@@ -1,35 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-
-"""Triton kernels for DeepSeek V4 sparse MLA attention on AMD GPUs.
-
-Ported from vLLM's
-``vllm/v1/attention/ops/rocm_aiter_mla_sparse.py`` and
-``vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse_dsv4.py``,
-mirroring the layout used by ``unified_attention.py`` in this directory
-(kernels live in ``_triton_kernels``; Python wrappers live in
-``aiter/ops/triton/attention/sparse_attention_dsv4.py``).
-
-The two heavyweight kernels are:
-
-* ``_sparse_attn_prefill_ragged_kernel`` — bf16 KV in a flat
-  ``[N, D]`` buffer, ragged per-query indices into that buffer,
-  optional per-head attention sink. One program per query × head-block.
-* ``_sparse_attn_decode_ragged_kernel`` — fp8_ds_mla paged cache layout
-  (NoPE 448 bytes in FP8 + 8-byte per-token scale group + RoPE 64 bf16
-  trailing the NoPE), with two parallel sparse passes: a "main" cache
-  (sliding-window / SWA) and an optional "extra" cache (top-k). Both
-  passes share one running softmax statistic.
-
-The 5 smaller helpers (`_pack_dense_prefix_to_ragged_kernel`,
-`_compute_topk_lens_kernel`, `_pack_global_topk_ragged_kernel`,
-`_compute_combined_lens_kernel`,
-`_combine_topk_swa_indices_ragged_kernel`) prepare CSR-style
-``(ragged_indices, ragged_indptr)`` pairs that the two attention
-kernels consume. They handle the global-topk → block-table indirection
-and the topk+SWA per-token interleaving on the prefill path.
-"""
-
 import torch
 import triton
 import triton.language as tl
@@ -53,52 +21,6 @@ def _get_lds_limit():
 
 
 _LDS_LIMIT = _get_lds_limit()
-
-
-# ---------------------------------------------------------------------------
-# Autotune configs for the prefill attention kernels
-# ---------------------------------------------------------------------------
-
-
-def _prefill_prune_configs(configs, named_args, **kwargs):
-    """Prune prefill configs that would exceed per-CU LDS.
-
-    The KV tile loaded into LDS is ``[BLOCK_K, BLOCK_D]`` bf16 (2 B/elem),
-    double-buffered across ``num_stages``.
-    """
-    BLOCK_D = kwargs.get("BLOCK_D", named_args.get("BLOCK_D"))
-    pruned = []
-    for cfg in configs:
-        bk = cfg.kwargs["BLOCK_K"]
-        ns = cfg.num_stages
-        kv_lds = BLOCK_D * bk * 2 * ns
-        if kv_lds <= _LDS_LIMIT:
-            pruned.append(cfg)
-    if not pruned:
-        pruned.append(configs[0])
-    return pruned
-
-
-def _get_prefill_autotune_configs():
-    return [
-        triton.Config(
-            {
-                "BLOCK_H": BLOCK_H,
-                "BLOCK_K": BLOCK_K,
-                "waves_per_eu": WPE,
-                "matrix_instr_nonkdim": NKDIM,
-            },
-            num_warps=nw,
-            num_stages=ns,
-        )
-        for BLOCK_H in [16, 32, 64]
-        for BLOCK_K in [16, 32, 64, 128]
-        for WPE in [0, 1, 2]
-        for NKDIM in [16, 32]
-        for nw in [4, 8]
-        for ns in [1, 2]
-        # triton.Config({"BLOCK_H": 64, "BLOCK_K": 32, "waves_per_eu": 2, "matrix_instr_nonkdim": 16}, num_warps=4, num_stages=2),
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +222,45 @@ def _combine_topk_swa_indices_ragged_kernel(
 # Sparse attention kernels (prefill + decode)
 # ---------------------------------------------------------------------------
 
+def _prefill_prune_configs(configs, named_args, **kwargs):
+    """Prune prefill configs that would exceed per-CU LDS.
+
+    The KV tile loaded into LDS is ``[BLOCK_K, BLOCK_D]`` bf16 (2 B/elem),
+    double-buffered across ``num_stages``.
+    """
+    BLOCK_D = kwargs.get("BLOCK_D", named_args.get("BLOCK_D"))
+    pruned = []
+    for cfg in configs:
+        bk = cfg.kwargs["BLOCK_K"]
+        ns = cfg.num_stages
+        kv_lds = BLOCK_D * bk * 2 * ns
+        if kv_lds <= _LDS_LIMIT:
+            pruned.append(cfg)
+    if not pruned:
+        pruned.append(configs[0])
+    return pruned
+
+
+def _get_prefill_autotune_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_H": BLOCK_H,
+                "BLOCK_K": BLOCK_K,
+                "waves_per_eu": WPE,
+                "matrix_instr_nonkdim": NKDIM,
+            },
+            num_warps=nw,
+            num_stages=ns,
+        )
+        for BLOCK_H in [32, 64]
+        for BLOCK_K in [16, 32, 64, 128]
+        for WPE in [0, 2]
+        for NKDIM in [16]
+        for nw in [4, 8]
+        for ns in [1, 2]
+    ]
+
 
 @triton.autotune(
     configs=_get_prefill_autotune_configs(),
@@ -307,7 +268,7 @@ def _combine_topk_swa_indices_ragged_kernel(
     prune_configs_by={"early_config_prune": _prefill_prune_configs},
 )
 @triton.jit
-def _sparse_attn_prefill_ragged_kernel(
+def _sparse_attn_prefill_kernel(
     q_ptr,              # [num_queries, num_heads, head_dim]            bf16
     kv_ptr,             # [num_kv, head_dim]                            bf16   (flat: SWA + topk concatenated by caller)
     kv_indices_ptr,     # [nnz]                                         int32  (CSR slot ids into kv_ptr)
@@ -362,10 +323,12 @@ def _sparse_attn_prefill_ragged_kernel(
     kv_len = kv_end - kv_start
 
     k_offsets = tl.arange(0, BLOCK_K)
+    # Prefetch first tile's slot indices so the indirect int32 load can overlap
+    # the next iteration's QK MFMA latency.
+    slot = tl.load(kv_indices_ptr + kv_start + k_offsets, mask=k_offsets < kv_len, other=-1)
     for k_start in tl.range(0, kv_len, BLOCK_K):
         k_pos = k_start + k_offsets
         in_range = k_pos < kv_len
-        slot = tl.load(kv_indices_ptr + kv_start + k_pos, mask=in_range, other=-1)
         valid = in_range & (slot >= 0) & (slot < num_kv)
 
         kv = tl.load(
@@ -374,7 +337,13 @@ def _sparse_attn_prefill_ragged_kernel(
             mask=valid[:, None] & dim_mask[None, :],
             other=0.0,
         )
-        kv = tl.where(valid[:, None] & dim_mask[None, :], kv, 0.0)
+
+        # Prefetch next tile's indices before heavy compute on current tile.
+        next_k_pos = k_start + BLOCK_K + k_offsets
+        slot = tl.load(
+            kv_indices_ptr + kv_start + next_k_pos,
+            mask=next_k_pos < kv_len, other=-1,
+        )
 
         scores = tl.dot(q, tl.trans(kv)) * scale
         scores = tl.where(head_mask[:, None] &
@@ -457,7 +426,6 @@ def _get_decode_autotune_configs():
         for NKDIM in [16]
         for nw in [4, 8]
         for ns in [1, 2]
-        # triton.Config({"BLOCK_H": 64, "BLOCK_K": 32, "waves_per_eu": 2, "matrix_instr_nonkdim": 16}, num_warps=4, num_stages=2),
     ]
 
 
@@ -467,7 +435,7 @@ def _get_decode_autotune_configs():
     prune_configs_by={"early_config_prune": _decode_prune_configs},
 )
 @triton.jit
-def _sparse_attn_decode_ragged_kernel(
+def _sparse_attn_decode_kernel(
     q_ptr,              # [num_queries, num_heads, NOPE_DIM + ROPE_DIM]                   bf16
     main_cache_ptr,     # [num_main_blocks, main_block_size * 584]                        uint8  (fp8_ds_mla: 576 B nope+rope, then 8 B scale per token)
     main_indices_ptr,   # [main_nnz]                                                      int32  (CSR global slot ids into main cache)

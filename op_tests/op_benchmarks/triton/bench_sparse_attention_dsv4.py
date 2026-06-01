@@ -2,19 +2,14 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Benchmark for the DSV4 sparse MLA prefill / decode Triton kernels.
-
-The Triton kernels are autotuned, so the benchmark just launches them with
-a META-aware grid and records timing / throughput.
-
 Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4.py
   python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4.py --shapes prefill
   python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4.py --shapes decode
 
-The benchmark deliberately imports the *_triton_kernels* module directly to
-avoid pulling in the full ``aiter`` package init (which imports flydsl). This
-keeps the benchmark self-contained and runnable on a machine that only has
-triton + torch installed.
+  # Benchmark the Gluon (CDNA4 / gfx950) kernels instead of the Triton ones:
+  USE_GLUON=1 python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4.py
+
 """
 
 from __future__ import annotations
@@ -27,27 +22,42 @@ import sys
 import torch
 import triton
 
-
-# ---------------------------------------------------------------------------
-# Direct module loading (bypass aiter/__init__.py)
-# ---------------------------------------------------------------------------
-def _load_module(name: str, path: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+# def _load_module(name: str, path: str):
+#     spec = importlib.util.spec_from_file_location(name, path)
+#     mod = importlib.util.module_from_spec(spec)
+#     sys.modules[name] = mod
+#     spec.loader.exec_module(mod)
+#     return mod
 
 
-_AITER_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..")
+# _AITER_ROOT = os.path.abspath(
+#     os.path.join(os.path.dirname(__file__), "..", "..", "..")
+# )
+# _TRITON_KERNEL_PATH = os.path.join(
+#     _AITER_ROOT,
+#     "aiter/ops/triton/_triton_kernels/attention/sparse_attention_dsv4.py",
+# )
+# _GLUON_KERNEL_PATH = os.path.join(
+#     _AITER_ROOT,
+#     "aiter/ops/triton/_gluon_kernels/gfx950/attention/sparse_attention_dsv4.py",
+# )
+# T = _load_module("_bench_tri_dsv4", _TRITON_KERNEL_PATH)
+# G = _load_module("_bench_gluon_dsv4", _GLUON_KERNEL_PATH)
+
+USE_GLUON = os.environ.get("USE_GLUON", "0") == "1"
+BACKEND = "gluon" if USE_GLUON else "triton"
+
+from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
+    _sparse_attn_decode_kernel as csa_decode_tl,
+    _sparse_attn_prefill_kernel as csa_prefill_tl,
 )
-_TRITON_KERNEL_PATH = os.path.join(
-    _AITER_ROOT,
-    "aiter/ops/triton/_triton_kernels/attention/sparse_attention_dsv4.py",
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_attention_dsv4 import (
+    _sparse_attn_decode_kernel as csa_decode_gl,
+    _sparse_attn_prefill_kernel as csa_prefill_gl,
 )
 
-T = _load_module("_bench_tri_dsv4", _TRITON_KERNEL_PATH)
+sparse_attn_prefill_kernel = csa_prefill_gl if USE_GLUON else csa_prefill_tl
+sparse_attn_decode_kernel = csa_decode_gl if USE_GLUON else csa_decode_tl
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +139,11 @@ def _launch_prefill(
     scale,
 ):
     block_d = triton.next_power_of_2(head_dim)
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         num_queries,
         triton.cdiv(num_heads, META["BLOCK_H"]),
     )
-    T._sparse_attn_prefill_ragged_kernel[grid](
+    sparse_attn_prefill_kernel[grid](
         q,
         kv,
         indices,
@@ -174,7 +184,7 @@ def _launch_decode(
         num_q,
         triton.cdiv(num_heads, META["BLOCK_H"]),
     )
-    T._sparse_attn_decode_ragged_kernel[grid](
+    sparse_attn_decode_kernel[grid](
         q,
         main_cache,
         main_idx,
@@ -232,7 +242,7 @@ def run_prefill_bench(args, device: str):
         )
         kv = torch.randn(num_kv, HEAD_DIM, dtype=torch.bfloat16, device=device)
         indices, indptr, _ = _build_csr(num_queries, num_kv, topk, device)
-        nnz = int(indptr[-1].item())
+        nnz = int(indptr[-1].item())        # number of non-zeros
         scale = 1.0 / (HEAD_DIM ** 0.5)
         attn_sink = torch.empty(1, device=device, dtype=torch.float32)
         out_tri = torch.empty_like(q)
@@ -243,13 +253,13 @@ def run_prefill_bench(args, device: str):
         )
         torch.cuda.synchronize()
 
-        tri_ms = _bench(
+        ms = _bench(
             lambda: _launch_prefill(
                 q, kv, indices, indptr, out_tri,
                 num_queries, num_heads, HEAD_DIM, False, attn_sink, scale,
             )
         )
-        print(f"best config: {T._sparse_attn_prefill_ragged_kernel.best_config}")
+        print(f"best config: {sparse_attn_prefill_kernel.best_config}")
 
         # FLOPS: per query, for each of `nnz` K positions, 2*H*D for QK + 2*H*D for PV.
         flops = 4.0 * num_heads * HEAD_DIM * nnz
@@ -260,14 +270,15 @@ def run_prefill_bench(args, device: str):
             + out_tri.numel() * out_tri.element_size()
         )
         rows.append(
-            (num_queries, num_heads, num_kv, topk, nnz,
-             tri_ms,
-             flops / (tri_ms * 1e-3) / 1e12,
-             bytes_moved / (tri_ms * 1e-3) / 1e9)
+            (num_queries, num_heads, num_kv, topk,
+             ms,
+             flops / (ms * 1e-3) / 1e12,
+             bytes_moved / (ms * 1e-3) / 1e9)
         )
     _print_table(
         "PREFILL",
-        ["Q", "H", "Kv", "topk", "nnz", "tri ms", "tri TFLOPS", "tri GB/s"],
+        ["Q", "H", "Kv", "topk",
+         f"{BACKEND} ms", f"{BACKEND} TFLOPS", f"{BACKEND} GB/s"],
         rows,
     )
 
@@ -302,15 +313,8 @@ def run_decode_bench(args, device: str):
         scale = 1.0 / (HEAD_DIM ** 0.5)
 
         out_tri = torch.empty_like(q)
-        # _launch_decode(
-        #     q, swa_cache, swa_idx, swa_indptr,
-        #     extra_cache, extra_idx, extra_indptr,
-        #     attn_sink, out_tri, num_q, num_heads,
-        #     block_size, block_size, has_extra, False, scale,
-        # )
-        # torch.cuda.synchronize()
 
-        tri_ms = _bench(
+        ms = _bench(
             lambda: _launch_decode(
                 q, swa_cache, swa_idx, swa_indptr,
                 extra_cache, extra_idx, extra_indptr,
@@ -318,7 +322,7 @@ def run_decode_bench(args, device: str):
                 block_size, block_size, has_extra, False, scale,
             )
         )
-        print(f"best config: {T._sparse_attn_decode_ragged_kernel.best_config}")
+        print(f"best config: {sparse_attn_decode_kernel.best_config}")
 
         total_nnz = swa_nnz + extra_nnz
         flops = 4.0 * num_heads * HEAD_DIM * total_nnz
@@ -330,21 +334,19 @@ def run_decode_bench(args, device: str):
         )
         rows.append(
             (num_q, num_heads, block_size, num_blocks, topk, int(has_extra),
-             swa_nnz, extra_nnz,
-             tri_ms,
-             flops / (tri_ms * 1e-3) / 1e12,
-             bytes_moved / (tri_ms * 1e-3) / 1e9)
+             ms,
+             flops / (ms * 1e-3) / 1e12,
+             bytes_moved / (ms * 1e-3) / 1e9)
         )
     _print_table(
         "DECODE",
         ["Q", "H", "blk", "N", "topk", "ext",
-         "swa_nnz", "ext_nnz", "tri ms", "tri TFLOPS", "tri GB/s"],
+         f"{BACKEND} ms", f"{BACKEND} TFLOPS", f"{BACKEND} GB/s"],
         rows,
     )
 
 
 def _print_table(title, headers, rows):
-    # ASCII table formatter
     def _fmt(x):
         if isinstance(x, float):
             return f"{x:.3f}" if x >= 1 or x == 0 else f"{x:.4f}"
@@ -372,9 +374,9 @@ def _parse_args():
         type=str,
         default=[
             # (num_queries, num_heads, num_kv, topk)
-            # "4096,128,4096,512",
-            # "4096,128,4096,1024",
-            # "8192,128,8192,512",
+            "4096,128,4096,512",
+            "4096,128,4096,1024",
+            "8192,128,8192,512",
             "8192,128,8192,1024",
         ],
     )
@@ -384,9 +386,9 @@ def _parse_args():
         type=str,
         default=[
             # (num_q, num_heads, block_size, num_blocks, topk, has_extra)
-            # "4096,128,64,512,512,0",
-            # "4096,128,64,512,1024,1",
-            # "8192,128,64,512,512,0",
+            "4096,128,64,512,512,0",
+            "4096,128,64,512,1024,1",
+            "8192,128,64,512,512,0",
             "8192,128,64,512,1024,1",
         ],
     )
@@ -404,10 +406,11 @@ def main():
         f"({torch.cuda.get_device_properties(0).multi_processor_count} CUs)"
     )
     print(f"Triton: {triton.__version__}")
+    print(f"Backend: {'GLUON (gfx950)' if USE_GLUON else 'TRITON'} ")
     if args.shapes in ("all", "prefill"):
         run_prefill_bench(args, device)
-    # if args.shapes in ("all", "decode"):
-    #     run_decode_bench(args, device)
+    if args.shapes in ("all", "decode"):
+        run_decode_bench(args, device)
 
 
 if __name__ == "__main__":

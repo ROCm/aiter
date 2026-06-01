@@ -1,36 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Some of the kernels are adapted from vLLM deepseek v4 sparse attention:
+# https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse_dsv4.py
 
-"""DeepSeek V4 sparse MLA attention — Python wrappers.
-
-Ported from vLLM's
-``vllm/v1/attention/ops/rocm_aiter_mla_sparse.py`` and the index helpers
-in ``vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse_dsv4.py``.
-See ``aiter/ops/triton/_triton_kernels/attention/sparse_attention_dsv4.py`` for
-the kernels' caller contract.
-
-Public API:
-
-* ``build_ragged_indices_from_dense`` — convert a dense
-  ``[N, max_topk]`` index matrix + per-row lengths into a
-  ``(flat_indices, indptr)`` CSR pair, masking any out-of-range slots.
-* ``compute_global_topk_ragged_indices_and_indptr`` — gather per-token
-  local top-k positions through the block table into global slot ids,
-  packed as CSR.
-* ``combine_topk_swa_indices_ragged`` — interleave per-token top-k and
-  sliding-window indices into one CSR buffer ready for the prefill
-  kernel.
-* ``sparse_attn_prefill`` — ragged sparse attention for the prefill
-  phase. Operates on a single bf16 ``[N, D]`` KV buffer.
-* ``sparse_attn_decode`` — ragged sparse attention for the decode
-  phase. Operates on an fp8_ds_mla paged cache (one mandatory ``main``
-  cache + an optional ``extra`` cache).
-
-The DSV4 sparse MLA layout (NoPE 448 fp8 + 8-byte per-64-element scale
-group + RoPE 64 bf16 trailing the NoPE; one cache "row" = 576 bytes)
-is hardcoded into the decode kernel and validated by
-``_validate_dsv4_sparse_dims`` at wrapper entry.
-"""
 
 import torch
 import triton
@@ -42,8 +15,8 @@ from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _compute_topk_lens_kernel,
     _pack_dense_prefix_to_ragged_kernel,
     _pack_global_topk_ragged_kernel,
-    _sparse_attn_decode_ragged_kernel,
-    _sparse_attn_prefill_ragged_kernel,
+    _sparse_attn_decode_kernel,
+    _sparse_attn_prefill_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
@@ -52,26 +25,26 @@ from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 _TRITON_VERSION = Version(triton.__version__)
 _TRITON_GE_36 = _TRITON_VERSION >= Version("3.6.0")
 _arch = arch_info.get_arch()
-_gluon_sparse_attn_prefill_ragged_kernel = None
-_gluon_sparse_attn_decode_ragged_kernel = None
+_gluon_sparse_attn_prefill_kernel = None
+_gluon_sparse_attn_decode_kernel = None
 if _TRITON_GE_36 and _arch == "gfx950":
     try:
         from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_attention_dsv4 import (
-            _gluon_sparse_attn_prefill_ragged_kernel,
-            _gluon_sparse_attn_decode_ragged_kernel,
+            _sparse_attn_prefill_kernel as _gluon_sparse_attn_prefill_kernel,
+            _sparse_attn_decode_kernel as _gluon_sparse_attn_decode_kernel,
         )
     except ImportError:
-        _gluon_sparse_attn_prefill_ragged_kernel = None
-        _gluon_sparse_attn_decode_ragged_kernel = None
+        _gluon_sparse_attn_prefill_kernel = None
+        _gluon_sparse_attn_decode_kernel = None
 
-# Buffer-load resource descriptors are 32-bit byte-addressed; the Gluon decode
-# kernel keeps all per-row offsets in int32 so we must fall back to Triton when
-# the paged cache exceeds 2 GiB.
+# Buffer-load resource descriptors are 32-bit byte-addressed; the Gluon kernels
+# keep all per-row offsets in int32, so they can only be used when the addressed
+# pool (bf16 KV buffer / fp8 paged cache) fits within 2 GiB.
 _BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
 
 
-def _use_gluon_decode_for_cache(cache: torch.Tensor) -> bool:
-    return cache.numel() * cache.element_size() < _BUFFER_LIMIT_BYTES
+def _fits_buffer_descriptor(tensor: torch.Tensor) -> bool:
+    return tensor.numel() * tensor.element_size() < _BUFFER_LIMIT_BYTES
 
 
 # ---------------------------------------------------------------------------
@@ -331,93 +304,39 @@ def _sparse_attn_prefill_ragged(
 
     block_d = triton.next_power_of_2(head_dim)
     out = torch.empty_like(q, dtype=torch.bfloat16)
-    if _gluon_sparse_attn_prefill_ragged_kernel is not None:
-        block_h = 16
-        block_k = 16 if head_dim >= 256 else 32
-        _gluon_sparse_attn_prefill_ragged_kernel[
-            (num_queries, triton.cdiv(num_heads, block_h))
-        ](
-            q,
-            kv,
-            indices,
-            indptr,
-            attn_sink,
-            out,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            kv.stride(0),
-            kv.stride(1),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            num_heads,
-            head_dim,
-            kv.shape[0],
-            float(scale),
-            HAS_ATTN_SINK=has_attn_sink,
-            BLOCK_H=block_h,
-            BLOCK_D=block_d,
-            BLOCK_K=block_k,
-            num_warps=8,
-        )
+    # Prefer the Gluon kernel, but it gathers KV via 32-bit buffer_load offsets,
+    # so fall back to Triton when the KV pool exceeds the 2 GiB descriptor cap.
+    if _gluon_sparse_attn_prefill_kernel is not None and _fits_buffer_descriptor(kv):
+        kernel = _gluon_sparse_attn_prefill_kernel
     else:
-        grid = lambda META: (  # noqa: E731
-            num_queries,
-            triton.cdiv(num_heads, META["BLOCK_H"]),
-        )
-        _sparse_attn_prefill_ragged_kernel[grid](
-            q,
-            kv,
-            indices,
-            indptr,
-            attn_sink,
-            out,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            kv.stride(0),
-            kv.stride(1),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            num_heads,
-            head_dim,
-            kv.shape[0],
-            float(scale),
-            HAS_ATTN_SINK=has_attn_sink,
-            BLOCK_D=block_d,
-        )
-    return out
-
-
-def _sparse_attn_prefill_dense(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    scale: float,
-    attn_sink: torch.Tensor | None,
-    nope_head_dim: int,
-    rope_head_dim: int,
-    topk_length: torch.Tensor | None = None,
-) -> torch.Tensor:
-    ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+        kernel = _sparse_attn_prefill_kernel
+    grid = lambda META: (  # noqa: E731
+        num_queries,
+        triton.cdiv(num_heads, META["BLOCK_H"]),
+    )
+    kernel[grid](
+        q,
+        kv,
         indices,
-        topk_length
-        if topk_length is not None
-        else (indices >= 0).sum(dim=-1, dtype=torch.int32),
-        num_rows=kv.shape[0],
+        indptr,
+        attn_sink,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        kv.stride(0),
+        kv.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        num_heads,
+        head_dim,
+        kv.shape[0],
+        float(scale),
+        HAS_ATTN_SINK=has_attn_sink,
+        BLOCK_D=block_d,
     )
-    return _sparse_attn_prefill_ragged(
-        q=q,
-        kv=kv,
-        indices=ragged_indices,
-        indptr=ragged_indptr,
-        scale=scale,
-        attn_sink=attn_sink,
-        nope_head_dim=nope_head_dim,
-        rope_head_dim=rope_head_dim,
-    )
+    return out
 
 
 def _sparse_attn_decode_ragged(
@@ -492,138 +411,51 @@ def _sparse_attn_decode_ragged(
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
     out = torch.empty_like(q, dtype=torch.bfloat16)
-    can_use_gluon = (
-        _gluon_sparse_attn_decode_ragged_kernel is not None
-        and _use_gluon_decode_for_cache(main_cache)
-        and _use_gluon_decode_for_cache(extra_cache)
-    )
-    if can_use_gluon:
-        block_h = 16
-        block_k = 16 if head_dim >= 256 else 32
-        _gluon_sparse_attn_decode_ragged_kernel[
-            (num_queries, triton.cdiv(num_heads, block_h))
-        ](
-            q,
-            main_cache,
-            main_indices,
-            main_indptr,
-            extra_cache,
-            extra_indices,
-            extra_indptr,
-            attn_sink,
-            out,
-            q.stride(0),
-            q.stride(1),
-            out.stride(0),
-            out.stride(1),
-            main_cache.stride(0),
-            extra_cache.stride(0),
-            main_cache.shape[0] * main_cache.shape[1],
-            extra_cache.shape[0] * extra_cache.shape[1],
-            main_cache.shape[1],
-            extra_cache.shape[1],
-            scale,
-            num_heads,
-            HAS_ATTN_SINK=has_attn_sink,
-            HAS_EXTRA=has_extra,
-            NOPE_DIM=nope_head_dim,
-            NOPE_BLOCK=triton.next_power_of_2(nope_head_dim),
-            ROPE_DIM=rope_head_dim,
-            IS_FNUZ=_is_fp8_fnuz(),
-            BLOCK_H=block_h,
-            BLOCK_K=block_k,
-            num_warps=8,
-        )
-    else:
-        grid = lambda META: (  # noqa: E731
-            num_queries,
-            triton.cdiv(num_heads, META["BLOCK_H"]),
-        )
-        _sparse_attn_decode_ragged_kernel[grid](
-            q,
-            main_cache,
-            main_indices,
-            main_indptr,
-            extra_cache,
-            extra_indices,
-            extra_indptr,
-            attn_sink,
-            out,
-            q.stride(0),
-            q.stride(1),
-            out.stride(0),
-            out.stride(1),
-            main_cache.stride(0),
-            extra_cache.stride(0),
-            main_cache.shape[0] * main_cache.shape[1],
-            extra_cache.shape[0] * extra_cache.shape[1],
-            main_cache.shape[1],
-            extra_cache.shape[1],
-            scale,
-            num_heads,
-            HAS_ATTN_SINK=has_attn_sink,
-            HAS_EXTRA=has_extra,
-            NOPE_DIM=nope_head_dim,
-            NOPE_BLOCK=triton.next_power_of_2(nope_head_dim),
-            ROPE_DIM=rope_head_dim,
-            IS_FNUZ=_is_fp8_fnuz(),
-        )
-    return out
-
-
-def _sparse_attn_decode_dense(
-    q: torch.Tensor,
-    main_cache: torch.Tensor,
-    main_indices: torch.Tensor,
-    scale: float,
-    attn_sink: torch.Tensor | None,
-    nope_head_dim: int,
-    rope_head_dim: int,
-    extra_cache: torch.Tensor | None = None,
-    extra_indices: torch.Tensor | None = None,
-    main_lengths: torch.Tensor | None = None,
-    extra_lengths: torch.Tensor | None = None,
-    main_ragged_indices: torch.Tensor | None = None,
-    main_ragged_indptr: torch.Tensor | None = None,
-    extra_ragged_indices: torch.Tensor | None = None,
-    extra_ragged_indptr: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if main_ragged_indices is None or main_ragged_indptr is None:
-        main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
-            main_indices,
-            main_lengths
-            if main_lengths is not None
-            else (main_indices >= 0).sum(dim=-1, dtype=torch.int32),
-            num_rows=main_cache.shape[0] * main_cache.shape[1],
-        )
-
+    # Prefer the Gluon kernel, but its 32-bit buffer_load offsets require both
+    # paged caches to fit within the 2 GiB descriptor cap; else fall back to
+    # Triton.
     if (
-        (extra_ragged_indices is None or extra_ragged_indptr is None)
-        and extra_cache is not None
-        and extra_indices is not None
+        _gluon_sparse_attn_decode_kernel is not None
+        and _fits_buffer_descriptor(main_cache)
+        and _fits_buffer_descriptor(extra_cache)
     ):
-        extra_ragged_indices, extra_ragged_indptr = build_ragged_indices_from_dense(
-            extra_indices,
-            extra_lengths
-            if extra_lengths is not None
-            else (extra_indices >= 0).sum(dim=-1, dtype=torch.int32),
-            num_rows=extra_cache.shape[0] * extra_cache.shape[1],
-        )
-
-    return _sparse_attn_decode_ragged(
-        q=q,
-        main_cache=main_cache,
-        main_indices=main_ragged_indices,
-        main_indptr=main_ragged_indptr,
-        scale=scale,
-        attn_sink=attn_sink,
-        nope_head_dim=nope_head_dim,
-        rope_head_dim=rope_head_dim,
-        extra_cache=extra_cache,
-        extra_indices=extra_ragged_indices,
-        extra_indptr=extra_ragged_indptr,
+        kernel = _gluon_sparse_attn_decode_kernel
+    else:
+        kernel = _sparse_attn_decode_kernel
+    grid = lambda META: (  # noqa: E731
+        num_queries,
+        triton.cdiv(num_heads, META["BLOCK_H"]),
     )
-
+    kernel[grid](
+        q,
+        main_cache,
+        main_indices,
+        main_indptr,
+        extra_cache,
+        extra_indices,
+        extra_indptr,
+        attn_sink,
+        out,
+        q.stride(0),
+        q.stride(1),
+        out.stride(0),
+        out.stride(1),
+        main_cache.stride(0),
+        extra_cache.stride(0),
+        main_cache.shape[0] * main_cache.shape[1],
+        extra_cache.shape[0] * extra_cache.shape[1],
+        main_cache.shape[1],
+        extra_cache.shape[1],
+        scale,
+        num_heads,
+        HAS_ATTN_SINK=has_attn_sink,
+        HAS_EXTRA=has_extra,
+        NOPE_DIM=nope_head_dim,
+        NOPE_BLOCK=triton.next_power_of_2(nope_head_dim),
+        ROPE_DIM=rope_head_dim,
+        IS_FNUZ=_is_fp8_fnuz(),
+    )
+    return out
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -670,29 +502,30 @@ def sparse_attn_prefill(
     _validate_dsv4_sparse_dims(
         head_dim, nope_head_dim, rope_head_dim, "sparse_attn_prefill"
     )
-    if ragged_indices is not None and ragged_indptr is not None:
-        output_chunk = _sparse_attn_prefill_ragged(
-            q=q,
-            kv=kv.squeeze(1),
-            indices=ragged_indices,
-            indptr=ragged_indptr,
-            scale=scale,
-            attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
-            nope_head_dim=nope_head_dim,
-            rope_head_dim=rope_head_dim,
-        )
-    else:
+
+    if ragged_indices is None or ragged_indptr is None:
+
         indices_2d = indices.reshape(indices.shape[0], -1)
-        output_chunk = _sparse_attn_prefill_dense(
-            q=q,
-            kv=kv.squeeze(1),
-            indices=indices_2d,
-            scale=scale,
-            attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
-            nope_head_dim=nope_head_dim,
-            rope_head_dim=rope_head_dim,
-            topk_length=topk_length,
+
+        ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+            indices_2d,
+            topk_length
+            if topk_length is not None
+            else (indices >= 0).sum(dim=-1, dtype=torch.int32),
+            num_rows=kv.shape[0],
         )
+
+    attn_sink = attn_sink[:, q.shape[1]] if attn_sink else None
+    output_chunk = _sparse_attn_prefill_ragged(
+        q=q,
+        kv=kv,
+        indices=ragged_indices,
+        indptr=ragged_indptr,
+        scale=scale,
+        attn_sink=attn_sink,
+        nope_head_dim=nope_head_dim,
+        rope_head_dim=rope_head_dim,
+    )
     output.copy_(output_chunk.to(output.dtype))
 
 
@@ -745,7 +578,7 @@ def sparse_attn_decode(
         output: ``[N, H, D]`` destination (any dtype). Filled in place.
     """
     assert swa_k_cache.dtype == torch.uint8, (
-        f"sparse_attn_decode expects uint8 fp8_ds_mla SWA cache, "
+        f"sparse_attn_decode expects uint8 SWA cache, "
         f"got {swa_k_cache.dtype}"
     )
     _validate_dsv4_sparse_dims(
@@ -753,37 +586,52 @@ def sparse_attn_decode(
     )
 
     main_indices = swa_indices.reshape(swa_indices.shape[0], -1)
+    main_lens = swa_lens or (main_indices >= 0).sum(dim=-1, dtype=torch.int32)
+
+    if swa_ragged_indices is None or swa_ragged_indptr is None:
+        swa_ragged_indices, swa_ragged_indptr = build_ragged_indices_from_dense(
+            main_indices,
+            main_lens,
+            num_rows=swa_k_cache.shape[0] * swa_k_cache.shape[1],
+        )
+
+    attn_sink = attn_sink[:, q.shape[1]] if attn_sink else None
 
     extra_cache = None
-    extra_indices = None
     if not swa_only:
         assert kv_cache is not None
         assert topk_indices is not None or (
             topk_ragged_indices is not None and topk_ragged_indptr is not None
         )
         assert kv_cache.dtype == torch.uint8, (
-            f"sparse_attn_decode expects uint8 fp8_ds_mla extra cache, "
+            f"sparse_attn_decode expects uint8 extra cache, "
             f"got {kv_cache.dtype}"
         )
+
         extra_cache = kv_cache
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
+            extra_lens = topk_lens or (extra_indices >= 0).sum(dim=-1, dtype=torch.int32)
 
-    attn_out = _sparse_attn_decode_dense(
+            if topk_ragged_indices is None or topk_ragged_indptr is None:
+                topk_ragged_indices, topk_ragged_indptr = build_ragged_indices_from_dense(
+                    extra_indices,
+                    extra_lens,
+                    num_rows=extra_cache.shape[0] * extra_cache.shape[1],
+                )
+
+    attn_out =  _sparse_attn_decode_ragged(
         q=q,
         main_cache=swa_k_cache,
-        main_indices=main_indices,
+        main_indices=swa_ragged_indices,
+        main_indptr=swa_ragged_indptr,
         scale=scale,
-        attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
+        attn_sink=attn_sink,
         nope_head_dim=nope_head_dim,
         rope_head_dim=rope_head_dim,
         extra_cache=extra_cache,
-        extra_indices=extra_indices,
-        main_lengths=swa_lens,
-        extra_lengths=topk_lens,
-        main_ragged_indices=swa_ragged_indices,
-        main_ragged_indptr=swa_ragged_indptr,
-        extra_ragged_indices=topk_ragged_indices,
-        extra_ragged_indptr=topk_ragged_indptr,
+        extra_indices=topk_ragged_indices,
+        extra_indptr=topk_ragged_indptr,
     )
+
     output.copy_(attn_out.to(output.dtype))
