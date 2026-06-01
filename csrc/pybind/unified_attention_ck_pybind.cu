@@ -32,5 +32,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("q_descale")                         = 1.0f,
           py::arg("k_descale")                         = 1.0f,
           py::arg("v_descale")                         = 1.0f,
-          py::arg("max_seqlen_q_override")             = 0);
+          py::arg("max_seqlen_q_override")             = 0,
+          py::arg("window_size_left")                  = -1,
+          py::arg("window_size_right")                 = -1);
 }

@@ -26,6 +26,14 @@ from ..jit.core import compile_ops
 #   * Empty splits are encoded by lse == -inf (host pre-fills lse_acc with
 #     -inf; the CK kernel only overwrites real splits). No seq_lens-derived
 #     mask is needed.
+#   * o_acc for empty splits is intentionally NOT zeroed by the host (saves
+#     a full-workspace fill on every call). The combine MUST therefore mask
+#     out the o_acc load on `is_empty` lanes — relying solely on the
+#     `weight==0` multiply is unsafe because uninitialized memory may
+#     contain NaN/Inf and `NaN * 0 == NaN` propagates. This bites SWA +
+#     split-KV in particular: short-window decode shapes can produce
+#     several fully-out-of-window splits where the kernel takes an early
+#     return without touching o_acc.
 # -----------------------------------------------------------------------------
 @triton.jit
 def _fast_exp(x):
@@ -80,11 +88,14 @@ def _reduce_segments_ck_layout(
         + query_token_idx * HEAD_SIZE
         + offs_d[None, :]
     )
-    o = tl.load(
-        o_acc_ptr + o_offset,
-        mask=split_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
+    # Mask out empty splits in the load itself: the CK kernel skips
+    # writing o_acc for splits whose KV range is fully outside the SWA
+    # window (or otherwise produced no work), so those lanes contain
+    # uninitialized memory that may be NaN/Inf. Relying on `weight==0`
+    # to zero them out is unsafe because `NaN * 0 == NaN` and that NaN
+    # then poisons the per-token reduction.
+    valid = split_mask[:, None] & dim_mask[None, :] & (~is_empty)[:, None]
+    o = tl.load(o_acc_ptr + o_offset, mask=valid, other=0.0)
     o = o * weight[:, None]
     acc = tl.sum(o, axis=0) / weight_sum_safe
 
@@ -123,6 +134,8 @@ def _gen_unified_attention_fwd_kernel_fake(
     k_descale: float = 1.0,
     v_descale: float = 1.0,
     max_seqlen_q_override: int = 0,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
 ) -> None:
     return None
 
@@ -154,6 +167,8 @@ def _unified_attention_fwd_kernel(
     k_descale: float = 1.0,
     v_descale: float = 1.0,
     max_seqlen_q_override: int = 0,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
 ) -> None: ...
 
 
@@ -408,6 +423,12 @@ def unified_attention_fwd(
     # tighter decode_d{64,128}_m{16,32,128} tiers instead of falling through
     # to prefill_d{64,128}.
     max_seqlen_q: int = 0,
+    # Sliding-window attention bounds in vLLM/Flash-Attention semantics. -1
+    # means "unbounded" on that side. Combined with `mask_type == 2` (causal)
+    # the C++ layer maps this to `(window_size_left=-1, window_size_right=0,
+    # is_top_left=false)`
+    window_size_left: int = -1,
+    window_size_right: int = -1,
 ) -> None:
     explicit_override = (
         num_splits > 1
@@ -439,6 +460,8 @@ def unified_attention_fwd(
             k_descale,
             v_descale,
             max_seqlen_q,
+            window_size_left,
+            window_size_right,
         )
         return
 
@@ -468,6 +491,8 @@ def unified_attention_fwd(
             k_descale,
             v_descale,
             max_seqlen_q,
+            window_size_left,
+            window_size_right,
         )
         return
 
@@ -506,5 +531,7 @@ def unified_attention_fwd(
         k_descale,
         v_descale,
         max_seqlen_q,
+        window_size_left,
+        window_size_right,
     )
     _combine_splits(output, o_acc, lse_acc)

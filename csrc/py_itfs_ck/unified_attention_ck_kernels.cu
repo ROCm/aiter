@@ -39,7 +39,12 @@ void unified_attention_fwd(
     // back to the conservative heuristic at line below. Pass the real per-seq
     // max here to let the C++ dispatcher pick a tighter (smaller) BlockM tier
     // (e.g. decode_d128_m128 with 4 warps vs prefill_d128 with 8 warps).
-    int64_t max_seqlen_q_override)
+    int64_t max_seqlen_q_override,
+    // SWA window bounds in vLLM/FA semantics. -1 = "unbounded" on that side.
+    // The mapping into the kernel's (window_size_left, window_size_right,
+    // is_top_left) triple lives below — see the "Mask + SWA plumbing" block.
+    int window_size_left,
+    int window_size_right)
 {
     auto dtype = query.dtype();
     // FP8 path: Q is FP8E4M3 (e4m3fn on gfx950 / e4m3fnuz on gfx942). The
@@ -81,6 +86,33 @@ void unified_attention_fwd(
     ck_tile::unified_attention_args args;
     args.data_type          = dt;
     args.mask_type          = mask_type;
+    // Mask + SWA plumbing. The Python/vLLM side passes a `(window_size_left,
+    // window_size_right)` pair where `-1` on either side means "unbounded".
+    // The CK kernel instead wants three concrete values:
+    //   args.window_size_left  : -1 for "no left bound", otherwise the
+    //                            sliding-window radius on the K side.
+    //   args.window_size_right : -1 for "no right bound", `0` is the
+    //                            standard causal anchor.
+    //   args.is_top_left       : true → mask_top_left (mask_type=1);
+    //                            false → mask_bottom_right (mask_type=2/3).
+    // When `mask_type == 0` (no mask) we force the "no SWA" defaults so the
+    // dispatcher routes to a non-mask, non-local instance.
+    // For causal/window masks (mask_type ∈ {1, 2}) we pass `window_size_left`
+    // through as-is and coerce `window_size_right < 0` to `0` — that matches
+    // the FA-style causal anchor and keeps the existing non-SWA causal call
+    // (window=(-1,-1), mask_type=2) bit-identical to before this change.
+    if(mask_type == 0)
+    {
+        args.window_size_left  = -1;
+        args.window_size_right = -1;
+        args.is_top_left       = false;
+    }
+    else
+    {
+        args.window_size_left  = window_size_left;
+        args.window_size_right = (window_size_right < 0) ? 0 : window_size_right;
+        args.is_top_left       = (mask_type == 1);
+    }
     args.num_tokens         = num_tokens;
     args.num_blks           = num_blks;
     args.num_head_q         = num_head_q;

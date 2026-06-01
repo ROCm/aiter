@@ -35,4 +35,8 @@ void unified_attention_fwd(
     // per-seq max here when known (e.g. uniform-sq benchmarks or when the
     // caller already has a host-side max) to let the dispatcher pick a tighter
     // tile-tier (e.g. decode_d128_m128 instead of prefill_d128).
-    int64_t max_seqlen_q_override = 0);
+    int64_t max_seqlen_q_override = 0,
+    // Sliding-window attention bounds in vLLM/Flash-Attention semantics. A
+    // value of -1 means "unbounded" on that side.
+    int window_size_left  = -1,
+    int window_size_right = -1);
