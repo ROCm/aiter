@@ -29,5 +29,5 @@
 - defaulted files list: `none`
 
 ## Test plan
-- [x] bash .github/scripts/split_tests.sh --shards 5 --test-type aiter --dry-run
+- [x] bash .github/scripts/split_tests.sh --shards 8 --test-type aiter --dry-run
 - [x] bash .github/scripts/split_tests.sh --shards 8 --test-type triton --dry-run
