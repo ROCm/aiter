@@ -24,7 +24,7 @@ def _get_a8w4_dispatch(arch: str) -> dict:
     """Per-(block_m, N, K) dispatch table for moe_gemm_a8w4. Returns {} if no
     tuned file is shipped for this arch (caller uses the safe-default fallback).
     Mirrors get_moe_configs() in utils/moe_config_utils.py."""
-    fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-MOE-MX_FP4_A8.json"
+    fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A8W4.json"
     if os.path.exists(fpath):
         with open(fpath, "r") as f:
             return json.load(f)
