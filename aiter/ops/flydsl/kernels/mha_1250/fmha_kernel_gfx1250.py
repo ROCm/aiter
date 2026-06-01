@@ -230,7 +230,7 @@ def _build_tdm_descs(dg1, addr_i64, stride_adv_i64,
 
     dg1 can be a single v8i32 (shared across SUs) or a list of n_su v8i32.
     """
-    from flydsl._mlir.dialects import arith as std_arith
+    from flydsl._mlir.dialects import arith as _mlir_arith
     pred = arith.constant(1, type=T.i32)
     cur_addr = addr_i64
     _dg1_list = dg1 if isinstance(dg1, list) else [dg1] * n_su
@@ -241,7 +241,7 @@ def _build_tdm_descs(dg1, addr_i64, stride_adv_i64,
         dg0 = vector.from_elements(T.vec(4, T.i32), [pred, lds_off, addr_lo, addr_hi])
         descs.append((dg0, _dg1_list[su]))
         if su < n_su - 1:
-            cur_addr = std_arith.AddIOp(cur_addr, stride_adv_i64).result
+            cur_addr = _mlir_arith.addi(cur_addr, stride_adv_i64)
     return descs
 
 
@@ -266,14 +266,12 @@ def _tdm_load_kv_blk(kv_type, dg1, addr_i64, stride_adv_i64,
 
 def _per_warp_oob_dim1(total_rows_i32, wave_id, rows_per_warp=8):
     """Compute per-warp OOB tensor_dim1 = clamp(total_rows - wave_id*rows, 0, rows)."""
-    from flydsl._mlir.dialects import arith as std_arith
-    wave_off = std_arith.MulIOp(
-        _raw(wave_id), _raw(arith.constant(rows_per_warp, type=T.i32))).result
-    remaining = std_arith.SubIOp(total_rows_i32, wave_off).result
-    clamped_lo = std_arith.MaxSIOp(
-        remaining, _raw(arith.constant(0, type=T.i32))).result
-    return std_arith.MinSIOp(
-        clamped_lo, _raw(arith.constant(rows_per_warp, type=T.i32))).result
+    from flydsl._mlir.dialects import arith as _mlir_arith
+    from flydsl.expr.arith import _to_raw
+    wave_off = _to_raw(arith.muli(wave_id, arith.constant(rows_per_warp, type=T.i32)))
+    remaining = _mlir_arith.subi(total_rows_i32, wave_off)
+    clamped_lo = _mlir_arith.maxsi(remaining, _to_raw(arith.constant(0, type=T.i32)))
+    return _mlir_arith.minsi(clamped_lo, _to_raw(arith.constant(rows_per_warp, type=T.i32)))
 
 
 def _make_kv_dg1_with_oob(config_bf16, dim0_elems, dim1_rows,
@@ -311,7 +309,7 @@ def _tdm_load_k_only(
     oob_dg1_list: pre-built list of CNT_SU dg1 vectors with OOB tensor_dim1.
                   Computed once per block and reused. None = full tile (no OOB).
     """
-    from flydsl._mlir.dialects import arith as std_arith
+    from flydsl._mlir.dialects import arith as _mlir_arith
     from flydsl.expr.arith import _to_raw
 
     i64 = ir.IntegerType.get_signless(64)
@@ -341,12 +339,10 @@ def _tdm_load_k_only(
 
     # Per-warp LDS offset: wave_id * 8 * K_ROW_BYTES
     wid_i32 = _to_raw(wave_id)
-    lds_warp_off = std_arith.MulIOp(
-        wid_i32,
-        _raw(arith.constant(8 * K_ROW_BYTES, type=T.i32))).result
-    lds_base_with_warp = std_arith.AddIOp(lds_base_i32, lds_warp_off).result
+    lds_warp_off = _mlir_arith.muli(wid_i32, _to_raw(arith.constant(8 * K_ROW_BYTES, type=T.i32)))
+    lds_base_with_warp = _mlir_arith.addi(lds_base_i32, lds_warp_off)
 
-    k_stride_adv = std_arith.ExtSIOp(i64, _to_raw(stride_k_32)).result
+    k_stride_adv = _mlir_arith.extsi(i64, _to_raw(stride_k_32))
 
     _tdm_load_kv_blk(KV_K, k_dg1, k_addr, k_stride_adv,
                       lds_base_with_warp, LDS_K_SU_P_SIZE, CNT_SU)
@@ -367,7 +363,7 @@ def _tdm_load_v_only(
     oob_dg1_list: pre-built list of CNT_SU dg1 vectors with OOB tensor_dim1.
                   None = full tile (no OOB).
     """
-    from flydsl._mlir.dialects import arith as std_arith
+    from flydsl._mlir.dialects import arith as _mlir_arith
     from flydsl.expr.arith import _to_raw
 
     i32 = ir.IntegerType.get_signless(32)
@@ -396,12 +392,10 @@ def _tdm_load_v_only(
                                          stride_v_seq)))
 
     wid_i32 = _to_raw(wave_id)
-    lds_warp_off = std_arith.MulIOp(
-        wid_i32,
-        _raw(arith.constant(8 * V_ROW_BYTES, type=T.i32))).result
-    lds_base_with_warp = std_arith.AddIOp(lds_base_i32, lds_warp_off).result
+    lds_warp_off = _mlir_arith.muli(wid_i32, _to_raw(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
+    lds_base_with_warp = _mlir_arith.addi(lds_base_i32, lds_warp_off)
 
-    v_stride_adv = std_arith.ExtSIOp(i64, _to_raw(stride_v_32)).result
+    v_stride_adv = _mlir_arith.extsi(i64, _to_raw(stride_v_32))
 
     _tdm_load_kv_blk(KV_V, v_dg1, v_addr, v_stride_adv,
                       lds_base_with_warp, LDS_V_SU_P_SIZE, CNT_SU)
@@ -422,8 +416,9 @@ def _manual_load_k_to_lds(
     N_CHUNKS_PER_ROW = QK_HDIM * KV_BPP / 16 (24 for QK_HDIM=192).
     LDS row stride = K_ROW_BYTES (400 for QK_HDIM=192, includes 16B padding).
     """
-    from flydsl._mlir.dialects import arith as std_arith
+    from flydsl._mlir.dialects import arith as _mlir_arith
     from flydsl._mlir.dialects import fly as _fly_d
+    from flydsl.expr.arith import _to_raw
 
     i32 = ir.IntegerType.get_signless(32)
     i64 = ir.IntegerType.get_signless(64)
@@ -434,15 +429,15 @@ def _manual_load_k_to_lds(
     a_raw = ptr_K.__extract_to_ir_values__()[0]
     glb_ptr = _fly_d.extract_aligned_pointer_as_index(glb_ptr_type, a_raw)
     base_i64 = llvm_dialect.ptrtoint(i64, glb_ptr)
-    k_off_i64 = std_arith.ExtSIOp(i64, k_offset_raw).result
-    k_base_i64 = std_arith.AddIOp(base_i64, k_off_i64).result
+    k_off_i64 = _mlir_arith.extsi(i64, k_offset_raw)
+    k_base_i64 = _mlir_arith.addi(base_i64, k_off_i64)
 
-    tid = std_arith.AddIOp(
-        std_arith.MulIOp(
+    tid = _mlir_arith.addi(
+        _mlir_arith.muli(
             _raw(wave_id),
-            _raw(arith.constant(WAVE_SIZE, type=T.i32))).result,
-        _raw(lane_id)).result
-    stride_i64 = std_arith.ExtSIOp(i64, _raw(stride_k_seq)).result
+            _raw(arith.constant(WAVE_SIZE, type=T.i32))),
+        _raw(lane_id))
+    stride_i64 = _mlir_arith.extsi(i64, _raw(stride_k_seq))
     c16 = _raw(arith.constant(16, type=T.i32))
     k_row_c = _raw(arith.constant(K_ROW_BYTES, type=T.i32))
 
@@ -455,28 +450,28 @@ def _manual_load_k_to_lds(
         su_row_c = _raw(arith.constant(su * SU_K_N, type=T.i32))
         su_lds_c = _raw(arith.constant(su * LDS_K_SU_P_SIZE, type=T.i32))
         for j in fx.range_constexpr(N_ITERS):
-            p = std_arith.AddIOp(
-                tid, _raw(arith.constant(j * BLOCK_SIZE, type=T.i32))).result
-            row = std_arith.DivUIOp(p, c_chunks).result
-            chunk = std_arith.RemUIOp(p, c_chunks).result
+            p = _mlir_arith.addi(
+                tid, _raw(arith.constant(j * BLOCK_SIZE, type=T.i32)))
+            row = _mlir_arith.divui(p, c_chunks)
+            chunk = _mlir_arith.remui(p, c_chunks)
 
-            global_row = std_arith.AddIOp(su_row_c, row).result
-            g_row_off = std_arith.MulIOp(
-                std_arith.ExtSIOp(i64, global_row).result, stride_i64).result
-            g_chunk_off = std_arith.ExtSIOp(
-                i64, std_arith.MulIOp(chunk, c16).result).result
-            g_addr = std_arith.AddIOp(
+            global_row = _mlir_arith.addi(su_row_c, row)
+            g_row_off = _mlir_arith.muli(
+                _mlir_arith.extsi(i64, global_row), stride_i64)
+            g_chunk_off = _mlir_arith.extsi(
+                i64, _mlir_arith.muli(chunk, c16))
+            g_addr = _mlir_arith.addi(
                 k_base_i64,
-                std_arith.AddIOp(g_row_off, g_chunk_off).result).result
+                _mlir_arith.addi(g_row_off, g_chunk_off))
             gptr = llvm_dialect.inttoptr(glb_ptr_type, g_addr)
             data = llvm_dialect.load(v4i32_ty, gptr)
 
-            lds_row_off = std_arith.MulIOp(row, k_row_c).result
-            lds_chunk_off = std_arith.MulIOp(chunk, c16).result
-            lds_off = std_arith.AddIOp(
+            lds_row_off = _mlir_arith.muli(row, k_row_c)
+            lds_chunk_off = _mlir_arith.muli(chunk, c16)
+            lds_off = _mlir_arith.addi(
                 su_lds_c,
-                std_arith.AddIOp(lds_row_off, lds_chunk_off).result).result
-            lds_addr = std_arith.AddIOp(lds_base_i32, lds_off).result
+                _mlir_arith.addi(lds_row_off, lds_chunk_off))
+            lds_addr = _mlir_arith.addi(lds_base_i32, lds_off)
             lptr = llvm_dialect.inttoptr(lds_ptr_type, lds_addr)
             llvm_dialect.store(data, lptr)
 
@@ -493,8 +488,9 @@ def _manual_load_v_to_lds(
 
     Same as K but with V_ROW_BYTES (288) row stride and LDS_V_SU_P_SIZE.
     """
-    from flydsl._mlir.dialects import arith as std_arith
+    from flydsl._mlir.dialects import arith as _mlir_arith
     from flydsl._mlir.dialects import fly as _fly_d
+    from flydsl.expr.arith import _to_raw
 
     i32 = ir.IntegerType.get_signless(32)
     i64 = ir.IntegerType.get_signless(64)
@@ -505,15 +501,15 @@ def _manual_load_v_to_lds(
     a_raw = ptr_V.__extract_to_ir_values__()[0]
     glb_ptr = _fly_d.extract_aligned_pointer_as_index(glb_ptr_type, a_raw)
     base_i64 = llvm_dialect.ptrtoint(i64, glb_ptr)
-    v_off_i64 = std_arith.ExtSIOp(i64, v_offset_raw).result
-    v_base_i64 = std_arith.AddIOp(base_i64, v_off_i64).result
+    v_off_i64 = _mlir_arith.extsi(i64, v_offset_raw)
+    v_base_i64 = _mlir_arith.addi(base_i64, v_off_i64)
 
-    tid = std_arith.AddIOp(
-        std_arith.MulIOp(
+    tid = _mlir_arith.addi(
+        _mlir_arith.muli(
             _raw(wave_id),
-            _raw(arith.constant(WAVE_SIZE, type=T.i32))).result,
-        _raw(lane_id)).result
-    stride_i64 = std_arith.ExtSIOp(i64, _raw(stride_v_seq)).result
+            _raw(arith.constant(WAVE_SIZE, type=T.i32))),
+        _raw(lane_id))
+    stride_i64 = _mlir_arith.extsi(i64, _raw(stride_v_seq))
     c16 = _raw(arith.constant(16, type=T.i32))
     c4_shift = _raw(arith.constant(4, type=T.i32))
     c15_mask = _raw(arith.constant(15, type=T.i32))
@@ -523,28 +519,28 @@ def _manual_load_v_to_lds(
         su_row_c = _raw(arith.constant(su * SU_K_N, type=T.i32))
         su_lds_c = _raw(arith.constant(su * LDS_V_SU_P_SIZE, type=T.i32))
         for j in fx.range_constexpr(4):
-            p = std_arith.AddIOp(
-                tid, _raw(arith.constant(j * BLOCK_SIZE, type=T.i32))).result
-            row = std_arith.ShRUIOp(p, c4_shift).result
-            chunk = std_arith.AndIOp(p, c15_mask).result
+            p = _mlir_arith.addi(
+                tid, _raw(arith.constant(j * BLOCK_SIZE, type=T.i32)))
+            row = _mlir_arith.shrui(p, c4_shift)
+            chunk = _mlir_arith.andi(p, c15_mask)
 
-            global_row = std_arith.AddIOp(su_row_c, row).result
-            g_row_off = std_arith.MulIOp(
-                std_arith.ExtSIOp(i64, global_row).result, stride_i64).result
-            g_chunk_off = std_arith.ExtSIOp(
-                i64, std_arith.MulIOp(chunk, c16).result).result
-            g_addr = std_arith.AddIOp(
+            global_row = _mlir_arith.addi(su_row_c, row)
+            g_row_off = _mlir_arith.muli(
+                _mlir_arith.extsi(i64, global_row), stride_i64)
+            g_chunk_off = _mlir_arith.extsi(
+                i64, _mlir_arith.muli(chunk, c16))
+            g_addr = _mlir_arith.addi(
                 v_base_i64,
-                std_arith.AddIOp(g_row_off, g_chunk_off).result).result
+                _mlir_arith.addi(g_row_off, g_chunk_off))
             gptr = llvm_dialect.inttoptr(glb_ptr_type, g_addr)
             data = llvm_dialect.load(v4i32_ty, gptr)
 
-            lds_row_off = std_arith.MulIOp(row, v_row_c).result
-            lds_chunk_off = std_arith.MulIOp(chunk, c16).result
-            lds_off = std_arith.AddIOp(
+            lds_row_off = _mlir_arith.muli(row, v_row_c)
+            lds_chunk_off = _mlir_arith.muli(chunk, c16)
+            lds_off = _mlir_arith.addi(
                 su_lds_c,
-                std_arith.AddIOp(lds_row_off, lds_chunk_off).result).result
-            lds_addr = std_arith.AddIOp(lds_base_i32, lds_off).result
+                _mlir_arith.addi(lds_row_off, lds_chunk_off))
+            lds_addr = _mlir_arith.addi(lds_base_i32, lds_off)
             lptr = llvm_dialect.inttoptr(lds_ptr_type, lds_addr)
             llvm_dialect.store(data, lptr)
 
@@ -567,7 +563,7 @@ def _tdm_prime_full_tile(
     Blocking — waits for all TDM to complete before returning.
     k_lds_base_i32/v_lds_base_i32: i32 LDS base addresses from SmemAllocator.
     """
-    from flydsl._mlir.dialects import arith as std_arith
+    from flydsl._mlir.dialects import arith as _mlir_arith
     from flydsl.expr.arith import _to_raw
 
     i64 = ir.IntegerType.get_signless(64)
@@ -578,8 +574,8 @@ def _tdm_prime_full_tile(
     k_addr = _compute_k_global_addr(ptr_K, k_offset, wave_id, stride_k_32)
     v_addr = _compute_v_global_addr(ptr_V, v_offset, wave_id, stride_v_32)
 
-    k_stride_adv = std_arith.ExtSIOp(i64, _to_raw(stride_k_32)).result
-    v_stride_adv = std_arith.ExtSIOp(i64, _to_raw(stride_v_32)).result
+    k_stride_adv = _mlir_arith.extsi(i64, _to_raw(stride_k_32))
+    v_stride_adv = _mlir_arith.extsi(i64, _to_raw(stride_v_32))
 
     # K: 4 SUs (tile_n=128)
     _tdm_load_kv_blk(KV_K, k_dg1, k_addr, k_stride_adv,
@@ -747,20 +743,20 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             _raw_t = ptr_tensor.__extract_to_ir_values__()[0]
             _base_ptr = _fly_cu.extract_aligned_pointer_as_index(_glb_ptr_ty, _raw_t)
             _base_i64 = llvm_dialect.ptrtoint(_i64_ty, _base_ptr)
-            _byte_off = _mlir_arith.MulIOp(idx_i32, _to_raw(arith.constant(4, type=T.i32))).result
-            _byte_off_64 = _mlir_arith.ExtSIOp(_i64_ty, _byte_off).result
-            _addr_i64 = _mlir_arith.AddIOp(_base_i64, _byte_off_64).result
+            _byte_off = _mlir_arith.muli(idx_i32, _to_raw(arith.constant(4, type=T.i32)))
+            _byte_off_64 = _mlir_arith.extsi(_i64_ty, _byte_off)
+            _addr_i64 = _mlir_arith.addi(_base_i64, _byte_off_64)
             _addr_ptr = llvm_dialect.inttoptr(_glb_ptr_ty, _addr_i64)
             return llvm_dialect.load(_i32_ty, _addr_ptr)
-    
+
         _bz_raw = _to_raw(bz)
-        _bz1_raw = _mlir_arith.AddIOp(_bz_raw, _to_raw(arith.constant(1, type=T.i32))).result
+        _bz1_raw = _mlir_arith.addi(_bz_raw, _to_raw(arith.constant(1, type=T.i32)))
         q_start_tok = _load_cu_seqlen(ptr_cu_seqlens_q, _bz_raw)
         q_end_tok = _load_cu_seqlen(ptr_cu_seqlens_q, _bz1_raw)
         k_start_tok = _load_cu_seqlen(ptr_cu_seqlens_k, _bz_raw)
         k_end_tok = _load_cu_seqlen(ptr_cu_seqlens_k, _bz1_raw)
-        actual_q_len = _mlir_arith.SubIOp(q_end_tok, q_start_tok).result
-        actual_kv_len = _mlir_arith.SubIOp(k_end_tok, k_start_tok).result
+        actual_q_len = _mlir_arith.subi(q_end_tok, q_start_tok)
+        actual_kv_len = _mlir_arith.subi(k_end_tok, k_start_tok)
 
         # ================================================================
         # Pre-compute per-block OOB dg1 lists — constant for this workgroup.
@@ -783,9 +779,9 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             _make_kv_dg1_with_oob(
                 _K_CFG_OOB, 200, 8, _stride_k_elems_oob,
                 _per_warp_oob_dim1(
-                    _mlir_arith.SubIOp(
+                    _mlir_arith.subi(
                         actual_kv_len,
-                        _to_raw(arith.constant(_su * 32, type=T.i32))).result,
+                        _to_raw(arith.constant(_su * 32, type=T.i32))),
                     wave_id, 8))
             for _su in range(CNT_SU)
         ]
@@ -794,27 +790,27 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             _make_kv_dg1_with_oob(
                 _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
                 _per_warp_oob_dim1(
-                    _mlir_arith.SubIOp(
+                    _mlir_arith.subi(
                         actual_kv_len,
-                        _to_raw(arith.constant(_su * 32, type=T.i32))).result,
+                        _to_raw(arith.constant(_su * 32, type=T.i32))),
                     wave_id, 8))
             for _su in range(CNT_SU)
         ]
         # per-SU K OOB dg1 for tile 1 prefetch: kv_remain = actual_kv_len - TILE_N
-        _kv_remain_t1_raw = _mlir_arith.SubIOp(
-            actual_kv_len, _to_raw(arith.constant(TILE_N, type=T.i32))).result
+        _kv_remain_t1_raw = _mlir_arith.subi(
+            actual_kv_len, _to_raw(arith.constant(TILE_N, type=T.i32)))
         _k_tile1_oob_dg1 = [
             _make_kv_dg1_with_oob(
                 _K_CFG_OOB, 200, 8, _stride_k_elems_oob,
                 _per_warp_oob_dim1(
-                    _mlir_arith.SubIOp(
+                    _mlir_arith.subi(
                         _kv_remain_t1_raw,
-                        _to_raw(arith.constant(_su * 32, type=T.i32))).result,
+                        _to_raw(arith.constant(_su * 32, type=T.i32))),
                     wave_id, 8))
             for _su in range(CNT_SU)
         ]
         # O store OOB: per-warp dim1 based on remaining Q rows for this WG
-        _q_remain_o = _mlir_arith.SubIOp(actual_q_len, m_start_raw).result
+        _q_remain_o = _mlir_arith.subi(actual_q_len, m_start_raw)
         _o_oob_dim1 = _per_warp_oob_dim1(_q_remain_o, wave_id, 32)
 
         # Head index (for GQA)
@@ -826,18 +822,18 @@ def compile_fmha_fwd(*, is_causal: bool = False):
         # Q offset = (q_start_tok + bx*128) * stride_q_seq + head * QK_HDIM * BPP
         _HEAD_BYTES_QK = QK_HDIM * KV_BPP    # compile-time
         _HEAD_BYTES_V = V_HDIM * KV_BPP
-        _q_tok_off = _mlir_arith.AddIOp(
-            q_start_tok, _to_raw(arith.muli(bx, arith.constant(128, type=T.i32)))).result
-        q_offset = _mlir_arith.AddIOp(
-            _mlir_arith.MulIOp(_q_tok_off, stride_q_seq).result,
-            _mlir_arith.MulIOp(_to_raw(by), _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))).result).result
-    
+        _q_tok_off = _mlir_arith.addi(
+            q_start_tok, _to_raw(arith.muli(bx, arith.constant(128, type=T.i32))))
+        q_offset = _mlir_arith.addi(
+            _mlir_arith.muli(_q_tok_off, stride_q_seq),
+            _mlir_arith.muli(_to_raw(by), _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))))
+
         # Q buffer resource with OOB
-        _q_end_byte = _mlir_arith.AddIOp(
-            _mlir_arith.MulIOp(q_end_tok, stride_q_seq).result,
-            _mlir_arith.MulIOp(_to_raw(by), _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))).result).result
-        _q_num_bytes = _mlir_arith.AddIOp(
-            _q_end_byte, _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))).result
+        _q_end_byte = _mlir_arith.addi(
+            _mlir_arith.muli(q_end_tok, stride_q_seq),
+            _mlir_arith.muli(_to_raw(by), _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))))
+        _q_num_bytes = _mlir_arith.addi(
+            _q_end_byte, _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32)))
         q_rsrc = buffer_ops.create_buffer_resource(
             ptr_Q, num_records_bytes=_q_num_bytes)
     
@@ -853,14 +849,14 @@ def compile_fmha_fwd(*, is_causal: bool = False):
         q_frags[2] = q_frags_raw[2] + q_frags_raw[3] + [None] * (Q_WMMA_PER_MSB - 2 * _frags_per_bank)
     
         # K offset = k_start_tok * stride_k_seq + head_index * D_qk * BPP
-        k_offset = _mlir_arith.AddIOp(
-            _mlir_arith.MulIOp(k_start_tok, stride_k_seq).result,
-            _mlir_arith.MulIOp(_to_raw(head_index), _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))).result).result
-    
+        k_offset = _mlir_arith.addi(
+            _mlir_arith.muli(k_start_tok, stride_k_seq),
+            _mlir_arith.muli(_to_raw(head_index), _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))))
+
         # V offset = k_start_tok * stride_v_seq + head_index * D_v * BPP
-        v_offset = _mlir_arith.AddIOp(
-            _mlir_arith.MulIOp(k_start_tok, stride_v_seq).result,
-            _mlir_arith.MulIOp(_to_raw(head_index), _to_raw(arith.constant(_HEAD_BYTES_V, type=T.i32))).result).result
+        v_offset = _mlir_arith.addi(
+            _mlir_arith.muli(k_start_tok, stride_v_seq),
+            _mlir_arith.muli(_to_raw(head_index), _to_raw(arith.constant(_HEAD_BYTES_V, type=T.i32))))
     
         # SmemAllocator bases → i32 LDS addresses
         k_a_base_i32 = _extract_lds_base_i32(_lds_alloc_k_a.get_base())
@@ -875,10 +871,10 @@ def compile_fmha_fwd(*, is_causal: bool = False):
         kv_lds_addrs_a = _build_kv_lds_addrs(lane_id, k_a_base_i32, v_a_base_i32)
         kv_lds_addrs_b = _build_kv_lds_addrs(lane_id, k_b_base_i32, v_b_base_i32)
     
-        stride_k_32 = _mlir_arith.MulIOp(
-            _to_raw(arith.constant(32, type=T.i32)), stride_k_seq).result
-        stride_v_32 = _mlir_arith.MulIOp(
-            _to_raw(arith.constant(32, type=T.i32)), stride_v_seq).result
+        stride_k_32 = _mlir_arith.muli(
+            _to_raw(arith.constant(32, type=T.i32)), stride_k_seq)
+        stride_v_32 = _mlir_arith.muli(
+            _to_raw(arith.constant(32, type=T.i32)), stride_v_seq)
     
         # SGPR state: softmax scale
         log2e_val = _mlir_arith.constant(ir.F32Type.get(), 1.4426950408889634)
@@ -1096,9 +1092,9 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             num_tiles = _mlir_arith.addi(
                 _to_raw(bx), _to_raw(arith.constant(1, type=T.i32)))
         else:
-            _kv_plus = _mlir_arith.AddIOp(
+            _kv_plus = _mlir_arith.addi(
                 actual_kv_len,
-                _to_raw(arith.constant(TILE_N - 1, type=T.i32))).result
+                _to_raw(arith.constant(TILE_N - 1, type=T.i32)))
             num_tiles = _mlir_arith.divui(_kv_plus, tile_n_const)
         num_tiles_idx = arith.index_cast(T.index, num_tiles)
         # Loop runs N-2 iterations (tiles 1..N-2); endtile handled in epilogue.
@@ -1277,13 +1273,12 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                     ptr_K, tdm_k_offset, wave_id,
                     _to_raw(arith.muli(
                         arith.constant(8, type=T.i32), stride_k_seq)))
-                k_stride_adv = _mlir_arith.ExtSIOp(
-                    i64, _to_raw(stride_k_32)).result
+                k_stride_adv = _mlir_arith.extsi(i64, _to_raw(stride_k_32))
                 _wid_k = _to_raw(wave_id)
-                _k_warp_off = _mlir_arith.MulIOp(
+                _k_warp_off = _mlir_arith.muli(
                     _wid_k,
-                    _raw(arith.constant(8 * K_ROW_BYTES, type=T.i32))).result
-                _k_lds_base = _mlir_arith.AddIOp(tdm_k_target, _k_warp_off).result
+                    _to_raw(arith.constant(8 * K_ROW_BYTES, type=T.i32)))
+                _k_lds_base = _mlir_arith.addi(tdm_k_target, _k_warp_off)
                 k_descs = _build_tdm_descs(
                     k_dg1, k_addr, k_stride_adv,
                     _k_lds_base, LDS_K_SU_P_SIZE, CNT_SU)
@@ -1311,19 +1306,18 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                     ptr_V, tdm_v_offset, wave_id,
                     _to_raw(arith.muli(
                         arith.constant(8, type=T.i32), stride_v_seq)))
-                v_stride_adv = _mlir_arith.ExtSIOp(
-                    i64, _to_raw(stride_v_32)).result
+                v_stride_adv = _mlir_arith.extsi(i64, _to_raw(stride_v_32))
                 _wid_v = _to_raw(wave_id)
-                _v_warp_off = _mlir_arith.MulIOp(
+                _v_warp_off = _mlir_arith.muli(
                     _wid_v,
-                    _raw(arith.constant(8 * V_ROW_BYTES, type=T.i32))).result
-                _v_lds_base = _mlir_arith.AddIOp(tdm_v_target, _v_warp_off).result
+                    _to_raw(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
+                _v_lds_base = _mlir_arith.addi(tdm_v_target, _v_warp_off)
                 v_descs = _build_tdm_descs(
                     v_dg1, v_addr, v_stride_adv,
                     _v_lds_base, LDS_V_SU_P_SIZE, CNT_SU)
                 tdm_state['v_descs'] = v_descs
                 tdm_state['v_desc_idx'] = 0
-    
+
             _g1_tdm_type = (KV_K if has_tdm_k_g1 else KV_V if has_tdm_v_g1 else KV_NONE)
             stage_configs = [
                 (0, _g1_tdm_type, KV_K, blk, 1),
@@ -1500,19 +1494,18 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                     ptr_V, tdm_v_offset, wave_id,
                     _to_raw(arith.muli(
                         arith.constant(8, type=T.i32), stride_v_seq)))
-                v_stride_adv = _mlir_arith.ExtSIOp(
-                    i64, _to_raw(stride_v_32)).result
+                v_stride_adv = _mlir_arith.extsi(i64, _to_raw(stride_v_32))
                 _wid_v = _to_raw(wave_id)
-                _v_warp_off = _mlir_arith.MulIOp(
+                _v_warp_off = _mlir_arith.muli(
                     _wid_v,
-                    _raw(arith.constant(8 * V_ROW_BYTES, type=T.i32))).result
-                _v_lds_base = _mlir_arith.AddIOp(tdm_v_target, _v_warp_off).result
+                    _to_raw(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
+                _v_lds_base = _mlir_arith.addi(tdm_v_target, _v_warp_off)
                 v_descs = _build_tdm_descs(
                     v_dg1, v_addr, v_stride_adv,
                     _v_lds_base, LDS_V_SU_P_SIZE, CNT_SU)
                 tdm_state['v_descs'] = v_descs
                 tdm_state['v_desc_idx'] = 0
-    
+
             # stage tuple: (gemm_su, lds_type, lds_blk, lds_su, tdm_type, tdm_barrier)
             g2_stage_configs = [
                 (0, KV_V, blk, 1, KV_V if has_tdm_v_g2 else KV_NONE, False),
@@ -1948,16 +1941,15 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             p_tiles = _build_p_tiles_from_softmax(ty, sfx)
     
             # O rescale
-            from flydsl._mlir.dialects import arith as _fin_a
             _vf8 = ir.VectorType.get([8], ir.F32Type.get())
             for _msb in fx.range_constexpr(NUM_MSB):
                 _ed = exp_delta_rescale[_msb]
                 _edv8 = llvm_dialect.mlir_undef(_vf8)
                 for _i in fx.range_constexpr(8):
                     _edv8 = llvm_dialect.insertelement(
-                        _edv8, _ed, _raw(arith.constant(_i, type=T.i32)))
+                        _edv8, _ed, _to_raw(arith.constant(_i, type=T.i32)))
                 for _n in fx.range_constexpr(N_PV_WMMA_N):
-                    o_tiles[_msb][_n] = _fin_a.mulf(o_tiles[_msb][_n], _edv8)
+                    o_tiles[_msb][_n] = _mlir_arith.mulf(o_tiles[_msb][_n], _edv8)
     
             # PV_pure
             _kv_pv = _build_kv_lds_addrs(lane_id, ep_k_cur_base, v_base_for_pv)
@@ -1994,22 +1986,22 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                 _sf = _mlir_arith.addf(_sm, _pm)
                 _rsf[_mb] = _sf
                 _rsf[_mb + 1] = _sf
-            _l2e = _mlir_arith.constant(ir.F32Type.get(), 0.6931471805599453)
+            _l2e = _to_raw(arith.constant(0.6931471805599453, type=T.f32))
             for _msb in fx.range_constexpr(NUM_MSB):
                 _mxs = _mlir_arith.mulf(_lmf[_msb], scalar_f)
                 _lgs = _rocdl.log(ty['f32'], _rsf[_msb])
                 _mlir_arith.addf(_mlir_arith.mulf(_lgs, _l2e), _mxs)  # LSE (not stored)
-            from flydsl._mlir.dialects import arith as _fin_a2
             _obf16 = []
             for _msb in fx.range_constexpr(NUM_MSB):
                 _rcp = _rocdl.rcp(ty['f32'], _rsf[_msb])
                 _rv8 = llvm_dialect.mlir_undef(_v8f32)
                 for _i in fx.range_constexpr(8):
                     _rv8 = llvm_dialect.insertelement(
-                        _rv8, _rcp, _raw(arith.constant(_i, type=T.i32)))
+                        _rv8, _rcp, _to_raw(arith.constant(_i, type=T.i32)))
                 _mb16 = []
                 for _n in fx.range_constexpr(N_PV_WMMA_N):
-                    _mb16.append(_fin_a2.truncf(_v8bf16, _fin_a2.mulf(o_tiles[_msb][_n], _rv8)))
+                    _mb16.append(_mlir_arith.truncf(
+                        _v8bf16, _mlir_arith.mulf(o_tiles[_msb][_n], _rv8)))
                 _obf16.append(_mb16)
     
             # Barrier: ensure all waves finish PV before any wave writes D to V_a LDS.
@@ -2018,70 +2010,60 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             rocdl.s_barrier_wait(-1)
     
             # 4e: TDM store D (VGPR -> LDS -> Global)
-            from flydsl._mlir.dialects import arith as _sa
             _i32t = ir.IntegerType.get_signless(32)
             _ldst = ir.Type.parse("!llvm.ptr<3>")
             _v4i32t = ir.VectorType.get([4], _i32t)
             _db32 = _extract_lds_base_i32(_lds_alloc_v_a.get_base())
-            _dw = _sa.AddIOp(_db32,
-                _sa.MulIOp(_to_raw(wave_id),
-                    _raw(arith.constant(LDS_D_WV_SIZE, type=T.i32))).result).result
-            _llo = _raw(arith.andi(lane_id, arith.constant(15, type=T.i32)))
-            _lhi = _raw(arith.shrui(lane_id, arith.constant(4, type=T.i32)))
-            _loff = _sa.AddIOp(
-                _sa.MulIOp(_llo, _raw(arith.constant(TDM_D_TILE_DIM0, type=T.i32))).result,
-                _sa.MulIOp(_lhi, _raw(arith.constant(16, type=T.i32))).result).result
+            _dw = _mlir_arith.addi(_db32,
+                _to_raw(arith.muli(wave_id, arith.constant(LDS_D_WV_SIZE, type=T.i32))))
+            _llo = _to_raw(arith.andi(lane_id, arith.constant(15, type=T.i32)))
+            _lhi = _to_raw(arith.shrui(lane_id, arith.constant(4, type=T.i32)))
+            _loff = _mlir_arith.addi(
+                _mlir_arith.muli(_llo, _to_raw(arith.constant(TDM_D_TILE_DIM0, type=T.i32))),
+                _mlir_arith.muli(_lhi, _to_raw(arith.constant(16, type=T.i32))))
             for _msb in fx.range_constexpr(NUM_MSB):
                 for _n in fx.range_constexpr(N_PV_WMMA_N):
                     _ioff = ((_msb // 2) * 16 * TDM_D_TILE_DIM0 + (_msb % 2) * 128 + _n * 32)
-                    _la = _sa.AddIOp(
-                        _sa.AddIOp(_dw, _loff).result,
-                        _raw(arith.constant(_ioff, type=T.i32))).result
+                    _la = _mlir_arith.addi(
+                        _mlir_arith.addi(_dw, _loff),
+                        _to_raw(arith.constant(_ioff, type=T.i32)))
                     llvm_dialect.store(
                         vector.bitcast(_v4i32t, _obf16[_msb][_n]),
                         llvm_dialect.inttoptr(_ldst, _la), volatile_=True)
             _asm_void("s_wait_dscnt 0x0")
             _wsgpr = rocdl.wave_id()
             _D = 128
-            _LOG2_D = 7
-            from flydsl._mlir.dialects import arith as _sa2
             from flydsl._mlir.dialects import fly as _fly2
             from flydsl._mlir.dialects import llvm as _llvm2
             _i64t = ir.IntegerType.get_signless(64)
             _glbpt = ir.Type.parse("!llvm.ptr<1>")
             # THD: O token = q_start_tok + bx*128 + wave*32
-            _o_tok = _sa2.AddIOp(
-                _sa2.AddIOp(q_start_tok,
-                    _sa2.MulIOp(bx, _raw(arith.constant(128, type=T.i32))).result).result,
-                _sa2.MulIOp(_wsgpr, _raw(arith.constant(WV_SUBQD, type=T.i32))).result).result
+            _bx128 = _to_raw(arith.muli(bx, arith.constant(128, type=T.i32)))
+            _wv32 = _to_raw(arith.muli(_wsgpr, arith.constant(WV_SUBQD, type=T.i32)))
+            _o_tok = _mlir_arith.addi(_mlir_arith.addi(q_start_tok, _bx128), _wv32)
             # Element offset = tok * stride_o_seq + head * D_v
-            _o_elem_off = _sa2.AddIOp(
-                _sa2.MulIOp(_o_tok, stride_o_seq).result,
-                _sa2.MulIOp(_to_raw(by), _raw(arith.constant(_D, type=T.i32))).result).result
+            _by_d = _to_raw(arith.muli(by, arith.constant(_D, type=T.i32)))
+            _o_elem_off = _mlir_arith.addi(
+                _mlir_arith.muli(_o_tok, stride_o_seq), _by_d)
             _o_raw = ptr_O.__extract_to_ir_values__()[0]
             _o_gp = _fly2.extract_aligned_pointer_as_index(_glbpt, _o_raw)
             _o64 = _llvm2.ptrtoint(_i64t, _o_gp)
-            _boff32 = _sa2.MulIOp(_o_elem_off, _raw(arith.constant(2, type=T.i32))).result
-            _boff64 = _sa2.ExtSIOp(_i64t, _boff32).result
-            _oadr64 = _sa2.AddIOp(_o64, _boff64).result
+            _boff32 = _mlir_arith.muli(_o_elem_off, _to_raw(arith.constant(2, type=T.i32)))
+            _boff64 = _mlir_arith.extsi(_i64t, _boff32)
+            _oadr64 = _mlir_arith.addi(_o64, _boff64)
             _alo, _ahi = _split_i64_to_lo_hi(_oadr64)
-            _olds2 = _sa2.AddIOp(
+            _olds2 = _mlir_arith.addi(
                 _extract_lds_base_i32(_lds_alloc_v_a.get_base()),
-                _sa2.MulIOp(_wsgpr, _raw(arith.constant(LDS_D_WV_SIZE, type=T.i32))).result).result
+                _to_raw(arith.muli(_wsgpr, arith.constant(LDS_D_WV_SIZE, type=T.i32))))
             _dg0 = vector.from_elements(T.vec(4, T.i32),
                 [_raw(arith.constant(1, type=T.i32)), _olds2, _alo, _ahi])
             _g0 = _raw(arith.constant((1 << 16) | 0, type=T.i32))
             _g1 = _raw(arith.constant((128 & 0xFFFF) << 16, type=T.i32))
             # tensor_dim1 OOB: _o_oob_dim1 = clamp(actual_q_len-m_start-wave*32, 0, 32)
-            # Use function-style _da.* ops (same as _make_kv_dg1_with_oob) to ensure emission.
-            from flydsl._mlir.dialects import arith as _da_o
-            _i32_o = ir.IntegerType.get_signless(32)
-            _td1_lo_o = _da_o.andi(_o_oob_dim1,
-                _da_o.constant(_i32_o, value=ir.IntegerAttr.get(_i32_o, 0xFFFF)))
-            _g2 = _da_o.ori(
-                _da_o.shli(_td1_lo_o,
-                    _da_o.constant(_i32_o, value=ir.IntegerAttr.get(_i32_o, 16))),
-                _da_o.constant(_i32_o, value=ir.IntegerAttr.get(_i32_o, (128>>16)&0xFFFF)))
+            _td1_lo_o = _mlir_arith.andi(_o_oob_dim1, _to_raw(arith.constant(0xFFFF, type=T.i32)))
+            _g2 = _mlir_arith.ori(
+                _mlir_arith.shli(_td1_lo_o, _to_raw(arith.constant(16, type=T.i32))),
+                _to_raw(arith.constant((128>>16)&0xFFFF, type=T.i32)))
             _g3 = _raw(arith.constant(((32>>16)&0xFFFF)|((128&0xFFFF)<<16), type=T.i32))
             _g4 = _raw(arith.constant(32 & 0xFFFF, type=T.i32))  # tile_dim1 stays 32
             _g5 = stride_o_seq  # THD: elements per token row
@@ -2092,12 +2074,8 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             tdm_ops.tensor_wait(0)
     
         # ---- 4c'': endtile dispatch — if N>=2: core_loop + ep_finish, else: ep_finish ----
-        from flydsl._mlir.dialects import arith as _ep_cmp_a
-        _two_ep = _ep_cmp_a.ConstantOp(
-            ir.IntegerType.get_signless(32),
-            ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 2)).result
-        _is_multi = _ep_cmp_a.CmpIOp(
-            _ep_cmp_a.CmpIPredicate.uge, num_tiles, _two_ep).result
+        _two_ep = _to_raw(arith.constant(2, type=T.i32))
+        _is_multi = _mlir_arith.cmpi(_mlir_arith.CmpIPredicate.uge, num_tiles, _two_ep)
     
         if _is_multi:  # N>=2: endtile core_loop then ep_finish
             # All variables defined fresh inside THEN — not state variables.
@@ -2146,20 +2124,20 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                                arith.constant(1, type=T.i32)),
                     arith.constant(TILE_N, type=T.i32))
             # Pre-build endtile V OOB dg1: actual_kv_len - (num_tiles-1)*TILE_N
-            _et_kv_remain = _mlir_arith.SubIOp(
+            _et_kv_remain = _mlir_arith.subi(
                 actual_kv_len,
-                _mlir_arith.MulIOp(
-                    _mlir_arith.SubIOp(num_tiles, _to_raw(arith.constant(1, type=T.i32))).result,
-                    tile_n_const).result).result
+                _mlir_arith.muli(
+                    _mlir_arith.subi(num_tiles, _to_raw(arith.constant(1, type=T.i32))),
+                    tile_n_const))
             _stride_v_elems_et = _to_raw(arith.shrui(
                 stride_v_seq, arith.constant(1, type=T.i32)))
             _et_v_oob_dg1 = [
                 _make_kv_dg1_with_oob(
                     (1 << 16) | _V_TDM_CONFIG, 128, 8, _stride_v_elems_et,
                     _per_warp_oob_dim1(
-                        _mlir_arith.SubIOp(
+                        _mlir_arith.subi(
                             _et_kv_remain,
-                            _to_raw(arith.constant(_su * 32, type=T.i32))).result,
+                            _to_raw(arith.constant(_su * 32, type=T.i32))),
                         wave_id, 8))
                 for _su in range(CNT_SU)
             ]

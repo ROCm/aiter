@@ -27,6 +27,7 @@ _EXP_BASE = 19  # token base for EXP_Mx (19..22 → MSB 0..3, draws from pair_ex
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import arith as _mlir_arith
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import vector as vector_dialect
@@ -488,8 +489,7 @@ def _atom_exp_f32(src, bank):
 def _atom_mul_f32(src0, src1, bank):
 
     _sched_barrier(0)
-    from flydsl._mlir.dialects import arith as arith_dialect
-    result = arith_dialect.mulf(src0, src1)
+    result = arith.mulf(src0, src1)
     banked = set_vgpr_bank(result, bank)
     _sched_barrier(0)
 
@@ -530,8 +530,7 @@ def _atom_mov_b32(src, bank):
 def _atom_add_f32(src0, src1, bank):
 
     _sched_barrier(0)
-    from flydsl._mlir.dialects import arith as arith_dialect
-    r = arith_dialect.addf(src0, src1)
+    r = arith.addf(src0, src1)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
 
@@ -594,8 +593,7 @@ def _atom_pk_add_f32(a, b, bank):
 
     """v_pk_add_f32 via arith.addf on v2f32."""
     _sched_barrier(0)
-    from flydsl._mlir.dialects import arith as arith_dialect
-    r = arith_dialect.addf(a, b)
+    r = arith.addf(a, b)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
 
@@ -606,8 +604,7 @@ def _atom_pk_mul_f32(a, b, bank):
 
     """v_pk_mul_f32 via arith.mulf on v2f32."""
     _sched_barrier(0)
-    from flydsl._mlir.dialects import arith as arith_dialect
-    r = arith_dialect.mulf(a, b)
+    r = arith.mulf(a, b)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
 
@@ -618,9 +615,7 @@ def _atom_cvt_pk_bf16_f32(a, bank):
 
     """v_cvt_pk_bf16_f32 via arith.truncf v2f32 → v2bf16."""
     _sched_barrier(0)
-    from flydsl._mlir.dialects import arith as arith_dialect
-    v2bf16_ty = ir.VectorType.get([2], ir.BF16Type.get())
-    r = arith_dialect.truncf(v2bf16_ty, a)
+    r = arith.trunc_f(T.vec(2, T.bf16), a)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
 
@@ -1674,8 +1669,7 @@ def _cl_su_v3_stage_gemm2(
         _ed_v8 = _o_rescale_ed_v8[d_msb]
         if _ed_v8 is None:
             return
-        from flydsl._mlir.dialects import arith as _o_arith
-        o_tiles[d_msb][n] = _o_arith.mulf(o_tiles[d_msb][n], _ed_v8)
+        o_tiles[d_msb][n] = arith.mulf(o_tiles[d_msb][n], _ed_v8)
 
     if const_expr(stage == 0):
         _sched_barrier(0)
