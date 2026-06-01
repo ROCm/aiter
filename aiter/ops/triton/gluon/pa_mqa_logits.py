@@ -78,6 +78,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 1,
     CDNA_VERSION: gl.constexpr = 3,
+    IS_GFX1250: gl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_block_q_head = tl.cdiv(heads_num, ChunkQ)
@@ -102,7 +103,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     residual_context = (ChunkK - split_context_length % ChunkK) % ChunkK
 
     NumWarps: gl.constexpr = 4
-    ThreadsPerWarp: gl.constexpr = 64
+    ThreadsPerWarp: gl.constexpr = 32 if IS_GFX1250 else 64
 
     # ===---------------------------------------------------
     # Gluon Layout
@@ -127,7 +128,27 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         order=[1, 0],
     )
 
-    if _Use_2d_instr_shape_mfma_layout:
+    if IS_GFX1250:
+        # gfx1250 (RDNA/WMMA, wave32): 16x16xK fp8 tile. Pick K=128 when the
+        # hidden dim is large enough; fall back to 64 to keep the K-tile within
+        # HiddenDim. warp_bases distributes NumWarps across the N (=ChunkK) axis;
+        # M (=ChunkQ) is shared (warp axis stride 0).
+        FP8_K_DIM: gl.constexpr = 128 if HiddenDim > 64 else 64
+        if NumWarps == 1:
+            warp_bases: gl.constexpr = []
+        elif NumWarps == 2:
+            warp_bases: gl.constexpr = [[0, 1]]
+        elif NumWarps == 4:
+            warp_bases: gl.constexpr = [[0, 1], [0, 2]]
+        else:
+            warp_bases: gl.constexpr = [[0, 1], [0, 2], [0, 4]]
+        mfma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+            version=3,
+            transposed=False,
+            instr_shape=[16, 16, FP8_K_DIM],
+            warp_bases=warp_bases,
+        )
+    elif _Use_2d_instr_shape_mfma_layout:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
             version=CDNA_VERSION,
             instr_shape=[16, 16],
@@ -246,7 +267,10 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         #!=----------------------------
         mfma_k = gl.convert_layout(k.T, mfma_layout_b)
 
-        o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
+        if IS_GFX1250:
+            o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero)
+        else:
+            o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
         o = o * k_scale_f[None, :]
 
         #!=----------------------------
@@ -292,7 +316,10 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     k_scale_f = k_scale_f_next
 
     mfma_k = gl.convert_layout(k.T, mfma_layout_b)
-    o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
+    if IS_GFX1250:
+        o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero)
+    else:
+        o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
 
     o = o * k_scale_f[None, :]
     o = gl.maximum(o, 0.0)

@@ -253,10 +253,22 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     VarCtxOpt: bool = False,
 ):
     gfx_version = get_gfx()
-    assert gfx_version == "gfx942" or gfx_version == "gfx950"
+    assert gfx_version in ("gfx942", "gfx950", "gfx1250")
+    is_gfx1250 = gfx_version == "gfx1250"
+    if is_gfx1250:
+        assert not Preshuffle, (
+            "Preshuffle path on gfx1250 is not implemented yet; only the "
+            "KVBlockSize=1 base kernel has been ported."
+        )
+        assert not VarCtxOpt, (
+            "VarCtx path on gfx1250 is not implemented yet."
+        )
     cdna_version = get_cdna_version()
-    target = GPUTarget("hip", gfx_version, 64)
+    warp_size = 32 if is_gfx1250 else 64
+    target = GPUTarget("hip", gfx_version, warp_size)
 
+    # gfx942 uses the AMD fnuz e4m3 variant (*fp8e4b8); gfx950 and gfx1250 use
+    # the OCP/IEEE e4m3 variant (*fp8e4nv), matching utils.types.get_fp8_dtypes.
     gfx_fp8_pointer = "*fp8e4b8" if gfx_version == "gfx942" else "*fp8e4nv"
 
     fn_signature = {
@@ -293,6 +305,8 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["KVBlockSize"] = "constexpr"
     fn_signature["HiddenDim"] = "constexpr"
     fn_signature["CDNA_VERSION"] = "constexpr"
+    if not Preshuffle:
+        fn_signature["IS_GFX1250"] = "constexpr"
 
     options = {
         "num_warps": 4,
@@ -302,7 +316,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "cluster_dims": [1, 1, 1],
         "arch": gfx_version,
         "backend_name": "hip",
-        "warp_size": 64,
+        "warp_size": warp_size,
         "name": (
             "_gluon_deepgemm_fp8_paged_mqa_logits"
             if not Preshuffle
@@ -327,16 +341,19 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             else _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
         )
     )
+    constexprs = {
+        "ChunkQ": ChunkQ,
+        "ChunkK": ChunkK,
+        "KVBlockSize": KVBlockSize,
+        "HiddenDim": HiddenDim,
+        "CDNA_VERSION": cdna_version,
+    }
+    if not Preshuffle:
+        constexprs["IS_GFX1250"] = is_gfx1250
     src = ASTSource(
         fn=kernel_fn,
         signature=fn_signature,
-        constexprs={
-            "ChunkQ": ChunkQ,
-            "ChunkK": ChunkK,
-            "KVBlockSize": KVBlockSize,
-            "HiddenDim": HiddenDim,
-            "CDNA_VERSION": cdna_version,
-        },
+        constexprs=constexprs,
         attrs={
             (2,): [["tt.divisibility", 16]],  # heads_num
             (3,): [["tt.divisibility", 16], ["tt.pointer_range", 32]],  # Q_buffer
