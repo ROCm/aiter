@@ -97,14 +97,6 @@ KERNEL_CONFIG_VARIANTS = [
         "block_m_warps": wm,
         "block_n_warps": wn,
         "block_k_warps": wk,
-        "b_to_lds": False,
-    }
-    for wm, wn, wk in HGEMM_WARP_SHAPE_OPTIONS
-] + [
-    {
-        "block_m_warps": wm,
-        "block_n_warps": wn,
-        "block_k_warps": wk,
         "b_to_lds": True,
     }
     for wm, wn, wk in HGEMM_WARP_SHAPE_OPTIONS
