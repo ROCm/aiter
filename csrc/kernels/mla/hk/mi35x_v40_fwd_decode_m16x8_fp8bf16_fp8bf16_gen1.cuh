@@ -5,7 +5,7 @@
 
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
-#include "hk_mla_buffer_managers.cuh"
+#include "hk_mla_v40_buffer_managers_gen1.cuh"
 #include "hk_mla_softmax.cuh"
 #include "mla.h"
 #include <assert.h>
@@ -24,7 +24,7 @@ using namespace hk_mla;
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     __attribute__((amdgpu_num_vgpr(64))) void
-    kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16(HkMlaV40DecodeFwdParams<T> params)
+    kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdParams<T> params)
 {
     using q_nope_t  = T::q_nope_t;
     using q_rope_t  = T::q_rope_t;
@@ -1321,7 +1321,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 #else
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) void
-kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16(HkMlaV40DecodeFwdParams<T> params)
+kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdParams<T> params)
 {
     (void)params;
     assert(false);
@@ -1424,11 +1424,11 @@ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16(aiter_tensor_t& query,
     const dim3 grid        = dim3(dev_prop.multiProcessorCount);
     const int32_t lds_size = dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy;
 
-    kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16<Traits>
+    kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1<Traits>
         <<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
 }
 
-void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16(aiter_tensor_t& query,
+void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& query,
                                                        aiter_tensor_t& query_rope,
                                                        aiter_tensor_t& kv_buffer,
                                                        aiter_tensor_t& kv_buffer_rope,
@@ -1452,12 +1452,12 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16(aiter_tensor_t& query,
     const bool kv_rope_is_bf16 = (kv_buffer_rope.dtype() == AITER_DTYPE_bf16);
 
     AITER_CHECK(q_nope_is_fp8 && kv_nope_is_fp8,
-                "hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16 requires FP8 NOPE; got q=",
+                "hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1 requires FP8 NOPE; got q=",
                 AiterDtype_to_str(query.dtype()),
                 ", kv=",
                 AiterDtype_to_str(kv_buffer.dtype()));
     AITER_CHECK(q_rope_is_bf16 && kv_rope_is_bf16,
-                "hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16 requires BF16 ROPE; got q_rope=",
+                "hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1 requires BF16 ROPE; got q_rope=",
                 AiterDtype_to_str(query_rope.dtype()),
                 ", kv_rope=",
                 AiterDtype_to_str(kv_buffer_rope.dtype()));
@@ -1501,7 +1501,7 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16(aiter_tensor_t& query,
         // DISPATCH_PAGE_SIZE(64)
     default:
         AITER_CHECK(false,
-                    "hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16: unsupported page_size ",
+                    "hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1: unsupported page_size ",
                     page_size,
                     " (supported: 1, 64).");
     }

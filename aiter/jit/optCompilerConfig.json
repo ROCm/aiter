@@ -1438,7 +1438,11 @@
     "module_hk_mla_v40_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_hk_v40_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/hk_v40_decode_fwd.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk_v40_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_utils.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_v40_buffer_managers_gen1.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_softmax.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi35x_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1.cuh'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "hk/mi35x_v40_fwd_decode_m16x8_fp8bf16_fp8bf16.cuh"
+#include "hk/mi35x_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1.cuh"
 #include "mla.h"
 #include "mla_hk.h"
 
@@ -26,7 +26,7 @@ void hk_mla_v40_decode_fwd(aiter_tensor_t& query,
 
     if ((num_head * max_seqlen_q == 128) && (gfx == "gfx950"))
     {
-        hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16(query,
+        hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(query,
                                                           query_rope,
                                                           kv_buffer,
                                                           kv_buffer_rope,
