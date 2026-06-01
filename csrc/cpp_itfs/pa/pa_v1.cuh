@@ -130,6 +130,14 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
         return;
     }
     const int context_len = context_lens[seq_idx];
+    if (context_len == 0) {
+        OUTT* out_ptr = out +
+                        (static_cast<int64_t>(query_loc) + blockIdx.z) *
+                            gridDim.x * HEAD_SIZE +
+                        static_cast<int64_t>(blockIdx.x) * HEAD_SIZE;
+        out_ptr[threadIdx.x] = OUTT(0);
+        return;
+    }
     _paged_attention_ll4mi_reduce_kernel<scalar_t, OUTT, HEAD_SIZE, NUM_THREADS, PARTITION_SIZE, NPAR_LOOPS>(static_cast<int64_t>(query_loc), context_len, out, exp_sums, max_logits, tmp_out, max_num_partitions, fp8_out_scale_ptr, sliding_window);
 }
 
