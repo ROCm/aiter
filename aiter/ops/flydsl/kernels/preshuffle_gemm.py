@@ -1227,10 +1227,6 @@ def compile_preshuffle_gemm_a8(
                 e_vec = 4 if (int(tile_n) % (32 * 4)) == 0 else 2
                 mfma_epilog(
                     use_cshuffle=True,
-                    arith=fx.arith,
-                    vector=fx.vector,
-                    gpu=gpu,
-                    range_constexpr=range_constexpr,
                     tile_m=tile_m,
                     tile_n=tile_n,
                     e_vec=e_vec,
@@ -1350,8 +1346,6 @@ def compile_preshuffle_gemm_a8(
 
             mfma_epilog(
                 use_cshuffle=False,
-                arith=fx.arith,
-                range_constexpr=range_constexpr,
                 m_repeat=m_repeat,
                 lane_div_16=lane_div_16,
                 bx_m=bx_m,

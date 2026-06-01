@@ -1640,11 +1640,6 @@ def compile_moe_gemm1(
                     _split_k_sw_vals[0] = sw_gate_vals
                     _split_k_n_offset[0] = 0
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=_split_k_e_vec,
@@ -1672,11 +1667,6 @@ def compile_moe_gemm1(
                     _split_k_sw_vals[0] = sw_up_vals
                     _split_k_n_offset[0] = inter_dim
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=_split_k_e_vec,
@@ -1799,11 +1789,6 @@ def compile_moe_gemm1(
 
                     mfma_epilog(
                         use_cshuffle=True,
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=4,
@@ -1892,8 +1877,6 @@ def compile_moe_gemm1(
 
                 mfma_epilog(
                     use_cshuffle=False,
-                    arith=arith,
-                    range_constexpr=range_constexpr,
                     m_repeat=m_repeat,
                     lane_div_16=lane_div_16,
                     bx_m=bx_m,
@@ -3297,8 +3280,6 @@ def compile_moe_gemm2(
                             atomic_add_f32(v, byte_off)
 
                     default_epilog(
-                        arith=arith,
-                        range_constexpr=range_constexpr,
                         m_repeat=m_repeat,
                         lane_div_16=lane_div_16,
                         bx_m=bx_m,
@@ -3436,11 +3417,6 @@ def compile_moe_gemm2(
                                 buffer_ops.buffer_store(frag, out_rsrc, idx_elem_even)
 
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=e_vec,

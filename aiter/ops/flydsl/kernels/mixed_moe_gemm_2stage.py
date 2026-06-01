@@ -2351,11 +2351,6 @@ def compile_mixed_moe_gemm1(
                     _gui_by_n = by_n // 2
                     _gui_n_tile_base = n_tile_base // 2
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=_gui_tile_n,
                         e_vec=_e_vec,
@@ -2380,11 +2375,6 @@ def compile_mixed_moe_gemm1(
                     _eff_e_vec = _e_vec_sk
                     acc = acc_gate
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=_eff_e_vec,
@@ -2413,11 +2403,6 @@ def compile_mixed_moe_gemm1(
                     acc = acc_gate
                     _sk_n_offset[0] = 0
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=_eff_e_vec,
@@ -2445,11 +2430,6 @@ def compile_mixed_moe_gemm1(
                     acc = acc_up
                     _sk_n_offset[0] = inter_dim
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=_eff_e_vec,
@@ -2472,11 +2452,6 @@ def compile_mixed_moe_gemm1(
                     )
                 else:
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=_e_vec,
@@ -4121,11 +4096,6 @@ def compile_mixed_moe_gemm2(
 
                 _e_vec = 2 if accumulate else min(tile_n // 32, 8)
                 c_shuffle_epilog(
-                    arith=arith,
-                    vector=vector,
-                    gpu=gpu,
-                    scf=scf,
-                    range_constexpr=range_constexpr,
                     tile_m=tile_m,
                     tile_n=tile_n,
                     e_vec=_e_vec,
