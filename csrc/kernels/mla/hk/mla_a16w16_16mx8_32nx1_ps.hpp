@@ -423,11 +423,71 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
     });
 }
 
+// Causal mask for one KV tile of the score matrix (adapted from the GQA D=512
+// template's `attn_mask_causal_tile`).
+//
+// The MLA decode M tile packs (q_token, q_head) with the head as the fast axis
+// (stride_qo_h), so the M row index `m = warp_id*W_M + lane%W_M` maps to
+//   q_token = m / num_qheads.
+// Each query token attends to keys up to its own position. The query tokens are
+// the LAST q_len tokens of the KV slice -- but only for the slice that reaches
+// the sequence end (kv_offset==0), which is gated at the call site. There the
+// query token's last attendable key (local to the slice) is
+//   q_pos = q_pos_base + q_token,   q_pos_base = valid_kv_len - q_len.
+// A score element at local key position `k_pos_actual = k_pos + thr` is masked
+// when k_pos_actual > q_pos, i.e. when `rel = q_pos - k_pos < thr` (thr is the
+// per-element compile-time column offset). Because q_pos <= valid_kv_len-1 this
+// also masks every OOB key, so no separate OOB pass is needed on causal tiles.
+template<typename T, typename V>
+__device__ inline void attn_mask_causal_tile(V& v_s, int q_pos_base, int num_qheads,
+                                             int kv_tile_idx, opus::u32_t neg_inf_v,
+                                             int warp_id, int lane_id) {
+    using D_ACC = typename T::D_ACC;
+    using D_ACC_X2 = opus::vector_t<D_ACC, 2>;
+    using U32_X2 = opus::vector_t<opus::u32_t, 2>;
+
+    constexpr int elems_per_wave_tile = (T::W_M * T::W_N) / T::WARP_SIZE;
+    constexpr int c_pack = 4;
+    constexpr int c_rept = elems_per_wave_tile / c_pack;
+    constexpr int c_rept_stride = (T::WARP_SIZE / T::W_M) * c_pack;
+
+    const int m_row = warp_id * T::W_M + (lane_id % T::W_M);
+    const int q_pos = q_pos_base + m_row / num_qheads;   // last key this query may attend to
+    const int k_start_pos = kv_tile_idx * T::KV_TILE_SIZE;
+    const int lane_group = lane_id / T::W_M;
+
+    opus::static_for<T::GEMM0_E_N>([&](auto i_n) {
+        constexpr int base_idx = i_n.value * elems_per_wave_tile;
+        const int k_pos = k_start_pos + i_n.value * T::W_N + lane_group * c_pack;
+        const opus::u32_t rel = static_cast<opus::u32_t>(q_pos - k_pos);
+
+        opus::static_for<c_rept>([&](auto i_rept) {
+            constexpr int rept_base_idx = base_idx + i_rept.value * c_pack;
+            constexpr int thr_base = i_rept.value * c_rept_stride;
+            opus::static_for<c_pack / 2>([&](auto i_pair) {
+                constexpr int idx = rept_base_idx + i_pair.value * 2;
+                constexpr int thr_x = thr_base + i_pair.value * 2;
+                constexpr int thr_y = thr_x + 1;
+
+                auto pair_acc = opus::slice(v_s, opus::number<idx>{}, opus::number<idx + 2>{});
+                auto pair_bits = __builtin_bit_cast(U32_X2, pair_acc);
+                opus::u32_t x_ref = pair_bits[0];
+                opus::u32_t y_ref = pair_bits[1];
+                attn_mask_vec2_imm<thr_x, thr_y>(rel, neg_inf_v, x_ref, y_ref);
+                pair_bits[0] = x_ref;
+                pair_bits[1] = y_ref;
+                opus::set_slice(v_s, __builtin_bit_cast(D_ACC_X2, pair_bits), opus::number<idx>{}, opus::number<idx + 2>{});
+            });
+        });
+    });
+}
+
 // MLA: simple (un-pipelined) accumulator for a small number of KV tiles.
 // Loads one KV tile at a time into shared memory and runs QK / softmax / PV.
 template<class Traits>
 __device__ void mla_decode_accum_le2_tiles(mla_decode_ps_kargs kargs,
                                            const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+                                           int q_len, int num_qheads, int kv_offset,
                                            char* smem_kv_buf,
                                            opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE   / Traits::WARP_SIZE>& v_q,
                                            opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::V_D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
@@ -533,7 +593,18 @@ __device__ void mla_decode_accum_le2_tiles(mla_decode_ps_kargs kargs,
     };
 
     const opus::u32_t neg_inf_v = std::bit_cast<opus::u32_t>(-opus::numeric_limits<D_ACC>::infinity());
-    auto mask_oob_scores = [&](auto& s, int tile_idx) {
+    // Causal masking only applies to the KV slice that reaches the sequence end
+    // (kv_offset==0); for that slice it subsumes the OOB mask. Non-causal traits
+    // and earlier split-K slices fall back to OOB masking on the last tile.
+    [[maybe_unused]] const bool causal_active = T::CAUSAL && (kv_offset == 0);
+    [[maybe_unused]] const int  q_pos_base    = valid_kv_len - q_len;
+    auto mask_scores = [&](auto& s, int tile_idx) {
+        if constexpr (T::CAUSAL) {
+            if (causal_active) {
+                attn_mask_causal_tile<T>(s, q_pos_base, num_qheads, tile_idx, neg_inf_v, warp_id, lane_id);
+                return;
+            }
+        }
         if ((tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len) {
             attn_mask_oob_kv_tile<T>(s, valid_kv_len, tile_idx, neg_inf_v, lane_id);
         }
@@ -561,7 +632,7 @@ __device__ void mla_decode_accum_le2_tiles(mla_decode_ps_kargs kargs,
         v_k[1] = load<T::VEC_KV>(s_kv, u_rk + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
         compute_qk(v_s, v_q_slices, v_k);
-        mask_oob_scores(v_s, tile_idx);
+        mask_scores(v_s, tile_idx);
 
         D_ACC row_max = max(m_row, attn_row_max<T>(v_s));
         D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
@@ -588,6 +659,7 @@ __device__ void mla_decode_accum_le2_tiles(mla_decode_ps_kargs kargs,
 template<class Traits, bool OddTail>
 __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
                                            const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+                                           int q_len, int num_qheads, int kv_offset,
                                            char* smem_kv_buf,
                                            opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE   / Traits::WARP_SIZE>& v_q,
                                            opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::V_D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
@@ -718,9 +790,23 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
         o[T::NUM_V_SLICES - 1] = mma1(p, v[(T::NUM_V_SLICES - 1) & 1], o[T::NUM_V_SLICES - 1]);
     };
 
-    // Masking helpers for out-of-bound KV tokens in the last tile
+    // Masking helpers. Causal masking applies only to the KV slice that reaches
+    // the sequence end (kv_offset==0) and subsumes the OOB mask there. With
+    // q_len <= KV_TILE_SIZE the causal diagonal touches at most the last two KV
+    // tiles, so the call sites below mask tile (num_kv_tiles-2) and
+    // (num_kv_tiles-1). Non-causal traits / earlier split-K slices keep the
+    // original OOB-on-last-tile behavior (the extra second-to-last call is a
+    // no-op there since that tile is full).
     const opus::u32_t neg_inf_v = std::bit_cast<opus::u32_t>(-opus::numeric_limits<D_ACC>::infinity());
-    auto mask_oob_scores = [&](auto& s, int tile_idx) {
+    [[maybe_unused]] const bool causal_active = T::CAUSAL && (kv_offset == 0);
+    [[maybe_unused]] const int  q_pos_base    = valid_kv_len - q_len;
+    auto mask_scores = [&](auto& s, int tile_idx) {
+        if constexpr (T::CAUSAL) {
+            if (causal_active) {
+                attn_mask_causal_tile<T>(s, q_pos_base, num_qheads, tile_idx, neg_inf_v, warp_id, lane_id);
+                return;
+            }
+        }
         if ((tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len) {
             attn_mask_oob_kv_tile<T>(s, valid_kv_len, tile_idx, neg_inf_v, lane_id);
         }
@@ -917,6 +1003,8 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
         // Cluster 2:
         v_v[0] = tr_load<T::VEC_TR_V>(s_kv[0], u_rv);
         v_v[1] = tr_load<T::VEC_TR_V>(s_kv[0], u_rv + skv_slice(1_I));
+        // Causal mask for the second-to-last tile (computed in Cluster 1).
+        mask_scores(v_s[1], num_kv_tiles - 2);
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_sched_barrier(0);
@@ -965,7 +1053,7 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
         // Cluster 6:
         v_v[0] = tr_load<T::VEC_TR_V>(s_kv[0], u_rv + kv_slot_offset);
         v_v[1] = tr_load<T::VEC_TR_V>(s_kv[0], u_rv + kv_slot_offset + skv_slice(1_I));
-        mask_oob_scores(v_s[0], num_kv_tiles - 1);
+        mask_scores(v_s[0], num_kv_tiles - 1);
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1089,6 +1177,8 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
         // Cluster 6:
         v_v[0] = tr_load<T::VEC_TR_V>(s_kv[0], u_rv + kv_slot_offset);
         v_v[1] = tr_load<T::VEC_TR_V>(s_kv[0], u_rv + kv_slot_offset + skv_slice(1_I));
+        // Causal mask for the second-to-last tile (computed in Cluster 5).
+        mask_scores(v_s[0], num_kv_tiles - 2);
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_sched_barrier(0);
@@ -1137,7 +1227,7 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
         // Cluster 10:
         v_v[0] = tr_load<T::VEC_TR_V>(s_kv[1], u_rv);
         v_v[1] = tr_load<T::VEC_TR_V>(s_kv[1], u_rv + skv_slice(1_I));
-        mask_oob_scores(v_s[1], num_kv_tiles - 1);
+        mask_scores(v_s[1], num_kv_tiles - 1);
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1236,9 +1326,12 @@ void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs kargs) {
         const int                  q_len_ptr_e  = work_item[3];
         const int                  kv_ind_ptr_s = work_item[4];
         const int                  kv_ind_ptr_e = work_item[5];
-        [[maybe_unused]] const int kv_offset    = work_item[6];
+        const int                  kv_offset    = work_item[6];
 
         const int q_len        = q_len_ptr_e - q_len_ptr_s;
+        // num q heads = stride_o_n / stride_o_h (D_v cancels). Needed by causal
+        // masking to map an M row -> q_token = m_row / num_qheads.
+        const int num_qheads   = static_cast<int>(kargs.stride_o_n / kargs.stride_o_h);
         // NOTE: kargs.kv_indices is per-token (the PA pipeline expects per-token
         // indexing). If the host hands out per-page indices, valid_kv_len needs
         // to be `(kv_ind_ptr_e - kv_ind_ptr_s) << kargs.s_log2_plen` etc.
@@ -1275,16 +1368,19 @@ void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs kargs) {
             mla_decode_accum_le2_tiles<Traits>(
                 kargs, kargs.kv_indices,
                 kv_ind_ptr_s, valid_kv_len, num_kv_tiles,
+                q_len, num_qheads, kv_offset,
                 smem_kv_buf, v_q, v_o, m_row, l_row);
         } else if (num_kv_tiles & 1) {
             mla_decode_accum_pipelined<Traits, /*OddTail=*/true>(
                 kargs, kargs.kv_indices,
                 kv_ind_ptr_s, valid_kv_len, num_kv_tiles,
+                q_len, num_qheads, kv_offset,
                 smem_kv_buf, v_q, v_o, m_row, l_row);
         } else {
             mla_decode_accum_pipelined<Traits, /*OddTail=*/false>(
                 kargs, kargs.kv_indices,
                 kv_ind_ptr_s, valid_kv_len, num_kv_tiles,
+                q_len, num_qheads, kv_offset,
                 smem_kv_buf, v_q, v_o, m_row, l_row);
         }
 
@@ -1339,17 +1435,19 @@ void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs kargs) {
             // `__builtin_amdgcn_logf` is the HW v_log_f32 = log2.  Therefore:
             //   lse = m_row * ln(2) + log2(l_row) * ln(2)
             //       = (m_row + log2(l_row)) * INV_LOG2_E
-            if (lane_id < T::W_M) {
+            // Skip padding M rows: in a partial work (q_len < kBlockM/num_qheads)
+            // the rows whose q_token = m_row/num_qheads >= q_len are unused. Their
+            // O store is dropped by the buffer-rsrc OOB guard, but this LSE write
+            // is a raw pointer store, so it must be gated explicitly -- otherwise
+            // it would clobber a neighbouring work's split_lse region.
+            const int m_row_o = warp_id_o * T::W_M + static_cast<int>(lane_id);
+            if (lane_id < T::W_M && (m_row_o / num_qheads) < q_len) {
                 constexpr D_ACC INV_LOG2_E = D_ACC(0.69314718055994530942f); // ln(2)
                 const D_ACC log2_l = (l_row > D_ACC(0.0f))
                                        ? __builtin_amdgcn_logf(l_row)
                                        : D_ACC(0.0f);
                 const D_ACC lse_val = (m_row + log2_l) * INV_LOG2_E;
-                const int num_qheads = static_cast<int>(kargs.stride_o_n /
-                                                        kargs.stride_o_h);
-                const int row_idx = static_cast<int>(lane_id)
-                                  + warp_id_o * T::W_M
-                                  + ps_partial * num_qheads;
+                const int row_idx = m_row_o + ps_partial * num_qheads;
                 D_ACC* lse_base = reinterpret_cast<D_ACC*>(kargs.split_lse_ptr);
                 lse_base[row_idx] = lse_val;
             }
@@ -1401,12 +1499,13 @@ void mla_a16w16_16mx8_32nx1_ps_launch(torch::Tensor& query,
                 kv_page_indices.dtype() == at::kInt,
                 "work_indptr / work_info_set / kv_page_indices must be int32");
     const int num_q_heads_check = static_cast<int>(query.size(1));
-    TORCH_CHECK(num_q_heads_check * max_seqlen_q == kBlockM,
-                "mla_a16w16_16mx8_32nx1_ps_launch requires num_q_heads * max_seqlen_q == ",
-                kBlockM, " (Traits BlockM). Got num_q_heads=", num_q_heads_check,
-                ", max_seqlen_q=", max_seqlen_q,
-                ". Try -n configs where nhead*max_seqlen_q==", kBlockM,
-                " (e.g. -n 16,4 / -n 32,2 / -n 64,1).");
+    // BlockM is fixed; num_q_heads must divide it so the (q_token, q_head) M-tile
+    // packing is clean (q_token = m_row / num_q_heads). Per-work q_len is read
+    // from work_info_set and may be < kBlockM/num_q_heads (partial / padded tile).
+    TORCH_CHECK(kBlockM % num_q_heads_check == 0 && num_q_heads_check <= kBlockM,
+                "mla_a16w16_16mx8_32nx1_ps_launch requires num_q_heads to divide BlockM=",
+                kBlockM, ". Got num_q_heads=", num_q_heads_check,
+                " (max_seqlen_q=", max_seqlen_q, ").");
 
     // --- Build kargs ---
     mla_decode_ps_kargs kargs{};
@@ -1492,22 +1591,31 @@ inline void hk_mla_a16w16_16mx8_32nx1_ps(torch::Tensor& query,
                                          torch::Tensor& split_lse,
                                          torch::Tensor& final_output)
 {
-    // Dispatch by dtype. This kernel only supports BlockM=128 (NUM_WARPS=8),
-    // i.e. nhead * max_seqlen_q == 128 (-n 32,4 / -n 64,2 / -n 128,1).
-    // Q_TILE_SIZE=16 keeps GEMM0_E_M=1 (the softmax helpers assume one m-row
-    // per thread in v_s) and kBlockM = Q_TILE_SIZE * NUM_WARPS = 128.
+    // This kernel uses a fixed M tile BlockM=128 (NUM_WARPS=8). Q_TILE_SIZE=16
+    // keeps GEMM0_E_M=1 (the softmax helpers assume one m-row per thread in
+    // v_s) and kBlockM = Q_TILE_SIZE * NUM_WARPS = 128.
+    //
+    // The metadata generator caps the number of query tokens per work item at
+    // BlockM / num_q_heads, so a single BlockM=128 launch covers any num_q_heads
+    // that divides 128:
+    //   - num_q_heads*qlen == 128 -> full M tile  (-n 32,4 / 64,2 / 128,1)
+    //   - num_q_heads*qlen  > 128 -> metadata splits qlen so each work has
+    //     q_len <= 128/num_q_heads; works with q_len < 128/num_q_heads leave the
+    //     trailing M rows (q_token >= q_len) as padding -- their Q load / O store
+    //     are dropped by the buffer-rsrc OOB guard and the split-K LSE write is
+    //     gated by a q_token < q_len check (see the kernel).  Examples:
+    //       -n 64,3  -> per-work q_len in {2, 1}
+    //       -n 128,2 -> per-work q_len == 1 (num_q_heads==128 -> full tile anyway)
     //
     // NUM_WARPS=8 -> warps_d = NUM_WARPS / smem_n_rpt = 8/4 = 2; smem_d_rpt=9
     // doesn't divide 2, so a single-stage gmem->smem load would silently drop
     // the rope tail.  Both le2_tiles and the pipelined accumulator split the
-    // load into two stages:
-    //   stage 1 (main):  32 x 512  -- all 8 warps participate (8/2=4 chunks
-    //                                 per warp_d_group, divides cleanly)
-    //   stage 2 (tail):  32 x 64   -- in pipelined, all 8 warps issue one tail
-    //                                 load each (uniform vmcnt); le2_tiles uses
-    //                                 the 4-warp tail variant.
-    const auto    q_dtype  = query.scalar_type();
-    const int32_t block_m  = static_cast<int32_t>(query.size(1)) * max_seqlen_q;
+    // load into two stages (32x512 main + 32x64 rope tail).
+    const auto    q_dtype     = query.scalar_type();
+    const int32_t num_q_heads = static_cast<int32_t>(query.size(1));
+    TORCH_CHECK(num_q_heads > 0 && num_q_heads <= 128 && (128 % num_q_heads) == 0,
+                "hk_mla_a16w16_16mx8_32nx1_ps: num_q_heads must divide BlockM=128 "
+                "(supported num_q_heads: 16/32/64/128), got ", num_q_heads);
 
 #define MLA_A16W16_LAUNCH(NW, DT) \
     do { \
@@ -1516,7 +1624,8 @@ inline void hk_mla_a16w16_16mx8_32nx1_ps(torch::Tensor& query,
                                             /*D_TILE_SIZE  =*/ 576, \
                                             /*V_D_TILE_SIZE=*/ 512, \
                                             /*NUM_WARPS    =*/ NW, \
-                                            /*D_ATTN       =*/ DT>; \
+                                            /*D_ATTN       =*/ DT, \
+                                            /*CAUSAL       =*/ true>; \
         mla_a16w16_16mx8_32nx1_ps_launch<Traits>(query, kv_buffer, qo_indptr, \
                                                  kv_indptr, kv_page_indices, \
                                                  kv_last_page_lens, work_indptr, \
@@ -1527,15 +1636,11 @@ inline void hk_mla_a16w16_16mx8_32nx1_ps(torch::Tensor& query,
 
     if (q_dtype == at::ScalarType::BFloat16)
     {
-        if   (block_m == 128) MLA_A16W16_LAUNCH(8, bf16_t);
-        else TORCH_CHECK(false, "hk_mla_a16w16_16mx8_32nx1_ps: unsupported BlockM=",
-                                block_m, " (only 128 / nhead*max_seqlen_q==128 supported).");
+        MLA_A16W16_LAUNCH(8, bf16_t);
     }
     else if (q_dtype == at::ScalarType::Half)
     {
-        if   (block_m == 128) MLA_A16W16_LAUNCH(8, fp16_t);
-        else TORCH_CHECK(false, "hk_mla_a16w16_16mx8_32nx1_ps: unsupported BlockM=",
-                                block_m, " (only 128 / nhead*max_seqlen_q==128 supported).");
+        MLA_A16W16_LAUNCH(8, fp16_t);
     }
     else
     {

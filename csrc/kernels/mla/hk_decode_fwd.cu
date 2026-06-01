@@ -26,12 +26,17 @@ void hk_mla_decode_fwd(torch::Tensor& query,
     const std::string gfx     = get_gpu_arch();
     const int32_t     block_m = num_head * max_seqlen_q;
 
-    // On gfx950, bf16/fp16 (D_qk=576, D_v=512) always go through the opus-based
-    // a16w16 persistent kernel for BlockM in {64, 128}.
+    // On gfx950, bf16/fp16 (D_qk=576, D_v=512) go through the opus-based a16w16
+    // persistent kernel. It uses a fixed M tile of 128 (NUM_WARPS=8); the
+    // metadata caps query tokens per work at 128/num_head, so any num_head that
+    // divides 128 is supported (full or partial/padded M tiles). This covers
+    // e.g. -n 32,4 / 64,2 / 128,1 (full) and -n 64,3 / 128,2 (split into
+    // q_len<=128/num_head works).
     const auto q_dtype = query.scalar_type();
     const bool is_a16  = (q_dtype == at::ScalarType::BFloat16 ||
                           q_dtype == at::ScalarType::Half);
-    if (gfx == "gfx950" && is_a16 && (block_m == 64 || block_m == 128))
+    if (gfx == "gfx950" && is_a16 && num_head > 0 && num_head <= 128 &&
+        (128 % num_head) == 0)
     {
         hk_mla_a16w16_16mx8_32nx1_ps(query,
                                      kv_buffer,

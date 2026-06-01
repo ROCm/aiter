@@ -483,13 +483,18 @@ def mla_decode_fwd(
                 and is_experimental_enabled()
             )
             or (
-                # opus-based a16w16 MLA decode kernel (BlockM in {64, 128}).
-                #   BlockM=64  -> Q_TILE_SIZE=16, NUM_WARPS=4 (-n 16,4 / -n 32,2 / -n 64,1)
-                #   BlockM=128 -> Q_TILE_SIZE=16, NUM_WARPS=8 (-n 32,4 / -n 64,2 / -n 128,1)
+                # opus-based a16w16 MLA decode kernel (fixed BlockM=128,
+                # Q_TILE_SIZE=16, NUM_WARPS=8). The metadata caps query tokens per
+                # work at 128/nhead, so any nhead dividing 128 is supported:
+                #   nhead*qlen == 128 -> full M tile   (-n 32,4 / 64,2 / 128,1)
+                #   nhead*qlen  > 128 -> metadata splits qlen into works with
+                #                        q_len <= 128/nhead (partial/padded tiles),
+                #                        e.g. -n 64,3 -> q_len {2,1}; -n 128,2.
                 # The kernel uses a two-stage gmem->smem KV load (32x512 main +
                 # 32x64 tail) so NUM_WARPS=8 with D=576 still divides cleanly.
                 get_gfx() == "gfx950"
-                and nhead * max_seqlen_q in (64, 128)
+                and nhead in (16, 32, 64, 128)
+                and nhead * max_seqlen_q >= 128
                 and q.dtype in (dtypes.bf16, dtypes.fp16)
                 and kv_buffer.dtype == q.dtype
                 and page_size in (1, 64)

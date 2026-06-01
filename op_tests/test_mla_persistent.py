@@ -1074,7 +1074,7 @@ def test_mla(
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
-        is_causal=False,
+        is_causal=True,
         dtype=out_dtype,
     )
 
