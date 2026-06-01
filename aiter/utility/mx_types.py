@@ -118,7 +118,11 @@ def __getattr__(name):
                 f"(drift; update both in lockstep)"
             )
     factory, int_mirror = pair
-    cls = type(factory(0))
+    # Use the first known int value from the mirror class (not a hard-coded 0)
+    # so this survives future enum reorderings where 0 may not be valid.
+    first_val = next(v for k, v in vars(int_mirror).items()
+                     if not k.startswith("_") and isinstance(v, int))
+    cls = type(factory(first_val))
     # Guard against C++/Python enum drift: every named member of the int
     # mirror must round-trip through ``int(cls.<NAME>)``.
     for attr_name, expected in vars(int_mirror).items():

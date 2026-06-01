@@ -6,7 +6,11 @@ import triton
 import triton.language as tl
 
 from . import dtypes
-from .mx_types import MX_DEFAULT_ROUND_MODE, MxDtype, MxScaleRoundMode
+from .mx_types import (
+    MX_DEFAULT_ROUND_MODE,
+    MxDtypeInt,
+    MxScaleRoundModeInt,
+)
 
 
 def f32_to_mxfp4(x):
@@ -68,21 +72,21 @@ def mxfp4_to_f32(x):
 # - target_max_pow2 = log2(largest pow2 <= max_normal(dtype))
 # - max_pos = max_normal(dtype) (e.g. 6.0 for fp4 e2m1, 448.0 for fp8 e4m3)
 # - mbits = mantissa bits of the target dtype (used only by EVEN mode)
-# dict keyed by ``int(MxDtype.X)`` so lookups work regardless of whether
-# the caller passes a pybind enum value or a bare ``int``.
-# Tuple form: (target_max_pow2, max_pos, mbits)
+# Keyed by bare int (MxDtypeInt) so this dict can be built at import time
+# without triggering the pybind11 JIT build of module_aiter_core -- same
+# pattern as ``aiter/ops/flydsl/kernels/quant_utils.py::_DTYPE_CFG``.
 _DTYPE_CFG = {
-    int(MxDtype.FP4_E2M1): (2, 6.0, 1),  # OCP MXFP4 / DSv4 / FlashInfer
-    int(MxDtype.FP8_E4M3): (8, 448.0, 3),  # OCP / NVIDIA H100 / gfx950+ (e4m3fn)
-    int(MxDtype.FP8_E4M3_FNUZ): (7, 240.0, 3),  # AMD gfx942 hardware FP8 (e4m3fnuz)
+    MxDtypeInt.FP4_E2M1: (2, 6.0, 1),  # OCP MXFP4 / DSv4 / FlashInfer
+    MxDtypeInt.FP8_E4M3: (8, 448.0, 3),  # OCP / NVIDIA H100 / gfx950+ (e4m3fn)
+    MxDtypeInt.FP8_E4M3_FNUZ: (7, 240.0, 3),  # AMD gfx942 hardware FP8 (e4m3fnuz)
 }
 
 
 def f32_to_mx_e8m0_scale(
     amax: Tensor,
     *,
-    mode: MxScaleRoundMode = MX_DEFAULT_ROUND_MODE,
-    dtype: MxDtype = MxDtype.FP4_E2M1,
+    mode: int = MX_DEFAULT_ROUND_MODE,
+    dtype: int = MxDtypeInt.FP4_E2M1,
 ) -> Tensor:
     """Compute the per-block E8M0 scale for an MX format (CPU torch ref).
 
@@ -98,15 +102,19 @@ def f32_to_mx_e8m0_scale(
     FlashInfer / AMD Quark naming).
 
     Args:
-        amax: f32 (or castable) tensor of per-block ``max(|x|)`` values.
-            Caller is responsible for the per-block reduction.
-        mode: :class:`MxScaleRoundMode`. Default ``RoundUp`` (industry
-            consensus for MXFP4 and MXFP8).
-        dtype: :class:`MxDtype`. Default ``FP4_E2M1``.
+        amax: f32 (or castable) non-negative tensor of per-block
+            ``max(|x|)`` values. Caller is responsible for the per-block
+            reduction **and** for taking abs -- negative inputs produce
+            undefined results in Even mode (bit-level rounding on a
+            negative f32 sign bit).
+        mode: ``MxScaleRoundMode`` int or pybind enum. Default ``RoundUp``
+            (industry consensus for MXFP4 and MXFP8).
+        dtype: ``MxDtype`` int or pybind enum. Default ``FP4_E2M1``.
 
     Returns:
         E8M0-encoded biased exponent tensor (``dtypes.fp8_e8m0``), same
         shape as ``amax``. NaN/Inf inputs map to ``0xFF`` (E8M0 NaN).
+        Inputs near FLT_MAX may also map to ``0xFF`` after ceil rounding.
     """
     # Normalise int / pybind enum into a plain int -- pybind11 enum classes
     # do not auto-compare equal to ``int`` (unlike ``IntEnum``), so callers
@@ -121,19 +129,19 @@ def f32_to_mx_e8m0_scale(
     target_max_pow2, max_pos, mbits = _DTYPE_CFG[dtype_int]
     target_pow2_factor = float(1 << target_max_pow2)  # 2^target_max_pow2
 
-    if mode_int == int(MxScaleRoundMode.RoundUp):
+    if mode_int == MxScaleRoundModeInt.RoundUp:
         # ceil_pow2(amax / max_pos) -- NV / DSv4 / FlashInfer / torchao RCEIL.
         return _f32_to_e8m0_ceil_impl(amax / max_pos)
 
-    if mode_int == int(MxScaleRoundMode.RoundDown):
+    if mode_int == MxScaleRoundModeInt.RoundDown:
         # floor_pow2(amax) / 2^target_max_pow2 -- OCP MX / torchao FLOOR.
         return _f32_to_e8m0_floor_impl(amax / target_pow2_factor)
 
-    if mode_int == int(MxScaleRoundMode.Ceil):
+    if mode_int == MxScaleRoundModeInt.Ceil:
         # ceil_pow2(amax) / 2^target_max_pow2 -- torchao CEIL.
         return _f32_to_e8m0_ceil_impl(amax / target_pow2_factor)
 
-    if mode_int == int(MxScaleRoundMode.Even):
+    if mode_int == MxScaleRoundModeInt.Even:
         # round_pow2_special(amax) / 2^target_max_pow2 -- torchao EVEN /
         # Quark EVEN. val_to_add is mantissa-precision-aware:
         # FP4 (mbits=1) -> 0x200000 (1.5x threshold)
@@ -146,7 +154,7 @@ def f32_to_mx_e8m0_scale(
 
     raise ValueError(
         f"f32_to_mx_e8m0_scale: unknown mode {mode!r} "
-        f"(expected one of {list(MxScaleRoundMode)})"
+        f"(expected 0=RoundDown, 1=RoundUp, 2=Even, 3=Ceil)"
     )
 
 
@@ -160,7 +168,7 @@ def fp4_f32_to_e8m0_scale(amax: Tensor) -> Tensor:
     ``aiter::fp4_f32_to_e8m0_scale`` in ``csrc/include/mx_quant_utils.h``.
     """
     return f32_to_mx_e8m0_scale(
-        amax, mode=MX_DEFAULT_ROUND_MODE, dtype=MxDtype.FP4_E2M1
+        amax, mode=MX_DEFAULT_ROUND_MODE, dtype=MxDtypeInt.FP4_E2M1
     )
 
 
@@ -174,11 +182,13 @@ def fp4_f32_to_e8m0_scale(amax: Tensor) -> Tensor:
 
 
 def _f32_to_e8m0_floor_impl(x: Tensor) -> Tensor:
-    """Floor pow2 of x as E8M0 (caller passes ``amax / divisor``)."""
+    """Floor pow2 of x as E8M0 (caller passes ``amax / divisor``).
+
+    NaN/Inf inputs (biased exponent == 0xFF) pass through unchanged --
+    the floor operation is the identity on the exponent field.
+    """
     u32 = x.view(torch.int32)
     exponent = ((u32 >> 23) & 0xFF).view(torch.uint32).to(torch.uint8)
-    nan_case = exponent == 0xFF
-    exponent[nan_case] = 0xFF
     return exponent.view(dtypes.fp8_e8m0)
 
 

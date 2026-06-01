@@ -12,7 +12,13 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
 from ..utility import dtypes, fp4_utils
-from ..utility.mx_types import MX_DEFAULT_ROUND_MODE, MxDtype, MxScaleRoundMode
+from ..utility.mx_types import (
+    MX_DEFAULT_ROUND_MODE,
+    MxDtype,
+    MxDtypeInt,
+    MxScaleRoundMode,
+    MxScaleRoundModeInt,
+)
 from . import triton
 from .enum import ActivationType, QuantType
 from ..jit.utils.chip_info import get_cu_num, get_gfx
@@ -137,11 +143,9 @@ def per_1x32_f4_quant(
     # formula (RoundDown / RoundUp / Even / Ceil) and ``dtype`` selects the
     # ``max_pos`` / ``target_max_pow2`` / ``mbits`` constants -- see
     # MxScaleRoundMode docstring for cross-stack equivalences.
-    from aiter.utility.mx_types import MxDtype as _MxDtype
-
     try:
         scale_e8m0_biased = fp4_utils.f32_to_mx_e8m0_scale(
-            max_abs, mode=round_mode, dtype=_MxDtype.FP4_E2M1
+            max_abs, mode=round_mode, dtype=MxDtypeInt.FP4_E2M1
         )
     except ValueError as e:
         raise ValueError(
@@ -261,7 +265,7 @@ def per_1x32_f8_scale_f8_quant(
         # The legacy f32_to_e8m0(amax / floor_pow2(max)) bypassed the default
         # and diverged by one exponent on ~1/8 of groups vs the RoundUp kernel.
         fp8_mx_dtype = (
-            MxDtype.FP8_E4M3_FNUZ if get_gfx() == "gfx942" else MxDtype.FP8_E4M3
+            MxDtypeInt.FP8_E4M3_FNUZ if get_gfx() == "gfx942" else MxDtypeInt.FP8_E4M3
         )
         scale_e8m0_biased = fp4_utils.f32_to_mx_e8m0_scale(
             max_abs, mode=MX_DEFAULT_ROUND_MODE, dtype=fp8_mx_dtype
@@ -944,7 +948,7 @@ def quant_mxfp4_hip(
     # __Float4_e2m1fn_x2 which is not available on gfx942; fall through
     # to the quant_mxfp4 kernel instead.
     if (
-        round_mode_int == int(MX_DEFAULT_ROUND_MODE)
+        round_mode_int == MxScaleRoundModeInt.RoundUp
         and not a16w4_shuffle
         and not gate_up
         and not shuffle_weight
