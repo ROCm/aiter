@@ -258,8 +258,12 @@ def compile_moe_gemm1(
         if w_is_int4
         else (experts * (2 * inter_dim) * model_dim * elem_bytes)
     )
+    # fp4_bf16 (MXFP4): E8M0 scale has one byte per group-of-32 along K, stored as int32
+    # (2 scale bytes packed per int32 word). num_groups=1 above is wrong for this dtype;
+    # compute the correct K-groups count directly.
+    _fp4_bf16_k_groups = (model_dim // 32) if is_fp4_bf16 else 1
     sw_nbytes = (
-        experts * (2 * inter_dim) * num_groups * (2 if _scale_is_bf16 else 4)
+        experts * (2 * inter_dim) * (num_groups * _fp4_bf16_k_groups) * (2 if _scale_is_bf16 else 4)
         if needs_scale_w
         else 0
     )
