@@ -85,7 +85,7 @@ def _ptr_view_safe(t: torch.Tensor):
 # and higher split-K values are now capped at 8 for better accuracy.
 HGEMM_TILE_N_OPTIONS = (64, 128, 256)
 HGEMM_TILE_K_OPTIONS = (64, 128, 256)
-HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 96, 128, 256)
+HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 80, 96, 128, 256)
 HGEMM_STAGE_OPTIONS = tuple([i for i in range(2, 9)])
 HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 14))
 HGEMM_MAX_SPLIT_K = 13
