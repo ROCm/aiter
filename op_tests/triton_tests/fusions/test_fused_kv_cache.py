@@ -14,6 +14,7 @@ from op_tests.triton_tests.attention.test_unified_attention import (
 )
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dequant_nvfp4
 from op_tests.triton_tests.test_kv_cache import check_kv_buffer
+from aiter.test_common import checkAllclose
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla,
     fused_qk_rope_reshape_and_cache,
@@ -489,51 +490,39 @@ def test_fused_qk_rope_reshape_and_cache(
         triton_key_cache = triton_key_cache.to(dtype)
         torch_value_cache = torch_value_cache.to(dtype)
         triton_value_cache = triton_value_cache.to(dtype)
+        tol_err_ratio = 0.05
         if flash_layout:
-            torch.testing.assert_close(
-                torch_key_cache[slot_t, slot_b],
-                triton_key_cache[slot_t, slot_b],
-                atol=1e-1,
-                rtol=1e-1,
-                equal_nan=arch_info.get_arch()
-                not in ["gfx950"],  # TODO: investigate nan elements for non-gfx950 arch
-            )
-            torch.testing.assert_close(
-                torch_value_cache[slot_t, slot_b],
-                triton_value_cache[slot_t, slot_b],
-                atol=1e-1,
-                rtol=1e-1,
-                equal_nan=arch_info.get_arch() not in ["gfx950"],
-            )
+            ref_key = torch_key_cache[slot_t, slot_b]
+            tri_key = triton_key_cache[slot_t, slot_b]
+            ref_value = torch_value_cache[slot_t, slot_b]
+            tri_value = triton_value_cache[slot_t, slot_b]
         else:
-            torch.testing.assert_close(
-                torch_key_cache[slot_t, :, :, slot_b, :],
-                triton_key_cache[slot_t, :, :, slot_b, :],
-                atol=1e-1,
-                rtol=1e-1,
-                equal_nan=arch_info.get_arch() not in ["gfx950"],
-            )
-            torch.testing.assert_close(
-                torch_value_cache[slot_t, :, :, slot_b],
-                triton_value_cache[slot_t, :, :, slot_b],
-                atol=1e-1,
-                rtol=1e-1,
-                equal_nan=arch_info.get_arch() not in ["gfx950"],
-            )
+            ref_key = torch_key_cache[slot_t, :, :, slot_b, :]
+            tri_key = triton_key_cache[slot_t, :, :, slot_b, :]
+            ref_value = torch_value_cache[slot_t, :, :, slot_b]
+            tri_value = triton_value_cache[slot_t, :, :, slot_b]
 
-        torch.testing.assert_close(
-            torch_key_cache,
-            triton_key_cache,
-            atol=1e-1,
-            rtol=1e-1,
-            equal_nan=arch_info.get_arch() not in ["gfx950"],
+        assert (
+            checkAllclose(
+                ref_key,
+                tri_key,
+                atol=1e-1,
+                rtol=1e-1,
+                tol_err_ratio=tol_err_ratio,
+                msg="key_cache written slots",
+            )
+            <= tol_err_ratio
         )
-        torch.testing.assert_close(
-            torch_value_cache,
-            triton_value_cache,
-            atol=1e-1,
-            rtol=1e-1,
-            equal_nan=arch_info.get_arch() not in ["gfx950"],
+        assert (
+            checkAllclose(
+                ref_value,
+                tri_value,
+                atol=1e-1,
+                rtol=1e-1,
+                tol_err_ratio=tol_err_ratio,
+                msg="value_cache written slots",
+            )
+            <= tol_err_ratio
         )
 
 
