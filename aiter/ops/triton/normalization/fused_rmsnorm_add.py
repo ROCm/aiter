@@ -3,7 +3,7 @@
 
 import torch
 import triton
-from aiter.ops.triton._gluon_kernels.gfx1250.norm.rmsnorm import (
+from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
     _gluon_fused_rms_kernel,
 )
 
