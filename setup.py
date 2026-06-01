@@ -65,20 +65,17 @@ if not IS_WINDOWS and is_develop_mode():
         if Version(pkg_version("flydsl")) != Version(FLYDSL_VERSION.split("==")[1]):
             raise ImportError("version mismatch")
     except Exception:
-        try:
-            subprocess.check_call(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--find-links",
-                    FLYDSL_FIND_LINKS,
-                    FLYDSL_VERSION,
-                ]
-            )
-        except Exception:
-            print("WARNING: failed to install flydsl, skipping")
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--find-links",
+                FLYDSL_FIND_LINKS,
+                FLYDSL_VERSION,
+            ]
+        )
 
 
 def _is_triton_installed():
