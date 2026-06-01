@@ -312,6 +312,42 @@ jobs:
             python -c "from flash_attn.flash_attn_interface import flash_attn_func; print('flash_attn_func loaded (fake ROCm):', flash_attn_func)"
         shell: bash
 
+  # Triton-backend users install aiter on a pip ROCm distribution that has no
+  # C++ build toolchain or CK. With AITER_TRITON_ONLY, `import aiter` must expose
+  # the Triton ops without triggering the C++ JIT build (see FA #2580). No GPU.
+  nightly_smoke:
+    if: ${{ needs.prechecks.outputs.run_triton == 'true' }}
+    name: Nightly Smoke Test
+    needs: [prechecks]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install torch (pip ROCm nightly)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --pre torch torchvision torchaudio \
+            --index-url https://rocm.nightlies.amd.com/v2/gfx110X-all/
+        shell: bash
+
+      - name: Install aiter
+        run: pip install -e . --no-build-isolation
+        shell: bash
+
+      - name: Import aiter (Triton ops only, no JIT)
+        env:
+          AITER_TRITON_ONLY: 1
+        run: python -c "import aiter; import aiter.ops.triton; print('triton-only import OK')"
+        shell: bash
+
   # =============================================================================
   # CK Backend
   # =============================================================================
