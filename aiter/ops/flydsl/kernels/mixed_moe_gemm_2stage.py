@@ -121,20 +121,17 @@ def compile_mixed_moe_gemm1(
     allocator_ping = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem1")
     _state = {}
 
-    if a_dtype not in ("fp8", "fp16", "int8", "fp4"):
+    # Specialized to a4w4 (a=fp4) and a8w4 (a=fp8); weights are always fp4.
+    if a_dtype not in ("fp4", "fp8"):
         raise ValueError(
-            f"a_dtype must be one of ('fp8','fp16','int8','fp4'), got {a_dtype!r}"
+            f"mixed MoE supports a_dtype in ('fp4','fp8'), got {a_dtype!r}"
         )
-    if b_dtype not in ("fp8", "fp16", "int8", "int4", "fp4"):
-        raise ValueError(
-            f"b_dtype must be one of ('fp8','fp16','int8','int4','fp4'), got {b_dtype!r}"
-        )
+    if b_dtype != "fp4":
+        raise ValueError(f"mixed MoE supports b_dtype='fp4' only, got {b_dtype!r}")
 
-    is_f16_a = a_dtype == "fp16"
-    is_f16_b = b_dtype == "fp16"
     is_f8_a = a_dtype == "fp8"
     is_f4_a = a_dtype == "fp4"
-    is_f4_b = b_dtype == "fp4"
+    is_f4_b = True
 
     sort_block_m = max(32, tile_m)
     num_waves = min(4, tile_n // 32)
@@ -145,7 +142,7 @@ def compile_mixed_moe_gemm1(
     pack_K = 2
     scale_mn_pack = 2
     elem_bytes = 1
-    a_elem_bytes = 2 if is_f16_a else 1
+    a_elem_bytes = 1
     b_elem_bytes = 1
     tile_k_bytes = int(tile_k) * int(a_elem_bytes)
     a_elem_vec_pack = 2 if is_f4_a else 1
@@ -158,13 +155,9 @@ def compile_mixed_moe_gemm1(
     out_s = str(out_dtype).strip().lower()
     out_is_f32 = out_s in ("f32", "fp32", "float")
     out_is_bf16 = out_s in ("bf16", "bfloat16")
-    is_int4 = b_dtype == "int4"
-    is_int8 = False
 
     def _w_elem_type():
-        if is_f4_b:
-            return T.i8
-        return T.f16 if is_f16_b else (T.i8 if is_int8 else T.f8)
+        return T.i8
 
     def out_elem():
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
@@ -288,7 +281,7 @@ def compile_mixed_moe_gemm1(
         _ping_buffer_bytes = _single_x_bytes
 
     def x_lds_elem():
-        return T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
+        return T.f8
 
     lds_pong_offset = allocator_pong._align(allocator_pong.ptr, 16)
     allocator_pong.ptr = lds_pong_offset + _pong_buffer_bytes
@@ -307,10 +300,10 @@ def compile_mixed_moe_gemm1(
         if _cur_lds < _min_lds:
             allocator_ping.ptr += _min_lds - _cur_lds
 
-    kpack_bytes = 8 if is_int4 else 16
+    kpack_bytes = 16
     out_elem_bytes = 4 if out_is_f32 else 2
-    w_elem_bytes = 2 if is_f16_b else 1
-    w_elem_pack = 2 if (is_f4_b or is_int4) else 1
+    w_elem_bytes = 1
+    w_elem_pack = 2
     w_nbytes = (experts * (2 * inter_dim) * model_dim * w_elem_bytes) // w_elem_pack
     bias_nbytes = experts * (2 * inter_dim) * 4
 
@@ -441,7 +434,7 @@ def compile_mixed_moe_gemm1(
             k_in = fx.Index(i32_k_in.ir_value())
             size_expert_ids_in = fx.Index(i32_size_expert_ids_in.ir_value())
 
-            x_elem = T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
+            x_elem = T.f8
             f32 = T.f32
             i32 = T.i32
             i64 = T.i64
@@ -615,7 +608,7 @@ def compile_mixed_moe_gemm1(
 
             sx_rsrc = 1
             sw_rsrc = 1
-            if const_expr(not (is_f16_a or a_scale_one)):
+            if const_expr(not a_scale_one):
                 # A scale: [sorted_size, model_dim/32] pre-scattered by caller
                 c32 = fx.Index(32)
                 kblk = k_in // c32
@@ -623,13 +616,12 @@ def compile_mixed_moe_gemm1(
                 sx_nbytes_i32 = fx.Int32(sx_nbytes_idx)
                 sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
 
-            if const_expr(not is_f16_b):
-                c32 = fx.Index(32)
-                kblk_w = k_in // c32
-                mn_w = fx.Index(experts * (2 * inter_dim))
-                sw_nbytes_idx = mn_w * kblk_w
-                sw_nbytes_i32 = fx.Int32(sw_nbytes_idx)
-                sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
+            c32 = fx.Index(32)
+            kblk_w = k_in // c32
+            mn_w = fx.Index(experts * (2 * inter_dim))
+            sw_nbytes_idx = mn_w * kblk_w
+            sw_nbytes_i32 = fx.Int32(sw_nbytes_idx)
+            sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
 
             sorted_nbytes_idx = size_expert_ids_in * (sort_block_m * 4)
             sorted_nbytes_i32 = fx.Int32(sorted_nbytes_idx)
@@ -2615,18 +2607,8 @@ def compile_mixed_moe_gemm2(
       - <= 0: **persistent mode** -- grid_y = cu_num (auto-detected), each CTA
         round-robins over M tiles with stride cu_num.
 
-    a_dtype:
-      - "fp8": A2 is fp8
-      - "fp16": A2 is fp16 (caller uses tile_k halved vs fp8 to match MFMA K halving)
-      - "int8": A2 is int8
-      - "fp4": A2 is fp4
-
-    b_dtype:
-      - "fp8": W is fp8
-      - "fp16": W is fp16 (caller uses tile_k halved vs fp8 to match MFMA K halving)
-      - "int8": W is int8
-      - "int4": W4A8 path: A2 is int8, W is packed int4 (2 values per byte) unpacked to int8 in-kernel
-      - "fp4": W is fp4
+    Supported dtypes (specialized): a8w4 (a_dtype="fp8") and a4w4
+    (a_dtype="fp4"); b_dtype is always "fp4".
 
     Stage2 output supports:
       - out_dtype="f16": fp16 half2 atomics (fast, can overflow to +/-inf for bf16 workloads)
@@ -2650,33 +2632,29 @@ def compile_mixed_moe_gemm2(
     allocator_ping = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem1")
     _state = {}
 
-    if a_dtype not in ("fp8", "fp16", "int8", "fp4"):
+    # Specialized to a4w4 (a=fp4) and a8w4 (a=fp8); weights are always fp4.
+    if a_dtype not in ("fp4", "fp8"):
         raise ValueError(
-            f"a_dtype must be one of ('fp8','fp16','int8','fp4'), got {a_dtype!r}"
+            f"mixed MoE supports a_dtype in ('fp4','fp8'), got {a_dtype!r}"
         )
-    if b_dtype not in ("fp8", "fp16", "int8", "int4", "fp4"):
-        raise ValueError(
-            f"b_dtype must be one of ('fp8','fp16','int8','int4','fp4'), got {b_dtype!r}"
-        )
-
-    is_f16_a = a_dtype == "fp16"
-    is_f16_b = b_dtype == "fp16"
+    if b_dtype != "fp4":
+        raise ValueError(f"mixed MoE supports b_dtype='fp4' only, got {b_dtype!r}")
 
     is_f8_a = a_dtype == "fp8"
     is_f4_a = a_dtype == "fp4"
-    is_f4_b = b_dtype == "fp4"
+    is_f4_b = True
 
     _scale_pack_m = 2  # physical mn_pack in preshuffle microscale layout
     _scale_pack_n = 2
     _scale_pack_k = 2  # physical k_pack in preshuffle scale layout
     pack_M = min(_scale_pack_m, tile_m // 16)
     pack_N = min(_scale_pack_n, tile_n // 64)
-    _k_unroll_raw = (int(tile_k) * (2 if a_dtype == "fp16" else 1)) // 128
+    _k_unroll_raw = int(tile_k) // 128
     pack_K = min(_scale_pack_k, _k_unroll_raw)
 
     elem_bytes = 1
 
-    a_elem_bytes = 2 if is_f16_a else 1
+    a_elem_bytes = 1
     b_elem_bytes = 1
     tile_k_bytes = int(tile_k) * int(a_elem_bytes)
 
@@ -2689,7 +2667,7 @@ def compile_mixed_moe_gemm2(
     # Using them in an explicit multiply-add replaces the fly dialect's
     # dynamic ``crd2idx`` path which emits Barrett reduction for the
     # non-power-of-2 ``n0 = experts*model_dim//16`` shape.
-    _b_kpack_bytes_s = 8 if (b_dtype == "int4") else 16
+    _b_kpack_bytes_s = 16
     _b_kpack_elems_s = _b_kpack_bytes_s // b_elem_bytes
     _b_c_k_s = inter_dim // _scale_pack_k
     _b_c_k0_s = (_b_c_k_s * b_elem_bytes) // 64
@@ -2718,29 +2696,13 @@ def compile_mixed_moe_gemm2(
         raise ValueError(
             "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16'}"
         )
-    is_int4 = b_dtype == "int4"
-    w_elem_bytes = 2 if is_f16_b else 1
-    w_elem_pack = 2 if (is_f4_b or is_int4) else 1
+    w_elem_bytes = 1
+    w_elem_pack = 2
     w_nbytes = (experts * model_dim * inter_dim * w_elem_bytes) // w_elem_pack
     bias_nbytes = experts * model_dim * 4
-    # INT4 here means W4A8: A2 is int8, W is packed int4 and unpacked to int8 in-kernel.
-    is_int8 = False
-
-    mfma_i32_k32 = None
-    if is_int8:
-        mfma_i32_k32 = getattr(rocdl, "mfma_i32_16x16x32i8", None) or getattr(
-            rocdl, "mfma_i32_16x16x32_i8", None
-        )
-        if mfma_i32_k32 is None:
-            raise AttributeError(
-                "INT8 K32 MFMA op not found: expected `rocdl.mfma_i32_16x16x32i8` "
-                "(or `rocdl.mfma_i32_16x16x32_i8`)."
-            )
 
     def _w_elem_type():
-        if is_f4_b:
-            return T.i8
-        return T.f16 if is_f16_b else (T.i8 if is_int8 else T.f8)
+        return T.i8
 
     total_threads = 256
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
@@ -2838,7 +2800,7 @@ def compile_mixed_moe_gemm2(
     _ping_buffer_bytes = _single_x_bytes
 
     def x_lds_elem():
-        return T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
+        return T.f8
 
     lds_pong_offset = allocator_pong._align(allocator_pong.ptr, 16)
     allocator_pong.ptr = lds_pong_offset + _pong_buffer_bytes
@@ -2872,7 +2834,7 @@ def compile_mixed_moe_gemm2(
             n_in = fx.Index(i32_n_in.ir_value())
             k_in = fx.Index(i32_k_in.ir_value())
             size_expert_ids_in = fx.Index(i32_size_expert_ids_in.ir_value())
-            x_elem = T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
+            x_elem = T.f8
             f32 = T.f32
             i32 = T.i32
             i64 = T.i64
@@ -2891,11 +2853,7 @@ def compile_mixed_moe_gemm2(
                     addr_i64, num_records_bytes=num_records_bytes
                 )
 
-            acc_init = (
-                arith.constant_vector(0, vec4_i32)
-                if is_int8
-                else arith.constant_vector(0.0, vec4_f32)
-            )
+            acc_init = arith.constant_vector(0.0, vec4_f32)
 
             # A2 layout (flatten token-slot -> M; use i32 for fly.make_shape).
             topk_idx = fx.Index(topk)
@@ -2903,7 +2861,7 @@ def compile_mixed_moe_gemm2(
 
             # B preshuffle layout: [experts*model_dim, inter_dim]
             c_n_total = fx.Index(experts * model_dim)
-            kpack_bytes = 8 if is_int4 else 16
+            kpack_bytes = 16
             from .layout_utils import _div_pow2, _mod_pow2
 
             # A&B's scale preshuffle layout
@@ -3030,31 +2988,22 @@ def compile_mixed_moe_gemm2(
             num_valid_i32 = rocdl.ReadfirstlaneOp(T.i32, num_valid_i32).res
             num_valid_idx = fx.Index(num_valid_i32)
 
-            # fp16 path ignores scales completely (implicit scale=1.0).
             sx_rsrc = 1
             sw_rsrc = 1
-            if const_expr(not is_f16_a):
-                if const_expr(is_f4_a or is_f8_a):
-                    # A2 microscale: e8m0 in sorted layout [sorted_size, K/32].
-                    # Caller must pre-scatter a2_scale via moe_mxfp4_sort.
-                    kblk = _div_pow2(k_in, 32)
-                    sx_nbytes_idx = num_valid_idx * kblk
-                    sx_nbytes_i32 = fx.Int32(sx_nbytes_idx)
-                    sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
-                else:
-                    # scale_x (A2 scale): [tokens*topk] f32 -> bytes = tokens*topk*4
-                    sx_nbytes_idx = (tokens_in * c_topk) * 4
-                    sx_nbytes_i32 = fx.Int32(sx_nbytes_idx)
-                    sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
+            # A2 microscale: e8m0 in sorted layout [sorted_size, K/32].
+            # Caller must pre-scatter a2_scale via moe_mxfp4_sort.
+            kblk = _div_pow2(k_in, 32)
+            sx_nbytes_idx = num_valid_idx * kblk
+            sx_nbytes_i32 = fx.Int32(sx_nbytes_idx)
+            sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
 
-            if const_expr(not is_f16_b):
-                # Weight microscale buffer (packed i32 holding e8m0 bytes).
-                # Use an exact descriptor size so hardware OOB checking works.
-                kblk_w = _div_pow2(k_in, 32)  # K/32
-                mn_w = fx.Index(experts * model_dim)
-                sw_nbytes_idx = mn_w * kblk_w  # bytes (e8m0)
-                sw_nbytes_i32 = fx.Int32(sw_nbytes_idx)
-                sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
+            # Weight microscale buffer (packed i32 holding e8m0 bytes).
+            # Use an exact descriptor size so hardware OOB checking works.
+            kblk_w = _div_pow2(k_in, 32)  # K/32
+            mn_w = fx.Index(experts * model_dim)
+            sw_nbytes_idx = mn_w * kblk_w  # bytes (e8m0)
+            sw_nbytes_i32 = fx.Int32(sw_nbytes_idx)
+            sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
 
             # sorted_token_ids / sorted_weights: [blocks*tile_m] (padded length)
             sorted_nbytes_idx = (
@@ -3168,23 +3117,16 @@ def compile_mixed_moe_gemm2(
                 # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
                 # Prefer 16B buffer-load (dwordx4). If the per-thread byte count isn't divisible by
                 # 16, fall back to 8B (dwordx2) or 4B (dword) loads. For fp16 we require 16B.
-                if const_expr(is_f16_a):
-                    if const_expr(bytes_per_thread_x % 16 != 0):
-                        raise ValueError(
-                            f"[fp16] bytes_per_thread_x ({bytes_per_thread_x}) must be divisible by 16"
-                        )
+                if const_expr(bytes_per_thread_x % 16 == 0):
                     x_load_bytes = 16
+                elif const_expr(bytes_per_thread_x % 8 == 0):
+                    x_load_bytes = 8
+                elif const_expr(bytes_per_thread_x % 4 == 0):
+                    x_load_bytes = 4
                 else:
-                    if const_expr(bytes_per_thread_x % 16 == 0):
-                        x_load_bytes = 16
-                    elif const_expr(bytes_per_thread_x % 8 == 0):
-                        x_load_bytes = 8
-                    elif const_expr(bytes_per_thread_x % 4 == 0):
-                        x_load_bytes = 4
-                    else:
-                        raise ValueError(
-                            f"bytes_per_thread_x ({bytes_per_thread_x}) must be divisible by 4 to use the dword-indexed load mapping."
-                        )
+                    raise ValueError(
+                        f"bytes_per_thread_x ({bytes_per_thread_x}) must be divisible by 4 to use the dword-indexed load mapping."
+                    )
                 num_x_loads = bytes_per_thread_x // x_load_bytes
                 chunk_i32 = x_load_bytes // 4  # dwords per chunk (1/2/4)
                 vec4_i32 = T.vec(4, i32)
@@ -3502,7 +3444,7 @@ def compile_mixed_moe_gemm2(
                     else:
                         b_tile_full = b_tile_in
                     acc_list = list(acc_in)
-                    mfma_res_ty = vec4_i32 if is_int8 else vec4_f32
+                    mfma_res_ty = vec4_f32
 
                     epilogue_pf = None
                     bias = None
@@ -4015,9 +3957,6 @@ def compile_mixed_moe_gemm2(
                         col_local = col_base_local + (ni * 16)
                         acc_idx = mi * num_acc_n + ni
                         v = Vec(acc[acc_idx])[ii].ir_value()
-                        if const_expr(is_int8):
-                            # keep raw: no ArithValue/fx signed-int->float equivalent
-                            v = arith.sitofp(f32, v)
                         if const_expr(enable_bias):
                             v = v + bias_pf[ni]
 
