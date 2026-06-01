@@ -193,27 +193,6 @@ def preshuffle_weights_gfx1250(data):
     return data.transpose(-1, -2)
 
 
-@gluon.constexpr_function
-def get_wmma_layout(num_warps, packed, scale_preshuffle):
-    assert num_warps in (4, 8)
-    if scale_preshuffle:
-        reg_bases = [[0, 1], [1, 0]]
-        tiles_per_warp = 2
-    else:
-        reg_bases = []
-        tiles_per_warp = 1
-
-    # [NUM_WARPS // 2, 2]
-    if num_warps == 4:
-        warp_bases = [[0, tiles_per_warp], [tiles_per_warp, 0]]
-    else:
-        warp_bases = [[0, tiles_per_warp], [0, tiles_per_warp * 2], [tiles_per_warp, 0]]
-
-    instr_shape = [16, 16, 64] if packed else [16, 16, 128]
-
-    return gl.amd.AMDWMMALayout(3, True, warp_bases, reg_bases, instr_shape)
-
-
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
@@ -388,12 +367,6 @@ def moe_gemm_a4w4(
     # launch kernel
     if use_gluon and get_arch() == "gfx1250":
         # layouts
-        WMMA_LAYOUT = get_wmma_layout(
-            config["num_warps"], False, swizzle_mx_scale == "GFX1250_SCALE"
-        )
-        WMMA_LAYOUT_PACKED = get_wmma_layout(
-            config["num_warps"], True, swizzle_mx_scale == "GFX1250_SCALE"
-        )
         assert (
             config["split_k"] == 1
         ), "Split-k is not supported for Gluon backend on gfx1250"
@@ -445,10 +418,7 @@ def moe_gemm_a4w4(
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
             NUM_BUFFERS=config["num_buffers"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
-            WMMA_LAYOUT=WMMA_LAYOUT,
-            WMMA_LAYOUT_PACKED=WMMA_LAYOUT_PACKED,
             L2_PREFETCH_DISTANCE=config["l2_prefetch_distance"],
-            NUM_WARPS=config["num_warps"],
             num_warps=config["num_warps"],
             waves_per_eu=config["waves_per_eu"],
         )

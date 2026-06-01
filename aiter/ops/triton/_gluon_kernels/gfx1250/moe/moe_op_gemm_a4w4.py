@@ -182,12 +182,8 @@ def _moe_gemm_a4w4_gfx1250(
     PRESHUFFLE_WEIGHTS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     UPCAST_INDICES: gl.constexpr,
-    # layouts
-    WMMA_LAYOUT: gl.constexpr,
-    WMMA_LAYOUT_PACKED: gl.constexpr,
     L2_PREFETCH_DISTANCE: gl.constexpr,
-    # triton configs
-    NUM_WARPS: gl.constexpr,
+    num_warps: gl.constexpr,
 ):
     gl.assume(stride_y_k >= 0)
     gl.assume(stride_y_m >= 0)
@@ -280,6 +276,20 @@ def _moe_gemm_a4w4_gfx1250(
     )  # 32 elements share 1 scale element
 
     # wmma layouts
+    WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
+        3,
+        transposed=True,
+        warp_bases=[[0, 1], [1, 0]],
+        reg_bases=[],
+        instr_shape=[16, 16, 128],
+    )
+    WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(
+        3,
+        transposed=True,
+        warp_bases=[[0, 1], [1, 0]],
+        reg_bases=[],
+        instr_shape=[16, 16, 64],
+    )
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT_PACKED, k_width=16
     )
@@ -293,7 +303,7 @@ def _moe_gemm_a4w4_gfx1250(
         DOT_LAYOUT_W, [PACKED_BLOCK_N_W, MX_SCALE_BLOCK_K]
     )
     BLOCKED_LAYOUT_X_SCALES: gl.constexpr = gl.BlockedLayout(
-        [1, MX_SCALE_BLOCK_K], [32, 1], [NUM_WARPS, 1], [1, 0]
+        [1, MX_SCALE_BLOCK_K], [32, 1], [num_warps, 1], [1, 0]
     )
 
     # A pointers
@@ -302,7 +312,7 @@ def _moe_gemm_a4w4_gfx1250(
         X += start_m * stride_x_m
     else:
         IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
-            0, gl.BlockedLayout([1, 8], [32, 1], [1, NUM_WARPS], [0, 1])
+            0, gl.BlockedLayout([1, 8], [32, 1], [1, num_warps], [0, 1])
         )
         offs_x_m = PACKED_BLOCK_M_X * block_id + gl.arange(
             0, PACKED_BLOCK_M_X, layout=IDX_LAYOUT
@@ -707,7 +717,7 @@ def _moe_gemm_a4w4_gfx1250(
             SWIGLU_LAYOUT: gl.constexpr = gl.BlockedLayout(
                 size_per_thread=[1, 2],
                 threads_per_warp=[16, 2],
-                warps_per_cta=[NUM_WARPS, 1],
+                warps_per_cta=[num_warps, 1],
                 order=[1, 0],
             )
             acc = gl.convert_layout(acc, SWIGLU_LAYOUT)
