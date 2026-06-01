@@ -12,6 +12,13 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter import hipb_mm, hipb_create_extension
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx, get_cu_num
+
+try:
+    from tuned_op_bench_utils import append_tuned_op_bench_rows
+except ModuleNotFoundError as e:
+    if e.name != "tuned_op_bench_utils":
+        raise
+    from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 import pandas as pd
 import argparse
 from functools import lru_cache
@@ -161,20 +168,21 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
                 printLog=False,
             )
         else:
-            err_b = checkAllclose(a, b, msg="ck: ", rtol=1e-2, atol=1e-2)
+            err_b = checkAllclose(
+                a, b, msg="ck: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
+            )
     if quantDtype != dtypes.i8:
         c, avg_c = run_gemm_ck_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
         # c = c + bias
-        err_c = checkAllclose(a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2)
+        err_c = checkAllclose(
+            a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
+        )
     else:
         avg_c = None
         err_c = None
 
     avg_d = None
     err_d = None
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
     if (
         dtype == dtypes.bf16
         and quantDtype == dtypes.i8
@@ -184,7 +192,9 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
         bias_f32 = bias.to(dtypes.fp32)
         d, avg_d = run_gemm_asm(x_asm, weightshuffle, x_scale, w_scale, bias_f32, dtype)
         if d is not None:
-            err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
+            err_d = checkAllclose(
+                a, d, msg="asm: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
+            )
         else:
             avg_d = None
 
@@ -193,7 +203,14 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
         init_hipblas()
         e, avg_e = run_aiter_hip_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
         # e = e + bias
-        err_e = checkAllclose(a, e, msg="hipmm bpreshuffle: ", rtol=1e-2, atol=1e-2)
+        err_e = checkAllclose(
+            a,
+            e,
+            msg="hipmm bpreshuffle: ",
+            rtol=1e-2,
+            atol=1e-2,
+            catastrophic_check=True,
+        )
     else:
         avg_e = None
         err_e = None
@@ -224,7 +241,9 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
         b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
-    checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
+    checkAllclose(
+        a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01, catastrophic_check=True
+    )
 
 
 def get_boundary_test_cases(cu_count, aligned_k):
@@ -409,7 +428,7 @@ def test_skinny_gemm_a8w8_pertoken_quant():
 
 
 def _iter_flydsl_csv_cases():
-    """Yield test_gemm kwargs for every flydsl row in the merged bpreshuffle tuned CSV."""
+    """Yield (test_gemm kwargs, bench metadata) for flydsl tuned CSV rows."""
     gfx, cu = get_gfx(), get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
     df = pd.read_csv(merged_csv)
@@ -423,14 +442,21 @@ def _iter_flydsl_csv_cases():
     )
     for _, row in rows.iterrows():
         q_dtype = dtypes.fp8 if "float8" in str(row["q_dtype_w"]) else dtypes.i8
-        yield dict(
-            dtype=dtypes.bf16,
-            m=int(row["M"]),
-            n=int(row["N"]),
-            k=int(row["K"]),
-            quantDtype=q_dtype,
-            pad_a=128,
-            skip_ck=True,
+        yield (
+            dict(
+                dtype=dtypes.bf16,
+                m=int(row["M"]),
+                n=int(row["N"]),
+                k=int(row["K"]),
+                quantDtype=q_dtype,
+                pad_a=128,
+                skip_ck=True,
+            ),
+            {
+                "source": "flydsl_csv",
+                "libtype": str(row.get("libtype", "")),
+                "kernelName1": str(row.get("kernelName", "")),
+            },
         )
 
 
@@ -558,8 +584,21 @@ parser.add_argument(
 args = parser.parse_args()
 
 if not args.no_flydsl_csv:
-    for kwargs in _iter_flydsl_csv_cases():
-        test_gemm(**kwargs)
+    bench_csv = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
+    for kwargs, extras in _iter_flydsl_csv_cases():
+        ret = test_gemm(**kwargs)
+        ret.update(extras)
+        written = append_tuned_op_bench_rows(
+            bench_csv,
+            [ret],
+            op_name="gemm_a8w8",
+        )
+        if written:
+            aiter.logger.info(
+                "gemm_a8w8: appended %d tuned op bench row(s) to %s",
+                written,
+                bench_csv,
+            )
 
 if not args.no_legacy:
     if args.csv is not None:
