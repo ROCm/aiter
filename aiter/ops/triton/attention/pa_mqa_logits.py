@@ -257,11 +257,18 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     is_gfx1250 = gfx_version == "gfx1250"
     if is_gfx1250:
         assert not Preshuffle, (
-            "Preshuffle path on gfx1250 is not implemented yet; only the "
-            "KVBlockSize=1 base kernel has been ported."
+            "Preshuffle path on gfx1250 is not implemented yet. Supported: the "
+            "KVBlockSize=1 base kernel and the KVBlockSize==ChunkK (>1) TDM "
+            "block-load kernel."
         )
         assert not VarCtxOpt, (
             "VarCtx path on gfx1250 is not implemented yet."
+        )
+        # gfx1250 supports either KVBlockSize==1 (per-token gather base path) or
+        # KVBlockSize==ChunkK>1 (TDM block-load path). Other ratios are not wired.
+        assert KVBlockSize == 1 or KVBlockSize == ChunkK, (
+            f"gfx1250 requires KVBlockSize==1 or KVBlockSize==ChunkK; got "
+            f"KVBlockSize={KVBlockSize}, ChunkK={ChunkK}."
         )
     cdna_version = get_cdna_version()
     warp_size = 32 if is_gfx1250 else 64

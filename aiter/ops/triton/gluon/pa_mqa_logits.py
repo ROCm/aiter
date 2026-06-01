@@ -194,21 +194,28 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         + gl.arange(0, ChunkQ, layout=layout_scale),
     )
 
-    if IS_GFX1250:
+    USE_TDM_BLOCK_LOAD: gl.constexpr = IS_GFX1250 and (KVBlockSize == ChunkK) and (
+        KVBlockSize > 1
+    )
+    if USE_TDM_BLOCK_LOAD:
         # gfx1250 TDM block-load path (1:1: one ChunkK tile == one paged block).
         # K for a block is physically contiguous (token stride = HiddenDim); blocks
         # jump by stride_k_seq (includes the per-block scale gap). We async_load the
-        # block into LDS, then read it transposed via ds_read_tr8 (the .permute load).
-        gl.static_assert(
-            ChunkK == KVBlockSize,
-            "gfx1250 TDM block-load path currently requires ChunkK == KVBlockSize",
-        )
-        # PaddedSharedLayout with interval 8 keeps fp8 ds_read_tr8 (tileSize=8) eligible.
+        # block into LDS, then read it transposed (the .permute load) for WMMA.
+        #
+        # Double-buffered: NUM_BUFFERS=2 LDS slices toggled by tile parity. Each
+        # iteration issues the async_load for tile t+1 into the *other* buffer
+        # before async_wait(1) drains tile t, so the TDM block transfer overlaps
+        # this tile's WMMA/reduce/store. Descriptors are rebuilt per tile because
+        # each paged block sits at a runtime row (base = blk * stride_k_seq).
+        NUM_BUFFERS: gl.constexpr = 2
         KV_SHARED: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[HiddenDim, 8]], [KVBlockSize, HiddenDim], [1, 0]
         )
         kv_shared = gl.allocate_shared_memory(
-            KV_buffer.type.element_ty, [KVBlockSize, HiddenDim], KV_SHARED
+            KV_buffer.type.element_ty,
+            [NUM_BUFFERS, KVBlockSize, HiddenDim],
+            KV_SHARED,
         )
         mfma_q = gl.convert_layout(q, mfma_layout_a)
         zero_acc = gl.zeros((ChunkQ, ChunkK), dtype=tl.float32, layout=mfma_layout)
@@ -216,19 +223,43 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
 
         n_tiles = tl.cdiv(split_context_length, ChunkK)
         cblk_base = split_context_start // KVBlockSize
+        kv_idx_base = kv_indices + pid_batch * max_block_len + cblk_base
+
+        # Prologue: kick off the async_load for tile 0 into buffer 0.
+        blk_cur = gl.load(kv_idx_base)
+        desc_cur = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=KV_buffer + blk_cur * stride_k_seq,
+            shape=(KVBlockSize, HiddenDim),
+            strides=(HiddenDim, 1),
+            block_shape=(KVBlockSize, HiddenDim),
+            layout=KV_SHARED,
+        )
+        gl.amd.gfx1250.tdm.async_load(desc_cur, [0, 0], kv_shared.index(0))
+
         for t in range(0, n_tiles):
+            buf = t % NUM_BUFFERS
             context_idx = split_context_start + t * ChunkK
-            blk = gl.load(kv_indices + pid_batch * max_block_len + cblk_base + t)
-            kv_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-                base=KV_buffer + blk * stride_k_seq,
-                shape=(KVBlockSize, HiddenDim),
-                strides=(HiddenDim, 1),
-                block_shape=(KVBlockSize, HiddenDim),
-                layout=KV_SHARED,
-            )
-            gl.amd.gfx1250.tdm.async_load(kv_desc, [0, 0], kv_shared)
-            gl.amd.gfx1250.tdm.async_wait(0)
-            mfma_k = kv_shared.permute([1, 0]).load(layout=mfma_layout_b)
+            blk = blk_cur
+
+            # Prefetch tile t+1 into the other buffer before waiting on tile t.
+            if t + 1 < n_tiles:
+                blk_cur = gl.load(kv_idx_base + (t + 1))
+                desc_cur = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                    base=KV_buffer + blk_cur * stride_k_seq,
+                    shape=(KVBlockSize, HiddenDim),
+                    strides=(HiddenDim, 1),
+                    block_shape=(KVBlockSize, HiddenDim),
+                    layout=KV_SHARED,
+                )
+                gl.amd.gfx1250.tdm.async_load(
+                    desc_cur, [0, 0], kv_shared.index((t + 1) % NUM_BUFFERS)
+                )
+                # Leave exactly the just-issued load (tile t+1) in flight.
+                gl.amd.gfx1250.tdm.async_wait(1)
+            else:
+                gl.amd.gfx1250.tdm.async_wait(0)
+
+            mfma_k = kv_shared.index(buf).permute([1, 0]).load(layout=mfma_layout_b)
             o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero_acc)
 
             k_scale_f = gl.amd.cdna3.buffer_load(
