@@ -108,3 +108,36 @@ def mxfp4_moe_scatter_reduce(
     D_HIDDEN: int,
     MB: int,
 ) -> None: ...
+
+
+@compile_ops("module_moe_mxfp4_gemm")
+def mxfp4_moe_gemm1_a4w4(
+    cumsum_tensor: Tensor,
+    a_quant: Tensor,
+    a_scale_sorted_shuffled: Tensor,
+    w12_shuffled_quant: Tensor,
+    w12_shuffled_scale: Tensor,
+    sorted_expert_ids: Tensor,
+    m_indices: Tensor,
+    inter_sorted_quant: Tensor,
+    inter_sorted_shuffled_scale: Tensor,
+    hidden_states: Tensor,
+    kernelName: str,
+) -> None: ...
+
+
+@compile_ops("module_moe_mxfp4_gemm")
+def mxfp4_moe_gemm2_a4w4(
+    cumsum_tensor: Tensor,
+    inter_sorted_quant: Tensor,
+    inter_sorted_shuffled_scale: Tensor,
+    w3_shuffled_quant: Tensor,
+    w3_shuffled_scale: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    sorted_weights: Tensor,
+    flat_out: Tensor,
+    M_logical: int,
+    max_sorted: int,
+    kernelName: str,
+) -> None: ...
