@@ -1444,7 +1444,9 @@
             "f'{AITER_CSRC_DIR}/kernels/mla/reduce.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-mllvm -enable-post-misched=1'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
