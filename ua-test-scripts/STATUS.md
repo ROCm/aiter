@@ -1271,6 +1271,82 @@ overlapped.
 
 ---
 
+## Post-permlane32 prefill bottleneck re-profile (2026-06-01)
+
+Re-ran the four-phase `rocprof_prefill_d128.sh` capture on the canonical
+worst-gap cell (`b=16 sq=sk=10000 d128 fp8 hq,hk=12,2 ps=64`, GPU3,
+gfx950) after the `ds_bpermute → v_permlane32_swap_b32` change, vs the
+pre-change `_dedup` run. Report:
+`rocprof_analysis/BOTTLENECK_PREFILL_D128_FP8_PERMLANE.md`.
+
+**Wall time: 5.938 → 5.778 ms avg (−2.7%)** — matches the ~2% sweep
+delta at this shape. The mechanism is exactly the intended one:
+
+| metric (per dispatch) | dedup | permlane | Δ |
+|---|---:|---:|---|
+| MFMA          | 154.64M | 154.64M | 0% (matmul unchanged) |
+| VALU          | 1,750M  | 1,692M  | **−3.3%** (is_sub_0 cndmask gone) |
+| SALU          | 502M    | 449M    | **−10.4%** (lane_id/bperm addr calc gone) |
+| LDS instrs    | 193M    | 174M    | **−10.0%** (ds_bpermute was an LDS op) |
+| `SQ_WAIT_INST_LDS` | 140.9M | 99.7M | **−29%** (LDS-crossbar wait gone) |
+
+**The kernel is now even more VALU-bound** — the permute change removed
+LDS/SALU work, so VALU's share of the profile rose. PC-sampling
+(336.6k stochastic samples):
+
+| Instruction_Type | dedup | permlane |
+|---|---:|---:|
+| VALU    | 44.3% | **47.2%** (42.4% of them stalled) |
+| NO_INST | 31.8% | 30.7% |
+| MATRIX  | 6.8%  | 6.8%  |
+| LDS     | 5.1%  | 4.0%  |
+
+| Stall_Reason | dedup | permlane |
+|---|---:|---:|
+| ARBITER_WIN_EX_STALL | 24.3% | **25.0%** |
+| ARBITER_NOT_WIN      | 21.5% | **22.7%** |
+| BARRIER_WAIT         | 19.2% | 21.1% |
+| WAITCNT              | 16.0% | 13.7% (↓ — less LDS/VMEM latency) |
+| ALU_DEPENDENCY       |  8.7% |  6.0% (↓) |
+
+`ARBITER_WIN_EX_STALL + ARBITER_NOT_WIN = 47.7%` of all stalls — the
+signature of **VALU-issue-port saturation**: instructions are ready but
+lose arbitration because the SIMD VALU pipe is oversubscribed. `WAITCNT`
+and `ALU_DEPENDENCY` both fell (the `ds_bpermute` latency they partly
+reflected is gone), so the residual stall budget is now dominated by
+raw VALU throughput + the warp-group barrier imbalance, not memory.
+
+Top stalled instructions (non-issued PCs):
+
+| samples | instruction | what it is |
+|---:|---|---|
+| 43,202 | `s_barrier` | warp-group pingpong imbalance (B1/B2/B3, unchanged) |
+| 10,890 | `s_waitcnt lgkmcnt(0)` | LDS drain |
+|  9,713 | `s_waitcnt vmcnt(0)` | VMEM drain |
+|  7,812 | `v_add_u32_e32 v114, v98, v100` | **address-calc int add** (arbiter-stalled) |
+|  3,548 | `v_max3_f32 v130, ...` | `fmha_alu0` rowmax reduction |
+|  ~3.4k×N | `v_mfma_f32_32x32x16_fp8_fp8` | the PV/QK gemms |
+|  2,769 | `v_add3_u32 v101, ...` | address-calc |
+
+The biggest single VALU stall is an **address-calc integer add**, and
+several more (`v_add_u32`, `v_add3_u32`) are in the top set — all
+arbiter-stalled, i.e. waiting for a VALU issue slot rather than on data.
+That means reducing *total* VALU instruction count is what relieves the
+gate (it frees issue slots for everything, including these adds). The
+two reducible VALU populations are (a) the per-iteration softmax output
+rescale (`v_pk_mul_f32` tail — the target of
+`PLAN_conditional_rescale.md`) and (b) redundant per-iteration
+address-calc adds (a page-pointer-style hoist was tried and reverted
+earlier — see Open items — but the LDS-read addressing adds here are a
+distinct, unexplored population).
+
+**Conclusion:** VALU is now the confirmed prefill gate (was masked by
+`ds_bpermute` LDS latency before). The conditional-softmax-rescale
+project (`PLAN_conditional_rescale.md`) targets the largest reducible
+VALU population and is the right next lever.
+
+---
+
 ## Open / parked items
 
 * **Hoisted SGPR-ring prefetch (Tier-0 → moved before `fmha_alu1`).** Tried
