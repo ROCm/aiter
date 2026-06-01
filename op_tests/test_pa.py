@@ -870,6 +870,8 @@ def test_paged_attention(
             ):
                 if dtype == dtypes.bf16 and block_size == 16:
                     high_precision_list = [1, 2]
+                elif dtype == dtypes.bf16 and block_size == 32:
+                    high_precision_list = [0, 1]
                 else:
                     high_precision_list = [1]
                 for high_precision in high_precision_list:

@@ -115,22 +115,26 @@ std::string get_heuristic_kernel(std::string q_type,
 
     const std::vector<int> mtp_flags = (mtp > 0) ? std::vector<int>{mtp, 1} : std::vector<int>{0};
     const std::vector<int> gqa_flags = {gqa, (gqa + 7) / 8 * 8};
-    for(int mtp_ : mtp_flags)
+    for(int exact_hp = 1; exact_hp >= 0; exact_hp--)
     {
-        for(int gqa_ : gqa_flags)
+        for(int mtp_ : mtp_flags)
         {
-            // find exact match
-            for(const auto& el : *cfgs)
+            for(int gqa_ : gqa_flags)
             {
-                if (el.first.find(arch_id) != 0)
-                    continue;
-                const auto& cfg = el.second;
-                // hp is just distinct from uhp
-                if(cfg.qType == q_type && cfg.kvType == kv_type && cfg.Gqa == gqa_ &&
-                   cfg.Mtp == mtp_ && cfg.Msk == msk && (cfg.Hp == hp || hp == 1) &&
-                   cfg.blkSz == block_size && cfg.ps == ps && cfg.qTile == qTile && cfg.quant_type == quant_type)
+                // find exact match
+                for(const auto& el : *cfgs)
+                {
+                    if (el.first.find(arch_id) != 0)
+                        continue;
+                    const auto& cfg = el.second;
+                    // hp is just distinct from uhp
+                    const bool hp_ok = exact_hp ? (cfg.Hp == hp) : (cfg.Hp == hp || hp == 1);
+                    if(cfg.qType == q_type && cfg.kvType == kv_type && cfg.Gqa == gqa_ &&
+                       cfg.Mtp == mtp_ && cfg.Msk == msk && hp_ok &&
+                       cfg.blkSz == block_size && cfg.ps == ps && cfg.qTile == qTile && cfg.quant_type == quant_type)
 
-                    return el.first;
+                        return el.first;
+                }
             }
         }
     }
