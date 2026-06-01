@@ -1,6 +1,6 @@
-# Quant-free fused RMSNorm (+ optional residual add) launcher for the gfx1250
-# gluon TDM kernel. bf16/fp16 in -> same dtype out (no MXFP4 quant), for models
-# with 16-bit activations (e.g. gpt-oss w4a16).
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 import torch
 import triton
 from aiter.ops.triton._gluon_kernels.gfx1250.norm.rmsnorm import (
