@@ -321,6 +321,12 @@ def routing_a8w4(
     bias: torch.Tensor | None = None,
     renorm: bool = True,
     routed_scaling_factor: float = 1.0,
+    use_grouped_topk: bool = False,
+    num_expert_group: int | None = None,
+    topk_group: int | None = None,
+    expert_group: torch.Tensor | None = None,
+    num_fused_shared_experts: int = 0,
+    shared_experts_score: float = 1.0,
 ):
     """All-Triton routing for the a8w4 path: fused V4 routing math + sort.
 
@@ -330,27 +336,72 @@ def routing_a8w4(
       2. aiter `sort_tokens` (or `sort_tokens_fused` for tiny M): sort tokens by
          expert and produce ExptData specialized for the given ``block_m``.
 
+    When ``use_grouped_topk=True``, step 1 is replaced by ATOM's single-fused
+    Triton ``grouped_topk`` kernel
+    (``atom.model_ops.grouped_topk_triton.grouped_topk``) — DeepSeek-V2/V3-style
+    hierarchical routing (pick ``topk_group`` groups out of
+    ``num_expert_group``, then top-``n_expts_act`` experts within those
+    groups). Same return contract as ``topk`` (y_vals, y_indx, Bitmatrix), so
+    ``sort_tokens`` / ``sort_tokens_fused`` consume it unchanged.
+
     Returns (RoutingData, gather_indx, scatter_indx) where gather_indx and
     scatter_indx are raw int32 tensors (no GatherIndx/ScatterIndx wrappers) —
     consumed directly by ``moe_gemm_a8w4``.
 
     No multi-block_m dict, no triton_kernels wrapper, no Python bridge step.
     """
-    from .topk import topk
+    n_tokens, n_routed = logits.shape
 
-    n_tokens, n_expts_tot = logits.shape
+    # Fused shared experts are appended (always-on) to every token by the
+    # grouped-topk kernel, occupying expert ids [n_routed, n_routed + n_shared).
+    # They widen both the per-token selection (n_expts_act) and the total
+    # expert count used for the sort / histogram.
+    n_shared = num_fused_shared_experts
+    n_expts_tot = n_routed + n_shared
 
-    # Step 1: extended topk does sqrtsoftplus + bias + topk + bitmatrix + renorm + scale.
-    expt_scal, expt_indx, bitmatrix = topk(
-        logits,
-        n_expts_act,
-        apply_softmax=False,
-        score_mode=score_mode,
-        bias=bias,
-        renorm=renorm,
-        routed_scaling_factor=routed_scaling_factor,
-        HIST_BLOCK_M=32,
-    )
+    # Step 1: per-token expert selection. Either flat top-k (existing aiter
+    # _topk kernel) or grouped top-k (ATOM's _grouped_topk kernel) — both
+    # return (y_vals, y_indx, Bitmatrix) with the same downstream contract.
+    if use_grouped_topk and num_expert_group != 1:
+        assert (
+            num_expert_group is not None and topk_group is not None
+        ), "use_grouped_topk requires num_expert_group and topk_group"
+        # Lazy import: ATOM-side kernel; avoids hard aiter→atom import order.
+        from aiter.ops.triton.moe.moe_routing.grouped_topk_triton import grouped_topk
+
+        expt_scal, expt_indx, bitmatrix = grouped_topk(
+            logits,
+            n_expts_act,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            expert_group=expert_group,
+            apply_softmax=False,
+            score_mode=score_mode,
+            bias=bias,
+            renorm=renorm,
+            routed_scaling_factor=routed_scaling_factor,
+            num_fused_shared_experts=n_shared,
+            shared_experts_score=shared_experts_score,
+            HIST_BLOCK_M=32,
+        )
+        # Routed top-k + appended shared experts per token.
+        n_expts_act = n_expts_act + n_shared
+    else:
+        assert n_shared == 0, (
+            "fused shared experts are only supported on the grouped-topk path"
+        )
+        from .topk import topk
+
+        expt_scal, expt_indx, bitmatrix = topk(
+            logits,
+            n_expts_act,
+            apply_softmax=False,
+            score_mode=score_mode,
+            bias=bias,
+            renorm=renorm,
+            routed_scaling_factor=routed_scaling_factor,
+            HIST_BLOCK_M=32,
+        )
 
     # Step 2: sort tokens by expert and build ExptData for the chosen block_m.
     if n_tokens <= 16:
