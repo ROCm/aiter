@@ -31,6 +31,11 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.gemm_op_common import get_padded_m
 from torch import Tensor
 
+try:
+    from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
+except Exception:
+    _opus_tune = None
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -473,6 +478,7 @@ def flydsl_gemm(
         split_k=flydsl_config["split_k"],
         block_m_warps=flydsl_config["block_m_warps"],
         block_n_warps=flydsl_config["block_n_warps"],
+        block_k_warps=flydsl_config.get("block_k_warps", 1),
         n_tile_repeat=flydsl_config.get("n_tile_repeat", 1),
         persistent_n_tiles=flydsl_config.get("persistent_n_tiles", 1),
         waves_per_eu=flydsl_config.get("waves_per_eu", 0),
@@ -489,6 +495,55 @@ def flydsl_gemm(
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
     return out
+
+
+def opus_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
+    bpreshuffle: Optional[bool] = False,
+    config: Optional[dict] = None,
+):
+    if _opus_tune is None:
+        logger.warning(
+            "opus tuned config found but opus is not available; falling back to torch"
+        )
+        return torch_gemm(
+            inp,
+            weights,
+            solidx,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            bpreshuffle,
+            config,
+        )
+    assert (
+        scale_a is None and scale_b is None and scale_c is None
+    ), "opus_gemm does not support scaling"
+    assert not bpreshuffle, "opus_gemm does not support bpreshuffle"
+    splitK = int(config.get("splitK", 0)) if config is not None else 0
+    m, k = inp.shape
+    n = weights.shape[0]
+    Y = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
+    _opus_tune(
+        inp.unsqueeze(0),
+        weights.unsqueeze(0),
+        Y.unsqueeze(0),
+        bias=bias,
+        kernelId=int(solidx),
+        splitK=splitK,
+    )
+    if bias is not None:
+        Y = Y + bias
+    return Y
 
 
 def triton_gemm(
@@ -519,6 +574,7 @@ solMap = {
     "asm": asm_gemm,
     "triton": triton_gemm,
     "flydsl": flydsl_gemm,
+    "opus": opus_gemm,
 }
 
 
