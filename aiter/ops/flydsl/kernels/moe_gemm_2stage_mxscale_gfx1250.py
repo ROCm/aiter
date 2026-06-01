@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""gfx1250 MoE 2-stage mxscale kernels (fp4/fp8/a8w4).
-
-Implements stage1/stage2 single-kernel inline paths using the
-``wmma_scale_f32_16x16x128_f8f6f4`` and ``wmma_scale_f32_32x16x128_f4``
-instructions for microscaling block formats with E8M0 scales.
-"""
+"""gfx1250 MoE 2-stage mxscale kernels (fp4/fp8/a8w4)."""
 
 from __future__ import annotations
 
@@ -69,15 +64,7 @@ def _compile_stage1_mxscale_kernel_impl(
     enable_bias: bool = False,
     act: str = "silu",
 ):
-    """Compile mxscale stage1 single kernel (route-pack + TDM + WMMA_SCALE + epilog).
-
-    ``use_tdm_gather_as`` enables the TDM-gather path for the A-scale matrix,
-    moving that load off ``ds_cnt`` and onto ``tdm_cnt`` to eliminate the
-    ``s_wait_dscnt`` stalls that dominate the scalar per-byte fallback. Falls
-    back to the vectorised scalar path when the LDS scale layout is not
-    row-major (``wmma_m_rep > 1`` and not ``is_fp4``) or the row width is below
-    the TDM gather minimum (``scale_k_per_tile < 4``).
-    """
+    """Compile mxscale stage1 single kernel (route-pack + TDM + WMMA_SCALE + epilog)."""
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl._mlir import ir
@@ -471,17 +458,7 @@ def _compile_stage1_mxscale_kernel_impl(
             return _acc
 
         def _preload_sorted_ids_to_lds():
-            """Preload tile_m sorted_token_ids entries into ``lds_tid`` (once per CTA).
-
-            Row ``ri`` (ri in ``[0, tile_m)``) gets the raw i32 from
-            ``sorted_token_ids[by * tile_m + ri]`` when that row is both inside
-            the block's route slot range and the valid prefix; otherwise the
-            sentinel ``0xFFFFFFFF`` is stored so that downstream
-            ``tok = fused & 0xFFFFFF`` / ``slot = fused >> 24`` decoding makes
-            ``tok_ok`` and ``slot_ok1`` naturally false, eliminating the need
-            for separate ``row_in_route`` / ``row_in_valid`` guards at every
-            consumer site.
-            """
+            """Preload tile_m sorted_token_ids entries into ``lds_tid`` (once per CTA)."""
             _tid_in_range = arith.cmpi(
                 arith.CmpIPredicate.ult, tx, fx.Index(int(tile_m)))
             _if_tid = scf.IfOp(_tid_in_range)
@@ -509,25 +486,13 @@ def _compile_stage1_mxscale_kernel_impl(
             workgroup_barrier(use_cluster=use_cluster)
 
         def _load_fused_from_lds(row_index):
-            """Load the cached ``fused`` i32 for a row (``0 <= row_index < tile_m``).
-
-            ``row_index`` may be a Python int (compile-time constant) or an
-            index-typed SSA value — both map to a single ``ds_read_b32``.
-            Invalid rows were pre-filled with ``0xFFFFFFFF`` at preload time.
-            """
+            """Load the cached ``fused`` i32 for a row (``0 <= row_index < tile_m``)."""
             if isinstance(row_index, int):
                 row_index = arith.index(row_index)
             return memref.load(lds_tid, [row_index])
 
         def _precompute_a_row_indices():
-            """Decode per-row token/slot meta from ``lds_tid`` into sgpr lists.
-
-            Reads the preloaded i32 for each ``ri`` via a uniform ``ds_read_b32``
-            (one per row for the whole wave), then ``readfirstlane`` to produce
-            sgpr values used by TDM gather and TDM store. Invalid rows decode
-            to ``tok=0xFFFFFF``/``slot=0xFF`` via the sentinel, which the
-            ``tok_ok`` / ``slot_ok`` checks below reject.
-            """
+            """Decode per-row token/slot meta from ``lds_tid`` into sgpr lists."""
             _safe_row = arith.constant(0, type=T.i32)
             _one_i32 = arith.constant(1, type=T.i32)
             _zero_i32 = arith.constant(0, type=T.i32)
@@ -645,16 +610,7 @@ def _compile_stage1_mxscale_kernel_impl(
             _a_gather_cache["base_addr_hi"] = _base_addr_hi
 
         def issue_a_load_tdm_gather(k_base, buf_idx):
-            """Hot path: advance addr_lo on the precomputed gather descriptor.
-
-            Requires ``_build_a_gather_base_descs(lds_bufs)`` to have been
-            called once before the K loop with the matching LDS buffer list.
-            Uses the carry-safe ``update_tensor_gather_descriptor_addr64`` so
-            that ``base_addr_lo + k_byte_off`` overflowing the i32 boundary
-            propagates into ``addr_hi`` instead of silently wrapping into a
-            wrong 4 GiB page (which on gfx1250 deadlocks the GPU in
-            ``amdgpu_mes_reg_write_reg_wait``).
-            """
+            """Hot path: advance addr_lo on the precomputed gather descriptor."""
             k_packed_base = k_base if PACK_FACTOR_A == 1 else k_base // fx.Index(PACK_FACTOR_A)
             _k_byte_off_i32 = arith.index_cast(T.i32, k_packed_base)
             _descs = _a_gather_cache["desc"]
@@ -775,17 +731,7 @@ def _compile_stage1_mxscale_kernel_impl(
             return k_base / arith.index(SCALE_BLOCK)
 
         def issue_as_load(k_scale_base, target_lds):
-            """Vectorised scalar A-scale loader (Option B).
-
-            Each thread loads one ``SCALES_PER_WMMA``-sized chunk (4 bytes)
-            and writes it either to the row-major LDS slot (``is_fp4`` or
-            ``wmma_m_rep == 1``) or to the interleaved LDS slot. Avoiding a
-            full-row i8 vector load is important for row widths such as 16
-            bytes, where LLVM cannot legalize ``v16i8`` raw buffer loads.
-
-            Rare fallback: ``scale_k_per_tile`` not a multiple of 4 falls back
-              to the original per-byte loop for correctness.
-            """
+            """Vectorised scalar A-scale loader (Option B)."""
             _blk_bytes = int(SCALES_PER_WMMA)
             _row_bytes = int(scale_k_per_tile)
             if const_expr(_row_bytes % _blk_bytes == 0 and _row_bytes >= _blk_bytes):
@@ -921,23 +867,7 @@ def _compile_stage1_mxscale_kernel_impl(
                         scf.YieldOp([])
 
         def issue_as_load_tdm_gather(k_scale_base, target_lds):
-            """TDM-gather A-scale loader (Option A).
-
-            Issues one TDM gather per 8-row group (``_TDM_GATHER_GROUPS``
-            total), each covering up to 8 rows × ``scale_k_per_tile`` bytes.
-            Reuses the ``_a_tok_ids`` SGPR cache built by
-            ``_precompute_a_row_indices()`` for the A-data path, so no extra
-            scalar loads of ``sorted_rsrc`` are issued here. Completion is
-            tracked via ``tdm_cnt`` instead of ``ds_cnt``, eliminating the
-            ``s_wait_dscnt 0`` stall cluster previously caused by per-byte
-            ``buffer_load`` + ``ds_write_b8`` on the scalar path.
-
-            Pre-conditions (enforced by the gating above):
-              - ``use_tdm_gather=True`` (otherwise ``_a_tok_ids`` is empty).
-              - Row-major LDS scale layout (``is_fp4`` or ``wmma_m_rep == 1``).
-              - ``scale_k_per_tile`` is a positive multiple of 4 (TDM row_width
-                hardware alignment).
-            """
+            """TDM-gather A-scale loader (Option A)."""
             _as_row_bytes = int(scale_k_per_tile)
             _tokens_dim1 = _get_tokens_sgpr()
             _zero_i32 = arith.constant(0, type=T.i32)
@@ -1519,14 +1449,7 @@ def _compile_stage1_mxscale_kernel_impl(
                 ]
 
                 def _issue_active_b_tdm_only(stage_idx, curr_addr_lo, curr_addr_hi):
-                    """Issue one B-load and advance the carry-safe (lo, hi) pair.
-
-                    Both ``curr_addr_lo`` and ``curr_addr_hi`` come from the
-                    pipeline-carried state; the descriptor's lanes 2 and 3 are
-                    spliced from these every iteration so a lo-32-bit overflow
-                    in the K-loop accumulation propagates into hi instead of
-                    silently aliasing into the wrong 4 GiB page.
-                    """
+                    """Issue one B-load and advance the carry-safe (lo, hi) pair."""
                     _if_loader = scf.IfOp(_is_loader_wave)
                     with ir.InsertionPoint(_if_loader.then_block):
                         tdm_ops.tensor_load_2d(
@@ -2156,15 +2079,7 @@ def _compile_stage2_mxscale_kernel_impl(
 
     enable_bias: bool = False,
 ):
-    """Compile mxscale stage2 single kernel (route-pack + TDM + WMMA_SCALE + epilog).
-
-    ``use_tdm_gather_as`` enables the TDM-gather path for the A-scale matrix
-    to eliminate the ``s_wait_dscnt`` stall cluster caused by per-byte
-    ``buffer_load`` + ``ds_write_b8`` on the scalar A-scale path. Falls back
-    to the vectorised scalar loader when the LDS scale layout is not row-major
-    (``wmma_m_rep > 1`` and not ``is_fp4``) or the row width is below the TDM
-    gather alignment (``scale_k_per_tile < 4`` / not a multiple of 4).
-    """
+    """Compile mxscale stage2 single kernel (route-pack + TDM + WMMA_SCALE + epilog)."""
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl._mlir import ir
@@ -2503,12 +2418,7 @@ def _compile_stage2_mxscale_kernel_impl(
             return _tokens_topk_sgpr
 
         def _preload_sorted_ids_to_lds():
-            """Preload tile_m sorted_token_ids entries into ``lds_tid`` (once per CTA).
-
-            See stage1 for the rationale. Invalid rows (row_in_route or
-            row_in_valid false) are stored as sentinel ``0xFFFFFFFF`` so
-            downstream ``tok_ok`` / ``slot_ok`` checks naturally reject them.
-            """
+            """Preload tile_m sorted_token_ids entries into ``lds_tid`` (once per CTA)."""
             _tid_in_range = arith.cmpi(
                 arith.CmpIPredicate.ult, tx, fx.Index(int(tile_m)))
             _if_tid = scf.IfOp(_tid_in_range)
@@ -2658,14 +2568,7 @@ def _compile_stage2_mxscale_kernel_impl(
             _a_gather_cache["base_addr_hi"] = _base_addr_hi
 
         def issue_a_load_tdm_gather(k_base, buf_idx):
-            """Hot path: carry-safe advance of the precomputed gather descriptor.
-
-            Requires ``_build_a_gather_base_descs(lds_bufs)`` to have been
-            called once before the K loop with the matching LDS buffer list.
-            Uses ``update_tensor_gather_descriptor_addr64`` so a lo-32-bit
-            overflow of ``base_addr_lo + k_byte_off`` propagates into hi
-            instead of redirecting the descriptor to a wrong 4 GiB page.
-            """
+            """Hot path: carry-safe advance of the precomputed gather descriptor."""
             k_packed_base = k_base if PACK_FACTOR_A == 1 else k_base // fx.Index(PACK_FACTOR_A)
             _k_byte_off_i32 = arith.index_cast(T.i32, k_packed_base)
             _descs = _a_gather_cache["desc"]
@@ -2689,12 +2592,7 @@ def _compile_stage2_mxscale_kernel_impl(
             return k_base / arith.index(SCALE_BLOCK)
 
         def issue_as_load(k_scale_base, target_lds):
-            """Vectorised scalar A-scale loader (Option B) for stage2.
-
-            See stage1 ``issue_as_load`` for the 4-byte chunking rationale.
-            Stage2 addresses rows by ``ts = tok * topk + slot`` and the
-            ``load_ok`` guard checks both ``tok_ok`` and ``slot_ok``.
-            """
+            """Vectorised scalar A-scale loader (Option B) for stage2."""
             _blk_bytes = int(SCALES_PER_WMMA)
             _row_bytes = int(scale_k_per_tile)
             if const_expr(_row_bytes % _blk_bytes == 0 and _row_bytes >= _blk_bytes):
@@ -2842,19 +2740,7 @@ def _compile_stage2_mxscale_kernel_impl(
                         scf.YieldOp([])
 
         def issue_as_load_tdm_gather(k_scale_base, target_lds):
-            """TDM-gather A-scale loader (Option A) for stage2.
-
-            Reuses the ``_a_row_ids`` / ``_a_row_valids`` SGPR caches populated
-            by ``_precompute_a_row_indices()`` for the stage2 A-data TDM path,
-            where each row index is ``ts = tok * topk + slot``. Routes
-            completion through ``tdm_cnt`` to eliminate the ``s_wait_dscnt 0``
-            stall cluster caused by per-byte ``buffer_load`` + ``ds_write_b8``.
-
-            Pre-conditions (enforced by the gating in this kernel):
-              - ``use_tdm_gather=True`` (otherwise ``_a_row_ids`` is empty).
-              - Row-major LDS scale layout (``is_fp4`` or ``wmma_m_rep == 1``).
-              - ``scale_k_per_tile`` is a positive multiple of 4.
-            """
+            """TDM-gather A-scale loader (Option A) for stage2."""
             _as_row_bytes = int(scale_k_per_tile)
             _tokens_topk = _get_tokens_topk_sgpr()
             _zero_i32 = arith.constant(0, type=T.i32)
