@@ -78,8 +78,9 @@ jobs:
           # Qwen3.5-397B-A17B-FP8, GLM-5.1-FP8 — all validated PASS on do-mi350x)
           # are covered on-demand via the ci:atom_full label, which runs every
           # pr/main model in ATOM models_accuracy.json with the runner pins below.
-          # MiniMax-M2.7 currently fails (needs an ATOM-side HSA_NO_SCRATCH_RECLAIM
-          # env), so it is only exercised under ci:atom_full, never on every PR.
+          # MiniMax-M2.7 needs HSA_NO_SCRATCH_RECLAIM=1 (scratch reclaim corrupts
+          # its MoE scratch buffers on gfx950); injected via model_env_overrides
+          # below. It runs under ci:atom_full, not on every PR.
           default_models = [
               {"model_name": "DeepSeek-R1-0528"},
               {"model_name": "gpt-oss-120b"},
@@ -112,10 +113,24 @@ jobs:
               "GLM-5.1-FP8": "linux-aiter-do-mi350x-8",            # -tp 8
           }
 
+          # Per-model extra env injected into the test container (one KEY=VALUE per
+          # line, merged with any env_vars already declared in the ATOM model
+          # config). MiniMax-M2.7 needs scratch reclaim disabled or its MoE
+          # scratch buffers get corrupted on gfx950, failing the accuracy gate.
+          model_env_overrides = {
+              "MiniMax-M2.7": "HSA_NO_SCRATCH_RECLAIM=1",
+          }
+
           def prepare_model(model):
               model = dict(model)
               model["runner"] = runner_overrides.get(model["runner"], model["runner"])
               model["runner"] = model_runner_overrides.get(model["model_name"], model["runner"])
+              extra_env = model_env_overrides.get(model["model_name"])
+              if extra_env:
+                  existing_env = str(model.get("env_vars", "")).strip()
+                  model["env_vars"] = (
+                      f"{existing_env}\n{extra_env}" if existing_env else extra_env
+                  )
               model["label"] = model.get("runner", "")
               model["accuracy_test_threshold"] = str(model.get("accuracy_threshold", 0))
               model["run_on_pr"] = True
