@@ -243,6 +243,31 @@ def build_sage_attn_cdna_module(
     if const_expr(_DEFER_SCALE):
         path_tag = f"{path_tag}_ds"
 
+    # ---- Causal LPT/SPT tile scheduling ("longest-processing-time-first") ----
+    # For CAUSAL shapes the inner K-loop length is triangular: Q-tile t attends
+    # only to KV tiles [0..t], so the first Q-tile does ~1 KV-block of work and
+    # the last does the full ~N. When workgroups are launched in naive Q-tile
+    # order (q_tile_idx = block-derived index, ascending), the CUs that draw the
+    # early (short) tiles retire early and idle while CUs holding the late (long)
+    # tiles still grind — a triangular load-imbalance tail. Borrowed from FA4's
+    # backward LPT scheduling: REVERSE the Q-tile assignment so workgroup 0 draws
+    # the LAST (longest) causal tile, etc. — heaviest tiles enter the machine
+    # first, so the tail is balanced. This is a PURE scheduling permutation of
+    # which workgroup owns which Q-tile; numerics are bit-identical (each Q-tile's
+    # math is independent and unchanged). It cannot help non-causal (uniform tile
+    # work), so it MUST be a no-op there.
+    # Env `SAGE_LPT_SCHED`: `auto` (default = on for causal, no-op non-causal) ·
+    # `0` (off / baseline order) · `force` (on regardless of causality).
+    _lpt_env = os.environ.get("SAGE_LPT_SCHED", "auto")
+    if _lpt_env in ("0", ""):
+        _LPT_SCHED = False
+    elif _lpt_env == "force":
+        _LPT_SCHED = True
+    else:  # "auto" / "1"
+        _LPT_SCHED = CAUSAL
+    if const_expr(_LPT_SCHED):
+        path_tag = f"{path_tag}_lpt"
+
     if const_expr(_dma_k):
         # DMA is lane-contiguous → packed K stride (no pad). Reintroduces K
         # read-side bank aliasing; the trade is removing the ds_write stripe +
@@ -521,8 +546,17 @@ def build_sage_attn_cdna_module(
         head_q_idx = block_id % NUM_Q_HEADS
         batch_q_tile_id = block_id // NUM_Q_HEADS
         num_q_tiles = (seq_len_q_v + BLOCK_M - 1) // BLOCK_M
-        q_tile_idx = batch_q_tile_id % num_q_tiles
+        q_tile_raw = batch_q_tile_id % num_q_tiles
         batch_idx = batch_q_tile_id // num_q_tiles
+        # Causal LPT/SPT remap: reverse the Q-tile order so workgroup 0 (drawn
+        # first) processes the LAST (longest-work) causal tile. Pure scheduling
+        # permutation — every Q-tile's computation is independent and unchanged,
+        # so output is bit-identical to the naive-order baseline. No-op (off) for
+        # non-causal where tile work is uniform.
+        if const_expr(_LPT_SCHED):
+            q_tile_idx = (num_q_tiles - fx.Index(1)) - q_tile_raw
+        else:
+            q_tile_idx = q_tile_raw
         q_start = q_tile_idx * BLOCK_M
 
         # KV head for this Q head (GQA)
