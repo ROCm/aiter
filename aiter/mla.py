@@ -691,8 +691,6 @@ def mla_v40_decode_fwd(
 
     return logits, final_lse
 
-    return logits, final_lse
-
 
 def mla_prefill_fwd(
     q,  # [num_seqs, num_heads, head_size]

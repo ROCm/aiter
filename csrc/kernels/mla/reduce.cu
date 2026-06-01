@@ -6,6 +6,7 @@
 #include "custom_all_reduce.cuh"
 #include "mla.h"
 #include "opus/opus.hpp"
+#include <cstdio>
 #include <optional>
 #include <sstream>
 

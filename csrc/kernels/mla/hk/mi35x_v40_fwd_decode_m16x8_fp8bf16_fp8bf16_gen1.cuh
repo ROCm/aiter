@@ -1509,7 +1509,7 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& quer
     switch(page_size)
     {
         DISPATCH_PAGE_SIZE(1)
-        // DISPATCH_PAGE_SIZE(64)
+        DISPATCH_PAGE_SIZE(64)
     default:
         AITER_CHECK(
             false,
