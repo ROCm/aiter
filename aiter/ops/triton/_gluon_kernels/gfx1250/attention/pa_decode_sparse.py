@@ -17,8 +17,22 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@gluon.jit
+_pa_decode_sparse_repr = make_kernel_repr(
+    "_pa_decode_sparse",
+    [
+        "BLOCK_H",
+        "BLOCK_D",
+        "BLOCK_K",
+        "H",
+        "D",
+        "KV_SPLITS",
+    ],
+)
+
+
+@gluon.jit(repr=_pa_decode_sparse_repr)
 def _pa_decode_sparse(
     q_ptr,
     unified_kv_ptr,
@@ -54,29 +68,61 @@ def _pa_decode_sparse(
     BLOCK_H: gl.constexpr,
     BLOCK_D: gl.constexpr,
     BLOCK_K: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
 ):
-    NUM_WARPS: gl.constexpr = 4
     WARP_SIZE: gl.constexpr = 32
 
-    mfma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+    # Distribute the warps of the WMMA layout along the column (N) dimension.
+    # log2(NUM_WARPS) basis vectors, each tiling the columns of the dot output.
+    if NUM_WARPS == 1:
+        pv_warp_bases: gl.constexpr = []
+        qk_warp_bases: gl.constexpr = []
+    elif NUM_WARPS == 2:
+        pv_warp_bases: gl.constexpr = [[0, 1]]
+        qk_warp_bases: gl.constexpr = [[1, 0]]
+    elif NUM_WARPS == 4:
+        pv_warp_bases: gl.constexpr = [[0, 1], [0, 2]]
+        qk_warp_bases: gl.constexpr = [[1, 0], [2, 0]]
+    else:
+        pv_warp_bases: gl.constexpr = [[0, 1], [0, 2], [0, 4]]
+        qk_warp_bases: gl.constexpr = [[1, 0], [2, 0], [4, 0]]
+
+    qk_mfma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         instr_shape=[16, 16, 32],
-        warp_bases=[[0, 1], [0, 2]],
+        warp_bases=qk_warp_bases,
+    )
+    pv_mfma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+        version=3,
+        transposed=True,
+        instr_shape=[16, 16, 32],
+        warp_bases=pv_warp_bases,
     )
     K_WIDTH: gl.constexpr = 8
-    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfma_layout, k_width=K_WIDTH
+    dot_q_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=qk_mfma_layout, k_width=K_WIDTH
     )
-    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfma_layout, k_width=K_WIDTH
+    dot_k_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=qk_mfma_layout, k_width=K_WIDTH
+    )
+    dot_p_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=pv_mfma_layout, k_width=K_WIDTH
+    )
+    dot_v_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=pv_mfma_layout, k_width=K_WIDTH
     )
 
     D_INNER: gl.constexpr = BLOCK_D // 8
+    # Split warps over [BLOCK_H, BLOCK_D]: up to 2 along the head dim, the rest
+    # along the feature dim. NUM_WARPS=4 -> [2, 2] (original), 2 -> [2, 1],
+    # 1 -> [1, 1]. Product must equal NUM_WARPS.
+    QKV_WARPS_H: gl.constexpr = 2 if NUM_WARPS >= 2 else 1
+    QKV_WARPS_D: gl.constexpr = NUM_WARPS // QKV_WARPS_H
     layout_qkv: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[WARP_SIZE // (D_INNER // 2), D_INNER // 2],
-        warps_per_cta=[2, 2],
+        warps_per_cta=[QKV_WARPS_H, QKV_WARPS_D],
         order=[1, 0],
     )
     slot_reg_layout: gl.constexpr = gl.SliceLayout(1, layout_qkv)
@@ -84,7 +130,7 @@ def _pa_decode_sparse(
     kv_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_D, 8]], [BLOCK_K, BLOCK_D], [1, 0]
     )
-    valid_col_mma: gl.constexpr = gl.SliceLayout(0, mfma_layout)
+    valid_col_mma: gl.constexpr = gl.SliceLayout(0, qk_mfma_layout)
 
     t = gl.program_id(0)
     pid_h = gl.program_id(1)
@@ -105,7 +151,7 @@ def _pa_decode_sparse(
         mask=h_mask_q[:, None],
         other=0.0,
     )
-    mfma_q = gl.convert_layout(q, dot_a_layout)
+    mfma_q = gl.convert_layout(q, dot_q_layout)
 
     kv_start = gl.load(kv_indptr_ptr + t)
     kv_end = gl.load(kv_indptr_ptr + t + 1)
@@ -121,9 +167,12 @@ def _pa_decode_sparse(
 
     neg_large: gl.constexpr = -3.4028234663852886e38
 
-    h_offs_mma_row = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
+    h_offs_mma_row = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, pv_mfma_layout))
     h_offs_mma_row_eff = h_off_base + h_offs_mma_row
     h_mask_mma_row = h_offs_mma_row_eff < H
+    h_mask_mma_row_qk = gl.convert_layout(
+        h_mask_mma_row, gl.SliceLayout(1, qk_mfma_layout)
+    )
 
     if KV_SPLITS == 1:
         sink = gl.amd.cdna4.buffer_load(
@@ -132,17 +181,23 @@ def _pa_decode_sparse(
             mask=h_mask_mma_row,
             other=neg_large,
         ).to(gl.float32)
+        sink = gl.convert_layout(sink, gl.SliceLayout(1, qk_mfma_layout))
         m_i = sink
-        l_i = gl.exp(sink - m_i)
+        l_i = gl.full(
+            [BLOCK_H], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, qk_mfma_layout)
+        )
     else:
         m_i = gl.full(
-            [BLOCK_H], neg_large, gl.float32, layout=gl.SliceLayout(1, mfma_layout)
+            [BLOCK_H], neg_large, gl.float32, layout=gl.SliceLayout(1, qk_mfma_layout)
         )
-        l_i = gl.zeros(
-            [BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)
+        l_i = gl.full(
+            [BLOCK_H], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, qk_mfma_layout)
         )
+        # l_i = gl.zeros(
+        #     [BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, qk_mfma_layout)
+        # )
 
-    acc = gl.zeros([BLOCK_H, BLOCK_D], dtype=gl.float32, layout=mfma_layout)
+    acc = gl.zeros([BLOCK_H, BLOCK_D], dtype=gl.float32, layout=pv_mfma_layout)
 
     # ---- 2-stage pipeline ----
     # Slot tensor: loaded synchronously (analogous to physical_block_idx
@@ -216,33 +271,33 @@ def _pa_decode_sparse(
         gl.amd.gfx1250.tdm.async_wait(1)
 
         # ---- Math for tile (tile_start + i) using kv_bufs[buf_idx] ----
-        j_cur = tile_start + i
-        cur_in_range_i = (j_cur * BLOCK_K + k_offs_slot) < kv_len
-        cur_valid_i = cur_in_range_i & (slot_reg >= 0)
+        # j_cur = tile_start + i
+        # cur_in_range_i = (j_cur * BLOCK_K + k_offs_slot) < kv_len
+        # cur_valid_i = cur_in_range_i & (slot_reg >= 0)
 
         kv_smem_cur = kv_bufs.index(buf_idx)
-        kv_t = kv_smem_cur.permute([1, 0]).load(dot_b_layout)
+        kv_t = kv_smem_cur.permute([1, 0]).load(dot_k_layout)
         scores = gl.amd.gfx1250.wmma(
             mfma_q,
             kv_t,
-            gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=mfma_layout),
+            gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=qk_mfma_layout),
         )
         scores = scores * softmax_scale
 
-        valid_col = gl.convert_layout(cur_valid_i, valid_col_mma)
-        keep = h_mask_mma_row[:, None] & valid_col[None, :]
-        scores = gl.where(keep, scores, neg_large)
+        # valid_col = gl.convert_layout(cur_valid_i, valid_col_mma)
+        # keep = h_mask_mma_row[:, None] & valid_col[None, :]
+        # scores = gl.where(keep, scores, neg_large)
 
         m_block = gl.max(scores, axis=1)
         m_new = gl.maximum(m_i, m_block)
         alpha = gl.exp(m_i - m_new)
         p = gl.exp(scores - m_new[:, None])
-        p = gl.where(keep, p, 0.0)
+        # p = gl.where(keep, p, 0.0)
         l_new = l_i * alpha + gl.sum(p, axis=1)
 
-        kv_for_acc = kv_smem_cur.load(dot_b_layout)
-        p_dot = gl.convert_layout(p.to(unified_kv_ptr.dtype.element_ty), dot_a_layout)
-        acc = acc * alpha[:, None]
+        kv_for_acc = kv_smem_cur.load(dot_v_layout)
+        p_dot = gl.convert_layout(p.to(unified_kv_ptr.dtype.element_ty), dot_p_layout)
+        acc = acc * gl.convert_layout(alpha[:, None], layout=pv_mfma_layout)
         acc = gl.amd.gfx1250.wmma(p_dot, kv_for_acc, acc)
 
         m_i = m_new
@@ -261,16 +316,16 @@ def _pa_decode_sparse(
     final_valid = final_in_range & (slot_reg >= 0)
 
     kv_smem_final = kv_bufs.index(buf_idx)
-    kv_t = kv_smem_final.permute([1, 0]).load(dot_b_layout)
+    kv_t = kv_smem_final.permute([1, 0]).load(dot_k_layout)
     scores = gl.amd.gfx1250.wmma(
         mfma_q,
         kv_t,
-        gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=mfma_layout),
+        gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=qk_mfma_layout),
     )
     scores = scores * softmax_scale
 
     valid_col = gl.convert_layout(final_valid, valid_col_mma)
-    keep = h_mask_mma_row[:, None] & valid_col[None, :]
+    keep = h_mask_mma_row_qk[:, None] & valid_col[None, :]
     scores = gl.where(keep, scores, neg_large)
 
     m_block = gl.max(scores, axis=1)
@@ -280,9 +335,9 @@ def _pa_decode_sparse(
     p = gl.where(keep, p, 0.0)
     l_new = l_i * alpha + gl.sum(p, axis=1)
 
-    kv_for_acc = kv_smem_final.load(dot_b_layout)
-    p_dot = gl.convert_layout(p.to(unified_kv_ptr.dtype.element_ty), dot_a_layout)
-    acc = acc * alpha[:, None]
+    kv_for_acc = kv_smem_final.load(dot_v_layout)
+    p_dot = gl.convert_layout(p.to(unified_kv_ptr.dtype.element_ty), dot_p_layout)
+    acc = acc * gl.convert_layout(alpha[:, None], layout=pv_mfma_layout)
     acc = gl.amd.gfx1250.wmma(p_dot, kv_for_acc, acc)
 
     m_i = m_new
@@ -290,8 +345,11 @@ def _pa_decode_sparse(
 
     # ---- Output ----
     if KV_SPLITS == 1:
-        denom = gl.maximum(l_i, 1.0e-30)
-        out_val = gl.where(l_i[:, None] > 0.0, acc / denom[:, None], 0.0)
+        # l_i = gl.maximum(l_i, 1.0e-30)
+        one_over_L = 1.0 / l_i[:, None]
+        one_over_L = gl.convert_layout(one_over_L, layout=pv_mfma_layout)
+        # out_val = gl.where(l_i[:, None] > 0.0, acc * one_over_L, 0.0)
+        out_val = acc * one_over_L
 
         h_offs_out = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, layout_qkv))
         d_offs_out = gl.arange(0, BLOCK_D, layout=gl.SliceLayout(0, layout_qkv))

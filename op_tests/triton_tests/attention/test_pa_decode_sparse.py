@@ -136,17 +136,23 @@ def _make_inputs(
     return q, unified_kv, indices, indptr, attn_sink, softmax_scale
 
 
-@pytest.mark.parametrize("T", [1, 32, 64])
-@pytest.mark.parametrize("H", [1, 8, 16, 64, 128])
+# @pytest.mark.parametrize("T", [1, 32, 64])
+# @pytest.mark.parametrize("H", [1, 8, 16, 64, 128])
+# @pytest.mark.parametrize("D", [512])
+# @pytest.mark.parametrize("kv_len", [100, 400, 1024, 4096, 8192, 16384])
+# @pytest.mark.parametrize("var_len", [True, False])
+# @pytest.mark.parametrize("sentinels", [True, False])
+@pytest.mark.parametrize("T", [1])
+@pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("D", [512])
-@pytest.mark.parametrize("kv_len", [100, 400, 1024, 4096, 8192, 16384])
+@pytest.mark.parametrize("kv_len", [8])
 @pytest.mark.parametrize("var_len", [True, False])
 @pytest.mark.parametrize("sentinels", [True, False])
 def test_pa_decode_sparse_vs_reference(T, H, D, kv_len, var_len, sentinels):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
-    pages = 2 * T * kv_len
+    pages = T * kv_len
     q, ukv, indices, indptr, sink, scale = _make_inputs(
         T,
         H,

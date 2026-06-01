@@ -100,7 +100,7 @@ def pa_decode_sparse(
     block_d = triton.next_power_of_2(D)
     block_k = 16 if D >= 256 else 32
     num_stages = 2
-    attn_num_warps = 4
+    attn_num_warps = 2
     waves_per_eu = 0
     reduce_num_warps = 4
 
@@ -141,8 +141,13 @@ def pa_decode_sparse(
 
     if DEVICE_ARCH == "gfx1250":
         _kernel = gluon_pa_decode_sparse
+        # The gluon kernel builds its WMMA / blocked layouts from NUM_WARPS, so
+        # it must be threaded through as a constexpr (not just the num_warps
+        # launch meta-param) to keep the layouts and the launch config in sync.
+        extra_kwargs = {"NUM_WARPS": attn_num_warps}
     else:
         _kernel = triton_pa_decode_sparse
+        extra_kwargs = {}
 
     grid_attn = (T, n_head_blocks, kv_splits)
     _kernel[grid_attn](
@@ -183,6 +188,7 @@ def pa_decode_sparse(
         num_warps=attn_num_warps,
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
+        **extra_kwargs,
     )
 
     if kv_splits == 1:
