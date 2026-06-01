@@ -11,10 +11,6 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, memref, scf
 from flydsl.compiler.kernel_function import CompilationContext
-try:
-    from flydsl.compiler.protocol import fly_values
-except ImportError:
-    from flydsl.compiler.protocol import extract_to_ir_values as fly_values
 from flydsl.expr import (
     arith,
     buffer_ops,

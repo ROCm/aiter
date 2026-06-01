@@ -428,11 +428,7 @@ if multiprocessing.current_process().name == "MainProcess":
 
 
 def validate_and_update_archs():
-    # Hardcoded to gfx1250 for the MI450 simulator: --offload-arch=native
-    # resolves to whatever real GPU hipcc detects on the host (gfx942 here),
-    # which produces .so files whose device kernels segfault under the
-    # gfx1250 emulator. Override via env GPU_ARCHS=... if building for real HW.
-    archs = os.getenv("GPU_ARCHS", "gfx1250").split(";")
+    archs = os.getenv("GPU_ARCHS", "native").split(";")
     archs = [arch.strip() for arch in archs]
     # List of allowed architectures
     allowed_archs = [
@@ -781,7 +777,7 @@ def build_module(
             "-D__HIP_PLATFORM_AMD__=1",
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
-            # "-mllvm --amdgpu-kernarg-preload-count=16",
+            "-mllvm --amdgpu-kernarg-preload-count=16",
             # "-v --save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",
@@ -1559,20 +1555,17 @@ def compile_ops(
                         func.__signature__ = sig
                         ann = {k: v.annotation for k, v in sig.parameters.items()}
                         ann["return"] = sig.return_annotation
-                        # ``torch.Tensor`` and ``aiter_tensor_t`` are dispatcher
-                        # equivalents -- the C++ ops accept either.  Treat them
-                        # as a single "tensor-like" set when matching call args
-                        # so a torch.Tensor caller doesn't get rejected for an
-                        # ``aiter_tensor_t`` annotation (and vice versa).
-                        if aiter_tensor_t is object:
-                            tensor_like = (torch.Tensor,)
-                        else:
-                            tensor_like = (torch.Tensor, aiter_tensor_t)
+                        _tensor_types = (torch.Tensor,)
+                        if aiter_tensor_t is not object:
+                            _tensor_types = (torch.Tensor, aiter_tensor_t)
 
-                        def _match_type(arg, expected):
-                            if expected in tensor_like:
-                                return isinstance(arg, tensor_like)
-                            return isinstance(arg, expected)
+                        def _is_tensor_like(obj):
+                            return isinstance(obj, _tensor_types)
+
+                        def _is_tensor_type(tp):
+                            return tp is torch.Tensor or (
+                                aiter_tensor_t is not object and tp is aiter_tensor_t
+                            )
 
                         callargs = inspect.getcallargs(func, *args, **kwargs)
                         for el, arg in callargs.items():
@@ -1582,7 +1575,11 @@ def compile_ops(
                             sub_t = typing.get_args(expected_type)
 
                             if origin is None:
-                                if not _match_type(arg, expected_type) and not (
+                                if _is_tensor_type(expected_type) and _is_tensor_like(
+                                    arg
+                                ):
+                                    pass
+                                elif not isinstance(arg, expected_type) and not (
                                     any(el in str(expected_type) for el in enum_types)
                                     and isinstance(arg, int)
                                 ):
@@ -1595,8 +1592,10 @@ def compile_ops(
                                         f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                     )
                             elif origin is typing.Union or origin is types.UnionType:
-                                if arg is not None and not any(
-                                    _match_type(arg, t) for t in sub_t
+                                if (
+                                    arg is not None
+                                    and not _is_tensor_like(arg)
+                                    and not isinstance(arg, sub_t)
                                 ):
                                     raise TypeError(
                                         f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
@@ -1662,19 +1661,15 @@ def compile_ops(
                             )
                     return True
 
-                # ``develop=True`` is meant for the new-style C++ modules whose
-                # pybind signatures take ``aiter_tensor_t`` *and* expose
-                # ``_set_current_hip_stream``.  Several legacy modules (e.g.
-                # ``module_quant``) are tagged with ``develop=True`` but still
-                # have the classic ``torch.Tensor`` signature and don't bind
-                # the stream setter.  Detect that mismatch via the stream
-                # setter as a proxy and skip the torch -> aiter_tensor_t
-                # conversion in that case, otherwise pybind11 overload
-                # resolution rejects every call.
-                _develop_module_ok = develop and hasattr(
-                    module, "_set_current_hip_stream"
-                )
-                if _develop_module_ok:
+                if not func.arg_checked:
+                    func.arg_checked = check_args()
+
+                if AITER_LOG_MORE == 2:
+                    from ..test_common import log_args
+
+                    log_args(func, *args, **kwargs)
+                # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
+                if develop:
                     import torch
 
                     from ..utility.dtypes import torch_to_aiter_pybind
@@ -1692,15 +1687,7 @@ def compile_ops(
                         for k, v in kwargs.items()
                     }
 
-                if not func.arg_checked:
-                    func.arg_checked = check_args()
-
-                if AITER_LOG_MORE == 2:
-                    from ..test_common import log_args
-
-                    log_args(func, *args, **kwargs)
-
-                if _develop_module_ok:
+                if develop:
                     module._set_current_hip_stream(
                         torch.cuda.current_stream().cuda_stream
                     )
