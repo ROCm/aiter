@@ -98,7 +98,13 @@ def pa_decode_sparse(
     n_head_blocks = triton.cdiv(H, block_h)
     h_padded = n_head_blocks * block_h
     block_d = triton.next_power_of_2(D)
-    block_k = 16 if D >= 256 else 32
+    # gfx1250 stages slots through LDS via TDM async_load, which hides the
+    # larger per-tile KV gather latency -> BLOCK_K=32 is fastest there. Other
+    # arches use the synchronous slot path, where 32 exposes memory latency.
+    if DEVICE_ARCH == "gfx1250":
+        block_k = 32
+    else:
+        block_k = 16 if D >= 256 else 32
     num_stages = 2
     attn_num_warps = 2
     waves_per_eu = 0
@@ -144,6 +150,7 @@ def pa_decode_sparse(
         # The gluon kernel builds its WMMA / blocked layouts from NUM_WARPS, so
         # it must be threaded through as a constexpr (not just the num_warps
         # launch meta-param) to keep the layouts and the launch config in sync.
+        # (total_pages is passed positionally, right after out, to both kernels.)
         extra_kwargs = {"NUM_WARPS": attn_num_warps}
     else:
         _kernel = triton_pa_decode_sparse
@@ -160,6 +167,7 @@ def pa_decode_sparse(
         acc_partial,
         attn_sink,
         out,
+        unified_kv.shape[0],
         q.stride(0),
         q.stride(1),
         q.stride(2),

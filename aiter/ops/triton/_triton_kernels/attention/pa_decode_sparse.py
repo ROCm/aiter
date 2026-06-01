@@ -59,6 +59,7 @@ def _pa_decode_sparse(
     acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32 (unused when KV_SPLITS==1)
     attn_sink_ptr,  # [H] (only used when KV_SPLITS==1)
     out_ptr,  # [N, H, D] (only used when KV_SPLITS==1)
+    total_pages,
     q_stride_t: tl.constexpr,
     q_stride_h: tl.constexpr,
     q_stride_d: tl.constexpr,
@@ -132,17 +133,16 @@ def _pa_decode_sparse(
     tile_start = pid_k * tiles_per_segment
     tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
 
-    neg_large = -3.4028234663852886e38
     if KV_SPLITS == 1:
         # Fold sink as initial running max so it participates in the softmax
         # denom; sink contributes 0 to acc (virtual K with weight 1).
-        sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(
+        sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(
             tl.float32
         )
         m_i = sink
         l_i = tl.exp(sink - m_i)
     else:
-        m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+        m_i = tl.full((BLOCK_H,), float("-inf"), dtype=tl.float32)
         l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
@@ -167,7 +167,7 @@ def _pa_decode_sparse(
         )
 
         scores = tl.dot(q, tl.trans(kv)) * softmax_scale
-        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
+        scores = tl.where(h_mask[:, None] & valid[None, :], scores, float("-inf"))
 
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
@@ -283,15 +283,13 @@ def _pa_decode_sparse_reduce(
     act_num_segments = tl.cdiv(kv_len, tiles_per_segment * BLOCK_K)
     segm_mask = k_offs < act_num_segments
 
-    neg_large = -3.4028234663852886e38
-
     m_p = tl.load(
         m_partial_ptr
         + t * mp_stride_t
         + k_offs[:, None] * mp_stride_k
         + h_offs[None, :] * mp_stride_h,
         mask=segm_mask[:, None] & h_mask[None, :],
-        other=neg_large,
+        other=float("-inf"),
     )  # [KV_SPLITS, BLOCK_H]
     l_p = tl.load(
         l_partial_ptr
@@ -318,7 +316,9 @@ def _pa_decode_sparse_reduce(
     acc_combined = tl.sum(a_p * alpha_split[:, :, None], axis=0)  # [BLOCK_H, BLOCK_D]
 
     # Fold attn_sink as a virtual K of weight 1.
-    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
+    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(
+        tl.float32
+    )
     m_final = tl.maximum(m_max, sink)
     alpha_kv = tl.exp(m_max - m_final)
     alpha_sink = tl.exp(sink - m_final)
