@@ -319,4 +319,4 @@ def _get_config(
 ):
     # Note: Config files use K=2*K in their naming because FP4 weights are packed,
     # so the actual K dimension in the config file corresponds to 2*K unpacked elements
-    return get_gemm_config("BATCHED_GEMM_PREQUANT-AFP4WFP4", M, N, 2 * K)
+    return get_gemm_config("BATCHED_GEMM-A16WFP4", M, N, 2 * K)

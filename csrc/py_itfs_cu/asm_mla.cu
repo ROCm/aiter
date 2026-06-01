@@ -310,13 +310,13 @@ void mla_decode_stage1_asm_fwd(
         }
     } else if (gqa_ratio == 32){
         if (q_type == "bf16" && kv_type == "bf16"){
-            if(persistent){
-                if (max_seqlen_q <= 4){
-                    config_max_seqlen_q = 4; // use the existing qh32 persistent kernel
-                }
-            }else{
+            if(!persistent){
                 config_max_seqlen_q = 0;
                 sub_Q = 64;
+            } else if(persistent && max_seqlen_q == 1){
+                config_max_seqlen_q = 4;
+                config_gqa_ratio = 32;
+                args.s_MQA = gqa_ratio;
             }
         }else if (q_type == "fp8" && kv_type == "fp8"){
             if((max_seqlen_q == 4) && persistent){
@@ -370,7 +370,7 @@ void mla_decode_stage1_asm_fwd(
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;
-    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && gqa_ratio != 32 && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio > 16)){
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio > 16) && (gqa_ratio * max_seqlen_q != 32)){
         config_max_seqlen_q = 1;
         config_gqa_ratio = 64;
         args.s_MQA = gqa_ratio;
