@@ -14,7 +14,11 @@ import torch
 import triton
 import triton.language as tl
 
-from ..utils import prepare_chunk_indices, prepare_chunk_offsets
+from ..utils import (
+    prepare_chunk_indices,
+    prepare_chunk_offsets,
+    prepare_rebased_cu_seqlens,
+)
 from ..utils.op import exp
 from ..gated_delta_rule_utils import (
     RCP_LN2,
@@ -1286,6 +1290,8 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     cu_seqlens: torch.LongTensor | None = None,
     use_exp2: bool = True,
     state_dtype: torch.dtype | None = None,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Optimized hidden state forward with h layout [V, K].
@@ -1298,6 +1304,10 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     use_exp2 selects whether cumulative gates are interpreted in log2 space.
     state_dtype selects the initial/final hidden-state dtype (`fp32` or `bf16`);
     defaults to fp32. The kernel accumulates in fp32 and casts on store.
+    num_decodes / num_decode_tokens skip a leading decode-only prefix in the
+    ORIGINAL cu_seqlens (data tensors are expected pre-sliced); offsets are
+    rebased internally via the cached prologue helpers so the chunk-index /
+    offset build stays cache-warm across forward calls.
     """
     B, T, Hg, K = k.shape
     BT = chunk_size
@@ -1307,12 +1317,25 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     T_flat = w.shape[2]
 
     if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-        N = len(cu_seqlens) - 1
+        # Pass the ORIGINAL (cache-stable) cu_seqlens + decode ints into the
+        # cached prologue helpers so chunk_indices / chunk_offsets are built
+        # once per (cu_seqlens_id, BT, num_decodes, num_decode_tokens) tuple
+        # (no per-forward .tolist() D2H). The kernel walks the pre-sliced
+        # prefill data via the rebased cu_seqlens.
+        chunk_indices = prepare_chunk_indices(
+            cu_seqlens, chunk_size, num_decodes, num_decode_tokens
+        )
+        chunk_offsets = prepare_chunk_offsets(
+            cu_seqlens, BT, num_decodes, num_decode_tokens
+        )
+        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+            cu_seqlens, num_decodes, num_decode_tokens
+        )
+        N = len(kernel_cu_seqlens) - 1
         NT = len(chunk_indices)
-        chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     else:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
+        kernel_cu_seqlens = None
 
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
@@ -1354,7 +1377,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
         h=h,
         h0=initial_state,
         ht=final_state,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=kernel_cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
         T_flat=T_flat,
