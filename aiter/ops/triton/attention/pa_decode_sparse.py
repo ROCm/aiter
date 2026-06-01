@@ -10,31 +10,16 @@ This module exposes ``pa_decode_sparse`` — a 3D split-K + widened-BLOCK_H
 where each token's K range is an unordered subset of a unified KV pool.
 """
 
-import os
 from typing import Optional
 
 import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
-    _pa_decode_sparse as triton_pa_decode_sparse,
+    _pa_decode_sparse,
     _pa_decode_sparse_reduce,
 )
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-
-DEVICE_ARCH = arch_info.get_arch()
-
-if DEVICE_ARCH == "gfx1250":
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-        _pa_decode_sparse as gluon_pa_decode_sparse,
-    )
-else:
-    gluon_pa_decode_sparse = None
-
-# PA_DECODE_SPARSE_BACKEND={triton,gluon,auto}. ``auto`` (default) picks gluon
-# on gfx1250 and triton elsewhere. Used for triton-vs-gluon profile A/B.
-_BACKEND_ENV = os.environ.get("PA_DECODE_SPARSE_BACKEND", "auto").lower()
 
 _LOGGER = AiterTritonLogger()
 
@@ -120,50 +105,22 @@ def pa_decode_sparse(
     # the reduce masks their stale partial-buffer slots).
     if kv_splits is None:
         max_kv_len = kv_indices.shape[0]
-        max_num_wg = 64
+        max_num_wg = 512
         max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
         kv_splits = triton.next_power_of_2(kv_splits)
-    # kv_splits = 1
-    # When kv_splits == 1, the kernel folds the sink as initial M and writes
-    # the final output directly to ``out`` (no partial buffers, no reduce
-    # kernel). Mirrors unified_attention 3D's NUM_SEGMENTS == 1 fast path,
-    # minus out_scale.
-    if kv_splits == 1:
-        m_partial = l_partial = acc_partial = out  # unused inside the kernel
-        mp_strides = (0, 0, 0)
-        lp_strides = (0, 0, 0)
-        ap_strides = (0, 0, 0, 0)
-    else:
-        m_partial = torch.empty(
-            (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
-        )
-        l_partial = torch.empty_like(m_partial)
-        acc_partial = torch.empty(
-            (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
-        )
-        mp_strides = m_partial.stride()
-        lp_strides = l_partial.stride()
-        ap_strides = acc_partial.stride()
 
-    if _BACKEND_ENV == "triton":
-        _kernel = triton_pa_decode_sparse
-    elif _BACKEND_ENV == "gluon":
-        if gluon_pa_decode_sparse is None:
-            raise RuntimeError(
-                "PA_DECODE_SPARSE_BACKEND=gluon but gluon kernel is unavailable "
-                f"for arch {DEVICE_ARCH}"
-            )
-        _kernel = gluon_pa_decode_sparse
-    else:
-        _kernel = (
-            gluon_pa_decode_sparse
-            if (DEVICE_ARCH == "gfx1250" and gluon_pa_decode_sparse is not None)
-            else triton_pa_decode_sparse
-        )
+    m_partial = torch.empty(
+        (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
+    )
+    l_partial = torch.empty_like(m_partial)
+    acc_partial = torch.empty(
+        (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
+    )
+
     grid_attn = (T, n_head_blocks, kv_splits)
-    _kernel[grid_attn](
+    _pa_decode_sparse[grid_attn](
         q,
         unified_kv,
         kv_indices,
@@ -171,26 +128,21 @@ def pa_decode_sparse(
         m_partial,
         l_partial,
         acc_partial,
-        attn_sink,
-        out,
         q.stride(0),
         q.stride(1),
         q.stride(2),
         unified_kv.stride(0),
         unified_kv.stride(1),
-        mp_strides[0],
-        mp_strides[1],
-        mp_strides[2],
-        lp_strides[0],
-        lp_strides[1],
-        lp_strides[2],
-        ap_strides[0],
-        ap_strides[1],
-        ap_strides[2],
-        ap_strides[3],
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
+        m_partial.stride(0),
+        m_partial.stride(1),
+        m_partial.stride(2),
+        l_partial.stride(0),
+        l_partial.stride(1),
+        l_partial.stride(2),
+        acc_partial.stride(0),
+        acc_partial.stride(1),
+        acc_partial.stride(2),
+        acc_partial.stride(3),
         H,
         D,
         kv_splits,
@@ -202,9 +154,6 @@ def pa_decode_sparse(
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
     )
-
-    if kv_splits == 1:
-        return out
 
     # One reduce CTA per head. For small per-rank H (TP=8 → H ∈ {8, 16}) this
     # multiplies the reduce-side CTA count by H, replacing the previous single
