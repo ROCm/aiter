@@ -1347,6 +1347,54 @@ VALU population and is the right next lever.
 
 ---
 
+## Merged dlejeune/ua-swa-v2 (sliding-window attention) (2026-06-01)
+
+Merged the colleague SWA branch `dlejeune/ua-swa-v2` (present on **both**
+the aiter and CK repos) into `jukorhon/unified-attention-ck`, on top of
+our optimized kernel (permlane32 repack + warp-id hoist + page-table
+dedup).
+
+**Topology — clean, recent divergence (not the stale aghamari line):**
+- aiter: merge-base `bc1c7d650` (May 28); 6 commits theirs / 2 ours;
+  **zero overlapping files** (theirs: wrapper/csrc/test/config; ours:
+  CK submodule pointer + STATUS.md). Auto-merge, no conflicts
+  (`05db035b3`).
+- CK: merge-base `a3714e82c` (May 27); 8 commits theirs / 3 ours;
+  **zero overlapping files** (theirs: `kernel.hpp`, `block_masking.hpp`,
+  args struct, `_local` instances; ours: `pipeline.hpp`,
+  `tile_scatter_gather.hpp`, scheduler). Auto-merge, no conflicts
+  (`64d3e0007`). aiter submodule bumped to it in `fe98ec154`.
+
+The SWA fields (`window_size_left/right`, `is_top_left`) the aiter csrc
+needed live in CK's `unified_attention_args` on their CK branch — that's
+why the first build (CK still at our pre-SWA `9373fab55`) failed; bumping
+to the CK merge fixed it.
+
+**Validation (post-merge, our kernel + their SWA):**
+- 32/32 correctness grid PASS.
+- **46/46 colleague SWA fixtures PASS** (`--swa-fixtures all`: smoke /
+  edge / gptoss / non-align / fp8).
+- FP8 prefill + decode PASS; perf bit-identical to pre-merge
+  (b=4 sq=sk=2048 fp8 = 0.1405 ms, same as the standalone permlane
+  build).
+
+**One pre-existing SWA edge (NOT our regression):** an ad-hoc
+`bf16 window=(128,0) sq=sk=2048` shape fails the 2·atol cap (~160-220
+elements, max delta ~0.08, boundary rows). Isolation test: swapping our
+optimized `pipeline.hpp`/`tile_scatter_gather.hpp` for the colleague's
+*pristine* baseline versions (keeping the SWA merge) reproduces the same
+failure (160 elems / 0.077). Our optimizations are dtype-orthogonal to
+this anyway (permlane32 is fp8-only; hoist/dedup/scheduler are
+non-numeric), so this is a colleague-side SWA-bf16 large-window-prefill
+edge they're still resolving (their CK tip is `5ce3a94b3 fix Q=1 SWA
+bug`), independent of this merge.
+
+Pushed: CK `9373fab55..64d3e0007`, aiter `34da6c8f5..fe98ec154`. Safety
+branches `jukorhon/{ua,ck}-pre-swa-merge-20260601` left at the pre-merge
+HEADs.
+
+---
+
 ## Open / parked items
 
 * **Hoisted SGPR-ring prefetch (Tier-0 → moved before `fmha_alu1`).** Tried
