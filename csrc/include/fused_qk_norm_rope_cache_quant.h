@@ -92,14 +92,43 @@ void fused_qk_norm_rope_1way(aiter_tensor_t& q,
                              aiter_tensor_t& out_q,
                              aiter_tensor_t& out_k);
 
+// Same signature as the pertensor variant, but writes per-(batch, head) descales:
+//   q_descale shape [batch_size, num_heads_q]
+//   k_descale shape [batch_size, num_heads_k]
+// These shapes match what CK FP8 flash attention accepts natively.
+void fused_qk_norm_rope_2way_fp8_perhead_quant(aiter_tensor_t& q0,
+                                               aiter_tensor_t& k0,
+                                               aiter_tensor_t& q1,
+                                               aiter_tensor_t& k1,
+                                               aiter_tensor_t& w_q0,
+                                               aiter_tensor_t& w_k0,
+                                               aiter_tensor_t& w_q1,
+                                               aiter_tensor_t& w_k1,
+                                               aiter_tensor_t& cos_sin0,
+                                               aiter_tensor_t& cos_sin1,
+                                               int64_t batch_size,
+                                               int64_t num_tokens0,
+                                               int64_t num_tokens1,
+                                               int64_t num_heads_q,
+                                               int64_t num_heads_k,
+                                               int64_t head_size,
+                                               bool is_interleaved,
+                                               double eps,
+                                               aiter_tensor_t& q_fp8,
+                                               aiter_tensor_t& k_fp8,
+                                               aiter_tensor_t& q_descale,
+                                               aiter_tensor_t& k_descale,
+                                               aiter_tensor_t& q_unquantized,
+                                               aiter_tensor_t& k_unquantized);
+
 void fused_qk_rmsnorm(aiter_tensor_t& q,
-                       aiter_tensor_t& q_weight,
-                       double q_eps,
-                       aiter_tensor_t& k,
-                       aiter_tensor_t& k_weight,
-                       double k_eps,
-                       aiter_tensor_t& q_out,
-                       aiter_tensor_t& k_out);
+                      aiter_tensor_t& q_weight,
+                      double q_eps,
+                      aiter_tensor_t& k,
+                      aiter_tensor_t& k_weight,
+                      double k_eps,
+                      aiter_tensor_t& q_out,
+                      aiter_tensor_t& k_out);
 
 void fused_qk_norm_rope_cache_block_quant_shuffle(
     aiter_tensor_t& qkv,
