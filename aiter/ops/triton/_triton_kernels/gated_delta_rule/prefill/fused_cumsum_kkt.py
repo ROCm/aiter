@@ -8,7 +8,7 @@ from ..gated_delta_rule_utils import (
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
 )
-from ..utils import prepare_chunk_indices
+from ..utils import prepare_chunk_indices, prepare_rebased_cu_seqlens
 from ..utils.op import exp
 
 
@@ -275,6 +275,8 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
     g_output_dtype: torch.dtype = torch.float32,
     A_output_dtype: torch.dtype = torch.float32,
     use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused cumsum + scaled dot KKT (optimized, with autotuning).
@@ -298,11 +300,22 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
     H = beta.shape[-1]
     BT = chunk_size
 
+    # Pass the ORIGINAL (cache-stable) cu_seqlens to prepare_chunk_indices
+    # together with num_decodes/num_decode_tokens, so the chunk-index build
+    # caches on the stable tensor identity and never re-fires the .tolist()
+    # D2H across forward calls. The kernel walks the pre-sliced prefill data
+    # via the rebased cu_seqlens.
     if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        chunk_indices = prepare_chunk_indices(
+            cu_seqlens, BT, num_decodes, num_decode_tokens
+        )
+        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+            cu_seqlens, num_decodes, num_decode_tokens
+        )
         NT = len(chunk_indices)
     else:
         chunk_indices = None
+        kernel_cu_seqlens = None
         NT = triton.cdiv(T, BT)
 
     g_cumsum_out = torch.empty(B, H, T, device=g.device, dtype=g_output_dtype)
@@ -314,7 +327,7 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         beta,
         g_cumsum_out,
         A_out,
-        cu_seqlens,
+        kernel_cu_seqlens,
         chunk_indices,
         T=T,
         H=H,

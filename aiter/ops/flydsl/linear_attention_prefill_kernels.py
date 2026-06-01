@@ -39,6 +39,11 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.fused_solve_tril_
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.l2norm import (
     l2norm_fwd,
 )
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
+    prepare_chunk_offsets,
+    prepare_num_chunks,
+    prepare_rebased_cu_seqlens,
+)
 
 __all__ = [
     "chunk_gated_delta_rule_fwd_h_flydsl",
@@ -103,9 +108,6 @@ def _lookup_tuned_bv(
     save_vn,
     is_varlen,
     wu_contig,
-    head_seqlen=0,
-    mid_seqlen=0,
-    tail_seqlen=0,
 ):
     """Select ``BV`` with the rule-based grid/CU heuristic."""
     del (
@@ -118,9 +120,6 @@ def _lookup_tuned_bv(
         store_fs,
         save_vn,
         wu_contig,
-        head_seqlen,
-        mid_seqlen,
-        tail_seqlen,
     )
     return _heuristic_bv(
         H=H,
@@ -310,6 +309,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     cu_seqlens: torch.LongTensor | None = None,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = False,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
 
@@ -332,6 +333,15 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         use_exp2: whether ``g`` is in log2 space. Standalone K5 callers pass
             natural-log ``g`` by default; end-to-end prefill passes the Triton
             K1 ``use_exp2`` setting through explicitly.
+        num_decodes: number of leading decode-only sequences to skip in
+            ``cu_seqlens``. When nonzero, ``cu_seqlens`` is the ORIGINAL,
+            cache-stable metadata tensor (decode prefix included) and the
+            data tensors (``k/w/u/g/...``) are expected to be pre-sliced to
+            the prefill region; the offsets are rebased internally via the
+            cached ``prepare_rebased_cu_seqlens``.
+        num_decode_tokens: number of leading decode tokens stripped from the
+            data tensors; subtracted from the rebased offsets so they index
+            from token 0 of the prefill region.
 
     Returns:
         (h, v_new, final_state) in VK-ordered layout (``[..., V, K]`` on the
@@ -374,44 +384,27 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
-        head_seqlen_lookup = 0
-        mid_seqlen_lookup = 0
-        tail_seqlen_lookup = 0
+        kernel_cu_seqlens = None
     else:
-        N = len(cu_seqlens) - 1
-        lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        lens_list = lens.tolist()
-        NT = sum(triton.cdiv(int(seq_len), BT) for seq_len in lens_list)
-        # Structural features of the cu_seqlens length distribution for
-        # BV lookup; computed identically by sweep_flydsl_k5_bv.py so
-        # the runtime key matches the tuned table's key.
-        if not lens_list:
-            head_seqlen_lookup = 0
-            mid_seqlen_lookup = 0
-            tail_seqlen_lookup = 0
-        elif len(lens_list) == 1:
-            head_seqlen_lookup = int(lens_list[0])
-            mid_seqlen_lookup = 0
-            tail_seqlen_lookup = 0
-        elif len(lens_list) == 2:
-            head_seqlen_lookup = int(lens_list[0])
-            mid_seqlen_lookup = 0
-            tail_seqlen_lookup = int(lens_list[1])
-        else:
-            mids = lens_list[1:-1]
-            head_seqlen_lookup = int(lens_list[0])
-            tail_seqlen_lookup = int(lens_list[-1])
-            mid_seqlen_lookup = int(mids[0]) if all(m == mids[0] for m in mids) else 0
-        chunk_offsets = (
-            torch.cat(
-                [
-                    cu_seqlens.new_tensor([0]),
-                    triton.cdiv(lens, BT),
-                ]
-            )
-            .cumsum(-1)
-            .to(torch.int32)
+        # Pass the ORIGINAL (cache-stable) cu_seqlens + the decode ints into
+        # the cached prologue helpers. They all key on the original tensor's
+        # identity, so chunk_offsets / NT / the rebased kernel cu_seqlens are
+        # computed ONCE per (cu_seqlens_id, BT, num_decodes, num_decode_tokens)
+        # tuple and every subsequent forward is a pure cache hit -> no
+        # per-forward D2H. (Passing a freshly-rebased tensor instead would key
+        # the offset/num-chunk caches on an unstable identity and re-fire the
+        # .tolist()/int() syncs every call.)
+        chunk_offsets = prepare_chunk_offsets(
+            cu_seqlens, BT, num_decodes, num_decode_tokens
         )
+        NT = prepare_num_chunks(cu_seqlens, BT, num_decodes, num_decode_tokens)
+        # Rebased kernel-facing cu_seqlens (matches the pre-sliced prefill
+        # data). N is the prefill sequence count (len() is a shape read, no
+        # sync).
+        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+            cu_seqlens, num_decodes, num_decode_tokens
+        )
+        N = len(kernel_cu_seqlens) - 1
 
     assert K <= 256
 
@@ -444,10 +437,20 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     h0_arg = initial_state if initial_state is not None else dummy
     ht_arg = final_state if final_state is not None else dummy
     vn_arg = v_new_buf
+    # cu_arg / co_arg are the kernel-facing (rebased) offsets, narrowed to
+    # int32. `.to(torch.int32)` is a device-to-device cast (no host sync); the
+    # resulting fresh objects are consumed only by the kernel launch, so their
+    # identity does not matter for the @tensor_cache helpers above.
     cu_arg = (
-        cu_seqlens.to(torch.int32) if cu_seqlens is not None else dummy.to(torch.int32)
+        kernel_cu_seqlens.to(torch.int32)
+        if kernel_cu_seqlens is not None
+        else dummy.to(torch.int32)
     )
-    co_arg = chunk_offsets if chunk_offsets is not None else dummy.to(torch.int32)
+    co_arg = (
+        chunk_offsets.to(torch.int32)
+        if chunk_offsets is not None
+        else dummy.to(torch.int32)
+    )
     stream = torch.cuda.current_stream()
 
     use_g = g is not None
@@ -472,9 +475,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         save_vn=bool(save_new_value),
         is_varlen=is_varlen,
         wu_contig=wu_contiguous,
-        head_seqlen=head_seqlen_lookup,
-        mid_seqlen=mid_seqlen_lookup,
-        tail_seqlen=tail_seqlen_lookup,
     )
 
     launch_fn = _get_or_compile(
@@ -526,6 +526,7 @@ def flydsl_gdr_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    o: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: float | None = None,
@@ -536,6 +537,8 @@ def flydsl_gdr_prefill(
     use_chunk_hip: bool = False,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """End-to-end GDN forward where K5 runs on FlyDSL.
 
@@ -566,21 +569,46 @@ def flydsl_gdr_prefill(
             K5 is always dispatched through FlyDSL in this backend.
         state_dtype: optional initial/final state dtype (float32 or bfloat16).
         use_exp2: use exp2/log2-scaled gates across K1-K6, matching Triton.
+        num_decodes: number of leading decode-only sequences in ``cu_seqlens``
+            to skip. When nonzero, the caller passes the ORIGINAL, cache-stable
+            ``cu_seqlens`` (decode prefix included) and the data tensors
+            (``q/k/v/g/beta/o``) pre-sliced to the prefill region
+            (``[:, num_decode_tokens:]``). The offsets are rebased ONCE here
+            via the cached ``prepare_rebased_cu_seqlens`` and the rebased tensor
+            is threaded into all four stages, keeping their identity-keyed
+            ``@tensor_cache`` (``prepare_chunk_indices`` / offsets) warm across
+            forward calls.
+        num_decode_tokens: number of leading decode tokens stripped from the
+            data tensors; subtracted from the rebased offsets.
 
     Returns:
         ``(o, final_state)`` where ``o`` is shape ``[B, T, H, V]`` and
         ``final_state`` is ``[N, H, V, K]`` (or ``None``).
     """
+    # The data tensors (q/k/v/g/beta/o) are expected to be pre-sliced by the
+    # caller to drop the leading `num_decode_tokens` decode tokens. We pass the
+    # ORIGINAL (cache-stable) `cu_seqlens` together with `num_decodes` /
+    # `num_decode_tokens` to every stage; each stage's cached prologue helpers
+    # (`prepare_chunk_indices` / `prepare_chunk_offsets` /
+    # `prepare_rebased_cu_seqlens`) key on the original tensor's identity, so
+    # the chunk-index / offset builds and the rebase fire ONCE per
+    # (cu_seqlens_id, BT, num_decodes, num_decode_tokens) tuple and every
+    # subsequent forward is a pure cache hit -> no per-forward D2H. Crucially we
+    # do NOT pre-rebase here: handing the sub-kernels a freshly sliced tensor
+    # each call would key their caches on an unstable identity and re-fire the
+    # `.tolist()` syncs every forward.
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} "
                 f"when using `cu_seqlens`."
             )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
+        # Prefill sequence count == len(cu_seqlens) - 1 - num_decodes.
+        n_prefill = len(cu_seqlens) - 1 - num_decodes
+        if initial_state is not None and initial_state.shape[0] != n_prefill:
             raise ValueError(
                 f"The number of initial states is expected to be equal to the "
-                f"number of input sequences, i.e., {len(cu_seqlens) - 1} "
+                f"number of input sequences, i.e., {n_prefill} "
                 f"rather than {initial_state.shape[0]}."
             )
 
@@ -601,6 +629,8 @@ def flydsl_gdr_prefill(
         g=g,
         cu_seqlens=cu_seqlens,
         use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
 
     # -- K3+K4 (Triton) : w (head-major), u (head-major) -------------------
@@ -612,6 +642,8 @@ def flydsl_gdr_prefill(
         g_cumsum=g_cumsum,
         cu_seqlens=cu_seqlens,
         use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
 
     # -- K5 (FlyDSL) : h, v_new, final_state -------------------------------
@@ -625,6 +657,8 @@ def flydsl_gdr_prefill(
         cu_seqlens=cu_seqlens,
         state_dtype=state_dtype,
         use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
 
     # -- K6 (Triton) : o = chunk_fwd_o_opt_vk(q, k, v_new, h, g_cumsum) ----
@@ -632,11 +666,14 @@ def flydsl_gdr_prefill(
         q=q,
         k=k,
         v=v_new,
+        o=o,
         h=h,
         g=g_cumsum,
         scale=scale,
         cu_seqlens=cu_seqlens,
         use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
 
     return o.to(q.dtype), final_state
