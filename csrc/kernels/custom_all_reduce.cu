@@ -271,127 +271,6 @@ static void _all_gather(fptr_t _fa,
     }
 }
 
-static void _all_gather_unreg(fptr_t _fa,
-                              void* inp,
-                              void* reg_inp,
-                              void* out,
-                              int64_t size,
-                              AiterDtype dtype,
-                              int64_t last_dim_size,
-                              int64_t gather_dim)
-{
-    hipStream_t stream = aiter::getCurrentHIPStream();
-    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    switch(dtype)
-    {
-    case AITER_DTYPE_fp32: {
-        fa->dispatchAllGatherUnreg<opus::fp32_t>(stream,
-                                                 reinterpret_cast<opus::fp32_t*>(inp),
-                                                 reinterpret_cast<opus::fp32_t*>(reg_inp),
-                                                 reinterpret_cast<opus::fp32_t*>(out),
-                                                 size,
-                                                 last_dim_size,
-                                                 gather_dim);
-        break;
-    }
-    case AITER_DTYPE_fp16: {
-        fa->dispatchAllGatherUnreg<opus::fp16_t>(stream,
-                                                 reinterpret_cast<opus::fp16_t*>(inp),
-                                                 reinterpret_cast<opus::fp16_t*>(reg_inp),
-                                                 reinterpret_cast<opus::fp16_t*>(out),
-                                                 size,
-                                                 last_dim_size,
-                                                 gather_dim);
-        break;
-    }
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-    case AITER_DTYPE_bf16: {
-        fa->dispatchAllGatherUnreg<opus::bf16_t>(stream,
-                                                 reinterpret_cast<opus::bf16_t*>(inp),
-                                                 reinterpret_cast<opus::bf16_t*>(reg_inp),
-                                                 reinterpret_cast<opus::bf16_t*>(out),
-                                                 size,
-                                                 last_dim_size,
-                                                 gather_dim);
-        break;
-    }
-#endif
-    case AITER_DTYPE_u64: {
-        fa->dispatchAllGatherUnreg<uint64_t>(stream,
-                                             reinterpret_cast<uint64_t*>(inp),
-                                             reinterpret_cast<uint64_t*>(reg_inp),
-                                             reinterpret_cast<uint64_t*>(out),
-                                             size,
-                                             last_dim_size,
-                                             gather_dim);
-        break;
-    }
-    case AITER_DTYPE_i64: {
-        fa->dispatchAllGatherUnreg<int64_t>(stream,
-                                            reinterpret_cast<int64_t*>(inp),
-                                            reinterpret_cast<int64_t*>(reg_inp),
-                                            reinterpret_cast<int64_t*>(out),
-                                            size,
-                                            last_dim_size,
-                                            gather_dim);
-        break;
-    }
-    case AITER_DTYPE_u32: {
-        fa->dispatchAllGatherUnreg<uint32_t>(stream,
-                                             reinterpret_cast<uint32_t*>(inp),
-                                             reinterpret_cast<uint32_t*>(reg_inp),
-                                             reinterpret_cast<uint32_t*>(out),
-                                             size,
-                                             last_dim_size,
-                                             gather_dim);
-        break;
-    }
-    case AITER_DTYPE_i32: {
-        fa->dispatchAllGatherUnreg<int32_t>(stream,
-                                            reinterpret_cast<int32_t*>(inp),
-                                            reinterpret_cast<int32_t*>(reg_inp),
-                                            reinterpret_cast<int32_t*>(out),
-                                            size,
-                                            last_dim_size,
-                                            gather_dim);
-        break;
-    }
-    case AITER_DTYPE_i16: {
-        fa->dispatchAllGatherUnreg<int16_t>(stream,
-                                            reinterpret_cast<int16_t*>(inp),
-                                            reinterpret_cast<int16_t*>(reg_inp),
-                                            reinterpret_cast<int16_t*>(out),
-                                            size,
-                                            last_dim_size,
-                                            gather_dim);
-        break;
-    }
-    case AITER_DTYPE_u8: {
-        fa->dispatchAllGatherUnreg<uint8_t>(stream,
-                                            reinterpret_cast<uint8_t*>(inp),
-                                            reinterpret_cast<uint8_t*>(reg_inp),
-                                            reinterpret_cast<uint8_t*>(out),
-                                            size,
-                                            last_dim_size,
-                                            gather_dim);
-        break;
-    }
-    case AITER_DTYPE_i8: {
-        fa->dispatchAllGatherUnreg<int8_t>(stream,
-                                           reinterpret_cast<int8_t*>(inp),
-                                           reinterpret_cast<int8_t*>(reg_inp),
-                                           reinterpret_cast<int8_t*>(out),
-                                           size,
-                                           last_dim_size,
-                                           gather_dim);
-        break;
-    }
-    default:
-        throw std::runtime_error(
-            "custom allgather only supports float32, float16, bfloat16, and integral dtypes");
-    }
-}
-
 static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      void* inp,
                                      void* residual_inp,
@@ -637,19 +516,14 @@ void all_gather_unreg(fptr_t _fa,
                       int64_t dim)
 {
     HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream    = aiter::getCurrentHIPStream();
     int64_t data_bytes    = inp.numel() * inp.element_size();
     int64_t last_dim_size = inp.size(-1);
 
     if(data_bytes > reg_bytes)
         throw std::runtime_error("registered buffer is too small to contain the input");
-    _all_gather_unreg(_fa,
-                      inp.data_ptr(),
-                      (void*)reg_buffer,
-                      out.data_ptr(),
-                      inp.numel(),
-                      inp.dtype(),
-                      last_dim_size,
-                      dim);
+    HIP_CALL(hipMemcpyAsync((void*)reg_buffer, inp.data_ptr(), data_bytes, hipMemcpyDeviceToDevice, stream));
+    _all_gather(_fa, (void*)reg_buffer, out.data_ptr(), inp.numel(), inp.dtype(), last_dim_size, dim);
 }
 
 void fused_allreduce_rmsnorm(fptr_t _fa,
