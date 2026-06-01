@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.1.8"
+FLYDSL_VERSION = "flydsl==0.1.9.dev599"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -57,8 +57,9 @@ def is_develop_mode():
 if not IS_WINDOWS and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
+        from packaging.version import Version
 
-        if pkg_version("flydsl") != FLYDSL_VERSION.split("==")[1]:
+        if Version(pkg_version("flydsl")) != Version(FLYDSL_VERSION.split("==")[1]):
             raise ImportError("version mismatch")
     except Exception:
         subprocess.check_call(
@@ -97,8 +98,26 @@ def _run_install_triton():
 
 AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", 0))
 
+
+def _torch_version_below(min_version):
+    try:
+        import torch
+        from packaging.version import Version
+
+        return Version(torch.__version__.split("+")[0].split("dev")[0]) < Version(
+            min_version
+        )
+    except Exception:
+        return False
+
+
 _triton_info = _is_triton_installed()
-if AITER_USE_SYSTEM_TRITON and _triton_info:
+if _torch_version_below("2.9.1"):
+    print(
+        f"[aiter] torch < 2.9.1 detected, skipping triton reinstall"
+        f"{f' (keeping {_triton_info[0]}=={_triton_info[1]})' if _triton_info else ''}"
+    )
+elif AITER_USE_SYSTEM_TRITON and _triton_info:
     print(
         f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping existing"
         f" {_triton_info[0]}=={_triton_info[1]}"
@@ -300,6 +319,9 @@ if PREBUILD_KERNELS != 0:
             req_md_names = [
                 "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale",
                 "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale",
+                "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_skip_nqscale",
+                "mha_varlen_fwd_bf16_nlogits_nbias_mask_lse_ndropout_skip_nqscale",
+                "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_skip_nqscale",
             ]
             variants = get_mha_varlen_prebuild_variants_by_names(req_md_names, ck_dir)
             base_args = core.get_args_of_build("module_mha_varlen_fwd")

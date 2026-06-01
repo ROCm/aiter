@@ -279,11 +279,16 @@ def get_torch_quant(qType):
 
 @functools.lru_cache()
 def get_hip_quant(qType):
+    # `per_1x32` points to the dtype-aware MX entry so callers can do
+    # `get_hip_quant(QuantType.per_1x32)(x, quant_dtype=dtypes.fp4x2)` for
+    # MXFP4 or `quant_dtype=dtypes.fp8` for MXFP8. The legacy
+    # `per_1x32_f4_quant_hip` thin wrapper is preserved separately for
+    # external callers that imported it by name.
     tmp = {
         QuantType.No.value: lambda *a, **k: (a[0], None),
         QuantType.per_Tensor.value: per_tensor_quant_hip,
         QuantType.per_Token.value: per_token_quant_hip,
-        QuantType.per_1x32.value: per_1x32_f4_quant_hip,
+        QuantType.per_1x32.value: per_1x32_mx_quant_hip,
         QuantType.per_1x128.value: functools.partial(
             per_group_quant_hip, group_size=128
         ),
@@ -379,46 +384,109 @@ def per_group_quant_hip(
     return y, scale
 
 
-def per_1x32_f4_quant_hip(
+def per_1x32_mx_quant_hip(
     x,
     scale=None,
     quant_dtype=dtypes.fp4x2,
     shuffle=False,
     num_rows: Optional[torch.Tensor] = None,
     num_rows_factor=1,
+    scale_type=None,
 ):
+    """1x32 per-group MX dynamic quant (HIP).
+
+    Dispatches by ``quant_dtype``:
+      * ``dtypes.fp4x2``: MXFP4, packed fp4x2 output ``(m, n // 2)``,
+        e8m0-byte scale ``(m, ceil(n/32))`` (or padded to
+        ``(pad256(m), pad8(ceil(n/32)))`` when ``shuffle=True``).
+        ``scale_type`` is ignored -- fp4 always produces an e8m0 byte scale.
+      * ``dtypes.fp8``: MXFP8, fp8 output ``(m, n)``. The scale layout is
+        chosen by ``scale_type``:
+            - ``dtypes.fp32`` (default for backward compat): continuous
+              fp32 per-group scale ``(m, ceil(n/32))``.
+            - ``dtypes.fp8_e8m0``: e8m0 byte scale ``(m, ceil(n/32))``
+              (or padded ``(pad256(m), pad8(ceil(n/32)))`` when
+              ``shuffle=True``). This is the byte layout consumed by
+              ``mxfp4_moe_sort_hip`` and MXFP8 GEMM kernels, enabling the
+              MXFP8 "split" path  (per_1x32 quant -> sorted-scale shuffle)
+              that mirrors the existing MXFP4 split path.
+
+    The legacy ``per_1x32_f4_quant_hip`` is kept as a thin wrapper for
+    backward compatibility.
+    """
     m, n = x.shape
-    assert quant_dtype == dtypes.fp4x2
-    assert n % 2 == 0
+    assert n % 32 == 0, f"n={n} must be divisible by 32"
     device = x.device
+
+    # Per-dtype defaults / validation.
+    if quant_dtype == dtypes.fp4x2:
+        assert n % 2 == 0
+        out_cols = n // 2
+        # fp4 is always e8m0; ignore caller-supplied scale_type (or assert
+        # it agrees) so the public surface stays simple.
+        effective_scale_type = dtypes.fp8_e8m0
+        if scale_type is not None and scale_type not in (dtypes.fp8_e8m0,):
+            raise ValueError(
+                f"per_1x32_mx_quant_hip: fp4x2 output requires e8m0 scale; "
+                f"got scale_type={scale_type}"
+            )
+    elif quant_dtype == dtypes.fp8:
+        out_cols = n
+        effective_scale_type = scale_type if scale_type is not None else dtypes.fp32
+        if effective_scale_type not in (dtypes.fp32, dtypes.fp8_e8m0):
+            raise ValueError(
+                f"per_1x32_mx_quant_hip: fp8 output expects scale_type in "
+                f"{{fp32, fp8_e8m0}}, got {effective_scale_type}"
+            )
+        if shuffle and effective_scale_type == dtypes.fp32:
+            raise NotImplementedError(
+                "per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp32, "
+                "shuffle=True): the fp32-scale path uses a transposed "
+                "(scaleN, M) layout and is not supported through this "
+                "wrapper. Pass scale_type=dtypes.fp8_e8m0 for the swizzled "
+                "byte-scale layout, or use fused_dynamic_mxfp8_quant_moe_sort "
+                "for the MoE-sort fused path."
+            )
+    else:
+        raise ValueError(
+            f"per_1x32_mx_quant_hip: unsupported quant_dtype {quant_dtype}, "
+            f"expected one of (dtypes.fp4x2, dtypes.fp8)"
+        )
+
+    # Allocate scale buffer matching the requested layout.
+    is_e8m0 = effective_scale_type == dtypes.fp8_e8m0
     if scale is None:
-        if shuffle:
-            scale = (
-                torch.empty(
+        if is_e8m0:
+            if shuffle:
+                scale = torch.empty(
                     (
                         (m + 255) // 256 * 256,
                         ((n + 31) // 32 + 7) // 8 * 8,
                     ),
                     dtype=torch.uint8,
                     device=device,
-                )
-                # .fill_(0x7F)
-                .view(dtypes.fp8_e8m0)
-            )
-        else:
-            scale = (
-                torch.empty(
+                ).view(dtypes.fp8_e8m0)
+            else:
+                scale = torch.empty(
                     (m, (n + 31) // 32),
                     dtype=torch.uint8,
                     device=device,
-                )
-                # .fill_(0x7F)
-                .view(dtypes.fp8_e8m0)
+                ).view(dtypes.fp8_e8m0)
+        else:
+            scale = torch.empty(
+                (m, (n + 31) // 32),
+                dtype=dtypes.fp32,
+                device=device,
             )
     else:
         raise ValueError("unsupported: static per token quant")
-    y = torch.empty(m, n // 2, dtype=quant_dtype, device=device)
-    dynamic_per_group_scaled_quant_fp4(
+    y = torch.empty(m, out_cols, dtype=quant_dtype, device=device)
+    # `dynamic_per_group_scaled_quant` is the canonical dtype-aware C entry;
+    # the C++ host dispatches by `out.dtype()` (fp4/fp8/i8) and by
+    # `scales.dtype()` (e8m0 vs fp32). The legacy
+    # `dynamic_per_group_scaled_quant_fp4` symbol is retained as a
+    # backward-compat forwarder for callers that import it directly.
+    dynamic_per_group_scaled_quant(
         y,
         x,
         scale,
@@ -428,6 +496,34 @@ def per_1x32_f4_quant_hip(
         num_rows_factor=num_rows_factor,
     )
     return y, scale
+
+
+def per_1x32_f4_quant_hip(
+    x,
+    scale=None,
+    quant_dtype=dtypes.fp4x2,
+    shuffle=False,
+    num_rows: Optional[torch.Tensor] = None,
+    num_rows_factor=1,
+):
+    """Backward-compat fp4-only wrapper around :func:`per_1x32_mx_quant_hip`.
+
+    New code should call ``per_1x32_mx_quant_hip`` directly with the
+    desired ``quant_dtype``; this wrapper exists so existing callers (and
+    the ``get_hip_quant(QuantType.per_1x32)`` lookup before MXFP8 support
+    was added) keep working unchanged.
+    """
+    assert (
+        quant_dtype == dtypes.fp4x2
+    ), "per_1x32_f4_quant_hip is fp4-only; use per_1x32_mx_quant_hip for fp8"
+    return per_1x32_mx_quant_hip(
+        x,
+        scale=scale,
+        quant_dtype=quant_dtype,
+        shuffle=shuffle,
+        num_rows=num_rows,
+        num_rows_factor=num_rows_factor,
+    )
 
 
 def per_tensor_quant_hip(
@@ -569,6 +665,28 @@ def dynamic_per_token_scaled_quant(
 
 
 @compile_ops("module_quant", develop=True)
+def dynamic_per_group_scaled_quant(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int = 32,
+    shuffle_scale: bool = True,
+    num_rows: Optional[torch.Tensor] = None,
+    num_rows_factor: int = 1,
+) -> None:
+    """Dtype-aware per-group dynamic quant.
+
+    ``out.dtype`` selects the element format:
+      * ``dtypes.fp4x2`` / ``torch.uint8`` -> MXFP4 (e8m0 byte scale)
+      * ``dtypes.fp8``                      -> MXFP8 (fp32 per-group scale today)
+      * ``dtypes.i8``                       -> int8 per-group (fp32 scale)
+
+    Only ``group_size`` in {32, 64, 128} is supported.
+    """
+    ...
+
+
+@compile_ops("module_quant", develop=True)
 def dynamic_per_group_scaled_quant_fp4(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -578,8 +696,10 @@ def dynamic_per_group_scaled_quant_fp4(
     num_rows: Optional[torch.Tensor] = None,
     num_rows_factor: int = 1,
 ) -> None:
-    """
-    Only support group_size in [32, 64, 128]
+    """Backward-compat fp4x2-only forwarder; delegates to
+    ``dynamic_per_group_scaled_quant``.
+
+    Only support group_size in [32, 64, 128].
     """
     ...
 
@@ -657,9 +777,12 @@ def mxfp4_moe_sort_fwd(
     token_num: int,
     cols: int,
 ):
+    # Pad cols to multiple of 8 to match `mx_scale_shuffle_idx`'s
+    # `scaleN_pad = pad8(scaleN)`. See note in `fused_dynamic_mx_quant_moe_sort`.
+    scaleN_pad = ((cols + 31) // 32 + 7) // 8 * 8
     out_scale = torch.empty(
         (sorted_ids.shape[0] + 31) // 32 * 32,
-        (cols + 31) // 32,
+        scaleN_pad,
         dtype=dtypes.fp8_e8m0,
         device=scale.device,
     )
@@ -668,7 +791,7 @@ def mxfp4_moe_sort_fwd(
 
 
 @compile_ops("module_quant", develop=True)
-def fused_dynamic_mxfp4_quant_moe_sort_hip(
+def fused_dynamic_mx_quant_moe_sort_hip(
     out: torch.Tensor,
     scales: torch.Tensor,
     input: torch.Tensor,
@@ -679,7 +802,9 @@ def fused_dynamic_mxfp4_quant_moe_sort_hip(
     group_size: int = 32,
 ) -> None:
     """
-    HIP path for fused dynamic MXFP4 quantization and MoE scale sorting.
+    HIP path for fused dynamic MX (fp4 or fp8) quantization and MoE scale
+    sorting. The output dtype of ``out`` selects the quant target: fp4x2/uint8
+    for MXFP4, fp8 for MXFP8.
     """
     ...
 
@@ -710,7 +835,7 @@ def quant_mxfp4_hip(
     """MXFP4 quantization with optional weight/scale shuffle.
 
     Args:
-        round_mode: 0 = Even — e8m0 scale via even-rounding group max
+        round_mode: 0 = Even -- e8m0 scale via even-rounding group max
             to nearest power-of-2. gfx950 uses HW builtin (exact RNE);
             gfx942 uses SW fallback (round-half-away).
     """
@@ -750,36 +875,89 @@ def quant_mxfp4_hip(
     return out_packed, out_scale
 
 
-def fused_dynamic_mxfp4_quant_moe_sort(
+def fused_dynamic_mx_quant_moe_sort(
     input: torch.Tensor,
     sorted_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
     token_num: int,
     topk: int,  # stage1 and stage2: same topk value
     block_size: int,
+    quant_dtype: torch.dtype = dtypes.fp4x2,
     num_rows: Optional[torch.Tensor] = None,
     group_size: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Unified fused dynamic MX quant + MoE-sort entry (MXFP4 / MXFP8).
+
+    Returns ``(out, scale)`` where:
+      * ``out``:
+          - ``dtypes.fp4x2`` -> ``(M, N // 2)`` packed fp4 (MXFP4)
+          - ``dtypes.fp8``   -> ``(M, N)`` fp8 e4m3 (MXFP8)
+      * ``scale``: ``(pad32(sorted_ids.shape[0]), N // group_size)`` e8m0
+                   byte, swizzled to the GEMM tile layout consumed by MXFP4
+                   / MXFP8 MoE GEMM kernels. The byte memory layout is
+                   identical between MXFP4 and MXFP8 (see
+                   ``mx_scale_shuffle_idx`` -- the swizzle formula is
+                   dtype-agnostic), only the per-byte exponent value
+                   differs based on the dtype's ``max_pow2`` constant.
+
+    Dispatch:
+      * Small ``M`` (or non-default ``group_size``): single fused HIP kernel
+        ``fused_dynamic_mx_quant_moe_sort_hip`` which does quant + sort +
+        swizzle in one pass. Saves a kernel launch but re-quantises each
+        input row up to ``topk`` times.
+      * Large ``M``: split path - one pass of ``per_1x32_mx_quant_hip`` to
+        produce per-token unswizzled fp8_e8m0 scale, then ``mxfp4_moe_sort_hip``
+        to sort + swizzle the byte tensor. The split kernel itself is dtype-
+        agnostic for the byte shuffle step (same kernel handles both MXFP4
+        and MXFP8 scale bytes). Wins at large ``M`` because the quant pass
+        reads each input row exactly once instead of ``topk`` times.
+
+    Threshold: stage1 cuts over at ``M = 8*256/topk``; stage2 cuts over at
+    ``M = 8*1024/topk * topk = 8*1024``. The previous ``fused_dynamic_mxfp4_*``
+    /``fused_dynamic_mxfp8_*`` entries are retained as thin wrappers for
+    backward compatibility.
+    """
+    if quant_dtype not in (dtypes.fp4x2, dtypes.fp8):
+        raise ValueError(
+            f"fused_dynamic_mx_quant_moe_sort: unsupported quant_dtype "
+            f"{quant_dtype}, expected one of (dtypes.fp4x2, dtypes.fp8)"
+        )
+
     token_num_quant_moe_sort_switch = [
         8 * 256 / topk,  # stage1
         8 * 1024 / topk,  # stage2
     ]
     M, N = input.view(-1, input.shape[-1]).shape
+    # Packed fp4x2 stores 2 elements per byte; fp8 is 1 elem per byte.
+    out_cols = N // 2 if quant_dtype == dtypes.fp4x2 else N
     is_stage1 = M == token_num
-    topk = 1 if is_stage1 else topk
+    # `eff_topk` mirrors what the HIP launcher would infer from
+    # `input.numel() / (cols * token_num)` (= 1 for stage1, original topk
+    # for stage2). Used as `num_rows_factor` in the split path.
+    eff_topk = 1 if is_stage1 else topk
+    # Scale cols pad to multiple of 8 to match `mx_scale_shuffle_idx`'s
+    # `scaleN_pad = pad8(scaleN)`. Without this, MX shapes with
+    # `N/group_size` not divisible by 8 (e.g. inter_dim=384 -> scaleN=12)
+    # trigger OOB writes in the kernel that uses the padded stride.
+    # Padding columns `[scaleN_valid, scaleN_pad)` are NOT written by the
+    # kernel (guarded by `scale_k < scaleN_valid`) and contain allocator
+    # garbage; production GEMM consumers don't read them so this is safe.
+    # Tests comparing byte-level equality must mask out those positions.
+    scaleN_pad = ((N + group_size - 1) // group_size + 7) // 8 * 8
     scale = torch.empty(
         (sorted_ids.shape[0] + 31) // 32 * 32,
-        (N + 31) // 32,
+        scaleN_pad,
         dtype=dtypes.fp8_e8m0,
         device=input.device,
     )
-    if (
+    use_fused = (
         (is_stage1 and M <= token_num_quant_moe_sort_switch[0])
-        or (not is_stage1 and M <= token_num_quant_moe_sort_switch[1] * topk)
+        or (not is_stage1 and M <= token_num_quant_moe_sort_switch[1] * eff_topk)
         or group_size != 32
-    ):
-        out = torch.empty(M, N // 2, dtype=dtypes.fp4x2, device=input.device)
-        fused_dynamic_mxfp4_quant_moe_sort_hip(
+    )
+    if use_fused:
+        out = torch.empty(M, out_cols, dtype=quant_dtype, device=input.device)
+        fused_dynamic_mx_quant_moe_sort_hip(
             out,
             scale,
             input,
@@ -790,11 +968,88 @@ def fused_dynamic_mxfp4_quant_moe_sort(
             group_size,
         )
     else:
-        out, scale_ = per_1x32_f4_quant_hip(
-            input, None, dtypes.fp4x2, num_rows=num_rows, num_rows_factor=topk
+        # Split path: per-token quant produces unswizzled e8m0 byte scale,
+        # then `mxfp4_moe_sort_hip` (dtype-agnostic byte shuffle) sorts +
+        # swizzles it into the GEMM-consumed tile layout.
+        # `per_1x32_mx_quant_hip` handles both fp4 (always e8m0 scale) and
+        # fp8 (with `scale_type=fp8_e8m0` for the byte-scale split path).
+        scale_type = dtypes.fp8_e8m0 if quant_dtype == dtypes.fp8 else None
+        out, scale_per_token = per_1x32_mx_quant_hip(
+            input,
+            scale=None,
+            quant_dtype=quant_dtype,
+            scale_type=scale_type,
+            shuffle=False,
+            num_rows=num_rows,
+            num_rows_factor=eff_topk,
         )
-        mxfp4_moe_sort_hip(scale, scale_, sorted_ids, num_valid_ids, token_num, N)
+        mxfp4_moe_sort_hip(
+            scale, scale_per_token, sorted_ids, num_valid_ids, token_num, N
+        )
     return out, scale
+
+
+def fused_dynamic_mxfp4_quant_moe_sort(
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,  # stage1 and stage2: same topk value
+    block_size: int,
+    num_rows: Optional[torch.Tensor] = None,
+    group_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
+
+    Forces ``quant_dtype=dtypes.fp4x2``; same dispatch + behaviour as the
+    unified entry. New code should call ``fused_dynamic_mx_quant_moe_sort``
+    directly with the desired ``quant_dtype``.
+    """
+    return fused_dynamic_mx_quant_moe_sort(
+        input=input,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token_num,
+        topk=topk,
+        block_size=block_size,
+        quant_dtype=dtypes.fp4x2,
+        num_rows=num_rows,
+        group_size=group_size,
+    )
+
+
+def fused_dynamic_mxfp8_quant_moe_sort(
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+    block_size: int,
+    num_rows: Optional[torch.Tensor] = None,
+    group_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
+
+    Forces ``quant_dtype=dtypes.fp8``; same dispatch + behaviour as the
+    unified entry. New code should call ``fused_dynamic_mx_quant_moe_sort``
+    directly with ``quant_dtype=dtypes.fp8``.
+
+    Note: ``num_rows`` was not part of the original signature but is exposed
+    here so callers benefit from the new split-path dispatch on large ``M``
+    without a separate update. Set to ``None`` to match the previous
+    behaviour exactly.
+    """
+    return fused_dynamic_mx_quant_moe_sort(
+        input=input,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token_num,
+        topk=topk,
+        block_size=block_size,
+        quant_dtype=dtypes.fp8,
+        num_rows=num_rows,
+        group_size=group_size,
+    )
 
 
 @compile_ops("module_quant", develop=True)

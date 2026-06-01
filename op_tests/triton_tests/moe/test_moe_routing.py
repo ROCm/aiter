@@ -127,6 +127,7 @@ def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):
     )
 
     def _assert_indx_equal(ref, tri):
+        tri = tri.to(torch.int32)
         assert_equal(ref, tri[: len(ref)])
         assert torch.all(tri[len(ref) :] == -1)
 

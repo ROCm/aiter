@@ -77,6 +77,10 @@ OUT_FOLDER/
 op_tests/moe_benchmarking_profiling/results/*.csv
 scripts/results/*.csv
 
+# Opus tuned/untuned CSVs (moved to aiter/configs/bf16_tuned_gemm.csv with libtype='opus' filter;
+# autolog feature removed). Reject any re-introduction under aiter/ops/opus/configs/.
+aiter/ops/opus/configs/
+
 # Jupyter notebook checkpoints and outputs
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/

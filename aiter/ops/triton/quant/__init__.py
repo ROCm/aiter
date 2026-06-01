@@ -7,6 +7,8 @@ from .quant import (
     dynamic_mxfp8_quant,
     fp8_legacy_to_mxfp8,
     _mxfp8_quant_op,
+    dynamic_nvfp4_quant,
+    _nvfp4_quant_op,
 )
 
 from .fused_fp8_quant import (
@@ -44,6 +46,8 @@ __all__ = [
     "dynamic_mxfp8_quant",
     "fp8_legacy_to_mxfp8",
     "_mxfp8_quant_op",
+    "dynamic_nvfp4_quant",
+    "_nvfp4_quant_op",
     # fused_fp8_quant.py exports
     "calc_rows_per_block",
     "get_fp8_min_max_bounds",

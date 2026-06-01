@@ -10,9 +10,12 @@ from typing import Optional
 @compile_ops(
     "module_fused_qk_norm_rope_cache_quant_shuffle",
     fc_name="fused_qk_norm_rope_cache_quant_shuffle",
+    develop=True,
 )
 def _fused_qk_norm_rope_cache_quant_shuffle_hip(
-    qkv: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
     num_heads_q: int,
     num_heads_k: int,
     num_heads_v: int,
@@ -29,14 +32,13 @@ def _fused_qk_norm_rope_cache_quant_shuffle_hip(
     kv_cache_dtype: str,
     k_scale: Tensor,
     v_scale: Tensor,
-    q: Optional[Tensor] = None,
-    k: Optional[Tensor] = None,
-    v: Optional[Tensor] = None,
 ) -> None: ...
 
 
 def fused_qk_norm_rope_cache_quant_shuffle(
-    qkv: Optional[Tensor] = None,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
     *,
     num_heads_q: int,
     num_heads_k: int,
@@ -54,50 +56,11 @@ def fused_qk_norm_rope_cache_quant_shuffle(
     kv_cache_dtype: str,
     k_scale: Tensor,
     v_scale: Tensor,
-    q: Optional[Tensor] = None,
-    k: Optional[Tensor] = None,
-    v: Optional[Tensor] = None,
 ) -> None:
-    if q is None:
-        if qkv is None or qkv.numel() == 0:
-            raise TypeError(
-                "fused_qk_norm_rope_cache_quant_shuffle: non-empty `qkv` is required when "
-                "`q`, `k`, `v` are not all passed."
-            )
-        _fused_qk_norm_rope_cache_quant_shuffle_hip(
-            qkv,
-            num_heads_q,
-            num_heads_k,
-            num_heads_v,
-            head_dim,
-            eps,
-            qw,
-            kw,
-            cos_sin_cache,
-            is_neox_style,
-            pos_ids,
-            k_cache,
-            v_cache,
-            slot_mapping,
-            kv_cache_dtype,
-            k_scale,
-            v_scale,
-            None,
-            None,
-            None,
-        )
-        return
-    if k is None or v is None:
-        raise TypeError(
-            "fused_qk_norm_rope_cache_quant_shuffle: q, k, v must be provided together."
-        )
-    qkv_hip: Tensor = (
-        qkv
-        if qkv is not None and qkv.numel() > 0
-        else torch.empty((0, 0), device=q.device, dtype=q.dtype)
-    )
     _fused_qk_norm_rope_cache_quant_shuffle_hip(
-        qkv_hip,
+        q,
+        k,
+        v,
         num_heads_q,
         num_heads_k,
         num_heads_v,
@@ -114,33 +77,13 @@ def fused_qk_norm_rope_cache_quant_shuffle(
         kv_cache_dtype,
         k_scale,
         v_scale,
-        q,
-        k,
-        v,
     )
-
-
-def gen_fused_qk_rmsnorm_fake_tensor(
-    q: Tensor,
-    q_weight: Tensor,
-    q_eps: float,
-    k: Tensor,
-    k_weight: Tensor,
-    k_eps: float,
-    q_out: Optional[Tensor],
-    k_out: Optional[Tensor],
-) -> tuple[Tensor, Tensor]:
-    if q_out is None:
-        q_out = torch.empty_like(q, dtype=q.dtype, device=q.device)
-    if k_out is None:
-        k_out = torch.empty_like(k, dtype=k.dtype, device=k.device)
-    return q_out, k_out
 
 
 @compile_ops(
     "module_fused_qk_norm_rope_cache_quant_shuffle",
     fc_name="fused_qk_rmsnorm",
-    gen_fake=gen_fused_qk_rmsnorm_fake_tensor,
+    develop=True,
 )
 def _fused_qk_rmsnorm_kernel(
     q: Tensor,
@@ -149,9 +92,9 @@ def _fused_qk_rmsnorm_kernel(
     k: Tensor,
     k_weight: Tensor,
     k_eps: float,
-    q_out: Optional[Tensor],
-    k_out: Optional[Tensor],
-) -> tuple[Tensor, Tensor]: ...
+    q_out: Tensor,
+    k_out: Tensor,
+) -> None: ...
 
 
 _FUSED_QK_FALLBACK_M = 16384
@@ -167,25 +110,23 @@ def _fused_qk_rmsnorm(
     k_weight: Tensor,
     k_eps: float,
 ) -> tuple[Tensor, Tensor]:
+    if q_out is None:
+        q_out = torch.empty_like(q, dtype=q.dtype, device=q.device)
+    if k_out is None:
+        k_out = torch.empty_like(k, dtype=k.dtype, device=k.device)
+
     m = q.size(0)
     if m >= _FUSED_QK_FALLBACK_M:
         from .rmsnorm import rmsnorm
 
-        if q_out is None:
-            q_out = torch.empty_like(q, dtype=q.dtype, device=q.device)
-        if k_out is None:
-            k_out = torch.empty_like(k, dtype=k.dtype, device=k.device)
-
         rmsnorm(q_out, q, q_weight, q_eps)
         rmsnorm(k_out, k, k_weight, k_eps)
-        return q_out, k_out
     else:
-        return _fused_qk_rmsnorm_kernel(
-            q, q_weight, q_eps, k, k_weight, k_eps, q_out, k_out
-        )
+        _fused_qk_rmsnorm_kernel(q, q_weight, q_eps, k, k_weight, k_eps, q_out, k_out)
+    return q_out, k_out
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
 def fused_qk_norm_rope_cache_block_quant_shuffle(
     qkv: Tensor,
     num_heads_q: int,
@@ -209,7 +150,7 @@ def fused_qk_norm_rope_cache_block_quant_shuffle(
 ) -> None: ...
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
 def fused_qk_norm_rope_cache_pts_quant_shuffle(
     qkv: Tensor,
     qw: Tensor,
@@ -239,7 +180,7 @@ def fused_qk_norm_rope_cache_pts_quant_shuffle(
 ) -> None: ...
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
 def fused_qk_norm_rope_2way(
     q0: Tensor,
     k0: Tensor,
@@ -262,3 +203,33 @@ def fused_qk_norm_rope_2way(
     out_q01: Tensor,
     out_k01: Tensor,
 ) -> None: ...
+
+
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
+def fused_qk_norm_rope_1way(
+    q: Tensor,
+    k: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    cos_sin: Tensor,
+    batch_size: int,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+    out_q: Tensor,
+    out_k: Tensor,
+) -> None:
+    """Fused per-head RMSNorm + RoPE on q/k for the 1way (single-stream) layout.
+
+    Dtype contract:
+        q, k, w_q, w_k, out_q, out_k : torch.bfloat16 or torch.float16 (same dtype)
+        cos_sin                      : torch.float32  (REQUIRED)
+
+    cos_sin must be float32 to match the diffusers / qwen-image-edit reference
+    (RoPE freqs are computed in fp32 there and the precision is consumed by the
+    fp32 rope multiply). Passing bf16/fp16 cos_sin will raise inside the kernel.
+    """
+    ...
