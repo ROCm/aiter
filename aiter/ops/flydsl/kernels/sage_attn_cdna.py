@@ -44,6 +44,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import (
     fly as _fly,
     llvm as _llvm,
+    math as _math,
     memref as _memref,
     scf as _scf,
 )
@@ -212,6 +213,25 @@ def build_sage_attn_cdna_module(
         path_tag = f"{path_tag}_dma{_dma_env}" + ("x" if _dma_xor else "")
         if const_expr(_need_dma_fence):
             path_tag = f"{path_tag}f"
+
+    # ---- Deferred-scale softmax ("gate the scale") ----
+    # Defer the QK descale out of the per-element score path and fold it into the
+    # softmax exp as one FMA (see section 2/4 in the kernel body). Removes the 32
+    # per-element `v_pk_mul_f32` per iter — the dominant non-exp VALU op in this
+    # VALU(exp)-bound loop. Measured: non-causal long shapes −6–7%, bit-identical
+    # cosine; causal+block_m=256 REGRESSES (~+15%, deferred FMA lands on the exp
+    # critical path where the eager scale had overlapped MFMA latency). So it is
+    # gated to non-causal by default. Env `SAGE_DEFER_SCALE` overrides for A/B:
+    # `1`/`auto` = default (non-causal only), `0` = always eager, `force` = always.
+    _defer_env = os.environ.get("SAGE_DEFER_SCALE", "auto")
+    if _defer_env in ("0", ""):
+        _DEFER_SCALE = False
+    elif _defer_env == "force":
+        _DEFER_SCALE = True
+    else:  # "auto" / "1": deferral wins on non-causal, regresses causal
+        _DEFER_SCALE = not CAUSAL
+    if const_expr(_DEFER_SCALE):
+        path_tag = f"{path_tag}_ds"
 
     if const_expr(_dma_k):
         # DMA is lane-contiguous → packed K stride (no pad). Reintroduces K
@@ -405,6 +425,11 @@ def build_sage_attn_cdna_module(
 
         def _fmax(a, b):
             return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
+
+        def _ffma(a, b, c):
+            # fused a*b + c (single rounding); used to fold the QK descale into
+            # the exp argument so the 32 per-element scale-muls collapse.
+            return _math.fma(_raw(a), _raw(b), _raw(c), fastmath=fm_fast)
 
         def _sitofp(v):
             return arith.SIToFPOp(T.f32, _raw(v)).result
@@ -1016,7 +1041,16 @@ def build_sage_attn_cdna_module(
                         [k_frag, q_packs[ks], s_accs_loc[st], 0, 0, 0],
                     )
 
-            # 2) Scale (with descale-index clamp for the last-iter OOB tile)
+            # 2) Scale (descale-index clamp for the last-iter OOB tile).
+            # "Gate the scale": when _DEFER_SCALE, carry RAW f32 scores and fold
+            # the (strictly positive, amax-based) descale into the softmax exp as
+            # one FMA per element — max commutes with a positive scale, so
+            # max(scale*s)==scale*max(s). This dissolves the 32 per-element
+            # `v_pk_mul_f32` the eager scale emits, the dominant non-exp VALU in
+            # this VALU-bound loop. Deferral wins on non-causal but REGRESSES
+            # causal+block_m=256 (the eager-scaled scores overlap MFMA latency
+            # there; the deferred FMA lands on the exp critical path), so it is
+            # gated off for causal — a compile-time per-shape branch.
             kv_tile_idx_loc = kv_block_start_arg // BLOCK_N
             max_kv_tile = num_k_blocks_per_head - fx.Index(1)
             kv_tile_safe = fx.Index(
@@ -1031,18 +1065,23 @@ def build_sage_attn_cdna_module(
             )
             k_ds_loc = fx.Float32(_load_ptr_f32(kds_ptr, k_descale_base_loc))
             qk_scale_loc = _fmul(q_ds, k_ds_loc)
-            qk_scale_v16_loc = Vec.from_elements(
-                [qk_scale_loc], fx.Float32
-            ).broadcast_to(16)
             s_f32_loc = []
-            for st in range_constexpr(N_SUBTILES):
-                s_i32_vec = Vec(s_accs_loc[st])
-                s_f32_vec = s_i32_vec.to(fx.Float32)
-                s_scaled_vec = Vec(
-                    arith.mulf(s_f32_vec, qk_scale_v16_loc, fastmath=fm_fast)
-                )
-                for elem in range_constexpr(ELEMS_PER_TILE):
-                    s_f32_loc.append(s_scaled_vec[elem])
+            if const_expr(_DEFER_SCALE):
+                for st in range_constexpr(N_SUBTILES):
+                    s_f32_vec = Vec(s_accs_loc[st]).to(fx.Float32)
+                    for elem in range_constexpr(ELEMS_PER_TILE):
+                        s_f32_loc.append(s_f32_vec[elem])
+            else:
+                qk_scale_v16_loc = Vec.from_elements(
+                    [qk_scale_loc], fx.Float32
+                ).broadcast_to(16)
+                for st in range_constexpr(N_SUBTILES):
+                    s_f32_vec = Vec(s_accs_loc[st]).to(fx.Float32)
+                    s_scaled_vec = Vec(
+                        arith.mulf(s_f32_vec, qk_scale_v16_loc, fastmath=fm_fast)
+                    )
+                    for elem in range_constexpr(ELEMS_PER_TILE):
+                        s_f32_loc.append(s_scaled_vec[elem])
 
             # 3) Mask
             kv_start_i32_loc = fx.Int32(
@@ -1108,11 +1147,18 @@ def build_sage_attn_cdna_module(
                     _scf.YieldOp([_raw(v) for v in s_f32_loc])
                 s_f32_loc = list(if_op.results)
 
-            # 4) Softmax
+            # 4) Softmax. When deferring, the running max/corr stay in SCALED
+            # space (the descale varies per KV-tile, so cross-tile comparison
+            # must be post-scale): max over RAW scores, scale the single reduced
+            # row-max by qk_scale (one scalar mul vs 32 per-element), and fold
+            # the scale into each exp argument as one FMA (scale*s_raw - m_new).
+            # When not deferring, scores are already scaled (section 2).
             local_max_l = s_f32_loc[0]
             for r in range_constexpr(NUM_S_VALS - 1):
                 local_max_l = _fmax(local_max_l, s_f32_loc[r + 1])
             row_max_l = row_max_reduce(local_max_l)
+            if const_expr(_DEFER_SCALE):
+                row_max_l = _fmul(row_max_l, qk_scale_loc)
             m_new_l = _fmax(m_in, row_max_l)
             diff_m_l = _fsub(m_in, m_new_l)
             corr_l = rocdl.exp2(ir.F32Type.get(), _raw(diff_m_l))
@@ -1120,7 +1166,10 @@ def build_sage_attn_cdna_module(
             p_vals_l = []
             local_sum_l = _raw(c_zero_f)
             for r in range_constexpr(NUM_S_VALS):
-                diff = _fadd(s_f32_loc[r], neg_max_l)
+                if const_expr(_DEFER_SCALE):
+                    diff = _ffma(s_f32_loc[r], qk_scale_loc, neg_max_l)
+                else:
+                    diff = _fadd(s_f32_loc[r], neg_max_l)
                 p = rocdl.exp2(ir.F32Type.get(), _raw(diff))
                 p_vals_l.append(p)
                 local_sum_l = _fadd(local_sum_l, p)
