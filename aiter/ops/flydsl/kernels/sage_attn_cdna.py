@@ -218,18 +218,28 @@ def build_sage_attn_cdna_module(
     # Defer the QK descale out of the per-element score path and fold it into the
     # softmax exp as one FMA (see section 2/4 in the kernel body). Removes the 32
     # per-element `v_pk_mul_f32` per iter — the dominant non-exp VALU op in this
-    # VALU(exp)-bound loop. Measured: non-causal long shapes −6–7%, bit-identical
-    # cosine; causal+block_m=256 REGRESSES (~+15%, deferred FMA lands on the exp
-    # critical path where the eager scale had overlapped MFMA latency). So it is
-    # gated to non-causal by default. Env `SAGE_DEFER_SCALE` overrides for A/B:
-    # `1`/`auto` = default (non-causal only), `0` = always eager, `force` = always.
+    # VALU(exp)-bound loop. The per-iter ISA histogram confirms deferral is a pure
+    # win on op count (96 vs 129 exposed VALU, 181 vs 192 VGPR), yet whether it
+    # nets faster depends on whether eager's scale-muls were *already hidden*:
+    #   - non-causal (any block_m): deferral wins (−5–7%), bit-identical cosine.
+    #   - causal, block_m<=128: deferral wins too (−5%) — the smaller MFMA shadow
+    #     and higher occupancy leave eager's muls exposed, so removing them pays.
+    #   - causal, block_m=256: deferral REGRESSES (+7–9%). The big-tile MFMA shadow
+    #     plus the per-element mask compute (64 cndmask+cmp) already swallow eager's
+    #     muls for free, so deferral removes nothing but still adds a serial
+    #     post-reduction `row_max*scale` on the exp critical path. Nothing to recoup
+    #     here — the cost is structural, not an op-count problem.
+    # So gate ON for non-causal OR (causal AND block_m<=128) — a compile-time
+    # per-shape branch (the dispatcher is a perf lever). Env `SAGE_DEFER_SCALE`
+    # overrides for A/B: `auto`/`1` = the gate above, `0` = always eager, `force` =
+    # always deferred.
     _defer_env = os.environ.get("SAGE_DEFER_SCALE", "auto")
     if _defer_env in ("0", ""):
         _DEFER_SCALE = False
     elif _defer_env == "force":
         _DEFER_SCALE = True
-    else:  # "auto" / "1": deferral wins on non-causal, regresses causal
-        _DEFER_SCALE = not CAUSAL
+    else:  # "auto" / "1": non-causal always; causal only at block_m<=128
+        _DEFER_SCALE = (not CAUSAL) or (BLOCK_M <= 128)
     if const_expr(_DEFER_SCALE):
         path_tag = f"{path_tag}_ds"
 
@@ -1047,10 +1057,11 @@ def build_sage_attn_cdna_module(
             # one FMA per element — max commutes with a positive scale, so
             # max(scale*s)==scale*max(s). This dissolves the 32 per-element
             # `v_pk_mul_f32` the eager scale emits, the dominant non-exp VALU in
-            # this VALU-bound loop. Deferral wins on non-causal but REGRESSES
-            # causal+block_m=256 (the eager-scaled scores overlap MFMA latency
-            # there; the deferred FMA lands on the exp critical path), so it is
-            # gated off for causal — a compile-time per-shape branch.
+            # this VALU-bound loop. Deferral wins on non-causal and on causal
+            # block_m<=128, but REGRESSES causal+block_m=256 (the big-tile MFMA
+            # shadow + per-element mask compute already hide the eager muls, so
+            # deferral only adds a serial post-reduction scale on the exp critical
+            # path). Gated accordingly at build time — a per-shape branch.
             kv_tile_idx_loc = kv_block_start_arg // BLOCK_N
             max_kv_tile = num_k_blocks_per_head - fx.Index(1)
             kv_tile_safe = fx.Index(
