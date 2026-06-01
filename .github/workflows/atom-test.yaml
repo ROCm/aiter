@@ -184,9 +184,9 @@ jobs:
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
           RUN rm -rf /app/aiter-test
-          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/aiter-test && \\
+          RUN git clone --no-checkout ${{ env.GITHUB_REPO_URL }} /app/aiter-test && \\
               cd /app/aiter-test && \\
-              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
+              git checkout --force ${{ env.GITHUB_COMMIT_SHA }} && \\
               git submodule sync && git submodule update --init --recursive && \\
               MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e . && \\
               ./.github/scripts/install_triton.sh

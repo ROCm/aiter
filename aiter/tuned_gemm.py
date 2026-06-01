@@ -478,6 +478,7 @@ def flydsl_gemm(
         split_k=flydsl_config["split_k"],
         block_m_warps=flydsl_config["block_m_warps"],
         block_n_warps=flydsl_config["block_n_warps"],
+        block_k_warps=flydsl_config.get("block_k_warps", 1),
         n_tile_repeat=flydsl_config.get("n_tile_repeat", 1),
         persistent_n_tiles=flydsl_config.get("persistent_n_tiles", 1),
         waves_per_eu=flydsl_config.get("waves_per_eu", 0),

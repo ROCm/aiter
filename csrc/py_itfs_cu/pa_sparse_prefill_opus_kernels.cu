@@ -106,25 +106,27 @@ void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
     HipDeviceGuard guard(q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    using TraitsBF16 = pa_sparse_prefill_traits<16, 32, 512, 8, bf16_t>;
-    using TraitsFP16 = pa_sparse_prefill_traits<16, 32, 512, 8, fp16_t>;
+#define LAUNCH_PA_PREFILL(KERNEL, TRAITS, KV_TILE, NUM_WARPS)                        \
+    do {                                                                             \
+        auto launch = [&](auto dtype_tag) {                                          \
+            using Traits = TRAITS<16, KV_TILE, 512, NUM_WARPS, decltype(dtype_tag)>; \
+            const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M); \
+            dim3 grid(N, num_h_blocks, 1);                                           \
+            dim3 block(Traits::BLOCK_SIZE);                                          \
+            KERNEL<Traits><<<grid, block, 0, stream>>>(kargs);                       \
+            HIP_CALL_LAUNCH(hipGetLastError());                                      \
+        };                                                                           \
+        if(q.dtype() == AITER_DTYPE_bf16)                                            \
+            launch(bf16_t{});                                                        \
+        else                                                                         \
+            launch(fp16_t{});                                                        \
+    } while(0)
 
-    auto launch = [&](auto traits_tag) {
-        using Traits           = decltype(traits_tag);
-        const int num_h_tiles  = ceil_div(H, Traits::Q_TILE_SIZE);
-        const int num_h_blocks = ceil_div(num_h_tiles, Traits::NUM_WARPS);
-        dim3 grid(N, num_h_blocks, 1);
-        dim3 block(Traits::BLOCK_SIZE);
-        pa_prefill_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
-        HIP_CALL_LAUNCH(hipGetLastError());
-    };
-
-    if(q.dtype() == AITER_DTYPE_bf16)
-    {
-        launch(TraitsBF16{});
-    }
+    // 16mx8_32nx1 (T_M=NUM_WARPS) for H > 32; 16mx1_16nx4 (T_M=1) for H <= 32.
+    if(H <= 32)
+        LAUNCH_PA_PREFILL(pa_prefill_16mx1_16nx4_kernel, pa_prefill_16mx1_16nx4_traits, 64, 4);
     else
-    {
-        launch(TraitsFP16{});
-    }
+        LAUNCH_PA_PREFILL(pa_prefill_16mx8_32nx1_kernel, pa_prefill_16mx8_32nx1_traits, 32, 8);
+
+#undef LAUNCH_PA_PREFILL
 }

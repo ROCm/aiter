@@ -255,7 +255,9 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
                          + batch_id * kargs.stride_b_batch + col * kargs.stride_b + k_start,
                          ((kargs.n - col) * kargs.stride_b - k_start) * sizeof(D_B));
-    auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_workspace)
+    // Deref the handle slot at entry; survives a post-capture grow.
+    D_C* ws_ptr = reinterpret_cast<D_C*>(kargs.ws_handle->ptr);
+    auto g_c = make_gmem(ws_ptr
                          + (size_t)split_id  * kargs.batch * kargs.stride_ws_batch
                          + (size_t)batch_id  * kargs.stride_ws_batch
                          + (size_t)row       * kargs.stride_ws
