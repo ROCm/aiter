@@ -142,10 +142,10 @@ def _make_inputs(
 # @pytest.mark.parametrize("kv_len", [100, 400, 1024, 4096, 8192, 16384])
 # @pytest.mark.parametrize("var_len", [True, False])
 # @pytest.mark.parametrize("sentinels", [True, False])
-@pytest.mark.parametrize("T", [1])
+@pytest.mark.parametrize("T", [4, 32])
 @pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("D", [512])
-@pytest.mark.parametrize("kv_len", [8])
+@pytest.mark.parametrize("kv_len", [8, 100])
 @pytest.mark.parametrize("var_len", [True, False])
 @pytest.mark.parametrize("sentinels", [True, False])
 def test_pa_decode_sparse_vs_reference(T, H, D, kv_len, var_len, sentinels):

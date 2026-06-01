@@ -123,7 +123,7 @@ def pa_decode_sparse(
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
         kv_splits = triton.next_power_of_2(kv_splits)
-    # kv_splits = 1
+
     # When kv_splits == 1, the kernel folds the sink as initial M and writes
     # the final output directly to ``out`` (no partial buffers, no reduce
     # kernel). Mirrors unified_attention 3D's NUM_SEGMENTS == 1 fast path,

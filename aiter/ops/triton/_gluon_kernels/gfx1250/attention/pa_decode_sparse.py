@@ -176,9 +176,6 @@ def _pa_decode_sparse(
     h_offs_mma_row = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, pv_mfma_layout))
     h_offs_mma_row_eff = h_off_base + h_offs_mma_row
     h_mask_mma_row = h_offs_mma_row_eff < H
-    h_mask_mma_row_qk = gl.convert_layout(
-        h_mask_mma_row, gl.SliceLayout(1, qk_mfma_layout)
-    )
 
     if KV_SPLITS == 1:
         sink = gl.amd.cdna4.buffer_load(
@@ -260,8 +257,11 @@ def _pa_decode_sparse(
     slot_reg = slot_bufs.index(0).reshape([BLOCK_K]).load(layout=slot_reg_layout)
 
     # Async gather KV[slot_reg] -> kv_bufs[0]. Clamp -1 sentinels to 0; the
-    # downstream `keep` mask zeros their contribution.
-    safe_slot_cur = gl.where(slot_reg >= 0, slot_reg, 0)
+    # downstream `keep` mask zeros their contribution. cur_valid (slot >= 0) is
+    # computed once here and carried into the loop so it serves both the gather
+    # clamp and the per-tile softmax mask without recomputing slot >= 0.
+    cur_valid = slot_reg >= 0
+    safe_slot_cur = gl.where(cur_valid, slot_reg, 0)
     gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, 0, kv_bufs.index(0))
 
     buf_idx: gl.int32 = 0
@@ -286,8 +286,11 @@ def _pa_decode_sparse(
             .load(layout=slot_reg_layout)
         )
 
-        # Async gather KV[i+1] using slot[i+1] -> kv_bufs[async_idx].
-        safe_next_slot = gl.where(slot_reg >= 0, slot_reg, 0)
+        # Async gather KV[i+1] using slot[i+1] -> kv_bufs[async_idx]. next_valid
+        # (slot[i+1] >= 0) is reused next iteration as that tile's softmax mask,
+        # so slot >= 0 is computed only once per tile.
+        next_valid = slot_reg >= 0
+        safe_next_slot = gl.where(next_valid, slot_reg, 0)
         gl.amd.gfx1250.tdm.async_gather(
             kv_desc, safe_next_slot, 0, kv_bufs.index(async_idx)
         )
@@ -296,10 +299,10 @@ def _pa_decode_sparse(
         gl.amd.gfx1250.tdm.async_wait(2)
 
         # ---- Math for tile (tile_start + i) using kv_bufs[buf_idx] ----
-        # j_cur = tile_start + i
-        # cur_in_range_i = (j_cur * BLOCK_K + k_offs_slot) < kv_len
-        # cur_valid_i = cur_in_range_i & (slot_reg >= 0)
-
+        # cur_valid (slot[i] >= 0) was computed when slot[i] was loaded (prev
+        # iter / prologue) and carried in. Main-loop tiles are always full (only
+        # the final tile, peeled into the epilogue, can be partial), so the -1
+        # sentinel mask is the only mask needed here.
         kv_smem_cur = kv_bufs.index(buf_idx)
         kv_t = kv_smem_cur.permute([1, 0]).load(dot_k_layout)
         scores = gl.amd.gfx1250.wmma(
@@ -309,15 +312,14 @@ def _pa_decode_sparse(
         )
         # scores = scores * softmax_scale
 
-        # valid_col = gl.convert_layout(cur_valid_i, valid_col_mma)
-        # keep = h_mask_mma_row[:, None] & valid_col[None, :]
-        # scores = gl.where(keep, scores, float("-inf"))
+        valid_col = gl.convert_layout(cur_valid, valid_col_mma)
+        score_bias = gl.where(valid_col, 0.0, float("-inf"))
+        scores = scores + score_bias[None, :]
 
         m_block = gl.max(scores, axis=1)
         m_new = gl.maximum(m_i, m_block)
         alpha = gl.exp(m_i - m_new)
         p = gl.exp(scores - m_new[:, None])
-        # p = gl.where(keep, p, 0.0)
         l_new = l_i * alpha + gl.sum(p, axis=1)
 
         kv_for_acc = kv_smem_cur.load(dot_v_layout)
@@ -328,8 +330,9 @@ def _pa_decode_sparse(
         m_i = m_new
         l_i = l_new
 
-        # Rotate. slot_reg already holds slot[i+1] (the next tile, also the
-        # final tile after the last iteration -> used by the epilogue mask).
+        # Rotate. slot_reg / cur_valid now describe slot[i+1] (the next tile,
+        # also the final tile after the last iteration -> used by the epilogue).
+        cur_valid = next_valid
         buf_idx = async_idx
 
     # ---- Epilogue: process final tile (tile_end - 1) ----
@@ -337,7 +340,9 @@ def _pa_decode_sparse(
 
     j_final = tile_end - 1
     final_in_range = (j_final * BLOCK_K + k_offs_slot) < kv_len
-    final_valid = final_in_range & (slot_reg >= 0)
+    # cur_valid carries slot[final] >= 0 (from the last loop iter, or the
+    # prologue when num_iters == 1), so slot >= 0 isn't recomputed here.
+    final_valid = final_in_range & cur_valid
 
     kv_smem_final = kv_bufs.index(buf_idx)
     kv_t = kv_smem_final.permute([1, 0]).load(dot_k_layout)
@@ -348,15 +353,15 @@ def _pa_decode_sparse(
     )
     # scores = scores * softmax_scale
 
+    # Mask OOB / -1 sentinel columns via an additive -inf bias (see main loop).
     valid_col = gl.convert_layout(final_valid, valid_col_mma)
-    keep = h_mask_mma_row_qk[:, None] & valid_col[None, :]
-    scores = gl.where(keep, scores, float("-inf"))
+    score_bias = gl.where(valid_col, 0.0, float("-inf"))
+    scores = scores + score_bias[None, :]
 
     m_block = gl.max(scores, axis=1)
     m_new = gl.maximum(m_i, m_block)
     alpha = gl.exp(m_i - m_new)
     p = gl.exp(scores - m_new[:, None])
-    p = gl.where(keep, p, 0.0)
     l_new = l_i * alpha + gl.sum(p, axis=1)
 
     kv_for_acc = kv_smem_final.load(dot_v_layout)
