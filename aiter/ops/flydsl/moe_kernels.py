@@ -12,6 +12,18 @@ import torch
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
 
+@functools.lru_cache(maxsize=128)
+def _get_moe_split_k_tensors(
+    device: torch.device,
+    stream: torch.cuda.Stream,
+    capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Small per-output-tile state. The kernel resets these counters after each
+    # split-K launch, so only the first allocation needs zero initialization.
+    semaphore = torch.zeros((capacity,), dtype=torch.int32, device=device)
+    signal = torch.zeros((capacity,), dtype=torch.int32, device=device)
+    return semaphore, signal
+
 
 def _get_dtypes():
     from aiter.utility import dtypes
@@ -291,7 +303,7 @@ def get_flydsl_stage1_kernels_blockscale(out_dtype: str) -> Dict[str, Dict]:
     quant_type = "per_1x128"
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
-    tile_ns = [128, 256]
+    tile_ns = [64, 128, 256]
     k_batches = [1, 2, 3, 4, 5, 6, 7, 8]
     waves_per_eus = [2, 3, 4]
 
@@ -913,10 +925,9 @@ def _flydsl_moe_stage1_blockscale(
     _is_splitk = k_batch > 1
 
     if _is_splitk:
-        # Split-K: stage1 writes f16/bf16 partials via atomic add into a zeroed
-        # `[token, topk, 2*inter]` buffer; silu_and_mul then writes the final
-        # output. Partials dtype = out_dtype so silu_and_mul reduces in-place
-        # (silu_and_mul requires input/output dtype match).
+        # Split-K: stage1 zeros each output tile in-kernel, then accumulates
+        # gate/up partials into an fp32 `[token, topk, 2*inter]` buffer.
+        # `silu_and_mul` accepts fp32 input and writes the requested output dtype.
         if out is None:
             out = torch.empty(
                 (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
@@ -927,10 +938,13 @@ def _flydsl_moe_stage1_blockscale(
                 f"got out.dtype={out.dtype} (caller should match out_dtype={out_dtype!r})"
             )
 
-        tmp_out = torch.zeros(
-            (token_num, topk, inter_dim * 2), dtype=torch_out_dtype, device=dev
+        tmp_out = torch.empty(
+            (token_num, topk, inter_dim * 2), dtype=torch.float32, device=dev
         )
-        _splitk_compile_out_dtype = "bf16" if out_dtype == "bf16" else "f16"
+        split_k_tiles = max(1, size_expert_ids * (inter_dim // tile_n))
+        split_k_semaphore, split_k_signal = _get_moe_split_k_tensors(
+            dev, stream, split_k_tiles
+        )
         exe = compile_flydsl_moe_stage1(
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -942,7 +956,7 @@ def _flydsl_moe_stage1_blockscale(
             doweight_stage1=False,
             a_dtype="fp8",
             b_dtype="fp8",
-            out_dtype=_splitk_compile_out_dtype,
+            out_dtype="f32",
             k_batch=k_batch,
             waves_per_eu=waves_per_eu,
             quant_type="per_1x128",
@@ -961,6 +975,8 @@ def _flydsl_moe_stage1_blockscale(
             inter_dim,
             model_dim,
             size_expert_ids,
+            split_k_semaphore,
+            split_k_signal,
             stream,
         )
 
@@ -975,6 +991,7 @@ def _flydsl_moe_stage1_blockscale(
         )
 
     # Non-splitk: kernel fuses silu(gate)*up directly into `out`.
+    empty_i32 = torch.empty(0, device=dev, dtype=torch.int32)
     exe = compile_flydsl_moe_stage1(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -1005,6 +1022,8 @@ def _flydsl_moe_stage1_blockscale(
         inter_dim,
         model_dim,
         size_expert_ids,
+        empty_i32,
+        empty_i32,
         stream,
     )
     return out
@@ -1492,7 +1511,9 @@ def flydsl_moe_stage2(
     else:
         _persist_m = -1 if m_blocks > 256 else 1
 
-    if a_dtype == "fp8":
+    if _is_blockscale:
+        _persist_m = 1
+    elif a_dtype == "fp8" and not _is_blockscale:
         _persist_m = 1
 
     if bias is not None and bias.dtype != torch.float32:
@@ -1508,6 +1529,50 @@ def flydsl_moe_stage2(
             device=out.device,
             dtype=out.dtype,
         )
+
+    if _is_blockscale:
+        exe = compile_flydsl_moe_stage2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=(sorted_weights is not None),
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype=out_dtype,
+            accumulate=accumulate,
+            persist_m=_persist_m,
+            sort_block_m=sort_block_m,
+            b_nt=b_nt,
+            model_dim_pad=model_dim_pad,
+            inter_dim_pad=inter_dim_pad,
+            xcd_swizzle=xcd_swizzle,
+            enable_bias=(bias is not None),
+            waves_per_eu=waves_per_eu,
+            quant_type=quant_type,
+        )
+        exe(
+            target.view(-1),
+            inter_states.view(-1),
+            w2,
+            flat_a_scale,
+            flat_w_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            token_num,
+            _n_in,
+            _k_in,
+            m_blocks,
+            torch.cuda.current_stream(),
+        )
+        if not accumulate:
+            torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+        return out
 
     if is_fp4:
         args = _s2_args_fp4(

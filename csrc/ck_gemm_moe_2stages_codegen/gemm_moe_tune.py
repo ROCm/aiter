@@ -1046,6 +1046,11 @@ class FmoeTuner(TunerCommon):
 
             # For the _fp8 FlyDSL variant (a_scale_one=True): cast bf16 input to fp8.
             a1_qt_fp8_cast = input.to(dtypes.fp8)
+            a1_scale_t = (
+                a1_scale.t().contiguous()
+                if q_type == QuantType.per_1x128 and a1_scale is not None
+                else a1_scale_fp4_sort
+            )
 
             return {
                 "a1_qt": a1_qt,
@@ -1069,6 +1074,7 @@ class FmoeTuner(TunerCommon):
                 "w1_scale_flydsl": w1_scale_flydsl,
                 "w2_scale_flydsl": w2_scale_flydsl,
                 "a1_qt_fp8_cast": a1_qt_fp8_cast,
+                "a1_scale_t": a1_scale_t,
                 "a1_scale_none": None,
                 "bias": (
                     torch.clamp(
@@ -3193,7 +3199,18 @@ class FmoeTuner(TunerCommon):
                         continue
 
                 ref_args_extra = (
-                    [0, 10, 11, 12, 13, 3, 4, 5, 8, 22],
+                    [
+                        "a1_qt",
+                        "w1_qt",
+                        "w2_qt",
+                        "topk_weights",
+                        "topk_ids",
+                        "a1_scale",
+                        "w1_scale",
+                        "sorted_ids",
+                        "num_valid_ids",
+                        "bias",
+                    ],
                     dtype,
                     act_type,
                     q_type,
@@ -3223,7 +3240,17 @@ class FmoeTuner(TunerCommon):
                         ),
                         FmoeTuner.run_flydsl_stage1_out,
                         (
-                            [0, 16, 5, 6, 7, 8, 18, 14, 22],
+                            [
+                                "a1_qt",
+                                "w1_qt_shffle_flydsl",
+                                "sorted_ids",
+                                "sorted_expert_ids",
+                                "sorted_weights",
+                                "num_valid_ids",
+                                "w1_scale_flydsl",
+                                "a1_scale_t",
+                                "bias",
+                            ],
                             dtype,
                             topk,
                             kparams,
@@ -3263,7 +3290,16 @@ class FmoeTuner(TunerCommon):
                 s2_kparams = {**kparams, "sort_block_m": blockM}
 
                 s2_ref_args = (
-                    [0, 10, 11, 12, 13, 3, 4, 22],
+                    [
+                        "a2_qt",
+                        "w1_qt",
+                        "w2_qt",
+                        "topk_weights",
+                        "topk_ids",
+                        "a2_scale",
+                        "w2_scale",
+                        "bias",
+                    ],
                     dtype,
                     q_type,
                     doweight_stage1,
@@ -3290,7 +3326,18 @@ class FmoeTuner(TunerCommon):
                         ),
                         FmoeTuner.run_flydsl_stage2_out,
                         (
-                            [0, 17, 5, 6, 7, 8, 19, 14, 9, 22],
+                            [
+                                "a2_qt",
+                                "w2_qt_shffle_flydsl",
+                                "sorted_ids",
+                                "sorted_expert_ids",
+                                "sorted_weights",
+                                "num_valid_ids",
+                                "w2_scale_flydsl",
+                                "a2_scale_mxfp4_sort",
+                                "moe_buf",
+                                "bias",
+                            ],
                             dtype,
                             topk,
                             s2_kparams,
