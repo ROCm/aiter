@@ -110,6 +110,37 @@ def mxfp4_moe_scatter_reduce(
 ) -> None: ...
 
 
+@compile_ops("module_moe_mxfp4_aux")
+def mxfp4_moe_scatter_reduce_q(
+    flat_out_q: Tensor,
+    flat_out_scale: Tensor,
+    reverse_sorted: Tensor,
+    sorted_weights: Tensor,
+    out: Tensor,
+    NE: int,
+    TOPK: int,
+    D_HIDDEN: int,
+    MB: int,
+) -> None: ...
+
+
+@compile_ops("module_moe_mxfp4_gemm")
+def mxfp4_moe_gemm2_a4w4_mxfp4out(
+    cumsum_tensor: Tensor,
+    inter_sorted_quant: Tensor,
+    inter_sorted_shuffled_scale: Tensor,
+    w3_shuffled_quant: Tensor,
+    w3_shuffled_scale: Tensor,
+    sorted_expert_ids: Tensor,
+    flat_out_q: Tensor,
+    flat_out_scale: Tensor,
+    NE: int,
+    D_HIDDEN: int,
+    D_INTER: int,
+    max_sorted: int,
+) -> None: ...
+
+
 @compile_ops("module_moe_mxfp4_gemm")
 def mxfp4_moe_gemm1_a4w4(
     cumsum_tensor: Tensor,

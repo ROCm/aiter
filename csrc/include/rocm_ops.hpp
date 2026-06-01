@@ -2192,4 +2192,15 @@ namespace py = pybind11;
           py::arg("NE"),                                                  \
           py::arg("TOPK"),                                                \
           py::arg("D_HIDDEN"),                                            \
+          py::arg("MB"));                                                 \
+    m.def("mxfp4_moe_scatter_reduce_q",                                   \
+          &mxfp4_moe_scatter_reduce_q_kernel,                             \
+          py::arg("flat_out_q"),                                          \
+          py::arg("flat_out_scale"),                                      \
+          py::arg("reverse_sorted"),                                      \
+          py::arg("sorted_weights"),                                      \
+          py::arg("out"),                                                 \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
           py::arg("MB"));

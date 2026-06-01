@@ -138,3 +138,44 @@ void mxfp4_moe_gemm2_a4w4_kernel(
         "mxfp4_moe_gemm2_a4w4 kernel not found: '", kernelName,
         "'. See gen_instances.py (enumerate_g2_instances) for the supported set.");
 }
+
+
+// gemm2 nonatomic that writes MXFP4 (packed fp4 + e8m0 scale) instead of bf16,
+// consumed by mxfp4_moe_scatter_reduce_q. Direct launch (Kimi shape only).
+void mxfp4_moe_gemm2_a4w4_mxfp4out_kernel(
+    torch::Tensor& cumsum_tensor,
+    torch::Tensor& inter_sorted_quant,
+    torch::Tensor& inter_sorted_shuffled_scale,
+    torch::Tensor& w3_shuffled_quant,
+    torch::Tensor& w3_shuffled_scale,
+    torch::Tensor& sorted_expert_ids,
+    torch::Tensor& flat_out_q,
+    torch::Tensor& flat_out_scale,
+    int64_t NE,
+    int64_t D_HIDDEN,
+    int64_t D_INTER,
+    int64_t max_sorted)
+{
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(inter_sorted_quant));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    // MUST match gen_instances.py's MAX_M (drives the A_q/A_scale buffer bound;
+    // too-small clips large-prefill tail rows to 0 → wrong output).
+    constexpr int MAX_M = 655360;
+
+#define LAUNCH_G2_MXFP4(NE_, K_, N_)                                                              \
+    aiter::mxfp4_moe::gemm2::launch_nonatomic_mxfp4<MAX_M, NE_, K_, N_>(                          \
+        stream,                                                                                  \
+        inter_sorted_quant.data_ptr(), inter_sorted_shuffled_scale.data_ptr(),                   \
+        w3_shuffled_quant.data_ptr(), w3_shuffled_scale.data_ptr(),                              \
+        sorted_expert_ids.data_ptr<int32_t>(), cumsum_tensor.data_ptr<int32_t>(),                \
+        static_cast<int>(max_sorted),                                                            \
+        flat_out_q.data_ptr(), flat_out_scale.data_ptr())
+
+    if (D_HIDDEN == 7168 && D_INTER == 512) {
+        if (NE == 385) { LAUNCH_G2_MXFP4(385, 512, 7168); return; }
+        if (NE == 257) { LAUNCH_G2_MXFP4(257, 512, 7168); return; }
+    }
+    TORCH_CHECK(false, "mxfp4_moe_gemm2_a4w4_mxfp4out: unsupported (NE=", NE,
+        " D_HIDDEN=", D_HIDDEN, " D_INTER=", D_INTER, ")");
+#undef LAUNCH_G2_MXFP4
+}

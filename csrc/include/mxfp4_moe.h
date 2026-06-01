@@ -81,6 +81,17 @@ void mxfp4_moe_scatter_reduce_kernel(
     int64_t D_HIDDEN,
     int64_t MB);
 
+void mxfp4_moe_scatter_reduce_q_kernel(
+    torch::Tensor& flat_out_q,
+    torch::Tensor& flat_out_scale,
+    torch::Tensor& reverse_sorted,
+    torch::Tensor& sorted_weights,
+    torch::Tensor& out,
+    int64_t NE,
+    int64_t TOPK,
+    int64_t D_HIDDEN,
+    int64_t MB);
+
 // ── gemm1 / gemm2 use codegen'd kernel-name dispatch ────────────────────────
 // kernelName uniquely identifies a template instance (shape + tile + flags).
 // See csrc/kernels/mxfp4_moe/codegen/gen_instances.py for the supported set.

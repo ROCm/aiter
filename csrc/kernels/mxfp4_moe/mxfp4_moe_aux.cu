@@ -29,6 +29,8 @@ constexpr int kNCtasScales          = 512;
 constexpr int kThreadsScales        = 1024;
 constexpr int kThreadsScatterReduce = 128;
 constexpr int kColsPerThread        = 8;
+constexpr int kColsPerThreadQ       = 8;  // mxfp4-input reduce: 8 fp4 = one u32 load (max threads/MLP)
+constexpr int kThreadsScatterReduceQ = 128;  // mxfp4-input reduce CTA size (bigger → larger fp4 burst/row)
 
 constexpr int kSplitSortCtas        = 16;
 constexpr int kInlineQuantZeroInitCtas = 128;
@@ -340,4 +342,43 @@ void mxfp4_moe_scatter_reduce_kernel(
         "mxfp4_moe_scatter_reduce: unsupported (TOPK=", TOPK,
         " D_HIDDEN=", D_HIDDEN, ")");
 #undef LAUNCH
+}
+
+
+// MXFP4-input scatter_reduce: flat_out staged as packed fp4 + e8m0 block scales.
+void mxfp4_moe_scatter_reduce_q_kernel(
+    torch::Tensor& flat_out_q,
+    torch::Tensor& flat_out_scale,
+    torch::Tensor& reverse_sorted,
+    torch::Tensor& sorted_weights,
+    torch::Tensor& out,
+    int64_t NE,
+    int64_t TOPK,
+    int64_t D_HIDDEN,
+    int64_t MB)
+{
+    (void)NE;
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(flat_out_q));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const int M = static_cast<int>(out.size(0));
+    const bool nt_hints = (MB >= 128);
+
+#define LAUNCH_Q(D_HIDDEN_, TOPK_, NT_)                                                           \
+    aiter::mxfp4_moe::moe_scatter_reduce::launch_mxfp4<                                           \
+            D_HIDDEN_, TOPK_, kThreadsScatterReduceQ, kColsPerThreadQ, NT_>(                      \
+        stream, M,                                                                               \
+        reinterpret_cast<const uint8_t*>(flat_out_q.data_ptr()),                                  \
+        reinterpret_cast<const uint8_t*>(flat_out_scale.data_ptr()),                              \
+        reverse_sorted.data_ptr<int32_t>(),                                                       \
+        sorted_weights.data_ptr<float>(),                                                         \
+        reinterpret_cast<__hip_bfloat16*>(out.data_ptr()))
+
+    if (D_HIDDEN == 7168 && TOPK == 9) {
+        if (nt_hints) { LAUNCH_Q(7168, 9, true);  return; }
+        else          { LAUNCH_Q(7168, 9, false); return; }
+    }
+    TORCH_CHECK(false,
+        "mxfp4_moe_scatter_reduce_q: unsupported (TOPK=", TOPK,
+        " D_HIDDEN=", D_HIDDEN, ")");
+#undef LAUNCH_Q
 }

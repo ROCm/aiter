@@ -1203,6 +1203,71 @@ def _mxfp4_moe_run(
         # sorted_weights applied inside; scatter_reduce unnecessary.
         out_buf = atomic_output_buf
     else:
+        # ── MXFP4-intermediate path — CSV-driven via a `_MXFP4OUT` g2 kernel ──
+        # When the tuned CSV selects `..._BM128_NONATOMIC_MXFP4OUT`, gemm2 stages
+        # flat_out as packed fp4 + e8m0 (mxfp4-out epilog) so the scatter_reduce
+        # reads ~3.8x less → ~2.25x on that kernel. The per-expert gemm2 output is
+        # quantized to 4-bit BEFORE the topk reduce (lossy), so the CSV only enables
+        # it for M buckets where the reduce win beats the gemm2 epilog overhead
+        # (cold full-MoE crossover ≈ M 8192 on Kimi — the CSV is the M-gate). Only
+        # the codegen'd Kimi/DSR nonatomic shapes (NE∈{257,385}, H=7168, E=512) have
+        # the gemm2-mxfp4out + scatter_reduce_q kernels.
+        mxfp4out = p2.get("mxfp4out", False)
+        _mx_shape_ok = (BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385))
+
+        # DEBUG (AITER_MXFP4_INTERMEDIATE=2): software-sim oracle — gemm2 → bf16,
+        # quant_mxfp4_hip round-trip (the same before-sum 4-bit quant the kernel
+        # does), then the stock bf16 reduce. gsm8k(oracle) == gsm8k(mxfp4out) ⟹ the
+        # kernels are correct and any loss is inherent to the before-sum quant.
+        if _mx_shape_ok and int(os.environ.get("AITER_MXFP4_INTERMEDIATE", "0")) == 2:
+            from aiter.ops.quant import quant_mxfp4_hip
+            from aiter.utility import fp4_utils
+            out_buf = torch.zeros(
+                (max_sorted, D_HIDDEN), dtype=dtypes.bf16, device=device)
+            aiter.mxfp4_moe_gemm2_a4w4(
+                cumsum_tensor=cumsum_tensor, inter_sorted_quant=inter_sorted_quant,
+                inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+                w3_shuffled_quant=w2, w3_shuffled_scale=w2_scale,
+                sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
+                sorted_weights=sorted_weights, flat_out=out_buf,
+                M_logical=M, max_sorted=max_sorted,
+                kernelName=kernelName2.replace("_MXFP4OUT", ""))
+            pk, sc = quant_mxfp4_hip(out_buf, group_size=32)
+            deq = (fp4_utils.mxfp4_to_f32(pk.view(torch.uint8))
+                   * fp4_utils.e8m0_to_f32(sc.view(torch.uint8)).float()
+                       .repeat_interleave(32, dim=-1))
+            out_buf = deq.to(dtypes.bf16)
+            out = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
+            aiter.mxfp4_moe_scatter_reduce(
+                flat_out=out_buf, reverse_sorted=reverse_sorted,
+                sorted_weights=sorted_weights, out=out,
+                NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM)
+            return out
+
+        if mxfp4out and _mx_shape_ok:
+            flat_out_q = torch.empty(
+                (max_sorted, D_HIDDEN // 2), dtype=torch.uint8, device=device)
+            flat_out_scale = torch.empty(
+                (max_sorted, D_HIDDEN // 32), dtype=torch.uint8, device=device)
+            aiter.mxfp4_moe_gemm2_a4w4_mxfp4out(
+                cumsum_tensor=cumsum_tensor,
+                inter_sorted_quant=inter_sorted_quant,
+                inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+                w3_shuffled_quant=w2, w3_shuffled_scale=w2_scale,
+                sorted_expert_ids=sorted_expert_ids,
+                flat_out_q=flat_out_q, flat_out_scale=flat_out_scale,
+                NE=NE, D_HIDDEN=D_HIDDEN, D_INTER=D_INTER, max_sorted=max_sorted)
+            out = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
+            aiter.mxfp4_moe_scatter_reduce_q(
+                flat_out_q=flat_out_q, flat_out_scale=flat_out_scale,
+                reverse_sorted=reverse_sorted, sorted_weights=sorted_weights,
+                out=out, NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM)
+            return out
+
+        # `_MXFP4OUT` requested on an unsupported shape → drop it, run bf16.
+        if mxfp4out:
+            kernelName2 = kernelName2.replace("_MXFP4OUT", "")
+
         # Non-atomic bf16: per-sorted-row staging; scatter_reduce afterwards.
         out_buf = torch.empty(
             (max_sorted, D_HIDDEN), dtype=dtypes.bf16, device=device)
