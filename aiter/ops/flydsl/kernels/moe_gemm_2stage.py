@@ -90,6 +90,48 @@ def _if_else(if_op):
                 scf.YieldOp([])
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers used identically by compile_moe_gemm1 / compile_moe_gemm2.
+# ---------------------------------------------------------------------------
+def _ptr_buffer_resource(ptr, num_records_bytes):
+    addr = fx.ptrtoint(ptr)
+    addr_i64 = fx.Int64(addr).ir_value()
+    return buffer_ops.create_buffer_resource_from_addr(
+        addr_i64, num_records_bytes=num_records_bytes
+    )
+
+
+def _i64_to_v4f16(x_i64):
+    v1 = Vec.from_elements([x_i64], fx.Int64).ir_value()
+    return Vec(v1).bitcast(fx.Float16)
+
+
+def _i64_to_v4i16(x_i64):
+    v1 = Vec.from_elements([x_i64], fx.Int64).ir_value()
+    return Vec(v1).bitcast(fx.Int16)
+
+
+def _i64x2_to_v8f16(lo, hi):
+    v2 = Vec.from_elements([lo, hi], fx.Int64).ir_value()
+    return Vec(v2).bitcast(fx.Float16)
+
+
+def _i64x2_to_v8bf16(lo, hi):
+    v2 = Vec.from_elements([lo, hi], fx.Int64).ir_value()
+    return Vec(v2).bitcast(fx.BFloat16)
+
+
+def _acc_scaled_f32(f32_acc_vec, f32_partial_vec, scale_val):
+    """MFMA f32 partial -> scale -> add to f32 accumulator via math.fma on vector."""
+    from flydsl._mlir.dialects._math_ops_gen import fma as _math_fma
+
+    _uw = arith._to_raw
+    scale_vec = _uw(Vec.filled([4], scale_val, fx.Float32))
+    return arith.ArithValue(
+        _math_fma(scale_vec, _uw(f32_partial_vec), _uw(f32_acc_vec))
+    )
+
+
 @functools.lru_cache(maxsize=1024)
 def compile_moe_gemm1(
     *,
@@ -381,13 +423,6 @@ def compile_moe_gemm1(
             vec8_elems = 8 if elem_bytes == 1 else 4
             vec8_x = T.vec(vec8_elems, x_elem)
             vec16_x = T.vec(vec16_elems, x_elem)
-
-            def _ptr_buffer_resource(ptr, num_records_bytes):
-                addr = fx.ptrtoint(ptr)
-                addr_i64 = fx.Int64(addr).ir_value()
-                return buffer_ops.create_buffer_resource_from_addr(
-                    addr_i64, num_records_bytes=num_records_bytes
-                )
 
             def silu(x):
                 # device fast path:
@@ -968,22 +1003,6 @@ def compile_moe_gemm1(
                             )
                         epilogue_pf = (sw_gate_pf, sw_up_pf)
 
-                    def _i64_to_v4f16(x_i64):
-                        v1 = Vec.from_elements([x_i64], fx.Int64).ir_value()
-                        return Vec(v1).bitcast(fx.Float16)
-
-                    def _i64_to_v4i16(x_i64):
-                        v1 = Vec.from_elements([x_i64], fx.Int64).ir_value()
-                        return Vec(v1).bitcast(fx.Int16)
-
-                    def _i64x2_to_v8f16(lo, hi):
-                        v2 = Vec.from_elements([lo, hi], fx.Int64).ir_value()
-                        return Vec(v2).bitcast(fx.Float16)
-
-                    def _i64x2_to_v8bf16(lo, hi):
-                        v2 = Vec.from_elements([lo, hi], fx.Int64).ir_value()
-                        return Vec(v2).bitcast(fx.BFloat16)
-
                     def mfma_k64(acc_in, a0, a1, b0, b1):
                         if const_expr(_use_mfma_k32):
                             # gfx950: single 16x16x32 MFMA consuming all 128 bits (K=32 f16/bf16)
@@ -1010,16 +1029,6 @@ def compile_moe_gemm1(
                             return mfma_fn(mfma_res_ty, [a1v, b1v, acc_mid, 0, 0, 0])
                         acc_mid = mfma_fn(mfma_res_ty, [a0, b0, acc_in, 0, 0, 0])
                         return mfma_fn(mfma_res_ty, [a1, b1, acc_mid, 0, 0, 0])
-
-                    def _acc_scaled_f32(f32_acc_vec, f32_partial_vec, scale_val):
-                        """MFMA f32 partial -> scale -> add to f32 accumulator via math.fma on vector."""
-                        from flydsl._mlir.dialects._math_ops_gen import fma as _math_fma
-
-                        _uw = arith._to_raw
-                        scale_vec = _uw(Vec.filled([4], scale_val, fx.Float32))
-                        return arith.ArithValue(
-                            _math_fma(scale_vec, _uw(f32_partial_vec), _uw(f32_acc_vec))
-                        )
 
                     if const_expr(is_int4_bf16 or is_int4_bf16_groupwise):
                         # W4A16: deferred dequant — unpack int4->bf16 right before MFMA
@@ -2228,13 +2237,6 @@ def compile_moe_gemm2(
             vec8_x = T.vec(vec8_elems, x_elem)
             vec16_x = T.vec(vec16_elems, x_elem)
 
-            def _ptr_buffer_resource(ptr, num_records_bytes):
-                addr = fx.ptrtoint(ptr)
-                addr_i64 = fx.Int64(addr).ir_value()
-                return buffer_ops.create_buffer_resource_from_addr(
-                    addr_i64, num_records_bytes=num_records_bytes
-                )
-
             acc_init = (
                 arith.constant_vector(0, T.i32x4)
                 if is_int8
@@ -2761,22 +2763,6 @@ def compile_moe_gemm2(
                                     )
                         epilogue_pf = (sw_pf, tw_pf)
 
-                    def _i64_to_v4f16(x_i64):
-                        v1 = Vec.from_elements([x_i64], fx.Int64).ir_value()
-                        return Vec(v1).bitcast(fx.Float16)
-
-                    def _i64_to_v4i16(x_i64):
-                        v1 = Vec.from_elements([x_i64], fx.Int64).ir_value()
-                        return Vec(v1).bitcast(fx.Int16)
-
-                    def _i64x2_to_v8f16(lo, hi):
-                        v2 = Vec.from_elements([lo, hi], fx.Int64).ir_value()
-                        return Vec(v2).bitcast(fx.Float16)
-
-                    def _i64x2_to_v8bf16(lo, hi):
-                        v2 = Vec.from_elements([lo, hi], fx.Int64).ir_value()
-                        return Vec(v2).bitcast(fx.BFloat16)
-
                     def mfma_k64(acc0, a0, a1, b0, b1):
                         if const_expr(_use_mfma_k32):
                             # gfx950: single 16x16x32 MFMA consuming all 128 bits (K=32 f16/bf16)
@@ -2803,16 +2789,6 @@ def compile_moe_gemm2(
                             return mfma_fn(mfma_res_ty, [a1v, b1v, acc1, 0, 0, 0])
                         acc1 = mfma_fn(mfma_res_ty, [a0, b0, acc0, 0, 0, 0])
                         return mfma_fn(mfma_res_ty, [a1, b1, acc1, 0, 0, 0])
-
-                    def _acc_scaled_f32(f32_acc_vec, f32_partial_vec, scale_val):
-                        """MFMA f32 partial -> scale -> add to f32 accumulator via math.fma on vector."""
-                        from flydsl._mlir.dialects._math_ops_gen import fma as _math_fma
-
-                        _uw = arith._to_raw
-                        scale_vec = _uw(Vec.filled([4], scale_val, fx.Float32))
-                        return arith.ArithValue(
-                            _math_fma(scale_vec, _uw(f32_partial_vec), _uw(f32_acc_vec))
-                        )
 
                     if const_expr(is_int4_bf16 or is_int4_bf16_groupwise):
                         # W4A16: deferred dequant -- unpack int4->bf16 right before MFMA
