@@ -1023,7 +1023,16 @@ for num_heads in args.num_heads:
         for block_size in args.block_size:
             for dtype in args.dtype:
                 ret = test_paged_attention(
-                    ctx_len, 128, num_heads, 128, False, block_size, dtype, "auto", 0, "cuda:0"
+                    ctx_len,
+                    128,
+                    num_heads,
+                    128,
+                    False,
+                    block_size,
+                    dtype,
+                    "auto",
+                    0,
+                    "cuda:0",
                 )
                 df.append(ret)
 df = pd.DataFrame(df)
