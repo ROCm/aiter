@@ -399,10 +399,6 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         # k-store path, so they sit behind pos in the issue stream.
         pos = gl.load(pos_ptr + pid_b * pos_stride_b)
         pid_slot = gl.load(slot_mapping_ptr + pid_b).to(gl.int64)
-        if HAVE_K_SCALE:
-            k_scale = gl.load(k_scale_ptr)
-        else:
-            k_scale = 1.0
 
         q_nope_desc = _make_tdm_desc_1d(
             q_nope_ptr + pid_b * q_nope_stride_b + pid_hq * q_nope_stride_h,
@@ -411,6 +407,10 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             SH,
         )
         _issue_tdm_load_1d(q_nope_desc, 0, qn_smem)
+        if HAVE_K_SCALE:
+            k_scale = gl.load(k_scale_ptr)
+        else:
+            k_scale = 1.0
 
         # cos/sin: TDM-load the contiguous freq slice (base depends on pos),
         # rebuilt into the BLOCK_D_pe vector after the wait. The slice is
