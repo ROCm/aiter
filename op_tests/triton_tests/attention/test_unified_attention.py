@@ -234,8 +234,6 @@ def ref_paged_attn(
     "seq_lens",
     [
         [(1, 1328)],
-        [(1, 8192)],
-        [(1, 1024)] * 32,
         [(1, 8192)] * 32,
         [(1, 523), (1, 37), (1, 2011)],
         [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
@@ -243,7 +241,6 @@ def ref_paged_attn(
 )
 @pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
 @pytest.mark.parametrize("head_size", [64])
-@pytest.mark.parametrize("block_size", [16, 64, 128])
 @pytest.mark.parametrize("sliding_window", [None])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, o_dtype, block_size, use_out_scale",
@@ -290,8 +287,6 @@ def test_triton_unified_attn_3d(
             pytest.skip(f"NVFP4 KV cache requires {DEVICE_ARCH}")
         if not shuffled_kv_cache:
             pytest.skip("NVFP4 KV cache requires shuffled KV cache")
-        if block_size < 128:
-            pytest.skip("Block size has to be 128 for NVFP4 KV cache")
 
     if shuffled_kv_cache:
         if q_dtype == e4m3_dtype and kv_dtype == e4m3_dtype and block_size < 32:

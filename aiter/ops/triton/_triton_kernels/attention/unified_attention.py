@@ -475,6 +475,7 @@ def kernel_unified_attention_3d(
     q_descale_ptr,  # float32
     k_descale_ptr,  # float32
     v_descale_ptr,  # float32
+    out_scale_ptr,  # float32
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
@@ -645,13 +646,19 @@ def kernel_unified_attention_3d(
         qk_scale = qk_scale * q_descale
     else:
         q_descale = None
-    if k_descale_ptr is not None and v_descale_ptr is not None:
-        k_descale = tl.load(k_descale_ptr)
-        v_descale = tl.load(v_descale_ptr)
-        qk_scale = qk_scale * k_descale
+
+    if k_descale_ptr is not None:
+        k_scale = tl.load(k_descale_ptr)
+        qk_scale = qk_scale * k_scale
     else:
-        k_descale = None
-        v_descale = None
+        k_scale = None
+
+    out_factor: tl.float32 = 1.0
+    if v_descale_ptr is not None:
+        out_factor = tl.load(v_descale_ptr)
+
+    if out_scale_ptr is not None:
+        out_factor = out_factor / tl.load(out_scale_ptr)
 
     # iterate through tiles within current segment
     for j in range(
@@ -811,8 +818,10 @@ def kernel_unified_attention_3d(
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
-    if v_descale is not None:
-        acc = acc * v_descale
+    acc = acc * out_factor
+    if NUM_SEGMENTS_PER_SEQ == 1:
+        one_over_L = 1.0 / L[:, None]
+        acc = acc * one_over_L
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
@@ -826,13 +835,14 @@ def kernel_unified_attention_3d(
         acc,
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
     )
-    segm_offset = (
-        query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_offset_1 * NUM_SEGMENTS_PER_SEQ
-        + segm_idx
-    )
-    tl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0 & query_mask_1)
-    tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
+    if NUM_SEGMENTS_PER_SEQ > 1:
+        segm_offset = (
+            query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_offset_1 * NUM_SEGMENTS_PER_SEQ
+            + segm_idx
+        )
+        tl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0 & query_mask_1)
+        tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
 
 
 @triton.jit

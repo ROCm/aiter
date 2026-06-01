@@ -486,15 +486,15 @@ def _mla_decode_fwd_kernel(
             )
             kv_lora_offset = (
                 kv_offset
-                + offs_t_shfl[:, None] * stride_kv_buffer_2
+                + offs_t_shfl[:, None] * (KV_LORA_RANK * 16) * stride_kv_buffer_3
                 + offs_lora_rank_shfl[None, :] * stride_kv_buffer_3
             )
 
             k_rope_offset = (
                 kv_offset
-                + offs_t_shfl[:, None] * stride_kv_buffer_2
-                + (KV_LORA_RANK * 16 + offs_rope_head_dim_shfl)[None, :]
-                * stride_kv_buffer_3
+                + (TILE_SIZE * KV_LORA_RANK) * stride_kv_buffer_3
+                + offs_t_shfl[:, None] * (QK_ROPE_HEAD_DIM * 16) * stride_kv_buffer_3
+                + offs_rope_head_dim_shfl[None, :] * stride_kv_buffer_3
             )
         else:
             kv_offset = (
