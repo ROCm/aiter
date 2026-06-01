@@ -43,6 +43,12 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>python op_tests/triton_tests/<br>test_pa_decode_gluon.py</td>
   <td>TBD</td><td>TBD</td><td>TBD</td>
 </tr>
+<tr>
+  <td><code>sparse_attention_dsv4</code></td><td>Sparse MLA<br>Prefill+Decode</td><td>CDNA4</td>
+  <td nowrap>Q/Out: bf16/fp16<br>head_dim=512 (NoPE 448 + RoPE 64)<br>Prefill KV: bf16 flat [N, D]<br>Decode KV: fp8 NoPE + bf16/fp16 RoPE</td>
+  <td>python op_tests/<br>test_sparse_attention_dsv4.py \<br>--cfgs 4096,128,4096,512</td>
+  <td>~380<br>TFLOPS</td><td>—</td><td>—</td>
+</tr>
 </table>
 </small>
 
@@ -170,3 +176,59 @@ Gluon reaches ~82% of MI350's 6.5 TB/s HBM peak (wall-clock 2162 &mu;s vs ASM 16
 | KV block sizes | 16, 64, 1024 (selected by kernel variant) |
 | Context partition | 256 (static_assert) |
 | Constraint | `query_length * query_group_size` &le; 64 |
+
+### `sparse_attention_dsv4.py` — DeepSeek V4 Sparse MLA (Prefill + Decode)
+
+**Functions:** `sparse_attn_prefill(q, kv, indices, topk_length, ...)`, `sparse_attn_decode(q, kv_cache, swa_k_cache, swa_only, topk_indices, topk_lens, swa_indices, ...)`
+
+**Description:** DeepSeek V4 Compressed Sparse Attention. Each query token attends to a sparse, per-token set of KV positions (top-k / sliding-window) supplied as CSR `(indices, indptr)` with `-1` sentinels masked out :
+
+- **Prefill** (`_sparse_attn_prefill_kernel`): bf16 KV in a flat `[N, D]` buffer, ragged per-query indices, optional per-head attention sink. One program per query token &times; `BLOCK_H` head block. The gathered KV tile is DMA'd global&rarr;LDS once via `async_copy` and read in both orientations (K^T for QK, V for PV) through a `permute` view of a single padded LDS buffer.
+- **Decode** (`_sparse_attn_decode_kernel`): fp8_ds_mla paged cache, with two parallel sparse passes — a "main"/sliding-window pass over `swa_k_cache` and an optional "extra"/top-k pass over `kv_cache` — that share one running softmax statistic. The NoPE half is dequantized from FP8 (per-64-element exp scale), the RoPE half is bf16.
+
+Ported from vLLM's `rocm_aiter_mla_sparse`. The host wrapper (`aiter/ops/triton/attention/sparse_attention_dsv4.py`) selects the Gluon kernel on gfx950 when the KV pool / paged cache fits within the 2 GB buffer-descriptor cap, otherwise falls back to the Triton kernel (whose 32-bit buffer offsets carry the same cap).
+
+| Parameter | Details |
+|-----------|---------|
+| Arch | gfx950 (CDNA4) only |
+| Q dtype | bf16 |
+| KV dtype | bf16 flat buffer (prefill); fp8_ds_mla `uint8` paged cache (decode) |
+| Output | bf16 |
+| head_dim | 512 = nope_head_dim (448) + rope_head_dim (64), enforced |
+| Decode cache row | 576 B (448 FP8 NoPE + 64 bf16 RoPE) + 8 B per-token scale = 584 B |
+| Sparsity | CSR ragged `(indices, indptr)`; `-1` sentinels masked |
+| Attn sink | optional `[H]` fp32 per-head softmax-denominator bias |
+| MFMA | QK 16&times;16&times;32 (kWidth=8), PV 16&times;16&times;16 (kWidth=4) |
+| Tunable | BLOCK_H, BLOCK_K, num_warps, waves_per_eu (`@triton.autotune`) |
+
+**Decode passes** (`swa_only`):
+- `True`: only the main/SWA pass over `swa_k_cache` runs (`HAS_EXTRA=False`).
+- `False`: the extra/top-k pass over `kv_cache` also runs, sharing the same online-softmax accumulator.
+
+**Test** (prefill accuracy + perf vs a torch reference, gfx950):
+
+```
+# config is num_queries,num_heads,num_kv,topk
+python op_tests/test_sparse_attention_dsv4.py --cfgs 4096,128,4096,512
+
+# multiple shapes; add --sink to exercise the per-head attention-sink path
+python op_tests/test_sparse_attention_dsv4.py \
+    --cfgs 4096,128,4096,512 8192,128,8192,1024 --sink
+```
+
+Per-query ragged top-k indices keep a random count in `[topk//4, topk]` of
+unique slots; the test checks `checkAllclose` against a per-query masked-softmax
+torch reference and reports TFLOPS / GB/s.
+
+**Perf** (MI350, prefill, bf16, H=128):
+
+```
+python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4.py --shapes prefill
+```
+
+| Q | Kv | topk | Triton TFLOPS | Gluon TFLOPS | Speedup |
+|------|------|------|---------------|--------------|---------|
+| 4096 | 4096 | 512  | 192.2 | 335.0 | 1.74&times; |
+| 4096 | 4096 | 1024 | 209.0 | 383.1 | 1.83&times; |
+| 8192 | 8192 | 512  | 191.0 | 329.8 | 1.73&times; |
+| 8192 | 8192 | 1024 | 211.2 | 369.8 | 1.75&times; |

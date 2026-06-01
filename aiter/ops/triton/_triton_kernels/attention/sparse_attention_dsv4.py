@@ -223,11 +223,6 @@ def _combine_topk_swa_indices_ragged_kernel(
 # ---------------------------------------------------------------------------
 
 def _prefill_prune_configs(configs, named_args, **kwargs):
-    """Prune prefill configs that would exceed per-CU LDS.
-
-    The KV tile loaded into LDS is ``[BLOCK_K, BLOCK_D]`` bf16 (2 B/elem),
-    double-buffered across ``num_stages``.
-    """
     BLOCK_D = kwargs.get("BLOCK_D", named_args.get("BLOCK_D"))
     pruned = []
     for cfg in configs:
@@ -292,11 +287,6 @@ def _sparse_attn_prefill_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """Sparse MLA prefill (single-kv ragged path).
-
-    Grid: (num_queries, cdiv(num_heads, BLOCK_H))
-    Each program: 1 query token x BLOCK_H heads.
-    """
     query_idx = tl.program_id(0)
     pid_h = tl.program_id(1)
 
@@ -388,12 +378,6 @@ def _sparse_attn_prefill_kernel(
 
 
 def _decode_prune_configs(configs, named_args, **kwargs):
-    """Prune decode configs that would exceed per-CU LDS.
-
-    Per tile we cache the NoPE half (FP8 — 1 B/elem) and the RoPE half
-    (bf16 — 2 B/elem) for ``BLOCK_K`` slots, double-buffered across
-    ``num_stages``. The per-64-element FP8 scale group is negligible.
-    """
     NOPE_DIM = kwargs.get("NOPE_DIM", named_args.get("NOPE_DIM"))
     ROPE_DIM = kwargs.get("ROPE_DIM", named_args.get("ROPE_DIM"))
     pruned = []
@@ -470,8 +454,7 @@ def _sparse_attn_decode_kernel(
 
     Grid: (num_queries, cdiv(num_heads, BLOCK_H))
     Each program: 1 query token x BLOCK_H heads. Walks the main / SWA
-    pass first, then (when HAS_EXTRA) the top-k pass, sharing one online
-    softmax statistic across both.
+    pass first, then (when HAS_EXTRA) the top-k pass.
     """
     query_idx = tl.program_id(0)
     pid_h = tl.program_id(1)

@@ -25,17 +25,16 @@ from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 _TRITON_VERSION = Version(triton.__version__)
 _TRITON_GE_36 = _TRITON_VERSION >= Version("3.6.0")
 _arch = arch_info.get_arch()
-_gluon_sparse_attn_prefill_kernel = None
-_gluon_sparse_attn_decode_kernel = None
+_gluon_sparse_attn_prefill = None
+_gluon_sparse_attn_decode = None
 if _TRITON_GE_36 and _arch == "gfx950":
     try:
-        from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_attention_dsv4 import (
-            _sparse_attn_prefill_kernel as _gluon_sparse_attn_prefill_kernel,
-            _sparse_attn_decode_kernel as _gluon_sparse_attn_decode_kernel,
+        from aiter.ops.triton.gluon.sparse_attention_dsv4 import (
+            sparse_attn_prefill_gluon as _gluon_sparse_attn_prefill,
+            sparse_attn_decode_gluon as _gluon_sparse_attn_decode,
         )
     except ImportError:
-        _gluon_sparse_attn_prefill_kernel = None
-        _gluon_sparse_attn_decode_kernel = None
+        pass  # symbols stay None (set above)
 
 # Buffer-load resource descriptors are 32-bit byte-addressed; the Gluon kernels
 # keep all per-row offsets in int32, so they can only be used when the addressed
@@ -47,6 +46,17 @@ def _fits_buffer_descriptor(tensor: torch.Tensor) -> bool:
     return tensor.numel() * tensor.element_size() < _BUFFER_LIMIT_BYTES
 
 
+def _use_gluon(gluon_fn, *pools: torch.Tensor) -> bool:
+    """Prefer the Gluon kernel when it is available and every addressed pool
+    fits the 32-bit buffer-load descriptor (< 2 GiB)."""
+    return gluon_fn is not None and all(_fits_buffer_descriptor(p) for p in pools)
+
+
+def _bh_grid(num_queries: int, num_heads: int):
+    """Triton-fallback launch grid: one program per (query, BLOCK_H head-block)."""
+    return lambda META: (num_queries, triton.cdiv(num_heads, META["BLOCK_H"]))  # noqa: E731
+
+
 # ---------------------------------------------------------------------------
 # DSV4 sparse-MLA layout constants
 # ---------------------------------------------------------------------------
@@ -56,12 +66,6 @@ _DSV4_SPARSE_ROPE_DIM = 64
 
 
 def _is_fp8_fnuz() -> bool:
-    """Return True on architectures that use ``float8_e4m3fnuz`` (e.g. gfx942).
-
-    The decode kernel bitcasts a packed uint8 lane to fp8 to dequantize the
-    NoPE half of the cache. The bitcast target dtype depends on the
-    architecture's FP8 encoding (FNUZ on MI300X / gfx942 vs FN on gfx950+).
-    """
     return get_fp8_e4m3_dtype() == torch.float8_e4m3fnuz
 
 
@@ -90,10 +94,27 @@ def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
 
 
 def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
-    lengths = lengths.to(dtype=torch.int32).contiguous()
-    indptr = torch.zeros(lengths.shape[0] + 1, dtype=torch.int32, device=lengths.device)
+    lengths = _as_int32_contiguous_1d(lengths)
+    indptr = torch.empty(lengths.shape[0] + 1, dtype=torch.int32, device=lengths.device)
+    indptr[0] = 0
     torch.cumsum(lengths, dim=0, out=indptr[1:])
     return indptr
+
+
+def _valid_lengths(indices_2d: torch.Tensor) -> torch.Tensor:
+    """Per-row count of non-sentinel (>= 0) entries."""
+    return (indices_2d >= 0).sum(dim=-1, dtype=torch.int32)
+
+
+def _prep_attn_sink(
+    attn_sink: torch.Tensor | None, device: torch.device
+) -> tuple[torch.Tensor, bool]:
+    """Normalize the optional per-head sink into ``(tensor, has_sink)``. When
+    absent, a 1-element placeholder keeps the kernel arg a valid pointer (its use
+    is gated by the HAS_ATTN_SINK constexpr)."""
+    if attn_sink is None:
+        return torch.empty(1, device=device, dtype=torch.float32), False
+    return attn_sink.contiguous(), True
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +127,11 @@ def build_ragged_indices_from_dense(
     lengths: torch.Tensor,
     num_rows: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack a dense ``[N, max_topk]`` index matrix into ``(flat, indptr)``.
+    """Pack a dense `[N, max_topk]` index matrix into `(flat, indptr)`.
 
-    ``lengths[i]`` controls how many of the leading entries of row ``i`` are
-    copied. Entries that fall outside ``[0, num_rows)`` (when
-    ``num_rows >= 0``) are mapped to ``-1`` so the consumer kernel can mask
+    `lengths[i]` controls how many of the leading entries of row `i` are
+    copied. Entries that fall outside `[0, num_rows)` (when
+    `num_rows >= 0`) are mapped to `-1` so the consumer kernel can mask
     them safely.
     """
     indices = indices.reshape(indices.shape[0], -1)
@@ -119,12 +140,10 @@ def build_ragged_indices_from_dense(
         f"Expected one length per row, got {lengths.shape} for indices {indices.shape}"
     )
 
-    max_width = indices.shape[1] if indices.ndim == 2 else 0
+    max_width = indices.shape[1]
     lengths = lengths.clamp(min=0, max=max_width).contiguous()
 
-    indptr = torch.empty(indices.shape[0] + 1, dtype=torch.int32, device=indices.device)
-    indptr[0] = 0
-    torch.cumsum(lengths, dim=0, out=indptr[1:])
+    indptr = _build_indptr_from_lengths(lengths)
 
     if indices.numel() == 0:
         flat = torch.empty(0, dtype=torch.int32, device=indices.device)
@@ -159,9 +178,9 @@ def compute_global_topk_ragged_indices_and_indptr(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Resolve per-token local top-k positions to global slot ids (CSR).
 
-    ``topk_indices[t, k]`` is a position inside the request ``token_to_req_indices[t]``;
-    looking it up in that request's ``block_table`` produces a physical slot id
-    in the unified KV pool. Returns ``(global_topk_ragged, topk_indptr, topk_lens)``.
+    `topk_indices[t, k]` is a position inside the request `token_to_req_indices[t]`;
+    looking it up in that request's `block_table` produces a physical slot id
+    in the unified KV pool. Returns `(global_topk_ragged, topk_indptr, topk_lens)`.
     """
     topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
     num_tokens = topk_indices.shape[0]
@@ -213,10 +232,10 @@ def combine_topk_swa_indices_ragged(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Interleave per-token top-k and sliding-window indices into one CSR.
 
-    For each query position, emits ``min(topk, (pos+1)//compress_ratio)``
-    top-k slots followed by ``min(window_size, pos+1)`` SWA slots. The two
-    halves live in disjoint logical ranges (``[batch*M, batch*M+N)`` for
-    top-k vs ``[batch*M+N, batch*M+N+window)`` for SWA) so a single bf16
+    For each query position, emits `min(topk, (pos+1)//compress_ratio)`
+    top-k slots followed by `min(window_size, pos+1)` SWA slots. The two
+    halves live in disjoint logical ranges (`[batch*M, batch*M+N)` for
+    top-k vs `[batch*M+N, batch*M+N+window)` for SWA) so a single bf16
     KV buffer indexed by these ids can hold both pools without aliasing.
     """
     topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
@@ -288,11 +307,7 @@ def _sparse_attn_prefill_ragged(
 
     indices = _as_int32_contiguous_1d(indices)
     indptr = _as_int32_contiguous_1d(indptr)
-    has_attn_sink = attn_sink is not None
-    if attn_sink is None:
-        attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
-    else:
-        attn_sink = attn_sink.contiguous()
+    attn_sink, has_attn_sink = _prep_attn_sink(attn_sink, q.device)
 
     num_queries, num_heads, head_dim = q.shape
     assert indptr.numel() == num_queries + 1, (
@@ -306,15 +321,22 @@ def _sparse_attn_prefill_ragged(
     out = torch.empty_like(q, dtype=torch.bfloat16)
     # Prefer the Gluon kernel, but it gathers KV via 32-bit buffer_load offsets,
     # so fall back to Triton when the KV pool exceeds the 2 GiB descriptor cap.
-    if _gluon_sparse_attn_prefill_kernel is not None and _fits_buffer_descriptor(kv):
-        kernel = _gluon_sparse_attn_prefill_kernel
-    else:
-        kernel = _sparse_attn_prefill_kernel
-    grid = lambda META: (  # noqa: E731
-        num_queries,
-        triton.cdiv(num_heads, META["BLOCK_H"]),
-    )
-    kernel[grid](
+    if _use_gluon(_gluon_sparse_attn_prefill, kv):
+        # Persistent Gluon kernel: its host launcher builds the 1-D grid and
+        # passes num_queries (it grid-strides over the tile space itself).
+        _gluon_sparse_attn_prefill(
+            q,
+            kv,
+            indices,
+            indptr,
+            out,
+            float(scale),
+            attn_sink=attn_sink if has_attn_sink else None,
+        )
+        return out
+
+    grid = _bh_grid(num_queries, num_heads)
+    _sparse_attn_prefill_kernel[grid](
         q,
         kv,
         indices,
@@ -369,11 +391,7 @@ def _sparse_attn_decode_ragged(
 
     main_indices = _as_int32_contiguous_1d(main_indices)
     main_indptr = _as_int32_contiguous_1d(main_indptr)
-    has_attn_sink = attn_sink is not None
-    if attn_sink is None:
-        attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
-    else:
-        attn_sink = attn_sink.contiguous()
+    attn_sink, has_attn_sink = _prep_attn_sink(attn_sink, q.device)
 
     num_queries, num_heads, head_dim = q.shape
     assert main_indptr.numel() == num_queries + 1, (
@@ -411,22 +429,31 @@ def _sparse_attn_decode_ragged(
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
     out = torch.empty_like(q, dtype=torch.bfloat16)
-    # Prefer the Gluon kernel, but its 32-bit buffer_load offsets require both
-    # paged caches to fit within the 2 GiB descriptor cap; else fall back to
-    # Triton.
-    if (
-        _gluon_sparse_attn_decode_kernel is not None
-        and _fits_buffer_descriptor(main_cache)
-        and _fits_buffer_descriptor(extra_cache)
-    ):
-        kernel = _gluon_sparse_attn_decode_kernel
-    else:
-        kernel = _sparse_attn_decode_kernel
-    grid = lambda META: (  # noqa: E731
-        num_queries,
-        triton.cdiv(num_heads, META["BLOCK_H"]),
-    )
-    kernel[grid](
+    # Prefer the persistent Gluon kernel, but it gathers the paged cache via
+    # 32-bit buffer_load offsets, so fall back to Triton when either cache pool
+    # exceeds the 2 GiB descriptor cap.
+    if _use_gluon(_gluon_sparse_attn_decode, main_cache, extra_cache):
+        # Persistent Gluon kernel: its host launcher builds the 1-D grid and
+        # passes num_queries (it grid-strides over the tile space itself).
+        _gluon_sparse_attn_decode(
+            q,
+            main_cache,
+            main_indices,
+            main_indptr,
+            out,
+            float(scale),
+            extra_cache=extra_cache if has_extra else None,
+            extra_indices=extra_indices if has_extra else None,
+            extra_indptr=extra_indptr if has_extra else None,
+            attn_sink=attn_sink if has_attn_sink else None,
+            nope_dim=nope_head_dim,
+            rope_dim=rope_head_dim,
+            is_fnuz=_is_fp8_fnuz(),
+        )
+        return out
+
+    grid = _bh_grid(num_queries, num_heads)
+    _sparse_attn_decode_kernel[grid](
         q,
         main_cache,
         main_indices,
@@ -457,6 +484,7 @@ def _sparse_attn_decode_ragged(
     )
     return out
 
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -479,26 +507,27 @@ def sparse_attn_prefill(
     """DSV4 sparse-MLA prefill — bf16 KV with ragged per-query indices.
 
     Args:
-        q: ``[N, H, D]`` queries (bf16). ``D = nope_head_dim + rope_head_dim``.
-        kv: ``[N_kv, 1, D]`` KV pool (bf16). The ``1`` lane dim is squeezed
+        q: `[N, H, D]` queries (bf16). `D = nope_head_dim + rope_head_dim`.
+        kv: `[N_kv, 1, D]` KV pool (bf16). The `1` lane dim is squeezed
             inside this wrapper.
-        indices: ``[N, max_topk]`` dense indices into ``kv``'s flat ``[N_kv, D]``
-            view, with ``-1`` sentinels. Ignored when ``ragged_indices`` and
-            ``ragged_indptr`` are both supplied.
-        topk_length: ``[N]`` per-row valid count for ``indices`` (used to
-            shrink the dense → ragged conversion). May be ``None`` to recompute
-            from ``(indices >= 0).sum(-1)``.
+        indices: `[N, max_topk]` dense indices into `kv`'s flat `[N_kv, D]`
+            view, with `-1` sentinels. Ignored when `ragged_indices` and
+            `ragged_indptr` are both supplied.
+        topk_length: `[N]` per-row valid count for `indices` (used to
+            shrink the dense → ragged conversion). May be `None` to recompute
+            from `(indices >= 0).sum(-1)`.
         scale: softmax scale.
-        head_dim, nope_head_dim, rope_head_dim: must be ``(512, 448, 64)``.
-        attn_sink: optional ``[H]`` per-head softmax-denom bias (fp32).
-        output: ``[N, H, D]`` destination (any dtype). Filled in place.
+        head_dim, nope_head_dim, rope_head_dim: must be `(512, 448, 64)`.
+        attn_sink: optional `[H]` per-head softmax-denom bias (fp32).
+        output: `[N, H, D]` destination (any dtype). Filled in place.
         ragged_indices, ragged_indptr: optional CSR alternative to
-            ``(indices, topk_length)``. Preferred when callers already have the
+            `(indices, topk_length)`. Preferred when callers already have the
             ragged form materialized (e.g. across CUDA-graph captures).
     """
     assert kv.ndim == 3 and kv.shape[1] == 1, (
         f"sparse_attn_prefill expects kv=[skv,1,d], got {kv.shape}"
     )
+    kv = kv.squeeze(1)  # [N_kv, 1, D] -> [N_kv, D] for the ragged launcher
     _validate_dsv4_sparse_dims(
         head_dim, nope_head_dim, rope_head_dim, "sparse_attn_prefill"
     )
@@ -509,13 +538,10 @@ def sparse_attn_prefill(
 
         ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
             indices_2d,
-            topk_length
-            if topk_length is not None
-            else (indices >= 0).sum(dim=-1, dtype=torch.int32),
+            topk_length if topk_length is not None else _valid_lengths(indices),
             num_rows=kv.shape[0],
         )
 
-    attn_sink = attn_sink[:, q.shape[1]] if attn_sink else None
     output_chunk = _sparse_attn_prefill_ragged(
         q=q,
         kv=kv,
@@ -552,30 +578,30 @@ def sparse_attn_decode(
     """DSV4 sparse-MLA decode — fp8_ds_mla paged cache with SWA + topk.
 
     The kernel walks two CSR-indexed sparse passes that share one running
-    softmax statistic: the "main" pass over ``swa_k_cache`` (SWA) and an
-    optional "extra" pass over ``kv_cache`` (top-k). When ``swa_only`` is
+    softmax statistic: the "main" pass over `swa_k_cache` (SWA) and an
+    optional "extra" pass over `kv_cache` (top-k). When `swa_only` is
     True only the main pass runs.
 
     Args:
-        q: ``[N, H, D]`` decode queries (bf16). ``D = 448 + 64 = 512``.
-        kv_cache: optional ``[blocks, block_size, 576]`` (uint8 fp8_ds_mla)
-            top-k cache. Required iff not ``swa_only``.
-        swa_k_cache: ``[blocks, block_size, 576]`` (uint8 fp8_ds_mla) SWA cache.
+        q: `[N, H, D]` decode queries (bf16). `D = 448 + 64 = 512`.
+        kv_cache: optional `[blocks, block_size, 576]` (uint8 fp8_ds_mla)
+            top-k cache. Required iff not `swa_only`.
+        swa_k_cache: `[blocks, block_size, 576]` (uint8 fp8_ds_mla) SWA cache.
         swa_only: when True, skip the extra (top-k) pass entirely.
-        topk_indices: dense ``[N, topk_max]`` indices into ``kv_cache``'s flat
-            slot space. Optional iff ``topk_ragged_*`` are supplied.
-        topk_lens: ``[N]`` valid count for ``topk_indices``.
-        swa_indices: dense ``[N, swa_max]`` indices into ``swa_k_cache``'s flat
+        topk_indices: dense `[N, topk_max]` indices into `kv_cache`'s flat
+            slot space. Optional iff `topk_ragged_*` are supplied.
+        topk_lens: `[N]` valid count for `topk_indices`.
+        swa_indices: dense `[N, swa_max]` indices into `swa_k_cache`'s flat
             slot space.
-        swa_lens: ``[N]`` valid count for ``swa_indices``.
+        swa_lens: `[N]` valid count for `swa_indices`.
         swa_ragged_indices, swa_ragged_indptr: optional CSR form of the SWA
             pass. Preferred when caller has them materialized.
         topk_ragged_indices, topk_ragged_indptr: optional CSR form of the top-k
             pass. Preferred when caller has them materialized.
-        attn_sink: optional ``[H]`` per-head softmax-denom bias (fp32).
+        attn_sink: optional `[H]` per-head softmax-denom bias (fp32).
         scale: softmax scale.
-        head_dim, nope_head_dim, rope_head_dim: must be ``(512, 448, 64)``.
-        output: ``[N, H, D]`` destination (any dtype). Filled in place.
+        head_dim, nope_head_dim, rope_head_dim: must be `(512, 448, 64)`.
+        output: `[N, H, D]` destination (any dtype). Filled in place.
     """
     assert swa_k_cache.dtype == torch.uint8, (
         f"sparse_attn_decode expects uint8 SWA cache, "
@@ -586,7 +612,7 @@ def sparse_attn_decode(
     )
 
     main_indices = swa_indices.reshape(swa_indices.shape[0], -1)
-    main_lens = swa_lens or (main_indices >= 0).sum(dim=-1, dtype=torch.int32)
+    main_lens = swa_lens if swa_lens is not None else _valid_lengths(main_indices)
 
     if swa_ragged_indices is None or swa_ragged_indptr is None:
         swa_ragged_indices, swa_ragged_indptr = build_ragged_indices_from_dense(
@@ -594,8 +620,6 @@ def sparse_attn_decode(
             main_lens,
             num_rows=swa_k_cache.shape[0] * swa_k_cache.shape[1],
         )
-
-    attn_sink = attn_sink[:, q.shape[1]] if attn_sink else None
 
     extra_cache = None
     if not swa_only:
@@ -611,7 +635,7 @@ def sparse_attn_decode(
         extra_cache = kv_cache
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
-            extra_lens = topk_lens or (extra_indices >= 0).sum(dim=-1, dtype=torch.int32)
+            extra_lens = topk_lens if topk_lens is not None else _valid_lengths(extra_indices)
 
             if topk_ragged_indices is None or topk_ragged_indptr is None:
                 topk_ragged_indices, topk_ragged_indptr = build_ragged_indices_from_dense(
@@ -620,7 +644,7 @@ def sparse_attn_decode(
                     num_rows=extra_cache.shape[0] * extra_cache.shape[1],
                 )
 
-    attn_out =  _sparse_attn_decode_ragged(
+    attn_out = _sparse_attn_decode_ragged(
         q=q,
         main_cache=swa_k_cache,
         main_indices=swa_ragged_indices,
