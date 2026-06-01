@@ -1,0 +1,2 @@
+qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,knl_name,co_name
+fp8,fp8,16,0,4,0,1,0,mla_a8w8_qh16_1tg_16mx4_64nx1_np_KERNEL_FUNC,mla_a8w8_qh16_1tg_16mx4_64nx1_np.co

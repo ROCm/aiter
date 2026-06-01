@@ -51,6 +51,49 @@ struct __attribute__((packed)) KernelArgs
     p2 _p24;
 };
 
+struct __attribute__((packed)) MlaMi400KernelArgs
+{
+    void* ptr_R;
+    p2 _p0;
+    void* ptr_LSE;
+    p2 _p1;
+    void* ptr_Q;
+    p2 _p2;
+    void* ptr_KV;
+    p2 _p3;
+    void* ptr_LTP;
+    p2 _p4;
+    void* ptr_LTD;
+    p2 _p5;
+    void* ptr_LTL;
+    p2 _p6;
+    float scalar;
+    p3 _p7;
+    unsigned int q_seq_lens;
+    p3 _p8;
+    unsigned int passes;
+    p3 _p9;
+    // Patched .args names this slot total_kv, but the v3 kernel uses stride_Q.
+    unsigned int stride_Q;
+    p3 _p10;
+    unsigned int stride_page;
+    p3 _p11;
+    unsigned int log2_page;
+    p3 _p12;
+    void* ptr_QTP;
+    p2 _p13;
+    void* ptr_STP;
+    p2 _p14;
+    unsigned int out_16_nosplit;
+    p3 _p15;
+    void* ptr_QROPE;
+    p2 _p16;
+    void* ptr_KVROPE;
+    p2 _p17;
+};
+
+static_assert(sizeof(MlaMi400KernelArgs) == 288, "MLA mi400 packed args must be 18*16=288B");
+
 std::string get_heuristic_kernel_mla(std::string q_type,
                                      std::string kv_type,
                                      int gqa,
@@ -93,6 +136,123 @@ std::string get_heuristic_kernel_mla(std::string q_type,
     return "";
 }
 
+static void mla_decode_mi400_dispatch(
+    aiter_tensor_t* Q,
+    aiter_tensor_t* KV,
+    aiter_tensor_t* qo_indptr,
+    aiter_tensor_t* kv_indptr,
+    aiter_tensor_t* kv_page_indices,
+    aiter_tensor_t* kv_last_page_lens,
+    aiter_tensor_t* num_kv_splits_indptr,
+    aiter_tensor_t* work_meta_data,
+    aiter_tensor_t* work_indptr,
+    aiter_tensor_t* work_info_set,
+    int max_seqlen_q,
+    int page_size,
+    int nhead_kv,
+    float softmax_scale,
+    aiter_tensor_t* splitData,
+    aiter_tensor_t* splitLse,
+    aiter_tensor_t* output,
+    aiter_tensor_t* lse,
+    aiter_tensor_t* q_scale,
+    aiter_tensor_t* kv_scale,
+    hipStream_t stream)
+{
+    const std::string arch_id = get_gpu_arch();
+    AITER_CHECK(arch_id == "gfx1250", __func__, ": only supports gfx1250, got ", arch_id);
+
+    AITER_CHECK(Q != nullptr && KV != nullptr && qo_indptr != nullptr && kv_indptr != nullptr &&
+                    kv_page_indices != nullptr && kv_last_page_lens != nullptr &&
+                    splitData != nullptr && splitLse != nullptr && output != nullptr,
+                __func__,
+                ": required tensor argument is null");
+    AITER_CHECK(work_meta_data == nullptr && work_indptr == nullptr && work_info_set == nullptr &&
+                    num_kv_splits_indptr != nullptr,
+                __func__,
+                ": gfx1250 MLA minimal smoke only supports non-persistent decode");
+    AITER_CHECK(lse == nullptr, __func__, ": gfx1250 MLA minimal smoke does not support LSE output");
+    AITER_CHECK(Q->is_contiguous(), __func__, ": only support Q.is_contiguous() for now");
+    AITER_CHECK(Q->dtype() == AITER_DTYPE_fp8 && KV->dtype() == AITER_DTYPE_fp8,
+                __func__,
+                ": only supports fp8/fp8 for minimal smoke");
+
+    const int batch        = qo_indptr->size(0) - 1;
+    const int num_heads    = Q->size(1);
+    const int gqa_ratio    = num_heads / nhead_kv;
+    const int kv_split     = splitData->size(1);
+    constexpr int sub_Q    = 64;
+    constexpr int bdx      = 128;
+    constexpr int bdy      = 1;
+    constexpr int bdz      = 1;
+
+    AITER_CHECK(nhead_kv == 1, __func__, ": only support nhead_kv == 1 for minimal smoke");
+    AITER_CHECK(gqa_ratio == 16, __func__, ": only support gqa_ratio == 16 for minimal smoke");
+    AITER_CHECK(max_seqlen_q == 4, __func__, ": only support max_seqlen_q == 4 for minimal smoke");
+    AITER_CHECK(page_size == 64, __func__, ": only support page_size == 64 for minimal smoke");
+    AITER_CHECK(kv_split == 1, __func__, ": only support num_kv_splits == 1 for minimal smoke");
+    AITER_CHECK(Q->size(2) == 576, __func__, ": only support Q head dim 576 for minimal smoke");
+    AITER_CHECK(output->size(2) == 512, __func__, ": only support output head dim 512 for minimal smoke");
+    AITER_CHECK(q_scale != nullptr && kv_scale != nullptr,
+                __func__,
+                ": q_scale and kv_scale are required for fp8 minimal smoke");
+    AITER_CHECK(q_scale->dtype() == AITER_DTYPE_fp32 && kv_scale->dtype() == AITER_DTYPE_fp32,
+                __func__,
+                ": q_scale and kv_scale must be fp32");
+    AITER_CHECK(static_cast<int64_t>(q_scale->numel()) >= batch &&
+                    static_cast<int64_t>(kv_scale->numel()) >= batch,
+                __func__,
+                ": q_scale and kv_scale must have at least batch elements");
+
+    CFG* config_map = &cfg_mla_asm;
+    std::string kernelName =
+        get_heuristic_kernel_mla("fp8", "fp8", gqa_ratio, 0, 0, 1, max_seqlen_q, arch_id, config_map, 0);
+    AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable gfx1250 kernel");
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> mi400_impl_ptr_map;
+    AiterAsmKernel* impl_ptr = nullptr;
+    auto it                  = config_map->find(kernelName);
+    if(it != config_map->end())
+    {
+        const auto& cfg     = it->second;
+        const char* name    = cfg.knl_name.c_str();
+        const char* co_name = cfg.co_name.c_str();
+        impl_ptr =
+            &mi400_impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
+    }
+    else
+    {
+        AITER_CHECK(false, __func__, " not find kernel ", kernelName);
+    }
+
+    MlaMi400KernelArgs args = {};
+    size_t arg_size         = sizeof(args);
+    args.ptr_R              = splitData->data_ptr();
+    args.ptr_LSE            = splitLse->data_ptr();
+    args.ptr_Q              = Q->data_ptr();
+    args.ptr_KV             = KV->data_ptr();
+    args.ptr_LTP            = kv_indptr->data_ptr();
+    args.ptr_LTD            = kv_page_indices->data_ptr();
+    args.ptr_LTL            = kv_last_page_lens->data_ptr();
+    args.scalar             = softmax_scale;
+    args.q_seq_lens         = max_seqlen_q * gqa_ratio;
+    args.passes             = kv_split;
+    args.stride_Q           = Q->stride(0) * Q->element_size() * max_seqlen_q;
+    args.stride_page        = KV->stride(0) * KV->element_size();
+    args.log2_page          = static_cast<unsigned int>(log2f(static_cast<float>(page_size)));
+    args.ptr_QTP            = qo_indptr->data_ptr();
+    args.ptr_STP            = num_kv_splits_indptr->data_ptr();
+    args.out_16_nosplit     = 0;
+    args.ptr_QROPE          = q_scale->data_ptr();
+    args.ptr_KVROPE         = kv_scale->data_ptr();
+
+    const int gdx = (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
+    const int gdy = batch;
+    const int gdz = kv_split;
+
+    impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, bdx, bdy, bdz, stream});
+}
+
 AITER_C_ITFS
 void mla_decode_stage1_asm_fwd(
     aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
@@ -128,6 +288,32 @@ void mla_decode_stage1_asm_fwd(
     bool persistent = (num_kv_splits_indptr == nullptr);
 
     const HipDeviceGuard device_guard(Q->device_id);
+
+    std::string arch_id = get_gpu_arch();
+    if(arch_id == "gfx1250")
+    {
+        return mla_decode_mi400_dispatch(Q,
+                                         KV,
+                                         qo_indptr,
+                                         kv_indptr,
+                                         kv_page_indices,
+                                         kv_last_page_lens,
+                                         num_kv_splits_indptr,
+                                         work_meta_data,
+                                         work_indptr,
+                                         work_info_set,
+                                         max_seqlen_q,
+                                         page_size,
+                                         nhead_kv,
+                                         softmax_scale,
+                                         splitData,
+                                         splitLse,
+                                         output,
+                                         lse,
+                                         q_scale,
+                                         kv_scale,
+                                         stream);
+    }
 
     int stride_Q       = Q->stride(0) * Q->element_size() * max_seqlen_q;
     int stride_Page    = KV->stride(0) * KV->element_size();
@@ -255,7 +441,6 @@ void mla_decode_stage1_asm_fwd(
         AITER_CHECK(false, __func__, ": unsupport KV dtype:", AiterDtype_to_str(kv_dtype));
 
     // Get kernel using config dispatch
-    std::string arch_id = get_gpu_arch();
     CFG* config_map = &cfg_mla_asm;
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     
