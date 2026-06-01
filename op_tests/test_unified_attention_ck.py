@@ -274,6 +274,204 @@ def ref_paged_attn(
 
 
 # ----------------------------------------------------------------------------
+# PLAN_conditional_rescale Part 1 — realistic-tensor generator (4A) + the
+# rescale-headroom instrument (4B). All gated; default `uniform` keeps the
+# existing randn synthesis bit-identical (Part-1 acceptance criterion).
+# ----------------------------------------------------------------------------
+@dataclass
+class GenConfig:
+    """Knobs for the realistic logit-distribution generator (PLAN §4A).
+
+    `uniform` (default) = today's `torch.randn`, bit-identical. `realistic`
+    post-processes the randn Q/K *before* FP8 quantisation so the quantiser
+    sees realistic activations (matching production)."""
+    logit_dist: str = "uniform"      # "uniform" | "realistic"
+    logit_std: float = 1.0           # gain on Q → per-row logit std ≈ this
+    peak_frac: float = 0.0           # fraction of keys on the shared peak dir
+    peak_gain: float = 0.0           # magnitude added along the peak/sink dir
+    sink_tokens: int = 0             # first-N keys biased up (StreamingLLM)
+
+
+# Module-level generator config; main() overrides from argparse. Kept global
+# so _make_inputs (called deep in the grid loop) reads it without threading a
+# parameter through every call site.
+_GEN = GenConfig()
+
+
+def _apply_realistic_qk_(
+    query: torch.Tensor,        # [total_q, num_q_heads, head_size]
+    key_cache: torch.Tensor,    # [num_blocks, block_size, num_kv_heads, head_size]
+    block_tables: torch.Tensor, # [num_seqs, max_blocks_per_seq]
+    query_lens: List[int],
+    kv_lens: List[int],
+    num_kv_heads: int,
+    gen: GenConfig,
+) -> None:
+    """In-place: reshape the randn Q/K into a realistic, peaked logit
+    distribution. Operates in fp32 then casts back to the source dtype.
+
+    Levers (PLAN §4A): (a) `logit_std` scales Q so every logit scales by the
+    same gain → softmax temperature; (b) `peak_frac`/`peak_gain` add a shared
+    low-rank direction to Q and a fraction of keys → a few systematically
+    high-scoring keys; (c) `sink_tokens` biases the first-N logical keys of
+    each sequence up the Q-mean direction → max concentrated early in stream
+    order (skip-friendly, decode-realistic).
+    """
+    dtype = query.dtype
+    device = query.device
+    head_size = query.shape[-1]
+    num_q_heads = query.shape[1]
+    qpkv = num_q_heads // num_kv_heads
+
+    qf = query.float()
+    kf = key_cache.float()
+
+    # (a) temperature: uniform gain on Q scales all logits by `logit_std`.
+    if gen.logit_std != 1.0:
+        qf *= gen.logit_std
+
+    # (b) shared low-rank "peak" direction per kv head. Adding P·u to Q and to
+    # a fraction F of keys makes those keys' scores ~P² above the random floor.
+    if gen.peak_gain > 0.0 and (gen.peak_frac > 0.0 or gen.sink_tokens > 0):
+        u = torch.randn(num_kv_heads, head_size, device=device)
+        u /= u.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+
+        # add to every query row along its kv group's direction
+        u_q = u.repeat_interleave(qpkv, dim=0)            # [num_q_heads, hd]
+        qf += gen.peak_gain * u_q.unsqueeze(0)
+
+        if gen.peak_frac > 0.0:
+            # boost a random fraction of *physical* key rows per kv head
+            sel = (torch.rand(key_cache.shape[:2] + (num_kv_heads,),
+                              device=device) < gen.peak_frac)  # [nb, bs, kvh]
+            kf += gen.peak_gain * (sel.unsqueeze(-1).float()
+                                   * u.view(1, 1, num_kv_heads, head_size))
+
+    # (c) attention sinks: bias the first-N logical keys of each sequence up
+    # the Q-mean direction. Maps logical→physical via block_tables so the
+    # bias lands on the pages the kernel actually reads.
+    if gen.sink_tokens > 0 and gen.peak_gain > 0.0:
+        bs = key_cache.shape[1]
+        # per-kv-head mean query direction (unit)
+        qmean = qf.mean(dim=0)                              # [num_q_heads, hd]
+        qmean = qmean.view(num_kv_heads, qpkv, head_size).mean(dim=1)
+        qmean /= qmean.norm(dim=-1, keepdim=True).clamp_min(1e-9)  # [kvh, hd]
+        bt = block_tables.cpu().numpy()
+        for i, kv_len in enumerate(kv_lens):
+            n_sink = min(gen.sink_tokens, kv_len)
+            for j in range(n_sink):
+                page = int(bt[i, j // bs])
+                off = j % bs
+                kf[page, off] += gen.peak_gain * qmean
+
+    query.copy_(qf.to(dtype))
+    key_cache.copy_(kf.to(dtype))
+
+
+def _rescale_headroom(
+    inputs: dict,
+    cfg: CaseConfig,
+    taus: Tuple[float, ...] = (0.0, 4.0, 8.0, 12.0),
+    block_n: int = 128,
+    sample_rows: int = 64,
+) -> dict:
+    """PLAN §4B: pure-Python replay of the online-softmax running-max
+    trajectory in the kernel's block/streaming order. No kernel involvement.
+
+    For a sample of query rows it walks K in blocks of `block_n`, tracking the
+    running max `m` and a committed max `m_commit`; a rescale "triggers" when
+    `m - m_commit > τ` (FA4's conditional-rescale predicate). skip_ratio(τ) =
+    1 - triggers/num_blocks is the predicted rescale-skip headroom. τ=0
+    reproduces today's always-rescale baseline. Also reports softmax entropy /
+    effective #attended-keys and per-row max-logit / logit-std to confirm the
+    distribution is realistic and non-degenerate."""
+    device = inputs["query"].device
+    query = inputs["query"].float()
+    key_cache = inputs["key_cache"].float()
+    scale = inputs["scale"]
+    query_lens = inputs["query_lens"]
+    kv_lens = inputs["kv_lens_list"]
+    block_tables = inputs["block_tables"].cpu().numpy()
+    _, bs, num_kv_heads, head_size = key_cache.shape
+    num_q_heads = query.shape[1]
+    qpkv = num_q_heads // num_kv_heads
+
+    trig = {t: 0 for t in taus}
+    total_blocks = 0
+    eff_keys_acc = 0.0
+    maxlogit_acc = 0.0
+    logitstd_acc = 0.0
+    n_rows = 0
+
+    start = 0
+    for i, (qlen, kv_len) in enumerate(zip(query_lens, kv_lens)):
+        num_kv_blocks = (kv_len + bs - 1) // bs
+        idx = block_tables[i, :num_kv_blocks]
+        k = key_cache[idx].reshape(-1, num_kv_heads, head_size)[:kv_len]  # [kv,kvh,hd]
+
+        # sample query rows spread across the sequence (cheap + representative)
+        rows = torch.linspace(0, qlen - 1, min(sample_rows, qlen),
+                              device=device).round().long().unique()
+        for h in range(num_q_heads):
+            kh = h // qpkv
+            q_rows = query[start + rows, h]                     # [R, hd]
+            kk = k[:, kh]                                       # [kv, hd]
+            logits = (q_rows @ kk.t()) * scale                 # [R, kv]
+
+            # bottom-right causal + SWA window per sampled row
+            for r_i, q_idx in enumerate(rows.tolist()):
+                center = q_idx + (kv_len - qlen)               # mask_type=2 anchor
+                lo = 0
+                hi = center + 1
+                if cfg.window_size_left >= 0:
+                    lo = max(0, center - cfg.window_size_left)
+                wr = cfg.window_size_right
+                if cfg.mask_type != 0 and wr < 0:
+                    wr = 0
+                if wr >= 0:
+                    hi = min(kv_len, center + wr + 1)
+                if hi <= lo:
+                    continue
+                row = logits[r_i, lo:hi]                        # valid logits, fp32
+
+                # distribution stats
+                p = torch.softmax(row, dim=-1)
+                ent = -(p * (p.clamp_min(1e-30)).log()).sum()
+                eff_keys_acc += float(torch.exp(ent))
+                maxlogit_acc += float(row.max())
+                logitstd_acc += float(row.std()) if row.numel() > 1 else 0.0
+                n_rows += 1
+
+                # running-max trajectory in block_n streaming order
+                nb = (row.numel() + block_n - 1) // block_n
+                total_blocks += nb
+                m = float("-inf")
+                m_commit = {t: float("-inf") for t in taus}
+                for b in range(nb):
+                    blk = row[b * block_n:(b + 1) * block_n]
+                    bmax = float(blk.max())
+                    m = max(m, bmax)
+                    for t in taus:
+                        if m - m_commit[t] > t:
+                            trig[t] += 1
+                            m_commit[t] = m
+        start += qlen
+
+    n_rows = max(n_rows, 1)
+    total_blocks = max(total_blocks, 1)
+    return {
+        "eff_keys": eff_keys_acc / n_rows,
+        "max_logit": maxlogit_acc / n_rows,
+        "logit_std": logitstd_acc / n_rows,
+        "sampled_rows": n_rows,
+        "total_blocks": total_blocks,
+        "block_n": block_n,
+        "triggers": {t: trig[t] for t in taus},
+        "skip_ratio": {t: 1.0 - trig[t] / total_blocks for t in taus},
+    }
+
+
+# ----------------------------------------------------------------------------
 # Input synthesis. Mirrors the Triton test exactly so the same inputs feed
 # both backends and the reference.
 # ----------------------------------------------------------------------------
@@ -308,6 +506,15 @@ def _make_inputs(cfg: CaseConfig, device: str, seed: int):
         (num_seqs, max_num_blocks_per_seq),
         dtype=torch.int32, device=device,
     )
+
+    # PLAN §4A: reshape randn Q/K into a realistic peaked distribution BEFORE
+    # FP8 quant (so the quantiser sees realistic activations). Default
+    # `uniform` is a no-op → bit-identical to the pre-Part-1 path.
+    if _GEN.logit_dist == "realistic":
+        _apply_realistic_qk_(
+            query, key_cache, block_tables, query_lens, kv_lens,
+            num_kv_heads, _GEN,
+        )
 
     # FP8 quantisation: per-tensor symmetric, matching Triton test.
     q_descale = k_descale = v_descale = 1.0
@@ -1050,7 +1257,44 @@ def main():
     parser.add_argument("--swa-filter", type=str, default=None,
                         help="Substring filter on the SWA fixture name "
                              "(used with --swa-fixtures).")
+    # PLAN_conditional_rescale Part 1 (§4A/4B): realistic-logit generator +
+    # rescale-headroom instrument. All default to today's behaviour.
+    parser.add_argument("--logit-dist", choices=["uniform", "realistic"],
+                        default="uniform",
+                        help="Q/K synthesis distribution. 'uniform' (default) "
+                             "= randn, bit-identical to pre-Part-1. "
+                             "'realistic' = peaked softmax (PLAN §4A).")
+    parser.add_argument("--logit-std", type=float, default=1.0,
+                        help="realistic: gain on Q so per-row logit std ≈ this "
+                             "(softmax temperature). 1 = random baseline.")
+    parser.add_argument("--peak-frac", type=float, default=0.0,
+                        help="realistic: fraction of keys placed on a shared "
+                             "high-scoring direction (peaked softmax).")
+    parser.add_argument("--peak-gain", type=float, default=0.0,
+                        help="realistic: magnitude added along the peak/sink "
+                             "direction.")
+    parser.add_argument("--sink-tokens", type=int, default=0,
+                        help="realistic: bias the first-N logical keys of each "
+                             "sequence up the Q-mean direction (attention "
+                             "sinks; needs --peak-gain).")
+    parser.add_argument("--headroom", action="store_true",
+                        help="PLAN §4B: run the pure-Python rescale-headroom "
+                             "instrument over the selected shapes (no kernel) "
+                             "and print the skip-ratio table, then exit.")
+    parser.add_argument("--headroom-taus", type=str, default="0,4,8,12",
+                        help="Comma-separated τ thresholds for --headroom "
+                             "(default 0,4,8,12; τ=0 = always-rescale).")
+    parser.add_argument("--headroom-blockn", type=int, default=128,
+                        help="K-tile width for the --headroom running-max "
+                             "replay (kernel KV-tile; default 128).")
     args = parser.parse_args()
+
+    global _GEN
+    _GEN = GenConfig(
+        logit_dist=args.logit_dist, logit_std=args.logit_std,
+        peak_frac=args.peak_frac, peak_gain=args.peak_gain,
+        sink_tokens=args.sink_tokens,
+    )
 
     if args.quick:
         num_heads_cfg  = QUICK_NUM_HEADS
@@ -1126,6 +1370,56 @@ def main():
         args.window if args.window else [(-1, -1)]
     )
     mask_types   = args.mask_type if args.mask_type else [2]
+
+    # ---- PLAN §4B: rescale-headroom instrument (analysis-only, no kernel) ---
+    if args.headroom:
+        taus = tuple(float(x) for x in args.headroom_taus.split(","))
+        hrows = []
+        for seq_lens in seq_lens_grid:
+            for nh in num_heads_cfg:
+                for hd in head_sizes:
+                    for bs in block_sizes:
+                        for (dt, qd) in dtype_pairs:
+                            for nb in num_blocks_lst:
+                                for mt in mask_types:
+                                    for (wl, wr) in window_pairs:
+                                        cfg = CaseConfig(
+                                            seq_lens, nh, hd, bs, dt, qd, nb,
+                                            mask_type=mt, window_size_left=wl,
+                                            window_size_right=wr,
+                                        )
+                                        inp = _make_inputs(cfg, "cuda", args.seed)
+                                        h = _rescale_headroom(
+                                            inp, cfg, taus=taus,
+                                            block_n=args.headroom_blockn,
+                                        )
+                                        row = {
+                                            "shape": f"b{len(seq_lens)} "
+                                                     f"sq{seq_lens[0][0]} "
+                                                     f"sk{seq_lens[0][1]}",
+                                            "heads": f"{nh[0]}/{nh[1]}",
+                                            "hd": hd, "dtype": str(dt).split('.')[-1]
+                                                     + ("+fp8" if qd else ""),
+                                            "dist": _GEN.logit_dist,
+                                            "std": _GEN.logit_std,
+                                            "eff_keys": round(h["eff_keys"], 1),
+                                            "max_logit": round(h["max_logit"], 2),
+                                            "logit_std": round(h["logit_std"], 2),
+                                        }
+                                        for t in taus:
+                                            row[f"skip@τ{t:g}"] = (
+                                                f"{100*h['skip_ratio'][t]:.1f}%"
+                                            )
+                                        hrows.append(row)
+                                        gc.collect()
+                                        torch.cuda.empty_cache()
+        df = pd.DataFrame(hrows)
+        aiter.logger.info(
+            "rescale-headroom (PLAN §4B; block_n=%d, skip%%=predicted "
+            "rescales avoided vs always-rescale):\n%s",
+            args.headroom_blockn, df.to_markdown(index=False),
+        )
+        return
 
     rows = []
     # ---- Curated SWA fixture mode -----------------------------------------

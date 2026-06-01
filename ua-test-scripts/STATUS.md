@@ -1395,6 +1395,66 @@ HEADs.
 
 ---
 
+## PLAN_conditional_rescale Part 1 — realistic generator + headroom instrument (2026-06-01)
+
+Landed Part 1 (4A/4B/4C) in `op_tests/test_unified_attention_ck.py`,
+**no kernel changes**, all gated (default `--logit-dist uniform` =
+bit-identical randn; `uniform` correctness PASS confirms no perturbation).
+
+**4A realistic generator** (`_apply_realistic_qk_`, gated in `_make_inputs`
+*before* FP8 quant): `--logit-std G` (uniform Q gain → per-row logit std),
+`--peak-frac/-gain` (shared low-rank peaked keys), `--sink-tokens N`
+(StreamingLLM front-bias, paged-mapped). Generator validated: per-row
+logit std tracks the knob exactly (3.96/7.9/11.84 at G=4/8/12) and
+`eff_keys` collapses 622→2.1.
+
+**4B headroom instrument** (`_rescale_headroom`, `--headroom`): pure-Python
+running-max replay in the kernel's block_n streaming order; reports
+entropy/eff-keys, max-logit, logit-std, and rescale **skip-ratio at
+τ∈{0,4,8,12}** (τ=0 = today's always-rescale).
+
+**4C calibration (skip% @ block_n=128):**
+| shape | dist | std | eff_keys | skip@τ0 | skip@τ4 | skip@τ8 | skip@τ12 |
+|---|---|---|---|---|---|---|---|
+| prefill b2 sq=sk=2048 | uniform   | 1  | 622 | 71.7 | 88.2 | 88.2 | 88.2 |
+| prefill b2 sq=sk=2048 | realistic | 4  | 14.6| 72.2 | 85.9 | 88.1 | 88.2 |
+| prefill b2 sq=sk=2048 | realistic | 8  | 3.2 | 72.0 | 81.8 | 85.9 | 87.7 |
+| prefill b2 sq=sk=2048 | realistic | 12 | 2.1 | 71.9 | 79.8 | 83.6 | 85.9 |
+| decode  b8 sq1 sk16384| uniform   | 1  | 9975| 96.0 | 99.2 | 99.2 | 99.2 |
+| decode  b8 sq1 sk16384| realistic | 8  | 4.5 | 96.0 | 98.1 | 98.6 | 98.9 |
+
+**Go/no-go → GO for Part 2:**
+- **High headroom even when peaked:** ~84-88% of output rescales skippable
+  at τ=8 in prefill, ~99% in decode, robust across the realistic std range.
+- **Random is unrepresentative for τ-tuning (PLAN's core hypothesis,
+  confirmed):** `uniform`'s τ-curve is *flat* (88.2% at τ4=τ8=τ12) — it
+  never exercises the threshold knee; `realistic` std≥4 shows a genuine τ
+  slope (the accuracy/perf knee), so τ must be tuned on realistic inputs.
+- **Rescale path IS exercised** (~12-16% prefill, ~1-4% decode triggers) →
+  the deferred-stat bookkeeping won't go untested in Part 2. The non-zero
+  τ=0 trigger floor is the *mandatory first-block-per-row* max-establish
+  (skip can't reach 100%), strongest in short causal rows → caps prefill
+  skip below decode's.
+- **Bounded ceiling reminder:** the rescale tail `T_D` is only part of the
+  ~12% barrier-wait budget (rocprof §), so expect a low-single-digit %
+  kernel win despite the large skippable fraction.
+
+**Calibration recommendation for §5C:** bf16 is the correctness oracle
+(PASSES at every std — no quant); **use std≈8** (eff_keys≈3, trained-attn
+realistic, clear τ knee). **FP8 cannot be strict-correctness-gated under
+peaking:** the fp8 *codes* are scale-invariant (per-tensor descale absorbs
+the Q gain), but as the softmax sharpens the fp8 logit-quant error stops
+averaging over keys and the output error grows past the bf16-derived
+atol=0.15 (fails by std=2). This is inherent fp8 lossiness on peaked
+attention, not a kernel/generator bug — so benchmark FP8 perf with
+`--no-reference` and gate correctness on bf16, exactly as PLAN §5B advises.
+
+Still open (Part 1 polish): wire a couple of these cells into
+`sweep_amir_shapes.py` (§4C "rides existing sweep tooling") — deferred,
+the `--headroom` CLI already covers ad-hoc runs.
+
+---
+
 ## Open / parked items
 
 * **Hoisted SGPR-ring prefetch (Tier-0 → moved before `fmha_alu1`).** Tried
