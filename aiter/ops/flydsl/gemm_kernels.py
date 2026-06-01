@@ -17,6 +17,7 @@ import flydsl.expr as fx
 import flydsl.compiler as flyc
 from aiter import logger
 from flydsl.runtime.device import get_rocm_arch
+from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 from aiter.jit.utils.chip_info import get_gfx
 
@@ -85,7 +86,7 @@ def _ptr_view_safe(t: torch.Tensor):
 HGEMM_TILE_N_OPTIONS = (64, 128, 256)
 HGEMM_TILE_K_OPTIONS = (64, 128, 256)
 HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 96, 128, 256)
-HGEMM_STAGE_OPTIONS = tuple([i for i in range(2, 33)])
+HGEMM_STAGE_OPTIONS = tuple([i for i in range(2, 9)])
 HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 14))
 HGEMM_MAX_SPLIT_K = 13
 HGEMM_WARP_SHAPE_OPTIONS = [
@@ -329,92 +330,20 @@ def selection_filter(m, n, k, kwargs):
     BLOCK_N_WARPS = kwargs["BLOCK_N_WARPS"]
     BLOCK_K_WARPS = kwargs["BLOCK_K_WARPS"]
     B_TO_LDS = kwargs.get("B_TO_LDS", True)
-    if BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS > 16:
-        return False
-    if TILE_M * TILE_N * TILE_K > 256 * 256 * 64:
-        return False
-    if (TILE_M == 256) and (TILE_N == 256):
-        if not ((TILE_K == 64) and (SPLIT_K == 1) and (STAGES == 2)):
-            return False
-    N_BLOCKS = n // TILE_N
-    if not ((N_BLOCKS >= 1) and (n % TILE_N == 0)):
-        return False
-    BLOCK_K = TILE_K
-    if not ((k % SPLIT_K == 0) and (k // SPLIT_K >= 1)):
-        return False
-    ks = k // SPLIT_K
-    if not ((ks % BLOCK_K == 0) and (ks // BLOCK_K >= 1)):
-        return False
     GPU_ARCH = get_rocm_arch()
-    BLOCK_K_LOOPS = ks // BLOCK_K
-    if not (BLOCK_K_LOOPS >= STAGES):
-        return False
-    WARP_ATOM_K = 16 if GPU_ARCH == "gfx942" else 32
-    WARP_SIZE = 64
-    WARP_ATOM_M = 16
-    WARP_ATOM_N = 16
-    WARP_GROUP_K = BLOCK_K_WARPS * WARP_ATOM_K
-    WARP_K_STEPS = BLOCK_K // WARP_GROUP_K
-    if not ((BLOCK_K % WARP_GROUP_K == 0) and (WARP_K_STEPS >= 1)):
-        return False
-    K_SLICE = BLOCK_K // BLOCK_K_WARPS
-    if not (K_SLICE % WARP_ATOM_K == 0):
-        return False
-    WARP_M_STEPS = TILE_M // BLOCK_M_WARPS // WARP_ATOM_M
-    WARP_N_STEPS = TILE_N // BLOCK_N_WARPS // WARP_ATOM_N
-    if not ((WARP_M_STEPS >= 1) and (WARP_N_STEPS >= 1)):
-        return False
-    if not (TILE_M % (BLOCK_M_WARPS * WARP_ATOM_M) == 0):
-        return False
-    if not (TILE_N % (BLOCK_N_WARPS * WARP_ATOM_N) == 0):
-        return False
-    WARP_M = WARP_M_STEPS * WARP_ATOM_M
-    WARP_N = WARP_N_STEPS * WARP_ATOM_N
-    BLOCK_M = BLOCK_M_WARPS * WARP_M
-    BLOCK_N = BLOCK_N_WARPS * WARP_N
-    if not ((n >= BLOCK_N) and (n % BLOCK_N == 0)):
-        return False
     DTYPE_BYTES = 2
 
     def get_stage_smem_use(stages_):
-        SMEM_USE = stages_ * BLOCK_M * BLOCK_K * DTYPE_BYTES
+        SMEM_USE = stages_ * TILE_M * TILE_K * DTYPE_BYTES
         if B_TO_LDS:
-            SMEM_USE += stages_ * BLOCK_N * BLOCK_K * DTYPE_BYTES
-        SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * BLOCK_M * BLOCK_N * DTYPE_BYTES)
+            SMEM_USE += stages_ * TILE_N * TILE_K * DTYPE_BYTES
+        SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * TILE_M * TILE_N * DTYPE_BYTES)
         return SMEM_USE
 
     smem_use_s0 = get_stage_smem_use(STAGES)
-    smem_use_s1 = get_stage_smem_use(STAGES + 2)
-    smem_cap = get_shared_memory_per_block(fallback_gfx=get_gfx())
-    if not (smem_use_s0 <= smem_cap and smem_use_s1 > smem_cap):
-        return False
-    LDG_VEC_SIZE = 8
-    BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE
-    BLOCK_VECS = LDG_VEC_SIZE * BLOCK_THREADS
-    BLOCK_MK_SIZE = BLOCK_M * BLOCK_K
-    BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
-    BLOCK_MN_SIZE = BLOCK_M * BLOCK_N
-    LDG_REG_A_COUNT = BLOCK_MK_SIZE // BLOCK_VECS
-    LDG_REG_B_COUNT = BLOCK_NK_SIZE // BLOCK_VECS
-    LDG_REG_C_COUNT = BLOCK_MN_SIZE // BLOCK_VECS
-    valid = (LDG_REG_A_COUNT >= 1) and (LDG_REG_B_COUNT >= 1) and (LDG_REG_C_COUNT >= 1)
-    valid = valid and (BLOCK_MK_SIZE % BLOCK_VECS == 0)
-    valid = valid and (BLOCK_NK_SIZE % BLOCK_VECS == 0)
-    valid = valid and (BLOCK_MN_SIZE % BLOCK_VECS == 0)
-    DMA_BYTES = 4 if GPU_ARCH == "gfx942" else 16
-    LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
-    LDG_REG_A_COUNT_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
-    LDG_REG_B_COUNT_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
-    LDG_WAIT_COUNT = LDG_REG_B_COUNT_AS + LDG_REG_A_COUNT_AS
-    valid = valid and (((STAGES - 2) * LDG_WAIT_COUNT) < 63)
-    if not valid:
-        return False
-    bm = (m + BLOCK_M - 1) // BLOCK_M
-    bn = n // BLOCK_N
-    work = bm * bn * BLOCK_M * BLOCK_N
-    useful = m * n
-    efficienty = float(useful) / float(work)
-    if efficienty < 0.5:
+    # smem_use_s1 = get_stage_smem_use(STAGES + 3)
+    smem_cap = SMEM_CAPACITY_MAP[GPU_ARCH]
+    if not (smem_use_s0 <= smem_cap):
         return False
     if m >= 4096 and n >= 4096 and k >= 4096:
         if not (
