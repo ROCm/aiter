@@ -41,7 +41,9 @@ def _div_pow2(val, divisor):
     """
     shift = _math.log2(divisor)
     assert shift == int(shift), f"{divisor} is not a power of 2"
-    return arith.shrui(val, arith.index(int(shift)))
+    # _to_raw is identity for raw ir.Value (byte-identical for existing callers)
+    # and unwraps fx Numerics, so callers may pass either.
+    return arith.shrui(arith._to_raw(val), arith.index(int(shift)))
 
 
 def _mod_pow2(val, modulus):
@@ -49,7 +51,7 @@ def _mod_pow2(val, modulus):
 
     Emits ``arith.andi`` (1 VALU cycle) instead of ``arith.remui``.
     """
-    return arith.andi(val, arith.index(modulus - 1))
+    return arith.andi(arith._to_raw(val), arith.index(modulus - 1))
 
 
 def _parse_dim(tok):
@@ -81,6 +83,7 @@ def idx2crd(idx, layout):
     Power-of-2 strides/shapes use shift/mask instead of div/rem.
     For dynamic layouts, falls back to fx.idx2crd + fx.get.
     """
+    idx = arith._to_raw(idx)  # accept fx Numerics; identity for raw ir.Value
     parsed = _parse_layout(layout)
 
     if parsed is None or _has_dynamic_strides(parsed[1]):
@@ -131,6 +134,7 @@ def crd2idx(crd, layout):
     """
     if not isinstance(crd, (list, tuple)):
         crd = [crd]
+    crd = [arith._to_raw(c) for c in crd]  # accept fx Numerics; identity for raw
     parsed = _parse_layout(layout)
 
     if parsed is None or _has_dynamic_strides(parsed[1]):
