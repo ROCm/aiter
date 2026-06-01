@@ -1528,7 +1528,13 @@ def compile_ops(
                             sub_t = typing.get_args(expected_type)
 
                             if origin is None:
-                                if not isinstance(arg, expected_type) and not (
+                                # Accept aiter_tensor_t wherever torch.Tensor is expected
+                                _ok = isinstance(arg, expected_type) or (
+                                    expected_type is torch.Tensor
+                                    and aiter_tensor_t is not object
+                                    and isinstance(arg, aiter_tensor_t)
+                                )
+                                if not _ok and not (
                                     any(el in str(expected_type) for el in enum_types)
                                     and isinstance(arg, int)
                                 ):
@@ -1607,7 +1613,8 @@ def compile_ops(
                     return True
 
                 # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
-                if develop:
+                # Guard: only wrap if the module supports aiter_tensor_t (has _set_current_hip_stream)
+                if develop and hasattr(module, "_set_current_hip_stream"):
                     import torch
 
                     from ..utility.dtypes import torch_to_aiter_pybind
@@ -1633,7 +1640,7 @@ def compile_ops(
 
                     log_args(func, *args, **kwargs)
 
-                if develop:
+                if develop and hasattr(module, "_set_current_hip_stream"):
                     module._set_current_hip_stream(
                         torch.cuda.current_stream().cuda_stream
                     )
