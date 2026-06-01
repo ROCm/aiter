@@ -202,6 +202,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         x_pad_to_multiple: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from aiter.dist.device_communicators.custom_all_reduce import (
+            can_pack_2d_last_dim_slice,
             is_weak_contiguous,
         )
 
@@ -260,7 +261,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             can_use_custom_ar
             and not input_is_weak_contiguous
             and residual_is_weak_contiguous
-            and input_.stride(-1) == 1
+            and can_pack_2d_last_dim_slice(input_)
             and ca_comm.should_custom_ar_bytes(input_, prefill_support)
         ):
             out, res_out = ca_comm.custom_fused_ar_rms_packed_input(
@@ -288,17 +289,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # or when custom all-reduce is unavailable for padded outputs.
             # Fall back to all-reduce + Triton RMSNorm so callers can pass strided
             # inputs/residuals and optionally request a padded output width.
+            # The Triton kernel is 2-D, so flatten leading dims before launch and
+            # restore the original batch shape on return.
             from aiter.ops.triton.normalization.fused_add_rmsnorm_pad import (
                 fused_add_rmsnorm_pad,
             )
 
-            out, residual_out = fused_add_rmsnorm_pad(
-                ar_out,
+            ar_out_2d = ar_out.reshape(-1, ar_out.shape[-1])
+            res_inp_2d = res_inp_.reshape(-1, res_inp_.shape[-1])
+            out_2d, residual_out_2d = fused_add_rmsnorm_pad(
+                ar_out_2d,
                 weight_,
                 eps,
-                res_inp_,
+                res_inp_2d,
                 x_pad_to_multiple=x_pad_to_multiple,
             )
+            out = out_2d.reshape(input_.shape[:-1] + (out_2d.shape[-1],))
+            residual_out = residual_out_2d.reshape(res_inp_.shape)
             return out, residual_out
 
         # call split kernel

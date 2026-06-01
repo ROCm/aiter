@@ -46,6 +46,21 @@ def is_weak_contiguous(inp: torch.Tensor):
     )
 
 
+def can_pack_2d_last_dim_slice(inp: torch.Tensor) -> bool:
+    """Mirror the C++ eager-mode packable-layout check.
+
+    The registered-buffer pack path only supports 2-D last-dim slices where
+    each row is dense but rows may have extra pitch. Keep this predicate in
+    sync with ``_can_pack_2d_last_dim_slice`` in
+    ``csrc/kernels/custom_all_reduce.cu`` so Python only routes layouts that
+    the C++ copy helper can materialize safely.
+    """
+    if inp.dim() != 2:
+        return False
+    n = inp.size(-1)
+    return inp.stride(-1) == 1 and inp.stride(0) >= n and not inp.is_contiguous()
+
+
 # Wavefront width on AMD CDNA / gfx94x / gfx950. ``__shfl_xor`` in the
 # fused per-group FP8 quant epilogue is scoped to a single wavefront, so
 # ``threads_per_group = group_size / PACK_SIZE`` must fit inside it.

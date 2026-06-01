@@ -387,10 +387,10 @@ def test_fused_ar_rmsnorm(
 
 
 def _make_strided_lastdim_view(x: torch.Tensor, extra_cols: int = 32) -> torch.Tensor:
-    m, n = x.shape
-    base = torch.empty((m, n + extra_cols), dtype=x.dtype, device=x.device)
-    base[:, :n].copy_(x)
-    return base[:, :n]
+    *prefix, n = x.shape
+    base = torch.empty((*prefix, n + extra_cols), dtype=x.dtype, device=x.device)
+    base[..., :n].copy_(x)
+    return base[..., :n]
 
 
 def fused_ar_rmsnorm_pad_stride(
@@ -555,7 +555,7 @@ def test_fused_ar_rmsnorm_pad_stride_case(
     max_res_err = 0.0
     expected_n = ref_out.shape[-1]
     for out, res_out in rets:
-        assert out.shape == (shape[0], expected_n)
+        assert out.shape == shape[:-1] + (expected_n,)
         assert res_out.shape == shape
         err = checkAllclose(
             ref_out,
@@ -721,6 +721,46 @@ try:
             shape=(13, 2880),
             dtype=dtypes.d_dtypes["bf16"],
             input_storage_width=3072,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
+        assert ret["err"] < 5e-2, f"fused_ar_rmsnorm err={ret['err']} config={ret}"
+        assert (
+            ret["res_err"] < 5e-2
+        ), f"fused_ar_rmsnorm residual err={ret['res_err']} config={ret}"
+
+    def test_large_padded_output_tp2():
+        if torch.cuda.device_count() < 2:
+            pytest.skip(f"requires >= 2 GPUs (have {torch.cuda.device_count()})")
+        ret = test_fused_ar_rmsnorm_pad_stride_case(
+            tp_size=2,
+            pp_size=1,
+            shape=(13, 4096),
+            dtype=dtypes.d_dtypes["bf16"],
+            x_pad_to_multiple=16384,
+            input_strided=False,
+            residual_strided=False,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
+        assert ret["err"] < 5e-2, f"fused_ar_rmsnorm err={ret['err']} config={ret}"
+        assert (
+            ret["res_err"] < 5e-2
+        ), f"fused_ar_rmsnorm residual err={ret['res_err']} config={ret}"
+
+    def test_strided_nd_input_tp2():
+        if torch.cuda.device_count() < 2:
+            pytest.skip(f"requires >= 2 GPUs (have {torch.cuda.device_count()})")
+        ret = test_fused_ar_rmsnorm_pad_stride_case(
+            tp_size=2,
+            pp_size=1,
+            shape=(3, 13, 2880),
+            dtype=dtypes.d_dtypes["bf16"],
+            x_pad_to_multiple=0,
+            input_strided=True,
+            residual_strided=False,
             distributed_init_method=get_distributed_init_method(
                 get_ip(), get_open_port()
             ),

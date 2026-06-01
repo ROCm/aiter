@@ -1347,10 +1347,10 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                 *(reinterpret_cast<P*>(residual_out) + read_idx)    = rmsnorm_inp;
             }
         }
-        if(tail_pack_count > 0 && threadIdx.x < tail_pack_count)
+        for(int tail_offset = threadIdx.x; tail_offset < tail_pack_count; tail_offset += blockDim.x)
         {
             P zero_pack{};
-            int tail_idx = bid * out_pack_count + in_pack_count + threadIdx.x;
+            int tail_idx = bid * out_pack_count + in_pack_count + tail_offset;
             *(reinterpret_cast<P*>(results) + tail_idx) = zero_pack;
         }
     }
