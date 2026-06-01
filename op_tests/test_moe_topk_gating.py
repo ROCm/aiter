@@ -95,20 +95,31 @@ def _count_routing_mismatches(
     created by the bias bringing two experts' biased scores nearly equal.
     """
     debug = os.environ.get("TOPK_TIE_DEBUG", "0") != "0"
-    sorted_sel, _ = sel_scores.sort(dim=-1, descending=True)
+    # Copy small tensors to CPU once to avoid per-token CUDA syncs.
+    i_fused_cpu = i_fused.cpu()
+    i_torch_cpu = i_torch.cpu()
+    sel_cpu = sel_scores.cpu()
+    sorted_sel, _ = sel_cpu.sort(dim=-1, descending=True)
     cutoff = sorted_sel[:, topk - 1]  # k-th largest selection score per token
     has_bias = bias is not None and bias.numel() > 0
+    bias_cpu = bias.cpu() if has_bias else None
     mism = 0
-    for t in range(i_fused.shape[0]):
-        kset = set(i_fused[t].tolist())
-        rset = set(i_torch[t].tolist())
-        if kset == rset:
+    for t in range(i_fused_cpu.shape[0]):
+        fused_row = i_fused_cpu[t].tolist()
+        torch_row = i_torch_cpu[t].tolist()
+        kset = set(fused_row)
+        rset = set(torch_row)
+        # Duplicate expert IDs collapse in set(); treat as real mismatch.
+        if kset == rset and len(kset) == topk:
             continue
         thr = cutoff[t].item()
         extra = kset - rset  # kernel picked, ref didn't -> must be >= thr - tol
         missing = rset - kset  # ref picked, kernel didn't -> must be <= thr + tol
-        excused = all(sel_scores[t, e].item() >= thr - tol for e in extra) and all(
-            sel_scores[t, e].item() <= thr + tol for e in missing
+        excused = (
+            len(kset) == topk
+            and len(rset) == topk
+            and all(sel_cpu[t, e].item() >= thr - tol for e in extra)
+            and all(sel_cpu[t, e].item() <= thr + tol for e in missing)
         )
         if not excused:
             mism += 1
@@ -116,8 +127,8 @@ def _count_routing_mismatches(
         if debug:
 
             def _fmt(e):
-                sel = sel_scores[t, e].item()
-                b = float(bias[e]) if has_bias else 0.0
+                sel = sel_cpu[t, e].item()
+                b = float(bias_cpu[e]) if has_bias else 0.0
                 return (
                     f"      expert {e:4d}: f(x)={sel - b:+.7f}  bias={b:+.7f}  "
                     f"f(x)+bias={sel:+.7f}  gap_to_cutoff={sel - thr:+.2e}"
@@ -134,10 +145,9 @@ def _count_routing_mismatches(
             print("    ref-only (picked by torch, not fused):")
             for e in sorted(missing):
                 print(_fmt(e))
-            # biased-score gap between the swapped experts (the actual tie size)
             for ek in sorted(extra):
                 for er in sorted(missing):
-                    d = abs(sel_scores[t, ek].item() - sel_scores[t, er].item())
+                    d = abs(sel_cpu[t, ek].item() - sel_cpu[t, er].item())
                     print(
                         f"    |f(x)+bias gap| between kernel#{ek} and ref#{er} = {d:.2e}"
                     )
@@ -339,7 +349,7 @@ def _make_gating(num_experts, num_tokens, dtype):
         .to(dtype=dtype, device="cuda")
     )
     permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
-    return torch.gather(gating_output, dim=-1, index=permutation)
+    return torch.gather(gating_output, dim=-1, index=permutation).contiguous()
 
 
 def benchmark_topk_softplus(
