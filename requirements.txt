@@ -6,4 +6,5 @@ pyyaml
 einops
 pybind11>=3.0.1
 ninja
-flydsl==0.1.9.dev599
+--find-links https://rocm.frameworks-devreleases.amd.com/whl/gfx942-gfx950/flydsl/
+flydsl==0.1.9.dev20260529+d7ae22d
