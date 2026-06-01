@@ -297,20 +297,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
         b_slot = smem_B.index(slot)
         as_slot = smem_AS.index(slot)
         bs_slot = smem_BS.index(slot)
-        gl.amd.gfx1250.tdm.async_load(a_desc, [0, 0], a_slot)
-        gl.amd.gfx1250.tdm.async_load(b_desc, [0, 0], b_slot)
-        gl.amd.gfx1250.tdm.async_load(as_desc, [0, 0], as_slot)
-        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, 0], bs_slot)
-        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_desc, [0, BLOCK_K_BYTES])
-        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            b_desc, [0, BLOCK_K_BYTES * 16]
-        )
-        as_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            as_desc, [0, K_GROUPS * PRESHUFFLE_FACTOR]
-        )
-        bs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            bs_desc, [0, K_GROUPS * PRESHUFFLE_FACTOR]
-        )
+        off_a = load_idx * BLOCK_K_BYTES
+        off_b = load_idx * BLOCK_K_BYTES * 16
+        off_s = load_idx * K_GROUPS * PRESHUFFLE_FACTOR
+        gl.amd.gfx1250.tdm.async_load(a_desc, [0, off_a], a_slot)
+        gl.amd.gfx1250.tdm.async_load(b_desc, [0, off_b], b_slot)
+        gl.amd.gfx1250.tdm.async_load(as_desc, [0, off_s], as_slot)
+        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, off_s], bs_slot)
         load_idx += 1
 
     # --- 2. Pre-load tile 0 from LDS into registers ---
@@ -343,20 +336,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
         b_slot = smem_B.index(slot)
         as_slot = smem_AS.index(slot)
         bs_slot = smem_BS.index(slot)
-        gl.amd.gfx1250.tdm.async_load(a_desc, [0, 0], a_slot)
-        gl.amd.gfx1250.tdm.async_load(b_desc, [0, 0], b_slot)
-        gl.amd.gfx1250.tdm.async_load(as_desc, [0, 0], as_slot)
-        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, 0], bs_slot)
-        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_desc, [0, BLOCK_K_BYTES])
-        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            b_desc, [0, BLOCK_K_BYTES * 16]
-        )
-        as_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            as_desc, [0, K_GROUPS * PRESHUFFLE_FACTOR]
-        )
-        bs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            bs_desc, [0, K_GROUPS * PRESHUFFLE_FACTOR]
-        )
+        off_a = load_idx * BLOCK_K_BYTES
+        off_b = load_idx * BLOCK_K_BYTES * 16
+        off_s = load_idx * K_GROUPS * PRESHUFFLE_FACTOR
+        gl.amd.gfx1250.tdm.async_load(a_desc, [0, off_a], a_slot)
+        gl.amd.gfx1250.tdm.async_load(b_desc, [0, off_b], b_slot)
+        gl.amd.gfx1250.tdm.async_load(as_desc, [0, off_s], as_slot)
+        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, off_s], bs_slot)
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
         load_idx += 1
