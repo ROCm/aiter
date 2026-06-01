@@ -19,92 +19,6 @@ DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 
 
-# def shuffle_kv_cache(
-#     key_cache: torch.Tensor,
-#     value_cache: torch.Tensor,
-# ):
-#     """
-#     Shuffle key and value cache layout for optimized memory access.
-
-#         layout: (num_lanes, num_elements_per_thread)
-#             gfx1250: (16, 8) for BF16 and FP8.
-#             gfx950: (16, 8) for BF16 and (16, 16) for FP8.
-
-#         WMMA/MFMA instruction shape:
-#             BF16: 16x16x32
-#             FP8: 16x16x64
-#     """
-#     dtype = key_cache.dtype
-#     assert value_cache.dtype == dtype
-#     assert dtype in (torch.bfloat16, e4m3_dtype)
-
-#     if IS_DEVICE_ARCH_GFX12:
-#         if dtype == torch.bfloat16:
-#             layout = (16, 8)
-#         else:
-#             # Caution: in gfx1250, the 16-bit and 8-bit layout should both be (16, 8), however, in order to enable ds_load_b128 for 8-bit WMMA,
-#             # we use (16, 16) here, noted that you must set k_width to 16 in the corresponding DotOperandLayout, the math will be equivalent.
-#             layout = (16, 16)
-#     else:
-#         if dtype == torch.bfloat16:
-#             layout = (16, 8)
-#         else:
-#             layout = (16, 16)
-
-#     num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
-#     num_blocks_v, block_size_v, num_kv_heads_v, head_size_v = value_cache.shape
-#     assert block_size >= 16
-#     assert num_blocks == num_blocks_v
-#     assert num_kv_heads == num_kv_heads_v
-#     assert head_size == head_size_v
-#     assert block_size == block_size_v
-
-#     num_lanes, num_elements_per_thread = layout
-#     key_cache_shuffled = key_cache.view(
-#         -1, block_size, num_kv_heads, head_size
-#     ).permute(0, 2, 1, 3)
-#     key_cache_shuffled = key_cache_shuffled.view(
-#         -1,
-#         num_kv_heads,
-#         block_size // num_lanes,
-#         num_lanes,
-#         head_size // (2 * num_elements_per_thread),
-#         2,  # there are 2 groups of threads, t0 ~ t15 and t16 ~ t31
-#         num_elements_per_thread,
-#     )
-#     key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
-#     key_cache_shuffled = key_cache_shuffled.view(
-#         -1,
-#         num_kv_heads,
-#         block_size,
-#         head_size,
-#     )
-
-#     value_cache_shuffled = value_cache.view(
-#         -1, block_size, num_kv_heads, head_size
-#     ).permute(0, 2, 1, 3)
-#     value_cache_shuffled = value_cache_shuffled.view(
-#         -1,
-#         num_kv_heads,
-#         block_size // (2 * num_elements_per_thread),
-#         2,
-#         num_elements_per_thread,
-#         head_size // num_lanes,
-#         num_lanes,
-#     )
-#     value_cache_shuffled = value_cache_shuffled.permute(
-#         0, 1, 5, 2, 3, 6, 4
-#     ).contiguous()
-#     value_cache_shuffled = value_cache_shuffled.view(
-#         -1,
-#         num_kv_heads,
-#         head_size,
-#         block_size,
-#     )
-
-#     return key_cache_shuffled, value_cache_shuffled
-
-
 def shuffle_kv_cache(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -316,56 +230,36 @@ def ref_paged_attn(
     return out.to(out_dtype)
 
 
-# @pytest.mark.parametrize(
-#     "seq_lens",
-#     [
-#         [(1, 1328)],
-#         [(1, 8192)],
-#         [(1, 1024)] * 32,
-#         [(1, 8192)] * 32,
-#         [(1, 523), (1, 37), (1, 2011)],
-#         [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
-#     ],
-# )
-# @pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
-# @pytest.mark.parametrize("head_size", [64])
-# @pytest.mark.parametrize("block_size", [16, 64, 128])
-# @pytest.mark.parametrize("sliding_window", [None])
-# @pytest.mark.parametrize(
-#     "q_dtype, kv_dtype, o_dtype, use_out_scale",
-#     [
-#         (torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
-#         (torch.bfloat16, e4m3_dtype, torch.bfloat16, False),
-#         (e4m3_dtype, e4m3_dtype, torch.bfloat16, False),
-#         (e4m3_dtype, e4m3_dtype, e4m3_dtype, True),
-#     ],
-# )
-# @pytest.mark.parametrize("soft_cap", [None])
-# @pytest.mark.parametrize("num_blocks", [32768, 256])
-# @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize(
     "seq_lens",
     [
         [(1, 1328)],
+        [(1, 8192)],
+        [(1, 1024)] * 32,
+        [(1, 8192)] * 32,
+        [(1, 523), (1, 37), (1, 2011)],
+        [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
     ],
 )
-@pytest.mark.parametrize("num_heads", [(8, 1)])
+@pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
 @pytest.mark.parametrize("head_size", [64])
+@pytest.mark.parametrize("block_size", [16, 64, 128])
 @pytest.mark.parametrize("sliding_window", [None])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, o_dtype, block_size, use_out_scale",
     [
-        # (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
-        # (torch.bfloat16, e4m3_dtype, torch.bfloat16, 128, False),
-        # (e4m3_dtype, e4m3_dtype, torch.bfloat16, 128, False),
-        # (e4m3_dtype, e4m3_dtype, e4m3_dtype, 128, True),
-        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
+        (torch.bfloat16, e4m3_dtype, torch.bfloat16, 128, False),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16, 128, False),
+        (e4m3_dtype, e4m3_dtype, e4m3_dtype, 128, True),
+        # skip NVFP4 KV cache for now as ds_load_tr4 is not yet supported
+        # (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
         # (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
     ],
 )
 @pytest.mark.parametrize("soft_cap", [None])
-@pytest.mark.parametrize("num_blocks", [256])
-@pytest.mark.parametrize("shuffled_kv_cache", [True])
+@pytest.mark.parametrize("num_blocks", [32768])
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @torch.inference_mode()
 def test_triton_unified_attn_3d(
     seq_lens: list[tuple[int, int]],
@@ -392,8 +286,12 @@ def test_triton_unified_attn_3d(
         pytest.skip(f"skip {DEVICE_ARCH}")
 
     if kv_dtype == torch.uint8:
+        if DEVICE_ARCH not in ("gfx1250",):
+            pytest.skip(f"NVFP4 KV cache requires {DEVICE_ARCH}")
         if not shuffled_kv_cache:
-            pytest.skip("NVFP4 requires shuffled KV cache")
+            pytest.skip("NVFP4 KV cache requires shuffled KV cache")
+        if block_size < 128:
+            pytest.skip("Block size has to be 128 for NVFP4 KV cache")
 
     if shuffled_kv_cache:
         if q_dtype == e4m3_dtype and kv_dtype == e4m3_dtype and block_size < 32:

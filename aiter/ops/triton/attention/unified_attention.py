@@ -9,9 +9,13 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_3d,
     reduce_segments,
 )
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_3d import (
-    _unified_attention_gluon_kernel_3d,
-)
+
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_3d import (
+        _unified_attention_gluon_kernel_3d,
+    )
+except:
+    _unified_attention_gluon_kernel_3d = None
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -105,7 +109,7 @@ def select_3d_config(
     attn_stages = 2
     if shuffled_kv_cache:
         if kv_cache_dtype == torch.bfloat16:
-            if num_2d_prgms >= 256:
+            if num_2d_prgms >= 2048:
                 attn_warps = 1
                 waves_per_eu = 2
                 if IS_DEVICE_ARCH_GFX12:
@@ -115,7 +119,7 @@ def select_3d_config(
                 waves_per_eu = 2
                 num_segments = 8
         elif kv_cache_dtype == e4m3_dtype:
-            if num_2d_prgms >= 256:
+            if num_2d_prgms >= 2048:
                 attn_warps = 1
                 waves_per_eu = 2
                 if IS_DEVICE_ARCH_GFX12:
@@ -128,7 +132,7 @@ def select_3d_config(
             assert (
                 block_size == 128
             ), "Only block_size == 128 is supported for FP4 KV cache"
-            if num_2d_prgms >= 256:
+            if num_2d_prgms >= 2048:
                 attn_warps = 1
                 waves_per_eu = 2
                 if IS_DEVICE_ARCH_GFX12:

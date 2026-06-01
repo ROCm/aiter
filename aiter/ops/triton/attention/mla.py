@@ -11,15 +11,21 @@ from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_decode_fwd_kernel as triton_mla_decode_fwd_kernel,
 )
 from aiter.ops.triton._triton_kernels.attention.mla import _mla_decode_fwd_reduce_kernel
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-    _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
-)
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-    _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
-)
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-    _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
-)
+
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+        _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+        _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+        _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
+    )
+except:  # noqa: E722
+    gluon_mla_prefill_fwd_kernel_non_pipelined = None
+    gluon_mla_decode_fwd_kernel_non_pipelined = None
+    gluon_mla_decode_fwd_kernel = None
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -64,12 +70,12 @@ def select_3d_config(
     if shuffled_kv_cache:
         if IS_DEVICE_ARCH_GFX12:
             if kv_dtype == torch.bfloat16:
-                if num_2d_prgms >= 64:
+                if num_2d_prgms >= 512:
                     num_segments = 1
                 else:
                     num_segments = 2
             else:
-                if num_2d_prgms >= 64:
+                if num_2d_prgms >= 512:
                     num_segments = 1
                 else:
                     num_segments = 2

@@ -5,8 +5,10 @@ import random
 import pytest
 import torch
 
-from aiter.ops.triton.attention.mla import mla_decode_fwd
-from aiter.ops.triton.attention.mla import mla_prefill_fwd
+from aiter.ops.triton.attention.mla import (
+    mla_prefill_fwd,
+    mla_decode_fwd,
+)
 from aiter.ops.shuffle import shuffle_weight
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
@@ -240,42 +242,27 @@ def torch_mla_extend(
     return out.to(o_dtype)
 
 
-# @pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
-# @pytest.mark.parametrize("decode_qlen", [1, 3])
-# @pytest.mark.parametrize("ctx_lens", [200, 4371, 8192])
-# @pytest.mark.parametrize("num_heads", [(16, 1)])
-# @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
-# @pytest.mark.parametrize("block_size", [64])
-# @pytest.mark.parametrize("num_blocks", [32768])
-# @pytest.mark.parametrize("varlen", [True, False])
-# @pytest.mark.parametrize(
-#     "q_dtype, kv_dtype, out_dtype, use_out_scale",
-#     [
-#         (torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
-#         (torch.bfloat16, e4m3_dtype, torch.bfloat16, True),
-#         (e4m3_dtype, e4m3_dtype, torch.bfloat16, True),
-#     ],
-# )
-# @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
-@pytest.mark.parametrize("batch_size", [1])
-@pytest.mark.parametrize("decode_qlen", [1])
-@pytest.mark.parametrize("ctx_lens", [1328])
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
+@pytest.mark.parametrize("decode_qlen", [1, 3])
+@pytest.mark.parametrize("ctx_lens", [200, 4371, 8192])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
-@pytest.mark.parametrize("num_blocks", [128])
-@pytest.mark.parametrize("varlen", [False])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("num_blocks", [32768])
+@pytest.mark.parametrize("varlen", [True, False])
 @pytest.mark.parametrize(
-    "q_dtype, kv_dtype, out_dtype, block_size, use_out_scale",
+    "q_dtype, kv_dtype, out_dtype, use_out_scale",
     [
         (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, e4m3_dtype, 64, True),
+        # skip NVFP4 KV cache for now as ds_load_tr4 is not yet supported
         # (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
         # (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
     ],
 )
-@pytest.mark.parametrize("shuffled_kv_cache", [True])
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @torch.inference_mode()
 def test_mla_decode_fwd(
     batch_size: int,
@@ -297,7 +284,17 @@ def test_mla_decode_fwd(
     num_query_heads, num_kv_heads = num_heads
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
 
+    if DEVICE_ARCH not in (
+        "gfx950",
+        "gfx1250",
+    ):
+        # gfx1250 -> Gluon
+        # gfx950 -> Triton
+        pytest.skip(f"skip {DEVICE_ARCH}")
+
     if kv_dtype == torch.uint8:
+        if DEVICE_ARCH not in ("gfx1250",):
+            pytest.skip(f"NVFP4 requires {DEVICE_ARCH}")
         if not shuffled_kv_cache:
             pytest.skip("NVFP4 requires shuffled KV cache")
 
