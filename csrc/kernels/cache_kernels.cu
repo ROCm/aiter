@@ -1256,8 +1256,9 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     const scalar_t* __restrict__ k,           // [num_tokens, head_dim]
     cache_t* __restrict__ kv_cache,           // [num_blocks, block_size, cache_stride]
     const int64_t* __restrict__ slot_mapping, // [num_tokens]
-    const scalar_t* __restrict__ norm_weight, // [head_dim]
-    const scalar_t* __restrict__ norm_bias,   // [head_dim]
+    // fp32 to match caller's LN params (bf16 cast drops precision).
+    const float* __restrict__ norm_weight,    // [head_dim]
+    const float* __restrict__ norm_bias,      // [head_dim]
     const int64_t* __restrict__ positions,    // [num_tokens]
     const scalar_t* __restrict__ cos_cache,   // [max_position, ..., rope_dim / 2]
     const scalar_t* __restrict__ sin_cache,   // [max_position, ..., rope_dim / 2]
@@ -1341,9 +1342,13 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     q_amax = block_reduce<float, decltype(max_func), HEAD_DIM, true>(q_amax, max_func);
 
     const float q_fp8_max = static_cast<float>(opus::finfo<cache_t>::max());
-    // Q scale is consumed by weights_out and must match the unfused quant path;
-    // only the K cache scale is encoded as UE8M0 for cache layout compatibility.
-    const float q_scale = fmaxf(q_amax, 1e-10f) / q_fp8_max;
+    // Match unfused per_token_group_quant_fp8: reciprocal-multiply + UE8M0.
+    const float q_inv_fp8_max = 1.0f / q_fp8_max;
+    float q_scale             = fmaxf(q_amax, 1e-10f) * q_inv_fp8_max;
+    if(use_ue8m0)
+    {
+        q_scale = exp2f(ceilf(log2f(q_scale)));
+    }
     const float q_inv_scale = 1.0f / q_scale;
     q_out[token_idx * q_out_stride_t + head_idx * q_out_stride_h + dim * q_out_stride_d] =
         opus::cast<cache_t>(q_val * q_inv_scale);
@@ -1370,8 +1375,7 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     float ss = block_reduce<float, decltype(sum_func), HEAD_DIM, true>(centered * centered, sum_func);
     const float inv_std = rsqrtf(ss / static_cast<float>(HEAD_DIM) + epsilon);
 
-    float k_val = centered * inv_std * static_cast<float>(norm_weight[dim]) +
-                  static_cast<float>(norm_bias[dim]);
+    float k_val = centered * inv_std * norm_weight[dim] + norm_bias[dim];
     k_val = static_cast<float>(static_cast<scalar_t>(k_val));
     normed[dim] = k_val;
     __syncthreads();
@@ -3151,8 +3155,8 @@ void reshape_and_cache_flash(
                                      reinterpret_cast<KV_T*>(k.data_ptr()),                       \
                                      reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),             \
                                      reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),          \
-                                     reinterpret_cast<KV_T*>(norm_weight.data_ptr()),              \
-                                     reinterpret_cast<KV_T*>(norm_bias.data_ptr()),                \
+                                     reinterpret_cast<float*>(norm_weight.data_ptr()),             \
+                                     reinterpret_cast<float*>(norm_bias.data_ptr()),               \
                                      reinterpret_cast<int64_t*>(positions.data_ptr()),             \
                                      reinterpret_cast<KV_T*>(cos_cache.data_ptr()),                \
                                      reinterpret_cast<KV_T*>(sin_cache.data_ptr()),                \
@@ -3689,8 +3693,8 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(q_out.dtype() == AITER_DTYPE_fp8, "q_out dtype must be fp8");
     AITER_CHECK(weights.dtype() == q.dtype(), "weights dtype must match q dtype");
     AITER_CHECK(weights_out.dtype() == AITER_DTYPE_fp32, "weights_out dtype must be fp32");
-    AITER_CHECK(norm_weight.dtype() == q.dtype(), "norm_weight dtype must match q dtype");
-    AITER_CHECK(norm_bias.dtype() == q.dtype(), "norm_bias dtype must match q dtype");
+    AITER_CHECK(norm_weight.dtype() == AITER_DTYPE_fp32, "norm_weight dtype must be fp32");
+    AITER_CHECK(norm_bias.dtype() == AITER_DTYPE_fp32, "norm_bias dtype must be fp32");
     AITER_CHECK(cos_cache.dtype() == q.dtype(), "cos_cache dtype must match q dtype");
     AITER_CHECK(sin_cache.dtype() == q.dtype(), "sin_cache dtype must match q dtype");
     AITER_CHECK(norm_weight.size(0) == head_dim, "norm_weight size must match head_dim");
