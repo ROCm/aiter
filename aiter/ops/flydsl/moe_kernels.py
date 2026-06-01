@@ -796,7 +796,7 @@ def _mxscale_pad_weight_k(w: torch.Tensor, delta_bytes: int,
     """Zero-pad a weight tensor of shape ``(E, N, K/pack_b)`` on the K-byte
     (last) dim.
 
-    When the caller has already applied ``preshuffle_b_16x16`` to the weight
+    When the caller has already preshuffled the weight
     (fp8 / a8w4 path), a raw ``F.pad`` on the last dim would insert zero
     bytes *inside* each 16-wide shuffled column group, not at the end of
     the virtual K axis. Instead reshape into the underlying 16x16 tile grid

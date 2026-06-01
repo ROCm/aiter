@@ -3192,17 +3192,6 @@ def fused_moe_2stages(
                 topk=topk,
                 block_size=block_size_M,
             )
-    elif (
-        quant_type == aiter.QuantType.per_1x32
-        and dtype in [dtypes.bf16, dtypes.fp16]
-        and q_dtype_a == dtypes.fp8
-        and w1.dtype == dtypes.fp8
-    ):
-        from aiter.ops.quant import _per_1x32_f8_e8m0_quant_triton
-
-        a1, a1_scale = _per_1x32_f8_e8m0_quant_triton(hidden_states.to(dtypes.fp32))
-        a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
-
     elif quant_type == QuantType.per_1x32 and _is_gfx1250_dispatch:
         if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
             logger.info(
@@ -3428,13 +3417,6 @@ def fused_moe_2stages(
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
         a2_scale = None
-    elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.fp8:
-        from aiter.ops.quant import _per_1x32_f8_e8m0_quant_triton
-
-        a2_flat = a2.view(-1, inter_dim)
-        a2_flat, a2_scale = _per_1x32_f8_e8m0_quant_triton(a2_flat.to(dtypes.fp32))
-        a2_scale = a2_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
-        a2 = a2_flat.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x32 and _is_gfx1250_dispatch:
         # Stage2 FlyDSL kernel expects scale_x in source order of shape
         # (tokens*topk, inter_dim//32). See comment in stage1 path.
