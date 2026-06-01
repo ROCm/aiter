@@ -23,7 +23,7 @@ def _gluon_fused_rms_kernel(
     out_res1_ptr,
     eps1,
     M,
-    N1,
+    N,
     x1_stride_m,
     res1_stride_m,
     out1_stride_m,
@@ -34,17 +34,17 @@ def _gluon_fused_rms_kernel(
 ):
     start_pid = gl.program_id(0)
 
-    gLayout2D: gl.constexpr = gl.BlockedLayout([1, 2], [1, 32], [1, 4], [1, 0])
+    gLayout2D: gl.constexpr = gl.BlockedLayout([1, 8], [1, 32], [1, 4], [1, 0])
     gLayoutN: gl.constexpr = gl.SliceLayout(0, gLayout2D)
     sharedLayout2D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
     sharedLayoutN: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
 
     # descriptors + smem for first input and its weight
     x1_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        x1_ptr, [M, N1], [x1_stride_m, 1], [BLOCK_SIZE_M, BLOCK_SIZE_N], sharedLayout2D
+        x1_ptr, [M, N], [x1_stride_m, 1], [BLOCK_SIZE_M, BLOCK_SIZE_N], sharedLayout2D
     )
     w1_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        w1_ptr, [N1], [1], [BLOCK_SIZE_N], sharedLayoutN
+        w1_ptr, [N], [1], [BLOCK_SIZE_N], sharedLayoutN
     )
     smemX1 = gl.allocate_shared_memory(
         x1_ptr.dtype.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_N], sharedLayout2D
@@ -60,7 +60,7 @@ def _gluon_fused_rms_kernel(
     if FIRST_INPUT_RES:
         res1_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             res1_ptr,
-            [M, N1],
+            [M, N],
             [res1_stride_m, 1],
             [BLOCK_SIZE_M, BLOCK_SIZE_N],
             sharedLayout2D,
@@ -73,7 +73,7 @@ def _gluon_fused_rms_kernel(
         )
         out_res1_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             out_res1_ptr,
-            [M, N1],
+            [M, N],
             [out_res1_stride_m, 1],
             [BLOCK_SIZE_M, BLOCK_SIZE_N],
             sharedLayout2D,
@@ -87,7 +87,7 @@ def _gluon_fused_rms_kernel(
     # output descriptor + smem (static alloc; placement before wait is free)
     out1_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         out1_ptr,
-        [M, N1],
+        [M, N],
         [out1_stride_m, 1],
         [BLOCK_SIZE_M, BLOCK_SIZE_N],
         sharedLayout2D,
@@ -96,7 +96,7 @@ def _gluon_fused_rms_kernel(
         out1_ptr.dtype.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_N], sharedLayout2D
     )
 
-    gl.amd.gfx1250.tdm.async_wait(0)
+    gl.amd.gfx1250.tdm.async_wait(1)
 
     x1 = smemX1.load(gLayout2D).to(gl.float32)
 
@@ -107,11 +107,14 @@ def _gluon_fused_rms_kernel(
         gl.amd.gfx1250.tdm.async_store(
             out_res1_desc, [start_pid * BLOCK_SIZE_M, 0], smemOutRes1
         )
+        gl.amd.gfx1250.tdm.async_wait(1)
+    else:
+        gl.amd.gfx1250.tdm.async_wait(0)
 
     w1 = smemW1.load(gLayoutN).to(gl.float32)
     w1 = w1.reshape(1, BLOCK_SIZE_N)
     w1 = gl.convert_layout(w1, gLayout2D)
-    norm1 = _rmsnorm_op(x1, w1, N1, eps1)
+    norm1 = _rmsnorm_op(x1, w1, N, eps1)
 
     smemOut1.store(norm1.to(out1_ptr.dtype.element_ty))
     gl.amd.gfx1250.tdm.async_store(out1_desc, [start_pid * BLOCK_SIZE_M, 0], smemOut1)
