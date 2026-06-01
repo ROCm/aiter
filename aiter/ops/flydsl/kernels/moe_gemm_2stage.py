@@ -58,6 +58,7 @@ from .mfma_preshuffle_pipeline import (
     load_b_raw_w4a16_groupwise,
     extract_bf16_scale,
     unpack_b_mxfp4_bf16,
+    load_b_raw_mxfp4,
     load_b_raw_mxfp4_dwordx4,
     tile_chunk_coord_i32,
     swizzle_xor16,
@@ -327,7 +328,7 @@ def compile_moe_gemm1(
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"{_gs_tag}{scale_tag}{_split_k_tag}{_gui_tag}"
-        f"_abi3"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
+        f"_abi4"  # v4: dwordx4 B-load for fp4_bf16; sw_nbytes K-group fix
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
@@ -896,41 +897,23 @@ def compile_moe_gemm1(
                             raw_data.append(raw_ku)
                         return raw_data
                     elif const_expr(is_fp4_bf16):
-                        # MXFP4: load via load_b_pack_k32 (kpack=16), split i64→2×i32,
-                        # pair each i32 with its E8M0 scale.
-                        # INTERLEAVE: blk_list is always gate (no up B-tile); use gate scale lists.
-                        base_k_packed = base_k // fx.Index(2)
-                        raw_data = []
+                        # MXFP4: use load_b_raw_mxfp4 which correctly handles the
+                        # klane dimension: ku=0..3 → klane_hw=0..3, cycling through
+                        # the 4 K-lanes of the preshuffle layout.
                         _is_gate_side = (id(blk_list) == id(n_blk_gate))
                         _mni_list = _mxfp4_scale_mni_gate if _is_gate_side else _mxfp4_scale_mni_up
                         _npk_list = _mxfp4_scale_n_pack_gate if _is_gate_side else _mxfp4_scale_n_pack_up
                         _sc_cache = {}
+                        raw_data = []
                         for ku in range_constexpr(k_unroll):
-                            ki_step = ku // 2
                             raw_ku = []
                             for ni in range_constexpr(num_acc_n):
-                                i64_val = load_b_pack_k32(
-                                    buffer_ops,
-                                    arith,
-                                    vector,
-                                    arg_b=arg_w,
-                                    b_rsrc=w_rsrc,
-                                    layout_b=layout_b,
-                                    base_k=base_k_packed,
-                                    ki_step=ki_step,
-                                    n_blk=blk_list[ni],
-                                    n_intra=intra_list[ni],
-                                    lane_div_16=lane_div_16,
-                                    elem_type=w_elem,
-                                    kpack_bytes=kpack_bytes,
-                                    elem_bytes=w_elem_bytes,
-                                )
-                                v1_i64 = vector.from_elements(T.vec(1, T.i64), [i64_val])
-                                v2_i32 = vector.bitcast(T.i32x2, v1_i64)
-                                raw_i32 = vector.extract(
-                                    v2_i32,
-                                    static_position=[ku % 2],
-                                    dynamic_position=[],
+                                raw_i32 = load_b_raw_mxfp4(
+                                    buffer_ops, arith, vector,
+                                    arg_b=arg_w, b_rsrc=w_rsrc, layout_b=layout_b,
+                                    base_k=base_k, ku=ku, n_blk=blk_list[ni],
+                                    n_intra=intra_list[ni], lane_div_16=lane_div_16,
+                                    elem_type=w_elem, kpack_bytes=kpack_bytes,
                                 )
                                 scale_f32 = _mxfp4_get_scale_f32(
                                     base_k, ku, ni, _mni_list, _npk_list, _sc_cache
