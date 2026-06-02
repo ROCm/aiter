@@ -67,14 +67,14 @@ class MxScaleKernelInstance:
 
 # Tuner search grid. Kept deliberately small but representative; the per-shape
 # filter in the tuner driver drops candidates that do not divide the problem.
-_TILE_M_OPTIONS = (64, 128, 256)
+_TILE_M_OPTIONS = (16, 64, 128, 256)
 _TILE_N_OPTIONS = (64, 128, 256)
 _TILE_K_OPTIONS = (128, 256)
-_WARP_OPTIONS = ((2, 2), (2, 4), (4, 2))
+_WARP_OPTIONS = ((2, 2),)
 _NUM_BUFFER_OPTIONS = (2, 3, 4)
 _SPLIT_K_OPTIONS = (1, 2, 4, 8, 12, 14, 16)
 # cluster_m * cluster_n <= 16
-_CLUSTER_OPTIONS = ((1, 1), (2, 1), (1, 2), (2, 2), (2, 4), (4, 2))
+_CLUSTER_OPTIONS = ((1, 1),)
 
 
 def _is_valid_static(

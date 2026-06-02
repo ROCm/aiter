@@ -125,7 +125,128 @@ def test_gemm_a8w8_mxscale_split_k():
     assert cos > 0.99, f"split_k cosine={cos} too low"
 
 
+def _build_mxscale_inputs(M, N, K):
+    """Random bf16 A/B quantized to OCP MXFP8 (E4M3 data + 1x32 E8M0 scales)."""
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 2.0
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 2.0
+    aq, a_s = per_1x32_f8_scale_f8_quant(
+        a, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0, shuffle=False
+    )
+    bq, b_s = per_1x32_f8_scale_f8_quant(
+        b, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0, shuffle=False
+    )
+    return aq, bq, a_s, b_s
+
+
+def _bench_gemm_mxscale(dtype, M, N, K, num_iters, num_warmup):
+    from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+    @benchmark()
+    def run(dtype, M, N, K):
+        if K % SCALE_BLOCK != 0:
+            raise ValueError(f"K={K} must be divisible by SCALE_BLOCK={SCALE_BLOCK}")
+        torch.manual_seed(0)
+        aq, bq, a_s, b_s = _build_mxscale_inputs(M, N, K)
+        ref = (_dequant_fp8(aq, a_s) @ _dequant_fp8(bq, b_s).t()).to(dtype)
+
+        out, us = run_perftest(
+            aiter.gemm_a8w8_mxscale,
+            aq,
+            bq,
+            a_s,
+            b_s,
+            dtype=dtype,
+            num_iters=num_iters,
+            num_warmup=num_warmup,
+        )
+
+        err = checkAllclose(ref, out, rtol=1e-2, atol=1e-2, msg=f"mxscale {M}x{N}x{K}")
+        rel, cos = _metrics(out, ref)
+        flops = 2.0 * M * N * K
+        bytes_moved = aq.nbytes + bq.nbytes + a_s.nbytes + b_s.nbytes + out.nbytes
+        return {
+            "us": us,
+            "TFLOPS": flops / us / 1e6,
+            "TB/s": bytes_moved / us / 1e6,
+            "cos": cos,
+            "rel": rel,
+            "err": err,
+        }
+
+    return run(dtype, M, N, K)
+
+
+def _main():
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Benchmark / test aiter.gemm_a8w8_mxscale (OCP MXFP8) on gfx1250.",
+    )
+    parser.add_argument(
+        "--pytest",
+        action="store_true",
+        default=False,
+        help="Run the pytest correctness suite instead of the benchmark.",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp16"]],
+        metavar="{bf16,fp16}",
+        default=[dtypes.d_dtypes["bf16"]],
+        help="Output dtype(s). e.g.: -d bf16 fp16",
+    )
+    parser.add_argument(
+        "-mnk",
+        "--shape",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[
+            (256, 256, 256),
+            (512, 1024, 512),
+            (1024, 1024, 1024),
+            (2048, 2048, 2048),
+            (4096, 4096, 4096),
+            (1, 4096, 4096),
+            (8192, 8192, 8192),
+        ],
+        help="Shapes of (M, N, K). K must be divisible by 32.\n    e.g. -mnk 1024,1024,1024 2048,2048,2048",
+    )
+    parser.add_argument(
+        "--iters", type=int, default=101, help="Timed iterations per shape."
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=2, help="Warmup iterations per shape."
+    )
+    args = parser.parse_args()
+
+    if args.pytest:
+        return pytest.main([__file__, "-v", "-s"])
+
+    if not torch.cuda.is_available() or get_gfx() != "gfx1250":
+        sys.exit("MXScale GEMM benchmark requires a gfx1250 device.")
+
+    import pandas as pd
+
+    pd.set_option("display.max_columns", 30)
+    pd.set_option("display.width", 1000)
+
+    df = []
+    for dtype in args.dtype:
+        for m, n, k in args.shape:
+            df.append(_bench_gemm_mxscale(dtype, m, n, k, args.iters, args.warmup))
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "gemm_a8w8_mxscale summary (markdown):\n%s", df.to_markdown(index=False)
+    )
+    return 0
+
+
 if __name__ == "__main__":
     import sys
 
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    sys.exit(_main())

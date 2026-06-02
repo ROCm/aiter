@@ -444,9 +444,15 @@ def flydsl_mxscale_gemm(
     b_s_dev = _to_target_device(b_s_p, target_device)
 
     # ----- Allocate padded out + (optional) zero-init for split-K -----
+    # split_k > 1 accumulates partials via atomic add. Rounding every partial
+    # into a bf16/f16 output buffer loses precision (error grows with split_k),
+    # so accumulate in an f32 scratch buffer and cast once at the end -- this
+    # matches the single-shot (split_k == 1) output precision.
+    acc_f32_scratch = split_k > 1 and out_dtype_name != "f32"
+    compile_out_dtype = "f32" if acc_f32_scratch else out_dtype_name
     out_buf = torch.empty(
         (padded["M"], padded["N"]),
-        dtype=out_torch_dtype,
+        dtype=torch.float32 if acc_f32_scratch else out_torch_dtype,
         device=a_dev.device,
     )
     if split_k > 1:
@@ -455,7 +461,7 @@ def flydsl_mxscale_gemm(
     # ----- Compile + launch -----
     compile_kwargs = mxscale_compile_kwargs(
         data_format=data_format,
-        out_dtype=out_dtype_name,
+        out_dtype=compile_out_dtype,
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,
@@ -485,16 +491,14 @@ def flydsl_mxscale_gemm(
         stream,
     )
 
-    # ----- Slice padded buffer back to (M, N) -----
-    if (padded["M"], padded["N"]) == (M, N):
-        if out is None:
-            return out_buf
-        out.copy_(out_buf)
+    # ----- Slice padded buffer back to (M, N) + cast f32 scratch to target -----
+    sliced = out_buf if (padded["M"], padded["N"]) == (M, N) else out_buf[:M, :N]
+    if out is not None:
+        out.copy_(sliced)
         return out
-    if out is None:
-        return out_buf[:M, :N].contiguous()
-    out.copy_(out_buf[:M, :N])
-    return out
+    if sliced.dtype != out_torch_dtype:
+        return sliced.to(out_torch_dtype)
+    return sliced.contiguous()
 
 
 # ---------------------------------------------------------------------------
