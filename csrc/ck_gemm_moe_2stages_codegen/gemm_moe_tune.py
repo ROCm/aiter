@@ -3452,7 +3452,17 @@ class FmoeTuner(TunerCommon):
             if failed_cases:
                 print(f"\n[tune] {len(failed_cases)} of {len(rets)} tasks failed:")
                 for i, tag, us, err in failed_cases:
-                    _, stage, kname, blockM = tag
+                    try:
+                        _, stage, kname, blockM = tag
+                    except (ValueError, TypeError):
+                        # Some task tags carry extra/fewer trailing fields (e.g.
+                        # 1-stage asm tasks). Be defensive so a single odd tag in
+                        # the failure report never aborts the whole tuning batch
+                        # (which would discard all already-completed results).
+                        _seq = tag if isinstance(tag, (list, tuple)) else (tag,)
+                        stage = _seq[1] if len(_seq) > 1 else "?"
+                        kname = _seq[2] if len(_seq) > 2 else "?"
+                        blockM = _seq[3] if len(_seq) > 3 else "?"
                     reason = "timeout/hang" if us == float("inf") else "crash/error"
                     print(f"  task {i}: {stage} {kname} blockM={blockM} -> {reason}")
             else:
