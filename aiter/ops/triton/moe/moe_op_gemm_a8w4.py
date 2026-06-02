@@ -164,6 +164,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
             block_n = 128
             num_warps = 4 if block_m == 128 else 8
     elif arch == "gfx950":
+        num_stages = 1
         if block_m == 16:
             block_n = 128
             num_warps = 4
