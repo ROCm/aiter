@@ -1124,9 +1124,14 @@ def attn_fwd(
     # Compute pointers for all the tensors used in this kernel.
     # When the caller guarantees that the head-axis strides of Q/K/V are
     # multiples of 8 elements (set via HEAD_STRIDE_ALIGNED_8), the head-axis
-    # byte offset is 16-byte aligned. Auto-specialization only fires at the
-    # 16-element threshold, so hint the smaller multiple explicitly to let
-    # AxisInfo widen the global load.
+    # offset is a multiple of 8 *elements*. The resulting byte alignment is
+    # element-size dependent: 16 bytes for 16-bit types (fp16/bf16), 8 bytes
+    # for fp8, 32 bytes for fp32. The 16-byte case is the one that lets
+    # AxisInfo widen the K/V global load to a 128-bit (buffer_load_b128)
+    # access; for the other dtypes the hint is still sound but yields a
+    # different (smaller or larger) vector width. Auto-specialization only
+    # fires at the 16-element threshold, so hint the smaller multiple
+    # explicitly.
     qh_off = off_h_q * stride_qh
     kh_off = off_h_k * stride_kh
     vh_off = off_h_k * stride_vh
