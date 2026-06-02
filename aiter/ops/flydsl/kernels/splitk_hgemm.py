@@ -1034,13 +1034,13 @@ def compile_hgemm_kernel(
 
     @flyc.jit
     def launch_hgemm_kernel(
-        C: fx.Tensor,
-        A: fx.Tensor,
-        B: fx.Tensor,
-        BIAS: fx.Tensor,
+        C: fx.Pointer,
+        A: fx.Pointer,
+        B: fx.Pointer,
+        BIAS: fx.Pointer,
         m: fx.Int32,
-        semaphore: fx.Tensor,
-        signal: fx.Tensor,
+        semaphore: fx.Pointer,
+        signal: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
