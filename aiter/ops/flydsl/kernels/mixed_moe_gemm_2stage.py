@@ -661,8 +661,7 @@ def compile_mixed_moe_gemm1(
                 _ptr_buffer_resource(arg_bias, bias_nbytes) if enable_bias else None
             )
 
-            # Sorted-scale buffer resource for fused mxfp4 quantization
-            _sorted_scale_cols = inter_dim // 32
+            _sorted_scale_cols = ((inter_dim // 32) + 7) // 8 * 8
             _sorted_scale_cols_i32 = arith.constant(_sorted_scale_cols, type=T.i32)
             sorted_scale_rsrc = None
             if const_expr(_need_sort):
