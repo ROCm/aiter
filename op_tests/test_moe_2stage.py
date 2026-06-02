@@ -366,6 +366,7 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
+
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
         x, y = x.double(), y.double()
         denominator = (x * x + y * y).sum()
