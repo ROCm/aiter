@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.1.8"
+FLYDSL_VERSION = "flydsl==0.1.9.dev599"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -57,8 +57,9 @@ def is_develop_mode():
 if not IS_WINDOWS and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
+        from packaging.version import Version
 
-        if pkg_version("flydsl") != FLYDSL_VERSION.split("==")[1]:
+        if Version(pkg_version("flydsl")) != Version(FLYDSL_VERSION.split("==")[1]):
             raise ImportError("version mismatch")
     except Exception:
         subprocess.check_call(
@@ -113,13 +114,18 @@ def _torch_version_below(min_version):
 _triton_info = _is_triton_installed()
 if _torch_version_below("2.9.1"):
     print(
-        f"[aiter] torch < 2.9.1 detected, skipping triton reinstall"
-        f"{f' (keeping {_triton_info[0]}=={_triton_info[1]})' if _triton_info else ''}"
+        f"[aiter] torch < 2.9.1 detected, triton reinstall skipped for compatibility"
+        f"{f' (keeping {_triton_info[0]}=={_triton_info[1]})' if _triton_info else ''}."
+    )
+    print(
+        "[aiter] To use aiter-compatible triton, please upgrade torch to 2.9.1 or later."
     )
 elif AITER_USE_SYSTEM_TRITON and _triton_info:
     print(
-        f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping existing"
-        f" {_triton_info[0]}=={_triton_info[1]}"
+        f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping {_triton_info[0]}=={_triton_info[1]}."
+    )
+    print(
+        "[aiter] To ensure compatibility, consider running .github/scripts/install_triton.sh."
     )
 else:
     if _triton_info:

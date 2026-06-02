@@ -578,6 +578,14 @@ def varlen_bwd(
             "softcap is not supported in varlen_bwd (expected 0.0)."
         )
 
+    is_sliding_window = (window_size_left >= 0) or (window_size_right >= 0)
+    if is_sliding_window:
+        raise NotImplementedError(
+            f"Sliding window attention is not yet supported in the AMD Triton backward pass "
+            f"(window_size_left={window_size_left}, window_size_right={window_size_right}). "
+            f"Use window_size=(-1, -1) for full attention."
+        )
+
     if DEBUG:
         print()
         print("varlen_bwd")
