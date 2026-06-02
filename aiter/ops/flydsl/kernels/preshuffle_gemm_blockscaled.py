@@ -1,6 +1,17 @@
-"""FP8 blockscaled GEMM: C(M,N) = A(M,K) @ B(N,K).T with DeepGEMM packed-UE8M0 scales.
+"""FP8 blockscaled GEMM: C(M,N) = A(M,K) @ B(N,K).T  —  CONSOLIDATED single-file.
 
 Preshuffled B layout (N//16, K//64, 4, 16, 16) for gfx950 / MI355X.
+
+This is the consolidated best-known implementation:
+  - 4-wave (256-thread), B in registers, A through LDS (the proven peak design).
+  - scale_format="fp32_post_mfma" uses the HANDCRAFT compute schedule
+    (`compute_tile_fp32_post_mfma_handcraft`): per-K-128-group, A double-buffered
+    (prefetch mi+1 while computing mi) + 1-deep MFMA→FMA interleave per ni. This
+    beats the older `mfma_batch` batched schedule by +40–58% at the production
+    128×128 tile (see _FP32_POST_MFMA_WINNERS / blockscale_per_analysis/).
+  - ue8m0 / fp32 paths use the MFMA-fused scale (fastest when scales are pow-2).
+NOTE: the b_in_lds (B-through-LDS) and 8-wave ping-pong experiments were explored
+and shelved (both lost to this design on the target shapes); not included here.
 
 Public entry points:
   compile_preshuffle_gemm_blockscaled(M, N, K, tile_m, tile_n, tile_k, ...)
@@ -65,8 +76,25 @@ from .mfma_preshuffle_pipeline import (
 # add a 5th element to override per-shape (e.g. tile_m=64 shapes like 6).
 _AUTOTUNE_WINNERS: dict[tuple[int, int, int], tuple] = {
     # (M,     N,     K   ) -> (tm,  tn,  tk,  bsw[, mfma_batch])
+    # --- ue8m0 (MFMA-fused scale) path winners ---
     (32768, 12288, 2048): (128, 128, 128, 2),         # 0.794 ms  -> 2077 TF  (83.1%)
     (32768,  4096, 2048): (128, 128, 128, 8),         # 0.250 ms  -> 2195 TF  (87.8%)
+}
+
+# fp32_post_mfma (true-FP32 blockscale, handcraft compute) sweep winners.
+# Swept tile_m{64,128,256} × tile_n{128,256} × tile_k{128,256} × bsw{0,1,2,4,8}
+# on MI355X (gfx950), per-config subprocess, min over 6×120-iter (1500 warmup).
+# All bit-identical to the batched compute (nf vs fp32-ref = shared ±1 bf16 ULP).
+# Pattern: N drives the tile (wide-N -> 128×128, narrow-N -> 64×256×128);
+# M scales time, not the winner; tile_k=128 always; tile_m=256/wide tiles spill.
+#   (M,     N,     K   ) -> (tm,  tn,  tk,  bsw)            TFLOPS
+_FP32_POST_MFMA_WINNERS: dict[tuple[int, int, int], tuple] = {
+    # (M,     N,     K   ) -> (tm,  tn,  tk,  bsw)            TFLOPS (MI355X)
+    (8192,   8192, 8192): (128, 128, 128, 8),   # 2014 TF
+    (16384,  2048, 4096): (64,  256, 128, 4),   # 1920 TF
+    (16384, 12288, 2048): (128, 128, 128, 8),   # 1799 TF
+    (32768,  2048, 4096): (64,  256, 128, 4),   # 1939 TF
+    (32768, 12288, 2048): (128, 128, 128, 2),   # 1695 TF
 }
 
 
@@ -1187,6 +1215,87 @@ def compile_preshuffle_gemm_blockscaled(
 
             return current_accs
 
+        def compute_tile_fp32_post_mfma_handcraft(
+            accs_in, b_tile_in, kt, fp8_lds_buffer,
+            sa_per_mi_g, sb_per_ni, a0_prefetch=None,
+        ):
+            current_accs = list(accs_in)
+            rocdl.iglp_opt(2)
+
+            # 2 buffer for a128
+            a128_list = [None, None]
+            # num_acc_n buffer for b128
+            b128_list = [None] * num_acc_n
+            for g in range_constexpr(groups_per_tile):
+                fp8_group_col_base = g * 128
+                ku_base = g * mfmas_per_group
+                b_pa = b_tile_in[ku_base + 0]
+                b_pb = b_tile_in[ku_base + 1]
+                b_pc = b_tile_in[ku_base + 2]
+                b_pd = b_tile_in[ku_base + 3]
+                for ni in range_constexpr(num_acc_n):
+                    b128_list[ni] = pack_i64x4_to_i32x8(
+                        b_pa[ni], b_pb[ni], b_pc[ni], b_pd[ni],
+                    )
+                # load m0
+                fp8_col_bytes_0 = fp8_group_col_base + lane_div_16 * 16
+                fp8_col_bytes_1 = fp8_col_bytes_0 + 64
+                a0, a1 = lds_load_a_packs_k64(
+                    lane_mod_16, fp8_col_bytes_0, fp8_lds_buffer
+                )
+                a2, a3 = lds_load_a_packs_k64(
+                    lane_mod_16, fp8_col_bytes_1, fp8_lds_buffer
+                )
+                a128_list[0] = pack_i64x4_to_i32x8(a0, a1, a2, a3)
+                for mi in range_constexpr(m_repeat):
+                    # prefetch mi+1
+                    prefetch_mi = mi + 1
+                    if prefetch_mi < m_repeat:
+                        fp8_row = lane_mod_16 + (prefetch_mi * 16)
+                        fp8_col_bytes_0 = fp8_group_col_base + lane_div_16 * 16
+                        fp8_col_bytes_1 = fp8_col_bytes_0 + 64
+                        a0, a1 = lds_load_a_packs_k64(
+                            fp8_row, fp8_col_bytes_0, fp8_lds_buffer,
+                        )
+                        a2, a3 = lds_load_a_packs_k64(
+                            fp8_row, fp8_col_bytes_1, fp8_lds_buffer,
+                        )
+                        a128_list[prefetch_mi % 2] = pack_i64x4_to_i32x8(a0, a1, a2, a3)
+                    scratch_acc = [None] * num_acc_n
+                    for ni in range_constexpr(num_acc_n):
+                        # interleave mfma with fma
+                        a128 = a128_list[mi % 2]
+                        b128 = b128_list[ni]
+                        scratch_acc[ni] = mfma_fp8_k128(
+                            mfma_res_ty,
+                            [a128, b128, Vec.filled(4, 0.0, fx.Float32),
+                             0, 0,
+                             0, _MFMA_K128_NO_SCALE,
+                             0, _MFMA_K128_NO_SCALE],
+                        )
+                        if const_expr(ni != 0):
+                            fma_ni = ni - 1 
+                            # accumulate into current_accs to save the scratch acc for the next MFMA
+                            idx = mi * num_acc_n + fma_ni
+                            current_accs[idx] = Vec(fx.vector.fma(
+                                scratch_acc[fma_ni],
+                                sa_per_mi_g[mi][g],
+                                current_accs[idx],
+                            ))
+                    # last ni: accumulate into current_accs
+                    fma_ni = num_acc_n - 1
+                    idx = mi * num_acc_n + fma_ni
+                    current_accs[idx] = Vec(fx.vector.fma(
+                        scratch_acc[fma_ni],
+                        sa_per_mi_g[mi][g],
+                        current_accs[idx],
+                    ))
+            return current_accs
+
+
+
+
+
         # ── Output store (bf16) ───────────────────────────────────
         # No head dim: C is (M, N); stride per row = N elements = N bf16 cells.
         def store_output_bf16(final_accs):
@@ -1231,7 +1340,7 @@ def compile_preshuffle_gemm_blockscaled(
         if const_expr(scale_format == "fp32_post_mfma"):
             _prefetch_sa = prefetch_sa_tile_fp32_post_mfma
             _prefetch_sb = lambda kt, regs: prefetch_sb_tile_fp32_post_mfma(kt, regs)
-            _compute_tile = compute_tile_fp32_post_mfma
+            _compute_tile = compute_tile_fp32_post_mfma_handcraft
         else:
             _prefetch_sa = prefetch_sa_tile
             _prefetch_sb = lambda kt, regs: prefetch_sb_tile(kt, regs)
@@ -1246,12 +1355,11 @@ def compile_preshuffle_gemm_blockscaled(
         gpu.barrier()
         sa_pong = _prefetch_sa(0)
         sb_pong = _prefetch_sb(0, sb_regs)
-        a0_pong = lds_a0_prefetch(lds_a_pong)
 
         if const_expr(num_tiles == 1):
             accs = _compute_tile(
                 accs, b_pong, 0, lds_a_pong,
-                sa_pong, sb_pong, a0_prefetch=a0_pong,
+                sa_pong, sb_pong,
             )
         else:
             if const_expr(num_tiles % 2 == 1):
@@ -1268,12 +1376,11 @@ def compile_preshuffle_gemm_blockscaled(
 
                 accs = _compute_tile(
                     accs, b_pong, kt_base, lds_a_pong,
-                    sa_pong, sb_pong, a0_prefetch=a0_pong,
+                    sa_pong, sb_pong,
                 )
 
                 rocdl.s_waitcnt(_waitcnt_imm)
                 gpu.barrier()
-                a0_ping = lds_a0_prefetch(lds_a_ping)
 
                 next_k2 = fx.Index((kt_base + 2) * tile_k)
                 load_a_tile_to_lds_async(next_k2, lds_a_pong)
@@ -1283,17 +1390,16 @@ def compile_preshuffle_gemm_blockscaled(
 
                 accs = _compute_tile(
                     accs, b_ping, kt_base + 1, lds_a_ping,
-                    sa_ping, sb_ping, a0_prefetch=a0_ping,
+                    sa_ping, sb_ping,
                 )
 
                 rocdl.s_waitcnt(_waitcnt_imm)
                 gpu.barrier()
-                a0_pong = lds_a0_prefetch(lds_a_pong)
 
             if const_expr(num_tiles % 2 == 1):
                 accs = _compute_tile(
                     accs, b_pong, _loop_end_excl, lds_a_pong,
-                    sa_pong, sb_pong, a0_prefetch=a0_pong,
+                    sa_pong, sb_pong,
                 )
             else:
                 next_k1 = fx.Index((_loop_end_excl + 1) * tile_k)
@@ -1304,16 +1410,15 @@ def compile_preshuffle_gemm_blockscaled(
 
                 accs = _compute_tile(
                     accs, b_pong, _loop_end_excl, lds_a_pong,
-                    sa_pong, sb_pong, a0_prefetch=a0_pong,
+                    sa_pong, sb_pong,
                 )
 
                 rocdl.s_waitcnt(_waitcnt_imm)
                 gpu.barrier()
-                a0_ping = lds_a0_prefetch(lds_a_ping)
 
                 accs = _compute_tile(
                     accs, b_ping, _loop_end_excl + 1, lds_a_ping,
-                    sa_ping, sb_ping, a0_prefetch=a0_ping,
+                    sa_ping, sb_ping
                 )
 
         store_output_bf16(accs)
