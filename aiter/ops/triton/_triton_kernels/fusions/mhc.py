@@ -970,12 +970,23 @@ def _mhc_post_pre_reduce_apply_res_block(
     stride_hr_n,
     BLOCK_M: tl.constexpr,
     NUM_SINKHORN_ITERS: tl.constexpr,
+    ASYMMETRIC_EXP_DOMAIN: tl.constexpr,
+    hc_sinkhorn_eps: tl.constexpr,
 ):
     """Compute h_res = rsigma * alpha_res * acc_res + bias_res, optionally run
-    log-domain Sinkhorn-Knopp, and store to ``h_res_ptr`` (flattened (M, n²)).
+    Sinkhorn-Knopp, and store to ``h_res_ptr`` (flattened (M, n²)).
 
-    Called from the dedicated res-stream CTA (``pid_c == NUM_C_BLOCKS + 1``)
-    in ``_mhc_reduce_apply_kernel``.
+    Called from the dedicated res-stream CTA in
+    ``_mhc_post_pre_reduce_apply_kernel``.
+
+    Sinkhorn variant selected by ``ASYMMETRIC_EXP_DOMAIN``:
+      False (default) → canonical log-domain Sinkhorn-Knopp: symmetric row/col
+          normalization, no eps perturbation.
+      True            → HIP-compatible exp-domain Sinkhorn
+          (``mhc_kernels.cu:493-507``): first iter is asymmetric
+          (softmax(row) + eps, then div(col + eps)); remaining
+          ``NUM_SINKHORN_ITERS - 1`` iters are symmetric div(row + eps) /
+          div(col + eps). ``hc_sinkhorn_eps`` is unused when False.
     """
     bias_res = tl.load(
         bias_ptr + rn_res_global,
@@ -985,30 +996,47 @@ def _mhc_post_pre_reduce_apply_res_block(
     h_res = rsigma[:, None] * alpha_res * acc_res + bias_res[None, :]
 
     if NUM_SINKHORN_ITERS > 0:
-        LOG2_E: tl.constexpr = 1.4426950408889634
+        if ASYMMETRIC_EXP_DOMAIN:
+            # Asymmetric first iter + (NUM_SINKHORN_ITERS - 1) symmetric iters,
+            # mirroring HIP exactly.
+            A = tl.reshape(h_res, (BLOCK_M, n, n))
+            row_max = tl.max(A, axis=2)
+            P = tl.exp(A - row_max[:, :, None])
+            row_sum = tl.sum(P, axis=2)
+            P = P / row_sum[:, :, None] + hc_sinkhorn_eps
+            col_sum = tl.sum(P, axis=1)
+            P = P / (col_sum[:, None, :] + hc_sinkhorn_eps)
+            for _ in range(NUM_SINKHORN_ITERS - 1):
+                row_sum = tl.sum(P, axis=2)
+                P = P / (row_sum[:, :, None] + hc_sinkhorn_eps)
+                col_sum = tl.sum(P, axis=1)
+                P = P / (col_sum[:, None, :] + hc_sinkhorn_eps)
+            out_res = tl.reshape(P, (BLOCK_M, n_squared))
+        else:
+            LOG2_E: tl.constexpr = 1.4426950408889634
 
-        log2_A = tl.reshape(h_res, (BLOCK_M, n, n)) * LOG2_E
-        log2_u = tl.zeros((BLOCK_M, n), dtype=tl.float32)
-        log2_v = tl.zeros((BLOCK_M, n), dtype=tl.float32)
+            log2_A = tl.reshape(h_res, (BLOCK_M, n, n)) * LOG2_E
+            log2_u = tl.zeros((BLOCK_M, n), dtype=tl.float32)
+            log2_v = tl.zeros((BLOCK_M, n), dtype=tl.float32)
 
-        for _ in range(NUM_SINKHORN_ITERS):
-            scaled_row = log2_A + log2_v[:, None, :]
-            row_max = tl.max(scaled_row, axis=2)
-            exp_shifted = tl.exp2(scaled_row - row_max[:, :, None])
-            row_sum_exp = tl.sum(exp_shifted, axis=2)
-            log2_row_sums = row_max + tl.log2(row_sum_exp)
-            log2_u = -log2_row_sums
+            for _ in range(NUM_SINKHORN_ITERS):
+                scaled_row = log2_A + log2_v[:, None, :]
+                row_max = tl.max(scaled_row, axis=2)
+                exp_shifted = tl.exp2(scaled_row - row_max[:, :, None])
+                row_sum_exp = tl.sum(exp_shifted, axis=2)
+                log2_row_sums = row_max + tl.log2(row_sum_exp)
+                log2_u = -log2_row_sums
 
-            scaled_col = log2_A + log2_u[:, :, None]
-            col_max = tl.max(scaled_col, axis=1)
-            exp_shifted = tl.exp2(scaled_col - col_max[:, None, :])
-            col_sum_exp = tl.sum(exp_shifted, axis=1)
-            log2_col_sums = col_max + tl.log2(col_sum_exp)
-            log2_v = -log2_col_sums
+                scaled_col = log2_A + log2_u[:, :, None]
+                col_max = tl.max(scaled_col, axis=1)
+                exp_shifted = tl.exp2(scaled_col - col_max[:, None, :])
+                col_sum_exp = tl.sum(exp_shifted, axis=1)
+                log2_col_sums = col_max + tl.log2(col_sum_exp)
+                log2_v = -log2_col_sums
 
-        log2_P = log2_A + log2_u[:, :, None] + log2_v[:, None, :]
-        P = tl.exp2(log2_P)
-        out_res = tl.reshape(P, (BLOCK_M, n_squared))
+            log2_P = log2_A + log2_u[:, :, None] + log2_v[:, None, :]
+            P = tl.exp2(log2_P)
+            out_res = tl.reshape(P, (BLOCK_M, n_squared))
     else:
         out_res = h_res
 
@@ -1058,6 +1086,8 @@ def _mhc_post_pre_reduce_apply_kernel(
     KSPLIT_POW2: tl.constexpr,
     BLOCK_M_POST_RES: tl.constexpr,
     NUM_SINKHORN_ITERS: tl.constexpr,
+    ASYMMETRIC_EXP_DOMAIN: tl.constexpr,
+    hc_sinkhorn_eps: tl.constexpr,
 ):
     """
     Reduce-and-apply kernel for the split-K mHC pipeline (Eq 15-19 + apply).
@@ -1161,7 +1191,7 @@ def _mhc_post_pre_reduce_apply_kernel(
             acc_sq_ptr
             + ks_offs[:, None] * stride_acc_sq_k
             + m_offs_post_res[None, :] * stride_acc_sq_m,
-            mask=m_mask_post_res,
+            mask=ks_mask[:, None] & m_mask_post_res[None, :],
             other=0.0,
         )
         acc_sq_post_res = tl.sum(acc_sq_post_res, 0)
@@ -1203,7 +1233,7 @@ def _mhc_post_pre_reduce_apply_kernel(
             acc_sq_ptr
             + ks_offs[:, None] * stride_acc_sq_k
             + m_offs_post_res[None, :] * stride_acc_sq_m,
-            mask=m_mask_post_res,
+            mask=ks_mask[:, None] & m_mask_post_res[None, :],
             other=0.0,
         )
         acc_sq_post_res = tl.sum(acc_sq_post_res, 0)
@@ -1242,4 +1272,6 @@ def _mhc_post_pre_reduce_apply_kernel(
             stride_hr_n,
             BLOCK_M_POST_RES,
             NUM_SINKHORN_ITERS,
+            ASYMMETRIC_EXP_DOMAIN,
+            hc_sinkhorn_eps,
         )

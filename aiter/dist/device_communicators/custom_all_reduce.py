@@ -46,6 +46,21 @@ def is_weak_contiguous(inp: torch.Tensor):
     )
 
 
+def can_pack_2d_last_dim_slice(inp: torch.Tensor) -> bool:
+    """Mirror the C++ eager-mode packable-layout check.
+
+    The registered-buffer pack path only supports 2-D last-dim slices where
+    each row is dense but rows may have extra pitch. Keep this predicate in
+    sync with ``_can_pack_2d_last_dim_slice`` in
+    ``csrc/kernels/custom_all_reduce.cu`` so Python only routes layouts that
+    the C++ copy helper can materialize safely.
+    """
+    if inp.dim() != 2:
+        return False
+    n = inp.size(-1)
+    return inp.stride(-1) == 1 and inp.stride(0) >= n and not inp.is_contiguous()
+
+
 # Wavefront width on AMD CDNA / gfx94x / gfx950. ``__shfl_xor`` in the
 # fused per-group FP8 quant epilogue is scoped to a single wavefront, so
 # ``threads_per_group = group_size / PACK_SIZE`` must fit inside it.
@@ -507,14 +522,12 @@ class CustomAllreduce:
         """Batch-register graph-captured buffer addresses."""
         self._pool.flush_graph_buffers(self._ptr)
 
-    def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
+    def _fits_custom_ar_size(self, inp: torch.Tensor, prefill_support: bool = False):
         if self.disabled:
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
-            return False
-        if not is_weak_contiguous(inp):
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
@@ -527,6 +540,19 @@ class CustomAllreduce:
             else:
                 return inp_size <= (self.max_size / 2)
         return False
+
+    def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
+        return self._fits_custom_ar_size(inp, prefill_support) and is_weak_contiguous(
+            inp
+        )
+
+    def should_custom_ar_bytes(self, inp: torch.Tensor, prefill_support: bool = False):
+        """Return whether the tensor size fits custom AR even if it is strided.
+
+        This is used by callers that can explicitly pack non-contiguous inputs
+        into the pre-registered IPC buffer before launching the fused kernel.
+        """
+        return self._fits_custom_ar_size(inp, prefill_support)
 
     def should_custom_ag(self, inp: torch.Tensor):
         if self.disabled:
@@ -680,17 +706,36 @@ class CustomAllreduce:
         )
         return out
 
+    # Int dtypes have no fp counterpart in the C++ dispatch enum, but the
+    # all-gather kernel is pure memcpy parametrized only by sizeof(T). View
+    # ints as same-size floats so callers gathering token-id tensors work
+    # (e.g. DeepSeek-V4-Pro hash-gate gathers int32 across DP ranks).
+    _INT_TO_FP_VIEW = {
+        torch.int64: torch.float64,
+        torch.int32: torch.float32,
+        torch.int16: torch.float16,
+    }
+
     def custom_all_gather(
         self, inp: torch.Tensor, dim: int = 0
     ) -> Optional[torch.Tensor]:
+        orig_dtype = inp.dtype
+        view_dtype = self._INT_TO_FP_VIEW.get(orig_dtype)
+        if view_dtype is not None:
+            inp = inp.view(view_dtype)
+
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_gather_reg(inp, dim=dim)
+                out = self.all_gather_reg(inp, dim=dim)
             else:
                 print("allgather capture hipgraph error")
-                return torch.zeros_like(inp)
+                out = torch.zeros_like(inp)
         else:
-            return self.all_gather_unreg(inp, dim=dim)
+            out = self.all_gather_unreg(inp, dim=dim)
+
+        if view_dtype is not None and out is not None:
+            out = out.view(orig_dtype)
+        return out
 
     def fused_ar_rms(
         self,
@@ -705,27 +750,46 @@ class CustomAllreduce:
         registered: bool = False,
         use_1stage: bool = False,
         post_per_token_quant: bool = False,
+        out_hidden_dim: int = 0,
     ):
+        valid_dim = w.numel()
         if res_out is None:
-            res_out = torch.empty_like(inp)
+            res_out = torch.empty(
+                inp.shape[:-1] + (valid_dim,), dtype=inp.dtype, device=inp.device
+            )
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
         if not post_per_token_quant:
             if out is None:
-                out = torch.empty_like(inp)
+                out_dim = out_hidden_dim or inp.shape[-1]
+                out = torch.empty(inp.shape[:-1] + (out_dim,), dtype=inp.dtype, device=inp.device)
             assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-            ops.fused_allreduce_rmsnorm(
-                self._ptr,
-                inp,
-                res_inp,
-                res_out,
-                out,
-                w,
-                eps,
-                reg,
-                reg_bytes,
-                use_1stage,
-            )
+            if inp.shape[-1] == valid_dim and out.shape[-1] == inp.shape[-1]:
+                ops.fused_allreduce_rmsnorm(
+                    self._ptr,
+                    inp,
+                    res_inp,
+                    res_out,
+                    out,
+                    w,
+                    eps,
+                    reg,
+                    reg_bytes,
+                    use_1stage,
+                )
+            else:
+                ops.fused_allreduce_rmsnorm_pad(
+                    self._ptr,
+                    inp,
+                    res_inp,
+                    res_out,
+                    out,
+                    w,
+                    eps,
+                    reg,
+                    reg_bytes,
+                    use_1stage,
+                )
             return out, res_out
         else:
             if out is None:
@@ -757,6 +821,7 @@ class CustomAllreduce:
         weight: torch.Tensor,
         eps: float,
         use_1stage: bool,
+        out_hidden_dim: int = 0,
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -770,9 +835,22 @@ class CustomAllreduce:
                     eps=eps,
                     registered=True,
                     use_1stage=use_1stage,
+                    out_hidden_dim=out_hidden_dim,
                 )
             else:
-                return torch.zeros_like(input), torch.zeros_like(input)
+                out_dim = out_hidden_dim or input.shape[-1]
+                return (
+                    torch.zeros(
+                        input.shape[:-1] + (out_dim,),
+                        dtype=input.dtype,
+                        device=input.device,
+                    ),
+                    torch.zeros(
+                        input.shape[:-1] + (weight.numel(),),
+                        dtype=input.dtype,
+                        device=input.device,
+                    ),
+                )
         else:
             return self.fused_ar_rms(
                 input,
@@ -781,7 +859,58 @@ class CustomAllreduce:
                 eps=eps,
                 registered=False,
                 use_1stage=use_1stage,
+                out_hidden_dim=out_hidden_dim,
             )
+
+    def custom_fused_ar_rms_packed_input(
+        self,
+        input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        use_1stage: bool,
+        out_hidden_dim: int = 0,
+        prefill_support: bool = False,
+    ) -> Optional[torch.Tensor]:
+        # Let the C++ wrapper pack supported last-dim sliced views directly
+        # into the registered IPC buffer so eager and graph paths both avoid
+        # materializing an intermediate contiguous tensor in Python.
+        if self.disabled or not self.should_custom_ar_bytes(input, prefill_support):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_ar_rms(
+                    input,
+                    residual_inp,
+                    w=weight,
+                    eps=eps,
+                    registered=False,
+                    use_1stage=use_1stage,
+                    out_hidden_dim=out_hidden_dim,
+                )
+            else:
+                out_dim = out_hidden_dim or input.shape[-1]
+                return (
+                    torch.zeros(
+                        input.shape[:-1] + (out_dim,),
+                        dtype=input.dtype,
+                        device=input.device,
+                    ),
+                    torch.zeros(
+                        input.shape[:-1] + (weight.numel(),),
+                        dtype=input.dtype,
+                        device=input.device,
+                    ),
+                )
+        return self.fused_ar_rms(
+            input,
+            residual_inp,
+            w=weight,
+            eps=eps,
+            registered=False,
+            use_1stage=use_1stage,
+            out_hidden_dim=out_hidden_dim,
+        )
 
     def custom_fused_ar_rms_quant(
         self,
@@ -876,7 +1005,7 @@ class CustomAllreduce:
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
-    
+
     def fused_qknorm_ar(
         self,
         qkv_in: torch.Tensor,
@@ -909,7 +1038,7 @@ class CustomAllreduce:
             reg_bytes,
         )
         return q_out, k_out, v_out
-    
+
     def custom_fused_qknorm_ar(
         self,
         qkv_in: torch.Tensor,
@@ -920,9 +1049,17 @@ class CustomAllreduce:
         dtype = qkv_in.dtype
         if self.disabled:
             return (
-                torch.empty((qkv_in.shape[0], q_w.shape[-1]), dtype=dtype, device=qkv_in.device),
-                torch.empty((qkv_in.shape[0], k_w.shape[-1]), dtype=dtype, device=qkv_in.device),
-                torch.empty((qkv_in.shape[0], qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1]), dtype=dtype, device=qkv_in.device)
+                torch.empty(
+                    (qkv_in.shape[0], q_w.shape[-1]), dtype=dtype, device=qkv_in.device
+                ),
+                torch.empty(
+                    (qkv_in.shape[0], k_w.shape[-1]), dtype=dtype, device=qkv_in.device
+                ),
+                torch.empty(
+                    (qkv_in.shape[0], qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1]),
+                    dtype=dtype,
+                    device=qkv_in.device,
+                ),
             )
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
@@ -935,9 +1072,24 @@ class CustomAllreduce:
                 )
             else:
                 return (
-                    torch.empty((qkv_in.shape[0], q_w.shape[-1]), dtype=dtype, device=qkv_in.device),
-                    torch.empty((qkv_in.shape[0], k_w.shape[-1]), dtype=dtype, device=qkv_in.device),
-                    torch.empty((qkv_in.shape[0], qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1]), dtype=dtype, device=qkv_in.device)
+                    torch.empty(
+                        (qkv_in.shape[0], q_w.shape[-1]),
+                        dtype=dtype,
+                        device=qkv_in.device,
+                    ),
+                    torch.empty(
+                        (qkv_in.shape[0], k_w.shape[-1]),
+                        dtype=dtype,
+                        device=qkv_in.device,
+                    ),
+                    torch.empty(
+                        (
+                            qkv_in.shape[0],
+                            qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1],
+                        ),
+                        dtype=dtype,
+                        device=qkv_in.device,
+                    ),
                 )
         else:
             return self.fused_qknorm_ar(

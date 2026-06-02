@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import copy
 import torch
 from torch import Tensor
 import aiter
@@ -17,6 +18,21 @@ def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
     x = x * torch.rsqrt(variance + eps)
     x = x.to(input_dtype)
     return weight * x
+
+
+def rms_norm_diffusers_forward(x: Tensor, weight: Tensor, eps: float):
+    input_dtype = x.dtype
+    variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    hidden_states = x * torch.rsqrt(variance + eps)
+
+    if weight is not None:
+        if weight.dtype in [torch.float16, torch.bfloat16]:
+            hidden_states = hidden_states.to(weight.dtype)
+        hidden_states = hidden_states * weight
+    else:
+        hidden_states = hidden_states.to(input_dtype)
+
+    return hidden_states
 
 
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
@@ -51,18 +67,89 @@ def apply_rotary_emb_torch(
         return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
+def apply_rotary_emb_diffusers(
+    x: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    is_neox_style: bool,
+) -> Tensor:
+    """Diffusers / qwen-image-edit reference rope: cos/sin stay fp32, x is upcast
+    to fp32 for the multiply, output is cast back to x's original dtype.
+    Mirrors the semantics of `_apply_rope_complex` (complex multiply in fp32,
+    `.to(original_dtype)` on the result)."""
+    out_dtype = x.dtype
+    cos = cos.unsqueeze(-2).float()
+    sin = sin.unsqueeze(-2).float()
+    x = x.float()
+    if is_neox_style:
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+    else:
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    if is_neox_style:
+        out = torch.cat((o1, o2), dim=-1)
+    else:
+        out = torch.stack((o1, o2), dim=-1).flatten(-2)
+    return out.to(out_dtype)
+
+
 def apply_rotary_emb_dispatch(
-    x: Tensor, cos: Tensor, sin: Tensor, is_neox_style: bool
+    x: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    is_neox_style: bool,
+    rotary_dim: int = 0,
 ) -> Tensor:
     """
     Args:
         x: [num_tokens, num_heads, head_size]
-        cos: [num_tokens, head_size // 2]
-        sin: [num_tokens, head_size // 2]
+        cos: [num_tokens, rotary_dim // 2]
+        sin: [num_tokens, rotary_dim // 2]
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
+        rotary_dim: 0 means full rotary; otherwise only the first rotary_dim
+            channels are rotated.
     """
+    head_size = x.shape[-1]
+    rotary_dim_ = rotary_dim if rotary_dim > 0 else head_size
+    if rotary_dim_ < head_size:
+        x_rot = apply_rotary_emb_torch(x[..., :rotary_dim_], cos, sin, is_neox_style)
+        return torch.cat((x_rot, x[..., rotary_dim_:]), dim=-1)
     return apply_rotary_emb_torch(x, cos, sin, is_neox_style)
+
+
+def split_qkv(
+    qkv: Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_size: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    q_size = num_heads_q * head_size
+    k_size = num_heads_k * head_size
+    v_size = num_heads_v * head_size
+    qkv_2d = qkv.view(qkv.shape[0], q_size + k_size + v_size)
+    return (
+        qkv_2d[:, :q_size],
+        qkv_2d[:, q_size : q_size + k_size],
+        qkv_2d[:, q_size + k_size :],
+    )
+
+
+def clone_qkv_inputs(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_size: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    # deepcopy preserves the original split-view aliasing/strides, so perf/warmup
+    # iterations do not mutate the caller's tensors in-place.
+    return copy.deepcopy((q, k, v))
 
 
 @perftest()
@@ -70,7 +157,7 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
     qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
     qw: Tensor,  #  contiguous (head_size)
     kw: Tensor,  #  contiguous (head_size)
-    cos_sin: Tensor,  # contiguous (max_positions * head_size)
+    cos_sin: Tensor,  # contiguous (max_positions * rotary_dim), rotary_dim <= head_size
     positions: Tensor,  # contiguous (3 * num_tokens) or (num_tokens)
     num_tokens: int,
     num_heads_q: int,
@@ -86,11 +173,7 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
     slot_mapping: Tensor,
     kv_cache_dtype: str,
 ):
-    q_size = num_heads_q * head_size
-    k_size = num_heads_k * head_size
-    v_size = num_heads_v * head_size
-    qkv = qkv.view(num_tokens, q_size + k_size + v_size)
-    q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
+    q, k, v = split_qkv(qkv, num_heads_q, num_heads_k, num_heads_v, head_size)
 
     q_by_head = q.view(num_tokens, num_heads_q, head_size)
     q_by_head = rms_norm_forward(q_by_head, qw, eps)
@@ -100,18 +183,19 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
     k_by_head = rms_norm_forward(k_by_head, kw, eps)
     k = k_by_head.view(k.shape)
 
-    cos_sin = cos_sin.view(cos_sin.shape[0], head_size)
+    rotary_dim = cos_sin.shape[-1]
+    cos_sin = cos_sin.view(cos_sin.shape[0], rotary_dim)
     cos_sin = cos_sin[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
 
     q_shape = q.shape
     q = q.view(num_tokens, -1, head_size)
-    q = apply_rotary_emb_dispatch(q, cos, sin, is_neox_style)
+    q = apply_rotary_emb_dispatch(q, cos, sin, is_neox_style, rotary_dim)
     q = q.reshape(q_shape)
 
     k_shape = k.shape
     k = k.view(num_tokens, -1, head_size)
-    k = apply_rotary_emb_dispatch(k, cos, sin, is_neox_style)
+    k = apply_rotary_emb_dispatch(k, cos, sin, is_neox_style, rotary_dim)
 
     v = v.view(num_tokens, -1, head_size)
 
@@ -141,12 +225,13 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
 
 @perftest()
 def run_aiter_qk_norm_rope_cache_quant_shuffle(
-    qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
     qw: Tensor,  #  contiguous (head_size)
     kw: Tensor,  #  contiguous (head_size)
     cos_sin: Tensor,  # contiguous (max_positions * head_size)
     positions: Tensor,  # contiguous (3 * num_tokens)
-    num_tokens: int,
     num_heads_q: int,
     num_heads_k: int,
     num_heads_v: int,
@@ -160,70 +245,13 @@ def run_aiter_qk_norm_rope_cache_quant_shuffle(
     k_scale: Tensor,
     v_scale: Tensor,
 ):
-    qkv = qkv.clone()  # inplace op
-
-    aiter.fused_qk_norm_rope_cache_quant_shuffle(
-        qkv,
-        num_heads_q=num_heads_q,
-        num_heads_k=num_heads_k,
-        num_heads_v=num_heads_v,
-        head_dim=head_size,
-        eps=eps,
-        qw=qw,
-        kw=kw,
-        cos_sin_cache=cos_sin,
-        is_neox_style=is_neox_style,
-        pos_ids=positions,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        slot_mapping=slot_mapping,
-        kv_cache_dtype=kv_cache_dtype,
-        k_scale=k_scale,
-        v_scale=v_scale,
+    q, k, v = clone_qkv_inputs(
+        q, k, v, num_heads_q, num_heads_k, num_heads_v, head_size
     )
-
-    q_size = num_heads_q * head_size
-    k_size = num_heads_k * head_size
-    v_size = num_heads_v * head_size
-
-    qkv = qkv.view(num_tokens, q_size + k_size + v_size)
-    q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
-    return q, k, v, k_cache, v_cache
-
-
-@perftest()
-def run_aiter_qk_norm_rope_cache_quant_shuffle_separate(
-    qkv: Tensor,
-    qw: Tensor,
-    kw: Tensor,
-    cos_sin: Tensor,
-    positions: Tensor,
-    num_tokens: int,
-    num_heads_q: int,
-    num_heads_k: int,
-    num_heads_v: int,
-    head_size: int,
-    is_neox_style: bool,
-    eps: float,
-    k_cache: Tensor,
-    v_cache: Tensor,
-    slot_mapping: Tensor,
-    kv_cache_dtype: str,
-    k_scale: Tensor,
-    v_scale: Tensor,
-):
-    """Same as run_aiter_qk_norm_rope_cache_quant_shuffle but exercises q/k/v inputs."""
-    q_size = num_heads_q * head_size
-    k_size = num_heads_k * head_size
-    v_size = num_heads_v * head_size
-    qkv_c = qkv.clone()
-    qkv_2d = qkv_c.view(num_tokens, q_size + k_size + v_size)
-    # 与 concat qkv 同一块存储上 split 出的视图（通常非 contiguous）
-    q = qkv_2d[:, :q_size]
-    k = qkv_2d[:, q_size : q_size + k_size]
-    v = qkv_2d[:, q_size + k_size :]
     aiter.fused_qk_norm_rope_cache_quant_shuffle(
-        None,
+        q,
+        k,
+        v,
         num_heads_q=num_heads_q,
         num_heads_k=num_heads_k,
         num_heads_v=num_heads_v,
@@ -240,16 +268,13 @@ def run_aiter_qk_norm_rope_cache_quant_shuffle_separate(
         kv_cache_dtype=kv_cache_dtype,
         k_scale=k_scale,
         v_scale=v_scale,
-        q=q,
-        k=k,
-        v=v,
     )
     return q, k, v, k_cache, v_cache
 
 
 @benchmark()
-def test_shuffle_separate_inputs_match_concat_qkv():
-    """fused_qk_norm_rope_cache_quant_shuffle: q/k/v path matches legacy concatenated qkv."""
+def test_shuffle_contiguous_inputs_match_split_views():
+    """Contiguous q/k/v inputs should match non-contiguous split views."""
     dtype = torch.bfloat16
     num_tokens = 11
     num_heads_q = num_heads_k = num_heads_v = 2
@@ -303,13 +328,27 @@ def test_shuffle_separate_inputs_match_concat_qkv():
     v_scale_c = v_scale.clone()
     qkv_c = qkv.clone()
 
+    q1_src, k1_src, v1_src = split_qkv(
+        qkv.clone(), num_heads_q, num_heads_k, num_heads_v, head_size
+    )
+    q1_src = q1_src.contiguous()
+    k1_src = k1_src.contiguous()
+    v1_src = v1_src.contiguous()
+    q2_src, k2_src, v2_src = split_qkv(
+        qkv_c, num_heads_q, num_heads_k, num_heads_v, head_size
+    )
+    assert not q2_src.is_contiguous()
+    assert not k2_src.is_contiguous()
+    assert not v2_src.is_contiguous()
+
     (q1, k1, v1, kc1, vc1), _ = run_aiter_qk_norm_rope_cache_quant_shuffle(
-        qkv,
+        q1_src,
+        k1_src,
+        v1_src,
         qw,
         kw,
         cos_sin,
         positions,
-        num_tokens,
         num_heads_q,
         num_heads_k,
         num_heads_v,
@@ -324,13 +363,14 @@ def test_shuffle_separate_inputs_match_concat_qkv():
         v_scale,
     )
 
-    (q2, k2, v2, kc2, vc2), _ = run_aiter_qk_norm_rope_cache_quant_shuffle_separate(
-        qkv_c,
+    (q2, k2, v2, kc2, vc2), _ = run_aiter_qk_norm_rope_cache_quant_shuffle(
+        q2_src,
+        k2_src,
+        v2_src,
         qw,
         kw,
         cos_sin,
         positions,
-        num_tokens,
         num_heads_q,
         num_heads_k,
         num_heads_v,
@@ -345,9 +385,9 @@ def test_shuffle_separate_inputs_match_concat_qkv():
         v_scale_c,
     )
 
-    checkAllclose(q1, q2, msg="q separate vs qkv", rtol=1e-2, atol=0.05)
-    checkAllclose(k1, k2, msg="k separate vs qkv", rtol=1e-2, atol=0.05)
-    checkAllclose(v1, v2, msg="v separate vs qkv", rtol=1e-2, atol=0.05)
+    checkAllclose(q1, q2, msg="q contiguous vs split-view", rtol=1e-2, atol=0.05)
+    checkAllclose(k1, k2, msg="k contiguous vs split-view", rtol=1e-2, atol=0.05)
+    checkAllclose(v1, v2, msg="v contiguous vs split-view", rtol=1e-2, atol=0.05)
     checkAllclose(kc1.float(), kc2.float(), msg="k_cache", rtol=1e-2, atol=0.05)
     checkAllclose(vc1.float(), vc2.float(), msg="v_cache", rtol=1e-2, atol=0.05)
     checkAllclose(k_scale, k_scale_c, msg="k_scale", rtol=1e-2, atol=0.05)
@@ -355,8 +395,8 @@ def test_shuffle_separate_inputs_match_concat_qkv():
 
 
 @benchmark()
-def test_shuffle_noncontiguous_qkv_matches_contiguous():
-    """q/k/v 仅从拼接 qkv 的 view 上 slice 得到（同一行存储、stride0 为总宽，通常非 contiguous），与 concat qkv 路径一致。"""
+def test_shuffle_noncontiguous_split_views_match_contiguous_inputs():
+    """Non-contiguous q/k/v split views should match equivalent contiguous inputs."""
     dtype = torch.bfloat16
     num_tokens = 11
     num_heads_q = num_heads_k = num_heads_v = 2
@@ -410,14 +450,21 @@ def test_shuffle_noncontiguous_qkv_matches_contiguous():
     v_cache_ref = v_cache.clone()
     k_scale_ref = k_scale.clone()
     v_scale_ref = v_scale.clone()
+    q_ref_src, k_ref_src, v_ref_src = split_qkv(
+        buf_ref, num_heads_q, num_heads_k, num_heads_v, head_size
+    )
+    q_ref_src = q_ref_src.contiguous()
+    k_ref_src = k_ref_src.contiguous()
+    v_ref_src = v_ref_src.contiguous()
     (q_ref, k_ref, v_ref, kc_ref, vc_ref), _ = (
         run_aiter_qk_norm_rope_cache_quant_shuffle(
-            buf_ref,
+            q_ref_src,
+            k_ref_src,
+            v_ref_src,
             qw,
             kw,
             cos_sin,
             positions,
-            num_tokens,
             num_heads_q,
             num_heads_k,
             num_heads_v,
@@ -447,7 +494,9 @@ def test_shuffle_noncontiguous_qkv_matches_contiguous():
     assert not v_nc.is_contiguous()
 
     aiter.fused_qk_norm_rope_cache_quant_shuffle(
-        qkv=None,
+        q_nc,
+        k_nc,
+        v_nc,
         num_heads_q=num_heads_q,
         num_heads_k=num_heads_k,
         num_heads_v=num_heads_v,
@@ -464,14 +513,11 @@ def test_shuffle_noncontiguous_qkv_matches_contiguous():
         kv_cache_dtype=kv_cache_dtype,
         k_scale=k_scale_a,
         v_scale=v_scale_a,
-        q=q_nc,
-        k=k_nc,
-        v=v_nc,
     )
 
-    checkAllclose(q_nc, q_ref, msg="q split-view vs concat qkv", rtol=1e-2, atol=0.05)
-    checkAllclose(k_nc, k_ref, msg="k split-view vs concat qkv", rtol=1e-2, atol=0.05)
-    checkAllclose(v_nc, v_ref, msg="v split-view vs concat qkv", rtol=1e-2, atol=0.05)
+    checkAllclose(q_nc, q_ref, msg="q split-view vs contiguous", rtol=1e-2, atol=0.05)
+    checkAllclose(k_nc, k_ref, msg="k split-view vs contiguous", rtol=1e-2, atol=0.05)
+    checkAllclose(v_nc, v_ref, msg="v split-view vs contiguous", rtol=1e-2, atol=0.05)
     checkAllclose(
         k_cache_a.float(), kc_ref.float(), msg="k_cache", rtol=1e-2, atol=0.05
     )
@@ -483,8 +529,8 @@ def test_shuffle_noncontiguous_qkv_matches_contiguous():
 
 
 @benchmark()
-def test_shuffle_when_qkv_and_qkv_tensors_both_passed_uses_qk_v():
-    """同时传入拼接 qkv 与 q/k/v 时走 q/k/v；qkv 内容应被忽略。"""
+def test_shuffle_3d_inputs_match_2d_inputs():
+    """The operator should produce the same result for equivalent 2D and 3D q/k/v inputs."""
     dtype = torch.bfloat16
     num_tokens = 9
     num_heads_q = num_heads_k = num_heads_v = 2
@@ -517,7 +563,7 @@ def test_shuffle_when_qkv_and_qkv_tensors_both_passed_uses_qk_v():
         return kc, vc
 
     slot_mapping = torch.randperm(num_tokens, dtype=torch.int64, device="cuda")
-    qkv_truth = torch.randn(
+    qkv = torch.randn(
         (num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
         dtype=dtype,
         device="cuda",
@@ -532,23 +578,24 @@ def test_shuffle_when_qkv_and_qkv_tensors_both_passed_uses_qk_v():
     qs = int(num_heads_q * head_size)
     ks = int(num_heads_k * head_size)
     vs = int(num_heads_v * head_size)
-    flat = qkv_truth.view(num_tokens, qs + ks + vs)
+    flat = qkv.view(num_tokens, qs + ks + vs)
     q_src = flat[:, :qs].contiguous()
     k_src = flat[:, qs : qs + ks].contiguous()
     v_src = flat[:, qs + ks :].contiguous()
 
-    k_cache_a, v_cache_a = make_kv_caches()
+    k_cache_init, v_cache_init = make_kv_caches()
+    k_cache_a, v_cache_a = k_cache_init.clone(), v_cache_init.clone()
     k_scale_a = torch.zeros(
         [num_blocks, num_heads_k, page_size], dtype=torch.float32, device="cuda"
     )
     v_scale_a = torch.zeros(
         [num_blocks, num_heads_v, page_size], dtype=torch.float32, device="cuda"
     )
-    qkv_decoy = torch.randn_like(qkv_truth)
-
     q_a, k_a, v_a = q_src.clone(), k_src.clone(), v_src.clone()
     aiter.fused_qk_norm_rope_cache_quant_shuffle(
-        qkv_decoy,
+        q_a,
+        k_a,
+        v_a,
         num_heads_q=num_heads_q,
         num_heads_k=num_heads_k,
         num_heads_v=num_heads_v,
@@ -565,17 +612,18 @@ def test_shuffle_when_qkv_and_qkv_tensors_both_passed_uses_qk_v():
         kv_cache_dtype=kv_cache_dtype,
         k_scale=k_scale_a,
         v_scale=v_scale_a,
-        q=q_a,
-        k=k_a,
-        v=v_a,
     )
 
-    k_cache_b, v_cache_b = make_kv_caches()
+    k_cache_b, v_cache_b = k_cache_init.clone(), v_cache_init.clone()
     k_scale_b = torch.zeros_like(k_scale_a)
     v_scale_b = torch.zeros_like(v_scale_a)
-    q_b, k_b, v_b = q_src.clone(), k_src.clone(), v_src.clone()
+    q_b = q_src.clone().view(num_tokens, num_heads_q, head_size)
+    k_b = k_src.clone().view(num_tokens, num_heads_k, head_size)
+    v_b = v_src.clone().view(num_tokens, num_heads_v, head_size)
     aiter.fused_qk_norm_rope_cache_quant_shuffle(
-        qkv_truth.clone(),
+        q_b,
+        k_b,
+        v_b,
         num_heads_q=num_heads_q,
         num_heads_k=num_heads_k,
         num_heads_v=num_heads_v,
@@ -592,14 +640,11 @@ def test_shuffle_when_qkv_and_qkv_tensors_both_passed_uses_qk_v():
         kv_cache_dtype=kv_cache_dtype,
         k_scale=k_scale_b,
         v_scale=v_scale_b,
-        q=q_b,
-        k=k_b,
-        v=v_b,
     )
 
-    checkAllclose(q_a, q_b, msg="q decoy vs truth qkv", rtol=1e-2, atol=0.05)
-    checkAllclose(k_a, k_b, msg="k decoy vs truth qkv", rtol=1e-2, atol=0.05)
-    checkAllclose(v_a, v_b, msg="v decoy vs truth qkv", rtol=1e-2, atol=0.05)
+    checkAllclose(q_a, q_b.view_as(q_a), msg="q 2d vs 3d", rtol=1e-2, atol=0.05)
+    checkAllclose(k_a, k_b.view_as(k_a), msg="k 2d vs 3d", rtol=1e-2, atol=0.05)
+    checkAllclose(v_a, v_b.view_as(v_a), msg="v 2d vs 3d", rtol=1e-2, atol=0.05)
     checkAllclose(
         k_cache_a.float(), k_cache_b.float(), msg="k_cache", rtol=1e-2, atol=0.05
     )
@@ -846,12 +891,16 @@ def test_qk_norm_rope_cache_quant(
     num_blocks,
     page_size,
     max_positions: int = 10000,
+    rotary_dim: int = 0,
 ):
     # Construct tensors inside the function
     if kv_cache_dtype == "fp8_e4m3":
         cache_dtype = get_dtype_fp8()
     else:
         cache_dtype = dtype
+    rotary_dim_ = rotary_dim if rotary_dim > 0 else head_size
+    assert rotary_dim_ <= head_size
+    assert rotary_dim_ % 2 == 0
 
     k_cache = torch.randn(
         [num_blocks, page_size, num_heads_k, head_size],
@@ -886,7 +935,7 @@ def test_qk_norm_rope_cache_quant(
     )
     qw = torch.randn(head_size, dtype=dtype, device="cuda")
     kw = torch.randn(head_size, dtype=dtype, device="cuda")
-    cos_sin = torch.randn((max_positions, head_size), dtype=dtype, device="cuda")
+    cos_sin = torch.randn((max_positions, rotary_dim_), dtype=dtype, device="cuda")
     pos_shape = (num_tokens,)
     positions = torch.randint(
         0, max_positions, pos_shape, dtype=torch.int64, device="cuda"
@@ -916,13 +965,17 @@ def test_qk_norm_rope_cache_quant(
             kv_cache_dtype,
         )
     )
+    q_in, k_in, v_in = split_qkv(
+        qkv.clone(), num_heads_q, num_heads_k, num_heads_v, head_size
+    )
     (q, k, v, k_cache, v_cache), avg_cu = run_aiter_qk_norm_rope_cache_quant_shuffle(
-        qkv,
+        q_in,
+        k_in,
+        v_in,
         qw,
         kw,
         cos_sin,
         positions,
-        num_tokens,
         num_heads_q,
         num_heads_k,
         num_heads_v,
@@ -938,6 +991,8 @@ def test_qk_norm_rope_cache_quant(
     )
 
     info = f"dtype:{dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}, num_heads_v:{num_heads_v}, head_size:{head_size}, is_neox_style:{is_neox_style}"
+    if rotary_dim > 0:
+        info += f", rotary_dim:{rotary_dim_}"
     msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch / avg_cu - 1:<5.1%}"
     checkAllclose(q_ref, q, msg="q", rtol=1e-2, atol=0.05)
     checkAllclose(k_ref, k, msg="k", rtol=1e-2, atol=0.05)
@@ -953,6 +1008,7 @@ def test_qk_norm_rope_cache_quant(
     ret = {}
     ret["fused_qk_us"] = avg_cu
     ret["unfused_us"] = avg_torch
+    ret["rotary_dim"] = rotary_dim_
     ret["aiter_bw(TB/s)"] = (
         num_tokens
         * (num_heads_k + num_heads_v + num_heads_q)
@@ -1036,14 +1092,22 @@ def test_qk_norm_rope_cache_quant_v_shuffle_layout(
     k_scale_b = k_scale.clone()
     v_scale_b = v_scale.clone()
 
+    q_a_in, k_a_in, v_a_in = split_qkv(
+        qkv.clone(), num_heads_q, num_heads_k, num_heads_v, head_size
+    )
+    q_b_in, k_b_in, v_b_in = split_qkv(
+        qkv.clone(), num_heads_q, num_heads_k, num_heads_v, head_size
+    )
+
     (q_a, k_a, v_a, k_cache_a, v_cache_a), avg_a = (
         run_aiter_qk_norm_rope_cache_quant_shuffle(
-            qkv.clone(),
+            q_a_in,
+            k_a_in,
+            v_a_in,
             qw,
             kw,
             cos_sin,
             positions,
-            num_tokens,
             num_heads_q,
             num_heads_k,
             num_heads_v,
@@ -1061,12 +1125,13 @@ def test_qk_norm_rope_cache_quant_v_shuffle_layout(
 
     (q_b, k_b, v_b, k_cache_b, v_cache_b), avg_b = (
         run_aiter_qk_norm_rope_cache_quant_shuffle(
-            qkv.clone(),
+            q_b_in,
+            k_b_in,
+            v_b_in,
             qw,
             kw,
             cos_sin,
             positions,
-            num_tokens,
             num_heads_q,
             num_heads_k,
             num_heads_v,
@@ -1323,6 +1388,168 @@ def test_qk_norm_rope_2way(
     ret["batch_size"] = batch_size
     ret["num_tokens0"] = num_tokens0
     ret["num_tokens1"] = num_tokens1
+    ret["num_heads_q"] = num_heads_q
+    ret["num_heads_k"] = num_heads_k
+    ret["head_size"] = head_size
+    ret["is_interleaved"] = "1" if is_interleaved else "0"
+    ret["avg_torch"] = avg_torch
+    ret["avg_cu"] = avg_cu
+    ret["speedup"] = avg_torch / avg_cu
+    return ret
+
+
+@perftest()
+def run_torch_qk_norm_rope_1way(
+    q: Tensor,  # contiguous (batch_size * num_tokens * num_heads_q * head_size)
+    k: Tensor,  # contiguous (batch_size * num_tokens * num_heads_k * head_size)
+    w_q: Tensor,  # contiguous (head_size)
+    w_k: Tensor,  # contiguous (head_size)
+    cos_sin: Tensor,  # contiguous (num_tokens * head_size)
+    batch_size: int,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+):
+    is_neox_style = not is_interleaved
+    q_shape = q.shape
+    k_shape = k.shape
+    q_by_head = rms_norm_diffusers_forward(
+        q.view(batch_size, num_tokens, num_heads_q, head_size), w_q, eps
+    )
+    k_by_head = rms_norm_diffusers_forward(
+        k.view(batch_size, num_tokens, num_heads_k, head_size), w_k, eps
+    )
+    # cos_sin must arrive as fp32 — diffusers / qwen-image-edit reference
+    # passes the complex freqs in fp32 to keep the rope multiply precision.
+    assert (
+        cos_sin.dtype == torch.float32
+    ), f"cos_sin must be fp32 to match the diffusers reference, got {cos_sin.dtype}"
+    cos_sin = cos_sin.view(num_tokens, head_size)
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    q = apply_rotary_emb_diffusers(q_by_head, cos, sin, is_neox_style)
+    k = apply_rotary_emb_diffusers(k_by_head, cos, sin, is_neox_style)
+    q = q.reshape(q_shape)
+    k = k.reshape(k_shape)
+    return q, k
+
+
+@perftest()
+def run_fused_qk_norm_rope_1way(
+    q: Tensor,  # contiguous (batch_size * num_tokens * num_heads_q * head_size)
+    k: Tensor,  # contiguous (batch_size * num_tokens * num_heads_k * head_size)
+    w_q: Tensor,  # contiguous (head_size)
+    w_k: Tensor,  # contiguous (head_size)
+    cos_sin: Tensor,  # contiguous (num_tokens * head_size)
+    batch_size: int,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+):
+    out_q = torch.empty(
+        (batch_size, num_tokens, num_heads_q, head_size),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    out_k = torch.empty(
+        (batch_size, num_tokens, num_heads_k, head_size),
+        dtype=k.dtype,
+        device=k.device,
+    )
+    aiter.fused_qk_norm_rope_1way(
+        q,
+        k,
+        w_q,
+        w_k,
+        cos_sin,
+        batch_size,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        is_interleaved,
+        eps,
+        out_q,
+        out_k,
+    )
+    return out_q, out_k
+
+
+@benchmark()
+def test_qk_norm_rope_1way(
+    dtype,
+    batch_size,
+    num_tokens,
+    num_heads_q,
+    num_heads_k,
+    head_size,
+    is_interleaved,
+    eps=1e-6,
+):
+    q = torch.randn(
+        (batch_size, num_tokens, num_heads_q, head_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    k = torch.randn(
+        (batch_size, num_tokens, num_heads_k, head_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    w_q = torch.randn(head_size, dtype=dtype, device="cuda")
+    w_k = torch.randn(head_size, dtype=dtype, device="cuda")
+    # cos_sin is fp32 to match the kernel's new dtype contract (kernel will
+    # TORCH_CHECK; diffusers reference also expects fp32).
+    cos_sin = torch.randn(
+        (num_tokens, head_size),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    (q_ref, k_ref), avg_torch = run_torch_qk_norm_rope_1way(
+        q,
+        k,
+        w_q,
+        w_k,
+        cos_sin,
+        batch_size,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        is_interleaved,
+        eps,
+    )
+    (q_out, k_out), avg_cu = run_fused_qk_norm_rope_1way(
+        q,
+        k,
+        w_q,
+        w_k,
+        cos_sin,
+        batch_size,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        is_interleaved,
+        eps,
+    )
+
+    info = f"dtype:{dtype}, batch_size:{batch_size}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}"
+    info += f", head_size:{head_size}, is_interleaved:{is_interleaved}, eps:{eps}"
+    msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
+    checkAllclose(q_ref, q_out, msg="q", rtol=1e-2, atol=0.05)
+    checkAllclose(k_ref, k_out, msg="k", rtol=1e-2, atol=0.05)
+    print(msg, flush=True)
+
+    ret = {}
+    ret["dtype"] = dtype
+    ret["batch_size"] = batch_size
+    ret["num_tokens"] = num_tokens
     ret["num_heads_q"] = num_heads_q
     ret["num_heads_k"] = num_heads_k
     ret["head_size"] = head_size
@@ -2583,6 +2810,9 @@ if __name__ == "__main__":
     df = []
     # rope
     block_df = []
+    # partial rope: Qwen3.5-style has head_size=256 and rotary_dim=64
+    # GLM 4.7 has head_size=128 and rotary_dim=64
+    partial_rotary_configs = {256: 64, 128: 64, 64: 16}
 
     for is_neox_style in args.is_neox_styles:
         for num_token in args.token:
@@ -2628,6 +2858,27 @@ if __name__ == "__main__":
                                     max_positions=args.max_positions,
                                 )
                                 df.append(ret)
+                                partial_rotary_dim = partial_rotary_configs.get(
+                                    head_size
+                                )
+                                if partial_rotary_dim is not None:
+                                    assert partial_rotary_dim < head_size
+                                    ret = test_qk_norm_rope_cache_quant(
+                                        args.dtype,
+                                        num_token,
+                                        num_head,
+                                        num_kv_head,
+                                        num_kv_head,
+                                        head_size,
+                                        is_neox_style,
+                                        1e-6,
+                                        kv_cache_dtype,
+                                        args.num_blocks,
+                                        args.page_size,
+                                        max_positions=args.max_positions,
+                                        rotary_dim=partial_rotary_dim,
+                                    )
+                                    df.append(ret)
     df = pd.DataFrame(df)
     block_df = pd.DataFrame(block_df)
     if "per_head" in args.quant_type:
@@ -2701,6 +2952,26 @@ if __name__ == "__main__":
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("qk_norm_rope_2way summary (markdown):\n%s", df_md)
+
+    # 1way tests (Qwen-Image-2-style: single token stream norm + RoPE)
+    df = []
+    for head_size in args.head_sizes:
+        for num_tokens in args.token:
+            for is_neox_styles in args.is_neox_styles:
+                ret = test_qk_norm_rope_1way(
+                    dtype,
+                    batch_size,
+                    num_tokens,
+                    num_heads_q,
+                    num_heads_k,
+                    head_size,
+                    not is_neox_styles,
+                    eps=1e-6,
+                )
+                df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("qk_norm_rope_1way summary (markdown):\n%s", df_md)
 
     # partial rotary tests (Qwen3.5-style: head_size=256, rotary_dim=64)
     df = []
