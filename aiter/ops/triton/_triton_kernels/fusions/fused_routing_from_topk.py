@@ -15,6 +15,7 @@ _fused_routing_from_topk_hist_kernel_repr = make_kernel_repr(
     "_fused_routing_from_topk_hist_kernel",
     [
         "E",
+        "HAS_EXPERT_MAP",
         "BLOCK_NK",
         "BLOCK_E",
     ],
@@ -31,6 +32,7 @@ _fused_routing_from_topk_offset_kernel_repr = make_kernel_repr(
 _fused_routing_from_topk_place_kernel_repr = make_kernel_repr(
     "_fused_routing_from_topk_place_kernel",
     [
+        "HAS_EXPERT_MAP",
         "BLOCK_NK",
     ],
 )
@@ -40,11 +42,14 @@ _fused_routing_from_topk_place_kernel_repr = make_kernel_repr(
 def _fused_routing_from_topk_hist_kernel(
     # inputs
     topk_ids_ptr,  # [NK] int32 — flattened topk_ids
+    expert_map_ptr,  # [N_EXPERTS_GLOBAL] int32 or identity map fallback
+    expert_map_numel,  # runtime int — bounds for expert_map_ptr
     # outputs
     hist_ptr,  # [E] int32 — tokens-per-expert histogram
     # shapes
     NK,  # runtime int — actual valid item count (≤ BLOCK_NK)
     E: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_NK: tl.constexpr,  # padded to next pow2 of NK
     BLOCK_E: tl.constexpr,  # padded to next pow2 of E (tl.histogram needs pow2)
 ):
@@ -62,7 +67,20 @@ def _fused_routing_from_topk_hist_kernel(
     # Clamp the offset for masked-out lanes to 0 so the pointer arithmetic
     # below stays within the allocated buffers.
     safe_item = tl.where(item_mask, item_offs, 0)
-    expt = tl.load(topk_ids_ptr + safe_item, mask=item_mask, other=0).to(tl.int32)
+    global_expt = tl.load(topk_ids_ptr + safe_item, mask=item_mask, other=0).to(
+        tl.int32
+    )
+    if HAS_EXPERT_MAP:
+        map_mask = item_mask & (global_expt >= 0) & (global_expt < expert_map_numel)
+        safe_global_expt = tl.where(map_mask, global_expt, 0)
+        local_expt = tl.load(
+            expert_map_ptr + safe_global_expt, mask=map_mask, other=-1
+        ).to(tl.int32)
+        # Match reference semantics: invalid experts are redirected to bucket 0
+        # and later zeroed in gate_scal.
+        expt = tl.where(local_expt >= 0, local_expt, 0)
+    else:
+        expt = global_expt
 
     hist = tl.histogram(expt, BLOCK_E, mask=item_mask)
 
@@ -99,6 +117,8 @@ def _fused_routing_from_topk_place_kernel(
     # inputs
     topk_ids_ptr,  # [NK] int32 — flattened topk_ids
     topk_weights_ptr,  # [NK] (any float dtype) — flattened topk_weights
+    expert_map_ptr,  # [N_EXPERTS_GLOBAL] int32 or identity map fallback
+    expert_map_numel,  # runtime int — bounds for expert_map_ptr
     offset_ptr,  # [E] int32 — exclusive prefix sums from the offset kernel
     # outputs
     topk_indx_ptr,  # [NK] int32 — output gather_indx.src_indx
@@ -106,6 +126,7 @@ def _fused_routing_from_topk_place_kernel(
     gate_scal_ptr,  # [NK] same dtype as topk_weights
     # shapes
     NK,  # runtime int — actual valid item count (≤ BLOCK_NK)
+    HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_NK: tl.constexpr,  # padded to next pow2 of NK
 ):
     """Phase C: place items.
@@ -122,8 +143,21 @@ def _fused_routing_from_topk_place_kernel(
     item_offs = tl.arange(0, BLOCK_NK)
     item_mask = item_offs < NK
     safe_item = tl.where(item_mask, item_offs, 0)
-    expt = tl.load(topk_ids_ptr + safe_item, mask=item_mask, other=0).to(tl.int32)
+    global_expt = tl.load(topk_ids_ptr + safe_item, mask=item_mask, other=0).to(
+        tl.int32
+    )
     weights = tl.load(topk_weights_ptr + safe_item, mask=item_mask, other=0.0)
+    if HAS_EXPERT_MAP:
+        map_mask = item_mask & (global_expt >= 0) & (global_expt < expert_map_numel)
+        safe_global_expt = tl.where(map_mask, global_expt, 0)
+        local_expt = tl.load(
+            expert_map_ptr + safe_global_expt, mask=map_mask, other=-1
+        ).to(tl.int32)
+        invalid = local_expt < 0
+        expt = tl.where(invalid, 0, local_expt)
+        weights = tl.where(invalid, 0.0, weights)
+    else:
+        expt = global_expt
 
     pos = tl.atomic_add(offset_ptr + expt, 1, mask=item_mask)
 

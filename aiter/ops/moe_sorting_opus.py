@@ -32,4 +32,5 @@ def moe_sorting_opus_fwd(
     num_local_tokens: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     dispatch_policy: int = 0,
+    local_topk_ids: Optional[torch.Tensor] = None,
 ) -> None: ...

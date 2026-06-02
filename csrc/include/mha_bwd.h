@@ -9,6 +9,7 @@
 #include "fmha_bwd.hpp"
 #endif
 #include <functional>
+#include <memory>
 #include <variant>
 
 namespace aiter {
@@ -147,6 +148,17 @@ struct mha_bwd_args
     // until aiter::mha_bwd returns. If zero_init is true the bytes must be zero
     // by the time the kernel reads them.
     std::function<void*(size_t bytes, bool zero_init)> workspace_alloc{};
+
+    // Per-call pinned (page-locked) host buffer allocator. Returned shared_ptr
+    // owns the underlying host allocation and is type-erased so the caller can
+    // back it with PyTorch's CachingHostAllocator (pin_memory=true), raw
+    // hipHostMalloc/hipHostFree, or a custom pool. The pointer accessed via
+    // .get() must remain valid (not reused by the allocator) for as long as any
+    // pending stream operation references it; aiter ensures this by extending
+    // shared_ptr lifetime via a stream-tail hipLaunchHostFunc keepalive.
+    // Required for the group-mode async pipeline; mha_bwd returns an error if
+    // left empty in group mode. Unused in batch mode (may be left empty).
+    std::function<std::shared_ptr<void>(size_t bytes)> pinned_host_alloc{};
 };
 
 struct __attribute__((packed)) fmha_bwd_dqdkdv_args

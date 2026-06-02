@@ -15,6 +15,10 @@ void swiglu_and_mul_bias(const aiter_tensor_t& out,
                          const aiter_tensor_t& input,
                          const aiter_tensor_t& expert_ids,
                          const aiter_tensor_t& bias);
+void gelu_and_mul_bias(const aiter_tensor_t& out,
+                       const aiter_tensor_t& input,
+                       const aiter_tensor_t& expert_ids,
+                       const aiter_tensor_t& bias);
 void scaled_silu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input, const aiter_tensor_t& scale);
 void silu_and_mul_quant(const aiter_tensor_t& out, const aiter_tensor_t& input,
                         const aiter_tensor_t& scale, int group_size,

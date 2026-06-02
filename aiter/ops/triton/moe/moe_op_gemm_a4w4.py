@@ -10,6 +10,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
     _moe_gemm_a4w4,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 # -----------------------------------------------------------------------------
@@ -72,7 +73,6 @@ def get_kernel_config(m, n, k, routing_data):
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     arch = get_arch()
-    num_stages = 1 if arch == "gfx950" else 2
 
     split_k = 1
     if block_m == 16:
@@ -93,6 +93,9 @@ def get_kernel_config(m, n, k, routing_data):
         block_n = 512
         block_k = 256
         num_warps = 8
+    num_stages = pick_gemm_num_stages(
+        arch, block_m, block_n, block_k, 4, 4, use_async_padding=True
+    )
 
     ret = {
         "block_m": block_m,
@@ -403,6 +406,7 @@ def moe_gemm_torch(
         if gather_indx is None:
             idx = torch.arange(lo, hi, device=x.device)
         else:
+            gather_indx = gather_indx.to(torch.int32)
             idx = gather_indx[lo:hi] // n_expts_act
         out = torch.matmul(x[idx, :].float(), w[i].float())
         if bias is not None:
@@ -415,6 +419,7 @@ def moe_gemm_torch(
     if scatter_indx is None:
         return y
     # accumulate output from all experts
+    scatter_indx = scatter_indx.to(torch.int32)
     n_rows = y.shape[0] // n_expts_act
     out = torch.zeros((n_rows, y.shape[-1]), dtype=torch.float32, device=x.device)
     src_idx = scatter_indx.view(-1, n_expts_act)
