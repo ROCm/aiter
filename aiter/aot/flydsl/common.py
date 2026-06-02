@@ -166,7 +166,14 @@ def fail_on_aot_cache_miss(
                     exe._ensure_sig()
                     bound = exe._sig.bind(*compile_args)
                     bound.apply_defaults()
-                    last_cache_key[id(exe)] = exe._make_cache_key(bound.arguments)
+                    # FlyDSL >=0.2 (ROCm/FlyDSL#597) renamed _make_cache_key to
+                    # _build_full_cache_key; fall back so the looked-up-key
+                    # diagnostic keeps working across both versions.
+                    make_key = getattr(exe, "_build_full_cache_key", None) or getattr(
+                        exe, "_make_cache_key", None
+                    )
+                    if make_key is not None:
+                        last_cache_key[id(exe)] = make_key(bound.arguments)
                 except Exception:
                     pass
                 return orig_run_compiled(exe, compile_args)
