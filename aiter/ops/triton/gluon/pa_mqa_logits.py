@@ -395,12 +395,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     # gl.zeros((ChunkQ, ChunkKPerStage), layout=WMMA) has an N dim of 8, which is
     # neither 1 nor >= nDim(16) and trips the "Unsupported tensor shape for given
     # wmma layout" assert. Pin a compile-safe (runtime-unused) value on gfx1250.
-    # MFMAPerWarp is likewise kept out of the gfx1250 path (defined only inside
-    # the CDNA branches): with ChunkK==KVBlockSize it evaluates to 0.
     if IS_GFX1250:
         ChunkKPerStage: gl.constexpr = 16
     else:
         ChunkKPerStage: gl.constexpr = ChunkK // 2
+    MFMAPerWarp: gl.constexpr = ChunkKPerStage // 16 // NumWarps
 
     if IS_GFX1250:
         # gfx1250 (RDNA/WMMA, wave32): 16x16xK fp8 tile. The mfma_layout* names
@@ -422,7 +421,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             warp_bases=warp_bases,
         )
     elif _Use_2d_instr_shape_mfma_layout:
-        MFMAPerWarp: gl.constexpr = ChunkKPerStage // 16 // NumWarps
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
             version=CDNA_VERSION,
             instr_shape=[16, 16],
@@ -431,7 +429,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             tiles_per_warp=[1, MFMAPerWarp],
         )
     else:
-        MFMAPerWarp: gl.constexpr = ChunkKPerStage // 16 // NumWarps
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
             version=CDNA_VERSION,
             instr_shape=[16, 16, 32],

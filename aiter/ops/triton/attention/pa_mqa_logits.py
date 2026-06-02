@@ -349,18 +349,17 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             else _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
         )
     )
-    constexprs = {
-        "ChunkQ": ChunkQ,
-        "ChunkK": ChunkK,
-        "KVBlockSize": KVBlockSize,
-        "HiddenDim": HiddenDim,
-        "CDNA_VERSION": cdna_version,
-        "IS_GFX1250": is_gfx1250,
-    }
     src = ASTSource(
         fn=kernel_fn,
         signature=fn_signature,
-        constexprs=constexprs,
+        constexprs={
+            "ChunkQ": ChunkQ,
+            "ChunkK": ChunkK,
+            "KVBlockSize": KVBlockSize,
+            "HiddenDim": HiddenDim,
+            "CDNA_VERSION": cdna_version,
+            "IS_GFX1250": is_gfx1250,
+        },
         attrs={
             (2,): [["tt.divisibility", 16]],  # heads_num
             (3,): [["tt.divisibility", 16], ["tt.pointer_range", 32]],  # Q_buffer
