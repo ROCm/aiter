@@ -6,7 +6,7 @@
 Usage:
     HIP_VISIBLE_DEVICES=7 pytest -sv aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformance -s
     HIP_VISIBLE_DEVICES=7 python -m pytest aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformanceCI -s
-    HIP_VISIBLE_DEVICES=7 python -m pytest aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformance -k "bench333-varlen-32k" -v -s
+    HIP_VISIBLE_DEVICES=7 python -m pytest aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-16k-aws" -v -s
 """
 
 from __future__ import annotations
@@ -258,8 +258,16 @@ _PREFILL_GROUPS = [
         Hv=32,
         tps=[1],
         # full_prompt_lens=[1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000],
-        full_prompt_lens=[1000, 5000,10000],
+        full_prompt_lens=[1000, 5000, 10000],
         max_num_batched_tokens=16384,
+    ),
+    PrefillGroup(
+        model_name="varlen-32k-aws",
+        Hv=32,
+        tps=[1],
+        # full_prompt_lens=[1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000],
+        full_prompt_lens=[1000, 5000, 10000],
+        max_num_batched_tokens=32768,
     ),
 ]
 

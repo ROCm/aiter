@@ -105,9 +105,6 @@ def _lookup_tuned_bv(
     save_vn,
     is_varlen,
     wu_contig,
-    head_seqlen=0,
-    mid_seqlen=0,
-    tail_seqlen=0,
 ):
     """Select ``BV`` with the rule-based grid/CU heuristic."""
     del (
@@ -120,9 +117,6 @@ def _lookup_tuned_bv(
         store_fs,
         save_vn,
         wu_contig,
-        head_seqlen,
-        mid_seqlen,
-        tail_seqlen,
     )
     return _heuristic_bv(
         H=H,
@@ -212,6 +206,42 @@ def _k5_exp2_prescaled_enabled() -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+_G_HEAD_MAJOR_TRUTHY = ("1", "true", "yes", "on")
+_G_HEAD_MAJOR_FALSY = ("0", "false", "no", "off")
+
+
+def _k5_g_head_major_enabled() -> bool:
+    """Read FLYDSL_K5_G_HEAD_MAJOR env var at every call (no caching).
+
+    Layout for the cumulative gate tensor consumed by K5:
+
+    * ``True`` (DEFAULT): the K5 kernel is compiled with
+      ``G_HEAD_MAJOR=True`` and the host wrapper transposes ``g_cumsum``
+      from the K1+K2 producer's ``[B, T, H]`` (token-major) layout into
+      a head-major tensor ``[B, H, T]`` (or ``[H, T_total]`` in varlen)
+      before launch, so that each head's gate values are contiguous in
+      HBM (stride=1). This matches the head-major access pattern used
+      by the rest of the K5 hot tensors (``w``/``u``/``v_new``).
+
+    * ``False`` (legacy escape hatch): the K5 kernel reads ``g`` with
+      the original token-major offsets ``(bos + row) * H + i_h``. Set
+      ``FLYDSL_K5_G_HEAD_MAJOR=0`` (or any of ``false / no / off``) to
+      restore this path -- useful for A/B parity with older FlyDSL
+      revisions or for diagnosing a regression suspected to come from
+      the layout switch.
+
+    Recognised values (case-insensitive): truthy ``1/true/yes/on``,
+    falsy ``0/false/no/off``. Unset / unrecognised -> default (head-
+    major).
+    """
+    val = os.environ.get("FLYDSL_K5_G_HEAD_MAJOR", "").strip().lower()
+    if val in _G_HEAD_MAJOR_FALSY:
+        return False
+    if val in _G_HEAD_MAJOR_TRUTHY:
+        return True
+    return True  # default: head-major
+
+
 def _get_or_compile(
     K,
     V,
@@ -227,6 +257,7 @@ def _get_or_compile(
     is_varlen,
     wu_contig,
     state_bf16=False,
+    g_head_major=False,
 ):
     g_log2_scaled = _k5_exp2_prescaled_enabled()
     cache_key = (
@@ -245,6 +276,7 @@ def _get_or_compile(
         wu_contig,
         state_bf16,
         g_log2_scaled,
+        g_head_major,
     )
     if cache_key not in _compiled_kernels:
         _compiled_kernels[cache_key] = compile_chunk_gated_delta_h(
@@ -263,6 +295,7 @@ def _get_or_compile(
             WU_CONTIGUOUS=wu_contig,
             STATE_DTYPE_BF16=state_bf16,
             G_IS_LOG2_SCALED=g_log2_scaled,
+            G_HEAD_MAJOR=g_head_major,
         )
     return _compiled_kernels[cache_key]
 
@@ -333,7 +366,13 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         k: [B, T, Hg, K] bf16.
         w: [B, H, T_flat, K] bf16, head-major contiguous layout.
         u: [B, H, T_flat, V] bf16, head-major contiguous layout.
-        g: [T_total, H] f32 cumulative gate, or None.
+        g: [B, T_total, H] f32 cumulative gate produced by K1+K2 (the
+            ``fused_chunk_local_cumsum_scaled_dot_kkt_fwd`` token-major
+            output), or None. Internally transposed to head-major
+            ``[B, H, T_total]`` when ``FLYDSL_K5_G_HEAD_MAJOR`` is on
+            (DEFAULT). Set ``FLYDSL_K5_G_HEAD_MAJOR=0`` to keep the
+            tensor in token-major layout for both the wrapper and the
+            kernel (legacy escape hatch).
         gk: [T_total, H, K] f32 per-K cumulative gate, or None.
         initial_state: [N, H, V, K] f32, or None.
         output_final_state: whether to return the final hidden state.
@@ -382,34 +421,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
-        head_seqlen_lookup = 0
-        mid_seqlen_lookup = 0
-        tail_seqlen_lookup = 0
     else:
         N = len(cu_seqlens) - 1
         lens = cu_seqlens[1:] - cu_seqlens[:-1]
         lens_list = lens.tolist()
         NT = sum(triton.cdiv(int(seq_len), BT) for seq_len in lens_list)
-        # Structural features of the cu_seqlens length distribution for
-        # BV lookup; computed identically by sweep_flydsl_k5_bv.py so
-        # the runtime key matches the tuned table's key.
-        if not lens_list:
-            head_seqlen_lookup = 0
-            mid_seqlen_lookup = 0
-            tail_seqlen_lookup = 0
-        elif len(lens_list) == 1:
-            head_seqlen_lookup = int(lens_list[0])
-            mid_seqlen_lookup = 0
-            tail_seqlen_lookup = 0
-        elif len(lens_list) == 2:
-            head_seqlen_lookup = int(lens_list[0])
-            mid_seqlen_lookup = 0
-            tail_seqlen_lookup = int(lens_list[1])
-        else:
-            mids = lens_list[1:-1]
-            head_seqlen_lookup = int(lens_list[0])
-            tail_seqlen_lookup = int(lens_list[-1])
-            mid_seqlen_lookup = int(mids[0]) if all(m == mids[0] for m in mids) else 0
         chunk_offsets = (
             torch.cat(
                 [
@@ -433,7 +449,26 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     v_new = v_new_buf if save_new_value else None
 
     dummy = torch.empty(1, device=k.device, dtype=torch.float32)
-    g_arg = g if g is not None else dummy
+
+    # G-layout switch (perf probe). When ``FLYDSL_K5_G_HEAD_MAJOR=1`` the K5
+    # kernel is compiled with ``G_HEAD_MAJOR=True`` and expects ``g`` to be
+    # contiguous along the T dimension for each head. The K1+K2 producer
+    # (``fused_chunk_local_cumsum_scaled_dot_kkt_fwd``) emits ``g`` in
+    # ``[B, T, H]`` (token-major) layout, so transpose+contiguous it here
+    # to ``[B, H, T_flat]`` before launch. The transpose is one extra
+    # ``H * T_flat`` f32 element copy per call -- the probe measures
+    # whether the kernel-side scalar-load address pattern win exceeds
+    # this transpose cost.
+    g_head_major = _k5_g_head_major_enabled()
+    if g_head_major and g is not None:
+        # ``g`` shape from K1+K2: ``[B, T, H]`` (B==1 in varlen). Transpose
+        # the last two dims to ``[B, H, T]`` then ``contiguous()`` so the
+        # kernel's stride-1 reads land on consecutive HBM addresses.
+        g_for_kernel = g.transpose(-2, -1).contiguous()
+    else:
+        g_for_kernel = g
+
+    g_arg = g_for_kernel if g_for_kernel is not None else dummy
     gk_arg = gk if gk is not None else dummy
     h0_arg = initial_state if initial_state is not None else dummy
     ht_arg = final_state if final_state is not None else dummy
@@ -466,9 +501,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         save_vn=bool(save_new_value),
         is_varlen=is_varlen,
         wu_contig=wu_contiguous,
-        head_seqlen=head_seqlen_lookup,
-        mid_seqlen=mid_seqlen_lookup,
-        tail_seqlen=tail_seqlen_lookup,
     )
 
     launch_fn = _get_or_compile(
@@ -486,6 +518,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         is_varlen,
         wu_contiguous,
         state_bf16=state_bf16,
+        g_head_major=g_head_major,
     )
     _launch_kernel(
         launch_fn,
