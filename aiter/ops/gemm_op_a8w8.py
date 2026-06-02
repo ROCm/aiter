@@ -780,7 +780,9 @@ def gemm_a8w8_blockscale(
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
         try:
-            return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y, y_is_zeroed=y_is_zeroed)
+            return gemm_a8w8_blockscale_ck(
+                XQ, WQ, x_scale, w_scale, Y, y_is_zeroed=y_is_zeroed
+            )
         except RuntimeError as e:
             raise RuntimeError(
                 f"gemm_a8w8_blockscale failed for shape M={m}, N={n}, K={k}, "

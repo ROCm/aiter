@@ -290,9 +290,9 @@ def fused_rms_fp8_group_quant(
     # ``y_is_zeroed=True``; otherwise we pass a dummy 1-element int32 tensor
     # and the constexpr-gated prologue is compiled out.
     if gemm_out_zero_init is not None:
-        assert gemm_out_zero_init.is_contiguous(), (
-            "fused_rms_fp8_group_quant: gemm_out_zero_init must be contiguous"
-        )
+        assert (
+            gemm_out_zero_init.is_contiguous()
+        ), "fused_rms_fp8_group_quant: gemm_out_zero_init must be contiguous"
         total_bytes = gemm_out_zero_init.numel() * gemm_out_zero_init.element_size()
         assert total_bytes % 4 == 0, (
             "fused_rms_fp8_group_quant: gemm_out_zero_init total bytes must be a "
@@ -302,9 +302,7 @@ def fused_rms_fp8_group_quant(
         gemm_out_zero_init_n_int32 = total_bytes // 4
         has_zero_init = True
     else:
-        gemm_out_zero_init_int32 = torch.empty(
-            1, dtype=torch.int32, device=inp1.device
-        )
+        gemm_out_zero_init_int32 = torch.empty(1, dtype=torch.int32, device=inp1.device)
         gemm_out_zero_init_n_int32 = 0
         has_zero_init = False
 
@@ -494,9 +492,9 @@ def fused_rms_gated_fp8_group_quant(
     grid = (triton.cdiv(M, rows_per_block),)
     # See ``fused_rms_fp8_group_quant`` for the SplitK fused-zero-init contract.
     if gemm_out_zero_init is not None:
-        assert gemm_out_zero_init.is_contiguous(), (
-            "fused_rms_gated_fp8_group_quant: gemm_out_zero_init must be contiguous"
-        )
+        assert (
+            gemm_out_zero_init.is_contiguous()
+        ), "fused_rms_gated_fp8_group_quant: gemm_out_zero_init must be contiguous"
         total_bytes = gemm_out_zero_init.numel() * gemm_out_zero_init.element_size()
         assert total_bytes % 4 == 0, (
             "fused_rms_gated_fp8_group_quant: gemm_out_zero_init total bytes "

@@ -184,9 +184,9 @@ def act_mul_and_fp8_group_quant(
     # prologue (int32 writes) so the downstream blockscale SplitK GEMM can
     # skip its own ``Y.zero_()`` launch.
     if gemm_out_zero_init is not None:
-        assert gemm_out_zero_init.is_contiguous(), (
-            "act_mul_and_fp8_group_quant: gemm_out_zero_init must be contiguous"
-        )
+        assert (
+            gemm_out_zero_init.is_contiguous()
+        ), "act_mul_and_fp8_group_quant: gemm_out_zero_init must be contiguous"
         total_bytes = gemm_out_zero_init.numel() * gemm_out_zero_init.element_size()
         assert total_bytes % 4 == 0, (
             "act_mul_and_fp8_group_quant: gemm_out_zero_init total bytes must "
