@@ -1,4 +1,4 @@
 [submodule "3rdparty/composable_kernel"]
 	path = 3rdparty/composable_kernel
-	url = git@github.com:CHINA-CE-TEAM/HY3_CK.git
-	branch = HYCK-dev0508-FP8temp
+	url = https://github.com/LORD-ROY/tx-composable_kernel.git
+	branch = HYCK-dev0508
