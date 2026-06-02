@@ -10,7 +10,6 @@ This module exposes ``pa_decode_sparse`` — a 3D split-K + widened-BLOCK_H
 where each token's K range is an unordered subset of a unified KV pool.
 """
 
-import os
 from typing import Optional
 
 import torch
