@@ -40,14 +40,12 @@ exercise only the host-side scheduling hint plumbing.
 """
 
 import sys
-import types
 
 import pytest
 import torch
 
 from aiter import fused_moe as fused_moe_mod
 from aiter.fused_moe import fused_moe_, get_padded_M
-
 
 # --------------------------------------------------------------------------
 # (1) Pure tier-selection check
