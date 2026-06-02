@@ -460,8 +460,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     # Self-contained branch; the CDNA preshuffle pipeline below is untouched.
     if IS_GFX1250:
         NUM_BUFFERS: gl.constexpr = 2
-        KV_SHARED: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[HiddenDim, 8]], [KVBlockSize, HiddenDim], [1, 0]
+        # Plain contiguous shared layout (no padding/swizzle) so the LDS tile can
+        # be reshaped/permuted to undo shuffle_weight; matches mla.py's shuffled
+        # KV path. TDM still DMAs the block as one contiguous chunk.
+        KV_SHARED: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
         kv_shared = gl.allocate_shared_memory(
             KV_buffer.type.element_ty,
@@ -549,7 +552,28 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             else:
                 gl.amd.gfx1250.tdm.async_wait(0)
 
-            mfma_k = kv_shared.index(buf).permute([1, 0]).load(layout=mfma_layout_b)
+            # The KV block was written by shuffle_weight(layout=(16,16)), whose
+            # fp8 swizzle maps logical (n, k) to physical row-major
+            # [n//16, k//32, (k//16)%2, n%16, k%16]. Undo it in LDS with a
+            # reshape/permute (mla.py lds_unshuffle pattern) -- pure view work,
+            # no extra data movement -- then transpose-read for WMMA operand B.
+            K_WIDTH: gl.constexpr = 16
+            mfma_k = (
+                kv_shared.index(buf)
+                .reshape(
+                    (
+                        KVBlockSize // 16,
+                        HiddenDim // (2 * K_WIDTH),
+                        2,
+                        16,
+                        K_WIDTH,
+                    )
+                )
+                .permute((0, 3, 1, 2, 4))
+                .reshape((KVBlockSize, HiddenDim))
+                .permute([1, 0])
+                .load(layout=mfma_layout_b)
+            )
             o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero_acc)
 
             k_scale_f = gl.amd.cdna3.buffer_load(
