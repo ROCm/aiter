@@ -33,6 +33,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -571,6 +572,14 @@ def test_mla_v4(
     decode_qlen,
     max_split_per_batch,
 ):
+    gfx = get_gfx()
+    if gfx not in ["gfx950"]:
+        print(
+            f"skip test_mla_v4(b={batch_size}, c={ctx_lens}, n={nhead}, "
+            f"ql={decode_qlen}): unsupported on {gfx}"
+        )
+        return None
+
     ret = {}
     out_dtype = torch.bfloat16
 
@@ -949,6 +958,8 @@ for nhead, decode_qlen in args.nhead:
             decode_qlen=decode_qlen,
             max_split_per_batch=max_split_per_batch,
         )
+        if ret is None:
+            continue
         df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
