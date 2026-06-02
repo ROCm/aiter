@@ -2141,7 +2141,7 @@ def build_mixed_moe_gemm1_kernel(
             ):
                 nonlocal acc
                 acc = acc_value
-                if sk_n_offset is not None:
+                if const_expr(sk_n_offset is not None):
                     _sk_n_offset[0] = sk_n_offset
                 c_shuffle_epilog(
                     tile_m=tile_m,
