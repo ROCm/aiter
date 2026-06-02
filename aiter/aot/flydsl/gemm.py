@@ -13,6 +13,7 @@ way as runtime JIT config lookup.
 Supported kernel families:
   - ``flydsl_gemm2_*``           split-K HGEMM kernels
   - ``flydsl_bpreshuflle_*``     a8w8 preshuffle GEMM kernels
+  - ``flydsl_mxscale_*``         gfx1250 mxscale GEMM kernels
 
 Usage:
     # Compile all unique FlyDSL GEMM kernels from default CSVs
@@ -52,6 +53,11 @@ from aiter.ops.flydsl.gemm_kernels import (
 )
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+from aiter.ops.flydsl.mxscale_gemm import parse_flydsl_mxscale_kernel_name
+from aiter.ops.flydsl.mxscale_layout import (
+    get_padded_problem_shape as _mxscale_padded_shape,
+    validate_mxscale_num_buffers as _validate_mxscale_num_buffers,
+)
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -63,8 +69,10 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
+    AITER_CONFIGS.AITER_CONFIG_GEMM_MXSCALE_FILE,
 ]
 GEMM_AOT_ARCH_DEFAULT = "gfx950"
+MXSCALE_AOT_ARCH_DEFAULT = "gfx1250"
 
 _PRESHUFFLE_RE = re.compile(
     r"^flydsl_bpreshuflle_"
@@ -146,6 +154,8 @@ def parse_csv(csv_path: str):
 
             if kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
+            elif kernel_name.startswith("flydsl_mxscale_"):
+                params = parse_flydsl_mxscale_kernel_name(kernel_name)
             elif kernel_name.startswith("flydsl_gemm"):
                 params = get_flydsl_splitk_hgemm_kernel_params(kernel_name)
                 if params is not None:
@@ -354,13 +364,89 @@ def _compile_preshuffle_to_cache(
     )
 
 
+def _compile_mxscale_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    data_format: str,
+    out_dtype: str,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    m_warp: int,
+    n_warp: int,
+    num_buffers: int,
+    split_k: int,
+    cluster_m: int = 1,
+    cluster_n: int = 1,
+    **kwargs,
+):
+    del kwargs
+
+    import torch
+
+    from aiter.ops.flydsl.kernels.gemm_fp8fp4_gfx1250 import compile_mxscale_gemm
+    from aiter.ops.flydsl.mxscale_gemm import mxscale_compile_kwargs
+
+    out_torch_dtype = {
+        "bf16": torch.bfloat16,
+        "f16": torch.float16,
+        "f32": torch.float32,
+    }[out_dtype]
+
+    _validate_mxscale_num_buffers(k, tile_k, num_buffers, split_k=split_k)
+    padded = _mxscale_padded_shape(
+        data_format, m, n, k, tile_m, tile_n, tile_k, split_k=split_k
+    )
+    pack_a, pack_b = padded["pack_a"], padded["pack_b"]
+    padded_m, padded_n, padded_k = padded["M"], padded["N"], padded["K"]
+    k_scale = padded["K_scale"]
+
+    a = torch.empty((padded_m, padded_k // pack_a), device="cpu", dtype=torch.uint8)
+    b = torch.empty((padded_n, padded_k // pack_b), device="cpu", dtype=torch.uint8)
+    a_scale = torch.empty((padded_m, k_scale), device="cpu", dtype=torch.uint8)
+    b_scale = torch.empty((padded_n, k_scale), device="cpu", dtype=torch.uint8)
+    out = torch.empty((padded_m, padded_n), device="cpu", dtype=out_torch_dtype)
+    stream = fx.Stream(0)
+
+    compile_kwargs = mxscale_compile_kwargs(
+        data_format=data_format,
+        out_dtype=out_dtype,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        m_warp=m_warp,
+        n_warp=n_warp,
+        num_buffers=num_buffers,
+        split_k=split_k,
+        cluster_m=cluster_m,
+        cluster_n=cluster_n,
+    )
+    exe = compile_mxscale_gemm(M=padded_m, N=padded_n, K=padded_k, **compile_kwargs)
+    _compile_executable_to_cache(
+        exe,
+        _ptr_view_safe(out.contiguous().view(-1)),
+        _ptr_view_safe(a.contiguous().view(-1)),
+        _ptr_view_safe(b.contiguous().view(-1)),
+        _ptr_view_safe(a_scale.contiguous().view(-1)),
+        _ptr_view_safe(b_scale.contiguous().view(-1)),
+        padded_m,
+        padded_n,
+        stream,
+    )
+
+
 def compile_one_config(
     kernel_name: str, kind: str, m: int, n: int, k: int, cu_num: int = 0, **kwargs
 ) -> dict:
     """Compile one GEMM kernel configuration and save it to cache."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    aot_arch = cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
+    if kind == "mxscale":
+        aot_arch = kwargs.get("target_gfx") or MXSCALE_AOT_ARCH_DEFAULT
+    else:
+        aot_arch = cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
         "kernel_name": kernel_name,
@@ -381,6 +467,8 @@ def compile_one_config(
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "mxscale":
+                _compile_mxscale_to_cache(m=m, n=n, k=k, **kwargs)
             else:
                 raise ValueError(f"Unknown GEMM AOT kind: {kind}")
 
@@ -422,6 +510,7 @@ def main():
 
     hgemm_jobs = [j for j in all_jobs if j["kind"] == "hgemm"]
     preshuffle_jobs = [j for j in all_jobs if j["kind"] == "preshuffle"]
+    mxscale_jobs = [j for j in all_jobs if j["kind"] == "mxscale"]
 
     print("=" * 72)
     print("FlyDSL GEMM AOT Pre-compilation")
@@ -430,6 +519,7 @@ def main():
         print(f"  CSV:              {csv_path}")
     print(f"  HGEMM jobs:       {len(hgemm_jobs)}")
     print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
+    print(f"  MXScale jobs:     {len(mxscale_jobs)}")
     print(f"  Total jobs:       {len(all_jobs)}")
     print("  Compile arch:     (from cu_num)")
     print(f"  Cache dir:        {cache_dir}")
@@ -449,6 +539,12 @@ def main():
         print(f"\n--- Preshuffle GEMM ({len(preshuffle_jobs)} kernels) ---")
         for i, job in enumerate(preshuffle_jobs, 1):
             print(f"\n[{i}/{len(preshuffle_jobs)}] ", end="")
+            results.append(compile_one_config(**job))
+
+    if mxscale_jobs:
+        print(f"\n--- MXScale GEMM ({len(mxscale_jobs)} kernels) ---")
+        for i, job in enumerate(mxscale_jobs, 1):
+            print(f"\n[{i}/{len(mxscale_jobs)}] ", end="")
             results.append(compile_one_config(**job))
 
     total_elapsed = time.time() - total_t0

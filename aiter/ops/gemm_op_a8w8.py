@@ -958,3 +958,185 @@ def gemm_a8w8_bpreshuffle_cktile_tune(
     kernelId: int,
     splitK: int = 0,
 ) -> Tensor: ...
+
+
+# ---------------------------------------------------------------------------
+# OCP-MX dense GEMM (gfx1250, FlyDSL backend)
+# ---------------------------------------------------------------------------
+
+_MXSCALE_TARGET_GFX = "gfx1250"
+
+_Q_DTYPE_W = {
+    "fp8": str(dtypes.fp8),
+}
+
+_MXSCALE_CONFIG_CACHE: dict = {}
+_MXSCALE_CONFIG_HAS_GFX: dict = {}
+
+
+def _load_mxscale_tuned(tuned_file: str):
+    """Cache the tuned CSV as a lookup dict (keyed with or without a gfx column).
+
+    A missing / empty CSV caches an empty table so routing cleanly falls back to
+    the default kernel. has_gfx=True is a safe sentinel there: with an empty
+    table the gfx-keyed lookup just misses and returns None.
+    """
+    if tuned_file in _MXSCALE_CONFIG_CACHE:
+        return
+    try:
+        df = pd.read_csv(tuned_file).drop_duplicates()
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        _MXSCALE_CONFIG_CACHE[tuned_file] = {}
+        _MXSCALE_CONFIG_HAS_GFX[tuned_file] = True
+        return
+    if "gfx" in df.columns:
+        keys = ["gfx", "cu_num", "M", "N", "K", "q_dtype_w"]
+        _MXSCALE_CONFIG_HAS_GFX[tuned_file] = True
+    else:
+        keys = ["cu_num", "M", "N", "K", "q_dtype_w"]
+        _MXSCALE_CONFIG_HAS_GFX[tuned_file] = False
+    if df.empty:
+        _MXSCALE_CONFIG_CACHE[tuned_file] = {}
+        return
+    _MXSCALE_CONFIG_CACHE[tuned_file] = df.set_index(keys).to_dict("index")
+
+
+@functools.lru_cache(maxsize=1024)
+def get_mxscale_GEMM_config(M: int, N: int, K: int, q_dtype_w: str) -> Optional[dict]:
+    """Return the tuned config row for this shape, or ``None`` if untuned."""
+    tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_MXSCALE_FILE
+    _load_mxscale_tuned(tuned_file)
+    table = _MXSCALE_CONFIG_CACHE[tuned_file]
+    if not table:
+        return None
+    gfx = get_gfx()
+    cu_num = get_cu_num()
+    has_gfx = _MXSCALE_CONFIG_HAS_GFX[tuned_file]
+    for gl in (None, 0, 1):
+        padded_M = M if gl is None else get_padded_m(M, N, K, gl)
+        key = (
+            (gfx, cu_num, padded_M, N, K, q_dtype_w)
+            if has_gfx
+            else (cu_num, padded_M, N, K, q_dtype_w)
+        )
+        config = table.get(key)
+        if config is not None:
+            if AITER_LOG_TUNED_CONFIG:
+                logger.info(
+                    f"[mxscale] shape M:{M} N:{N} K:{K} q_dtype_w:{q_dtype_w} "
+                    f"resolved padded_M:{padded_M} -> {config.get('kernelName')}"
+                )
+            return config
+    if AITER_LOG_TUNED_CONFIG:
+        logger.info(
+            f"[mxscale] shape M:{M} N:{N} K:{K} q_dtype_w:{q_dtype_w} not found in "
+            f"{tuned_file}, using default kernel"
+        )
+    return None
+
+
+def clear_mxscale_config_cache() -> None:
+    """Drop the cached tuned table (used by the tuner after writing new rows)."""
+    _MXSCALE_CONFIG_CACHE.clear()
+    _MXSCALE_CONFIG_HAS_GFX.clear()
+    get_mxscale_GEMM_config.cache_clear()
+    # Also reset the kernel-signature probe so a swapped-in kernel is re-read.
+    from .flydsl.mxscale_gemm import clear_mxscale_compile_caches
+
+    clear_mxscale_compile_caches()
+
+
+def _mxscale_gemm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Optional[Tensor],
+    dtype: torch.dtype,
+) -> Tensor:
+    """Resolve the tuned (or default) MXFP8 kernel and run the FlyDSL backend."""
+    cur_gfx = get_gfx()
+    if cur_gfx != _MXSCALE_TARGET_GFX:
+        raise RuntimeError(
+            f"gemm_a8w8_mxscale requires {_MXSCALE_TARGET_GFX}, current arch is {cur_gfx!r}"
+        )
+    if not is_flydsl_available():
+        raise RuntimeError(
+            "gemm_a8w8_mxscale requires the FlyDSL backend; install the "
+            "matching flydsl wheel."
+        )
+
+    from .flydsl.mxscale_gemm import (
+        default_mxscale_kernel_name,
+        flydsl_mxscale_gemm,
+        parse_flydsl_mxscale_kernel_name,
+    )
+
+    out_dtype_name = {
+        torch.bfloat16: "bf16",
+        torch.float16: "f16",
+        torch.float32: "f32",
+    }.get(dtype)
+    if out_dtype_name is None:
+        raise ValueError(f"unsupported out dtype {dtype}; expected bf16/f16/f32")
+
+    M = XQ.shape[0]
+    N = WQ.shape[0]
+    K = WQ.shape[-1]
+
+    kernel_name = None
+    config = get_mxscale_GEMM_config(M, N, K, _Q_DTYPE_W["fp8"])
+    if config is not None and str(config.get("libtype", "flydsl")) == "flydsl":
+        cand = str(config["kernelName"])
+        parsed = parse_flydsl_mxscale_kernel_name(cand)
+        if (
+            parsed is not None
+            and parsed["data_format"] == "fp8"
+            and parsed["out_dtype"] == out_dtype_name
+        ):
+            kernel_name = cand
+    if kernel_name is None:
+        kernel_name = default_mxscale_kernel_name(
+            data_format="fp8", M=M, N=N, K=K, out_dtype=out_dtype_name
+        )
+
+    return flydsl_mxscale_gemm(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        data_format="fp8",
+        out=out,
+        out_dtype=out_dtype_name,
+        kernel_name=kernel_name,
+    )
+
+
+def _mxscale_fake(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Optional[Tensor] = None,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+
+@torch_compile_guard(gen_fake=_mxscale_fake)
+def gemm_a8w8_mxscale(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Optional[Tensor] = None,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """OCP MXFP8 dense GEMM: ``(XQ*x_scale) @ (WQ*w_scale)^T`` (gfx1250).
+
+    XQ      : (M, K)        FP8 E4M3 activation (row-major).
+    WQ      : (N, K)        FP8 E4M3 weight (row-major, unshuffled).
+    x_scale : (M, K // 32)  E8M0 block scale (uint8 storage).
+    w_scale : (N, K // 32)  E8M0 block scale (uint8 storage).
+    """
+    return _mxscale_gemm(XQ, WQ, x_scale, w_scale, out, dtype)

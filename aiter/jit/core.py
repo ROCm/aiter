@@ -124,6 +124,11 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_MXSCALE = os.getenv(
+    "AITER_CONFIG_GEMM_MXSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_mxscale_tuned_gemm.csv",
+)
+
 
 class AITER_CONFIG(object):
     @property
@@ -154,6 +159,14 @@ class AITER_CONFIG(object):
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
             AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
             "a8w8_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_MXSCALE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_MXSCALE",
+            AITER_CONFIG_GEMM_MXSCALE,
+            "a8w8_mxscale_tuned_gemm",
         )
 
     @property
