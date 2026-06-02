@@ -41,6 +41,27 @@ def _ensure_kernel_mod():
     _kernel_mod = mod
 
 
+def _patch_reusable_slot_specs():
+    """Compat shim: older FlyDSL builds lack _reusable_slot_spec on Float32/Float64,
+    which flyc.compile() requires for the AOT fast-dispatch path."""
+    import ctypes
+    from flydsl.expr.numeric import Float32, Float64
+
+    if not hasattr(Float32, "_reusable_slot_spec"):
+        @classmethod
+        def _f32_slot_spec(cls, arg):
+            return ctypes.c_float, lambda a: a.value if hasattr(a, "value") else a
+        Float32._reusable_slot_spec = _f32_slot_spec
+        Float32._reusable_ctype = ctypes.c_float
+
+    if not hasattr(Float64, "_reusable_slot_spec"):
+        @classmethod
+        def _f64_slot_spec(cls, arg):
+            return ctypes.c_double, lambda a: a.value if hasattr(a, "value") else a
+        Float64._reusable_slot_spec = _f64_slot_spec
+        Float64._reusable_ctype = ctypes.c_double
+
+
 def _ensure_kernel(is_causal: bool):
     if is_causal in _launch_fns:
         return
@@ -54,6 +75,8 @@ def _ensure_kernel(is_causal: bool):
     from flydsl.expr.typing import T
     from flydsl._mlir import ir
     from flydsl.compiler.kernel_function import CompilationContext
+
+    _patch_reusable_slot_specs()
 
     kernel = mod.compile_fmha_fwd(is_causal=is_causal)
     _lds_alloc_k_a = mod._lds_alloc_k_a

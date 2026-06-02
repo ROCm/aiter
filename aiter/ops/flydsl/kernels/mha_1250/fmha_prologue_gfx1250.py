@@ -142,6 +142,7 @@ def _has_vgpr_bank():
 def set_vgpr_bank(raw_val, bank: int):
     if not _has_vgpr_bank():
         return raw_val
+    return raw_val
     val_type = raw_val.type
     bank_val = _raw(arith.constant(bank, type=T.i32))
     return llvm_dialect.call_intrinsic(
@@ -158,6 +159,7 @@ def set_vgpr_bank_offset(raw_val, bank: int, offset: int):
     """
     if not _has_vgpr_bank():
         return raw_val
+    return raw_val
     val_type = raw_val.type
     bank_val   = _raw(arith.constant(bank,   type=T.i32))
     offset_val = _raw(arith.constant(offset, type=T.i32))
