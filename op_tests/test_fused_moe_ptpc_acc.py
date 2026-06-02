@@ -24,6 +24,12 @@ DTYPE = torch.bfloat16
 FP8_DTYPE = torch.float8_e4m3fnuz
 DIFF_THR = 0.02
 
+# Correctness scope: we only certify fused_moe paths backed by pyhip-compiled .co
+# kernels (fmoe_asmjit). Numerical checks here are aligned with pyhip's MoE tests on
+# branch moe_prefill_fp8_308:
+#   https://github.com/tingqli/pyhip/tree/moe_prefill_fp8_308
+# (see tests/contrib/moe/test_moe.py). Other kernel backends are out of scope.
+
 # Qwen3.5 PTPC FP8 model shapes (TP-split inter_dim)
 MOE_CONFIGS = [
     {"name": "qwen3_5_35b", "hidden_size": 2048, "inter_dim": 512 // 4, "expert": 257, "topk": 9},
