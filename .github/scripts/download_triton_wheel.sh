@@ -23,4 +23,12 @@ python3 -m pip download \
     --extra-index-url https://pypi.org/simple \
     triton
 
+echo "Downloading triton-kernels wheel from ${TRITON_INDEX_URL} into ${TRITON_WHEEL_DIR}"
+python3 -m pip download \
+    --only-binary=:all: \
+    --dest "${TRITON_WHEEL_DIR}" \
+    --index-url "${TRITON_INDEX_URL}" \
+    --extra-index-url https://pypi.org/simple \
+    triton-kernels
+
 ls -lh "${TRITON_WHEEL_DIR}"
