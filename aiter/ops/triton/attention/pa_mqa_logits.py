@@ -256,20 +256,22 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     assert gfx_version in ("gfx942", "gfx950", "gfx1250")
     is_gfx1250 = gfx_version == "gfx1250"
     if is_gfx1250:
-        assert not Preshuffle, (
-            "Preshuffle path on gfx1250 is not implemented yet. Supported: the "
-            "KVBlockSize=1 base kernel and the KVBlockSize==ChunkK (>1) TDM "
-            "block-load kernel."
-        )
-        assert not VarCtxOpt, (
-            "VarCtx path on gfx1250 is not implemented yet."
-        )
-        # gfx1250 supports either KVBlockSize==1 (per-token gather base path) or
-        # KVBlockSize==ChunkK>1 (TDM block-load path). Other ratios are not wired.
-        assert KVBlockSize == 1 or KVBlockSize == ChunkK, (
-            f"gfx1250 requires KVBlockSize==1 or KVBlockSize==ChunkK; got "
-            f"KVBlockSize={KVBlockSize}, ChunkK={ChunkK}."
-        )
+        # gfx1250 has two kernels:
+        #   - base (Preshuffle=False): per-token gather, requires KVBlockSize==1
+        #   - preshuffle (Preshuffle=True): TDM block-load, requires
+        #     KVBlockSize==ChunkK>1
+        if Preshuffle:
+            assert KVBlockSize > 1 and ChunkK % KVBlockSize == 0, (
+                f"gfx1250 preshuffle (TDM block-load) requires KVBlockSize>1 "
+                f"and ChunkK % KVBlockSize == 0 (ChunkK = N*KVBlockSize); got "
+                f"KVBlockSize={KVBlockSize}, ChunkK={ChunkK}."
+            )
+        else:
+            assert KVBlockSize == 1, (
+                f"gfx1250 base kernel requires KVBlockSize==1; got "
+                f"KVBlockSize={KVBlockSize}. Use Preshuffle=True for "
+                f"KVBlockSize>1 (TDM block-load)."
+            )
     cdna_version = get_cdna_version()
     warp_size = 32 if is_gfx1250 else 64
     target = GPUTarget("hip", gfx_version, warp_size)
@@ -312,8 +314,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["KVBlockSize"] = "constexpr"
     fn_signature["HiddenDim"] = "constexpr"
     fn_signature["CDNA_VERSION"] = "constexpr"
-    if not Preshuffle:
-        fn_signature["IS_GFX1250"] = "constexpr"
+    fn_signature["IS_GFX1250"] = "constexpr"
 
     options = {
         "num_warps": 4,
@@ -354,9 +355,8 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "KVBlockSize": KVBlockSize,
         "HiddenDim": HiddenDim,
         "CDNA_VERSION": cdna_version,
+        "IS_GFX1250": is_gfx1250,
     }
-    if not Preshuffle:
-        constexprs["IS_GFX1250"] = is_gfx1250
     src = ASTSource(
         fn=kernel_fn,
         signature=fn_signature,
@@ -477,6 +477,17 @@ def deepgemm_fp8_paged_mqa_logits(
     )
     kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
     kv_cache_scale = kv_cache_scale.view(torch.float32)
+
+    if VarCtxSchedule is not None and get_gfx() == "gfx1250":
+        # VarCtx is not implemented on gfx1250 yet; fall back to the preshuffle
+        # path (which gfx1250 does support) instead of failing to compile.
+        import warnings
+
+        warnings.warn(
+            "VarCtx schedule is not implemented on gfx1250 yet; ignoring it and "
+            "falling back to the non-varctx preshuffle path."
+        )
+        VarCtxSchedule = None
 
     VarCtxOpt = VarCtxSchedule is not None
     if VarCtxOpt:
