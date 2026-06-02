@@ -121,7 +121,7 @@ def chunk_gated_delta_rule_fwd_opt(
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
-    initial_state: torch.Tensor,
+    initial_state: torch.Tensor | None,
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
 ):
@@ -141,13 +141,13 @@ def chunk_gated_delta_rule_fwd_opt(
         g: Gate tensor (in log space, pre-cumsum) of shape [B, T, H]
         beta: Beta parameter tensor of shape [B, T, H]
         scale: Scaling factor for queries
-        initial_state: Initial hidden state of shape [N, H, K, V]
+        initial_state: Optional initial hidden state of shape [N, H, K, V]
         output_final_state: Whether to output the final state
         cu_seqlens: Cumulative sequence lengths for variable-length inputs (optional) [N+1]
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:
-            - g_cumsum: Cumulative gate values [B, T, H]
+            - g_cumsum: Cumulative gate values [B, H, T]
             - o: Output tensor [B, T, H, V]
             - final_state: Final hidden state [N, H, K, V] if output_final_state=True, else None
     """
@@ -157,6 +157,7 @@ def chunk_gated_delta_rule_fwd_opt(
         beta=beta,
         g=g,
         cu_seqlens=cu_seqlens,
+        use_exp2=False,
     )
 
     # Step 2: Compute fused triangular solve and recompute w, u
@@ -168,26 +169,31 @@ def chunk_gated_delta_rule_fwd_opt(
         beta=beta,
         g_cumsum=g_cumsum,
         cu_seqlens=cu_seqlens,
+        use_exp2=False,
     )
+
+    # k5_opt / k6_opt index g with token-major [B, T, H] strides, but the fused
+    # k12 returns g_cumsum head-major [B, H, T]. Convert to token-major here.
+    g_cumsum_tok = g_cumsum.transpose(1, 2).contiguous()
 
     # Step 3: Compute hidden states
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt(
         k=k,
         w=w,
         u=u,
-        g=g_cumsum,
+        g=g_cumsum_tok,
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
     )
 
-    # Step 4: Compute output (directly in [B, T, H, V] layout)
+    # Step 4: Compute output
     o = chunk_fwd_o_opt(
         q=q,
         k=k,
         v=v_new,
         h=h,
-        g=g_cumsum,
+        g=g_cumsum_tok,
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
@@ -202,15 +208,24 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
-    initial_state: torch.Tensor,
+    initial_state: torch.Tensor | None,
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
+    use_chunk_hip: bool = False,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    o: torch.Tensor | None = None,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ):
     """
     Optimized chunk gated delta rule forward with h layout [V, K].
 
-    Uses the same fused K12/K34 kernels as opt, but K5/K6 use transposed
+    Uses the same fused kernels as opt, but with transposed
     h layout [V, K] instead of [K, V].
+
+    When use_chunk_hip=True, hidden state computation uses a HIP kernel
+    instead of Triton.
 
     Args:
         q: [B, T, Hg, K]
@@ -219,13 +234,26 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         g: [B, T, H] — raw gate (pre-cumsum)
         beta: [B, T, H]
         scale: float
-        initial_state: [N, H, V, K] — note transposed h layout
+        initial_state: optional [N, H, V, K] — note transposed h layout
         output_final_state: bool
         cu_seqlens: [N+1] optional
+        use_chunk_hip: bool — use HIP kernel for hidden state computation
+        state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
+            supported by both the HIP and Triton hidden-state paths
+        use_exp2: bool — use exp2 instead of exp for gate computation
+        o: optional pre-allocated [B, T, H, V] output buffer (written in
+            place by K6). If None, a fresh buffer is allocated.
+        num_decodes / num_decode_tokens: skip a leading decode-only prefix in
+            the ORIGINAL cu_seqlens (data tensors are expected pre-sliced).
+            Threaded into every stage; the cached prologue helpers
+            (prepare_chunk_indices / prepare_chunk_offsets /
+            prepare_rebased_cu_seqlens) key on the original cu_seqlens identity,
+            so chunk-index / offset builds stay cache-warm across forwards
+            (no per-forward .tolist() D2H).
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:
-            - g_cumsum: [B, T, H]
+            - g_cumsum: [B, H, T]
             - o: [B, T, H, V]
             - final_state: [N, H, V, K] if output_final_state=True, else None
     """
@@ -234,6 +262,9 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         beta=beta,
         g=g,
         cu_seqlens=cu_seqlens,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
 
     w, u = fused_solve_tril_recompute_w_u(
@@ -243,26 +274,59 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         beta=beta,
         g_cumsum=g_cumsum,
         cu_seqlens=cu_seqlens,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
 
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(
-        k=k,
-        w=w,
-        u=u,
-        g=g_cumsum,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-    )
+    if use_chunk_hip:
+        from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+            chunk_gated_delta_rule_fwd_h_hip_fn,
+        )
+
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_hip_fn(
+            k=k,
+            w=w,
+            u=u,
+            g=g_cumsum,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            state_dtype=state_dtype,
+            use_exp2=use_exp2,
+            g_head_major=True,
+        )
+    else:
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(
+            k=k,
+            w=w,
+            u=u,
+            g=g_cumsum,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_exp2=use_exp2,
+            state_dtype=state_dtype,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+        )
+
+    if o is None:
+        # Output matches v's [B, T, H, V] layout.
+        o = v.new_empty(v.shape)
 
     o = chunk_fwd_o_opt_vk(
         q=q,
         k=k,
         v=v_new,
+        o=o,
         h=h,
         g=g_cumsum,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
 
     return g_cumsum, o, final_state

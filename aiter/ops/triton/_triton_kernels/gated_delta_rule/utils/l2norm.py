@@ -16,38 +16,46 @@ import triton.language as tl
 
 from ..gated_delta_rule_utils import IS_AMD, autotune_cache_kwargs, input_guard
 
+# Backward-pass autotune config space. Forward kernels deliberately do not
+# autotune (see ``l2norm_fwd_kernel`` for the rationale); only the bwd
+# kernels still use this list because the bwd path is autograd-only and
+# its dispatch overhead is not on a critical inference loop.
 BT_LIST = [8, 16, 32, 64, 128]
 NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps) for num_warps in NUM_WARPS_AUTOTUNE
-    ],
-    key=["D"],
-    **autotune_cache_kwargs,
-)
+# Default forward-kernel tile config (MBLOCK=32, num_warps=4): a robust
+# choice across the supported head dimensions D in {64, 128, 256, 512}.
+_L2NORM_FWD_BT = 32
+_L2NORM_FWD_NUM_WARPS = 4
+
+
 @triton.jit
 def l2norm_fwd_kernel1(
-    x,
-    y,
-    rstd,
-    eps,
+    X, Y, Rstd, eps,
     D,
     BD: tl.constexpr,
+    STORE_RSTD: tl.constexpr,
 ):
+    """L2 normalize per row, D > 512 (one row per program; no autotune --
+    the kernel is too simple to benefit from config sweep, and the host
+    dispatch overhead matters here).
+
+    ``STORE_RSTD`` is a compile-time flag: when False the rstd store is
+    dead-code-eliminated and the caller may pass any placeholder tensor
+    as ``Rstd``.
+    """
     i_t = tl.program_id(0)
-    x += i_t * D
-    y += i_t * D
-    # Compute mean and variance
+    X += i_t * D
+    Y += i_t * D
     cols = tl.arange(0, BD)
     mask = cols < D
-
-    b_x = tl.load(x + cols, mask=mask, other=0.0).to(tl.float32)
-    b_rstd = 1 / tl.sqrt(tl.sum(b_x * b_x) + eps)
+    b_x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+    b_rstd = tl.rsqrt(tl.sum(b_x * b_x) + eps)
     b_y = b_x * b_rstd
-    tl.store(y + cols, b_y, mask=mask)
-    tl.store(rstd + i_t, b_rstd)
+    tl.store(Y + cols, b_y.to(Y.dtype.element_ty), mask=mask)
+    if STORE_RSTD:
+        tl.store(Rstd + i_t, b_rstd)
 
 
 @triton.autotune(
@@ -81,38 +89,42 @@ def l2norm_bwd_kernel1(
     tl.store(dx + cols, b_dx, mask=mask)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BT": BT}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16]
-        for BT in BT_LIST
-    ],
-    key=["D", "NB"],
-    **autotune_cache_kwargs,
-)
 @triton.jit
 def l2norm_fwd_kernel(
-    x,
-    y,
-    rstd,
-    eps,
-    T: tl.constexpr,
+    X, Y, Rstd, eps,
+    T,
     D: tl.constexpr,
     BD: tl.constexpr,
-    NB: tl.constexpr,
     BT: tl.constexpr,
+    STORE_RSTD: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    p_rstd = tl.make_block_ptr(rstd, (T,), (1,), (i_t * BT,), (BT,), (0,))
+    """L2 normalize per row, D <= 512 (``BT`` rows per program).
 
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
-    b_rstd = 1 / tl.sqrt(tl.sum(b_x * b_x, 1) + eps)
-    b_y = b_x * b_rstd[:, None]
+    Uses direct pointer arithmetic instead of ``tl.make_block_ptr`` because
+    on small kernels the block_ptr codegen prologue adds non-trivial
+    overhead. ``STORE_RSTD`` is a
+    compile-time flag: when False the rstd store is DCE-eliminated and
+    the caller may pass any tensor as the ``Rstd`` argument.
 
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), boundary_check=(0,))
+    ``BT`` and ``num_warps`` are fixed at the call site (defaults
+    ``_L2NORM_FWD_BT=32`` / ``_L2NORM_FWD_NUM_WARPS=4``) rather than
+    autotuned: the autotune dispatch + per-NB specialization overhead
+    outweighs any tile-size gains for this small kernel.
+    """
+    xoffset = tl.program_id(0) * BT
+    row_idx = xoffset + tl.arange(0, BT)[:, None]
+    xmask = row_idx < T
+    col_idx = tl.arange(0, BD)[None, :]
+    cmask = col_idx < D
+    mask = xmask & cmask
+    x = tl.load(X + col_idx + D * row_idx, mask=mask, other=0.0).to(tl.float32)
+    sumsq = tl.sum(tl.where(xmask, x * x, 0.0), axis=1)
+    rstd = tl.rsqrt(sumsq + eps)
+    y = x * rstd[:, None]
+    tl.store(Y + col_idx + D * row_idx, y.to(Y.dtype.element_ty), mask=mask)
+    if STORE_RSTD:
+        row1d = xoffset + tl.arange(0, BT)
+        tl.store(Rstd + row1d, rstd, mask=row1d < T)
 
 
 @triton.autotune(
@@ -156,62 +168,75 @@ def l2norm_fwd(
     x: torch.Tensor,
     eps: float = 1e-6,
     output_dtype: torch.dtype | None = None,
+    *,
+    need_rstd: bool = False,
 ):
     """
     Forward pass for L2 normalization.
 
     Args:
-        x (torch.Tensor): Input tensor of shape [..., D].
-        eps (float): Small epsilon for numerical stability. Default: 1e-6.
-        output_dtype (torch.dtype, optional): Output dtype. If None, uses input dtype.
+        x: Input tensor of shape ``[..., D]``.
+        eps: Numerical-stability constant. Default ``1e-6``.
+        output_dtype: Output dtype. ``None`` (default) keeps input dtype.
+        need_rstd: If ``True``, also allocate and return the per-row
+            reciprocal-std tensor required by ``l2norm_bwd`` for the
+            autograd backward path. If ``False`` (default), both the
+            rstd allocation and the in-kernel rstd write are skipped.
+            ``L2NormFunction.forward`` passes
+            ``need_rstd=True`` so autograd users get the correct
+            behavior automatically; pure forward inference call sites
+            should keep the default.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]:
-            - y: Normalized tensor of same shape as x.
-            - rstd: Reciprocal of standard deviation, shape [...].
+        ``(y, rstd)`` where ``rstd`` is the per-row reciprocal std when
+        ``need_rstd=True`` and ``None`` otherwise.
+
+    .. note::
+        The default value of ``need_rstd`` is ``False``. Code that
+        previously consumed ``rstd`` directly via ``y, rstd =
+        l2norm_fwd(x)`` must now opt in with ``need_rstd=True``, or use
+        the higher-level ``l2norm`` / ``L2NormFunction.apply`` wrappers
+        which already pass the right flag.
     """
     x_shape_og = x.shape
     x = x.view(-1, x.shape[-1])
-    # allocate output
     if output_dtype is None:
         y = torch.empty_like(x)
     else:
         y = torch.empty_like(x, dtype=output_dtype)
     assert y.stride(-1) == 1
     T, D = x.shape[0], x.shape[-1]
-    # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
     if D > BD:
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
-    rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
+    if need_rstd:
+        rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
+    else:
+        # Placeholder pointer. ``STORE_RSTD=False`` makes the kernel
+        # never dereference it, so reusing ``y`` avoids even a 1-elem
+        # allocation. (Any in-bounds tensor would work; ``y`` is handy.)
+        rstd = y
+
     if D <= 512:
-        NB = triton.cdiv(T, 2048)
-
-        def grid(meta):
-            return (triton.cdiv(T, meta["BT"]),)
-
-        l2norm_fwd_kernel[grid](
-            x=x,
-            y=y,
-            rstd=rstd,
-            eps=eps,
-            T=T,
-            D=D,
-            BD=BD,
-            NB=NB,
+        BT = _L2NORM_FWD_BT
+        l2norm_fwd_kernel[(triton.cdiv(T, BT),)](
+            x, y, rstd, eps,
+            T, D, BD, BT,
+            STORE_RSTD=need_rstd,
+            num_warps=_L2NORM_FWD_NUM_WARPS,
         )
     else:
         l2norm_fwd_kernel1[(T,)](
-            x=x,
-            y=y,
-            rstd=rstd,
-            eps=eps,
-            D=D,
-            BD=BD,
+            x, y, rstd, eps,
+            D, BD,
+            STORE_RSTD=need_rstd,
         )
-    return y.view(x_shape_og), rstd.view(x_shape_og[:-1])
+
+    if need_rstd:
+        return y.view(x_shape_og), rstd.view(x_shape_og[:-1])
+    return y.view(x_shape_og), None
 
 
 def l2norm_bwd(
@@ -286,7 +311,7 @@ class L2NormFunction(torch.autograd.Function):
         eps=1e-6,
         output_dtype=None,
     ):
-        y, rstd = l2norm_fwd(x, eps, output_dtype)
+        y, rstd = l2norm_fwd(x, eps, output_dtype, need_rstd=True)
         ctx.eps = eps
         ctx.x_dtype = x.dtype
         ctx.save_for_backward(y, rstd)

@@ -76,6 +76,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_fused_qk_norm_rope_cache_quant.py]=446
     FILE_TIMES[op_tests/test_topk_plain.py]=403
     FILE_TIMES[op_tests/test_rope.py]=396
+    FILE_TIMES[op_tests/test_gated_delta_rule.py]=318
     FILE_TIMES[op_tests/test_topk_per_row.py]=272
     FILE_TIMES[op_tests/test_concat_cache_mla.py]=232
     FILE_TIMES[op_tests/test_moe_topk_gating.py]=198
@@ -142,7 +143,6 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/test_pa_decode_gluon.py]=763
     FILE_TIMES[op_tests/triton_tests/gemm/batched/test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant.py]=416
     FILE_TIMES[op_tests/triton_tests/attention/test_mha_fp8.py]=340
-    FILE_TIMES[op_tests/triton_tests/test_gated_delta_rule.py]=318
     FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_a16w16.py]=296
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_a8w4.py]=227
     FILE_TIMES[op_tests/triton_tests/rope/test_fused_qkv_split_qk_rope.py]=206
