@@ -366,19 +366,33 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
-    err = checkAllclose(
-        out2_ref,
-        out2_ck,
-        msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
-    )
-
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
         x, y = x.double(), y.double()
         denominator = (x * x + y * y).sum()
         sim = 2 * (x * y).sum() / denominator
         return 1 - sim
 
-    logits_diff = calc_diff(out2_ref, out2_ck)
+    # The trailing hidden_pad columns of the output map to the padded model_dim
+    # tail, which is discarded downstream (and the kernel may leave NaN there for
+    # all-zero weight blocks). Accuracy is judged on the real region only; the
+    # full tensor is reported as a diagnostic when padding is present.
+    real_model_dim = model_dim - hidden_pad
+    out2_ref_real = out2_ref[:, :real_model_dim]
+    out2_ck_real = out2_ck[:, :real_model_dim]
+    err = checkAllclose(
+        out2_ref_real,
+        out2_ck_real,
+        msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        catastrophic_check=True,
+    )
+    logits_diff = calc_diff(out2_ref_real, out2_ck_real)
+    if hidden_pad != 0:
+        logging.warning(
+            f"[pad diag] real[:, :{real_model_dim}]: err={err}, logits_diff={logits_diff} | "
+            f"full: err={checkAllclose(out2_ref, out2_ck, msg='full(incl pad)')}, "
+            f"logits_diff={calc_diff(out2_ref, out2_ck)}"
+        )
+
     if logits_diff > 1e-3:
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
@@ -432,8 +446,9 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     default=[(7168, 256)],
-    help="""Model dimension.
-    e.g.: -dim 6144,4096""",
+    help="""True (real) model dimension; aligned up to the kernel granularity
+    internally with the pad derived automatically (same as the model-CSV path).
+    e.g.: -dim 2880,360""",
 )
 
 parser.add_argument(
@@ -527,15 +542,6 @@ parser.add_argument(
     -p t    # True.""",
 )
 parser.add_argument(
-    "-hip",
-    "--hidden_intermediate_pad",
-    type=dtypes.str2tuple,
-    nargs="*",
-    default=[(192, 128)],
-    help="""Hidden intermediate pad.
-    e.g.: -hip 0,0""",
-)
-parser.add_argument(
     "--no-flydsl-csv",
     action="store_true",
     help="Skip validating flydsl shapes from tuned fmoe CSVs.",
@@ -589,20 +595,46 @@ def _str2enum(s, enum_cls):
     return getattr(enum_cls, s.strip().split(".")[-1])
 
 
+# Tuned fmoe CSVs store each model's real (unpadded) MoE dims, e.g. gpt-oss
+# 2880/1440/360. The kernel runs on 256-aligned dims and masks the padded tail,
+# so derive the aligned dims and the pad the kernel must receive from the real
+# dims. Runtime/AOT lookup also aligns its keys, so the real dims still resolve
+# to the same tuned/compiled kernel as the padded tensors at inference time.
+_MOE_DIM_ALIGN = 256
+
+
+def _align_up(value, alignment):
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _aligned_dims_and_pad(real_model_dim, real_inter_dim):
+    """Align true dims up to the kernel granularity and return the pad widths.
+
+    Shared by the model-CSV path and the legacy CLI sweep so both feed the kernel
+    aligned dims plus the pad that masks the real-dim tail.
+    """
+    model_dim = _align_up(real_model_dim, _MOE_DIM_ALIGN)
+    inter_dim = _align_up(real_inter_dim, _MOE_DIM_ALIGN)
+    return model_dim, inter_dim, model_dim - real_model_dim, inter_dim - real_inter_dim
+
+
 def _row_to_kwargs(row):
-    # csv rows store already-effective dims, so pad defaults to 0.
     q_type = _str2enum(row["q_type"], aiter.QuantType)
     aq_dtype = _str2dtype(row["q_dtype_a"])
     wq_dtype = _str2dtype(row["q_dtype_w"])
     act_type = _str2enum(row["act_type"], aiter.ActivationType)
-    # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
-    # from the selected activation/weight dtype layout used by fused_moe.
     gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
+    real_model_dim = int(row["model_dim"])
+    real_inter_dim = int(row["inter_dim"])
+
+    model_dim, inter_dim, hidden_pad, intermediate_pad = _aligned_dims_and_pad(
+        real_model_dim, real_inter_dim
+    )
     return dict(
         dtype=_str2dtype(row["dtype"]),
         token=int(row["token"]),
-        model_dim=int(row["model_dim"]),
-        inter_dim=int(row["inter_dim"]),
+        model_dim=model_dim,
+        inter_dim=inter_dim,
         E=int(row["expert"]),
         topk=int(row["topk"]),
         actType=act_type,
@@ -612,8 +644,8 @@ def _row_to_kwargs(row):
         WQDType=wq_dtype,
         use_g1u1=dtypes.str2bool(str(row["use_g1u1"])),
         doweight_stage1=dtypes.str2bool(str(row["doweight_stage1"])),
-        hidden_pad=0,
-        intermediate_pad=0,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
         preshuffle=True,
     )
 
@@ -747,27 +779,29 @@ def _iter_legacy_cases():
     for (
         dtype,
         (quant_type, aq_dtype, wq_dtype),
-        (model_dim, inter_dim),
+        (real_model_dim, real_inter_dim),
         doweight_stage1,
     ) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
         triple = (quant_type, aq_dtype, wq_dtype)
+        model_dim, inter_dim, hidden_pad, intermediate_pad = _aligned_dims_and_pad(
+            real_model_dim, real_inter_dim
+        )
 
         if triple in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
-            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
-                for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        aiter.ActivationType.Swiglu,
-                        hidden_pad=hidden_pad,
-                        intermediate_pad=intermediate_pad,
-                    ), extras
+            for m in args.tokenNum:
+                yield _kw(
+                    dtype,
+                    m,
+                    model_dim,
+                    inter_dim,
+                    quant_type,
+                    aq_dtype,
+                    wq_dtype,
+                    doweight_stage1,
+                    aiter.ActivationType.Swiglu,
+                    hidden_pad=hidden_pad,
+                    intermediate_pad=intermediate_pad,
+                ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
                 for act_type in args.act:
@@ -783,8 +817,8 @@ def _iter_legacy_cases():
                             doweight_stage1,
                             act_type,
                             preshuffle=preshuffle,
-                            hidden_pad=0,
-                            intermediate_pad=0,
+                            hidden_pad=hidden_pad,
+                            intermediate_pad=intermediate_pad,
                         ), extras
         elif triple == _PER1X32_BF16_I4:
             for m in args.tokenNum:
@@ -798,6 +832,8 @@ def _iter_legacy_cases():
                     wq_dtype,
                     doweight_stage1,
                     aiter.ActivationType.Silu,
+                    hidden_pad=hidden_pad,
+                    intermediate_pad=intermediate_pad,
                 ), extras
         else:
             for act_type in args.act:
@@ -812,6 +848,8 @@ def _iter_legacy_cases():
                         wq_dtype,
                         doweight_stage1,
                         act_type,
+                        hidden_pad=hidden_pad,
+                        intermediate_pad=intermediate_pad,
                     ), extras
 
 

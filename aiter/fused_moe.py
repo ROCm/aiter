@@ -783,17 +783,6 @@ def _normalize_bias_for_kernel(
     return bias
 
 
-# TODO: remove this function once kernel handles padding in the runtime
-def _get_padding_for_flydsl(
-    inter_dim_pad,
-    model_dim_pad,
-    bias: Optional[torch.Tensor] = None,
-):
-    if bias is not None:
-        return 0, 0
-    return inter_dim_pad, model_dim_pad
-
-
 def _flydsl_stage1_wrapper(
     hidden_states,
     w1,
@@ -817,9 +806,6 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     **_kwargs,
 ):
-    inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
-        inter_dim_pad, model_dim_pad, bias1
-    )
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
@@ -877,9 +863,6 @@ def _flydsl_stage2_wrapper(
     **_kwargs,
 ):
 
-    inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
-        inter_dim_pad, model_dim_pad, bias2
-    )
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
@@ -947,10 +930,20 @@ def get_2stage_cfgs(
         "doweight_stage1",
     ]
 
+    def _align_up_256(value):
+        return (int(value) + 255) // 256 * 256
+
+    def _align_lookup_dims(df):
+        for col in ("model_dim", "inter_dim"):
+            if col in df.columns:
+                df[col] = ((df[col].astype("int64") + 255) // 256) * 256
+        return df
+
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
         df = pd.read_csv(tune_file)
+        df = _align_lookup_dims(df)
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
 
@@ -992,6 +985,7 @@ def get_2stage_cfgs(
             _flydsl_fallback_cache[tune_file] = {}
             return {}
         df = pd.read_csv(tune_file)
+        df = _align_lookup_dims(df)
         if "_tag" not in df.columns:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
@@ -1020,11 +1014,14 @@ def get_2stage_cfgs(
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
+    # Align to match the real-dim rows in the tuned CSV (see _align_lookup_dims).
+    lookup_model_dim = _align_up_256(model_dim)
+    lookup_inter_dim = _align_up_256(inter_dim)
     keys = (
         cu_num,
         token,
-        model_dim,
-        inter_dim,
+        lookup_model_dim,
+        lookup_inter_dim,
         expert,
         topk,
         activation,
@@ -1038,8 +1035,8 @@ def get_2stage_cfgs(
     keys_disabled = (
         cu_num,
         token,
-        model_dim,
-        inter_dim,
+        lookup_model_dim,
+        lookup_inter_dim,
         expert,
         topk,
         _ACT_TYPE_DISABLED_KEY,

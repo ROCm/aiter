@@ -72,6 +72,13 @@ def _row_swiglu_limit(row: dict[str, str]) -> float:
     return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit") or 0.0
 
 
+_MOE_DIM_ALIGN = 256
+
+
+def _align_up(value: int, alignment: int = _MOE_DIM_ALIGN) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
 def parse_csv(csv_path: str):
     """Parse the CSV and return a list of unique compile jobs.
 
@@ -89,8 +96,12 @@ def parse_csv(csv_path: str):
         reader = csv.DictReader(f)
         for row in reader:
             token = int(row["token"])
-            model_dim = int(row["model_dim"])
-            inter_dim = int(row["inter_dim"])
+            real_model_dim = int(row["model_dim"])
+            real_inter_dim = int(row["inter_dim"])
+            model_dim = _align_up(real_model_dim)
+            inter_dim = _align_up(real_inter_dim)
+            model_dim_pad = model_dim - real_model_dim
+            inter_dim_pad = inter_dim - real_inter_dim
             experts = int(row["expert"])
             topk = int(row["topk"])
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
@@ -137,10 +148,15 @@ def parse_csv(csv_path: str):
                     continue
 
                 for enable_bias in enable_bias_options:
+                    # Runtime passes the real pad to the kernel regardless of
+                    # bias, so the AOT cache key must use the real pad for both
+                    # bias variants to match the runtime compile key.
                     job = {
                         "kernel_name": name,
                         "model_dim": model_dim,
                         "inter_dim": inter_dim,
+                        "model_dim_pad": model_dim_pad,
+                        "inter_dim_pad": inter_dim_pad,
                         "experts": experts,
                         "topk": topk,
                         "doweight_stage1": doweight_stage1,
@@ -201,6 +217,8 @@ def _precompile_to_cache(
     enable_bias: bool = False,
     stage1_fuse_quant=None,
     swiglu_limit: float = 0.0,
+    model_dim_pad: int = 0,
+    inter_dim_pad: int = 0,
     **kwargs,
 ):
     """Trigger MLIR compilation by calling the runtime stage1/stage2 entry points
@@ -551,6 +569,8 @@ def _precompile_to_cache(
                 waves_per_eu=waves_per_eu,
                 b_nt=b_nt,
                 gate_mode=gate_mode,
+                model_dim_pad=model_dim_pad,
+                inter_dim_pad=inter_dim_pad,
                 enable_bias=(kernel_bias is not None),
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
@@ -722,6 +742,8 @@ def _precompile_to_cache(
                 persist_m=_persist_m,
                 sort_block_m=sort_block_m,
                 b_nt=b_nt,
+                model_dim_pad=model_dim_pad,
+                inter_dim_pad=inter_dim_pad,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
             )
