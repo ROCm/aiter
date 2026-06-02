@@ -83,7 +83,7 @@ def launch_fmha(
         _lds_alloc_v_b.finalize()
 
     from flydsl.expr.arith import _to_raw
-    num_tg = arith.index_cast(T.index, arith.divui(
+    num_tg = arith.index_cast(T.index, arith.ceildivui(
         _to_raw(q_seq_len), arith.constant(BLOCK_M, type=T.i32)))
     grid_x = arith.index_cast(T.index, batch_size)
     grid_z = arith.index_cast(T.index, num_heads)
@@ -190,6 +190,7 @@ if __name__ == "__main__":
     tests = [
         (1, 1, 128, 128),
         (1, 1, 256, 256),
+        (1, 1, 300, 300),
         (1, 1, 384, 384),
     ]
 
