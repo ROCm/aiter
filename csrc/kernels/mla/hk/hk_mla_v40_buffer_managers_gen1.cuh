@@ -350,15 +350,10 @@ class QManager8to16bitsV1
         const uintptr_t addr_base =
             p_lds_warp_staging + row_in_warp * kP1ChunkCols + C_phys * 16u + byte_off;
 
-        // Drain BOTH vmcnt AND lgkmcnt:
-        //  - vmcnt covers the vmem-fetch side of buffer_load_lds + the scale
-        //    buffer_load_ubytes that returned to VGPR.
-        //  - lgkmcnt covers the LDS-write side of buffer_load_lds. On GFX9 a
-        //    buffer_load_lds increments lgkmcnt for its LDS-store half; ds_read
-        //    of that LDS region can see stale data unless lgkmcnt is drained
-        //    first. Phase 1 is a one-shot warmup -- the lost pipelining is fine.
-        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/0));
-        __builtin_amdgcn_sched_barrier(0);
+        // CALLER CONTRACT: drain vmcnt to the level appropriate for this
+        // (kChunkIdx, kBufIdx) before calling. buffer_load_lds completion is
+        // tracked in vmcnt only (NOT lgkmcnt); the matching scale
+        // buffer_load_ubyte from p1_vmem_to_staging_chunk is also vmcnt.
 
         // 16 fp8/lane (both iters) via a single ds_read_b128. The two iters
         // are contiguous (offset 0 and +8 within the per-lane row chunk), so
@@ -618,14 +613,37 @@ class QManager8to16bitsV1
         // chunk's cvt runs. The single per-chunk scale dword (V4 has one scale
         // per 64-col tile) is returned by p1_vmem_to_staging_chunk and held in
         // s_X across the ladder until p1_staging_to_vgpr_chunk consumes it.
+        // Phase 1 vmcnt budget: each p1_vmem_to_staging_chunk issues 2 vmem
+        // ops (dwordx4_lds + scale ubyte). buffer_load_lds completion is in
+        // vmcnt only (NOT lgkmcnt). buf 0/1 are double-buffered: chunk c+2
+        // overwrites buf used by chunk c, so before reusing a buf we also
+        // need the prior consume's ds_read drained (lgkmcnt=0).
         uint32_t s_0, s_1, s_2, s_3;
-        p1_vmem_to_staging_chunk<0, 0>(p_q_warp, p_lds_warp_staging, s_0);
-        p1_vmem_to_staging_chunk<1, 1>(p_q_warp, p_lds_warp_staging, s_1);
+        p1_vmem_to_staging_chunk<0, 0>(p_q_warp, p_lds_warp_staging, s_0); // out=2
+        p1_vmem_to_staging_chunk<1, 1>(p_q_warp, p_lds_warp_staging, s_1); // out=4
+        // Drain c0 (oldest 2 of 4 outstanding).
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/2));
+        __builtin_amdgcn_sched_barrier(0);
         p1_staging_to_vgpr_chunk<0, 0, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_0);
-        p1_vmem_to_staging_chunk<2, 0>(p_q_warp, p_lds_warp_staging, s_2);
+        // c0 ds_read must be done before c2 overwrites buf 0.
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
+        __builtin_amdgcn_sched_barrier(0);
+        p1_vmem_to_staging_chunk<2, 0>(p_q_warp, p_lds_warp_staging, s_2); // out=4 (c1+c2)
+        // Drain c1 (oldest 2 of 4).
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/2));
+        __builtin_amdgcn_sched_barrier(0);
         p1_staging_to_vgpr_chunk<1, 1, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_1);
-        p1_vmem_to_staging_chunk<3, 1>(p_q_warp, p_lds_warp_staging, s_3);
+        // c1 ds_read must be done before c3 overwrites buf 1.
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
+        __builtin_amdgcn_sched_barrier(0);
+        p1_vmem_to_staging_chunk<3, 1>(p_q_warp, p_lds_warp_staging, s_3); // out=4 (c2+c3)
+        // Drain c2.
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/2));
+        __builtin_amdgcn_sched_barrier(0);
         p1_staging_to_vgpr_chunk<2, 0, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_2);
+        // Drain c3.
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/0));
+        __builtin_amdgcn_sched_barrier(0);
         p1_staging_to_vgpr_chunk<3, 1, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_3);
 
         // ---- Phase 2: LDS half (Q[:, 256:512]) ----
