@@ -3,22 +3,27 @@
 
 """Tests for the BF16 ``rope_norm_store_kv`` Triton kernel.
 
-The reference is the pure-PyTorch implementation supplied alongside the API spec;
-it is reproduced here so the test file is self-contained.
+New cache layouts:
+  key_cache  : [num_blocks, num_kv_heads, qk_head_dim // X, block_size, X]
+  value_cache: [num_blocks, num_kv_heads, v_head_dim, block_size]
+
+RMSNorm eps is fixed at 1e-5 inside the wrapper; the reference matches.
 """
 
 from typing import Optional
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from aiter.ops.triton.fusions.rope_norm_store_kv import rope_norm_store_kv
 
 
 # ---------- Reference ----------
 
-def _rms_norm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
+_EPS = 1e-5
+
+
+def _rms_norm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float = _EPS):
     rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
     return x / rms * weight
 
@@ -31,6 +36,26 @@ def _apply_rope_neox_ref(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     return torch.cat([y1, y2], dim=-1)
 
 
+def _write_k_paged(key_cache, phys_block, slot, vec_bf16):
+    """Write k[num_kv_heads, head_dim] vector to the new K layout.
+
+    key_cache: [B, H, D//X, S, X]
+    """
+    num_kv = key_cache.shape[1]
+    X = key_cache.shape[-1]
+    head_dim = key_cache.shape[2] * X
+    reshaped = vec_bf16.reshape(num_kv, head_dim // X, X)
+    key_cache[phys_block, :, :, slot, :] = reshaped
+
+
+def _write_v_paged(value_cache, phys_block, slot, vec_bf16):
+    """Write v[num_kv_heads, v_head_dim] vector to the new V layout.
+
+    value_cache: [B, H, D, S]
+    """
+    value_cache[phys_block, :, :, slot] = vec_bf16
+
+
 def rope_norm_store_kv_reference(
     key_cache, value_cache, qkv, cos_sin,
     num_seqlen_per_req, q_index, kvcache_indices, is_prefill,
@@ -39,10 +64,11 @@ def rope_norm_store_kv_reference(
     qk_norm_policy=0,
 ):
     num_rows = qkv.shape[0]
-    num_kv_heads = key_cache.shape[2]
-    qk_head_dim = key_cache.shape[3]
-    v_head_dim = value_cache.shape[3]
-    block_size = key_cache.shape[1]
+    num_kv_heads = key_cache.shape[1]
+    X = key_cache.shape[-1]
+    qk_head_dim = key_cache.shape[2] * X
+    block_size = key_cache.shape[3]
+    v_head_dim = value_cache.shape[2]
     hidden = qkv.shape[1]
     num_q_heads = (
         hidden - num_kv_heads * qk_head_dim - num_kv_heads * v_head_dim
@@ -99,7 +125,7 @@ def rope_norm_store_kv_reference(
             for i in range(start, end):
                 tp = i + seq_len - end
                 phys = kvcache_indices[req_id, tp // block_size].item()
-                key_cache[phys, tp % block_size, :, :] = k_bf16[i]
+                _write_k_paged(key_cache, phys, tp % block_size, k_bf16[i])
 
     if out_v is not None:
         out_v.copy_(v_bf16)
@@ -111,7 +137,7 @@ def rope_norm_store_kv_reference(
             for i in range(start, end):
                 tp = i + seq_len - end
                 phys = kvcache_indices[req_id, tp // block_size].item()
-                value_cache[phys, tp % block_size, :, :] = v_bf16[i]
+                _write_v_paged(value_cache, phys, tp % block_size, v_bf16[i])
 
     if is_prefill:
         for req_id in range(num_req):
@@ -124,9 +150,11 @@ def rope_norm_store_kv_reference(
             phys = kvcache_indices[req_id, lbi].item()
             if lbr + 1 < block_size:
                 if out_k is None:
-                    key_cache[phys, lbr + 1:, :, :] = 0
+                    # K layout [B, H, D//X, S, X] — zero slots > lbr
+                    key_cache[phys, :, :, lbr + 1:, :] = 0
                 if out_v is None:
-                    value_cache[phys, lbr + 1:, :, :] = 0
+                    # V layout [B, H, D, S] — zero slots > lbr
+                    value_cache[phys, :, :, lbr + 1:] = 0
 
     return out_q
 
@@ -141,23 +169,21 @@ def _make_inputs(
     v_head_dim,
     block_size,
     is_prefill,
+    X,
     seed=0,
     device="cuda",
     extra_pad_blocks=2,
 ):
-    """Build a self-consistent batch.
+    """Build a self-consistent batch with the new cache layouts."""
+    if qk_head_dim % X != 0:
+        raise ValueError(f"qk_head_dim={qk_head_dim} must be divisible by X={X}")
 
-    ``seqlens`` is a list of *total* sequence lengths per request (including the
-    new tokens). For prefill we treat every token in the request as new; for decode
-    each request supplies exactly one new token.
-    """
     torch.manual_seed(seed)
     num_req = len(seqlens)
     new_tokens_per_req = list(seqlens) if is_prefill else [1] * num_req
     q_index = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(new_tokens_per_req), dim=0).tolist()),
-        dtype=torch.int32,
-        device=device,
+        dtype=torch.int32, device=device,
     )
     num_rows = int(q_index[-1].item())
     num_seqlen_per_req = torch.tensor(seqlens, dtype=torch.int32, device=device)
@@ -165,14 +191,16 @@ def _make_inputs(
     max_seqlen = max(seqlens)
     max_blocks_per_req = (max_seqlen + block_size - 1) // block_size
     total_blocks_needed = max_blocks_per_req * num_req + extra_pad_blocks
-    # Use a fresh shuffled physical block per logical slot to catch any
-    # indexing assumptions.
     physical_blocks = torch.randperm(total_blocks_needed, device=device).to(torch.int32)
     kvcache_indices = physical_blocks[: num_req * max_blocks_per_req].reshape(
         num_req, max_blocks_per_req
     )
 
-    hidden = num_q_heads * qk_head_dim + num_kv_heads * qk_head_dim + num_kv_heads * v_head_dim
+    hidden = (
+        num_q_heads * qk_head_dim
+        + num_kv_heads * qk_head_dim
+        + num_kv_heads * v_head_dim
+    )
     qkv = torch.randn(num_rows, hidden, dtype=torch.bfloat16, device=device)
 
     max_table_len = max_seqlen + 8
@@ -181,17 +209,14 @@ def _make_inputs(
     q_norm_weight = torch.randn(qk_head_dim, dtype=torch.float32, device=device)
     k_norm_weight = torch.randn(qk_head_dim, dtype=torch.float32, device=device)
 
+    # NEW layouts
     key_cache = torch.full(
-        (total_blocks_needed, block_size, num_kv_heads, qk_head_dim),
-        7.0,
-        dtype=torch.bfloat16,
-        device=device,
+        (total_blocks_needed, num_kv_heads, qk_head_dim // X, block_size, X),
+        7.0, dtype=torch.bfloat16, device=device,
     )
     value_cache = torch.full(
-        (total_blocks_needed, block_size, num_kv_heads, v_head_dim),
-        -3.0,
-        dtype=torch.bfloat16,
-        device=device,
+        (total_blocks_needed, num_kv_heads, v_head_dim, block_size),
+        -3.0, dtype=torch.bfloat16, device=device,
     )
 
     return dict(
@@ -209,6 +234,7 @@ def _make_inputs(
         qk_head_dim=qk_head_dim,
         v_head_dim=v_head_dim,
         block_size=block_size,
+        X=X,
     )
 
 
@@ -270,25 +296,30 @@ def _assert_close(a, b, name):
 
 # ---------- Tests ----------
 
+# (seqlens, qh, kvh, qk_d, v_d, bs, X)
+# Cover bs=16 (the new minimum) and 32/64, plus X=4 and X=8.
 PREFILL_CONFIGS = [
-    ([4],            1, 1, 64,  64,  16),
-    ([1, 3, 5],      4, 2, 64,  64,  16),
-    ([17, 5, 1],     8, 2, 128, 128, 16),
-    ([32],           8, 8, 128, 128, 16),
-    ([7, 11],        4, 1, 64,  32,  8),   # different qk_head_dim and v_head_dim
-    ([200],          16, 4, 128, 128, 32),
+    ([4],            1, 1, 64,  64,  16, 8),
+    ([4],            1, 1, 64,  64,  16, 4),
+    ([1, 3, 5],      4, 2, 64,  64,  16, 8),
+    ([17, 5, 1],     8, 2, 128, 128, 16, 8),
+    ([17, 5, 1],     8, 2, 128, 128, 32, 8),
+    ([32],           8, 8, 128, 128, 32, 4),
+    ([7, 11],        4, 1, 64,  32,   8, 4),  # block_size < 16: ensure non-pow2 still works
+    ([200],          16, 4, 128, 128, 64, 8),
+    ([200],          16, 4, 128, 128, 16, 8),  # block_size=16 explicit
 ]
 
 
 @pytest.mark.parametrize(
-    "seqlens, qh, kvh, qk_d, v_d, bs",
+    "seqlens, qh, kvh, qk_d, v_d, bs, X",
     PREFILL_CONFIGS,
-    ids=[f"L{','.join(map(str,s))}_qh{qh}_kvh{kvh}_qkd{qk}_vd{vd}_bs{bs}"
-         for (s, qh, kvh, qk, vd, bs) in PREFILL_CONFIGS],
+    ids=[f"L{','.join(map(str,s))}_qh{qh}_kvh{kvh}_qkd{qk}_vd{vd}_bs{bs}_X{x}"
+         for (s, qh, kvh, qk, vd, bs, x) in PREFILL_CONFIGS],
 )
 @pytest.mark.parametrize("policy", [0, 1, 2])
-def test_rope_norm_store_kv_prefill_paged_cache(seqlens, qh, kvh, qk_d, v_d, bs, policy):
-    inp = _make_inputs(seqlens, qh, kvh, qk_d, v_d, bs, is_prefill=True)
+def test_prefill_paged_cache(seqlens, qh, kvh, qk_d, v_d, bs, X, policy):
+    inp = _make_inputs(seqlens, qh, kvh, qk_d, v_d, bs, is_prefill=True, X=X)
     (rq, kq, rkc, okc, rvc, ovc, *_) = _run_pair(inp, True, policy, use_out_kv=False)
     _assert_close(rq, kq, "out_q")
     _assert_close(rkc, okc, "key_cache")
@@ -296,14 +327,14 @@ def test_rope_norm_store_kv_prefill_paged_cache(seqlens, qh, kvh, qk_d, v_d, bs,
 
 
 @pytest.mark.parametrize(
-    "seqlens, qh, kvh, qk_d, v_d, bs",
+    "seqlens, qh, kvh, qk_d, v_d, bs, X",
     PREFILL_CONFIGS,
-    ids=[f"L{','.join(map(str,s))}_qh{qh}_kvh{kvh}_qkd{qk}_vd{vd}_bs{bs}"
-         for (s, qh, kvh, qk, vd, bs) in PREFILL_CONFIGS],
+    ids=[f"L{','.join(map(str,s))}_qh{qh}_kvh{kvh}_qkd{qk}_vd{vd}_bs{bs}_X{x}"
+         for (s, qh, kvh, qk, vd, bs, x) in PREFILL_CONFIGS],
 )
 @pytest.mark.parametrize("policy", [0, 1])
-def test_rope_norm_store_kv_prefill_out_kv(seqlens, qh, kvh, qk_d, v_d, bs, policy):
-    inp = _make_inputs(seqlens, qh, kvh, qk_d, v_d, bs, is_prefill=True)
+def test_prefill_out_kv(seqlens, qh, kvh, qk_d, v_d, bs, X, policy):
+    inp = _make_inputs(seqlens, qh, kvh, qk_d, v_d, bs, is_prefill=True, X=X)
     (rq, kq, _, _, _, _, rk, ok_, rv, ov) = _run_pair(inp, True, policy, use_out_kv=True)
     _assert_close(rq, kq, "out_q")
     _assert_close(rk, ok_, "out_k")
@@ -311,23 +342,23 @@ def test_rope_norm_store_kv_prefill_out_kv(seqlens, qh, kvh, qk_d, v_d, bs, poli
 
 
 DECODE_CONFIGS = [
-    ([5],         1, 1, 64,  64,  16),
-    ([3, 7, 11],  4, 2, 64,  64,  16),
-    ([1, 1, 17, 33], 8, 2, 128, 128, 16),
-    ([129],       16, 4, 128, 128, 32),
+    ([5],         1, 1, 64,  64,  16, 8),
+    ([5],         1, 1, 64,  64,  16, 4),
+    ([3, 7, 11],  4, 2, 64,  64,  32, 8),
+    ([1, 1, 17, 33], 8, 2, 128, 128, 16, 8),
+    ([129],       16, 4, 128, 128, 64, 8),
 ]
 
 
 @pytest.mark.parametrize(
-    "seqlens, qh, kvh, qk_d, v_d, bs",
+    "seqlens, qh, kvh, qk_d, v_d, bs, X",
     DECODE_CONFIGS,
-    ids=[f"L{','.join(map(str,s))}_qh{qh}_kvh{kvh}_qkd{qk}_vd{vd}_bs{bs}"
-         for (s, qh, kvh, qk, vd, bs) in DECODE_CONFIGS],
+    ids=[f"L{','.join(map(str,s))}_qh{qh}_kvh{kvh}_qkd{qk}_vd{vd}_bs{bs}_X{x}"
+         for (s, qh, kvh, qk, vd, bs, x) in DECODE_CONFIGS],
 )
 @pytest.mark.parametrize("policy", [0, 1, 2])
-def test_rope_norm_store_kv_decode_paged_cache(seqlens, qh, kvh, qk_d, v_d, bs, policy):
-    inp = _make_inputs(seqlens, qh, kvh, qk_d, v_d, bs, is_prefill=False)
-    # Decode: each request appends 1 token, so num_rows == num_req
+def test_decode_paged_cache(seqlens, qh, kvh, qk_d, v_d, bs, X, policy):
+    inp = _make_inputs(seqlens, qh, kvh, qk_d, v_d, bs, is_prefill=False, X=X)
     assert inp["qkv"].shape[0] == len(seqlens)
     (rq, kq, rkc, okc, rvc, ovc, *_) = _run_pair(inp, False, policy, use_out_kv=False)
     _assert_close(rq, kq, "out_q")

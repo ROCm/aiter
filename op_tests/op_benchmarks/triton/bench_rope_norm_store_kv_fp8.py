@@ -86,7 +86,7 @@ def run_benchmark(args):
         inp = _make_inputs(
             seqlens, num_q_heads, num_kv_heads,
             qk_head_dim, v_head_dim, block_size,
-            is_prefill=is_prefill, quant_policy=quant_policy,
+            is_prefill=is_prefill, quant_policy=quant_policy, X=args.X,
         )
         fn = lambda: _run_once(inp, is_prefill, qk_norm_policy, quant_policy)
         ms = triton.testing.do_bench(fn, warmup=10, rep=50)
@@ -112,6 +112,8 @@ def main():
     parser.add_argument("--qkd", type=int, default=128)
     parser.add_argument("--vd", type=int, default=128)
     parser.add_argument("--block-size", type=int, default=64)
+    parser.add_argument("--X", type=int, default=16,
+                        help="K-cache vector chunk size (typically 16/dtype_bytes = 16 for fp8).")
     parser.add_argument("--metric", choices=["us", "bw"], default="us")
     parser.add_argument("--save-path", type=str, default=None)
     args = parser.parse_args()

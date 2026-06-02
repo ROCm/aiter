@@ -24,13 +24,7 @@ def _rope_norm_store_kv_fp8_compute_pos_slot_kernel(
     BLOCK_R: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Same as the BF16 helper, but also writes req_id and per-request local
-    row index for each output row (needed by the FP8 kernel to address the
-    [num_req, num_q_heads, max_seqlens_pad128] q_scale_out tensor in prefill).
-
-    Skips writes for padding requests (seq_len == 0); callers must pre-fill
-    slot_indices with -1 to mark untouched rows as invalid.
-    """
+    """Same as the BF16 helper, plus per-row req_id and local row index."""
     req = tl.program_id(0)
     start = tl.load(q_index_ptr + req).to(tl.int32)
     end = tl.load(q_index_ptr + req + 1).to(tl.int32)
@@ -65,41 +59,36 @@ def _rope_norm_store_kv_fp8_kernel(
     cos_sin_ptr,             # [max_seq_len, qk_head_dim] f32
     positions_ptr,           # [num_rows] int32
     slot_indices_ptr,        # [num_rows] int64 (-1 = invalid)
-    req_ids_ptr,             # [num_rows] int32  (prefill dynamic-Q only)
-    local_idx_ptr,           # [num_rows] int32  (prefill dynamic-Q only)
+    req_ids_ptr,             # [num_rows] int32
+    local_idx_ptr,           # [num_rows] int32
     q_norm_weight_ptr,
     k_norm_weight_ptr,
-    hadamard_ptr,            # [qk_head_dim, qk_head_dim] bf16 (pre-normalized by 1/sqrt(d))
+    hadamard_ptr,            # [qk_head_dim, qk_head_dim] bf16 (pre-normalized)
     q_scale_inv_ptr,         # [1] f32 (static Q only)
-    k_scale_ptr,             # paged [num_blocks, R, num_kv_heads, L] (dynamic) or [1] (static)
-    v_scale_ptr,             # [num_kv_heads] (dynamic V per-head) or [1] (static)
-    q_scale_out_ptr,         # [num_req, num_q_heads, pad128] (prefill) or [num_rows, num_q_heads] (decode); dynamic Q
+    k_scale_ptr,             # paged [num_blocks, R, num_kv_heads, L] or [1]
+    v_scale_ptr,             # [num_kv_heads] or [1]
+    q_scale_out_ptr,         # [num_req, num_q_heads, pad128] (prefill) or [num_rows, num_q_heads] (decode)
     out_q_ptr,               # FP8 [num_rows, num_q_heads, qk_head_dim]
-    out_k_ptr,               # FP8 (optional)
-    out_v_ptr,               # FP8 (optional)
-    key_cache_ptr,           # FP8 [num_blocks, block_size, num_kv_heads, qk_head_dim]
-    value_cache_ptr,         # FP8 [num_blocks, block_size, num_kv_heads, v_head_dim]
+    out_k_ptr,               # FP8 (optional, simple [rows, kvh, qkd] layout)
+    out_v_ptr,               # FP8 (optional, simple [rows, kvh, vd] layout)
+    key_cache_ptr,           # FP8 [num_blocks, num_kv_heads, qk_head_dim/X, block_size, X]
+    value_cache_ptr,         # FP8 [num_blocks, num_kv_heads, v_head_dim, block_size]
     eps,
     num_rows,
     total_num_kv_cache_tokens: tl.int64,
     fp8_max,
-    # qkv strides
     stride_qkv_t, stride_qkv_d,
-    # cos_sin strides
     stride_cos_t, stride_cos_d,
-    # out_q strides
     stride_out_q_t, stride_out_q_h, stride_out_q_d,
-    # out_k strides (only used if WRITE_K_TO_CACHE=False)
     stride_out_k_t, stride_out_k_h, stride_out_k_d,
-    # out_v strides (only used if WRITE_V_TO_CACHE=False)
     stride_out_v_t, stride_out_v_h, stride_out_v_d,
-    # key_cache strides
-    stride_kc_b, stride_kc_t, stride_kc_h, stride_kc_d,
-    # value_cache strides
-    stride_vc_b, stride_vc_t, stride_vc_h, stride_vc_d,
-    # k_scale strides (dynamic path only)
+    # key_cache strides (5-D: B, H, D/X, S, X)
+    stride_kc_b, stride_kc_h, stride_kc_chunk, stride_kc_slot, stride_kc_x,
+    # value_cache strides (4-D: B, H, D, S)
+    stride_vc_b, stride_vc_h, stride_vc_d, stride_vc_slot,
+    # k_scale strides (dynamic path only: B, R, H, L)
     stride_ks_b, stride_ks_r, stride_ks_h, stride_ks_l,
-    # q_scale_out strides (dynamic-Q path)
+    # q_scale_out strides
     stride_qs_0, stride_qs_1, stride_qs_2,
     # constexprs
     NUM_Q_HEADS: tl.constexpr,
@@ -110,17 +99,18 @@ def _rope_norm_store_kv_fp8_kernel(
     V_HEAD_DIM_PAD: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_T: tl.constexpr,
-    QK_NORM_POLICY: tl.constexpr,      # 0/1/2
+    X: tl.constexpr,                # K-cache vector chunk size
+    QK_NORM_POLICY: tl.constexpr,
     APPLY_Q_NORM: tl.constexpr,
     APPLY_K_NORM: tl.constexpr,
-    Q_QUANT_DYNAMIC: tl.constexpr,     # True for policy 0/1/3, False for 2
-    K_QUANT_DYNAMIC: tl.constexpr,     # True for policy 0/3, False for 1/2
-    V_QUANT_PERHEAD: tl.constexpr,     # True for policy 0/3, False for 1/2
-    APPLY_HADAMARD: tl.constexpr,      # True for policy 3
+    Q_QUANT_DYNAMIC: tl.constexpr,
+    K_QUANT_DYNAMIC: tl.constexpr,
+    V_QUANT_PERHEAD: tl.constexpr,
+    APPLY_HADAMARD: tl.constexpr,
     IS_PREFILL: tl.constexpr,
     WRITE_K_TO_CACHE: tl.constexpr,
     WRITE_V_TO_CACHE: tl.constexpr,
-    K_SCALE_L: tl.constexpr,           # qk_head_dim // 4 (sizeof(fp8)/sizeof(float))
+    K_SCALE_L: tl.constexpr,           # qk_head_dim // 4
 ):
     tl.assume(stride_qkv_t > 0)
     tl.assume(stride_qkv_d > 0)
@@ -135,7 +125,6 @@ def _rope_norm_store_kv_fp8_kernel(
     t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
     t_mask = t_offs < num_rows
 
-    # ===== Positions / slots / req / local_idx =====
     positions = tl.load(positions_ptr + t_offs, mask=t_mask, other=0).to(tl.int32)
     slots = tl.load(slot_indices_ptr + t_offs, mask=t_mask, other=-1)
     valid_row = (
@@ -147,7 +136,6 @@ def _rope_norm_store_kv_fp8_kernel(
     phys_block = safe_slots // BLOCK_SIZE
     block_row = (safe_slots % BLOCK_SIZE).to(tl.int32)
 
-    # ===== cos/sin (NeoX: cos/sin[d] = table[d % half]) =====
     d = tl.arange(0, QK_HEAD_DIM)
     d_mod = d % QK_HEAD_DIM_HALF
     cos_offs = positions[:, None] * stride_cos_t + d_mod[None, :] * stride_cos_d
@@ -156,7 +144,6 @@ def _rope_norm_store_kv_fp8_kernel(
     sin_full = tl.load(cos_sin_ptr + sin_offs, mask=t_mask[:, None], other=0.0)
     qk_rotated_mask = (d < QK_HEAD_DIM_HALF)[None, :]
 
-    # Load Hadamard once if needed
     if APPLY_HADAMARD:
         had_offs = (
             tl.arange(0, QK_HEAD_DIM)[:, None] * QK_HEAD_DIM
@@ -184,10 +171,8 @@ def _rope_norm_store_kv_fp8_kernel(
             q = _standard_rms_norm(q, q_norm_weight_ptr, QK_HEAD_DIM, eps)
 
     if APPLY_HADAMARD:
-        # Per-head Walsh-Hadamard with 1/sqrt(d) baked into H.
         q = tl.dot(q.to(H.dtype), H).to(tl.float32)
 
-    # ===== Q quant + write =====
     if Q_QUANT_DYNAMIC:
         q_amax = tl.max(tl.abs(q), axis=-1)
         q_scale = q_amax / fp8_max
@@ -247,15 +232,12 @@ def _rope_norm_store_kv_fp8_kernel(
         if APPLY_HADAMARD:
             k = tl.dot(k.to(H.dtype), H).to(tl.float32)
 
-        # ===== K quant =====
         if K_QUANT_DYNAMIC:
             k_amax = tl.max(tl.abs(k), axis=-1)
             k_scale_dyn = k_amax / fp8_max
             k_scale_dyn = tl.maximum(k_scale_dyn, 1e-12)
             k_scale_dyn_recip = 1.0 / k_scale_dyn
             k_quant = k * k_scale_dyn_recip[:, None]
-            # Write per-(slot, kv_head) scale to paged layout
-            # idx = cb * stride_b + (pb // L) * stride_r + h * stride_h + (pb % L) * stride_l
             r_idx = block_row // K_SCALE_L
             l_idx = block_row % K_SCALE_L
             ks_offs = (
@@ -270,7 +252,6 @@ def _rope_norm_store_kv_fp8_kernel(
             k_quant = k / k_scale_static
         k_quant = tl.clamp(k_quant, -fp8_max, fp8_max)
 
-        # ===== V quant =====
         d_v = tl.arange(0, V_HEAD_DIM_PAD)
         v_mask_d = d_v < V_HEAD_DIM
         v_off_base = q_dim + k_dim + hq * V_HEAD_DIM
@@ -287,11 +268,16 @@ def _rope_norm_store_kv_fp8_kernel(
 
         # ===== Store K =====
         if WRITE_K_TO_CACHE:
+            # New layout [num_blocks, num_kv_heads, qk_head_dim/X, block_size, X]:
+            # offset = block*sB + h*sH + (d//X)*sChunk + slot*sSlot + (d%X)*sX
+            chunk_idx = d // X
+            x_idx = d % X
             k_cache_offs = (
                 phys_block[:, None] * stride_kc_b
-                + block_row[:, None].to(tl.int64) * stride_kc_t
                 + hq * stride_kc_h
-                + d[None, :] * stride_kc_d
+                + chunk_idx[None, :] * stride_kc_chunk
+                + block_row[:, None].to(tl.int64) * stride_kc_slot
+                + x_idx[None, :] * stride_kc_x
             )
             tl.store(
                 key_cache_ptr + k_cache_offs,
@@ -312,11 +298,13 @@ def _rope_norm_store_kv_fp8_kernel(
 
         # ===== Store V =====
         if WRITE_V_TO_CACHE:
+            # New layout [num_blocks, num_kv_heads, v_head_dim, block_size]:
+            # offset = block*sB + h*sH + d*sD + slot*sSlot
             v_cache_offs = (
                 phys_block[:, None] * stride_vc_b
-                + block_row[:, None].to(tl.int64) * stride_vc_t
                 + hq * stride_vc_h
                 + d_v[None, :] * stride_vc_d
+                + block_row[:, None].to(tl.int64) * stride_vc_slot
             )
             v_cache_mask = valid_row[:, None] & v_mask_d[None, :]
             tl.store(
@@ -345,14 +333,17 @@ def _rope_norm_store_kv_fp8_zero_trailing_kernel(
     value_cache_ptr,
     stride_kvi_r,
     stride_kvi_b,
-    stride_kc_b, stride_kc_t, stride_kc_h, stride_kc_d,
-    stride_vc_b, stride_vc_t, stride_vc_h, stride_vc_d,
+    # key_cache strides (5-D: B, H, D/X, S, X)
+    stride_kc_b, stride_kc_h, stride_kc_chunk, stride_kc_slot, stride_kc_x,
+    # value_cache strides (4-D: B, H, D, S)
+    stride_vc_b, stride_vc_h, stride_vc_d, stride_vc_slot,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE_PAD: tl.constexpr,
     QK_HEAD_DIM: tl.constexpr,
     QK_HEAD_DIM_PAD: tl.constexpr,
     V_HEAD_DIM: tl.constexpr,
     V_HEAD_DIM_PAD: tl.constexpr,
+    X: tl.constexpr,
 ):
     req = tl.program_id(0)
     h = tl.program_id(1)
@@ -368,12 +359,16 @@ def _rope_norm_store_kv_fp8_zero_trailing_kernel(
         slot_offs = tl.arange(0, BLOCK_SIZE_PAD)
         slot_mask = (slot_offs > last_block_row) & (slot_offs < BLOCK_SIZE)
 
+        # K trailing slots: layout [B, H, D/X, S, X]
         d_qk = tl.arange(0, QK_HEAD_DIM_PAD)
+        chunk_idx = d_qk // X
+        x_idx = d_qk % X
         k_offs = (
             phys_block * stride_kc_b
-            + slot_offs[:, None] * stride_kc_t
             + h * stride_kc_h
-            + d_qk[None, :] * stride_kc_d
+            + chunk_idx[None, :] * stride_kc_chunk
+            + slot_offs[:, None] * stride_kc_slot
+            + x_idx[None, :] * stride_kc_x
         )
         k_mask = slot_mask[:, None] & (d_qk < QK_HEAD_DIM)[None, :]
         tl.store(
@@ -385,12 +380,13 @@ def _rope_norm_store_kv_fp8_zero_trailing_kernel(
             mask=k_mask,
         )
 
+        # V trailing slots: layout [B, H, D, S]
         d_v = tl.arange(0, V_HEAD_DIM_PAD)
         v_offs = (
             phys_block * stride_vc_b
-            + slot_offs[:, None] * stride_vc_t
             + h * stride_vc_h
             + d_v[None, :] * stride_vc_d
+            + slot_offs[:, None] * stride_vc_slot
         )
         v_mask = slot_mask[:, None] & (d_v < V_HEAD_DIM)[None, :]
         tl.store(

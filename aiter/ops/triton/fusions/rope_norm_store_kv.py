@@ -15,6 +15,9 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
+# RMSNorm epsilon (matches the model-side default used by callers).
+_RMS_NORM_EPS = 1e-5
+
 
 def _pick_block_t(num_rows: int, device: torch.device) -> int:
     """Mirror `infer_rope_cache_triton_block_t`: scale tile with row count and CUs."""
@@ -38,8 +41,9 @@ def _precompute_positions_slots(
     kvcache_indices: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     device = q_index.device
-    positions = torch.empty(num_rows, dtype=torch.int32, device=device)
-    slot_indices = torch.empty(num_rows, dtype=torch.int64, device=device)
+    positions = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    # -1 sentinel marks rows the helper didn't touch (padded requests).
+    slot_indices = torch.full((num_rows,), -1, dtype=torch.int64, device=device)
 
     BLOCK_R = 32
     _rope_norm_store_kv_compute_pos_slot_kernel[(num_req,)](
@@ -72,14 +76,19 @@ def rope_norm_store_kv(
     out_v: Optional[torch.Tensor] = None,
     qk_norm_policy: int = 0,
 ) -> torch.Tensor:
-    """Triton implementation of ``torch.ops.hpc.rope_norm_store_kv``.
+    """Triton implementation of ``torch.ops.hpc.rope_norm_store_kv`` (BF16).
 
     Fuses NeoX RoPE on Q/K, optional RMSNorm on Q/K (order controlled by
     ``qk_norm_policy``), and a paged BF16 KV-cache write into a single launch
     (plus tiny helpers for per-row position/slot computation and, in prefill,
     trailing-slot zeroing).
 
-    See ``rope_norm_store_kv_api.py`` for argument shapes and dtypes.
+    Cache layouts (vLLM-style):
+      - ``key_cache``:   ``[num_blocks, num_kv_heads, qk_head_dim // X, block_size, X]``
+        with ``X = key_cache.shape[-1]`` (typically ``16 // sizeof(dtype) = 8`` for bf16).
+      - ``value_cache``: ``[num_blocks, num_kv_heads, v_head_dim, block_size]``.
+
+    RMSNorm uses ``eps = 1e-5``.
     """
     if qk_norm_policy not in (0, 1, 2):
         raise ValueError(
@@ -92,27 +101,42 @@ def rope_norm_store_kv(
                 "qk_norm_policy != 0."
             )
 
-    num_blocks, block_size, num_kv_heads, qk_head_dim = key_cache.shape
-    v_blocks, v_block_size, v_kv_heads, v_head_dim = value_cache.shape
-    if (num_blocks, block_size, num_kv_heads) != (v_blocks, v_block_size, v_kv_heads):
+    # ----- key_cache: 5-D [B, H, D/X, S, X] -----
+    if key_cache.ndim != 5:
         raise ValueError(
-            "key_cache and value_cache must share num_blocks/block_size/num_kv_heads "
-            f"(got {tuple(key_cache.shape)} vs {tuple(value_cache.shape)})."
+            "key_cache must be 5-D [num_blocks, num_kv_heads, qk_head_dim/X, "
+            f"block_size, X] (got shape {tuple(key_cache.shape)})."
         )
+    num_blocks, num_kv_heads, qk_chunks, block_size, X = key_cache.shape
+    qk_head_dim = qk_chunks * X
+    if qk_head_dim % X != 0:
+        raise ValueError(
+            f"qk_head_dim ({qk_head_dim}) must be divisible by X ({X})."
+        )
+
+    # ----- value_cache: 4-D [B, H, D, S] -----
+    if value_cache.ndim != 4:
+        raise ValueError(
+            "value_cache must be 4-D [num_blocks, num_kv_heads, v_head_dim, "
+            f"block_size] (got shape {tuple(value_cache.shape)})."
+        )
+    v_blocks, v_kv_heads, v_head_dim, v_block_size = value_cache.shape
+    if (v_blocks, v_kv_heads, v_block_size) != (num_blocks, num_kv_heads, block_size):
+        raise ValueError(
+            "key_cache and value_cache must share num_blocks/num_kv_heads/block_size "
+            f"(got K={tuple(key_cache.shape)} vs V={tuple(value_cache.shape)})."
+        )
+
     if qk_head_dim % 2 != 0:
         raise ValueError(f"qk_head_dim must be even (got {qk_head_dim}).")
-    if cos_sin.shape[-1] != qk_head_dim:
-        raise ValueError(
-            "cos_sin last dim must equal qk_head_dim "
-            f"(got {cos_sin.shape[-1]} vs {qk_head_dim})."
-        )
-    qk_head_dim_pow2 = triton.next_power_of_2(qk_head_dim)
-    if qk_head_dim_pow2 != qk_head_dim:
+    if triton.next_power_of_2(qk_head_dim) != qk_head_dim:
         raise ValueError(
             f"qk_head_dim must be a power of two (got {qk_head_dim}). "
             "Non-pow2 qk_head_dim would require padding the NeoX rotation "
             "helper, which is unsupported."
         )
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0 (got {block_size}).")
 
     num_rows, hidden = qkv.shape
     q_dim = hidden - num_kv_heads * qk_head_dim - num_kv_heads * v_head_dim
@@ -139,7 +163,7 @@ def rope_norm_store_kv(
     _LOGGER.info(
         f"ROPE_NORM_STORE_KV: qkv={tuple(qkv.shape)} num_req={num_req} "
         f"qh={num_q_heads} kvh={num_kv_heads} qk_d={qk_head_dim} v_d={v_head_dim} "
-        f"block_size={block_size} policy={qk_norm_policy} prefill={is_prefill}"
+        f"block_size={block_size} X={X} policy={qk_norm_policy} prefill={is_prefill}"
     )
 
     if out_q is None:
@@ -162,7 +186,7 @@ def rope_norm_store_kv(
     BLOCK_T = _pick_block_t(num_rows, qkv.device)
     grid = (triton.cdiv(num_rows, BLOCK_T), num_q_heads)
 
-    out_k_for_kernel = out_k if out_k is not None else qkv  # any valid ptr; masked off
+    out_k_for_kernel = out_k if out_k is not None else qkv
     out_v_for_kernel = out_v if out_v is not None else qkv
 
     v_head_dim_pad = triton.next_power_of_2(v_head_dim)
@@ -179,7 +203,7 @@ def rope_norm_store_kv(
         out_v_ptr=out_v_for_kernel,
         key_cache_ptr=key_cache,
         value_cache_ptr=value_cache,
-        eps=1e-6,
+        eps=_RMS_NORM_EPS,
         num_rows=num_rows,
         total_num_kv_cache_tokens=num_blocks * block_size,
         stride_qkv_t=qkv.stride(0),
@@ -196,13 +220,14 @@ def rope_norm_store_kv(
         stride_out_v_h=out_v.stride(1) if out_v is not None else 0,
         stride_out_v_d=out_v.stride(2) if out_v is not None else 0,
         stride_kc_b=key_cache.stride(0),
-        stride_kc_t=key_cache.stride(1),
-        stride_kc_h=key_cache.stride(2),
-        stride_kc_d=key_cache.stride(3),
+        stride_kc_h=key_cache.stride(1),
+        stride_kc_chunk=key_cache.stride(2),
+        stride_kc_slot=key_cache.stride(3),
+        stride_kc_x=key_cache.stride(4),
         stride_vc_b=value_cache.stride(0),
-        stride_vc_t=value_cache.stride(1),
-        stride_vc_h=value_cache.stride(2),
-        stride_vc_d=value_cache.stride(3),
+        stride_vc_h=value_cache.stride(1),
+        stride_vc_d=value_cache.stride(2),
+        stride_vc_slot=value_cache.stride(3),
         NUM_Q_HEADS=num_q_heads,
         NUM_KV_HEADS=num_kv_heads,
         QK_HEAD_DIM=qk_head_dim,
@@ -211,6 +236,7 @@ def rope_norm_store_kv(
         V_HEAD_DIM_PAD=v_head_dim_pad,
         BLOCK_SIZE=block_size,
         BLOCK_T=BLOCK_T,
+        X=X,
         QK_NORM_POLICY=qk_norm_policy,
         APPLY_Q_NORM=(qk_norm_policy != 0 and q_norm_weight is not None),
         APPLY_K_NORM=(qk_norm_policy != 0 and k_norm_weight is not None),
@@ -230,19 +256,21 @@ def rope_norm_store_kv(
             stride_kvi_r=kvcache_indices.stride(0),
             stride_kvi_b=kvcache_indices.stride(1),
             stride_kc_b=key_cache.stride(0),
-            stride_kc_t=key_cache.stride(1),
-            stride_kc_h=key_cache.stride(2),
-            stride_kc_d=key_cache.stride(3),
+            stride_kc_h=key_cache.stride(1),
+            stride_kc_chunk=key_cache.stride(2),
+            stride_kc_slot=key_cache.stride(3),
+            stride_kc_x=key_cache.stride(4),
             stride_vc_b=value_cache.stride(0),
-            stride_vc_t=value_cache.stride(1),
-            stride_vc_h=value_cache.stride(2),
-            stride_vc_d=value_cache.stride(3),
+            stride_vc_h=value_cache.stride(1),
+            stride_vc_d=value_cache.stride(2),
+            stride_vc_slot=value_cache.stride(3),
             BLOCK_SIZE=block_size,
             BLOCK_SIZE_PAD=block_size_pad,
             QK_HEAD_DIM=qk_head_dim,
             QK_HEAD_DIM_PAD=qk_head_dim_pad,
             V_HEAD_DIM=v_head_dim,
             V_HEAD_DIM_PAD=v_head_dim_pad,
+            X=X,
         )
 
     return out_q

@@ -105,7 +105,7 @@ def run_benchmark(args):
         inp = _make_inputs(
             seqlens, num_q_heads, num_kv_heads,
             qk_head_dim, v_head_dim, block_size,
-            is_prefill=is_prefill,
+            is_prefill=is_prefill, X=args.X,
         )
         fn = (lambda: _run_once(inp, is_prefill, policy)) if provider == "triton" \
             else (lambda: _run_ref_once(inp, is_prefill, policy))
@@ -133,6 +133,8 @@ def main():
     parser.add_argument("--qkd", type=int, default=128)
     parser.add_argument("--vd", type=int, default=128)
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--X", type=int, default=8,
+                        help="K-cache vector chunk size (typically 16/dtype_bytes = 8 for bf16).")
     parser.add_argument("--include-ref", action="store_true",
                         help="Also benchmark the pure-PyTorch reference (very slow).")
     parser.add_argument("--metric", choices=["us", "bw"], default="us",

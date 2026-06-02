@@ -26,12 +26,18 @@ def _rope_norm_store_kv_compute_pos_slot_kernel(
     num_seqlen_per_req_ptr,  # [num_req]   int32
     kvcache_indices_ptr,     # [num_req, max_blocks] int32
     positions_ptr,           # [num_rows]  int32 OUT
-    slot_indices_ptr,        # [num_rows]  int64 OUT
+    slot_indices_ptr,        # [num_rows]  int64 OUT  (-1 = invalid/padding)
     stride_kvi_r,
     stride_kvi_b,
     BLOCK_R: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    """Per-row position / absolute-slot precompute.
+
+    slot is encoded as ``phys_block * BLOCK_SIZE + (token_pos % BLOCK_SIZE)``.
+    Padding requests (seq_len <= 0) leave their rows untouched; callers must
+    pre-fill slot_indices with -1 to mark them invalid.
+    """
     req = tl.program_id(0)
 
     start = tl.load(q_index_ptr + req).to(tl.int32)
@@ -41,22 +47,23 @@ def _rope_norm_store_kv_compute_pos_slot_kernel(
     num_rows_req = end - start
     pos_offset = seq_len - end
 
-    num_chunks = tl.cdiv(num_rows_req, BLOCK_R)
-    for chunk in tl.range(0, num_chunks):
-        row_local = chunk * BLOCK_R + tl.arange(0, BLOCK_R)
-        mask = row_local < num_rows_req
-        row = start + row_local
-        token_pos = row + pos_offset
-        block_idx = token_pos // BLOCK_SIZE
-        block_row = token_pos % BLOCK_SIZE
-        phys_block = tl.load(
-            kvcache_indices_ptr + req * stride_kvi_r + block_idx * stride_kvi_b,
-            mask=mask,
-            other=0,
-        ).to(tl.int64)
-        slot = phys_block * BLOCK_SIZE + block_row.to(tl.int64)
-        tl.store(positions_ptr + row, token_pos, mask=mask)
-        tl.store(slot_indices_ptr + row, slot, mask=mask)
+    if (seq_len > 0) & (num_rows_req > 0):
+        num_chunks = tl.cdiv(num_rows_req, BLOCK_R)
+        for chunk in tl.range(0, num_chunks):
+            row_local = chunk * BLOCK_R + tl.arange(0, BLOCK_R)
+            mask = row_local < num_rows_req
+            row = start + row_local
+            token_pos = row + pos_offset
+            block_idx = token_pos // BLOCK_SIZE
+            block_row = token_pos % BLOCK_SIZE
+            phys_block = tl.load(
+                kvcache_indices_ptr + req * stride_kvi_r + block_idx * stride_kvi_b,
+                mask=mask,
+                other=0,
+            ).to(tl.int64)
+            slot = phys_block * BLOCK_SIZE + block_row.to(tl.int64)
+            tl.store(positions_ptr + row, token_pos, mask=mask)
+            tl.store(slot_indices_ptr + row, slot, mask=mask)
 
 
 @triton.jit
@@ -64,14 +71,14 @@ def _rope_norm_store_kv_kernel(
     qkv_ptr,                 # [num_rows, hidden]                  bf16
     cos_sin_ptr,             # [max_seq_len, qk_head_dim]          f32  (cos | sin halves)
     positions_ptr,           # [num_rows]                          int32
-    slot_indices_ptr,        # [num_rows]                          int64 (slot per row)
-    q_norm_weight_ptr,       # [qk_head_dim] f32 (unused if APPLY_Q_NORM=False)
-    k_norm_weight_ptr,       # [qk_head_dim] f32 (unused if APPLY_K_NORM=False)
+    slot_indices_ptr,        # [num_rows]                          int64 (slot per row, -1 = invalid)
+    q_norm_weight_ptr,
+    k_norm_weight_ptr,
     out_q_ptr,               # [num_rows, num_q_heads,  qk_head_dim] bf16
     out_k_ptr,               # null or [num_rows, num_kv_heads, qk_head_dim] bf16
     out_v_ptr,               # null or [num_rows, num_kv_heads,  v_head_dim] bf16
-    key_cache_ptr,           # [num_blocks, block_size, num_kv_heads, qk_head_dim] bf16
-    value_cache_ptr,         # [num_blocks, block_size, num_kv_heads,  v_head_dim] bf16
+    key_cache_ptr,           # [num_blocks, num_kv_heads, qk_head_dim/X, block_size, X] bf16
+    value_cache_ptr,         # [num_blocks, num_kv_heads, v_head_dim, block_size]       bf16
     eps,
     num_rows,
     total_num_kv_cache_tokens: tl.int64,
@@ -81,8 +88,10 @@ def _rope_norm_store_kv_kernel(
     stride_out_q_t, stride_out_q_h, stride_out_q_d,
     stride_out_k_t, stride_out_k_h, stride_out_k_d,
     stride_out_v_t, stride_out_v_h, stride_out_v_d,
-    stride_kc_b, stride_kc_t, stride_kc_h, stride_kc_d,
-    stride_vc_b, stride_vc_t, stride_vc_h, stride_vc_d,
+    # key_cache strides (5-D: B, H, D/X, S, X)
+    stride_kc_b, stride_kc_h, stride_kc_chunk, stride_kc_slot, stride_kc_x,
+    # value_cache strides (4-D: B, H, D, S)
+    stride_vc_b, stride_vc_h, stride_vc_d, stride_vc_slot,
     # constexprs
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
@@ -92,6 +101,7 @@ def _rope_norm_store_kv_kernel(
     V_HEAD_DIM_PAD: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    X: tl.constexpr,                # K-cache vector chunk size (D % X == 0)
     QK_NORM_POLICY: tl.constexpr,      # 0: no norm; 1: RoPE -> Norm; 2: Norm -> RoPE
     APPLY_Q_NORM: tl.constexpr,
     APPLY_K_NORM: tl.constexpr,
@@ -183,10 +193,9 @@ def _rope_norm_store_kv_kernel(
         v_load_mask = t_mask[:, None] & v_mask_d[None, :]
         v = tl.load(qkv_ptr + v_in_offs, mask=v_load_mask)
 
-        # Slot lookup is needed if K or V is going to cache
+        # Slot lookup needed if either K or V is going to cache
         if WRITE_K_TO_CACHE or WRITE_V_TO_CACHE:
             slots = tl.load(slot_indices_ptr + t_offs, mask=t_mask, other=-1)
-            # Defensive bounds check (matches existing fused_kv_cache pattern)
             valid_slot = (
                 t_mask
                 & (slots >= 0)
@@ -198,11 +207,16 @@ def _rope_norm_store_kv_kernel(
 
         # ===== Store K =====
         if WRITE_K_TO_CACHE:
+            # Layout [num_blocks, num_kv_heads, qk_head_dim/X, block_size, X]:
+            # offset = block*sB + h*sH + (d//X)*sChunk + slot*sSlot + (d%X)*sX
+            chunk_idx = d // X
+            x_idx = d % X
             k_cache_offs = (
                 phys_block[:, None] * stride_kc_b
-                + block_row[:, None] * stride_kc_t
                 + hq * stride_kc_h
-                + d[None, :] * stride_kc_d
+                + chunk_idx[None, :] * stride_kc_chunk
+                + block_row[:, None] * stride_kc_slot
+                + x_idx[None, :] * stride_kc_x
             )
             tl.store(
                 key_cache_ptr + k_cache_offs,
@@ -223,11 +237,13 @@ def _rope_norm_store_kv_kernel(
 
         # ===== Store V =====
         if WRITE_V_TO_CACHE:
+            # Layout [num_blocks, num_kv_heads, v_head_dim, block_size]:
+            # offset = block*sB + h*sH + d*sD + slot*sSlot
             v_cache_offs = (
                 phys_block[:, None] * stride_vc_b
-                + block_row[:, None] * stride_vc_t
                 + hq * stride_vc_h
                 + d_v[None, :] * stride_vc_d
+                + block_row[:, None] * stride_vc_slot
             )
             v_cache_mask = valid_slot[:, None] & v_mask_d[None, :]
             tl.store(
@@ -256,14 +272,17 @@ def _rope_norm_store_kv_zero_trailing_kernel(
     value_cache_ptr,
     stride_kvi_r,
     stride_kvi_b,
-    stride_kc_b, stride_kc_t, stride_kc_h, stride_kc_d,
-    stride_vc_b, stride_vc_t, stride_vc_h, stride_vc_d,
+    # key_cache strides (5-D: B, H, D/X, S, X)
+    stride_kc_b, stride_kc_h, stride_kc_chunk, stride_kc_slot, stride_kc_x,
+    # value_cache strides (4-D: B, H, D, S)
+    stride_vc_b, stride_vc_h, stride_vc_d, stride_vc_slot,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE_PAD: tl.constexpr,
     QK_HEAD_DIM: tl.constexpr,
     QK_HEAD_DIM_PAD: tl.constexpr,
     V_HEAD_DIM: tl.constexpr,
     V_HEAD_DIM_PAD: tl.constexpr,
+    X: tl.constexpr,
 ):
     req = tl.program_id(0)
     h = tl.program_id(1)
@@ -280,13 +299,16 @@ def _rope_norm_store_kv_zero_trailing_kernel(
         slot_offs = tl.arange(0, BLOCK_SIZE_PAD)
         slot_mask = (slot_offs > last_block_row) & (slot_offs < BLOCK_SIZE)
 
-        # Zero K trailing slots for this head
+        # K trailing slots: new layout [B, H, D/X, S, X]
         d_qk = tl.arange(0, QK_HEAD_DIM_PAD)
+        chunk_idx = d_qk // X
+        x_idx = d_qk % X
         k_offs = (
             phys_block * stride_kc_b
-            + slot_offs[:, None] * stride_kc_t
             + h * stride_kc_h
-            + d_qk[None, :] * stride_kc_d
+            + chunk_idx[None, :] * stride_kc_chunk
+            + slot_offs[:, None] * stride_kc_slot
+            + x_idx[None, :] * stride_kc_x
         )
         k_mask = slot_mask[:, None] & (d_qk < QK_HEAD_DIM)[None, :]
         tl.store(
@@ -298,13 +320,13 @@ def _rope_norm_store_kv_zero_trailing_kernel(
             mask=k_mask,
         )
 
-        # Zero V trailing slots for this head
+        # V trailing slots: new layout [B, H, D, S]
         d_v = tl.arange(0, V_HEAD_DIM_PAD)
         v_offs = (
             phys_block * stride_vc_b
-            + slot_offs[:, None] * stride_vc_t
             + h * stride_vc_h
             + d_v[None, :] * stride_vc_d
+            + slot_offs[:, None] * stride_vc_slot
         )
         v_mask = slot_mask[:, None] & (d_v < V_HEAD_DIM)[None, :]
         tl.store(
