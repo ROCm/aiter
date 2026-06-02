@@ -668,23 +668,16 @@ def fmha_fwd_kernel(
     ptr_K: fx.Tensor,
     ptr_V: fx.Tensor,
     ptr_LSE: fx.Tensor,
+    ptr_cu_seqlens_q: fx.Tensor,
+    ptr_cu_seqlens_k: fx.Tensor,
     scalar_f: fx.Float32,
-    kv_seq_len: fx.Int32,
     stride_q_seq: fx.Int32,
-    stride_q_tg: fx.Int32,
-    stride_q_head: fx.Int32,
-    stride_q_batch: fx.Int32,
-    gqa: fx.Int32,
     stride_k_seq: fx.Int32,
-    stride_k_head: fx.Int32,
-    stride_k_batch: fx.Int32,
     stride_v_seq: fx.Int32,
-    stride_v_head: fx.Int32,
-    stride_v_batch: fx.Int32,
     stride_o_seq: fx.Int32,
-    stride_o_head: fx.Int32,
-    stride_o_batch: fx.Int32,
-    q_seq_len: fx.Int32,
+    gqa: fx.Int32,
+    max_seqlen_q: fx.Int32,
+    max_seqlen_k: fx.Int32,
 ):
     """D128 BF16 FMHA Forward — full kernel with dynamic KV loop.
 
@@ -703,22 +696,11 @@ def fmha_fwd_kernel(
     from flydsl._mlir.dialects import arith as _mlir_arith
 
     scalar_f = _to_raw(scalar_f)
-    kv_seq_len_raw = _to_raw(kv_seq_len)
     stride_q_seq = _to_raw(stride_q_seq)
-    stride_q_tg = _to_raw(stride_q_tg)
-    stride_q_head = _to_raw(stride_q_head)
-    stride_q_batch = _to_raw(stride_q_batch)
-    gqa = _to_raw(gqa)
     stride_k_seq = _to_raw(stride_k_seq)
-    stride_k_head = _to_raw(stride_k_head)
-    stride_k_batch = _to_raw(stride_k_batch)
     stride_v_seq = _to_raw(stride_v_seq)
-    stride_v_head = _to_raw(stride_v_head)
-    stride_v_batch = _to_raw(stride_v_batch)
     stride_o_seq = _to_raw(stride_o_seq)
-    stride_o_head = _to_raw(stride_o_head)
-    stride_o_batch = _to_raw(stride_o_batch)
-    q_seq_len_raw = _to_raw(q_seq_len)
+    gqa = _to_raw(gqa)
 
     ty = _get_types()
 
@@ -750,33 +732,46 @@ def fmha_fwd_kernel(
     _raw_by = arith.index_cast(T.i32, gpu.block_id("y"))   # raw m-block
     _raw_bz = arith.index_cast(T.i32, gpu.block_id("z"))   # raw head
     _gdx = _to_raw(gpu.grid_dim.x)      # B
-    _gdy = _to_raw(gpu.grid_dim.y)      # M
+    _gdy = _to_raw(gpu.grid_dim.y)      # M (num_tg)
     _gdz = _to_raw(gpu.grid_dim.z)      # H
-    # flat wgid
-    _wgid = arith.addi(arith.addi(
-        _raw_bx,
-        arith.muli(_gdx, _raw_by)),
-        arith.muli(arith.muli(_gdx, _gdy), _raw_bz))
-    # total workgroups
-    _num_wgs = arith.muli(arith.muli(_gdx, _gdy), _gdz)
-    # remap: new = (wgid % 8) * (total/8) + wgid/8
-    # Guard: only remap if num_wgs > NUM_XCDS; otherwise use identity (avoid div-by-zero).
-    _wgs_per_xcd = arith.divui(_num_wgs, _NUM_XCDS)
-    _do_remap = arith.cmpi(arith.CmpIPredicate.ugt, _num_wgs, _NUM_XCDS)
-    _new_wgid_remapped = arith.addi(
-        arith.muli(arith.remui(_wgid, _NUM_XCDS), _wgs_per_xcd),
-        arith.divui(_wgid, _NUM_XCDS))
-    _new_wgid = arith.select(_do_remap, _new_wgid_remapped, _wgid)
-    # decompose back to 3D: x = new%gdx, y = (new/gdx)%gdy, z = new/(gdx*gdy)
-    _new_bx = arith.remui(_new_wgid, _gdx)
-    _new_tmp = arith.divui(_new_wgid, _gdx)
-    _new_by = arith.remui(_new_tmp, _gdy)
-    _new_bz = arith.divui(_new_tmp, _gdy)
-    bz = _new_bx    # batch    (grid.x)
-    bx = _new_by    # m-block  (grid.y)
-    by = _new_bz    # head     (grid.z)
+    _num_pairs = arith.muli(_gdx, _gdz)  # B * H
+    _new_wgid = arith.addi(
+        arith.addi(_raw_bx, arith.muli(_gdx, _raw_bz)),
+        arith.muli(_num_pairs, _raw_by))
+    _pair_idx = arith.remui(_new_wgid, _num_pairs)
+    bz = arith.remui(_pair_idx, _gdx)          # batch
+    by = arith.divui(_pair_idx, _gdx)          # head
+    bx = arith.divui(_new_wgid, _num_pairs)    # m-block (tile)
 
     m_start = arith.muli(bx, arith.constant(TILE_N, type=T.i32))
+    m_start_raw = _to_raw(m_start)
+
+    # ================================================================
+    # Per-batch seq_len from cu_seqlens (THD varlen layout)
+    # ================================================================
+    _i32_ty = ir.IntegerType.get_signless(32)
+    _i64_ty = ir.IntegerType.get_signless(64)
+    _glb_ptr_ty = ir.Type.parse("!llvm.ptr<1>")
+    from flydsl._mlir.dialects import fly as _fly_cu
+
+    def _load_cu_seqlen(ptr_tensor, idx_i32):
+        _raw_t = ptr_tensor.__extract_to_ir_values__()[0]
+        _base_ptr = _fly_cu.extract_aligned_pointer_as_index(_glb_ptr_ty, _raw_t)
+        _base_i64 = llvm_dialect.ptrtoint(_i64_ty, _base_ptr)
+        _byte_off = _mlir_arith.MulIOp(idx_i32, _to_raw(arith.constant(4, type=T.i32))).result
+        _byte_off_64 = _mlir_arith.ExtSIOp(_i64_ty, _byte_off).result
+        _addr_i64 = _mlir_arith.AddIOp(_base_i64, _byte_off_64).result
+        _addr_ptr = llvm_dialect.inttoptr(_glb_ptr_ty, _addr_i64)
+        return llvm_dialect.load(_i32_ty, _addr_ptr)
+
+    _bz_raw = _to_raw(bz)
+    _bz1_raw = _mlir_arith.AddIOp(_bz_raw, _to_raw(arith.constant(1, type=T.i32))).result
+    q_start_tok = _raw(rocdl.readfirstlane(T.i32, _load_cu_seqlen(ptr_cu_seqlens_q, _bz_raw)))
+    q_end_tok = _raw(rocdl.readfirstlane(T.i32, _load_cu_seqlen(ptr_cu_seqlens_q, _bz1_raw)))
+    k_start_tok = _raw(rocdl.readfirstlane(T.i32, _load_cu_seqlen(ptr_cu_seqlens_k, _bz_raw)))
+    k_end_tok = _raw(rocdl.readfirstlane(T.i32, _load_cu_seqlen(ptr_cu_seqlens_k, _bz1_raw)))
+    actual_q_len = _mlir_arith.SubIOp(q_end_tok, q_start_tok).result
+    actual_kv_len = _mlir_arith.SubIOp(k_end_tok, k_start_tok).result
 
     def _apply_causal_mask(su_sp_tiles, n_start_fx):
         _lane_lo = arith.andi(lane_id, arith.constant(15, type=T.i32))
@@ -835,14 +830,13 @@ def fmha_fwd_kernel(
         stride_v_seq, arith.constant(1, type=T.i32)))
     _K_CFG_OOB = (1 << 16) | _K_TDM_CONFIG
     _V_CFG_OOB = (1 << 16) | _V_TDM_CONFIG
-    m_start_raw = _to_raw(m_start)
 
     _k_oob_dg1 = [
         _make_kv_dg1_with_oob(
             _K_CFG_OOB, 200, 8, _stride_k_elems_oob,
             _per_warp_oob_dim1(
-                _mlir_arith.subi(kv_seq_len_raw,
-                    _to_raw(arith.constant(_su * 32, type=T.i32))),
+                _mlir_arith.SubIOp(actual_kv_len,
+                    _to_raw(arith.constant(_su * 32, type=T.i32))).result,
                 wave_id, 8))
         for _su in range(CNT_SU)
     ]
@@ -850,23 +844,32 @@ def fmha_fwd_kernel(
         _make_kv_dg1_with_oob(
             _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
             _per_warp_oob_dim1(
-                _mlir_arith.subi(kv_seq_len_raw,
-                    _to_raw(arith.constant(_su * 32, type=T.i32))),
+                _mlir_arith.SubIOp(actual_kv_len,
+                    _to_raw(arith.constant(_su * 32, type=T.i32))).result,
                 wave_id, 8))
         for _su in range(CNT_SU)
     ]
-    _q_remain_o = _mlir_arith.subi(q_seq_len_raw, m_start_raw)
+    _q_remain_o = _mlir_arith.SubIOp(actual_q_len, m_start_raw).result
     _o_oob_dim1 = _per_warp_oob_dim1(_q_remain_o, wave_id, 32)
 
-    # Q resource descriptor with OOB protection
-    q_offset = arith.addi(
-        arith.addi(arith.muli(bz, stride_q_batch), arith.muli(by, stride_q_head)),
-        arith.muli(bx, stride_q_tg))
-    _q_num_bytes = _mlir_arith.addi(
-        _to_raw(q_offset),
-        _mlir_arith.muli(
-            _mlir_arith.subi(q_seq_len_raw, m_start_raw),
-            stride_q_seq))
+    # Head index (for GQA)
+    head_index = _phase5_head_index_div_flydsl(by, gqa)
+
+    # Q/K/V offsets for THD layout
+    _HEAD_BYTES_QK = QK_HDIM * KV_BPP
+    _HEAD_BYTES_V = V_HDIM * KV_BPP
+    _q_tok_off = _mlir_arith.AddIOp(
+        q_start_tok, _to_raw(arith.muli(bx, arith.constant(128, type=T.i32)))).result
+    q_offset = _mlir_arith.AddIOp(
+        _mlir_arith.MulIOp(_q_tok_off, stride_q_seq).result,
+        _mlir_arith.MulIOp(_to_raw(by), _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))).result).result
+
+    # Q buffer resource with OOB
+    _q_end_byte = _mlir_arith.AddIOp(
+        _mlir_arith.MulIOp(q_end_tok, stride_q_seq).result,
+        _mlir_arith.MulIOp(_to_raw(by), _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))).result).result
+    _q_num_bytes = _mlir_arith.AddIOp(
+        _q_end_byte, _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))).result
     q_rsrc = buffer_ops.create_buffer_resource(
         ptr_Q, num_records_bytes=_q_num_bytes)
 
@@ -903,14 +906,15 @@ def fmha_fwd_kernel(
     #                     _qf32 = _qa.ExtFOp(ir.F32Type.get(), _qbf).result
     #                     fx.printf(f"Q l=0 w=0 m={_qm} f={_qf} e={_qe} v={{}}\n", _qf32)
 
-    # Head index (for GQA)
-    head_index = _phase5_head_index_div_flydsl(by, gqa)
+    # K offset = k_start_tok * stride_k_seq + head_index * D_qk * BPP
+    k_offset = _mlir_arith.AddIOp(
+        _mlir_arith.MulIOp(k_start_tok, stride_k_seq).result,
+        _mlir_arith.MulIOp(_to_raw(head_index), _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))).result).result
 
-    # K/V base offsets
-    k_offset = arith.addi(arith.muli(bz, stride_k_batch),
-                           arith.muli(head_index, stride_k_head))
-    v_offset = arith.addi(arith.muli(bz, stride_v_batch),
-                           arith.muli(head_index, stride_v_head))
+    # V offset = k_start_tok * stride_v_seq + head_index * D_v * BPP
+    v_offset = _mlir_arith.AddIOp(
+        _mlir_arith.MulIOp(k_start_tok, stride_v_seq).result,
+        _mlir_arith.MulIOp(_to_raw(head_index), _to_raw(arith.constant(_HEAD_BYTES_V, type=T.i32))).result).result
 
     # SmemAllocator bases → i32 LDS addresses
     k_a_base_i32 = _extract_lds_base_i32(_lds_alloc_k_a.get_base())
@@ -1000,7 +1004,7 @@ def fmha_fwd_kernel(
     _apply_causal_mask(all_su_sp_tiles, arith.constant(0, type=T.i32))
 
     # -- 2d'': KV OOB mask on prologue tile --
-    _apply_kv_oob_mask(all_su_sp_tiles, kv_seq_len_raw)
+    _apply_kv_oob_mask(all_su_sp_tiles, actual_kv_len)
 
     # -- 2d: sp_tiles → sp_pairs --
     sp_pairs_all_pro = _sp_tiles_to_sp_pairs(all_su_sp_tiles)
@@ -1052,8 +1056,8 @@ def fmha_fwd_kernel(
     rocdl.sched_barrier(0)
     _k_tile1_stride = _mlir_arith.muli(tile_n_const, stride_k_seq)
     _k_tile1_offset = _mlir_arith.addi(_to_raw(k_offset), _k_tile1_stride)
-    _kv_remain_t1 = _mlir_arith.subi(kv_seq_len_raw,
-        _to_raw(arith.constant(TILE_N, type=T.i32)))
+    _kv_remain_t1 = _mlir_arith.SubIOp(actual_kv_len,
+        _to_raw(arith.constant(TILE_N, type=T.i32))).result
     _k_tile1_oob_dg1 = [
         _make_kv_dg1_with_oob(
             _K_CFG_OOB, 200, 8, _stride_k_elems_oob,
@@ -1251,7 +1255,7 @@ def fmha_fwd_kernel(
             _V_CFG = (1 << 16) | _V_TDM_CONFIG
             _stride_v_elems = _to_raw(arith.shrui(
                 stride_v_seq, arith.constant(1, type=T.i32)))
-            v_dg1 = vector.from_elements(
+            v_dg1 = endtile_v_dg1 if const_expr(endtile_v_dg1 is not None) else vector.from_elements(
                 T.vec(8, T.i32),
                 [arith.constant(_V_CFG, type=T.i32),
                  arith.constant(128 << 16, type=T.i32),
@@ -1965,6 +1969,11 @@ def fmha_fwd_kernel(
         from flydsl._mlir.dialects import arith as _fin_a2
         _obf16 = []
         for _msb in fx.range_constexpr(NUM_MSB):
+            _f32_t = ir.F32Type.get()
+            _rs_is_zero = _mlir_arith.cmpf(_mlir_arith.CmpFPredicate.OEQ,
+                _rsf[_msb], _mlir_arith.constant(_f32_t, value=ir.FloatAttr.get(_f32_t, 0.0)))
+            _rsf[_msb] = _mlir_arith.select(_rs_is_zero,
+                _mlir_arith.constant(_f32_t, value=ir.FloatAttr.get(_f32_t, 1.0)), _rsf[_msb])
             _rcp = _rocdl.rcp(ty['f32'], _rsf[_msb])
             _rv8 = llvm_dialect.mlir_undef(_v8f32)
             for _i in fx.range_constexpr(8):
@@ -2006,28 +2015,23 @@ def fmha_fwd_kernel(
         _asm_void("s_wait_dscnt 0x0")
         _wsgpr = rocdl.wave_id()
         _D = 128
-        _LOG2_D = 7
         from flydsl._mlir.dialects import arith as _sa2
         from flydsl._mlir.dialects import fly as _fly2
         from flydsl._mlir.dialects import llvm as _llvm2
         _i64t = ir.IntegerType.get_signless(64)
         _glbpt = ir.Type.parse("!llvm.ptr<1>")
-        _rph = _sa2.ShRSIOp(stride_o_head, _raw(arith.constant(_LOG2_D, type=T.i32))).result
-        _rpb = _sa2.ShRSIOp(stride_o_batch, _raw(arith.constant(_LOG2_D, type=T.i32))).result
-        _roff = _sa2.AddIOp(
-            _sa2.AddIOp(
-                _sa2.MulIOp(bz, _rpb).result,
-                _sa2.MulIOp(by, _rph).result,
-            ).result,
-            _sa2.AddIOp(
-                _sa2.MulIOp(bx, _raw(arith.constant(128, type=T.i32))).result,
-                _sa2.MulIOp(_wsgpr, _raw(arith.constant(WV_SUBQD, type=T.i32))).result,
-            ).result,
-        ).result
+        # THD: O token = q_start_tok + bx*128 + wave*32
+        _bx128 = _to_raw(arith.muli(bx, arith.constant(128, type=T.i32)))
+        _wv32 = _to_raw(arith.muli(_wsgpr, arith.constant(WV_SUBQD, type=T.i32)))
+        _o_tok = _sa2.AddIOp(_sa2.AddIOp(q_start_tok, _bx128).result, _wv32).result
+        # Element offset = tok * stride_o_seq + head * D_v
+        _by_d = _to_raw(arith.muli(by, arith.constant(_D, type=T.i32)))
+        _o_elem_off = _sa2.AddIOp(
+            _sa2.MulIOp(_o_tok, stride_o_seq).result, _by_d).result
         _o_raw = ptr_O.__extract_to_ir_values__()[0]
         _o_gp = _fly2.extract_aligned_pointer_as_index(_glbpt, _o_raw)
         _o64 = _llvm2.ptrtoint(_i64t, _o_gp)
-        _boff32 = _sa2.MulIOp(_roff, _raw(arith.constant(_D * 2, type=T.i32))).result
+        _boff32 = _sa2.MulIOp(_o_elem_off, _raw(arith.constant(2, type=T.i32))).result
         _boff64 = _sa2.ExtSIOp(_i64t, _boff32).result
         _oadr64 = _sa2.AddIOp(_o64, _boff64).result
         _alo, _ahi = _split_i64_to_lo_hi(_oadr64)
@@ -2050,7 +2054,7 @@ def fmha_fwd_kernel(
         # _g3 = _raw(arith.constant(((32>>16)&0xFFFF)|((_TDM_D_TILE_DIM0_ELEMS&0xFFFF)<<16), type=T.i32))
         _g3 = _raw(arith.constant(((32>>16)&0xFFFF)|((128&0xFFFF)<<16), type=T.i32))
         _g4 = _raw(arith.constant(32 & 0xFFFF, type=T.i32))
-        _g5 = _raw(arith.constant(_D & 0xFFFFFFFF, type=T.i32))
+        _g5 = stride_o_seq
         _g6 = _raw(arith.constant(0, type=T.i32))
         _g7 = _raw(arith.constant(0, type=T.i32))
         _dg1 = vector.from_elements(T.vec(8, T.i32), [_g0,_g1,_g2,_g3,_g4,_g5,_g6,_g7])
@@ -2109,11 +2113,11 @@ def fmha_fwd_kernel(
             arith.subi(arith.index_cast(T.i32, num_tiles_idx),
                        arith.constant(1, type=T.i32)),
             arith.constant(TILE_N, type=T.i32))
-        _et_kv_remain = _mlir_arith.subi(
-            kv_seq_len_raw,
+        _et_kv_remain = _mlir_arith.SubIOp(
+            actual_kv_len,
             _mlir_arith.muli(
                 _mlir_arith.subi(num_tiles, _to_raw(arith.constant(1, type=T.i32))),
-                tile_n_const))
+                tile_n_const)).result
         _et_v_oob_dg1 = [
             _make_kv_dg1_with_oob(
                 _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
@@ -2160,3 +2164,7 @@ def fmha_fwd_kernel(
             ep_v_cur_base,
             list(ep_old_max), list(ep_local_max), list(ep_delta), list(ep_row_sums),
         )
+
+
+def compile_fmha_fwd(*, is_causal: bool = True):
+    return fmha_fwd_kernel
