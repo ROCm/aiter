@@ -338,7 +338,7 @@ def routing_a8w4(
 
     When ``use_grouped_topk=True``, step 1 is replaced by ATOM's single-fused
     Triton ``grouped_topk`` kernel
-    (``atom.model_ops.grouped_topk_triton.grouped_topk``) — DeepSeek-V2/V3-style
+    (``atom.model_ops.grouped_topk.grouped_topk``) — DeepSeek-V2/V3-style
     hierarchical routing (pick ``topk_group`` groups out of
     ``num_expert_group``, then top-``n_expts_act`` experts within those
     groups). Same return contract as ``topk`` (y_vals, y_indx, Bitmatrix), so
@@ -367,7 +367,7 @@ def routing_a8w4(
             num_expert_group is not None and topk_group is not None
         ), "use_grouped_topk requires num_expert_group and topk_group"
         # Lazy import: ATOM-side kernel; avoids hard aiter→atom import order.
-        from aiter.ops.triton.moe.moe_routing.grouped_topk_triton import grouped_topk
+        from aiter.ops.triton.moe.moe_routing.grouped_topk import grouped_topk
 
         expt_scal, expt_indx, bitmatrix = grouped_topk(
             logits,
