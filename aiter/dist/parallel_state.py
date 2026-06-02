@@ -507,10 +507,12 @@ class GroupCoordinator:
         k_w: torch.Tensor,
         eps: float,
     ):
-        if self.device_communicator is None:
-            raise ValueError("No device communicator found")
-        return self.device_communicator.fused_qknorm_allreduce(
-            qkv_in, q_w, k_w, eps
+        return fused_qknorm_allreduce_(
+            qkv_in,
+            q_w,
+            k_w,
+            eps,
+            group_name=self.unique_name,
         )
 
     def _fused_allreduce_rmsnorm_out_place(
