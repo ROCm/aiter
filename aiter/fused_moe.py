@@ -46,8 +46,7 @@ def _moe_sorting_impl(
     dispatch_policy,
     use_opus,
     return_local_topk_ids=False,
-    need_reduce=False,
-    has_reduce_mask=False,
+    accumulate=True,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -61,15 +60,13 @@ def _moe_sorting_impl(
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     # moe_buf shape depends on the downstream stage2 path:
-    #  - has_reduce_mask: caller owns the [M, topk, model_dim] intermediate; placeholder here.
-    #  - need_reduce no mask: stage2 writes per-topk slabs into [M, topk*model_dim].
-    #  - else: stage2 atomically accumulates into [M, model_dim].
-    if need_reduce and has_reduce_mask:
-        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
-    elif need_reduce:
-        moe_buf = torch.empty((M, topk * model_dim), dtype=moebuf_dtype, device=device)
-    else:
+    #  - accumulate (or EP w/ expert_mask): stage2 atomically accumulates into [M, model_dim].
+    #  - else (FlyDSL stage2 reduce mode without mask): caller owns the
+    #    [M, topk, model_dim] intermediate; allocate a placeholder here.
+    if (expert_mask is not None) or accumulate:
         moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    else:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     local_topk_ids = torch.empty_like(topk_ids) if return_local_topk_ids else None
     if return_local_topk_ids:
         # CK sorting does not emit local ids; use Opus so callers do not need a slow
@@ -133,8 +130,7 @@ def moe_sorting(
     num_local_tokens=None,
     dispatch_policy=0,
     return_local_topk_ids=False,
-    need_reduce=False,
-    has_reduce_mask=False,
+    accumulate=True,
 ):
     try:
         return _moe_sorting_impl(
@@ -149,8 +145,7 @@ def moe_sorting(
             dispatch_policy,
             use_opus=not _USE_CK_MOE_SORTING,
             return_local_topk_ids=return_local_topk_ids,
-            need_reduce=need_reduce,
-            has_reduce_mask=has_reduce_mask,
+            accumulate=accumulate,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -176,6 +171,21 @@ def get_topk_valid_mask(
     if expert_mask is None:
         return torch.ones(topk_ids.shape, dtype=dtypes.i32, device=topk_ids.device)
     return expert_mask[topk_ids]
+
+
+def is_flydsl_stage2_reduce(stage2: Callable) -> bool:
+    """Return True iff `stage2` is the FlyDSL stage2 wrapper compiled in
+    reduce mode (i.e. its kernelName parses to ``mode == "reduce"``).
+
+    All other stage2 paths (CK, cktile, FlyDSL atomic) return False, which
+    keeps moe_sorting on the atomic-accumulate moe_buf shape.
+    """
+    func = getattr(stage2, "func", stage2)
+    if func is not _flydsl_stage2_wrapper:
+        return False
+    kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
+    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
+    return parsed is not None and parsed.get("mode", "atomic") == "reduce"
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
@@ -407,6 +417,7 @@ def fused_moe_(
         num_local_tokens,
         moe_sorting_dispatch_policy,
         return_local_topk_ids=need_local_topk_ids,
+        accumulate=not is_flydsl_stage2_reduce(metadata.stage2),
     )
     if need_local_topk_ids:
         (
