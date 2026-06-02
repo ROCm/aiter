@@ -1,7 +1,7 @@
-"""Accuracy test: FMHA kernel via flash_attn_varlen_flydsl production path.
+"""Accuracy test: compare FMHA kernel output against PyTorch reference.
 
-THD varlen layout: q(total_q, H, D_qk), k(total_k, H, D_qk), v(total_k, H, D_v).
-Causal mask always on.
+BSHD layout: q(B,SQ,H,D_qk), k(B,SK,H,D_qk), v(B,SK,H,D_v), o(B,SQ,H,D_v).
+Strides for Q/K/V in bytes, strides for O in elements.
 
 Usage:
     bash run_test.sh
@@ -14,40 +14,103 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.join(_HERE, "FlyDSL")
 _BUILD_PKGS = os.path.join(_REPO, "build-fly", "python_packages")
-_AITER_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "..", ".."))
-for p in [_BUILD_PKGS, os.path.join(_REPO, "python"), _AITER_ROOT]:
+for p in [_BUILD_PKGS, os.path.join(_REPO, "python"), _HERE]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-os.environ.setdefault("FLYDSL_ROOT", _REPO)
 os.environ["ARCH"] = "gfx1250"
 os.environ["FLYDSL_RUNTIME_ENABLE_CACHE"] = "0"
 
 import torch
-from aiter.ops.flydsl.mha_flydsl import flash_attn_varlen_flydsl
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import arith
+from flydsl.expr.typing import T
+from flydsl._mlir import ir
+from flydsl.compiler.kernel_function import CompilationContext
+
+import ctypes
+from flydsl.expr.numeric import Float32 as _Float32, Float64 as _Float64
+if not hasattr(_Float32, "_reusable_slot_spec"):
+    @classmethod
+    def _f32_slot_spec(cls, arg):
+        return ctypes.c_float, lambda a: a.value if hasattr(a, "value") else a
+    _Float32._reusable_slot_spec = _f32_slot_spec
+    _Float32._reusable_ctype = ctypes.c_float
+if not hasattr(_Float64, "_reusable_slot_spec"):
+    @classmethod
+    def _f64_slot_spec(cls, arg):
+        return ctypes.c_double, lambda a: a.value if hasattr(a, "value") else a
+    _Float64._reusable_slot_spec = _f64_slot_spec
+    _Float64._reusable_ctype = ctypes.c_double
+
+from fmha_kernel_gfx1250 import (
+    fmha_fwd_kernel,
+    BLOCK_SIZE,
+    _lds_alloc_k_a,
+    _lds_alloc_k_b,
+    _lds_alloc_v_a,
+    _lds_alloc_v_b,
+)
 
 HEAD_QK = 192
 HEAD_V = 128
+BLOCK_M = 128
+BPP = 2
 
 
-def _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=True):
-    B = len(cu_q) - 1
-    H = q.shape[1]
-    outs = []
-    for b in range(B):
-        sq = cu_q[b+1] - cu_q[b]
-        sk = cu_k[b+1] - cu_k[b]
-        qb = q[cu_q[b]:cu_q[b+1]].float()
-        kb = k[cu_k[b]:cu_k[b+1]].float()
-        vb = v[cu_k[b]:cu_k[b+1]].float()
-        qk = torch.bmm(qb.permute(1,0,2), kb.permute(1,2,0)) * scale
-        if causal:
-            mask = torch.triu(torch.ones(sq, sk, device=qk.device, dtype=torch.bool), diagonal=1)
-            qk = qk.masked_fill(mask.unsqueeze(0), float('-inf'))
-        p = torch.softmax(qk, dim=-1)
-        ob = torch.bmm(p, vb.permute(1,0,2))
-        outs.append(ob.permute(1,0,2))
-    return torch.cat(outs, dim=0)
+@flyc.jit
+def launch_fmha(
+    ptr_O: fx.Tensor, ptr_Q: fx.Tensor, ptr_K: fx.Tensor, ptr_V: fx.Tensor,
+    ptr_LSE: fx.Tensor, scalar_f: fx.Float32, kv_seq_len: fx.Int32,
+    stride_q_seq: fx.Int32, stride_q_tg: fx.Int32,
+    stride_q_head: fx.Int32, stride_q_batch: fx.Int32,
+    gqa: fx.Int32,
+    stride_k_seq: fx.Int32, stride_k_head: fx.Int32, stride_k_batch: fx.Int32,
+    stride_v_seq: fx.Int32, stride_v_head: fx.Int32, stride_v_batch: fx.Int32,
+    stride_o_seq: fx.Int32, stride_o_head: fx.Int32, stride_o_batch: fx.Int32,
+    q_seq_len: fx.Int32, num_heads: fx.Int32, batch_size: fx.Int32,
+):
+    _lds_alloc_k_a.finalized = False
+    _lds_alloc_k_b.finalized = False
+    _lds_alloc_v_a.finalized = False
+    _lds_alloc_v_b.finalized = False
+    ctx = CompilationContext.get_current()
+    with ir.InsertionPoint(ctx.gpu_module_body):
+        _lds_alloc_k_a.finalize()
+        _lds_alloc_k_b.finalize()
+        _lds_alloc_v_a.finalize()
+        _lds_alloc_v_b.finalize()
+
+    from flydsl.expr.arith import _to_raw
+    num_tg = arith.index_cast(T.index, arith.ceildivui(
+        _to_raw(q_seq_len), arith.constant(BLOCK_M, type=T.i32)))
+    grid_x = arith.index_cast(T.index, batch_size)
+    grid_z = arith.index_cast(T.index, num_heads)
+
+    launcher = fmha_fwd_kernel(
+        ptr_O, ptr_Q, ptr_K, ptr_V, ptr_LSE,
+        scalar_f, kv_seq_len,
+        stride_q_seq, stride_q_tg, stride_q_head, stride_q_batch,
+        gqa,
+        stride_k_seq, stride_k_head, stride_k_batch,
+        stride_v_seq, stride_v_head, stride_v_batch,
+        stride_o_seq, stride_o_head, stride_o_batch,
+        q_seq_len,
+    )
+    launcher.launch(grid=(grid_x, num_tg, grid_z), block=(BLOCK_SIZE, 1, 1))
+
+launch_fmha.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
+
+
+def _ref_mha(q, k, v, sm_scale, causal=True):
+    qk = torch.matmul(q.float(), k.float().transpose(-2, -1)) * sm_scale
+    if causal:
+        S_q, S_kv = qk.shape[-2], qk.shape[-1]
+        mask = torch.triu(torch.ones(S_q, S_kv, device=qk.device, dtype=torch.bool), diagonal=1)
+        qk = qk.masked_fill(mask, float('-inf'))
+    p = torch.softmax(qk, dim=-1)
+    return torch.matmul(p, v.float())
 
 
 def _checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg=""):
@@ -65,80 +128,122 @@ def _checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg=""):
     return pct
 
 
-def run_varlen_test(cu_q_list, cu_k_list, H=1, causal=True):
-    device = torch.device("cuda")
+def run_test(B, H, SQ, SK):
+    scale = 1.0 / math.sqrt(HEAD_QK)
     torch.manual_seed(42)
 
-    cu_q, cu_k = cu_q_list, cu_k_list
-    B = len(cu_q) - 1
-    total_q, total_k = cu_q[-1], cu_k[-1]
-    max_sq = max(cu_q[i+1] - cu_q[i] for i in range(B))
-    max_sk = max(cu_k[i+1] - cu_k[i] for i in range(B))
+    # BSHD layout: (B, S, H, D)
+    q = torch.randn(B, SQ, H, HEAD_QK, dtype=torch.bfloat16).cuda()
+    k = torch.randn(B, SK, H, HEAD_QK, dtype=torch.bfloat16).cuda()
+    v = torch.randn(B, SK, H, HEAD_V, dtype=torch.bfloat16).cuda()
+    o = torch.zeros(B, SQ, H, HEAD_V, dtype=torch.bfloat16).cuda()
+    lse = torch.zeros(B, H, SQ, dtype=torch.float32).cuda()
 
-    q = torch.randn(total_q, H, HEAD_QK, dtype=torch.bfloat16, device=device)
-    k = torch.randn(total_k, H, HEAD_QK, dtype=torch.bfloat16, device=device)
-    v = torch.randn(total_k, H, HEAD_V, dtype=torch.bfloat16, device=device)
+    # BSHD strides
+    stride_q_seq_b = H * HEAD_QK * BPP
+    stride_q_tg_b = BLOCK_M * H * HEAD_QK * BPP
+    stride_q_head_b = HEAD_QK * BPP
+    stride_q_batch_b = SQ * H * HEAD_QK * BPP
+    stride_k_seq_b = H * HEAD_QK * BPP
+    stride_k_head_b = HEAD_QK * BPP
+    stride_k_batch_b = SK * H * HEAD_QK * BPP
+    stride_v_seq_b = H * HEAD_V * BPP
+    stride_v_head_b = HEAD_V * BPP
+    stride_v_batch_b = SK * H * HEAD_V * BPP
+    stride_o_seq_e = H * HEAD_V
+    stride_o_head_e = HEAD_V
+    stride_o_batch_e = SQ * H * HEAD_V
 
-    scale = 1.0 / math.sqrt(HEAD_QK)
-    cu_seqlens_q = torch.tensor(cu_q, dtype=torch.int32, device=device)
-    cu_seqlens_k = torch.tensor(cu_k, dtype=torch.int32, device=device)
-
-    o = flash_attn_varlen_flydsl(
-        q, k, v,
-        cu_seqlens_q, cu_seqlens_k,
-        max_sq, max_sk,
-        softmax_scale=scale,
-        causal=causal,
+    args = (
+        o, q, k, v, lse,
+        scale, SK,
+        stride_q_seq_b, stride_q_tg_b, stride_q_head_b, stride_q_batch_b,
+        1,  # gqa
+        stride_k_seq_b, stride_k_head_b, stride_k_batch_b,
+        stride_v_seq_b, stride_v_head_b, stride_v_batch_b,
+        stride_o_seq_e, stride_o_head_e, stride_o_batch_e,
+        SQ, H, B,
     )
+
+    launch_fmha(*args)
     torch.cuda.synchronize()
 
-    ref = _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=causal)
-
-    seqs = [cu_q[i+1] - cu_q[i] for i in range(B)]
-    tag = f"B={B} H={H} seqs={seqs} causal={causal}"
+    # ref expects BHSD: transpose BSHD -> BHSD for the reference and back for comparison
+    ref_bhsd = _ref_mha(
+        q.transpose(1, 2).contiguous(),
+        k.transpose(1, 2).contiguous(),
+        v.transpose(1, 2).contiguous(),
+        scale, causal=True)
+    ref = ref_bhsd.transpose(1, 2).contiguous()  # back to BSHD
     o_cpu = o.cpu().float()
     ref_cpu = ref.cpu().float()
-
-    nan_mask = torch.isnan(o_cpu)
-    if nan_mask.any():
-        nan_count = nan_mask.sum().item()
-        print(f"  [{tag}] WARNING: {nan_count} NaN values in output!")
-        for b in range(B):
-            sq = cu_q[b+1] - cu_q[b]
-            blk = o_cpu[cu_q[b]:cu_q[b+1]]
-            bn = torch.isnan(blk).sum().item()
-            if bn > 0:
-                nan_rows = torch.isnan(blk).any(dim=-1).any(dim=-1).nonzero().squeeze(-1)
-                print(f"    batch {b} (sq={sq}): {bn} NaN, rows: {nan_rows[:10].tolist()}")
-
+    tag = f"B={B} H={H} SQ={SQ} SK={SK}"
     err = _checkAllclose(o_cpu, ref_cpu, rtol=1e-2, atol=1e-2, msg=f"  [{tag}] ")
+    if err >= 0.05:
+        # per-(batch, head) breakdown
+        for b in range(B):
+            for h in range(H):
+                close_bh = torch.isclose(o_cpu[b, :, h, :], ref_cpu[b, :, h, :], rtol=1e-2, atol=1e-2)
+                fail_bh = (~close_bh).sum().item() / close_bh.numel()
+                max_bh = (o_cpu[b, :, h, :] - ref_cpu[b, :, h, :]).abs().max().item()
+                print(f"    batch {b} head {h}: max_err={max_bh:.6f} fail={fail_bh:.1%}")
+        # token-level pass map for h=0 to spot a pattern
+        if H >= 2:
+            pat = []
+            for t in range(min(SQ, 128)):
+                ok = torch.allclose(o_cpu[0, t, 0, :], ref_cpu[0, t, 0, :], rtol=1e-2, atol=1e-2)
+                pat.append('.' if ok else 'X')
+            print(f"    tok-pass-pattern h=0: {''.join(pat)}")
     return err < 0.05
 
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("FMHA Accuracy Tests (THD varlen, causal, production path)")
+    print("FMHA Accuracy Tests (BSHD layout, D_qk=192 D_v=128, causal)")
     print("=" * 60)
 
     tests = [
-        ([0, 128], [0, 128], 1, True),
-        ([0, 256], [0, 256], 1, True),
-        ([0, 300], [0, 300], 1, True),
-        ([0, 384], [0, 384], 1, True),
-        ([0, 128, 256], [0, 128, 256], 1, True),
-        ([0, 128, 300], [0, 128, 300], 1, True),
-        ([0, 481, 581, 982], [0, 481, 581, 982], 1, True),
+        # small + smoke
+        (1, 1, 128, 128),
+        (1, 1, 256, 256),
+        (1, 1, 300, 300),
+        (1, 1, 384, 384),
+        # H > 1
+        (1, 2, 128, 128),
+        (1, 2, 256, 256),
+        (1, 4, 128, 128),
+        (1, 8, 256, 256),
+        # B > 1
+        (2, 1, 128, 128),
+        (4, 1, 256, 256),
+        # B > 1 and H > 1
+        (2, 2, 128, 128),
+        (2, 2, 256, 256),
+        (2, 4, 256, 256),
+        (4, 4, 128, 128),
+        # larger SQ / SK
+        (1, 1, 512, 512),
+        (1, 2, 512, 512),
+        (1, 1, 1024, 1024),
+        (1, 4, 1024, 1024),
+        # non-multiple-of-128 SQ/SK
+        (1, 2, 300, 300),
+        (2, 4, 481, 481),
+        (1, 2, 1000, 1000),
+        # uneven SQ vs SK (with causal)
+        (1, 2, 128, 256),
+        (1, 2, 256, 384),
+        (2, 4, 384, 512),
     ]
 
     n_pass = 0
-    for cu_q, cu_k, H, causal in tests:
-        seqs = [cu_q[i+1] - cu_q[i] for i in range(len(cu_q)-1)]
+    for B, H, SQ, SK in tests:
         try:
-            ok = run_varlen_test(cu_q, cu_k, H=H, causal=causal)
+            ok = run_test(B, H, SQ, SK)
             if ok:
                 n_pass += 1
         except Exception as e:
-            print(f"  [seqs={seqs} causal={causal}] ERROR: {e}")
+            print(f"  [B={B} H={H} SQ={SQ} SK={SK}] ERROR: {e}")
             import traceback; traceback.print_exc()
 
     print(f"\n{'='*60}")
