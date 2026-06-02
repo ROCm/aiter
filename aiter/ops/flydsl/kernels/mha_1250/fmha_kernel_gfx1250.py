@@ -7,7 +7,7 @@ Integrates:
   - Dynamic scf.for_ loop over KV tiles (tile_n=128, variable kv_seq_len)
 
 Target: gfx1250 (MI450), wave32, 4 waves per TG (1TG), 1024 shared VGPRs.
-No causal mask. kv_seq_len must be aligned to tile_n=128.
+Causal mask always on. num_tiles = bx + 1 (triangular).
 
     sp3 core_loop
     tile n = 128
@@ -740,8 +740,32 @@ def fmha_fwd_kernel(
     bx = _new_by    # m-block  (grid.y)
     by = _new_bz    # head     (grid.z)
 
+    m_start = arith.muli(bx, arith.constant(TILE_N, type=T.i32))
 
-
+    def _apply_causal_mask(su_sp_tiles, n_start_fx):
+        _lane_lo = arith.andi(lane_id, arith.constant(15, type=T.i32))
+        _lane_hi_x8 = arith.muli(
+            arith.shrui(lane_id, arith.constant(4, type=T.i32)),
+            arith.constant(8, type=T.i32))
+        _wave_x32 = arith.muli(wave_id, arith.constant(32, type=T.i32))
+        _base = arith.addi(
+            arith.addi(arith.subi(m_start, n_start_fx), _wave_x32),
+            arith.subi(_lane_lo, _lane_hi_x8))
+        _neg_inf_c = arith.constant(float('-inf'), type=T.f32)
+        for _su in fx.range_constexpr(CNT_SU):
+            for _msb in fx.range_constexpr(NUM_MSB):
+                _off = (_msb // 2) * 16 - _su * 32 - (_msb % 2) * 16
+                _bnd_fx = arith.addi(_base, arith.constant(_off, type=T.i32))
+                _v8 = su_sp_tiles[_su][_msb][0]
+                for _e in fx.range_constexpr(8):
+                    _e_idx = _to_raw(arith.constant(_e, type=T.i32))
+                    _cmp_fx = arith.cmpi(arith.CmpIPredicate.slt,
+                                         _bnd_fx, arith.constant(_e, type=T.i32))
+                    _elem_raw = llvm_dialect.extractelement(_v8, _e_idx)
+                    _elem_fx = arith.bitcast(T.f32, _elem_raw)
+                    _mval_fx = arith.select(_cmp_fx, _neg_inf_c, _elem_fx)
+                    _v8 = llvm_dialect.insertelement(_v8, _to_raw(_mval_fx), _e_idx)
+                su_sp_tiles[_su][_msb][0] = _v8
 
 
     # Q resource descriptor
@@ -874,6 +898,9 @@ def fmha_fwd_kernel(
         ptr_V, v_offset, stride_v_seq, stride_v_32,
         wave_id, v_a_base_i32)
 
+    # -- 2d': causal mask on prologue tile (n_start=0) --
+    _apply_causal_mask(all_su_sp_tiles, arith.constant(0, type=T.i32))
+
     # -- 2d: sp_tiles → sp_pairs --
     sp_pairs_all_pro = _sp_tiles_to_sp_pairs(all_su_sp_tiles)
 
@@ -911,7 +938,8 @@ def fmha_fwd_kernel(
 
     # -- 2f: Prefetch K(tile 1) → K_b if available --
     tile_n_const = _to_raw(arith.constant(TILE_N, type=T.i32))
-    num_tiles = _mlir_arith.divui(kv_seq_len_raw, tile_n_const)
+    num_tiles = _mlir_arith.addi(
+        _to_raw(bx), _to_raw(arith.constant(1, type=T.i32)))
     num_tiles_idx = arith.index_cast(T.index, num_tiles)
     # Loop runs N-2 iterations (tiles 1..N-2); endtile handled in epilogue.
     _one_i32_loop = _to_raw(arith.constant(1, type=T.i32))
@@ -1001,6 +1029,7 @@ def fmha_fwd_kernel(
         tdm_v_target=None,  # i32 LDS base for TDM V writes (next V buf)
         kv_lds_addrs_next=None,  # [8] [K_next[0:4] + V_next[4:8]] for K reload
         gemm1_tdm_is_v=False,  # False=main-loop(GEMM1 loads K) True=epilogue(GEMM1 loads V)
+        causal_n_start=None,   # i32 n_start for causal mask (None = skip)
     ):
         """Full core loop: GEMM1 (QK) + softmax + GEMM2 (PV).
 
@@ -1259,6 +1288,12 @@ def fmha_fwd_kernel(
         # SP3-style: O_resc moved entirely to GEMM1 stages — no O_resc in GEMM2.
         _o_rescale_exp_delta = None
 
+        # ================================================================
+        # Causal mask on current QK tile (before sp_pairs conversion)
+        # ================================================================
+        if const_expr(causal_n_start is not None):
+            _apply_causal_mask(su_sp_tiles_list, causal_n_start)
+
         # 2. Build sp_pairs for current tile (all 4 SUs).
         sp_pairs_current = _sp_tiles_to_sp_pairs(su_sp_tiles_list)
 
@@ -1275,11 +1310,6 @@ def fmha_fwd_kernel(
 
         # 4. Build P tiles from p_bf16 (produced by PART2 second half on prev tile)
         p_tiles_computed = _build_p_tiles_from_softmax(ty, softmax_state)
-
-        # ================================================================
-        # fmha_mask placeholder (no causal mask)
-        # ================================================================
-        _asm_void("s_nop 0")
 
         # ================================================================
         # GEMM2 (PV): 4 stages (SU 0..3)
@@ -1951,6 +1981,10 @@ def fmha_fwd_kernel(
         }
         _et_o = [[ep_o_tiles[_d][_n] for _n in range(N_PV_WMMA_N)]
                  for _d in range(NUM_MSB)]
+        _et_causal_ns = arith.muli(
+            arith.subi(arith.index_cast(T.i32, num_tiles_idx),
+                       arith.constant(1, type=T.i32)),
+            arith.constant(TILE_N, type=T.i32))
         _, _, _et_o, _, _et_psp_lo, _et_psp_hi, _et_ped = _core_loop(
             ty, False,
             q_frags, ep_kv_tiles, _et_sp_t,
@@ -1962,6 +1996,7 @@ def fmha_fwd_kernel(
             tdm_k_offset=None,
             kv_lds_addrs_next=ep_kv_lds_addrs_next,
             gemm1_tdm_is_v=True,
+            causal_n_start=_et_causal_ns,
         )
         # Pass updated softmax state (old_max/local_max/delta/row_sums after PART0+1
         # for the endtile tile) so _ep_finish can correctly run PART2 second half.

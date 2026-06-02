@@ -103,8 +103,12 @@ def launch_fmha(
 launch_fmha.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
 
 
-def _ref_mha(q, k, v, sm_scale):
+def _ref_mha(q, k, v, sm_scale, causal=True):
     qk = torch.matmul(q.float(), k.float().transpose(-2, -1)) * sm_scale
+    if causal:
+        S_q, S_kv = qk.shape[-2], qk.shape[-1]
+        mask = torch.triu(torch.ones(S_q, S_kv, device=qk.device, dtype=torch.bool), diagonal=1)
+        qk = qk.masked_fill(mask, float('-inf'))
     p = torch.softmax(qk, dim=-1)
     return torch.matmul(p, v.float())
 
@@ -162,27 +166,31 @@ def run_test(B, H, SQ, SK):
     launch_fmha(*args)
     torch.cuda.synchronize()
 
-    ref = _ref_mha(q, k, v, scale)
+    ref = _ref_mha(q, k, v, scale, causal=True)
+    o_cpu = o.cpu().float()
+    ref_cpu = ref.cpu().float()
     tag = f"B={B} H={H} SQ={SQ} SK={SK}"
-    err = _checkAllclose(o.cpu().float(), ref.cpu().float(),
-                         rtol=1e-2, atol=1e-2, msg=f"  [{tag}] ")
+    err = _checkAllclose(o_cpu, ref_cpu, rtol=1e-2, atol=1e-2, msg=f"  [{tag}] ")
+    if err >= 0.05:
+        num_m_blocks = SQ // 128
+        for mb in range(num_m_blocks):
+            r0, r1 = mb * 128, (mb + 1) * 128
+            blk_err = (o_cpu[:, :, r0:r1, :] - ref_cpu[:, :, r0:r1, :]).abs().max().item()
+            close = torch.isclose(o_cpu[:, :, r0:r1, :], ref_cpu[:, :, r0:r1, :], rtol=1e-2, atol=1e-2)
+            fail_pct = (~close).sum().item() / close.numel()
+            print(f"    m_block {mb} (rows {r0}-{r1}): max_err={blk_err:.6f} fail={fail_pct:.1%}")
     return err < 0.05
 
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("FMHA Accuracy Tests (BHSD layout, D_qk=192 D_v=128)")
+    print("FMHA Accuracy Tests (BHSD layout, D_qk=192 D_v=128, causal)")
     print("=" * 60)
 
     tests = [
         (1, 1, 128, 128),
-        # (1, 1, 128, 256),
-        # (1, 1, 128, 512),
-        # (1, 1, 128, 1024),
+        (1, 1, 256, 256),
         (1, 1, 384, 384),
-        # (1, 1, 256, 1024),
-        # (2, 2, 128, 512),
-        # (4, 1, 128, 1024),
     ]
 
     n_pass = 0
