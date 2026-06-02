@@ -117,7 +117,13 @@ pip install -r requirements.txt
 
 AITER includes Triton-based operators that require triton from AMD PyPI, with the correct version selected based on your ROCm installation.
 
-If you install with `python3 setup.py develop`, triton is installed automatically. If you use `pip install -e .`, run the install script manually:
+If you install with `python3 setup.py develop`, triton is installed automatically. To skip this and keep your existing triton, set:
+
+```bash
+AITER_USE_SYSTEM_TRITON=1 python3 setup.py develop
+```
+
+If you use `pip install -e .`, run the install script manually:
 
 ```bash
 ./.github/scripts/install_triton.sh
