@@ -1038,14 +1038,6 @@ def mla_decode_fwd_v4_nm(
     `num_heads = num_kv_heads * gqa_ratio` (gqa-flattened, mirrors V3
     convention).
 
-    NOTE on layout: V3 wrapper exposes the same kernel-native ordering as
-    its `mla_decode_fwd` (line 229-253). poc_kl host calls
-    `mla_reorder_gpuO` (poc_kl/common/mla.hpp:585) to transpose
-    `(max_seqlen_q, num_kv_splits)` so the dump shape becomes
-    `[num_seqs, num_kv_splits, num_kv_heads, max_seqlen_q*gqa_ratio, dv]`.
-    We deliberately keep the kernel-native shape here so the cross-split
-    merge can run with zero reorder copy.
-
     Single-pass mode (`num_kv_splits == 1`):
       Returned `logits[:, 0]` already holds the per-token output (no merge
       needed). `output[total_q, num_heads, v_head_dim]` BF16 is only written
@@ -1078,10 +1070,10 @@ def mla_decode_fwd_v4_nm(
       debugging or custom merge paths).
 
     `sink` (REQUIRED, keyword-only):
-      Per-(q_token, head) attention sink logit, total
-      `num_heads * max_seqlen_q` FP32 values. Adds a virtual K-column of
-      logit `sink[t, h]` (or flat `sink[t * num_heads + h]`) to the
-      softmax denominator for the (q_token=t, head=h) slot.
+      Per-Q-head attention sink logit, total `num_heads` FP32 values
+      (= `num_kv_heads * gqa_ratio`). Adds a virtual K-column of logit
+      `sink[h]` to the softmax denominator for head `h`; the same
+      value is shared across ALL q_token positions.
     """
     num_seqs = qo_indptr.shape[0] - 1
     num_heads = q.size(1)
@@ -1090,8 +1082,7 @@ def mla_decode_fwd_v4_nm(
     gqa_ratio = num_heads // num_kv_heads
 
     # ---- sink shape / dtype validation -----------------------------------
-    # Layout: 1D `(num_heads * max_seqlen_q,)`
-    expected_sink_size = num_heads * max_seqlen_q
+    expected_sink_size = num_heads
     if sink.dtype != dtypes.fp32:
         raise ValueError(
             f"mla_decode_fwd_v4_nm: `sink` must be FP32, got {sink.dtype}."
@@ -1104,14 +1095,11 @@ def mla_decode_fwd_v4_nm(
     if sink.numel() != expected_sink_size:
         raise ValueError(
             f"mla_decode_fwd_v4_nm: `sink` numel {sink.numel()} != expected "
-            f"{expected_sink_size} (= num_heads({num_heads}) * "
-            f"max_seqlen_q({max_seqlen_q})). kernel reads it as a flat fp32 buffer."
-            f"`num_heads * max_seqlen_q` fp32 entries; under-sized buffers "
-            f"silently OOB into HBM padding. Accepted shapes: "
-            f"({expected_sink_size},) flat, or "
-            f"({max_seqlen_q}, {num_heads}) 2D row-major. "
-            f"Pass torch.full(({expected_sink_size},), float('-inf'), "
-            f"dtype=fp32) for 'no sink' semantics."
+            f"{expected_sink_size} (= num_heads = "
+            f"num_kv_heads({num_kv_heads}) * gqa_ratio({gqa_ratio})). "
+            f"Accepted shapes: ({num_heads},) flat or "
+            f"({num_kv_heads}, {gqa_ratio}) 2D row-major. Under-sized "
+            f"buffers silently OOB into HBM padding. "
         )
     if sink.device != q.device:
         raise ValueError(

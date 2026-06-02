@@ -163,10 +163,8 @@ def _build_inputs(
 
     # sink: required by mla_decode_fwd_v4_nm. -inf = "no sink" math
     # (exp(-inf) = 0 → virtual K-col contributes 0 to softmax denom).
-    # Size = num_heads * q_seq_logical (one float per (q_token, head) —
-    # matches poc_kl `num_kv_heads * q_seq_lens` post-gqa).
     sink = torch.full(
-        (num_heads * q_seq_logical,),
+        (num_heads,),
         float("-inf"),
         dtype=torch.float32,
         device=device,
@@ -567,10 +565,10 @@ def _asm_attn_decode_bf16(
         dtype=torch.int32,
         device=q_bf16.device,
     )
-    # sink: -inf = "no sink" math. Size = num_heads * max_seqlen_q (one
-    # float per (q_token, head)) — see aiter/mla.py docstring.
+    # sink: -inf = "no sink" math. Size = num_heads (post-2026-06-01
+    # shrink — kernel reads sink head-only). See aiter/mla.py docstring.
     sink = torch.full(
-        (num_heads * max_seqlen_q,),
+        (num_heads,),
         float("-inf"),
         dtype=torch.float32,
         device=q_bf16.device,
@@ -694,10 +692,8 @@ def _build_bf16_inputs(
     kv_last_page_lens.fill_(1)
 
     # sink: required by mla_decode_fwd_v4_nm. -inf = "no sink" semantics
-    # (see aiter/mla.py docstring). Size = num_heads * q_seq_logical
-    # (here num_heads = num_kv_heads * gqa_ratio = 1 * gqa_ratio).
     sink = torch.full(
-        (gqa_ratio * q_seq_logical,),
+        (gqa_ratio,),
         float("-inf"),
         dtype=torch.float32,
         device=device,
@@ -1145,15 +1141,12 @@ def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0):
 
     total_q = bf["q_bf16"].size(0)
     num_heads = bf["q_bf16"].size(1)
-    max_seqlen_q = bf["max_seqlen_q"]
     device = bf["q_bf16"].device
     output = torch.empty(
         (total_q, num_heads, V_HEAD_DIM), dtype=dtypes.bf16, device=device
     )
-    # sink size = num_heads * max_seqlen_q (matches poc_kl post-gqa); see
-    # aiter/mla.py docstring for layout. -inf = "no sink" math by default.
     sink = torch.full(
-        (num_heads * max_seqlen_q,),
+        (num_heads,),
         float("-inf"),
         dtype=torch.float32,
         device=device,
@@ -1194,7 +1187,7 @@ def test_v4_nm_sink_value_affects_output():
     static_assert(... == 0x120) in csrc/py_itfs_cu/asm_mla_v4.cu.
     """
     args_a = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0)
-    sink_size = args_a["sink"].numel()  # = num_heads * max_seqlen_q
+    sink_size = args_a["sink"].numel()  # = num_heads (2026-06-01 shrink)
     device = args_a["q"].device
 
     args_b = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0)
@@ -1241,7 +1234,7 @@ def test_v4_nm_sink_neg_inf_no_nan_regression():
     pattern.
     """
     args_inf = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=7)
-    sink_size = args_inf["sink"].numel()  # = num_heads * max_seqlen_q
+    sink_size = args_inf["sink"].numel()  # = num_heads (2026-06-01 shrink)
     device = args_inf["q"].device
 
     args_big = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=7)
@@ -1277,16 +1270,15 @@ def test_v4_nm_sink_shape_and_dtype_validation():
     rejection paths so future refactors don't accidentally weaken the
     guard.
 
-    The under-sized case (numel = num_heads, no max_seqlen_q multiplier)
-    is the historic bug this validation was added to catch: PR-1
-    initially shipped with `(num_heads,)` only, which silently OOB-read
-    HBM padding for the upper q_token rows. See the WARNING block in the
-    aiter/mla.py docstring for the post-mortem.
+    Two notable rejection paths come from real bugs:
+      - *Under-sized* (e.g. `(gqa_ratio,)` for a multi-kv-head config or
+        `(0,)` empty buffer): kernel would silently OOB-read HBM
+        padding.
     """
     args = _build_inputs(batch=1, kv_seq_lens=64, q_seq_logical=4, seed=0)
     num_heads = args["q"].size(1)
     max_seqlen_q = args["max_seqlen_q"]
-    expected = num_heads * max_seqlen_q
+    expected = num_heads  # 2026-06-01 shrink: was num_heads * max_seqlen_q
     device = args["q"].device
 
     # Wrong dtype (BF16 instead of FP32).
@@ -1297,28 +1289,25 @@ def test_v4_nm_sink_shape_and_dtype_validation():
     with pytest.raises(ValueError, match="sink.*FP32|sink.*float32"):
         aiter.mla.mla_decode_fwd_v4_nm(**args_bad_dtype)
 
-    # Under-sized: numel = num_heads (missing the max_seqlen_q factor).
-    # This is the *historic bug* — kernel reads num_heads*max_seqlen_q
-    # floats; aiter PR-1 handed it only num_heads → silent OOB.
     args_under = dict(args)
     args_under["sink"] = torch.full(
-        (num_heads,), float("-inf"), dtype=torch.float32, device=device
+        (max_seqlen_q,), float("-inf"), dtype=torch.float32, device=device
     )
     with pytest.raises(ValueError, match="sink.*numel"):
         aiter.mla.mla_decode_fwd_v4_nm(**args_under)
 
-    # Over-sized (numel > expected) — also rejected; we want the byte
-    # contract pinned exactly so callers can't accidentally pass e.g.
-    # num_heads * max_seqlen_q * num_kv_splits and trip the kernel.
     args_over = dict(args)
     args_over["sink"] = torch.full(
-        (expected * 2,), float("-inf"), dtype=torch.float32, device=device
+        (num_heads * max_seqlen_q,),
+        float("-inf"),
+        dtype=torch.float32,
+        device=device,
     )
     with pytest.raises(ValueError, match="sink.*numel"):
         aiter.mla.mla_decode_fwd_v4_nm(**args_over)
 
     # Non-contiguous sink (slice/transpose) — kernel reads flat fp32, so
-    # any stride mismatch silently scrambles the per-row sink layout.
+    # any stride mismatch silently scrambles the per-head sink layout.
     args_strided = dict(args)
     args_strided["sink"] = torch.full(
         (expected * 2,), float("-inf"), dtype=torch.float32, device=device
