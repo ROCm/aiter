@@ -44,6 +44,7 @@ from aiter.ops.flydsl.kernels.blockscale_moe_gemm_2stage import (
     SCALE_BLOCK_K_DEFAULT,
     SCALE_BLOCK_N_DEFAULT,
     compile_blockscale_moe_gemm1,
+    pick_k_batch_for_blockscale_stage1,
 )
 from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
@@ -744,6 +745,70 @@ def test_blockscale_correctness_stage1_stage2_e2e(
     assert err_s2 <= 0.05, f"stage2 numerics err_ratio={err_s2:.4f} > 0.05"
 
     print(f"  [{tokens}t] e2e via aiter dispatcher: {us1 + us2:.1f}us total")
+
+
+# ---------------------------------------------------------------------------
+# Split-K heuristic table (DSR1 TP=8 calibration)
+#
+# Measured optima on gfx950 (see commit message of the split-K MR):
+#   model_dim=7168, E=257, topk=9
+#     M=1   idim=256/512 -> k=4 (1.65x / 1.52x vs CK)
+#     M=8   idim=256     -> k=2 (1.09x vs CK)
+#     M=8   idim=512     -> k=1 (0.98x, near parity; k=2 was 0.93x)
+#     M>=16              -> k=1
+# The selector is intentionally coarse-grained (picks from {1, 2, 4}).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "M, inter_dim, expected_k",
+    [
+        # DSR1 TP=8 routed-expert shapes (model_dim=7168, E=257, topk=9):
+        (1, 256, 4),
+        (1, 512, 4),
+        (8, 256, 2),
+        (8, 512, 1),
+        (16, 256, 2),
+        (16, 512, 1),
+        (32, 256, 1),
+        (64, 256, 1),
+        (128, 256, 1),
+        (256, 256, 1),
+        (1024, 256, 1),
+        (8192, 512, 1),
+    ],
+)
+def test_pick_k_batch_dsr1_tp8(M, inter_dim, expected_k):
+    """Pin the auto-selector to the values that matched the measured perf
+    sweep on the DSR1 TP=8 shape (see commit message of the split-K MR).
+    """
+    k = pick_k_batch_for_blockscale_stage1(
+        token_num=M,
+        inter_dim=inter_dim,
+        topk=9,
+        model_dim=7168,
+        tile_m=64,
+        tile_n=128,
+        tile_k=128,
+    )
+    assert k == expected_k, f"M={M} idim={inter_dim}: got k_batch={k}, expected {expected_k}"
+
+
+def test_pick_k_batch_invalid_kslice_falls_back():
+    """If desired k_batch violates the K-slice constraints (e.g. model_dim
+    not divisible), selector snaps down to a valid value, ultimately 1.
+    """
+    # model_dim=1024, k=4 -> kps=256 (ok), tile_k=128 -> 2 tiles (even ok)
+    # but choose a model_dim where k=4 fails: 1280 / 4 = 320; 320 / 128 = 2.5 -> fail.
+    # Then k=2: 1280 / 2 = 640; 640 / 128 = 5 -> odd -> fail. Falls back to 1.
+    k = pick_k_batch_for_blockscale_stage1(
+        token_num=1,
+        inter_dim=128,
+        topk=9,
+        model_dim=1280,
+        tile_m=64,
+        tile_n=128,
+        tile_k=128,
+    )
+    assert k == 1
 
 
 # ---------------------------------------------------------------------------

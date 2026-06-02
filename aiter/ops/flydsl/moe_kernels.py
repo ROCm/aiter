@@ -1251,7 +1251,7 @@ def flydsl_moe_stage1(
     sorted_weights: Optional[torch.Tensor] = None,
     persist_m: int = 0,
     use_async_copy: bool = False,
-    k_batch: int = 1,
+    k_batch=1,
     waves_per_eu: int = 3,
     b_nt: int = 0,
     gate_mode: str = "separated",
@@ -1276,6 +1276,8 @@ def flydsl_moe_stage1(
 
     When k_batch>1 (split-K), the kernel outputs gate/up partials via atomic
     add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
+    Pass ``k_batch="auto"`` to let the dispatcher pick a value (FP8/FP8
+    blockscale only); see ``pick_k_batch_for_blockscale_stage1``.
 
     gate_mode controls the gate/up computation strategy (see GateMode enum).
 
@@ -1290,6 +1292,30 @@ def flydsl_moe_stage1(
 
     if a_dtype == "fp4":
         model_dim = model_dim * 2
+
+    # k_batch="auto": let the blockscale-stage1 heuristic pick a split-K
+    # factor from the M*N grid occupancy. Only applies to the FP8/FP8
+    # blockscale path; any other dtype combo falls back to k_batch=1 since
+    # the upstream kernels there have no split-K support yet.
+    if isinstance(k_batch, str):
+        if k_batch != "auto":
+            raise ValueError(f"k_batch={k_batch!r} not understood; use int or 'auto'")
+        if a_dtype == "fp8" and b_dtype == "fp8":
+            from aiter.ops.flydsl.kernels.blockscale_moe_gemm_2stage import (
+                pick_k_batch_for_blockscale_stage1,
+            )
+
+            k_batch = pick_k_batch_for_blockscale_stage1(
+                token_num=token_num,
+                inter_dim=inter_dim,
+                topk=topk,
+                model_dim=model_dim,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+            )
+        else:
+            k_batch = 1
 
     _need_fp4 = out_dtype == "fp4"
     _need_fp8 = out_dtype == "fp8"
