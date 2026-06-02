@@ -189,11 +189,17 @@ def fused_moe(
     splitk=0,
     swiglu_limit=0.0,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
-    # Host-side scheduling hint: average #tokens per local expert under uniform
-    # routing. Only meaningful for DeepEP/Mori low-latency dispatch, where
-    # topk_ids.shape[0] is the padded buffer size (num_max_dispatch_tokens_per_
-    # rank * world_size) and tells nothing about the real workload. When None,
-    # falls back to topk_ids.shape[0] -- bit-identical to old behavior.
+    # Host-side scheduling hint: an *estimate* of the per-local-expert token
+    # count (not an average, not exact). Only meaningful for DeepEP/Mori
+    # low-latency dispatch, where the dispatched hidden_states / topk_ids are
+    # padded, so topk_ids.shape[0] is the padded buffer size and tells nothing
+    # about the real workload. In that case expected_m is used as the num_token
+    # for kernel selection instead of the padded shape. It is chosen so that, for
+    # a fixed CUDA graph whose real num_token varies from run to run, the kernel
+    # it selects delivers good average performance over that range; hence it MUST
+    # be identical for every call sharing the same graph -- one graph key maps to
+    # one fixed expected_m. When None, falls back to topk_ids.shape[0] --
+    # bit-identical to old behavior.
     expected_m: Optional[int] = None,
 ):
     if not block_size_M:
@@ -343,16 +349,15 @@ def fused_moe_(
             q_dtype_a = dtypes.fp4x2
 
     # In DeepEP/Mori low-latency dispatch, topk_ids.shape[0] is the padded
-    # buffer size (num_max_dispatch_tokens_per_rank * world_size), not the real
-    # workload, so the M passed to get_padded_M always pegs at the worst tier.
-    # If the caller has computed expected_m (host-side avg #tokens per local
-    # expert under uniform routing), use that instead for tier matching --
-    # mirrors DeepGEMM's `expected_m` SM-scheduling hint.
+    # buffer size, not the real workload, so the M passed to get_padded_M always
+    # pegs at the worst tier. If the caller has supplied expected_m (a host-side
+    # estimate of the per-local-expert token count), use that instead for tier
+    # matching -- mirrors DeepGEMM's `expected_m` SM-scheduling hint.
     # expected_m is a post-dispatch, per-local-expert token count: the topk
     # fan-out and the EP routing are already folded into it, so topk no longer
     # carries scheduling information. Canonicalize topk to 1 for the config
     # lookup, keeping the tuned CSV unambiguous:
-    #   topk == 1  -> EP / expected_m view (token == avg #tokens per local expert)
+    #   topk == 1  -> EP / expected_m view (token == per-local-expert estimate)
     #   topk != 1  -> classic pre-dispatch view (token == #input tokens, topk == fan-out)
     # Only the lookup key changes; the real topk (topk_ids.shape[1]) still drives
     # moe_sorting and the stage1/stage2 kernels below. expected_m is None ->
@@ -482,6 +487,7 @@ def fused_moe_(
             # only for flydsl dsv4
             swiglu_limit=swiglu_limit,
             gate_mode=gate_mode,
+            expected_m=expected_m,
         )
 
 
@@ -1571,6 +1577,7 @@ def fused_moe_2stages(
     topk_weights=None,
     swiglu_limit=0.0,
     gate_mode=GateMode.SEPARATED.value,
+    expected_m: Optional[int] = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -1579,12 +1586,32 @@ def fused_moe_2stages(
     dtype = moe_out.dtype
     device = hidden_states.device
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    # Under EP, the hidden_states handed in by the dispatcher is padded (its row
+    # count is the padded dispatch-buffer size, not the real token count), so we
+    # use expected_m as the num_token for kernel-config selection instead of the
+    # padded token_num, and canonicalize the EP marker topk to 1. expected_m is
+    # an *estimate* (not an average, not exact), chosen so the kernel picked for
+    # this graph gives good average performance as the real num_token varies. It
+    # MUST be identical for every call that shares the same CUDA graph -- i.e.
+    # one graph key maps to one fixed expected_m -- otherwise the same graph
+    # would capture mismatched kernels.
+    # This lookup picks the stage1/stage2 kernels actually executed below, so it
+    # must use the same tier key as fused_moe_'s lookup; otherwise the
+    # topk=1-relabeled EP rows are missed here and metadata falls back to the
+    # slow default kernel. expected_m is None -> bit-identical to before
+    # (raw token_num / raw topk).
+    if expected_m is not None:
+        M_for_schedule = expected_m
+        topk_for_schedule = 1
+    else:
+        M_for_schedule = token_num
+        topk_for_schedule = topk
     metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
+        get_padded_M(M_for_schedule),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
-        topk,
+        topk_for_schedule,
         dtype,
         q_dtype_a,
         q_dtype_w,
