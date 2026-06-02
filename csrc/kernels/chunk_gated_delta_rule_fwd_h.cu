@@ -730,6 +730,7 @@ __device__ __forceinline__ void run_gemm2_fulltile_bvp(
 {
     constexpr int NUM_BV_TILES = BV_P / MFMA_N;
     const float decay = gated_exp(g_last, use_exp2);
+    const int row_group = lane_id >> 4;
 
     for (int round = 0; round < K_DIM / (MFMA_M * WAVE_COUNT); ++round) {
         floatx4 gacc[NUM_BV_TILES];
@@ -739,13 +740,15 @@ __device__ __forceinline__ void run_gemm2_fulltile_bvp(
         const int row_base_global = k_tile_idx * MFMA_M;
         const bf16_t* k_panel = row_base_global < 64 ? k_panel0 : k_panel1;
         const int row_base = row_base_global & 63;
-        float full_decay = decay;
-        if constexpr (HAS_GK) {
-            const int k_row = row_base_global + (lane_id & 15);
-            full_decay *= gated_exp(gk[gk_last_offset + k_row], use_exp2);
-        }
         for (int bv = 0; bv < NUM_BV_TILES; ++bv) {
-            for (int reg = 0; reg < 4; ++reg) h_reg[bv * 8 + round * 4 + reg] *= full_decay;
+            for (int reg = 0; reg < 4; ++reg) {
+                float full_decay = decay;
+                if constexpr (HAS_GK) {
+                    const int k_row = row_base_global + row_group * 4 + reg;
+                    full_decay *= gated_exp(gk[gk_last_offset + k_row], use_exp2);
+                }
+                h_reg[bv * 8 + round * 4 + reg] *= full_decay;
+            }
         }
 
 #pragma unroll
@@ -980,13 +983,15 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
         const int row_base_global = k_tile_idx * MFMA_M;
         const bf16_t* k_panel = row_base_global < 64 ? k_panel0 : k_panel1;
         const int rb = row_base_global & 63;
-        float full_decay = decay;
-        if constexpr (HAS_GK) {
-            const int k_row = row_base_global + (lane_id & 15);
-            full_decay *= gated_exp(gk[gk_last_off + k_row], use_exp2);
-        }
         for (int bv = 0; bv < NUM_BV_TILES; ++bv) {
-            for (int reg = 0; reg < 4; ++reg) h_reg[bv * 8 + round * 4 + reg] *= full_decay;
+            for (int reg = 0; reg < 4; ++reg) {
+                float full_decay = decay;
+                if constexpr (HAS_GK) {
+                    const int k_row = row_base_global + row_group * 4 + reg;
+                    full_decay *= gated_exp(gk[gk_last_off + k_row], use_exp2);
+                }
+                h_reg[bv * 8 + round * 4 + reg] *= full_decay;
+            }
         }
 
 #pragma unroll
@@ -1327,6 +1332,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_f
     TORCH_CHECK(T_flat == T, "`w/u` T dimension must match flattened token count.");
     TORCH_CHECK(w.size(0) == B && u.size(0) == B, "`w/u` batch dimension must match `k`.");
     TORCH_CHECK(u.size(1) == H && u.size(2) == T_flat, "`u` shape mismatch.");
+    if (has_gk) {
+        const int64_t total_gk_tokens = is_varlen ? T_flat : B * T_flat;
+        TORCH_CHECK(gk.size(0) == total_gk_tokens && gk.size(1) == H && gk.size(2) == K_DIM,
+                    "`gk` shape mismatch; expected [total_T, H, K].");
+    }
     if (g_head_major) {
         TORCH_CHECK(
             g.size(0) == B && g.size(1) == H && g.size(2) == T_flat,

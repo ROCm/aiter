@@ -139,7 +139,6 @@ def _prepare_state_args(
         raise ValueError(
             f"`initial_state.dtype` ({initial_state.dtype}) must match `state_dtype` ({dtype})."
         )
-
     tensor = (
         initial_state.to(dtype=dtype).contiguous()
         if initial_state is not None
@@ -269,6 +268,12 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
             selected_bv = _select_bv_for_dense(B, T_flat, chunk_size, H, k.device)
 
     if gk is not None:
+        total_gk_tokens = T_flat if is_varlen else B * T_flat
+        expected_gk_shape = (total_gk_tokens, H, K)
+        if tuple(gk.shape) != expected_gk_shape:
+            raise ValueError(
+                f"`gk` shape mismatch, expected {expected_gk_shape}, got {tuple(gk.shape)}."
+            )
         gk_arg = gk.to(torch.float32)
         if use_exp2:
             # gk is provided in natural-log space; convert once before exp2 kernels consume it.

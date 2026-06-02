@@ -32,7 +32,10 @@ _L2NORM_FWD_NUM_WARPS = 4
 
 @triton.jit
 def l2norm_fwd_kernel1(
-    X, Y, Rstd, eps,
+    X,
+    Y,
+    Rstd,
+    eps,
     D,
     BD: tl.constexpr,
     STORE_RSTD: tl.constexpr,
@@ -91,7 +94,10 @@ def l2norm_bwd_kernel1(
 
 @triton.jit
 def l2norm_fwd_kernel(
-    X, Y, Rstd, eps,
+    X,
+    Y,
+    Rstd,
+    eps,
     T,
     D: tl.constexpr,
     BD: tl.constexpr,
@@ -222,15 +228,25 @@ def l2norm_fwd(
     if D <= 512:
         BT = _L2NORM_FWD_BT
         l2norm_fwd_kernel[(triton.cdiv(T, BT),)](
-            x, y, rstd, eps,
-            T, D, BD, BT,
+            x,
+            y,
+            rstd,
+            eps,
+            T,
+            D,
+            BD,
+            BT,
             STORE_RSTD=need_rstd,
             num_warps=_L2NORM_FWD_NUM_WARPS,
         )
     else:
         l2norm_fwd_kernel1[(T,)](
-            x, y, rstd, eps,
-            D, BD,
+            x,
+            y,
+            rstd,
+            eps,
+            D,
+            BD,
             STORE_RSTD=need_rstd,
         )
 

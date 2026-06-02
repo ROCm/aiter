@@ -1096,3 +1096,7 @@ def test_chunk_opt_vk_varlen(
     assert_close("o", ref, tri, 0.005)
     # ref_ht is [N, H, K, V], tri_ht is [N, H, V, K]
     assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

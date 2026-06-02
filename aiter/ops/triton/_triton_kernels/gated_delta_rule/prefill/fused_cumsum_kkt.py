@@ -12,7 +12,6 @@ from ..utils import prepare_chunk_indices
 from ..utils.op import exp
 
 
-
 @triton.jit
 def safe_exp(x):
     return tl.exp(tl.where(x <= 0, x, float("-inf")))

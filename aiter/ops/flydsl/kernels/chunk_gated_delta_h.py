@@ -534,12 +534,12 @@ def compile_chunk_gated_delta_h(
             # k_prefetch results are filled inside the GEMM1 main loop below.
             k_prefetch = [None] * len(k_prefetch_off)
 
-            # Compute last_idx for the current chunk (shared by USE_G / USE_GK)
-            if const_expr(USE_G or USE_GK):
-                next_chunk_end = (i_t_i32 + fx.Int32(1)) * fx.Int32(BT)
-                last_idx_raw = (next_chunk_end < T_local).select(
-                    next_chunk_end, T_local
-                ) - fx.Int32(1)
+            # Compute last_idx for the current chunk. The offset precompute
+            # below is intentionally unconditional, even for ungated kernels.
+            next_chunk_end = (i_t_i32 + fx.Int32(1)) * fx.Int32(BT)
+            last_idx_raw = (next_chunk_end < T_local).select(
+                next_chunk_end, T_local
+            ) - fx.Int32(1)
 
             # OPT-VC (vmcnt-spread): precompute HBM offsets for g/gk/u prefetch
             # but DEFER the actual vec_load/scalar load until interleaved into

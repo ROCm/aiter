@@ -24,16 +24,21 @@ from ..utils import prepare_chunk_indices
 from ..utils.op import exp
 from ..utils.solve_tril import FLA_TRIL_PRECISION, solve_tril
 
-
 # solve_tril + recompute_w_u dispatch threshold in chunks (NT). At or below
 # this the single fused kernel is used; above it the split path
 # (solve_tril + recompute) is used.
 # The split path's small-NT cost is dominated by launch overhead, so the
 # crossover can shift under CUDA-graph/async capture -- re-tune via the env
 # var if needed.
-_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX = int(os.environ.get("AITER_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX", "32"))
-_SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT = os.environ.get("AITER_SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT")
-_SOLVE_TRIL_RECOMPUTE_FORCE = os.environ.get("AITER_SOLVE_TRIL_RECOMPUTE_FORCE", "").lower()  # "", "fused", "split"
+_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX = int(
+    os.environ.get("AITER_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX", "32")
+)
+_SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT = os.environ.get(
+    "AITER_SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT"
+)
+_SOLVE_TRIL_RECOMPUTE_FORCE = os.environ.get(
+    "AITER_SOLVE_TRIL_RECOMPUTE_FORCE", ""
+).lower()  # "", "fused", "split"
 
 
 if IS_AMD:
@@ -52,7 +57,9 @@ else:
         for ns in [2, 3, 4]
     ]
 
-_SOLVE_TRIL_RECOMPUTE_DEFAULT_CONFIG = triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=2)
+_SOLVE_TRIL_RECOMPUTE_DEFAULT_CONFIG = triton.Config(
+    {"BK": 64, "BV": 64}, num_warps=2, num_stages=2
+)
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -410,7 +417,9 @@ else:
         for ns in [2, 3, 4]
     ]
 
-_RECOMPUTE_WU_HM_DEFAULT_CONFIG = triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=2)
+_RECOMPUTE_WU_HM_DEFAULT_CONFIG = triton.Config(
+    {"BK": 64, "BV": 64}, num_warps=2, num_stages=2
+)
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -629,7 +638,10 @@ def fused_solve_tril_recompute_w_u(
     else:
         # Auto: use split once NT exceeds the threshold; below it the
         # fused kernel's fewer launches win.
-        if cu_seqlens is not None and _SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT is not None:
+        if (
+            cu_seqlens is not None
+            and _SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT is not None
+        ):
             varlen_split = _SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT == "1"
             use_split = varlen_split and NT > _SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX
         else:
