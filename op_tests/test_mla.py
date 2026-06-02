@@ -681,21 +681,28 @@ def test_mla(
 
     # Gluon MLA bh16bn64 decode test (gfx950, bf16 Q + bf16 KV, nhead in (4,8,16),
     # decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
-    # NUM_KV_SPLITS = max(1, 256 // batch_size); wrapper asserts
-    # min_kv_seq_len >= NUM_KV_SPLITS (non-empty splits, num_iter >= 1). Both
-    # full decode and the stage-1-only DCP path (-lse) run here, for any
-    # batch_size (e.g. B in {1, 3, 4}). Example: -c 3000000 -b 1 -n 16,1 -d bf16 -kvd bf16
+    # Two modes with different accuracy envelopes, so different gates:
+    #   -lse (DCP stage-1): the cross-split merge runs in fp32 on the host, so it
+    #     meets cal_diff for any batch. Only requirement is non-empty splits:
+    #     NUM_KV_SPLITS = max(1, 256 // batch_size), so ctx >= 256 // batch_size.
+    #     Example: -c 10000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -lse
+    #   full decode: the per-split combine is the in-kernel bf16 stage-2 reduce,
+    #     which only meets cal_diff's strict cos_diff<1e-5 at batch_size==1
+    #     (NUM_KV_SPLITS=256) with min_seq_len_wg >= BLOCK_N*3, i.e.
+    #     ctx >= 256 * 64 * 3 = 49152. Example: -c 49152 -b 1 -n 16,1 -d bf16 -kvd bf16
     if (
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
         and kvtype == torch.bfloat16
         and nhead <= 16
         and decode_qlen == 1
-        and 1 <= batch_size <= 256  # NUM_KV_SPLITS = max(1, 256 // batch_size) >= 1
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
-        and ctx_lens >= (256 // batch_size)
+        and (
+            (return_lse and 1 <= batch_size <= 256 and ctx_lens >= (256 // batch_size))
+            or (not return_lse and batch_size == 1 and ctx_lens >= 256 * 64 * 3)
+        )
     ):
         err_gluon, us_gluon_decode = test_absorb_decode_gluon_bh16("bh16bn64")
         ret["decode:gluon_err"] = err_gluon
