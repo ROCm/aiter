@@ -72,9 +72,21 @@ jobs:
           import json
           import os
 
+          # Always-on PR gate set (every ci:atom / ci:all). Kept small so the
+          # do-mi350x pool isn't overloaded (overload was flaking the Kimi +
+          # perf gates). The InferenceX frontier models (DeepSeek-V4-Pro,
+          # Qwen3.5-397B-A17B-FP8, GLM-5.1-FP8 — all validated PASS on do-mi350x)
+          # are covered on-demand via the ci:atom_full label, which runs every
+          # pr/main model in ATOM models_accuracy.json with the runner pins below.
+          # MiniMax-M2.7 needs HSA_NO_SCRATCH_RECLAIM=1 (scratch reclaim corrupts
+          # its MoE scratch buffers on gfx950); injected via model_env_overrides
+          # below. It runs under ci:atom_full, not on every PR.
           default_models = [
               {"model_name": "DeepSeek-R1-0528"},
               {"model_name": "gpt-oss-120b"},
+              # Kimi-K2.5 ATOM (in-tree) downstream gate. Config (model_path,
+              # extraArgs -tp4, threshold) is pulled from ATOM models_accuracy.json.
+              {"model_name": "Kimi-K2.5-MXFP4"},
           ]
 
           labels_raw = os.environ.get("LABELS_JSON") or "[]"
@@ -91,9 +103,49 @@ jobs:
               "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
           }
 
+          # Per-model runner pin (overrides the generic mapping above). Kimi-K2.5
+          # runs the downstream gate on the AITER MI350X pool (TP4 -> 4 GPUs).
+          model_runner_overrides = {
+              "Kimi-K2.5-MXFP4": "linux-aiter-do-mi350x-4",
+              "DeepSeek-V4-Pro": "linux-aiter-do-mi350x-8",       # -tp 8
+              "Qwen3.5-397B-A17B-FP8": "linux-aiter-do-mi350x-4",  # -tp 4
+              "MiniMax-M2.7-MXFP4": "linux-aiter-do-mi350x-2",     # -tp 2 (MXFP4)
+              "GLM-5.1-FP8": "linux-aiter-do-mi350x-8",            # -tp 8
+          }
+
+          # Per-model extra env injected into the test container (one KEY=VALUE per
+          # line, merged with any env_vars already declared in the ATOM model
+          # config). MiniMax MoE needs scratch reclaim disabled or its scratch
+          # buffers get corrupted on gfx950, failing the accuracy gate.
+          model_env_overrides = {
+              "MiniMax-M2.7-MXFP4": "HSA_NO_SCRATCH_RECLAIM=1",
+          }
+
+          # Extra CLI args appended (after the ATOM config's extraArgs) for
+          # specific models. MiniMax's trust_remote_code modeling breaks ATOM's
+          # torch.compile/inductor path during warmup (BackendCompilerFailed ->
+          # FileNotFoundError '<frozen posixpath>'); --enforce-eager only
+          # disables cudagraph capture in ATOM, so --level 0 (NO_COMPILATION) is
+          # what bypasses the failing backend. The MXFP4 ATOM entry has no -tp,
+          # so pin TP2 to match the do-mi350x-2 runner.
+          model_extra_args_append = {
+              "MiniMax-M2.7-MXFP4": "-tp 2 --enforce-eager --level 0",
+          }
+
           def prepare_model(model):
               model = dict(model)
               model["runner"] = runner_overrides.get(model["runner"], model["runner"])
+              model["runner"] = model_runner_overrides.get(model["model_name"], model["runner"])
+              extra_env = model_env_overrides.get(model["model_name"])
+              if extra_env:
+                  existing_env = str(model.get("env_vars", "")).strip()
+                  model["env_vars"] = (
+                      f"{existing_env}\n{extra_env}" if existing_env else extra_env
+                  )
+              extra_args = model_extra_args_append.get(model["model_name"])
+              if extra_args:
+                  base_args = str(model.get("extraArgs", "")).strip()
+                  model["extraArgs"] = f"{base_args} {extra_args}".strip()
               model["label"] = model.get("runner", "")
               model["accuracy_test_threshold"] = str(model.get("accuracy_threshold", 0))
               model["run_on_pr"] = True
@@ -102,6 +154,11 @@ jobs:
                   f"{model.get('extraArgs', '')}, {model['runner']})"
               )
               return model
+
+          # Models force-included in ci:atom_full regardless of their ATOM
+          # test_level. The MiniMax MXFP4 variant is tagged "nightly" in the ATOM
+          # config, so the pr/main filter below would otherwise skip it.
+          full_atom_extra_models = {"MiniMax-M2.7-MXFP4"}
 
           full_atom = os.environ["EVENT_NAME"] == "pull_request" and "ci:atom_full" in labels
           if not full_atom:
@@ -123,6 +180,7 @@ jobs:
                   prepare_model(model)
                   for model in atom_models
                   if str(model.get("test_level", "")).lower() in {"pr", "main"}
+                  or model["model_name"] in full_atom_extra_models
               ]
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
