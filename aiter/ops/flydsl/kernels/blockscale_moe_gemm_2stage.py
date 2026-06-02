@@ -156,6 +156,79 @@ def _validate_scale_blocks(
     return int(scale_block_k)
 
 
+def _splitk_kslice_is_valid(
+    k_batch: int, model_dim: int, tile_k: int, scale_block_k: int = SCALE_BLOCK_K_DEFAULT
+) -> bool:
+    """Cheap predicate version of ``_validate_split_k`` (no exceptions).
+
+    Returns True iff a ``k_batch`` value satisfies the K-slice constraints
+    (model_dim divisible by k_batch, slice divisible by scale_block_k and
+    tile_k, and an even number of tile_k tiles per slice >= 2).
+    """
+    if k_batch <= 1:
+        return True
+    if model_dim % k_batch != 0:
+        return False
+    kps = model_dim // k_batch
+    if kps % scale_block_k != 0:
+        return False
+    if kps % tile_k != 0:
+        return False
+    ttps = kps // tile_k
+    return ttps >= 2 and (ttps % 2) == 0
+
+
+def pick_k_batch_for_blockscale_stage1(
+    *,
+    token_num: int,
+    inter_dim: int,
+    topk: int,
+    model_dim: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    scale_block_k: int = SCALE_BLOCK_K_DEFAULT,
+) -> int:
+    """Pick ``k_batch`` for FP8 blockscale MoE stage1 from grid occupancy.
+
+    Tuned on DSR1 TP=8 shapes (``model_dim=7168``, ``inter_dim`` in
+    ``{256, 512}``, ``E=257``, ``topk=9``) on gfx950. Selector picks from
+    ``{1, 2, 4}`` only -- larger split factors are uniformly worse on the
+    measured shapes (atomic-add contention dominates).
+
+    Heuristic:
+      blocks_m == 1 (decode-1: only one M-tile)   -> k_batch = 4
+      base_ctas >= 16 (grid already fills the GPU) -> k_batch = 1
+      base_ctas >=  8                              -> k_batch = 2
+      base_ctas <   8                              -> k_batch = 4
+
+    where ``blocks_m = ceil(M*topk / tile_m)`` and
+    ``base_ctas = blocks_m * ceil(2*inter_dim / tile_n)``.
+
+    The chosen value is then snapped down to the largest valid ``k_batch
+    <= desired`` that satisfies the K-slice constraints; otherwise falls
+    back to ``1``. Safe to call for any shape -- never raises.
+    """
+    blocks_m = max(1, (token_num * topk + tile_m - 1) // tile_m)
+    blocks_n = max(1, (2 * inter_dim + tile_n - 1) // tile_n)
+    base_ctas = blocks_m * blocks_n
+    if blocks_m == 1 and base_ctas < 16:
+        # Only one M-tile (decode-1 case): occupancy is most starved on
+        # the M dimension regardless of N; split-K=4 is uniformly best
+        # in the measured sweep.
+        desired = 4
+    elif base_ctas >= 16:
+        desired = 1
+    elif base_ctas >= 8:
+        desired = 2
+    else:
+        desired = 4
+    for kb in (desired, max(desired // 2, 1), 1):
+        if _splitk_kslice_is_valid(kb, model_dim, tile_k, scale_block_k):
+            return kb
+    return 1
+
+
 def _reject_tier_c(
     *,
     act: str,
@@ -393,6 +466,7 @@ def compile_blockscale_moe_gemm2(
 __all__ = [
     "compile_blockscale_moe_gemm1",
     "compile_blockscale_moe_gemm2",
+    "pick_k_batch_for_blockscale_stage1",
     "SCALE_BLOCK_M_DEFAULT",
     "SCALE_BLOCK_N_DEFAULT",
     "SCALE_BLOCK_K_DEFAULT",
