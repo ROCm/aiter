@@ -7,9 +7,9 @@ This module hosts:
 
 * ``chunk_gated_delta_rule_fwd_h_flydsl`` -- host wrapper around the K5
   hidden-state recurrence FlyDSL kernel (``compile_chunk_gated_delta_h``).
-  Performs PyTorch tensor preparation, looks up ``BV`` from the
-  offline-tuned table ``chunk_gdn_h_tuned.csv``, manages the compiled
-  kernel cache, and handles the launch stream. The kernel-compile module
+  Performs PyTorch tensor preparation, chooses ``BV`` with a rule-based
+  grid/CU heuristic, manages the compiled kernel cache, and handles the
+  launch stream. The kernel-compile module
   ``kernels.chunk_gated_delta_h`` is kept ``torch``-free, mirroring the
   layering used by ``kernels.gdr_decode``.
 
@@ -22,14 +22,10 @@ This module hosts:
 
 from __future__ import annotations
 
-import csv
 import os
-from pathlib import Path
 
 import torch
 import triton
-
-from flydsl.runtime.device import get_rocm_arch
 
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 
@@ -52,60 +48,45 @@ __all__ = [
 ]
 
 
-# -- K5 host wrapper (FlyDSL kernel + offline-tuned BV lookup) ------------
+# -- K5 host wrapper (FlyDSL kernel + rule-based BV selection) ------------
 
 _compiled_kernels = {}
 _BV_CANDIDATES = [16, 32, 64]
 _DEFAULT_BV = 16
-_TUNED_FILE = "chunk_gdn_h_tuned.csv"
-
-# (dtype_str, arch, K, V, BT, H, Hg, T_flat, N,
-#  use_g, use_gk, use_h0, store_fs, save_vn, is_varlen, wu_contig) -> {"BV": int}
-GDN_H_GLOBAL_CONFIG_MAP = None
-# Secondary index for the ``is_varlen=False`` nearest-T fallback. Keyed on the
-# full shape tuple but with ``T_flat`` removed; value is the list of
-# ``(T_flat, cfg)`` pairs sorted by ``T_flat``.
-GDN_H_T_INDEX = None
-GDN_H_GPU_ARCH = get_rocm_arch()
-_GDN_H_FALLBACK_WARNED = set()
-_GDN_H_NEAREST_WARNED = set()
 
 
-def _gdn_h_shape_key_no_T(
-    dtype_str,
-    arch,
-    K,
-    V,
-    BT,
-    H,
-    Hg,
-    N,
-    use_g,
-    use_gk,
-    use_h0,
-    store_fs,
-    save_vn,
-    is_varlen,
-    wu_contig,
-):
-    """Lookup key with ``T_flat`` removed (used by nearest-T fallback)."""
-    return (
-        dtype_str,
-        arch,
-        K,
-        V,
-        BT,
-        H,
-        Hg,
-        N,
-        use_g,
-        use_gk,
-        use_h0,
-        store_fs,
-        save_vn,
-        is_varlen,
-        wu_contig,
-    )
+def _legal_bv_candidates(V: int) -> list[int]:
+    return [c for c in _BV_CANDIDATES if c <= V and V % c == 0]
+
+
+def _grid_ctas(*, H: int, V: int, N: int, BV: int) -> int:
+    return max(1, N) * H * ((V + BV - 1) // BV)
+
+
+def _select_bv_for_grid(*, H: int, V: int, N: int, target_ctas: int) -> int:
+    """Choose the largest legal BV whose grid still covers target_ctas."""
+    legal = sorted(_legal_bv_candidates(V), reverse=True)
+    if not legal:
+        return _DEFAULT_BV
+    for bv in legal:
+        if _grid_ctas(H=H, V=V, N=N, BV=bv) >= target_ctas:
+            return bv
+    # If even BV=16 cannot reach the target, use it to maximize grid size.
+    return legal[-1]
+
+
+def _target_bv_for_shape(
+    *, H: int, Hg: int, T_flat: int, N: int, is_varlen: bool
+) -> int | None:
+    """Return the calibrated BV regime before legality/grid adjustment."""
+    if is_varlen and H == 32 and Hg == 16:
+        if N == 2 and 11000 <= T_flat < 15000:
+            return 16
+        if N == 3 and not (10000 <= T_flat < 12000 or 20000 <= T_flat < 25000):
+            return 64
+    if is_varlen and H == 16 and T_flat >= 32768 and N >= 7:
+        return 64
+    return None
 
 
 def _lookup_tuned_bv(
@@ -124,202 +105,75 @@ def _lookup_tuned_bv(
     save_vn,
     is_varlen,
     wu_contig,
+    head_seqlen=0,
+    mid_seqlen=0,
+    tail_seqlen=0,
 ):
-    """Look up the best ``BV`` for this shape from the offline-tuned table.
-
-    Falls back to ``_DEFAULT_BV`` when no entry matches (with a one-time
-    per-shape warning). Mirrors the lookup-table pattern used by
-    ``aiter.ops.flydsl.linear_attention_kernels.get_default_kwargs``.
-    """
-    global GDN_H_GLOBAL_CONFIG_MAP, GDN_H_T_INDEX
-    if GDN_H_GLOBAL_CONFIG_MAP is None:
-        _dict = {}
-        _t_index = {}
-        fname = os.path.join(Path(__file__).resolve().parent, _TUNED_FILE)
-        if os.path.exists(fname):
-            with open(fname, "r", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    # Coerce CSV string fields to native Python types so the
-                    # lookup key tuple is byte-for-byte identical to what
-                    # the runtime caller passes.
-                    obj_arch = row["arch"]
-                    obj_dtype = row["dtype"]
-                    obj_K = int(row["K"])
-                    obj_V = int(row["V"])
-                    obj_BT = int(row["BT"])
-                    obj_H = int(row["H"])
-                    obj_Hg = int(row["Hg"])
-                    obj_T_flat = int(row["T_flat"])
-                    obj_N = int(row["N"])
-                    obj_use_g = row["use_g"] == "True"
-                    obj_use_gk = row["use_gk"] == "True"
-                    obj_use_h0 = row["use_h0"] == "True"
-                    obj_store_fs = row["store_fs"] == "True"
-                    obj_save_vn = row["save_vn"] == "True"
-                    obj_is_varlen = row["is_varlen"] == "True"
-                    obj_wu_contig = row["wu_contig"] == "True"
-                    cfg = {"BV": int(row["BV"])}
-                    key = (
-                        obj_dtype,
-                        obj_arch,
-                        obj_K,
-                        obj_V,
-                        obj_BT,
-                        obj_H,
-                        obj_Hg,
-                        obj_T_flat,
-                        obj_N,
-                        obj_use_g,
-                        obj_use_gk,
-                        obj_use_h0,
-                        obj_store_fs,
-                        obj_save_vn,
-                        obj_is_varlen,
-                        obj_wu_contig,
-                    )
-                    _dict[key] = cfg
-                    sk = _gdn_h_shape_key_no_T(
-                        obj_dtype,
-                        obj_arch,
-                        obj_K,
-                        obj_V,
-                        obj_BT,
-                        obj_H,
-                        obj_Hg,
-                        obj_N,
-                        obj_use_g,
-                        obj_use_gk,
-                        obj_use_h0,
-                        obj_store_fs,
-                        obj_save_vn,
-                        obj_is_varlen,
-                        obj_wu_contig,
-                    )
-                    _t_index.setdefault(sk, []).append((obj_T_flat, cfg))
-        for _v in _t_index.values():
-            _v.sort(key=lambda x: x[0])
-        GDN_H_GLOBAL_CONFIG_MAP = _dict
-        GDN_H_T_INDEX = _t_index
-
-    key = (
+    """Select ``BV`` with the rule-based grid/CU heuristic."""
+    del (
         dtype_str,
-        GDN_H_GPU_ARCH,
         K,
-        V,
         BT,
-        H,
-        Hg,
-        T_flat,
-        N,
         use_g,
         use_gk,
         use_h0,
         store_fs,
         save_vn,
-        is_varlen,
         wu_contig,
+        head_seqlen,
+        mid_seqlen,
+        tail_seqlen,
     )
-    cfg = GDN_H_GLOBAL_CONFIG_MAP.get(key, None)
-    if cfg is not None:
-        BV = int(cfg["BV"])
-        if BV in _BV_CANDIDATES and BV <= V and V % BV == 0:
-            return BV
-
-    # Nearest-T fallback (is_varlen=False only): for non-varlen prefill the
-    # optimal BV is essentially independent of T (parallel block count is
-    # ``H * V/BV``, T only scales the inner loop). When the exact T_flat is
-    # not tuned, look up the closest tuned T_flat for the same shape and
-    # reuse its BV. ``is_varlen=True`` still falls through to ``_DEFAULT_BV``
-    # to avoid mixing N/T_local effects across batches.
-    if not is_varlen:
-        sk = _gdn_h_shape_key_no_T(
-            dtype_str,
-            GDN_H_GPU_ARCH,
-            K,
-            V,
-            BT,
-            H,
-            Hg,
-            N,
-            use_g,
-            use_gk,
-            use_h0,
-            store_fs,
-            save_vn,
-            is_varlen,
-            wu_contig,
-        )
-        candidates_for_shape = (
-            GDN_H_T_INDEX.get(sk) if GDN_H_T_INDEX is not None else None
-        )
-        if candidates_for_shape:
-            # Tie-break: prefer the smaller T_flat, i.e. err on the side of the
-            # short-sequence config (which favours larger BV / lower register
-            # pressure regimes) rather than overshooting.
-            nearest_T, nearest_cfg = min(
-                candidates_for_shape,
-                key=lambda tc: (abs(tc[0] - T_flat), tc[0]),
-            )
-            BV = int(nearest_cfg["BV"])
-            if BV in _BV_CANDIDATES and BV <= V and V % BV == 0:
-                if sk not in _GDN_H_NEAREST_WARNED:
-                    print(
-                        f"[K5 lookup] no exact tuned BV for T_flat={T_flat} "
-                        f"on shape={sk}; using nearest-T={nearest_T} -> BV={BV}."
-                    )
-                    _GDN_H_NEAREST_WARNED.add(sk)
-                return BV
-
-    # Tier 3 fallback: rule-based BV picker. Derived from the offline BV
-    # sweep on gfx950 (see flydsl_bv_sweep.log). Strictly better than
-    # always returning ``_DEFAULT_BV=16`` -- on small-H varlen shapes the
-    # latter was 1.5-1.8x slower than optimal. The rule lands on the
-    # empirical best for 18/20 sweeped shapes; the remaining 2 are within
-    # ~5%.
-    rule_bv = _heuristic_bv(H=H, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen)
-    if key not in _GDN_H_FALLBACK_WARNED:
-        print(
-            f"[K5 lookup] no tuned BV for {key}, "
-            f"using rule-based BV={rule_bv}. "
-            f"Run the offline tuner to add this shape to {_TUNED_FILE}."
-        )
-        _GDN_H_FALLBACK_WARNED.add(key)
-    return rule_bv
+    return _heuristic_bv(
+        H=H,
+        Hg=Hg,
+        V=V,
+        T_flat=T_flat,
+        N=N,
+        is_varlen=is_varlen,
+    )
 
 
-def _heuristic_bv(*, H: int, V: int, T_flat: int, N: int, is_varlen: bool) -> int:
-    """Pick a sensible BV when the offline-tuned csv has no entry for the
-    requested shape. Pure function: no IO, no state.
+def _heuristic_bv(
+    *,
+    H: int,
+    Hg: int,
+    V: int,
+    T_flat: int,
+    N: int,
+    is_varlen: bool,
+) -> int:
+    """Pick a sensible BV for the requested shape. Pure function: no IO, no state.
 
     Rules calibrated against a 27-point sweep matrix on gfx950 (20 in-csv
     shapes + 7 csv-uncovered probes). The 27 points span H in
     {8,16,24,32,48,64,128} and T_local in [256, 128000]; see
     flydsl_bv_sweep.log + flydsl_heuristic_verify.log.
 
-      * ``is_varlen=False`` -- BV is essentially independent of T. The
-        optimum tracks H in three tiers:
-          H <= 32  -> BV = 16
-          H in (32, 64]  -> BV = 32   (incl. H=48 interpolation point)
-          H > 64   -> BV = 64         (H=128 measured)
+      * First pick a target CTA count, then choose the largest legal BV whose
+        grid ``N * H * ceil(V / BV)`` still reaches that target. Larger BV
+        reduces per-CTA overhead; smaller BV exposes more CTAs for CU
+        utilization.
 
-      * ``is_varlen=True`` -- BV depends on (H, T_local) jointly. Three
-        H-regimes, each with its own BV ladder:
+      * ``is_varlen=False`` -- target one wave of CTAs over gfx950's 256 CUs.
+
+      * ``is_varlen=True`` -- the target grid depends on (H, T_local) jointly:
           H <= 8:
-            T_local <= 2048  -> BV = 64
-            T_local <= 4096  -> BV = 32
-            T_local >  4096  -> BV = 16
+            short chunks target the BV=64 grid; medium chunks target BV=32;
+            long chunks target BV=16.
           H in (8, 16]:
-            T_local >= 8192  -> BV = 32   (else BV = 64)
+            long chunks target BV=32; shorter chunks target BV=64.
+          H == 32, Hg == 16:
+            target grid follows the bench333/407 production trace: single
+            sequence needs BV=16 grid; N=2/3 use total-T windows; N>=4 has
+            enough grid at BV=64.
           H > 16:
-            BV = 64   (the only varlen sweep point at H>=32 is
-                       T_local=3500/BV=64; refrain from extrapolating)
+            target the BV=64 grid unless a more specific regime above applies.
 
-    Coverage: 27/27 calibration points (20 in-csv shapes + 7 csv-uncovered
-    probes) hit the empirical optimum. The rule is calibrated to a small
-    dataset, so shapes far outside the sampled (H, T_local) grid -- in
-    particular H in (16, 32) at long T_local, or T_local > 65K with
-    H >= 16 -- may still be suboptimal; consider extending the offline
-    csv when production reports new shape families via the warning.
+    Coverage: the rule matches the AOT seed CSV plus the measured bench333 /
+    bench407 probes used during calibration. Shapes far outside the sampled
+    (H, T_local) grid may still be suboptimal; extend the calibration sweep
+    when production reports new shape families.
 
     Args:
         H: number of v-heads (per TP rank).
@@ -328,6 +182,8 @@ def _heuristic_bv(*, H: int, V: int, T_flat: int, N: int, is_varlen: bool) -> in
             in varlen, ``B*T`` otherwise).
         N: number of sequences in the batch (varlen) or batch size.
         is_varlen: whether the kernel runs in variable-length mode.
+        Hg: number of k-heads (per TP rank). Currently only used to scope
+            trace-calibrated rules to the K5 H=32/Hg=16 family.
 
     Returns:
         A BV from ``_BV_CANDIDATES`` that satisfies ``BV <= V`` and
@@ -335,49 +191,25 @@ def _heuristic_bv(*, H: int, V: int, T_flat: int, N: int, is_varlen: bool) -> in
         V (rare: V<16 or V not divisible by 16), falls back to the
         largest legal candidate, then finally to ``_DEFAULT_BV``.
     """
-    if not is_varlen:
-        if H > 64:
-            bv = 64
-        elif H > 32:
-            bv = 32
-        else:
-            bv = 16
-    else:
-        # Approximate per-sequence length from T_flat / N.
-        T_local = T_flat // max(1, N)
-        # Three regimes by H. Boundaries are calibrated to the 27-point
-        # sweep matrix; revisit when extending the dataset.
-        if H <= 8:
-            # Three-step ladder: 64 for short chunks, 32 in the middle,
-            # 16 once chunks blow the register budget.
-            if T_local <= 2048:
-                bv = 64
-            elif T_local <= 4096:
-                bv = 32
-            else:
-                bv = 16
-        elif H <= 16:
-            # Only one descent at the very long end (>=8K), staying at
-            # BV=32 instead of 16 -- larger H tolerates the bigger tile.
-            bv = 32 if T_local >= 8192 else 64
-        else:
-            # H>=32 in varlen: only sweep point we have is T=3500/BV=64.
-            # Default to BV=64 across the board; any further descent would
-            # be a pure extrapolation guess.
-            bv = 64
-
-    # Respect the kernel-level legality constraint:
-    # BV must divide V and not exceed V.
-    if bv <= V and V % bv == 0:
-        return bv
-
-    legal = sorted(
-        (c for c in _BV_CANDIDATES if c <= V and V % c == 0),
-        reverse=True,  # prefer larger tiles when the rule's pick is illegal
+    target_bv = _target_bv_for_shape(
+        H=H, Hg=Hg, T_flat=T_flat, N=N, is_varlen=is_varlen
     )
-    if legal:
-        return legal[0]
-    return _DEFAULT_BV
+    target_ctas = (
+        _grid_ctas(H=H, V=V, N=N, BV=target_bv) if target_bv is not None else 256
+    )
+    return _select_bv_for_grid(H=H, V=V, N=N, target_ctas=target_ctas)
+
+
+def _k5_exp2_prescaled_enabled() -> bool:
+    """Read FLYDSL_K5_EXP2_PRESCALED env var at every call (no caching).
+
+    When set to a truthy value (1/true/yes/on), the K5 kernel is compiled
+    with ``G_IS_LOG2_SCALED=True`` and ``_fast_exp`` drops the per-call
+    ``* log2(e)`` multiply. This is a PERF-ONLY probe: outputs are
+    incorrect unless K12 has been updated to pre-scale ``g_cumsum``.
+    """
+    val = os.environ.get("FLYDSL_K5_EXP2_PRESCALED", "")
+    return val.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _get_or_compile(
@@ -396,6 +228,7 @@ def _get_or_compile(
     wu_contig,
     state_bf16=False,
 ):
+    g_log2_scaled = _k5_exp2_prescaled_enabled()
     cache_key = (
         K,
         V,
@@ -411,6 +244,7 @@ def _get_or_compile(
         is_varlen,
         wu_contig,
         state_bf16,
+        g_log2_scaled,
     )
     if cache_key not in _compiled_kernels:
         _compiled_kernels[cache_key] = compile_chunk_gated_delta_h(
@@ -428,6 +262,7 @@ def _get_or_compile(
             IS_VARLEN=is_varlen,
             WU_CONTIGUOUS=wu_contig,
             STATE_DTYPE_BF16=state_bf16,
+            G_IS_LOG2_SCALED=g_log2_scaled,
         )
     return _compiled_kernels[cache_key]
 
@@ -510,10 +345,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         (h, v_new, final_state) in VK-ordered layout (``[..., V, K]`` on the
         last two dims).
 
-    BV-tile selection uses an offline-tuned lookup table
-    (``chunk_gdn_h_tuned.csv``) -- mirrors the pattern used by
-    ``flydsl_gdr_decode``. Shapes not present in the table fall back to
-    ``_DEFAULT_BV`` with a one-time warning.
+    BV-tile selection is rule-based. ``chunk_gdn_h_tuned.csv`` remains an AOT
+    seed list for pre-compilation, but runtime BV selection does not read it.
     """
     # Layout is fixed to head-major contiguous (matches Triton VK wrapper).
     wu_contiguous = True
@@ -549,10 +382,34 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
+        head_seqlen_lookup = 0
+        mid_seqlen_lookup = 0
+        tail_seqlen_lookup = 0
     else:
         N = len(cu_seqlens) - 1
         lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        NT = sum(triton.cdiv(int(seq_len), BT) for seq_len in lens.tolist())
+        lens_list = lens.tolist()
+        NT = sum(triton.cdiv(int(seq_len), BT) for seq_len in lens_list)
+        # Structural features of the cu_seqlens length distribution for
+        # BV lookup; computed identically by sweep_flydsl_k5_bv.py so
+        # the runtime key matches the tuned table's key.
+        if not lens_list:
+            head_seqlen_lookup = 0
+            mid_seqlen_lookup = 0
+            tail_seqlen_lookup = 0
+        elif len(lens_list) == 1:
+            head_seqlen_lookup = int(lens_list[0])
+            mid_seqlen_lookup = 0
+            tail_seqlen_lookup = 0
+        elif len(lens_list) == 2:
+            head_seqlen_lookup = int(lens_list[0])
+            mid_seqlen_lookup = 0
+            tail_seqlen_lookup = int(lens_list[1])
+        else:
+            mids = lens_list[1:-1]
+            head_seqlen_lookup = int(lens_list[0])
+            tail_seqlen_lookup = int(lens_list[-1])
+            mid_seqlen_lookup = int(mids[0]) if all(m == mids[0] for m in mids) else 0
         chunk_offsets = (
             torch.cat(
                 [
@@ -592,7 +449,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     use_h0 = initial_state is not None
     is_varlen = cu_seqlens is not None
 
-    # Resolve BV from the offline-tuned lookup table.
+    # Resolve BV from the rule-based grid/CU heuristic.
     BV = _lookup_tuned_bv(
         dtype_str=str(k.dtype),
         K=K,
@@ -609,6 +466,9 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         save_vn=bool(save_new_value),
         is_varlen=is_varlen,
         wu_contig=wu_contiguous,
+        head_seqlen=head_seqlen_lookup,
+        mid_seqlen=mid_seqlen_lookup,
+        tail_seqlen=tail_seqlen_lookup,
     )
 
     launch_fn = _get_or_compile(
