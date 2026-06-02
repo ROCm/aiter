@@ -191,8 +191,19 @@ void mla_decode_stage1_asm_fwd(
         // nullptr causes GPU memory faults on gfx950.  Other non-persistent
         // kernels (v3, stage1) use split-reduce and expect ptr_RP = nullptr.
         bool legacy_qh16 = (gqa_ratio == 32 && max_seqlen_q == 1);
-        args.out_16_nosplit = legacy_qh16 ? kv_split : 0;
-        args.ptr_RP = legacy_qh16 ? output->data_ptr() : nullptr;
+        bool causal_qs4_direct_write = (causal_mask && max_seqlen_q == 4);
+        args.out_16_nosplit = legacy_qh16 || causal_qs4_direct_write ? kv_split : 0;
+        if (legacy_qh16) {
+            args.ptr_RP = output->data_ptr();
+        }
+        else if (causal_qs4_direct_write) {
+            void *temp  = reinterpret_cast<void*>(1);    
+            args.ptr_RP = temp;
+        }
+        else {
+            args.ptr_RP = nullptr;
+        }
+
         args.ptr_STP = num_kv_splits_indptr->data_ptr();
     }
 

@@ -237,7 +237,7 @@ def mla_decode_fwd(
         logits = (
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
             if (
-                num_kv_splits == 1 and not causal_mask
+                num_kv_splits == 1
                 and (
                     q.dtype == dtypes.fp8
                     or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
@@ -303,7 +303,7 @@ def mla_decode_fwd(
             return logits.view(total_s, nhead, v_head_dim), lse
 
         if num_kv_splits == 1 and causal_mask:
-            o.copy_(logits.view(total_s, nhead, v_head_dim).to(o.dtype))
+            #o.copy_(logits.view(total_s, nhead, v_head_dim).to(o.dtype))
             lse = final_lse if return_lse else attn_lse
             return o, lse
 
