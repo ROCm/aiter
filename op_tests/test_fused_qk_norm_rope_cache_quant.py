@@ -2700,12 +2700,16 @@ def test_pts_quant_shuffle_block_layout_parity(
 ):
     """Parity: the pts shuffle write must give identical KV cache for the original [2, num_blocks, ...] and new [num_blocks, 2, ...] (unbind(1)) layouts."""
     cache_dtype = cache_dtype or dtype  # None => auto (cache dtype == qkv dtype)
-    x = 16 // torch.empty(0, dtype=cache_dtype).element_size()  # 8 (bf16/fp16), 16 (fp8)
+    x = (
+        16 // torch.empty(0, dtype=cache_dtype).element_size()
+    )  # 8 (bf16/fp16), 16 (fp8)
     assert block_size % x == 0, f"block_size {block_size} must be a multiple of x={x}"
     # Enough blocks that every token fits and the mapping spans >1 block.
     num_blocks = (num_tokens + block_size - 1) // block_size + 2
     num_slots = num_blocks * block_size
-    rope_w = head_size if rotary_dim == 0 else rotary_dim  # rotary_dim==0 => full rotary
+    rope_w = (
+        head_size if rotary_dim == 0 else rotary_dim
+    )  # rotary_dim==0 => full rotary
     max_pos = 4096
 
     qkv = torch.randn(
