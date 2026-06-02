@@ -7497,6 +7497,10 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
     uint32_t a_bits               = __builtin_bit_cast(uint32_t, a);
     uint32_t b_bits               = __builtin_bit_cast(uint32_t, b);
     uint32_t result;
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
+    // CDNA path: v_cmp_u_f32 with explicit SGPR dest + v_add3 + v_and_or_b32
     // tmp scratch is read+written; nan_mask is an SGPR pair output of v_cmp_u_f32.
     // We declare them as early-clobber outputs so the compiler doesn't alias them
     // with any input register.
@@ -7522,6 +7526,22 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
           [bias] "v"(ROUND_BIAS),
           [nan] "v"(FP32_NAN),
           [mmsk] "v"(MERGE_MASK));
+#else
+    // Portable path for RDNA and other archs that lack explicit-dest v_cmp
+    // and/or v_add3_u32. Implements the same RNE + NaN logic in C++.
+    auto rne_f32_to_bf16 = [](uint32_t bits) -> uint32_t {
+        // If NaN, return canonical BF16 NaN (0x7fff)
+        if (__builtin_expect((bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0, 0))
+            return 0x7fffu;
+        // Round-to-nearest-even: add bias + lsb of target
+        uint32_t lsb = (bits >> 16) & 1u;
+        uint32_t rounded = bits + 0x7fffu + lsb;
+        return rounded >> 16;
+    };
+    uint32_t lo = rne_f32_to_bf16(a_bits);
+    uint32_t hi = rne_f32_to_bf16(b_bits);
+    result = lo | (hi << 16);
+#endif
     return result;
 }
 

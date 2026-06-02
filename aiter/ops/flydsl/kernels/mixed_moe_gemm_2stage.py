@@ -197,6 +197,7 @@ def compile_mixed_moe_gemm1(
 
     mock_gate_only = gate_mode is GateMode.MOCK_GATE_ONLY
     gate_up_interleave = gate_mode is GateMode.INTERLEAVE
+    gate_only = gate_mode is GateMode.GATE_ONLY
 
     # Padding semantics: model_dim and inter_dim INCLUDE padding.
     #   model_dim = model_dim_true + model_dim_pad   (K direction)
@@ -2701,17 +2702,27 @@ def compile_mixed_moe_gemm1(
             allocator_pong.finalize()
             allocator_ping.finalize()
 
+        inter_dim_pad_total = arith.constant(2 * inter_dim_pad, index=True)
+        tile2_pad = 0
+        if const_expr(not gate_only):
+            tile_k_stage2 = tile_k // 2
+            tile2_pad = (
+                tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
+            ) % tile_k_stage2
+
         inter_in = arith.index_cast(ir.IndexType.get(), i32_inter_in.ir_value())
         tile_n_index = arith.constant(tile_n, index=True)
-        inter_dim_pad_total = arith.constant(2 * inter_dim_pad, index=True)
         if const_expr(mock_gate_only or gate_up_interleave):
-            gx = (inter_in - inter_dim_pad_total + tile_n_index - 1) / tile_n_index
+            gx = (
+                inter_in - inter_dim_pad_total + tile2_pad + tile_n_index - 1
+            ) / tile_n_index
         else:
             gx = (
-                (inter_in - inter_dim_pad_total + 2 * tile_n_index - 1)
+                (inter_in - inter_dim_pad_total + tile2_pad + 2 * tile_n_index - 1)
                 / tile_n_index
                 / arith.constant(2, index=True)
             )
+
         _c_pm_l = arith.constant(persist_m, index=True)
         gy = (
             arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())

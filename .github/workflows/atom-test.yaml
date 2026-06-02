@@ -72,9 +72,20 @@ jobs:
           import json
           import os
 
+          # Always-on PR gate set (every ci:atom / ci:all). Kept small so the
+          # do-mi350x pool isn't overloaded (overload was flaking the Kimi +
+          # perf gates). The InferenceX frontier models (DeepSeek-V4-Pro,
+          # Qwen3.5-397B-A17B-FP8, GLM-5.1-FP8 — all validated PASS on do-mi350x)
+          # are covered on-demand via the ci:atom_full label, which runs every
+          # pr/main model in ATOM models_accuracy.json with the runner pins below.
+          # MiniMax-M2.7 currently fails (needs an ATOM-side HSA_NO_SCRATCH_RECLAIM
+          # env), so it is only exercised under ci:atom_full, never on every PR.
           default_models = [
               {"model_name": "DeepSeek-R1-0528"},
               {"model_name": "gpt-oss-120b"},
+              # Kimi-K2.5 ATOM (in-tree) downstream gate. Config (model_path,
+              # extraArgs -tp4, threshold) is pulled from ATOM models_accuracy.json.
+              {"model_name": "Kimi-K2.5-MXFP4"},
           ]
 
           labels_raw = os.environ.get("LABELS_JSON") or "[]"
@@ -91,9 +102,20 @@ jobs:
               "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
           }
 
+          # Per-model runner pin (overrides the generic mapping above). Kimi-K2.5
+          # runs the downstream gate on the AITER MI350X pool (TP4 -> 4 GPUs).
+          model_runner_overrides = {
+              "Kimi-K2.5-MXFP4": "linux-aiter-do-mi350x-4",
+              "DeepSeek-V4-Pro": "linux-aiter-do-mi350x-8",       # -tp 8
+              "Qwen3.5-397B-A17B-FP8": "linux-aiter-do-mi350x-4",  # -tp 4
+              "MiniMax-M2.7": "linux-aiter-do-mi350x-2",           # -tp 2
+              "GLM-5.1-FP8": "linux-aiter-do-mi350x-8",            # -tp 8
+          }
+
           def prepare_model(model):
               model = dict(model)
               model["runner"] = runner_overrides.get(model["runner"], model["runner"])
+              model["runner"] = model_runner_overrides.get(model["model_name"], model["runner"])
               model["label"] = model.get("runner", "")
               model["accuracy_test_threshold"] = str(model.get("accuracy_threshold", 0))
               model["run_on_pr"] = True
