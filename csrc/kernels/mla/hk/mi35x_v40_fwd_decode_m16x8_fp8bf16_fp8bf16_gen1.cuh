@@ -192,14 +192,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
     const int32_t log2_waves_per_head = log2_num_qheads - 4;           // log2(kTileM) = 4
     const int32_t qpos_off_from_last  = num_wave_group - 1 - (warp_idx >> log2_waves_per_head);
 
-    const uintptr_t out_as_int       = reinterpret_cast<uintptr_t>(params.final_output.raw_ptr);
-    const uint64_t out_as_u64        = static_cast<uint64_t>(out_as_int);
-    const hk::buffer_resource out_br = hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
-    const uintptr_t split_out_as_int = reinterpret_cast<uintptr_t>(params.split_output.raw_ptr);
-    const uint64_t split_out_as_u64  = static_cast<uint64_t>(split_out_as_int);
-    const hk::buffer_resource split_out_br =
-        hk::make_buffer_resource(split_out_as_u64, 0xFFFFFFFF, 0x00020000);
-
     // ---- LDS layout ----
     //
     // p_lds_kv_curr/   : 32 KB each (32 rows * 512 bf16 cols, 2 pongs).
@@ -336,21 +328,31 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
         // Load Q: Q[:, 0:256] -> VGPR pinned at k_q_vgpr_begin (32 vgprs/lane).
         //         Q[:, 256:512] -> bf16 final LDS region inside p_lds_q.
         // Q rope/nope buffers are separate tensors in V4.0.
-        q_manager.template load_q<k_q_vgpr_begin>(
-            params.query, params.query_rope, warp_idx, qo_start, p_lds_q);
+        q_manager.template load_q<k_q_vgpr_begin>(params.p_query,
+                                                  params.p_query_rope,
+                                                  num_qheads,
+                                                  warp_idx,
+                                                  qo_start,
+                                                  p_lds_q);
         __builtin_amdgcn_sched_barrier(0);
 
         // Prologue: prefetch + cvt+store the first KV tile into the curr pong.
         // kCheckBoundary is true when the tile straddles the batch tail.
         if(kv_len < T::kBlockN)
         {
-            kv_manager.template async_load_k<true>(
-                p_lds_kv_curr, warp_idx, params.kv_buffer, params.kv_buffer_rope, row_kv_ld_first);
+            kv_manager.template async_load_k<true>(p_lds_kv_curr,
+                                                   warp_idx,
+                                                   params.p_kv_buffer,
+                                                   params.p_kv_buffer_rope,
+                                                   row_kv_ld_first);
         }
         else
         {
-            kv_manager.template async_load_k<false>(
-                p_lds_kv_curr, warp_idx, params.kv_buffer, params.kv_buffer_rope, row_kv_ld_first);
+            kv_manager.template async_load_k<false>(p_lds_kv_curr,
+                                                    warp_idx,
+                                                    params.p_kv_buffer,
+                                                    params.p_kv_buffer_rope,
+                                                    row_kv_ld_first);
         }
 
         // ---- mla_main lambda (Phase 4g) ----
@@ -474,8 +476,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                     kv_manager.template prefetch_kv_tile<0u, 0u, kCheckBoundaryNext>(
                         p_lds_kv_next,
                         warp_idx,
-                        params.kv_buffer,
-                        params.kv_buffer_rope,
+                        params.p_kv_buffer,
+                        params.p_kv_buffer_rope,
                         row_kv_ld_next,
                         p0);
                 }
@@ -495,8 +497,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                     kv_manager.template prefetch_kv_tile<0u, kTileCols, kCheckBoundaryNext>(
                         p_lds_kv_next,
                         warp_idx,
-                        params.kv_buffer,
-                        params.kv_buffer_rope,
+                        params.p_kv_buffer,
+                        params.p_kv_buffer_rope,
                         row_kv_ld_next,
                         p1);
                 }
@@ -699,8 +701,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                     // Full prefetch + wait + cvt + store via async_load_k.
                     kv_manager.template async_load_k<kCheckBoundaryNext>(p_lds_kv_next,
                                                                          warp_idx,
-                                                                         params.kv_buffer,
-                                                                         params.kv_buffer_rope,
+                                                                         params.p_kv_buffer,
+                                                                         params.p_kv_buffer_rope,
                                                                          row_kv_ld_next);
                 }
                 else
@@ -955,7 +957,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                         constexpr uint32_t kOaccuBase = k_o_begin + iter * 16u;
                         constexpr uint32_t kColOff    = iter * (2u * T::kBlockN);
                         o_manager.template output_to_vram_pair<kOaccuBase, kColOff, true>(
-                            params.final_output.raw_ptr,
+                            params.p_final_output,
                             warp_idx,
                             qo_start,
                             qo_end,
@@ -973,7 +975,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                         constexpr uint32_t kOaccuBase = k_o_begin + iter * 16u;
                         constexpr uint32_t kColOff    = iter * (2u * T::kBlockN);
                         split_o_manager.template output_to_vram_pair<kOaccuBase, kColOff, false>(
-                            params.split_output.raw_ptr,
+                            params.p_split_output,
                             warp_idx,
                             static_cast<uint32_t>(partial_qo_loc),
                             0,
@@ -991,7 +993,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                         const uint32_t row_idx = lane_idx + warp_idx * kMfmaResultRows +
                                                  static_cast<uint32_t>(partial_qo_loc) * num_qheads;
                         const comp_t lse = row_max + __builtin_amdgcn_logf(row_sum_e) * inv_log2e;
-                        params.split_lse.raw_ptr[row_idx] = lse;
+                        params.p_split_lse[row_idx] = lse;
                     }
                 }
             }
@@ -1321,9 +1323,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
             }
         }
 #endif // MLA_SLIM_DISPATCH
-
-        (void)out_br;
-        (void)split_out_br;
     }
 }
 #else
@@ -1378,30 +1377,10 @@ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16(aiter_tensor_t& query,
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
     HkMlaV40DecodeFwdParams<Traits> params = {
-        hk::make_gl<typename Traits::gl_q_nope>(
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(query.data_ptr())),
-            query.size(0),
-            num_qheads / Traits::kTileM,
-            Traits::kTileM,
-            Traits::kQkPackedNopeQElems),
-        hk::make_gl<typename Traits::gl_q_rope>(
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(query_rope.data_ptr())),
-            query_rope.size(0),
-            num_qheads / Traits::kTileM,
-            Traits::kTileM,
-            Traits::kQkRopeHeadDim),
-        hk::make_gl<typename Traits::gl_kv_nope>(
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(kv_buffer.data_ptr())),
-            kv_buffer.size(0),
-            Traits::kPageSize,
-            Traits::kKvNumHead,
-            Traits::kQkPackedNopeKvElems),
-        hk::make_gl<typename Traits::gl_kv_rope>(
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(kv_buffer_rope.data_ptr())),
-            kv_buffer_rope.size(0),
-            Traits::kPageSize,
-            Traits::kKvNumHead,
-            Traits::kQkRopeHeadDim),
+        reinterpret_cast<typename Traits::q_nope_t const*>(query.data_ptr()),
+        reinterpret_cast<typename Traits::q_rope_t const*>(query_rope.data_ptr()),
+        reinterpret_cast<typename Traits::kv_nope_t const*>(kv_buffer.data_ptr()),
+        reinterpret_cast<typename Traits::kv_rope_t const*>(kv_buffer_rope.data_ptr()),
         // kv_indices
         reinterpret_cast<int32_t*>(kv_page_indices.data_ptr()),
         // kv_last_page_lens (only read by kernel when kPageSize > 1)
@@ -1409,24 +1388,10 @@ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16(aiter_tensor_t& query,
         // metadata
         reinterpret_cast<int32_t*>(work_indptr.data_ptr()),
         reinterpret_cast<int32_t*>(work_info_set.data_ptr()),
-        hk::make_gl<typename Traits::gl_o>(
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(final_output.data_ptr())),
-            1,
-            final_output.size(0),
-            Traits::kBlockM,
-            Traits::kVoHeadDim),
-        hk::make_gl<typename Traits::gl_so>(
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(split_output.data_ptr())),
-            1,
-            split_output.size(0),
-            Traits::kBlockM,
-            Traits::kVoHeadDim),
-        hk::make_gl<typename Traits::gl_slse>(
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(split_lse.data_ptr())),
-            1,
-            split_lse.size(0),
-            Traits::kBlockM,
-            1),
+        // outputs
+        reinterpret_cast<typename Traits::out_t*>(final_output.data_ptr()),
+        reinterpret_cast<float*>(split_output.data_ptr()),
+        reinterpret_cast<float*>(split_lse.data_ptr()),
         // parameters
         softmax_scale,
         log2_num_qheads};

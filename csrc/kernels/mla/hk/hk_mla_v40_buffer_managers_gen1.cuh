@@ -263,33 +263,26 @@ class QManager8to16bitsV1
         const uint32_t scale_row   = lane_idx & 15u;
         const uint32_t v_off_scale = scale_row * kPackedNopeStride;
 
-        // `buffer_load_dwordx4 lds:` adds i_offset to BOTH the vmem source AND
-        // the LDS destination. V32-style trick: keep the column stride in the
-        // imm i_offset (so vmem indexing folds it for free, saving a v_off
-        // vgpr add), and pre-subtract kColInRecord from the LDS dst pointer
-        // to cancel its contribution there.
+        // opus' buffer_load_lds builtin hardcodes i_offset = 0, so the V32
+        // trick of folding kColInRecord into i_off (and pre-subtracting it
+        // from the LDS dst) doesn't apply. Route kColInRecord through s_os
+        // instead -- still wave-uniform (no extra v_off vgpr), and the LDS
+        // dst becomes the plain staging-buffer base (no head-pad needed for
+        // this routine, though kLdsHeadPadBytes is kept for API stability).
         //
-        // CRITICAL: the LDS dst pointer must stay >= 0 after this subtraction
-        // on every warp -- for warp 0, staging = p_lds_q + 0, so the kernel
-        // MUST allocate at least kP1MaxColInRecord (192 B) of dummy padding
-        // BEFORE p_lds_q so that `staging - kColInRecord >= 0` even for
-        // chunk 3. Without the pad, m0 wraps mod 2^32 to a huge value, the
-        // wrap-around LDS store lands outside the LDS allocation (silently
-        // dropped or aliased), and chunk 2/3's bytes never reach warp 0's
-        // staging -- the consumer then reads stale chunk-0/1 bytes.
-        const hk::i32x4 srsrc = hk::make_srsrc(p_q_warp, 0xffffffff);
-        hk::llvm_amdgcn_raw_buffer_load_lds(
-            srsrc,
-            (hk::as3_uint32_ptr)(p_lds_warp_staging + kStagingI - kColInRecord),
-            16,
-            v_off,
-            0,
-            kVOffI,
-            0);
+        // opus' make_gmem ext_vector_type rejects __hip_fp8_e4m3; use a
+        // same-width scalar proxy (uint8_t). 16 B per call -> vec=16.
+        auto g_q_nope =
+            opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_warp));
+        void* p_dst = reinterpret_cast<void*>(p_lds_warp_staging + kStagingI);
+        g_q_nope.template async_load<16>(p_dst, v_off, /*s_os=*/kColInRecord);
 
-        const hk::buffer_resource br = hk::make_buffer_resource(
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_q_warp)), 0xffffffff, 0x00020000);
-        s_dw = hkm::buffer_load_ubyte(br, v_off_scale, /*s_off=*/0u, /*i_off=*/kScaleByteInRec);
+        // Scale: 1 byte/lane via opus' load<1, uint8>. Stored as uint32_t so
+        // e8m0_to_f32's `asm volatile` consumer has the v-class operand it
+        // needs. The asm volatile is what anchors cross-BB ordering against
+        // the builtin load -- see [[v40-e8m0-to-f32-asm-required]].
+        s_dw = static_cast<uint32_t>(
+            g_q_nope.template load<1>(v_off_scale, /*s_os=*/kScaleByteInRec)[0]);
     }
 
     // ---- Phase 1: 1 fp8 chunk in staging -> 2 mfma A-tiles in VGPR ----
@@ -372,7 +365,10 @@ class QManager8to16bitsV1
         // Drain lgkmcnt: ds_read fp8 results must be ready before cvt builtin
         // consumes them. Pair with sched_barrier(0) -- the cvt is a pure-SSA
         // intrinsic and is otherwise free to be hoisted past a bare s_waitcnt
-        // (verified by ISA inspection on KvManager8to16bitsV1).
+        // (verified by ISA inspection on KvManager8to16bitsV1). NOTE: LLVM's
+        // SIInsertWaitcnts does NOT auto-insert lgkmcnt for the inline-asm
+        // cvt consumer here -- the asm is opaque and the dependency on the
+        // ds_read result isn't visible. The manual wait is load-bearing.
         __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
         __builtin_amdgcn_sched_barrier(0);
 
@@ -407,21 +403,25 @@ class QManager8to16bitsV1
         constexpr uint32_t kScaleByteBase =
             kScaleBaseOff + kColInRecord / kSubBlockCols; // 456,458,460
 
-        const hk::buffer_resource br = hk::make_buffer_resource(
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_q_warp)), 0xffffffff, 0x00020000);
-
         const uint32_t lane_idx    = opus::lane_id();
         const uint32_t row_in_warp = lane_idx >> 2; // 0..15
         const uint32_t col_group   = lane_idx & 3u; // 0..3
 
         // Bank-conflict swizzle lives on the LDS-write side (see
-        // p2_cvt_store_nope_chunk) to mirror KvManager8to16bitsV1's
-        // cvt_and_store_kv_tile pattern. vmem-load address is straight.
+        // p2_cvt_store_nope_chunk). vmem-load address is straight.
+        // opus has no i_offset; fold kColInRecord / kScaleByteBase into s_os
+        // (still wave-uniform). Use uint8_t element proxy: nope = 16 B/lane
+        // -> vec=16 returning 16-byte vector; bit_cast to hk::u32x4 for the
+        // downstream cvt builtins. Scale = 1 B/lane via load<1>[0].
         const uint32_t v_off_nope  = row_in_warp * kPackedNopeStride + col_group * 16u;
         const uint32_t v_off_scale = row_in_warp * kPackedNopeStride + (col_group >> 1); // +0/+1
 
-        nope_dw  = hkm::buffer_load_dwordx4(br, v_off_nope, /*s_off=*/0u, /*i_off=*/kColInRecord);
-        scale_dw = hkm::buffer_load_ubyte(br, v_off_scale, /*s_off=*/0u, /*i_off=*/kScaleByteBase);
+        auto g_q_nope =
+            opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_warp));
+        auto raw = g_q_nope.template load<16>(v_off_nope, /*s_os=*/kColInRecord);
+        nope_dw  = __builtin_bit_cast(hk::u32x4, raw);
+        scale_dw = static_cast<uint32_t>(
+            g_q_nope.template load<1>(v_off_scale, /*s_os=*/kScaleByteBase)[0]);
     }
 
     template <uint32_t kChunkIdx>
@@ -452,16 +452,12 @@ class QManager8to16bitsV1
         // on a disjoint bit range and still composes.
         const uint32_t byte_in_sb = col_group << 4; // 0/16/32/48
 
-        // Drain vmcnt before cvt: both the dwordx4 fp8 load and the ubyte
-        // scale load (issued in p2_vmem_to_vgpr_nope_chunk) must complete.
-        // Drains EVERY outstanding vmem; with the double-buffer ordering
-        // (prefetch 0+1 -> drain -> process 0+1 -> prefetch 2 -> drain ->
-        // process 2) the second drain is a no-op, and the first drain waits
-        // for chunks 0 and 1 together. (cvt is a pure-SSA intrinsic, free to
-        // be hoisted past a bare s_waitcnt; intrinsic+sched_barrier is the
-        // true scheduling barrier.)
-        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/0));
-        __builtin_amdgcn_sched_barrier(0);
+        // No manual vmcnt drain needed here: nope_dw[] and scale_dw are
+        // produced by opus' builtin loads (SSA), and the cvt builtin below
+        // is also SSA -- LLVM's SIInsertWaitcnts auto-inserts per-consumer
+        // vmcnt waits (vmcnt(3), vmcnt(2), vmcnt(1), vmcnt(0)) so each cvt
+        // only waits for its own source. This is strictly better than a
+        // blanket vmcnt(0) (verified by ISA diff).
 
         const float scale_f = hk_mla::e8m0_to_f32(scale_dw);
 
@@ -591,17 +587,23 @@ class QManager8to16bitsV1
     //                         uses the first 16 KB as per-warp staging, then
     //                         Phase 2 overwrites the whole region.
     template <uint32_t GPR_NOPE_VGPR_START>
-    __device__ __forceinline__ void load_q(const typename T::gl_q_nope& q_buffer_nope,
-                                           const typename T::gl_q_rope& q_buffer_rope,
+    __device__ __forceinline__ void load_q(const q_nope_t* p_q_buffer_nope,
+                                           const q_rope_t* p_q_buffer_rope,
+                                           const int32_t num_qheads,
                                            const int32_t warp_idx,
                                            const int32_t qo_start,
                                            const uintptr_t p_lds_q)
     {
         // Per-warp base pointers in vmem (each warp owns kTileM=16 rows).
+        // Q layout: [total_q, num_qheads, kQkPackedNopeQElems] (the
+        // num_qheads/kTileM x kTileM axes from gl_q_nope collapse to one
+        // contiguous num_qheads axis since adjacent strides are unit).
         const q_nope_t* p_q_warp =
-            &q_buffer_nope[{qo_start, 0, 0, 0}] + warp_idx * T::kTileM * T::kQkPackedNopeQElems;
+            p_q_buffer_nope + qo_start * num_qheads * T::kQkPackedNopeQElems +
+            warp_idx * T::kTileM * T::kQkPackedNopeQElems;
         const q_rope_t* p_q_rope_warp =
-            &q_buffer_rope[{qo_start, 0, 0, 0}] + warp_idx * T::kTileM * T::kQkRopeHeadDim;
+            p_q_buffer_rope + qo_start * num_qheads * T::kQkRopeHeadDim +
+            warp_idx * T::kTileM * T::kQkRopeHeadDim;
 
         const uintptr_t p_lds_warp_staging = p1_warp_staging_base(p_lds_q, warp_idx);
 
@@ -885,8 +887,8 @@ class KvManager8to16bitsV1
     __device__ __forceinline__ static void
     prefetch_kv_tile(const uintptr_t p_lds_kv,
                      const uint32_t warp_idx,
-                     const typename T::gl_kv_nope& kv_buf_nope,
-                     const typename T::gl_kv_rope& kv_buf_rope,
+                     const kv_nope_t* p_kv_buf_nope,
+                     const kv_rope_t* p_kv_buf_rope,
                      const int32_t row_kv_ld,
                      KvTilePrefetch& prefetch_out)
     {
@@ -907,8 +909,8 @@ class KvManager8to16bitsV1
             // ---------------- NoPE prefetch ----------------
             constexpr uint32_t kPackedStride = T::kQkPackedNopeKvElems * sizeof(kv_nope_t); // 576
 
-            const kv_nope_t* p_kv_nope = &kv_buf_nope[{0, 0, 0, 0}];
-            const uint64_t as_u64 = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_kv_nope));
+            const uint64_t as_u64 =
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_kv_buf_nope));
             const hk::buffer_resource br = hk::make_buffer_resource(as_u64, 0xffffffff, 0x00020000);
 
             // Address split (NoPE): row_kv_ld is *per-lane* (each lane covers a
@@ -925,6 +927,11 @@ class KvManager8to16bitsV1
             // Pairs with the matching XOR on load_k_to_gpr/load_transposed_v_to_gpr
             // readers, and lets cvt_and_store_kv_tile keep the LDS dst address
             // straight -- same pattern QManager8to16bitsV1 ships.
+            //
+            // NOTE: kept on HK (hkm::buffer_load_dwordx4 + buffer_load_ubyte).
+            // Opus migration measured +18% regression at b=33 c=63333 -- the
+            // i_offset is load-bearing on this hot path; folding it into s_os
+            // costs an SGPR add per iter and stretches the prefetch chain.
             const uint32_t col_group_swz = col_group ^ (((lane_idx >> 4) & 1u) << 1);
             const uint32_t v_off_nope =
                 in_bounds ? (static_cast<uint32_t>(row_kv_ld) * kPackedStride + col_group_swz * 16u)
@@ -992,49 +999,40 @@ class KvManager8to16bitsV1
 
             if(in_bounds)
             {
-                const kv_rope_t* p_kv_rope = &kv_buf_rope[{0, 0, 0, 0}];
-                const hk::i32x4 srsrc      = hk::make_srsrc(p_kv_rope, 0xffffffff);
-
-                // Per-lane vmem voffset for the lo half (sub-block 14, RoPE
-                // cols 0..31). row_kv_ld already encodes the lane's row
-                // (row_tile*16 + lane>>2); col_group=lane&3 picks the 16 B
-                // (= 8 bf16) slice within the 32-bf16 lo half.
+                // RoPE branch via opus::gmem.async_load. opus's async_load
+                // builtin hardcodes i_offset=0, so the +16-byte delta we used
+                // to fold into i_off has to live in v_os now (one extra lane
+                // computation; trivial on the RoPE path which only fires on
+                // waves 5,7).
                 //
                 // Bank-conflict swizzle (vmem-load-side, matches the LDS-dst
                 // XOR-by-32 the NoPE writer applies for sub-tile-rows 1,3 of
                 // each 16-row sub-block). buffer_load_lds places lane t at
                 // LDS byte t*16 = (row_in_sb*64 + col_group*16), so the LDS
-                // dst is HW-fixed -- we instead permute the vmem source so
-                // the *data* landing at LDS (row, col_group) for swizzled
-                // rows is what would logically belong at (row, col_group ^ 2).
-                // row_in_sb = lane_idx>>2; sub-tile-row bit = (lane_idx>>4)&1.
+                // dst is HW-fixed -- we permute the vmem source instead.
+                //
+                // Sub-tile-of-8 perm [0,2,4,6,1,3,5,7] (vmem-src side).
+                // Each LDS sub-tile k holds data sub-tile perm^{-1}(k):
+                // lo (sb=14, q) <- data cols 16q..+7; hi (sb=15, q) <- data
+                // cols 16q+8..+15. Base v_off_lo = row*64 + col_quad_swz*16
+                // bf16 elements; hi adds +8 bf16 (= +16 bytes).
                 const uint32_t col_group_swz = col_group ^ (((lane_idx >> 4) & 1u) << 1);
+                const uint32_t v_off_lo_elems =
+                    static_cast<uint32_t>(row_kv_ld) * (kRopeStride / sizeof(hk::bf16)) +
+                    col_group_swz * (32u / sizeof(hk::bf16));
 
-                // Sub-tile-of-8 perm [0,2,4,6,1,3,5,7] (vmem-src side; LDS dst
-                // is HW-fixed). Mirror of QM p2_load_rope_chunk: each LDS
-                // sub-tile k holds data sub-tile perm^{-1}(k), so (sb=0, q)
-                // <- data cols 16q..+7 and (sb=1, q) <- data cols 16q+8..+15.
-                // Base v_off = row*kRopeStride + col_group*32 B; hi adds +16.
-                // Overlap the +16 with the LDS advance to kRopeColTileHi by
-                // pre-subtracting 16 from p_dst_hi_adj and using i_off=16.
-                const uint32_t v_off_lo =
-                    static_cast<uint32_t>(row_kv_ld) * kRopeStride + col_group_swz * 32u;
-
-                const uintptr_t p_dst_lo =
-                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileLo) + lane_idx * 16u;
-                const uintptr_t p_dst_hi_adj = p_lds_kv +
-                                               sub_block_byte_offset(row_tile, kRopeColTileHi) +
-                                               lane_idx * 16u - 16u;
-
-                hk::llvm_amdgcn_raw_buffer_load_lds(
-                    srsrc, (hk::as3_uint32_ptr)(p_dst_lo), 16, v_off_lo, 0, 0, 0);
-                hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                                    (hk::as3_uint32_ptr)(p_dst_hi_adj),
-                                                    16,
-                                                    v_off_lo,
-                                                    0,
-                                                    /*i_off=*/16,
-                                                    0);
+                // Use uint16_t as a 2-byte proxy for bf16: opus' vector_type
+                // ext_vector_type rejects __hip_bfloat16 on gfx950. Same
+                // element width -> identical addressing.
+                auto g_rope =
+                    opus::make_gmem<uint16_t>(reinterpret_cast<const uint16_t*>(p_kv_buf_rope));
+                void* p_dst_lo = reinterpret_cast<void*>(
+                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileLo) + lane_idx * 16u);
+                void* p_dst_hi = reinterpret_cast<void*>(
+                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileHi) + lane_idx * 16u);
+                // 16 B per call = 8 elems of uint16_t.
+                g_rope.template async_load<8>(p_dst_lo, v_off_lo_elems);
+                g_rope.template async_load<8>(p_dst_hi, v_off_lo_elems + 8u);
             }
             else
             {
@@ -1168,15 +1166,15 @@ class KvManager8to16bitsV1
     template <bool kCheckBoundary>
     __device__ __forceinline__ static void async_load_k(const uintptr_t p_lds_kv,
                                                         const uint32_t warp_idx,
-                                                        const typename T::gl_kv_nope& kv_buf_nope,
-                                                        const typename T::gl_kv_rope& kv_buf_rope,
+                                                        const kv_nope_t* p_kv_buf_nope,
+                                                        const kv_rope_t* p_kv_buf_rope,
                                                         const int32_t row_kv_ld)
     {
         KvTilePrefetch p0, p1;
         prefetch_kv_tile<0u, 0u, kCheckBoundary>(
-            p_lds_kv, warp_idx, kv_buf_nope, kv_buf_rope, row_kv_ld, p0);
+            p_lds_kv, warp_idx, p_kv_buf_nope, p_kv_buf_rope, row_kv_ld, p0);
         prefetch_kv_tile<0u, kTileCols, kCheckBoundary>(
-            p_lds_kv, warp_idx, kv_buf_nope, kv_buf_rope, row_kv_ld, p1);
+            p_lds_kv, warp_idx, p_kv_buf_nope, p_kv_buf_rope, row_kv_ld, p1);
 
         // Full-pong cvt+store, expressed via split steps (no interleave
         // here -- the wrapper is for prologue / cold callers).
