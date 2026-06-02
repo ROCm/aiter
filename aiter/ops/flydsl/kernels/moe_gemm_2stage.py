@@ -394,7 +394,7 @@ def compile_moe_gemm1(
             scale_dtype = T.bf16 if _scale_is_bf16 else T.f32
             vec16_elems = 16 if elem_bytes == 1 else 8
             vec8_elems = 8 if elem_bytes == 1 else 4
-            vec8_x = T.vec(vec8_elems, x_elem)
+            vec8_x = T.vec(vec8_elems, x_elem)  # noqa: F841
             vec16_x = T.vec(vec16_elems, x_elem)
 
             def silu(x):
@@ -2225,7 +2225,7 @@ def compile_moe_gemm2(
             scale_dtype = T.bf16 if _scale_is_bf16 else T.f32
             vec16_elems = 16 if elem_bytes == 1 else 8
             vec8_elems = 8 if elem_bytes == 1 else 4
-            vec8_x = T.vec(vec8_elems, x_elem)
+            vec8_x = T.vec(vec8_elems, x_elem)  # noqa: F841
             vec16_x = T.vec(vec16_elems, x_elem)
 
             acc_init = (
@@ -3326,7 +3326,7 @@ def compile_moe_gemm2(
                             v_out = v.truncf(out_elem())
 
                             lds_idx = row_base_lds + col_local
-                            vec1_out = T.vec(1, out_elem())
+                            vec1_out = T.vec(1, out_elem())  # noqa: F841
                             v1 = Vec.from_elements([v_out]).ir_value()
                             Vec(v1).store(lds_out, [lds_idx], alignment=2)
 

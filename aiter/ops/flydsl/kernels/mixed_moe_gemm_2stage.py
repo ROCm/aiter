@@ -139,7 +139,7 @@ def build_mixed_moe_gemm1_kernel(
 
     is_f8_a = a_dtype == "fp8"
     is_f4_a = a_dtype == "fp4"
-    is_f4_b = True
+    is_f4_b = True  # noqa: F841
 
     sort_block_m = max(32, tile_m)
     num_waves = min(4, tile_n // 32)
@@ -434,12 +434,12 @@ def build_mixed_moe_gemm1_kernel(
 
         x_elem = T.f8
         f32 = T.f32
-        i32 = T.i32
+        i32 = T.i32  # noqa: F841
         i64 = T.i64
         vec4_f32 = T.vec(4, f32)
         vec16_elems = 16 if a_elem_bytes == 1 else 8
         vec16_x = T.vec(vec16_elems, x_elem)
-        vec2_i64 = T.vec(2, i64)
+        vec2_i64 = T.vec(2, i64)  # noqa: F841
 
         def _ptr_buffer_resource(ptr, num_records_bytes):
             addr = fx.ptrtoint(ptr)
@@ -1140,8 +1140,8 @@ def build_mixed_moe_gemm1_kernel(
                     epilogue_pf = (None, tw_pf, bias_pf)
 
                 c0_i64 = fx.Int64(0)
-                vec4_i64 = T.vec(4, T.i64)
-                vec8_i32 = T.vec(8, T.i32)
+                vec4_i64 = T.vec(4, T.i64)  # noqa: F841
+                vec8_i32 = T.vec(8, T.i32)  # noqa: F841
 
                 def pack_i64x4_to_i32x8(x0, x1, x2, x3):
                     v4 = Vec.from_elements([x0, x1, x2, x3], fx.Int64)
@@ -1269,8 +1269,8 @@ def build_mixed_moe_gemm1_kernel(
                 a_scale_vals: list of A scale scalars indexed by mi_packed.
                 """
                 c0_i64 = fx.Int64(0)
-                vec4_i64 = T.vec(4, T.i64)
-                vec8_i32 = T.vec(8, T.i32)
+                vec4_i64 = T.vec(4, T.i64)  # noqa: F841
+                vec8_i32 = T.vec(8, T.i32)  # noqa: F841
 
                 def _pack(x0, x1, x2, x3):
                     v4 = Vec.from_elements([x0, x1, x2, x3], fx.Int64)
@@ -1854,13 +1854,13 @@ def build_mixed_moe_gemm1_kernel(
                         v = v * tw
                     if const_expr(_need_quant):
                         lds_idx = row_base_lds + col_local
-                        vec1_f32 = T.vec(1, f32)
+                        vec1_f32 = T.vec(1, f32)  # noqa: F841
                         v1 = Vec.from_elements([v], fx.Float32)
                         Vec(v1).store(lds_out, [lds_idx], alignment=4)
                     else:
                         v_out = v.truncf(out_elem())
                         lds_idx = row_base_lds + col_local
-                        vec1_out = T.vec(1, out_elem())
+                        vec1_out = T.vec(1, out_elem())  # noqa: F841
                         v1 = Vec.from_elements([v_out])
                         Vec(v1).store(lds_out, [lds_idx], alignment=2)
 
@@ -2311,7 +2311,7 @@ def build_mixed_moe_gemm2_kernel(
 
     is_f8_a = a_dtype == "fp8"
     is_f4_a = a_dtype == "fp4"
-    is_f4_b = True
+    is_f4_b = True  # noqa: F841
 
     _scale_pack_m = 2  # physical mn_pack in preshuffle microscale layout
     _scale_pack_n = 2
@@ -2488,15 +2488,15 @@ def build_mixed_moe_gemm2_kernel(
         size_expert_ids_in = fx.Index(i32_size_expert_ids_in.ir_value())
         x_elem = T.f8
         f32 = T.f32
-        i32 = T.i32
+        i32 = T.i32  # noqa: F841
         i64 = T.i64
         vec4_f32 = T.vec(4, f32)
-        vec4_i32 = T.vec(4, i32)
+        vec4_i32 = T.vec(4, i32)  # noqa: F841
         vec16_elems = 16 if a_elem_bytes == 1 else 8
         vec8_elems = 8 if a_elem_bytes == 1 else 4
         vec4_elems = 4 if a_elem_bytes == 1 else 2
         vec16_x = T.vec(vec16_elems, x_elem)
-        vec2_i64 = T.vec(2, i64)
+        vec2_i64 = T.vec(2, i64)  # noqa: F841
 
         def _ptr_buffer_resource(ptr, num_records_bytes):
             addr = fx.ptrtoint(ptr)
@@ -2596,7 +2596,7 @@ def build_mixed_moe_gemm2_kernel(
         if const_expr(not bool(accumulate)):
             out_nbytes_idx = tokens_in * topk * n_in * out_elem_bytes
         out_nbytes_i32 = fx.Int32(out_nbytes_idx)
-        out_rsrc = _ptr_buffer_resource(arg_out, out_nbytes_i32)
+        out_rsrc = _ptr_buffer_resource(arg_out, out_nbytes_i32)  # noqa: F841
 
         # num_valid_ids (sorted padded MN) for scale sizing / guards.
         numids_rsrc = _ptr_buffer_resource(arg_num_valid_ids, fx.Int32(4))
@@ -2966,8 +2966,8 @@ def build_mixed_moe_gemm2_kernel(
                     ),
                 ]
 
-            vec8_x = T.vec(vec8_elems, x_elem)
-            vec4_x_lds = T.vec(vec4_elems, x_elem)
+            vec8_x = T.vec(vec8_elems, x_elem)  # noqa: F841
+            vec4_x_lds = T.vec(vec4_elems, x_elem)  # noqa: F841
 
             # --- A LDS load helper for K64 (load 16B once, extract 2x i64 halves) ---
             def lds_load_packs_k64(curr_row_a_lds, col_base, lds_buffer):
@@ -3035,8 +3035,8 @@ def build_mixed_moe_gemm2_kernel(
                     epilogue_pf = (None, tw_pf, bias)
 
                 c0_i64 = fx.Int64(0)
-                vec4_i64 = T.vec(4, T.i64)
-                vec8_i32 = T.vec(8, T.i32)
+                vec4_i64 = T.vec(4, T.i64)  # noqa: F841
+                vec8_i32 = T.vec(8, T.i32)  # noqa: F841
 
                 def pack_i64x4_to_i32x8(x0, x1, x2, x3):
                     v4 = Vec.from_elements([x0, x1, x2, x3], fx.Int64)
@@ -3489,7 +3489,7 @@ def build_mixed_moe_gemm2_kernel(
                     v_out = v.truncf(out_elem())
 
                     lds_idx = row_base_lds + col_local
-                    vec1_out = T.vec(1, out_elem())
+                    vec1_out = T.vec(1, out_elem())  # noqa: F841
                     v1 = Vec.from_elements([v_out])
 
                     Vec(v1).store(lds_out, [lds_idx], alignment=2)
