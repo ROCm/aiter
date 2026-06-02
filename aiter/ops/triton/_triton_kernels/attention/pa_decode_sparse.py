@@ -118,9 +118,12 @@ def _pa_decode_sparse(
         mask=h_mask[:, None] & d_mask[None, :],
         other=0.0,
     )
-    # Fold softmax_scale into q once (mirrors the gluon port) so the per-tile
-    # QK dot drops its trailing `* softmax_scale`.
-    q = (q.to(tl.float32) * softmax_scale).to(q_ptr.dtype.element_ty)
+    # Fold softmax_scale AND log2(e) into q once, so the QK dot lands scores in
+    # the base-2 domain and the per-element softmax can use the bare exp2 HW
+    # instruction (v_exp_f32) instead of natural exp (which adds a *log2(e) fmac
+    # in front of every exp). Mirrors ATOM's qk_scale = softmax_scale * LOG2E.
+    LOG2E = 1.4426950408889634
+    q = (q.to(tl.float32) * (softmax_scale * LOG2E)).to(q_ptr.dtype.element_ty)
 
     kv_start = tl.load(kv_indptr_ptr + t)
     kv_end = tl.load(kv_indptr_ptr + t + 1)
@@ -138,12 +141,16 @@ def _pa_decode_sparse(
 
     if KV_SPLITS == 1:
         # Fold sink as initial running max so it participates in the softmax
-        # denom; sink contributes 0 to acc (virtual K with weight 1).
-        sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(
-            tl.float32
+        # denom; sink contributes 0 to acc (virtual K with weight 1). Scores
+        # live in the base-2 domain, so lift the sink there too (* LOG2E).
+        sink = (
+            tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(
+                tl.float32
+            )
+            * LOG2E
         )
         m_i = sink
-        l_i = tl.exp(sink - m_i)
+        l_i = tl.exp2(sink - m_i)
     else:
         m_i = tl.full((BLOCK_H,), float("-inf"), dtype=tl.float32)
         l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
@@ -178,8 +185,8 @@ def _pa_decode_sparse(
         # m_new == -inf, so exp(m_i - m_new) = exp(-inf + inf) = NaN. With
         # l_i/acc still 0 that NaN survives as 0*NaN = NaN and poisons the
         # split's partials (and the reduce). Treat such a tile as a no-op.
-        alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp(m_i - m_new))
-        p = tl.exp(scores - m_new[:, None])
+        alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp2(m_i - m_new))
+        p = tl.exp2(scores - m_new[:, None])
         p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
@@ -316,24 +323,29 @@ def _pa_decode_sparse_reduce(
         other=0.0,
     )  # [KV_SPLITS, BLOCK_H, BLOCK_D]
 
+    # The split kernel emits m partials in the base-2 domain (scores were scaled
+    # by softmax_scale * log2(e)), so combine with exp2 and lift the sink there.
+    LOG2E = 1.4426950408889634
+
     # Pre-sink combine across splits.
     m_max = tl.max(m_p, axis=0)  # [BLOCK_H]
     # Empty/stale splits carry m_p == -inf. Force their weight to 0 rather than
-    # evaluating exp(m_p - m_max): when a token has *no* valid key at all,
-    # m_max is also -inf and exp(-inf + inf) = NaN would corrupt the output.
+    # evaluating exp2(m_p - m_max): when a token has *no* valid key at all,
+    # m_max is also -inf and exp2(-inf + inf) = NaN would corrupt the output.
     alpha_split = tl.where(
-        m_p == float("-inf"), 0.0, tl.exp(m_p - m_max[None, :])
+        m_p == float("-inf"), 0.0, tl.exp2(m_p - m_max[None, :])
     )  # [KV_SPLITS, BLOCK_H]
     l_combined = tl.sum(l_p * alpha_split, axis=0)  # [BLOCK_H]
     acc_combined = tl.sum(a_p * alpha_split[:, :, None], axis=0)  # [BLOCK_H, BLOCK_D]
 
-    # Fold attn_sink as a virtual K of weight 1.
-    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(
-        tl.float32
+    # Fold attn_sink as a virtual K of weight 1 (lifted into the base-2 domain).
+    sink = (
+        tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(tl.float32)
+        * LOG2E
     )
     m_final = tl.maximum(m_max, sink)
-    alpha_kv = tl.exp(m_max - m_final)
-    alpha_sink = tl.exp(sink - m_final)
+    alpha_kv = tl.exp2(m_max - m_final)
+    alpha_sink = tl.exp2(sink - m_final)
     l_final = l_combined * alpha_kv + alpha_sink
     acc_final = acc_combined * alpha_kv[:, None]
 

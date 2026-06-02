@@ -102,10 +102,11 @@ def pa_decode_sparse(
     # arches use the synchronous slot path, where 32 exposes memory latency.
     if DEVICE_ARCH == "gfx1250":
         block_k = 32
+        attn_num_warps = 2
     else:
         block_k = 16 if D >= 256 else 32
+        attn_num_warps = 4
     num_stages = 2
-    attn_num_warps = 2
     waves_per_eu = 0
     reduce_num_warps = 4
 
