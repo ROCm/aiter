@@ -608,29 +608,39 @@ def sparse_mla_bwd(q, kv, o, do, topk_indices, lse, kv_lora_rank=512, scale=None
         # bf16 dKV intermediate — overwritten each pass
         interm = torch.empty(total_tokens, R_CHUNK, d_qk, dtype=torch.bfloat16, device=q.device)
 
+        # Pad topk_indices to a multiple of R_CHUNK so the dQ kernel never reads
+        # past the end of the row. The dQ kernel reads R_CHUNK indices starting
+        # at R_START; padding cells (-1) are filtered by topk_pos != -1 mask.
+        # (Without this, configs where TOPK % R_CHUNK != 0 hit OOB on the last
+        # chunk — e.g. V4 CSA Flash TOPK=640: last chunk reads up to 767.)
+        topk_padded_len = ((topk + R_CHUNK - 1) // R_CHUNK) * R_CHUNK
+        if topk_padded_len != topk:
+            pad = torch.full(
+                (total_tokens, topk_padded_len - topk),
+                -1, dtype=torch.int32, device=q.device,
+            )
+            topk_indices_padded = torch.cat([topk_indices, pad], dim=1).contiguous()
+        else:
+            topk_indices_padded = topk_indices
+
         # Precompute all CSR arrays
         all_csr = []
         for r_start in range(0, topk, R_CHUNK):
-            r_end = min(r_start + R_CHUNK, topk)
-            topk_slice = topk_indices[:, r_start:r_end]
-            if r_end - r_start < R_CHUNK:
-                pad = torch.full(
-                    (total_tokens, R_CHUNK - (r_end - r_start)),
-                    -1, dtype=torch.int32, device=q.device,
-                )
-                topk_slice = torch.cat([topk_slice, pad], dim=1)
+            topk_slice = topk_indices_padded[:, r_start:r_start + R_CHUNK]
             all_csr.append(_build_inverted_topk_slice(topk_slice, r_start, R_CHUNK))
 
         for chunk_idx, r_start in enumerate(range(0, topk, R_CHUNK)):
             is_first = (r_start == 0)
 
             # Kernel 1: dQ accumulation + store chunk dS/P [T, H, R_CHUNK]
+            # Use padded topk_indices so kernel can safely read R_CHUNK entries
+            # starting at any R_START.
             _bwd_chunk_dq_store_ds[(total_tokens, num_hg)](
-                q, kv, do, topk_indices, lse, delta, dq, chunk_dS, chunk_P,
+                q, kv, do, topk_indices_padded, lse, delta, dq, chunk_dS, chunk_P,
                 q.stride(0), q.stride(1), kv.stride(0),
                 do.stride(0), do.stride(1),
                 dq.stride(0), dq.stride(1),
-                topk_indices.stride(0),
+                topk_indices_padded.stride(0),
                 chunk_dS.stride(0), chunk_dS.stride(1),
                 scale, num_heads,
                 R_START=r_start,
@@ -641,10 +651,10 @@ def sparse_mla_bwd(q, kv, o, do, topk_indices, lse, kv_lora_rank=512, scale=None
             )
 
             # Kernel 2: dKV intermediate using stored chunk dS/P (reuses gather kernel)
-            # TOPK=R_CHUNK: kernel iterates 0..R_CHUNK-1 ranks of chunk_dS/P and topk_indices[:,r_start:]
+            # TOPK=R_CHUNK: kernel iterates 0..R_CHUNK-1 ranks of chunk_dS/P
             _bwd_compute_dkv_intermediate[(total_tokens,)](
                 q_t, do_t, chunk_dS, chunk_P,
-                topk_indices[:, r_start:r_start + R_CHUNK].contiguous(),
+                topk_indices_padded[:, r_start:r_start + R_CHUNK].contiguous(),
                 interm,
                 q_t.stride(0), do_t.stride(0),
                 chunk_dS.stride(0), chunk_dS.stride(1),
