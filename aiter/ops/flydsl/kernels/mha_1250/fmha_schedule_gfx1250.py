@@ -1,5 +1,5 @@
 """
-Per-WMMA fine-grained schedule table for FMHA on gfx1250.
+Per-WMMA fine-grained schedule table for d128 FMHA on gfx1250.
 
 160-row table (96 GEMM1 + 64 GEMM2 WMMAs) where each row is a flat list of
 instruction tokens emitted in order between consecutive WMMAs.

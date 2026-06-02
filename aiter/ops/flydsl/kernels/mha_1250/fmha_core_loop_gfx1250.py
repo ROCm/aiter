@@ -1,14 +1,14 @@
-"""BF16 FMHA Forward Core Loop — GEMM1 (QK) Only — gfx1250 FlyDSL.
+"""D128 BF16 FMHA Forward Core Loop — GEMM1 (QK) Only — gfx1250 FlyDSL.
 
-Core loop stages 0-3 (GEMM1/QK) + cl_su_V3 interleaving.
-Target: align with BF16_FMHA_FWD_1TG_4W_32mx4_256nx1_cas_brd_rxy.s L1701-~2400.
+Translates SP3 core_loop stages 0-3 (GEMM1/QK) + cl_su_V3 interleaving.
+Target: align with BF16_FMHA_FWD_D128_1TG_4W_32mx4_256nx1_cas_brd_rxy.s L1701-~2400.
 
 GEMM2 (PV) stages 4-7 are handled by a separate agent.
 
 Architecture:
   1. Atomic primitives: one instruction per function (no per-atom barriers)
   2. Schedule builders: compile-time lists of WMMA / LDS / softmax ops
-  3. cl_su_V3 interleaving engine: dispatches ops following slot tables
+  3. cl_su_V3 interleaving engine: dispatches ops following SP3 slot tables
   4. core_loop: stages 0-3 (QK) + mask placeholder
 
 Target: gfx1250, wave32, 4 waves (1TG), 1024 shared VGPRs (256 per bank).
@@ -27,7 +27,6 @@ _EXP_BASE = 19  # token base for EXP_Mx (19..22 → MSB 0..3, draws from pair_ex
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as _mlir_arith
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import vector as vector_dialect
@@ -37,7 +36,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.primitive import const_expr, range_constexpr
 
 # ============================================================================
-# Constants
+# Constants (from SP3)
 # ============================================================================
 
 WAVE_SIZE = 32
@@ -148,7 +147,7 @@ GEMM1_VALU_PER_PHASE = 3
 
 N_SP_PAIRS = VPS_MSB_SP // 2  # 16 v2f32 pairs per MSB (compact, no -inf padding)
 
-# GEMM2 PV constants (adapted for SU_K_N=32)
+# GEMM2 PV constants (SP3 L1942-1944, adapted for SU_K_N=32)
 GEMM2 = 1   # PV
 N_V_MSB = 2                     # v_msb = d_msb % 2, only 2 V banks needed
 N_PV_WMMA_N = 4                 # D_MSB_N / WMMA_N = 64 / 16
@@ -198,7 +197,7 @@ def _sched_barrier(mask=0):
 # VGPR Bank Hint
 # ============================================================================
 
-_USE_BANK_HINTS = True
+_USE_BANK_HINTS = False
 
 # Starting physical-register offset (within each bank) reserved for sp_pairs.
 # sp_pairs[i] (v2f32) lands at HWIdx = bank*256 + SP_PAIR_BASE + i*2.
@@ -219,7 +218,6 @@ LOG2E_PAIR_OFFSET = 206
 def set_vgpr_bank(raw_val, bank: int):
     if const_expr(not _USE_BANK_HINTS):
         return raw_val
-    return raw_val
     val_type = raw_val.type
     bank_val = _raw(arith.constant(bank, type=T.i32))
     return llvm_dialect.call_intrinsic(
@@ -231,7 +229,6 @@ def set_vgpr_bank_offset(raw_val, bank: int, offset: int):
     """Pin raw_val to HWIdx = bank*256+offset (single-candidate BankOffsetHint)."""
     if const_expr(not _USE_BANK_HINTS):
         return raw_val
-    return raw_val
     val_type = raw_val.type
     bank_val   = _raw(arith.constant(bank,   type=T.i32))
     offset_val = _raw(arith.constant(offset, type=T.i32))
@@ -491,7 +488,8 @@ def _atom_exp_f32(src, bank):
 def _atom_mul_f32(src0, src1, bank):
 
     _sched_barrier(0)
-    result = arith.mulf(src0, src1)
+    from flydsl._mlir.dialects import arith as arith_dialect
+    result = arith_dialect.mulf(src0, src1)
     banked = set_vgpr_bank(result, bank)
     _sched_barrier(0)
 
@@ -532,7 +530,8 @@ def _atom_mov_b32(src, bank):
 def _atom_add_f32(src0, src1, bank):
 
     _sched_barrier(0)
-    r = arith.addf(src0, src1)
+    from flydsl._mlir.dialects import arith as arith_dialect
+    r = arith_dialect.addf(src0, src1)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
 
@@ -595,7 +594,8 @@ def _atom_pk_add_f32(a, b, bank):
 
     """v_pk_add_f32 via arith.addf on v2f32."""
     _sched_barrier(0)
-    r = arith.addf(a, b)
+    from flydsl._mlir.dialects import arith as arith_dialect
+    r = arith_dialect.addf(a, b)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
 
@@ -606,7 +606,8 @@ def _atom_pk_mul_f32(a, b, bank):
 
     """v_pk_mul_f32 via arith.mulf on v2f32."""
     _sched_barrier(0)
-    r = arith.mulf(a, b)
+    from flydsl._mlir.dialects import arith as arith_dialect
+    r = arith_dialect.mulf(a, b)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
 
@@ -617,7 +618,9 @@ def _atom_cvt_pk_bf16_f32(a, bank):
 
     """v_cvt_pk_bf16_f32 via arith.truncf v2f32 → v2bf16."""
     _sched_barrier(0)
-    r = arith.trunc_f(T.vec(2, T.bf16), a)
+    from flydsl._mlir.dialects import arith as arith_dialect
+    v2bf16_ty = ir.VectorType.get([2], ir.BF16Type.get())
+    r = arith_dialect.truncf(v2bf16_ty, a)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
 
@@ -758,7 +761,7 @@ def _build_lds_k_schedule(blk, su):
 def _build_lds_v_schedule(blk, su):
     """Build 16 LDS load descriptors for V data (ds_load_tr16_b128).
 
-    Reference uses 2 MSBs × 8 loads each (VPS_MSB_KV=32).  FlyDSL uses 4 MSBs × 4
+    SP3 uses 2 MSBs × 8 loads each (VPS_MSB_KV=32).  FlyDSL uses 4 MSBs × 4
     loads each (VPS_MSB_KV=16).  MSBs 0,2 map to V-bank 0 (D cols 0-63) and
     MSBs 1,3 map to V-bank 1 (D cols 64-127).  Within each bank, MSBs 0/1
     cover the first 32 columns and MSBs 2/3 cover the second 32 columns via
@@ -783,7 +786,7 @@ def _build_lds_v_schedule(blk, su):
 
 
 # ============================================================================
-# Slot Scheduling Tables
+# Slot Scheduling Tables (from SP3 L3573-3707)
 # ============================================================================
 
 def _get_lds_slots(stage, gemm_idx, cycle23,
@@ -846,7 +849,7 @@ def _build_softmax_part2_ops(ty, msb, blk, sp_pairs, ss, sgpr,
     ops = []
     bank = msb
 
-    # --- Setup phase (8 ops) ---
+    # --- Setup phase (8 ops, SP3 L2354-2414) ---
     # exp_delta is at op[2] — included in GEMM2 first half (< PART2_SPLIT=32).
     # This is required: partial_ed_out carries exp_delta as iter_arg for the next
     # tile's O-rescale. 4 exp_delta total (1/MSB) are unavoidable pipeline overhead.
@@ -1186,7 +1189,7 @@ def _build_softmax_part0_ops(ty, msb, sp_pairs, ss, sgpr):
 def _build_softmax_part1_ops(ty, ss, sgpr):
     """Build 8 PART1 closures for cross-MSB merge + delta.
 
-    Cross-MSB merge + delta:
+    SP3 fmha_softmax_pure_issue_rlts PART1 (L2280-2339):
       2 max3 (pair merge, old_max 3rd arg forces VOP3) + 2 mov + 4 fma
 
     Returns (ops_list, per_msb_assignment):
@@ -1229,7 +1232,7 @@ def _build_softmax_part1_ops(ty, ss, sgpr):
     msb_assign.append(3)
 
     # fma delta[msb] = preMaxLog2eScl[msb] - local_max[msb] * log2e_scl
-    # order: [0, 2, 1, 3]
+    # SP3 order: [0, 2, 1, 3]
     for msb in [0, 2, 1, 3]:
         def op_fma_delta(b=msb):
             ss['delta'][b] = _atom_fma_f32_neg_src0(
@@ -1411,7 +1414,7 @@ def _emit_lds_load(ty, lds_op, kv_lds_addrs, kv_tiles_out):
         tile = _atom_ds_load_b128(ty, addr, offset, msb)
     else:
         half_p = lds_op['half_p']
-        # kv_lds_addrs[4 + msb*2 + half_p] — both dh0 and dh1 for
+        # SP3 style: kv_lds_addrs[4 + msb*2 + half_p] — both dh0 and dh1 for
         # this MSB are in bank=msb, so dst/addr/addr are all same bank →
         # s_set_vgpr_msb stays constant within each MSB's load group.
         addr = kv_lds_addrs[NUM_MSB + msb * 2 + (1 if half_p else 0)]
@@ -1671,7 +1674,8 @@ def _cl_su_v3_stage_gemm2(
         _ed_v8 = _o_rescale_ed_v8[d_msb]
         if _ed_v8 is None:
             return
-        o_tiles[d_msb][n] = arith.mulf(o_tiles[d_msb][n], _ed_v8)
+        from flydsl._mlir.dialects import arith as _o_arith
+        o_tiles[d_msb][n] = _o_arith.mulf(o_tiles[d_msb][n], _ed_v8)
 
     if const_expr(stage == 0):
         _sched_barrier(0)
@@ -1897,7 +1901,7 @@ def _load_v_two_sus_from_lds(ty, kv_lds_addrs, blk, su0, su1):
     grouped by MSB (all MSB-0 loads first, then MSB-1, …, then MSB-3),
     followed by a single s_wait_dscnt.
 
-    Within each MSB group every load uses the same address
+    SP3 insight: within each MSB group every load uses the same address
     bank (= bank_msb) and the same dst bank (= bank_msb), so
     s_set_vgpr_msb only changes at the three MSB-group boundaries →
     4 MSB contexts total instead of 8 with two back-to-back single-SU calls.
@@ -2039,7 +2043,7 @@ def _softmax_pure(ty, blk, sp_pairs_all, softmax_state, sgpr_state):
 
 
 def _softmax_part01_only(ty, blk, sp_pairs_all, softmax_state, sgpr_state):
-    """Run PART0 + PART1 only (no PART2). Matches init stages 0..3 core work.
+    """Run PART0 + PART1 only (no PART2). Matches SP3 init stages 0..3 core work.
 
     After this call:
       - softmax_state['local_max'][msb] = max of sp_pairs for each MSB
@@ -2149,7 +2153,7 @@ def _softmax_part2_only(ty, blk, sp_pairs_all, softmax_state, sgpr_state,
                         skip_rescale_sum=False):
     """Run PART2 only (run_ids 5-8): rescale, exp, sum, cvt → p_bf16.
 
-    Matches post_process softmax stages 4..7 (is_first=0).
+    Matches SP3 post_process softmax stages 4..7 (is_first=0).
     After this call, softmax_state['p_bf16'] has the bf16 softmax output
     ready for PV GEMM.
     """

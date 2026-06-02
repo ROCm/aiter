@@ -13,5 +13,5 @@ export FLYDSL_RUNTIME_ENABLE_CACHE=0
 
 cd "$(dirname "$0")"
 
-echo "=== Running FMHA accuracy test (causal + non-causal) ==="
-FLYDSL_DUMP_IR=1 python3 -u test_acc.py
+echo "=== FMHA Accuracy Test (BHSD layout, D_qk=192 D_v=128) ==="
+python3 -u test_acc.py
