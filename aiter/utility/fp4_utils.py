@@ -629,6 +629,20 @@ def moe_mxfp4_sort(
     if len(blockscale_e8m0.shape) == 3:
         topk = blockscale_e8m0.shape[1]
         blockscale_e8m0 = blockscale_e8m0.view(-1, blockscale_e8m0.shape[-1])
+    M_i, N_i_raw = blockscale_e8m0.shape
+    # Pad N up to BLOCK_SIZE_N so that downstream kernels (which expect a
+    # padded scale stride matching ``e8m0_shuffle``) see the same layout for
+    # any ``inter_dim/32`` value.  The padded columns are zero so they
+    # contribute zero scale (no extra signal) when read by the GEMM.
+    if N_i_raw % BLOCK_SIZE_N != 0:
+        padded_N_i = triton.cdiv(N_i_raw, BLOCK_SIZE_N) * BLOCK_SIZE_N
+        padded = torch.zeros(
+            (M_i, padded_N_i),
+            dtype=blockscale_e8m0.dtype,
+            device=blockscale_e8m0.device,
+        )
+        padded[:, :N_i_raw] = blockscale_e8m0
+        blockscale_e8m0 = padded
     M_i, N_i = blockscale_e8m0.shape
     M_o, N_o = sorted_ids.shape[0], N_i
     assert (N_i // 2) % 2 == 0
@@ -676,5 +690,6 @@ def moe_mxfp4_sort(
         grid = (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_i, BLOCK_SIZE_N))
         _moe_mxfp4_sort_kernel[grid](*common_args, **common_kwargs)
 
-    # Reshape the output to the final shape
+    # ``N_i`` was padded to a multiple of BLOCK_SIZE_N above, so ``N_o == N_i``
+    # is also a multiple of BLOCK_SIZE_N and the flat view is well-defined.
     return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o)
