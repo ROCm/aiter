@@ -32,7 +32,8 @@ void pa_fp8_reduce_kernel(
     const scalar_t* __restrict__ tmp_out,  // [num_seqs * mtp, num_heads, max_num_partitions, head_size]
     const int* __restrict__ context_lens,
     const int max_num_partitions,
-    const int fixed_num_partitions  // > 0 = fat mode (use directly); <= 0 = auto from ctx
+    const int fixed_num_partitions, // > 0 = fat mode (use directly); <= 0 = auto from ctx
+    const int num_kblocks_per_fat_part
 )
 {
     using namespace v_red;
@@ -47,10 +48,24 @@ void pa_fp8_reduce_kernel(
     const int MTP       = gridDim.z;
     const int mtp       = blockIdx.z;
 
-    const int context_len    = context_lens[seq_idx];
+    const int context_len   = context_lens[seq_idx];
+    const int total_kblocks = PAGQA_DIVUP(context_len, kPar);
+    // FlyDSL-aligned page size, MUST match the main kernel's kbi slicing.
+    //   v2 sentinel (fixed_num_partitions>0 && num_kblocks_per_fat_part<=0):
+    //     derive AT RUNTIME from actual ctx + launched partition count,
+    //     == v2 main's cdiv(total_num_kblocks, gridDim.y).
+    //   v1/v3 (num_kblocks_per_fat_part>0): capture-time static page size.
+    //   v0 (fixed_num_partitions<=0): one partition per 256-token kblock.
+    const int eff_page =
+        (fixed_num_partitions > 0 && num_kblocks_per_fat_part <= 0)
+            ? PAGQA_DIVUP(total_kblocks, fixed_num_partitions)
+            : num_kblocks_per_fat_part;
+    const int active_parts  = (eff_page > 0)
+        ? PAGQA_DIVUP(total_kblocks, eff_page)
+        : total_kblocks;
     const int num_partitions = (fixed_num_partitions > 0)
-                                   ? fixed_num_partitions
-                                   : PAGQA_DIVUP(context_len, kPar);
+                                   ? min(active_parts, fixed_num_partitions)
+                                   : active_parts;
 
     const int warpid = threadIdx.x / WARP_SIZE;
 
@@ -253,7 +268,8 @@ void pa_fp8_reduce_kernel_v2(
     const scalar_t* __restrict__ tmp_out,  // [num_seqs * mtp, num_heads, max_num_partitions, head_size]
     const int* __restrict__ context_lens,
     const int max_num_partitions,
-    const int fixed_num_partitions
+    const int fixed_num_partitions,
+    const int num_kblocks_per_fat_part
 )
 {
     using namespace v_red2;
@@ -272,10 +288,27 @@ void pa_fp8_reduce_kernel_v2(
     const int warp_id   = tid / kWarp;
     const int lane      = tid % kWarp;
 
-    const int context_len    = context_lens[seq_idx];
+    // See v3 comment: shrink iteration count to active fat partitions so dead
+    // slots (filled with -inf/0 sentinel by the main kernel) don't waste HBM
+    // bandwidth.
+    const int context_len   = context_lens[seq_idx];
+    const int total_kblocks = PAGQA_DIVUP(context_len, kPar);
+    // FlyDSL-aligned page size, MUST match the main kernel's kbi slicing.
+    //   v2 sentinel (fixed_num_partitions>0 && num_kblocks_per_fat_part<=0):
+    //     derive AT RUNTIME from actual ctx + launched partition count,
+    //     == v2 main's cdiv(total_num_kblocks, gridDim.y).
+    //   v1/v3 (num_kblocks_per_fat_part>0): capture-time static page size.
+    //   v0 (fixed_num_partitions<=0): one partition per 256-token kblock.
+    const int eff_page =
+        (fixed_num_partitions > 0 && num_kblocks_per_fat_part <= 0)
+            ? PAGQA_DIVUP(total_kblocks, fixed_num_partitions)
+            : num_kblocks_per_fat_part;
+    const int active_parts  = (eff_page > 0)
+        ? PAGQA_DIVUP(total_kblocks, eff_page)
+        : total_kblocks;
     const int num_partitions = (fixed_num_partitions > 0)
-                                   ? fixed_num_partitions
-                                   : PAGQA_DIVUP(context_len, kPar);
+                                   ? min(active_parts, fixed_num_partitions)
+                                   : active_parts;
     const int ns_mtp_idx     = seq_idx * MTP + mtp;
 
     __shared__ float shared_weights[kMaxPart > 0 ? kMaxPart : 1];
@@ -406,7 +439,8 @@ void pa_fp8_reduce_kernel_v3(
     const scalar_t* __restrict__ tmp_out,  // [num_seqs * mtp, num_heads, max_num_partitions, head_size]
     const int* __restrict__ context_lens,
     const int max_num_partitions,
-    const int fixed_num_partitions
+    const int fixed_num_partitions,
+    const int num_kblocks_per_fat_part
 )
 {
     using namespace v_red2;
@@ -424,10 +458,29 @@ void pa_fp8_reduce_kernel_v3(
     const int tid       = threadIdx.x;
     const int lane      = tid & (kWarp - 1);
 
-    const int context_len    = context_lens[seq_idx];
+    // Active partitions = ceil(actual_kblocks / num_kblocks_per_fat_part).
+    // For graph-capture safety the kernel still works with `fixed_num_partitions`
+    // sized workspaces (writes -inf / 0 for empty slots in the main kernel), but
+    // here we *shrink* the iteration count to the actually-populated slots so
+    // dead partitions don't pay HBM-load or FMA cycles.
+    const int context_len   = context_lens[seq_idx];
+    const int total_kblocks = PAGQA_DIVUP(context_len, kPar);
+    // FlyDSL-aligned page size, MUST match the main kernel's kbi slicing.
+    //   v2 sentinel (fixed_num_partitions>0 && num_kblocks_per_fat_part<=0):
+    //     derive AT RUNTIME from actual ctx + launched partition count,
+    //     == v2 main's cdiv(total_num_kblocks, gridDim.y).
+    //   v1/v3 (num_kblocks_per_fat_part>0): capture-time static page size.
+    //   v0 (fixed_num_partitions<=0): one partition per 256-token kblock.
+    const int eff_page =
+        (fixed_num_partitions > 0 && num_kblocks_per_fat_part <= 0)
+            ? PAGQA_DIVUP(total_kblocks, fixed_num_partitions)
+            : num_kblocks_per_fat_part;
+    const int active_parts  = (eff_page > 0)
+        ? PAGQA_DIVUP(total_kblocks, eff_page)
+        : total_kblocks;
     const int num_partitions = (fixed_num_partitions > 0)
-                                   ? fixed_num_partitions
-                                   : PAGQA_DIVUP(context_len, kPar);
+                                   ? min(active_parts, fixed_num_partitions)
+                                   : active_parts;
     const int ns_mtp_idx     = seq_idx * MTP + mtp;
 
     const int64_t base =
@@ -504,6 +557,12 @@ void pa_fp8_reduce_kernel_v3(
         + tid;
     const scalar_t* logits_ptr = tmp_out + logits_base;
 
+    // Fully-unrolled load + FMA pipeline (preserves the 2-stage prefetch
+    // schedule that hides global_load latency on long contexts).  Dead lanes
+    // (`p_idx >= num_partitions`) skip their FMA via select; the load itself
+    // is allowed to issue — at short ctx the bandwidth cost is negligible
+    // (≤ 64 partitions × 1 lane per partition) and keeping the unroll matters
+    // far more at the long-ctx end where every cycle counts.
     float acc = 0.f;
     #pragma unroll
     for (int p0 = 0; p0 < NumPart; p0 += kBatch)
@@ -515,8 +574,9 @@ void pa_fp8_reduce_kernel_v3(
         #pragma unroll
         for (int k = 0; k < kBatch; k++)
         {
-            const float w = pa_lane_bcast(weight_local, p0 + k);
-            if ((p0 + k) < num_partitions)
+            const int p_idx = p0 + k;
+            const float w = pa_lane_bcast(weight_local, p_idx);
+            if (p_idx < num_partitions)
                 acc = fmaf(v_batch[k], w, acc);
         }
     }

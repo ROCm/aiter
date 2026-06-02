@@ -71,7 +71,7 @@ def rope_norm_store_kv(
     out_k: Optional[torch.Tensor] = None,
     out_v: Optional[torch.Tensor] = None,
     qk_norm_policy: int = 0,
-    eps: float = 1e-6,
+    eps: float = 1e-5,
     positions: Optional[torch.Tensor] = None,
     slot_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:

@@ -92,26 +92,41 @@ constexpr int kBytesPerWideQkhe    = v0::kRowsPerWarp * kBytesPerChunkAllSlot; /
 // QK uses kWidth=16 (16 fp8/lane) + buffer_load_dwordx4 + paired MFMA;
 // everything else (V load, PV MFMA, LDS layout, softmax, output) is the
 // same as v1.  See block-comment at top of this file for the lane mapping.
+//
+// Template parameters mirror v1: `QIn` selects fp8-direct vs bf16-with-in-
+// kernel-quantisation Q loading, and `HasPScale` toggles the FlyDSL-style
+// P fp8 quantisation rescale (p_scale before pack, p_scale_inv folded into
+// the post-PV correction).
 // ---------------------------------------------------------------------------
-template <typename output_t, int Mtp>
+// `EnablePrefetch` toggles the FlyDSL-aligned cross-kbi K + K-scale
+// pipeline.  Launcher picks it via `num_kblocks_per_fat_part >= 2`:
+//   - true:  prologue prefetches K(kbi_start) parallel to Q load; each
+//            iter consumes loop-carried K and issues next-kbi prefetch
+//            during PV MFMA → +20-60% wins at long-ctx low-bs.
+//   - false: legacy in-iter K-load path (load_k_tile interleaved with
+//            QK MFMA t-loop) → avoids prologue + wasted-last-iter
+//            prefetch overhead in 1-iter-per-CTA short-ctx cases.
+template <typename output_t, int Mtp,
+          typename QIn = __hip_fp8_e4m3_fnuz, bool HasPScale = false,
+          bool EnablePrefetch = true>
 __global__ __launch_bounds__(v0::kNumThreads, 2)
 void pa_fp8_main_kernel_v2(
-    const __hip_fp8_e4m3_fnuz* __restrict__ q,
+    const QIn* __restrict__                  q,
     const __hip_fp8_e4m3_fnuz* __restrict__ k_cache,
     const __hip_fp8_e4m3_fnuz* __restrict__ v_cache,
     const float                              softmax_scale,
-    const float* __restrict__                q_scale_ptr,
+    const float* __restrict__                q_scale_ptr,   // unused when QIn=bf16
     const float* __restrict__                k_scale_ptr,
     const float* __restrict__                v_scale_ptr,
-    const float* __restrict__                p_scale_ptr,
-    const float* __restrict__                p_scale_inv_ptr,
-    const bool                               has_p_scale,
+    const float* __restrict__                p_scale_ptr,     // [total_num_heads]
+    const float* __restrict__                p_scale_inv_ptr, // [total_num_heads]
     const int* __restrict__                  block_tables,
     const int* __restrict__                  context_lens,
     const int                                max_num_blocks_per_seq,
     const int                                q_stride,
     const int                                kv_block_stride,
     const int                                kv_head_stride,
+    const int                                ks_head_stride,  // k_scale per-kv-head stride: block_size (flat [nb,nkv,bs]) or head_dim/4 (FlyDSL packed fp32-view [nb,1,nkv,hd/4])
     float* __restrict__                      exp_sums,
     float* __restrict__                      max_logits,
     output_t* __restrict__                   out,
@@ -138,12 +153,55 @@ void pa_fp8_main_kernel_v2(
     const int context_len        = context_lens[seq_idx];
     const int total_num_kblocks  = PAGQA_DIVUP(context_len, kTParSize);
 
-    const int kbi_start    = fp_idx * num_kblocks_per_fat_part;
-    const int kbi_stop_raw = kbi_start + num_kblocks_per_fat_part;
+    // FlyDSL-aligned RUNTIME page size.  Distribute the ACTUAL context's
+    // kblocks across the launched fat partitions (grid.y) at runtime,
+    // instead of the capture-time `num_kblocks_per_fat_part` (sized off the
+    // worst-case max_seq_len).  The static value left every partition
+    // covering a fixed `cdiv(total_kblocks(max_seq_len), nf)` slice, which
+    // at ctx << max_seq_len both (a) under-parallelizes the real work
+    // (few partitions cover all of it serially) and (b) leaves the rest as
+    // dead CTAs.  The runtime page size mirrors
+    // `page_size_partitions = cdiv(num_total_partitions, max_context_partition_num)`
+    // in FlyDSL's pa_decode_ps_kernel, so the real work always spreads over
+    // `min(nf, total_num_kblocks)` partitions.  `num_kblocks_per_fat_part`
+    // is now consumed ONLY by the launcher (prefetch-variant selection).
+    const int kbpfp_rt     = PAGQA_DIVUP(total_num_kblocks, num_fat_partitions);
+    const int kbi_start    = fp_idx * kbpfp_rt;
+    const int kbi_stop_raw = kbi_start + kbpfp_rt;
     const int kbi_stop     = (kbi_stop_raw < total_num_kblocks)
                                  ? kbi_stop_raw : total_num_kblocks;
 
-    if (kbi_start >= total_num_kblocks) return;
+    if (kbi_start >= total_num_kblocks) {
+        // Graph-capture safety: this partition has no work for the
+        // current `context_lens[seq_idx]`.  Put exp_sums/max_logits
+        // into "contributes-zero" state so the reduce kernel ignores
+        // this slot:
+        //   max_logits = -inf  →  rescale weight = exp(-inf - max) = 0
+        //   exp_sums   = 0     →  prevents `0 * inf = NaN` from stale data
+        //
+        // We deliberately DO NOT clear tmp_out here (it would cost ~1us
+        // per skipped CTA, which dominates at short ctx + large nf).
+        // Instead the caller's `make_workspace` zero-initializes
+        // tmp_out once; subsequent writes by valid partitions leave it
+        // with finite real values.  Either way, the reduce's
+        // `0 * tmp_out` term is `0 * finite = 0` — safe.  This depends
+        // on the caller using `make_workspace` (or any zero-init alloc);
+        // calling decode with a `torch.empty` tmp_out is UB.
+        if (warpid == 0 && rowid == 0 && lane16id < kMtp * kGqaRatio) {
+            const int q_token_for_lane_ee = (kMtp == 1) ? 0 : (lane16id >> 3);
+            const int head_idx_ee = lane16id & (kGqaRatio - 1);
+            const int total_num_heads_ee = gridDim.z * kGqaRatio;
+            const int64_t maxp_ee = static_cast<int64_t>(num_fat_partitions);
+            const int64_t offset_ee =
+                  (static_cast<int64_t>(seq_idx) * kMtp + q_token_for_lane_ee)
+                      * static_cast<int64_t>(total_num_heads_ee) * maxp_ee
+                + (static_cast<int64_t>(kv_head_idx) * kGqaRatio + head_idx_ee) * maxp_ee
+                + static_cast<int64_t>(fp_idx);
+            max_logits[offset_ee] = -FLT_MAX;
+            exp_sums[offset_ee]   = 0.f;
+        }
+        return;
+    }
 
     const int wg_start_head_idx    = kv_head_idx * kGqaRatio;
     const int wg_start_kv_head_idx = kv_head_idx;
@@ -153,6 +211,34 @@ void pa_fp8_main_kernel_v2(
 
     __shared__ _T8x8 shared_logits[kNWarps * kTLoop * kSlotsPerWarpT];
     __shared__ float shared_qk[kNWarps * 16 * 2];
+    // Dedicated bf16-quant staging — see v1 for full layout commentary.
+    __shared__ int64_t q_stage_lds[16 * 16];
+    __shared__ float   q_scale_lds[16];
+    // K-scale LDS staging (FlyDSL-aligned).  Each warp stages
+    //   ks_lds[warpid][t][slot]  ← k_scale[kphys[warpid][t]][kv_head][slot]
+    // Per kbi the warp does 1 buffer_load_dword (each lane loads 1 fp32,
+    // covering 4 kphys × 16 slots = 64 fp32 → 1 VMEM op vs the previous
+    // 4 dwordx4 loads inside the apply step).  Lane (rowid, lane16id)
+    // loads kphys[rowid]'s slot lane16id; the apply step then does a
+    // ds_read_b128 (4 contiguous fp32) per t.  Layout is warp-local so
+    // no cross-warp sync needed; the compiler-emitted `s_waitcnt lgkmcnt`
+    // handles the intra-wave RAW hazard between write and read.
+    __shared__ float ks_lds[kNWarps * kTLoop * kBlockSize];
+
+    // ── Per-kbi phys-block-table LDS staging (FlyDSL-aligned) ───────────
+    // Profiling (rocprof, bs=64 ctx=16384 mtp=2) showed our K/V buffer_loads
+    // serialise behind the per-lane `block_table_seq[...]` global_loads that
+    // feed their addresses: same MFMA + L2 traffic as FlyDSL, yet 2.46x the
+    // SQ_WAIT_ANY and 5.67x the VMEM-active cycles.  We break that dependency
+    // chain by cooperatively staging this kbi's `kBlocksPerKbi` block-table
+    // entries into LDS once (16 threads, 1 coalesced load), so both the K
+    // prefetch and the inline V load read phys blocks from LDS (ds_read,
+    // ~20cy) instead of each issuing dependent narrow global_loads.
+    // Double-buffered on `kbi & 1` so iter `kbi`'s V can read BT(kbi) while
+    // the same iter's K-prefetch reads the just-staged BT(kbi+1); the write
+    // is published by the EXISTING post-prob-pack barrier (no new sync).
+    constexpr int kBlocksPerKbi = kTParSize / kBlockSize;
+    __shared__ int bt_lds[2][kBlocksPerKbi];
 
     const __amdgpu_buffer_rsrc_t k_rsrc =
         pa_make_buffer_rsrc(k_cache + wg_start_kv_head_idx * kv_head_stride);
@@ -162,35 +248,244 @@ void pa_fp8_main_kernel_v2(
     const int q_token_for_lane = (kMtp == 1) ? 0 : (lane16id >> 3);
     const int head_for_lane    = lane16id & (kGqaRatio - 1);
     const int q_head_idx       = wg_start_head_idx + head_for_lane;
-    const int64_t q_scale_idx =
-          (static_cast<int64_t>(seq_idx) * kMtp + q_token_for_lane)
-        * static_cast<int64_t>(total_num_heads) + q_head_idx;
-    const float qk_base_log2 = softmax_scale * q_scale_ptr[q_scale_idx] * kLog2E;
+
+    float qk_base_log2;
+    if constexpr (std::is_same<QIn, __hip_fp8_e4m3_fnuz>::value)
+    {
+        const int64_t q_scale_idx =
+              (static_cast<int64_t>(seq_idx) * kMtp + q_token_for_lane)
+            * static_cast<int64_t>(total_num_heads) + q_head_idx;
+        qk_base_log2 = softmax_scale * q_scale_ptr[q_scale_idx] * kLog2E;
+    }
+    else
+    {
+        qk_base_log2 = 0.f;  // filled in after Q load
+    }
     const float v_scale_perhead = v_scale_ptr[kv_head_idx];
-    const float p_scale_perhead = has_p_scale ? p_scale_ptr[q_head_idx] : 1.f;
-    const float p_scale_inv_perhead =
-        has_p_scale ? p_scale_inv_ptr[q_head_idx] : 1.f;
+
+    float p_scale_lane     = 1.f;
+    float p_scale_inv_lane = 1.f;
+    if constexpr (HasPScale)
+    {
+        p_scale_lane     = p_scale_ptr    [q_head_idx];
+        p_scale_inv_lane = p_scale_inv_ptr[q_head_idx];
+    }
 
     // Wide Q load: 16 fp8 / lane per qkhe step, covering head_dim
     // (qkhe*64 + rowid*16) .. (+15) — one head_dim chunk worth.  Held as
     // a pair of int64 so the lo/hi halves can be fed to two consecutive
     // MFMA calls (mirrors gluon's `v[N+0:N+1]` + `v[N+2:N+3]` pattern).
+    //
+    // For QIn=bf16 we still produce the same `(lo, hi)` int64 packed-fp8
+    // pair after per-lane bf16→fp32→fp8 conversion + cross-rowid max-abs
+    // reduce, so the downstream wide-load MFMA chain is byte-identical.
     struct PaWide { int64_t lo; int64_t hi; };
     PaWide Qlocal[v2::kWideQkheLoop];
+
+    // ── Loop-carried K-data + K-scale (FlyDSL-aligned cross-kbi prefetch) ──
+    //
+    // When `EnablePrefetch=true`: `Klocal` / `my_ks_carried` are refreshed
+    // at the END of each iter (after QK MFMA consumes them, before PV
+    // MFMA starts) with the NEXT kbi's K + K-scale, so the buffer_load
+    // latency overlaps with PV MFMA + the accumulator update of the
+    // current iter — mirrors FlyDSL's `k_flat` / `k_scale_next` loop-
+    // carry pattern in `pa_decode_ps_kernel`
+    // (FlyDSL/kernels/pa_decode_fp8.py lines 2497-2595).
+    //
+    // When `EnablePrefetch=false`: K is loaded inside each iter via the
+    // legacy `load_k_tile` lambda (interleaved with QK MFMA t-loop) and
+    // these VGPRs are unused.  Compiler DCE removes the allocation.
+    //
+    // VGPR cost (EnablePrefetch=true): +17 VGPR for K-data + K-scale.
+    // Stays at occupancy 4 waves/SIMD; baseline (no prefetch) is at 3.
+    PaWide Klocal_carried[kTLoop][v2::kWideQkheLoop];
+    float  my_ks_carried;
+
+    const unsigned int k_chunk_row_off =
+        (unsigned int)rowid * (unsigned int)v2::kBytesPerChunkAllSlot;
+
+    // Cooperative single-shot load of kbi_in's block table into LDS buffer
+    // `kbi_in & 1`.  Caller MUST issue a __syncthreads() before any thread
+    // reads bt_lds[kbi_in & 1] (the cross-kbi-prefetch path reuses the
+    // existing post-prob-pack barrier for this; the prologue / no-prefetch
+    // path adds its own).
+    auto stage_bt_to_lds = [&](int kbi_in) __attribute__((always_inline))
+    {
+        if (warpid == 0 && rowid == 0)
+        {
+            const int g_idx      = kbi_in * kBlocksPerKbi + lane16id;
+            const int g_idx_safe = (g_idx < num_context_blocks)
+                                       ? g_idx : last_ctx_block;
+            bt_lds[kbi_in & 1][lane16id] = block_table_seq[g_idx_safe];
+        }
+    };
+
+    auto stage_kbi_prefetch = [&](int kbi_in) __attribute__((always_inline))
+    {
+        // Issues K-data + K-scale buffer_loads for `kbi_in`, writing into
+        // `Klocal_carried` and `my_ks_carried` (the loop-carried VGPRs).
+        // The block_table index is clamped to `last_ctx_block` to keep
+        // OOB-speculative loads (final iter's prefetch) safe.
+        const int partition_start_token_idx_x = kbi_in * kTParSize;
+
+        int kphys_local[kTLoop];
+        int kphys_off_local[kTLoop];
+        #pragma unroll
+        for (int t = 0; t < kTLoop; t++)
+        {
+            const int klocal_token_idx  = kTokensPerWarp * warpid + t * 16 + lane16id;
+            const int kglobal_token_idx = partition_start_token_idx_x + klocal_token_idx;
+            // Phys block from the LDS-staged block table (stage_bt_to_lds),
+            // not a per-lane global_load — breaks the block_table_seq[...] ->
+            // K-address dependency chain that serialised the K buffer_loads.
+            kphys_local[t]              = bt_lds[kbi_in & 1][warpid * kTLoop + t];
+            kphys_off_local[t]          = kglobal_token_idx % kBlockSize;
+        }
+
+        // Per-thread K-scale fetch (mirrors FlyDSL's `_load_my_k_scale_from_vgpr`):
+        // each thread gets its `kphys[rowid]` directly from VGPR (avoids
+        // the LDS round-trip needed by the K-data path's wider broadcast).
+        int my_kphys;
+        if (rowid == 0)      my_kphys = kphys_local[0];
+        else if (rowid == 1) my_kphys = kphys_local[1];
+        else if (rowid == 2) my_kphys = kphys_local[2];
+        else                 my_kphys = kphys_local[3];
+        // K-scale element layout is parameterised by `ks_head_stride`
+        //   flat   [nb, nkv, bs]              → ks_head_stride = block_size
+        //   packed [nb, 1, nkv, head_dim/4]   → ks_head_stride = head_dim/4
+        // Both map (kphys, kv_head, slot) → (kphys*nkv + kv_head)*stride + slot.
+        // For the packed FlyDSL layout scale_rows==1 (block_size*4 <= head_dim,
+        // i.e. v2's fixed bs=16/hd=128), so slot < block_size <= head_dim/4 always
+        // lands in row 0 — no row term needed and the padding tail is never read.
+        const int64_t ks_off =
+              (static_cast<int64_t>(my_kphys) * gridDim.z + kv_head_idx)
+                  * ks_head_stride
+            + lane16id;
+        my_ks_carried = k_scale_ptr[ks_off];
+
+        // Issue all K-data buffer_loads for this kbi (8 dwordx4 / lane).
+        #pragma unroll
+        for (int t = 0; t < kTLoop; t++)
+        {
+            const unsigned int kblock_number = (unsigned int)kphys_local[t];
+            const unsigned int k_base_voffset =
+                kblock_number * (unsigned int)kv_block_stride
+                + (unsigned int)kphys_off_local[t] * kElems16B_fp8
+                + k_chunk_row_off;
+            #pragma unroll
+            for (int qkhe = 0; qkhe < v2::kWideQkheLoop; qkhe++)
+            {
+                const unsigned int voff =
+                    k_base_voffset
+                    + (unsigned int)qkhe * (unsigned int)v2::kBytesPerWideQkhe;
+                const pa_u32x4 v = pa_buffer_load_b128(k_rsrc, voff);
+                Klocal_carried[t][qkhe].lo = pa_u32x4_low_long(v);
+                Klocal_carried[t][qkhe].hi = pa_u32x4_high_long(v);
+            }
+        }
+    };
+
+    if constexpr (EnablePrefetch) {
+        // PROLOGUE: stage iter 0's block table to LDS, then issue
+        // K(kbi_start) + K-scale(kbi_start) buffer_loads BEFORE the Q load.
+        // The one-shot barrier here is amortised over the whole CTA; the K
+        // HBM latency (~400 cy) then overlaps with the Q load + Q LDS staging
+        // + Q register prep that follows (~500-800 cy on the bf16-Q path),
+        // so iter 0's QK MFMA finds K already in VGPR with no extra wait.
+        stage_bt_to_lds(kbi_start);
+        __syncthreads();
+        stage_kbi_prefetch(kbi_start);
+    }
+
     {
         const int64_t query_row_off =
             (static_cast<int64_t>(seq_idx) * kMtp + q_token_for_lane) * q_stride
             + (wg_start_head_idx + head_for_lane) * kHeadSize;
-        const __hip_fp8_e4m3_fnuz* q_row = q + query_row_off;
-        #pragma unroll
-        for (int qkhe = 0; qkhe < v2::kWideQkheLoop; qkhe++)
+        const QIn* q_row = q + query_row_off;
+        if constexpr (std::is_same<QIn, __hip_fp8_e4m3_fnuz>::value)
         {
-            const int hd_off = qkhe * v2::kK_PER_WIDE_QKHE
-                             + rowid * v2::kFp8PerLaneWide;
-            const int64_t* p =
-                reinterpret_cast<const int64_t*>(q_row + hd_off);
-            Qlocal[qkhe].lo = p[0];
-            Qlocal[qkhe].hi = p[1];
+            #pragma unroll
+            for (int qkhe = 0; qkhe < v2::kWideQkheLoop; qkhe++)
+            {
+                const int hd_off = qkhe * v2::kK_PER_WIDE_QKHE
+                                 + rowid * v2::kFp8PerLaneWide;
+                const int64_t* p =
+                    reinterpret_cast<const int64_t*>(q_row + hd_off);
+                Qlocal[qkhe].lo = p[0];
+                Qlocal[qkhe].hi = p[1];
+            }
+        }
+        else
+        {
+            // bf16 Q in-kernel quant — same FlyDSL-aligned LDS staging as v1
+            // (dedicated q_stage_lds buffer).  Producer writes 8 fp8 per
+            // (qhead, segment), consumer reads back pairs of i64 cells for
+            // v2's wide-load (16 fp8 / lane / qkhe) layout.
+            const int q_quant_qhead_raw = warpid * kRowsPerWarp + rowid;
+            const int q_quant_qhead = (kMtp == 1)
+                                         ? (q_quant_qhead_raw & (kGqaRatio - 1))
+                                         : q_quant_qhead_raw;
+            const int q_quant_qtoken =
+                (kMtp == 1) ? 0 : (q_quant_qhead_raw >> 3);
+            const int q_quant_qhead_in_token =
+                (kMtp == 1) ? q_quant_qhead : (q_quant_qhead & (kGqaRatio - 1));
+
+            const int64_t q_quant_row_off =
+                  (static_cast<int64_t>(seq_idx) * kMtp + q_quant_qtoken) * q_stride
+                + (wg_start_head_idx + q_quant_qhead_in_token) * kHeadSize;
+            const __hip_bfloat16* q_q_row =
+                reinterpret_cast<const __hip_bfloat16*>(q + q_quant_row_off);
+            const _B16x8 q_bf =
+                *reinterpret_cast<const _B16x8*>(q_q_row + lane16id * 8);
+
+            const floatx4 qf_lo = pa_to_floatx4<__hip_bfloat16>(q_bf.xy[0]);
+            const floatx4 qf_hi = pa_to_floatx4<__hip_bfloat16>(q_bf.xy[1]);
+            float lm = fmaxf(
+                fmaxf(fmaxf(fabsf(qf_lo[0]), fabsf(qf_lo[1])),
+                      fmaxf(fabsf(qf_lo[2]), fabsf(qf_lo[3]))),
+                fmaxf(fmaxf(fabsf(qf_hi[0]), fabsf(qf_hi[1])),
+                      fmaxf(fabsf(qf_hi[2]), fabsf(qf_hi[3]))));
+            lm = fmaxf(lm, pa_shfl_xor_within_32<8>(lm));
+            lm = fmaxf(lm, pa_shfl_xor_within_32<4>(lm));
+            lm = fmaxf(lm, pa_shfl_xor_within_32<2>(lm));
+            lm = fmaxf(lm, pa_shfl_xor_within_32<1>(lm));
+
+            const float q_scale_lane =
+                (lm > 0.f) ? (lm * (1.f / PA_FP8_MAX)) : 1.f;
+            const float inv_q = __builtin_amdgcn_rcpf(q_scale_lane);
+
+            const uint32_t pk_lo = pa_pk_fp8x4(
+                qf_lo[0] * inv_q, qf_lo[1] * inv_q,
+                qf_lo[2] * inv_q, qf_lo[3] * inv_q);
+            const uint32_t pk_hi = pa_pk_fp8x4(
+                qf_hi[0] * inv_q, qf_hi[1] * inv_q,
+                qf_hi[2] * inv_q, qf_hi[3] * inv_q);
+
+            q_stage_lds[q_quant_qhead * 16 + lane16id] =
+                  static_cast<int64_t>(pk_lo)
+                | (static_cast<int64_t>(pk_hi) << 32);
+            if (lane16id == 0)
+                q_scale_lds[q_quant_qhead] = q_scale_lane;
+
+            __syncthreads();
+
+            // Consumer (v2 wide-load): lane (R, L) needs 16 fp8 per qkhe
+            //   = (qhead=L, hd[qkhe*64 + R*16 .. qkhe*64 + R*16 + 15])
+            // split into two consecutive i64 cells:
+            //   lo  = q_stage_lds[L][qkhe*8 + R*2 + 0]   (hd_seg = qkhe*8 + R*2)
+            //   hi  = q_stage_lds[L][qkhe*8 + R*2 + 1]   (hd_seg = qkhe*8 + R*2 + 1)
+            const int consumer_qhead = (kMtp == 1)
+                                         ? (lane16id & (kGqaRatio - 1))
+                                         : lane16id;
+            qk_base_log2 = softmax_scale * q_scale_lds[consumer_qhead] * kLog2E;
+
+            #pragma unroll
+            for (int qkhe = 0; qkhe < v2::kWideQkheLoop; qkhe++)
+            {
+                const int seg_base = qkhe * 8 + rowid * 2;
+                Qlocal[qkhe].lo = q_stage_lds[consumer_qhead * 16 + seg_base + 0];
+                Qlocal[qkhe].hi = q_stage_lds[consumer_qhead * 16 + seg_base + 1];
+            }
         }
     }
 
@@ -201,12 +496,31 @@ void pa_fp8_main_kernel_v2(
     for (int vhe = 0; vhe < kVheLoop; vhe++)
         o_running[vhe] = floatx4{0.f, 0.f, 0.f, 0.f};
 
+    // EnablePrefetch=true: K + K-scale for iter 0 were prefetched BEFORE
+    // the Q load above so the HBM latency overlaps with Q load.  See
+    // `stage_kbi_prefetch(kbi_start)` near `PaWide Qlocal`.
+    // EnablePrefetch=false: K + K-scale for iter 0 are loaded inline at
+    // iter start below (no prologue).
+    constexpr unsigned int kVBytesPerVhe = (unsigned int)(kNWarps * 16 * kBlockSize);
+
     for (int kbi = kbi_start; kbi < kbi_stop; kbi++)
     {
         const int partition_start_token_idx = kbi * kTParSize;
-        const int partition_block_start     = kbi * (kTParSize / kBlockSize);
 
         if (kbi != kbi_start) __syncthreads();
+
+        // Baseline path: K + K-scale are NOT prefetched cross-kbi.  Issue
+        // the buffer_loads here at iter start (compiler inserts implicit
+        // waitcnt before QK MFMA reads `Klocal_carried`).  This is the
+        // 1-iter-per-CTA short-ctx friendly path: no prologue overhead
+        // (Q-load is the long pole anyway) and no wasted final-iter
+        // prefetch.  At ≥2 iters per CTA, the cross-kbi prefetch path
+        // wins (selected by `EnablePrefetch=true` in launcher).
+        if constexpr (!EnablePrefetch) {
+            stage_bt_to_lds(kbi);
+            __syncthreads();
+            stage_kbi_prefetch(kbi);
+        }
 
         floatx4 d_out[kTLoop];
         // V_wide[v_group][vhe]: per-(warp's-tile-group, head_dim_chunk)
@@ -216,22 +530,15 @@ void pa_fp8_main_kernel_v2(
         // Lo half (slots 0..7) → PV MFMA #1, hi half (slots 8..15) → MFMA #2.
         pa_u32x4 V_wide[kNWarps][kVheLoop];
         {
-            int kphysical_block_number[kTLoop];
-            int kphysical_block_offset[kTLoop];
-            #pragma unroll
-            for (int t = 0; t < kTLoop; t++)
-            {
-                const int klocal_token_idx  = kTokensPerWarp * warpid + t * 16 + lane16id;
-                const int kglobal_token_idx = partition_start_token_idx + klocal_token_idx;
-                const int kblock_idx        = warpid * kTLoop + t;
-                const int bt_g_idx          = partition_block_start + kblock_idx;
-                const int bt_g_idx_safe     = (bt_g_idx < num_context_blocks)
-                                                  ? bt_g_idx : last_ctx_block;
-                kphysical_block_number[t]   = block_table_seq[bt_g_idx_safe];
-                kphysical_block_offset[t]   = kglobal_token_idx % kBlockSize;
-            }
-
-            PaWide Klocal[kTLoop][v2::kWideQkheLoop];
+            // ── K-scale LDS staging (from loop-carried VGPR) ────────────
+            // Source of `my_ks_carried`:
+            //   EnablePrefetch=true  → loaded by previous iter's
+            //     `stage_kbi_prefetch` (or prologue for iter 0), HBM
+            //     latency already paid for.
+            //   EnablePrefetch=false → loaded inline at iter start (just
+            //     above), compiler inserts implicit waitcnt here.
+            ks_lds[warpid * (kTLoop * kBlockSize) + rowid * kBlockSize + lane16id] =
+                my_ks_carried;
 
             // Wide V phys-block table: rowid now selects which of the 4
             // blocks within a v_group (= warp's tile of 4 blocks).  Each
@@ -241,45 +548,17 @@ void pa_fp8_main_kernel_v2(
             #pragma unroll
             for (int v_group = 0; v_group < kNWarps; v_group++)
             {
-                const int v_bt_g_idx = partition_block_start
-                                       + v_group * kRowsPerWarp + rowid;
-                const int v_bt_g_idx_safe =
-                    (v_bt_g_idx < num_context_blocks) ? v_bt_g_idx : last_ctx_block;
+                // Phys block from the LDS-staged block table (stage_bt_to_lds
+                // for THIS kbi, published by the previous iter's post-prob-pack
+                // barrier / the prologue barrier) — removes the per-lane
+                // block_table_seq[...] global_load on the V-address path.
                 v_phys_block_wide[v_group] =
-                    (unsigned int)block_table_seq[v_bt_g_idx_safe];
+                    (unsigned int)bt_lds[kbi & 1][v_group * kRowsPerWarp + rowid];
             }
 
-            // Wide K base offset: lane (rowid, lane16id) reads its chunk's
-            // intra_chunk row of 16 fp8.  Stride for qkhe is
-            // `kBytesPerWideQkhe` (= 1024 B = 4 head_dim chunks).
-            const unsigned int k_chunk_row_off =
-                (unsigned int)rowid * (unsigned int)v2::kBytesPerChunkAllSlot;
-
-            auto load_k_tile = [&](int t) __attribute__((always_inline))
-            {
-                const unsigned int kblock_number =
-                    (unsigned int)kphysical_block_number[t];
-                const unsigned int k_base_voffset =
-                    kblock_number * (unsigned int)kv_block_stride
-                    + (unsigned int)kphysical_block_offset[t] * kElems16B_fp8
-                    + k_chunk_row_off;
-                #pragma unroll
-                for (int qkhe = 0; qkhe < v2::kWideQkheLoop; qkhe++)
-                {
-                    const unsigned int voff =
-                        k_base_voffset
-                        + (unsigned int)qkhe * (unsigned int)v2::kBytesPerWideQkhe;
-                    const pa_u32x4 v = pa_buffer_load_b128(k_rsrc, voff);
-                    Klocal[t][qkhe].lo = pa_u32x4_low_long(v);
-                    Klocal[t][qkhe].hi = pa_u32x4_high_long(v);
-                }
-            };
-
-            constexpr unsigned int kVBytesPerVhe = (unsigned int)(kNWarps * 16 * kBlockSize);
             // Wide V load: 1 dwordx4 per (v_group, vhe), reading 16 slots
-            // (= full block) × 1 head_dim per lane.  Same total bytes as
-            // v1's 2 dwordx2 per (v, t_pv, vhe) but half the VMEM
-            // instruction count.
+            // (= full block) × 1 head_dim per lane.  Issued interleaved
+            // with QK MFMA so V's load latency hides behind QK compute.
             auto load_v_slice_wide = [&](int v_group) __attribute__((always_inline))
             {
                 const unsigned int v_phys = v_phys_block_wide[v_group];
@@ -295,14 +574,11 @@ void pa_fp8_main_kernel_v2(
                     v_rsrc, v_base_voffset + kVBytesPerVhe);
             };
 
-            load_k_tile(0);
             #pragma unroll
             for (int t = 0; t < kTLoop; t++)
             {
-                if (t + 1 < kTLoop) load_k_tile(t + 1);
                 // v_group index aligns with t: warp `myself` issues
-                // load_v_slice_wide(0..3) interleaved with QK MFMA #0..3,
-                // mirroring v1's load_v_slice(t) cadence.
+                // load_v_slice_wide(0..3) interleaved with QK MFMA #0..3.
                 load_v_slice_wide(t);
 
                 d_out[t] = floatx4{0.f, 0.f, 0.f, 0.f};
@@ -311,28 +587,23 @@ void pa_fp8_main_kernel_v2(
                 {
                     // Lo half: head_dim subset {rowid*16 + qkhe*64 + 0..7}
                     d_out[t] = pa_mfma16x16x32_fp8_fp8(
-                        Klocal[t][qkhe].lo, Qlocal[qkhe].lo, d_out[t]);
+                        Klocal_carried[t][qkhe].lo, Qlocal[qkhe].lo, d_out[t]);
                     // Hi half: head_dim subset {rowid*16 + qkhe*64 + 8..15}
                     d_out[t] = pa_mfma16x16x32_fp8_fp8(
-                        Klocal[t][qkhe].hi, Qlocal[qkhe].hi, d_out[t]);
+                        Klocal_carried[t][qkhe].hi, Qlocal[qkhe].hi, d_out[t]);
                 }
-                pa_apply_qk_token_scales_for_block(
-                    d_out[t], k_scale_ptr, kphysical_block_number[t], rowid * 4,
-                    gridDim.z, kv_head_idx, kBlockSize, qk_base_log2);
+                // K-scale apply via LDS-staged values: lane (rowid, lane16id)
+                // reads 4 contiguous fp32 from ks_lds[warpid][t][rowid*4 .. +3]
+                // (one ds_read_b128 per t).  The HBM K-scale load latency
+                // was hidden by prev iter's PV MFMA (cross-kbi prefetch).
+                const float* ks_row =
+                    &ks_lds[warpid * (kTLoop * kBlockSize) + t * kBlockSize + rowid * 4];
+                const float4 ks4 = *reinterpret_cast<const float4*>(ks_row);
+                d_out[t][0] *= qk_base_log2 * ks4.x;
+                d_out[t][1] *= qk_base_log2 * ks4.y;
+                d_out[t][2] *= qk_base_log2 * ks4.z;
+                d_out[t][3] *= qk_base_log2 * ks4.w;
             }
-            // NOTE: NO `__builtin_amdgcn_sched_group_barrier` here.  v1 had
-            // a `sched_group_barrier(MFMA, 4, 0)` which forced "4 MFMA in a
-            // row, then VMEM" — this BURSTS the memory pipeline and creates
-            // both consumer-side stalls (waiting for V) and issue-side
-            // stalls (4 dwordx4 in a row).  Removing it lets the LLVM
-            // AMDGPU scheduler freely interleave the 16 K+V dwordx4 loads
-            // with the 16 QK MFMAs (1:1 ratio), which beats every
-            // explicit IGLP pattern we tested (incl. gluon's 1:4 pattern).
-            //
-            // Measured on bs=64..256 ctx=128k:
-            //   with    sched_group_barrier(MFMA, 4, 0) : v2 = 818 us (bs=64)
-            //   without sched_group_barrier            : v2 = 770 us (bs=64)
-            // — a 6% main-kernel win from a single deletion.
         }
 
         const int qkout_token_idx = partition_start_token_idx
@@ -419,16 +690,60 @@ void pa_fp8_main_kernel_v2(
             warp_scale = warp_qk_max_exp[warpid];
         }
 
+        // FlyDSL-style P-scale: pre-multiply attention weights by
+        // `p_scale_lane` so the cvt_pk_fp8_f32 input is centred near 1.0
+        // (caller-chosen), preserving fp8 dynamic range.  Compensated by
+        // `p_scale_inv_lane` in `post_scale` below.
+        const float p_pack_scale = HasPScale ? (warp_scale * p_scale_lane)
+                                             :  warp_scale;
         #pragma unroll
         for (int t = 0; t < kTLoop; t++)
         {
-            d_out[t] *= warp_scale * p_scale_perhead;
+            d_out[t] *= p_pack_scale;
             const uint32_t pk = pa_pk_fp8x4(
                 d_out[t][0], d_out[t][1], d_out[t][2], d_out[t][3]);
             const int idx = v0::shared_logits_index(warpid, t, lane16id, rowid);
             shared_logits[idx].i64 = static_cast<int64_t>(pk);
         }
+        // Stage NEXT kbi's block table to LDS NOW, so the existing
+        // post-prob-pack barrier below publishes it for both this iter's
+        // K-prefetch (which reads BT(kbi+1)) and next iter's V load — i.e.
+        // no new barrier is introduced.  Clamp mirrors the K-prefetch's
+        // `kbi_safe` so the final iter re-stages the current kbi harmlessly.
+        if constexpr (EnablePrefetch) {
+            const int kbi_bt_next = kbi + 1;
+            const int kbi_bt_safe = (kbi_bt_next < kbi_stop)
+                                        ? kbi_bt_next : (kbi_stop - 1);
+            stage_bt_to_lds(kbi_bt_safe);
+        }
         __syncthreads();
+
+        // ── Cross-kbi K + K-scale prefetch (FlyDSL-aligned) ─────────────
+        // Issue next iter's K-data and K-scale buffer_loads here, BEFORE
+        // PV MFMA, so the ~400-cy HBM latency is hidden behind PV MFMA +
+        // accumulator update (~512+ cycles of compute on the
+        // critical path).  By the time next iter's QK MFMA needs them,
+        // the loads have completed.
+        //
+        // Clamp `kbi+1` to `kbi_stop-1` so the FINAL iter's prefetch
+        // re-loads the current iter's K (a harmless no-op-after-quiesce
+        // since QK MFMA consumed those values already and the data is
+        // discarded post-loop).  Using a select instead of a branch keeps
+        // the compiler from materializing both Klocal_carried & a "next"
+        // buffer at the iter boundary — VGPR stays at 126 / occupancy 4
+        // vs 150 / occupancy 3 we'd get with `if (kbi+1<kbi_stop) prefetch`.
+        // Mirrors FlyDSL's `arith.select` pattern in pa_decode_ps_kernel.
+        //
+        // We overwrite `Klocal_carried` / `my_ks_carried` in place —
+        // current iter's QK MFMA already consumed them and PV MFMA reads
+        // `V_wide` and `P_lo/P_hi_per_g` (unrelated VGPRs), so K's old
+        // values are dead.
+        if constexpr (EnablePrefetch) {
+            const int kbi_next = kbi + 1;
+            const int kbi_safe = (kbi_next < kbi_stop)
+                                     ? kbi_next : (kbi_stop - 1);
+            stage_kbi_prefetch(kbi_safe);
+        }
 
         floatx4 pv_acc[kVheLoop];
         #pragma unroll
@@ -501,7 +816,11 @@ void pa_fp8_main_kernel_v2(
     }
 
     const float inv_l = __fdividef(1.f, l_running + 1e-6f);
-    const float post_scale = inv_l * v_scale_perhead * p_scale_inv_perhead;
+    // Fold p_scale_inv into post_scale when HasPScale (compensates the
+    // P-pack pre-scale).  Net o_running math is identical to !HasPScale.
+    const float post_scale = HasPScale
+        ? (inv_l * v_scale_perhead * p_scale_inv_lane)
+        : (inv_l * v_scale_perhead);
     #pragma unroll
     for (int vhe = 0; vhe < kVheLoop; vhe++)
         o_running[vhe] *= post_scale;

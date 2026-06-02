@@ -16,7 +16,6 @@
 
 #include "pa_fp8_main_kernel.cuh"
 #include "pa_fp8_main_kernel_v2.cuh"
-#include "pa_fp8_main_kernel_v3.cuh"
 #include "pa_fp8_reduce_kernel.cuh"
 
 using namespace pa_fp8_gqa;
@@ -38,22 +37,28 @@ inline bool is_fp16(const at::Tensor& t)
     return t.dtype() == at::kHalf;
 }
 
-inline void check_p_scale_tensors(
-    const at::Tensor& p_scale,
-    const at::Tensor& p_scale_inv,
-    int num_q_heads)
+// Tag helper used by the v1/v2 dispatcher to carry a compile-time QIn type
+// through lambda hops (so we don't need verbose 4-level nested ifs).
+template <typename T> struct qin_t { using type = T; };
+
+inline bool has_pscale_tensors(const at::Tensor& p_scale,
+                               const at::Tensor& p_scale_inv)
 {
-    TORCH_CHECK((p_scale.numel() == 0) == (p_scale_inv.numel() == 0),
-                "p_scale and p_scale_inv must either both be empty or both be set");
-    if (p_scale.numel() == 0)
-        return;
-    TORCH_CHECK(p_scale.scalar_type() == at::kFloat
-                    && p_scale_inv.scalar_type() == at::kFloat,
-                "p_scale and p_scale_inv must be float32 tensors");
-    TORCH_CHECK(p_scale.numel() == num_q_heads
-                    && p_scale_inv.numel() == num_q_heads,
-                "p_scale and p_scale_inv must be per-Q-head tensors with ",
-                num_q_heads, " elements");
+    // EMPTY tensor (numel == 0) is the convention for "no p-scale".  Both
+    // tensors must agree on presence to avoid silent half-applied scaling.
+    const bool a = p_scale.defined()     && p_scale.numel()     > 0;
+    const bool b = p_scale_inv.defined() && p_scale_inv.numel() > 0;
+    TORCH_CHECK(a == b,
+        "p_scale and p_scale_inv must be either both empty or both populated");
+    return a;
+}
+
+inline const float* maybe_data_ptr_f32(const at::Tensor& t)
+{
+    if (!t.defined() || t.numel() == 0) return nullptr;
+    TORCH_CHECK(t.scalar_type() == at::kFloat,
+                "auxiliary tensor must be float32");
+    return t.data_ptr<float>();
 }
 
 template <typename output_t>
@@ -66,8 +71,6 @@ void launch_main_v0_impl(
     const at::Tensor& q_scale_t,
     const at::Tensor& k_scale_t,
     const at::Tensor& v_scale_t,
-    const at::Tensor& p_scale_t,
-    const at::Tensor& p_scale_inv_t,
     at::Tensor&       exp_sums,
     at::Tensor&       max_logits,
     at::Tensor&       tmp_out,
@@ -110,9 +113,6 @@ void launch_main_v0_impl(
                 q_scale_t.data_ptr<float>(),
                 k_scale_t.data_ptr<float>(),
                 v_scale_t.data_ptr<float>(),
-                p_scale_t.numel() ? p_scale_t.data_ptr<float>() : nullptr,
-                p_scale_inv_t.numel() ? p_scale_inv_t.data_ptr<float>() : nullptr,
-                p_scale_t.numel() != 0,
                 block_tables.data_ptr<int>(),
                 context_lens.data_ptr<int>(),
                 max_num_blocks_per_seq,
@@ -135,7 +135,8 @@ void launch_reduce_impl(
     const at::Tensor& context_lens,
     int num_seqs, int num_heads, int /*head_size*/, int mtp,
     int max_num_partitions,
-    int fixed_num_partitions = -1)
+    int fixed_num_partitions = -1,
+    int num_kblocks_per_fat_part = 0)
 {
     const auto stream = at::hip::getCurrentHIPStream();
     dim3 grid(num_heads, num_seqs, mtp);
@@ -152,7 +153,8 @@ void launch_reduce_impl(
                     reinterpret_cast<const output_t*>(tmp_out.data_ptr()),
                     context_lens.data_ptr<int>(),
                     max_num_partitions,
-                    fixed_num_partitions);
+                    fixed_num_partitions,
+                    num_kblocks_per_fat_part);
         };
 
         if      (max_num_partitions <= 1 ) launch_v3(std::integral_constant<int, 1 >{});
@@ -179,7 +181,8 @@ void launch_reduce_impl(
                     reinterpret_cast<const output_t*>(tmp_out.data_ptr()),
                     context_lens.data_ptr<int>(),
                     max_num_partitions,
-                    fixed_num_partitions);
+                    fixed_num_partitions,
+                    num_kblocks_per_fat_part);
         };
 
         if (npar_loops <= 1) launch_v2(std::integral_constant<int, 1>{});
@@ -197,7 +200,8 @@ void launch_reduce_impl(
                 reinterpret_cast<const output_t*>(tmp_out.data_ptr()),
                 context_lens.data_ptr<int>(),
                 max_num_partitions,
-                fixed_num_partitions);
+                fixed_num_partitions,
+                num_kblocks_per_fat_part);
     };
 
     if      (npar_loops <= 4 ) launch(std::integral_constant<int, 4 >{});
@@ -206,76 +210,7 @@ void launch_reduce_impl(
     else                       launch(std::integral_constant<int, 32>{});
 }
 
-template <typename output_t>
-void launch_main_v1_impl(
-    const at::Tensor& query,
-    const at::Tensor& k_cache,
-    const at::Tensor& v_cache,
-    const at::Tensor& block_tables,
-    const at::Tensor& context_lens,
-    const at::Tensor& q_scale_t,
-    const at::Tensor& k_scale_t,
-    const at::Tensor& v_scale_t,
-    const at::Tensor& p_scale_t,
-    const at::Tensor& p_scale_inv_t,
-    at::Tensor&       exp_sums,
-    at::Tensor&       max_logits,
-    at::Tensor&       tmp_out,
-    int num_seqs, int num_kv_heads, int num_q_heads,
-    int head_size, int block_size, int mtp,
-    int num_fat_partitions,
-    int num_kblocks_per_fat_part,
-    double scale)
-{
-    TORCH_CHECK(num_q_heads == 8, "v1 requires num_q_heads=8, got ", num_q_heads);
-    TORCH_CHECK(num_kv_heads == 1, "v1 requires num_kv_heads=1, got ", num_kv_heads);
-    TORCH_CHECK(head_size == 128, "v1 requires head_size=128, got ", head_size);
-    TORCH_CHECK(block_size == 16, "v1 requires block_size=16, got ", block_size);
-    TORCH_CHECK(mtp == 1 || mtp == 2, "v1 requires mtp in {1, 2}, got ", mtp);
-    TORCH_CHECK(num_kblocks_per_fat_part >= 1,
-                "num_kblocks_per_fat_part must be >= 1");
-
-    const auto stream = at::hip::getCurrentHIPStream();
-    const int q_stride        = query.stride(0);
-    const int kv_block_stride = k_cache.stride(0);
-    const int kv_head_stride  = k_cache.stride(1);
-    const int max_num_blocks_per_seq = static_cast<int>(block_tables.size(1));
-
-    dim3 grid(num_seqs, num_fat_partitions, num_kv_heads);
-    dim3 block(v0::kNumThreads);
-
-    const __hip_fp8_e4m3_fnuz* q_ptr =
-        reinterpret_cast<const __hip_fp8_e4m3_fnuz*>(query.data_ptr());
-    const __hip_fp8_e4m3_fnuz* k_ptr =
-        reinterpret_cast<const __hip_fp8_e4m3_fnuz*>(k_cache.data_ptr());
-    const __hip_fp8_e4m3_fnuz* v_ptr =
-        reinterpret_cast<const __hip_fp8_e4m3_fnuz*>(v_cache.data_ptr());
-
-    auto launch_with_mtp = [&](auto mtp_const) {
-        constexpr int kMtpC = decltype(mtp_const)::value;
-        pa_fp8_main_kernel_v1<output_t, kMtpC>
-            <<<grid, block, 0, stream>>>(
-                q_ptr, k_ptr, v_ptr,
-                static_cast<float>(scale),
-                q_scale_t.data_ptr<float>(),
-                k_scale_t.data_ptr<float>(),
-                v_scale_t.data_ptr<float>(),
-                p_scale_t.numel() ? p_scale_t.data_ptr<float>() : nullptr,
-                p_scale_inv_t.numel() ? p_scale_inv_t.data_ptr<float>() : nullptr,
-                p_scale_t.numel() != 0,
-                block_tables.data_ptr<int>(),
-                context_lens.data_ptr<int>(),
-                max_num_blocks_per_seq,
-                q_stride, kv_block_stride, kv_head_stride,
-                exp_sums.data_ptr<float>(),
-                max_logits.data_ptr<float>(),
-                reinterpret_cast<output_t*>(tmp_out.data_ptr()),
-                num_kblocks_per_fat_part);
-    };
-
-    if (mtp == 1) launch_with_mtp(std::integral_constant<int, 1>{});
-    else          launch_with_mtp(std::integral_constant<int, 2>{});
-}
+// (launch_main_v1_impl removed — v1 path deprecated; decode_auto uses v2.)
 
 // ---------------------------------------------------------------------------
 // v2 main launcher — gluon-aligned inter-tile K prefetch.
@@ -309,80 +244,11 @@ void launch_main_v2_impl(
     TORCH_CHECK(num_kblocks_per_fat_part >= 1,
                 "num_kblocks_per_fat_part must be >= 1");
 
-    const auto stream = at::hip::getCurrentHIPStream();
-    const int q_stride        = query.stride(0);
-    const int kv_block_stride = k_cache.stride(0);
-    const int kv_head_stride  = k_cache.stride(1);
-    const int max_num_blocks_per_seq = static_cast<int>(block_tables.size(1));
-
-    dim3 grid(num_seqs, num_fat_partitions, num_kv_heads);
-    dim3 block(v0::kNumThreads);
-
-    const __hip_fp8_e4m3_fnuz* q_ptr =
-        reinterpret_cast<const __hip_fp8_e4m3_fnuz*>(query.data_ptr());
-    const __hip_fp8_e4m3_fnuz* k_ptr =
-        reinterpret_cast<const __hip_fp8_e4m3_fnuz*>(k_cache.data_ptr());
-    const __hip_fp8_e4m3_fnuz* v_ptr =
-        reinterpret_cast<const __hip_fp8_e4m3_fnuz*>(v_cache.data_ptr());
-
-    auto launch_with_mtp = [&](auto mtp_const) {
-        constexpr int kMtpC = decltype(mtp_const)::value;
-        pa_fp8_main_kernel_v2<output_t, kMtpC>
-            <<<grid, block, 0, stream>>>(
-                q_ptr, k_ptr, v_ptr,
-                static_cast<float>(scale),
-                q_scale_t.data_ptr<float>(),
-                k_scale_t.data_ptr<float>(),
-                v_scale_t.data_ptr<float>(),
-                p_scale_t.numel() ? p_scale_t.data_ptr<float>() : nullptr,
-                p_scale_inv_t.numel() ? p_scale_inv_t.data_ptr<float>() : nullptr,
-                p_scale_t.numel() != 0,
-                block_tables.data_ptr<int>(),
-                context_lens.data_ptr<int>(),
-                max_num_blocks_per_seq,
-                q_stride, kv_block_stride, kv_head_stride,
-                exp_sums.data_ptr<float>(),
-                max_logits.data_ptr<float>(),
-                reinterpret_cast<output_t*>(tmp_out.data_ptr()),
-                num_kblocks_per_fat_part);
-    };
-
-    if (mtp == 1) launch_with_mtp(std::integral_constant<int, 1>{});
-    else          launch_with_mtp(std::integral_constant<int, 2>{});
-}
-
-// ---------------------------------------------------------------------------
-// v3 main launcher — cross-iter K prefetch on top of v2 wide-load.
-// Same signature & launch grid as v2; just a different kernel symbol.
-// ---------------------------------------------------------------------------
-template <typename output_t>
-void launch_main_v3_impl(
-    const at::Tensor& query,
-    const at::Tensor& k_cache,
-    const at::Tensor& v_cache,
-    const at::Tensor& block_tables,
-    const at::Tensor& context_lens,
-    const at::Tensor& q_scale_t,
-    const at::Tensor& k_scale_t,
-    const at::Tensor& v_scale_t,
-    const at::Tensor& p_scale_t,
-    const at::Tensor& p_scale_inv_t,
-    at::Tensor&       exp_sums,
-    at::Tensor&       max_logits,
-    at::Tensor&       tmp_out,
-    int num_seqs, int num_kv_heads, int num_q_heads,
-    int head_size, int block_size, int mtp,
-    int num_fat_partitions,
-    int num_kblocks_per_fat_part,
-    double scale)
-{
-    TORCH_CHECK(num_q_heads == 8, "v3 requires num_q_heads=8, got ", num_q_heads);
-    TORCH_CHECK(num_kv_heads == 1, "v3 requires num_kv_heads=1, got ", num_kv_heads);
-    TORCH_CHECK(head_size == 128, "v3 requires head_size=128, got ", head_size);
-    TORCH_CHECK(block_size == 16, "v3 requires block_size=16, got ", block_size);
-    TORCH_CHECK(mtp == 1 || mtp == 2, "v3 requires mtp in {1, 2}, got ", mtp);
-    TORCH_CHECK(num_kblocks_per_fat_part >= 1,
-                "num_kblocks_per_fat_part must be >= 1");
+    const bool query_is_fp8  = is_fp8_e4m3(query);
+    const bool query_is_bf16 = is_bf16(query);
+    TORCH_CHECK(query_is_fp8 || query_is_bf16,
+        "v2 query must be float8_e4m3fnuz or bfloat16; got ", query.dtype());
+    const bool has_pscale = has_pscale_tensors(p_scale_t, p_scale_inv_t);
 
     const auto stream = at::hip::getCurrentHIPStream();
     const int q_stride        = query.stride(0);
@@ -390,41 +256,88 @@ void launch_main_v3_impl(
     const int kv_head_stride  = k_cache.stride(1);
     const int max_num_blocks_per_seq = static_cast<int>(block_tables.size(1));
 
+    // k_scale per-kv-head element stride = size of the last (contiguous) dim:
+    //   flat   [nb, nkv, block_size]      → block_size
+    //   packed [nb, 1,   nkv, head_dim/4] → head_dim/4  (FlyDSL fp32 view)
+    // The kernel indexes k_scale[(kphys*nkv + kv_head)*stride + slot], so the
+    // FlyDSL packed scale buffer is consumed natively (zero host copy).
+    const int ks_head_stride =
+        static_cast<int>(k_scale_t.size(k_scale_t.dim() - 1));
+
     dim3 grid(num_seqs, num_fat_partitions, num_kv_heads);
     dim3 block(v0::kNumThreads);
 
-    const __hip_fp8_e4m3_fnuz* q_ptr =
-        reinterpret_cast<const __hip_fp8_e4m3_fnuz*>(query.data_ptr());
     const __hip_fp8_e4m3_fnuz* k_ptr =
         reinterpret_cast<const __hip_fp8_e4m3_fnuz*>(k_cache.data_ptr());
     const __hip_fp8_e4m3_fnuz* v_ptr =
         reinterpret_cast<const __hip_fp8_e4m3_fnuz*>(v_cache.data_ptr());
 
-    auto launch_with_mtp = [&](auto mtp_const) {
-        constexpr int kMtpC = decltype(mtp_const)::value;
-        pa_fp8_main_kernel_v3<output_t, kMtpC>
+    const float* q_scale_ptr     = query_is_fp8 ? q_scale_t.data_ptr<float>()
+                                                : nullptr;
+    const float* p_scale_ptr     = maybe_data_ptr_f32(p_scale_t);
+    const float* p_scale_inv_ptr = maybe_data_ptr_f32(p_scale_inv_t);
+
+    auto launch_full = [&](auto mtp_c, auto qin_tag, auto hps_c, auto pf_c) {
+        constexpr int  kMtp     = decltype(mtp_c)::value;
+        using QIn               = typename decltype(qin_tag)::type;
+        constexpr bool kHPS     = decltype(hps_c)::value;
+        constexpr bool kPrefetch = decltype(pf_c)::value;
+
+        const QIn* q_ptr = reinterpret_cast<const QIn*>(query.data_ptr());
+
+        pa_fp8_main_kernel_v2<output_t, kMtp, QIn, kHPS, kPrefetch>
             <<<grid, block, 0, stream>>>(
                 q_ptr, k_ptr, v_ptr,
                 static_cast<float>(scale),
-                q_scale_t.data_ptr<float>(),
+                q_scale_ptr,
                 k_scale_t.data_ptr<float>(),
                 v_scale_t.data_ptr<float>(),
-                p_scale_t.numel() ? p_scale_t.data_ptr<float>() : nullptr,
-                p_scale_inv_t.numel() ? p_scale_inv_t.data_ptr<float>() : nullptr,
-                p_scale_t.numel() != 0,
+                p_scale_ptr,
+                p_scale_inv_ptr,
                 block_tables.data_ptr<int>(),
                 context_lens.data_ptr<int>(),
                 max_num_blocks_per_seq,
-                q_stride, kv_block_stride, kv_head_stride,
+                q_stride, kv_block_stride, kv_head_stride, ks_head_stride,
                 exp_sums.data_ptr<float>(),
                 max_logits.data_ptr<float>(),
                 reinterpret_cast<output_t*>(tmp_out.data_ptr()),
                 num_kblocks_per_fat_part);
     };
 
-    if (mtp == 1) launch_with_mtp(std::integral_constant<int, 1>{});
-    else          launch_with_mtp(std::integral_constant<int, 2>{});
+    // Cross-kbi K/K-scale prefetch helps when each CTA executes ≥2 kbi
+    // iters: the prefetch latency hides behind PV MFMA of the previous
+    // iter.  When `num_kblocks_per_fat_part == 1` (1 iter per CTA), the
+    // prologue prefetch + a wasted "next-kbi" prefetch on the only iter
+    // are pure overhead → fall back to the no-prefetch baseline.
+    //
+    // CUDA-graph-capture safe: dispatch decision uses only
+    // `num_kblocks_per_fat_part`, which is a function of (bs, mtp,
+    // num_fat_partitions) — all known at launcher time independent of
+    // actual context_len.
+    const bool use_prefetch = (num_kblocks_per_fat_part >= 2);
+
+    auto launch_with_pf = [&](auto mtp_c, auto qin_tag, auto hps_c) {
+        if (use_prefetch) launch_full(mtp_c, qin_tag, hps_c, std::true_type{});
+        else              launch_full(mtp_c, qin_tag, hps_c, std::false_type{});
+    };
+
+    auto launch_with_hps = [&](auto mtp_c, auto qin_tag) {
+        if (has_pscale) launch_with_pf(mtp_c, qin_tag, std::true_type{});
+        else            launch_with_pf(mtp_c, qin_tag, std::false_type{});
+    };
+
+    auto launch_with_qin = [&](auto mtp_c) {
+        if (query_is_fp8)
+            launch_with_hps(mtp_c, qin_t<__hip_fp8_e4m3_fnuz>{});
+        else
+            launch_with_hps(mtp_c, qin_t<__hip_bfloat16>{});
+    };
+
+    if (mtp == 1) launch_with_qin(std::integral_constant<int, 1>{});
+    else          launch_with_qin(std::integral_constant<int, 2>{});
 }
+
+// (launch_main_v3_impl removed — v3 cross-iter prefetch dropped occupancy.)
 
 } // anonymous namespace
 
@@ -450,8 +363,6 @@ void pa_fp8_decode_v0(
     const at::Tensor& q_scale,           // [1] fp32 (per-tensor)
     const at::Tensor& k_scale,           // [1] fp32
     const at::Tensor& v_scale,           // [1] fp32
-    const at::Tensor& p_scale,
-    const at::Tensor& p_scale_inv,
     int64_t num_seqs, int64_t num_kv_heads, int64_t num_q_heads,
     int64_t head_size, int64_t block_size, int64_t mtp,
     int64_t max_num_partitions,
@@ -466,13 +377,12 @@ void pa_fp8_decode_v0(
                 && k_scale.scalar_type() == at::kFloat
                 && v_scale.scalar_type() == at::kFloat,
                 "scales must be float32 tensors");
-    check_p_scale_tensors(p_scale, p_scale_inv, (int)num_q_heads);
 
     if (is_bf16(output))
     {
         launch_main_v0_impl<__hip_bfloat16>(
             query, k_cache, v_cache, block_tables, context_lens,
-            q_scale, k_scale, v_scale, p_scale, p_scale_inv,
+            q_scale, k_scale, v_scale,
             exp_sums, max_logits, tmp_out,
             (int)num_seqs, (int)num_kv_heads, (int)num_q_heads,
             (int)head_size, (int)block_size, (int)mtp,
@@ -480,13 +390,15 @@ void pa_fp8_decode_v0(
         launch_reduce_impl<__hip_bfloat16>(
             output, exp_sums, max_logits, tmp_out, context_lens,
             (int)num_seqs, (int)num_q_heads, (int)head_size, (int)mtp,
-            (int)max_num_partitions);
+            (int)max_num_partitions,
+            /*fixed_num_partitions=*/-1,
+            /*num_kblocks_per_fat_part=*/0);
     }
     else if (is_fp16(output))
     {
         launch_main_v0_impl<_Float16>(
             query, k_cache, v_cache, block_tables, context_lens,
-            q_scale, k_scale, v_scale, p_scale, p_scale_inv,
+            q_scale, k_scale, v_scale,
             exp_sums, max_logits, tmp_out,
             (int)num_seqs, (int)num_kv_heads, (int)num_q_heads,
             (int)head_size, (int)block_size, (int)mtp,
@@ -494,7 +406,9 @@ void pa_fp8_decode_v0(
         launch_reduce_impl<_Float16>(
             output, exp_sums, max_logits, tmp_out, context_lens,
             (int)num_seqs, (int)num_q_heads, (int)head_size, (int)mtp,
-            (int)max_num_partitions);
+            (int)max_num_partitions,
+            /*fixed_num_partitions=*/-1,
+            /*num_kblocks_per_fat_part=*/0);
     }
     else
     {
@@ -502,82 +416,7 @@ void pa_fp8_decode_v0(
     }
 }
 
-// ---------------------------------------------------------------------------
-// pa_fp8_decode_v1 — fat-CTA variant.
-//   num_fat_partitions       : kernel grid Y (≤ ~8, matches gluon's
-//                              get_recommended_splits policy)
-//   num_kblocks_per_fat_part : each CTA loops over this many 256-token
-//                              sub-blocks (last CTA may stop early)
-// Reduce kernel is launched with fixed_num_partitions=num_fat_partitions so
-// every (seq, head) reads exactly num_fat_partitions partial outputs.
-// ---------------------------------------------------------------------------
-void pa_fp8_decode_v1(
-    at::Tensor&       output,
-    at::Tensor&       tmp_out,
-    at::Tensor&       exp_sums,
-    at::Tensor&       max_logits,
-    const at::Tensor& query,
-    const at::Tensor& k_cache,
-    const at::Tensor& v_cache,
-    const at::Tensor& block_tables,
-    const at::Tensor& context_lens,
-    const at::Tensor& q_scale,
-    const at::Tensor& k_scale,
-    const at::Tensor& v_scale,
-    const at::Tensor& p_scale,
-    const at::Tensor& p_scale_inv,
-    int64_t num_seqs, int64_t num_kv_heads, int64_t num_q_heads,
-    int64_t head_size, int64_t block_size, int64_t mtp,
-    int64_t num_fat_partitions,
-    int64_t num_kblocks_per_fat_part,
-    double scale)
-{
-    const c10::hip::OptionalHIPGuardMasqueradingAsCUDA guard(query.device());
-
-    TORCH_CHECK(is_fp8_e4m3(query),   "query must be float8_e4m3fnuz");
-    TORCH_CHECK(is_fp8_e4m3(k_cache), "k_cache must be float8_e4m3fnuz");
-    TORCH_CHECK(is_fp8_e4m3(v_cache), "v_cache must be float8_e4m3fnuz");
-    TORCH_CHECK(q_scale.scalar_type() == at::kFloat
-                && k_scale.scalar_type() == at::kFloat
-                && v_scale.scalar_type() == at::kFloat,
-                "scales must be float32 tensors");
-    check_p_scale_tensors(p_scale, p_scale_inv, (int)num_q_heads);
-
-    if (is_bf16(output))
-    {
-        launch_main_v1_impl<__hip_bfloat16>(
-            query, k_cache, v_cache, block_tables, context_lens,
-            q_scale, k_scale, v_scale, p_scale, p_scale_inv,
-            exp_sums, max_logits, tmp_out,
-            (int)num_seqs, (int)num_kv_heads, (int)num_q_heads,
-            (int)head_size, (int)block_size, (int)mtp,
-            (int)num_fat_partitions, (int)num_kblocks_per_fat_part, scale);
-        launch_reduce_impl<__hip_bfloat16>(
-            output, exp_sums, max_logits, tmp_out, context_lens,
-            (int)num_seqs, (int)num_q_heads, (int)head_size, (int)mtp,
-            (int)num_fat_partitions,
-            /*fixed_num_partitions=*/(int)num_fat_partitions);
-    }
-    else if (is_fp16(output))
-    {
-        launch_main_v1_impl<_Float16>(
-            query, k_cache, v_cache, block_tables, context_lens,
-            q_scale, k_scale, v_scale, p_scale, p_scale_inv,
-            exp_sums, max_logits, tmp_out,
-            (int)num_seqs, (int)num_kv_heads, (int)num_q_heads,
-            (int)head_size, (int)block_size, (int)mtp,
-            (int)num_fat_partitions, (int)num_kblocks_per_fat_part, scale);
-        launch_reduce_impl<_Float16>(
-            output, exp_sums, max_logits, tmp_out, context_lens,
-            (int)num_seqs, (int)num_q_heads, (int)head_size, (int)mtp,
-            (int)num_fat_partitions,
-            /*fixed_num_partitions=*/(int)num_fat_partitions);
-    }
-    else
-    {
-        TORCH_CHECK(false, "output must be bf16 or fp16");
-    }
-}
+// (pa_fp8_decode_v1 removed — v1 path deprecated; decode_auto uses v2.)
 
 // ---------------------------------------------------------------------------
 // pa_fp8_decode_v2 — gluon-aligned fat-CTA variant, optimized for bs >= 32.
@@ -610,14 +449,16 @@ void pa_fp8_decode_v2(
 {
     const c10::hip::OptionalHIPGuardMasqueradingAsCUDA guard(query.device());
 
-    TORCH_CHECK(is_fp8_e4m3(query),   "query must be float8_e4m3fnuz");
+    TORCH_CHECK(is_fp8_e4m3(query) || is_bf16(query),
+        "query must be float8_e4m3fnuz or bfloat16 (got ", query.dtype(), ")");
     TORCH_CHECK(is_fp8_e4m3(k_cache), "k_cache must be float8_e4m3fnuz");
     TORCH_CHECK(is_fp8_e4m3(v_cache), "v_cache must be float8_e4m3fnuz");
-    TORCH_CHECK(q_scale.scalar_type() == at::kFloat
-                && k_scale.scalar_type() == at::kFloat
+    TORCH_CHECK(k_scale.scalar_type() == at::kFloat
                 && v_scale.scalar_type() == at::kFloat,
-                "scales must be float32 tensors");
-    check_p_scale_tensors(p_scale, p_scale_inv, (int)num_q_heads);
+                "k_scale / v_scale must be float32 tensors");
+    if (is_fp8_e4m3(query))
+        TORCH_CHECK(q_scale.scalar_type() == at::kFloat,
+            "q_scale must be float32 when query is fp8");
 
     if (is_bf16(output))
     {
@@ -628,11 +469,16 @@ void pa_fp8_decode_v2(
             (int)num_seqs, (int)num_kv_heads, (int)num_q_heads,
             (int)head_size, (int)block_size, (int)mtp,
             (int)num_fat_partitions, (int)num_kblocks_per_fat_part, scale);
+        // num_kblocks_per_fat_part=0 is the v2 RUNTIME-page-size sentinel:
+        // the reduce derives active partitions from the actual context +
+        // num_fat_partitions, matching the v2 main kernel's runtime
+        // `cdiv(total_num_kblocks, gridDim.y)` slicing (FlyDSL-aligned).
         launch_reduce_impl<__hip_bfloat16>(
             output, exp_sums, max_logits, tmp_out, context_lens,
             (int)num_seqs, (int)num_q_heads, (int)head_size, (int)mtp,
             (int)num_fat_partitions,
-            /*fixed_num_partitions=*/(int)num_fat_partitions);
+            /*fixed_num_partitions=*/(int)num_fat_partitions,
+            /*num_kblocks_per_fat_part=*/0);
     }
     else if (is_fp16(output))
     {
@@ -643,11 +489,13 @@ void pa_fp8_decode_v2(
             (int)num_seqs, (int)num_kv_heads, (int)num_q_heads,
             (int)head_size, (int)block_size, (int)mtp,
             (int)num_fat_partitions, (int)num_kblocks_per_fat_part, scale);
+        // num_kblocks_per_fat_part=0: v2 RUNTIME-page-size sentinel (see bf16 branch).
         launch_reduce_impl<_Float16>(
             output, exp_sums, max_logits, tmp_out, context_lens,
             (int)num_seqs, (int)num_q_heads, (int)head_size, (int)mtp,
             (int)num_fat_partitions,
-            /*fixed_num_partitions=*/(int)num_fat_partitions);
+            /*fixed_num_partitions=*/(int)num_fat_partitions,
+            /*num_kblocks_per_fat_part=*/0);
     }
     else
     {
@@ -655,77 +503,7 @@ void pa_fp8_decode_v2(
     }
 }
 
-// ---------------------------------------------------------------------------
-// pa_fp8_decode_v3 — cross-iter K prefetch fat-CTA variant.
-// Same layout / reduce contract as v1 and v2.
-// ---------------------------------------------------------------------------
-void pa_fp8_decode_v3(
-    at::Tensor&       output,
-    at::Tensor&       tmp_out,
-    at::Tensor&       exp_sums,
-    at::Tensor&       max_logits,
-    const at::Tensor& query,
-    const at::Tensor& k_cache,
-    const at::Tensor& v_cache,
-    const at::Tensor& block_tables,
-    const at::Tensor& context_lens,
-    const at::Tensor& q_scale,
-    const at::Tensor& k_scale,
-    const at::Tensor& v_scale,
-    const at::Tensor& p_scale,
-    const at::Tensor& p_scale_inv,
-    int64_t num_seqs, int64_t num_kv_heads, int64_t num_q_heads,
-    int64_t head_size, int64_t block_size, int64_t mtp,
-    int64_t num_fat_partitions,
-    int64_t num_kblocks_per_fat_part,
-    double scale)
-{
-    const c10::hip::OptionalHIPGuardMasqueradingAsCUDA guard(query.device());
-
-    TORCH_CHECK(is_fp8_e4m3(query),   "query must be float8_e4m3fnuz");
-    TORCH_CHECK(is_fp8_e4m3(k_cache), "k_cache must be float8_e4m3fnuz");
-    TORCH_CHECK(is_fp8_e4m3(v_cache), "v_cache must be float8_e4m3fnuz");
-    TORCH_CHECK(q_scale.scalar_type() == at::kFloat
-                && k_scale.scalar_type() == at::kFloat
-                && v_scale.scalar_type() == at::kFloat,
-                "scales must be float32 tensors");
-    check_p_scale_tensors(p_scale, p_scale_inv, (int)num_q_heads);
-
-    if (is_bf16(output))
-    {
-        launch_main_v3_impl<__hip_bfloat16>(
-            query, k_cache, v_cache, block_tables, context_lens,
-            q_scale, k_scale, v_scale, p_scale, p_scale_inv,
-            exp_sums, max_logits, tmp_out,
-            (int)num_seqs, (int)num_kv_heads, (int)num_q_heads,
-            (int)head_size, (int)block_size, (int)mtp,
-            (int)num_fat_partitions, (int)num_kblocks_per_fat_part, scale);
-        launch_reduce_impl<__hip_bfloat16>(
-            output, exp_sums, max_logits, tmp_out, context_lens,
-            (int)num_seqs, (int)num_q_heads, (int)head_size, (int)mtp,
-            (int)num_fat_partitions,
-            /*fixed_num_partitions=*/(int)num_fat_partitions);
-    }
-    else if (is_fp16(output))
-    {
-        launch_main_v3_impl<_Float16>(
-            query, k_cache, v_cache, block_tables, context_lens,
-            q_scale, k_scale, v_scale, p_scale, p_scale_inv,
-            exp_sums, max_logits, tmp_out,
-            (int)num_seqs, (int)num_kv_heads, (int)num_q_heads,
-            (int)head_size, (int)block_size, (int)mtp,
-            (int)num_fat_partitions, (int)num_kblocks_per_fat_part, scale);
-        launch_reduce_impl<_Float16>(
-            output, exp_sums, max_logits, tmp_out, context_lens,
-            (int)num_seqs, (int)num_q_heads, (int)head_size, (int)mtp,
-            (int)num_fat_partitions,
-            /*fixed_num_partitions=*/(int)num_fat_partitions);
-    }
-    else
-    {
-        TORCH_CHECK(false, "output must be bf16 or fp16");
-    }
-}
+// (pa_fp8_decode_v3 removed — v3 cross-iter prefetch dropped occupancy.)
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -743,8 +521,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           pybind11::arg("q_scale"),
           pybind11::arg("k_scale"),
           pybind11::arg("v_scale"),
-          pybind11::arg("p_scale"),
-          pybind11::arg("p_scale_inv"),
           pybind11::arg("num_seqs"),
           pybind11::arg("num_kv_heads"),
           pybind11::arg("num_q_heads"),
@@ -754,63 +530,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           pybind11::arg("max_num_partitions"),
           pybind11::arg("scale"));
 
-    m.def("pa_fp8_decode_v1", &pa_fp8_decode_v1,
-          "FP8 paged-attention decode v1 (fat-CTA, online softmax across "
-          "sub-partitions; mirrors gluon's get_recommended_splits scheduling)",
-          pybind11::arg("output"),
-          pybind11::arg("tmp_out"),
-          pybind11::arg("exp_sums"),
-          pybind11::arg("max_logits"),
-          pybind11::arg("query"),
-          pybind11::arg("k_cache"),
-          pybind11::arg("v_cache"),
-          pybind11::arg("block_tables"),
-          pybind11::arg("context_lens"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale"),
-          pybind11::arg("p_scale"),
-          pybind11::arg("p_scale_inv"),
-          pybind11::arg("num_seqs"),
-          pybind11::arg("num_kv_heads"),
-          pybind11::arg("num_q_heads"),
-          pybind11::arg("head_size"),
-          pybind11::arg("block_size"),
-          pybind11::arg("mtp"),
-          pybind11::arg("num_fat_partitions"),
-          pybind11::arg("num_kblocks_per_fat_part"),
-          pybind11::arg("scale"));
-
     m.def("pa_fp8_decode_v2", &pa_fp8_decode_v2,
           "FP8 paged-attention decode v2 (gluon-aligned fat-CTA with "
-          "inter-tile K prefetch; tuned for bs >= 32, ctx >= 64k)",
-          pybind11::arg("output"),
-          pybind11::arg("tmp_out"),
-          pybind11::arg("exp_sums"),
-          pybind11::arg("max_logits"),
-          pybind11::arg("query"),
-          pybind11::arg("k_cache"),
-          pybind11::arg("v_cache"),
-          pybind11::arg("block_tables"),
-          pybind11::arg("context_lens"),
-          pybind11::arg("q_scale"),
-          pybind11::arg("k_scale"),
-          pybind11::arg("v_scale"),
-          pybind11::arg("p_scale"),
-          pybind11::arg("p_scale_inv"),
-          pybind11::arg("num_seqs"),
-          pybind11::arg("num_kv_heads"),
-          pybind11::arg("num_q_heads"),
-          pybind11::arg("head_size"),
-          pybind11::arg("block_size"),
-          pybind11::arg("mtp"),
-          pybind11::arg("num_fat_partitions"),
-          pybind11::arg("num_kblocks_per_fat_part"),
-          pybind11::arg("scale"));
-
-    m.def("pa_fp8_decode_v3", &pa_fp8_decode_v3,
-          "FP8 paged-attention decode v3 (cross-iteration K prefetch software "
-          "pipeline on top of v2 wide-load; targets bs >= 64, ctx >= 64k)",
+          "inter-tile K prefetch; tuned for bs >= 32, ctx >= 64k; "
+          "FlyDSL-aligned: accepts bf16 OR fp8 query and optional p_scale)",
           pybind11::arg("output"),
           pybind11::arg("tmp_out"),
           pybind11::arg("exp_sums"),

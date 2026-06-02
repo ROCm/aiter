@@ -33,7 +33,11 @@ NUM_KV_HEADS = 1
 HEAD_SIZE = 128
 BLOCK_SIZE = 16
 FP8 = dtypes.fp8
-DEFAULT_P_SCALE = 256.0
+# gfx942 packs P in fp8 e4m3fnuz (max magnitude 240): a p_scale that pushes the
+# peak prob (1.0) past 240 saturates / NaNs on this arch.  The documented
+# p_scale=256 is an e4m3fn / gfx950 value, so the explicit "scalar" sweep mode
+# uses a safe 128 here.
+DEFAULT_P_SCALE = 128.0
 
 
 def _make_inputs(bs: int, ctx: int, mtp: int, seed: int = 0) -> Tuple[torch.Tensor, ...]:
@@ -107,12 +111,12 @@ def _reference_decode(
 
     q_deq = query.float() * q_scale[:, :, None]
     if p_scale is None:
-        p_scale = torch.full(
-            (NUM_Q_HEADS,), DEFAULT_P_SCALE,
-            dtype=torch.float32, device=query.device)
-        p_scale_inv = torch.full(
-            (NUM_Q_HEADS,), 1.0 / DEFAULT_P_SCALE,
-            dtype=torch.float32, device=query.device)
+        # No p_scale requested → mirror the production default (p_scale OFF):
+        # the reference applies an identity scale, so this path validates the
+        # no-p_scale fp8 P quantisation directly (and matches the kernel, which
+        # runs HasPScale=false when the caller passes nothing).
+        p_scale = torch.ones(NUM_Q_HEADS, dtype=torch.float32, device=query.device)
+        p_scale_inv = torch.ones(NUM_Q_HEADS, dtype=torch.float32, device=query.device)
     elif p_scale.numel() == 1 and p_scale_inv is not None and p_scale_inv.numel() == 1:
         p_scale = p_scale.reshape(1).expand(NUM_Q_HEADS)
         p_scale_inv = p_scale_inv.reshape(1).expand(NUM_Q_HEADS)
@@ -184,9 +188,9 @@ def _run_paged_attention(
 
 
 def _make_pscale(mode: str, device: torch.device):
-    if mode in ("none", "default_256"):
+    if mode in ("none", "default"):
         return None, None
-    if mode == "scalar_256":
+    if mode == "scalar":
         p = torch.tensor(DEFAULT_P_SCALE, dtype=torch.float32, device=device)
         return p, torch.tensor(1.0 / DEFAULT_P_SCALE, dtype=torch.float32, device=device)
     if mode == "all_ones":
@@ -283,18 +287,19 @@ parser = argparse.ArgumentParser(
     description="Test project-internal FP8 GQA paged-attention decode.",
 )
 parser.add_argument("--bs", type=int, nargs="+", default=[2, 16],
-                    help="Batch sizes to sweep; bs=2 exercises v1, bs=16 exercises v2 for mtp=1.")
+                    help="Batch sizes to sweep (all sizes dispatch to the v2 kernel).")
 parser.add_argument("--ctx", type=int, nargs="+", default=[64],
                     help="Context lengths to sweep.")
 parser.add_argument("--mtp", type=int, nargs="+", default=[1, 2],
                     help="MTP values to sweep.")
 parser.add_argument("--p_scale_mode", type=str, nargs="+",
-                    default=["default_256", "scalar_256", "all_2", "per_head_random"],
+                    default=["none", "scalar", "all_2", "per_head_random"],
                     choices=[
-                        "none", "default_256", "scalar_256",
+                        "none", "default", "scalar",
                         "all_ones", "all_2", "per_head_random",
                     ],
-                    help="P scale modes to sweep; none/default_256 use the kernel default.")
+                    help="P scale modes to sweep; none/default use the kernel "
+                         "default (p_scale off).")
 parser.add_argument("--iters", type=int, default=100,
                     help="Timing iterations per cell.")
 parser.add_argument("--atol", type=float, default=2e-1)

@@ -1,0 +1,810 @@
+diff --git a/example/ck_tile/01_fmha/codegen/cpp_symbol_map.py b/example/ck_tile/01_fmha/codegen/cpp_symbol_map.py
+index e9ae11fb5..14f2beec1 100644
+--- a/example/ck_tile/01_fmha/codegen/cpp_symbol_map.py
++++ b/example/ck_tile/01_fmha/codegen/cpp_symbol_map.py
+@@ -81,6 +81,7 @@ QSCALE_MAP = {
+     "pertensor": "ck_tile::BlockAttentionQuantScaleEnum::PERTENSOR",
+     "blockscale": "ck_tile::BlockAttentionQuantScaleEnum::BLOCKSCALE",
+     "kv_blockscale": "ck_tile::BlockAttentionQuantScaleEnum::KV_BLOCKSCALE",
++    "per_token_head": "ck_tile::BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD",
+     "mx": "ck_tile::BlockAttentionQuantScaleEnum::MX",
+ }
+ 
+@@ -89,6 +90,7 @@ QSCALE_CHECK_MAP = {
+     "pertensor": "quant_scale_enum::pertensor",
+     "blockscale": "quant_scale_enum::blockscale",
+     "kv_blockscale": "quant_scale_enum::kv_blockscale",
++    "per_token_head": "quant_scale_enum::per_token_head",
+     "mx": "quant_scale_enum::mx",
+ }
+ 
+diff --git a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
+index 35e8c1be4..e41e31abe 100644
+--- a/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
++++ b/example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py
+@@ -36,7 +36,7 @@ DTYPE_BITS = {
+ 
+ K0_MAX_SUBMAX_MAP = {32: 32, 64: 64, 96: 128, 128: 128, 256: 256}
+ 
+-SUPPORTED_PAGE_SIZE = [1, 16, 1024]
++SUPPORTED_PAGE_SIZE = [1, 16, 64, 1024]
+ SUPPORTED_KV_MEMORY_LAYOUT = ["vectorized", "linear"]
+ SUPPORTED_KV_LOOKUP_TABLE = ["vllm", "sglang"]
+ KV_MEMORY_LAYOUT_ENUM_MAP = {
+@@ -678,7 +678,7 @@ class KernelComponentFactory:
+                 kv_lookup_table,
+             ) in itertools.product(
+                 ["t", "f"],
+-                ["pertensor", "kv_blockscale"],
++                ["pertensor", "kv_blockscale", "per_token_head"],
+                 get_mask_map(mask_impl).keys(),
+                 ["no"],
+                 SUPPORTED_KV_MEMORY_LAYOUT,
+@@ -741,9 +741,11 @@ def get_fwd_blobs(
+                 for page_size in SUPPORTED_PAGE_SIZE:
+                     if page_size == 1 and pipeline.F_kv_memory_layout != "linear":
+                         continue
+-                    # kv_blockscale requires page_size >= kN0 (tile.F_bn0)
+-                    # This ensures all tokens in a main loop iteration belong to the same page
+-                    if pipeline.F_qscale == "kv_blockscale" and page_size < tile.F_bn0:
++                    # kv_blockscale only supports page_size >= kN0; per_token_head can cross pages.
++                    if (
++                        pipeline.F_qscale == "kv_blockscale"
++                        and page_size < tile.F_bn0
++                    ):
+                         continue
+                     k = FmhaFwdKernel(
+                         F_idx=0,
+diff --git a/example/ck_tile/01_fmha/fmha_fwd.hpp b/example/ck_tile/01_fmha/fmha_fwd.hpp
+index 521f1e473..62359ef6b 100644
+--- a/example/ck_tile/01_fmha/fmha_fwd.hpp
++++ b/example/ck_tile/01_fmha/fmha_fwd.hpp
+@@ -671,8 +671,36 @@ struct fmha_batch_prefill_args
+     // v_descale_ptr: [num_block, num_kv_head] - points to v block descale
+     ck_tile::index_t nblock_stride_kv_block_descale = 0; // Stride along num_block dimension
+     ck_tile::index_t nhead_stride_kv_block_descale  = 0; // Stride along num_kv_head dimension
++
++    // PER_TOKEN_HEAD: q/k use per-token-per-head descales; v uses per-head descales.
++    ck_tile::index_t stride_q_descale_token       = 0; // Q descale: row stride (per-token)
++    ck_tile::index_t nhead_stride_q_descale       = 0; // Q descale: head stride
++    ck_tile::index_t nblock_stride_k_descale_page = 0; // K descale: page stride
++    ck_tile::index_t stride_k_descale_token       = 0; // K descale: within-page token stride
++    ck_tile::index_t nhead_stride_k_descale       = 0; // K descale: head stride
++    ck_tile::index_t nhead_stride_v_descale       = 0; // V descale: head stride (per-head only)
++
++    // PER_TOKEN_HEAD optional per-q-head P scale [num_head_q] fp32.
++    const void* p_scale_ptr                       = nullptr;
+ };
+ 
++// Select KV-cache load mode for batch-prefill.
++inline ck_tile::BlockAttentionKVCacheLoadModeEnum
++fmha_batch_prefill_select_kv_load_mode(ck_tile::index_t page_block_size,
++                                       ck_tile::index_t kN0,
++                                       ck_tile::index_t num_total_pages,
++                                       ck_tile::index_t batch_stride_k,
++                                       ck_tile::index_t element_bytes)
++{
++    // Promote all operands before multiply to avoid intermediate overflow.
++    const auto kv_pool_bytes = static_cast<ck_tile::long_index_t>(num_total_pages) *
++                               static_cast<ck_tile::long_index_t>(batch_stride_k) *
++                               static_cast<ck_tile::long_index_t>(element_bytes);
++    return (page_block_size < kN0 && kv_pool_bytes > INT32_MAX)
++               ? ck_tile::BlockAttentionKVCacheLoadModeEnum::GLOBAL_LOAD_LDS
++               : ck_tile::BlockAttentionKVCacheLoadModeEnum::BUFFER_LOAD;
++}
++
+ template <typename FmhaKernel>
+ auto fmha_fwd_create_kargs_and_grids(fmha_fwd_args args)
+ {
+@@ -1307,7 +1335,14 @@ auto fmha_batch_prefill_create_kargs_and_grids(fmha_batch_prefill_args args)
+                                          args.drop_seed_offset,
+                                          args.sink_ptr,
+                                          args.nblock_stride_kv_block_descale,
+-                                         args.nhead_stride_kv_block_descale);
++                                         args.nhead_stride_kv_block_descale,
++                                         args.stride_q_descale_token,
++                                         args.nhead_stride_q_descale,
++                                         args.nblock_stride_k_descale_page,
++                                         args.stride_k_descale_token,
++                                         args.nhead_stride_k_descale,
++                                         args.nhead_stride_v_descale,
++                                         args.p_scale_ptr);
+         }
+         else
+         { // create batch mode kernel arguments
+@@ -1362,7 +1397,14 @@ auto fmha_batch_prefill_create_kargs_and_grids(fmha_batch_prefill_args args)
+                                          args.drop_seed_offset,
+                                          args.sink_ptr,
+                                          args.nblock_stride_kv_block_descale,
+-                                         args.nhead_stride_kv_block_descale);
++                                         args.nhead_stride_kv_block_descale,
++                                         args.stride_q_descale_token,
++                                         args.nhead_stride_q_descale,
++                                         args.nblock_stride_k_descale_page,
++                                         args.stride_k_descale_token,
++                                         args.nhead_stride_k_descale,
++                                         args.nhead_stride_v_descale,
++                                         args.p_scale_ptr);
+         }
+     }();
+ 
+diff --git a/example/ck_tile/01_fmha/quant.hpp b/example/ck_tile/01_fmha/quant.hpp
+index 4b8cd2e9a..70c4f843a 100644
+--- a/example/ck_tile/01_fmha/quant.hpp
++++ b/example/ck_tile/01_fmha/quant.hpp
+@@ -14,11 +14,12 @@
+ // keep sync with BlockAttentionQuantScaleEnum
+ enum class quant_scale_enum
+ {
+-    no_scale      = 0,
+-    pertensor     = 1,
+-    blockscale    = 2,
+-    kv_blockscale = 3, // Q per-tensor, K/V per-page block scale
+-    mx            = 4, // Microscaling (MX)
++    no_scale       = 0,
++    pertensor      = 1,
++    blockscale     = 2,
++    kv_blockscale  = 3, // Q per-tensor, K/V per-page block scale
++    mx             = 4, // Microscaling (MX)
++    per_token_head = 5, // Q/K per-token per-head, V per-head (FP8 fine-grained)
+ };
+ 
+ struct quant_scale_info
+@@ -37,6 +38,8 @@ struct quant_scale_info
+             os << "kvbs";
+         else if(type == quant_scale_enum::mx)
+             os << "mx";
++        else if(type == quant_scale_enum::per_token_head)
++            os << "pth";
+     }
+ 
+     static quant_scale_info decode(std::string str)
+@@ -62,6 +65,10 @@ struct quant_scale_info
+         {
+             info.type = quant_scale_enum::mx;
+         }
++        else if(str == "pth" || str == "5")
++        {
++            info.type = quant_scale_enum::per_token_head;
++        }
+         else
+         {
+             throw std::invalid_argument("invalid quant scale value: " + str);
+diff --git a/include/ck_tile/ops/fmha/block/block_attention_kv_load_mode_enum.hpp b/include/ck_tile/ops/fmha/block/block_attention_kv_load_mode_enum.hpp
+new file mode 100644
+index 000000000..826cd106f
+--- /dev/null
++++ b/include/ck_tile/ops/fmha/block/block_attention_kv_load_mode_enum.hpp
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
++
++#pragma once
++
++namespace ck_tile {
++
++// KV cache load addressing mode selector for batch_prefill / paged-attention pipelines.
++// - BUFFER_LOAD:     SGPR-based SRD via buffer_load_* (default; 32-bit byte addressing, <2GB pool)
++// - GLOBAL_LOAD_LDS: direct global_load_lds_* (64-bit addressing, required for >2GB KV cache)
++enum class BlockAttentionKVCacheLoadModeEnum
++{
++    BUFFER_LOAD     = 0,
++    GLOBAL_LOAD_LDS = 1,
++};
++
++} // namespace ck_tile
+diff --git a/include/ck_tile/ops/fmha/block/block_attention_quant_scale_enum.hpp b/include/ck_tile/ops/fmha/block/block_attention_quant_scale_enum.hpp
+index 61051cc08..401f2050a 100644
+--- a/include/ck_tile/ops/fmha/block/block_attention_quant_scale_enum.hpp
++++ b/include/ck_tile/ops/fmha/block/block_attention_quant_scale_enum.hpp
+@@ -10,11 +10,12 @@ namespace ck_tile {
+ // This class is used for codegen pattern matching
+ enum class BlockAttentionQuantScaleEnum
+ {
+-    NO_SCALE      = 0,
+-    PERTENSOR     = 1,
+-    BLOCKSCALE    = 2,
+-    KV_BLOCKSCALE = 3, // Q per-tensor, K/V per-page block scale
+-    MX            = 4, // Microscaling
++    NO_SCALE       = 0,
++    PERTENSOR      = 1,
++    BLOCKSCALE     = 2,
++    KV_BLOCKSCALE  = 3, // Q per-tensor, K/V per-page block scale
++    MX             = 4, // Microscaling
++    PER_TOKEN_HEAD = 5, // Q/K per-token per-head, V per-head (FP8 fine-grained)
+ };
+ 
+ template <BlockAttentionQuantScaleEnum>
+@@ -45,5 +46,10 @@ struct BlockAttentionQuantScaleEnumToStr<BlockAttentionQuantScaleEnum::MX>
+ {
+     static constexpr const char* name = "mx";
+ };
++template <>
++struct BlockAttentionQuantScaleEnumToStr<BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD>
++{
++    static constexpr const char* name = "per_token_head";
++};
+ 
+ } // namespace ck_tile
+diff --git a/include/ck_tile/ops/fmha/kernel/fmha_batch_prefill_kernel.hpp b/include/ck_tile/ops/fmha/kernel/fmha_batch_prefill_kernel.hpp
+index a658a44e1..988171f50 100644
+--- a/include/ck_tile/ops/fmha/kernel/fmha_batch_prefill_kernel.hpp
++++ b/include/ck_tile/ops/fmha/kernel/fmha_batch_prefill_kernel.hpp
+@@ -205,6 +205,25 @@ struct FmhaBatchPrefillWithPagedKVCacheKernel
+         ck_tile::index_t nhead_stride_kv_block_descale  = 0; // Stride along num_kv_head dimension
+     };
+ 
++    // PER_TOKEN_HEAD: Q per-token-per-head, K per-token-per-head (paged-aligned), V per-head
++    //   q_descale: [total_q, nhead_q]
++    //   k_descale: [num_total_pages, page_block_size, nhead_k]
++    //   v_descale: [nhead_k]
++    struct FmhaFwdPerTokenHeadKargs
++    {
++        const void* q_descale_ptr                  = nullptr;
++        const void* k_descale_ptr                  = nullptr;
++        const void* v_descale_ptr                  = nullptr;
++        ck_tile::index_t stride_q_descale_token    = 0;
++        ck_tile::index_t nhead_stride_q_descale    = 0;
++        ck_tile::index_t nblock_stride_k_descale_page = 0;
++        ck_tile::index_t stride_k_descale_token    = 0;
++        ck_tile::index_t nhead_stride_k_descale    = 0;
++        ck_tile::index_t nhead_stride_v_descale    = 0;
++        // Optional per-q-head P scale [num_head_q] fp32.
++        const void* p_scale_ptr                    = nullptr;
++    };
++
+     // Helper template to select QScale Kargs type based on QScaleEnum
+     // EmptyType: type to use when QScaleEnum is NO_SCALE (e.g., FmhaFwdEmptyKargs<3>)
+     template <BlockAttentionQuantScaleEnum QScale, typename EmptyType>
+@@ -225,6 +244,12 @@ struct FmhaBatchPrefillWithPagedKVCacheKernel
+         using type = FmhaFwdKVBlockScaleKargs;
+     };
+ 
++    template <typename EmptyType>
++    struct GetQScaleKargs<BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD, EmptyType>
++    {
++        using type = FmhaFwdPerTokenHeadKargs;
++    };
++
+     struct FmhaFwdDropoutSeedOffset
+     {
+         template <typename T>
+@@ -379,7 +404,15 @@ struct FmhaBatchPrefillWithPagedKVCacheKernel
+                   drop_seed_offset,
+               const void* sink_ptr                            = nullptr,
+               ck_tile::index_t nblock_stride_kv_block_descale = 0,
+-              ck_tile::index_t nhead_stride_kv_block_descale  = 0)
++              ck_tile::index_t nhead_stride_kv_block_descale  = 0,
++              // PER_TOKEN_HEAD strides (only used when QScaleEnum == PER_TOKEN_HEAD)
++              ck_tile::index_t stride_q_descale_token       = 0,
++              ck_tile::index_t nhead_stride_q_descale       = 0,
++              ck_tile::index_t nblock_stride_k_descale_page = 0,
++              ck_tile::index_t stride_k_descale_token       = 0,
++              ck_tile::index_t nhead_stride_k_descale       = 0,
++              ck_tile::index_t nhead_stride_v_descale       = 0,
++              const void* p_scale_ptr                       = nullptr)
+     {
+         Kargs kargs{{q_ptr,
+                      k_ptr,
+@@ -458,6 +491,19 @@ struct FmhaBatchPrefillWithPagedKVCacheKernel
+             kargs.nblock_stride_kv_block_descale = nblock_stride_kv_block_descale;
+             kargs.nhead_stride_kv_block_descale  = nhead_stride_kv_block_descale;
+         }
++        else if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD)
++        {
++            kargs.q_descale_ptr                = q_descale_ptr;
++            kargs.k_descale_ptr                = k_descale_ptr;
++            kargs.v_descale_ptr                = v_descale_ptr;
++            kargs.stride_q_descale_token       = stride_q_descale_token;
++            kargs.nhead_stride_q_descale       = nhead_stride_q_descale;
++            kargs.nblock_stride_k_descale_page = nblock_stride_k_descale_page;
++            kargs.stride_k_descale_token       = stride_k_descale_token;
++            kargs.nhead_stride_k_descale       = nhead_stride_k_descale;
++            kargs.nhead_stride_v_descale       = nhead_stride_v_descale;
++            kargs.p_scale_ptr                  = p_scale_ptr;
++        }
+         if constexpr(kHasDropout)
+         {
+             if(drop_seed_offset.index() == 0) // seed & offset come from host
+@@ -536,7 +582,15 @@ struct FmhaBatchPrefillWithPagedKVCacheKernel
+                   drop_seed_offset,
+               const void* sink_ptr                            = nullptr,
+               ck_tile::index_t nblock_stride_kv_block_descale = 0,
+-              ck_tile::index_t nhead_stride_kv_block_descale  = 0)
++              ck_tile::index_t nhead_stride_kv_block_descale  = 0,
++              // PER_TOKEN_HEAD strides (only used when QScaleEnum == PER_TOKEN_HEAD)
++              ck_tile::index_t stride_q_descale_token       = 0,
++              ck_tile::index_t nhead_stride_q_descale       = 0,
++              ck_tile::index_t nblock_stride_k_descale_page = 0,
++              ck_tile::index_t stride_k_descale_token       = 0,
++              ck_tile::index_t nhead_stride_k_descale       = 0,
++              ck_tile::index_t nhead_stride_v_descale       = 0,
++              const void* p_scale_ptr                       = nullptr)
+     {
+         Kargs kargs{{q_ptr,
+                      k_ptr,
+@@ -612,6 +666,19 @@ struct FmhaBatchPrefillWithPagedKVCacheKernel
+             kargs.nblock_stride_kv_block_descale = nblock_stride_kv_block_descale;
+             kargs.nhead_stride_kv_block_descale  = nhead_stride_kv_block_descale;
+         }
++        else if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD)
++        {
++            kargs.q_descale_ptr                = q_descale_ptr;
++            kargs.k_descale_ptr                = k_descale_ptr;
++            kargs.v_descale_ptr                = v_descale_ptr;
++            kargs.stride_q_descale_token       = stride_q_descale_token;
++            kargs.nhead_stride_q_descale       = nhead_stride_q_descale;
++            kargs.nblock_stride_k_descale_page = nblock_stride_k_descale_page;
++            kargs.stride_k_descale_token       = stride_k_descale_token;
++            kargs.nhead_stride_k_descale       = nhead_stride_k_descale;
++            kargs.nhead_stride_v_descale       = nhead_stride_v_descale;
++            kargs.p_scale_ptr                  = p_scale_ptr;
++        }
+         if constexpr(kHasDropout)
+         {
+             if(drop_seed_offset.index() == 0) // seed & offset come from host
+@@ -1220,6 +1287,12 @@ struct FmhaBatchPrefillWithPagedKVCacheKernel
+                     float q_descale = *(reinterpret_cast<const float*>(kargs.q_descale_ptr));
+                     return kargs.scale_s * q_descale;
+                 }
++                else if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD)
++                {
++                    // Q/K descales are per-token-per-head, applied as outer product in pipeline.
++                    // Here we only forward the softmax scale (1/sqrt(d)).
++                    return kargs.scale_s;
++                }
+                 else
+                 {
+                     return kargs.scale_s;
+@@ -1337,6 +1410,51 @@ struct FmhaBatchPrefillWithPagedKVCacheKernel
+                                       kargs.nblock_stride_kv_block_descale,
+                                       kargs.nhead_stride_kv_block_descale);
+             }
++            else if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD)
++            {
++                // PER_TOKEN_HEAD: Q/K descales are per-token-per-head, V is per-head.
++                assert(kargs.q_descale_ptr != nullptr);
++                assert(kargs.k_descale_ptr != nullptr);
++                assert(kargs.v_descale_ptr != nullptr);
++                const float* q_descale_ptr = reinterpret_cast<const float*>(kargs.q_descale_ptr);
++                const float* k_descale_ptr = reinterpret_cast<const float*>(kargs.k_descale_ptr);
++                const float* v_descale_ptr = reinterpret_cast<const float*>(kargs.v_descale_ptr);
++
++                const float* p_scale_ptr =
++                    reinterpret_cast<const float*>(kargs.p_scale_ptr);
++
++                return FmhaPipeline{}(q_dram_window,
++                                      k_dram_window,
++                                      v_dram_window,
++                                      bias_dram_window,
++                                      randval_dram_window,
++                                      lse_dram_window,
++                                      mask,
++                                      position_encoding,
++                                      variant_params.sm_scale,
++                                      variant,
++                                      variant_params,
++                                      block_indices,
++                                      smem_ptr,
++                                      page_idx,
++                                      stride_k_for_pipeline,
++                                      stride_v_for_pipeline,
++                                      kargs.batch_stride_k,
++                                      kargs.batch_stride_v,
++                                      dropout,
++                                      sink_value,
++                                      max_page_table_idx,
++                                      q_descale_ptr,
++                                      k_descale_ptr,
++                                      v_descale_ptr,
++                                      kargs.stride_q_descale_token,
++                                      kargs.nhead_stride_q_descale,
++                                      kargs.nblock_stride_k_descale_page,
++                                      kargs.stride_k_descale_token,
++                                      kargs.nhead_stride_k_descale,
++                                      kargs.nhead_stride_v_descale,
++                                      p_scale_ptr);
++            }
+             else
+             {
+                 return FmhaPipeline{}(q_dram_window,
+diff --git a/include/ck_tile/ops/fmha/pipeline/block_fmha_batch_prefill_pipeline_qr_ks_vs_async.hpp b/include/ck_tile/ops/fmha/pipeline/block_fmha_batch_prefill_pipeline_qr_ks_vs_async.hpp
+index 691b270f8..2d63b2b1a 100644
+--- a/include/ck_tile/ops/fmha/pipeline/block_fmha_batch_prefill_pipeline_qr_ks_vs_async.hpp
++++ b/include/ck_tile/ops/fmha/pipeline/block_fmha_batch_prefill_pipeline_qr_ks_vs_async.hpp
+@@ -6,6 +6,7 @@
+ #include "ck_tile/core.hpp"
+ #include "ck_tile/ops/common/tensor_layout.hpp"
+ #include "ck_tile/ops/fmha/block/block_attention_bias_enum.hpp"
++#include "ck_tile/ops/fmha/block/block_attention_kv_load_mode_enum.hpp"
+ #include "ck_tile/ops/fmha/block/block_attention_kvcache_layout_enum.hpp"
+ #include "ck_tile/ops/fmha/block/block_attention_quant_scale_enum.hpp"
+ #include "ck_tile/ops/fmha/block/block_dropout.hpp"
+@@ -438,7 +439,24 @@ struct BlockFmhaBatchPrefillPipelineQRKSVSAsync
+                const float* k_descale_ptr             = nullptr,
+                const float* v_descale_ptr             = nullptr,
+                index_t nblock_stride_kv_block_descale = 0,
+-               index_t nhead_stride_kv_block_descale  = 0) const
++               index_t nhead_stride_kv_block_descale  = 0,
++               // PER_TOKEN_HEAD parameters (only used when QScaleEnum == PER_TOKEN_HEAD)
++               // Reuses k_descale_ptr / v_descale_ptr above; q_descale provided here.
++               // Layouts:
++               //   q_descale_per_token_ptr: [total_q, nhead_q]
++               //   k_descale_ptr (when PER_TOKEN_HEAD): [num_total_pages, page_block_size, nhead_k]
++               //   v_descale_ptr (when PER_TOKEN_HEAD): [nhead_k]
++               const float* q_descale_per_token_ptr   = nullptr,
++               index_t stride_q_descale_token         = 0,
++               index_t nhead_stride_q_descale         = 0,
++               index_t nblock_stride_k_descale_page   = 0,
++               index_t stride_k_descale_token         = 0,
++               index_t nhead_stride_k_descale         = 0,
++               index_t nhead_stride_v_descale         = 0,
++               // PER_TOKEN_HEAD caller P scale [num_head_q] fp32, optional.
++               // Folded into the exp2 row-max shift; the rowsum carries the
++               // same factor so it cancels in O/l with no v_descale fixup.
++               const float* p_scale_ptr               = nullptr) const
+     {
+         // KV_BLOCKSCALE requires page_block_size >= kN0 to ensure
+         // all tokens in a main loop iteration belong to the same page
+@@ -446,6 +464,21 @@ struct BlockFmhaBatchPrefillPipelineQRKSVSAsync
+         {
+             static_assert(kPageBlockSize >= kN0, "KV_BLOCKSCALE requires kPageBlockSize >= kN0");
+         }
++        // PER_TOKEN_HEAD supports both kPageBlockSize >= kN0 (single page per
++        // tile) and kPageBlockSize < kN0 (cross-page tile). The dequant loop
++        // below precomputes per-(kPageBlockSize)-wide-slice physical page IDs
++        // and applies them per column.
++
++        // Per-q-head P scale (PER_TOKEN_HEAD only): folded into the exp2
++        // row-max shift below; null pointer reduces to the default 2^shift.
++        float p_scale_log2 = 0.f;
++        if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD)
++        {
++            if(p_scale_ptr != nullptr)
++            {
++                p_scale_log2 = log2f(p_scale_ptr[block_indices.qo_head_idx]);
++            }
++        }
+ 
+         static_assert(
+             std::is_same_v<QDataType, remove_cvref_t<typename QDramBlockWindowTmp::DataType>> &&
+@@ -627,15 +660,30 @@ struct BlockFmhaBatchPrefillPipelineQRKSVSAsync
+                                                       k_offsets); // K DRAM tile window for
+         k_dram_window.init_raw();
+ 
+-        // SRD rebasing: move the buffer descriptor base pointer to each page's start address
+-        // using 48-bit pointer arithmetic, so voffset only needs the small within-page offset.
+-        // Only applies when kPageBlockSize >= kN0 (all threads in a wave access the same page).
++        // Track the K/V SRD's current physical page so consecutive same-page rebases
++        // (the common case when kPageBlockSize >> kN0, e.g. page_size=1024 / kN0=128
++        // gives 8 same-page tiles in a row) collapse to a no-op. -1 is a never-valid
++        // sentinel that forces the first rebase to run.
++        index_t last_k_page = static_cast<index_t>(-1);
++        index_t last_v_page = static_cast<index_t>(-1);
++
++        // SRD rebasing for K: only for page_size >= kN0 (all threads on same page).
++        // For page_size < kN0: either flat loads (kUseGlobalLoad) or full offsets handle
++        // addressing.
+         auto rebase_k_window = [&](auto& window, index_t physical_page) {
+             if constexpr(kPageBlockSize >= kN0)
+             {
+                 // readfirstlane: make physical_page provably wave-uniform so the
+                 // resulting SRD lands in SGPRs (required by buffer load instructions).
+-                physical_page        = __builtin_amdgcn_readfirstlane(physical_page);
++                physical_page = __builtin_amdgcn_readfirstlane(physical_page);
++                // Skip the SRD reset (data ptr + num_records + init_raw) when the
++                // target page is the same as the one currently encoded in the SRD.
++                // last_k_page is also wave-uniform (initialized to -1 and only ever
++                // assigned from readfirstlane'd values), so the branch is wave-uniform
++                // and the compiler can keep last_k_page in SGPRs.
++                if(physical_page == last_k_page)
++                    return;
++                last_k_page = physical_page;
+                 const auto* base_ptr = k_dram_block_window.get_bottom_tensor_view().buf_.p_data_;
+                 const auto* page_ptr =
+                     base_ptr + static_cast<long_index_t>(physical_page) * page_stride_k;
+@@ -648,6 +696,13 @@ struct BlockFmhaBatchPrefillPipelineQRKSVSAsync
+             if constexpr(kPageBlockSize >= kN0)
+             {
+                 physical_page = __builtin_amdgcn_readfirstlane(physical_page);
++                // Same same-page-skip trick as rebase_k_window above. The V SRD is
++                // rebased multiple times per K-loop iter (initial setup, post-GEMM0,
++                // sink boundary, next-iter prep); for large page_size all of those
++                // typically stay on the same page.
++                if(physical_page == last_v_page)
++                    return;
++                last_v_page = physical_page;
+                 const auto* base_ptr =
+                     v_dram_block_window_tmp.get_bottom_tensor_view().buf_.p_data_;
+                 const auto* page_ptr =
+@@ -963,6 +1018,13 @@ struct BlockFmhaBatchPrefillPipelineQRKSVSAsync
+                 k_descale = k_descale_ptr[scale_offset];
+                 v_descale = v_descale_ptr[scale_offset];
+             }
++            else if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD)
++            {
++                // V scale is per-head only; load scalar from v_descale_ptr[kv_head_idx].
++                // K scale is per-token-per-head and is applied as a vector after GEMM0
++                // (see PER_TOKEN_HEAD branch below).
++                v_descale = v_descale_ptr[block_indices.kv_head_idx * nhead_stride_v_descale];
++            }
+ 
+             // Prefetch V physical pages early - overlaps with GEMM0 computation
+             prefetch_v_physical_pages(number<kK1>{});
+@@ -1023,6 +1085,119 @@ struct BlockFmhaBatchPrefillPipelineQRKSVSAsync
+             {
+                 tile_elementwise_inout([&k_descale](auto& x) { x *= k_descale; }, s_acc);
+             }
++            // PER_TOKEN_HEAD: dequantize QK result with per-row Q descale and per-column K descale.
++            // s_acc[i,j] *= q_descale[q_origin+i, qo_head] * k_descale[k_page(j), k_slot(j), kv_head]
++            //
++            // Implementation notes:
++            //   The naive form (one global load of qd + kd inside the per-element
++            //   s_acc sweep) has two problems on gfx9 qr_async: (a) it inflates
++            //   the inner-loop instruction footprint with multi-component address
++            //   arithmetic that the compiler must keep alive per element, and (b)
++            //   it puts the K SRD under SGPR pressure (same class of issue we hit
++            //   in fmha_fwd qr_async). To dodge both we stage Q-row and K-col
++            //   descales through LDS once per K-loop iteration; the per-element
++            //   sweep then collapses to a pure LDS read + FP multiply, identical
++            //   to the fmha_fwd qr_async PER_TOKEN_HEAD path
++            //   (block_fmha_pipeline_qr_ks_vs_async.hpp).
++            //
++            //   Supports cross-page tiles (kPageBlockSize < kN0): each LDS-load
++            //   thread resolves its page index from `tile_k_pages` (1 entry on
++            //   the fast path, kN0/kPageBlockSize entries on the cross-page path).
++            else if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD)
++            {
++                const index_t qo_head    = block_indices.qo_head_idx;
++                const index_t kv_head    = block_indices.kv_head_idx;
++                const index_t q_row_base = q_origin.at(number<0>{});
++
++                // Number of distinct pages this tile spans.
++                //   page_size >= kN0 -> 1 (fast path: single page covers the tile)
++                //   page_size <  kN0 -> kN0 / page_size  (cross-page tile)
++                constexpr index_t kPagesPerTile =
++                    (kPageBlockSize >= kN0) ? 1 : (kN0 / kPageBlockSize);
++                constexpr index_t kLog2PageBlockSize = []{
++                    index_t shift = 0;
++                    index_t val   = kPageBlockSize;
++                    while(val > 1) { val >>= 1; ++shift; }
++                    return shift;
++                }();
++                constexpr index_t kPageSlotMask = kPageBlockSize - 1;
++
++                // Physical pages for each kPageBlockSize-wide column slice of the tile.
++                // Tiny array (1 or kN0/kPageBlockSize entries); compiler keeps in registers.
++                index_t tile_k_pages[kPagesPerTile];
++                if constexpr(kPagesPerTile == 1)
++                {
++                    // Single-page tile: reuse the page already resolved for K-gemm.
++                    tile_k_pages[0] = k_physical_pages[number<0>{}];
++                }
++                else
++                {
++                    // Only read k_dram_block_window origin in the cross-page case
++                    // where we actually need it (kPagesPerTile == 1 already has the
++                    // page via k_physical_pages, and avoiding the window-origin read
++                    // here keeps the K SRD off VGPRs on the fast path -- the same
++                    // discipline the fmha_fwd qr_async PER_TOKEN_HEAD branch uses).
++                    const index_t k_origin_n =
++                        k_dram_block_window.get_window_origin().at(number<0>{});
++                    static_for<0, kPagesPerTile, 1>{}([&](auto p) {
++                        const index_t gp = (k_origin_n + p.value * kPageBlockSize)
++                                           >> kLog2PageBlockSize;
++                        tile_k_pages[p.value] =
++                            page_idx[ck_tile::min(gp, max_page_table_idx)];
++                    });
++                }
++
++                // LDS staging tiles. Per-block allocations sized to the descale
++                // working set (kM0 + kN0 fp32 = 1024 B for the d128 tile).
++                __shared__ float lds_q_descale[kM0];
++                __shared__ float lds_k_descale[kN0];
++
++                const index_t tid_in_block =
++                    static_cast<index_t>(threadIdx.x + threadIdx.y * blockDim.x +
++                                         threadIdx.z * blockDim.x * blockDim.y);
++                const index_t threads_per_block =
++                    static_cast<index_t>(blockDim.x * blockDim.y * blockDim.z);
++
++                __builtin_amdgcn_sched_barrier(0);
++
++                // Q-row descales (kM0 entries).
++                for(index_t off = tid_in_block; off < kM0; off += threads_per_block)
++                {
++                    lds_q_descale[off] = q_descale_per_token_ptr[
++                        (q_row_base + off) * stride_q_descale_token +
++                        qo_head * nhead_stride_q_descale];
++                }
++
++                // K-col descales (kN0 entries).
++                // Fast path (kPagesPerTile == 1): k_page folds to tile_k_pages[0]
++                //   so the inner address is a single stride product over k_slot.
++                // Cross-page path: k_page switches every kPageBlockSize columns.
++                for(index_t off = tid_in_block; off < kN0; off += threads_per_block)
++                {
++                    const index_t k_page = tile_k_pages[
++                        (kPagesPerTile == 1) ? index_t{0}
++                                             : (off >> kLog2PageBlockSize)];
++                    const index_t k_slot = off & kPageSlotMask;
++                    lds_k_descale[off] = k_descale_ptr[
++                        k_page * nblock_stride_k_descale_page +
++                        kv_head * nhead_stride_k_descale +
++                        k_slot * stride_k_descale_token];
++                }
++                __builtin_amdgcn_s_barrier();
++
++                constexpr auto s_spans = decltype(s_acc)::get_distributed_spans();
++                sweep_tile_span(s_spans[number<0>{}], [&](auto idx0) {
++                    sweep_tile_span(s_spans[number<1>{}], [&](auto idx1) {
++                        const auto tile_idx = get_x_indices_from_distributed_indices(
++                            s_acc.get_tile_distribution(), make_tuple(idx0, idx1));
++                        const index_t i = tile_idx.at(number<0>{});
++                        const index_t j = tile_idx.at(number<1>{});
++                        constexpr auto i_j_idx = make_tuple(idx0, idx1);
++                        s_acc(i_j_idx) *= lds_q_descale[i] * lds_k_descale[j];
++                    });
++                });
++                __builtin_amdgcn_sched_barrier(0);
++            }
+ 
+             const auto p = [&]() {
+                 const auto bias_tile = load_tile(bias_dram_window); // load bias tile
+@@ -1219,20 +1394,27 @@ struct BlockFmhaBatchPrefillPipelineQRKSVSAsync
+                 sweep_tile_span(p_spans[number<0>{}], [&](auto idx0) {
+                     constexpr auto i_idx = make_tuple(idx0);
+ #if CK_TILE_FMHA_FWD_FAST_EXP2
+-                    // For KV_BLOCKSCALE: precompute (m - shift) once per row
+-                    // exp2(s - (m - shift)) = exp2(s - m + shift) = exp2(s - m) * 2^shift
+-                    // This scales P by 2^shift (≈448 for fp8_e4m3) without explicit multiply
++                    // exp2(s - (m - shift)) = exp2(s - m) * 2^shift, i.e. P is
++                    // scaled by 2^shift before the fp8 cast: OCP fp8 (e4m3)
++                    // uses 8 -> 256, FNUZ fp8 uses 7 -> 128.
+                     auto validated_m = get_validated_m(m[i_idx]);
+                     auto row_max     = scale_s * validated_m;
+-                    if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::KV_BLOCKSCALE)
++                    if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::KV_BLOCKSCALE ||
++                                 QScaleEnum == BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD)
+                     {
+ #if CK_TILE_USE_OCP_FP8
+-                        validated_m -= OCP_FP8_SHIFT; // for Bias/Alibi/SoftCap
+-                        row_max -= OCP_FP8_SHIFT;     // for else branch
++                        validated_m -= OCP_FP8_SHIFT;
++                        row_max -= OCP_FP8_SHIFT;
+ #else
+                         validated_m -= FNUZ_FP8_SHIFT;
+                         row_max -= FNUZ_FP8_SHIFT;
+ #endif
++                        if constexpr(QScaleEnum ==
++                                     BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD)
++                        {
++                            validated_m -= p_scale_log2;
++                            row_max -= p_scale_log2;
++                        }
+                     }
+ #endif
+                     sweep_tile_span(p_spans[number<1>{}], [&](auto idx1) {
+@@ -1331,7 +1513,8 @@ struct BlockFmhaBatchPrefillPipelineQRKSVSAsync
+             // STAGE 3, KV gemm
+             // KV_BLOCKSCALE: accumulate P*V into temporary tile before applying v_descale
+             auto o_acc_unscaled = decltype(o_acc){};
+-            if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::KV_BLOCKSCALE)
++            if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::KV_BLOCKSCALE ||
++                         QScaleEnum == BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD)
+             {
+                 clear_tile(o_acc_unscaled);
+             }
+@@ -1339,7 +1522,8 @@ struct BlockFmhaBatchPrefillPipelineQRKSVSAsync
+             // Select GEMM1 target: o_acc_unscaled for KV_BLOCKSCALE (needs v_descale), o_acc
+             // otherwise
+             auto& gemm1_acc = [&]() -> auto& {
+-                if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::KV_BLOCKSCALE)
++                if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::KV_BLOCKSCALE ||
++                             QScaleEnum == BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD)
+                     return o_acc_unscaled;
+                 else
+                     return o_acc;
+@@ -1463,7 +1647,8 @@ struct BlockFmhaBatchPrefillPipelineQRKSVSAsync
+             // 1. P was scaled by 2^shift through exp2 shift trick
+             // 2. rowsum l was also scaled by 2^shift
+             // 3. Final O = sum(P*V) / l, so the 2^shift cancels out
+-            if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::KV_BLOCKSCALE)
++            if constexpr(QScaleEnum == BlockAttentionQuantScaleEnum::KV_BLOCKSCALE ||
++                         QScaleEnum == BlockAttentionQuantScaleEnum::PER_TOKEN_HEAD)
+             {
+                 tile_elementwise_inout(
+                     [&v_descale](auto& o, auto& o_unscaled) { o += o_unscaled * v_descale; },
+@@ -1664,6 +1849,92 @@ struct BlockFmhaBatchPrefillPipelineQRKSVSAsync
+                           nblock_stride_kv_block_descale,
+                           nhead_stride_kv_block_descale);
+     }
++
++    // Overload for PER_TOKEN_HEAD: Q/K per-token-per-head, V per-head
++    template <typename QDramBlockWindowTmp,
++              typename KDramBlockWindowTmp,
++              typename VDramBlockWindowTmp,
++              typename BiasDramBlockWindowTmp,
++              typename RandValDramBlockWindowTmp,
++              typename LSEDramBlockWindowTmp,
++              typename PositionEncoding,
++              typename AttentionVariantParams,
++              typename BlockIndices>
++    CK_TILE_HOST_DEVICE auto
++    operator()(const QDramBlockWindowTmp& q_dram_block_window_tmp,       // M0*K0 tile
++               const KDramBlockWindowTmp& k_dram_block_window_tmp,       // N0*K0 tile
++               const VDramBlockWindowTmp& v_dram_block_window_tmp,       // N1*K1 tile
++               const BiasDramBlockWindowTmp& bias_dram_block_window_tmp, // M0*N0 tile
++               RandValDramBlockWindowTmp& randval_dram_block_window_tmp, // M0*N0 tile
++               LSEDramBlockWindowTmp& lse_dram_block_window_tmp,         // M0*1 tile
++               FmhaMask mask,
++               PositionEncoding position_encoding,
++               float scale_s,
++               const AttentionVariant& variant,
++               const AttentionVariantParams& variant_params,
++               const BlockIndices& block_indices,
++               void* smem_ptr,
++               const index_t* page_idx,
++               const index_t stride_k,
++               const index_t stride_v,
++               const index_t page_stride_k,
++               const index_t page_stride_v,
++               DropoutType& dropout,
++               float sink_v,
++               const index_t max_page_table_idx,
++               const float* q_descale_per_token_ptr,
++               const float* k_descale_per_token_ptr,
++               const float* v_descale_per_head_ptr,
++               index_t stride_q_descale_token,
++               index_t nhead_stride_q_descale,
++               index_t nblock_stride_k_descale_page,
++               index_t stride_k_descale_token,
++               index_t nhead_stride_k_descale,
++               index_t nhead_stride_v_descale,
++               const float* p_scale_ptr = nullptr) const
++    {
++        return operator()(q_dram_block_window_tmp,
++                          identity{},
++                          k_dram_block_window_tmp,
++                          identity{},
++                          v_dram_block_window_tmp,
++                          identity{},
++                          bias_dram_block_window_tmp,
++                          identity{},
++                          randval_dram_block_window_tmp,
++                          lse_dram_block_window_tmp,
++                          identity{},
++                          identity{},
++                          identity{},
++                          identity{},
++                          mask,
++                          position_encoding,
++                          scale_s,
++                          variant,
++                          variant_params,
++                          block_indices,
++                          smem_ptr,
++                          page_idx,
++                          stride_k,
++                          stride_v,
++                          page_stride_k,
++                          page_stride_v,
++                          dropout,
++                          sink_v,
++                          max_page_table_idx,
++                          k_descale_per_token_ptr, // reused: k_descale_ptr slot
++                          v_descale_per_head_ptr,  // reused: v_descale_ptr slot
++                          /*nblock_stride_kv_block_descale*/ 0,
++                          /*nhead_stride_kv_block_descale*/ 0,
++                          q_descale_per_token_ptr,
++                          stride_q_descale_token,
++                          nhead_stride_q_descale,
++                          nblock_stride_k_descale_page,
++                          stride_k_descale_token,
++                          nhead_stride_k_descale,
++                          nhead_stride_v_descale,
++                          p_scale_ptr);
++    }
+ };
+ 
+ } // namespace ck_tile

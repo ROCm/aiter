@@ -288,12 +288,6 @@ __device__ __forceinline__ __hip_fp8_e4m3_fnuz pa_float_to_fp8(float x)
     return __hip_fp8_e4m3_fnuz(x);
 }
 
-__device__ __forceinline__ float pa_clamp_fp8_e4m3_fnuz(float x)
-{
-    constexpr float kFp8E4m3FnuzMax = 240.0f;
-    return fminf(fmaxf(x, -kFp8E4m3FnuzMax), kFp8E4m3FnuzMax);
-}
-
 // pk_fp8_f32: pack 2 fp32 to 2 fp8 using gfx942 hardware intrinsic.
 // `__builtin_amdgcn_cvt_pk_fp8_f32` writes 2 fp8 (16 bits) into the
 // upper or lower 16 bits of a 32-bit register based on `byte_sel`.
@@ -303,14 +297,16 @@ __device__ __forceinline__ uint32_t pa_pk_fp8x4(float a0, float a1, float a2, fl
 {
     // Pack 4 fp32 → 4 fp8 e4m3 in one 32-bit register.
     uint32_t r = 0;
-    a0 = pa_clamp_fp8_e4m3_fnuz(a0);
-    a1 = pa_clamp_fp8_e4m3_fnuz(a1);
-    a2 = pa_clamp_fp8_e4m3_fnuz(a2);
-    a3 = pa_clamp_fp8_e4m3_fnuz(a3);
     r = __builtin_amdgcn_cvt_pk_fp8_f32(a0, a1, r, false); // lo 16b
     r = __builtin_amdgcn_cvt_pk_fp8_f32(a2, a3, r, true);  // hi 16b
     return r;
 }
+
+// e4m3fnuz max magnitude (bias=8, so range is [-240, +240]).  Used for
+// in-kernel bf16→fp8 Q quantisation in the FlyDSL-aligned path: each lane
+// computes `scale = max_abs / FP8_MAX` over its per-(q_token, q_head) slice
+// of head_dim, mirrors FlyDSL `pa_decode_fp8.py:FP8_MAX = 240.0`.
+constexpr float PA_FP8_MAX = 240.0f;
 
 // Apply Q/K dequant scales to four QK logits held by one lane.
 // Scale layout:
