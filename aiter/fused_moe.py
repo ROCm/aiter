@@ -348,13 +348,27 @@ def fused_moe_(
     # If the caller has computed expected_m (host-side avg #tokens per local
     # expert under uniform routing), use that instead for tier matching --
     # mirrors DeepGEMM's `expected_m` SM-scheduling hint.
-    M_for_schedule = expected_m if expected_m is not None else M
+    # expected_m is a post-dispatch, per-local-expert token count: the topk
+    # fan-out and the EP routing are already folded into it, so topk no longer
+    # carries scheduling information. Canonicalize topk to 1 for the config
+    # lookup, keeping the tuned CSV unambiguous:
+    #   topk == 1  -> EP / expected_m view (token == avg #tokens per local expert)
+    #   topk != 1  -> classic pre-dispatch view (token == #input tokens, topk == fan-out)
+    # Only the lookup key changes; the real topk (topk_ids.shape[1]) still drives
+    # moe_sorting and the stage1/stage2 kernels below. expected_m is None ->
+    # behavior is bit-identical to before.
+    if expected_m is not None:
+        M_for_schedule = expected_m
+        topk_for_schedule = 1
+    else:
+        M_for_schedule = M
+        topk_for_schedule = topk
     metadata = get_2stage_cfgs(
         get_padded_M(M_for_schedule),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
-        topk,
+        topk_for_schedule,
         dtype,
         q_dtype_a,
         q_dtype_w,
