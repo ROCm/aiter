@@ -373,7 +373,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
         "untune_file": "aiter/configs/bf16_untuned_gemm.csv",
         "errRatio": 0.05,
-        "batch": 1,
+        "batch": 100,
         "profile_file": "",
         "config_env_name": "AITER_CONFIG_GEMM_BF16",
     }
@@ -952,7 +952,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
             shape_kernel_nums = len(task) - prev_count
             tasks_data.append((shape_kernel_nums, ()))
 
-            # hipblaslt runs separately via gradlib
             if with_hipblaslt and ("all" in libtype or "hipblaslt" in libtype):
                 hipblaslt_rets.extend(self._run_hipblaslt(ds, args))
 

@@ -16,13 +16,24 @@ For hipblaslt-only tuning, use `gradlib/gradlib/gemm_tuner.py` instead.
    Or capture shapes automatically by running your workload with `AITER_TUNE_GEMM=1`.
 
 3. Start tuning:
+
+There are two entry points:
+
+- **`gemm_a16w16_tune.py`** — runs the tuner directly. Use this when tuning
+  non-hipblaslt backends only (asm, opus, flydsl, triton, skinny, torch).
+- **`gemm_tuner.py`** — runs the tuner inside a subprocess with automatic
+  retry on GPU crashes (SIGABRT, SIGSEGV). Use this when `--with-hipblaslt`
+  is enabled, because hipblaslt is a third-party library whose GPU faults
+  cannot be fixed locally. The subprocess wrapper catches these crashes and
+  retries automatically (up to 30 times).
+
 ```bash
-# Tune non-hipblaslt backends (default):
+# Tune non-hipblaslt backends (default, no subprocess wrapper needed):
 python3 csrc/gemm_a16w16/gemm_a16w16_tune.py \
   --input_file aiter/configs/bf16_untuned_gemm.csv
 
-# Tune all backends including hipblaslt:
-python3 csrc/gemm_a16w16/gemm_a16w16_tune.py \
+# Tune all backends including hipblaslt (use subprocess wrapper):
+python3 csrc/gemm_a16w16/gemm_tuner.py \
   --input_file aiter/configs/bf16_untuned_gemm.csv \
   --with-hipblaslt
 
@@ -59,7 +70,7 @@ If you have built kernels before tuning, add `AITER_REBUILD=1` to rebuild with n
 ### `--with-hipblaslt`
 - **Type**: Flag
 - **Default**: disabled
-- **Description**: Include hipblaslt solutions in tuning (imports from gradlib). Without this flag, hipblaslt is **never** run — even with `--libtype all` or `--libtype hipblaslt`.
+- **Description**: Include hipblaslt solutions in tuning (imports from gradlib). Without this flag, hipblaslt is **never** run — even with `--libtype all` or `--libtype hipblaslt`. When using this flag, it is recommended to run via `gemm_tuner.py` (the subprocess wrapper) so that GPU-level crashes from hipblaslt are retried automatically.
 
 ### `--indtype` / `--outdtype`
 - **Choices**: `f32`, `f16`, `bf16`, `fp8`

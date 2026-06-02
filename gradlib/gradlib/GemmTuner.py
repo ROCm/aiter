@@ -377,7 +377,7 @@ class GemmTuner(GemmCommonTuner):
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
         "untune_file": "aiter/configs/bf16_untuned_gemm.csv",
-        "batch": 1,
+        "batch": 100,
         "config_env_name": "AITER_CONFIG_GEMM_BF16",
     }
 
