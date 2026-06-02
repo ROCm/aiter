@@ -31,7 +31,7 @@ MOE_CONFIGS = [
     {"name": "qwen3_5_397b", "hidden_size": 4096, "inter_dim": 128, "expert": 513, "topk": 11},
 ]
 
-DEFAULT_TOKEN_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+DEFAULT_TOKEN_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 
 
 def div_up(a: int, b: int) -> int:
