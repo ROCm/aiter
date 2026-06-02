@@ -4,6 +4,7 @@
 import functools
 import itertools
 import os
+import json
 import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
@@ -154,44 +155,28 @@ def get_kernel_config_triton(m, n, k, routing_data):
     block_k = 256
     num_stages = 2
 
-    if block_m == 16:
-        block_n = 128
-        num_warps = 4
-
-        grid_m = routing_data.n_blocks(m, block_m)
-        grid_n = triton.cdiv(n, block_n)
-        grid = grid_m * grid_n * split_k
-        # Floor at 64 (was 32): out_mx_quant=True with apply_swiglu requires
-        # OUT_BLOCK_N = BLOCK_N // 2 >= 32. Loop boundary changed to keep
-        # block_n >= 64 for both MX and non-MX paths.
-        while block_n >= 128 and grid < get_num_sms():
-            block_n = block_n // 2
+    if arch == "gfx942":
+        if block_m == 16:
+            block_n = 128
+            num_warps = 4
             grid_m = routing_data.n_blocks(m, block_m)
             grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
-
-        if k >= 512:
-            block_k = 512
-
-    elif block_m == 32:
-        if n <= 1024:
-            block_n = 128
-            num_warps = 4
-        elif n <= 4096:
-            block_n = 256
-            num_warps = 4
+            while block_n >= 64 and grid < 256:
+                block_n = block_n // 2
+                grid_m = routing_data.n_blocks(m, block_m)
+                grid_n = triton.cdiv(n, block_n)
+                grid = grid_m * grid_n * split_k
+        elif block_m == 32:
+            if n <= 1024:
+                block_n = 128
+                num_warps = 4
+            else:
+                block_n = 256
+                num_warps = 8
         else:
-            block_n = 512
-            num_warps = 4
-
-    elif block_m == 64:
-        # V4-Flash prefill-tuned (rocprof brute force v2): for block_m=64,
-        # (bn=128, nw=4, ns=1) gives 2-4x speedup over the previous bn=512/nw=8
-        # default on all four V4-Flash prefill shapes.
-        block_n = 128
-        num_warps = 4
-        num_stages = 1
-
+            block_n = 128
+            num_warps = 4 if block_m == 128 else 8
     else:
         block_n = 128
         num_warps = 4
@@ -210,23 +195,6 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
-    # Env-driven overrides split by regime: block_m>=64 → PREFILL_*, else DECODE_*.
-    # Generic AITER_A8W4_* still works as a fallback when the regime-specific var is unset.
-    _regime = "PREFILL" if block_m >= 64 else "DECODE"
-    _knobs = (
-        "block_n", "block_k", "num_warps", "num_stages",
-        "group_m", "waves_per_eu", "matrix_instr_nonkdim", "split_k",
-    )
-    for key in _knobs:
-        env_specific = f"AITER_A8W4_{_regime}_{key.upper()}"
-        env_generic = f"AITER_A8W4_{key.upper()}"
-        v = os.environ.get(env_specific, os.environ.get(env_generic))
-        if v is not None:
-            try:
-                ret[key] = int(v)
-            except ValueError:
-                pass
-    return ret
 
 
 def get_kernel_config_gluon(m, n, k, routing_data):
