@@ -167,9 +167,15 @@ def build_sage_attn_cdna_module(
     # per-wave-uniform pointer (HW adds lane*size). gfx950 supports a 16 B/lane
     # DMA (one buffer_load_dwordx4-to-LDS); gfx942 is 4 B/lane. V on gfx942 is
     # column-major (scatter-transpose) which the DMA cannot express, so V-DMA
-    # is gfx950-only. Gated by env so the prior padded/register-staged path
-    # stays the default until measured.
-    _dma_env = os.environ.get("SAGE_LDS_DMA", "0")
+    # is gfx950-only.
+    # Auto gate: the only measured net win is K-only DMA + XOR swizzle on causal
+    # gfx950 (~3-4.7%); non-causal is ~flat and V/kv modes regress (see
+    # sage_attn_memstage/). So "auto" (default) turns on K-DMA exactly there and
+    # stays byte-identical to baseline everywhere else. Explicit values still
+    # force a specific arm for A/B: 0/""=off, k/v/kv/1=that mode unconditionally.
+    _dma_env = os.environ.get("SAGE_LDS_DMA", "auto")
+    if _dma_env == "auto":
+        _dma_env = "k" if (CAUSAL and _is_gfx950_kv) else "0"
     _dma_k = _dma_env in ("1", "k", "kv")
     _dma_v = _dma_env in ("1", "v", "kv") and _is_gfx950_kv
     _dma_any = _dma_k or _dma_v
