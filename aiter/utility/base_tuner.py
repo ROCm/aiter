@@ -233,7 +233,19 @@ class TunerCommon:
             "and break the tie by smaller kernelId. Stabilizes picks across "
             "repeated multi-GPU tune runs when many candidates have very "
             "close timings (common on a8w8_bpreshuffle). Default 0 = off "
-            "(strict us ordering, current behavior).",
+            "(strict us ordering, current behavior). Recommended: 0.02.",
+        )
+        self.parser.add_argument(
+            "--auto_group_small_m",
+            type=int,
+            default=0,
+            help="Hybrid batching: when >0, shapes with M <= this value are "
+            "tuned with shape_grouped=True (one shape's kernels back-to-back "
+            "on one GPU -- stabilizes small-shape picks at ~10pct extra "
+            "wallclock on that batch only), while larger shapes keep the "
+            "global --shape_grouped setting (default False, which is faster "
+            "for large shapes). Default 0 = off. Recommended pairing: "
+            "--auto_group_small_m 64 --tune_tie_break_rel_tol 0.02.",
         )
         self.parser.add_argument(
             "--fast_tune",
@@ -512,6 +524,39 @@ class TunerCommon:
 
     def get_gfx(self):
         return _chip_get_gfx()
+
+    def _build_batch_plan(self, args, batch_size):
+        """Return a list of (batch_df, shape_grouped_override).
+
+        Default: naive contiguous slices of self.untunedf, override=None
+        (use args.shape_grouped unchanged).
+
+        Hybrid batching (--auto_group_small_m N > 0): partition shapes into
+        small (M <= N) and rest (M > N); small batches force
+        shape_grouped=True (stabilizes small-shape picks cheaply), rest
+        batches keep args.shape_grouped. Small and rest never share a batch.
+        """
+        df = self.untunedf
+        auto_m = getattr(args, "auto_group_small_m", 0) or 0
+
+        def _slice(d, override):
+            return [
+                (d.iloc[i : i + batch_size].reset_index(drop=True), override)
+                for i in range(0, len(d), batch_size)
+            ]
+
+        if auto_m > 0 and "M" in df.columns:
+            small = df[df["M"] <= auto_m].reset_index(drop=True)
+            rest = df[df["M"] > auto_m].reset_index(drop=True)
+            plan = _slice(small, True) + _slice(rest, args.shape_grouped)
+            if getattr(args, "verbose", False):
+                logger.info(
+                    f"[auto_group_small_m={auto_m}] small(M<={auto_m})="
+                    f"{len(small)} shapes -> shape_grouped=True; "
+                    f"rest={len(rest)} shapes -> shape_grouped={args.shape_grouped}"
+                )
+            return plan
+        return _slice(df, None)
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""
@@ -1470,7 +1515,11 @@ class TunerCommon:
             )
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
         batch_size = min(args.batch, len(self.untunedf))
-        total_batches = (len(self.untunedf) + batch_size - 1) // batch_size
+        # Build the batch plan as a list of (batch_df, shape_grouped_override).
+        # shape_grouped_override is None to use args.shape_grouped unchanged,
+        # or a bool to force grouping for that batch (hybrid batching).
+        batch_plan = self._build_batch_plan(args, batch_size)
+        total_batches = len(batch_plan)
         compare_report_file = self._init_compare_report(
             args, output_file, batch_size, total_batches
         )
@@ -1492,9 +1541,14 @@ class TunerCommon:
         self.tune_start_time = time.time()
         tuning_status = "Finished"
         try:
-            for i in range(0, len(self.untunedf), batch_size):
-                batch = self.untunedf.iloc[i : i + batch_size].reset_index(drop=True)
+            for batch, sg_override in batch_plan:
                 processed_batches += 1
+                # Hybrid batching: temporarily override shape_grouped for this
+                # batch (small shapes -> grouped). tune() reads args.shape_grouped,
+                # so set/restore it around the call. None = leave as-is.
+                _saved_sg = args.shape_grouped
+                if sg_override is not None:
+                    args.shape_grouped = sg_override
                 batch_pre_tune_results = None
                 if args.compare:
                     batch_header = f"=== Running pre-tune benchmark (batch {processed_batches}/{total_batches}) ==="
@@ -1507,6 +1561,8 @@ class TunerCommon:
                         print_results=args.verbose,
                     )
                 all_results = self.tune(batch, self.tunedf, args)
+                # Restore global shape_grouped now that tune() has consumed it.
+                args.shape_grouped = _saved_sg
                 if all_results:
                     results = self.post_process(all_results, args, topk)
                     if args.compare:
