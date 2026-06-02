@@ -359,6 +359,13 @@ def fused_moe_(
     # lookup, keeping the tuned CSV unambiguous:
     #   topk == 1  -> EP / expected_m view (token == per-local-expert estimate)
     #   topk != 1  -> classic pre-dispatch view (token == #input tokens, topk == fan-out)
+    # So an EP caller MUST land the lookup on a topk==1 row, in one of two ways:
+    #   (a) pass expected_m -> key becomes (expected_m, 1). Recommended for
+    #       low-latency dispatch, where topk_ids is padded and its shape[0]
+    #       cannot be trusted; expected_m overrides the token count.
+    #   (b) feed topk_ids already shaped with topk == 1 AND a real (un-padded)
+    #       shape[0] -> the raw key is already (real_tokens, 1), no expected_m
+    #       needed. Only valid when the input is not padded.
     # Only the lookup key changes; the real topk (topk_ids.shape[1]) still drives
     # moe_sorting and the stage1/stage2 kernels below. expected_m is None ->
     # behavior is bit-identical to before.
