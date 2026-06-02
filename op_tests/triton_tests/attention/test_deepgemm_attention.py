@@ -7,6 +7,7 @@ import random
 import pytest
 import torch
 
+from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
@@ -31,7 +32,7 @@ def kv_cache_cast_to_fp8(x: torch.Tensor, padding: bool = False) -> torch.Tensor
     assert num_heads == 1
     x_amax = x.abs().float().amax(dim=3, keepdim=True).clamp(1e-4)
     sf = x_amax / 240.0
-    x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fnuz)
+    x_scaled = (x * (1.0 / sf)).to(dtypes.fp8)
 
     padding_size = 0 if not padding else (16 - (block_size * 4) % 16) % 16
     x_fp8 = torch.empty(
@@ -102,19 +103,12 @@ def make_paged_inputs(
     avg_kv_length: int,
     blocksize: int = 1,
     padding: bool = False,
-    var_ratio: float = 0.5,
-    qk_datatype: torch.dtype = torch.float8_e4m3fnuz,
+    var_ratio: float = 0.0,
+    qk_datatype: torch.dtype = dtypes.fp8,
 ):
     """Build inputs for paged MQA logits kernels.
-
-    Returns a dict with the bf16 reference tensors (``q``, ``kv_cache``),
-    the FP8 packed tensors (``q_fp8``, ``kv_cache_fp8``), ``weights``, the
-    per-batch ``context_lens`` and ``block_tables`` (used by the non-ragged
-    kernel), and the ragged-form ``prefix_sum_context_lens`` / ``kv_indices``
-    (used by the ragged kernel).
     """
     max_model_len = 2 * avg_kv_length
-    num_blocks = (max_model_len + blocksize - 1) // blocksize
 
     context_lens = (
         torch.randint(
@@ -129,6 +123,9 @@ def make_paged_inputs(
         (batch_size + 1,), device="cuda", dtype=torch.int32
     )
     prefix_sum_context_lens[1:] = torch.cumsum(context_lens, dim=0)
+
+    # Total physical KV blocks needed across all batches
+    num_blocks = sum(cdiv(int(c), blocksize) for c in context_lens.tolist())
 
     q = torch.randn(
         (batch_size, next_n, heads, index_dim),
@@ -156,7 +153,7 @@ def make_paged_inputs(
     for i in range(batch_size):
         ctx_len = context_lens[i].item()
         for j in range(cdiv(ctx_len, blocksize)):
-            block_tables[i][j] = block_idx_pool[counter % num_blocks]
+            block_tables[i][j] = block_idx_pool[counter]
             counter += 1
 
     q_fp8 = q.to(qk_datatype)
@@ -256,6 +253,10 @@ def test_deepgemm_fp8_paged_mqa_logits(
     var_ctx_opt: bool,
     padding: bool,
 ) -> None:
+    # Non-preshuffle path has no varctx kernel (lacks safe_chunks_per_cta_ptr).
+    if var_ctx_opt and not preshuffle:
+        pytest.skip("var_ctx_opt requires preshuffle")
+
     torch.manual_seed(0)
     random.seed(0)
 

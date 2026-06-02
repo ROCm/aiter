@@ -21,18 +21,25 @@ from op_tests.triton_tests.attention.test_deepgemm_attention import (
     make_paged_inputs,
 )
 
-_METRIC_TO_UNIT = {
-    "time": "Time_(us)",
-    "throughput": "TFLOPS",
-    "bandwidth": "Bandwidth_(GB/s)",
+_METRIC_TO_LABEL = {
+    "time": ("Time", "us"),
+    "throughput": ("Throughput", "TFLOPS"),
+    "bandwidth": ("Bandwidth", "GB/s"),
 }
 
 
 def create_paged_mqa_logits_configs(args: argparse.Namespace):
-    x_names = ["batch_size", "next_n", "heads", "head_size", "avg_kv_length"]
+    x_names = [
+        "batch_size",
+        "next_n",
+        "num_heads",
+        "head_size",
+        "avg_kv_length",
+        "var_ratio",
+    ]
 
     if args.perf:
-        x_vals_list = [
+        base_vals = [
             (1, 2, 64, 128, 16384),
             (1, 2, 64, 128, 32768),
             (1, 2, 64, 128, 65536),
@@ -47,26 +54,34 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
             (4, 1, 64, 128, 65536),
             (8, 1, 64, 128, 65536),
         ]
+        x_vals_list = [(*v, args.var_ratio) for v in base_vals]
     else:
         x_vals_list = [
-            (args.batch, args.mtp + 1, args.heads, args.head_size, args.kv_length)
+            (
+                args.batch,
+                args.mtp + 1,
+                args.num_heads,
+                args.head_size,
+                args.kv_length,
+                args.var_ratio,
+            )
         ]
 
-    if args.metric not in _METRIC_TO_UNIT:
+    if args.metric not in _METRIC_TO_LABEL:
         raise NotImplementedError(f"{args.metric} is not supported")
-    unit = _METRIC_TO_UNIT[args.metric]
+    label, unit = _METRIC_TO_LABEL[args.metric]
 
     return [
         triton.testing.Benchmark(
             x_names=x_names,
             x_vals=x_vals_list,
-            line_arg="unit",
-            line_vals=[unit],
-            line_names=[unit],
+            line_arg="metric",
+            line_vals=[args.metric],
+            line_names=[label],
             styles=[("green", "-")],
             ylabel=unit,
             plot_name=get_caller_name_no_ext(),
-            args={"metric": args.metric},
+            args={},
         )
     ]
 
@@ -74,22 +89,22 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
 def _bandwidth_bytes(
     batch_size: int,
     next_n: int,
-    heads: int,
+    num_heads: int,
     head_size: int,
     context_lens: torch.Tensor,
 ) -> int:
     """Bytes moved by one kernel invocation (memory-bound op)."""
     total_ctx = int(context_lens.sum().item())
-    q_bytes = batch_size * next_n * heads * head_size  # fp8, 1 B/elem
+    q_bytes = batch_size * next_n * num_heads * head_size  # fp8, 1 B/elem
     # KV is MQA (num_kv_heads=1): FP8 data + per-token FP32 scale.
     kv_bytes = total_ctx * (head_size + 4)
-    w_bytes = batch_size * next_n * heads * 4  # fp32
+    w_bytes = batch_size * next_n * num_heads * 4  # fp32
     # Output: only valid positions are written (one per query/key pair).
     out_bytes = next_n * total_ctx * 4  # fp32
     return q_bytes + kv_bytes + w_bytes + out_bytes
 
 
-def _dump_aot_cache(args, cache_key, heads, head_size, blocksize, enable_var_ctx):
+def _dump_aot_cache(args, cache_key, num_heads, head_size, blocksize, enable_var_ctx):
     """Move the just-compiled triton cache entry under ./paged_mqa_logits/aot/."""
     triton_cache_dir = str(triton.knobs.cache.dir)
     aot_kernel_dir = "./paged_mqa_logits/aot"
@@ -100,7 +115,7 @@ def _dump_aot_cache(args, cache_key, heads, head_size, blocksize, enable_var_ctx
     varctx_suffix = "_varctx" if enable_var_ctx else ""
     aot_name = (
         f"paged_mqa_logits{preshuffle_suffix}{varctx_suffix}"
-        f"_{heads}x{args.chunk_k}x{head_size}_B{blocksize}P{padded_str}W{args.wave_per_eu}"
+        f"_{num_heads}x{args.chunk_k}x{head_size}_B{blocksize}P{padded_str}W{args.wave_per_eu}"
     )
 
     src = os.path.join(triton_cache_dir, cache_key)
@@ -115,7 +130,7 @@ def _dump_aot_cache(args, cache_key, heads, head_size, blocksize, enable_var_ctx
 def run_benchmark(args: argparse.Namespace):
     @triton.testing.perf_report(create_paged_mqa_logits_configs(args))
     def bench_deepgemm_fp8_paged_mqa_logits(
-        batch_size, next_n, heads, head_size, avg_kv_length, metric, **kwargs
+        batch_size, next_n, num_heads, head_size, avg_kv_length, var_ratio, metric, **kwargs
     ):
         torch.manual_seed(0)
         random.seed(0)
@@ -126,11 +141,12 @@ def run_benchmark(args: argparse.Namespace):
         inputs = make_paged_inputs(
             batch_size,
             next_n,
-            heads,
+            num_heads,
             head_size,
             avg_kv_length,
             blocksize=blocksize,
             padding=args.padding,
+            var_ratio=var_ratio,
         )
         q_fp8 = inputs["q_fp8"]
         kv_cache_fp8 = inputs["kv_cache_fp8"]
@@ -178,18 +194,18 @@ def run_benchmark(args: argparse.Namespace):
 
         if args.aot:
             _dump_aot_cache(
-                args, cache_key, heads, head_size, blocksize, args.var_ctx_opt
+                args, cache_key, num_heads, head_size, blocksize, args.var_ctx_opt
             )
 
         if metric == "time":
             return elapsed_us
         if metric == "throughput":
             total_flops = (
-                2 * next_n * heads * head_size * context_lens.float().sum().item()
+                2 * next_n * num_heads * head_size * context_lens.float().sum().item()
             )
             return total_flops / elapsed_us * 1e-6  # TFLOPS = FLOPs / us * 1e-6
         if metric == "bandwidth":
-            mem = _bandwidth_bytes(batch_size, next_n, heads, head_size, context_lens)
+            mem = _bandwidth_bytes(batch_size, next_n, num_heads, head_size, context_lens)
             return mem / elapsed_us * 1e-3  # GB/s = B / us * 1e-3
         raise ValueError(f"Unknown metric: {metric}")
 
@@ -206,7 +222,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-B", "--batch", type=int, default=128, help="Batch size.")
     parser.add_argument(
         "-hq",
-        "--heads",
+        "--num_heads",
         type=int,
         default=64,
         help="Number of query heads (equal to number of key/value heads)",
@@ -228,6 +244,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Q sequence length (mtp + 1 == qo_len) in MTP mode",
+    )
+    parser.add_argument(
+        "--var_ratio",
+        type=float,
+        default=0.0,
+        help="Per-batch context-length variation ratio; 0 means all batches have the same length",
     )
     parser.add_argument(
         "-p",
@@ -259,7 +281,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--var_ctx_opt",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Enable variable-context-length scheduling",
     )
     parser.add_argument(
@@ -277,7 +299,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metric",
         type=str,
-        choices=list(_METRIC_TO_UNIT.keys()),
+        choices=list(_METRIC_TO_LABEL.keys()),
         default="bandwidth",
         help="Metric to report (default: bandwidth, since this kernel is memory-bound)",
     )
