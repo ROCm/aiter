@@ -13,7 +13,6 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.compiler.kernel_function import CompilationContext
 
 from flydsl.expr import range_constexpr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
@@ -49,9 +48,11 @@ from .mfma_epilogues import (
     run_moe_stage1_cshuffle_epilog,
     store_or_atomic_add,
 )
+from .mixed_moe_gemm_dispatch import (
+    make_mixed_moe_gemm1_launcher,
+    make_mixed_moe_gemm2_launcher,
+)
 from .layout_utils import crd2idx, idx2crd, get as layout_get
-
-import functools
 
 from aiter.ops.flydsl.moe_common import (
     GateMode,
@@ -84,8 +85,7 @@ def _barrier(vmcnt=63, lgkmcnt=63):
     )
 
 
-@functools.lru_cache(maxsize=None)
-def compile_mixed_moe_gemm1(
+def build_mixed_moe_gemm1_kernel(
     *,
     model_dim: int,
     inter_dim: int,
@@ -2225,80 +2225,25 @@ def compile_mixed_moe_gemm1(
         xcd_swizzle,
     )
 
-    @flyc.jit
-    def launch_mixed_moe_gemm1(
-        arg_out: fx.Pointer,
-        arg_x: fx.Pointer,
-        arg_w: fx.Pointer,
-        arg_scale_x: fx.Pointer,
-        arg_scale_w: fx.Pointer,
-        arg_sorted_token_ids: fx.Pointer,
-        arg_expert_ids: fx.Pointer,
-        arg_sorted_weights: fx.Pointer,
-        arg_max_token_ids: fx.Pointer,
-        arg_bias: fx.Pointer,
-        arg_out_scale_sorted: fx.Pointer,
-        i32_tokens_in: fx.Int32,
-        i32_inter_in: fx.Int32,
-        i32_k_in: fx.Int32,
-        i32_size_expert_ids_in: fx.Int32,
-        stream: fx.Stream,
-    ):
-        _ = _cache_tag
-        allocator_pong.finalized = False
-        allocator_ping.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator_pong.finalize()
-            allocator_ping.finalize()
-
-        inter_dim_pad_total = fx.Index(2 * inter_dim_pad)
-        tile2_pad = 0
-        if const_expr(not gate_only):
-            tile_k_stage2 = tile_k // 2
-            tile2_pad = (
-                tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
-            ) % tile_k_stage2
-
-        inter_in = fx.Index(i32_inter_in.ir_value())
-        tile_n_index = fx.Index(tile_n)
-        if const_expr(mock_gate_only or gate_up_interleave):
-            gx = (
-                inter_in - inter_dim_pad_total + tile2_pad + tile_n_index - 1
-            ) // tile_n_index
-        else:
-            gx = (
-                (inter_in - inter_dim_pad_total + tile2_pad + 2 * tile_n_index - 1)
-                // tile_n_index
-                // 2
-            )
-
-        _c_pm_l = fx.Index(persist_m)
-        gy = (fx.Index(i32_size_expert_ids_in.ir_value()) + _c_pm_l - 1) // _c_pm_l
-
-        moe_gemm1(
-            arg_out,
-            arg_x,
-            arg_w,
-            arg_scale_x,
-            arg_scale_w,
-            arg_sorted_token_ids,
-            arg_expert_ids,
-            arg_sorted_weights,
-            arg_max_token_ids,
-            arg_bias,
-            arg_out_scale_sorted,
-            i32_tokens_in,
-            i32_inter_in,
-            i32_k_in,
-            i32_size_expert_ids_in,
-        ).launch(grid=(gx, gy, k_batch), block=(total_threads, 1, 1), stream=stream)
-
-    return launch_mixed_moe_gemm1
+    return make_mixed_moe_gemm1_launcher(
+        moe_gemm1=moe_gemm1,
+        cache_tag=_cache_tag,
+        allocator_pong=allocator_pong,
+        allocator_ping=allocator_ping,
+        gate_only=gate_only,
+        mock_gate_only=mock_gate_only,
+        gate_up_interleave=gate_up_interleave,
+        inter_dim=inter_dim,
+        inter_dim_pad=inter_dim_pad,
+        tile_k=tile_k,
+        tile_n=tile_n,
+        total_threads=total_threads,
+        persist_m=persist_m,
+        k_batch=k_batch,
+    )
 
 
-@functools.lru_cache(maxsize=None)
-def compile_mixed_moe_gemm2(
+def build_mixed_moe_gemm2_kernel(
     *,
     model_dim: int,
     inter_dim: int,
@@ -3660,61 +3605,14 @@ def compile_mixed_moe_gemm2(
         xcd_swizzle,
     )
 
-    @flyc.jit
-    def launch_mixed_moe_gemm2(
-        arg_out: fx.Pointer,
-        arg_x: fx.Pointer,
-        arg_w: fx.Pointer,
-        arg_scale_x: fx.Pointer,
-        arg_scale_w: fx.Pointer,
-        arg_sorted_token_ids: fx.Pointer,
-        arg_expert_ids: fx.Pointer,
-        arg_sorted_weights: fx.Pointer,
-        arg_num_valid_ids: fx.Pointer,
-        arg_bias: fx.Pointer,
-        i32_tokens_in: fx.Int32,
-        i32_n_in: fx.Int32,
-        i32_k_in: fx.Int32,
-        i32_size_expert_ids_in: fx.Int32,
-        stream: fx.Stream,
-    ):
-        _ = _cache_tag
-        allocator_pong.finalized = False
-        allocator_ping.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator_pong.finalize()
-            allocator_ping.finalize()
-
-        n_in = fx.Index(i32_n_in.ir_value())
-        _tile_n_idx = fx.Index(tile_n)
-        _model_dim_pad_idx = fx.Index(model_dim_pad)
-        gx = (n_in - _model_dim_pad_idx + _tile_n_idx - 1) // _tile_n_idx
-        if const_expr(_persistent):
-            gy = fx.Index(_cu_num)
-        else:
-            _c_pm_l = fx.Index(persist_m)
-            gy = (fx.Index(i32_size_expert_ids_in.ir_value()) + _c_pm_l - 1) // _c_pm_l
-
-        moe_gemm2(
-            arg_out,
-            arg_x,
-            arg_w,
-            arg_scale_x,
-            arg_scale_w,
-            arg_sorted_token_ids,
-            arg_expert_ids,
-            arg_sorted_weights,
-            arg_num_valid_ids,
-            arg_bias,
-            i32_tokens_in,
-            i32_n_in,
-            i32_k_in,
-            i32_size_expert_ids_in,
-        ).launch(
-            grid=(gx, gy, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
-
-    return launch_mixed_moe_gemm2
+    return make_mixed_moe_gemm2_launcher(
+        moe_gemm2=moe_gemm2,
+        cache_tag=_cache_tag,
+        allocator_pong=allocator_pong,
+        allocator_ping=allocator_ping,
+        persistent=_persistent,
+        cu_num=_cu_num,
+        model_dim_pad=model_dim_pad,
+        tile_n=tile_n,
+        persist_m=persist_m,
+    )
