@@ -138,6 +138,7 @@ def test_mla(
     decode_qlen,
     split_per_batch=None,
     return_lse=False,
+    causal=False,
 ):
     ret = {}
 
@@ -458,6 +459,7 @@ def test_mla(
             q_scale=q_scale,
             kv_scale=kv_scale,
             num_kv_splits=split_per_batch,
+            causal_mask=causal,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -802,6 +804,14 @@ parser.add_argument(
     --lse # True""",
 )
 
+parser.add_argument(
+    "-cs",
+    "--causal",
+    action="store_true",
+    help="""use causal mask. Default: False.
+    --cs # True""",
+)
+
 
 args = parser.parse_args()
 
@@ -826,6 +836,7 @@ for nhead, decode_qlen in args.nhead:
                 decode_qlen=decode_qlen,
                 split_per_batch=split_per_batch,
                 return_lse=args.return_lse,
+                causal=args.causal,
             )
             df.append(ret)
     df = pd.DataFrame(df)

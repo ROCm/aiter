@@ -116,6 +116,7 @@ void mla_decode_stage1_asm_fwd(
     aiter_tensor_t* lse,                  //   [batch_size, num_heads] (nullable)
     aiter_tensor_t* q_scale,              //   [1] (nullable)
     aiter_tensor_t* kv_scale,             //   [1] (nullable)
+    bool causal_mask, 
     hipStream_t stream)
 {    
     int batch           = qo_indptr->size(0) - 1;
@@ -261,7 +262,7 @@ void mla_decode_stage1_asm_fwd(
     
     int ps = persistent ? 1 : 0;
     int prefill = 0; // decode stage
-    int causal = 0;
+    int causal = causal_mask;
     int config_max_seqlen_q = max_seqlen_q;
     int config_gqa_ratio = gqa_ratio;
     int sub_Q = 128; // default value
@@ -305,7 +306,7 @@ void mla_decode_stage1_asm_fwd(
             }else if(max_seqlen_q == 2){
                 config_max_seqlen_q = 2;
             }else if(max_seqlen_q <= 4){
-                sub_Q = 64;
+                sub_Q = causal_mask ? 16 : 64;
                 config_max_seqlen_q = 4;
             }else if (max_seqlen_q > 4){
                 AITER_CHECK(false, __func__, ":only support fp8 mla decoding for qo_len <= 4");
