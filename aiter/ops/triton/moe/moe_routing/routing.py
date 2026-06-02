@@ -367,7 +367,7 @@ def routing_a8w4(
             num_expert_group is not None and topk_group is not None
         ), "use_grouped_topk requires num_expert_group and topk_group"
         # Lazy import: ATOM-side kernel; avoids hard aiter→atom import order.
-        from aiter.ops.triton.moe.moe_routing.grouped_topk import grouped_topk
+        from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
         expt_scal, expt_indx, bitmatrix = grouped_topk(
             logits,
