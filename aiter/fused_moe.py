@@ -6,16 +6,6 @@ import os
 import re
 import sys
 
-_LOCAL_DEPS = (
-    "/root/data/aiter",
-    "/root/data/triton/python",
-    "/root/data/FlyDSL/python",
-    "/root/data/FlyDSL",
-)
-for _dep in reversed(_LOCAL_DEPS):
-    if os.path.exists(_dep) and _dep not in sys.path:
-        sys.path.insert(0, _dep)
-
 from dataclasses import dataclass
 from typing import Callable, Optional
 

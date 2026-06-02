@@ -22,11 +22,6 @@ import time
 import pytest
 import torch
 
-_LOCAL_DEPS = ("/root/data/aiter", "/root/data/triton/python")
-for _dep in reversed(_LOCAL_DEPS):
-    if os.path.exists(_dep) and _dep not in sys.path:
-        sys.path.insert(0, _dep)
-
 from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (  # noqa: E402
     compile_moe_grouped_gemm1_a8w4_masked,
     compile_moe_grouped_gemm1_mxfp4_masked,
