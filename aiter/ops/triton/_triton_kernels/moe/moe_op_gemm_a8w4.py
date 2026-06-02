@@ -169,10 +169,6 @@ def _moe_gemm_a8w4(
     stride_y_mx_m=0,
     stride_y_mx_n=0,
     HAS_MX_OUT: tl.constexpr = False,
-    # Kept for call-site compatibility. The MXFP8 emit path now derives the
-    # e8m0 scale via the shared `_mxfp8_quant_op`, which uses a power-of-two
-    # dtype-max (2**8) internally, so this value is no longer consulted.
-    MX_OUT_DTYPE_MAX: tl.constexpr = 448.0,
 ):
     tl.assume(stride_y_k >= 0)
     tl.assume(stride_y_m >= 0)

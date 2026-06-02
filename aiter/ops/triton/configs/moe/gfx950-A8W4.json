@@ -191,6 +191,14 @@
         "num_warps": 4,
         "waves_per_eu": 0
     },
+    "bm64_n1024_k7168": {
+        "BLOCK_SIZE_K": 256,
+        "BLOCK_SIZE_N": 256,
+        "matrix_instr_nonkdim": 16,
+        "num_stages": 2,
+        "num_warps": 8,
+        "waves_per_eu": 0
+    },
     "bm64_n1440_k2880": {
         "BLOCK_SIZE_K": 128,
         "BLOCK_SIZE_N": 64,
@@ -238,6 +246,14 @@
         "num_stages": 2,
         "num_warps": 8,
         "waves_per_eu": 1
+    },
+    "bm64_n7168_k512": {
+        "BLOCK_SIZE_K": 256,
+        "BLOCK_SIZE_N": 256,
+        "matrix_instr_nonkdim": 32,
+        "num_stages": 2,
+        "num_warps": 8,
+        "waves_per_eu": 0
     },
     "bm64_n720_k2880": {
         "BLOCK_SIZE_K": 256,
