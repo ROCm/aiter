@@ -82,6 +82,7 @@ def compile_moe_blockscale_gemm1(
     use_cshuffle_epilog: bool | None = None,
     waves_per_eu: int | None = None,
     act: str = "silu",
+    k_batch: int = 1,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -96,6 +97,53 @@ def compile_moe_blockscale_gemm1(
     """
     if act not in ("silu", "gelu"):
         raise ValueError(f"act must be 'silu' or 'gelu', got {act!r}")
+
+    # ── split-K (k_batch) plumbing ───────────────────────────────────────────
+    # When k_batch>1, the K dim of each (M,N) tile is partitioned across
+    # k_batch CTAs along blockIdx.z. Each CTA computes one slice's contribution
+    # to gate/up and atomic-adds it (unactivated, no sorted_weight) into
+    # `tmp_out` in the gui_layout per-16 interleave that the downstream
+    # `silu_and_mul_fq` kernel expects.
+    k_batch = int(k_batch)
+    if k_batch < 1:
+        raise ValueError(f"k_batch must be >= 1, got {k_batch}")
+    if k_batch > 1:
+        if model_dim % k_batch != 0:
+            raise ValueError(
+                f"k_batch={k_batch} does not divide model_dim={model_dim}"
+            )
+        k_per_split = model_dim // k_batch
+        if k_per_split % scale_block_k != 0:
+            raise ValueError(
+                f"k_per_split={k_per_split} not divisible by "
+                f"scale_block_k={scale_block_k}"
+            )
+        if k_per_split % tile_k != 0:
+            raise ValueError(
+                f"k_per_split={k_per_split} not divisible by tile_k={tile_k}"
+            )
+        if (k_per_split // tile_k) < 2 or ((k_per_split // tile_k) % 2) != 0:
+            raise ValueError(
+                f"k_per_split={k_per_split} / tile_k={tile_k} = "
+                f"{k_per_split // tile_k} must be even and >= 2 (K-loop "
+                "unrolls in pairs of tile_k tiles)"
+            )
+    else:
+        k_per_split = int(model_dim)
+    if k_batch > 1 and bool(doweight_stage1):
+        # The plan defers sorted_weight to silu_and_mul_fq under split-K, but
+        # the current aiter dispatcher's _gui_sk path does not forward
+        # sorted_weights to the post-activation kernel. Until that wiring
+        # lands, refuse rather than silently dropping the weight multiply.
+        raise NotImplementedError(
+            "blockscale stage1: doweight_stage1=True with k_batch>1 is not "
+            "supported yet (sorted_weight must be applied by "
+            "silu_and_mul_fq, which is not wired in the current dispatcher)."
+        )
+    # Compile-time per-CTA K-loop constants.
+    _total_tiles_per_split = k_per_split // int(tile_k)
+    _pair_iters_per_split = max((_total_tiles_per_split - 2) // 2, 0)
+    _c_k_main_per_split = _pair_iters_per_split * int(tile_k) * 2
 
     gpu_arch = get_hip_arch()
     _is_gfx950 = str(gpu_arch).startswith("gfx95")
@@ -172,6 +220,12 @@ def compile_moe_blockscale_gemm1(
     if use_cshuffle_epilog is None:
         use_cshuffle_epilog = os.environ.get("FLYDSL_MOE_STAGE1_CSHUFFLE", "1") in ("1", "true", "True", "YES", "yes")
     use_cshuffle_epilog = bool(use_cshuffle_epilog)
+    # Split-K must bypass the CShuffle LDS epilogue: the atomic-add store goes
+    # to a 2*inter_dim-wide tmp_out in gui_layout per-16 interleave, which the
+    # current CShuffle reorganization doesn't produce. Force the direct-store
+    # path; correctness over a small throughput loss in the first iteration.
+    if k_batch > 1 and use_cshuffle_epilog:
+        use_cshuffle_epilog = False
     # cshuffle epilog now supports both f16 and bf16 (out_mlir() handles the type swap).
     _out_is_bf16 = out_dtype == "bf16"
 
@@ -179,9 +233,10 @@ def compile_moe_blockscale_gemm1(
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
     # Keep an explicit ABI tag so signature changes can't accidentally reuse an old binary.
     _wpe_tag = f"_wpe{waves_per_eu}" if waves_per_eu is not None else ""
+    _kb_tag = f"_kb{k_batch}" if k_batch > 1 else ""
     module_name = (
         f"mfma_moe1_bs_{in_dtype}_{out_dtype}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_wpe_tag}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_wpe_tag}{_kb_tag}"
         f"_abi8"  # scf.for main loop (reduced ISA size)
     ).replace("-", "_")
 
@@ -294,6 +349,12 @@ def compile_moe_blockscale_gemm1(
         # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
         by = gpu.block_id("x")  # tile along inter_dim
         bx = gpu.block_id("y")  # tile along sorted M
+        # split-K: each CTA's K-slice base. When k_batch==1 this is 0.
+        if const_expr(k_batch > 1):
+            bz = gpu.block_id("z")
+            k_offset_base = bz * fx.Index(k_per_split)
+        else:
+            k_offset_base = fx.Index(0)
 
         # Block validity: compute as early as possible so invalid blocks skip all buffer-resource
         # setup, LDS pointer math, and gmem prefetch work.
@@ -348,8 +409,12 @@ def compile_moe_blockscale_gemm1(
             w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False, num_records_bytes=w_nbytes)
 
             # OUT: [tokens, topk, inter] f16/bf16 -> bytes = tokens*topk*inter*out_elem_bytes
+            # Split-K: arg_out is tmp_out of shape (tokens, topk, 2*inter_dim)
+            # in gui_layout per-16 interleave. Double the per-row width so the
+            # buffer-resource OOB bound covers the full tmp_out span.
             out_elem_bytes = 2  # f16/bf16
-            out_nbytes_idx = tokens_in * c_topk * inter_in * fx.Index(out_elem_bytes)
+            _out_row_mult = fx.Index(2 if k_batch > 1 else 1)
+            out_nbytes_idx = tokens_in * c_topk * inter_in * _out_row_mult * fx.Index(out_elem_bytes)
             out_rsrc = buffer_ops.create_buffer_resource(
                 arg_out, max_size=False, num_records_bytes=arith.index_cast(T.i64, out_nbytes_idx)
             )
@@ -986,7 +1051,8 @@ def compile_moe_blockscale_gemm1(
                 return ag, au
 
             # Prologue: prefetch tile0 X into LDS, sync.
-            k0 = fx.Index(0)
+            # Split-K: tile0 of this CTA's slice starts at k_offset_base.
+            k0 = k_offset_base
             x_regs0 = load_x_tile(k0, x_load_bytes)
             store_x_tile_to_lds(x_regs0, lds_base_cur, x_load_bytes)
             gpu.barrier()
@@ -996,13 +1062,19 @@ def compile_moe_blockscale_gemm1(
 
             c2_tile_k = arith.index(tile_k * 2)
             c_tile_k = arith.index(tile_k)
-            total_tiles = int(model_dim) // int(tile_k)
-            pair_iters = max((total_tiles - 2) // 2, 0)
-            c_k_main = pair_iters * tile_k * 2
+            # Per-CTA K-loop bounds (compile-time): k_per_split = model_dim
+            # when k_batch==1, otherwise model_dim/k_batch. Compile-time
+            # constants computed above as _c_k_main_per_split.
+            c_k_main = int(_c_k_main_per_split)
+            # Main K loop iterates over absolute K positions in
+            #   [k_offset_base, k_offset_base + c_k_main),
+            # leaving the last 2 tiles of this slice for the tail.
+            k_main_lo = k_offset_base
+            k_main_hi = k_offset_base + arith.index(c_k_main)
 
             init_state = list(acc_gate) + list(acc_up)
 
-            for k_iv, inner in range(0, c_k_main, tile_k * 2, init=init_state):
+            for k_iv, inner in range(k_main_lo, k_main_hi, tile_k * 2, init=init_state):
                 n = n_accs_half
                 acc_gate_in = list(inner[:n])
                 acc_up_in = list(inner[n : 2 * n])
@@ -1025,9 +1097,15 @@ def compile_moe_blockscale_gemm1(
             acc_gate = list(results[:n])
             acc_up = list(results[n : 2 * n])
 
-            # Tail: use fresh scale decode (no dependency on prologue _pre_t_safe_idx)
-            k_tail0 = k_in - c2_tile_k
-            k_tail1 = k_in - c_tile_k
+            # Tail: use fresh scale decode (no dependency on prologue _pre_t_safe_idx).
+            # Split-K: tail tiles are at the end of this CTA's K-slice, not
+            # the end of the full K. k_slice_end = k_offset_base + k_per_split.
+            if const_expr(k_batch > 1):
+                k_slice_end = k_offset_base + arith.index(k_per_split)
+            else:
+                k_slice_end = k_in
+            k_tail0 = k_slice_end - c2_tile_k
+            k_tail1 = k_slice_end - c_tile_k
 
             acc_gate, acc_up = do_one_stage(acc_gate, acc_up, k_tail0, k_tail1, lds_base_pong, lds_base_ping)
 
@@ -1137,12 +1215,115 @@ def compile_moe_blockscale_gemm1(
                 )
                 return
 
+            # ── split-K atomic store helper (k_batch > 1) ──────────────────
+            # AMD lacks a scalar fp16/bf16 buffer atomic; on gfx950 packed
+            # half2 atomic-add (`buffer_atomic_pk_add_f16/bf16`) is the only
+            # 16-bit atomic. To emit a per-element atomic from a single
+            # scalar value we round the element index down to the nearest
+            # even position and pack the scalar into the matching half of a
+            # half2 vector, leaving the other half as 0.0 (no-op under add).
+            #   - even element idx -> packed = (val, 0.0)
+            #   - odd  element idx -> packed = (0.0, val)
+            # Both addresses are 4-byte aligned, so the same packed atomic
+            # works for any element position.
+            if const_expr(k_batch > 1):
+                # Half2 scalar-via-packed atomic emit. Defined once and
+                # used by the per-row body below.
+                _out_ty_local = T.bf16 if _out_is_bf16 else T.f16
+                _out_vec2_ty = T.vec(2, _out_ty_local)
+                _c_two_i32 = fx.Int32(2)
+                _c_one_i32 = fx.Int32(1)
+                _c_even_mask_i32 = fx.Int32(0xFFFFFFFE)
+                _zero_half = arith.constant(0.0, type=_out_ty_local)
+
+                def _atomic_add_scalar_via_pk(idx_elem_i32, val_half):
+                    """Emit a scalar f16/bf16 atomic-add by packing into a
+                    half2 with the unused lane zeroed.
+
+                    idx_elem_i32: element index into `arg_out` (tmp_out) in
+                                  fp16/bf16 units.
+                    val_half:     the scalar f16/bf16 value to add.
+                    """
+                    idx_even = idx_elem_i32 & _c_even_mask_i32
+                    is_odd_i32 = idx_elem_i32 & _c_one_i32
+                    is_odd_i1 = arith.cmpi(
+                        arith.CmpIPredicate.ne, is_odd_i32, fx.Int32(0)
+                    )
+                    elem0 = arith.select(is_odd_i1, _zero_half, val_half)
+                    elem1 = arith.select(is_odd_i1, val_half, _zero_half)
+                    packed = vector.from_elements(_out_vec2_ty, [elem0, elem1])
+                    byte_off = idx_even * _c_two_i32
+                    rocdl.raw_ptr_buffer_atomic_fadd(
+                        packed,
+                        out_rsrc,
+                        byte_off,
+                        fx.Int32(0),
+                        fx.Int32(0),
+                    )
+
+                # Compile-time column base for gui_layout per-16 interleave.
+                #   In inter_dim coords (no split):
+                #     col_g_inter = by_n + n_tile_base + ni*16 + lane_mod_16
+                #   In 2*inter_dim coords (gui_layout, per-16 interleave):
+                #     gate_col = 2*(by_n + n_tile_base + ni*16) + lane_mod_16
+                #     up_col   = gate_col + 16
+                # Row stride in tmp_out: (t*topk + s) * (2*inter_dim).
+                _two_inter_i32 = fx.Int32(2 * inter_dim)
+                _c16_i32 = fx.Int32(16)
+                lane_mod_16_i32 = arith.index_cast(T.i32, lane_mod_16)
+
+                # Precompute per-ni gate_col / up_col in i32.
+                _gate_col_i32_list = []
+                _up_col_i32_list = []
+                for ni in range_constexpr(num_acc_n):
+                    # block_base_inter = by_n + n_tile_base + ni*16 (no lane).
+                    blk_base_inter_idx = (
+                        by_n + n_tile_base + arith.index(ni * 16)
+                    )
+                    blk_base_inter_i32 = arith.index_cast(T.i32, blk_base_inter_idx)
+                    gate_col_i32 = (blk_base_inter_i32 * _c_two_i32) + lane_mod_16_i32
+                    up_col_i32 = gate_col_i32 + _c16_i32
+                    _gate_col_i32_list.append(gate_col_i32)
+                    _up_col_i32_list.append(up_col_i32)
+
             def _stage1_store_row(*, mi: int, ii: int, row_in_tile, row):
                 # Blockscale: dequant already done in compute_tile_bs_s1.
                 fused2 = buffer_ops.buffer_load(sorted_rsrc, row, vec_width=1, dtype=T.i32)
                 t2 = fused2 & mask24_i32
                 s2 = fused2 >> 24
                 t_valid = arith.cmpi(arith.CmpIPredicate.ult, t2, tokens_i32_v)
+
+                if const_expr(k_batch > 1):
+                    # Split-K: write **unactivated** gate and up partials to
+                    # tmp_out (shape (tokens, topk, 2*inter_dim), gui_layout
+                    # per-16 interleave) via half2-packed scalar atomic add.
+                    # The downstream silu_and_mul_fq kernel applies silu(g)*u
+                    # and (optionally) quant. No sorted_weight is applied here
+                    # (deferred; doweight_stage1=True is rejected at compile
+                    # time for k_batch>1).
+                    row_base_i32 = (t2 * topk_i32_v + s2) * _two_inter_i32
+
+                    _if_valid = scf.IfOp(t_valid)
+                    with _if_then(_if_valid):
+                        for ni in range_constexpr(num_acc_n):
+                            acc_idx = mi * num_acc_n + ni
+                            vg_f32 = vector.extract(
+                                acc_gate[acc_idx],
+                                static_position=[ii],
+                                dynamic_position=[],
+                            )
+                            vu_f32 = vector.extract(
+                                acc_up[acc_idx],
+                                static_position=[ii],
+                                dynamic_position=[],
+                            )
+                            vg = arith.trunc_f(out_mlir(), vg_f32)
+                            vu = arith.trunc_f(out_mlir(), vu_f32)
+                            gate_idx_i32 = row_base_i32 + _gate_col_i32_list[ni]
+                            up_idx_i32 = row_base_i32 + _up_col_i32_list[ni]
+                            _atomic_add_scalar_via_pk(gate_idx_i32, vg)
+                            _atomic_add_scalar_via_pk(up_idx_i32, vu)
+                    return
 
                 # out linear index base = ((t*topk + s)*inter_dim) (invariant across ni)
                 idx0 = (t2 * topk_i32_v + s2) * inter_i32_local
@@ -1220,7 +1401,7 @@ def compile_moe_blockscale_gemm1(
             i32_k_in,
             i32_size_expert_ids_in,
             value_attrs={"rocdl.waves_per_eu": waves_per_eu},
-        ).launch(grid=(gx, gy, 1), block=(256, 1, 1), stream=stream)
+        ).launch(grid=(gx, gy, k_batch), block=(256, 1, 1), stream=stream)
 
     return launch_moe_blockscale_gemm1
 

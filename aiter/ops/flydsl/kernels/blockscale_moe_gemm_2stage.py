@@ -31,7 +31,6 @@ CK feature surface coverage in this adapter (matched against
   Tier C  (raises NotImplementedError until upstream grows the knob):
     - act not in {"silu", "gelu"}
     - enable_bias=True
-    - k_batch > 1               (no split-K in upstream blockscale)
     - persist_m > 1             (no persistent kernel)
     - use_async_copy=False      (upstream always uses async/buffer copy)
     - b_nt != default            (non-temporal B load — TODO)
@@ -94,6 +93,47 @@ def _validate_blockscale_dtypes(a_dtype: str, b_dtype: str) -> None:
         )
 
 
+def _validate_split_k(
+    *, k_batch: int, model_dim: int, tile_k: int, scale_block_k: int, stage: str
+) -> None:
+    """Validate split-K constraints for stage1.
+
+    Per the split-K plan (Steps 1-5):
+      1. K-slice must be divisible by scale_block_k (each CTA processes whole
+         scale blocks in K).
+      2. K-slice must be divisible by tile_k (no per-CTA tail-tile handling).
+    Violations raise ValueError so the caller can fall back to k_batch=1.
+    """
+    if k_batch <= 0:
+        raise ValueError(f"blockscale {stage}: k_batch={k_batch} must be >= 1")
+    if k_batch == 1:
+        return
+    if model_dim % k_batch != 0:
+        raise ValueError(
+            f"blockscale {stage}: model_dim={model_dim} not divisible by "
+            f"k_batch={k_batch}"
+        )
+    k_per_split = model_dim // k_batch
+    if k_per_split % scale_block_k != 0:
+        raise ValueError(
+            f"blockscale {stage}: k_per_split={k_per_split} (model_dim/k_batch) "
+            f"not divisible by scale_block_k={scale_block_k}"
+        )
+    if k_per_split % tile_k != 0:
+        raise ValueError(
+            f"blockscale {stage}: k_per_split={k_per_split} not divisible by "
+            f"tile_k={tile_k}"
+        )
+    # The main K-loop processes pairs of tile_k tiles + a 2-tile tail. That
+    # requires total_tiles_per_split (=k_per_split/tile_k) to be even and >= 2.
+    if (k_per_split // tile_k) < 2 or ((k_per_split // tile_k) % 2) != 0:
+        raise ValueError(
+            f"blockscale {stage}: k_per_split={k_per_split} / tile_k={tile_k} "
+            f"= {k_per_split // tile_k} must be even and >= 2 "
+            "(K-loop unrolls in pairs of tile_k tiles)"
+        )
+
+
 def _validate_scale_blocks(
     scale_block_m: int, scale_block_n: int, scale_block_k: int
 ) -> int:
@@ -123,7 +163,6 @@ def _reject_tier_c(
     model_dim_pad: int,
     inter_dim_pad: int,
     swiglu_limit: float,
-    k_batch: int,
     persist_m: int,
     use_async_copy: bool,
     b_nt: int,
@@ -159,11 +198,6 @@ def _reject_tier_c(
         raise NotImplementedError(
             f"blockscale {stage}: swiglu_limit={swiglu_limit} != 0.0 "
             "(no clipping in upstream SiLU — Tier C)"
-        )
-    if k_batch != 1:
-        raise NotImplementedError(
-            f"blockscale {stage}: k_batch={k_batch} != 1 "
-            "(split-K not supported in upstream blockscale — Tier C)"
         )
     if persist_m != 1:
         raise NotImplementedError(
@@ -237,11 +271,17 @@ def compile_blockscale_moe_gemm1(
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         swiglu_limit=swiglu_limit,
-        k_batch=k_batch,
         persist_m=persist_m,
         use_async_copy=use_async_copy,
         b_nt=b_nt,
         xcd_swizzle=xcd_swizzle,
+        stage="stage1",
+    )
+    _validate_split_k(
+        k_batch=int(k_batch),
+        model_dim=int(model_dim),
+        tile_k=int(tile_k),
+        scale_block_k=sbk,
         stage="stage1",
     )
 
@@ -267,6 +307,7 @@ def compile_blockscale_moe_gemm1(
         out_dtype=upstream_out,
         waves_per_eu=wpe,
         act=act,
+        k_batch=int(k_batch),
     )
 
 
@@ -315,7 +356,6 @@ def compile_blockscale_moe_gemm2(
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         swiglu_limit=0.0,
-        k_batch=1,
         persist_m=persist_m,
         use_async_copy=True,
         b_nt=b_nt,
