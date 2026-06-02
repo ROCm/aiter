@@ -1135,17 +1135,11 @@ def attn_fwd(
         kh_off = tl.multiple_of(kh_off, 8)
         vh_off = tl.multiple_of(vh_off, 8)
 
-    q_offset = (
-        Q + off_z * stride_qz + qh_off + cu_seqlens_q_start * stride_qm
-    )
+    q_offset = Q + off_z * stride_qz + qh_off + cu_seqlens_q_start * stride_qm
     q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qk
-    k_offset = (
-        K + off_z * stride_kz + kh_off + cu_seqlens_k_start * stride_kn
-    )
+    k_offset = K + off_z * stride_kz + kh_off + cu_seqlens_k_start * stride_kn
     k_ptrs = k_offset + offs_d_qk[:, None] * stride_kk + offs_n[None, :] * stride_kn
-    v_offset = (
-        V + off_z * stride_vz + vh_off + cu_seqlens_k_start * stride_vk
-    )
+    v_offset = V + off_z * stride_vz + vh_off + cu_seqlens_k_start * stride_vk
     v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v[None, :] * stride_vn
     if USE_BIAS:
         # Note: this might get large enough to overflow on some configs
