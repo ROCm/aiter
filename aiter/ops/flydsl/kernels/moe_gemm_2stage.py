@@ -12,7 +12,6 @@ It is extracted from `tests/kernels/test_moe_gemm.py` so that:
 - `tests/` holds correctness/perf harnesses
 """
 
-import logging
 import os
 import functools
 from contextlib import contextmanager
@@ -52,6 +51,11 @@ from .mfma_preshuffle_pipeline import (
     lds_store_8b_xor16,
     lds_store_16b_xor16,
     make_preshuffle_b_layout,
+    acc_scaled_f32,
+    i64_to_v4f16,
+    i64_to_v4i16,
+    i64x2_to_v8bf16,
+    i64x2_to_v8f16,
     load_b_pack_k32,
     load_b_raw_w4a16,
     unpack_b_w4a16,
@@ -98,37 +102,6 @@ def _ptr_buffer_resource(ptr, num_records_bytes):
     addr_i64 = fx.Int64(addr).ir_value()
     return buffer_ops.create_buffer_resource_from_addr(
         addr_i64, num_records_bytes=num_records_bytes
-    )
-
-
-def _i64_to_v4f16(x_i64):
-    v1 = Vec.from_elements([x_i64], fx.Int64).ir_value()
-    return Vec(v1).bitcast(fx.Float16)
-
-
-def _i64_to_v4i16(x_i64):
-    v1 = Vec.from_elements([x_i64], fx.Int64).ir_value()
-    return Vec(v1).bitcast(fx.Int16)
-
-
-def _i64x2_to_v8f16(lo, hi):
-    v2 = Vec.from_elements([lo, hi], fx.Int64).ir_value()
-    return Vec(v2).bitcast(fx.Float16)
-
-
-def _i64x2_to_v8bf16(lo, hi):
-    v2 = Vec.from_elements([lo, hi], fx.Int64).ir_value()
-    return Vec(v2).bitcast(fx.BFloat16)
-
-
-def _acc_scaled_f32(f32_acc_vec, f32_partial_vec, scale_val):
-    """MFMA f32 partial -> scale -> add to f32 accumulator via math.fma on vector."""
-    from flydsl._mlir.dialects._math_ops_gen import fma as _math_fma
-
-    _uw = arith._to_raw
-    scale_vec = _uw(Vec.filled([4], scale_val, fx.Float32))
-    return arith.ArithValue(
-        _math_fma(scale_vec, _uw(f32_partial_vec), _uw(f32_acc_vec))
     )
 
 
@@ -1007,24 +980,24 @@ def compile_moe_gemm1(
                         if const_expr(_use_mfma_k32):
                             # gfx950: single 16x16x32 MFMA consuming all 128 bits (K=32 f16/bf16)
                             if const_expr(is_f16):
-                                av = _i64x2_to_v8f16(a0, a1)
-                                bv = _i64x2_to_v8f16(b0, b1)
+                                av = i64x2_to_v8f16(a0, a1)
+                                bv = i64x2_to_v8f16(b0, b1)
                             else:
-                                av = _i64x2_to_v8bf16(a0, a1)
-                                bv = _i64x2_to_v8bf16(b0, b1)
+                                av = i64x2_to_v8bf16(a0, a1)
+                                bv = i64x2_to_v8bf16(b0, b1)
                             return mfma_fn(mfma_res_ty, [av, bv, acc_in, 0, 0, 0])
                         if const_expr(is_f16):
-                            a0v = _i64_to_v4f16(a0)
-                            a1v = _i64_to_v4f16(a1)
-                            b0v = _i64_to_v4f16(b0)
-                            b1v = _i64_to_v4f16(b1)
+                            a0v = i64_to_v4f16(a0)
+                            a1v = i64_to_v4f16(a1)
+                            b0v = i64_to_v4f16(b0)
+                            b1v = i64_to_v4f16(b1)
                             acc_mid = mfma_fn(mfma_res_ty, [a0v, b0v, acc_in, 0, 0, 0])
                             return mfma_fn(mfma_res_ty, [a1v, b1v, acc_mid, 0, 0, 0])
                         if const_expr(is_bf16):
-                            a0v = _i64_to_v4i16(a0)
-                            a1v = _i64_to_v4i16(a1)
-                            b0v = _i64_to_v4i16(b0)
-                            b1v = _i64_to_v4i16(b1)
+                            a0v = i64_to_v4i16(a0)
+                            a1v = i64_to_v4i16(a1)
+                            b0v = i64_to_v4i16(b0)
+                            b1v = i64_to_v4i16(b1)
                             acc_mid = mfma_fn(mfma_res_ty, [a0v, b0v, acc_in, 0, 0, 0])
                             return mfma_fn(mfma_res_ty, [a1v, b1v, acc_mid, 0, 0, 0])
                         acc_mid = mfma_fn(mfma_res_ty, [a0, b0, acc_in, 0, 0, 0])
@@ -1094,10 +1067,10 @@ def compile_moe_gemm1(
                                             p_idx, p_g, p_u, p_sc_g, p_sc_u = (
                                                 _pending_gate_up
                                             )
-                                            gate_list[p_idx] = _acc_scaled_f32(
+                                            gate_list[p_idx] = acc_scaled_f32(
                                                 gate_list[p_idx], p_g, p_sc_g
                                             )
-                                            up_list[p_idx] = _acc_scaled_f32(
+                                            up_list[p_idx] = acc_scaled_f32(
                                                 up_list[p_idx], p_u, p_sc_u
                                             )
                                         _pending_gate_up = (
@@ -1133,12 +1106,10 @@ def compile_moe_gemm1(
                         # Drain last pending FMA.
                         if _pending_gate_up is not None:
                             p_idx, p_g, p_u, p_sc_g, p_sc_u = _pending_gate_up
-                            gate_list[p_idx] = _acc_scaled_f32(
+                            gate_list[p_idx] = acc_scaled_f32(
                                 gate_list[p_idx], p_g, p_sc_g
                             )
-                            up_list[p_idx] = _acc_scaled_f32(
-                                up_list[p_idx], p_u, p_sc_u
-                            )
+                            up_list[p_idx] = acc_scaled_f32(up_list[p_idx], p_u, p_sc_u)
                     else:
                         for ku in range_constexpr(k_unroll):
                             b_gate_packs0, b_gate_packs1 = b_gate_tile_in[ku]
@@ -1528,17 +1499,23 @@ def compile_moe_gemm1(
                             sx = (
                                 fx.Float32(1.0)
                                 if is_f16_or_bf16
-                                else fx.Boolean(t_valid).select(buffer_ops.buffer_load(
+                                else fx.Boolean(t_valid).select(
+                                    buffer_ops.buffer_load(
                                         sx_rsrc, ts2, vec_width=1, dtype=T.f32
-                                    ), fx.Float32(0.0))
+                                    ),
+                                    fx.Float32(0.0),
+                                )
                             )
                         else:
                             sx = (
                                 fx.Float32(1.0)
                                 if is_f16_or_bf16
-                                else fx.Boolean(t_valid).select(buffer_ops.buffer_load(
+                                else fx.Boolean(t_valid).select(
+                                    buffer_ops.buffer_load(
                                         sx_rsrc, t2, vec_width=1, dtype=T.f32
-                                    ), fx.Float32(0.0))
+                                    ),
+                                    fx.Float32(0.0),
+                                )
                             )
                         for ni in range_constexpr(num_acc_n):
                             col_local = col_base_local + (ni * 16)
@@ -1551,7 +1528,9 @@ def compile_moe_gemm1(
                                 v = v.truncf(T.bf16)
                             lds_idx = row_base_lds + col_local
                             v1 = Vec.from_elements([v]).ir_value()
-                            Vec(v1).store(lds_out, [lds_idx], alignment=_splitk_lds_align)
+                            Vec(v1).store(
+                                lds_out, [lds_idx], alignment=_splitk_lds_align
+                            )
 
                     def precompute_row_splitk(*, row_local, row):
                         fused2 = buffer_ops.buffer_load(
@@ -1729,17 +1708,23 @@ def compile_moe_gemm1(
                             sx = (
                                 fx.Float32(1.0)
                                 if is_f16_or_bf16
-                                else fx.Boolean(t_valid).select(buffer_ops.buffer_load(
+                                else fx.Boolean(t_valid).select(
+                                    buffer_ops.buffer_load(
                                         sx_rsrc, ts2, vec_width=1, dtype=T.f32
-                                    ), fx.Float32(0.0))
+                                    ),
+                                    fx.Float32(0.0),
+                                )
                             )
                         else:
                             sx = (
                                 fx.Float32(1.0)
                                 if is_f16_or_bf16
-                                else fx.Boolean(t_valid).select(buffer_ops.buffer_load(
+                                else fx.Boolean(t_valid).select(
+                                    buffer_ops.buffer_load(
                                         sx_rsrc, t2, vec_width=1, dtype=T.f32
-                                    ), fx.Float32(0.0))
+                                    ),
+                                    fx.Float32(0.0),
+                                )
                             )
 
                         # Sorted weight aligned with `row` (matches aiter moe_sorting output).
@@ -1836,17 +1821,23 @@ def compile_moe_gemm1(
                         sx0 = (
                             fx.Float32(1.0)
                             if is_f16_or_bf16
-                            else fx.Boolean(t_valid).select(buffer_ops.buffer_load(
+                            else fx.Boolean(t_valid).select(
+                                buffer_ops.buffer_load(
                                     sx_rsrc, ts2, vec_width=1, dtype=T.f32
-                                ), fx.Float32(0.0))
+                                ),
+                                fx.Float32(0.0),
+                            )
                         )
                     else:
                         sx0 = (
                             fx.Float32(1.0)
                             if is_f16_or_bf16
-                            else fx.Boolean(t_valid).select(buffer_ops.buffer_load(
+                            else fx.Boolean(t_valid).select(
+                                buffer_ops.buffer_load(
                                     sx_rsrc, t2, vec_width=1, dtype=T.f32
-                                ), fx.Float32(0.0))
+                                ),
+                                fx.Float32(0.0),
+                            )
                         )
                     sx = sx0
                     arith.constant(0.0, type=out_mlir())
@@ -2767,24 +2758,24 @@ def compile_moe_gemm2(
                         if const_expr(_use_mfma_k32):
                             # gfx950: single 16x16x32 MFMA consuming all 128 bits (K=32 f16/bf16)
                             if const_expr(is_f16):
-                                av = _i64x2_to_v8f16(a0, a1)
-                                bv = _i64x2_to_v8f16(b0, b1)
+                                av = i64x2_to_v8f16(a0, a1)
+                                bv = i64x2_to_v8f16(b0, b1)
                             else:
-                                av = _i64x2_to_v8bf16(a0, a1)
-                                bv = _i64x2_to_v8bf16(b0, b1)
+                                av = i64x2_to_v8bf16(a0, a1)
+                                bv = i64x2_to_v8bf16(b0, b1)
                             return mfma_fn(mfma_res_ty, [av, bv, acc0, 0, 0, 0])
                         if const_expr(is_f16):
-                            a0v = _i64_to_v4f16(a0)
-                            a1v = _i64_to_v4f16(a1)
-                            b0v = _i64_to_v4f16(b0)
-                            b1v = _i64_to_v4f16(b1)
+                            a0v = i64_to_v4f16(a0)
+                            a1v = i64_to_v4f16(a1)
+                            b0v = i64_to_v4f16(b0)
+                            b1v = i64_to_v4f16(b1)
                             acc1 = mfma_fn(mfma_res_ty, [a0v, b0v, acc0, 0, 0, 0])
                             return mfma_fn(mfma_res_ty, [a1v, b1v, acc1, 0, 0, 0])
                         if const_expr(is_bf16):
-                            a0v = _i64_to_v4i16(a0)
-                            a1v = _i64_to_v4i16(a1)
-                            b0v = _i64_to_v4i16(b0)
-                            b1v = _i64_to_v4i16(b1)
+                            a0v = i64_to_v4i16(a0)
+                            a1v = i64_to_v4i16(a1)
+                            b0v = i64_to_v4i16(b0)
+                            b1v = i64_to_v4i16(b1)
                             acc1 = mfma_fn(mfma_res_ty, [a0v, b0v, acc0, 0, 0, 0])
                             return mfma_fn(mfma_res_ty, [a1v, b1v, acc1, 0, 0, 0])
                         acc1 = mfma_fn(mfma_res_ty, [a0, b0, acc0, 0, 0, 0])
@@ -2836,7 +2827,7 @@ def compile_moe_gemm2(
                                         tmp = mfma_k64(zero_f32_acc, a0, a1, b0, b1)
                                         if _pending_acc is not None:
                                             p_idx, p_tmp, p_sc = _pending_acc
-                                            acc_list[p_idx] = _acc_scaled_f32(
+                                            acc_list[p_idx] = acc_scaled_f32(
                                                 acc_list[p_idx], p_tmp, p_sc
                                             )
                                         _pending_acc = (acc_idx, tmp, sc)
@@ -2855,7 +2846,7 @@ def compile_moe_gemm2(
                         # Drain last pending FMA.
                         if _pending_acc is not None:
                             p_idx, p_tmp, p_sc = _pending_acc
-                            acc_list[p_idx] = _acc_scaled_f32(
+                            acc_list[p_idx] = acc_scaled_f32(
                                 acc_list[p_idx], p_tmp, p_sc
                             )
                     else:
@@ -3222,9 +3213,12 @@ def compile_moe_gemm2(
                         sx = (
                             fx.Boolean(ts_ok).select(fx.Float32(1.0), fx.Float32(0.0))
                             if is_f16_or_bf16
-                            else fx.Boolean(ts_ok).select(buffer_ops.buffer_load(
+                            else fx.Boolean(ts_ok).select(
+                                buffer_ops.buffer_load(
                                     sx_rsrc, ts2, vec_width=1, dtype=T.f32
-                                ), fx.Float32(0.0))
+                                ),
+                                fx.Float32(0.0),
+                            )
                         )
 
                         if const_expr(doweight_stage2):
@@ -3232,9 +3226,12 @@ def compile_moe_gemm2(
                             if const_expr(tw_pf is not None):
                                 tw = ts_ok.select(tw_pf[tw_idx], fx.Float32(0.0))
                             else:
-                                tw = fx.Boolean(ts_ok).select(buffer_ops.buffer_load(
+                                tw = fx.Boolean(ts_ok).select(
+                                    buffer_ops.buffer_load(
                                         sorted_w_rsrc, row, vec_width=1, dtype=T.f32
-                                    ), fx.Float32(0.0))
+                                    ),
+                                    fx.Float32(0.0),
+                                )
 
                         idx0 = (
                             t2_safe * model_i32
@@ -3299,9 +3296,12 @@ def compile_moe_gemm2(
                         sx = (
                             fx.Float32(1.0)
                             if is_f16_or_bf16
-                            else fx.Boolean(ts_ok).select(buffer_ops.buffer_load(
+                            else fx.Boolean(ts_ok).select(
+                                buffer_ops.buffer_load(
                                     sx_rsrc, ts2, vec_width=1, dtype=T.f32
-                                ), fx.Float32(0.0))
+                                ),
+                                fx.Float32(0.0),
+                            )
                         )
 
                         if const_expr(doweight_stage2):

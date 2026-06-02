@@ -11,9 +11,10 @@ Key primitives:
 from __future__ import annotations
 from dataclasses import dataclass
 from flydsl._mlir import ir
-from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 from flydsl.expr import arith as _arith
+from flydsl.expr import const_expr, range_constexpr
 import flydsl.expr as fx
 
 
@@ -252,6 +253,101 @@ def _pack_i32_pair_to_i64(lo, hi, vector):
     v2 = vector.from_elements(T.vec(2, T.i32), [lo, hi])
     v64 = vector.bitcast(T.vec(1, T.i64), v2)
     return vector.extract(v64, static_position=[0], dynamic_position=[])
+
+
+def i64s_to_vec(vals, dtype):
+    return Vec(Vec.from_elements(vals, fx.Int64).ir_value()).bitcast(dtype)
+
+
+def i64_to_v4f16(x_i64):
+    return i64s_to_vec([x_i64], fx.Float16)
+
+
+def i64_to_v4i16(x_i64):
+    return i64s_to_vec([x_i64], fx.Int16)
+
+
+def i64x2_to_v8f16(lo, hi):
+    return i64s_to_vec([lo, hi], fx.Float16)
+
+
+def i64x2_to_v8bf16(lo, hi):
+    return i64s_to_vec([lo, hi], fx.BFloat16)
+
+
+def acc_scaled_f32(f32_acc_vec, f32_partial_vec, scale_val):
+    """MFMA f32 partial -> scale -> add to f32 accumulator via math.fma on vector."""
+    from flydsl._mlir.dialects._math_ops_gen import fma as _math_fma
+
+    scale_vec = _arith._to_raw(fx.full(4, fx.Float32(scale_val), fx.Float32))
+    return _arith.ArithValue(
+        _math_fma(
+            scale_vec,
+            _arith._to_raw(f32_partial_vec),
+            _arith._to_raw(f32_acc_vec),
+        )
+    )
+
+
+def load_b_tile_range_k64(load_b_packs_k64, *, base_k, ku_begin, ku_end, num_acc_n):
+    b_tile = []
+    for ku in range_constexpr(ku_begin, ku_end):
+        packs0 = []
+        packs1 = []
+        for ni in range_constexpr(num_acc_n):
+            b0, b1 = load_b_packs_k64(base_k, ku, ni)
+            packs0.append(b0)
+            packs1.append(b1)
+        b_tile.append((packs0, packs1))
+    return b_tile
+
+
+def load_scale_vec(buffer_ops, rsrc, scale_info, *, ku, mni, lane_div_16, lane_mod_16):
+    idx_pack = (
+        mni * scale_info.stride_n0
+        + ku * scale_info.stride_k0
+        + lane_div_16 * scale_info.stride_klane
+        + lane_mod_16
+    )
+    s = buffer_ops.buffer_load(rsrc, idx_pack, vec_width=1, dtype=T.i32)
+    return Vec.from_elements([s], fx.Int32)
+
+
+def apply_k_shift(scale_vec, k_shift_bits):
+    if const_expr(k_shift_bits > 0):
+        val = Vec(scale_vec)[0].ir_value()
+        val = (fx.Uint32(val) >> k_shift_bits).ir_value()
+        return Vec.from_elements([val], fx.Int32)
+    return scale_vec
+
+
+def load_scale_tile(
+    buffer_ops,
+    rsrc,
+    scale_info,
+    *,
+    base_k,
+    mni_base,
+    mni_count,
+    ku_packed_limit,
+    lane_div_16,
+    lane_mod_16,
+    k_shift_bits=0,
+):
+    tile = []
+    for ku in range_constexpr(ku_packed_limit):
+        for mni_i in range_constexpr(mni_count):
+            scale = load_scale_vec(
+                buffer_ops,
+                rsrc,
+                scale_info,
+                ku=ku + base_k,
+                mni=mni_base + mni_i,
+                lane_div_16=lane_div_16,
+                lane_mod_16=lane_mod_16,
+            )
+            tile.append(apply_k_shift(scale, k_shift_bits))
+    return tile
 
 
 def _i8x4_in_i32_to_bf16x4_i64(val_i32, arith, vector, scale_val=None):
@@ -732,30 +828,43 @@ def xcd_remap_bx_by(
     _c_tm = fx.arith.constant(tile_m, index=True)
     _gx = fx.arith.constant(N // tile_n, index=True)
     _gy = (c_m + _c_tm - _c1) / _c_tm
+    return xcd_remap_bx_by_grid(
+        bx, by, _gx, _gy, xcd_swizzle=xcd_swizzle, num_xcds=num_xcds
+    )
 
-    _linear_id = bx * _gx + by
-    _num_wgs = _gx * _gy
 
-    _c_xcds = fx.arith.constant(num_xcds, index=True)
-    _q = _num_wgs / _c_xcds
-    _r = _num_wgs % _c_xcds
-    _xcd = _linear_id % _c_xcds
-    _in_xcd = _linear_id / _c_xcds
-    _xcd_lt_r = fx.arith.cmpi(CmpIPredicate.ult, _xcd, _r)
-    _clip = fx.arith.select(_xcd_lt_r, _xcd, _r)
-    _wgid = _xcd * _q + _clip + _in_xcd
+def xcd_remap_bx_by_grid(
+    bx,
+    by,
+    gx,
+    gy,
+    *,
+    xcd_swizzle: int,
+    num_xcds: int = 8,
+):
+    """Remap (bx, by) when grid extents (gx, gy) are already computed."""
+    if xcd_swizzle <= 0:
+        return bx, by
 
-    _c_wgm = fx.arith.constant(xcd_swizzle, index=True)
-    _num_wgid_in_group = _c_wgm * _gx
-    _group_id = _wgid / _num_wgid_in_group
+    _linear_id = bx * gx + by
+    _num_wgs = gx * gy
+
+    _c_xcds = fx.Index(num_xcds)
+    _wgs_per_xcd = _num_wgs // _c_xcds
+    _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id // _c_xcds)
+
+    _c_wgm = fx.Index(xcd_swizzle).ir_value()
+    _num_wgid_in_group = _c_wgm * gx
+    _group_id = _wgid // _num_wgid_in_group
     _first_pid_m = _group_id * _c_wgm
-    _remaining_m = _gy - _first_pid_m
-    _cmp_m = fx.arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
-    _group_size_m = fx.arith.select(_cmp_m, _remaining_m, _c_wgm)
+    _remaining_m = gy - _first_pid_m
+    _group_size_m = (fx.Index(_remaining_m) < fx.Index(_c_wgm)).select(
+        _remaining_m, _c_wgm
+    )
 
     _wgid_in_group = _wgid % _num_wgid_in_group
     new_bx = _first_pid_m + (_wgid_in_group % _group_size_m)
-    new_by = _wgid_in_group / _group_size_m
+    new_by = _wgid_in_group // _group_size_m
     return new_bx, new_by
 
 
@@ -780,6 +889,7 @@ __all__ = [
     "swizzle_xor16",
     "tile_chunk_coord_i32",
     "xcd_remap_bx_by",
+    "xcd_remap_bx_by_grid",
 ]
 
 

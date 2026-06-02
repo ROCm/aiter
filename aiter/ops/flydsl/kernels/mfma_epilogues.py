@@ -26,29 +26,196 @@ modules (`arith`, `vector`, `gpu`) and the `range_constexpr` iterator.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from typing import Callable
 
 from flydsl._mlir import ir
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr import arith, vector, gpu, range_constexpr
-from flydsl._mlir.dialects import scf
-from flydsl._mlir.dialects.arith import CmpIPredicate
+from flydsl.expr import arith, gpu, range_constexpr, const_expr
+from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr.typing import T
 
 
-@contextmanager
-def _if_then(if_op):
-    """Compat helper for SCF IfOp then-region across old/new Python APIs."""
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
+def raw_value(val):
+    if not isinstance(val, ir.Value) and hasattr(val, "ir_value"):
+        val = val.ir_value()
+    return val._value if hasattr(val, "_value") else val
+
+
+def idx_to_llvm_ptr(idx_val, addr_space=1):
+    """Convert an index-typed byte address to !llvm.ptr<addr_space>."""
+    idx_v = raw_value(idx_val)
+    i64_v = fx.Int64(idx_v).ir_value()
+    return llvm.inttoptr(ir.Type.parse(f"!llvm.ptr<{addr_space}>"), raw_value(i64_v))
+
+
+def store_or_atomic_add(ptr, frag, *, accumulate: bool, alignment: int):
+    frag_v = raw_value(frag)
+    if accumulate:
+        llvm.AtomicRMWOp(
+            llvm.AtomicBinOp.fadd,
+            ptr,
+            frag_v,
+            llvm.AtomicOrdering.monotonic,
+            syncscope="agent",
+            alignment=alignment,
+        )
+    else:
+        llvm.StoreOp(frag_v, ptr, alignment=alignment, nontemporal=True)
+
+
+def _silu_elem_f32(g):
+    neg_log2e = fx.Float32(-1.4426950408889634)
+    t = g * neg_log2e
+    emu = llvm.call_intrinsic(T.f32, "llvm.amdgcn.exp2.f32", [raw_value(t)], [], [])
+    one = fx.Float32(1.0).ir_value()
+    den = one + emu
+    sig = llvm.call_intrinsic(T.f32, "llvm.amdgcn.rcp.f32", [raw_value(den)], [], [])
+    return g * sig
+
+
+def moe_silu_mul_vec4(gate_v4, up_v4, *, swiglu_limit: float = 0.0):
+    """Element-wise silu(gate) * up on vec4_f32."""
+    result_elems = []
+    if const_expr(swiglu_limit != 0):
+        limit = fx.Float32(float(swiglu_limit)).ir_value()
+        neg_limit = fx.Float32(-float(swiglu_limit)).ir_value()
+    for ei in range_constexpr(4):
+        g = Vec(gate_v4)[ei].ir_value()
+        u = Vec(up_v4)[ei].ir_value()
+        if const_expr(swiglu_limit != 0):
+            g = arith.minimumf(g, limit)
+            u = arith.minimumf(u, limit)
+            u = arith.maximumf(u, neg_limit)
+        result_elems.append(_silu_elem_f32(g) * u)
+    return Vec.from_elements(result_elems, fx.Float32)
+
+
+def moe_swiglu_mul_vec4(gate_v4, up_v4, *, swiglu_limit: float = 0.0):
+    """Element-wise swiglu(gate, up) on vec4_f32."""
+    result_elems = []
+    alpha = fx.Float32(1.702)
+    one = fx.Float32(1.0).ir_value()
+    neg_log2e = fx.Float32(-1.4426950408889634)
+    if const_expr(swiglu_limit != 0):
+        limit = fx.Float32(float(swiglu_limit)).ir_value()
+        neg_limit = fx.Float32(-float(swiglu_limit)).ir_value()
+    else:
+        limit = fx.Float32(7.0).ir_value()
+        neg_limit = fx.Float32(-7.0).ir_value()
+
+    for ei in range_constexpr(4):
+        g = Vec(gate_v4)[ei].ir_value()
+        u = Vec(up_v4)[ei].ir_value()
+        g = arith.minimumf(g, limit)
+        u = arith.minimumf(u, limit)
+        u = arith.maximumf(u, neg_limit)
+        t = g * alpha * neg_log2e
+        emu = llvm.call_intrinsic(T.f32, "llvm.amdgcn.exp2.f32", [raw_value(t)], [], [])
+        den = one + emu
+        sig = llvm.call_intrinsic(
+            T.f32, "llvm.amdgcn.rcp.f32", [raw_value(den)], [], []
+        )
+        result_elems.append(g * sig * (u + one))
+    return Vec.from_elements(result_elems, fx.Float32)
+
+
+def moe_act_vec4(gate_v4, up_v4, *, act: str, swiglu_limit: float = 0.0):
+    if const_expr(act == "swiglu"):
+        return moe_swiglu_mul_vec4(gate_v4, up_v4, swiglu_limit=swiglu_limit)
+    return moe_silu_mul_vec4(gate_v4, up_v4, swiglu_limit=swiglu_limit)
+
+
+def f32_to_e2m1(qx_f32):
+    """Convert a scaled f32 value to fp4 (e2m1) 4-bit integer."""
+    qx = arith.bitcast(T.i32, raw_value(qx_f32))
+    s = qx & fx.Int32(0x80000000)
+    qx_abs = qx & 0x7FFFFFFF
+    denormal_mask = fx.Uint32(qx_abs) < 0x3F800000
+    normal_mask = (fx.Uint32(qx_abs) < 0x40C00000) & (fx.Uint32(qx_abs) >= 0x3F800000)
+
+    c4a8 = fx.Int32(0x4A800000)
+    denorm_f32 = arith.bitcast(T.f32, raw_value(qx_abs)) + arith.bitcast(
+        T.f32, raw_value(c4a8)
+    )
+    denormal_x = arith.bitcast(T.i32, raw_value(denorm_f32)) - c4a8
+
+    mant_odd = (qx_abs >> 22) & 1
+    normal_x = qx_abs + fx.Int32(0xC11FFFFF) + mant_odd
+    normal_x = normal_x >> 22
+
+    e2m1 = normal_mask.select(normal_x, 7)
+    e2m1 = denormal_mask.select(denormal_x, e2m1)
+    return (s >> 28) | e2m1
+
+
+def run_moe_stage1_cshuffle_epilog(
+    *,
+    gate_up_interleave: bool,
+    is_splitk: bool,
+    mock_gate_only: bool,
+    acc,
+    acc_gate,
+    acc_up,
+    gui_out_n: int,
+    tile_n: int,
+    e_vec: int,
+    e_vec_sk: int,
+    cshuffle_nlane: int,
+    cshuffle_nlane_sk: int,
+    num_acc_n: int,
+    by_n,
+    n_tile_base,
+    inter_dim: int,
+    run_cshuffle_epilog,
+):
+    if const_expr(gate_up_interleave and not is_splitk):
+        gui_tile_n = tile_n // 2
+        run_cshuffle_epilog(
+            acc_value=acc,
+            tile_n_value=gui_tile_n,
+            e_vec_value=e_vec,
+            cshuffle_nlane_value=min(32, gui_tile_n // e_vec),
+            num_acc_n_value=gui_out_n,
+            by_n_value=by_n // 2,
+            n_tile_base_value=n_tile_base // 2,
+            lds_out_split_value=None,
+        )
+    elif const_expr(mock_gate_only or (gate_up_interleave and is_splitk)):
+        run_cshuffle_epilog(
+            acc_value=acc_gate,
+            tile_n_value=tile_n,
+            e_vec_value=e_vec_sk,
+            cshuffle_nlane_value=cshuffle_nlane_sk,
+            num_acc_n_value=num_acc_n,
+        )
+    elif const_expr(is_splitk):
+        run_cshuffle_epilog(
+            acc_value=acc_gate,
+            tile_n_value=tile_n,
+            e_vec_value=e_vec_sk,
+            cshuffle_nlane_value=cshuffle_nlane_sk,
+            num_acc_n_value=num_acc_n,
+            sk_n_offset=0,
+        )
+        gpu.barrier()
+        run_cshuffle_epilog(
+            acc_value=acc_up,
+            tile_n_value=tile_n,
+            e_vec_value=e_vec_sk,
+            cshuffle_nlane_value=cshuffle_nlane_sk,
+            num_acc_n_value=num_acc_n,
+            sk_n_offset=inter_dim,
+        )
+    else:
+        run_cshuffle_epilog(
+            acc_value=acc,
+            tile_n_value=tile_n,
+            e_vec_value=e_vec,
+            cshuffle_nlane_value=cshuffle_nlane,
+            num_acc_n_value=num_acc_n,
+        )
 
 
 def default_epilog(
@@ -274,7 +441,9 @@ def c_shuffle_epilog(
                         scf.YieldOp([fa])
                     frag = _if_ld.results[0]
 
-                    col_pair0 = col_pair0_local + fx.Boolean(_is_group_b).select(_half_n_idx, _zero_idx)
+                    col_pair0 = col_pair0_local + fx.Boolean(_is_group_b).select(
+                        _half_n_idx, _zero_idx
+                    )
                     store_pair(
                         row_local=row_local,
                         row=row,
@@ -285,10 +454,12 @@ def c_shuffle_epilog(
                     )
 
             if row_pred is not None:
+
                 @flyc.jit
                 def _row_guard_split():
                     if row_pred:
                         _do_store_row_split()
+
                 _row_guard_split()
             else:
                 _do_store_row_split()
@@ -406,10 +577,12 @@ def c_shuffle_epilog(
                 )
 
         if row_pred is not None:
+
             @flyc.jit
             def _row_guard():
                 if row_pred:
                     _do_store_row()
+
             _row_guard()
         else:
             _do_store_row()
