@@ -102,7 +102,46 @@ def _mul_nuw(a, b):
     return _raw(arith.muli(a, b, overflow_flags=_get_nuw()))
 
 
+def _probe_vgpr_bank_support():
+    """Probe LLVM backend to check if llvm.amdgcn.set.vgpr.bank is supported."""
+    import subprocess, tempfile, os
+    ir_code = (
+        'declare i32 @llvm.amdgcn.set.vgpr.bank(i32, i32)\n'
+        'define i32 @test(i32 %x) {\n'
+        '  %r = call i32 @llvm.amdgcn.set.vgpr.bank(i32 %x, i32 0)\n'
+        '  ret i32 %r\n'
+        '}\n'
+    )
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.ll', delete=False) as f:
+            f.write(ir_code)
+            tmp = f.name
+        result = subprocess.run(
+            ['llc', '-march=amdgcn', '-mcpu=gfx1250', tmp, '-o', os.devnull],
+            capture_output=True, timeout=10)
+        return result.returncode == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+_VGPR_BANK_SUPPORTED = None
+
+
+def _has_vgpr_bank():
+    global _VGPR_BANK_SUPPORTED
+    if _VGPR_BANK_SUPPORTED is None:
+        _VGPR_BANK_SUPPORTED = _probe_vgpr_bank_support()
+    return _VGPR_BANK_SUPPORTED
+
+
 def set_vgpr_bank(raw_val, bank: int):
+    if not _has_vgpr_bank():
+        return raw_val
     val_type = raw_val.type
     bank_val = _raw(arith.constant(bank, type=T.i32))
     return llvm_dialect.call_intrinsic(
@@ -117,6 +156,8 @@ def set_vgpr_bank_offset(raw_val, bank: int, offset: int):
     BankOffsetHint — a single-candidate hint that is much stronger than the
     256-candidate BankHint produced by set_vgpr_bank.
     """
+    if not _has_vgpr_bank():
+        return raw_val
     val_type = raw_val.type
     bank_val   = _raw(arith.constant(bank,   type=T.i32))
     offset_val = _raw(arith.constant(offset, type=T.i32))

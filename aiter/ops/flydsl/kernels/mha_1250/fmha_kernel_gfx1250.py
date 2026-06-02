@@ -245,6 +245,85 @@ def _build_tdm_descs(dg1, addr_i64, stride_adv_i64,
     return descs
 
 
+def _build_dg0_comps_flat(addr_i64, stride_adv_i64, lds_base, su_p_size, n_su):
+    """Compute TDM dg0 components as flat list for iter_arg carry.
+
+    Returns [lds_off0_i32, addr_mod0_i64, lds_off1_i32, addr_mod1_i64, ...] (2×n_su values).
+    addr_mod_i64 = addr_i64 | bit63 (bit31 of hi word set once here at initialization).
+    Called ONCE before the loop; subsequent iterations use _advance_dg0_flat which
+    advances addr_mod additively — bit63 is preserved through addition for GPU addresses
+    (tile_stride << 2^63), so s_or/s_bitset1 are never needed again in the hot path.
+    """
+    from flydsl._mlir.dialects import arith as _mlir_arith
+    i64 = ir.IntegerType.get_signless(64)
+    _bit63 = _mlir_arith.constant(i64, value=ir.IntegerAttr.get(i64, -9223372036854775808))
+    cur_addr = addr_i64
+    flat = []
+    for su in range(n_su):
+        lds_off = _raw(arith.addi(lds_base, arith.constant(su * su_p_size, type=T.i32)))
+        addr_mod = _mlir_arith.ori(cur_addr, _bit63)
+        flat += [lds_off, addr_mod]
+        if su < n_su - 1:
+            cur_addr = _mlir_arith.addi(cur_addr, stride_adv_i64)
+    return flat  # 2*n_su values: alternating i32 (lds_off) and i64 (addr_mod)
+
+
+def _advance_dg0_flat(old_flat, tile_stride_i64, new_lds_base, su_p_size, n_su):
+    """Advance per-SU dg0 components for next iteration — no ori/bitset needed.
+
+    addr_mod per SU is advanced by tile_stride additively. Since GPU addresses are
+    << 2^63 and tile_stride << 2^63, addition preserves bit63 (= bit31 of addr_hi).
+    lds_off is recomputed from new_lds_base (changes with ping-pong swap).
+    This eliminates 8 s_or / s_bitset1_b32 instructions per iteration.
+    """
+    from flydsl._mlir.dialects import arith as _mlir_arith
+    flat = []
+    for su in range(n_su):
+        old_addr_mod = old_flat[su * 2 + 1]  # i64 with bit63 already set
+        new_addr_mod = _mlir_arith.addi(old_addr_mod, tile_stride_i64)  # bit63 preserved
+        new_lds_off = _raw(arith.addi(new_lds_base, arith.constant(su * su_p_size, type=T.i32)))
+        flat += [new_lds_off, new_addr_mod]
+    return flat
+
+
+def _descs_from_comps_flat(flat, dg1, n_su):
+    """Rebuild (dg0, dg1) desc pairs from flat components — 2 s_mov_b64 per SU.
+
+    Each SU uses 2 entries from flat: lds_off_i32 and addr_modified_i64.
+    dg0 = v4i32([pred=1, lds_off, addr_lo, addr_hi]) is assembled by bitcasting
+    a v2i64([pred_lds_i64, addr_mod_i64]) where:
+      pred_lds_i64 = (lds_off << 32) | 1  →  lo=pred=1, hi=lds_off
+      addr_mod_i64                          →  lo=addr_lo, hi=addr_hi|0x80000000
+    The v2i64 construction generates 2 × s_mov_b64 (no double-writes), and the
+    bitcast to v4i32 is zero-cost (same 4-SGPR group, just type reinterpretation).
+    """
+    from flydsl._mlir.dialects import arith as _mlir_arith
+    i32 = ir.IntegerType.get_signless(32)
+    i64 = ir.IntegerType.get_signless(64)
+    v2i64_ty = ir.VectorType.get([2], i64)
+    v4i32_ty = ir.VectorType.get([4], i32)
+    _idx0 = _raw(arith.constant(0, type=T.i32))
+    _idx1 = _raw(arith.constant(1, type=T.i32))
+    _c1_i64 = _mlir_arith.constant(i64, value=ir.IntegerAttr.get(i64, 1))
+    _dg1_list = dg1 if isinstance(dg1, list) else [dg1] * n_su
+    descs = []
+    for su in range(n_su):
+        lds_off = flat[su * 2]        # i32
+        addr_mod = flat[su * 2 + 1]   # i64 with bit63 set
+        # pred_lds_i64: lo=1(pred), hi=lds_off → 1 | (lds_off_i64 << 32)
+        lds_off_i64 = _mlir_arith.extsi(i64, lds_off)
+        lds_off_shifted = _mlir_arith.shli(
+            lds_off_i64, _mlir_arith.constant(i64, value=ir.IntegerAttr.get(i64, 32)))
+        pred_lds_i64 = _mlir_arith.ori(lds_off_shifted, _c1_i64)
+        # v2i64([pred_lds, addr_mod]) → bitcast → v4i32([pred,lds_off,addr_lo,addr_hi])
+        v2 = llvm_dialect.mlir_undef(v2i64_ty)
+        v2 = llvm_dialect.insertelement(v2, pred_lds_i64, _idx0)
+        v2 = llvm_dialect.insertelement(v2, addr_mod, _idx1)
+        dg0 = vector.bitcast(v4i32_ty, v2)
+        descs.append((dg0, _dg1_list[su]))
+    return descs
+
+
 def _issue_tdm_from_descs(descs):
     """Issue TDM loads from pre-built descriptors, with per-SU barriers."""
     for dg0, dg1 in descs:
@@ -875,7 +954,71 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             _to_raw(arith.constant(32, type=T.i32)), stride_k_seq)
         stride_v_32 = _mlir_arith.muli(
             _to_raw(arith.constant(32, type=T.i32)), stride_v_seq)
-    
+
+        # ================================================================
+        # Precomputed TDM constants — factored out of _core_loop so each
+        # iteration only pays one addi (no ptrtoint / muli on the hot path).
+        # ================================================================
+        _i64_tdm = ir.IntegerType.get_signless(64)
+        tile_n_const = _to_raw(arith.constant(TILE_N, type=T.i32))  # also redefined at prologue 2f
+        _K_CFG_MAIN = (1 << 16) | _K_TDM_CONFIG
+        _V_CFG_MAIN = (1 << 16) | _V_TDM_CONFIG
+        _stride_k_elems_main = _to_raw(arith.shrui(
+            stride_k_seq, arith.constant(1, type=T.i32)))
+        _stride_v_elems_main = _to_raw(arith.shrui(
+            stride_v_seq, arith.constant(1, type=T.i32)))
+
+        # K dg1 for main-loop (full-tile, no OOB)
+        k_dg1_main = vector.from_elements(T.vec(8, T.i32), [
+            arith.constant(_K_CFG_MAIN, type=T.i32),
+            arith.constant(200 << 16, type=T.i32),
+            arith.constant(8 << 16, type=T.i32),
+            arith.constant(200 << 16, type=T.i32),
+            arith.constant(8, type=T.i32),
+            _stride_k_elems_main,
+            arith.constant(0, type=T.i32),
+            arith.constant(0, type=T.i32)])
+
+        # V dg1 for main-loop (full-tile, no OOB)
+        v_dg1_main = vector.from_elements(T.vec(8, T.i32), [
+            arith.constant(_V_CFG_MAIN, type=T.i32),
+            arith.constant(128 << 16, type=T.i32),
+            arith.constant(8 << 16, type=T.i32),
+            arith.constant(128 << 16, type=T.i32),
+            arith.constant(8, type=T.i32),
+            _stride_v_elems_main,
+            arith.constant(0, type=T.i32),
+            arith.constant(0, type=T.i32)])
+
+        # Per-SU stride advance (i64) for _build_tdm_descs
+        k_stride_adv_i64 = _mlir_arith.extsi(_i64_tdm, stride_k_32)
+        v_stride_adv_i64 = _mlir_arith.extsi(_i64_tdm, stride_v_32)
+
+        # Per-wave LDS offset for K/V TDM target.
+        # wave_id is computed from thread_id (VGPR). Use readfirstlane to make
+        # it SGPR so all downstream dg0 components are SGPR — eliminates
+        # v_readfirstlane before tensor_load_to_lds.
+        _wave_id_sgpr = _raw(rocdl.readfirstlane(T.i32, wave_id))
+        _k_warp_lds_off = _mlir_arith.muli(
+            _wave_id_sgpr, _to_raw(arith.constant(8 * K_ROW_BYTES, type=T.i32)))
+        _v_warp_lds_off = _mlir_arith.muli(
+            _wave_id_sgpr, _to_raw(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
+
+        # Absolute global base addresses (tile-0, wave-adjusted) for K and V TDM.
+        # All per-tile addresses are derived by adding multiples of tile stride.
+        _k_wave_stride_32 = _to_raw(arith.muli(
+            arith.constant(8, type=T.i32), stride_k_seq))
+        _v_wave_stride_32 = _to_raw(arith.muli(
+            arith.constant(8, type=T.i32), stride_v_seq))
+        k_tdm_base_i64 = _compute_k_global_addr(ptr_K, k_offset, wave_id, _k_wave_stride_32)
+        v_tdm_base_i64 = _compute_v_global_addr(ptr_V, v_offset, wave_id, _v_wave_stride_32)
+
+        # Per-tile stride (i64): TILE_N rows * stride_bytes
+        _tile_k_stride_i64 = _mlir_arith.extsi(
+            _i64_tdm, _mlir_arith.muli(tile_n_const, stride_k_seq))
+        _tile_v_stride_i64 = _mlir_arith.extsi(
+            _i64_tdm, _mlir_arith.muli(tile_n_const, stride_v_seq))
+
         # SGPR state: softmax scale
         log2e_val = _mlir_arith.constant(ir.F32Type.get(), 1.4426950408889634)
         scale = _mlir_arith.mulf(log2e_val, scalar_f)
@@ -1174,18 +1317,13 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             sp_tiles,       # [4 msb][1] v8f32 — QK accumulators
             o_tiles,        # [4 d_msb][N_PV_WMMA_N] v8f32 — O accumulators (or None)
             kv_lds_addrs,   # [8] i32 — [K_cur[0:4] + V_cur[4:8]] LDS addresses
-            tdm_state,      # TDM SGPR descriptors
+            tdm_state,      # TDM descriptors — caller pre-populates k_descs/v_descs
             softmax_state,  # Softmax state (old_max, local_max, row_sums, delta, etc.)
             sgpr_state,     # SGPR references (s_log2e_scl, etc.)
             gemm2=True,     # Whether to run GEMM2 stages
-            tdm_v_offset=None,  # V global offset for TDM (current tile → next V buf)
-            tdm_k_offset=None,  # K global offset for TDM (next tile → next K buf)
-            tdm_k_target=None,  # i32 LDS base for TDM K writes (next K buf)
-            tdm_v_target=None,  # i32 LDS base for TDM V writes (next V buf)
             kv_lds_addrs_next=None,  # [8] [K_next[0:4] + V_next[4:8]] for K reload
             gemm1_tdm_is_v=False,  # False=main-loop(GEMM1 loads K) True=epilogue(GEMM1 loads V)
             causal_n_start=None,   # i32 n_start for causal mask (None = skip)
-            endtile_v_dg1=None,    # pre-built OOB dg1 list for GEMM1 V TDM (endtile only)
             kv_oob_cols=None,      # raw i32: valid K columns in this tile (None = all 128)
         ):
             """Full core loop: GEMM1 (QK) + softmax + GEMM2 (PV).
@@ -1246,77 +1384,9 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                 for _i in fx.range_constexpr(PART2_SETUP_A - 1):  # ops 0..5, skip op 6
                     softmax_ops_by_msb[_m][_i]()
     
-            # Build TDM descriptors for GEMM1 stages 0-1.
-            # Main-loop (gemm1_tdm_is_v=False): GEMM1 loads K(i+1) -> K_next
-            # Epilogue (gemm1_tdm_is_v=True):  GEMM1 loads V(endtile) -> V_next
-            has_tdm_k_g1 = (not gemm1_tdm_is_v) and (tdm_k_offset is not None)
-            has_tdm_v_g1 = gemm1_tdm_is_v and (tdm_v_offset is not None)
-    
-            if has_tdm_k_g1:
-                from flydsl._mlir.dialects import arith as _mlir_arith
-                from flydsl.expr.arith import _to_raw
-                i64 = ir.IntegerType.get_signless(64)
-                _K_CFG = (1 << 16) | _K_TDM_CONFIG
-                _stride_k_elems = _to_raw(arith.shrui(
-                    stride_k_seq, arith.constant(1, type=T.i32)))
-                k_dg1 = vector.from_elements(
-                    T.vec(8, T.i32),
-                    [arith.constant(_K_CFG, type=T.i32),
-                     arith.constant(200 << 16, type=T.i32),  # dim0=200, LDS stride=400B
-                     arith.constant(8 << 16, type=T.i32),
-                     arith.constant(200 << 16, type=T.i32),  # tile_dim0=200
-                     arith.constant(8, type=T.i32),
-                     _stride_k_elems,
-                     arith.constant(0, type=T.i32),
-                     arith.constant(0, type=T.i32)])
-                k_addr = _compute_k_global_addr(
-                    ptr_K, tdm_k_offset, wave_id,
-                    _to_raw(arith.muli(
-                        arith.constant(8, type=T.i32), stride_k_seq)))
-                k_stride_adv = _mlir_arith.extsi(i64, _to_raw(stride_k_32))
-                _wid_k = _to_raw(wave_id)
-                _k_warp_off = _mlir_arith.muli(
-                    _wid_k,
-                    _to_raw(arith.constant(8 * K_ROW_BYTES, type=T.i32)))
-                _k_lds_base = _mlir_arith.addi(tdm_k_target, _k_warp_off)
-                k_descs = _build_tdm_descs(
-                    k_dg1, k_addr, k_stride_adv,
-                    _k_lds_base, LDS_K_SU_P_SIZE, CNT_SU)
-                tdm_state['k_descs'] = k_descs
-                tdm_state['k_desc_idx'] = 0
-    
-            if has_tdm_v_g1:
-                from flydsl._mlir.dialects import arith as _mlir_arith
-                from flydsl.expr.arith import _to_raw
-                i64 = ir.IntegerType.get_signless(64)
-                _V_CFG = (1 << 16) | _V_TDM_CONFIG
-                _stride_v_elems = _to_raw(arith.shrui(
-                    stride_v_seq, arith.constant(1, type=T.i32)))
-                v_dg1 = endtile_v_dg1 if endtile_v_dg1 is not None else vector.from_elements(
-                    T.vec(8, T.i32),
-                    [arith.constant(_V_CFG, type=T.i32),
-                     arith.constant(128 << 16, type=T.i32),
-                     arith.constant(8 << 16, type=T.i32),
-                     arith.constant(128 << 16, type=T.i32),
-                     arith.constant(8, type=T.i32),
-                     _stride_v_elems,
-                     arith.constant(0, type=T.i32),
-                     arith.constant(0, type=T.i32)])
-                v_addr = _compute_v_global_addr(
-                    ptr_V, tdm_v_offset, wave_id,
-                    _to_raw(arith.muli(
-                        arith.constant(8, type=T.i32), stride_v_seq)))
-                v_stride_adv = _mlir_arith.extsi(i64, _to_raw(stride_v_32))
-                _wid_v = _to_raw(wave_id)
-                _v_warp_off = _mlir_arith.muli(
-                    _wid_v,
-                    _to_raw(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
-                _v_lds_base = _mlir_arith.addi(tdm_v_target, _v_warp_off)
-                v_descs = _build_tdm_descs(
-                    v_dg1, v_addr, v_stride_adv,
-                    _v_lds_base, LDS_V_SU_P_SIZE, CNT_SU)
-                tdm_state['v_descs'] = v_descs
-                tdm_state['v_desc_idx'] = 0
+            # GEMM1 TDM type: caller pre-builds descs in tdm_state before calling.
+            has_tdm_k_g1 = (not gemm1_tdm_is_v) and ('k_descs' in tdm_state)
+            has_tdm_v_g1 = gemm1_tdm_is_v and ('v_descs' in tdm_state)
 
             _g1_tdm_type = (KV_K if has_tdm_k_g1 else KV_V if has_tdm_v_g1 else KV_NONE)
             stage_configs = [
@@ -1470,41 +1540,8 @@ def compile_fmha_fwd(*, is_causal: bool = False):
     
             v_tiles_paired = _pair_v_tiles_for_wmma(v_tiles_out, ty)
     
-            # Build V TDM descriptors for GEMM2 stages 0-1.
-            # Main-loop mode: GEMM2 loads V(i) -> V_next
-            has_tdm_v_g2 = (not gemm1_tdm_is_v) and (tdm_v_offset is not None)
-            if has_tdm_v_g2:
-                from flydsl._mlir.dialects import arith as _mlir_arith
-                from flydsl.expr.arith import _to_raw
-                i64 = ir.IntegerType.get_signless(64)
-                _V_CFG = (1 << 16) | _V_TDM_CONFIG
-                _stride_v_elems = _to_raw(arith.shrui(
-                    stride_v_seq, arith.constant(1, type=T.i32)))
-                v_dg1 = vector.from_elements(
-                    T.vec(8, T.i32),
-                    [arith.constant(_V_CFG, type=T.i32),
-                     arith.constant(128 << 16, type=T.i32),
-                     arith.constant(8 << 16, type=T.i32),
-                     arith.constant(128 << 16, type=T.i32),
-                     arith.constant(8, type=T.i32),
-                     _stride_v_elems,
-                     arith.constant(0, type=T.i32),
-                     arith.constant(0, type=T.i32)])
-                v_addr = _compute_v_global_addr(
-                    ptr_V, tdm_v_offset, wave_id,
-                    _to_raw(arith.muli(
-                        arith.constant(8, type=T.i32), stride_v_seq)))
-                v_stride_adv = _mlir_arith.extsi(i64, _to_raw(stride_v_32))
-                _wid_v = _to_raw(wave_id)
-                _v_warp_off = _mlir_arith.muli(
-                    _wid_v,
-                    _to_raw(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
-                _v_lds_base = _mlir_arith.addi(tdm_v_target, _v_warp_off)
-                v_descs = _build_tdm_descs(
-                    v_dg1, v_addr, v_stride_adv,
-                    _v_lds_base, LDS_V_SU_P_SIZE, CNT_SU)
-                tdm_state['v_descs'] = v_descs
-                tdm_state['v_desc_idx'] = 0
+            # GEMM2 V TDM: caller pre-builds v_descs in tdm_state (main-loop only).
+            has_tdm_v_g2 = (not gemm1_tdm_is_v) and ('v_descs' in tdm_state)
 
             # stage tuple: (gemm_su, lds_type, lds_blk, lds_su, tdm_type, tdm_barrier)
             g2_stage_configs = [
@@ -1609,6 +1646,8 @@ def compile_fmha_fwd(*, is_causal: bool = False):
         #   [24+KV+28..+91]    partial_sp_pairs[4][16] v2f32        = 64 values
         #                      (PART2 first half output, double-buffered pipeline)
         #   [24+KV+92..+95]    exp_delta[4] f32                     = 4 values
+        #   [24+KV+96]         k_tdm_addr i64 (next K TDM absolute addr)
+        #   [24+KV+97]         v_tdm_addr i64 (current V TDM absolute addr)
         # ================================================================
         _KV_SIZE = NUM_MSB * N_WMMA_K_TILES   # 12 for 192-dim, 8 for 128-dim
         _OFF_LOCAL_MAX = 24 + _KV_SIZE        # 36 for 192-dim
@@ -1619,18 +1658,52 @@ def compile_fmha_fwd(*, is_causal: bool = False):
         _PSP_SIZE      = NUM_MSB * N_SP_PAIRS         # = 64 (lo half)
         _OFF_PSP_HI    = _OFF_PSP + _PSP_SIZE         # partial_sp hi: 64 f32
         _OFF_PED       = _OFF_PSP_HI + _PSP_SIZE      # exp_delta: 4 f32
+        _OFF_KTDM      = _OFF_PED + NUM_MSB           # K TDM addr (i64)
+        _OFF_VTDM      = _OFF_KTDM + 1               # V TDM addr (i64)
+        # K/V pre-computed dg0 components: (lds_off_i32, addr_mod_i64) × CNT_SU.
+        # addr_mod_i64 = addr_i64 | bit63 (has bit31 pre-set in hi word).
+        # 2 iter_arg slots per SU × CNT_SU per K or V.
+        # Assembly at loop entry: 2 × s_mov_b64 per SU (no double-write).
+        _DG0_COMPS     = 2 * CNT_SU                  # 8 values per K or V
+        _OFF_KDG0      = _OFF_VTDM + 1               # K desc components
+        _OFF_VDG0      = _OFF_KDG0 + _DG0_COMPS      # V desc components
         o_flat_init = [zero_v8f32] * (NUM_MSB * N_PV_WMMA_N)
-    
+
         # Ping-pong bases for iteration 1:
         #   K_cur = K_b (tile 1 K), V_cur = V_a (tile 0 V)
         #   K_next = K_a (TDM K target), V_next = V_b (TDM V target)
         pp_init = [k_b_base_i32, v_a_base_i32,
                    k_a_base_i32, v_b_base_i32]
-    
+
+        # Initial TDM absolute addresses for main-loop iteration 1:
+        #   K: loads tile 2 (tile_idx=1 loads K(idx+1)=K(2))
+        #   V: loads tile 1 (tile_idx=1 loads V(idx)=V(1))
+        _init_k_tdm_addr = _mlir_arith.addi(
+            _mlir_arith.addi(k_tdm_base_i64, _tile_k_stride_i64),
+            _tile_k_stride_i64)   # base + 2*tile_stride
+        _init_v_tdm_addr = _mlir_arith.addi(v_tdm_base_i64, _tile_v_stride_i64)
+
+        # Pre-build K/V dg0 component flat lists for iteration 1.
+        # K LDS target = K_next = K_a (k_a_base_i32).
+        # V LDS target = V_next = V_b (v_b_base_i32).
+        _init_k_lds_base = _mlir_arith.addi(k_a_base_i32, _k_warp_lds_off)
+        _init_v_lds_base = _mlir_arith.addi(v_b_base_i32, _v_warp_lds_off)
+        _init_k_dg0s = _build_dg0_comps_flat(
+            _init_k_tdm_addr, k_stride_adv_i64, _init_k_lds_base, LDS_K_SU_P_SIZE, CNT_SU)
+        _init_v_dg0s = _build_dg0_comps_flat(
+            _init_v_tdm_addr, v_stride_adv_i64, _init_v_lds_base, LDS_V_SU_P_SIZE, CNT_SU)
+
+        # Precompute zero placeholder vectors for tdm_state (loop-invariant).
+        _zero_i32_pp = _to_raw(arith.constant(0, type=T.i32))
+        _tdm_zero_v4i32 = vector_dialect.broadcast(ty['v4i32'], _zero_i32_pp)
+        _tdm_zero_v8i32 = vector_dialect.broadcast(ty['v8i32'], _zero_i32_pp)
+
         init_args = (o_flat_init + pro_old_max + pro_row_sums
                      + kv_flat_init + pro_local_max + pro_delta
                      + sp_flat_init + pp_init
-                     + pro_partial_sp_flat + pro_exp_delta)
+                     + pro_partial_sp_flat + pro_exp_delta
+                     + [_init_k_tdm_addr, _init_v_tdm_addr]
+                     + _init_k_dg0s + _init_v_dg0s)
     
         for tile_idx, iter_args, loop_results in scf.for_(
             arith.index(1),
@@ -1687,6 +1760,11 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             ia_partial_sp_lo = [iter_args[_OFF_PSP + i]     for i in fx.range_constexpr(_PSP_SIZE)]
             ia_partial_sp_hi = [iter_args[_OFF_PSP_HI + i]  for i in fx.range_constexpr(_PSP_SIZE)]
             ia_exp_delta = [set_vgpr_bank(iter_args[_OFF_PED + i], i) for i in fx.range_constexpr(NUM_MSB)]
+            ia_k_tdm_addr = iter_args[_OFF_KTDM]   # i64: next K TDM absolute addr
+            ia_v_tdm_addr = iter_args[_OFF_VTDM]   # i64: current V TDM absolute addr
+            # Pre-computed dg0 components (i32, uniform → SGPR, no readfirstlane).
+            ia_k_dg0_flat = [iter_args[_OFF_KDG0 + _i] for _i in range(_DG0_COMPS)]
+            ia_v_dg0_flat = [iter_args[_OFF_VDG0 + _i] for _i in range(_DG0_COMPS)]
     
             # Reconstruct v2f32 from f32 scalars in sequential context (no WMMA pressure → correct).
             ia_partial_sp_pairs = []
@@ -1717,39 +1795,25 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                 'sp_pairs_prev': ia_partial_sp_pairs,  # partial (after PART2 first half)
             }
     
-            # ---- Build TDM state (zero placeholder for memload=False) ----
-            _zero_i32 = _to_raw(arith.constant(0, type=T.i32))
-    
-            def _mk_zero_v4i32():
-                return vector_dialect.broadcast(ty['v4i32'], _zero_i32)
-    
-            def _mk_zero_v8i32():
-                return vector_dialect.broadcast(ty['v8i32'], _zero_i32)
-    
+            # ---- Build TDM state from pre-computed i32 components — zero addr SALU ----
+            # Components were computed at end of previous iteration (overlapping GEMM2).
+            # Separate i32 iter_args → SGPR → rebuild dg0 via s_mov (no readfirstlane).
+            _k_descs_loop = _descs_from_comps_flat(ia_k_dg0_flat, k_dg1_main, CNT_SU)
+            _v_descs_loop = _descs_from_comps_flat(ia_v_dg0_flat, v_dg1_main, CNT_SU)
+
             tdm_state = {
-                'v_g0': _mk_zero_v4i32(),
-                'v_g1': _mk_zero_v8i32(),
-                'k_g0': _mk_zero_v4i32(),
-                'k_g1': _mk_zero_v8i32(),
+                'v_g0': _tdm_zero_v4i32,
+                'v_g1': _tdm_zero_v8i32,
+                'k_g0': _tdm_zero_v4i32,
+                'k_g1': _tdm_zero_v8i32,
                 'v_salu_queue': [],
                 'k_salu_queue': [],
+                'k_descs': _k_descs_loop,
+                'k_desc_idx': 0,
+                'v_descs': _v_descs_loop,
+                'v_desc_idx': 0,
             }
-    
-            # ---- Compute TDM offsets ----
-            # GEMM1 loads K(tile_idx+1) -> K_next (stage 2 wait + stage 3 ds_load)
-            # GEMM2 loads V(tile_idx) -> V_next (stage 2 wait)
-            tile_idx_i32 = arith.index_cast(T.i32, tile_idx)
-    
-            tile_n_stride_v = _mlir_arith.muli(tile_n_const, stride_v_seq)
-            cur_v_advance = _mlir_arith.muli(tile_idx_i32, tile_n_stride_v)
-            cur_v_offset = _mlir_arith.addi(_to_raw(v_offset), cur_v_advance)
-    
-            next_tile = _mlir_arith.addi(
-                tile_idx_i32, _to_raw(arith.constant(1, type=T.i32)))
-            tile_n_stride_k = _mlir_arith.muli(tile_n_const, stride_k_seq)
-            next_k_advance = _mlir_arith.muli(next_tile, tile_n_stride_k)
-            next_k_offset = _mlir_arith.addi(_to_raw(k_offset), next_k_advance)
-    
+
             # ---- Core loop: GEMM1(QK)+TDM_K + softmax + GEMM2(PV)+TDM_V ----
             sp_out, kv_out, o_tiles, su_sp_tiles_out, _partial_sp_lo_out, _partial_sp_hi_out, _partial_ed_out = _core_loop(
                 ty, False,
@@ -1757,10 +1821,6 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                 o_tiles,
                 kv_lds_addrs_cur, tdm_state, softmax_state, sgpr_state,
                 gemm2=True,
-                tdm_v_offset=cur_v_offset,   # GEMM2 loads V(tile_idx)
-                tdm_v_target=ia_v_next_base,
-                tdm_k_offset=next_k_offset,  # GEMM1 loads K(tile_idx+1)
-                tdm_k_target=ia_k_next_base,
                 kv_lds_addrs_next=kv_lds_addrs_next,
                 gemm1_tdm_is_v=False,
             )
@@ -1811,11 +1871,28 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             new_partial_sp_flat = _partial_sp_lo_out + _partial_sp_hi_out
             new_exp_delta = [_partial_ed_out[_m]
                              for _m in fx.range_constexpr(NUM_MSB)]
-    
+
+            # Advance TDM addresses by one tile stride (additive, no muli)
+            new_k_tdm_addr = _mlir_arith.addi(ia_k_tdm_addr, _tile_k_stride_i64)
+            new_v_tdm_addr = _mlir_arith.addi(ia_v_tdm_addr, _tile_v_stride_i64)
+
+            # Advance K/V dg0 components for NEXT iteration — during GEMM2 SALU slots.
+            # addr_mod per SU is advanced by tile stride (bit63 preserved, no s_or/bitset).
+            # lds_off is recomputed from new ping-pong bases (changes each iteration).
+            # After ping-pong swap: next iter's K_next = ia_k_cur_base, V_next = ia_v_cur_base.
+            _next_k_lds_base = _mlir_arith.addi(ia_k_cur_base, _k_warp_lds_off)
+            _next_v_lds_base = _mlir_arith.addi(ia_v_cur_base, _v_warp_lds_off)
+            _next_k_dg0_flat = _advance_dg0_flat(
+                ia_k_dg0_flat, _tile_k_stride_i64, _next_k_lds_base, LDS_K_SU_P_SIZE, CNT_SU)
+            _next_v_dg0_flat = _advance_dg0_flat(
+                ia_v_dg0_flat, _tile_v_stride_i64, _next_v_lds_base, LDS_V_SU_P_SIZE, CNT_SU)
+
             yield (new_o + new_max + new_sums
                    + kv_out_flat + new_local_max + new_delta
                    + sp_out_flat + pp_swapped
-                   + new_partial_sp_flat + new_exp_delta)
+                   + new_partial_sp_flat + new_exp_delta
+                   + [new_k_tdm_addr, new_v_tdm_addr]
+                   + _next_k_dg0_flat + _next_v_dg0_flat)
     
         # ================================================================
         # SECTION 4: Epilogue — post_process + div_cvt + write_out
@@ -1874,12 +1951,13 @@ def compile_fmha_fwd(*, is_causal: bool = False):
         ep_v_next_base = loop_results[_OFF_PP + 3]
         ep_kv_lds_addrs_next = _build_kv_lds_addrs(lane_id, ep_k_next_base, ep_v_next_base)
     
-        # V(N-1) global offset for endtile GEMM1 TDM.
-        from flydsl._mlir.dialects import arith as _ep_arith_off
-        _num_tiles_m1_ep = _ep_arith_off.subi(num_tiles, _to_raw(arith.constant(1, type=T.i32)))
-        ep_v_endtile_offset = _ep_arith_off.addi(
-            _to_raw(v_offset),
-            _ep_arith_off.muli(_ep_arith_off.muli(_num_tiles_m1_ep, tile_n_const), stride_v_seq))
+        # V(N-1) absolute address for endtile GEMM1 TDM.
+        # = v_tdm_base_i64 + (num_tiles-1) * tile_v_stride_i64
+        _num_tiles_m1_ep = _mlir_arith.subi(num_tiles, _to_raw(arith.constant(1, type=T.i32)))
+        _num_tiles_m1_ep_i64 = _mlir_arith.extsi(_i64_tdm, _num_tiles_m1_ep)
+        ep_v_endtile_addr_i64 = _mlir_arith.addi(
+            v_tdm_base_i64,
+            _mlir_arith.muli(_num_tiles_m1_ep_i64, _tile_v_stride_i64))
     
         # ia_exp_delta for endtile core_loop: exp_delta from last loop GEMM2.
         ia_exp_delta = [set_vgpr_bank(loop_results[_OFF_PED + _m], _m)
@@ -2108,13 +2186,6 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                     # fx.printf(f"ETCL_RS l=16 m={_etm} rs={{}}\n", ep_row_sums[_etm])
     
             _et_z = _to_raw(arith.constant(0, type=T.i32))
-            _et_tdm = {
-                'v_g0': vector_dialect.broadcast(ty['v4i32'], _et_z),
-                'v_g1': vector_dialect.broadcast(ty['v8i32'], _et_z),
-                'k_g0': vector_dialect.broadcast(ty['v4i32'], _et_z),
-                'k_g1': vector_dialect.broadcast(ty['v8i32'], _et_z),
-                'v_salu_queue': [], 'k_salu_queue': [],
-            }
             _et_o = [[ep_o_tiles[_d][_n] for _n in range(N_PV_WMMA_N)]
                      for _d in range(NUM_MSB)]
             _et_causal_ns = None
@@ -2129,11 +2200,9 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                 _mlir_arith.muli(
                     _mlir_arith.subi(num_tiles, _to_raw(arith.constant(1, type=T.i32))),
                     tile_n_const))
-            _stride_v_elems_et = _to_raw(arith.shrui(
-                stride_v_seq, arith.constant(1, type=T.i32)))
             _et_v_oob_dg1 = [
                 _make_kv_dg1_with_oob(
-                    (1 << 16) | _V_TDM_CONFIG, 128, 8, _stride_v_elems_et,
+                    (1 << 16) | _V_TDM_CONFIG, 128, 8, _stride_v_elems_main,
                     _per_warp_oob_dim1(
                         _mlir_arith.subi(
                             _et_kv_remain,
@@ -2141,19 +2210,29 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                         wave_id, 8))
                 for _su in range(CNT_SU)
             ]
+            # Pre-build endtile V descs (GEMM1 TDM: loads V(N-1) into V_next buffer).
+            _et_v_lds_base = _mlir_arith.addi(ep_v_next_base, _v_warp_lds_off)
+            _et_v_descs = _build_tdm_descs(
+                _et_v_oob_dg1, ep_v_endtile_addr_i64, v_stride_adv_i64,
+                _et_v_lds_base, LDS_V_SU_P_SIZE, CNT_SU)
+            _et_tdm = {
+                'v_g0': vector_dialect.broadcast(ty['v4i32'], _et_z),
+                'v_g1': vector_dialect.broadcast(ty['v8i32'], _et_z),
+                'k_g0': vector_dialect.broadcast(ty['v4i32'], _et_z),
+                'k_g1': vector_dialect.broadcast(ty['v8i32'], _et_z),
+                'v_salu_queue': [], 'k_salu_queue': [],
+                'v_descs': _et_v_descs,
+                'v_desc_idx': 0,
+            }
             _, _, _et_o, _, _et_psp_lo, _et_psp_hi, _et_ped = _core_loop(
                 ty, False,
                 q_frags, ep_kv_tiles, _et_sp_t,
                 _et_o,
                 ep_kv_lds_addrs, _et_tdm, _et_sfx, sgpr_state,
                 gemm2=True,
-                tdm_v_offset=ep_v_endtile_offset,
-                tdm_v_target=ep_v_next_base,
-                tdm_k_offset=None,
                 kv_lds_addrs_next=ep_kv_lds_addrs_next,
                 gemm1_tdm_is_v=True,
                 causal_n_start=_et_causal_ns,
-                endtile_v_dg1=_et_v_oob_dg1,
                 kv_oob_cols=_et_kv_remain,
             )
             # Pass updated softmax state (old_max/local_max/delta/row_sums after PART0+1
