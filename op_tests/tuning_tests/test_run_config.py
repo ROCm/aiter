@@ -307,6 +307,12 @@ TUNER_FAMILIES = {
         "exclude_patterns": ["batched"],
         "config_property": "AITER_CONFIG_GEMM_BF16_FILE",
     },
+    "csrc_bf16": {
+        "script": "csrc/gemm_a16w16/gemm_a16w16_tune.py",
+        "csv_pattern": "bf16_tuned_gemm",
+        "exclude_patterns": ["batched"],
+        "config_property": "AITER_CONFIG_GEMM_BF16_FILE",
+    },
 }
 
 
@@ -398,6 +404,9 @@ class TestRunConfig(unittest.TestCase):
 
     def test_gradlib_bf16(self):
         self._test_family("gradlib_bf16")
+
+    def test_csrc_bf16(self):
+        self._test_family("csrc_bf16")
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

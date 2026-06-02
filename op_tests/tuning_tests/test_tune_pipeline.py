@@ -283,6 +283,56 @@ class TestTunePipeline(unittest.TestCase):
                 "timeout": 1800,
                 "timeout_mp1": 2400,
             },
+            "csrc_bf16": {
+                "script": "csrc/gemm_a16w16/gemm_a16w16_tune.py",
+                "header": [
+                    "M",
+                    "N",
+                    "K",
+                    "bias",
+                    "dtype",
+                    "outdtype",
+                    "scaleAB",
+                    "bpreshuffle",
+                ],
+                "shapes": [
+                    (
+                        1,
+                        1024,
+                        512,
+                        "False",
+                        "torch.bfloat16",
+                        "torch.float32",
+                        "False",
+                        "False",
+                    ),
+                    (
+                        512,
+                        5120,
+                        1280,
+                        "False",
+                        "torch.bfloat16",
+                        "torch.bfloat16",
+                        "False",
+                        "False",
+                    ),
+                ],
+                "shapes_mp1": [
+                    (
+                        1,
+                        1024,
+                        512,
+                        "False",
+                        "torch.bfloat16",
+                        "torch.float32",
+                        "False",
+                        "False",
+                    ),
+                ],
+                "keys": ["M", "N", "K"],
+                "timeout": 900,
+                "timeout_mp1": 1800,
+            },
             "gradlib_bf16": {
                 "script": "gradlib/gradlib/gemm_tuner.py",
                 "header": [
@@ -296,7 +346,6 @@ class TestTunePipeline(unittest.TestCase):
                     "bpreshuffle",
                 ],
                 "shapes": [
-                    # decode (M=1): hipBLASLt/ASM typically wins
                     (
                         1,
                         1024,
@@ -307,20 +356,8 @@ class TestTunePipeline(unittest.TestCase):
                         "False",
                         "False",
                     ),
-                    # prefill (large M): FlyDSL has a chance to win
-                    (
-                        512,
-                        5120,
-                        1280,
-                        "False",
-                        "torch.bfloat16",
-                        "torch.bfloat16",
-                        "False",
-                        "False",
-                    ),
                 ],
                 "shapes_mp1": [
-                    # single small decode shape for mp=1
                     (
                         1,
                         1024,
@@ -463,6 +500,12 @@ class TestTunePipeline(unittest.TestCase):
 
     def test_fmoe_mp_default(self):
         self._run_one("fmoe", mp=None)
+
+    def test_csrc_bf16_mp1(self):
+        self._run_one("csrc_bf16", mp=1)
+
+    def test_csrc_bf16_mp_default(self):
+        self._run_one("csrc_bf16", mp=None)
 
     def _run_gradlib(self, mp):
         """gradlib spawns an internal subprocess; use /tmp paths that persist."""
@@ -654,7 +697,8 @@ class TestOnlineTuneE2E(unittest.TestCase):
             pass
 
         fp8, qtype = _get_platform_dtypes()
-        script = textwrap.dedent(f"""\
+        script = textwrap.dedent(
+            f"""\
             import torch
             from aiter.fused_moe import fused_moe, fused_topk
             from aiter.ops.shuffle import shuffle_weight
@@ -686,7 +730,8 @@ class TestOnlineTuneE2E(unittest.TestCase):
             )
             print(f"OUTPUT_SHAPE={{out.shape}}")
             print(f"OUTPUT_OK={{out.shape[0] == token and out.shape[1] == model_dim}}")
-        """)
+        """
+        )
 
         script_path = os.path.join(tmp_dir, "online_tune_e2e.py")
         with open(script_path, "w") as f:
