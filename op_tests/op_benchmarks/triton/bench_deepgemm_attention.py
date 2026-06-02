@@ -29,7 +29,7 @@ _METRIC_TO_UNIT = {
 
 
 def create_paged_mqa_logits_configs(args: argparse.Namespace):
-    x_names = ["batch_size", "next_n", "heads", "index_dim", "avg_kv_length"]
+    x_names = ["batch_size", "next_n", "heads", "head_size", "avg_kv_length"]
 
     if args.perf:
         x_vals_list = [
@@ -49,7 +49,7 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
         ]
     else:
         x_vals_list = [
-            (args.batch, args.mtp + 1, args.heads, args.index_dim, args.kv_length)
+            (args.batch, args.mtp + 1, args.heads, args.head_size, args.kv_length)
         ]
 
     if args.metric not in _METRIC_TO_UNIT:
@@ -75,21 +75,21 @@ def _bandwidth_bytes(
     batch_size: int,
     next_n: int,
     heads: int,
-    index_dim: int,
+    head_size: int,
     context_lens: torch.Tensor,
 ) -> int:
     """Bytes moved by one kernel invocation (memory-bound op)."""
     total_ctx = int(context_lens.sum().item())
-    q_bytes = batch_size * next_n * heads * index_dim  # fp8, 1 B/elem
+    q_bytes = batch_size * next_n * heads * head_size  # fp8, 1 B/elem
     # KV is MQA (num_kv_heads=1): FP8 data + per-token FP32 scale.
-    kv_bytes = total_ctx * (index_dim + 4)
+    kv_bytes = total_ctx * (head_size + 4)
     w_bytes = batch_size * next_n * heads * 4  # fp32
     # Output: only valid positions are written (one per query/key pair).
     out_bytes = next_n * total_ctx * 4  # fp32
     return q_bytes + kv_bytes + w_bytes + out_bytes
 
 
-def _dump_aot_cache(args, cache_key, heads, index_dim, blocksize, enable_var_ctx):
+def _dump_aot_cache(args, cache_key, heads, head_size, blocksize, enable_var_ctx):
     """Move the just-compiled triton cache entry under ./paged_mqa_logits/aot/."""
     triton_cache_dir = str(triton.knobs.cache.dir)
     aot_kernel_dir = "./paged_mqa_logits/aot"
@@ -100,7 +100,7 @@ def _dump_aot_cache(args, cache_key, heads, index_dim, blocksize, enable_var_ctx
     varctx_suffix = "_varctx" if enable_var_ctx else ""
     aot_name = (
         f"paged_mqa_logits{preshuffle_suffix}{varctx_suffix}"
-        f"_{heads}x{args.chunk_k}x{index_dim}_B{blocksize}P{padded_str}W{args.wave_per_eu}"
+        f"_{heads}x{args.chunk_k}x{head_size}_B{blocksize}P{padded_str}W{args.wave_per_eu}"
     )
 
     src = os.path.join(triton_cache_dir, cache_key)
@@ -115,7 +115,7 @@ def _dump_aot_cache(args, cache_key, heads, index_dim, blocksize, enable_var_ctx
 def run_benchmark(args: argparse.Namespace):
     @triton.testing.perf_report(create_paged_mqa_logits_configs(args))
     def bench_deepgemm_fp8_paged_mqa_logits(
-        batch_size, next_n, heads, index_dim, avg_kv_length, metric, **kwargs
+        batch_size, next_n, heads, head_size, avg_kv_length, metric, **kwargs
     ):
         torch.manual_seed(0)
         random.seed(0)
@@ -127,7 +127,7 @@ def run_benchmark(args: argparse.Namespace):
             batch_size,
             next_n,
             heads,
-            index_dim,
+            head_size,
             avg_kv_length,
             blocksize=blocksize,
             padding=args.padding,
@@ -140,7 +140,7 @@ def run_benchmark(args: argparse.Namespace):
         max_model_len = inputs["max_model_len"]
 
         if args.kv_preshuffle:
-            apply_preshuffle(kv_cache_fp8, blocksize, index_dim)
+            apply_preshuffle(kv_cache_fp8, blocksize, head_size)
 
         safe_chunks_per_cta = None
         if args.var_ctx_opt:
@@ -178,18 +178,18 @@ def run_benchmark(args: argparse.Namespace):
 
         if args.aot:
             _dump_aot_cache(
-                args, cache_key, heads, index_dim, blocksize, args.var_ctx_opt
+                args, cache_key, heads, head_size, blocksize, args.var_ctx_opt
             )
 
         if metric == "time":
             return elapsed_us
         if metric == "throughput":
             total_flops = (
-                2 * next_n * heads * index_dim * context_lens.float().sum().item()
+                2 * next_n * heads * head_size * context_lens.float().sum().item()
             )
             return total_flops / elapsed_us * 1e-6  # TFLOPS = FLOPs / us * 1e-6
         if metric == "bandwidth":
-            mem = _bandwidth_bytes(batch_size, next_n, heads, index_dim, context_lens)
+            mem = _bandwidth_bytes(batch_size, next_n, heads, head_size, context_lens)
             return mem / elapsed_us * 1e-3  # GB/s = B / us * 1e-3
         raise ValueError(f"Unknown metric: {metric}")
 
@@ -212,7 +212,7 @@ def parse_args() -> argparse.Namespace:
         help="Number of query heads (equal to number of key/value heads)",
     )
     parser.add_argument(
-        "--index_dim",
+        "--head_size",
         type=int,
         default=128,
         help="Head dimension (dimension of query/key/value vectors)",
