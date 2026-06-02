@@ -500,34 +500,6 @@ def pa_persistent_fwd(
 import os as _os
 
 
-@compile_ops("module_pa_fp8_gqa", fc_name="pa_fp8_decode_v1")
-def _pa_fp8_decode_v1(
-    output: torch.Tensor,
-    tmp_out: torch.Tensor,
-    exp_sums: torch.Tensor,
-    max_logits: torch.Tensor,
-    query: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    block_tables: torch.Tensor,
-    context_lens: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    p_scale: torch.Tensor,
-    p_scale_inv: torch.Tensor,
-    num_seqs: int,
-    num_kv_heads: int,
-    num_q_heads: int,
-    head_size: int,
-    block_size: int,
-    mtp: int,
-    num_fat_partitions: int,
-    num_kblocks_per_fat_part: int,
-    scale: float,
-) -> None: ...
-
-
 @compile_ops("module_pa_fp8_gqa", fc_name="pa_fp8_decode_v2")
 def _pa_fp8_decode_v2(
     output: torch.Tensor,
@@ -556,23 +528,21 @@ def _pa_fp8_decode_v2(
 ) -> None: ...
 
 
-_PA_FP8_DEFAULT_P_SCALE = 256.0
-
-
 def _pa_fp8_p_scale_tensors(
     p_scale: Optional[torch.Tensor],
     p_scale_inv: Optional[torch.Tensor],
     device: torch.device,
     num_q_heads: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # p_scale is OPT-IN.  On gfx942 the in-kernel P fp8 pack is e4m3fnuz
+    # (max magnitude 240), so the documented p_scale=256 default (an e4m3fn /
+    # gfx950 value) overflows and produces NaNs for max-probability rows.  When
+    # the caller passes nothing we forward EMPTY [0] tensors so the kernel runs
+    # the no-p_scale path (HasPScale=false) — matching the upstream
+    # Page_Attetion_GQA_fp8 default (p_scale off unless explicitly requested).
     if p_scale is None and p_scale_inv is None:
-        p = torch.full(
-            (num_q_heads,), _PA_FP8_DEFAULT_P_SCALE,
-            dtype=torch.float32, device=device)
-        p_inv = torch.full(
-            (num_q_heads,), 1.0 / _PA_FP8_DEFAULT_P_SCALE,
-            dtype=torch.float32, device=device)
-        return p, p_inv
+        empty = torch.empty(0, dtype=torch.float32, device=device)
+        return empty, empty
     if p_scale is None or p_scale_inv is None:
         raise ValueError("p_scale and p_scale_inv must either both be set or both be None")
     if p_scale.numel() == 1 and p_scale_inv.numel() == 1:
@@ -583,45 +553,41 @@ def _pa_fp8_p_scale_tensors(
     return p_scale, p_scale_inv
 
 
-def _pa_fp8_v1_splits(num_seqs: int, ctx_len: int, cap: int = 128) -> int:
-    total_kblocks = (ctx_len + 255) // 256
-    if num_seqs <= 16:
-        nf = min(80, max(40, total_kblocks // 4))
-    elif num_seqs <= 32:
-        nf = 48 if ctx_len >= 100_000 else 40
-    elif num_seqs <= 64:
-        nf = 48 if ctx_len >= 100_000 else 28
-    elif num_seqs <= 128:
-        nf = 20 if ctx_len >= 100_000 else 12
-    else:
-        nf = 14
-    return max(1, min(nf, total_kblocks, cap))
+def _pa_fp8_v2_splits(num_seqs: int, num_kv_heads: int, mtp: int) -> int:
+    """num_fat_partitions (= v2 launch grid.y) — BS-ONLY (fly-aligned).
 
-
-def _pa_fp8_v2_splits(num_seqs: int, ctx_len: int, mtp: int) -> int:
-    total_kblocks = (ctx_len + 255) // 256
+    `nf` is a pure function of (bs, mtp, hardware), NEVER of ctx: the v2 kernel
+    re-derives each partition's kblock stride from the runtime context_len, so a
+    bs-only nf is correct for ANY ctx (incl. > the representative max) and keeps
+    the launch grid a capture-time constant of the bs bucket — no
+    context_lens.max().item() sync, no CUDA-graph fragmentation.  The old
+    min(nf, total_kblocks) cap is dropped: the kernel early-exits empty
+    partitions at runtime.  Tuned on MI308X gfx942 (80 CU, 2 CTA/CU = 160
+    concurrent CTAs); high nf at low bs fills the otherwise CTA-starved GPU.
+    """
+    bs = num_seqs * max(1, num_kv_heads)
     if mtp == 1:
-        if ctx_len <= 1024:
-            nf = total_kblocks
-        elif num_seqs <= 16:
-            nf = 64
-        elif num_seqs <= 32:
-            nf = 40 if ctx_len >= 100_000 else (26 if ctx_len >= 32_000 else 32)
-        elif num_seqs <= 64:
-            nf = 47 if ctx_len >= 100_000 else (26 if ctx_len >= 32_000 else 32)
-        elif num_seqs <= 128:
-            nf = 20
-        else:
-            nf = 20 if ctx_len >= 100_000 else 10
-    elif num_seqs <= 32:
-        nf = _pa_fp8_v1_splits(num_seqs, ctx_len)
-    elif 64 <= num_seqs <= 96 and ctx_len >= 32_000:
-        nf = 10
-    elif 130 <= num_seqs <= 200:
-        nf = 7
+        if   bs <= 1:   nf = 160
+        elif bs <= 2:   nf = 96
+        elif bs <= 4:   nf = 64
+        elif bs <= 8:   nf = 32
+        elif bs <= 16:  nf = 20
+        elif bs <= 32:  nf = 12
+        elif bs <= 64:  nf = 10
+        elif bs <= 128: nf = 10
+        else:           nf = 8
     else:
-        nf = 5
-    return max(1, min(nf, total_kblocks))
+        if   bs <= 1:   nf = 160
+        elif bs <= 2:   nf = 128
+        elif bs <= 4:   nf = 64
+        elif bs <= 8:   nf = 32
+        elif bs <= 16:  nf = 20
+        elif bs <= 24:  nf = 20
+        elif bs <= 32:  nf = 10
+        elif bs <= 48:  nf = 12
+        elif bs <= 96:  nf = 10
+        else:           nf = 6
+    return max(1, nf)
 
 
 def pa_fp8_gqa_decode(
@@ -636,7 +602,7 @@ def pa_fp8_gqa_decode(
     max_context_len: int,
     partition_size: int,
     mtp: int,
-    q_scale: torch.Tensor,
+    q_scale: Optional[torch.Tensor] = None,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     p_scale: Optional[torch.Tensor] = None,
@@ -650,21 +616,32 @@ def pa_fp8_gqa_decode(
     assert num_kv_heads == 1 and num_q_heads == 8
     assert head_size == 128 and block_size == 16 and partition_size == 256
 
+    assert k_scale.dtype == torch.float32, (
+        "k_scale must be the fp32 view of the packed FP8 scales; call "
+        ".view(torch.float32) on the fp8 buffer before pa_fp8_gqa_decode"
+    )
+
+    # bf16 query is quantised in-kernel (max|Q|) so the external q_scale is
+    # ignored by the C++ (passes nullptr); accept None and forward an empty
+    # fp32 tensor.  An fp8 query always carries a real q_scale (gate-enforced).
+    if q_scale is None:
+        q_scale = torch.empty(0, dtype=torch.float32, device=query.device)
+
     p_scale, p_scale_inv = _pa_fp8_p_scale_tensors(
         p_scale, p_scale_inv, query.device, num_q_heads)
 
+    # nf (= grid.y) is BS-ONLY (fly-aligned): a pure function of (bs, mtp, hw),
+    # never of ctx.  v2 is the only kernel (v1 dropped — it lost everywhere to
+    # v2 once K-scale LDS staging landed).  See _pa_fp8_v2_splits.
+    num_fat_partitions = _pa_fp8_v2_splits(num_seqs, num_kv_heads, mtp)
+
+    # num_kblocks_per_fat_part is ONLY a prefetch-variant hint (the kernel uses
+    # the runtime per-partition stride for correctness).  Derive it from the
+    # capture-time max_context_len so the launch never needs a
+    # context_lens.max().item() host-device sync.
     total_kblocks = (max_context_len + partition_size - 1) // partition_size
-    use_v2 = num_seqs >= 16 if mtp == 1 else num_seqs > 16
-    num_fat_partitions = (
-        _pa_fp8_v2_splits(num_seqs, max_context_len, mtp)
-        if use_v2
-        else _pa_fp8_v1_splits(num_seqs, max_context_len)
-    )
-    num_fat_partitions = min(num_fat_partitions, max(1, total_kblocks))
-    num_kblocks_per_fat_part = (
-        total_kblocks + num_fat_partitions - 1) // num_fat_partitions
-    num_fat_partitions = max(
-        1, (total_kblocks + num_kblocks_per_fat_part - 1) // num_kblocks_per_fat_part)
+    num_kblocks_per_fat_part = max(
+        1, (total_kblocks + num_fat_partitions - 1) // num_fat_partitions)
 
     exp_sums = torch.empty(
         (num_query_tokens, num_q_heads, num_fat_partitions),
@@ -677,8 +654,7 @@ def pa_fp8_gqa_decode(
         dtype=out.dtype,
         device=out.device,
     )
-    decode = _pa_fp8_decode_v2 if use_v2 else _pa_fp8_decode_v1
-    decode(
+    _pa_fp8_decode_v2(
         out,
         tmp_out,
         exp_sums,
@@ -711,12 +687,18 @@ def _pa_fp8_gqa_eligible(
     alibi_slopes, fp8_out_scale, q_scale, k_scale, v_scale,
     p_scale=None, p_scale_inv=None,
 ):
-    """Match the project-internal FP8 GQA HIP specialisation."""
+    """Match the project-internal FP8 GQA HIP specialisation.
+
+    The v2 kernel accepts BOTH a pre-quantised fp8 query (external per-
+    (token, head) q_scale) AND a bf16 query (quantised in-kernel from max|Q|,
+    FlyDSL-aligned — q_scale is then ignored).  K/V must be fp8 either way.
+    """
     if _os.environ.get("AITER_DISABLE_PA_FP8_GQA") == "1":
         return False
     fp8 = dtypes.fp8
+    query_is_fp8 = query.dtype == fp8
     return (
-        query.dtype == fp8
+        (query_is_fp8 or query.dtype == dtypes.bf16)
         and key_cache.dtype == fp8
         and value_cache.dtype == fp8
         and out.dtype in (dtypes.bf16, dtypes.fp16)
@@ -731,7 +713,9 @@ def _pa_fp8_gqa_eligible(
         and mtp in (1, 2)
         and alibi_slopes is None
         and fp8_out_scale is None
-        and q_scale is not None
+        # fp8 query needs an external per-(token, head) q_scale; bf16 query is
+        # quantised in-kernel so q_scale is optional/ignored there.
+        and (q_scale is not None or not query_is_fp8)
         and k_scale is not None
         and v_scale is not None
         and ((p_scale is None and p_scale_inv is None)

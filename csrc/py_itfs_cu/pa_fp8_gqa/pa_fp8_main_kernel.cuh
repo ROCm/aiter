@@ -147,9 +147,6 @@ void pa_fp8_main_kernel_v0(
     const float* __restrict__                q_scale_ptr,   // [1] device fp32
     const float* __restrict__                k_scale_ptr,   // [1]
     const float* __restrict__                v_scale_ptr,   // [1]
-    const float* __restrict__                p_scale_ptr,
-    const float* __restrict__                p_scale_inv_ptr,
-    const bool                               has_p_scale,
     const int* __restrict__                  block_tables,
     const int* __restrict__                  context_lens,
     const int                                max_num_blocks_per_seq,
@@ -224,9 +221,6 @@ void pa_fp8_main_kernel_v0(
         * static_cast<int64_t>(total_num_heads) + q_head_idx;
     const float qk_base_log2 = softmax_scale * q_scale_ptr[q_scale_idx] * kLog2E;
     const float v_scale_perhead = v_scale_ptr[kv_head_idx];
-    const float p_scale_perhead = has_p_scale ? p_scale_ptr[q_head_idx] : 1.f;
-    const float p_scale_inv_perhead =
-        has_p_scale ? p_scale_inv_ptr[q_head_idx] : 1.f;
 
     // -----------------------------------------------------------------------
     // Q load — 8 fp8 = 1 long per lane per qkhe; 4 longs total = 32 fp8.
@@ -461,7 +455,7 @@ void pa_fp8_main_kernel_v0(
     #pragma unroll
     for (int t = 0; t < kTLoop; t++)
     {
-        d_out[t] *= inv_sum_scale * p_scale_perhead;
+        d_out[t] *= inv_sum_scale;
         const uint32_t pk = pa_pk_fp8x4(
             d_out[t][0], d_out[t][1], d_out[t][2], d_out[t][3]);
         const int idx = v0::shared_logits_index(warpid, t, lane16id, rowid);
@@ -556,7 +550,7 @@ void pa_fp8_main_kernel_v0(
     // Apply V dequant scale (per KV head).
     #pragma unroll
     for (int vhe = 0; vhe < kVheLoop; vhe++)
-        pv_acc[vhe] *= v_scale_perhead * p_scale_inv_perhead;
+        pv_acc[vhe] *= v_scale_perhead;
 
     // -----------------------------------------------------------------------
     // Convert PV to output_t and stage to LDS for warp-0 gmem write.
@@ -673,20 +667,37 @@ void pa_fp8_main_kernel_v0(
 // VGPR cap is 256/2 = 128 per wave on gfx942 (256 SGPRs, 512 VGPRs/CU /2).
 // At 2 CTAs/CU each CTA holds ~half the HBM bandwidth (~1.45 TB/s) but the
 // second CTA hides single-CTA HBM-latency gaps, mirroring gluon's per-CU
+//
+// Template parameters:
+//   output_t : bf16 / fp16
+//   Mtp      : 1 or 2 (query rows per (seq, kv_head))
+//   QIn      : either __hip_fp8_e4m3_fnuz (default — pre-quantised Q) or
+//              __hip_bfloat16 (in-kernel Q quantisation à la FlyDSL).  When
+//              QIn=bf16: each lane loads its 8 bf16 Q elems, cross-rowid
+//              ds_swizzle XOR-16/32 reduces max-abs over the full 128
+//              head_dim per (q_token, q_head), then `cvt_pk_fp8_f32` packs
+//              to 8 fp8 — `q_scale_ptr` is IGNORED.
+//   HasPScale: when true, attention weights are multiplied by
+//              `p_scale_ptr[q_head]` before fp8 packing of P, and the post-
+//              PV `o_running` is multiplied by `p_scale_inv_ptr[q_head]`
+//              (fused into the existing `v_scale_perhead` post-multiply).
+//              Mirrors FlyDSL's `_has_p_scale` path — improves P fp8
+//              quantisation resolution by centring `p_scale * exp(qk)`
+//              around 1.0 instead of the partition's natural softmax peak.
 // load-issue rate while still respecting the 128-VGPR target.
-template <typename output_t, int Mtp>
+template <typename output_t, int Mtp,
+          typename QIn = __hip_fp8_e4m3_fnuz, bool HasPScale = false>
 __global__ __launch_bounds__(v0::kNumThreads, 2)
 void pa_fp8_main_kernel_v1(
-    const __hip_fp8_e4m3_fnuz* __restrict__ q,
+    const QIn* __restrict__                  q,
     const __hip_fp8_e4m3_fnuz* __restrict__ k_cache,
     const __hip_fp8_e4m3_fnuz* __restrict__ v_cache,
     const float                              softmax_scale,
-    const float* __restrict__                q_scale_ptr,
+    const float* __restrict__                q_scale_ptr,   // unused when QIn=bf16
     const float* __restrict__                k_scale_ptr,
     const float* __restrict__                v_scale_ptr,
-    const float* __restrict__                p_scale_ptr,
-    const float* __restrict__                p_scale_inv_ptr,
-    const bool                               has_p_scale,
+    const float* __restrict__                p_scale_ptr,     // [total_num_heads]; unused when !HasPScale
+    const float* __restrict__                p_scale_inv_ptr, // [total_num_heads]
     const int* __restrict__                  block_tables,
     const int* __restrict__                  context_lens,
     const int                                max_num_blocks_per_seq,
@@ -725,7 +736,45 @@ void pa_fp8_main_kernel_v1(
     const int kbi_stop  = (kbi_stop_raw < total_num_kblocks)
                               ? kbi_stop_raw : total_num_kblocks;
 
-    if (kbi_start >= total_num_kblocks) return;
+    if (kbi_start >= total_num_kblocks) {
+        // Graph-capture safety (see pa_fp8_main_kernel_v2.cuh): write
+        // max_logits=-inf, exp_sums=0, tmp_out=0 for empty partitions
+        // so stale values from prior replays don't corrupt reduce.
+        const int total_num_heads_ee = gridDim.z * kGqaRatio;
+        if (warpid == 0 && rowid == 0 && lane16id < kMtp * kGqaRatio) {
+            const int q_token_for_lane_ee = (kMtp == 1) ? 0 : (lane16id >> 3);
+            const int head_idx_ee = lane16id & (kGqaRatio - 1);
+            const int64_t maxp_ee = static_cast<int64_t>(num_fat_partitions);
+            const int64_t offset_ee =
+                  (static_cast<int64_t>(seq_idx) * kMtp + q_token_for_lane_ee)
+                      * static_cast<int64_t>(total_num_heads_ee) * maxp_ee
+                + (static_cast<int64_t>(kv_head_idx) * kGqaRatio + head_idx_ee) * maxp_ee
+                + static_cast<int64_t>(fp_idx);
+            max_logits[offset_ee] = -FLT_MAX;
+            exp_sums[offset_ee]   = 0.f;
+        }
+        constexpr int kElemsEE = kMtp * kGqaRatio * kHeadSize;
+        const int64_t hsz_maxp_mult_ee =
+            static_cast<int64_t>(kHeadSize) * static_cast<int64_t>(num_fat_partitions);
+        output_t* out_base_ee = out
+            + static_cast<int64_t>(seq_idx) * kMtp
+                * static_cast<int64_t>(total_num_heads_ee) * hsz_maxp_mult_ee
+            + static_cast<int64_t>(kv_head_idx) * kGqaRatio * hsz_maxp_mult_ee
+            + static_cast<int64_t>(fp_idx) * kHeadSize;
+        #pragma unroll
+        for (int idx = threadIdx.x; idx < kElemsEE; idx += kNumThreads) {
+            const int hd_ee     = idx % kHeadSize;
+            const int head_lin  = idx / kHeadSize;
+            const int q_tok_ee  = head_lin / kGqaRatio;
+            const int hidx_ee   = head_lin - q_tok_ee * kGqaRatio;
+            const int64_t off_ee =
+                  static_cast<int64_t>(q_tok_ee) * total_num_heads_ee * hsz_maxp_mult_ee
+                + static_cast<int64_t>(hidx_ee) * hsz_maxp_mult_ee
+                + hd_ee;
+            out_base_ee[off_ee] = pa_from_float<output_t>(0.f);
+        }
+        return;
+    }
 
     const int wg_start_head_idx    = kv_head_idx * kGqaRatio;
     const int wg_start_kv_head_idx = kv_head_idx;
@@ -735,6 +784,15 @@ void pa_fp8_main_kernel_v1(
 
     __shared__ _T8x8 shared_logits[kNWarps * kTLoop * kSlotsPerWarpT];
     __shared__ float shared_qk[kNWarps * 16 * 2];
+    // Dedicated bf16-quant staging buffers.  Lives across the K outer loop
+    // but only the producer/consumer code (below) touches it, so no aliasing
+    // with shared_logits / shared_qk inner-loop writes.
+    //
+    // Memory cost:  16 qheads × 16 segments × 8 fp8  =  2048 bytes
+    //             + 16 qheads × 4-byte scale          =    64 bytes
+    // Total +2112 B → 12.6 KB of LDS (still 5+ WG/CU, VGPR-bound).
+    __shared__ int64_t q_stage_lds[16 * 16];
+    __shared__ float   q_scale_lds[16];
 
     // ----- Buffer V# resource descriptors (uniform across wave) ----------
     // Built once per CTA so K/V hot-path loads can use buffer_load_dwordx2
@@ -756,26 +814,151 @@ void pa_fp8_main_kernel_v1(
     const int q_token_for_lane = (kMtp == 1) ? 0 : (lane16id >> 3);
     const int head_for_lane    = lane16id & (kGqaRatio - 1);
     const int q_head_idx       = wg_start_head_idx + head_for_lane;
-    const int64_t q_scale_idx =
-          (static_cast<int64_t>(seq_idx) * kMtp + q_token_for_lane)
-        * static_cast<int64_t>(total_num_heads) + q_head_idx;
-    const float qk_base_log2 = softmax_scale * q_scale_ptr[q_scale_idx] * kLog2E;
+
+    // qk_base_log2 source depends on QIn:
+    //   fp8  → reuse caller-provided per-(q_token, q_head) scale.
+    //   bf16 → computed in-kernel from max|Q| after the load below; we
+    //          materialise it AFTER the Q-load block.
+    float qk_base_log2;
+    if constexpr (std::is_same<QIn, __hip_fp8_e4m3_fnuz>::value)
+    {
+        const int64_t q_scale_idx =
+              (static_cast<int64_t>(seq_idx) * kMtp + q_token_for_lane)
+            * static_cast<int64_t>(total_num_heads) + q_head_idx;
+        qk_base_log2 = softmax_scale * q_scale_ptr[q_scale_idx] * kLog2E;
+    }
+    else
+    {
+        qk_base_log2 = 0.f;  // filled in after Q load
+    }
     const float v_scale_perhead = v_scale_ptr[kv_head_idx];
-    const float p_scale_perhead = has_p_scale ? p_scale_ptr[q_head_idx] : 1.f;
-    const float p_scale_inv_perhead =
-        has_p_scale ? p_scale_inv_ptr[q_head_idx] : 1.f;
+
+    // Per-q-head P-scale lanes (read once per CTA — no hot-path overhead).
+    // p_scale tensors are tiny ([total_num_heads]) so the load is L1-hot.
+    float p_scale_lane     = 1.f;
+    float p_scale_inv_lane = 1.f;
+    if constexpr (HasPScale)
+    {
+        p_scale_lane     = p_scale_ptr    [q_head_idx];
+        p_scale_inv_lane = p_scale_inv_ptr[q_head_idx];
+    }
 
     int64_t Qlocal[kQkheLoop];
     {
         const int64_t query_row_off =
             (static_cast<int64_t>(seq_idx) * kMtp + q_token_for_lane) * q_stride
             + (wg_start_head_idx + head_for_lane) * kHeadSize;
-        const __hip_fp8_e4m3_fnuz* q_row = q + query_row_off;
-        #pragma unroll
-        for (int qkhe = 0; qkhe < kQkheLoop; qkhe++)
+        const QIn* q_row = q + query_row_off;
+        if constexpr (std::is_same<QIn, __hip_fp8_e4m3_fnuz>::value)
         {
-            const int k_off = qkhe * kKPerMfma + rowid * kFp8PerLanePerMfma;
-            Qlocal[qkhe] = *reinterpret_cast<const int64_t*>(q_row + k_off);
+            // Pre-quantised fp8 Q: load as int64 (= 8 fp8) per qkhe.
+            #pragma unroll
+            for (int qkhe = 0; qkhe < kQkheLoop; qkhe++)
+            {
+                const int k_off = qkhe * kKPerMfma + rowid * kFp8PerLanePerMfma;
+                Qlocal[qkhe] = *reinterpret_cast<const int64_t*>(q_row + k_off);
+            }
+        }
+        else
+        {
+            // bf16 Q in-kernel quant — FlyDSL-aligned, LDS-staged.
+            //
+            // PRODUCER  (one thread = one qhead row × one 8-hd segment):
+            //   (warp W, rowid R, lane16id L)
+            //     q_quant_qhead  = (W*4 + R)         (mtp=1: & 7; mtp=2: full 0..15)
+            //     q_quant_qtoken = q_quant_qhead >> 3  (mtp=2)   else 0
+            //     hd_segment     = L (×8 elements)
+            //   1.  Load 8 bf16 (one 128-bit ds_read worth) from
+            //         q[seq, qtoken, head, hd[L*8 .. L*8+7]].
+            //   2.  bf16→fp32, tree max-abs over the 8 fp32.
+            //   3.  DPP XOR butterfly within the rowid's 16-lane group
+            //       (sh ∈ {8,4,2,1}) → qhead-wide max.
+            //   4.  q_scale = max / FP8_MAX  (rcp = inv_q).
+            //   5.  Pack 8 fp8 → 1 i64 → q_stage_lds[qhead*16 + L]
+            //       lane16id == 0 writes q_scale_lds[qhead].
+            //
+            // CONSUMER  (matches the fp8 Qlocal layout):
+            //   (warp W_c, rowid R_c, lane16id L_c)
+            //     consumer_qhead  = (kMtp==1) ? (L_c & 7) : L_c
+            //     Qlocal[qkhe]    = q_stage_lds[consumer_qhead*16 + (qkhe*4 + R_c)]
+            //
+            // Synchronization:
+            //   barrier 1: AFTER producer writes, BEFORE consumer reads.
+            //   barrier 2: AFTER consumer reads, BEFORE the outer loop's
+            //              softmax pack writes (which could otherwise race
+            //              with stragglering consumer-read waves on the
+            //              shared LDS hardware).
+            //   Using a dedicated q_stage_lds means we ONLY need ordering on
+            //   the q_stage_lds region itself; both barriers are still
+            //   __syncthreads (the cheap path).
+            const int q_quant_qhead_raw = warpid * kRowsPerWarp + rowid;
+            const int q_quant_qhead = (kMtp == 1)
+                                         ? (q_quant_qhead_raw & (kGqaRatio - 1))
+                                         : q_quant_qhead_raw;
+            const int q_quant_qtoken =
+                (kMtp == 1) ? 0 : (q_quant_qhead_raw >> 3);
+            const int q_quant_qhead_in_token =
+                (kMtp == 1) ? q_quant_qhead : (q_quant_qhead & (kGqaRatio - 1));
+
+            const int64_t q_quant_row_off =
+                  (static_cast<int64_t>(seq_idx) * kMtp + q_quant_qtoken) * q_stride
+                + (wg_start_head_idx + q_quant_qhead_in_token) * kHeadSize;
+            const __hip_bfloat16* q_q_row =
+                reinterpret_cast<const __hip_bfloat16*>(q + q_quant_row_off);
+            const _B16x8 q_bf =
+                *reinterpret_cast<const _B16x8*>(q_q_row + lane16id * 8);
+
+            const floatx4 qf_lo = pa_to_floatx4<__hip_bfloat16>(q_bf.xy[0]);
+            const floatx4 qf_hi = pa_to_floatx4<__hip_bfloat16>(q_bf.xy[1]);
+            float lm = fmaxf(
+                fmaxf(fmaxf(fabsf(qf_lo[0]), fabsf(qf_lo[1])),
+                      fmaxf(fabsf(qf_lo[2]), fabsf(qf_lo[3]))),
+                fmaxf(fmaxf(fabsf(qf_hi[0]), fabsf(qf_hi[1])),
+                      fmaxf(fabsf(qf_hi[2]), fabsf(qf_hi[3]))));
+            lm = fmaxf(lm, pa_shfl_xor_within_32<8>(lm));
+            lm = fmaxf(lm, pa_shfl_xor_within_32<4>(lm));
+            lm = fmaxf(lm, pa_shfl_xor_within_32<2>(lm));
+            lm = fmaxf(lm, pa_shfl_xor_within_32<1>(lm));
+
+            const float q_scale_lane =
+                (lm > 0.f) ? (lm * (1.f / PA_FP8_MAX)) : 1.f;
+            const float inv_q = __builtin_amdgcn_rcpf(q_scale_lane);
+
+            const uint32_t pk_lo = pa_pk_fp8x4(
+                qf_lo[0] * inv_q, qf_lo[1] * inv_q,
+                qf_lo[2] * inv_q, qf_lo[3] * inv_q);
+            const uint32_t pk_hi = pa_pk_fp8x4(
+                qf_hi[0] * inv_q, qf_hi[1] * inv_q,
+                qf_hi[2] * inv_q, qf_hi[3] * inv_q);
+
+            q_stage_lds[q_quant_qhead * 16 + lane16id] =
+                  static_cast<int64_t>(pk_lo)
+                | (static_cast<int64_t>(pk_hi) << 32);
+            if (lane16id == 0)
+                q_scale_lds[q_quant_qhead] = q_scale_lane;
+
+            __syncthreads();  // barrier 1
+
+            const int consumer_qhead = (kMtp == 1)
+                                         ? (lane16id & (kGqaRatio - 1))
+                                         : lane16id;
+            qk_base_log2 = softmax_scale * q_scale_lds[consumer_qhead] * kLog2E;
+
+            #pragma unroll
+            for (int qkhe = 0; qkhe < kQkheLoop; qkhe++)
+            {
+                Qlocal[qkhe] = q_stage_lds[consumer_qhead * 16 + qkhe * 4 + rowid];
+            }
+            // q_stage_lds is independent of shared_logits / shared_qk so no
+            // race with the outer loop's softmax-pack writes; the natural
+            // barrier between iters covers any subsequent uses.  We still
+            // need a barrier here to ensure ALL waves have read their Q
+            // pack BEFORE proceeding (otherwise a fast wave might begin
+            // overwriting registers + cycle into the K loop while a slow
+            // wave is still draining ds_reads — moot for correctness on
+            // dedicated LDS but kept for cleanliness; the cost is ~30 ns).
+            // Actually NOT needed — we use a dedicated buffer that nobody
+            // else writes to.  Skip barrier 2 entirely.
         }
     }
 
@@ -1023,10 +1206,18 @@ void pa_fp8_main_kernel_v1(
         // we do NOT divide by partition_exp_sum here — the cross-partition
         // online softmax merge below handles the global normalisation, and
         // the final write divides by l_running once.
+        //
+        // When HasPScale: also multiply by `p_scale_lane` BEFORE the fp8
+        // pack, so cvt_pk_fp8_f32 receives values centred near 1.0 (chosen
+        // by the caller) instead of the natural softmax peak — recovers
+        // dynamic range that would otherwise saturate to 0 / 240.  The
+        // `p_scale_inv_lane` multiply is folded into `post_scale` below.
+        const float p_pack_scale = HasPScale ? (warp_scale * p_scale_lane)
+                                             :  warp_scale;
         #pragma unroll
         for (int t = 0; t < kTLoop; t++)
         {
-            d_out[t] *= warp_scale * p_scale_perhead;
+            d_out[t] *= p_pack_scale;
             const uint32_t pk = pa_pk_fp8x4(
                 d_out[t][0], d_out[t][1], d_out[t][2], d_out[t][3]);
             const int idx = v0::shared_logits_index(warpid, t, lane16id, rowid);
@@ -1100,8 +1291,16 @@ void pa_fp8_main_kernel_v1(
     }  // === end outer loop ===
 
     // ----- Normalise o_running and apply v_scale --------------------------
+    //
+    // When HasPScale: also fold `p_scale_inv_lane` into `post_scale` —
+    // compensates the `p_scale_lane` factor we applied to P before fp8
+    // packing.  Net effect on o_running: identical math to the !HasPScale
+    // path, just with reduced P fp8 quantisation error.  Mirrors FlyDSL
+    // `v_correction * p_scale_inv_lane * v_scale`.
     const float inv_l = __fdividef(1.f, l_running + 1e-6f);
-    const float post_scale = inv_l * v_scale_perhead * p_scale_inv_perhead;
+    const float post_scale = HasPScale
+        ? (inv_l * v_scale_perhead * p_scale_inv_lane)
+        : (inv_l * v_scale_perhead);
     #pragma unroll
     for (int vhe = 0; vhe < kVheLoop; vhe++)
         o_running[vhe] *= post_scale;
