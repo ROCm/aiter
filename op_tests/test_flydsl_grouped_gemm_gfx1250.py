@@ -16,9 +16,8 @@ grouped GEMM launcher directly. The grouped path is opted-in via the
 
 Pytest covers a small correctness case for each format. Direct execution
 (``python op_tests/test_flydsl_grouped_gemm_gfx1250.py``) runs a
-DeepSeek-style perf bench. There is also a ``--scenario real-dump`` mode
-that compares the grouped path against the PyTorch / Triton MoE reference
-on a real ATOM dump (gpt-oss-style weights + per-iter activations).
+DeepSeek-style perf bench (``--scenario bench``) or a tiny correctness
+check (``--scenario verify``).
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -339,131 +337,6 @@ def test_grouped_a8w4_matches_torch_ref():
 
 
 # ---------------------------------------------------------------------------
-# Real-dump scenario: compare against gpt-oss-style ATOM dump
-# ---------------------------------------------------------------------------
-def _load_real_layer_inputs(iter_dir: str, layer: int) -> dict[str, torch.Tensor]:
-    root = Path(iter_dir)
-    p = f"model.layers.{layer}.mlp.experts."
-    return {
-        "hidden_in": torch.load(root / f"{p}hidden_in.pt", map_location="cpu", weights_only=False),
-        "hidden_out": torch.load(root / f"{p}hidden_out.pt", map_location="cpu", weights_only=False),
-        "router_logits": torch.load(root / f"{p}router_logits.pt", map_location="cpu", weights_only=False),
-    }
-
-
-def _load_real_layer_weights(weights_dir: str, layer: int) -> dict[str, torch.Tensor]:
-    root = Path(weights_dir)
-    p = f"model.layers.{layer}.mlp.experts."
-    return {k: torch.load(root / f"{p}{k}.pt", map_location="cpu", weights_only=False)
-            for k in ("gate_up_proj_blocks", "gate_up_proj_scales", "gate_up_proj_bias",
-                     "down_proj_blocks", "down_proj_scales", "down_proj_bias")}
-
-
-def _pad_dim(t: torch.Tensor, dim: int, target: int, fill: float = 0.0) -> torch.Tensor:
-    cur = t.shape[dim]
-    if cur == target:
-        return t
-    pad_shape = list(t.shape)
-    pad_shape[dim] = target - cur
-    pad = torch.full(pad_shape, fill, dtype=t.dtype, device=t.device)
-    return torch.cat([t, pad], dim=dim).contiguous()
-
-
-def _round_up(x: int, m: int) -> int:
-    return ((x + m - 1) // m) * m
-
-
-def _run_real_dump(
-    *,
-    dump_iter_dir: str,
-    dump_weights_dir: str,
-    layer: int = 0,
-    topk: int = 4,
-    swiglu_limit: float = 7.0,
-    pad_align: int = 256,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compare grouped FlyDSL path vs golden ``hidden_out`` from an ATOM dump.
-
-    Returns ``(grouped_out, golden)``.
-    """
-    _require_gfx1250()
-    inputs = _load_real_layer_inputs(dump_iter_dir, layer)
-    weights = _load_real_layer_weights(dump_weights_dir, layer)
-
-    gu_b, gu_s, gu_bias = weights["gate_up_proj_blocks"], weights["gate_up_proj_scales"], weights["gate_up_proj_bias"]
-    dn_b, dn_s, dn_bias = weights["down_proj_blocks"], weights["down_proj_scales"], weights["down_proj_bias"]
-
-    E, two_I, k_blocks, _bb = gu_b.shape
-    inter = two_I // 2
-    real_hidden = k_blocks * SCALE_BLOCK
-    gu_packed = gu_b.reshape(E, two_I, k_blocks * 16).contiguous()
-    dn_packed = dn_b.reshape(E, real_hidden, dn_b.shape[2] * 16).contiguous()
-
-    H = _round_up(real_hidden, pad_align)
-    I = _round_up(inter, pad_align)
-    if H != real_hidden or I != inter:
-        gu_packed = _pad_dim(_pad_dim(gu_packed, 1, 2 * I), 2, H // 2)
-        gu_s = _pad_dim(_pad_dim(gu_s, 1, 2 * I, fill=DEFAULT_SCALE_BYTE), 2, H // SCALE_BLOCK, fill=DEFAULT_SCALE_BYTE)
-        gu_bias = _pad_dim(gu_bias, 1, 2 * I)
-        dn_packed = _pad_dim(_pad_dim(dn_packed, 1, H), 2, I // 2)
-        dn_s = _pad_dim(_pad_dim(dn_s, 1, H, fill=DEFAULT_SCALE_BYTE), 2, I // SCALE_BLOCK, fill=DEFAULT_SCALE_BYTE)
-        dn_bias = _pad_dim(dn_bias, 1, H)
-    print(f"[real-dump] E={E} hidden={real_hidden}->{H} inter={inter}->{I} topk={topk}", flush=True)
-
-    hidden_in = inputs["hidden_in"]
-    hidden_out = inputs["hidden_out"]
-    if hidden_in.shape[-1] != H:
-        hidden_in = (hidden_in[..., :H] if hidden_in.shape[-1] > H else _pad_dim(hidden_in, -1, H)).contiguous()
-    if hidden_out.shape[-1] != H:
-        hidden_out = (hidden_out[..., :H] if hidden_out.shape[-1] > H else _pad_dim(hidden_out, -1, H)).contiguous()
-
-    probs = torch.softmax(inputs["router_logits"].float(), dim=-1)
-    tw, tid = probs.topk(k=topk, dim=-1)
-    tw = (tw / tw.sum(-1, keepdim=True).clamp(min=1e-12)).to(torch.bfloat16).cuda()
-    tid = tid.to(torch.int32).cuda()
-
-    hidden_cuda = hidden_in.to(torch.bfloat16).cuda()
-    bias1 = gu_bias.float().cuda()
-    bias2 = dn_bias.float().cuda()
-
-    # Grouped path consumes native GUGU layout + INTERLEAVE gate_mode.
-    w1_grouped = _preshuffle_b_n16_packed(gu_packed).cuda()
-    w2_grouped = _preshuffle_b_n16_packed(dn_packed).cuda()
-    w1_scale = _grouped_scale(gu_s, experts=E, rows=2 * I, k_dim=H)
-    w2_scale = _grouped_scale(dn_s, experts=E, rows=H, k_dim=I)
-
-    saved = {k: os.environ.get(k) for k in
-             ("AITER_USE_GROUPED_GEMM", "AITER_GROUPED_STAGE1_WEIGHT_LAYOUT",
-              "AITER_DISABLE_GFX1250_FLYDSL_MOE")}
-    try:
-        os.environ["AITER_USE_GROUPED_GEMM"] = "1"
-        os.environ["AITER_GROUPED_STAGE1_WEIGHT_LAYOUT"] = "gugu"
-        os.environ.pop("AITER_DISABLE_GFX1250_FLYDSL_MOE", None)
-        grouped_out = fused_moe(
-            hidden_cuda, w1_grouped, w2_grouped, tw, tid,
-            activation=ActivationType.Swiglu,
-            quant_type=QuantType.per_1x32,
-            w1_scale=w1_scale, w2_scale=w2_scale,
-            bias1=bias1, bias2=bias2,
-            gate_mode=GateMode.INTERLEAVE.value,
-            dtype=dtypes.bf16, swiglu_limit=swiglu_limit,
-        )
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-
-    golden = hidden_out.to(torch.bfloat16).cuda()
-    rel = _rel_l2(grouped_out, golden)
-    print(f"[real-dump] grouped vs golden rel_l2 = {rel:.4e} "
-          f"(grouped_norm={float(grouped_out.float().norm()):.4e} "
-          f"golden_norm={float(golden.float().norm()):.4e})", flush=True)
-    return grouped_out, golden
-
-
-# ---------------------------------------------------------------------------
 # Perf bench (uses aiter's run_perftest for stable timing)
 # ---------------------------------------------------------------------------
 def _bench(args: argparse.Namespace) -> None:
@@ -508,8 +381,7 @@ def _bench(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=("bench", "verify", "real-dump"),
-                        default="bench")
+    parser.add_argument("--scenario", choices=("bench", "verify"), default="bench")
     parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
     parser.add_argument("--experts", type=int, default=256)
     parser.add_argument("--tokens", type=int, default=64)
@@ -519,25 +391,10 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=101)
     parser.add_argument("--swiglu-limit", type=float, default=7.0)
-    # real-dump knobs
-    parser.add_argument("--dump-iter-dir", default=None)
-    parser.add_argument("--dump-weights-dir", default=None)
-    parser.add_argument("--dump-layer", type=int, default=0)
     args = parser.parse_args()
 
     if args.scenario == "verify":
         _sanity_check(args.data_format)
-        return
-    if args.scenario == "real-dump":
-        if not args.dump_iter_dir or not args.dump_weights_dir:
-            raise SystemExit("--scenario real-dump requires --dump-iter-dir + --dump-weights-dir")
-        _run_real_dump(
-            dump_iter_dir=args.dump_iter_dir,
-            dump_weights_dir=args.dump_weights_dir,
-            layer=args.dump_layer,
-            topk=args.topk,
-            swiglu_limit=args.swiglu_limit,
-        )
         return
     _bench(args)
 
