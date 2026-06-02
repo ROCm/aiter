@@ -42,7 +42,7 @@ autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
 
-FLA_USE_AUTOTUNE = False
+FLA_USE_AUTOTUNE = True
 
 
 def maybe_autotune(configs, default_config=None, **kwargs):
