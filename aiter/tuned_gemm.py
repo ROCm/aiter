@@ -61,8 +61,18 @@ def get_GEMM_A16W16_config_():
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
     gemm_dict = {}
     if os.path.exists(tuned_file):
-        gemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
-        gemm_dict = gemm_dict.set_index(
+        df = pd.read_csv(f"{tuned_file}").drop_duplicates()
+        # Tuned entries are arch-specific (kernel names / libtype availability
+        # differ across gfx targets), but the lookup key below indexes only on
+        # cu_num. Different archs can share a cu_num (e.g. gfx950 and gfx1250
+        # both report cu_num=256), which would otherwise let a gfx950-tuned
+        # row shadow as a hit on gfx1250 and dispatch a kernel whose intrinsics
+        # the current LLVM backend cannot select. Filter by the running gfx up
+        # front so only matching rows ever enter the lookup table.
+        if "gfx" in df.columns:
+            current_gfx = get_gfx()
+            df = df[df["gfx"] == current_gfx]
+        gemm_dict = df.set_index(
             [
                 "cu_num",
                 "M",

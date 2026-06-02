@@ -777,7 +777,7 @@ def build_module(
             "-D__HIP_PLATFORM_AMD__=1",
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
-            "-mllvm --amdgpu-kernarg-preload-count=16",
+            # "-mllvm --amdgpu-kernarg-preload-count=16",
             # "-v --save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",
@@ -1705,3 +1705,4 @@ def compile_ops(
             )
 
     return decorator
+
