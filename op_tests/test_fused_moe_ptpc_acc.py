@@ -24,6 +24,12 @@ DTYPE = torch.bfloat16
 FP8_DTYPE = torch.float8_e4m3fnuz
 DIFF_THR = 0.02
 
+# Correctness scope: we only certify fused_moe paths backed by pyhip-compiled .co
+# kernels (fmoe_asmjit). Numerical checks here are aligned with pyhip's MoE tests on
+# branch moe_prefill_fp8_308:
+#   https://github.com/tingqli/pyhip/tree/moe_prefill_fp8_308
+# (see tests/contrib/moe/test_moe.py). Other kernel backends are out of scope.
+
 # Qwen3.5 PTPC FP8 model shapes (TP-split inter_dim)
 MOE_CONFIGS = [
     {"name": "qwen3_5_35b", "hidden_size": 2048, "inter_dim": 512 // 4, "expert": 257, "topk": 9},
@@ -31,7 +37,7 @@ MOE_CONFIGS = [
     {"name": "qwen3_5_397b", "hidden_size": 4096, "inter_dim": 128, "expert": 513, "topk": 11},
 ]
 
-DEFAULT_TOKEN_COUNTS = [1, 2, 4, 8, 16, 32, 8192, 16384, 32768, 65536, 131072]
+DEFAULT_TOKEN_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 
 
 def div_up(a: int, b: int) -> int:
