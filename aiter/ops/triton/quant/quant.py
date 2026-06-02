@@ -5,7 +5,6 @@ from typing import Optional, Tuple
 
 import triton
 import torch
-from typing import Optional
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_tensor_quant_fp8_i8_kernel,
