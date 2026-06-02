@@ -385,18 +385,25 @@ def _do_bench(fn, warmup, rep):
     return (time.perf_counter() - t0) / 50 * 1000
 
 
-def run_speed(shapes, device, warmup, rep, e2e):
+def run_speed(shapes, device, warmup, rep, e2e, no_sdpa=False):
     mode = "e2e (wrapper, incl. sage_quant)" if e2e else "kernel-only (pre-quantized)"
     print("\n" + "=" * 110)
     print(f"SPEED  (warmup={warmup}ms  rep={rep}ms  mode={mode})")
     print("=" * 110)
 
-    hdr = (
-        f"{'Shape':<38}"
-        f"{'SDPA ms':>9} {'SDPA TFLOPS':>11}"
-        f"{'Triton ms':>10} {'Triton TFLOPS':>13} {'vs SDPA':>8}"
-        f"{'FlyDSL ms':>10} {'FlyDSL TFLOPS':>13} {'vs SDPA':>8} {'vs Triton':>10}"
-    )
+    if no_sdpa:
+        hdr = (
+            f"{'Shape':<38}"
+            f"{'Triton ms':>10} {'Triton TFLOPS':>13}"
+            f"{'FlyDSL ms':>10} {'FlyDSL TFLOPS':>13} {'vs Triton':>10}"
+        )
+    else:
+        hdr = (
+            f"{'Shape':<38}"
+            f"{'SDPA ms':>9} {'SDPA TFLOPS':>11}"
+            f"{'Triton ms':>10} {'Triton TFLOPS':>13} {'vs SDPA':>8}"
+            f"{'FlyDSL ms':>10} {'FlyDSL TFLOPS':>13} {'vs SDPA':>8} {'vs Triton':>10}"
+        )
     print(hdr)
     print("-" * 110)
 
@@ -407,21 +414,25 @@ def run_speed(shapes, device, warmup, rep, e2e):
         flops = _attn_flops(B, Hq, S, D, causal)
 
         # SDPA (fp32 reference) — expand KV heads for GQA
-        q_bhsd = q.float().transpose(1, 2).contiguous()
-        k_bhsd = k.float().transpose(1, 2).contiguous()
-        v_bhsd = v.float().transpose(1, 2).contiguous()
-        if Hq != Hk:
-            groups = Hq // Hk
-            k_bhsd = k_bhsd.repeat_interleave(groups, dim=1)
-            v_bhsd = v_bhsd.repeat_interleave(groups, dim=1)
+        if no_sdpa:
+            sdpa_ms = None
+            sdpa_tflops = None
+        else:
+            q_bhsd = q.float().transpose(1, 2).contiguous()
+            k_bhsd = k.float().transpose(1, 2).contiguous()
+            v_bhsd = v.float().transpose(1, 2).contiguous()
+            if Hq != Hk:
+                groups = Hq // Hk
+                k_bhsd = k_bhsd.repeat_interleave(groups, dim=1)
+                v_bhsd = v_bhsd.repeat_interleave(groups, dim=1)
 
-        def sdpa_fn():
-            return F.scaled_dot_product_attention(
-                q_bhsd, k_bhsd, v_bhsd, is_causal=causal
-            )
+            def sdpa_fn():
+                return F.scaled_dot_product_attention(
+                    q_bhsd, k_bhsd, v_bhsd, is_causal=causal
+                )
 
-        sdpa_ms = _do_bench(sdpa_fn, warmup, rep)
-        sdpa_tflops = flops / sdpa_ms / 1e9
+            sdpa_ms = _do_bench(sdpa_fn, warmup, rep)
+            sdpa_tflops = flops / sdpa_ms / 1e9
 
         # Triton sage
         if HAS_TRITON_SAGE:
@@ -439,15 +450,27 @@ def run_speed(shapes, device, warmup, rep, e2e):
 
                 triton_ms = _do_bench(triton_fn, warmup, rep)
                 triton_tflops = flops / triton_ms / 1e9
-                triton_vs_sdpa = sdpa_ms / triton_ms
-                t_str = (
-                    f"{triton_ms:>10.3f} {triton_tflops:>13.2f} {triton_vs_sdpa:>7.2f}x"
-                )
+                if no_sdpa:
+                    t_str = f"{triton_ms:>10.3f} {triton_tflops:>13.2f}"
+                else:
+                    triton_vs_sdpa = sdpa_ms / triton_ms
+                    t_str = (
+                        f"{triton_ms:>10.3f} {triton_tflops:>13.2f}"
+                        f" {triton_vs_sdpa:>7.2f}x"
+                    )
             except Exception:
-                t_str = f"{'FAILED':>10} {'':>13} {'':>8}"
+                t_str = (
+                    f"{'FAILED':>10} {'':>13}"
+                    if no_sdpa
+                    else f"{'FAILED':>10} {'':>13} {'':>8}"
+                )
                 triton_ms = None
         else:
-            t_str = f"{'N/A':>10} {'':>13} {'':>8}"
+            t_str = (
+                f"{'N/A':>10} {'':>13}"
+                if no_sdpa
+                else f"{'N/A':>10} {'':>13} {'':>8}"
+            )
             triton_ms = None
 
         # FlyDSL sage
@@ -466,22 +489,43 @@ def run_speed(shapes, device, warmup, rep, e2e):
 
                 flydsl_ms = _do_bench(flydsl_fn, warmup, rep)
                 flydsl_tflops = flops / flydsl_ms / 1e9
-                flydsl_vs_sdpa = sdpa_ms / flydsl_ms
                 flydsl_vs_triton = (
                     f"{triton_ms / flydsl_ms:.2f}x" if triton_ms else "  N/A"
                 )
-                f_str = (
-                    f"{flydsl_ms:>10.3f} {flydsl_tflops:>13.2f}"
-                    f" {flydsl_vs_sdpa:>7.2f}x {flydsl_vs_triton:>10}"
-                )
+                if no_sdpa:
+                    f_str = (
+                        f"{flydsl_ms:>10.3f} {flydsl_tflops:>13.2f}"
+                        f" {flydsl_vs_triton:>10}"
+                    )
+                else:
+                    flydsl_vs_sdpa = sdpa_ms / flydsl_ms
+                    f_str = (
+                        f"{flydsl_ms:>10.3f} {flydsl_tflops:>13.2f}"
+                        f" {flydsl_vs_sdpa:>7.2f}x {flydsl_vs_triton:>10}"
+                    )
             except Exception:
-                f_str = f"{'FAILED':>10} {'':>13} {'':>8} {'':>10}"
+                f_str = (
+                    f"{'FAILED':>10} {'':>13} {'':>10}"
+                    if no_sdpa
+                    else f"{'FAILED':>10} {'':>13} {'':>8} {'':>10}"
+                )
                 flydsl_ms = None
         else:
-            f_str = f"{'N/A':>10} {'':>13} {'':>8} {'':>10}"
+            f_str = (
+                f"{'N/A':>10} {'':>13} {'':>10}"
+                if no_sdpa
+                else f"{'N/A':>10} {'':>13} {'':>8} {'':>10}"
+            )
             flydsl_ms = None
 
-        line = f"{label:<38}" f"{sdpa_ms:>9.3f} {sdpa_tflops:>11.2f}" f"{t_str}{f_str}"
+        if no_sdpa:
+            line = f"{label:<38}{t_str}{f_str}"
+        else:
+            line = (
+                f"{label:<38}"
+                f"{sdpa_ms:>9.3f} {sdpa_tflops:>11.2f}"
+                f"{t_str}{f_str}"
+            )
         print(line)
         csv_rows.append((label, sdpa_ms, sdpa_tflops, triton_ms, flydsl_ms))
 
@@ -510,6 +554,11 @@ def main():
     )
     parser.add_argument("--accuracy-only", action="store_true")
     parser.add_argument("--speed-only", action="store_true")
+    parser.add_argument(
+        "--no-sdpa",
+        action="store_true",
+        help="Skip the PyTorch SDPA reference timing and drop its columns.",
+    )
     parser.add_argument(
         "--e2e",
         action="store_true",
@@ -547,7 +596,9 @@ def main():
 
     speed_rows = None
     if not args.accuracy_only:
-        speed_rows = run_speed(SHAPES, device, args.warmup, args.rep, args.e2e)
+        speed_rows = run_speed(
+            SHAPES, device, args.warmup, args.rep, args.e2e, no_sdpa=args.no_sdpa
+        )
 
     if args.csv and speed_rows:
         save_csv(args.csv, speed_rows)
