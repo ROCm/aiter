@@ -48,8 +48,11 @@ if is_flydsl_available():
     from aiter.ops.flydsl.moe_kernels import (
         get_flydsl_stage1_kernels,
         get_flydsl_stage2_kernels,
+        get_flydsl_kernel_params,
         flydsl_moe_stage1,
+        flydsl_moe_stage1_direct,
         flydsl_moe_stage2,
+        flydsl_moe_stage2_direct,
     )
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
@@ -405,6 +408,8 @@ class FmoeTuner(TunerCommon):
         num_valid_ids,
         w1_scale_aiter,
         a1_scale,
+        topk_ids,
+        moe_buf,
         dtype,
         topk,
         kparams,
@@ -424,6 +429,36 @@ class FmoeTuner(TunerCommon):
         inter_dim = (
             w1_qt_shffle_ck.shape[1] // 2 if use_g1u1 else w1_qt_shffle_ck.shape[1]
         )
+        if kparams.get("direct", False):
+            out_shape = (token_num, topk, inter_dim)
+            out_buf = getattr(FmoeTuner, "_flydsl_stage1_direct_out", None)
+            if (
+                out_buf is None
+                or tuple(out_buf.shape) != out_shape
+                or out_buf.device != a1_qt.device
+                or out_buf.dtype != torch.bfloat16
+            ):
+                out_buf = torch.empty(out_shape, dtype=torch.bfloat16, device=a1_qt.device)
+                FmoeTuner._flydsl_stage1_direct_out = out_buf
+            return flydsl_moe_stage1_direct(
+                a=a1_qt,
+                w1=w1_qt_shffle_ck,
+                topk_ids=topk_ids,
+                out=out_buf,
+                topk=topk,
+                tile_m=kparams["tile_m"],
+                tile_n=kparams["tile_n"],
+                tile_k=kparams["tile_k"],
+                a_dtype=kparams["a_dtype"],
+                b_dtype=kparams["b_dtype"],
+                out_dtype=kparams["out_dtype"],
+                w1_scale=w1_scale_aiter,
+                a1_scale=a1_scale,
+                routes_per_block=kparams.get("routes_per_block", 1),
+                num_waves=kparams.get("num_waves", 0),
+                k_batch=kparams.get("k_batch", 1),
+                splitk_mode=kparams.get("splitk_mode", "atomic"),
+            )
         result = flydsl_moe_stage1(
             a=a1_qt,
             w1=w1_qt_shffle_ck,
@@ -448,6 +483,8 @@ class FmoeTuner(TunerCommon):
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
             gate_only=kparams.get("gate_only", False),
+            n_per_wave=kparams.get("n_per_wave", 32),
+            splitk_mode=kparams.get("splitk_mode", "atomic"),
             fuse_fp4_quant=fuse_fq,
             fuse_sort_scale=fuse_fq,
         )
@@ -469,6 +506,8 @@ class FmoeTuner(TunerCommon):
         w2_scale_shuffled_flydsl,
         a2_scale,
         moe_buf,
+        topk_ids,
+        topk_weights,
         dtype,
         topk,
         kparams,
@@ -476,6 +515,24 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
+        if kparams.get("direct", False):
+            return flydsl_moe_stage2_direct(
+                inter_states=a2_qt,
+                w2=w2_shuffled_flydsl,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                out=moe_buf,
+                topk=topk,
+                tile_m=kparams["tile_m"],
+                tile_n=kparams["tile_n"],
+                tile_k=kparams["tile_k"],
+                a_dtype=kparams["a_dtype"],
+                b_dtype=kparams["b_dtype"],
+                out_dtype=kparams["out_dtype"],
+                w2_scale=w2_scale_shuffled_flydsl,
+                a2_scale=a2_scale,
+                split_reduce=kparams.get("split_reduce", False),
+            )
         if kparams.get("mode", "atomic") == "atomic":
             moe_buf.zero_()
 
@@ -505,6 +562,8 @@ class FmoeTuner(TunerCommon):
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
             mfma_variant=kparams.get("mfma_variant", None),
+            n_per_wave=kparams.get("n_per_wave", 32),
+            k_batch=kparams.get("k_batch", 1),
         )
 
     @staticmethod
@@ -2250,6 +2309,60 @@ class FmoeTuner(TunerCommon):
             model_dim=model_dim,
             n_dim=inter_dim,
         )
+        if (
+            a_dtype_s1 == "fp8"
+            and b_dtype_s1 == "fp8"
+            and out_dtype_str == "bf16"
+            and act_type == ActivationType.Silu
+            and use_g1u1
+            and not doweight_stage1
+        ):
+            # Direct stage1 split-K candidates (compile_moe_gemm1_direct_smallm
+            # supports the same k_batch + splitk_mode knobs as the standard
+            # kernel via patch 0002's codegen path).  Mirror the standard
+            # stage1 kb pool [1, 2, 4, 8]; reduce-mode only enumerated when
+            # kb > 1.  Divisibility checks are inlined below so the tuner
+            # never queues impossible variants.
+            for tn in (16, 32, 64, 96, 192):
+                if inter_dim % tn != 0:
+                    continue
+                num_waves_candidates = [0]
+                if tn in (32, 64):
+                    num_waves_candidates.append(2)
+                elif tn == 96:
+                    num_waves_candidates.extend([2, 3])
+                elif tn == 192:
+                    num_waves_candidates.append(3)
+                for tk in (64, 128, 256, 512):
+                    if model_dim % tk != 0:
+                        continue
+                    for num_waves in num_waves_candidates:
+                        for kb in (1, 2, 4, 8):
+                            if kb > 1:
+                                if model_dim % kb != 0:
+                                    continue
+                                _kpb = model_dim // kb
+                                if _kpb % tk != 0:
+                                    continue
+                                if (_kpb // tk) < 1:
+                                    continue
+                            splitk_modes = (
+                                ("atomic", "reduce") if kb > 1 else ("atomic",)
+                            )
+                            for skmode in splitk_modes:
+                                kname = (
+                                    f"flydsl_moe1_direct_a{a_dtype_s1}_w{b_dtype_s1}_"
+                                    f"{out_dtype_str}_t16x{tn}x{tk}"
+                                )
+                                if num_waves:
+                                    kname += f"_nw{num_waves}"
+                                if kb != 1:
+                                    kname += f"_kb{kb}"
+                                if skmode == "reduce":
+                                    kname += "_red"
+                                kparams = get_flydsl_kernel_params(kname)
+                                if kparams is not None:
+                                    flydsl_s1_kernels[kname] = kparams
         flydsl_s2_kernels = get_flydsl_stage2_kernels(
             a_dtype_s2,
             b_dtype_s2,
@@ -2262,6 +2375,12 @@ class FmoeTuner(TunerCommon):
             for kname, kparams in flydsl_s1_kernels.items():
                 ktm = kparams["tile_m"]
                 if ktm != blockM:
+                    continue
+                if kparams.get("direct", False) and (
+                    act_type != ActivationType.Silu
+                    or not use_g1u1
+                    or doweight_stage1
+                ):
                     continue
 
                 is_splitk = kparams.get("k_batch", 1) > 1
@@ -2313,7 +2432,7 @@ class FmoeTuner(TunerCommon):
                             ),
                             FmoeTuner.run_flydsl_stage1_out,
                             (
-                                [0, 1, 5, 6, 7, 8, 15, 14],
+                                [0, 1, 5, 6, 7, 8, 15, 14, 13, 9],
                                 dtype,
                                 topk,
                                 s1_params,
@@ -2334,6 +2453,8 @@ class FmoeTuner(TunerCommon):
                     )
 
             for kname, kparams in flydsl_s2_kernels.items():
+                if kparams.get("direct", False) and doweight_stage1:
+                    continue
                 if b_dtype_s2 != "fp4":
                     if kparams["tile_m"] != blockM:
                         continue
@@ -2379,7 +2500,7 @@ class FmoeTuner(TunerCommon):
                         ),
                         FmoeTuner.run_flydsl_stage2_out,
                         (
-                            [0, 17, 5, 6, 7, 8, 19, 14, 9],
+                            [0, 17, 5, 6, 7, 8, 19, 14, 9, 13, 12],
                             dtype,
                             topk,
                             s2_kparams,
@@ -2868,9 +2989,21 @@ class FmoeTuner(TunerCommon):
             _non_flydsl_best = _non_flydsl.sort_values("us").drop_duplicates(
                 ["stage", "block_m"], keep="first"
             )
-            profileDF = profileDF.sort_values("us").drop_duplicates(
-                ["stage", "block_m"], keep="first"
+            # Direct FlyDSL kernels bypass moe_sorting at runtime when both stages
+            # are direct. Preserve the best direct and non-direct candidate per
+            # stage/block_m before forming stage1-stage2 pairs; otherwise a CK
+            # stage1 with a lower standalone kernel time can hide a faster
+            # direct+direct end-to-end path.
+            profileDF["_direct_family"] = profileDF["kernelName"].astype(str).apply(
+                lambda name: "direct"
+                if name.startswith("flydsl_moe1_direct")
+                or name.startswith("flydsl_moe2_direct")
+                else "non_direct"
             )
+            profileDF = profileDF.sort_values("us").drop_duplicates(
+                ["stage", "block_m", "_direct_family"], keep="first"
+            )
+            profileDF = profileDF.drop(columns=["_direct_family"])
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
                 columns=["stage"]
             )
@@ -2972,6 +3105,62 @@ class FmoeTuner(TunerCommon):
                 )
                 profileDF = profileDF.loc[~_invalid_fq_mixed_bm].reset_index(drop=True)
             profileDF["run_1stage"] = 0
+
+            sort_us_cache = {}
+
+            def _get_sort_us(block_m):
+                block_m = int(block_m)
+                if block_m in sort_us_cache:
+                    return sort_us_cache[block_m]
+                from aiter.test_common import run_perftest
+
+                topk_ids = torch.randint(
+                    0, expert, (token, topk), dtype=torch.int32, device="cuda"
+                )
+                topk_weights = torch.rand(
+                    (token, topk), dtype=torch.float32, device="cuda"
+                )
+                try:
+                    _, us_sort = run_perftest(
+                        moe_sorting,
+                        topk_ids,
+                        topk_weights,
+                        expert,
+                        model_dim,
+                        dtype,
+                        block_m,
+                    )
+                    us_sort = round(float(us_sort), 4)
+                except Exception as exc:
+                    print(f"  warning: moe_sorting benchmark failed: {exc}")
+                    us_sort = 0.0
+                sort_us_cache[block_m] = us_sort
+                print(f"  moe_sorting benchmark: blockM={block_m}, us={us_sort}")
+                return us_sort
+
+            s1_direct = profileDF["kernelName1"].astype(str).str.startswith(
+                "flydsl_moe1_direct"
+            )
+            s2_direct = profileDF["kernelName2"].astype(str).str.startswith(
+                "flydsl_moe2_direct"
+            )
+            direct_2stage = s1_direct & s2_direct
+            if (~direct_2stage).any():
+                profileDF["us_moe_sort"] = 0.0
+                non_direct_idx = profileDF.index[~direct_2stage]
+                for idx in non_direct_idx:
+                    bm1 = int(profileDF.at[idx, "block_m"])
+                    bm2 = int(profileDF.at[idx, "block_m2"])
+                    sort_us = _get_sort_us(bm1)
+                    if bm2 != bm1:
+                        sort_us += _get_sort_us(bm2)
+                    profileDF.at[idx, "us_moe_sort"] = sort_us
+                profileDF.loc[non_direct_idx, "us1"] = (
+                    profileDF.loc[non_direct_idx, "us1"]
+                    + profileDF.loc[non_direct_idx, "us_moe_sort"]
+                )
+                profileDF.drop(columns=["us_moe_sort"], inplace=True)
+
             profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
             if len(profileDF) == 0:
                 print(

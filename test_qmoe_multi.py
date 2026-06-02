@@ -689,6 +689,31 @@ def expand_quant_list(
     ]
 
 
+def _result_base(case: CaseSpec, quant: QuantSpec, args, seed: int, case_tag: str):
+    return {
+        "case_name": case.case_name,
+        "case": case_tag,
+        "token": case.token,
+        "model_dim": case.model_dim,
+        "inter_dim": case.inter_dim,
+        "expert": case.expert,
+        "topk": case.topk,
+        "act_type": str(case.activation),
+        "dtype": str(case.dtype),
+        "use_g1u1": int(case.use_g1u1),
+        "doweight_stage1": int(case.doweight_stage1),
+        "smooth_scale": args.smooth_scale,
+        "seed": seed,
+        "quant": quant.name,
+        "q_type": str(quant.q_type),
+        "q_dtype_a": str(quant.q_dtype_a),
+        "q_dtype_w": str(quant.q_dtype_w),
+        "q_type2": str(quant.stage2_q_type),
+        "q_dtype_a2": str(quant.stage2_q_dtype_a),
+        "q_dtype_w2": str(quant.stage2_q_dtype_w),
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Unified qMOE test: int8/fp8/fp4, functional + performance."
@@ -770,6 +795,12 @@ def parse_args():
         default="",
         help="Optional config csv path for fused_moe lookup; if empty and --csv has hybrid columns, use --csv.",
     )
+    parser.add_argument(
+        "--output-csv",
+        type=str,
+        default="",
+        help="Optional path to write structured per-case results as CSV.",
+    )
     return parser.parse_args()
 
 
@@ -777,8 +808,8 @@ def _configure_fmoe_config(args):
     cfg_path = args.fmoe_config
     if not cfg_path and args.csv:
         df_head = pd.read_csv(args.csv, nrows=1)
-        hybrid_cols = {"q_type2", "q_dtype_a2", "q_dtype_w2"}
-        if hybrid_cols.issubset(set(df_head.columns)):
+        fmoe_config_cols = {"q_type2", "q_dtype_a2", "q_dtype_w2", "kernelName1", "kernelName2"}
+        if fmoe_config_cols.issubset(set(df_head.columns)):
             cfg_path = args.csv
 
     if not cfg_path:
@@ -840,6 +871,7 @@ def main():
                 f"shape=({case.token},{case.model_dim},{case.inter_dim},E={case.expert},topk={case.topk})"
             )
             print(f"\n{'=' * 90}\n[RUN] {case_tag}\n{'=' * 90}")
+            result_base = _result_base(case, quant, args, seed, case_tag)
             try:
                 q_data = case_data["quant_data"][quant.name]
                 w1_qt = q_data["w1_qt"]
@@ -928,23 +960,25 @@ def main():
                     )
                     results.append(
                         {
-                            "case": case_tag,
+                            **result_base,
                             "status": "PASS" if stat["pass"] else "FAIL",
                             "max_delta": stat["max_delta"],
                             "close_pct": stat["pct_close"],
                             "cos": stat["cos"],
                             "perf_us": perf_us,
+                            "error": "",
                         }
                     )
                 else:
                     results.append(
                         {
-                            "case": case_tag,
+                            **result_base,
                             "status": "PERF_ONLY",
                             "max_delta": None,
                             "close_pct": None,
                             "cos": None,
                             "perf_us": perf_us,
+                            "error": "",
                         }
                     )
             except Exception as ex:
@@ -954,14 +988,19 @@ def main():
                 traceback.print_exc()
                 results.append(
                     {
-                        "case": case_tag,
+                        **result_base,
                         "status": "ERROR",
                         "max_delta": None,
                         "close_pct": None,
                         "cos": None,
                         "perf_us": None,
+                        "error": str(ex),
                     }
                 )
+
+    if args.output_csv:
+        pd.DataFrame(results).to_csv(args.output_csv, index=False)
+        print(f"[CSV] wrote results to {args.output_csv}")
 
     print(f"\n{'=' * 90}\nSUMMARY\n{'=' * 90}")
     for item in results:

@@ -39,7 +39,9 @@ if is_flydsl_available():
     )
     from .moe_kernels import (
         flydsl_moe_stage1,
+        flydsl_moe_stage1_direct,
         flydsl_moe_stage2,
+        flydsl_moe_stage2_direct,
     )
 
     from .gemm_kernels import flydsl_hgemm
@@ -47,6 +49,8 @@ if is_flydsl_available():
     __all__ += [
         "flydsl_preshuffle_gemm_a8",
         "flydsl_moe_stage1",
+        "flydsl_moe_stage1_direct",
         "flydsl_moe_stage2",
+        "flydsl_moe_stage2_direct",
         "flydsl_hgemm",
     ]

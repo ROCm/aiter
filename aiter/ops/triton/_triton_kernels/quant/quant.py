@@ -52,6 +52,49 @@ def _dynamic_per_tensor_quant_fp8_i8_kernel(
 
 
 @triton.jit
+def _per_tensor_amax_kernel(
+    x_in_ptr,
+    amax_ptr,
+    n_elements: int,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_in_ptr + offsets, mask=mask, other=0.0, cache_modifier=".cg")
+    tl.store(amax_ptr + pid, tl.max(tl.abs(x)))
+
+
+@triton.jit
+def _quant_from_per_tensor_amax_kernel(
+    qx_ptr,
+    x_in_ptr,
+    amax_ptr,
+    scale_out_ptr,
+    n_elements: int,
+    n_blocks: int,
+    DTYPE_MAX: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    AMAX_BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    amax_offsets = tl.arange(0, AMAX_BLOCK_SIZE)
+    amax_mask = amax_offsets < n_blocks
+    amax_values = tl.load(amax_ptr + amax_offsets, mask=amax_mask, other=0.0)
+    scale = tl.max(amax_values) / DTYPE_MAX
+    scale_recip = 1 / scale
+
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_in_ptr + offsets, mask=mask, cache_modifier=".cg")
+    qx = (x * scale_recip).to(qx_ptr.dtype.element_ty)
+    tl.store(qx_ptr + offsets, qx, mask=mask)
+
+    if pid == 0:
+        tl.store(scale_out_ptr, scale)
+
+
+@triton.jit
 def _dynamic_per_token_quant_fp8_i8_kernel(
     qx_ptr,
     scale_out_ptr,
