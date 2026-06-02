@@ -62,7 +62,9 @@ BPP = 2
 @flyc.jit
 def launch_fmha(
     ptr_O: fx.Tensor, ptr_Q: fx.Tensor, ptr_K: fx.Tensor, ptr_V: fx.Tensor,
-    ptr_LSE: fx.Tensor, scalar_f: fx.Float32, kv_seq_len: fx.Int32,
+    ptr_LSE: fx.Tensor,
+    ptr_cu_seqlens_q: fx.Tensor, ptr_cu_seqlens_k: fx.Tensor,
+    scalar_f: fx.Float32, kv_seq_len: fx.Int32,
     stride_q_seq: fx.Int32, stride_q_tg: fx.Int32,
     stride_q_head: fx.Int32, stride_q_batch: fx.Int32,
     gqa: fx.Int32,
@@ -90,6 +92,7 @@ def launch_fmha(
 
     launcher = fmha_fwd_kernel(
         ptr_O, ptr_Q, ptr_K, ptr_V, ptr_LSE,
+        ptr_cu_seqlens_q, ptr_cu_seqlens_k,
         scalar_f, kv_seq_len,
         stride_q_seq, stride_q_tg, stride_q_head, stride_q_batch,
         gqa,
@@ -139,6 +142,10 @@ def run_test(B, H, SQ, SK):
     o = torch.zeros(B, SQ, H, HEAD_V, dtype=torch.bfloat16).cuda()
     lse = torch.zeros(B, H, SQ, dtype=torch.float32).cuda()
 
+    # Dummy cu_seqlens for BSHD (uniform per-batch seq_len)
+    cu_q = torch.arange(0, (B + 1) * SQ, SQ, dtype=torch.int32, device='cuda')
+    cu_k = torch.arange(0, (B + 1) * SK, SK, dtype=torch.int32, device='cuda')
+
     # BSHD strides
     stride_q_seq_b = H * HEAD_QK * BPP
     stride_q_tg_b = BLOCK_M * H * HEAD_QK * BPP
@@ -156,6 +163,7 @@ def run_test(B, H, SQ, SK):
 
     args = (
         o, q, k, v, lse,
+        cu_q, cu_k,
         scale, SK,
         stride_q_seq_b, stride_q_tg_b, stride_q_head_b, stride_q_batch_b,
         1,  # gqa
@@ -195,6 +203,99 @@ def run_test(B, H, SQ, SK):
                 pat.append('.' if ok else 'X')
             print(f"    tok-pass-pattern h=0: {''.join(pat)}")
     return err < 0.05
+
+
+def run_test_thd(seqs_q, seqs_k, H):
+    """THD varlen test: q/k/v are packed (total_tokens, H, D)."""
+    B = len(seqs_q)
+    assert B == len(seqs_k)
+    scale = 1.0 / math.sqrt(HEAD_QK)
+    torch.manual_seed(42)
+
+    total_q = sum(seqs_q)
+    total_k = sum(seqs_k)
+
+    # THD packed tensors
+    q = torch.randn(total_q, H, HEAD_QK, dtype=torch.bfloat16).cuda()
+    k = torch.randn(total_k, H, HEAD_QK, dtype=torch.bfloat16).cuda()
+    v = torch.randn(total_k, H, HEAD_V, dtype=torch.bfloat16).cuda()
+    o = torch.zeros(total_q, H, HEAD_V, dtype=torch.bfloat16).cuda()
+
+    cu_q = torch.zeros(B + 1, dtype=torch.int32, device='cuda')
+    cu_k = torch.zeros(B + 1, dtype=torch.int32, device='cuda')
+    for i in range(B):
+        cu_q[i + 1] = cu_q[i] + seqs_q[i]
+        cu_k[i + 1] = cu_k[i] + seqs_k[i]
+
+    max_sq = max(seqs_q)
+    max_sk = max(seqs_k)
+    # LSE is per-batch but kernel writes ignore it
+    lse = torch.zeros(B, H, max_sq, dtype=torch.float32).cuda()
+
+    # THD strides: per-token byte stride = H*D*BPP
+    stride_q_seq_b = H * HEAD_QK * BPP
+    stride_q_tg_b = BLOCK_M * H * HEAD_QK * BPP
+    stride_q_head_b = HEAD_QK * BPP
+    stride_q_batch_b = 0  # unused in THD
+    stride_k_seq_b = H * HEAD_QK * BPP
+    stride_k_head_b = HEAD_QK * BPP
+    stride_k_batch_b = 0  # unused
+    stride_v_seq_b = H * HEAD_V * BPP
+    stride_v_head_b = HEAD_V * BPP
+    stride_v_batch_b = 0  # unused
+    stride_o_seq_e = H * HEAD_V
+    stride_o_head_e = HEAD_V
+    stride_o_batch_e = 0  # unused
+
+    args = (
+        o, q, k, v, lse,
+        cu_q, cu_k,
+        scale, max_sk,
+        stride_q_seq_b, stride_q_tg_b, stride_q_head_b, stride_q_batch_b,
+        1,  # gqa
+        stride_k_seq_b, stride_k_head_b, stride_k_batch_b,
+        stride_v_seq_b, stride_v_head_b, stride_v_batch_b,
+        stride_o_seq_e, stride_o_head_e, stride_o_batch_e,
+        max_sq, H, B,
+    )
+
+    launch_fmha(*args)
+    torch.cuda.synchronize()
+
+    # Reference: per-batch (variable seq_len)
+    err_max = 0.0
+    fail_total = 0
+    n_total = 0
+    o_cpu = o.cpu().float()
+    for i in range(B):
+        sq, sk = seqs_q[i], seqs_k[i]
+        qb = q[cu_q[i]:cu_q[i + 1]].transpose(0, 1).contiguous()  # (H, sq, D)
+        kb = k[cu_k[i]:cu_k[i + 1]].transpose(0, 1).contiguous()
+        vb = v[cu_k[i]:cu_k[i + 1]].transpose(0, 1).contiguous()
+        ref_bh = _ref_mha(qb, kb, vb, scale, causal=True)  # (H, sq, D)
+        ref_b = ref_bh.transpose(0, 1).contiguous()  # (sq, H, D)
+        o_b = o_cpu[cu_q[i]:cu_q[i + 1]]
+        ref_b_cpu = ref_b.cpu().float()
+        close = torch.isclose(o_b, ref_b_cpu, rtol=1e-2, atol=1e-2)
+        fail_b = (~close).sum().item()
+        err_b = (o_b - ref_b_cpu).abs().max().item()
+        err_max = max(err_max, err_b)
+        fail_total += fail_b
+        n_total += close.numel()
+        if fail_b > 0:
+            print(f"      batch {i} sq={sq} sk={sk}: max_err={err_b:.4f} fail={fail_b/close.numel():.1%}")
+            # which tokens fail
+            tok_fail = []
+            for t in range(sq):
+                if not torch.allclose(o_b[t], ref_b_cpu[t], rtol=1e-2, atol=1e-2):
+                    tok_fail.append(t)
+            print(f"      bad tokens: {tok_fail[:30]}{'...' if len(tok_fail)>30 else ''} (total {len(tok_fail)})")
+    pct = fail_total / n_total
+    tag = f"THD seqs_q={seqs_q} seqs_k={seqs_k} H={H}"
+    color = "\033[32m" if pct < 0.05 else "\033[31m"
+    label = "passed" if pct < 0.05 else "FAIL"
+    print(f"  [{tag}] {color}{label}\033[0m  max_err={err_max:.6f}  {pct:.1%}")
+    return pct < 0.05
 
 
 if __name__ == "__main__":
@@ -245,6 +346,41 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"  [B={B} H={H} SQ={SQ} SK={SK}] ERROR: {e}")
             import traceback; traceback.print_exc()
+
+    print("=" * 60)
+    print("THD varlen tests (different seq_len per batch)")
+    print("=" * 60)
+    thd_tests = [
+        # uniform seq_lens (should match BSHD result)
+        ([128], [128], 1),
+        ([128, 128], [128, 128], 1),
+        ([128, 128], [128, 128], 2),
+        # variable seq_len per batch
+        ([128, 256], [128, 256], 1),
+        ([128, 256], [128, 256], 2),
+        ([256, 128, 384], [256, 128, 384], 1),
+        ([256, 128, 384], [256, 128, 384], 2),
+        ([300, 481, 200], [300, 481, 200], 2),
+        # uneven q vs k
+        ([128, 128], [256, 256], 1),
+        ([128, 256], [256, 384], 2),
+        ([200, 300], [400, 500], 4),
+        # bigger
+        ([512, 1024], [512, 1024], 2),
+        ([100, 200, 300, 400], [100, 200, 300, 400], 2),
+    ]
+    n_thd = 0
+    for seqs_q, seqs_k, H in thd_tests:
+        try:
+            ok = run_test_thd(seqs_q, seqs_k, H)
+            if ok:
+                n_thd += 1
+        except Exception as e:
+            print(f"  [THD seqs_q={seqs_q} H={H}] ERROR: {e}")
+            import traceback; traceback.print_exc()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    print(f"\nTHD: {n_thd}/{len(thd_tests)} passed")
 
     print(f"\n{'='*60}")
     print(f"{n_pass}/{len(tests)} passed")
