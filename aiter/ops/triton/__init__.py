@@ -1,6 +1,42 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+# --- Triton < 3.6 import-time backward-compatibility shim ---
+# Some gluon kernels under aiter/ops/triton/{gluon,_gluon_kernels}/ decorate
+# helper functions with `@gluon.constexpr_function`, a symbol that only exists
+# in `triton.experimental.gluon` on Triton >= 3.6. Those kernel modules are
+# imported eagerly at module load (and across GPU archs), so on Triton < 3.6
+# (e.g. the ROCm 7.0 image ships Triton 3.4) merely importing them raises:
+#     AttributeError: module 'triton.experimental.gluon'
+#                     has no attribute 'constexpr_function'
+# This breaks downstream importers (e.g. SGLang's model registry, which sweeps
+# and imports every model module) for any model whose import chain reaches a
+# gluon kernel -- even though the gluon kernels are never *executed* on
+# Triton < 3.6 (aiter selects non-gluon code paths there). Installing a no-op
+# `constexpr_function` keeps `import` working on old Triton; it is a no-op on
+# Triton >= 3.6 where the real symbol is present.
+try:
+    import triton as _triton
+    from packaging.version import Version as _Version
+
+    if _Version(_triton.__version__.split("+")[0]) < _Version("3.6.0"):
+        from triton.experimental import gluon as _gluon
+
+        if not hasattr(_gluon, "constexpr_function"):
+
+            def _aiter_compat_constexpr_function(fn=None, *args, **kwargs):
+                # Supports both `@gluon.constexpr_function` and
+                # `@gluon.constexpr_function(...)`. Returns the decorated
+                # function unchanged so the module imports; it is never called
+                # on Triton < 3.6 because the gluon kernels are not dispatched.
+                if callable(fn):
+                    return fn
+                return lambda _fn: _fn
+
+            _gluon.constexpr_function = _aiter_compat_constexpr_function
+except Exception:
+    pass
+
 import importlib.util
 import sys
 from types import SimpleNamespace
