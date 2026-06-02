@@ -269,6 +269,43 @@ __device__ constexpr T block_reduce(T local, F reduce_op)
     return local;
 }
 
+// Combined block reduction for (square_sum, v_max) using a single __syncthreads().
+// Requires BlockSize to be a power-of-2 multiple of WARP_SIZE.
+template <int BlockSize>
+__device__ __forceinline__ void block_reduce_dual_sum_max(float& sq_sum, float& v_max)
+{
+    static constexpr int waves = BlockSize / WARP_SIZE;
+    auto sum_op = [](float a, float b) { return a + b; };
+    auto max_op = [](float a, float b) { return a > b ? a : b; };
+
+    if constexpr(waves == 1)
+    {
+        sq_sum = wave_reduce<float, decltype(sum_op), WARP_SIZE, true>(sq_sum, sum_op);
+        v_max  = wave_reduce<float, decltype(max_op), WARP_SIZE, true>(v_max,  max_op);
+        return;
+    }
+
+    int wave_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    sq_sum = wave_reduce<float, decltype(sum_op), WARP_SIZE, false>(sq_sum, sum_op);
+    v_max  = wave_reduce<float, decltype(max_op), WARP_SIZE, false>(v_max,  max_op);
+
+    __shared__ float smem[2 * waves];
+    if(lane_id == WARP_SIZE - 1)
+    {
+        smem[wave_id]         = sq_sum;
+        smem[waves + wave_id] = v_max;
+    }
+    __syncthreads();
+
+    static_assert(WARP_SIZE % waves == 0, "BlockSize must be a power-of-2 multiple of WARP_SIZE");
+    sq_sum = smem[lane_id % waves];
+    v_max  = smem[waves + (lane_id % waves)];
+    sq_sum = wave_reduce<float, decltype(sum_op), waves, true>(sq_sum, sum_op);
+    v_max  = wave_reduce<float, decltype(max_op), waves, true>(v_max,  max_op);
+}
+
 // ---------------------------------------------------------------------------
 // Fused DPP reduce for float max: generates a single v_max_f32 with DPP
 // modifier instead of separate v_mov_b32_dpp + v_max_f32.
