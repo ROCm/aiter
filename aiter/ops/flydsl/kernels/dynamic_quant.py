@@ -98,6 +98,65 @@ def _input_elem_mlir_type(in_dtype: str):
 
 
 # ----------------------------------------------------------------------------
+# 64-bit addressing helpers (used when ``rows * cols >= 2**31``).
+#
+# The AMD buffer-load/store path takes a 32-bit element/byte offset, so once
+# the per-thread offset ``row * cols + ...`` overflows i32 (i.e. the bf16
+# tensor exceeds the 4 GB buffer window) we must fall back to an explicit
+# 64-bit GEP + global load/store. These helpers emit that path; they must be
+# called from inside a ``@flyc.kernel`` body (active MLIR context). The
+# builders select between this and the cheaper ``buffer_ops.buffer_load`` at
+# *build time* via a ``use_ptr64`` flag, so each variant compiles only one
+# path with no runtime branch.
+# ----------------------------------------------------------------------------
+def _global_base_ptr(tensor):
+    """Return ``(base_ptr, ptr_ty)`` for addrspace-1 GEP addressing."""
+    from flydsl._mlir.dialects import fly as _fly
+
+    ptr_ty = ir.Type.parse("!llvm.ptr<1>")
+    return _fly.extract_aligned_pointer_as_index(ptr_ty, tensor), ptr_ty
+
+
+def _ptr64_load_dwords(base_ptr, ptr_ty, elem_off_index, elem_bytes, vec_dw):
+    """64-bit GEP + global load of ``vec_dw`` i32 dwords.
+
+    Byte address = ``elem_off_index * elem_bytes``. Returns the same shape a
+    ``buffer_ops.buffer_load(..., vec_width=vec_dw, dtype=i32)`` would (scalar
+    i32 for ``vec_dw == 1``, else ``vec<vec_dw, i32>``).
+    """
+    i32 = T.i32
+    byte_off = arith.index_cast(
+        T.i64, elem_off_index * arith.constant(int(elem_bytes), type=T.index)
+    )
+    ptr = _llvm.GEPOp(
+        ptr_ty,
+        base_ptr,
+        [byte_off],
+        [-2147483648],
+        T.i8,
+        _llvm.GEPNoWrapFlags.none,
+    ).result
+    align = int(vec_dw) * 4
+    if int(vec_dw) == 1:
+        return _llvm.LoadOp(i32, ptr, alignment=align).result
+    return _llvm.LoadOp(T.vec(int(vec_dw), i32), ptr, alignment=align).result
+
+
+def _ptr64_store(value, base_ptr, ptr_ty, byte_off_index, align):
+    """64-bit GEP + global store of ``value`` at byte address ``byte_off_index``."""
+    byte_off = arith.index_cast(T.i64, byte_off_index)
+    ptr = _llvm.GEPOp(
+        ptr_ty,
+        base_ptr,
+        [byte_off],
+        [-2147483648],
+        T.i8,
+        _llvm.GEPNoWrapFlags.none,
+    ).result
+    _llvm.StoreOp(value, ptr, alignment=int(align))
+
+
+# ----------------------------------------------------------------------------
 # Kernel builder (cached so we don't re-JIT for the same shape/dtype combo).
 # ----------------------------------------------------------------------------
 @functools.lru_cache(maxsize=None)
@@ -105,6 +164,7 @@ def build_dynamic_per_tensor_quant_module(
     cols: int,
     in_dtype: str = "bf16",
     out_dtype: str = "fp8",
+    use_ptr64: bool = False,
 ):
     """Build (and cache) a launcher for fp8 per-tensor dynamic quant.
 
@@ -201,9 +261,23 @@ def build_dynamic_per_tensor_quant_module(
             dw_off = safe_elem_off >> c1_i32  # 2 bf16/fp16 per dword
             vec_dw = VEC * elem_bytes_in // 4  # = 4 dwords for VEC=8
 
-            raw_i32 = buffer_ops.buffer_load(
-                in_rsrc, dw_off, vec_width=vec_dw, dtype=i32
-            )
+            if use_ptr64:
+                # ``bid * cols`` overflows i32 once rows*cols >= 2**31; read
+                # via a 64-bit GEP from the input base pointer instead.
+                inp_base_ptr, _ptr_ty_as1 = _global_base_ptr(inp)
+                safe_col_idx = arith.index_cast(
+                    T.index, arith.select(in_range, col_thread, c0_i32)
+                )
+                elem_idx = arith.index_cast(
+                    T.index, bid_i32
+                ) * arith.constant(cols, type=T.index) + safe_col_idx
+                raw_i32 = _ptr64_load_dwords(
+                    inp_base_ptr, _ptr_ty_as1, elem_idx, elem_bytes_in, vec_dw
+                )
+            else:
+                raw_i32 = buffer_ops.buffer_load(
+                    in_rsrc, dw_off, vec_width=vec_dw, dtype=i32
+                )
             x_vec = vector.bitcast(in_vec_ty, raw_i32)
             x_f32 = x_vec.extf(T.vec(VEC, f32))
 
@@ -351,9 +425,26 @@ def build_dynamic_per_tensor_quant_module(
             dw_off_in = safe_elem_off >> c1_i32  # 2 bf16/fp16 per dword
             vec_dw_in = VEC * elem_bytes_in // 4  # 4
 
-            raw_i32 = buffer_ops.buffer_load(
-                in_rsrc, dw_off_in, vec_width=vec_dw_in, dtype=i32
-            )
+            if use_ptr64:
+                # ``bid * cols`` overflows i32 once rows*cols >= 2**31; read
+                # the input and write the fp8 output via 64-bit GEPs instead.
+                inp_base_ptr, _ptr_ty_as1 = _global_base_ptr(inp)
+                out_base_ptr, _ = _global_base_ptr(out)
+                row_base_idx = arith.index_cast(
+                    T.index, bid_i32
+                ) * arith.constant(cols, type=T.index)
+                safe_col_idx = arith.index_cast(
+                    T.index, arith.select(in_range, col_thread, c0_i32)
+                )
+                elem_idx_in = row_base_idx + safe_col_idx
+                raw_i32 = _ptr64_load_dwords(
+                    inp_base_ptr, _ptr_ty_as1, elem_idx_in, elem_bytes_in,
+                    vec_dw_in,
+                )
+            else:
+                raw_i32 = buffer_ops.buffer_load(
+                    in_rsrc, dw_off_in, vec_width=vec_dw_in, dtype=i32
+                )
             x_vec = vector.bitcast(in_vec_ty, raw_i32)
             x_f32 = x_vec.extf(T.vec(VEC, f32))
 
@@ -389,12 +480,22 @@ def build_dynamic_per_tensor_quant_module(
             # 0x7FFFFFFF which is < the dynamic-shape rsrc bound (=0xFFFFFFFF).
             _if_store = _scf.IfOp(in_range)
             with ir.InsertionPoint(_if_store.then_block):
-                buffer_ops.buffer_store(
-                    packed_vec,
-                    out_rsrc,
-                    elem_off,
-                    offset_is_bytes=True,
-                )
+                if use_ptr64:
+                    # fp8 output: 1 byte/elem, so the byte offset == elem_off
+                    # (which overflows i32 here); recompute it in 64-bit.
+                    elem_idx_out = row_base_idx + arith.index_cast(
+                        T.index, col_thread
+                    )
+                    _ptr64_store(
+                        packed_vec, out_base_ptr, _ptr_ty_as1, elem_idx_out, 8
+                    )
+                else:
+                    buffer_ops.buffer_store(
+                        packed_vec,
+                        out_rsrc,
+                        elem_off,
+                        offset_is_bytes=True,
+                    )
                 _scf.YieldOp([])
 
     # ------------------------------------------------------------------
@@ -475,6 +576,7 @@ def build_per_1x32_fp4_quant_module(
     cols: int,
     in_dtype: str = "bf16",
     shuffle_scale: bool = False,
+    use_ptr64: bool = False,
 ):
     """Build (and cache) a launcher for MXFP4 per-1x32 dynamic quant.
 
@@ -576,14 +678,34 @@ def build_per_1x32_fp4_quant_module(
         in_dw_off_base = safe_elem_off >> c1_i32  # 2 bf16/fp16 per dword
 
         chunks = []
-        for ci in range_constexpr(LOADS_PER_GROUP):
-            dw_off_c = in_dw_off_base + arith.constant(
-                ci * DWORDS_PER_LOAD, type=i32
+        if use_ptr64:
+            # ``group_id * group_size`` overflows i32 once rows*cols >= 2**31;
+            # gather via a 64-bit GEP from the input base pointer instead.
+            inp_base_ptr, _ptr_ty_as1 = _global_base_ptr(inp)
+            safe_gid_idx = arith.index_cast(
+                T.index, arith.select(in_range_group, group_id_i32, c0_i32)
             )
-            raw_i32_c = buffer_ops.buffer_load(
-                in_rsrc, dw_off_c, vec_width=DWORDS_PER_LOAD, dtype=i32
+            base_elem_idx = safe_gid_idx * arith.constant(
+                FP4_GROUP_SIZE, type=T.index
             )
-            chunks.append(vector.bitcast(in_chunk_vec_ty, raw_i32_c))
+            for ci in range_constexpr(LOADS_PER_GROUP):
+                elem_idx_ci = base_elem_idx + arith.constant(
+                    ci * ELEMS_PER_LOAD, type=T.index
+                )
+                raw_i32_c = _ptr64_load_dwords(
+                    inp_base_ptr, _ptr_ty_as1, elem_idx_ci, elem_bytes_in,
+                    DWORDS_PER_LOAD,
+                )
+                chunks.append(vector.bitcast(in_chunk_vec_ty, raw_i32_c))
+        else:
+            for ci in range_constexpr(LOADS_PER_GROUP):
+                dw_off_c = in_dw_off_base + arith.constant(
+                    ci * DWORDS_PER_LOAD, type=i32
+                )
+                raw_i32_c = buffer_ops.buffer_load(
+                    in_rsrc, dw_off_c, vec_width=DWORDS_PER_LOAD, dtype=i32
+                )
+                chunks.append(vector.bitcast(in_chunk_vec_ty, raw_i32_c))
 
         # ----- Compute absMax across all 32 elements -----
         abs_max = c0_f32
@@ -758,6 +880,7 @@ def build_per_1x32_fp4_quant_hadamard_module(
     cols: int,
     in_dtype: str = "bf16",
     shuffle_scale: bool = False,
+    use_ptr64: bool = False,
 ):
     """Build (and cache) an H_32-fused MXFP4 per-1x32 dynamic quant launcher.
 
@@ -835,14 +958,34 @@ def build_per_1x32_fp4_quant_hadamard_module(
         in_dw_off_base = safe_elem_off >> c1_i32  # 2 elems/dword
 
         chunks = []
-        for ci in range_constexpr(LOADS_PER_GROUP):
-            dw_off_c = in_dw_off_base + arith.constant(
-                ci * DWORDS_PER_LOAD, type=i32
+        if use_ptr64:
+            # ``group_id * group_size`` overflows i32 once rows*cols >= 2**31;
+            # gather via a 64-bit GEP from the input base pointer instead.
+            inp_base_ptr, _ptr_ty_as1 = _global_base_ptr(inp)
+            safe_gid_idx = arith.index_cast(
+                T.index, arith.select(in_range_group, group_id_i32, c0_i32)
             )
-            raw_i32_c = buffer_ops.buffer_load(
-                in_rsrc, dw_off_c, vec_width=DWORDS_PER_LOAD, dtype=i32
+            base_elem_idx = safe_gid_idx * arith.constant(
+                FP4_GROUP_SIZE, type=T.index
             )
-            chunks.append(vector.bitcast(in_chunk_vec_ty, raw_i32_c))
+            for ci in range_constexpr(LOADS_PER_GROUP):
+                elem_idx_ci = base_elem_idx + arith.constant(
+                    ci * ELEMS_PER_LOAD, type=T.index
+                )
+                raw_i32_c = _ptr64_load_dwords(
+                    inp_base_ptr, _ptr_ty_as1, elem_idx_ci, elem_bytes_in,
+                    DWORDS_PER_LOAD,
+                )
+                chunks.append(vector.bitcast(in_chunk_vec_ty, raw_i32_c))
+        else:
+            for ci in range_constexpr(LOADS_PER_GROUP):
+                dw_off_c = in_dw_off_base + arith.constant(
+                    ci * DWORDS_PER_LOAD, type=i32
+                )
+                raw_i32_c = buffer_ops.buffer_load(
+                    in_rsrc, dw_off_c, vec_width=DWORDS_PER_LOAD, dtype=i32
+                )
+                chunks.append(vector.bitcast(in_chunk_vec_ty, raw_i32_c))
 
         # ----- Extend each chunk to f32 -> 32 scalar SSA values --------------
         # We deliberately extf chunk-by-chunk so the SSA dependency makes it
@@ -1035,6 +1178,7 @@ def build_per_1x32_fp4_quant_block_rotation_module(
     in_dtype: str = "bf16",
     rot_dtype: str = "bf16",
     shuffle_scale: bool = False,
+    use_ptr64: bool = False,
 ):
     """Build (and cache) the per-block-rotated MXFP4 per-1x32 quant launcher.
 
@@ -1227,14 +1371,33 @@ def build_per_1x32_fp4_quant_block_rotation_module(
         in_dw_off_base = elem_off_i32 >> c1_i32  # 2 elems / dword
 
         chunks = []
-        for ci in range_constexpr(LOADS_PER_GROUP):
-            dw_off_c = in_dw_off_base + arith.constant(
-                ci * DWORDS_PER_LOAD, type=i32
-            )
-            raw_i32_c = buffer_ops.buffer_load(
-                in_rsrc, dw_off_c, vec_width=DWORDS_PER_LOAD, dtype=i32
-            )
-            chunks.append(vector.bitcast(in_chunk_vec_ty, raw_i32_c))
+        if use_ptr64:
+            # ``m * cols`` overflows i32 once rows*cols >= 2**31; gather via a
+            # 64-bit GEP from the input base pointer instead.
+            inp_base_ptr, _ptr_ty_as1 = _global_base_ptr(inp)
+            base_elem_idx = arith.index_cast(
+                T.index, safe_m_i32
+            ) * arith.constant(cols, type=T.index) + arith.index_cast(
+                T.index, b_i32
+            ) * arith.constant(FP4_GROUP_SIZE, type=T.index)
+            for ci in range_constexpr(LOADS_PER_GROUP):
+                elem_idx_ci = base_elem_idx + arith.constant(
+                    ci * ELEMS_PER_LOAD, type=T.index
+                )
+                raw_i32_c = _ptr64_load_dwords(
+                    inp_base_ptr, _ptr_ty_as1, elem_idx_ci, elem_bytes_in,
+                    DWORDS_PER_LOAD,
+                )
+                chunks.append(vector.bitcast(in_chunk_vec_ty, raw_i32_c))
+        else:
+            for ci in range_constexpr(LOADS_PER_GROUP):
+                dw_off_c = in_dw_off_base + arith.constant(
+                    ci * DWORDS_PER_LOAD, type=i32
+                )
+                raw_i32_c = buffer_ops.buffer_load(
+                    in_rsrc, dw_off_c, vec_width=DWORDS_PER_LOAD, dtype=i32
+                )
+                chunks.append(vector.bitcast(in_chunk_vec_ty, raw_i32_c))
 
         # Extend each chunk to f32 and unpack to 32 scalar SSA values.
         x_vals = [None] * FP4_GROUP_SIZE
@@ -1414,6 +1577,7 @@ def build_per_1x32_fp4_quant_block_rotation_mfma_module(
     rot_dtype: str = "bf16",
     shuffle_scale: bool = False,
     rot_transposed: bool = False,
+    use_ptr64: bool = False,
 ):
     """MFMA-accelerated per-block-rotated MXFP4 per-1x32 quant launcher.
 
@@ -1712,7 +1876,17 @@ def build_per_1x32_fp4_quant_block_rotation_mfma_module(
             # The 32-wide group lives at columns [b*32, b*32 + 32) of the
             # input row -- the input A frags must include the per-b col
             # offset (counterpart of the scalar kernel's ``b * 32`` term).
-            row_off_in_inp = safe_m_row * cols_i32 + b_i32 * group_size_i32
+            if use_ptr64:
+                # ``m * cols`` overflows i32 once rows*cols >= 2**31; gather
+                # the A frags via 64-bit GEP from the input base pointer.
+                inp_base_ptr, _ptr_ty_as1 = _global_base_ptr(inp)
+                row_base_elem_idx = arith.index_cast(
+                    T.index, safe_m_row
+                ) * arith.constant(cols, type=T.index) + arith.index_cast(
+                    T.index, b_i32
+                ) * arith.constant(FP4_GROUP_SIZE, type=T.index)
+            else:
+                row_off_in_inp = safe_m_row * cols_i32 + b_i32 * group_size_i32
 
             for n_tile in range_constexpr(NUM_N_TILES):
                 # ----- zero-init accumulator (vec4 f32 per lane) -----
@@ -1726,12 +1900,20 @@ def build_per_1x32_fp4_quant_block_rotation_mfma_module(
                     k_col_i32 = (
                         arith.constant(k_tile * 16, type=i32) + k_off_in_tile
                     )
-                    elem_off_a = row_off_in_inp + k_col_i32
-                    dw_off_a = elem_off_a >> c1_i32  # 2 elem/dword
-                    # vec2 i32 = 4 bytes/lane * 2 = 8 bytes = 4 bf16
-                    raw_a = buffer_ops.buffer_load(
-                        in_rsrc, dw_off_a, vec_width=2, dtype=i32
-                    )
+                    if use_ptr64:
+                        elem_off_a_idx = row_base_elem_idx + arith.index_cast(
+                            T.index, k_col_i32
+                        )
+                        raw_a = _ptr64_load_dwords(
+                            inp_base_ptr, _ptr_ty_as1, elem_off_a_idx, 2, 2
+                        )
+                    else:
+                        elem_off_a = row_off_in_inp + k_col_i32
+                        dw_off_a = elem_off_a >> c1_i32  # 2 elem/dword
+                        # vec2 i32 = 4 bytes/lane * 2 = 8 bytes = 4 bf16
+                        raw_a = buffer_ops.buffer_load(
+                            in_rsrc, dw_off_a, vec_width=2, dtype=i32
+                        )
                     a_frag_bf = vector.bitcast(
                         T.vec(WMMA_FRAG_VALS, in_elem_ty), raw_a
                     )
@@ -1949,6 +2131,7 @@ def build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module(
     rot_dtype: str = "bf16",
     topk: int = 1,
     rot_transposed: bool = False,
+    use_ptr64: bool = False,
 ):
     """MFMA rotation + per-1x32 MXFP4 quant **fused with** MoE scale-sort.
 
@@ -2000,6 +2183,15 @@ def build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module(
         :func:`build_per_1x32_fp4_quant_block_rotation_mfma_module` for
         the full convention. Implementation reuses the same
         cooperative LDS load with the same constexpr layout swap.
+    use_ptr64 : bool, default False
+        Addressing mode for the ``inp`` (stage2 activation) gather. When
+        ``False`` the gather uses the cheap hardware buffer load with an
+        i32 element offset, valid while ``rows * cols < 2**31``. When
+        ``True`` the gather is emitted as a 64-bit GEP + global load so
+        large-M activations (``rows * cols >= 2**31``, i.e. the bf16
+        tensor exceeds the 4 GB buffer window) stay correct. Selected at
+        build time by the wrapper from the tensor size, so each variant
+        is compiled once with no runtime branch.
 
     Returns
     -------
@@ -2136,6 +2328,24 @@ def build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module(
         num_valid_rsrc = buffer_ops.create_buffer_resource(
             num_valid_ids, max_size=True
         )
+
+        # 64-bit global addressing for the ``inp`` (stage2 a2) gather.
+        # ``inp`` has ``rows = token_num * topk`` rows of ``cols`` elements;
+        # once ``rows * cols >= 2**31`` the element offset ``src_row * cols``
+        # overflows i32, and the bf16 byte offset (``rows*cols*2``) exceeds the
+        # 4 GB buffer-resource window. In that regime read the activation
+        # through an explicit 64-bit GEP + global load (same approach as the
+        # moe GEMM's wptr64 path). When the tensor fits in 32-bit
+        # (``use_ptr64 == False``) keep the cheaper hardware buffer load.
+        # The fp4 / scale stores keep their <4 GB buffer offsets unchanged.
+        if use_ptr64:
+            from flydsl._mlir.dialects import fly as _fly
+
+            _ptr_ty_as1 = ir.Type.parse("!llvm.ptr<1>")
+            inp_base_ptr = _fly.extract_aligned_pointer_as_index(_ptr_ty_as1, inp)
+            c_in_elem_bytes_idx = arith.constant(2, type=T.index)  # bf16 / fp16
+            cols_idx = arith.constant(cols, type=T.index)
+            group_size_idx = arith.constant(FP4_GROUP_SIZE, type=T.index)
 
         tid_i32 = ArithValue(tid)
         bid_x_i32 = ArithValue(bid_x)
@@ -2305,11 +2515,21 @@ def build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module(
         # ``src_row_for_mfma[m_tile]`` we resolved above (instead of
         # the natural ``m_base + m_tile*16 + lane_mod_16`` source row).
         # ============================================================
+        if use_ptr64:
+            b_idx = arith.index_cast(T.index, b_i32)
         for m_tile in range_constexpr(NUM_M_TILES):
-            row_off_in_inp = (
-                src_row_for_mfma[m_tile] * cols_i32
-                + b_i32 * group_size_i32
-            )
+            if use_ptr64:
+                # 64-bit element offset of this row's group base within ``inp``.
+                src_row_idx = arith.index_cast(T.index, src_row_for_mfma[m_tile])
+                row_base_elem_idx = (
+                    src_row_idx * cols_idx + b_idx * group_size_idx
+                )
+            else:
+                # 32-bit element offset (cheap hardware buffer load).
+                row_off_in_inp = (
+                    src_row_for_mfma[m_tile] * cols_i32
+                    + b_i32 * group_size_i32
+                )
 
             for n_tile in range_constexpr(NUM_N_TILES):
                 acc = vector.from_elements(
@@ -2321,11 +2541,32 @@ def build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module(
                     k_col_i32 = (
                         arith.constant(k_tile * 16, type=i32) + k_off_in_tile
                     )
-                    elem_off_a = row_off_in_inp + k_col_i32
-                    dw_off_a = elem_off_a >> c1_i32
-                    raw_a = buffer_ops.buffer_load(
-                        in_rsrc, dw_off_a, vec_width=2, dtype=i32
-                    )
+                    if use_ptr64:
+                        # 64-bit byte offset = (row_base + k_col) * elem_bytes,
+                        # then GEP from the i64 base pointer + global load.
+                        elem_off_a_idx = row_base_elem_idx + arith.index_cast(
+                            T.index, k_col_i32
+                        )
+                        byte_off_a = arith.index_cast(
+                            T.i64, elem_off_a_idx * c_in_elem_bytes_idx
+                        )
+                        a_ptr = _llvm.GEPOp(
+                            _ptr_ty_as1,
+                            inp_base_ptr,
+                            [byte_off_a],
+                            [-2147483648],
+                            T.i8,
+                            _llvm.GEPNoWrapFlags.none,
+                        ).result
+                        raw_a = _llvm.LoadOp(
+                            T.vec(2, i32), a_ptr, alignment=8
+                        ).result
+                    else:
+                        elem_off_a = row_off_in_inp + k_col_i32
+                        dw_off_a = elem_off_a >> c1_i32
+                        raw_a = buffer_ops.buffer_load(
+                            in_rsrc, dw_off_a, vec_width=2, dtype=i32
+                        )
                     a_frag_bf = vector.bitcast(
                         T.vec(WMMA_FRAG_VALS, in_elem_ty), raw_a
                     )

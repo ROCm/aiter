@@ -104,7 +104,10 @@ def flydsl_dynamic_per_tensor_quant(
             scale.zero_()
 
     launcher = build_dynamic_per_tensor_quant_module(
-        cols=cols, in_dtype=in_dtype, out_dtype=out_dtype
+        cols=cols,
+        in_dtype=in_dtype,
+        out_dtype=out_dtype,
+        use_ptr64=bool((rows * cols) >= (1 << 31)),
     )
 
     if stream is None:
@@ -180,7 +183,10 @@ def flydsl_per_1x32_fp4_quant(
         in_dtype = "fp16"
 
     launcher = build_per_1x32_fp4_quant_module(
-        cols=cols, in_dtype=in_dtype, shuffle_scale=False
+        cols=cols,
+        in_dtype=in_dtype,
+        shuffle_scale=False,
+        use_ptr64=bool((rows * cols) >= (1 << 31)),
     )
 
     if stream is None:
@@ -246,7 +252,10 @@ def flydsl_per_1x32_fp4_quant_hadamard(
         in_dtype = "fp16"
 
     launcher = build_per_1x32_fp4_quant_hadamard_module(
-        cols=cols, in_dtype=in_dtype, shuffle_scale=False
+        cols=cols,
+        in_dtype=in_dtype,
+        shuffle_scale=False,
+        use_ptr64=bool((rows * cols) >= (1 << 31)),
     )
 
     if stream is None:
@@ -338,7 +347,11 @@ def flydsl_per_1x32_fp4_quant_block_rotation(
     num_m_blocks = (rows + _FP4_GROUP_QUANT_BLOCK_SIZE - 1) // _FP4_GROUP_QUANT_BLOCK_SIZE
 
     launcher = build_per_1x32_fp4_quant_block_rotation_module(
-        cols=cols, in_dtype=in_dtype, rot_dtype=rot_dtype, shuffle_scale=False
+        cols=cols,
+        in_dtype=in_dtype,
+        rot_dtype=rot_dtype,
+        shuffle_scale=False,
+        use_ptr64=bool((rows * cols) >= (1 << 31)),
     )
 
     if stream is None:
@@ -453,6 +466,7 @@ def flydsl_per_1x32_fp4_quant_block_rotation_mfma(
         rot_dtype=rot_dtype,
         shuffle_scale=False,
         rot_transposed=bool(rot_transposed),
+        use_ptr64=bool((rows * cols) >= (1 << 31)),
     )
 
     if stream is None:
@@ -605,12 +619,20 @@ def flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace(
         int(sorted_ids.shape[0]) + _FP4_GROUP_QUANT_BLOCK_SIZE - 1
     ) // _FP4_GROUP_QUANT_BLOCK_SIZE
 
+    # The input gather computes an i32 element offset ``src_row * cols``; once
+    # ``rows * cols >= 2**31`` that product overflows (and the bf16 byte offset
+    # leaves the 4 GB buffer window). Only then pay for the slower 64-bit GEP +
+    # global load; otherwise keep the cheap hardware buffer load. This mirrors
+    # the wptr64 selection in the moe GEMM kernels.
+    use_ptr64 = (rows * cols) >= (1 << 31)
+
     launcher = build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module(
         cols=cols,
         in_dtype=in_dtype,
         rot_dtype=rot_dtype,
         topk=topk,
         rot_transposed=bool(rot_transposed),
+        use_ptr64=bool(use_ptr64),
     )
 
     if stream is None:
