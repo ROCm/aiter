@@ -518,9 +518,15 @@ def test_mla(
         return err, us_gluon_decode
 
     def test_absorb_decode_gluon_bh16(name):
-        # Shared bh16bn{64,128} runner. The wrapper dispatches on (nhead, kv dtype):
-        # name='bh16bn128' -> cast kv to fp8; name='bh16bn64' -> keep bf16.
+        # Shared bh16bn{64,128} runner. The wrapper dispatches on
+        # (nhead, kv dtype): name='bh16bn128' -> cast kv to fp8;
+        # name='bh16bn64' -> keep bf16. When the outer -lse/--return_lse flag is
+        # set, run the stage-1-only (DCP) path: per-GPU stage-1, no intra-GPU
+        # reducev. Host-side LSE-merge over splits validates equivalence to the
+        # unified attention reference.
         from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
+
+        is_1st_stage = return_lse
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
         q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
@@ -539,19 +545,41 @@ def test_mla(
             seq_info = kv_indptr
             use_2d_view = False
 
-        (attn_logits, attn_lse), us_decode = run_perftest(
+        if is_1st_stage:
+            # Stage-1-only: kernel writes per-split (acc, lse); host merges.
+            NUM_KV_SPLITS = 256 // batch_size
+            Dckv = v_head_dim
+            out_buf = torch.empty(
+                (batch_size, nhead, NUM_KV_SPLITS, Dckv),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+        else:
+            out_buf = out_gluon.view(batch_size, nhead, v_head_dim)
+
+        (_, lse), us_decode = run_perftest(
             mla_decode_gluon,
             q_nope,
             q_pe,
             kv_c,
-            out_gluon.view(batch_size, nhead, v_head_dim),
+            out_buf,
             page_table,
             seq_info,
             sm_scale,
             use_2d_view=use_2d_view,
             kv_scale=1.0,
             min_kv_seq_len=ctx_lens,
+            return_lse=is_1st_stage,
         )
+
+        if is_1st_stage:
+            # Host-side log-sum-exp merge across splits:
+            #   final = sum_i acc_i * exp(lse_i - max_lse) / sum_i exp(lse_i - max_lse)
+            acc_f = out_buf.float()
+            max_lse = lse.max(dim=-1, keepdim=True).values
+            w = torch.exp(lse - max_lse)
+            merged = (acc_f * w[..., None]).sum(dim=-2) / w.sum(dim=-1, keepdim=True)
+            out_gluon.copy_(merged.view(total_q, nhead, v_head_dim).to(out_dtype))
 
         err = checkAllclose(
             out_ref,
@@ -561,74 +589,15 @@ def test_mla(
         cal_diff(out_ref, out_gluon, f"out_gluon_{name}", use_fp8=(name == "bh16bn128"))
         return err, us_decode
 
-    def test_absorb_decode_gluon_bh16_dcp():
-        # DCP (Decode Context Parallel) wrapper: per-GPU stage-1 only, no
-        # intra-GPU reducev. Host-side LSE-merge over splits validates
-        # equivalence to the unified attention reference. Triggered for
-        # bf16, nhead<=16;
-        from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon_dcp
-
-        out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
-        q_pe = q[:, :, v_head_dim:].view(batch_size, nhead, qk_head_dim - v_head_dim)
-        kv_c = kv_buffer.view(-1, qk_head_dim)
-
-        if not varlen:
-            page_table = kv_indices[:total_kv].view(batch_size, ctx_lens)
-            seq_info = seq_lens_kv
-            use_2d_view = True
-        else:
-            page_table = kv_indices
-            seq_info = kv_indptr
-            use_2d_view = False
-
-        NUM_KV_SPLITS = 256 // batch_size
-        Dckv = v_head_dim
-        attn_logits = torch.empty(
-            (batch_size, nhead, NUM_KV_SPLITS, Dckv),
-            dtype=torch.bfloat16,
-            device=q.device,
-        )
-        lse = torch.empty(
-            (batch_size, nhead, NUM_KV_SPLITS),
-            dtype=torch.float32,
-            device=q.device,
-        )
-
-        _, us_decode = run_perftest(
-            mla_decode_gluon_dcp,
-            q_nope,
-            q_pe,
-            kv_c,
-            attn_logits,
-            lse,
-            page_table,
-            seq_info,
-            sm_scale,
-            use_2d_view=use_2d_view,
-            kv_scale=1.0,
-            min_kv_seq_len=ctx_lens,
-        )
-
-        # Host-side log-sum-exp merge across splits:
-        #   final = sum_i acc_i * exp(lse_i - max_lse) / sum_i exp(lse_i - max_lse)
-        acc_f = attn_logits.float()
-        max_lse = lse.max(dim=-1, keepdim=True).values
-        w = torch.exp(lse - max_lse)
-        merged = (acc_f * w[..., None]).sum(dim=-2) / w.sum(dim=-1, keepdim=True)
-        out_gluon.copy_(merged.view(total_q, nhead, v_head_dim).to(out_dtype))
-
-        err = checkAllclose(
-            out_ref,
-            out_gluon,
-            msg=f"mla_decode-absorb    [golden vs gluon_dcp]: {us_decode:>8.2f} us......",
-        )
-        cal_diff(out_ref, out_gluon, "out_gluon_dcp")
-        return err, us_decode
-
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
+    # The ASM decode baseline has no LSE kernel for these MLA configs (e.g.
+    # nhead<=16 bf16 aborts in get_heuristic_kernel_mla with lse:1); skip it
+    # entirely when -lse is set. The -lse path exercises only the Gluon
+    # stage-1/DCP kernel.
+    if return_lse:
+        pass
+    elif (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
         16,
         32,
         64,
@@ -690,8 +659,8 @@ def test_mla(
 
     # Gluon MLA bh16bn128 decode test (gfx950, bf16 Q + fp8 KV, nhead in (4,8,16),
     # batch=1, decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
-    # NUM_KV_SPLITS=256 hardcoded; kernel asserts min_kv_seq_len // 256 >= BLOCK_N*3,
-    # i.e. min_kv_seq_len >= 98304. Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
+    # NUM_KV_SPLITS=256 hardcoded; wrapper asserts min_kv_seq_len >= NUM_KV_SPLITS
+    # (=256; non-empty splits, num_iter >= 1). Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
     if (
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
@@ -702,7 +671,7 @@ def test_mla(
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
-        and ctx_lens >= 256 * 128 * 3
+        and ctx_lens >= 256
     ):
         err_gluon, us_gluon_decode = test_absorb_decode_gluon_bh16("bh16bn128")
         ret["decode:gluon_err"] = err_gluon
@@ -711,51 +680,28 @@ def test_mla(
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
 
     # Gluon MLA bh16bn64 decode test (gfx950, bf16 Q + bf16 KV, nhead in (4,8,16),
-    # batch=1, decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
-    # NUM_KV_SPLITS=256 hardcoded; kernel asserts min_kv_seq_len // 256 >= BLOCK_N*3,
-    # i.e. min_kv_seq_len >= 49152. Example: -c 3000000 -b 1 -n 16,1 -d bf16 -kvd bf16
+    # decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
+    # NUM_KV_SPLITS = max(1, 256 // batch_size); wrapper asserts
+    # min_kv_seq_len >= NUM_KV_SPLITS (non-empty splits, num_iter >= 1). Both
+    # full decode and the stage-1-only DCP path (-lse) run here, for any
+    # batch_size (e.g. B in {1, 3, 4}). Example: -c 3000000 -b 1 -n 16,1 -d bf16 -kvd bf16
     if (
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
         and kvtype == torch.bfloat16
         and nhead <= 16
         and decode_qlen == 1
-        and batch_size == 1
+        and 1 <= batch_size <= 256  # NUM_KV_SPLITS = max(1, 256 // batch_size) >= 1
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
-        and ctx_lens >= 256 * 64 * 3
+        and ctx_lens >= (256 // batch_size)
     ):
         err_gluon, us_gluon_decode = test_absorb_decode_gluon_bh16("bh16bn64")
         ret["decode:gluon_err"] = err_gluon
         ret["decode:gluon_576"] = us_gluon_decode
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
-
-    # Gluon MLA dcp_bh16 decode test (gfx950, bf16 Q + bf16 KV, nhead<=16,
-    # decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
-    # NUM_KV_SPLITS = 256 // batch_size (floor); for B not dividing 256
-    # (e.g., 3, 5, 6, 7) total WGs is slightly under 256 (a few CUs idle for
-    # the wave). Wrapper asserts min_kv_seq_len >= NUM_KV_SPLITS so num_iter
-    # >= 1 per split. Target operating window is B * ctx_lens in 10K..100K.
-    # Example: -c 10000 -b 1 -n 16,1 -d bf16 -kvd bf16  (num_iter=1 boundary).
-    if (
-        get_gfx() == "gfx950"
-        and dtype == torch.bfloat16
-        and kvtype == torch.bfloat16
-        and nhead <= 16
-        and decode_qlen == 1
-        and 1 <= batch_size <= 256  # NUM_KV_SPLITS = 256 // batch_size must be >= 1
-        and v_head_dim == 512
-        and (qk_head_dim - v_head_dim) == 64
-        and page_size == 1
-        and ctx_lens >= (256 // batch_size)
-    ):
-        err_gluon_dcp, us_gluon_dcp_decode = test_absorb_decode_gluon_bh16_dcp()
-        ret["decode:gluon_dcp_err"] = err_gluon_dcp
-        ret["decode:gluon_dcp_576"] = us_gluon_dcp_decode
-        ret["decode:gluon_dcp_TFLOPS"] = flops / us_gluon_dcp_decode / 1e6
-        ret["decode:gluon_dcp_TB/s"] = bytes / us_gluon_dcp_decode / 1e6
 
     return ret
 
