@@ -165,6 +165,12 @@ class TunerCommon:
             default=defaults["timeout"],
             help="timeout for task group",
         )
+        self.parser.add_argument(
+            "--e2e_tune",
+            action="store_true",
+            required=False,
+            help="Run an extra round of e2e tuning after main tuning is done, using production-op benchmark as the indicator",
+        )
 
     def parse_args(self):
         return self.parser.parse_args()

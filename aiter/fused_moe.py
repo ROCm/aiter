@@ -379,6 +379,22 @@ def fused_moe_(
         q_type2=q_type2,
     )
 
+    if metadata.stage0 is not None:
+        return metadata.stage0(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            activation,
+            quant_type,
+            w1_scale,
+            w2_scale,
+            expert_mask,
+            num_local_tokens,
+            moe_sorting_dispatch_policy,
+        )
+
     if metadata.run_1stage:
         block_size_M1 = metadata.block_m if block_size_M is None else block_size_M
         block_size_M2 = block_size_M1
@@ -976,6 +992,7 @@ class MOEMetadata:
     has_bias: bool = False
     use_non_temporal_load: bool = True
     fuse_fp4_quant: bool = False
+    stage0: Callable = None
 
     def __post_init__(self):
         if self.block_m2 is None:
@@ -1414,6 +1431,20 @@ def get_2stage_cfgs(
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
+
+    if kernelName1.startswith("fused_moe_asmjit_aot"):
+        from aiter.fused_moe_asmjit_aot import fused_moe_asmjit_aot
+
+        return MOEMetadata(
+            None,
+            None,
+            block_m,
+            ksplit,
+            run_1stage,
+            stage0=functools.partial(
+                fused_moe_asmjit_aot, config_string=kernelName1.split("__")[1]
+            ),
+        )
 
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:

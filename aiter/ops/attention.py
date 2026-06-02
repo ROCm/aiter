@@ -500,6 +500,245 @@ def pa_persistent_fwd(
 import os as _os
 
 
+@compile_ops("module_pa_fp8_gqa", fc_name="pa_fp8_decode_v1")
+def _pa_fp8_decode_v1(
+    output: torch.Tensor,
+    tmp_out: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    p_scale: torch.Tensor,
+    p_scale_inv: torch.Tensor,
+    num_seqs: int,
+    num_kv_heads: int,
+    num_q_heads: int,
+    head_size: int,
+    block_size: int,
+    mtp: int,
+    num_fat_partitions: int,
+    num_kblocks_per_fat_part: int,
+    scale: float,
+) -> None: ...
+
+
+@compile_ops("module_pa_fp8_gqa", fc_name="pa_fp8_decode_v2")
+def _pa_fp8_decode_v2(
+    output: torch.Tensor,
+    tmp_out: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    p_scale: torch.Tensor,
+    p_scale_inv: torch.Tensor,
+    num_seqs: int,
+    num_kv_heads: int,
+    num_q_heads: int,
+    head_size: int,
+    block_size: int,
+    mtp: int,
+    num_fat_partitions: int,
+    num_kblocks_per_fat_part: int,
+    scale: float,
+) -> None: ...
+
+
+_PA_FP8_DEFAULT_P_SCALE = 256.0
+
+
+def _pa_fp8_p_scale_tensors(
+    p_scale: Optional[torch.Tensor],
+    p_scale_inv: Optional[torch.Tensor],
+    device: torch.device,
+    num_q_heads: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if p_scale is None and p_scale_inv is None:
+        p = torch.full(
+            (num_q_heads,), _PA_FP8_DEFAULT_P_SCALE,
+            dtype=torch.float32, device=device)
+        p_inv = torch.full(
+            (num_q_heads,), 1.0 / _PA_FP8_DEFAULT_P_SCALE,
+            dtype=torch.float32, device=device)
+        return p, p_inv
+    if p_scale is None or p_scale_inv is None:
+        raise ValueError("p_scale and p_scale_inv must either both be set or both be None")
+    if p_scale.numel() == 1 and p_scale_inv.numel() == 1:
+        return (
+            p_scale.to(device=device, dtype=torch.float32).reshape(1).expand(num_q_heads).contiguous(),
+            p_scale_inv.to(device=device, dtype=torch.float32).reshape(1).expand(num_q_heads).contiguous(),
+        )
+    return p_scale, p_scale_inv
+
+
+def _pa_fp8_v1_splits(num_seqs: int, ctx_len: int, cap: int = 128) -> int:
+    total_kblocks = (ctx_len + 255) // 256
+    if num_seqs <= 16:
+        nf = min(80, max(40, total_kblocks // 4))
+    elif num_seqs <= 32:
+        nf = 48 if ctx_len >= 100_000 else 40
+    elif num_seqs <= 64:
+        nf = 48 if ctx_len >= 100_000 else 28
+    elif num_seqs <= 128:
+        nf = 20 if ctx_len >= 100_000 else 12
+    else:
+        nf = 14
+    return max(1, min(nf, total_kblocks, cap))
+
+
+def _pa_fp8_v2_splits(num_seqs: int, ctx_len: int, mtp: int) -> int:
+    total_kblocks = (ctx_len + 255) // 256
+    if mtp == 1:
+        if ctx_len <= 1024:
+            nf = total_kblocks
+        elif num_seqs <= 16:
+            nf = 64
+        elif num_seqs <= 32:
+            nf = 40 if ctx_len >= 100_000 else (26 if ctx_len >= 32_000 else 32)
+        elif num_seqs <= 64:
+            nf = 47 if ctx_len >= 100_000 else (26 if ctx_len >= 32_000 else 32)
+        elif num_seqs <= 128:
+            nf = 20
+        else:
+            nf = 20 if ctx_len >= 100_000 else 10
+    elif num_seqs <= 32:
+        nf = _pa_fp8_v1_splits(num_seqs, ctx_len)
+    elif 64 <= num_seqs <= 96 and ctx_len >= 32_000:
+        nf = 10
+    elif 130 <= num_seqs <= 200:
+        nf = 7
+    else:
+        nf = 5
+    return max(1, min(nf, total_kblocks))
+
+
+def pa_fp8_gqa_decode(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    *,
+    scale: float,
+    max_context_len: int,
+    partition_size: int,
+    mtp: int,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    p_scale: Optional[torch.Tensor] = None,
+    p_scale_inv: Optional[torch.Tensor] = None,
+) -> None:
+    """Project-internal HIP FP8 GQA decode path."""
+    num_query_tokens, num_q_heads, head_size = query.shape
+    _, num_kv_heads, _, block_size, _ = key_cache.shape
+    num_seqs = num_query_tokens // mtp
+    assert num_query_tokens % mtp == 0
+    assert num_kv_heads == 1 and num_q_heads == 8
+    assert head_size == 128 and block_size == 16 and partition_size == 256
+
+    p_scale, p_scale_inv = _pa_fp8_p_scale_tensors(
+        p_scale, p_scale_inv, query.device, num_q_heads)
+
+    total_kblocks = (max_context_len + partition_size - 1) // partition_size
+    use_v2 = num_seqs >= 16 if mtp == 1 else num_seqs > 16
+    num_fat_partitions = (
+        _pa_fp8_v2_splits(num_seqs, max_context_len, mtp)
+        if use_v2
+        else _pa_fp8_v1_splits(num_seqs, max_context_len)
+    )
+    num_fat_partitions = min(num_fat_partitions, max(1, total_kblocks))
+    num_kblocks_per_fat_part = (
+        total_kblocks + num_fat_partitions - 1) // num_fat_partitions
+    num_fat_partitions = max(
+        1, (total_kblocks + num_kblocks_per_fat_part - 1) // num_kblocks_per_fat_part)
+
+    exp_sums = torch.empty(
+        (num_query_tokens, num_q_heads, num_fat_partitions),
+        dtype=dtypes.fp32,
+        device=out.device,
+    )
+    max_logits = torch.empty_like(exp_sums)
+    tmp_out = torch.empty(
+        (num_query_tokens, num_q_heads, num_fat_partitions, head_size),
+        dtype=out.dtype,
+        device=out.device,
+    )
+    decode = _pa_fp8_decode_v2 if use_v2 else _pa_fp8_decode_v1
+    decode(
+        out,
+        tmp_out,
+        exp_sums,
+        max_logits,
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lens,
+        q_scale,
+        k_scale,
+        v_scale,
+        p_scale,
+        p_scale_inv,
+        num_seqs,
+        num_kv_heads,
+        num_q_heads,
+        head_size,
+        block_size,
+        mtp,
+        num_fat_partitions,
+        num_kblocks_per_fat_part,
+        scale,
+    )
+
+
+def _pa_fp8_gqa_eligible(
+    query, key_cache, value_cache, out,
+    num_kv_heads, block_size, partition_size, mtp,
+    alibi_slopes, fp8_out_scale, q_scale, k_scale, v_scale,
+    p_scale=None, p_scale_inv=None,
+):
+    """Match the project-internal FP8 GQA HIP specialisation."""
+    if _os.environ.get("AITER_DISABLE_PA_FP8_GQA") == "1":
+        return False
+    fp8 = dtypes.fp8
+    return (
+        query.dtype == fp8
+        and key_cache.dtype == fp8
+        and value_cache.dtype == fp8
+        and out.dtype in (dtypes.bf16, dtypes.fp16)
+        and query.dim() == 3
+        and key_cache.dim() == 5
+        and value_cache.dim() in (4, 5)
+        and num_kv_heads == 1
+        and query.shape[1] == 8
+        and query.shape[2] == 128
+        and block_size == 16
+        and partition_size == 256
+        and mtp in (1, 2)
+        and alibi_slopes is None
+        and fp8_out_scale is None
+        and q_scale is not None
+        and k_scale is not None
+        and v_scale is not None
+        and ((p_scale is None and p_scale_inv is None)
+             or (p_scale is not None and p_scale_inv is not None))
+    )
+
+
 @compile_ops("module_pa_gqa_v5")
 def pa_gqa_v5_decode(
     out: torch.Tensor,

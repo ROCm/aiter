@@ -22,7 +22,12 @@ import torch
 
 import aiter as ops
 from aiter import dtypes
-from aiter.ops.attention import _pa_gqa_v5_eligible, pa_gqa_v5_decode
+from aiter.ops.attention import (
+    _pa_fp8_gqa_eligible,
+    _pa_gqa_v5_eligible,
+    pa_fp8_gqa_decode,
+    pa_gqa_v5_decode,
+)
 
 
 # from vllm.utils import is_hip
@@ -245,10 +250,24 @@ class PagedAttention:
         fp8_out_scale=None,
         mtp: int = 1,
         output_dtype: torch.dtype = None,
+        p_scale: Optional[torch.Tensor] = None,
+        p_scale_inv: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Whether to use rocm custom paged attention or not
         num_query_tokens, num_heads, head_size = query.shape
         block_size = key_cache.size(3)
+        if (
+            output_dtype is None
+            and query.dtype == dtypes.fp8
+            and key_cache.dtype == dtypes.fp8
+            and value_cache.dtype == dtypes.fp8
+            and num_kv_heads == 1
+            and num_heads == 8
+            and head_size == 128
+            and block_size == 16
+            and mtp in (1, 2)
+        ):
+            output_dtype = dtypes.bf16
         output = torch.empty_like(query, dtype=output_dtype)
         cpa_fp8_out = False
         if fp8_out_scale is not None:
@@ -260,6 +279,42 @@ class PagedAttention:
         ) // _PARTITION_SIZE_ROCM
         if scale is None:
             scale = float(1.0 / (head_size**0.5))
+
+        # ---- FP8 GQA HIP fast path ----
+        # Project-internal HIP kernel for the default FP8 GQA decode config:
+        # Q/K/V fp8_e4m3fnuz, 8Q/1KV heads, head=128, block=16, mtp in
+        # {1,2}, Q/K per-token scale, V per-head scale, and P scale
+        # (default 256 when not explicitly provided).
+        # Disable via $AITER_DISABLE_PA_FP8_GQA=1.
+        if _pa_fp8_gqa_eligible(
+            query, key_cache, value_cache, output,
+            num_kv_heads, block_size, _PARTITION_SIZE_ROCM, mtp,
+            alibi_slopes, fp8_out_scale, q_scale, k_scale, v_scale,
+            p_scale, p_scale_inv,
+        ):
+            pa_fp8_gqa_decode(
+                output,
+                query,
+                key_cache,
+                value_cache,
+                block_tables,
+                seq_lens,
+                scale=scale,
+                max_context_len=max_seq_len,
+                partition_size=_PARTITION_SIZE_ROCM,
+                mtp=mtp,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                p_scale=p_scale,
+                p_scale_inv=p_scale_inv,
+            )
+            return output
+
+        if p_scale is not None or p_scale_inv is not None:
+            raise NotImplementedError(
+                "p_scale/p_scale_inv are only supported by the FP8 GQA fast path"
+            )
 
         # ---- pa_gqa v5 .co fast path ----
         # Hand-optimised for the default decode config (bf16, num_kv_heads=1,

@@ -1382,6 +1382,24 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_pa_fp8_gqa": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/pa_fp8_gqa/pa_fp8_extension.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-mllvm'",
+            "'-amdgpu-early-inline-all=true'",
+            "'-mllvm'",
+            "'-amdgpu-function-calls=false'",
+            "'-mllvm'",
+            "'--enable-newgvn=true'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_mla_metadata": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_metadata_pybind.cu'",
