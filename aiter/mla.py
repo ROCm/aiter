@@ -226,41 +226,62 @@ def mla_decode_fwd(
         if nhead in [8, 16] and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
 
+        # gfx1250 (mi400) MLA shader writes R as fp32; the bf16 `o.view(...)`
+        # alias optimization that gfx942/gfx950 use makes splitData only half
+        # the required size on gfx1250 and causes GPU page faults. Force a
+        # standalone fp32 splitData on gfx1250 and let the existing stage2
+        # reduction project it back to bf16 `o`.
+        _is_gfx1250 = get_gfx() == "gfx1250"
+        _can_alias_o_as_logits = (
+            num_kv_splits == 1
+            and (
+                q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+            )
+            and not _is_gfx1250
+        )
+
+        # gfx1250 (mi400) stage1 asm kernel may not write every element of the
+        # split buffers (e.g. OOB page padding), and the downstream finiteness
+        # check inspects the full logits/lse tensors. Zero-initialize on gfx1250
+        # so uninitialized memory cannot surface as transient NaN/Inf; other
+        # archs keep torch.empty to avoid the memset cost.
+        _alloc_split = torch.zeros if _is_gfx1250 else torch.empty
         logits = (
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
-            if (
-                num_kv_splits == 1
-                and (
-                    q.dtype == dtypes.fp8
-                    or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
-                    or (
-                        q.dtype == dtypes.bf16
-                        and kv_buffer.dtype == dtypes.bf16
-                        and nhead == 32
-                    )
-                )
-            )
-            else torch.empty(
+            if _can_alias_o_as_logits
+            else _alloc_split(
                 (total_s, num_kv_splits, nhead, v_head_dim),
                 dtype=dtypes.fp32,
                 device=device,
             )
         )
 
-        attn_lse = torch.empty(
+        attn_lse = _alloc_split(
             (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
         )
         final_lse = (
-            torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+            _alloc_split((total_s, nhead), dtype=dtypes.fp32, device=device)
             if return_lse
             else None
         )
+
+        kv_indptr_stage1 = kv_indptr
+        if _is_gfx1250:
+            kv_seq_lens = kv_indptr[1:] - kv_indptr[:-1]
+            kv_page_counts = torch.div(
+                kv_seq_lens + page_size - 1,
+                page_size,
+                rounding_mode="floor",
+            )
+            kv_indptr_stage1 = torch.empty_like(kv_indptr)
+            kv_indptr_stage1[0] = 0
+            kv_indptr_stage1[1:] = torch.cumsum(kv_page_counts, dim=0)
 
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
             qo_indptr,
-            kv_indptr,
+            kv_indptr_stage1,
             kv_indices,
             kv_last_page_lens,
             num_kv_splits_indptr,
@@ -279,17 +300,17 @@ def mla_decode_fwd(
             kv_scale,
         )
 
-        if num_kv_splits == 1 and (
-            q.dtype == dtypes.fp8
-            or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
-            or (
-                q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
-                and nhead == 32
-            )
-        ):
+        if _can_alias_o_as_logits:
             lse = final_lse if return_lse else attn_lse
             return logits.view(total_s, nhead, v_head_dim), lse
+
+        if _is_gfx1250:
+            if num_kv_splits == 1:
+                o.copy_(logits[:, 0].to(o.dtype))
+                if final_lse is not None:
+                    final_lse.copy_(attn_lse[:, 0, :, 0])
+
+            return logits, final_lse if return_lse else None
 
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
