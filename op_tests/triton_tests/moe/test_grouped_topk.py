@@ -1,5 +1,5 @@
-"""Unit tests for ATOM's single-fused Triton grouped-top-k routing kernel
-(``atom.model_ops.grouped_topk_triton.grouped_topk``).
+"""Unit tests for aiter's single-fused Triton grouped-top-k routing kernel
+(``aiter.ops.triton.moe.moe_routing.topk.grouped_topk``).
 
 Structured after ``test_moe_routing.py``:
   * Reference uses aiter's torch grouped-topk
@@ -26,12 +26,7 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     compute_expt_data_torch,
 )
 
-# grouped_topk lives in ATOM; skip the whole module if ATOM isn't importable
-# in this environment (e.g. aiter-only CI).
-atom_grouped_topk = pytest.importorskip(
-    "atom.model_ops.grouped_topk_triton"
-).grouped_topk
-
+from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
 # --------------------------------------------------------------------------
 # comparison helpers (copied from test_moe_routing.py for self-containment)
@@ -154,7 +149,15 @@ def _ref_contiguous(
 
 
 def _ref_arbitrary_grouped(
-    logits, expert_group, k, num_expert_group, topk_group, score_mode, bias, renorm, scale
+    logits,
+    expert_group,
+    k,
+    num_expert_group,
+    topk_group,
+    score_mode,
+    bias,
+    renorm,
+    scale,
 ):
     """General reference honoring an arbitrary expert->group table (equal-size
     groups). Used for the non-contiguous mapping case where the aiter refs
@@ -181,7 +184,9 @@ def _ref_arbitrary_grouped(
             group_scores[:, g] = sub.max(dim=-1).values
 
     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False).indices
-    group_sel = torch.zeros((nt, num_expert_group), device=logits.device, dtype=torch.bool)
+    group_sel = torch.zeros(
+        (nt, num_expert_group), device=logits.device, dtype=torch.bool
+    )
     group_sel.scatter_(1, group_idx, True)
     # expert keep mask via group table lookup
     expert_keep = group_sel[:, expert_group.long()]  # (nt, ne)
@@ -210,9 +215,9 @@ def _assert_selection_matches(ref_ids, ref_w, tri_ids, tri_w):
     identical and gathered weights close."""
     ref_ids_s, ref_w_s = _row_sort_by_id(ref_ids.cpu(), ref_w.cpu())
     tri_ids_s, tri_w_s = _row_sort_by_id(tri_ids.cpu().long(), tri_w.cpu().float())
-    assert torch.equal(ref_ids_s, tri_ids_s), (
-        f"selected expert ids differ:\nref={ref_ids_s}\ntri={tri_ids_s}"
-    )
+    assert torch.equal(
+        ref_ids_s, tri_ids_s
+    ), f"selected expert ids differ:\nref={ref_ids_s}\ntri={tri_ids_s}"
     assert_close(ref_w_s, tri_w_s, 2e-2, 4e-3, description="weights")
 
 
@@ -260,8 +265,12 @@ def _check_routing_data_bucket(
     ref_hist, _, _, _, ref_expt_data = ref_pack
     assert_equal(ref_hist, tri_routing_data.expt_hist)
     assert_equal(ref_expt_data.hist, tri_routing_data.expt_data.hist)
-    assert_equal(ref_expt_data.token_offs_raw, tri_routing_data.expt_data.token_offs_raw)
-    assert_equal(ref_expt_data.token_offs_pad, tri_routing_data.expt_data.token_offs_pad)
+    assert_equal(
+        ref_expt_data.token_offs_raw, tri_routing_data.expt_data.token_offs_raw
+    )
+    assert_equal(
+        ref_expt_data.token_offs_pad, tri_routing_data.expt_data.token_offs_pad
+    )
     assert_equal(ref_expt_data.block_pid_map, tri_routing_data.expt_data.block_pid_map)
 
     n_tokens, n_expts_act = topk_ids.shape
@@ -269,7 +278,9 @@ def _check_routing_data_bucket(
     n_expts_tot = ref_hist.numel()
 
     iota = torch.arange(n_gates, dtype=torch.int32, device=tri_gather.device)
-    assert torch.equal(tri_scatter[tri_gather.long()], iota), "scatter[gather[j]] != j"
+    assert torch.equal(
+        tri_scatter.long()[tri_gather.long()], iota
+    ), "scatter[gather[j]] != j"
 
     flat_ids = topk_ids.reshape(-1).cpu().tolist()
     flat_w = topk_weights.reshape(-1).float().cpu().tolist()
@@ -368,7 +379,7 @@ def test_grouped_topk_kernel(
         renorm,
         scale,
     )
-    y_vals, y_indx, bitmatrix = atom_grouped_topk(
+    y_vals, y_indx, bitmatrix = grouped_topk(
         logits,
         n_expts_act,
         num_expert_group=num_expert_group,
@@ -425,7 +436,7 @@ def test_grouped_topk_arbitrary_group(
         renorm,
         scale,
     )
-    y_vals, y_indx, bitmatrix = atom_grouped_topk(
+    y_vals, y_indx, bitmatrix = grouped_topk(
         logits,
         n_expts_act,
         num_expert_group=num_expert_group,
@@ -463,7 +474,7 @@ def test_routing_a8w4_grouped(
 
     # The selection the kernel makes (deterministic for fixed inputs); used as
     # ground truth for the sort/scatter pipeline check.
-    y_vals, y_indx, _ = atom_grouped_topk(
+    y_vals, y_indx, _ = grouped_topk(
         logits,
         n_expts_act,
         num_expert_group=num_expert_group,
@@ -522,10 +533,16 @@ def test_grouped_topk_shared_expert(
     score_mode, renorm, scale = "sqrtsoftplus", True, 2.5
 
     ref_w, ref_ids = _ref_contiguous(
-        logits.clone(), n_expts_act, num_expert_group, topk_group,
-        score_mode, bias, renorm, scale,
+        logits.clone(),
+        n_expts_act,
+        num_expert_group,
+        topk_group,
+        score_mode,
+        bias,
+        renorm,
+        scale,
     )
-    y_vals, y_indx, bitmatrix = atom_grouped_topk(
+    y_vals, y_indx, bitmatrix = grouped_topk(
         logits,
         n_expts_act,
         num_expert_group=num_expert_group,
@@ -600,4 +617,4 @@ def test_routing_a8w4_grouped_shared(
 
     n_gates = n_tokens * (n_expts_act + n_shared)
     iota = torch.arange(n_gates, dtype=torch.int32, device=gather.device)
-    assert torch.equal(scatter[gather.long()], iota), "scatter[gather[j]] != j"
+    assert torch.equal(scatter.long()[gather.long()], iota), "scatter[gather[j]] != j"
