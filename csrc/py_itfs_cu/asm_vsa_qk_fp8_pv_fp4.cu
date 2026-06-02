@@ -27,6 +27,20 @@ constexpr int kNumCus  = 256;       // MI355X CU count
 constexpr int kOcc     = 2;         // waves/EU target -> 2 workgroups/CU
 constexpr int kGridCap = kNumCus * kOcc;   // 512 outer waves
 
+// The .co is built from a single templated implementation with three
+// NUM_HEADS_T instantiations exposed as separate __global__ shims:
+//     vsa_qk_fp8_pv_fp4_kernel_h1   (NUM_HEADS=1)
+//     vsa_qk_fp8_pv_fp4_kernel_h2   (NUM_HEADS=2)
+//     vsa_qk_fp8_pv_fp4_kernel_h4   (NUM_HEADS=4)
+// NUM_HEADS appears in exactly one place inside the kernel:
+//     total_tiles = B * NUM_HEADS * num_q_blks
+// so the three variants share IDENTICAL SASS / VGPR / LDS footprint;
+// the only difference is the immediate operand of one IMUL.
+// The launcher picks the variant whose NUM_HEADS is the largest divisor
+// of BH in {1, 2, 4}, and forwards B_eff = BH / NUM_HEADS, so
+// total_tiles = B_eff * NUM_HEADS * num_q_blks == BH * num_q_blks
+// for arbitrary H without changing per-tile work.
+
 // ---------------------------------------------------------------------------
 // 400-byte kernarg layout — must match the kernel signature
 //   __global__ void vsa_qk_fp8_pv_fp4_kernel(
@@ -79,36 +93,51 @@ static_assert(sizeof(KernelArgs) == 400,
 // ---------------------------------------------------------------------------
 class VsaQkFp8PvFp4AsmKernel {
    public:
-    VsaQkFp8PvFp4AsmKernel(const char* name, const char* hsaco) {
+    // Loads ONE .co containing all three NUM_HEADS_T variants
+    // (`<base>_h1`, `<base>_h2`, `<base>_h4`).  The selected entry-point
+    // is then picked per call by `func_for_bh(BH)`.
+    VsaQkFp8PvFp4AsmKernel(const char* base_name, const char* hsaco) {
         const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
         AITER_CHECK(AITER_ASM_DIR != nullptr,
                     "AITER_ASM_DIR not set (needed to locate ", hsaco, ")");
-        // AITER_ASM_DIR is typically "<root>/hsa/" (no trailing arch).
-        // Insert the GPU arch sub-dir so this works regardless of how the
-        // env-var is exported by aiter.jit.core.
         const std::string full_path =
             std::string(AITER_ASM_DIR) + "/gfx950/" + hsaco;
         std::cout << "[aiter] hipModuleLoad: " << full_path
-                  << " GetFunction: " << name;
+                  << " GetFunction: " << base_name << "_h{1,2,4}";
         HIP_CALL(hipModuleLoad(&module_, full_path.c_str()));
-        HIP_CALL(hipModuleGetFunction(&kernel_func_, module_, name));
+
+        const std::string b = base_name;
+        HIP_CALL(hipModuleGetFunction(&func_h1_, module_, (b + "_h1").c_str()));
+        HIP_CALL(hipModuleGetFunction(&func_h2_, module_, (b + "_h2").c_str()));
+        HIP_CALL(hipModuleGetFunction(&func_h4_, module_, (b + "_h4").c_str()));
         std::cout << " Success" << std::endl;
     }
 
     ~VsaQkFp8PvFp4AsmKernel() { HIP_CALL(hipModuleUnload(module_)); }
 
-    void launch(void*           args,
-                size_t          arg_size,
-                int             gdx,
-                int             bdx,
-                int             lds_bytes,
-                hipStream_t     stream) {
+    // Pick the variant whose NUM_HEADS is the largest divisor of BH
+    // in {1, 2, 4}, and return both the function handle and the
+    // corresponding NUM_HEADS so the caller can derive B_eff.
+    struct Selected { hipFunction_t func; int num_heads; };
+    Selected select_for_bh(int64_t BH) const {
+        if (BH % 4 == 0) return {func_h4_, 4};
+        if (BH % 2 == 0) return {func_h2_, 2};
+        return {func_h1_, 1};
+    }
+
+    static void launch_one(hipFunction_t   func,
+                           void*           args,
+                           size_t          arg_size,
+                           int             gdx,
+                           int             bdx,
+                           int             lds_bytes,
+                           hipStream_t     stream) {
         void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
                           args,
                           HIP_LAUNCH_PARAM_BUFFER_SIZE,
                           &arg_size,
                           HIP_LAUNCH_PARAM_END};
-        HIP_CALL(hipModuleLaunchKernel(kernel_func_,
+        HIP_CALL(hipModuleLaunchKernel(func,
                                        gdx, 1, 1,
                                        bdx, 1, 1,
                                        lds_bytes,    // dynamic LDS
@@ -118,8 +147,10 @@ class VsaQkFp8PvFp4AsmKernel {
     }
 
    private:
-    hipModule_t   module_      = nullptr;
-    hipFunction_t kernel_func_ = nullptr;
+    hipModule_t   module_  = nullptr;
+    hipFunction_t func_h1_ = nullptr;
+    hipFunction_t func_h2_ = nullptr;
+    hipFunction_t func_h4_ = nullptr;
 };
 
 }  // namespace
@@ -166,8 +197,17 @@ void vsa_qk_fp8_pv_fp4(const torch::Tensor& q,
                             counters.numel() * sizeof(int32_t),
                             stream));
 
+    // Pick the kernel variant that exactly divides BH (see Selected{}
+    // doc in VsaQkFp8PvFp4AsmKernel above).  B_eff = BH / NUM_HEADS so
+    // the kernel's `total_tiles = B * NUM_HEADS * num_q_blks` evaluates
+    // to BH * num_q_blks regardless of the user's real (B, H) split.
+    static VsaQkFp8PvFp4AsmKernel impl("vsa_qk_fp8_pv_fp4_kernel",
+                                       "vsa/vsa_qk_fp8_pv_fp4.co");
+    const auto picked    = impl.select_for_bh(BH);
+    const int32_t B_eff  = static_cast<int32_t>(BH / picked.num_heads);
+
     KernelArgs a{};
-    a.B                    = static_cast<int32_t>(B);
+    a.B                    = B_eff;
     a.T                    = static_cast<int32_t>(T);
     a.num_q_blks           = static_cast<int32_t>(num_q_blks);
     a.max_kv_blks          = static_cast<int32_t>(max_kv);
@@ -187,11 +227,9 @@ void vsa_qk_fp8_pv_fp4(const torch::Tensor& q,
     a.s_counter            = reinterpret_cast<int32_t*>(counters.data_ptr()) + 1;
     a.n_dense              = static_cast<int32_t>(n_dense);
 
-    static VsaQkFp8PvFp4AsmKernel impl("vsa_qk_fp8_pv_fp4_kernel",
-                                       "vsa/vsa_qk_fp8_pv_fp4.co");
-
     const int grid_x = (total_tiles < kGridCap)
                            ? static_cast<int>(total_tiles)
                            : kGridCap;
-    impl.launch(&a, sizeof(a), grid_x, kBlockX, kLdsBytes, stream);
+    VsaQkFp8PvFp4AsmKernel::launch_one(
+        picked.func, &a, sizeof(a), grid_x, kBlockX, kLdsBytes, stream);
 }
