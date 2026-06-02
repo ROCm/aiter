@@ -6,7 +6,7 @@
 Background
 ----------
 ``fused_moe`` historically used ``M = topk_ids.shape[0]`` for kernel-config
-tier lookup via ``get_padded_M``. Under DeepEP / Mori low-latency dispatch,
+tier lookup via ``get_padded_M``. Under Mori low-latency dispatch,
 ``topk_ids.shape[0]`` is the *padded* buffer size
 (``num_max_dispatch_tokens_per_rank * world_size``) and tells nothing about
 the real workload, which pegs the lookup at the worst-case tier
