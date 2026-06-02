@@ -169,7 +169,7 @@ class MLAConfig:
                 QK -> FP8-FP4 scaled WMMA (Q scales with all 1.0 in e8m0)
                 PV -> BF16 WMMA (downcast P, unpack and upcast V and multiply with V_scales)
             A4W4:
-                QK -> FP4-FP4 scaled WMMA 
+                QK -> FP4-FP4 scaled WMMA
                 PV -> BF16 WMMA (downcast P, unpack and upcast V and multiply with V_scales)
         """
 
