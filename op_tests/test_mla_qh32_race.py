@@ -255,9 +255,13 @@ def test_determinism(inp, iters):
 def test_correctness(inp, batch_size, ctx_len, nhead, kv_lora_rank, qk_rope_head_dim, dtype, kvtype):
     # The kernel is only correct for page_size=1; blk>1 has a known addressing bug.
     # Build separate inputs at page_size=1 for the correctness comparison.
-    print("\n[correctness] comparing kernel output to PyTorch fp32 reference (page_size=1)...")
+    # Run the kernel twice and use the SECOND result: the race only fires after the
+    # kernel has been run at least once (cold vs warm GPU scheduling), so the first
+    # run is misleadingly clean. The second run reflects steady-state behavior.
+    print("\n[correctness] comparing kernel output to PyTorch fp32 reference (page_size=1, warm run)...")
     ref_inp = build_inputs(batch_size, ctx_len, nhead, kv_lora_rank, qk_rope_head_dim,
                            page_size=1, decode_qlen=1, dtype=dtype, kvtype=kvtype)
+    run_kernel(ref_inp)   # warm-up — discard
     out_asm = run_kernel(ref_inp)
     out_ref = reference_mla(
         ref_inp["q_fp8"],
