@@ -62,7 +62,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              double eps,
                              int64_t reg_ptr,
                              int64_t reg_bytes,
-                             bool use_1stage);
+                             bool use_1stage,
+                             bool use_new = true);
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    const aiter_tensor_t& inp,
                                    const aiter_tensor_t& res_inp,

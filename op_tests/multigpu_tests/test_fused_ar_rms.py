@@ -50,6 +50,7 @@ def fused_ar_rmsnorm(
     withGraph=False,
     distributed_init_method: Optional[str] = None,
     post_per_token_quant: bool = False,
+    use_new: bool = True,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -77,7 +78,7 @@ def fused_ar_rmsnorm(
             with torch.cuda.graph(graph, stream=gc.stream):
                 if not post_per_token_quant:
                     out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
-                        x, x, weight, eps
+                        x, x, weight, eps, use_new=use_new
                     )
                 else:
                     out, res_out, scale_out = (
@@ -94,16 +95,16 @@ def fused_ar_rmsnorm(
 
         _, us = run_ca()
         if not post_per_token_quant:
-            out = (out, us)
+            out = (rankID, out.cpu(), us)
         else:
-            out = (out.float() * scale_out, us)
+            out = (rankID, (out.float() * scale_out).cpu(), us)
     else:
 
         @perftest()
         def run_ca(x):
             if not post_per_token_quant:
                 out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
-                    x, x, weight, eps
+                    x, x, weight, eps, use_new=use_new
                 )
                 return out
             else:
@@ -114,11 +115,11 @@ def fused_ar_rmsnorm(
                 )
                 return out, scale_out
 
+        result, us = run_ca(x)
         if not post_per_token_quant:
-            out = run_ca(x)
+            out = (rankID, result.cpu(), us)
         else:
-            out = run_ca(x)
-            out = (out[0][0].float() * out[0][1], out[1])
+            out = (rankID, (result[0].float() * result[1]).cpu(), us)
 
     # destroy
     if dist.is_initialized():
@@ -317,6 +318,7 @@ def test_fused_ar_rmsnorm(
     withGraph=False,
     distributed_init_method: Optional[str] = None,
     post_per_token_quant: bool = False,
+    use_new: bool = True,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -348,6 +350,7 @@ def test_fused_ar_rmsnorm(
                     withGraph,
                     distributed_init_method,
                     post_per_token_quant,
+                    use_new,
                 ),
             )
         )
@@ -366,20 +369,23 @@ def test_fused_ar_rmsnorm(
         cpu_rslt.append(host_rslt)
 
     rets = [el.get() for el in rets]
-    all_us = [us for _, us in rets]
+    all_us = [us for _, _, us in rets]
     atol = 5e-2 if post_per_token_quant else 1e-2
     rtol = atol
     max_err = 0.0
-    for out, us in rets:
-        msg = f"test_fused_ar_rmsnorm: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
-        # print(cpu_rslt[out.device.index])
+    for rank_idx, out, us in rets:
+        msg = (
+            f"test_fused_ar_rmsnorm: {shape=} {dtype=} {withGraph=} "
+            f"{use_new=} {us:>8.2f}"
+        )
         err = checkAllclose(
-            cpu_rslt[out.device.index], out.to(ref), msg=msg, atol=atol, rtol=rtol
+            cpu_rslt[rank_idx], out.to(ref), msg=msg, atol=atol, rtol=rtol
         )
         max_err = max(max_err, err)
         # checkAllclose(ref, out.to(ref), msg=msg)
     suffix = "quant" if post_per_token_quant else "fused"
     return {
+        "use_new": use_new,
         f"{suffix}_min_us": min(all_us),
         f"{suffix}_max_us": max(all_us),
         f"{suffix}_err": max_err,
@@ -400,6 +406,7 @@ l_shape = [
 l_tp = [8]
 l_pp = [1]
 l_graph = [False, True]
+l_use_new = [True]
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(
@@ -460,6 +467,13 @@ parser.add_argument(
     default=None,
     help="test type(s) to run. e.g. --test fused quant",
 )
+parser.add_argument(
+    "--use-new",
+    type=int,
+    choices=[0, 1],
+    default=1,
+    help="select custom all-reduce version for fused AR+RMSNorm; 0 uses legacy CA",
+)
 
 
 if __name__ == "__main__":
@@ -478,10 +492,11 @@ if __name__ == "__main__":
     if args.graphon is not None:
         print(args.graphon)
         l_graph = [args.graphon]
+    l_use_new = [bool(args.use_new)]
     run_tests = args.test if args.test else l_test_types
     df = []
-    for dtype, shape, tp, pp, graph_on in itertools.product(
-        l_dtype, l_shape, l_tp, l_pp, l_graph
+    for dtype, shape, tp, pp, graph_on, use_new in itertools.product(
+        l_dtype, l_shape, l_tp, l_pp, l_graph, l_use_new
     ):
         row = {}
         if "fused" in run_tests:
@@ -495,6 +510,7 @@ if __name__ == "__main__":
                     get_ip(), get_open_port()
                 ),
                 post_per_token_quant=False,
+                use_new=use_new,
             )
             row.update(ret)
         if "quant" in run_tests:
@@ -508,6 +524,7 @@ if __name__ == "__main__":
                     get_ip(), get_open_port()
                 ),
                 post_per_token_quant=True,
+                use_new=use_new,
             )
             row.update(ret)
         df.append(row)
@@ -517,6 +534,7 @@ if __name__ == "__main__":
         "shape",
         "dtype",
         "withGraph",
+        "use_new",
         "fused_min_us",
         "fused_max_us",
         "fused_err",

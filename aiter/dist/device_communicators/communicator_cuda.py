@@ -199,6 +199,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         weight_,
         eps,
         prefill_support: bool = False,
+        use_new: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n = input_.shape[-1]
         total_bytes = input_.numel() * input_.element_size()
@@ -218,7 +219,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 else (total_bytes <= 128 * 1024)
             )
             out, res_out = ca_comm.custom_fused_ar_rms(
-                input_, res_inp_, weight_, eps, use_1stage
+                input_, res_inp_, weight_, eps, use_1stage, use_new=use_new
             )
             assert out is not None
             assert res_out is not None

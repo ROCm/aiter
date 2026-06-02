@@ -456,7 +456,20 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
         prefill_support: bool = False,
+        use_new: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The torch_compile_guard-wrapped dispatcher does not expose the
+        # custom-AR version selector, so call the out-place path directly
+        # when the caller requests the legacy path.
+        if not use_new:
+            return self._fused_allreduce_rmsnorm_out_place(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                prefill_support,
+                use_new=False,
+            )
         return fused_allreduce_rmsnorm_(
             input_,
             residual_inp_,
@@ -520,6 +533,7 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
         prefill_support: bool = False,
+        use_new: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -529,6 +543,7 @@ class GroupCoordinator:
             weight_,
             eps,
             prefill_support,
+            use_new=use_new,
         )
 
     def _fused_allreduce_rmsnorm_quant_out_place(
