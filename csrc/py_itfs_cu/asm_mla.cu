@@ -185,7 +185,8 @@ void mla_decode_stage1_asm_fwd(
     }
     else
     {
-        args.out_16_nosplit = 0;
+        // nsplit==1: kernel must use bf16 R_write (logits may alias final output o)
+        args.out_16_nosplit = (kv_split == 1) ? 1 : 0;
         args.ptr_RP = nullptr;
         args.ptr_STP = num_kv_splits_indptr->data_ptr();
     }
