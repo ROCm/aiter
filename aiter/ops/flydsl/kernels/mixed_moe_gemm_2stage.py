@@ -29,6 +29,12 @@ from flydsl.expr import arith, gpu, buffer_ops, vector, rocdl, const_expr
 from flydsl._mlir.dialects import llvm, scf, memref
 from flydsl._mlir.dialects.arith import CmpIPredicate
 
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
+from aiter.utility.mx_types import (
+    MxDtypeInt as _D,
+    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
+)
+
 from .mfma_preshuffle_pipeline import (
     _buffer_load_vec,
     buffer_copy_gmem16_dwordx4,
@@ -126,7 +132,7 @@ def compile_mixed_moe_gemm1(
     is large, so each CTA is already compute-heavy. persist_m>1 serializes M blocks
     that the GPU can process in parallel.
 
-    gate_mode controls the gate/up computation strategy — see GateMode enum.
+    gate_mode controls the gate/up computation strategy -- see GateMode enum.
     """
     gpu_arch = get_hip_arch()
     allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem0")
@@ -2209,6 +2215,10 @@ def compile_mixed_moe_gemm1(
                 _c256_i32 = arith.constant(256, type=T.i32)
                 _c0xFF800000_i32 = arith.constant(0xFF800000, type=T.i32)
                 _c0x400000_i32 = arith.constant(0x400000, type=T.i32)
+                _c0x7FFFFF_i32 = arith.constant(
+                    0x7FFFFF, type=T.i32
+                )  # f32 mantissa mask
+                _c0xFF_i32 = arith.constant(0xFF, type=T.i32)  # e8m0 exponent mask
                 _c0x7FFFFFFF_i32 = arith.constant(0x7FFFFFFF, type=T.i32)
                 _c0x80000000_i32 = arith.constant(0x80000000, type=T.i32)
                 _c0x3F800000_i32 = arith.constant(0x3F800000, type=T.i32)  # 1.0f
@@ -2217,36 +2227,30 @@ def compile_mixed_moe_gemm1(
                 _c0xC11FFFFF_i32 = arith.constant(0xC11FFFFF, type=T.i32)
                 _c0x7_i32 = arith.constant(0x7, type=T.i32)
                 _c0_f32 = arith.constant(0.0, type=T.f32)
+                # 1.0f / 6.0f ? 0.16666666 fp32 bits (FP4 ceil_pow2(amax/6) scale).
+                _c0x3E2AAAAB_i32 = arith.constant(0x3E2AAAAB, type=T.i32)
 
-                _c8_i32 = arith.constant(8, type=T.i32)
-                _fp_headroom = 2 if _need_fp4 else (8 if _need_fp8 else 0)
-                _c_headroom_i32 = arith.constant(_fp_headroom, type=T.i32)
-
-                def _f32_to_e2m1(qx_f32):
-                    """Convert a scaled f32 value to fp4 (e2m1) 4-bit integer."""
-                    # Match fp4_utils.f32_to_mxfp4 / HIP quant: saturate, denorm,
-                    # and normal round-to-nearest-even paths.
-                    qx = qx_f32.bitcast(T.i32)
-                    s = qx & _c0x80000000_i32
-                    qx_abs = qx & _c0x7FFFFFFF_i32
-                    denormal_mask = arith.cmpi(
-                        CmpIPredicate.ult, qx_abs, _c0x3F800000_i32
+                # NV ROUND_UP / torchao RCEIL block-scale formula
+                # (``ceil_pow2(amax / max_pos)``); FP8 dtype follows the HW
+                # FP8 variant (gfx942 e4m3fnuz max=240, gfx950+ e4m3fn max=448).
+                # Single-statement ternary mirrors the original ``_fp_headroom``
+                # pattern -- avoids closure-cell binding edge cases hit by
+                # FlyDSL AOT trace when the assignment is split across
+                # if/elif/else branches.
+                _mx_dtype = (
+                    _D.FP4_E2M1
+                    if _need_fp4
+                    else (
+                        (_D.FP8_E4M3_FNUZ if gpu_arch == "gfx942" else _D.FP8_E4M3)
+                        if _need_fp8
+                        else _D.FP4_E2M1
                     )
-                    normal_mask = arith.andi(
-                        arith.cmpi(CmpIPredicate.ult, qx_abs, _c0x40C00000_i32),
-                        arith.cmpi(CmpIPredicate.uge, qx_abs, _c0x3F800000_i32),
-                    )
+                )
 
-                    denorm_f32 = qx_abs.bitcast(T.f32) + _c0x4A800000_i32.bitcast(T.f32)
-                    denormal_x = denorm_f32.bitcast(T.i32) - _c0x4A800000_i32
-
-                    mant_odd = (qx_abs >> _c22_i32) & _c1_i32
-                    normal_x = qx_abs + _c0xC11FFFFF_i32 + mant_odd
-                    normal_x = normal_x >> _c22_i32
-
-                    e2m1 = arith.select(normal_mask, normal_x, _c0x7_i32)
-                    e2m1 = arith.select(denormal_mask, denormal_x, e2m1)
-                    return (s >> _c28_i32) | e2m1
+                # FP4/FP8 scale and f32->fp4 conversion are shared with
+                # silu_and_mul_fq; helpers live in
+                # aiter.ops.flydsl.kernels.quant_utils.
+                _f32_to_e2m1 = emit_f32_to_e2m1
 
                 if const_expr(_need_sort):
                     _n32_sort = _sorted_scale_cols_i32 * _c32_i32
@@ -2277,12 +2281,11 @@ def compile_mixed_moe_gemm1(
                             peer = local_max.shuffle_xor(off, _c64_i32)
                             local_max = arith.maximumf(local_max, peer)
 
-                        max_i32 = local_max.bitcast(T.i32)
-                        # Match fp4_utils.f32_to_e8m0(max_abs / 4): round the
-                        # exponent at the 1.5x threshold before dropping mantissa.
-                        max_rounded = (max_i32 + _c0x400000_i32) & _c0xFF800000_i32
-                        exp_field = max_rounded >> _c23_i32
-                        e8m0_biased = arith.maxsi(exp_field - _c_headroom_i32, _c0_i32)
+                        # Same formula for FP4 / FP8; only ``max_pos`` differs
+                        # (selected by ``_mx_dtype``).
+                        e8m0_biased = emit_mx_e8m0_scale(
+                            local_max, mode=_DEFAULT_MODE, dtype=_mx_dtype
+                        )
 
                         quant_exp = _c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << _c23_i32).bitcast(T.f32)
