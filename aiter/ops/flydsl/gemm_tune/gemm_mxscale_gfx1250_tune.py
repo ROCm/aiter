@@ -35,7 +35,10 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_gfx1250_common import (
 )
 
 if is_flydsl_available():
-    from aiter.ops.flydsl.mxscale_gemm import flydsl_mxscale_gemm
+    from aiter.ops.flydsl.mxscale_gemm import (
+        flydsl_mxscale_gemm,
+        shuffle_weight_mxscale,
+    )
 
 # Single source of truth for the data_format -> q_dtype_w CSV key mapping.
 from aiter.ops.gemm_op_a8w8 import _Q_DTYPE_W
@@ -77,13 +80,40 @@ def generate_data(m, n, k, seed, out_dtype="bf16", device="cuda"):
     }
 
 
+def _shuffled_weight_for(weight, w_scale, kernel_name, data_format):
+    """Pre-shuffle (B, w_scale) once per kernel_name, cached on the weight tensor.
+
+    The tuner generates input data once per shape and reuses it across every
+    candidate kernel and every timed iteration. Weight preshuffle is a multi-MB
+    layout pass that must not be charged to the kernel's measured latency, so we
+    cache the shuffled result (keyed by kernel_name, since the B layout depends on
+    the kernel's N/K tiling) on the shared raw weight tensor. The first (warmup)
+    call populates it; the timed iterations hit the cache and pass an already
+    ``is_shuffled`` weight straight through.
+    """
+    cache = getattr(weight, "_mxscale_tuner_shuf", None)
+    if cache is None:
+        cache = {}
+        weight._mxscale_tuner_shuf = cache
+    hit = cache.get(kernel_name)
+    if hit is None:
+        hit = shuffle_weight_mxscale(
+            weight, w_scale, data_format=data_format, kernel_name=kernel_name
+        )
+        cache[kernel_name] = hit
+    return hit
+
+
 def run_gemm_mxscale(x, weight, x_scale, w_scale, out, kernel_name, data_format):
     """Run flydsl_mxscale_gemm with a fixed kernel_name; writes into out."""
+    weight_s, w_scale_s = _shuffled_weight_for(
+        weight, w_scale, kernel_name, data_format
+    )
     flydsl_mxscale_gemm(
         x,
-        weight,
+        weight_s,
         x_scale,
-        w_scale,
+        w_scale_s,
         data_format=data_format,
         out=out,
         kernel_name=kernel_name,

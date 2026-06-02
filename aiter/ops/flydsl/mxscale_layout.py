@@ -156,34 +156,6 @@ def _pad_2d(t: Tensor, rows: int, cols: int, fill_value: int) -> Tensor:
     return padded
 
 
-def pad_mxscale_inputs(
-    a: Tensor,
-    b: Tensor,
-    a_scale: Tensor,
-    b_scale: Tensor,
-    padded_shape: dict,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Pad A / B / A_scale / B_scale to padded_shape boundaries.
-
-    Data is padded with 0 (decodes to 0); scales are padded with
-    E8M0(127) = 2^0 = 1.0 so zero data contributes zero to the
-    accumulator regardless of scale.
-    """
-    a = _pad_2d(
-        a, padded_shape["M"], padded_shape["K"] // padded_shape["pack_a"], fill_value=0
-    )
-    b = _pad_2d(
-        b, padded_shape["N"], padded_shape["K"] // padded_shape["pack_b"], fill_value=0
-    )
-    a_scale = _pad_2d(
-        a_scale, padded_shape["M"], padded_shape["K_scale"], fill_value=E8M0_ONE
-    )
-    b_scale = _pad_2d(
-        b_scale, padded_shape["N"], padded_shape["K_scale"], fill_value=E8M0_ONE
-    )
-    return a, b, a_scale, b_scale
-
-
 def preshuffle_b_16x16(b: Tensor, rows: int, cols: int) -> Tensor:
     """Preshuffle B into 16x16 byte tiles for WMMA-friendly LDS loads.
 
@@ -233,6 +205,64 @@ def preshuffle_e8m0_scale_wmma(
     g = scale.view(-1, wmma_rep, wmma_dim, k_groups, k_wmma_steps, SCALES_PER_WMMA)
     g = g.permute(0, 2, 3, 4, 1, 5).contiguous()
     return g.reshape(-1, k_groups * k_wmma_steps * wmma_rep * SCALES_PER_WMMA)
+
+
+def preshuffle_mxscale_weight(
+    b: Tensor,
+    b_scale: Tensor,
+    data_format: str,
+    tile_n: int,
+    tile_k: int,
+    n_warp: int,
+    split_k: int = 1,
+) -> tuple[Tensor, Tensor]:
+    """Pad + preshuffle the B weight and its E8M0 scale for the MXScale kernel.
+
+    Weight-side preprocessing depends only on (N, K) and the N/K tiling knobs
+    (``tile_n`` / ``tile_k`` / ``n_warp`` / ``split_k``) -- never on M, tile_m
+    or m_warp -- so the result can be computed once at weight-load time and
+    reused across activations. ``aiter.ops.flydsl.mxscale_gemm`` exposes this via
+    ``shuffle_weight_mxscale``; the backend then skips this pass per call.
+    """
+    _, pack_b = mxscale_pack_factors(data_format)
+    n = b.shape[0]
+    k = b.shape[1] * pack_b
+    padded_n = _align_up(n, tile_n)
+    padded_k = _align_up(k, tile_k * split_k)
+    b_p = _pad_2d(b, padded_n, padded_k // pack_b, fill_value=0)
+    b_p = preshuffle_b_16x16(b_p, padded_n, padded_k // pack_b)
+    skt = tile_k // SCALE_BLOCK
+    warp_tile_n = tile_n // n_warp
+    b_s_p = _pad_2d(b_scale, padded_n, padded_k // SCALE_BLOCK, fill_value=E8M0_ONE)
+    b_s_p = preshuffle_e8m0_scale_wmma(b_s_p, warp_tile_n, scale_k_per_tile=skt)
+    return b_p, b_s_p
+
+
+def preshuffle_mxscale_activation(
+    a: Tensor,
+    a_scale: Tensor,
+    data_format: str,
+    tile_m: int,
+    tile_k: int,
+    m_warp: int,
+    split_k: int = 1,
+) -> tuple[Tensor, Tensor]:
+    """Pad + preshuffle the A activation and its E8M0 scale for the MXScale kernel.
+
+    Counterpart of :func:`preshuffle_mxscale_weight` for the per-call activation
+    (A is always 1 byte/elem, so no data preshuffle -- only pad + scale shuffle).
+    """
+    pack_a, _ = mxscale_pack_factors(data_format)
+    m = a.shape[0]
+    k = a.shape[1] * pack_a
+    padded_m = _align_up(m, tile_m)
+    padded_k = _align_up(k, tile_k * split_k)
+    a_p = _pad_2d(a, padded_m, padded_k // pack_a, fill_value=0)
+    skt = tile_k // SCALE_BLOCK
+    warp_tile_m = tile_m // m_warp
+    a_s_p = _pad_2d(a_scale, padded_m, padded_k // SCALE_BLOCK, fill_value=E8M0_ONE)
+    a_s_p = preshuffle_e8m0_scale_wmma(a_s_p, warp_tile_m, scale_k_per_tile=skt)
+    return a_p, a_s_p
 
 
 def to_kernel_uint8(t: Tensor) -> Tensor:
