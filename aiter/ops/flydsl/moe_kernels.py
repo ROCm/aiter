@@ -1221,7 +1221,8 @@ def flydsl_moe_stage2(
                 model_dim=model_dim,
                 dtype_str=_reduce_dtype_str,
                 use_mask=use_mask,
-                num_experts=E,
+                # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
+                num_experts=int(expert_mask.numel()) if use_mask else 0,
             )
             X = target.view(token_num, topk, model_dim)
             if use_mask:
