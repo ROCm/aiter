@@ -25,7 +25,7 @@ def _reduce_grouped(
     K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     EVEN_N: tl.constexpr,
-    ADD_RESIDUAL: tl.constexpr,
+    SWIGLU_ADD_RESIDUAL: tl.constexpr,
     USE_TDM: tl.constexpr,
     # Step 9: external residual fold-in. When HAS_EXT_RESIDUAL=True,
     # Residual[token, :] is added to `acc` before the writeback.
@@ -75,7 +75,9 @@ def _reduce_grouped(
 
         # apply nonlinearity to split-k output
         if APPLY_SWIGLU:
-            curr = _swiglu(curr[None, :], alpha, limit, ADD_RESIDUAL=ADD_RESIDUAL)
+            curr = _swiglu(
+                curr[None, :], alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL
+            )
         curr = tl.reshape(curr, [curr.shape[-1]])
         # update final accumulator
         acc += curr

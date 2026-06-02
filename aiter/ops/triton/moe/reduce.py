@@ -14,7 +14,7 @@ def reduce_grouped(
     limit=1.0,
     reduction_n=1,
     out_dtype=None,
-    add_residual: bool = True,
+    swiglu_add_residual: bool = True,
     residual: Optional[torch.Tensor] = None,
 ):
     """
@@ -87,7 +87,7 @@ def reduce_grouped(
         BLOCK_N=BLOCK_N,
         EVEN_N=(x.shape[-1] % BLOCK_N == 0),
         K=K,  #
-        ADD_RESIDUAL=add_residual,
+        SWIGLU_ADD_RESIDUAL=swiglu_add_residual,
         USE_TDM=is_tdm_avail(),
         Residual=residual,
         stride_extres_m=res_stride_m,
