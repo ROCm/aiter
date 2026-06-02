@@ -361,7 +361,6 @@ def test_dispatcher_routes_fp8_fp8_bf16_compiles():
     [
         ("act", "relu", "act='relu'"),
         ("enable_bias", True, "enable_bias=True"),
-        ("k_batch", 4, "k_batch=4"),
         ("persist_m", 2, "persist_m=2"),
         ("xcd_swizzle", 4, "xcd_swizzle=4"),
         ("swiglu_limit", 7.0, "swiglu_limit=7"),
@@ -383,6 +382,66 @@ def test_tier_c_kwargs_raise(kwarg, bad_value, expected_match):
     base[kwarg] = bad_value
     with pytest.raises(NotImplementedError, match=expected_match):
         compile_blockscale_moe_gemm1(**base)
+
+
+# ---------------------------------------------------------------------------
+# Split-K (k_batch) scaffolding tests
+#
+# Step 1 of the split-K plan lifts the adapter Tier-C gate but Steps 3-5
+# (grid expansion, K-loop slicing, atomic gate/up epilogue) are still TODO
+# in the upstream kernel. Until those land, k_batch>1 with otherwise-valid
+# config compiles down to a NotImplementedError raised by upstream after
+# adapter-side validation; bad K-slice still raises ValueError.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("k_batch", [1, 2, 4])
+def test_splitk_valid_config_compiles(k_batch):
+    """k_batch>1 with a valid K-slice should compile to a JitFunction.
+    Steps 3-5 (z-grid expansion, K-loop slicing, atomic gate/up epilogue)
+    are wired; this guards against regressions in the compile path."""
+    f = compile_blockscale_moe_gemm1(
+        model_dim=7168,
+        inter_dim=256,
+        experts=8,
+        topk=2,
+        tile_m=64,
+        tile_n=128,
+        tile_k=128,
+        doweight_stage1=False,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        out_dtype="bf16",
+        act="silu",
+        k_batch=k_batch,
+    )
+    assert f is not None
+
+
+@pytest.mark.parametrize(
+    "k_batch,model_dim,tile_k,expected_match",
+    [
+        # k_per_split = 1024/3 -> not integer
+        (3, 1024, 128, "not divisible by k_batch"),
+        # k_per_split = 256/4 = 64, < scale_block_k=128
+        (4, 256, 64, "scale_block_k"),
+    ],
+)
+def test_splitk_invalid_kslice_raises(k_batch, model_dim, tile_k, expected_match):
+    with pytest.raises(ValueError, match=expected_match):
+        compile_blockscale_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=256,
+            experts=8,
+            topk=2,
+            tile_m=64,
+            tile_n=128,
+            tile_k=tile_k,
+            doweight_stage1=False,
+            a_dtype="fp8",
+            b_dtype="fp8",
+            out_dtype="bf16",
+            act="silu",
+            k_batch=k_batch,
+        )
 
 
 def test_invalid_dtype_combo_raises():
@@ -685,6 +744,174 @@ def test_blockscale_correctness_stage1_stage2_e2e(
     assert err_s2 <= 0.05, f"stage2 numerics err_ratio={err_s2:.4f} > 0.05"
 
     print(f"  [{tokens}t] e2e via aiter dispatcher: {us1 + us2:.1f}us total")
+
+
+# ---------------------------------------------------------------------------
+# Split-K stage1 correctness via flydsl_moe_stage1 dispatcher
+# ---------------------------------------------------------------------------
+def _launch_flydsl_stage1_splitk(data, *, tile_m, tile_n, tile_k, k_batch, act):
+    """Compile + run FlyDSL stage1 with k_batch>1; return tmp_out (bf16,
+    gate/up interleave gui_layout, shape (tokens, topk, inter_dim*2)).
+
+    Mirrors _launch_flydsl_stage1 but: (a) passes k_batch + gate_mode to the
+    compiler, (b) allocates a zero-init tmp_out buffer (the GEMM atomic-adds
+    into it), and (c) writes to out_dtype='bf16'.
+    """
+    tokens = data["tokens"]
+    model_dim = data["model_dim"]
+    inter_dim = data["inter_dim"]
+    experts = data["experts"]
+    topk = data["topk"]
+
+    sorted_ids, sorted_w, sorted_e, num_valid, _ = aiter_moe_sorting(
+        data["topk_ids"],
+        data["topk_weights"],
+        experts,
+        model_dim,
+        torch.bfloat16,
+        tile_m,
+    )
+    size_expert_ids = sorted_e.numel()
+
+    a1_bq = data["x_bq"]
+    a1_scale_fly = data["x_bscale_fly"].view(-1)
+    w1_scale_fly = data["w1_bscale_flat"].view(-1)
+    w1_shuf_flat = data["w1_bq_shuf"].view(-1)
+
+    tmp_out = torch.zeros(
+        tokens, topk, inter_dim * 2, device=DEVICE, dtype=torch.bfloat16
+    )
+
+    exe1 = compile_flydsl_moe_stage1(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage1=False,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        out_dtype="bf16",
+        act=act,
+        waves_per_eu=2,
+        k_batch=k_batch,
+        gate_mode="interleave",
+    )
+    stream = torch.cuda.current_stream()
+    compiled = flyc.compile(
+        exe1,
+        tmp_out.view(-1),
+        a1_bq.view(-1),
+        w1_shuf_flat,
+        a1_scale_fly,
+        w1_scale_fly,
+        sorted_ids,
+        sorted_e,
+        sorted_w,
+        num_valid,
+        tokens,
+        inter_dim,
+        model_dim,
+        size_expert_ids,
+        stream,
+    )
+    # Atomic-add into a zeroed buffer: must clear before each launch.
+    tmp_out.zero_()
+    compiled(
+        tmp_out.view(-1),
+        a1_bq.view(-1),
+        w1_shuf_flat,
+        a1_scale_fly,
+        w1_scale_fly,
+        sorted_ids,
+        sorted_e,
+        sorted_w,
+        num_valid,
+        tokens,
+        inter_dim,
+        model_dim,
+        size_expert_ids,
+        stream,
+    )
+    torch.cuda.synchronize()
+    return tmp_out
+
+
+@pytest.mark.parametrize("act", ["silu"])
+@pytest.mark.parametrize("k_batch", [2, 4])
+@pytest.mark.parametrize(
+    "tokens, model_dim, inter_dim, experts, topk",
+    [
+        pytest.param(8, 1024, 256, 8, 2, id="m8"),
+        pytest.param(64, 1024, 256, 8, 2, id="m64"),
+        pytest.param(256, 2048, 512, 16, 4, id="m256"),
+    ],
+)
+def test_blockscale_splitk_stage1_e2e(
+    tokens, model_dim, inter_dim, experts, topk, k_batch, act
+):
+    """End-to-end stage1 split-K: z-grid expansion + per-CTA K-slice + atomic
+    gate/up store to ``tmp_out`` (interleave gui_layout). Validates the
+    atomic gate+up partials reduce to the same result as the baseline
+    fused-silu kernel within tolerance.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP device required")
+    from aiter.ops.activation import silu_and_mul
+
+    data = _prepare_data(tokens, model_dim, inter_dim, experts, topk)
+    tile_m, tile_n, tile_k = 64, 128, 128
+
+    tmp_out = _launch_flydsl_stage1_splitk(
+        data,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        k_batch=k_batch,
+        act=act,
+    )
+    # gui_layout=True interleave: [gate0..15, up0..15, gate16..31, up16..31, ...]
+    # silu_and_mul expects [..., 2*inter_dim] with gate/up split via 16-wide
+    # blocks (this is the same layout the dispatcher's _gui_sk path consumes
+    # via silu_and_mul_fq).
+    out1 = torch.empty(tokens, topk, inter_dim, device=DEVICE, dtype=torch.bfloat16)
+    # silu_and_mul over the concat-style layout: reinterpret tmp_out so the
+    # gate-block of 16 and up-block of 16 line up. The dispatcher uses
+    # silu_and_mul_fq with gui_layout=True; for an act-only correctness
+    # check we permute gate/up into the standard [gate||up] split that
+    # silu_and_mul consumes.
+    t2 = tmp_out.view(tokens, topk, inter_dim // 16, 2, 16)
+    gate_part = t2[..., 0, :].reshape(tokens, topk, inter_dim)
+    up_part = t2[..., 1, :].reshape(tokens, topk, inter_dim)
+    silu_input = torch.cat([gate_part, up_part], dim=-1)
+    silu_and_mul(out1.view(-1, inter_dim), silu_input.view(-1, 2 * inter_dim))
+    torch.cuda.synchronize()
+
+    out1_ref = _torch_stage1_ref(
+        data["x_bq"],
+        data["w1_bq"],
+        data["topk_ids"],
+        data["x_bscale_ref"],
+        data["w1_bscale_flat"],
+        inter_dim,
+        SCALE_BLOCK_N_DEFAULT,
+        SCALE_BLOCK_K_DEFAULT,
+        act=act,
+    )
+
+    assert torch.isfinite(out1).all(), "split-K stage1 produced non-finite values"
+    err = checkAllclose(
+        out1_ref.to(out1.dtype),
+        out1,
+        rtol=0.1,
+        atol=0.1,
+        msg=f"flydsl-stage1 splitk k_batch={k_batch}",
+        printLog=False,
+    )
+    print(f"\n  [{tokens}t k_batch={k_batch}] split-K stage1 err_ratio={err:.4f}")
+    assert err <= 0.05, f"split-K stage1 err_ratio={err:.4f} > 0.05"
 
 
 # ---------------------------------------------------------------------------
