@@ -22,6 +22,7 @@ Supports:
 """
 
 import math as host_math
+import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
@@ -43,6 +44,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import (
     fly as _fly,
     llvm as _llvm,
+    math as _math,
     memref as _memref,
     scf as _scf,
 )
@@ -154,16 +156,137 @@ def build_sage_attn_cdna_module(
     #    only; performs a 16-lane in-instruction transpose) to deliver the
     #    32 K-contiguous bytes per lane that the f8f6f4 MFMA expects.
     _is_gfx950_kv = "gfx950" in gpu_arch
-    K_STRIDE = HEAD_DIM + 16  # 16 B pad: HEAD_DIM=128 = 32 banks × 4 B,
-    #   so naive +0/+8 hits bank conflicts on
-    #   ds_read paths. +16 shifts each row by 4
-    #   banks → conflict-free (matches V_STRIDE).
+
+    # ---- Direct global→LDS DMA staging (experimental memory-staging lever) ----
+    # Default coop loads stage K/V through the VGPR file: buffer_load (global→
+    # VGPR) then ds_write (VGPR→LDS) — a two-hop copy that pins staging VGPRs
+    # per outstanding load and emits a ds_write stripe per KV tile. The CDNA
+    # `buffer_load_lds` path moves global→LDS directly, bypassing the register
+    # file. The hardware writes are LANE-CONTIGUOUS within a wave, so the K/V
+    # LDS strides MUST be packed (no +16 pad / XOR) and the destination is a
+    # per-wave-uniform pointer (HW adds lane*size). gfx950 supports a 16 B/lane
+    # DMA (one buffer_load_dwordx4-to-LDS); gfx942 is 4 B/lane. V on gfx942 is
+    # column-major (scatter-transpose) which the DMA cannot express, so V-DMA
+    # is gfx950-only. Gated by env so the prior padded/register-staged path
+    # stays the default until measured.
+    _dma_env = os.environ.get("SAGE_LDS_DMA", "0")
+    _dma_k = _dma_env in ("1", "k", "kv")
+    _dma_v = _dma_env in ("1", "v", "kv") and _is_gfx950_kv
+    _dma_any = _dma_k or _dma_v
+    # DMA forces a packed (no-pad) stride, which aliases every KV row onto the
+    # same 32-bank set (HEAD_DIM=128 B = 32 banks × 4 B) → 32-way ds_read
+    # conflicts. The pad is unavailable (the lane-contiguous DMA destination is
+    # not a per-lane address), but an XOR swizzle CAN be carried purely in
+    # ADDRESS ARITHMETIC: permute which 16-B chunk each lane fetches on the
+    # global side (write) and apply the inverse permute on the LDS read index.
+    # chunk' = chunk ^ (row & (CHUNKS_PER_ROW-1)) is self-inverse and in-row
+    # (16-B aligned), so global reads stay fully coalesced (same 128-B rows,
+    # only lane↔chunk assignment permutes) and the QK ds_read sees rows scattered
+    # across distinct banks. Default ON whenever DMA is on (set SAGE_LDS_DMA_XOR=0
+    # to reproduce the un-swizzled packed baseline for A/B).
+    # The in-row XOR is only self-inverse when CHUNKS_PER_ROW is a power of two
+    # (so `& mask` selects a within-row chunk). HEAD_DIM 64/128/256 → 4/8/16
+    # chunks (all p2); guard non-p2 head_dims by falling back to no-xor.
+    _cpr_k_host = head_dim // 16  # VEC_WIDTH_K = 16 B chunks per K row
+    _cpr_k_is_p2 = _cpr_k_host > 0 and (_cpr_k_host & (_cpr_k_host - 1)) == 0
+    _dma_xor = (
+        _dma_any
+        and _cpr_k_is_p2
+        and os.environ.get("SAGE_LDS_DMA_XOR", "1") not in ("0", "")
+    )
+    # `buffer_load_lds` completion is tracked by the global `vmcnt`, not
+    # `lgkmcnt`, so the LDS data is only guaranteed visible after a `vmcnt`
+    # drain — which `gpu.barrier()`'s implicit `lgkmcnt(0)` does NOT provide.
+    # An explicit `s_waitcnt vmcnt(0)` before the gating barrier is therefore
+    # required *unless* something else already drains vmcnt there. In single-
+    # tensor DMA modes (`k` or `v`) the OTHER tensor is still register-staged,
+    # and its coop-load issues its own `s_waitcnt vmcnt(0)` before its
+    # `ds_write` (the VGPR→LDS store needs the loaded VGPRs) — a full drain that
+    # also lands the sibling DMA. So the explicit fence is only needed when BOTH
+    # K and V are DMA (`kv`/`1`), where no register path forces a drain. Skipping
+    # the redundant fence in single-tensor modes removes a per-iter critical-path
+    # stall that the lean, high-occupancy non-causal iters could not hide
+    # (causal iters hid it under the per-element mask compute). Verified
+    # bit-identical with the fence gated off in K-only mode.
+    _need_dma_fence = _dma_k and _dma_v
+    if const_expr(_dma_any):
+        path_tag = f"{path_tag}_dma{_dma_env}" + ("x" if _dma_xor else "")
+        if const_expr(_need_dma_fence):
+            path_tag = f"{path_tag}f"
+
+    # ---- Deferred-scale softmax ("gate the scale") ----
+    # Defer the QK descale out of the per-element score path and fold it into the
+    # softmax exp as one FMA (see section 2/4 in the kernel body). Removes the 32
+    # per-element `v_pk_mul_f32` per iter — the dominant non-exp VALU op in this
+    # VALU(exp)-bound loop. The per-iter ISA histogram confirms deferral is a pure
+    # win on op count (96 vs 129 exposed VALU, 181 vs 192 VGPR), yet whether it
+    # nets faster depends on whether eager's scale-muls were *already hidden*:
+    #   - non-causal (any block_m): deferral wins (−5–7%), bit-identical cosine.
+    #   - causal, block_m<=128: deferral wins too (−5%) — the smaller MFMA shadow
+    #     and higher occupancy leave eager's muls exposed, so removing them pays.
+    #   - causal, block_m=256: deferral REGRESSES (+7–9%). The big-tile MFMA shadow
+    #     plus the per-element mask compute (64 cndmask+cmp) already swallow eager's
+    #     muls for free, so deferral removes nothing but still adds a serial
+    #     post-reduction `row_max*scale` on the exp critical path. Nothing to recoup
+    #     here — the cost is structural, not an op-count problem.
+    # So gate ON for non-causal OR (causal AND block_m<=128) — a compile-time
+    # per-shape branch (the dispatcher is a perf lever). Env `SAGE_DEFER_SCALE`
+    # overrides for A/B: `auto`/`1` = the gate above, `0` = always eager, `force` =
+    # always deferred.
+    _defer_env = os.environ.get("SAGE_DEFER_SCALE", "auto")
+    if _defer_env in ("0", ""):
+        _DEFER_SCALE = False
+    elif _defer_env == "force":
+        _DEFER_SCALE = True
+    else:  # "auto" / "1": non-causal always; causal only at block_m<=128
+        _DEFER_SCALE = (not CAUSAL) or (BLOCK_M <= 128)
+    if const_expr(_DEFER_SCALE):
+        path_tag = f"{path_tag}_ds"
+
+    # ---- Causal LPT/SPT tile scheduling ("longest-processing-time-first") ----
+    # For CAUSAL shapes the inner K-loop length is triangular: Q-tile t attends
+    # only to KV tiles [0..t], so the first Q-tile does ~1 KV-block of work and
+    # the last does the full ~N. When workgroups are launched in naive Q-tile
+    # order (q_tile_idx = block-derived index, ascending), the CUs that draw the
+    # early (short) tiles retire early and idle while CUs holding the late (long)
+    # tiles still grind — a triangular load-imbalance tail. Borrowed from FA4's
+    # backward LPT scheduling: REVERSE the Q-tile assignment so workgroup 0 draws
+    # the LAST (longest) causal tile, etc. — heaviest tiles enter the machine
+    # first, so the tail is balanced. This is a PURE scheduling permutation of
+    # which workgroup owns which Q-tile; numerics are bit-identical (each Q-tile's
+    # math is independent and unchanged). It cannot help non-causal (uniform tile
+    # work), so it MUST be a no-op there.
+    # Env `SAGE_LPT_SCHED`: `auto` (default = on for causal, no-op non-causal) ·
+    # `0` (off / baseline order) · `force` (on regardless of causality).
+    _lpt_env = os.environ.get("SAGE_LPT_SCHED", "auto")
+    if _lpt_env in ("0", ""):
+        _LPT_SCHED = False
+    elif _lpt_env == "force":
+        _LPT_SCHED = True
+    else:  # "auto" / "1"
+        _LPT_SCHED = CAUSAL
+    if const_expr(_LPT_SCHED):
+        path_tag = f"{path_tag}_lpt"
+
+    if const_expr(_dma_k):
+        # DMA is lane-contiguous → packed K stride (no pad). Reintroduces K
+        # read-side bank aliasing; the trade is removing the ds_write stripe +
+        # freeing staging VGPRs. Measured net effect is the experiment.
+        K_STRIDE = HEAD_DIM
+    else:
+        K_STRIDE = HEAD_DIM + 16  # 16 B pad: HEAD_DIM=128 = 32 banks × 4 B,
+        #   so naive +0/+8 hits bank conflicts on
+        #   ds_read paths. +16 shifts each row by 4
+        #   banks → conflict-free (matches V_STRIDE).
     if _is_gfx950_kv:
-        # Pad row stride by 16 bytes to break LDS bank conflicts on the
-        # ds_read_tr8_b64 path. HEAD_DIM=128 = exact multiple of 32 banks ×
-        # 4 B/bank, so consecutive rows hit the same bank set; adding 16 B
-        # shifts each row by 4 banks.
-        V_STRIDE = HEAD_DIM + 16
+        if const_expr(_dma_v):
+            V_STRIDE = HEAD_DIM  # packed (lane-contiguous DMA)
+        else:
+            # Pad row stride by 16 bytes to break LDS bank conflicts on the
+            # ds_read_tr8_b64 path. HEAD_DIM=128 = exact multiple of 32 banks ×
+            # 4 B/bank, so consecutive rows hit the same bank set; adding 16 B
+            # shifts each row by 4 banks.
+            V_STRIDE = HEAD_DIM + 16
     else:
         # Pad V "row" stride to a 16-byte multiple so loads can issue as
         # ds_read_b128. BLOCK_N=128 + 16 = 144 bytes per row.
@@ -338,6 +461,11 @@ def build_sage_attn_cdna_module(
         def _fmax(a, b):
             return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
 
+        def _ffma(a, b, c):
+            # fused a*b + c (single rounding); used to fold the QK descale into
+            # the exp argument so the 32 per-element scale-muls collapse.
+            return _math.fma(_raw(a), _raw(b), _raw(c), fastmath=fm_fast)
+
         def _sitofp(v):
             return arith.SIToFPOp(T.f32, _raw(v)).result
 
@@ -418,8 +546,17 @@ def build_sage_attn_cdna_module(
         head_q_idx = block_id % NUM_Q_HEADS
         batch_q_tile_id = block_id // NUM_Q_HEADS
         num_q_tiles = (seq_len_q_v + BLOCK_M - 1) // BLOCK_M
-        q_tile_idx = batch_q_tile_id % num_q_tiles
+        q_tile_raw = batch_q_tile_id % num_q_tiles
         batch_idx = batch_q_tile_id // num_q_tiles
+        # Causal LPT/SPT remap: reverse the Q-tile order so workgroup 0 (drawn
+        # first) processes the LAST (longest-work) causal tile. Pure scheduling
+        # permutation — every Q-tile's computation is independent and unchanged,
+        # so output is bit-identical to the naive-order baseline. No-op (off) for
+        # non-causal where tile work is uniform.
+        if const_expr(_LPT_SCHED):
+            q_tile_idx = (num_q_tiles - fx.Index(1)) - q_tile_raw
+        else:
+            q_tile_idx = q_tile_raw
         q_start = q_tile_idx * BLOCK_M
 
         # KV head for this Q head (GQA)
@@ -539,10 +676,135 @@ def build_sage_attn_cdna_module(
         else:
             kv_upper = seq_len_k_v
 
+        # ---- Direct global→LDS DMA helpers (experimental) ----
+        # raw_ptr_buffer_load_lds moves `size` bytes/lane straight from a buffer
+        # resource into LDS, bypassing the VGPR file. The HW LDS write is
+        # lane-contiguous within a wave: lane l of wave w lands at
+        #   lds_ptr_base + w*WARP_SIZE*size + l*size
+        # so the caller passes a WAVE-UNIFORM destination pointer (the per-lane
+        # stride is implicit) and the full per-lane address goes on the GLOBAL
+        # side via `voffset` (byte offset into the resource). With packed
+        # K/V strides this reproduces the row-major LDS tile bit-for-bit, since
+        # load_row*STRIDE + load_col == tid*size for THREADS_PER_ROW*VEC==STRIDE.
+        if const_expr(_dma_any):
+            from flydsl.expr import rocdl as _rocdl_dma
+
+            def _dma_fence():
+                # buffer_load_lds completion is tracked by vmcnt, NOT lgkmcnt,
+                # so gpu.barrier()'s implicit lgkmcnt(0) does not guarantee the
+                # LDS data has landed. Drain vmcnt before the gating barrier.
+                _llvm.inline_asm(
+                    None, [], "s_waitcnt vmcnt(0)", "", has_side_effects=True
+                )
+
+            def _lds_as3_base(lds_view):
+                base_idx = _memref.extract_aligned_pointer_as_index(
+                    _llvm_value(lds_view)
+                )
+                base_i64 = arith.unwrap(arith.index_cast(T.i64, base_idx))
+                return buffer_ops.create_llvm_ptr(base_i64, address_space=3)
+
+        def _coop_load_k_dma(tile_start, buf_off):
+            # K DMA: packed row-major LDS, DMA_BYTES = VEC_WIDTH_K (16 on gfx950,
+            # one buffer_load_dwordx4-to-LDS). guard never fires for shipped
+            # tile configs (ROWS_PER_BATCH_K <= BLOCK_N); asserted at build.
+            assert not K_NEEDS_GUARD, "K DMA path requires ROWS_PER_BATCH_K<=BLOCK_N"
+            DMA_BYTES_K = VEC_WIDTH_K
+            buf_off_i64 = arith.unwrap(arith.index_cast(T.i64, _raw(buf_off)))
+            wave_byte = _rocdl_dma.readfirstlane(
+                T.i64,
+                arith.unwrap(
+                    arith.index_cast(
+                        T.i64, wave_id * fx.Index(WARP_SIZE * DMA_BYTES_K)
+                    )
+                ),
+            )
+            base_ptr = _lds_as3_base(lds)
+            base_ptr = buffer_ops.get_element_ptr(base_ptr, buf_off_i64)
+            base_ptr = buffer_ops.get_element_ptr(base_ptr, wave_byte)
+            size_i32 = arith.constant(DMA_BYTES_K, type=T.i32)
+            c0 = arith.constant(0, type=T.i32)
+            aux1 = arith.constant(1, type=T.i32)
+            # CHUNKS_PER_ROW = HEAD_DIM / VEC_WIDTH_K = number of 16-B chunks per
+            # K row; the XOR period is the next-lower power of two so the permute
+            # stays in-row. K row = HEAD_DIM(128)/16 = 8 chunks → period 8.
+            _CPR_K = HEAD_DIM // VEC_WIDTH_K
+            _XMASK_K = _CPR_K - 1  # 7 for HEAD_DIM=128
+            for batch in range_constexpr(NUM_BATCHES_K):
+                row_offset = batch * ROWS_PER_BATCH_K
+                row_idx_raw = tile_start + load_row_k_batch + row_offset
+                if const_expr(_dma_xor):
+                    # Physical chunk this lane owns in LDS = load_col_k_base/16;
+                    # fetch the XOR-permuted chunk from GLOBAL so that, combined
+                    # with the inverse permute on the QK read, each LDS row lands
+                    # on a distinct bank set. tile_row = LDS row within the tile.
+                    tile_row = load_row_k_batch + row_offset
+                    phys_chunk = load_lane_k  # = load_col_k_base // VEC_WIDTH_K
+                    g_chunk = ArithValue(phys_chunk) ^ (
+                        ArithValue(tile_row) & fx.Index(_XMASK_K)
+                    )
+                    g_col = fx.Index(g_chunk) * fx.Index(VEC_WIDTH_K)
+                    g_idx = kv_global_idx(row_idx_raw, g_col)
+                else:
+                    g_idx = kv_global_idx(row_idx_raw, load_col_k_base)
+                voff = arith.unwrap(arith.index_cast(T.i32, _raw(g_idx)))
+                if const_expr(batch == 0):
+                    lds_ptr = base_ptr
+                else:
+                    lds_ptr = buffer_ops.get_element_ptr(
+                        base_ptr,
+                        static_byte_offset=batch * BLOCK_SIZE * DMA_BYTES_K,
+                    )
+                _rocdl_dma.raw_ptr_buffer_load_lds(
+                    k_rsrc, lds_ptr, size_i32, voff, c0, c0, aux1
+                )
+
+        def _coop_load_v_dma(tile_start, buf_off):
+            # gfx950 row-major V: structurally identical to K DMA. Packed
+            # V stride, DMA_BYTES = VEC_WIDTH_V = 16. global voffset = byte
+            # index into V resource; HW write lands lane-contiguous == the
+            # row-major LDS tile. gfx942 column-major (transpose) cannot be a
+            # DMA — _dma_v is forced False there.
+            assert not V_NEEDS_GUARD, "V DMA path requires ROWS_PER_BATCH_V<=BLOCK_N"
+            DMA_BYTES_V = VEC_WIDTH_V
+            buf_off_i64 = arith.unwrap(arith.index_cast(T.i64, _raw(buf_off)))
+            wave_byte = _rocdl_dma.readfirstlane(
+                T.i64,
+                arith.unwrap(
+                    arith.index_cast(
+                        T.i64, wave_id * fx.Index(WARP_SIZE * DMA_BYTES_V)
+                    )
+                ),
+            )
+            base_ptr = _lds_as3_base(lds_v)
+            base_ptr = buffer_ops.get_element_ptr(base_ptr, buf_off_i64)
+            base_ptr = buffer_ops.get_element_ptr(base_ptr, wave_byte)
+            size_i32 = arith.constant(DMA_BYTES_V, type=T.i32)
+            c0 = arith.constant(0, type=T.i32)
+            aux1 = arith.constant(1, type=T.i32)
+            for batch in range_constexpr(NUM_BATCHES_V):
+                row_offset = batch * ROWS_PER_BATCH_V
+                row_idx_raw = tile_start + load_row_v_batch + row_offset
+                g_idx = kv_global_idx(row_idx_raw, load_col_v_base)
+                voff = arith.unwrap(arith.index_cast(T.i32, _raw(g_idx)))
+                if const_expr(batch == 0):
+                    lds_ptr = base_ptr
+                else:
+                    lds_ptr = buffer_ops.get_element_ptr(
+                        base_ptr,
+                        static_byte_offset=batch * BLOCK_SIZE * DMA_BYTES_V,
+                    )
+                _rocdl_dma.raw_ptr_buffer_load_lds(
+                    v_rsrc, lds_ptr, size_i32, voff, c0, c0, aux1
+                )
+
         # ---- Cooperative load helpers for K (Int8) ----
         # buf_off: byte offset into the K-side LDS that selects the ping-pong
         # buffer. 0 = buffer 0, LDS_K_BYTES = buffer 1.
         def coop_load_k(tile_start, buf_off):
+            if const_expr(_dma_k):
+                _coop_load_k_dma(tile_start, buf_off)
+                return
             for batch in range_constexpr(NUM_BATCHES_K):
                 row_offset = batch * ROWS_PER_BATCH_K
                 row_idx_raw = tile_start + load_row_k_batch + row_offset
@@ -598,6 +860,9 @@ def build_sage_attn_cdna_module(
 
             buf_off: byte offset into lds_v selecting the ping-pong V buffer.
             """
+            if const_expr(_dma_v):
+                _coop_load_v_dma(tile_start, buf_off)
+                return
             for batch in range_constexpr(NUM_BATCHES_V):
                 row_offset = batch * ROWS_PER_BATCH_V
                 row_idx_raw = tile_start + load_row_v_batch + row_offset
@@ -642,7 +907,19 @@ def build_sage_attn_cdna_module(
             ks: K-step index (selects 32-wide K chunk; klane picks the 16-byte half)
             buf_off: ping-pong K-buffer byte offset.
             """
-            k_col = fx.Index(ks * MFMA_K_INT8) + klane * 16
+            if const_expr(_dma_xor):
+                # Inverse of the write-side permute: QK wants global 16-B chunk
+                # g = ks*2 + klane of this kv row; it physically lives at chunk
+                # g ^ (row & (CHUNKS_PER_ROW-1)) in the packed LDS tile.
+                _CPR_K = HEAD_DIM // VEC_WIDTH_K
+                _XMASK_K = _CPR_K - 1
+                g_chunk = fx.Index(ks * 2) + klane  # 16-B chunk QK needs
+                phys_chunk = ArithValue(g_chunk) ^ (
+                    ArithValue(kv_block_row) & fx.Index(_XMASK_K)
+                )
+                k_col = fx.Index(phys_chunk) * fx.Index(VEC_WIDTH_K)
+            else:
+                k_col = fx.Index(ks * MFMA_K_INT8) + klane * 16
             lds_idx = buf_off + fx.Index(kv_block_row * K_STRIDE) + k_col
             v16i8 = Vec.load(v16i8_type, lds, [lds_idx])
             return vector.bitcast(v4i32_type, v16i8)
@@ -808,7 +1085,17 @@ def build_sage_attn_cdna_module(
                         [k_frag, q_packs[ks], s_accs_loc[st], 0, 0, 0],
                     )
 
-            # 2) Scale (with descale-index clamp for the last-iter OOB tile)
+            # 2) Scale (descale-index clamp for the last-iter OOB tile).
+            # "Gate the scale": when _DEFER_SCALE, carry RAW f32 scores and fold
+            # the (strictly positive, amax-based) descale into the softmax exp as
+            # one FMA per element — max commutes with a positive scale, so
+            # max(scale*s)==scale*max(s). This dissolves the 32 per-element
+            # `v_pk_mul_f32` the eager scale emits, the dominant non-exp VALU in
+            # this VALU-bound loop. Deferral wins on non-causal and on causal
+            # block_m<=128, but REGRESSES causal+block_m=256 (the big-tile MFMA
+            # shadow + per-element mask compute already hide the eager muls, so
+            # deferral only adds a serial post-reduction scale on the exp critical
+            # path). Gated accordingly at build time — a per-shape branch.
             kv_tile_idx_loc = kv_block_start_arg // BLOCK_N
             max_kv_tile = num_k_blocks_per_head - fx.Index(1)
             kv_tile_safe = fx.Index(
@@ -823,18 +1110,23 @@ def build_sage_attn_cdna_module(
             )
             k_ds_loc = fx.Float32(_load_ptr_f32(kds_ptr, k_descale_base_loc))
             qk_scale_loc = _fmul(q_ds, k_ds_loc)
-            qk_scale_v16_loc = Vec.from_elements(
-                [qk_scale_loc], fx.Float32
-            ).broadcast_to(16)
             s_f32_loc = []
-            for st in range_constexpr(N_SUBTILES):
-                s_i32_vec = Vec(s_accs_loc[st])
-                s_f32_vec = s_i32_vec.to(fx.Float32)
-                s_scaled_vec = Vec(
-                    arith.mulf(s_f32_vec, qk_scale_v16_loc, fastmath=fm_fast)
-                )
-                for elem in range_constexpr(ELEMS_PER_TILE):
-                    s_f32_loc.append(s_scaled_vec[elem])
+            if const_expr(_DEFER_SCALE):
+                for st in range_constexpr(N_SUBTILES):
+                    s_f32_vec = Vec(s_accs_loc[st]).to(fx.Float32)
+                    for elem in range_constexpr(ELEMS_PER_TILE):
+                        s_f32_loc.append(s_f32_vec[elem])
+            else:
+                qk_scale_v16_loc = Vec.from_elements(
+                    [qk_scale_loc], fx.Float32
+                ).broadcast_to(16)
+                for st in range_constexpr(N_SUBTILES):
+                    s_f32_vec = Vec(s_accs_loc[st]).to(fx.Float32)
+                    s_scaled_vec = Vec(
+                        arith.mulf(s_f32_vec, qk_scale_v16_loc, fastmath=fm_fast)
+                    )
+                    for elem in range_constexpr(ELEMS_PER_TILE):
+                        s_f32_loc.append(s_scaled_vec[elem])
 
             # 3) Mask
             kv_start_i32_loc = fx.Int32(
@@ -900,11 +1192,18 @@ def build_sage_attn_cdna_module(
                     _scf.YieldOp([_raw(v) for v in s_f32_loc])
                 s_f32_loc = list(if_op.results)
 
-            # 4) Softmax
+            # 4) Softmax. When deferring, the running max/corr stay in SCALED
+            # space (the descale varies per KV-tile, so cross-tile comparison
+            # must be post-scale): max over RAW scores, scale the single reduced
+            # row-max by qk_scale (one scalar mul vs 32 per-element), and fold
+            # the scale into each exp argument as one FMA (scale*s_raw - m_new).
+            # When not deferring, scores are already scaled (section 2).
             local_max_l = s_f32_loc[0]
             for r in range_constexpr(NUM_S_VALS - 1):
                 local_max_l = _fmax(local_max_l, s_f32_loc[r + 1])
             row_max_l = row_max_reduce(local_max_l)
+            if const_expr(_DEFER_SCALE):
+                row_max_l = _fmul(row_max_l, qk_scale_loc)
             m_new_l = _fmax(m_in, row_max_l)
             diff_m_l = _fsub(m_in, m_new_l)
             corr_l = rocdl.exp2(ir.F32Type.get(), _raw(diff_m_l))
@@ -912,7 +1211,10 @@ def build_sage_attn_cdna_module(
             p_vals_l = []
             local_sum_l = _raw(c_zero_f)
             for r in range_constexpr(NUM_S_VALS):
-                diff = _fadd(s_f32_loc[r], neg_max_l)
+                if const_expr(_DEFER_SCALE):
+                    diff = _ffma(s_f32_loc[r], qk_scale_loc, neg_max_l)
+                else:
+                    diff = _fadd(s_f32_loc[r], neg_max_l)
                 p = rocdl.exp2(ir.F32Type.get(), _raw(diff))
                 p_vals_l.append(p)
                 local_sum_l = _fadd(local_sum_l, p)
@@ -944,6 +1246,8 @@ def build_sage_attn_cdna_module(
         coop_load_v(ZERO_INDEX, ZERO_INDEX)
         coop_load_k(fx.Index(BLOCK_N), K_BUF1_OFF)
         coop_load_v(fx.Index(BLOCK_N), V_BUF1_OFF)
+        if const_expr(_need_dma_fence):
+            _dma_fence()
         gpu.barrier()
 
         # i32 0 — current buffer index for iter 0 (buf 0 holds K[0]/V[0]).
@@ -1040,6 +1344,16 @@ def build_sage_attn_cdna_module(
             # (untouched here) so a single barrier suffices — vs the prior
             # scheme's two barriers per iter (the second was needed because
             # next iter's softmax read this-iter's prefetch target).
+            # DMA path (kv only): drain vmcnt so the PREVIOUS iter's tail DMA
+            # prefetch (issued one iter ago, into the buffer this barrier
+            # protects) is guaranteed landed in LDS before any wave reuses it.
+            # In single-tensor DMA modes the sibling register coop-load's own
+            # vmcnt(0) (before its ds_write) already drains this — see
+            # _need_dma_fence. The DMA had a full iter of compute to overlap, so
+            # even when emitted the drain is mostly free on causal; on lean
+            # non-causal iters it was an exposed stall, hence the gate.
+            if const_expr(_need_dma_fence):
+                _dma_fence()
             gpu.barrier()
 
             kv_block_after_next = kv_block_start + fx.Index(2 * BLOCK_N)
