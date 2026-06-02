@@ -33,6 +33,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import checkAllclose, run_perftest
 
@@ -577,6 +578,12 @@ def test_mla_v4(
         print(
             f"skip test_mla_v4(b={batch_size}, c={ctx_lens}, n={nhead}, "
             f"ql={decode_qlen}): unsupported on {gfx}"
+        )
+        return None
+    if not is_experimental_enabled():
+        print(
+            f"skip test_mla_v4(b={batch_size}, c={ctx_lens}, n={nhead}, "
+            f"ql={decode_qlen}): requires AITER_ENABLE_EXPERIMENTAL=1"
         )
         return None
 
