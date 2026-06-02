@@ -16,6 +16,7 @@ import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_vfa import (
     _sage_k_sabsmax_kernel,
+    _sage_vfa_m_exact_kernel,
     _sage_vfa_m_init_kernel,
     sage_fwd_vfa,
 )
@@ -145,6 +146,70 @@ def compute_m_init(
     return m_init
 
 
+def compute_m_exact(
+    q_int8: torch.Tensor,
+    k_int8: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    BLKQ: int,
+    BLKK: int,
+    layout: str = "bshd",
+    safety_log2: float = 0.0,
+) -> torch.Tensor:
+    """Per-row TRUE running-max, computed by a full QK pass.
+
+    Same output layout as :func:`compute_m_init`.  Expensive (O(N_q*N_k*D)
+    int8 MFMA) -- use as a correctness ceiling or whenever the signed-absmax
+    estimate is too sloppy (uncorrelated Q/K).
+    """
+    bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+    batch, seqlen_q, nheads_q, head_dim = map_dims(q_int8.shape, bshd_map)
+    _, seqlen_k, nheads_k, _ = map_dims(k_int8.shape, bshd_map)
+    num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
+    num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
+    n_extra_tokens = seqlen_k % BLKK
+
+    m_init = torch.empty(
+        (batch, nheads_q, num_q_blocks, BLKQ),
+        dtype=torch.float32,
+        device=q_int8.device,
+    )
+
+    stride_qz, stride_qm, stride_qh, stride_qd = map_dims(q_int8.stride(), bshd_map)
+    stride_kz, stride_kn, stride_kh, stride_kd = map_dims(k_int8.stride(), bshd_map)
+    stride_qsz, stride_qsh, stride_qsblk = q_descale.stride()
+    stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
+    stride_mz, stride_mh, stride_mblk, stride_mr = m_init.stride()
+
+    padded_d_model_qk = max(16, 1 << (head_dim - 1).bit_length())
+
+    grid = (num_q_blocks, nheads_q, batch)
+    _sage_vfa_m_exact_kernel[grid](
+        q_int8, k_int8,
+        q_descale, k_descale,
+        m_init,
+        stride_qz, stride_qh, stride_qm, stride_qd,
+        stride_kz, stride_kh, stride_kn, stride_kd,
+        stride_qsz, stride_qsh, stride_qsblk,
+        stride_ksz, stride_ksh, stride_ksblk,
+        stride_mz, stride_mh, stride_mblk, stride_mr,
+        SEQLEN_Q=seqlen_q,
+        SEQLEN_K=seqlen_k,
+        NUM_K_BLOCKS=num_k_blocks,
+        N_EXTRA_TOKENS=n_extra_tokens,
+        SAFETY=safety_log2,
+        HQ=nheads_q,
+        HK=nheads_k,
+        BLOCK_M=BLKQ,
+        BLOCK_N=BLKK,
+        BLOCK_DMODEL_QK=padded_d_model_qk,
+        ACTUAL_BLOCK_DMODEL_QK=head_dim,
+        num_warps=4,
+        num_stages=2,
+    )
+    return m_init
+
+
 def fav3_sage_vfa_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -152,19 +217,20 @@ def fav3_sage_vfa_func(
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
-    k_repr: torch.Tensor,
+    m_init: torch.Tensor,
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
-    block_k_repr: int = 64,
-    safety_log2: float = _M_INIT_SAFETY_LOG2,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """SageAttention v1 with Vector Relieved Flash Attention.
+    """SageAttention v1 with Vector Relieved Flash Attention -- hot kernel only.
 
     Dense, non-causal, no-sliding-window, no-block-sparse path only.  Inputs
-    follow the same quantization protocol as :func:`fav3_sage_func`; ``k_repr``
-    is expected to come from :func:`compute_k_repr_sabsmax`.
+    follow the same quantization protocol as :func:`fav3_sage_func`; ``m_init``
+    must be a precomputed per-row running-max estimate (see
+    :func:`compute_m_init` for the cheap signed-absmax estimator and
+    :func:`compute_m_exact` for the true per-row max).  Any additive safety
+    margin (in log2 units) must already be baked into ``m_init``.
     """
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
@@ -190,7 +256,11 @@ def fav3_sage_vfa_func(
 
     assert q_descale.shape == (batch, nheads_q, num_q_blocks)
     assert k_descale.shape == (batch, nheads_k, num_k_blocks)
-    assert k_repr.shape == (batch, nheads_k, num_k_blocks, head_size_qk)
+    assert m_init.shape == (batch, nheads_q, num_q_blocks, BLKQ), (
+        f"m_init shape {tuple(m_init.shape)} does not match expected "
+        f"{(batch, nheads_q, num_q_blocks, BLKQ)}"
+    )
+    assert m_init.dtype == torch.float32
 
     out_dtype = torch.bfloat16
     out_shape = (q.shape[0], q.shape[1], q.shape[2], v.shape[-1])
@@ -217,17 +287,6 @@ def fav3_sage_vfa_func(
     padded_d_model_qk = max(16, 1 << (head_size_qk - 1).bit_length())
     padded_d_model_v = max(16, 1 << (head_size_v - 1).bit_length())
 
-    # Phase 0: precompute m_init via the standalone helper kernel.
-    m_init = compute_m_init(
-        q,
-        q_descale,
-        k_repr,
-        k_descale,
-        BLKQ=BLKQ,
-        layout=layout,
-        block_k_repr=block_k_repr,
-        safety_log2=safety_log2,
-    )
     stride_mz, stride_mh, stride_mblk, stride_mr = m_init.stride()
 
     def grid(META):
@@ -283,8 +342,20 @@ def fav3_sage_vfa_wrapper_func(
     return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    exact_m_init: bool = False,
+    safety_log2: Optional[float] = None,
 ) -> torch.Tensor:
-    """High-precision API that quantizes Q/K/V internally and runs VFA."""
+    """High-precision API that handles quantization, ``k_repr`` and ``m_init``.
+
+    Set ``exact_m_init=True`` to use the true per-row max (full QK pass) as
+    ``m_init`` instead of the signed-absmax estimate.  Matches `sage_fp8`
+    accuracy on uncorrelated Q/K at the cost of a second QK pass.
+
+    ``safety_log2`` is the additive bias (log2 units) baked into ``m_init``.
+    When unset it defaults to :data:`_M_INIT_SAFETY_LOG2` for the signed-absmax
+    estimator (where it absorbs estimator under-shoot) and to 0.0 in exact mode
+    (where there is nothing to absorb).
+    """
     assert q.dtype in [torch.float16, torch.bfloat16, torch.float32]
     assert k.dtype in [torch.float16, torch.bfloat16, torch.float32]
     assert v.dtype in [torch.float16, torch.bfloat16, torch.float32]
@@ -300,6 +371,9 @@ def fav3_sage_vfa_wrapper_func(
     fp8_dtype = aiter.dtypes.fp8
     fp8_max = torch.finfo(fp8_dtype).max
 
+    if safety_log2 is None:
+        safety_log2 = 0.0 if exact_m_init else _M_INIT_SAFETY_LOG2
+
     q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
         q, k, v,
         fp8_dtype, fp8_max,
@@ -309,12 +383,22 @@ def fav3_sage_vfa_wrapper_func(
         layout=layout,
     )
 
-    k_repr = compute_k_repr_sabsmax(k_int8, BLKK=BLKK, layout=layout)
+    if exact_m_init:
+        m_init = compute_m_exact(
+            q_int8, k_int8, q_descale, k_descale,
+            BLKQ=BLKQ, BLKK=BLKK, layout=layout, safety_log2=safety_log2,
+        )
+    else:
+        k_repr = compute_k_repr_sabsmax(k_int8, BLKK=BLKK, layout=layout)
+        m_init = compute_m_init(
+            q_int8, q_descale, k_repr, k_descale,
+            BLKQ=BLKQ, layout=layout, safety_log2=safety_log2,
+        )
 
     out, lse = fav3_sage_vfa_func(
         q_int8, k_int8, v_fp8,
         q_descale, k_descale, v_descale,
-        k_repr,
+        m_init,
         softmax_scale=softmax_scale,
         return_lse=return_lse,
         layout=layout,

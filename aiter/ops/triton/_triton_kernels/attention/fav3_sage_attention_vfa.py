@@ -215,6 +215,125 @@ def _sage_vfa_m_init_kernel(
 
 
 # ----------------------------------------------------------------------------
+# Exact m-init kernel: per-row TRUE running max.
+#
+# Mirrors the hot-loop QK pipe but only emits the per-row max (no PV, no
+# softmax, no acc).  Use as a ground-truth m_init for accuracy debugging
+# or whenever the signed-absmax estimate is too sloppy for the workload
+# (e.g. uncorrelated Q/K).  Cost is one full QK pass: O(N_q * N_k * D)
+# int8 MFMA ops -- roughly half the work of the hot kernel.
+# ----------------------------------------------------------------------------
+@triton.jit
+def _sage_vfa_m_exact_kernel(
+    Q,                  # int8 [B, S_q, H_Q, D]   (bshd) or [B, H_Q, S_q, D] (bhsd)
+    K,                  # int8 [B, S_k, H_K, D]   ditto
+    Q_Descale,          # fp32 [B, H_Q, num_q_blocks]
+    K_Descale,          # fp32 [B, H_K, num_k_blocks]
+    M_Init,             # fp32 [B, H_Q, num_q_blocks, BLOCK_M] output
+    stride_qz, stride_qh, stride_qm, stride_qd,
+    stride_kz, stride_kh, stride_kn, stride_kd,
+    stride_qsz, stride_qsh, stride_qsblk,
+    stride_ksz, stride_ksh, stride_ksblk,
+    stride_mz, stride_mh, stride_mblk, stride_mr,
+    SEQLEN_Q,
+    SEQLEN_K,
+    NUM_K_BLOCKS: tl.constexpr,
+    N_EXTRA_TOKENS: tl.constexpr,
+    SAFETY,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+):
+    start_m = tl.program_id(0).to(tl.int64)
+    off_h_q = tl.program_id(1).to(tl.int64)
+    off_z = tl.program_id(2).to(tl.int64)
+
+    GROUP_SIZE: tl.constexpr = HQ // HK
+    if GROUP_SIZE != 1:
+        off_h_k = off_h_q // GROUP_SIZE
+    else:
+        off_h_k = off_h_q
+
+    PADDED_HEAD_QK: tl.constexpr = ACTUAL_BLOCK_DMODEL_QK != BLOCK_DMODEL_QK
+    LAST_BLOCK_HAS_TAIL: tl.constexpr = N_EXTRA_TOKENS > 0  # noqa: F841
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_DMODEL_QK)
+
+    q_ptrs = (
+        Q
+        + off_z * stride_qz
+        + off_h_q * stride_qh
+        + offs_m[:, None] * stride_qm
+        + offs_d[None, :] * stride_qd
+    )
+    q_mask = offs_m[:, None] < SEQLEN_Q
+    if PADDED_HEAD_QK:
+        q_mask = q_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL_QK)
+    q = tl.load(q_ptrs, mask=q_mask, other=0)
+
+    q_descale = tl.load(
+        Q_Descale + off_z * stride_qsz + off_h_q * stride_qsh + start_m * stride_qsblk
+    )
+
+    k_base = K + off_z * stride_kz + off_h_k * stride_kh
+    k_base_ptrs = (
+        k_base + offs_d[:, None] * stride_kd + offs_n[None, :] * stride_kn
+    )
+    k_descale_off = K_Descale + off_z * stride_ksz + off_h_k * stride_ksh
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+
+    if LAST_BLOCK_HAS_TAIL:
+        loop_end = NUM_K_BLOCKS - 1
+    else:
+        loop_end = NUM_K_BLOCKS
+
+    for j in range(0, loop_end):
+        start_n = (j * BLOCK_N).to(tl.int64)
+        k_ptrs = k_base_ptrs + start_n * stride_kn
+        if PADDED_HEAD_QK:
+            k = tl.load(k_ptrs, mask=offs_d[:, None] < ACTUAL_BLOCK_DMODEL_QK, other=0)
+        else:
+            k = tl.load(k_ptrs)
+        k_descale = tl.load(k_descale_off + j * stride_ksblk)
+        qk = tl.dot(q, k).to(tl.float32) * (q_descale * k_descale)
+        m_i = tl.maximum(m_i, tl.max(qk, axis=1))
+
+    if LAST_BLOCK_HAS_TAIL:
+        j_last = NUM_K_BLOCKS - 1
+        start_n = (j_last * BLOCK_N).to(tl.int64)
+        k_ptrs = k_base_ptrs + start_n * stride_kn
+        if PADDED_HEAD_QK:
+            k = tl.load(k_ptrs, mask=offs_d[:, None] < ACTUAL_BLOCK_DMODEL_QK, other=0)
+        else:
+            k = tl.load(k_ptrs)
+        k_descale = tl.load(k_descale_off + j_last * stride_ksblk)
+        qk = tl.dot(q, k).to(tl.float32) * (q_descale * k_descale)
+        # Mask invalid columns in tail block.
+        boundary = tl.full([BLOCK_N], N_EXTRA_TOKENS, dtype=tl.int32)
+        valid_n = offs_n < boundary
+        qk = tl.where(valid_n[None, :], qk, float("-inf"))
+        m_i = tl.maximum(m_i, tl.max(qk, axis=1))
+
+    valid = m_i != float("-inf")
+    m_i = tl.where(valid, m_i + SAFETY, m_i)
+
+    m_ptrs = (
+        M_Init
+        + off_z * stride_mz
+        + off_h_q * stride_mh
+        + start_m * stride_mblk
+        + tl.arange(0, BLOCK_M) * stride_mr
+    )
+    tl.store(m_ptrs, m_i, mask=offs_m < SEQLEN_Q)
+
+
+# ----------------------------------------------------------------------------
 # Main VFA attention kernel.
 #
 # Single tight loop, structurally close to the sage_fp8 inner body but with

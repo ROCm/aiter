@@ -28,9 +28,16 @@ from aiter.ops.triton.attention.fav3_sage import (
 )
 from aiter.ops.triton.attention.fav3_sage_vfa import (
     compute_k_repr_sabsmax,
+    compute_m_exact,
+    compute_m_init,
     fav3_sage_vfa_func,
     fav3_sage_vfa_wrapper_func,
 )
+
+# When True the VFA kernel uses the true per-row max (full QK pass) as
+# ``m_init`` instead of the cheap signed-absmax estimate.  Matches `sage_fp8`
+# accuracy on uncorrelated Q/K at the cost of a second QK pass.
+EXACT_M = True
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_func,
     fav3_sage_mxfp4_wrapper,
@@ -255,11 +262,13 @@ def _make_sage_fp8_vfa_runner(
             softmax_scale=softmax_scale,
             return_lse=False,
             layout=args.layout,
+            exact_m_init=EXACT_M,
         )
 
     cfg = get_sage_fwd_configs()
     fp8_type = aiter.dtypes.fp8
     fp8_max = torch.finfo(fp8_type).max
+    BLKQ, BLKK = cfg["BLOCK_M"], cfg["BLOCK_N"]
 
     q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale = sage_quant(
         q,
@@ -267,13 +276,23 @@ def _make_sage_fp8_vfa_runner(
         v,
         fp8_type,
         fp8_max,
-        BLKQ=cfg["BLOCK_M"],
-        BLKK=cfg["BLOCK_N"],
+        BLKQ=BLKQ,
+        BLKK=BLKK,
         sm_scale=softmax_scale,
         layout=args.layout,
     )
 
-    k_repr = compute_k_repr_sabsmax(k_int8, BLKK=cfg["BLOCK_N"], layout=args.layout)
+    if EXACT_M:
+        m_init = compute_m_exact(
+            q_int8, k_int8, q_scale, k_scale,
+            BLKQ=BLKQ, BLKK=BLKK, layout=args.layout, safety_log2=0.0,
+        )
+    else:
+        k_repr = compute_k_repr_sabsmax(k_int8, BLKK=BLKK, layout=args.layout)
+        m_init = compute_m_init(
+            q_int8, q_scale, k_repr, k_scale,
+            BLKQ=BLKQ, layout=args.layout,
+        )
 
     return lambda: fav3_sage_vfa_func(
         q_int8,
@@ -282,7 +301,7 @@ def _make_sage_fp8_vfa_runner(
         q_scale,
         k_scale,
         v_scale,
-        k_repr,
+        m_init,
         softmax_scale=softmax_scale,
         return_lse=False,
         layout=args.layout,
