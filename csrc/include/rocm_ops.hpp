@@ -3,6 +3,7 @@
 #pragma once
 
 #include "aiter_tensor.h"
+#include "mx_quant_utils.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -14,57 +15,67 @@ namespace py = pybind11;
         [](int64_t stream_ptr) { aiter::setCurrentHIPStream((hipStream_t)stream_ptr); }, \
         py::arg("stream_ptr"));
 
-#define AITER_CORE_PYBIND                                           \
-    pybind11::enum_<QuantType>(m, "QuantType")                      \
-        .value("No", QuantType::No)                                 \
-        .value("per_Tensor", QuantType::per_Tensor)                 \
-        .value("per_Token", QuantType::per_Token)                   \
-        .value("per_1x32", QuantType::per_1x32)                     \
-        .value("per_1x128", QuantType::per_1x128)                   \
-        .value("per_128x128", QuantType::per_128x128)               \
-        .value("per_256x128", QuantType::per_256x128)               \
-        .value("per_1024x128", QuantType::per_1024x128)             \
-        .export_values();                                           \
-    pybind11::enum_<ActivationType>(m, "ActivationType")            \
-        .value("No", ActivationType::No)                            \
-        .value("Silu", ActivationType::Silu)                        \
-        .value("Gelu", ActivationType::Gelu)                        \
-        .value("Swiglu", ActivationType::Swiglu)                    \
-        .export_values();                                           \
-    pybind11::implicitly_convertible<int, QuantType>();             \
-    pybind11::implicitly_convertible<int, ActivationType>();        \
-    AITER_SET_STREAM_PYBIND                                         \
-    pybind11::class_<aiter_tensor_t>(m, "aiter_tensor_t")           \
-        .def(pybind11::init<>())                                    \
-        .def(pybind11::init([](int64_t data_ptr,                    \
-                               size_t numel,                        \
-                               int ndim,                            \
-                               const std::vector<int64_t>& shape,   \
-                               const std::vector<int64_t>& strides, \
-                               int dtype,                           \
-                               int device_id) {                     \
-                 aiter_tensor_t at{};                               \
-                 at.ptr    = (void*)data_ptr;                       \
-                 at.numel_ = numel;                                 \
-                 at.ndim   = ndim;                                  \
-                 for(int i = 0; i < ndim && i < 8; i++)             \
-                 {                                                  \
-                     at.shape[i]   = shape[i];                      \
-                     at.strides[i] = strides[i];                    \
-                 }                                                  \
-                 at.dtype_    = (AiterDtype)dtype;                  \
-                 at.device_id = device_id;                          \
-                 return at;                                         \
-             }),                                                    \
-             pybind11::arg("data_ptr"),                             \
-             pybind11::arg("numel"),                                \
-             pybind11::arg("ndim"),                                 \
-             pybind11::arg("shape"),                                \
-             pybind11::arg("strides"),                              \
-             pybind11::arg("dtype"),                                \
-             pybind11::arg("device_id"))                            \
-        .def_readwrite("numel_", &aiter_tensor_t::numel_)           \
-        .def_readwrite("ndim", &aiter_tensor_t::ndim)               \
+#define AITER_CORE_PYBIND                                                                      \
+    pybind11::enum_<QuantType>(m, "QuantType")                                                 \
+        .value("No", QuantType::No)                                                            \
+        .value("per_Tensor", QuantType::per_Tensor)                                            \
+        .value("per_Token", QuantType::per_Token)                                              \
+        .value("per_1x32", QuantType::per_1x32)                                               \
+        .value("per_1x128", QuantType::per_1x128)                                             \
+        .value("per_128x128", QuantType::per_128x128)                                         \
+        .value("per_256x128", QuantType::per_256x128)                                         \
+        .value("per_1024x128", QuantType::per_1024x128)                                       \
+        .export_values();                                                                      \
+    pybind11::enum_<ActivationType>(m, "ActivationType")                                       \
+        .value("No", ActivationType::No)                                                       \
+        .value("Silu", ActivationType::Silu)                                                   \
+        .value("Gelu", ActivationType::Gelu)                                                   \
+        .value("Swiglu", ActivationType::Swiglu)                                              \
+        .export_values();                                                                      \
+    pybind11::enum_<aiter::MxScaleRoundMode>(m, "MxScaleRoundMode")                            \
+        .value("RoundDown", aiter::MxScaleRoundMode::RoundDown)                                \
+        .value("RoundUp",   aiter::MxScaleRoundMode::RoundUp)                                  \
+        .value("Even",      aiter::MxScaleRoundMode::Even)                                     \
+        .value("Ceil",      aiter::MxScaleRoundMode::Ceil)                                     \
+        .export_values();                                                                      \
+    pybind11::enum_<aiter::MxDtype>(m, "MxDtype")                                              \
+        .value("FP4_E2M1",      aiter::MxDtype::FP4_E2M1)                                      \
+        .value("FP8_E4M3",      aiter::MxDtype::FP8_E4M3)                                      \
+        .value("FP8_E4M3_FNUZ", aiter::MxDtype::FP8_E4M3_FNUZ)                                 \
+        .export_values();                                                                      \
+    pybind11::implicitly_convertible<int, QuantType>();                                         \
+    pybind11::implicitly_convertible<int, ActivationType>();                                    \
+    pybind11::implicitly_convertible<int, aiter::MxScaleRoundMode>();                          \
+    pybind11::implicitly_convertible<int, aiter::MxDtype>();                                   \
+    m.attr("kDefaultMxScaleRoundMode") = static_cast<int>(aiter::kDefaultMxScaleRoundMode);    \
+    AITER_SET_STREAM_PYBIND                                                                    \
+    pybind11::class_<aiter_tensor_t>(m, "aiter_tensor_t")                                      \
+        .def(pybind11::init<>())                                                               \
+        .def(pybind11::init([](int64_t data_ptr, size_t numel, int ndim,                       \
+                               const std::vector<int64_t>& shape,                              \
+                               const std::vector<int64_t>& strides,                            \
+                               int dtype, int device_id) {                                     \
+                 aiter_tensor_t at{};                                                          \
+                 at.ptr = (void*)data_ptr;                                                     \
+                 at.numel_ = numel;                                                            \
+                 at.ndim = ndim;                                                               \
+                 for(int i = 0; i < ndim && i < 8; i++) {                                      \
+                     at.shape[i] = shape[i];                                                   \
+                     at.strides[i] = strides[i];                                               \
+                 }                                                                             \
+                 at.dtype_ = (AiterDtype)dtype;                                                \
+                 at.device_id = device_id;                                                     \
+                 return at;                                                                    \
+             }),                                                                               \
+             pybind11::arg("data_ptr"),                                                        \
+             pybind11::arg("numel"),                                                           \
+             pybind11::arg("ndim"),                                                            \
+             pybind11::arg("shape"),                                                           \
+             pybind11::arg("strides"),                                                         \
+             pybind11::arg("dtype"),                                                           \
+             pybind11::arg("device_id"))                                                       \
+        .def_readwrite("numel_", &aiter_tensor_t::numel_)                                      \
+        .def_readwrite("ndim", &aiter_tensor_t::ndim)                                          \
         .def_readwrite("device_id", &aiter_tensor_t::device_id);
 
 #define ACTIVATION_PYBIND                                \
