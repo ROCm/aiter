@@ -831,6 +831,20 @@ def _maybe_broadcast_w2_scale_for_smalltile(
     """
     if w2_scale is None:
         return w2_scale
+    # [W8 T19b fix — b_scale ÷8 bug] DISABLE the per-NPerBlock broadcast.
+    # Root cause (GPU-verified, ck e90ecddea): this broadcast remapped w2_scale to a
+    # per-expert stride of ceil(N*2, NPerBlock)*ceil(K, ScaleBlockK) = 512 (NPerBlock=32
+    # granularity), but the CK gridwise stage2 kernel uses
+    #   expert_scale_stride = ceil(N, ScaleBlockN)*ceil(K, ScaleBlockK) = 64
+    # and reads the per-ScaleBlockN(128) scale layout directly — it already maps the
+    # NPerBlock < ScaleBlockN case via the thread-copy coordinate (block_n_id*NPerBlock/
+    # ScaleBlockN). The 512-vs-64 (×8) per-expert stride mismatch made the kernel read
+    # expert floor(e/8)'s scale block for EVERY expert (sink-token cos 0.11 vs correct
+    # ref; routed errors masked by neighbouring experts). With the broadcast disabled the
+    # kernel consumes the original per-128 w2_scale and matches the fp32 correct-ref
+    # exactly (sink cos→1.000, all-token cos<0.99 = 0/76). The kernel is correct; the host
+    # broadcast (added in T36 against an assumed NPerBlock-granularity contract) is stale.
+    return w2_scale
     if quant_type != QuantType.per_1x128:
         return w2_scale
     # Resolve NPerBlock: explicit kernelName has priority, then heuristic.
