@@ -109,6 +109,27 @@ TESTS = [
         "comment": "Standalone performance job is too long for PR validation.",
         "run_on_schedule": True,
     },
+    {
+        # GLM-5.1-MXFP4 (InferenceX MI355X frontier model) SGLang accuracy gate.
+        # Uses SGLang's own registered regression test, which exists specifically
+        # to catch AITER GLM-5.1-MXFP4 TP=2 accuracy drops on gfx950 (bad BF16
+        # GEMM path). TP=2 -> run on the 2-GPU pool to avoid the saturated 8-GPU
+        # queue (8-GPU downstream jobs queue 15-55 min under nightly burst).
+        "runner": "linux-aiter-do-mi350x-2",
+        "label": "MI35X",
+        "model": "GLM-5.1-MXFP4",
+        "model_id": "amd/GLM-5.1-MXFP4",
+        # No model_path_env: the SGLang test hardcodes amd/GLM-5.1-MXFP4 and does
+        # not import os, so it pulls from HF (as SGLang's own nightly CI does).
+        # Add a /models cache patch (with an os import) in a follow-up if the HF
+        # download becomes the bottleneck.
+        "test_type": "Accuracy",
+        "timeout_minutes": 110,
+        "extra_exec_args": "",
+        "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-2-gpu-mi35x-glm51-mxfp4 --nightly --timeout-per-file 5400",
+        "run_on_pr": True,
+        "run_on_schedule": True,
+    },
 ]
 
 
