@@ -212,6 +212,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
+    use_chunk_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
 ):
@@ -222,7 +223,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     h layout [V, K] instead of [K, V].
 
     When use_chunk_hip=True, hidden state computation uses a HIP kernel
-    instead of Triton.
+    instead of Triton. When use_chunk_flydsl=True, hidden state computation
+    uses the FlyDSL kernel. The two flags are mutually exclusive.
 
     Args:
         q: [B, T, Hg, K]
@@ -234,7 +236,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         initial_state: optional [N, H, V, K] — note transposed h layout
         output_final_state: bool
         cu_seqlens: [N+1] optional
-        use_chunk_hip: bool — use HIP kernel for hidden state computation
+        use_chunk_hip: bool — use HIP kernel for hidden state (K5)
+        use_chunk_flydsl: bool — use FlyDSL kernel for hidden state (K5)
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
         use_exp2: bool — use exp2 instead of exp for gate computation
@@ -245,6 +248,11 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             - o: [B, T, H, V]
             - final_state: [N, H, V, K] if output_final_state=True, else None
     """
+    if use_chunk_hip and use_chunk_flydsl:
+        raise ValueError(
+            "use_chunk_hip and use_chunk_flydsl are mutually exclusive; "
+            "set at most one."
+        )
     g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         k=k,
         beta=beta,
@@ -279,6 +287,26 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             state_dtype=state_dtype,
             use_exp2=use_exp2,
             g_head_major=True,
+        )
+    elif use_chunk_flydsl:
+        # FlyDSL K5 wrapper expects ``g`` in head-major [B, H, T] layout
+        # (matches Triton VK / HIP). ``g_cumsum`` from K1+K2 is already
+        # head-major, so pass it through directly. The wrapper accepts
+        # ``use_exp2`` as a kwarg and pre-scales ``gk`` internally.
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            chunk_gated_delta_rule_fwd_h_flydsl,
+        )
+
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl(
+            k=k,
+            w=w,
+            u=u,
+            g=g_cumsum,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            state_dtype=state_dtype,
+            use_exp2=use_exp2,
         )
     else:
         h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(

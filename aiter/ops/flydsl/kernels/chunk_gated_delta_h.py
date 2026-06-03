@@ -88,7 +88,6 @@ def compile_chunk_gated_delta_h(
     WU_CONTIGUOUS: bool = True,
     STATE_DTYPE_BF16: bool = False,
     G_IS_LOG2_SCALED: bool = False,
-    G_HEAD_MAJOR: bool = False,
 ):
     """Compile the GDN K5 kernel.
 
@@ -153,7 +152,7 @@ def compile_chunk_gated_delta_h(
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    _K5_KERNEL_REVISION = 24  # rev23 + G_HEAD_MAJOR experimental switch (head-major g layout: offset = i_h * T_flat + (bos+row), stride=1)
+    _K5_KERNEL_REVISION = 25  # rev24, drop token-major g path: g layout is fixed to head-major [B, H, T] (offset = i_h * T_flat + (bos+row), stride=1) to match Triton VK / HIP K5
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -553,18 +552,10 @@ def compile_chunk_gated_delta_h(
             # bookkeeping (slot_assignments, EXTRAS_PER_SLOT, etc.) was done
             # at compile-time in the enclosing compile_chunk_gated_delta_h
             # scope to avoid AST-rewriter interference.
-            # G layout (compile-time switch via G_HEAD_MAJOR):
-            #   token-major (default, matches K1+K2 producer):
-            #       g[(bos + row) * H + i_h]   -- stride H between consecutive
-            #       tokens of the same head; scalar load.
-            #   head-major (experimental, requires caller to transpose g into
-            #   ``[H, T_total]`` before launch):
-            #       g[i_h * T_flat + (bos + row)]  -- stride 1; consecutive
-            #       tokens of the same head are contiguous in HBM.
-            if const_expr(G_HEAD_MAJOR):
-                g_last_off = i_h * T_flat + (bos + last_idx_raw)
-            else:
-                g_last_off = (bos + last_idx_raw) * fx.Int32(H) + i_h
+            # G layout: head-major [B, H, T_flat] (matches Triton VK / HIP).
+            # Each head's gate values are contiguous in HBM (stride=1):
+            #     g[i_h * T_flat + (bos + row)]
+            g_last_off = i_h * T_flat + (bos + last_idx_raw)
             g_row_off_list = []
             g_row_in_bounds = []
             for elem_i in range_constexpr(4):
@@ -576,10 +567,7 @@ def compile_chunk_gated_delta_h(
                 )
                 in_bounds = abs_row < T_local
                 safe_row = in_bounds.select(abs_row, fx.Int32(0))
-                if const_expr(G_HEAD_MAJOR):
-                    g_row_off = i_h * T_flat + (bos + safe_row)
-                else:
-                    g_row_off = (bos + safe_row) * fx.Int32(H) + i_h
+                g_row_off = i_h * T_flat + (bos + safe_row)
                 g_row_off_list.append(g_row_off)
                 g_row_in_bounds.append(in_bounds)
             g_last_prefetch_cell = [None]

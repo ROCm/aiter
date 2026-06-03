@@ -452,6 +452,7 @@ def chunk_gated_delta_rule_opt_vk(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
+    use_chunk_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -473,7 +474,9 @@ def chunk_gated_delta_rule_opt_vk(
         output_final_state (bool): Whether to output final state `[N, H, V, K]`.
         use_qk_l2norm_in_kernel (bool): Whether to use L2 normalization.
         cu_seqlens (torch.LongTensor, optional): Cumulative sequence lengths `[N+1]`.
-        use_chunk_hip (bool): Use HIP kernel for hidden state computation.
+        use_chunk_hip (bool): Use HIP kernel for hidden state (K5).
+        use_chunk_flydsl (bool): Use FlyDSL kernel for hidden state (K5).
+            Mutually exclusive with ``use_chunk_hip``.
         state_dtype (torch.dtype, optional): Initial/final state dtype
             (`fp32` or `bf16`), supported by both the HIP and Triton paths.
         use_exp2 (bool): Use exp2 instead of exp for gate computation.
@@ -518,6 +521,7 @@ def chunk_gated_delta_rule_opt_vk(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         use_chunk_hip=use_chunk_hip,
+        use_chunk_flydsl=use_chunk_flydsl,
         state_dtype=state_dtype,
         use_exp2=use_exp2,
     )

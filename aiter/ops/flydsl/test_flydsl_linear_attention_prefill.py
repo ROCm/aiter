@@ -523,8 +523,10 @@ def _make_inputs(
     k = torch.randn(B, T_total, Hg, K_dim, dtype=dtype, device=device) * 0.1
     w_orig = torch.randn(B, T_total, H, K_dim, dtype=dtype, device=device) * 0.1
     u_orig = torch.randn(B, T_total, H, V_dim, dtype=dtype, device=device) * 0.1
-    g = torch.randn(T_total, H, dtype=torch.float32, device=device).abs() * -0.5
-    g = g.cumsum(dim=0)
+    # g is head-major [H, T_total] (matches Triton VK / HIP / FlyDSL K5).
+    # cumsum is along the T dim.
+    g = torch.randn(H, T_total, dtype=torch.float32, device=device).abs() * -0.5
+    g = g.cumsum(dim=1)
 
     w_c = w_orig.permute(0, 2, 1, 3).contiguous()
     u_c = u_orig.permute(0, 2, 1, 3).contiguous()
@@ -611,8 +613,8 @@ def ref_chunk_gated_delta_rule_fwd_h(
                     v_new_out[b_idx, bos + t_start : bos + t_end, i_h] = b_v
 
                     last_idx = bos + t_end - 1
-                    g_last = g[last_idx, i_h].float()
-                    g_chunk = g[bos + t_start : bos + t_end, i_h].float()
+                    g_last = g[i_h, last_idx].float()
+                    g_chunk = g[i_h, bos + t_start : bos + t_end].float()
 
                     mask = torch.zeros(BT_dim, device=k.device)
                     mask[:actual_bt] = 1.0
@@ -849,11 +851,17 @@ class TestCorrectness:
         # ``H = T`` and try to allocate ``(B, NT, T, V, K)`` for ``h``
         # (terabytes for long contexts). vLLM supports GQA natively, so we
         # also do NOT repeat_interleave ``k``.
+        # vLLM's upstream K5 host wrapper indexes ``g`` as token-major
+        # ``[T_total, H]`` (FLA's original layout). Our test fixture now
+        # produces ``g`` in head-major ``[H, T_total]`` (matching the
+        # aiter / FlyDSL K5 convention), so transpose+contiguous it back
+        # to token-major before launching vLLM.
+        g_token_major = g.transpose(0, 1).contiguous()
         h_vllm, vn_vllm, fs_vllm = chunk_gated_delta_rule_fwd_h_vllm(
             k,
             w_orig,
             u_orig,
-            g=g,
+            g=g_token_major,
             initial_state=h0,
             output_final_state=args.output_final_state,
             cu_seqlens=cu,
@@ -1823,7 +1831,17 @@ def chunk_gated_delta_rule_fwd_h_origin_opt(
 
     # USE_EXP2=True expects gates pre-scaled by 1/ln(2). Cheap elementwise
     # op; excluded from kernel time when profiled via torch.profiler.
-    g_scaled = g * _RCP_LN2 if g is not None else None
+    # ``triton_origin_opt`` reads g with token-major offsets
+    # ``(bos*H + row*H + i_h)`` so transpose head-major [H, T_total] back
+    # to token-major [T_total, H] before launch.
+    if g is not None:
+        if g.dim() == 2:
+            g_for_kernel = g.transpose(0, 1).contiguous()  # [T_total, H]
+        else:
+            g_for_kernel = g.transpose(-2, -1).contiguous()
+        g_scaled = g_for_kernel * _RCP_LN2
+    else:
+        g_scaled = None
 
     def grid(meta):
         return (_triton.cdiv(V, meta["BV"]), N * H)
