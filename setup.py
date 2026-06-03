@@ -20,7 +20,9 @@ PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
-if IS_WINDOWS:
+# Single skip-C++/HIP-build gate; Windows enables it automatically.
+AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1" or IS_WINDOWS
+if AITER_TRITON_ONLY:
     ENABLE_CK = False
     PREBUILD_KERNELS = False
 
@@ -54,7 +56,7 @@ def is_develop_mode():
     return False
 
 
-if not IS_WINDOWS and is_develop_mode():
+if not AITER_TRITON_ONLY and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
         from packaging.version import Version
@@ -159,7 +161,7 @@ def prepare_packaging():
         shutil.copytree("3rdparty", "aiter_meta/3rdparty")
     else:
         os.makedirs("aiter_meta/3rdparty", exist_ok=True)
-    if not IS_WINDOWS:
+    if not AITER_TRITON_ONLY:
         shutil.copytree("hsa", "aiter_meta/hsa")
     else:
         os.makedirs("aiter_meta/hsa", exist_ok=True)
@@ -197,7 +199,7 @@ def _is_metadata_only():
 
 
 # Defer heavy imports until build time
-if not _is_metadata_only() and not IS_WINDOWS:
+if not _is_metadata_only() and not AITER_TRITON_ONLY:
     import json
     from concurrent.futures import ThreadPoolExecutor
 
@@ -459,7 +461,7 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
-if IS_WINDOWS:
+if AITER_TRITON_ONLY:
     install_requires = ["einops", "packaging", "psutil"]
 else:
     install_requires = [
