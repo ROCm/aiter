@@ -45,13 +45,15 @@ if not hasattr(_Float64, "_reusable_slot_spec"):
     _Float64._reusable_ctype = ctypes.c_double
 
 from fmha_kernel_gfx1250 import (
-    fmha_fwd_kernel,
+    compile_fmha_fwd,
     BLOCK_SIZE,
     _lds_alloc_k_a,
     _lds_alloc_k_b,
     _lds_alloc_v_a,
     _lds_alloc_v_b,
 )
+
+fmha_fwd_kernel = compile_fmha_fwd(is_causal=True)
 
 HEAD_QK = 192
 HEAD_V = 128

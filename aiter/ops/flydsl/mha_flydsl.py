@@ -85,6 +85,8 @@ def _ensure_kernel(is_causal: bool):
     _lds_alloc_v_b = mod._lds_alloc_v_b
     _BLOCK_SIZE = mod.BLOCK_SIZE
 
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!enter")
+
     @flyc.jit
     def _launch(
         ptr_O: fx.Tensor,
@@ -135,6 +137,7 @@ def _ensure_kernel(is_causal: bool):
             block=(_BLOCK_SIZE, 1, 1),
         )
 
+    _launch.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
     _launch_fns[is_causal] = _launch
 
 

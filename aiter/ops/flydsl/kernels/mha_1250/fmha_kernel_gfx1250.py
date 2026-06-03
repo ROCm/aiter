@@ -42,6 +42,7 @@ Causal mask always on. num_tiles = bx + 1 (triangular).
 
 from __future__ import annotations
 
+import functools
 import os
 import sys
 
@@ -674,6 +675,11 @@ def _load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
 # Unified FMHA Kernel
 # ============================================================================
 
+@functools.lru_cache(maxsize=None)
+def compile_fmha_fwd(*, is_causal: bool = False):
+    """Compile FMHA kernel variant. Cached per is_causal value."""
+    IS_CAUSAL = int(is_causal)
+
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def fmha_fwd_kernel(
         ptr_O: fx.Tensor,
@@ -684,22 +690,13 @@ def _load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
         ptr_cu_seqlens_q: fx.Tensor,
         ptr_cu_seqlens_k: fx.Tensor,
         scalar_f: fx.Float32,
-        kv_seq_len: fx.Int32,
         stride_q_seq: fx.Int32,
-        stride_q_tg: fx.Int32,
-        stride_q_head: fx.Int32,
-        stride_q_batch: fx.Int32,
-        gqa: fx.Int32,
         stride_k_seq: fx.Int32,
-        stride_k_head: fx.Int32,
-        stride_k_batch: fx.Int32,
         stride_v_seq: fx.Int32,
-        stride_v_head: fx.Int32,
-        stride_v_batch: fx.Int32,
         stride_o_seq: fx.Int32,
-        stride_o_head: fx.Int32,
-        stride_o_batch: fx.Int32,
-        q_seq_len: fx.Int32,
+        gqa: fx.Int32,
+        max_seqlen_q: fx.Int32,
+        max_seqlen_k: fx.Int32,
     ):
         """D128 BF16 FMHA Forward — full kernel with dynamic KV loop.
     
@@ -719,21 +716,17 @@ def _load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
     
         scalar_f = _to_raw(scalar_f)
         stride_q_seq = _to_raw(stride_q_seq)
-        stride_q_tg = _to_raw(stride_q_tg)
-        stride_q_head = _to_raw(stride_q_head)
-        stride_q_batch = _to_raw(stride_q_batch)
-        gqa = _to_raw(gqa)
         stride_k_seq = _to_raw(stride_k_seq)
-        stride_k_head = _to_raw(stride_k_head)
-        stride_k_batch = _to_raw(stride_k_batch)
         stride_v_seq = _to_raw(stride_v_seq)
-        stride_v_head = _to_raw(stride_v_head)
-        stride_v_batch = _to_raw(stride_v_batch)
         stride_o_seq = _to_raw(stride_o_seq)
-        stride_o_head = _to_raw(stride_o_head)
-        stride_o_batch = _to_raw(stride_o_batch)
+        gqa = _to_raw(gqa)
+        max_seqlen_q_raw = _to_raw(max_seqlen_q)
+        max_seqlen_k_raw = _to_raw(max_seqlen_k)
+
+        # Per-head byte / elem strides are compile-time (THD packed layout).
+        _HEAD_BYTES_QK = QK_HDIM * KV_BPP   # 384
+        _HEAD_BYTES_V = V_HDIM * KV_BPP     # 256
         # actual_q_len / actual_kv_len are derived later from cu_seqlens (THD).
-        # kv_seq_len / q_seq_len params are kept for API compatibility but unused.
     
         ty = _get_types()
     
@@ -916,14 +909,15 @@ def _load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
             _q_tok = _mlir_arith.AddIOp(
                 q_start_tok,
                 _mlir_arith.MulIOp(_to_raw(bx), _to_raw(arith.constant(128, type=T.i32))).result).result
+            _head_qk_bytes_v = _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))
             q_offset = _mlir_arith.AddIOp(
                 _mlir_arith.MulIOp(_q_tok, stride_q_seq).result,
-                _mlir_arith.MulIOp(_to_raw(by), stride_q_head).result).result
+                _mlir_arith.MulIOp(_to_raw(by), _head_qk_bytes_v).result).result
             _q_end_byte = _mlir_arith.AddIOp(
                 _mlir_arith.MulIOp(q_end_tok, stride_q_seq).result,
-                _mlir_arith.MulIOp(_to_raw(by), stride_q_head).result).result
+                _mlir_arith.MulIOp(_to_raw(by), _head_qk_bytes_v).result).result
             _q_num_bytes = _mlir_arith.AddIOp(
-                _q_end_byte, stride_q_head).result
+                _q_end_byte, _head_qk_bytes_v).result
             q_rsrc = buffer_ops.create_buffer_resource(
                 ptr_Q, num_records_bytes=_q_num_bytes)
     
@@ -967,10 +961,12 @@ def _load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
             # THD: K/V batch offset = k_start_tok * stride_{k,v}_seq
             k_offset = _mlir_arith.AddIOp(
                 _mlir_arith.MulIOp(k_start_tok, stride_k_seq).result,
-                _mlir_arith.MulIOp(_to_raw(head_index), stride_k_head).result).result
+                _mlir_arith.MulIOp(_to_raw(head_index),
+                    _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))).result).result
             v_offset = _mlir_arith.AddIOp(
                 _mlir_arith.MulIOp(k_start_tok, stride_v_seq).result,
-                _mlir_arith.MulIOp(_to_raw(head_index), stride_v_head).result).result
+                _mlir_arith.MulIOp(_to_raw(head_index),
+                    _to_raw(arith.constant(_HEAD_BYTES_V, type=T.i32))).result).result
     
             # SmemAllocator bases → i32 LDS addresses
             k_a_base_i32 = _extract_lds_base_i32(_lds_alloc_k_a.get_base())
@@ -2095,9 +2091,9 @@ def _load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
                 _glbpt = ir.Type.parse("!llvm.ptr<1>")
                 # THD O byte offset:
                 #   _o_tok = q_start_tok + bx*128 + wave*32       (absolute token index)
-                #   elem_off = by*stride_o_head + _o_tok*stride_o_seq
+                #   elem_off = by*V_HDIM + _o_tok*stride_o_seq
                 #   byte_off = elem_off * BPP(=2)
-                # Note: stride_o_{seq,head} are in ELEMENT units (test_acc uses *_e).
+                # stride_o_seq is in ELEMENT units; per-head stride is V_HDIM (THD packed).
                 _o_tok = _sa2.AddIOp(
                     _sa2.AddIOp(
                         q_start_tok,
@@ -2106,7 +2102,7 @@ def _load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
                     _sa2.MulIOp(_wsgpr, _raw(arith.constant(WV_SUBQD, type=T.i32))).result,
                 ).result
                 _o_elem_off = _sa2.AddIOp(
-                    _sa2.MulIOp(by, stride_o_head).result,
+                    _sa2.MulIOp(by, _raw(arith.constant(V_HDIM, type=T.i32))).result,
                     _sa2.MulIOp(_o_tok, stride_o_seq).result,
                 ).result
                 _o_raw = ptr_O.__extract_to_ir_values__()[0]
@@ -2245,3 +2241,5 @@ def _load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
                     ep_v_cur_base,
                     list(ep_old_max), list(ep_local_max), list(ep_delta), list(ep_row_sums),
                 )
+
+    return fmha_fwd_kernel
