@@ -104,8 +104,8 @@ def get_mhc_fused_post_pre_splitk(m: int, hidden_size: int) -> tuple[int, int]:
     tile_m = 16
     num_cu = get_cu_num()
     tile_k_tg_dict = {
-        64: 4 * num_cu,
-        32: 8 * num_cu,
+        64: 2 * num_cu,
+        32: 4 * num_cu,
     }
     selected_splitk = 1
     selected_tile_k = 32
@@ -311,9 +311,10 @@ def mhc_fused_post_pre(
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
     hidden_size = residual_in.size(2)
-    assert layer_input.shape == (m, hidden_size), (
-        f"layer_input shape mismatch: expected ({m}, {hidden_size}), got {tuple(layer_input.shape)}"
-    )
+    assert layer_input.shape == (
+        m,
+        hidden_size,
+    ), f"layer_input shape mismatch: expected ({m}, {hidden_size}), got {tuple(layer_input.shape)}"
     assert residual_in.shape == (m, hc_mult, hidden_size), (
         f"residual_in shape mismatch: expected ({m}, {hc_mult}, {hidden_size}), "
         f"got {tuple(residual_in.shape)}"
@@ -327,9 +328,10 @@ def mhc_fused_post_pre(
 
     if post_layer_mix.ndim == 3:
         post_layer_mix = post_layer_mix.squeeze(-1)
-    assert post_layer_mix.shape == (m, hc_mult), (
-        f"post_layer_mix shape mismatch: expected ({m}, {hc_mult}), got {tuple(post_layer_mix.shape)}"
-    )
+    assert post_layer_mix.shape == (
+        m,
+        hc_mult,
+    ), f"post_layer_mix shape mismatch: expected ({m}, {hc_mult}), got {tuple(post_layer_mix.shape)}"
     assert comb_res_mix.shape == (m, hc_mult, hc_mult), (
         f"comb_res_mix shape mismatch: expected ({m}, {hc_mult}, {hc_mult}), "
         f"got {tuple(comb_res_mix.shape)}"
