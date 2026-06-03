@@ -23,14 +23,38 @@ if is_flydsl_available():
     from aiter.ops.flydsl import (
         flydsl_per_1x32_fp4_quant_block_rotation_mfma,
         flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort,
+        flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace,
     )
 else:  # noqa: E501
     flydsl_per_1x32_fp4_quant_block_rotation_mfma = None  # type: ignore[assignment]
     flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort = None  # type: ignore[assignment]
+    flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace = None  # type: ignore[assignment]
 
 BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+
+# Overrides for zero-init of the rotation-path padding buffers (``a2`` stage1
+# output + ``out_scale``). Default behaviour (both off): zero only on the
+# non-flydsl (CK) consumer path, since flydsl masks padding internally.
+#   AITER_FMOE_FORCE_ZERO_PADDING=1   -> always zero (even for flydsl); safety
+#                                        override e.g. for a new GEMM backend.
+#   AITER_FMOE_DISABLE_ZERO_PADDING=1 -> never zero (even for CK); for
+#                                        perf/debug. Takes precedence if both set.
+_FORCE_ZERO_PADDING = os.environ.get("AITER_FMOE_FORCE_ZERO_PADDING", "0") == "1"
+_DISABLE_ZERO_PADDING = os.environ.get("AITER_FMOE_DISABLE_ZERO_PADDING", "1") == "1"
+
+
+def _zero_padding_enabled(consumer_is_flydsl: bool) -> bool:
+    """Whether to zero-init the rotation-path padding buffers for a consumer
+    GEMM. ``AITER_FMOE_DISABLE_ZERO_PADDING`` forces off, then
+    ``AITER_FMOE_FORCE_ZERO_PADDING`` forces on; otherwise zero only when the
+    consumer is not flydsl (flydsl masks padding internally)."""
+    if _DISABLE_ZERO_PADDING:
+        return False
+    if _FORCE_ZERO_PADDING:
+        return True
+    return not consumer_is_flydsl
 
 
 def _moe_sorting_impl(
@@ -174,6 +198,7 @@ def _flydsl_rotation_mxfp4_quant_moe_sort(
     num_valid_ids,
     token_num,
     cols,
+    zero_scale_padding=False,
 ):
     """``flydsl_per_1x32_fp4_quant_block_rotation_mfma`` + MoE scale-sort.
 
@@ -183,7 +208,7 @@ def _flydsl_rotation_mxfp4_quant_moe_sort(
     quant. The rotation+quant runs in a single FlyDSL MFMA kernel; the
     scale-scatter then runs separately via :func:`mxfp4_moe_sort_fwd`.
     """
-    assert flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort is not None, (
+    assert flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace is not None, (
         "flydsl is not available; cannot apply block rotation via the "
         "fused MFMA+sort kernel"
     )
@@ -192,14 +217,32 @@ def _flydsl_rotation_mxfp4_quant_moe_sort(
         f"!= cols={cols}"
     )
     rot_transposed = _read_rot_transposed_attr(rot_R)
-    return flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort(
+    rows = int(x.shape[0])
+    out_u8 = torch.empty(rows, cols // 2, dtype=torch.uint8, device=x.device)
+    # The rotation+quant+sort kernel only writes scales for routed sorted-rows;
+    # the per-expert block-padding rows of ``out_scale`` are left untouched.
+    # A non-flydsl (CK) consumer GEMM reads those padding scales raw --
+    # uninitialised E8M0 bytes decode to NaN and leak via 0*NaN on the padded
+    # reduction (one full output row goes NaN per unlucky token). The flydsl
+    # consumer GEMM masks the padding, so zero the scale buffer up-front only
+    # when the consumer needs it; flydsl keeps the cheaper ``torch.empty``.
+    out_scale = (torch.zeros if zero_scale_padding else torch.empty)(
+        (int(sorted_ids.shape[0]) + 31) // 32 * 32,
+        cols // 32,
+        dtype=dtypes.fp8_e8m0,
+        device=x.device,
+    )
+    flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace(
+        out_u8,
         x,
         rot_R,
-        sorted_ids=sorted_ids,
-        num_valid_ids=num_valid_ids,
-        token_num=token_num,
+        out_scale,
+        sorted_ids,
+        num_valid_ids,
+        token_num,
         rot_transposed=rot_transposed,
     )
+    return out_u8.view(dtypes.fp4x2), out_scale
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
@@ -1514,6 +1557,8 @@ def _quantize_stage2_per_1x32(
             num_valid_ids=num_valid_ids2,
             token_num=token_num,
             cols=inter_dim,
+            # CK stage2 reads padding scales raw -> zero them; flydsl masks.
+            zero_scale_padding=_zero_padding_enabled(is_flydsl_stage2),
         )
         return a2.view(token_num, topk, -1), a2_scale
     if is_flydsl_stage2 and q_dtype_a2 == dtypes.fp4x2:
@@ -1694,6 +1739,9 @@ def fused_moe_2stages(
             if W1_R is not None:
                 # Fold the per-block rotation into the per-1x32 fp4 quant
                 # via flydsl_per_1x32_fp4_quant_block_rotation_mfma.
+                _flydsl_stage1 = (
+                    getattr(metadata.stage1, "func", None) is _flydsl_stage1_wrapper
+                )
                 a1, a1_scale = _flydsl_rotation_mxfp4_quant_moe_sort(
                     a1_input,
                     W1_R,
@@ -1701,6 +1749,8 @@ def fused_moe_2stages(
                     num_valid_ids=num_valid_ids,
                     token_num=token_num,
                     cols=model_dim,
+                    # CK stage1 reads padding scales raw -> zero them; flydsl masks.
+                    zero_scale_padding=_zero_padding_enabled(_flydsl_stage1),
                 )
             else:
                 a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
@@ -1753,7 +1803,23 @@ def fused_moe_2stages(
             device=device,
         )
     else:
-        a2 = torch.empty(
+        # On the per-block rotation path (W1_R/W2_R) the CK stage1 GEMM
+        # addresses its ``a2`` output with a 32-bit element offset, so once
+        # ``token * topk * inter_dim`` exceeds 2**31 it drops those stores and
+        # leaves whole tokens untouched; with many experts at small token
+        # counts it also leaves per-expert padding rows untouched. Either way
+        # ``torch.empty`` would carry non-finite garbage that the stage2 quant
+        # + final reduction turns into NaN/Inf. Zero-initialise to keep the
+        # output finite. The flydsl stage1 GEMM writes every routed row
+        # (verified 0 unwritten rows even past the 2**31 boundary), so it needs
+        # no zeroing -- gate the memset on the non-flydsl (CK) path only.
+        _flydsl_stage1 = (
+            getattr(metadata.stage1, "func", None) is _flydsl_stage1_wrapper
+        )
+        _zero_a2 = (
+            W1_R is not None or W2_R is not None
+        ) and _zero_padding_enabled(_flydsl_stage1)
+        a2 = (torch.zeros if _zero_a2 else torch.empty)(
             (token_num, topk, inter_dim),
             dtype=dtype,
             device=device,

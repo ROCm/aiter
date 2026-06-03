@@ -21,6 +21,35 @@ from aiter.fused_moe import (
 )
 
 
+def _build_rot_R(cols, mode, dtype, seed=0):
+    """Per-block rotation matrix ``(cols // 32, 32, 32)`` for W1_R / W2_R.
+
+    mode:
+      "none"     -> None (no explicit R, no rotation kernel)
+      "identity" -> identity rotation (numerical no-op; output matches the
+                    non-rotated torch reference, so checkAllclose stays valid)
+      "ortho"    -> random per-block orthonormal R (exercises the real
+                    rotation math; will NOT match the non-rotated reference)
+    """
+    g = 32
+    nblk = cols // g
+    if mode == "none":
+        return None
+    if mode == "identity":
+        return (
+            torch.eye(g, dtype=dtype, device="cuda")
+            .unsqueeze(0)
+            .expand(nblk, g, g)
+            .contiguous()
+        )
+    if mode == "ortho":
+        gen = torch.Generator(device="cpu").manual_seed(seed)
+        M = torch.randn(nblk, g, g, generator=gen, device="cpu")
+        Q, _ = torch.linalg.qr(M)
+        return Q.to(dtype).to("cuda").contiguous()
+    raise ValueError(f"unknown rotation mode {mode}")
+
+
 from aiter.ops.shuffle import (
     shuffle_weight,
     shuffle_scale_a16w4,
@@ -48,6 +77,7 @@ def test_fmoe(
     hidden_pad=0,
     intermediate_pad=0,
     preshuffle=False,
+    rotation="none",
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
@@ -231,6 +261,23 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
+    # Rotation matrices for the fused rotation+MXFP4-quant+sort kernel.
+    #   W1_R: (model_dim // 32, 32, 32) -- rotates hidden_states before stage1
+    #   W2_R: (inter_dim  // 32, 32, 32) -- rotates a2 before stage2
+    # Only the per_1x32 fp4 activation path consumes them.
+    use_rot = rotation != "none" and (
+        qType == aiter.QuantType.per_1x32 and AQDType == dtypes.fp4x2
+    )
+    W1_R = _build_rot_R(model_dim, rotation, dtype) if use_rot else None
+    W2_R = _build_rot_R(inter_dim, rotation, dtype) if use_rot else None
+    if use_rot:
+        aiter.logger.info(
+            "fused rotation enabled (mode=%s): W1_R=%s W2_R=%s",
+            rotation,
+            tuple(W1_R.shape),
+            tuple(W2_R.shape),
+        )
+
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
@@ -247,6 +294,8 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
+        W1_R=W1_R,
+        W2_R=W2_R,
         num_iters=5,
         num_warmup=2,
     )
@@ -406,6 +455,19 @@ parser.add_argument(
     e.g.: -hip 0,0""",
 )
 
+parser.add_argument(
+    "-r",
+    "--rotation",
+    type=str,
+    choices=["none", "identity", "ortho"],
+    default="identity",
+    help="""Fused rotation (W1_R/W2_R) mode for the per_1x32 fp4 path. Default: identity.
+    none     : do not pass W1_R/W2_R (no rotation kernel).
+    identity : pass identity rotation (no-op; output matches torch reference).
+    ortho    : pass random orthonormal rotation (exercises real rotation math;
+               will NOT match the non-rotated reference -> err is expected).""",
+)
+
 args = parser.parse_args()
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
@@ -490,6 +552,7 @@ for (
                         preshuffle=preshuffle,
                         hidden_pad=0,
                         intermediate_pad=0,
+                        rotation=args.rotation,
                     )
                     df.append(ret)
     else:
