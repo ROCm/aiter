@@ -31,8 +31,6 @@ No model loading at runtime — model shapes come from the pre-extracted
 model_shapes.json (see extract_conv_shapes.py for how to regenerate it).
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import os

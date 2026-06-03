@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from __future__ import annotations
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
@@ -136,7 +135,7 @@ def _conv2d_3x3_nhwc_kernel(
                 w_tile = tl.load(
                     w_ptrs, mask=c_mask[:, None] & kout_mask[None, :], other=0.0
                 )
-                acc += tl.dot(x_tile, w_tile, out_dtype=tl.float32)
+                acc = tl.dot(x_tile, w_tile, acc=acc)
 
     # Epilogue: bias + activation + store
     if HAS_BIAS:
@@ -287,7 +286,7 @@ def _conv2d_3x3_cblocked_kernel(
                 w_tile = tl.load(
                     w_ptrs, mask=c_mask[:, None] & kout_mask[None, :], other=0.0
                 )
-                acc += tl.dot(x_tile, w_tile, out_dtype=tl.float32)
+                acc = tl.dot(x_tile, w_tile, acc=acc)
 
     # Epilogue: bias + activation + store
     if HAS_BIAS:
@@ -314,17 +313,11 @@ if CONV_AUTOTUNE_ENABLED:
     _conv2d_3x3_nhwc_kernel = triton.autotune(
         configs=AUTOTUNE_3x3_NHWC_CONFIGS,
         key=["M_total", "K_out", "C_pad"],
-        reset_to_zero=["Y"],
-        warmup=50,
-        rep=200,
         cache_results=True,
     )(_conv2d_3x3_nhwc_kernel)
 
     _conv2d_3x3_cblocked_kernel = triton.autotune(
         configs=AUTOTUNE_3x3_CBLOCKED_CONFIGS,
         key=["M_total", "K_out", "C_pad"],
-        reset_to_zero=["Y"],
-        warmup=50,
-        rep=200,
         cache_results=True,
     )(_conv2d_3x3_cblocked_kernel)

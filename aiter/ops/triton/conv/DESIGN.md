@@ -127,7 +127,7 @@ aiter/ops/triton/_triton_kernels/conv/
   helpers.py           _tanh helper (shared by all kernels for the gelu path),
                        plus AUTOTUNE_*_CONFIGS candidate-config lists and the
                        CONV_AUTOTUNE_ENABLED env-var gate (consumed when
-                       AITER_CONV_AUTOTUNE=1).
+                       AITER_TRITON_CONV_AUTOTUNE=1).
                        Steady-state per-kernel configs live in JSON under
                        aiter/ops/triton/configs/conv/, loaded via
                        aiter/ops/triton/utils/conv_config_utils.py.

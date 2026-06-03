@@ -30,8 +30,6 @@ op_tests/op_benchmarks/triton/bench_conv2d.py (and, for real-model
 shapes, in op_benchmarks/triton/model_benchmarking_tool/bench_models.py).
 """
 
-from __future__ import annotations
-
 import pytest
 import torch
 

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from __future__ import annotations
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
@@ -786,7 +785,7 @@ def _winograd_f4x3_batched_gemm_kernel(
         u_mask = (offs_n[:, None] < K_out) & (k_offs[None, :] < C_pad)
         u_tile = tl.load(u_ptrs, mask=u_mask, other=0.0)
 
-        acc += tl.dot(v_tile, tl.trans(u_tile), out_dtype=tl.float32)
+        acc = tl.dot(v_tile, tl.trans(u_tile), acc=acc)
 
     m_ptrs = (
         M_out

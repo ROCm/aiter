@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from __future__ import annotations
 import triton
 import triton.language as tl
 
@@ -133,7 +132,7 @@ def _conv2d_1x1_kernel(
         w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)
 
         # Accumulate: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N]
-        acc += tl.dot(x_tile, w_tile, out_dtype=tl.float32)
+        acc = tl.dot(x_tile, w_tile, acc=acc)
 
     # Bias
     if HAS_BIAS:
@@ -166,8 +165,5 @@ if CONV_AUTOTUNE_ENABLED:
     _conv2d_1x1_kernel = triton.autotune(
         configs=AUTOTUNE_1x1_CONFIGS,
         key=["M_total", "K_out", "C"],
-        reset_to_zero=["Y"],
-        warmup=50,
-        rep=200,
         cache_results=True,
     )(_conv2d_1x1_kernel)
