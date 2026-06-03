@@ -114,7 +114,16 @@ def build_l2_aware_lim_vsa_qk_fp8_pv_fp4(
     per-K loop body tight when every q-row touches every KV block.
 
     Cost: O(n_tasks) Triton key build + O(n) radix sort + 2 small splits.
+
+    Accepts ``q2k_idx`` / ``q2k_num`` of any rank; they are internally
+    flattened to ``(n_tasks, max_kv)`` and ``(n_tasks,)``, matching what
+    the caller will subsequently feed to ``vsa_qk_fp8_pv_fp4_dropB`` after
+    its own layout normalisation.  Both inputs must be contiguous; we use
+    ``.view`` for the flatten (0-copy, raises on non-contiguous) instead of
+    ``.reshape().contiguous()`` to avoid a silent copy on the perf path.
     """
+    q2k_idx = q2k_idx.view(-1, q2k_idx.shape[-1])
+    q2k_num = q2k_num.view(-1)
     n = q2k_num.numel()
     threshold = int(max_kv * dense_ratio)
 
@@ -173,17 +182,32 @@ def vsa_qk_fp8_pv_fp4_dropB(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Launch the QK=FP8 / PV=FP4 mixed-precision VSA kernel.
 
-    Tensor layout (flattened heads, BH = B * H):
-      q, k:     (BH, T, 128)        float8_e4m3fn  (per-32-element E8M0 scale)
-      v:        (BH, T, 64)         uint8           (FP4 nibbles, 2 per byte)
-      qs, ks:   (BH, T, 4)          uint8           (E8M0 per 32-element group)
-      vs:       (BH, T/128, 128, 4) uint8           (E8M0 per K-block, HBM-coalesced)
-      q2k_idx:  (BH * num_q_blks, max_kv) int32
-      q2k_num:  (BH * num_q_blks,)        int32
-      vbs:      (num_q_blks,)              int32
-      lim:      (BH * num_q_blks,)         int32
-      out:      (BH, T, 128)               bfloat16
-      lse:      (BH, T)                    float32
+    Accepts EITHER input layout; ``out`` / ``lse`` are returned in the same
+    rank as the input so callers don't need to reshape on either side:
+
+      * **Flat ("BH")** — ``q.ndim == 3``::
+          q, k:    (BH, T, 128)            float8_e4m3fn
+          v:       (BH, T, 64)             uint8   (FP4, 2 nibbles/byte)
+          qs, ks:  (BH, T, 4)              uint8   (E8M0 per 32-elem group)
+          vs:      (BH, num_q_blks, 128, 4) uint8  (E8M0 per K-block)
+          q2k_idx: (BH * num_q_blks, max_kv) int32
+          q2k_num: (BH * num_q_blks,)        int32
+          out:     (BH, T, 128)              bfloat16
+          lse:     (BH, T)                   float32
+
+      * **Batched ("B,H")** — ``q.ndim == 4``::
+          q, k:    (B, H, T, 128)              float8_e4m3fn
+          v:       (B, H, T, 64)               uint8
+          qs, ks:  (B, H, T, 4)                uint8
+          vs:      (B, H, num_q_blks, 128, 4)  uint8
+          q2k_idx: (..., num_q_blks, max_kv)   int32   (any leading shape)
+          q2k_num: (..., num_q_blks)           int32   (any leading shape)
+          out:     (B, H, T, 128)              bfloat16  (returned in this shape)
+          lse:     (B, H, T)                   float32   (returned in this shape)
+
+    Always-flat regardless of layout::
+      vbs: (num_q_blks,)              int32
+      lim: (BH * num_q_blks,)         int32   (produced by build_l2_aware_lim_...)
 
     Numerical contract (sparsity 0.0846, seed-independent, T = 50k..1M):
       - cosine similarity vs FP32 ref: 0.9826 .. 0.9833
@@ -191,8 +215,55 @@ def vsa_qk_fp8_pv_fp4_dropB(
       - max |diff|                   : 6e-3 (T=1M) .. 2.4e-2 (T=50k)
       - no NaN / Inf at any tested size
     """
-    BH = q.shape[0]
-    assert BH % B == 0, f"q.shape[0]={BH} must be divisible by B={B}"
+    assert q.ndim in (3, 4), (
+        f"q must be 3D (BH,T,D) or 4D (B,H,T,D); got shape={tuple(q.shape)}"
+    )
+    # Kernel ABI is row-major over (BH, T, D) -- silently calling .contiguous()
+    # on a transposed view would copy hundreds of MB on every attention step.
+    # Fail-fast instead so the caller can fix it once at construction time.
+    for _name, _t in (("q", q), ("k", k), ("v", v),
+                      ("qs", qs), ("ks", ks), ("vs", vs),
+                      ("q2k_idx", q2k_idx), ("q2k_num", q2k_num), ("lim", lim)):
+        assert _t.is_contiguous(), (
+            f"vsa_qk_fp8_pv_fp4_dropB: `{_name}` must be contiguous "
+            f"(shape={tuple(_t.shape)}, strides={tuple(_t.stride())}); "
+            f"call .contiguous() at allocation time"
+        )
+
+    is_4d = q.ndim == 4
+    if is_4d:
+        B_in, H_in = q.shape[0], q.shape[1]
+        assert B == B_in, (
+            f"4D layout: q.shape[0]={B_in} but caller passed B={B}; "
+            f"these must match (B is the batch dim of q in 4D mode)"
+        )
+        BH = B_in * H_in
+        # All inputs verified contiguous above, so .view is 0-copy and safe.
+        # Contiguous (B, H, T, D) is byte-identical to (B*H, T, D) -- the
+        # flatten is purely a metadata change (shape + stride), no DMA.
+        q  = q .view(BH, *q .shape[2:])
+        k  = k .view(BH, *k .shape[2:])
+        v  = v .view(BH, *v .shape[2:])
+        qs = qs.view(BH, *qs.shape[2:])
+        ks = ks.view(BH, *ks.shape[2:])
+        vs = vs.view(BH, *vs.shape[2:])
+        q2k_idx = q2k_idx.view(BH * num_q_blks, -1)
+        q2k_num = q2k_num.view(BH * num_q_blks)
+        if lim.ndim > 1:
+            lim = lim.view(-1)
+    else:
+        BH = q.shape[0]
+
+    assert BH % B == 0, f"BH={BH} must be divisible by B={B}"
+    assert q2k_num.numel() == BH * num_q_blks, (
+        f"q2k_num.numel()={q2k_num.numel()} != BH*num_q_blks={BH*num_q_blks}; "
+        f"in 3D mode flatten q2k_num to (BH*num_q_blks,) before calling"
+    )
+    assert lim.numel() == BH * num_q_blks, (
+        f"lim.numel()={lim.numel()} != BH*num_q_blks={BH*num_q_blks}; "
+        f"lim must be flat 1D of length BH*num_q_blks"
+    )
+
     if out is None:
         out = torch.empty((BH, T, _HEAD_DIM), dtype=torch.bfloat16, device=q.device)
     if lse is None:
@@ -200,11 +271,23 @@ def vsa_qk_fp8_pv_fp4_dropB(
     if counters is None:
         counters = torch.zeros(2, dtype=torch.int32, device=q.device)
 
+    # Caller may hand us pre-allocated 4D out / 3D lse to match input layout;
+    # kernel ABI is (BH,T,D) / (BH,T) so 0-copy view-flatten before the launch.
+    out_kernel = out if out.ndim == 3 else out.view(BH, T, _HEAD_DIM)
+    lse_kernel = lse if lse.ndim == 2 else lse.view(BH, T)
+
     vsa_qk_fp8_pv_fp4(
         q, k, v,
         qs, ks, vs,
         q2k_idx, q2k_num, vbs,
-        lim, out, lse, counters,
+        lim, out_kernel, lse_kernel, counters,
         B, T, num_q_blks, max_kv, n_dense,
     )
+
+    if is_4d:
+        out = out_kernel.view(B_in, H_in, T, _HEAD_DIM)
+        lse = lse_kernel.view(B_in, H_in, T)
+    else:
+        out = out_kernel
+        lse = lse_kernel
     return out, lse
