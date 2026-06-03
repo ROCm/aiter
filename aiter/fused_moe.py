@@ -1763,7 +1763,9 @@ def fused_moe_2stages(
                 num_rows=num_local_tokens,
             )
     elif hidden_states.dtype != q_dtype_a:
-        if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+        if quant_type == QuantType.per_1x128 and getattr(
+            metadata.stage1, "func", metadata.stage1
+        ) in (asm_stage1, _flydsl_stage1_wrapper):
             quant_func = functools.partial(quant_func, transpose_scale=True)
         a1, a1_scale = quant_func(
             hidden_states,
@@ -1894,7 +1896,12 @@ def fused_moe_2stages(
         )
         a2 = a2_v
     else:
-        a2, a2_scale = quant_func(
+        a2_quant_func = quant_func
+        if quant_type == QuantType.per_1x128 and getattr(
+            metadata.stage1, "func", metadata.stage1
+        ) is _flydsl_stage1_wrapper:
+            a2_quant_func = functools.partial(a2_quant_func, transpose_scale=True)
+        a2, a2_scale = a2_quant_func(
             a2,
             scale=a2_scale,
             quant_dtype=q_dtype_a,
