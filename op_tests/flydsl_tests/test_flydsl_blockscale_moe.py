@@ -509,6 +509,7 @@ def _launch_flydsl_stage1(
     )
     stream = torch.cuda.current_stream()
     w1_shuf_flat = data["w1_bq_shuf"].view(-1)
+    _scale_ph = torch.empty(1, dtype=torch.uint8, device=DEVICE)
     compiled = flyc.compile(
         exe1,
         out1.view(-1),
@@ -520,6 +521,7 @@ def _launch_flydsl_stage1(
         sorted_e,
         sorted_w,
         num_valid,
+        _scale_ph,
         tokens,
         inter_dim,
         model_dim,
@@ -538,6 +540,7 @@ def _launch_flydsl_stage1(
             sorted_e,
             sorted_w,
             num_valid,
+            _scale_ph,
             tokens,
             inter_dim,
             model_dim,
@@ -865,6 +868,7 @@ def _launch_flydsl_stage1_splitk(data, *, tile_m, tile_n, tile_k, k_batch, act):
         gate_mode="interleave",
     )
     stream = torch.cuda.current_stream()
+    _scale_ph = torch.empty(1, dtype=torch.uint8, device=DEVICE)
     compiled = flyc.compile(
         exe1,
         tmp_out.view(-1),
@@ -876,6 +880,7 @@ def _launch_flydsl_stage1_splitk(data, *, tile_m, tile_n, tile_k, k_batch, act):
         sorted_e,
         sorted_w,
         num_valid,
+        _scale_ph,
         tokens,
         inter_dim,
         model_dim,
@@ -894,6 +899,7 @@ def _launch_flydsl_stage1_splitk(data, *, tile_m, tile_n, tile_k, k_batch, act):
         sorted_e,
         sorted_w,
         num_valid,
+        _scale_ph,
         tokens,
         inter_dim,
         model_dim,
