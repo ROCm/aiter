@@ -398,9 +398,19 @@ def build_silu_and_mul_fq_module(
                             )
                             out_byte_off = out_row_byte_base + col0
 
+                            # Per CK pattern (vec_convert.h:46-59, aiter_opus_plus.h:34-56):
+                            # clamp scaled f32 to e4m3fnuz max (±240) before
+                            # cvt_pk_fp8_f32 — the intrinsic itself does NOT
+                            # saturate, so out-of-range inputs become fp8 NaN
+                            # (0x80) and propagate through stage2.
+                            _fp8_max = arith.constant(240.0, type=f32)
+                            _fp8_min = arith.constant(-240.0, type=f32)
                             scaled_vals = []
                             for vi in range_constexpr(VEC):
-                                scaled_vals.append(act_vals[vi] * quant_scale)
+                                s = act_vals[vi] * quant_scale
+                                s = arith.minimumf(s, _fp8_max)
+                                s = arith.maximumf(s, _fp8_min)
+                                scaled_vals.append(s)
 
                             if const_expr(VEC <= 4):
                                 packed_i32 = c0_i32
