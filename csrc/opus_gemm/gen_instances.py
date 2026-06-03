@@ -65,6 +65,34 @@ KERNEL_FUNC_MAP = {
     "a16w16_mono_tile": "gemm_a16w16_mono_tile_kernel_gfx950",
 }
 
+# 4g_safe sibling pipelines: only defined for the a16w16-family tags that have
+# matching *_4g_safe_gfx950.cuh files. Kids with is_4g_safe=True route to these
+# headers/kernel symbols instead of the legacy maps above.
+PIPELINE_HEADER_MAP_4G_SAFE = {
+    "a16w16": "gfx950/opus_gemm_pipeline_a16w16_4g_safe_gfx950.cuh",
+    "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_4g_safe_gfx950.cuh",
+    "a16w16_mono_tile": "gfx950/opus_gemm_pipeline_a16w16_mono_tile_4g_safe_gfx950.cuh",
+}
+
+KERNEL_FUNC_MAP_4G_SAFE = {
+    "a16w16": "gemm_a16w16_4g_safe_kernel",
+    "a16w16_persistent": "gemm_a16w16_persistent_4g_safe_kernel",
+    "a16w16_mono_tile": "gemm_a16w16_mono_tile_4g_safe_kernel_gfx950",
+}
+
+
+def _pipeline_header_for(k):
+    if getattr(k, "is_4g_safe", False):
+        return PIPELINE_HEADER_MAP_4G_SAFE[k.kernel_tag]
+    return PIPELINE_HEADER_MAP[k.kernel_tag]
+
+
+def _kernel_func_for(k):
+    if getattr(k, "is_4g_safe", False):
+        return KERNEL_FUNC_MAP_4G_SAFE[k.kernel_tag]
+    return KERNEL_FUNC_MAP[k.kernel_tag]
+
+
 INPUT_DTYPE_MAP = {
     "a8w8_scale": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
@@ -763,9 +791,9 @@ class opus_gemm_codegen:
                 f"LDS={info['lds_bytes'] // 1024}KiB K>={info['min_k']} WG={k.WG_PER_CU}"
             )
 
-        pipeline_header = PIPELINE_HEADER_MAP[k.kernel_tag]
+        pipeline_header = _pipeline_header_for(k)
         traits_header = TRAITS_HEADER_MAP[k.kernel_tag]
-        kernel_func = KERNEL_FUNC_MAP[k.kernel_tag]
+        kernel_func = _kernel_func_for(k)
         da, db = INPUT_DTYPE_MAP[k.kernel_tag]
         traits_name = TRAITS_NAME_MAP[k.kernel_tag]
         kargs_name = KARGS_NAME_MAP[k.kernel_tag]

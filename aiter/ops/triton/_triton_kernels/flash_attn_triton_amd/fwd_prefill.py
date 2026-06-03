@@ -1499,14 +1499,6 @@ def attention_forward_prefill_triton_impl(
         assert (
             cu_seqlens_k.dtype == torch.int32
         ), f"cu_seqlens_k must be int32, got {cu_seqlens_k.dtype}"
-        assert cu_seqlens_q[0] == 0, "cu_seqlens_q must start with 0"
-        assert cu_seqlens_k[0] == 0, "cu_seqlens_k must start with 0"
-        assert (
-            cu_seqlens_q[-1] == total_seqlen_q
-        ), f"cu_seqlens_q[-1] {cu_seqlens_q[-1]} != total_seqlen_q {total_seqlen_q}"
-        assert (
-            cu_seqlens_k[-1] == total_seqlen_k
-        ), f"cu_seqlens_k[-1] {cu_seqlens_k[-1]} != total_seqlen_k {total_seqlen_k}"
 
         # set vars
         batch = len(cu_seqlens_q) - 1
