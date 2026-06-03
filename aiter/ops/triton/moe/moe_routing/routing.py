@@ -312,7 +312,7 @@ def routing(logits, n_expts_act, sm_first=False):
     )
 
 
-def routing_a8w4(
+def routing_ds(
     logits: torch.Tensor,
     n_expts_act: int,
     block_m: int,
