@@ -257,67 +257,12 @@ def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
 # --------------------------
 
 
-def routing(logits, n_expts_act, sm_first=False):
-    HIST_BLOCK_M = 32
-
-    from .topk import topk
-
-    if sm_first:
-        logits = torch.softmax(logits, dim=-1)
-    expt_scal, expt_indx, bitmatrix = topk(
-        logits,
-        n_expts_act,
-        apply_softmax=not sm_first,
-        HIST_BLOCK_M=HIST_BLOCK_M,
-    )
-
-    num_tokens, n_expts_tot = logits.shape
-    m = num_tokens * n_expts_act
-    tokens_per_expt = max(1, m // n_expts_tot)
-    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
-    if num_tokens <= 16:
-        HIST_BLOCK_M = triton.next_power_of_2(num_tokens)
-        (
-            hist,
-            topk_indx,
-            gate_indx,
-            gate_scal,
-            token_offs_raw,
-            token_offs_pad,
-            block_pid_map,
-        ) = sort_tokens_fused(
-            expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M
-        )
-    else:
-        (
-            hist,
-            topk_indx,
-            gate_indx,
-            gate_scal,
-            token_offs_raw,
-            token_offs_pad,
-            block_pid_map,
-        ) = sort_tokens(
-            expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M
-        )
-    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
-
-    # pack the matmul data structure
-    gather_indx = topk_indx
-    scatter_indx = gate_indx
-    return (
-        RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data),
-        gather_indx,
-        scatter_indx,
-    )
-
-
-def routing_ds(
+def routing(
     logits: torch.Tensor,
     n_expts_act: int,
-    block_m: int,
     *,
-    score_mode: str = "sqrtsoftplus",
+    score_mode: str | None = None,
+    sm_first: bool = False,
     bias: torch.Tensor | None = None,
     renorm: bool = True,
     routed_scaling_factor: float = 1.0,
@@ -328,45 +273,78 @@ def routing_ds(
     num_fused_shared_experts: int = 0,
     shared_experts_score: float = 1.0,
 ):
-    """All-Triton routing for the a8w4 path: fused V4 routing math + sort.
+    """Routing entry point. ``score_mode`` selects the path:
 
-    One-shot pipeline:
-      1. aiter `_topk` (extended): pre-transform (sqrtsoftplus) + bias + topk
-         + bitmatrix + renorm + scale — single Triton kernel.
-      2. aiter `sort_tokens` (or `sort_tokens_fused` for tiny M): sort tokens by
-         expert and produce ExptData specialized for the given ``block_m``.
+    * ``score_mode is None`` (default) -> the plain flat top-k routing process:
+      flat top-k with softmax. ``sm_first`` controls whether softmax is applied
+      to the logits before the top-k (``True``) or inside the top-k
+      (``False``). The fused-V4-only arguments (``bias``, ``use_grouped_topk``,
+      ``num_fused_shared_experts`` ...) are ignored on this path.
+    * ``score_mode is not None`` -> the fused V4 (DeepSeek) routing process:
+      fused score transform + (optionally grouped) top-k + fused shared
+      experts. ``sm_first`` is ignored on this path.
 
-    When ``use_grouped_topk=True``, step 1 is replaced by ATOM's single-fused
-    Triton ``grouped_topk`` kernel
-    (``atom.model_ops.grouped_topk.grouped_topk``) — DeepSeek-V2/V3-style
-    hierarchical routing (pick ``topk_group`` groups out of
-    ``num_expert_group``, then top-``n_expts_act`` experts within those
-    groups). Same return contract as ``topk`` (y_vals, y_indx, Bitmatrix), so
-    ``sort_tokens`` / ``sort_tokens_fused`` consume it unchanged.
+    ``block_m`` is not supplied by the caller: it is derived internally from the
+    raw ``logits`` shape and the originally requested ``n_expts_act`` (before
+    any shared-expert widening).
 
-    Returns (RoutingData, gather_indx, scatter_indx) where gather_indx and
-    scatter_indx are raw int32 tensors (no GatherIndx/ScatterIndx wrappers) —
-    consumed directly by ``moe_gemm_a8w4``.
-
-    No multi-block_m dict, no triton_kernels wrapper, no Python bridge step.
+    Returns ``(RoutingData, gather_indx, scatter_indx)``.
     """
-    n_tokens, n_routed = logits.shape
+    num_tokens, n_routed = logits.shape
 
-    # Fused shared experts are appended (always-on) to every token by the
-    # grouped-topk kernel, occupying expert ids [n_routed, n_routed + n_shared).
-    # They widen both the per-token selection (n_expts_act) and the total
-    # expert count used for the sort / histogram.
+    # block_m heuristic from the raw logits shape and the originally requested
+    # n_expts_act.
+    m = num_tokens * n_expts_act
+    tokens_per_expt = max(1, m // n_routed)
+    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+
+    # ------------------------------------------------------------------
+    # flat top-k path: plain top-k + softmax (score_mode is None)
+    # ------------------------------------------------------------------
+    if score_mode is None:
+        from .topk import topk
+
+        HIST_BLOCK_M = 32
+        if sm_first:
+            logits = torch.softmax(logits, dim=-1)
+        expt_scal, expt_indx, bitmatrix = topk(
+            logits,
+            n_expts_act,
+            apply_softmax=not sm_first,
+            HIST_BLOCK_M=HIST_BLOCK_M,
+        )
+        n_expts_tot = n_routed
+        if num_tokens <= 16:
+            HIST_BLOCK_M = triton.next_power_of_2(num_tokens)
+            sort_fn = sort_tokens_fused
+        else:
+            sort_fn = sort_tokens
+        (
+            hist,
+            topk_indx,
+            gate_indx,
+            gate_scal,
+            token_offs_raw,
+            token_offs_pad,
+            block_pid_map,
+        ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
+        expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
+        return (
+            RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data),
+            topk_indx,
+            gate_indx,
+        )
+
+    # ------------------------------------------------------------------
+    # fused V4 path: fused routing math + sort (score_mode given)
+    # ------------------------------------------------------------------
     n_shared = num_fused_shared_experts
     n_expts_tot = n_routed + n_shared
 
-    # Step 1: per-token expert selection. Either flat top-k (existing aiter
-    # _topk kernel) or grouped top-k (ATOM's _grouped_topk kernel) — both
-    # return (y_vals, y_indx, Bitmatrix) with the same downstream contract.
     if use_grouped_topk and num_expert_group != 1:
         assert (
             num_expert_group is not None and topk_group is not None
         ), "use_grouped_topk requires num_expert_group and topk_group"
-        # Lazy import: ATOM-side kernel; avoids hard aiter→atom import order.
         from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
         expt_scal, expt_indx, bitmatrix = grouped_topk(
@@ -403,9 +381,8 @@ def routing_ds(
             HIST_BLOCK_M=32,
         )
 
-    # Step 2: sort tokens by expert and build ExptData for the chosen block_m.
-    if n_tokens <= 16:
-        HIST_BLOCK_M = triton.next_power_of_2(max(n_tokens, 1))
+    if num_tokens <= 16:
+        HIST_BLOCK_M = triton.next_power_of_2(max(num_tokens, 1))
         sort_fn = sort_tokens_fused
     else:
         HIST_BLOCK_M = 32

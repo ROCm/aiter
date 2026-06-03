@@ -1,14 +1,26 @@
 import pytest
 import torch
+import triton
 import torch.nn.functional as F
 from aiter.ops.triton.moe.moe_routing.routing import (
     routing,
-    routing_ds,
     routing_a8w4_from_hash,
     routing_a8w4_from_topk,
     routing_torch,
     compute_expt_data_torch,
 )
+
+
+def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):
+    """block_m heuristic used by `routing`.
+
+    Uses the raw logits shape and the originally requested n_expts_act (before
+    any shared-expert widening), exactly as `routing` does internally.
+    """
+    tokens_per_expt = max(1, (n_tokens * n_expts_act) // n_expts_tot)
+    return max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+
+
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
@@ -125,7 +137,7 @@ def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):
         ref_logits, n_expts_act, sm_first
     )
     tri_routing_data, tri_gather, tri_scatter = routing(
-        tri_logits, n_expts_act, sm_first
+        tri_logits, n_expts_act, sm_first=sm_first
     )
 
     def _assert_indx_equal(ref, tri):
@@ -386,7 +398,6 @@ def _check_routing_data_bucket(
         ("softmax", False, False, 1.0),  # identity transform, no renorm
     ],
 )
-@pytest.mark.parametrize("block_m", [16, 32])
 def test_routing_a8w4(
     n_tokens,
     n_expts_tot,
@@ -395,7 +406,6 @@ def test_routing_a8w4(
     has_bias,
     renorm,
     routed_scaling_factor,
-    block_m,
 ):
     if get_arch() not in ["gfx950", "gfx1250"]:
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
@@ -409,6 +419,9 @@ def test_routing_a8w4(
         else None
     )
 
+    # routing derives block_m internally; mirror that here for the ref.
+    block_m = _routing_block_m(n_tokens, n_expts_act, n_expts_tot)
+
     ref_pack = routing_a8w4_torch(
         logits.clone(),
         n_expts_act,
@@ -418,10 +431,9 @@ def test_routing_a8w4(
         renorm=renorm,
         routed_scaling_factor=routed_scaling_factor,
     )
-    tri_routing_data, tri_gather, tri_scatter = routing_ds(
+    tri_routing_data, tri_gather, tri_scatter = routing(
         logits,
         n_expts_act,
-        block_m,
         score_mode=score_mode,
         bias=bias,
         renorm=renorm,
@@ -895,9 +907,8 @@ def test_grouped_topk_arbitrary_group(
 @pytest.mark.parametrize(
     "n_expts_tot, num_expert_group, topk_group, n_expts_act", GROUP_SHAPES
 )
-@pytest.mark.parametrize("block_m", [16, 32])
 def test_routing_ds_grouped(
-    n_tokens, n_expts_tot, num_expert_group, topk_group, n_expts_act, block_m
+    n_tokens, n_expts_tot, num_expert_group, topk_group, n_expts_act
 ):
     _maybe_skip()
     device = "cuda"
@@ -905,6 +916,9 @@ def test_routing_ds_grouped(
     logits = init_data(n_tokens, n_expts_tot, device=device, dtype=torch.float32)
     bias = torch.randn(n_expts_tot, dtype=torch.float32, device=device) * 0.05
     score_mode, renorm, scale = "sqrtsoftplus", True, 2.5
+
+    # routing derives block_m internally; mirror that here for the ref.
+    block_m = _routing_block_m(n_tokens, n_expts_act, n_expts_tot)
 
     # The selection the kernel makes (deterministic for fixed inputs); used as
     # ground truth for the sort/scatter pipeline check.
@@ -919,10 +933,9 @@ def test_routing_ds_grouped(
         routed_scaling_factor=scale,
     )
 
-    tri_routing_data, tri_gather, tri_scatter = routing_ds(
+    tri_routing_data, tri_gather, tri_scatter = routing(
         logits,
         n_expts_act,
-        block_m,
         score_mode=score_mode,
         bias=bias,
         renorm=renorm,
@@ -1012,14 +1025,14 @@ def test_grouped_topk_shared_expert(
 @pytest.mark.parametrize(
     "n_expts_tot, num_expert_group, topk_group, n_expts_act", GROUP_SHAPES
 )
-@pytest.mark.parametrize("block_m", [16, 32])
 @pytest.mark.parametrize("n_shared", [1, 2])
 def test_routing_ds_grouped_shared(
-    n_tokens, n_expts_tot, num_expert_group, topk_group, n_expts_act, block_m, n_shared
+    n_tokens, n_expts_tot, num_expert_group, topk_group, n_expts_act, n_shared
 ):
-    """End-to-end routing_ds with fused shared experts: histogram must include
-    a full shared bucket (n_tokens) per shared expert and the gather/scatter must
-    form a valid inverse permutation over the widened gate count."""
+    """End-to-end routing with fused shared experts: histogram must
+    include a full shared bucket (n_tokens) per shared expert and the
+    gather/scatter must form a valid inverse permutation over the widened gate
+    count."""
     _maybe_skip()
     device = "cuda"
     torch.manual_seed(2)
@@ -1027,10 +1040,9 @@ def test_routing_ds_grouped_shared(
     bias = torch.randn(n_expts_tot, dtype=torch.float32, device=device) * 0.05
     score_mode, renorm, scale = "sqrtsoftplus", True, 2.5
 
-    rd, gather, scatter = routing_ds(
+    rd, gather, scatter = routing(
         logits,
         n_expts_act,
-        block_m,
         score_mode=score_mode,
         bias=bias,
         renorm=renorm,
