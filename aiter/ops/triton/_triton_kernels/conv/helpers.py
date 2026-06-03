@@ -2,14 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
-import triton
-import triton.language as tl
-
-
-@triton.jit
-def _tanh(x):
-    return 2 * tl.sigmoid(2 * x) - 1
-
 
 # Env-var escape hatch: set AITER_TRITON_CONV_AUTOTUNE=1 to bypass JSON-loaded
 # configs and let @triton.autotune do a runtime search across each kernel file's
@@ -21,5 +13,3 @@ CONV_AUTOTUNE_ENABLED = os.environ.get("AITER_TRITON_CONV_AUTOTUNE", "0").lower(
     "yes",
     "on",
 )
-
-

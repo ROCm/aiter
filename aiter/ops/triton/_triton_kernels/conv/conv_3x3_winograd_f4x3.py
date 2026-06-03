@@ -4,7 +4,8 @@
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
-from .helpers import _tanh, CONV_AUTOTUNE_ENABLED
+from .helpers import CONV_AUTOTUNE_ENABLED
+from ..activation import _relu, _relu6, _gelu_tanh
 
 
 def _get_config_input(shape_key=None, M=None):
@@ -958,88 +959,56 @@ def _winograd_f4x3_output_transform_kernel(
 
     # Activation
     if ACTIVATION == "relu":
-        y00 = tl.maximum(y00, 0)
-        y01 = tl.maximum(y01, 0)
-        y02 = tl.maximum(y02, 0)
-        y03 = tl.maximum(y03, 0)
-        y10 = tl.maximum(y10, 0)
-        y11 = tl.maximum(y11, 0)
-        y12 = tl.maximum(y12, 0)
-        y13 = tl.maximum(y13, 0)
-        y20 = tl.maximum(y20, 0)
-        y21 = tl.maximum(y21, 0)
-        y22 = tl.maximum(y22, 0)
-        y23 = tl.maximum(y23, 0)
-        y30 = tl.maximum(y30, 0)
-        y31 = tl.maximum(y31, 0)
-        y32 = tl.maximum(y32, 0)
-        y33 = tl.maximum(y33, 0)
+        y00 = _relu(y00)
+        y01 = _relu(y01)
+        y02 = _relu(y02)
+        y03 = _relu(y03)
+        y10 = _relu(y10)
+        y11 = _relu(y11)
+        y12 = _relu(y12)
+        y13 = _relu(y13)
+        y20 = _relu(y20)
+        y21 = _relu(y21)
+        y22 = _relu(y22)
+        y23 = _relu(y23)
+        y30 = _relu(y30)
+        y31 = _relu(y31)
+        y32 = _relu(y32)
+        y33 = _relu(y33)
     elif ACTIVATION == "relu6":
-        y00 = tl.minimum(tl.maximum(y00, 0), 6)
-        y01 = tl.minimum(tl.maximum(y01, 0), 6)
-        y02 = tl.minimum(tl.maximum(y02, 0), 6)
-        y03 = tl.minimum(tl.maximum(y03, 0), 6)
-        y10 = tl.minimum(tl.maximum(y10, 0), 6)
-        y11 = tl.minimum(tl.maximum(y11, 0), 6)
-        y12 = tl.minimum(tl.maximum(y12, 0), 6)
-        y13 = tl.minimum(tl.maximum(y13, 0), 6)
-        y20 = tl.minimum(tl.maximum(y20, 0), 6)
-        y21 = tl.minimum(tl.maximum(y21, 0), 6)
-        y22 = tl.minimum(tl.maximum(y22, 0), 6)
-        y23 = tl.minimum(tl.maximum(y23, 0), 6)
-        y30 = tl.minimum(tl.maximum(y30, 0), 6)
-        y31 = tl.minimum(tl.maximum(y31, 0), 6)
-        y32 = tl.minimum(tl.maximum(y32, 0), 6)
-        y33 = tl.minimum(tl.maximum(y33, 0), 6)
+        y00 = _relu6(y00)
+        y01 = _relu6(y01)
+        y02 = _relu6(y02)
+        y03 = _relu6(y03)
+        y10 = _relu6(y10)
+        y11 = _relu6(y11)
+        y12 = _relu6(y12)
+        y13 = _relu6(y13)
+        y20 = _relu6(y20)
+        y21 = _relu6(y21)
+        y22 = _relu6(y22)
+        y23 = _relu6(y23)
+        y30 = _relu6(y30)
+        y31 = _relu6(y31)
+        y32 = _relu6(y32)
+        y33 = _relu6(y33)
     elif ACTIVATION == "gelu":
-        y00 = (
-            0.5 * y00 * (1.0 + _tanh(0.7978845608 * (y00 + 0.044715 * y00 * y00 * y00)))
-        )
-        y01 = (
-            0.5 * y01 * (1.0 + _tanh(0.7978845608 * (y01 + 0.044715 * y01 * y01 * y01)))
-        )
-        y02 = (
-            0.5 * y02 * (1.0 + _tanh(0.7978845608 * (y02 + 0.044715 * y02 * y02 * y02)))
-        )
-        y03 = (
-            0.5 * y03 * (1.0 + _tanh(0.7978845608 * (y03 + 0.044715 * y03 * y03 * y03)))
-        )
-        y10 = (
-            0.5 * y10 * (1.0 + _tanh(0.7978845608 * (y10 + 0.044715 * y10 * y10 * y10)))
-        )
-        y11 = (
-            0.5 * y11 * (1.0 + _tanh(0.7978845608 * (y11 + 0.044715 * y11 * y11 * y11)))
-        )
-        y12 = (
-            0.5 * y12 * (1.0 + _tanh(0.7978845608 * (y12 + 0.044715 * y12 * y12 * y12)))
-        )
-        y13 = (
-            0.5 * y13 * (1.0 + _tanh(0.7978845608 * (y13 + 0.044715 * y13 * y13 * y13)))
-        )
-        y20 = (
-            0.5 * y20 * (1.0 + _tanh(0.7978845608 * (y20 + 0.044715 * y20 * y20 * y20)))
-        )
-        y21 = (
-            0.5 * y21 * (1.0 + _tanh(0.7978845608 * (y21 + 0.044715 * y21 * y21 * y21)))
-        )
-        y22 = (
-            0.5 * y22 * (1.0 + _tanh(0.7978845608 * (y22 + 0.044715 * y22 * y22 * y22)))
-        )
-        y23 = (
-            0.5 * y23 * (1.0 + _tanh(0.7978845608 * (y23 + 0.044715 * y23 * y23 * y23)))
-        )
-        y30 = (
-            0.5 * y30 * (1.0 + _tanh(0.7978845608 * (y30 + 0.044715 * y30 * y30 * y30)))
-        )
-        y31 = (
-            0.5 * y31 * (1.0 + _tanh(0.7978845608 * (y31 + 0.044715 * y31 * y31 * y31)))
-        )
-        y32 = (
-            0.5 * y32 * (1.0 + _tanh(0.7978845608 * (y32 + 0.044715 * y32 * y32 * y32)))
-        )
-        y33 = (
-            0.5 * y33 * (1.0 + _tanh(0.7978845608 * (y33 + 0.044715 * y33 * y33 * y33)))
-        )
+        y00 = _gelu_tanh(y00)
+        y01 = _gelu_tanh(y01)
+        y02 = _gelu_tanh(y02)
+        y03 = _gelu_tanh(y03)
+        y10 = _gelu_tanh(y10)
+        y11 = _gelu_tanh(y11)
+        y12 = _gelu_tanh(y12)
+        y13 = _gelu_tanh(y13)
+        y20 = _gelu_tanh(y20)
+        y21 = _gelu_tanh(y21)
+        y22 = _gelu_tanh(y22)
+        y23 = _gelu_tanh(y23)
+        y30 = _gelu_tanh(y30)
+        y31 = _gelu_tanh(y31)
+        y32 = _gelu_tanh(y32)
+        y33 = _gelu_tanh(y33)
 
     # Store 4x4 output tile
     n_valid = n < N
@@ -1329,88 +1298,56 @@ def _winograd_f4x3_fused_gemm_output_kernel(
 
     # Activation
     if ACTIVATION == "relu":
-        y00 = tl.maximum(y00, 0)
-        y01 = tl.maximum(y01, 0)
-        y02 = tl.maximum(y02, 0)
-        y03 = tl.maximum(y03, 0)
-        y10 = tl.maximum(y10, 0)
-        y11 = tl.maximum(y11, 0)
-        y12 = tl.maximum(y12, 0)
-        y13 = tl.maximum(y13, 0)
-        y20 = tl.maximum(y20, 0)
-        y21 = tl.maximum(y21, 0)
-        y22 = tl.maximum(y22, 0)
-        y23 = tl.maximum(y23, 0)
-        y30 = tl.maximum(y30, 0)
-        y31 = tl.maximum(y31, 0)
-        y32 = tl.maximum(y32, 0)
-        y33 = tl.maximum(y33, 0)
+        y00 = _relu(y00)
+        y01 = _relu(y01)
+        y02 = _relu(y02)
+        y03 = _relu(y03)
+        y10 = _relu(y10)
+        y11 = _relu(y11)
+        y12 = _relu(y12)
+        y13 = _relu(y13)
+        y20 = _relu(y20)
+        y21 = _relu(y21)
+        y22 = _relu(y22)
+        y23 = _relu(y23)
+        y30 = _relu(y30)
+        y31 = _relu(y31)
+        y32 = _relu(y32)
+        y33 = _relu(y33)
     elif ACTIVATION == "relu6":
-        y00 = tl.minimum(tl.maximum(y00, 0), 6)
-        y01 = tl.minimum(tl.maximum(y01, 0), 6)
-        y02 = tl.minimum(tl.maximum(y02, 0), 6)
-        y03 = tl.minimum(tl.maximum(y03, 0), 6)
-        y10 = tl.minimum(tl.maximum(y10, 0), 6)
-        y11 = tl.minimum(tl.maximum(y11, 0), 6)
-        y12 = tl.minimum(tl.maximum(y12, 0), 6)
-        y13 = tl.minimum(tl.maximum(y13, 0), 6)
-        y20 = tl.minimum(tl.maximum(y20, 0), 6)
-        y21 = tl.minimum(tl.maximum(y21, 0), 6)
-        y22 = tl.minimum(tl.maximum(y22, 0), 6)
-        y23 = tl.minimum(tl.maximum(y23, 0), 6)
-        y30 = tl.minimum(tl.maximum(y30, 0), 6)
-        y31 = tl.minimum(tl.maximum(y31, 0), 6)
-        y32 = tl.minimum(tl.maximum(y32, 0), 6)
-        y33 = tl.minimum(tl.maximum(y33, 0), 6)
+        y00 = _relu6(y00)
+        y01 = _relu6(y01)
+        y02 = _relu6(y02)
+        y03 = _relu6(y03)
+        y10 = _relu6(y10)
+        y11 = _relu6(y11)
+        y12 = _relu6(y12)
+        y13 = _relu6(y13)
+        y20 = _relu6(y20)
+        y21 = _relu6(y21)
+        y22 = _relu6(y22)
+        y23 = _relu6(y23)
+        y30 = _relu6(y30)
+        y31 = _relu6(y31)
+        y32 = _relu6(y32)
+        y33 = _relu6(y33)
     elif ACTIVATION == "gelu":
-        y00 = (
-            0.5 * y00 * (1.0 + _tanh(0.7978845608 * (y00 + 0.044715 * y00 * y00 * y00)))
-        )
-        y01 = (
-            0.5 * y01 * (1.0 + _tanh(0.7978845608 * (y01 + 0.044715 * y01 * y01 * y01)))
-        )
-        y02 = (
-            0.5 * y02 * (1.0 + _tanh(0.7978845608 * (y02 + 0.044715 * y02 * y02 * y02)))
-        )
-        y03 = (
-            0.5 * y03 * (1.0 + _tanh(0.7978845608 * (y03 + 0.044715 * y03 * y03 * y03)))
-        )
-        y10 = (
-            0.5 * y10 * (1.0 + _tanh(0.7978845608 * (y10 + 0.044715 * y10 * y10 * y10)))
-        )
-        y11 = (
-            0.5 * y11 * (1.0 + _tanh(0.7978845608 * (y11 + 0.044715 * y11 * y11 * y11)))
-        )
-        y12 = (
-            0.5 * y12 * (1.0 + _tanh(0.7978845608 * (y12 + 0.044715 * y12 * y12 * y12)))
-        )
-        y13 = (
-            0.5 * y13 * (1.0 + _tanh(0.7978845608 * (y13 + 0.044715 * y13 * y13 * y13)))
-        )
-        y20 = (
-            0.5 * y20 * (1.0 + _tanh(0.7978845608 * (y20 + 0.044715 * y20 * y20 * y20)))
-        )
-        y21 = (
-            0.5 * y21 * (1.0 + _tanh(0.7978845608 * (y21 + 0.044715 * y21 * y21 * y21)))
-        )
-        y22 = (
-            0.5 * y22 * (1.0 + _tanh(0.7978845608 * (y22 + 0.044715 * y22 * y22 * y22)))
-        )
-        y23 = (
-            0.5 * y23 * (1.0 + _tanh(0.7978845608 * (y23 + 0.044715 * y23 * y23 * y23)))
-        )
-        y30 = (
-            0.5 * y30 * (1.0 + _tanh(0.7978845608 * (y30 + 0.044715 * y30 * y30 * y30)))
-        )
-        y31 = (
-            0.5 * y31 * (1.0 + _tanh(0.7978845608 * (y31 + 0.044715 * y31 * y31 * y31)))
-        )
-        y32 = (
-            0.5 * y32 * (1.0 + _tanh(0.7978845608 * (y32 + 0.044715 * y32 * y32 * y32)))
-        )
-        y33 = (
-            0.5 * y33 * (1.0 + _tanh(0.7978845608 * (y33 + 0.044715 * y33 * y33 * y33)))
-        )
+        y00 = _gelu_tanh(y00)
+        y01 = _gelu_tanh(y01)
+        y02 = _gelu_tanh(y02)
+        y03 = _gelu_tanh(y03)
+        y10 = _gelu_tanh(y10)
+        y11 = _gelu_tanh(y11)
+        y12 = _gelu_tanh(y12)
+        y13 = _gelu_tanh(y13)
+        y20 = _gelu_tanh(y20)
+        y21 = _gelu_tanh(y21)
+        y22 = _gelu_tanh(y22)
+        y23 = _gelu_tanh(y23)
+        y30 = _gelu_tanh(y30)
+        y31 = _gelu_tanh(y31)
+        y32 = _gelu_tanh(y32)
+        y33 = _gelu_tanh(y33)
 
     # Decode tile indices and compute per-tile base pointers
     n_idx = offs_t // (tile_H * tile_W)

@@ -5,7 +5,8 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
-from .helpers import _tanh, CONV_AUTOTUNE_ENABLED
+from .helpers import CONV_AUTOTUNE_ENABLED
+from ..activation import _relu, _relu6, _gelu_tanh
 
 
 def _get_config(shape_key=None, M=None):
@@ -141,13 +142,11 @@ def _conv2d_1x1_kernel(
 
     # Activation
     if ACTIVATION == "relu":
-        acc = tl.maximum(acc, 0)
+        acc = _relu(acc)
     elif ACTIVATION == "relu6":
-        acc = tl.minimum(tl.maximum(acc, 0), 6)
+        acc = _relu6(acc)
     elif ACTIVATION == "gelu":
-        acc = (
-            0.5 * acc * (1.0 + _tanh(0.7978845608 * (acc + 0.044715 * acc * acc * acc)))
-        )
+        acc = _gelu_tanh(acc)
 
     # Store output: Y[n, k, p, q]
     y_ptrs = (
