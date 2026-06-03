@@ -98,6 +98,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     group_size: int = 128,
     prefill_support: bool = False,
     emit_bf16: bool = False,
+    transpose_scale: bool = False,
 ):
     return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
         input_,
@@ -107,6 +108,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
         group_size,
         prefill_support,
         emit_bf16=emit_bf16,
+        transpose_scale=transpose_scale,
     )
 
 

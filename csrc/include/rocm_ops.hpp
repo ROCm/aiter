@@ -495,6 +495,7 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                                   \
           py::arg("reg_bytes"),                                                                 \
           py::arg("use_1stage"),                                                                \
+          py::arg("transpose_scale") = false,                                                    \
           py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                                   \
     m.def("fused_qknorm_allreduce",                                                             \
           &aiter::fused_qknorm_allreduce,                                                       \

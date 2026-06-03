@@ -86,6 +86,7 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t reg_ptr,
                                              int64_t reg_bytes,
                                              bool use_1stage,
+                                             bool transpose_scale = false,
                                              int64_t bf16_out_ptr = 0);
 void fused_qknorm_allreduce(fptr_t _fa,
                             const aiter_tensor_t& qkv_in,

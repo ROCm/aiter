@@ -195,6 +195,7 @@ def fused_ar_rmsnorm_per_group_quant(
     withGraph=False,
     distributed_init_method: Optional[str] = None,
     emit_bf16: bool = False,
+    transpose_scale: bool = False,
 ):
     """Run fused AR+RMSNorm+per-group-quant on a single rank.
 
@@ -225,7 +226,13 @@ def fused_ar_rmsnorm_per_group_quant(
     @perftest()
     def run_fused(x):
         res = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
-            x, x, weight, eps, group_size=group_size, emit_bf16=emit_bf16
+            x,
+            x,
+            weight,
+            eps,
+            group_size=group_size,
+            emit_bf16=emit_bf16,
+            transpose_scale=transpose_scale,
         )
         if emit_bf16:
             out, res_out, scale_out, bf16_out = res
@@ -239,7 +246,13 @@ def fused_ar_rmsnorm_per_group_quant(
     else:
         out_fp8, scale_out, res_out = result
         bf16_out = None
-    dequant = out_fp8.float() * scale_out.repeat_interleave(group_size, dim=-1)
+    if transpose_scale:
+        M, K = x.shape
+        num_groups = K // group_size
+        scale_for_dequant = scale_out.view(num_groups, M).transpose(0, 1)
+    else:
+        scale_for_dequant = scale_out
+    dequant = out_fp8.float() * scale_for_dequant.repeat_interleave(group_size, dim=-1)
 
     # When requesting bf16 output, verify it matches the fp8+scale dequant
     # at FP8 precision: both are produced by the same fused kernel from the
@@ -267,6 +280,7 @@ def test_fused_ar_rmsnorm_per_group_quant(
     withGraph=False,
     distributed_init_method: Optional[str] = None,
     emit_bf16: bool = False,
+    transpose_scale: bool = False,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -294,6 +308,7 @@ def test_fused_ar_rmsnorm_per_group_quant(
                     withGraph,
                     distributed_init_method,
                     emit_bf16,
+                    transpose_scale,
                 ),
             )
         )
@@ -328,7 +343,7 @@ def test_fused_ar_rmsnorm_per_group_quant(
         msg = (
             f"test_fused_ar_rmsnorm_per_group_quant: "
             f"{shape=} {dtype=} {group_size=} {withGraph=} "
-            f"{emit_bf16=} {us:>8.2f}"
+            f"{emit_bf16=} {transpose_scale=} {us:>8.2f}"
         )
         err = checkAllclose(
             cpu_rslt[dequant_out.device.index],
@@ -350,6 +365,7 @@ def test_fused_ar_rmsnorm_per_group_quant(
 
     return {
         "emit_bf16": emit_bf16,
+        "transpose_scale": transpose_scale,
         "per_group_min_us": min(all_us),
         "per_group_max_us": max(all_us),
         "per_group_err": max_err,
@@ -401,6 +417,7 @@ l_group_size = [128]
 # Cover both the fp8-only output (keep_bf16=False, std-attention layers)
 # and the fp8+bf16 dual-output (keep_bf16=True, GDN-style layers).
 l_emit_bf16 = [False, True]
+l_transpose_scale = [False]
 
 parser = argparse.ArgumentParser(
     description="Test fused AR+RMSNorm+per-group FP8 quant"
@@ -469,6 +486,11 @@ parser.add_argument(
     action="store_true",
     help="Skip the non-distributed _validate_per_group_size unit test.",
 )
+parser.add_argument(
+    "--transpose-scale",
+    action="store_true",
+    help="Write scale storage as [group, M] while exposing shape [M, group].",
+)
 
 if __name__ == "__main__":
     freeze_support()
@@ -494,6 +516,8 @@ if __name__ == "__main__":
         l_graph = [args.graphon]
     if args.group_size is not None:
         l_group_size = [args.group_size]
+    if args.transpose_scale:
+        l_transpose_scale = [True]
 
     # ``--sweep-group-size`` replaces the default matrix with the cross
     # product of every supported group_size (power-of-two tpg on bf16)
@@ -507,8 +531,8 @@ if __name__ == "__main__":
         l_emit_bf16 = [False, True]
 
     df = []
-    for dtype, shape, tp, pp, graph_on, gs, emit_bf16 in itertools.product(
-        l_dtype, l_shape, l_tp, l_pp, l_graph, l_group_size, l_emit_bf16
+    for dtype, shape, tp, pp, graph_on, gs, emit_bf16, transpose_scale in itertools.product(
+        l_dtype, l_shape, l_tp, l_pp, l_graph, l_group_size, l_emit_bf16, l_transpose_scale
     ):
         ret = test_fused_ar_rmsnorm_per_group_quant(
             tp,
@@ -521,6 +545,7 @@ if __name__ == "__main__":
                 get_ip(), get_open_port()
             ),
             emit_bf16=emit_bf16,
+            transpose_scale=transpose_scale,
         )
         df.append(ret)
 
@@ -532,6 +557,7 @@ if __name__ == "__main__":
         "group_size",
         "withGraph",
         "emit_bf16",
+        "transpose_scale",
         "per_group_min_us",
         "per_group_max_us",
         "per_group_err",

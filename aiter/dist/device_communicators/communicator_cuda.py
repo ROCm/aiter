@@ -282,6 +282,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         group_size=128,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         """Fused AR+RMSNorm+per-group FP8 quant, optionally also emitting the
         pre-quantization bf16/fp16 normed output.
@@ -312,6 +313,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
                     input_, res_inp_, weight_, eps, group_size, use_1stage,
                     emit_bf16=emit_bf16,
+                    transpose_scale=transpose_scale,
                 )
                 if emit_bf16:
                     out, res_out, scale_out, bf16_out = result
@@ -325,7 +327,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 input_, res_inp_, weight_, eps, prefill_support
             )
             hip_quant = get_hip_quant(QuantType.per_1x128)
-            out, scale_out = hip_quant(out_, quant_dtype=fp8)
+            out, scale_out = hip_quant(
+                out_, quant_dtype=fp8, transpose_scale=transpose_scale
+            )
             if emit_bf16:
                 bf16_out = out_
         assert out is not None

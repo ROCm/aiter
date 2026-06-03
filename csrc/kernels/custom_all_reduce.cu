@@ -531,6 +531,7 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t group_size,
                                              int64_t reg_ptr, int64_t reg_bytes,
                                              bool use_1stage,
+                                             bool transpose_scale,
                                              int64_t bf16_out_ptr)
 {
     HipDeviceGuard device_guard(inp.device_id);
@@ -572,7 +573,7 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
             reinterpret_cast<float*>(scale_out.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
             (float)eps, m, n, (int)group_size, use_1stage,
-            reinterpret_cast<opus::bf16_t*>(bf16_out));
+            transpose_scale, reinterpret_cast<opus::bf16_t*>(bf16_out));
         break;
     }
 #endif
@@ -586,7 +587,7 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
             reinterpret_cast<float*>(scale_out.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(w.data_ptr()),
             (float)eps, m, n, (int)group_size, use_1stage,
-            reinterpret_cast<opus::fp16_t*>(bf16_out));
+            transpose_scale, reinterpret_cast<opus::fp16_t*>(bf16_out));
         break;
     }
     default:
