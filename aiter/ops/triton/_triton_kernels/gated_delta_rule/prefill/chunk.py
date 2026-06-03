@@ -323,6 +323,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             cu_seqlens=cu_seqlens,
             state_dtype=state_dtype,
             use_exp2=use_exp2,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
         )
     else:
         h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(

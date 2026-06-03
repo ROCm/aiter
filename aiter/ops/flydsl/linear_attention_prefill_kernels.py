@@ -29,6 +29,12 @@ from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 # place of exp(g) (matches the Triton VK / HIP K5 convention).
 _RCP_LN2 = math.log2(math.e)
 
+from ..triton._triton_kernels.gated_delta_rule.utils import (
+    prepare_chunk_offsets,
+    prepare_num_chunks,
+    prepare_rebased_cu_seqlens,
+)
+
 __all__ = [
     "chunk_gated_delta_rule_fwd_h_flydsl",
 ]
@@ -292,6 +298,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     cu_seqlens: torch.LongTensor | None = None,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
 
@@ -319,14 +327,19 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         chunk_size: chunk size BT (default 64).
         save_new_value: whether to materialize ``v_new``.
         cu_seqlens: [N+1] LongTensor for variable-length batching, or None.
-        state_dtype: optional initial/final state dtype (``fp32`` or
-            ``bf16``).
-        use_exp2: if True (default, matches Triton VK / HIP), the
-            kernel uses ``exp2`` for the gate recurrence (``g`` / ``gk``
-            are interpreted in log2 space; ``g`` must be pre-scaled by
-            ``log2(e)`` upstream and ``gk`` is pre-scaled inside this
-            wrapper). If False, the kernel uses ``exp`` (natural-log
-            space).
+        state_dtype: optional initial/final state dtype (float32 or bfloat16).
+        use_exp2: whether ``g`` is in log2 space. Standalone K5 callers pass
+            natural-log ``g`` by default; end-to-end prefill passes the Triton
+            K1 ``use_exp2`` setting through explicitly.
+        num_decodes: number of leading decode-only sequences to skip in
+            ``cu_seqlens``. When nonzero, ``cu_seqlens`` is the ORIGINAL,
+            cache-stable metadata tensor (decode prefix included) and the
+            data tensors (``k/w/u/g/...``) are expected to be pre-sliced to
+            the prefill region; the offsets are rebased internally via the
+            cached ``prepare_rebased_cu_seqlens``.
+        num_decode_tokens: number of leading decode tokens stripped from the
+            data tensors; subtracted from the rebased offsets so they index
+            from token 0 of the prefill region.
 
     Returns:
         (h, v_new, final_state) in VK-ordered layout (``[..., V, K]`` on the
@@ -371,21 +384,27 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
+        kernel_cu_seqlens = None
     else:
-        N = len(cu_seqlens) - 1
-        lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        lens_list = lens.tolist()
-        NT = sum(triton.cdiv(int(seq_len), BT) for seq_len in lens_list)
-        chunk_offsets = (
-            torch.cat(
-                [
-                    cu_seqlens.new_tensor([0]),
-                    triton.cdiv(lens, BT),
-                ]
-            )
-            .cumsum(-1)
-            .to(torch.int32)
+        # Pass the ORIGINAL (cache-stable) cu_seqlens + the decode ints into
+        # the cached prologue helpers. They all key on the original tensor's
+        # identity, so chunk_offsets / NT / the rebased kernel cu_seqlens are
+        # computed ONCE per (cu_seqlens_id, BT, num_decodes, num_decode_tokens)
+        # tuple and every subsequent forward is a pure cache hit -> no
+        # per-forward D2H. (Passing a freshly-rebased tensor instead would key
+        # the offset/num-chunk caches on an unstable identity and re-fire the
+        # .tolist()/int() syncs every call.)
+        chunk_offsets = prepare_chunk_offsets(
+            cu_seqlens, BT, num_decodes, num_decode_tokens
         )
+        NT = prepare_num_chunks(cu_seqlens, BT, num_decodes, num_decode_tokens)
+        # Rebased kernel-facing cu_seqlens (matches the pre-sliced prefill
+        # data). N is the prefill sequence count (len() is a shape read, no
+        # sync).
+        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+            cu_seqlens, num_decodes, num_decode_tokens
+        )
+        N = len(kernel_cu_seqlens) - 1
 
     assert K <= 256
 
@@ -431,11 +450,20 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     h0_arg = initial_state if initial_state is not None else dummy
     ht_arg = final_state if final_state is not None else dummy
     vn_arg = v_new_buf
-
+    # cu_arg / co_arg are the kernel-facing (rebased) offsets, narrowed to
+    # int32. `.to(torch.int32)` is a device-to-device cast (no host sync); the
+    # resulting fresh objects are consumed only by the kernel launch, so their
+    # identity does not matter for the @tensor_cache helpers above.
     cu_arg = (
-        cu_seqlens.to(torch.int32) if cu_seqlens is not None else dummy.to(torch.int32)
+        kernel_cu_seqlens.to(torch.int32)
+        if kernel_cu_seqlens is not None
+        else dummy.to(torch.int32)
     )
-    co_arg = chunk_offsets if chunk_offsets is not None else dummy.to(torch.int32)
+    co_arg = (
+        chunk_offsets.to(torch.int32)
+        if chunk_offsets is not None
+        else dummy.to(torch.int32)
+    )
     stream = torch.cuda.current_stream()
 
     use_g = g is not None
