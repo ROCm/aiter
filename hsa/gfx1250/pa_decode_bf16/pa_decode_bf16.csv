@@ -1,0 +1,2 @@
+qdtype,kvdtype,hdim,page_size,gqa,knl_name,co_name
+fp8,fp8,64,256,8,_ZN5aiter31pa_decode_bf16_d64_page256_gqa8E,pa_decode_bf16_d64_page256_gqa8.co
