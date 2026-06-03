@@ -474,10 +474,10 @@ namespace aiter {
         __syncthreads();
         float rms[num_rows];
         constexpr int hc_mult3_reduce_warp_num = (warp_num_pow2 * num_rows + warp_size - 1) / warp_size;
-        if(warp_id < hc_mult3_reduce_warp_num && lane_id < warp_num_pow2 * num_rows) {
-            float sum = s_pre_rms_partial[lane_id];
-            if (lane_id % warp_num_pow2 >= warp_num) {
-                sum = 0.0f;
+        if(warp_id < hc_mult3_reduce_warp_num) {
+            float sum = 0.0f;
+            if(lane_id < warp_num_pow2 * num_rows && lane_id % warp_num_pow2 < warp_num) {
+                sum = s_pre_rms_partial[lane_id];
             }
             sum = multithread_reduce(sum, sum_f, warp_num_pow2);
             sum = rsqrtf(sum / (hidden_size * hc_mult) + rms_eps);
@@ -1181,10 +1181,10 @@ namespace aiter {
         __syncthreads();
         float rms[num_rows];
         constexpr int hc_mult3_reduce_warp_num = (warp_num_pow2 * num_rows + warp_size - 1) / warp_size;
-        if(warp_id < hc_mult3_reduce_warp_num && lane_id < warp_num_pow2 * num_rows) {
-            float sum = s_pre_rms_partial[lane_id];
-            if (lane_id % warp_num_pow2 >= warp_num) {
-                sum = 0.0f;
+        if(warp_id < hc_mult3_reduce_warp_num) {
+            float sum = 0.0f;
+            if(lane_id < warp_num_pow2 * num_rows && lane_id % warp_num_pow2 < warp_num) {
+                sum = s_pre_rms_partial[lane_id];
             }
             sum = multithread_reduce(sum, sum_f, warp_num_pow2);
             sum = rsqrtf(sum / (hidden_size * hc_mult) + rms_eps);

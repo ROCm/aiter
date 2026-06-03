@@ -60,7 +60,7 @@ activation_strides_logical_3d(const aiter_tensor_t& t, int64_t num_heads, int64_
                     " vs ",
                     num_heads * head_dim,
                     ")");
-        return {t.stride(0), num_heads * t.stride(1), t.stride(1)};
+        return {t.stride(0), head_dim * t.stride(1), t.stride(1)};
     }
     AITER_CHECK(t.dim() == 3, "q/k/v must be 2D [T, H*D] or 3D [T, H, D], got dim ", t.dim());
     AITER_CHECK(t.size(1) == num_heads && t.size(2) == head_dim,
@@ -120,11 +120,9 @@ template <typename scalar_t,
           int num_kv_heads,
           vllm::Fp8KVCacheDataType kv_dt>
 __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
-    scalar_t* qkv_void,      // Combined QKV tensor (unused if separate_qkv)
-    bool const separate_qkv, // If true, use q_act/k_act/v_act with [token, heads, dim] layout
-    scalar_t* q_act,         // [num_tokens, num_heads_q * head_dim] or nullptr
-    scalar_t* k_act,         // [num_tokens, num_heads_k * head_dim] or nullptr
-    scalar_t* v_act,         // [num_tokens, num_heads_v * head_dim] or nullptr
+    scalar_t* q_act, // [num_tokens, num_heads_q * head_dim]
+    scalar_t* k_act, // [num_tokens, num_heads_k * head_dim]
+    scalar_t* v_act, // [num_tokens, num_heads_v * head_dim]
     int64_t const q_st,
     int64_t const q_sh,
     int64_t const q_sd,
@@ -151,7 +149,8 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
     float* v_scale,        // Value scale for quantized value cache [num_blocks, block_size]
     int const num_tokens,  // Number of tokens
     int const page_size,   // Page size for kv cache
-    int x                  // kv cache tiling size
+    int x,                 // kv cache tiling size
+    int const rotary_dim   // Rotary dimension (concatenated cos+sin width); <= head_dim
 )
 {
 
@@ -188,19 +187,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
 
     // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before
     // kernel launch
-    if(!separate_qkv)
-    {
-#pragma unroll
-        for(int i = 0; i < load_loop_cnt; i += 1)
-        {
-            int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim +
-                                  laneId * numElemsPerThread) /
-                                 vec_size;
-            reinterpret_cast<ltype*>(elements)[i] =
-                reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
-        }
-    }
-    else if(act_sd == 1)
+    if(act_sd == 1)
     {
         int64_t const base_elems = (int64_t)tokenIdx * act_st + (int64_t)headIdx * act_sh +
                                    (int64_t)(laneId * numElemsPerThread);
@@ -248,12 +235,9 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
 
         // Apply RoPE to normalized elements
 
-        int64_t pos_id = position_ids[tokenIdx];
-
-        // Calculate cache pointer for this position - similar to
-        // pos_encoding_kernels.cu
-        scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
-        int const embed_dim       = head_dim / 2;
+        int64_t pos_id            = position_ids[tokenIdx];
+        int const embed_dim       = rotary_dim / 2;
+        scalar_t const* cache_ptr = cos_sin_cache + pos_id * rotary_dim;
         scalar_t const* cos_ptr   = cache_ptr;
         scalar_t const* sin_ptr   = cache_ptr + embed_dim;
 
@@ -265,43 +249,48 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
             {
                 int const idx0 = 2 * i;
                 int const idx1 = 2 * i + 1;
+                int const dim0 = laneId * numElemsPerThread + idx0;
 
-                float const val0 = elements[idx0];
-                float const val1 = elements[idx1];
+                if(dim0 + 1 < rotary_dim)
+                {
+                    float const val0  = elements[idx0];
+                    float const val1  = elements[idx1];
+                    int const half_dim = dim0 / 2;
+                    float cos_val     = static_cast<float>(cos_ptr[half_dim]);
+                    float sin_val     = static_cast<float>(sin_ptr[half_dim]);
 
-                int const dim_idx  = laneId * numElemsPerThread + idx0;
-                int const half_dim = dim_idx / 2;
-                float cos_val      = static_cast<float>(cos_ptr[half_dim]);
-                float sin_val      = static_cast<float>(sin_ptr[half_dim]);
-
-                elements[idx0] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
-                elements[idx1] = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
+                    elements[idx0] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
+                    elements[idx1] = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
+                }
             }
         }
         else
         {
             scalar_t elements2[numElemsPerThread]; // Additional buffer required for RoPE.
-            // Before data exchange with in warp, we need to sync.
+            // Before data exchange within warp, we need to sync.
             __syncwarp();
-            // Get the data from the other half of the warp. Use pre-computed cos/sin
-            // values.
+            int const partner_lane_delta = embed_dim / numElemsPerThread;
+            // Get the data from the other half of the warp. Use pre-computed cos/sin values.
 #pragma unroll
             for(int i = 0; i < numElemsPerThread; i++)
             {
-                elements2[i] = static_cast<scalar_t>(__shfl_xor(float(elements[i]), 16, 32));
-                if(laneId < 16)
+                int const dim_idx = laneId * numElemsPerThread + i;
+                if(dim_idx < rotary_dim)
                 {
-                    elements2[i] = -elements2[i];
+                    elements2[i] = static_cast<scalar_t>(
+                        __shfl_xor(float(elements[i]), partner_lane_delta, 32));
+                    if(dim_idx < embed_dim)
+                    {
+                        elements2[i] = -elements2[i];
+                    }
+
+                    int const half_dim = dim_idx % embed_dim;
+                    float cos_val      = static_cast<float>(cos_ptr[half_dim]);
+                    float sin_val      = static_cast<float>(sin_ptr[half_dim]);
+
+                    elements[i] = static_cast<scalar_t>(
+                        elements[i] * cos_val + elements2[i] * sin_val);
                 }
-
-                int dim_idx  = laneId * numElemsPerThread + i;
-                dim_idx      = (dim_idx * 2) % head_dim;
-                int half_dim = dim_idx / 2;
-                // Use pre-computed cos/sin from cache
-                float cos_val = cos_ptr[half_dim];
-                float sin_val = sin_ptr[half_dim];
-
-                elements[i] = static_cast<scalar_t>(elements[i] * cos_val + elements2[i] * sin_val);
             }
             __syncwarp();
         }
@@ -309,19 +298,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
         int64_t const qk_sh    = isQ ? q_sh : k_sh;
         int64_t const qk_sd    = isQ ? q_sd : k_sd;
         scalar_t* const qk_dst = isQ ? q_act : k_act;
-        if(!separate_qkv)
-        {
-#pragma unroll
-            for(int i = 0; i < load_loop_cnt; i += 1)
-            {
-                int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim +
-                                      laneId * numElemsPerThread) /
-                                     vec_size;
-                reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] =
-                    reinterpret_cast<ltype*>(elements)[i];
-            }
-        }
-        else if(qk_sd == 1)
+        if(qk_sd == 1)
         {
             int64_t const base_elems = (int64_t)tokenIdx * qk_st + (int64_t)headIdx * qk_sh +
                                        (int64_t)(laneId * numElemsPerThread);
@@ -1003,9 +980,7 @@ __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
     }
 
 template <typename scalar_t, typename kv_cache_scalar_t, vllm::Fp8KVCacheDataType kv_dt>
-void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv,
-                                            bool const separate_qkv,
-                                            scalar_t* q_act,
+void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* q_act,
                                             scalar_t* k_act,
                                             scalar_t* v_act,
                                             int64_t const q_st,
@@ -1035,6 +1010,7 @@ void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv,
                                             float* v_scale,
                                             int page_size,
                                             int x,
+                                            int const rotary_dim,
                                             hipStream_t stream)
 {
     // make sure no thread is wasted, adopt 64 here
@@ -1056,9 +1032,7 @@ void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv,
                                                    INTERLEAVE,
                                                    NUM_KV_HEADS,
                                                    kv_dt>
-                <<<gridDim, blockDim, 0, stream>>>(qkv,
-                                                   separate_qkv,
-                                                   q_act,
+                <<<gridDim, blockDim, 0, stream>>>(q_act,
                                                    k_act,
                                                    v_act,
                                                    q_st,
@@ -1085,7 +1059,8 @@ void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv,
                                                    v_scale,
                                                    num_tokens,
                                                    page_size,
-                                                   x);
+                                                   x,
+                                                   rotary_dim);
         });
         break;
     case 128:
@@ -1096,9 +1071,7 @@ void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv,
                                                    INTERLEAVE,
                                                    NUM_KV_HEADS,
                                                    kv_dt>
-                <<<gridDim, blockDim, 0, stream>>>(qkv,
-                                                   separate_qkv,
-                                                   q_act,
+                <<<gridDim, blockDim, 0, stream>>>(q_act,
                                                    k_act,
                                                    v_act,
                                                    q_st,
@@ -1125,7 +1098,8 @@ void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv,
                                                    v_scale,
                                                    num_tokens,
                                                    page_size,
-                                                   x);
+                                                   x,
+                                                   rotary_dim);
         });
         break;
     case 256:
@@ -1136,9 +1110,7 @@ void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv,
                                                    INTERLEAVE,
                                                    NUM_KV_HEADS,
                                                    kv_dt>
-                <<<gridDim, blockDim, 0, stream>>>(qkv,
-                                                   separate_qkv,
-                                                   q_act,
+                <<<gridDim, blockDim, 0, stream>>>(q_act,
                                                    k_act,
                                                    v_act,
                                                    q_st,
@@ -1165,7 +1137,8 @@ void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv,
                                                    v_scale,
                                                    num_tokens,
                                                    page_size,
-                                                   x);
+                                                   x,
+                                                   rotary_dim);
         });
         break;
     default: AITER_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
@@ -1353,11 +1326,9 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
 
 #define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)                        \
     launchFusedQKNormRopeQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE>(                  \
-        use_separate ? nullptr : reinterpret_cast<SRC_T*>(qkv.data_ptr()),             \
-        use_separate,                                                                  \
-        use_separate ? reinterpret_cast<SRC_T*>(opt_q.value().data_ptr()) : nullptr,   \
-        use_separate ? reinterpret_cast<SRC_T*>(opt_k.value().data_ptr()) : nullptr,   \
-        use_separate ? reinterpret_cast<SRC_T*>(opt_v.value().data_ptr()) : nullptr,   \
+        reinterpret_cast<SRC_T*>(q_t.data_ptr()),                                       \
+        reinterpret_cast<SRC_T*>(k_t.data_ptr()),                                       \
+        reinterpret_cast<SRC_T*>(v_t.data_ptr()),                                       \
         q_stride_token,                                                                \
         q_stride_head,                                                                 \
         q_stride_dim,                                                                  \
@@ -1385,6 +1356,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
         v_scale.has_value() ? reinterpret_cast<float*>(v_scale->data_ptr()) : nullptr, \
         page_size,                                                                     \
         x,                                                                             \
+        rotary_dim_,                                                                   \
         stream);
 
 template <typename T, int HEAD_SIZE, bool IS_NEOX>
@@ -2420,40 +2392,28 @@ void fused_rope_rms_1way(const T* q,
 namespace aiter {
 
 void fused_qk_norm_rope_cache_quant_shuffle(
-    aiter_tensor_t&
-        qkv, // Deprecated concat QKV; empty if only q/k/v. If both given, q/k/v used; qkv ignored.
-    int64_t num_heads_q,           // Number of query heads
-    int64_t num_heads_k,           // Number of key heads
-    int64_t num_heads_v,           // Number of value heads
-    int64_t head_dim,              // Dimension per head
-    double eps,                    // Epsilon for RMS normalization
-    aiter_tensor_t& q_weight,      // RMSNorm weights for query [head_dim]
-    aiter_tensor_t& k_weight,      // RMSNorm weights for key [head_dim]
-    aiter_tensor_t& cos_sin_cache, // Cos/sin cache [max_position, head_dim]
-    bool is_neox,                  // Whether RoPE is applied in Neox style
-    aiter_tensor_t& position_ids,  // Position IDs for RoPE [num_tokens]
-    aiter_tensor_t& k_cache,       // [num_blocks, num_kv_heads, head_dim//x, page_size, x]
-    aiter_tensor_t& v_cache,      // 4D [num_blocks, num_heads_v, head_dim, page_size] or 5D shuffle
-                                  // [num_blocks, num_heads_v, page_size//x, head_dim, x]
-    aiter_tensor_t& slot_mapping, // slot mapping
-    const std::string& kv_cache_dtype,     // kv cache data type
+    aiter_tensor_t& q,
+    aiter_tensor_t& k,
+    aiter_tensor_t& v,
+    int64_t num_heads_q,               // Number of query heads
+    int64_t num_heads_k,               // Number of key heads
+    int64_t num_heads_v,               // Number of value heads
+    int64_t head_dim,                  // Dimension per head
+    double eps,                        // Epsilon for RMS normalization
+    aiter_tensor_t& q_weight,          // RMSNorm weights for query [head_dim]
+    aiter_tensor_t& k_weight,          // RMSNorm weights for key [head_dim]
+    aiter_tensor_t& cos_sin_cache,     // Cos/sin cache [max_position, rotary_dim]
+    bool is_neox,                      // Whether RoPE is applied in Neox style
+    aiter_tensor_t& position_ids,      // Position IDs for RoPE [num_tokens]
+    aiter_tensor_t& k_cache,           // [num_blocks, num_kv_heads, head_dim//x, page_size, x]
+    aiter_tensor_t& v_cache,           // 4D [num_blocks, num_heads_v, head_dim, page_size] or 5D shuffle
+                                       // [num_blocks, num_heads_v, page_size//x, head_dim, x]
+    aiter_tensor_t& slot_mapping,      // slot mapping
+    const std::string& kv_cache_dtype, // kv cache data type
     std::optional<aiter_tensor_t> k_scale, // k scale tensor for quantized k cache
-    std::optional<aiter_tensor_t> v_scale, // v scale tensor for quantized v cache
-    std::optional<aiter_tensor_t> opt_q,   // [num_tokens, num_heads_q * head_dim] (preferred)
-    std::optional<aiter_tensor_t> opt_k,   // [num_tokens, num_heads_k * head_dim]
-    std::optional<aiter_tensor_t> opt_v    // [num_tokens, num_heads_v * head_dim]
+    std::optional<aiter_tensor_t> v_scale  // v scale tensor for quantized v cache
 )
 {
-    const bool have_q  = opt_q.has_value();
-    const bool have_k  = opt_k.has_value();
-    const bool have_v  = opt_v.has_value();
-    const bool any_sep = have_q || have_k || have_v;
-    AITER_CHECK(
-        !any_sep || (have_q && have_k && have_v),
-        "fused_qk_norm_rope_cache_quant_shuffle: pass all of q, k, v together, or omit all three.");
-    const bool use_separate = have_q && have_k && have_v;
-    const bool have_qkv     = qkv.numel() > 0;
-
     CHECK_INPUT(position_ids);
     CHECK_INPUT(q_weight);
     CHECK_INPUT(k_weight);
@@ -2461,16 +2421,37 @@ void fused_qk_norm_rope_cache_quant_shuffle(
     CHECK_INPUT(k_cache);
     CHECK_INPUT(v_cache);
     CHECK_INPUT(slot_mapping);
+    CHECK_TH_CUDA(q);
+    CHECK_TH_CUDA(k);
+    CHECK_TH_CUDA(v);
     CHECK_TYPE(position_ids, AITER_DTYPE_i64);
     CHECK_TYPE(slot_mapping, AITER_DTYPE_i64);
 
     AITER_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
     AITER_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
     AITER_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
-    AITER_CHECK(cos_sin_cache.dim() == 2, "Cos/sin cache must be 2D: [max_position, head_dim]");
+    AITER_CHECK(cos_sin_cache.dim() == 2, "Cos/sin cache must be 2D: [max_position, rotary_dim]");
     AITER_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
     AITER_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
-    AITER_CHECK(cos_sin_cache.size(1) == head_dim, "Cos/sin cache dimension must match head_dim");
+    int64_t const rotary_dim_ = cos_sin_cache.size(1);
+    AITER_CHECK(rotary_dim_ > 0, "rotary_dim must be positive");
+    AITER_CHECK(rotary_dim_ <= head_dim,
+                "rotary_dim (",
+                rotary_dim_,
+                ") must be <= head_dim (",
+                head_dim,
+                ")");
+    AITER_CHECK(rotary_dim_ % 2 == 0, "rotary_dim must be even");
+    if(is_neox)
+    {
+        int64_t const num_elems_per_thread = head_dim / 32;
+        AITER_CHECK((rotary_dim_ / 2) % num_elems_per_thread == 0,
+                    "For NeoX-style partial rotary, rotary_dim/2 (",
+                    rotary_dim_ / 2,
+                    ") must be divisible by head_dim/32 (",
+                    num_elems_per_thread,
+                    ")");
+    }
     AITER_CHECK(head_dim % 32 == 0,
                 "Head dimension must be multiple of 32 for fused QK Norm RoPE kernel");
     AITER_CHECK(
@@ -2483,100 +2464,61 @@ void fused_qk_norm_rope_cache_quant_shuffle(
     int64_t q_stride_token = 0, q_stride_head = 0, q_stride_dim = 0;
     int64_t k_stride_token = 0, k_stride_head = 0, k_stride_dim = 0;
     int64_t v_stride_token = 0, v_stride_head = 0, v_stride_dim = 0;
+    aiter_tensor_t const& q_t = q;
+    aiter_tensor_t const& k_t = k;
+    aiter_tensor_t const& v_t = v;
 
-    if(use_separate)
+    AITER_CHECK((q_t.dim() == 2 || q_t.dim() == 3) && (k_t.dim() == 2 || k_t.dim() == 3) &&
+                    (v_t.dim() == 2 || v_t.dim() == 3),
+                "q, k, v must be 2D [num_tokens, num_heads * head_dim] or 3D [num_tokens, "
+                "num_heads, head_dim]");
+    num_tokens = q_t.size(0);
+    AITER_CHECK(k_t.size(0) == num_tokens && v_t.size(0) == num_tokens,
+                "q, k, v must share the same num_tokens");
+    if(q_t.dim() == 2)
     {
-        aiter_tensor_t const& q_t = opt_q.value();
-        aiter_tensor_t const& k_t = opt_k.value();
-        aiter_tensor_t const& v_t = opt_v.value();
-        CHECK_TH_CUDA(q_t);
-        CHECK_TH_CUDA(k_t);
-        CHECK_TH_CUDA(v_t);
-        AITER_CHECK((q_t.dim() == 2 || q_t.dim() == 3) && (k_t.dim() == 2 || k_t.dim() == 3) &&
-                        (v_t.dim() == 2 || v_t.dim() == 3),
-                    "q, k, v must be 2D [num_tokens, num_heads * head_dim] or 3D [num_tokens, "
-                    "num_heads, head_dim]");
-        num_tokens = q_t.size(0);
-        AITER_CHECK(k_t.size(0) == num_tokens && v_t.size(0) == num_tokens,
-                    "q, k, v must share the same num_tokens");
-        if(q_t.dim() == 2)
-        {
-            AITER_CHECK(q_t.size(1) == num_heads_q * head_dim,
-                        "q dim 1 must be num_heads_q * head_dim");
-        }
-        else
-        {
-            AITER_CHECK(q_t.size(1) == num_heads_q && q_t.size(2) == head_dim,
-                        "q 3D shape must be [num_tokens, num_heads_q, head_dim]");
-        }
-        if(k_t.dim() == 2)
-        {
-            AITER_CHECK(k_t.size(1) == num_heads_k * head_dim,
-                        "k dim 1 must be num_heads_k * head_dim");
-        }
-        else
-        {
-            AITER_CHECK(k_t.size(1) == num_heads_k && k_t.size(2) == head_dim,
-                        "k 3D shape must be [num_tokens, num_heads_k, head_dim]");
-        }
-        if(v_t.dim() == 2)
-        {
-            AITER_CHECK(v_t.size(1) == num_heads_v * head_dim,
-                        "v dim 1 must be num_heads_v * head_dim");
-        }
-        else
-        {
-            AITER_CHECK(v_t.size(1) == num_heads_v && v_t.size(2) == head_dim,
-                        "v 3D shape must be [num_tokens, num_heads_v, head_dim]");
-        }
-        AITER_CHECK(q_t.dtype() == k_t.dtype() && q_t.dtype() == v_t.dtype(),
-                    "q, k, v must share the same dtype");
-        AITER_CHECK(q_t.dtype() == q_weight.dtype() && q_t.dtype() == k_weight.dtype(),
-                    "q/k/v must match q_weight/k_weight dtype");
-        act_dtype                    = q_t.dtype();
-        ActivationStrides3D const sq = activation_strides_logical_3d(q_t, num_heads_q, head_dim);
-        ActivationStrides3D const sk = activation_strides_logical_3d(k_t, num_heads_k, head_dim);
-        ActivationStrides3D const sv = activation_strides_logical_3d(v_t, num_heads_v, head_dim);
-        q_stride_token               = sq.st;
-        q_stride_head                = sq.sh;
-        q_stride_dim                 = sq.sd;
-        k_stride_token               = sk.st;
-        k_stride_head                = sk.sh;
-        k_stride_dim                 = sk.sd;
-        v_stride_token               = sv.st;
-        v_stride_head                = sv.sh;
-        v_stride_dim                 = sv.sd;
-        if(have_qkv)
-        {
-            // qkv is deprecated; q/k/v used instead.
-            int64_t const total_heads = num_heads_q + num_heads_k + num_heads_v;
-            AITER_CHECK(qkv.dim() == 2,
-                        "When passing both qkv and q/k/v, qkv must be 2D [num_tokens, "
-                        "total_heads*head_dim]");
-            AITER_CHECK(qkv.size(0) == num_tokens && qkv.size(1) == total_heads * head_dim,
-                        "When passing both qkv and q/k/v, qkv shape must be [num_tokens, "
-                        "(nh_q+nh_k+nh_v)*head_dim] "
-                        "(qkv is unused but must be consistent).");
-            AITER_CHECK(qkv.dtype() == q_t.dtype(),
-                        "When passing both qkv and q/k/v, qkv dtype must match q/k/v.");
-            CHECK_INPUT(qkv);
-        }
+        AITER_CHECK(q_t.size(1) == num_heads_q * head_dim, "q dim 1 must be num_heads_q * head_dim");
     }
     else
     {
-        AITER_CHECK(have_qkv,
-                    "fused_qk_norm_rope_cache_quant_shuffle: pass non-empty `qkv`, or pass all of "
-                    "`q`, `k`, `v`.");
-        // qkv alone is deprecated; prefer separate q, k, v tensors.
-        CHECK_INPUT(qkv);
-        AITER_CHECK(qkv.dim() == 2,
-                    "QKV tensor must be 2D: [num_tokens, "
-                    "(num_heads_q+num_heads_k+num_heads_v)*head_dim]");
-        AITER_CHECK(qkv.dtype() == q_weight.dtype() && qkv.dtype() == k_weight.dtype(),
-                    "qkv, q_weight and k_weight must have the same dtype");
-        num_tokens = qkv.size(0);
-        act_dtype  = qkv.dtype();
+        AITER_CHECK(q_t.size(1) == num_heads_q && q_t.size(2) == head_dim,
+                    "q 3D shape must be [num_tokens, num_heads_q, head_dim]");
     }
+    if(k_t.dim() == 2)
+    {
+        AITER_CHECK(k_t.size(1) == num_heads_k * head_dim, "k dim 1 must be num_heads_k * head_dim");
+    }
+    else
+    {
+        AITER_CHECK(k_t.size(1) == num_heads_k && k_t.size(2) == head_dim,
+                    "k 3D shape must be [num_tokens, num_heads_k, head_dim]");
+    }
+    if(v_t.dim() == 2)
+    {
+        AITER_CHECK(v_t.size(1) == num_heads_v * head_dim, "v dim 1 must be num_heads_v * head_dim");
+    }
+    else
+    {
+        AITER_CHECK(v_t.size(1) == num_heads_v && v_t.size(2) == head_dim,
+                    "v 3D shape must be [num_tokens, num_heads_v, head_dim]");
+    }
+    AITER_CHECK(q_t.dtype() == k_t.dtype() && q_t.dtype() == v_t.dtype(),
+                "q, k, v must share the same dtype");
+    AITER_CHECK(q_t.dtype() == q_weight.dtype() && q_t.dtype() == k_weight.dtype(),
+                "q/k/v must match q_weight/k_weight dtype");
+    act_dtype                    = q_t.dtype();
+    ActivationStrides3D const sq = activation_strides_logical_3d(q_t, num_heads_q, head_dim);
+    ActivationStrides3D const sk = activation_strides_logical_3d(k_t, num_heads_k, head_dim);
+    ActivationStrides3D const sv = activation_strides_logical_3d(v_t, num_heads_v, head_dim);
+    q_stride_token               = sq.st;
+    q_stride_head                = sq.sh;
+    q_stride_dim                 = sq.sd;
+    k_stride_token               = sk.st;
+    k_stride_head                = sk.sh;
+    k_stride_dim                 = sk.sd;
+    v_stride_token               = sv.st;
+    v_stride_head                = sv.sh;
+    v_stride_dim                 = sv.sd;
 
     AITER_CHECK(position_ids.size(0) == num_tokens,
                 "Number of tokens in position_ids must match activations");
@@ -2658,14 +2600,7 @@ void fused_qk_norm_rope_cache_quant_shuffle(
             v_cache.dim());
     }
 
-    if(!use_separate)
-    {
-        int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
-        AITER_CHECK(qkv.size(1) == total_heads * head_dim,
-                    "QKV tensor size must match total number of heads and head dimension");
-    }
-
-    const int stream_device = use_separate ? opt_q.value().device_id : qkv.device_id;
+    const int stream_device = q_t.device_id;
     HipDeviceGuard device_guard(stream_device);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
