@@ -65,7 +65,7 @@ if _arch_ok:
 else:
     # Non-supported arch (or unknown / probe failed): warn once and install
     # stubs. We deliberately do NOT raise ImportError here -- raising would
-    # would propagate up through `from aiter.ops.opus import *` in
+    # propagate up through `from aiter.ops.opus import *` in
     # aiter/__init__.py, where it would be caught by the surrounding
     # try/except and silently disable the 30+ subsequent op imports.
     #
