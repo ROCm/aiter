@@ -1496,8 +1496,8 @@ def get_2stage_cfgs(
         and not kernelName1
     ):
         logger.warning(
-            f"[fused_moe] SwiGLU MXFP4 with unshuffled weights not supported "
-            f"by CK2stages codegen; routing to CK-Tile (ROCM-25478)"
+            "[fused_moe] SwiGLU MXFP4 with unshuffled weights not supported "
+            "by CK2stages codegen; routing to CK-Tile (ROCM-25478)"
         )
         _split_k = max(int(ksplit), 2)
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
