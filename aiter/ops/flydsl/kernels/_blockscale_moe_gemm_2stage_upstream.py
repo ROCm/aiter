@@ -153,10 +153,26 @@ def compile_moe_blockscale_gemm1(
     in_dtype = "fp8"  # blockscale is FP8-only
     is_f16 = in_dtype == "fp16"
     elem_bytes = 2 if is_f16 else 1
-    if out_dtype not in ("f16", "bf16"):
-        raise ValueError(f"out_dtype must be 'f16' or 'bf16', got {out_dtype!r}")
+    if out_dtype not in ("f16", "bf16", "fp8"):
+        raise ValueError(f"out_dtype must be 'f16', 'bf16', or 'fp8', got {out_dtype!r}")
+    # fp8 output = fused silu_and_mul + e4m3fnuz quant + tiled e8m0 scale write
+    # inside the GEMM epilogue (no separate silu_and_mul_fq launch).
+    _out_is_fp8 = out_dtype == "fp8"
+    if _out_is_fp8 and k_batch > 1:
+        raise NotImplementedError(
+            "blockscale stage1: out_dtype='fp8' with k_batch>1 is not "
+            "supported (atomic-add fp8 quant is non-trivial; use k_batch=1 "
+            "or fall back to out_dtype='bf16'+silu_and_mul_fq for split-K)."
+        )
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
-    out_mlir = lambda: (lambda ty: ty() if callable(ty) else ty)(T.f16 if out_dtype == "f16" else T.bf16)
+    def out_mlir():
+        if out_dtype == "f16":
+            ty = T.f16
+        elif out_dtype == "bf16":
+            ty = T.bf16
+        else:  # fp8
+            ty = T.f8
+        return ty() if callable(ty) else ty
     tile_k_bytes = int(tile_k) * int(elem_bytes)
     # K64-byte micro-step: always 64 bytes per `ku`. For fp16 this is 32 elements.
     if (tile_k_bytes % 64) != 0:
@@ -226,8 +242,28 @@ def compile_moe_blockscale_gemm1(
     # path; correctness over a small throughput loss in the first iteration.
     if k_batch > 1 and use_cshuffle_epilog:
         use_cshuffle_epilog = False
+    # fp8 output uses direct epilog (CShuffle f16/bf16 LDS aliasing doesn't
+    # match the per-32-element quant block layout we need).
+    if _out_is_fp8 and use_cshuffle_epilog:
+        use_cshuffle_epilog = False
     # cshuffle epilog now supports both f16 and bf16 (out_mlir() handles the type swap).
     _out_is_bf16 = out_dtype == "bf16"
+
+    # For fp8 output: quant blocks span 32 contiguous output cols. With
+    # direct-epilog ni-stride=16 cols, each pair (ni, ni+1) forms one quant
+    # block. Require num_acc_n to be even.
+    if _out_is_fp8:
+        _n_per_wave_fp8 = tile_n // 4
+        _num_acc_n_fp8 = _n_per_wave_fp8 // 16
+        if (_num_acc_n_fp8 % 2) != 0:
+            raise ValueError(
+                f"out_dtype='fp8' requires num_acc_n (={_num_acc_n_fp8}) "
+                f"to be even (tile_n={tile_n} -> n_per_wave={_n_per_wave_fp8})"
+            )
+        if (inter_dim % 32) != 0:
+            raise ValueError(
+                f"out_dtype='fp8' requires inter_dim ({inter_dim}) divisible by 32"
+            )
 
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
@@ -251,6 +287,21 @@ def compile_moe_blockscale_gemm1(
     lds_alloc_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_alloc_offset + lds_alloc_bytes
 
+    # Extra LDS scratch for fused-fp8 per-128 cross-wave amax reduction.
+    # tile_m rows × num_waves(=4) × f32 = 256B for tile_m=16.
+    _fp8_per128 = bool(_out_is_fp8) and (int(tile_n) == 128)
+    if _fp8_per128:
+        _lds_amax_bytes = int(tile_m) * 4 * 4
+        _lds_amax_offset = allocator._align(allocator.ptr, 16)
+        allocator.ptr = _lds_amax_offset + _lds_amax_bytes
+    else:
+        _lds_amax_offset = 0
+        _lds_amax_bytes = 0
+    if _out_is_fp8 and not _fp8_per128:
+        raise NotImplementedError(
+            f"fused fp8 epilog (per-1x128 f32 scale) currently requires tile_n=128; got tile_n={tile_n}"
+        )
+
     @flyc.kernel(name=module_name)
     def moe_blockscale_gemm1(
         arg_out: fx.Tensor,
@@ -262,6 +313,7 @@ def compile_moe_blockscale_gemm1(
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
         arg_max_token_ids: fx.Tensor,
+        arg_out_scale_sorted: fx.Tensor,
         i32_tokens_in: fx.Int32,
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -394,6 +446,18 @@ def compile_moe_blockscale_gemm1(
                 if _use_cshuffle_epilog
                 else None
             )
+            # Per-128 amax scratch (fused fp8 epilog only). Separate region
+            # from lds_x, allocated after the GEMM LDS so it does not collide.
+            lds_amax = (
+                SmemPtr(
+                    base_ptr,
+                    _lds_amax_offset,
+                    T.f32,
+                    shape=(int(tile_m) * 4,),
+                ).get()
+                if _fp8_per128
+                else None
+            )
 
             # Buffer resources: for dynamic memrefs, provide `num_records_bytes` explicitly so
             # hardware OOB behavior is stable (otherwise it falls back to a large max size).
@@ -408,16 +472,32 @@ def compile_moe_blockscale_gemm1(
 
             w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False, num_records_bytes=w_nbytes)
 
-            # OUT: [tokens, topk, inter] f16/bf16 -> bytes = tokens*topk*inter*out_elem_bytes
+            # OUT: [tokens, topk, inter] f16/bf16/fp8 -> bytes = tokens*topk*inter*out_elem_bytes
             # Split-K: arg_out is tmp_out of shape (tokens, topk, 2*inter_dim)
             # in gui_layout per-16 interleave. Double the per-row width so the
             # buffer-resource OOB bound covers the full tmp_out span.
-            out_elem_bytes = 2  # f16/bf16
+            out_elem_bytes = 1 if _out_is_fp8 else 2
             _out_row_mult = fx.Index(2 if k_batch > 1 else 1)
             out_nbytes_idx = tokens_in * c_topk * inter_in * _out_row_mult * fx.Index(out_elem_bytes)
             out_rsrc = buffer_ops.create_buffer_resource(
                 arg_out, max_size=False, num_records_bytes=arith.index_cast(T.i64, out_nbytes_idx)
             )
+
+            # OUT_SCALE (Phase B-v2): per-1x128 f32 blockscale in per-row
+            # layout, shape (n_blocks_k, tokens*topk). This matches what the
+            # downstream fp8/fp8 stage2 kernel consumes natively (the same
+            # format `per_group_quant_hip(..., transpose_scale=True)` emits).
+            out_scale_rsrc = -1
+            if const_expr(_out_is_fp8):
+                _n_blocks_k = inter_dim // 128
+                out_scale_nbytes_idx = (
+                    arith.index(_n_blocks_k) * tokens_in * fx.Index(topk) * fx.Index(4)
+                )
+                out_scale_rsrc = buffer_ops.create_buffer_resource(
+                    arg_out_scale_sorted,
+                    max_size=False,
+                    num_records_bytes=arith.index_cast(T.i64, out_scale_nbytes_idx),
+                )
 
             # fp16 path ignores scales completely (implicit scale=1.0).
             x_load_bytes = 16
@@ -1325,12 +1405,153 @@ def compile_moe_blockscale_gemm1(
                             _atomic_add_scalar_via_pk(up_idx_i32, vu)
                     return
 
-                # out linear index base = ((t*topk + s)*inter_dim) (invariant across ni)
+                # out linear index base. For bf16/f16: element-indexed -> (t*topk+s)*inter_dim.
+                # For fp8: byte-indexed -> (t*topk+s)*inter_dim (each element is 1 byte).
                 idx0 = (t2 * topk_i32_v + s2) * inter_i32_local
 
                 # Sorted weight aligned with `row` (matches aiter moe_sorting output).
                 if const_expr(doweight_stage1):
                     tw = buffer_ops.buffer_load(sorted_w_rsrc, row, vec_width=1, dtype=T.f32)
+
+                if const_expr(_out_is_fp8):
+                    # ── Phase B-v2: fused fp8 emit (tile_n=128) ──────────────
+                    # Each wave owns 32 N-cols (n_per_wave = tile_n/4 = 32);
+                    # 4 waves combine via LDS to form one per-1x128 amax.
+                    # Output:
+                    #   * fp8 bytes -> token-major out[(t*topk+s)*inter + col]
+                    #   * f32 scale -> per-row [n_blocks_k, tokens*topk] flat,
+                    #     written as scale[by * tokens*topk + t*topk + s].
+                    #
+                    # Two-pass with one block-wide barrier:
+                    #   1) compute act(g)*u; intra-wave amax via shuffle_xor;
+                    #      lane_mod_16==0 publishes per-wave amax to LDS
+                    #      slot [row_in_tile*4 + wave_mod_4].
+                    #   2) barrier; all threads read 4 slots → per-128 amax;
+                    #      apply quant_scale = 240/amax + clamp ±240 →
+                    #      cvt_pk_fp8 → buffer_store fp8 bytes.
+                    #      Lane (wave_mod_4==0, lane_mod_16==0) writes f32
+                    #      (amax/240) to per-row scale buffer.
+                    _fp8_max_v = arith.constant(240.0, type=T.f32)
+                    _fp8_min_v = arith.constant(-240.0, type=T.f32)
+                    _fp8_inv240 = arith.constant(1.0 / 240.0, type=T.f32)
+                    _c_240_f32 = arith.constant(240.0, type=T.f32)
+                    _c_tiny_f32 = arith.constant(1e-10, type=T.f32)
+                    _c0_i32 = arith.constant(0, type=T.i32)
+                    _c8_i32 = arith.constant(8, type=T.i32)
+                    _c64_i32 = arith.constant(64, type=T.i32)
+                    _shuffle_dists = (1, 2, 4, 8)
+                    lane_mod_16_i32_local = arith.index_cast(T.i32, lane_mod_16)
+                    wave_mod_4_i32 = arith.index_cast(T.i32, wave_mod_4)
+                    _vec1_f32 = T.vec(1, T.f32)
+                    _c4_idx = fx.Index(4)
+                    _c1_idx = fx.Index(1)
+                    _c2_idx = fx.Index(2)
+                    _c3_idx = fx.Index(3)
+
+                    # Restricted to tile_n=128: exactly one (ni0,ni1) pair per
+                    # wave (num_acc_n == 2). The outer compile-time guard
+                    # rejects other tile_n at module-build time.
+                    ni0 = 0
+                    ni1 = 1
+                    acc_idx0 = mi * num_acc_n + ni0
+                    acc_idx1 = mi * num_acc_n + ni1
+                    vg0 = vector.extract(acc_gate[acc_idx0], static_position=[ii], dynamic_position=[])
+                    vu0 = vector.extract(acc_up[acc_idx0], static_position=[ii], dynamic_position=[])
+                    vg1 = vector.extract(acc_gate[acc_idx1], static_position=[ii], dynamic_position=[])
+                    vu1 = vector.extract(acc_up[acc_idx1], static_position=[ii], dynamic_position=[])
+                    a0 = act_fn(vg0) * vu0
+                    a1 = act_fn(vg1) * vu1
+                    if const_expr(doweight_stage1):
+                        a0 = a0 * tw
+                        a1 = a1 * tw
+
+                    # Pass 1: per-wave amax of these 32 cols.
+                    abs0 = math_dialect.absf(a0)
+                    abs1 = math_dialect.absf(a1)
+                    local_max = arith.maximumf(abs0, abs1)
+                    for _d in _shuffle_dists:
+                        _off = arith.constant(_d, type=T.i32)
+                        peer = local_max.shuffle_xor(_off, _c64_i32)
+                        local_max = arith.maximumf(local_max, peer)
+
+                    # Publish per-wave amax to LDS. Guard with t_valid: pad
+                    # rows skip the write (and skip the read in pass 2).
+                    lane_eq_0 = arith.cmpi(
+                        arith.CmpIPredicate.eq, lane_mod_16_i32_local, _c0_i32
+                    )
+                    pub_cond = arith.andi(lane_eq_0, t_valid)
+                    _if_pub = scf.IfOp(pub_cond)
+                    with _if_then(_if_pub):
+                        lds_off = row_in_tile * _c4_idx + wave_mod_4
+                        v1 = vector.from_elements(_vec1_f32, [local_max])
+                        vector.store(v1, lds_amax, [lds_off], alignment=4)
+
+                    # Block-wide barrier (must be unconditional).
+                    gpu.barrier()
+
+                    # Pass 2: cross-wave amax, scale, quant, store.
+                    _if_valid = scf.IfOp(t_valid)
+                    with _if_then(_if_valid):
+                        row_base_idx = row_in_tile * _c4_idx
+                        m0_v = vector.load_op(_vec1_f32, lds_amax, [row_base_idx])
+                        m1_v = vector.load_op(_vec1_f32, lds_amax, [row_base_idx + _c1_idx])
+                        m2_v = vector.load_op(_vec1_f32, lds_amax, [row_base_idx + _c2_idx])
+                        m3_v = vector.load_op(_vec1_f32, lds_amax, [row_base_idx + _c3_idx])
+                        m0 = vector.extract(m0_v, static_position=[0], dynamic_position=[])
+                        m1 = vector.extract(m1_v, static_position=[0], dynamic_position=[])
+                        m2 = vector.extract(m2_v, static_position=[0], dynamic_position=[])
+                        m3 = vector.extract(m3_v, static_position=[0], dynamic_position=[])
+                        per128_amax = arith.maximumf(
+                            arith.maximumf(m0, m1), arith.maximumf(m2, m3)
+                        )
+                        amax_safe = arith.maximumf(per128_amax, _c_tiny_f32)
+                        # quant_scale = 240 / amax (multiplier on activations).
+                        quant_scale = _c_240_f32 * rocdl.rcp(T.f32, amax_safe)
+                        # scale_f32 = amax / 240 (per-row scale to stage2).
+                        scale_f32 = amax_safe * _fp8_inv240
+
+                        s0 = a0 * quant_scale
+                        s0 = arith.minimumf(s0, _fp8_max_v)
+                        s0 = arith.maximumf(s0, _fp8_min_v)
+                        s1 = a1 * quant_scale
+                        s1 = arith.minimumf(s1, _fp8_max_v)
+                        s1 = arith.maximumf(s1, _fp8_min_v)
+                        packed_i32 = rocdl.cvt_pk_fp8_f32(
+                            T.i32, s0, s1, _c0_i32, 0
+                        )
+                        byte0 = arith.TruncIOp(T.i8, packed_i32)
+                        byte1 = arith.TruncIOp(T.i8, packed_i32 >> _c8_i32)
+                        col0_i32 = col_i32_list[ni0]
+                        col1_i32 = col_i32_list[ni1]
+                        buffer_ops.buffer_store(
+                            byte0, out_rsrc, idx0 + col0_i32,
+                            offset_is_bytes=True,
+                        )
+                        buffer_ops.buffer_store(
+                            byte1, out_rsrc, idx0 + col1_i32,
+                            offset_is_bytes=True,
+                        )
+
+                        # Designated writer for the per-row f32 scale: exactly
+                        # one thread per (row, per-128-block). For tile_n=128
+                        # each CTA owns one block in N, indexed by `by`.
+                        wave_eq_0 = arith.cmpi(
+                            arith.CmpIPredicate.eq, wave_mod_4_i32, _c0_i32
+                        )
+                        is_writer = arith.andi(wave_eq_0, lane_eq_0)
+                        _if_w = scf.IfOp(is_writer)
+                        with _if_then(_if_w):
+                            by_i32 = arith.index_cast(T.i32, by)
+                            scale_off_elems = (
+                                by_i32 * (tokens_i32_v * topk_i32_v)
+                                + (t2 * topk_i32_v + s2)
+                            )
+                            scale_byte_off = scale_off_elems * fx.Int32(4)
+                            buffer_ops.buffer_store(
+                                scale_f32, out_scale_rsrc, scale_byte_off,
+                                offset_is_bytes=True,
+                            )
+                    return
 
                 _if_valid = scf.IfOp(t_valid)
                 with _if_then(_if_valid):
@@ -1370,6 +1591,7 @@ def compile_moe_blockscale_gemm1(
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
         arg_max_token_ids: fx.Tensor,
+        arg_out_scale_sorted: fx.Tensor,
         i32_tokens_in: fx.Int32,
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -1396,6 +1618,7 @@ def compile_moe_blockscale_gemm1(
             arg_expert_ids,
             arg_sorted_weights,
             arg_max_token_ids,
+            arg_out_scale_sorted,
             i32_tokens_in,
             i32_inter_in,
             i32_k_in,

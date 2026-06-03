@@ -653,7 +653,35 @@ def _view_safe(t: torch.Tensor) -> torch.Tensor:
 
 
 def _ptr_view_safe(t: torch.Tensor):
-    """Pass only the device data pointer; shape is carried by explicit args."""
+    """Pass a TensorAdaptor (fx.Tensor / memref) for kernels with shaped args.
+
+    Used for the upstream MoE GEMM kernel whose args are annotated `fx.Tensor`
+    (dynamic-shape memref).  For kernels whose args are annotated `fx.Pointer`
+    (raw pointer, shape carried by explicit args), use ``_ptr_arg_safe``
+    instead — it produces a PointerAdaptor that survives ptrtoint.
+    """
+    import flydsl.compiler as flyc
+
+    view = _view_safe(t)
+    type_name = type(view).__name__
+    module_name = type(view).__module__
+    if type_name == "FakeTensor" or "fake_tensor" in module_name:
+        # No real storage; hand a 1-byte placeholder so the launcher gets a
+        # valid pointer.  The kernel will not be executed on fake tensors.
+        return flyc.from_dlpack(
+            torch.empty(1, dtype=torch.uint8, device="cuda")
+        )
+    return flyc.from_dlpack(view)
+
+
+def _ptr_arg_safe(t: torch.Tensor):
+    """Pass a PointerAdaptor (raw device pointer) for kernels with `fx.Pointer` args.
+
+    Used by the split-K post-processing kernel ``silu_and_mul_fq_kernel``,
+    which immediately calls ``fx.ptrtoint`` on its args.  ``from_dlpack``
+    returns a shaped Tensor (memref) which fails ptrtoint; ``from_c_void_p``
+    returns a bare pointer that ptrtoint accepts.
+    """
     import flydsl.compiler as flyc
     import flydsl.expr as fx
 
@@ -723,9 +751,16 @@ def _s1_args_std(
     k_in,
     size_expert_ids_in,
     stream=None,
+    out_scale_sorted=None,
 ):
     if stream is None:
         stream = torch.cuda.current_stream()
+    if out_scale_sorted is None:
+        # Stage1 kernel signature always includes `arg_out_scale_sorted` (only
+        # used for fused fp8 epilogue). Non-fp8 paths pass a 1-byte placeholder.
+        out_scale_sorted = torch.empty(
+            1, dtype=torch.uint8, device=out.device
+        )
     return (
         _ptr_view_safe(out),
         _ptr_view_safe(a),
@@ -736,6 +771,7 @@ def _s1_args_std(
         _ptr_view_safe(sorted_expert_ids),
         _ptr_view_safe(sorted_weights),
         _ptr_view_safe(num_valid_ids),
+        _ptr_view_safe(out_scale_sorted),
         token_num,
         n_in,
         k_in,
@@ -1384,18 +1420,40 @@ def flydsl_moe_stage1(
 
     _persist_m = persist_m if persist_m > 0 else 1
 
-    # Allocate sorted-scale buffer with padding for tiled layout
-    scale_cols = inter_dim // 32
-    sorted_size = max(
-        sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * _sort_block_m
-    )
-    padded_rows = (sorted_size + 255) // 256 * 256
-    padded_cols = (scale_cols + 7) // 8 * 8
-    out_scale_sorted_flat = (
-        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
-        if _need_sort
-        else torch.empty(0, dtype=torch.uint8, device=dev)
-    )
+    # Scale-buffer allocation.
+    #
+    # Two layouts coexist:
+    #   * Phase B-v2 fused fp8 GEMM (non-splitK): per-1x128 f32 in per-row
+    #     layout (n_blocks_k, tokens*topk). Drop-in replacement for what
+    #     `per_group_quant_hip(..., transpose_scale=True)` produces, and the
+    #     format flydsl_moe_stage2 / compile_blockscale_moe_gemm2 consumes
+    #     natively as `a2_scale`.
+    #   * Legacy post-quant kernels (silu_and_mul_fq via _gui_sk_fused,
+    #     _gui_sk, _splitk_fp4): per-32 e8m0 in sorted-tile uint8 layout
+    #     with padding. Unchanged.
+    _fused_fp8_in_gemm = _need_fp8 and not _is_splitk
+    if _fused_fp8_in_gemm:
+        # Per-row f32 layout. Size = n_blocks_k * tokens*topk * 4 bytes.
+        # Stage2 indexes as a2_scale[blk_k, t*topk + s].
+        _n_blocks_k_s1 = inter_dim // 128
+        out_scale_sorted_flat = torch.empty(
+            _n_blocks_k_s1 * token_num * topk, dtype=torch.float32, device=dev
+        )
+        # padded_rows/cols kept None for this branch — only the legacy
+        # uint8 path consumes them.
+        padded_rows = padded_cols = None
+    else:
+        scale_cols = inter_dim // 32
+        sorted_size = max(
+            sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * _sort_block_m
+        )
+        padded_rows = (sorted_size + 255) // 256 * 256
+        padded_cols = (scale_cols + 7) // 8 * 8
+        out_scale_sorted_flat = (
+            torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
+            if _need_sort
+            else torch.empty(0, dtype=torch.uint8, device=dev)
+        )
 
     # split-K GEMM kernel does not fuse quant; the fused silu_and_mul_fq kernel
     # handles activation + quant + scale-sort after the GEMM completes.
@@ -1434,6 +1492,13 @@ def flydsl_moe_stage1(
             ),
         )
     else:
+        # Fused fp8 stage1 (non-splitK) consumes out_scale_sorted_flat as a
+        # real argument; other paths get a 1-byte placeholder (the kernel
+        # signature still requires the slot).
+        _fused_fp8_in_gemm = _need_fp8 and not _is_splitk
+        _s1_scale_arg = (
+            out_scale_sorted_flat.view(-1) if _fused_fp8_in_gemm else None
+        )
         args = _s1_args_std(
             _kernel_out.view(-1),
             a.view(-1),
@@ -1448,6 +1513,7 @@ def flydsl_moe_stage1(
             _n_in,
             _k_in,
             _grid_y,
+            out_scale_sorted=_s1_scale_arg,
         )
 
     exe = compile_flydsl_moe_stage1(
@@ -1512,13 +1578,13 @@ def flydsl_moe_stage1(
         _run_compiled(
             _silu_fused_k,
             (
-                _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
-                _ptr_view_safe(out.view(-1).view(torch.uint8)),
-                _ptr_view_safe(out_scale_sorted_flat),
-                _ptr_view_safe(sorted_token_ids),
-                _ptr_view_safe(num_valid_ids),
-                _ptr_view_safe(topk_ids_arg),
-                _ptr_view_safe(bias_arg),
+                _ptr_arg_safe(tmp_out.view(-1, inter_dim * 2)),
+                _ptr_arg_safe(out.view(-1).view(torch.uint8)),
+                _ptr_arg_safe(out_scale_sorted_flat),
+                _ptr_arg_safe(sorted_token_ids),
+                _ptr_arg_safe(num_valid_ids),
+                _ptr_arg_safe(topk_ids_arg),
+                _ptr_arg_safe(bias_arg),
                 token_num,
                 num_sorted_rows,
                 torch.cuda.current_stream(),
@@ -1537,13 +1603,13 @@ def flydsl_moe_stage1(
         _run_compiled(
             _silu_fused_k,
             (
-                _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
-                _ptr_view_safe(out.view(-1).view(torch.uint8)),
-                _ptr_view_safe(out_scale_sorted_flat),
-                _ptr_view_safe(sorted_token_ids),
-                _ptr_view_safe(num_valid_ids),
-                _ptr_view_safe(topk_ids_arg),
-                _ptr_view_safe(bias_arg),
+                _ptr_arg_safe(tmp_out.view(-1, inter_dim * 2)),
+                _ptr_arg_safe(out.view(-1).view(torch.uint8)),
+                _ptr_arg_safe(out_scale_sorted_flat),
+                _ptr_arg_safe(sorted_token_ids),
+                _ptr_arg_safe(num_valid_ids),
+                _ptr_arg_safe(topk_ids_arg),
+                _ptr_arg_safe(bias_arg),
                 token_num,
                 num_sorted_rows,
                 torch.cuda.current_stream(),
@@ -1560,13 +1626,13 @@ def flydsl_moe_stage1(
         _run_compiled(
             _silu_fused_k,
             (
-                _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
-                _ptr_view_safe(out.view(-1).view(torch.uint8)),
-                _ptr_view_safe(out_scale_sorted_flat),
-                _ptr_view_safe(sorted_token_ids),
-                _ptr_view_safe(num_valid_ids),
-                _ptr_view_safe(topk_ids_arg),
-                _ptr_view_safe(bias_arg),
+                _ptr_arg_safe(tmp_out.view(-1, inter_dim * 2)),
+                _ptr_arg_safe(out.view(-1).view(torch.uint8)),
+                _ptr_arg_safe(out_scale_sorted_flat),
+                _ptr_arg_safe(sorted_token_ids),
+                _ptr_arg_safe(num_valid_ids),
+                _ptr_arg_safe(topk_ids_arg),
+                _ptr_arg_safe(bias_arg),
                 token_num,
                 num_sorted_rows,
                 torch.cuda.current_stream(),
@@ -1597,6 +1663,12 @@ def flydsl_moe_stage1(
             silu_and_mul(post_out, post_input)
 
     if _fuse_any_quant and _need_sort:
+        if _fused_fp8_in_gemm:
+            # Per-row f32 blockscale (n_blocks_k, tokens*topk).
+            out_scale = out_scale_sorted_flat.view(
+                inter_dim // 128, token_num * topk
+            )
+            return out, out_scale
         from aiter.utility.dtypes import fp8_e8m0
 
         out_scale_sorted = out_scale_sorted_flat.view(fp8_e8m0).view(
