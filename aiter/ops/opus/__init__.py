@@ -63,6 +63,7 @@ if _arch_ok:
     from .gemm_op_a16w16 import (  # noqa: E402
         opus_gemm_a16w16_tune,
         gemm_a16w16_opus,
+        opus_gemm_workspace_init,
     )
 else:
     # Non-supported arch (or unknown / probe failed): warn once and install
@@ -78,9 +79,11 @@ else:
     )
     gemm_a16w16_opus = _make_unsupported_arch_stub("gemm_a16w16_opus")
     opus_gemm_a16w16_tune = _make_unsupported_arch_stub("opus_gemm_a16w16_tune")
+    opus_gemm_workspace_init = _make_unsupported_arch_stub("opus_gemm_workspace_init")
 
 
 __all__ = [
     "opus_gemm_a16w16_tune",
     "gemm_a16w16_opus",
+    "opus_gemm_workspace_init",
 ]

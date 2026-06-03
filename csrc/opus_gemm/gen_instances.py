@@ -2027,32 +2027,32 @@ void
     int padded_M    = num_tiles_m * {k.B_M};
     int padded_N    = num_tiles_n * {k.B_N};
 
-    // Thread-local growing workspace cache. Kernels see a stable handle
-    // slot (host-coherent, address never changes) and deref slot->ptr at
-    // entry; grow path swaps slot contents after a device sync. Captured
-    // graphs hold the slot, not the raw buffer, so a later grow doesn't
-    // dangle them. 4 MiB round-up absorbs near-miss shapes.
+    // Per-stream workspace handle (process-global registry, mutex-protected
+    // in opus_gemm.cu). Replaces the prior `static thread_local` cache —
+    // under TBO two CPU threads drive two streams concurrently, and each
+    // captured graph must bake in its own buffer pointer. Eager: lazy-
+    // create. Capture: must be pre-warmed via
+    // aiter.opus_gemm_workspace_init() on the capture stream.
+    // (opus_splitk_ws_handle is already a complete type at this point via
+    // the traits header included at the top of this launcher .cuh.)
+    extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
+
     auto stream = aiter::getCurrentHIPStream();
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
+    const bool capturing = (capture_status != hipStreamCaptureStatusNone);
+    auto* ws_handle_ = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
+
     size_t ws_bytes = (size_t)split_k * (size_t)batch
                     * (size_t)padded_M * (size_t)padded_N * sizeof(float);
-    static thread_local opus_splitk_ws_handle* ws_handle_ = []() {{
-        opus_splitk_ws_handle* h = nullptr;
-        HIP_CALL(hipHostMalloc(reinterpret_cast<void**>(&h),
-                               sizeof(opus_splitk_ws_handle),
-                               hipHostMallocCoherent));
-        h->ptr = nullptr;
-        h->bytes = 0;
-        return h;
-    }}();
     if (ws_handle_->ptr == nullptr || ws_bytes > ws_handle_->bytes)
     {{
-        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-        HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
-        AITER_CHECK(capture_status == hipStreamCaptureStatusNone,
+        AITER_CHECK(!capturing,
             "splitk workspace grow inside HIP graph capture is not "
             "supported (hipMalloc / hipFree are stream-capture-illegal). "
-            "Warm the cache once eagerly with the largest workspace before "
-            "capturing.");
+            "Warm this stream eagerly with the largest expected workspace "
+            "before capture (call aiter.opus_gemm_workspace_init() then "
+            "run the largest expected gemm).");
 
         void* new_ptr = nullptr;
         const size_t kGrowAlign = (size_t)4 * 1024 * 1024;

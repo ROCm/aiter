@@ -317,6 +317,14 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,                \
           py::arg("splitK")   = 0);
 
+#define OPUS_GEMM_WORKSPACE_INIT_PYBIND                                 \
+    m.def("opus_gemm_workspace_init",                                   \
+          &opus_gemm_workspace_init,                                    \
+          "Register a splitk fp32 workspace handle for the current "    \
+          "CUDA stream. Call once per stream eagerly (outside HIP "     \
+          "graph capture) before capturing graphs that include "        \
+          "opus_gemm splitk kernels under TBO.");
+
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
           &aiter::swap_blocks,                                                      \
