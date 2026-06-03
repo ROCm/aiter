@@ -1427,14 +1427,18 @@ def compile_moe_blockscale_gemm1(
                     #      lane_mod_16==0 publishes per-wave amax to LDS
                     #      slot [row_in_tile*4 + wave_mod_4].
                     #   2) barrier; all threads read 4 slots → per-128 amax;
-                    #      apply quant_scale = 240/amax + clamp ±240 →
+                    #      apply quant_scale = FMAX/amax + clamp ±FMAX →
                     #      cvt_pk_fp8 → buffer_store fp8 bytes.
                     #      Lane (wave_mod_4==0, lane_mod_16==0) writes f32
-                    #      (amax/240) to per-row scale buffer.
-                    _fp8_max_v = arith.constant(240.0, type=T.f32)
-                    _fp8_min_v = arith.constant(-240.0, type=T.f32)
-                    _fp8_inv240 = arith.constant(1.0 / 240.0, type=T.f32)
-                    _c_240_f32 = arith.constant(240.0, type=T.f32)
+                    #      (amax/FMAX) to per-row scale buffer.
+                    #   FMAX = 240 on gfx942 (fp8 e4m3 fnuz), 448 on gfx950+
+                    #   (fp8 e4m3 fn) — matches finfo<fp8_t>::max() used by
+                    #   per_group_quant_hip on each arch.
+                    _fp8_fmax_val = 448.0 if _is_gfx950 else 240.0
+                    _fp8_max_v = arith.constant(_fp8_fmax_val, type=T.f32)
+                    _fp8_min_v = arith.constant(-_fp8_fmax_val, type=T.f32)
+                    _fp8_inv240 = arith.constant(1.0 / _fp8_fmax_val, type=T.f32)
+                    _c_240_f32 = arith.constant(_fp8_fmax_val, type=T.f32)
                     _c_tiny_f32 = arith.constant(1e-10, type=T.f32)
                     _c0_i32 = arith.constant(0, type=T.i32)
                     _c8_i32 = arith.constant(8, type=T.i32)
