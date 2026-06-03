@@ -268,8 +268,13 @@ def test_pa_decode(
         page_size, max_qlen, qlen_with_mtp, device,
     )
     split_rows = reduce_partial_map.size(0) * max_qlen
-    split_o = torch.empty((split_rows, 1, q_head_num, head_dim), dtype=dtypes.fp32, device=device)
-    split_lse = torch.empty((split_rows, 1, q_head_num, 1), dtype=dtypes.fp32, device=device)
+    # Init split_lse=-inf / split_o=0 so any split the kernel leaves unwritten
+    # (e.g. an empty-kv split the scheduler created for a short sequence)
+    # contributes exp(lse-max)=0 and is ignored by the host reduce.
+    split_o = torch.zeros((split_rows, 1, q_head_num, head_dim), dtype=dtypes.fp32, device=device)
+    split_lse = torch.full(
+        (split_rows, 1, q_head_num, 1), float("-inf"), dtype=dtypes.fp32, device=device
+    )
 
     # PA stage on GPU (timed); reduce on host (gfx1250 reduce kernel is WIP).
     out, us = run_pa_stage(
