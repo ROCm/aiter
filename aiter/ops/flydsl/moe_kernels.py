@@ -601,16 +601,21 @@ def _view_safe(t: torch.Tensor) -> torch.Tensor:
 
 
 def _ptr_view_safe(t: torch.Tensor):
-    """Pass only the device data pointer; shape is carried by explicit args."""
+    """Pass a TensorAdaptor (fx.Tensor / memref) for kernels with shaped args.
+
+    The wheel's `flyc.from_c_void_p` returns a raw `!fly.ptr<i8, global>` which
+    `create_buffer_resource` rejects (it calls `extract_aligned_pointer_as_index`
+    expecting a memref). `from_dlpack` returns a memref that satisfies the
+    verifier.
+    """
     import flydsl.compiler as flyc
-    import flydsl.expr as fx
 
     view = _view_safe(t)
     type_name = type(view).__name__
     module_name = type(view).__module__
     if type_name == "FakeTensor" or "fake_tensor" in module_name:
-        return flyc.from_c_void_p(fx.Uint8, 0)
-    return flyc.from_c_void_p(fx.Uint8, view.data_ptr())
+        return flyc.from_dlpack(torch.empty(1, dtype=torch.uint8, device="cuda"))
+    return flyc.from_dlpack(view)
 
 
 def _s1_args_fp4(
