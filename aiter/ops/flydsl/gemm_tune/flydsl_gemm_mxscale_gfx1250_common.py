@@ -11,7 +11,7 @@ specialization, ...) is held at the conservative default baked into
 ``flydsl_mxscale_kernel_name`` so tuned kernels never depend on unstable knobs.
 
 ``.name`` round-trips through ``parse_flydsl_mxscale_kernel_name`` and is what
-gets written into the ``mxscale_gfx1250`` tuned CSV.
+gets written into the a8w8 bpreshuffle tuned CSV for MXScale rows.
 """
 
 from __future__ import annotations
@@ -20,7 +20,11 @@ from dataclasses import dataclass
 from itertools import product
 
 from aiter.ops.flydsl.mxscale_gemm import flydsl_mxscale_kernel_name
-from aiter.ops.flydsl.mxscale_layout import SCALE_BLOCK, mxscale_k_tiles_per_split
+from aiter.ops.flydsl.mxscale_layout import (
+    SCALE_BLOCK,
+    get_padded_weight_shape,
+    validate_mxscale_kernel_shape,
+)
 
 # gfx1250 WMMA tile dims — must match the compile_mxscale_gemm contract.
 WMMA_M = 16  # == mxscale_layout.WMMA_DIM
@@ -68,7 +72,7 @@ class MxScaleKernelInstance:
 # Tuner search grid. Kept deliberately small but representative; the per-shape
 # filter in the tuner driver drops candidates that do not divide the problem.
 _TILE_M_OPTIONS = (16, 64, 128, 256)
-_TILE_N_OPTIONS = (64, 128, 256)
+_TILE_N_OPTIONS = (32, 64, 128, 256)
 _TILE_K_OPTIONS = (128, 256)
 _WARP_OPTIONS = ((2, 2),)
 _NUM_BUFFER_OPTIONS = (2, 3, 4)
@@ -78,11 +82,19 @@ _CLUSTER_OPTIONS = ((1, 1),)
 
 
 def _is_valid_static(
-    tile_m: int, tile_n: int, tile_k: int, m_warp: int, n_warp: int
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    m_warp: int,
+    n_warp: int,
+    data_format: str,
 ) -> bool:
     if tile_m % (m_warp * WMMA_M) != 0:
         return False
     if tile_n % (n_warp * WMMA_N) != 0:
+        return False
+    wmma_n_eff = 32 if data_format == "fp4" else 16
+    if (tile_n // n_warp) % wmma_n_eff != 0:
         return False
     if tile_k % WMMA_K != 0:
         return False
@@ -114,7 +126,7 @@ def _build_kernels_list(
         _SPLIT_K_OPTIONS,
         _CLUSTER_OPTIONS,
     ):
-        if not _is_valid_static(tile_m, tile_n, tile_k, m_warp, n_warp):
+        if not _is_valid_static(tile_m, tile_n, tile_k, m_warp, n_warp, data_format):
             continue
         kernels[idx] = MxScaleKernelInstance(
             tile_m=tile_m,
@@ -160,18 +172,27 @@ def kernel_fits_shape(ki: MxScaleKernelInstance, M: int, N: int, K: int) -> bool
     """Whether this candidate can run the given (M, N, K) without violating
     the kernel's structural constraints (divisibility + pipeline depth +
     workgroup-cluster grid evenness)."""
-    # N must tile into 16-wide WMMA cols; K only needs the 32-elem scale block
-    # (the op pads K up to tile_k*split_k, so tile_k need not divide raw K).
-    if N % WMMA_N != 0 or K % SCALE_BLOCK != 0:
+    if K % SCALE_BLOCK != 0:
         return False
-    num_k_tiles, _ = mxscale_k_tiles_per_split(K, ki.tile_k, ki.split_k)
-    if num_k_tiles < ki.num_buffers:
+    weight_shape = get_padded_weight_shape(ki.data_format, N, K)
+    prepared_n = weight_shape["N"]
+    k_pad = weight_shape["K"]
+    try:
+        validate_mxscale_kernel_shape(
+            N=prepared_n,
+            K=k_pad,
+            tile_n=ki.tile_n,
+            tile_k=ki.tile_k,
+            num_buffers=ki.num_buffers,
+            split_k=ki.split_k,
+        )
+    except ValueError:
         return False
     if kernel_instance_estimated_lds_bytes(ki) > max_lds_bytes_for_tune():
         return False
     # Workgroup clusters need the tile grid to divide evenly by the cluster dims.
     num_m_tiles = _ceil_div(M, ki.tile_m)
-    num_n_tiles = _ceil_div(N, ki.tile_n)
+    num_n_tiles = prepared_n // ki.tile_n
     if num_m_tiles % ki.cluster_m != 0 or num_n_tiles % ki.cluster_n != 0:
         return False
     return True

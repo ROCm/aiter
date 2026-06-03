@@ -6,26 +6,27 @@
 FlyDSL is the only backend, so this driver is a FlyDSL-only subclass of
 GemmCommonTuner: for every untuned ``(M, N, K)`` shape it benchmarks the
 candidate kernels from ``flydsl_gemm_mxscale_gfx1250_common.kernels_list`` and
-writes the winner (its encoded ``kernelName``) into the ``mxscale_gfx1250`` tuned
-CSV. The public ``aiter.gemm_a8w8_mxscale`` op then routes to that kernel
-automatically. MX A8W4 is not integrated this round, so this driver tunes
-``--data_format fp8`` only.
+writes the winner (its encoded ``kernelName``) into the a8w8 bpreshuffle tuned
+CSV. The public ``aiter.gemm_a8w8_bpreshuffle`` op then routes MXScale inputs to
+that kernel automatically. MX A8W4 is not integrated this round, so this driver
+tunes ``--data_format fp8`` only.
 
 Usage::
 
     python aiter/ops/flydsl/gemm_tune/gemm_mxscale_gfx1250_tune.py \
-        --untune_file aiter/configs/a8w8_mxscale_untuned_gemm.csv \
-        --tune_file   aiter/configs/a8w8_mxscale_tuned_gemm.csv
+        --untune_file aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv \
+        --tune_file   aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv
 """
 
 import torch
 
 from aiter import dtypes
-from aiter.jit.core import AITER_CONFIG_GEMM_MXSCALE, AITER_ROOT_DIR
+from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE, AITER_ROOT_DIR
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.utility import fp4_utils
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant
+from aiter.ops.shuffle import shuffle_weight
 
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.flydsl.mxscale_layout import SCALE_BLOCK
@@ -35,15 +36,10 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_gfx1250_common import (
 )
 
 if is_flydsl_available():
-    from aiter.ops.flydsl.mxscale_gemm import (
-        flydsl_mxscale_gemm,
-        shuffle_weight_mxscale,
-    )
-
-# Single source of truth for the data_format -> q_dtype_w CSV key mapping.
-from aiter.ops.gemm_op_a8w8 import _Q_DTYPE_W
+    from aiter.ops.flydsl.mxscale_gemm import flydsl_mxscale_gemm
 
 _OUT_TORCH = {"bf16": torch.bfloat16, "f16": torch.float16}
+_Q_DTYPE_W = {"fp8": str(dtypes.fp8)}
 
 
 def _dequant_fp8(q, s):
@@ -70,50 +66,27 @@ def generate_data(m, n, k, seed, out_dtype="bf16", device="cuda"):
     weight, w_scale = per_1x32_f8_scale_f8_quant(
         b, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0, shuffle=False
     )
+    weight_prepared = shuffle_weight(weight, mxscale_data_format="fp8")
     out = torch.empty(m, n, dtype=_OUT_TORCH[out_dtype], device=device)
     return {
         "x": x,
         "weight": weight,
+        "weight_prepared": weight_prepared,
         "x_scale": x_scale,
         "w_scale": w_scale,
         "out": out,
     }
 
 
-def _shuffled_weight_for(weight, w_scale, kernel_name, data_format):
-    """Pre-shuffle (B, w_scale) once per kernel_name, cached on the weight tensor.
-
-    The tuner generates input data once per shape and reuses it across every
-    candidate kernel and every timed iteration. Weight preshuffle is a multi-MB
-    layout pass that must not be charged to the kernel's measured latency, so we
-    cache the shuffled result (keyed by kernel_name, since the B layout depends on
-    the kernel's N/K tiling) on the shared raw weight tensor. The first (warmup)
-    call populates it; the timed iterations hit the cache and pass an already
-    ``is_shuffled`` weight straight through.
-    """
-    cache = getattr(weight, "_mxscale_tuner_shuf", None)
-    if cache is None:
-        cache = {}
-        weight._mxscale_tuner_shuf = cache
-    hit = cache.get(kernel_name)
-    if hit is None:
-        hit = shuffle_weight_mxscale(
-            weight, w_scale, data_format=data_format, kernel_name=kernel_name
-        )
-        cache[kernel_name] = hit
-    return hit
-
-
-def run_gemm_mxscale(x, weight, x_scale, w_scale, out, kernel_name, data_format):
+def run_gemm_mxscale(
+    x, weight_prepared, x_scale, w_scale, out, kernel_name, data_format
+):
     """Run flydsl_mxscale_gemm with a fixed kernel_name; writes into out."""
-    weight_s, w_scale_s = _shuffled_weight_for(
-        weight, w_scale, kernel_name, data_format
-    )
     flydsl_mxscale_gemm(
         x,
-        weight_s,
+        weight_prepared,
         x_scale,
-        w_scale_s,
+        w_scale,
         data_format=data_format,
         out=out,
         kernel_name=kernel_name,
@@ -124,15 +97,17 @@ def run_gemm_mxscale(x, weight, x_scale, w_scale, out, kernel_name, data_format)
 class GemmMxScaleGfx1250Tuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
-        "tune_file": f"{AITER_CONFIG_GEMM_MXSCALE}",
-        "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/a8w8_mxscale_untuned_gemm.csv",
-        "config_env_name": "AITER_CONFIG_GEMM_MXSCALE",
+        "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE}",
+        "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv",
+        "config_env_name": "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
     }
 
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op
 
-        _op.clear_mxscale_config_cache()
+        _op.get_GEMM_config_with_quant_type.cache_clear()
+        _op._GEMM_QUANT_TYPE_CACHE.clear()
+        _op._GEMM_QUANT_TYPE_HAS_GFX.clear()
 
     def _setup_specific_arguments(self):
         self.parser.add_argument(
@@ -218,7 +193,7 @@ class GemmMxScaleGfx1250Tuner(GemmCommonTuner):
         if (not is_flydsl_available()) or ("flydsl_mxscale_gemm" not in globals()):
             return []
         kernels = self._kernels_for(data_format, out_dtype)
-        run_keys = ["x", "weight", "x_scale", "w_scale", "out"]
+        run_keys = ["x", "weight_prepared", "x_scale", "w_scale", "out"]
         ref_keys = ["x", "weight", "x_scale", "w_scale"]
         tasks = []
         for i in sorted(kernels.keys()):
@@ -226,7 +201,7 @@ class GemmMxScaleGfx1250Tuner(GemmCommonTuner):
             if not kernel_fits_shape(ki, M, N, K):
                 continue
             kernel_name = ki.name
-            info = (info_keys, i, 0, kernel_name, "flydsl")
+            info = (info_keys, i, ki.split_k, kernel_name, "flydsl")
             tasks.append(
                 (
                     info,
@@ -260,8 +235,8 @@ class GemmMxScaleGfx1250Tuner(GemmCommonTuner):
         tasks_data = []
         seed = 0
         # q_dtype_w is keyed off the data format being tuned, so the tuned-CSV
-        # key matches what the op looks up (gemm_op_a8w8._Q_DTYPE_W) regardless
-        # of the value in the untuned CSV.
+        # key matches the public op's get_GEMM_config_with_quant_type lookup
+        # regardless of the value in the untuned CSV.
         q_dtype_w = _Q_DTYPE_W[args.data_format]
         # base pre_process dedups against the untuned CSV's (wrong) q_dtype_w;
         # skip shapes already tuned for this format's real q_dtype_w here.
@@ -273,6 +248,11 @@ class GemmMxScaleGfx1250Tuner(GemmCommonTuner):
             M = untunedf.loc[i, "M"]
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
+            if (
+                "q_dtype_w" in untunedf.columns
+                and str(untunedf.loc[i, "q_dtype_w"]) != q_dtype_w
+            ):
+                continue
             if (int(M), int(N), int(K)) in already:
                 continue
             seed += 1
@@ -310,10 +290,11 @@ class GemmMxScaleGfx1250Tuner(GemmCommonTuner):
 
         out_dtype = args.out_dtype
         allowed = args.errRatio
-        op = aiter.gemm_a8w8_mxscale
         results = []
         for i in range(len(self.untunedf)):
             row = self.untunedf.iloc[i]
+            if "q_dtype_w" in row and str(row["q_dtype_w"]) != _Q_DTYPE_W["fp8"]:
+                continue
             M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
             shape_str = f"M{M}_N{N}_K{K}_fp8_{out_dtype}"
             try:
@@ -326,9 +307,9 @@ class GemmMxScaleGfx1250Tuner(GemmCommonTuner):
                     _OUT_TORCH[out_dtype],
                 )
                 out, us = run_perftest(
-                    op,
+                    aiter.gemm_a8w8_bpreshuffle,
                     d["x"],
-                    d["weight"],
+                    d["weight_prepared"],
                     d["x_scale"],
                     d["w_scale"],
                     dtype=_OUT_TORCH[out_dtype],

@@ -55,8 +55,10 @@ from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 from aiter.ops.flydsl.mxscale_gemm import parse_flydsl_mxscale_kernel_name
 from aiter.ops.flydsl.mxscale_layout import (
-    get_padded_problem_shape as _mxscale_padded_shape,
-    validate_mxscale_num_buffers as _validate_mxscale_num_buffers,
+    align_up as _mxscale_align_up,
+    get_padded_weight_shape as _mxscale_padded_weight_shape,
+    mxscale_pack_factors as _mxscale_pack_factors,
+    validate_mxscale_kernel_shape as _validate_mxscale_kernel_shape,
 )
 
 # Keep the default AOT coverage aligned with runtime config resolution.
@@ -69,7 +71,6 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
-    AITER_CONFIGS.AITER_CONFIG_GEMM_MXSCALE_FILE,
 ]
 GEMM_AOT_ARCH_DEFAULT = "gfx950"
 MXSCALE_AOT_ARCH_DEFAULT = "gfx1250"
@@ -389,30 +390,37 @@ def _compile_mxscale_to_cache(
     from aiter.ops.flydsl.kernels.gemm_fp8fp4_gfx1250 import compile_mxscale_gemm
     from aiter.ops.flydsl.mxscale_gemm import mxscale_compile_kwargs
 
+    compile_out_dtype = "f32" if split_k > 1 and out_dtype != "f32" else out_dtype
     out_torch_dtype = {
         "bf16": torch.bfloat16,
         "f16": torch.float16,
         "f32": torch.float32,
-    }[out_dtype]
+    }[compile_out_dtype]
 
-    _validate_mxscale_num_buffers(k, tile_k, num_buffers, split_k=split_k)
-    padded = _mxscale_padded_shape(
-        data_format, m, n, k, tile_m, tile_n, tile_k, split_k=split_k
+    weight_shape = _mxscale_padded_weight_shape(data_format, n, k)
+    _validate_mxscale_kernel_shape(
+        N=weight_shape["N"],
+        K=weight_shape["K"],
+        tile_n=tile_n,
+        tile_k=tile_k,
+        num_buffers=num_buffers,
+        split_k=split_k,
     )
-    pack_a, pack_b = padded["pack_a"], padded["pack_b"]
-    padded_m, padded_n, padded_k = padded["M"], padded["N"], padded["K"]
-    k_scale = padded["K_scale"]
+    pack_a, pack_b = _mxscale_pack_factors(data_format)
+    padded_m = _mxscale_align_up(m, tile_m)
+    compile_n, padded_k = weight_shape["N"], weight_shape["K"]
+    k_scale = weight_shape["K_scale"]
 
     a = torch.empty((padded_m, padded_k // pack_a), device="cpu", dtype=torch.uint8)
-    b = torch.empty((padded_n, padded_k // pack_b), device="cpu", dtype=torch.uint8)
+    b = torch.empty((compile_n, padded_k // pack_b), device="cpu", dtype=torch.uint8)
     a_scale = torch.empty((padded_m, k_scale), device="cpu", dtype=torch.uint8)
-    b_scale = torch.empty((padded_n, k_scale), device="cpu", dtype=torch.uint8)
-    out = torch.empty((padded_m, padded_n), device="cpu", dtype=out_torch_dtype)
+    b_scale = torch.empty((compile_n, k_scale), device="cpu", dtype=torch.uint8)
+    out = torch.empty((padded_m, compile_n), device="cpu", dtype=out_torch_dtype)
     stream = fx.Stream(0)
 
     compile_kwargs = mxscale_compile_kwargs(
         data_format=data_format,
-        out_dtype=out_dtype,
+        out_dtype=compile_out_dtype,
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,
@@ -423,7 +431,7 @@ def _compile_mxscale_to_cache(
         cluster_m=cluster_m,
         cluster_n=cluster_n,
     )
-    exe = compile_mxscale_gemm(M=padded_m, N=padded_n, K=padded_k, **compile_kwargs)
+    exe = compile_mxscale_gemm(M=padded_m, N=compile_n, K=padded_k, **compile_kwargs)
     _compile_executable_to_cache(
         exe,
         _ptr_view_safe(out.contiguous().view(-1)),
@@ -432,7 +440,7 @@ def _compile_mxscale_to_cache(
         _ptr_view_safe(a_scale.contiguous().view(-1)),
         _ptr_view_safe(b_scale.contiguous().view(-1)),
         padded_m,
-        padded_n,
+        compile_n,
         stream,
     )
 

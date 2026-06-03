@@ -6,11 +6,10 @@
 ``flydsl_mxscale_gemm`` is the backend launch primitive covering ``data_format``
 ``"fp8"`` (MXFP8 E4M3 + E8M0).
 
-This module is the codegen/launch layer. End users should go through the
-public ``aiter.gemm_a8w8_mxscale`` op (see ``aiter/ops/gemm_op_a8w8.py``), which
-resolves the best tuned kernel from the ``mxscale_gfx1250`` tuned-config CSV and
-calls this backend. The codegen / tuning knobs below are tuner-internal and are
-*not* part of the public op surface.
+This module is the codegen/launch layer. The public GEMM entry is
+``aiter.gemm_a8w8_bpreshuffle``; MXFP8 routes here when its tuned config uses a
+``flydsl_mxscale_*`` kernel name. The codegen / tuning knobs below are
+tuner-internal and are *not* part of the public op surface.
 """
 
 from __future__ import annotations
@@ -25,13 +24,18 @@ from torch import Tensor
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
 from .mxscale_layout import (
+    MXSCALE_B_LAYOUT,
+    MXSCALE_B_SCALE_LAYOUT,
     SCALE_BLOCK,
-    get_padded_problem_shape,
+    align_up,
+    get_padded_weight_shape,
     mxscale_pack_factors,
+    pad_scale_mxscale,
     preshuffle_mxscale_activation,
-    preshuffle_mxscale_weight,
+    preshuffle_mxscale_scale_for_kernel,
+    preshuffle_mxscale_weight_data,
     to_kernel_uint8,
-    validate_mxscale_num_buffers,
+    validate_mxscale_kernel_shape,
 )
 from .utils import is_flydsl_available
 
@@ -50,6 +54,7 @@ _TORCH_DTYPE_FROM_NAME = {
     "f32": torch.float32,
 }
 _NAME_FROM_TORCH_DTYPE = {v: k for k, v in _TORCH_DTYPE_FROM_NAME.items()}
+_B_SCALE_KERNEL_LAYOUT = "tdm_v1"
 
 
 def _resolve_target_device(*tensors: Optional[Tensor]) -> torch.device:
@@ -132,16 +137,6 @@ def _compile_accepted_params() -> frozenset:
     from .kernels.gemm_fp8fp4_gfx1250 import compile_mxscale_gemm
 
     return frozenset(inspect.signature(compile_mxscale_gemm).parameters)
-
-
-def clear_mxscale_compile_caches() -> None:
-    """Reset the cached kernel-signature probe.
-
-    Useful when the kernel module is reloaded in-process (e.g. importlib.reload);
-    a fresh interpreter re-probes automatically. Note: simply replacing the
-    flydsl wheel on disk is not picked up without a reload/restart.
-    """
-    _compile_accepted_params.cache_clear()
 
 
 def mxscale_compile_kwargs(
@@ -300,6 +295,286 @@ def _resolve_out_dtype(
     return out_dtype, _TORCH_DTYPE_FROM_NAME[out_dtype]
 
 
+def mxscale_out_dtype_name(dtype: torch.dtype) -> str:
+    """Return the MXScale kernel-name dtype token for a torch output dtype."""
+    name = _NAME_FROM_TORCH_DTYPE.get(dtype)
+    if name is None:
+        raise ValueError(
+            f"unsupported MXScale out dtype {dtype}; expected bf16/f16/f32"
+        )
+    return name
+
+
+def _is_mxscale_prepared_weight(B: Tensor) -> bool:
+    return getattr(B, "_mxscale_layout", None) == MXSCALE_B_LAYOUT
+
+
+def is_mxscale_bpreshuffle_weight(B: Tensor) -> bool:
+    """Whether B carries the prepared MXScale bpreshuffle layout marker."""
+    return _is_mxscale_prepared_weight(B)
+
+
+def _is_raw_mxscale_bpreshuffle_input(
+    A: Tensor, B: Tensor, A_scale: Tensor, B_scale: Tensor
+) -> bool:
+    from aiter.utility import dtypes
+
+    return (
+        A.dtype == dtypes.fp8
+        and B.dtype == dtypes.fp8
+        and A_scale.dtype == dtypes.fp8_e8m0
+        and B_scale.dtype == dtypes.fp8_e8m0
+    )
+
+
+def _mxscale_logical_shape(tensor: Tensor) -> tuple[int, int]:
+    shape = getattr(tensor, "_mxscale_logical_shape", None)
+    if shape is None or len(shape) != 2:
+        raise ValueError(
+            "MXScale tensor is missing logical-shape metadata; build B with "
+            "shuffle_weight(WQ, mxscale_data_format='fp8')"
+        )
+    return int(shape[0]), int(shape[1])
+
+
+def _mxscale_padded_shape(tensor: Tensor) -> tuple[int, int]:
+    shape = getattr(tensor, "_mxscale_padded_shape", None)
+    if shape is None or len(shape) != 2:
+        raise ValueError(
+            "MXScale tensor is missing padded-shape metadata; build B with "
+            "shuffle_weight(WQ, mxscale_data_format='fp8')"
+        )
+    return int(shape[0]), int(shape[1])
+
+
+def _validate_prepared_b_scale(B: Tensor, B_scale: Tensor) -> None:
+    if getattr(B_scale, "_mxscale_layout", None) != MXSCALE_B_SCALE_LAYOUT:
+        raise ValueError(
+            "Prepared MXScale B_scale must be a row-major padded MXScale scale "
+            "tensor produced by the internal B-scale helper"
+        )
+    data_format = getattr(B, "_mxscale_data_format", None)
+    if getattr(B_scale, "_mxscale_data_format", None) != data_format:
+        raise ValueError("Prepared MXScale B and B_scale data_format metadata differ")
+
+    N, K = _mxscale_logical_shape(B)
+    N_scale, K_scale = _mxscale_logical_shape(B_scale)
+    if (N_scale, K_scale) != (N, K // SCALE_BLOCK):
+        raise ValueError(
+            f"Prepared MXScale B_scale logical shape {(N_scale, K_scale)} does not "
+            f"match B logical shape {(N, K)}"
+        )
+
+    prepared_n, K_pad = _mxscale_padded_shape(B)
+    scale_prepared_n, K_scale_pad = _mxscale_padded_shape(B_scale)
+    if (scale_prepared_n, K_scale_pad) != (prepared_n, K_pad // SCALE_BLOCK):
+        raise ValueError(
+            f"Prepared MXScale B_scale prepared shape {(scale_prepared_n, K_scale_pad)} "
+            f"does not match B prepared shape {(prepared_n, K_pad)}"
+        )
+
+    _, pack_b = mxscale_pack_factors(str(data_format))
+    if tuple(B.shape) != (prepared_n, K_pad // pack_b):
+        raise ValueError(
+            f"Prepared MXScale B tensor shape must be {(prepared_n, K_pad // pack_b)}, "
+            f"got {tuple(B.shape)}"
+        )
+    if tuple(B_scale.shape) != (prepared_n, K_pad // SCALE_BLOCK):
+        raise ValueError(
+            f"Prepared MXScale B_scale tensor shape must be "
+            f"{(prepared_n, K_pad // SCALE_BLOCK)}, got {tuple(B_scale.shape)}"
+        )
+
+
+def _pad_b_scale_for_prepared_weight(
+    B: Tensor,
+    B_scale: Tensor,
+    *,
+    data_format: str,
+) -> Tensor:
+    if getattr(B_scale, "_mxscale_layout", None) == MXSCALE_B_SCALE_LAYOUT:
+        _validate_prepared_b_scale(B, B_scale)
+        return B_scale
+
+    N, K = _mxscale_logical_shape(B)
+    prepared_n, K_pad = _mxscale_padded_shape(B)
+    if tuple(B_scale.shape) != (N, K // SCALE_BLOCK):
+        raise ValueError(
+            f"B_scale shape must be {(N, K // SCALE_BLOCK)} for prepared MXScale B, "
+            f"got {tuple(B_scale.shape)}"
+        )
+    key = (data_format, N, K, K_pad, MXSCALE_B_SCALE_LAYOUT)
+    cache = getattr(B_scale, "_mxscale_padded_scale_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        B_scale._mxscale_padded_scale_cache = cache
+    hit = cache.get(key)
+    if hit is None:
+        hit = pad_scale_mxscale(
+            B_scale,
+            data_format=data_format,
+            logical_n=N,
+            logical_k=K,
+            prepared_n=prepared_n,
+            padded_k=K_pad,
+        )
+        cache[key] = hit
+    return hit
+
+
+def _prepare_b_scale_for_mxscale_kernel(
+    B: Tensor,
+    B_scale: Tensor,
+    *,
+    data_format: str,
+    tile_n: int,
+    tile_k: int,
+    n_warp: int,
+) -> Tensor:
+    """Pad + swizzle B_scale for the selected kernel, cached per tensor."""
+    B_scale = _pad_b_scale_for_prepared_weight(
+        B,
+        B_scale,
+        data_format=data_format,
+    )
+    prepared_n, K_scale_pad = _mxscale_padded_shape(B_scale)
+    key = (
+        data_format,
+        prepared_n,
+        K_scale_pad,
+        tile_n,
+        tile_k,
+        n_warp,
+        _B_SCALE_KERNEL_LAYOUT,
+    )
+    cache = getattr(B_scale, "_mxscale_kernel_scale_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        B_scale._mxscale_kernel_scale_cache = cache
+    hit = cache.get(key)
+    if hit is None:
+        hit = preshuffle_mxscale_scale_for_kernel(
+            B_scale,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            n_warp=n_warp,
+        )
+        cache[key] = hit
+    return hit
+
+
+def _mxscale_config_usable(
+    config: dict,
+    *,
+    N: int,
+    K: int,
+    out_dtype_name: str,
+) -> bool:
+    if str(config.get("libtype", "")) != "flydsl":
+        return False
+    kernel_name = str(config.get("kernelName", ""))
+    if not kernel_name.startswith("flydsl_mxscale_"):
+        return False
+    parsed = parse_flydsl_mxscale_kernel_name(kernel_name)
+    if parsed is None:
+        return False
+    if parsed["data_format"] != "fp8" or parsed["out_dtype"] != out_dtype_name:
+        return False
+    weight_shape = get_padded_weight_shape("fp8", N, K)
+    try:
+        validate_mxscale_kernel_shape(
+            N=weight_shape["N"],
+            K=weight_shape["K"],
+            tile_n=parsed["tile_n"],
+            tile_k=parsed["tile_k"],
+            num_buffers=parsed["num_buffers"],
+            split_k=parsed["split_k"],
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def _default_mxscale_bpreshuffle_config(M: int, N: int, K: int, dtype: torch.dtype):
+    return {
+        "libtype": "flydsl",
+        "kernelId": -1,
+        "splitK": 0,
+        "kernelName": default_mxscale_kernel_name(
+            data_format="fp8",
+            M=M,
+            N=N,
+            K=K,
+            out_dtype=mxscale_out_dtype_name(dtype),
+        ),
+    }
+
+
+def resolve_mxscale_bpreshuffle_config(
+    config: Optional[dict],
+    *,
+    M: int,
+    N: int,
+    K: int,
+    dtype: torch.dtype,
+) -> dict:
+    cur_gfx = get_gfx()
+    if cur_gfx != _TARGET_GFX:
+        raise RuntimeError(
+            f"MXScale gemm_a8w8_bpreshuffle requires {_TARGET_GFX}, "
+            f"current arch is {cur_gfx!r}"
+        )
+    if not is_flydsl_available():
+        raise RuntimeError(
+            "MXScale gemm_a8w8_bpreshuffle requires the FlyDSL backend; install "
+            "the matching flydsl wheel."
+        )
+
+    out_dtype_name = mxscale_out_dtype_name(dtype)
+    if config is not None and _mxscale_config_usable(
+        config, N=N, K=K, out_dtype_name=out_dtype_name
+    ):
+        return config
+    return _default_mxscale_bpreshuffle_config(M, N, K, dtype)
+
+
+def resolve_mxscale_bpreshuffle_config_for_inputs(
+    config: Optional[dict],
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    *,
+    M: int,
+    N: int,
+    K: int,
+    dtype: torch.dtype,
+) -> Optional[dict]:
+    layout = getattr(B, "_mxscale_layout", None)
+    if layout is None:
+        if _is_raw_mxscale_bpreshuffle_input(A, B, A_scale, B_scale):
+            raise ValueError(
+                "MXScale inputs to gemm_a8w8_bpreshuffle require B to be prepared "
+                "once with shuffle_weight(WQ, mxscale_data_format='fp8')."
+            )
+        return None
+
+    if layout != MXSCALE_B_LAYOUT:
+        raise ValueError(
+            "MXScale B must be prepared with "
+            "shuffle_weight(WQ, mxscale_data_format='fp8')."
+        )
+
+    logical_n, logical_k = _mxscale_logical_shape(B)
+    if (logical_n, logical_k) != (N, K):
+        raise ValueError(
+            f"MXScale A/B dimensions disagree: A is {(M, K)}, "
+            f"B logical shape is {(logical_n, logical_k)}"
+        )
+
+    return resolve_mxscale_bpreshuffle_config(config, M=M, N=N, K=K, dtype=dtype)
+
+
 def flydsl_mxscale_gemm(
     A: Tensor,
     B: Tensor,
@@ -310,7 +585,7 @@ def flydsl_mxscale_gemm(
     out: Optional[Tensor] = None,
     out_dtype: Optional[str] = None,
     tile_m: int = 128,
-    tile_n: int = 128,
+    tile_n: int = 32,
     tile_k: int = 128,
     m_warp: int = 2,
     n_warp: int = 2,
@@ -330,18 +605,18 @@ def flydsl_mxscale_gemm(
     Parameters
     ----------
     A : (M, K) FP8 E4M3 byte storage (both formats).
-    B : (N, K) FP8 for fp8 / (N, K // 2) FP4 packed bytes for a8w4.
-        Caller may pass an unshuffled tensor; it is pad + 16x16-preshuffled here.
-        To skip that per-call layout pass, pre-shuffle the weight once with
-        :func:`shuffle_weight_mxscale` and pass the marked ``(B, B_scale)`` pair.
+    B : prepared B weight from :func:`shuffle_weight_mxscale`.
+        A raw unshuffled tensor is accepted only as a low-level fallback; the
+        standard public path prepares B once before calling
+        ``aiter.gemm_a8w8_bpreshuffle``.
     A_scale : (M, K // 32) E8M0 (uint8 storage).
     B_scale : (N, K // 32) E8M0 (uint8 storage).
 
     Notes
     -----
-    * If ``out`` is provided it must have shape ``(M, N)``. The wrapper
-      allocates an internal padded buffer when ``M`` / ``N`` / ``K`` are not
-      tile-aligned, then slice-copies into ``out``.
+    * If ``out`` is provided it must have shape ``(M, N)``. The wrapper pads M
+      at runtime and uses the prepared B K extent. N is not host-padded; the
+      selected kernel must divide the logical/prepared N.
     * ``split_k > 1`` uses buffer-store atomic accumulation (derived internally)
       and zero-fills the padded output before launch.
     * ``kernel_name`` may be provided when the dispatch was already resolved
@@ -364,9 +639,7 @@ def flydsl_mxscale_gemm(
             f"A and B must be 2-D, got A.shape={tuple(A.shape)}, B.shape={tuple(B.shape)}"
         )
     M = A.shape[0]
-    # B may arrive already pad+16x16-preshuffled (see shuffle_weight_mxscale); its
-    # tensor shape is then no longer (N, K_packed), so N is recovered below.
-    shuf_b = getattr(B, "is_shuffled", False)
+    prepared_b = _is_mxscale_prepared_weight(B)
 
     # If a kernel name was provided, take its perf knobs verbatim.
     if kernel_name is not None:
@@ -393,8 +666,8 @@ def flydsl_mxscale_gemm(
     # may already have set out_dtype); they must agree.
     out_dtype_name, out_torch_dtype = _resolve_out_dtype(out, out_dtype)
 
-    # ----- Recover unpadded K (A is always 1 byte/elem; B packs 2 FP4/byte) -----
-    pack_b = 1 if data_format == "fp8" else 2
+    # ----- Recover logical K (A is always 1 byte/elem; B packs 2 FP4/byte) -----
+    pack_a, pack_b = mxscale_pack_factors(data_format)
     K = A.shape[1]
     if K % SCALE_BLOCK != 0:
         raise ValueError(f"K={K} must be divisible by SCALE_BLOCK={SCALE_BLOCK}")
@@ -403,27 +676,25 @@ def flydsl_mxscale_gemm(
             f"A_scale shape must be {(M, K // SCALE_BLOCK)}, got {tuple(A_scale.shape)}"
         )
 
-    # ----- Recover N (raw layout) or revalidate it against the shuffle key -----
-    if shuf_b:
-        shuf_key = getattr(B, "_mxscale_shuffle_key", None)
-        if shuf_key is None:
+    # ----- Recover logical/padded B shape -----
+    if prepared_b:
+        N, K_from_b = _mxscale_logical_shape(B)
+        prepared_n, K_pad = _mxscale_padded_shape(B)
+        if K_from_b != K:
             raise ValueError(
-                "B.is_shuffled is set but its shuffle key is missing; build "
-                "pre-shuffled weights with shuffle_weight_mxscale"
+                f"A and prepared B contraction dimensions disagree: A K={K}, "
+                f"B logical K={K_from_b}"
             )
-        expected_key = (data_format, shuf_key[1], K, tile_n, tile_k, n_warp, split_k)
-        if shuf_key != expected_key:
-            raise ValueError(
-                f"pre-shuffled B was built for {shuf_key} but this kernel needs "
-                f"{expected_key}; re-run shuffle_weight_mxscale with the matching "
-                "kernel_name"
-            )
-        N = shuf_key[1]
     else:
-        N = B.shape[0]
-        if A.shape[1] != B.shape[1] * pack_b:
+        if getattr(B, "_mxscale_shuffle_key", None) is not None:
             raise ValueError(
-                f"A and B contraction dimensions disagree: A.shape[1]={A.shape[1]} "
+                "B uses the deprecated tile-dependent MXScale shuffle metadata; "
+                "rebuild it with shuffle_weight(WQ, mxscale_data_format='fp8')."
+            )
+        N = B.shape[0]
+        if K != B.shape[1] * pack_b:
+            raise ValueError(
+                f"A and B contraction dimensions disagree: A.shape[1]={K} "
                 f"vs B.shape[1]={B.shape[1]} (pack_b={pack_b})"
             )
         if B_scale.shape != (N, K // SCALE_BLOCK):
@@ -431,8 +702,17 @@ def flydsl_mxscale_gemm(
                 f"B_scale shape must be {(N, K // SCALE_BLOCK)}, "
                 f"got {tuple(B_scale.shape)}"
             )
+        B = shuffle_weight_mxscale(B, data_format=data_format)
+        prepared_n, K_pad = _mxscale_padded_shape(B)
 
-    validate_mxscale_num_buffers(K, tile_k, num_buffers, split_k=split_k)
+    validate_mxscale_kernel_shape(
+        N=prepared_n,
+        K=K_pad,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        num_buffers=num_buffers,
+        split_k=split_k,
+    )
     # The host scale preshuffle below produces the "tdm" scale layout. If a kernel
     # update drops scale_load_path (filtered out -> kernel default) and that
     # default is not "tdm", the layouts would silently disagree — guard loudly.
@@ -449,26 +729,24 @@ def flydsl_mxscale_gemm(
             f"got {out.device}"
         )
 
-    # ----- Pad + preshuffle -----
-    padded = get_padded_problem_shape(
-        data_format, M, N, K, tile_m, tile_n, tile_k, split_k=split_k
+    # ----- Runtime-private A prepare and B-scale kernel swizzle -----
+    compile_shape = {
+        "M": align_up(M, tile_m),
+        "N": prepared_n,
+        "K": K_pad,
+        "K_scale": K_pad // SCALE_BLOCK,
+        "pack_a": pack_a,
+        "pack_b": pack_b,
+    }
+    b_p = B
+    b_s_p = _prepare_b_scale_for_mxscale_kernel(
+        B,
+        B_scale,
+        data_format=data_format,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        n_warp=n_warp,
     )
-    # Weight-side (B + B_scale) layout is M-independent. Callers may hoist it out
-    # of the hot path with shuffle_weight_mxscale (which marks ``is_shuffled`` and
-    # is revalidated above); otherwise it is built here per call. A + A_scale are
-    # fresh data every call.
-    if shuf_b:
-        b_p, b_s_p = B, B_scale
-    else:
-        b_p, b_s_p = preshuffle_mxscale_weight(
-            B,
-            B_scale,
-            data_format=data_format,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            n_warp=n_warp,
-            split_k=split_k,
-        )
     a_p, a_s_p = preshuffle_mxscale_activation(
         A,
         A_scale,
@@ -477,6 +755,7 @@ def flydsl_mxscale_gemm(
         tile_k=tile_k,
         m_warp=m_warp,
         split_k=split_k,
+        padded_k=K_pad,
     )
 
     a_dev = _to_target_device(a_p, target_device)
@@ -492,7 +771,7 @@ def flydsl_mxscale_gemm(
     acc_f32_scratch = split_k > 1 and out_dtype_name != "f32"
     compile_out_dtype = "f32" if acc_f32_scratch else out_dtype_name
     out_buf = torch.empty(
-        (padded["M"], padded["N"]),
+        (compile_shape["M"], compile_shape["N"]),
         dtype=torch.float32 if acc_f32_scratch else out_torch_dtype,
         device=a_dev.device,
     )
@@ -514,9 +793,9 @@ def flydsl_mxscale_gemm(
         cluster_n=cluster_n,
     )
     launch_fn = _compile_mxscale_gemm(
-        M=padded["M"],
-        N=padded["N"],
-        K=padded["K"],
+        M=compile_shape["M"],
+        N=compile_shape["N"],
+        K=compile_shape["K"],
         **compile_kwargs,
     )
     stream = _fx.Stream(torch.cuda.current_stream(device=a_dev.device))
@@ -527,13 +806,17 @@ def flydsl_mxscale_gemm(
         to_kernel_uint8(b_dev),
         to_kernel_uint8(a_s_dev),
         to_kernel_uint8(b_s_dev),
-        padded["M"],
-        padded["N"],
+        compile_shape["M"],
+        compile_shape["N"],
         stream,
     )
 
     # ----- Slice padded buffer back to (M, N) + cast f32 scratch to target -----
-    sliced = out_buf if (padded["M"], padded["N"]) == (M, N) else out_buf[:M, :N]
+    sliced = (
+        out_buf
+        if (compile_shape["M"], compile_shape["N"]) == (M, N)
+        else out_buf[:M, :N]
+    )
     if out is not None:
         out.copy_(sliced)
         return out
@@ -554,8 +837,9 @@ def flydsl_mxscale_gemm(
 # configs — every other codegen flag is held at its conservative default so the
 # public op never has to reason about microarchitecture details.
 
-# Conservative, broadly-valid baseline tile for gfx1250 MXScale GEMM.
-_DEFAULT_TILE = (128, 128, 128)
+# Conservative baseline tile for gfx1250 MXFP8. tile_n=32 covers the DS-style
+# N=16160 family without host-side N padding.
+_DEFAULT_TILE = (128, 32, 128)
 _DEFAULT_WARPS = (2, 2)
 
 
@@ -577,7 +861,15 @@ def default_mxscale_kernel_name(
 
     tile_m, tile_n, tile_k = _DEFAULT_TILE
     m_warp, n_warp = _DEFAULT_WARPS
-    num_buffers = recommended_num_buffers(K, tile_k, split_k=1)
+    weight_shape = get_padded_weight_shape(data_format, N, K)
+    prepared_n = weight_shape["N"]
+    if prepared_n % tile_n != 0:
+        raise ValueError(
+            f"N={N} is not supported by the default MXScale tile_n={tile_n}; "
+            "add/tune a compatible flydsl_mxscale kernel for this shape."
+        )
+    K_pad = weight_shape["K"]
+    num_buffers = recommended_num_buffers(K_pad, tile_k, split_k=1)
     if num_buffers is None:
         raise ValueError(
             f"K={K} is too small for the default tile_k={tile_k}; "
@@ -598,65 +890,27 @@ def default_mxscale_kernel_name(
 
 def shuffle_weight_mxscale(
     WQ: Tensor,
-    w_scale: Tensor,
     *,
     data_format: str = "fp8",
-    kernel_name: Optional[str] = None,
-    tile_n: int = 128,
-    tile_k: int = 128,
-    n_warp: int = 2,
-    split_k: int = 1,
-) -> tuple[Tensor, Tensor]:
-    """Pre-shuffle an MXScale B weight (and its E8M0 scale) once, off the hot path.
+) -> Tensor:
+    """Pre-shuffle an MXScale B weight once, off the hot path.
 
     Mirrors the ``aiter.ops.shuffle.shuffle_weight`` / ``bpreshuffle`` convention:
-    call this once at weight-load time and pass the returned ``(WQ, w_scale)``
-    into ``gemm_a8w8_mxscale`` / ``flydsl_mxscale_gemm``. The backend detects the
-    ``is_shuffled`` marker and reuses the tensors verbatim instead of re-padding
-    and re-shuffling the (often multi-MB) weight on every call.
-
-    The B layout depends on the N/K tiling knobs, so pass the resolved
-    ``kernel_name`` (its ``tile_n`` / ``tile_k`` / ``n_warp`` / ``split_k`` then
-    override the explicit kwargs) to guarantee the layout matches the kernel that
-    will consume it. A mismatched config is rejected at launch time.
+    call this once at weight-load time and pass the returned ``WQ`` into
+    ``aiter.gemm_a8w8_bpreshuffle`` with the original raw ``w_scale``. The B data
+    K padding and 16x16 layout are fixed and do not depend on the selected
+    runtime kernel. B-scale padding/swizzling is handled privately and cached by
+    ``flydsl_mxscale_gemm``.
     """
-    if kernel_name is not None:
-        parsed = parse_flydsl_mxscale_kernel_name(kernel_name)
-        if parsed is None:
-            raise ValueError(f"unrecognised mxscale kernel_name: {kernel_name!r}")
-        if parsed["data_format"] != data_format:
-            raise ValueError(
-                f"kernel_name data_format={parsed['data_format']!r} != "
-                f"data_format={data_format!r}"
-            )
-        tile_n = parsed["tile_n"]
-        tile_k = parsed["tile_k"]
-        n_warp = parsed["n_warp"]
-        split_k = parsed["split_k"]
-
-    b_p, b_s_p = preshuffle_mxscale_weight(
-        WQ,
-        w_scale,
-        data_format=data_format,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        n_warp=n_warp,
-        split_k=split_k,
-    )
-    _, pack_b = mxscale_pack_factors(data_format)
-    N = WQ.shape[0]
-    K = WQ.shape[1] * pack_b
-    b_p.is_shuffled = True
-    b_p._mxscale_shuffle_key = (data_format, N, K, tile_n, tile_k, n_warp, split_k)
-    b_s_p.is_shuffled = True
-    return b_p, b_s_p
+    return preshuffle_mxscale_weight_data(WQ, data_format=data_format)
 
 
 __all__ = [
     "flydsl_mxscale_gemm",
     "flydsl_mxscale_kernel_name",
+    "is_mxscale_bpreshuffle_weight",
     "parse_flydsl_mxscale_kernel_name",
     "default_mxscale_kernel_name",
+    "resolve_mxscale_bpreshuffle_config_for_inputs",
     "shuffle_weight_mxscale",
-    "clear_mxscale_compile_caches",
 ]

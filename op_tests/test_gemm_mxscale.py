@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness tests for ``aiter.gemm_a8w8_mxscale`` (OCP MXFP8 dense GEMM) on
-gfx1250.
+"""Correctness tests for MXFP8 via ``aiter.gemm_a8w8_bpreshuffle`` on gfx1250.
 
-The op (E4M3 x E4M3) consumes 1x32 E8M0 block scales and is routed through the
-FlyDSL gfx1250 backend. Skipped on non-gfx1250 hardware.
+The op (E4M3 x E4M3) consumes 1x32 E8M0 block scales and routes MXScale inputs
+through the FlyDSL gfx1250 backend. Skipped on non-gfx1250 hardware.
 """
 
 import pytest
@@ -14,6 +13,7 @@ import torch
 import aiter
 from aiter.utility import dtypes, fp4_utils
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant
+from aiter.ops.shuffle import shuffle_weight
 
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.flydsl.mxscale_layout import SCALE_BLOCK
@@ -43,11 +43,12 @@ def _metrics(out: torch.Tensor, ref: torch.Tensor):
         (256, 256, 256),
         (512, 1024, 512),
         (1, 4096, 4096),
-        (333, 512, 1024),  # unaligned M
+        (333, 576, 1024),  # unaligned M, N not 128/256 aligned
+        (17, 64, 160),  # K pads to the fixed 256 baseline
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gemm_a8w8_mxscale(M, N, K, dtype):
+def test_gemm_a8w8_bpreshuffle_mxscale(M, N, K, dtype):
     torch.manual_seed(0)
     a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 2.0
     b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 2.0
@@ -60,7 +61,8 @@ def test_gemm_a8w8_mxscale(M, N, K, dtype):
     )
 
     ref = (_dequant_fp8(aq, a_s) @ _dequant_fp8(bq, b_s).t()).to(dtype)
-    out = aiter.gemm_a8w8_mxscale(aq, bq, a_s, b_s, dtype=dtype)
+    bq_prepared = shuffle_weight(bq, mxscale_data_format="fp8")
+    out = aiter.gemm_a8w8_bpreshuffle(aq, bq_prepared, a_s, b_s, dtype=dtype)
 
     assert out.shape == (M, N)
     assert out.dtype == dtype
@@ -69,8 +71,10 @@ def test_gemm_a8w8_mxscale(M, N, K, dtype):
     assert rel < 0.05, f"rel L1={rel} too high (M={M},N={N},K={K})"
 
 
-def test_gemm_a8w8_mxscale_out_tensor():
-    """The out= path must write into the caller-provided tensor."""
+def test_flydsl_mxscale_backend_out_tensor():
+    """The low-level backend out= path must write into caller-provided storage."""
+    from aiter.ops.flydsl.mxscale_gemm import flydsl_mxscale_gemm
+
     torch.manual_seed(0)
     M, N, K = 512, 512, 512
     a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 2.0
@@ -82,14 +86,23 @@ def test_gemm_a8w8_mxscale_out_tensor():
         b, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0, shuffle=False
     )
     ref = (_dequant_fp8(aq, a_s) @ _dequant_fp8(bq, b_s).t()).to(torch.bfloat16)
+    bq_prepared = shuffle_weight(bq, mxscale_data_format="fp8")
     out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
-    ret = aiter.gemm_a8w8_mxscale(aq, bq, a_s, b_s, out=out, dtype=torch.bfloat16)
+    ret = flydsl_mxscale_gemm(
+        aq,
+        bq_prepared,
+        a_s,
+        b_s,
+        out=out,
+        data_format="fp8",
+        out_dtype="bf16",
+    )
     assert ret.data_ptr() == out.data_ptr()
     _, cos = _metrics(out, ref)
     assert cos > 0.99, f"cosine={cos} too low"
 
 
-def test_gemm_a8w8_mxscale_split_k():
+def test_flydsl_mxscale_backend_split_k():
     """split_k > 1 uses the buffer-store atomic-accumulation path."""
     from aiter.ops.flydsl.mxscale_gemm import (
         flydsl_mxscale_gemm,
@@ -107,6 +120,7 @@ def test_gemm_a8w8_mxscale_split_k():
         b, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0, shuffle=False
     )
     ref = (_dequant_fp8(aq, a_s) @ _dequant_fp8(bq, b_s).t()).to(torch.bfloat16)
+    bq_prepared = shuffle_weight(bq, mxscale_data_format="fp8")
     name = flydsl_mxscale_kernel_name(
         data_format="fp8",
         out_dtype="bf16",
@@ -119,7 +133,13 @@ def test_gemm_a8w8_mxscale_split_k():
         split_k=2,
     )
     out = flydsl_mxscale_gemm(
-        aq, bq, a_s, b_s, data_format="fp8", out_dtype="bf16", kernel_name=name
+        aq,
+        bq_prepared,
+        a_s,
+        b_s,
+        data_format="fp8",
+        out_dtype="bf16",
+        kernel_name=name,
     )
     _, cos = _metrics(out, ref)
     assert cos > 0.99, f"split_k cosine={cos} too low"
@@ -148,11 +168,12 @@ def _bench_gemm_mxscale(dtype, M, N, K, num_iters, num_warmup):
         torch.manual_seed(0)
         aq, bq, a_s, b_s = _build_mxscale_inputs(M, N, K)
         ref = (_dequant_fp8(aq, a_s) @ _dequant_fp8(bq, b_s).t()).to(dtype)
+        bq_prepared = shuffle_weight(bq, mxscale_data_format="fp8")
 
         out, us = run_perftest(
-            aiter.gemm_a8w8_mxscale,
+            aiter.gemm_a8w8_bpreshuffle,
             aq,
-            bq,
+            bq_prepared,
             a_s,
             b_s,
             dtype=dtype,
@@ -181,7 +202,7 @@ def _main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Benchmark / test aiter.gemm_a8w8_mxscale (OCP MXFP8) on gfx1250.",
+        description="Benchmark / test MXFP8 via aiter.gemm_a8w8_bpreshuffle on gfx1250.",
     )
     parser.add_argument(
         "--pytest",
@@ -244,7 +265,7 @@ def _main():
         summary = df.to_markdown(index=False)
     except ImportError:
         summary = df.to_string(index=False)
-    aiter.logger.info("gemm_a8w8_mxscale summary:\n%s", summary)
+    aiter.logger.info("gemm_a8w8_bpreshuffle MXScale summary:\n%s", summary)
     return 0
 
 
