@@ -221,20 +221,6 @@ namespace py = pybind11;
 
 #define ATTENTION_PYBIND m.def("paged_attention_rocm", &paged_attention);
 
-#define ATTENTION_RAGGED_PYBIND                                   \
-    m.def("paged_attention_ragged",                               \
-          &paged_attention_ragged,                                \
-          "paged_attention_ragged(Tensor! out, Tensor exp_sums,"  \
-          "                Tensor max_logits, Tensor tmp_out,"    \
-          "                Tensor query, Tensor key_cache,"       \
-          "                Tensor value_cache, int num_kv_heads," \
-          "                float scale, Tensor block_tables,"     \
-          "                Tensor context_lens, int block_size,"  \
-          "                int max_context_len,"                  \
-          "                Tensor? alibi_slopes,"                 \
-          "                str kv_cache_dtype,"                   \
-          "                float k_scale, float v_scale) -> ()");
-
 #define ATTENTION_V1_PYBIND                                       \
     m.def("paged_attention_v1",                                   \
           &paged_attention_v1,                                    \
