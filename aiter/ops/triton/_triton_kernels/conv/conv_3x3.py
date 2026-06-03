@@ -4,12 +4,7 @@
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
-from .helpers import (
-    _tanh,
-    AUTOTUNE_3x3_NHWC_CONFIGS,
-    AUTOTUNE_3x3_CBLOCKED_CONFIGS,
-    CONV_AUTOTUNE_ENABLED,
-)
+from .helpers import _tanh, CONV_AUTOTUNE_ENABLED
 
 
 def _get_config_nhwc(shape_key=None, M=None):
@@ -50,7 +45,7 @@ def _conv2d_3x3_nhwc_kernel(
     BLOCK_C: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    ACT_TYPE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
 ):
     """Specialized 3x3 NHWC kernel: stride_x_c=1 and stride_y_k=1 hardcoded
     so the compiler can emit coalesced vector loads/stores."""
@@ -142,11 +137,11 @@ def _conv2d_3x3_nhwc_kernel(
         b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0)
         acc += b[None, :]
 
-    if ACT_TYPE == 1:
+    if ACTIVATION == "relu":
         acc = tl.maximum(acc, 0)
-    elif ACT_TYPE == 2:
+    elif ACTIVATION == "relu6":
         acc = tl.minimum(tl.maximum(acc, 0), 6)
-    elif ACT_TYPE == 3:
+    elif ACTIVATION == "gelu":
         acc = (
             0.5 * acc * (1.0 + _tanh(0.7978845608 * (acc + 0.044715 * acc * acc * acc)))
         )
@@ -185,7 +180,7 @@ def _conv2d_3x3_cblocked_kernel(
     BLOCK_C: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    ACT_TYPE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
 ):
     """Specialized 3x3 kernel for channel-blocked [N, C_blocks, H, W, Cb] input.
     stride_c_local=1 is hardcoded so the compiler emits coalesced vector loads."""
@@ -293,11 +288,11 @@ def _conv2d_3x3_cblocked_kernel(
         b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0)
         acc += b[None, :]
 
-    if ACT_TYPE == 1:
+    if ACTIVATION == "relu":
         acc = tl.maximum(acc, 0)
-    elif ACT_TYPE == 2:
+    elif ACTIVATION == "relu6":
         acc = tl.minimum(tl.maximum(acc, 0), 6)
-    elif ACT_TYPE == 3:
+    elif ACTIVATION == "gelu":
         acc = (
             0.5 * acc * (1.0 + _tanh(0.7978845608 * (acc + 0.044715 * acc * acc * acc)))
         )
@@ -307,6 +302,64 @@ def _conv2d_3x3_cblocked_kernel(
         acc,
         mask=(n_valid & (p_idx < P) & (q_idx < Q) & kout_mask[None, :]),
     )
+
+
+# Autotune search spaces (used when AITER_TRITON_CONV_AUTOTUNE=1).
+AUTOTUNE_3x3_NHWC_CONFIGS = [
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_C": 64, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_C": 32, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+]
+
+AUTOTUNE_3x3_CBLOCKED_CONFIGS = [
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_C": 64, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_C": 128, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+]
 
 
 if CONV_AUTOTUNE_ENABLED:

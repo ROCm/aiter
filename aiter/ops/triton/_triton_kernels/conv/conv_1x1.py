@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
-from .helpers import _tanh, AUTOTUNE_1x1_CONFIGS, CONV_AUTOTUNE_ENABLED
+from .helpers import _tanh, CONV_AUTOTUNE_ENABLED
 
 
 def _get_config(shape_key=None, M=None):
@@ -37,7 +37,7 @@ def _conv2d_1x1_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    ACT_TYPE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
     LAYOUT: tl.constexpr,
 ):
     """
@@ -140,11 +140,11 @@ def _conv2d_1x1_kernel(
         acc += b[None, :]
 
     # Activation
-    if ACT_TYPE == 1:  # ReLU
+    if ACTIVATION == "relu":
         acc = tl.maximum(acc, 0)
-    elif ACT_TYPE == 2:  # ReLU6
+    elif ACTIVATION == "relu6":
         acc = tl.minimum(tl.maximum(acc, 0), 6)
-    elif ACT_TYPE == 3:  # GELU
+    elif ACTIVATION == "gelu":
         acc = (
             0.5 * acc * (1.0 + _tanh(0.7978845608 * (acc + 0.044715 * acc * acc * acc)))
         )
@@ -159,6 +159,46 @@ def _conv2d_1x1_kernel(
     )
     y_mask = m_mask[:, None] & n_mask[None, :]
     tl.store(y_ptrs, acc, mask=y_mask)
+
+
+# Autotune search space (used when AITER_TRITON_CONV_AUTOTUNE=1).
+AUTOTUNE_1x1_CONFIGS = [
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=4,
+        num_stages=1,
+    ),
+]
 
 
 if CONV_AUTOTUNE_ENABLED:

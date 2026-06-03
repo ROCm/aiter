@@ -4,7 +4,7 @@
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
-from .helpers import _tanh, AUTOTUNE_GENERAL_CONFIGS, CONV_AUTOTUNE_ENABLED
+from .helpers import _tanh, CONV_AUTOTUNE_ENABLED
 
 
 def _get_config(shape_key=None, M=None):
@@ -41,7 +41,7 @@ def _conv2d_general_kernel(
     BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    ACT_TYPE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
     LAYOUT: tl.constexpr,
 ):
     """General conv kernel with precomputed bases.
@@ -145,11 +145,11 @@ def _conv2d_general_kernel(
         b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0)
         acc += b[None, :]
 
-    if ACT_TYPE == 1:
+    if ACTIVATION == "relu":
         acc = tl.maximum(acc, 0)
-    elif ACT_TYPE == 2:
+    elif ACTIVATION == "relu6":
         acc = tl.minimum(tl.maximum(acc, 0), 6)
-    elif ACT_TYPE == 3:
+    elif ACTIVATION == "gelu":
         acc = (
             0.5 * acc * (1.0 + _tanh(0.7978845608 * (acc + 0.044715 * acc * acc * acc)))
         )
@@ -159,6 +159,31 @@ def _conv2d_general_kernel(
         acc,
         mask=(n_valid & (p_idx < P) & (q_idx < Q) & kout_mask[None, :]),
     )
+
+
+# Autotune search space (used when AITER_TRITON_CONV_AUTOTUNE=1).
+AUTOTUNE_GENERAL_CONFIGS = [
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+]
 
 
 if CONV_AUTOTUNE_ENABLED:
