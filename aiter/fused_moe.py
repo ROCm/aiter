@@ -333,24 +333,59 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    metadata = get_2stage_cfgs(
-        get_padded_M(M),  # consider token_num > 1024 as prefill
-        model_dim,
-        inter_dim,
-        E,
-        topk,
-        dtype,
-        q_dtype_a,
-        q_dtype_w,
-        quant_type,
-        isG1U1,
-        activation,
-        doweight_stage1,
-        hidden_pad,
-        intermediate_pad,
-        isShuffled,
-        gate_mode,
-    )
+    # fp4_bf16 INTERLEAVE: FlyDSL kernel takes raw bf16 activations and handles
+    # gate+up interleave internally. Bypass CSV lookup — no tuned entries exist yet.
+    if (
+        quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and gate_mode == GateMode.INTERLEAVE
+        and is_flydsl_available()
+    ):
+        logger.info("[fused_moe] fp4_bf16 INTERLEAVE: dispatching to FlyDSL kernel")
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+        _out_str = "bf16"
+        _tile_m = 16 if M < 2048 else 32 if M < 16384 else 64
+        _tile_n = 128
+        _tile_k = 128
+        _kn1 = flydsl_kernel_name(1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k) + "_gui"
+        _kn2 = flydsl_kernel_name(2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic")
+        metadata = MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=_kn1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=_kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            _tile_m,
+            1,
+            False,
+        )
+    else:
+        metadata = get_2stage_cfgs(
+            get_padded_M(M),  # consider token_num > 1024 as prefill
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            quant_type,
+            isG1U1,
+            activation,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            isShuffled,
+            gate_mode,
+        )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
@@ -1225,6 +1260,45 @@ def get_2stage_cfgs(
             stage2_has_bias=enable_bias and is_flydsl2,
         )
     if (
+        q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+        and gate_mode in (GateMode.SEPARATED, GateMode.INTERLEAVE)
+        and is_flydsl_available()
+    ):
+        # fp4_bf16: MXFP4 weights (FP4 E2M1 + E8M0 scales) with bf16 activations.
+        # Supports both SEPARATED and INTERLEAVE gate modes.
+        # Uses FlyDSL compile_moe_gemm1/2 with in_dtype="fp4_bf16".
+        _out_str = "bf16"
+        _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        _tile_n = 128
+        _tile_k = 128
+        _gui_tag = "_gui" if gate_mode == GateMode.INTERLEAVE else ""
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+        kn1 = flydsl_kernel_name(1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k) + _gui_tag
+        kn2 = flydsl_kernel_name(
+            2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kn1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            _tile_m,
+            1,     # no split-K for fp4_bf16 (not yet tuned)
+            False,
+        )
+    if (
         gate_mode != GateMode.SEPARATED
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
@@ -1258,43 +1332,6 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
     )
-    if (
-        q_type == QuantType.per_1x32
-        and q_dtype_w == dtypes.fp4x2
-        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
-        and gate_mode == GateMode.SEPARATED
-        and is_flydsl_available()
-    ):
-        # fp4_bf16 SEPARATED: MXFP4 weights (FP4 E2M1 + E8M0 scales) with bf16 activations.
-        # Uses our FlyDSL compile_moe_gemm1/2 with in_dtype="fp4_bf16".
-        _out_str = "bf16"
-        _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
-        _tile_n = 128
-        _tile_k = 128
-        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
-
-        kn1 = flydsl_kernel_name(1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k)
-        kn2 = flydsl_kernel_name(
-            2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
-        )
-        return MOEMetadata(
-            functools.partial(
-                _flydsl_stage1_wrapper,
-                kernelName=kn1,
-                activation=activation,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            ),
-            functools.partial(
-                _flydsl_stage2_wrapper,
-                kernelName=kn2,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            ),
-            _tile_m,
-            1,     # no split-K for fp4_bf16 (not yet tuned)
-            False,
-        )
     if (
         q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.i4x2
@@ -1586,24 +1623,58 @@ def fused_moe_2stages(
     dtype = moe_out.dtype
     device = hidden_states.device
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
-    metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
-        model_dim,
-        inter_dim,
-        E,
-        topk,
-        dtype,
-        q_dtype_a,
-        q_dtype_w,
-        quant_type,
-        isG1U1,
-        activation,
-        doweight_stage1,
-        hidden_pad,
-        intermediate_pad,
-        is_shuffled,
-        gate_mode,
-    )
+    # fp4_bf16 INTERLEAVE: bypass CSV lookup, use FlyDSL directly.
+    if (
+        quant_type == QuantType.per_1x32
+        and w1.dtype == dtypes.fp4x2
+        and gate_mode == GateMode.INTERLEAVE
+        and is_flydsl_available()
+    ):
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+        _tile_m = 16 if token_num < 2048 else 32 if token_num < 16384 else 64
+        _kn1 = flydsl_kernel_name(1, "bf16", "fp4bf16", "bf16", _tile_m, 128, 128) + "_gui"
+        _kn2 = flydsl_kernel_name(2, "bf16", "fp4bf16", "bf16", _tile_m, 128, 128, "atomic")
+        metadata = MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=_kn1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=_kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            _tile_m,
+            1,
+            False,
+        )
+        q_dtype_a = dtypes.bf16
+        # get_inter_dim doubles inter_dim for fp4x2 weights (w1.shape[-1]=model_dim//2).
+        # The real inter_dim is w1.shape[1]//2 (physical N tiles / 2).
+        inter_dim = w1.shape[1] // 2
+    else:
+        metadata = get_2stage_cfgs(
+            get_padded_M(token_num),  # consider token_num > 1024 as prefill
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            quant_type,
+            isG1U1,
+            activation,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            is_shuffled,
+            gate_mode,
+        )
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1822,6 +1893,13 @@ def fused_moe_2stages(
             num_rows_factor=topk,
         )
         a2 = a2.view(token_num, topk, inter_dim)
+
+    # FlyDSL stage2 uses atomic accumulation (mode='atomic') and expects a
+    # zeroed output buffer. moe_out comes from moe_sorting (torch.empty, not
+    # zeroed), so zero it here when the stage2 function is our FlyDSL wrapper.
+    stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    if stage2_func is _flydsl_stage2_wrapper:
+        moe_out.zero_()
 
     metadata.stage2(
         a2,
