@@ -143,7 +143,50 @@ def unified_attention(
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
-    block_size = v.shape[1]
+    q_dtype = q.dtype
+    kv_cache_dtype = k.dtype
+    num_tokens, num_query_heads, head_size = q.shape
+
+    if sinks is not None:
+        assert sinks.shape[0] == num_query_heads, "Sinks must be num_query_heads size"
+
+    BLOCK_SCALES_SIZE = 16
+    if q_dtype == torch.uint8:
+        # A4W4
+        assert q_scales is not None and q_scales.dtype == e4m3_dtype
+        head_size = head_size * 2
+        QUERY_DTYPE = "nvfp4"
+    elif q_dtype == e4m3_dtype:
+        QUERY_DTYPE = "fp8"
+    else:
+        QUERY_DTYPE = "bf16"
+
+    if kv_cache_dtype == torch.uint8:
+        KV_CACHE_DTYPE = "nvfp4"
+    elif kv_cache_dtype == e4m3_dtype:
+        KV_CACHE_DTYPE = "fp8"
+    else:
+        KV_CACHE_DTYPE = "bf16"
+
+    if shuffled_kv_cache:
+        SCALE_K_WIDTH = 4
+        if kv_cache_dtype == torch.uint8:
+            num_blocks, num_kv_heads, block_size, _ = k.shape
+            K_WIDTH = 16
+            SCALE_K = head_size // 16
+            SCALE_K_WIDTH = (
+                min(16, triton.next_power_of_2(SCALE_K)) if SCALE_K >= 4 else SCALE_K
+            )
+        else:
+            # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
+            # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
+            num_blocks, num_kv_heads, _, block_size, K_WIDTH = k.shape
+    else:
+        # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
+        num_blocks, block_size, num_kv_heads, _ = k.shape
+        K_WIDTH = 16 if kv_cache_dtype == e4m3_dtype else 8
+        SCALE_K_WIDTH = 4
+
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
     num_kv_heads = k.shape[2]
