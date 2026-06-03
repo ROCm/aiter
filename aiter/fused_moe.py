@@ -1816,9 +1816,12 @@ def fused_moe_2stages(
         _flydsl_stage1 = (
             getattr(metadata.stage1, "func", None) is _flydsl_stage1_wrapper
         )
-        _zero_a2 = (
-            W1_R is not None or W2_R is not None
-        ) and _zero_padding_enabled(_flydsl_stage1)
+        # Force-zero ignores the rotation guard: when forced on we clean ``a2``
+        # regardless of whether a rotation (W1_R/W2_R) is present. The default
+        # (and disable) behaviour still only applies on the rotation path.
+        _zero_a2 = _zero_padding_enabled(_flydsl_stage1) and (
+            _FORCE_ZERO_PADDING or W1_R is not None or W2_R is not None
+        )
         a2 = (torch.zeros if _zero_a2 else torch.empty)(
             (token_num, topk, inter_dim),
             dtype=dtype,
