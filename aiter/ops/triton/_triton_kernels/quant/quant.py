@@ -370,6 +370,163 @@ def _dynamic_mxfp4_quant_kernel(
             )
 
 
+# MXFP8 (1x32 e8m0) quant: derives a per-block uint8 e8m0 scale + FP8 e4m3
+# values. The bit-trick (bitcast amax to int32, add 0x200000, mask 0xFF800000,
+# bitcast back to fp32) rounds amax up to a power of 2; log2(amax).floor() - 8
+# is the unbiased e8m0 exponent (dtypeMax = 2**8).
+
+
+@triton.jit
+def _mxfp8_quant_op(x_grouped, QUANT_AXIS: tl.constexpr):
+    """Shared MXFP8 (1x32 e8m0) scale derivation.
+
+    Given a fp32 tile where the QUANT_AXIS dim is sized QUANT_BLOCK_SIZE (=32),
+    returns (scale_e8m0, quant_scale): the per-group uint8 e8m0 scale and the
+    matching fp32 multiplicative scale. Both outputs keep QUANT_AXIS with size 1
+    so they broadcast against the input for in-place quantization.
+    """
+    amax = tl.max(tl.abs(x_grouped), axis=QUANT_AXIS, keep_dims=True)
+    amax_i32 = amax.to(tl.int32, bitcast=True)
+    amax_i32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax_p2 = amax_i32.to(tl.float32, bitcast=True)
+    scale_unbiased = tl.log2(amax_p2).floor() - 8
+    scale_unbiased = tl.clamp(scale_unbiased, min=-127, max=127)
+    scale_e8m0 = (scale_unbiased.to(tl.int32) + 127).to(tl.uint8)
+    quant_scale = tl.exp2(-scale_unbiased)
+    return scale_e8m0, quant_scale
+
+
+@triton.jit
+def _dynamic_mxfp8_quant_kernel(
+    x_ptr,
+    y_ptr,
+    s_ptr,
+    M,
+    N,
+    stride_xm,
+    stride_xn,
+    stride_ym,
+    stride_yn,
+    stride_sm,
+    stride_sn,
+    BLOCK_SIZE_N: tl.constexpr,  # power-of-2 covering full N
+    QUANT_BLOCK_SIZE: tl.constexpr,  # =32
+    NUM_PRGMS: tl.constexpr,  # row-loop range (usually =M)
+):
+    """
+    Per-1x32 MXFP8 quant. One program per row, holding the full row in
+    registers so a single launch handles all K-groups. Mirrors
+    _fused_rms_mxfp8_kernel shape (in fused_mxfp8_quant.py) and minimizes
+    grid overhead.
+    """
+    row_start = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE_N)
+    mask = col_offsets < N
+    n_groups: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
+
+    for row_idx in tl.range(row_start, M, NUM_PRGMS, num_stages=2):
+        x = tl.load(
+            x_ptr + row_idx * stride_xm + col_offsets * stride_xn,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        # (BLOCK_SIZE_N,) -> (n_groups, QUANT_BLOCK_SIZE)
+        x_2d = tl.reshape(x, (n_groups, QUANT_BLOCK_SIZE))
+        scale_e8m0, quant_scale = _mxfp8_quant_op(x_2d, QUANT_AXIS=1)
+
+        qx_2d = x_2d * quant_scale
+        qx = tl.reshape(qx_2d, (BLOCK_SIZE_N,))
+        y = qx.to(y_ptr.type.element_ty)
+
+        tl.store(
+            y_ptr + row_idx * stride_ym + col_offsets * stride_yn,
+            y,
+            mask=mask,
+        )
+
+        group_offsets = tl.arange(0, n_groups)
+        group_mask = group_offsets < (N // QUANT_BLOCK_SIZE)
+        scale_flat = tl.reshape(scale_e8m0, (n_groups,))
+        tl.store(
+            s_ptr + row_idx * stride_sm + group_offsets * stride_sn,
+            scale_flat,
+            mask=group_mask,
+        )
+
+
+# Transcoder: (FP8 fnuz, fp32 1x128 scale) -> (FP8 fn, e8m0 1x32 scale).
+# Replaces the Python dequant+requant cascade (fp32 cast + multiply + bf16 cast
+# + per_1x32_mxfp8 quant) used in linear.py's MXFP8 fallback path for MLA wq_b
+# when q_norm emits the legacy fp8 fnuz + fp32 1x128 format.
+#
+# In: x_fp8_fnuz (M, N) — fp8 e4m3fnuz bits (interpreted with bias 8 -> value)
+#     x_scale_fp32 (M, N//128) — fp32 per-token-block scale
+# Out: y_fp8_fn (M, N) — fp8 e4m3fn bits (NV format, bias 7)
+#      y_scale_e8m0 (M, N//32) — uint8 e8m0 (1x32 MX scale)
+
+
+@triton.jit
+def _fp8_legacy_to_mxfp8_kernel(
+    x_fnuz_ptr,
+    x_scale_fp32_ptr,
+    y_fn_ptr,
+    y_scale_e8m0_ptr,
+    M,
+    N,
+    stride_xm,
+    stride_xn,
+    stride_xsm,
+    stride_xsn,
+    stride_ym,
+    stride_yn,
+    stride_ysm,
+    stride_ysn,
+    BLOCK_SIZE_M: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,  # =32 (MXFP8 group)
+    LEGACY_BLOCK_SIZE: tl.constexpr,  # =128 (input scale group)
+):
+    """
+    One program per (BLOCK_SIZE_M rows, QUANT_BLOCK_SIZE-element column window).
+    For each 1x32 block, dequantize fnuz fp8 values using the corresponding
+    1x128 fp32 scale, derive the e8m0 (1x32) scale, then re-quantize to fp8 fn.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * QUANT_BLOCK_SIZE + tl.arange(0, QUANT_BLOCK_SIZE)
+
+    x_offs = offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
+    x_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # Load fp8 fnuz values; .to(fp32) decodes via fnuz bias 8 semantically.
+    x_fnuz = tl.load(x_fnuz_ptr + x_offs, mask=x_mask, other=0.0).to(tl.float32)
+
+    # Which legacy 1x128 group does this 1x32 block fall into?
+    legacy_n = (pid_n * QUANT_BLOCK_SIZE) // LEGACY_BLOCK_SIZE
+    xs_offs = offs_m * stride_xsm + legacy_n * stride_xsn
+    xs_mask = offs_m < M
+    x_scale = tl.load(x_scale_fp32_ptr + xs_offs, mask=xs_mask, other=1.0)
+
+    # Dequantize: bf16-equivalent reconstruction.
+    x_dq = x_fnuz * x_scale[:, None]
+
+    # Derive new e8m0 (1x32) scale from x_dq amax.
+    scale_e8m0, quant_scale = _mxfp8_quant_op(x_dq, QUANT_AXIS=1)
+
+    # Re-quantize to fp8 fn.
+    qx = x_dq * quant_scale
+    y = qx.to(y_fn_ptr.type.element_ty)
+
+    y_offs = offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+    tl.store(y_fn_ptr + y_offs, y, mask=x_mask)
+
+    s_offs = offs_m[:, None] * stride_ysm + pid_n * stride_ysn
+    s_mask = offs_m[:, None] < M
+    tl.store(y_scale_e8m0_ptr + s_offs, scale_e8m0, mask=s_mask)
+
+
 @triton.heuristics(
     {
         "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0

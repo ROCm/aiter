@@ -42,6 +42,14 @@ class OpusGemmInstance:
     # 0=LRU, 1=SC0(LLC Evict), 17=SC0+SC1(L2 Bypass).
     cachectl_a: int = -1
     cachectl_b: int = -1
+    # 4g_safe variant flag. True = use the *_4g_safe_gfx950.cuh pipeline
+    # header (per-WG-tight buffer-resource sizing -- safe for tensors
+    # whose full extent exceeds 4 GiB). False = use the legacy header
+    # (full row/col-band BR sizing which wraps at 4 GiB). Same Traits
+    # struct and kargs struct either way; only the pipeline body and
+    # kernel symbol differ. The kid families that set this to True live
+    # under SPLITK_4G_SAFE_KIDS / NON_SPLITK_4G_SAFE_KIDS.
+    is_4g_safe: bool = False
 
     @property
     def name(self) -> str:
@@ -64,6 +72,8 @@ class OpusGemmInstance:
             parts.insert(1, "mono_tile")
         if not self.has_oob:
             parts.append("nooob")
+        if self.is_4g_safe:
+            parts.append("4g_safe")
         # Legacy cache policy = traits default for split-barrier &
         # persistent a16w16: CACHECTL_A=0 (LRU), CACHECTL_B=17
         # (BYPASS_L2). When a kid carries this exact policy, suppress
@@ -470,6 +480,54 @@ a16w16_mono_tile_kernels_list = {
     for i, (bm, bn, bk) in enumerate(_MONO_TILE_TILES)
 }
 
+# ── 4g_safe variants (offset +5000) ───────────────────────────────────────
+#
+# Per-WG-tight buffer-resource sizing pipelines that handle tensors whose
+# full extent exceeds 4 GiB without buffer_inst num_records wrap. Same
+# Traits / kargs as their legacy siblings; only the pipeline header and
+# kernel symbol differ. See
+#   csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_4g_safe_gfx950.cuh
+#   csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_persistent_4g_safe_gfx950.cuh
+#   csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_mono_tile_4g_safe_gfx950.cuh
+#
+# Offset choice: +5000 sits above the cpol band (which uses +2000/+3000/+4000)
+# and well clear of the nooob mirror band (+1000). 4g_safe kids carry HAS_OOB
+# from their parent (M/N tail is absorbed by the per-WG BR num_records, so
+# the per-thread predicate is structurally a no-op for valid in-tile threads;
+# we still emit both has_oob variants for consistency with the legacy axis).
+_FOUR_G_SAFE_OFFSET = 5000
+
+
+def _make_4g_safe(inst: "OpusGemmInstance") -> "OpusGemmInstance":
+    """Clone an OpusGemmInstance with is_4g_safe=True; everything else
+    (kernel_tag, traits, kargs, BLOCK/B_*/T_*/W_*/VEC_*, cachectl, has_oob)
+    is inherited verbatim. The codegen dispatch in gen_instances.py reads
+    is_4g_safe to pick the 4g_safe pipeline header + kernel symbol."""
+    from dataclasses import replace
+    return replace(inst, is_4g_safe=True)
+
+
+a16w16_kernels_list_4g_safe = {
+    kid + _FOUR_G_SAFE_OFFSET: _make_4g_safe(inst)
+    for kid, inst in a16w16_kernels_list.items()
+}
+a16w16_kernels_list_4g_safe_nooob = {
+    kid + _FOUR_G_SAFE_OFFSET: _make_4g_safe(inst)
+    for kid, inst in a16w16_kernels_list_nooob.items()
+}
+a16w16_persistent_kernels_list_4g_safe = {
+    kid + _FOUR_G_SAFE_OFFSET: _make_4g_safe(inst)
+    for kid, inst in a16w16_persistent_kernels_list.items()
+}
+a16w16_persistent_kernels_list_4g_safe_nooob = {
+    kid + _FOUR_G_SAFE_OFFSET: _make_4g_safe(inst)
+    for kid, inst in a16w16_persistent_kernels_list_nooob.items()
+}
+a16w16_mono_tile_kernels_list_4g_safe = {
+    kid + _FOUR_G_SAFE_OFFSET: _make_4g_safe(inst)
+    for kid, inst in a16w16_mono_tile_kernels_list.items()
+}
+
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
     **a8w8_scale_kernels_list,
@@ -486,6 +544,11 @@ kernels_list = {
     **a16w16_persistent_kernels_list_nooob,
     **a16w16_persistent_kernels_list_cpol_nooob,
     **a16w16_mono_tile_kernels_list,
+    **a16w16_kernels_list_4g_safe,
+    **a16w16_kernels_list_4g_safe_nooob,
+    **a16w16_persistent_kernels_list_4g_safe,
+    **a16w16_persistent_kernels_list_4g_safe_nooob,
+    **a16w16_mono_tile_kernels_list_4g_safe,
 }
 
 default_kernels_dict = {
@@ -529,6 +592,27 @@ NON_SPLITK_KIDS = (
     | frozenset(a16w16_mono_tile_kernels_list.keys())
 )
 
+# 4g_safe kid families. Per-WG-tight BR sizing -- selectable for any shape
+# (M/N/K tail safe by BR num_records). All current 4g_safe kids are non-splitk
+# (split-barrier / persistent / mono_tile variants). flatmm_splitk_4g_safe
+# can be added later if needed.
+SPLITK_4G_SAFE_KIDS = frozenset()
+NON_SPLITK_4G_SAFE_KIDS = (
+    frozenset(a16w16_kernels_list_4g_safe.keys())
+    | frozenset(a16w16_kernels_list_4g_safe_nooob.keys())
+    | frozenset(a16w16_persistent_kernels_list_4g_safe.keys())
+    | frozenset(a16w16_persistent_kernels_list_4g_safe_nooob.keys())
+    | frozenset(a16w16_mono_tile_kernels_list_4g_safe.keys())
+)
+# Per the opus kid pruning policy (project memory), 4g_safe kids are added
+# additively -- they do NOT shadow or replace any existing kid.
+NON_SPLITK_KIDS = NON_SPLITK_KIDS | NON_SPLITK_4G_SAFE_KIDS
+
+# All-4g_safe-kids superset, consumed by the per-kid 4 GiB filter in
+# opus_gemm_tune.py (legacy kids are dropped from the candidate pool when
+# A/B/C bytes exceed UINT32_MAX; 4g_safe kids stay).
+FOUR_G_SAFE_KIDS = SPLITK_4G_SAFE_KIDS | NON_SPLITK_4G_SAFE_KIDS
+
 # Bias-aware kids: split-barrier (4..9 + cpol/nooob mirrors) and the entire
 # splitk family. Persistent is excluded because its launcher currently
 # rejects any non-empty bias up front.
@@ -537,6 +621,8 @@ BIAS_AWARE_KIDS = (
     | frozenset(a16w16_kernels_list_nooob.keys())
     | frozenset(a16w16_kernels_list_cpol.keys())
     | frozenset(a16w16_kernels_list_cpol_nooob.keys())
+    | frozenset(a16w16_kernels_list_4g_safe.keys())
+    | frozenset(a16w16_kernels_list_4g_safe_nooob.keys())
     | SPLITK_KIDS
 )
 
