@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
-
 import torch
 
 
@@ -12,14 +10,7 @@ def shuffle_weight(
     use_int4=False,
     is_guinterleave=False,
     gate_up: bool = False,
-    *,
-    mxscale_data_format: Optional[str] = None,
-):
-    if mxscale_data_format is not None:
-        from .flydsl.mxscale_gemm import shuffle_weight_mxscale
-
-        return shuffle_weight_mxscale(x, data_format=mxscale_data_format)
-
+) -> torch.Tensor:
     x_type = x.dtype
     if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
         x = x.view(torch.uint8)

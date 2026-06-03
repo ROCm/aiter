@@ -22,7 +22,6 @@ from itertools import product
 from aiter.ops.flydsl.mxscale_gemm import flydsl_mxscale_kernel_name
 from aiter.ops.flydsl.mxscale_layout import (
     SCALE_BLOCK,
-    get_padded_weight_shape,
     validate_mxscale_kernel_shape,
 )
 
@@ -76,7 +75,7 @@ _TILE_N_OPTIONS = (32, 64, 128, 256)
 _TILE_K_OPTIONS = (128, 256)
 _WARP_OPTIONS = ((2, 2),)
 _NUM_BUFFER_OPTIONS = (2, 3, 4)
-_SPLIT_K_OPTIONS = (1, 2, 8, 14, 16)
+_SPLIT_K_OPTIONS = (1, 2, 4, 8, 16)
 # cluster_m * cluster_n <= 16
 _CLUSTER_OPTIONS = ((1, 1),)
 
@@ -174,13 +173,11 @@ def kernel_fits_shape(ki: MxScaleKernelInstance, M: int, N: int, K: int) -> bool
     workgroup-cluster grid evenness)."""
     if K % SCALE_BLOCK != 0:
         return False
-    weight_shape = get_padded_weight_shape(ki.data_format, N, K)
-    prepared_n = weight_shape["N"]
-    k_pad = weight_shape["K"]
+    # K is never padded: the kernel must divide the logical (N, K) directly.
     try:
         validate_mxscale_kernel_shape(
-            N=prepared_n,
-            K=k_pad,
+            N=N,
+            K=K,
             tile_n=ki.tile_n,
             tile_k=ki.tile_k,
             num_buffers=ki.num_buffers,
@@ -192,7 +189,7 @@ def kernel_fits_shape(ki: MxScaleKernelInstance, M: int, N: int, K: int) -> bool
         return False
     # Workgroup clusters need the tile grid to divide evenly by the cluster dims.
     num_m_tiles = _ceil_div(M, ki.tile_m)
-    num_n_tiles = prepared_n // ki.tile_n
+    num_n_tiles = N // ki.tile_n
     if num_m_tiles % ki.cluster_m != 0 or num_n_tiles % ki.cluster_n != 0:
         return False
     return True

@@ -55,8 +55,8 @@ from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 from aiter.ops.flydsl.mxscale_gemm import parse_flydsl_mxscale_kernel_name
 from aiter.ops.flydsl.mxscale_layout import (
+    SCALE_BLOCK as _MXSCALE_SCALE_BLOCK,
     align_up as _mxscale_align_up,
-    get_padded_weight_shape as _mxscale_padded_weight_shape,
     mxscale_pack_factors as _mxscale_pack_factors,
     validate_mxscale_kernel_shape as _validate_mxscale_kernel_shape,
 )
@@ -397,10 +397,11 @@ def _compile_mxscale_to_cache(
         "f32": torch.float32,
     }[compile_out_dtype]
 
-    weight_shape = _mxscale_padded_weight_shape(data_format, n, k)
+    # K is never padded: the kernel must divide the logical (N, K). Only M is
+    # padded to tile_m. Raises if the kernel cannot run this shape (no fallback).
     _validate_mxscale_kernel_shape(
-        N=weight_shape["N"],
-        K=weight_shape["K"],
+        N=n,
+        K=k,
         tile_n=tile_n,
         tile_k=tile_k,
         num_buffers=num_buffers,
@@ -408,11 +409,11 @@ def _compile_mxscale_to_cache(
     )
     pack_a, pack_b = _mxscale_pack_factors(data_format)
     padded_m = _mxscale_align_up(m, tile_m)
-    compile_n, padded_k = weight_shape["N"], weight_shape["K"]
-    k_scale = weight_shape["K_scale"]
+    compile_n, compile_k = n, k
+    k_scale = k // _MXSCALE_SCALE_BLOCK
 
-    a = torch.empty((padded_m, padded_k // pack_a), device="cpu", dtype=torch.uint8)
-    b = torch.empty((compile_n, padded_k // pack_b), device="cpu", dtype=torch.uint8)
+    a = torch.empty((padded_m, compile_k // pack_a), device="cpu", dtype=torch.uint8)
+    b = torch.empty((compile_n, compile_k // pack_b), device="cpu", dtype=torch.uint8)
     a_scale = torch.empty((padded_m, k_scale), device="cpu", dtype=torch.uint8)
     b_scale = torch.empty((compile_n, k_scale), device="cpu", dtype=torch.uint8)
     out = torch.empty((padded_m, compile_n), device="cpu", dtype=out_torch_dtype)
@@ -431,7 +432,7 @@ def _compile_mxscale_to_cache(
         cluster_m=cluster_m,
         cluster_n=cluster_n,
     )
-    exe = compile_mxscale_gemm(M=padded_m, N=compile_n, K=padded_k, **compile_kwargs)
+    exe = compile_mxscale_gemm(M=padded_m, N=compile_n, K=compile_k, **compile_kwargs)
     _compile_executable_to_cache(
         exe,
         _ptr_view_safe(out.contiguous().view(-1)),

@@ -119,27 +119,6 @@ def _parse_flydsl_kernel_name(kernel_name: str):
     return tuple(int(m.group(i)) for i in range(1, 9))
 
 
-def _is_flydsl_mxscale8_bpreshuffle(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    kernel_name: str = "",
-) -> bool:
-    if kernel_name:
-        return kernel_name.startswith("flydsl_mxscale_fp8_")
-    if getattr(WQ, "_mxscale_layout", None) is not None:
-        return True
-    # On torch builds without native fp8_e8m0, dtypes.fp8_e8m0 aliases uint8.
-    # Keep this as a narrow fallback for raw MXScale inputs without B metadata.
-    return (
-        XQ.dtype == dtypes.fp8
-        and WQ.dtype == dtypes.fp8
-        and x_scale.dtype == dtypes.fp8_e8m0
-        and w_scale.dtype == dtypes.fp8_e8m0
-    )
-
-
 def _run_gemm_a8w8_bpreshuffle_mxscale_flydsl(
     XQ: Tensor,
     WQ: Tensor,
@@ -171,12 +150,12 @@ def gemm_a8w8_bpreshuffle_flydsl(
     x_scale: Tensor,
     w_scale: Tensor,
     Out: Tensor,
-    config: Optional[dict],
-) -> Optional[Tensor]:
-    kernel_name = str(config.get("kernelName", "")) if config is not None else ""
-    if kernel_name.startswith("flydsl_mxscale_fp8_"):
+    config: dict,
+) -> Tensor:
+    kernel_name = config.get("kernelName", "")
+    if str(kernel_name).startswith("flydsl_mxscale_fp8_"):
         return _run_gemm_a8w8_bpreshuffle_mxscale_flydsl(
-            XQ, WQ, x_scale, w_scale, Out, kernel_name
+            XQ, WQ, x_scale, w_scale, Out, str(kernel_name)
         )
 
     from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
@@ -202,42 +181,6 @@ def gemm_a8w8_bpreshuffle_flydsl(
         xcd,
     )
     return Out
-
-
-def _try_gemm_a8w8_bpreshuffle_mxscale_flydsl(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    Out: Tensor,
-    config: Optional[dict],
-) -> Optional[Tensor]:
-    """Return MXScale FlyDSL result for MXScale inputs, otherwise ``None``."""
-    if not _is_flydsl_mxscale8_bpreshuffle(XQ, WQ, x_scale, w_scale):
-        return None
-
-    from .flydsl.mxscale_gemm import resolve_mxscale_bpreshuffle_config_for_inputs
-
-    config = resolve_mxscale_bpreshuffle_config_for_inputs(
-        config,
-        XQ,
-        WQ,
-        x_scale,
-        w_scale,
-        M=XQ.shape[0],
-        N=WQ.shape[0],
-        K=XQ.shape[-1],
-        dtype=Out.dtype,
-    )
-    if config is None:
-        return None
-
-    kernel_name = str(config.get("kernelName", ""))
-    if not _is_flydsl_mxscale8_bpreshuffle(XQ, WQ, x_scale, w_scale, kernel_name):
-        return None
-    return _run_gemm_a8w8_bpreshuffle_mxscale_flydsl(
-        XQ, WQ, x_scale, w_scale, Out, kernel_name
-    )
 
 
 @compile_ops(
@@ -732,7 +675,6 @@ def gemm_a8w8_bpreshuffle(
         dtypes.fp8,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
     )
-
     if config is not None:
         libtype = config["libtype"]
         splitK = int(config["splitK"])
@@ -743,10 +685,7 @@ def gemm_a8w8_bpreshuffle(
         elif libtype == "flydsl" and is_flydsl_available():
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
     try:
-        return _run_gemm_a8w8_bpreshuffle_mxscale_flydsl(
-            XQ, WQ, x_scale, w_scale, Y, None
-        )
-        # return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
     except RuntimeError as e:
         raise RuntimeError(
             f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "

@@ -66,7 +66,7 @@ def generate_data(m, n, k, seed, out_dtype="bf16", device="cuda"):
     weight, w_scale = per_1x32_f8_scale_f8_quant(
         b, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0, shuffle=False
     )
-    weight_prepared = shuffle_weight(weight, mxscale_data_format="fp8")
+    weight_prepared = shuffle_weight(weight)
     out = torch.empty(m, n, dtype=_OUT_TORCH[out_dtype], device=device)
     return {
         "x": x,

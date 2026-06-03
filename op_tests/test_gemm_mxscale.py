@@ -37,18 +37,47 @@ def _metrics(out: torch.Tensor, ref: torch.Tensor):
     return rel.item(), cos.item()
 
 
+def _inject_mxscale_tuned_config(monkeypatch, dtype):
+    """Simulate a tuned-CSV hit: route gemm_a8w8_bpreshuffle to an MXScale kernel.
+
+    Dispatch is tuned-CSV-driven (no fallback), so the public-op test stubs the
+    config lookup to return a valid ``flydsl_mxscale_*`` row. tile_n=64 / tile_k=128
+    / split_k=1 divides every parametrized (N, K) below.
+    """
+    import aiter.ops.gemm_op_a8w8 as gmod
+    from aiter.ops.flydsl.mxscale_gemm import (
+        flydsl_mxscale_kernel_name,
+        mxscale_out_dtype_name,
+    )
+
+    name = flydsl_mxscale_kernel_name(
+        data_format="fp8",
+        out_dtype=mxscale_out_dtype_name(dtype),
+        tile_m=128,
+        tile_n=64,
+        tile_k=128,
+        m_warp=2,
+        n_warp=2,
+        num_buffers=2,
+        split_k=1,
+    )
+    config = {"libtype": "flydsl", "splitK": 1, "kernelName": name}
+    monkeypatch.setattr(gmod, "get_GEMM_config_with_quant_type", lambda *a, **k: config)
+
+
 @pytest.mark.parametrize(
     "M,N,K",
     [
         (256, 256, 256),
         (512, 1024, 512),
         (1, 4096, 4096),
-        (333, 576, 1024),  # unaligned M, N not 128/256 aligned
-        (17, 64, 160),  # K pads to the fixed 256 baseline
+        (333, 576, 1024),  # unaligned M, N=576 (tile_n=64 divides it)
+        (17, 64, 512),  # unaligned M, small N
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gemm_a8w8_bpreshuffle_mxscale(M, N, K, dtype):
+def test_gemm_a8w8_bpreshuffle_mxscale(M, N, K, dtype, monkeypatch):
+    _inject_mxscale_tuned_config(monkeypatch, dtype)
     torch.manual_seed(0)
     a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 2.0
     b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 2.0
@@ -61,7 +90,7 @@ def test_gemm_a8w8_bpreshuffle_mxscale(M, N, K, dtype):
     )
 
     ref = (_dequant_fp8(aq, a_s) @ _dequant_fp8(bq, b_s).t()).to(dtype)
-    bq_prepared = shuffle_weight(bq, mxscale_data_format="fp8")
+    bq_prepared = shuffle_weight(bq)
     out = aiter.gemm_a8w8_bpreshuffle(aq, bq_prepared, a_s, b_s, dtype=dtype)
 
     assert out.shape == (M, N)
@@ -120,7 +149,7 @@ def test_flydsl_mxscale_backend_split_k():
         b, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0, shuffle=False
     )
     ref = (_dequant_fp8(aq, a_s) @ _dequant_fp8(bq, b_s).t()).to(torch.bfloat16)
-    bq_prepared = shuffle_weight(bq, mxscale_data_format="fp8")
+    bq_prepared = shuffle_weight(bq)
     name = flydsl_mxscale_kernel_name(
         data_format="fp8",
         out_dtype="bf16",
@@ -168,7 +197,7 @@ def _bench_gemm_mxscale(dtype, M, N, K, num_iters, num_warmup):
         torch.manual_seed(0)
         aq, bq, a_s, b_s = _build_mxscale_inputs(M, N, K)
         ref = (_dequant_fp8(aq, a_s) @ _dequant_fp8(bq, b_s).t()).to(dtype)
-        bq_prepared = shuffle_weight(bq, mxscale_data_format="fp8")
+        bq_prepared = shuffle_weight(bq)
 
         out, us = run_perftest(
             aiter.gemm_a8w8_bpreshuffle,
