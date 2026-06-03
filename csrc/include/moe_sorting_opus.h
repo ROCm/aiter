@@ -37,6 +37,8 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
 #include <hip/hip_runtime.h>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <utility>
 
 #include "opus/opus.hpp"
 
@@ -3238,9 +3240,11 @@ moe_sorting_opus_get_workspace_size(int tokens, int num_experts, int topk, int d
     return aiter::moe_sorting_get_workspace_size(tokens, num_experts, topk, dispatch_policy);
 }
 
-// Forward declaration
+// Forward declarations
 inline float
 moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::stream_config s);
+inline float
+moe_sorting_opus_oneshot(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::stream_config s);
 
 // ---------------------------------------------------------------------------
 // Dispatch macros
@@ -3495,15 +3499,10 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
 // Main API functions
 
 inline float
-moe_sorting_opus(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::stream_config s)
+moe_sorting_opus_oneshot(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::stream_config s)
 {
     if(t.weight_type == "fp32" && t.index_type == "i32")
     {
-        if(moe_sorting_opus_get_workspace_size(
-               a.tokens, a.num_experts, a.topk, t.dispatch_policy) != 0)
-        {
-            return moe_sorting_opus_mp(t, a, s);
-        }
         using ms_weight_type         = float;
         auto sub_token_              = aiter::moe_sorting_get_sub_token(a.tokens, a.num_experts);
         auto row_                    = sub_token_ / 8;
@@ -3514,6 +3513,61 @@ moe_sorting_opus(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::strea
         OPUS_MOE_SORTING_DISPATCH_EMASK_(row_);
     }
     return -1;
+}
+
+inline float
+moe_sorting_opus(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::stream_config s)
+{
+    if(t.dispatch_policy == 1)
+        return moe_sorting_opus_oneshot(t, a, s);
+    if(t.dispatch_policy == 2)
+        return moe_sorting_opus_mp(t, a, s);
+
+    if(!aiter::moe_sorting_is_oneshot(a.tokens, a.num_experts))
+        return moe_sorting_opus_mp(t, a, s);
+
+    using autotune_key_t = std::pair<int, int>;
+    struct autotune_key_hash
+    {
+        std::size_t operator()(const autotune_key_t& k) const noexcept
+        {
+            return (static_cast<std::size_t>(static_cast<uint32_t>(k.first)) << 32) ^
+                   static_cast<uint32_t>(k.second);
+        }
+    };
+    static auto& cache =
+        *new std::unordered_map<autotune_key_t, bool, autotune_key_hash>();
+
+    autotune_key_t key{a.tokens, a.num_experts};
+    auto it = cache.find(key);
+    if(it != cache.end())
+        return it->second ? moe_sorting_opus_oneshot(t, a, s)
+                          : moe_sorting_opus_mp(t, a, s);
+
+    auto time_path = [&](float (*fn)(moe_sorting_opus_trait,
+                                     moe_sorting_opus_args,
+                                     aiter::stream_config)) -> float {
+        hipEvent_t ev_start = nullptr, ev_stop = nullptr;
+        hipEventCreate(&ev_start);
+        hipEventCreate(&ev_stop);
+        hipEventRecord(ev_start, s.stream_id_);
+        fn(t, a, s);
+        hipEventRecord(ev_stop, s.stream_id_);
+        hipEventSynchronize(ev_stop);
+        float ms = 0.0f;
+        hipEventElapsedTime(&ms, ev_start, ev_stop);
+        hipEventDestroy(ev_start);
+        hipEventDestroy(ev_stop);
+        return ms;
+    };
+
+    float t_oneshot  = time_path(moe_sorting_opus_oneshot);
+    float t_mp       = time_path(moe_sorting_opus_mp);
+    bool use_oneshot = t_oneshot <= t_mp;
+    cache[key]       = use_oneshot;
+
+    return use_oneshot ? moe_sorting_opus_oneshot(t, a, s)
+                       : moe_sorting_opus_mp(t, a, s);
 }
 
 inline float
