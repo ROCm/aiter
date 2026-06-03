@@ -522,7 +522,7 @@ def moe_gemm_a8w4(
             alpha,
             limit,
             reduction_n_matmul,
-            add_residual,
+            swiglu_add_residual,
             routing_data.n_expts_act,
             config["block_m"],
             config["block_n"],

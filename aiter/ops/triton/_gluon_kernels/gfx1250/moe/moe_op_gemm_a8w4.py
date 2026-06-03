@@ -125,7 +125,7 @@ def _moe_gemm_a8w4_decode(
     alpha,
     limit,
     ACTIVATION_REDUCTION_N: gl.constexpr,
-    ADD_RESIDUAL: gl.constexpr,
+    SWIGLU_ADD_RESIDUAL: gl.constexpr,
     # MoE config
     N_EXPTS_ACT: gl.constexpr,
     # optimization config
@@ -595,7 +595,7 @@ def _moe_gemm_a8w4_decode(
         acc = acc + bias[None, :]
 
     if APPLY_SWIGLU:
-        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=ADD_RESIDUAL)
+        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
@@ -608,11 +608,11 @@ def _moe_gemm_a8w4_decode(
         out = acc
 
     if Gammas is not None:
-        offs_m = BLOCK_M * block_id + gl.arange(
-            0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-        )
+        offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
         mask_m = offs_m < M
-        gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
+        gammas = gl.amd.gfx1250.buffer_load(
+            Gammas + start_m, offs_m, mask=mask_m, other=0.0
+        )
         out *= gammas[:, None]
 
     # quant
@@ -645,7 +645,6 @@ def _moe_gemm_a8w4_decode(
 @gluon.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a8w4_prefill(
     Y,
-    # stride_y_k,
     stride_y_m,
     stride_y_n,
     X,
@@ -1163,11 +1162,11 @@ def _moe_gemm_a8w4_prefill(
         out = acc
 
     if Gammas is not None:
-        offs_m = BLOCK_M * block_id + gl.arange(
-            0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-        )
+        offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
         mask_m = offs_m < M
-        gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
+        gammas = gl.amd.gfx1250.buffer_load(
+            Gammas + start_m, offs_m, mask=mask_m, other=0.0
+        )
         out *= gammas[:, None]
 
     # quant
