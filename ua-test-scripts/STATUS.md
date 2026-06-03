@@ -16,6 +16,103 @@ recursive checkout is enough.
 
 ---
 
+## `-fav4` branch: pipeline cleanup + prefill fallback (2026-06-03)
+
+A dedicated `jukorhon/unified-attention-ck-fav4` branch (same name on both
+repos) carries the pipeline cleanup so the main branch stays untouched while
+FA4 tuning continues.
+
+### 1. 4-warp serial prefill fallback — hypothesis FALSIFIED
+
+We tested whether routing prefill through the barrier-free single-warp-group
+**serial** pipeline (`NumWarpGroups==1`, the path the decode tiers already use
+at `unified_attention_pipeline.hpp`'s `if constexpr(NumWarpGroups == 1)` branch)
+would reach Triton-level perf and let us PR immediately. The softmax row layout
+requires `BlockM == 32 * NumWarps`, so "4 warps" means `BlockM=128` — i.e. the
+existing `decode_*_m128` config applied to prefill shapes.
+
+Result (gfx950, fp8, GQA-12/2, d128, bottom-right causal, vs Triton):
+
+| shape           | FA4 8-warp | 4-warp serial |
+|-----------------|-----------:|--------------:|
+| b16 sq=sk=1000  | **0.80x**  | 0.71x |
+| b16 sq=sk=5000  | **0.73x**  | 0.66x |
+| b16 sq=sk=10000 | **0.75x**  | 0.68x |
+| b8  sq=sk=10000 | **0.75x**  | 0.67x |
+| b4  sq=sk=10000 | **0.75x**  | 0.66x |
+| b32 sq=sk=5000  | **0.73x**  | 0.67x |
+| b8  sq=sk=5000  | **0.75x**  | 0.66x |
+
+The serial path is ~8-10% **slower** than FA4 on every prefill shape, and
+neither reaches Triton parity. Expected in hindsight: the single-warp-group
+serial loop has no matrix‖softmax overlap, which is exactly FA4's advantage.
+**Conclusion:** there is no "free" Triton-parity prefill fallback via warp
+reduction; FA4 remains the best non-Triton prefill option.
+
+### 2. Opt-in fallback knob (kept anyway, OFF by default)
+
+`AITER_UA_PREFILL_FALLBACK=1` routes prefill-sized shapes to the 4-warp serial
+`decode_*_m128` instances (reuses already-compiled kernels — no extra binary).
+OFF by default since it is slower; kept as a diagnostic / robustness A-B knob
+(`select_config` in `unified_attention.cpp`). Verified: b16 sq=sk=10000 fp8 →
+FA4 5.76 ms (default) vs serial 6.65 ms (knob on).
+
+### 3. Pipeline cleanup — legacy ping-pong removed, FA4 canonical
+
+* Deleted the ~200-line monolithic ping-pong `core_loop` lambda + its 2-warp-
+  group dispatch. It was reachable only under `-DUA_FA4_PIPELINE=0` and never
+  beat FA4, so it was dead under the default build.
+* Removed the `UA_FA4_PIPELINE` toggle. `kFA4` is now derived purely from
+  `NumWarpGroups==2` + the 32x32x16 within-wave FP8-relayout invariant, with a
+  `static_assert` pinning that every 2-WG instance is FA4-capable.
+* Removed orphaned `ADD_SBARRIER_FOR_PHASE0/PHASE2` knobs (only gated barriers
+  inside the deleted `core_loop`). `MOVE_FMHA_MASK_*` stay (still consumed by
+  the FA4 core-loop scheduler). The non-FA4 pre-stage + `fmha_post_process`
+  epilogue stay — shared by the single-warp-group serial decode path.
+* **Behaviour-preserving**: FA4 prefill is bit-for-bit unchanged (b16 sq=sk=
+  10000 fp8 CK=5.76 ms before/after) and the full decode regression
+  (d{64,128} × {bf16,fp8} × split-KV {2,64}) still PASSes.
+
+### 4. FA4 vs Triton — where the ~25-35% prefill gap lives
+
+Fresh rocprof on the cleaned-up FA4 build (prefill_d128 fp8 b16 sq=sk=10000,
+report: `rocprof_analysis/BOTTLENECK_FAV4_PREFILL_D128_FP8.md`) shows the
+bottleneck has **shifted away from barriers** vs the earlier permlane-era
+profile — it is now **LDS-read-latency / waitcnt-bound with the matrix units
+starved**, and still NOT memory-bandwidth-bound:
+
+| signal | value | reading |
+|--------|------:|---------|
+| `s_waitcnt lgkmcnt(0)` samples | 75,680 (#1 hotspot) | exposed LDS-read latency |
+| WAITCNT % of all stalls | **44.9%** | up from ~14% (permlane era) |
+| `s_waitcnt vmcnt(0)` samples | 22,088 | global K/V load waits |
+| `s_barrier` samples | 20,973 (9.7% of stalls) | down from ~21% |
+| MATRIX % of samples / stalled | 6.0% / **63.9%** | matrix pipe idle most of the time |
+| VALU/dispatch | 1.37B (was 1.69B) | ~19% less VALU than permlane era |
+| VALU / MFMA | 8.87 (was 10.94) | less VALU-bound than before |
+| TCC/HBM busy | **11.4%** | latency-bound, NOT bandwidth-bound |
+
+Interpretation: the FA4 MATRIX phase issues `K_lds_load`/`V_lds_load` and then
+hits `s_waitcnt lgkmcnt(0)` right before the MFMA, so the LDS read latency is
+exposed instead of hidden — the matrix pipe sits idle ~64% of the time waiting
+on LDS. HBM is barely touched, so deeper/earlier prefetch should be free.
+
+Levers to chase next (in rough priority):
+1. **Hide the LDS-read latency.** Issue the next tile's `*_lds_load` further
+   ahead of its consuming MFMA (deeper LDS double-buffer / reorder the waitcnt
+   so compute from the current tile covers the next tile's LDS read).
+2. **Feed the matrix pipe.** With MATRIX at 6%/64%-stalled and HBM at 11%, the
+   win is scheduling, not bandwidth — more in-flight K/V loads + LDS reads.
+3. **Strength-reduce page-table address math.** Still-hot `v_lshlrev_b64` /
+   `v_ashrrev_i32 31` (64-bit sign-extend) / `v_add_u32` from the per-tile
+   page-table indexing; hoist loop-invariant parts and lean on the compile-time
+   `kPageSize` instances.
+
+(Profiling continues on this branch; the four-phase capture lives under
+`rocprof_analysis/runs/fav4_prefill_d128_fp8_b16_sq10000`.)
+
+---
+
 ## How to reproduce / test
 
 ### One-time checkout
@@ -1452,6 +1549,217 @@ attention, not a kernel/generator bug — so benchmark FP8 perf with
 Still open (Part 1 polish): wire a couple of these cells into
 `sweep_amir_shapes.py` (§4C "rides existing sweep tooling") — deferred,
 the `--headroom` CLI already covers ad-hoc runs.
+
+---
+
+## PLAN_conditional_rescale Part 2 — gated kernel conditional rescale (2026-06-01)
+
+Implemented the FA4-style "skipped rescale" in the kernel, behind the
+`CONDITIONAL_RESCALE` macro (`unified_attention_pipeline.hpp`). **Status:
+landed, validated, ON by default for prefill.** `=0` is bit-identical to
+the pre-Part-2 kernel (one-line revert).
+
+**The transform (mathematically exact, not an approximation).** The
+baseline online softmax keeps `o_acc`/`l` normalised to the true running
+max `m` and rescales *both every KV tile* (`o_acc *= exp2(scale_s*(m_old-m))`
+— the 128-VGPR `v_pk_mul_f32` tail in `fmha_alu_D_upd` + a 6-reg partial in
+`fmha_alu1`). Part 2 carries the accumulators in the frame of a *committed*
+max `m_commit` that only advances when the true max pulls more than τ ahead:
+
+```
+fmha_alu0:  m = max(m, rowmax_j)                       # true running max, as before
+            need_rescale = ballot_w64(scale_s*(m - m_commit) > τ) != 0   # wave-uniform
+            if need_rescale: m_commit = m              # commit (advance the frame)
+            sp_delta = scale_s*S_j - scale_s*m_commit  # shift by committed max
+fmha_alu1:  l = exp2(scale_s*(m_commit_old-m_commit))*l + rowsum_j   # ==1 when no commit
+            if need_rescale: o_acc[0:6] *= o_acc_scale # 6-reg partial (deferred carry)
+D_upd:      o_acc_scale = exp2(scale_s*(m_commit_old-m_commit))      # ==1.0 when no commit
+            if need_rescale: o_acc[6:] *= o_acc_scale  # the 128-VGPR tail — SKIPPED ~85%
+epilogue:   lse = scale*m_commit + log(l)              # frame base = m_commit
+```
+
+Why it's exact: the `m_commit` normalisation cancels in `o = o_acc/l`
+regardless of frame, so the *output is frame-independent*; only the
+side-output LSE needs the matching base (`m_commit`), and
+`exp2(m_commit)*l == sum exp2(s)` makes `scale*m_commit + log(l)` the exact
+log-sum-exp. No end-of-loop correction is needed — l and o_acc are kept in
+the *same* frame, so they rescale together (or not at all). Overflow-safe:
+we commit *before* shifting whenever the gap would exceed τ, so the
+shifted scores feeding `exp2` are always ≤ τ = log2(256) = 8 (fp32-safe
+even summed over thousands of keys). FA4 uses the same τ.
+
+**Key correctness subtlety — the pipelined deferral.** The split rescale
+(`o_acc[6:]` in `D_upd`, `o_acc[0:6]` in the *next* `fmha_alu1`) means the
+partial-rescale guard must read a `need_rescale`/`o_acc_scale` that is
+deferred one pipeline stage — exactly as the baseline already defers the
+`o_acc_scale` *value*. `need_rescale`, `m_commit`, `m_commit_old` are
+therefore given the same lifetime as the baseline's `o_acc_scale`/`m_old`
+(set in `fmha_alu0`/`D_upd`, no intervening overwrite before the matching
+`fmha_alu1`), so the conditional path inherits the baseline's proven
+deferral timing rather than inventing a new one.
+
+**Wave-uniform branch (no divergence).** `m`/`m_commit` are row-uniform
+after the cross-lane reduce, but the two 32-lane row groups of a wave hold
+different rows. `__builtin_amdgcn_ballot_w64(...) != 0` ORs the per-lane
+predicate across the wave: if either group needs a rescale, both commit
+(the other does a near-no-op rescale). The guard then lives in an SGPR →
+scalar `s_cbranch` that genuinely skips the `v_pk_mul` tail, no per-lane
+predication.
+
+**Prefill-only gate (`kCondRescale = CONDITIONAL_RESCALE && NumWarpGroups==2`).**
+Decode (single-warp-group, memory-bound, tiny `o_acc`) measured a ~+2%
+*regression* from the per-tile ballot+branch overhead it can't recover, so
+it keeps the always-rescale path. `NumWarpGroups` is compile-time and
+prefill/decode are separate instances, so each lowers to exactly one path
+(zero runtime cost; `if constexpr`).
+
+**Scheduler-hint co-tune (`UAcoreLoopScheduler`, `UA_DUPD_PER_MFMA_VALU`).**
+The gemm1+`D_upd` phase statically reserved 4 VALU slots per PV-MFMA
+(`8×4 + 4 ≈ 36`) for the always-on rescale tail. With the tail skipped
+~85% of the time those slots sat empty, leaving schedule bubbles the
+MFMAs could fill. Dropping the per-MFMA reservation `4 → 2` (gated on
+`CONDITIONAL_RESCALE`, so `=0` keeps the original `4` byte-for-byte) packs
+the common skip path tighter. **`2` is the sweet spot:** `4`→`2` gave
+bf16 a small extra win and **fp8 a further −2.5%**; `2`→`1` *regressed*
+bf16 back near baseline (under-reserves the always-present score-shift
+VALU + the 15% commit tiles).
+
+**Validated (final config: `CONDITIONAL_RESCALE=1`, `UA_DUPD_PER_MFMA_VALU=2`):**
+- Correctness: **32/32 default grid + 46/46 SWA fixtures** PASS; bf16
+  realistic std=8/12 (peaked, exercises the commit path) PASS; fp8 uniform
+  + decode PASS. (fp8 peaked correctness gated on bf16 oracle per Part 1.)
+- `=0` rebuilt + re-checked: bit-identical (grid PASS, perf == pre-Part-2).
+
+**Perf vs `=0` baseline (realistic std=8, `--no-reference`, d128, gfx950):**
+
+| shape (b, sq=sk, heads)   | dtype | =0 baseline | =1 final | speedup |
+|---------------------------|-------|-------------|----------|---------|
+| 4, 2048, (12,2)           | bf16  | 0.1725      | 0.1684   | −2.4%   |
+| 2, 4096, (12,2)           | bf16  | 0.2598      | 0.2519   | −3.0%   |
+| 2, 8192, (12,2)           | bf16  | 0.7586      | 0.7202   | −5.1%   |
+| 1, 16384, (12,2)          | bf16  | 1.4149      | 1.3593   | −3.9%   |
+| 16, 4096, (64,8)          | bf16  | 5.9204      | 5.7003   | −3.7%   |
+| 4, 2048, (12,2)           | fp8   | 0.1398      | 0.1344   | −3.9%   |
+| 2, 4096, (12,2)           | fp8   | 0.2246      | 0.2119   | −5.7%   |
+| 2, 8192, (12,2)           | fp8   | 0.6370      | 0.5945   | −6.7%   |
+| 1, 16384, (12,2)          | fp8   | 1.1613      | 1.0664   | **−8.2%** |
+| 16, 4096, (64,8)          | fp8   | 5.1279      | 4.8631   | −5.2%   |
+| decode b128 sq1 sk16384   | bf16  | 0.1937      | 0.1908   | ~0 (gated off) |
+
+The win **grows with sequence length** (more KV tiles → more skipped
+rescales, fixed launch overhead amortised) and is **larger for fp8** (the
+hint co-tune helps the fp8 gemm1 phase most). This *exceeds* Part 1's
+"low-single-digit %" ceiling estimate — the scheduler co-tune recovered
+more than the bare instruction-skip because the freed VALU slots let the
+PV-MFMAs pack tighter, not just the rescale issue cycles.
+
+**Knobs (all in headers, compile-time):**
+- `CONDITIONAL_RESCALE` (`unified_attention_pipeline.hpp`, default 1):
+  master switch. `0` ⇒ bit-identical pre-Part-2 kernel.
+- `CONDITIONAL_RESCALE_TAU` (default `8.0f`): commit threshold in scaled-
+  log2 units. Lower = commit more (smaller intermediates, fewer skips);
+  higher = skip more (Part-1 headroom shows the skip ratio is ~flat above
+  τ≈4, so 8 is comfortably past the knee with margin to the fp32 bound).
+- `UA_DUPD_PER_MFMA_VALU` (`unified_attention_core_loop_scheduler.hpp`,
+  `2` when `CONDITIONAL_RESCALE`, else `4`): gemm1+`D_upd` per-MFMA VALU
+  hint.
+
+**Parked / next:** (a) confirm the mechanism directly with rocprof
+(expect `T_D`/barrier-wait drop in the gemm1 phase) — perf delta already
+proves the skip, but a profile would close the loop; (b) τ sensitivity on
+the production sweep; (c) decision on flipping `CONDITIONAL_RESCALE`
+default to 1 for the shipped build (currently 1 in-tree for evaluation —
+trivially revertible). **Not pushed to remote.**
+
+---
+
+## Warp-group balance plan A1 — mask→gemm1 REGRESSES once cond-rescale is on (2026-06-02)
+
+Re-ran `MOVE_FMHA_MASK_TO_GEMM1=1` on top of the now-default
+`CONDITIONAL_RESCALE=1` baseline (clean A/B, full rebuild of all 108
+instances via `ninja` — note the JIT/ninja graph does **not** track the
+CK header dep, so a header edit needs `touch instances/*.cpp` + manual
+`.so` copy to `aiter/jit/`). Canonical profiled cell, b16 sq=sk=10000
+h12,2 ps64, GPU2, harness `CK time` median:
+
+| dtype | mask=0 baseline | mask=1 (gemm1) | Δ |
+|-------|----------------:|---------------:|---|
+| fp8   | 5.2405 ms       | 5.4246 ms      | **+3.5%** |
+| bf16  | 6.7884 ms       | 6.9651 ms      | **+2.6%** |
+
+Correctness clean: the bf16 canary (b4 sq=sk=2048) is **bit-identical**
+between mask=0 and mask=1 (both 3 / 12.58M elements, max delta 0.0223 =
+1.49× atol — the pre-existing reduction-order ULP flake, not a
+regression; the harness escalates the marginal warning to FAIL).
+
+**Mechanism (no rocprof needed — it's in the scheduler header).** The
+mask-move and conditional-rescale compete for the *same* slack in the
+gemm1+`D_upd` phase. Pre-cond-rescale that phase carried the always-on
+128-VGPR `v_pk_mul` rescale tail (`UA_DUPD_PER_MFMA_VALU=4`) — abundant
+VALU the mask overlapped with for free, hence exp2's −0.6%/−1.0% win.
+Conditional rescale *removed that tail* (skipped ~85%, hint dropped to
+`UA_DUPD_PER_MFMA_VALU=2`), leaving the phase lean and MFMA-bound.
+Adding the mask's VALU/SALU back now stretches the tightened phase and
+disrupts the tight MFMA packing → net regression. Conditional rescale
+already claimed that slack and is worth ~10× more (−5..−8% vs −0.6..−1%).
+
+**Verdict: A1 is a NO-GO with `CONDITIONAL_RESCALE=1`.** Reverted to
+`MOVE_FMHA_MASK_TO_GEMM1=0` (source + rebuilt baseline `.so`). The lever
+isn't dead in principle (a full gemm1-phase hint re-tune for the
+mask+cond-rescale combo *might* recover the −1%), but it targets the
+same phase cond-rescale optimizes and the upside is small. Next levers
+(A2 `s_setprio` on the gating compute group; A3 KV-address-gen VALU
+strength-reduction) act on different resources and don't fight the
+gemm1-phase slack.
+
+### A2 — dynamic `s_setprio` (HipKittens compute-boost): REGRESSES
+
+Added gated macro `UA_DYNAMIC_SETPRIO` (default 0). When on, `cl_calc`
+raises `s_setprio(1)` around the gemm MFMA cluster and drops to
+`s_setprio(0)` after; the static W4-7=1 loop-entry priority is
+neutralised to 0 so the non-compute baseline is uniformly prio 0. Intent:
+the computing warp group outbids the co-resident memory-issuing group at
+the shared SIMD issue port, attacking the ARBITER_NOT_WIN stall on the
+gating compute side (W0-3, 37.8%). Canonical cell, harness `CK time`:
+
+| dtype | baseline | A2 setprio | Δ |
+|-------|---------:|-----------:|---|
+| fp8   | 5.2405 ms | 5.3596 ms | **+2.3%** |
+| bf16  | 6.7884 ms | 6.8436 ms | **+0.8%** |
+
+Correctness clean (canary 4/12.58M, same ULP magnitude). **NO-GO** —
+boosting compute *hurts*. The existing static scheme already gives the
+memory-leading group (W4-7) global priority, and that's better: starving
+memory **issue** delays the async global→LDS loads the *next* compute
+depends on, so the gating side ends up waiting on data instead of issue
+slots. Reverted to `UA_DYNAMIC_SETPRIO=0` (gated infra kept).
+
+### A3 — KV address-gen VALU strength-reduction: NOT VIABLE (already optimized)
+
+The hot `v_add_u32 (coord.get_offset() + page_offset)` feeding each
+`buffer_load_dword … offen lds` is **per-lane paged-gather** arithmetic,
+not a redundant recompute. From `refresh_k/v_offsets`:
+`page_offset = (phys_page·page_size + within_page)·row_stride`, where
+`phys_page` is wave-uniform (and *already* hoisted to a single
+`readfirstlane` per tile by the dedup/scalar-promote work, commits
+7fc24c8c4 / 87658a951) but `within_page` depends on the per-lane
+`k_thread_n_pos` row position. So `page_offset` is genuinely per-lane →
+must live in VGPR → the add cannot fold into the scalar buffer SRD base.
+The pipeline header (≈L754-778) already documents that further hoisting
+**regresses ~30% from register pressure**. No quick strength-reduction
+remains; the address-gen is intrinsic and already scalar-promoted.
+
+### Plan-A verdict: ping-pong balance levers exhausted → pivot to Track B
+
+A1 (regress, cond-rescale interaction), A2 (regress, arbitration already
+tuned), A3 (not viable, already optimized). The 8-wave ping-pong is at /
+near its local optimum for this imbalanced FP8 prefill workload, and the
+~12% barrier-wait is **structural** imbalance the cheap rebalance levers
+can't move on top of conditional rescale. This is precisely the regime
+HipKittens addresses with the **4-wave interleave** pipeline (Track B) —
+one wave per SIMD issuing memory + compute lazily, no cross-group
+`s_barrier` rendezvous, so imbalance doesn't serialize. Recommend
+prototyping Track B next.
 
 ---
 
