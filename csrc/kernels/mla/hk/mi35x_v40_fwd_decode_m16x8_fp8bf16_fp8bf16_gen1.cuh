@@ -148,8 +148,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
     // ---- Managers ----
     QManager8to16bitsV1<T> q_manager;
     KvManager8to16bitsV1<T> kv_manager;
-    OManager16bitsV3<T, out_t> o_manager;
-    OManager32bitsV3<T, split_t> split_o_manager;
+    OManager16bitsV4Gen1Swizzle<T, out_t> o_manager;
+    OManager32bitsV4Gen1Swizzle<T, split_t> split_o_manager;
 
     // ---- art tile declarations ----
     // q_vgpr: Q[:, 0:256] held bf16 in VGPR, mfma A-operand layout.
@@ -933,8 +933,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
             //
             // Rescale oaccu by 1/row_sum_e (single mul_vgpr over full 128-vgpr
             // tile), then write 16-row x kVoHeadDim tile to vmem.
-            //   partial_qo_loc < 0 -> final_output via OManager16bitsV3 (bf16).
-            //   partial_qo_loc >= 0 -> split_output via OManager32bitsV3 (fp32)
+            //   partial_qo_loc < 0 -> final_output via OManager16bitsV4Gen1Swizzle (bf16).
+            //   partial_qo_loc >= 0 -> split_output via OManager32bitsV4Gen1Swizzle (fp32)
             //                          + per-warp LSE row (lanes 0..15).
             // O LDS bounce overlays p_lds_kv_next (the next pong is dead on
             // the global last iter -- the swap is a no-op and the next

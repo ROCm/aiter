@@ -4,10 +4,9 @@
 #pragma once
 
 // V40 Gen1 buffer managers: QManager8to16bitsV1, KvManager8to16bitsV1,
-// OManager16bitsV3, OManager32bitsV3, OManager32bitsV3NoStage. Moved out
-// of hk_mla_buffer_managers.cuh so V32 and V40-gen1 keep their residency
-// managers separated. Generic cvt/pack helpers (float_2_bf16_pair etc.)
-// live in hk_mla_utils.cuh.
+// OManager16bitsV4Gen1Swizzle, OManager32bitsV4Gen1Swizzle, OManager32bitsV4Gen1SwNoStage. Moved
+// out of hk_mla_buffer_managers.cuh so V32 and V40-gen1 keep their residency managers separated.
+// Generic cvt/pack helpers (float_2_bf16_pair etc.) live in hk_mla_utils.cuh.
 
 #include "hk_mla_utils.cuh"
 
@@ -1322,7 +1321,7 @@ class KvManager8to16bitsV1
 // LDS-store side is written in permuted (LDS) order, no perm here — that matches
 // oaccu's natural col axis.
 template <typename T, typename out_t>
-class OManager16bitsV3
+class OManager16bitsV4Gen1Swizzle
 {
     private:
     static_assert(sizeof(out_t) == 2, "Output type must be 16 bits");
@@ -1460,11 +1459,11 @@ class OManager16bitsV3
     }
 };
 
-// 32-bit (fp32 split-O) sibling of OManager16bitsV3 — same sub-tile-of-8 un-swizzle
+// 32-bit (fp32 split-O) sibling of OManager16bitsV4Gen1Swizzle — same sub-tile-of-8 un-swizzle
 // model: straight permuted layout into the bounce, perm-undo on the LDS read side
 // so VRAM stores stay coalesced.
 template <typename T, typename out_t>
-class OManager32bitsV3
+class OManager32bitsV4Gen1Swizzle
 {
     private:
     static_assert(sizeof(out_t) == 4, "Output type must be 32 bits");
@@ -1609,7 +1608,7 @@ class OManager32bitsV3
 // buffer_store_dwordx4 straight from its accumulator VGPRs to VRAM. The lanes
 // in a wave write to non-contiguous addresses (no coalescing), but the manager
 // allocates zero LDS, which removes any possibility of overlap with the
-// split-O reduction region that OManager32bitsV3 (staged) competes with.
+// split-O reduction region that OManager32bitsV4Gen1Swizzle (staged) competes with.
 //
 // Per-lane oaccu layout for one 64-col wave-tile (16 fp32 in VGPRs):
 //   GPR_START + m*4 + i  =  fp32 at (row=lane%16, mfma=m, col-in-mfma = (lane/16)*4 + i)
@@ -1622,7 +1621,7 @@ class OManager32bitsV3
 //   intra_half  = col_quad & 1                  // 0 or 1
 //   data_col    = data_subtile*8 + intra_half*4
 template <typename T, typename out_t>
-class OManager32bitsV3NoStage
+class OManager32bitsV4Gen1SwNoStage
 {
     private:
     static_assert(sizeof(out_t) == 4, "Output type must be 32 bits");

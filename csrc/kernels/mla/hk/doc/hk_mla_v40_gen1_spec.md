@@ -339,7 +339,7 @@ under compute by the prefetch chain in step 2.
 | `p_comp` v120..v127 | softmax (`hk_mla_softmax.cuh`) | between softmax and PV of one iter |
 | `p_mfma` v120..v123 | PV gemm | reads from p_comp overlay |
 | `oaccu` v128..v255 | PV gemm | whole loop |
-| OMgr bounce LDS | `OManager16bitsV3` / `OManager32bitsV3*` | epilogue only |
+| OMgr bounce LDS | `OManager16bitsV4Gen1Swizzle` / `OManager32bitsV4Gen1Swizzle*` | epilogue only |
 
 The pinned VGPR layout is fixed by `__attribute__((amdgpu_num_vgpr(64)))`
 on the `__global__` plus inline-asm hex names — see Ch. 5.
@@ -364,9 +364,9 @@ Concretely (from the manager `get_lds_size_in_byte()` accessors):
 |---|---:|---|---|
 | `kSzLdsKv` (one KV pong) | 32 KiB | `KvManager8to16bitsV1` | $\mathrm{kBlockN} \cdot D_{\mathrm{QK}} \cdot \mathrm{sizeof(bf16)} = 32 \cdot 512 \cdot 2 = 32{,}768$ B (NoPE 448 + RoPE 64 = 512 bf16 cols per row, see Ch. 8) |
 | `kSzLdsQ` (Q final + Phase-1 staging overlay) | 64 KiB | `QManager8to16bitsV1` | `kFinalLdsBytes` |
-| `kSzLdsO` (OMgr V3 bf16 bounce) | 16,896 B (~16.5 KiB) | `OManager16bitsV3` | $8 \text{ warps} \cdot 2112~\text{B}$ |
-| `kSzLdsO` (OMgr V3 fp32 split bounce) | 34,816 B (~34 KiB) | `OManager32bitsV3` | $8 \text{ warps} \cdot 4352~\text{B}$ |
-| `kSzLdsO` (V3NoStage variant) | 0 | `OManager32bitsV3NoStage` | direct VRAM, no bounce |
+| `kSzLdsO` (OMgr V3 bf16 bounce) | 16,896 B (~16.5 KiB) | `OManager16bitsV4Gen1Swizzle` | $8 \text{ warps} \cdot 2112~\text{B}$ |
+| `kSzLdsO` (OMgr V3 fp32 split bounce) | 34,816 B (~34 KiB) | `OManager32bitsV4Gen1Swizzle` | $8 \text{ warps} \cdot 4352~\text{B}$ |
+| `kSzLdsO` (V3NoStage variant) | 0 | `OManager32bitsV4Gen1SwNoStage` | direct VRAM, no bounce |
 
 Two epilogue managers are sized; the kernel picks `max(V3, V3NoStage)` —
 the **V3** path (with bounce) is taken when the output is bf16 final and
@@ -1666,9 +1666,9 @@ Three variants are shipped:
 
 | Manager | Output | Bounce LDS | When used |
 |---|---|---:|---|
-| `OManager16bitsV3` | bf16 → final_output | 2112 B / warp ($\approx 16.5$ KiB) | `kEpilogueType = OutputFinal`, the common case |
-| `OManager32bitsV3` | fp32 → split_output | 4352 B / warp ($\approx 34$ KiB) | `kEpilogueType = OutputSplit`, with a bounce, when split-O LSE is needed |
-| `OManager32bitsV3NoStage` | fp32 → split_output | 0 (direct) | `kEpilogueType = OutputSplit`, direct write when the LDS region is contended by the split-O reduction (see commit `15a8736c4`'s notes) |
+| `OManager16bitsV4Gen1Swizzle` | bf16 → final_output | 2112 B / warp ($\approx 16.5$ KiB) | `kEpilogueType = OutputFinal`, the common case |
+| `OManager32bitsV4Gen1Swizzle` | fp32 → split_output | 4352 B / warp ($\approx 34$ KiB) | `kEpilogueType = OutputSplit`, with a bounce, when split-O LSE is needed |
+| `OManager32bitsV4Gen1SwNoStage` | fp32 → split_output | 0 (direct) | `kEpilogueType = OutputSplit`, direct write when the LDS region is contended by the split-O reduction (see commit `15a8736c4`'s notes) |
 
 ### 11.1 Call shape: 64-cols-per-call, 8 calls per warp
 
@@ -1753,10 +1753,10 @@ calculation).
 The two split-O variants differ only in whether they use a per-warp
 bounce LDS:
 
-- **`OManager32bitsV3`** uses a 4352 B/warp bounce — same un-swizzle
+- **`OManager32bitsV4Gen1Swizzle`** uses a 4352 B/warp bounce — same un-swizzle
   pattern as the bf16 V3, scaled to fp32 with `kNumElemPerPaddedRow = 68`
   (= 64 + 4 pad). Total per-WG bounce = $8 \cdot 4352 = 34816$ B.
-- **`OManager32bitsV3NoStage`** writes directly from oaccu VGPR to
+- **`OManager32bitsV4Gen1SwNoStage`** writes directly from oaccu VGPR to
   VRAM. No bounce LDS. Used when the LDS budget at epilogue time is
   contended by a downstream split-O reduction step that needs the
   same LDS region.
@@ -1785,7 +1785,7 @@ trade is favorable.
 
 ### 11.6 The vmcnt(0) gate removal (commit `15a8736c4`)
 
-A prior version of `OManager32bitsV3` (and `V3NoStage`) issued a
+A prior version of `OManager32bitsV4Gen1Swizzle` (and `V3NoStage`) issued a
 `__builtin_amdgcn_s_waitcnt(0)` before each call's `buffer_store_dwordx4`.
 At `b=33, c=63333` this added ~30k cycles per epilogue invocation —
 ~10 µs of pure stall. The gate was removed (the surrounding wait
@@ -2019,7 +2019,7 @@ ISA inspection + careful diff are good at; raw "add a printf" is not.
 |---|---|
 | `csrc/kernels/mla/hk_v40_decode_fwd.cu` | Host wrapper. Dispatches to the kernel for the wired `(H=128, mtp=1)` case on gfx950. |
 | `csrc/kernels/mla/hk/mi35x_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1.cuh` | Main kernel: persistent work loop, `mla_main` lambda + dispatch ladder, pinned-VGPR & LDS layout, QK Phase A/B fusion, softmax, PV gemm + oaccu rescale, epilogue. |
-| `csrc/kernels/mla/hk/hk_mla_v40_buffer_managers_gen1.cuh` | V40-only managers: `QManager8to16bitsV1`, `KvManager8to16bitsV1`, `OManager16bitsV3`, `OManager32bitsV3`, `OManager32bitsV3NoStage`. Also the sb8 perm helpers (`sb8_perm_col_elems`, `sb8_inv_perm_col_elems`). |
+| `csrc/kernels/mla/hk/hk_mla_v40_buffer_managers_gen1.cuh` | V40-only managers: `QManager8to16bitsV1`, `KvManager8to16bitsV1`, `OManager16bitsV4Gen1Swizzle`, `OManager32bitsV4Gen1Swizzle`, `OManager32bitsV4Gen1SwNoStage`. Also the sb8 perm helpers (`sb8_perm_col_elems`, `sb8_inv_perm_col_elems`). |
 | `csrc/kernels/mla/hk/hk_mla_softmax.cuh` | Online-softmax helpers: `softmax_scale_p`, `softmax_p0`, `softmax_p1`, `softmax_p1_16`. Free functions, no class state. |
 | `csrc/kernels/mla/hk/hk_mla_utils.cuh` | Shared with V32: traits (`HkMlaV40DecodeFwdTraits`, `HkMlaV32DecodeFwdTraits`), enums (`PvGemmEpilogueType`), and helpers under `namespace hk_mla`: `e8m0_to_f32`, `encode_s_waitcnt`, `max_8`, `sum_8`, `warp_reduce`, `cvt_scalef32_pk_bf16_fp8_pinned`, `pack_2f32_to_bf16_pair_pinned`, `float_2_bf16_pair`, `get_kv_ld_row`. |
 
