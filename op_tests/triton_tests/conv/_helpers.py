@@ -32,7 +32,6 @@ Public surface:
     and the 12-shape edge-case list respectively.
 """
 
-from __future__ import annotations
 import random
 import traceback
 from collections import namedtuple

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from __future__ import annotations
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
@@ -140,7 +139,7 @@ def _conv2d_general_kernel(
         )
         x_tile = tl.load(X_ptrs, mask=x_mask, other=0.0)
 
-        acc += tl.dot(x_tile, w_tile, out_dtype=tl.float32)
+        acc = tl.dot(x_tile, w_tile, acc=acc)
 
     if HAS_BIAS:
         b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0)
@@ -166,8 +165,5 @@ if CONV_AUTOTUNE_ENABLED:
     _conv2d_general_kernel = triton.autotune(
         configs=AUTOTUNE_GENERAL_CONFIGS,
         key=["M_total", "K_out", "K_pad"],
-        reset_to_zero=["Y"],
-        warmup=50,
-        rep=200,
         cache_results=True,
     )(_conv2d_general_kernel)

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from __future__ import annotations
 import os
 from collections import OrderedDict
 from typing import Dict
