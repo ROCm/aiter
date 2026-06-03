@@ -150,12 +150,8 @@ def _run_gemm_a8w8_bpreshuffle_mxscale_flydsl(
 ) -> Tensor:
     from .flydsl.mxscale_gemm import (
         flydsl_mxscale_gemm,
-        is_mxscale_bpreshuffle_weight,
         mxscale_out_dtype_name,
     )
-
-    if not is_mxscale_bpreshuffle_weight(WQ):
-        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
 
     return flydsl_mxscale_gemm(
         XQ,
@@ -178,7 +174,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
     config: Optional[dict],
 ) -> Optional[Tensor]:
     kernel_name = str(config.get("kernelName", "")) if config is not None else ""
-    if _is_flydsl_mxscale8_bpreshuffle(XQ, WQ, x_scale, w_scale, kernel_name):
+    if kernel_name.startswith("flydsl_mxscale_fp8_"):
         return _run_gemm_a8w8_bpreshuffle_mxscale_flydsl(
             XQ, WQ, x_scale, w_scale, Out, kernel_name
         )
@@ -736,11 +732,6 @@ def gemm_a8w8_bpreshuffle(
         dtypes.fp8,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
     )
-    flydsl_ret = _try_gemm_a8w8_bpreshuffle_mxscale_flydsl(
-        XQ, WQ, x_scale, w_scale, Y, config
-    )
-    if flydsl_ret is not None:
-        return flydsl_ret
 
     if config is not None:
         libtype = config["libtype"]
@@ -752,7 +743,10 @@ def gemm_a8w8_bpreshuffle(
         elif libtype == "flydsl" and is_flydsl_available():
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
     try:
-        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
+        return _run_gemm_a8w8_bpreshuffle_mxscale_flydsl(
+            XQ, WQ, x_scale, w_scale, Y, None
+        )
+        # return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
     except RuntimeError as e:
         raise RuntimeError(
             f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "

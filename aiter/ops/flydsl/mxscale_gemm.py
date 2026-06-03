@@ -115,7 +115,7 @@ def _lazy_import_flydsl():
 _FIXED_CODEGEN = {
     "use_scale_opsel": False,
     "wave_specialized_tdm": True,
-    "l2_prefetch_distance": 2,
+    "l2_prefetch_distance": 0,
     "waves_per_eu": 0,
     "inst_prefetch": False,
     "expert_sched_mode": True,

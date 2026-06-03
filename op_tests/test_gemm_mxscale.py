@@ -86,7 +86,7 @@ def test_flydsl_mxscale_backend_out_tensor():
         b, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0, shuffle=False
     )
     ref = (_dequant_fp8(aq, a_s) @ _dequant_fp8(bq, b_s).t()).to(torch.bfloat16)
-    bq_prepared = shuffle_weight(bq, mxscale_data_format="fp8")
+    bq_prepared = shuffle_weight(bq)
     out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
     ret = flydsl_mxscale_gemm(
         aq,
