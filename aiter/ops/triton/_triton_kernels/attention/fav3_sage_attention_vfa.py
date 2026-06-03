@@ -26,209 +26,52 @@
 #     (b) `m_init` must not severely underestimate the true rowmax, or
 #         `exp2(qk - m_init)` overflows.
 #
-# VFA's signed-absmax estimate
-#   m_init[i] = max_j (Q[i] @ sabsmax_K[j]) * q_descale * k_descale[j]
-# meets (a) very well in practice -- on real attention payloads we measured
-# gaps of |m_init - true_max| < 1 log2 unit on average.  It does NOT meet
-# (b) exactly (~30% of rows underestimate by < 0.5 log2 unit on real data).
-# We close that gap with a small additive safety margin (in log2 units) on
-# top of `m_init` in the precompute kernel.  The hot kernel keeps
-# `qk - m_i` unclamped on purpose: a small positive shift just produces `p`
-# values slightly above 1.0, which still fit in fp8 E4M3 (max ~448 = 2^8.8)
-# and yield more accurate softmax weights than clamping at 1.  Only a row
-# whose `m_init` undershoots true rowmax by more than ~8 log2 units would
-# saturate `p` to `fp8_max` -- a bounded bias, never inf/NaN.
+# We estimate `m_init` by dotting Q against the REAL int8 K rows of a small
+# set of K blocks and taking the per-row max.  Because every evaluated block
+# contributes its true block max, the estimate is a strict lower bound on the
+# true rowmax that tightens as more blocks are added -- meeting (a) well and
+# never overestimating.  Two block-selection strategies are provided:
+#   * uniform random sampling of N blocks (``_sage_vfa_m_sampled_kernel``);
+#   * SpargeAttn-style guided top-N selection per q-block, where blocks are
+#     ranked by a cheap mean-pooled block-attention score computed outside
+#     these kernels (``_sage_vfa_m_selected_kernel``).
+# The hot kernel keeps `qk - m_i` unclamped on purpose: a small positive shift
+# just produces `p` values slightly above 1.0, which still fit in fp8 E4M3
+# (max ~448 = 2^8.8) and yield more accurate softmax weights than clamping at
+# 1.  Only a row whose `m_init` undershoots true rowmax by more than ~8 log2
+# units would saturate `p` to `fp8_max` -- a bounded bias, never inf/NaN.
 #
 # Layout:
-#   _sage_k_sabsmax_kernel    -> K_Repr[B, H_K, num_k_blocks, D]   int8 (signed)
-#   _sage_vfa_m_init_kernel   -> M_Init[B, H_Q, num_q_blocks, BLOCK_M] fp32
-#   sage_fwd_vfa              -> single tight loop, frozen m, fp32 acc
+#   _sage_vfa_m_sampled_kernel  -> M_Init[B, H_Q, num_q_blocks, BLOCK_M] fp32
+#   _sage_vfa_m_selected_kernel -> M_Init[B, H_Q, num_q_blocks, BLOCK_M] fp32
+#   sage_fwd_vfa                -> single tight loop, frozen m, fp32 acc
 
 import triton
 import triton.language as tl
 
 
 # ----------------------------------------------------------------------------
-# K-block signed-absmax kernel.
+# Sampled-block m-init kernel: per-row max over N randomly sampled K blocks.
 #
-# For each (block, dim), picks the K element with maximum |K| and preserves
-# its sign.  Storing the sign lets the m-init dot exploit dim-wise sign
-# alignment between Q and K, which is what makes the bound tight on real
-# attention payloads where Q and K co-vary.
+# Instead of the signed-absmax composite (which mixes max-magnitude elements
+# from different sequence positions and so suffers heavy sign-cancellation
+# bias) this estimator dots Q against REAL K rows from N_SAMPLES randomly
+# chosen blocks and takes the per-row max.  Every sampled block contributes
+# its true block max, so the estimate is a lower bound on the true rowmax that
+# tightens monotonically as N_SAMPLES grows -- no sign cancellation, no safety
+# margin needed.  Cost is O(N_q * N_SAMPLES * BLOCK_N * D), i.e. the full QK
+# pass scaled down by N_SAMPLES / num_k_blocks.
+#
+# ``Block_Idx`` is a host-provided int32 [N_SAMPLES] tensor of distinct K
+# block indices in [0, num_k_blocks), shared across all programs.
 # ----------------------------------------------------------------------------
 @triton.jit
-def _sage_k_sabsmax_kernel(
-    K_Int8,             # [B, S, H_K, D] (bshd) or [B, H_K, S, D] (bhsd) int8
-    K_Repr,             # [B, H_K, num_k_blocks, D] int8
-    stride_kz, stride_kh, stride_kn, stride_kd,
-    stride_rz, stride_rh, stride_rblk, stride_rd,
-    SEQLEN_K,
-    BLOCK_N: tl.constexpr,
-    D: tl.constexpr,
-):
-    off_b = tl.program_id(0).to(tl.int64)
-    off_h = tl.program_id(1).to(tl.int64)
-    off_blk = tl.program_id(2).to(tl.int64)
-
-    offs_n = off_blk * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, D)
-    n_mask = offs_n < SEQLEN_K
-
-    k_ptr = (
-        K_Int8
-        + off_b * stride_kz
-        + off_h * stride_kh
-        + offs_n[:, None] * stride_kn
-        + offs_d[None, :] * stride_kd
-    )
-    # Promote to int32 to avoid -128 corner case when taking abs.
-    k = tl.load(k_ptr, mask=n_mask[:, None], other=0).to(tl.int32)
-    k_abs = tl.abs(k)
-    # Mask padding rows so they cannot win the per-dim absmax.
-    k_abs_masked = tl.where(n_mask[:, None], k_abs, -1)
-    max_abs_per_d = tl.max(k_abs_masked, axis=0)  # [D]
-
-    # Pick the signed value whose |.| equals the column max.  Ties resolve to
-    # the positive choice via tl.max (which is fine -- both have the same |.|).
-    is_max = k_abs_masked == max_abs_per_d[None, :]
-    signed = tl.where(is_max, k, 0)
-    repr_val = tl.max(signed, axis=0)
-    repr_val = tl.where(max_abs_per_d <= 0, 0, repr_val).to(tl.int8)
-
-    r_ptr = (
-        K_Repr
-        + off_b * stride_rz
-        + off_h * stride_rh
-        + off_blk * stride_rblk
-        + offs_d * stride_rd
-    )
-    tl.store(r_ptr, repr_val)
-
-
-# ----------------------------------------------------------------------------
-# m-init kernel: per-row running-max estimate.
-#
-#   m_init[i] = SAFETY + max_j  Q[i] @ sabsmax_K[j]  *  q_descale[i_blk] *
-#                                                       k_descale[j]
-#
-# `SAFETY` is a small additive bias in log2 units that absorbs the cases
-# where the sabsmax representative happens to be on the wrong side of the
-# true block max for some row.  The hot kernel also clamps `qk - m_init` to
-# <= 0 before exp2 so a leftover undershoot is bounded in its effect on the
-# softmax weights rather than producing inf/NaN.
-# ----------------------------------------------------------------------------
-@triton.jit
-def _sage_vfa_m_init_kernel(
+def _sage_vfa_m_sampled_kernel(
     Q,                  # int8 query tensor
-    Q_Descale,          # fp32 per-Q-block descale
-    K_Repr,             # int8 [B, H_K, num_k_blocks, D]  signed absmax
-    K_Descale,          # fp32 [B, H_K, num_k_blocks]
-    M_Init,             # fp32 [B, H_Q, num_q_blocks, BLOCK_M] output
-    stride_qz, stride_qh, stride_qm, stride_qd,
-    stride_qsz, stride_qsh, stride_qsblk,
-    stride_krz, stride_krh, stride_krblk, stride_krd,
-    stride_ksz, stride_ksh, stride_ksblk,
-    stride_mz, stride_mh, stride_mblk, stride_mr,
-    SEQLEN_Q,
-    NUM_K_BLOCKS,
-    SAFETY,             # fp32 additive bias in log2 units
-    HQ: tl.constexpr,
-    HK: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_K_REPR: tl.constexpr,
-    BLOCK_DMODEL_QK: tl.constexpr,
-    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
-):
-    start_m = tl.program_id(0).to(tl.int64)
-    off_h_q = tl.program_id(1).to(tl.int64)
-    off_z = tl.program_id(2).to(tl.int64)
-
-    GROUP_SIZE: tl.constexpr = HQ // HK
-    if GROUP_SIZE != 1:
-        off_h_k = off_h_q // GROUP_SIZE
-    else:
-        off_h_k = off_h_q
-
-    PADDED_HEAD_QK: tl.constexpr = ACTUAL_BLOCK_DMODEL_QK != BLOCK_DMODEL_QK
-
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_DMODEL_QK)
-
-    q_ptrs = (
-        Q
-        + off_z * stride_qz
-        + off_h_q * stride_qh
-        + offs_m[:, None] * stride_qm
-        + offs_d[None, :] * stride_qd
-    )
-    q_descale_ptr = (
-        Q_Descale + off_z * stride_qsz + off_h_q * stride_qsh + start_m * stride_qsblk
-    )
-    k_repr_off = K_Repr + off_z * stride_krz + off_h_k * stride_krh
-    k_descale_off = K_Descale + off_z * stride_ksz + off_h_k * stride_ksh
-
-    q_mask = offs_m[:, None] < SEQLEN_Q
-    if PADDED_HEAD_QK:
-        q_mask = q_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL_QK)
-    q = tl.load(q_ptrs, mask=q_mask, other=0)
-    q_descale = tl.load(q_descale_ptr)
-
-    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-
-    for j_start in range(0, NUM_K_BLOCKS, BLOCK_K_REPR):
-        j_offs = j_start + tl.arange(0, BLOCK_K_REPR)
-        j_mask = j_offs < NUM_K_BLOCKS
-
-        kr_ptrs = (
-            k_repr_off
-            + j_offs[None, :] * stride_krblk
-            + offs_d[:, None] * stride_krd
-        )
-        if PADDED_HEAD_QK:
-            kr_load_mask = (offs_d[:, None] < ACTUAL_BLOCK_DMODEL_QK) & j_mask[None, :]
-        else:
-            kr_load_mask = tl.broadcast_to(
-                j_mask[None, :], (BLOCK_DMODEL_QK, BLOCK_K_REPR)
-            )
-        kr = tl.load(kr_ptrs, mask=kr_load_mask, other=0)
-
-        kd_ptrs = k_descale_off + j_offs * stride_ksblk
-        kd = tl.load(kd_ptrs, mask=j_mask, other=0.0)
-
-        # Signed int8 dot then per-block descale.
-        approx = tl.dot(q, kr).to(tl.float32) * (q_descale * kd[None, :])
-        approx = tl.where(j_mask[None, :], approx, float("-inf"))
-        m_i = tl.maximum(m_i, tl.max(approx, axis=1))
-
-    # Additive safety margin.  Mask out the -inf for empty rows.
-    valid = m_i != float("-inf")
-    m_i = tl.where(valid, m_i + SAFETY, m_i)
-
-    m_ptrs = (
-        M_Init
-        + off_z * stride_mz
-        + off_h_q * stride_mh
-        + start_m * stride_mblk
-        + tl.arange(0, BLOCK_M) * stride_mr
-    )
-    tl.store(m_ptrs, m_i, mask=offs_m < SEQLEN_Q)
-
-
-# ----------------------------------------------------------------------------
-# Exact m-init kernel: per-row TRUE running max.
-#
-# Mirrors the hot-loop QK pipe but only emits the per-row max (no PV, no
-# softmax, no acc).  Use as a ground-truth m_init for accuracy debugging
-# or whenever the signed-absmax estimate is too sloppy for the workload
-# (e.g. uncorrelated Q/K).  Cost is one full QK pass: O(N_q * N_k * D)
-# int8 MFMA ops -- roughly half the work of the hot kernel.
-# ----------------------------------------------------------------------------
-@triton.jit
-def _sage_vfa_m_exact_kernel(
-    Q,                  # int8 [B, S_q, H_Q, D]   (bshd) or [B, H_Q, S_q, D] (bhsd)
-    K,                  # int8 [B, S_k, H_K, D]   ditto
+    K,                  # int8 key tensor
     Q_Descale,          # fp32 [B, H_Q, num_q_blocks]
     K_Descale,          # fp32 [B, H_K, num_k_blocks]
+    Block_Idx,          # int32 [N_SAMPLES] sampled K-block indices
     M_Init,             # fp32 [B, H_Q, num_q_blocks, BLOCK_M] output
     stride_qz, stride_qh, stride_qm, stride_qd,
     stride_kz, stride_kh, stride_kn, stride_kd,
@@ -237,15 +80,13 @@ def _sage_vfa_m_exact_kernel(
     stride_mz, stride_mh, stride_mblk, stride_mr,
     SEQLEN_Q,
     SEQLEN_K,
-    NUM_K_BLOCKS: tl.constexpr,
-    N_EXTRA_TOKENS: tl.constexpr,
-    SAFETY,
     HQ: tl.constexpr,
     HK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL_QK: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    N_SAMPLES: tl.constexpr,
 ):
     start_m = tl.program_id(0).to(tl.int64)
     off_h_q = tl.program_id(1).to(tl.int64)
@@ -258,7 +99,6 @@ def _sage_vfa_m_exact_kernel(
         off_h_k = off_h_q
 
     PADDED_HEAD_QK: tl.constexpr = ACTUAL_BLOCK_DMODEL_QK != BLOCK_DMODEL_QK
-    LAST_BLOCK_HAS_TAIL: tl.constexpr = N_EXTRA_TOKENS > 0  # noqa: F841
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -281,47 +121,135 @@ def _sage_vfa_m_exact_kernel(
     )
 
     k_base = K + off_z * stride_kz + off_h_k * stride_kh
-    k_base_ptrs = (
-        k_base + offs_d[:, None] * stride_kd + offs_n[None, :] * stride_kn
-    )
+    k_base_ptrs = k_base + offs_d[:, None] * stride_kd + offs_n[None, :] * stride_kn
     k_descale_off = K_Descale + off_z * stride_ksz + off_h_k * stride_ksh
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
 
-    if LAST_BLOCK_HAS_TAIL:
-        loop_end = NUM_K_BLOCKS - 1
+    for s in range(0, N_SAMPLES):
+        jb = tl.load(Block_Idx + s).to(tl.int64)
+        start_n = jb * BLOCK_N
+        k_ptrs = k_base_ptrs + start_n * stride_kn
+
+        # Mask columns past SEQLEN_K so a sampled tail block contributes only
+        # its real tokens.
+        col = start_n + offs_n
+        col_mask = col < SEQLEN_K
+        if PADDED_HEAD_QK:
+            k_mask = (offs_d[:, None] < ACTUAL_BLOCK_DMODEL_QK) & col_mask[None, :]
+        else:
+            k_mask = tl.broadcast_to(col_mask[None, :], (BLOCK_DMODEL_QK, BLOCK_N))
+        k = tl.load(k_ptrs, mask=k_mask, other=0)
+
+        k_descale = tl.load(k_descale_off + jb * stride_ksblk)
+        qk = tl.dot(q, k).to(tl.float32) * (q_descale * k_descale)
+        qk = tl.where(col_mask[None, :], qk, float("-inf"))
+        m_i = tl.maximum(m_i, tl.max(qk, axis=1))
+
+    m_ptrs = (
+        M_Init
+        + off_z * stride_mz
+        + off_h_q * stride_mh
+        + start_m * stride_mblk
+        + tl.arange(0, BLOCK_M) * stride_mr
+    )
+    tl.store(m_ptrs, m_i, mask=offs_m < SEQLEN_Q)
+
+
+# ----------------------------------------------------------------------------
+# Selected-block m-init kernel: per-row max over a per-(q-block) index set.
+#
+# Like the sampled kernel but ``Block_Idx`` is a 4D tensor
+# [B, H_Q, num_q_blocks, N_SAMPLES] so each q-block evaluates its own chosen
+# blocks (proxy top-k + stratified residual).  Real K rows are used, so the
+# estimate is a lower bound on the true rowmax; no safety margin.
+# ----------------------------------------------------------------------------
+@triton.jit
+def _sage_vfa_m_selected_kernel(
+    Q,                  # int8 query tensor
+    K,                  # int8 key tensor
+    Q_Descale,          # fp32 [B, H_Q, num_q_blocks]
+    K_Descale,          # fp32 [B, H_K, num_k_blocks]
+    Block_Idx,          # int32 [B, H_Q, num_q_blocks, N_SAMPLES]
+    M_Init,             # fp32 [B, H_Q, num_q_blocks, BLOCK_M] output
+    stride_qz, stride_qh, stride_qm, stride_qd,
+    stride_kz, stride_kh, stride_kn, stride_kd,
+    stride_qsz, stride_qsh, stride_qsblk,
+    stride_ksz, stride_ksh, stride_ksblk,
+    stride_biz, stride_bih, stride_biqblk, stride_bis,
+    stride_mz, stride_mh, stride_mblk, stride_mr,
+    SEQLEN_Q,
+    SEQLEN_K,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    N_SAMPLES: tl.constexpr,
+):
+    start_m = tl.program_id(0).to(tl.int64)
+    off_h_q = tl.program_id(1).to(tl.int64)
+    off_z = tl.program_id(2).to(tl.int64)
+
+    GROUP_SIZE: tl.constexpr = HQ // HK
+    if GROUP_SIZE != 1:
+        off_h_k = off_h_q // GROUP_SIZE
     else:
-        loop_end = NUM_K_BLOCKS
+        off_h_k = off_h_q
 
-    for j in range(0, loop_end):
-        start_n = (j * BLOCK_N).to(tl.int64)
+    PADDED_HEAD_QK: tl.constexpr = ACTUAL_BLOCK_DMODEL_QK != BLOCK_DMODEL_QK
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_DMODEL_QK)
+
+    q_ptrs = (
+        Q
+        + off_z * stride_qz
+        + off_h_q * stride_qh
+        + offs_m[:, None] * stride_qm
+        + offs_d[None, :] * stride_qd
+    )
+    q_mask = offs_m[:, None] < SEQLEN_Q
+    if PADDED_HEAD_QK:
+        q_mask = q_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL_QK)
+    q = tl.load(q_ptrs, mask=q_mask, other=0)
+
+    q_descale = tl.load(
+        Q_Descale + off_z * stride_qsz + off_h_q * stride_qsh + start_m * stride_qsblk
+    )
+
+    k_base = K + off_z * stride_kz + off_h_k * stride_kh
+    k_base_ptrs = k_base + offs_d[:, None] * stride_kd + offs_n[None, :] * stride_kn
+    k_descale_off = K_Descale + off_z * stride_ksz + off_h_k * stride_ksh
+
+    bi_off = (
+        Block_Idx
+        + off_z * stride_biz
+        + off_h_q * stride_bih
+        + start_m * stride_biqblk
+    )
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+
+    for s in range(0, N_SAMPLES):
+        jb = tl.load(bi_off + s * stride_bis).to(tl.int64)
+        start_n = jb * BLOCK_N
         k_ptrs = k_base_ptrs + start_n * stride_kn
-        if PADDED_HEAD_QK:
-            k = tl.load(k_ptrs, mask=offs_d[:, None] < ACTUAL_BLOCK_DMODEL_QK, other=0)
-        else:
-            k = tl.load(k_ptrs)
-        k_descale = tl.load(k_descale_off + j * stride_ksblk)
-        qk = tl.dot(q, k).to(tl.float32) * (q_descale * k_descale)
-        m_i = tl.maximum(m_i, tl.max(qk, axis=1))
 
-    if LAST_BLOCK_HAS_TAIL:
-        j_last = NUM_K_BLOCKS - 1
-        start_n = (j_last * BLOCK_N).to(tl.int64)
-        k_ptrs = k_base_ptrs + start_n * stride_kn
+        col = start_n + offs_n
+        col_mask = col < SEQLEN_K
         if PADDED_HEAD_QK:
-            k = tl.load(k_ptrs, mask=offs_d[:, None] < ACTUAL_BLOCK_DMODEL_QK, other=0)
+            k_mask = (offs_d[:, None] < ACTUAL_BLOCK_DMODEL_QK) & col_mask[None, :]
         else:
-            k = tl.load(k_ptrs)
-        k_descale = tl.load(k_descale_off + j_last * stride_ksblk)
-        qk = tl.dot(q, k).to(tl.float32) * (q_descale * k_descale)
-        # Mask invalid columns in tail block.
-        boundary = tl.full([BLOCK_N], N_EXTRA_TOKENS, dtype=tl.int32)
-        valid_n = offs_n < boundary
-        qk = tl.where(valid_n[None, :], qk, float("-inf"))
-        m_i = tl.maximum(m_i, tl.max(qk, axis=1))
+            k_mask = tl.broadcast_to(col_mask[None, :], (BLOCK_DMODEL_QK, BLOCK_N))
+        k = tl.load(k_ptrs, mask=k_mask, other=0)
 
-    valid = m_i != float("-inf")
-    m_i = tl.where(valid, m_i + SAFETY, m_i)
+        k_descale = tl.load(k_descale_off + jb * stride_ksblk)
+        qk = tl.dot(q, k).to(tl.float32) * (q_descale * k_descale)
+        qk = tl.where(col_mask[None, :], qk, float("-inf"))
+        m_i = tl.maximum(m_i, tl.max(qk, axis=1))
 
     m_ptrs = (
         M_Init

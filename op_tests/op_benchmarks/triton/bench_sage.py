@@ -27,17 +27,25 @@ from aiter.ops.triton.attention.fav3_sage import (
     get_sage_fwd_configs,
 )
 from aiter.ops.triton.attention.fav3_sage_vfa import (
-    compute_k_repr_sabsmax,
-    compute_m_exact,
-    compute_m_init,
+    compute_m_proxy_topn,
+    compute_m_sampled,
     fav3_sage_vfa_func,
     fav3_sage_vfa_wrapper_func,
 )
 
-# When True the VFA kernel uses the true per-row max (full QK pass) as
-# ``m_init`` instead of the cheap signed-absmax estimate.  Matches `sage_fp8`
-# accuracy on uncorrelated Q/K at the cost of a second QK pass.
-EXACT_M = True
+# VFA m_init mode selection:
+#   GUIDED_SAMPLE=True (default) -> per-(q-block) max over the top-N_SAMPLE_BLOCKS
+#                          K blocks chosen by a SpargeAttn mean-pooled
+#                          block-score, evaluated with real K rows.
+#   GUIDED_SAMPLE=False -> per-row max over N_SAMPLE_BLOCKS uniformly random K
+#                          blocks.
+def _env_flag(name, default):
+    v = os.environ.get(name)
+    return default if v is None else v.lower() in ("1", "true", "yes", "on")
+
+
+GUIDED_SAMPLE = _env_flag("VFA_GUIDED_SAMPLE", True)
+N_SAMPLE_BLOCKS = int(os.environ.get("VFA_N_SAMPLE_BLOCKS", "16"))
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_func,
     fav3_sage_mxfp4_wrapper,
@@ -262,7 +270,8 @@ def _make_sage_fp8_vfa_runner(
             softmax_scale=softmax_scale,
             return_lse=False,
             layout=args.layout,
-            exact_m_init=EXACT_M,
+            n_sample_blocks=N_SAMPLE_BLOCKS,
+            guided_sample=GUIDED_SAMPLE,
         )
 
     cfg = get_sage_fwd_configs()
@@ -282,16 +291,16 @@ def _make_sage_fp8_vfa_runner(
         layout=args.layout,
     )
 
-    if EXACT_M:
-        m_init = compute_m_exact(
-            q_int8, k_int8, q_scale, k_scale,
-            BLKQ=BLKQ, BLKK=BLKK, layout=args.layout, safety_log2=0.0,
+    if GUIDED_SAMPLE:
+        m_init = compute_m_proxy_topn(
+            q, k, q_int8, k_int8, q_scale, k_scale,
+            BLKQ=BLKQ, BLKK=BLKK, layout=args.layout,
+            n_blocks=N_SAMPLE_BLOCKS,
         )
     else:
-        k_repr = compute_k_repr_sabsmax(k_int8, BLKK=BLKK, layout=args.layout)
-        m_init = compute_m_init(
-            q_int8, q_scale, k_repr, k_scale,
-            BLKQ=BLKQ, layout=args.layout,
+        m_init = compute_m_sampled(
+            q_int8, k_int8, q_scale, k_scale,
+            BLKQ=BLKQ, BLKK=BLKK, layout=args.layout, n_blocks=N_SAMPLE_BLOCKS,
         )
 
     return lambda: fav3_sage_vfa_func(

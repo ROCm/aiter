@@ -15,138 +15,15 @@ import triton
 import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_vfa import (
-    _sage_k_sabsmax_kernel,
-    _sage_vfa_m_exact_kernel,
-    _sage_vfa_m_init_kernel,
+    _sage_vfa_m_sampled_kernel,
+    _sage_vfa_m_selected_kernel,
     sage_fwd_vfa,
 )
 from aiter.ops.triton.attention.fav3_sage import get_sage_fwd_configs
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant
 
 
-# Additive safety bias in log2 units applied to the per-row m_init estimate.
-# Chosen so that the typical sabsmax under-shoot on real workloads
-# (|m_init - true_max| <= ~0.5 log2 units on the captured payloads we tested)
-# is fully absorbed.  +2 log2 units = 4x scaling: the maximum p value drops
-# from 1.0 to 0.25, comfortably within fp8 E4M3 dynamic range while still
-# leaving headroom for outlier rows whose sabsmax bound is off by ~1.5 log2
-# units.  The hot kernel additionally clamps `qk - m_init` to <= 0 before
-# exp2 so anything beyond this margin can only bias a few weights up to
-# `p == 1`, never inf/NaN.
-_M_INIT_SAFETY_LOG2 = 1.0
-
-
-def compute_k_repr_sabsmax(
-    k_int8: torch.Tensor,
-    BLKK: int,
-    layout: str = "bshd",
-) -> torch.Tensor:
-    """Compute the signed absmax representative per K block, per feature dim.
-
-    Returns ``[batch, num_kv_heads, num_k_blocks, head_dim]`` int8.  For each
-    K block and dim, holds the K element with the largest absolute value
-    along the sequence axis, preserving its sign so the m-init dot can
-    exploit Q/K sign alignment.
-    """
-    bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
-    batch, seqlen_k, num_kv_heads, head_dim = map_dims(k_int8.shape, bshd_map)
-    num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
-
-    k_repr = torch.empty(
-        (batch, num_kv_heads, num_k_blocks, head_dim),
-        dtype=torch.int8,
-        device=k_int8.device,
-    )
-
-    stride_kz, stride_kn, stride_kh, stride_kd = map_dims(k_int8.stride(), bshd_map)
-    stride_rz, stride_rh, stride_rblk, stride_rd = k_repr.stride()
-
-    grid = (batch, num_kv_heads, num_k_blocks)
-    _sage_k_sabsmax_kernel[grid](
-        k_int8,
-        k_repr,
-        stride_kz, stride_kh, stride_kn, stride_kd,
-        stride_rz, stride_rh, stride_rblk, stride_rd,
-        SEQLEN_K=seqlen_k,
-        BLOCK_N=BLKK,
-        D=head_dim,
-    )
-    return k_repr
-
-
-def compute_m_init(
-    q_int8: torch.Tensor,
-    q_descale: torch.Tensor,
-    k_repr: torch.Tensor,
-    k_descale: torch.Tensor,
-    BLKQ: int,
-    layout: str = "bshd",
-    block_k_repr: int = 64,
-    safety_log2: float = _M_INIT_SAFETY_LOG2,
-) -> torch.Tensor:
-    """Per-row running-max estimate, computed in a dedicated kernel.
-
-    Returns fp32 ``[batch, num_q_heads, num_q_blocks, BLOCK_M]``.  Includes
-    an additive ``safety_log2`` margin so that the hot kernel can rely on it
-    as a near-upper-bound without rescale.
-    """
-    bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
-    batch, seqlen_q, nheads_q, head_dim = map_dims(q_int8.shape, bshd_map)
-    _, nheads_k, num_k_blocks, _ = k_repr.shape
-    num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
-
-    m_init = torch.empty(
-        (batch, nheads_q, num_q_blocks, BLKQ),
-        dtype=torch.float32,
-        device=q_int8.device,
-    )
-
-    stride_qz, stride_qm, stride_qh, stride_qd = map_dims(q_int8.stride(), bshd_map)
-    stride_qsz, stride_qsh, stride_qsblk = q_descale.stride()
-    stride_krz, stride_krh, stride_krblk, stride_krd = k_repr.stride()
-    stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
-    stride_mz, stride_mh, stride_mblk, stride_mr = m_init.stride()
-
-    # Cap BLOCK_K_REPR at next_pow2(num_k_blocks) so very small-K cases
-    # (e.g. cross-attention with K < 64*BLKK tokens) do not pay for an
-    # oversized tile that is then almost entirely masked out.  16 is the
-    # smallest tile we support (MFMA tile size constraints).
-    if block_k_repr < 16:
-        block_k_repr = 16
-    block_k_repr = 1 << (block_k_repr - 1).bit_length()
-    if num_k_blocks > 0:
-        block_k_repr = min(block_k_repr, max(16, 1 << (num_k_blocks - 1).bit_length()))
-
-    padded_d_model_qk = max(16, 1 << (head_dim - 1).bit_length())
-
-    grid = (num_q_blocks, nheads_q, batch)
-    _sage_vfa_m_init_kernel[grid](
-        q_int8,
-        q_descale,
-        k_repr,
-        k_descale,
-        m_init,
-        stride_qz, stride_qh, stride_qm, stride_qd,
-        stride_qsz, stride_qsh, stride_qsblk,
-        stride_krz, stride_krh, stride_krblk, stride_krd,
-        stride_ksz, stride_ksh, stride_ksblk,
-        stride_mz, stride_mh, stride_mblk, stride_mr,
-        SEQLEN_Q=seqlen_q,
-        NUM_K_BLOCKS=num_k_blocks,
-        SAFETY=safety_log2,
-        HQ=nheads_q,
-        HK=nheads_k,
-        BLOCK_M=BLKQ,
-        BLOCK_K_REPR=block_k_repr,
-        BLOCK_DMODEL_QK=padded_d_model_qk,
-        ACTUAL_BLOCK_DMODEL_QK=head_dim,
-        num_warps=4,
-        num_stages=2,
-    )
-    return m_init
-
-
-def compute_m_exact(
+def compute_m_sampled(
     q_int8: torch.Tensor,
     k_int8: torch.Tensor,
     q_descale: torch.Tensor,
@@ -154,20 +31,33 @@ def compute_m_exact(
     BLKQ: int,
     BLKK: int,
     layout: str = "bshd",
-    safety_log2: float = 0.0,
+    n_blocks: int = 8,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
-    """Per-row TRUE running-max, computed by a full QK pass.
+    """Per-row max over ``n_blocks`` randomly sampled K blocks.
 
-    Same output layout as :func:`compute_m_init`.  Expensive (O(N_q*N_k*D)
-    int8 MFMA) -- use as a correctness ceiling or whenever the signed-absmax
-    estimate is too sloppy (uncorrelated Q/K).
+    Dots Q against the real int8 K rows of ``n_blocks`` distinct, randomly
+    chosen K blocks and takes the per-row max.  Because it uses coherent K
+    rows the estimate is a lower bound on the true rowmax that tightens as
+    ``n_blocks`` grows.  Cost scales as ``n_blocks / num_k_blocks`` of a full
+    QK pass.
+
+    Returns fp32 ``[batch, num_q_heads, num_q_blocks, BLOCK_M]``.  No safety
+    margin.
     """
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
     batch, seqlen_q, nheads_q, head_dim = map_dims(q_int8.shape, bshd_map)
     _, seqlen_k, nheads_k, _ = map_dims(k_int8.shape, bshd_map)
     num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
     num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
-    n_extra_tokens = seqlen_k % BLKK
+
+    n = max(1, min(n_blocks, num_k_blocks))
+    if n >= num_k_blocks:
+        block_idx = torch.arange(num_k_blocks, device=q_int8.device, dtype=torch.int32)
+    else:
+        # Sample distinct blocks without replacement; sort for K-load locality.
+        perm = torch.randperm(num_k_blocks, generator=generator, device=q_int8.device)
+        block_idx = perm[:n].sort().values.to(torch.int32)
 
     m_init = torch.empty(
         (batch, nheads_q, num_q_blocks, BLKQ),
@@ -184,9 +74,10 @@ def compute_m_exact(
     padded_d_model_qk = max(16, 1 << (head_dim - 1).bit_length())
 
     grid = (num_q_blocks, nheads_q, batch)
-    _sage_vfa_m_exact_kernel[grid](
+    _sage_vfa_m_sampled_kernel[grid](
         q_int8, k_int8,
         q_descale, k_descale,
+        block_idx,
         m_init,
         stride_qz, stride_qh, stride_qm, stride_qd,
         stride_kz, stride_kh, stride_kn, stride_kd,
@@ -195,15 +86,145 @@ def compute_m_exact(
         stride_mz, stride_mh, stride_mblk, stride_mr,
         SEQLEN_Q=seqlen_q,
         SEQLEN_K=seqlen_k,
-        NUM_K_BLOCKS=num_k_blocks,
-        N_EXTRA_TOKENS=n_extra_tokens,
-        SAFETY=safety_log2,
         HQ=nheads_q,
         HK=nheads_k,
         BLOCK_M=BLKQ,
         BLOCK_N=BLKK,
         BLOCK_DMODEL_QK=padded_d_model_qk,
         ACTUAL_BLOCK_DMODEL_QK=head_dim,
+        N_SAMPLES=n,
+        num_warps=4,
+        num_stages=2,
+    )
+    return m_init
+
+
+def _pool_blocks_mean(
+    x: torch.Tensor,
+    BLK: int,
+    layout: str,
+) -> torch.Tensor:
+    """Mean-pooled block representatives.
+
+    Returns fp32 ``[batch, nheads, num_blocks, head_dim]`` -- the per-block
+    token mean of ``x``.
+    """
+    bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+    batch, seqlen, nheads, head_dim = map_dims(x.shape, bshd_map)
+    num_blocks = (seqlen + BLK - 1) // BLK
+
+    # Logical [batch, nheads, seqlen, head_dim] view regardless of layout.
+    xv = (x if layout == "bhsd" else x.permute(0, 2, 1, 3)).to(torch.float32)
+    pad = num_blocks * BLK - seqlen
+    if pad:
+        xv = torch.nn.functional.pad(xv, (0, 0, 0, pad))
+    xb = xv.reshape(batch, nheads, num_blocks, BLK, head_dim)
+
+    counts = torch.full((num_blocks,), float(BLK), device=x.device)
+    if pad:
+        counts[-1] = BLK - pad
+    return xb.sum(dim=3) / counts[None, None, :, None]
+
+
+def _compute_pooled_scores(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    BLKQ: int,
+    BLKK: int,
+    layout: str,
+) -> torch.Tensor:
+    """SpargeAttn-style block-attention estimate used to rank candidate K blocks.
+
+    Mean-pools Q and K into per-block representatives and forms the block-level
+    score ``pooled_q @ pooled_k^T * head_dim**-0.5``.  Operates on the original
+    (pre-quant) float Q/K, which keeps the estimate a genuine block-attention
+    proxy.
+
+    Returns fp32 ``[batch, nheads_q, num_q_blocks, num_k_blocks]``.
+    """
+    pooled_q = _pool_blocks_mean(q, BLKQ, layout)
+    pooled_k = _pool_blocks_mean(k, BLKK, layout)
+
+    nheads_q, nheads_k = pooled_q.shape[1], pooled_k.shape[1]
+    if nheads_q != nheads_k:
+        pooled_k = pooled_k.repeat_interleave(nheads_q // nheads_k, dim=1)
+
+    head_dim = pooled_q.shape[-1]
+    return torch.matmul(pooled_q, pooled_k.transpose(-1, -2)) * (head_dim ** -0.5)
+
+
+def compute_m_proxy_topn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_int8: torch.Tensor,
+    k_int8: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    BLKQ: int,
+    BLKK: int,
+    layout: str = "bshd",
+    n_blocks: int = 8,
+) -> torch.Tensor:
+    """Guided per-row max over the top-``n_blocks`` pooled-score K blocks.
+
+    Ranks candidate K blocks with a SpargeAttn-style mean-pooled block-attention
+    estimate (see :func:`_compute_pooled_scores`) and evaluates the per-(q-block)
+    top-``n_blocks`` of them exactly.  Only the proposal stage is approximate:
+    the selected blocks are evaluated with REAL K rows, so the estimate is a
+    lower bound on the true rowmax with far smaller gap than uniform sampling at
+    the same ``n_blocks``.  No safety margin.
+
+    The proposal pools the original (pre-quant) float ``q``/``k`` into per-block
+    means and forms ``pooled_q @ pooled_k^T``; ``q_int8``/``k_int8`` are used
+    only for the exact selected-block evaluation.
+    """
+    bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+    batch, seqlen_q, nheads_q, head_dim = map_dims(q_int8.shape, bshd_map)
+    _, seqlen_k, nheads_k, _ = map_dims(k_int8.shape, bshd_map)
+    num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
+    num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
+
+    n = max(1, min(n_blocks, num_k_blocks))
+
+    score = _compute_pooled_scores(q, k, BLKQ=BLKQ, BLKK=BLKK, layout=layout)
+    block_idx = score.topk(n, dim=-1).indices.to(torch.int32).contiguous()
+
+    m_init = torch.empty(
+        (batch, nheads_q, num_q_blocks, BLKQ),
+        dtype=torch.float32,
+        device=q_int8.device,
+    )
+
+    stride_qz, stride_qm, stride_qh, stride_qd = map_dims(q_int8.stride(), bshd_map)
+    stride_kz, stride_kn, stride_kh, stride_kd = map_dims(k_int8.stride(), bshd_map)
+    stride_qsz, stride_qsh, stride_qsblk = q_descale.stride()
+    stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
+    stride_biz, stride_bih, stride_biqblk, stride_bis = block_idx.stride()
+    stride_mz, stride_mh, stride_mblk, stride_mr = m_init.stride()
+
+    padded_d_model_qk = max(16, 1 << (head_dim - 1).bit_length())
+
+    grid = (num_q_blocks, nheads_q, batch)
+    _sage_vfa_m_selected_kernel[grid](
+        q_int8, k_int8,
+        q_descale, k_descale,
+        block_idx,
+        m_init,
+        stride_qz, stride_qh, stride_qm, stride_qd,
+        stride_kz, stride_kh, stride_kn, stride_kd,
+        stride_qsz, stride_qsh, stride_qsblk,
+        stride_ksz, stride_ksh, stride_ksblk,
+        stride_biz, stride_bih, stride_biqblk, stride_bis,
+        stride_mz, stride_mh, stride_mblk, stride_mr,
+        SEQLEN_Q=seqlen_q,
+        SEQLEN_K=seqlen_k,
+        HQ=nheads_q,
+        HK=nheads_k,
+        BLOCK_M=BLKQ,
+        BLOCK_N=BLKK,
+        BLOCK_DMODEL_QK=padded_d_model_qk,
+        ACTUAL_BLOCK_DMODEL_QK=head_dim,
+        N_SAMPLES=block_idx.shape[-1],
         num_warps=4,
         num_stages=2,
     )
@@ -228,9 +249,8 @@ def fav3_sage_vfa_func(
     Dense, non-causal, no-sliding-window, no-block-sparse path only.  Inputs
     follow the same quantization protocol as :func:`fav3_sage_func`; ``m_init``
     must be a precomputed per-row running-max estimate (see
-    :func:`compute_m_init` for the cheap signed-absmax estimator and
-    :func:`compute_m_exact` for the true per-row max).  Any additive safety
-    margin (in log2 units) must already be baked into ``m_init``.
+    :func:`compute_m_proxy_topn` for the guided pooled-score estimator and
+    :func:`compute_m_sampled` for the uniform-sampling estimator).
     """
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
@@ -342,19 +362,18 @@ def fav3_sage_vfa_wrapper_func(
     return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
-    exact_m_init: bool = False,
-    safety_log2: Optional[float] = None,
+    n_sample_blocks: int = 16,
+    guided_sample: bool = True,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
-    """High-precision API that handles quantization, ``k_repr`` and ``m_init``.
+    """High-precision API that handles quantization and ``m_init``.
 
-    Set ``exact_m_init=True`` to use the true per-row max (full QK pass) as
-    ``m_init`` instead of the signed-absmax estimate.  Matches `sage_fp8`
-    accuracy on uncorrelated Q/K at the cost of a second QK pass.
-
-    ``safety_log2`` is the additive bias (log2 units) baked into ``m_init``.
-    When unset it defaults to :data:`_M_INIT_SAFETY_LOG2` for the signed-absmax
-    estimator (where it absorbs estimator under-shoot) and to 0.0 in exact mode
-    (where there is nothing to absorb).
+    ``m_init`` is always estimated from ``n_sample_blocks`` K blocks evaluated
+    with real K rows (a lower bound on the true per-row max; no safety margin):
+      * ``guided_sample=True`` (default) -> the top-``n_sample_blocks`` blocks
+        per q-block ranked by a SpargeAttn mean-pooled block-score.
+      * ``guided_sample=False``          -> ``n_sample_blocks`` uniformly random
+        K blocks.
     """
     assert q.dtype in [torch.float16, torch.bfloat16, torch.float32]
     assert k.dtype in [torch.float16, torch.bfloat16, torch.float32]
@@ -371,9 +390,6 @@ def fav3_sage_vfa_wrapper_func(
     fp8_dtype = aiter.dtypes.fp8
     fp8_max = torch.finfo(fp8_dtype).max
 
-    if safety_log2 is None:
-        safety_log2 = 0.0 if exact_m_init else _M_INIT_SAFETY_LOG2
-
     q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
         q, k, v,
         fp8_dtype, fp8_max,
@@ -383,16 +399,17 @@ def fav3_sage_vfa_wrapper_func(
         layout=layout,
     )
 
-    if exact_m_init:
-        m_init = compute_m_exact(
-            q_int8, k_int8, q_descale, k_descale,
-            BLKQ=BLKQ, BLKK=BLKK, layout=layout, safety_log2=safety_log2,
+    if guided_sample:
+        m_init = compute_m_proxy_topn(
+            q, k, q_int8, k_int8, q_descale, k_descale,
+            BLKQ=BLKQ, BLKK=BLKK, layout=layout,
+            n_blocks=n_sample_blocks,
         )
     else:
-        k_repr = compute_k_repr_sabsmax(k_int8, BLKK=BLKK, layout=layout)
-        m_init = compute_m_init(
-            q_int8, q_descale, k_repr, k_descale,
-            BLKQ=BLKQ, layout=layout, safety_log2=safety_log2,
+        m_init = compute_m_sampled(
+            q_int8, k_int8, q_descale, k_descale,
+            BLKQ=BLKQ, BLKK=BLKK, layout=layout,
+            n_blocks=n_sample_blocks, generator=generator,
         )
 
     out, lse = fav3_sage_vfa_func(
