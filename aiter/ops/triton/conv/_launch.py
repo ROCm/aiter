@@ -39,15 +39,6 @@ from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
 )
 
 
-def _torch_dtype_to_tl(dtype):
-    """Map torch dtype to triton dtype for constexpr params."""
-    if dtype == torch.float16:
-        return tl.float16
-    elif dtype == torch.bfloat16:
-        return tl.bfloat16
-    raise ValueError(f"Unsupported dtype: {dtype}")
-
-
 def _select_3x3_method(N, C, H, W, K_out, stride, dilation):
     """Pick the best 3x3 kernel method based on shape heuristics.
 
@@ -114,7 +105,6 @@ def _launch_1x1(
         BN = meta["BLOCK_N"]
         return (triton.cdiv(N * P * Q, BM) * triton.cdiv(K_out, BN),)
 
-    ACT_MAP = {"none": 0, "relu": 1, "relu6": 2, "gelu": 3}
     bias_arg = bias_fp32 if bias_fp32 is not None else w.new_empty(1)
 
     M_total = N * P * Q
@@ -154,7 +144,7 @@ def _launch_1x1(
         pw,
         M_total,
         HAS_BIAS=1 if bias_fp32 is not None else 0,
-        ACT_TYPE=ACT_MAP.get(activation, 0),
+        ACTIVATION=activation,
         LAYOUT=layout,
         **config,
     )
@@ -191,7 +181,6 @@ def _launch_3x3_nhwc(
         BN = meta["BLOCK_N"]
         return (triton.cdiv(N * P * Q, BM) * triton.cdiv(K_out, BN),)
 
-    ACT_MAP = {"none": 0, "relu": 1, "relu6": 2, "gelu": 3}
     bias_arg = bias_fp32 if bias_fp32 is not None else w_3x3.new_empty(1)
 
     M_total = N * P * Q
@@ -234,7 +223,7 @@ def _launch_3x3_nhwc(
         dw,
         M_total,
         HAS_BIAS=1 if bias_fp32 is not None else 0,
-        ACT_TYPE=ACT_MAP.get(activation, 0),
+        ACTIVATION=activation,
         **config,
     )
 
@@ -271,7 +260,6 @@ def _launch_3x3_cblocked(
         BN = meta["BLOCK_N"]
         return (triton.cdiv(N * P * Q, BM) * triton.cdiv(K_out, BN),)
 
-    ACT_MAP = {"none": 0, "relu": 1, "relu6": 2, "gelu": 3}
     bias_arg = bias_fp32 if bias_fp32 is not None else w_3x3.new_empty(1)
 
     M_total = N * P * Q
@@ -315,7 +303,7 @@ def _launch_3x3_cblocked(
         dw,
         M_total,
         HAS_BIAS=1 if bias_fp32 is not None else 0,
-        ACT_TYPE=ACT_MAP.get(activation, 0),
+        ACTIVATION=activation,
         **config,
     )
 
@@ -358,7 +346,6 @@ def _launch_general(
         BN = meta["BLOCK_N"]
         return (triton.cdiv(N * P * Q, BM) * triton.cdiv(K_out, BN),)
 
-    ACT_MAP = {"none": 0, "relu": 1, "relu6": 2, "gelu": 3}
     bias_arg = bias_fp32 if bias_fp32 is not None else w_k.new_empty(1)
 
     M_total = N * P * Q
@@ -403,7 +390,7 @@ def _launch_general(
         dw,
         M_total,
         HAS_BIAS=1 if bias_fp32 is not None else 0,
-        ACT_TYPE=ACT_MAP.get(activation, 0),
+        ACTIVATION=activation,
         LAYOUT=layout,
         **config,
     )
@@ -473,13 +460,11 @@ def _launch_winograd_f4x3_fused(
         T,
         ph,
         pw,
-        INPUT_DTYPE=_torch_dtype_to_tl(input_dtype),
         LAYOUT=layout_int,
         **input_config,
     )
 
     # 2. Fused GEMM + output transform
-    ACT_MAP = {"none": 0, "relu": 1, "relu6": 2, "gelu": 3}
     bias_arg = bias_fp32 if bias_fp32 is not None else x.new_empty(1)
 
     def fused_grid_f4(meta):
@@ -499,7 +484,7 @@ def _launch_winograd_f4x3_fused(
         tile_W,
         T,
         HAS_BIAS=1 if bias_fp32 is not None else 0,
-        ACT_TYPE=ACT_MAP.get(activation, 0),
+        ACTIVATION=activation,
         LAYOUT=layout_int,
         **fused_config,
     )
@@ -571,7 +556,6 @@ def _launch_winograd_f4x3(
         T,
         ph,
         pw,
-        INPUT_DTYPE=_torch_dtype_to_tl(input_dtype),
         LAYOUT=layout_int,
         **input_config,
     )
@@ -593,7 +577,6 @@ def _launch_winograd_f4x3(
     )
 
     # 3. Output transform
-    ACT_MAP = {"none": 0, "relu": 1, "relu6": 2, "gelu": 3}
     bias_arg = bias_fp32 if bias_fp32 is not None else x.new_empty(1)
 
     def output_grid_f4(meta):
@@ -611,7 +594,7 @@ def _launch_winograd_f4x3(
         tile_W,
         T,
         HAS_BIAS=1 if bias_fp32 is not None else 0,
-        ACT_TYPE=ACT_MAP.get(activation, 0),
+        ACTIVATION=activation,
         LAYOUT=layout_int,
         **output_config,
     )
@@ -685,7 +668,6 @@ def _launch_winograd_f4x3_cblocked(
         ph,
         pw,
         Cb,
-        INPUT_DTYPE=_torch_dtype_to_tl(input_dtype),
         **input_config,
     )
 
@@ -704,7 +686,6 @@ def _launch_winograd_f4x3_cblocked(
         **gemm_config,
     )
 
-    ACT_MAP = {"none": 0, "relu": 1, "relu6": 2, "gelu": 3}
     bias_arg = bias_fp32 if bias_fp32 is not None else x_blocked.new_empty(1)
 
     def output_grid_f4(meta):
@@ -722,6 +703,6 @@ def _launch_winograd_f4x3_cblocked(
         tile_W,
         T,
         HAS_BIAS=1 if bias_fp32 is not None else 0,
-        ACT_TYPE=ACT_MAP.get(activation, 0),
+        ACTIVATION=activation,
         **output_config,
     )

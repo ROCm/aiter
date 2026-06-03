@@ -207,8 +207,8 @@ Tuned for RDNA4 today (configs ship as `gfx1201-*.json` and `gfx1200-*.json`).
 
 If you need to retune at runtime (e.g. while developing a new kernel), set
 `AITER_TRITON_CONV_AUTOTUNE=1` — this restores the original `@triton.autotune`
-behaviour across the candidate-config lists in
-`_triton_kernels/conv/helpers.py::AUTOTUNE_*_CONFIGS` for the current process.
+behaviour across the `AUTOTUNE_*_CONFIGS` lists defined alongside each kernel
+in `_triton_kernels/conv/conv_*.py` for the current process.
 
 ---
 

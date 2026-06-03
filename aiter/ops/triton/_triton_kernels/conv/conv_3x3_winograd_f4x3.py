@@ -4,14 +4,7 @@
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
-from .helpers import (
-    _tanh,
-    AUTOTUNE_WINO4_INPUT_CONFIGS,
-    AUTOTUNE_WINO_GEMM_CONFIGS,
-    AUTOTUNE_WINO4_OUTPUT_CONFIGS,
-    AUTOTUNE_FUSED_F4X3_CONFIGS,
-    CONV_AUTOTUNE_ENABLED,
-)
+from .helpers import _tanh, CONV_AUTOTUNE_ENABLED
 
 
 def _get_config_input(shape_key=None, M=None):
@@ -53,9 +46,9 @@ def _winograd_f4x3_input_transform_kernel(
     pad_h: tl.constexpr,
     pad_w: tl.constexpr,
     BLOCK_C: tl.constexpr,
-    INPUT_DTYPE: tl.constexpr = tl.float16,
     LAYOUT: tl.constexpr = 0,
 ):
+    INPUT_DTYPE: tl.constexpr = X.type.element_ty
     # X layout: LAYOUT=0 NCHW, LAYOUT=1 NHWC
     if LAYOUT == 0:
         stride_x_w: tl.constexpr = 1
@@ -403,8 +396,8 @@ def _winograd_f4x3_cblocked_input_transform_kernel(
     pad_w: tl.constexpr,
     Cb: tl.constexpr,
     BLOCK_C: tl.constexpr,
-    INPUT_DTYPE: tl.constexpr = tl.float16,
 ):
+    INPUT_DTYPE: tl.constexpr = X.type.element_ty
     # X layout: [N, C_blocks, H, W_in, Cb] where C_blocks = C_pad // Cb
     stride_x_w: tl.constexpr = Cb
     stride_x_h: tl.constexpr = W_in * Cb
@@ -811,7 +804,7 @@ def _winograd_f4x3_output_transform_kernel(
     T: tl.constexpr,
     BLOCK_K: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    ACT_TYPE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
     LAYOUT: tl.constexpr = 0,
 ):
     # M layout: [36, T, K_out] contiguous
@@ -964,7 +957,7 @@ def _winograd_f4x3_output_transform_kernel(
         y33 += bias
 
     # Activation
-    if ACT_TYPE == 1:
+    if ACTIVATION == "relu":
         y00 = tl.maximum(y00, 0)
         y01 = tl.maximum(y01, 0)
         y02 = tl.maximum(y02, 0)
@@ -981,7 +974,7 @@ def _winograd_f4x3_output_transform_kernel(
         y31 = tl.maximum(y31, 0)
         y32 = tl.maximum(y32, 0)
         y33 = tl.maximum(y33, 0)
-    elif ACT_TYPE == 2:
+    elif ACTIVATION == "relu6":
         y00 = tl.minimum(tl.maximum(y00, 0), 6)
         y01 = tl.minimum(tl.maximum(y01, 0), 6)
         y02 = tl.minimum(tl.maximum(y02, 0), 6)
@@ -998,7 +991,7 @@ def _winograd_f4x3_output_transform_kernel(
         y31 = tl.minimum(tl.maximum(y31, 0), 6)
         y32 = tl.minimum(tl.maximum(y32, 0), 6)
         y33 = tl.minimum(tl.maximum(y33, 0), 6)
-    elif ACT_TYPE == 3:
+    elif ACTIVATION == "gelu":
         y00 = (
             0.5 * y00 * (1.0 + _tanh(0.7978845608 * (y00 + 0.044715 * y00 * y00 * y00)))
         )
@@ -1118,7 +1111,7 @@ def _winograd_f4x3_fused_gemm_output_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_C: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    ACT_TYPE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
     LAYOUT: tl.constexpr = 0,
 ):
     """Fused GEMM + output transform for Winograd F(4x4,3x3).
@@ -1335,7 +1328,7 @@ def _winograd_f4x3_fused_gemm_output_kernel(
         y33 += b
 
     # Activation
-    if ACT_TYPE == 1:
+    if ACTIVATION == "relu":
         y00 = tl.maximum(y00, 0)
         y01 = tl.maximum(y01, 0)
         y02 = tl.maximum(y02, 0)
@@ -1352,7 +1345,7 @@ def _winograd_f4x3_fused_gemm_output_kernel(
         y31 = tl.maximum(y31, 0)
         y32 = tl.maximum(y32, 0)
         y33 = tl.maximum(y33, 0)
-    elif ACT_TYPE == 2:
+    elif ACTIVATION == "relu6":
         y00 = tl.minimum(tl.maximum(y00, 0), 6)
         y01 = tl.minimum(tl.maximum(y01, 0), 6)
         y02 = tl.minimum(tl.maximum(y02, 0), 6)
@@ -1369,7 +1362,7 @@ def _winograd_f4x3_fused_gemm_output_kernel(
         y31 = tl.minimum(tl.maximum(y31, 0), 6)
         y32 = tl.minimum(tl.maximum(y32, 0), 6)
         y33 = tl.minimum(tl.maximum(y33, 0), 6)
-    elif ACT_TYPE == 3:
+    elif ACTIVATION == "gelu":
         y00 = (
             0.5 * y00 * (1.0 + _tanh(0.7978845608 * (y00 + 0.044715 * y00 * y00 * y00)))
         )
@@ -1478,6 +1471,53 @@ def _winograd_f4x3_fused_gemm_output_kernel(
                     tl.store(ptrs_ij, y32, mask=mask_ij)
                 else:
                     tl.store(ptrs_ij, y33, mask=mask_ij)
+
+
+# Autotune search spaces (used when AITER_TRITON_CONV_AUTOTUNE=1).
+AUTOTUNE_WINO_GEMM_CONFIGS = [
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+]
+
+AUTOTUNE_WINO4_INPUT_CONFIGS = [
+    triton.Config({"BLOCK_C": 64}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_C": 32}, num_warps=4, num_stages=1),
+]
+
+AUTOTUNE_WINO4_OUTPUT_CONFIGS = [
+    triton.Config({"BLOCK_K": 64}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_K": 128}, num_warps=4, num_stages=1),
+]
+
+AUTOTUNE_FUSED_F4X3_CONFIGS = [
+    triton.Config(
+        {"BLOCK_T": 16, "BLOCK_K": 64, "BLOCK_C": 64}, num_warps=4, num_stages=1
+    ),
+    triton.Config(
+        {"BLOCK_T": 16, "BLOCK_K": 128, "BLOCK_C": 64}, num_warps=8, num_stages=1
+    ),
+    triton.Config(
+        {"BLOCK_T": 32, "BLOCK_K": 64, "BLOCK_C": 64}, num_warps=4, num_stages=1
+    ),
+]
 
 
 if CONV_AUTOTUNE_ENABLED:
