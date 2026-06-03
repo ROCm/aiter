@@ -164,6 +164,195 @@ def _sage_vfa_m_blockidx_kernel(
 
 
 # ----------------------------------------------------------------------------
+# Per-block VFA inner body: one K block's QK -> exp -> PV, with the four
+# softmax-rescale vector ops removed (see the top-of-file comment).  ``m_i`` is
+# frozen, so each block just accumulates `p = exp2(qk - m_i)` into ``l_i`` and
+# `p @ v` into ``acc``.
+#
+# ``APPLY_TAIL_MASK`` (constexpr) pushes columns past ``MAX_SEQLENS_K`` to -inf
+# (p == 0) so a ragged last K block contributes nothing; it is a no-op for
+# fully in-bounds blocks.
+# ----------------------------------------------------------------------------
+@triton.jit
+def _sage_vfa_attend_block(
+    acc, l_i, q, q_descale, m_i,
+    k_ptrs, v_ptrs, k_descale,
+    start_n,
+    offs_n, offs_d_qk, offs_d_v,
+    MAX_SEQLENS_K: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
+    PADDED_HEAD_QK: tl.constexpr,
+    PADDED_HEAD_V: tl.constexpr,
+    PRE_LOAD_V: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    APPLY_TAIL_MASK: tl.constexpr,
+):
+    if PADDED_HEAD_QK:
+        k_mask = offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK
+        k = tl.load(k_ptrs, mask=k_mask, other=0)
+    else:
+        k = tl.load(k_ptrs)
+
+    if PRE_LOAD_V:
+        if PADDED_HEAD_V:
+            v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
+            v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+        else:
+            v = tl.load(v_ptrs)
+
+    # Fused multiply-add: (dot * scale) - m_i lowers to v_fma_f32 with `-m_i`
+    # carried as a source modifier on the FMA, saving the separate multiply
+    # that used to land between the QK dot and the shift.  No clamp on the
+    # shift: rely on the margin in m_init to keep `qk - m_i` below ~8 log2
+    # units (fp8 E4M3 max ~ 2^8.8); an undershoot merely saturates p at
+    # fp8_max -- a bounded bias, never inf/NaN.
+    scale = q_descale * k_descale
+    q_shifted = tl.dot(q, k) * scale - m_i[:, None]
+    if APPLY_TAIL_MASK:
+        col = start_n + offs_n
+        q_shifted = tl.where(col[None, :] < MAX_SEQLENS_K, q_shifted, float("-inf"))
+    if USE_EXP2:
+        p = tl.math.exp2(q_shifted)
+    else:
+        p = tl.math.exp(q_shifted)
+
+    l_i = l_i + tl.sum(p, 1)
+
+    if not PRE_LOAD_V:
+        if PADDED_HEAD_V:
+            v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
+            v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+        else:
+            v = tl.load(v_ptrs)
+
+    acc = tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
+    return acc, l_i
+
+
+# ----------------------------------------------------------------------------
+# Dense loop driver: every K block in order.  Interior blocks need no column
+# mask; only the final block (when ``seqlen_k % BLOCK_N != 0``) carries the
+# tail mask.
+# ----------------------------------------------------------------------------
+@triton.jit
+def _sage_fwd_vfa_dense(
+    acc, l_i, q, q_descale, m_i,
+    k_base_ptrs, v_base_ptrs, k_descale_ptr,
+    stride_kn, stride_vk, stride_ksblk,
+    offs_n, offs_d_qk, offs_d_v,
+    MAX_SEQLENS_K: tl.constexpr,
+    NUM_K_BLOCKS: tl.constexpr,
+    N_EXTRA_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
+    PADDED_HEAD_QK: tl.constexpr,
+    PADDED_HEAD_V: tl.constexpr,
+    PRE_LOAD_V: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+):
+    LAST_BLOCK_HAS_TAIL: tl.constexpr = N_EXTRA_TOKENS > 0
+    if LAST_BLOCK_HAS_TAIL:
+        loop_end = NUM_K_BLOCKS - 1
+    else:
+        loop_end = NUM_K_BLOCKS
+
+    for j in range(0, loop_end):
+        start_n = (j * BLOCK_N).to(tl.int64)
+        k_descale = tl.load(k_descale_ptr + j * stride_ksblk)
+        acc, l_i = _sage_vfa_attend_block(
+            acc, l_i, q, q_descale, m_i,
+            k_base_ptrs + start_n * stride_kn,
+            v_base_ptrs + start_n * stride_vk,
+            k_descale,
+            start_n,
+            offs_n, offs_d_qk, offs_d_v,
+            MAX_SEQLENS_K=MAX_SEQLENS_K,
+            ACTUAL_BLOCK_DMODEL_QK=ACTUAL_BLOCK_DMODEL_QK,
+            ACTUAL_BLOCK_DMODEL_V=ACTUAL_BLOCK_DMODEL_V,
+            PADDED_HEAD_QK=PADDED_HEAD_QK,
+            PADDED_HEAD_V=PADDED_HEAD_V,
+            PRE_LOAD_V=PRE_LOAD_V,
+            USE_EXP2=USE_EXP2,
+            APPLY_TAIL_MASK=False,
+        )
+
+    if LAST_BLOCK_HAS_TAIL:
+        j_last = NUM_K_BLOCKS - 1
+        start_n = (j_last * BLOCK_N).to(tl.int64)
+        k_descale = tl.load(k_descale_ptr + j_last * stride_ksblk)
+        acc, l_i = _sage_vfa_attend_block(
+            acc, l_i, q, q_descale, m_i,
+            k_base_ptrs + start_n * stride_kn,
+            v_base_ptrs + start_n * stride_vk,
+            k_descale,
+            start_n,
+            offs_n, offs_d_qk, offs_d_v,
+            MAX_SEQLENS_K=MAX_SEQLENS_K,
+            ACTUAL_BLOCK_DMODEL_QK=ACTUAL_BLOCK_DMODEL_QK,
+            ACTUAL_BLOCK_DMODEL_V=ACTUAL_BLOCK_DMODEL_V,
+            PADDED_HEAD_QK=PADDED_HEAD_QK,
+            PADDED_HEAD_V=PADDED_HEAD_V,
+            PRE_LOAD_V=PRE_LOAD_V,
+            USE_EXP2=USE_EXP2,
+            APPLY_TAIL_MASK=True,
+        )
+
+    return acc, l_i
+
+
+# ----------------------------------------------------------------------------
+# Block-sparse loop driver: visit only the K blocks listed in the ragged LUT
+# for this (batch, head, q-block).  Any selected block may be the ragged last
+# K block, so the tail mask is applied to every block when ``N_EXTRA_TOKENS >
+# 0`` (a no-op for in-bounds blocks).  A q-block with ``n_blocks == 0`` skips
+# the loop and the epilogue zeroes its output via the m_i == -inf mask.
+# ----------------------------------------------------------------------------
+@triton.jit
+def _sage_fwd_vfa_blocksparse(
+    acc, l_i, q, q_descale, m_i,
+    k_base_ptrs, v_base_ptrs, k_descale_ptr,
+    stride_kn, stride_vk, stride_ksblk,
+    KV_Block_Indices, lut_start_val, n_blocks,
+    offs_n, offs_d_qk, offs_d_v,
+    MAX_SEQLENS_K: tl.constexpr,
+    N_EXTRA_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
+    PADDED_HEAD_QK: tl.constexpr,
+    PADDED_HEAD_V: tl.constexpr,
+    PRE_LOAD_V: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+):
+    LAST_BLOCK_HAS_TAIL: tl.constexpr = N_EXTRA_TOKENS > 0
+
+    for i in range(0, n_blocks):
+        start_b = tl.load(KV_Block_Indices + lut_start_val + i).to(tl.int64)
+        start_n = (start_b * BLOCK_N).to(tl.int64)
+        k_descale = tl.load(k_descale_ptr + start_b * stride_ksblk)
+        acc, l_i = _sage_vfa_attend_block(
+            acc, l_i, q, q_descale, m_i,
+            k_base_ptrs + start_n * stride_kn,
+            v_base_ptrs + start_n * stride_vk,
+            k_descale,
+            start_n,
+            offs_n, offs_d_qk, offs_d_v,
+            MAX_SEQLENS_K=MAX_SEQLENS_K,
+            ACTUAL_BLOCK_DMODEL_QK=ACTUAL_BLOCK_DMODEL_QK,
+            ACTUAL_BLOCK_DMODEL_V=ACTUAL_BLOCK_DMODEL_V,
+            PADDED_HEAD_QK=PADDED_HEAD_QK,
+            PADDED_HEAD_V=PADDED_HEAD_V,
+            PRE_LOAD_V=PRE_LOAD_V,
+            USE_EXP2=USE_EXP2,
+            APPLY_TAIL_MASK=LAST_BLOCK_HAS_TAIL,
+        )
+
+    return acc, l_i
+
+
+# ----------------------------------------------------------------------------
 # Main VFA attention kernel.
 #
 # Single tight loop, structurally close to the sage_fp8 inner body but with
@@ -182,6 +371,7 @@ def sage_fwd_vfa(
     Q, K, V,
     Q_Descale, K_Descale, V_Descale,
     M_Init,
+    KV_Block_Indices, Lut_Start, Lut_Count,
     LSE, Out,
     stride_qsz, stride_qsh, stride_qsblk,
     stride_ksz, stride_ksh, stride_ksblk,
@@ -199,6 +389,7 @@ def sage_fwd_vfa(
     MAX_SEQLENS_Q: tl.constexpr,
     MAX_SEQLENS_K: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
+    NUM_Q_BLOCKS: tl.constexpr,
     N_EXTRA_TOKENS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -207,6 +398,7 @@ def sage_fwd_vfa(
     PRE_LOAD_V: tl.constexpr,
     USE_EXP2: tl.constexpr,
     RETURN_LSE: tl.constexpr,
+    USE_BLOCK_SPARSE: tl.constexpr,
 ):
     ACCUMULATOR_TYPE = tl.float32
 
@@ -277,106 +469,44 @@ def sage_fwd_vfa(
     l_i = tl.zeros([BLOCK_M], dtype=ACCUMULATOR_TYPE)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_V], dtype=ACCUMULATOR_TYPE)
 
-    LAST_BLOCK_HAS_TAIL: tl.constexpr = N_EXTRA_TOKENS > 0
-
-    if LAST_BLOCK_HAS_TAIL:
-        loop_end = NUM_K_BLOCKS - 1
+    if USE_BLOCK_SPARSE:
+        # Visit only the K blocks listed in the ragged LUT for this q-block.
+        lut_idx = off_z * (HQ * NUM_Q_BLOCKS) + off_h_q * NUM_Q_BLOCKS + start_m
+        n_blocks = tl.load(Lut_Count + lut_idx)
+        lut_start_val = tl.load(Lut_Start + lut_idx)
+        acc, l_i = _sage_fwd_vfa_blocksparse(
+            acc, l_i, q, q_descale, m_i,
+            k_base_ptrs, v_base_ptrs, k_descale_ptr,
+            stride_kn, stride_vk, stride_ksblk,
+            KV_Block_Indices, lut_start_val, n_blocks,
+            offs_n, offs_d_qk, offs_d_v,
+            MAX_SEQLENS_K=MAX_SEQLENS_K,
+            N_EXTRA_TOKENS=N_EXTRA_TOKENS,
+            BLOCK_N=BLOCK_N,
+            ACTUAL_BLOCK_DMODEL_QK=ACTUAL_BLOCK_DMODEL_QK,
+            ACTUAL_BLOCK_DMODEL_V=ACTUAL_BLOCK_DMODEL_V,
+            PADDED_HEAD_QK=PADDED_HEAD_QK,
+            PADDED_HEAD_V=PADDED_HEAD_V,
+            PRE_LOAD_V=PRE_LOAD_V,
+            USE_EXP2=USE_EXP2,
+        )
     else:
-        loop_end = NUM_K_BLOCKS
-
-    # Interior blocks: no tail mask needed.
-    for j in range(0, loop_end):
-        start_n = (j * BLOCK_N).to(tl.int64)
-        k_ptrs = k_base_ptrs + start_n * stride_kn
-        v_ptrs = v_base_ptrs + start_n * stride_vk
-
-        if PADDED_HEAD_QK:
-            k_mask = offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK
-            k = tl.load(k_ptrs, mask=k_mask, other=0)
-        else:
-            k = tl.load(k_ptrs)
-
-        k_descale = tl.load(k_descale_ptr + j * stride_ksblk)
-
-        if PRE_LOAD_V:
-            if PADDED_HEAD_V:
-                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
-                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-            else:
-                v = tl.load(v_ptrs)
-
-        # Fused multiply-add: (dot * scale) - m_i  lowers to v_fma_f32 with
-        # `-m_i` carried as a source modifier on the FMA, saving the separate
-        # multiply that used to land between the QK dot and the shift.
-        # No clamp on the shift: rely on the safety margin in m_init to keep
-        # `qk - m_i` comfortably below ~8 log2 units (fp8 E4M3 max ~ 2^8.8).
-        # If a row's m_init nevertheless undershoots true rowmax by more than
-        # ~8 log2 units the corresponding p saturates at fp8_max -- a bounded
-        # bias, never inf/NaN.
-        scale = q_descale * k_descale
-        q_shifted = tl.dot(q, k) * scale - m_i[:, None]
-        if USE_EXP2:
-            p = tl.math.exp2(q_shifted)
-        else:
-            p = tl.math.exp(q_shifted)
-
-        l_i = l_i + tl.sum(p, 1)
-
-        if not PRE_LOAD_V:
-            if PADDED_HEAD_V:
-                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
-                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-            else:
-                v = tl.load(v_ptrs)
-
-        acc = tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
-
-    # Tail block (only when seqlen_k % BLOCK_N != 0).
-    if LAST_BLOCK_HAS_TAIL:
-        j_last = NUM_K_BLOCKS - 1
-        start_n = (j_last * BLOCK_N).to(tl.int64)
-        k_ptrs = k_base_ptrs + start_n * stride_kn
-        v_ptrs = v_base_ptrs + start_n * stride_vk
-
-        if PADDED_HEAD_QK:
-            k_mask = offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK
-            k = tl.load(k_ptrs, mask=k_mask, other=0)
-        else:
-            k = tl.load(k_ptrs)
-
-        k_descale = tl.load(k_descale_ptr + j_last * stride_ksblk)
-
-        if PRE_LOAD_V:
-            if PADDED_HEAD_V:
-                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
-                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-            else:
-                v = tl.load(v_ptrs)
-
-        # Same FMA-friendly form as the interior loop; tail mask is applied
-        # afterwards by pushing invalid columns to -inf so the exp result is
-        # exactly 0 and the columns contribute nothing to l_i.
-        scale = q_descale * k_descale
-        boundary = tl.full([BLOCK_N], N_EXTRA_TOKENS, dtype=tl.int32)
-        valid_n = offs_n < boundary
-
-        q_shifted = tl.dot(q, k) * scale - m_i[:, None]
-        q_shifted = tl.where(valid_n[None, :], q_shifted, float("-inf"))
-        if USE_EXP2:
-            p = tl.math.exp2(q_shifted)
-        else:
-            p = tl.math.exp(q_shifted)
-
-        l_i = l_i + tl.sum(p, 1)
-
-        if not PRE_LOAD_V:
-            if PADDED_HEAD_V:
-                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
-                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-            else:
-                v = tl.load(v_ptrs)
-
-        acc = tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
+        acc, l_i = _sage_fwd_vfa_dense(
+            acc, l_i, q, q_descale, m_i,
+            k_base_ptrs, v_base_ptrs, k_descale_ptr,
+            stride_kn, stride_vk, stride_ksblk,
+            offs_n, offs_d_qk, offs_d_v,
+            MAX_SEQLENS_K=MAX_SEQLENS_K,
+            NUM_K_BLOCKS=NUM_K_BLOCKS,
+            N_EXTRA_TOKENS=N_EXTRA_TOKENS,
+            BLOCK_N=BLOCK_N,
+            ACTUAL_BLOCK_DMODEL_QK=ACTUAL_BLOCK_DMODEL_QK,
+            ACTUAL_BLOCK_DMODEL_V=ACTUAL_BLOCK_DMODEL_V,
+            PADDED_HEAD_QK=PADDED_HEAD_QK,
+            PADDED_HEAD_V=PADDED_HEAD_V,
+            PRE_LOAD_V=PRE_LOAD_V,
+            USE_EXP2=USE_EXP2,
+        )
 
     # Epilogue.
     invalid_mask = m_i == float("-inf")

@@ -266,14 +266,24 @@ def fav3_sage_vfa_func(
     return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    kv_block_indices: Optional[torch.Tensor] = None,
+    lut_start: Optional[torch.Tensor] = None,
+    lut_count: Optional[torch.Tensor] = None,
+    use_block_sparse: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """SageAttention v1 with Vector Relieved Flash Attention -- hot kernel only.
 
-    Dense, non-causal, no-sliding-window, no-block-sparse path only.  Inputs
-    follow the same quantization protocol as :func:`fav3_sage_func`; ``m_init``
-    must be a precomputed per-row running-max estimate (see
-    :func:`compute_m_proxy_topn` for the guided pooled-score estimator and
-    :func:`compute_m_sampled` for the uniform-sampling estimator).
+    Non-causal, no-sliding-window.  Inputs follow the same quantization
+    protocol as :func:`fav3_sage_func`; ``m_init`` must be a precomputed
+    per-row running-max estimate (see :func:`compute_m_proxy_topn` for the
+    guided pooled-score estimator and :func:`compute_m_sampled` for the
+    uniform-sampling estimator).
+
+    Block-sparse: pass ``use_block_sparse=True`` together with a ragged LUT
+    ``(kv_block_indices, lut_start, lut_count)`` from
+    :func:`block_attn_mask_to_ragged_lut`; the hot loop then visits only the
+    attended K blocks.  ``m_init`` is still a sampled/guided estimate over the
+    full K sequence (it only shifts the exponent, so it stays correct).
     """
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
@@ -304,6 +314,19 @@ def fav3_sage_vfa_func(
         f"{(batch, nheads_q, num_q_blocks, BLKQ)}"
     )
     assert m_init.dtype == torch.float32
+
+    if use_block_sparse:
+        if kv_block_indices is None or lut_start is None or lut_count is None:
+            raise ValueError(
+                "kv_block_indices, lut_start, and lut_count must be provided "
+                "when use_block_sparse=True"
+            )
+    else:
+        # Dummy 1-element tensors keep the kernel signature uniform; the
+        # block-sparse loop is compiled out when USE_BLOCK_SPARSE is False.
+        kv_block_indices = torch.zeros(1, dtype=torch.int32, device=q.device)
+        lut_start = torch.zeros(1, dtype=torch.int32, device=q.device)
+        lut_count = torch.zeros(1, dtype=torch.int32, device=q.device)
 
     out_dtype = torch.bfloat16
     out_shape = (q.shape[0], q.shape[1], q.shape[2], v.shape[-1])
@@ -339,6 +362,7 @@ def fav3_sage_vfa_func(
         q, k, v,
         q_descale, k_descale, v_descale,
         m_init,
+        kv_block_indices, lut_start, lut_count,
         softmax_lse, out,
         stride_qsz, stride_qsh, stride_qsblk,
         stride_ksz, stride_ksh, stride_ksblk,
@@ -356,6 +380,7 @@ def fav3_sage_vfa_func(
         MAX_SEQLENS_Q=seqlen_q,
         MAX_SEQLENS_K=seqlen_k,
         NUM_K_BLOCKS=num_k_blocks,
+        NUM_Q_BLOCKS=num_q_blocks,
         N_EXTRA_TOKENS=n_extra_tokens,
         BLOCK_M=BLKQ,
         BLOCK_N=BLKK,
@@ -364,6 +389,7 @@ def fav3_sage_vfa_func(
         PRE_LOAD_V=config.get("PRE_LOAD_V", False),
         USE_EXP2=True,
         RETURN_LSE=return_lse,
+        USE_BLOCK_SPARSE=use_block_sparse,
         waves_per_eu=config.get("waves_per_eu", 2),
         # num_stages=4 wins on gfx950: the extra K/V prefetch stage hides
         # roughly one full HBM round trip per loop iteration without pushing
@@ -388,15 +414,22 @@ def fav3_sage_vfa_wrapper_func(
     n_sample_blocks: int = 16,
     guided_sample: bool = True,
     generator: Optional[torch.Generator] = None,
+    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """High-precision API that handles quantization and ``m_init``.
 
-    ``m_init`` is always estimated from ``n_sample_blocks`` K blocks evaluated
-    with real K rows (a lower bound on the true per-row max; no safety margin):
+    When ``block_lut`` is None (dense), ``m_init`` is estimated from
+    ``n_sample_blocks`` K blocks evaluated with real K rows (a lower bound on
+    the true per-row max; no safety margin):
       * ``guided_sample=True`` (default) -> the top-``n_sample_blocks`` blocks
         per q-block ranked by a SpargeAttn mean-pooled block-score.
       * ``guided_sample=False``          -> ``n_sample_blocks`` uniformly random
         K blocks.
+
+    When ``block_lut`` (a ragged ``(kv_block_indices, lut_start, lut_count)``
+    LUT from :func:`block_attn_mask_to_ragged_lut`) is provided, the
+    block-sparse path runs (the hot loop visits only attended K blocks); the
+    same sampled/guided ``m_init`` estimate is used.
     """
     assert q.dtype in [torch.float16, torch.bfloat16, torch.float32]
     assert k.dtype in [torch.float16, torch.bfloat16, torch.float32]
@@ -422,6 +455,12 @@ def fav3_sage_vfa_wrapper_func(
         layout=layout,
     )
 
+    use_block_sparse = block_lut is not None
+    if use_block_sparse:
+        kv_block_indices, lut_start, lut_count = block_lut
+    else:
+        kv_block_indices = lut_start = lut_count = None
+
     if guided_sample:
         m_init = compute_m_proxy_topn(
             q, k, q_int8, k_int8, q_descale, k_descale,
@@ -443,6 +482,10 @@ def fav3_sage_vfa_wrapper_func(
         return_lse=return_lse,
         layout=layout,
         config=config,
+        kv_block_indices=kv_block_indices,
+        lut_start=lut_start,
+        lut_count=lut_count,
+        use_block_sparse=use_block_sparse,
     )
     if return_lse:
         return out, lse

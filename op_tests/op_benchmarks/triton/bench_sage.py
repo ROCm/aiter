@@ -253,11 +253,13 @@ def _make_sage_fp8_vfa_runner(
     k: torch.Tensor,
     v: torch.Tensor,
     softmax_scale: float,
+    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> Any:
     """Build a runner for the VFA-on-top-of-sage_fp8 kernel.
 
-    Dense/non-causal/no-block-sparse only (matches the regime where VFA is
-    designed to relieve the rowmax+rescale bottleneck).
+    Non-causal only.  ``m_init`` always comes from the sampled/guided block
+    estimators; ``block_lut`` (if given) just restricts the hot loop to the
+    attended K blocks.
     """
     if args.causal:
         raise NotImplementedError("sage_fp8_vfa does not support causal attention yet")
@@ -272,6 +274,7 @@ def _make_sage_fp8_vfa_runner(
             layout=args.layout,
             n_sample_blocks=N_SAMPLE_BLOCKS,
             guided_sample=GUIDED_SAMPLE,
+            block_lut=block_lut,
         )
 
     cfg = get_sage_fwd_configs()
@@ -290,6 +293,8 @@ def _make_sage_fp8_vfa_runner(
         sm_scale=softmax_scale,
         layout=args.layout,
     )
+
+    kv_idx, lut_s, lut_c, sparse = _unpack_block_lut(block_lut)
 
     if GUIDED_SAMPLE:
         m_init = compute_m_proxy_topn(
@@ -315,6 +320,10 @@ def _make_sage_fp8_vfa_runner(
         return_lse=False,
         layout=args.layout,
         config=cfg,
+        kv_block_indices=kv_idx,
+        lut_start=lut_s,
+        lut_count=lut_c,
+        use_block_sparse=sparse,
     )
 
 
@@ -615,7 +624,7 @@ def make_kernel_runner(
         )
 
     if args.kernel == "sage_fp8_vfa":
-        return _make_sage_fp8_vfa_runner(args, q, k, v, softmax_scale)
+        return _make_sage_fp8_vfa_runner(args, q, k, v, softmax_scale, block_lut)
 
     if args.kernel == "sage_mxfp4":
         block_r = args.block_r
