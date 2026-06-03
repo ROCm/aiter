@@ -10,17 +10,11 @@ Compares HIP kernels against:
 """
 
 import argparse
-import os
-import sys
 
 import pandas as pd
 import pytest
 import torch
 from torch import Tensor
-
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
 
 import aiter
 from aiter import dtypes
@@ -381,7 +375,7 @@ def _validate_qk_perhead_case(
         rtol=1e-2,
         atol=1e-2,
         tol_err_ratio=0.0,
-        msg=f"check q_descale vs torch per-head ref: ",
+        msg="check q_descale vs torch per-head ref: ",
     )
     k_scale_err = checkAllclose(
         k_torch_scale,
@@ -389,7 +383,7 @@ def _validate_qk_perhead_case(
         rtol=1e-2,
         atol=1e-2,
         tol_err_ratio=0.0,
-        msg=f"check k_descale vs torch per-head ref: ",
+        msg="check k_descale vs torch per-head ref: ",
     )
 
     uplift = (baseline_us / hip_us - 1) if baseline_us and hip_us else None
@@ -477,7 +471,7 @@ def _validate_v_perhead_case(
         rtol=0.15,
         atol=0.5,
         tol_err_ratio=0.25,
-        msg=f"check v_descale vs torch per-head ref: ",
+        msg="check v_descale vs torch per-head ref: ",
     )
     v_deq_err = checkAllclose(
         v_ref.float(),
@@ -485,7 +479,7 @@ def _validate_v_perhead_case(
         rtol=0.15,
         atol=1.0,
         tol_err_ratio=0.01,
-        msg=f"check v_dequant vs bf16 ref: ",
+        msg="check v_dequant vs bf16 ref: ",
     )
 
     uplift = (baseline_us / hip_us - 1) if baseline_us and hip_us else None
