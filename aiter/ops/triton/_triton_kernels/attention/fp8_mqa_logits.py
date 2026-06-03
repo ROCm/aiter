@@ -79,7 +79,7 @@ def _fp8_mqa_logits_kernel(
         kv_scales = tl.load(kv_scales_ptrs)
 
         # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
-        scores = tl.dot(q_block, kv_block, input_precision="ieee")
+        scores = tl.dot(q_block, kv_block)
         # Multiply by kv_scales (broadcast along rows)
         scores = scores * kv_scales[None, :]
         # ReLU
@@ -100,7 +100,7 @@ def _fp8_mqa_logits_kernel(
     kv_scales = tl.load(kv_scales_ptrs, mask=kv_col_mask, other=0.0)
 
     # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
-    scores = tl.dot(q_block, kv_block, input_precision="ieee")
+    scores = tl.dot(q_block, kv_block)
     # Multiply by kv_scales (broadcast along rows)
     scores = scores * kv_scales[None, :]
     # ReLU

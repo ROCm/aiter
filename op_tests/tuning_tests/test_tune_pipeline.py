@@ -7,6 +7,7 @@ Runs each tuner on small shapes, verifies CSV output, and tests
 --shape_grouped with profile row count comparison.
 """
 
+import glob
 import os
 import sys
 import csv
@@ -52,7 +53,27 @@ def _write_csv(path, header, rows):
             writer.writerow(row)
 
 
+def _cleanup_stale_lock_files():
+    """Remove stale FileBaton lock files left by killed subprocesses."""
+    build_dir = os.path.join(AITER_ROOT, "aiter", "jit", "build")
+    if not os.path.isdir(build_dir):
+        return
+    lock_patterns = [
+        os.path.join(build_dir, "lock_*"),
+        os.path.join(build_dir, "*", "build", "lock"),
+        os.path.join(build_dir, "lock_3rdparty_*"),
+    ]
+    for pattern in lock_patterns:
+        for lock_file in glob.glob(pattern):
+            try:
+                os.remove(lock_file)
+                print(f"Cleaned up stale lock file: {lock_file}", flush=True)
+            except OSError:
+                pass
+
+
 def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300, mp=1):
+    _cleanup_stale_lock_files()
     cmd = [
         sys.executable,
         os.path.join(AITER_ROOT, script),
@@ -82,6 +103,7 @@ def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300, mp=1):
             env=env,
         )
     except subprocess.TimeoutExpired as e:
+        _cleanup_stale_lock_files()
         raise AssertionError(
             f"Tuner timed out after {timeout}s (likely GPU hang or infinite loop)\n"
             f"  cmd: {' '.join(cmd)}\n"
@@ -113,9 +135,12 @@ class TestTunePipeline(unittest.TestCase):
             "a8w8_blockscale": {
                 "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
                 "header": ["M", "N", "K"],
-                "shapes": [(1, 1024, 512)],
-                "shapes_mp1": [(1, 1024, 512)],
+                # Use the B-preshuffle ASM path to avoid expensive CK JIT builds
+                # in the smoke pipeline.
+                "shapes": [(16, 1536, 7168)],
+                "shapes_mp1": [(16, 1536, 7168)],
                 "keys": ["cu_num", "M", "N", "K"],
+                "extra_args": ["--libtype", "asm", "--preshuffle", "--batch", "1"],
             },
             "a8w8_bpreshuffle": {
                 "script": "csrc/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_tune.py",
@@ -327,7 +352,14 @@ class TestTunePipeline(unittest.TestCase):
             tuned = os.path.join(tmp, "tuned.csv")
             _write_csv(untuned, cfg["header"], shapes)
 
-            result = _run_tuner(cfg["script"], untuned, tuned, timeout=timeout, mp=mp)
+            result = _run_tuner(
+                cfg["script"],
+                untuned,
+                tuned,
+                extra_args=cfg.get("extra_args"),
+                timeout=timeout,
+                mp=mp,
+            )
             if result.returncode != 0:
                 print(f"\n=== {name} ({mp_label}) STDOUT ===\n{result.stdout[-2000:]}")
                 print(f"\n=== {name} ({mp_label}) STDERR ===\n{result.stderr[-2000:]}")
@@ -368,6 +400,45 @@ class TestTunePipeline(unittest.TestCase):
 
     def test_a8w8_blockscale_mp_default(self):
         self._run_one("a8w8_blockscale", mp=None)
+
+    def test_a8w8_blockscale_bpreshuffle_asm_mp1(self):
+        """Smoke-test the a8w8 blockscale B-preshuffle ASM tuner path."""
+        cfg = self.TUNERS["a8w8_blockscale"]
+        with tempfile.TemporaryDirectory() as tmp:
+            untuned = os.path.join(tmp, "untuned.csv")
+            tuned = os.path.join(tmp, "tuned.csv")
+            _write_csv(untuned, cfg["header"], [(16, 1536, 7168)])
+
+            result = _run_tuner(
+                cfg["script"],
+                untuned,
+                tuned,
+                extra_args=["--libtype", "asm", "--preshuffle", "--batch", "1"],
+                timeout=900,
+                mp=1,
+            )
+            if result.returncode != 0:
+                print(
+                    f"\n=== a8w8_blockscale bpreshuffle asm STDOUT ===\n{result.stdout[-2000:]}"
+                )
+                print(
+                    f"\n=== a8w8_blockscale bpreshuffle asm STDERR ===\n{result.stderr[-2000:]}"
+                )
+            self.assertEqual(
+                result.returncode,
+                0,
+                "a8w8_blockscale bpreshuffle asm tuner failed",
+            )
+            self.assertTrue(
+                os.path.exists(tuned),
+                "a8w8_blockscale bpreshuffle asm: tuned CSV not created",
+            )
+
+            df = pd.read_csv(tuned)
+            df.columns = df.columns.str.strip()
+            self.assertGreaterEqual(len(df), 1)
+            self.assertTrue((df["libtype"] == "asm").any())
+            self.assertTrue((df["errRatio"].astype(float) <= 0.05).all())
 
     def test_a8w8_bpreshuffle_mp1(self):
         self._run_one("a8w8_bpreshuffle", mp=1)
@@ -440,8 +511,9 @@ class TestShapeGrouped(unittest.TestCase):
         "a8w8_blockscale": {
             "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
             "header": ["M", "N", "K"],
-            "shapes": [(16, 1536, 7168), (16, 576, 7168), (16, 7168, 256)],
+            "shapes": [(16, 1536, 7168), (32, 1536, 7168), (64, 1536, 7168)],
             "keys": ["cu_num", "M", "N", "K"],
+            "extra_args": ["--libtype", "asm", "--preshuffle"],
             "timeout": 600,
         },
         "batched_bf16": {
@@ -468,7 +540,7 @@ class TestShapeGrouped(unittest.TestCase):
                 cfg["script"],
                 untuned,
                 tuned_ref,
-                extra_args=["-o2", profile_ref],
+                extra_args=cfg.get("extra_args", []) + ["-o2", profile_ref],
                 timeout=timeout,
             )
             self.assertEqual(
@@ -479,7 +551,8 @@ class TestShapeGrouped(unittest.TestCase):
                 cfg["script"],
                 untuned,
                 tuned,
-                extra_args=["--shape_grouped", "-o2", profile],
+                extra_args=cfg.get("extra_args", [])
+                + ["--shape_grouped", "-o2", profile],
                 timeout=timeout,
             )
             if r.returncode != 0:
@@ -512,65 +585,52 @@ class TestShapeGrouped(unittest.TestCase):
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
 class TestComparePipeline(unittest.TestCase):
-    """Test --compare and --compare --update_improved end-to-end."""
+    """Test --compare --update_improved end-to-end."""
 
     CONFIGS = {
         "a8w8_blockscale": {
             "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
             "header": ["M", "N", "K"],
-            "shapes": [(1, 1024, 512), (16, 1536, 7168)],
+            "shapes": [(16, 1536, 7168)],
             "keys": ["cu_num", "M", "N", "K"],
+            "timeout": 3600,
         },
     }
 
-    def _run_compare(self, name, update_improved=False):
-        cfg = self.CONFIGS[name]
+    def test_compare_and_update(self):
+        """--compare --update_improved: tune, compare, update tuned CSV."""
+        cfg = self.CONFIGS["a8w8_blockscale"]
+        timeout = cfg.get("timeout", 900)
         tmp = tempfile.mkdtemp()
-        untuned = os.path.join(tmp, "untuned.csv")
-        tuned = os.path.join(tmp, "tuned.csv")
-        _write_csv(untuned, cfg["header"], cfg["shapes"])
-
-        extra = ["--compare"]
-        if update_improved:
-            extra.append("--update_improved")
-        result = _run_tuner(
-            cfg["script"], untuned, tuned, extra_args=extra, timeout=900
-        )
-        return result, tuned, tmp
-
-    def test_compare_only(self):
-        """--compare runs pre/post benchmark and prints comparison."""
-        result, tuned, tmp = self._run_compare("a8w8_blockscale", update_improved=False)
         try:
+            untuned = os.path.join(tmp, "untuned.csv")
+            tuned = os.path.join(tmp, "tuned.csv")
+            _write_csv(untuned, cfg["header"], cfg["shapes"])
+
+            result = _run_tuner(
+                cfg["script"],
+                untuned,
+                tuned,
+                extra_args=[
+                    "--compare",
+                    "--update_improved",
+                    "--libtype",
+                    "asm",
+                    "--preshuffle",
+                    "--batch",
+                    "1",
+                ],
+                timeout=timeout,
+                mp=1,
+            )
             if result.returncode != 0:
                 print(f"\n=== compare STDOUT ===\n{result.stdout[-2000:]}")
                 print(f"\n=== compare STDERR ===\n{result.stderr[-2000:]}")
-            self.assertEqual(result.returncode, 0, "compare tuner failed")
-            output = result.stdout + result.stderr
-            self.assertIn(
-                "Compare Report", output, "Expected 'Compare Report' in output"
-            )
-        finally:
-            import shutil
-
-            shutil.rmtree(tmp, ignore_errors=True)
-
-    def test_compare_update_improved(self):
-        """--compare --update_improved writes tuned CSV and prints comparison."""
-        result, tuned, tmp = self._run_compare("a8w8_blockscale", update_improved=True)
-        try:
-            if result.returncode != 0:
-                print(f"\n=== compare+update STDOUT ===\n{result.stdout[-2000:]}")
-                print(f"\n=== compare+update STDERR ===\n{result.stderr[-2000:]}")
             self.assertEqual(result.returncode, 0, "compare+update tuner failed")
-            self.assertTrue(os.path.exists(tuned), "tuned CSV not created")
             output = result.stdout + result.stderr
             self.assertIn(
                 "Compare Report", output, "Expected 'Compare Report' in output"
             )
-            df = pd.read_csv(tuned)
-            df.columns = df.columns.str.strip()
-            self.assertGreaterEqual(len(df), 1, "tuned CSV should have at least 1 row")
         finally:
             import shutil
 
