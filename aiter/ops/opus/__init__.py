@@ -19,9 +19,9 @@ The a16w16 kernels are gfx950-only today (MFMA-32x32x16, ds_read_b64_tr,
 160 KiB LDS). On non-gfx950 devices this package still imports cleanly
 so that `import aiter` (and the 30+ other ops imported alongside it in
 `aiter/__init__.py`) keeps working. The two public callables are
-replaced with stubs that raise a clear ``RuntimeError`` -- carrying the
-hint below -- only when the caller actually invokes them. Importing the
-package on an unsupported arch is silent.
+replaced with stubs that raise a clear ``RuntimeError`` only when the
+caller actually invokes them; a single ``RuntimeWarning`` is emitted
+at import time.
 """
 
 from ._arch import _detect_arch
@@ -63,8 +63,8 @@ if _arch_ok:
         gemm_a16w16_opus,
     )
 else:
-    # Non-supported arch (or unknown / probe failed): install stubs
-    # silently. We deliberately do NOT raise ImportError here -- raising
+    # Non-supported arch (or unknown / probe failed): warn once and install
+    # stubs. We deliberately do NOT raise ImportError here -- raising would
     # would propagate up through `from aiter.ops.opus import *` in
     # aiter/__init__.py, where it would be caught by the surrounding
     # try/except and silently disable the 30+ subsequent op imports.
