@@ -2110,6 +2110,194 @@ struct smem {
 template<typename T_> OPUS_D decltype(auto) make_smem(T_* ptr) { return smem<T_>{ptr}; }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
+// tcopy (gfx1250): tcopy_desc = stateless D# (sg0..sg3 raw dwords); tcopy_window = stateful tile
+// window with make() + move(d0..d4, lds) + load_to_lds<cpol>(). cpol[6:0] = | rsvd | NV | scope[2] | th[3] |.
+
+enum class tcopy_load_th : uint8_t { rt=0, nt=1, ht=2, bypass=3, nt_rt=4, rt_nt=5, nt_ht=6 };           // bypass = LU (last-use)
+enum class tcopy_scope   : uint8_t { cu=0, se=1, dev=2, sys=3 };
+
+OPUS_H_D constexpr int make_cpol(tcopy_load_th th = tcopy_load_th::rt, tcopy_scope sc = tcopy_scope::dev, bool nv = false) { return (int(th) & 0x7) | ((int(sc) & 0x3) << 3) | (nv ? (1 << 5) : 0); }
+inline constexpr int default_cpol = make_cpol(tcopy_load_th::rt, tcopy_scope::dev);                     // = 16
+static_assert(default_cpol == 16, "cpol layout drift");
+
+namespace impl {
+template<typename T> struct is_static_zero : false_type {};
+template<index_t I>  struct is_static_zero<number<I>> : bool_constant<I == 0> {};
+template<typename T> static constexpr bool is_static_zero_v = is_static_zero<remove_cvref_t<T>>::value;
+
+template<bool En> struct tcopy_dim_state {};
+template<>        struct tcopy_dim_state<true> { uint32_t extent=0; uint64_t stride=0; uint32_t origin=0; };
+
+// saturating_sub via pure SALU (s_sub_co_u32 + s_cselect_b32); avoids v_sub_nc_u32 clamp which
+OPUS_H_D inline uint32_t tcopy_saturating_sub(uint32_t e, uint32_t o) {
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__AMDGCN__)
+    uint32_t es = __builtin_amdgcn_readfirstlane(e), os = __builtin_amdgcn_readfirstlane(o), r;
+    asm("s_sub_co_u32 %0, %1, %2\n\ts_cselect_b32 %0, 0, %0" : "=s"(r) : "s"(es), "s"(os) : "scc"); return r;
+#else
+    return (o < e) ? (e - o) : 0u;
+#endif
+}
+
+// wg_mask: seq<i0, i1, ...> index i → bit i. WgCount=0 → mask=0 (no multicast).
+template<index_t WgCount, typename Wgs> struct tcopy_wg_mask;
+template<index_t WgCount, index_t... Is> struct tcopy_wg_mask<WgCount, seq<Is...>> {
+    static_assert(WgCount >= 0 && (WgCount == 0 || index_t(sizeof...(Is)) == WgCount) && (WgCount == 0 || (((Is >= 0) && ...) && ((Is < 16) && ...))), "tcopy_desc: bad selected workgroups");
+    static constexpr uint16_t value = [] { if constexpr (WgCount == 0) return uint16_t{0}; else return (uint16_t{0} | ... | uint16_t(uint16_t{1} << Is)); }();
+};
+template<index_t WgCount, typename Wgs> static constexpr uint16_t tcopy_wg_mask_v = tcopy_wg_mask<WgCount, Wgs>::value;
+
+// __builtin_amdgcn_tensor_load_to_lds operand types (6th arg sg_extra MUST be present & all-zero).
+using tcopy_sg0_vec      = int32_t __attribute__((ext_vector_type(4)));
+using tcopy_sg1_vec      = int32_t __attribute__((ext_vector_type(8)));
+using tcopy_sg2_vec      = int32_t __attribute__((ext_vector_type(4)));
+using tcopy_sg3_vec      = int32_t __attribute__((ext_vector_type(4)));
+using tcopy_sg_extra_vec = int32_t __attribute__((ext_vector_type(8)));
+} // namespace impl
+
+template<typename T> struct tcopy_data_size { static_assert(sizeof(T)==1||sizeof(T)==2||sizeof(T)==4||sizeof(T)==8, "tcopy_data_size: bad element size"); static constexpr uint64_t value = (sizeof(T)==1)?0:(sizeof(T)==2)?1:(sizeof(T)==4)?2:3; };
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// tcopy_desc<T, TileDim0..4, flags, pad, SelectedWgs>: stateless D# (sg0..sg3 raw uint32_t arrays).
+// Compile-time defaults baked into storage initializer; runtime setters are hand-coded mask+or.
+template<typename DataType,
+         uint64_t TileDim0=0, uint64_t TileDim1=0, uint64_t TileDim2=0, uint64_t TileDim3=0, uint64_t TileDim4=0,
+         uint64_t Count=1, uint64_t GatherIndexSize=0, uint64_t GatherMode=0, uint64_t TypeLo=0, uint64_t TypeHi=1,
+         uint64_t AtomicBarrierEn=0, uint64_t IterateEn=0, uint64_t McEarlyTimeout=0, index_t SelectedWorkgroupCount=0,
+         uint64_t LdsPadEn=0, uint64_t PadInterval=0, uint64_t PadAmount=0, typename SelectedWorkgroups = seq<>>
+struct tcopy_desc {
+    static constexpr uint64_t data_size = tcopy_data_size<DataType>::value;
+    static constexpr uint64_t wg_mask   = impl::tcopy_wg_mask_v<SelectedWorkgroupCount, SelectedWorkgroups>;
+    static constexpr uint32_t ndim      = (TileDim4!=0)?5:(TileDim3!=0)?4:(TileDim2!=0)?3:2;
+
+    // Compile-time dword inits (only slots holding ≥1 compile-time field):
+    static constexpr uint32_t sg0_init0 = uint32_t(Count & 0x1) | (uint32_t(GatherIndexSize & 0x1) << 30) | (uint32_t(GatherMode & 0x1) << 31);                                            // count | gather flags
+    static constexpr uint32_t sg0_init3 = (uint32_t(TypeLo & 0x1) << 30) | (uint32_t(TypeHi & 0x1) << 31);                                                                                  // global_addr_hi(rt) | type
+    static constexpr uint32_t sg1_init0 = uint32_t(wg_mask & 0xFFFF) | (uint32_t(data_size & 0x3) << 16) | (uint32_t(AtomicBarrierEn & 0x1) << 18) | (uint32_t(IterateEn & 0x1) << 19) | (uint32_t(LdsPadEn & 0x1) << 20) | (uint32_t(McEarlyTimeout & 0x1) << 21) | (uint32_t(PadInterval & 0x7) << 22) | (uint32_t(PadAmount & 0x7F) << 25);   // wg_mask | data_size | flags | pad
+    static constexpr uint32_t sg1_init3 = uint32_t(TileDim0 & 0xFFFF) << 16;                                                                                                                // tensor_dim1_lo(rt) | tile_dim0
+    static constexpr uint32_t sg1_init4 = uint32_t(TileDim1 & 0xFFFF) | (uint32_t(TileDim2 & 0xFFFF) << 16);                                                                                // tile_dim1 | tile_dim2
+    static constexpr uint32_t sg2_init3 = uint32_t(TileDim3 & 0xFFFF) << 16;                                                                                                                // tdim2_stride_hi(rt) | tile_dim3
+    static constexpr uint32_t sg3_init2 = uint32_t(TileDim4 & 0xFFFF) << 16;                                                                                                                // tensor_dim4_hi(rt) | tile_dim4
+
+    uint32_t sg0[4]{ sg0_init0, 0, 0, sg0_init3 };
+    uint32_t sg1[8]{ sg1_init0, 0, 0, sg1_init3, sg1_init4, 0, 0, 0 };
+    uint32_t sg2[4]{ 0, 0, 0, sg2_init3 };
+    uint32_t sg3[4]{ 0, 0, sg3_init2, 0 };
+
+    // Runtime setters (bit positions as comments):
+    OPUS_H_D void set_lds_addr          (uintptr_t v) { sg0[1] = uint32_t(v); }                                                                                            // [32:32]
+    OPUS_H_D void set_global_addr       (uintptr_t v) { sg0[2] = uint32_t(v); sg0[3] = (sg0[3] & 0xFE000000u) | uint32_t((v >> 32) & 0x01FFFFFFu); }                       // [64:57]
+    OPUS_H_D void set_tensor_dim0       (uint32_t  v) { sg1[1] = (sg1[1] & 0x0000FFFFu) | (v << 16); sg1[2] = (sg1[2] & 0xFFFF0000u) | (v >> 16); }                        // [48:32]
+    OPUS_H_D void set_tensor_dim1       (uint32_t  v) { sg1[2] = (sg1[2] & 0x0000FFFFu) | (v << 16); sg1[3] = (sg1[3] & 0xFFFF0000u) | (v >> 16); }                        // [80:32]
+    OPUS_H_D void set_lds_barrier_addr  (uint16_t  v) { sg1[1] = (sg1[1] & 0xFFFF0000u) | uint32_t(v); }                                                                   // [32:16]
+    OPUS_H_D void set_tensor_dim0_stride(uint64_t  v) { sg1[5] = uint32_t(v); sg1[6] = (sg1[6] & 0xFFFF0000u) | uint32_t((v >> 32) & 0xFFFFu); }                           // [160:48]
+    OPUS_H_D void set_tensor_dim1_stride(uint64_t  v) { sg1[6] = (sg1[6] & 0x0000FFFFu) | uint32_t((v & 0xFFFFu) << 16); sg1[7] = uint32_t(v >> 16); }                     // [208:48]
+    OPUS_H_D void set_tensor_dim2       (uint32_t  v) { sg2[0] = v; }                                                                                                      // [0:32]
+    OPUS_H_D void set_tensor_dim3       (uint32_t  v) { sg2[1] = v; }                                                                                                      // [32:32]
+    OPUS_H_D void set_tensor_dim2_stride(uint64_t  v) { sg2[2] = uint32_t(v); sg2[3] = (sg2[3] & 0xFFFF0000u) | uint32_t((v >> 32) & 0xFFFFu); }                           // [64:48]
+    OPUS_H_D void set_tensor_dim3_stride(uint64_t  v) { sg3[0] = uint32_t(v); sg3[1] = (sg3[1] & 0xFFFF0000u) | uint32_t((v >> 32) & 0xFFFFu); }                           // [0:48]
+    OPUS_H_D void set_tensor_dim4       (uint32_t  v) { sg3[1] = (sg3[1] & 0x0000FFFFu) | (v << 16); sg3[2] = (sg3[2] & 0xFFFF0000u) | (v >> 16); }                        // [48:32]
+
+    OPUS_H_D void make(uintptr_t lds_addr, const void* global_addr, uint32_t td0, uint32_t td1, uint64_t s0,
+                       uint64_t s1=0, uint16_t lds_bar=0, uint32_t td2=0, uint32_t td3=0, uint64_t s2=0, uint64_t s3=0, uint32_t td4=0) {
+        set_lds_addr(lds_addr); set_global_addr(reinterpret_cast<uintptr_t>(global_addr));
+        set_tensor_dim0(td0); set_tensor_dim1(td1); set_tensor_dim0_stride(s0);
+        if (lds_bar) set_lds_barrier_addr(lds_bar);
+        if (s1)  set_tensor_dim1_stride(s1);
+        if (td2) set_tensor_dim2(td2); if (td3) set_tensor_dim3(td3); if (s2) set_tensor_dim2_stride(s2);
+        if (s3)  set_tensor_dim3_stride(s3); if (td4) set_tensor_dim4(td4);
+    }
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// tcopy_window<T, ...>: stateful tile window over tcopy_desc. Caches global_offset_bytes /
+// lds_offset_bytes (layout_linear pattern); move(d0..d4, lds) does cache += delta and rewrites
+// only affected fields. opus::number<0>{} (0_I) → compile-time elide for that slot.
+template<typename DataType,
+         uint64_t TileDim0=0, uint64_t TileDim1=0, uint64_t TileDim2=0, uint64_t TileDim3=0, uint64_t TileDim4=0,
+         uint64_t Count=1, uint64_t GatherIndexSize=0, uint64_t GatherMode=0, uint64_t TypeLo=0, uint64_t TypeHi=1,
+         uint64_t AtomicBarrierEn=0, uint64_t IterateEn=0, uint64_t McEarlyTimeout=0, index_t SelectedWorkgroupCount=0,
+         uint64_t LdsPadEn=0, uint64_t PadInterval=0, uint64_t PadAmount=0, typename SelectedWorkgroups = seq<>,
+         int CachePol = default_cpol>
+struct tcopy_window {
+    using desc_t = tcopy_desc<DataType, TileDim0, TileDim1, TileDim2, TileDim3, TileDim4, Count, GatherIndexSize, GatherMode, TypeLo, TypeHi, AtomicBarrierEn, IterateEn, McEarlyTimeout, SelectedWorkgroupCount, LdsPadEn, PadInterval, PadAmount, SelectedWorkgroups>;
+
+    static constexpr int      cache_pol = CachePol;
+    static constexpr uint32_t ndim      = desc_t::ndim;
+    static constexpr bool     has_dim2  = (ndim >= 3), has_dim3 = (ndim >= 4), has_dim4 = (ndim >= 5);
+    static_assert((CachePol & ~0x3F) == 0, "tcopy_window: cache_pol must fit in 6 bits");
+
+    desc_t    desc{};
+    uintptr_t lds_base_addr=0, global_base_addr=0, lds_offset_bytes=0, global_offset_bytes=0;
+    uint32_t  extent0=0, extent1=0, origin0=0, origin1=0;
+    uint64_t  stride0=0;                                                                                // = tcopy tensor_dim0_stride (elements)
+    [[no_unique_address]] impl::tcopy_dim_state<has_dim2> dim2{};
+    [[no_unique_address]] impl::tcopy_dim_state<has_dim3> dim3{};
+    [[no_unique_address]] impl::tcopy_dim_state<has_dim4> dim4{};
+
+    // 2D make; 3D/4D/5D SFINAE overloads omitted (uncommon).
+    OPUS_H_D void make(uintptr_t lds_base, const void* global_base, uintptr_t lds_off, uint32_t td0, uint32_t td1, uint64_t s0, uint32_t o0=0, uint32_t o1=0) {
+        lds_base_addr=lds_base; global_base_addr=reinterpret_cast<uintptr_t>(global_base);
+        lds_offset_bytes=lds_off; stride0=s0; origin0=o0; origin1=o1;
+        extent0=o0+td0; extent1=o1+td1; materialize_desc_initial();
+    }
+
+    template<int cpol = cache_pol>
+    OPUS_D void load_to_lds() const {
+        if constexpr (ndim == 2)
+            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tcopy_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tcopy_sg1_vec, desc.sg1), impl::tcopy_sg2_vec{0,0,0,0}, impl::tcopy_sg3_vec{0,0,0,0}, impl::tcopy_sg_extra_vec{0,0,0,0,0,0,0,0}, cpol);
+        else
+            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tcopy_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tcopy_sg1_vec, desc.sg1), __builtin_bit_cast(impl::tcopy_sg2_vec, desc.sg2), __builtin_bit_cast(impl::tcopy_sg3_vec, desc.sg3), impl::tcopy_sg_extra_vec{0,0,0,0,0,0,0,0}, cpol);
+    }
+
+    // move(d0..d4, lds): per-dim signed deltas + lds byte delta. 0_I args are compile-time elided.
+    template<typename D0=number<0>, typename D1=number<0>, typename D2=number<0>, typename D3=number<0>, typename D4=number<0>, typename Lds=number<0>>
+    OPUS_H_D void move(D0 d0={}, D1 d1={}, D2 d2={}, D3 d3={}, D4 d4={}, Lds lds={}) {
+        static_assert(has_dim2 || impl::is_static_zero_v<D2>, "tcopy_window::move(): d2 requires has_dim2");
+        static_assert(has_dim3 || impl::is_static_zero_v<D3>, "tcopy_window::move(): d3 requires has_dim3");
+        static_assert(has_dim4 || impl::is_static_zero_v<D4>, "tcopy_window::move(): d4 requires has_dim4");
+        constexpr bool z0=impl::is_static_zero_v<D0>, z1=impl::is_static_zero_v<D1>, z2=impl::is_static_zero_v<D2>, z3=impl::is_static_zero_v<D3>, z4=impl::is_static_zero_v<D4>, zL=impl::is_static_zero_v<Lds>;
+        if constexpr (!z0)             origin0     = uint32_t(int64_t(origin0)     + int64_t(d0));
+        if constexpr (!z1)             origin1     = uint32_t(int64_t(origin1)     + int64_t(d1));
+        if constexpr (has_dim2 && !z2) dim2.origin = uint32_t(int64_t(dim2.origin) + int64_t(d2));
+        if constexpr (has_dim3 && !z3) dim3.origin = uint32_t(int64_t(dim3.origin) + int64_t(d3));
+        if constexpr (has_dim4 && !z4) dim4.origin = uint32_t(int64_t(dim4.origin) + int64_t(d4));
+        constexpr bool any_moved = !z0 || !z1 || (has_dim2 && !z2) || (has_dim3 && !z3) || (has_dim4 && !z4);
+        if constexpr (any_moved) { global_offset_bytes = uintptr_t(intptr_t(global_offset_bytes) + coord_delta_to_global_offset_bytes(d0, d1, d2, d3, d4)); desc.set_global_addr(global_base_addr + global_offset_bytes); }
+        if constexpr (!zL)       { lds_offset_bytes    = uintptr_t(intptr_t(lds_offset_bytes)    + intptr_t(lds)); desc.sg0[1] = uint32_t(lds_base_addr + lds_offset_bytes); }   // lds_addr direct dword write
+        if constexpr (!z0)             desc.set_tensor_dim0(impl::tcopy_saturating_sub(extent0,     origin0));
+        if constexpr (!z1)             desc.set_tensor_dim1(impl::tcopy_saturating_sub(extent1,     origin1));
+        if constexpr (has_dim2 && !z2) desc.set_tensor_dim2(impl::tcopy_saturating_sub(dim2.extent, dim2.origin));
+        if constexpr (has_dim3 && !z3) desc.set_tensor_dim3(impl::tcopy_saturating_sub(dim3.extent, dim3.origin));
+        if constexpr (has_dim4 && !z4) desc.set_tensor_dim4(impl::tcopy_saturating_sub(dim4.extent, dim4.origin));
+    }
+private:
+    template<typename D0, typename D1, typename D2, typename D3, typename D4>
+    OPUS_H_D constexpr int64_t coord_delta_to_global_offset_bytes(D0 d0, D1 d1, D2 d2, D3 d3, D4 d4) const {
+        int64_t dg = 0;
+        if constexpr (!impl::is_static_zero_v<D0>)             dg += int64_t(d0) * int64_t(sizeof(DataType));
+        if constexpr (!impl::is_static_zero_v<D1>)             dg += int64_t(d1) * int64_t(stride0)     * int64_t(sizeof(DataType));
+        if constexpr (has_dim2 && !impl::is_static_zero_v<D2>) dg += int64_t(d2) * int64_t(dim2.stride) * int64_t(sizeof(DataType));
+        if constexpr (has_dim3 && !impl::is_static_zero_v<D3>) dg += int64_t(d3) * int64_t(dim3.stride) * int64_t(sizeof(DataType));
+        if constexpr (has_dim4 && !impl::is_static_zero_v<D4>) dg += int64_t(d4) * int64_t(dim4.stride) * int64_t(sizeof(DataType));
+        return dg;
+    }
+    OPUS_H_D void materialize_desc_initial() {
+        uint64_t s1=0, s2=0, s3=0; uint32_t td2=0, td3=0, td4=0;
+        if constexpr (has_dim2) { s1 = dim2.stride; td2 = dim2.extent; }
+        if constexpr (has_dim3) { s2 = dim3.stride; td3 = dim3.extent; }
+        if constexpr (has_dim4) { s3 = dim4.stride; td4 = dim4.extent; }
+        uint64_t off = uint64_t(origin0) + uint64_t(origin1) * stride0;
+        if constexpr (has_dim2) off += uint64_t(dim2.origin) * dim2.stride;
+        if constexpr (has_dim3) off += uint64_t(dim3.origin) * dim3.stride;
+        if constexpr (has_dim4) off += uint64_t(dim4.origin) * dim4.stride;
+        global_offset_bytes = off * sizeof(DataType);
+        desc.make(lds_base_addr + lds_offset_bytes, reinterpret_cast<const void*>(global_base_addr + global_offset_bytes),
+                  impl::tcopy_saturating_sub(extent0, origin0), impl::tcopy_saturating_sub(extent1, origin1),
+                  stride0, s1, 0, td2, td3, s2, s3, td4);
+    }
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
 // mem type traits & free function wrappers (eliminate .template syntax in dependent context)
 template<typename>   struct is_gmem : false_type {};
 template<typename T> struct is_gmem<gmem<T>> : true_type {};
