@@ -685,6 +685,7 @@ def _check_split_k_semaphore_capacity(
         )
 
 
+@functools.lru_cache(maxsize=16384)
 def _compile_flydsl_hgemm(
     dtype: str,
     m: int,
