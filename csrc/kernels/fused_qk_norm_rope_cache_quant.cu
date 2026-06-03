@@ -3389,4 +3389,192 @@ void fused_qk_norm_rope_2way_fp8_perhead_quant(aiter_tensor_t& q0,
         });
 }
 
+// ---------- per-(batch, head) FP8 V quant (2-way, no bf16 cat) ----------
+
+__device__ __forceinline__ void atomic_fmax_pos(float* addr, float val)
+{
+    int* iaddr = reinterpret_cast<int*>(addr);
+    int ival   = __float_as_int(val);
+    atomicMax(iaddr, ival);
+}
+
+__global__ void v_amax_to_descale_kernel(const float* __restrict__ v_amax,
+                                         int num_heads,
+                                         float* __restrict__ v_descale)
+{
+    int b   = blockIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= num_heads) return;
+    constexpr float fp8_max = 240.0f;
+    v_descale[b * num_heads + idx] =
+        fmaxf(v_amax[b * num_heads + idx], 1e-8f) / fp8_max;
+}
+
+template <typename T, int TILE_T, int HEAD_SIZE>
+__global__ void __launch_bounds__(256) v_2way_per_head_amax_tiled_kernel(
+    const T* __restrict__ v0_,
+    const T* __restrict__ v1_,
+    int num_tokens0,
+    int num_tokens1,
+    int num_heads,
+    float* __restrict__ v_amax)
+{
+    constexpr int BT = 256;
+    int b            = blockIdx.z;
+    int h            = blockIdx.y;
+    int tile         = blockIdx.x;
+    int total_tokens = num_tokens0 + num_tokens1;
+    int t_start      = tile * TILE_T;
+    int t_end        = min(t_start + TILE_T, total_tokens);
+    int slab_h_stride = num_heads * HEAD_SIZE;
+    float local       = 0.0f;
+
+    for(int idx = threadIdx.x; idx < (t_end - t_start) * HEAD_SIZE; idx += BT)
+    {
+        int local_t = idx / HEAD_SIZE;
+        int d       = idx % HEAD_SIZE;
+        int t       = t_start + local_t;
+        float val;
+        if(t < num_tokens0)
+        {
+            int64_t off = ((int64_t)b * num_tokens0 + t) * slab_h_stride +
+                          (int64_t)h * HEAD_SIZE + d;
+            val = (float)v0_[off];
+        }
+        else
+        {
+            int t1      = t - num_tokens0;
+            int64_t off = ((int64_t)b * num_tokens1 + t1) * slab_h_stride +
+                          (int64_t)h * HEAD_SIZE + d;
+            val = (float)v1_[off];
+        }
+        local = fmaxf(local, fabsf(val));
+    }
+
+    __shared__ float sm[BT];
+    sm[threadIdx.x] = local;
+    __syncthreads();
+#pragma unroll
+    for(int s = BT / 2; s > 0; s >>= 1)
+    {
+        if(threadIdx.x < s) sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if(threadIdx.x == 0) atomic_fmax_pos(v_amax + b * num_heads + h, sm[0]);
+}
+
+template <typename T, int TILE_T, int HEAD_SIZE>
+__global__ void __launch_bounds__(256) v_2way_per_head_quant_tiled_kernel(
+    const T* __restrict__ v0_,
+    const T* __restrict__ v1_,
+    int num_tokens0,
+    int num_tokens1,
+    int num_heads,
+    mrope_utils::fp8e4m3fnuz* __restrict__ v_fp8_,
+    const float* __restrict__ v_descale)
+{
+    constexpr int BT = 256;
+    int b            = blockIdx.z;
+    int h            = blockIdx.y;
+    int tile         = blockIdx.x;
+    int total_tokens = num_tokens0 + num_tokens1;
+    int t_start      = tile * TILE_T;
+    int t_end        = min(t_start + TILE_T, total_tokens);
+    int slab_h_stride = num_heads * HEAD_SIZE;
+    float inv         = 1.0f / v_descale[b * num_heads + h];
+
+    for(int idx = threadIdx.x; idx < (t_end - t_start) * HEAD_SIZE; idx += BT)
+    {
+        int local_t = idx / HEAD_SIZE;
+        int d       = idx % HEAD_SIZE;
+        int t       = t_start + local_t;
+        int64_t out_off = ((int64_t)b * total_tokens + t) * slab_h_stride +
+                          (int64_t)h * HEAD_SIZE + d;
+        float val;
+        if(t < num_tokens0)
+        {
+            int64_t in_off = ((int64_t)b * num_tokens0 + t) * slab_h_stride +
+                             (int64_t)h * HEAD_SIZE + d;
+            val = (float)v0_[in_off];
+        }
+        else
+        {
+            int t1         = t - num_tokens0;
+            int64_t in_off = ((int64_t)b * num_tokens1 + t1) * slab_h_stride +
+                             (int64_t)h * HEAD_SIZE + d;
+            val = (float)v1_[in_off];
+        }
+        v_fp8_[out_off] = mrope_utils::fp8e4m3fnuz(val * inv);
+    }
+}
+
+void v_2way_per_head_fp8_quant(aiter_tensor_t& v0,
+                               aiter_tensor_t& v1,
+                               aiter_tensor_t& v_fp8,
+                               aiter_tensor_t& v_descale)
+{
+    AITER_CHECK(v0.is_contiguous() && v1.is_contiguous());
+    AITER_CHECK(v_fp8.is_contiguous() && v_descale.is_contiguous());
+    AITER_CHECK(v0.ndim == 4 && v1.ndim == 4, "v0/v1 must be 4D [B, T, H, D]");
+    int64_t batch_size  = v0.size(0);
+    int64_t num_tokens0 = v0.size(1);
+    int64_t num_tokens1 = v1.size(1);
+    int64_t num_heads   = v0.size(2);
+    int64_t head_size   = v0.size(3);
+    AITER_CHECK(v1.size(0) == batch_size && v1.size(2) == num_heads &&
+                    v1.size(3) == head_size,
+                "v0/v1 must share B/H/D");
+    AITER_CHECK(head_size == 128,
+                "v_2way_per_head_fp8_quant currently only supports head_size=128");
+    AITER_CHECK(v0.dtype() == v1.dtype(), "v0/v1 dtype must match");
+    AITER_CHECK(v_fp8.dtype() == AITER_DTYPE_fp8, "v_fp8 must be fp8");
+    AITER_CHECK(v_descale.dtype() == AITER_DTYPE_fp32, "v_descale must be fp32");
+
+    HipDeviceGuard device_guard(v0.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    AiterTensor v_amax =
+        AiterTensor::empty({batch_size, num_heads}, AITER_DTYPE_fp32, v0.device_id, stream);
+
+    constexpr int TILE_T    = 128;
+    constexpr int HEAD_SIZE = 128;
+    int num_tiles           = (int)((num_tokens0 + num_tokens1 + TILE_T - 1) / TILE_T);
+    dim3 grid((unsigned)num_tiles, (unsigned)num_heads, (unsigned)batch_size);
+    dim3 block(256);
+
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        v0.dtype(), "v_2way_per_head_amax_tiled", [&] {
+            v_2way_per_head_amax_tiled_kernel<scalar_t, TILE_T, HEAD_SIZE>
+                <<<grid, block, 0, stream>>>(
+                    reinterpret_cast<scalar_t*>(v0.data_ptr()),
+                    reinterpret_cast<scalar_t*>(v1.data_ptr()),
+                    (int)num_tokens0,
+                    (int)num_tokens1,
+                    (int)num_heads,
+                    reinterpret_cast<float*>(v_amax.data_ptr()));
+        });
+
+    {
+        dim3 fg((unsigned)((num_heads + 31) / 32), (unsigned)batch_size);
+        dim3 fb(32);
+        v_amax_to_descale_kernel<<<fg, fb, 0, stream>>>(
+            reinterpret_cast<float*>(v_amax.data_ptr()),
+            (int)num_heads,
+            reinterpret_cast<float*>(v_descale.data_ptr()));
+    }
+
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        v0.dtype(), "v_2way_per_head_quant_tiled", [&] {
+            v_2way_per_head_quant_tiled_kernel<scalar_t, TILE_T, HEAD_SIZE>
+                <<<grid, block, 0, stream>>>(
+                    reinterpret_cast<scalar_t*>(v0.data_ptr()),
+                    reinterpret_cast<scalar_t*>(v1.data_ptr()),
+                    (int)num_tokens0,
+                    (int)num_tokens1,
+                    (int)num_heads,
+                    reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(v_fp8.data_ptr()),
+                    reinterpret_cast<float*>(v_descale.data_ptr()));
+        });
+}
+
 } // namespace aiter

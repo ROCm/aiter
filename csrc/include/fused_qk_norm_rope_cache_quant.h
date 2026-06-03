@@ -121,6 +121,13 @@ void fused_qk_norm_rope_2way_fp8_perhead_quant(aiter_tensor_t& q0,
                                                aiter_tensor_t& q_unquantized,
                                                aiter_tensor_t& k_unquantized);
 
+// Per-(batch, head) FP8 quant for concatenated [v0, v1] without a bf16 cat.
+// v0/v1: [B, T0/T1, H, D]; v_fp8: [B, T0+T1, H, D]; v_descale: [B, H].
+void v_2way_per_head_fp8_quant(aiter_tensor_t& v0,
+                               aiter_tensor_t& v1,
+                               aiter_tensor_t& v_fp8,
+                               aiter_tensor_t& v_descale);
+
 void fused_qk_rmsnorm(aiter_tensor_t& q,
                       aiter_tensor_t& q_weight,
                       double q_eps,

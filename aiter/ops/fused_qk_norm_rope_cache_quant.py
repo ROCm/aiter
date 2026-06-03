@@ -371,7 +371,33 @@ def fused_qk_norm_rope_2way_fp8_perhead_quant(
     return q_fp8, k_fp8, q_descale, k_descale, q_unquantized, k_unquantized
 
 
-@compile_ops("module_v_per_head_fp8_quant")
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="v_2way_per_head_fp8_quant",
+    develop=True,
+)
+def _v_2way_per_head_fp8_quant_kernel(
+    v0: Tensor,
+    v1: Tensor,
+    v_fp8: Tensor,
+    v_descale: Tensor,
+) -> None: ...
+
+
 def v_2way_per_head_fp8_quant(v0: Tensor, v1: Tensor) -> tuple[Tensor, Tensor]:
     """Per-(batch, head) FP8 quant for concatenated [v0, v1] without bf16 cat."""
-    ...
+    batch_size = v0.size(0)
+    num_heads = v0.size(2)
+    head_size = v0.size(3)
+    total_tokens = v0.size(1) + v1.size(1)
+    fp8_dtype = get_dtype_fp8()
+    v_fp8 = torch.empty(
+        (batch_size, total_tokens, num_heads, head_size),
+        dtype=fp8_dtype,
+        device=v0.device,
+    )
+    v_descale = torch.empty(
+        (batch_size, num_heads), dtype=torch.float32, device=v0.device
+    )
+    _v_2way_per_head_fp8_quant_kernel(v0, v1, v_fp8, v_descale)
+    return v_fp8, v_descale
