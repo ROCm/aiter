@@ -387,9 +387,9 @@ def routing_ds(
         # Routed top-k + appended shared experts per token.
         n_expts_act = n_expts_act + n_shared
     else:
-        assert n_shared == 0, (
-            "fused shared experts are only supported on the grouped-topk path"
-        )
+        assert (
+            n_shared == 0
+        ), "fused shared experts are only supported on the grouped-topk path"
         from .topk import topk
 
         expt_scal, expt_indx, bitmatrix = topk(

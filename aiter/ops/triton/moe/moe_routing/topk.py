@@ -1,6 +1,10 @@
 import triton
 import torch
-from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import _topk, _hash_routing, _grouped_topk
+from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import (
+    _topk,
+    _hash_routing,
+    _grouped_topk,
+)
 from aiter.ops.triton.moe.moe_routing.bitmatrix import Bitmatrix
 
 
@@ -11,7 +15,7 @@ def grouped_topk(
     topk_group: int,
     *,
     expert_group: torch.Tensor | None = None,
-    apply_softmax: bool = False,        # accepted for parity with topk(); ignored
+    apply_softmax: bool = False,  # accepted for parity with topk(); ignored
     HIST_BLOCK_M: int = 32,
     score_mode: str = "softmax",
     bias: torch.Tensor | None = None,
@@ -43,31 +47,35 @@ def grouped_topk(
     """
     assert x.dim() == 2
     n_rows, n_cols = x.shape
-    assert n_cols <= 256, (
-        f"DeepSeek-class envelope: n_expts_tot ({n_cols}) must be <= 256"
-    )
+    assert (
+        n_cols <= 256
+    ), f"DeepSeek-class envelope: n_expts_tot ({n_cols}) must be <= 256"
     # Fused shared experts are appended (always-on) AFTER the routed selection;
     # they occupy expert ids [n_cols, n_cols + num_fused_shared_experts).
     n_shared = num_fused_shared_experts
     assert n_shared >= 0
-    n_total = n_cols + n_shared          # experts incl. shared (bitmatrix width)
-    k_out = k + n_shared                 # output width (routed top-k + shared)
+    n_total = n_cols + n_shared  # experts incl. shared (bitmatrix width)
+    k_out = k + n_shared  # output width (routed top-k + shared)
     assert num_expert_group > 1
-    assert num_expert_group <= 16, (
-        f"NUM_EXPERT_GROUP ({num_expert_group}) > 16 not supported"
-    )
+    assert (
+        num_expert_group <= 16
+    ), f"NUM_EXPERT_GROUP ({num_expert_group}) > 16 not supported"
     assert 0 < topk_group <= num_expert_group
     assert 0 < k <= 16
-    assert score_mode in ("softmax", "sigmoid", "sqrtsoftplus", "none"), (
-        f"unknown score_mode {score_mode!r}"
-    )
+    assert score_mode in (
+        "softmax",
+        "sigmoid",
+        "sqrtsoftplus",
+        "none",
+    ), f"unknown score_mode {score_mode!r}"
     has_bias = bias is not None
     if has_bias:
         assert bias.dim() == 1 and bias.shape[0] == n_cols
         assert bias.dtype == torch.float32
-        assert score_mode in ("sqrtsoftplus", "sigmoid"), (
-            "bias only supported with sqrtsoftplus / sigmoid"
-        )
+        assert score_mode in (
+            "sqrtsoftplus",
+            "sigmoid",
+        ), "bias only supported with sqrtsoftplus / sigmoid"
 
     dev = x.device
 
@@ -171,7 +179,6 @@ def grouped_topk(
         scratchpad_partials=scratchpad_partials,
     )
     return y_vals, y_indx, bitmatrix
-
 
 
 def topk(

@@ -428,24 +428,23 @@ def _hash_routing(
         tl.store(BitsPtrs, r, mask=mask_m[:, None])
 
 
-
 @triton.jit
 def _grouped_topk(
-    X,                      # router logits [n_rows, n_expts_tot] (bf16/fp32)
+    X,  # router logits [n_rows, n_expts_tot] (bf16/fp32)
     stride_xm,
-    ExpertGroup,            # int32 [n_expts_tot] expert→group_id
-    Yv,                     # [n_rows, N_EXPTS_ACT_PAD] selected weights
-    Yi,                     # [n_rows, N_EXPTS_ACT_PAD] selected expert ids (int16)
+    ExpertGroup,  # int32 [n_expts_tot] expert→group_id
+    Yv,  # [n_rows, N_EXPTS_ACT_PAD] selected weights
+    Yi,  # [n_rows, N_EXPTS_ACT_PAD] selected expert ids (int16)
     stride_ym,
-    Bits,                   # bitmatrix data
+    Bits,  # bitmatrix data
     stride_rm,
     stride_rn,
     n_rows,
     n_expts_tot,
-    S,                      # bitmatrix scratchpad — must memset to 0
+    S,  # bitmatrix scratchpad — must memset to 0
     BLOCK_S: tl.constexpr,
     s_blocks,
-    SP,                     # bitmatrix partials — must memset to 0
+    SP,  # bitmatrix partials — must memset to 0
     BLOCK_SP: tl.constexpr,
     sp_blocks,
     sp_size,
@@ -528,7 +527,7 @@ def _grouped_topk(
     # -- 4. Per-group reduction over arbitrary expert→group mapping.
     gid = tl.load(ExpertGroup + offs_n, mask=mask_n, other=0).to(tl.int32)
     g_arange = tl.arange(0, NUM_EXPERT_GROUP)
-    gid_eq = gid[:, None] == g_arange[None, :]   # [BLOCK_N, NUM_EXPERT_GROUP]
+    gid_eq = gid[:, None] == g_arange[None, :]  # [BLOCK_N, NUM_EXPERT_GROUP]
 
     # 3-D one-hot expand: [BLOCK_M, BLOCK_N, NUM_EXPERT_GROUP], with -inf
     # outside each group's column.
@@ -536,7 +535,7 @@ def _grouped_topk(
         BLOCK_M, BLOCK_N, NUM_EXPERT_GROUP
     )
     expanded = tl.where(gid_eq[None, :, :], sfc_3d, float("-inf"))
-    group_max1 = tl.max(expanded, axis=1)        # [BLOCK_M, NUM_EXPERT_GROUP]
+    group_max1 = tl.max(expanded, axis=1)  # [BLOCK_M, NUM_EXPERT_GROUP]
 
     if HAS_BIAS:
         # Top-2-sum-per-group. To find the second-largest score per group
@@ -545,13 +544,11 @@ def _grouped_topk(
         gm1_per_e = tl.sum(
             gid_eq[None, :, :].to(tl.float32) * group_max1[:, None, :],
             axis=2,
-        )                                         # [BLOCK_M, BLOCK_N]
+        )  # [BLOCK_M, BLOCK_N]
         suppressed = tl.where(
             scores_for_choice == gm1_per_e, float("-inf"), scores_for_choice
         )
-        sup_3d = suppressed[:, :, None].broadcast_to(
-            BLOCK_M, BLOCK_N, NUM_EXPERT_GROUP
-        )
+        sup_3d = suppressed[:, :, None].broadcast_to(BLOCK_M, BLOCK_N, NUM_EXPERT_GROUP)
         expanded2 = tl.where(gid_eq[None, :, :], sup_3d, float("-inf"))
         group_max2 = tl.max(expanded2, axis=1)
         group_scores = group_max1 + group_max2
@@ -563,17 +560,20 @@ def _grouped_topk(
     group_mask_i = tl.zeros([BLOCK_M, NUM_EXPERT_GROUP], dtype=tl.int32)
     gs = group_scores
     for _gj in tl.static_range(TOPK_GROUP):
-        am_g = tl.argmax(gs, axis=1).to(tl.int32)            # [BLOCK_M]
-        sel_g = (g_arange[None, :] == am_g[:, None])         # [BLOCK_M, NUM_EXPERT_GROUP]
+        am_g = tl.argmax(gs, axis=1).to(tl.int32)  # [BLOCK_M]
+        sel_g = g_arange[None, :] == am_g[:, None]  # [BLOCK_M, NUM_EXPERT_GROUP]
         group_mask_i = group_mask_i | sel_g.to(tl.int32)
         gs = tl.where(sel_g, float("-inf"), gs)
 
     # -- 6. Per-(token, expert) keep-mask via group-id lookup, then suppress
     #       experts in non-selected groups on the bias-augmented scores.
-    expert_keep = tl.sum(
-        gid_eq[None, :, :].to(tl.int32) * group_mask_i[:, None, :],
-        axis=2,
-    ) > 0                                                    # [BLOCK_M, BLOCK_N]
+    expert_keep = (
+        tl.sum(
+            gid_eq[None, :, :].to(tl.int32) * group_mask_i[:, None, :],
+            axis=2,
+        )
+        > 0
+    )  # [BLOCK_M, BLOCK_N]
     sfc_masked = tl.where(expert_keep, scores_for_choice, float("-inf"))
 
     # -- 7. Per-expert top-``N_EXPTS_ACT`` via repeated argmax. Padded slots
@@ -583,17 +583,15 @@ def _grouped_topk(
     y_indices = tl.zeros([BLOCK_M, N_EXPTS_ACT_PAD], dtype=tl.int32)
     sfc_iter = sfc_masked
     for kj in tl.static_range(N_EXPTS_ACT):
-        am_k = tl.argmax(sfc_iter, axis=1).to(tl.int32)      # [BLOCK_M]
+        am_k = tl.argmax(sfc_iter, axis=1).to(tl.int32)  # [BLOCK_M]
         slot_eq = (tl.arange(0, N_EXPTS_ACT_PAD) == kj)[None, :]
         y_indices = tl.where(slot_eq, am_k[:, None], y_indices)
-        sfc_iter = tl.where(
-            n_arange[None, :] == am_k[:, None], float("-inf"), sfc_iter
-        )
+        sfc_iter = tl.where(n_arange[None, :] == am_k[:, None], float("-inf"), sfc_iter)
 
     # -- 8. Gather UNBIASED weights at selected indices.
     pos_eq = (
         n_arange[None, None, :] == y_indices[:, :, None]
-    )                                                        # [BLOCK_M, K_PAD, BLOCK_N]
+    )  # [BLOCK_M, K_PAD, BLOCK_N]
     scores_3d = scores[:, None, :].broadcast_to(BLOCK_M, N_EXPTS_ACT_PAD, BLOCK_N)
     y_weights = tl.sum(tl.where(pos_eq, scores_3d, 0.0), axis=2)  # [BLOCK_M, K_PAD]
 
@@ -641,7 +639,7 @@ def _grouped_topk(
     safe_idx = tl.where(real_mask, y_indices, 0).to(tl.uint32)
     y_div = safe_idx // 32
     y_rem = safe_idx % 32
-    bm_iters: tl.constexpr = N_EXPTS_PAD // BLOCK_N          # = 1 (single-block)
+    bm_iters: tl.constexpr = N_EXPTS_PAD // BLOCK_N  # = 1 (single-block)
     for i in range(bm_iters):
         offs_r_n = tl.arange(0, BLOCK_N // 32) + i * (BLOCK_N // 32)
         y2 = tl.where(
@@ -650,8 +648,5 @@ def _grouped_topk(
             0,
         )
         r = tl.reduce_or(y2, axis=1)
-        BitsPtrs = (
-            Bits + offs_m[:, None] * stride_rm + offs_r_n[None, :] * stride_rn
-        )
+        BitsPtrs = Bits + offs_m[:, None] * stride_rm + offs_r_n[None, :] * stride_rn
         tl.store(BitsPtrs, r, mask=mask_m[:, None])
-
