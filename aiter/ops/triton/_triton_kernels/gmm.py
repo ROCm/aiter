@@ -18,6 +18,7 @@ import triton.language as tl
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 # Kernel config.
 # ------------------------------------------------------------------------------
@@ -397,7 +398,23 @@ def _work_stealing_gmm(
         == 0,
     }
 )
-@triton.jit
+@triton.jit(
+    repr=make_kernel_repr(
+        "gmm_kernel",
+        (
+            "TRANS_RHS",
+            "BLOCK_SIZE_G",
+            "BLOCK_SIZE_M",
+            "BLOCK_SIZE_K",
+            "BLOCK_SIZE_N",
+            "K_DIVISIBLE_BY_BLOCK_SIZE_K",
+            "GROUP_SIZE",
+            "GRID_DIM",
+            "USE_BIAS",
+            "WORK_STEALING",
+        ),
+    )
+)
 def gmm_kernel(
     # Tensor pointers:
     lhs_ptr,
@@ -489,7 +506,21 @@ def gmm_kernel(
 # ------------------------------------------------------------------------------
 
 
-@triton.jit
+@triton.jit(
+    repr=make_kernel_repr(
+        "tgmm_persistent_kernel",
+        (
+            "TRANS_LHS",
+            "BLOCK_SIZE_M",
+            "BLOCK_SIZE_K",
+            "BLOCK_SIZE_N",
+            "GROUP_SIZE",
+            "GRID_DIM",
+            "COMPUTE_BIAS_GRAD",
+            "ACCUMULATE",
+        ),
+    )
+)
 def tgmm_persistent_kernel(
     # Tensor pointers:
     lhs_ptr,
@@ -679,7 +710,21 @@ def tgmm_persistent_kernel(
 
 
 @triton.heuristics({"BLOCK_SIZE_G": lambda META: triton.next_power_of_2(META["G"])})
-@triton.jit
+@triton.jit(
+    repr=make_kernel_repr(
+        "tgmm_non_persistent_kernel",
+        (
+            "TRANS_LHS",
+            "BLOCK_SIZE_G",
+            "BLOCK_SIZE_M",
+            "BLOCK_SIZE_K",
+            "BLOCK_SIZE_N",
+            "GROUP_SIZE",
+            "COMPUTE_BIAS_GRAD",
+            "ACCUMULATE",
+        ),
+    )
+)
 def tgmm_non_persistent_kernel(
     # Tensor pointers:
     lhs_ptr,
