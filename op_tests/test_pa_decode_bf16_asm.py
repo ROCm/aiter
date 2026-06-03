@@ -13,10 +13,12 @@ Kernel properties (see the reference host file sched2/pa_ps.cpp):
 
 Style mirrors op_tests/test_pa_ps.py: a torch host reference is compared against
 the kernel via aiter.test_common.checkAllclose (no pytest), driven by argparse
-over a config grid.  Supports arbitrary kv_len (multi-page): the persistent
-kernel splits KV across workgroups and writes partials into split_o/split_lse,
-then pa_reduce_v1 combines them into the final output (same compose as
-pa_persistent_fwd).
+over a config grid.  Supports arbitrary kv_len (multi-page) via split-KV.
+
+The gfx1250 split-KV reduce kernel is WIP, so the PA stage runs on GPU and the
+LSE merge runs on host in cpu_reduce (which faithfully matches aiter
+csrc/kernels/mla/reduce.cu).  The summary also reports n_partial / unwritten to
+flag any partial slots the kernel did not write (a kernel/metadata mismatch).
 """
 
 import argparse
@@ -48,15 +50,7 @@ def make_persistent_metadata(
     batch, kv_head_num, gqa, qo_indptr, kv_indptr, context_lens, page_size,
     max_qlen, uni_qlen, device,
 ):
-    """Generate work + reduce metadata via aiter's GPU helper.
-
-    The PA-decode kernel is the persistent / split-KV variant: every workgroup
-    reads work_indptr+work_info to find its (batch, q-head, kv-range) slice, and
-    the reduce maps tell pa_reduce_v1 how to merge split partials.  All MUST be
-    non-null.  aiter's `WorkInfo` union (csrc/include/ps.h) is byte-identical to
-    the sched2 ps::WORK_INFO this kernel was authored against, so the metadata is
-    directly consumable.
-    """
+    """Generate split-KV work + reduce metadata via aiter.get_pa_metadata_v1."""
     (
         (work_meta_data_size, work_meta_data_type),
         (work_indptr_size, work_indptr_type),
@@ -74,32 +68,56 @@ def make_persistent_metadata(
     reduce_partial_map = torch.empty(reduce_partial_map_size, dtype=reduce_partial_map_type, device=device)
 
     aiter.get_pa_metadata_v1(
-        qo_indptr,
-        kv_indptr,
-        context_lens,
-        gqa,
-        kv_head_num,
-        True,
-        work_metadata_ptrs,
-        work_indptr,
-        work_info,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-        kv_granularity=max(page_size, 16),
-        block_size=page_size,
-        max_seqlen_qo=int(max_qlen),
-        uni_seqlen_qo=int(uni_qlen),
-        fast_mode=True,
-        max_split_per_batch=-1,
+        qo_indptr, kv_indptr, context_lens, gqa, kv_head_num, True,
+        work_metadata_ptrs, work_indptr, work_info,
+        reduce_indptr, reduce_final_map, reduce_partial_map,
+        kv_granularity=max(page_size, 16), block_size=page_size,
+        max_seqlen_qo=int(max_qlen), uni_seqlen_qo=int(uni_qlen),
+        fast_mode=True, max_split_per_batch=-1,
     )
-    return (
-        work_indptr,
-        work_info,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-    )
+    return work_indptr, work_info, reduce_indptr, reduce_final_map, reduce_partial_map
+
+
+def cpu_reduce(out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_partial_map, gqa):
+    """Host reduce (matches aiter csrc/kernels/mla/reduce.cu convention, natural log):
+        global_lse = max_lse + log(sum exp(lse - max_lse))
+        out        = sum_p partial_o_p * exp(lse_p - global_lse)
+    partial_lse layout [row, head]; partial_output [row, head, dv]; row = loc+local_seq.
+    Only reduced rows are touched; padded groups (start>=end) skipped.
+    Returns (out, n_referenced, n_unwritten) for diagnostics.
+    """
+    batch, qlen, kv_head_num = out.shape[0], out.shape[1], out.shape[2]
+    head_dim = out.shape[-1]
+    q_head_num = kv_head_num * gqa
+    total_s = batch * qlen
+    out_flat = out.view(total_s, q_head_num, head_dim)
+    so = split_o.reshape(split_o.shape[0], q_head_num, head_dim).float()
+    sl = split_lse.reshape(split_lse.shape[0], q_head_num).float()
+
+    rip = reduce_indptr.to(torch.int64).tolist()
+    rfm = reduce_final_map.to(torch.int64).reshape(-1, 2).tolist()
+    rpm = reduce_partial_map.to(torch.int64)
+
+    n_ref = 0
+    n_unwritten = 0
+    for g in range(len(rip) - 1):
+        s0, s1 = rip[g], rip[g + 1]
+        if s1 <= s0:
+            continue
+        qo_start, qo_end = rfm[g][0], rfm[g][1]
+        base = rpm[s0:s1]
+        for seq_id in range(qo_start, qo_end):
+            locs = base + (seq_id - qo_start)
+            lses = sl[locs]                       # [P, q_head_num]
+            n_ref += lses.numel()
+            n_unwritten += int(torch.isinf(lses).sum().item())
+            m = lses.max(dim=0).values
+            s = torch.exp(lses - m).sum(dim=0)
+            global_lse = m + torch.log(s)
+            scale = torch.exp(lses - global_lse)
+            o = (so[locs] * scale.unsqueeze(-1)).sum(dim=0)
+            out_flat[seq_id] = o.to(out_flat.dtype)
+    return out, n_ref, n_unwritten
 
 
 def ref_pa_decode(
@@ -151,9 +169,9 @@ def run_pa_stage(
     gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
     work_indptr, work_info, split_o, split_lse,
 ):
-    # PA stage only: writes O directly for non-split work items and partials into
-    # split_o/split_lse for split (multi-page) ones.  (num_rotate_args=1 so the
-    # split buffers after the call belong to the same call whose `out` we keep.)
+    # PA stage: direct-to-O for non-split work items, partials -> split_o/split_lse
+    # for split (multi-page) ones.  num_rotate_args=1 so the split buffers after
+    # the call belong to the same call whose `out` we keep.
     return aiter.pa_decode_bf16_asm(
         Q, K, V, kv_indices, context_lens, softmax_scale, kv_indptr,
         gqa=gqa, mtp=mtp,
@@ -161,47 +179,6 @@ def run_pa_stage(
         qo_indptr=qo_indptr, work_indptr=work_indptr, work_info=work_info,
         split_o=split_o, split_lse=split_lse,
     )
-
-
-def cpu_reduce(out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_partial_map, gqa):
-    """Host (torch) replacement for pa_reduce_v1 (gfx1250 reduce kernel WIP).
-
-    Merges the kernel's split partials into the final O in place, mirroring
-    sched2 common_pa_ps.h::paged_attention_reduce: per reduce group,
-        final_lse = max_lse + log(sum exp(lse - max_lse))
-        final_o   = sum_p partial_o_p * exp(lse_p - final_lse)
-    Rows written directly to O by the kernel (partial_o_loc == -1, not in any
-    reduce group) are left untouched.  Empty/padded groups (start >= end) skip.
-    """
-    batch, qlen, kv_head_num = out.shape[0], out.shape[1], out.shape[2]
-    head_dim = out.shape[-1]
-    q_head_num = kv_head_num * gqa
-    total_s = batch * qlen
-
-    out_flat = out.view(total_s, q_head_num, head_dim)
-    so = split_o.reshape(split_o.shape[0], q_head_num, head_dim).float()
-    sl = split_lse.reshape(split_lse.shape[0], q_head_num).float()
-
-    rip = reduce_indptr.to(torch.int64).tolist()
-    rfm = reduce_final_map.to(torch.int64).reshape(-1, 2).tolist()
-    rpm = reduce_partial_map.to(torch.int64)
-
-    for g in range(len(rip) - 1):
-        s0, s1 = rip[g], rip[g + 1]
-        if s1 <= s0:  # padded/empty group
-            continue
-        qo_start, qo_end = rfm[g][0], rfm[g][1]
-        base = rpm[s0:s1]  # [P] partial_o_loc base for each split
-        for seq_id in range(qo_start, qo_end):
-            locs = base + (seq_id - qo_start)
-            lses = sl[locs]                       # [P, q_head_num]
-            m = lses.max(dim=0).values            # [q_head_num]
-            s = torch.exp(lses - m).sum(dim=0)    # [q_head_num]
-            final_lse = m + torch.log(s)          # [q_head_num]
-            scale = torch.exp(lses - final_lse)   # [P, q_head_num]
-            o = (so[locs] * scale.unsqueeze(-1)).sum(dim=0)  # [q_head_num, head_dim]
-            out_flat[seq_id] = o.to(out_flat.dtype)
-    return out
 
 
 @benchmark()
@@ -218,7 +195,6 @@ def test_pa_decode(
     page_size = PA_PAGE_SIZE
     mtp = 0
     qlen_with_mtp = mtp + 1
-    q_head_num = kv_head_num * gqa
     device = "cuda"
 
     query_scale, key_scale, value_scale = scales
@@ -255,35 +231,31 @@ def test_pa_decode(
     K = (0.5 * torch.randn(num_phys_pages, kv_head_num, head_dim // 16, page_size, 16, device=device)).to(fp8)
     V = (0.5 * torch.randn(num_phys_pages, kv_head_num, page_size // 16, head_dim, 16, device=device)).to(fp8)
 
-    # ---- persistent metadata + split scratch ----
+    # ---- split-KV metadata + split scratch (host reduce; gfx1250 reduce WIP) ----
     max_qlen = qlen_with_mtp
+    q_head_num = kv_head_num * gqa
     (
-        work_indptr,
-        work_info,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
+        work_indptr, work_info,
+        reduce_indptr, reduce_final_map, reduce_partial_map,
     ) = make_persistent_metadata(
         batch, kv_head_num, gqa, qo_indptr, kv_indptr, seq_lens_kv,
         page_size, max_qlen, qlen_with_mtp, device,
     )
     split_rows = reduce_partial_map.size(0) * max_qlen
-    # Init split_lse=-inf / split_o=0 so any split the kernel leaves unwritten
-    # (e.g. an empty-kv split the scheduler created for a short sequence)
-    # contributes exp(lse-max)=0 and is ignored by the host reduce.
+    # -inf lse / 0 o so any split the kernel leaves unwritten is inert in reduce.
     split_o = torch.zeros((split_rows, 1, q_head_num, head_dim), dtype=dtypes.fp32, device=device)
     split_lse = torch.full(
         (split_rows, 1, q_head_num, 1), float("-inf"), dtype=dtypes.fp32, device=device
     )
 
-    # PA stage on GPU (timed); reduce on host (gfx1250 reduce kernel is WIP).
     out, us = run_pa_stage(
         Q, K, V, kv_indices, seq_lens_kv, softmax_scale, kv_indptr,
         gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
         work_indptr, work_info, split_o, split_lse,
     )
     torch.cuda.synchronize()
-    out = cpu_reduce(
+
+    out, n_ref, n_unwritten = cpu_reduce(
         out, split_o, split_lse,
         reduce_indptr, reduce_final_map, reduce_partial_map, gqa,
     )
@@ -302,9 +274,15 @@ def test_pa_decode(
         msg="[torch vs pa_decode_bf16_asm][fp8]: us......",
     )
 
-    # us_pa = PA kernel stage only (reduce runs on host until the gfx1250 reduce
-    # kernel lands, so it is excluded from the kernel latency number).
-    return {"max_kv": int(seq_lens_kv.max().item()), "us_pa": us, "err": err}
+    # Diagnostics: n_ref = partial (row,head) entries the reduce read; unwritten =
+    # those still -inf (kernel never wrote them -> kernel/metadata split mismatch).
+    return {
+        "max_kv": int(seq_lens_kv.max().item()),
+        "us_pa": us,
+        "n_partial": n_ref,
+        "unwritten": n_unwritten,
+        "err": err,
+    }
 
 
 parser = argparse.ArgumentParser(
