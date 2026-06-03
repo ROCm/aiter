@@ -10,7 +10,9 @@
 namespace aiter {
 
 void fused_qk_norm_rope_cache_quant_shuffle(
-    aiter_tensor_t& qkv,
+    aiter_tensor_t& q,
+    aiter_tensor_t& k,
+    aiter_tensor_t& v,
     int64_t num_heads_q,
     int64_t num_heads_k,
     int64_t num_heads_v,
@@ -26,10 +28,7 @@ void fused_qk_norm_rope_cache_quant_shuffle(
     aiter_tensor_t& slot_mapping,
     const std::string& kv_cache_dtype,
     std::optional<aiter_tensor_t> k_scale,
-    std::optional<aiter_tensor_t> v_scale,
-    std::optional<aiter_tensor_t> opt_q = std::nullopt,
-    std::optional<aiter_tensor_t> opt_k = std::nullopt,
-    std::optional<aiter_tensor_t> opt_v = std::nullopt);
+    std::optional<aiter_tensor_t> v_scale);
 
 void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                 aiter_tensor_t& qw,

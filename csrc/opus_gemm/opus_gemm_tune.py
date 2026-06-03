@@ -194,6 +194,25 @@ def kid_rejects_shape(k_inst, M, N, K):
             splitk main kernel's mask_va_tail cover both edge cases, so
             splitk is safe for any (M, N, K).
     """
+    # 4 GiB buffer-resource filter. Legacy a16w16 kids build a single
+    # AMDGPU buffer-resource per tensor (A/B/C), whose `num_records` field
+    # is 32-bit -- any of the three exceeding UINT32_MAX bytes wraps and
+    # the kernel OOB-writes. 4g_safe kids carry per-WG-tight BR sizing so
+    # they remain valid for arbitrarily large M/N/K; only legacy kids must
+    # be filtered. Replaces the prior shape-wide reject at tune/runtime
+    # entry (commit 739771b5 reverted).
+    if not getattr(k_inst, "is_4g_safe", False):
+        _UINT32_MAX_BYTES = (1 << 32) - 1
+        # B is bf16 in a16w16 family; C dtype is decided per-call but is
+        # at most 4B (fp32 accum). Use 4B upper bound for C so this filter
+        # stays dtype-agnostic.
+        if (
+            M * K * 2 > _UINT32_MAX_BYTES
+            or N * K * 2 > _UINT32_MAX_BYTES
+            or M * N * 4 > _UINT32_MAX_BYTES
+        ):
+            return True
+
     B_K = k_inst.B_K
     loops = _ceil_div(K, B_K)
 
@@ -260,6 +279,17 @@ def kid_rejects_shape(k_inst, M, N, K):
             return True
         if N % 16 != 0:
             return True
+        # In the >4 GiB regime, the persistent pipeline's M-outer + XCD
+        # swizzle distribution only pays off when M >= N (work is dealt
+        # along the long dimension). For very wide shapes (N >> M, e.g.
+        # M=32k N=129k) split-barrier beats persistent by 5-8x. Restrict
+        # 4g_safe persistent candidates to M > N to avoid tuning a dead
+        # branch.
+        if getattr(k_inst, "is_4g_safe", False):
+            _U32 = (1 << 32) - 1
+            over_4g = (M * K * 2 > _U32) or (N * K * 2 > _U32) or (M * N * 2 > _U32)
+            if over_4g and M <= N:
+                return True
         num_tiles_m = _ceil_div(M, k_inst.B_M)
         num_tiles_n = _ceil_div(N, k_inst.B_N)
         NUM_CU = 256
