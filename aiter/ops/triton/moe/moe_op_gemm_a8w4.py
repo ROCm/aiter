@@ -12,7 +12,8 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
-    _moe_gemm_a8w4 as _moe_gemm_a8w4_gluon,
+    _moe_gemm_a8w4_decode as _moe_gemm_a8w4_decode_gluon,
+    _moe_gemm_a8w4_prefill as _moe_gemm_a8w4_prefill_gluon,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
@@ -188,8 +189,10 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_buffers = 3
 
     if block_m == 16:
-        block_n = 128
+        block_n = 256
+        block_k = 512
         num_warps = 4
+        num_buffers = 2
 
     elif block_m == 32:
         if n <= 1024:
@@ -214,7 +217,6 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "split_k": split_k,
         "w_cache_modifier": w_cache_modifier,
         "waves_per_eu": 0,
-        "num_buffers": num_buffers,
     }
     return ret
 
@@ -352,10 +354,9 @@ def moe_gemm_a8w4(
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    if use_gluon:
-        _moe_gemm_a8w4_gluon[(grid,)](
+    if use_gluon and block_m == 16:
+        _moe_gemm_a8w4_decode_gluon[(grid,)](
             y,
-            # y.stride(0),
             y.stride(1),
             y.stride(2),
             x,
@@ -397,11 +398,59 @@ def moe_gemm_a8w4(
             config["block_n"],
             config["block_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=(
-                config["num_buffers"]
-                if config["num_buffers"] is not None
-                else config["num_stages"]
-            ),
+            NUM_BUFFERS=config["num_stages"],
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            MASK_K_LIMIT=K % config["block_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+        )
+    elif use_gluon:
+        _moe_gemm_a8w4_prefill_gluon[(grid,)](
+            y,
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scales,
+            stride_x_mx_m,
+            stride_x_mx_k,
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            x_static_scale,
+            quant_static_scale,
+            bias,
+            stride_bias,
+            gammas,
+            num_tokens,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            NUM_BUFFERS=config["num_stages"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             MASK_K_LIMIT=K % config["block_k"],
             W_CACHE_MODIFIER=config["w_cache_modifier"],
