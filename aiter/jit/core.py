@@ -1002,7 +1002,6 @@ def _get_ck_exclude_modules():
         "module_mla_metadata",
         "module_mla_reduce",
         "module_moe_asm",
-        "module_pa",
         "module_pa_metadata",
         "module_pa_ragged",
         "module_pa_v1",
