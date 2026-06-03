@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -253,20 +254,40 @@ def ref_paged_attn(
             k = torch.repeat_interleave(k, qpkv, dim=1)
             v = torch.repeat_interleave(v, qpkv, dim=1)
 
-        attn = torch.einsum("qhd,khd->hqk", q, k.float())
         mask = _build_swa_mask(
             query_len, kv_len,
             mask_type, window_size_left, window_size_right,
             device=q.device,
         )
-        attn.masked_fill_(mask, float("-inf"))
-        attn = torch.softmax(attn, dim=-1)
-        # Pure-mask rows (entirely -inf) appear at sparse-window corners;
-        # softmax produces NaN there. The CK kernel writes a zero row
-        # (LSE = -inf); match that so the comparison stays meaningful.
-        # For plain causal this branch never fires.
-        attn = torch.nan_to_num(attn, nan=0.0)
-        out = torch.einsum("hqk,khd->qhd", attn, v.float()).to(query.dtype)
+
+        # Compute attention one head at a time. The vectorised
+        # `einsum("qhd,khd->hqk")` + broadcast `masked_fill_` path builds a
+        # [num_heads, q, k] tensor and broadcasts the [q, k] mask across the
+        # head dim; once that tensor exceeds 2**31 elements (long-context ×
+        # >1 head, e.g. sq=sk=75600) PyTorch's broadcasting masked_fill_
+        # mis-indexes (32-bit offset overflow), silently masking the wrong
+        # entries — the reference then disagrees with *both* the CK and
+        # Triton kernels (which agree with each other). Looping per head
+        # keeps every op on a [q, k] tensor with a same-shape (non-broadcast)
+        # mask, which indexes correctly at any length. Slower, but the
+        # reference only has to be right.
+        num_q_heads = q.shape[1]
+        out = torch.empty(
+            query_len, num_q_heads, head_size,
+            dtype=query.dtype, device=q.device,
+        )
+        for h in range(num_q_heads):
+            attn = torch.einsum("qd,kd->qk", q[:, h], k[:, h].float())
+            attn.masked_fill_(mask, float("-inf"))
+            attn = torch.softmax(attn, dim=-1)
+            # Pure-mask rows (entirely -inf) appear at sparse-window corners;
+            # softmax produces NaN there. The CK kernel writes a zero row
+            # (LSE = -inf); match that so the comparison stays meaningful.
+            # For plain causal this branch never fires.
+            attn = torch.nan_to_num(attn, nan=0.0)
+            out[:, h] = torch.einsum("qk,kd->qd", attn, v[:, h].float()).to(
+                query.dtype
+            )
         outputs.append(out)
         start += query_len
 
@@ -501,11 +522,48 @@ def _make_inputs(cfg: CaseConfig, device: str, seed: int):
     kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32, device=device)
     max_num_blocks_per_seq = (max_kv_len + cfg.block_size - 1) // cfg.block_size
     num_seqs = len(cfg.seq_lens)
-    block_tables = torch.randint(
-        0, cfg.num_blocks,
-        (num_seqs, max_num_blocks_per_seq),
-        dtype=torch.int32, device=device,
-    )
+
+    # Realistic paged-KV mapping: every logical block must reference a DISTINCT
+    # physical block (a real allocator never aliases two live logical blocks
+    # onto the same page). `torch.randint` samples with replacement, so it can
+    # hand out duplicates — two logical positions then read identical K/V,
+    # masking address-arithmetic / paging bugs. Use a permutation instead so
+    # the mapping is a bijection onto a unique subset of the pool.
+    num_required_blocks = num_seqs * max_num_blocks_per_seq
+    # Real deployments keep the pool oversubscribed relative to the working
+    # set; flag runs whose pool is barely big enough (a tightly-packed pool is
+    # not representative and can hide stride/overflow issues).
+    min_num_blocks = num_required_blocks * 2
+    if cfg.num_blocks < min_num_blocks:
+        warnings.warn(
+            f"num_blocks={cfg.num_blocks} is below the recommended "
+            f"{min_num_blocks} (2x the {num_required_blocks}-block working set) "
+            f"for a realistic paged-KV run; the physical pool will be tightly "
+            f"packed.",
+            stacklevel=2,
+        )
+
+    if cfg.num_blocks >= num_required_blocks:
+        # Unique physical indices drawn from the actual pool [0, num_blocks).
+        block_tables = (
+            torch.randperm(cfg.num_blocks, device=device)[:num_required_blocks]
+            .reshape(num_seqs, max_num_blocks_per_seq)
+            .to(torch.int32)
+        )
+    else:
+        # Pool smaller than the working set: a bijection is impossible, so we
+        # cannot avoid aliasing. Fall back to sampling with replacement.
+        warnings.warn(
+            f"num_blocks={cfg.num_blocks} < working set "
+            f"{num_required_blocks}; physical blocks must alias (sampling with "
+            f"replacement). Pass a larger --num-blocks for a realistic run.",
+            stacklevel=2,
+        )
+        block_tables = torch.randint(
+            0, cfg.num_blocks,
+            (num_seqs, max_num_blocks_per_seq),
+            dtype=torch.int32, device=device,
+        )
 
     # PLAN §4A: reshape randn Q/K into a realistic peaked distribution BEFORE
     # FP8 quant (so the quantiser sees realistic activations). Default
@@ -560,6 +618,59 @@ def _int32_overflow_possible(num_blocks, block_size, num_kv_heads, head_size) ->
     return num_blocks * block_size * num_kv_heads * head_size > INT32_MAX
 
 
+def _auto_num_blocks(batch: int, seq_k: int, block_size: int) -> int:
+    """Realistic physical-KV pool size for a single custom shape.
+
+    Sizes the pool to 2x the working set — `batch · ceil(seq_k/block_size)`
+    — mirroring the oversubscription a real allocator keeps relative to any
+    one request's live pages. This is the value single-shape (bench) mode
+    auto-selects so runs are representative and warning-free in the
+    block-table builder. Grid / sweep mode keeps using its explicit
+    num_blocks lists, where any pool size is acceptable.
+    """
+    pages_per_seq = (seq_k + block_size - 1) // block_size
+    return 2 * batch * pages_per_seq
+
+
+def _count_valid_attention_elements(
+    query_len: int,
+    kv_len: int,
+    mask_type: int,
+    window_size_left: int,
+    window_size_right: int,
+) -> int:
+    """Number of unmasked (query, key) pairs under the test's mask convention.
+
+    Mirrors `_build_swa_mask` exactly so the FLOPs estimate reflects the
+    work the kernel actually does: causal / sliding-window masking trims the
+    upper triangle (and the SWA corners), so a dense `query_len · kv_len`
+    count overstates causal throughput by ~2x. Convention:
+      * mask_type 0          → dense (every pair valid).
+      * mask_type 1          → top-left causal  (anchor at key col q_idx).
+      * mask_type 2          → bottom-right causal (anchor shifted by
+                               kv_len - query_len).
+      * window_size_left < 0 → unbounded earlier context.
+      * window_size_right<0 + masked → coerced to 0 (the causal anchor),
+                               matching the CK wrapper and `_build_swa_mask`.
+    """
+    if mask_type == 0:
+        return query_len * kv_len
+    if window_size_right < 0:
+        window_size_right = 0
+    is_top_left = (mask_type == 1)
+    shift = 0 if is_top_left else (kv_len - query_len)
+    total = 0
+    for q_idx in range(query_len):
+        center = q_idx + shift
+        right = min(kv_len - 1, center + window_size_right)
+        left = 0
+        if window_size_left >= 0:
+            left = max(left, center - window_size_left)
+        if right >= left:
+            total += right - left + 1
+    return total
+
+
 def _attn_flops_and_mem_bytes(cfg: "CaseConfig", total_q: int) -> Tuple[int, int]:
     """Theoretical attention FLOPs and HBM-traffic bytes for one launch.
 
@@ -567,10 +678,14 @@ def _attn_flops_and_mem_bytes(cfg: "CaseConfig", total_q: int) -> Tuple[int, int
     the-envelope cost model the standalone test_single_shape.py used, so
     bandwidth numbers stay directly comparable across the consolidation).
 
-    FLOPs: Q·Kᵀ and Attn·V are each `2 · total_q · seqlen_k · head_dim ·
-    num_q_heads` for causal/no-mask (the GQA broadcast doesn't change the
-    per-q-head MFMA count); softmax/mask are ignored as O(N) relative to
-    the O(N·D) matmuls.
+    FLOPs: Q·Kᵀ and Attn·V each cost `2 · head_dim` per attended (q, k)
+    pair per query head; summing `4 · head_dim · num_q_heads` over the
+    *valid* (unmasked) pairs charges only the work the kernel performs.
+    Causal / SWA masking skips everything past the boundary, so we count
+    valid elements via `_count_valid_attention_elements` rather than the
+    dense `seqlen_q · seqlen_k` rectangle (the GQA broadcast doesn't change
+    the per-q-head MFMA count); softmax/mask are ignored as O(N) relative
+    to the O(N·D) matmuls.
 
     Bytes: Q + K + V at the activation dtype (FP8 halves the K/V traffic
     that dominates decode) + output at bf16 (CK FP8 outputs bf16 too).
@@ -579,14 +694,23 @@ def _attn_flops_and_mem_bytes(cfg: "CaseConfig", total_q: int) -> Tuple[int, int
     its seq_lens list.
     """
     batch = len(cfg.seq_lens)
-    sq, sk = cfg.seq_lens[0]
+    sk = cfg.seq_lens[0][1]
     hq, hk = cfg.num_heads
     d = cfg.head_size
     bytes_per_elem = 1 if cfg.q_dtype == "fp8" else (
         2 if cfg.dtype in (torch.bfloat16, torch.float16) else 4
     )
     bytes_per_out = 2  # bf16 always for the kernel outputs we benchmark
-    flops = 4 * total_q * sk * d * hq
+
+    valid_elems = sum(
+        _count_valid_attention_elements(
+            sq_i, sk_i, cfg.mask_type,
+            cfg.window_size_left, cfg.window_size_right,
+        )
+        for (sq_i, sk_i) in cfg.seq_lens
+    )
+    flops = 4 * valid_elems * d * hq
+
     mem_q = total_q * hq * d * bytes_per_elem
     mem_k = batch * sk * hk * d * bytes_per_elem
     mem_v = mem_k
@@ -1345,24 +1469,35 @@ def main():
     # Resolve the mode-dependent Triton default (see CLI comment).
     run_triton = args.triton if args.triton is not None else single_shape
 
-    # `--num-blocks auto` requires a single (batch, sk, block_size) so we
-    # can compute the exact pool size. It's most useful precisely in
-    # single-shape mode (the only mode where there's one well-defined sk).
-    if args.num_blocks:
-        if any(x.lower() == "auto" for x in args.num_blocks):
-            if len(args.num_blocks) != 1:
-                parser.error("--num-blocks auto must be the only --num-blocks "
-                             "value (can't mix 'auto' with explicit sizes)")
-            if not (all(v is not None for v in single_shape_flags)
-                    and len(block_sizes) == 1):
-                parser.error("--num-blocks auto requires --batch/--seq-q/"
-                             "--seq-k *and* a single --block-size so the "
-                             "pool size is unambiguously batch * "
-                             "ceil(sk / block_size).")
-            pages_per_seq = (args.seq_k + block_sizes[0] - 1) // block_sizes[0]
-            num_blocks_lst = [args.batch * pages_per_seq]
-        else:
-            num_blocks_lst = [int(x) for x in args.num_blocks]
+    # Pool sizing. Single-shape (bench) mode auto-sizes the physical KV pool
+    # to a realistic, oversubscribed value (see `_auto_num_blocks`) so a
+    # custom shape is representative without the caller having to pin
+    # --num-blocks. Grid / sweep mode keeps its explicit num_blocks lists,
+    # where any pool size is fine. `--num-blocks auto` forces auto-sizing
+    # explicitly and needs a single (batch, sk, block_size) to be
+    # unambiguous; an explicit numeric list always wins.
+    explicit_auto = bool(args.num_blocks) and any(
+        x.lower() == "auto" for x in args.num_blocks
+    )
+    if explicit_auto:
+        if len(args.num_blocks) != 1:
+            parser.error("--num-blocks auto must be the only --num-blocks "
+                         "value (can't mix 'auto' with explicit sizes)")
+        if not (all(v is not None for v in single_shape_flags)
+                and len(block_sizes) == 1):
+            parser.error("--num-blocks auto requires --batch/--seq-q/"
+                         "--seq-k *and* a single --block-size so the "
+                         "pool size is unambiguously batch * "
+                         "ceil(sk / block_size).")
+        num_blocks_lst = [_auto_num_blocks(args.batch, args.seq_k, block_sizes[0])]
+    elif args.num_blocks:
+        num_blocks_lst = [int(x) for x in args.num_blocks]
+    elif single_shape and len(block_sizes) == 1:
+        # Single-shape default: auto-size the pool so the custom shape is
+        # realistic without an explicit --num-blocks. Needs one block-size
+        # (the common single-shape case); otherwise fall back to the grid
+        # default list above.
+        num_blocks_lst = [_auto_num_blocks(args.batch, args.seq_k, block_sizes[0])]
 
     # SWA axes for the cartesian grid. Defaults preserve pre-SWA behaviour
     # bit-for-bit (one row per shape, plain bottom-right causal).
@@ -1498,7 +1633,10 @@ def main():
         dt0, qd0 = dtype_pairs[0]
         _print_single_shape_report(rows[0], seq_lens_grid[0], num_heads_cfg[0],
                                    head_sizes[0], block_sizes[0],
-                                   dt0, qd0, num_blocks_lst[0])
+                                   dt0, qd0, num_blocks_lst[0],
+                                   mask_type=mask_types[0],
+                                   window_size_left=window_pairs[0][0],
+                                   window_size_right=window_pairs[0][1])
     else:
         df = pd.DataFrame(rows)
         # `@benchmark()` merges the call kwargs into the row dict; drop
@@ -1538,6 +1676,9 @@ def _print_single_shape_report(
     dtype: torch.dtype,
     q_dtype: Optional[str],
     num_blocks: int,
+    mask_type: int = 2,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
 ) -> None:
     """Pretty-print a single-shape result block.
 
@@ -1554,7 +1695,9 @@ def _print_single_shape_report(
     cfg = CaseConfig(
         seq_lens=seq_lens, num_heads=num_heads, head_size=head_size,
         block_size=block_size, dtype=dtype, q_dtype=q_dtype,
-        num_blocks=num_blocks,
+        num_blocks=num_blocks, mask_type=mask_type,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
     )
     flops, mem_bytes = _attn_flops_and_mem_bytes(cfg, total_q)
     mem_gb = mem_bytes / 1e9
@@ -1574,6 +1717,10 @@ def _print_single_shape_report(
     print(f"  block_size    = {block_size}")
     print(f"  num_blocks    = {num_blocks}")
     print(f"  dtype         = {dtype}  q_dtype={q_dtype}")
+    mask_name = {0: "none", 1: "top-left causal", 2: "bottom-right causal"}.get(
+        mask_type, f"mask_type={mask_type}")
+    print(f"  mask          = {mask_name}  window=({window_size_left},"
+          f"{window_size_right})")
     print(f"  phase         = {phase}")
     print(f"  total_q       = {total_q}")
     num_splits = row.get("num_splits")
