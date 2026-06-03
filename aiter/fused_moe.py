@@ -658,117 +658,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if get_gfx() != "gfx1250" and "gfx1250" not in _gfx_env and "1" not in _gfx_env:
         return None
 
-    if os.environ.get("AITER_GROUPED_CKTILE_MASKED", "0") not in (
-        "0",
-        "false",
-        "False",
-    ):
-        token_num, topk = topk_ids.shape
-        metadata = get_2stage_cfgs(
-            get_padded_M(token_num),
-            model_dim,
-            inter_dim,
-            E,
-            topk,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            quant_type,
-            isG1U1,
-            activation,
-            doweight_stage1,
-            hidden_pad,
-            intermediate_pad,
-            getattr(w1, "is_shuffled", False),
-        )
-        block_size_M = int(metadata.block_m)
-        fast_all_experts = (
-            os.environ.get("AITER_GROUPED_FAST_ROUTE", "0") in ("1", "true", "True")
-            and topk == E
-        )
-        if fast_all_experts:
-            blocks_per_expert = (token_num + block_size_M - 1) // block_size_M
-            padded_per_expert = blocks_per_expert * block_size_M
-            total_padded = E * padded_per_expert
-            sorted_ids = torch.full(
-                (total_padded,), token_num, dtype=dtypes.i32, device=topk_ids.device
-            )
-            token_ids = torch.arange(
-                token_num, dtype=dtypes.i32, device=topk_ids.device
-            )
-            for expert_id in range(E):
-                base = expert_id * padded_per_expert
-                sorted_ids[base : base + token_num] = token_ids
-            sorted_weights = torch.zeros(
-                (total_padded,), dtype=dtypes.fp32, device=topk_ids.device
-            )
-            topk_weight_fp32 = topk_weight.to(dtypes.fp32)
-            for expert_id in range(E):
-                base = expert_id * padded_per_expert
-                expert_weight = torch.where(
-                    topk_ids == expert_id,
-                    topk_weight_fp32,
-                    torch.zeros((), dtype=dtypes.fp32, device=topk_ids.device),
-                ).sum(dim=1)
-                sorted_weights[base : base + token_num] = expert_weight
-            sorted_expert_ids = torch.arange(
-                E, dtype=dtypes.i32, device=topk_ids.device
-            ).repeat_interleave(blocks_per_expert)
-            num_valid_ids = torch.tensor(
-                [total_padded, token_num], dtype=dtypes.i32, device=topk_ids.device
-            )
-            moe_buf = torch.empty(
-                (token_num, model_dim), dtype=dtype, device=topk_ids.device
-            )
-        else:
-            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
-                moe_sorting(
-                    topk_ids,
-                    topk_weight,
-                    E,
-                    model_dim,
-                    dtype,
-                    block_size_M,
-                    expert_mask,
-                    None,
-                    0,
-                )
-            )
-        out = fused_moe_2stages(
-            hidden_states,
-            w1,
-            w2,
-            topk,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            isG1U1,
-            block_size_M,
-            activation=activation,
-            quant_type=quant_type,
-            doweight_stage1=doweight_stage1,
-            q_dtype_a=q_dtype_a,
-            q_dtype_w=q_dtype_w,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=None,
-            a2_scale=None,
-            num_local_tokens=None,
-            hidden_pad=hidden_pad,
-            intermediate_pad=intermediate_pad,
-            bias1=bias1,
-            bias2=bias2,
-        )
-        impl_name = "grouped_a4w4" if data_format == "fp4" else "grouped_a8w4"
-        os.environ["AITER_LAST_FUSED_MOE_IMPL"] = impl_name
-        logger.info(
-            f"[{impl_name}] used CKTile-style masked FlyDSL {data_format} path: "
-            f"tokens={token_num}, topk={topk}, E={E}, block_m={block_size_M}"
-        )
-        return out
-
     try:
         from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (
             compile_moe_grouped_gemm1_a8w4_masked,
@@ -972,7 +861,39 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         bias=bias1.to(dtype) if bias1 is not None else None,
     )
     torch.cuda.synchronize()
+    _grouped_dbg("[crash-probe] after stage1 sync OK, unsort")
     _grouped_dbg("[crash-probe] after stage1 sync OK")
+
+    # Dump stage1 output (grouped_a2) reshaped to (num_token, topk, inter_dim).
+    # grouped_a2 is laid out per-expert as (E, max_m, inter_dim); to recover the
+    # per-token/per-topk view we gather each token's row from the expert it was
+    # routed to. We only support num_token==1 decoding here (each active expert
+    # holds exactly one row at index 0), and topk is already known.
+    _dump_a2 = os.environ.get("AITER_GROUPED_DUMP_A2", "")
+    if _dump_a2 not in ("", "0", "false", "False"):
+        if token_num == 1:
+            # experts this single token was routed to: (topk,)
+            _routed_experts = topk_ids[0].to(torch.long)
+            # (topk, inter_dim) -> (num_token=1, topk, inter_dim)
+            _a2_tt = grouped_a2[_routed_experts, 0].view(token_num, topk, inter_dim)
+            print(
+                f"[dump] grouped_a2 (num_token, topk, inter_dim)="
+                f"{tuple(_a2_tt.shape)}",
+                flush=True,
+            )
+            for _k in range(topk):
+                _row = _a2_tt[0, _k, :10].detach().cpu().tolist()
+                print(
+                    f"[dump]   topk={_k} expert={int(_routed_experts[_k])} "
+                    f"first10={_row}",
+                    flush=True,
+                )
+        else:
+            _grouped_dbg(
+                f"[dump] skip grouped_a2 dump: only num_token==1 supported "
+                f"(got token_num={token_num})"
+            )
+
     if doweight_stage1:
         for e in range(E):
             n = int(counts[e].item())
