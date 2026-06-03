@@ -158,6 +158,63 @@ def test_scale_folding(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Persistent-scheduling metadata (mirrors op_tests/test_pa_ps.py).
+# ---------------------------------------------------------------------------
+def _make_persistent_metadata(
+    batch, kv_head_num, gqa, qo_indptr, kv_indptr, context_lens, page_size,
+    max_qlen, uni_qlen, device,
+):
+    """Generate work_indptr / work_info (+ reduce maps) via aiter's GPU helper.
+
+    The PA-decode kernel is the persistent / split-KV variant: every workgroup
+    reads work_indptr+work_info to find its (batch, q-head, kv-range) slice, so
+    these MUST be non-null or the kernel dereferences null on device. aiter's
+    `WorkInfo` union (csrc/include/ps.h) is byte-identical to the sched2
+    ps::WORK_INFO this kernel was authored against, so this metadata is directly
+    consumable. Returns the split-buffer row capacity too (reduce_partial_map).
+    """
+    import torch
+
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_pa_metadata_info_v1(batch, kv_head_num)
+
+    work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type, device=device)
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
+    work_info = torch.empty(work_info_set_size, dtype=work_info_set_type, device=device)
+    reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type, device=device)
+    reduce_final_map = torch.empty(reduce_final_map_size, dtype=reduce_final_map_type, device=device)
+    reduce_partial_map = torch.empty(reduce_partial_map_size, dtype=reduce_partial_map_type, device=device)
+
+    aiter.get_pa_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        context_lens,
+        gqa,
+        kv_head_num,
+        True,
+        work_metadata_ptrs,
+        work_indptr,
+        work_info,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        kv_granularity=max(page_size, 16),
+        block_size=page_size,
+        max_seqlen_qo=int(max_qlen),
+        uni_seqlen_qo=int(uni_qlen),
+        fast_mode=True,
+        max_split_per_batch=-1,
+    )
+    return work_indptr, work_info, reduce_partial_map
+
+
+# ---------------------------------------------------------------------------
 # Functional smoke test — gfx1250 only.
 # ---------------------------------------------------------------------------
 @pytest.mark.skipif(
@@ -219,6 +276,24 @@ def test_decode_smoke(batch, kv_head_num):
     # (the wrapper folds softmax_scale into key_scale before launch).
     query_scale, key_scale, value_scale = 0.5, 2.0, 1.5
 
+    # Persistent metadata + split scratch (the kernel reads all of these).
+    max_qlen = qlen_with_mtp
+    work_indptr, work_info, reduce_partial_map = _make_persistent_metadata(
+        batch, kv_head_num, gqa, qo_indptr, kv_indptr, context_lens,
+        page_size, max_qlen, qlen_with_mtp, device,
+    )
+    # split_o / split_lse: fp32 partial-output scratch, row capacity from the
+    # reduce map (matches pa_persistent_fwd's logits/splitLse sizing). For this
+    # single-page case work items use partial_o_loc=-1 (write straight to O), so
+    # these stay scratch and no reduce pass is needed.
+    split_rows = reduce_partial_map.size(0) * max_qlen
+    split_o = torch.empty(
+        (split_rows, 1, q_head_num, head_dim), dtype=torch.float32, device=device
+    )
+    split_lse = torch.empty(
+        (split_rows, 1, q_head_num, 1), dtype=torch.float32, device=device
+    )
+
     try:
         out = aiter.pa_decode_bf16_asm(
             Q,
@@ -234,7 +309,12 @@ def test_decode_smoke(batch, kv_head_num):
             key_scale=key_scale,
             value_scale=value_scale,
             qo_indptr=qo_indptr,
+            work_indptr=work_indptr,
+            work_info=work_info,
+            split_o=split_o,
+            split_lse=split_lse,
         )
+        torch.cuda.synchronize()
     except Exception as e:  # placeholder .co / missing kernel symbol
         msg = str(e).lower()
         if "kernel" in msg or "hsaco" in msg or "co" in msg or "symbol" in msg:
@@ -243,6 +323,10 @@ def test_decode_smoke(batch, kv_head_num):
 
     assert out.shape == Q.shape
     assert out.dtype == torch.bfloat16
+    # K==V==0 -> uniform softmax over zero-valued V -> output is all zeros.
+    # This is a light correctness signal that the kernel ran and wrote O.
+    assert torch.isfinite(out.float()).all()
+    assert out.float().abs().max().item() < 1e-2
 
 
 if __name__ == "__main__":
