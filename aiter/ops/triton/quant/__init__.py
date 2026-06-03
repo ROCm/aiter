@@ -2,6 +2,7 @@ from .quant import (
     static_per_tensor_quant_fp8_i8,
     dynamic_per_tensor_quant_fp8_i8,
     dynamic_per_tensor_quant_fp8_i8_nozero,
+    dynamic_per_tensor_quant_fp8_i8_fused_small,  # P1.1_init
     dynamic_per_token_quant_fp8_i8,
     dynamic_mxfp4_quant,
     _mxfp4_quant_op,
@@ -28,6 +29,7 @@ __all__ = [
     "static_per_tensor_quant_fp8_i8",
     "dynamic_per_tensor_quant_fp8_i8",
     "dynamic_per_tensor_quant_fp8_i8_nozero",
+    "dynamic_per_tensor_quant_fp8_i8_fused_small",
     "dynamic_per_token_quant_fp8_i8",
     "dynamic_mxfp4_quant",
     "_mxfp4_quant_op",

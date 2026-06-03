@@ -421,7 +421,7 @@ def fused_moe_(
         sorted_ids1 = topk_ids
         sorted_weights1 = None
         sorted_expert_ids1, num_valid_ids1 = _direct_dummy_sort_tensors(device)
-        moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
+        moe_buf = _direct_moe_out_buffer(M, model_dim, dtype, device)
         sorted_ids2 = sorted_ids1
         sorted_weights2 = sorted_weights1
         sorted_expert_ids2 = sorted_expert_ids1
@@ -507,6 +507,44 @@ def fused_moe_(
             fc1_smooth_scale=fc1_smooth_scale,
         )
     else:
+        # 1-kernel fused path: no D2D, no graph overhead
+        _topk = topk_ids.shape[1]
+        _fused1k_ok = (
+            _FUSED_1K_ENABLED
+            and direct_2stage
+            and quant_type == QuantType.per_Tensor
+            and M <= 16
+            and _topk <= 2  # 1-kernel serializes routes; impractical for large topk
+            and activation == ActivationType.Silu
+            and isG1U1
+            and w1_scale is not None
+            and w2_scale is not None
+        )
+        if _fused1k_ok:
+            moe_buf = _direct_moe_out_buffer(M, model_dim, dtype, topk_ids.device)
+            return _fused_1kernel_2stage(
+                hidden_states, w1, w2, topk_ids, topk_weight,
+                a1_scale, w1_scale, w2_scale, moe_buf,
+                model_dim, inter_dim, global_E,
+            )
+        if direct_2stage and _DIRECT_GRAPH_ENABLED:
+            return _direct_2stage_with_graph(
+                hidden_states, w1, w2, topk,
+                sorted_ids1, sorted_weights1, sorted_expert_ids1, num_valid_ids1,
+                moe_buf, isG1U1, block_size_M1,
+                activation=activation, quant_type=quant_type,
+                doweight_stage1=doweight_stage1,
+                q_dtype_a=q_dtype_a, q_dtype_w=q_dtype_w,
+                q_type2=q_type2, q_dtype_a2=q_dtype_a2, q_dtype_w2=q_dtype_w2,
+                w1_scale=w1_scale, w2_scale=w2_scale,
+                a1_scale=a1_scale, a2_scale=a2_scale,
+                sorted_ids2=sorted_ids2, sorted_weights2=sorted_weights2,
+                sorted_expert_ids2=sorted_expert_ids2, num_valid_ids2=num_valid_ids2,
+                block_size_M2=block_size_M2, num_local_tokens=num_local_tokens,
+                hidden_pad=hidden_pad, intermediate_pad=intermediate_pad,
+                bias1=bias1, bias2=bias2, fc1_smooth_scale=fc1_smooth_scale,
+                topk_ids=topk_ids, topk_weight=topk_weight,
+            )
         return fused_moe_2stages(
             hidden_states,
             w1,
@@ -814,6 +852,11 @@ _DIRECT_STAGE2_QUANT_AMAX = None
 _DIRECT_DUMMY_SORTED_EXPERT_IDS = None
 _DIRECT_DUMMY_NUM_VALID_IDS = None
 _DIRECT_STAGE1_OUT_A2 = None
+_DIRECT_MOE_OUT_BUF = None
+_DIRECT_GRAPH_CACHE: dict = {}  # key: (token_num, model_dim, inter_dim, topk) -> (graph, static_hidden, static_out)
+_DIRECT_GRAPH_ENABLED = os.environ.get("AITER_DIRECT_HIP_GRAPH", "0") == "1"
+_FUSED_1K_ENABLED = os.environ.get("AITER_FUSED_1K", "1") == "1"
+_FUSED_1K_CACHE: dict = {}  # key: (model_dim, inter_dim, experts, topk) -> fn
 
 
 def _cached_empty(buf, shape, dtype, device):
@@ -855,13 +898,44 @@ def _direct_per_tensor_quant_cached(
 
     qbuf = _cached_empty(qbuf, x.shape, quant_dtype, x.device)
     quant_input = x.view(-1, x.shape[-1]) if flatten_last_dim else x
+
+    def _guard_zero_input(q, s):
+        # [HY3_FIX_V14] zero-input guard for the non-a2q direct path, mirroring
+        # the a2q stage1 path in moe_kernels.py. When an entire tile is zero
+        # (e.g. a padding / discarded spec-decode step at the benchmark tail),
+        # per-tensor amax=0 -> scale=0 -> x/scale = 0/0 = fp8 0x80 (NaN), which
+        # then poisons stage2 and the downstream logits. Clamp the scale and
+        # rewrite fp8 NaN(0x80) to 0 so a zero tile stays a clean zero.
+        if quant_dtype is dtypes.fp8:
+            s.clamp_(min=1e-12)
+            q_u8 = q.view(torch.uint8)
+            q_u8.masked_fill_(q_u8.eq(0x80), 0)
+
     if scale is not None:
         from aiter.ops.triton.quant import static_per_tensor_quant_fp8_i8
 
         static_per_tensor_quant_fp8_i8(qbuf, quant_input, scale)
+        # [HY3_FIX_V15] The static-scale branch previously skipped the zero/NaN
+        # guard. In the flydsl direct 2-stage path the cached intermediate buffer
+        # can hand fp8 NaN(0x80) bytes to the next stage, which then poisons the
+        # whole MoE output (deterministically reproduced: flydsl direct + static
+        # per-tensor scales -> NaN; same inputs through ck or via the dynamic
+        # path -> clean). Mask 0x80 -> 0 here too, matching the dynamic path.
+        # Do NOT clamp `scale`: it is a shared/static tensor owned by the caller.
+        if quant_dtype is dtypes.fp8:
+            q_u8 = qbuf.view(torch.uint8)
+            q_u8.masked_fill_(q_u8.eq(0x80), 0)
         return qbuf, sbuf, amax, scale.view(1)
 
     sbuf = _cached_empty(sbuf, (1,), dtypes.fp32, x.device)
+    # P1.1 — try single-launch fused path for small inputs (m<=8 @ dim=4096).
+    from aiter.ops.triton.quant import (
+        dynamic_per_tensor_quant_fp8_i8_nozero,
+        dynamic_per_tensor_quant_fp8_i8_fused_small,
+    )
+    if dynamic_per_tensor_quant_fp8_i8_fused_small(qbuf, quant_input, sbuf) is not None:
+        _guard_zero_input(qbuf, sbuf)
+        return qbuf, sbuf, amax, sbuf.view(1)
     n_blocks = (quant_input.numel() + 1023) // 1024
     if (
         amax is None
@@ -870,9 +944,8 @@ def _direct_per_tensor_quant_cached(
         or amax.device != x.device
     ):
         amax = torch.empty(n_blocks, dtype=dtypes.fp32, device=x.device)
-    from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8_nozero
-
     dynamic_per_tensor_quant_fp8_i8_nozero(qbuf, quant_input, sbuf, amax)
+    _guard_zero_input(qbuf, sbuf)
     return qbuf, sbuf, amax, sbuf.view(1)
 
 
@@ -895,6 +968,107 @@ def _direct_stage1_out_buffer(token_num, topk, inter_dim, dtype, device):
         _DIRECT_STAGE1_OUT_A2, (token_num, topk, inter_dim), dtype, device
     )
     return _DIRECT_STAGE1_OUT_A2
+
+
+def _direct_moe_out_buffer(token_num, model_dim, dtype, device):
+    global _DIRECT_MOE_OUT_BUF
+    _DIRECT_MOE_OUT_BUF = _cached_empty(
+        _DIRECT_MOE_OUT_BUF, (token_num, model_dim), dtype, device
+    )
+    return _DIRECT_MOE_OUT_BUF
+
+
+def _fused_1kernel_2stage(
+    hidden_states, w1, w2, topk_ids, topk_weight,
+    a1_scale, w1_scale, w2_scale, out_buf,
+    model_dim, inter_dim, experts,
+):
+    """Call the fused single-kernel MoE for small m (fp8 per-tensor)."""
+    from .ops.flydsl.kernels.moe_gemm_2stage_direct import (
+        compile_moe_fused_1kernel_smallm,
+    )
+    M, topk = topk_ids.shape
+    cache_key = (model_dim, inter_dim, experts, topk)
+    if cache_key not in _FUSED_1K_CACHE:
+        _FUSED_1K_CACHE[cache_key] = compile_moe_fused_1kernel_smallm(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+        )
+    fn = _FUSED_1K_CACHE[cache_key]
+
+    # Quantize hidden_states -> fp8 if needed
+    if hidden_states.dtype != dtypes.fp8:
+        a1_fp8, a1_sc = _direct_stage1_per_tensor_quant(
+            hidden_states, a1_scale, dtypes.fp8
+        )
+    else:
+        a1_fp8, a1_sc = hidden_states, a1_scale
+
+    # a1_sc is scalar tensor [1]; kernel expects shape [1]
+    a1_sc_1d = a1_sc.reshape(1)
+
+    # Extract per-expert scalar scale: w1_scale=[E,inter_dim,1], w2_scale=[E,model_dim,1]
+    # For per_Tensor quant each expert has one repeated scalar; take [:, 0]
+    _w1sc = w1_scale.reshape(experts, -1)[:, 0].contiguous().float()
+    _w2sc = w2_scale.reshape(experts, -1)[:, 0].contiguous().float()
+
+    out_buf.zero_()
+    fn(
+        out_buf, a1_fp8, w1, w2,
+        a1_sc_1d, _w1sc, _w2sc,
+        topk_ids.int(), topk_weight.float(),
+        M, model_dim, model_dim, inter_dim,
+        torch.cuda.current_stream().cuda_stream,
+    )
+    return out_buf
+
+
+def _direct_2stage_with_graph(
+    hidden_states, w1, w2, topk,
+    sorted_ids1, sorted_weights1, sorted_expert_ids1, num_valid_ids1,
+    moe_buf, isG1U1, block_size_M1, **kwargs
+):
+    """Run fused_moe_2stages with HIP graph capture/replay for the direct path.
+
+    On first call for a given (token_num, model_dim, inter_dim, topk): warm up
+    3x then capture a CUDAGraph.  Subsequent calls copy hidden_states into the
+    static input buffer and replay the graph.
+    """
+    token_num = hidden_states.shape[0]
+    model_dim = hidden_states.shape[1]
+    _, _model_dim_w, inter_dim = get_inter_dim(w1.shape, w2.shape, q_dtype_w=w2.dtype)
+    cache_key = (token_num, model_dim, inter_dim, topk)
+
+    if cache_key not in _DIRECT_GRAPH_CACHE:
+        # Warmup -- triggers JIT compilation and static buffer allocation.
+        for _ in range(3):
+            fused_moe_2stages(
+                hidden_states, w1, w2, topk,
+                sorted_ids1, sorted_weights1, sorted_expert_ids1, num_valid_ids1,
+                moe_buf, isG1U1, block_size_M1, **kwargs
+            )
+        torch.cuda.synchronize()
+
+        static_hidden = hidden_states.clone()
+        static_out = moe_buf.clone()
+        static_hidden.copy_(hidden_states)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            fused_moe_2stages(
+                static_hidden, w1, w2, topk,
+                sorted_ids1, sorted_weights1, sorted_expert_ids1, num_valid_ids1,
+                static_out, isG1U1, block_size_M1, **kwargs
+            )
+        torch.cuda.synchronize()
+        _DIRECT_GRAPH_CACHE[cache_key] = (g, static_hidden, static_out)
+
+    g, static_hidden, static_out = _DIRECT_GRAPH_CACHE[cache_key]
+    static_hidden.copy_(hidden_states)
+    g.replay()
+    return static_out
 
 
 def _direct_stage1_per_tensor_quant(hidden_states, scale, quant_dtype):
@@ -1052,6 +1226,7 @@ def _flydsl_stage1_wrapper(
             num_waves=parsed.get("num_waves", 0),
             k_batch=parsed.get("k_batch", 1),
             splitk_mode=parsed.get("splitk_mode", "atomic"),
+            fuse_a2_quant=parsed.get("fuse_a2_quant", False),
         )
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
@@ -1884,6 +2059,12 @@ def fused_moe_2stages(
         _is_direct_params(stage1_params)
         and _is_direct_params(stage2_params)
     )
+    stage1_emits_quantized_a2 = (
+        direct_2stage
+        and bool(stage1_params.get("fuse_a2_quant", False))
+        and q_type2 == QuantType.per_Tensor
+        and q_dtype_a2 == dtypes.fp8
+    )
     if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
         a2 = torch.empty(
@@ -1892,7 +2073,8 @@ def fused_moe_2stages(
             device=device,
         )
     elif direct_2stage:
-        a2 = _direct_stage1_out_buffer(token_num, topk, inter_dim, dtype, device)
+        _a2_dtype = q_dtype_a2 if stage1_emits_quantized_a2 else dtype
+        a2 = _direct_stage1_out_buffer(token_num, topk, inter_dim, _a2_dtype, device)
     else:
         a2 = torch.empty(
             (token_num, topk, inter_dim),
@@ -1941,6 +2123,9 @@ def fused_moe_2stages(
             .view(dtypes.fp4x2)
             .reshape(token_num, topk, -1)
         )
+    elif stage1_emits_quantized_a2:
+        a2, a2_scale = a2
+        a2 = a2.view(token_num, topk, inter_dim)
     elif (
         q_type2 == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]

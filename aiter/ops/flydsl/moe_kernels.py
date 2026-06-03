@@ -186,6 +186,7 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             "k_batch": 1,
             "gate_only": False,
             "fuse_fp4_quant": False,
+            "fuse_a2_quant": False,
             "routes_per_block": 1,
             "num_waves": 0,
             # Default split-K mode: "atomic" (legacy single-buffer atomic-fadd).
@@ -211,6 +212,8 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
                 # kb-axis sum.  Default ("atomic") keeps the legacy
                 # single-buffer atomic-fadd path.
                 params["splitk_mode"] = "reduce"
+            elif token == "a2q":
+                params["fuse_a2_quant"] = True
             else:
                 return None
         return params
@@ -703,6 +706,10 @@ def get_flydsl_stage1_kernels(
                             # regardless of which other knobs are present.
                             if skmode == "reduce":
                                 name += "_red"
+                            # Variant for the small-M direct path: the wrapper
+                            # emits fp8 A2 plus per-route scales, so fused_moe
+                            # can skip its separate stage2 activation quant.
+                            name_a2q = name + "_a2q"
                             kernels[name] = {
                                 "stage": 1,
                                 "direct": True,
@@ -721,6 +728,11 @@ def get_flydsl_stage1_kernels(
                                 "routes_per_block": 1,
                                 "num_waves": num_waves,
                                 "splitk_mode": skmode,
+                                "fuse_a2_quant": False,
+                            }
+                            kernels[name_a2q] = {
+                                **kernels[name],
+                                "fuse_a2_quant": True,
                             }
     return kernels
 
@@ -2222,6 +2234,147 @@ def flydsl_moe_stage2_direct(
     return out
 
 
+def route_fused_mfma_moe_experimental(
+    a: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    a1_scale: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    tile_m: int = 16,
+    stage1_tile_n: int = 16,
+    stage1_tile_k: int = 256,
+    stage2_tile_n: int = 256,
+    stage2_tile_k: int = 64,
+    stage2_split_reduce: bool = False,
+    stage1_zero_splitk_tmp: bool = False,
+    topk: Optional[int] = None,
+) -> torch.Tensor:
+    """Experimental MFMA-preserving route-fusion facade for small-M MoE.
+
+    This entrypoint is intentionally isolated from `fused_moe.py`.  It keeps
+    the route-fusion experiment on the direct FlyDSL MFMA path:
+
+    1. direct stage1 emits fp8 A2 plus per-route scales (`_a2q` behavior)
+    2. experimental direct stage2 backend consumes that fp8 A2 with MFMA
+
+    It is not a production one-kernel yet; the API exists to benchmark the
+    MFMA-preserving direction separately from the scalar Triton one-kernel
+    prototype and to provide the backend seam for a future inlined version.
+    """
+
+    if a.dtype != dtypes.fp8 or w1.dtype != dtypes.fp8 or w2.dtype != dtypes.fp8:
+        raise ValueError("route_fused_mfma_moe_experimental requires fp8 A/W tensors")
+    if a.ndim != 2 or w1.ndim != 3 or w2.ndim != 3:
+        raise ValueError(
+            "route_fused_mfma_moe_experimental expects a=(M,K), "
+            "w1=(E,2I,K), w2=(E,N,I)"
+        )
+
+    token_num, model_dim = a.shape
+    experts, two_inter_dim, w1_model_dim = w1.shape
+    w2_experts, w2_model_dim, inter_dim = w2.shape
+    inferred_topk = int(topk_ids.shape[1] if topk is None else topk)
+    if token_num > 16:
+        raise ValueError(f"route_fused_mfma_moe_experimental supports M <= 16, got {token_num}")
+    if two_inter_dim != 2 * inter_dim:
+        raise ValueError(f"w1 shape {tuple(w1.shape)} is not g1u1 for inter_dim={inter_dim}")
+    if experts != w2_experts or model_dim != w1_model_dim or model_dim != w2_model_dim:
+        raise ValueError("route_fused_mfma_moe_experimental shape mismatch between A/W1/W2")
+    if topk_ids.shape != topk_weights.shape or inferred_topk != int(topk_ids.shape[1]):
+        raise ValueError("topk_ids/topk_weights shape does not match topk")
+
+    a2, a2_scale = flydsl_moe_stage1_direct(
+        a,
+        w1,
+        topk_ids,
+        topk=inferred_topk,
+        tile_m=tile_m,
+        tile_n=stage1_tile_n,
+        tile_k=stage1_tile_k,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        out_dtype="bf16",
+        w1_scale=w1_scale,
+        a1_scale=a1_scale,
+        routes_per_block=1,
+        num_waves=0,
+        k_batch=8,
+        splitk_mode="reduce",
+        fuse_a2_quant=True,
+        zero_splitk_tmp=stage1_zero_splitk_tmp,
+    )
+
+    if out is None:
+        out = torch.empty((token_num, model_dim), dtype=torch.bfloat16, device=a.device)
+    target = (
+        _direct_stage2_workspace(out, token_num, inferred_topk, model_dim)
+        if stage2_split_reduce
+        else out
+    )
+
+    flat_w2_scale = w2_scale.view(-1)
+    w_scale_per_expert = flat_w2_scale.numel() == experts
+    flat_w_scale = (
+        flat_w2_scale
+        if w_scale_per_expert
+        else _expand_per_tensor_scale(w2_scale, experts * model_dim, model_dim)
+    )
+    if flat_w_scale is None:
+        raise ValueError("route_fused_mfma_moe_experimental requires w2_scale")
+
+    from .kernels.moe_gemm_2stage_direct import compile_moe_route_fused_mfma_experimental
+
+    exe = compile_moe_route_fused_mfma_experimental(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=inferred_topk,
+        tile_m=tile_m,
+        tile_n=stage2_tile_n,
+        tile_k=stage2_tile_k,
+        in_dtype="fp8",
+        out_dtype="bf16",
+        a_scale_scalar=False,
+        w_scale_per_expert=w_scale_per_expert,
+        split_reduce=stage2_split_reduce,
+    )
+    if stage2_split_reduce:
+        args = (
+            _view_safe(out),
+            _view_safe(target),
+            _view_safe(a2),
+            _view_safe(w2),
+            _view_safe(a2_scale.view(-1)),
+            _view_safe(flat_w_scale),
+            topk_ids,
+            topk_weights,
+            token_num,
+            model_dim,
+            inter_dim,
+            torch.cuda.current_stream(),
+        )
+    else:
+        args = _s2_direct_args_std(
+            target,
+            a2,
+            w2,
+            a2_scale.view(-1),
+            flat_w_scale,
+            topk_ids,
+            topk_weights,
+            token_num,
+            model_dim,
+            inter_dim,
+        )
+    _run_compiled(exe, args)
+    return out
+
+
 def flydsl_moe_stage1_direct(
     a: torch.Tensor,
     w1: torch.Tensor,
@@ -2241,6 +2394,8 @@ def flydsl_moe_stage1_direct(
     num_waves: int = 0,
     k_batch: int = 1,
     splitk_mode: str = "atomic",
+    fuse_a2_quant: bool = False,
+    zero_splitk_tmp: bool = True,
 ) -> torch.Tensor:
     """Small-M direct stage1 for fp8/fp8 silu(gate)*up.
 
@@ -2274,8 +2429,13 @@ def flydsl_moe_stage1_direct(
         raise ValueError("direct stage1 expects g1u1 W1 with shape[1] == 2*inter_dim")
     inter_dim = w1.shape[1] // 2
     if out is None:
+        _out_dtype = dtypes.fp8 if fuse_a2_quant else torch.bfloat16
         out = torch.empty(
-            (token_num, topk, inter_dim), dtype=torch.bfloat16, device=a.device
+            (token_num, topk, inter_dim), dtype=_out_dtype, device=a.device
+        )
+    elif fuse_a2_quant and out.dtype != dtypes.fp8:
+        out = torch.empty(
+            (token_num, topk, inter_dim), dtype=dtypes.fp8, device=a.device
         )
 
     flat_a1_scale = a1_scale.view(-1) if a1_scale is not None else None
@@ -2337,7 +2497,8 @@ def flydsl_moe_stage1_direct(
         # buffer_load, so there is no broadcast to fuse and the lone
         # zero-fill is faster as a stock torch op.
         if _splitk_reduce:
-            tmp_out = torch.zeros(
+            _tmp_factory = torch.zeros if zero_splitk_tmp else torch.empty
+            tmp_out = _tmp_factory(
                 (int(k_batch), token_num, topk, 2 * inter_dim),
                 dtype=torch.float32,
                 device=a.device,
@@ -2371,9 +2532,39 @@ def flydsl_moe_stage1_direct(
         # only needs the single-launch aiter silu_and_mul.
         # Env kill-switch ``AITER_FLYDSL_FUSED_SILU_OFF=1`` falls back.
         from aiter.ops.flydsl._fused_post import (
+            fused_kb_sum_silu_mul_quant as _fused_kb_silu_quant,
             fused_kb_sum_silu_and_mul as _fused_kb_silu,
+            fused_silu_mul_quant as _fused_silu_quant,
             is_disabled as _fused_post_disabled,
         )
+
+        if fuse_a2_quant:
+            # [HY3_FIX_V14] splitk: same per_Tensor + zero-guard as v12/v13 non-splitk path.
+            # Bypass _fused_kb_silu_quant/_fused_silu_quant (those assert per-token scale shape).
+            from aiter.ops.activation import silu_and_mul
+            from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
+
+            out_scale = torch.zeros((1,), dtype=torch.float32, device=a.device)
+            reduced = tmp_out.sum(dim=0) if _splitk_reduce else tmp_out
+            tmp_bf16 = torch.empty(
+                (token_num, topk, inter_dim),
+                dtype=torch.bfloat16,
+                device=a.device,
+            )
+            silu_and_mul(
+                tmp_bf16.view(-1, inter_dim),
+                reduced.view(-1, 2 * inter_dim),
+            )
+            dynamic_per_tensor_quant_fp8_i8(
+                out.view(-1, inter_dim),
+                tmp_bf16.view(-1, inter_dim),
+                out_scale,
+            )
+            # [HY3_FIX_V14] zero-input guard (graph-safe).
+            out_scale.clamp_(min=1e-12)
+            _out_u8 = out.view(torch.uint8)
+            _out_u8.masked_fill_(_out_u8.eq(0x80), 0)
+            return out, out_scale
 
         if _splitk_reduce and not _fused_post_disabled():
             _fused_kb_silu(
@@ -2394,8 +2585,14 @@ def flydsl_moe_stage1_direct(
             )
         return out
 
+    _kernel_out = out
+    if fuse_a2_quant:
+        _kernel_out = torch.empty(
+            (token_num, topk, inter_dim), dtype=torch.bfloat16, device=a.device
+        )
+
     args = _s1_direct_args_std(
-        out,
+        _kernel_out,
         a,
         w1,
         flat_a_scale,
@@ -2406,6 +2603,25 @@ def flydsl_moe_stage1_direct(
         model_dim,
     )
     _run_compiled(exe, args)
+    if fuse_a2_quant:
+        # [HY3_FIX_V12] per_Tensor scale (was per_Token shape (T*topk,) which caller treats as per_Tensor scalar -> bug)
+        out_scale = torch.zeros(
+            (1,), dtype=torch.float32, device=a.device
+        )
+        from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
+
+        dynamic_per_tensor_quant_fp8_i8(
+            out.view(-1, inter_dim),
+            _kernel_out.view(-1, inter_dim),
+            out_scale,
+        )
+        # [HY3_FIX_V13] zero-input guard (graph-safe): when amax=0 -> scale=0 -> static quant div/0 -> fp8 NaN.
+        # 1) clamp scale to small eps so downstream dequant won't div/0.
+        # 2) replace any fp8_e4m3fnuz NaN (encoding 0x80) with fp8 zero (0x00) via uint8 view.
+        out_scale.clamp_(min=1e-12)
+        _out_u8 = out.view(torch.uint8)
+        _out_u8.masked_fill_(_out_u8.eq(0x80), 0)
+        return out, out_scale
     return out
 
 

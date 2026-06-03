@@ -434,10 +434,17 @@ def mp_tuner(
     logged_error_types = (
         set()
     )  # Track error types that already logged to avoid duplicates
+    # Per-task count of "PID not in gpu_map" (mapping) errors. A worker that dies
+    # mid-task (e.g. an in-process LLVM/lld compile aborts on pthread_create EAGAIN
+    # under a low cgroup pids.max) is silently replaced by Pool with a new PID that
+    # was never recorded in gpu_map, so work_group raises KeyError. We recover via a
+    # pool restart, but cap retries so a persistently-unmappable task can't spin the
+    # restart loop forever.
+    mapping_error_counts = {}
+    MAX_MAPPING_RETRIES = 3
 
     while remaining_tasks:
         completed_this_round = []
-        dummy_failed_tasks = []
         timeout_count_this_round = 0  # Track timeouts in this round
 
         for k, async_result in remaining_tasks:
@@ -503,9 +510,34 @@ def mp_tuner(
                 is_mapping_error = error_type == "KeyError"
 
                 if is_mapping_error:
-                    error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map (triggering pool restart): {error_type} - {e}"
-                    dummy_failed_tasks.append((k, "mapping error"))
-                    # pool_restart_needed = True
+                    # The worker that handled this task had a PID not in gpu_map,
+                    # i.e. Pool replaced a worker that died mid-task. Trigger a pool
+                    # restart: it rebuilds gpu_map for the fresh workers and resubmits
+                    # every task still in remaining_tasks -- this task (deliberately
+                    # NOT marked complete so it is retried with a valid mapping) and
+                    # any sibling task whose result was lost when its worker died.
+                    mapping_error_counts[k] = mapping_error_counts.get(k, 0) + 1
+                    pool_restart_needed = True
+                    if mapping_error_counts[k] <= MAX_MAPPING_RETRIES:
+                        error_msg = (
+                            f"[Mapping Error] Task {k} - worker PID not in GPU map "
+                            f"(retry {mapping_error_counts[k]}/{MAX_MAPPING_RETRIES} "
+                            f"via pool restart): {error_type} - {e}"
+                        )
+                    else:
+                        # Persistently unmappable: record a failure and let it be
+                        # removed so the restart loop cannot spin forever.
+                        error_msg = (
+                            f"[Mapping Error] Task {k} exceeded {MAX_MAPPING_RETRIES} "
+                            f"remaps; recording failure: {error_type} - {e}"
+                        )
+                        failed_tasks.append((k, "mapping error"))
+                        dummy_results = []
+                        add_dummy_result(k, dummy_results)
+                        result_dict[k] = (
+                            dummy_results if shape_grouped else [dummy_results[0]]
+                        )
+                        completed_this_round.append((k, async_result))
                 elif error_type == "AcceleratorError":
                     # GPU fault (e.g. illegal memory access): worker returns exception instead of
                     # hanging. Unlike hang->timeout, the faulting worker may stay alive and accept

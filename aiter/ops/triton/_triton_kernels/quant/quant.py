@@ -94,6 +94,32 @@ def _quant_from_per_tensor_amax_kernel(
         tl.store(scale_out_ptr, scale)
 
 
+# P1.1_FUSED_SMALL_KERNEL — single-launch per-tensor quant for small inputs.
+@triton.jit
+def _per_tensor_quant_fused_small_kernel(
+    x_in_ptr,
+    qx_ptr,
+    scale_out_ptr,
+    n_elements: int,
+    BLOCK_SIZE: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+):
+    """Single workgroup loads whole input, computes amax, writes scale+qx.
+    Eliminates the amax->quant kernel-launch handoff used by
+    dynamic_per_tensor_quant_fp8_i8_nozero. Only valid when
+    n_elements <= BLOCK_SIZE.
+    """
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_in_ptr + offsets, mask=mask, other=0.0, cache_modifier=".cg")
+    amax = tl.max(tl.abs(x))
+    scale = amax / DTYPE_MAX
+    scale_recip = 1.0 / scale
+    qx = (x * scale_recip).to(qx_ptr.dtype.element_ty)
+    tl.store(qx_ptr + offsets, qx, mask=mask)
+    tl.store(scale_out_ptr, scale)
+
+
 @triton.jit
 def _dynamic_per_token_quant_fp8_i8_kernel(
     qx_ptr,

@@ -1104,3 +1104,512 @@ def compile_moe_gemm2_direct_smallm(
 
     launch_moe_gemm2_direct.__name__ = module_name
     return launch_moe_gemm2_direct
+
+
+@functools.lru_cache(maxsize=64)
+def compile_moe_route_fused_mfma_experimental(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int = 16,
+    tile_n: int = 256,
+    tile_k: int = 64,
+    in_dtype: str = "fp8",
+    out_dtype: str = "bf16",
+    a_scale_scalar: bool = True,
+    w_scale_per_expert: bool = True,
+    split_reduce: bool = False,
+):
+    """Compile the MFMA-preserving route-fusion experiment backend.
+
+    This is deliberately a narrow experimental entrypoint.  The current
+    implementation reuses the direct stage2 MFMA kernel as the backend after
+    the caller has produced fp8 A2 with the direct stage1 `_a2q` path.  Keeping
+    this as a separate compile hook lets us benchmark and profile the
+    MFMA-preserving route-fused API without touching production dispatch while
+    leaving room to inline stage1 into this backend once the in-kernel A2 scale
+    contract is solved.
+    """
+
+    return compile_moe_gemm2_direct_smallm(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        in_dtype=in_dtype,
+        out_dtype=out_dtype,
+        a_scale_scalar=a_scale_scalar,
+        w_scale_per_expert=w_scale_per_expert,
+        split_reduce=split_reduce,
+    )
+
+
+@functools.lru_cache(maxsize=16)
+def compile_moe_fused_1kernel_smallm(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_n1: int = 16,
+    tile_k1: int = 64,
+    tile_n2: int = 256,
+    tile_k2: int = 64,
+    a_scale_scalar: bool = True,
+    w_scale_per_expert: bool = True,
+):
+    """Single-kernel fused MoE: fp8 A1 -> stage1 MFMA -> silu -> LDS fp8 A2 -> stage2 MFMA -> bf16 out.
+
+    Eliminates all inter-kernel data movement and dispatch overhead vs the
+    5-kernel pipeline (A1-quant + stage1 + silu-A2q + stage2 + topk-reduce).
+
+    Grid  : (ceil(model_dim / tile_n2), tokens, 1)
+    Block : (tile_n2 // 32) * 64 threads
+
+    Stage 1 (wave 0 only):
+      For each route r in [0, topk):
+        MFMA fp8xfp8 gate+up over all inter_dim N-tiles and model_dim K-tiles.
+        Apply silu(gate)*up * x_scale * w1_scale_r  -> f32 A2.
+        Track running abs-max per lane across N-tiles.
+        Write 16 lane-maxima to LDS scratch; lane 0 reduces to per-route scale.
+        Quantize f32 A2 -> fp8, store to LDS.
+
+    Barrier (workgroup-wide)
+
+    Stage 2 (all waves):
+      Load fp8 A2 from LDS, MFMA fp8xfp8 with W2, accumulate weighted bf16 out.
+    """
+    if tile_n1 != 16:
+        raise ValueError("fused 1-kernel requires tile_n1=16")
+    if tile_k1 % 64 != 0:
+        raise ValueError("fused 1-kernel requires tile_k1 divisible by 64")
+    if tile_k2 % 64 != 0:
+        raise ValueError("fused 1-kernel requires tile_k2 divisible by 64")
+    if tile_n2 % 32 != 0:
+        raise ValueError("fused 1-kernel requires tile_n2 divisible by 32")
+    if model_dim % tile_k1 != 0:
+        raise ValueError(f"model_dim={model_dim} not divisible by tile_k1={tile_k1}")
+    if inter_dim % tile_n1 != 0:
+        raise ValueError(f"inter_dim={inter_dim} not divisible by tile_n1={tile_n1}")
+    if inter_dim % tile_k2 != 0:
+        raise ValueError(f"inter_dim={inter_dim} not divisible by tile_k2={tile_k2}")
+    if model_dim % tile_n2 != 0:
+        raise ValueError(f"model_dim={model_dim} not divisible by tile_n2={tile_n2}")
+
+    num_n1_tiles  = inter_dim // tile_n1
+    num_k1_tiles  = model_dim // tile_k1
+    num_k2_tiles  = inter_dim // tile_k2
+    num_waves2    = tile_n2 // 32
+    block_threads = num_waves2 * 64
+    n_per_wave2   = tile_n2 // num_waves2
+    num_acc_n2    = n_per_wave2 // 16
+
+    _FP8_MAX = 240.0  # cvt_pk_fp8_f32 on CDNA3 uses E4M3FNUZ (max=240, not 448)
+
+    # LDS layout (bytes, 16-byte aligned offsets)
+    # _lds_a2f  : f32 A2 values (topk routes * inter_dim f32)  topk*inter_dim*4 bytes
+    # _lds_sc   : f32 per-route A2 abs-max scale               topk*4 bytes
+    # _lds_lm   : f32 lane-max scratch for scale reduction      topk*16*4 bytes
+    # No fp8 LDS: stage2 loads f32 and packs on-the-fly via cvt_pk_fp8_f32
+    _lds_a2f_b  = topk * inter_dim * 4   # f32 A2
+    _lds_sc_b   = topk * 4               # f32 per-route abs-max scale
+    _lds_lm_b   = topk * 16 * 4         # f32 lane-max scratch (16 lanes x topk)
+    _off_a2f    = 0
+    _off_sc     = _ceil_div(_off_a2f + _lds_a2f_b, 16) * 16
+    _off_lm     = _ceil_div(_off_sc  + _lds_sc_b,  16) * 16
+    _lds_total  = _ceil_div(_off_lm  + _lds_lm_b,  16) * 16
+
+    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+    from flydsl.compiler.kernel_function import CompilationContext
+    _alloc = SmemAllocator(None, arch="gfx942", global_sym_name="smem_fused1k")
+    _alloc.ptr = _lds_total
+
+    module_name = (
+        f"fused_1k_moe_fp8_bf16"
+        f"_t1x{tile_n1}x{tile_k1}_t2x{tile_n2}x{tile_k2}"
+        f"_top{topk}_e{experts}"
+    )
+
+    def _out_elem():
+        return T.bf16() if callable(T.bf16) else T.bf16
+
+    def _silu(x):
+        return x / (arith.constant(1.0, type=T.f32) + rocdl.exp2(T.f32, arith.constant(-1.4426950408889634, type=T.f32) * x))
+
+    def _s_waitcnt_lgkm():
+        llvm.InlineAsmOp(
+            res=None, operands_=[],
+            asm_string="s_waitcnt lgkmcnt(0)",
+            constraints="", has_side_effects=True,
+        )
+
+    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    def moe_fused_1kernel(
+        arg_out: fx.Tensor,
+        arg_a1: fx.Tensor,
+        arg_w1: fx.Tensor,
+        arg_w2: fx.Tensor,
+        arg_scale_a1: fx.Tensor,
+        arg_scale_w1: fx.Tensor,
+        arg_scale_w2: fx.Tensor,
+        arg_topk_ids: fx.Tensor,
+        arg_topk_weights: fx.Tensor,
+        i32_tokens_in: fx.Int32,
+        i32_n_in: fx.Int32,
+        i32_k1_in: fx.Int32,
+        i32_k2_in: fx.Int32,
+    ):
+        tokens_in = arith.index_cast(T.index, i32_tokens_in)
+        n_in  = arith.index_cast(T.index, i32_n_in)
+        k1_in = arith.index_cast(T.index, i32_k1_in)
+        k2_in = arith.index_cast(T.index, i32_k2_in)
+
+        bx_n2  = gpu.block_id("x")
+        by_tok = gpu.block_id("y")
+        tx     = gpu.thread_id("x")
+
+        _bp          = _alloc.get_base()
+        _lds_a2f_ptr = SmemPtr(_bp, _off_a2f, T.f32, shape=(topk * inter_dim,))
+        _lds_sc_ptr  = SmemPtr(_bp, _off_sc,  T.f32, shape=(topk,))
+        _lds_lm_ptr  = SmemPtr(_bp, _off_lm,  T.f32, shape=(topk * 16,))
+        # Force memref.view creation at kernel body scope for SSA dominance
+        _ = _lds_a2f_ptr.get()
+        _ = _lds_sc_ptr.get()
+        _ = _lds_lm_ptr.get()
+
+        _out_nb  = tokens_in * n_in * fx.Index(2)
+        _a1_nb   = tokens_in * k1_in
+        _w1_nb   = fx.Index(experts * 2 * inter_dim) * k1_in
+        _w2_nb   = fx.Index(experts) * n_in * k2_in
+        _sa1_nb  = (fx.Index(1) if a_scale_scalar else tokens_in) * fx.Index(4)
+        _sw_nb   = fx.Index(experts * 4)
+        _tid_nb  = tokens_in * fx.Index(topk * 4)
+
+        out_rsrc = buffer_ops.create_buffer_resource(arg_out,           max_size=False, num_records_bytes=_out_nb)
+        a1_rsrc  = buffer_ops.create_buffer_resource(arg_a1,            max_size=False, num_records_bytes=_a1_nb)
+        w1_rsrc  = buffer_ops.create_buffer_resource(arg_w1,            max_size=False, num_records_bytes=_w1_nb)
+        w2_rsrc  = buffer_ops.create_buffer_resource(arg_w2,            max_size=False, num_records_bytes=_w2_nb)
+        sa1_rsrc = buffer_ops.create_buffer_resource(arg_scale_a1,      max_size=False, num_records_bytes=_sa1_nb)
+        sw1_rsrc = buffer_ops.create_buffer_resource(arg_scale_w1,      max_size=False, num_records_bytes=_sw_nb)
+        sw2_rsrc = buffer_ops.create_buffer_resource(arg_scale_w2,      max_size=False, num_records_bytes=_sw_nb)
+        tid_rsrc = buffer_ops.create_buffer_resource(arg_topk_ids,      max_size=False, num_records_bytes=_tid_nb)
+        tw_rsrc  = buffer_ops.create_buffer_resource(arg_topk_weights,   max_size=False, num_records_bytes=_tid_nb)
+
+        _ly_wl      = fx.make_layout((block_threads // 64, 64), stride=(64, 1))
+        _ly_l16     = fx.make_layout((4, 16), stride=(16, 1))
+        _crd_wl     = fx.idx2crd(tx, _ly_wl)
+        wave_id     = fx.get(_crd_wl, 0)
+        lane_id     = fx.get(_crd_wl, 1)
+        _crd_l16    = fx.idx2crd(lane_id, _ly_l16)
+        lane_div_16 = fx.get(_crd_l16, 0)
+        lane_mod_16 = fx.get(_crd_l16, 1)
+
+        is_wave0 = arith.cmpi(arith.CmpIPredicate.eq,
+                               arith.index_cast(T.i32, wave_id),
+                               arith.constant(0, type=T.i32))
+        is_row0  = arith.cmpi(arith.CmpIPredicate.eq,
+                               arith.index_cast(T.i32, lane_div_16),
+                               arith.constant(0, type=T.i32))
+        is_lane0 = arith.cmpi(arith.CmpIPredicate.eq,
+                               arith.index_cast(T.i32, lane_id),
+                               arith.constant(0, type=T.i32))
+
+        col_off_bytes = lane_div_16 * fx.Index(16)
+
+        _sa1_idx = fx.Index(0) if a_scale_scalar else by_tok
+        x_scale  = buffer_ops.buffer_load(
+            sa1_rsrc, arith.index_cast(T.i32, _sa1_idx), vec_width=1, dtype=T.f32)
+
+        _b1_lay = make_preshuffle_b_layout(arith,
+            c_n=arith.index(experts * inter_dim * 2), c_k=k1_in,
+            kpack_bytes=16, elem_bytes=1)
+        _lb1    = _b1_lay.layout_b
+        _ly_n1b = fx.make_layout((experts * inter_dim * 2 // 16, 16), stride=(16, 1))
+
+        _b2_lay = make_preshuffle_b_layout(arith,
+            c_n=arith.index(experts * model_dim), c_k=k2_in,
+            kpack_bytes=16, elem_bytes=1)
+        _lb2    = _b2_lay.layout_b
+        _ly_n2b = fx.make_layout((experts * model_dim // 16, 16), stride=(16, 1))
+
+        # ============================================================
+        # STAGE 1 — wave 0 only
+        # ============================================================
+        _if_w0 = scf.IfOp(is_wave0)
+        with ir.InsertionPoint(_if_w0.then_block):
+            _acc0 = arith.constant_vector(0.0, T.f32x4)
+
+            def _ld_a1_k64(bk):
+                _idx = (by_tok * k1_in + bk + col_off_bytes) // fx.Index(4)
+                _v   = buffer_copy_gmem16_dwordx4(buffer_ops, vector,
+                    elem_type=T.f8, idx_i32=_idx, rsrc=a1_rsrc,
+                    vec_elems=16, elem_bytes=1)
+                _i2  = vector.bitcast(T.i64x2, _v)
+                return (vector.extract(_i2, static_position=[0], dynamic_position=[]),
+                        vector.extract(_i2, static_position=[1], dynamic_position=[]))
+
+            def _mfma(acc, a0, a1v, b0, b1):
+                _t = rocdl.mfma_f32_16x16x32_fp8_fp8(T.f32x4, [a0, b0, acc, 0, 0, 0])
+                return rocdl.mfma_f32_16x16x32_fp8_fp8(T.f32x4, [a1v, b1, _t, 0, 0, 0])
+
+            for _r in range_constexpr(topk):
+                _ridx  = by_tok * fx.Index(topk) + fx.Index(_r)
+                _ei32  = buffer_ops.buffer_load(
+                    tid_rsrc, arith.index_cast(T.i32, _ridx), vec_width=1, dtype=T.i32)
+                _eidx  = arith.index_cast(T.index, _ei32)
+                _w1sc  = buffer_ops.buffer_load(sw1_rsrc, _ei32, vec_width=1, dtype=T.f32)
+                _rsc   = x_scale * _w1sc
+                _ebase = _eidx * fx.Index((2 * inter_dim) // 16)
+
+                # --- Pass 1: MFMA (all 64 lanes) + silu + LDS store (row-0 lanes only) ---
+                # MFMA ignores EXEC mask on CDNA3. All wave-0 lanes must participate
+                # with valid fp8 A data so the accumulator does not see NaN/garbage.
+                # Only row-0 lanes apply silu and write to LDS; extract(acc,[0])
+                # holds the valid M=1 result for those lanes.
+                _lane_max = arith.constant(0.0, type=T.f32)
+                for _n1 in range_constexpr(num_n1_tiles):
+                    _cg     = fx.Index(_n1 * 16) + lane_mod_16
+                    _crdg   = fx.idx2crd(_cg, _ly_n1b)
+                    _gblk   = _ebase + fx.get(_crdg, 0)
+                    _gintra = fx.get(_crdg, 1)
+                    _crdu   = fx.idx2crd(fx.Index(inter_dim) + _cg, _ly_n1b)
+                    _ublk   = _ebase + fx.get(_crdu, 0)
+                    _uintra = fx.get(_crdu, 1)
+                    _ag = _acc0
+                    _au = _acc0
+                    for _kt in range_constexpr(num_k1_tiles):
+                        for _kk in range_constexpr(tile_k1 // 64):
+                            _kb  = fx.Index(_kt * tile_k1 + _kk * 64)
+                            _a0, _a1v = _ld_a1_k64(_kb)
+                            _bg0 = load_b_pack_k32(buffer_ops, arith, vector,
+                                arg_b=arg_w1, b_rsrc=w1_rsrc, layout_b=_lb1,
+                                base_k=_kb, ki_step=0, n_blk=_gblk, n_intra=_gintra,
+                                lane_div_16=lane_div_16, elem_type=T.f8,
+                                kpack_bytes=16, elem_bytes=1)
+                            _bg1 = load_b_pack_k32(buffer_ops, arith, vector,
+                                arg_b=arg_w1, b_rsrc=w1_rsrc, layout_b=_lb1,
+                                base_k=_kb, ki_step=1, n_blk=_gblk, n_intra=_gintra,
+                                lane_div_16=lane_div_16, elem_type=T.f8,
+                                kpack_bytes=16, elem_bytes=1)
+                            _bu0 = load_b_pack_k32(buffer_ops, arith, vector,
+                                arg_b=arg_w1, b_rsrc=w1_rsrc, layout_b=_lb1,
+                                base_k=_kb, ki_step=0, n_blk=_ublk, n_intra=_uintra,
+                                lane_div_16=lane_div_16, elem_type=T.f8,
+                                kpack_bytes=16, elem_bytes=1)
+                            _bu1 = load_b_pack_k32(buffer_ops, arith, vector,
+                                arg_b=arg_w1, b_rsrc=w1_rsrc, layout_b=_lb1,
+                                base_k=_kb, ki_step=1, n_blk=_ublk, n_intra=_uintra,
+                                lane_div_16=lane_div_16, elem_type=T.f8,
+                                kpack_bytes=16, elem_bytes=1)
+                            _ag = _mfma(_ag, _a0, _a1v, _bg0, _bg1)
+                            _au = _mfma(_au, _a0, _a1v, _bu0, _bu1)
+                    # All lanes: compute silu (row1-3 values finite but unused)
+                    _gv  = vector.extract(_ag, static_position=[0], dynamic_position=[]) * _rsc
+                    _uv  = vector.extract(_au, static_position=[0], dynamic_position=[]) * _rsc
+                    _a2v = _silu(_gv) * _uv
+                    _abs_a2v = llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_a2v], [], [])
+                    _lane_max = arith.maximumf(_lane_max, _abs_a2v)
+                    # Only row-0 lanes store to LDS (exec-masked ds_write)
+                    _if_r0a = scf.IfOp(is_row0)
+                    with ir.InsertionPoint(_if_r0a.then_block):
+                        _a2f_i = fx.Index(_r * inter_dim + _n1 * 16) + lane_mod_16
+                        _lds_a2f_ptr.store(_a2v, idxs=[_a2f_i])
+                        scf.YieldOp([])
+                # Store per-lane max to LDS scratch (row-0 lanes only)
+                _if_r0b = scf.IfOp(is_row0)
+                with ir.InsertionPoint(_if_r0b.then_block):
+                    _lm_i = fx.Index(_r * 16) + lane_mod_16
+                    _lds_lm_ptr.store(_lane_max, idxs=[_lm_i])
+                    scf.YieldOp([])
+
+                # Intra-wavefront fence: LDS writes from all row-0 lanes visible
+                _s_waitcnt_lgkm()
+
+                # Lane 0 reduces per-lane maxima -> per-route abs-max scale
+                _if_l0 = scf.IfOp(is_lane0)
+                with ir.InsertionPoint(_if_l0.then_block):
+                    _gmax = arith.constant(0.0, type=T.f32)
+                    for _li in range_constexpr(16):
+                        _lm_val = _lds_lm_ptr.load(idxs=[fx.Index(_r * 16 + _li)])
+                        _gmax = arith.maximumf(_gmax, _lm_val)
+                    _fp8max = arith.constant(_FP8_MAX, type=T.f32)
+                    _safe_max = arith.maximumf(_gmax, arith.constant(1e-12, type=T.f32))
+                    _sc = _safe_max / _fp8max  # dequant scale: rcp used for packing in stage2
+                    _lds_sc_ptr.store(_sc, idxs=[fx.Index(_r)])
+                    scf.YieldOp([])
+
+                _s_waitcnt_lgkm()
+                # Note: no fp8 quantization pass here — stage2 loads f32 and
+                # packs on-the-fly using rocdl.cvt_pk_fp8_f32.
+
+            scf.YieldOp([])
+        # end wave-0 if-block
+
+        # ============================================================
+        # Workgroup barrier: fp8 A2 in LDS visible to all waves
+        # Use inline asm s_barrier (gpu.barrier() does not lower to s_barrier here)
+        # ============================================================
+        llvm.InlineAsmOp(
+            res=None, operands_=[],
+            asm_string="s_waitcnt lgkmcnt(0)\ns_barrier",
+            constraints="", has_side_effects=True,
+        )
+
+        # ============================================================
+        # STAGE 2 — all waves
+        # ============================================================
+        _by_n2   = bx_n2 * fx.Index(tile_n2)
+        _n2base  = (wave_id % fx.Index(num_waves2)) * fx.Index(n_per_wave2)
+
+        _col2s  = []
+        _n2blks = []
+        _n2intr = []
+        for _ni in range_constexpr(num_acc_n2):
+            _c2 = _by_n2 + _n2base + fx.Index(_ni * 16) + lane_mod_16
+            _col2s.append(_c2)
+            _cw = fx.idx2crd(_c2, _ly_n2b)
+            _n2blks.append(fx.get(_cw, 0))
+            _n2intr.append(fx.get(_cw, 1))
+
+        _oacc  = [arith.constant(0.0, type=T.f32)] * num_acc_n2
+        _ai2   = arith.constant_vector(0.0, T.f32x4)
+        _rbase = by_tok * fx.Index(topk)
+
+        for _sl in range_constexpr(topk):
+            _ri2    = _rbase + fx.Index(_sl)
+            _ri32_2 = arith.index_cast(T.i32, _ri2)
+            _ei32_2 = buffer_ops.buffer_load(tid_rsrc, _ri32_2, vec_width=1, dtype=T.i32)
+            _eidx_2 = arith.index_cast(T.index, _ei32_2)
+            _tw_2   = buffer_ops.buffer_load(tw_rsrc,  _ri32_2, vec_width=1, dtype=T.f32)
+            _a2sc2  = _lds_sc_ptr.load(idxs=[fx.Index(_sl)])
+            _w2sc2  = buffer_ops.buffer_load(sw2_rsrc, _ei32_2, vec_width=1, dtype=T.f32)
+            _csc    = _a2sc2 * _w2sc2 * _tw_2
+            _eoff2  = _eidx_2 * n_in
+            _asl    = [_ai2] * num_acc_n2
+
+            for _kt2 in range_constexpr(num_k2_tiles):
+                for _kk2 in range_constexpr(tile_k2 // 64):
+                    _kb2 = fx.Index(_kt2 * tile_k2 + _kk2 * 64)
+
+                    # Load f32 A2 from LDS, scale, pack 16xf32->16xfp8 via cvt_pk_fp8_f32
+                    # _kb2 is the inter_dim element offset (already in f32-element units)
+                    # lane_div_16 selects which 16-element stripe this lane-group handles
+                    _a2sc_s2  = _lds_sc_ptr.load(idxs=[fx.Index(_sl)])
+                    _a2_invsc = rocdl.rcp(T.f32, _a2sc_s2)
+                    _a2f_base = fx.Index(_sl * inter_dim) + _kb2 + lane_div_16 * fx.Index(16)
+                    _zero_i32 = arith.constant(0, type=T.i32)
+
+                    # Pack f32[0..3] -> i32 _pk0a (4 fp8 bytes)
+                    _fv0 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(0)]) * _a2_invsc
+                    _fv1 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(1)]) * _a2_invsc
+                    _pk0a = rocdl.cvt_pk_fp8_f32(T.i32, _fv0, _fv1, _zero_i32, 0)
+                    _fv0 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(2)]) * _a2_invsc
+                    _fv1 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(3)]) * _a2_invsc
+                    _pk0a = rocdl.cvt_pk_fp8_f32(T.i32, _fv0, _fv1, _pk0a, 1)
+
+                    # Pack f32[4..7] -> i32 _pk0b (4 fp8 bytes)
+                    _fv0 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(4)]) * _a2_invsc
+                    _fv1 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(5)]) * _a2_invsc
+                    _pk0b = rocdl.cvt_pk_fp8_f32(T.i32, _fv0, _fv1, _zero_i32, 0)
+                    _fv0 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(6)]) * _a2_invsc
+                    _fv1 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(7)]) * _a2_invsc
+                    _pk0b = rocdl.cvt_pk_fp8_f32(T.i32, _fv0, _fv1, _pk0b, 1)
+
+                    # _ap0 = fp8[0..7] as i64
+                    _pk0a_64 = arith.extui(T.i64, _pk0a)
+                    _pk0b_64 = arith.extui(T.i64, _pk0b)
+                    _ap0 = _pk0a_64 | (_pk0b_64 << arith.constant(32, type=T.i64))
+
+                    # Pack f32[8..11] -> i32 _pk1a (4 fp8 bytes)
+                    _fv0 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(8)])  * _a2_invsc
+                    _fv1 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(9)])  * _a2_invsc
+                    _pk1a = rocdl.cvt_pk_fp8_f32(T.i32, _fv0, _fv1, _zero_i32, 0)
+                    _fv0 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(10)]) * _a2_invsc
+                    _fv1 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(11)]) * _a2_invsc
+                    _pk1a = rocdl.cvt_pk_fp8_f32(T.i32, _fv0, _fv1, _pk1a, 1)
+
+                    # Pack f32[12..15] -> i32 _pk1b (4 fp8 bytes)
+                    _fv0 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(12)]) * _a2_invsc
+                    _fv1 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(13)]) * _a2_invsc
+                    _pk1b = rocdl.cvt_pk_fp8_f32(T.i32, _fv0, _fv1, _zero_i32, 0)
+                    _fv0 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(14)]) * _a2_invsc
+                    _fv1 = _lds_a2f_ptr.load(idxs=[_a2f_base + fx.Index(15)]) * _a2_invsc
+                    _pk1b = rocdl.cvt_pk_fp8_f32(T.i32, _fv0, _fv1, _pk1b, 1)
+
+                    # _ap1 = fp8[8..15] as i64
+                    _pk1a_64 = arith.extui(T.i64, _pk1a)
+                    _pk1b_64 = arith.extui(T.i64, _pk1b)
+                    _ap1 = _pk1a_64 | (_pk1b_64 << arith.constant(32, type=T.i64))
+
+                    for _ni in range_constexpr(num_acc_n2):
+                        _rw2  = _eoff2 + _col2s[_ni]
+                        _cw2n = fx.idx2crd(_rw2, _ly_n2b)
+                        _b20  = load_b_pack_k32(buffer_ops, arith, vector,
+                            arg_b=arg_w2, b_rsrc=w2_rsrc, layout_b=_lb2,
+                            base_k=_kb2, ki_step=0,
+                            n_blk=fx.get(_cw2n, 0), n_intra=fx.get(_cw2n, 1),
+                            lane_div_16=lane_div_16, elem_type=T.f8,
+                            kpack_bytes=16, elem_bytes=1)
+                        _b21  = load_b_pack_k32(buffer_ops, arith, vector,
+                            arg_b=arg_w2, b_rsrc=w2_rsrc, layout_b=_lb2,
+                            base_k=_kb2, ki_step=1,
+                            n_blk=fx.get(_cw2n, 0), n_intra=fx.get(_cw2n, 1),
+                            lane_div_16=lane_div_16, elem_type=T.f8,
+                            kpack_bytes=16, elem_bytes=1)
+                        _t1      = rocdl.mfma_f32_16x16x32_fp8_fp8(T.f32x4, [_ap0, _b20, _asl[_ni], 0, 0, 0])
+                        _asl[_ni] = rocdl.mfma_f32_16x16x32_fp8_fp8(T.f32x4, [_ap1, _b21, _t1, 0, 0, 0])
+
+            for _ni in range_constexpr(num_acc_n2):
+                _v = vector.extract(_asl[_ni], static_position=[0], dynamic_position=[])
+                _oacc[_ni] = _oacc[_ni] + _v * _csc
+
+        _if_out = scf.IfOp(is_row0)
+        with ir.InsertionPoint(_if_out.then_block):
+            for _ni in range_constexpr(num_acc_n2):
+                _ov = arith.trunc_f(_out_elem(), _oacc[_ni])
+                _oi = by_tok * n_in + _col2s[_ni]
+                buffer_ops.buffer_store(_ov, out_rsrc, arith.index_cast(T.i32, _oi))
+            scf.YieldOp([])
+
+
+    @flyc.jit
+    def launch_fused_1kernel(
+        arg_out: fx.Tensor,
+        arg_a1: fx.Tensor,
+        arg_w1: fx.Tensor,
+        arg_w2: fx.Tensor,
+        arg_scale_a1: fx.Tensor,
+        arg_scale_w1: fx.Tensor,
+        arg_scale_w2: fx.Tensor,
+        arg_topk_ids: fx.Tensor,
+        arg_topk_weights: fx.Tensor,
+        i32_tokens_in: fx.Int32,
+        i32_n_in: fx.Int32,
+        i32_k1_in: fx.Int32,
+        i32_k2_in: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _alloc.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            _alloc.finalize()
+        gx = fx.Index(_ceil_div(model_dim, tile_n2))
+        gy = arith.index_cast(T.index, i32_tokens_in)
+        moe_fused_1kernel(
+            arg_out, arg_a1, arg_w1, arg_w2,
+            arg_scale_a1, arg_scale_w1, arg_scale_w2,
+            arg_topk_ids, arg_topk_weights,
+            i32_tokens_in, i32_n_in, i32_k1_in, i32_k2_in,
+        ).launch(
+            grid=(gx, gy, fx.Index(1)),
+            block=(block_threads, 1, 1),
+            stream=stream,
+        )
+
+    launch_fused_1kernel.__name__ = module_name
+    return launch_fused_1kernel
