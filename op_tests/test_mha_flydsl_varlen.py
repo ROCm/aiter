@@ -107,6 +107,38 @@ def run_varlen_test(cu_q_list, cu_k_list, H=1, causal=False):
     err = _checkAllclose(o.cpu().float(), ref.cpu().float(),
                          rtol=1e-2, atol=1e-2, msg=f"  [{tag}] ")
 
+    if err > 0.0 and B > 1:
+        o_f = o.cpu().float()
+        r_f = ref.cpu().float()
+        for b in range(B):
+            sq = cu_q[b+1] - cu_q[b]
+            ob = o_f[cu_q[b]:cu_q[b+1]]
+            rb = r_f[cu_q[b]:cu_q[b+1]]
+            isC = torch.isclose(ob, rb, rtol=1e-2, atol=1e-2)
+            bad = (~isC).sum().item()
+            if bad > 0:
+                delta = (ob[~isC] - rb[~isC]).abs()
+                bad_idx = torch.nonzero(~isC)
+                print(f"    batch {b} (sq={sq}): {bad} bad, max_err={delta.max():.6f}, "
+                      f"first_tok={bad_idx[0,0].item()}, last_tok={bad_idx[-1,0].item()}")
+
+    if err > 0.0 and B > 1:
+        o_f = o.cpu().float()
+        r_f = ref.cpu().float()
+        for b in range(B):
+            sq = cu_q[b+1] - cu_q[b]
+            ob = o_f[cu_q[b]:cu_q[b+1]]
+            rb = r_f[cu_q[b]:cu_q[b+1]]
+            isC = torch.isclose(ob, rb, rtol=1e-2, atol=1e-2)
+            bad = (~isC).sum().item()
+            if bad > 0:
+                delta = (ob[~isC] - rb[~isC]).abs()
+                bad_idx = torch.nonzero(~isC)
+                toks = bad_idx[:, 0].unique()
+                print(f"    batch {b} (sq={sq}): {bad} bad, max_err={delta.max():.6f}, "
+                      f"tok_range=[{toks.min().item()}..{toks.max().item()}], "
+                      f"n_bad_toks={len(toks)}")
+
     return err < 0.05
 
 
@@ -119,10 +151,10 @@ if __name__ == "__main__":
         ([0, 128], [0, 128], 1, False),
         ([0, 128], [0, 128], 1, True),
         ([0, 184], [0, 184], 1, False),
-        ([0, 184], [0, 184], 1, True),
+        ([0, 184], [0, 184], 128, True),
         ([0, 341], [0, 341], 1, False),
-        ([0, 341], [0, 341], 1, True),
-        ([0, 481, 581, 982], [0, 481, 581, 982], 1, True),
+        ([0, 341], [0, 341], 128, True),
+        ([0, 481, 581, 982], [0, 481, 581, 982], 128, True),
     ]
 
     n_pass = 0

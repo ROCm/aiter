@@ -297,19 +297,22 @@ def _per_warp_oob_dim1(total_rows_i32, wave_id, rows_per_warp=8):
 
 
 def _make_kv_dg1_with_oob(config_bf16, dim0_elems, dim1_rows,
-                          stride_seq_elems, oob_dim1_raw):
+                          stride_seq_elems, oob_dim1_raw,
+                          dim0_stride=None):
     from flydsl._mlir.dialects import arith as _da
     _i32 = ir.IntegerType.get_signless(32)
     _td1_lo = _da.andi(oob_dim1_raw,
         _da.constant(_i32, value=ir.IntegerAttr.get(_i32, 0xFFFF)))
     _sgpr2 = _da.shli(_td1_lo,
         _da.constant(_i32, value=ir.IntegerAttr.get(_i32, 16)))
+    if dim0_stride is None:
+        dim0_stride = dim0_elems
     return vector.from_elements(
         T.vec(8, T.i32),
         [arith.constant(config_bf16, type=T.i32),
          arith.constant(dim0_elems << 16, type=T.i32),
          _sgpr2,
-         arith.constant(dim0_elems << 16, type=T.i32),
+         arith.constant(dim0_stride << 16, type=T.i32),
          arith.constant(dim1_rows, type=T.i32),
          stride_seq_elems,
          arith.constant(0, type=T.i32),
@@ -349,11 +352,12 @@ def _tdm_load_k_only(
 
     i64 = ir.IntegerType.get_signless(64)
 
-    # dim0=200 (not QK_HDIM=192): gives LDS inner stride = 200*2=400B = K_ROW_BYTES.
-    # TDM reads 8 extra bf16 past each real K row in global; those land at LDS
-    # bytes 384-399 which the reader never accesses (max read byte = 367).
-    # 2-way bank conflict: 100 dwords, 100 mod 32 = 4. Safe on GPU (page-aligned).
-    _DIM0_ELEMS = 200
+    # dim0_valid=QK_HDIM(192): only read 192 bf16 from global per row.
+    # dim0_stride=200: LDS inner stride = 200*2=400B = K_ROW_BYTES.
+    # Previous dim0_valid=200 caused OOB reads for the last head of the last
+    # token (16 extra bytes past valid K allocation).
+    _DIM0_VALID = QK_HDIM    # 192 — global read width
+    _DIM0_STRIDE = 200       # LDS row stride in elements
     _DIM1_ROWS = 8           # rows per warp
 
     # _K_TDM_CONFIG = (1 << 16): data_size=1 (bf16), pad_enable=0
@@ -364,9 +368,9 @@ def _tdm_load_k_only(
     k_dg1 = oob_dg1_list if oob_dg1_list is not None else vector.from_elements(
         T.vec(8, T.i32),
         [arith.constant(_K_CONFIG_BF16, type=T.i32),
-         arith.constant(_DIM0_ELEMS << 16, type=T.i32),
+         arith.constant(_DIM0_VALID << 16, type=T.i32),
          arith.constant(_DIM1_ROWS << 16, type=T.i32),
-         arith.constant(_DIM0_ELEMS << 16, type=T.i32),
+         arith.constant(_DIM0_STRIDE << 16, type=T.i32),
          arith.constant(_DIM1_ROWS, type=T.i32),
          stride_k_seq_elems,
          arith.constant(0, type=T.i32),
@@ -878,11 +882,12 @@ def compile_fmha_fwd(*, is_causal: bool = False):
     
         _k_oob_dg1 = [
             _make_kv_dg1_with_oob(
-                _K_CFG_OOB, 200, 8, _stride_k_elems_oob,
+                _K_CFG_OOB, QK_HDIM, 8, _stride_k_elems_oob,
                 _per_warp_oob_dim1(
                     _mlir_arith.subi(actual_kv_len,
                         _to_raw(arith.constant(_su * 32, type=T.i32))),
-                    wave_id, 8))
+                    wave_id, 8),
+                dim0_stride=200)
             for _su in range(CNT_SU)
         ]
         _v_oob_dg1 = [
@@ -1121,11 +1126,12 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                 _to_raw(arith.constant(TILE_N, type=T.i32)))
             _k_tile1_oob_dg1 = [
                 _make_kv_dg1_with_oob(
-                    _K_CFG_OOB, 200, 8, _stride_k_elems_oob,
+                    _K_CFG_OOB, QK_HDIM, 8, _stride_k_elems_oob,
                     _per_warp_oob_dim1(
                         _mlir_arith.subi(_kv_remain_t1,
                             _to_raw(arith.constant(_su * 32, type=T.i32))),
-                        wave_id, 8))
+                        wave_id, 8),
+                    dim0_stride=200)
                 for _su in range(CNT_SU)
             ]
             _tdm_load_k_only(
@@ -1290,7 +1296,7 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                         k_dg1 = vector.from_elements(
                             T.vec(8, T.i32),
                             [arith.constant(_K_CFG, type=T.i32),
-                             arith.constant(200 << 16, type=T.i32),
+                             arith.constant(QK_HDIM << 16, type=T.i32),
                              arith.constant(8 << 16, type=T.i32),
                              arith.constant(200 << 16, type=T.i32),
                              arith.constant(8, type=T.i32),
@@ -1784,19 +1790,47 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                 # GEMM1 loads K(tile_idx+1) -> K_next (stage 2 wait + stage 3 ds_load)
                 # GEMM2 loads V(tile_idx) -> V_next (stage 2 wait)
                 tile_idx_i32 = arith.index_cast(T.i32, tile_idx)
-    
+
                 tile_n_stride_v = _mlir_arith.muli(tile_n_const, stride_v_seq)
                 cur_v_advance = _mlir_arith.muli(tile_idx_i32, tile_n_stride_v)
                 cur_v_offset = _mlir_arith.addi(_to_raw(v_offset), cur_v_advance)
-    
+
                 next_tile = _mlir_arith.addi(
                     tile_idx_i32, _to_raw(arith.constant(1, type=T.i32)))
                 tile_n_stride_k = _mlir_arith.muli(tile_n_const, stride_k_seq)
                 next_k_advance = _mlir_arith.muli(next_tile, tile_n_stride_k)
                 next_k_offset = _mlir_arith.addi(_to_raw(k_offset), next_k_advance)
-    
+
+                # ---- Per-tile OOB dg1 for K prefetch and V load ----
+                # V(tile_idx): remaining = actual_kv_len - tile_idx * TILE_N
+                _loop_v_remain = _mlir_arith.subi(
+                    actual_kv_len,
+                    _mlir_arith.muli(tile_idx_i32, tile_n_const))
+                _loop_v_oob_dg1 = [
+                    _make_kv_dg1_with_oob(
+                        _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
+                        _per_warp_oob_dim1(
+                            _mlir_arith.subi(_loop_v_remain,
+                                _to_raw(arith.constant(_su * 32, type=T.i32))),
+                            wave_id, 8))
+                    for _su in range(CNT_SU)
+                ]
+                # K(tile_idx+1): remaining = actual_kv_len - (tile_idx+1) * TILE_N
+                _loop_k_remain = _mlir_arith.subi(
+                    actual_kv_len,
+                    _mlir_arith.muli(next_tile, tile_n_const))
+                _loop_k_oob_dg1 = [
+                    _make_kv_dg1_with_oob(
+                        _K_CFG_OOB, QK_HDIM, 8, _stride_k_elems_oob,
+                        _per_warp_oob_dim1(
+                            _mlir_arith.subi(_loop_k_remain,
+                                _to_raw(arith.constant(_su * 32, type=T.i32))),
+                            wave_id, 8),
+                        dim0_stride=200)
+                    for _su in range(CNT_SU)
+                ]
+
                 # ---- Core loop: GEMM1(QK)+TDM_K + softmax + GEMM2(PV)+TDM_V ----
-                _DBG_ZERO_OFF_LOOP = _to_raw(arith.constant(0, type=T.i32))  # DBG: zero loop KV offsets
                 sp_out, kv_out, o_tiles, su_sp_tiles_out, _partial_sp_lo_out, _partial_sp_hi_out, _partial_ed_out = _core_loop(
                     ty, False,
                     q_frags, kv_tiles, sp_tiles,
@@ -1809,6 +1843,8 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                     tdm_k_target=ia_k_next_base,
                     kv_lds_addrs_next=kv_lds_addrs_next,
                     gemm1_tdm_is_v=False,
+                    loop_k_oob_dg1=_loop_k_oob_dg1,
+                    loop_v_oob_dg1=_loop_v_oob_dg1,
                 )
     
                 # ---- Yield updated state with ping-pong swap ----
