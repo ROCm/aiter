@@ -161,8 +161,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(sink->dtype() == AITER_DTYPE_fp32, "pa_decode_bf16_asm: sink must be fp32");
 
     // ---- dimensions -------------------------------------------------------
+    // head_dim comes from Q's innermost dim ([batch, mtp, kv_head, gqa, head_dim]).
+    // Do NOT derive it from K/V: those use the tiled paged layout
+    //   K[num_pages, kv_head, head_dim/16, page, 16] / V[..., page/16, head_dim, 16]
+    // (see pa_ps.cpp), whose last dim is the 16-element tile, not head_dim.
     const int kv_head_num = (int)K->size(1);
-    const int head_dim    = (int)V->size(-1);
+    const int head_dim    = (int)Q->size(-1);
     const int page_size   = PA_PAGE_SIZE;
 
     AITER_CHECK(head_dim == PA_HEAD_DIM,
