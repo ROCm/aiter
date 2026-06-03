@@ -209,9 +209,9 @@ def prepare_num_chunks(
     it runs once per shape rather than once per forward call.
     """
     return int(
-        prepare_chunk_offsets(
-            cu_seqlens, chunk_size, num_decodes, num_decode_tokens
-        )[-1]
+        prepare_chunk_offsets(cu_seqlens, chunk_size, num_decodes, num_decode_tokens)[
+            -1
+        ]
     )
 
 
