@@ -343,12 +343,20 @@ def fused_moe_(
     ):
         logger.info("[fused_moe] fp4_bf16 INTERLEAVE: dispatching to FlyDSL kernel")
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
         _out_str = "bf16"
         _tile_m = 16 if M < 2048 else 32 if M < 16384 else 64
         _tile_n = 128
         _tile_k = 128
-        _kn1 = flydsl_kernel_name(1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k) + "_gui"
-        _kn2 = flydsl_kernel_name(2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic")
+        _kn1 = (
+            flydsl_kernel_name(
+                1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k
+            )
+            + "_gui"
+        )
+        _kn2 = flydsl_kernel_name(
+            2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
         metadata = MOEMetadata(
             functools.partial(
                 _flydsl_stage1_wrapper,
@@ -1276,7 +1284,12 @@ def get_2stage_cfgs(
         _gui_tag = "_gui" if gate_mode == GateMode.INTERLEAVE else ""
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
-        kn1 = flydsl_kernel_name(1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k) + _gui_tag
+        kn1 = (
+            flydsl_kernel_name(
+                1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k
+            )
+            + _gui_tag
+        )
         kn2 = flydsl_kernel_name(
             2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
         )
@@ -1295,7 +1308,7 @@ def get_2stage_cfgs(
                 model_dim_pad=hidden_pad,
             ),
             _tile_m,
-            1,     # no split-K for fp4_bf16 (not yet tuned)
+            1,  # no split-K for fp4_bf16 (not yet tuned)
             False,
         )
     if (
@@ -1631,9 +1644,14 @@ def fused_moe_2stages(
         and is_flydsl_available()
     ):
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
         _tile_m = 16 if token_num < 2048 else 32 if token_num < 16384 else 64
-        _kn1 = flydsl_kernel_name(1, "bf16", "fp4bf16", "bf16", _tile_m, 128, 128) + "_gui"
-        _kn2 = flydsl_kernel_name(2, "bf16", "fp4bf16", "bf16", _tile_m, 128, 128, "atomic")
+        _kn1 = (
+            flydsl_kernel_name(1, "bf16", "fp4bf16", "bf16", _tile_m, 128, 128) + "_gui"
+        )
+        _kn2 = flydsl_kernel_name(
+            2, "bf16", "fp4bf16", "bf16", _tile_m, 128, 128, "atomic"
+        )
         metadata = MOEMetadata(
             functools.partial(
                 _flydsl_stage1_wrapper,
