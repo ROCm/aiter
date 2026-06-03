@@ -876,10 +876,19 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     **_kwargs,
 ):
-
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
         inter_dim_pad, model_dim_pad, bias2
     )
+    # `parsed` is the static per-kernel params dict registered at
+    # import time by `get_flydsl_stage2_kernels` (see
+    # aiter/ops/flydsl/moe_kernels.py) and pre-populated into
+    # `_KERNEL_PARAMS` by `_register_all_configs()`. Variant-specific
+    # knobs that live on the kernel name (e.g. the
+    # `..._persist_async_w4_cumul3` production variant adds
+    # `use_async_copy=True / waves_per_eu=4 / cu_num_mul=3`) are
+    # already baked into this dict, so the `parsed.get(..., default)`
+    # calls below pick up the registered values for that kernel name
+    # rather than always falling back to defaults.
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
@@ -902,6 +911,9 @@ def _flydsl_stage2_wrapper(
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
         sort_block_m=parsed.get("sort_block_m", 0),
+        waves_per_eu=parsed.get("waves_per_eu", None),
+        use_async_copy=parsed.get("use_async_copy", False),
+        cu_num_mul=parsed.get("cu_num_mul", 1),
         b_nt=parsed.get("b_nt", 0),
         persist=parsed.get("persist", None),
         inter_dim_pad=inter_dim_pad,
