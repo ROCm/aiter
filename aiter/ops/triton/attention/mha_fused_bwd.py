@@ -8,6 +8,7 @@ import triton
 from aiter.ops.triton.utils.types import _is_fp8
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
+    _bwd_preprocess_mxfp8,
     _bwd_preprocess,
     _bwd_kernel_dkdvdq_causal,
     _bwd_kernel_dkdvdq_noncausal,
@@ -16,6 +17,73 @@ from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
 _LOGGER = AiterTritonLogger()
+
+
+def bwd_preprocess_mxfp8(
+    o: torch.Tensor,
+    o_scale: torch.Tensor,
+    do: torch.Tensor,
+    do_scale: torch.Tensor,
+    config: Optional[Dict[str, any]] = None,
+):
+    """
+    Backward mx8 preprocess function.
+
+    Args:
+        o (torch.Tensor): Output from forward pass. Shape (..., seqlen, head_dim)
+        o_scale (torch.Tensor): MX scales for o computed along head dimension. Shape (..., seqlen, head_dim // 32)
+        do (torch.Tensor): Output gradient. Shape (..., seqlen, head_dim)
+        do_scale (torch.Tensor): Output gradient. Shape (..., seqlen, head_dim // 32)
+        config (Optional[Dict[str, any]]): Kernel tuning parameters.
+
+    Returns:
+        torch.Tensor: Delta tensor (element-wise product of do and o) with shape matching softmax_lse.
+    """
+
+    # get strides and shape
+    if o.dim() > 3:  # flatten batch and number of heads dimensions
+        o = o.reshape(-1, o.shape[-2], o.shape[-1])
+        o_scale = o_scale.reshape(-1, o.shape[-2], o.shape[-1])
+        do = do.reshape(-1, do.shape[-2], do.shape[-1])
+        do_scale = do_scale.reshape(-1, do.shape[-2], do.shape[-1])
+    batch, seqlen, head_dim = o.shape
+
+    # BLOCK_D, BLOCK_D_POW2
+    # padding for head_dim. Power of 2 or 16
+    BLOCK_D_POW2 = triton.next_power_of_2(head_dim)
+    BLOCK_D_POW2 = max(BLOCK_D_POW2, 16)
+
+    # init delta
+    delta = torch.empty((batch, seqlen), dtype=torch.float32).cuda()
+
+    # preprocess
+    # compute D(delta) = rowsum(dO*O). Note, multiplication is element-wise.
+    if config is None:
+        config = _get_config()
+
+    pre_grid = (
+        triton.cdiv(seqlen, config["preprocess_kernel"]["PRE_BLOCK"]),
+        batch,
+    )
+
+    _bwd_preprocess_mxfp8[pre_grid](
+        o,
+        o_scale,
+        do,
+        do_scale,
+        delta,
+        *o.stride(),
+        *o_scale.stride(),
+        *do.stride(),
+        *do_scale.stride(),
+        *delta.stride(),
+        seqlen,
+        BLOCK_M=config["preprocess_kernel"]["PRE_BLOCK"],
+        BLOCK_D=head_dim,
+        BLOCK_D_POW2=BLOCK_D_POW2,
+    )
+
+    return delta
 
 
 def flash_attn_fused_backward(

@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Attention backward fp8 test — @flyc.kernel API.
+
+Kernel implementation lives in `kernels/attn_bwd_mxfp8_gfx950.py`.
+"""
+
+import logging
+import torch
+import pytest
+
+from aiter.ops.triton.quant.mxfp8_quant import (
+    downcast_to_mxfp8,
+    upcast_from_mxfp8,
+    downcast_to_mxfp8_2d,
+    upcast_from_mxfp8_2d,
+)
+from aiter.ops.flydsl.kernels.attn_bwd_mxfp8_gfx950 import compile_attn_bwd_mxfp8_gfx950
+from flydsl.runtime.device import get_rocm_arch
+
+logging.basicConfig(level=logging.INFO)
+
+if not torch.cuda.is_available():
+    pytest.skip("CUDA/ROCm not available. Skipping GPU tests.", allow_module_level=True)
+
+ARCH = str(get_rocm_arch())
+
+
+def check_result(test_out, ref_out, atol=0.01, rtol=0.01, pass_pct=95.0):
+    """Compare outputs and print result. Returns (passed, max_delta, pct_close)."""
+    close_mask = torch.isclose(test_out.float(), ref_out.float(), atol=atol, rtol=rtol)
+    pct_close = close_mask.float().mean().item() * 100
+    passed = pct_close > pass_pct
+    if passed:
+        return True
+
+    max_delta = (ref_out.float() - test_out.float()).abs().max().item()
+    print(
+        f"  max_delta={max_delta:.4f}, {pct_close:.1f}% close (atol={atol}, rtol={rtol})"
+    )
+    print(f"  ref  sample: {ref_out.reshape(-1)[:8]}")
+    print(f"  test sample: {test_out.reshape(-1)[:8]}")
+    print(f"  --> {'PASS' if passed else 'FAIL'}")
+
+
+def mx_quant(x, dim=-1):
+    x_fp8, x_scale = downcast_to_mxfp8(x, torch.float8_e4m3fn, dim)
+    x_fp32 = upcast_from_mxfp8(x_fp8, x_scale, torch.float32, dim)
+    return x_fp32.contiguous(), x_fp8.contiguous(), x_scale.contiguous()
+
+
+def mx_quant_2d(x):
+    x_fp8, x_scale = downcast_to_mxfp8_2d(x, torch.float8_e4m3fn)
+    x_fp32 = upcast_from_mxfp8_2d(x_fp8, x_scale, torch.float32)
+    return x_fp32.contiguous(), x_fp8.contiguous(), x_scale.contiguous()
+
+
+def run_torch(
+    q_fp32,
+    k_fp32,
+    v,
+    do_fp32,
+    m,
+    D,
+    sm_scale,
+    causal,
+    gqa_size,
+):
+    batch = q_fp32.shape[0]
+    num_heads_q = q_fp32.shape[1]
+    num_heads_kv = num_heads_q // gqa_size
+    seqlen = q_fp32.shape[2]
+    head_dim = q_fp32.shape[3]
+    device = q_fp32.device
+    v_f32 = v.to(torch.float32)
+    qk = torch.matmul(q_fp32, k_fp32.transpose(-2, -1)) * sm_scale
+    p = torch.exp(qk - m[:, :, :, None])
+    if causal:
+        mask = torch.tril(torch.ones((seqlen, seqlen), device=device))
+        p[:, :, mask == 0] = 0.0
+
+    ppT, _, _ = mx_quant(p, -2)
+    ppT = ppT.transpose(-2, -1)
+    dv = torch.matmul(ppT, do_fp32)
+    dp = torch.matmul(do_fp32, v_f32.transpose(-2, -1))
+    ds = p * (dp - D[:, :, :, None])
+    dsT, _, _ = mx_quant(ds, -1)
+    dsT = dsT.transpose(-2, -1)
+    ds, _, _ = mx_quant(ds, -2)
+    dk = torch.matmul(dsT, q_fp32) * sm_scale
+    dq = torch.matmul(ds, k_fp32) * sm_scale
+
+    dk = dk.view(batch, num_heads_kv, gqa_size, seqlen, head_dim).sum(dim=2)
+    dv = dv.view(batch, num_heads_kv, gqa_size, seqlen, head_dim).sum(dim=2)
+
+    return dq, dk, dv
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize(
+    "num_heads_q, num_heads_kv",
+    [(48, 48), (64, 8), (80, 20)],
+)
+@pytest.mark.parametrize("seqlen", [128, 1024, 1056, 1152, 4096])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("tile_m", [64, 128])
+@pytest.mark.parametrize("tile_n", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_attn_bwd_flyc(
+    batch,
+    num_heads_q,
+    num_heads_kv,
+    seqlen,
+    head_dim,
+    tile_m,
+    tile_n,
+    causal,
+    waves_per_eu: int = 0,
+):
+    tile_head = head_dim
+    if tile_m == 128 and tile_head == 128:
+        pytest.skip("Too large block size")
+
+    torch.manual_seed(0)
+
+    sm_scale = 0.5
+    _wpe = int(waves_per_eu)
+    launch_fn = compile_attn_bwd_mxfp8_gfx950(
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        seqlen=seqlen,
+        head_dim=head_dim,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_head=tile_head,
+        sm_scale=sm_scale,
+        causal=causal,
+        waves_per_eu=_wpe,
+    )
+
+    device = torch.device("cuda")
+    gqa_size = num_heads_q // num_heads_kv
+    q_fp32 = (
+        torch.randn(
+            batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
+    k_fp32 = (
+        torch.randn(
+            batch, num_heads_kv, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
+    v_fp32 = (
+        torch.randn(
+            batch, num_heads_kv, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
+    do_fp32 = (
+        torch.randn(
+            batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
+
+    q_fp32, q_quant, q_scale = mx_quant_2d(q_fp32)
+    k_fp32, k_quant, k_scale = mx_quant_2d(k_fp32)
+    v_fp32, v_quant, v_scale = mx_quant(v_fp32)
+    do_fp32, do_quant, do_scale = mx_quant_2d(do_fp32)
+
+    k_fp32 = k_fp32.repeat_interleave(gqa_size, dim=1)
+    v_fp32 = v_fp32.repeat_interleave(gqa_size, dim=1)
+
+    qk = q_fp32 @ k_fp32.transpose(-2, -1)
+    qk = qk * sm_scale
+    m = qk.max(dim=-1)[0]
+    p = (qk - m[:, :, :, None]).exp()
+    L = p.sum(dim=-1)
+    p = p / L[:, :, :, None]
+    o_fp32 = torch.matmul(p, v_fp32)
+    m = m + torch.log(L)
+    D = (o_fp32 * do_fp32).sum(dim=-1)
+
+    dq_ref, dk_ref, dv_ref = run_torch(
+        q_fp32,
+        k_fp32,
+        v_fp32,
+        do_fp32,
+        m,
+        D,
+        sm_scale,
+        causal,
+        gqa_size,
+    )
+
+    dq_fly = torch.zeros(
+        (batch, num_heads_q, seqlen, head_dim), dtype=torch.float32, device=device
+    )
+    dk_fly = torch.zeros(
+        (batch, num_heads_kv, seqlen, head_dim), dtype=torch.float32, device=device
+    )
+    dv_fly = torch.zeros(
+        (batch, num_heads_kv, seqlen, head_dim), dtype=torch.float32, device=device
+    )
+
+    def launch_kernel(
+        dq,
+        dk,
+        dv,
+        q,
+        q_scale,
+        k,
+        k_scale,
+        v,
+        v_scale,
+        do,
+        do_scale,
+        m,
+        D,
+        batch,
+    ):
+        launch_fn(
+            dq.contiguous().view(-1),
+            dk.contiguous().view(-1),
+            dv.contiguous().view(-1),
+            q.contiguous().view(-1),
+            q_scale.contiguous().view(-1),
+            k.contiguous().view(-1),
+            k_scale.contiguous().view(-1),
+            v.contiguous().view(-1),
+            v_scale.contiguous().view(-1),
+            do.contiguous().view(-1),
+            do_scale.contiguous().view(-1),
+            m.contiguous().view(-1),
+            D.contiguous().view(-1),
+            batch,
+            q.stride(0),
+            k.stride(0),
+            m.stride(0),
+            q.stride(1),
+            m.stride(1),
+            q_scale.stride(0),
+            q_scale.stride(1),
+            k_scale.stride(0),
+            k_scale.stride(1),
+            v_scale.stride(0),
+            v_scale.stride(1),
+            do_scale.stride(0),
+            do_scale.stride(1),
+            torch.cuda.current_stream(),
+        )
+
+    launch_kernel(
+        dq_fly,
+        dk_fly,
+        dv_fly,
+        q_quant,
+        q_scale,
+        k_quant,
+        k_scale,
+        v_quant,
+        v_scale,
+        do_quant,
+        do_scale,
+        m,
+        D,
+        batch,
+    )
+
+    dq_fly_fp32 = dq_fly.to(torch.float32)
+    dk_fly_fp32 = dk_fly.to(torch.float32)
+    dv_fly_fp32 = dv_fly.to(torch.float32)
+
+    assert check_result(dq_fly_fp32, dq_ref, rtol=0.01, atol=0.01, pass_pct=99.0)
+    assert check_result(dk_fly_fp32, dk_ref, rtol=0.01, atol=0.01, pass_pct=99.0)
+    assert check_result(dv_fly_fp32, dv_ref, rtol=0.01, atol=0.01, pass_pct=99.0)
