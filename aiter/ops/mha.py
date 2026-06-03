@@ -292,6 +292,7 @@ def _gen_fmha_v3_fwd_sparse_fake_tensors(
     "module_fmha_v3_fwd",
     fc_name="fmha_v3_fwd_sparse",
     gen_fake=_gen_fmha_v3_fwd_sparse_fake_tensors,
+    mutates_args=[],
 )
 def fmha_v3_fwd_sparse(
     q: Tensor,                    # [b, sq, hq, 128], int8
