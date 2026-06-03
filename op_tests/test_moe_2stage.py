@@ -244,8 +244,9 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
-        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+        gate_up = GateMode(gateMode) == GateMode.INTERLEAVE
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, gate_up)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, gate_up)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif WQDType != dtypes.fp4x2 or preshuffle:
@@ -552,6 +553,16 @@ parser.add_argument(
     default=0.0,
     help="Limit the number of experts for swiglu activation type. Default is 0.0.",
 )
+parser.add_argument(
+    "--gate-mode",
+    choices=["interleave", "separated"],
+    default=None,
+    help=(
+        "Override gate mode for a16w4/a8w4 (fp4x2 weight) quant types. "
+        "Default: interleave (matches physical weight layout from shuffle_weight_a16w4). "
+        "Use 'separated' to benchmark the SEPARATED FlyDSL kernel path."
+    ),
+)
 
 args = parser.parse_args()
 
@@ -678,6 +689,8 @@ _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
+    if args.gate_mode is not None and wq_dtype == dtypes.fp4x2:
+        return GateMode(args.gate_mode).value
     if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     return GateMode.SEPARATED.value
