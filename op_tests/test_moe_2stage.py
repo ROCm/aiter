@@ -366,9 +366,17 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
+    # Accuracy is judged on the real (unpadded) hidden region only. With
+    # hidden_pad != 0 (e.g. gpt-oss fp4fp4) the kernel runs on the 256-aligned
+    # model_dim and masks the trailing hidden_pad columns; their output is
+    # undefined (may be NaN), so comparing the full tensor would poison the
+    # metric. For hidden_pad == 0 this is a no-op.
+    real_model_dim = model_dim - hidden_pad
+    out2_ref_cmp = out2_ref[..., :real_model_dim]
+    out2_ck_cmp = out2_ck[..., :real_model_dim]
     err = checkAllclose(
-        out2_ref,
-        out2_ck,
+        out2_ref_cmp,
+        out2_ck_cmp,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
@@ -378,7 +386,7 @@ def test_fmoe(
         sim = 2 * (x * y).sum() / denominator
         return 1 - sim
 
-    logits_diff = calc_diff(out2_ref, out2_ck)
+    logits_diff = calc_diff(out2_ref_cmp, out2_ck_cmp)
     if logits_diff > 1e-3:
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
@@ -676,6 +684,19 @@ _PER1X32_FP8_FP4 = (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2)
 _PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
 _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
+# gpt-oss real MoE shapes used to derive padded legacy cases (see
+# _iter_legacy_cases). hidden_size=2880; expert intermediate is 2880 / 1440 /
+# 360 at tensor-parallel 1 / 2 / 8. align_up(_, 256) recovers the tuned-config
+# dims (3072 / 3072,1536,512); the difference is the pad.
+GPTOSS_EXPERT = 128
+GPTOSS_TOPK = 4
+GPTOSS_TOKENS = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+GPTOSS_REAL_SHAPES = [(2880, 2880), (2880, 1440), (2880, 360)]
+
+
+def _align_up(x, alignment=256):
+    return ((x + alignment - 1) // alignment) * alignment
+
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
     if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
@@ -723,6 +744,9 @@ def _iter_legacy_cases():
         wq_dtype,
         doweight_stage1,
         act_type,
+        E=args.expert,
+        topk=args.topk,
+        strict_accuracy=False,
         **over,
     ):
         return dict(
@@ -730,8 +754,8 @@ def _iter_legacy_cases():
             token=m,
             model_dim=model_dim,
             inter_dim=inter_dim,
-            E=args.expert,
-            topk=args.topk,
+            E=E,
+            topk=topk,
             actType=act_type,
             gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
             qType=quant_type,
@@ -739,7 +763,7 @@ def _iter_legacy_cases():
             WQDType=wq_dtype,
             use_g1u1=True,
             doweight_stage1=doweight_stage1,
-            strict_accuracy=False,
+            strict_accuracy=strict_accuracy,
             check_aot_cache=False,
             **over,
         )
@@ -814,6 +838,35 @@ def _iter_legacy_cases():
                         act_type,
                     ), extras
 
+    # GPTOSS tuned fmoe CSVs (gptoss_fp4 / gptoss_fp8fp4)
+    gptoss_extras = {"model": "gptoss"}
+    gptoss_quants = [q for q in l_quant if q in (_PER1X32_FP4_FP4, _PER1X32_FP8_FP4)]
+    for dtype, (quant_type, aq_dtype, wq_dtype), doweight_stage1 in itertools.product(
+        args.dtype, gptoss_quants, args.doweight_stage1
+    ):
+        for real_model_dim, real_inter_dim in GPTOSS_REAL_SHAPES:
+            model_dim = _align_up(real_model_dim, 256)
+            inter_dim = _align_up(real_inter_dim, 256)
+            hidden_pad = model_dim - real_model_dim
+            intermediate_pad = inter_dim - real_inter_dim
+            for m in GPTOSS_TOKENS:
+                yield _kw(
+                    dtype,
+                    m,
+                    model_dim,
+                    inter_dim,
+                    quant_type,
+                    aq_dtype,
+                    wq_dtype,
+                    doweight_stage1,
+                    aiter.ActivationType.Swiglu,
+                    E=GPTOSS_EXPERT,
+                    topk=GPTOSS_TOPK,
+                    hidden_pad=hidden_pad,
+                    intermediate_pad=intermediate_pad,
+                    strict_accuracy=True,
+                ), gptoss_extras
+
 
 # ---------------------------------------------------------------------------
 # Run
@@ -832,7 +885,7 @@ def _write_bench_csv(rows):
     if not _csv_out or len(rows) == 0:
         return
     row = rows[-1]
-    if row.get("model") == "legacy":
+    if row.get("model") in ("legacy", "gptoss"):
         return
     written = append_tuned_op_bench_rows(
         _csv_out,
