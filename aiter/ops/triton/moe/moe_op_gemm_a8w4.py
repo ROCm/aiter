@@ -183,16 +183,15 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 2
+    num_stages = 3
     split_k = 1
     block_k = 512
-    num_buffers = 3
 
     if block_m == 16:
         block_n = 256
         block_k = 512
         num_warps = 4
-        num_buffers = 2
+        num_stages = 2
 
     elif block_m == 32:
         if n <= 1024:
