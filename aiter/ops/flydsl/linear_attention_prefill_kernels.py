@@ -24,16 +24,16 @@ import torch
 import triton
 
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
-
-# log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
-# place of exp(g) (matches the Triton VK / HIP K5 convention).
-_RCP_LN2 = math.log2(math.e)
-
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_chunk_offsets,
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
+
+# log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
+# place of exp(g) (matches the Triton VK / HIP K5 convention).
+_RCP_LN2 = math.log2(math.e)
+
 
 __all__ = [
     "chunk_gated_delta_rule_fwd_h_flydsl",
