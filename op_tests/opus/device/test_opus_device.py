@@ -365,6 +365,14 @@ class OpusDeviceLib:
         fn.argtypes = [_VP, _VP, _VP, _I]
         fn(self._ptr(Input), self._ptr(Workspace), self._ptr(Result), int(n_chunks))
 
+    # -- tcopy_window 2-slot GEMM (gfx1250) --
+    def run_tcopy_gfx1250(self, A, B, C, stride_a, stride_b, stride_c):
+        fn = self._lib.run_tcopy_gfx1250
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I, _I, _I]
+        fn(self._ptr(A), self._ptr(B), self._ptr(C),
+           int(stride_a), int(stride_b), int(stride_c))
+
 
 def _get_gpu_arch():
     """Return the GCN architecture name of the current GPU, e.g. 'gfx942'."""
@@ -2631,6 +2639,45 @@ def test_wb_streamk_reduce(mod):
     return 0
 
 
+def test_tcopy_gfx1250(mod):
+    """Test opus::tcopy_window 2-slot ping-pong GEMM (gfx1250 only).
+
+    Kernel is specialized for M=32, N=64 and K = positive multiple of 128.
+    Threshold scales with K (fp16 accumulation noise grows ~linearly).
+    """
+    if _get_gpu_arch() not in {"gfx1250"}:
+        print("  SKIP: test_tcopy_gfx1250 (gfx1250 only)")
+        return 0
+    if _skip_if_missing_symbol(mod, "run_tcopy_gfx1250", "test_tcopy_gfx1250"):
+        return 0
+
+    device = torch.device("cuda")
+    M, N = 32, 64
+    failures = 0
+    for K in [128, 256, 384, 512]:
+        torch.manual_seed(K)
+        # RCR layout: A row-major [M,K], B row-major [N,K] (consumed as K-contig)
+        a_fp32 = torch.empty(M, K, device=device, dtype=torch.float32).uniform_(0.0, 1.0)
+        b_fp32 = torch.empty(N, K, device=device, dtype=torch.float32).uniform_(-0.5, 0.5)
+        a = a_fp32.to(torch.float16)
+        b = b_fp32.to(torch.float16)
+        c = torch.empty(M, N, device=device, dtype=torch.float16)
+
+        mod.run_tcopy_gfx1250(a, b, c, stride_a=K, stride_b=K, stride_c=N)
+
+        # Reference: C = A @ B^T (B is row-major NxK -> use transpose).
+        ref = (a_fp32 @ b_fp32.t()).to(torch.float16).to(torch.float32)
+        got = c.to(torch.float32)
+        max_abs = (ref - got).abs().max().item()
+        threshold = max(1e-2, 5e-5 * K)
+        if max_abs > threshold:
+            print(f"  FAIL: tcopy_move_2slot K={K} max_abs={max_abs:.4f} (thr={threshold:.4f})")
+            failures += 1
+        else:
+            print(f"  PASS: tcopy_move_2slot K={K} max_abs={max_abs:.4f} (thr={threshold:.4f})")
+    return failures
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -2730,6 +2777,7 @@ def main():
     failures += test_mdiv(mod)
     failures += test_wb_cumulative(mod)
     failures += test_wb_streamk_reduce(mod)
+    failures += test_tcopy_gfx1250(mod)
 
     if failures:
         print(f"\n{failures} test(s) FAILED")

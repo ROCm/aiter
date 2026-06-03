@@ -2112,6 +2112,7 @@ template<typename T_> OPUS_D decltype(auto) make_smem(T_* ptr) { return smem<T_>
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // tcopy (gfx1250): tcopy_desc = stateless D# (sg0..sg3 raw dwords); tcopy_window = stateful tile
 // window with make() + move(d0..d4, lds) + load_to_lds<cpol>(). cpol[6:0] = | rsvd | NV | scope[2] | th[3] |.
+#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
 
 enum class tcopy_load_th : uint8_t { rt=0, nt=1, ht=2, bypass=3, nt_rt=4, rt_nt=5, nt_ht=6 };           // bypass = LU (last-use)
 enum class tcopy_scope   : uint8_t { cu=0, se=1, dev=2, sys=3 };
@@ -2296,6 +2297,8 @@ private:
                   stride0, s1, 0, td2, td3, s2, s3, td4);
     }
 };
+
+#endif
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // mem type traits & free function wrappers (eliminate .template syntax in dependent context)
