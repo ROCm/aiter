@@ -15,8 +15,7 @@ import triton
 import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_vfa import (
-    _sage_vfa_m_sampled_kernel,
-    _sage_vfa_m_selected_kernel,
+    _sage_vfa_m_blockidx_kernel,
     sage_fwd_vfa,
 )
 from aiter.ops.triton.attention.fav3_sage import get_sage_fwd_configs
@@ -73,8 +72,10 @@ def compute_m_sampled(
 
     padded_d_model_qk = max(16, 1 << (head_dim - 1).bit_length())
 
+    # The shared 1D [N_SAMPLES] table is broadcast to every (batch, head,
+    # q-block) program by zeroing the leading block-index strides.
     grid = (num_q_blocks, nheads_q, batch)
-    _sage_vfa_m_sampled_kernel[grid](
+    _sage_vfa_m_blockidx_kernel[grid](
         q_int8, k_int8,
         q_descale, k_descale,
         block_idx,
@@ -83,6 +84,7 @@ def compute_m_sampled(
         stride_kz, stride_kh, stride_kn, stride_kd,
         stride_qsz, stride_qsh, stride_qsblk,
         stride_ksz, stride_ksh, stride_ksblk,
+        0, 0, 0, block_idx.stride(0),
         stride_mz, stride_mh, stride_mblk, stride_mr,
         SEQLEN_Q=seqlen_q,
         SEQLEN_K=seqlen_k,
@@ -114,16 +116,29 @@ def _pool_blocks_mean(
     num_blocks = (seqlen + BLK - 1) // BLK
 
     # Logical [batch, nheads, seqlen, head_dim] view regardless of layout.
-    xv = (x if layout == "bhsd" else x.permute(0, 2, 1, 3)).to(torch.float32)
-    pad = num_blocks * BLK - seqlen
-    if pad:
-        xv = torch.nn.functional.pad(xv, (0, 0, 0, pad))
-    xb = xv.reshape(batch, nheads, num_blocks, BLK, head_dim)
+    # Reduce each block directly with a fp32 accumulator (``dtype=torch.float32``)
+    # so we never materialize a full-precision copy of the large sequence tensor,
+    # and split off any ragged tail instead of padding the whole tensor -- both
+    # avoid extra full-size allocations/copies that dominated this proxy.
+    xv = x if layout == "bhsd" else x.permute(0, 2, 1, 3)
+    n_full = seqlen // BLK
+    full = n_full * BLK
 
+    sums = (
+        xv[:, :, :full, :]
+        .reshape(batch, nheads, n_full, BLK, head_dim)
+        .sum(dim=3, dtype=torch.float32)
+    )
+
+    rem = seqlen - full
+    if rem == 0:
+        return sums / BLK
+
+    tail = xv[:, :, full:, :].sum(dim=2, dtype=torch.float32).unsqueeze(2)
+    sums = torch.cat([sums, tail], dim=2)
     counts = torch.full((num_blocks,), float(BLK), device=x.device)
-    if pad:
-        counts[-1] = BLK - pad
-    return xb.sum(dim=3) / counts[None, None, :, None]
+    counts[-1] = rem
+    return sums / counts[None, None, :, None]
 
 
 def _compute_pooled_scores(
@@ -186,8 +201,17 @@ def compute_m_proxy_topn(
 
     n = max(1, min(n_blocks, num_k_blocks))
 
-    score = _compute_pooled_scores(q, k, BLKQ=BLKQ, BLKK=BLKK, layout=layout)
-    block_idx = score.topk(n, dim=-1).indices.to(torch.int32).contiguous()
+    if n >= num_k_blocks:
+        # Selecting every K block: the pooled-score ranking + top-k is pure
+        # overhead (and the result is the exact per-row max).  Use a single
+        # shared 1D [num_k_blocks] table broadcast to every program.
+        block_idx = torch.arange(num_k_blocks, device=q_int8.device, dtype=torch.int32)
+        stride_biz, stride_bih, stride_biqblk = 0, 0, 0
+        stride_bis = block_idx.stride(0)
+    else:
+        score = _compute_pooled_scores(q, k, BLKQ=BLKQ, BLKK=BLKK, layout=layout)
+        block_idx = score.topk(n, dim=-1).indices.to(torch.int32).contiguous()
+        stride_biz, stride_bih, stride_biqblk, stride_bis = block_idx.stride()
 
     m_init = torch.empty(
         (batch, nheads_q, num_q_blocks, BLKQ),
@@ -199,13 +223,12 @@ def compute_m_proxy_topn(
     stride_kz, stride_kn, stride_kh, stride_kd = map_dims(k_int8.stride(), bshd_map)
     stride_qsz, stride_qsh, stride_qsblk = q_descale.stride()
     stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
-    stride_biz, stride_bih, stride_biqblk, stride_bis = block_idx.stride()
     stride_mz, stride_mh, stride_mblk, stride_mr = m_init.stride()
 
     padded_d_model_qk = max(16, 1 << (head_dim - 1).bit_length())
 
     grid = (num_q_blocks, nheads_q, batch)
-    _sage_vfa_m_selected_kernel[grid](
+    _sage_vfa_m_blockidx_kernel[grid](
         q_int8, k_int8,
         q_descale, k_descale,
         block_idx,
