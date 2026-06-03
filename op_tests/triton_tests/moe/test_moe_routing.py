@@ -9,6 +9,9 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     routing_torch,
     compute_expt_data_torch,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
+from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
 
 def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):
@@ -19,11 +22,6 @@ def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):
     """
     tokens_per_expt = max(1, (n_tokens * n_expts_act) // n_expts_tot)
     return max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
-
-
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
-from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
 
 def assert_equal(ref, tri):
