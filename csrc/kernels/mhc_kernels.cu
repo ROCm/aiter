@@ -1642,7 +1642,7 @@ namespace aiter {
 #if defined(__gfx942__)
         static constexpr int x_async_load_vec = 4 / sizeof(DTYPE_I);
 #else
-        static constexpr int x_async_load_vec = 16 / sizeof(DTYPE_I) * warp_size < tile_mk ? 16 / sizeof(DTYPE_I) : 4 / sizeof(DTYPE_I);
+        static constexpr int x_async_load_vec = 16 / sizeof(DTYPE_I) * warp_size <= tile_mk ? 16 / sizeof(DTYPE_I) : 4 / sizeof(DTYPE_I);
 #endif
         static constexpr int x_async_load_threads = block_size * x_async_load_vec < tile_mk ? block_size : tile_mk / x_async_load_vec;
         static constexpr int x_load_waitcnt = tile_mk / (x_async_load_threads * x_async_load_vec);
@@ -1664,7 +1664,7 @@ namespace aiter {
 #if defined(__gfx942__)
         static constexpr int r_async_load_vec = 4 / sizeof(DTYPE_I);
 #else
-        static constexpr int r_async_load_vec = 16 / sizeof(DTYPE_I) * warp_size < tile_mk ? 16 / sizeof(DTYPE_I) : 4 / sizeof(DTYPE_I);
+        static constexpr int r_async_load_vec = 16 / sizeof(DTYPE_I) * warp_size <= tile_mk ? 16 / sizeof(DTYPE_I) : 4 / sizeof(DTYPE_I);
 #endif
         static constexpr int residual_load_waitcnt = tile_mk / (warp_size * r_async_load_vec);
         auto lds_load_residual_tile = [&](int k){
@@ -1748,7 +1748,7 @@ namespace aiter {
                         sqrsum_part += res[t] * res[t];
                     }
                 }
-                store_vector<DTYPE_I, float, ds_read_vec, store_policy, false>(
+                store_vector<DTYPE_I, float, ds_read_vec, 0, false>(
                     g_nres, res, (lane_id % mfma_m) * residual_stride + warp_id * hidden_size + i * tile_k + 
                     (s_offset % tile_k) + k_split_offset);
                 s_offset += step;
