@@ -97,17 +97,27 @@ def pa_decode_sparse(
     n_head_blocks = triton.cdiv(H, block_h)
     h_padded = n_head_blocks * block_h
     block_d = triton.next_power_of_2(D)
+
+    use_gluon = DEVICE_ARCH == "gfx1250"
+
+    # import os
+    # use_gluon = os.environ.get("PA_DECODE_SPARSE_BACKEND", "gluon").lower() == "gluon"
+
     # gfx1250 stages slots through LDS via TDM async_load, which hides the
     # larger per-tile KV gather latency -> BLOCK_K=32 is fastest there. Other
     # arches use the synchronous slot path, where 32 exposes memory latency.
-    if DEVICE_ARCH == "gfx1250":
+    if use_gluon:
         block_k = 32
         attn_num_warps = 2
+        # max_num_wg = 512
+        max_num_wg = 64
     else:
         block_k = 16 if D >= 256 else 32
         attn_num_warps = 4
+        # max_num_wg = 256
+        max_num_wg = 32
     num_stages = 2
-    waves_per_eu = 0
+    waves_per_eu = 1
     reduce_num_warps = 4
 
     # Infer KV_SPLITS from inputs when caller doesn't override.
@@ -118,17 +128,12 @@ def pa_decode_sparse(
     # the reduce masks their stale partial-buffer slots).
     if kv_splits is None:
         max_kv_len = kv_indices.shape[0]
-        max_num_wg = 512
-        # max_num_wg = 64
         max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
         kv_splits = triton.next_power_of_2(kv_splits)
+    print(f"{kv_splits=}")
 
-    # When kv_splits == 1, the kernel folds the sink as initial M and writes
-    # the final output directly to ``out`` (no partial buffers, no reduce
-    # kernel). Mirrors unified_attention 3D's NUM_SEGMENTS == 1 fast path,
-    # minus out_scale.
     if kv_splits == 1:
         m_partial = l_partial = acc_partial = out  # unused inside the kernel
         mp_strides = (0, 0, 0)
@@ -146,19 +151,13 @@ def pa_decode_sparse(
         lp_strides = l_partial.stride()
         ap_strides = acc_partial.stride()
 
-    if DEVICE_ARCH == "gfx1250":
-        _kernel = gluon_pa_decode_sparse
-        # The gluon kernel builds its WMMA / blocked layouts from NUM_WARPS, so
-        # it must be threaded through as a constexpr (not just the num_warps
-        # launch meta-param) to keep the layouts and the launch config in sync.
-        # (total_pages is passed positionally, right after out, to both kernels.)
-        extra_kwargs = {"NUM_WARPS": attn_num_warps}
+    if use_gluon:
+        impl = gluon_pa_decode_sparse
     else:
-        _kernel = triton_pa_decode_sparse
-        extra_kwargs = {}
+        impl = triton_pa_decode_sparse
 
     grid_attn = (T, n_head_blocks, kv_splits)
-    _kernel[grid_attn](
+    impl[grid_attn](
         q,
         unified_kv,
         kv_indices,
@@ -197,7 +196,6 @@ def pa_decode_sparse(
         num_warps=attn_num_warps,
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
-        **extra_kwargs,
     )
 
     if kv_splits == 1:

@@ -69,19 +69,19 @@ def _pa_decode_sparse(
     BLOCK_H: gl.constexpr,
     BLOCK_D: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
+    num_warps: gl.constexpr,
 ):
     WARP_SIZE: gl.constexpr = 32
 
     # Distribute the warps of the WMMA layout along the column (N) dimension.
-    # log2(NUM_WARPS) basis vectors, each tiling the columns of the dot output.
-    if NUM_WARPS == 1:
+    # log2(num_warps) basis vectors, each tiling the columns of the dot output.
+    if num_warps == 1:
         pv_warp_bases: gl.constexpr = []
         qk_warp_bases: gl.constexpr = []
-    elif NUM_WARPS == 2:
+    elif num_warps == 2:
         pv_warp_bases: gl.constexpr = [[0, 1]]
         qk_warp_bases: gl.constexpr = [[1, 0]]
-    elif NUM_WARPS == 4:
+    elif num_warps == 4:
         pv_warp_bases: gl.constexpr = [[0, 1], [0, 2]]
         qk_warp_bases: gl.constexpr = [[1, 0], [2, 0]]
     else:
@@ -116,10 +116,10 @@ def _pa_decode_sparse(
 
     D_INNER: gl.constexpr = BLOCK_D // 8
     # Split warps over [BLOCK_H, BLOCK_D]: up to 2 along the head dim, the rest
-    # along the feature dim. NUM_WARPS=4 -> [2, 2] (original), 2 -> [2, 1],
-    # 1 -> [1, 1]. Product must equal NUM_WARPS.
-    QKV_WARPS_H: gl.constexpr = 2 if NUM_WARPS >= 2 else 1
-    QKV_WARPS_D: gl.constexpr = NUM_WARPS // QKV_WARPS_H
+    # along the feature dim. num_warps=4 -> [2, 2] (original), 2 -> [2, 1],
+    # 1 -> [1, 1]. Product must equal num_warps.
+    QKV_WARPS_H: gl.constexpr = 2 if num_warps >= 2 else 1
+    QKV_WARPS_D: gl.constexpr = num_warps // QKV_WARPS_H
     layout_qkv: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[WARP_SIZE // (D_INNER // 2), D_INNER // 2],
@@ -199,9 +199,6 @@ def _pa_decode_sparse(
         l_i = gl.full(
             [BLOCK_H], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, qk_mfma_layout)
         )
-        # l_i = gl.zeros(
-        #     [BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, qk_mfma_layout)
-        # )
 
     acc = gl.zeros([BLOCK_H, BLOCK_D], dtype=gl.float32, layout=pv_mfma_layout)
 

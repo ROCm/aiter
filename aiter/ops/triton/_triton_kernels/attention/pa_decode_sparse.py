@@ -85,6 +85,7 @@ def _pa_decode_sparse(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    num_warps: tl.constexpr,
 ):
     """3D split-K sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
 
