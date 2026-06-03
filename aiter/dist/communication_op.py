@@ -66,10 +66,16 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     weight_: torch.Tensor,
     eps: float,
     prefill_support: bool = False,
+    x_pad_to_multiple: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm")
     return get_tp_group().fused_allreduce_rmsnorm(
-        input_, residual_inp_, weight_, eps, prefill_support
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        prefill_support,
+        x_pad_to_multiple=x_pad_to_multiple,
     )
 
 
