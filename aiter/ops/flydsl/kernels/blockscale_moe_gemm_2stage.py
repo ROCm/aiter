@@ -77,9 +77,11 @@ def _normalize_out_dtype(out_dtype: str) -> str:
         return "bf16"
     if s in ("f32", "fp32", "float"):
         return "f32"
+    if s in ("fp8", "f8", "e4m3", "e4m3fnuz"):
+        return "fp8"
     raise ValueError(
         f"blockscale: unsupported out_dtype={out_dtype!r}; "
-        "expected one of {'bf16','f16','fp16','f32'}"
+        "expected one of {'bf16','f16','fp16','f32','fp8'}"
     )
 
 
@@ -361,6 +363,19 @@ def compile_blockscale_moe_gemm1(
     upstream_out = _normalize_out_dtype(out_dtype)
     if upstream_out == "f32":
         raise ValueError("blockscale stage1: out_dtype='f32' is only valid for stage2")
+    # Phase B-v2 fused fp8 emits a per-1x128 f32 blockscale via a cross-wave
+    # LDS reduction restricted to tile_n=128 (one per-128 block per CTA).
+    if upstream_out == "fp8":
+        if int(tile_n) != 128:
+            raise ValueError(
+                f"blockscale stage1 (out_dtype='fp8'): tile_n must be 128 "
+                f"(Phase B-v2 per-128 epilog), got tile_n={tile_n}"
+            )
+        if (int(inter_dim) % 128) != 0:
+            raise ValueError(
+                f"blockscale stage1 (out_dtype='fp8'): inter_dim ({inter_dim}) "
+                f"must be a multiple of 128"
+            )
 
     # waves_per_eu == 0 (or negative) means "let the backend decide" in some
     # aiter callers. Forward None to upstream in that case so it can apply
