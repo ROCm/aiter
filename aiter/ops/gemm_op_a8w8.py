@@ -685,7 +685,10 @@ def gemm_a8w8_bpreshuffle(
         elif libtype == "flydsl" and is_flydsl_available():
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
     try:
-        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
+        # DEBUG: untuned shapes fall back to flydsl MXScale (default kernel) instead of CK.
+        return _run_gemm_a8w8_bpreshuffle_mxscale_flydsl(
+            XQ, WQ, x_scale, w_scale, Y, None
+        )
     except RuntimeError as e:
         raise RuntimeError(
             f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
