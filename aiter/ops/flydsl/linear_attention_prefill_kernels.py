@@ -47,6 +47,76 @@ _BV_CANDIDATES = [16, 32, 64]
 _DEFAULT_BV = 16
 
 
+# ---------------------------------------------------------------------------
+# Host-side overhead caches
+# ---------------------------------------------------------------------------
+# The flyc launcher requires every tensor argument to be an ``fx.Tensor``
+# (``None`` is not accepted), and the K5 kernel reads the offset arrays as
+# int32 (``GTensor(..., dtype=T.i32, ...)``). The Triton-side cached prologue
+# helpers (``prepare_chunk_offsets`` / ``prepare_rebased_cu_seqlens``) return
+# int64, so the launch path was previously doing ``.to(torch.int32)`` on
+# every forward, even though the underlying int64 tensor is identity-stable
+# across forwards thanks to ``@tensor_cache``. We sidestep that by:
+#
+#   1. ``_as_int32``: attaches the int32 view directly onto the int64 tensor
+#      as a private attribute (``Tensor`` objects accept arbitrary
+#      attributes). The first forward casts once; every subsequent forward
+#      is a pure ``getattr`` -- no ATen op dispatch, no allocator hit, no
+#      D2D copy. Lifetime is bound to the int64 tensor itself, so when the
+#      upstream ``@tensor_cache`` evicts an entry the int32 copy is freed
+#      automatically (no ``id``-recycling hazard, unlike a global dict).
+#
+#   2. ``_get_dummy``: per-device cached scalar tensors for the
+#      ``cu_seqlens is None`` (batched) path. The original code allocated a
+#      fresh ``torch.empty(1, dtype=fp32)`` plus two ``dummy.to(int32)``
+#      casts on every call; those are pure overhead because the kernel never
+#      reads them when ``IS_VARLEN=False``. We hand back a single shared
+#      tensor per (device, dtype) instead.
+_INT32_ATTR = "_flydsl_int32_view"
+_dummy_tensors: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+
+
+def _as_int32(t: torch.Tensor) -> torch.Tensor:
+    """Return an int32 narrowing of ``t``, cached on the tensor itself.
+
+    ``t`` is expected to come from one of the ``@tensor_cache``-decorated
+    prologue helpers (so its identity is stable across forwards). The
+    cached int32 result lives as an attribute on ``t`` itself, which keeps
+    cache invalidation trivially correct: when the upstream cache evicts
+    ``t``, the int32 copy is collected with it.
+    """
+    if t.dtype == torch.int32:
+        return t
+    cached = getattr(t, _INT32_ATTR, None)
+    if cached is None:
+        cached = t.to(torch.int32)
+        try:
+            object.__setattr__(t, _INT32_ATTR, cached)
+        except (AttributeError, TypeError):
+            # Some tensor subclasses or autograd-tracked tensors disallow
+            # ad-hoc attributes; fall back to the uncached cast (still
+            # correct, just no longer hot-path-optimised for this caller).
+            pass
+    return cached
+
+
+def _get_dummy(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Return a shared 1-element scalar tensor for null-arg launches.
+
+    Used to satisfy ``@flyc.jit``'s no-``None`` requirement on the batched
+    path where the kernel reads neither ``cu_seqlens`` nor ``chunk_offsets``
+    (and the various ``use_*`` guards in the kernel body also skip the
+    corresponding loads). Returning the same tensor avoids allocator and
+    dispatch overhead on every forward.
+    """
+    key = (device.index if device.type == "cuda" else -1, dtype)
+    out = _dummy_tensors.get(key)
+    if out is None:
+        out = torch.empty(1, device=device, dtype=dtype)
+        _dummy_tensors[key] = out
+    return out
+
+
 def _legal_bv_candidates(V: int) -> list[int]:
     return [c for c in _BV_CANDIDATES if c <= V and V % c == 0]
 
@@ -417,8 +487,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     v_new_buf = k.new_empty(B, H, T_flat, V, dtype=u.dtype)
     v_new = v_new_buf if save_new_value else None
 
-    dummy = torch.empty(1, device=k.device, dtype=torch.float32)
-
     # G layout is fixed to head-major [B, H, T_flat] (matches Triton VK /
     # HIP K5). The kernel reads ``g`` with stride-1 along the T dim; require
     # the caller to provide a contiguous head-major tensor.
@@ -435,7 +503,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
             f"FlyDSL K5: ``g.shape[-2]`` must equal H={H}, "
             f"got g.shape={tuple(g.shape)}."
         )
-    g_arg = g if g is not None else dummy
 
     # Mirror the Triton VK wrapper: when ``use_exp2=True`` the K5 kernel
     # interprets ``gk`` in log2 space, so pre-scale by log2(e) here. The
@@ -446,24 +513,32 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         gk = gk.contiguous()
         if g_log2_scaled:
             gk = gk * _RCP_LN2
-    gk_arg = gk if gk is not None else dummy
-    h0_arg = initial_state if initial_state is not None else dummy
-    ht_arg = final_state if final_state is not None else dummy
+
+    # Per-device shared dummies. The kernel never reads these (the
+    # corresponding ``USE_G`` / ``USE_GK`` / ``USE_INITIAL_STATE`` /
+    # ``STORE_FINAL_STATE`` / ``IS_VARLEN`` constexprs gate the loads); we
+    # only allocate them because ``@flyc.jit`` rejects ``None`` tensor args.
+    fp32_dummy = _get_dummy(k.device, torch.float32)
+    int32_dummy = _get_dummy(k.device, torch.int32)
+
+    g_arg = g if g is not None else fp32_dummy
+    gk_arg = gk if gk is not None else fp32_dummy
+    h0_arg = initial_state if initial_state is not None else fp32_dummy
+    ht_arg = final_state if final_state is not None else fp32_dummy
     vn_arg = v_new_buf
-    # cu_arg / co_arg are the kernel-facing (rebased) offsets, narrowed to
-    # int32. `.to(torch.int32)` is a device-to-device cast (no host sync); the
-    # resulting fresh objects are consumed only by the kernel launch, so their
-    # identity does not matter for the @tensor_cache helpers above.
+
+    # cu_arg / co_arg are the kernel-facing (rebased) offsets in int32. The
+    # upstream prologue helpers (``prepare_rebased_cu_seqlens`` /
+    # ``prepare_chunk_offsets``) return int64 cached tensors with stable
+    # identity across forwards, so ``_as_int32`` does the dtype narrowing
+    # exactly once per shape and every subsequent forward is an attribute
+    # lookup. When ``cu_seqlens is None`` (pure batched, kernel skips the
+    # loads entirely) we hand back a shared int32 dummy instead of
+    # allocating one per forward.
     cu_arg = (
-        kernel_cu_seqlens.to(torch.int32)
-        if kernel_cu_seqlens is not None
-        else dummy.to(torch.int32)
+        _as_int32(kernel_cu_seqlens) if kernel_cu_seqlens is not None else int32_dummy
     )
-    co_arg = (
-        chunk_offsets.to(torch.int32)
-        if chunk_offsets is not None
-        else dummy.to(torch.int32)
-    )
+    co_arg = _as_int32(chunk_offsets) if chunk_offsets is not None else int32_dummy
     stream = torch.cuda.current_stream()
 
     use_g = g is not None

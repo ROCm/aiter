@@ -181,6 +181,20 @@ class PrefillGroup:
     #           length 1024. Preserving that behavior is what keeps the
     #           varlen path's per-case shape unchanged across this refactor.
     max_num_batched_tokens: object = None
+    # Optional "trace-derived 3-segment" expansion knob. When set, each
+    # expanded case overrides ``_build_context_lens`` with the explicit
+    # 3-segment layout ``[head, mid_seqlen, full_prompt_len - head - mid_seqlen]``,
+    # i.e. cu_seqlens = [0, head, head + mid_seqlen, full_prompt_len].
+    # This reproduces the worst K5 regression family found in bench
+    # results 20260603 (n=3, T ~= 16384, middle segment == 10000): the
+    # K5 kernel exhibits a near-constant ~543us cost across this whole
+    # cluster regardless of head_seqlen, while triton K5 varies with the
+    # head split between ~460-495us. Sweeping head_seqlens lets us probe
+    # the kernel's sensitivity (or lack thereof) to the head boundary.
+    # Group is materialised as the (tps x full_prompt_lens x head_seqlens)
+    # Cartesian product when this is not None.
+    head_seqlens: object = None  # list[int] | None
+    mid_seqlen: int = 10000
 
 
 def expand_groups(groups):
@@ -194,23 +208,55 @@ def expand_groups(groups):
                     mnbt = 32768  # PrefillArgs dataclass default
                 else:
                     mnbt = g.max_num_batched_tokens
-                out.append(
-                    PrefillArgs(
-                        K=g.K,
-                        V=g.V,
-                        Hk=g.Hk,
-                        Hv=g.Hv,
-                        tp=tp,
-                        full_prompt_len=full_len,
-                        model_name=g.model_name,
-                        BT=g.BT,
-                        max_num_batched_tokens=mnbt,
-                        dtype=g.dtype,
-                        is_varlen=g.is_varlen,
-                        output_final_state=g.output_final_state,
-                        ssm_state_dtype=g.ssm_state_dtype,
+
+                # head_seqlens=None : preserve the original "equal split via
+                # _build_context_lens" behavior. Otherwise materialise one
+                # PrefillArgs per (tp, full_len, head) triple with an
+                # explicit 3-segment cu_seqlens layout
+                # [head, mid_seqlen, full_len - head - mid_seqlen].
+                if g.head_seqlens is None:
+                    out.append(
+                        PrefillArgs(
+                            K=g.K, V=g.V, Hk=g.Hk, Hv=g.Hv,
+                            tp=tp,
+                            full_prompt_len=full_len,
+                            model_name=g.model_name,
+                            BT=g.BT,
+                            max_num_batched_tokens=mnbt,
+                            dtype=g.dtype,
+                            is_varlen=g.is_varlen,
+                            output_final_state=g.output_final_state,
+                            ssm_state_dtype=g.ssm_state_dtype,
+                        )
                     )
-                )
+                else:
+                    for head in g.head_seqlens:
+                        tail = full_len - head - g.mid_seqlen
+                        if tail <= 0:
+                            raise ValueError(
+                                f"head_seqlens expansion produced non-positive "
+                                f"tail ({tail}) for group={g.model_name!r} "
+                                f"full_prompt_len={full_len} head={head} "
+                                f"mid_seqlen={g.mid_seqlen}. Drop this "
+                                f"(full_len, head) combo or raise full_prompt_len."
+                            )
+                        context_lens = [head, g.mid_seqlen, tail]
+                        out.append(
+                            PrefillArgs(
+                                K=g.K, V=g.V, Hk=g.Hk, Hv=g.Hv,
+                                tp=tp,
+                                full_prompt_len=full_len,
+                                model_name=g.model_name,
+                                BT=g.BT,
+                                max_num_batched_tokens=mnbt,
+                                dtype=g.dtype,
+                                is_varlen=g.is_varlen,
+                                output_final_state=g.output_final_state,
+                                ssm_state_dtype=g.ssm_state_dtype,
+                                context_lens=context_lens,
+                                trace_tag=f"head{head}_mid{g.mid_seqlen}",
+                            )
+                        )
     return out
 
 
@@ -266,9 +312,105 @@ _PREFILL_GROUPS = [
         full_prompt_lens=[1000, 5000, 10000],
         max_num_batched_tokens=32768,
     ),
+    PrefillGroup(
+        model_name="flydsl-poor-aws",
+        Hv=32,
+        tps=[1],
+        # full_prompt_lens=[1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000],
+        full_prompt_lens=[5000, 10000],
+        max_num_batched_tokens="full_prompt_len",
+    ),
+    # n=3 "10000 long-segment" K5 regression family.
+    #
+    # Sourced from bench_gdr_inline_prefill_only_results_20260603_1742.txt,
+    # which has ~200 cases (88.5% of all flydsl-vs-triton regressions)
+    # clustered on cu_seqlens = [0, head, head+10000, full_len] with
+    # full_len ~= 16384. flydsl K5 sits at a near-constant ~543us across
+    # the whole cluster (vs triton K5 ~460-495us, i.e. 1.10x-1.18x slower)
+    # regardless of head, which strongly suggests K5 falls onto a
+    # "fill-max-blocks" path and ignores the actual head boundary.
+    #
+    # ``head_seqlens`` (new field) sweeps the leading tiny segment so we
+    # can probe (a) at which head the regression appears / disappears,
+    # and (b) whether the kernel cost truly is head-insensitive. Values
+    # cover the full range observed in the bench: extreme-tiny (5, 10),
+    # "tens" (65), "hundreds" (704, 936), "low-thousands" (1820, 4467).
+    # 5508 hits a corner where the 3rd segment becomes < BT.
+    PrefillGroup(
+        model_name="flydsl-k5-n3-mid10k",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[16384],
+        max_num_batched_tokens=16384,
+        # head_seqlens=[5, 10, 65, 704, 936, 1820, 4467, 5508],
+        head_seqlens=[936],
+        mid_seqlen=10000,
+    ),
 ]
 
 PREFILL_PARAMS = expand_groups(_PREFILL_GROUPS)
+
+
+# -- Trace-derived flydsl-K5 regression cases ---------------------------
+#
+# Picked from bench_gdr_inline_prefill_only_results_20260603_1742.txt
+# (varlen-16k-aws family: K=128, V=128, Hk=16, Hv=32, tp=1, BT=64,
+# is_varlen=True, output_final_state=True, ssm_state_dtype=f32,
+# max_num_batched_tokens=16384). For each case the trace recorded
+# ``flydsl K5`` running noticeably slower than ``triton K5`` on the same
+# cu_seqlens. They are kept as explicit ``context_lens`` (i.e. the diff
+# of cu_seqlens) so the exact shape that triggered the regression is
+# reproduced verbatim -- ``_build_context_lens`` cannot express these
+# "tiny + 10000 + remainder" splits.
+#
+# Layout: (trace_tag, context_lens, K5-flydsl/triton ratio seen in bench)
+#   - n=3 "10000 long-segment" cluster: flydsl K5 is constant ~543us
+#     across the cluster (vs triton ~460-495us), 1.14x-1.18x slower.
+#   - n=2 small-T outliers: flydsl K5 ~210us vs triton ~169us on
+#     T=5356 ([0,356,5356]) is the single worst point (1.24x).
+#   - n=1 single-segment cases at "unfriendly" lengths (5333, 7271)
+#     give a milder 1.08x regression but still reproduce.
+_FLYDSL_K5_REGRESSION_CASES = [
+    # (trace_tag, context_lens) -- comments include the bench idx and ratio.
+    ("212_t5356_n2_1.24x",      [356, 5000]),          # [496/621] worst single point
+    ("496_t16384_n3_1.18x",     [65, 10000, 6319]),    # [496/621]
+    ("533_t16384_n3_1.18x",     [41, 10000, 6343]),    # [533/621]
+    ("485_t16337_n3_1.17x",     [10, 10000, 6327]),    # [485/621]
+    ("570_t16384_n3_1.16x",     [5, 10000, 6379]),     # [570/621]
+    ("343_t16384_n3_1.16x",     [704, 10000, 5680]),   # [343/621] larger tiny-segment variant
+    ("312_t16384_n3_1.14x",     [732, 10000, 5652]),   # [312/621]
+    ("401_t10880_n2_1.08x",     [880, 10000]),         # [401/621]
+    ("437_t7271_n1_1.08x",      [7271]),               # [437/621] single-seg unfriendly length
+    ("273_t5333_n1_1.08x",      [5333]),               # [273/621]
+]
+
+
+def _make_flydsl_k5_regression_params():
+    out = []
+    for tag, context_lens in _FLYDSL_K5_REGRESSION_CASES:
+        out.append(
+            PrefillArgs(
+                K=128,
+                V=128,
+                Hk=16,
+                Hv=32,
+                tp=1,
+                full_prompt_len=sum(context_lens),
+                model_name="flydsl-k5-regress",
+                BT=64,
+                max_num_batched_tokens=16384,
+                dtype=torch.bfloat16,
+                is_varlen=True,
+                output_final_state=True,
+                ssm_state_dtype=torch.float32,
+                context_lens=context_lens,
+                trace_tag=tag,
+            )
+        )
+    return out
+
+
+PREFILL_PARAMS.extend(_make_flydsl_k5_regression_params())
 
 
 # Perf-test parametrization is identical to the correctness one; trace-
