@@ -1524,6 +1524,41 @@ def get_2stage_cfgs(
         )
 
     if (kernelName1 and "ck2stages" in kernelName1) or (
+        not kernelName1
+        and (
+            (q_type == QuantType.per_1x128 and doweight_stage1)
+            or q_dtype_w
+            in [
+                dtypes.bf16,
+                dtypes.fp16,
+                torch.uint32,
+                dtypes.fp4x2,
+                dtypes.fp8,
+            ]
+        )
+    ):
+        if kernelName2 and kernelName2.startswith("flydsl_") and is_flydsl_available():
+            stage2_func = functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kernelName2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            )
+        elif kernelName2 and kernelName2.startswith("cktile_"):
+            stage2_func = functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            )
+        else:
+            stage2_func = functools.partial(
+                aiter.ck_moe_stage2_fwd,
+                kernelName=kernelName2,
+                activation=activation,
+                quant_type=q_type,
+                use_non_temporal_load=use_non_temporal_load,
+            )
         return MOEMetadata(
             functools.partial(
                 ck_moe_stage1,
