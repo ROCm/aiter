@@ -6,12 +6,53 @@ import os
 import torch
 from torch.distributed import ProcessGroup
 
-should_nccl_symm_mem_allreduce = False
-from aiter.dist.parallel_state import is_global_first_rank
 from aiter import logger, get_hip_quant
-from aiter.utility.dtypes import fp8
+from aiter.dist.parallel_state import is_global_first_rank
 from aiter.ops.enum import QuantType
+from aiter.utility.dtypes import fp8
 from .base_device_communicator import DeviceCommunicatorBase
+
+should_nccl_symm_mem_allreduce = False
+
+_FUSED_AR_RMS_QUANT_ALIASES = {
+    "fp8": "per_token",
+    "fp8_per_token": "per_token",
+    "per-token": "per_token",
+    "per_token": "per_token",
+    "per_token_fp8": "per_token",
+    "fp8_per_group": "per_group",
+    "per-group": "per_group",
+    "per_group": "per_group",
+    "per_group_fp8": "per_group",
+    "per_1x128": "per_group",
+    "fp4": "mxfp4",
+    "fp4_e2m1": "mxfp4",
+    "mx_fp4": "mxfp4",
+    "mxfp4": "mxfp4",
+    "per_1x32": "mxfp4",
+}
+
+
+def _normalize_fused_ar_rms_quant_type(quant_type):
+    if isinstance(quant_type, str):
+        normalized = _FUSED_AR_RMS_QUANT_ALIASES.get(quant_type.lower())
+        if normalized is not None:
+            return normalized
+    else:
+        if quant_type == QuantType.per_Token:
+            return "per_token"
+        if quant_type in (QuantType.per_1x128, getattr(QuantType, "per_128x128", None)):
+            return "per_group"
+        if quant_type == QuantType.per_1x32:
+            return "mxfp4"
+        try:
+            return _normalize_fused_ar_rms_quant_type(QuantType(quant_type))
+        except Exception:
+            pass
+    raise ValueError(
+        "unsupported fused AR+RMSNorm quant_type="
+        f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
+    )
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -331,7 +372,32 @@ class CudaCommunicator(DeviceCommunicatorBase):
         weight_,
         eps,
         prefill_support: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        quant_type="per_token",
+        group_size=128,
+        emit_bf16: bool = False,
+    ):
+        quant_type = _normalize_fused_ar_rms_quant_type(quant_type)
+        if quant_type == "per_group":
+            return self.fused_allreduce_rmsnorm_quant_per_group(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                group_size=group_size,
+                prefill_support=prefill_support,
+                emit_bf16=emit_bf16,
+            )
+        if quant_type == "mxfp4":
+            return self.fused_allreduce_rmsnorm_mxfp4_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                prefill_support=prefill_support,
+                emit_bf16=emit_bf16,
+            )
+        if emit_bf16:
+            raise ValueError("emit_bf16 is not supported for per-token FP8 quant")
         total_bytes = input_.numel() * input_.element_size()
         if (
             int(input_.shape[-1]) in [512, 1024, 2048, 4096]
@@ -394,7 +460,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             try:
                 result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
-                    input_, res_inp_, weight_, eps, group_size, use_1stage,
+                    input_,
+                    res_inp_,
+                    weight_,
+                    eps,
+                    group_size,
+                    use_1stage,
                     emit_bf16=emit_bf16,
                 )
                 if emit_bf16:
@@ -419,7 +490,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert bf16_out is not None
             return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
-    
+
     def fused_qknorm_allreduce(
         self,
         qkv_in,
@@ -427,13 +498,115 @@ class CudaCommunicator(DeviceCommunicatorBase):
         k_w,
         eps,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_out, k_out, v_out = self.ca_comm.custom_fused_qknorm_ar(
-            qkv_in, q_w, k_w, eps
-        )
+        q_out, k_out, v_out = self.ca_comm.custom_fused_qknorm_ar(qkv_in, q_w, k_w, eps)
         assert q_out is not None
         assert k_out is not None
         assert v_out is not None
         return q_out, k_out, v_out
+
+    def fused_allreduce_rmsnorm_mxfp4_quant(
+        self,
+        input_,
+        res_inp_,
+        weight_,
+        eps,
+        prefill_support: bool = False,
+        emit_bf16: bool = False,
+    ):
+        """Fused AR+RMSNorm with an MXFP4 quantization epilogue when supported.
+
+        Selects the 1-stage decode-shape kernel when the shape qualifies,
+        otherwise the 2-stage kernel for larger shapes that still fit in the
+        512 KiB shared-memory reduce-scatter budget. Falls back to fused
+        AR+RMSNorm + ``dynamic_mxfp4_quant`` for any shape neither kernel
+        supports.
+
+        ``AITER_AR_1STAGE``:
+            * ``"1"``  -> only attempt the 1-stage kernel
+            * ``"0"``  -> only attempt the 2-stage kernel
+            * unset    -> auto: prefer 1-stage when eligible, else 2-stage
+        """
+        total_bytes = input_.numel() * input_.element_size()
+        K = input_.shape[-1]
+        token_num = input_.numel() // K
+        element_size = input_.element_size()
+        pack_size = 16 // element_size if element_size > 0 else 0
+        block_size = K // pack_size if pack_size > 0 else 0
+
+        # 1-stage gate: direct decode shapes only (matches kernel constraints).
+        use_direct_mxfp4 = (
+            token_num <= 4
+            or (K <= 4096 and token_num <= 32)
+            or (K <= 6144 and token_num <= 16)
+            or (K == 8192 and token_num <= 8)
+        )
+        override = self._ar_1stage_override
+        can_1stage = (
+            override is not False
+            and K % 32 == 0
+            and K <= 16384
+            and token_num <= 80
+            and use_direct_mxfp4
+        )
+
+        # 2-stage gate: larger prefill shapes that still fit the 512 KiB
+        # shared-memory reduce-scatter budget and split evenly across ranks.
+        can_2stage = (
+            override is not True
+            and K % 32 == 0
+            and pack_size > 0
+            and K <= 8192
+            and block_size % self.world_size == 0
+            and (not emit_bf16 or block_size % 32 == 0)
+            and total_bytes <= 512 * 1024
+        )
+        if override is None:
+            prefer_2stage = (
+                can_2stage and self.world_size == 8 and token_num >= 16 and K <= 6144
+            )
+            if prefer_2stage:
+                can_1stage = False
+
+        out_fp4 = res_out = scale_out = bf16_out = None
+        ca_comm = self.ca_comm
+        use_kernel = (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_, prefill_support)
+            and self.world_size != 6
+            and (prefill_support or total_bytes <= 64 * 1024 * 1024)
+            and (can_1stage or can_2stage)
+        )
+        if use_kernel:
+            result = ca_comm.custom_fused_ar_rms_mxfp4_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                use_1stage=can_1stage,
+                emit_bf16=emit_bf16,
+            )
+            assert result is not None
+            if emit_bf16:
+                out_fp4, res_out, scale_out, bf16_out = result
+            else:
+                out_fp4, res_out, scale_out = result
+        else:
+            normed, res_out = self.fused_allreduce_rmsnorm(
+                input_, res_inp_, weight_, eps, prefill_support
+            )
+            from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+            out_fp4, scale_out = dynamic_mxfp4_quant(normed)
+            if emit_bf16:
+                bf16_out = normed
+        assert out_fp4 is not None
+        assert res_out is not None
+        assert scale_out is not None
+        if emit_bf16:
+            assert bf16_out is not None
+            return out_fp4, res_out, scale_out, bf16_out
+        return out_fp4, res_out, scale_out
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:

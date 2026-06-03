@@ -1066,14 +1066,12 @@ def attention_forward_decode_triton_impl(
         # For paged attention, k_cache and v_cache have shape [num_blocks, block_size, nheads, head_dim]
         num_blocks_kc, block_size_k, nheads_kc, dim_kc = k_cache.shape
         num_blocks_vc, block_size_v, nheads_vc, dim_vc = v_cache.shape
-        # Get the actual sequence length from cache_seqlens or block_table
-        if cache_seqlens is not None:
-            seqlen_kc = int(cache_seqlens.max().item())
-        else:
-            # Infer from block_table shape [batch_size, num_blocks_per_seq]
-            assert block_table is not None
-            num_blocks_per_seq = block_table.shape[1]
-            seqlen_kc = num_blocks_per_seq * block_size_k
+        # Get the actual sequence length from the block_table upper bound.
+        # Avoid cache_seqlens.max().item(): GPU-to-CPU sync is illegal during
+        # CUDA graph capture, and the block-table bound is always safe.
+        assert block_table is not None
+        num_blocks_per_seq = block_table.shape[1]
+        seqlen_kc = num_blocks_per_seq * block_size_k
         seqlen_vc = seqlen_kc
 
         # Strides for paged layout
@@ -1141,13 +1139,8 @@ def attention_forward_decode_triton_impl(
 
     # Use heuristics for split_k
     if use_block_table:
-        # For paged attention, use the actual sequence length from cache_seqlens
-        max_seqlen = (
-            int(cache_seqlens.max().item())
-            if cache_seqlens is not None
-            else block_size_k
-        )
-        split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, max_seqlen)
+        # Reuse seqlen_kc (already computed above without GPU-to-CPU sync)
+        split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, seqlen_kc)
     else:
         split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, seqlen_kc)
     split_size = (seqlen_kc + split_k - 1) // split_k
