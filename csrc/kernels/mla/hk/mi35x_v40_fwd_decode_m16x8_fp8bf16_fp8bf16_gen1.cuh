@@ -328,12 +328,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
         // Load Q: Q[:, 0:256] -> VGPR pinned at k_q_vgpr_begin (32 vgprs/lane).
         //         Q[:, 256:512] -> bf16 final LDS region inside p_lds_q.
         // Q rope/nope buffers are separate tensors in V4.0.
-        q_manager.template load_q<k_q_vgpr_begin>(params.p_query,
-                                                  params.p_query_rope,
-                                                  num_qheads,
-                                                  warp_idx,
-                                                  qo_start,
-                                                  p_lds_q);
+        q_manager.template load_q<k_q_vgpr_begin>(
+            params.p_query, params.p_query_rope, num_qheads, warp_idx, qo_start, p_lds_q);
         __builtin_amdgcn_sched_barrier(0);
 
         // Prologue: prefetch + cvt+store the first KV tile into the curr pong.
@@ -957,12 +953,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                         constexpr uint32_t kOaccuBase = k_o_begin + iter * 16u;
                         constexpr uint32_t kColOff    = iter * (2u * T::kBlockN);
                         o_manager.template output_to_vram_pair<kOaccuBase, kColOff, true>(
-                            params.p_final_output,
-                            warp_idx,
-                            qo_start,
-                            qo_end,
-                            p_lds_o,
-                            num_qheads);
+                            params.p_final_output, warp_idx, qo_start, qo_end, p_lds_o, num_qheads);
                         // Block LLVM from fusing adjacent OMgr calls' ds_reads
                         // (caps in-flight depth, keeps OMgr targets at v[58:69]).
                         __builtin_amdgcn_sched_barrier(0);
@@ -1338,35 +1329,26 @@ __global__ __launch_bounds__(
 #endif
 
 template <typename Traits>
-void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16(aiter_tensor_t& query,
-                                                    aiter_tensor_t& query_rope,
-                                                    aiter_tensor_t& kv_buffer,
-                                                    aiter_tensor_t& kv_buffer_rope,
-                                                    const aiter_tensor_t& qo_indptr,
-                                                    const aiter_tensor_t& kv_indptr,
-                                                    const aiter_tensor_t& kv_page_indices,
-                                                    const aiter_tensor_t& kv_last_page_lens,
-                                                    const aiter_tensor_t& work_indptr,
-                                                    const aiter_tensor_t& work_info_set,
-                                                    const int max_seqlen_q,
-                                                    const float softmax_scale,
-                                                    aiter_tensor_t& split_output,
-                                                    aiter_tensor_t& split_lse,
-                                                    aiter_tensor_t& final_output)
+void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& query,
+                                                         aiter_tensor_t& query_rope,
+                                                         aiter_tensor_t& kv_buffer,
+                                                         aiter_tensor_t& kv_buffer_rope,
+                                                         const aiter_tensor_t& qo_indptr,
+                                                         const aiter_tensor_t& kv_indptr,
+                                                         const aiter_tensor_t& kv_page_indices,
+                                                         const aiter_tensor_t& kv_last_page_lens,
+                                                         const aiter_tensor_t& work_indptr,
+                                                         const aiter_tensor_t& work_info_set,
+                                                         const int max_seqlen_q,
+                                                         const float softmax_scale,
+                                                         aiter_tensor_t& split_output,
+                                                         aiter_tensor_t& split_lse,
+                                                         aiter_tensor_t& final_output)
 {
-    const int32_t num_qheads = query.size(1);
-    AITER_CHECK((num_qheads & (num_qheads - 1)) == 0 && num_qheads >= 16 && num_qheads <= 128,
-                "num_qheads must be a power of 2 in [16, 128], got ",
-                num_qheads);
-    AITER_CHECK(num_qheads * max_seqlen_q == Traits::kBlockM,
-                "num_qheads * max_seqlen_q must equal ",
-                Traits::kBlockM,
-                ", got ",
-                num_qheads,
-                " * ",
-                max_seqlen_q,
-                " = ",
-                num_qheads * max_seqlen_q);
+    // Shape / dtype / rank checks live ONCE in the outer dispatcher
+    // (hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1) so we don't
+    // pay for them per page_size template instantiation.
+    const int32_t num_qheads      = query.size(1);
     const int32_t log2_num_qheads = __builtin_ctz(num_qheads);
 
     hipDevice_t dev;
@@ -1438,36 +1420,170 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& quer
         ", kv_rope=",
         AiterDtype_to_str(kv_buffer_rope.dtype()));
 
+    // ---- Shape / rank checks ----
+    // The kernel takes raw device pointers (no HK gl_* shape carrier), so
+    // every shape MUST be validated here against the V4 layout constants:
+    // any mismatch silently OOBs the kernel. Checks live ONCE in the outer
+    // dispatcher (page_size-independent constants only) so the rank/size
+    // logic doesn't bloat per page-size instantiation.
+    //
+    // Pull constants from a dummy traits instantiation so the values stay in
+    // sync with HkMlaV40DecodeFwdTraits without duplication. kPageSize_=1 is
+    // arbitrary -- only page_size-independent constants are used below.
+    using DummyTraits = HkMlaV40DecodeFwdTraits<hk::fp8e4m3,
+                                                hk::bf16,
+                                                hk::fp8e4m3,
+                                                hk::bf16,
+                                                hk::bf16,
+                                                /*kBlockN_=*/32,
+                                                /*kNumWarps_=*/8,
+                                                /*kOccupancy_=*/1,
+                                                /*kBlockM_=*/128,
+                                                /*kPageSize_=*/1>;
+
+    const int64_t num_qheads = query.size(1);
+    AITER_CHECK((num_qheads & (num_qheads - 1)) == 0 && num_qheads >= 16 && num_qheads <= 128,
+                "num_qheads must be a power of 2 in [16, 128], got ",
+                num_qheads);
+    AITER_CHECK(num_qheads * max_seqlen_q == DummyTraits::kBlockM,
+                "num_qheads * max_seqlen_q must equal ",
+                DummyTraits::kBlockM,
+                ", got ",
+                num_qheads,
+                " * ",
+                max_seqlen_q,
+                " = ",
+                num_qheads * max_seqlen_q);
+
+    AITER_CHECK(query.dim() == 3,
+                "query must be 3-D [total_q, num_qheads, kQkPackedNopeQElems], got rank ",
+                query.dim());
+    AITER_CHECK(query.size(2) == DummyTraits::kQkPackedNopeQElems,
+                "query.size(2) must equal kQkPackedNopeQElems=",
+                DummyTraits::kQkPackedNopeQElems,
+                ", got ",
+                query.size(2));
+
+    AITER_CHECK(query_rope.dim() == 3,
+                "query_rope must be 3-D [total_q, num_qheads, kQkRopeHeadDim], got rank ",
+                query_rope.dim());
+    AITER_CHECK(query_rope.size(0) == query.size(0) && query_rope.size(1) == num_qheads,
+                "query_rope dims 0,1 must match query: query=[",
+                query.size(0),
+                ",",
+                query.size(1),
+                "] vs query_rope=[",
+                query_rope.size(0),
+                ",",
+                query_rope.size(1),
+                "]");
+    AITER_CHECK(query_rope.size(2) == DummyTraits::kQkRopeHeadDim,
+                "query_rope.size(2) must equal kQkRopeHeadDim=",
+                DummyTraits::kQkRopeHeadDim,
+                ", got ",
+                query_rope.size(2));
+
     const int32_t page_size = kv_buffer.size(1);
 
-#define DISPATCH_PAGE_SIZE(PageSize)                                              \
-    case PageSize: {                                                              \
-        using Traits = HkMlaV40DecodeFwdTraits<hk::fp8e4m3,                       \
-                                               hk::bf16,                          \
-                                               hk::fp8e4m3,                       \
-                                               hk::bf16,                          \
-                                               hk::bf16,                          \
-                                               /*kBlockN_=*/32,                   \
-                                               /*kNumWarps_=*/8,                  \
-                                               /*kOccupancy_=*/1,                 \
-                                               /*kBlockM_=*/128,                  \
-                                               /*kPageSize_=*/PageSize>;          \
-        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16<Traits>(query,             \
-                                                               query_rope,        \
-                                                               kv_buffer,         \
-                                                               kv_buffer_rope,    \
-                                                               qo_indptr,         \
-                                                               kv_indptr,         \
-                                                               kv_page_indices,   \
-                                                               kv_last_page_lens, \
-                                                               work_indptr,       \
-                                                               work_info_set,     \
-                                                               max_seqlen_q,      \
-                                                               softmax_scale,     \
-                                                               split_output,      \
-                                                               split_lse,         \
-                                                               final_output);     \
-        break;                                                                    \
+    AITER_CHECK(kv_buffer.dim() == 4,
+                "kv_buffer must be 4-D [num_page, page_size, kKvNumHead, kQkPackedNopeKvElems], "
+                "got rank ",
+                kv_buffer.dim());
+    AITER_CHECK(kv_buffer.size(2) == DummyTraits::kKvNumHead,
+                "kv_buffer.size(2) must equal kKvNumHead=",
+                DummyTraits::kKvNumHead,
+                ", got ",
+                kv_buffer.size(2));
+    AITER_CHECK(kv_buffer.size(3) == DummyTraits::kQkPackedNopeKvElems,
+                "kv_buffer.size(3) must equal kQkPackedNopeKvElems=",
+                DummyTraits::kQkPackedNopeKvElems,
+                ", got ",
+                kv_buffer.size(3));
+
+    AITER_CHECK(
+        kv_buffer_rope.dim() == 4, "kv_buffer_rope must be 4-D, got rank ", kv_buffer_rope.dim());
+    AITER_CHECK(
+        kv_buffer_rope.size(0) == kv_buffer.size(0) && kv_buffer_rope.size(1) == page_size &&
+            kv_buffer_rope.size(2) == DummyTraits::kKvNumHead,
+        "kv_buffer_rope dims 0..2 must match kv_buffer's [num_page, page_size, kKvNumHead]=[",
+        kv_buffer.size(0),
+        ",",
+        page_size,
+        ",",
+        DummyTraits::kKvNumHead,
+        "], got [",
+        kv_buffer_rope.size(0),
+        ",",
+        kv_buffer_rope.size(1),
+        ",",
+        kv_buffer_rope.size(2),
+        "]");
+    AITER_CHECK(kv_buffer_rope.size(3) == DummyTraits::kQkRopeHeadDim,
+                "kv_buffer_rope.size(3) must equal kQkRopeHeadDim=",
+                DummyTraits::kQkRopeHeadDim,
+                ", got ",
+                kv_buffer_rope.size(3));
+
+    AITER_CHECK(final_output.dim() == 3,
+                "final_output must be 3-D [total_q, num_qheads, kVoHeadDim], got rank ",
+                final_output.dim());
+    AITER_CHECK(final_output.size(0) == query.size(0) && final_output.size(1) == num_qheads &&
+                    final_output.size(2) == DummyTraits::kVoHeadDim,
+                "final_output shape must be [",
+                query.size(0),
+                ",",
+                num_qheads,
+                ",",
+                DummyTraits::kVoHeadDim,
+                "], got [",
+                final_output.size(0),
+                ",",
+                final_output.size(1),
+                ",",
+                final_output.size(2),
+                "]");
+
+    AITER_CHECK(split_output.dim() >= 2 &&
+                    split_output.size(split_output.dim() - 1) == DummyTraits::kVoHeadDim,
+                "split_output trailing dim must equal kVoHeadDim=",
+                DummyTraits::kVoHeadDim,
+                ", got ",
+                split_output.size(split_output.dim() - 1));
+    AITER_CHECK(split_lse.dim() >= 1, "split_lse must have rank >= 1");
+
+    AITER_CHECK(work_indptr.dim() == 1, "work_indptr must be 1-D, got rank ", work_indptr.dim());
+    AITER_CHECK(kv_page_indices.dim() == 1,
+                "kv_page_indices must be 1-D, got rank ",
+                kv_page_indices.dim());
+
+#define DISPATCH_PAGE_SIZE(PageSize)                                                   \
+    case PageSize: {                                                                   \
+        using Traits = HkMlaV40DecodeFwdTraits<hk::fp8e4m3,                            \
+                                               hk::bf16,                               \
+                                               hk::fp8e4m3,                            \
+                                               hk::bf16,                               \
+                                               hk::bf16,                               \
+                                               /*kBlockN_=*/32,                        \
+                                               /*kNumWarps_=*/8,                       \
+                                               /*kOccupancy_=*/1,                      \
+                                               /*kBlockM_=*/128,                       \
+                                               /*kPageSize_=*/PageSize>;               \
+        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1<Traits>(query,             \
+                                                                    query_rope,        \
+                                                                    kv_buffer,         \
+                                                                    kv_buffer_rope,    \
+                                                                    qo_indptr,         \
+                                                                    kv_indptr,         \
+                                                                    kv_page_indices,   \
+                                                                    kv_last_page_lens, \
+                                                                    work_indptr,       \
+                                                                    work_info_set,     \
+                                                                    max_seqlen_q,      \
+                                                                    softmax_scale,     \
+                                                                    split_output,      \
+                                                                    split_lse,         \
+                                                                    final_output);     \
+        break;                                                                         \
     }
 
     // Only page_size in {1, 64} are instantiated -- same pattern as v32.

@@ -201,10 +201,13 @@ struct HkMlaV40DecodeFwdParams
 {
     // inputs (raw device pointers; tensor layouts are encoded by the Traits
     // compile-time dims, the kernel rebuilds opus::gmem views inside).
-    typename Traits::q_nope_t const* p_query;        // [total_q, kBlockM/kTileM*kTileM, kQkPackedNopeQElems]
-    typename Traits::q_rope_t const* p_query_rope;   // [total_q, ...,                   kQkRopeHeadDim]
-    typename Traits::kv_nope_t const* p_kv_buffer;   // [num_page, kPageSize, kKvNumHead, kQkPackedNopeKvElems]
-    typename Traits::kv_rope_t const* p_kv_buffer_rope; // [num_page, kPageSize, kKvNumHead, kQkRopeHeadDim]
+    typename Traits::q_nope_t const*
+        p_query; // [total_q, kBlockM/kTileM*kTileM, kQkPackedNopeQElems]
+    typename Traits::q_rope_t const* p_query_rope; // [total_q, ..., kQkRopeHeadDim]
+    typename Traits::kv_nope_t const*
+        p_kv_buffer; // [num_page, kPageSize, kKvNumHead, kQkPackedNopeKvElems]
+    typename Traits::kv_rope_t const*
+        p_kv_buffer_rope; // [num_page, kPageSize, kKvNumHead, kQkRopeHeadDim]
     const int32_t* p_kv_indices;
     // Only read when kPageSize > 1 AND this work item ends at the batch tail
     // (work_info.kv_offset == 0). Pass nullptr when kPageSize == 1.
@@ -216,9 +219,9 @@ struct HkMlaV40DecodeFwdParams
 
     // outputs (raw device pointers; OManager constructs HK buffer-resource
     // wrappers around these internally for the pinned-VGPR buffer_store path).
-    typename Traits::out_t* p_final_output;          // [1, total_q, kBlockM, kVoHeadDim]
-    float* p_split_output;                           // [1, n_split,  kBlockM, kVoHeadDim]
-    float* p_split_lse;                              // [1, n_split,  kBlockM, 1]
+    typename Traits::out_t* p_final_output; // [1, total_q, kBlockM, kVoHeadDim]
+    float* p_split_output;                  // [1, n_split,  kBlockM, kVoHeadDim]
+    float* p_split_lse;                     // [1, n_split,  kBlockM, 1]
 
     // parameters
     const float softmax_scale;

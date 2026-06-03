@@ -272,9 +272,8 @@ class QManager8to16bitsV1
         //
         // opus' make_gmem ext_vector_type rejects __hip_fp8_e4m3; use a
         // same-width scalar proxy (uint8_t). 16 B per call -> vec=16.
-        auto g_q_nope =
-            opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_warp));
-        void* p_dst = reinterpret_cast<void*>(p_lds_warp_staging + kStagingI);
+        auto g_q_nope = opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_warp));
+        void* p_dst   = reinterpret_cast<void*>(p_lds_warp_staging + kStagingI);
         g_q_nope.template async_load<16>(p_dst, v_off, /*s_os=*/kColInRecord);
 
         // Scale: 1 byte/lane via opus' load<1, uint8>. Stored as uint32_t so
@@ -416,11 +415,10 @@ class QManager8to16bitsV1
         const uint32_t v_off_nope  = row_in_warp * kPackedNopeStride + col_group * 16u;
         const uint32_t v_off_scale = row_in_warp * kPackedNopeStride + (col_group >> 1); // +0/+1
 
-        auto g_q_nope =
-            opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_warp));
-        auto raw = g_q_nope.template load<16>(v_off_nope, /*s_os=*/kColInRecord);
-        nope_dw  = __builtin_bit_cast(hk::u32x4, raw);
-        scale_dw = static_cast<uint32_t>(
+        auto g_q_nope = opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_warp));
+        auto raw      = g_q_nope.template load<16>(v_off_nope, /*s_os=*/kColInRecord);
+        nope_dw       = __builtin_bit_cast(hk::u32x4, raw);
+        scale_dw      = static_cast<uint32_t>(
             g_q_nope.template load<1>(v_off_scale, /*s_os=*/kScaleByteBase)[0]);
     }
 
@@ -598,12 +596,12 @@ class QManager8to16bitsV1
         // Q layout: [total_q, num_qheads, kQkPackedNopeQElems] (the
         // num_qheads/kTileM x kTileM axes from gl_q_nope collapse to one
         // contiguous num_qheads axis since adjacent strides are unit).
-        const q_nope_t* p_q_warp =
-            p_q_buffer_nope + qo_start * num_qheads * T::kQkPackedNopeQElems +
-            warp_idx * T::kTileM * T::kQkPackedNopeQElems;
-        const q_rope_t* p_q_rope_warp =
-            p_q_buffer_rope + qo_start * num_qheads * T::kQkRopeHeadDim +
-            warp_idx * T::kTileM * T::kQkRopeHeadDim;
+        const q_nope_t* p_q_warp      = p_q_buffer_nope +
+                                        qo_start * num_qheads * T::kQkPackedNopeQElems +
+                                        warp_idx * T::kTileM * T::kQkPackedNopeQElems;
+        const q_rope_t* p_q_rope_warp = p_q_buffer_rope +
+                                        qo_start * num_qheads * T::kQkRopeHeadDim +
+                                        warp_idx * T::kTileM * T::kQkRopeHeadDim;
 
         const uintptr_t p_lds_warp_staging = p1_warp_staging_base(p_lds_q, warp_idx);
 
@@ -884,13 +882,12 @@ class KvManager8to16bitsV1
     // No s_waitcnt is issued here -- the caller chooses when to wait, allowing
     // the gap between prefetch and cvt_and_store to be filled with mfmas.
     template <uint32_t kRowOffset, uint32_t kColOffset, bool kCheckBoundary>
-    __device__ __forceinline__ static void
-    prefetch_kv_tile(const uintptr_t p_lds_kv,
-                     const uint32_t warp_idx,
-                     const kv_nope_t* p_kv_buf_nope,
-                     const kv_rope_t* p_kv_buf_rope,
-                     const int32_t row_kv_ld,
-                     KvTilePrefetch& prefetch_out)
+    __device__ __forceinline__ static void prefetch_kv_tile(const uintptr_t p_lds_kv,
+                                                            const uint32_t warp_idx,
+                                                            const kv_nope_t* p_kv_buf_nope,
+                                                            const kv_rope_t* p_kv_buf_rope,
+                                                            const int32_t row_kv_ld,
+                                                            KvTilePrefetch& prefetch_out)
     {
         static_assert(kRowOffset == 0u,
                       "prefetch_kv_tile: kRowOffset must be 0 -- a tile spans all 32 rows.");
