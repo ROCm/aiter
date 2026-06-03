@@ -5,14 +5,11 @@
 
 Usage:
     HIP_VISIBLE_DEVICES=7 pytest -sv aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformance -s
-    HIP_VISIBLE_DEVICES=7 python -m pytest aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformanceCI -s
     HIP_VISIBLE_DEVICES=7 python -m pytest aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-16k-aws" -v -s
 """
 
 from __future__ import annotations
 
-import csv as _bench407_csv
-import os as _bench407_os
 from dataclasses import dataclass
 
 import pytest
@@ -274,57 +271,6 @@ _PREFILL_GROUPS = [
 PREFILL_PARAMS = expand_groups(_PREFILL_GROUPS)
 
 
-# -- bench_407 prefill shapes -------------------------------------------
-#
-# Append every shape from ``bench_407_prefill_only.csv`` (333 unique
-# prefill shapes extracted from a Qwen3-Next prefill_gdr trace,
-# decode-only segments stripped, duplicates merged with summed
-# ``log_count``). Each row maps to one ``PrefillArgs`` that drives the
-# varlen + final-state K5 path under the trace's head-dim choice
-# (K=128, V=128, Hk=16, Hv=32, tp=1, BT=64, bf16 weights, f32 SSM state).
-
-_BENCH407_CSV = _bench407_os.path.join(
-    _bench407_os.path.dirname(_bench407_os.path.abspath(__file__)),
-    "bench_407_prefill_only.csv",
-)
-
-
-def _build_bench407_params():
-    if not _bench407_os.path.isfile(_BENCH407_CSV):
-        return []
-    out = []
-    with open(_BENCH407_CSV) as f:
-        for row in _bench407_csv.DictReader(f):
-            cu = [int(x) for x in row["cu_seqlens_prefill"].split()]
-            context_lens = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
-            if not context_lens:
-                continue
-            T = sum(context_lens)
-            log_count = int(row["log_count"])
-            out.append(
-                PrefillArgs(
-                    K=128,
-                    V=128,
-                    Hk=16,
-                    Hv=32,
-                    tp=1,
-                    BT=64,
-                    full_prompt_len=T,
-                    max_num_batched_tokens=T,
-                    model_name="prefill-bench333",
-                    is_varlen=True,
-                    output_final_state=True,
-                    ssm_state_dtype=torch.float32,
-                    context_lens=context_lens,
-                    trace_tag=f"cnt{log_count}",
-                )
-            )
-    return out
-
-
-BENCH407_PARAMS = _build_bench407_params()
-PREFILL_PARAMS.extend(BENCH407_PARAMS)
-
 # Perf-test parametrization is identical to the correctness one; trace-
 # derived shapes have been removed from this file.
 PERF_PARAMS = list(PREFILL_PARAMS)
@@ -383,78 +329,6 @@ STATE_BF16_PARAMS = [
     ),
 ]
 STATE_BF16_TEST_IDS = [repr(p) for p in STATE_BF16_PARAMS]
-
-
-# -- bench333 CI regression subset (paired with TestPerformanceCI) ------
-
-# 35 representative cases covering all distinct (T_bucket, N_bucket,
-# mid_bucket, BV) signatures of the 333-shape bench333 trace, one
-# highest-log_count case per signature, plus nearest-T probes around
-# 16k / 32k.
-#
-# Derived offline from ``bench_407_prefill_only.csv`` +
-# ``chunk_gdn_h_bench407_tuned.csv``; encoded here as a frozenset of
-# pytest ids (= ``repr(args)`` for each case) so we don't recompute
-# the signature classification at import time.
-#
-# Ordering convention: cases where FlyDSL beats vLLM (fly/vllm > 1.10x)
-# appear FIRST (sorted by ratio desc), then near-parity cases that are
-# slightly above 1.0x, then the cases where FlyDSL is at or below
-# vLLM. This makes regressions visible early in the per-row summary
-# table -- the bottom rows are the ones to watch when a kernel change
-# might trade short-T wins for long-T losses.
-#
-# Ratios reflect a single bench run on MI355X gfx950 (see commit log)
-# and have some variance across runs (~0.05x on long-T single-seg
-# cases); rerank if the population shifts > 0.20x.
-REP_BENCH333_IDS = [
-    # --- Nearest-T probes around 16k / 32k ---
-    "prefill-bench333_T15864_n4_cnt36",
-    "prefill-bench333_T15211_n2_cnt36",
-    "prefill-bench333_T15000_n3_cnt828",
-    "prefill-bench333_T15000_n15_cnt36",
-    "prefill-bench333_T17976_n2_cnt36",
-    # "prefill-bench333_T32766_n4_cnt72",
-    # "prefill-bench333_T32765_n7_cnt36",
-    # # --- FlyDSL clearly beats vLLM (fly/vllm > 1.10x, 9 cases) ---
-    # "prefill-bench333_T5000_n1_cnt2844",  # rvllm=1.55x
-    # "prefill-bench333_T4469_n1_cnt180",  # rvllm=1.54x
-    # "prefill-bench333_T5356_n2_cnt36",  # rvllm=1.49x
-    # "prefill-bench333_T1000_n1_cnt3096",  # rvllm=1.48x
-    # "prefill-bench333_T10000_n1_cnt1764",  # rvllm=1.34x
-    # "prefill-bench333_T11720_n2_cnt144",  # rvllm=1.27x
-    # "prefill-bench333_T2000_n2_cnt36",  # rvllm=1.18x
-    # "prefill-bench333_T9472_n2_cnt36",  # rvllm=1.11x
-    # "prefill-bench333_T20000_n2_cnt576",  # rvllm=1.10x
-    # # --- Near-parity with vLLM (0.95-1.10x, 15 cases) ---
-    # "prefill-bench333_T10000_n2_cnt576",  # rvllm=1.08x
-    # "prefill-bench333_T7000_n7_cnt288",  # rvllm=1.02x
-    # "prefill-bench333_T11745_n3_cnt36",  # rvllm=1.01x
-    # "prefill-bench333_T32000_n32_cnt180",  # rvllm=0.99x
-    # "prefill-bench333_T23499_n3_cnt108",  # rvllm=0.98x
-    # "prefill-bench333_T30000_n3_cnt1080",  # rvllm=0.96x
-    # "prefill-bench333_T30000_n6_cnt360",  # rvllm=0.96x
-    # "prefill-bench333_T32755_n33_cnt72",  # rvllm=0.96x
-    # "prefill-bench333_T20000_n20_cnt288",  # rvllm=0.95x
-    # "prefill-bench333_T27236_n6_cnt144",  # rvllm=0.95x
-    # "prefill-bench333_T18245_n19_cnt72",  # rvllm=0.95x
-    # "prefill-bench333_T27264_n3_cnt36",  # rvllm=0.95x
-    # # --- FlyDSL loses to vLLM (fly/vllm < 0.95x, 4 cases) ---
-    # "prefill-bench333_T9000_n9_cnt108",  # rvllm=0.94x
-    # "prefill-bench333_T4000_n4_cnt36",  # rvllm=0.94x
-    # "prefill-bench333_T3000_n3_cnt432",  # rvllm=0.91x
-    # "prefill-bench333_T10000_n10_cnt252",  # rvllm=0.87x
-]
-
-# Build PARAMS in ``REP_BENCH333_IDS`` order (not BENCH407_PARAMS order)
-# so pytest collection -- and the per-row summary table that follows
-# ``_perf_results`` insertion order -- emits the cases in the same order
-# they are listed above.
-_bench407_by_id = {repr(p): p for p in BENCH407_PARAMS}
-REP_BENCH333_PARAMS = [
-    _bench407_by_id[i] for i in REP_BENCH333_IDS if i in _bench407_by_id
-]
-REP_BENCH333_TEST_IDS = [repr(p) for p in REP_BENCH333_PARAMS]
 
 
 # -- Helper functions ---------------------------------------------------
@@ -987,7 +861,7 @@ _perf_results: list[dict] = []
 
 
 def _run_perf_comparison(args: PrefillArgs):
-    """Per-shape K5 perf body shared by ``TestPerformance`` and ``TestPerformanceCI``.
+    """Per-shape K5 perf body used by ``TestPerformance``.
 
     Bench 4 backends (FlyDSL, Triton opt_vk, Triton origin_opt, vLLM)
     under identical inputs and append a row to ``_perf_results``. The
@@ -1171,40 +1045,10 @@ def _run_perf_comparison(args: PrefillArgs):
 
 
 class TestPerformance:
-    """Kernel-only performance comparison: FlyDSL vs Triton opt_vk vs Triton opt3_kv.
-
-    Parametrizes over the full ``PERF_PARAMS`` (= main-table + bench333
-    + STATE_BF16 in some configurations). For CI regression on the
-    bench333 subset, use ``TestPerformanceCI`` instead -- it covers
-    the same set of distinct (T_bucket, N_bucket, mid_bucket, BV)
-    families with ~28 representative cases (~50% workload-weighted
-    coverage) in under 10 seconds.
-    """
+    """Kernel-only performance comparison: FlyDSL vs Triton opt_vk vs Triton opt3_kv."""
 
     @pytest.mark.parametrize("args", PERF_PARAMS, ids=PERF_TEST_IDS)
     def test_perf_comparison(self, args: PrefillArgs):
-        _run_perf_comparison(args)
-
-
-class TestPerformanceCI:
-    """Regression-gating subset of bench333: 28 cases covering all
-    distinct (T_bucket, N_bucket, mid_bucket, BV) signatures.
-
-    Selection:
-      - T_bucket: <2k, 2k-5k, 5k-10k, 10k-20k, 20k-30k, >=30k
-      - N_bucket: 1, 2, 3, 4-8, 9-16, 17-32, >32
-      - mid_bucket: 0 (none) / 1k / 5k / 10k / other
-      - BV: 16 / 32 / 64 (from offline sweep)
-
-    Within each signature the case with the highest ``log_count`` is
-    chosen. The 28-case set covers 13,896 / 28,152 = 49.4% of the
-    bench333 trace's total log_count weight.
-
-    Runs in ~8 seconds on MI355X (28 cases × ~0.3s each).
-    """
-
-    @pytest.mark.parametrize("args", REP_BENCH333_PARAMS, ids=REP_BENCH333_TEST_IDS)
-    def test_perf_comparison_ci(self, args: PrefillArgs):
         _run_perf_comparison(args)
 
 
