@@ -1005,7 +1005,6 @@ def _get_ck_exclude_modules():
         "module_pa",
         "module_pa_metadata",
         "module_pa_ragged",
-        "module_pa_v1",
         "module_ps_metadata",
         "module_quant",
         "module_rmsnorm_quant",
