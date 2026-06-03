@@ -1806,6 +1806,11 @@ if __name__ == "__main__":
             df = df[df["libtype"] == "opus"]
             if df.empty:
                 continue
+            # Drop off-arch kids: lookup must only reference symbols S actually emitted.
+            if "solidx" in df.columns:
+                df = df[df["solidx"].astype(int).isin(S)]
+                if df.empty:
+                    continue
             combined_frames.append(df)
 
         if combined_frames:
