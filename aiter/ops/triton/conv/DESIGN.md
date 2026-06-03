@@ -124,13 +124,15 @@ aiter/ops/triton/conv/
 
 aiter/ops/triton/_triton_kernels/conv/
   __init__.py          empty marker (kernels are imported by full path)
-  helpers.py           _tanh helper (shared by all kernels for the gelu path)
-                       and the CONV_AUTOTUNE_ENABLED env-var gate (consumed
-                       when AITER_TRITON_CONV_AUTOTUNE=1). Each kernel file
-                       ships its own AUTOTUNE_*_CONFIGS candidate-config list
-                       alongside the kernel it tunes. Steady-state per-kernel
-                       configs live in JSON under aiter/ops/triton/configs/conv/,
-                       loaded via aiter/ops/triton/utils/conv_config_utils.py.
+  helpers.py           CONV_AUTOTUNE_ENABLED env-var gate (consumed when
+                       AITER_TRITON_CONV_AUTOTUNE=1). Activation helpers
+                       (_relu, _relu6, _gelu_tanh) are imported from the
+                       shared aiter/ops/triton/_triton_kernels/activation.py.
+                       Each kernel file ships its own AUTOTUNE_*_CONFIGS
+                       candidate-config list alongside the kernel it tunes.
+                       Steady-state per-kernel configs live in JSON under
+                       aiter/ops/triton/configs/conv/, loaded via
+                       aiter/ops/triton/utils/conv_config_utils.py.
   conv_1x1.py          1×1 GEMM kernel (NCHW + NHWC via LAYOUT constexpr)
   conv_3x3.py          3×3 NHWC kernel + 3×3 cblocked (NCHWc) kernel
   conv_general.py      K-major reduction with on-the-fly (c, r, s) decoding
