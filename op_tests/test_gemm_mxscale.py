@@ -178,7 +178,6 @@ def _bench_gemm_mxscale(dtype, M, N, K, num_iters, num_warmup):
 
 def _main():
     import argparse
-    import sys
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -228,7 +227,8 @@ def _main():
         return pytest.main([__file__, "-v", "-s"])
 
     if not torch.cuda.is_available() or get_gfx() != "gfx1250":
-        sys.exit("MXScale GEMM benchmark requires a gfx1250 device.")
+        print("SKIP: MXScale GEMM requires a gfx1250 device; skipping benchmark.")
+        return 0
 
     import pandas as pd
 
@@ -240,9 +240,11 @@ def _main():
         for m, n, k in args.shape:
             df.append(_bench_gemm_mxscale(dtype, m, n, k, args.iters, args.warmup))
     df = pd.DataFrame(df)
-    aiter.logger.info(
-        "gemm_a8w8_mxscale summary (markdown):\n%s", df.to_markdown(index=False)
-    )
+    try:
+        summary = df.to_markdown(index=False)
+    except ImportError:
+        summary = df.to_string(index=False)
+    aiter.logger.info("gemm_a8w8_mxscale summary:\n%s", summary)
     return 0
 
 
