@@ -86,15 +86,7 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
                 "splitK must be in the range [0, 30], got ",
                 splitK);
 
-    // CK's ABQuantGemmPipelineAgBgCrCompV3 currently only supports k_batch == 1
-    // (asserted in include/ck_tile/ops/gemm_quant/kernel/gemm_quant_kernel.hpp).
-    // The previous k_batch > 1 support added in ROCm/composable_kernel#3359 was
-    // dropped when #6978 re-synced the ABQuant pipeline from internal/gfx1250.
-    // Until CK restores k_batch > 1 in this pipeline, silently clamp KBatch to 1
-    // on the cktile path so callers requesting splitK > 0 fall back to a single
-    // k_batch instead of hitting a device-side assert.
-    (void)splitK;
-    int KBatch = 1;
+    int KBatch = 1 << splitK;
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
