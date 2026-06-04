@@ -563,7 +563,33 @@ def fused_moe_1stage(
             activation,
         )
     else:
-        if xbf16:
+        token_num = hidden_states.shape[0]
+        E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+        if quant_type == QuantType.per_1x32:
+            if hidden_states.dtype == q_dtype_a:
+                assert a1_scale is not None, \
+                    "a1_scale must be provided for pre-quantized FP4 input"
+                a1 = hidden_states
+                a1_scale = mxfp4_moe_sort_fwd(
+                    a1_scale,
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token_num,
+                    cols=model_dim,
+                )
+            else:
+                a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
+                    hidden_states,
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token_num,
+                    topk=topk,
+                    block_size=block_size_M,
+                    num_rows=num_local_tokens,
+                )
+            w1_scale = w1_scale.view(E, -1)
+            w2_scale = w2_scale.view(E, -1)
+        elif xbf16:
             # xquant happens inside the asm kernel for per_1x128
             a1 = hidden_states
             a1_scale = torch.empty(0, device="cuda")
@@ -589,19 +615,6 @@ def fused_moe_1stage(
                         scale_t, a1_scale, num_rows=num_local_tokens
                     )
                     a1_scale = scale_t
-
-        token_num = hidden_states.shape[0]
-        E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-        if quant_type == QuantType.per_1x32:
-            a1_scale = mxfp4_moe_sort_fwd(
-                a1_scale,
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=token_num,
-                cols=model_dim,
-            )
-            w1_scale = w1_scale.view(E, -1)
-            w2_scale = w2_scale.view(E, -1)
 
         if quant_type == QuantType.per_1x128:
             fmoe_func = functools.partial(
