@@ -76,7 +76,10 @@ def _vsa_qk_fp8_pv_fp4_composite_key_kernel(
     n_tasks: tl.int32,
     max_kv_x2: tl.int32,
     threshold: tl.int32,
-    idx_stride0: tl.int32,
+    idx_stride0: tl.int64,   # int64 to survive long contexts where
+                             #   max_kv * (n_tasks-1) > INT32_MAX
+                             # (e.g. Seedance 5.9M tokens => max_kv = n_tasks = 46_425,
+                             #  product 2.155e9 overflows int32 by 7.8M).
     BLOCK: tl.constexpr,
     FKV_LOG2: tl.constexpr,
     QN_BITS: tl.constexpr,
@@ -85,7 +88,11 @@ def _vsa_qk_fp8_pv_fp4_composite_key_kernel(
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_tasks
     qn = tl.load(q2k_num_ptr + offs, mask=mask, other=0)
-    fkv = tl.load(q2k_idx_ptr + offs * idx_stride0, mask=mask, other=0)
+    # Promote offs to int64 BEFORE the multiply so the address arithmetic
+    # cannot wrap at huge num_q_blks; without this Triton would do an
+    # int32 multiply and then sign-extend the wrapped result, jumping to
+    # a wild GPU address (HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION).
+    fkv = tl.load(q2k_idx_ptr + offs.to(tl.int64) * idx_stride0, mask=mask, other=0)
     band = fkv >> FKV_LOG2
     qn_neg = (max_kv_x2 - qn) & ((1 << QN_BITS) - 1)
     key = (band << QN_BITS) | qn_neg
