@@ -188,6 +188,125 @@ def moe_sorting(
         raise e
 
 
+# gfx942 / gfx950 expose 64 KiB of LDS per workgroup; mirrors the C++ budget
+# check in csrc/include/fused_topk_moe_sorting.h.
+_FUSED_TOPK_SORT_LDS_LIMIT = 64 * 1024
+_FUSED_TOPK_SORT_MAX_TOPK = 16
+
+
+def _fused_topk_sort_lds_bytes(tokens, num_experts, topk):
+    cols = num_experts + 1
+    return ((tokens + 1) * cols + tokens * topk) * 4
+
+
+def _fused_topk_sort_eligible(gating_output, num_experts, topk, expert_mask):
+    # The fused kernel keeps the whole token set + histogram in one CU's LDS,
+    # so it only covers the oneshot decode regime. Anything else falls back.
+    if get_gfx() not in ["gfx942", "gfx950"]:
+        return False
+    if expert_mask is not None:
+        return False
+    if topk <= 0 or topk > _FUSED_TOPK_SORT_MAX_TOPK:
+        return False
+    if gating_output.dim() != 2 or gating_output.shape[1] < num_experts:
+        return False
+    if gating_output.dtype not in [dtypes.bf16, dtypes.fp16, dtypes.fp32]:
+        return False
+    M = gating_output.shape[0]
+    if M <= 0:
+        return False
+    return (
+        _fused_topk_sort_lds_bytes(M, num_experts, topk) <= _FUSED_TOPK_SORT_LDS_LIMIT
+    )
+
+
+def topk_softmax_sorting(
+    gating_output,
+    topk,
+    num_experts,
+    model_dim,
+    moebuf_dtype,
+    need_renorm=True,
+    block_size=BLOCK_SIZE_M,
+    expert_mask=None,
+    num_local_tokens=None,
+    dispatch_policy=0,
+):
+    """Fused softmax -> topk -> counting-sort.
+
+    Returns the same tuple as ``moe_sorting``:
+    ``(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)``.
+
+    Uses the single-launch fused kernel for oneshot-feasible decode shapes and
+    transparently falls back to the separate ``topk_softmax`` + ``moe_sorting``
+    chain otherwise.
+    """
+    M = gating_output.shape[0]
+
+    if _fused_topk_sort_eligible(gating_output, num_experts, topk, expert_mask):
+        device = gating_output.device
+        max_num_tokens_padded = int(M * topk + num_experts * block_size - topk)
+        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+        sorted_ids = torch.empty(
+            max_num_tokens_padded, dtype=dtypes.i32, device=device
+        )
+        sorted_weights = torch.empty(
+            max_num_tokens_padded, dtype=dtypes.fp32, device=device
+        )
+        sorted_expert_ids = torch.empty(
+            max_num_m_blocks, dtype=dtypes.i32, device=device
+        )
+        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+        moe_buf = torch.zeros((M, model_dim), dtype=moebuf_dtype, device=device)
+        try:
+            gating = (
+                gating_output
+                if gating_output.is_contiguous()
+                else gating_output.contiguous()
+            )
+            aiter.fused_topk_moe_sorting_fwd(
+                gating,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                int(num_experts),
+                int(topk),
+                int(block_size),
+                bool(need_renorm),
+            )
+            return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+        except Exception as e:
+            logger.warning(
+                f"fused_topk_moe_sorting failed ({e}); falling back to separate kernels"
+            )
+
+    # Fallback: separate topk_softmax + moe_sorting.
+    device = gating_output.device
+    topk_weights = torch.empty(M, topk, dtype=dtypes.fp32, device=device)
+    topk_ids = torch.empty(M, topk, dtype=dtypes.i32, device=device)
+    token_expert_indices = torch.empty(M, topk, dtype=dtypes.i32, device=device)
+    aiter.topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indices,
+        gating_output,
+        need_renorm,
+    )
+    return moe_sorting(
+        topk_ids,
+        topk_weights,
+        num_experts,
+        model_dim,
+        moebuf_dtype,
+        block_size=block_size,
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
+        dispatch_policy=dispatch_policy,
+    )
+
+
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
 # We can use torch.compile(dynamic=False) to avoid
 @functools.lru_cache(maxsize=2048)

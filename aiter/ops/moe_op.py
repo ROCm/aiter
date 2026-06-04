@@ -42,6 +42,25 @@ def topk_sigmoid(
 ) -> None: ...
 
 
+@compile_ops("module_fused_topk_moe_sorting")
+def fused_topk_moe_sorting_fwd(
+    gating_output: Tensor,
+    sorted_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    moe_buf: Tensor,
+    num_experts: int,
+    topk: int,
+    unit_size: int,
+    need_renorm: bool,
+) -> None: ...
+
+
+@compile_ops("module_fused_topk_moe_sorting")
+def fused_topk_moe_sorting_max_tokens(num_experts: int, topk: int) -> int: ...
+
+
 @compile_ops("module_moe_asm")
 def moe_sum(input: Tensor, output: Tensor) -> None: ...
 

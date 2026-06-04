@@ -554,6 +554,18 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_fused_topk_moe_sorting": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fused_topk_moe_sorting_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/fused_topk_moe_sorting_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_pa_sparse_prefill_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/pa_sparse_prefill_opus_kernels.cu'",

@@ -2157,3 +2157,21 @@ namespace py = pybind11;
           py::arg("split_output"),      \
           py::arg("split_lse"),         \
           py::arg("final_output"));
+
+#define FUSED_TOPK_MOE_SORTING_PYBIND                       \
+    m.def("fused_topk_moe_sorting_fwd",                     \
+          &aiter::fused_topk_moe_sorting_fwd,               \
+          py::arg("gating_output"),                         \
+          py::arg("sorted_ids"),                            \
+          py::arg("sorted_weights"),                        \
+          py::arg("sorted_expert_ids"),                     \
+          py::arg("num_valid_ids"),                         \
+          py::arg("moe_buf"),                               \
+          py::arg("num_experts"),                           \
+          py::arg("topk"),                                  \
+          py::arg("unit_size"),                             \
+          py::arg("need_renorm"));                          \
+    m.def("fused_topk_moe_sorting_max_tokens",              \
+          &aiter::fused_topk_moe_sorting_max_tokens,        \
+          py::arg("num_experts"),                           \
+          py::arg("topk"));
