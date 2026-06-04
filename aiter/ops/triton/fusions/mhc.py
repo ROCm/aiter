@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from typing import Optional, Tuple
 import torch
 import triton
@@ -9,7 +10,7 @@ from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_fused_kernel,
     _mhc_fused_split_kernel,
     _mhc_post_kernel,
-    _mhc_post_pre_split_kernel,
+    _mhc_post_pre_split_kernel as triton_mhc_post_pre_split_kernel,
     _mhc_reduce_apply_kernel,
     _mhc_post_pre_reduce_apply_kernel,
 )
@@ -21,6 +22,13 @@ from aiter.ops.triton.utils.mhc_config_utils import (
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
+
+if DEVICE_ARCH == "gfx1250":
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc import (
+        _mhc_post_pre_split_kernel as gluon_mhc_post_pre_split_kernel,
+    )
+else:
+    gluon_mhc_post_pre_split_kernel = None
 
 _LOGGER = AiterTritonLogger()
 
@@ -592,6 +600,7 @@ def mhc_post_pre(
     if config is None:
         config, _ = get_mhc_config("MHC_FUSED", M, C, mode="sinkhorn")
     config = dict(config)
+    print(config)
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
     if DEVICE_ARCH in ("gfx942",):
         BLOCK_M = 16
@@ -673,7 +682,24 @@ def mhc_post_pre(
 
     # --- Launch 1: fused post + partial pre GEMM/sqrsum, one CTA per (M-tile, C-tile).
     grid_split = (triton.cdiv(M, BLOCK_M), NUM_KSPLIT)
-    _mhc_post_pre_split_kernel[grid_split](
+    if _MHC_BACKEND_ENV == "triton":
+        _post_pre_kernel = triton_mhc_post_pre_split_kernel
+    elif _MHC_BACKEND_ENV == "gluon":
+        if gluon_mhc_post_pre_split_kernel is None:
+            raise RuntimeError(
+                "MHC_POST_PRE_BACKEND=gluon but gluon kernel is unavailable "
+                f"for arch {DEVICE_ARCH}"
+            )
+        _post_pre_kernel = gluon_mhc_post_pre_split_kernel
+    else:
+        _post_pre_kernel = (
+            gluon_mhc_post_pre_split_kernel
+            if (
+                DEVICE_ARCH == "gfx1250" and gluon_mhc_post_pre_split_kernel is not None
+            )
+            else triton_mhc_post_pre_split_kernel
+        )
+    _post_pre_kernel[grid_split](
         layer_input,
         residual_in,
         post_mix,
