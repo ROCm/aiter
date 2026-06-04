@@ -76,6 +76,7 @@ def make_no_split_metadata(batch, kv_head_num, gqa, qo_indptr, kv_indptr, device
 def make_sched2_metadata(
     batch, kv_head_num, gqa, qo_indptr, kv_indptr, context_lens,
     block_size, qlen_granularity, available_tgs, device, is_causal=False,
+    force_split=True,
 ):
     """Faithful Python port of sched2 common_ps.h generate_metadata +
     generate_reduce_info (the convention the SP3 PA_DECODE kernel was authored
@@ -132,7 +133,10 @@ def make_sched2_metadata(
                 kv_start = cur_block + kvp[bt]
                 if remaining_kv <= cap * block_size + SPLIT_KV_OVERHEAD:
                     consuming = remaining_blocks
-                    if cur_block == 0:
+                    # force_split: never use the direct-to-O path (partial_o_loc=-1)
+                    # because this gfx1250 .co does not implement it (writes nothing
+                    # to O); route every tile through split_o + host reduce instead.
+                    if cur_block == 0 and not force_split:
                         ploc = -1  # whole tile in one TG -> direct to O
                     else:
                         ploc = qlen_granularity * partial_tile_idx
@@ -380,6 +384,19 @@ def test_pa_decode(
             work_indptr, work_info, split_o, split_lse,
         )
         torch.cuda.synchronize()
+
+        if os.environ.get("AITER_PA_DEBUG", "0") == "1":
+            fin = torch.isfinite(split_lse)
+            nfin = int(fin.sum().item())
+            lse_min = split_lse[fin].min().item() if nfin else float("nan")
+            lse_max = split_lse[fin].max().item() if nfin else float("nan")
+            print(f"\n[DEBUG] split_lse: finite={nfin}/{split_lse.numel()} "
+                  f"range=[{lse_min:.4f},{lse_max:.4f}]")
+            print(f"[DEBUG] split_o : absmean={split_o.abs().mean().item():.5f} "
+                  f"absmax={split_o.abs().max().item():.5f} "
+                  f"(rows={split_o.shape[0]}, kernel wrote partials if >0)")
+            print(f"[DEBUG] O after kernel (pre-reduce) absmean={out.float().abs().mean().item():.5f}")
+            print(f"[DEBUG] work_info[0:8] = {work_info[:8].tolist()}")
 
         out, n_ref, n_unwritten = cpu_reduce(
             out, split_o, split_lse,
