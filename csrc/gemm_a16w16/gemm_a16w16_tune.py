@@ -210,7 +210,10 @@ def run_opus_gemm_bf16(inp, weight, out, bias=None, kid=0, splitK=0):
         return out
     ref_fp32 = torch.bmm(inp3.float(), weight3.float().transpose(-1, -2))
     if bias is not None:
-        ref_fp32 = ref_fp32 + bias.float().unsqueeze(-1)
+        if bias.dim() == 1:
+            ref_fp32 = ref_fp32 + bias.float().view(1, 1, -1)
+        else:
+            ref_fp32 = ref_fp32 + bias.float().unsqueeze(1)
     max_delta = (out3.float() - ref_fp32).abs().max().item()
     max_ref = ref_fp32.abs().max().item()
     bound = max(max_ref * 0.1, 1.0)
@@ -534,13 +537,19 @@ class GemmA16W16Tuner(GemmCommonTuner):
         else:
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
             if "outdtype" not in self.untunedf.columns:
-                self.untunedf["outdtype"] = str(args.indtype)
+                self.untunedf["outdtype"] = self.untunedf["dtype"]
             if "scaleAB" not in self.untunedf.columns:
                 self.untunedf["scaleAB"] = False
+            _cli_to_dtypes = {
+                "f16": "fp16",
+                "f32": "fp32",
+                "bf16": "bf16",
+                "fp8": "fp8",
+            }
             if args.indtype is not None:
-                self.untunedf["dtype"] = str(args.indtype)
+                self.untunedf["dtype"] = f"dtypes.{_cli_to_dtypes[args.indtype]}"
             if args.outdtype is not None:
-                self.untunedf["outdtype"] = str(args.outdtype)
+                self.untunedf["outdtype"] = f"dtypes.{_cli_to_dtypes[args.outdtype]}"
             self.tunedf = self.get_tuned_gemm_list(self.get_out_file(args.tune_file))
             self.untunedf["gfx"] = self.get_gfx()
             self.untunedf["cu_num"] = self.get_cu_num()
