@@ -391,8 +391,11 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     sin_smem = gl.allocate_shared_memory(sin_ptr.dtype.element_ty, [FREQ_W], SH)
 
     if pid < B * QH:
-        pid_b = pid // QH
-        pid_hq = pid % QH
+        # pid_b = pid // QH
+        # pid_hq = pid % QH
+        # This is a new optimization that prioritized heavy workload WGs first
+        pid_hq = pid // B
+        pid_b = pid % B
 
         # Issue ``pos`` first — it's used immediately by the cos/sin TDM
         # descriptors. pid_slot / k_scale are only consumed later in the
@@ -436,8 +439,12 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         )
         _issue_tdm_load_1d(q_pe_desc, 0, qpe_smem)
 
-        pid_hk = pid_hq // QH_PER_KH
-        is_kv = pid_hq % QH_PER_KH == 0
+        # pid_hk = pid_hq // QH_PER_KH
+        # is_kv = pid_hq % QH_PER_KH == 0
+        # This is a new optimization that prioritized heavy workload WGs first
+        pid_hk = pid_hq
+        is_kv = pid_hk < KH
+        
         q_out_base = pid_b * q_out_stride_b + pid_hq * q_out_stride_h
 
         if is_kv:
