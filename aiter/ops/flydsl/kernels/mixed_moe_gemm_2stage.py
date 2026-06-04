@@ -4474,6 +4474,11 @@ def compile_mixed_moe_gemm2(
                     for k_iv_py in range_constexpr(0, k_main2_py, tile_k * 2):
                         k_iv = arith.index(k_iv_py)
                         next_k1 = k_iv + tile_k
+                        # Python-int K offset for the compile-time scale-shift /
+                        # scale-base helpers (`_k_shift_bits` builds an
+                        # `arith.constant(..., i32)` so it must NOT receive the
+                        # MLIR `next_k1` value -- mirrors `next_k2_py`).
+                        next_k1_py = k_iv_py + tile_k
                         next_k1_bk = next_k1 // 2
                         # Issue scales BEFORE B-VMEM in the steady-state K-loop:
                         # scales are 1-dword (low VMEM latency) and feed
@@ -4484,7 +4489,7 @@ def compile_mixed_moe_gemm2(
                         else:
                             x_regs_ping = load_x_tile(next_k1)
                         a_scale_ping, b_scale_ping = prefetch_ab_scale_tile(
-                            _k_base(next_k1), _k_shift_bits(next_k1)
+                            _k_base(next_k1_py), _k_shift_bits(next_k1_py)
                         )
                         b_ping_lo = (
                             load_b_tile_lo(next_k1_bk)
