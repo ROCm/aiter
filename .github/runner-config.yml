@@ -25,3 +25,7 @@ runners:
   linux-aiter-mi35x-8:
     gpu_arch: MI35X
     gpu_count: 8
+
+  "9700":
+    gpu_arch: Radeon AI PRO R9700 (gfx1201)
+    gpu_count: 8
