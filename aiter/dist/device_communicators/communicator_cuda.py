@@ -200,8 +200,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
         prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        from aiter.dist.device_communicators.custom_all_reduce import (
+            is_weak_contiguous,
+        )
+
         n = input_.shape[-1]
         total_bytes = input_.numel() * input_.element_size()
+        residual_is_weak_contiguous = is_weak_contiguous(res_inp_)
         can_use_fuse_ar_rms = (
             n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
         )
@@ -210,6 +215,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             ca_comm is not None
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_, prefill_support)
+            and residual_is_weak_contiguous
             and can_use_fuse_ar_rms
         ):
             use_1stage = (
@@ -248,11 +254,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
         prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from aiter.dist.device_communicators.custom_all_reduce import (
+            is_weak_contiguous,
+        )
+
         total_bytes = input_.numel() * input_.element_size()
         if (
             int(input_.shape[-1]) in [512, 1024, 2048, 4096]
             and total_bytes <= 4096 * 1024
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
+            and is_weak_contiguous(res_inp_)
         ):
             use_1stage = (
                 self._ar_1stage_override
@@ -293,6 +304,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         gating projection consuming the same normed activation, so they can
         skip the separate per-group quant kernel entirely (see Qwen3.5).
         """
+        from aiter.dist.device_communicators.custom_all_reduce import (
+            is_weak_contiguous,
+        )
+
         total_bytes = input_.numel() * input_.element_size()
         K = input_.shape[-1]
         fused_ok = False
@@ -303,6 +318,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and total_bytes < 8 * 1024 * 8192
             and self.world_size != 6
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
+            and is_weak_contiguous(res_inp_)
         ):
             use_1stage = (
                 self._ar_1stage_override
