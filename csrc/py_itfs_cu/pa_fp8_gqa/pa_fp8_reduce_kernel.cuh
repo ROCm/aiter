@@ -67,6 +67,17 @@ void pa_fp8_reduce_kernel(
                                    ? min(active_parts, fixed_num_partitions)
                                    : active_parts;
 
+    // Graph-capture padding can produce empty decode slots (context_len == 0).
+    // Avoid negative "last partition" math and return a neutral output.
+    if (num_partitions <= 0)
+    {
+        scalar_t* out_ptr =
+            out + static_cast<int64_t>(seq_idx * MTP + mtp) * num_heads * kHead
+            + static_cast<int64_t>(head_idx) * kHead;
+        out_ptr[threadIdx.x] = pa_from_float<scalar_t>(0.f);
+        return;
+    }
+
     const int warpid = threadIdx.x / WARP_SIZE;
 
     __shared__ float shared_global_exp_sum;
@@ -311,6 +322,15 @@ void pa_fp8_reduce_kernel_v2(
                                    : active_parts;
     const int ns_mtp_idx     = seq_idx * MTP + mtp;
 
+    if (num_partitions <= 0)
+    {
+        scalar_t* out_ptr = out
+            + static_cast<int64_t>(ns_mtp_idx) * num_heads * kHead
+            + static_cast<int64_t>(head_idx) * kHead;
+        out_ptr[tid] = pa_from_float<scalar_t>(0.f);
+        return;
+    }
+
     __shared__ float shared_weights[kMaxPart > 0 ? kMaxPart : 1];
 
     // ============ Warp 0: load + max/sum + write weights to LDS ============
@@ -483,6 +503,15 @@ void pa_fp8_reduce_kernel_v3(
                                    : active_parts;
     const int ns_mtp_idx     = seq_idx * MTP + mtp;
 
+    if (num_partitions <= 0)
+    {
+        scalar_t* out_ptr = out
+            + static_cast<int64_t>(ns_mtp_idx) * num_heads * kHead
+            + static_cast<int64_t>(head_idx) * kHead;
+        out_ptr[tid] = pa_from_float<scalar_t>(0.f);
+        return;
+    }
+
     const int64_t base =
           static_cast<int64_t>(ns_mtp_idx) * num_heads * max_num_partitions
         + static_cast<int64_t>(head_idx) * max_num_partitions;
@@ -558,11 +587,10 @@ void pa_fp8_reduce_kernel_v3(
     const scalar_t* logits_ptr = tmp_out + logits_base;
 
     // Fully-unrolled load + FMA pipeline (preserves the 2-stage prefetch
-    // schedule that hides global_load latency on long contexts).  Dead lanes
-    // (`p_idx >= num_partitions`) skip their FMA via select; the load itself
-    // is allowed to issue — at short ctx the bandwidth cost is negligible
-    // (≤ 64 partitions × 1 lane per partition) and keeping the unroll matters
-    // far more at the long-ctx end where every cycle counts.
+    // schedule that hides global_load latency on long contexts).  FMA is
+    // still masked by `num_partitions`; loads are additionally bounded by
+    // `max_num_partitions` so bucketed templates (e.g. NumPart=32 with
+    // max_num_partitions=20) cannot read past the allocated workspace.
     float acc = 0.f;
     #pragma unroll
     for (int p0 = 0; p0 < NumPart; p0 += kBatch)
@@ -570,7 +598,12 @@ void pa_fp8_reduce_kernel_v3(
         float v_batch[kBatch];
         #pragma unroll
         for (int k = 0; k < kBatch; k++)
-            v_batch[k] = pa_to_float<scalar_t>(logits_ptr[(p0 + k) * kHead]);
+        {
+            const int p_idx = p0 + k;
+            v_batch[k] = (p_idx < max_num_partitions)
+                ? pa_to_float<scalar_t>(logits_ptr[p_idx * kHead])
+                : 0.f;
+        }
         #pragma unroll
         for (int k = 0; k < kBatch; k++)
         {
