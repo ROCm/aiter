@@ -195,6 +195,31 @@ def check_layout_skip_conditions(
         ):
             return True
 
+    if kvcache_layout == "vec_k_col_v":
+        # Decode-aligned col-V kernels are only generated for the non-quant
+        # bf16/fp16 path (and the separate fp8bf16 PER_TOKEN_HEAD path). The
+        # in-test fp8 pertensor path has no col-V kernel, so skip it here.
+        if skip_test_if(
+            is_input_fp8,
+            "vec_k_col_v has no in-test FP8 pertensor kernel (bf16/fp16 only)",
+        ):
+            return True
+        # The ColumnMajor V is loaded as a single merged (D, TotalSeqK) view, so a
+        # V tile must stay within one physical page. Small pages let a tile cross
+        # page boundaries and read wrong data (same kernel limitation the FP8
+        # PER_TOKEN_HEAD path guards). Supported page sizes match: (64, 1024).
+        if skip_test_if(
+            page_size not in (64, 1024),
+            f"vec_k_col_v only supports page_size in (64, 1024), got {page_size}",
+        ):
+            return True
+        # K is 5D vectorized, so it shares the vectorized layout's constraints.
+        if skip_test_if(
+            page_size % k_vector_size != 0 or head_dim % k_vector_size != 0,
+            "vec_k_col_v layout requires page/head dim divisible by vector size",
+        ):
+            return True
+
     return False
 
 
@@ -1115,7 +1140,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
             assert_lse_matches_reference(lse_kernel, lse_ref)
 
 
-@pytest.mark.parametrize("kvcache_layout", ["linear", "vectorized"])
+@pytest.mark.parametrize("kvcache_layout", ["linear", "vectorized", "vec_k_col_v"])
 @pytest.mark.parametrize("table_layout", ["sglang", "vllm"])
 @pytest.mark.parametrize("input_dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("batch_size", [1, 3, 7])
@@ -3757,7 +3782,7 @@ def run_batch_prefill_sink(
 # (the bisect family that isolated the bug to total cache size, i.e. the page
 # table is read past the valid region).
 #
-# Crash shape from Tencent Hunyuan / MI-308X:
+# Crash shape (prefill paged-KV out-of-bounds page-table read):
 #   prefill (q=2042, kv=2042), 10 q-heads, 1 kv-head, head_dim=128,
 #   page_size=16, bf16, causal=True
 #
