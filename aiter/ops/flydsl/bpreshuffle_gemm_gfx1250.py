@@ -113,6 +113,9 @@ def run_preshuffle_gemm_a8_gfx1250(
     cluster_m = max(1, int(cluster_m))
     cluster_n = max(1, int(cluster_n))
 
+    accumulate_fp32 = split_k > 1
+    kernel_out_dtype = "f32" if accumulate_fp32 else out_dtype
+
     # Pipeline depth needs >= 1 K tile per buffer (per split-k chunk).
     num_k_tiles = (K // split_k) // tile_k
     nb = max(2, min(int(num_buffers), num_k_tiles))
@@ -149,16 +152,17 @@ def run_preshuffle_gemm_a8_gfx1250(
         waves_per_eu=(None if waves_per_eu <= 0 else waves_per_eu),
         cluster_m=cluster_m,
         cluster_n=cluster_n,
-        out_dtype=out_dtype,
+        out_dtype=kernel_out_dtype,
         split_k=split_k,
     )
 
-    if padded_m == M:
+    if accumulate_fp32:
+        # fp32 atomic-accumulation scratch (zeroed; narrowed into Out below).
+        out_buf = torch.zeros((padded_m, N), dtype=torch.float32, device=Out.device)
+    elif padded_m == M:
         out_buf = Out.contiguous()
     else:
         out_buf = torch.empty((padded_m, N), dtype=Out.dtype, device=Out.device)
-    if split_k > 1:
-        out_buf.zero_()  # split-k accumulates partials via atomic add
 
     stream = _fx.Stream(torch.cuda.current_stream(device=a_dev.device))
     _run_compiled(

@@ -133,12 +133,20 @@ def test_split_k(split_k, monkeypatch):
     torch.manual_seed(0)
     M, N, K = 256, 256, 1024
     aq, bq, a_scale, b_scale = _quant(M, N, K)
+    bq_sh = shuffle_weight(bq, layout=(16, 16))
     ref = _ref(aq, bq, a_scale, b_scale, torch.bfloat16)
-    out = aiter.gemm_a8w8_bpreshuffle(
-        aq, shuffle_weight(bq, layout=(16, 16)), a_scale, b_scale, dtype=torch.bfloat16
-    )
+    out = aiter.gemm_a8w8_bpreshuffle(aq, bq_sh, a_scale, b_scale, dtype=torch.bfloat16)
     _, cos = _metrics(out, ref)
     assert cos > 0.99, f"cosine={cos} too low (split_k={split_k})"
+
+    # split-k must accumulate in fp32
+    _inject_tuned_config(monkeypatch, _kernel_name(128, 128, 128, 2, split_k=1))
+    out_sk1 = aiter.gemm_a8w8_bpreshuffle(
+        aq, bq_sh, a_scale, b_scale, dtype=torch.bfloat16
+    )
+    rel, cos = _metrics(out, out_sk1)
+    assert rel < 1e-3, f"split_k={split_k} drifts from sk1 (rel L1={rel})"
+    assert cos > 0.9999, f"split_k={split_k} drifts from sk1 (cos={cos})"
 
 
 def test_cluster(monkeypatch):
