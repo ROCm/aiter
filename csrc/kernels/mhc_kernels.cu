@@ -10,6 +10,7 @@
 #include "rocprim/rocprim.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
+#include <type_traits>
 
 
 namespace aiter {
@@ -34,6 +35,28 @@ namespace aiter {
         return val;
     }
 
+    template <typename DTYPE_I>
+    __device__ inline float mhc_to_float(DTYPE_I value) {
+        if constexpr (std::is_same_v<DTYPE_I, opus::bf16_t>) {
+            return opus::bf16_to_fp32(value);
+        } else if constexpr (std::is_same_v<DTYPE_I, opus::fp16_t>) {
+            return opus::fp16_to_fp32(value);
+        } else {
+            return static_cast<float>(value);
+        }
+    }
+
+    template <typename DTYPE_I>
+    __device__ inline DTYPE_I mhc_from_float(float value) {
+        if constexpr (std::is_same_v<DTYPE_I, opus::bf16_t>) {
+            return opus::fp32_to_bf16(value);
+        } else if constexpr (std::is_same_v<DTYPE_I, opus::fp16_t>) {
+            return opus::fp32_to_fp16(value);
+        } else {
+            return static_cast<DTYPE_I>(value);
+        }
+    }
+
     template <typename DTYPE_I, int block_size, int tile_m, int tile_n, int tile_k>
     __global__ __launch_bounds__(block_size, 2)
     void mhc_pre_gemm_sqrsum_kernel(
@@ -47,7 +70,17 @@ namespace aiter {
         int x_stride,
         int fn_stride,
         int out_stride,
-        int split_k = 1
+        int split_k,
+        DTYPE_I* post_x,
+        DTYPE_I* post_residual,
+        float* post_layer_mix,
+        float* comb_res_mix,
+        DTYPE_I* residual_out,
+        int hidden_size,
+        int post_x_stride,
+        int post_residual_stride,
+        int residual_out_stride,
+        bool do_post
     )
     {
         using opus::operator""_I;
@@ -57,6 +90,9 @@ namespace aiter {
         static constexpr int mfma_n = 16;
         static constexpr int mfma_k = 4;
         __shared__ float s_fn[tile_n * tile_k * 2];
+        __shared__ DTYPE_I s_a[tile_m * tile_k];
+        __shared__ float s_post_mix[tile_m * 4];
+        __shared__ float s_comb_mix[tile_m * 16];
         static_assert(tile_k % warp_size == 0, "tile_k must be divisible by warp_size");
         static_assert(tile_n % warp_per_block == 0, "tile_n must be divisible by (block_size / warp_size)");
         static_assert(tile_k % (mfma_k * 8) == 0, "tile_k must be divisible by (mfma_k * 8)");
@@ -154,10 +190,117 @@ namespace aiter {
         static constexpr int fn_lds_load_waitcnt =
             ((tile_n / warp_per_block) * (tile_k / fn_vec_size) + warp_size - 1) / warp_size;
         halfxtile v_a[2];
-        v_a[0] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I), 0, true, interleave_size>(g_a, ga_offset);
+        auto load_a_tile = [&](int k_tile) {
+            int offset = ga_offset + k_tile * tile_k;
+            if (!do_post) {
+                return load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I), 0, true, interleave_size>(g_a, offset);
+            }
+            static constexpr int stage_vec = 16;
+            using stage_vec_t = opus::vector_t<DTYPE_I, stage_vec>;
+            DTYPE_I* s_a_tile = s_a;
+            for (int linear = threadIdx.x * stage_vec; linear < tile_m * tile_k;
+                 linear += block_size * stage_vec) {
+                const int row_local = linear / tile_k;
+                const int k_local = linear - row_local * tile_k;
+                const int k_flat = k_split_offset + k_tile * tile_k + k_local;
+                stage_vec_t out_vec;
+                #pragma unroll
+                for (int elem = 0; elem < stage_vec; elem++) {
+                    out_vec[elem] = mhc_from_float<DTYPE_I>(0.0f);
+                }
+                if (row_local < m_oob && k_flat + stage_vec <= hc_hidden_size) {
+                    const int row = idx + row_local;
+                    const int stream_idx = k_flat / hidden_size;
+                    const int hidden_base = k_flat - stream_idx * hidden_size;
+                    if (stream_idx < 4 && hidden_base + stage_vec <= hidden_size) {
+                        const float post = s_post_mix[row_local * 4 + stream_idx];
+                        const float comb0 = s_comb_mix[row_local * 16 + 0 * 4 + stream_idx];
+                        const float comb1 = s_comb_mix[row_local * 16 + 1 * 4 + stream_idx];
+                        const float comb2 = s_comb_mix[row_local * 16 + 2 * 4 + stream_idx];
+                        const float comb3 = s_comb_mix[row_local * 16 + 3 * 4 + stream_idx];
+                        stage_vec_t x_vec = *reinterpret_cast<stage_vec_t*>(
+                            post_x + row * post_x_stride + hidden_base);
+                        stage_vec_t r0_vec = *reinterpret_cast<stage_vec_t*>(
+                            post_residual + row * post_residual_stride +
+                            0 * hidden_size + hidden_base);
+                        stage_vec_t r1_vec = *reinterpret_cast<stage_vec_t*>(
+                            post_residual + row * post_residual_stride +
+                            1 * hidden_size + hidden_base);
+                        stage_vec_t r2_vec = *reinterpret_cast<stage_vec_t*>(
+                            post_residual + row * post_residual_stride +
+                            2 * hidden_size + hidden_base);
+                        stage_vec_t r3_vec = *reinterpret_cast<stage_vec_t*>(
+                            post_residual + row * post_residual_stride +
+                            3 * hidden_size + hidden_base);
+                        #pragma unroll
+                        for (int elem = 0; elem < stage_vec; elem++) {
+                            float value = post * mhc_to_float(x_vec[elem]);
+                            value += comb0 * mhc_to_float(r0_vec[elem]);
+                            value += comb1 * mhc_to_float(r1_vec[elem]);
+                            value += comb2 * mhc_to_float(r2_vec[elem]);
+                            value += comb3 * mhc_to_float(r3_vec[elem]);
+                            out_vec[elem] = mhc_from_float<DTYPE_I>(value);
+                        }
+                        if (n_idx == 0) {
+                            *reinterpret_cast<stage_vec_t*>(
+                                residual_out + row * residual_out_stride +
+                                stream_idx * hidden_size + hidden_base) = out_vec;
+                        }
+                    }
+                }
+                *reinterpret_cast<stage_vec_t*>(s_a_tile + linear) = out_vec;
+            }
+            __syncthreads();
+            halfxtile result;
+            static constexpr int chunk_size = x_vec_size;
+            static constexpr int interleave_elements = interleave_size * chunk_size;
+            static constexpr int chunk_count = vec_tile / chunk_size;
+            #pragma unroll
+            for (int chunk_idx = 0; chunk_idx < chunk_count; chunk_idx++) {
+                const int row_local = warp_id * mfma_m + lane_id % mfma_m;
+                const int k_base = lane_id / mfma_m * 8 +
+                                   chunk_idx * interleave_elements;
+                using chunk_vec_t = opus::vector_t<DTYPE_I, chunk_size>;
+                chunk_vec_t a_vec = *reinterpret_cast<chunk_vec_t*>(
+                    s_a_tile + row_local * tile_k + k_base);
+                #pragma unroll
+                for (int elem_idx = 0; elem_idx < chunk_size; elem_idx++) {
+                    result[chunk_idx * chunk_size + elem_idx] = a_vec[elem_idx];
+                }
+            }
+            __syncthreads();
+            return result;
+        };
+
+        if (do_post) {
+            for (int linear = threadIdx.x; linear < tile_m * 20; linear += block_size) {
+                const int row_local = linear / 20;
+                const int coeff_idx = linear - row_local * 20;
+                const int row = idx + row_local;
+                if (row_local < m_oob) {
+                    if (coeff_idx < 4) {
+                        s_post_mix[row_local * 4 + coeff_idx] =
+                            post_layer_mix[row * 4 + coeff_idx];
+                    } else {
+                        const int comb_idx = coeff_idx - 4;
+                        s_comb_mix[row_local * 16 + comb_idx] =
+                            comb_res_mix[row * 16 + comb_idx];
+                    }
+                } else {
+                    if (coeff_idx < 4) {
+                        s_post_mix[row_local * 4 + coeff_idx] = 0.0f;
+                    } else {
+                        s_comb_mix[row_local * 16 + coeff_idx - 4] = 0.0f;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        v_a[0] = load_a_tile(0);
         __builtin_amdgcn_sched_barrier(0);
         lds_load_fn_tile(0);
-        v_a[1] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I), 0, true, interleave_size>(g_a, ga_offset + tile_k);
+        v_a[1] = load_a_tile(1);
         lds_load_fn_tile(1);
         
         fp32x4_t v_cf[repeat_n];
@@ -219,9 +362,7 @@ namespace aiter {
                     sqrsum_part += v_af[i] * v_af[i];                                             \
             }                                                                                     \
             if (DO_PREFETCH) {                                                                    \
-                v_a[BUF] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I),             \
-                                                0, true, interleave_size>(                        \
-                    g_a, ga_offset + ((k) + 2) * tile_k);                                         \
+                v_a[BUF] = load_a_tile((k) + 2);                                                   \
                 opus::s_waitcnt_vmcnt(opus::number<2 * x_load_waitcnt + fn_lds_load_waitcnt>{});  \
             } else {                                                                              \
                 opus::s_waitcnt_vmcnt(0_I);                                                       \
@@ -291,9 +432,10 @@ namespace aiter {
 #define MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(block_size, tile_n, tile_k) \
     AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_pre_gemm_sqrsum", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
-        const int tile_m = m_per_block; \
+        const int tile_m = (block_size / WARP_SIZE) * 16; \
+        int m_blocks_local = (m + tile_m - 1) / tile_m; \
         int n_blocks = (hc_mult3 + tile_n - 1) / tile_n; \
-        dim3 grid(m_blocks, n_blocks, split_k); \
+        dim3 grid(m_blocks_local, n_blocks, split_k); \
         TORCH_CHECK(hc_hidden_size % (tile_k * split_k) == 0, "hc_hidden_size must be divisible by tile_k * split_k"); \
         TORCH_CHECK(hc_hidden_size >= (tile_k * split_k) * 2, "hc_hidden_size must >= tile_k * split_k * 2 stages prefetch"); \
         mhc_pre_gemm_sqrsum_kernel<DTYPE_I, block_size, tile_m, tile_n, tile_k><<<grid, block, 0, stream>>>( \
@@ -307,12 +449,26 @@ namespace aiter {
             x_stride, \
             fn_stride, \
             out_stride, \
-            split_k \
+            split_k, \
+            reinterpret_cast<DTYPE_I*>(post_x_ptr), \
+            reinterpret_cast<DTYPE_I*>(post_residual_ptr), \
+            post_layer_mix_ptr, \
+            comb_res_mix_ptr, \
+            reinterpret_cast<DTYPE_I*>(residual_out_ptr), \
+            hidden_size, \
+            post_x_stride, \
+            post_residual_stride, \
+            residual_out_stride, \
+            do_post \
         ); \
     });
 
 #define MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k) \
-    if (tile_k == 64) { \
+    if (do_post && tile_k == 64) { \
+        MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 32, 64); \
+    } else if (do_post && tile_k == 128) { \
+        MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 32, 128); \
+    } else if (tile_k == 64) { \
         if (cu_num * 2 > m_blocks * split_k || hc_mult3 <= 16) { \
             MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 64); \
         } else { \
@@ -354,7 +510,69 @@ namespace aiter {
         const hipStream_t stream = at::hip::getCurrentHIPStream();
 
         dim3 block(block_size);
+        void* post_x_ptr = nullptr;
+        void* post_residual_ptr = nullptr;
+        float* post_layer_mix_ptr = nullptr;
+        float* comb_res_mix_ptr = nullptr;
+        void* residual_out_ptr = nullptr;
+        int hidden_size = 0;
+        int post_x_stride = 0;
+        int post_residual_stride = 0;
+        int residual_out_stride = 0;
+        bool do_post = false;
         
+        MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
+    }
+
+    void mhc_post_pre_mfma_gemm_sqrsum(
+        torch::Tensor& residual_out,    // (m, hc_mult, hidden_size)
+        torch::Tensor& out,             // (split_k, m, hc_mult3)
+        torch::Tensor& sqrsum,          // (split_k, m)
+        torch::Tensor& x,               // (m, hidden_size)
+        torch::Tensor& residual,        // (m, hc_mult, hidden_size)
+        torch::Tensor& post_layer_mix,  // (m, hc_mult)
+        torch::Tensor& comb_res_mix,    // (m, hc_mult, hc_mult)
+        torch::Tensor& fn,              // (hc_mult3, hc_mult * hidden_size)
+        int tile_k = 128
+    )
+    {
+        TORCH_CHECK(out.size(0) == sqrsum.size(0), "out and sqrsum must have the same number of split_k or m");
+        int m = residual.size(0);
+        int hc_mult = residual.size(1);
+        int hidden_size = residual.size(2);
+        int hc_mult3 = fn.size(0);
+        int hc_hidden_size = fn.size(1);
+        int x_stride = hc_hidden_size;
+        int fn_stride = fn.stride(0);
+        int out_stride = out.dim() > 2 ? out.stride(1) : out.stride(0);
+        int split_k = out.dim() > 2 ? out.size(0) : 1;
+        const int block_size = 256;
+        const int warp_size = 64;
+        const int m_per_block = block_size / warp_size * 16;
+        int m_blocks = (m + m_per_block - 1) / m_per_block;
+        const int cu_num = get_num_cu_func();
+
+        TORCH_CHECK(hc_mult == 4, "hc_mult only supports 4");
+        TORCH_CHECK(hc_hidden_size == hc_mult * hidden_size,
+                    "fn second dimension must equal hc_mult * hidden_size");
+        TORCH_CHECK(residual_out.size(0) == m && residual_out.size(1) == hc_mult &&
+                        residual_out.size(2) == hidden_size,
+                    "residual_out shape mismatch");
+
+        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(residual));
+        const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+        dim3 block(block_size);
+        void* post_x_ptr = x.data_ptr();
+        void* post_residual_ptr = residual.data_ptr();
+        float* post_layer_mix_ptr = reinterpret_cast<float*>(post_layer_mix.data_ptr());
+        float* comb_res_mix_ptr = reinterpret_cast<float*>(comb_res_mix.data_ptr());
+        void* residual_out_ptr = residual_out.data_ptr();
+        int post_x_stride = x.stride(0);
+        int post_residual_stride = residual.stride(0);
+        int residual_out_stride = residual_out.stride(0);
+        bool do_post = true;
+
         MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
     }
 
@@ -1012,6 +1230,368 @@ namespace aiter {
         compute_store_tile(i);
     }
 
+    // Fused post+pre first stage: mhc_post vector pipeline + pre-GEMM partial accumulation.
+    // Keeps async LDS x/residual loads and post mix from mhc_post_kernel; accumulates
+    // gemm_out/sqrsum partials per (row, split_k, k_block). k_blocks merge via atomics.
+    template <typename DTYPE_I,
+              int block_size,
+              int hc_mult,
+              int residual_block,
+              int max_hc_mult3,
+              int tile_n_gemm,
+              bool store_nt>
+    __global__ __launch_bounds__(block_size, 2)
+    void mhc_post_pre_fused_kernel(
+        DTYPE_I* residual_out,
+        float* gemm_out_mul,
+        float* gemm_out_sqrsum,
+        DTYPE_I* x,
+        DTYPE_I* residual,
+        float* post_layer_mix,
+        float* comb_res_mix,
+        float* fn,
+        int m,
+        int hidden_size,
+        int hc_mult3,
+        int hc_hidden_size,
+        int x_stride,
+        int residual_stride,
+        int residual_out_stride,
+        int fn_stride,
+        int gemm_out_mul_stride,
+        int split_k,
+        int sub_hidden_size)
+    {
+        static constexpr int store_policy = store_nt ? GROUP_NT : RT;
+        using opus::operator""_I;
+        static constexpr int warp_size = opus::get_warp_size();
+        static constexpr int hc_mult2 = hc_mult * hc_mult;
+        static_assert(block_size == hc_mult * warp_size,
+                      "block_size must be equal to hc_mult * warp_size");
+        static_assert(max_hc_mult3 <= 32, "max_hc_mult3 must be <= 32");
+        static_assert(tile_n_gemm <= max_hc_mult3, "tile_n_gemm must be <= max_hc_mult3");
+
+        __shared__ DTYPE_I s_x[2 * residual_block];
+        __shared__ DTYPE_I s_residual[2 * hc_mult * residual_block];
+
+        const int64_t idx = blockIdx.x;
+        const int split_idx = blockIdx.z;
+        const int k_offset = blockIdx.y * sub_hidden_size;
+        const int k_per_split = hc_hidden_size / split_k;
+        const int split_begin = split_idx * k_per_split;
+        const int split_end = split_begin + k_per_split;
+
+        const int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x / warp_size);
+        const int lane_id = threadIdx.x % warp_size;
+
+        DTYPE_I* x_ptr = x + idx * x_stride + k_offset;
+        auto g_x = opus::make_gmem<DTYPE_I>(x_ptr, (hidden_size - k_offset) * sizeof(DTYPE_I));
+        DTYPE_I* residual_ptr = residual + idx * residual_stride + k_offset;
+        auto g_residual = opus::make_gmem<DTYPE_I>(
+            residual_ptr, (hc_mult * hidden_size - k_offset) * sizeof(DTYPE_I));
+        DTYPE_I* residual_out_ptr =
+            residual_out + idx * residual_out_stride + warp_id * hidden_size + k_offset;
+        auto g_residual_out = opus::make_gmem<DTYPE_I>(
+            residual_out_ptr, (hidden_size - k_offset) * sizeof(DTYPE_I));
+
+        float post_mix_v = post_layer_mix[idx * hc_mult + warp_id];
+        using float_hc_mult = opus::vector_t<float, hc_mult>;
+        float_hc_mult comb_mix;
+        for (int h = 0; h < hc_mult; h++) {
+            comb_mix[h] = comb_res_mix[idx * hc_mult2 + h * hc_mult + warp_id];
+        }
+
+#if defined(__gfx942__)
+        static constexpr int x_async_load_vec = 4 / sizeof(DTYPE_I);
+        static constexpr int r_async_load_vec = 4 / sizeof(DTYPE_I);
+        static constexpr int ds_read_bytes = 8;
+#else
+        static constexpr int x_async_load_vec =
+            16 / sizeof(DTYPE_I) * warp_size < residual_block ? 16 / sizeof(DTYPE_I)
+                                                            : 4 / sizeof(DTYPE_I);
+        static constexpr int r_async_load_vec =
+            16 / sizeof(DTYPE_I) * warp_size < residual_block ? 16 / sizeof(DTYPE_I)
+                                                            : 4 / sizeof(DTYPE_I);
+        static constexpr int ds_read_bytes = 16;
+#endif
+        static constexpr int x_async_load_threads =
+            block_size * x_async_load_vec < residual_block ? block_size
+                                                           : residual_block / x_async_load_vec;
+        static constexpr int x_load_waitcnt =
+            residual_block / (x_async_load_threads * x_async_load_vec);
+        static constexpr int residual_load_waitcnt =
+            residual_block / (warp_size * r_async_load_vec);
+        constexpr int ds_read_vec =
+            (residual_block / warp_size) < (ds_read_bytes / sizeof(DTYPE_I))
+                ? (residual_block / warp_size)
+                : (ds_read_bytes / sizeof(DTYPE_I));
+        static_assert(residual_block % (warp_size * ds_read_vec) == 0,
+                      "residual_block must be divisible by warp_size * ds_read_vec");
+
+        auto lds_load_x_tile = [&](int k_tile) {
+            if (threadIdx.x < x_async_load_threads) {
+                DTYPE_I* s_x_wr_ptr = s_x + (k_tile & 1) * residual_block;
+                const int offset = k_tile * residual_block;
+                for (int i = 0; i < x_load_waitcnt; i++) {
+                    const int offset_in_block =
+                        i * x_async_load_threads * x_async_load_vec +
+                        threadIdx.x * x_async_load_vec;
+                    async_load<x_async_load_vec>(
+                        g_x,
+                        s_x_wr_ptr + offset_in_block,
+                        offset + offset_in_block,
+                        0,
+                        opus::number<GROUP_NT>{});
+                }
+            }
+        };
+
+        auto lds_load_residual_tile = [&](int k_tile) {
+            DTYPE_I* s_residual_wr_ptr =
+                s_residual + (k_tile & 1) * (hc_mult * residual_block);
+            const int offset = warp_id * hidden_size + k_tile * residual_block;
+            for (int i = 0; i < residual_load_waitcnt; i++) {
+                const int offset_in_block =
+                    i * warp_size * r_async_load_vec + lane_id * r_async_load_vec;
+                async_load<r_async_load_vec>(
+                    g_residual,
+                    s_residual_wr_ptr + warp_id * residual_block + offset_in_block,
+                    offset + offset_in_block,
+                    0,
+                    opus::number<GROUP_NT>{});
+            }
+        };
+
+        // Per-thread partials (lanes own disjoint k); wave-reduce before block merge.
+        float thread_gemm_acc[max_hc_mult3];
+        float thread_sqrsum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < max_hc_mult3; i++) {
+            thread_gemm_acc[i] = 0.0f;
+        }
+
+        auto gemm_acc_scalar = [&](float value, int k_flat) {
+            if (k_flat < split_begin || k_flat >= split_end) {
+                return;
+            }
+            thread_sqrsum += value * value;
+            for (int n_base = 0; n_base < hc_mult3; n_base += tile_n_gemm) {
+                #pragma unroll
+                for (int ni = 0; ni < tile_n_gemm; ni++) {
+                    const int n = n_base + ni;
+                    if (n < hc_mult3) {
+                        thread_gemm_acc[n] += value * fn[n * fn_stride + k_flat];
+                    }
+                }
+            }
+        };
+
+        const int loop = sub_hidden_size / residual_block;
+        auto compute_store_tile = [&](int i) {
+            DTYPE_I* s_x_rd_ptr = s_x + (i & 1) * residual_block;
+            DTYPE_I* s_residual_rd_ptr = s_residual + (i & 1) * (hc_mult * residual_block);
+            for (int j = 0; j < residual_block / (warp_size * ds_read_vec); j++) {
+                opus::vector_t<float, ds_read_vec> res;
+                using DTYPE_I_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
+                const int s_offset = j * warp_size * ds_read_vec + lane_id * ds_read_vec;
+                DTYPE_I_vec x_vec = *(reinterpret_cast<DTYPE_I_vec*>(s_x_rd_ptr + s_offset));
+                DTYPE_I_vec residual_vec[hc_mult];
+                for (int h = 0; h < hc_mult; h++) {
+                    residual_vec[h] = *(
+                        reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset +
+                                                       h * residual_block));
+                }
+                opus::s_waitcnt_lgkmcnt(opus::number<hc_mult>{});
+                #pragma unroll
+                for (int k = 0; k < ds_read_vec; k++) {
+                    res[k] = static_cast<float>(x_vec[k]) * post_mix_v;
+                }
+                opus::static_for<hc_mult>([&](auto h) {
+                    #pragma unroll
+                    for (int k = 0; k < ds_read_vec; k++) {
+                        res[k] += static_cast<float>(residual_vec[h.value][k]) *
+                                  comb_mix[h.value];
+                    }
+                });
+
+                store_vector<DTYPE_I, float, ds_read_vec, store_policy>(
+                    g_residual_out,
+                    res,
+                    i * residual_block + s_offset);
+
+                #pragma unroll
+                for (int k = 0; k < ds_read_vec; k++) {
+                    const int k_flat =
+                        warp_id * hidden_size + k_offset + i * residual_block + s_offset + k;
+                    gemm_acc_scalar(res[k], k_flat);
+                }
+            }
+        };
+
+        lds_load_x_tile(0);
+        lds_load_residual_tile(0);
+        for (int i = 0; i < loop - 1; i++) {
+            lds_load_x_tile(i + 1);
+            lds_load_residual_tile(i + 1);
+            __builtin_amdgcn_sched_barrier(0);
+            if (threadIdx.x < x_async_load_threads) {
+                opus::s_waitcnt_vmcnt(opus::number<x_load_waitcnt + residual_load_waitcnt>{});
+            } else {
+                opus::s_waitcnt_vmcnt(opus::number<residual_load_waitcnt>{});
+            }
+            __builtin_amdgcn_s_barrier();
+            compute_store_tile(i);
+            __builtin_amdgcn_s_barrier();
+        }
+        const int i = loop - 1;
+        opus::s_waitcnt_vmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
+        compute_store_tile(i);
+
+        __shared__ float s_gemm_acc[max_hc_mult3];
+        __shared__ float s_sqrsum_acc;
+        if (threadIdx.x < max_hc_mult3) {
+            s_gemm_acc[threadIdx.x] = 0.0f;
+        }
+        if (threadIdx.x == 0) {
+            s_sqrsum_acc = 0.0f;
+        }
+        __syncthreads();
+
+        for (int n = 0; n < hc_mult3; n++) {
+            atomicAdd(s_gemm_acc + n, thread_gemm_acc[n]);
+        }
+        atomicAdd(&s_sqrsum_acc, thread_sqrsum);
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            atomicAdd(gemm_out_sqrsum + static_cast<int64_t>(split_idx) * m + idx, s_sqrsum_acc);
+        }
+        if (threadIdx.x < hc_mult3) {
+            atomicAdd(gemm_out_mul + (static_cast<int64_t>(split_idx) * m + idx) *
+                                          gemm_out_mul_stride + threadIdx.x,
+                      s_gemm_acc[threadIdx.x]);
+        }
+    }
+
+#define MHC_POST_PRE_FUSED_KERNEL_IMPL_(hidden_size, residual_block, store_nt, split_k_val) \
+    AITER_CHECK(hidden_size % residual_block == 0,                           \
+                "hidden_size must be divisible by residual_block");          \
+    AITER_CHECK(hidden_size >= residual_block * 2,                             \
+                "hidden_size must be >= residual_block * 2 stages prefetch"); \
+    const int block_size_fused = 4 * 64;                                       \
+    int num_tg_cu_fused = 32 / (block_size_fused / WARP_SIZE);               \
+    int max_k_blocks_fused =                                                   \
+        min(cu_num * num_tg_cu_fused / m, hidden_size / (residual_block));   \
+    if (max_k_blocks_fused < 1) {                                              \
+        max_k_blocks_fused = 1;                                                \
+    }                                                                          \
+    int k_blocks_fused = max_k_blocks_fused;                                   \
+    for (; k_blocks_fused > 1; k_blocks_fused--) {                             \
+        if (hidden_size % (k_blocks_fused * residual_block) == 0 &&          \
+            hidden_size / k_blocks_fused >= residual_block) {                  \
+            break;                                                             \
+        }                                                                      \
+    }                                                                          \
+    const int sub_hidden_size_fused = hidden_size / k_blocks_fused;            \
+    dim3 grid_fused(m, k_blocks_fused, split_k_val);                           \
+    dim3 block_fused(block_size_fused);                                        \
+    AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_pre_fused", [&] { \
+        using DTYPE_I = typename t2opus<scalar_t>::type;                     \
+        mhc_post_pre_fused_kernel<DTYPE_I,                                     \
+                                  block_size_fused,                          \
+                                  4,                                         \
+                                  residual_block,                            \
+                                  32,                                        \
+                                  8,                                         \
+                                  store_nt>                                  \
+            <<<grid_fused, block_fused, 0, stream>>>(                        \
+                reinterpret_cast<DTYPE_I*>(residual_out.data_ptr()),         \
+                reinterpret_cast<float*>(gemm_out_mul.data_ptr()),             \
+                reinterpret_cast<float*>(gemm_out_sqrsum.data_ptr()),        \
+                reinterpret_cast<DTYPE_I*>(x.data_ptr()),                    \
+                reinterpret_cast<DTYPE_I*>(residual.data_ptr()),             \
+                reinterpret_cast<float*>(post_layer_mix.data_ptr()),         \
+                reinterpret_cast<float*>(comb_res_mix.data_ptr()),           \
+                reinterpret_cast<float*>(fn.data_ptr()),                   \
+                m,                                                           \
+                hidden_size,                                                   \
+                hc_mult3,                                                      \
+                hc_hidden_size,                                                \
+                x_stride,                                                      \
+                residual_stride,                                               \
+                residual_out_stride,                                           \
+                fn_stride,                                                     \
+                gemm_out_mul_stride,                                           \
+                split_k_val,                                                   \
+                sub_hidden_size_fused);                                        \
+    });
+
+#define MHC_POST_PRE_FUSED_KERNEL_IMPL(hidden_size, residual_block, split_k_val) \
+    if (m > 8 * cu_num) {                                                        \
+        MHC_POST_PRE_FUSED_KERNEL_IMPL_(hidden_size, residual_block, true, split_k_val); \
+    } else {                                                                     \
+        MHC_POST_PRE_FUSED_KERNEL_IMPL_(hidden_size, residual_block, false, split_k_val); \
+    }
+
+#define MHC_POST_PRE_FUSED_KERNEL_DISPATCH(hidden_size, split_k_val)             \
+    if (arch_id != "gfx942" && hidden_size % 1024 == 0) {                      \
+        MHC_POST_PRE_FUSED_KERNEL_IMPL(hidden_size, 1024, split_k_val);        \
+    } else if (hidden_size % 512 == 0) {                                       \
+        MHC_POST_PRE_FUSED_KERNEL_IMPL(hidden_size, 512, split_k_val);          \
+    } else if (hidden_size % 256 == 0) {                                       \
+        MHC_POST_PRE_FUSED_KERNEL_IMPL(hidden_size, 256, split_k_val);         \
+    } else {                                                                   \
+        AITER_CHECK(false, "hidden_size must be divisible by 256");            \
+    }
+
+    void mhc_post_pre_fused_gemm_sqrsum(
+        torch::Tensor& residual_out,
+        torch::Tensor& gemm_out_mul,
+        torch::Tensor& gemm_out_sqrsum,
+        torch::Tensor& x,
+        torch::Tensor& residual,
+        torch::Tensor& post_layer_mix,
+        torch::Tensor& comb_res_mix,
+        torch::Tensor& fn)
+    {
+        constexpr int hc_mult_const = 4;
+        const int m = residual.size(0);
+        const int hc_mult = residual.size(1);
+        const int hidden_size = residual.size(2);
+        const int hc_mult3 = fn.size(0);
+        const int hc_hidden_size = fn.size(1);
+        const int split_k = gemm_out_mul.dim() > 2 ? gemm_out_mul.size(0) : 1;
+        const int x_stride = x.stride(0);
+        const int residual_stride = residual.stride(0);
+        const int residual_out_stride = residual_out.stride(0);
+        const int fn_stride = fn.stride(0);
+        const int gemm_out_mul_stride =
+            gemm_out_mul.dim() > 2 ? gemm_out_mul.stride(1) : gemm_out_mul.stride(0);
+
+        TORCH_CHECK(hc_mult == hc_mult_const, "hc_mult only supports 4");
+        TORCH_CHECK(hc_mult3 <= 32, "hc_mult3 must be <= 32");
+        TORCH_CHECK(hc_hidden_size == hc_mult * hidden_size,
+                    "fn second dimension must equal hc_mult * hidden_size");
+        TORCH_CHECK(hc_hidden_size % split_k == 0,
+                    "hc_hidden_size must be divisible by split_k");
+        TORCH_CHECK(residual_out.size(0) == m && residual_out.size(1) == hc_mult &&
+                        residual_out.size(2) == hidden_size,
+                    "residual_out shape mismatch");
+        TORCH_CHECK(gemm_out_sqrsum.size(0) == split_k && gemm_out_sqrsum.size(1) == m,
+                    "gemm_out_sqrsum shape mismatch");
+
+        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(residual));
+        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        const int cu_num = get_num_cu_func();
+        const std::string arch_id = get_gpu_arch();
+
+        gemm_out_mul.zero_();
+        gemm_out_sqrsum.zero_();
+
+        MHC_POST_PRE_FUSED_KERNEL_DISPATCH(hidden_size, split_k);
+    }
+
 
 #define MHC_POST_KERNEL_IMPL_(kernel_name, hidden_size, residual_block, store_nt) \
     AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
@@ -1083,6 +1663,185 @@ namespace aiter {
         const std::string arch_id = get_gpu_arch();
         
         MHC_POST_KERNEL_DISPATCH(hidden_size);
+    }
+
+    template <typename DTYPE_I, int block_size, int hc_mult, int tile_n>
+    __global__ __launch_bounds__(block_size, 2)
+    void mhc_post_pre_gemm_sqrsum_kernel(
+        DTYPE_I* residual_out,
+        float* gemm_out_mul,
+        float* gemm_out_sqrsum,
+        DTYPE_I* x,
+        DTYPE_I* residual,
+        float* post_layer_mix,
+        float* comb_res_mix,
+        float* fn,
+        int m,
+        int hidden_size,
+        int hc_mult3,
+        int hc_hidden_size,
+        int x_stride,
+        int residual_stride,
+        int residual_out_stride,
+        int fn_stride,
+        int gemm_out_mul_stride,
+        int split_k)
+    {
+        const int row_idx = blockIdx.x;
+        const int out_tile_idx = blockIdx.y;
+        const int split_idx = blockIdx.z;
+        const int tid = threadIdx.x;
+        const int out_begin = out_tile_idx * tile_n;
+        const int k_per_split = hc_hidden_size / split_k;
+        const int k_begin = split_idx * k_per_split;
+        const int k_end = k_begin + k_per_split;
+        auto sum_f = [](float a, float b) { return a + b; };
+
+        float acc[tile_n];
+        #pragma unroll
+        for (int i = 0; i < tile_n; i++) {
+            acc[i] = 0.0f;
+        }
+        float sqrsum = 0.0f;
+
+        for (int k = k_begin + tid; k < k_end; k += block_size) {
+            const int stream_idx = k / hidden_size;
+            const int hidden_idx = k - stream_idx * hidden_size;
+
+            float value = post_layer_mix[row_idx * hc_mult + stream_idx] *
+                          mhc_to_float(x[row_idx * x_stride + hidden_idx]);
+            #pragma unroll
+            for (int src = 0; src < hc_mult; src++) {
+                value += comb_res_mix[(row_idx * hc_mult + src) * hc_mult + stream_idx] *
+                         mhc_to_float(residual[row_idx * residual_stride +
+                                               src * hidden_size + hidden_idx]);
+            }
+
+            if (out_tile_idx == 0) {
+                residual_out[row_idx * residual_out_stride +
+                             stream_idx * hidden_size + hidden_idx] =
+                    mhc_from_float<DTYPE_I>(value);
+                sqrsum += value * value;
+            }
+
+            #pragma unroll
+            for (int out_off = 0; out_off < tile_n; out_off++) {
+                const int out_idx = out_begin + out_off;
+                if (out_idx < hc_mult3) {
+                    acc[out_off] += value * fn[out_idx * fn_stride + k];
+                }
+            }
+        }
+
+        const bool is_reduce_lane = tid == block_size - 1;
+        if (out_tile_idx == 0) {
+            float sqrsum_total =
+                wave_reduce<float, decltype(sum_f), block_size, false>(sqrsum, sum_f);
+            if (is_reduce_lane) {
+                gemm_out_sqrsum[split_idx * m + row_idx] = sqrsum_total;
+            }
+        }
+
+        float total_acc[tile_n];
+        #pragma unroll
+        for (int out_off = 0; out_off < tile_n; out_off++) {
+            total_acc[out_off] =
+                wave_reduce<float, decltype(sum_f), block_size, false>(
+                    acc[out_off], sum_f);
+        }
+
+        if (is_reduce_lane) {
+            float* gemm_row =
+                gemm_out_mul + (static_cast<int64_t>(split_idx) * m + row_idx) *
+                                   gemm_out_mul_stride;
+            #pragma unroll
+            for (int out_off = 0; out_off < tile_n; out_off++) {
+                const int out_idx = out_begin + out_off;
+                if (out_idx >= hc_mult3) {
+                    continue;
+                }
+                float total = total_acc[out_off];
+                gemm_row[out_idx] = total;
+            }
+        }
+    }
+
+    void mhc_post_pre_gemm_sqrsum(
+        torch::Tensor& residual_out,     // (m, hc_mult, hidden_size)
+        torch::Tensor& gemm_out_mul,     // (split_k, m, hc_mult3)
+        torch::Tensor& gemm_out_sqrsum,  // (split_k, m)
+        torch::Tensor& x,                // (m, hidden_size)
+        torch::Tensor& residual,         // (m, hc_mult, hidden_size)
+        torch::Tensor& post_layer_mix,   // (m, hc_mult)
+        torch::Tensor& comb_res_mix,     // (m, hc_mult, hc_mult)
+        torch::Tensor& fn                // (hc_mult3, hc_mult * hidden_size)
+    )
+    {
+        constexpr int block_size = 64;
+        constexpr int hc_mult_const = 4;
+        constexpr int max_hc_mult3 = 32;
+
+        const int m = residual.size(0);
+        const int hc_mult = residual.size(1);
+        const int hidden_size = residual.size(2);
+        const int hc_mult3 = fn.size(0);
+        const int hc_hidden_size = fn.size(1);
+        const int split_k = gemm_out_mul.dim() > 2 ? gemm_out_mul.size(0) : 1;
+        const int x_stride = x.stride(0);
+        const int residual_stride = residual.stride(0);
+        const int residual_out_stride = residual_out.stride(0);
+        const int fn_stride = fn.stride(0);
+        const int gemm_out_mul_stride =
+            gemm_out_mul.dim() > 2 ? gemm_out_mul.stride(1) : gemm_out_mul.stride(0);
+
+        TORCH_CHECK(hc_mult == hc_mult_const, "hc_mult only supports 4");
+        TORCH_CHECK(hc_mult3 <= max_hc_mult3, "hc_mult3 must be <= 32");
+        TORCH_CHECK(hc_hidden_size == hc_mult * hidden_size,
+                    "fn second dimension must equal hc_mult * hidden_size");
+        TORCH_CHECK(hc_hidden_size % split_k == 0,
+                    "hc_hidden_size must be divisible by split_k");
+        TORCH_CHECK(residual_out.size(0) == m && residual_out.size(1) == hc_mult &&
+                        residual_out.size(2) == hidden_size,
+                    "residual_out shape mismatch");
+        TORCH_CHECK(gemm_out_sqrsum.size(0) == split_k && gemm_out_sqrsum.size(1) == m,
+                    "gemm_out_sqrsum shape mismatch");
+
+        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(residual));
+        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        dim3 block(block_size);
+
+        AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post_pre_gemm_sqrsum", [&] {
+            using DTYPE_I = typename t2opus<scalar_t>::type;
+            auto launch = [&](auto tile_n_const) {
+                constexpr int tile_n = decltype(tile_n_const)::value;
+                dim3 grid(m, (hc_mult3 + tile_n - 1) / tile_n, split_k);
+                mhc_post_pre_gemm_sqrsum_kernel<DTYPE_I, block_size, hc_mult_const, tile_n>
+                    <<<grid, block, 0, stream>>>(
+                        reinterpret_cast<DTYPE_I*>(residual_out.data_ptr()),
+                        reinterpret_cast<float*>(gemm_out_mul.data_ptr()),
+                        reinterpret_cast<float*>(gemm_out_sqrsum.data_ptr()),
+                        reinterpret_cast<DTYPE_I*>(x.data_ptr()),
+                        reinterpret_cast<DTYPE_I*>(residual.data_ptr()),
+                        reinterpret_cast<float*>(post_layer_mix.data_ptr()),
+                        reinterpret_cast<float*>(comb_res_mix.data_ptr()),
+                        reinterpret_cast<float*>(fn.data_ptr()),
+                        m,
+                        hidden_size,
+                        hc_mult3,
+                        hc_hidden_size,
+                        x_stride,
+                        residual_stride,
+                        residual_out_stride,
+                        fn_stride,
+                        gemm_out_mul_stride,
+                        split_k);
+            };
+            if (m <= 1) {
+                launch(std::integral_constant<int, 2>{});
+            } else {
+                launch(std::integral_constant<int, 8>{});
+            }
+        });
     }
 
 

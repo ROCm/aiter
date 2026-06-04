@@ -2098,7 +2098,41 @@ namespace py = pybind11;
           py::arg("x"),                         \
           py::arg("residual"),                  \
           py::arg("post_layer_mix"),            \
-          py::arg("comb_res_mix"));
+          py::arg("comb_res_mix"));             \
+    m.def("mhc_post_pre_gemm_sqrsum",           \
+          &aiter::mhc_post_pre_gemm_sqrsum,     \
+          "mhc_post_pre_gemm_sqrsum",           \
+          py::arg("residual_out"),              \
+          py::arg("gemm_out_mul"),              \
+          py::arg("gemm_out_sqrsum"),           \
+          py::arg("x"),                         \
+          py::arg("residual"),                  \
+          py::arg("post_layer_mix"),            \
+          py::arg("comb_res_mix"),              \
+          py::arg("fn"));                       \
+    m.def("mhc_post_pre_mfma_gemm_sqrsum",      \
+          &aiter::mhc_post_pre_mfma_gemm_sqrsum,\
+          "mhc_post_pre_mfma_gemm_sqrsum",      \
+          py::arg("residual_out"),              \
+          py::arg("gemm_out_mul"),              \
+          py::arg("gemm_out_sqrsum"),           \
+          py::arg("x"),                         \
+          py::arg("residual"),                  \
+          py::arg("post_layer_mix"),            \
+          py::arg("comb_res_mix"),              \
+          py::arg("fn"),                        \
+          py::arg("tile_k") = 128);            \
+    m.def("mhc_post_pre_fused_gemm_sqrsum",     \
+          &aiter::mhc_post_pre_fused_gemm_sqrsum,\
+          "mhc_post_pre_fused_gemm_sqrsum",     \
+          py::arg("residual_out"),              \
+          py::arg("gemm_out_mul"),              \
+          py::arg("gemm_out_sqrsum"),           \
+          py::arg("x"),                         \
+          py::arg("residual"),                  \
+          py::arg("post_layer_mix"),            \
+          py::arg("comb_res_mix"),              \
+          py::arg("fn"));
 #define CAUSAL_CONV1D_UPDATE_PYBIND                                            \
     m.def("causal_conv1d_update",                                              \
           &aiter::causal_conv1d_update,                                        \

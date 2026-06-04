@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import os
 
 import torch
 import functools
@@ -202,3 +203,227 @@ def mhc_post(
     post_layer_mix: Tensor,
     comb_res_mix: Tensor,
 ) -> None: ...
+
+
+@compile_ops("module_mhc")
+def mhc_post_pre_gemm_sqrsum(
+    residual_out: Tensor,
+    gemm_out_mul: Tensor,
+    gemm_out_sqrsum: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+    fn: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_mhc")
+def mhc_post_pre_mfma_gemm_sqrsum(
+    residual_out: Tensor,
+    gemm_out_mul: Tensor,
+    gemm_out_sqrsum: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+    fn: Tensor,
+    tile_k: int = 128,
+) -> None: ...
+
+
+@compile_ops("module_mhc")
+def mhc_post_pre_fused_gemm_sqrsum(
+    residual_out: Tensor,
+    gemm_out_mul: Tensor,
+    gemm_out_sqrsum: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+    fn: Tensor,
+) -> None: ...
+
+
+def mhc_post_pre_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    m = residual.size(0)
+    hc_mult = residual.size(1)
+    hidden_size = residual.size(2)
+    device = residual.device
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
+    layer_input = torch.empty(m, hidden_size, dtype=residual.dtype, device=device)
+    residual_out = torch.empty_like(residual)
+    return post_mix, comb_mix, layer_input, residual_out
+
+
+@torch_compile_guard(gen_fake=mhc_post_pre_fake)
+def mhc_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    m = residual.size(0)
+    hc_mult = residual.size(1)
+    hidden_size = residual.size(2)
+    hc_mult3 = fn.size(0)
+    assert x.shape == (m, hidden_size)
+    assert residual.shape == (m, hc_mult, hidden_size)
+    assert hc_mult == 4
+    assert hc_mult3 == hc_mult * 2 + hc_mult * hc_mult
+    assert fn.shape == (hc_mult3, hc_mult * hidden_size)
+    assert hc_scale.shape == (3,)
+    assert hc_base.shape == (hc_mult3,)
+
+    post_layer_mix = post_layer_mix.view(m, hc_mult).contiguous()
+    comb_res_mix = comb_res_mix.contiguous()
+    residual = residual.contiguous()
+    x = x.contiguous()
+    fn = fn.contiguous()
+
+    if norm_weight is not None:
+        assert norm_weight.shape == (hidden_size,)
+        if norm_weight.dtype != residual.dtype:
+            norm_weight = norm_weight.to(residual.dtype)
+        norm_weight = norm_weight.contiguous()
+
+    hc_hidden_size = hc_mult * hidden_size
+    device = residual.device
+    residual_out = torch.empty_like(residual)
+
+    use_hybrid = os.environ.get("AITER_MHC_HYBRID", "0") == "1"
+    use_post_first_scalar = os.environ.get("AITER_MHC_POST_FIRST", "0") == "1"
+    # Profile-guided: true MFMA post-fuse wins for M<=64; separated chain wins M>=128.
+    if m >= 128 and os.environ.get("AITER_MHC_FORCE_MFMA", "0") != "1":
+        use_hybrid = True
+
+    if m > 1 and use_hybrid:
+        mhc_post(residual_out, x, residual, post_layer_mix, comb_res_mix)
+        post_mix, comb_mix, layer_input = mhc_pre(
+            residual_out,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
+        return post_mix, comb_mix, layer_input, residual_out
+
+    selected_splitk, selected_tile_k = get_mhc_pre_splitk(m, hc_hidden_size)
+
+    gemm_out_pad = torch.empty(
+        selected_splitk,
+        m,
+        (hc_mult3 + 31) // 32 * 32,
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    gemm_out = gemm_out_pad[:, :, :hc_mult3]
+    sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
+
+    if m > 1 and use_post_first_scalar:
+        mhc_post_pre_fused_gemm_sqrsum(
+            residual_out,
+            gemm_out,
+            sqrsum,
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+        )
+    elif m > 1:
+        mhc_post_pre_mfma_gemm_sqrsum(
+            residual_out,
+            gemm_out,
+            sqrsum,
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            selected_tile_k,
+        )
+    else:
+        mhc_post_pre_gemm_sqrsum(
+            residual_out,
+            gemm_out,
+            sqrsum,
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+        )
+
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
+    layer_input = torch.empty(m, hidden_size, dtype=residual.dtype, device=device)
+
+    if norm_weight is not None:
+        mhc_pre_big_fuse_rmsnorm(
+            post_mix,
+            comb_mix,
+            layer_input,
+            gemm_out,
+            sqrsum,
+            hc_scale,
+            hc_base,
+            residual_out,
+            norm_weight,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            norm_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+    else:
+        mhc_pre_big_fuse(
+            post_mix,
+            comb_mix,
+            layer_input,
+            gemm_out,
+            sqrsum,
+            hc_scale,
+            hc_base,
+            residual_out,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+
+    return post_mix, comb_mix, layer_input, residual_out

@@ -45,10 +45,12 @@ try:
 
     _HAS_AITER_MHC_PRE = hasattr(_aiter, "mhc_pre")
     _HAS_AITER_MHC_POST = hasattr(_aiter, "mhc_post")
+    _HAS_AITER_MHC_POST_PRE = hasattr(_aiter, "mhc_post_pre")
 except ImportError:
     _aiter = None
     _HAS_AITER_MHC_PRE = False
     _HAS_AITER_MHC_POST = False
+    _HAS_AITER_MHC_POST_PRE = False
 
 
 # =============================================================================
@@ -974,6 +976,97 @@ def test_triton_mhc_pre_post(M, n, C, dtype, use_asymmetric_exp_domain):
         pct = checkAllclose(
             t.float(),
             ref.float(),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=0.05,
+            msg=msg,
+        )
+        assert (
+            pct <= 0.05
+        ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+
+
+@pytest.mark.parametrize(
+    "M, n, C",
+    [
+        (1, 4, 1024),
+        (64, 4, 4096),
+        (128, 4, 7168),
+    ],
+)
+def test_hip_mhc_post_pre_matches_triton(M, n, C):
+    """HIP ``aiter.mhc_post_pre`` matches Triton ``mhc_post_pre``.
+
+    HIP uses the same asymmetric exp-domain Sinkhorn semantics as
+    ``mhc_pre_big_fuse``, so the Triton reference enables
+    ``asymmetric_exp_domain=True``.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required for mHC kernels")
+    if not _HAS_AITER_MHC_POST_PRE:
+        pytest.skip("aiter.mhc_post_pre is not available in this environment")
+    if n != 4:
+        pytest.skip("aiter.mhc_post_pre hardcodes hc_mult == 4")
+
+    dtype = torch.bfloat16
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    layer_input, residual_in, post_mix, comb_mix = generate_mhc_post_inputs(
+        M, n, C, dtype
+    )
+    _x_unused, phi, alpha_pre, alpha_post, alpha_res, bias, _n = generate_mhc_inputs(
+        M, n, C, dtype
+    )
+    alphas_t = _alphas(alpha_pre, alpha_post, alpha_res, device=layer_input.device)
+    fn_hip = phi.T.contiguous().float()
+    hc_scale = alphas_t.float()
+    hc_base = bias.float().contiguous()
+
+    phi_triton = phi.T.contiguous().T
+    post_t, comb_t, layer_t, residual_t = mhc_post_pre(
+        layer_input,
+        residual_in,
+        post_mix,
+        comb_mix,
+        phi_triton,
+        alphas_t,
+        bias,
+        n,
+        hc_pre_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_iters=20,
+        asymmetric_exp_domain=True,
+        hc_sinkhorn_eps=1e-6,
+    )
+
+    with torch.device(layer_input.device):
+        post_h, comb_h, layer_h, residual_h = _aiter.mhc_post_pre(
+            layer_input,
+            residual_in,
+            post_mix,
+            comb_mix,
+            fn_hip,
+            hc_scale,
+            hc_base,
+            hc_pre_eps=1e-6,
+            hc_sinkhorn_eps=1e-6,
+            hc_post_mult_value=2.0,
+            sinkhorn_repeat=20,
+        )
+
+    cfg = f"(M={M}, n={n}, C={C})"
+    for name, hip, tri, atol, rtol in (
+        ("residual_out", residual_h, residual_t, 4e-2, 2e-2),
+        ("post_mix", post_h, post_t, 4e-2, 2e-2),
+        ("comb_mix", comb_h, comb_t, 4e-2, 2e-2),
+        ("layer_input", layer_h, layer_t, 8e-2, 2e-2),
+    ):
+        msg = f"{name} HIP vs Triton mhc_post_pre mismatch at {cfg}"
+        pct = checkAllclose(
+            hip.float(),
+            tri.float(),
             atol=atol,
             rtol=rtol,
             tol_err_ratio=0.05,
