@@ -500,4 +500,19 @@ def gemm_a16w16_opus(
     return _finalize_output(Y, reshape_out_to_2d)
 
 
-__all__ = ["opus_gemm_a16w16_tune", "gemm_a16w16_opus"]
+# Per-stream splitk workspace init. Call once inside `with torch.cuda.stream(s):`
+# (eagerly, before HIP graph capture) to register a workspace handle for that
+# stream. Needed under vLLM/sglang-style TBO where two CPU threads drive two
+# streams concurrently — each captured graph must bake in its own buffer
+# pointer; the prior thread_local cache would fail capture on the second
+# stream. After init, run the largest expected gemm eagerly on the same
+# stream to grow the buffer, then capture.
+@compile_ops("module_deepgemm_opus", fc_name="opus_gemm_workspace_init")
+def opus_gemm_workspace_init() -> None: ...
+
+
+__all__ = [
+    "opus_gemm_a16w16_tune",
+    "gemm_a16w16_opus",
+    "opus_gemm_workspace_init",
+]
