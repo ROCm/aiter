@@ -195,7 +195,7 @@ def cpu_reduce(out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_
 
 def ref_pa_decode(
     Q, K, V, kv_indices, kv_indptr, context_lens, gqa,
-    query_scale, key_scale, value_scale, softmax_scale,
+    query_scale, key_scale, value_scale, softmax_scale, sink=None,
 ):
     """Torch host reference for the gfx1250 PA-decode kernel (no sink, mtp=0).
 
@@ -204,9 +204,17 @@ def ref_pa_decode(
     with the per-tensor scales, then does softmax attention per (batch, kv_head,
     gqa) over the whole context (multi-page via kv_indptr/kv_indices) -> bf16.
 
-    For mtp>0 the kernel applies the per-MTP-position causal bound (see sched2
-    common_pa_ps.h): query position i (0..mtp) attends only to the first
-    `ctx - mtp + 1 + i` tokens.  For mtp=0 this is the full context (no-op).
+    For mtp>0 the SP3 kernel applies a per-MTP-position causal border (var CAUSAL,
+    setup_mask_border): query position i (0..mtp) attends only to the first
+    `seq_len - mtp + i` tokens (token p masked when p >= border).  Note this is
+    the kernel's convention; the sched2 CPU ref single_work_decode uses one extra
+    token (`ctx - mtp + 1 + i`), but the GPU follows the no-`+1` border above.
+    For mtp=0 this is the full context (no-op).
+
+    sink (optional): per-Q-head fp32 logits in the kernel's PRE-SCALE raw domain,
+    shape [kv_head_num*gqa].  It adds one virtual logit `s_eff*sink_raw` (s_eff =
+    query_scale*key_scale*softmax_scale) to each row's softmax denominator; the
+    sink has no value, so it only shrinks the real-token weights.
     """
     num_pages, kv_head_num = K.shape[0], K.shape[1]
     head_dim = Q.shape[-1]
@@ -214,6 +222,8 @@ def ref_pa_decode(
     batch, qlen = Q.shape[0], Q.shape[1]
     mtp = qlen - 1
     device = Q.device
+    s_eff = query_scale * key_scale * softmax_scale
+    sink_hg = (sink.float().view(kv_head_num, gqa) * s_eff) if sink is not None else None
 
     # K[p,h,d//16,tok,d%16] -> K_tm[p,h,tok,d];  V[p,h,tok//16,d,tok%16] -> V_tm[p,h,tok,d]
     K_tm = K.float().permute(0, 1, 3, 2, 4).reshape(num_pages, kv_head_num, page_size, head_dim)
@@ -229,10 +239,14 @@ def ref_pa_decode(
         Kc = K_tm[tok_page, :, tok_off, :] * key_scale     # [ctx, kv_head, head_dim]
         Vc = V_tm[tok_page, :, tok_off, :] * value_scale   # [ctx, kv_head, head_dim]
         for ql in range(qlen):
-            valid = max(min(ctx - mtp + 1 + ql, ctx), 1)   # MTP causal bound
+            valid = max(min(ctx - mtp + ql, ctx), 1)   # SP3 causal border (no +1)
             q = Qf[b, ql] * query_scale  # [kv_head, gqa, head_dim]
-            logits = torch.einsum("hgd,thd->hgt", q, Kc[:valid]) * softmax_scale
-            w = torch.softmax(logits.float(), dim=-1)
+            logits = torch.einsum("hgd,thd->hgt", q, Kc[:valid]) * softmax_scale  # [kvh,gqa,valid]
+            if sink_hg is not None:
+                logits = torch.cat([logits, sink_hg.unsqueeze(-1)], dim=-1)  # +1 sink logit
+                w = torch.softmax(logits.float(), dim=-1)[..., :valid]       # drop sink weight
+            else:
+                w = torch.softmax(logits.float(), dim=-1)
             out[b, ql] = torch.einsum("hgt,thd->hgd", w, Vc[:valid])
     return out.to(torch.bfloat16)
 
@@ -241,16 +255,17 @@ def ref_pa_decode(
 def run_pa_stage(
     Q, K, V, kv_indices, context_lens, softmax_scale, kv_indptr,
     gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
-    work_indptr, work_info, split_o, split_lse,
+    work_indptr, work_info, split_o, split_lse, sink,
 ):
     # PA stage: direct-to-O for non-split work items, partials -> split_o/split_lse
-    # for split (multi-page) ones (merged on host by cpu_reduce).
+    # for split (multi-page) ones (merged on host by cpu_reduce).  sink=None ->
+    # wrapper fills a -inf no-op buffer (kernel always reads the sink slot).
     return aiter.pa_decode_bf16_asm(
         Q, K, V, kv_indices, context_lens, softmax_scale, kv_indptr,
         gqa=gqa, mtp=mtp,
         query_scale=query_scale, key_scale=key_scale, value_scale=value_scale,
         qo_indptr=qo_indptr, work_indptr=work_indptr, work_info=work_info,
-        split_o=split_o, split_lse=split_lse,
+        split_o=split_o, split_lse=split_lse, sink=sink,
     )
 
 
@@ -262,11 +277,15 @@ def test_pa_decode(
     mtp: int = 0,
     scales: Optional[Tuple[float, float, float]] = None,
     varlen: bool = False,
+    use_sink: bool = False,
 ) -> dict:
     """Random FP8 paged inputs (arbitrary kv_len) vs the torch host reference.
 
     scales=None -> random per-tensor q/k/v scales; otherwise the given (q,k,v).
     mtp -> multi-token-predict layers (qlen = mtp+1); kernel requires mtp < 4.
+    use_sink -> pass a random per-Q-head sink (pre-scale raw logits) to the kernel
+    and include the matching sink term in the reference (needs the sink-enabled
+    kernel binary; with the current .co the kernel ignores it and this fails).
     """
     gqa = PA_GQA_RATIO
     head_dim = PA_HEAD_DIM
@@ -329,10 +348,13 @@ def test_pa_decode(
         (split_rows, 1, q_head_num, 1), float("-inf"), dtype=dtypes.fp32, device=device
     )
 
+    # Sink: per-Q-head logits in the kernel's pre-scale raw domain (~Q.K range).
+    sink = (torch.randn(q_head_num, device=device) * 2.0).to(dtypes.fp32) if use_sink else None
+
     out, us = run_pa_stage(
         Q, K, V, kv_indices, seq_lens_kv, softmax_scale, kv_indptr,
         gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
-        work_indptr, work_info, split_o, split_lse,
+        work_indptr, work_info, split_o, split_lse, sink,
     )
     torch.cuda.synchronize()
     out = cpu_reduce(
@@ -341,7 +363,7 @@ def test_pa_decode(
 
     ref = ref_pa_decode(
         Q, K, V, kv_indices, kv_indptr, seq_lens_kv, gqa,
-        query_scale, key_scale, value_scale, softmax_scale,
+        query_scale, key_scale, value_scale, softmax_scale, sink,
     )
 
     # FP8 inputs + bf16 output + exp2/log2e + MFMA accumulation -> loose tol.
@@ -356,6 +378,7 @@ def test_pa_decode(
     return {
         "max_kv": int(seq_lens_kv.max().item()),
         "mtp": mtp,
+        "sink": use_sink,
         "qkv_scale": (query_scale, key_scale, value_scale),
         "us": us,
         "err": err,
@@ -416,6 +439,13 @@ parser.add_argument(
     help="""Per-tensor q/k/v dequant scales by hand, e.g. --scales 0.5 2.0 1.5.
     Default: random scales per config.""",
 )
+parser.add_argument(
+    "--sink",
+    action="store_true",
+    help="""Enable GPT-OSS attention sink: random per-Q-head sink logits passed to
+    the kernel + matching sink term in the reference. Requires the sink-enabled
+    kernel binary; with the current .co the kernel ignores it and this fails.""",
+)
 args = parser.parse_args()
 
 df = []
@@ -426,6 +456,7 @@ for batch, kv_head_num, ctx_len, mtp in itertools.product(
         batch, kv_head_num, ctx_len, mtp,
         tuple(args.scales) if args.scales is not None else None,
         args.varlen,
+        args.sink,
     )
     df.append(ret)
 df = pd.DataFrame(df)
