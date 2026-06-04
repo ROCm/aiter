@@ -76,7 +76,7 @@ def make_no_split_metadata(batch, kv_head_num, gqa, qo_indptr, kv_indptr, device
 def make_sched2_metadata(
     batch, kv_head_num, gqa, qo_indptr, kv_indptr, context_lens,
     block_size, qlen_granularity, available_tgs, device, is_causal=False,
-    force_split=True,
+    force_split=False,
 ):
     """Faithful Python port of sched2 common_ps.h generate_metadata +
     generate_reduce_info (the convention the SP3 PA_DECODE kernel was authored
@@ -133,9 +133,10 @@ def make_sched2_metadata(
                 kv_start = cur_block + kvp[bt]
                 if remaining_kv <= cap * block_size + SPLIT_KV_OVERHEAD:
                     consuming = remaining_blocks
-                    # force_split: never use the direct-to-O path (partial_o_loc=-1)
-                    # because this gfx1250 .co does not implement it (writes nothing
-                    # to O); route every tile through split_o + host reduce instead.
+                    # Real persistent convention: a tile handled entirely by one TG
+                    # writes straight to O (partial_o_loc=-1); the kernel's direct-O
+                    # store path handles it and cpu_reduce leaves those rows alone.
+                    # (force_split forces everything through split_o; only for debug.)
                     if cur_block == 0 and not force_split:
                         ploc = -1  # whole tile in one TG -> direct to O
                     else:
@@ -281,17 +282,18 @@ def ref_pa_decode(
 def run_pa_stage(
     Q, K, V, kv_indices, context_lens, softmax_scale, kv_indptr,
     gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
-    work_indptr, work_info, split_o, split_lse,
+    work_indptr, work_info, split_o, split_lse, out,
 ):
     # PA stage: direct-to-O for non-split work items, partials -> split_o/split_lse
-    # for split (multi-page) ones.  num_rotate_args=1 so the split buffers after
-    # the call belong to the same call whose `out` we keep.
+    # for split (multi-page) ones.  Pass an explicit pre-zeroed `out` as the
+    # kernel's direct-O store target (matches pa_ps.cpp memset(R) before launch).
+    # num_rotate_args=1 so the split buffers after the call belong to the same call.
     return aiter.pa_decode_bf16_asm(
         Q, K, V, kv_indices, context_lens, softmax_scale, kv_indptr,
         gqa=gqa, mtp=mtp,
         query_scale=query_scale, key_scale=key_scale, value_scale=value_scale,
         qo_indptr=qo_indptr, work_indptr=work_indptr, work_info=work_info,
-        split_o=split_o, split_lse=split_lse,
+        split_o=split_o, split_lse=split_lse, out=out,
     )
 
 
@@ -349,6 +351,13 @@ def test_pa_decode(
     max_qlen = qlen_with_mtp
     q_head_num = kv_head_num * gqa
 
+    # Explicit, pre-zeroed output buffer (kernel's direct-O store target; also the
+    # buffer cpu_reduce fills for split rows). bf16, Q's logical shape.
+    out = torch.zeros(
+        (batch, qlen_with_mtp, kv_head_num, gqa, head_dim),
+        dtype=torch.bfloat16, device=device,
+    )
+
     if no_split:
         # Hand-built sched2-convention metadata: every work item writes direct to
         # O, no split/reduce.  Isolates kernel correctness from aiter metadata.
@@ -358,7 +367,7 @@ def test_pa_decode(
         out, us = run_pa_stage(
             Q, K, V, kv_indices, seq_lens_kv, softmax_scale, kv_indptr,
             gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
-            work_indptr, work_info, None, None,
+            work_indptr, work_info, None, None, out,
         )
         torch.cuda.synchronize()
         n_ref = n_unwritten = 0
@@ -381,7 +390,7 @@ def test_pa_decode(
         out, us = run_pa_stage(
             Q, K, V, kv_indices, seq_lens_kv, softmax_scale, kv_indptr,
             gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
-            work_indptr, work_info, split_o, split_lse,
+            work_indptr, work_info, split_o, split_lse, out,
         )
         torch.cuda.synchronize()
 
