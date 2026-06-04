@@ -49,6 +49,7 @@ class AiterCommunicator:
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
     _HEAP_SIZE = 2**33  # 8 GB
+    _AG_SLAB_SIZE = 2**25  # 32 MB per rank
 
     def __init__(
         self,
@@ -65,6 +66,9 @@ class AiterCommunicator:
         self._input_buf = None
         self._buf_shape = None
         self._buf_dtype = None
+        self._ag_workspace = None
+        self._ag_input_slab = None
+        self._ag_output_slab = None
 
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -156,6 +160,78 @@ class AiterCommunicator:
         except Exception as e:
             logger.error(
                 "AiterCommunicator.all_reduce failed: shape=%s dtype=%s "
+                "capturing=%s err=%s",
+                tuple(inp.shape),
+                inp.dtype,
+                torch.cuda.is_current_stream_capturing(),
+                e,
+            )
+            raise
+
+    def should_allgather(self, inp: torch.Tensor) -> bool:
+        """Replace every NCCL all_gather; only slab capacity falls back."""
+        if self.disabled or self._shmem is None:
+            return False
+        inp_size = inp.numel() * inp.element_size()
+        if inp_size > self._AG_SLAB_SIZE:
+            logger.warning(
+                "AiterCommunicator.all_gather fallback to NCCL: %d bytes "
+                "exceeds slab",
+                inp_size,
+            )
+            return False
+        return True
+
+    def _get_allgather_buffers(self, numel, dtype):
+        # Fixed byte slabs allocated once; per-call views avoid heap churn
+        # (the symmetric heap never frees).
+        if self._ag_input_slab is None:
+            assert self._shmem is not None
+            world_size = self._shmem.num_ranks
+            self._ag_input_slab = self._shmem.empty(
+                (self._AG_SLAB_SIZE,), dtype=torch.uint8
+            )
+            self._ag_output_slab = self._shmem.empty(
+                (world_size, self._AG_SLAB_SIZE), dtype=torch.uint8
+            )
+        input_buf = self._ag_input_slab.view(dtype)[:numel].view(1, numel)
+        output_buf = self._ag_output_slab.view(dtype)[:, :numel]
+        return input_buf, output_buf
+
+    def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        assert self._shmem is not None
+        try:
+            if dim < 0:
+                dim += inp.dim()
+            world_size = self._shmem.num_ranks
+            input_size = inp.size()
+
+            input_buf, output_buf = self._get_allgather_buffers(
+                inp.numel(), inp.dtype
+            )
+            input_buf.view(-1).copy_(inp.reshape(-1))
+
+            self._ag_workspace = self._shmem.ccl.all_gather(
+                output_buf,
+                input_buf,
+                workspace=self._ag_workspace,
+                config=self._gluon_config,
+                async_op=True,
+            )
+
+            # Same reshape contract as vLLM's DeviceCommunicatorBase.all_gather.
+            # output_buf is a non-contiguous slab view, so reshape always
+            # copies; the result never aliases the symmetric heap.
+            output = output_buf.reshape((world_size,) + input_size).movedim(0, dim)
+            return output.reshape(
+                input_size[:dim]
+                + (world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
+
+        except Exception as e:
+            logger.error(
+                "AiterCommunicator.all_gather failed: shape=%s dtype=%s "
                 "capturing=%s err=%s",
                 tuple(inp.shape),
                 inp.dtype,
