@@ -298,6 +298,8 @@ def fused_moe_(
     ], f"Invalid MoE weight: {w1.shape=} {w2.shape=}"
     isG1U1 = inter_dim != w1.shape[1]
     isShuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    if gate_mode == GateMode.SEPARATED and getattr(w1, "is_guinterleave", False):
+        gate_mode = GateMode.INTERLEAVE
 
     global_E = E
     if expert_mask is not None:
