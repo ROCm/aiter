@@ -233,3 +233,281 @@ def fused_qk_norm_rope_1way(
     fp32 rope multiply). Passing bf16/fp16 cos_sin will raise inside the kernel.
     """
     ...
+
+
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="fused_qk_norm_rope_group_quant",
+    develop=True,
+)
+def _fused_qk_norm_rope_group_quant_kernel(
+    q: Tensor,  # [num_tokens, num_heads, head_dim]
+    kv: Tensor,  # [num_tokens, (k_num_heads,) head_dim]
+    k_pe_out: Tensor,  # rope_buff [num_tokens, (k_num_heads,) pe_dim] bf16 (RoPE'd K-PE)
+    k_weight: Tensor,  # [head_dim] RMSNorm weights
+    kv_cache: Tensor,  # nope_scale_buff [num_tokens, (k_num_heads,) 512B] token-contiguous
+    q_out: Tensor,  # [num_tokens, num_heads, head_dim] bf16 OR fp8 output
+    positions: Tensor,  # [num_tokens]
+    cos_cache: Tensor,  # [max_position, rot_dim//2]
+    sin_cache: Tensor,  # [max_position, rot_dim//2]
+    eps: float,
+    is_neox: bool,
+    # q_weight: optional per-channel RMSNorm weight for Q [head_dim]. None = weightless (V4-Pro).
+    q_weight: Optional[Tensor] = None,
+    # q_scale: legacy separate Q scale (unused on the fp8 inline path; scale is written
+    #   into q_out at bytes [nope_dim : nope_dim+2*num_nope_groups), each tile-scale x2).
+    q_scale: Optional[Tensor] = None,
+    # quant_group_size: 1xG block-scale width for Q. Must be one of {32, 64, 128} and divide head_dim.
+    # Ignored when q_out is bf16.
+    quant_group_size: int = 64,
+    # scale_dtype: 'e8m0' (1-byte MX) or 'fp32' (4-byte). Ignored when q_out is bf16.
+    scale_dtype: str = "e8m0",
+    # q_rope_out: rotated Q-PE bf16 [num_tokens, num_heads, pe_dim]; required when q_out is fp8
+    #   (fp8 Q mirrors K: nope fp8 + inline dup e8m0 scale in q_out, PE bf16 here). None for bf16 Q.
+    q_rope_out: Optional[Tensor] = None,
+) -> None: ...
+
+
+def fused_qk_norm_rope_group_quant(
+    q: Tensor,  # [num_tokens, num_heads, head_dim]
+    kv: Tensor,  # [num_tokens, (num_kv_heads,) head_dim]
+    k_weight: Tensor,  # [head_dim] RMSNorm weights
+    positions: Tensor,  # [num_tokens] int64
+    cos_cache: Tensor,  # [max_position, rot_dim//2]
+    sin_cache: Tensor,  # [max_position, rot_dim//2]
+    eps: float,
+    *,
+    is_neox: bool = False,
+    # q_out_dtype controls whether Q is quantized: fp8 -> Q group-quant (q_scale produced);
+    # bf16/fp16 -> Q stays unquantized (matches DeepSeek-V4 / ATOM, whose sparse_attn takes
+    # bf16 Q). Default bf16. Ignored when an explicit `q_out` tensor is passed (its dtype wins).
+    q_out_dtype: torch.dtype = torch.bfloat16,
+    q_out: Optional[
+        Tensor
+    ] = None,  # bf16: [.,H,512]; fp8: q_nope_scale_buff [.,H,512]. dtype decides quant. Alloc if None.
+    q_rope_buff: Optional[
+        Tensor
+    ] = None,  # [num_tokens, num_heads, rot_dim] bf16 rotated Q-PE; only for fp8 Q. Alloc if None.
+    nope_scale_buff: Optional[
+        Tensor
+    ] = None,  # [num_tokens, num_kv_heads, 512] fp8; allocated (zeroed) if None
+    rope_buff: Optional[
+        Tensor
+    ] = None,  # [num_tokens, num_kv_heads, rot_dim] bf16; allocated if None
+    q_weight: Optional[
+        Tensor
+    ] = None,  # optional per-channel Q RMSNorm weight [head_dim]
+    quant_group_size: int = 64,
+    scale_dtype: str = "e8m0",
+):
+    """DeepSeek-V4 fused Q/K RMSNorm + RoPE + group-quant WITHOUT a paged KV cache.
+
+    Thin, dense (token-contiguous) wrapper over the fused QK norm+RoPE+group-quant kernel.
+    K NoPE is fp8 with a 1x64 e8m0 group scale; K RoPE (pe) stays bf16 (NOT quantized).
+    No ``slot_mapping`` / paging.
+
+    See also ``fused_kv_norm_rope_group_quant`` -- the K-only fast path for call
+    sites that do NOT need Q (e.g. the V4-Pro Indexer's Compressor). It skips the
+    Q wave entirely (~1.6x faster at large T) and is bit-exact with this function's
+    K-side. Prefer it whenever you would pass a throwaway Q here.
+
+    K output is split into the two buffers the v4 nm asm attention kernel reads:
+
+    ``nope_scale_buff`` -- per (token, kv_head), 512 bytes (head_dim=512):
+        [0   : 448)  K-nope fp8                                            (448 B)
+        [448 : 462)  e8m0 scale, 2*(nope_dim/64)=14 B, each tile-scale x2  (s0,s0,..,s6,s6)
+        [462 : 512)  pad (zero-initialised)                                (50 B)
+      The asm reader reads each tile scale TWICE consecutively, hence the x2 duplication.
+
+    ``rope_buff`` -- per (token, kv_head), rotated K-PE bf16 [rot_dim]      (128 B).
+
+    Q output mirrors K when fp8 (``q_out_dtype=fp8``):
+      ``q_out``      -- q_nope_scale_buff [.,H,512]: nope fp8 + 14 dup e8m0 scale + pad.
+      ``q_rope_buff``-- rotated Q-PE bf16 [.,H,rot_dim] (Q-PE NOT quantized).
+    For bf16 Q (default, DeepSeek-V4 / ATOM sparse_attn): ``q_out`` is the full
+    [.,H,512] bf16 rotated Q and ``q_rope_buff`` is None.
+
+    Layout is always nope-first (V4); the kernel hardcodes it.
+    Returns ``(q_out, q_rope_buff_or_None, nope_scale_buff, rope_buff)``.
+    """
+    assert q.dim() == 3, "q must be [num_tokens, num_heads, head_dim]"
+    num_tokens, num_heads, head_dim = q.shape
+    num_kv_heads = kv.shape[1] if kv.dim() == 3 else 1
+    rot_dim = cos_cache.shape[-1] * 2
+    assert (
+        head_dim % quant_group_size == 0
+    ), "head_dim must be divisible by quant_group_size"
+    # nope_scale_buff / fp8-q_out entry = 512 B (head_dim): nope + 14 dup e8m0 scale + pad.
+    k_entry_bytes = head_dim
+
+    from .. import dtypes
+
+    q_is_fp8 = (q_out.dtype if q_out is not None else q_out_dtype) == dtypes.fp8
+    if q_out is None:
+        # fp8: q_nope_scale_buff (zeros for the pad); bf16: plain [.,H,512] rotated Q.
+        q_out = (
+            torch.zeros(
+                (num_tokens, num_heads, head_dim), dtype=dtypes.fp8, device=q.device
+            )
+            if q_is_fp8
+            else torch.empty(
+                (num_tokens, num_heads, head_dim), dtype=q_out_dtype, device=q.device
+            )
+        )
+    if q_is_fp8 and q_rope_buff is None:
+        q_rope_buff = torch.empty(
+            (num_tokens, num_heads, rot_dim), dtype=kv.dtype, device=q.device
+        )
+    if not q_is_fp8:
+        q_rope_buff = None  # bf16 Q: PE stays in q_out, no separate rope buffer
+    if nope_scale_buff is None:
+        # zeros: the kernel writes nope[0:nope) + 14 scale bytes; the trailing pad must
+        # read back as zero for the asm reader, so zero-initialise it here.
+        nope_scale_buff = torch.zeros(
+            (num_tokens, num_kv_heads, k_entry_bytes), dtype=dtypes.fp8, device=q.device
+        )
+    if rope_buff is None:
+        rope_buff = torch.empty(
+            (num_tokens, num_kv_heads, rot_dim), dtype=kv.dtype, device=q.device
+        )
+
+    _fused_qk_norm_rope_group_quant_kernel(
+        q,
+        kv,
+        rope_buff,
+        k_weight,
+        nope_scale_buff,
+        q_out,
+        positions,
+        cos_cache,
+        sin_cache,
+        eps,
+        is_neox,
+        q_weight=q_weight,
+        quant_group_size=quant_group_size,
+        scale_dtype=scale_dtype,
+        q_rope_out=q_rope_buff,
+    )
+    return q_out, q_rope_buff, nope_scale_buff, rope_buff
+
+
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="fused_kv_norm_rope_group_quant",
+    develop=True,
+)
+def _fused_kv_norm_rope_group_quant_kernel(
+    kv: Tensor,  # [num_tokens, (NK=1,) head_dim]
+    k_pe_out: Tensor,  # rope_buff [num_tokens, (NK=1,) pe_dim] bf16 (RoPE'd K-PE)
+    k_weight: Tensor,  # [head_dim] RMSNorm weights
+    kv_cache: Tensor,  # nope_scale_buff [num_tokens, (NK=1,) head_dim] fp8 (token-contiguous)
+    positions: Tensor,  # [num_tokens]
+    cos_cache: Tensor,  # [max_position, rot_dim//2]
+    sin_cache: Tensor,  # [max_position, rot_dim//2]
+    eps: float,
+    is_neox: bool,
+    # quant_group_size / scale_dtype are accepted for API symmetry with the
+    # QK entry. The kernel currently hardcodes G=64 and e8m0 (the V4-Pro shape).
+    quant_group_size: int = 64,
+    scale_dtype: str = "e8m0",
+) -> None: ...
+
+
+def fused_kv_norm_rope_group_quant(
+    kv: Tensor,  # [num_tokens, head_dim] OR [num_tokens, num_kv_heads, head_dim]
+    kv_weight: Tensor,  # [head_dim] RMSNorm weights (reuses K-side gamma)
+    positions: Tensor,  # [num_tokens] int64
+    cos_cache: Tensor,  # [max_position, rot_dim//2]
+    sin_cache: Tensor,  # [max_position, rot_dim//2]
+    eps: float,
+    *,
+    is_neox: bool = False,
+    quant_group_size: int = 64,
+    scale_dtype: str = "e8m0",
+    nope_scale_buff: Optional[Tensor] = None,
+    rope_buff: Optional[Tensor] = None,
+) -> tuple[Tensor, Tensor]:
+    """KV-only fused RMSNorm + GPT-J/NeoX RoPE + FP8 group-quant.
+
+    RMSNorm the KV, apply RoPE on the PE tail (stays bf16), and 1xG e8m0 FP8
+    group-quant the NoPE part. Bit-exact with the K-side of
+    ``fused_qk_norm_rope_group_quant``; use that one instead when Q is also
+    needed (it fuses Q+K into one launch).
+
+    Outputs (V4 nm asm sparse-attn reader layout, always nope-first):
+        ``nope_scale_buff`` -- per (token, kv_head), ``head_dim`` fp8 bytes:
+            ``[0:nope_dim)`` K-nope fp8, then ``2*nGroups`` e8m0 scale bytes
+            (each tile-scale duplicated x2), then zero pad.
+        ``rope_buff`` -- per (token, kv_head), rotated K-PE bf16 ``[rot_dim]``.
+
+    Supported (head_dim, rot_dim, group_size) shapes are defined by
+    ``KV_K_ONLY_DISPATCH_TABLE`` in
+    ``csrc/kernels/fused_qk_norm_rope_cache_quant.cu`` (default
+    ``(512, 64, 64)`` is V4-Pro); add an X(...) entry there to extend. An
+    unsupported shape raises from the kernel.
+
+    Args:
+        kv: ``[T, D]`` or ``[T, NK, D]`` bf16 (MQA: ``NK == 1``).
+        kv_weight: ``[D]`` bf16 RMSNorm gamma.
+        positions: ``[T]`` int64 RoPE positions.
+        cos_cache, sin_cache: ``[max_pos, rot_dim//2]`` bf16 RoPE tables.
+        eps: RMSNorm epsilon.
+        is_neox: NeoX (half-split) vs GPT-J (adjacent-pair) PE rotation.
+        quant_group_size: ``G`` for the NoPE e8m0 scale; must divide
+            ``head_dim - rot_dim``. Default 64.
+        scale_dtype: only ``"e8m0"`` supported.
+        nope_scale_buff, rope_buff: optional pre-allocated outputs
+            (``[T, NK, head_dim]`` fp8 and ``[T, NK, rot_dim]`` bf16);
+            allocated (fp8 zeroed) if None.
+
+    Returns:
+        ``(nope_scale_buff, rope_buff)``.
+    """
+    if kv.dim() == 2:
+        kv_3d = kv.unsqueeze(1)
+    elif kv.dim() == 3:
+        kv_3d = kv
+    else:
+        raise ValueError(
+            f"kv must be 2D [T,D] or 3D [T,NK,D]; got rank {kv.dim()} shape={tuple(kv.shape)}"
+        )
+    num_tokens, num_kv_heads, head_dim = kv_3d.shape
+    rot_dim = cos_cache.shape[-1] * 2
+    nope_dim = head_dim - rot_dim
+    if nope_dim <= 0:
+        raise ValueError(
+            f"rot_dim ({rot_dim}) must be < head_dim ({head_dim}); cos_cache last-dim must be < head_dim/2"
+        )
+    if nope_dim % quant_group_size != 0:
+        raise ValueError(
+            f"(head_dim - rot_dim) = {nope_dim} must be divisible by quant_group_size={quant_group_size}"
+        )
+
+    from .. import dtypes
+
+    if nope_scale_buff is None:
+        # zeros: the kernel writes nope[0:nope_dim) + 2*num_nope_groups scale bytes;
+        # the trailing pad must read back as zero for the asm reader, so
+        # zero-initialise it here.
+        nope_scale_buff = torch.zeros(
+            (num_tokens, num_kv_heads, head_dim), dtype=dtypes.fp8, device=kv.device
+        )
+    if rope_buff is None:
+        rope_buff = torch.empty(
+            (num_tokens, num_kv_heads, rot_dim), dtype=kv.dtype, device=kv.device
+        )
+
+    _fused_kv_norm_rope_group_quant_kernel(
+        kv_3d,
+        rope_buff,
+        kv_weight,
+        nope_scale_buff,
+        positions,
+        cos_cache,
+        sin_cache,
+        eps,
+        is_neox,
+        quant_group_size=quant_group_size,
+        scale_dtype=scale_dtype,
+    )
+    return nope_scale_buff, rope_buff

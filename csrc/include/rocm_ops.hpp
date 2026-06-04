@@ -425,7 +425,6 @@ namespace py = pybind11;
           py::arg("is_neox"),                                                       \
           py::arg("is_nope_first"));
 
-
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
     AITER_SET_STREAM_PYBIND                                                                    \
     m.def("init_custom_ar",                                                                    \
@@ -1804,7 +1803,38 @@ namespace py = pybind11;
           py::arg("v_scale"),                                   \
           py::arg("max_tokens_per_batch") = 0);                 \
     m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);                  \
-    m.def("fused_qk_norm_rope_1way", &aiter::fused_qk_norm_rope_1way);
+    m.def("fused_qk_norm_rope_1way", &aiter::fused_qk_norm_rope_1way);                  \
+    m.def("fused_qk_norm_rope_group_quant",                                             \
+          &aiter::fused_qk_norm_rope_group_quant,                                       \
+          py::arg("q"),                                                                 \
+          py::arg("kv"),                                                                \
+          py::arg("k_pe_out"),                                                          \
+          py::arg("k_weight"),                                                          \
+          py::arg("kv_cache"),                                                          \
+          py::arg("q_out"),                                                             \
+          py::arg("positions"),                                                         \
+          py::arg("cos_cache"),                                                         \
+          py::arg("sin_cache"),                                                         \
+          py::arg("eps"),                                                               \
+          py::arg("is_neox"),                                                           \
+          py::arg("q_weight")          = std::nullopt,                                  \
+          py::arg("q_scale")           = std::nullopt,                                  \
+          py::arg("quant_group_size")  = 64,                                            \
+          py::arg("scale_dtype")       = std::string("e8m0"),                           \
+          py::arg("q_rope_out")        = std::nullopt);                                 \
+    m.def("fused_kv_norm_rope_group_quant",                                             \
+          &aiter::fused_kv_norm_rope_group_quant,                                       \
+          py::arg("kv"),                                                                \
+          py::arg("k_pe_out"),                                                          \
+          py::arg("k_weight"),                                                          \
+          py::arg("kv_cache"),                                                          \
+          py::arg("positions"),                                                         \
+          py::arg("cos_cache"),                                                         \
+          py::arg("sin_cache"),                                                         \
+          py::arg("eps"),                                                               \
+          py::arg("is_neox"),                                                           \
+          py::arg("quant_group_size")  = 64,                                            \
+          py::arg("scale_dtype")       = std::string("e8m0"));
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
