@@ -481,7 +481,7 @@ def _grouped_topk(
     tl.static_assert(BLOCK_N % 32 == 0)
     tl.static_assert(
         N_EXPTS_PAD == BLOCK_N,
-        "DeepSeek-class envelope: BLOCK_N must equal N_EXPTS_PAD (single-block).",
+        "grouped topk BLOCK_N must equal N_EXPTS_PAD (single-block).",
     )
 
     x_dtype: tl.constexpr = X.dtype.element_ty
