@@ -158,9 +158,18 @@ DINLINE void start_sync(const RankSignals& sg,
 #ifdef USE_ROCM
     // Ensure prior memory writes (e.g. from producer kernels in CUDA graph)
     // are visible to peer GPUs before signaling readiness.
+#if 1
     if(threadIdx.x == 0)
         __threadfence_system();
     __syncthreads();
+#else
+    // buffer_wbl2 sc0 sc1: L2 writeback with system-scope coherence.
+    // s_waitcnt vmcnt(0): wait for all VMEM operations to complete.
+    if(threadIdx.x == 0) {
+        asm volatile("buffer_wbl2 sc0 sc1\n\t"
+                     "s_waitcnt vmcnt(0)" ::: "memory");
+    }
+#endif
     uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
     if(threadIdx.x < ngpus)
     {
