@@ -444,7 +444,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         # This is a new optimization that prioritized heavy workload WGs first
         pid_hk = pid_hq
         is_kv = pid_hk < KH
-        
+
         q_out_base = pid_b * q_out_stride_b + pid_hq * q_out_stride_h
 
         if is_kv:
