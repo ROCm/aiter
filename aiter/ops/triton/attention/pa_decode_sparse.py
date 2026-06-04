@@ -114,10 +114,6 @@ def pa_decode_sparse(
 
     use_gluon = DEVICE_ARCH == "gfx1250"
 
-    # import os
-
-    # use_gluon = os.environ.get("PA_DECODE_SPARSE_BACKEND", "gluon").lower() == "gluon"
-
     # gfx1250 stages slots through LDS via TDM async_load, which hides the
     # larger per-tile KV gather latency -> BLOCK_K=32 is fastest there. Other
     # arches use the synchronous slot path, where 32 exposes memory latency.
@@ -126,16 +122,11 @@ def pa_decode_sparse(
         attn_num_warps = 2
         max_num_wg = 512
         # max_num_wg = 64
-
-        # attn_num_warps = 4
-        # # max_num_wg = 256
-        # max_num_wg = 32
-
     else:
         block_k = 16 if D >= 256 else 32
         attn_num_warps = 4
-        # max_num_wg = 256
-        max_num_wg = 32
+        max_num_wg = 256
+        # max_num_wg = 32
     num_stages = 2
     waves_per_eu = 1
     reduce_num_warps = 4
@@ -153,7 +144,6 @@ def pa_decode_sparse(
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
         kv_splits = triton.next_power_of_2(kv_splits)
-    # print(f"{use_gluon=} {kv_splits=}")
 
     if kv_splits == 1:
         m_partial = l_partial = acc_partial = out  # unused inside the kernel
@@ -227,7 +217,7 @@ def pa_decode_sparse(
         # Hand back the pre-reduce partials; the caller (or a downstream op)
         # is responsible for the log-sum-exp combine + sink fold.
         return acc_partial, m_partial, l_partial
-    assert False
+
     # One reduce CTA per head. For small per-rank H (TP=8 → H ∈ {8, 16}) this
     # multiplies the reduce-side CTA count by H, replacing the previous single
     # under-occupied CTA per token with a small fan-out that hides launch
