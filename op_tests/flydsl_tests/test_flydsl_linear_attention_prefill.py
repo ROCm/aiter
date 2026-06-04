@@ -195,6 +195,16 @@ class PrefillGroup:
     # Cartesian product when this is not None.
     head_seqlens: object = None  # list[int] | None
     mid_seqlen: int = 10000
+    # Number of segments per expanded case when ``head_seqlens`` is set:
+    #   num_segments=3 (default): context_lens = [head, mid_seqlen, full_len-head-mid_seqlen]
+    #     -> cu_seqlens = [0, head, head+mid_seqlen, full_len]   (n=3)
+    #   num_segments=2          : context_lens = [head, full_len-head]
+    #     -> cu_seqlens = [0, head, full_len]                    (n=2)
+    #     ``mid_seqlen`` is ignored in this mode; the tail length is whatever
+    #     remains after ``head``. Used to cover the n=2 T=16384 regression
+    #     clusters (head near 6400 / 8192 / 9912 / 10000) found in the
+    #     bench_gdr 20260604 trace.
+    num_segments: int = 3
 
 
 def expand_groups(groups):
@@ -231,16 +241,36 @@ def expand_groups(groups):
                     )
                 else:
                     for head in g.head_seqlens:
-                        tail = full_len - head - g.mid_seqlen
-                        if tail <= 0:
+                        if g.num_segments == 2:
+                            tail = full_len - head
+                            if tail <= 0:
+                                raise ValueError(
+                                    f"head_seqlens (num_segments=2) produced "
+                                    f"non-positive tail ({tail}) for "
+                                    f"group={g.model_name!r} "
+                                    f"full_prompt_len={full_len} head={head}."
+                                )
+                            context_lens = [head, tail]
+                            tag = f"head{head}_tail{tail}"
+                        elif g.num_segments == 3:
+                            tail = full_len - head - g.mid_seqlen
+                            if tail <= 0:
+                                raise ValueError(
+                                    f"head_seqlens (num_segments=3) produced "
+                                    f"non-positive tail ({tail}) for "
+                                    f"group={g.model_name!r} "
+                                    f"full_prompt_len={full_len} head={head} "
+                                    f"mid_seqlen={g.mid_seqlen}. Drop this "
+                                    f"(full_len, head) combo or raise "
+                                    f"full_prompt_len."
+                                )
+                            context_lens = [head, g.mid_seqlen, tail]
+                            tag = f"head{head}_mid{g.mid_seqlen}"
+                        else:
                             raise ValueError(
-                                f"head_seqlens expansion produced non-positive "
-                                f"tail ({tail}) for group={g.model_name!r} "
-                                f"full_prompt_len={full_len} head={head} "
-                                f"mid_seqlen={g.mid_seqlen}. Drop this "
-                                f"(full_len, head) combo or raise full_prompt_len."
+                                f"num_segments={g.num_segments} unsupported; "
+                                f"only 2 or 3 are implemented."
                             )
-                        context_lens = [head, g.mid_seqlen, tail]
                         out.append(
                             PrefillArgs(
                                 K=g.K, V=g.V, Hk=g.Hk, Hv=g.Hv,
@@ -254,7 +284,7 @@ def expand_groups(groups):
                                 output_final_state=g.output_final_state,
                                 ssm_state_dtype=g.ssm_state_dtype,
                                 context_lens=context_lens,
-                                trace_tag=f"head{head}_mid{g.mid_seqlen}",
+                                trace_tag=tag,
                             )
                         )
     return out
@@ -300,7 +330,6 @@ _PREFILL_GROUPS = [
         model_name="varlen-16k-aws",
         Hv=32,
         tps=[1],
-        # full_prompt_lens=[1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000],
         full_prompt_lens=[1000, 5000, 10000],
         max_num_batched_tokens=16384,
     ),
@@ -308,135 +337,40 @@ _PREFILL_GROUPS = [
         model_name="varlen-32k-aws",
         Hv=32,
         tps=[1],
-        # full_prompt_lens=[1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000],
         full_prompt_lens=[1000, 5000, 10000],
         max_num_batched_tokens=32768,
     ),
     PrefillGroup(
-        model_name="flydsl-poor-aws",
+        model_name="flydsl-k5-n1",
         Hv=32,
         tps=[1],
-        # full_prompt_lens=[1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000],
         full_prompt_lens=[5000, 10000],
         max_num_batched_tokens="full_prompt_len",
     ),
-    # n=3 "10000 long-segment" K5 regression family.
-    #
-    # Sourced from bench_gdr_inline_prefill_only_results_20260603_1742.txt,
-    # which has ~200 cases (88.5% of all flydsl-vs-triton regressions)
-    # clustered on cu_seqlens = [0, head, head+10000, full_len] with
-    # full_len ~= 16384. flydsl K5 sits at a near-constant ~543us across
-    # the whole cluster (vs triton K5 ~460-495us, i.e. 1.10x-1.18x slower)
-    # regardless of head, which strongly suggests K5 falls onto a
-    # "fill-max-blocks" path and ignores the actual head boundary.
-    #
-    # ``head_seqlens`` (new field) sweeps the leading tiny segment so we
-    # can probe (a) at which head the regression appears / disappears,
-    # and (b) whether the kernel cost truly is head-insensitive. Values
-    # cover the full range observed in the bench: extreme-tiny (5, 10),
-    # "tens" (65), "hundreds" (704, 936), "low-thousands" (1820, 4467).
-    # 5508 hits a corner where the 3rd segment becomes < BT.
     PrefillGroup(
         model_name="flydsl-k5-n3-mid10k",
         Hv=32,
         tps=[1],
         full_prompt_lens=[16384],
         max_num_batched_tokens=16384,
-        # head_seqlens=[5, 10, 65, 704, 936, 1820, 4467, 5508],
-        head_seqlens=[936],
+        head_seqlens=[5, 10, 65, 704, 936, 1820, 4467, 5508],
         mid_seqlen=10000,
+    ),
+    PrefillGroup(
+        model_name="flydsl-k5-n2-16k",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[16384],
+        max_num_batched_tokens=16384,
+        head_seqlens=[4000, 6396, 8192, 9912, 10000],
+        num_segments=2,
     ),
 ]
 
 PREFILL_PARAMS = expand_groups(_PREFILL_GROUPS)
 
 
-# -- Trace-derived flydsl-K5 regression cases ---------------------------
-#
-# Picked from bench_gdr_inline_prefill_only_results_20260603_1742.txt
-# (varlen-16k-aws family: K=128, V=128, Hk=16, Hv=32, tp=1, BT=64,
-# is_varlen=True, output_final_state=True, ssm_state_dtype=f32,
-# max_num_batched_tokens=16384). For each case the trace recorded
-# ``flydsl K5`` running noticeably slower than ``triton K5`` on the same
-# cu_seqlens. They are kept as explicit ``context_lens`` (i.e. the diff
-# of cu_seqlens) so the exact shape that triggered the regression is
-# reproduced verbatim -- ``_build_context_lens`` cannot express these
-# "tiny + 10000 + remainder" splits.
-#
-# Layout: (trace_tag, context_lens, K5-flydsl/triton ratio seen in bench)
-#   - n=3 "10000 long-segment" cluster: flydsl K5 is constant ~543us
-#     across the cluster (vs triton ~460-495us), 1.14x-1.18x slower.
-#   - n=2 small-T outliers: flydsl K5 ~210us vs triton ~169us on
-#     T=5356 ([0,356,5356]) is the single worst point (1.24x).
-#   - n=1 single-segment cases at "unfriendly" lengths (5333, 7271)
-#     give a milder 1.08x regression but still reproduce.
-_FLYDSL_K5_REGRESSION_CASES = [
-    # (trace_tag, context_lens) -- comments include the bench idx and ratio.
-    ("212_t5356_n2_1.24x",      [356, 5000]),          # [496/621] worst single point
-    ("496_t16384_n3_1.18x",     [65, 10000, 6319]),    # [496/621]
-    ("533_t16384_n3_1.18x",     [41, 10000, 6343]),    # [533/621]
-    ("485_t16337_n3_1.17x",     [10, 10000, 6327]),    # [485/621]
-    ("570_t16384_n3_1.16x",     [5, 10000, 6379]),     # [570/621]
-    ("343_t16384_n3_1.16x",     [704, 10000, 5680]),   # [343/621] larger tiny-segment variant
-    ("312_t16384_n3_1.14x",     [732, 10000, 5652]),   # [312/621]
-    ("401_t10880_n2_1.08x",     [880, 10000]),         # [401/621]
-    ("437_t7271_n1_1.08x",      [7271]),               # [437/621] single-seg unfriendly length
-    ("273_t5333_n1_1.08x",      [5333]),               # [273/621]
-]
-
-
-def _make_flydsl_k5_regression_params():
-    out = []
-    for tag, context_lens in _FLYDSL_K5_REGRESSION_CASES:
-        out.append(
-            PrefillArgs(
-                K=128,
-                V=128,
-                Hk=16,
-                Hv=32,
-                tp=1,
-                full_prompt_len=sum(context_lens),
-                model_name="flydsl-k5-regress",
-                BT=64,
-                max_num_batched_tokens=16384,
-                dtype=torch.bfloat16,
-                is_varlen=True,
-                output_final_state=True,
-                ssm_state_dtype=torch.float32,
-                context_lens=context_lens,
-                trace_tag=tag,
-            )
-        )
-    return out
-
-
-PREFILL_PARAMS.extend(_make_flydsl_k5_regression_params())
-
-
-# Perf-test parametrization is identical to the correctness one; trace-
-# derived shapes have been removed from this file.
-PERF_PARAMS = list(PREFILL_PARAMS)
-PERF_TEST_IDS = [repr(p) for p in PERF_PARAMS]
-
-
-# Mirror every base shape with a bf16-SSM-state variant. The bf16 vs f32
-# kernel paths only differ in two ``if const_expr`` branches:
-#   - h0 load (gated by USE_INITIAL_STATE)
-#   - ht store (gated by STORE_FINAL_STATE)
-# The bf16 mirror keeps ``output_final_state`` from the base shape, so:
-#   - ``_nofs`` shapes (use_h0=True, store_fs=False) cover the h0 load path
-#   - default shapes (use_h0=True, store_fs=True) cover both paths
-# Only ``(use_h0=False, store_fs=False)`` would generate IR identical to
-# the f32 path; none of the current PREFILL_PARAMS hits that combo, so we
-# do not filter here. If you add such a case later, gate the mirror with
-# ``if _base.output_final_state or _make_inputs(...) provides h0``.
-# NOTE: bf16 SSM-state mirrors disabled for focused perf profiling.
-# PREFILL_PARAMS.extend(
-#     [
-#         _dataclass_replace(_base, ssm_state_dtype=torch.bfloat16)
-#         for _base in list(PREFILL_PARAMS)
-#     ]
-# )
+PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
 
 
 # -- bf16 SSM-state params (paired with TestStateDtypeBF16 below) ------
@@ -701,8 +635,6 @@ def _bench_fn(fn, *args, **kwargs):
 
 
 # -- Correctness tests ---------------------------------------------------
-
-PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
 
 
 def _assert_k5_outputs_match_ref(
@@ -1113,68 +1045,16 @@ def _run_perf_comparison(args: PrefillArgs):
         us_vllm / us_fly if (us_fly > 0 and us_vllm == us_vllm) else float("nan")
     )
 
-    # bench333 cases carry trace-derived structural features (head/mid/
-    # tail seqlen, log_count); compute these once so the summary table
-    # can display them in a bench333-specific sub-table. Non-bench333
-    # rows leave these fields at their defaults (None / 0).
-    head_seqlen = mid_seqlen = tail_seqlen = 0
-    log_count = 0
-    if args.context_lens is not None and args.model_name == "prefill-bench333":
-        lens = list(args.context_lens)
-        if len(lens) == 1:
-            head_seqlen, tail_seqlen = int(lens[0]), 0
-        elif len(lens) == 2:
-            head_seqlen, tail_seqlen = int(lens[0]), int(lens[1])
-        elif len(lens) >= 3:
-            mids = lens[1:-1]
-            head_seqlen = int(lens[0])
-            tail_seqlen = int(lens[-1])
-            mid_seqlen = int(mids[0]) if all(m == mids[0] for m in mids) else 0
-        # trace_tag is set to "cnt{log_count}" by _build_bench407_params.
-        if args.trace_tag.startswith("cnt"):
-            try:
-                log_count = int(args.trace_tag[3:])
-            except ValueError:
-                log_count = 0
-
-    # For bench333 trace shapes the model name is the same string for
-    # all 333 rows ("prefill-bench333") which is useless in the per-row
-    # summary table. Use the trailing "T{T}_n{N}_cnt{log_count}" suffix
-    # of the pytest id instead, so each row's Model cell uniquely
-    # identifies the case.
-    if args.model_name == "prefill-bench333" and args.context_lens is not None:
-        n_seqs = len(args.context_lens)
-        T_total = sum(args.context_lens)
-        model_label = f"T{T_total}_n{n_seqs}_{args.trace_tag}"
-    else:
-        model_label = args.model_name or "-"
-
     _perf_results.append(
         {
-            "Model": model_label,
+            "Model": args.model_name or "-",
             "TP": args.tp,
-            "K": args.K,
-            "V": args.V,
             "Hg": args.Hg,
             "H": args.H,
             "SeqLen": args.full_prompt_len,
             "T": total_tokens,
             "varlen": args.is_varlen,
             "final_st": args.output_final_state,
-            "state": "bf16" if args.ssm_state_dtype == torch.bfloat16 else "fp32",
-            # bench333-only fields (0 for main-table rows)
-            "T_prefill": total_tokens if args.model_name == "prefill-bench333" else 0,
-            "num_seqs_prefill": (
-                len(args.context_lens)
-                if args.context_lens is not None
-                and args.model_name == "prefill-bench333"
-                else 0
-            ),
-            "head_seqlen": head_seqlen,
-            "mid_seqlen": mid_seqlen,
-            "tail_seqlen": tail_seqlen,
-            "log_count": log_count,
-            # Perf columns (same for all rows)
             "FlyDSL_vk(us)": us_fly,
             "Triton_vk(us)": us_triton_vk,
             "Triton_origin_opt(us)": us_triton_origin_opt,
@@ -1189,7 +1069,7 @@ def _run_perf_comparison(args: PrefillArgs):
 class TestPerformance:
     """Kernel-only performance comparison: FlyDSL vs Triton opt_vk vs Triton opt3_kv."""
 
-    @pytest.mark.parametrize("args", PERF_PARAMS, ids=PERF_TEST_IDS)
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_perf_comparison(self, args: PrefillArgs):
         _run_perf_comparison(args)
 
@@ -1198,24 +1078,7 @@ def _print_perf_table():
     if not _perf_results:
         return
 
-    # Two column layouts:
-    #   - main_cols  : for hand-written PrefillGroup shapes (Qwen3.5-35B
-    #                  / 397B / varlen-fs / bench333-varlen) showing
-    #                  SeqLen + T + varlen + final_st.
-    #   - bench_cols : for bench333 trace-derived shapes showing
-    #                  T_prefill + num_seqs_prefill + head/mid/tail
-    #                  + log_count instead. SeqLen / T are redundant
-    #                  here because T_prefill carries the same info.
-    perf_tail_cols = [
-        ("FlyDSL", "FlyDSL_vk(us)", 8),
-        ("Tri_vk", "Triton_vk(us)", 8),
-        ("Tri_orig_opt", "Triton_origin_opt(us)", 12),
-        ("vLLM", "vLLM_vk(us)", 8),
-        ("fly/vk", "flydsl_vs_vk", 7),
-        ("fly/o_opt", "flydsl_vs_origin_opt", 9),
-        ("fly/vllm", "flydsl_vs_vllm", 8),
-    ]
-    main_cols = [
+    cols = [
         ("Model", "Model", 16),
         ("TP", "TP", 3),
         ("Hg", "Hg", 3),
@@ -1224,113 +1087,41 @@ def _print_perf_table():
         ("T", "T", 7),
         ("var", "varlen", 3),
         ("fs", "final_st", 3),
-    ] + perf_tail_cols
-    bench_cols = [
-        ("Model", "Model", 22),
-        ("TP", "TP", 3),
-        ("Hg", "Hg", 3),
-        ("H", "H", 3),
-        ("T_prefill", "T_prefill", 9),
-        ("n_pref", "num_seqs_prefill", 6),
-        ("head", "head_seqlen", 6),
-        ("mid", "mid_seqlen", 6),
-        ("tail", "tail_seqlen", 6),
-        ("log_cnt", "log_count", 7),
-    ] + perf_tail_cols
+        ("FlyDSL", "FlyDSL_vk(us)", 8),
+        ("Tri_vk", "Triton_vk(us)", 8),
+        ("Tri_orig_opt", "Triton_origin_opt(us)", 12),
+        ("vLLM", "vLLM_vk(us)", 8),
+        ("fly/vk", "flydsl_vs_vk", 7),
+        ("fly/o_opt", "flydsl_vs_origin_opt", 9),
+        ("fly/vllm", "flydsl_vs_vllm", 8),
+    ]
 
-    def _build_header_sep(cols):
-        header = " | ".join(display.rjust(width) for display, _, width in cols)
-        sep = "-+-".join("-" * width for _, _, width in cols)
-        return header, sep
+    def _fmt_cell(val, key, width):
+        if isinstance(val, bool):
+            return ("Y" if val else "N").rjust(width)
+        if isinstance(val, float):
+            if val != val:  # NaN (vLLM column when vllm not installed)
+                return "-".rjust(width)
+            return (f"{val:.2f}x" if "_vs_" in key else f"{val:.1f}").rjust(width)
+        return str(val).rjust(width)
 
-    def _fmt_row(row, cols):
-        cells = []
-        for display, key, width in cols:
-            val = row[key]
-            if isinstance(val, bool):
-                cells.append(("Y" if val else "N").rjust(width))
-            elif isinstance(val, float):
-                if val != val:  # NaN (e.g. vLLM column when vllm not installed)
-                    cells.append("-".rjust(width))
-                elif "_vs_" in key:
-                    cells.append(f"{val:.2f}x".rjust(width))
-                else:
-                    cells.append(f"{val:.1f}".rjust(width))
-            else:
-                cells.append(str(val).rjust(width))
-        return " | ".join(cells)
+    header = " | ".join(display.rjust(w) for display, _, w in cols)
+    sep = "-+-".join("-" * w for _, _, w in cols)
+    border = "=" * len(header)
 
-    main_header, main_sep = _build_header_sep(main_cols)
-    bench_header, bench_sep = _build_header_sep(bench_cols)
-    border = "=" * max(len(main_header), len(bench_header))
-
-    # Bucket rows by SSM-state dtype and by main-vs-bench333. Keep each
-    # bucket's order consistent with ``_perf_results`` insertion so rows
-    # line up with the parametrize id order. bench333 trace rows are
-    # tagged by ``log_count > 0`` (main groups all leave log_count at 0).
-    def _split(rows):
-        main = [r for r in rows if r.get("log_count", 0) == 0]
-        bench = [r for r in rows if r.get("log_count", 0) > 0]
-        return main, bench
-
-    rows_fp32_main, rows_fp32_bench = _split(
-        [r for r in _perf_results if r["state"] == "fp32"]
-    )
-    rows_bf16_main, rows_bf16_bench = _split(
-        [r for r in _perf_results if r["state"] == "bf16"]
-    )
-
-    lines = ["", border]
-    lines.append(
-        "K5 Prefill Performance Summary "
-        "(K5 device kernel time only, via torch.profiler)"
-    )
-    lines.append(
-        "  Triton K5 references always use fp32 SSM state; only FlyDSL's "
-        "SSM-state dtype changes between the sub-tables below."
-    )
-    lines.append(border)
-
-    def _emit_subtable(title, rows, cols, header, sep):
-        if not rows:
-            return
-        lines.append("")
-        lines.append(title)
-        lines.append(sep)
-        lines.append(header)
-        lines.append(sep)
-        for row in rows:
-            lines.append(_fmt_row(row, cols))
-        lines.append(sep)
-
-    _emit_subtable(
-        "[FlyDSL SSM state = fp32] -- main groups",
-        rows_fp32_main,
-        main_cols,
-        main_header,
-        main_sep,
-    )
-    _emit_subtable(
-        "[FlyDSL SSM state = fp32] -- bench333 trace shapes",
-        rows_fp32_bench,
-        bench_cols,
-        bench_header,
-        bench_sep,
-    )
-    _emit_subtable(
-        "[FlyDSL SSM state = bf16] -- main groups",
-        rows_bf16_main,
-        main_cols,
-        main_header,
-        main_sep,
-    )
-    _emit_subtable(
-        "[FlyDSL SSM state = bf16] -- bench333 trace shapes",
-        rows_bf16_bench,
-        bench_cols,
-        bench_header,
-        bench_sep,
-    )
+    lines = [
+        "",
+        border,
+        "K5 Prefill Performance Summary (K5 device kernel time only, via torch.profiler)",
+        border,
+        "",
+        sep,
+        header,
+        sep,
+    ]
+    for row in _perf_results:
+        lines.append(" | ".join(_fmt_cell(row[k], k, w) for _, k, w in cols))
+    lines.append(sep)
     lines.append("")
     print("\n".join(lines))
 
