@@ -40,6 +40,7 @@ def pa_decode_sparse(
     block_h: Optional[int] = None,
     kv_splits: Optional[int] = None,
     has_invalid: Optional[bool] = True,
+    skip_reduce: Optional[bool] = False,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -58,9 +59,19 @@ def pa_decode_sparse(
             auto-infers to fill ~512 total CTAs while capping below the number
             of K-blocks, then rounds up to a power of 2.
         num_stages: software-pipeline depth of the K loop (default 2).
+        skip_reduce: when the split-K path is active (``kv_splits > 1``), return
+            the pre-reduce ``(acc_partial, m_partial, l_partial)`` partials
+            instead of launching the reduce kernel. Has no effect when
+            ``kv_splits == 1`` (the single-CTA path already produces the final
+            ``out`` directly). Useful for profiling the main kernel in
+            isolation and for callers that fold the reduce into a downstream op.
 
     Returns:
-        ``[N, H, D]`` attention output, same dtype as ``q``.
+        ``[N, H, D]`` attention output, same dtype as ``q``. When
+        ``skip_reduce`` is set and ``kv_splits > 1`` instead returns the tuple
+        ``(acc_partial, m_partial, l_partial)`` with shapes
+        ``([N, KV_SPLITS, H_padded, D], [N, KV_SPLITS, H_padded],
+        [N, KV_SPLITS, H_padded])`` (all fp32).
 
     Optimizations targeted:
       (1) Wider ``BLOCK_H`` so all heads of a token are handled by one CTA →
@@ -84,8 +95,10 @@ def pa_decode_sparse(
     )
 
     out = torch.empty_like(q)
-    kv_indices = kv_indices.to(torch.int32).contiguous()
-    kv_indptr = kv_indptr.to(torch.int32).contiguous()
+    assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
+    assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
+    # kv_indices = kv_indices.to(torch.int32).contiguous()
+    # kv_indptr = kv_indptr.to(torch.int32).contiguous()
 
     if block_h is None:
         # Default: one CTA per token (kills the H/BLOCK_H KV duplication).
@@ -101,9 +114,9 @@ def pa_decode_sparse(
 
     use_gluon = DEVICE_ARCH == "gfx1250"
 
-    import os
+    # import os
 
-    use_gluon = os.environ.get("PA_DECODE_SPARSE_BACKEND", "gluon").lower() == "gluon"
+    # use_gluon = os.environ.get("PA_DECODE_SPARSE_BACKEND", "gluon").lower() == "gluon"
 
     # gfx1250 stages slots through LDS via TDM async_load, which hides the
     # larger per-tile KV gather latency -> BLOCK_K=32 is fastest there. Other
@@ -111,8 +124,8 @@ def pa_decode_sparse(
     if use_gluon:
         block_k = 32
         attn_num_warps = 2
-        # max_num_wg = 512
-        max_num_wg = 64
+        max_num_wg = 512
+        # max_num_wg = 64
 
         # attn_num_warps = 4
         # # max_num_wg = 256
@@ -133,13 +146,14 @@ def pa_decode_sparse(
     # reduce kernel's tl.arange(0, KV_SPLITS) compiles; over-splitting past
     # max_kv_splits is handled by the kernel (empty splits early-return and
     # the reduce masks their stale partial-buffer slots).
+    # print(f"{kv_indices.shape[0]=}")
     if kv_splits is None:
         max_kv_len = kv_indices.shape[0]
         max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
         kv_splits = triton.next_power_of_2(kv_splits)
-    print(f"{use_gluon=} {kv_splits=}")
+    # print(f"{use_gluon=} {kv_splits=}")
 
     if kv_splits == 1:
         m_partial = l_partial = acc_partial = out  # unused inside the kernel
@@ -209,6 +223,11 @@ def pa_decode_sparse(
     if kv_splits == 1:
         return out
 
+    if skip_reduce:
+        # Hand back the pre-reduce partials; the caller (or a downstream op)
+        # is responsible for the log-sum-exp combine + sink fold.
+        return acc_partial, m_partial, l_partial
+    assert False
     # One reduce CTA per head. For small per-rank H (TP=8 → H ∈ {8, 16}) this
     # multiplies the reduce-side CTA count by H, replacing the previous single
     # under-occupied CTA per token with a small fan-out that hides launch
