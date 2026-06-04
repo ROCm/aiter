@@ -2117,6 +2117,9 @@ namespace py = pybind11;
           py::arg("initial_state"),                                         \
           py::arg("cu_seqlens"),                                            \
           py::arg("chunk_offsets"),                                         \
+          py::arg("h"),                                                     \
+          py::arg("v_new"),                                                 \
+          py::arg("final_state"),                                           \
           py::arg("selected_bv"),                                           \
           py::arg("has_initial_state"),                                     \
           py::arg("output_final_state"),                                    \

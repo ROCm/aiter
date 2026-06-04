@@ -274,7 +274,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             "use_chunk_hip and use_chunk_flydsl are mutually exclusive; "
             "set at most one."
         )
-    if use_chunk_hip and _is_gfx12_runtime():
+    if use_chunk_hip and (_is_gfx12_runtime() or num_decodes > 0):
         use_chunk_hip = False
 
     g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(

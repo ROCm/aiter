@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import triton
@@ -90,7 +90,7 @@ def _select_bv_for_varlen(chunk_offsets: torch.Tensor, num_heads: int) -> int:
     return _select_bv(chunk_offsets.device, num_heads, total_chunks, max_seq_chunks)
 
 
-@compile_ops(MD_NAME)
+@compile_ops(MD_NAME, develop=True)
 def chunk_gated_delta_rule_fwd_h_hip(
     k: Tensor,
     w: Tensor,
@@ -100,13 +100,16 @@ def chunk_gated_delta_rule_fwd_h_hip(
     initial_state: Tensor,
     cu_seqlens: Tensor,
     chunk_offsets: Tensor,
+    h: Tensor,
+    v_new: Tensor,
+    final_state: Tensor,
     selected_bv: int,
     has_initial_state: bool,
     output_final_state: bool,
     save_new_value: bool,
     use_exp2: bool,
     g_head_major: bool,
-) -> Tuple[Tensor, Tensor, Tensor]: ...
+) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -282,7 +285,25 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     else:
         gk_arg = torch.empty(0, device=k.device, dtype=torch.float32)
 
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h_hip(
+    N = int(cu_seqlens_int32.numel() - 1) if is_varlen else B
+    total_chunks = int(chunk_offsets_int32[-1].item()) if is_varlen else B * NT
+    h = torch.empty(
+        (1, total_chunks, H, V, K) if is_varlen else (B, NT, H, V, K),
+        device=k.device,
+        dtype=torch.bfloat16,
+    )
+    v_new = (
+        torch.empty((B, H, T_flat, V), device=k.device, dtype=torch.bfloat16)
+        if save_new_value
+        else torch.empty(0, device=k.device, dtype=torch.bfloat16)
+    )
+    final_state = (
+        torch.empty((N, H, V, K), device=k.device, dtype=state.tensor.dtype)
+        if output_final_state
+        else torch.empty(0, device=k.device, dtype=state.tensor.dtype)
+    )
+
+    chunk_gated_delta_rule_fwd_h_hip(
         k_hip,
         w_hip,
         u_hip,
@@ -291,6 +312,9 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
         state.tensor,
         cu_seqlens_int32,
         chunk_offsets_int32,
+        h,
+        v_new,
+        final_state,
         selected_bv,
         state.has_initial_state,
         output_final_state,

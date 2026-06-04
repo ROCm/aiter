@@ -1,18 +1,14 @@
 # Copyright (C) 2023-2026, Songlin Yang, Yu Zhang
 
 import os
-from typing import Tuple as _TypingTuple
 
 os.environ.setdefault("AITER_TRITON_ONLY", "1")
 os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
 
-import aiter
 import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-
-aiter.Tuple = _TypingTuple
 
 from aiter.ops.triton.gated_delta_net import (
     fused_recurrent_gated_delta_rule,
