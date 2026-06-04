@@ -6,7 +6,24 @@ import pytest
 import torch
 from einops import rearrange, repeat
 
-from aiter.ops.triton.attention.mha_v3 import flash_attn_with_kvcache
+from aiter.ops.triton.attention.mha_v3 import (
+    flash_attn_with_kvcache,
+    flash_attn_func,
+    flash_attn_varlen_func,
+    flash_attn_fp8_func,
+    flash_attn_varlen_fp8_func,
+)
+from aiter.test_mha_common import (
+    attention_ref as _mha_common_attention_ref,
+    attention_ref_with_tol,
+    generate_random_padding_mask,
+    generate_qkv,
+)
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
+
+_arch = get_arch()
+_supports_fp8 = _arch in FP8_ARCHS
 
 SEED = 0
 
@@ -405,7 +422,7 @@ def test_flash_attn_kvcache_torch_compile(
 
 @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])
-def test_flash_attn_kvcache_hipgraph_capture(mha_type, new_kv):
+def test_flash_attn_kvcache_graph_capture(mha_type, new_kv):
     d = 128
     device = "cuda"
     torch.random.manual_seed(SEED)
@@ -511,11 +528,9 @@ def test_flash_attn_kvcache_hipgraph_capture(mha_type, new_kv):
     if isinstance(out_eager, tuple):
         out_eager = out_eager[0]
 
-    assert not torch.isnan(out_graph).any(), "HIP graph replay 1 produced NaN"
+    assert not torch.isnan(out_graph).any(), "graph replay 1 produced NaN"
     diff1 = (out_eager - out_graph).abs().max().item()
-    assert (
-        diff1 < 1e-5
-    ), f"HIP graph replay 1 vs eager max diff {diff1:.6e} exceeds 1e-5"
+    assert diff1 < 1e-5, f"graph replay 1 vs eager max diff {diff1:.6e} exceeds 1e-5"
 
     # second replay with new data (simulates next decode step)
     q_new_data = torch.randn_like(q)
@@ -553,8 +568,512 @@ def test_flash_attn_kvcache_hipgraph_capture(mha_type, new_kv):
     if isinstance(out_eager_2, tuple):
         out_eager_2 = out_eager_2[0]
 
-    assert not torch.isnan(out_graph_2).any(), "HIP graph replay 2 produced NaN"
+    assert not torch.isnan(out_graph_2).any(), "graph replay 2 produced NaN"
     diff2 = (out_eager_2 - out_graph_2).abs().max().item()
-    assert (
-        diff2 < 1e-5
-    ), f"HIP graph replay 2 vs eager max diff {diff2:.6e} exceeds 1e-5"
+    assert diff2 < 1e-5, f"graph replay 2 vs eager max diff {diff2:.6e} exceeds 1e-5"
+
+
+# ===========================================================================
+# Additional mha_v3 tests: FP8 fwd/bwd, paged graph capture, and
+# flash_attn_func / flash_attn_varlen_func graph capture.
+# ===========================================================================
+
+
+def assert_cosine_similarity(actual, expected, threshold=0.96, norm_floor=1e-3):
+    a = actual.float().flatten()
+    b = expected.float().flatten()
+    if b.norm().item() > norm_floor:
+        cos_sim = torch.nn.functional.cosine_similarity(
+            a.unsqueeze(0), b.unsqueeze(0)
+        ).item()
+        assert cos_sim >= threshold, f"Cosine similarity {cos_sim:.6f} < {threshold}"
+
+
+def fp8_assert_close(tensor_a, tensor_b, atol=1.0, cos_sim_threshold=0.96):
+    a = tensor_a.float().flatten()
+    b = tensor_b.float().flatten()
+    max_abs = (a - b).abs().max().item()
+    assert max_abs <= atol, f"Max absolute error {max_abs:.4f} > {atol}"
+    assert_cosine_similarity(tensor_a, tensor_b, cos_sim_threshold)
+
+
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (512, 2048)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 8), (16, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_fp8(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    dtype=torch.float16,
+):
+    if not _supports_fp8:
+        pytest.skip(f"FP8 not supported on {_arch}")
+
+    torch.cuda.empty_cache()
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+
+    triton_out = flash_attn_fp8_func(q, k, v, causal=CAUSAL)
+
+    torch_out, _, _ = _mha_common_attention_ref(q, k, v, causal=CAUSAL)
+
+    fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
+
+
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (512, 2048)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 8), (16, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_varlen_fp8(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    dtype=torch.float16,
+):
+    if not _supports_fp8:
+        pytest.skip(f"FP8 not supported on {_arch}")
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    query_padding_mask = generate_random_padding_mask(
+        SEQLEN_Q, BATCH, "cuda", mode="random"
+    )
+    key_padding_mask = generate_random_padding_mask(
+        SEQLEN_K, BATCH, "cuda", mode="random"
+    )
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+    triton_out = flash_attn_varlen_fp8_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=CAUSAL,
+    )
+    triton_out = output_pad_fn(triton_out)
+
+    torch_out, _, _ = _mha_common_attention_ref(
+        q,
+        k,
+        v,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        causal=CAUSAL,
+    )
+
+    fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
+
+
+@pytest.mark.parametrize("SEQLEN_Q", [512, 2048])
+@pytest.mark.parametrize("SEQLEN_K", [512, 2048])
+@pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_backward_fp8(
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    CAUSAL: bool,
+    dtype=torch.float16,
+):
+    BATCH = 3
+    NUM_K_HEADS = 8
+    HEAD_SZ = 128
+    if not _supports_fp8:
+        pytest.skip(f"FP8 not supported on {_arch}")
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    v = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    q.requires_grad = True
+    k.requires_grad = True
+    v.requires_grad = True
+    do = torch.randn_like(q)
+
+    with torch.enable_grad():
+        triton_out = flash_attn_fp8_func(q, k, v, causal=CAUSAL)
+    triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+        triton_out, (q, k, v), do.clone()
+    )
+
+    torch_out, torch_grads, fwd_tol, bwd_tols = attention_ref_with_tol(
+        q,
+        k,
+        v,
+        do,
+        is_fp8=True,
+        causal=CAUSAL,
+    )
+    torch_dq, torch_dk, torch_dv = torch_grads
+
+    triton_vals = [triton_out, triton_dq, triton_dk, triton_dv]
+    ref_vals = [torch_out, torch_dq, torch_dk, torch_dv]
+    tols = [fwd_tol] + bwd_tols
+    for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
+        torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
+        assert_cosine_similarity(tri, ref)
+
+
+@pytest.mark.parametrize("SEQLEN_Q", [512, 2048])
+@pytest.mark.parametrize("SEQLEN_K", [512, 2048])
+@pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_backward_varlen_fp8(
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    CAUSAL: bool,
+    dtype=torch.float16,
+):
+    BATCH = 3
+    NUM_K_HEADS = 8
+    HEAD_SZ = 128
+    if not _supports_fp8:
+        pytest.skip(f"FP8 not supported on {_arch}")
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    v = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    q.requires_grad = True
+    k.requires_grad = True
+    v.requires_grad = True
+
+    query_padding_mask = generate_random_padding_mask(
+        SEQLEN_Q, BATCH, "cuda", mode="random"
+    )
+    key_padding_mask = generate_random_padding_mask(
+        SEQLEN_K, BATCH, "cuda", mode="random"
+    )
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+    q_unpad.requires_grad = True
+    k_unpad.requires_grad = True
+    v_unpad.requires_grad = True
+    do = torch.randn_like(q)
+
+    with torch.enable_grad():
+        triton_out = flash_attn_varlen_fp8_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=CAUSAL,
+        )
+    triton_out = output_pad_fn(triton_out)
+    triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+        triton_out, (q_unpad, k_unpad, v_unpad), do.clone()
+    )
+    triton_dq = dq_pad_fn(triton_dq)
+    triton_dk = dk_pad_fn(triton_dk)
+    triton_dv = dk_pad_fn(triton_dv)
+
+    torch_out, torch_grads, fwd_tol, bwd_tols = attention_ref_with_tol(
+        q,
+        k,
+        v,
+        do,
+        is_fp8=True,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        causal=CAUSAL,
+    )
+    torch_dq, torch_dk, torch_dv = torch_grads
+
+    triton_vals = [triton_out, triton_dq, triton_dk, triton_dv]
+    ref_vals = [torch_out, torch_dq, torch_dk, torch_dv]
+    tols = [fwd_tol] + bwd_tols
+    for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
+        torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
+        assert_cosine_similarity(tri, ref)
+
+
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+def test_flash_attn_kvcache_paged_graph(mha_type):
+    """graph capture with paged KV cache (block_table)."""
+    d = 128
+    device = "cuda"
+    torch.random.manual_seed(SEED)
+    torch.cuda.manual_seed(SEED)
+    batch_size = 2
+    seqlen_q = 1
+    num_blocks_per_seq = 32
+    block_size = 16
+    max_cache_len = num_blocks_per_seq * block_size - 3  # 509
+    nheads = 8
+    nheads_k = nheads if mha_type == "mha" else 2
+    dtype = torch.bfloat16
+
+    num_blocks = batch_size * num_blocks_per_seq
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(
+        num_blocks, block_size, nheads_k, d, device=device, dtype=dtype
+    )
+    v_cache = torch.randn_like(k_cache)
+    block_table = (
+        torch.arange(num_blocks, device=device, dtype=torch.int32)
+        .view(batch_size, num_blocks_per_seq)
+        .contiguous()
+    )
+    cache_seqlens = torch.full(
+        (batch_size,), max_cache_len, device=device, dtype=torch.int32
+    )
+
+    q_orig = q.clone()
+
+    # warmup (Triton JIT)
+    for _ in range(3):
+        _ = flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=d ** (-0.5),
+            causal=False,
+            page_table=block_table,
+        )
+    torch.cuda.synchronize()
+
+    q.copy_(q_orig)
+
+    # capture
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out_graph = flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=d ** (-0.5),
+            causal=False,
+            page_table=block_table,
+        )
+
+    q.copy_(q_orig)
+    g.replay()
+    torch.cuda.synchronize()
+
+    if isinstance(out_graph, tuple):
+        out_graph = out_graph[0]
+
+    # eager reference
+    out_eager = flash_attn_with_kvcache(
+        q_orig.clone(),
+        k_cache.clone(),
+        v_cache.clone(),
+        cache_seqlens=cache_seqlens.clone(),
+        softmax_scale=d ** (-0.5),
+        causal=False,
+        page_table=block_table.clone(),
+    )
+    torch.cuda.synchronize()
+    if isinstance(out_eager, tuple):
+        out_eager = out_eager[0]
+
+    assert not torch.isnan(out_graph).any(), "Paged graph replay produced NaN"
+    diff = (out_eager - out_graph).abs().max().item()
+    assert diff < 1e-5, f"Paged graph replay vs eager max diff {diff:.6e} exceeds 1e-5"
+
+
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+def test_flash_attn_func_graph(mha_type):
+    """graph capture for flash_attn_func (basic forward)."""
+    d = 128
+    device = "cuda"
+    torch.manual_seed(SEED)
+    batch_size = 2
+    seqlen = 128
+    nheads = 8
+    nheads_k = nheads if mha_type == "mha" else 2
+    dtype = torch.bfloat16
+
+    q = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, nheads_k, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, nheads_k, d, device=device, dtype=dtype)
+
+    q_orig = q.clone()
+    k_orig = k.clone()
+    v_orig = v.clone()
+
+    # warmup
+    for _ in range(3):
+        _ = flash_attn_func(q, k, v, causal=True)
+    torch.cuda.synchronize()
+
+    q.copy_(q_orig)
+    k.copy_(k_orig)
+    v.copy_(v_orig)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out_graph = flash_attn_func(q, k, v, causal=True)
+
+    q.copy_(q_orig)
+    k.copy_(k_orig)
+    v.copy_(v_orig)
+    g.replay()
+    torch.cuda.synchronize()
+
+    out_eager = flash_attn_func(
+        q_orig.clone(), k_orig.clone(), v_orig.clone(), causal=True
+    )
+    torch.cuda.synchronize()
+
+    assert not torch.isnan(out_graph).any(), "Graph replay produced NaN"
+    diff = (out_eager - out_graph).abs().max().item()
+    assert diff < 1e-5, f"Graph replay vs eager max diff {diff:.6e} exceeds 1e-5"
+
+
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+def test_flash_attn_varlen_func_graph(mha_type):
+    """graph capture for flash_attn_varlen_func."""
+    d = 128
+    device = "cuda"
+    torch.manual_seed(SEED)
+    batch_size = 2
+    seqlen = 128
+    nheads = 8
+    nheads_k = nheads if mha_type == "mha" else 2
+    dtype = torch.bfloat16
+
+    q = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, nheads_k, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, nheads_k, d, device=device, dtype=dtype)
+    query_padding_mask = generate_random_padding_mask(
+        seqlen, batch_size, device, mode="full"
+    )
+    key_padding_mask = generate_random_padding_mask(
+        seqlen, batch_size, device, mode="full"
+    )
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+    q_orig = q_unpad.clone()
+    k_orig = k_unpad.clone()
+    v_orig = v_unpad.clone()
+
+    # warmup
+    for _ in range(3):
+        _ = flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=True,
+        )
+    torch.cuda.synchronize()
+
+    with torch.no_grad():
+        q_unpad.copy_(q_orig)
+        k_unpad.copy_(k_orig)
+        v_unpad.copy_(v_orig)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out_graph = flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=True,
+        )
+
+    with torch.no_grad():
+        q_unpad.copy_(q_orig)
+        k_unpad.copy_(k_orig)
+        v_unpad.copy_(v_orig)
+    g.replay()
+    torch.cuda.synchronize()
+
+    out_eager = flash_attn_varlen_func(
+        q_orig.clone(),
+        k_orig.clone(),
+        v_orig.clone(),
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=True,
+    )
+    torch.cuda.synchronize()
+
+    if isinstance(out_graph, tuple):
+        out_graph = out_graph[0]
+    if isinstance(out_eager, tuple):
+        out_eager = out_eager[0]
+
+    assert not torch.isnan(out_graph).any(), "Graph replay produced NaN"
+    diff = (out_eager - out_graph).abs().max().item()
+    assert diff < 1e-5, f"Graph replay vs eager max diff {diff:.6e} exceeds 1e-5"

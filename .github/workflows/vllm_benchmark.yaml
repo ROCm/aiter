@@ -98,7 +98,6 @@ jobs:
               pip uninstall -y aiter amd-aiter || true
               pip config set global.default-timeout 60
               pip config set global.retries 10
-              pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
               pip install -r requirements.txt
               pip install --upgrade pandas pyzmq einops numpy==1.26.2
               pip install --upgrade "pybind11>=3.0.1"

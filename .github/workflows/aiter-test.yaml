@@ -26,7 +26,7 @@ env:
   GPU_ARCH_LIST: "gfx942;gfx950"
   AITER_TEST: "op_tests"
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
-  AITER_PREBUILD_MAX_JOBS: "96"
+  AITER_PREBUILD_MAX_JOBS: "64"
   TRITON_WHEEL_ARTIFACT_NAME: triton_wheelhouse
 
 jobs:
@@ -603,7 +603,7 @@ jobs:
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
     if: github.ref == 'refs/heads/main'
-    needs: build_aiter_wheels
+    needs: [build_aiter_wheels, prepare_triton_wheel]
     strategy:
       fail-fast: false
       matrix:
@@ -625,6 +625,13 @@ jobs:
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
+
+      - name: Download Triton wheel artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
+          path: triton_wheels
 
       - name: Docker login
         if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
@@ -663,6 +670,7 @@ jobs:
           --network=host \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
+          -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
