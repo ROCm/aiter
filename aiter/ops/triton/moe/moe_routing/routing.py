@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
     _expt_data_only_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
+from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
 
 @dataclass
@@ -345,7 +346,6 @@ def routing(
         assert (
             num_expert_group is not None and topk_group is not None
         ), "use_grouped_topk requires num_expert_group and topk_group"
-        from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
         expt_scal, expt_indx, bitmatrix = grouped_topk(
             logits,
