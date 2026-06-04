@@ -163,7 +163,10 @@ def _kb_sum_silu_mul_kernel(
     Python overhead (~25 us) dwarfs this kernel's GPU time at the small-M
     shapes that are the only place stage1 reduce mode ever wins.
     """
-    pid_m = tl.program_id(0)
+    # int64 offsets: KB * rows * (2*inter_dim) can exceed INT32_MAX for large
+    # rows (= token_num*topk), so compute flat offsets in 64-bit to avoid
+    # wraparound -> illegal memory access.
+    pid_m = tl.program_id(0).to(tl.int64)
     pid_n = tl.program_id(1)
 
     col_off = pid_n * BLOCK_N
@@ -174,7 +177,7 @@ def _kb_sum_silu_mul_kernel(
     u = tl.zeros([BLOCK_N], dtype=tl.float32)
 
     row_stride = 2 * inter_dim
-    slab_stride = rows * row_stride
+    slab_stride = rows.to(tl.int64) * row_stride
 
     for k in tl.static_range(KB):
         base = tmp_out_ptr + k * slab_stride + pid_m * row_stride
@@ -202,7 +205,10 @@ def _kb_sum_silu_mul_quant_kernel(
     BLOCK_N: tl.constexpr,
 ):
     """Per route: reduce kb -> silu(gate)*up -> per-row fp8 quant."""
-    pid_m = tl.program_id(0)
+    # int64 offsets: KB * rows * (2*inter_dim) can exceed INT32_MAX for large
+    # rows (= token_num*topk), so compute flat offsets in 64-bit to avoid
+    # wraparound -> illegal memory access.
+    pid_m = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, BLOCK_N)
     mask = offs < inter_dim
 
@@ -210,7 +216,7 @@ def _kb_sum_silu_mul_quant_kernel(
     u = tl.zeros([BLOCK_N], dtype=tl.float32)
 
     row_stride = 2 * inter_dim
-    slab_stride = rows * row_stride
+    slab_stride = rows.to(tl.int64) * row_stride
 
     for k in tl.static_range(KB):
         base = tmp_out_ptr + k * slab_stride + pid_m * row_stride
@@ -237,7 +243,9 @@ def _silu_mul_quant_kernel(
     BLOCK_N: tl.constexpr,
 ):
     """Per route: silu(gate)*up -> per-row fp8 quant."""
-    pid_m = tl.program_id(0)
+    # int64 row index: rows * (2*inter_dim) can exceed INT32_MAX for large
+    # rows/inter_dim, so compute flat offsets in 64-bit to avoid wraparound.
+    pid_m = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, BLOCK_N)
     mask = offs < inter_dim
 
@@ -457,7 +465,10 @@ def _topk_sum_kernel(
     Same host-side config picker as ``_kb_sum_silu_mul_kernel``; ditto the
     rationale for skipping ``@triton.autotune``.
     """
-    pid_m = tl.program_id(0)
+    # int64 row index: token_num * TOPK * model_dim can exceed INT32_MAX
+    # (e.g. 65536 * 9 * 4096 ~= 2.42e9 > 2^31), so the flat offset must be
+    # computed in 64-bit to avoid wraparound -> illegal memory access.
+    pid_m = tl.program_id(0).to(tl.int64)
     pid_n = tl.program_id(1)
 
     col_off = pid_n * BLOCK_N
@@ -606,7 +617,10 @@ def _fused_init_kernel(
     and the kernel computes ``expert_idx = offs // w_cols`` to broadcast each
     expert's scale across its ``w_cols`` adjacent output columns.
     """
-    pid = tl.program_id(0)
+    # int64 offset base: the unified offset space (max of tmp_n / flat_a_n /
+    # flat_w_n) can exceed INT32_MAX for very large token counts, so compute
+    # the flat offset in 64-bit to avoid wraparound -> illegal memory access.
+    pid = tl.program_id(0).to(tl.int64)
     base = pid * BLOCK
     offs = base + tl.arange(0, BLOCK)
 
