@@ -138,6 +138,7 @@ def test_mla(
     decode_qlen,
     split_per_batch=None,
     return_lse=False,
+    sequential_page_indices=False,
 ):
     ret = {}
 
@@ -161,9 +162,14 @@ def test_mla(
         seq_lens_kv.fill_(ctx_lens)
         seq_lens_qo.fill_(ctx_lens)
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
-    kv_indices = torch.randint(
-        0, num_page, (kv_indptr[-1].item() + 10000,), dtype=torch.int
-    )
+    if sequential_page_indices:
+        # page_id == logical token index; needs pool >= ctx and byte offset can exceed 2^32
+        num_page = max(num_page, kv_indptr[-1].item() + 10000)
+    n_kv_idx = kv_indptr[-1].item() + 10000
+    if sequential_page_indices:
+        kv_indices = torch.arange(n_kv_idx, dtype=torch.int)
+    else:
+        kv_indices = torch.randint(0, num_page, (n_kv_idx,), dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
     max_seqlen_kv = seq_lens_kv.max().item()
@@ -844,6 +850,12 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
+parser.add_argument(
+    "--sequential-page-indices",
+    action="store_true",
+    help="""Use kv_indices[i]=i (sequential physical page id) instead of random pages.
+    Expands KV pool to cover ctx length (tests 64-bit page_idx * stride).""",
+)
 
 
 args = parser.parse_args()
@@ -869,6 +881,7 @@ for nhead, decode_qlen in args.nhead:
                 decode_qlen=decode_qlen,
                 split_per_batch=split_per_batch,
                 return_lse=args.return_lse,
+                sequential_page_indices=args.sequential_page_indices,
             )
             df.append(ret)
     df = pd.DataFrame(df)

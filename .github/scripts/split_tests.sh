@@ -76,6 +76,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_fused_qk_norm_rope_cache_quant.py]=446
     FILE_TIMES[op_tests/test_topk_plain.py]=403
     FILE_TIMES[op_tests/test_rope.py]=396
+    FILE_TIMES[op_tests/test_gated_delta_rule.py]=318
     FILE_TIMES[op_tests/test_topk_per_row.py]=272
     FILE_TIMES[op_tests/test_concat_cache_mla.py]=232
     FILE_TIMES[op_tests/test_moe_topk_gating.py]=198

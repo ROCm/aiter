@@ -9,6 +9,9 @@ from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dequant_nvfp4
 
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+DEVICE_ARCH = arch_info.get_arch()
 
 
 def split_unshuffle_nvfp4_kv_buffer(kv_buffer, D_lora, D_pe):
@@ -209,6 +212,12 @@ def test_cat_and_cache_mla(
     shuffled_kv_cache: bool,
     block_size: int,
 ):
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in (
+        "gfx950",
+        "gfx1250",
+    ):
+        pytest.skip("FP4 KV cache is only supported in GFX950 and GFX1250")
+
     dtype = torch.bfloat16
     k_lora = torch.randn((T, KH, D_lora), dtype=torch.float32, device="cuda") / (
         20 if cache_dtype != torch.bfloat16 else 1

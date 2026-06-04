@@ -153,7 +153,7 @@ def moe_gemm_a16w4(
     apply_swiglu=False,
     alpha=1.0,
     limit=1.0,
-    add_residual=True,
+    swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
 ):
@@ -254,7 +254,7 @@ def moe_gemm_a16w4(
         alpha,
         limit,
         reduction_n_matmul,
-        add_residual,
+        swiglu_add_residual,
         routing_data.n_expts_act,
         config["block_m"],
         config["block_n"],
@@ -289,7 +289,7 @@ def moe_gemm_a16w4(
         limit,
         reduction_n_reduction,
         out_dtype=out_dtype,
-        add_residual=add_residual,
+        swiglu_add_residual=swiglu_add_residual,
     )
 
     return y_final
