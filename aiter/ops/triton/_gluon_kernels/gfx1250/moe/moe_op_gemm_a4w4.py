@@ -311,9 +311,17 @@ def _moe_gemm_a4w4_gfx1250(
     if GatherIndx is None:
         X += start_m * stride_x_m
     else:
-        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
-            0, gl.BlockedLayout([1, 8], [32, 1], [1, num_warps], [0, 1])
+        gl.static_assert(
+            GatherIndx.dtype.element_ty == gl.uint16 or GatherIndx.dtype.element_ty == gl.int32, "GatherIndex must be uint16 or int32"
         )
+        if GatherIndx.dtype.element_ty == gl.uint16:
+            IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
+                0, gl.BlockedLayout([1, 16], [32, 1], [1, num_warps], [0, 1])
+            )
+        else:
+            IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
+                0, gl.BlockedLayout([1, 8], [32, 1], [1, num_warps], [0, 1])
+            )
         offs_x_m = PACKED_BLOCK_M_X * block_id + gl.arange(
             0, PACKED_BLOCK_M_X, layout=IDX_LAYOUT
         )
@@ -389,6 +397,9 @@ def _moe_gemm_a4w4_gfx1250(
         SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[256, 16]], [SCALE_BLOCK_N, PACKED_MX_BLOCK], [1, 0]
         )
+    SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[OUT_BLOCK_N, 8]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
+    )
 
     if GatherIndx is None:
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -713,24 +724,12 @@ def _moe_gemm_a4w4_gfx1250(
 
     # apply activation function
     if APPLY_SWIGLU and SPLIT_K == 1:
-        if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
-            SWIGLU_LAYOUT: gl.constexpr = gl.BlockedLayout(
-                size_per_thread=[1, 2],
-                threads_per_warp=[16, 2],
-                warps_per_cta=[num_warps, 1],
-                order=[1, 0],
-            )
-            acc = gl.convert_layout(acc, SWIGLU_LAYOUT)
         out = _swiglu(acc, alpha, limit, ADD_RESIDUAL)
         out = gl.convert_layout(out, WMMA_LAYOUT)
         gl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
         )
-        offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(
-            0, OUT_BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-        )
-        mask_n = offs_y_n < yN
     else:
         gl.static_assert(
             ACTIVATION_REDUCTION_N == 1,
@@ -743,13 +742,23 @@ def _moe_gemm_a4w4_gfx1250(
         gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
         out *= gammas[:, None]
 
-    # write-back
-    Y += start_m * stride_y_m
-    offs_y_m = offs_m
-    offs_y = (
-        offs_y_m.to(index_type)[:, None] * stride_y_m
-        + offs_y_n.to(index_type)[None, :] * stride_y_n
-    )
-    mask = mask_m[:, None] & mask_n[None, :]
+    # write-back via TDM store: registers -> shared memory -> global memory
     out = out.to(gl.bfloat16)
-    gl.amd.gfx1250.buffer_store(out, Y, offs_y, mask=mask)
+    Y += start_m * stride_y_m
+    y_buffer = gl.allocate_shared_memory(
+        Y.type.element_ty,
+        shape=[BLOCK_M, OUT_BLOCK_N],
+        layout=SHARED_LAYOUT_Y,
+    )
+    y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=Y,
+        shape=(M, yN),
+        strides=(stride_y_m, stride_y_n),
+        block_shape=(BLOCK_M, OUT_BLOCK_N),
+        layout=SHARED_LAYOUT_Y,
+    )
+    y_buffer.store(out)
+    gl.amd.gfx1250.tdm.async_store(
+        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+    )
+    gl.amd.gfx1250.tdm.async_wait(0)
