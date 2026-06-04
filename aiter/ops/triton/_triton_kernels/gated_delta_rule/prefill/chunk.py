@@ -27,6 +27,15 @@ from ..utils import (
 )
 
 
+def _is_gfx12_runtime() -> bool:
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = getattr(props, "gcnArchName", "")
+        return arch.split(":")[0].startswith("gfx12") if arch else False
+    except Exception:
+        return False
+
+
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -265,6 +274,9 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             "use_chunk_hip and use_chunk_flydsl are mutually exclusive; "
             "set at most one."
         )
+    if use_chunk_hip and _is_gfx12_runtime():
+        use_chunk_hip = False
+
     g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         k=k,
         beta=beta,

@@ -1,11 +1,18 @@
 # Copyright (C) 2023-2026, Songlin Yang, Yu Zhang
 
 import os
+from typing import Tuple as _TypingTuple
 
+os.environ.setdefault("AITER_TRITON_ONLY", "1")
+os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
+
+import aiter
 import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+
+aiter.Tuple = _TypingTuple
 
 from aiter.ops.triton.gated_delta_net import (
     fused_recurrent_gated_delta_rule,
@@ -22,6 +29,17 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
     assert_close,
     device,
 )
+
+
+def _is_gfx12_runtime() -> bool:
+    if not IS_AMD:
+        return False
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = getattr(props, "gcnArchName", "")
+        return arch.split(":")[0].startswith("gfx12") if arch else False
+    except Exception:
+        return False
 
 
 def recurrent_gated_delta_rule_ref(
@@ -677,6 +695,10 @@ def test_chunk_opt(
     ],
 )
 @pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
+@pytest.mark.skipif(
+    _is_gfx12_runtime(),
+    reason="chunk_gated_delta_rule_fwd_h_hip_fn kernel does not support gfx12!",
+)
 def test_chunk_opt_hip(
     B: int,
     T: int,
@@ -849,6 +871,10 @@ def test_chunk_opt_varlen(
     ],
 )
 @pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
+@pytest.mark.skipif(
+    _is_gfx12_runtime(),
+    reason="chunk_gated_delta_rule_fwd_h_hip_fn kernel does not support gfx12!",
+)
 def test_chunk_opt_varlen_hip(
     H: int,
     D: int,
