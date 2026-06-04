@@ -2516,9 +2516,15 @@ def build_mixed_moe_gemm2_kernel(
         kpack_bytes = 16
         from .layout_utils import _div_pow2, _mod_pow2
 
-        # A&B's scale preshuffle layout
-        # For fp4, k_in is already packed (inter_dim // a_elem_vec_pack), so we need original inter_dim
-        c_k_orig = fx.Index(inter_dim)
+        # A&B's scale preshuffle layout.
+        # The scattered a2_scale / weight-scale tensors pad K up to a multiple of
+        # 256 (the scale preshuffle granularity), so the layout K must use the
+        # padded value -- for inter_dim not a multiple of 256 (e.g. 384) the
+        # padded stride differs from inter_dim and using the raw value reads the
+        # wrong scale bytes.
+        scale_k_padded = (inter_dim + 255) // 256 * 256
+        scale_kblk_padded = scale_k_padded // 32
+        c_k_orig = fx.Index(scale_k_padded)
         layout_a_scale = make_preshuffle_scale_layout(c_mn=m_in, c_k=c_k_orig)
         layout_b_scale = make_preshuffle_scale_layout(c_mn=c_n_total, c_k=c_k_orig)
 
@@ -2614,14 +2620,15 @@ def build_mixed_moe_gemm2_kernel(
         sw_rsrc = 1
         # A2 microscale: e8m0 in sorted layout [sorted_size, K/32].
         # Caller must pre-scatter a2_scale via moe_mxfp4_sort.
-        kblk = _div_pow2(k_in, 32)
+        # Use the 256-padded K so the descriptor matches the padded scale tensor.
+        kblk = fx.Index(scale_kblk_padded)
         sx_nbytes_idx = num_valid_idx * kblk
         sx_nbytes_i32 = fx.Int32(sx_nbytes_idx)
         sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
 
         # Weight microscale buffer (packed i32 holding e8m0 bytes).
         # Use an exact descriptor size so hardware OOB checking works.
-        kblk_w = _div_pow2(k_in, 32)  # K/32
+        kblk_w = fx.Index(scale_kblk_padded)  # K/32, 256-padded
         mn_w = fx.Index(experts * model_dim)
         sw_nbytes_idx = mn_w * kblk_w  # bytes (e8m0)
         sw_nbytes_i32 = fx.Int32(sw_nbytes_idx)
