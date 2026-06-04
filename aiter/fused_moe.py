@@ -1503,7 +1503,7 @@ def get_2stage_cfgs(
                 model_dim_pad=hidden_pad,
             ),
             _tile_m,
-            int(ksplit),
+            -1, # split_k = -1
             False,
             has_bias=enable_bias,
             stage2_has_bias=enable_bias,
