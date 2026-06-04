@@ -307,8 +307,12 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     d_pe_offs = tl.arange(0, BLOCK_D_pe).to(tl.int64)
 
     if pid < B * QH:
-        pid_b = pid // QH
-        pid_hq = pid % QH
+        # pid_b = pid // QH
+        # pid_hq = pid % QH
+        # This is a new optimization that prioritized heavy workload WGs first
+        pid_hq = pid // B
+        pid_b = pid % B
+
         if REUSE_FREQS_FRONT_PART:
             if IS_NEOX:
                 d_cos_offs = d_pe_offs
@@ -384,7 +388,12 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     z,
                 )
 
-        if pid_hq % QH_PER_KH == 0:
+        # pid_hk = pid_hq // QH_PER_KH
+        # is_kv = pid_hq % QH_PER_KH == 0
+        # This is a new optimization that prioritized heavy workload WGs first
+        pid_hk = pid_hq
+        is_kv = pid_hk < KH
+        if is_kv:
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
             if pid_slot >= 0:
                 if BLOCK_SIZE > 1:
@@ -404,7 +413,6 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                 else:
                     k_scale = 1
 
-                pid_hk = pid_hq // QH_PER_KH
                 k_nope_ptrs = (
                     k_nope_ptr
                     + pid_b * k_nope_stride_b
