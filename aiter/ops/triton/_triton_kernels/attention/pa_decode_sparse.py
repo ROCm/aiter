@@ -349,8 +349,16 @@ def _pa_decode_sparse_reduce(
         )  # [KV_SPLITS, BLOCK_H]
     else:
         alpha_split = tl.where(m_p == float("-inf"), 0.0, tl.exp(m_p - m_max[None, :]))
-    l_combined = tl.sum(l_p * alpha_split, axis=0)  # [BLOCK_H]
-    acc_combined = tl.sum(a_p * alpha_split[:, :, None], axis=0)  # [BLOCK_H, BLOCK_D]
+    # A split with zero valid keys (all -inf / sentinels) carries m_p == -inf and
+    # may have written NaN l/acc partials (the gluon main kernel does, since it
+    # has no dead-tile guard). alpha_split is 0 there, but NaN * 0 == NaN would
+    # still leak through the sum, zeroing the whole token's output. Mask the full
+    # term (not just the weight) so dead splits contribute exactly 0.
+    is_dead = m_p == float("-inf")  # [KV_SPLITS, BLOCK_H]
+    l_combined = tl.sum(tl.where(is_dead, 0.0, l_p * alpha_split), axis=0)  # [BLOCK_H]
+    acc_combined = tl.sum(
+        tl.where(is_dead[:, :, None], 0.0, a_p * alpha_split[:, :, None]), axis=0
+    )  # [BLOCK_H, BLOCK_D]
 
     # Fold attn_sink as a virtual K of weight 1 (lifted into the main kernel's
     # domain: base-2 for triton, natural for gluon).

@@ -127,7 +127,20 @@ def _pa_decode_sparse(
         warps_per_cta=[QKV_WARPS_H, QKV_WARPS_D],
         order=[1, 0],
     )
-    slot_reg_layout: gl.constexpr = gl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+    SLOT_BLOCKED_LAYOUT: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[BLOCK_K],
+        threads_per_warp=[32],
+        warps_per_cta=[num_warps],
+        order=[0],
+    )
+    slot_reg_layout: gl.constexpr = SLOT_BLOCKED_LAYOUT
+    # SLOT_BLOCKED_LAYOUT: gl.constexpr = gl.BlockedLayout(
+    #     size_per_thread=[1, 8],
+    #     threads_per_warp=[32, 1],
+    #     warps_per_cta=[1, num_warps],
+    #     order=[0, 1],
+    # )
+    # slot_reg_layout: gl.constexpr = gl.SliceLayout(0, SLOT_BLOCKED_LAYOUT)
 
     kv_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_D, 8]], [BLOCK_K, BLOCK_D], [1, 0]

@@ -101,9 +101,9 @@ def pa_decode_sparse(
 
     use_gluon = DEVICE_ARCH == "gfx1250"
 
-    # import os
+    import os
 
-    # use_gluon = os.environ.get("PA_DECODE_SPARSE_BACKEND", "gluon").lower() == "gluon"
+    use_gluon = os.environ.get("PA_DECODE_SPARSE_BACKEND", "gluon").lower() == "gluon"
 
     # gfx1250 stages slots through LDS via TDM async_load, which hides the
     # larger per-tile KV gather latency -> BLOCK_K=32 is fastest there. Other
@@ -139,7 +139,7 @@ def pa_decode_sparse(
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
         kv_splits = triton.next_power_of_2(kv_splits)
-    # print(f"{use_gluon=} {kv_splits=}")
+    print(f"{use_gluon=} {kv_splits=}")
 
     if kv_splits == 1:
         m_partial = l_partial = acc_partial = out  # unused inside the kernel
