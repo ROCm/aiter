@@ -3268,6 +3268,7 @@ def build_mixed_moe_gemm2_kernel(
                     rocdl.sched_barrier(0)
                     k_iv = fx.Index(k_iv_py)
                     next_k1 = k_iv + tile_k
+                    next_k1_py = k_iv_py + tile_k
                     next_k1_bk = next_k1 // 2
                     # DMA X(next_k1) -> ping (non-blocking, overlaps with compute)
                     prefetch_x_to_lds(next_k1, lds_x_ping)
@@ -3277,7 +3278,7 @@ def build_mixed_moe_gemm2_kernel(
                         else load_b_tile(next_k1_bk)
                     )
                     a_scale_ping, b_scale_ping = prefetch_ab_scale_tile(
-                        _k_base(next_k1), _k_shift_bits(next_k1)
+                        _k_base(next_k1_py), _k_shift_bits(next_k1_py)
                     )
 
                     acc, _ = compute_tile(
