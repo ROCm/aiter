@@ -663,9 +663,20 @@ class GroupCoordinator:
                 input_, output_, group_name=self.unique_name, dim=dim
             )
         else:
-            torch.distributed.reduce_scatter_tensor(
-                output_, input_, group=self.device_group
-            )
+            if dim != 0:
+                input_ = input_.movedim(dim, 0).contiguous()
+                tmp_out_shape = (input_.shape[0] // world_size,) + input_.shape[1:]
+                tmp_output = torch.empty(
+                    tmp_out_shape, dtype=input_.dtype, device=input_.device
+                )
+                torch.distributed.reduce_scatter_tensor(
+                    tmp_output, input_, group=self.device_group
+                )
+                output_ = tmp_output.movedim(0, dim).contiguous()
+            else:
+                torch.distributed.reduce_scatter_tensor(
+                    output_, input_, group=self.device_group
+                )
         return output_
 
     def all_gather(
