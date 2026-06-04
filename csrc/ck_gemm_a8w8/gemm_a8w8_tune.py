@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8
 from aiter.utility.base_tuner import GemmCommonTuner
-from gemm_a8w8_common import kernels_list
+from gemm_a8w8_common import kernels_list, kernels_list_cktile
 from aiter.utility.mp_tuner import mp_tuner
 
 
@@ -102,10 +102,12 @@ def gemm_a8w8_ref(x, weight, x_scale, w_scale, dtype=dtypes.bf16, q_dtype_w=dtyp
 
 
 def run_gemm_a8w8(x, weight, x_scale, w_scale, out, kernelId, splitK):
-
     aiter.gemm_a8w8_tune(x, weight, x_scale, w_scale, out, kernelId, splitK)
     return out
 
+def run_gemm_a8w8_cktile(x, weight, x_scale, w_scale, out, kernelId, splitK):
+    aiter.gemm_a8w8_cktile_tune(x, weight, x_scale, w_scale, out, kernelId, splitK)
+    return out
 
 class GemmA8W8Tuner(GemmCommonTuner):
     ARG_DEFAULTS = {
@@ -118,6 +120,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
         "config_env_name": "AITER_CONFIG_GEMM_A8W8",
     }
 
+    # TODO: correct
     def getKernelName(self, kernelId):
         if kernelId >= len(kernels_list) or kernelId < 0:
             return None
@@ -220,7 +223,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
             K = untunedf.loc[i, "K"]
             q_dtype_w = untunedf.loc[i, "q_dtype_w"]
 
-            kernels_num = len(kernels_list)
+            kernels_num = 0 # len(kernels_list)
             total_kernel_nums = 0
             info_keys = (gfx, cu_num, M, N, K, q_dtype_w)
 
@@ -246,6 +249,47 @@ class GemmA8W8Tuner(GemmCommonTuner):
                             generate_data,
                             (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
                             run_gemm_a8w8,
+                            (gemm_keys, j, splitK),
+                            {
+                                "num_warmup": args.warmup,
+                                "num_iters": args.iters,
+                            },
+                            gemm_a8w8_ref,
+                            (ref_keys, dtypes.bf16, eval(q_dtype_w)),
+                            {},
+                            None,
+                            1e-2,
+                            1e-2,
+                            None,
+                            None,
+                            ("out",),
+                        )
+                    )
+                    total_kernel_nums = total_kernel_nums + 1
+
+            kernels_num = len(kernels_list_cktile)
+            for j in range(kernels_num):
+                kernel = kernels_list_cktile[j]
+                maxsplitK = (
+                    aiter.compute_gemm_SplitK(
+                        M,
+                        N,
+                        K,
+                        kernel.MPerBLOCK,
+                        kernel.NPerBLOCK,
+                        kernel.KPerBLOCK,
+                    )
+                    if useSplitK
+                    else 0
+                )
+                for splitK in range(maxsplitK + 1):
+                    info = (info_keys, j, splitK, "")
+                    task.append(
+                        (
+                            info,
+                            generate_data,
+                            (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
+                            run_gemm_a8w8_cktile,
                             (gemm_keys, j, splitK),
                             {
                                 "num_warmup": args.warmup,

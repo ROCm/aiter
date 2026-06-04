@@ -49,6 +49,21 @@ def gemm_a8w8_ck(
     splitK: int = 0,
 ) -> torch.Tensor: ...
 
+@compile_ops(
+    "module_gemm_a8w8_cktile",
+    fc_name="gemm_a8w8_cktile",
+    gen_fake=gen_gemm_a8w8_ck_fake_tensors,
+)
+def gemm_a8w8_cktile(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    splitK: int = 0,
+) -> torch.Tensor: ...
+
 
 def gen_gemm_a8w8_bpreshuffle_ck_fake_tensors(
     XQ: torch.Tensor,
@@ -841,6 +856,22 @@ def gen_gemm_a8w8_tune_fake_tensors(
     gen_fake=gen_gemm_a8w8_tune_fake_tensors,
 )
 def gemm_a8w8_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor: ...
+
+
+@compile_ops(
+    "module_gemm_a8w8_cktile_tune",
+    fc_name="gemm_a8w8_cktile_tune",
+    gen_fake=gen_gemm_a8w8_tune_fake_tensors,
+)
+def gemm_a8w8_cktile_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,

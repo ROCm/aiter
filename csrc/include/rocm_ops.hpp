@@ -719,6 +719,31 @@ namespace py = pybind11;
           py::arg("Out"),          \
           py::arg("kernelId") = 0, \
           py::arg("splitK")   = 0);
+
+#define GEMM_A8W8_CKTILE_PYBIND             \
+    m.def("gemm_a8w8_cktile",               \
+          &gemm_a8w8_cktile,                \
+          "gemm_a8w8_cktile",               \
+          py::arg("XQ"),                    \
+          py::arg("WQ"),                    \
+          py::arg("x_scale"),               \
+          py::arg("w_scale"),               \
+          py::arg("Out"),                   \
+          py::arg("bias")   = std::nullopt, \
+          py::arg("splitK") = 0);
+
+#define GEMM_A8W8_CKTILE_TUNE_PYBIND \
+    m.def("gemm_a8w8_cktile_tune",   \
+          &gemm_a8w8_cktile_tune,    \
+          "gemm_a8w8_cktile_tune",   \
+          py::arg("XQ"),             \
+          py::arg("WQ"),             \
+          py::arg("x_scale"),        \
+          py::arg("w_scale"),        \
+          py::arg("Out"),            \
+          py::arg("kernelId") = 0,   \
+          py::arg("splitK")   = 0);
+
 #define GEMM_A8W8_BPRESHUFFLE_PYBIND \
     m.def("gemm_a8w8_bpreshuffle",   \
           &gemm_a8w8_bpreshuffle,    \
