@@ -16,16 +16,13 @@ the kernel via aiter.test_common.checkAllclose (no pytest), driven by argparse
 over a config grid.  Supports arbitrary kv_len (multi-page) via split-KV.
 
 The gfx1250 split-KV reduce kernel is WIP, so the PA stage runs on GPU and the
-LSE merge runs on host in cpu_reduce (which faithfully matches aiter
-csrc/kernels/mla/reduce.cu).  The summary also reports n_partial / unwritten to
-flag any partial slots the kernel did not write (a kernel/metadata mismatch).
+LSE merge runs on host in cpu_reduce (which matches aiter csrc/kernels/mla/reduce.cu).
 """
 
 import argparse
 import itertools
-import os
 import random
-from typing import Tuple
+from typing import Optional, Tuple
 
 import pandas as pd
 import torch
@@ -47,58 +44,28 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
-def make_no_split_metadata(batch, kv_head_num, gqa, qo_indptr, kv_indptr, device):
-    """Hand-built NO-SPLIT metadata in the SP3 kernel's (sched2) convention:
-    one work item per (batch, kv_head), partial_o_loc=-1 (direct-to-O), covering
-    the whole context.  work_info = 8-dword WORK_INFO:
-      [batch_idx, partial_o_loc, qo_start, qo_end, kv_start, kv_end, kv_offset,
-       q_head_range=pack(q_head_start,q_head_end)]
-    kv_start/kv_end = global block indices (kv_indptr-based); qo_* global qo idx.
-    """
-    qo = qo_indptr.tolist()
-    kvp = kv_indptr.tolist()
-    works = []
-    for b in range(batch):
-        for h in range(kv_head_num):
-            qhs, qhe = h * gqa, (h + 1) * gqa
-            q_head_range = ((qhe & 0xFFFF) << 16) | (qhs & 0xFFFF)
-            works.append([b, -1, qo[b], qo[b + 1], kvp[b], kvp[b + 1], 0, q_head_range])
-    num_work = len(works)
-    work_info = torch.tensor(works, dtype=torch.int32, device=device).reshape(-1)
-    num_tg = torch.cuda.get_device_properties(device).multi_processor_count
-    work_indptr = torch.tensor(
-        [(i * num_work) // num_tg for i in range(num_tg + 1)],
-        dtype=torch.int32, device=device,
-    )
-    return work_indptr, work_info
-
-
 def make_sched2_metadata(
     batch, kv_head_num, gqa, qo_indptr, kv_indptr, context_lens,
     block_size, qlen_granularity, available_tgs, device, is_causal=False,
-    force_split=False,
 ):
-    """Faithful Python port of sched2 common_ps.h generate_metadata +
-    generate_reduce_info (the convention the SP3 PA_DECODE kernel was authored
-    against).  aiter.get_pa_metadata_v1 encodes work_info differently (the SP3
-    kernel reads zeros from it), so we build it directly.
+    """Python port of sched2 common_ps.h generate_metadata + generate_reduce_info
+    (the convention the SP3 PA_DECODE kernel was authored against).
 
     work_info = 8-dword WORK_INFO: [batch_idx, partial_o_loc, qo_start, qo_end,
-    kv_start, kv_end, kv_offset, q_head_range=pack(qhs,qhe)].  partial_o_loc=-1
-    means write straight to O (single-TG tile); otherwise the row in split_o.
-    Returns (work_indptr, work_info, reduce_indptr, reduce_final_map,
-    reduce_partial_map, split_rows).
+    kv_start, kv_end, kv_offset, q_head_range=pack(qhs,qhe)].  A tile handled by a
+    single TG uses partial_o_loc=-1 (direct-to-O); split tiles emit partials + a
+    reduce group.  Returns (work_indptr, work_info, reduce_indptr,
+    reduce_final_map, reduce_partial_map, split_rows).
     """
     qhead_granularity = gqa
-    kvlen_granularity = block_size          # pa_ps.cpp passes PA_PAGE_SIZE
-    blocks_per_unit = kvlen_granularity // block_size  # = 1
-    SPLIT_KV_OVERHEAD = 0
+    kvlen_granularity = block_size
+    blocks_per_unit = kvlen_granularity // block_size
     qo = qo_indptr.tolist()
     kvp = kv_indptr.tolist()
     ctx = context_lens.tolist()
     num_head_k = kv_head_num
 
-    # Step 1: query tiles (single cluster, one work = one Q-tile x one q-head).
+    # Step 1: query tiles (one work = one Q-tile x one q-head).
     qtiles = []  # [batch_idx, qo_start, qo_end, num_blocks, effective_kv_len]
     total_units = 0
     for b in range(batch):
@@ -131,13 +98,9 @@ def make_sched2_metadata(
                 remaining_blocks = nblk - cur_block
                 remaining_kv = ekv - cur_block * block_size
                 kv_start = cur_block + kvp[bt]
-                if remaining_kv <= cap * block_size + SPLIT_KV_OVERHEAD:
+                if remaining_kv <= cap * block_size:
                     consuming = remaining_blocks
-                    # Real persistent convention: a tile handled entirely by one TG
-                    # writes straight to O (partial_o_loc=-1); the kernel's direct-O
-                    # store path handles it and cpu_reduce leaves those rows alone.
-                    # (force_split forces everything through split_o; only for debug.)
-                    if cur_block == 0 and not force_split:
+                    if cur_block == 0:
                         ploc = -1  # whole tile in one TG -> direct to O
                     else:
                         ploc = qlen_granularity * partial_tile_idx
@@ -179,9 +142,9 @@ def make_sched2_metadata(
     plocs_all = [w[1] for w in work_info if w[1] != -1]
     split_rows = (max(plocs_all) + qlen_granularity) if plocs_all else 1
 
-    def _t(lst, n=None):
-        t = torch.tensor(lst if lst else [0], dtype=torch.int32, device=device)
-        return t if lst else t[:0]
+    def _t(lst):
+        return torch.tensor(lst, dtype=torch.int32, device=device) if lst \
+            else torch.zeros(0, dtype=torch.int32, device=device)
 
     return (
         torch.tensor(work_indptr, dtype=torch.int32, device=device),
@@ -194,18 +157,16 @@ def make_sched2_metadata(
 
 
 def cpu_reduce(out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_partial_map, gqa):
-    """Host reduce (matches aiter csrc/kernels/mla/reduce.cu convention, natural log):
+    """Host reduce (matches aiter csrc/kernels/mla/reduce.cu, natural log):
         global_lse = max_lse + log(sum exp(lse - max_lse))
         out        = sum_p partial_o_p * exp(lse_p - global_lse)
     partial_lse layout [row, head]; partial_output [row, head, dv]; row = loc+local_seq.
-    Only reduced rows are touched; padded groups (start>=end) skipped.
-    Returns (out, n_referenced, n_unwritten) for diagnostics.
+    Only reduced rows are touched; direct-O rows (written by the kernel) are left alone.
     """
     batch, qlen, kv_head_num = out.shape[0], out.shape[1], out.shape[2]
     head_dim = out.shape[-1]
     q_head_num = kv_head_num * gqa
-    total_s = batch * qlen
-    out_flat = out.view(total_s, q_head_num, head_dim)
+    out_flat = out.view(batch * qlen, q_head_num, head_dim)
     so = split_o.reshape(split_o.shape[0], q_head_num, head_dim).float()
     sl = split_lse.reshape(split_lse.shape[0], q_head_num).float()
 
@@ -213,8 +174,6 @@ def cpu_reduce(out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_
     rfm = reduce_final_map.to(torch.int64).reshape(-1, 2).tolist()
     rpm = reduce_partial_map.to(torch.int64)
 
-    n_ref = 0
-    n_unwritten = 0
     for g in range(len(rip) - 1):
         s0, s1 = rip[g], rip[g + 1]
         if s1 <= s0:
@@ -223,16 +182,14 @@ def cpu_reduce(out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_
         base = rpm[s0:s1]
         for seq_id in range(qo_start, qo_end):
             locs = base + (seq_id - qo_start)
-            lses = sl[locs]                       # [P, q_head_num]
-            n_ref += lses.numel()
-            n_unwritten += int(torch.isinf(lses).sum().item())
+            lses = sl[locs]
             m = lses.max(dim=0).values
             s = torch.exp(lses - m).sum(dim=0)
             global_lse = m + torch.log(s)
             scale = torch.exp(lses - global_lse)
             o = (so[locs] * scale.unsqueeze(-1)).sum(dim=0)
             out_flat[seq_id] = o.to(out_flat.dtype)
-    return out, n_ref, n_unwritten
+    return out
 
 
 def ref_pa_decode(
@@ -244,8 +201,7 @@ def ref_pa_decode(
     De-interleaves the tiled paged FP8 K/V into token-major [token, head, dim]
     (matching test_pa_ps.py's k-cache reconstruction / asm_V_shuffle), dequants
     with the per-tensor scales, then does softmax attention per (batch, kv_head,
-    gqa) over the whole context (multi-page via kv_indptr/kv_indices) and returns
-    bf16.
+    gqa) over the whole context (multi-page via kv_indptr/kv_indices) -> bf16.
     """
     num_pages, kv_head_num = K.shape[0], K.shape[1]
     head_dim = Q.shape[-1]
@@ -254,12 +210,8 @@ def ref_pa_decode(
     device = Q.device
 
     # K[p,h,d//16,tok,d%16] -> K_tm[p,h,tok,d];  V[p,h,tok//16,d,tok%16] -> V_tm[p,h,tok,d]
-    K_tm = (
-        K.float().permute(0, 1, 3, 2, 4).reshape(num_pages, kv_head_num, page_size, head_dim)
-    )
-    V_tm = (
-        V.float().permute(0, 1, 2, 4, 3).reshape(num_pages, kv_head_num, page_size, head_dim)
-    )
+    K_tm = K.float().permute(0, 1, 3, 2, 4).reshape(num_pages, kv_head_num, page_size, head_dim)
+    V_tm = V.float().permute(0, 1, 2, 4, 3).reshape(num_pages, kv_head_num, page_size, head_dim)
     Qf = Q.float()  # [batch, qlen, kv_head, gqa, head_dim]
     out = torch.empty_like(Qf)
 
@@ -282,18 +234,16 @@ def ref_pa_decode(
 def run_pa_stage(
     Q, K, V, kv_indices, context_lens, softmax_scale, kv_indptr,
     gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
-    work_indptr, work_info, split_o, split_lse, out,
+    work_indptr, work_info, split_o, split_lse,
 ):
     # PA stage: direct-to-O for non-split work items, partials -> split_o/split_lse
-    # for split (multi-page) ones.  Pass an explicit pre-zeroed `out` as the
-    # kernel's direct-O store target (matches pa_ps.cpp memset(R) before launch).
-    # num_rotate_args=1 so the split buffers after the call belong to the same call.
+    # for split (multi-page) ones (merged on host by cpu_reduce).
     return aiter.pa_decode_bf16_asm(
         Q, K, V, kv_indices, context_lens, softmax_scale, kv_indptr,
         gqa=gqa, mtp=mtp,
         query_scale=query_scale, key_scale=key_scale, value_scale=value_scale,
         qo_indptr=qo_indptr, work_indptr=work_indptr, work_info=work_info,
-        split_o=split_o, split_lse=split_lse, out=out,
+        split_o=split_o, split_lse=split_lse,
     )
 
 
@@ -302,19 +252,28 @@ def test_pa_decode(
     batch: int,
     kv_head_num: int,
     ctx_len: int,
-    scales: Tuple[float, float, float],
+    scales: Optional[Tuple[float, float, float]] = None,
     varlen: bool = False,
-    no_split: bool = False,
 ) -> dict:
-    """Random FP8 paged inputs (arbitrary kv_len) vs the torch host reference."""
+    """Random FP8 paged inputs (arbitrary kv_len) vs the torch host reference.
+
+    scales=None -> random per-tensor q/k/v scales; otherwise the given (q,k,v).
+    """
     gqa = PA_GQA_RATIO
     head_dim = PA_HEAD_DIM
     page_size = PA_PAGE_SIZE
     mtp = 0
     qlen_with_mtp = mtp + 1
+    q_head_num = kv_head_num * gqa
     device = "cuda"
+    torch.manual_seed(0)
 
-    query_scale, key_scale, value_scale = scales
+    if scales is None:
+        query_scale = round(random.uniform(0.5, 2.0), 4)
+        key_scale = round(random.uniform(0.5, 2.0), 4)
+        value_scale = round(random.uniform(0.5, 2.0), 4)
+    else:
+        query_scale, key_scale, value_scale = scales
     softmax_scale = 1.0 / (head_dim**0.5)
 
     # ---- KV lengths + paged block tables (mirrors test_pa_ps.py) ----
@@ -330,14 +289,12 @@ def test_pa_decode(
     block_tables = torch.randperm(max_blocks, device=device).to(torch.int32).reshape(
         batch, max_blocks_per_seq
     )
-
     actual_blocks = ceil_div(seq_lens_kv, page_size)
     kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=device)
     kv_indptr[1:] = torch.cumsum(actual_blocks, dim=0)
     kv_indices = torch.cat(
         [block_tables[i, : int(actual_blocks[i].item())] for i in range(batch)]
     ).to(torch.int32)
-
     qo_indptr = torch.arange(
         0, (batch + 1) * qlen_with_mtp, qlen_with_mtp, dtype=torch.int32, device=device
     )
@@ -348,105 +305,35 @@ def test_pa_decode(
     K = (0.5 * torch.randn(num_phys_pages, kv_head_num, head_dim // 16, page_size, 16, device=device)).to(fp8)
     V = (0.5 * torch.randn(num_phys_pages, kv_head_num, page_size // 16, head_dim, 16, device=device)).to(fp8)
 
-    max_qlen = qlen_with_mtp
-    q_head_num = kv_head_num * gqa
-
-    # Explicit output buffer (kernel's direct-O store target; also the buffer
-    # cpu_reduce fills for split rows). bf16, Q's logical shape.  In debug we fill
-    # it with a SENTINEL so we can tell whether the kernel actually wrote O
-    # (sentinel changed) vs computed/stored zero (sentinel -> 0).
-    _dbg = os.environ.get("AITER_PA_DEBUG", "0") == "1"
-    SENTINEL = -99.0
-    out = torch.full(
-        (batch, qlen_with_mtp, kv_head_num, gqa, head_dim),
-        SENTINEL if _dbg else 0.0,
-        dtype=torch.bfloat16, device=device,
+    # ---- sched2-convention split-KV metadata + scratch (host reduce; gfx1250 reduce WIP) ----
+    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+    (
+        work_indptr, work_info,
+        reduce_indptr, reduce_final_map, reduce_partial_map, split_rows,
+    ) = make_sched2_metadata(
+        batch, kv_head_num, gqa, qo_indptr, kv_indptr, seq_lens_kv,
+        page_size, qlen_with_mtp, num_cu, device,
+    )
+    # -inf lse / 0 o so any split the kernel leaves unwritten is inert in reduce.
+    split_o = torch.zeros((split_rows, 1, q_head_num, head_dim), dtype=dtypes.fp32, device=device)
+    split_lse = torch.full(
+        (split_rows, 1, q_head_num, 1), float("-inf"), dtype=dtypes.fp32, device=device
     )
 
-    if no_split:
-        # Hand-built sched2-convention metadata: every work item writes direct to
-        # O, no split/reduce.  Isolates kernel correctness from aiter metadata.
-        work_indptr, work_info = make_no_split_metadata(
-            batch, kv_head_num, gqa, qo_indptr, kv_indptr, device,
-        )
-        out, us = run_pa_stage(
-            Q, K, V, kv_indices, seq_lens_kv, softmax_scale, kv_indptr,
-            gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
-            work_indptr, work_info, None, None, out,
-        )
-        torch.cuda.synchronize()
-        n_ref = n_unwritten = 0
-    else:
-        # ---- sched2-convention split-KV metadata + scratch (host reduce; gfx1250 reduce WIP) ----
-        num_cu = torch.cuda.get_device_properties(device).multi_processor_count
-        (
-            work_indptr, work_info,
-            reduce_indptr, reduce_final_map, reduce_partial_map, split_rows,
-        ) = make_sched2_metadata(
-            batch, kv_head_num, gqa, qo_indptr, kv_indptr, seq_lens_kv,
-            page_size, qlen_with_mtp, num_cu, device,
-        )
-        # -inf lse / 0 o so any split the kernel leaves unwritten is inert in reduce.
-        split_o = torch.zeros((split_rows, 1, q_head_num, head_dim), dtype=dtypes.fp32, device=device)
-        split_lse = torch.full(
-            (split_rows, 1, q_head_num, 1), float("-inf"), dtype=dtypes.fp32, device=device
-        )
-
-        out, us = run_pa_stage(
-            Q, K, V, kv_indices, seq_lens_kv, softmax_scale, kv_indptr,
-            gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
-            work_indptr, work_info, split_o, split_lse, out,
-        )
-        torch.cuda.synchronize()
-
-        if os.environ.get("AITER_PA_DEBUG", "0") == "1":
-            fin = torch.isfinite(split_lse)
-            nfin = int(fin.sum().item())
-            lse_min = split_lse[fin].min().item() if nfin else float("nan")
-            lse_max = split_lse[fin].max().item() if nfin else float("nan")
-            print(f"\n[DEBUG] split_lse: finite={nfin}/{split_lse.numel()} "
-                  f"range=[{lse_min:.4f},{lse_max:.4f}]")
-            print(f"[DEBUG] split_o : absmean={split_o.abs().mean().item():.5f} "
-                  f"absmax={split_o.abs().max().item():.5f} "
-                  f"(rows={split_o.shape[0]}, kernel wrote partials if >0)")
-            changed = int((out.float() != SENTINEL).sum().item())
-            print(f"[DEBUG] O written by kernel: {changed}/{out.numel()} elems changed "
-                  f"from sentinel (0 => kernel never wrote O; >0 => O IS being written)")
-            print(f"[DEBUG] O after kernel (pre-reduce) absmean="
-                  f"{out.float().masked_fill(out.float()==SENTINEL, 0).abs().mean().item():.5f}")
-            print(f"[DEBUG] work_info[0:8] = {work_info[:8].tolist()}")
-            print(f"[DEBUG] inputs on GPU: |Q|={Q.float().abs().mean().item():.4f} "
-                  f"|K|={K.float().abs().mean().item():.4f} "
-                  f"|V|={V.float().abs().mean().item():.4f} "
-                  f"(should be ~0.4; if ~0 the test data is the problem)")
-            print(f"[DEBUG] context_lens={seq_lens_kv.tolist()[:4]} "
-                  f"kv_indptr={kv_indptr.tolist()[:4]} kv_indices={kv_indices.tolist()[:4]} "
-                  f"qo_indptr={qo_indptr.tolist()[:4]}")
-
-        out, n_ref, n_unwritten = cpu_reduce(
-            out, split_o, split_lse,
-            reduce_indptr, reduce_final_map, reduce_partial_map, gqa,
-        )
+    out, us = run_pa_stage(
+        Q, K, V, kv_indices, seq_lens_kv, softmax_scale, kv_indptr,
+        gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
+        work_indptr, work_info, split_o, split_lse,
+    )
+    torch.cuda.synchronize()
+    out = cpu_reduce(
+        out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_partial_map, gqa,
+    )
 
     ref = ref_pa_decode(
         Q, K, V, kv_indices, kv_indptr, seq_lens_kv, gqa,
         query_scale, key_scale, value_scale, softmax_scale,
     )
-
-    if os.environ.get("AITER_PA_DEBUG", "0") == "1":
-        of = out.float()
-        rf = ref.float()
-        o0 = of[0, 0, 0, 0, :8]
-        r0 = rf[0, 0, 0, 0, :8]
-        print(f"\n[DEBUG] b={batch} kvh={kv_head_num} ctx={ctx_len} scales={scales} "
-              f"n_partial={n_ref} unwritten={n_unwritten}")
-        print(f"[DEBUG] out[0,0,0,0,:8] = {[round(x,4) for x in o0.tolist()]}")
-        print(f"[DEBUG] ref[0,0,0,0,:8] = {[round(x,4) for x in r0.tolist()]}")
-        print(f"[DEBUG] out/ref          = {[round(x,4) for x in (o0/r0).tolist()]}")
-        # per (kv_head, gqa) max abs err -> reveals per-head / gqa-broadcast issues
-        perhead = (of - rf).abs().amax(dim=(0, 1, 4))  # [kv_head, gqa]
-        print(f"[DEBUG] per-head maxerr  =\n{perhead}")
-        print(f"[DEBUG] |out| mean={of.abs().mean():.4f}  |ref| mean={rf.abs().mean():.4f}")
 
     # FP8 inputs + bf16 output + exp2/log2e + MFMA accumulation -> loose tol.
     err = checkAllclose(
@@ -457,13 +344,10 @@ def test_pa_decode(
         msg="[torch vs pa_decode_bf16_asm][fp8]: us......",
     )
 
-    # Diagnostics: n_ref = partial (row,head) entries the reduce read; unwritten =
-    # those still -inf (kernel never wrote them -> kernel/metadata split mismatch).
     return {
         "max_kv": int(seq_lens_kv.max().item()),
-        "us_pa": us,
-        "n_partial": n_ref,
-        "unwritten": n_unwritten,
+        "qkv_scale": (query_scale, key_scale, value_scale),
+        "us": us,
         "err": err,
     }
 
@@ -477,56 +361,53 @@ parser.add_argument(
     "--batch_size",
     type=int,
     nargs="*",
-    default=[1, 2, 4],
+    default=[1, 3, 8, 64],
     help="""Batch size.
-    e.g. -b 1 2 4""",
+    e.g. -b 1 3 8 64""",
 )
 parser.add_argument(
     "-kvh",
     "--kv_head_num",
     type=int,
     nargs="*",
-    default=[1, 2],
+    default=[1, 8],
     help="""Number of KV heads (q heads = kv_head_num * gqa(8)).
-    e.g. -kvh 1 2""",
+    e.g. -kvh 1 8""",
 )
 parser.add_argument(
     "-c",
     "--ctx_len",
     type=int,
     nargs="*",
-    default=[64, 256, 1024, 4097, 10240],
+    default=[7, 256, 1024, 4097, 16384],
     help="""Context length (arbitrary; multi-page when > 256).
     e.g. -c 256 4097""",
 )
 parser.add_argument(
     "--varlen",
     action="store_true",
-    help="""Variable kv seqlens per batch (random in [1, ctx_len]). Default: False.
-    --varlen # enable""",
+    help="""Variable kv seqlens per batch (random in [1, ctx_len]). Default: False.""",
 )
 parser.add_argument(
-    "--scaled",
-    action="store_true",
-    help="""Use non-trivial per-tensor scales (0.5/2.0/1.5) instead of unit.
-    --scaled # enable""",
-)
-parser.add_argument(
-    "--no-split",
-    dest="no_split",
-    action="store_true",
-    help="""Use hand-built no-split metadata (direct-to-O, no reduce). Isolates
-    kernel correctness from aiter.get_pa_metadata_v1. Default: False.""",
+    "--scales",
+    type=float,
+    nargs=3,
+    default=None,
+    metavar=("Q", "K", "V"),
+    help="""Per-tensor q/k/v dequant scales by hand, e.g. --scales 0.5 2.0 1.5.
+    Default: random scales per config.""",
 )
 args = parser.parse_args()
 
-l_scales = [(0.5, 2.0, 1.5)] if args.scaled else [(1.0, 1.0, 1.0)]
-
 df = []
-for batch, kv_head_num, ctx_len, scales in itertools.product(
-    args.batch_size, args.kv_head_num, args.ctx_len, l_scales
+for batch, kv_head_num, ctx_len in itertools.product(
+    args.batch_size, args.kv_head_num, args.ctx_len
 ):
-    ret = test_pa_decode(batch, kv_head_num, ctx_len, scales, args.varlen, args.no_split)
+    ret = test_pa_decode(
+        batch, kv_head_num, ctx_len,
+        tuple(args.scales) if args.scales is not None else None,
+        args.varlen,
+    )
     df.append(ret)
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
