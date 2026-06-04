@@ -1,8 +1,9 @@
 """Unified MXFP4/MXFP8/A8W4 GEMM kernel for gfx1250.
 
-Supports FP4 (E2M1), FP8 (E4M3) and A8W4 (FP8 activation + FP4 weight)
-data with E8M0 block scales via V_WMMA_SCALE instructions.
-Select precision with ``data_format="fp4"|"fp8"|"a8w4"``.
+Supports FP4 (E2M1), FP8 (E4M3) and A8W4 (FP8 activation + FP4 weight),
+selected via ``data_format="fp4"|"fp8"|"a8w4"``. Scales are either E8M0
+block scales applied in-MMA (``scale_mode="mxscale"``) or per-token/
+per-channel fp32 scales applied in the epilogue (``scale_mode="ptpc"``).
 """
 
 import functools
@@ -12,9 +13,8 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import (
     arith,
     buffer_ops,
@@ -83,9 +83,10 @@ LDS_GFX1250_MAX_BYTES = 5 * LDS_SEGMENT_BYTES
 
 
 @functools.lru_cache(maxsize=256)
-def compile_mxscale_gemm(
+def compile_fp8fp4_gemm(
     *,
     data_format: str = "fp4",
+    scale_mode: str = "mxscale",
     M: int = 0,
     N: int = 0,
     K: int,
@@ -111,16 +112,18 @@ def compile_mxscale_gemm(
     scale_load_path: str = "tdm",
     fp8_schedule: str = "auto",
 ):
-    """Compile an MXFP4 or MXFP8 GEMM kernel with TDM async copy.
+    """Compile an FP4/FP8/A8W4 GEMM kernel with TDM async copy.
 
     Args:
-        data_format: "fp4" for FP4/E2M1, "fp8" for FP8/E4M3.
+        data_format: "fp4" (E2M1), "fp8" (E4M3), or "a8w4" (FP8 act + FP4 weight).
+        scale_mode: "mxscale" (E8M0 block scale via V_WMMA_SCALE) or "ptpc"
+            (per-token sa[M] / per-channel sb[N] fp32, applied in the epilogue).
 
-    Data layout (both formats):
+    Data layout:
         A: [M, K_packed] uint8 (FP4: K_packed=K//2, FP8: K_packed=K)
         B: [N, K_packed] uint8, preshuffled (16x16 byte tiles)
-        scale_A: [M, K//32] uint8 E8M0 (preshuffled)
-        scale_B: [N, K//32] uint8 E8M0 (preshuffled)
+        mxscale: scale_A [M, K//32], scale_B [N, K//32] uint8 E8M0 (preshuffled)
+        ptpc:    scale_A [M], scale_B [N] fp32
 
     Returns a JitFunction:
         launch_fn(arg_c, arg_a, arg_b, arg_a_scale, arg_b_scale, M, N, stream)
@@ -129,9 +132,16 @@ def compile_mxscale_gemm(
         raise ValueError(
             f"data_format must be 'fp4', 'fp8', or 'a8w4', got {data_format!r}"
         )
+    if scale_mode not in ("mxscale", "ptpc"):
+        raise ValueError(f"scale_mode must be 'mxscale' or 'ptpc', got {scale_mode!r}")
+    if scale_mode == "ptpc" and data_format not in ("fp8", "a8w4"):
+        raise ValueError(
+            "scale_mode='ptpc' currently only supports data_format='fp8' or 'a8w4'"
+        )
 
     is_fp4 = data_format == "fp4"
     is_a8w4 = data_format == "a8w4"
+    is_ptpc = scale_mode == "ptpc"
 
     if out_dtype not in ("f32", "bf16", "f16"):
         raise ValueError(
@@ -177,9 +187,10 @@ def compile_mxscale_gemm(
     if block_threads > 1024:
         raise ValueError(f"block_threads must be <= 1024, got {block_threads}")
 
-    if wave_specialized_tdm and num_warps < 4:
+    _min_wave_spec_warps = 2 if is_ptpc else 4
+    if wave_specialized_tdm and num_warps < _min_wave_spec_warps:
         raise ValueError(
-            f"wave_specialized_tdm requires at least 4 waves, got {num_warps}"
+            f"wave_specialized_tdm requires at least {_min_wave_spec_warps} waves, got {num_warps}"
         )
 
     # ── Format-dependent compile-time constants ──
@@ -285,8 +296,8 @@ def compile_mxscale_gemm(
     ab_split_a_rows = tile_m // 2
     ab_split_b_groups = tile_n // 32
     _scale_guard_bytes = 16
-    lds_a_scale_bytes = tile_m * scale_k_per_tile + _scale_guard_bytes
-    lds_b_scale_bytes = tile_n * scale_k_per_tile + _scale_guard_bytes
+    lds_a_scale_bytes = 0 if is_ptpc else tile_m * scale_k_per_tile + _scale_guard_bytes
+    lds_b_scale_bytes = 0 if is_ptpc else tile_n * scale_k_per_tile + _scale_guard_bytes
     interleaved_scale_cols_a = wmma_m_rep * scale_k_per_tile
     interleaved_scale_cols_b = b_scale_load_rep * scale_k_per_tile
 
@@ -488,7 +499,7 @@ def compile_mxscale_gemm(
     COMPUTE_SCHEDULE_B_STREAMING = "b_streaming"
 
     fp8_deep_pipeline_eligible = (
-        data_format == "fp8"
+        data_format in ("fp8", "a8w4")
         and tile_m == 256
         and tile_n == 256
         and tile_k == 128
@@ -517,7 +528,9 @@ def compile_mxscale_gemm(
         # accumulators and uses the split to increase LDS-load-to-WMMA distance.
         if is_fp4:
             return COMPUTE_SCHEDULE_FP4_COL_BAND
-        if data_format == "fp8":
+        # A8W4 (FP8 act + FP4 weight) shares FP8's accumulator layout and operand
+        # path, so it reuses the FP8 schedules.
+        if data_format in ("fp8", "a8w4"):
             if fp8_schedule == "deep-pipeline" or (
                 fp8_schedule == "auto" and fp8_deep_pipeline_eligible
             ):
@@ -574,7 +587,7 @@ def compile_mxscale_gemm(
         _fp8_half_wm = wmma_m_rep // 2
         _fp8_half_wn = wmma_n_rep // 2
         _fp8_group_size = _fp8_half_wm * _fp8_half_wn
-        _fp8_b_scale_loads = (b_scale_load_rep + 3) // 4
+        _fp8_b_scale_loads = 0 if is_ptpc else (b_scale_load_rep + 3) // 4
     if use_fp8_deep_pipeline_schedule:
         _fp8_pair_wm = 2
         _fp8_pair_wn = 2
@@ -582,7 +595,9 @@ def compile_mxscale_gemm(
         _fp8_wn_pairs = wmma_n_rep // _fp8_pair_wn
         _fp8_pair_a_loads = _fp8_pair_wm * DS_LOADS_PER_A_FRAG
         _fp8_pair_b_loads = _fp8_pair_wn * _b_frag_loads_per_wn
-        _fp8_scale_loads = (wmma_m_rep + 3) // 4 + (b_scale_load_rep + 3) // 4
+        _fp8_scale_loads = (
+            0 if is_ptpc else (wmma_m_rep + 3) // 4 + (b_scale_load_rep + 3) // 4
+        )
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def kernel_mxscale_gemm(
@@ -677,6 +692,13 @@ def compile_mxscale_gemm(
         n_stride = arith.index(N)
         c_nrec = m_idx * n_stride * arith.index(elem_bytes_d)
         c_rsrc = buffer_ops.create_buffer_resource(arg_c, num_records_bytes=c_nrec)
+        c_global_ptr_type = ir.Type.parse("!llvm.ptr<1>")
+        c_global_base_i64 = llvm.PtrToIntOp(
+            T.i64,
+            fly.extract_aligned_pointer_as_index(
+                c_global_ptr_type, arg_c.__extract_to_ir_values__()[0]
+            ),
+        ).result
 
         def make_desc_a(memref, k_base):
             k_packed_off = k_base / arith.index(PACK_FACTOR_A)
@@ -996,6 +1018,8 @@ def compile_mxscale_gemm(
             FP4 BScale has no op_sel (scaleAType=0 fixed); only AScale halves.
             FP8/A8W4 16x16 supports op_sel on both.
             """
+            if const_expr(is_ptpc):
+                return None, None
             a_all = load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
             b_all = load_scale_b128(bs_buf, bs_bases[0], b_scale_load_rep, ks)
             if const_expr(use_scale_opsel):
@@ -1028,6 +1052,32 @@ def compile_mxscale_gemm(
         def _emit_wmma(accs, wm, wn, a_frag, b_frag, a_scales, b_scales):
             """Emit one WMMA instruction (format-specific)."""
             idx = wm * wmma_n_rep + wn
+            if const_expr(is_ptpc):
+                if const_expr(is_a8w4):
+                    accs[idx] = rocdl.wmma_scale_f32_16x16x128_f8f6f4(
+                        T.vec(8, T.f32),
+                        b_frag,
+                        a_frag,
+                        accs[idx],
+                        0x7F7F7F7F,
+                        0x7F7F7F7F,
+                        fmtA=4,
+                        fmtB=0,
+                    )
+                else:
+                    # for compatibility, use the following no-scale wmma instead future
+                    # accs[idx] = rocdl.wmma_f32_16x16x128_fp8_fp8(T.vec(8, T.f32), b_frag, a_frag, accs[idx])
+                    accs[idx] = rocdl.wmma_scale_f32_16x16x128_f8f6f4(
+                        T.vec(8, T.f32),
+                        b_frag,
+                        a_frag,
+                        accs[idx],
+                        0x7F7F7F7F,
+                        0x7F7F7F7F,
+                        fmtA=0,
+                        fmtB=0,
+                    )
+                return
             if const_expr(use_scale_opsel):
                 a_scale_idx = wm // 2
                 a_opsel = wm % 2
@@ -1508,12 +1558,16 @@ def compile_mxscale_gemm(
                 ]
 
             def _load_a_scales(ks):
+                if const_expr(is_ptpc):
+                    return None  # PTPC: scale applied in epilogue, not in K-loop
                 a_scales = load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
                 if const_expr(use_scale_opsel):
                     return a_scales[::2]
                 return a_scales
 
             def _load_b_scales(ks):
+                if const_expr(is_ptpc):
+                    return None  # PTPC: scale applied in epilogue, not in K-loop
                 b_scales = load_scale_b128(bs_buf, bs_bases[0], b_scale_load_rep, ks)
                 if const_expr(use_scale_opsel):
                     return b_scales[::2]
@@ -1723,6 +1777,8 @@ def compile_mxscale_gemm(
                 ]
 
             def _load_a_scales(ks):
+                if const_expr(is_ptpc):
+                    return None  # PTPC: scale applied in epilogue, not in K-loop
                 if const_expr(use_buffer_vgpr_scale):
                     if const_expr(pf_a_scales is not None):
                         return (
@@ -1734,6 +1790,8 @@ def compile_mxscale_gemm(
                 return load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
 
             def _load_b_scales(ks):
+                if const_expr(is_ptpc):
+                    return None  # PTPC: scale applied in epilogue, not in K-loop
                 if const_expr(use_buffer_vgpr_scale):
                     if const_expr(pf_b_scales is not None):
                         return pf_b_scales
@@ -1955,12 +2013,13 @@ def compile_mxscale_gemm(
             _half_wm = wmma_m_rep // 2
             _half_wmma = _half_wm * wmma_n_rep
             _b_loads_per_frag = 2 if is_a8w4 else 4
+            _scale_dsrd = 0 if is_ptpc else 2
 
             for _ks in range_constexpr(k_wmma_steps):
                 if const_expr(_ks == 0):
                     rocdl.sched_dsrd(
                         wmma_n_rep * _b_loads_per_frag
-                        + 2
+                        + _scale_dsrd
                         + _half_wm * DS_LOADS_PER_A_FRAG
                     )
                 else:
@@ -1969,7 +2028,7 @@ def compile_mxscale_gemm(
                 rocdl.sched_dsrd(_half_wm * DS_LOADS_PER_A_FRAG)
                 rocdl.sched_mfma(_half_wmma)
                 if const_expr(_ks < k_wmma_steps - 1):
-                    rocdl.sched_dsrd(wmma_n_rep * _b_loads_per_frag + 2)
+                    rocdl.sched_dsrd(wmma_n_rep * _b_loads_per_frag + _scale_dsrd)
             rocdl.sched_barrier(0)
 
         def hot_loop_scheduler_fp4_bank_friendly():
@@ -2000,7 +2059,7 @@ def compile_mxscale_gemm(
             rocdl.sched_barrier(0)
 
         def hot_loop_scheduler_fp8_quadrant():
-            _a_scale_loads = (wmma_m_rep + 3) // 4
+            _a_scale_loads = 0 if is_ptpc else (wmma_m_rep + 3) // 4
             _a_top_loads = _fp8_half_wm * DS_LOADS_PER_A_FRAG
             _a_bottom_loads = _a_top_loads
             _b_half_loads = _fp8_half_wn * _b_frag_loads_per_wn
@@ -2251,32 +2310,32 @@ def compile_mxscale_gemm(
                     d_buf, d_base, imm, sub8, out_elem=_out_elem_local
                 )
 
-        def _raw_ir(v):
-            if isinstance(v, ir.Value):
-                return v
-            return extract_to_ir_values(v)[0]
-
-        def _atomic_fadd_agent(ptr_idx, val, alignment):
-            out_ptr = buffer_ops.create_llvm_ptr(ptr_idx, address_space=1)
+        def _atomic_fadd_global(val, byte_off):
+            # Device-scoped, relaxed atomic add into C at c_global_base_i64 + byte_off.
+            addr_i64 = llvm.AddOp(
+                c_global_base_i64,
+                arith.index_cast(T.i64, byte_off),
+                llvm.IntegerOverflowFlags(0),
+            ).result
+            ptr = llvm.IntToPtrOp(c_global_ptr_type, addr_i64).result
             llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.fadd,
-                _raw_ir(out_ptr),
-                _raw_ir(val),
+                ptr,
+                val.ir_value(),
                 llvm.AtomicOrdering.monotonic,
                 syncscope="agent",
-                alignment=alignment,
+                alignment=4,
             )
 
         def _atomic_add_acc_vec8_to_buffer(acc_vec8, addr):
-            c_base_idx = buffer_ops.extract_base_index(arg_c)
             if const_expr(_bf16_out):
                 h_vec = fx.Vector(arith.trunc_f(T.vec(8, _out_elem_local), acc_vec8))
                 for pair in range_constexpr(4):
                     pair_vec = fx.Vector.from_elements(
                         [h_vec[pair * 2], h_vec[pair * 2 + 1]]
                     )
-                    ptr_idx = c_base_idx + addr + arith.index(pair * 4)
-                    _atomic_fadd_agent(ptr_idx, pair_vec, 4)
+                    byte_off = addr + arith.index(pair * 4)
+                    _atomic_fadd_global(pair_vec, byte_off)
                 return 1
 
             acc_vec = fx.Vector(acc_vec8)
@@ -2284,8 +2343,8 @@ def compile_mxscale_gemm(
                 base_addr = addr[half] if isinstance(addr, (list, tuple)) else addr
                 for vi in range_constexpr(4):
                     val = acc_vec[half * 4 + vi]
-                    ptr_idx = (base_addr + arith.index(vi)) * arith.index(4)
-                    _atomic_fadd_agent(c_base_idx + ptr_idx, val, 4)
+                    byte_off = (base_addr + arith.index(vi)) * arith.index(4)
+                    _atomic_fadd_global(val, byte_off)
             return 2
 
         def epilogue_atomic_adds(final_accs, addrs):
@@ -2309,6 +2368,58 @@ def compile_mxscale_gemm(
             if const_expr(compute_schedule_kind == COMPUTE_SCHEDULE_FP4_COL_BAND):
                 return grouped_accs_to_row_major(accs_in)
             return accs_in
+
+        def epilogue_load_ptpc_scales():
+            # PTPC scales: sa[M] per-token (scalar per wm), sb[N] per-channel
+            # (8 contiguous N cols per wn). Both fp32, constant along K.
+            sa_rsrc = buffer_ops.create_buffer_resource(arg_a_scale, max_size=False)
+            sb_rsrc = buffer_ops.create_buffer_resource(arg_b_scale, max_size=False)
+            sa = []
+            for wm in range_constexpr(wmma_m_rep):
+                row = blk_m + warp_m_base + arith.index(wm * WMMA_M) + lane16
+                sv = buffer_ops.buffer_load(
+                    sa_rsrc, arith.index_cast(T.i32, row), vec_width=1, dtype=T.f32
+                )
+                sa.append(fx.Vector.from_elements([sv] * 8))
+            sb = []
+            for wn in range_constexpr(wmma_n_rep):
+                col_base = (
+                    blk_n
+                    + warp_n_base
+                    + arith.index(wn * WMMA_N)
+                    + lane_kgrp * arith.index(8)
+                )
+                # buffer_load vec_width is capped at 4: read 8 cols as 2x vec4.
+                lo = fx.Vector(
+                    buffer_ops.buffer_load(
+                        sb_rsrc,
+                        arith.index_cast(T.i32, col_base),
+                        vec_width=4,
+                        dtype=T.f32,
+                    )
+                )
+                hi = fx.Vector(
+                    buffer_ops.buffer_load(
+                        sb_rsrc,
+                        arith.index_cast(T.i32, col_base + arith.index(4)),
+                        vec_width=4,
+                        dtype=T.f32,
+                    )
+                )
+                sb.append(
+                    fx.Vector.from_elements(
+                        [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]]
+                    )
+                )
+            return sa, sb
+
+        def epilogue_apply_ptpc_scale(accs_in, sa, sb):
+            out = list(accs_in)
+            for wm in range_constexpr(wmma_m_rep):
+                for wn in range_constexpr(wmma_n_rep):
+                    idx = wm * wmma_n_rep + wn
+                    out[idx] = (fx.Vector(out[idx]) * sb[wn] * sa[wm]).ir_value()
+            return out
 
         _effective_l2_pf = l2_prefetch_distance
         if const_expr(use_cluster and l2_prefetch_distance > 0):
@@ -2368,24 +2479,31 @@ def compile_mxscale_gemm(
             )
             for i in range_constexpr(num_buffers)
         ]
-        stages_as = [
-            SmemPtr(
-                arena_base_ptr,
-                stage_a_scale_off[i],
-                elem_ty_lds,
-                shape=(lds_a_scale_f16,),
-            )
-            for i in range_constexpr(num_buffers)
-        ]
-        stages_bs = [
-            SmemPtr(
-                arena_base_ptr,
-                stage_b_scale_off[i],
-                elem_ty_lds,
-                shape=(lds_b_scale_f16,),
-            )
-            for i in range_constexpr(num_buffers)
-        ]
+        if const_expr(is_ptpc):
+            # PTPC applies sa*sb in the epilogue from global memory: no scale LDS.
+            # Alias the scale stage handles to A/B so the shared plumbing stays
+            # valid; for PTPC they are never written (no scale TDM) or read.
+            stages_as = stages_a
+            stages_bs = stages_b
+        else:
+            stages_as = [
+                SmemPtr(
+                    arena_base_ptr,
+                    stage_a_scale_off[i],
+                    elem_ty_lds,
+                    shape=(lds_a_scale_f16,),
+                )
+                for i in range_constexpr(num_buffers)
+            ]
+            stages_bs = [
+                SmemPtr(
+                    arena_base_ptr,
+                    stage_b_scale_off[i],
+                    elem_ty_lds,
+                    shape=(lds_b_scale_f16,),
+                )
+                for i in range_constexpr(num_buffers)
+            ]
 
         stages_a_mem = [stages_a[i].get() for i in range_constexpr(num_buffers)]
         stages_b_mem = [stages_b[i].get() for i in range_constexpr(num_buffers)]
@@ -2468,17 +2586,26 @@ def compile_mxscale_gemm(
             stages_b_lds_addr.append(
                 _dg0_lane(make_desc_b(stages_b_mem[i], arith.index(0)), 1)
             )
-            stages_as_lds_addr.append(
-                _dg0_lane(make_desc_as(stages_as_mem[i], arith.index(0)), 1)
-            )
-            stages_bs_lds_addr.append(
-                _dg0_lane(make_desc_bs(stages_bs_mem[i], arith.index(0)), 1)
-            )
+            if const_expr(not is_ptpc):
+                stages_as_lds_addr.append(
+                    _dg0_lane(make_desc_as(stages_as_mem[i], arith.index(0)), 1)
+                )
+                stages_bs_lds_addr.append(
+                    _dg0_lane(make_desc_bs(stages_bs_mem[i], arith.index(0)), 1)
+                )
 
         desc_a_init = make_desc_a(stages_a_mem[0], split_k_base)
         desc_b_init = make_desc_b(stages_b_mem[0], split_k_base)
-        desc_as_init = make_desc_as(stages_as_mem[0], split_k_base)
-        desc_bs_init = make_desc_bs(stages_bs_mem[0], split_k_base)
+        if const_expr(is_ptpc):
+            # No scale TDM for PTPC: alias the scale descriptors/addresses to A/B.
+            # Scale waves are predicated off, so these selections are never issued.
+            stages_as_lds_addr = stages_a_lds_addr
+            stages_bs_lds_addr = stages_b_lds_addr
+            desc_as_init = desc_a_init
+            desc_bs_init = desc_b_init
+        else:
+            desc_as_init = make_desc_as(stages_as_mem[0], split_k_base)
+            desc_bs_init = make_desc_bs(stages_bs_mem[0], split_k_base)
         if const_expr(use_ab_half_split):
             stages_a0_lds_addr = []
             stages_b0_lds_addr = []
@@ -2510,9 +2637,9 @@ def compile_mxscale_gemm(
 
         pred_const = fx.Int32(1)
         if const_expr(wave_specialized_tdm):
-            # With scale on the VGPR path, drop scale waves 2,3 from the active TDM
-            # path -- unless ab-half-split repurposes them as the second A/B halves.
-            _drop_scale_waves = use_buffer_vgpr_scale and not use_ab_half_split
+            _drop_scale_waves = is_ptpc or (
+                use_buffer_vgpr_scale and not use_ab_half_split
+            )
             _active_wave_limit = 2 if _drop_scale_waves else 4
             active_pred_const = arith.select(
                 tdm_wave_id < fx.Int32(_active_wave_limit), fx.Int32(1), fx.Int32(0)
@@ -2853,6 +2980,12 @@ def compile_mxscale_gemm(
         elif const_expr(use_cluster):
             cluster.cluster_barrier()
         epi_addrs_box = [None]
+        _ptpc_scale_box = [None]
+
+        def _load_ptpc_scales_once():
+            if const_expr(is_ptpc and _ptpc_scale_box[0] is None):
+                _ptpc_scale_box[0] = epilogue_load_ptpc_scales()
+
         _tail_had_load = False
         # Tail K-tile index, so the VGPR-path scale buffer_load uses the right k_base.
         _bvs_tail_kt = [loop_iters * num_buffers]
@@ -2879,6 +3012,7 @@ def compile_mxscale_gemm(
                         stages_b_idx[_compute_stage],
                         stages_as_idx[_compute_stage],
                         stages_bs_idx[_compute_stage],
+                        emit_filler=(_load_ptpc_scales_once if is_ptpc else None),
                         a0_prefetch=a0_prefetch,
                         scale_k_base=_entry_kb,
                     )
@@ -2886,6 +3020,7 @@ def compile_mxscale_gemm(
 
                     def _emit_epi_addrs():
                         epi_addrs_box[0] = epilogue_prepare_addrs()
+                        _load_ptpc_scales_once()
 
                     a0_prefetch = maybe_prefetch_fp8_deep_a0(
                         stages_a_idx[_compute_stage]
@@ -2981,6 +3116,11 @@ def compile_mxscale_gemm(
 
         accs = finalize_acc_layout(accs)
 
+        if const_expr(is_ptpc):
+            _load_ptpc_scales_once()
+            _ptpc_sa, _ptpc_sb = _ptpc_scale_box[0]
+            accs = epilogue_apply_ptpc_scale(accs, _ptpc_sa, _ptpc_sb)
+
         if const_expr(use_tdm_store):
             if const_expr(d_need_epilogue_fence):
                 _pipeline_fence(outstanding=0)
@@ -3000,6 +3140,7 @@ def compile_mxscale_gemm(
 
     cache_tag = (
         data_format,
+        scale_mode,
         K,
         tile_m,
         tile_n,
@@ -3076,21 +3217,90 @@ def compile_mxscale_gemm(
     return launch_mxscale_gemm
 
 
+def compile_mxscale_gemm(**kw):
+    """Backward-compatible wrapper: MX block-scale (E8M0) GEMM."""
+    return compile_fp8fp4_gemm(scale_mode="mxscale", **kw)
+
+
 def compile_mxfp4_gemm(**kw):
-    return compile_mxscale_gemm(data_format="fp4", **kw)
+    return compile_fp8fp4_gemm(data_format="fp4", scale_mode="mxscale", **kw)
 
 
 def compile_mxfp8_gemm(**kw):
-    return compile_mxscale_gemm(data_format="fp8", **kw)
+    return compile_fp8fp4_gemm(data_format="fp8", scale_mode="mxscale", **kw)
 
 
 def compile_a8w4_gemm(**kw):
-    return compile_mxscale_gemm(data_format="a8w4", **kw)
+    return compile_fp8fp4_gemm(data_format="a8w4", scale_mode="mxscale", **kw)
+
+
+def compile_ptpc_gemm(
+    *,
+    M: int = 0,
+    N: int = 0,
+    K: int,
+    data_format: str = "fp8",
+    tile_m: int = 128,
+    tile_n: int = 128,
+    tile_k: int = 128,
+    m_warp: int = 2,
+    n_warp: int = 2,
+    num_buffers: int = 4,
+    waves_per_eu: int = None,
+    l2_prefetch_distance: int = 0,
+    cluster_m: int = 1,
+    cluster_n: int = 1,
+    out_dtype: str = "bf16",
+    inst_prefetch: bool = False,
+    expert_sched_mode: bool = True,
+    atomic_barrier_enable: bool = False,
+    split_k: int = 1,
+):
+    """Compile a PTPC (per-token per-channel) GEMM kernel.
+
+    A scale is per-token (sa[M], fp32), B scale is per-channel (sb[N], fp32),
+    both constant along K. The K-loop runs the WMMA unscaled (FP8) or with an
+    identity E8M0 scale (A8W4, which has no non-scale op); sa*sb is applied in
+    the epilogue in fp32. split_k>1 is supported (atomic add path).
+
+    data_format: "fp8" (FP8 act + FP8 weight) or "a8w4" (FP8 act + FP4 weight).
+    wave_specialized_tdm=True requires m_warp*n_warp >= 2.
+    """
+    return compile_fp8fp4_gemm(
+        data_format=data_format,
+        scale_mode="ptpc",
+        b_streaming=False,
+        wave_specialized_tdm=True,
+        use_scale_opsel=False,
+        fp8_schedule="auto",
+        scale_load_path="tdm",
+        use_tdm_store=(split_k == 1),
+        M=M,
+        N=N,
+        K=K,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        m_warp=m_warp,
+        n_warp=n_warp,
+        num_buffers=num_buffers,
+        waves_per_eu=waves_per_eu,
+        l2_prefetch_distance=l2_prefetch_distance,
+        cluster_m=cluster_m,
+        cluster_n=cluster_n,
+        out_dtype=out_dtype,
+        inst_prefetch=inst_prefetch,
+        expert_sched_mode=expert_sched_mode,
+        atomic_barrier_enable=atomic_barrier_enable,
+        split_k=split_k,
+    )
 
 
 __all__ = [
+    "compile_fp8fp4_gemm",
     "compile_mxscale_gemm",
     "compile_mxfp4_gemm",
     "compile_mxfp8_gemm",
     "compile_a8w4_gemm",
+    "compile_ptpc_gemm",
 ]

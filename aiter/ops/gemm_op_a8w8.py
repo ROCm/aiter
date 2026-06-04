@@ -119,31 +119,6 @@ def _parse_flydsl_kernel_name(kernel_name: str):
     return tuple(int(m.group(i)) for i in range(1, 9))
 
 
-def _run_gemm_a8w8_bpreshuffle_mxscale_flydsl(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    Out: Tensor,
-    kernel_name: str,
-) -> Tensor:
-    from .flydsl.mxscale_gemm import (
-        flydsl_mxscale_gemm,
-        mxscale_out_dtype_name,
-    )
-
-    return flydsl_mxscale_gemm(
-        XQ,
-        WQ,
-        x_scale,
-        w_scale,
-        data_format="fp8",
-        out=Out,
-        out_dtype=mxscale_out_dtype_name(Out.dtype),
-        kernel_name=kernel_name,
-    )
-
-
 def gemm_a8w8_bpreshuffle_flydsl(
     XQ: Tensor,
     WQ: Tensor,
@@ -152,15 +127,17 @@ def gemm_a8w8_bpreshuffle_flydsl(
     Out: Tensor,
     config: dict,
 ) -> Tensor:
-    kernel_name = config.get("kernelName", "")
-    if str(kernel_name).startswith("flydsl_mxscale_fp8_"):
-        return _run_gemm_a8w8_bpreshuffle_mxscale_flydsl(
-            XQ, WQ, x_scale, w_scale, Out, str(kernel_name)
+    kernel_name = str(config.get("kernelName", ""))
+    if kernel_name.startswith("flydsl_bpreshuffle_wmma_"):
+        from .flydsl.bpreshuffle_gemm_gfx1250 import run_gemm_a8w8_bpreshuffle_gfx1250
+
+        return run_gemm_a8w8_bpreshuffle_gfx1250(
+            XQ, WQ, x_scale, w_scale, Out, kernel_name
         )
 
     from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 
-    parsed = _parse_flydsl_kernel_name(str(kernel_name))
+    parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
     tm, tn, tk, lds, csh, acp, wpe, xcd = parsed
@@ -685,10 +662,7 @@ def gemm_a8w8_bpreshuffle(
         elif libtype == "flydsl" and is_flydsl_available():
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
     try:
-        # DEBUG: untuned shapes fall back to flydsl MXScale (default kernel) instead of CK.
-        return _run_gemm_a8w8_bpreshuffle_mxscale_flydsl(
-            XQ, WQ, x_scale, w_scale, Y, None
-        )
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
     except RuntimeError as e:
         raise RuntimeError(
             f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
