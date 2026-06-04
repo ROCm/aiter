@@ -1721,6 +1721,7 @@ def compile_moe_gemm1(
                         range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
+                        block_size=total_threads,
                         e_vec=4,
                         m_repeat=m_repeat,
                         num_acc_n=num_acc_n,
