@@ -359,6 +359,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     SCALE_K_WIDTH_ROPE: gl.constexpr = 4,
     OUTPUT_Q_NOPE_ZEROS_AND_Q_PE: gl.constexpr = False,
     HAVE_K_SCALE: gl.constexpr = False,
+    UPCAST_OPERAND: gl.constexpr = False,
 ):
     # 1-warp (wave32) blocked layouts matching the Triton-generated ttgir.
     L_NOPE: gl.constexpr = gl.BlockedLayout(
@@ -471,6 +472,9 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         sin = _freq_from_shared(
             sin_smem, REUSE_FREQS_FRONT_PART, IS_NEOX, BLOCK_D_pe, L_PE, L_FREQ
         )
+        if UPCAST_OPERAND:
+            cos = cos.to(gl.float32)
+            sin = sin.to(gl.float32)
         # q_nope is a pure passthrough (no rope, no scale) and the host
         # asserts q_out.dtype == q_nope.dtype, so the data already in qn_smem
         # (from the async_load) is bit-identical. Skip the LDS round-trip and

@@ -300,6 +300,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     SCALE_K_WIDTH_ROPE: tl.constexpr = 4,
     OUTPUT_Q_NOPE_ZEROS_AND_Q_PE: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
+    UPCAST_OPERAND: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
 
@@ -321,18 +322,18 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     d_cos_offs - BLOCK_D_HALF_pe,
                     d_cos_offs,
                 ).to(d_cos_offs.dtype)
-                # d_cos_mask = d_cos_offs < BLOCK_D_pe
             else:
                 d_cos_offs = d_pe_offs // 2
-                # d_cos_mask = d_cos_offs < BLOCK_D_HALF_pe
         else:
             d_cos_offs = d_pe_offs
-            # d_cos_mask = d_cos_offs < BLOCK_D_pe
 
         pos = tl.load(pos_ptr + pid_b * pos_stride_b)
         cos_offs = pos * cos_stride_b + d_cos_offs * cos_stride_d
         cos = tl.load(cos_ptr + cos_offs)
         sin = tl.load(sin_ptr + cos_offs)
+        if UPCAST_OPERAND:
+            cos = cos.to(tl.float32)
+            sin = sin.to(tl.float32)
 
         q_nope_ptrs = (
             q_nope_ptr
@@ -629,6 +630,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     HAVE_K_SCALE: tl.constexpr = False,
     HAVE_V_SCALE: tl.constexpr = False,
     HAVE_ZEROS: tl.constexpr = False,
+    UPCAST_OPERAND: tl.constexpr = False,
 ):
 
     tl.assume(q_stride_t >= 0)
@@ -679,13 +681,10 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     d_cos_offs - BLOCK_D_HALF_pe,
                     d_cos_offs,
                 ).to(d_cos_offs.dtype)
-                # d_cos_mask = d_cos_offs < BLOCK_D_pe
             else:
                 d_cos_offs = d_pe_offs // 2
-                # d_cos_mask = d_cos_offs < BLOCK_D_HALF_pe
         else:
             d_cos_offs = d_pe_offs
-            # d_cos_mask = d_cos_offs < BLOCK_D_pe
 
         pos = tl.load(pos_ptr + pid_t)
         if HAVE_POS:
@@ -694,6 +693,9 @@ def _fused_qk_rope_reshape_and_cache_kernel(
         cos_offs = pos * cos_stride_t + d_cos_offs * cos_stride_d
         cos = tl.load(cos_ptr + cos_offs)
         sin = tl.load(sin_ptr + cos_offs)
+        if UPCAST_OPERAND:
+            cos = cos.to(tl.float32)
+            sin = sin.to(tl.float32)
 
         q_ptrs = (
             q_ptr + pid_t * q_stride_t + pid_hq * q_stride_h + d_pe_offs * q_stride_d
