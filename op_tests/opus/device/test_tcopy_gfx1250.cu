@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 /**
- * @file test_tcopy_move_2slot.cu
+ * @file test_tcopy_gfx1250.cu
  * @brief Device test for opus::tcopy_window with 2-slot LDS ping-pong on gfx1250.
  *
  * Kernel: 32x64xK WMMA GEMM driven by tcopy_window K-step.
@@ -46,11 +46,11 @@ __device__ __forceinline__ int waveid_in_workgroup() {
 
 __global__ __launch_bounds__(256, 2) __cluster_dims__(2, 1, 1)
 void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
-                              const void* __restrict__ ptr_b,
-                              void* __restrict__       ptr_c,
-                              int stride_a,
-                              int stride_b,
-                              int stride_c)
+                          const void* __restrict__ ptr_b,
+                          void* __restrict__       ptr_c,
+                          int stride_a,
+                          int stride_b,
+                          int stride_c)
 {
     using namespace opus;
     using opus::operator""_I;
@@ -283,7 +283,7 @@ __global__ void tcopy_gfx1250_kernel(const void*, const void*, void*, int, int, 
 __global__ void tcopy_gfx1250_kernel(const void*, const void*, void*, int, int, int) {}
 
 extern "C" void run_tcopy_gfx1250(const void* d_a, const void* d_b, void* d_c,
-                                     int stride_a, int stride_b, int stride_c)
+                                  int stride_a, int stride_b, int stride_c)
 {
     // 2 WGs forming a cluster (cluster_dims(2,1,1)); each WG has 256 threads = 8 waves.
     hipLaunchKernelGGL(tcopy_gfx1250_kernel,
