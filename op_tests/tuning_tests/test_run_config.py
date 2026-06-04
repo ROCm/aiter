@@ -267,6 +267,9 @@ TUNER_FAMILIES = {
         "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
         "csv_pattern": "a8w8_blockscale_tuned_gemm",
         "exclude_patterns": ["bpreshuffle", "fmoe"],
+        # Merged CSV has ~15k shapes plus a production-op benchmark pass;
+        # the default 600s is not enough.
+        "timeout": 3600,
         "config_property": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE",
     },
     "a8w8_blockscale_bpreshuffle": {
@@ -274,6 +277,7 @@ TUNER_FAMILIES = {
         "csv_pattern": "a8w8_blockscale_bpreshuffle_tuned_gemm",
         "exclude_patterns": ["fmoe"],
         "extra_args": ["--preshuffle"],
+        "timeout": 3600,
         "config_property": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE",
     },
     "a4w4_blockscale": {
@@ -298,7 +302,8 @@ TUNER_FAMILIES = {
         "script": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
         "csv_pattern": "tuned_fmoe",
         "exclude_patterns": ["untuned", "profile"],
-        "timeout": 1200,
+        # fmoe merges many model configs and JIT-builds many modules; needs >1h.
+        "timeout": 3600,
         "config_property": "AITER_CONFIG_FMOE_FILE",
     },
     "gradlib_bf16": {
