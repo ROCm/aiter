@@ -48,6 +48,7 @@ from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 
 from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.flydsl.moe_common import GateMode
 
 if is_flydsl_available():
     from aiter.ops.flydsl.moe_kernels import (
@@ -3185,6 +3186,15 @@ class FmoeTuner(TunerCommon):
 
                 w1_qt_fmoe.is_shuffled = True
                 w2_qt_fmoe.is_shuffled = True
+                _fmoe_gate_mode = (
+                    GateMode.INTERLEAVE.value
+                    if (
+                        q_type == QuantType.per_1x32
+                        and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+                        and q_dtype_w == dtypes.fp4x2
+                    )
+                    else GateMode.SEPARATED.value
+                )
 
                 score = torch.randn((token, expert), dtype=dtype, device="cuda")
                 topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
@@ -3221,6 +3231,7 @@ class FmoeTuner(TunerCommon):
                     w1_scale=w1_scale_fmoe,
                     w2_scale=w2_scale_fmoe,
                     dtype=dtype,
+                    gate_mode=_fmoe_gate_mode,
                     num_warmup=args.warmup,
                     num_iters=args.iters,
                 )
