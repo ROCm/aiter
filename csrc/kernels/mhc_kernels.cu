@@ -1572,7 +1572,7 @@ namespace aiter {
     }
 
     template <typename DTYPE_I, int block_size, int hc_mult, int tile_m, int tile_n, int tile_k, bool store_nt>
-    __global__ __launch_bounds__(block_size, 2)
+    __global__ __launch_bounds__(block_size, 1)
     void mhc_fused_post_pre_gemm_sqrsum_kernel(
         float* out,
         float* sqrsum,
@@ -1601,8 +1601,9 @@ namespace aiter {
         static constexpr int hc_mult3 = hc_mult * hc_mult + 2 * hc_mult;
         static_assert(block_size == hc_mult * warp_size, "block_size must be equal to hc_mult * warp_size");
 
-        __shared__ DTYPE_I s_x[2 * tile_m * tile_k];
-        __shared__ DTYPE_I s_residual[2 * tile_m * hc_mult * tile_k];
+        static constexpr int n_stages = 2;
+        __shared__ DTYPE_I s_x[n_stages * tile_m * tile_k];
+        __shared__ DTYPE_I s_residual[n_stages * tile_m * hc_mult * tile_k];
 
         int64_t idx = blockIdx.x * tile_m;
         int n_idx = blockIdx.y * tile_n;
@@ -1616,7 +1617,9 @@ namespace aiter {
         using halfx8_t = opus::vector_t<DTYPE_I, 8>;
         using fp32x16_t = opus::vector_t<float, 16>;
 
-        static_assert(tile_m == mfma_m, "tile_m == mfma_m");
+        static_assert(tile_m % mfma_m == 0, "tile_m must be a multiple of mfma_m");
+        static constexpr int m_repeat = tile_m / mfma_m;
+        static constexpr int band_mk = mfma_m * tile_k;
         static constexpr int vec_tile = tile_k / (warp_size / mfma_m);
         static constexpr int repeat_n = tile_n / mfma_n;
         using fp32xtile = opus::vector_t<float, vec_tile>;
@@ -1694,18 +1697,22 @@ namespace aiter {
             return v_fn;
         };
 
-        float post_mix_v = lane_id % tile_m < m_oob ? post_layer_mix[(lane_id % tile_m + idx) * hc_mult + warp_id] : 0.0f;
         using float_hc_mult = opus::vector_t<float, hc_mult>;
-        float_hc_mult comb_mix;
-        for(int h = 0; h < hc_mult; h++) {
-            comb_mix[h] = lane_id % tile_m < m_oob ? comb_res_mix[(lane_id % tile_m + idx) * hc_mult2 + h * hc_mult + warp_id] : 0.0f;
+        float post_mix_v[m_repeat];
+        float_hc_mult comb_mix[m_repeat];
+        for(int b = 0; b < m_repeat; b++) {
+            int row = b * mfma_m + lane_id % mfma_m;
+            post_mix_v[b] = row < m_oob ? post_layer_mix[(row + idx) * hc_mult + warp_id] : 0.0f;
+            for(int h = 0; h < hc_mult; h++) {
+                comb_mix[b][h] = row < m_oob ? comb_res_mix[(row + idx) * hc_mult2 + h * hc_mult + warp_id] : 0.0f;
+            }
         }
 
         const int k_loop = hidden_size / (split_k * tile_k);
 
         fp32xfntile v_fn0;
         fp32xfntile v_fn1;
-        
+
         lds_load_x_tile(0);
         lds_load_residual_tile(0);
         v_fn0 = vgpr_load_fn_tile(0);
@@ -1714,10 +1721,13 @@ namespace aiter {
         lds_load_residual_tile(1);
         v_fn1 = vgpr_load_fn_tile(1);
 
-        float sqrsum_part = 0.0f;
-        fp32xovec_t v_cf[repeat_n];
-        for (int n = 0; n < repeat_n; n++) {
-            opus::clear(v_cf[n]);
+        float sqrsum_part[m_repeat];
+        fp32xovec_t v_cf[m_repeat][repeat_n];
+        for (int b = 0; b < m_repeat; b++) {
+            sqrsum_part[b] = 0.0f;
+            for (int n = 0; n < repeat_n; n++) {
+                opus::clear(v_cf[b][n]);
+            }
         }
 
         auto compute_store_tile = [&](int i, fp32xfntile& v_fn) {
@@ -1725,37 +1735,40 @@ namespace aiter {
             DTYPE_I* s_residual_rd_ptr = s_residual + (i & 1) * (hc_mult * tile_mk);
             static constexpr int ds_read_vec = 16 / sizeof(DTYPE_I);
             static constexpr int step = ds_read_vec;
-            int s_offset = lane_id % mfma_m * tile_k + lane_id / mfma_m * vec_tile;
-            for(int j = 0; j < tile_mk / (warp_size * ds_read_vec); j++) {
-                opus::vector_t<float, ds_read_vec> res;
-                using DTYPE_I_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
-                DTYPE_I_vec x_vec = *(reinterpret_cast<DTYPE_I_vec*>(s_x_rd_ptr + s_offset));
-                DTYPE_I_vec residual_vec[hc_mult];
-                for(int h = 0; h < hc_mult; h++) {
-                    residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset + h * tile_mk));
-                }
-                opus::s_waitcnt_lgkmcnt(opus::number<0>{});
-                for(int k = 0; k < ds_read_vec; k++) {
-                    res[k] = static_cast<float>(x_vec[k]) * post_mix_v;
-                }
-                for(int h = 0; h < hc_mult; h++) {
-                    for(int k = 0; k < ds_read_vec; k++) {
-                        res[k] += static_cast<float>(residual_vec[h][k]) * comb_mix[h];
+            static constexpr int band_j = band_mk / (warp_size * ds_read_vec);
+            for(int b = 0; b < m_repeat; b++) {
+                int s_offset = b * band_mk + lane_id % mfma_m * tile_k + lane_id / mfma_m * vec_tile;
+                for(int j = 0; j < band_j; j++) {
+                    opus::vector_t<float, ds_read_vec> res;
+                    using DTYPE_I_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
+                    DTYPE_I_vec x_vec = *(reinterpret_cast<DTYPE_I_vec*>(s_x_rd_ptr + s_offset));
+                    DTYPE_I_vec residual_vec[hc_mult];
+                    for(int h = 0; h < hc_mult; h++) {
+                        residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset + h * tile_mk));
                     }
-                }
-                if(n_idx == 0) {
-                    for(int t = 0; t < ds_read_vec; t++) {
-                        sqrsum_part += res[t] * res[t];
-                    }
-                }
-                store_vector<DTYPE_I, float, ds_read_vec, 0, false>(
-                    g_nres, res, (lane_id % mfma_m) * residual_stride + warp_id * hidden_size + i * tile_k + 
-                    (s_offset % tile_k) + k_split_offset);
-                s_offset += step;
-                for(int n = 0; n < repeat_n; n++) {
+                    opus::s_waitcnt_lgkmcnt(opus::number<0>{});
                     for(int k = 0; k < ds_read_vec; k++) {
-                        v_cf[n] = __builtin_amdgcn_mfma_f32_16x16x4f32(
-                            v_fn[n][k + j * ds_read_vec], res[k], v_cf[n], 0, 0, 0);
+                        res[k] = static_cast<float>(x_vec[k]) * post_mix_v[b];
+                    }
+                    for(int h = 0; h < hc_mult; h++) {
+                        for(int k = 0; k < ds_read_vec; k++) {
+                            res[k] += static_cast<float>(residual_vec[h][k]) * comb_mix[b][h];
+                        }
+                    }
+                    if(n_idx == 0) {
+                        for(int t = 0; t < ds_read_vec; t++) {
+                            sqrsum_part[b] += res[t] * res[t];
+                        }
+                    }
+                    store_vector<DTYPE_I, float, ds_read_vec, 0, false>(
+                        g_nres, res, (b * mfma_m + lane_id % mfma_m) * residual_stride + warp_id * hidden_size + i * tile_k +
+                        (s_offset % tile_k) + k_split_offset);
+                    s_offset += step;
+                    for(int n = 0; n < repeat_n; n++) {
+                        for(int k = 0; k < ds_read_vec; k++) {
+                            v_cf[b][n] = __builtin_amdgcn_mfma_f32_16x16x4f32(
+                                v_fn[n][k + j * ds_read_vec], res[k], v_cf[b][n], 0, 0, 0);
+                        }
                     }
                 }
             }
@@ -1821,24 +1834,28 @@ namespace aiter {
         }
 
         if (n_idx == 0) {
-            float sqrsum_ = cross_row_sum_4(sqrsum_part, lane_id);
-            if (lane_id < mfma_m && (lane_id < m_oob)) {
-                sqrsum[(hc_mult * k_split_idx + warp_id) * m + idx + lane_id] = sqrsum_;
+            for (int b = 0; b < m_repeat; b++) {
+                float sqrsum_ = cross_row_sum_4(sqrsum_part[b], lane_id);
+                if (lane_id < mfma_m && (b * mfma_m + lane_id < m_oob)) {
+                    sqrsum[(hc_mult * k_split_idx + warp_id) * m + idx + b * mfma_m + lane_id] = sqrsum_;
+                }
             }
         }
 
-        int gc_offset = (lane_id % mfma_m) * out_stride + (lane_id / mfma_m) * ovec;
-        for (int n = 0; n < repeat_n; n++) {
-            store_vector_nbytes<float, float, 4, 16, 0, false>(g_o, v_cf[n], gc_offset + n * mfma_n);
+        for (int b = 0; b < m_repeat; b++) {
+            int gc_offset = (b * mfma_m + lane_id % mfma_m) * out_stride + (lane_id / mfma_m) * ovec;
+            for (int n = 0; n < repeat_n; n++) {
+                store_vector_nbytes<float, float, 4, 16, 0, false>(g_o, v_cf[b][n], gc_offset + n * mfma_n);
+            }
         }
     }
 
-#define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(block_size, tile_n, tile_k, store_nt) \
+#define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(block_size, tile_m, tile_n, tile_k, store_nt) \
     AITER_DISPATCH_FLOATING16_TYPES(layer_input.scalar_type(), "mhc_fused_post_pre_gemm_sqrsum", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
-        const int tile_m = 16; \
+        int mb = (m + tile_m - 1) / tile_m; \
         int n_blocks = (hc_mult3 + tile_n - 1) / tile_n; \
-        dim3 grid(m_blocks, n_blocks, split_k); \
+        dim3 grid(mb, n_blocks, split_k); \
         TORCH_CHECK(hidden_size % (tile_k * split_k) == 0, \
                     "hidden_size must be divisible by tile_k * split_k"); \
         TORCH_CHECK(hidden_size >= (tile_k * split_k) * 2, \
@@ -1860,25 +1877,35 @@ namespace aiter {
                 split_k); \
     });
 
-#define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(block_size, tile_n, tile_k) \
+#define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(block_size, tile_m, tile_n, tile_k) \
     if (m >= 8 * cu_num) { \
-        MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(block_size, tile_n, tile_k, true); \
+        MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(block_size, tile_m, tile_n, tile_k, true); \
     } else { \
-        MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(block_size, tile_n, tile_k, false); \
+        MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(block_size, tile_m, tile_n, tile_k, false); \
     }
 
 #define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k) \
     if (tile_k == 32) { \
-        if (cu_num * 2 > m_blocks * split_k || hc_mult3 <= 16) { \
-            MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 32); \
+        if (cu_num * 2 > m_blocks * split_k) { \
+            int nb = (hc_mult3 + 15) / 16; \
+            if ((m + 31) / 32 * nb * split_k >= cu_num) { \
+                MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 32, 16, 32); \
+            } else { \
+                MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 16, 32); \
+            } \
         } else { \
-            MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 32, 32); \
+            int nb = (hc_mult3 + 31) / 32; \
+            if ((m + 31) / 32 * nb * split_k >= cu_num) { \
+                MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 32, 32, 32); \
+            } else { \
+                MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 32, 32); \
+            } \
         } \
     } else if (tile_k == 64) { \
-        if (cu_num * 2 > m_blocks * split_k || hc_mult3 <= 16) { \
-            MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 64); \
+        if (cu_num * 2 > m_blocks * split_k) { \
+            MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 16, 64); \
         } else { \
-            MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 32, 64); \
+            MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 32, 64); \
         } \
     } else { \
         TORCH_CHECK(false, "tile_k must be 32 or 64"); \

@@ -99,36 +99,39 @@ def get_mhc_pre_splitk(m: int, hc_hidden_size: int) -> tuple[int, int]:
 
 @functools.lru_cache(maxsize=1024)
 def get_mhc_fused_post_pre_splitk(m: int, hidden_size: int) -> tuple[int, int]:
-    """Split-K / tile_k selection for fused post+pre GEMM (K = hidden_size per stream)."""
+    """Split-K / tile_k selection for fused post+pre GEMM (K = hidden_size per stream).
+
+    Empirically (gfx950, n=7168) tile_k=32 wins for nearly all m because it enables
+    the tile_m=32 kernel path (fn loaded once, reused across two mfma m-bands), which
+    cuts redundant fn traffic. tile_k=64 (tile_m fixed at 16) only wins once m is large
+    enough to fill the device on its own, i.e. ceil(m/32) >= 2*num_cu, where the kernel
+    is compute-bound and the wider k-tile amortizes loop overhead.
+
+    Split-K targets ~32*num_cu total thread-blocks so the grid fills the device a few
+    waves deep without over-splitting (which shrinks per-block work and adds reduction
+    cost). The chosen split-k is snapped to the nearest value that evenly divides
+    hidden_size/tile_k and keeps at least `prefetch_stages` k-tiles per block.
+    """
     prefetch_stages = 2
-    tile_m = 16
     num_cu = get_cu_num()
-    tile_k_tg_dict = {
-        64: 2 * num_cu,
-        32: 4 * num_cu,
-    }
-    selected_splitk = 1
-    selected_tile_k = 32
-    num_tg_m = (m + tile_m - 1) // tile_m
-    selected_score = num_tg_m / (num_cu * tile_k_tg_dict[selected_tile_k])
-    selected_score = selected_score / math.ceil(selected_score)
-    for tile_k, meanwhile_tg in tile_k_tg_dict.items():
-        if (hidden_size % tile_k) != 0:
-            continue
-        for splitk in range(1, num_cu + 1):
-            if hidden_size % (splitk * tile_k) != 0 or (hidden_size // splitk) < (
-                tile_k * prefetch_stages
-            ):
-                continue
-            num_tg = num_tg_m * splitk
-            score = num_tg / meanwhile_tg
-            score = score / math.ceil(score)
-            if selected_score < score:
-                selected_splitk = splitk
-                selected_tile_k = tile_k
-                selected_score = score
-            if num_tg > meanwhile_tg * 2:
-                break
+
+    selected_tile_k = 64 if (m + 31) // 32 >= 2 * num_cu else 32
+    if hidden_size % selected_tile_k != 0:
+        selected_tile_k = 32 if selected_tile_k == 64 else 64
+
+    valid_splitk = [
+        sk
+        for sk in range(1, num_cu + 1)
+        if hidden_size % (sk * selected_tile_k) == 0
+        and (hidden_size // sk) >= selected_tile_k * prefetch_stages
+    ]
+    if not valid_splitk:
+        return 1, selected_tile_k
+
+    ideal = max(1.0, 32.0 * num_cu / m)
+    selected_splitk = min(
+        valid_splitk, key=lambda sk: (abs(math.log(sk) - math.log(ideal)), -sk)
+    )
 
     return selected_splitk, selected_tile_k
 
