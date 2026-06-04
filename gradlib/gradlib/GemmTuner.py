@@ -580,7 +580,12 @@ class GemmTuner(GemmCommonTuner):
                 self.untunedf["outdtype"] = self.untunedf["dtype"]
             if "scaleAB" not in self.untunedf.columns:
                 self.untunedf["scaleAB"] = False
-            _cli_to_dtypes = {"f16": "fp16", "f32": "fp32", "bf16": "bf16", "fp8": "fp8"}
+            _cli_to_dtypes = {
+                "f16": "fp16",
+                "f32": "fp32",
+                "bf16": "bf16",
+                "fp8": "fp8",
+            }
             if args.indtype is not None:
                 self.untunedf["dtype"] = f"dtypes.{_cli_to_dtypes[args.indtype]}"
             if args.outdtype is not None:
