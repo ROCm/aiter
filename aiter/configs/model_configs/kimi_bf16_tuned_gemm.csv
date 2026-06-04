@@ -15,3 +15,5 @@ gfx950,256,256,7168,512,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,5
 gfx950,256,1024,7168,512,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,3886,1,13.203,flydsl_gemm3_abf16_wbf16_bf16_t128x256x64_split_k1_block_m_warp2_block_n_warp4_block_k_warp1_async_copyTrue_b_to_ldsTrue_b_preshuffleFalse_c_to_ldsFalse_gfx950,0.0,569.28,1747.23
 gfx950,256,4096,7168,512,False,torch.bfloat16,torch.bfloat16,False,False,asm,10,1,40.4141,_ZN5aiter24bf16gemm_bf16_tn_256x256E,0.0,743.92,1738.37
 gfx950,256,16384,7168,512,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,131.6552,native,0.0,913.44,1967.25
+gfx942,80,512,384,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,50200,6,35.8617,opus_gemm_gfx942_splitk_legacy_512x128x128x64_2x4_16x16x16_0x0x0,0.0,78.6,369.15
+gfx942,80,128,7168,512,False,torch.bfloat16,torch.bfloat16,False,False,opus,50000,0,14.1933,opus_gemm_gfx942_512x128x128x64_2x4_16x16x16_0x0x0,0.0,66.19,655.67
