@@ -482,175 +482,175 @@ __device__ inline void attn_mask_causal_tile(V& v_s, int q_pos_base, int num_qhe
     });
 }
 
-// MLA: simple (un-pipelined) accumulator for a small number of KV tiles.
-// Loads one KV tile at a time into shared memory and runs QK / softmax / PV.
-template<class Traits>
-__device__ void mla_decode_accum_le2_tiles(mla_decode_ps_kargs kargs,
-                                           const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
-                                           int q_len, int num_qheads, int kv_offset,
-                                           char* smem_kv_buf,
-                                           opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE   / Traits::WARP_SIZE>& v_q,
-                                           opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::V_D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
-                                           typename Traits::D_ACC& m_row,
-                                           typename Traits::D_ACC& l_row) {
-    using namespace opus;
-    using T = opus::remove_cvref_t<Traits>;
-    using D_ATTN = typename T::D_ATTN;
-    using D_ACC = typename T::D_ACC;
+// // MLA: simple (un-pipelined) accumulator for a small number of KV tiles.
+// // Loads one KV tile at a time into shared memory and runs QK / softmax / PV.
+// template<class Traits>
+// __device__ void mla_decode_accum_le2_tiles(mla_decode_ps_kargs kargs,
+//                                            const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+//                                            int q_len, int num_qheads, int kv_offset,
+//                                            char* smem_kv_buf,
+//                                            opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE   / Traits::WARP_SIZE>& v_q,
+//                                            opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::V_D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
+//                                            typename Traits::D_ACC& m_row,
+//                                            typename Traits::D_ACC& l_row) {
+//     using namespace opus;
+//     using T = opus::remove_cvref_t<Traits>;
+//     using D_ATTN = typename T::D_ATTN;
+//     using D_ACC = typename T::D_ACC;
 
-    int lane_id = thread_id_x() % T::WARP_SIZE;
-    asm volatile("" : "+v"(lane_id));  // break CSE
-    const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+//     int lane_id = thread_id_x() % T::WARP_SIZE;
+//     asm volatile("" : "+v"(lane_id));  // break CSE
+//     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    // KV cache is [num_pages, page_size, num_kv_heads, D_kv] -> indexed by page id.
-    // The buffer rsrc MUST cover the WHOLE kv_ptr range (passed as kargs.kv_buffer_bytes):
-    // each kv_indices entry is a *global* page id, so the load offsets can land
-    // anywhere inside the cache.  Using `valid_kv_len * stride` here would trip
-    // the buffer-rsrc OOB guard and silently return 0 for K/V -> output = 0.
-    const int kv_row_stride = static_cast<int>(kargs.s_Bs / sizeof(D_ATTN));
-    auto g_kv = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.kv_ptr), kargs.kv_buffer_bytes);
-    auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
+//     // KV cache is [num_pages, page_size, num_kv_heads, D_kv] -> indexed by page id.
+//     // The buffer rsrc MUST cover the WHOLE kv_ptr range (passed as kargs.kv_buffer_bytes):
+//     // each kv_indices entry is a *global* page id, so the load offsets can land
+//     // anywhere inside the cache.  Using `valid_kv_len * stride` here would trip
+//     // the buffer-rsrc OOB guard and silently return 0 for K/V -> output = 0.
+//     const int kv_row_stride = static_cast<int>(kargs.s_Bs / sizeof(D_ATTN));
+//     auto g_kv = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.kv_ptr), kargs.kv_buffer_bytes);
+//     auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
 
-    auto s_kv = make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf));
+//     auto s_kv = make_smem(reinterpret_cast<D_ATTN*>(smem_kv_buf));
 
-    auto mma0 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
-        seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_E_K>{},
-        seq<T::T_M, T::T_N, T::T_K>{},
-        seq<T::W_M, T::W_N, T::W_K>{},
-        mfma_adaptor_swap_ab{});
-    auto mma1 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
-        seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
-        seq<T::T_M, T::T_N, T::T_K>{},
-        seq<T::W_M, T::W_N, T::W_K>{},
-        mfma_adaptor_swap_ab{});
+//     auto mma0 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
+//         seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_E_K>{},
+//         seq<T::T_M, T::T_N, T::T_K>{},
+//         seq<T::W_M, T::W_N, T::W_K>{},
+//         mfma_adaptor_swap_ab{});
+//     auto mma1 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
+//         seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
+//         seq<T::T_M, T::T_N, T::T_K>{},
+//         seq<T::W_M, T::W_N, T::W_K>{},
+//         mfma_adaptor_swap_ab{});
 
-    auto u_gkv_main = make_layout_gkv_main<T>(warp_id, lane_id);
-    auto u_gkv_tail = make_layout_gkv_tail<T>(warp_id, lane_id);
-    auto u_skv_main = make_layout_skv_main<T>(warp_id);
-    auto u_skv_tail = make_layout_skv_tail<T>(warp_id);
-    auto u_rk = make_layout_rk<T>(lane_id);
-    auto u_rv = make_layout_rv<T>(lane_id);
-    auto u_kv_indices = make_layout_kv_indices<T>(warp_id, lane_id);
+//     auto u_gkv_main = make_layout_gkv_main<T>(warp_id, lane_id);
+//     auto u_gkv_tail = make_layout_gkv_tail<T>(warp_id, lane_id);
+//     auto u_skv_main = make_layout_skv_main<T>(warp_id);
+//     auto u_skv_tail = make_layout_skv_tail<T>(warp_id);
+//     auto u_rk = make_layout_rk<T>(lane_id);
+//     auto u_rv = make_layout_rv<T>(lane_id);
+//     auto u_kv_indices = make_layout_kv_indices<T>(warp_id, lane_id);
 
-    // Tail stage offsets:
-    //   gmem: starts at element offset V_D_TILE_SIZE inside each KV row (the
-    //         rope tail begins immediately after the V prefix).
-    //   smem: starts at chunk index `smem_v_d_rpt`.  Each physical chunk in
-    //         smem occupies `smem_n_rpt * (smem_linear_wave + smem_padding_32B)`
-    //         elements (4 N-group blocks x 528 elements = 2112), see
-    //         `skv_slice`. So the tail chunk's base is
-    //           smem_v_d_rpt x smem_n_rpt x (smem_linear_wave + padding).
-    constexpr auto tail_gmem_d_offset = number<T::V_D_TILE_SIZE>{};
-    constexpr auto tail_smem_d_offset = number<T::smem_v_d_rpt * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B)>{};
+//     // Tail stage offsets:
+//     //   gmem: starts at element offset V_D_TILE_SIZE inside each KV row (the
+//     //         rope tail begins immediately after the V prefix).
+//     //   smem: starts at chunk index `smem_v_d_rpt`.  Each physical chunk in
+//     //         smem occupies `smem_n_rpt * (smem_linear_wave + smem_padding_32B)`
+//     //         elements (4 N-group blocks x 528 elements = 2112), see
+//     //         `skv_slice`. So the tail chunk's base is
+//     //           smem_v_d_rpt x smem_n_rpt x (smem_linear_wave + padding).
+//     constexpr auto tail_gmem_d_offset = number<T::V_D_TILE_SIZE>{};
+//     constexpr auto tail_smem_d_offset = number<T::smem_v_d_rpt * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B)>{};
 
-    typename decltype(mma0)::vtype_b v_k[2];
-    typename decltype(mma0)::vtype_c v_s;
-    typename decltype(mma1)::vtype_a v_p;
-    typename decltype(mma1)::vtype_b v_v[2];
-    auto v_q_slices = reinterpret_cast<vector_t<D_ATTN, T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_q);
-    auto v_o_slices = reinterpret_cast<vector_t<D_ACC,  T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_o);
+//     typename decltype(mma0)::vtype_b v_k[2];
+//     typename decltype(mma0)::vtype_c v_s;
+//     typename decltype(mma1)::vtype_a v_p;
+//     typename decltype(mma1)::vtype_b v_v[2];
+//     auto v_q_slices = reinterpret_cast<vector_t<D_ATTN, T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_q);
+//     auto v_o_slices = reinterpret_cast<vector_t<D_ACC,  T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_o);
 
-    constexpr index_t s_len = vector_traits<typename decltype(mma0)::vtype_c>::size();
+//     constexpr index_t s_len = vector_traits<typename decltype(mma0)::vtype_c>::size();
 
-    auto load_kv_page = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
-    auto kv_token_offset = [&](int token_idx) { return token_idx * kv_row_stride; };
-    auto skv_slice = [](auto slice_idx) {
-        constexpr int s = decltype(slice_idx)::value;
-        return number<(s / 2) * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B) + (s % 2) * T::SLICE_D>{};
-    };
+//     auto load_kv_page = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
+//     auto kv_token_offset = [&](int token_idx) { return token_idx * kv_row_stride; };
+//     auto skv_slice = [](auto slice_idx) {
+//         constexpr int s = decltype(slice_idx)::value;
+//         return number<(s / 2) * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B) + (s % 2) * T::SLICE_D>{};
+//     };
 
-    // QK over D_TILE_SIZE (576): NUM_K_SLICES iterations
-    auto compute_qk = [&](auto& s, const auto& q, auto& k) {
-        clear(s);
-        static_for<T::NUM_K_SLICES>([&](auto i) {
-            constexpr int idx = i.value;
-            constexpr int slot = idx & 1;
-            s = mma0(q[idx], k[slot], s);
-            if constexpr (idx + 2 < T::NUM_K_SLICES) {
-                k[slot] = load<T::VEC_KV>(s_kv, u_rk + skv_slice(number<idx + 2>{}));
-                s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
-            } else if constexpr (idx + 1 < T::NUM_K_SLICES) {
-                s_waitcnt_lgkmcnt(0_I);
-            }
-        });
-    };
+//     // QK over D_TILE_SIZE (576): NUM_K_SLICES iterations
+//     auto compute_qk = [&](auto& s, const auto& q, auto& k) {
+//         clear(s);
+//         static_for<T::NUM_K_SLICES>([&](auto i) {
+//             constexpr int idx = i.value;
+//             constexpr int slot = idx & 1;
+//             s = mma0(q[idx], k[slot], s);
+//             if constexpr (idx + 2 < T::NUM_K_SLICES) {
+//                 k[slot] = load<T::VEC_KV>(s_kv, u_rk + skv_slice(number<idx + 2>{}));
+//                 s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
+//             } else if constexpr (idx + 1 < T::NUM_K_SLICES) {
+//                 s_waitcnt_lgkmcnt(0_I);
+//             }
+//         });
+//     };
 
-    // PV over V_D_TILE_SIZE (512): NUM_V_SLICES iterations.
-    // V is the first V_D_TILE_SIZE columns of every K row already in smem,
-    // so we iterate fewer slices and ignore the rope tail.
-    auto compute_pv = [&](const auto& p, auto& v, auto& o) {
-        static_for<T::NUM_V_SLICES - 2>([&](auto i) {
-            constexpr int idx = i.value;
-            constexpr int slot = idx & 1;
-            o[idx] = mma1(p, v[slot], o[idx]);
-            v[slot] = tr_load<T::VEC_TR_V>(s_kv, u_rv + skv_slice(number<idx + 2>{}));
-            s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
-            __builtin_amdgcn_sched_barrier(0);
-        });
-        o[T::NUM_V_SLICES - 2] = mma1(p, v[(T::NUM_V_SLICES - 2) & 1], o[T::NUM_V_SLICES - 2]);
-        s_waitcnt_lgkmcnt(0_I);
-        o[T::NUM_V_SLICES - 1] = mma1(p, v[(T::NUM_V_SLICES - 1) & 1], o[T::NUM_V_SLICES - 1]);
-    };
+//     // PV over V_D_TILE_SIZE (512): NUM_V_SLICES iterations.
+//     // V is the first V_D_TILE_SIZE columns of every K row already in smem,
+//     // so we iterate fewer slices and ignore the rope tail.
+//     auto compute_pv = [&](const auto& p, auto& v, auto& o) {
+//         static_for<T::NUM_V_SLICES - 2>([&](auto i) {
+//             constexpr int idx = i.value;
+//             constexpr int slot = idx & 1;
+//             o[idx] = mma1(p, v[slot], o[idx]);
+//             v[slot] = tr_load<T::VEC_TR_V>(s_kv, u_rv + skv_slice(number<idx + 2>{}));
+//             s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
+//             __builtin_amdgcn_sched_barrier(0);
+//         });
+//         o[T::NUM_V_SLICES - 2] = mma1(p, v[(T::NUM_V_SLICES - 2) & 1], o[T::NUM_V_SLICES - 2]);
+//         s_waitcnt_lgkmcnt(0_I);
+//         o[T::NUM_V_SLICES - 1] = mma1(p, v[(T::NUM_V_SLICES - 1) & 1], o[T::NUM_V_SLICES - 1]);
+//     };
 
-    const opus::u32_t neg_inf_v = std::bit_cast<opus::u32_t>(-opus::numeric_limits<D_ACC>::infinity());
-    // Causal masking only applies to the KV slice that reaches the sequence end
-    // (kv_offset==0); for that slice it subsumes the OOB mask. Non-causal traits
-    // and earlier split-K slices fall back to OOB masking on the last tile.
-    [[maybe_unused]] const bool causal_active = T::CAUSAL && (kv_offset == 0);
-    [[maybe_unused]] const int  q_pos_base    = valid_kv_len - q_len;
-    auto mask_scores = [&](auto& s, int tile_idx) {
-        if constexpr (T::CAUSAL) {
-            if (causal_active) {
-                attn_mask_causal_tile<T>(s, q_pos_base, num_qheads, tile_idx, neg_inf_v, warp_id, lane_id);
-                return;
-            }
-        }
-        if ((tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len) {
-            attn_mask_oob_kv_tile<T>(s, valid_kv_len, tile_idx, neg_inf_v, lane_id);
-        }
-    };
+//     const opus::u32_t neg_inf_v = std::bit_cast<opus::u32_t>(-opus::numeric_limits<D_ACC>::infinity());
+//     // Causal masking only applies to the KV slice that reaches the sequence end
+//     // (kv_offset==0); for that slice it subsumes the OOB mask. Non-causal traits
+//     // and earlier split-K slices fall back to OOB masking on the last tile.
+//     [[maybe_unused]] const bool causal_active = T::CAUSAL && (kv_offset == 0);
+//     [[maybe_unused]] const int  q_pos_base    = valid_kv_len - q_len;
+//     auto mask_scores = [&](auto& s, int tile_idx) {
+//         if constexpr (T::CAUSAL) {
+//             if (causal_active) {
+//                 attn_mask_causal_tile<T>(s, q_pos_base, num_qheads, tile_idx, neg_inf_v, warp_id, lane_id);
+//                 return;
+//             }
+//         }
+//         if ((tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len) {
+//             attn_mask_oob_kv_tile<T>(s, valid_kv_len, tile_idx, neg_inf_v, lane_id);
+//         }
+//     };
 
-    // Active in tail-stage only when this warp's warp_d_group is 0.
-    const bool tail_active = (warp_id / T::smem_n_rpt) == 0;
+//     // Active in tail-stage only when this warp's warp_d_group is 0.
+//     const bool tail_active = (warp_id / T::smem_n_rpt) == 0;
 
-    for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
-        const int kv_page = load_kv_page(tile_idx);
-        // Stage 1: 32 x 512 -- all warps participate.
-        async_load<T::VEC_KV>(g_kv, s_kv.ptr,
-                              u_gkv_main + kv_token_offset(kv_page),
-                              u_skv_main);
-        // Stage 2: 32 x 64 (rope tail) -- only warps with warp_d_group == 0.
-        if (tail_active) {
-            async_load<T::VEC_KV>(g_kv, s_kv.ptr,
-                                  u_gkv_tail + kv_token_offset(kv_page) + tail_gmem_d_offset,
-                                  u_skv_tail + tail_smem_d_offset);
-        }
-        s_waitcnt_vmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+//     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
+//         const int kv_page = load_kv_page(tile_idx);
+//         // Stage 1: 32 x 512 -- all warps participate.
+//         async_load<T::VEC_KV>(g_kv, s_kv.ptr,
+//                               u_gkv_main + kv_token_offset(kv_page),
+//                               u_skv_main);
+//         // Stage 2: 32 x 64 (rope tail) -- only warps with warp_d_group == 0.
+//         if (tail_active) {
+//             async_load<T::VEC_KV>(g_kv, s_kv.ptr,
+//                                   u_gkv_tail + kv_token_offset(kv_page) + tail_gmem_d_offset,
+//                                   u_skv_tail + tail_smem_d_offset);
+//         }
+//         s_waitcnt_vmcnt(0_I);
+//         __builtin_amdgcn_s_barrier();
 
-        v_k[0] = load<T::VEC_KV>(s_kv, u_rk);
-        v_k[1] = load<T::VEC_KV>(s_kv, u_rk + skv_slice(1_I));
-        s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
-        compute_qk(v_s, v_q_slices, v_k);
-        mask_scores(v_s, tile_idx);
+//         v_k[0] = load<T::VEC_KV>(s_kv, u_rk);
+//         v_k[1] = load<T::VEC_KV>(s_kv, u_rk + skv_slice(1_I));
+//         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
+//         compute_qk(v_s, v_q_slices, v_k);
+//         mask_scores(v_s, tile_idx);
 
-        D_ACC row_max = max(m_row, attn_row_max<T>(v_s));
-        D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-        m_row = row_max;
-        attn_sub_row<T>(v_s, row_max);
-        attn_exp2_slice<T, 0, s_len>(v_s);
-        l_row *= rescale_m;
-        l_row += attn_row_sum<T>(v_s);
-        v_p = cast<D_ATTN>(v_s);
-        scale_output_tile<T>(v_o, rescale_m);
+//         D_ACC row_max = max(m_row, attn_row_max<T>(v_s));
+//         D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+//         m_row = row_max;
+//         attn_sub_row<T>(v_s, row_max);
+//         attn_exp2_slice<T, 0, s_len>(v_s);
+//         l_row *= rescale_m;
+//         l_row += attn_row_sum<T>(v_s);
+//         v_p = cast<D_ATTN>(v_s);
+//         scale_output_tile<T>(v_o, rescale_m);
 
-        v_v[0] = tr_load<T::VEC_TR_V>(s_kv, u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_kv, u_rv + skv_slice(1_I));
-        s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
-        compute_pv(v_p, v_v, v_o_slices);
-        __builtin_amdgcn_s_barrier();
-    }
-}
+//         v_v[0] = tr_load<T::VEC_TR_V>(s_kv, u_rv);
+//         v_v[1] = tr_load<T::VEC_TR_V>(s_kv, u_rv + skv_slice(1_I));
+//         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
+//         compute_pv(v_p, v_v, v_o_slices);
+//         __builtin_amdgcn_s_barrier();
+//     }
+// }
 
 // MLA: 2-buffer pipelined accumulator.
 //   - QK iterates over K's full feature dim     (NUM_K_SLICES = D_TILE_SIZE / SLICE_D)
@@ -719,10 +719,10 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
     constexpr auto tail_smem_d_offset = number<T::smem_v_d_rpt * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B)>{};
 
     // Register fragments
-    typename decltype(mma0)::vtype_b v_k[2];
-    typename decltype(mma0)::vtype_c v_s[2];
-    typename decltype(mma1)::vtype_a v_p;
-    typename decltype(mma1)::vtype_b v_v[2];
+    typename decltype(mma0)::vtype_b v_k[2]; // 16x32 x 2 x2 /4 /64 =  8
+    typename decltype(mma0)::vtype_c v_s[2]; // 16x16x 4 x 2 / 64 /4 = 8
+    typename decltype(mma1)::vtype_a v_p; // 16 x 32 x 2 / 64 /4 = 4
+    typename decltype(mma1)::vtype_b v_v[2]; // 16 x 
     auto v_q_slices = reinterpret_cast<vector_t<D_ATTN, T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_q);
     auto v_o_slices = reinterpret_cast<vector_t<D_ACC,  T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_o);
 
@@ -1345,8 +1345,8 @@ void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs kargs) {
                              q_len * kargs.stride_qo_n * sizeof(D_ATTN));
         auto u_q = make_layout_q<T>(warp_id, lane_id, kargs.stride_qo_h);
 
-        vector_t<D_ATTN, T::Q_TILE_SIZE * T::D_TILE_SIZE   / T::WARP_SIZE> v_q;
-        vector_t<D_ACC,  T::Q_TILE_SIZE * T::V_D_TILE_SIZE / T::WARP_SIZE> v_o;
+        vector_t<D_ATTN, T::Q_TILE_SIZE * T::D_TILE_SIZE   / T::WARP_SIZE> v_q; // 144 x 2 /4 =72
+        vector_t<D_ACC,  T::Q_TILE_SIZE * T::V_D_TILE_SIZE / T::WARP_SIZE> v_o; // 128 x 4 / 4 =128
 
         v_q = load<T::VEC_Q>(g_q, u_q);
         auto v_q_f32 = cast<float>(v_q);
@@ -1364,13 +1364,14 @@ void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs kargs) {
         // load so D_TILE_SIZE=576 works for NUM_WARPS=8:
         //   <= 2 tiles : simple un-pipelined accumulator (le2_tiles).
         //   >  2 tiles : 2-buffer pipelined accumulator (parity selects epilogue).
-        if (num_kv_tiles <= 2) {
-            mla_decode_accum_le2_tiles<Traits>(
-                kargs, kargs.kv_indices,
-                kv_ind_ptr_s, valid_kv_len, num_kv_tiles,
-                q_len, num_qheads, kv_offset,
-                smem_kv_buf, v_q, v_o, m_row, l_row);
-        } else if (num_kv_tiles & 1) {
+        // if (num_kv_tiles <= 2) {
+        //     mla_decode_accum_le2_tiles<Traits>(
+        //         kargs, kargs.kv_indices,
+        //         kv_ind_ptr_s, valid_kv_len, num_kv_tiles,
+        //         q_len, num_qheads, kv_offset,
+        //         smem_kv_buf, v_q, v_o, m_row, l_row);
+        // } else 
+        if (num_kv_tiles & 1) {
             mla_decode_accum_pipelined<Traits, /*OddTail=*/true>(
                 kargs, kargs.kv_indices,
                 kv_ind_ptr_s, valid_kv_len, num_kv_tiles,
