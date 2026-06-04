@@ -231,8 +231,17 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
         name, [&]() { return AiterAsmKernel(name, co_name); });
 
-    // ---- launch (persistent: grid.x = CU count, bdx = 128 wave32) ---------
-    const int gdx = (int)get_num_cu_func();
+    // ---- launch (persistent) ----------------------------------------------
+    // grid.x MUST equal the available_tgs the work metadata was built for: each
+    // TG t processes work_indptr[t]..work_indptr[t+1].  The metadata is generated
+    // (Python) for a specific TG count, so derive grid.x from work_indptr's length
+    // (= available_tgs + 1) rather than get_num_cu_func() — those can differ on
+    // gfx1250 (HIP CU count vs the count used to build the metadata), and a grid
+    // larger than the metadata makes extra TGs read work_indptr OOB -> they pick up
+    // garbage work and overwrite O with zeros.  Falls back to CU count if no metadata.
+    const int gdx = (work_indptr != nullptr)
+                        ? (int)(work_indptr->size(0) - 1)
+                        : (int)get_num_cu_func();
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              gdx,      // gdx

@@ -351,10 +351,15 @@ def test_pa_decode(
     max_qlen = qlen_with_mtp
     q_head_num = kv_head_num * gqa
 
-    # Explicit, pre-zeroed output buffer (kernel's direct-O store target; also the
-    # buffer cpu_reduce fills for split rows). bf16, Q's logical shape.
-    out = torch.zeros(
+    # Explicit output buffer (kernel's direct-O store target; also the buffer
+    # cpu_reduce fills for split rows). bf16, Q's logical shape.  In debug we fill
+    # it with a SENTINEL so we can tell whether the kernel actually wrote O
+    # (sentinel changed) vs computed/stored zero (sentinel -> 0).
+    _dbg = os.environ.get("AITER_PA_DEBUG", "0") == "1"
+    SENTINEL = -99.0
+    out = torch.full(
         (batch, qlen_with_mtp, kv_head_num, gqa, head_dim),
+        SENTINEL if _dbg else 0.0,
         dtype=torch.bfloat16, device=device,
     )
 
@@ -404,8 +409,19 @@ def test_pa_decode(
             print(f"[DEBUG] split_o : absmean={split_o.abs().mean().item():.5f} "
                   f"absmax={split_o.abs().max().item():.5f} "
                   f"(rows={split_o.shape[0]}, kernel wrote partials if >0)")
-            print(f"[DEBUG] O after kernel (pre-reduce) absmean={out.float().abs().mean().item():.5f}")
+            changed = int((out.float() != SENTINEL).sum().item())
+            print(f"[DEBUG] O written by kernel: {changed}/{out.numel()} elems changed "
+                  f"from sentinel (0 => kernel never wrote O; >0 => O IS being written)")
+            print(f"[DEBUG] O after kernel (pre-reduce) absmean="
+                  f"{out.float().masked_fill(out.float()==SENTINEL, 0).abs().mean().item():.5f}")
             print(f"[DEBUG] work_info[0:8] = {work_info[:8].tolist()}")
+            print(f"[DEBUG] inputs on GPU: |Q|={Q.float().abs().mean().item():.4f} "
+                  f"|K|={K.float().abs().mean().item():.4f} "
+                  f"|V|={V.float().abs().mean().item():.4f} "
+                  f"(should be ~0.4; if ~0 the test data is the problem)")
+            print(f"[DEBUG] context_lens={seq_lens_kv.tolist()[:4]} "
+                  f"kv_indptr={kv_indptr.tolist()[:4]} kv_indices={kv_indices.tolist()[:4]} "
+                  f"qo_indptr={qo_indptr.tolist()[:4]}")
 
         out, n_ref, n_unwritten = cpu_reduce(
             out, split_o, split_lse,
