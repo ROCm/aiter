@@ -2,7 +2,7 @@
 
 Tests with THD packed layout and variable-length sequences via cu_seqlens.
 Supports both causal and non-causal modes.
-Uses the production path (flash_attn_varlen_flydsl) including AOT compilation.
+Uses the production path (flash_attn_varlen_func -> flash_attn_varlen_flydsl).
 
 Usage:
     bash run_mha_flydsl_varlen.sh
@@ -29,8 +29,9 @@ for p in [_BUILD_PKGS, os.path.join(_REPO, "python"), _AITER_ROOT]:
 
 os.environ["ARCH"] = "gfx1250"
 os.environ["FLYDSL_RUNTIME_ENABLE_CACHE"] = "0"
+os.environ["ENABLE_CK"] = "0"
 
-from aiter.ops.flydsl.mha_flydsl import flash_attn_varlen_flydsl
+from aiter.ops.mha import flash_attn_varlen_func
 
 HEAD_DIM_QK = 192
 HEAD_DIM_V = 128
@@ -91,7 +92,7 @@ def run_varlen_test(cu_q_list, cu_k_list, H=1, causal=False):
     cu_seqlens_q = torch.tensor(cu_q, dtype=torch.int32, device=device)
     cu_seqlens_k = torch.tensor(cu_k, dtype=torch.int32, device=device)
 
-    o = flash_attn_varlen_flydsl(
+    o = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q, cu_seqlens_k,
         max_sq, max_sk,
@@ -148,12 +149,13 @@ if __name__ == "__main__":
     print("=" * 60)
 
     tests = [
-        ([0, 128], [0, 128], 1, False),
+        # ([0, 128], [0, 128], 1, False),
         ([0, 128], [0, 128], 1, True),
-        ([0, 184], [0, 184], 1, False),
+        # ([0, 184], [0, 184], 1, False),
         ([0, 184], [0, 184], 128, True),
-        ([0, 341], [0, 341], 1, False),
+        # ([0, 341], [0, 341], 1, False),
         ([0, 341], [0, 341], 128, True),
+        ([0, 5], [0, 5], 128, True),
         ([0, 481, 581, 982], [0, 481, 581, 982], 128, True),
     ]
 

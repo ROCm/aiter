@@ -101,6 +101,10 @@ def _ensure_kernel(is_causal: bool):
         stride_k_seq: fx.Int32,
         stride_v_seq: fx.Int32,
         stride_o_seq: fx.Int32,
+        stride_q_head: fx.Int32,
+        stride_k_head: fx.Int32,
+        stride_v_head: fx.Int32,
+        stride_o_head: fx.Int32,
         gqa: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
@@ -130,6 +134,7 @@ def _ensure_kernel(is_causal: bool):
             ptr_cu_seqlens_q, ptr_cu_seqlens_k,
             scalar_f,
             stride_q_seq, stride_k_seq, stride_v_seq, stride_o_seq,
+            stride_q_head, stride_k_head, stride_v_head, stride_o_head,
             gqa, max_seqlen_q, max_seqlen_k,
         )
         launcher.launch(
@@ -200,11 +205,15 @@ def flash_attn_varlen_flydsl(
         (batch, nheads_q, max_seqlen_q), dtype=torch.float32, device=q.device
     )
 
-    # THD strides: per-token stride = nheads * dim * BPP bytes
-    stride_q_seq = nheads_q * HEAD_DIM_QK * BPP
-    stride_k_seq = nheads_k * HEAD_DIM_QK * BPP
-    stride_v_seq = nheads_k * HEAD_DIM_V * BPP
-    stride_o_seq = nheads_q * HEAD_DIM_V   # elements
+    # THD strides from actual tensor layout (bytes for q/k/v, elements for o)
+    stride_q_seq = q.stride(0) * BPP
+    stride_k_seq = k.stride(0) * BPP
+    stride_v_seq = v.stride(0) * BPP
+    stride_o_seq = out.stride(0)
+    stride_q_head = q.stride(1) * BPP
+    stride_k_head = k.stride(1) * BPP
+    stride_v_head = v.stride(1) * BPP
+    stride_o_head = out.stride(1)
 
     _ensure_kernel(bool(causal))
 
@@ -215,6 +224,7 @@ def flash_attn_varlen_flydsl(
             cu_seqlens_q, cu_seqlens_k,
             softmax_scale,
             stride_q_seq, stride_k_seq, stride_v_seq, stride_o_seq,
+            stride_q_head, stride_k_head, stride_v_head, stride_o_head,
             gqa, max_seqlen_q, max_seqlen_k,
             nheads_q, batch,
         ),

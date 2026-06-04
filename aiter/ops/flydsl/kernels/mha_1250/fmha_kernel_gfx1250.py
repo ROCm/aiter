@@ -698,6 +698,10 @@ def compile_fmha_fwd(*, is_causal: bool = False):
         stride_k_seq: fx.Int32,
         stride_v_seq: fx.Int32,
         stride_o_seq: fx.Int32,
+        stride_q_head: fx.Int32,
+        stride_k_head: fx.Int32,
+        stride_v_head: fx.Int32,
+        stride_o_head: fx.Int32,
         gqa: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
@@ -723,13 +727,15 @@ def compile_fmha_fwd(*, is_causal: bool = False):
         stride_k_seq = _to_raw(stride_k_seq)
         stride_v_seq = _to_raw(stride_v_seq)
         stride_o_seq = _to_raw(stride_o_seq)
+        stride_q_head = _to_raw(stride_q_head)
+        stride_k_head = _to_raw(stride_k_head)
+        stride_v_head = _to_raw(stride_v_head)
+        stride_o_head = _to_raw(stride_o_head)
         gqa = _to_raw(gqa)
         max_seqlen_q_raw = _to_raw(max_seqlen_q)
         max_seqlen_k_raw = _to_raw(max_seqlen_k)
 
-        # Per-head byte / elem strides are compile-time (THD packed layout).
-        _HEAD_BYTES_QK = QK_HDIM * KV_BPP   # 384
-        _HEAD_BYTES_V = V_HDIM * KV_BPP     # 256
+        # Per-head byte strides are now runtime parameters (stride_q/k/v/o_head).
         # actual_q_len / actual_kv_len are derived later from cu_seqlens (THD).
     
         ty = _get_types()
@@ -914,15 +920,14 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             _q_tok = _mlir_arith.AddIOp(
                 q_start_tok,
                 _mlir_arith.MulIOp(_to_raw(bx), _to_raw(arith.constant(128, type=T.i32))).result).result
-            _head_qk_bytes_v = _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))
             q_offset = _mlir_arith.AddIOp(
                 _mlir_arith.MulIOp(_q_tok, stride_q_seq).result,
-                _mlir_arith.MulIOp(_to_raw(by), _head_qk_bytes_v).result).result
+                _mlir_arith.MulIOp(_to_raw(by), stride_q_head).result).result
             _q_end_byte = _mlir_arith.AddIOp(
                 _mlir_arith.MulIOp(q_end_tok, stride_q_seq).result,
-                _mlir_arith.MulIOp(_to_raw(by), _head_qk_bytes_v).result).result
+                _mlir_arith.MulIOp(_to_raw(by), stride_q_head).result).result
             _q_num_bytes = _mlir_arith.AddIOp(
-                _q_end_byte, _head_qk_bytes_v).result
+                _q_end_byte, stride_q_head).result
             q_rsrc = buffer_ops.create_buffer_resource(
                 ptr_Q, num_records_bytes=_q_num_bytes)
     
@@ -966,12 +971,10 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             # THD: K/V batch offset = k_start_tok * stride_{k,v}_seq
             k_offset = _mlir_arith.AddIOp(
                 _mlir_arith.MulIOp(k_start_tok, stride_k_seq).result,
-                _mlir_arith.MulIOp(_to_raw(head_index),
-                    _to_raw(arith.constant(_HEAD_BYTES_QK, type=T.i32))).result).result
+                _mlir_arith.MulIOp(_to_raw(head_index), stride_k_head).result).result
             v_offset = _mlir_arith.AddIOp(
                 _mlir_arith.MulIOp(k_start_tok, stride_v_seq).result,
-                _mlir_arith.MulIOp(_to_raw(head_index),
-                    _to_raw(arith.constant(_HEAD_BYTES_V, type=T.i32))).result).result
+                _mlir_arith.MulIOp(_to_raw(head_index), stride_v_head).result).result
     
             # SmemAllocator bases → i32 LDS addresses
             k_a_base_i32 = _extract_lds_base_i32(_lds_alloc_k_a.get_base())
@@ -2118,18 +2121,14 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                             llvm_dialect.inttoptr(_ldst, _la), volatile_=True)
                 _asm_void("s_wait_dscnt 0x0")
                 _wsgpr = rocdl.wave_id()
-                _D = 128
-                _LOG2_D = 7
                 from flydsl._mlir.dialects import arith as _sa2
                 from flydsl._mlir.dialects import fly as _fly2
                 from flydsl._mlir.dialects import llvm as _llvm2
                 _i64t = ir.IntegerType.get_signless(64)
                 _glbpt = ir.Type.parse("!llvm.ptr<1>")
-                # THD O byte offset:
-                #   _o_tok = q_start_tok + bx*128 + wave*32       (absolute token index)
-                #   elem_off = by*V_HDIM + _o_tok*stride_o_seq
-                #   byte_off = elem_off * BPP(=2)
-                # stride_o_seq is in ELEMENT units; per-head stride is V_HDIM (THD packed).
+                # THD O element offset:
+                #   _o_tok = q_start_tok + bx*128 + wave*32
+                #   elem_off = by*stride_o_head + _o_tok*stride_o_seq
                 _o_tok = _sa2.AddIOp(
                     _sa2.AddIOp(
                         q_start_tok,
@@ -2138,7 +2137,7 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                     _sa2.MulIOp(_wsgpr, _raw(arith.constant(WV_SUBQD, type=T.i32))).result,
                 ).result
                 _o_elem_off = _sa2.AddIOp(
-                    _sa2.MulIOp(by, _raw(arith.constant(V_HDIM, type=T.i32))).result,
+                    _sa2.MulIOp(by, stride_o_head).result,
                     _sa2.MulIOp(_o_tok, stride_o_seq).result,
                 ).result
                 _o_raw = ptr_O.__extract_to_ir_values__()[0]

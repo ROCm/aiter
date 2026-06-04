@@ -2622,15 +2622,19 @@ def flash_attn_varlen_func(
             "physical sequence padding (cu_seqlens_*_padded)."
         )
 
+    _flydsl_out = None
     if get_gfx() == "gfx1250" and q.shape[-1] == 192 and v.shape[-1] == 128 and q.dtype == torch.bfloat16:
         from .flydsl.mha_flydsl import flash_attn_varlen_flydsl
-        return flash_attn_varlen_flydsl(
+        _flydsl_out = torch.empty_like(q[:, :, :v.shape[-1]])
+        flash_attn_varlen_flydsl(
             q, k, v, cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k,
             softmax_scale=softmax_scale,
             causal=causal,
-            out=out,
+            out=_flydsl_out,
         )
+
+    # print("flydsl_out", _flydsl_out)
 
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -2693,7 +2697,7 @@ def flash_attn_varlen_func(
             flash_attn_varlen_func as flash_attn_varlen_func_triton,
         )
 
-        return flash_attn_varlen_func_triton(
+        o = flash_attn_varlen_func_triton(
             q=q,
             k=k,
             v=v,
@@ -2714,7 +2718,56 @@ def flash_attn_varlen_func(
             out=out,
             sink=sink_ptr,
         )
-    return FlashAttnVarlenFunc.apply(
+        # print("triton_out", o)
+        # print("line: =====================================================================")
+
+        # import pdb;pdb.set_trace()
+
+        if _flydsl_out is not None:
+            _rtol, _atol = 1e-2, 1e-2
+            if not torch.allclose(_flydsl_out, o, rtol=_rtol, atol=_atol):
+                _diff = (_flydsl_out.float() - o.float()).abs()
+                _max_err = _diff.max().item()
+                _num_bad = (~torch.isclose(_flydsl_out, o, rtol=_rtol, atol=_atol)).sum().item()
+                print(f"[flydsl vs triton] MISMATCH  max_err={_max_err:.6f}  bad_elements={_num_bad}/{_flydsl_out.numel()}")
+                try:
+                    import tempfile, os as _os
+                    _dump_dir = tempfile.mkdtemp(prefix="flydsl_mismatch_")
+                    torch.save(q, _os.path.join(_dump_dir, "q.pt"))
+                    torch.save(k, _os.path.join(_dump_dir, "k.pt"))
+                    torch.save(v, _os.path.join(_dump_dir, "v.pt"))
+                    torch.save(cu_seqlens_q, _os.path.join(_dump_dir, "cu_seqlens_q.pt"))
+                    torch.save(cu_seqlens_k, _os.path.join(_dump_dir, "cu_seqlens_k.pt"))
+                    torch.save(torch.tensor([max_seqlen_q, max_seqlen_k]), _os.path.join(_dump_dir, "seqlens.pt"))
+                    torch.save(torch.tensor([softmax_scale or q.shape[-1] ** (-0.5)]), _os.path.join(_dump_dir, "softmax_scale.pt"))
+                    torch.save(torch.tensor([causal]), _os.path.join(_dump_dir, "causal.pt"))
+                    torch.save(torch.tensor([dropout_p]), _os.path.join(_dump_dir, "dropout_p.pt"))
+                    torch.save(torch.tensor([deterministic]), _os.path.join(_dump_dir, "deterministic.pt"))
+                    torch.save(torch.tensor([return_lse, return_attn_probs]), _os.path.join(_dump_dir, "return_flags.pt"))
+                    torch.save(torch.tensor(list(window_size)), _os.path.join(_dump_dir, "window_size.pt"))
+                    if bias is not None:
+                        torch.save(bias, _os.path.join(_dump_dir, "bias.pt"))
+                    if alibi_slopes is not None:
+                        torch.save(alibi_slopes, _os.path.join(_dump_dir, "alibi_slopes.pt"))
+                    if block_table is not None:
+                        torch.save(block_table, _os.path.join(_dump_dir, "block_table.pt"))
+                    if sink_ptr is not None:
+                        torch.save(sink_ptr, _os.path.join(_dump_dir, "sink_ptr.pt"))
+                    if out is not None:
+                        torch.save(out, _os.path.join(_dump_dir, "out_pre.pt"))
+                    torch.save(_flydsl_out, _os.path.join(_dump_dir, "out_flydsl.pt"))
+                    torch.save(o, _os.path.join(_dump_dir, "out_triton.pt"))
+                    print(f"[flydsl vs triton] inputs dumped to {_dump_dir}")
+                except Exception as _e:
+                    import traceback
+                    print(f"[flydsl vs triton] DUMP FAILED: {_e}")
+                    traceback.print_exc()
+            else:
+                print("[flydsl vs triton] MATCH")
+
+        return o
+
+    o = FlashAttnVarlenFunc.apply(
         q,
         k,
         v,
@@ -2742,6 +2795,8 @@ def flash_attn_varlen_func(
         how_v3_bf16_cvt,
         sink_ptr,
     )
+    print("o",o)
+    return o
 
 
 def mha_batch_prefill_fake_tensors(

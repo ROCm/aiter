@@ -218,6 +218,7 @@ LOG2E_PAIR_OFFSET = 206
 def set_vgpr_bank(raw_val, bank: int):
     if const_expr(not _USE_BANK_HINTS):
         return raw_val
+    return raw_val
     val_type = raw_val.type
     bank_val = _raw(arith.constant(bank, type=T.i32))
     return llvm_dialect.call_intrinsic(
@@ -229,6 +230,7 @@ def set_vgpr_bank_offset(raw_val, bank: int, offset: int):
     """Pin raw_val to HWIdx = bank*256+offset (single-candidate BankOffsetHint)."""
     if const_expr(not _USE_BANK_HINTS):
         return raw_val
+    return raw_val
     val_type = raw_val.type
     bank_val   = _raw(arith.constant(bank,   type=T.i32))
     offset_val = _raw(arith.constant(offset, type=T.i32))
