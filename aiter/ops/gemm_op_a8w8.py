@@ -662,6 +662,25 @@ def gemm_a8w8_bpreshuffle(
         elif libtype == "flydsl" and is_flydsl_available():
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
     try:
+        # DEBUG (temporary): untuned shapes fall back to the gfx1250 FlyDSL WMMA
+        # (ptpc) kernel instead of CK.
+        if get_gfx() == "gfx1250" and is_flydsl_available():
+            from .flydsl.bpreshuffle_gemm_gfx1250 import run_preshuffle_gemm_a8_gfx1250
+
+            tn = next((t for t in (128, 64, 32) if n % t == 0), 32)
+            tk = 256 if k % 256 == 0 else 128
+            logger.info(
+                "gemm_a8w8_bpreshuffle: untuned M=%s N=%s K=%s -> FlyDSL gfx1250 "
+                "WMMA fallback (tile=128x%sx%s)",
+                m,
+                n,
+                k,
+                tn,
+                tk,
+            )
+            return run_preshuffle_gemm_a8_gfx1250(
+                XQ, WQ, x_scale, w_scale, Y, 128, tn, tk, num_buffers=2
+            )
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
     except RuntimeError as e:
         raise RuntimeError(
