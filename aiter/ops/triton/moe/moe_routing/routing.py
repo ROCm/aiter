@@ -5,9 +5,6 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
 )
-from aiter.ops.triton.fusions.fused_routing_from_topk import (
-    fused_routing_from_topk,
-)
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
