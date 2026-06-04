@@ -69,6 +69,7 @@ def _pa_decode_sparse(
     BLOCK_H: gl.constexpr,
     BLOCK_D: gl.constexpr,
     BLOCK_K: gl.constexpr,
+    HAS_INVALID: gl.constexpr,
     num_warps: gl.constexpr,
 ):
     WARP_SIZE: gl.constexpr = 32
@@ -157,6 +158,9 @@ def _pa_decode_sparse(
         mask=h_mask_q[:, None],
         other=0.0,
     )
+    # Natural-exp domain (scores scaled by softmax_scale only). The shared
+    # reduce kernel is told to recombine these partials with exp (USE_EXP2=False)
+    # for the gluon path, so this kernel must NOT pre-scale q by log2(e).
     mfma_q = gl.convert_layout(q, dot_q_layout)
     mfma_q = mfma_q.to(gl.float32) * softmax_scale
     mfma_q = mfma_q.to(q_ptr.dtype.element_ty)
@@ -253,12 +257,15 @@ def _pa_decode_sparse(
     gl.amd.gfx1250.tdm.async_wait(1)  # slot[tile_start] ready (slot[+1] in flight)
     slot_reg = slot_bufs.index(0).reshape([BLOCK_K]).load(layout=slot_reg_layout)
 
-    # Async gather KV[slot_reg] -> kv_bufs[0]. Clamp -1 sentinels to 0; the
-    # downstream `keep` mask zeros their contribution. cur_valid (slot >= 0) is
-    # computed once here and carried into the loop so it serves both the gather
-    # clamp and the per-tile softmax mask without recomputing slot >= 0.
-    cur_valid = slot_reg >= 0
-    safe_slot_cur = gl.where(cur_valid, slot_reg, 0)
+    # Async gather KV[slot_reg] -> kv_bufs[0]. When HAS_INVALID, clamp -1
+    # sentinels to 0 and carry cur_valid (slot >= 0) into the loop so it serves
+    # both the gather clamp and the per-tile softmax mask. When the caller
+    # guarantees no -1 (HAS_INVALID=False), skip the clamp and all masking.
+    if HAS_INVALID:
+        cur_valid = slot_reg >= 0
+        safe_slot_cur = gl.where(cur_valid, slot_reg, 0)
+    else:
+        safe_slot_cur = slot_reg
     gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, 0, kv_bufs.index(0))
 
     buf_idx: gl.int32 = 0
@@ -286,8 +293,11 @@ def _pa_decode_sparse(
         # Async gather KV[i+1] using slot[i+1] -> kv_bufs[async_idx]. next_valid
         # (slot[i+1] >= 0) is reused next iteration as that tile's softmax mask,
         # so slot >= 0 is computed only once per tile.
-        next_valid = slot_reg >= 0
-        safe_next_slot = gl.where(next_valid, slot_reg, 0)
+        if HAS_INVALID:
+            next_valid = slot_reg >= 0
+            safe_next_slot = gl.where(next_valid, slot_reg, 0)
+        else:
+            safe_next_slot = slot_reg
         gl.amd.gfx1250.tdm.async_gather(
             kv_desc, safe_next_slot, 0, kv_bufs.index(async_idx)
         )
@@ -309,9 +319,13 @@ def _pa_decode_sparse(
         )
         # scores = scores * softmax_scale
 
-        valid_col = gl.convert_layout(cur_valid, valid_col_mma)
-        score_bias = gl.where(valid_col, 0.0, float("-inf"))
-        scores = scores + score_bias[None, :]
+        # Main-loop tiles are always full (only the partial final tile is peeled
+        # into the epilogue), so the only mask needed here is the -1 sentinel
+        # mask. Skip it entirely when the caller guarantees no -1.
+        if HAS_INVALID:
+            valid_col = gl.convert_layout(cur_valid, valid_col_mma)
+            score_bias = gl.where(valid_col, 0.0, float("-inf"))
+            scores = scores + score_bias[None, :]
 
         m_block = gl.max(scores, axis=1)
         m_new = gl.maximum(m_i, m_block)
@@ -329,17 +343,22 @@ def _pa_decode_sparse(
 
         # Rotate. slot_reg / cur_valid now describe slot[i+1] (the next tile,
         # also the final tile after the last iteration -> used by the epilogue).
-        cur_valid = next_valid
+        if HAS_INVALID:
+            cur_valid = next_valid
         buf_idx = async_idx
 
     # ---- Epilogue: process final tile (tile_end - 1) ----
     gl.amd.gfx1250.tdm.async_wait(0)
 
     j_final = tile_end - 1
+    # The final tile can be partial, so the in-range mask is always needed; the
+    # -1 sentinel part (cur_valid, carried from the last loop iter / prologue) is
+    # only AND-ed in when the caller may have sentinels.
     final_in_range = (j_final * BLOCK_K + k_offs_slot) < kv_len
-    # cur_valid carries slot[final] >= 0 (from the last loop iter, or the
-    # prologue when num_iters == 1), so slot >= 0 isn't recomputed here.
-    final_valid = final_in_range & cur_valid
+    if HAS_INVALID:
+        final_valid = final_in_range & cur_valid
+    else:
+        final_valid = final_in_range
 
     kv_smem_final = kv_bufs.index(buf_idx)
     kv_t = kv_smem_final.permute([1, 0]).load(dot_k_layout)

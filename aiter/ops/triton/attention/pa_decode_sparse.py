@@ -39,6 +39,7 @@ def pa_decode_sparse(
     softmax_scale: float,
     block_h: Optional[int] = None,
     kv_splits: Optional[int] = None,
+    has_invalid: Optional[bool] = True,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -101,6 +102,7 @@ def pa_decode_sparse(
     use_gluon = DEVICE_ARCH == "gfx1250"
 
     # import os
+
     # use_gluon = os.environ.get("PA_DECODE_SPARSE_BACKEND", "gluon").lower() == "gluon"
 
     # gfx1250 stages slots through LDS via TDM async_load, which hides the
@@ -111,6 +113,11 @@ def pa_decode_sparse(
         attn_num_warps = 2
         # max_num_wg = 512
         max_num_wg = 64
+
+        # attn_num_warps = 4
+        # # max_num_wg = 256
+        # max_num_wg = 32
+
     else:
         block_k = 16 if D >= 256 else 32
         attn_num_warps = 4
@@ -132,7 +139,7 @@ def pa_decode_sparse(
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
         kv_splits = triton.next_power_of_2(kv_splits)
-    print(f"{kv_splits=}")
+    # print(f"{use_gluon=} {kv_splits=}")
 
     if kv_splits == 1:
         m_partial = l_partial = acc_partial = out  # unused inside the kernel
@@ -193,6 +200,7 @@ def pa_decode_sparse(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
+        HAS_INVALID=has_invalid,
         num_warps=attn_num_warps,
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
@@ -233,6 +241,7 @@ def pa_decode_sparse(
         BLOCK_H=block_h_reduce,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
+        USE_EXP2=not use_gluon,
         num_warps=reduce_num_warps,
     )
     return out

@@ -85,6 +85,7 @@ def _pa_decode_sparse(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    HAS_INVALID: tl.constexpr,
     num_warps: tl.constexpr,
 ):
     """3D split-K sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
@@ -167,7 +168,12 @@ def _pa_decode_sparse(
             mask=in_range,
             other=-1,
         )
-        valid = in_range & (slot >= 0)
+        # in_range masks the partial final tile (always needed); the slot >= 0
+        # term skips -1 sentinels and is dropped when the caller guarantees none.
+        if HAS_INVALID:
+            valid = in_range & (slot >= 0)
+        else:
+            valid = in_range
 
         kv = tl.load(
             unified_kv_ptr
@@ -272,6 +278,7 @@ def _pa_decode_sparse_reduce(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_EXP2: tl.constexpr,
 ):
     """Combine KV_SPLITS partials, fold in attn_sink, write final output.
 
@@ -324,29 +331,40 @@ def _pa_decode_sparse_reduce(
         other=0.0,
     )  # [KV_SPLITS, BLOCK_H, BLOCK_D]
 
-    # The split kernel emits m partials in the base-2 domain (scores were scaled
-    # by softmax_scale * log2(e)), so combine with exp2 and lift the sink there.
+    # The main kernel's domain must match here: the triton main scales scores by
+    # softmax_scale * log2(e) and emits base-2 partials (USE_EXP2=True, exp2 +
+    # sink lifted by log2(e)); the gluon main stays in the natural-exp domain
+    # (USE_EXP2=False, exp + sink unscaled).
     LOG2E = 1.4426950408889634
+    sink_scale = LOG2E if USE_EXP2 else 1.0
 
     # Pre-sink combine across splits.
     m_max = tl.max(m_p, axis=0)  # [BLOCK_H]
     # Empty/stale splits carry m_p == -inf. Force their weight to 0 rather than
-    # evaluating exp2(m_p - m_max): when a token has *no* valid key at all,
-    # m_max is also -inf and exp2(-inf + inf) = NaN would corrupt the output.
-    alpha_split = tl.where(
-        m_p == float("-inf"), 0.0, tl.exp2(m_p - m_max[None, :])
-    )  # [KV_SPLITS, BLOCK_H]
+    # evaluating exp(m_p - m_max): when a token has *no* valid key at all,
+    # m_max is also -inf and exp(-inf + inf) = NaN would corrupt the output.
+    if USE_EXP2:
+        alpha_split = tl.where(
+            m_p == float("-inf"), 0.0, tl.exp2(m_p - m_max[None, :])
+        )  # [KV_SPLITS, BLOCK_H]
+    else:
+        alpha_split = tl.where(m_p == float("-inf"), 0.0, tl.exp(m_p - m_max[None, :]))
     l_combined = tl.sum(l_p * alpha_split, axis=0)  # [BLOCK_H]
     acc_combined = tl.sum(a_p * alpha_split[:, :, None], axis=0)  # [BLOCK_H, BLOCK_D]
 
-    # Fold attn_sink as a virtual K of weight 1 (lifted into the base-2 domain).
+    # Fold attn_sink as a virtual K of weight 1 (lifted into the main kernel's
+    # domain: base-2 for triton, natural for gluon).
     sink = (
         tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(tl.float32)
-        * LOG2E
+        * sink_scale
     )
     m_final = tl.maximum(m_max, sink)
-    alpha_kv = tl.exp2(m_max - m_final)
-    alpha_sink = tl.exp2(sink - m_final)
+    if USE_EXP2:
+        alpha_kv = tl.exp2(m_max - m_final)
+        alpha_sink = tl.exp2(sink - m_final)
+    else:
+        alpha_kv = tl.exp(m_max - m_final)
+        alpha_sink = tl.exp(sink - m_final)
     l_final = l_combined * alpha_kv + alpha_sink
     acc_final = acc_combined * alpha_kv[:, None]
 
