@@ -372,7 +372,9 @@ def test_fmoe(
     # masked by atomic-reduction noise, so detect NaN explicitly and deterministically.
     has_nan = out2_ck.isnan().any().item()
     if has_nan:
-        logging.error("output contains NaN! (possible aiter #3117 stage2 K-pad regression)")
+        logging.error(
+            "output contains NaN! (possible aiter #3117 stage2 K-pad regression)"
+        )
     err = checkAllclose(
         out2_ref,
         out2_ck,
