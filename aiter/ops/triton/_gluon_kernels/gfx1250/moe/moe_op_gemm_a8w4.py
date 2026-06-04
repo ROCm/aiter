@@ -198,6 +198,7 @@ def _moe_gemm_a8w4_decode(
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
                 0, gl.BlockedLayout([1, 16], [32, 1], [1, num_warps], [0, 1])
             )
+            oob_idx = (num_tokens).to(gl.uint16)
         else:
             gl.static_assert(
                 GatherIndx.dtype.element_ty == gl.int32,
@@ -206,10 +207,13 @@ def _moe_gemm_a8w4_decode(
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
                 0, gl.BlockedLayout([1, 8], [32, 1], [1, num_warps], [0, 1])
             )
+            oob_idx = num_tokens
         offs_x_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
+        mask_idx = offs_x_m < M
         offs_x_m = offs_x_m % M
         GatherIndx += start_m
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
+        offs_x_m = gl.where(mask_idx, offs_x_m, oob_idx)
 
     W_K_DIVISOR: gl.constexpr = 2
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // W_K_DIVISOR
@@ -362,19 +366,17 @@ def _moe_gemm_a8w4_decode(
 
     read_idx = 0
     write_idx = 0
-    for _ in gl.static_range(NUM_BUFFERS):
+    for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
             [off_w_n, write_idx * PACKED_BLOCK_K_W],
             w_buffer.index(write_idx % NUM_BUFFERS),
-            warp_used_hint=12,
         )
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
                 [off_x_m, write_idx * BLOCK_K],
                 x_buffer.index(write_idx % NUM_BUFFERS),
-                warp_used_hint=1,
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
@@ -387,7 +389,6 @@ def _moe_gemm_a8w4_decode(
             w_scales_desc,
             [off_w_n_scale, write_idx * PACKED_MX_BLOCK],
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
-            warp_used_hint=2,
         )
         if is_x_microscaled:
             if GatherIndx is None:
@@ -406,40 +407,8 @@ def _moe_gemm_a8w4_decode(
         write_idx += 1
 
     num_k_iter = tl.cdiv(K, BLOCK_K)
-
-    gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS * NUM_TDM_OPS - 1)
-    cur_w = (
-        w_buffer.index(read_idx % NUM_BUFFERS).permute((1, 0)).load(layout=DOT_LAYOUT_W)
-    )
-
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
-    cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
-    w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
-    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
-        w_scales_buffer_slice = unswizzle_mx_scale_gfx1250(
-            w_scales_buffer_slice,
-            BLOCK_N,
-            MX_SCALE_BLOCK_K,
-            PRESHUFFLE_FACTOR,
-            SCALE_KWIDTH,
-        )
-    cur_w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
-    if is_x_microscaled:
-        cur_x_scales = x_scales_buffer.index(read_idx % NUM_BUFFERS).load(
-            layout=DOT_LAYOUT_X_SCALES
-        )
-    read_idx += 1
-
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
-    for k in range(num_k_iter - NUM_BUFFERS):
-        if is_x_microscaled:
-            acc = gl.amd.gfx1250.wmma_scaled(
-                cur_x, cur_x_scales, "e4m3", cur_w, cur_w_scales, "e2m1", acc
-            )
-        else:
-            acc = gl.amd.gfx1250.wmma_scaled(
-                cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc
-            )
+    for k in range(num_k_iter - (NUM_BUFFERS - 1)):
 
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
@@ -481,14 +450,14 @@ def _moe_gemm_a8w4_decode(
         write_idx += 1
 
         gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS * NUM_TDM_OPS - 1)
-        next_w = (
+        cur_w = (
             w_buffer.index(read_idx % NUM_BUFFERS)
             .permute((1, 0))
             .load(layout=DOT_LAYOUT_W)
         )
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
-        next_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
+        cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
             w_scales_buffer_slice = unswizzle_mx_scale_gfx1250(
@@ -498,18 +467,22 @@ def _moe_gemm_a8w4_decode(
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
             )
-        next_w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
+        cur_w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
         if is_x_microscaled:
-            next_x_scales = x_scales_buffer.index(read_idx % NUM_BUFFERS).load(
+            cur_x_scales = x_scales_buffer.index(read_idx % NUM_BUFFERS).load(
                 layout=DOT_LAYOUT_X_SCALES
             )
 
-        cur_x = next_x
-        cur_w = next_w
-        cur_w_scales = next_w_scales
-        if is_x_microscaled:
-            cur_x_scales = next_x_scales
         read_idx += 1
+
+        if is_x_microscaled:
+            acc = gl.amd.gfx1250.wmma_scaled(
+                cur_x, cur_x_scales, "e4m3", cur_w, cur_w_scales, "e2m1", acc
+            )
+        else:
+            acc = gl.amd.gfx1250.wmma_scaled(
+                cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc
+            )
 
     # bias
     if B is not None:
@@ -535,14 +508,17 @@ def _moe_gemm_a8w4_decode(
     # The first NUM_BUFFERS-1 iterations still use the pre-load / WMMA pattern.
     for k_ep in gl.static_range(NUM_BUFFERS - 1):
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS + 1)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1 - k_ep) * NUM_TDM_OPS - 1 + 1)
 
-        next_w = (
+        cur_w = (
             w_buffer.index(read_idx % NUM_BUFFERS)
             .permute((1, 0))
             .load(layout=DOT_LAYOUT_W)
         )
-        next_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
+
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS + 1)
+
+        cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
             w_scales_buffer_slice = unswizzle_mx_scale_gfx1250(
@@ -552,11 +528,13 @@ def _moe_gemm_a8w4_decode(
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
             )
-        next_w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
+        cur_w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
         if is_x_microscaled:
-            next_x_scales = x_scales_buffer.index(read_idx % NUM_BUFFERS).load(
+            cur_x_scales = x_scales_buffer.index(read_idx % NUM_BUFFERS).load(
                 layout=DOT_LAYOUT_X_SCALES
             )
+
+        read_idx += 1
 
         if is_x_microscaled:
             acc = gl.amd.gfx1250.wmma_scaled(
@@ -566,22 +544,6 @@ def _moe_gemm_a8w4_decode(
             acc = gl.amd.gfx1250.wmma_scaled(
                 cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc
             )
-
-        cur_x = next_x
-        cur_w = next_w
-        cur_w_scales = next_w_scales
-        if is_x_microscaled:
-            cur_x_scales = next_x_scales
-        read_idx += 1
-
-    if is_x_microscaled:
-        acc = gl.amd.gfx1250.wmma_scaled(
-            cur_x, cur_x_scales, "e4m3", cur_w, cur_w_scales, "e2m1", acc
-        )
-    else:
-        acc = gl.amd.gfx1250.wmma_scaled(
-            cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc
-        )
 
     # scalar fp8 scale
     if X_static_scale is not None:
