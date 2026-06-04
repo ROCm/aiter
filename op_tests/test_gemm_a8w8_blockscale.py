@@ -158,16 +158,27 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
         catastrophic_check=True,
     )
 
-    # CKTile path: skip splitK > 0 correctness check.
-    # CK's ABQuantGemmPipelineAgBgCrCompV3 only supports k_batch == 1, and the
-    # cktile dispatcher (csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_cktile.cu)
-    # silently clamps KBatch to 1 regardless of the splitK argument. Comparing
-    # splitK=0 vs splitK>0 on the cktile path would therefore just compare two
-    # identical KBatch=1 runs.
+    # CKTile path (no preshuffle): compare splitK=0 vs splitK>0
+    Y_base_tile = torch.empty((m, n), dtype=dtype, device="cuda")
+    Y_split_tile = torch.empty((m, n), dtype=dtype, device="cuda")
+    gemm_a8w8_blockscale_cktile(
+        x, weight, x_scale, w_scale, Y_base_tile, False, splitK=0
+    )
+    gemm_a8w8_blockscale_cktile(
+        x, weight, x_scale, w_scale, Y_split_tile, False, splitK=splitK
+    )
+    cktile_err = checkAllclose(
+        Y_base_tile,
+        Y_split_tile,
+        msg=f"cktile splitK={splitK} vs splitK=0",
+        rtol=1e-2,
+        atol=1e-2,
+        catastrophic_check=True,
+    )
 
     print(
         f"test_splitk_correctness(m={m}, n={n}, k={k}, splitK={splitK}): "
-        f"ck_err={ck_err:.4g} (cktile splitK>0 path disabled, see source)"
+        f"ck_err={ck_err:.4g}, cktile_err={cktile_err:.4g}"
     )
 
 
