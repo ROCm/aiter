@@ -12,7 +12,8 @@
 3. Start tuning:
 Run the following cmd to start tuning, please wait a few minutes as it will build gemm_a8w8_tune via jit:
 `python3 csrc/ck_gemm_a8w8/gemm_a8w8_tune.py -i aiter/configs/a8w8_untuned_gemm.csv -o aiter/configs/a8w8_tuned_gemm.csv`
-You can find the results of this tuning in `aiter/configs/a8w8_tuned_gemm.csv`, like this:
+You can find the results of this tuning in `aiter/configs/a8w8_tuned_gemm.csv --libtype both`
+libtype can be `ck`, `cktile` or `both`. We recommend to tune together by setting `--libtype both` to get both ck legacy and tile implementations, then choose the best one, this will take more time but help to get better performance. You can find the results of the tuning in `aiter/configs/a8w8_tuned_gemm.csv`, like this:
     |**gfx**  |**cu_num**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
     |---------|----------|-----|-----|-----|------------|----------|------|--------------|----------|------|------------|
     |gfx942   |80        |128  |1536 |7168 |23          |0         |32.99 |xxxxxxxx      |125.4     |89.5  |0.01        |
