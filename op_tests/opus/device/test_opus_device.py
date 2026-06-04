@@ -370,8 +370,14 @@ class OpusDeviceLib:
         fn = self._lib.run_tcopy_gfx1250
         fn.restype = None
         fn.argtypes = [_VP, _VP, _VP, _I, _I, _I]
-        fn(self._ptr(A), self._ptr(B), self._ptr(C),
-           int(stride_a), int(stride_b), int(stride_c))
+        fn(
+            self._ptr(A),
+            self._ptr(B),
+            self._ptr(C),
+            int(stride_a),
+            int(stride_b),
+            int(stride_c),
+        )
 
 
 def _get_gpu_arch():
@@ -2657,8 +2663,12 @@ def test_tcopy_gfx1250(mod):
     for K in [128, 256, 384, 512]:
         torch.manual_seed(K)
         # RCR layout: A row-major [M,K], B row-major [N,K] (consumed as K-contig)
-        a_fp32 = torch.empty(M, K, device=device, dtype=torch.float32).uniform_(0.0, 1.0)
-        b_fp32 = torch.empty(N, K, device=device, dtype=torch.float32).uniform_(-0.5, 0.5)
+        a_fp32 = torch.empty(M, K, device=device, dtype=torch.float32).uniform_(
+            0.0, 1.0
+        )
+        b_fp32 = torch.empty(N, K, device=device, dtype=torch.float32).uniform_(
+            -0.5, 0.5
+        )
         a = a_fp32.to(torch.float16)
         b = b_fp32.to(torch.float16)
         c = torch.empty(M, N, device=device, dtype=torch.float16)
@@ -2671,10 +2681,14 @@ def test_tcopy_gfx1250(mod):
         max_abs = (ref - got).abs().max().item()
         threshold = max(1e-2, 5e-5 * K)
         if max_abs > threshold:
-            print(f"  FAIL: tcopy_move_2slot K={K} max_abs={max_abs:.4f} (thr={threshold:.4f})")
+            print(
+                f"  FAIL: tcopy_move_2slot K={K} max_abs={max_abs:.4f} (thr={threshold:.4f})"
+            )
             failures += 1
         else:
-            print(f"  PASS: tcopy_move_2slot K={K} max_abs={max_abs:.4f} (thr={threshold:.4f})")
+            print(
+                f"  PASS: tcopy_move_2slot K={K} max_abs={max_abs:.4f} (thr={threshold:.4f})"
+            )
     return failures
 
 
