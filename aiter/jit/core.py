@@ -1003,7 +1003,6 @@ def _get_ck_exclude_modules():
         "module_mla_reduce",
         "module_moe_asm",
         "module_pa_metadata",
-        "module_pa_ragged",
         "module_ps_metadata",
         "module_quant",
         "module_rmsnorm_quant",
