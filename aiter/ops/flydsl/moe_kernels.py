@@ -774,6 +774,34 @@ def flydsl_moe_stage1(
                 (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
             )
 
+    # Workaround: stage1 launcher computes grid_x from the *valid* inter_dim
+    # (= inter_dim - 2*inter_dim_pad in the SEPARATED gate-mode path; see
+    # `launch_mixed_moe_gemm1` in kernels/mixed_moe_gemm_2stage.py around the
+    # `gx = (inter_in - inter_dim_pad_total + ...) / tile_n / 2` block).
+    # When the resulting CTA grid doesn't cover the *padded* output tail, the
+    # last output tile is never written by any CTA, and the consumer (swiglu /
+    # stage2 quant) ends up reading uninitialised memory.
+    #
+    # Concrete repro on gpt-oss-120b TP=2 (per-rank inter_dim=1536, valid=1440,
+    # pad=96) with the tuned kernel
+    # `flydsl_moe1_afp4_wfp4_bf16_t64x64x256_w4_bnt0`:
+    #   gx = (1536 - 192 + 128 - 1) / 64 / 2 = 11
+    # which covers 22 output tiles, missing tile index 23 -> output positions
+    # [1472:1536] retain whatever was previously in the buffer. GSM8K@TP=2
+    # collapses from 0.90+ to <0.10. Pre-zeroing the buffer makes the unwritten
+    # padded tail read as 0, which is the semantically correct value for the
+    # pad region (silu(0) * up = 0; downstream stage2 then contributes 0 from
+    # the padded columns).
+    #
+    # Note: torch.zero_() isn't implemented for Float4_e2m1fn_x2 / fp8 dtypes;
+    # for those out variants we view the buffer as uint8 (bit-pattern zero is
+    # the additive identity for both fp4_e2m1 and fp8_e4m3/e5m2).
+    if inter_dim_pad > 0 and not _is_splitk:
+        if out.dtype in (dtypes.bf16, dtypes.fp16, torch.float32):
+            out.zero_()
+        else:
+            out.view(torch.uint8).zero_()
+
     if _is_splitk:
         torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
         tmp_out = torch.zeros(
