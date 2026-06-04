@@ -5,7 +5,67 @@
 import os
 from pathlib import Path
 
-from codegen.common import register_emit
+from opus_gemm_common import OpusGemmInstance
+
+from codegen.common import (
+    WARP_SIZE,
+    _GFX942_A16W16_TAGS,
+    _NOSPLIT,
+    _SPLITK,
+    W3_KERNEL_PAIRS,
+    register_arch_map,
+    register_emit,
+)
+
+
+# gfx942 pipeline header derived from W3_KERNEL_PAIRS: splitk_X reuses
+# nosplit_X's .cuh (paired template); splitk_fused has its own.
+def _gfx942_pipeline(tag):
+    return f"gfx942/opus_gemm_pipeline_{tag}.cuh"
+
+
+# Traits header carries the traits struct + kargs struct definitions for a given pipeline tag.
+GFX942_TRAITS_HEADER = "gfx942/opus_gemm_traits_a16w16.cuh"
+
+# gfx942 a16w16 tags all share one traits class name (no arch suffix).
+GFX942_TRAITS_NAME = "opus_gemm_a16w16_traits"
+
+# gfx942 a16w16 family supports only the 16x16x16 BF16 MFMA shape.
+VALID_GFX942_BF16_MFMA = {(16, 16, 16)}
+
+PIPELINE_HEADER_MAP = {
+    "a16w16_fused_reduce": _gfx942_pipeline("a16w16_fused_reduce"),
+    "a16w16_kbuf1_large_tile": _gfx942_pipeline("a16w16_kbuf1_large_tile"),
+    **{nosplit: _gfx942_pipeline(nosplit) for nosplit in _NOSPLIT},
+    **{
+        splitk: _gfx942_pipeline(nosplit) for nosplit, splitk in W3_KERNEL_PAIRS.items()
+    },
+}
+
+TRAITS_HEADER_MAP = {tag: GFX942_TRAITS_HEADER for tag in _GFX942_A16W16_TAGS}
+
+TRAITS_NAME_MAP = {tag: GFX942_TRAITS_NAME for tag in _GFX942_A16W16_TAGS}
+
+KARGS_NAME_MAP = {
+    "a16w16_fused_reduce": "opus_gemm_splitk_fused_kargs",
+    "a16w16_kbuf1_large_tile": "opus_gemm_noscale_kargs",
+    **{tag: "opus_gemm_splitk_kargs" for tag in _SPLITK},
+    **{tag: "opus_gemm_noscale_kargs" for tag in _NOSPLIT},
+}
+
+KERNEL_FUNC_MAP = {
+    "a16w16_fused_reduce": "gemm_a16w16_fused_reduce_kernel",
+    "a16w16_kbuf1_large_tile": "gemm_a16w16_kbuf1_large_tile_kernel",
+    # gfx942 paired tags: nosplit_tag's kernel symbol; splitk_tag reuses it.
+    **{nosplit: f"gemm_{nosplit}_kernel" for nosplit in W3_KERNEL_PAIRS.keys()},
+    **{splitk: f"gemm_{nosplit}_kernel" for nosplit, splitk in W3_KERNEL_PAIRS.items()},
+}
+
+register_arch_map("gfx942", "pipeline_header", PIPELINE_HEADER_MAP)
+register_arch_map("gfx942", "traits_header", TRAITS_HEADER_MAP)
+register_arch_map("gfx942", "traits_name", TRAITS_NAME_MAP)
+register_arch_map("gfx942", "kargs_name", KARGS_NAME_MAP)
+register_arch_map("gfx942", "kernel_func", KERNEL_FUNC_MAP)
 
 
 def gen_splitk_gfx942_instance(
@@ -584,3 +644,64 @@ _GFX942_NOSPLIT_TAGS = (
 )
 for _tag in _GFX942_NOSPLIT_TAGS:
     register_emit("gfx942", _tag, gen_a16w16_nosplit_gfx942_instance)
+
+
+# ---------------- gfx942 a16w16 validator ----------------
+# Coverage: basic physical limits only. Detailed LDS depth / layout checks
+# live in gfx942/opus_gemm_traits_a16w16.cuh static_asserts (hipcc enforces).
+
+# gfx942 (CDNA3 / MI300X) hardware LDS budget per WG.
+_GFX942_LDS_PER_WG_BYTES = 64 * 1024
+
+
+def _validate_a16w16_gfx942(k: OpusGemmInstance):
+    """Validate a gfx942 a16w16 instance -- basic physical limits only."""
+    errors = []
+
+    # MFMA shape: gfx942 a16w16 family is locked to 16x16x16 BF16.
+    if (k.W_M, k.W_N, k.W_K) not in VALID_GFX942_BF16_MFMA:
+        errors.append(f"WAVE=({k.W_M},{k.W_N},{k.W_K}) not in {VALID_GFX942_BF16_MFMA}")
+
+    # BLOCK_SIZE physical cap (hardware: 1024 max; gfx942 a16w16 we cap at 512).
+    if k.BLOCK_SIZE > 512:
+        errors.append(f"BLOCK_SIZE={k.BLOCK_SIZE} exceeds 512")
+
+    # AGPR/VGPR register-file caps (hardware: 256 each, 512 combined).
+    E_M = (k.B_M // 2) // (k.W_M * k.T_M) if (k.W_M * k.T_M) else 0
+    E_N = (k.B_N // 2) // (k.W_N * k.T_N) if (k.W_N * k.T_N) else 0
+    E_K = k.B_K // k.W_K if k.W_K else 0
+    agpr_per_mfma = (k.W_M * k.W_N) // WARP_SIZE
+    total_agprs = 4 * E_M * E_N * agpr_per_mfma
+    vgpr_est = 4 * E_K * (E_M + 2 * E_N) + 80
+    if total_agprs >= 256:
+        errors.append(f"AGPR={total_agprs} must be < 256")
+    if vgpr_est > 256:
+        errors.append(f"VGPR_est={vgpr_est} exceeds 256")
+    if vgpr_est + total_agprs > 512:
+        errors.append(f"VGPR+AGPR={vgpr_est + total_agprs} exceeds 512")
+
+    # Loose LDS bound: 2 * B_M * B_K + 2 * B_N * B_K bytes for bf16 (1-deep
+    # per slot, ignores pipeline depth + padding). Anything past 64 KiB is
+    # physically impossible; finer-grained checks live in traits.cuh.
+    lds_min_bytes = 2 * (k.B_M + k.B_N) * k.B_K
+    if lds_min_bytes > _GFX942_LDS_PER_WG_BYTES:
+        errors.append(
+            f"LDS lower bound={lds_min_bytes // 1024}KiB exceeds "
+            f"{_GFX942_LDS_PER_WG_BYTES // 1024}KiB (gfx942 budget)"
+        )
+
+    if errors:
+        msg = f"Invalid gfx942 a16w16 instance '{k.name}':\n" + "\n".join(
+            f"  - {e}" for e in errors
+        )
+        raise ValueError(msg)
+
+    return {
+        "E_M": E_M,
+        "E_N": E_N,
+        "E_K": E_K,
+        "agprs": total_agprs,
+        "vgpr_est": vgpr_est,
+        "lds_bytes": lds_min_bytes,
+        "min_k": 2 * k.B_K,
+    }

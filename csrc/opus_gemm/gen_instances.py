@@ -9,9 +9,17 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from codegen.common import kid_arch as _kid_arch_common
+from codegen.common import (
+    _A16W16_TAGS,
+    _GFX942_A16W16_TAGS,
+    _NOSPLIT,
+    _SPLITK,
+    get_arch_map,
+    kid_arch as _kid_arch_common,
+)
 
-# Import for side-effect: each arch module self-registers into EMIT_REGISTRY.
+# Import for side-effect: each arch module self-registers into EMIT_REGISTRY
+# and ARCH_MAP_REGISTRY at import time.
 from codegen import gen_instances_gfx950 as _gfx950  # noqa: F401
 from codegen import gen_instances_gfx942 as _gfx942  # noqa: F401
 from opus_gemm_common import (
@@ -30,66 +38,18 @@ from opus_gemm_common import (
     kernels_list,
 )
 
-# Paired W3 kernels (nosplit_tag -> splitk_tag) share one <Traits, Kargs> template.
-W3_KERNEL_PAIRS = {
-    "a16w16_kbuf3": "a16w16_kbuf3_sk",
-    "a16w16_kbuf2v": "a16w16_kbuf2v_sk",
-    "a16w16_kbuf2v_bk128": "a16w16_kbuf2v_bk128_sk",
-    "a16w16_kbuf1": "a16w16_kbuf1_sk",
-}
-_NOSPLIT = tuple(W3_KERNEL_PAIRS.keys())
-_SPLITK = tuple(W3_KERNEL_PAIRS.values())
-_GFX942_A16W16_TAGS = (
-    _SPLITK + ("a16w16_fused_reduce", "a16w16_kbuf1_large_tile") + _NOSPLIT
-)
-_A16W16_TAGS = (
-    "a16w16",
-    "a16w16_flatmm",
-    "a16w16_flatmm_splitk",
-    "a16w16_persistent",
-    "a16w16_mono_tile",
-) + _GFX942_A16W16_TAGS
-
-
-# gfx942 pipeline header derived from W3_KERNEL_PAIRS: splitk_X reuses
-# nosplit_X's .cuh (paired template); splitk_fused has its own.
-def _gfx942_pipeline(tag):
-    return f"gfx942/opus_gemm_pipeline_{tag}.cuh"
-
-
+# Cross-arch maps merged from per-arch contributions. Each arch module
+# registers its piece into ARCH_MAP_REGISTRY at import; we merge gfx950 first
+# (legacy default) then overlay gfx942 entries.
 PIPELINE_HEADER_MAP = {
-    "a8w8_scale": "gfx950/opus_gemm_pipeline_a8w8_scale_gfx950.cuh",
-    "a8w8": "gfx950/opus_gemm_pipeline_a8w8_noscale_gfx950.cuh",
-    "a16w16": "gfx950/opus_gemm_pipeline_a16w16_gfx950.cuh",
-    "a16w16_flatmm": "gfx950/opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh",
-    "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
-    "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh",
-    "a16w16_mono_tile": "gfx950/opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh",
-    "a16w16_fused_reduce": _gfx942_pipeline("a16w16_fused_reduce"),
-    "a16w16_kbuf1_large_tile": _gfx942_pipeline("a16w16_kbuf1_large_tile"),
-    **{nosplit: _gfx942_pipeline(nosplit) for nosplit in _NOSPLIT},
-    **{
-        splitk: _gfx942_pipeline(nosplit) for nosplit, splitk in W3_KERNEL_PAIRS.items()
-    },
+    **get_arch_map("gfx950", "pipeline_header"),
+    **get_arch_map("gfx942", "pipeline_header"),
 }
-GFX942_PIPELINE_HEADER_MAP = {
-    "a16w16_kbuf1_large_tile": _gfx942_pipeline("a16w16_kbuf1_large_tile")
-}
-
-# Traits header carries the traits struct + kargs struct definitions for a given pipeline tag.
-GFX942_TRAITS_HEADER = "gfx942/opus_gemm_traits_a16w16.cuh"
 
 TRAITS_HEADER_MAP = {
-    "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
-    "a8w8": "gfx950/opus_gemm_traits_a8w8_noscale_gfx950.cuh",
-    "a16w16": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
-    "a16w16_flatmm": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
-    "a16w16_flatmm_splitk": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
-    "a16w16_persistent": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
-    "a16w16_mono_tile": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
-    **{tag: GFX942_TRAITS_HEADER for tag in _GFX942_A16W16_TAGS},
+    **get_arch_map("gfx950", "traits_header"),
+    **get_arch_map("gfx942", "traits_header"),
 }
-GFX942_TRAITS_HEADER_MAP = {"a16w16_kbuf1_large_tile": GFX942_TRAITS_HEADER}
 
 # Per-tag splitk reduce header (splitk_fused omitted: in-kernel reduce).
 SPLITK_REDUCE_HEADER_MAP = {
@@ -114,44 +74,24 @@ V3_NVEC_ROWS = (
 # V4 (8, 32) DEAD 2026-05-30: BLOCK=256 4-wave, 0 wall-time benefit (vmcnt contention).
 
 KERNEL_FUNC_MAP = {
-    "a8w8_scale": "gemm_a8w8_scale_kernel",
-    "a8w8": "gemm_a8w8_noscale_kernel",
-    "a16w16": "gemm_a16w16_kernel",
-    "a16w16_flatmm": "gemm_a16w16_flatmm_kernel",
-    "a16w16_flatmm_splitk": "gemm_a16w16_flatmm_splitk_kernel",
-    "a16w16_persistent": "gemm_a16w16_persistent_kernel",
-    "a16w16_mono_tile": "gemm_a16w16_mono_tile_kernel_gfx950",
-    "a16w16_fused_reduce": "gemm_a16w16_fused_reduce_kernel",
-    "a16w16_kbuf1_large_tile": "gemm_a16w16_kbuf1_large_tile_kernel",
-    # gfx942 paired tags: nosplit_tag's kernel symbol; splitk_tag reuses it.
-    **{nosplit: f"gemm_{nosplit}_kernel" for nosplit in W3_KERNEL_PAIRS.keys()},
-    **{splitk: f"gemm_{nosplit}_kernel" for nosplit, splitk in W3_KERNEL_PAIRS.items()},
-}
-
-# 4g_safe sibling pipelines: only defined for the a16w16-family tags that have
-# matching *_4g_safe_gfx950.cuh files. Kids with is_4g_safe=True route to these
-# headers/kernel symbols instead of the legacy maps above.
-PIPELINE_HEADER_MAP_4G_SAFE = {
-    "a16w16": "gfx950/opus_gemm_pipeline_a16w16_4g_safe_gfx950.cuh",
-    "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_4g_safe_gfx950.cuh",
-    "a16w16_mono_tile": "gfx950/opus_gemm_pipeline_a16w16_mono_tile_4g_safe_gfx950.cuh",
-}
-
-KERNEL_FUNC_MAP_4G_SAFE = {
-    "a16w16": "gemm_a16w16_4g_safe_kernel",
-    "a16w16_persistent": "gemm_a16w16_persistent_4g_safe_kernel",
-    "a16w16_mono_tile": "gemm_a16w16_mono_tile_4g_safe_kernel_gfx950",
+    **get_arch_map("gfx950", "kernel_func"),
+    **get_arch_map("gfx942", "kernel_func"),
 }
 
 
 def _pipeline_header_for(k):
     if getattr(k, "is_4g_safe", False):
+        # 4g_safe is gfx950-only (no gfx942 sibling pipeline exists).
+        from codegen.gen_instances_gfx950 import PIPELINE_HEADER_MAP_4G_SAFE
+
         return PIPELINE_HEADER_MAP_4G_SAFE[k.kernel_tag]
     return PIPELINE_HEADER_MAP[k.kernel_tag]
 
 
 def _kernel_func_for(k):
     if getattr(k, "is_4g_safe", False):
+        from codegen.gen_instances_gfx950 import KERNEL_FUNC_MAP_4G_SAFE
+
         return KERNEL_FUNC_MAP_4G_SAFE[k.kernel_tag]
     return KERNEL_FUNC_MAP[k.kernel_tag]
 
@@ -174,41 +114,15 @@ SPLITK_TAGS = {
     *_SPLITK,
 }
 
-# gfx942 a16w16 tags all share one traits class name (no arch suffix).
-GFX942_TRAITS_NAME = "opus_gemm_a16w16_traits"
-
 TRAITS_NAME_MAP = {
-    "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
-    "a8w8": "opus_gemm_a8w8_noscale_traits_gfx950",
-    "a16w16": "opus_gemm_a16w16_traits_gfx950",
-    "a16w16_flatmm": "opus_gemm_a16w16_flatmm_traits_gfx950",
-    "a16w16_flatmm_splitk": "opus_flatmm_splitk_traits_gfx950",
-    "a16w16_persistent": "opus_gemm_a16w16_persistent_traits_gfx950",
-    "a16w16_mono_tile": "opus_gemm_a16w16_mono_tile_traits_gfx950",
-    **{tag: GFX942_TRAITS_NAME for tag in _GFX942_A16W16_TAGS},
+    **get_arch_map("gfx950", "traits_name"),
+    **get_arch_map("gfx942", "traits_name"),
 }
-GFX942_TRAITS_NAME_MAP = {"a16w16_kbuf1_large_tile": GFX942_TRAITS_NAME}
 
 KARGS_NAME_MAP = {
-    "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
-    "a8w8": "opus_gemm_noscale_kargs_gfx950",
-    "a16w16": "opus_gemm_noscale_kargs_gfx950",
-    "a16w16_flatmm": "opus_gemm_flatmm_kargs_gfx950",
-    "a16w16_flatmm_splitk": "opus_gemm_flatmm_splitk_kargs_gfx950",
-    "a16w16_persistent": "opus_gemm_persistent_kargs_gfx950",
-    "a16w16_mono_tile": "opus_gemm_mono_tile_kargs_gfx950",
-    "a16w16_fused_reduce": "opus_gemm_splitk_fused_kargs",
-    **{tag: "opus_gemm_splitk_kargs" for tag in _SPLITK},
-    **{tag: "opus_gemm_noscale_kargs" for tag in _NOSPLIT},
+    **get_arch_map("gfx950", "kargs_name"),
+    **get_arch_map("gfx942", "kargs_name"),
 }
-GFX942_KARGS_NAME_MAP = {"a16w16_kbuf1_large_tile": "opus_gemm_noscale_kargs"}
-
-
-def _lookup(k, default_map, arch_map):
-    """Pick the gfx942 override when k.arch_prefix=='gfx942', else default."""
-    if getattr(k, "arch_prefix", "") == "gfx942" and k.kernel_tag in arch_map:
-        return arch_map[k.kernel_tag]
-    return default_map[k.kernel_tag]
 
 
 def _kargs_template_vars(kernel_tag, kargs_name):
@@ -311,22 +225,6 @@ def _record_one_instantiation(
         )
 
 
-WARP_SIZE = 64
-VALID_BF16_MFMA = {(16, 16, 32), (32, 32, 16)}
-# gfx942 a16w16 family supports only the 16x16x16 BF16 MFMA shape.
-VALID_GFX942_BF16_MFMA = {(16, 16, 16)}
-# Flatmm pipeline currently only supports W_M < 32 (ra layout relies on
-# LOAD_GROUP_M_LANE == 1). W_M == 32 (LGML == 4) path not rewritten.
-VALID_FLATMM_MFMA = {(16, 16, 32)}
-VALID_FLATMM_SPLITK_MFMA = {(16, 16, 32)}
-# Persistent pipeline ports the mouter reference which only validated
-# 16x16x32 BF16 MFMA. Add 32x32x16 later if needed.
-VALID_PERSISTENT_MFMA = {(16, 16, 32)}
-# Mono-tile pipeline: same MFMA lock as persistent (16x16x32 BF16) -- the
-# kernel template hard-codes T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32.
-VALID_MONO_TILE_MFMA = {(16, 16, 32)}
-
-
 class opus_gemm_codegen:
     def __init__(self, working_path, istune=False):
         self.working_path = working_path
@@ -342,565 +240,31 @@ class opus_gemm_codegen:
         # device TU only).
         self._kid_pipeline_header = {}
 
-    # -- a16w16 compile-time + VGPR spill validator --
-
-    @staticmethod
-    def _validate_a16w16(k: OpusGemmInstance):
-        """Validate an a16w16 instance at codegen time. Raises ValueError if invalid."""
-        errors = []
-        sizeof_da = 2  # bf16
-
-        T_K = 1
-        HALF_B_M = k.B_M // 2
-        HALF_B_N = k.B_N // 2
-        num_waves = k.T_M * k.T_N * T_K
-        smem_linear_wave = WARP_SIZE * 16 // sizeof_da  # 512
-
-        # -- Hardware --
-        if k.BLOCK_SIZE > 512:
-            errors.append(f"BLOCK_SIZE={k.BLOCK_SIZE} exceeds 512")
-
-        # -- Pipeline: T_M must be 2 (split-barrier) --
-        if k.T_M != 2:
-            errors.append(f"T_M={k.T_M} must be 2")
-
-        # -- Traits: BLOCK_SIZE = T_M * T_N * T_K * WARP_SIZE --
-        if k.BLOCK_SIZE != num_waves * WARP_SIZE:
-            errors.append(
-                f"BLOCK_SIZE={k.BLOCK_SIZE} != "
-                f"{k.T_M}*{k.T_N}*{T_K}*{WARP_SIZE}={num_waves * WARP_SIZE}"
-            )
-
-        # -- Layout: T_N % T_M == 0 (rb: T_N/T_M) --
-        if k.T_N % k.T_M != 0:
-            errors.append(f"T_N={k.T_N} not divisible by T_M={k.T_M}")
-
-        # -- MFMA validity --
-        valid_mfma = (
-            VALID_GFX942_BF16_MFMA
-            if getattr(k, "arch_prefix", "") == "gfx942"
-            else VALID_BF16_MFMA
-        )
-        if (k.W_M, k.W_N, k.W_K) not in valid_mfma:
-            errors.append(f"WAVE=({k.W_M},{k.W_N},{k.W_K}) not in {valid_mfma}")
-        if WARP_SIZE % k.W_M != 0:
-            errors.append(f"WARP_SIZE not divisible by W_M={k.W_M}")
-        if WARP_SIZE % k.W_N != 0:
-            errors.append(f"WARP_SIZE not divisible by W_N={k.W_N}")
-        if k.W_M % k.T_N != 0:
-            errors.append(f"W_M={k.W_M} not divisible by T_N={k.T_N}")
-        if k.W_N % k.T_N != 0:
-            errors.append(f"W_N={k.W_N} not divisible by T_N={k.T_N}")
-
-        # -- VEC --
-        expected_vec = 16 // sizeof_da
-        if k.VEC_A != expected_vec:
-            errors.append(f"VEC_A={k.VEC_A} must be {expected_vec}")
-
-        # -- Block tile divisibility --
-        if k.B_M % 2 != 0 or k.B_N % 2 != 0:
-            errors.append(f"B_M={k.B_M}, B_N={k.B_N} must be even")
-        if HALF_B_M % (k.W_M * k.T_M) != 0:
-            errors.append(f"HALF_B_M={HALF_B_M} not div by W_M*T_M={k.W_M * k.T_M}")
-        if HALF_B_N % (k.W_N * k.T_N) != 0:
-            errors.append(f"HALF_B_N={HALF_B_N} not div by W_N*T_N={k.W_N * k.T_N}")
-        if k.B_K % k.W_K != 0:
-            errors.append(f"B_K={k.B_K} not div by W_K={k.W_K}")
-
-        E_M = HALF_B_M // (k.W_M * k.T_M) if (k.W_M * k.T_M) else 0
-        E_N = HALF_B_N // (k.W_N * k.T_N) if (k.W_N * k.T_N) else 0
-        E_K = k.B_K // k.W_K if k.W_K else 0
-
-        # -- smem layout --
-        if smem_linear_wave % k.B_K != 0:
-            errors.append(f"smem_linear_wave={smem_linear_wave} not div by B_K={k.B_K}")
-        else:
-            smem_sub = smem_linear_wave // k.B_K
-            if HALF_B_M % smem_sub != 0:
-                errors.append(f"HALF_B_M={HALF_B_M} not div by smem_sub={smem_sub}")
-            if HALF_B_N % smem_sub != 0:
-                errors.append(f"HALF_B_N={HALF_B_N} not div by smem_sub={smem_sub}")
-
-        # -- buffer/ds instruction counts >= 1 and integer --
-        for name, num, den in [
-            ("a_buffer_load_insts", HALF_B_M * k.B_K, k.BLOCK_SIZE * k.VEC_A),
-            ("b_buffer_load_insts", HALF_B_N * k.B_K, k.BLOCK_SIZE * k.VEC_B),
-            ("a_ds_read_insts", E_M * E_K * k.W_M * k.W_K, WARP_SIZE * k.VEC_A),
-            ("b_ds_read_insts", E_N * E_K * k.W_N * k.W_K, WARP_SIZE * k.VEC_B),
-        ]:
-            if den == 0 or num % den != 0 or num // den < 1:
-                errors.append(f"{name}={num}/{den} invalid")
-
-        # -- ra/rb: W_M*W_K / (WARP_SIZE*VEC_A) >= 1 (gfx942 ra/rb uses different stride; skip). --
-        if getattr(k, "arch_prefix", "") != "gfx942":
-            for tag, ww, vec in [
-                ("ra", k.W_M * k.W_K, k.VEC_A),
-                ("rb", k.W_N * k.W_K, k.VEC_B),
-            ]:
-                denom = WARP_SIZE * vec
-                if ww < denom or ww % denom != 0:
-                    errors.append(f"{tag}: W*W_K={ww} must be >= and div by {denom}")
-
-        # -- gb: exact division (not ceil_div) --
-        if k.VEC_B and k.B_K % k.VEC_B == 0:
-            threads_k_b = k.B_K // k.VEC_B
-            if k.BLOCK_SIZE % threads_k_b == 0:
-                thr_n = k.BLOCK_SIZE // threads_k_b
-                if HALF_B_N % thr_n != 0:
-                    errors.append(f"gb: HALF_B_N={HALF_B_N} not div by {thr_n}")
-
-        # -- sb: exact division --
-        if smem_linear_wave % k.B_K == 0:
-            smem_sub = smem_linear_wave // k.B_K
-            if smem_sub and HALF_B_N % smem_sub == 0:
-                smem_n_rep = HALF_B_N // smem_sub
-                if smem_n_rep % num_waves != 0:
-                    errors.append(f"sb: smem_n_rep={smem_n_rep} not div by {num_waves}")
-
-        # -- threads_k <= WARP_SIZE --
-        for tag, vec in [("ga", k.VEC_A), ("gb", k.VEC_B)]:
-            if vec and k.B_K // vec > WARP_SIZE:
-                errors.append(f"{tag}: B_K/VEC={k.B_K // vec} > WARP_SIZE")
-
-        # -- AGPR < 256 --
-        agpr_per_mfma = (k.W_M * k.W_N) // WARP_SIZE
-        total_agprs = 4 * E_M * E_N * agpr_per_mfma
-        if total_agprs >= 256:
-            errors.append(f"AGPR={total_agprs} must be < 256")
-
-        # -- LDS <= 160 KiB --
-        if smem_linear_wave % k.B_K == 0:
-            smem_sub = smem_linear_wave // k.B_K
-            smem_m_rep = (
-                HALF_B_M // smem_sub if smem_sub and HALF_B_M % smem_sub == 0 else 0
-            )
-            smem_n_rep = (
-                HALF_B_N // smem_sub if smem_sub and HALF_B_N % smem_sub == 0 else 0
-            )
-            smem_padding = 2 * 16 // sizeof_da
-            smem_a = smem_m_rep * (smem_linear_wave + smem_padding) * sizeof_da
-            smem_b = smem_n_rep * (smem_linear_wave + smem_padding) * sizeof_da
-            total_lds = (smem_a + smem_b) * 4
-            if total_lds > 160 * 1024:
-                errors.append(f"LDS={total_lds // 1024}KiB exceeds 160KiB")
-
-        # -- VGPR spill estimate --
-        vgpr_ops = 4 * E_K * (E_M + 2 * E_N)
-        vgpr_est = vgpr_ops + 80
-        if vgpr_est > 256:
-            errors.append(f"VGPR_est={vgpr_est} exceeds 256")
-        if vgpr_est + total_agprs > 512:
-            errors.append(f"VGPR+AGPR={vgpr_est + total_agprs} exceeds 512")
-
-        # -- ra/rb layout constraint: B_K must equal T_N * W_K / 2 -- The ra/rb LDS read layouts couple
-        # E_K with T_N through the T_M part...
-        if getattr(k, "arch_prefix", "") != "gfx942":
-            required_bk = k.T_N * k.W_K // 2
-            if k.B_K != required_bk:
-                errors.append(
-                    f"B_K={k.B_K} must equal T_N*W_K/2={required_bk} "
-                    f"(ra/rb layout E_K/T_N coupling)"
-                )
-
-        if errors:
-            msg = f"Invalid a16w16 instance '{k.name}':\n" + "\n".join(
-                f"  - {e}" for e in errors
-            )
-            raise ValueError(msg)
-
-        return {
-            "E_M": E_M,
-            "E_N": E_N,
-            "E_K": E_K,
-            "agprs": total_agprs,
-            "vgpr_est": vgpr_est,
-            "lds_bytes": total_lds if smem_linear_wave % k.B_K == 0 else -1,
-            "min_k": 2 * k.B_K,
-        }
-
-    # -- a16w16_flatmm validator --
-
-    @staticmethod
-    def _validate_a16w16_flatmm(k: OpusGemmInstance):
-        """Validate an a16w16_flatmm instance at codegen time.
-
-        Mirrors the static_asserts in opus_gemm_a16w16_flatmm_traits_gfx950: derives
-        pfk from LDS budget / WG_PER_CU and requires pfk >= 3 (depth-1 pipeline
-        entry point). Raises ValueError if invalid.
-        """
-        errors = []
-        sizeof_da = 2  # bf16 locked
-
-        # -- Locked config (traits enforces these via templates) --
-        if k.BLOCK_SIZE != 256:
-            errors.append(f"BLOCK_SIZE={k.BLOCK_SIZE} must be 256 (4-wave warp-spec)")
-        if k.T_M != 2:
-            errors.append(f"T_M={k.T_M} must be 2")
-        if k.T_N != 1:
-            errors.append(f"T_N={k.T_N} must be 1")
-
-        # -- MFMA: only W_M<32 path supported (LOAD_GROUP_M_LANE=1) --
-        if (k.W_M, k.W_N, k.W_K) not in VALID_FLATMM_MFMA:
-            errors.append(
-                f"WAVE=({k.W_M},{k.W_N},{k.W_K}) not in {VALID_FLATMM_MFMA} "
-                f"(flatmm ra layout requires W_M<32)"
-            )
-        if k.W_M >= 32:
-            errors.append(f"W_M={k.W_M}: flatmm LGML=4 path not implemented")
-
-        # -- VEC --
-        expected_vec = 16 // sizeof_da
-        if k.VEC_A != expected_vec or k.VEC_B != expected_vec:
-            errors.append(f"VEC_A={k.VEC_A}, VEC_B={k.VEC_B} must be {expected_vec}")
-        if k.VEC_C != 4:
-            errors.append(f"VEC_C={k.VEC_C} must be 4")
-
-        # -- Tile geometry (LOAD_GROUP_K = W_K * 2 = 64 for W_K=32) --
-        LOAD_GROUP_M = 64 if k.W_M >= 32 else 32
-        LOAD_GROUP_N = 64 if k.W_N >= 32 else 32
-        LOAD_GROUP_K = k.W_K * 2
-        if k.B_M % LOAD_GROUP_M != 0:
-            errors.append(f"B_M={k.B_M} not div by LOAD_GROUP_M={LOAD_GROUP_M}")
-        if k.B_N % LOAD_GROUP_N != 0:
-            errors.append(f"B_N={k.B_N} not div by LOAD_GROUP_N={LOAD_GROUP_N}")
-        if k.B_K % LOAD_GROUP_K != 0:
-            errors.append(f"B_K={k.B_K} not div by LOAD_GROUP_K={LOAD_GROUP_K}")
-
-        num_load_groups_per_bm = k.B_M // LOAD_GROUP_M
-        num_load_groups_per_bn = k.B_N // LOAD_GROUP_N
-        num_load_groups_per_bk = k.B_K // LOAD_GROUP_K
-
-        # -- LDS per-group-load size --
-        smem_linear_wave = WARP_SIZE * 16 // sizeof_da  # 512 for bf16
-        smem_sub = smem_linear_wave // LOAD_GROUP_K
-        slots = LOAD_GROUP_M // smem_sub
-        smem_padding = 16 // sizeof_da if k.W_M >= 32 else 2 * 16 // sizeof_da
-        smem_per_group_load_size = slots * (smem_linear_wave + smem_padding) * sizeof_da
-
-        # -- WG_PER_CU --
-        if k.WG_PER_CU not in (1, 2):
-            errors.append(f"WG_PER_CU={k.WG_PER_CU} must be 1 or 2")
-
-        # -- pfk derivation (match traits formula) --
-        lds_total = 163840  # gfx950 budget; host-side constant for validation only
-        max_lds_per_wg = lds_total // max(k.WG_PER_CU, 1)
-        per_block_iter = (
-            (num_load_groups_per_bm + num_load_groups_per_bn)
-            * num_load_groups_per_bk
-            * smem_per_group_load_size
-        )
-        pfk = max_lds_per_wg // per_block_iter if per_block_iter > 0 else 0
-        if pfk < 3:
-            errors.append(
-                f"prefetch_k_iter={pfk} < 3 "
-                f"(LDS budget {max_lds_per_wg} / per-iter {per_block_iter})"
-            )
-
-        min_k = pfk * k.B_K
-        lds_footprint = pfk * per_block_iter
-
-        if errors:
-            msg = f"Invalid a16w16_flatmm instance '{k.name}':\n" + "\n".join(
-                f"  - {e}" for e in errors
-            )
-            raise ValueError(msg)
-
-        return {
-            "pfk": pfk,
-            "min_k": min_k,
-            "lds_bytes": lds_footprint,
-            "slots": slots,
-            "groups_bm": num_load_groups_per_bm,
-            "groups_bn": num_load_groups_per_bn,
-            "groups_bk": num_load_groups_per_bk,
-        }
-
-    # -- a16w16_flatmm_splitk validator --
-
-    @staticmethod
-    def _validate_a16w16_flatmm_splitk(k: OpusGemmInstance):
-        """Validate an a16w16_flatmm_splitk instance at codegen time.
-
-        Mirrors _validate_a16w16_flatmm's checks (LDS budget, pfk>=3, MFMA,
-        VEC, tile divisibility) and adds a VGPR-spill guard: WG_PER_CU=1 with
-        COM_REP_M*COM_REP_N > 16 causes 100+ VGPR spill to scratch and ~1000x
-        slowdown (cc lines 1143-1150 hand-picked only 3 WG=1 tiles for this
-        reason). Raises ValueError if invalid.
-        """
-        errors = []
-        sizeof_da = 2  # bf16 locked
-
-        if k.BLOCK_SIZE != 256:
-            errors.append(f"BLOCK_SIZE={k.BLOCK_SIZE} must be 256 (4-wave warp-spec)")
-        if k.T_M != 2:
-            errors.append(f"T_M={k.T_M} must be 2")
-        if k.T_N != 1:
-            errors.append(f"T_N={k.T_N} must be 1")
-
-        if (k.W_M, k.W_N, k.W_K) not in VALID_FLATMM_SPLITK_MFMA:
-            errors.append(
-                f"WAVE=({k.W_M},{k.W_N},{k.W_K}) not in {VALID_FLATMM_SPLITK_MFMA} "
-                f"(flatmm_splitk ra layout requires W_M<32)"
-            )
-        if k.W_M >= 32:
-            errors.append(f"W_M={k.W_M}: flatmm_splitk LGML=4 path not implemented")
-
-        expected_vec = 16 // sizeof_da
-        if k.VEC_A != expected_vec or k.VEC_B != expected_vec:
-            errors.append(f"VEC_A={k.VEC_A}, VEC_B={k.VEC_B} must be {expected_vec}")
-        if k.VEC_C != 4:
-            errors.append(f"VEC_C={k.VEC_C} must be 4")
-
-        LOAD_GROUP_M = 64 if k.W_M >= 32 else 32
-        LOAD_GROUP_N = 64 if k.W_N >= 32 else 32
-        LOAD_GROUP_K = k.W_K * 2
-        if k.B_M % LOAD_GROUP_M != 0:
-            errors.append(f"B_M={k.B_M} not div by LOAD_GROUP_M={LOAD_GROUP_M}")
-        if k.B_N % LOAD_GROUP_N != 0:
-            errors.append(f"B_N={k.B_N} not div by LOAD_GROUP_N={LOAD_GROUP_N}")
-        if k.B_K % LOAD_GROUP_K != 0:
-            errors.append(f"B_K={k.B_K} not div by LOAD_GROUP_K={LOAD_GROUP_K}")
-
-        num_load_groups_per_bm = k.B_M // LOAD_GROUP_M
-        num_load_groups_per_bn = k.B_N // LOAD_GROUP_N
-        num_load_groups_per_bk = k.B_K // LOAD_GROUP_K
-
-        smem_linear_wave = WARP_SIZE * 16 // sizeof_da
-        smem_sub = smem_linear_wave // LOAD_GROUP_K
-        slots = LOAD_GROUP_M // smem_sub
-        smem_padding = 16 // sizeof_da if k.W_M >= 32 else 2 * 16 // sizeof_da
-        smem_per_group_load_size = slots * (smem_linear_wave + smem_padding) * sizeof_da
-
-        if k.WG_PER_CU not in (1, 2):
-            errors.append(f"WG_PER_CU={k.WG_PER_CU} must be 1 or 2")
-
-        lds_total = 163840  # gfx950
-        max_lds_per_wg = lds_total // max(k.WG_PER_CU, 1)
-        per_block_iter = (
-            (num_load_groups_per_bm + num_load_groups_per_bn)
-            * num_load_groups_per_bk
-            * smem_per_group_load_size
-        )
-        pfk = max_lds_per_wg // per_block_iter if per_block_iter > 0 else 0
-        if pfk < 3:
-            errors.append(
-                f"prefetch_k_iter={pfk} < 3 "
-                f"(LDS budget {max_lds_per_wg} / per-iter {per_block_iter})"
-            )
-
-        # VGPR-spill guard: cc hand-picked only 3 WG=1 tiles because larger tiles (COM_REP_M*COM_REP_N >
-        # 16) spill v_c to scratch and run...
-        com_rep_m = k.B_M // (k.W_M * 2)
-        com_rep_n = k.B_N // k.W_N
-        if k.WG_PER_CU == 1 and com_rep_m * com_rep_n > 16:
-            errors.append(
-                f"WG_PER_CU=1 requires COM_REP_M*COM_REP_N<=16 "
-                f"(got {com_rep_m * com_rep_n}={com_rep_m}*{com_rep_n}); "
-                f"larger WG=1 tiles spill VGPR to scratch, ~1000x slower"
-            )
-
-        min_k = pfk * k.B_K
-        lds_footprint = pfk * per_block_iter
-
-        if errors:
-            msg = f"Invalid a16w16_flatmm_splitk instance '{k.name}':\n" + "\n".join(
-                f"  - {e}" for e in errors
-            )
-            raise ValueError(msg)
-
-        return {
-            "pfk": pfk,
-            "min_k": min_k,
-            "lds_bytes": lds_footprint,
-            "slots": slots,
-            "com_rep_m": com_rep_m,
-            "com_rep_n": com_rep_n,
-        }
-
-    @staticmethod
-    def _validate_a16w16_persistent(k: OpusGemmInstance):
-        """Validate an a16w16 persistent instance.
-
-        Persistent uses the same per-tile layout as the split-barrier pipeline
-        (TILE/WAVE traits, E_M/E_N/E_K derivation, smem footprint), so its
-        constraints are a superset of _validate_a16w16's. Additionally:
-          * MFMA restricted to VALID_PERSISTENT_MFMA (mouter reference only).
-          * BLOCK_SIZE locked to 512 and T_M*T_N == 8 (matches mouter
-            8-wave WG; smaller WGs not yet ported).
-        """
-        if (k.W_M, k.W_N, k.W_K) not in VALID_PERSISTENT_MFMA:
-            raise ValueError(
-                f"Invalid a16w16_persistent instance '{k.name}':\n"
-                f"  - WAVE=({k.W_M},{k.W_N},{k.W_K}) not in {VALID_PERSISTENT_MFMA}"
-            )
-        if k.BLOCK_SIZE != 512:
-            raise ValueError(
-                f"Invalid a16w16_persistent instance '{k.name}':\n"
-                f"  - BLOCK_SIZE={k.BLOCK_SIZE} must be 512 (mouter 8-wave WG)"
-            )
-        # All other shape/divisibility constraints fall through to the split-barrier validator.
-        return opus_gemm_codegen._validate_a16w16(k)
-
-    @staticmethod
-    def _validate_a16w16_mono_tile(k: OpusGemmInstance):
-        """Validate an a16w16 mono-tile instance.
-
-        Mirrors the static_asserts in opus_gemm_a16w16_mono_tile_traits_gfx950
-        and the kernel-internal constraints in the mono-tile pipeline header.
-        Mono-tile locks T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32 (MFMA
-        16x16x32 BF16), VEC=8, BLOCK_SIZE=512 (8 waves * 64 lanes); the
-        tile must satisfy:
-          * B_M divisible by W_M*T_M = 32
-          * B_N divisible by W_N*T_N = 64
-          * B_K divisible by W_K*T_K = 32
-          * B_K divides smem_linear_wave = 512 (bf16)
-          * smem_m_rep = B_M / smem_sub >= 8 and divisible by 8 (num_waves)
-          * smem_n_rep = B_N / smem_sub >= 8 and divisible by 8
-          * E_N = B_N / (W_N*T_N) divisible by (T_N/T_M) = 2  ->  B_N % 128 == 0
-          * E_M divisible by smem_sub / (W_M/T_N)
-        Plus a user-imposed B_M <= 192 cap.
-        """
-        errors = []
-        sizeof_da = 2  # bf16 locked
-
-        # -- Locked config --
-        if k.BLOCK_SIZE != 512:
-            errors.append(
-                f"BLOCK_SIZE={k.BLOCK_SIZE} must be 512 (mono-tile 8-wave WG)"
-            )
-        if k.T_M != 2:
-            errors.append(f"T_M={k.T_M} must be 2 (mono-tile locked)")
-        if k.T_N != 4:
-            errors.append(f"T_N={k.T_N} must be 4 (mono-tile locked)")
-        if (k.W_M, k.W_N, k.W_K) not in VALID_MONO_TILE_MFMA:
-            errors.append(
-                f"WAVE=({k.W_M},{k.W_N},{k.W_K}) not in {VALID_MONO_TILE_MFMA}"
-            )
-
-        # -- VEC --
-        expected_vec = 16 // sizeof_da  # 8 for bf16
-        if (
-            k.VEC_A != expected_vec
-            or k.VEC_B != expected_vec
-            or k.VEC_C != expected_vec
-        ):
-            errors.append(
-                f"VEC=({k.VEC_A},{k.VEC_B},{k.VEC_C}) must all be {expected_vec}"
-            )
-
-        # -- User cap: B_M <= 192 --
-        if k.B_M > 192:
-            errors.append(f"B_M={k.B_M} exceeds mono-tile cap of 192")
-
-        # -- Mono-tile must be non-OOB (intrinsic; launcher rejects unaligned) --
-        if k.has_oob:
-            errors.append("mono-tile is intrinsically non-OOB; has_oob must be False")
-
-        # -- Block tile divisibility --
-        if k.B_M % (k.W_M * k.T_M) != 0:
-            errors.append(f"B_M={k.B_M} not div by W_M*T_M={k.W_M * k.T_M}")
-        if k.B_N % (k.W_N * k.T_N) != 0:
-            errors.append(f"B_N={k.B_N} not div by W_N*T_N={k.W_N * k.T_N}")
-        if k.B_K % (k.W_K * 1) != 0:
-            errors.append(f"B_K={k.B_K} not div by W_K*T_K={k.W_K}")
-
-        E_M = k.B_M // (k.W_M * k.T_M) if (k.W_M * k.T_M) else 0
-        E_N = k.B_N // (k.W_N * k.T_N) if (k.W_N * k.T_N) else 0
-        E_K = k.B_K // k.W_K if k.W_K else 0
-
-        # -- E_N divisibility (rb layout grouping by T_N/T_M = 2) --
-        if k.T_M and (E_N * k.T_M) % k.T_N != 0:
-            errors.append(
-                f"E_N={E_N} not div by T_N/T_M={k.T_N // k.T_M} "
-                f"(mono-tile rb layout grouping; needs B_N % 128 == 0)"
-            )
-
-        # -- LDS layout --
-        smem_linear_wave = WARP_SIZE * 16 // sizeof_da  # 512 for bf16
-        if k.B_K and smem_linear_wave % k.B_K != 0:
-            errors.append(
-                f"B_K={k.B_K} does not divide smem_linear_wave={smem_linear_wave}"
-            )
-        elif k.B_K:
-            smem_sub = smem_linear_wave // k.B_K
-            num_waves = k.BLOCK_SIZE // WARP_SIZE  # 8
-            if k.B_M % smem_sub != 0:
-                errors.append(f"B_M={k.B_M} not div by smem_sub={smem_sub}")
-            if k.B_N % smem_sub != 0:
-                errors.append(f"B_N={k.B_N} not div by smem_sub={smem_sub}")
-            smem_m_rep = k.B_M // smem_sub if smem_sub else 0
-            smem_n_rep = k.B_N // smem_sub if smem_sub else 0
-            if smem_m_rep < num_waves or (smem_m_rep % num_waves) != 0:
-                errors.append(
-                    f"smem_m_rep={smem_m_rep} must be >= {num_waves} "
-                    f"and divisible by {num_waves}"
-                )
-            if smem_n_rep < num_waves or (smem_n_rep % num_waves) != 0:
-                errors.append(
-                    f"smem_n_rep={smem_n_rep} must be >= {num_waves} "
-                    f"and divisible by {num_waves}"
-                )
-            # ra layout: smem_sub_e_m = smem_sub / (W_M / T_N); E_M must
-            # divide cleanly.
-            if k.T_N and (k.W_M % k.T_N) != 0:
-                errors.append(
-                    f"W_M={k.W_M} not div by T_N={k.T_N} (mono-tile ra layout)"
-                )
-            else:
-                ratio = k.W_M // k.T_N
-                if ratio and smem_sub % ratio != 0:
-                    errors.append(
-                        f"smem_sub={smem_sub} not div by W_M/T_N={ratio} (ra layout)"
-                    )
-                else:
-                    smem_sub_e_m = smem_sub // ratio if ratio else 0
-                    if smem_sub_e_m == 0 or (E_M % smem_sub_e_m) != 0:
-                        errors.append(
-                            f"E_M={E_M} not div by smem_sub_e_m={smem_sub_e_m} "
-                            f"(ra layout)"
-                        )
-
-            # -- LDS footprint --
-            # Mono-tile pipeline allocates `smem_a[2]` (double-buffered:
-            # one compute slot + one fetch slot) and `smem_b[3]` (two
-            # read slots sb_r0/sb_r1 plus a write slot sb_w; B is
-            # consumed twice per MMA pair under the T_N/T_M = 2 grouping).
-            # See the pipeline header (smem_a / smem_b allocation).
-            smem_padding = 2 * 16 // sizeof_da
-            smem_a_one = smem_m_rep * (smem_linear_wave + smem_padding) * sizeof_da
-            smem_b_one = smem_n_rep * (smem_linear_wave + smem_padding) * sizeof_da
-            total_lds = smem_a_one * 2 + smem_b_one * 3
-            if total_lds > 160 * 1024:
-                errors.append(f"LDS={total_lds // 1024}KiB exceeds 160KiB")
-        else:
-            total_lds = -1
-
-        if errors:
-            msg = f"Invalid a16w16_mono_tile instance '{k.name}':\n" + "\n".join(
-                f"  - {e}" for e in errors
-            )
-            raise ValueError(msg)
-
-        return {
-            "E_M": E_M,
-            "E_N": E_N,
-            "E_K": E_K,
-            "lds_bytes": total_lds,
-            "min_k": 2 * k.B_K,
-        }
-
     # -- Instance generation --
 
     def gen_instance(self, k: OpusGemmInstance):
-        if k.kernel_tag in (
-            "a16w16",
-            "a16w16_kbuf1_large_tile",
-            "a16w16_kbuf2v",
-            "a16w16_kbuf2v_bk128",
-            "a16w16_kbuf3",
-            "a16w16_kbuf1",
-        ):
-            info = self._validate_a16w16(k)
+        from codegen.gen_instances_gfx942 import _validate_a16w16_gfx942
+        from codegen.gen_instances_gfx950 import (
+            _validate_a16w16,
+            _validate_a16w16_flatmm,
+            _validate_a16w16_flatmm_splitk,
+            _validate_a16w16_mono_tile,
+            _validate_a16w16_persistent,
+        )
+
+        # gfx950 split-barrier (only "a16w16" tag uses this validator).
+        if k.kernel_tag == "a16w16":
+            info = _validate_a16w16(k)
+            print(
+                f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
+                f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
+                f"  LDS={info['lds_bytes'] // 1024}KiB"
+                f"  K>={info['min_k']}"
+            )
+        # gfx942 a16w16 family (nosplit + splitk + fused_reduce); all share
+        # _validate_a16w16_gfx942 -- tag set == _GFX942_A16W16_TAGS.
+        elif k.kernel_tag in _GFX942_A16W16_TAGS:
+            info = _validate_a16w16_gfx942(k)
             print(
                 f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
                 f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
@@ -908,7 +272,7 @@ class opus_gemm_codegen:
                 f"  K>={info['min_k']}"
             )
         elif k.kernel_tag == "a16w16_persistent":
-            info = self._validate_a16w16_persistent(k)
+            info = _validate_a16w16_persistent(k)
             print(
                 f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
                 f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
@@ -916,14 +280,14 @@ class opus_gemm_codegen:
                 f"  K>={info['min_k']}"
             )
         elif k.kernel_tag == "a16w16_mono_tile":
-            info = self._validate_a16w16_mono_tile(k)
+            info = _validate_a16w16_mono_tile(k)
             print(
                 f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
                 f"  LDS={info['lds_bytes'] // 1024}KiB"
                 f"  K>={info['min_k']}"
             )
         elif k.kernel_tag == "a16w16_flatmm":
-            info = self._validate_a16w16_flatmm(k)
+            info = _validate_a16w16_flatmm(k)
             print(
                 f"  {k.name}: pfk={info['pfk']} "
                 f"slots={info['slots']} "
@@ -931,32 +295,20 @@ class opus_gemm_codegen:
                 f"LDS={info['lds_bytes'] // 1024}KiB K>={info['min_k']}"
             )
         elif k.kernel_tag == "a16w16_flatmm_splitk":
-            info = self._validate_a16w16_flatmm_splitk(k)
+            info = _validate_a16w16_flatmm_splitk(k)
             print(
                 f"  {k.name}: pfk={info['pfk']} "
                 f"slots={info['slots']} "
                 f"comrep=({info['com_rep_m']},{info['com_rep_n']}) "
                 f"LDS={info['lds_bytes'] // 1024}KiB K>={info['min_k']} WG={k.WG_PER_CU}"
             )
-        elif k.kernel_tag in (
-            "a16w16_kbuf3_sk",
-            "a16w16_kbuf1_sk",
-            "a16w16_fused_reduce",
-        ):
-            # gfx942 splitk: reuse split-barrier per-tile validator.
-            info = self._validate_a16w16(k)
-            print(
-                f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
-                f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
-                f"  LDS={info['lds_bytes'] // 1024}KiB"
-            )
 
         pipeline_header = _pipeline_header_for(k)
-        traits_header = _lookup(k, TRAITS_HEADER_MAP, GFX942_TRAITS_HEADER_MAP)
+        traits_header = TRAITS_HEADER_MAP[k.kernel_tag]
         kernel_func = _kernel_func_for(k)
         da, db = INPUT_DTYPE_MAP[k.kernel_tag]
-        traits_name = _lookup(k, TRAITS_NAME_MAP, GFX942_TRAITS_NAME_MAP)
-        kargs_name = _lookup(k, KARGS_NAME_MAP, GFX942_KARGS_NAME_MAP)
+        traits_name = TRAITS_NAME_MAP[k.kernel_tag]
+        kargs_name = KARGS_NAME_MAP[k.kernel_tag]
 
         # Track per-kid pipeline header so the per-kid device.cu can include
         # exactly the right one without re-running the full logic.
