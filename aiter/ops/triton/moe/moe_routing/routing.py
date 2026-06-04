@@ -408,7 +408,7 @@ def routing(
     return routing_data, topk_indx, gate_indx
 
 
-def routing_a8w4_from_hash(
+def routing_from_hash(
     router_logits: torch.Tensor,
     tid2eid: torch.Tensor,
     input_ids: torch.Tensor,
@@ -458,65 +458,6 @@ def routing_a8w4_from_hash(
         token_offs_pad,
         block_pid_map,
     ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
-    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
-    routing_data = RoutingData(
-        block_m=block_m,
-        gate_scal=gate_scal,
-        expt_hist=hist,
-        n_expts_tot=n_expts_tot,
-        n_expts_act=n_expts_act,
-        expt_data=expt_data,
-    )
-    return routing_data, topk_indx, gate_indx
-
-
-def routing_a8w4_from_topk(
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    n_expts_tot: int,
-    block_m: int,
-):
-    """Routing for the a8w4 path when topk has been pre-computed externally
-    (e.g. DeepSeek-V4 hash layers with tid2eid lookup).
-
-    Mirrors ``routing_a8w4`` but skips the score+topk math step. Pipeline:
-      1. aiter ``fused_routing_from_topk``: 3-kernel counting-sort over the
-         supplied ``(topk_weights, topk_ids)``. Allocates only via
-         ``torch.empty`` — no histogram memset.
-      2. aiter ``_expt_data_only_kernel``: standalone stage1+stage2 launch
-         that materialises ExptData (token_offs_raw, token_offs_pad,
-         block_pid_map) from the histogram for the chosen ``block_m``.
-
-    Returns ``(RoutingData, gather_indx, scatter_indx)`` where ``gather_indx``
-    and ``scatter_indx`` are raw int32 tensors — same contract as
-    ``routing_a8w4`` — so ``_a8w4_fused_experts`` consumes them unchanged.
-    """
-
-    n_tokens, n_expts_act = topk_weights.shape
-    n_gates = n_tokens * n_expts_act
-
-    hist, topk_indx, gate_indx, gate_scal = fused_routing_from_topk(
-        topk_weights, topk_ids, n_expts_tot
-    )
-
-    token_offs_raw, token_offs_pad, block_pid_map, blocks1a, BLOCK_A, block_m_log2 = (
-        _compute_expt_data_internal(n_expts_tot, n_gates, block_m, topk_weights.device)
-    )
-
-    _expt_data_only_kernel[(blocks1a,)](
-        hist,
-        n_expts_tot,
-        token_offs_raw,
-        token_offs_pad,
-        block_pid_map,
-        block_pid_map.shape[0],
-        n_gates,
-        block_m_log2,
-        BLOCK_A,
-        (hist.shape[0] == BLOCK_A),
-        num_warps=1,
-    )
-
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
     routing_data = RoutingData(
         block_m=block_m,

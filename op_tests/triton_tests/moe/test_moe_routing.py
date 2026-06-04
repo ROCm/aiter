@@ -4,8 +4,7 @@ import triton
 import torch.nn.functional as F
 from aiter.ops.triton.moe.moe_routing.routing import (
     routing,
-    routing_a8w4_from_hash,
-    routing_a8w4_from_topk,
+    routing_from_hash,
     routing_torch,
     compute_expt_data_torch,
 )
@@ -163,7 +162,7 @@ def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):
 
 
 # --------------------------
-# Reference implementations for routing_a8w4* paths
+# Reference implementations for routing with score mode paths
 # --------------------------
 
 
@@ -197,7 +196,7 @@ def _sort_and_build_torch(expt_scal, expt_indx, n_expts_tot, block_m):
     return hist, topk_indx, gate_indx, gate_scal, expt_data
 
 
-def routing_a8w4_torch(
+def routing_score_mode_torch(
     logits,
     n_expts_act,
     block_m,
@@ -236,7 +235,7 @@ def routing_a8w4_torch(
     return _sort_and_build_torch(expt_scal, topk_ids, n_expts_tot, block_m)
 
 
-def routing_a8w4_from_hash_torch(
+def routing_from_hash_torch(
     router_logits,
     tid2eid,
     input_ids,
@@ -267,15 +266,6 @@ def routing_a8w4_from_hash_torch(
     expt_scal = expt_scal.to(router_logits.dtype)
     expt_indx = expt_indx.to(torch.int16)
     return _sort_and_build_torch(expt_scal, expt_indx, n_expts_tot, block_m)
-
-
-def routing_a8w4_from_topk_torch(topk_weights, topk_ids, n_expts_tot, block_m):
-    return _sort_and_build_torch(
-        topk_weights,
-        topk_ids.to(torch.int16),
-        n_expts_tot,
-        block_m,
-    )
 
 
 def _check_routing_data(ref_pack, tri_routing_data, tri_gather, tri_scatter):
@@ -325,7 +315,7 @@ def _check_routing_data_bucket(
     n_expts_tot = ref_hist.numel()
 
     # Inverse permutation invariant: gate_indx[topk_indx[j]] == j.
-    # Cast scatter to int64 first: the grouped routing_ds path returns uint16
+    # Cast scatter to int64 first: the grouped routing_score_mode path returns uint16
     # indices, which CUDA cannot advanced-index.
     iota = torch.arange(n_gates, dtype=torch.int64, device=tri_gather.device)
     assert torch.equal(
@@ -373,7 +363,7 @@ def _check_routing_data_bucket(
 
 
 # --------------------------
-# routing_a8w4
+# routing score mode
 # --------------------------
 
 
@@ -396,7 +386,7 @@ def _check_routing_data_bucket(
         ("softmax", False, False, 1.0),  # identity transform, no renorm
     ],
 )
-def test_routing_a8w4(
+def test_routing_score_mode(
     n_tokens,
     n_expts_tot,
     n_expts_act,
@@ -420,7 +410,7 @@ def test_routing_a8w4(
     # routing derives block_m internally; mirror that here for the ref.
     block_m = _routing_block_m(n_tokens, n_expts_act, n_expts_tot)
 
-    ref_pack = routing_a8w4_torch(
+    ref_pack = routing_score_mode_torch(
         logits.clone(),
         n_expts_act,
         block_m,
@@ -445,7 +435,7 @@ def test_routing_a8w4(
 
 
 # --------------------------
-# routing_a8w4_from_hash
+# routing_from_hash
 # --------------------------
 
 
@@ -466,7 +456,7 @@ def test_routing_a8w4(
     ],
 )
 @pytest.mark.parametrize("block_m", [16, 32])
-def test_routing_a8w4_from_hash(
+def test_routing_from_hash(
     n_tokens,
     n_expts_tot,
     n_expts_act,
@@ -497,7 +487,7 @@ def test_routing_a8w4_from_hash(
         0, vocab_size, (n_tokens,), dtype=torch.int32, device=device
     )
 
-    ref_pack = routing_a8w4_from_hash_torch(
+    ref_pack = routing_from_hash_torch(
         router_logits.clone(),
         tid2eid,
         input_ids,
@@ -507,7 +497,7 @@ def test_routing_a8w4_from_hash(
         renorm=renorm,
         routed_scaling_factor=routed_scaling_factor,
     )
-    tri_routing_data, tri_gather, tri_scatter = routing_a8w4_from_hash(
+    tri_routing_data, tri_gather, tri_scatter = routing_from_hash(
         router_logits,
         tid2eid,
         input_ids,
@@ -519,72 +509,6 @@ def test_routing_a8w4_from_hash(
     )
 
     _check_routing_data(ref_pack, tri_routing_data, tri_gather, tri_scatter)
-    assert tri_routing_data.n_expts_tot == n_expts_tot
-    assert tri_routing_data.n_expts_act == n_expts_act
-    assert tri_routing_data.block_m == block_m
-
-
-# --------------------------
-# routing_a8w4_from_topk
-# --------------------------
-
-
-# fused_routing_from_topk requires n_tokens * n_expts_act <= 4096.
-@pytest.mark.parametrize(
-    "n_tokens, n_expts_tot, n_expts_act",
-    [
-        (8, 128, 4),
-        (64, 128, 4),
-        (256, 128, 4),
-        (256, 256, 8),
-        (512, 128, 8),
-    ],
-)
-@pytest.mark.parametrize("block_m", [16, 32])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_routing_a8w4_from_topk(
-    n_tokens,
-    n_expts_tot,
-    n_expts_act,
-    block_m,
-    dtype,
-):
-    if get_arch() not in ["gfx950", "gfx1250"]:
-        pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
-
-    device = "cuda"
-    torch.manual_seed(2)
-    topk_weights = torch.randn(n_tokens, n_expts_act, dtype=dtype, device=device).abs()
-    # Per-row unique expert ids (the natural V4 case).
-    topk_ids = torch.stack(
-        [
-            torch.randperm(n_expts_tot, device=device)[:n_expts_act]
-            for _ in range(n_tokens)
-        ],
-        dim=0,
-    ).to(torch.int32)
-
-    ref_pack = routing_a8w4_from_topk_torch(
-        topk_weights.clone(),
-        topk_ids.clone(),
-        n_expts_tot,
-        block_m,
-    )
-    tri_routing_data, tri_gather, tri_scatter = routing_a8w4_from_topk(
-        topk_weights,
-        topk_ids,
-        n_expts_tot,
-        block_m,
-    )
-
-    _check_routing_data_bucket(
-        ref_pack,
-        tri_routing_data,
-        tri_gather,
-        tri_scatter,
-        topk_weights,
-        topk_ids,
-    )
     assert tri_routing_data.n_expts_tot == n_expts_tot
     assert tri_routing_data.n_expts_act == n_expts_act
     assert tri_routing_data.block_m == block_m
@@ -784,28 +708,87 @@ def _maybe_skip():
 
 # --------------------------------------------------------------------------
 # 1. direct kernel test: (y_vals, y_indx, bitmatrix)
+#
+# Unified across contiguous/arbitrary expert->group layouts, score modes, and
+# 0/1/2 fused always-on shared experts. The curated case list reproduces the
+# original three tests' coverage exactly (contiguous x SCORE_COMBOS x no shared;
+# arbitrary x sqrtsoftplus; contiguous x sqrtsoftplus x shared 1/2).
 # --------------------------------------------------------------------------
 
+# sqrtsoftplus + bias + renorm + scale=2.5: the fixed combo the arbitrary-group
+# and shared-expert variants exercise.
+SQ_COMBO = ("sqrtsoftplus", True, True, 2.5)
 
-@pytest.mark.parametrize("n_tokens", GROUPED_N_TOKENS)
+
+def _make_shuffled_expert_group(n_expts_tot, num_expert_group, device):
+    """Equal-size groups with a shuffled (non-contiguous) expert->group table."""
+    g_size = n_expts_tot // num_expert_group
+    perm = torch.randperm(n_expts_tot, device=device)
+    expert_group = torch.empty(n_expts_tot, dtype=torch.int32, device=device)
+    for g in range(num_expert_group):
+        expert_group[perm[g * g_size : (g + 1) * g_size]] = g
+    return expert_group
+
+
+def _grouped_topk_kernel_cases():
+    cases = []
+    # (1) contiguous groups, all score combos, no shared experts.
+    for nt in GROUPED_N_TOKENS:
+        for shape in GROUP_SHAPES:
+            for sc in SCORE_COMBOS:
+                cases.append(
+                    pytest.param(
+                        nt,
+                        shape,
+                        sc,
+                        "contiguous",
+                        0,
+                        id=f"contig-nt{nt}-e{shape[0]}-{sc[0]}-s0",
+                    )
+                )
+    # (2) arbitrary (non-contiguous) expert->group table, fixed sqrtsoftplus.
+    for nt in [8, 64, 1024]:
+        for shape in GROUP_SHAPES:
+            cases.append(
+                pytest.param(
+                    nt,
+                    shape,
+                    SQ_COMBO,
+                    "arbitrary",
+                    0,
+                    id=f"arb-nt{nt}-e{shape[0]}-s0",
+                )
+            )
+    # (3) contiguous groups, fixed sqrtsoftplus, 1/2 fused shared experts.
+    for nt in [8, 64, 1024]:
+        for shape in GROUP_SHAPES:
+            for ns in [1, 2]:
+                cases.append(
+                    pytest.param(
+                        nt,
+                        shape,
+                        SQ_COMBO,
+                        "contiguous",
+                        ns,
+                        id=f"contig-nt{nt}-e{shape[0]}-s{ns}",
+                    )
+                )
+    return cases
+
+
 @pytest.mark.parametrize(
-    "n_expts_tot, num_expert_group, topk_group, n_expts_act", GROUP_SHAPES
+    "n_tokens, shape, score_combo, group_mode, n_shared",
+    _grouped_topk_kernel_cases(),
 )
-@pytest.mark.parametrize("score_mode, has_bias, renorm, scale", SCORE_COMBOS)
-def test_grouped_topk_kernel(
-    n_tokens,
-    n_expts_tot,
-    num_expert_group,
-    topk_group,
-    n_expts_act,
-    score_mode,
-    has_bias,
-    renorm,
-    scale,
-):
+def test_grouped_topk_kernel(n_tokens, shape, score_combo, group_mode, n_shared):
+    """Direct grouped_topk kernel test: routed selection + bitmatrix vs torch
+    reference, parametrized over expert->group layout, score mode, and fused
+    shared experts."""
     _maybe_skip()
+    n_expts_tot, num_expert_group, topk_group, n_expts_act = shape
+    score_mode, has_bias, renorm, scale = score_combo
     device = "cuda"
-    torch.manual_seed(2)
+    torch.manual_seed(7 if group_mode == "arbitrary" else 2)
     logits = init_data(n_tokens, n_expts_tot, device=device, dtype=torch.float32)
     bias = (
         torch.randn(n_expts_tot, dtype=torch.float32, device=device) * 0.05
@@ -813,73 +796,34 @@ def test_grouped_topk_kernel(
         else None
     )
 
-    ref_w, ref_ids = _ref_contiguous(
-        logits.clone(),
-        n_expts_act,
-        num_expert_group,
-        topk_group,
-        score_mode,
-        bias,
-        renorm,
-        scale,
-    )
-    y_vals, y_indx, bitmatrix = grouped_topk(
-        logits,
-        n_expts_act,
-        num_expert_group=num_expert_group,
-        topk_group=topk_group,
-        score_mode=score_mode,
-        bias=bias,
-        renorm=renorm,
-        routed_scaling_factor=scale,
-    )
+    if group_mode == "arbitrary":
+        expert_group = _make_shuffled_expert_group(
+            n_expts_tot, num_expert_group, device
+        )
+        ref_w, ref_ids = _ref_arbitrary_grouped(
+            logits.clone(),
+            expert_group,
+            n_expts_act,
+            num_expert_group,
+            topk_group,
+            score_mode,
+            bias,
+            renorm,
+            scale,
+        )
+    else:
+        expert_group = None
+        ref_w, ref_ids = _ref_contiguous(
+            logits.clone(),
+            n_expts_act,
+            num_expert_group,
+            topk_group,
+            score_mode,
+            bias,
+            renorm,
+            scale,
+        )
 
-    assert y_vals.shape == (n_tokens, n_expts_act)
-    assert y_indx.shape == (n_tokens, n_expts_act)
-    assert y_indx.dtype == torch.int16
-    assert y_vals.dtype == logits.dtype
-
-    _assert_selection_matches(ref_ids, ref_w, y_indx, y_vals)
-    _assert_bitmatrix_matches(bitmatrix, y_indx, n_tokens, n_expts_tot)
-
-
-# --------------------------------------------------------------------------
-# 2. arbitrary (non-contiguous) expert->group mapping
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("n_tokens", [8, 64, 1024])
-@pytest.mark.parametrize(
-    "n_expts_tot, num_expert_group, topk_group, n_expts_act", GROUP_SHAPES
-)
-def test_grouped_topk_arbitrary_group(
-    n_tokens, n_expts_tot, num_expert_group, topk_group, n_expts_act
-):
-    _maybe_skip()
-    device = "cuda"
-    torch.manual_seed(7)
-    logits = init_data(n_tokens, n_expts_tot, device=device, dtype=torch.float32)
-    bias = torch.randn(n_expts_tot, dtype=torch.float32, device=device) * 0.05
-
-    # Equal-size groups but a shuffled (non-contiguous) expert->group table.
-    g_size = n_expts_tot // num_expert_group
-    perm = torch.randperm(n_expts_tot, device=device)
-    expert_group = torch.empty(n_expts_tot, dtype=torch.int32, device=device)
-    for g in range(num_expert_group):
-        expert_group[perm[g * g_size : (g + 1) * g_size]] = g
-
-    score_mode, renorm, scale = "sqrtsoftplus", True, 2.5
-    ref_w, ref_ids = _ref_arbitrary_grouped(
-        logits.clone(),
-        expert_group,
-        n_expts_act,
-        num_expert_group,
-        topk_group,
-        score_mode,
-        bias,
-        renorm,
-        scale,
-    )
     y_vals, y_indx, bitmatrix = grouped_topk(
         logits,
         n_expts_act,
@@ -890,118 +834,14 @@ def test_grouped_topk_arbitrary_group(
         bias=bias,
         renorm=renorm,
         routed_scaling_factor=scale,
-    )
-
-    _assert_selection_matches(ref_ids, ref_w, y_indx, y_vals)
-    _assert_bitmatrix_matches(bitmatrix, y_indx, n_tokens, n_expts_tot)
-
-
-# --------------------------------------------------------------------------
-# 3. end-to-end routing_ds(use_grouped_topk=True)
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("n_tokens", [8, 16, 64, 1024])
-@pytest.mark.parametrize(
-    "n_expts_tot, num_expert_group, topk_group, n_expts_act", GROUP_SHAPES
-)
-def test_routing_ds_grouped(
-    n_tokens, n_expts_tot, num_expert_group, topk_group, n_expts_act
-):
-    _maybe_skip()
-    device = "cuda"
-    torch.manual_seed(2)
-    logits = init_data(n_tokens, n_expts_tot, device=device, dtype=torch.float32)
-    bias = torch.randn(n_expts_tot, dtype=torch.float32, device=device) * 0.05
-    score_mode, renorm, scale = "sqrtsoftplus", True, 2.5
-
-    # routing derives block_m internally; mirror that here for the ref.
-    block_m = _routing_block_m(n_tokens, n_expts_act, n_expts_tot)
-
-    # The selection the kernel makes (deterministic for fixed inputs); used as
-    # ground truth for the sort/scatter pipeline check.
-    y_vals, y_indx, _ = grouped_topk(
-        logits,
-        n_expts_act,
-        num_expert_group=num_expert_group,
-        topk_group=topk_group,
-        score_mode=score_mode,
-        bias=bias,
-        renorm=renorm,
-        routed_scaling_factor=scale,
-    )
-
-    tri_routing_data, tri_gather, tri_scatter = routing(
-        logits,
-        n_expts_act,
-        score_mode=score_mode,
-        bias=bias,
-        renorm=renorm,
-        routed_scaling_factor=scale,
-        use_grouped_topk=True,
-        num_expert_group=num_expert_group,
-        topk_group=topk_group,
-    )
-
-    ref_pack = _sort_and_build_torch(
-        y_vals.float(), y_indx.to(torch.int32), n_expts_tot, block_m
-    )
-    _check_routing_data_bucket(
-        ref_pack, tri_routing_data, tri_gather, tri_scatter, y_vals.float(), y_indx
-    )
-    assert tri_routing_data.n_expts_tot == n_expts_tot
-    assert tri_routing_data.n_expts_act == n_expts_act
-    assert tri_routing_data.block_m == block_m
-
-
-# --------------------------------------------------------------------------
-# 4. fused shared experts (DeepSeek-R1/V3 always-on shared expert)
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("n_tokens", [8, 64, 1024])
-@pytest.mark.parametrize(
-    "n_expts_tot, num_expert_group, topk_group, n_expts_act", GROUP_SHAPES
-)
-@pytest.mark.parametrize("n_shared", [1, 2])
-def test_grouped_topk_shared_expert(
-    n_tokens, n_expts_tot, num_expert_group, topk_group, n_expts_act, n_shared
-):
-    """The kernel appends `n_shared` always-on shared experts (id n_expts_tot+i,
-    weight 1.0) AFTER the routed renorm. The routed portion must still match the
-    reference, and the shared columns + bitmatrix must reflect the append."""
-    _maybe_skip()
-    device = "cuda"
-    torch.manual_seed(2)
-    logits = init_data(n_tokens, n_expts_tot, device=device, dtype=torch.float32)
-    bias = torch.randn(n_expts_tot, dtype=torch.float32, device=device) * 0.05
-    score_mode, renorm, scale = "sqrtsoftplus", True, 2.5
-
-    ref_w, ref_ids = _ref_contiguous(
-        logits.clone(),
-        n_expts_act,
-        num_expert_group,
-        topk_group,
-        score_mode,
-        bias,
-        renorm,
-        scale,
-    )
-    y_vals, y_indx, bitmatrix = grouped_topk(
-        logits,
-        n_expts_act,
-        num_expert_group=num_expert_group,
-        topk_group=topk_group,
-        score_mode=score_mode,
-        bias=bias,
-        renorm=renorm,
-        routed_scaling_factor=scale,
         num_fused_shared_experts=n_shared,
         shared_experts_score=1.0,
     )
 
     assert y_vals.shape == (n_tokens, n_expts_act + n_shared)
     assert y_indx.shape == (n_tokens, n_expts_act + n_shared)
+    assert y_indx.dtype == torch.int16
+    assert y_vals.dtype == logits.dtype
 
     # Routed slots (first n_expts_act) must match the reference selection.
     _assert_selection_matches(
@@ -1015,20 +855,30 @@ def test_grouped_topk_shared_expert(
         assert torch.all(ids_i == n_expts_tot + i), f"shared id col {i}: {ids_i}"
         assert torch.allclose(w_i, torch.ones(n_tokens)), f"shared weight col {i}"
 
-    # Bitmatrix must contain routed + shared selections over the widened width.
     _assert_bitmatrix_matches(bitmatrix, y_indx, n_tokens, n_expts_tot + n_shared)
+
+
+# --------------------------------------------------------------------------
+# 3. end-to-end routing_score_mode(use_grouped_topk=True)
+#
+# Unified with the former test_routing_score_mode_grouped_shared: n_shared in {0,1,2}.
+# grouped_topk (with the same n_shared) is the deterministic ground truth, and
+# _check_routing_data_bucket validates hist / ExptData / inverse-permutation /
+# per-expert (token, weight) multisets over the (widened) gate count.
+# --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("n_tokens", [8, 16, 64, 1024])
 @pytest.mark.parametrize(
     "n_expts_tot, num_expert_group, topk_group, n_expts_act", GROUP_SHAPES
 )
-@pytest.mark.parametrize("n_shared", [1, 2])
-def test_routing_ds_grouped_shared(
+@pytest.mark.parametrize("n_shared", [0, 1, 2])
+def test_routing_score_mode_grouped(
     n_tokens, n_expts_tot, num_expert_group, topk_group, n_expts_act, n_shared
 ):
-    """End-to-end routing with fused shared experts: histogram must
-    include a full shared bucket (n_tokens) per shared expert and the
+    """End-to-end routing(use_grouped_topk=True) with 0/1/2 fused always-on
+    shared experts. The routed selection must match the grouped_topk kernel, the
+    histogram must include a full shared bucket (n_tokens) per shared expert, and
     gather/scatter must form a valid inverse permutation over the widened gate
     count."""
     _maybe_skip()
@@ -1038,7 +888,26 @@ def test_routing_ds_grouped_shared(
     bias = torch.randn(n_expts_tot, dtype=torch.float32, device=device) * 0.05
     score_mode, renorm, scale = "sqrtsoftplus", True, 2.5
 
-    rd, gather, scatter = routing(
+    # routing derives block_m from the raw shape + pre-widening n_expts_act.
+    block_m = _routing_block_m(n_tokens, n_expts_act, n_expts_tot)
+
+    # The selection the kernel makes (deterministic for fixed inputs), including
+    # the appended shared experts; used as ground truth for the sort/scatter
+    # pipeline check.
+    y_vals, y_indx, _ = grouped_topk(
+        logits,
+        n_expts_act,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        score_mode=score_mode,
+        bias=bias,
+        renorm=renorm,
+        routed_scaling_factor=scale,
+        num_fused_shared_experts=n_shared,
+        shared_experts_score=1.0,
+    )
+
+    tri_routing_data, tri_gather, tri_scatter = routing(
         logits,
         n_expts_act,
         score_mode=score_mode,
@@ -1051,17 +920,20 @@ def test_routing_ds_grouped_shared(
         num_fused_shared_experts=n_shared,
     )
 
-    assert rd.n_expts_tot == n_expts_tot + n_shared
-    assert rd.n_expts_act == n_expts_act + n_shared
+    n_total = n_expts_tot + n_shared
+    ref_pack = _sort_and_build_torch(
+        y_vals.float(), y_indx.to(torch.int32), n_total, block_m
+    )
+    _check_routing_data_bucket(
+        ref_pack, tri_routing_data, tri_gather, tri_scatter, y_vals.float(), y_indx
+    )
+    assert tri_routing_data.n_expts_tot == n_total
+    assert tri_routing_data.n_expts_act == n_expts_act + n_shared
+    assert tri_routing_data.block_m == block_m
 
-    # Every token is routed to each shared expert exactly once.
+    # Each fused shared expert is an always-on bucket: every token routed once.
     for i in range(n_shared):
-        assert rd.expt_hist[n_expts_tot + i].item() == n_tokens
-    assert rd.expt_hist.sum().item() == n_tokens * (n_expts_act + n_shared)
-
-    n_gates = n_tokens * (n_expts_act + n_shared)
-    iota = torch.arange(n_gates, dtype=torch.int32, device=gather.device)
-    assert torch.equal(scatter.long()[gather.long()], iota), "scatter[gather[j]] != j"
+        assert tri_routing_data.expt_hist[n_expts_tot + i].item() == n_tokens
 
 
 def bench_routing():
