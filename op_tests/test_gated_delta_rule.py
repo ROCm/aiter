@@ -2,6 +2,9 @@
 
 import os
 
+os.environ.setdefault("AITER_TRITON_ONLY", "1")
+os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -17,10 +20,22 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gati
     fused_sigmoid_gating_delta_rule_update,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
+    IS_AMD,
     IS_INTEL_ALCHEMIST,
     assert_close,
     device,
 )
+
+
+def _is_gfx12_runtime() -> bool:
+    if not IS_AMD:
+        return False
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = getattr(props, "gcnArchName", "")
+        return arch.split(":")[0].startswith("gfx12") if arch else False
+    except Exception:
+        return False
 
 
 def recurrent_gated_delta_rule_ref(
@@ -641,6 +656,114 @@ def test_chunk_opt(
 
 
 @pytest.mark.parametrize(
+    (
+        "B",
+        "T",
+        "H",
+        "D",
+        "scale",
+        "gate_logit_normalizer",
+        "mask_p",
+        "use_qk_l2norm_in_kernel",
+        "dtype",
+    ),
+    [
+        pytest.param(
+            *test,
+            id="hip-B{}-T{}-H{}-D{}-scale{}-gate_logit_normalizer{}-mask_p{}-use_qk_l2norm_in_kernel{}-{}".format(
+                *test
+            ),
+        )
+        for test in [
+            (4, 1024, 4, 128, 0.1, 1, 0, False, torch.bfloat16),
+            (4, 1024, 4, 128, 0.1, 1, 0, True, torch.bfloat16),
+            (2, 1500, 4, 128, 0.1, 10, 0, False, torch.bfloat16),
+            (1, 63, 1, 128, 1, 1, 0, False, torch.bfloat16),
+            (2, 500, 3, 128, 1, 1, 0, False, torch.bfloat16),
+        ]
+    ],
+)
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.float32, id="state_fp32"),
+        pytest.param(torch.bfloat16, id="state_bf16"),
+    ],
+)
+@pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
+@pytest.mark.skipif(
+    _is_gfx12_runtime(),
+    reason="chunk_gated_delta_rule_fwd_h_hip_fn kernel does not support gfx12!",
+)
+def test_chunk_opt_hip(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
+    mask_p: float,
+    use_qk_l2norm_in_kernel: bool,
+    dtype: torch.dtype,
+    state_dtype: torch.dtype,
+):
+    torch.manual_seed(42)
+    if D != 128 or dtype != torch.bfloat16:
+        pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
+
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype)
+    beta = torch.rand(B, T, H, dtype=dtype).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+    g = g / gate_logit_normalizer
+    g = g * (torch.rand_like(g) > mask_p)
+    h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
+    q, k, v, beta, g, h0 = map(
+        lambda x: x.to(device).requires_grad_(True), (q, k, v, beta, g, h0)
+    )
+    initial_state = h0.clone().to(state_dtype).transpose(-1, -2).contiguous()
+
+    tri, tri_ht = chunk_gated_delta_rule_opt_vk(
+        q=(
+            F.normalize(q.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else q.clone()
+        ),
+        k=(
+            F.normalize(k.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else k.clone()
+        ),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_chunk_hip=True,
+        state_dtype=state_dtype,
+    )
+
+    ref, ref_ht = recurrent_gated_delta_rule_ref(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        scale=scale,
+        output_final_state=True,
+        initial_state=h0.clone(),
+    )
+
+    tol = 0.005 if state_dtype == torch.float32 else 0.02
+    assert tri_ht.dtype == state_dtype
+    assert_close("o", ref.float(), tri.float(), tol)
+    assert_close("ht", ref_ht.float(), tri_ht.transpose(-1, -2).float(), tol)
+
+
+@pytest.mark.parametrize(
     ("H", "D", "mask_p", "cu_seqlens", "dtype"),
     [
         pytest.param(*test, id="H{}-D{}-mask_p{}-cu_seqlens{}-{}".format(*test))
@@ -719,6 +842,98 @@ def test_chunk_opt_varlen(
 
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+@pytest.mark.parametrize(
+    ("H", "D", "mask_p", "cu_seqlens", "dtype"),
+    [
+        pytest.param(*test, id="hip-H{}-D{}-mask_p{}-cu_seqlens{}-{}".format(*test))
+        for test in [
+            (4, 128, 0, [0, 15], torch.bfloat16),
+            (4, 128, 0, [0, 256, 500, 1000], torch.bfloat16),
+            (4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16),
+        ]
+    ],
+)
+@pytest.mark.skipif(
+    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
+    reason="Skipping test_chunk_opt_varlen_hip because SKIP_TEST_CHUNK_VARLEN is set",
+)
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.float32, id="state_fp32"),
+        pytest.param(torch.bfloat16, id="state_bf16"),
+    ],
+)
+@pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
+@pytest.mark.skipif(
+    _is_gfx12_runtime(),
+    reason="chunk_gated_delta_rule_fwd_h_hip_fn kernel does not support gfx12!",
+)
+def test_chunk_opt_varlen_hip(
+    H: int,
+    D: int,
+    mask_p: float,
+    cu_seqlens: list[int],
+    dtype: torch.dtype,
+    state_dtype: torch.dtype,
+):
+    if D != 128 or dtype != torch.bfloat16:
+        pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    T = cu_seqlens[-1]
+    N = len(cu_seqlens) - 1
+
+    q = torch.randn((1, T, H, D), dtype=dtype)
+    k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
+    v = torch.randn((1, T, H, D), dtype=dtype)
+    g = F.logsigmoid(torch.rand(1, T, H, dtype=dtype))
+    g = g * (torch.rand_like(g) > mask_p)
+    beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
+    h0 = torch.randn((N, H, D, D), dtype=torch.float32)
+
+    q, k, v, beta, g, h0 = map(
+        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    )
+    initial_state = h0.clone().to(state_dtype).transpose(-1, -2).contiguous()
+
+    tri, tri_ht = chunk_gated_delta_rule_opt_vk(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_chunk_hip=True,
+        state_dtype=state_dtype,
+    )
+
+    ref = []
+    ref_ht = []
+    for i in range(N):
+        ref_i, ref_ht_i = recurrent_gated_delta_rule_ref(
+            q=q[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            k=k[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            v=v[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            beta=beta[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            g=g[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            initial_state=h0[i],
+            output_final_state=True,
+        )
+        ref.append(ref_i)
+        ref_ht.append(ref_ht_i)
+    ref = torch.cat(ref, 1)
+    ref_ht = torch.cat(ref_ht, 0)
+
+    tol = 0.005 if state_dtype == torch.float32 else 0.02
+    assert tri_ht.dtype == state_dtype
+    assert_close("o", ref.float(), tri.float(), tol)
+    assert_close("ht", ref_ht.float(), tri_ht.transpose(-1, -2).float(), tol)
 
 
 @pytest.mark.parametrize(
@@ -903,3 +1118,7 @@ def test_chunk_opt_vk_varlen(
     assert_close("o", ref, tri, 0.005)
     # ref_ht is [N, H, K, V], tri_ht is [N, H, V, K]
     assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

@@ -1798,7 +1798,23 @@ namespace py = pybind11;
           py::arg("v_scale"),                                   \
           py::arg("max_tokens_per_batch") = 0);                 \
     m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);                  \
-    m.def("fused_qk_norm_rope_1way", &aiter::fused_qk_norm_rope_1way);
+    m.def("fused_qk_norm_rope_1way", &aiter::fused_qk_norm_rope_1way);                  \
+    m.def("fused_qk_norm_rope_2way_fp8_perhead_quant",                                  \
+          &aiter::fused_qk_norm_rope_2way_fp8_perhead_quant,                            \
+          py::arg("q0"), py::arg("k0"), py::arg("q1"), py::arg("k1"),                   \
+          py::arg("w_q0"), py::arg("w_k0"), py::arg("w_q1"), py::arg("w_k1"),           \
+          py::arg("cos_sin0"), py::arg("cos_sin1"),                                     \
+          py::arg("batch_size"), py::arg("num_tokens0"), py::arg("num_tokens1"),        \
+          py::arg("num_heads_q"), py::arg("num_heads_k"), py::arg("head_size"),         \
+          py::arg("is_interleaved"), py::arg("eps"),                                    \
+          py::arg("q_fp8"), py::arg("k_fp8"), py::arg("q_descale"), py::arg("k_descale"), \
+          py::arg("q_unquantized"), py::arg("k_unquantized"));                            \
+    m.def("v_2way_per_head_fp8_quant",                                                    \
+          &aiter::v_2way_per_head_fp8_quant,                                              \
+          py::arg("v0"),                                                                  \
+          py::arg("v1"),                                                                  \
+          py::arg("v_fp8"),                                                               \
+          py::arg("v_descale"));
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
@@ -2112,6 +2128,28 @@ namespace py = pybind11;
           py::arg("cache_seqlens")      = torch::Tensor(),                     \
           py::arg("conv_state_indices") = torch::Tensor(),                     \
           py::arg("pad_slot_id")        = -1);
+
+#define CHUNK_GDR_FWD_H_PYBIND                                              \
+    m.def("chunk_gated_delta_rule_fwd_h_hip",                               \
+          &aiter::chunk_gated_delta_rule_fwd_h_hip,                         \
+          "chunk_gated_delta_rule_fwd_h (HIP)",                             \
+          py::arg("k"),                                                     \
+          py::arg("w"),                                                     \
+          py::arg("u"),                                                     \
+          py::arg("g"),                                                     \
+          py::arg("gk"),                                                    \
+          py::arg("initial_state"),                                         \
+          py::arg("cu_seqlens"),                                            \
+          py::arg("chunk_offsets"),                                         \
+          py::arg("h"),                                                     \
+          py::arg("v_new"),                                                 \
+          py::arg("final_state"),                                           \
+          py::arg("selected_bv"),                                           \
+          py::arg("has_initial_state"),                                     \
+          py::arg("output_final_state"),                                    \
+          py::arg("save_new_value"),                                        \
+          py::arg("use_exp2"),                                              \
+          py::arg("g_head_major") = false);
 
 #define FUSED_SPLIT_GDR_UPDATE_PYBIND                                 \
     m.def("fused_split_gdr_update",                                   \

@@ -1,26 +1,22 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-// opus_gemm.cu is the host-side dispatcher (lookup table + heuristic
-// fallback). It contains no __global__ functions and no `<<<>>>` launches,
-// so the device pass has nothing to codegen but still pays the full
-// libtorch + HIP runtime + opus.hpp parse (~15s/TU). Skipping the entire
-// translation unit on the device pass makes it essentially free, saving
-// a second-bottleneck TU's worth of wall time on every rebuild.
-//
-// Host pass is also torch-free now: the entry points take aiter_tensor_t
-// (POD, defined in csrc/include/aiter_tensor.h) instead of torch::Tensor,
-// mirroring the refactor in PR #2932 (csrc/kernels/quant_kernels.cu).
-// Eliminating <torch/all.h> + <ATen/...> from this TU drops its host-pass
-// preprocessed lines from ~440K to ~110K, which feeds straight into a
-// shorter critical path in the fused codegen layout (see
-// aiter/ops/opus/README.md §7.6).
+// Host-side dispatcher (lookup table + heuristic).
 #ifndef __HIP_DEVICE_COMPILE__
 
 #include "opus_gemm_arch.cuh"                      // OpusGfxArch + opus_get_arch_info / opus_get_gfx_arch
+#include "opus_build_archs.h"                      // OPUS_BUILD_HAS_GFX942 / OPUS_BUILD_HAS_GFX950
+// gfx950 dispatcher always included (carries OpusA16W16NoscaleKernel typedef +
+// a8w8 launchers used unconditionally below); a8w8 is gfx950-only today.
 #include "gfx950/opus_gemm_arch_gfx950.cuh"        // opus_dispatch_a16w16_gfx950<T> / opus_a16w16_tune_dispatch_gfx950<T>
+#ifdef OPUS_BUILD_HAS_GFX942
+#include "gfx942/opus_gemm_arch_gfx942.cuh"        // opus_dispatch_a16w16_gfx942<T> / opus_a16w16_tune_dispatch_gfx942<T>
+#endif
 #include "opus_gemm_common.cuh"
 #include "gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh"  // OpusA16W16NoscaleKernel
+#ifdef OPUS_BUILD_HAS_GFX942
+#include "gfx942/opus_gemm_heuristic_dispatch_gfx942.cuh"
+#endif
 #include "opus_gemm_manifest.h"                    // a8w8 launcher symbols
 #include "opus_gemm_utils.cuh"                     // bf16_t / fp32_t
 #include "aiter_stream.h"                          // aiter::getCurrentHIPStream
@@ -29,17 +25,8 @@
 #include <optional>
 #include <unordered_map>
 
-// ── a8w8 / a8w8_scale launcher signatures ───────────────────────────────────
-//
-// a8w8 paths bypass the arch-routed dispatcher because there's currently a
-// single hardcoded launcher per dtype (no tuned lookup table). The fp8 entry
-// in opus_gemm() guards them with an explicit gfx950 AITER_CHECK so callers
-// on other archs see the same "pipeline TBD" error as the bf16 path.
-//
-// Plain function pointers (was: `std::function<...>`). Same rationale as
-// OpusA16W16NoscaleKernel: every callable stored here is one of the
-// explicit launcher template instantiations, no captures, so std::function's
-// type-erasure overhead and template instantiation cost are pure waste.
+// a8w8 / a8w8_scale: single hardcoded launcher per dtype (no tuned table).
+// Plain fn ptrs; std::function's type-erasure is pure waste here.
 using OpusScaleKernel = void (*)(
     aiter_tensor_t &, aiter_tensor_t &,
     aiter_tensor_t &,
@@ -61,13 +48,7 @@ OpusNoscaleKernel opus_dispatch_a8w8(int M, int N, int K)
   return opus_gemm_512x256x256x128_2x4_16x16x128_0x0x0<CDataType>;
 }
 
-// ── a16w16 arch routers ─────────────────────────────────────────────────────
-//
-// Both routers share the same shape: switch on opus_get_gfx_arch() and
-// dispatch to the per-arch dispatch function for that arch. Adding a new
-// arch is local to opus_gemm_arch.cuh + a new opus_gemm_arch_<arch>.cuh +
-// one extra `case` in each router below.
-
+// a16w16 arch routers: switch on opus_get_gfx_arch() to per-arch dispatch.
 template <typename CDataType>
 OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch, bool has_bias = false)
 {
@@ -75,7 +56,10 @@ OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch, boo
   {
     case OpusGfxArch::Gfx950:
       return opus_dispatch_a16w16_gfx950<CDataType>(M, N, K, batch, has_bias);
-    // future: case OpusGfxArch::Gfx942: return opus_dispatch_a16w16_gfx942<CDataType>(M, N, K, batch, has_bias);
+#ifdef OPUS_BUILD_HAS_GFX942
+    case OpusGfxArch::Gfx942:
+      return opus_dispatch_a16w16_gfx942<CDataType>(M, N, K, batch, has_bias);
+#endif
     default:
     {
       const auto &info = opus_get_arch_info();
@@ -97,7 +81,10 @@ opus_a16w16_tune_dispatch(int id)
   {
     case OpusGfxArch::Gfx950:
       return opus_a16w16_tune_dispatch_gfx950<CDataType>(id);
-    // future: case OpusGfxArch::Gfx942: return opus_a16w16_tune_dispatch_gfx942<CDataType>(id);
+#ifdef OPUS_BUILD_HAS_GFX942
+    case OpusGfxArch::Gfx942:
+      return opus_a16w16_tune_dispatch_gfx942<CDataType>(id);
+#endif
     default:
     {
       const auto &info = opus_get_arch_info();
@@ -133,10 +120,8 @@ void opus_gemm(
 
   if (XQ.dtype() == AITER_DTYPE_fp8)
   {
-    // a8w8 / a8w8_scale launchers are gfx950-only today and don't yet flow
-    // through the arch-routed dispatcher (they pick a single hardcoded
-    // launcher). Guard the entry explicitly so non-gfx950 callers see the
-    // same "pipeline TBD for this arch" message as the bf16 path.
+    // a8w8 / a8w8_scale launchers are gfx950-only today and don't yet flow through the arch-routed
+    // dispatcher (they pick a single har...
     const auto &arch_info = opus_get_arch_info();
     AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx950,
                 "opus_gemm: a8w8 path is only implemented for gfx950 today; "
@@ -162,19 +147,7 @@ void opus_gemm(
   }
   else if (XQ.dtype() == AITER_DTYPE_bf16)
   {
-    // Two-level dispatch: tuned CSV lookup (baked in at JIT time) first,
-    // heuristic if-else tree on miss. splitK is passed 0; splitk kids
-    // auto-clamp to pfk anyway so no extra information is needed at this
-    // entry point. Kernels that ignore splitK (a16w16 / flatmm) just
-    // drop it.
-    //
-    // Bias routing
-    // ------------
-    // bias is forwarded to whichever launcher the lookup / heuristic
-    // picks. The lookup map only contains bias-aware kids today
-    // (a16w16_flatmm_kernels_list is empty -- see opus_gemm_common.py;
-    // only split-barrier 4..9 and a16w16_flatmm_splitk 200..299 ever
-    // appear), so a non-empty bias is always safe at this entry.
+    // Tuned-lookup-then-heuristic dispatch. splitK=0 = "launcher decides".
     int batch = XQ.size(0);
     const bool has_bias = bias.has_value();
     if (Y.dtype() == AITER_DTYPE_bf16)
@@ -196,30 +169,17 @@ void opus_gemm(
   }
 }
 
-// ── opus_gemm_a16w16_tune() — id-based tune entry ───────────────────────────
-//
-// Launcher signature is 4-arg (XQ, WQ, Y, int splitK); all three a16w16-family
-// kernels populate the same tune lookup map:
-//   * split-barrier a16w16 (kids 4..9)      - ignores splitK
-//   * a16w16_flatmm      (kids 100..115)    - ignores splitK
-//   * a16w16_flatmm_splitk (kids 200..210)  - interprets splitK as literal KBatch
-//
-// splitk kids require D_C=fp32 (main kernel writes an fp32 workspace; the
-// reduce kernel D_OUT is templated on Y.dtype() and chosen at launch time),
-// so the dispatcher forces the <fp32_t> branch for kids >= 200 regardless of
-// Y dtype. Both bf16 and fp32 Y are valid.
+// opus_gemm_a16w16_tune() — id-based tune entry.
 
-// splitk kids live in [200, 300) with non-OOB variants at [1200, 1300).
+// splitk kids: gfx950 [200,300) + nooob [1200,1300); gfx942 [50200, 50400).
 static constexpr int OPUS_SPLITK_KID_MIN = 200;
 static constexpr int OPUS_SPLITK_KID_MAX = 300;
-// Split-barrier a16w16 kids live in [4, 10) with non-OOB variants at [1004, 1010).
-// Cpol variants (3 cache-policy groups) live at +2000/+3000/+4000 offsets.
+static constexpr int OPUS_GFX942_KID_OFFSET = 50000;
+static constexpr int OPUS_GFX942_SPLITK_KID_MAX = 400;
+// SB a16w16 kids: gfx950 [4,10) + mirrors at +1000/.../+7000.
 static constexpr int OPUS_A16W16_SB_KID_MIN = 4;
 static constexpr int OPUS_A16W16_SB_KID_MAX = 10;
 // Persistent a16w16 kids: compact [300, 316) = 4 tiles × 4 cpol groups.
-// Nooob mirrors at +1000 = [1300, 1316). See opus_gemm_common.py
-// :: a16w16_persistent_kernels_list / _cpol / _nooob / _cpol_nooob
-// for the per-kid (tile, cpol) layout.
 static constexpr int OPUS_PERSISTENT_KID_MIN = 300;
 static constexpr int OPUS_PERSISTENT_KID_MAX = 316;
 // Mono-tile a16w16 kids: [1400, 1500). Mono-tile is intrinsically non-OOB
@@ -235,20 +195,14 @@ static inline bool opus_kid_is_splitk(int kid)
 {
   return (kid >= OPUS_SPLITK_KID_MIN && kid < OPUS_SPLITK_KID_MAX) ||
          (kid >= OPUS_SPLITK_KID_MIN + OPUS_NOOOB_KID_OFFSET &&
-          kid < OPUS_SPLITK_KID_MAX + OPUS_NOOOB_KID_OFFSET);
+          kid < OPUS_SPLITK_KID_MAX + OPUS_NOOOB_KID_OFFSET) ||
+         (kid >= OPUS_SPLITK_KID_MIN + OPUS_GFX942_KID_OFFSET &&
+          kid < OPUS_GFX942_SPLITK_KID_MAX + OPUS_GFX942_KID_OFFSET);
 }
 
 static inline bool opus_kid_is_a16w16_sb(int kid)
 {
-  // Split-barrier a16w16 kid layout (see opus_gemm_common.py):
-  //   base legacy:        [4, 10)
-  //   nooob mirror:       [1004, 1010)
-  //   cpol Mheavy:        [2004, 2010)
-  //   cpol Nheavy:        [3004, 3010)
-  //   cpol balanced:      [4004, 4010)
-  //   cpol Mheavy nooob:  [5004, 5010)
-  //   cpol Nheavy nooob:  [6004, 6010)
-  //   cpol balanced nooob:[7004, 7010)
+  // SB a16w16 kid bases: 0/1000/2000/.../7000 + [4,10) (cpol mirrors).
   for (int base : {0, 1000, 2000, 3000, 4000, 5000, 6000, 7000})
   {
     if (kid >= base + OPUS_A16W16_SB_KID_MIN && kid < base + OPUS_A16W16_SB_KID_MAX)
@@ -270,11 +224,20 @@ static inline bool opus_kid_is_mono_tile(int kid)
   return kid >= OPUS_MONO_TILE_KID_MIN && kid < OPUS_MONO_TILE_KID_MAX;
 }
 
+static inline bool opus_kid_is_gfx942_splitk(int kid)
+{
+  return kid >= OPUS_SPLITK_KID_MIN + OPUS_GFX942_KID_OFFSET &&
+         kid < OPUS_GFX942_SPLITK_KID_MAX + OPUS_GFX942_KID_OFFSET;
+}
+
 static inline bool opus_kid_supports_bias(int kid)
 {
   // persistent and mono-tile do not support bias (kargs lacks
   // ptr_bias/stride_bias_batch; launchers reject non-empty bias up front).
-  return opus_kid_is_a16w16_sb(kid) || opus_kid_is_splitk(kid);
+  // gfx942 splitk/SB silently ignored bias; exclude explicitly to surface
+  // misuse as a clear error.
+  return (opus_kid_is_a16w16_sb(kid) || opus_kid_is_splitk(kid))
+         && !opus_kid_is_gfx942_splitk(kid);
 }
 
 void opus_gemm_a16w16_tune(
@@ -290,9 +253,7 @@ void opus_gemm_a16w16_tune(
   AITER_CHECK(Y.dim() == 3, "Y must be 3D [batch, M, N]");
   AITER_CHECK(XQ.dtype() == WQ.dtype(),
               "XQ and WQ should have the same dtype!");
-  // Gate non-bias-capable kids early. The launcher itself will also do the
-  // detailed shape/dtype check on a non-empty bias; this guard just gives a
-  // clear "wrong kid" error before we even enter the launcher.
+  // Early-gate non-bias-capable kids for a clean error before launcher entry.
   AITER_CHECK(!bias.has_value() || opus_kid_supports_bias(kernelId),
               "opus_gemm_a16w16_tune: bias is currently only supported on "
               "a16w16 split-barrier kids [", OPUS_A16W16_SB_KID_MIN, ", ",
@@ -302,9 +263,8 @@ void opus_gemm_a16w16_tune(
 
   if (XQ.dtype() == AITER_DTYPE_bf16)
   {
-    // splitk kids force <fp32_t> because traits static_assert D_C=float.
-    // Y can be bf16 or fp32 -- the launcher dispatches the reduce kernel
-    // on Y.dtype() at runtime.
+    // splitk kids force <fp32_t> (traits static_assert D_C=float); Y can be
+    // bf16 or fp32, the reduce kernel dispatches on Y.dtype() at runtime.
     if (opus_kid_is_splitk(kernelId))
     {
       AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
