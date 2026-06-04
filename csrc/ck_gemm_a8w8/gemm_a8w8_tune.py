@@ -8,7 +8,11 @@ import torch.nn.functional as F
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8
 from aiter.utility.base_tuner import GemmCommonTuner
-from gemm_a8w8_common import kernels_list, kernels_list_cktile
+from gemm_a8w8_common import (
+    kernels_list,
+    kernels_list_cktile,
+    BLOCK_PER_CU_MAX,
+)
 from aiter.utility.mp_tuner import mp_tuner
 
 
@@ -105,9 +109,11 @@ def run_gemm_a8w8(x, weight, x_scale, w_scale, out, kernelId, splitK):
     aiter.gemm_a8w8_tune(x, weight, x_scale, w_scale, out, kernelId, splitK)
     return out
 
+
 def run_gemm_a8w8_cktile(x, weight, x_scale, w_scale, out, kernelId, splitK):
     aiter.gemm_a8w8_cktile_tune(x, weight, x_scale, w_scale, out, kernelId, splitK)
     return out
+
 
 class GemmA8W8Tuner(GemmCommonTuner):
     ARG_DEFAULTS = {
@@ -120,11 +126,127 @@ class GemmA8W8Tuner(GemmCommonTuner):
         "config_env_name": "AITER_CONFIG_GEMM_A8W8",
     }
 
-    # TODO: correct
-    def getKernelName(self, kernelId):
-        if kernelId >= len(kernels_list) or kernelId < 0:
+    def getKernelName(self, kernelId, libType): # ="ck"
+        """
+        Get the kernel name based on the kernel ID for different types.
+        """
+        kernels = []
+        if libType == "ck":
+            kernels = kernels_list
+        elif libType == "cktile":
+            kernels = kernels_list_cktile
+        else:
             return None
-        return kernels_list[kernelId].name
+
+        if kernelId >= len(kernels) or kernelId < 0:
+            return None
+        return kernels[kernelId].name
+
+    def get_gemm_a8w8_ck_tune_task(
+        self,
+        info_keys,
+        useSplitK,
+        seed,
+        run_kwargs,
+    ):
+        gfx, cu_num, M, N, K, q_dtype_w = info_keys
+
+        gemm_keys = ["x", "weight", "x_scale", "w_scale", "out"]
+        ref_keys = ["x", "weight", "x_scale", "w_scale"]
+        tasks_ck = []
+
+        for j, kernel in enumerate(kernels_list):
+            maxsplitK = (
+                aiter.compute_gemm_SplitK(
+                    M,
+                    N,
+                    K,
+                    kernel.MPerBLOCK,
+                    kernel.NPerBLOCK,
+                    kernel.KPerBLOCK,
+                )
+                if useSplitK
+                else 0
+            )
+            for splitK in range(maxsplitK + 1):
+                info = (info_keys, j, splitK, "", "ck")
+                tasks_ck.append(
+                    (
+                        info,
+                        generate_data,
+                        (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
+                        run_gemm_a8w8,
+                        (gemm_keys, j, splitK),
+                        run_kwargs,
+                        gemm_a8w8_ref,
+                        (ref_keys, dtypes.bf16, eval(q_dtype_w)),
+                        {},
+                        None,
+                        1e-2,
+                        1e-2,
+                        None,
+                        None,
+                        ("out",),
+                    )
+                )
+        return tasks_ck
+
+
+    def get_gemm_a8w8_cktile_tune_task(
+        self,
+        info_keys,
+        useSplitK,
+        seed,
+        block_per_cu,
+        run_kwargs,
+    ):
+        gfx, cu_num, M, N, K, q_dtype_w = info_keys
+        kernel_list = {
+            k: v
+            for k, v in kernels_list_cktile.items()
+            if v.BlockPerCu in block_per_cu
+        }
+
+        gemm_keys = ["x", "weight", "x_scale", "w_scale", "out"]
+        ref_keys = ["x", "weight", "x_scale", "w_scale"]
+        tasks_cktile = []
+
+        for j, kernel in enumerate(kernel_list):
+            maxsplitK = (
+                aiter.compute_gemm_SplitK(
+                    M,
+                    N,
+                    K,
+                    kernel.MPerBLOCK,
+                    kernel.NPerBLOCK,
+                    kernel.KPerBLOCK,
+                )
+                if useSplitK
+                else 0
+            )
+            for splitK in range(maxsplitK + 1):
+                info = (info_keys, j, splitK, "", "cktile")
+                tasks_cktile.append(
+                    (
+                        info,
+                        generate_data,
+                        (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
+                        run_gemm_a8w8_cktile,
+                        (gemm_keys, j, splitK),
+                        run_kwargs,
+                        gemm_a8w8_ref,
+                        (ref_keys, dtypes.bf16, eval(q_dtype_w)),
+                        {},
+                        None,
+                        1e-2,
+                        1e-2,
+                        None,
+                        None,
+                        ("out",),
+                    )
+                )
+        return tasks_cktile
+
 
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op
@@ -134,7 +256,26 @@ class GemmA8W8Tuner(GemmCommonTuner):
         _op._GEMM_QUANT_TYPE_HAS_GFX.clear()
 
     def _setup_specific_arguments(self):
-        pass
+        """
+        Setup specific arguments for the tuner.
+        """
+
+        self.parser.add_argument(
+            "--libtype",
+            type=str,
+            default="all",
+            choices=["ck", "cktile", "all", "both"],
+            required=False,
+            help="CK gemm a8w8 type to tune: ck, cktile, both or all (covers all supported backends across standard/preshuffleB modes)",
+        )
+
+        self.parser.add_argument(
+            "--blockPerCu",
+            nargs="+",
+            type=int,
+            default=list(range(1, BLOCK_PER_CU_MAX + 1)),
+            help="List of BlockPerCu values to tune (CKTile only)",
+        )
 
     def calculate(self, results, bpes=(1, 1, 2)):
         return super().calculate(results, bpes=(1, 1, 2))
@@ -208,13 +349,16 @@ class GemmA8W8Tuner(GemmCommonTuner):
         mp_num = args.mp
         shape_grouped = args.shape_grouped
         errRatio = args.errRatio
+        block_per_cu = args.blockPerCu
         cu_num = self.get_cu_num()
         gfx = self.get_gfx()
 
         task = []
+        run_kwargs = {
+            "num_warmup": args.warmup,
+            "num_iters": args.iters,
+        }
         tasks_data = []
-        gemm_keys = ["x", "weight", "x_scale", "w_scale", "out"]
-        ref_keys = ["x", "weight", "x_scale", "w_scale"]
         seed = 0
 
         for i in range(len(untunedf)):
@@ -222,94 +366,32 @@ class GemmA8W8Tuner(GemmCommonTuner):
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
             q_dtype_w = untunedf.loc[i, "q_dtype_w"]
-
-            kernels_num = 0 # len(kernels_list)
-            total_kernel_nums = 0
             info_keys = (gfx, cu_num, M, N, K, q_dtype_w)
+            prev_task_count = len(task)
 
-            for j in range(kernels_num):
-                kernel = kernels_list[j]
-                maxsplitK = (
-                    aiter.compute_gemm_SplitK(
-                        M,
-                        N,
-                        K,
-                        kernel.MPerBLOCK,
-                        kernel.NPerBLOCK,
-                        kernel.KPerBLOCK,
+            lib = args.libtype
+            if lib in ("ck", "both", "all"):
+                task.extend(
+                    self.get_gemm_a8w8_ck_tune_task(
+                        info_keys,
+                        useSplitK,
+                        seed,
+                        run_kwargs,
                     )
-                    if useSplitK
-                    else 0
                 )
-                for splitK in range(maxsplitK + 1):
-                    info = (info_keys, j, splitK, "")
-                    task.append(
-                        (
-                            info,
-                            generate_data,
-                            (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
-                            run_gemm_a8w8,
-                            (gemm_keys, j, splitK),
-                            {
-                                "num_warmup": args.warmup,
-                                "num_iters": args.iters,
-                            },
-                            gemm_a8w8_ref,
-                            (ref_keys, dtypes.bf16, eval(q_dtype_w)),
-                            {},
-                            None,
-                            1e-2,
-                            1e-2,
-                            None,
-                            None,
-                            ("out",),
-                        )
+            if lib in ("cktile", "both", "all"):
+                task.extend(
+                    self.get_gemm_a8w8_cktile_tune_task(
+                        info_keys,
+                        useSplitK,
+                        seed,
+                        block_per_cu,
+                        run_kwargs,
                     )
-                    total_kernel_nums = total_kernel_nums + 1
-
-            kernels_num = len(kernels_list_cktile)
-            for j in range(kernels_num):
-                kernel = kernels_list_cktile[j]
-                maxsplitK = (
-                    aiter.compute_gemm_SplitK(
-                        M,
-                        N,
-                        K,
-                        kernel.MPerBLOCK,
-                        kernel.NPerBLOCK,
-                        kernel.KPerBLOCK,
-                    )
-                    if useSplitK
-                    else 0
                 )
-                for splitK in range(maxsplitK + 1):
-                    info = (info_keys, j, splitK, "")
-                    task.append(
-                        (
-                            info,
-                            generate_data,
-                            (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
-                            run_gemm_a8w8_cktile,
-                            (gemm_keys, j, splitK),
-                            {
-                                "num_warmup": args.warmup,
-                                "num_iters": args.iters,
-                            },
-                            gemm_a8w8_ref,
-                            (ref_keys, dtypes.bf16, eval(q_dtype_w)),
-                            {},
-                            None,
-                            1e-2,
-                            1e-2,
-                            None,
-                            None,
-                            ("out",),
-                        )
-                    )
-                    total_kernel_nums = total_kernel_nums + 1
 
-            tasks_data.append((total_kernel_nums, ()))
-
+            shape_kernel_nums = len(task) - prev_task_count
+            tasks_data.append((shape_kernel_nums, ()))
         ret = []
         if task:
             ret = mp_tuner(
@@ -324,12 +406,60 @@ class GemmA8W8Tuner(GemmCommonTuner):
             )
         return ret
 
+    def result_to_df(self, results):
+        """
+        post-process the tuning results into a DataFrame.
+        """
+
+        resultdf = pd.DataFrame(columns=self.columns)
+        for el in results:
+            print(el)
+            info, time, err_ratio = el
+            keys, kernelId, splitK, kernelName, libtype = info
+            kernelName = (
+                "None"
+                if time == self.INVALID_TIME or time == self.INF_TIME
+                else (
+                    self.getKernelName(kernelId, libtype)
+                    if kernelName == ""
+                    else kernelName
+                )
+            )
+            tflops, bw = self.calculate(el)
+            key_dict = dict(zip(self.keys, keys))
+
+            if len(results) == self.topk:
+                print(
+                    f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} "
+                    f"{kernelName} splitK={splitK}, {time}us, err_ratio={err_ratio}, "
+                    f"tflops={tflops} TFLOPS, bw={bw} GB/s"
+                )
+            key_dict.update(
+                {
+                    "libtype": [libtype],
+                    "kernelId": [kernelId],
+                    "splitK": [splitK],
+                    "us": [time],
+                    "kernelName": [kernelName],
+                    "errRatio": [err_ratio],
+                    "tflops": [tflops],
+                    "bw": [bw],
+                }
+            )
+            temp = pd.DataFrame(key_dict)
+            if resultdf.empty:
+                resultdf = temp
+            else:
+                resultdf = pd.concat([resultdf, temp], ignore_index=True)
+        return resultdf
+
 
 if __name__ == "__main__":
 
     ## use default key and resultList with q_dtype_w support
     key = ["gfx", "cu_num", "M", "N", "K", "q_dtype_w"]
     resultList = [
+        "libtype",
         "kernelId",
         "splitK",
         "us",

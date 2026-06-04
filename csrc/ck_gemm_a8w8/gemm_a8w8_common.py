@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
 
 
@@ -129,6 +129,9 @@ class tileKernelInstance:
         if self.AQRowMajor:
             parts.append("aqrm")
         return "_".join(parts)
+
+
+BLOCK_PER_CU_MAX = 4
 
 
 # fmt: off
