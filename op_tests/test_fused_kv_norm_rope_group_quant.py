@@ -21,10 +21,15 @@ NOTE: the wrapper currently issues a dummy bf16 Q wave alongside the K wave
 (see ``aiter/ops/fused_qk_norm_rope_cache_quant.py::fused_kv_norm_rope_group_quant``),
 so reported us / GB-s include that overhead until a true K-only kernel lands.
 
+By default sweeps every (head_dim, rot_dim, group_size) shape the K-only kernel
+supports (KV_KERNEL_SUPPORTED_SHAPES, mirrors KV_K_ONLY_DISPATCH_TABLE on the
+C++ side); pass --D/--RD/--G to pin a single shape.
+
 Usage::
 
     python op_tests/test_fused_kv_norm_rope_group_quant.py
     python op_tests/test_fused_kv_norm_rope_group_quant.py -T 64 256 1024
+    python op_tests/test_fused_kv_norm_rope_group_quant.py --D 192 --RD 64
     python op_tests/test_fused_kv_norm_rope_group_quant.py --neox
 """
 
@@ -209,6 +214,9 @@ def test_fused_kv_norm_rope_group_quant(T, D, RD, *, is_neox, G):
     gbps = (bytes_in + bytes_out) / (us * 1e-6) / 1e9
 
     return {
+        "D": D,
+        "RD": RD,
+        "G": G,
         "hip_us": round(us, 3),
         "GB/s": round(gbps, 0),
         "%peak": round(gbps / _PEAK_BW_GBPS * 100, 1),
@@ -233,8 +241,18 @@ parser.add_argument(
     default=[4, 16, 64, 256, 1024, 4096, 16384],
     help="token-count sweep. e.g. -T 4 64 1024",
 )
-parser.add_argument("--D", type=int, default=512, help="head_dim (kernel MVP: 512)")
-parser.add_argument("--RD", type=int, default=64, help="rope_head_dim (RoPE tail size)")
+parser.add_argument(
+    "--D",
+    type=int,
+    default=None,
+    help="head_dim override (single shape). Default: sweep all supported shapes.",
+)
+parser.add_argument(
+    "--RD", type=int, default=None, help="rope_head_dim override (used with --D)."
+)
+parser.add_argument(
+    "--G", type=int, default=None, help="group_size override (used with --D)."
+)
 parser.add_argument(
     "--neox", action="store_true", help="also sweep is_neox=True (default: GPT-J only)."
 )
@@ -242,18 +260,32 @@ args = parser.parse_args()
 
 neox_modes = [False, True] if args.neox else [False]
 
+# (head_dim, rot_dim, group_size) shapes the K-only kernel supports today; mirrors
+# KV_K_ONLY_DISPATCH_TABLE in csrc/kernels/fused_qk_norm_rope_cache_quant.cu.
+KV_KERNEL_SUPPORTED_SHAPES = (
+    (512, 64, 64),  # DeepSeek V4-Pro (default)
+    (192, 64, 64),  # DeepSeek V2 / V3 MLA
+    (384, 128, 64),  # head_dim=384, rope=128 (Qwen-style)
+)
+
+if args.D is not None:
+    shapes = [(args.D, args.RD or 64, args.G or 64)]
+else:
+    shapes = list(KV_KERNEL_SUPPORTED_SHAPES)
+
 rows = []
 for neox in neox_modes:
-    for T in args.T:
-        rows.append(
-            test_fused_kv_norm_rope_group_quant(
-                T,
-                args.D,
-                args.RD,
-                is_neox=neox,
-                G=64,
+    for D, RD, G in shapes:
+        for T in args.T:
+            rows.append(
+                test_fused_kv_norm_rope_group_quant(
+                    T,
+                    D,
+                    RD,
+                    is_neox=neox,
+                    G=G,
+                )
             )
-        )
 
 df = pd.DataFrame(rows)
 aiter.logger.info(
