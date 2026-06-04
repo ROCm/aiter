@@ -248,14 +248,98 @@ def _select_bv_for_grid(*, H: int, V: int, N: int, target_ctas: int) -> int:
 
 
 def _target_bv_for_shape(
-    *, H: int, Hg: int, T_flat: int, N: int, is_varlen: bool
+    *, H: int, Hg: int, T_flat: int, N: int, is_varlen: bool,
+    min_seqlen: int | None = None,
 ) -> int | None:
-    """Return the calibrated BV regime before legality/grid adjustment."""
+    """Return the calibrated BV regime before legality/grid adjustment.
+
+    Calibration scope (gfx950, V=128, BT=64, is_varlen=True):
+      * H==32, Hg==16  : N in {2, 3} swept on T_flat in [2000, 25000].
+        Outside that (T_flat, N) cube the rule deliberately returns
+        ``None`` so the grid-fill default applies -- matches the
+        pre-20260604 behavior. The N=2 / N=3 carve-outs are the only
+        new behavior; everything else is preserved exactly.
+      * H==16          : 32k-context many-seq carve-out (unchanged).
+
+    Args:
+        min_seqlen: smallest segment length in the (varlen) batch, i.e.
+            ``min(cu_seqlens[1:] - cu_seqlens[:-1])``. Optional; some
+            sub-rules (e.g. the N=2 "balanced-split" carve-out below)
+            need this to distinguish "head ~= T/2" from "head << T".
+            When None, those sub-rules fall through to the previous
+            T_flat-only logic.
+
+    If you extend this rule, please keep:
+      (a) every return statement guarded by an explicit T_flat range
+          you actually measured;
+      (b) the "no data -> return None" fallthrough at the end of each
+          branch so untested combos can't silently regress.
+    """
     if is_varlen and H == 32 and Hg == 16:
-        if N == 2 and 11000 <= T_flat < 15000:
-            return 16
-        if N == 3 and not (10000 <= T_flat < 12000 or 20000 <= T_flat < 25000):
-            return 64
+        if N == 2:
+            # Calibrated range: T_flat in [2000, 25000]. Two flips
+            # measured on H=32/Hg=16/V=128/gfx950 (notes:
+            # _bv_sweep_n2_20260604):
+            #   T_flat <  8000 : BV=32 (grid 256, exactly one wave)
+            #   8000 <= T_flat < 12000 : BV=16
+            #   12000 <= T_flat < 13000 : BV=32 (narrow tail-fit window)
+            #   13000 <= T_flat <= 25000 : BV=16
+            # T_flat outside [2000, 25000] is NOT covered; fall through.
+            #
+            # Balanced-split carve-out (bench20260604_051030, n=2 T~16k
+            # cluster, 134 cases): when both segments are roughly
+            # balanced (min_seqlen >= 6300), BV=32 wins by 17-76us per
+            # case across T_flat in [12000, 20000]. The earlier
+            # T_flat-only rule misses this because it assumed n=2 with
+            # T>=13000 was always "long single-segment dominant"; large
+            # min_seqlen indicates the opposite (two comparable runs).
+            # The (T_flat, min_seqlen) window was sweep-validated to
+            # avoid any regression vs the T_flat-only rule on 44
+            # measured (T_flat, head) points (notes: _bv_sweep_n2_balanced).
+            if (
+                12000 <= T_flat <= 20000
+                and min_seqlen is not None
+                and min_seqlen >= 6300
+            ):
+                return 32
+            if 2000 <= T_flat <= 25000:
+                if T_flat < 8000:
+                    return 32
+                if 12000 <= T_flat < 13000:
+                    return 32
+                return 16
+            # else: untested range, fall through to default
+        elif N == 3:
+            # Calibrated range: T_flat in [8000, 30000]. Across this
+            # whole range BV=32 (grid=N*H*ceil(V/32) = 384, ~1.5 waves
+            # on 256 CUs) measured 22-95us faster than the prior BV=64
+            # / grid-fill choice, including the bench20260603 cluster
+            # T~=16384 cu=[0,head,head+10000,T] (~85us per case, 200+
+            # cases). T_flat outside this range is NOT covered; fall
+            # through.
+            #
+            # Balanced-split carve-out (notes: _bv_sweep_n3_balanced,
+            # 20 measured (T_flat, min_seg, max_seg) points): when the
+            # smallest segment is >= 3000 the three segments are large
+            # enough that BV=64 (grid 192, exactly 0.75 wave on 256 CUs)
+            # wins by 11-74us across T_flat in [10000, 25000]. The
+            # earlier rule missed this because the original calibration
+            # only swept skewed splits (head << T) where one tiny
+            # segment makes BV=64 padding-bound. Validated decision
+            # boundary: min_seg <= 2384 -> BV=32 still wins, min_seg
+            # >= 3000 -> BV=64 wins; no regression observed on the
+            # skewed-split cluster (which has min_seg << 3000).
+            if (
+                T_flat >= 10000
+                and min_seqlen is not None
+                and min_seqlen >= 3000
+            ):
+                return 64
+            if 8000 <= T_flat <= 30000:
+                return 32
+            # else: untested range, fall through to default
+        # N==1 and N>=4 are NOT touched by this branch -- the original
+        # behavior (return None -> grid-fill default) is preserved.
     if is_varlen and H == 16 and T_flat >= 32768 and N >= 7:
         return 64
     return None
@@ -278,6 +362,7 @@ def _lookup_tuned_bv(
     save_vn,
     is_varlen,
     wu_contig,
+    min_seqlen=None,
 ):
     """Select ``BV`` with the rule-based grid/CU heuristic.
 
@@ -287,6 +372,12 @@ def _lookup_tuned_bv(
     4k entries is more than enough to make this a permanent hit
     after warm-up. Reduces the heuristic chain from ~0.83us to
     ~0.15us per call.
+
+    ``min_seqlen`` (smallest segment length in a varlen batch) is part
+    of the cache key because the N=2 "balanced-split" carve-out in
+    ``_target_bv_for_shape`` distinguishes "head ~= T/2" from
+    "head << T"; two shapes with the same (T_flat, N) but different
+    min_seqlen can pick different BVs.
     """
     del (
         dtype_str,
@@ -306,6 +397,7 @@ def _lookup_tuned_bv(
         T_flat=T_flat,
         N=N,
         is_varlen=is_varlen,
+        min_seqlen=min_seqlen,
     )
 
 
@@ -317,6 +409,7 @@ def _heuristic_bv(
     T_flat: int,
     N: int,
     is_varlen: bool,
+    min_seqlen: int | None = None,
 ) -> int:
     """Pick a sensible BV for the requested shape. Pure function: no IO, no state.
 
@@ -367,7 +460,8 @@ def _heuristic_bv(
         largest legal candidate, then finally to ``_DEFAULT_BV``.
     """
     target_bv = _target_bv_for_shape(
-        H=H, Hg=Hg, T_flat=T_flat, N=N, is_varlen=is_varlen
+        H=H, Hg=Hg, T_flat=T_flat, N=N, is_varlen=is_varlen,
+        min_seqlen=min_seqlen,
     )
     target_ctas = (
         _grid_ctas(H=H, V=V, N=N, BV=target_bv) if target_bv is not None else 256
@@ -492,14 +586,26 @@ def _build_plan(
         chunk_offsets = None
         kernel_cu_seqlens = None
         is_varlen = False
+        min_seqlen = None
     else:
         NT, chunk_offsets, kernel_cu_seqlens, N = _resolve_prologue(
             cu_seqlens, BT, num_decodes, num_decode_tokens
         )
         is_varlen = True
+        # Smallest segment length, used by ``_target_bv_for_shape``'s
+        # N=2 "balanced-split" carve-out. ``_build_plan`` is a cold path
+        # (one call per unique ``_plan_key``; subsequent forwards on the
+        # same shape hit ``_plan_cache``), so the host-side .min() +
+        # .item() sync (~5us) is paid once per shape, not per forward.
+        if N >= 1:
+            seg_lens = kernel_cu_seqlens[1:] - kernel_cu_seqlens[:-1]
+            min_seqlen = int(seg_lens.min().item())
+        else:
+            min_seqlen = None
 
     BV = _heuristic_bv(
-        H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen
+        H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen,
+        min_seqlen=min_seqlen,
     )
 
     launch_fn = _get_or_compile(
