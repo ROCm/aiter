@@ -59,6 +59,78 @@ class kernelInstance:
         )
 
 
+@dataclass
+class tileKernelInstance:
+    M_Tile: int
+    N_Tile: int
+    K_Tile: int
+    M_Warp: int
+    N_Warp: int
+    K_Warp: int
+    M_Warp_Tile: int
+    N_Warp_Tile: int
+    K_Warp_Tile: int
+
+    Scheduler: str  # Default, Intrawave, Interwave
+
+    TiledMMAPermuteN: bool
+    TransposeC: bool
+    UsePersistentKernel: bool
+
+    BlockPerCu: int  # 1..BLOCK_PER_CU_MAX
+
+    # When True, 8-warp kernels read x_scale in row-major layout natively,
+    # skipping the host-side transpose.
+    AQRowMajor: bool = False
+
+    @property
+    def is_eight_warp(self) -> bool:
+        return self.M_Warp * self.N_Warp * self.K_Warp == 8 and self.K_Warp_Tile == 128
+
+    @property
+    def name(self) -> str:
+        """
+        Generate a unique name for the kernel instance based on its parameters.
+        """
+
+        parts = [
+            "a8w8_cktile",
+            ("x").join(
+                map(
+                    lambda x: str(x),
+                    [self.M_Tile, self.N_Tile, self.K_Tile],
+                )
+            ),
+            ("x").join(
+                map(
+                    lambda x: str(x),
+                    [self.M_Warp, self.N_Warp, self.K_Warp],
+                )
+            ),
+            ("x").join(
+                map(
+                    lambda x: str(x),
+                    [self.M_Warp_Tile, self.N_Warp_Tile, self.K_Warp_Tile],
+                )
+            ),
+            self.Scheduler.lower(),
+            ("x").join(
+                map(
+                    lambda x: str(int(x)),
+                    [
+                        self.TiledMMAPermuteN,
+                        self.TransposeC,
+                        self.UsePersistentKernel,
+                    ],
+                )
+            ),
+            str(self.BlockPerCu),
+        ]
+        if self.AQRowMajor:
+            parts.append("aqrm")
+        return "_".join(parts)
+
+
 # fmt: off
 kernels_list = {
 #   id: kernel:        BLOCK_SIZE| MPerBLOCK| NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_MAP_M| WAVE_MAP_N| ABLOCK_TRANSFER| BBLOCK_TRANSFER| CBLOCK_TRANSFER| CBLOCK_SPV| CSHUFFLE_MX| CSHUFFLE_NX|   LOOP_SCHED| PIPELINE_VERSION
@@ -166,6 +238,14 @@ default_kernels_dict = {
     (-8):                  kernelInstance(       256,       256,       128,        64,           32,         32,          4,          2,      [4, 64, 1],      [4, 64, 1],   [1, 32, 1, 8],  [8, 8, 1],           1,           1, "Interwave",  1),
     (-9):                  kernelInstance(       256,       224,       256,       128,           16,         16,          7,          8,      [8, 32, 1],      [8, 32, 1],   [1, 32, 1, 8],  [8, 8, 1],           1,           2, "Intrawave",  3),
     (-10):                 kernelInstance(       128,        16,        32,       128,           16,         16,          1,          1,      [8, 16, 1],      [8, 16, 1],   [1, 16, 1, 8],  [4, 4, 1],           1,           1, "Intrawave",  2),
-
 }
+
+kernels_list_cktile = {
+    0:  tileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           64,      "Intrawave",        False,             True,           False,             1      ),
+}
+
+default_kernels_dict_cktile = {
+    (-1):  tileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           64,      "Intrawave",        False,             True,           False,             1      ),
+}
+
 # fmt: on
