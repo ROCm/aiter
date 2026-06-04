@@ -26,11 +26,9 @@
 # Wrapper dispatch: nhead in {64,128} -> bh64; nhead <= 16 routes by KV dtype
 # (bf16 -> bh16bn64, fp8 -> bh16bn128).
 #
-# All regimes always run the full decode. For NUM_KV_SPLITS>1 each program writes
-# per-split normalized acc to a temp buffer and per-split fp32 lse to a separate
-# mid_lse buffer; stage-2 (_mla_softmax_reducev_kernel) combines them into the
-# final O. RETURN_LSE additionally returns the merged fp32 lse [B, H] (written by
-# stage-2 for NUM_KV_SPLITS>1, or by stage-1 for the NUM_KV_SPLITS==1 fast path).
+# Full decode for all regimes. For NUM_KV_SPLITS>1 stage-1 writes per-split acc +
+# fp32 lse; stage-2 (_mla_softmax_reducev_kernel) reduces into O. RETURN_LSE also
+# returns the merged fp32 lse [B, H] (stage-2 for splits>1, else stage-1).
 #
 # 3-stage software pipeline (double-buffered, BLOCK_N with 2x(BLOCK_N/2) KV slices):
 #   AC = async_copy (global->LDS), LL = load (LDS->reg), P = page, K = K-cache, V = V-cache
@@ -76,7 +74,7 @@ def _mla_decode_gluon(
     stride_o_b,
     stride_o_h,
     stride_o_s,
-    Mid_lse,  # K>1: per-split fp32 lse [B, H, NUM_KV_SPLITS] (else None)
+    Mid_lse,  # split>1: per-split fp32 lse [B, H, NUM_KV_SPLITS] (else None)
     stride_mid_lse_b,
     stride_mid_lse_h,
     stride_mid_lse_s,
@@ -629,9 +627,7 @@ def _mla_decode_gluon(
     else:
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
     if RETURN_LSE and NUM_KV_SPLITS == 1:
-        # K==1 fast path: stage-1 writes the final attention directly, so it also
-        # writes the merged fp32 lse here (the single split spans the whole
-        # sequence, so its lse IS the final lse). No stage-2 reduce runs.
+        # split==1: single split is the whole sequence, so its lse is the final lse.
         offs_final_lse = cur_batch * stride_final_lse_b + cur_head_o * stride_final_lse_h
         lse = e_max + gl.log(e_sum)
         if NHEAD < BLOCK_H:
@@ -639,8 +635,7 @@ def _mla_decode_gluon(
         else:
             gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse)
     elif NUM_KV_SPLITS > 1:
-        # Full-decode: per-split fp32 lse to a separate Mid_lse tensor for the
-        # stage-2 reduce (fp32, not packed into the bf16 O buffer).
+        # per-split lse for stage-2 reduce.
         offs_mid_lse = cur_batch * stride_mid_lse_b + cur_head_o * stride_mid_lse_h + split_kv_id * stride_mid_lse_s
         lse = e_max + gl.log(e_sum)
         if NHEAD < BLOCK_H:
@@ -682,8 +677,7 @@ def _mla_softmax_reducev_kernel(
     e_max = -float("inf")
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
 
-    # Stage-1's floor-with-remainder-on-last split scheme guarantees every split
-    # is non-empty, so all NUM_KV_SPLITS splits are merged unconditionally.
+    # all splits non-empty (floor-with-remainder-on-last), so merge unconditionally.
     for split_kv_id in range(0, NUM_KV_SPLITS):
         logits = tl.load(Logits + offs_l + split_kv_id * stride_l_s)
         logits_1 = tl.load(Mid_lse + offs_ml + split_kv_id * stride_ml_s)
@@ -715,8 +709,7 @@ def mla_decode_gluon(
     # Shared: kv_c=[N, kv_lora_rank+qk_rope_head_dim], k_pe=None,              kv_pe_offset=kv_lora_rank
     # Split:  kv_c=[N, kv_lora_rank],                k_pe=[N,qk_rope_head_dim], kv_pe_offset=0
     kv_c,
-    # return_lse=False: final output [batch, nhead, kv_lora_rank].
-    # return_lse=True:  per-split logits [batch, nhead, NUM_KV_SPLITS, kv_lora_rank].
+    # final output [batch, nhead, kv_lora_rank].
     o,
     page_table,  # 2D: block_table [batch, max_seqlen] | 1D: kv_indices [total_kv]
     seq_info,  # 2D: cache_seqlens [batch]           | 1D: kv_indptr [batch+1]
@@ -738,13 +731,7 @@ def mla_decode_gluon(
     return_lse=False (default): returns (o, None).
 
     return_lse=True: additionally returns the merged log-sum-exp, a separate
-        fp32 tensor [batch, nhead] allocated here: (o, final_lse). final_lse is
-        the post-reduce value (e_max + log(e_sum) over the whole KV sequence),
-        matching the asm path's final_lse and the torch reference's
-        logsumexp(dim=-1). Supported for all regimes. When NUM_KV_SPLITS>1 the
-        per-split lse is kept in a separate fp32 buffer (not packed into the bf16
-        O) and stage-2 produces final_lse; when NUM_KV_SPLITS==1 stage-1 writes
-        final_lse directly.
+        fp32 tensor [batch, nhead]
     """
     if k_pe is None:
         k_pe = kv_c
@@ -841,15 +828,12 @@ def mla_decode_gluon(
     within_2gb = max_kv_bytes <= 0x80000000  # 2 GB
 
     if NUM_KV_SPLITS == 1:
-        # Fast path: stage-1 writes the final attention output directly to o, no
-        # temp buffer, no stage-2 reduce. For return_lse it also writes the merged
-        # fp32 lse (the single split spans the whole sequence).
+        # Fast path: stage-1 writes the final attention (and lse) directly to o.
         logits_buf = o.view(batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv)
         mid_lse = None
         stride_mid_lse_b, stride_mid_lse_h, stride_mid_lse_s = 0, 0, 0
     else:
-        # Stage-1 writes per-split normalized acc to a temp buffer and per-split
-        # fp32 lse to a separate mid_lse; stage-2 reduces them into o.
+        # stage-1 -> per-split (acc, lse); stage-2 reduces into o.
         logits_buf = torch.empty(
             (batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv),
             dtype=o.dtype,
@@ -863,7 +847,6 @@ def mla_decode_gluon(
         stride_mid_lse_b, stride_mid_lse_h, stride_mid_lse_s = mid_lse.stride()
 
     if return_lse:
-        # Merged fp32 lse: written by stage-1 (K==1) or stage-2 (K>1).
         final_lse = torch.empty(
             (batch_size, nhead), dtype=torch.float32, device=q_nope.device
         )
@@ -925,14 +908,10 @@ def mla_decode_gluon(
     )
 
     if NUM_KV_SPLITS == 1:
-        # Fast path: stage-1 already wrote the final attention (and, for
-        # return_lse, the merged fp32 lse) directly to o.
+        # Fast path: stage-1 already wrote o (and lse) directly.
         return o, final_lse
 
-    # Stage-2: combine per-split (acc, fp32 lse) into the final attention in o,
-    # and (when return_lse) write the merged fp32 lse. Stage-1's
-    # floor-with-remainder-on-last split scheme guarantees every split is
-    # non-empty, so all splits are merged unconditionally.
+    # Stage-2: reduce per-split (acc, lse) into o (and lse when return_lse).
     grid_reduce = (batch_size, nhead)
     _mla_softmax_reducev_kernel[grid_reduce](
         logits_buf,

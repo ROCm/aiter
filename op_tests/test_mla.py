@@ -664,9 +664,8 @@ def test_mla(
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
 
-    # Gluon MLA bh16bn64 decode test (gfx950, bf16 Q + bf16 KV). Full decode; `o`
-    # is identical with/without -lse (-lse only adds the merged fp32 lse, validated
-    # vs lse_ref). Same gate for both modes: splits must be non-empty, i.e.
+    # Gluon MLA bh16bn64 decode test (gfx950, bf16 Q + bf16 KV).
+    # Splits must be non-empty, i.e.
     # ctx >= NUM_KV_SPLITS = max(1, 256 // batch_size).
     # Example: -c 10000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 [-lse]
     if (

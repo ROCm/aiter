@@ -82,11 +82,11 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 
 The wrapper dispatches by `(nhead, kv_c.dtype)` to one of three compile-time regimes (single `@gluon.jit` kernel, REGIME constexpr gates layouts and grid mapping):
 
-- **`bh64`** (`nhead in {64, 128}`): bf16 KV, BLOCK_H=64, BLOCK_N=64, multi-batch + XCD-aware 3-D grid. `NUM_KV_SPLITS` auto-picked &isin; {1, 2, 4} so the launch fills ~256 workgroups (one wave on MI350). When `NUM_KV_SPLITS == 1`, stage-1 writes the final attention output directly to `o` (no temp buffer, no reduce). When `NUM_KV_SPLITS > 1`, stage-1 writes per-split normalized `acc` to a temp buffer and per-split fp32 `lse` to a separate `mid_lse` buffer, and stage-2 (`_mla_softmax_reducev_kernel`) reduces them into `o`.
+- **`bh64`** (`nhead in {64, 128}`): bf16 KV, BLOCK_H=64, BLOCK_N=64, multi-batch + XCD-aware 3-D grid. `NUM_KV_SPLITS` auto-picked &isin; {1, 2, 4} so the launch fills ~256 workgroups (one wave on MI350). When `NUM_KV_SPLITS == 1`, stage-1 writes the final attention output directly to `o` (no temp buffer, no reduce). When `NUM_KV_SPLITS > 1`, stage-1 writes per-split `(acc, fp32 lse)` and stage-2 (`_mla_softmax_reducev_kernel`) reduces them into `o`.
 - **`bh16bn128`** (`nhead &le; 16`, `batch_size == 1`, fp8 KV): BLOCK_H=16, BLOCK_N=128, 2-D grid `(1, NUM_KV_SPLITS=256)`. Optional `kv_scale` dequant. Always splits + always runs stage-2 reduce. Supports the general case `num_iter &isin; {1, 2, ...}` (no `gl.assume(num_iter >= 3)`). `NHEAD < BLOCK_H` masks OOB heads on Q load and O store (wasted MFMA lanes are free; this regime is memory-bound).
 - **`bh16bn64`** (`nhead &le; 16`, bf16 KV): BLOCK_H=16, BLOCK_N=64, 2-D grid `(batch_size, NUM_KV_SPLITS)` with `NUM_KV_SPLITS = max(1, 256 // batch_size)`. Use when KV is kept in bf16 (no fp8 quant). Same `NHEAD < BLOCK_H` masking. Full decode (stage-1 + stage-2 reduce into `o`).
 
-All three regimes run the full decode. `return_lse=True` additionally returns the merged log-sum-exp (`e_max + log(e_sum)` over the whole KV sequence, matching `logsumexp(dim=-1)`) as a separate fp32 tensor `[batch, nhead]`, so `mla_decode_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
+All three regimes run the full decode. `return_lse=True` also returns the merged fp32 lse `[batch, nhead]`, so `mla_decode_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
 
 Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
 
