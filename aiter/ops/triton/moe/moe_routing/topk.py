@@ -47,9 +47,7 @@ def grouped_topk(
     """
     assert x.dim() == 2
     n_rows, n_cols = x.shape
-    assert (
-        n_cols <= 256
-    ), f"grouped_topk n_expts_tot ({n_cols}) only supported <= 256"
+    assert n_cols <= 256, f"grouped_topk n_expts_tot ({n_cols}) only supported <= 256"
     # Fused shared experts are appended (always-on) AFTER the routed selection;
     # they occupy expert ids [n_cols, n_cols + num_fused_shared_experts).
     n_shared = num_fused_shared_experts
