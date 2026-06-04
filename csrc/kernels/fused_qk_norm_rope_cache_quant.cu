@@ -2393,6 +2393,296 @@ void fused_rope_rms_1way(const T* q,
 #undef DISPATCH_NEOX
 }
 
+template <typename T, int HEAD_SIZE, bool IS_NEOX>
+__global__ void fused_rope_rms_2way_amax_kernel(const T* q0_,
+                                                const T* k0_,
+                                                const T* q1_,
+                                                const T* k1_,
+                                                const T* w_q0,
+                                                const T* w_k0,
+                                                const T* w_q1,
+                                                const T* w_k1,
+                                                const T* cos_sin0,
+                                                const T* cos_sin1,
+                                                int num_tokens0,
+                                                int num_tokens1,
+                                                int num_heads_q,
+                                                int num_heads_k,
+                                                float eps,
+                                                int total_warps,
+                                                T* out_q01_,
+                                                T* out_k01_,
+                                                float* q_partial_amax,
+                                                float* k_partial_amax)
+{
+    using mrope_utils::WARP_SIZE;
+    constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
+    constexpr int PAIR_VEC_SIZE   = VEC_SIZE / 2;
+    constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
+    const int warp_id             = threadIdx.x / WARP_SIZE;
+    const int lane_id             = threadIdx.x % WARP_SIZE;
+    const int num_warps_per_block = blockDim.x / WARP_SIZE;
+    const int global_warp_id      = blockIdx.x * num_warps_per_block + warp_id;
+    if(global_warp_id >= total_warps)
+    {
+        return;
+    }
+
+    int batch_id = blockIdx.y;
+    auto q0      = q0_ + batch_id * num_tokens0 * num_heads_q * HEAD_SIZE;
+    auto k0      = k0_ + batch_id * num_tokens0 * num_heads_k * HEAD_SIZE;
+    auto q1      = q1_ + batch_id * num_tokens1 * num_heads_q * HEAD_SIZE;
+    auto k1      = k1_ + batch_id * num_tokens1 * num_heads_k * HEAD_SIZE;
+    auto out_q01 = out_q01_ + batch_id * (num_tokens0 + num_tokens1) * num_heads_q * HEAD_SIZE;
+    auto out_k01 = out_k01_ + batch_id * (num_tokens0 + num_tokens1) * num_heads_k * HEAD_SIZE;
+    int warp_offset_q0 = 0;
+    int warp_offset_k0 = num_tokens0 * num_heads_q;
+    int warp_offset_q1 = num_tokens0 * (num_heads_q + num_heads_k);
+    int warp_offset_k1 = num_tokens0 * (num_heads_q + num_heads_k) + num_tokens1 * num_heads_q;
+
+    bool is_q0 = global_warp_id < warp_offset_k0;
+    bool is_k0 = !is_q0 && global_warp_id < warp_offset_q1;
+    bool is_q1 = !is_q0 && !is_k0 && global_warp_id < warp_offset_k1;
+    bool is_k1 = !is_q0 && !is_k0 && !is_q1;
+
+    int access_id_in_head = lane_id * VEC_SIZE;
+    int neighbor_offset =
+        access_id_in_head < HALF_HEAD_SIZE ? HALF_HEAD_SIZE / VEC_SIZE : -HALF_HEAD_SIZE / VEC_SIZE;
+
+    int token_id;
+    int specialized_warp_id;
+    int head_id_in_token;
+    int data_offset;
+
+    vec_t<T, VEC_SIZE> w_vec, x_vec, cos_sin_vec;
+    vec_t<T, PAIR_VEC_SIZE> cos_vec, sin_vec;
+
+    if(is_q0)
+    {
+        specialized_warp_id = global_warp_id - warp_offset_q0;
+        token_id            = specialized_warp_id / num_heads_q;
+        head_id_in_token    = specialized_warp_id % num_heads_q;
+        data_offset         = (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_q0 + access_id_in_head);
+        x_vec.load(q0 + data_offset + access_id_in_head);
+        if constexpr(IS_NEOX)
+            cos_sin_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head]);
+        else
+        {
+            cos_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head / 2]);
+            sin_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+        }
+    }
+    else if(is_k0)
+    {
+        specialized_warp_id = global_warp_id - warp_offset_k0;
+        token_id            = specialized_warp_id / num_heads_k;
+        head_id_in_token    = specialized_warp_id % num_heads_k;
+        data_offset         = (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_k0 + access_id_in_head);
+        x_vec.load(k0 + data_offset + access_id_in_head);
+        if constexpr(IS_NEOX)
+            cos_sin_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head]);
+        else
+        {
+            cos_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head / 2]);
+            sin_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+        }
+    }
+    else if(is_q1)
+    {
+        specialized_warp_id = global_warp_id - warp_offset_q1;
+        token_id            = specialized_warp_id / num_heads_q;
+        head_id_in_token    = specialized_warp_id % num_heads_q;
+        data_offset         = (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_q1 + access_id_in_head);
+        x_vec.load(q1 + data_offset + access_id_in_head);
+        if constexpr(IS_NEOX)
+            cos_sin_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head]);
+        else
+        {
+            cos_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head / 2]);
+            sin_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+        }
+    }
+    else
+    {
+        specialized_warp_id = global_warp_id - warp_offset_k1;
+        token_id            = specialized_warp_id / num_heads_k;
+        head_id_in_token    = specialized_warp_id % num_heads_k;
+        data_offset         = (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_k1 + access_id_in_head);
+        x_vec.load(k1 + data_offset + access_id_in_head);
+        if constexpr(IS_NEOX)
+            cos_sin_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head]);
+        else
+        {
+            cos_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head / 2]);
+            sin_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+        }
+    }
+
+    mrope_utils::warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+    vec_t<T, VEC_SIZE> out_vec;
+    if constexpr(IS_NEOX)
+    {
+        auto nb_cos_sin_vec = mrope_utils::warp_shfl_sync_vec<T, VEC_SIZE>(
+            cos_sin_vec, threadIdx.x + neighbor_offset);
+        auto nb_x_vec =
+            mrope_utils::warp_shfl_sync_vec<T, VEC_SIZE>(x_vec, threadIdx.x + neighbor_offset);
+        if(neighbor_offset > 0)
+        {
+#pragma unroll
+            for(int i = 0; i < VEC_SIZE; ++i)
+                out_vec[i] = (float)x_vec[i] * (float)cos_sin_vec[i] -
+                             (float)nb_x_vec[i] * (float)nb_cos_sin_vec[i];
+        }
+        else
+        {
+#pragma unroll
+            for(int i = 0; i < VEC_SIZE; ++i)
+                out_vec[i] = (float)x_vec[i] * (float)nb_cos_sin_vec[i] +
+                             (float)nb_x_vec[i] * (float)cos_sin_vec[i];
+        }
+    }
+    else
+    {
+#pragma unroll
+        for(int i = 0; i < PAIR_VEC_SIZE; ++i)
+        {
+            out_vec[2 * i + 0] = (float)x_vec[2 * i + 0] * (float)cos_vec[i] -
+                                 (float)x_vec[2 * i + 1] * (float)sin_vec[i];
+            out_vec[2 * i + 1] = (float)x_vec[2 * i + 1] * (float)cos_vec[i] +
+                                 (float)x_vec[2 * i + 0] * (float)sin_vec[i];
+        }
+    }
+
+    float local_max = 0.0f;
+#pragma unroll
+    for(int i = 0; i < VEC_SIZE; ++i)
+        local_max = fmaxf(local_max, fabsf((float)out_vec[i]));
+#pragma unroll
+    for(int mask = 16; mask > 0; mask >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor(local_max, mask, WARP_SIZE));
+    if(lane_id == 0)
+    {
+        if(is_q0 || is_q1)
+        {
+            q_partial_amax[blockIdx.y * total_warps + global_warp_id] = local_max;
+            k_partial_amax[blockIdx.y * total_warps + global_warp_id] = 0.0f;
+        }
+        else
+        {
+            q_partial_amax[blockIdx.y * total_warps + global_warp_id] = 0.0f;
+            k_partial_amax[blockIdx.y * total_warps + global_warp_id] = local_max;
+        }
+    }
+
+    if(is_q0)
+    {
+        out_vec.store(out_q01 + (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE +
+                      access_id_in_head);
+    }
+    else if(is_k0)
+    {
+        out_vec.store(out_k01 + (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE +
+                      access_id_in_head);
+    }
+    else if(is_q1)
+    {
+        out_vec.store(out_q01 +
+                      ((num_tokens0 + token_id) * num_heads_q + head_id_in_token) * HEAD_SIZE +
+                      access_id_in_head);
+    }
+    else
+    {
+        out_vec.store(out_k01 +
+                      ((num_tokens0 + token_id) * num_heads_k + head_id_in_token) * HEAD_SIZE +
+                      access_id_in_head);
+    }
+}
+// Per-head scale reduction for the 2way layout. q_partial_amax / k_partial_amax
+// are produced by fused_rope_rms_2way_amax_kernel: shape [batch, total_warps],
+// where total_warps lays out 4 contiguous segments
+//   q0 [num_tokens0 * num_heads_q],
+//   k0 [num_tokens0 * num_heads_k],
+//   q1 [num_tokens1 * num_heads_q],
+//   k1 [num_tokens1 * num_heads_k].
+// Slots that do not match a side are written as 0, so we only read the segments
+// for the requested side.
+__global__ void qk_partial_amax_to_perhead_scale_kernel(
+    const float* q_partial_amax,
+    const float* k_partial_amax,
+    int num_tokens0,
+    int num_tokens1,
+    int num_heads_q,
+    int num_heads_k,
+    int total_warps,
+    float* q_scale, // [batch, num_heads_q]
+    float* k_scale) // [batch, num_heads_k]
+{
+    int b = blockIdx.y;
+    int head_packed = blockIdx.x; // 0 .. num_heads_q + num_heads_k - 1
+    bool is_q = head_packed < num_heads_q;
+    int h = is_q ? head_packed : head_packed - num_heads_q;
+    int H = is_q ? num_heads_q : num_heads_k;
+
+    int warp_offset_seg0 = is_q ? 0 : num_tokens0 * num_heads_q;
+    int warp_offset_seg1 = is_q
+        ? num_tokens0 * (num_heads_q + num_heads_k)
+        : num_tokens0 * (num_heads_q + num_heads_k) + num_tokens1 * num_heads_q;
+
+    const float* base = (is_q ? q_partial_amax : k_partial_amax) + (int64_t)b * total_warps;
+
+    float local = 0.0f;
+    for(int t = threadIdx.x; t < num_tokens0; t += blockDim.x)
+        local = fmaxf(local, base[warp_offset_seg0 + t * H + h]);
+    for(int t = threadIdx.x; t < num_tokens1; t += blockDim.x)
+        local = fmaxf(local, base[warp_offset_seg1 + t * H + h]);
+
+    __shared__ float sm[256];
+    sm[threadIdx.x] = local;
+    __syncthreads();
+#pragma unroll
+    for(int s = 128; s > 0; s >>= 1)
+    {
+        if(threadIdx.x < s)
+            sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if(threadIdx.x == 0)
+    {
+        constexpr float fp8_max = 240.0f;
+        float* out             = is_q ? q_scale : k_scale;
+        out[b * H + h]         = fmaxf(sm[0], 1e-8f) / fp8_max;
+    }
+}
+
+// FP8 static quant where each (batch, head) carries its own scale.
+// Input/output shape: [batch, num_tokens, num_heads, head_size].
+template <typename T>
+__global__ void static_fp8_quant_perhead_kernel(mrope_utils::fp8e4m3fnuz* out,
+                                                const T* input,
+                                                const float* scale, // [batch, num_heads]
+                                                int batch_size,
+                                                int num_tokens,
+                                                int num_heads,
+                                                int head_size)
+{
+    int64_t idx    = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)gridDim.x * blockDim.x;
+    int64_t numel  = (int64_t)batch_size * num_tokens * num_heads * head_size;
+    for(int64_t i = idx; i < numel; i += stride)
+    {
+        int64_t tmp = i / head_size;
+        int h       = tmp % num_heads;
+        tmp /= num_heads;
+        int b         = tmp / num_tokens;
+        float inv     = 1.0f / scale[b * num_heads + h];
+        out[i] = mrope_utils::fp8e4m3fnuz(static_cast<float>(input[i]) * inv);
+    }
+}
+
 namespace aiter {
 
 void fused_qk_norm_rope_cache_quant_shuffle(
@@ -2956,6 +3246,339 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
     const hipStream_t stream = aiter::getCurrentHIPStream();
     DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(
         qkv.dtype(), kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT);
+}
+
+void fused_qk_norm_rope_2way_fp8_perhead_quant(aiter_tensor_t& q0,
+                                               aiter_tensor_t& k0,
+                                               aiter_tensor_t& q1,
+                                               aiter_tensor_t& k1,
+                                               aiter_tensor_t& w_q0,
+                                               aiter_tensor_t& w_k0,
+                                               aiter_tensor_t& w_q1,
+                                               aiter_tensor_t& w_k1,
+                                               aiter_tensor_t& cos_sin0,
+                                               aiter_tensor_t& cos_sin1,
+                                               int64_t batch_size,
+                                               int64_t num_tokens0,
+                                               int64_t num_tokens1,
+                                               int64_t num_heads_q,
+                                               int64_t num_heads_k,
+                                               int64_t head_size,
+                                               bool is_interleaved,
+                                               double eps,
+                                               aiter_tensor_t& q_fp8,
+                                               aiter_tensor_t& k_fp8,
+                                               aiter_tensor_t& q_descale,
+                                               aiter_tensor_t& k_descale,
+                                               aiter_tensor_t& q_unquantized,
+                                               aiter_tensor_t& k_unquantized)
+{
+    AITER_CHECK(q0.is_contiguous() && k0.is_contiguous() && q1.is_contiguous() &&
+                k1.is_contiguous());
+    AITER_CHECK(w_q0.is_contiguous() && w_k0.is_contiguous() && w_q1.is_contiguous() &&
+                w_k1.is_contiguous());
+    AITER_CHECK(cos_sin0.is_contiguous() && cos_sin1.is_contiguous());
+    AITER_CHECK(q_fp8.is_contiguous() && k_fp8.is_contiguous());
+    AITER_CHECK(q_descale.is_contiguous() && k_descale.is_contiguous());
+    AITER_CHECK(q_unquantized.is_contiguous() && k_unquantized.is_contiguous());
+    AITER_CHECK(q0.dtype() == k0.dtype() && q0.dtype() == q1.dtype() && q0.dtype() == k1.dtype());
+    AITER_CHECK(q0.dtype() == w_q0.dtype() && q0.dtype() == w_k0.dtype() &&
+                q0.dtype() == w_q1.dtype() && q0.dtype() == w_k1.dtype());
+    AITER_CHECK(q0.dtype() == q_unquantized.dtype() && k0.dtype() == k_unquantized.dtype());
+    AITER_CHECK(q_fp8.dtype() == AITER_DTYPE_fp8 && k_fp8.dtype() == AITER_DTYPE_fp8);
+    AITER_CHECK(q_descale.dtype() == AITER_DTYPE_fp32 && k_descale.dtype() == AITER_DTYPE_fp32);
+
+    HipDeviceGuard device_guard(q0.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    int total_warps         = (num_tokens0 + num_tokens1) * (num_heads_q + num_heads_k);
+    constexpr int block_size = 256;
+    constexpr int warp_size  = 32;
+    int num_warps_per_block  = block_size / warp_size;
+
+    AiterTensor q_partial_amax =
+        AiterTensor::empty({batch_size, total_warps}, AITER_DTYPE_fp32, q0.device_id, stream);
+    AiterTensor k_partial_amax =
+        AiterTensor::empty({batch_size, total_warps}, AITER_DTYPE_fp32, q0.device_id, stream);
+
+    dim3 threadsPerBlock(block_size);
+    dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block, batch_size);
+
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        q0.dtype(), "fused_qk_norm_rope_2way_fp8_perhead_amax", [&] {
+            using T = scalar_t;
+            auto launch_amax = [&]<int HS, bool NEOX>() {
+                fused_rope_rms_2way_amax_kernel<T, HS, NEOX>
+                    <<<numBlocks, threadsPerBlock, 0, stream>>>(
+                        reinterpret_cast<T*>(q0.data_ptr()),
+                        reinterpret_cast<T*>(k0.data_ptr()),
+                        reinterpret_cast<T*>(q1.data_ptr()),
+                        reinterpret_cast<T*>(k1.data_ptr()),
+                        reinterpret_cast<T*>(w_q0.data_ptr()),
+                        reinterpret_cast<T*>(w_k0.data_ptr()),
+                        reinterpret_cast<T*>(w_q1.data_ptr()),
+                        reinterpret_cast<T*>(w_k1.data_ptr()),
+                        reinterpret_cast<T*>(cos_sin0.data_ptr()),
+                        reinterpret_cast<T*>(cos_sin1.data_ptr()),
+                        (int)num_tokens0,
+                        (int)num_tokens1,
+                        (int)num_heads_q,
+                        (int)num_heads_k,
+                        (float)eps,
+                        total_warps,
+                        reinterpret_cast<T*>(q_unquantized.data_ptr()),
+                        reinterpret_cast<T*>(k_unquantized.data_ptr()),
+                        reinterpret_cast<float*>(q_partial_amax.data_ptr()),
+                        reinterpret_cast<float*>(k_partial_amax.data_ptr()));
+            };
+            switch(head_size)
+            {
+            case 64:
+                if(!is_interleaved) launch_amax.template operator()<64, true>();
+                else                launch_amax.template operator()<64, false>();
+                break;
+            case 128:
+                if(!is_interleaved) launch_amax.template operator()<128, true>();
+                else                launch_amax.template operator()<128, false>();
+                break;
+            case 256:
+                if(!is_interleaved) launch_amax.template operator()<256, true>();
+                else                launch_amax.template operator()<256, false>();
+                break;
+            default:
+                AITER_CHECK(false, "Unsupported head_size: ", head_size);
+            }
+        });
+
+    {
+        dim3 reduce_grid((unsigned)(num_heads_q + num_heads_k), (unsigned)batch_size);
+        dim3 reduce_block(256);
+        qk_partial_amax_to_perhead_scale_kernel<<<reduce_grid, reduce_block, 0, stream>>>(
+            reinterpret_cast<float*>(q_partial_amax.data_ptr()),
+            reinterpret_cast<float*>(k_partial_amax.data_ptr()),
+            (int)num_tokens0,
+            (int)num_tokens1,
+            (int)num_heads_q,
+            (int)num_heads_k,
+            total_warps,
+            reinterpret_cast<float*>(q_descale.data_ptr()),
+            reinterpret_cast<float*>(k_descale.data_ptr()));
+    }
+
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        q0.dtype(), "fused_qk_norm_rope_2way_fp8_perhead_quant", [&] {
+            using T          = scalar_t;
+            int total_tokens = num_tokens0 + num_tokens1;
+            int64_t q_numel  = (int64_t)batch_size * total_tokens * num_heads_q * head_size;
+            int64_t k_numel  = (int64_t)batch_size * total_tokens * num_heads_k * head_size;
+            dim3 quant_block(256);
+            dim3 q_grid((unsigned)((q_numel + quant_block.x - 1) / quant_block.x));
+            dim3 k_grid((unsigned)((k_numel + quant_block.x - 1) / quant_block.x));
+            static_fp8_quant_perhead_kernel<T><<<q_grid, quant_block, 0, stream>>>(
+                reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(q_fp8.data_ptr()),
+                reinterpret_cast<T*>(q_unquantized.data_ptr()),
+                reinterpret_cast<float*>(q_descale.data_ptr()),
+                (int)batch_size,
+                total_tokens,
+                (int)num_heads_q,
+                (int)head_size);
+            static_fp8_quant_perhead_kernel<T><<<k_grid, quant_block, 0, stream>>>(
+                reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(k_fp8.data_ptr()),
+                reinterpret_cast<T*>(k_unquantized.data_ptr()),
+                reinterpret_cast<float*>(k_descale.data_ptr()),
+                (int)batch_size,
+                total_tokens,
+                (int)num_heads_k,
+                (int)head_size);
+        });
+}
+
+// ---------- per-(batch, head) FP8 V quant (2-way, no bf16 cat) ----------
+
+__device__ __forceinline__ void atomic_fmax_pos(float* addr, float val)
+{
+    int* iaddr = reinterpret_cast<int*>(addr);
+    int ival   = __float_as_int(val);
+    atomicMax(iaddr, ival);
+}
+
+__global__ void v_amax_to_descale_kernel(const float* __restrict__ v_amax,
+                                         int num_heads,
+                                         float* __restrict__ v_descale)
+{
+    int b   = blockIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= num_heads) return;
+    constexpr float fp8_max = 240.0f;
+    v_descale[b * num_heads + idx] =
+        fmaxf(v_amax[b * num_heads + idx], 1e-8f) / fp8_max;
+}
+
+template <typename T, int TILE_T, int HEAD_SIZE>
+__global__ void __launch_bounds__(256) v_2way_per_head_amax_tiled_kernel(
+    const T* __restrict__ v0_,
+    const T* __restrict__ v1_,
+    int num_tokens0,
+    int num_tokens1,
+    int num_heads,
+    float* __restrict__ v_amax)
+{
+    constexpr int BT = 256;
+    int b            = blockIdx.z;
+    int h            = blockIdx.y;
+    int tile         = blockIdx.x;
+    int total_tokens = num_tokens0 + num_tokens1;
+    int t_start      = tile * TILE_T;
+    int t_end        = min(t_start + TILE_T, total_tokens);
+    int slab_h_stride = num_heads * HEAD_SIZE;
+    float local       = 0.0f;
+
+    for(int idx = threadIdx.x; idx < (t_end - t_start) * HEAD_SIZE; idx += BT)
+    {
+        int local_t = idx / HEAD_SIZE;
+        int d       = idx % HEAD_SIZE;
+        int t       = t_start + local_t;
+        float val;
+        if(t < num_tokens0)
+        {
+            int64_t off = ((int64_t)b * num_tokens0 + t) * slab_h_stride +
+                          (int64_t)h * HEAD_SIZE + d;
+            val = (float)v0_[off];
+        }
+        else
+        {
+            int t1      = t - num_tokens0;
+            int64_t off = ((int64_t)b * num_tokens1 + t1) * slab_h_stride +
+                          (int64_t)h * HEAD_SIZE + d;
+            val = (float)v1_[off];
+        }
+        local = fmaxf(local, fabsf(val));
+    }
+
+    __shared__ float sm[BT];
+    sm[threadIdx.x] = local;
+    __syncthreads();
+#pragma unroll
+    for(int s = BT / 2; s > 0; s >>= 1)
+    {
+        if(threadIdx.x < s) sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if(threadIdx.x == 0) atomic_fmax_pos(v_amax + b * num_heads + h, sm[0]);
+}
+
+template <typename T, int TILE_T, int HEAD_SIZE>
+__global__ void __launch_bounds__(256) v_2way_per_head_quant_tiled_kernel(
+    const T* __restrict__ v0_,
+    const T* __restrict__ v1_,
+    int num_tokens0,
+    int num_tokens1,
+    int num_heads,
+    mrope_utils::fp8e4m3fnuz* __restrict__ v_fp8_,
+    const float* __restrict__ v_descale)
+{
+    constexpr int BT = 256;
+    int b            = blockIdx.z;
+    int h            = blockIdx.y;
+    int tile         = blockIdx.x;
+    int total_tokens = num_tokens0 + num_tokens1;
+    int t_start      = tile * TILE_T;
+    int t_end        = min(t_start + TILE_T, total_tokens);
+    int slab_h_stride = num_heads * HEAD_SIZE;
+    float inv         = 1.0f / v_descale[b * num_heads + h];
+
+    for(int idx = threadIdx.x; idx < (t_end - t_start) * HEAD_SIZE; idx += BT)
+    {
+        int local_t = idx / HEAD_SIZE;
+        int d       = idx % HEAD_SIZE;
+        int t       = t_start + local_t;
+        int64_t out_off = ((int64_t)b * total_tokens + t) * slab_h_stride +
+                          (int64_t)h * HEAD_SIZE + d;
+        float val;
+        if(t < num_tokens0)
+        {
+            int64_t in_off = ((int64_t)b * num_tokens0 + t) * slab_h_stride +
+                             (int64_t)h * HEAD_SIZE + d;
+            val = (float)v0_[in_off];
+        }
+        else
+        {
+            int t1         = t - num_tokens0;
+            int64_t in_off = ((int64_t)b * num_tokens1 + t1) * slab_h_stride +
+                             (int64_t)h * HEAD_SIZE + d;
+            val = (float)v1_[in_off];
+        }
+        v_fp8_[out_off] = mrope_utils::fp8e4m3fnuz(val * inv);
+    }
+}
+
+void v_2way_per_head_fp8_quant(aiter_tensor_t& v0,
+                               aiter_tensor_t& v1,
+                               aiter_tensor_t& v_fp8,
+                               aiter_tensor_t& v_descale)
+{
+    AITER_CHECK(v0.is_contiguous() && v1.is_contiguous());
+    AITER_CHECK(v_fp8.is_contiguous() && v_descale.is_contiguous());
+    AITER_CHECK(v0.ndim == 4 && v1.ndim == 4, "v0/v1 must be 4D [B, T, H, D]");
+    int64_t batch_size  = v0.size(0);
+    int64_t num_tokens0 = v0.size(1);
+    int64_t num_tokens1 = v1.size(1);
+    int64_t num_heads   = v0.size(2);
+    int64_t head_size   = v0.size(3);
+    AITER_CHECK(v1.size(0) == batch_size && v1.size(2) == num_heads &&
+                    v1.size(3) == head_size,
+                "v0/v1 must share B/H/D");
+    AITER_CHECK(head_size == 128,
+                "v_2way_per_head_fp8_quant currently only supports head_size=128");
+    AITER_CHECK(v0.dtype() == v1.dtype(), "v0/v1 dtype must match");
+    AITER_CHECK(v_fp8.dtype() == AITER_DTYPE_fp8, "v_fp8 must be fp8");
+    AITER_CHECK(v_descale.dtype() == AITER_DTYPE_fp32, "v_descale must be fp32");
+
+    HipDeviceGuard device_guard(v0.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    AiterTensor v_amax =
+        AiterTensor::empty({batch_size, num_heads}, AITER_DTYPE_fp32, v0.device_id, stream);
+
+    constexpr int TILE_T    = 128;
+    constexpr int HEAD_SIZE = 128;
+    int num_tiles           = (int)((num_tokens0 + num_tokens1 + TILE_T - 1) / TILE_T);
+    dim3 grid((unsigned)num_tiles, (unsigned)num_heads, (unsigned)batch_size);
+    dim3 block(256);
+
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        v0.dtype(), "v_2way_per_head_amax_tiled", [&] {
+            v_2way_per_head_amax_tiled_kernel<scalar_t, TILE_T, HEAD_SIZE>
+                <<<grid, block, 0, stream>>>(
+                    reinterpret_cast<scalar_t*>(v0.data_ptr()),
+                    reinterpret_cast<scalar_t*>(v1.data_ptr()),
+                    (int)num_tokens0,
+                    (int)num_tokens1,
+                    (int)num_heads,
+                    reinterpret_cast<float*>(v_amax.data_ptr()));
+        });
+
+    {
+        dim3 fg((unsigned)((num_heads + 31) / 32), (unsigned)batch_size);
+        dim3 fb(32);
+        v_amax_to_descale_kernel<<<fg, fb, 0, stream>>>(
+            reinterpret_cast<float*>(v_amax.data_ptr()),
+            (int)num_heads,
+            reinterpret_cast<float*>(v_descale.data_ptr()));
+    }
+
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        v0.dtype(), "v_2way_per_head_quant_tiled", [&] {
+            v_2way_per_head_quant_tiled_kernel<scalar_t, TILE_T, HEAD_SIZE>
+                <<<grid, block, 0, stream>>>(
+                    reinterpret_cast<scalar_t*>(v0.data_ptr()),
+                    reinterpret_cast<scalar_t*>(v1.data_ptr()),
+                    (int)num_tokens0,
+                    (int)num_tokens1,
+                    (int)num_heads,
+                    reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(v_fp8.data_ptr()),
+                    reinterpret_cast<float*>(v_descale.data_ptr()));
+        });
 }
 
 } // namespace aiter
