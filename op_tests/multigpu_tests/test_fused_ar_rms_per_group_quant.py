@@ -219,13 +219,19 @@ def fused_ar_rmsnorm_per_group_quant(
     torch.cuda.synchronize()
 
     from aiter.dist.communication_op import (
-        tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group,
+        tensor_model_parallel_fused_allreduce_rmsnorm_quant,
     )
 
     @perftest()
     def run_fused(x):
-        res = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
-            x, x, weight, eps, group_size=group_size, emit_bf16=emit_bf16
+        res = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+            x,
+            x,
+            weight,
+            eps,
+            quant_type="per_group",
+            group_size=group_size,
+            emit_bf16=emit_bf16,
         )
         if emit_bf16:
             out, res_out, scale_out, bf16_out = res

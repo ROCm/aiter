@@ -303,6 +303,7 @@ def unified_attention(
         # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
         num_blocks, block_size, num_kv_heads, _ = k.shape
         K_WIDTH = 16 if kv_cache_dtype == e4m3_dtype else 8
+        SCALE_K_WIDTH = 4
 
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads

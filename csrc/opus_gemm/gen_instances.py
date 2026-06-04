@@ -65,6 +65,34 @@ KERNEL_FUNC_MAP = {
     "a16w16_mono_tile": "gemm_a16w16_mono_tile_kernel_gfx950",
 }
 
+# 4g_safe sibling pipelines: only defined for the a16w16-family tags that have
+# matching *_4g_safe_gfx950.cuh files. Kids with is_4g_safe=True route to these
+# headers/kernel symbols instead of the legacy maps above.
+PIPELINE_HEADER_MAP_4G_SAFE = {
+    "a16w16": "gfx950/opus_gemm_pipeline_a16w16_4g_safe_gfx950.cuh",
+    "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_4g_safe_gfx950.cuh",
+    "a16w16_mono_tile": "gfx950/opus_gemm_pipeline_a16w16_mono_tile_4g_safe_gfx950.cuh",
+}
+
+KERNEL_FUNC_MAP_4G_SAFE = {
+    "a16w16": "gemm_a16w16_4g_safe_kernel",
+    "a16w16_persistent": "gemm_a16w16_persistent_4g_safe_kernel",
+    "a16w16_mono_tile": "gemm_a16w16_mono_tile_4g_safe_kernel_gfx950",
+}
+
+
+def _pipeline_header_for(k):
+    if getattr(k, "is_4g_safe", False):
+        return PIPELINE_HEADER_MAP_4G_SAFE[k.kernel_tag]
+    return PIPELINE_HEADER_MAP[k.kernel_tag]
+
+
+def _kernel_func_for(k):
+    if getattr(k, "is_4g_safe", False):
+        return KERNEL_FUNC_MAP_4G_SAFE[k.kernel_tag]
+    return KERNEL_FUNC_MAP[k.kernel_tag]
+
+
 INPUT_DTYPE_MAP = {
     "a8w8_scale": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
@@ -763,9 +791,9 @@ class opus_gemm_codegen:
                 f"LDS={info['lds_bytes'] // 1024}KiB K>={info['min_k']} WG={k.WG_PER_CU}"
             )
 
-        pipeline_header = PIPELINE_HEADER_MAP[k.kernel_tag]
+        pipeline_header = _pipeline_header_for(k)
         traits_header = TRAITS_HEADER_MAP[k.kernel_tag]
-        kernel_func = KERNEL_FUNC_MAP[k.kernel_tag]
+        kernel_func = _kernel_func_for(k)
         da, db = INPUT_DTYPE_MAP[k.kernel_tag]
         traits_name = TRAITS_NAME_MAP[k.kernel_tag]
         kargs_name = KARGS_NAME_MAP[k.kernel_tag]
@@ -1999,32 +2027,32 @@ void
     int padded_M    = num_tiles_m * {k.B_M};
     int padded_N    = num_tiles_n * {k.B_N};
 
-    // Thread-local growing workspace cache. Kernels see a stable handle
-    // slot (host-coherent, address never changes) and deref slot->ptr at
-    // entry; grow path swaps slot contents after a device sync. Captured
-    // graphs hold the slot, not the raw buffer, so a later grow doesn't
-    // dangle them. 4 MiB round-up absorbs near-miss shapes.
+    // Per-stream workspace handle (process-global registry, mutex-protected
+    // in opus_gemm.cu). Replaces the prior `static thread_local` cache —
+    // under TBO two CPU threads drive two streams concurrently, and each
+    // captured graph must bake in its own buffer pointer. Eager: lazy-
+    // create. Capture: must be pre-warmed via
+    // aiter.opus_gemm_workspace_init() on the capture stream.
+    // (opus_splitk_ws_handle is already a complete type at this point via
+    // the traits header included at the top of this launcher .cuh.)
+    extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
+
     auto stream = aiter::getCurrentHIPStream();
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
+    const bool capturing = (capture_status != hipStreamCaptureStatusNone);
+    auto* ws_handle_ = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
+
     size_t ws_bytes = (size_t)split_k * (size_t)batch
                     * (size_t)padded_M * (size_t)padded_N * sizeof(float);
-    static thread_local opus_splitk_ws_handle* ws_handle_ = []() {{
-        opus_splitk_ws_handle* h = nullptr;
-        HIP_CALL(hipHostMalloc(reinterpret_cast<void**>(&h),
-                               sizeof(opus_splitk_ws_handle),
-                               hipHostMallocCoherent));
-        h->ptr = nullptr;
-        h->bytes = 0;
-        return h;
-    }}();
     if (ws_handle_->ptr == nullptr || ws_bytes > ws_handle_->bytes)
     {{
-        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-        HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
-        AITER_CHECK(capture_status == hipStreamCaptureStatusNone,
+        AITER_CHECK(!capturing,
             "splitk workspace grow inside HIP graph capture is not "
             "supported (hipMalloc / hipFree are stream-capture-illegal). "
-            "Warm the cache once eagerly with the largest workspace before "
-            "capturing.");
+            "Warm this stream eagerly with the largest expected workspace "
+            "before capture (call aiter.opus_gemm_workspace_init() then "
+            "run the largest expected gemm).");
 
         void* new_ptr = nullptr;
         const size_t kGrowAlign = (size_t)4 * 1024 * 1024;

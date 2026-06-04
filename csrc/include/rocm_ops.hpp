@@ -235,20 +235,6 @@ namespace py = pybind11;
           "                str kv_cache_dtype,"                   \
           "                float k_scale, float v_scale) -> ()");
 
-#define ATTENTION_V1_PYBIND                                       \
-    m.def("paged_attention_v1",                                   \
-          &paged_attention_v1,                                    \
-          "paged_attention_v1(Tensor! out, Tensor exp_sums,"      \
-          "                Tensor max_logits, Tensor tmp_out,"    \
-          "                Tensor query, Tensor key_cache,"       \
-          "                Tensor value_cache, int num_kv_heads," \
-          "                float scale, Tensor block_tables,"     \
-          "                Tensor context_lens, int block_size,"  \
-          "                int max_context_len,"                  \
-          "                Tensor? alibi_slopes,"                 \
-          "                str kv_cache_dtype,"                   \
-          "                float k_scale, float v_scale) -> ()");
-
 #define BATCHED_GEMM_A8W8_PYBIND            \
     m.def("batched_gemm_a8w8",              \
           &batched_gemm_a8w8,               \
@@ -316,6 +302,14 @@ namespace py = pybind11;
           py::arg("bias") = std::nullopt,         \
           py::arg("kernelId") = 0,                \
           py::arg("splitK")   = 0);
+
+#define OPUS_GEMM_WORKSPACE_INIT_PYBIND                                 \
+    m.def("opus_gemm_workspace_init",                                   \
+          &opus_gemm_workspace_init,                                    \
+          "Register a splitk fp32 workspace handle for the current "    \
+          "CUDA stream. Call once per stream eagerly (outside HIP "     \
+          "graph capture) before capturing graphs that include "        \
+          "opus_gemm splitk kernels under TBO.");
 
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
@@ -515,6 +509,20 @@ namespace py = pybind11;
           py::arg("w"),                                                                         \
           py::arg("eps"),                                                                       \
           py::arg("group_size"),                                                                \
+          py::arg("reg_ptr"),                                                                   \
+          py::arg("reg_bytes"),                                                                 \
+          py::arg("use_1stage"),                                                                \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                                   \
+    m.def("fused_allreduce_rmsnorm_mxfp4_quant",                                                \
+          &aiter::fused_allreduce_rmsnorm_mxfp4_quant,                                          \
+          py::arg("_fa"),                                                                       \
+          py::arg("inp"),                                                                       \
+          py::arg("res_inp"),                                                                   \
+          py::arg("res_out"),                                                                   \
+          py::arg("out"),                                                                       \
+          py::arg("scale_out"),                                                                 \
+          py::arg("w"),                                                                         \
+          py::arg("eps"),                                                                       \
           py::arg("reg_ptr"),                                                                   \
           py::arg("reg_bytes"),                                                                 \
           py::arg("use_1stage"),                                                                \

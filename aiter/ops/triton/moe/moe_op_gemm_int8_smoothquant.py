@@ -169,7 +169,7 @@ def moe_gemm_int8_smoothquant(
     preshuffled: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
     apply_activation: bool = False,
-    add_residual: bool = False,
+    swiglu_add_residual: bool = False,
     alpha: float = 1.0,
     limit: float = 1.0,
 ):
@@ -306,7 +306,7 @@ def moe_gemm_int8_smoothquant(
             limit,
             reduction_n_matmul,
             (alpha != 0) and (config["split_k"] == 1),  # APPLY_ACTIVATION
-            add_residual,
+            swiglu_add_residual,
             routing_data.n_expts_act,
             config["block_m"],
             gluon_block_n,
@@ -351,7 +351,7 @@ def moe_gemm_int8_smoothquant(
             limit,
             reduction_n_matmul,
             (alpha != 0) and (config["split_k"] == 1),  # APPLY_ACTIVATION
-            add_residual,
+            swiglu_add_residual,
             routing_data.n_expts_act,
             config["block_m"],
             config["block_n"],
@@ -384,7 +384,7 @@ def moe_gemm_int8_smoothquant(
         limit,
         reduction_n_reduction,
         out_dtype=out_dtype,
-        add_residual=add_residual,
+        swiglu_add_residual=swiglu_add_residual,
     )
 
     return y_final
