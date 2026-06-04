@@ -12,8 +12,7 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-
-import os
+from aiter.jit.core import is_experimental_enabled
 
 
 @triton.jit
@@ -125,6 +124,7 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
     get_block_n_fp8 = {
+        8: 64,
         16: 128,
         32: 128,
         48: 64,
@@ -206,7 +206,7 @@ def mla_decode_fwd(
                 num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
             )
 
-        mgc = 64 if max_seqlen_q == 1 and nhead == 16 else 16
+        mgc = 64 if max_seqlen_q == 1 and nhead in [8, 16] else 16
         mgc = (
             32
             if (
@@ -223,7 +223,7 @@ def mla_decode_fwd(
 
         MAYBE_FINAL_OUT = True
 
-        if nhead == 16 and max_seqlen_q == 1:
+        if nhead in [8, 16] and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
 
         logits = (
@@ -233,6 +233,11 @@ def mla_decode_fwd(
                 and (
                     q.dtype == dtypes.fp8
                     or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+                    or (
+                        q.dtype == dtypes.bf16
+                        and kv_buffer.dtype == dtypes.bf16
+                        and nhead == 32
+                    )
                 )
             )
             else torch.empty(
@@ -275,7 +280,13 @@ def mla_decode_fwd(
         )
 
         if num_kv_splits == 1 and (
-            q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+            q.dtype == dtypes.fp8
+            or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+            or (
+                q.dtype == dtypes.bf16
+                and kv_buffer.dtype == dtypes.bf16
+                and nhead == 32
+            )
         ):
             lse = final_lse if return_lse else attn_lse
             return logits.view(total_s, nhead, v_head_dim), lse
@@ -329,10 +340,28 @@ def mla_decode_fwd(
             )
             or (
                 get_gfx() == "gfx950"
-                and nhead == 32
+                and nhead == 128
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q == 4
+                and is_experimental_enabled()
+            )
+            or (
+                get_gfx() == "gfx942"
+                and nhead in (16, 32, 64)
+                and nhead * max_seqlen_q == 128
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and is_experimental_enabled()
+            )
+            or (
+                get_gfx() == "gfx950"
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and (
+                    (nhead == 32 and max_seqlen_q == 4)
+                    or (nhead == 64)
+                    or (nhead == 128)
+                )
             )
             or (
                 get_gfx() == "gfx950"
@@ -343,53 +372,31 @@ def mla_decode_fwd(
             )
             or (
                 get_gfx() == "gfx950"
-                and nhead * max_seqlen_q % 128 == 0
-                and q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
-            )
-            or (
-                get_gfx() == "gfx950"
                 and nhead == 8
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
                 and max_seqlen_q == 4
             )
             or (
+                get_gfx() == "gfx942"
+                and nhead == 8
+                and q.dtype == dtypes.bf16
+                and kv_buffer.dtype == dtypes.bf16
+                and max_seqlen_q == 2
+            )
+            or (
                 get_gfx() == "gfx950"
-                and nhead == 64
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q == 1
+                and q.dtype == dtypes.bf16
+                and kv_buffer.dtype == dtypes.bf16
             )
         ):
             # Natively support cases
             pass
         elif nhead in range(32, 128 + 1, 16) and persistent_mode:
-            # we use nhead=16 to simulate such cases by customized metadata
-            # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
-            use_qseqlen_fold = (
-                get_gfx() == "gfx950"
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and (
-                    (max_seqlen_q * (ori_nhead // 16) == 4)
-                    or (ori_nhead == 64 and max_seqlen_q == 2)
-                )
-            )
-
-            if use_qseqlen_fold and (ori_nhead == 64 and max_seqlen_q == 2):
-                fold_factor = ori_nhead // 32
-                nhead = 32
-            else:
-                fold_factor = ori_nhead // 16
-                nhead = 16
-
+            fold_factor = ori_nhead // 16
+            nhead = 16
             total_s = ori_total_s * fold_factor
-            if use_qseqlen_fold:
-                max_seqlen_q = max_seqlen_q * fold_factor
-                q = q.view(total_s, nhead, -1)
-                qseqlen_folded = True
-            elif max_seqlen_q == 1:
+            if max_seqlen_q == 1:
                 q = q.view(total_s, nhead, -1)
             else:
                 q = (
@@ -427,11 +434,19 @@ def mla_decode_fwd(
         )
 
         use_hk = (
-            nhead == 128
+            get_gfx() in ("gfx942", "gfx950")
+            and nhead * max_seqlen_q == 128
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
-            and page_size == 1
-            and os.getenv("AITER_ENABLE_EXPERIMENTAL", False)
+            and page_size in (1, 64)
+            and is_experimental_enabled()
+        ) or (
+            get_gfx() == "gfx950"
+            and nhead * max_seqlen_q == 64
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and page_size in (1, 64)
+            and is_experimental_enabled()
         )
 
         if use_hk:

@@ -185,6 +185,7 @@ def input_helper(
         k_shape = (BATCH, N_CTX_K, HK, D_HEAD)
         v_shape = (BATCH, N_CTX_K, HK, D_HEAD_V)
 
+    torch.manual_seed(20)
     q = torch.randn(q_shape, device="cuda", dtype=dtype)
     k = torch.randn(k_shape, device="cuda", dtype=dtype)
     v = torch.randn(v_shape, device="cuda", dtype=dtype)
@@ -203,7 +204,6 @@ def input_helper(
 @pytest.mark.parametrize(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
-@pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
 def test_sage(
     BATCH: int,
@@ -211,10 +211,12 @@ def test_sage(
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
     NUM_K_HEADS: int,
-    HEAD_SZ: int,
     layout: str,
     dtype=torch.bfloat16,
 ):
+    HEAD_SZ = 128
+
+    torch.manual_seed(20)
     torch.cuda.empty_cache()
 
     softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
@@ -453,6 +455,118 @@ def test_sage_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat16):
     )
 
 
+@pytest.mark.parametrize("layout", ["bshd"])
+def test_sage_block_sparse_empty_kv_blocks_lse_is_neg_inf(
+    layout: str, dtype=torch.bfloat16
+):
+    """
+    For Q blocks that have no allowed KV blocks the kernel takes the
+    `_no_blocks` early-exit path. The returned softmax_lse for those rows must
+    be -inf so FA-style ring merges treat the shard as zero-weight; non-empty
+    Q blocks must keep finite LSE.
+    """
+    torch.cuda.empty_cache()
+    BATCH, SEQLEN_Q, SEQLEN_K = 1, 256, 256
+    NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 4, 4, 128
+    config = get_sage_fwd_configs()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    num_q_blocks = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
+    num_kv_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+    block_attn_mask = torch.ones(
+        BATCH, num_q_blocks, num_kv_blocks, dtype=torch.bool, device="cuda"
+    )
+    block_attn_mask[:, 0, :] = False
+
+    block_lut = block_attn_mask_to_ragged_lut(block_attn_mask, num_heads=NUM_Q_HEADS)
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    _, lse = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=True,
+        layout=layout,
+        block_lut=block_lut,
+    )
+
+    assert lse.shape == (BATCH, NUM_Q_HEADS, SEQLEN_Q)
+    empty_rows = lse[:, :, :BLOCK_M]
+    rest_rows = lse[:, :, BLOCK_M:]
+    assert torch.isneginf(
+        empty_rows
+    ).all(), f"Expected -inf LSE for empty Q block, got {empty_rows}"
+    assert torch.isfinite(
+        rest_rows
+    ).all(), "Expected finite LSE for Q blocks with valid KV"
+
+
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(64, 16), (128, 32), (256, 64)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 4)])
+def test_sage_causal_above_diagonal_lse_is_neg_inf(
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """
+    With causal masking and seqlen_q > seqlen_k, the first (seqlen_q - seqlen_k)
+    Q rows have no valid K positions. Their softmax_lse must be -inf (logsumexp
+    over empty set) so FA-style ring merges treat them correctly.
+    """
+    torch.cuda.empty_cache()
+    BATCH, HEAD_SZ = 2, 128
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    _, lse = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=True,
+        return_lse=True,
+        layout=layout,
+    )
+
+    assert lse.shape == (BATCH, NUM_Q_HEADS, SEQLEN_Q)
+    n_above = SEQLEN_Q - SEQLEN_K
+    above = lse[:, :, :n_above]
+    below = lse[:, :, n_above:]
+    assert torch.isneginf(
+        above
+    ).all(), f"Expected -inf LSE for rows above causal diagonal, got {above}"
+    assert torch.isfinite(
+        below
+    ).all(), "Expected finite LSE for rows on/below causal diagonal"
+
+
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -461,24 +575,21 @@ def test_sage_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat16):
 @pytest.mark.parametrize(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
-@pytest.mark.parametrize("HEAD_SZ", [128])
-@pytest.mark.parametrize("layout", ["bhsd"])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("qsmooth", [True, False])
-@pytest.mark.parametrize("hadamard_rotate", [True])  # TODO: hadamard expected to be on
 def test_sage_mxfp4(
     BATCH: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
     NUM_K_HEADS: int,
-    HEAD_SZ: int,
-    layout: str,
     causal: bool,
     qsmooth: bool,
-    hadamard_rotate: bool,
     dtype=torch.bfloat16,
 ):
+    HEAD_SZ = 128
+    layout = "bhsd"
+    hadamard_rotate = True  # hadamard expected to be on
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
@@ -734,4 +845,184 @@ def test_sage_mxfp4_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat
         atol=ATOL_fp8,
         rtol=RTOL_fp8,
         max_diff_percentage=1.5,
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(256, 256), (512, 512)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 16), (16, 4)])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_sage_return_lse_matches_reference(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """
+    With smooth_k=True the kernel computes LSE against (K - mean(K)). The
+    wrapper's correction term should make the returned LSE match the LSE that
+    an un-smoothed K would produce (within sage's int8/fp8 quant noise).
+    This is the property that FA-style ring-attention merging relies on.
+    """
+    HEAD_SZ = 128
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    _, triton_lse = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=True,
+        layout=layout,
+        smooth_k=True,
+    )
+
+    if layout == "bshd":
+        q_b = q.permute(0, 2, 1, 3).contiguous()
+        k_b = k.permute(0, 2, 1, 3).contiguous()
+    else:
+        q_b = q
+        k_b = k
+    if NUM_Q_HEADS != NUM_K_HEADS:
+        assert NUM_Q_HEADS % NUM_K_HEADS == 0
+        k_b = k_b.repeat_interleave(NUM_Q_HEADS // NUM_K_HEADS, dim=1)
+    qk = (q_b.float() @ k_b.float().transpose(-1, -2)) * softmax_scale
+    lse_ref = torch.logsumexp(qk, dim=-1)
+
+    assert (
+        triton_lse.shape == lse_ref.shape
+    ), f"LSE shape {tuple(triton_lse.shape)} != reference {tuple(lse_ref.shape)}"
+    # Pre-PR (no K-mean correction) the LSE is offset by
+    # softmax_scale * Q . mean(K)^T, which is O(1)+ in magnitude.
+    # With the correction, the residual is bounded by sage's int8/fp8 quant noise.
+    torch.testing.assert_close(
+        triton_lse,
+        lse_ref.to(triton_lse.dtype),
+        atol=2e-1,
+        rtol=5e-2,
+    )
+
+
+def _fa_merge_partial(out_a, lse_a, out_b, lse_b, layout: str):
+    """FA log-sum-exp partial merge. LSE is (B, H_q, S_q); output layout varies."""
+    m = torch.maximum(lse_a, lse_b)
+    w_a = (lse_a - m).exp()
+    w_b = (lse_b - m).exp()
+    denom = w_a + w_b
+    if layout == "bhsd":
+        w_a4 = w_a.unsqueeze(-1)
+        w_b4 = w_b.unsqueeze(-1)
+        denom4 = denom.unsqueeze(-1)
+    else:  # bshd: out is (B, S_q, H_q, D); merge weights into that layout.
+        w_a4 = w_a.transpose(1, 2).unsqueeze(-1)
+        w_b4 = w_b.transpose(1, 2).unsqueeze(-1)
+        denom4 = denom.transpose(1, 2).unsqueeze(-1)
+    out = (out_a * w_a4 + out_b * w_b4) / denom4
+    lse = m + denom.log()
+    return out, lse
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize("SEQLEN", [512, 1024])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 4)])
+@pytest.mark.parametrize("RING_DEGREE", [2, 4])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_sage_ring_merge_matches_single_call(
+    BATCH: int,
+    SEQLEN: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    RING_DEGREE: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """
+    Mimic ring attention: split K/V along the sequence dim into RING_DEGREE shards,
+    run sage per shard with return_lse=True, FA-merge the partial (out, lse) pairs,
+    and assert the merged output matches a single-call sage forward (within sage's
+    int8/fp8 quant noise). Pre-PR this diverges with RING_DEGREE because each
+    shard uses a different K mean; post-PR it stays bounded.
+    """
+    HEAD_SZ = 128
+    assert SEQLEN % RING_DEGREE == 0
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN,
+        SEQLEN,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    full_out, _ = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=True,
+        layout=layout,
+        smooth_k=True,
+    )
+
+    seq_dim_kv = 2 if layout == "bhsd" else 1
+    k_shards = k.chunk(RING_DEGREE, dim=seq_dim_kv)
+    v_shards = v.chunk(RING_DEGREE, dim=seq_dim_kv)
+
+    out_acc = None
+    lse_acc = None
+    for k_s, v_s in zip(k_shards, v_shards):
+        out_s, lse_s = fav3_sage_wrapper_func(
+            q,
+            k_s.contiguous(),
+            v_s.contiguous(),
+            softmax_scale,
+            causal=False,
+            return_lse=True,
+            layout=layout,
+            smooth_k=True,
+        )
+        out_s = out_s.float()
+        lse_s = lse_s.float()
+        if out_acc is None:
+            out_acc, lse_acc = out_s, lse_s
+        else:
+            out_acc, lse_acc = _fa_merge_partial(out_acc, lse_acc, out_s, lse_s, layout)
+
+    merged_out = out_acc.to(full_out.dtype)
+    assert merged_out.shape == full_out.shape
+
+    check_attention_outputs(
+        merged_out,
+        full_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=1.0,
     )

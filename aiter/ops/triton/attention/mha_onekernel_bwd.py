@@ -221,6 +221,7 @@ def flash_attn_onekernel_backward(
         do,
         delta,
         *o_strides,
+        *do_strides,
         *delta_strides,
         descale_strides[3],
         cu_seqlens_q,

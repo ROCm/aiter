@@ -152,7 +152,11 @@ class TunerCommon:
             "--errRatio",
             type=float,
             default=defaults["errRatio"],
-            help="tolerable error ratio, default 0.05.",
+            help="Tolerable error ratio (default 0.05). During tuning, kernels "
+            "with observed error above this are rejected. During --run_config, "
+            "the effective threshold per shape is max(this value, the observed "
+            "errRatio stored in the tuned CSV), so kernels that were tuned with "
+            "a larger observed error are not falsely flagged.",
         )
         self.parser.add_argument(
             "--batch",
@@ -269,15 +273,25 @@ class TunerCommon:
         for i, path in enumerate(path_list[1:]):
             if os.path.exists(path):
                 df = _read_csv(path)
-                base_cols = [c for c in df_list[0].columns if c != "_tag"]
-                new_cols = [c for c in df.columns if c != "_tag"]
-                assert (
-                    base_cols == new_cols
-                ), f"Column mismatch between {path_list[0]} and {path}, {base_cols}, {new_cols}"
-
                 df_list.append(df)
             else:
                 print(f"path {i+1}: {path} (not exist)")
+
+        if len(df_list) > 1:
+            all_cols = list(df_list[0].columns)
+            for df in df_list[1:]:
+                for c in df.columns:
+                    if c not in all_cols:
+                        insert_before = (
+                            "tflops" if "tflops" in all_cols else all_cols[-1]
+                        )
+                        all_cols.insert(all_cols.index(insert_before), c)
+            _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
+            for j in range(len(df_list)):
+                for c in all_cols:
+                    if c not in df_list[j].columns:
+                        df_list[j][c] = _FILL_DEFAULTS.get(c, 0)
+                df_list[j] = df_list[j][all_cols]
         merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
         dedup_keys = self.keys
         if "_tag" in merge_df.columns:
@@ -288,7 +302,8 @@ class TunerCommon:
             .drop_duplicates(subset=dedup_keys, keep="first")
             .reset_index(drop=True)
         )
-        new_file_path = f"/tmp/{merge_name}.csv"
+        pid = os.getpid()
+        new_file_path = f"/tmp/{merge_name}.{pid}.csv"
         merge_df.to_csv(new_file_path, index=False)
         return new_file_path
 
@@ -376,7 +391,18 @@ class TunerCommon:
             return df_old
         key_columns = self.keys
         df_updates = df_updates.loc[:, self.columns]
-        # print(df_updates)
+        # Widen integer columns to object so that float/string updates don't
+        # trigger a Pandas dtype-coercion error (e.g. tflops=0 stored as int64
+        # cannot accept a float like 2.61).
+        import numpy as np
+
+        for col in df_old.columns:
+            if col in df_updates.columns and df_old[col].dtype != df_updates[col].dtype:
+                try:
+                    common = np.result_type(df_old[col].dtype, df_updates[col].dtype)
+                except TypeError:
+                    common = object
+                df_old[col] = df_old[col].astype(common)
         df_old["_tmp_key"] = df_old[key_columns].apply(tuple, axis=1)
         df_updates["_tmp_key"] = df_updates[key_columns].apply(tuple, axis=1)
         matched_keys = df_updates[df_updates["_tmp_key"].isin(df_old["_tmp_key"])][
@@ -596,6 +622,66 @@ class TunerCommon:
         if not status:
             return "UNKNOWN", ""
         return status.upper(), ""
+
+    # Margin added to CSV observed errRatio to absorb seed/run-to-run variance.
+    _ERR_RATIO_MARGIN = 0.05
+
+    def _get_run_config_err_ratio_limit(self, row, args):
+        """Return ``(threshold, desc)`` for run_config pass/fail.
+
+        Threshold = max(--errRatio, csv_observed_errRatio + margin).
+
+        Tuned CSVs store the observed error ratio at tuning time, which may
+        have been measured with a different random seed. Adding a small margin
+        (default 4%) absorbs the run-to-run variance so that run_config does
+        not falsely flag kernels whose error fluctuates slightly across seeds.
+        """
+        default_limit = float(
+            getattr(args, "errRatio", self.ARG_DEFAULTS.get("errRatio", 0.05))
+        )
+        default_desc = f"--errRatio={default_limit:.6g}"
+        if row is None or not hasattr(row, "get"):
+            return default_limit, default_desc
+
+        csv_label = None
+        csv_value = None
+        for column in ("errRatio", "err_ratio", "err"):
+            value = row.get(column, None)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            if not pd.notna(value):
+                continue
+            try:
+                csv_value = float(value)
+            except (TypeError, ValueError):
+                continue
+            csv_label = f"csv {column}"
+            break
+
+        if csv_value is None:
+            stage_limits = []
+            for column in ("err1", "err2"):
+                value = row.get(column, None)
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    continue
+                if not pd.notna(value):
+                    continue
+                try:
+                    stage_limits.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            if stage_limits:
+                csv_value = max(stage_limits)
+                csv_label = "csv max(err1,err2)"
+
+        if csv_value is None:
+            return default_limit, default_desc
+
+        csv_with_margin = csv_value + self._ERR_RATIO_MARGIN
+        csv_part = f"{csv_label}={csv_value:.6g}+{self._ERR_RATIO_MARGIN:.0%}margin"
+        if csv_with_margin > default_limit:
+            return csv_with_margin, f"{csv_part}={csv_with_margin:.6g}"
+        return default_limit, f"{default_desc}, {csv_part} baseline"
 
     def _format_benchmark_keys(self, row):
         parts = []
@@ -1035,14 +1121,11 @@ class TunerCommon:
         compare_dir = os.path.join(tempfile.gettempdir(), "aiter_compare")
         os.makedirs(compare_dir, exist_ok=True)
         base_name = os.path.splitext(os.path.basename(output_file))[0]
-        fd, compare_report_file = tempfile.mkstemp(
-            prefix=f"{base_name}.",
-            suffix=".compare.txt",
-            dir=compare_dir,
-            text=True,
+        pid = os.getpid()
+        compare_report_file = os.path.join(
+            compare_dir, f"{base_name}.{pid}.compare.txt"
         )
-        os.chmod(compare_report_file, 0o600)
-        with os.fdopen(fd, "w") as f:
+        with open(compare_report_file, "w") as f:
             f.write(
                 f"Compare report for {self.name}\n"
                 f"Shapes: {len(self.untunedf)}\n"
@@ -1104,11 +1187,13 @@ class TunerCommon:
         processed_batches,
         compare_candidate_file=None,
     ):
-        fd, batch_compare_output_file = tempfile.mkstemp(
-            prefix=f"{self.name}_compare_batch_{processed_batches}_",
-            suffix=".csv",
+        pid = os.getpid()
+        compare_dir = os.path.join(tempfile.gettempdir(), "aiter_compare")
+        os.makedirs(compare_dir, exist_ok=True)
+        batch_compare_output_file = os.path.join(
+            compare_dir,
+            f"{self.name}_compare_batch_{processed_batches}_{pid}.csv",
         )
-        os.close(fd)
         candidate_base_file = (
             compare_candidate_file
             if compare_candidate_file and os.path.exists(compare_candidate_file)

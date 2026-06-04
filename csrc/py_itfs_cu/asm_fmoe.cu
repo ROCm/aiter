@@ -76,21 +76,26 @@ class FMoeKernel
     bool is_int4                = false;
     uint32_t num_persistent_tgs = 0;
     const char* name            = nullptr;
+    //Kernel is processing 1 token per TG and does not require sorting.
+    bool is_flat_dispatch = false;
 
     public:
     FMoeKernel(const char* name,
                const char* hsaco,
                uint32_t sub_GU             = 512,
-               uint32_t num_persistent_tgs = 0) : kernel(name, hsaco)
+               uint32_t num_persistent_tgs = 0,
+               bool is_flat_dispatch       = false) : kernel(name, hsaco)
     {
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
         this->name               = name;
+        this->is_flat_dispatch   = is_flat_dispatch;
     };
 
     const char* get_name() const { return name; }
     int get_num_persistent_tgs() { return num_persistent_tgs; }
     int get_sub_GU() { return sub_GU; }
+    bool get_is_flat_dispatch() const { return is_flat_dispatch; }
     void set_4bit(bool is_4bit_) { is_int4 = is_4bit_; }
 
     template <int I_elemSize, int O_elemSize, bool switchGxy = false>
@@ -182,8 +187,18 @@ class FMoeKernel
         int gdx;
         int gdy;
         int gdz;
-        if(this->num_persistent_tgs != 0 && args.total_tgs > 0 &&
-           (args.total_tgs % args.ps_deno) == 0) // ps
+        // FLAT (manifest flat): raw topk in sorted_* slots; no host moe_sort.
+        // gdx=tiles, gdy=topk, gdz=tokens; switchGxy swaps gdx/gdy at launch.
+        // One TG per (token, top-k slot); sub_X_cnt unused for grid sizing.
+        if(this->is_flat_dispatch)
+        {
+            bdx = 256;
+            gdx = ((inter_dim + sub_GU - 1) / sub_GU);
+            gdy = static_cast<int>(topk);
+            gdz = static_cast<int>(token_cnt);
+        }
+        else if(this->num_persistent_tgs != 0 && args.total_tgs > 0 &&
+                (args.total_tgs % args.ps_deno) == 0) // ps
         {
 
             bdx = 256;
@@ -297,8 +312,10 @@ FMoeKernel* get_heuristic_kernel(
         else
             num_persistent_tgs = 0;
 
-        impl_ptr = &impl_ptr_map.get_or_create(
-            name, [&]() { return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs); });
+        const bool is_flat_dispatch = (cfg.flat != 0);
+        impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
+            return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs, is_flat_dispatch);
+        });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel " + selectedKl);
@@ -891,10 +908,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     if(out->dtype() == AITER_DTYPE_bf16 && inter_dim % 128 == 0 && fc_scale_blkn == 128 &&
        fc_scale_blkk == 128)
     {
+        bool xquant = (input->dtype() == AITER_DTYPE_bf16);
         if(act == ActivationType::Silu)
-            config_map = &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
+            config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
         else if(act == ActivationType::Gelu)
-            config_map = &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
+            config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_gelu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
         else
             AITER_CHECK(
                 false, __func__, "Unsupported activation type for fmoe_fp8_blockscale_g1u1");

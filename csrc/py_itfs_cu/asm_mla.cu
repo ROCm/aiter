@@ -185,7 +185,8 @@ void mla_decode_stage1_asm_fwd(
     }
     else
     {
-        args.out_16_nosplit = 0;
+        // nsplit==1: kernel must use bf16 R_write (logits may alias final output o)
+        args.out_16_nosplit = (kv_split == 1) ? 1 : 0;
         args.ptr_RP = nullptr;
         args.ptr_STP = num_kv_splits_indptr->data_ptr();
     }
@@ -313,6 +314,10 @@ void mla_decode_stage1_asm_fwd(
             if(!persistent){
                 config_max_seqlen_q = 0;
                 sub_Q = 64;
+            } else if(persistent && max_seqlen_q == 1){
+                config_max_seqlen_q = 4;
+                config_gqa_ratio = 32;
+                args.s_MQA = gqa_ratio;
             }
         }else if (q_type == "fp8" && kv_type == "fp8"){
             if((max_seqlen_q == 4) && persistent){
@@ -322,7 +327,7 @@ void mla_decode_stage1_asm_fwd(
                 config_max_seqlen_q = 2;
                 sub_Q = 128;
             } else {
-                AITER_CHECK(false, __func__, 
+                AITER_CHECK(false, __func__,
                     ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=2,4 in persistent mode");
             }
         }
@@ -337,23 +342,49 @@ void mla_decode_stage1_asm_fwd(
                 sub_Q = 64;
             }
         } else if (q_type == "fp8" && kv_type == "fp8"){
-            if (persistent && max_seqlen_q == 1){
-                config_max_seqlen_q = 1;
+            if (persistent){
+                if(max_seqlen_q == 1){
+                    config_max_seqlen_q = 1;
+                } else {
+                    config_max_seqlen_q = 4;
+                }
             } else {
                 AITER_CHECK(false, __func__,
-                    ": fp8/fp8 with gqa_ratio=64 only supports decode_qlen=1 in persistent mode");
+                    ": fp8/fp8 with gqa_ratio=64 only supports persistent mode");
+            }
+        }
+    } else if (gqa_ratio == 8){
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(!persistent){
+                config_max_seqlen_q = 1;
+                sub_Q = 8;
+            }
+        } else if (q_type == "fp8" && kv_type == "fp8"){
+            if(!persistent && max_seqlen_q == 1){
+                config_max_seqlen_q = 1;
+                sub_Q = 8;
             }
         }
     }
 
-    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio* max_seqlen_q % 128 == 0)){
+    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
-        args.s_Q_Bs = gqa_ratio;
+        args.s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio > 16) && (gqa_ratio * max_seqlen_q != 32)){
+        config_max_seqlen_q = 1;
+        config_gqa_ratio = 64;
+        args.s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
+               && ((gqa_ratio == 32 && max_seqlen_q == 4)
+                   || (gqa_ratio == 64 && max_seqlen_q >= 2 && max_seqlen_q <= 4)
+                   || (gqa_ratio == 128))){
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 32;
+        args.s_MQA = gqa_ratio;
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag);
-
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
     AiterAsmKernel* impl_ptr = nullptr;

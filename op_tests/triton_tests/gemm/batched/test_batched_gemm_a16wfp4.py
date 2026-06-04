@@ -189,3 +189,49 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
     batched_gemm_a16wfp4(x, w, w_scales, dtype, out, transpose_bm=False, prequant=True)
 
     torch.testing.assert_close(torch_out, out)
+
+
+def test_batched_gemm_a16wfp4_fake_honors_transpose_bm():
+    """Regression: the fake must match the real kernel's allocation
+    branch on ``transpose_bm`` (lines 100-103 of batched_gemm_a16wfp4.py).
+
+    Pre-fix the fake returned ``(Bx, M, N)`` regardless of
+    ``transpose_bm``, so under ``torch.compile`` AOTAutograd specialized
+    the unbacked SymInt ``M`` of any downstream consumer to the static
+    ``Bx`` -- silently producing wrong output (or a GPU memory access
+    fault) on cudagraph replay at any other ``M``. Post-fix the fake
+    returns ``(M, Bx, N)`` when ``transpose_bm=True``, matching the real
+    kernel.
+
+    Pure meta-tensor test: no GPU, no FP4 hardware, no kernel launch,
+    no ``torch.compile`` trace -- testing the fake function in isolation
+    is the necessary and sufficient condition for the downstream graph
+    to be correct.
+    """
+    from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
+        batched_gemm_a16wfp4_fake_tensor,
+    )
+
+    B, M, N, K = 16, 7, 512, 128
+
+    x = torch.empty((B, M, K), dtype=torch.bfloat16, device="meta")
+    w = torch.empty((B, N, K // 2), dtype=torch.uint8, device="meta")
+    w_scales = torch.empty((B, N, K // 32), dtype=torch.uint8, device="meta")
+
+    out_t = batched_gemm_a16wfp4_fake_tensor(
+        x, w, w_scales, dtype=torch.bfloat16, transpose_bm=True
+    )
+    assert out_t.shape == (
+        M,
+        B,
+        N,
+    ), f"transpose_bm=True must return (M, B, N); got {tuple(out_t.shape)}"
+
+    out_f = batched_gemm_a16wfp4_fake_tensor(
+        x, w, w_scales, dtype=torch.bfloat16, transpose_bm=False
+    )
+    assert out_f.shape == (
+        B,
+        M,
+        N,
+    ), f"transpose_bm=False must return (B, M, N); got {tuple(out_f.shape)}"
