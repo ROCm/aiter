@@ -36,6 +36,7 @@ torch.set_default_device("cuda")
 PA_HEAD_DIM = 64
 PA_PAGE_SIZE = 256
 PA_GQA_RATIO = 8
+PA_TILE_Q = 32  # kernel TileQ; mtp must be < PA_TILE_Q / gqa (= 4)
 
 fp8 = torch.float8_e4m3fn
 
@@ -202,11 +203,16 @@ def ref_pa_decode(
     (matching test_pa_ps.py's k-cache reconstruction / asm_V_shuffle), dequants
     with the per-tensor scales, then does softmax attention per (batch, kv_head,
     gqa) over the whole context (multi-page via kv_indptr/kv_indices) -> bf16.
+
+    For mtp>0 the kernel applies the per-MTP-position causal bound (see sched2
+    common_pa_ps.h): query position i (0..mtp) attends only to the first
+    `ctx - mtp + 1 + i` tokens.  For mtp=0 this is the full context (no-op).
     """
     num_pages, kv_head_num = K.shape[0], K.shape[1]
     head_dim = Q.shape[-1]
     page_size = V.shape[2] * V.shape[4]  # (page_size//16) * 16
     batch, qlen = Q.shape[0], Q.shape[1]
+    mtp = qlen - 1
     device = Q.device
 
     # K[p,h,d//16,tok,d%16] -> K_tm[p,h,tok,d];  V[p,h,tok//16,d,tok%16] -> V_tm[p,h,tok,d]
@@ -223,10 +229,11 @@ def ref_pa_decode(
         Kc = K_tm[tok_page, :, tok_off, :] * key_scale     # [ctx, kv_head, head_dim]
         Vc = V_tm[tok_page, :, tok_off, :] * value_scale   # [ctx, kv_head, head_dim]
         for ql in range(qlen):
+            valid = max(min(ctx - mtp + 1 + ql, ctx), 1)   # MTP causal bound
             q = Qf[b, ql] * query_scale  # [kv_head, gqa, head_dim]
-            logits = torch.einsum("hgd,thd->hgt", q, Kc) * softmax_scale
+            logits = torch.einsum("hgd,thd->hgt", q, Kc[:valid]) * softmax_scale
             w = torch.softmax(logits.float(), dim=-1)
-            out[b, ql] = torch.einsum("hgt,thd->hgd", w, Vc)
+            out[b, ql] = torch.einsum("hgt,thd->hgd", w, Vc[:valid])
     return out.to(torch.bfloat16)
 
 
@@ -252,17 +259,19 @@ def test_pa_decode(
     batch: int,
     kv_head_num: int,
     ctx_len: int,
+    mtp: int = 0,
     scales: Optional[Tuple[float, float, float]] = None,
     varlen: bool = False,
 ) -> dict:
     """Random FP8 paged inputs (arbitrary kv_len) vs the torch host reference.
 
     scales=None -> random per-tensor q/k/v scales; otherwise the given (q,k,v).
+    mtp -> multi-token-predict layers (qlen = mtp+1); kernel requires mtp < 4.
     """
     gqa = PA_GQA_RATIO
     head_dim = PA_HEAD_DIM
     page_size = PA_PAGE_SIZE
-    mtp = 0
+    assert mtp < PA_TILE_Q // gqa, f"kernel requires mtp < {PA_TILE_Q // gqa}, got {mtp}"
     qlen_with_mtp = mtp + 1
     q_head_num = kv_head_num * gqa
     device = "cuda"
@@ -346,6 +355,7 @@ def test_pa_decode(
 
     return {
         "max_kv": int(seq_lens_kv.max().item()),
+        "mtp": mtp,
         "qkv_scale": (query_scale, key_scale, value_scale),
         "us": us,
         "err": err,
@@ -384,6 +394,15 @@ parser.add_argument(
     e.g. -c 256 4097""",
 )
 parser.add_argument(
+    "-m",
+    "--mtp",
+    type=int,
+    nargs="*",
+    default=[0],
+    help="""Multi-token-predict layers (qlen = mtp+1). Kernel requires mtp < 4.
+    e.g. -m 0 1 2 3""",
+)
+parser.add_argument(
     "--varlen",
     action="store_true",
     help="""Variable kv seqlens per batch (random in [1, ctx_len]). Default: False.""",
@@ -400,11 +419,11 @@ parser.add_argument(
 args = parser.parse_args()
 
 df = []
-for batch, kv_head_num, ctx_len in itertools.product(
-    args.batch_size, args.kv_head_num, args.ctx_len
+for batch, kv_head_num, ctx_len, mtp in itertools.product(
+    args.batch_size, args.kv_head_num, args.ctx_len, args.mtp
 ):
     ret = test_pa_decode(
-        batch, kv_head_num, ctx_len,
+        batch, kv_head_num, ctx_len, mtp,
         tuple(args.scales) if args.scales is not None else None,
         args.varlen,
     )
