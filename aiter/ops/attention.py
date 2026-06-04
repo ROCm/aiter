@@ -484,8 +484,12 @@ def pa_decode_bf16_asm(
     v_scale = torch.tensor([value_scale], dtype=torch.float32, device=device)
 
     if sink is None:
+        # The kernel is compiled sink-enabled (always reads + merges the sink
+        # slot), so default to a FINITE large-negative buffer (numerical no-op:
+        # exp2((sink-max)*scl) underflows to 0) rather than -inf, which can
+        # produce inf/NaN in the in-kernel sink merge.
         sink = torch.full(
-            (q_head_num,), float("-inf"), dtype=torch.float32, device=device
+            (q_head_num,), -1.0e30, dtype=torch.float32, device=device
         )
     else:
         sink = sink.to(torch.float32).contiguous()
