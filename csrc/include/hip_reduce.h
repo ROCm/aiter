@@ -324,6 +324,7 @@ __device__ __forceinline__ float multithread_reduce_max_dpp(float v)
         return v;
     }
 
+#if defined(__GFX9__)
     if constexpr(thread_num == 64)
     {
         _ASM_DPP_MAX_F32(v, "row_ror:4 row_mask:0xf bank_mask:0xf");
@@ -334,6 +335,7 @@ __device__ __forceinline__ float multithread_reduce_max_dpp(float v)
             v = rocprim::warp_shuffle(v, thread_num - 1, thread_num);
         return v;
     }
+#endif
 }
 
 #undef _ASM_DPP_MAX_F32
