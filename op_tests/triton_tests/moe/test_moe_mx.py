@@ -14,6 +14,7 @@ from op_tests.triton_tests.moe.test_moe import (
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
 from aiter.ops.triton.utils.moe_common import torch_silu_and_mul_ref
+from aiter.utility.fp4_utils import e8m0_to_f32
 
 DEBUG_MODE = False
 
@@ -159,12 +160,6 @@ def mxfp4_to_f32(x):
     ]
     mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device="cuda")
     return mxfp4_in_f32[x.long()]
-
-
-def e8m0_to_f32(x):
-    x_f32 = 2 ** ((x - 127).to(torch.float32))
-    x_f32[x_f32 == 128] = float("nan")
-    return x_f32
 
 
 def torch_mxfp4_to_fp32(x, x_scales):
