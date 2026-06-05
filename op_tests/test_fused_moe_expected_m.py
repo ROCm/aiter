@@ -183,20 +183,21 @@ def test_fused_moe_uses_expected_m_for_tier_lookup(monkeypatch):
     )
 
 
-def test_fused_moe_uses_topk1_for_ep_lookup(monkeypatch):
-    """When expected_m is supplied we are in an EP dispatch path; the value
-    already folds the topk fan-out into a per-local-expert token count, so the
-    topk handed to get_2stage_cfgs must be canonicalized to 1. Without the
-    hint, the real topk (topk_ids.shape[1]) is forwarded unchanged."""
+def test_fused_moe_forwards_real_topk_with_expected_m(monkeypatch):
+    """expected_m overrides only the M used for tier lookup; the topk handed to
+    get_2stage_cfgs is the real topk (topk_ids.shape[1]) whether or not the hint
+    is supplied. The topk dimension of the EP key is handled separately by
+    is_ep inside get_2stage_cfgs (topk -= int(is_ep), to drop the +1 fake-mask
+    slot), not by canonicalizing topk at this call site."""
     expected_m = 17
     real_topk = _make_tiny_inputs()[-1].shape[1]  # topk_ids.shape[1]
 
     _, topk_with_hint = _call_fused_moe_capture_M(monkeypatch, expected_m=expected_m)
     _, topk_without_hint = _call_fused_moe_capture_M(monkeypatch, expected_m=None)
 
-    assert topk_with_hint == 1, (
-        "With expected_m supplied, fused_moe_ must look up the EP-canonical "
-        f"topk==1 CSV tier; saw topk={topk_with_hint}."
+    assert topk_with_hint == real_topk, (
+        f"expected_m must not change the topk forwarded to get_2stage_cfgs; "
+        f"expected the real topk ({real_topk}), saw {topk_with_hint}."
     )
     assert topk_without_hint == real_topk, (
         f"Without expected_m, fused_moe_ must forward the real topk "

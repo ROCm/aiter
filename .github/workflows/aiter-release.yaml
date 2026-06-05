@@ -349,14 +349,12 @@ jobs:
               set -e
               ${PYBIN}/pip install --upgrade --timeout=60 --retries=10 pip
               ${PYBIN}/pip install --timeout=60 --retries=10 --index-url "${TORCH_INDEX}" "${TORCH_SPEC}"
-              # flydsl publishes only manylinux_2_35 wheels which cannot install
-              # on AlmaLinux 8 (glibc 2.28). FlyDSL AOT pre-compilation in
-              # setup.py is wrapped in try/except and is skipped gracefully when
-              # flydsl is missing, so we drop it here. The resulting wheel still
-              # contains all CK-free + Triton kernels; only the optional
-              # FlyDSL AOT cache is omitted (kernels JIT on first use).
-              grep -v "^flydsl" requirements.txt > /tmp/requirements-no-flydsl.txt
-              ${PYBIN}/pip install --timeout=60 --retries=10 -r /tmp/requirements-no-flydsl.txt
+              # flydsl 0.1.9.dev599+ ships manylinux_2_28 wheels via AMD mirror
+              # (see ROCm/FlyDSL#527 backport). Required at build time since
+              # v0.1.15 setup.py imports aiter.aot.flydsl.gemm during start_aot().
+              ${PYBIN}/pip install --timeout=60 --retries=10 \
+                --extra-index-url https://rocm.frameworks-devreleases.amd.com/whl-staging/gfx942-gfx950/ \
+                -r requirements.txt
               ${PYBIN}/pip install --timeout=60 --retries=10 "setuptools_scm<10" ninja auditwheel patchelf
             '
 
@@ -577,6 +575,7 @@ jobs:
     steps:
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
+        timeout-minutes: 15
         with:
           pattern: aiter-whl-packages-py*
           path: all-wheels

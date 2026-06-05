@@ -9,21 +9,6 @@
     |---------|-------------|-------------|----------|--------|------------|---------|-------------|-------------|----------|------------|-------------------|
     |1024     |4096         |14336        |8         |2       |ActivationType.Silu|dtypes.bf16|dtypes.fp8|dtypes.fp8|QuantType.per_Token|True|True|
 
-    > **`topk=1` rows are the expert-parallel (EP) marker.** For a `topk=1`
-    > row the `token` column is `expected_m` — the *estimated* per-local-expert
-    > token count (topk fan-out and EP routing already folded in) — not the
-    > input-token count. This is a fused-moe lookup-key convention, so it holds
-    > regardless of which backend the tuned row resolves to (CK 2-stage, asm, or
-    > FlyDSL). To make the lookup land on a `topk=1` row, an EP caller must
-    > either **(a) pass `expected_m`** to `aiter.fused_moe(...)` (recommended —
-    > the key becomes `(expected_m, 1)`, which works even when the low-latency
-    > dispatch buffer is padded), or **(b) feed `topk_ids` already shaped with
-    > `topk=1` and the real (un-padded) token count** (then the raw key is
-    > already `(real_tokens, 1)`). Otherwise the raw `(padded_tokens, topk)` key
-    > misses every `topk=1` row and drops to the slow default kernel. See the
-    > `expected_m` docstring in `aiter/fused_moe.py` for the full runtime
-    > contract.
-
 
 3. Start tuning:
 Run the following cmd to start tuning, please wait a few minutes as it will build moe 2-stages kernels via jit:
@@ -224,7 +209,6 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 ```
 
 ## Notes
-- A `topk=1` row is the expert-parallel (EP) marker (`token` = `expected_m`); this is a backend-general fused-moe lookup convention — see step 2 and the `expected_m` docstring in `aiter/fused_moe.py`.
 - This tuner supports both 1-stage fused MoE kernels and 2-stages MoE kernels (stage1 and stage2)
 - The tuner will automatically select the best kernel configuration based on performance
 - Only G1U1 (gate-up fused) MoE configurations are currently supported for tuning

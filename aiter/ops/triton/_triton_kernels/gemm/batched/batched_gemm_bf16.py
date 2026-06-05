@@ -179,4 +179,5 @@ def _get_config(
     K: int,
 ):
 
+    # BF16 uses the shared 16-bit activation / 16-bit weight batched GEMM config.
     return get_gemm_config("BATCHED_GEMM-A16W16", M, N, K)

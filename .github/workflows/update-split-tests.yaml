@@ -52,7 +52,7 @@ jobs:
             --summary-path split-tests-update-summary.md
 
       - name: Dry run rebalance check (aiter)
-        run: bash .github/scripts/split_tests.sh --shards 5 --test-type aiter --dry-run
+        run: bash .github/scripts/split_tests.sh --shards 8 --test-type aiter --dry-run
 
       - name: Dry run rebalance check (triton)
         run: bash .github/scripts/split_tests.sh --shards 8 --test-type triton --dry-run
@@ -65,7 +65,7 @@ jobs:
             cat split-tests-update-summary.md
             echo ""
             echo "## Test plan"
-            echo "- [x] bash .github/scripts/split_tests.sh --shards 5 --test-type aiter --dry-run"
+            echo "- [x] bash .github/scripts/split_tests.sh --shards 8 --test-type aiter --dry-run"
             echo "- [x] bash .github/scripts/split_tests.sh --shards 8 --test-type triton --dry-run"
           } > pr-body.md
 

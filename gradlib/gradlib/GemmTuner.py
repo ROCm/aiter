@@ -56,11 +56,8 @@ try:
     _opus_csrc = os.path.join(os.path.dirname(__file__), "../../csrc/opus_gemm")
     if _opus_csrc not in _sys.path:
         _sys.path.insert(0, os.path.abspath(_opus_csrc))
-    # opus_gemm_common owns the data constants (kid sets); the host-side
-    # tune helpers (candidate_kids_for_shape, candidate_splitK,
-    # kid_rejects_*, _ensure_kids_compiled) live in opus_gemm_tune.py
-    # because they are tune-only logic and have no consumer at codegen
-    # time (gen_instances.py) or at runtime dispatch (aiter.ops.opus).
+    # opus_gemm_common owns the data constants (kid sets); the host-side tune helpers
+    # (candidate_kids_for_shape, candidate_splitK, ki...
     from opus_gemm_common import (
         kernels_list as _opus_kernels_list,
     )
@@ -138,7 +135,7 @@ def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
 # 32K x 2K x 7K), so running it on every iter of run_perftest's
 # num_iters=101 hot loop adds 100 * 8ms = 800ms of pure ref-compute
 # time to each candidate, AND inflates the reported per-iter latency
-# to (kernel + ref) ≈ kernel + ~8ms. That hides the true kernel
+# to (kernel + ref) ? kernel + ~8ms. That hides the true kernel
 # ranking (every candidate measures ~ref_time) and makes mp_tuner
 # pick a sub-optimal winner -- e.g. on 32K x 2K x 7K the tuner
 # reported kid=9 @ 108 TFLOPS while persistent kid=304 actually runs
@@ -177,9 +174,7 @@ def run_opus_gemm_bf16(inp, weight, out, bias=None, kid=0, splitK=0):
     )
     if cache_key in _opus_max_delta_checked:
         return out
-    # First call for this (kid, shape, splitK, bias): build fp32 reference
-    # and gate on max_delta. See opus_gemm_tune.py:MAX_DELTA_SCALE for
-    # rationale (10% of max|ref|, floor 1.0).
+    # First call for this (kid, shape, splitK, bias): build fp32 reference and gate on max_delta.
     ref_fp32 = torch.bmm(inp3.float(), weight3.float().transpose(-1, -2))
     if bias is not None:
         ref_fp32 = ref_fp32 + bias.float().unsqueeze(-1)
@@ -259,6 +254,7 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         split_k=config["split_k"],
         block_m_warps=config["block_m_warps"],
         block_n_warps=config["block_n_warps"],
+        block_k_warps=config["block_k_warps"],
         n_tile_repeat=config.get("n_tile_repeat", 1),
         persistent_n_tiles=config.get("persistent_n_tiles", 1),
         waves_per_eu=config.get("waves_per_eu", 0),
@@ -364,22 +360,8 @@ def get_gemm_ref(inp, weights, bias, scaleA, scaleB, indtype, outdtype):
         if bias is not None:
             out = out.to(bias) + bias
         return out.to(outdtype)
-        # try:
-        #    ref = torch._scaled_mm(
-        #        inp,
-        #        weights.t(),
-        #        bias=bias,
-        #        scale_a=scaleA,
-        #        scale_b=scaleB,
-        #        out_dtype=outdtype,
-        #    )
-        # except RuntimeError:
-        #    ref = (
-        #        F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32)) * scaleA * scaleB
-        #    )
-        #    ref = (ref.to(outdtype) + bias) if bias is not None else ref.to(outdtype)
-        # if type(ref) is tuple and len(ref) == 2:
-        #    ref = ref[0]
+        # try: ref = torch._scaled_mm( inp, weights.t(), bias=bias, scale_a=scaleA, scale_b=scaleB,
+        # out_dtype=outdtype, ) except RuntimeE...
     else:
         ref = (
             (
@@ -444,10 +426,8 @@ class Gemm:
         self.check_err_ratio = err_ratio
         self.splitK = None
         self.profile_file = profile_file
-        # self.start = torch.cuda.Event(enable_timing=True)
-        # self.end = torch.cuda.Event(enable_timing=True)
-        # prefer hipblaslt unless rocblas time is less than this
-        # ratio of hipblaslt time
+        # self.start = torch.cuda.Event(enable_timing=True) self.end =
+        # torch.cuda.Event(enable_timing=True) prefer hipblaslt unless rocbl...
         self.hipb_prefer_ratio = 0.995
         self.mp = mp
         self.is_shuffle = is_shuffle
@@ -680,31 +660,32 @@ class Gemm:
             return []
         tasks = []
         cu_num = get_cu_num()
-        # Smart candidate selection: instead of iterating ALL kids for every
-        # shape, ask the shared helper for the subset that's worth measuring
-        # given (M, N, K, bias, cu_num). The helper implements the
-        # "small-problem -> only splitk; otherwise both classes; K-misaligned
-        # or bias -> safe fallback" decision tree. See
-        # csrc/opus_gemm/opus_gemm_common.py::candidate_kids_for_shape.
+        # Smart candidate selection: instead of iterating ALL kids for every shape, ask the shared
+        # helper for the subset that's worth mea...
         cand_kids = _opus_candidate_kids_for_shape(
             self.m, self.n, self.k, self.has_bias, cu_num
         )
         for kid in sorted(cand_kids):
             k_inst = _opus_all_kernels.get(kid)
             if k_inst is None:
-                # Defensive: candidate_kids_for_shape returns kids from
-                # SPLITK_KIDS | NON_SPLITK_KIDS, all of which live in
-                # kernels_list. Skip if somehow stale.
+                # Defensive: candidate_kids_for_shape returns kids from SPLITK_KIDS | NON_SPLITK_KIDS, all of
+                # which live in kernels_list.
                 continue
-            # Apply the per-kid host-side reject filter on top (catches
-            # launcher TORCH_CHECK rejects + known correctness bugs for
-            # specific (kid, shape) combos that the coarse occupancy rule
-            # doesn't know about).
+            # Apply the per-kid host-side reject filter on top (catches launcher TORCH_CHECK rejects + known
+            # correctness bugs for specific (k...
             if _opus_kid_rejects_shape(k_inst, self.m, self.n, self.k):
                 continue
             if _opus_kid_rejects_bias(k_inst, self.has_bias):
                 continue
-            if k_inst.kernel_tag == "a16w16_flatmm_splitk":
+            _SPLITK_FAMILY_TAGS = (
+                "a16w16_flatmm_splitk",  # gfx950
+                "a16w16_kbuf3_sk",  # gfx942 W3 K-dbuf depth=3 (50201)
+                "a16w16_kbuf1_sk",  # gfx942 4-phase E_M>=2 (50200/50202)
+                "a16w16_fused_reduce",  # gfx942 fused-reduce (50300)
+                "a16w16_kbuf2v_sk",  # gfx942 P1 depth=2 + V-dbuf (50211)
+                "a16w16_kbuf2v_bk128_sk",  # gfx942 P1 B_K=128 (50203)
+            )
+            if k_inst.kernel_tag in _SPLITK_FAMILY_TAGS:
                 splitK_range = _opus_candidate_splitK(
                     self.m, self.n, self.k, 1, cu_num, k_inst
                 )
@@ -743,17 +724,29 @@ class Gemm:
                             self.has_bias,
                         ),
                         run_opus_gemm_bf16,
-                        ([0, 1, 5, 3], kid, sk),
+                        (
+                            ["inp", "weights", "out_asm", "bias"],
+                            kid,
+                            sk,
+                        ),
                         {
                             "num_warmup": self.num_warmup,
                             "num_iters": 101,
+                            "num_rotate_args": 16,
                         },
                         get_gemm_ref,
-                        ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                        (
+                            ["inp", "weights", "bias", "x_scale", "w_scale"],
+                            self.indtype,
+                            self.outdtype,
+                        ),
                         {},
                         None,
                         2e-2,
                         1.0,
+                        None,  # compare_fn
+                        None,  # max_abs_delta
+                        ("out_asm",),  # output_keys: NaN-init the out tensor
                     )
                 )
         logger.info(
@@ -776,10 +769,8 @@ class Gemm:
             tasks.extend(self.asm_gemm_all_solutions())
         if "all" in self.libtype or "opus" in self.libtype:
             opus_tasks = self.opus_gemm_all_sols()
-            # If opus is enabled and tasks are scheduled, ensure every kid
-            # they reference is compiled into module_deepgemm_opus.so. The
-            # helper expands the subset-compile sidecar + forces a JIT
-            # rebuild only if at least one candidate kid is missing.
+            # If opus is enabled and tasks are scheduled, ensure every kid they reference is compiled into
+            # module_deepgemm_opus.so.
             if opus_tasks and _opus_ensure_kids_compiled is not None:
                 opus_kids = {t[0][1] for t in opus_tasks}  # info[1] is kid
                 if _opus_ensure_kids_compiled(opus_kids):
@@ -1097,9 +1088,7 @@ class Gemm:
         if top_sols:
             solutions = self.hipb_top_sols
         task = []
-        # scaleA = HALF if self.scaleAB else None
-        # scaleB = HALF if self.scaleAB else None
-        # gtimes = {}
+        # scaleA = HALF if self.scaleAB else None scaleB = HALF if self.scaleAB else None gtimes = {}
         for solidx in solutions:
             info = (
                 (
@@ -1186,9 +1175,7 @@ class Gemm:
             solidx = info[1]
             splitK = info[2]
             kernelName = info[4]
-            # if fast_mode == 0:
-            #    if err_ratio > self.check_err_ratio:
-            #        continue
+            # if fast_mode == 0: if err_ratio > self.check_err_ratio: continue
             res_one.append(solidx)
             res_one.append(round(us / 1000.0, 4))
             res_one.append(splitK)
