@@ -1,0 +1,174 @@
+import argparse
+import os
+import sys
+from dataclasses import dataclass
+ 
+# sys.path.insert(0, os.environ.get("AITER_REPO", "/tmp/aiter-pr3470"))
+ 
+import torch
+ 
+import aiter
+from aiter import ActivationType, QuantType, dtypes
+from aiter.fused_moe import fused_moe
+from aiter.test_common import run_perftest
+from aiter.ops.shuffle import (
+    shuffle_scale_a16w4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
+)
+from aiter.utility.fp4_utils import e8m0_shuffle
+
+from mx_sort_fly_gemm import mx_sort_fly_gemm1_gemm2
+ 
+ 
+@dataclass(frozen=True)
+class Shape:
+    NE: int
+    H: int
+    INTER: int
+    TOPK: int
+ 
+ 
+KIMI = Shape(NE=385, H=7168, INTER=512, TOPK=9)
+ 
+ 
+def build_weights(shape: Shape, device, seed=0):
+    torch.manual_seed(seed)
+    ne, h, inter = shape.NE, shape.H, shape.INTER
+    torch_quant = aiter.get_torch_quant(QuantType.per_1x32)
+    w1 = torch.randn((ne, 2 * inter, h), dtype=dtypes.bf16, device=device) / 10
+    w2 = torch.randn((ne, h, inter), dtype=dtypes.bf16, device=device) / 10
+    w1_qt, w1_scale = torch_quant(w1, quant_dtype=dtypes.fp4x2)
+    w2_qt, w2_scale = torch_quant(w2, quant_dtype=dtypes.fp4x2)
+ 
+    # Default tuned FP4/FlyDSL rows use the legacy preshuffle layout from
+    # op_tests/test_moe_2stage.py for (q_dtype_a=fp4x2, q_dtype_w=fp4x2).
+    fly_w1 = shuffle_weight(w1_qt, layout=(16, 16))
+    fly_w2 = shuffle_weight(w2_qt, layout=(16, 16))
+    fly = dict(
+        w1=fly_w1,
+        w2=fly_w2,
+        w1_scale=e8m0_shuffle(w1_scale),
+        w2_scale=e8m0_shuffle(w2_scale),
+    )
+ 
+    # PR #3470 mxfp4_moe rows are selected by the shuffle_kind tag and use the
+    # a16w4 gate/up-interleaved weight/scale layout.
+    mx_w1 = shuffle_weight_a16w4(w1_qt, 16, True)
+    mx_w1.shuffle_kind = "mxfp4_moe"
+    mx = dict(
+        w1=mx_w1,
+        w2=shuffle_weight_a16w4(w2_qt, 16, False),
+        w1_scale=shuffle_scale_a16w4(w1_scale, ne, True),
+        w2_scale=shuffle_scale_a16w4(w2_scale, ne, False),
+    )
+    return fly, mx
+ 
+ 
+def build_inputs(shape: Shape, M: int, device, seed=1):
+    torch.manual_seed(seed)
+    ne, h, topk = shape.NE, shape.H, shape.TOPK
+    hidden = torch.randn((M, h), dtype=dtypes.bf16, device=device) / 10
+    n_routed = ne - 1
+    shared_id = ne - 1
+    n_topk_routed = topk - 1
+    g = torch.Generator(device=device).manual_seed(seed)
+    bias = torch.randn(n_routed, generator=g, device=device) * 0.5
+    scores = torch.randn(M, n_routed, generator=g, device=device) + bias
+    routed_w, routed_ids = torch.topk(scores.softmax(-1), n_topk_routed, dim=-1)
+    shared_ids = torch.full((M, 1), shared_id, device=device, dtype=routed_ids.dtype)
+    shared_w = torch.ones((M, 1), device=device, dtype=routed_w.dtype)
+    topk_ids = torch.cat([shared_ids, routed_ids], dim=1).to(torch.int32)
+    topk_weight = torch.cat([shared_w, routed_w], dim=1).to(torch.float32)
+    return hidden, topk_ids, topk_weight
+ 
+ 
+def make_fn(hidden, topk_ids, topk_weight, w):
+    def fn():
+        return fused_moe(
+            hidden,
+            w["w1"],
+            w["w2"],
+            topk_weight,
+            topk_ids,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.per_1x32,
+            w1_scale=w["w1_scale"],
+            w2_scale=w["w2_scale"],
+        )
+ 
+    return fn
+
+
+def make_mx_sort_fly_fn(hidden, topk_ids, topk_weight, w):
+    """mxfp4 sort kernels + (swappable) gemm1/gemm2. Uses mx_w (a16w4) weights."""
+
+    def fn():
+        return mx_sort_fly_gemm1_gemm2(
+            hidden,
+            w["w1"],
+            w["w2"],
+            topk_ids,
+            topk_weight,
+            topk=topk_ids.shape[1],
+            w1_scale=w["w1_scale"],
+            w2_scale=w["w2_scale"],
+        )
+
+    return fn
+ 
+ 
+def cosine(a, b):
+    a = a.float().reshape(-1)
+    b = b.float().reshape(-1)
+    return torch.nn.functional.cosine_similarity(a, b, dim=0).item()
+ 
+ 
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-M", "--M-list", default="4,8,16,32,64,128,256")
+    parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument("--warmup", type=int, default=10)
+    args = parser.parse_args()
+ 
+    device = torch.device("cuda")
+    shape = KIMI
+    fly_w, mx_w = build_weights(shape, device)
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(
+        f"Shape Kimi-K2.5 TP=4: NE={shape.NE} H={shape.H} "
+        f"INTER={shape.INTER} TOPK={shape.TOPK}"
+    )
+    print(
+        f"\n{'M':>6} | {'mxfp4 tuned us':>15} | {'flydsl tuned us':>16} | "
+        f"{'mxsort+flygemm us':>18} | {'fly/mx':>8} | {'msfg/mx':>8} | "
+        f"{'cos':>7} | {'cos_msfg':>9}"
+    )
+    print("-" * 105)
+    for M in [int(x) for x in args.M_list.split(",")]:
+        hidden, topk_ids, topk_weight = build_inputs(shape, M, device)
+        fly_fn = make_fn(hidden, topk_ids, topk_weight, fly_w)
+        mx_fn = make_fn(hidden, topk_ids, topk_weight, mx_w)
+        mx_sort_fly_gemm1_gemm2_fn = make_mx_sort_fly_fn(
+            hidden, topk_ids, topk_weight, mx_w
+        )
+        mx_out = mx_fn()
+        fly_out = fly_fn()
+        msfg_out = mx_sort_fly_gemm1_gemm2_fn()
+        cos = cosine(mx_out, fly_out)
+        cos_msfg = cosine(mx_out, msfg_out)
+        _, mx_us = run_perftest(mx_fn, num_warmup=args.warmup, num_iters=args.iters)
+        _, fly_us = run_perftest(fly_fn, num_warmup=args.warmup, num_iters=args.iters)
+        _, mx_sort_fly_gemm1_gemm2_us = run_perftest(mx_sort_fly_gemm1_gemm2_fn, num_warmup=args.warmup, num_iters=args.iters)
+        print(
+            f"{M:>6} | {mx_us:>15.1f} | {fly_us:>16.1f} | "
+            f"{mx_sort_fly_gemm1_gemm2_us:>18.1f} | {fly_us / mx_us:>7.2f}x | "
+            f"{mx_sort_fly_gemm1_gemm2_us / mx_us:>7.2f}x | {cos:>7.4f} | {cos_msfg:>9.4f}",
+            flush=True,
+        )
+ 
+ 
+if __name__ == "__main__":
+    main()
+ 
+ 
