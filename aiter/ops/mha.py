@@ -1871,6 +1871,7 @@ class FlashAttnFunc(torch.autograd.Function):
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_kv: Optional[torch.Tensor] = None,
         sink_ptr: Optional[Tensor] = None,
+        num_splits: int = 0,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -1903,6 +1904,7 @@ class FlashAttnFunc(torch.autograd.Function):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
             sink_ptr=sink_ptr,  # fwd kernel still uses sink_ptr naming
+            num_splits=num_splits,
         )
         if is_grad:
             assert return_lse
@@ -1987,7 +1989,8 @@ class FlashAttnFunc(torch.autograd.Function):
         # 18 sink_ptr (fwd-only sink scores; not differentiable via autograd.
         #              bwd sink gradient d_sink is computed inside mha_bwd kernel,
         #              not returned here as a positional gradient.)
-        # Need to return exactly 18 gradient entries.
+        # 19 num_splits
+        # Need to return exactly 19 gradient entries.
         return (
             dq,  # q
             dk,  # k
@@ -2007,6 +2010,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # cu_seqlens_q
             None,  # cu_seqlens_kv
             None,  # sink_ptr (not differentiable; bwd uses sink/d_sink args separately)
+            None,  # num_splits
         )
 
 
@@ -2027,6 +2031,7 @@ def flash_attn_func(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    num_splits: int = 0,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -2116,6 +2121,7 @@ def flash_attn_func(
         cu_seqlens_q,
         cu_seqlens_kv,
         sink_ptr,
+        num_splits,
     )
 
 
