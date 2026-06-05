@@ -371,6 +371,7 @@ def mhc_fused_post_pre_fake(
     sinkhorn_repeat: int = 20,
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
+    force_fused: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
@@ -399,6 +400,7 @@ def mhc_fused_post_pre(
     sinkhorn_repeat: int = 20,
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
+    force_fused: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mhc_post + next mhc_pre (HIP), mirroring ``mhc_pre`` with post-step inputs.
 
@@ -409,10 +411,39 @@ def mhc_fused_post_pre(
 
     Returns ``(post_mix, comb_mix, layer_input_out, next_residual)`` -- next pre mixes,
     folded layer input, and the new residual stream for the following layer's post.
+
+    ``force_fused``: when True, always use the fused HIP kernel. When False (default),
+    only m<=64 uses the fused kernel; larger m falls back to the unfused
+    ``mhc_post`` + ``mhc_pre`` path (faster on this chip at large m).
     """
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
     hidden_size = residual_in.size(2)
+
+    if not force_fused and m > 64:
+        next_residual = torch.empty_like(residual_in)
+        mhc_post(
+            next_residual,
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+        )
+        post_mix, comb_mix, layer_input_out = mhc_pre(
+            next_residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
+        return post_mix, comb_mix, layer_input_out, next_residual
+
     assert layer_input.shape == (
         m,
         hidden_size,

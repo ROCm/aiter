@@ -844,6 +844,7 @@ def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False):
         fn,
         hc_scale,
         hc_base,
+        force_fused=True,
         **hip_kwargs,
     )
 
@@ -969,34 +970,34 @@ _mode_group.add_argument(
 
 args = parser.parse_args()
 
-# df = []
-# for dtype in args.dtype:
-#     for hidden_size in args.hidden_size:
-#         for m in args.m:
-#             for hc_mult in [4]:
-#                 ret = test_mhc_pre(
-#                     m=m,
-#                     hidden_size=hidden_size,
-#                     hc_mult=hc_mult,
-#                     test_hc_head=args.hc_head,
-#                     fuse_rmsnorm=args.fuse_rmsnorm,
-#                 )
-#                 df.append(ret)
-# df = pd.DataFrame(df)
-# df_md = df.to_markdown(index=False)
-# aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
+df = []
+for dtype in args.dtype:
+    for hidden_size in args.hidden_size:
+        for m in args.m:
+            for hc_mult in [4]:
+                ret = test_mhc_pre(
+                    m=m,
+                    hidden_size=hidden_size,
+                    hc_mult=hc_mult,
+                    test_hc_head=args.hc_head,
+                    fuse_rmsnorm=args.fuse_rmsnorm,
+                )
+                df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
 
 if not args.hc_head:
-    # df = []
-    # for dtype in args.dtype:
-    #     for hidden_size in args.hidden_size:
-    #         for m in args.m:
-    #             for hc_mult in [4]:
-    #                 ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
-    #                 df.append(ret)
-    # df = pd.DataFrame(df)
-    # df_md = df.to_markdown(index=False)
-    # aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
+    df = []
+    for dtype in args.dtype:
+        for hidden_size in args.hidden_size:
+            for m in args.m:
+                for hc_mult in [4]:
+                    ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
+                    df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
 
     df = []
     for dtype in args.dtype:
