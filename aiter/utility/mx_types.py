@@ -54,13 +54,6 @@ class MxDtypeInt:
     FP8_E4M3_FNUZ = 2
 
 
-# Import-time-safe public aliases.  These keep ``from mx_types import
-# MxScaleRoundMode`` JIT-free for package import / AOT paths; callers that need
-# raw pybind enum objects can still go through the lazy private factories below.
-MxScaleRoundMode = MxScaleRoundModeInt
-MxDtype = MxDtypeInt
-
-
 # --------------------------------------------------------------------------
 # Project-wide default round mode (Python single source of truth).
 # Must match ``kDefaultMxScaleRoundMode`` in ``mx_quant_utils.h``; the
