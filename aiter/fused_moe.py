@@ -987,17 +987,21 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # ``index_add_`` scatter loop.
     _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
     if (not _use_naive) and dtype in (dtypes.bf16, dtypes.fp16):
-        from aiter.ops.flydsl.moe_kernels import flydsl_moe_gather_reduce
+        from aiter.ops.flydsl.moe_kernels import (
+            flydsl_moe_gather_reduce,
+            build_gather_reduce_src_rows,
+        )
 
         _grouped_dbg("start gather-reduce output")
-        flydsl_moe_gather_reduce(
-            grouped_out,
-            topk_ids,
-            topk_weight,
-            counts,
-            doweight_stage1,
-            out=moe_out,
+        # Build the per-token gather map once (argsort-free); can be shared with
+        # the route-gather step. gather_w is already in (token, topk) layout.
+        src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E)
+        gather_w = (
+            torch.ones((token_num, topk), dtype=torch.float32, device=device)
+            if doweight_stage1
+            else topk_weight.to(torch.float32)
         )
+        flydsl_moe_gather_reduce(grouped_out, src_rows, gather_w, out=moe_out)
         _grouped_dbg("gather-reduce output done")
     else:
         _grouped_dbg("start scatter output")

@@ -1420,25 +1420,43 @@ def _get_compiled_gather_reduce(model_dim: int, topk: int, out_dtype: str):
     return build_moe_gather_reduce_module(model_dim, topk, out_dtype)
 
 
+def build_gather_reduce_src_rows(
+    topk_ids: torch.Tensor,  # (token_num, topk) local expert ids in [0, E)
+    max_m: int,
+    E: int,
+) -> torch.Tensor:
+    """Per-token gather map: ``src_rows[t,k] = topk_ids[t,k]*max_m + slot``, where
+    ``slot`` is token ``t``'s within-expert position in token-major route order
+    (matching how the route-gather fills each expert). Returns (token_num, topk)
+    int32.
+
+    Argsort-free: the within-expert ``slot`` is a one-hot cumsum (running count
+    per expert in route order). Build this once and share it with the
+    route-gather (scatter-copy) step instead of recomputing.
+    """
+    import torch.nn.functional as F
+
+    token_num, topk = topk_ids.shape
+    flat_e = topk_ids.reshape(-1).to(torch.long)
+    # slot[r] = (# earlier routes to the same expert) = running count - 1
+    slot = F.one_hot(flat_e, E).cumsum(0).gather(1, flat_e[:, None]).squeeze(1) - 1
+    return (flat_e * max_m + slot).view(token_num, topk).to(torch.int32)
+
+
 def flydsl_moe_gather_reduce(
-    grouped_out: torch.Tensor,   # (E, max_m, model_dim) bf16/f16
-    topk_ids: torch.Tensor,      # (token_num, topk) local expert ids in [0, E)
-    topk_weight: torch.Tensor,   # (token_num, topk)
-    counts: torch.Tensor,        # (E,) tokens routed per expert
-    doweight_stage1: bool,
+    grouped_out: torch.Tensor,  # (E, max_m, model_dim) bf16/f16
+    src_rows: torch.Tensor,     # (token_num, topk) int32 grouped flat rows
+    gather_w: torch.Tensor,     # (token_num, topk) per-(token,k) weight
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """One-pass gather-reduce epilogue (replaces the per-expert ``index_add_``
-    scatter loop). ``grouped_out`` must be bf16 or f16.
+    """One-pass gather-reduce epilogue. Thin launcher over a *precomputed* gather
+    map: ``out[t] = sum_k gather_w[t,k] * grouped_out_flat[src_rows[t,k]]``.
 
-    The per-token gather map is built directly from ``topk_ids`` -- which is
-    already in (token, topk) order -- so ``src_rows[t,k]`` = the grouped-GEMM row
-    that token ``t``'s k-th expert occupies = ``topk_ids[t,k]*max_m + slot``.
-    Only one ``argsort`` is needed (to assign the within-expert ``slot``); there
-    is no boolean-mask indexing / ``nonzero``. Weights are already in the right
-    layout: ``gather_w == topk_weight`` (or all-ones when ``doweight_stage1``)."""
+    The caller builds ``src_rows`` once (see ``build_gather_reduce_src_rows``,
+    argsort-free) and may share it with the route-gather step; this wrapper does
+    no host-side map building. ``grouped_out`` must be bf16 or f16."""
     E, max_m, model_dim = grouped_out.shape
-    token_num, topk = topk_ids.shape
+    token_num, topk = src_rows.shape
     device = grouped_out.device
     if grouped_out.dtype == torch.bfloat16:
         out_dtype = "bf16"
@@ -1447,24 +1465,7 @@ def flydsl_moe_gather_reduce(
     else:
         raise ValueError(f"unsupported dtype {grouped_out.dtype}; need bf16/f16")
 
-    # topk_ids -> grouped rows. slot(t,k) = token t's within-expert position in
-    # route (token-major) order, matching how the route-gather fills each expert.
-    flat_e = topk_ids.reshape(-1).to(torch.long)
-    order = torch.argsort(flat_e, stable=True)            # group routes by expert
-    e_sorted = flat_e[order]
-    start = torch.zeros(E, dtype=torch.long, device=device)
-    start[1:] = torch.cumsum(counts.to(torch.long), 0)[:-1]
-    slot = torch.arange(flat_e.numel(), device=device) - start[e_sorted]
-    grow_sorted = e_sorted * max_m + slot
-    grow_of_route = torch.empty_like(flat_e)
-    grow_of_route[order] = grow_sorted                    # back to route order
-    src_rows = grow_of_route.view(token_num, topk).to(torch.int32)
-
-    if doweight_stage1:
-        gather_w = torch.ones((token_num, topk), dtype=torch.float32, device=device)
-    else:
-        gather_w = topk_weight.to(torch.float32).contiguous()
-
+    # Caller passes src_rows int32 and gather_w f32 (both contiguous); no cast.
     grouped_out_flat = grouped_out.contiguous().view(E * max_m, model_dim)
     if out is None:
         out = torch.empty(

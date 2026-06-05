@@ -19,6 +19,10 @@ import os
 import sys
 import types
 
+# Allow `import aiter` on boxes with triton<3.6 (gluon's hard requirement) so
+# aiter.test_common.run_perftest is importable for --perf. Harmless otherwise.
+os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
+
 import torch
 
 torch.set_default_device("cuda")
@@ -54,7 +58,7 @@ def ref_moe_gather_reduce(
 
 
 def _import_flydsl_gather_reduce():
-    """Return ``flydsl_moe_gather_reduce`` from the library.
+    """Return (flydsl_moe_gather_reduce, build_gather_reduce_src_rows).
 
     Prefer the normal package import. If the full ``aiter`` package can't be
     imported in this environment (e.g. a FLIR build mismatch in unrelated
@@ -62,9 +66,12 @@ def _import_flydsl_gather_reduce():
     the parent packages so the heavy package ``__init__`` chain is skipped.
     """
     try:
-        from aiter.ops.flydsl.moe_kernels import flydsl_moe_gather_reduce
+        from aiter.ops.flydsl.moe_kernels import (
+            flydsl_moe_gather_reduce,
+            build_gather_reduce_src_rows,
+        )
 
-        return flydsl_moe_gather_reduce
+        return flydsl_moe_gather_reduce, build_gather_reduce_src_rows
     except Exception:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         base = os.path.join(root, "aiter", "ops", "flydsl")
@@ -83,10 +90,10 @@ def _import_flydsl_gather_reduce():
         )
         sys.modules["aiter.ops.flydsl.kernels.moe_gather_reduce"] = kern
         mk = _load(os.path.join(base, "moe_kernels.py"), "aiter.ops.flydsl.moe_kernels")
-        return mk.flydsl_moe_gather_reduce
+        return mk.flydsl_moe_gather_reduce, mk.build_gather_reduce_src_rows
 
 
-flydsl_moe_gather_reduce = _import_flydsl_gather_reduce()
+flydsl_moe_gather_reduce, build_gather_reduce_src_rows = _import_flydsl_gather_reduce()
 
 
 def _build_grouped_layout(token_num, topk, E_total, ep, model_dim, dtype, seed):
@@ -153,14 +160,14 @@ def _run_one(token_num, topk, E_total, ep, model_dim, dtype, doweight_stage1,
     ref = ref_moe_gather_reduce(
         grouped_out, route_tokens, route_weights, counts, token_num, doweight_stage1
     )
-    # optimized: gather map built directly from topk_ids / topk_weight
-    opt = flydsl_moe_gather_reduce(
-        grouped_out,
-        topk_ids,
-        topk_weight,
-        counts,
-        doweight_stage1,
+    # optimized: precompute the gather map (argsort-free), then thin launch
+    src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E_local)
+    gather_w = (
+        torch.ones((token_num, topk), dtype=torch.float32, device="cuda")
+        if doweight_stage1
+        else topk_weight.to(torch.float32)
     )
+    opt = flydsl_moe_gather_reduce(grouped_out, src_rows, gather_w)
     torch.cuda.synchronize()
 
     ref_f = ref.float()
@@ -198,6 +205,40 @@ REAL_MODELS = [
 ]
 
 
+def _run_perf(args):
+    """Profile the gather-reduce epilogue (map build + launch) via run_perftest."""
+    os.environ["AITER_LOG_MORE"] = "1"  # makes run_perftest log the per-op table
+    from aiter.test_common import run_perftest
+
+    token_num = args.tokens[0] if args.tokens else 1
+    dtype = torch.bfloat16
+    (grouped_out, topk_ids, topk_weight, _rt, _rw, counts, max_m, E_local) = (
+        _build_grouped_layout(token_num, args.topk, args.E, 1, args.model_dim, dtype, 0)
+    )
+    out = torch.empty((token_num, args.model_dim), dtype=dtype, device="cuda")
+    gather_w = topk_weight.to(torch.float32)
+
+    # Profile build (argsort-free src_rows) + thin launch -- the full epilogue.
+    def _epilogue():
+        src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E_local)
+        return flydsl_moe_gather_reduce(grouped_out, src_rows, gather_w, out=out)
+
+    print(
+        f"perf: tok={token_num} E={args.E} topk={args.topk} dim={args.model_dim} "
+        f"max_m={max_m} dtype=bf16 -> profiling build_src_rows + gather_reduce"
+    )
+    _, avg_us = run_perftest(
+        _epilogue,
+        num_iters=args.iters,
+        num_warmup=10,
+        num_rotate_args=1,
+    )
+    print(
+        f"\n[run_perftest] avg device time: {avg_us:.1f} us/iter "
+        f"(per-op breakdown / hot loop logged above via AITER_LOG_MORE=1)"
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-t", "--tokens", type=int, action="append", default=None,
@@ -207,7 +248,19 @@ def main():
     ap.add_argument("--dtype", choices=["bf16", "f16", "both"], default="both")
     ap.add_argument("--skip-generic", action="store_true",
                     help="run only the real-world model shapes")
+    # --perf: profile flydsl_moe_gather_reduce with test_common.run_perftest and
+    # dump the per-op breakdown (the host-side hot loop) via AITER_LOG_MORE.
+    ap.add_argument("--perf", action="store_true",
+                    help="profile the gather-reduce hot loop instead of correctness")
+    ap.add_argument("--E", type=int, default=32, help="[--perf] experts")
+    ap.add_argument("--topk", type=int, default=8, help="[--perf] topk")
+    ap.add_argument("--model-dim", type=int, default=4096, help="[--perf] model dim")
+    ap.add_argument("--iters", type=int, default=50, help="[--perf] run_perftest iters")
     args = ap.parse_args()
+
+    if args.perf:
+        _run_perf(args)
+        return
 
     tokens = args.tokens if args.tokens else [1, 256]
     tps = args.tp if args.tp else [1, 8]
