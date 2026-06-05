@@ -302,6 +302,7 @@ def compile_flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
     inline_quant: bool = False,
+    sort_block_m_override: int = 0,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -334,6 +335,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             swiglu_limit=swiglu_limit,
             inline_quant=inline_quant,
+            sort_block_m_override=sort_block_m_override,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -722,6 +724,7 @@ def flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
     inline_quant: bool = False,
+    sort_block_m_override: int = 0,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -810,7 +813,7 @@ def flydsl_moe_stage1(
     _need_quant = _fuse_any_quant or _splitk_fp4 or _gui_sk_fused
     _need_sort = _need_quant
 
-    _sort_block_m = tile_m
+    _sort_block_m = sort_block_m_override if sort_block_m_override > 0 else tile_m
     _all_blks = sorted_expert_ids.shape[0]
     _dense_blks = (
         min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])
@@ -911,6 +914,7 @@ def flydsl_moe_stage1(
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
         inline_quant=inline_quant,
+        sort_block_m_override=sort_block_m_override,
     )
     _run_compiled(exe, args)
 

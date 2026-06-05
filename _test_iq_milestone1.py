@@ -77,46 +77,37 @@ def main():
     w1v = w1u.view(dtypes.fp4x2)
     w1sv = w1_scale.view(dtypes.fp8_e8m0)
 
-    common = dict(
-        sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids, topk=topk,
-        tile_m=32, tile_n=128, tile_k=256,
-        a_dtype="fp4", b_dtype="fp4", out_dtype="fp4",
-        w1_scale=w1sv, a1_scale=a1_scale, sorted_weights=None,
-        waves_per_eu=2, b_nt=2, gate_mode="separated",
-    )
+    tile_m = int(sys.argv[2]) if len(sys.argv) > 2 else 32
+    from aiter.utility.fp4_utils import mxfp4_to_f32
 
-    std = flydsl_moe_stage1(a=a1, w1=w1v, use_async_copy=False, **common)
-    iq = flydsl_moe_stage1(a=hidden, w1=w1v, use_async_copy=False,
-                           inline_quant=True, **common)
+    def run(a, tm, iq):
+        r = flydsl_moe_stage1(
+            a=a, w1=w1v, use_async_copy=False, inline_quant=iq,
+            sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids, topk=topk,
+            tile_m=tm, tile_n=128, tile_k=256,
+            a_dtype="fp4", b_dtype="fp4", out_dtype="fp4",
+            w1_scale=w1sv, a1_scale=a1_scale, sorted_weights=None,
+            waves_per_eu=2, b_nt=2, gate_mode="separated",
+            sort_block_m_override=32,
+        )
+        return r if isinstance(r, tuple) else (r, None)
+
+    ref_q, _ = run(a1, 32, False)        # known-good reference (tile_m=32 std)
+    std_q, _ = run(a1, tile_m, False)    # std at requested tile_m
+    iq_q, _ = run(hidden, tile_m, True)  # inline at requested tile_m
     torch.cuda.synchronize()
 
-    std_q, std_s = (std if isinstance(std, tuple) else (std, None))
-    iq_q, iq_s = (iq if isinstance(iq, tuple) else (iq, None))
+    def cmp(name, q):
+        m = (ref_q.view(torch.uint8).reshape(-1) == q.view(torch.uint8).reshape(-1)).float().mean().item()
+        c = torch.nn.functional.cosine_similarity(
+            mxfp4_to_f32(ref_q.view(dtypes.fp4x2)).reshape(-1),
+            mxfp4_to_f32(q.view(dtypes.fp4x2)).reshape(-1), dim=0).item()
+        print(f"  {name:18s} vs std@32: byte={m*100:6.2f}%  cos={c:.5f}")
 
-    sq = std_q.view(torch.uint8).reshape(-1)
-    iqq = iq_q.view(torch.uint8).reshape(-1)
-    match_q = (sq == iqq).float().mean().item()
-    print(f"M={M}  inter_q  bytes match: {match_q*100:.3f}%  ({sq.numel()} bytes)")
-    if std_s is not None:
-        ss = std_s.view(torch.uint8).reshape(-1)
-        iss = iq_s.view(torch.uint8).reshape(-1)
-        match_s = (ss == iss).float().mean().item()
-        print(f"M={M}  inter_sc bytes match: {match_s*100:.3f}%  ({ss.numel()} bytes)")
-
-    # Dequant cosine (nominal fp4 values, scale-agnostic) -> tells noise vs bug.
-    from aiter.utility.fp4_utils import mxfp4_to_f32
-    sdq = mxfp4_to_f32(std_q.view(dtypes.fp4x2)).reshape(-1)
-    idq = mxfp4_to_f32(iq_q.view(dtypes.fp4x2)).reshape(-1)
-    cos = torch.nn.functional.cosine_similarity(sdq, idq, dim=0).item()
-    print(f"M={M}  inter dequant(nominal) cosine std-vs-iq: {cos:.5f}")
-
-    if match_q > 0.999:
-        print("PASS: inline quant reproduces a_quant (gemm1 inputs bit-identical)")
-    elif cos > 0.99:
-        print("CLOSE: dequant cosine high -> quant essentially correct (fp4 noise)")
-    else:
-        print("DIFF: inline quant differs from a_quant -> inspect quant logic")
+    print(f"M={M} tile_m={tile_m}:")
+    cmp(f"std@{tile_m}", std_q)
+    cmp(f"inline@{tile_m}", iq_q)
 
 
 if __name__ == "__main__":

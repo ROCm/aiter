@@ -117,6 +117,7 @@ def compile_mixed_moe_gemm1(
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
     inline_quant: bool = False,
+    sort_block_m_override: int = 0,
 ):
     """Compile stage1 kernel (gate+up with silu/swiglu).
 
@@ -161,7 +162,12 @@ def compile_mixed_moe_gemm1(
     is_f4_a = a_dtype == "fp4"
     is_f4_b = b_dtype == "fp4"
 
-    sort_block_m = max(32, tile_m)
+    # inline_quant pairs with the cheap BM=16 single-CTA sort (sort_block_m=16);
+    # the 32-grouped scale layout is handled via _m_half / _rearrange_a_scale.
+    if sort_block_m_override > 0:
+        sort_block_m = int(sort_block_m_override)
+    else:
+        sort_block_m = int(tile_m) if inline_quant else max(32, tile_m)
     num_waves = min(4, tile_n // 32)
     total_threads = num_waves * 64
     pack_M = 1 if tile_m < 32 else 2
@@ -280,9 +286,10 @@ def compile_mixed_moe_gemm1(
     _as1_tag = "_as1" if a_scale_one else ""
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     _iq_tag = "_iq" if inline_quant else ""
+    _sbm_tag = f"_sbm{sort_block_m}" if sort_block_m != max(32, tile_m) else ""
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}{_iq_tag}_v32"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}{_iq_tag}{_sbm_tag}_v32"
     ).replace("-", "_")
 
     # -- LDS sizing --
@@ -3494,7 +3501,9 @@ def compile_mixed_moe_gemm2(
             )
 
             # For tile_m < 32 (pack_M < _scale_pack_m): shift a_scale i32 so the
-            # correct bytes land at the op_sel positions we use.
+            # correct bytes land at the op_sel positions we use. op_sel for A is
+            # ikxdl*_scale_pack_m (= {0,2}), so a plain >>8 places byte[m_half]
+            # and byte[m_half+2] at slots 0 and 2 respectively.
             if const_expr(pack_M < _scale_pack_m):
                 _m_off = _mod_pow2(_div_pow2(bx_m, 16), _scale_pack_m)
                 _m_scale_shift_i32 = arith.index_cast(
@@ -4029,6 +4038,8 @@ def compile_mixed_moe_gemm2(
                                 a_scale_i32, static_position=[0], dynamic_position=[]
                             )
                             if const_expr(_m_scale_shift_i32 is not None):
+                                # op_sel = ikxdl*_scale_pack_m (= {0,2}), so a plain
+                                # >>8 moves byte[m_half],byte[m_half+2] to slots 0,2.
                                 a_scale_val = arith.shrui(
                                     a_scale_val, _m_scale_shift_i32
                                 )
