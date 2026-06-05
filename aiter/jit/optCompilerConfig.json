@@ -1478,7 +1478,9 @@
             "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_combine.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-mllvm -enable-post-misched=1'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{AITER_CSRC_DIR}/kernels/mha_native'"
