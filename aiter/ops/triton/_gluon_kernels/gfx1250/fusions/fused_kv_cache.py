@@ -930,15 +930,15 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     sin_smem = gl.allocate_shared_memory(sin_ptr.dtype.element_ty, [FREQ_W], SH)
 
     if pid < T * QH:
-        pid_t = pid // QH
-        pid_hq = pid % QH
-        pid_hk = pid_hq // QH_PER_KH
-        is_kv = pid_hq % QH_PER_KH == 0
+        # pid_t = pid // QH
+        # pid_hq = pid % QH
+        # pid_hk = pid_hq // QH_PER_KH
+        # is_kv = pid_hq % QH_PER_KH == 0
         # This is a new optimization that prioritized heavy workload WGs first
-        # pid_hq = pid // T
-        # pid_t = pid % T
-        # pid_hk = pid_hq
-        # is_kv = pid_hk < KH
+        pid_hq = pid // T
+        pid_t = pid % T
+        pid_hk = pid_hq
+        is_kv = pid_hk < KH
 
         # pos / offs first — needed for cos/sin TDM addresses.
         pos = gl.load(pos_ptr + pid_t)
