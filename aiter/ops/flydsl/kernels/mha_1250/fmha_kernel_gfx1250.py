@@ -680,9 +680,10 @@ def _load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
 # ============================================================================
 
 @functools.lru_cache(maxsize=None)
-def compile_fmha_fwd(*, is_causal: bool = False):
-    """Compile FMHA kernel variant. Cached per is_causal value."""
+def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
+    """Compile FMHA kernel variant. Cached per (is_causal, return_lse)."""
     IS_CAUSAL = int(is_causal)
+    RETURN_LSE = int(return_lse)
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def fmha_fwd_kernel(
@@ -923,11 +924,7 @@ def compile_fmha_fwd(*, is_causal: bool = False):
             q_offset = _mlir_arith.AddIOp(
                 _mlir_arith.MulIOp(_q_tok, stride_q_seq).result,
                 _mlir_arith.MulIOp(_to_raw(by), stride_q_head).result).result
-            _q_end_byte = _mlir_arith.AddIOp(
-                _mlir_arith.MulIOp(q_end_tok, stride_q_seq).result,
-                _mlir_arith.MulIOp(_to_raw(by), stride_q_head).result).result
-            _q_num_bytes = _mlir_arith.AddIOp(
-                _q_end_byte, stride_q_head).result
+            _q_num_bytes = _mlir_arith.MulIOp(q_end_tok, stride_q_seq).result
             q_rsrc = buffer_ops.create_buffer_resource(
                 ptr_Q, num_records_bytes=_q_num_bytes)
     
@@ -2074,10 +2071,56 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                     _rsf[_mb] = _sf
                     _rsf[_mb + 1] = _sf
                 _l2e = _mlir_arith.constant(ir.F32Type.get(), 0.6931471805599453)
+                _lse_vals = [None] * NUM_MSB
                 for _msb in fx.range_constexpr(NUM_MSB):
                     _mxs = _mlir_arith.mulf(_lmf[_msb], scalar_f)
                     _lgs = _rocdl.log(ty['f32'], _rsf[_msb])
-                    _mlir_arith.addf(_mlir_arith.mulf(_lgs, _l2e), _mxs)  # LSE (not stored)
+                    _lse_vals[_msb] = _mlir_arith.addf(_mlir_arith.mulf(_lgs, _l2e), _mxs)
+
+                # Store LSE to global: ptr_LSE layout (total_q, nheads) fp32
+                if const_expr(RETURN_LSE):
+                    # lse[tok, head] where tok = q_start_tok + bx*128 + wave*32 + lane_lo + msb_off
+                    from flydsl._mlir.dialects import fly as _fly_lse
+                    from flydsl._mlir.dialects import llvm as _llvm_lse
+                    _i64_lse = ir.IntegerType.get_signless(64)
+                    _glbpt_lse = ir.Type.parse("!llvm.ptr<1>")
+                    _lse_raw = ptr_LSE.__extract_to_ir_values__()[0]
+                    _lse_base = _fly_lse.extract_aligned_pointer_as_index(_glbpt_lse, _lse_raw)
+                    _lse_base_i64 = _llvm_lse.ptrtoint(_i64_lse, _lse_base)
+
+                    _wv_lse = rocdl.wave_id()
+                    _lane_lo_lse = _to_raw(arith.andi(lane_id, arith.constant(15, type=T.i32)))
+
+                    _lse_bx128 = _mlir_arith.MulIOp(
+                        _to_raw(bx), _to_raw(arith.constant(128, type=T.i32))).result
+                    _lse_wv32 = _mlir_arith.MulIOp(
+                        _wv_lse, _to_raw(arith.constant(WV_SUBQD, type=T.i32))).result
+                    _lse_base_row = _mlir_arith.AddIOp(_lse_bx128, _lse_wv32).result
+
+                    for _msb_lse in [0, 2]:
+                        _msb_off = 0 if _msb_lse == 0 else 16
+                        _seq_pos = _mlir_arith.AddIOp(
+                            _lse_base_row,
+                            _mlir_arith.AddIOp(
+                                _lane_lo_lse,
+                                _to_raw(arith.constant(_msb_off, type=T.i32))).result).result
+                        _lse_valid = _mlir_arith.CmpIOp(
+                            _mlir_arith.CmpIPredicate.slt, _seq_pos, actual_q_len)
+                        _lse_if = scf.IfOp(_lse_valid)
+                        with _if_then(_lse_if):
+                            # tok = q_start_tok + seq_pos
+                            _lse_tok = _mlir_arith.AddIOp(q_start_tok, _seq_pos).result
+                            # elem_off = tok * nheads + head
+                            _lse_elem_off = _mlir_arith.AddIOp(
+                                _mlir_arith.MulIOp(_lse_tok, _gdz).result,
+                                _to_raw(by)).result
+                            _lse_byte_off = _mlir_arith.MulIOp(
+                                _lse_elem_off,
+                                _to_raw(arith.constant(4, type=T.i32))).result
+                            _lse_byte_off_i64 = _mlir_arith.ExtSIOp(_i64_lse, _lse_byte_off).result
+                            _lse_addr = _mlir_arith.AddIOp(_lse_base_i64, _lse_byte_off_i64).result
+                            _lse_ptr = _llvm_lse.inttoptr(_glbpt_lse, _lse_addr)
+                            _llvm_lse.store(_lse_vals[_msb_lse], _lse_ptr)
                 from flydsl._mlir.dialects import arith as _fin_a2
                 _obf16 = []
                 for _msb in fx.range_constexpr(NUM_MSB):
@@ -2263,6 +2306,9 @@ def compile_fmha_fwd(*, is_causal: bool = False):
                                            _et_psp_hi[_rpsm * N_SP_PAIRS + _rpi], _rpsm)
                                for _rpi in fx.range_constexpr(N_SP_PAIRS)]
                     _et_psp.append(_rpairs)
+                _rocdl.s_wait_tensorcnt(0)
+                rocdl.s_barrier_signal(-1)
+                rocdl.s_barrier_wait(-1)
                 _ep_finish(
                     _et_o, _et_psp, _et_ped, ep_v_next_base,
                     _et_sfx['old_max'], _et_sfx['local_max'],

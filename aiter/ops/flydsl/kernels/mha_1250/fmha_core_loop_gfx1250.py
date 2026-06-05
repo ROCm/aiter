@@ -1520,7 +1520,6 @@ def _cl_su_v3_stage(
         # TDM barrier signal (mandatory, non-scheduled)
         if const_expr(tdm_barrier and gemm_idx == GEMM_INST_COUNT - BARRIER_SIGNAL_AHEAD - 1):
             _atom_s_wait_tensorcnt(4)
-            # _atom_s_wait_tensorcnt(TDM_WAIT_CNT)
             rocdl.s_barrier_signal(-1)
 
         # === Schedule-driven dispatch: ALL tokens between this WMMA and next ===

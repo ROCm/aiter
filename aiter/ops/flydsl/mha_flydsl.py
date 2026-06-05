@@ -18,7 +18,7 @@ BLOCK_THREADS = 128  # WAVE_SIZE(32) * NUM_WAVES(4)
 KV_TILE_N = 128
 BPP = 2  # bytes per element (bf16)
 
-_launch_fns = {}   # {is_causal: launch_fn}
+_launch_fns = {}   # {(is_causal, return_lse): launch_fn}
 _kernel_mod = None
 
 
@@ -62,8 +62,9 @@ def _patch_reusable_slot_specs():
         Float64._reusable_ctype = ctypes.c_double
 
 
-def _ensure_kernel(is_causal: bool):
-    if is_causal in _launch_fns:
+def _ensure_kernel(is_causal: bool, return_lse: bool = False):
+    key = (is_causal, return_lse)
+    if key in _launch_fns:
         return
 
     _ensure_kernel_mod()
@@ -78,7 +79,7 @@ def _ensure_kernel(is_causal: bool):
 
     _patch_reusable_slot_specs()
 
-    kernel = mod.compile_fmha_fwd(is_causal=is_causal)
+    kernel = mod.compile_fmha_fwd(is_causal=is_causal, return_lse=return_lse)
     _lds_alloc_k_a = mod._lds_alloc_k_a
     _lds_alloc_k_b = mod._lds_alloc_k_b
     _lds_alloc_v_a = mod._lds_alloc_v_a
@@ -143,7 +144,7 @@ def _ensure_kernel(is_causal: bool):
         )
 
     _launch.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
-    _launch_fns[is_causal] = _launch
+    _launch_fns[key] = _launch
 
 
 def _run_compiled(exe, args):
@@ -168,6 +169,7 @@ def flash_attn_varlen_flydsl(
     softmax_scale=None,
     causal=False,
     out=None,
+    return_lse=False,
 ):
     """FlyDSL MHA forward for gfx1250, varlen layout.
 
@@ -179,9 +181,10 @@ def flash_attn_varlen_flydsl(
         v: (total_k, nheads_k, headdim_v) bf16
         cu_seqlens_q: (batch+1,) i32
         cu_seqlens_k: (batch+1,) i32
+        return_lse: if True, also return (batch, nheads, max_seqlen_q) fp32 logsumexp
 
     Returns:
-        out: (total_q, nheads, headdim_v) bf16
+        out or (out, lse)
     """
     assert q.dtype == torch.bfloat16, f"Expected bf16, got {q.dtype}"
     assert q.shape[-1] == HEAD_DIM_QK, f"Expected headdim_qk={HEAD_DIM_QK}, got {q.shape[-1]}"
@@ -201,9 +204,14 @@ def flash_attn_varlen_flydsl(
             (total_q_tokens, nheads_q, HEAD_DIM_V),
             dtype=torch.bfloat16, device=q.device,
         )
-    lse = torch.zeros(
-        (batch, nheads_q, max_seqlen_q), dtype=torch.float32, device=q.device
-    )
+    if return_lse:
+        lse = torch.zeros(
+            (total_q_tokens, nheads_q), dtype=torch.float32, device=q.device
+        )
+    else:
+        lse = torch.zeros(
+            (batch, nheads_q, max_seqlen_q), dtype=torch.float32, device=q.device
+        )
 
     # THD strides from actual tensor layout (bytes for q/k/v, elements for o)
     stride_q_seq = q.stride(0) * BPP
@@ -215,10 +223,10 @@ def flash_attn_varlen_flydsl(
     stride_v_head = v.stride(1) * BPP
     stride_o_head = out.stride(1)
 
-    _ensure_kernel(bool(causal))
+    _ensure_kernel(bool(causal), bool(return_lse))
 
     _run_compiled(
-        _launch_fns[bool(causal)],
+        _launch_fns[(bool(causal), bool(return_lse))],
         (
             out, q, k, v, lse,
             cu_seqlens_q, cu_seqlens_k,
@@ -230,4 +238,6 @@ def flash_attn_varlen_flydsl(
         ),
     )
 
+    if return_lse:
+        return out, lse
     return out

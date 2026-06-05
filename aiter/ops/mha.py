@@ -2625,14 +2625,23 @@ def flash_attn_varlen_func(
     _flydsl_out = None
     if get_gfx() == "gfx1250" and q.shape[-1] == 192 and v.shape[-1] == 128 and q.dtype == torch.bfloat16:
         from .flydsl.mha_flydsl import flash_attn_varlen_flydsl
+        import sys
+        print(f"[flydsl] q={list(q.shape)} stride={q.stride()} k={list(k.shape)} stride={k.stride()} v={list(v.shape)} stride={v.stride()}", flush=True)
+        print(f"[flydsl] cu_q={cu_seqlens_q.tolist()} cu_k={cu_seqlens_k.tolist()} max_sq={max_seqlen_q} max_sk={max_seqlen_k} causal={causal} scale={softmax_scale}", flush=True)
+        sys.stdout.flush()
         _flydsl_out = torch.empty_like(q[:, :, :v.shape[-1]])
-        flash_attn_varlen_flydsl(
+        _flydsl_result = flash_attn_varlen_flydsl(
             q, k, v, cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k,
             softmax_scale=softmax_scale,
             causal=causal,
             out=_flydsl_out,
+            return_lse=return_lse,
         )
+        if return_lse:
+            _flydsl_out, _flydsl_lse = _flydsl_result
+        else:
+            _flydsl_out = _flydsl_result
 
     # print("flydsl_out", _flydsl_out)
 
@@ -2725,10 +2734,11 @@ def flash_attn_varlen_func(
 
         if _flydsl_out is not None:
             _rtol, _atol = 1e-2, 1e-2
-            if not torch.allclose(_flydsl_out, o, rtol=_rtol, atol=_atol):
-                _diff = (_flydsl_out.float() - o.float()).abs()
+            _o_cmp = o[0] if isinstance(o, tuple) else o
+            if not torch.allclose(_flydsl_out, _o_cmp, rtol=_rtol, atol=_atol):
+                _diff = (_flydsl_out.float() - _o_cmp.float()).abs()
                 _max_err = _diff.max().item()
-                _num_bad = (~torch.isclose(_flydsl_out, o, rtol=_rtol, atol=_atol)).sum().item()
+                _num_bad = (~torch.isclose(_flydsl_out, _o_cmp, rtol=_rtol, atol=_atol)).sum().item()
                 print(f"[flydsl vs triton] MISMATCH  max_err={_max_err:.6f}  bad_elements={_num_bad}/{_flydsl_out.numel()}")
                 try:
                     import tempfile, os as _os
@@ -2756,7 +2766,7 @@ def flash_attn_varlen_func(
                     if out is not None:
                         torch.save(out, _os.path.join(_dump_dir, "out_pre.pt"))
                     torch.save(_flydsl_out, _os.path.join(_dump_dir, "out_flydsl.pt"))
-                    torch.save(o, _os.path.join(_dump_dir, "out_triton.pt"))
+                    torch.save(_o_cmp, _os.path.join(_dump_dir, "out_triton.pt"))
                     print(f"[flydsl vs triton] inputs dumped to {_dump_dir}")
                 except Exception as _e:
                     import traceback
