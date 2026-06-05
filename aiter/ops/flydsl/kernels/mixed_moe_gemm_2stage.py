@@ -662,8 +662,10 @@ def compile_mixed_moe_gemm1(
                 _ptr_buffer_resource(arg_bias, bias_nbytes) if enable_bias else None
             )
 
-            # Sorted-scale buffer resource for fused mxfp4 quantization
-            _sorted_scale_cols = inter_dim // 32
+            # Sorted-scale buffer resource for fused mxfp4 quantization.
+            # #3476: pad group-N (= inter_dim/32) up to a multiple of 8 so it
+            # matches host e8m0_shuffle padding (inter_dim rounded to next 256).
+            _sorted_scale_cols = ((inter_dim // 32) + 7) // 8 * 8
             _sorted_scale_cols_i32 = arith.constant(_sorted_scale_cols, type=T.i32)
             sorted_scale_rsrc = None
             if const_expr(_need_sort):
@@ -2919,6 +2921,12 @@ def compile_mixed_moe_gemm2(
     w_elem_bytes = 2 if is_f16_b else 1
     w_elem_pack = 2 if (is_f4_b or is_int4) else 1
     w_nbytes = (experts * model_dim * inter_dim * w_elem_bytes) // w_elem_pack
+    # #3476: host e8m0_shuffle pads scale group-N up to a multiple of 8, i.e.
+    # inter_dim rounded up to the next 256. The kernel must size/stride its
+    # microscale reads with the SAME padded K, else inter_dim values that are
+    # 128- but not 256-aligned (e.g. 384) read OOB scales -> garbage e8m0 -> NaN.
+    scale_k_padded = (inter_dim + 255) // 256 * 256
+    scale_kblk_padded = scale_k_padded // 32
     bias_nbytes = experts * model_dim * 4
     # INT4 here means W4A8: A2 is int8, W is packed int4 and unpacked to int8 in-kernel.
     is_int8 = False
@@ -3121,9 +3129,11 @@ def compile_mixed_moe_gemm2(
             def check_c_k_valid_gate(base_k):
                 return arith.cmpi(CmpIPredicate.ult, base_k, inter_dim - inter_dim_pad)
 
-            # A&B's scale preshuffle layout
-            # For fp4, k_in is already packed (inter_dim // a_elem_vec_pack), so we need original inter_dim
-            c_k_orig = arith.constant(inter_dim, index=True)
+            # A&B's scale preshuffle layout.  #3476: host e8m0_shuffle pads the
+            # group-N dim up to a multiple of 8 (= inter_dim rounded to next 256),
+            # so read scale with the SAME padded K-stride. No-op when inter_dim is
+            # 256-aligned; required for 128-but-not-256-aligned inter_dim (e.g. 384).
+            c_k_orig = arith.constant(scale_k_padded, index=True)
             layout_a_scale = make_preshuffle_scale_layout(
                 arith, c_mn=m_in, c_k=c_k_orig
             )
@@ -3288,7 +3298,8 @@ def compile_mixed_moe_gemm2(
                 if const_expr(is_f4_a or is_f8_a):
                     # A2 microscale: e8m0 in sorted layout [sorted_size, K/32].
                     # Caller must pre-scatter a2_scale via moe_mxfp4_sort.
-                    kblk = _div_pow2(k_in, 32)
+                    # #3476: use 256-padded K/32 to match host scale padding.
+                    kblk = arith.constant(scale_kblk_padded, index=True)
                     sx_nbytes_idx = num_valid_idx * kblk
                     sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
                     sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
@@ -3303,7 +3314,8 @@ def compile_mixed_moe_gemm2(
             else:
                 # Weight microscale buffer (packed i32 holding e8m0 bytes).
                 # Use an exact descriptor size so hardware OOB checking works.
-                kblk_w = _div_pow2(k_in, 32)  # K/32
+                # #3476: use 256-padded K/32 to match host scale padding.
+                kblk_w = arith.constant(scale_kblk_padded, index=True)
                 mn_w = arith.constant(experts * model_dim, index=True)
                 sw_nbytes_idx = mn_w * kblk_w  # bytes (e8m0)
                 sw_nbytes_i32 = arith.index_cast(T.i32, sw_nbytes_idx)
