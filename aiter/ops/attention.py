@@ -837,10 +837,18 @@ def get_ps_metadata_info_v1(
     qo_tile_cnt = batch_size * max_qo_split_per_batch
     # TODO: consider split q to reduce max_works & max_partials
     max_works = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch * num_head_k
-    max_partials = (
-        min(batch_size + cus_per_cluster - 1, (cus_per_cluster - 1) * 2)
-        * max_qo_split_per_batch
-    )
+    # NOTE: the previous max_partials formula assumed unsplit tiles (a single TG
+    # absorbing an entire q-tile) were tagged with partial_o_loc == -1 and thus
+    # contributed zero partial slots. v1_2_host.cuh now always assigns a real
+    # partial_o_loc so mla_reduce_v1 runs for those tiles too (required to
+    # populate final_lse, which downstream chunked-context merges in vLLM
+    # consume). Each work_info entry from one cluster now contributes one
+    # partial slot, so the bound must dominate per-cluster work_info count
+    # rather than just multi-split slots. Per-cluster work_info count is at
+    # most max_works / num_clusters; using (batch_size + cus_per_cluster - 1)
+    # * max_qo_split_per_batch is a tight upper bound that subsumes both the
+    # original split-driven partials and the newly-emitted unsplit-tile slots.
+    max_partials = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch
 
     return (
         (2, torch.uint64),  # work_metadata_ptrs
