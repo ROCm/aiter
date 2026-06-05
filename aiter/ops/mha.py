@@ -1293,6 +1293,13 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _native_splitkv_heuristic(batch, nhead_q, seqlen_k, hdim_q):
+    # Phase-1: hardcoded special case only. seqlen_q-independent (decode shapes hit too).
+    if batch == 1 and nhead_q == 2 and hdim_q == 64 and seqlen_k >= 38912:
+        return 4
+    return 1
+
+
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1315,6 +1322,7 @@ def _flash_attn_forward(
     cu_seqlens_kv: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    num_splits: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     batch_size, seqlen_q, nhead_q, hdim_q = q.shape
@@ -1367,6 +1375,31 @@ def _flash_attn_forward(
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         return ret
 
+    def can_impl_fmha_native():
+        # Native hand-written HIP D64 split-K forward. gfx942-only, dense bf16, no
+        # bias/alibi/swa/dropout/sink/fp8/varlen. See design doc.
+        ret = get_gfx() == "gfx942"
+        ret = ret and (
+            q.dtype == dtypes.bf16
+            and k.dtype == dtypes.bf16
+            and v.dtype == dtypes.bf16
+        )
+        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
+        ret = ret and (hdim_q == 64 and hdim_v == 64)
+        ret = ret and (seqlen_q > 0 and seqlen_k > 0)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (bias is None) and (alibi_slopes is None)
+        ret = ret and (not swa)
+        ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        ret = ret and (sink_ptr is None)
+        ret = ret and (nhead_q % nhead_k == 0)
+        if causal:
+            # sq>sk causal would NaN fully-masked rows in attention_ref but combine
+            # returns 0 -> divergence; let those fall back to ASM/CK. decode/square
+            # always satisfy sk>=sq.
+            ret = ret and (seqlen_k >= seqlen_q)
+        return ret
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
     # Validate newly added optional cumulative length / padded arrays if provided.
@@ -1381,6 +1414,25 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_q", cu_seqlens_q)
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
+    if can_impl_fmha_native():
+        ns = (
+            num_splits
+            if num_splits >= 1
+            else _native_splitkv_heuristic(batch_size, nhead_q, seqlen_k, hdim_q)
+        )
+        if ns > 1:
+            assert ns <= (seqlen_k + 63) // 64, (  # ceil(seqlen_k/64); don't silently clamp
+                f"num_splits={ns} too large for seqlen_k={seqlen_k}"
+            )
+            out_, softmax_lse = mha_fwd_native_splitkv(
+                q, k, v, out, softmax_scale, causal, return_lse, ns
+            )
+            S_dmask = None
+            # grad path needs a real rng_state tensor (dropout=0 -> no-dropout path).
+            rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+            return out_, softmax_lse, S_dmask, rng_state
+        # ns == 1 -> fall through to the existing dispatch
+    # can_impl_fmha_native() False -> num_splits ignored, existing dispatch
     if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
         out_, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
