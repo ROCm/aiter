@@ -864,7 +864,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # per-token/per-topk view we gather each token's row from the expert it was
     # routed to. We only support num_token==1 decoding here (each active expert
     # holds exactly one row at index 0), and topk is already known.
-    _dump_a2 = os.environ.get("AITER_GROUPED_DUMP_A2", "1")
+    _dump_a2 = os.environ.get("AITER_GROUPED_DUMP_A2", "0")
     if _dump_a2 not in ("", "0", "false", "False"):
         if token_num == 1:
             # experts this single token was routed to: (topk,)
