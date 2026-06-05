@@ -71,7 +71,9 @@ def _build_p_scale(num_qo_heads):
         num_qo_heads, dtype=torch.float32, device="cuda", generator=g
     )
 
-DEFAULT_SEQS = (1024, 16384, 32768, 65536, 131072)
+# Small seqlens (<=16) exercise the kM0=128 query tile with mostly padding rows;
+# they reproduce the PER_TOKEN_HEAD small-seqlen q_descale out-of-bounds coredump.
+DEFAULT_SEQS = (4, 8, 16, 1024, 16384, 32768, 65536, 131072)
 _parser = argparse.ArgumentParser(
     description="Benchmark FP8 PER_TOKEN_HEAD batch_prefill kernel.",
     formatter_class=argparse.RawDescriptionHelpFormatter,

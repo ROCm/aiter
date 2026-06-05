@@ -2933,6 +2933,48 @@ def test_batch_prefill_per_token_head_pytest(
     )
 
 
+# Small-seqlen regression for the PER_TOKEN_HEAD q_descale coredump. When
+# qo_len <= kM0 (128), the query tile is mostly padding rows; before the fix the
+# kernel read q_descale_per_token for those padding rows (past the [total_q]
+# tensor) and faulted. Exercises both supported page sizes; the q_descale
+# staging is layout-independent so "linear" coverage guards the crash.
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("qo_len,kv_len", [(1, 1), (4, 4), (16, 16), (16, 64)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("page_size", [64, 1024])
+def test_batch_prefill_per_token_head_small_seqlen_pytest(
+    batch_size,
+    qo_len,
+    kv_len,
+    causal,
+    page_size,
+):
+    """Regression: PER_TOKEN_HEAD must not OOB-read q_descale on padding rows
+    when the query tile (kM0=128) is larger than the valid sequence length."""
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, 0.0),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return
+
+    run_batch_prefill_per_token_head(
+        kvcache_layout="linear",
+        table_layout="sglang",
+        batch_size=batch_size,
+        qo_len=qo_len,
+        kv_len=kv_len,
+        page_size=page_size,
+        num_qo_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        causal=causal,
+        logits_soft_cap=0.0,
+        dtype=torch.bfloat16,
+        contiguous_kv=True,
+        seed=42,
+    )
+
+
 # Decode-aligned VEC_K_COL_V_LAYOUT pytest. Codegen only emits this variant for
 # fp8bf16 PER_TOKEN_HEAD with the sglang lookup table (see fmha_batch_prefill.py).
 @pytest.mark.parametrize("batch_size", [1, 4])
