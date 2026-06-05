@@ -256,10 +256,6 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     assert gfx_version in ("gfx942", "gfx950", "gfx1250")
     is_gfx1250 = gfx_version == "gfx1250"
     if is_gfx1250:
-        # gfx1250 has two kernels:
-        #   - base (Preshuffle=False): per-token gather, requires KVBlockSize==1
-        #   - preshuffle (Preshuffle=True): TDM block-load, requires
-        #     KVBlockSize==ChunkK>1
         if Preshuffle:
             assert KVBlockSize > 1 and ChunkK % KVBlockSize == 0, (
                 f"gfx1250 preshuffle (TDM block-load) requires KVBlockSize>1 "
@@ -482,8 +478,6 @@ def deepgemm_fp8_paged_mqa_logits(
     kv_cache_scale = kv_cache_scale.view(torch.float32)
 
     if VarCtxSchedule is not None and get_gfx() == "gfx1250":
-        # VarCtx is not implemented on gfx1250 yet; fall back to the preshuffle
-        # path (which gfx1250 does support) instead of failing to compile.
         import warnings
 
         warnings.warn(
