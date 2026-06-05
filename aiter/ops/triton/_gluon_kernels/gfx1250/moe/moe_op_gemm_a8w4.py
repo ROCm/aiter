@@ -503,9 +503,9 @@ def _moe_gemm_a8w4_decode(
             [0, pid_n * BLOCK_N],
             bias_buffer,
         )
-        TDM_BIAS_WAIT = 1
+        TDM_BIAS_WAIT: gl.constexpr = 1
     else:
-        TDM_BIAS_WAIT = 0
+        TDM_BIAS_WAIT: gl.constexpr = 0
 
     # Epilogue: drain remaining pipeline stages (no new TDM loads).
     # The first NUM_BUFFERS-1 iterations still use the pre-load / WMMA pattern.
@@ -1054,9 +1054,9 @@ def _moe_gemm_a8w4_prefill(
             [0, pid_n * BLOCK_N],
             bias_buffer,
         )
-        TDM_BIAS_WAIT = 1
+        TDM_BIAS_WAIT: gl.constexpr = 1
     else:
-        TDM_BIAS_WAIT = 0
+        TDM_BIAS_WAIT: gl.constexpr = 0
 
     # Epilogue: drain remaining pipeline stages (no new TDM loads).
     # The first NUM_BUFFERS-1 iterations still use the pre-load / WMMA pattern.
