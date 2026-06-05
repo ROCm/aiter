@@ -106,6 +106,7 @@ class AttentionConfig:
         self,
         HEAD_SIZE,
         BLOCK_SIZE,
+        TILE_SIZE,
         NUM_BLOCKS_GATHER_PER_TILE,
         NUM_SEGMENTS_PER_SEQ,
         BLOCK_M,
@@ -134,6 +135,7 @@ class AttentionConfig:
         # Constants
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
+        self.TILE_SIZE = gl.constexpr(TILE_SIZE)
         self.NUM_BLOCKS_GATHER_PER_TILE = gl.constexpr(NUM_BLOCKS_GATHER_PER_TILE)
         self.NUM_SEGMENTS_PER_SEQ = gl.constexpr(NUM_SEGMENTS_PER_SEQ)
         self.BLOCK_M = gl.constexpr(BLOCK_M)
@@ -149,7 +151,6 @@ class AttentionConfig:
         self.SCALE_K_WIDTH = gl.constexpr(SCALE_K_WIDTH)
         self.BLOCK_SCALES_SIZE = gl.constexpr(BLOCK_SCALES_SIZE)
         # Derived constants
-        self.TILE_SIZE = gl.constexpr(BLOCK_SIZE * NUM_BLOCKS_GATHER_PER_TILE)
         self.NUM_QUERIES_PER_KV = gl.constexpr(NUM_QUERY_HEADS // NUM_KV_HEADS)
         self.BLOCK_Q = gl.constexpr(BLOCK_Q)
         self.RCP_LN2 = gl.constexpr(1.4426950408889634)
@@ -1993,6 +1994,7 @@ def _unified_attention_gluon_kernel_3d(
     cfg = AttentionConfig(
         HEAD_SIZE,
         BLOCK_SIZE,
+        TILE_SIZE,
         NUM_BLOCKS_GATHER_PER_TILE,
         NUM_SEGMENTS_PER_SEQ,
         BLOCK_M,
