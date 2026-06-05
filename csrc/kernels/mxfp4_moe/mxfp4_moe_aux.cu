@@ -16,10 +16,10 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/amd_detail/amd_hip_bf16.h>
 
-#include "aux/moe_3stage_sort.cuh"
-#include "aux/moe_scatter_reduce.cuh"
-#include "aux/moe_sort_quant.cuh"
-#include "aux/moe_sort_scales.cuh"
+#include "moe_aux/moe_3stage_sort.cuh"
+#include "moe_aux/moe_scatter_reduce.cuh"
+#include "moe_aux/moe_sort_quant.cuh"
+#include "moe_aux/moe_sort_scales.cuh"
 
 namespace {
 
