@@ -1001,16 +1001,37 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
 
     moe_out = torch.zeros((token_num, model_dim), dtype=dtype, device=device)
-    _grouped_dbg("start scatter output")
-    for e in range(E):
-        n = int(counts[e].item())
-        if n == 0:
-            continue
-        vals = grouped_out[e, :n]
-        if not doweight_stage1:
-            vals = vals * route_weights[e, :n].view(-1, 1)
-        moe_out.index_add_(0, route_tokens[e, :n], vals)
-    _grouped_dbg("scatter output done")
+    # One-pass gather-reduce epilogue (default): a single FlyDSL kernel gathers
+    # each token's topk source rows, weights them, and sums in f32. Set
+    # AITER_GROUPED_GEMM_NAIVE=1 to fall back to the naive per-expert
+    # ``index_add_`` scatter loop.
+    _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
+    if (not _use_naive) and dtype in (dtypes.bf16, dtypes.fp16):
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_gather_reduce
+
+        _grouped_dbg("start gather-reduce output")
+        flydsl_moe_gather_reduce(
+            grouped_out,
+            route_tokens,
+            route_weights,
+            counts,
+            token_num,
+            topk,
+            doweight_stage1,
+            out=moe_out,
+        )
+        _grouped_dbg("gather-reduce output done")
+    else:
+        _grouped_dbg("start scatter output")
+        for e in range(E):
+            n = int(counts[e].item())
+            if n == 0:
+                continue
+            vals = grouped_out[e, :n]
+            if not doweight_stage1:
+                vals = vals * route_weights[e, :n].view(-1, 1)
+            moe_out.index_add_(0, route_tokens[e, :n], vals)
+        _grouped_dbg("scatter output done")
     impl_name = "grouped_a4w4" if data_format == "fp4" else "grouped_a8w4"
     os.environ["AITER_LAST_FUSED_MOE_IMPL"] = impl_name
     logger.info(

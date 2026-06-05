@@ -1391,3 +1391,128 @@ def flydsl_moe_stage2(
         torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# MoE gather-reduce (weighted) epilogue
+#
+# Final MoE step: combine the per-expert stage2 output ``grouped_out (E, max_m,
+# model_dim)`` into the flat per-token output, weighting each row by its route
+# weight and summing the ``topk`` contributions of every token::
+#
+#     moe_out[t] = sum_k  w(t,k) * grouped_out[expert(t,k), pos(t,k)]
+#
+# ``flydsl_moe_gather_reduce`` is the one-pass gather-reduce kernel: it builds a
+# per-token inverse index map (vectorized host prep) and launches a single
+# kernel that produces each output token's row in one pass. The scatter
+# reference it is validated against (the per-expert ``index_add_`` loop) lives
+# in ``op_tests/test_moe_gather_reduce.py``.
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _get_compiled_gather_reduce(model_dim: int, topk: int, out_dtype: str):
+    """Compile and cache the one-pass MoE gather-reduce kernel."""
+    from aiter.ops.flydsl.kernels.moe_gather_reduce import (
+        build_moe_gather_reduce_module,
+    )
+
+    return build_moe_gather_reduce_module(model_dim, topk, out_dtype)
+
+
+def _build_gather_reduce_index_map(
+    route_tokens: torch.Tensor,
+    route_weights: torch.Tensor,
+    counts: torch.Tensor,
+    token_num: int,
+    topk: int,
+    max_m: int,
+    doweight_stage1: bool,
+):
+    """Invert the grouped layout into per-token (src_rows, gather_w) maps.
+
+    Returns
+    -------
+    src_rows : (token_num, topk) int32  -- flat row ``e*max_m + pos`` per (t,k)
+    gather_w : (token_num, topk) f32    -- route weight (or 1.0) per (t,k)
+
+    Unused slots (tokens with fewer than ``topk`` valid rows) are left as
+    ``(row=0, w=0)`` so the kernel can sum them unconditionally.
+    """
+    device = route_tokens.device
+    E = route_tokens.shape[0]
+
+    # Valid grouped rows: position < counts[e].
+    pos = torch.arange(max_m, device=device)
+    valid = pos.unsqueeze(0) < counts.to(device).view(-1, 1)  # (E, max_m)
+    flat_valid = valid.reshape(-1)
+
+    flat_rows = torch.arange(E * max_m, device=device, dtype=torch.long)[flat_valid]
+    tok = route_tokens.reshape(-1)[flat_valid].to(torch.long)
+    if doweight_stage1:
+        wgt = torch.ones(tok.shape, dtype=torch.float32, device=device)
+    else:
+        wgt = route_weights.reshape(-1)[flat_valid].to(torch.float32)
+
+    # Stable sort by destination token -> contiguous per-token groups; the slot
+    # within each group is the running rank (order within topk is irrelevant to
+    # the sum). Scatter into (token_num, topk), dropping any overflow > topk.
+    order = torch.argsort(tok, stable=True)
+    tok_s = tok[order]
+    counts_per_tok = torch.bincount(tok_s, minlength=token_num)
+    start = torch.zeros(token_num, dtype=torch.long, device=device)
+    if token_num > 1:
+        start[1:] = torch.cumsum(counts_per_tok, 0)[:-1]
+    rank = torch.arange(tok_s.shape[0], device=device) - start[tok_s]
+    keep = rank < topk
+    dst = tok_s * topk + rank
+
+    src_rows = torch.zeros(token_num * topk, dtype=torch.int32, device=device)
+    gather_w = torch.zeros(token_num * topk, dtype=torch.float32, device=device)
+    src_rows[dst[keep]] = flat_rows[order][keep].to(torch.int32)
+    gather_w[dst[keep]] = wgt[order][keep]
+    return src_rows.view(token_num, topk), gather_w.view(token_num, topk)
+
+
+def flydsl_moe_gather_reduce(
+    grouped_out: torch.Tensor,   # (E, max_m, model_dim) bf16/f16
+    route_tokens: torch.Tensor,  # (E, max_m) long
+    route_weights: torch.Tensor, # (E, max_m)
+    counts: torch.Tensor,        # (E,)
+    token_num: int,
+    topk: int,
+    doweight_stage1: bool,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """One-pass gather-reduce epilogue (replaces the per-expert ``index_add_``
+    scatter loop). Builds a per-token inverse index map (vectorized host prep)
+    and launches a single kernel that produces each output token's row in one
+    pass. ``grouped_out`` must be bf16 or f16."""
+    E, max_m, model_dim = grouped_out.shape
+    if grouped_out.dtype == torch.bfloat16:
+        out_dtype = "bf16"
+    elif grouped_out.dtype == torch.float16:
+        out_dtype = "f16"
+    else:
+        raise ValueError(f"unsupported dtype {grouped_out.dtype}; need bf16/f16")
+
+    src_rows, gather_w = _build_gather_reduce_index_map(
+        route_tokens, route_weights, counts, token_num, topk, max_m, doweight_stage1
+    )
+
+    grouped_out_flat = grouped_out.contiguous().view(E * max_m, model_dim)
+    if out is None:
+        out = torch.empty(
+            (token_num, model_dim), dtype=grouped_out.dtype, device=grouped_out.device
+        )
+
+    launch = _get_compiled_gather_reduce(model_dim, topk, out_dtype)
+    launch(
+        grouped_out_flat,
+        src_rows,
+        gather_w,
+        out,
+        token_num,
+        stream=torch.cuda.current_stream(),
+    )
+    return out
