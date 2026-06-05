@@ -4,11 +4,34 @@
 import torch
 
 
-def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Tensor:
-    # Hardcode BLOCK_K and BLOCK_N
+def shuffle_weight(
+    x: torch.Tensor,
+    layout=(16, 16),
+    use_int4=False,
+    is_guinterleave=False,
+    gate_up: bool = False,
+) -> torch.Tensor:
     x_type = x.dtype
     if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
         x = x.view(torch.uint8)
+
+    if is_guinterleave:
+        experts_cnt, N, K_pk = x.shape
+        if gate_up:
+            N = N // 2
+        NLane, KPack = layout
+        KLane = 64 // NLane
+        N0 = N // NLane
+        K0 = K_pk // (KLane * KPack)
+        if gate_up:
+            x_ = x.view(experts_cnt, 2, N0, NLane, K0, KLane, KPack)
+            x_ = x_.permute(0, 2, 1, 4, 5, 3, 6).contiguous()
+        else:
+            x_ = x.view(experts_cnt, N0, NLane, K0, KLane, KPack)
+            x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
+        x_ = x_.view(*x.shape).contiguous().view(x_type)
+        x_.is_shuffled = True
+        return x_
 
     IN, IK = layout
     BK = IK * 2
@@ -25,6 +48,13 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
     x_ = x_.view(x_type)
     x_.is_shuffled = True
     return x_
+
+
+def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.Tensor:
+    """Backward-compatible wrapper around `shuffle_weight(..., is_guinterleave=True)`."""
+    return shuffle_weight(
+        src, layout=(NLane, 16), is_guinterleave=True, gate_up=gate_up
+    )
 
 
 def shuffle_weight_NK(
@@ -48,42 +78,37 @@ def shuffle_weight_NK(
     return x_.view(*x.shape)
 
 
-def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.Tensor:
-    """
-    src: shape [experts_cnt, N, K_pk], where K_pk = K // 2
-    Returns: shuffled tensor of shape [experts_cnt, N0*2, K0, KLane, NLane, KPack]
-    """
-    # print("gemm shape:", src.shape)
-    src_type = src.dtype
-    if hasattr(torch, "float4_e2m1fn_x2") and src_type == torch.float4_e2m1fn_x2:
-        src = src.view(torch.uint8)
-    experts_cnt, N, K_pk = src.shape
-    if gate_up:
-        N = N // 2
-    KPack = 16
-    KLane = 64 // NLane  # 4
-    N0 = N // NLane
-    K0 = K_pk // (KLane * KPack)
-    if gate_up:
-        src_reshaped = src.view(
-            experts_cnt, 2, N0, NLane, K0, KLane, KPack
-        )  # [E,2, N0, NLane ,K0, KLane, KPack]
-        src_reshaped = src_reshaped.permute(
-            0, 2, 1, 4, 5, 3, 6
-        ).contiguous()  # [E, N0, 2, K0, KLane, NLane, KPack]
-        interleaved = src_reshaped.view(*src.shape)
-    else:
-        src_reshaped = src.view(experts_cnt, N0, NLane, K0, KLane, KPack)
-        interleaved = (
-            src_reshaped.permute(0, 1, 3, 4, 2, 5).contiguous().view(*src.shape)
-        )
-    # print("interleaved shape:", interleaved.shape)
-    return interleaved.contiguous().view(src_type)
-
-
-def shuffle_scale_a16w4(
-    src: torch.Tensor, experts_cnt: int, gate_up: bool
+def shuffle_scale(
+    src: torch.Tensor,
+    experts_cnt: int = None,
+    is_guinterleave: bool = False,
+    gate_up: bool = False,
 ) -> torch.Tensor:
+    if src is None:
+        return src
+    if src.dtype == torch.float32:
+        return src
+    assert src.ndim == 2, "scale must be a 2D tensor"
+
+    if not is_guinterleave:
+        m, n = src.shape
+        scale_padded = torch.empty(
+            (m + 255) // 256 * 256,
+            (n + 7) // 8 * 8,
+            dtype=src.dtype,
+            device=src.device,
+        )
+
+        scale_padded[:m, :n] = src
+        scale = scale_padded
+        sm, sn = scale.shape
+        scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
+        scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
+        return scale.view(sm, sn)
+
+    if experts_cnt is None:
+        raise ValueError("experts_cnt is required when is_guinterleave=True")
+
     n_experts, k_ = src.shape
     n_ = n_experts // experts_cnt
     # MXFP4 constants
@@ -111,6 +136,15 @@ def shuffle_scale_a16w4(
         shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
     # print("shf_scale shape:", shfl_scale.shape)
     return shfl_scale.view(*src.shape).contiguous()
+
+
+def shuffle_scale_a16w4(
+    src: torch.Tensor, experts_cnt: int, gate_up: bool
+) -> torch.Tensor:
+    """Backward-compatible wrapper around `shuffle_scale(..., is_guinterleave=True)`."""
+    return shuffle_scale(
+        src, experts_cnt=experts_cnt, is_guinterleave=True, gate_up=gate_up
+    )
 
 
 def pack_int8_to_packed_int4(x_shuf_i8: torch.Tensor) -> torch.Tensor:

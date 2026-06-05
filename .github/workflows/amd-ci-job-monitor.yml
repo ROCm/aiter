@@ -221,3 +221,11 @@ jobs:
             --summary | tee runner-fleet-report.md
 
           cat runner-fleet-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload runner fleet report
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-fleet-report
+          path: runner-fleet-report.md
+          if-no-files-found: error
+          retention-days: 7

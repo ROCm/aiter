@@ -28,6 +28,18 @@ from torch_guard import torch_compile_guard  # noqa: E402
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
 
+
+def is_experimental_enabled() -> bool:
+    # Mirror the C++ side (atoi(...) != 0): treat unset and "0" as disabled,
+    # any other integer value as enabled. Non-numeric strings are treated as
+    # disabled to avoid accidentally turning on experimental code paths.
+    val = os.environ.get("AITER_ENABLE_EXPERIMENTAL", "0")
+    try:
+        return int(val) != 0
+    except ValueError:
+        return False
+
+
 aiter_lib = None
 
 
@@ -694,7 +706,7 @@ def clone_3rdparty(third_party: str) -> None:
         dir_path = HIP_KITTENS_DIR
         third_party_info = {
             "url": "https://github.com/HazyResearch/HipKittens.git",
-            "commit": "b027c06ba935b80a53a7c7f7f82c0f9cbd0bf3cb",
+            "commit": "a5e308a7ec633b1e94a952de629f41653a0874f3",
         }
     elif third_party == "ComposableKernel":
         # TODO: ComposableKernel will be supported in the future
@@ -727,6 +739,7 @@ def build_module(
     torch_exclude,
     third_party,
     hipify=False,
+    flags_extra_hip_per_source=None,
 ):
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
@@ -743,7 +756,10 @@ def build_module(
         elif AITER_REBUILD >= 2:
             rm_module(md_name)
         op_dir = f"{bd_dir}/{md_name}"
-        logger.info(f"start build [{md_name}] under {op_dir}")
+        logger.info(
+            f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
+            f"start build [{md_name}] under {op_dir}"
+        )
 
         opbd_dir = f"{op_dir}/build"
         src_dir = f"{op_dir}/build/srcs"
@@ -813,6 +829,13 @@ def build_module(
             flags_hip.append(
                 f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
             )
+
+        # ASM kernel debug instrumentation (host prints + post-launch sync) in
+        # *.cu is compiled only when AITER_ASM_DEBUG=1, mirroring poc_kl's
+        # `compile-dbg` / -DASM_DEBUG. Default builds stay free of debug code.
+        if int(os.environ.get("AITER_ASM_DEBUG", "0")) != 0:
+            if not any("ASM_DEBUG" in f for f in flags_extra_hip):
+                flags_hip.append("-DASM_DEBUG")
 
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
@@ -903,6 +926,7 @@ def build_module(
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
                 hipify=hipify,
+                extra_cuda_cflags_per_source=flags_extra_hip_per_source,
             )
             if is_python_module and not is_standalone:
                 shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
@@ -928,6 +952,7 @@ def build_module(
 
     def FinalFunc():
         logger.info(
+            f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
             f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
         )
 
@@ -977,10 +1002,7 @@ def _get_ck_exclude_modules():
         "module_mla_metadata",
         "module_mla_reduce",
         "module_moe_asm",
-        "module_pa",
         "module_pa_metadata",
-        "module_pa_ragged",
-        "module_pa_v1",
         "module_ps_metadata",
         "module_quant",
         "module_rmsnorm_quant",
@@ -1022,10 +1044,21 @@ def get_args_of_build(ops_name: str, exclude=[]):
         "hip_clang_path": None,
         "blob_gen_cmd": "",
         "third_party": [],
+        # Optional per-source HIP flags. Maps a source path or fnmatch
+        # glob (e.g. "*_device.cu") to a list of additional flags that
+        # ninja will append to that single TU's $cuda_post_cflags. Used
+        # by opus_gemm to apply -D__HIPCC_RTC__ to kernel-only TUs while
+        # leaving dispatcher / pybind TUs untouched.
+        "flags_extra_hip_per_source": {},
     }
 
     def convert(d_ops: dict):
         for k, val in d_ops.items():
+            # `flags_extra_hip_per_source` is a dict-valued field
+            # whose string elements are plain compile flags (no env-var
+            # interpolation, no `eval`). Pass it through unchanged.
+            if k == "flags_extra_hip_per_source":
+                continue
             if isinstance(val, list):
                 for idx, el in enumerate(val):
                     if isinstance(el, str):
@@ -1038,9 +1071,10 @@ def get_args_of_build(ops_name: str, exclude=[]):
             else:
                 pass
 
-        # undefined compile features will be replaced with default value
-        d_opt_build_args.update(d_ops)
-        return d_opt_build_args
+        # Use a fresh copy so keys from previous modules don't leak
+        result = dict(d_opt_build_args)
+        result.update(d_ops)
+        return result
 
     with open(this_dir + "/optCompilerConfig.json", "r") as file:
         data = json.load(file)
@@ -1071,7 +1105,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
                         continue
                     single_ops = convert(d_ops)
                     # exclude experimental ops if AITER_ENABLE_EXPERIMENTAL is not set
-                    if not os.getenv("AITER_ENABLE_EXPERIMENTAL", False):
+                    if not is_experimental_enabled():
                         if single_ops.get("is_experimental", False):
                             continue
                     d_single_ops = {
@@ -1165,6 +1199,7 @@ def _ctypes_call(func, fc_name, md_name):
                 d_args["is_standalone"],
                 d_args["torch_exclude"],
                 d_args.get("third_party", []),
+                flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
             )
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
@@ -1436,6 +1471,9 @@ def compile_ops(
                         prev_hip_clang_path = os.environ.get("HIP_CLANG_PATH", None)
                         os.environ["HIP_CLANG_PATH"] = hip_clang_path
 
+                    flags_extra_hip_per_source = d_args.get(
+                        "flags_extra_hip_per_source", {}
+                    )
                     build_module(
                         md_name,
                         srcs,
@@ -1450,6 +1488,7 @@ def compile_ops(
                         torch_exclude,
                         third_party,
                         hipify,
+                        flags_extra_hip_per_source=flags_extra_hip_per_source,
                     )
 
                     if hip_clang_path is not None:
@@ -1520,6 +1559,18 @@ def compile_ops(
                         func.__signature__ = sig
                         ann = {k: v.annotation for k, v in sig.parameters.items()}
                         ann["return"] = sig.return_annotation
+                        _tensor_types = (torch.Tensor,)
+                        if aiter_tensor_t is not object:
+                            _tensor_types = (torch.Tensor, aiter_tensor_t)
+
+                        def _is_tensor_like(obj):
+                            return isinstance(obj, _tensor_types)
+
+                        def _is_tensor_type(tp):
+                            return tp is torch.Tensor or (
+                                aiter_tensor_t is not object and tp is aiter_tensor_t
+                            )
+
                         callargs = inspect.getcallargs(func, *args, **kwargs)
                         for el, arg in callargs.items():
                             expected_type = ann[el]
@@ -1528,13 +1579,11 @@ def compile_ops(
                             sub_t = typing.get_args(expected_type)
 
                             if origin is None:
-                                # Accept aiter_tensor_t wherever torch.Tensor is expected
-                                _ok = isinstance(arg, expected_type) or (
-                                    expected_type is torch.Tensor
-                                    and aiter_tensor_t is not object
-                                    and isinstance(arg, aiter_tensor_t)
-                                )
-                                if not _ok and not (
+                                if _is_tensor_type(expected_type) and _is_tensor_like(
+                                    arg
+                                ):
+                                    pass
+                                elif not isinstance(arg, expected_type) and not (
                                     any(el in str(expected_type) for el in enum_types)
                                     and isinstance(arg, int)
                                 ):
@@ -1547,7 +1596,11 @@ def compile_ops(
                                         f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                     )
                             elif origin is typing.Union or origin is types.UnionType:
-                                if arg is not None and not isinstance(arg, sub_t):
+                                if (
+                                    arg is not None
+                                    and not _is_tensor_like(arg)
+                                    and not isinstance(arg, sub_t)
+                                ):
                                     raise TypeError(
                                         f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
                                     )
@@ -1612,6 +1665,13 @@ def compile_ops(
                             )
                     return True
 
+                if not func.arg_checked:
+                    func.arg_checked = check_args()
+
+                if AITER_LOG_MORE == 2:
+                    from ..test_common import log_args
+
+                    log_args(func, *args, **kwargs)
                 # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
                 # Guard: only wrap if the module supports aiter_tensor_t (has _set_current_hip_stream)
                 if develop and hasattr(module, "_set_current_hip_stream"):
@@ -1631,14 +1691,6 @@ def compile_ops(
                         )
                         for k, v in kwargs.items()
                     }
-
-                if not func.arg_checked:
-                    func.arg_checked = check_args()
-
-                if AITER_LOG_MORE == 2:
-                    from ..test_common import log_args
-
-                    log_args(func, *args, **kwargs)
 
                 if develop and hasattr(module, "_set_current_hip_stream"):
                     module._set_current_hip_stream(

@@ -45,7 +45,6 @@ from aiter.jit.utils.chip_info import get_gfx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm, memref, scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.compiler.protocol import fly_values
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
@@ -539,13 +538,13 @@ def compile_small_m_hgemm_kernel(
 
     @flyc.kernel
     def small_m_hgemm_kernel(
-        C: fx.Tensor,
-        A: fx.Tensor,
-        B: fx.Tensor,
-        BIAS: fx.Tensor,
+        C: fx.Pointer,
+        A: fx.Pointer,
+        B: fx.Pointer,
+        BIAS: fx.Pointer,
         m: fx.Int32,
-        semaphore: fx.Tensor,
-        signal: fx.Tensor,
+        semaphore: fx.Pointer,
+        signal: fx.Pointer,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
@@ -658,10 +657,7 @@ def compile_small_m_hgemm_kernel(
                     scf.YieldOp([])
 
         def get_llvm_ptr(ptr, offset, dtype_bytes):
-            base_ptr = fly.extract_aligned_pointer_as_index(
-                _ptr_type, fly_values(ptr)[0]
-            )
-            base_ptr = llvm.PtrToIntOp(_i64_type, base_ptr).result
+            base_ptr = arith.index_cast(_i64_type, fx.ptrtoint(ptr))
             byte_offset = arith.index_cast(
                 T.i64, fx.Index(offset) * fx.Index(dtype_bytes)
             )
@@ -936,9 +932,8 @@ def compile_small_m_hgemm_kernel(
             return c_frags_new
 
         def store_split_k_tile(c_tensor, c_g, c_s, tile_n_offset):
-            out_raw = fly_values(c_tensor)[0]
-            out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
-            out_base_int = llvm.PtrToIntOp(_i64_type, out_base_ptr).result
+            out_raw = c_tensor
+            out_base_int = arith.index_cast(_i64_type, fx.ptrtoint(out_raw))
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
@@ -1356,13 +1351,13 @@ def compile_small_m_hgemm_kernel(
 
     @flyc.jit
     def launch_small_m_hgemm_kernel(
-        C: fx.Tensor,
-        A: fx.Tensor,
-        B: fx.Tensor,
-        BIAS: fx.Tensor,
+        C: fx.Pointer,
+        A: fx.Pointer,
+        B: fx.Pointer,
+        BIAS: fx.Pointer,
         m: fx.Int32,
-        semaphore: fx.Tensor,
-        signal: fx.Tensor,
+        semaphore: fx.Pointer,
+        signal: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False

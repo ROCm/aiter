@@ -12,6 +12,12 @@ from ..jit.utils.chip_info import get_cu_num
 from ..utility import dtypes
 
 
+# DEPRECATED: low-level binding kept for backward compatibility only.
+# Will be removed once all callers have migrated to topk_gating() below.
+# New code should use topk_gating(), which:
+#   - accepts an Optional[Tensor] correction_bias (None => no bias)
+#   - validates score_func string
+#   - exposes the same C++ kernel under a more accurate name
 @compile_ops("module_moe_topk")
 def topk_softplus(
     topk_weights: torch.Tensor,
@@ -20,7 +26,52 @@ def topk_softplus(
     correction_bias: torch.Tensor,
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,
+    score_func: str = "sqrtsoftplus",
 ) -> None: ...
+
+
+_VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
+
+
+def topk_gating(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: Optional[torch.Tensor] = None,
+    need_renorm: bool = True,
+    routed_scaling_factor: float = 1.0,
+    score_func: str = "sqrtsoftplus",
+) -> None:
+    """Unified fused topk gating for MoE routing.
+
+    Args:
+        score_func: one of {"sqrtsoftplus" (DeepSeek V4-Pro default),
+                            "sigmoid" (Llama4),
+                            "softmax" (DeepSeek V3 / classic MoE)}.
+        correction_bias: optional bias tensor, pass None for no bias.
+
+    Note: softmax is already normalized, so renorm is forced off.
+    """
+    assert (
+        score_func in _VALID_SCORE_FUNCS
+    ), f"Unknown score_func '{score_func}', expected one of {_VALID_SCORE_FUNCS}"
+    if correction_bias is None:
+        # Match gating dtype/device so dispatch picks DTYPE_B == DTYPE_I,
+        # avoiding extra kernel template instantiations.
+        correction_bias = torch.empty(
+            0, dtype=gating_output.dtype, device=gating_output.device
+        )
+    if score_func == "softmax":
+        need_renorm = False
+    topk_softplus(
+        topk_weights,
+        topk_indices,
+        gating_output,
+        correction_bias,
+        need_renorm,
+        routed_scaling_factor,
+        score_func,
+    )
 
 
 @compile_ops("module_moe_asm", fc_name="biased_grouped_topk")

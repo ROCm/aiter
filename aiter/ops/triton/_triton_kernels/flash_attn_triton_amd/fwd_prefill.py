@@ -347,7 +347,7 @@ def _attn_fwd_inner(
         if IS_FP8:
             qk += tl.dot(q, k) * q_descale * k_descale
         else:
-            qk += tl.dot(q, k)
+            qk = tl.dot(q, k, acc=qk)
         qk_scaled = qk * SM_SCALE
 
         if USE_ALIBI:
@@ -565,7 +565,7 @@ def _attn_fwd_inner(
             else:
                 acc += tl.dot(p.to(v.type.element_ty), v) * v_descale
         else:
-            acc += tl.dot(p.to(v.type.element_ty), v)
+            acc = tl.dot(p.to(v.type.element_ty), v, acc=acc)
 
     return acc, l_i, m_i
 
@@ -1499,14 +1499,6 @@ def attention_forward_prefill_triton_impl(
         assert (
             cu_seqlens_k.dtype == torch.int32
         ), f"cu_seqlens_k must be int32, got {cu_seqlens_k.dtype}"
-        assert cu_seqlens_q[0] == 0, "cu_seqlens_q must start with 0"
-        assert cu_seqlens_k[0] == 0, "cu_seqlens_k must start with 0"
-        assert (
-            cu_seqlens_q[-1] == total_seqlen_q
-        ), f"cu_seqlens_q[-1] {cu_seqlens_q[-1]} != total_seqlen_q {total_seqlen_q}"
-        assert (
-            cu_seqlens_k[-1] == total_seqlen_k
-        ), f"cu_seqlens_k[-1] {cu_seqlens_k[-1]} != total_seqlen_k {total_seqlen_k}"
 
         # set vars
         batch = len(cu_seqlens_q) - 1
