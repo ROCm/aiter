@@ -22,6 +22,10 @@ import os
 import sys
 import types
 
+# Allow `import aiter` on boxes with triton<3.6 (gluon's hard requirement) so
+# aiter.test_common.run_perftest is importable for --perf. Harmless otherwise.
+os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
+
 import torch
 
 torch.set_default_device("cuda")
@@ -67,8 +71,8 @@ def ref_moe_scatter_copy_token(
     return grouped_a1, a1_scale_raw, route_tokens, route_weights
 
 
-def _import_flydsl_scatter_copy_token():
-    """Return ``flydsl_moe_scatter_copy_token`` from the library.
+def _import_flydsl():
+    """Return (flydsl_moe_scatter_copy_token, build_gather_reduce_src_rows).
 
     Prefer the normal package import. If the full ``aiter`` package can't be
     imported in this environment (e.g. a FLIR build mismatch in unrelated
@@ -76,9 +80,12 @@ def _import_flydsl_scatter_copy_token():
     the parent packages so the heavy package ``__init__`` chain is skipped.
     """
     try:
-        from aiter.ops.flydsl.moe_kernels import flydsl_moe_scatter_copy_token
+        from aiter.ops.flydsl.moe_kernels import (
+            flydsl_moe_scatter_copy_token,
+            build_gather_reduce_src_rows,
+        )
 
-        return flydsl_moe_scatter_copy_token
+        return flydsl_moe_scatter_copy_token, build_gather_reduce_src_rows
     except Exception:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         base = os.path.join(root, "aiter", "ops", "flydsl")
@@ -97,39 +104,36 @@ def _import_flydsl_scatter_copy_token():
         )
         sys.modules["aiter.ops.flydsl.kernels.moe_scatter_copy_token"] = kern
         mk = _load(os.path.join(base, "moe_kernels.py"), "aiter.ops.flydsl.moe_kernels")
-        return mk.flydsl_moe_scatter_copy_token
+        return mk.flydsl_moe_scatter_copy_token, mk.build_gather_reduce_src_rows
 
 
-flydsl_moe_scatter_copy_token = _import_flydsl_scatter_copy_token()
+flydsl_moe_scatter_copy_token, build_gather_reduce_src_rows = _import_flydsl()
 
 
 def _build_routing(token_num, topk, E_total, ep, model_dim, fp4, dtype, seed):
-    """Build per-rank routing + random payload/scale under TP/EP of degree ``ep``.
+    """All-local routing (the real-path contract: topk_ids in [0, E_local),
+    exactly topk per token), parallelism degree ``ep`` -> ``E_local``.
 
-    Experts are sharded: a rank owns ``E_local = E_total // ep`` experts. Each
-    token routes to ``topk`` distinct experts globally; only local hits land in
-    this rank's grouped layout (so tokens may have <topk local rows). For ep==1
-    every token has exactly ``topk`` local rows.
-
-    Returns a1_payload, a1_scale, flat_experts, flat_tokens, flat_weights,
-    counts, E_local, max_m.
+    Returns a1_payload, a1_scale, topk_ids, topk_weight, flat_experts,
+    flat_tokens, flat_weights, counts, E_local, max_m. The flat_* / counts are
+    for the scatter reference; topk_ids/topk_weight feed the kernel.
     """
     gen = torch.Generator(device="cuda").manual_seed(seed)
     E_local = max(1, E_total // ep)
+    assert topk <= E_local, f"need topk<=E_local, got topk={topk} E_local={E_local}"
 
-    g_ids = torch.stack(
-        [torch.randperm(E_total, generator=gen, device="cuda")[:topk]
+    topk_ids = torch.stack(
+        [torch.randperm(E_local, generator=gen, device="cuda")[:topk]
          for _ in range(token_num)]
     ).to(torch.long)
-    g_w = torch.rand((token_num, topk), generator=gen, device="cuda", dtype=torch.float32)
-    g_w = (g_w / g_w.sum(-1, keepdim=True)).to(dtype)
+    topk_weight = torch.rand(
+        (token_num, topk), generator=gen, device="cuda", dtype=torch.float32
+    )
+    topk_weight = (topk_weight / topk_weight.sum(-1, keepdim=True)).to(dtype)
 
-    local_hit = g_ids < E_local
-    tok_idx = torch.arange(token_num, device="cuda").view(-1, 1).expand_as(g_ids)
-    flat_experts = g_ids[local_hit].contiguous()
-    flat_tokens = tok_idx[local_hit].contiguous()
-    flat_weights = g_w[local_hit].to(dtype).contiguous()
-
+    flat_experts = topk_ids.reshape(-1)
+    flat_tokens = torch.arange(token_num * topk, device="cuda") // topk
+    flat_weights = topk_weight.reshape(-1).to(dtype)
     counts = torch.bincount(flat_experts, minlength=E_local)
     max_m = int(counts.max().item()) if counts.numel() else 0
     max_m = max(WARP_TILE_M, ((max_m + WARP_TILE_M - 1) // WARP_TILE_M) * WARP_TILE_M)
@@ -138,23 +142,25 @@ def _build_routing(token_num, topk, E_total, ep, model_dim, fp4, dtype, seed):
     Ws = model_dim // 32                          # per-32 e8m0 scale, 1 byte each
     a1_payload = torch.randint(0, 256, (token_num, Wp), dtype=torch.uint8, device="cuda")
     a1_scale = torch.randint(0, 256, (token_num, Ws), dtype=torch.uint8, device="cuda")
-    return (a1_payload, a1_scale, flat_experts, flat_tokens, flat_weights,
-            counts, E_local, max_m)
+    return (a1_payload, a1_scale, topk_ids, topk_weight, flat_experts,
+            flat_tokens, flat_weights, counts, E_local, max_m)
 
 
 def _run_one(token_num, topk, E_total, ep, model_dim, fp4, dtype, seed=0, name=""):
-    (a1_payload, a1_scale, flat_experts, flat_tokens, flat_weights,
-     counts, E_local, max_m) = _build_routing(
+    (a1_payload, a1_scale, topk_ids, topk_weight, flat_experts,
+     flat_tokens, flat_weights, counts, E_local, max_m) = _build_routing(
         token_num, topk, E_total, ep, model_dim, fp4, dtype, seed
     )
 
+    # reference: per-expert copy loop using flat routing
     ref = ref_moe_scatter_copy_token(
         a1_payload, a1_scale, flat_experts, flat_tokens, flat_weights,
         counts, E_local, max_m,
     )
+    # optimized: shared src_rows map (argsort-free) -> scatter-copy kernel
+    src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E_local)
     opt = flydsl_moe_scatter_copy_token(
-        a1_payload, a1_scale, flat_experts, flat_tokens, flat_weights,
-        counts, E_local, max_m,
+        a1_payload, a1_scale, src_rows, topk_weight, E_local, max_m,
     )
     torch.cuda.synchronize()
 
@@ -188,12 +194,67 @@ REAL_MODELS = [
 ]
 
 
+def _run_perf(args):
+    """Profile the scatter-copy epilogue (map build + launch) via run_perftest."""
+    os.environ["AITER_LOG_MORE"] = "1"  # makes run_perftest log the per-op table
+    from aiter.test_common import run_perftest
+
+    token_num = args.tokens[0] if args.tokens else 1
+    dtype = torch.bfloat16
+    (a1_payload, a1_scale, topk_ids, topk_weight, _fe, _ft, _fw,
+     counts, E_local, max_m) = _build_routing(
+        token_num, args.topk, args.E, 1, args.model_dim, args.fp4, dtype, 0
+    )
+    Wp, Ws = a1_payload.shape[1], a1_scale.shape[1]
+    # Pre-allocated output buffers (as fused_moe passes them): kernel writes only
+    # valid rows, so a1_scale_raw padding stays 127.
+    grouped_a1 = torch.zeros((E_local, max_m, Wp), dtype=torch.uint8, device="cuda")
+    a1_scale_raw = torch.full((E_local, max_m, Ws), 127, dtype=torch.uint8, device="cuda")
+    route_tokens = torch.empty((E_local, max_m), dtype=torch.long, device="cuda")
+    route_weights = torch.zeros((E_local, max_m), dtype=dtype, device="cuda")
+
+    # Profile build (argsort-free src_rows) + scatter-copy launch.
+    def _epilogue():
+        src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E_local)
+        return flydsl_moe_scatter_copy_token(
+            a1_payload, a1_scale, src_rows, topk_weight, E_local, max_m,
+            grouped_a1=grouped_a1, a1_scale_raw=a1_scale_raw,
+            route_tokens=route_tokens, route_weights=route_weights,
+        )
+
+    print(
+        f"perf: tok={token_num} E={args.E} topk={args.topk} dim={args.model_dim} "
+        f"fp4={int(args.fp4)} Wp={Wp} Ws={Ws} max_m={max_m} "
+        f"-> profiling build_src_rows + scatter_copy"
+    )
+    _, avg_us = run_perftest(
+        _epilogue, num_iters=args.iters, num_warmup=10, num_rotate_args=1,
+    )
+    print(
+        f"\n[run_perftest] avg device time: {avg_us:.1f} us/iter "
+        f"(per-op breakdown / hot loop logged above via AITER_LOG_MORE=1)"
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-t", "--tokens", type=int, action="append", default=None)
     ap.add_argument("--tp", type=int, action="append", default=None)
     ap.add_argument("--skip-generic", action="store_true")
+    # --perf: profile flydsl_moe_scatter_copy_token with run_perftest and dump
+    # the per-op breakdown (host-side hot loop) via AITER_LOG_MORE.
+    ap.add_argument("--perf", action="store_true",
+                    help="profile the scatter-copy hot loop instead of correctness")
+    ap.add_argument("--E", type=int, default=32, help="[--perf] experts")
+    ap.add_argument("--topk", type=int, default=8, help="[--perf] topk")
+    ap.add_argument("--model-dim", type=int, default=4096, help="[--perf] model dim")
+    ap.add_argument("--fp4", action="store_true", help="[--perf] a4w4 payload (Wp=dim/2)")
+    ap.add_argument("--iters", type=int, default=50, help="[--perf] run_perftest iters")
     args = ap.parse_args()
+
+    if args.perf:
+        _run_perf(args)
+        return
 
     tokens = args.tokens if args.tokens else [1, 256]
     tps = args.tp if args.tp else [1, 8]
@@ -221,6 +282,9 @@ def main():
 
     all_ok = True
     for i, (tn, topk, E_total, ep, md, fp4, name) in enumerate(configs):
+        if topk > max(1, E_total // ep):
+            print(f"[SKIP] {name} tp={ep}: topk={topk} > E_local={E_total // ep}")
+            continue
         all_ok &= _run_one(tn, topk, E_total, ep, md, fp4, dtype, seed=i, name=name)
 
     print("\nALL PASS" if all_ok else "\nSOME FAILED")

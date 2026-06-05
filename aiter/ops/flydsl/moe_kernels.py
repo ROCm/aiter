@@ -1512,38 +1512,11 @@ def _get_compiled_scatter_copy(row_bytes: int):
     return build_moe_scatter_copy_token_module(row_bytes)
 
 
-def _build_scatter_copy_map(flat_experts, counts, E, max_m):
-    """Map grouped rows to their source-token rows (mirrors the per-expert loop).
-
-    Returns
-    -------
-    order  : (Nr,) long   -- stable argsort of routes by expert
-    dst_g  : (Nr,) long   -- flattened grouped row ``e*max_m + rank`` per route
-    keep   : (Nr,) bool   -- routes whose rank < max_m (drop overflow)
-
-    Stable sort by expert preserves the original route order within each expert,
-    matching ``flat_tokens[flat_experts == e]`` in the reference loop.
-    """
-    device = flat_experts.device
-    Nr = flat_experts.shape[0]
-    order = torch.argsort(flat_experts, stable=True)
-    e_s = flat_experts[order]
-    start = torch.zeros(E, dtype=torch.long, device=device)
-    if E > 1:
-        start[1:] = torch.cumsum(counts, 0)[:-1]
-    rank = torch.arange(Nr, device=device) - start[e_s]
-    keep = rank < max_m
-    dst_g = e_s * max_m + rank
-    return order, dst_g, keep
-
-
 def flydsl_moe_scatter_copy_token(
     a1_payload: torch.Tensor,                  # (token_num, Wp) uint8
     a1_scale_token_u8: Optional[torch.Tensor], # (token_num, Ws) uint8 or None
-    flat_experts: torch.Tensor,                # (token_num*topk,) long
-    flat_tokens: torch.Tensor,                 # (token_num*topk,) long
-    flat_weights: torch.Tensor,                # (token_num*topk,) dtype
-    counts: torch.Tensor,                      # (E,)
+    src_rows: torch.Tensor,                    # (token_num, topk) topk_ids->grouped rows
+    topk_weight: torch.Tensor,                 # (token_num, topk) route weights
     E: int,
     max_m: int,
     grouped_a1: Optional[torch.Tensor] = None,    # (E, max_m, Wp) uint8 out
@@ -1554,6 +1527,10 @@ def flydsl_moe_scatter_copy_token(
     """One-pass route-gather into the grouped layout. Equivalent to the
     per-expert copy loop in fused_moe.
 
+    Driven by the shared ``src_rows`` map (topk_ids -> grouped rows, the same one
+    gather-reduce uses). ``dst_src`` (grouped row -> source token) is its inverse,
+    built with a single scatter -- no argsort, no boolean-mask indexing.
+
     Output tensors may be passed in (the kernel writes only the mapped/valid
     rows, leaving any pre-existing padding untouched -- e.g. an a1_scale_raw
     pre-filled with 127). When omitted they are allocated zero-filled.
@@ -1561,25 +1538,24 @@ def flydsl_moe_scatter_copy_token(
     Returns (grouped_a1, a1_scale_raw, route_tokens, route_weights)."""
     device = a1_payload.device
     Wp = a1_payload.shape[1]
+    token_num, topk = src_rows.shape
+    num_dst = E * max_m
 
-    order, dst_g, keep = _build_scatter_copy_map(flat_experts, counts, E, max_m)
-    tok_sorted = flat_tokens[order]
-    w_sorted = flat_weights[order]
-    dst_keep = dst_g[keep]
-    src_keep = tok_sorted[keep]
+    src_flat = src_rows.reshape(-1).to(torch.long)          # grouped row per route
+    flat_tokens = torch.arange(token_num * topk, device=device) // topk  # token per route
 
-    # dst row -> src token map (-1 = unused padding slot, kernel skips it).
-    dst_src = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
-    dst_src[dst_keep] = src_keep.to(torch.int32)
+    # dst row -> src token (-1 = unused padding slot, kernel skips it). This is
+    # the inverse of src_rows: scatter each route's token into its grouped row.
+    dst_src = torch.full((num_dst,), -1, dtype=torch.int32, device=device)
+    dst_src[src_flat] = flat_tokens.to(torch.int32)
 
     if route_tokens is None:
         route_tokens = torch.zeros((E, max_m), dtype=torch.long, device=device)
     if route_weights is None:
-        route_weights = torch.zeros((E, max_m), dtype=flat_weights.dtype, device=device)
-    route_tokens.view(-1)[dst_keep] = src_keep.to(route_tokens.dtype)
-    route_weights.view(-1)[dst_keep] = w_sorted[keep].to(route_weights.dtype)
+        route_weights = torch.zeros((E, max_m), dtype=topk_weight.dtype, device=device)
+    route_tokens.view(-1)[src_flat] = flat_tokens.to(route_tokens.dtype)
+    route_weights.view(-1)[src_flat] = topk_weight.reshape(-1).to(route_weights.dtype)
 
-    num_dst = E * max_m
     if grouped_a1 is None:
         grouped_a1 = torch.zeros((E, max_m, Wp), dtype=torch.uint8, device=device)
     launch_p = _get_compiled_scatter_copy(Wp)

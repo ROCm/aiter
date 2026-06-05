@@ -758,17 +758,22 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # pre-filled a1_scale_raw=127 padding is preserved). Set
     # AITER_GROUPED_GEMM_NAIVE=1 to fall back to the naive per-expert copy loop.
     _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
+    # Per-token gather map (topk_ids -> grouped rows), built once (argsort-free)
+    # and shared by the scatter-copy and gather-reduce kernels below.
+    src_rows = None
     if not _use_naive:
-        from aiter.ops.flydsl.moe_kernels import flydsl_moe_scatter_copy_token
+        from aiter.ops.flydsl.moe_kernels import (
+            flydsl_moe_scatter_copy_token,
+            build_gather_reduce_src_rows,
+        )
 
+        src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E)
         _grouped_dbg("start route gather (scatter-copy kernel)")
         flydsl_moe_scatter_copy_token(
             a1_payload,
             a1_scale_token_u8,
-            flat_experts,
-            flat_tokens,
-            flat_weights,
-            counts,
+            src_rows,
+            topk_weight,
             E,
             max_m,
             grouped_a1=grouped_a1,
@@ -993,9 +998,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
 
         _grouped_dbg("start gather-reduce output")
-        # Build the per-token gather map once (argsort-free); can be shared with
-        # the route-gather step. gather_w is already in (token, topk) layout.
-        src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E)
+        # Reuse the per-token gather map built for the route-gather step (shared,
+        # argsort-free); only rebuild if the scatter-copy path didn't run.
+        if src_rows is None:
+            src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E)
         gather_w = (
             torch.ones((token_num, topk), dtype=torch.float32, device=device)
             if doweight_stage1
