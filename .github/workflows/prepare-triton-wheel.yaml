@@ -61,7 +61,7 @@ jobs:
         if: ${{ inputs.source-artifact-name != '' }}
         run: |
           set -euo pipefail
-          SOURCE_ARCHIVE=aiter-source.tar.gz
+          SOURCE_ARCHIVE="${RUNNER_TEMP}/aiter-source.tar.gz"
           rm -f "${SOURCE_ARCHIVE}"
           tar \
             --exclude=".git" \
@@ -80,7 +80,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.source-artifact-name }}
-          path: aiter-source.tar.gz
+          path: ${{ runner.temp }}/aiter-source.tar.gz
           retention-days: ${{ inputs.retention-days }}
 
       - name: Download Triton wheel
