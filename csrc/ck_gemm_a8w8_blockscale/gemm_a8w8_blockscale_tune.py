@@ -107,6 +107,20 @@ def run_gemm_a8w8_blockscale_cktile(
         )
 
 
+def _skip_ref(*args, **kwargs):
+    """Sentinel reference function for timing-only tuning.
+
+    Returns ``None`` so ``mp_tuner.worker`` skips the correctness compare
+    (it guards on ``if ref is not None``).  Used for ``y_is_zeroed=True``
+    cktile tasks: the split-K kernel intentionally skips its in-kernel
+    ``Y.zero_()``, so the tuner's repeated launches accumulate into ``Y`` and
+    a multi-iteration allclose cannot pass.  Correctness for these kernels is
+    covered by the default (``y_is_zeroed=False``) tuning and by
+    ``op_tests/test_zero_init_splitk_fusion.py``.
+    """
+    return None
+
+
 def run_gemm_a8w8_blockscale(
     x, weight, x_scale, w_scale, out, kernel_id, splitK, preshuffleB
 ):
@@ -335,6 +349,13 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         )
         ref_keys = ["x", "weight", "x_scale", "w_scale"]
         tasks_cktile = []
+        # When y_is_zeroed=True the cktile kernel skips its in-kernel Y.zero_(),
+        # so the tuner's repeated launches accumulate into Y and a multi-iteration
+        # correctness compare cannot pass. For that mode, run timing-only (skip the
+        # torch ref via _skip_ref) and do not NaN-init Y, preserving the zeros()
+        # that generate_data sets up.
+        cktile_ref_func = _skip_ref if y_is_zeroed else run_torch
+        cktile_output_keys = None if y_is_zeroed else ("out",)
         for i, kernel in kernel_list.items():
             if not get_gfx().startswith("gfx95"):
                 if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp == 8) or (
@@ -374,7 +395,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             y_is_zeroed,
                         ),
                         dict(run_kwargs),
-                        run_torch,
+                        cktile_ref_func,
                         (
                             ref_keys,
                             None,
@@ -386,7 +407,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         0.01,
                         None,
                         None,
-                        ("out",),
+                        cktile_output_keys,
                     )
                 )
         return tasks_cktile

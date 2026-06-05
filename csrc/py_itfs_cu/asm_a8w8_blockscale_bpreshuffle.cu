@@ -328,8 +328,19 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         //   - Skipped when y_is_zeroed is true: the caller (typically aiter
         //     after a fused zero-init producer kernel) guarantees `out` is
         //     already zero, so we avoid the redundant fill launch.
+        //   - Use a 2D memset (pitch = row stride) so a row-padded `out`
+        //     (stride(0) > N, matching ldc = out->stride(0) above) is zeroed
+        //     per row. A flat memset of numel*element_size would only be
+        //     correct for a contiguous `out`; for a padded row stride it would
+        //     leave the inter-row gaps dirty and corrupt the split-K
+        //     atomic accumulation.
         if (selectedsplitK > 1 && !y_is_zeroed) {
-            HIP_CALL(hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream));
+            const size_t elem_size   = out->element_size();
+            const size_t row_bytes   = static_cast<size_t>(out->size(1)) * elem_size;
+            const size_t pitch_bytes = static_cast<size_t>(out->stride(0)) * elem_size;
+            const size_t num_rows    = static_cast<size_t>(out->size(0));
+            HIP_CALL(hipMemset2DAsync(
+                out->ptr, pitch_bytes, 0, row_bytes, num_rows, stream));
         }
     }
 

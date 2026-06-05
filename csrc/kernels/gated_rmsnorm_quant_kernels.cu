@@ -340,6 +340,10 @@ void gated_rmsnorm_fp8_group_quant(
     {
         const auto& y = gemm_out_zero_init.value();
         TORCH_CHECK(y.is_cuda(), "gemm_out_zero_init must be on CUDA device");
+        TORCH_CHECK(y.device() == x.device(),
+                    "gemm_out_zero_init must be on the same device as inputs");
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0,
+                    "gemm_out_zero_init must be 16-byte aligned");
         TORCH_CHECK(y.is_contiguous(), "gemm_out_zero_init must be contiguous");
         const int64_t total_bytes = y.numel() * y.element_size();
         TORCH_CHECK(total_bytes % 16 == 0,

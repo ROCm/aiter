@@ -776,6 +776,16 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                     "{32,64,128}); got cols=",
                     cols);
         const aiter_tensor_t& y = *gemm_out_zero_init;
+        AITER_CHECK(y.is_gpu(),
+                    "gemm_out_zero_init must be on GPU");
+        AITER_CHECK(y.device_id == input.device_id,
+                    "gemm_out_zero_init must be on the same device as input; "
+                    "got y.device_id=",
+                    y.device_id,
+                    " input.device_id=",
+                    input.device_id);
+        AITER_CHECK(reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0,
+                    "gemm_out_zero_init base pointer must be 16-byte aligned");
         AITER_CHECK(y.is_contiguous(),
                     "gemm_out_zero_init must be contiguous");
         const int64_t y_bytes = y.numel() * y.element_size();

@@ -649,6 +649,12 @@ void fused_qk_rmsnorm_group_quant(
     if(gemm_out_zero_init.has_value())
     {
         const aiter_tensor_t& y = *gemm_out_zero_init;
+        AITER_CHECK(y.is_gpu(),
+                    __func__,
+                    " gemm_out_zero_init must be on GPU");
+        AITER_CHECK(reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0,
+                    __func__,
+                    " gemm_out_zero_init base pointer must be 16-byte aligned");
         AITER_CHECK(y.is_contiguous(),
                     __func__,
                     " gemm_out_zero_init must be contiguous");
@@ -669,6 +675,15 @@ void fused_qk_rmsnorm_group_quant(
     aiter_tensor_t& q = q_opt.value();
     aiter_tensor_t& q_weight = q_weight_opt.value();
     double q_epsilon = q_epsilon_opt.value();
+
+    // Same-device check for the optional SplitK zero-init buffer; q is the
+    // primary input and is only bound here, after the buffer block above.
+    if(gemm_out_zero_init.has_value())
+    {
+        AITER_CHECK(gemm_out_zero_init->device_id == q.device_id,
+                    __func__,
+                    " gemm_out_zero_init must be on the same device as q");
+    }
 
     // No-quant mode: caller skipped both q_out_quantized and q_out_scale; we only do RMSNorm
     // and write the post-norm vector to q_out_unquantized.
