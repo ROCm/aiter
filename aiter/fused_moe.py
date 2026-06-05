@@ -1549,6 +1549,24 @@ def get_2stage_cfgs(
             stage2_has_bias=activation == ActivationType.Swiglu,
         )
 
+    # CK 2-stage MoE does not currently codegen a Swiglu specialization for
+    # MXFP4 (gen_instances.py only emits -act {silu,gelu}). If dispatch lands
+    # here for that combination the JIT compile fails with a missing lookup
+    # header. Refuse it explicitly rather than silently falling through.
+    # Tracked: ROCm/aiter#TODO
+    if (
+        activation == ActivationType.Swiglu
+        and q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and not (kernelName1 and "ck2stages" in kernelName1)
+    ):
+        raise NotImplementedError(
+            "CK 2-stage MoE has no Swiglu+MXFP4 specialization; this "
+            "combination must be routed to CK-Tile or FlyDSL upstream. "
+            f"Got q_type={q_type}, q_dtype_a={q_dtype_a}, q_dtype_w={q_dtype_w}, "
+            f"is_shuffled={is_shuffled}, gate_mode={gate_mode}."
+        )
+
     if (kernelName1 and "ck2stages" in kernelName1) or (
         not kernelName1
         and (
