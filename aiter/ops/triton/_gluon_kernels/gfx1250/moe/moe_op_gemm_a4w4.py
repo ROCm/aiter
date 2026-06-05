@@ -1,5 +1,4 @@
 import torch
-import triton
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
