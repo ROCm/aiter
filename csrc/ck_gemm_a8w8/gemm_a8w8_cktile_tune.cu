@@ -82,12 +82,12 @@ torch::Tensor gemm_a8w8_cktile_tune(
 
   if (Y.dtype() == at::ScalarType::BFloat16)
   {
-    // if (is_i8)
-    // {
-    //   // INT8 path
-    //   rowwise_dispatch<TILE_I8, TILE_BF16, TILE_BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-    // }
-    // else
+    if (is_i8)
+    {
+      // INT8 path
+      rowwise_dispatch<TILE_I8, TILE_BF16, TILE_BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+    }
+    else
     {
       // FP8 path
       rowwise_dispatch<TILE_FP8, TILE_FP32, TILE_BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);

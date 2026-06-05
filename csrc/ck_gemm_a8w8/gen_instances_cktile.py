@@ -159,16 +159,16 @@ template torch::Tensor
 """
         if self.istune:
             # Generate both I8 and F8 instances for tuning
-            # # I8 instances
-            # for EDtype in ["TILE_BF16"]:
-            #     INSTANCE_abI8 = INSTANCE_template.format(
-            #         name=k.name, dtypes=f"TILE_I8, TILE_BF16, {EDtype}"
-            #     )
-            #     Path(
-            #         os.path.join(
-            #             self.instances_path, f"{k.name}_abI8_dB16_e{EDtype}.cpp"
-            #         )
-            #     ).write_text(INSTANCE_abI8)
+            # I8 instances
+            for EDtype in ["TILE_BF16"]:
+                INSTANCE_abI8 = INSTANCE_template.format(
+                    name=k.name, dtypes=f"TILE_I8, TILE_BF16, {EDtype}"
+                )
+                Path(
+                    os.path.join(
+                        self.instances_path, f"{k.name}_abI8_dB16_e{EDtype}.cpp"
+                    )
+                ).write_text(INSTANCE_abI8)
 
             # F8 instances
             for EDtype in ["TILE_BF16"]:
@@ -182,7 +182,7 @@ template torch::Tensor
                 ).write_text(INSTANCE_abF8)
         else:
             for EDtype in ["TILE_BF16", "TILE_FP16"]:
-                for ABDtype in ["TILE_FP8"]: # I8
+                for ABDtype in ["TILE_FP8", "TILE_I8"]:
                     for DDtype in ["TILE_FP32", EDtype]:
                         intsance = INSTANCE_template.format(
                             name=k.name, dtypes=f"{ABDtype}, {DDtype}, {EDtype}"
