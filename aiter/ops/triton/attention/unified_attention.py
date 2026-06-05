@@ -104,72 +104,83 @@ def select_3d_config(
 ):
     # TODO: wait for Triton compiler to support ds_load_tr4 before we can include torch.uint8 kv_cache_dtype
     # assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, torch.uint8, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8})"
-    assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
+    assert kv_cache_dtype in (
+        torch.bfloat16,
+        e4m3_dtype,
+    ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
     reduce_num_warps = 2
     attn_warps = 2
     waves_per_eu = 2
     num_segments = 0
     attn_stages = 2
-    if IS_DEVICE_ARCH_GFX12 and shuffled_kv_cache and head_size < 128:
-        TILE_SIZE = block_size
-        if kv_cache_dtype == torch.bfloat16:
-            if block_size <= 64:
+    if IS_DEVICE_ARCH_GFX12:
+        if shuffled_kv_cache and head_size < 128:
+            TILE_SIZE = block_size
+            if kv_cache_dtype == torch.bfloat16:
+                if block_size <= 64:
+                    attn_warps = 1
+                    waves_per_eu = 2
+                else:
+                    attn_warps = 1
+                    waves_per_eu = 1
+                    attn_stages = 1
+            elif kv_cache_dtype == e4m3_dtype:
+                if block_size <= 128:
+                    attn_warps = 1
+                    waves_per_eu = 2
+                else:
+                    attn_warps = 1
+                    waves_per_eu = 1
+                    attn_stages = 1
+            else:
+                assert block_size == 128, "FP4 KV cache only supports block_size 128"
                 attn_warps = 1
                 waves_per_eu = 2
-            else:
-                attn_warps = 1
-                waves_per_eu = 1
-                attn_stages = 1
-        elif kv_cache_dtype == e4m3_dtype:
-            if block_size <= 128:
-                attn_warps = 1
-                waves_per_eu = 2
-            else:
-                attn_warps = 1
-                waves_per_eu = 1
-                attn_stages = 1
         else:
-            assert block_size == 128, "FP4 KV cache only supports block_size 128"
+            # GFX12 fallback for un-tunned shapes
+            TILE_SIZE = block_size
             attn_warps = 1
-            waves_per_eu = 2
+            waves_per_eu = 1
+            attn_stages = 1
+
         occ = waves_per_eu * 4 // attn_warps
         MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
         num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
         num_segments = min(MAX_SEGMENTS, num_segments)
         num_segments = triton.next_power_of_2(num_segments)
 
-    occ = waves_per_eu * 4 // attn_warps
-    target_num_prgms = target_num_prgms * occ
+        # # this section increases the num_warps if the occ is too high
+        # total_num_wg = num_2d_prgms * num_segments
+        # if total_num_wg < occ * target_num_prgms:
+        #     # occ too high, increase attn_warps to relax occ
+        #     attn_warps = (waves_per_eu * 4) // max(
+        #         1, triton.next_power_of_2(total_num_wg // target_num_prgms)
+        #     )
+        #     attn_warps = max(attn_warps, 1)
+        #     attn_warps = min(attn_warps, 4)
 
-    TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        if (
+            2 * attn_stages * TILE_SIZE * head_size * kv_cache_dtype.itemsize * occ
+            >= 327680
+        ):
+            waves_per_eu = 0
+    else:
+        occ = waves_per_eu * 4 // attn_warps
+        target_num_prgms = target_num_prgms * occ
 
-    MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
-    MIN_SEGMENTS = min(8, MAX_SEGMENTS)
-    if num_segments == 0:
-        num_segments = math.ceil(target_num_prgms / num_2d_prgms)
-        num_segments = min(num_segments, MAX_SEGMENTS)
-        num_segments = triton.next_power_of_2(num_segments)
-        num_segments = min(num_segments, 128)
-        num_segments = max(num_segments, MIN_SEGMENTS)
+        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
 
-    if num_segments == MIN_SEGMENTS:
-        reduce_num_warps = 1
+        MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+        MIN_SEGMENTS = min(8, MAX_SEGMENTS)
+        if num_segments == 0:
+            num_segments = math.ceil(target_num_prgms / num_2d_prgms)
+            num_segments = min(num_segments, MAX_SEGMENTS)
+            num_segments = triton.next_power_of_2(num_segments)
+            num_segments = min(num_segments, 128)
+            num_segments = max(num_segments, MIN_SEGMENTS)
 
-    # # this section increases the num_warps if the occ is too high
-    # total_num_wg = num_2d_prgms * num_segments
-    # if total_num_wg < occ * target_num_prgms:
-    #     # occ too high, increase attn_warps to relax occ
-    #     attn_warps = (waves_per_eu * 4) // max(
-    #         1, triton.next_power_of_2(total_num_wg // target_num_prgms)
-    #     )
-    #     attn_warps = max(attn_warps, 1)
-    #     attn_warps = min(attn_warps, 4)
-
-    if (
-        2 * attn_stages * TILE_SIZE * head_size * kv_cache_dtype.itemsize * occ
-        >= 327680
-    ):
-        waves_per_eu = 0
+        if num_segments == MIN_SEGMENTS:
+            reduce_num_warps = 1
 
     if NUM_BLOCKS_GATHER_PER_TILE > 1:
         # force gather mode
@@ -450,7 +461,7 @@ def unified_attention(
             segm_output = out
             segm_max = out  # dummy ptr
             segm_expsum = out  # dummy ptr
-        print(f"{attn_config=}")
+
         if IS_DEVICE_ARCH_GFX12:
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
