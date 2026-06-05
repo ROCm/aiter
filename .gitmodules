@@ -1,4 +1,4 @@
 [submodule "3rdparty/composable_kernel"]
 	path = 3rdparty/composable_kernel
-	url = https://github.com/ROCm/composable_kernel.git
+	url = https://github.com/LORD-ROY/tx-composable_kernel
 	branch = AITERKER-112
