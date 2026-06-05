@@ -220,6 +220,45 @@ def mha_fwd(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
+def gen_mha_fwd_native_splitkv_fake_tensors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: Optional[torch.Tensor],
+    softmax_scale: float,
+    causal: bool,
+    return_lse: bool,
+    num_splits: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch_size, seqlen_q, nhead_q, hdim = q.shape
+    o = (
+        torch.empty((batch_size, seqlen_q, nhead_q, hdim), dtype=q.dtype, device=q.device)
+        if out is None
+        else out
+    )
+    if return_lse:
+        lse = torch.empty((batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device)
+    else:
+        lse = torch.empty((0,), dtype=torch.float32, device=q.device)
+    return o, lse
+
+
+@compile_ops(
+    "module_mha_fwd_native_splitkv",
+    gen_fake=gen_mha_fwd_native_splitkv_fake_tensors,
+)
+def mha_fwd_native_splitkv(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Optional[Tensor],
+    softmax_scale: float,
+    causal: bool,
+    return_lse: bool,
+    num_splits: int,
+) -> Tuple[Tensor, Tensor]: ...
+
+
 def gen_fmha_v3_fwd_fake_tensors(
     q: Tensor,
     k: Tensor,
