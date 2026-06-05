@@ -794,19 +794,37 @@ def benchmark_single_case(
     attn_mode = effective_attn_mode(args)
     freeze_softmax_max_count = -1
 
-    # An explicit static mask or a --block-mask-file mask is used directly and
-    # wins over the Q/K-derived (--sparge) build.
+    # Block-mask precedence (highest first):
+    #   1. an explicit list-mode mask, 2. a --block-mask-file mask,
+    #   3. a random --block-sparsity mask, 4. the Q/K-derived --sparge/vfa LUT.
+    # A static mask (1-3) is used directly and wins over the --sparge build.
     file_mask = (
         explicit_block_attn_mask
         if explicit_block_attn_mask is not None
         else build_block_mask(args, shape, loaded_single_mask)
     )
+    if file_mask is None and args.block_sparsity is not None:
+        device = q.device
+        block_m, block_n = kernel_block_sizes(args.kernel)
+        num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
+        num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
+        warmup_mask = (
+            torch.rand(shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device)
+            > args.block_sparsity
+        ).to(torch.bool)
+        file_mask = warmup_mask
 
     if file_mask is not None:
         block_attn_mask = file_mask
         block_lut = block_attn_mask_to_ragged_lut(
             block_attn_mask, return_none_if_dense=True
         )
+        # sage_fp8_vfa on a static (random) mask: don't reorder the LUT to
+        # front-load the top-n blocks (no build_attention_lut). Keep the LUT in
+        # ascending block order and just run the kernel with the n_sample freeze
+        # count so the VFA running-max-freeze path is still exercised.
+        if args.kernel == "sage_fp8_vfa" and block_lut is not None:
+            freeze_softmax_max_count = args.n_sample
     elif attn_mode is not None:
         # VFA/Sparge: build the ragged LUT (+ freeze count) from the bhsd Q/K
         # via build_attention_lut, replacing the mask-driven LUT path.
@@ -940,7 +958,9 @@ def create_single_shape_config(args: argparse.Namespace) -> List[Any]:
     d_head_v = args.dv if args.dv else d_head
 
     include_sparse_metric = (
-        args.block_mask_file is not None or effective_attn_mode(args) is not None
+        args.block_mask_file is not None
+        or args.block_sparsity is not None
+        or effective_attn_mode(args) is not None
     )
     lines = metric_lines(args, include_sparse_metric)
 
@@ -970,7 +990,9 @@ def create_captured_config(
     inputs: List[Dict[str, Any]],
 ) -> List[Any]:
     include_sparse_metric = (
-        args.block_mask_file is not None or effective_attn_mode(args) is not None
+        args.block_mask_file is not None
+        or args.block_sparsity is not None
+        or effective_attn_mode(args) is not None
     )
     lines = metric_lines(args, include_sparse_metric)
 
@@ -1049,6 +1071,31 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if args.compare_to_ref and args.ref not in ("torch", "aiter_bf16"):
         raise ValueError("--ref must be one of: torch, aiter_bf16")
+
+    if args.block_sparsity is not None:
+        if not 0.0 <= args.block_sparsity <= 1.0:
+            raise ValueError("--block-sparsity must be in [0, 1]")
+        if args.block_mask_file:
+            raise ValueError(
+                "--block-sparsity cannot be combined with --block-mask-file"
+            )
+        if args.kernel == "all":
+            raise ValueError("--kernel=all does not support --block-sparsity")
+        if args.sparge:
+            logger.warning(
+                "--block-sparsity overrides --sparge: using a random block-sparse "
+                "mask instead of the Q/K-derived sparge selection"
+            )
+    elif args.sparge and not args.load_captured:
+        # Sparge block selection is data-driven; on randomly generated Q/K it keeps
+        # essentially every block (a near-dense LUT), so the sparse metrics match
+        # the dense ones. Steer users to real data or a random mask instead.
+        logger.warning(
+            "--sparge on randomly generated input produces a near-dense block "
+            "selection (random Q/K keeps almost all blocks), so sparse_throughput "
+            "will match throughput. Use --load-captured with real data, or "
+            "--block-sparsity R to benchmark a random block-sparse mask."
+        )
 
     attn_mode = effective_attn_mode(args)
     if attn_mode is not None:
@@ -1305,6 +1352,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="JSON file with block masks. Used directly as the block mask "
         "(takes precedence over the Q/K-derived --sparge mask).",
+    )
+    parser.add_argument(
+        "--block-sparsity",
+        type=float,
+        default=None,
+        help="Random block sparsity ratio in [0,1] (fraction of (q_block, "
+        "kv_block) pairs masked out). Generates a random block-sparse mask, "
+        "useful for benchmarking sparsity on randomly generated inputs where "
+        "--sparge selection is meaningless. Takes precedence over --sparge.",
     )
 
     parser.add_argument(
