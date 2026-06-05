@@ -612,11 +612,8 @@ def test_mla(
     ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
     ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
 
-    # Gluon MLA decode test (bf16 only, nhead in (64,128), decode_qlen=1,
-    # head_dim_ckv=512, head_dim_kpe=64, batch in (64,128,256), page_size=1).
-    # NUM_KV_SPLITS is auto-picked by the wrapper so the launch fills ~256
-    # workgroups; the per-split min seq_len bound depends on it. Mirror the
-    # picker here to gate ctx_lens precisely.
+    # Gluon MLA decode test
+    # Example: -c 16384 -b 64 128 -n 64,1 128,1 -d bf16 -kvd bf16
     NUM_XCDS_GFX950 = 8
     BLOCK_H_GLUON = 64
     if (
@@ -647,10 +644,7 @@ def test_mla(
             ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
             ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
 
-    # Gluon MLA bh16bn128 decode test (gfx950, bf16 Q + fp8 KV, nhead in (4,8,16),
-    # batch=1, decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
-    # Token-bound NUM_KV_SPLITS = min(256, min_kv_seq_len) keeps splits non-empty
-    # for any ctx >= 1, so small kv (1..256) is supported.
+    # Gluon MLA bh16bn128 decode test
     # Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
     if (
         get_gfx() == "gfx950"
@@ -670,10 +664,7 @@ def test_mla(
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
 
-    # Gluon MLA bh16bn64 decode test (gfx950, bf16 Q + bf16 KV).
-    # Block-bound NUM_KV_SPLITS = min(256 // batch_size, cdiv(min_kv_seq_len, 64))
-    # keeps splits non-empty for any ctx >= 1 (collapses to 1 split when
-    # ctx <= 64), so small kv (1..256) is supported.
+    # Gluon MLA bh16bn64 decode test
     # Example: -c 10000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 [-lse]
     if (
         get_gfx() == "gfx950"

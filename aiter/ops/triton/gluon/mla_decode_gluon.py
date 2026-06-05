@@ -630,12 +630,11 @@ def _mla_decode_gluon(
     ### store lse
     blocked_lse: gl.constexpr = gl.BlockedLayout(size_per_thread=[1], threads_per_warp=[64], warps_per_cta=[4], order=[0])
     cur_head_lse = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=blocked_lse)
-    lse = e_max + gl.log(e_sum)
-    # convert so that 1 store is enough
-    lse = gl.convert_layout(lse, blocked_lse)
     if RETURN_LSE and NUM_KV_SPLITS == 1:
         # split==1: single split is the whole sequence, so its lse is the final lse.
         offs_final_lse = cur_batch * stride_final_lse_b + cur_head_lse * stride_final_lse_h
+        lse = e_max + gl.log(e_sum)
+        lse = gl.convert_layout(lse, blocked_lse)
         if NHEAD < BLOCK_H:
             gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=(cur_head_lse < NHEAD))
         else:
@@ -643,6 +642,8 @@ def _mla_decode_gluon(
     elif NUM_KV_SPLITS > 1:
         # per-split lse for stage-2 reduce.
         offs_mid_lse = cur_batch * stride_mid_lse_b + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_s
+        lse = e_max + gl.log(e_sum)
+        lse = gl.convert_layout(lse, blocked_lse)
         if NHEAD < BLOCK_H:
             gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=(cur_head_lse < NHEAD))
         else:
