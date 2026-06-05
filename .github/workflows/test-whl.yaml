@@ -46,6 +46,7 @@ jobs:
 
       - name: Download wheel artifacts
         uses: actions/download-artifact@v4
+        timeout-minutes: 15
         with:
           pattern: aiter-whl-packages-py*
           path: dist
