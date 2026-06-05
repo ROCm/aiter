@@ -190,52 +190,27 @@ __global__ void add_rmsnorm_quant_kernel(
                 }
                 auto sum_f = [](float a, float b) { return a + b; };
                 rcp[0] = block_reduce<float, decltype(sum_f), BlockSize, true>(square_sum, sum_f);
-                rcp[0] = rsqrtf(rcp[0] / n + epsilon);
-                rcp[1] = rcp[0];
+                float rms = rsqrtf(rcp[0] / n + epsilon);
                 vec2_f* thread_data_float2 = reinterpret_cast<vec2_f*>(&thread_data_float);
-                for(int i = 0; i < thread_data_size / 2; i++)
-                {
-#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
-    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
-    defined(__gfx950__)
-                    asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(rcp));
-#else
-                    thread_data_float2[i][0] *= rcp[0];
-                    thread_data_float2[i][1] *= rcp[1];
-#endif
-                }
-                for(int i = 0; i < thread_data_size / 2; i++)
-                {
-                    vec2_f& thread_data_weight_float2 = rcp;
-                    thread_data_weight_float2[0] = static_cast<float>(thread_data_weight[2 * i]);
-                    thread_data_weight_float2[1] = static_cast<float>(thread_data_weight[2 * i + 1]);
-#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
-    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
-    defined(__gfx950__)
-                    asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(thread_data_weight_float2));
-#else
-                    thread_data_float2[i][0] *= thread_data_weight_float2[0];
-                    thread_data_float2[i][1] *= thread_data_weight_float2[1];
-#endif
-                }
                 float thread_max = 1e-10f;
-                if constexpr(thread_data_size % 2 == 0)
+                for(int i = 0; i < thread_data_size / 2; i++)
                 {
-                    for(int i = 0; i < thread_data_size; i += 2)
-                    {
-                        asm volatile("v_max3_f32 %0, %1, %2, %3\n"
-                                    : "=v"(thread_max)
-                                    : "v"(thread_max),
-                                    "v"(fabsf(thread_data_float[i])),
-                                    "v"(fabsf(thread_data_float[i + 1])));
-                    }
-                }
-                else
-                {
-                    for(int i = 0; i < thread_data_size; i++)
-                    {
-                        thread_max = fmaxf(thread_max, fabsf(static_cast<float>(thread_data_float[i])));
-                    }
+                    vec2_f scale_pair;
+                    scale_pair[0] = rms * static_cast<float>(thread_data_weight[2 * i]);
+                    scale_pair[1] = rms * static_cast<float>(thread_data_weight[2 * i + 1]);
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
+                    asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(scale_pair));
+#else
+                    thread_data_float2[i][0] *= scale_pair[0];
+                    thread_data_float2[i][1] *= scale_pair[1];
+#endif
+                    asm volatile("v_max3_f32 %0, %1, %2, %3\n"
+                                : "=v"(thread_max)
+                                : "v"(thread_max),
+                                "v"(fabsf(thread_data_float2[i][0])),
+                                "v"(fabsf(thread_data_float2[i][1])));
                 }
                 float quant_scale;
                 {
@@ -271,32 +246,20 @@ __global__ void add_rmsnorm_quant_kernel(
                 }
                 auto sum_f = [](float a, float b) { return a + b; };
                 rcp[0] = block_reduce<float, decltype(sum_f), BlockSize, true>(square_sum, sum_f);
-                rcp[0] = rsqrtf(rcp[0] / n + epsilon);
-                rcp[1] = rcp[0];
+                float rms = rsqrtf(rcp[0] / n + epsilon);
                 vec2_f* thread_data_float2 = reinterpret_cast<vec2_f*>(&thread_data_float);
                 for(int i = 0; i < thread_data_size / 2; i++)
                 {
+                    vec2_f scale_pair;
+                    scale_pair[0] = rms * static_cast<float>(thread_data_weight[2 * i]);
+                    scale_pair[1] = rms * static_cast<float>(thread_data_weight[2 * i + 1]);
 #if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
     defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
     defined(__gfx950__)
-                    asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(rcp));
+                    asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(scale_pair));
 #else
-                    thread_data_float2[i][0] *= rcp[0];
-                    thread_data_float2[i][1] *= rcp[1];
-#endif
-                }
-                for(int i = 0; i < thread_data_size / 2; i++)
-                {
-                    vec2_f& thread_data_weight_float2 = rcp;
-                    thread_data_weight_float2[0] = static_cast<float>(thread_data_weight[2 * i]);
-                    thread_data_weight_float2[1] = static_cast<float>(thread_data_weight[2 * i + 1]);
-#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
-    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
-    defined(__gfx950__)
-                    asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(thread_data_weight_float2));
-#else
-                    thread_data_float2[i][0] *= thread_data_weight_float2[0];
-                    thread_data_float2[i][1] *= thread_data_weight_float2[1];
+                    thread_data_float2[i][0] *= scale_pair[0];
+                    thread_data_float2[i][1] *= scale_pair[1];
 #endif
                 }
                 if constexpr(FUSE_QUANT) // must be fp4 here
