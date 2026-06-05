@@ -18,6 +18,9 @@ from aiter.ops.triton.utils.mhc_config_utils import (
     get_mhc_config,
     get_mhc_post_config,
 )
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+DEVICE_ARCH = arch_info.get_arch()
 
 _LOGGER = AiterTritonLogger()
 
@@ -442,6 +445,8 @@ def mhc_post_pre(
     hc_pre_eps: float = 1e-6,
     hc_post_mult_value: float = 2.0,
     sinkhorn_iters: int = 20,
+    asymmetric_exp_domain: bool = False,
+    hc_sinkhorn_eps: float = 1e-6,
     residual_out: Optional[torch.Tensor] = None,
     h_post: Optional[torch.Tensor] = None,
     h_res: Optional[torch.Tensor] = None,
@@ -487,7 +492,16 @@ def mhc_post_pre(
         eps:                RMS-norm epsilon (default 1e-6)
         hc_pre_eps:         added to sigmoid(H^pre) (default 0.0)
         hc_post_mult_value: multiplier on sigmoid(H^post) (default 2.0)
-        sinkhorn_iters:     log-domain SK iterations on next pre's H^res (default 20)
+        sinkhorn_iters:     SK iterations on next pre's H^res (default 20).
+        asymmetric_exp_domain: when True, runs HIP-compatible exp-domain
+                            Sinkhorn (``mhc_kernels.cu:493-507``): first iter
+                            ``softmax(row) + eps`` then ``div(col + eps)``,
+                            followed by ``sinkhorn_iters - 1`` symmetric
+                            ``div(row+eps), div(col+eps)`` iters. Default
+                            False (canonical log-domain Sinkhorn-Knopp).
+        hc_sinkhorn_eps:    eps used during asymmetric-exp-domain Sinkhorn;
+                            ignored when ``asymmetric_exp_domain`` is False
+                            (default 1e-6).
         residual_out:       optional pre-allocated (M, n, C) output of dtype
                             ``layer_input.dtype``. Allocated if None.
         h_post:             optional pre-allocated post-stream output. Accepts
@@ -578,8 +592,9 @@ def mhc_post_pre(
     if config is None:
         config, _ = get_mhc_config("MHC_FUSED", M, C, mode="sinkhorn")
     config = dict(config)
-
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
+    if DEVICE_ARCH in ("gfx942",):
+        BLOCK_M = 16
     BLOCK_K = config.pop("BLOCK_K", min(512, triton.next_power_of_2(K)))
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
     BLOCK_C = config.pop("BLOCK_C", min(128, triton.next_power_of_2(C)))
@@ -783,6 +798,8 @@ def mhc_post_pre(
         KSPLIT_POW2=KSPLIT_POW2,
         BLOCK_M_POST_RES=BLOCK_M_POST_RES,
         NUM_SINKHORN_ITERS=sinkhorn_iters,
+        ASYMMETRIC_EXP_DOMAIN=asymmetric_exp_domain,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
         **config,
     )
 

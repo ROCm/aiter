@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+import functools
 from itertools import product
 from typing import Dict, Optional
 
@@ -13,8 +14,10 @@ import torch
 from torch import Tensor
 
 import flydsl.expr as fx
+import flydsl.compiler as flyc
 from aiter import logger
 from flydsl.runtime.device import get_rocm_arch
+from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 from aiter.jit.utils.chip_info import get_gfx
 
@@ -42,12 +45,13 @@ KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
 KERNEL_FAMILY_HGEMM = "hgemm"
 KERNEL_FAMILY_SMALL_M = "small_m"
 _HGEMM_KERNEL_RE = re.compile(
-    r"^flydsl_gemm(?P<stage>\d+)_"
+    r"^flydsl_gemm(?P<stages>\d+)_"
     r"a(?P<a_dtype>[a-z0-9]+)_w(?P<w_dtype>[a-z0-9]+)_(?P<out_dtype>[a-z0-9]+)_"
     r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"split_k(?P<split_k>\d+)_"
     r"block_m_warp(?P<block_m_warps>\d+)_"
     r"block_n_warp(?P<block_n_warps>\d+)_"
+    r"block_k_warp(?P<block_k_warps>\d+)_"
     r"async_copy(?P<async_copy>True|False)_"
     r"b_to_lds(?P<b_to_lds>True|False)_"
     r"b_preshuffle(?P<b_preshuffle>True|False)_"
@@ -66,58 +70,48 @@ SplitKStreamKey = tuple[int, int]
 SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
 SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
 
+
+def _ptr_view_safe(t: torch.Tensor):
+    type_name = type(t).__name__
+    module_name = type(t).__module__
+    if type_name == "FakeTensor" or "fake_tensor" in module_name:
+        return flyc.from_c_void_p(fx.Uint8, 0)
+    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+
+
 # Keep the generic auto-generated catalog aligned with the upstream FlyDSL
 # reference tuning space. The wider local one-off search space introduced
 # gfx950-faulting candidates (for example tile_k=160 and tile_n=160/192),
 # and higher split-K values are now capped at 8 for better accuracy.
 HGEMM_TILE_N_OPTIONS = (64, 128, 256)
 HGEMM_TILE_K_OPTIONS = (64, 128, 256)
-HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 96, 128, 256)
-HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 9))
-HGEMM_MAX_SPLIT_K = 8
-KERNEL_CONFIG_VARIANTS = (
+HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 80, 96, 128, 256)
+HGEMM_STAGE_OPTIONS = tuple([i for i in range(2, 9)])
+HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 14))
+HGEMM_MAX_SPLIT_K = 13
+HGEMM_WARP_SHAPE_OPTIONS = [
+    (wm, wn, wk) for wm, wn, wk in product([1, 2, 4], repeat=3) if wm * wn * wk <= 16
+]
+KERNEL_CONFIG_VARIANTS = [
     {
-        "block_m_warps": 1,
-        "block_n_warps": 2,
-        "b_to_lds": False,
-    },
-    {
-        "block_m_warps": 1,
-        "block_n_warps": 4,
-        "b_to_lds": False,
-    },
-    {
-        "block_m_warps": 2,
-        "block_n_warps": 2,
-        "b_to_lds": False,
-    },
-    {
-        "block_m_warps": 1,
-        "block_n_warps": 4,
+        "block_m_warps": wm,
+        "block_n_warps": wn,
+        "block_k_warps": wk,
         "b_to_lds": True,
-    },
-    {
-        "block_m_warps": 2,
-        "block_n_warps": 2,
-        "b_to_lds": True,
-    },
-)
+    }
+    for wm, wn, wk in HGEMM_WARP_SHAPE_OPTIONS
+]
 
 _SPLITK_HGEMM_KERNELS: Dict[str, Dict] = {}
 
 
 def _normalize_supported_kernel_metadata(
     *,
-    stage: int,
     async_copy: bool,
     c_to_lds: bool,
 ) -> tuple[int, bool, bool]:
     # Latest `hgemm.py` fixes these choices internally instead of exposing
     # multiple codegen variants to the wrapper layer.
-    if stage != FIXED_STAGE:
-        raise ValueError(
-            f"Current kernel only supports stage={FIXED_STAGE}; got stage={stage}"
-        )
     if async_copy != KERNEL_ASYNC_COPY:
         raise ValueError(
             "Current kernel fixes async_copy from the active GPU architecture; "
@@ -128,11 +122,11 @@ def _normalize_supported_kernel_metadata(
             f"Current kernel only supports c_to_lds={FIXED_C_TO_LDS}; "
             f"got c_to_lds={c_to_lds}"
         )
-    return FIXED_STAGE, KERNEL_ASYNC_COPY, FIXED_C_TO_LDS
+    return KERNEL_ASYNC_COPY, FIXED_C_TO_LDS
 
 
 def flydsl_kernel_name(
-    stage: int,
+    stages: int,
     dtype: str,
     out_dtype: str,
     tile_m: int,
@@ -141,6 +135,7 @@ def flydsl_kernel_name(
     split_k: int,
     block_m_warp: int,
     block_n_warp: int,
+    block_k_warp: int,
     async_copy: bool,
     b_to_lds: bool,
     b_preshuffle: bool = False,
@@ -151,8 +146,7 @@ def flydsl_kernel_name(
     waves_per_eu: int = 0,
     b_to_lds_unroll: int = 0,
 ) -> str:
-    stage, async_copy, c_to_lds = _normalize_supported_kernel_metadata(
-        stage=stage,
+    async_copy, c_to_lds = _normalize_supported_kernel_metadata(
         async_copy=async_copy,
         c_to_lds=c_to_lds,
     )
@@ -165,9 +159,9 @@ def flydsl_kernel_name(
     if kernel_family == KERNEL_FAMILY_SMALL_M and b_preshuffle:
         raise ValueError("small-M kernel only supports `b_preshuffle=False`")
     name = (
-        f"flydsl_gemm{stage}_a{dtype}_w{dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
+        f"flydsl_gemm{stages}_a{dtype}_w{dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
     )
-    name += f"_split_k{split_k}_block_m_warp{block_m_warp}_block_n_warp{block_n_warp}"
+    name += f"_split_k{split_k}_block_m_warp{block_m_warp}_block_n_warp{block_n_warp}_block_k_warp{block_k_warp}"
     name += (
         f"_async_copy{async_copy}_b_to_lds{b_to_lds}_b_preshuffle{b_preshuffle}"
         f"_c_to_lds{c_to_lds}"
@@ -318,6 +312,46 @@ def _validate_hgemm_inputs(
     return m, n, k
 
 
+def selection_filter(m, n, k, kwargs):
+    TILE_M = kwargs["TILE_M"]
+    TILE_N = kwargs["TILE_N"]
+    TILE_K = kwargs["TILE_K"]
+    STAGES = kwargs["STAGES"]
+    SPLIT_K = kwargs["SPLIT_K"]
+    BLOCK_M_WARPS = kwargs["BLOCK_M_WARPS"]
+    BLOCK_N_WARPS = kwargs["BLOCK_N_WARPS"]
+    BLOCK_K_WARPS = kwargs["BLOCK_K_WARPS"]
+    B_TO_LDS = kwargs.get("B_TO_LDS", True)
+    GPU_ARCH = get_rocm_arch()
+    DTYPE_BYTES = 2
+
+    def get_stage_smem_use(stages_):
+        SMEM_USE = stages_ * TILE_M * TILE_K * DTYPE_BYTES
+        if B_TO_LDS:
+            SMEM_USE += stages_ * TILE_N * TILE_K * DTYPE_BYTES
+        SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * TILE_M * TILE_N * DTYPE_BYTES)
+        return SMEM_USE
+
+    smem_use_s0 = get_stage_smem_use(STAGES)
+    # smem_use_s1 = get_stage_smem_use(STAGES + 3)
+    smem_cap = SMEM_CAPACITY_MAP[GPU_ARCH]
+    if not (smem_use_s0 <= smem_cap):
+        return False
+    if m >= 4096 and n >= 4096 and k >= 4096:
+        if not (
+            TILE_M == 256
+            and TILE_N == 256
+            and TILE_K == 64
+            and STAGES == 2
+            and SPLIT_K == 1
+            and BLOCK_M_WARPS == 2
+            and BLOCK_N_WARPS == 4
+            and BLOCK_K_WARPS == 1
+        ):
+            return False
+    return True
+
+
 def _validate_hgemm_tiling(
     m: int,
     n: int,
@@ -332,18 +366,33 @@ def _validate_hgemm_tiling(
     stages: int,
     block_m_warps: int,
     block_n_warps: int,
+    block_k_warps: int,
     b_to_lds: bool,
 ) -> None:
-    del m
+    config = {
+        "TILE_M": tile_m,
+        "TILE_N": tile_n,
+        "TILE_K": tile_k,
+        "STAGES": stages,
+        "SPLIT_K": split_k,
+        "BLOCK_M_WARPS": block_m_warps,
+        "BLOCK_N_WARPS": block_n_warps,
+        "BLOCK_K_WARPS": block_k_warps,
+        "B_TO_LDS": b_to_lds,
+    }
+    if not selection_filter(m, n, k, config):
+        raise ValueError(
+            f"Invalid tiling configuration for m={m} n={n} k={k}: {config}"
+        )
 
     if tile_m < 1 or tile_n < 1 or tile_k < 1:
         raise ValueError(
             f"Tile sizes must be positive, got tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}"
         )
-    if block_m_warps < 1 or block_n_warps < 1:
+    if block_m_warps < 1 or block_n_warps < 1 or block_k_warps < 1:
         raise ValueError(
             "Warp tiling must be positive, got "
-            f"block_m_warps={block_m_warps}, block_n_warps={block_n_warps}"
+            f"block_m_warps={block_m_warps}, block_n_warps={block_n_warps}, block_k_warps={block_k_warps}"
         )
     if tile_k < 32:
         raise ValueError(
@@ -355,10 +404,6 @@ def _validate_hgemm_tiling(
         )
     if split_k < 1:
         raise ValueError(f"Invalid split_k={split_k}; split_k must be >= 1")
-    if stages != FIXED_STAGE:
-        raise ValueError(
-            f"Invalid stages={stages}; current kernel always compiles a {FIXED_STAGE}-stage kernel"
-        )
     if pack_n != 1:
         raise ValueError(
             f"Current kernel only supports `pack_n=1`; got pack_n={pack_n}"
@@ -396,7 +441,7 @@ def _validate_hgemm_tiling(
             f">= tile_k={tile_k} and % tile_k == 0"
         )
 
-    block_threads = block_m_warps * block_n_warps * 64
+    block_threads = block_m_warps * block_n_warps * block_k_warps * 64
     ldg_vec_size = 8
     block_vecs = ldg_vec_size * block_threads
     block_mk_size = tile_m * tile_k
@@ -450,31 +495,31 @@ def _validate_hgemm_tiling(
 def _normalize_registry_config(
     *,
     dtype: str,
-    stage: int,
+    stages: int,
     tile_m: int,
     tile_n: int,
     tile_k: int,
     split_k: int,
     block_m_warps: int,
     block_n_warps: int,
+    block_k_warps: int,
     b_to_lds: bool,
 ) -> Optional[Dict]:
     config = {
         "kernel_family": KERNEL_FAMILY_HGEMM,
-        "stage": FIXED_STAGE,
+        "stages": int(stages),
         "tile_m": int(tile_m),
         "tile_n": int(tile_n),
         "tile_k": int(tile_k),
         "split_k": int(split_k),
         "block_m_warps": int(block_m_warps),
         "block_n_warps": int(block_n_warps),
+        "block_k_warps": int(block_k_warps),
         "async_copy": KERNEL_ASYNC_COPY,
         "b_to_lds": bool(b_to_lds),
         "b_preshuffle": False,
         "c_to_lds": FIXED_C_TO_LDS,
     }
-    if stage != FIXED_STAGE:
-        return None
 
     try:
         _validate_hgemm_tiling(
@@ -487,9 +532,10 @@ def _normalize_registry_config(
             tile_k=config["tile_k"],
             pack_n=1,
             split_k=config["split_k"],
-            stages=FIXED_STAGE,
+            stages=config["stages"],
             block_m_warps=config["block_m_warps"],
             block_n_warps=config["block_n_warps"],
+            block_k_warps=config["block_k_warps"],
             b_to_lds=config["b_to_lds"],
         )
     except ValueError:
@@ -510,15 +556,18 @@ def _parse_hgemm_kernel_params(name: str) -> Optional[Dict]:
         if m.group("small_m_suffix") is not None
         else KERNEL_FAMILY_HGEMM
     )
+    block_k_warps = m.group("block_k_warps")
+    block_k_warps = int(block_k_warps) if block_k_warps else 1
     config: Dict[str, object] = {
         "kernel_family": kernel_family,
-        "stage": int(m.group("stage")),
+        "stages": int(m.group("stages")),
         "tile_m": int(m.group("tile_m")),
         "tile_n": int(m.group("tile_n")),
         "tile_k": int(m.group("tile_k")),
         "split_k": int(m.group("split_k")),
         "block_m_warps": int(m.group("block_m_warps")),
         "block_n_warps": int(m.group("block_n_warps")),
+        "block_k_warps": block_k_warps,
         "async_copy": m.group("async_copy") == "True",
         "b_to_lds": m.group("b_to_lds") == "True",
         "b_preshuffle": m.group("b_preshuffle") == "True",
@@ -561,10 +610,11 @@ def get_flydsl_splitk_hgemm_kernels(
             "m, n, k must be provided together when requesting shape-aware kernels"
         )
     tile_ms = _hgemm_tile_m_options(m)
-    for tile_m, tile_n, tile_k, variant in product(
+    for tile_m, tile_n, tile_k, stages, variant in product(
         tile_ms,
         HGEMM_TILE_N_OPTIONS,
         HGEMM_TILE_K_OPTIONS,
+        HGEMM_STAGE_OPTIONS,
         KERNEL_CONFIG_VARIANTS,
     ):
         if n is not None and (n < tile_n or n % tile_n != 0):
@@ -575,13 +625,14 @@ def get_flydsl_splitk_hgemm_kernels(
         for split_k in split_k_options:
             config = _normalize_registry_config(
                 dtype=dtype,
-                stage=FIXED_STAGE,
+                stages=stages,
                 tile_m=tile_m,
                 tile_n=tile_n,
                 tile_k=tile_k,
                 split_k=split_k,
                 block_m_warps=variant["block_m_warps"],
                 block_n_warps=variant["block_n_warps"],
+                block_k_warps=variant["block_k_warps"],
                 b_to_lds=variant["b_to_lds"],
             )
             if config is None:
@@ -590,7 +641,7 @@ def get_flydsl_splitk_hgemm_kernels(
             config["out_dtype"] = out_dtype
             config["target_gfx"] = get_gfx()
             name = flydsl_kernel_name(
-                config["stage"],
+                config["stages"],
                 dtype,
                 out_dtype,
                 config["tile_m"],
@@ -599,6 +650,7 @@ def get_flydsl_splitk_hgemm_kernels(
                 config["split_k"],
                 config["block_m_warps"],
                 config["block_n_warps"],
+                config["block_k_warps"],
                 config["async_copy"],
                 config["b_to_lds"],
                 config["b_preshuffle"],
@@ -653,27 +705,15 @@ def _register_all_configs():
 _register_all_configs()
 
 
+@functools.lru_cache(maxsize=128)
 def _get_split_k_tensors(
+    device: torch.device,
     stream: torch.cuda.Stream,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    key = _stream_cache_key(stream)
-    semaphore = SPLIT_K_GLOBAL_SEMAPHORE.get(key)
-    signal = SPLIT_K_GLOBAL_SIGNAL.get(key)
-    with torch.cuda.device(stream.device), torch.cuda.stream(stream):
-        if semaphore is None:
-            semaphore = torch.zeros(
-                (SPLIT_K_SEMAPHORE_MAX_LEN,),
-                dtype=torch.int32,
-                device=stream.device,
-            )
-            SPLIT_K_GLOBAL_SEMAPHORE[key] = semaphore
-        if signal is None:
-            signal = torch.zeros(
-                (SPLIT_K_SEMAPHORE_MAX_LEN,),
-                dtype=torch.int32,
-                device=stream.device,
-            )
-            SPLIT_K_GLOBAL_SIGNAL[key] = signal
+    semaphore = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
+    )
+    signal = torch.zeros((SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device)
     return semaphore, signal
 
 
@@ -692,6 +732,7 @@ def _check_split_k_semaphore_capacity(
         )
 
 
+@functools.lru_cache(maxsize=16384)
 def _compile_flydsl_hgemm(
     dtype: str,
     m: int,
@@ -699,8 +740,9 @@ def _compile_flydsl_hgemm(
     k: int,
     *,
     tile_k: int = 64,
-    block_m_warps: int = 1,
-    block_n_warps: int = 4,
+    block_m_warps: int = 2,
+    block_n_warps: int = 2,
+    block_k_warps: int = 1,
     tile_m: int = 128,
     tile_n: int = 128,
     pack_n: int = 1,
@@ -740,15 +782,12 @@ def _compile_flydsl_hgemm(
             stages=stages,
             block_m_warps=block_m_warps,
             block_n_warps=block_n_warps,
+            block_k_warps=block_k_warps,
             b_to_lds=b_to_lds,
         )
     elif kernel_family == KERNEL_FAMILY_SMALL_M:
         if dtype != "bf16":
             raise ValueError(f"small-M kernel only supports `bf16`, got {dtype!r}")
-        if stages != FIXED_STAGE:
-            raise ValueError(
-                f"small-M kernel only supports stage={FIXED_STAGE}; got stage={stages}"
-            )
         if b_preshuffle:
             raise ValueError("small-M kernel only supports `b_preshuffle=False`")
         if tile_m != 16:
@@ -776,6 +815,7 @@ def _compile_flydsl_hgemm(
         split_k=split_k,
         block_m_warps=block_m_warps,
         block_n_warps=block_n_warps,
+        block_k_warps=block_k_warps,
         n_tile_repeat=n_tile_repeat,
         persistent_n_tiles=persistent_n_tiles,
         waves_per_eu=waves_per_eu,
@@ -808,16 +848,16 @@ def _compile_flydsl_hgemm(
         runtime_m = int(a.shape[0])
         launch_stream = _normalize_launch_stream(a.device, stream)
         _check_split_k_semaphore_capacity(runtime_m, n, tile_m, tile_n, split_k)
-        semaphore, signal = _get_split_k_tensors(launch_stream)
+        semaphore, signal = _get_split_k_tensors(a.device, launch_stream)
         return _run_compiled(
             kernel,
-            out,
-            a,
-            b,
-            launch_bias,
+            _ptr_view_safe(out),
+            _ptr_view_safe(a),
+            _ptr_view_safe(b),
+            _ptr_view_safe(launch_bias),
             runtime_m,
-            semaphore,
-            signal,
+            _ptr_view_safe(semaphore),
+            _ptr_view_safe(signal),
             fx.Stream(launch_stream),
         )
 
@@ -835,13 +875,14 @@ def flydsl_hgemm(
     tile_k: int = 64,
     pack_n: int = 1,
     split_k: int = 1,
-    block_m_warps: int = 1,
-    block_n_warps: int = 4,
+    block_m_warps: int = 2,
+    block_n_warps: int = 2,
+    block_k_warps: int = 1,
     n_tile_repeat: int = 1,
     persistent_n_tiles: int = 1,
     waves_per_eu: int = 0,
     b_to_lds_unroll: int = 0,
-    stages: int = FIXED_STAGE,
+    stages: int = 2,
     async_copy: bool = False,
     b_to_lds: bool = False,
     b_preshuffle: bool = False,
@@ -887,6 +928,7 @@ def flydsl_hgemm(
         tile_k=tile_k,
         block_m_warps=block_m_warps,
         block_n_warps=block_n_warps,
+        block_k_warps=block_k_warps,
         tile_m=tile_m,
         tile_n=tile_n,
         pack_n=pack_n,
@@ -1015,12 +1057,12 @@ def flydsl_preshuffle_gemm_a8(
     _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
     _run_compiled(
         exe,
-        out_contig.view(-1),
-        _as_i8(XQ.contiguous()).view(-1),
-        _as_i8(WQ.contiguous()).view(-1),
-        x_scale.contiguous().view(-1),
-        w_scale.contiguous().view(-1),
-        _dummy_bias,
+        _ptr_view_safe(out_contig.view(-1)),
+        _ptr_view_safe(_as_i8(XQ.contiguous()).view(-1)),
+        _ptr_view_safe(_as_i8(WQ.contiguous()).view(-1)),
+        _ptr_view_safe(x_scale.contiguous().view(-1)),
+        _ptr_view_safe(w_scale.contiguous().view(-1)),
+        _ptr_view_safe(_dummy_bias),
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),

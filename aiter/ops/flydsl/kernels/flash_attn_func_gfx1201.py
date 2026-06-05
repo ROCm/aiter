@@ -52,7 +52,6 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import (
-    fly as _fly,
     llvm as _llvm,
     memref as _memref,
 )
@@ -72,9 +71,10 @@ def _llvm_ptr_ty():
     return ir.Type.parse("!llvm.ptr")
 
 
-def _extract_aligned_pointer(tensor) -> ir.Value:
-    """Extract the aligned LLVM pointer from a FlyDSL tensor/memref."""
-    return _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), _llvm_value(tensor))
+def _pointer_to_llvm_ptr(ptr) -> ir.Value:
+    """Convert a FlyDSL pointer argument to the LLVM pointer used by raw loads."""
+    ptr_i64 = arith.index_cast(T.i64, fx.ptrtoint(ptr))
+    return _llvm.IntToPtrOp(_llvm_ptr_ty(), ptr_i64).result
 
 
 def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
@@ -202,18 +202,18 @@ def build_flash_attn_func_module_primary(
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def flash_attn_func_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,  # noqa: E741
+        Q: fx.Pointer,
+        K: fx.Pointer,
+        V: fx.Pointer,
+        O: fx.Pointer,  # noqa: E741
         seq_len: fx.Int32,
     ):
         elem_type = dtype_to_elem_type(dtype_str)
         elem_dtype = elem_numeric_cls
-        q_ptr = _extract_aligned_pointer(Q)
-        k_ptr = _extract_aligned_pointer(K)
-        v_ptr = _extract_aligned_pointer(V)
-        o_ptr = _extract_aligned_pointer(O)
+        q_ptr = _pointer_to_llvm_ptr(Q)
+        k_ptr = _pointer_to_llvm_ptr(K)
+        v_ptr = _pointer_to_llvm_ptr(V)
+        o_ptr = _pointer_to_llvm_ptr(O)
         fm_fast = arith.FastMathFlags.fast
 
         # Local fast-math arithmetic helpers — preserve fastmath flag while using
@@ -682,10 +682,10 @@ def build_flash_attn_func_module_primary(
 
     @flyc.jit
     def launch_flash_attn_func(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,  # noqa: E741
+        Q: fx.Pointer,
+        K: fx.Pointer,
+        V: fx.Pointer,
+        O: fx.Pointer,  # noqa: E741
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -756,7 +756,29 @@ def build_flash_attn_func_module_primary(
         "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
     }
 
+    def _ptr_arg(t):
+        if hasattr(t, "data_ptr"):
+            type_name = type(t).__name__
+            module_name = type(t).__module__
+            ptr = (
+                0
+                if type_name == "FakeTensor" or "fake_tensor" in module_name
+                else t.data_ptr()
+            )
+            return flyc.from_c_void_p(fx.Uint8, ptr)
+        return t
+
+    def _wrap_qkvo(args, kwargs):
+        args = list(args)
+        for idx in range(min(4, len(args))):
+            args[idx] = _ptr_arg(args[idx])
+        for name in ("Q", "K", "V", "O"):
+            if name in kwargs:
+                kwargs[name] = _ptr_arg(kwargs[name])
+        return tuple(args), kwargs
+
     def _launch(*args, **kwargs):
+        args, kwargs = _wrap_qkvo(args, kwargs)
         with CompilationContext.compile_hints(_fmha_compile_hints):
             return launch_flash_attn_func(*args, **kwargs)
 
@@ -764,10 +786,10 @@ def build_flash_attn_func_module_primary(
         with CompilationContext.compile_hints(_fmha_compile_hints):
             return flyc.compile(
                 launch_flash_attn_func,
-                Q,
-                K,
-                V,
-                O,
+                _ptr_arg(Q),
+                _ptr_arg(K),
+                _ptr_arg(V),
+                _ptr_arg(O),
                 batch_size,
                 seq_len,
                 fx.Stream(stream),

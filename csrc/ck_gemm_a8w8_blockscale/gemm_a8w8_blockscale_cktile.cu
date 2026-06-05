@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <functional>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include <torch/extension.h>
-
-#include "gemm_common.h"
-#include "gemm_dispatch_utils.h"
 
 #include "gemm_a8w8_blockscale_cktile_common.cuh"
 #include "gemm_a8w8_blockscale_cktile_lookup.h"
@@ -16,15 +14,17 @@
 using BlockwiseKernel = torch::Tensor (*)(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool, int);
 
-using BlockwiseKernelMap = GemmDispatchMap<BlockwiseKernel>;
+// Name-keyed dispatch table; see gemm_a8w8_blockscale.cu for the rationale
+// behind std::string_view keys + raw fn-ptr values (constant-init into
+// .data.rel.ro, matching PR #3255's GemmDispatchMap style).
+using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>;
 
+// Python-driven name-keyed dispatch (see gemm_a8w8_blockscale.cu for the
+// rationale).  Empty kernelName -> default heuristic; non-empty but unknown
+// kernelName -> hard error.
 template <typename DDataType, typename EDataType = DDataType>
-static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
+static BlockwiseKernel blockscale_dispatch(const std::string& kernelName)
 {
-    // For a given shape, either find the best kernel via lookup or heuristic.
-    // For many small M shapes, we bucket them to the next largest kernel.
-    // This is fine since kernels are padded anyway.
-
     static const auto lookup = [] {
         if constexpr(std::is_same_v<EDataType, TILE_FP16>)
         {
@@ -40,41 +40,23 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
         }
     }();
 
-    const int cu_num           = get_device_cu_num();
-    const std::string_view gfx = get_device_gfx();
-
-    // First check if this shape(M,N,K) is available in the direct lookup.
-    auto it = lookup.find({gfx, cu_num, M, N, K});
-    // If we found an optimal kernel, use it.
-    if(it != lookup.end())
+    if(!kernelName.empty())
     {
-        return it->second;
+        auto it = lookup.find(std::string_view{kernelName});
+        if(it != lookup.end())
+        {
+            return it->second;
+        }
+        TORCH_CHECK(false,
+                    "gemm_a8w8_blockscale_cktile kernel '",
+                    kernelName,
+                    "' is not present in the compiled registry. The tuned CSV references a "
+                    "kernel that was not built into aiter. Rebuild aiter (or remove this row "
+                    "from aiter/configs/a8w8_blockscale_tuned_gemm.csv) and try again.");
     }
 
-    int padded_m = M;
-
-    // Fine-grained search
-    padded_m = getPaddedM(M, N, K, 0);
-
-    // Second check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({gfx, cu_num, padded_m, N, K});
-    // If we found an optimal kernel, use it.
-    if(it != lookup.end())
-    {
-        return it->second;
-    }
-
-    // Coarse-grained search
-    padded_m = getPaddedM(M, N, K, 1);
-    it       = lookup.find({gfx, cu_num, padded_m, N, K});
-    if(it != lookup.end())
-    {
-        return it->second;
-    }
-
-    // Default tile kernel
-    return a8w8_blockscale_cktile_128x128x128_1x4x1_16x16x64_intrawave_0x1x0_1<DDataType,
-                                                                               EDataType>;
+    // Default tile kernel (used when Python had no tuned row).
+    return a8w8_blockscale_cktile_128x128x128_1x4x1_16x16x64_intrawave_0x1x0_1<DDataType, EDataType>;
 }
 
 torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
@@ -83,7 +65,8 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
                                           torch::Tensor& w_scale,
                                           torch::Tensor& Y,
                                           bool preshuffleB,
-                                          int splitK)
+                                          int splitK,
+                                          std::string kernelName)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -92,19 +75,16 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
                 "splitK must be in the range [0, 30], got ",
                 splitK);
 
-    int M      = XQ.size(0);
-    int N      = WQ.size(0);
-    int K      = XQ.size(1);
     int KBatch = 1 << splitK;
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        blockscale_dispatch<TILE_FP32, TILE_FP16>(M, N, K)(
+        blockscale_dispatch<TILE_FP32, TILE_FP16>(kernelName)(
             XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockscale_dispatch<TILE_FP32, TILE_BF16>(M, N, K)(
+        blockscale_dispatch<TILE_FP32, TILE_BF16>(kernelName)(
             XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
     }
     else
@@ -119,7 +99,9 @@ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_cktile(torch::Tensor& XQ,
                                                       torch::Tensor& x_scale,
                                                       torch::Tensor& w_scale,
                                                       torch::Tensor& Y,
-                                                      bool preshuffleB)
+                                                      bool preshuffleB,
+                                                      std::string kernelName)
 {
-    return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB, 0);
+    return gemm_a8w8_blockscale_cktile(
+        XQ, WQ, x_scale, w_scale, Y, preshuffleB, 0, std::move(kernelName));
 }

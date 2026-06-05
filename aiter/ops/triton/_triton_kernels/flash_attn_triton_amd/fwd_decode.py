@@ -186,7 +186,7 @@ def _attn_fwd_inner(
     if IS_FP8:
         qk += tl.dot(q, kT) * q_descale * k_descale  # Apply FP8 scaling
     else:
-        qk += tl.dot(q, kT)  # noqa: F821
+        qk = tl.dot(q, kT, acc=qk)  # noqa: F821
 
     if USE_ALIBI:
         row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -270,7 +270,7 @@ def _attn_fwd_inner(
     if IS_FP8:
         acc += tl.dot(p.to(v.dtype), v) * v_descale  # Apply FP8 scaling for V
     else:
-        acc += tl.dot(p.to(v.dtype), v)
+        acc = tl.dot(p.to(v.dtype), v, acc=acc)
 
     return m_i, l_i, acc
 
@@ -332,6 +332,8 @@ def _fwd_kernel_splitK(
     stride_vn_d,
     stride_bt_b,
     stride_bt_s,
+    stride_kb,  # paged K block stride (k_cache.stride(0)); supports non-contiguous cache
+    stride_vb,  # paged V block stride (v_cache.stride(0))
     stride_az,
     stride_ah,
     stride_q_descale_z,  # FP8 descale strides
@@ -377,6 +379,8 @@ def _fwd_kernel_splitK(
     stride_qd_i64 = tl.cast(stride_qd, tl.int64)
     stride_kz_i64 = tl.cast(stride_kz, tl.int64)
     stride_kn_i64 = tl.cast(stride_kn, tl.int64)
+    stride_kb_i64 = tl.cast(stride_kb, tl.int64)
+    stride_vb_i64 = tl.cast(stride_vb, tl.int64)
     stride_kg_i64 = tl.cast(stride_kg, tl.int64)
     stride_kh_i64 = tl.cast(stride_kh, tl.int64)
     stride_kd_i64 = tl.cast(stride_kd, tl.int64)
@@ -556,13 +560,13 @@ def _fwd_kernel_splitK(
                     # Calculate base addresses for K and V in this physical block
                     k_base = (
                         K
-                        + physical_block * BLOCK_SIZE_K * stride_kn_i64
+                        + physical_block * stride_kb_i64
                         + hk_id * stride_kh_i64
                         + g_id * stride_kg_i64
                     )
                     v_base = (
                         V
-                        + physical_block * BLOCK_SIZE_K * stride_vn_i64
+                        + physical_block * stride_vb_i64
                         + hv_id * stride_vh_i64
                         + g_id * stride_vg_i64
                     )
@@ -1066,14 +1070,12 @@ def attention_forward_decode_triton_impl(
         # For paged attention, k_cache and v_cache have shape [num_blocks, block_size, nheads, head_dim]
         num_blocks_kc, block_size_k, nheads_kc, dim_kc = k_cache.shape
         num_blocks_vc, block_size_v, nheads_vc, dim_vc = v_cache.shape
-        # Get the actual sequence length from cache_seqlens or block_table
-        if cache_seqlens is not None:
-            seqlen_kc = int(cache_seqlens.max().item())
-        else:
-            # Infer from block_table shape [batch_size, num_blocks_per_seq]
-            assert block_table is not None
-            num_blocks_per_seq = block_table.shape[1]
-            seqlen_kc = num_blocks_per_seq * block_size_k
+        # Get the actual sequence length from the block_table upper bound.
+        # Avoid cache_seqlens.max().item(): GPU-to-CPU sync is illegal during
+        # CUDA graph capture, and the block-table bound is always safe.
+        assert block_table is not None
+        num_blocks_per_seq = block_table.shape[1]
+        seqlen_kc = num_blocks_per_seq * block_size_k
         seqlen_vc = seqlen_kc
 
         # Strides for paged layout
@@ -1141,13 +1143,8 @@ def attention_forward_decode_triton_impl(
 
     # Use heuristics for split_k
     if use_block_table:
-        # For paged attention, use the actual sequence length from cache_seqlens
-        max_seqlen = (
-            int(cache_seqlens.max().item())
-            if cache_seqlens is not None
-            else block_size_k
-        )
-        split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, max_seqlen)
+        # Reuse seqlen_kc (already computed above without GPU-to-CPU sync)
+        split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, seqlen_kc)
     else:
         split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, seqlen_kc)
     split_size = (seqlen_kc + split_k - 1) // split_k
@@ -1379,6 +1376,11 @@ def attention_forward_decode_triton_impl(
         # block table strides
         stride_bt_b=stride_bt_b,
         stride_bt_s=stride_bt_s,
+        # paged KV block strides (real k/v_cache.stride(0)); lets the kernel
+        # index a non-contiguous paged cache instead of assuming the block
+        # stride equals BLOCK_SIZE_K * stride_kn (contiguous-only).
+        stride_kb=(k_cache.stride(0) if use_block_table else 0),
+        stride_vb=(v_cache.stride(0) if use_block_table else 0),
         # alibi strides
         stride_az=stride_az,
         stride_ah=stride_ah,
