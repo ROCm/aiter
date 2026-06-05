@@ -462,14 +462,17 @@ def _grouped_a8w4_preshuffle_e8m0_scale(
     warp_tile: int,
     scale_k_per_tile: int = 4,
 ) -> torch.Tensor:
+    # Batched over the expert axis: scale is (E, rows, k_scale) and the result
+    # is (E, rows // wmma_rep, k_scale * wmma_rep). The preshuffle only touches
+    # the (rows, k_scale) axes, so E rides along as a leading batch dim.
     scale = scale.view(torch.uint8).contiguous()
-    _, k_scale = scale.shape
+    E, _, k_scale = scale.shape
     wmma_rep = int(warp_tile) // 16
     k_groups = k_scale // scale_k_per_tile
     k_wmma_steps = scale_k_per_tile // 4
-    g = scale.view(-1, wmma_rep, 16, k_groups, k_wmma_steps, 4)
-    g = g.permute(0, 2, 3, 4, 1, 5).contiguous()
-    return g.reshape(-1, k_groups * k_wmma_steps * wmma_rep * 4)
+    g = scale.view(E, -1, wmma_rep, 16, k_groups, k_wmma_steps, 4)
+    g = g.permute(0, 1, 3, 4, 5, 2, 6).contiguous()
+    return g.reshape(E, -1, k_groups * k_wmma_steps * wmma_rep * 4)
 
 
 def _grouped_a8w4_prepare_scale_batch(
@@ -496,13 +499,8 @@ def _grouped_a8w4_prepare_scale_batch(
             f"or preshuffled {preshuffled_shape}, got {tuple(scale_u8.shape)}"
         )
     scale_k_per_tile = int(tile_k) // 32
-    return torch.stack(
-        [
-            _grouped_a8w4_preshuffle_e8m0_scale(
-                scale_u8[e], warp_tile=warp_tile, scale_k_per_tile=scale_k_per_tile
-            )
-            for e in range(experts)
-        ]
+    return _grouped_a8w4_preshuffle_e8m0_scale(
+        scale_u8, warp_tile=warp_tile, scale_k_per_tile=scale_k_per_tile
     ).to(device=device)
 
 
@@ -704,24 +702,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     masked_m = counts.to(torch.int32).to(device=device)
 
     if data_format == "fp4":
-        if os.environ.get("AITER_GROUPED_FAST_ACT_QUANT", "0") in ("1", "true", "True"):
-            _grouped_dbg("fast a1 fp4 quant")
-            a1_payload = torch.full(
-                (token_num, model_dim // 2), 0x33, dtype=torch.uint8, device=device
-            )
-            a1_scale_token_u8 = torch.full(
-                (token_num, model_dim // 32), 127, dtype=torch.uint8, device=device
-            )
-        else:
-            from aiter.ops.quant import per_1x32_f4_quant
+        from aiter.ops.quant import per_1x32_f4_quant
 
-            _grouped_dbg("start a1 fp4 quant")
-            a1_quant, a1_scale_token = per_1x32_f4_quant(
-                hidden_states, quant_dtype=dtypes.fp4x2, shuffle=False
-            )
-            _grouped_dbg("a1 fp4 quant done")
-            a1_payload = a1_quant.view(torch.uint8).contiguous()
-            a1_scale_token_u8 = a1_scale_token.view(torch.uint8).contiguous()
+        _grouped_dbg("start a1 fp4 quant")
+        a1_quant, a1_scale_token = per_1x32_f4_quant(
+            hidden_states, quant_dtype=dtypes.fp4x2, shuffle=False
+        )
+        _grouped_dbg("a1 fp4 quant done")
+        a1_payload = a1_quant.view(torch.uint8).contiguous()
+        a1_scale_token_u8 = a1_scale_token.view(torch.uint8).contiguous()
         grouped_a1 = torch.zeros(
             (E, max_m, model_dim // 2), dtype=torch.uint8, device=device
         )
@@ -765,31 +754,17 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
 
     _grouped_dbg("start route gather")
-    _fast_route = (
-        os.environ.get("AITER_GROUPED_FAST_ROUTE", "0") in ("1", "true", "True")
-        and topk == E
-        and max_m == token_num
-    )
-    if _fast_route:
-        token_ids = torch.arange(token_num, device=device, dtype=torch.long)
-        for e in range(E):
-            grouped_a1[e].copy_(a1_payload)
-            if a1_scale_token_u8 is not None:
-                a1_scale_raw[e].copy_(a1_scale_token_u8)
-            route_tokens[e].copy_(token_ids)
-            route_weights[e].fill_(1.0 / topk)
-    else:
-        for e in range(E):
-            mask = flat_experts == e
-            n = int(counts[e].item())
-            if n == 0:
-                continue
-            toks = flat_tokens[mask]
-            grouped_a1[e, :n].copy_(a1_payload[toks])
-            if a1_scale_token_u8 is not None:
-                a1_scale_raw[e, :n].copy_(a1_scale_token_u8[toks])
-            route_tokens[e, :n].copy_(toks)
-            route_weights[e, :n].copy_(flat_weights[mask])
+    for e in range(E):
+        mask = flat_experts == e
+        n = int(counts[e].item())
+        if n == 0:
+            continue
+        toks = flat_tokens[mask]
+        grouped_a1[e, :n].copy_(a1_payload[toks])
+        if a1_scale_token_u8 is not None:
+            a1_scale_raw[e, :n].copy_(a1_scale_token_u8[toks])
+        route_tokens[e, :n].copy_(toks)
+        route_weights[e, :n].copy_(flat_weights[mask])
     _grouped_dbg("route gather done")
 
     grouped_w1 = (w1 if w1.dtype == torch.uint8 else w1.view(torch.uint8)).contiguous()
@@ -807,13 +782,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         E, model_dim // _wmma_rep, (inter_dim // 32) * _wmma_rep
     )
 
-    grouped_a1_scale = torch.stack(
-        [
-            _grouped_a8w4_preshuffle_e8m0_scale(
-                a1_scale_raw[e], warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
-            )
-            for e in range(E)
-        ]
+    grouped_a1_scale = _grouped_a8w4_preshuffle_e8m0_scale(
+        a1_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
     )
     _grouped_dbg("scale layout done")
 
@@ -901,46 +871,31 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 grouped_a2[e, :n].mul_(route_weights[e, :n].view(-1, 1))
 
     if data_format == "fp4":
-        if os.environ.get("AITER_GROUPED_FAST_ACT_QUANT", "0") in ("1", "true", "True"):
-            _grouped_dbg("fast a2 fp4 quant")
-            grouped_a2_payload = torch.full(
-                (E, max_m, inter_dim // 2), 0x33, dtype=torch.uint8, device=device
-            )
-            a2_scale_raw = torch.full(
-                (E, max_m, inter_dim // 32), 127, dtype=torch.uint8, device=device
-            )
-        else:
-            from aiter.ops.quant import per_1x32_f4_quant
-
-            _grouped_dbg("start a2 fp4 quant")
-            a2_quant, a2_scale_token = per_1x32_f4_quant(
-                grouped_a2.view(E * max_m, inter_dim),
-                quant_dtype=dtypes.fp4x2,
-                shuffle=False,
-            )
-            _grouped_dbg("a2 fp4 quant done")
-            grouped_a2_payload = (
-                a2_quant.view(torch.uint8).contiguous().view(E, max_m, inter_dim // 2)
-            )
-            a2_scale_raw = (
-                a2_scale_token.view(torch.uint8)
-                .contiguous()
-                .view(E, max_m, inter_dim // 32)
-            )
-            torch.cuda.synchronize()
-            _grouped_dbg("[crash-probe] after a2 fp4 quant sync OK")
+        from aiter.ops.quant import per_1x32_f4_quant
+        _grouped_dbg("start a2 fp4 quant")
+        a2_quant, a2_scale_token = per_1x32_f4_quant(
+            grouped_a2.view(E * max_m, inter_dim),
+            quant_dtype=dtypes.fp4x2,
+            shuffle=False,
+        )
+        _grouped_dbg("a2 fp4 quant done")
+        grouped_a2_payload = (
+            a2_quant.view(torch.uint8).contiguous().view(E, max_m, inter_dim // 2)
+        )
+        a2_scale_raw = (
+            a2_scale_token.view(torch.uint8)
+            .contiguous()
+            .view(E, max_m, inter_dim // 32)
+        )
+        torch.cuda.synchronize()
+        _grouped_dbg("[crash-probe] after a2 fp4 quant sync OK")
     else:
         grouped_a2_payload = grouped_a2.to(dtypes.fp8).view(torch.uint8).contiguous()
         a2_scale_raw = torch.full(
             (E, max_m, inter_dim // 32), 127, dtype=torch.uint8, device=device
         )
-    grouped_a2_scale = torch.stack(
-        [
-            _grouped_a8w4_preshuffle_e8m0_scale(
-                a2_scale_raw[e], warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
-            )
-            for e in range(E)
-        ]
+    grouped_a2_scale = _grouped_a8w4_preshuffle_e8m0_scale(
+        a2_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
     )
     _grouped_dbg("a2 scale layout done")
     grouped_out = torch.zeros((E, max_m, model_dim), dtype=dtype, device=device)

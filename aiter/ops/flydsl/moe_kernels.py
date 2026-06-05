@@ -1516,3 +1516,116 @@ def flydsl_moe_gather_reduce(
         stream=torch.cuda.current_stream(),
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# MoE route-gather (scatter-copy) input layout
+#
+# Pre-stage1 step: copy each token's quantized payload (and per-token scale)
+# from the flat per-token layout into the grouped per-expert layout::
+#
+#     for e in range(E):
+#         toks = tokens routed to expert e        # n = counts[e]
+#         grouped[e, :n] = a_payload[toks]
+#
+# ``flydsl_moe_scatter_copy_token`` does the heavy row copies in one kernel pass
+# (one block per grouped row, gathered from its source token via a precomputed
+# dst->src map) and fills route_tokens/route_weights with cheap host ops. The
+# reference loop it is validated against lives in
+# ``op_tests/test_moe_scatter_copy_token.py``.
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _get_compiled_scatter_copy(row_bytes: int):
+    """Compile and cache the one-pass row scatter-copy kernel (per row width)."""
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
+        build_moe_scatter_copy_token_module,
+    )
+
+    return build_moe_scatter_copy_token_module(row_bytes)
+
+
+def _build_scatter_copy_map(flat_experts, counts, E, max_m):
+    """Map grouped rows to their source-token rows (mirrors the per-expert loop).
+
+    Returns
+    -------
+    order  : (Nr,) long   -- stable argsort of routes by expert
+    dst_g  : (Nr,) long   -- flattened grouped row ``e*max_m + rank`` per route
+    keep   : (Nr,) bool   -- routes whose rank < max_m (drop overflow)
+
+    Stable sort by expert preserves the original route order within each expert,
+    matching ``flat_tokens[flat_experts == e]`` in the reference loop.
+    """
+    device = flat_experts.device
+    Nr = flat_experts.shape[0]
+    order = torch.argsort(flat_experts, stable=True)
+    e_s = flat_experts[order]
+    start = torch.zeros(E, dtype=torch.long, device=device)
+    if E > 1:
+        start[1:] = torch.cumsum(counts, 0)[:-1]
+    rank = torch.arange(Nr, device=device) - start[e_s]
+    keep = rank < max_m
+    dst_g = e_s * max_m + rank
+    return order, dst_g, keep
+
+
+def flydsl_moe_scatter_copy_token(
+    a1_payload: torch.Tensor,                  # (token_num, Wp) uint8
+    a1_scale_token_u8: Optional[torch.Tensor], # (token_num, Ws) uint8 or None
+    flat_experts: torch.Tensor,                # (token_num*topk,) long
+    flat_tokens: torch.Tensor,                 # (token_num*topk,) long
+    flat_weights: torch.Tensor,                # (token_num*topk,) dtype
+    counts: torch.Tensor,                      # (E,)
+    E: int,
+    max_m: int,
+):
+    """One-pass route-gather into the grouped layout. Equivalent to the
+    per-expert ``index_add_``-free copy loop in fused_moe.
+
+    Returns (grouped_a1, a1_scale_raw, route_tokens, route_weights). Unused
+    grouped rows are left zero (payload/scale) / zero (route tensors)."""
+    device = a1_payload.device
+    Wp = a1_payload.shape[1]
+
+    order, dst_g, keep = _build_scatter_copy_map(flat_experts, counts, E, max_m)
+    tok_sorted = flat_tokens[order]
+    w_sorted = flat_weights[order]
+    dst_keep = dst_g[keep]
+    src_keep = tok_sorted[keep]
+
+    # dst row -> src token map (-1 = unused padding slot, kernel skips it).
+    dst_src = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
+    dst_src[dst_keep] = src_keep.to(torch.int32)
+
+    route_tokens = torch.zeros((E, max_m), dtype=torch.long, device=device)
+    route_weights = torch.zeros((E, max_m), dtype=flat_weights.dtype, device=device)
+    route_tokens.view(-1)[dst_keep] = src_keep
+    route_weights.view(-1)[dst_keep] = w_sorted[keep]
+
+    num_dst = E * max_m
+    grouped_a1 = torch.zeros((E, max_m, Wp), dtype=torch.uint8, device=device)
+    launch_p = _get_compiled_scatter_copy(Wp)
+    launch_p(
+        a1_payload.contiguous().view(-1, Wp),
+        grouped_a1.view(num_dst, Wp),
+        dst_src,
+        num_dst,
+        stream=torch.cuda.current_stream(),
+    )
+
+    a1_scale_raw = None
+    if a1_scale_token_u8 is not None:
+        Ws = a1_scale_token_u8.shape[1]
+        a1_scale_raw = torch.zeros((E, max_m, Ws), dtype=torch.uint8, device=device)
+        launch_s = _get_compiled_scatter_copy(Ws)
+        launch_s(
+            a1_scale_token_u8.contiguous().view(-1, Ws),
+            a1_scale_raw.view(num_dst, Ws),
+            dst_src,
+            num_dst,
+            stream=torch.cuda.current_stream(),
+        )
+
+    return grouped_a1, a1_scale_raw, route_tokens, route_weights
