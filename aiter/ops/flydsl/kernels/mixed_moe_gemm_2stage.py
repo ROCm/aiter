@@ -116,8 +116,15 @@ def compile_mixed_moe_gemm1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    inline_quant: bool = False,
 ):
     """Compile stage1 kernel (gate+up with silu/swiglu).
+
+    inline_quant: read bf16 activation from ``arg_x`` and MXFP4-quantize it on
+    the fly into LDS (each thread owns a full 32-elem K group -> thread-local
+    amax, no cross-thread reduction), instead of reading pre-quantized fp4.
+    Enables the cheap BM=16 ``sort_quant`` prologue (whose scale can't go
+    through ``moe_mxfp4_sort``). Implies a_dtype="fp4", use_async_copy=False.
 
     GEMM: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]
     Direct store (no atomic).  When k_batch>1 (split-K), each CTA
@@ -142,6 +149,12 @@ def compile_mixed_moe_gemm1(
             f"b_dtype must be one of ('fp8','fp16','int8','int4','fp4'), got {b_dtype!r}"
         )
 
+    if inline_quant:
+        # inline quant reads bf16 and produces fp4 in LDS; force the fp4 A path
+        # and the simple (non-async) register load path.
+        a_dtype = "fp4"
+        use_async_copy = False
+
     is_f16_a = a_dtype == "fp16"
     is_f16_b = b_dtype == "fp16"
     is_f8_a = a_dtype == "fp8"
@@ -158,6 +171,9 @@ def compile_mixed_moe_gemm1(
     scale_mn_pack = 2
     elem_bytes = 1
     a_elem_bytes = 2 if is_f16_a else 1
+    # GMEM element bytes for the A read. For inline_quant we read bf16 (2 bytes)
+    # from arg_x but store fp4 (a_elem_bytes=1) into LDS -> decouple the two.
+    a_in_bytes = 2 if inline_quant else a_elem_bytes
     b_elem_bytes = 1
     tile_k_bytes = int(tile_k) * int(a_elem_bytes)
     a_elem_vec_pack = 2 if is_f4_a else 1
@@ -263,9 +279,10 @@ def compile_mixed_moe_gemm1(
     _gui_tag = "_gui" if gate_up_interleave else ""
     _as1_tag = "_as1" if a_scale_one else ""
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    _iq_tag = "_iq" if inline_quant else ""
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}_v32"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}{_iq_tag}_v32"
     ).replace("-", "_")
 
     # -- LDS sizing --
@@ -615,7 +632,13 @@ def compile_mixed_moe_gemm1(
             c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
 
             # X: [tokens, model_dim]
-            x_nbytes_idx = (tokens_in * k_in * c_elem_bytes) / c_a_pack
+            if const_expr(inline_quant):
+                # bf16 activation: tokens * model_dim * 2 bytes (no fp4 packing).
+                x_nbytes_idx = tokens_in * k_in * arith.constant(
+                    int(a_in_bytes), index=True
+                )
+            else:
+                x_nbytes_idx = (tokens_in * k_in * c_elem_bytes) / c_a_pack
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
             x_rsrc = _ptr_buffer_resource(arg_x, x_nbytes_i32)
 
@@ -781,16 +804,116 @@ def compile_mixed_moe_gemm1(
                     t_idx = arith.index_cast(ir.IndexType.get(), t_safe)
                     x_row_base_div4.append(t_idx * c_k_div4)
 
+                if const_expr(inline_quant):
+                    # ---- inline MXFP4 quant constants (self-contained) ----
+                    _iq_c0 = arith.constant(0, type=T.i32)
+                    _iq_c1 = arith.constant(1, type=T.i32)
+                    _iq_c4 = arith.constant(4, type=T.i32)
+                    _iq_c16 = arith.constant(16, type=T.i32)
+                    _iq_c22 = arith.constant(22, type=T.i32)
+                    _iq_c23 = arith.constant(23, type=T.i32)
+                    _iq_c28 = arith.constant(28, type=T.i32)
+                    _iq_c254 = arith.constant(254, type=T.i32)
+                    _iq_headroom = arith.constant(2, type=T.i32)  # fp4 e8m0 headroom
+                    _iq_0x80000000 = arith.constant(0x80000000, type=T.i32)
+                    _iq_0x7FFFFFFF = arith.constant(0x7FFFFFFF, type=T.i32)
+                    _iq_0x3F800000 = arith.constant(0x3F800000, type=T.i32)  # 1.0f
+                    _iq_0x40C00000 = arith.constant(0x40C00000, type=T.i32)  # 6.0f
+                    _iq_0x4A800000 = arith.constant(0x4A800000, type=T.i32)
+                    _iq_0xC11FFFFF = arith.constant(0xC11FFFFF, type=T.i32)
+                    _iq_0x200000 = arith.constant(0x200000, type=T.i32)
+                    _iq_0xFF = arith.constant(0xFF, type=T.i32)
+                    _iq_0xFFFF0000 = arith.constant(0xFFFF0000, type=T.i32)
+                    _iq_0x7 = arith.constant(0x7, type=T.i32)
+                    _iq_0_f32 = arith.constant(0.0, type=T.f32)
+
+                    def _iq_f32_to_e2m1(qx_f32):
+                        qx = qx_f32.bitcast(T.i32)
+                        s = qx & _iq_0x80000000
+                        qx_abs = qx & _iq_0x7FFFFFFF
+                        denormal_mask = arith.cmpi(
+                            CmpIPredicate.ult, qx_abs, _iq_0x3F800000
+                        )
+                        normal_mask = arith.andi(
+                            arith.cmpi(CmpIPredicate.ult, qx_abs, _iq_0x40C00000),
+                            arith.cmpi(CmpIPredicate.uge, qx_abs, _iq_0x3F800000),
+                        )
+                        denorm_f32 = qx_abs.bitcast(T.f32) + _iq_0x4A800000.bitcast(
+                            T.f32
+                        )
+                        denormal_x = denorm_f32.bitcast(T.i32) - _iq_0x4A800000
+                        mant_odd = (qx_abs >> _iq_c22) & _iq_c1
+                        normal_x = qx_abs + _iq_0xC11FFFFF + mant_odd
+                        normal_x = normal_x >> _iq_c22
+                        e2m1 = arith.select(normal_mask, normal_x, _iq_0x7)
+                        e2m1 = arith.select(denormal_mask, denormal_x, e2m1)
+                        return (s >> _iq_c28) | e2m1
+
                 def load_x_tile(base_k):
                     base_k_div4 = (
                         (base_k / c_a_pack)
                         * arith.constant(int(a_elem_bytes), index=True)
                     ) / arith.index(4)
+                    if const_expr(not inline_quant):
+                        parts = []
+                        for i in range_constexpr(num_x_loads):
+                            idx_i32 = (
+                                x_row_base_div4[i] + base_k_div4 + x_col_local_i32[i]
+                            )
+                            x_vec = load_x(idx_i32)
+                            parts.append(vector.bitcast(T.vec(4, i32), x_vec))
+                        return parts
+
+                    # ---- inline MXFP4 quant: read bf16 (bf16_dword = 4*fp4_dword),
+                    # thread-local amax over its 32-elem K group, quantize to fp4 ----
                     parts = []
                     for i in range_constexpr(num_x_loads):
-                        idx_i32 = x_row_base_div4[i] + base_k_div4 + x_col_local_i32[i]
-                        x_vec = load_x(idx_i32)
-                        parts.append(vector.bitcast(T.vec(4, i32), x_vec))
+                        fp4_idx = x_row_base_div4[i] + base_k_div4 + x_col_local_i32[i]
+                        bf16_dw0 = fp4_idx * arith.index(4)
+                        f32v = []
+                        for j in range_constexpr(4):
+                            dw_off = bf16_dw0 + arith.index(j * 4)
+                            vv = buffer_ops.buffer_load(
+                                x_rsrc, dw_off, vec_width=4, dtype=T.i32
+                            )
+                            for kk in range_constexpr(4):
+                                d = vector.extract(
+                                    vv, static_position=[kk], dynamic_position=[]
+                                )
+                                f32v.append((d << _iq_c16).bitcast(T.f32))
+                                f32v.append((d & _iq_0xFFFF0000).bitcast(T.f32))
+                        amax = _iq_0_f32
+                        for kk in range_constexpr(32):
+                            av = llvm.call_intrinsic(
+                                f32, "llvm.fabs.f32", [f32v[kk]], [], []
+                            )
+                            amax = arith.maximumf(amax, av)
+                        # mxfp4 moe_sort_quant e8m0: bexp = ((amax_f32bits +
+                        # 0x200000) >> 23) & 0xFF; scale = min(254, max(0, bexp-2)).
+                        max_i32 = amax.bitcast(T.i32)
+                        exp_field = ((max_i32 + _iq_0x200000) >> _iq_c23) & _iq_0xFF
+                        e8m0_biased = arith.maxsi(exp_field - _iq_headroom, _iq_c0)
+                        e8m0_biased = arith.minsi(e8m0_biased, _iq_c254)
+                        quant_exp = _iq_c254 - e8m0_biased
+                        quant_scale = (quant_exp << _iq_c23).bitcast(T.f32)
+                        dwords = []
+                        for dd in range_constexpr(4):
+                            byte_acc = None
+                            for b in range_constexpr(4):
+                                kk = dd * 8 + b * 2
+                                lo4 = _iq_f32_to_e2m1(f32v[kk] * quant_scale)
+                                hi4 = _iq_f32_to_e2m1(f32v[kk + 1] * quant_scale)
+                                byte_b = lo4 | (hi4 << _iq_c4)
+                                shifted = byte_b << arith.constant(b * 8, type=T.i32)
+                                byte_acc = (
+                                    shifted
+                                    if byte_acc is None
+                                    else (byte_acc | shifted)
+                                )
+                            dwords.append(byte_acc)
+                        parts.append(
+                            vector.from_elements(T.vec(4, T.i32), dwords)
+                        )
                     return parts
 
                 # Wave/lane decomposition (identical to stage2)
@@ -2774,8 +2897,20 @@ def compile_mixed_moe_gemm2(
     sort_block_m: int = 0,
     b_nt: int = 2,
     xcd_swizzle: int = 0,
+    flat_output: bool = False,
+    flat_mxfp4: bool = False,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
+
+    flat_output: when True, write the (unweighted) down-proj result per *sorted
+    row* into a [max_sorted, model_dim] buffer (row index == sorted position),
+    so an external scatter_reduce (e.g. mxfp4's HIP kernel) can do the topk
+    weighted reduction. Implies accumulate=False (raw global store path).
+
+    flat_mxfp4: like flat_output, but quantize each sorted row to MXFP4 on the
+    fly -- write packed fp4 to ``arg_out`` ([max_sorted, model_dim/2] uint8) and
+    the per-32 e8m0 scale (row-major [max_sorted, model_dim/32]) to
+    ``arg_out_scale`` -- so mxfp4's HIP ``scatter_reduce_q`` reads ~3.8x less.
 
     persist_m:
       - > 0: legacy mode -- each CTA processes exactly persist_m consecutive M tiles.
@@ -2992,11 +3127,25 @@ def compile_mixed_moe_gemm2(
     _sbm_tag = "" if _sort_block_m == tile_m else f"_sbm{_sort_block_m}"
     _pm_tag = f"_persist_cu{_cu_num}" if _persistent else f"_pm{persist_m}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    # flat_mxfp4 implies flat (per-sorted-row, unweighted, accumulate=False).
+    if flat_mxfp4:
+        flat_output = True
+    _flat_tag = "_flatmx" if flat_mxfp4 else ("_flat" if flat_output else "")
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_vscale_fix3{_pm_tag}{_sbm_tag}{_xcd_tag}"
+        f"_vscale_fix3{_pm_tag}{_sbm_tag}{_xcd_tag}{_flat_tag}"
     ).replace("-", "_")
+    # flat_mxfp4 quant grouping (pure Python; computed here to avoid the kernel
+    # AST-rewriter turning a `while` into scf.while).
+    _fm_evec = max(2, min(tile_n // 32, 8))
+    _fm_nt = 32 // _fm_evec
+    _fm_dists = []
+    _fm_vv = 1
+    while _fm_vv < _fm_nt:
+        _fm_dists.append(_fm_vv)
+        _fm_vv *= 2
+    _fm_scols = model_dim // 32
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Ping-pong A2 tiles via separate allocators (like stage1).
     _single_x_bytes = int(tile_m) * int(_eff_lds_stride) * int(a_elem_bytes)
@@ -3037,6 +3186,7 @@ def compile_mixed_moe_gemm2(
             arg_sorted_weights: fx.Pointer,
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
+            arg_out_scale: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -4310,6 +4460,50 @@ def compile_mixed_moe_gemm2(
                 out_base_i64 = arith.index_cast(T.i64, fx.ptrtoint(arg_out))
                 out_base_idx = arith.index_cast(ir.IndexType.get(), out_base_i64)
 
+                # ── flat_mxfp4: per-32 fp4 requant of the down-proj result ──
+                if const_expr(flat_mxfp4):
+                    _fm_scale_base_idx = arith.index_cast(
+                        ir.IndexType.get(),
+                        arith.index_cast(T.i64, fx.ptrtoint(arg_out_scale)),
+                    )
+                    _fm_c1 = arith.constant(1, type=T.i32)
+                    _fm_c4 = arith.constant(4, type=T.i32)
+                    _fm_c22 = arith.constant(22, type=T.i32)
+                    _fm_c23 = arith.constant(23, type=T.i32)
+                    _fm_c28 = arith.constant(28, type=T.i32)
+                    _fm_c31 = arith.constant(31, type=T.i32)
+                    _fm_c64 = arith.constant(64, type=T.i32)
+                    _fm_c254 = arith.constant(254, type=T.i32)
+                    _fm_c0i = arith.constant(0, type=T.i32)
+                    _fm_hr = arith.constant(2, type=T.i32)  # fp4 e8m0 headroom
+                    _fm_0f = arith.constant(0.0, type=T.f32)
+                    _fm_FF8 = arith.constant(0xFF800000, type=T.i32)
+                    _fm_400 = arith.constant(0x400000, type=T.i32)
+                    _fm_7F = arith.constant(0x7FFFFFFF, type=T.i32)
+                    _fm_80 = arith.constant(0x80000000, type=T.i32)
+                    _fm_3F8 = arith.constant(0x3F800000, type=T.i32)
+                    _fm_40C = arith.constant(0x40C00000, type=T.i32)
+                    _fm_4A8 = arith.constant(0x4A800000, type=T.i32)
+                    _fm_C11 = arith.constant(0xC11FFFFF, type=T.i32)
+                    _fm_7 = arith.constant(0x7, type=T.i32)
+
+                    def _fm_f32_to_e2m1(qx_f32):
+                        qx = qx_f32.bitcast(T.i32)
+                        s = qx & _fm_80
+                        qx_abs = qx & _fm_7F
+                        dmask = arith.cmpi(CmpIPredicate.ult, qx_abs, _fm_3F8)
+                        nmask = arith.andi(
+                            arith.cmpi(CmpIPredicate.ult, qx_abs, _fm_40C),
+                            arith.cmpi(CmpIPredicate.uge, qx_abs, _fm_3F8),
+                        )
+                        dn = qx_abs.bitcast(T.f32) + _fm_4A8.bitcast(T.f32)
+                        dnx = dn.bitcast(T.i32) - _fm_4A8
+                        modd = (qx_abs >> _fm_c22) & _fm_c1
+                        nx = (qx_abs + _fm_C11 + modd) >> _fm_c22
+                        e2 = arith.select(nmask, nx, _fm_7)
+                        e2 = arith.select(dmask, dnx, e2)
+                        return (s >> _fm_c28) | e2
+
                 def write_row_to_lds(
                     *,
                     mi: int,
@@ -4379,7 +4573,18 @@ def compile_mixed_moe_gemm2(
                     t_idx = arith.index_cast(ir.IndexType.get(), t)
                     s_idx = arith.index_cast(ir.IndexType.get(), s)
                     ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
-                    if const_expr(accumulate):
+                    if const_expr(flat_output):
+                        # flat: write per sorted-row position (== `row`), unweighted.
+                        _flat_stride = (
+                            (model_dim // 2)  # fp4 packed bytes/row
+                            if flat_mxfp4
+                            else (model_dim * out_elem_bytes)
+                        )
+                        row_byte_base = out_base_idx + row * arith.constant(
+                            _flat_stride, index=True
+                        )
+                        row_valid = row_valid0
+                    elif const_expr(accumulate):
                         row_byte_base = out_base_idx + t_idx * arith.constant(
                             model_dim * out_elem_bytes, index=True
                         )
@@ -4399,6 +4604,91 @@ def compile_mixed_moe_gemm2(
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
                     fused, row_byte_base = row_ctx
+                    if const_expr(flat_mxfp4):
+                        # ---- per-sorted-row MXFP4 requant (unweighted) ----
+                        # cshuffle frag is bf16/f16; promote to f32 for quant.
+                        frag_vals = [
+                            arith.extf(
+                                f32,
+                                vector.extract(
+                                    frag, static_position=[i], dynamic_position=[]
+                                ),
+                            )
+                            for i in range_constexpr(_fm_evec)
+                        ]
+                        local_max = _fm_0f
+                        for i in range_constexpr(_fm_evec):
+                            abs_v = llvm.call_intrinsic(
+                                f32, "llvm.fabs.f32", [frag_vals[i]], [], []
+                            )
+                            local_max = arith.maximumf(local_max, abs_v)
+                        for _si in range_constexpr(len(_fm_dists)):
+                            off = arith.constant(_fm_dists[_si], type=T.i32)
+                            peer = local_max.shuffle_xor(off, _fm_c64)
+                            local_max = arith.maximumf(local_max, peer)
+                        max_i32 = local_max.bitcast(T.i32)
+                        max_rounded = (max_i32 + _fm_400) & _fm_FF8
+                        exp_field = max_rounded >> _fm_c23
+                        e8m0_biased = arith.maxsi(exp_field - _fm_hr, _fm_c0i)
+                        # Software f32->e2m1 (HW cvt.scalef32.pk8 is gfx12-only;
+                        # the per-2 cvt_scalef32_pk_fp4 isn't exposed in rocdl).
+                        quant_scale = (
+                            (_fm_c254 - e8m0_biased) << _fm_c23
+                        ).bitcast(T.f32)
+                        fp4_vals = [
+                            _fm_f32_to_e2m1(frag_vals[i] * quant_scale)
+                            for i in range_constexpr(_fm_evec)
+                        ]
+                        packed_i32 = fp4_vals[0] | (fp4_vals[1] << _fm_c4)
+                        for k in range_constexpr(1, _fm_evec // 2):
+                            byte_k = fp4_vals[2 * k] | (fp4_vals[2 * k + 1] << _fm_c4)
+                            packed_i32 = packed_i32 | (
+                                byte_k << arith.constant(k * 8, type=T.i32)
+                            )
+                        ptr_addr_idx = row_byte_base + col_g0 / arith.constant(
+                            2, index=True
+                        )
+                        out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
+                        _pack_bytes = _fm_evec // 2
+                        if const_expr(_pack_bytes == 1):
+                            sv = arith.TruncIOp(T.i8, packed_i32)
+                            llvm.StoreOp(
+                                sv._value if hasattr(sv, "_value") else sv,
+                                out_ptr_v, alignment=1, nontemporal=True,
+                            )
+                        elif const_expr(_pack_bytes == 2):
+                            sv = arith.TruncIOp(T.i16, packed_i32)
+                            llvm.StoreOp(
+                                sv._value if hasattr(sv, "_value") else sv,
+                                out_ptr_v, alignment=2, nontemporal=True,
+                            )
+                        else:
+                            llvm.StoreOp(
+                                packed_i32._value
+                                if hasattr(packed_i32, "_value")
+                                else packed_i32,
+                                out_ptr_v, alignment=4, nontemporal=True,
+                            )
+                        col_g0_i32 = arith.index_cast(T.i32, col_g0)
+                        is_w = arith.cmpi(
+                            CmpIPredicate.eq, col_g0_i32 & _fm_c31, _fm_c0i
+                        )
+                        _ifw = scf.IfOp(is_w)
+                        with ir.InsertionPoint(_ifw.then_block):
+                            blk_idx = col_g0 / arith.constant(32, index=True)
+                            scale_addr = (
+                                _fm_scale_base_idx
+                                + row * arith.constant(_fm_scols, index=True)
+                                + blk_idx
+                            )
+                            sptr = _idx_to_llvm_ptr(scale_addr)
+                            e8 = arith.TruncIOp(T.i8, e8m0_biased)
+                            llvm.StoreOp(
+                                e8._value if hasattr(e8, "_value") else e8,
+                                sptr, alignment=1, nontemporal=True,
+                            )
+                            scf.YieldOp([])
+                        return
                     if const_expr(not bool(accumulate)):
                         # ---- 64-bit global store path (avoids i32 offset overflow) ----
                         col_idx = col_g0
@@ -4518,6 +4808,7 @@ def compile_mixed_moe_gemm2(
         arg_sorted_weights: fx.Pointer,
         arg_num_valid_ids: fx.Pointer,
         arg_bias: fx.Pointer,
+        arg_out_scale: fx.Pointer,
         i32_tokens_in: fx.Int32,
         i32_n_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -4559,6 +4850,7 @@ def compile_mixed_moe_gemm2(
             arg_sorted_weights,
             arg_num_valid_ids,
             arg_bias,
+            arg_out_scale,
             i32_tokens_in,
             i32_n_in,
             i32_k_in,

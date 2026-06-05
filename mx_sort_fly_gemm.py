@@ -196,3 +196,169 @@ def mx_sort_fly_gemm1_gemm2(
         kernelName2=kernelName2,
     )
     return atomic_output_buf
+
+
+# ════════════════════════════════════════════════════════════════════════
+# FlyDSL gemm path: mxfp4 sort kernels + FlyDSL a4w4 gemm1/gemm2 (reads mx_w).
+# ════════════════════════════════════════════════════════════════════════
+def mx_sort_fly_gemm1_gemm2_flydsl(
+    hidden_states,
+    w1,            # fly_w1 = shuffle_weight(w1_qt, (16,16))   (FlyDSL separated layout)
+    w2,            # fly_w2 = shuffle_weight(w2_qt, (16,16))
+    topk_ids,
+    topk_weight,
+    topk,
+    *,
+    w1_scale=None, # e8m0_shuffle(w1_scale)
+    w2_scale=None, # e8m0_shuffle(w2_scale)
+    large_m_threshold=2048,
+):
+    """mxfp4 routing sort + mxfp4 quant, then FlyDSL stage1/stage2 a4w4 gemm.
+
+    sort-related kernels are mx_fn's (threestage routing sort + activation quant);
+    the activation scale is re-sorted into the FlyDSL tile layout via
+    ``moe_mxfp4_sort`` (matching test_flydsl_moe_a4w4.py). The FlyDSL gemm reads
+    the FlyDSL preshuffle of the weights (``fly_w`` = shuffle_weight(16,16)) which
+    is the only layout the tested FlyDSL a4w4 path supports for w1.
+
+    Per-M regime (mirrors mx_fn's BM/mode policy):
+      * small/mid M  -> BM=32 sort, gemm1 t32x128, gemm2 t32x256 ATOMIC.
+      * large M      -> BM=128 sort, gemm1 t128x128, gemm2 t64x256 REDUCE (sbm128,
+        persistent). FlyDSL reduce sums topk via torch internally; mxfp4's HIP
+        scatter_reduce is not layout-compatible with FlyDSL stage2 output.
+    """
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+    from aiter.utility.fp4_utils import moe_mxfp4_sort
+
+    device = hidden_states.device
+    w1u = w1.view(torch.uint8) if (w1.element_size() == 1 and w1.dtype != torch.uint8) else w1
+    w2u = w2.view(torch.uint8) if (w2.element_size() == 1 and w2.dtype != torch.uint8) else w2
+    NE = w1u.shape[0]
+    D_HIDDEN = hidden_states.shape[1]
+    D_INTER = w1u.shape[1] // 2
+    M = hidden_states.shape[0]
+
+    # ── per-M regime (BM must be in {32,128}: mxfp4 3stage sort support) ──
+    if M >= large_m_threshold:
+        # large M: BM=128 sort, gemm1 t128x128, gemm2 FLAT (per-sorted-row,
+        # unweighted) -> mxfp4 HIP scatter_reduce does the topk weighted reduce.
+        BM = 128
+        g1_tm, g1_tn, g1_wpe, b_nt1 = 128, 128, 2, 2
+        g2_tm, g2_tn, g2_sbm, g2_persist, b_nt2 = 64, 256, 128, True, 2
+        g2_flat, g2_fp4 = True, True
+    else:
+        BM = 32
+        g1_tm, g1_tn, g1_wpe, b_nt1 = 32, 128, 2, 2
+        g2_tm, g2_tn, g2_mode, g2_sbm, g2_persist, b_nt2 = 32, 256, "atomic", 0, None, 2
+        g2_flat, g2_fp4 = False, False
+
+    # ── mxfp4 routing sort + activation quant (mx_fn's sort-related kernels) ──
+    active = min(NE, M * topk)
+    cumsum_max = M * topk + active * (BM - 1)
+    max_sorted = ((cumsum_max + BM - 1) // BM) * BM
+
+    sorted_token_ids = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
+    sorted_expert_ids = torch.empty((max_sorted // BM,), device=device, dtype=dtypes.i32)
+    cumsum_tensor = torch.empty((1,), device=device, dtype=dtypes.i32)
+    reverse_sorted = torch.empty((M * topk,), device=device, dtype=dtypes.i32)
+    sorted_weights = torch.empty((max_sorted,), device=device, dtype=dtypes.fp32)
+    masked_m = torch.empty((NE,), device=device, dtype=dtypes.i32)
+    m_indices = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
+    a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
+    a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
+    out_buf = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
+
+    aiter.mxfp4_moe_sort(
+        topk_ids=topk_ids, topk_weight=topk_weight,
+        sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=cumsum_tensor, reverse_sorted=reverse_sorted,
+        sorted_weights=sorted_weights, masked_m=masked_m, m_indices=m_indices,
+        bf16_zero_out=_empty_bf16(device), bf16_zero_workspace=_empty_bf16(device),
+        M_logical=M, NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, D_INTER=D_INTER, MB=BM,
+        prologue=1,
+    )
+    aiter.mxfp4_moe_quant(
+        a_input=hidden_states, a_quant=a_quant, a_scale=a_scale,
+        bf16_zero_out=out_buf, NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM,
+    )
+
+    # FlyDSL expects num_valid_ids[0] = padded sorted-row count (== cumsum_tensor[0]).
+    num_valid_ids = cumsum_tensor.repeat(2)
+
+    # Re-sort the per-token e8m0 activation scale into FlyDSL's tile layout.
+    a1 = a_quant.view(dtypes.fp4x2)
+    a1_scale = moe_mxfp4_sort(
+        a_scale.view(dtypes.fp8_e8m0).view(M, 1, -1),
+        sorted_ids=sorted_token_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=M,
+        block_size=BM,
+    )
+
+    # ── FlyDSL gemm1 (a4w4 gate/up + SiLU·mul + fused fp4 requant) ─────────
+    inter = flydsl_moe_stage1(
+        a=a1, w1=w1u.view(dtypes.fp4x2),
+        sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids, topk=topk,
+        tile_m=g1_tm, tile_n=g1_tn, tile_k=256,
+        a_dtype="fp4", b_dtype="fp4", out_dtype="fp4",
+        w1_scale=w1_scale.view(dtypes.fp8_e8m0) if w1_scale is not None else None,
+        a1_scale=a1_scale, sorted_weights=None, use_async_copy=True,
+        waves_per_eu=g1_wpe, b_nt=b_nt1,
+        gate_mode="separated",
+    )
+    inter_q, inter_scale = (inter[0], inter[1]) if isinstance(inter, tuple) else (inter, None)
+
+    w2v = w2u.view(dtypes.fp4x2)
+    w2sv = w2_scale.view(dtypes.fp8_e8m0) if w2_scale is not None else None
+    if g2_fp4:
+        # ── FlyDSL gemm2 FLAT-MXFP4: per-sorted-row fp4 + e8m0 (unweighted) ──
+        flat_out_q = torch.empty(
+            (max_sorted, D_HIDDEN // 2), dtype=torch.uint8, device=device)
+        flat_out_scale = torch.empty(
+            (max_sorted, D_HIDDEN // 32), dtype=torch.uint8, device=device)
+        flydsl_moe_stage2(
+            inter_states=inter_q, w2=w2v,
+            sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids, topk=topk,
+            out=flat_out_q.view(dtypes.fp4x2), out_scale=flat_out_scale,
+            tile_m=g2_tm, tile_n=g2_tn, tile_k=256,
+            a_dtype="fp4", b_dtype="fp4", out_dtype="bf16",
+            w2_scale=w2sv, a2_scale=inter_scale, sorted_weights=None, b_nt=b_nt2,
+            sort_block_m=g2_sbm, persist=g2_persist, flat_mxfp4=True,
+        )
+        # ── mx_fn's HIP scatter_reduce_q (fp4 input) weighted topk reduce ──
+        aiter.mxfp4_moe_scatter_reduce_q(
+            flat_out_q=flat_out_q, flat_out_scale=flat_out_scale,
+            reverse_sorted=reverse_sorted, sorted_weights=sorted_weights,
+            out=out_buf, NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM,
+        )
+    elif g2_flat:
+        # ── FlyDSL gemm2 FLAT bf16 (per-sorted-row, unweighted) ────────────
+        flat_out = torch.empty((max_sorted, D_HIDDEN), dtype=dtypes.bf16, device=device)
+        flydsl_moe_stage2(
+            inter_states=inter_q, w2=w2v,
+            sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids, topk=topk, out=flat_out,
+            tile_m=g2_tm, tile_n=g2_tn, tile_k=256,
+            a_dtype="fp4", b_dtype="fp4", out_dtype="bf16",
+            w2_scale=w2sv, a2_scale=inter_scale, sorted_weights=None, b_nt=b_nt2,
+            sort_block_m=g2_sbm, persist=g2_persist, flat_output=True,
+        )
+        aiter.mxfp4_moe_scatter_reduce(
+            flat_out=flat_out, reverse_sorted=reverse_sorted,
+            sorted_weights=sorted_weights, out=out_buf,
+            NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM,
+        )
+    else:
+        # ── FlyDSL gemm2 (a4w4 down-proj + atomic topk reduce) ─────────────
+        flydsl_moe_stage2(
+            inter_states=inter_q, w2=w2v,
+            sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids, topk=topk, out=out_buf,
+            tile_m=g2_tm, tile_n=g2_tn, tile_k=256,
+            a_dtype="fp4", b_dtype="fp4", out_dtype="bf16", mode=g2_mode,
+            w2_scale=w2sv, a2_scale=inter_scale, sorted_weights=sorted_weights,
+            b_nt=b_nt2, sort_block_m=g2_sbm, persist=g2_persist,
+        )
+    return out_buf

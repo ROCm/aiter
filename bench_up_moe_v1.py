@@ -18,7 +18,7 @@ from aiter.ops.shuffle import (
 )
 from aiter.utility.fp4_utils import e8m0_shuffle
 
-from mx_sort_fly_gemm import mx_sort_fly_gemm1_gemm2
+from mx_sort_fly_gemm import mx_sort_fly_gemm1_gemm2_flydsl
  
  
 @dataclass(frozen=True)
@@ -101,10 +101,14 @@ def make_fn(hidden, topk_ids, topk_weight, w):
 
 
 def make_mx_sort_fly_fn(hidden, topk_ids, topk_weight, w):
-    """mxfp4 sort kernels + (swappable) gemm1/gemm2. Uses mx_w (a16w4) weights."""
+    """mxfp4 sort/quant kernels + FlyDSL a4w4 gemm1/gemm2.
+
+    Sort prologue uses mx_fn's mxfp4 kernels; the FlyDSL gemm reads the FlyDSL
+    preshuffle of the weights (``w`` = fly_w).
+    """
 
     def fn():
-        return mx_sort_fly_gemm1_gemm2(
+        return mx_sort_fly_gemm1_gemm2_flydsl(
             hidden,
             w["w1"],
             w["w2"],
@@ -121,6 +125,10 @@ def make_mx_sort_fly_fn(hidden, topk_ids, topk_weight, w):
 def cosine(a, b):
     a = a.float().reshape(-1)
     b = b.float().reshape(-1)
+    mask = torch.isfinite(a) & torch.isfinite(b)
+    if not bool(mask.all()):
+        a = a[mask]
+        b = b[mask]
     return torch.nn.functional.cosine_similarity(a, b, dim=0).item()
  
  
@@ -150,11 +158,12 @@ def main():
         fly_fn = make_fn(hidden, topk_ids, topk_weight, fly_w)
         mx_fn = make_fn(hidden, topk_ids, topk_weight, mx_w)
         mx_sort_fly_gemm1_gemm2_fn = make_mx_sort_fly_fn(
-            hidden, topk_ids, topk_weight, mx_w
+            hidden, topk_ids, topk_weight, fly_w
         )
-        mx_out = mx_fn()
-        fly_out = fly_fn()
-        msfg_out = mx_sort_fly_gemm1_gemm2_fn()
+        mx_out = mx_fn().clone()
+        fly_out = fly_fn().clone()
+        msfg_out = mx_sort_fly_gemm1_gemm2_fn().clone()
+        torch.cuda.synchronize()
         cos = cosine(mx_out, fly_out)
         cos_msfg = cosine(mx_out, msfg_out)
         _, mx_us = run_perftest(mx_fn, num_warmup=args.warmup, num_iters=args.iters)

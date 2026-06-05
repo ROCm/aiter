@@ -301,6 +301,7 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    inline_quant: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -332,6 +333,7 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
             swiglu_limit=swiglu_limit,
+            inline_quant=inline_quant,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -382,6 +384,8 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    flat_output: bool = False,
+    flat_mxfp4: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -407,6 +411,8 @@ def compile_flydsl_moe_stage2(
             inter_dim_pad=inter_dim_pad,
             xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
+            flat_output=flat_output,
+            flat_mxfp4=flat_mxfp4,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -557,11 +563,17 @@ def _s2_args_fp4(
     dev,
     bias=None,
     stream=None,
+    out_scale=None,
 ):
     _bias = (
         bias.view(-1)
         if bias is not None
         else torch.empty(0, device=dev, dtype=torch.float32)
+    )
+    _out_scale = (
+        out_scale.view(-1)
+        if out_scale is not None
+        else torch.empty(0, device=dev, dtype=torch.uint8)
     )
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -576,6 +588,7 @@ def _s2_args_fp4(
         _ptr_view_safe(sorted_weights),
         _ptr_view_safe(num_valid_ids),
         _ptr_view_safe(_bias),
+        _ptr_view_safe(_out_scale),
         token_num,
         n_in,
         k_in,
@@ -708,6 +721,7 @@ def flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    inline_quant: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -734,8 +748,10 @@ def flydsl_moe_stage1(
     inter_dim = w1.shape[1] // 2
     model_dim = a.shape[1]
 
-    if a_dtype == "fp4":
+    if a_dtype == "fp4" and not inline_quant:
         model_dim = model_dim * 2
+    # inline_quant: `a` is bf16 (model_dim columns, no fp4 halving); the kernel
+    # reads bf16 and MXFP4-quantizes on the fly.
 
     _need_fp4 = out_dtype == "fp4"
     _need_fp8 = out_dtype == "fp8"
@@ -894,6 +910,7 @@ def flydsl_moe_stage1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
+        inline_quant=inline_quant,
     )
     _run_compiled(exe, args)
 
@@ -1052,8 +1069,21 @@ def flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     bias: Optional[torch.Tensor] = None,
+    flat_output: bool = False,
+    flat_mxfp4: bool = False,
+    out_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
+
+    flat_output: write the unweighted down-proj per *sorted row* into the
+    caller-provided ``out`` of shape [max_sorted, model_dim] (row == sorted
+    position). No topk reduction is performed; an external scatter_reduce is
+    expected to do the weighted topk reduce. Implies accumulate=False.
+
+    flat_mxfp4: like flat_output but MXFP4-quantize each sorted row -- ``out`` is
+    packed fp4 [max_sorted, model_dim/2] uint8 and ``out_scale`` is the e8m0
+    row-major scale [max_sorted, model_dim/32] uint8 -- for mxfp4
+    ``scatter_reduce_q``. Implies flat_output + accumulate=False.
 
     a: (token_num, topk, inter_dim), w1: (E, model_dim, inter_dim) pre-shuffled.
     Returns (token_num, model_dim).
@@ -1072,6 +1102,10 @@ def flydsl_moe_stage2(
     inter_dim = inter_states.shape[2]
 
     accumulate = mode != "reduce"
+    if flat_mxfp4:
+        flat_output = True
+    if flat_output:
+        accumulate = False  # raw per-sorted-row store; external scatter_reduce reduces
 
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
@@ -1119,7 +1153,7 @@ def flydsl_moe_stage2(
     _k_in = inter_dim
 
     target = out
-    if not accumulate:
+    if not accumulate and not flat_output:
         target = torch.empty(
             (token_num * topk * model_dim,),
             device=out.device,
@@ -1143,6 +1177,7 @@ def flydsl_moe_stage2(
             m_blocks,
             dev,
             bias=bias,
+            out_scale=out_scale,
         )
     else:
         args = _s2_args_std(
@@ -1181,10 +1216,12 @@ def flydsl_moe_stage2(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        flat_output=flat_output,
+        flat_mxfp4=flat_mxfp4,
     )
     _run_compiled(exe, args)
 
-    if not accumulate:
+    if not accumulate and not flat_output:
         torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
 
     return out
