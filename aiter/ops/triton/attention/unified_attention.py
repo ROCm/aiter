@@ -182,6 +182,15 @@ def select_3d_config(
         if num_segments == MIN_SEGMENTS:
             reduce_num_warps = 1
 
+        if shuffled_kv_cache:
+            if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+                assert (
+                    block_size >= 32
+                ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+            TILE_SIZE = block_size
+        elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+            TILE_SIZE = max(32, TILE_SIZE)
+
     if NUM_BLOCKS_GATHER_PER_TILE > 1:
         # force gather mode
         assert NUM_BLOCKS_GATHER_PER_TILE in [
@@ -462,7 +471,9 @@ def unified_attention(
             segm_max = out  # dummy ptr
             segm_expsum = out  # dummy ptr
 
-        if IS_DEVICE_ARCH_GFX12:
+        if IS_DEVICE_ARCH_GFX12 and shuffled_kv_cache:
+            print()
+            print("gluon")
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
@@ -529,6 +540,8 @@ def unified_attention(
                 **attn_config,
             )
         else:
+            print()
+            print("triton")
             kernel_unified_attention_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
