@@ -992,11 +992,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("start gather-reduce output")
         flydsl_moe_gather_reduce(
             grouped_out,
-            route_tokens,
-            route_weights,
+            topk_ids,
+            topk_weight,
             counts,
-            token_num,
-            topk,
             doweight_stage1,
             out=moe_out,
         )

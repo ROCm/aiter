@@ -1420,75 +1420,26 @@ def _get_compiled_gather_reduce(model_dim: int, topk: int, out_dtype: str):
     return build_moe_gather_reduce_module(model_dim, topk, out_dtype)
 
 
-def _build_gather_reduce_index_map(
-    route_tokens: torch.Tensor,
-    route_weights: torch.Tensor,
-    counts: torch.Tensor,
-    token_num: int,
-    topk: int,
-    max_m: int,
-    doweight_stage1: bool,
-):
-    """Invert the grouped layout into per-token (src_rows, gather_w) maps.
-
-    Returns
-    -------
-    src_rows : (token_num, topk) int32  -- flat row ``e*max_m + pos`` per (t,k)
-    gather_w : (token_num, topk) f32    -- route weight (or 1.0) per (t,k)
-
-    Unused slots (tokens with fewer than ``topk`` valid rows) are left as
-    ``(row=0, w=0)`` so the kernel can sum them unconditionally.
-    """
-    device = route_tokens.device
-    E = route_tokens.shape[0]
-
-    # Valid grouped rows: position < counts[e].
-    pos = torch.arange(max_m, device=device)
-    valid = pos.unsqueeze(0) < counts.to(device).view(-1, 1)  # (E, max_m)
-    flat_valid = valid.reshape(-1)
-
-    flat_rows = torch.arange(E * max_m, device=device, dtype=torch.long)[flat_valid]
-    tok = route_tokens.reshape(-1)[flat_valid].to(torch.long)
-    if doweight_stage1:
-        wgt = torch.ones(tok.shape, dtype=torch.float32, device=device)
-    else:
-        wgt = route_weights.reshape(-1)[flat_valid].to(torch.float32)
-
-    # Stable sort by destination token -> contiguous per-token groups; the slot
-    # within each group is the running rank (order within topk is irrelevant to
-    # the sum). Scatter into (token_num, topk), dropping any overflow > topk.
-    order = torch.argsort(tok, stable=True)
-    tok_s = tok[order]
-    counts_per_tok = torch.bincount(tok_s, minlength=token_num)
-    start = torch.zeros(token_num, dtype=torch.long, device=device)
-    if token_num > 1:
-        start[1:] = torch.cumsum(counts_per_tok, 0)[:-1]
-    rank = torch.arange(tok_s.shape[0], device=device) - start[tok_s]
-    keep = rank < topk
-    dst = tok_s * topk + rank
-
-    src_rows = torch.zeros(token_num * topk, dtype=torch.int32, device=device)
-    gather_w = torch.zeros(token_num * topk, dtype=torch.float32, device=device)
-    src_rows[dst[keep]] = flat_rows[order][keep].to(torch.int32)
-    gather_w[dst[keep]] = wgt[order][keep]
-    return src_rows.view(token_num, topk), gather_w.view(token_num, topk)
-
-
 def flydsl_moe_gather_reduce(
     grouped_out: torch.Tensor,   # (E, max_m, model_dim) bf16/f16
-    route_tokens: torch.Tensor,  # (E, max_m) long
-    route_weights: torch.Tensor, # (E, max_m)
-    counts: torch.Tensor,        # (E,)
-    token_num: int,
-    topk: int,
+    topk_ids: torch.Tensor,      # (token_num, topk) local expert ids in [0, E)
+    topk_weight: torch.Tensor,   # (token_num, topk)
+    counts: torch.Tensor,        # (E,) tokens routed per expert
     doweight_stage1: bool,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """One-pass gather-reduce epilogue (replaces the per-expert ``index_add_``
-    scatter loop). Builds a per-token inverse index map (vectorized host prep)
-    and launches a single kernel that produces each output token's row in one
-    pass. ``grouped_out`` must be bf16 or f16."""
+    scatter loop). ``grouped_out`` must be bf16 or f16.
+
+    The per-token gather map is built directly from ``topk_ids`` -- which is
+    already in (token, topk) order -- so ``src_rows[t,k]`` = the grouped-GEMM row
+    that token ``t``'s k-th expert occupies = ``topk_ids[t,k]*max_m + slot``.
+    Only one ``argsort`` is needed (to assign the within-expert ``slot``); there
+    is no boolean-mask indexing / ``nonzero``. Weights are already in the right
+    layout: ``gather_w == topk_weight`` (or all-ones when ``doweight_stage1``)."""
     E, max_m, model_dim = grouped_out.shape
+    token_num, topk = topk_ids.shape
+    device = grouped_out.device
     if grouped_out.dtype == torch.bfloat16:
         out_dtype = "bf16"
     elif grouped_out.dtype == torch.float16:
@@ -1496,14 +1447,28 @@ def flydsl_moe_gather_reduce(
     else:
         raise ValueError(f"unsupported dtype {grouped_out.dtype}; need bf16/f16")
 
-    src_rows, gather_w = _build_gather_reduce_index_map(
-        route_tokens, route_weights, counts, token_num, topk, max_m, doweight_stage1
-    )
+    # topk_ids -> grouped rows. slot(t,k) = token t's within-expert position in
+    # route (token-major) order, matching how the route-gather fills each expert.
+    flat_e = topk_ids.reshape(-1).to(torch.long)
+    order = torch.argsort(flat_e, stable=True)            # group routes by expert
+    e_sorted = flat_e[order]
+    start = torch.zeros(E, dtype=torch.long, device=device)
+    start[1:] = torch.cumsum(counts.to(torch.long), 0)[:-1]
+    slot = torch.arange(flat_e.numel(), device=device) - start[e_sorted]
+    grow_sorted = e_sorted * max_m + slot
+    grow_of_route = torch.empty_like(flat_e)
+    grow_of_route[order] = grow_sorted                    # back to route order
+    src_rows = grow_of_route.view(token_num, topk).to(torch.int32)
+
+    if doweight_stage1:
+        gather_w = torch.ones((token_num, topk), dtype=torch.float32, device=device)
+    else:
+        gather_w = topk_weight.to(torch.float32).contiguous()
 
     grouped_out_flat = grouped_out.contiguous().view(E * max_m, model_dim)
     if out is None:
         out = torch.empty(
-            (token_num, model_dim), dtype=grouped_out.dtype, device=grouped_out.device
+            (token_num, model_dim), dtype=grouped_out.dtype, device=device
         )
 
     launch = _get_compiled_gather_reduce(model_dim, topk, out_dtype)

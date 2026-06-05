@@ -90,77 +90,75 @@ flydsl_moe_gather_reduce = _import_flydsl_gather_reduce()
 
 
 def _build_grouped_layout(token_num, topk, E_total, ep, model_dim, dtype, seed):
-    """Recreate fused_moe's grouped routing for one rank under tensor/expert
-    parallelism of degree ``ep``.
+    """Recreate fused_moe's grouped routing for one rank, parallelism degree ep.
 
-    In this grouped a8w4/a4w4 path, parallelism shards the experts: a rank owns
-    ``E_local = E_total // ep`` experts (here the first ones). Each token still
-    routes to ``topk`` distinct experts *globally*, but only the hits that land
-    on local experts appear in this rank's grouped layout -- so a token may have
-    fewer than ``topk`` local rows (the gather-reduce index map pads the missing
-    slots with zero weight). For ``ep == 1`` every token has exactly ``topk``
-    local rows. The per-rank output is the partial combine over local experts,
-    which is exactly what both ref and kernel must produce.
+    The grouped a8w4/a4w4 path requires ``topk_ids`` to be local expert ids in
+    ``[0, E_local)`` with exactly ``topk`` per token (validated in fused_moe). We
+    model that: experts are sharded ``E_local = E_total // ep`` and each token
+    routes to ``topk`` distinct *local* experts. route_tokens/route_weights are
+    derived for the scatter reference; topk_ids/topk_weight feed the kernel.
 
-    Returns grouped_out, route_tokens, route_weights, counts, max_m, E_local.
+    Returns grouped_out, topk_ids, topk_weight, route_tokens, route_weights,
+    counts, max_m, E_local.
     """
     gen = torch.Generator(device="cuda").manual_seed(seed)
     E_local = max(1, E_total // ep)
+    assert topk <= E_local, f"need topk<=E_local, got topk={topk} E_local={E_local}"
 
-    # Global routing: each token picks `topk` distinct experts in [0, E_total).
-    g_ids = torch.stack(
-        [torch.randperm(E_total, generator=gen, device="cuda")[:topk]
+    # Each token routes to topk distinct LOCAL experts (the real-path contract).
+    topk_ids = torch.stack(
+        [torch.randperm(E_local, generator=gen, device="cuda")[:topk]
          for _ in range(token_num)]
     ).to(torch.long)
-    g_w = torch.rand((token_num, topk), generator=gen, device="cuda", dtype=torch.float32)
-    g_w = (g_w / g_w.sum(-1, keepdim=True)).to(dtype)  # normalize over global topk
+    topk_weight = torch.rand(
+        (token_num, topk), generator=gen, device="cuda", dtype=torch.float32
+    )
+    topk_weight = (topk_weight / topk_weight.sum(-1, keepdim=True)).to(dtype)
 
-    # Keep only hits on locally-owned experts ([0, E_local)); their id is already
-    # the local id. Boolean-mask flattening is token-major (stable per token).
-    local_hit = g_ids < E_local
-    tok_idx = torch.arange(token_num, device="cuda").view(-1, 1).expand_as(g_ids)
-    le = g_ids[local_hit]               # local expert id per local route
-    lt = tok_idx[local_hit]             # dest token per local route
-    lw = g_w[local_hit].to(dtype)       # weight per local route
-
-    counts = torch.bincount(le, minlength=E_local)
+    # route_tokens/route_weights for the scatter reference (token-major order).
+    flat_e = topk_ids.reshape(-1)
+    flat_t = torch.arange(token_num * topk, device="cuda") // topk
+    flat_w = topk_weight.reshape(-1).to(dtype)
+    counts = torch.bincount(flat_e, minlength=E_local)
     max_m = int(counts.max().item()) if counts.numel() else 0
     max_m = max(WARP_TILE_M, ((max_m + WARP_TILE_M - 1) // WARP_TILE_M) * WARP_TILE_M)
 
     route_tokens = torch.zeros((E_local, max_m), dtype=torch.long, device="cuda")
     route_weights = torch.zeros((E_local, max_m), dtype=dtype, device="cuda")
     for e in range(E_local):
-        mask = le == e
+        mask = flat_e == e
         n = int(counts[e].item())
         if n == 0:
             continue
-        route_tokens[e, :n] = lt[mask]
-        route_weights[e, :n] = lw[mask]
+        route_tokens[e, :n] = flat_t[mask]
+        route_weights[e, :n] = flat_w[mask]
 
     # Random grouped output; rows beyond counts[e] are deliberately garbage so
     # the test confirms neither path reads them.
     grouped_out = torch.randn(
         (E_local, max_m, model_dim), generator=gen, device="cuda", dtype=torch.float32
     ).to(dtype)
-    return grouped_out, route_tokens, route_weights, counts, max_m, E_local
+    return (grouped_out, topk_ids, topk_weight, route_tokens, route_weights,
+            counts, max_m, E_local)
 
 
 def _run_one(token_num, topk, E_total, ep, model_dim, dtype, doweight_stage1,
              seed=0, name=""):
-    grouped_out, route_tokens, route_weights, counts, max_m, E_local = (
-        _build_grouped_layout(token_num, topk, E_total, ep, model_dim, dtype, seed)
+    (grouped_out, topk_ids, topk_weight, route_tokens, route_weights,
+     counts, max_m, E_local) = _build_grouped_layout(
+        token_num, topk, E_total, ep, model_dim, dtype, seed
     )
 
+    # reference: scatter (index_add_) using route_tokens/route_weights
     ref = ref_moe_gather_reduce(
         grouped_out, route_tokens, route_weights, counts, token_num, doweight_stage1
     )
+    # optimized: gather map built directly from topk_ids / topk_weight
     opt = flydsl_moe_gather_reduce(
         grouped_out,
-        route_tokens,
-        route_weights,
+        topk_ids,
+        topk_weight,
         counts,
-        token_num,
-        topk,
         doweight_stage1,
     )
     torch.cuda.synchronize()
@@ -243,6 +241,9 @@ def main():
 
     all_ok = True
     for i, (tn, topk, E_total, ep, md, dt, dw1, name) in enumerate(configs):
+        if topk > max(1, E_total // ep):
+            print(f"[SKIP] {name} tp={ep}: topk={topk} > E_local={E_total // ep}")
+            continue
         all_ok &= _run_one(tn, topk, E_total, ep, md, dt, dw1, seed=i, name=name)
 
     print("\nALL PASS" if all_ok else "\nSOME FAILED")
