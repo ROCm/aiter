@@ -2703,8 +2703,10 @@ def compile_mixed_moe_gemm1(
         inter_dim_pad_total = arith.constant(2 * inter_dim_pad, index=True)
         tile2_pad = 0
         if const_expr(not gate_only):
-            tile_k_stage2 = 256
-            tile2_pad = tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
+            tile_k_stage2 = tile_k // 2
+            tile2_pad = (
+                tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
+            ) % tile_k_stage2
 
         inter_in = arith.index_cast(ir.IndexType.get(), i32_inter_in.ir_value())
         tile_n_index = arith.constant(tile_n, index=True)
