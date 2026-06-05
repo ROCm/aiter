@@ -612,14 +612,9 @@ def build_mixed_moe_gemm1_kernel(
         expert_rsrc = _ptr_buffer_resource(arg_expert_ids, eid_nbytes_i32)
         bias_rsrc = _ptr_buffer_resource(arg_bias, bias_nbytes) if enable_bias else None
 
-        # Sorted-scale buffer resource for fused mxfp4 quantization.
-        # Pad the e8m0 group-N count up to a multiple of 8 (== inter_dim padded
-        # to the next 256), matching the 256-padded scale layout that stage2
-        # reads (scale_k_padded / scale_kblk_padded). This keeps the producer
-        # sorted-scale row stride (`_n32_sort` below) consistent with stage2's
-        # scale descriptor; otherwise stage1 writes stride inter_dim//32 while
-        # stage2 reads the padded stride -> wrong e8m0 bytes -> garbage output
-        # for inter_dim not a multiple of 256 (e.g. 384). No-op when 256-aligned.
+        # Sorted-scale buffer for fused mxfp4 quant. Pad group-N to a multiple
+        # of 8 (== inter_dim padded to 256) so the producer stride matches the
+        # 256-padded scale layout stage2 reads. No-op when 256-aligned.
         _sorted_scale_cols = ((inter_dim // 32) + 7) // 8 * 8
         _sorted_scale_cols_i32 = fx.Int32(_sorted_scale_cols)
         sorted_scale_rsrc = None
@@ -2523,12 +2518,9 @@ def build_mixed_moe_gemm2_kernel(
         kpack_bytes = 16
         from .layout_utils import _div_pow2, _mod_pow2
 
-        # A&B's scale preshuffle layout.
-        # The scattered a2_scale / weight-scale tensors pad K up to a multiple of
-        # 256 (the scale preshuffle granularity), so the layout K must use the
-        # padded value -- for inter_dim not a multiple of 256 (e.g. 384) the
-        # padded stride differs from inter_dim and using the raw value reads the
-        # wrong scale bytes.
+        # A&B's scale preshuffle layout. Scattered a2/weight scales pad K to a
+        # multiple of 256, so the layout K must use the padded value (raw
+        # inter_dim reads wrong bytes when not 256-aligned, e.g. 384).
         scale_k_padded = (inter_dim + 255) // 256 * 256
         scale_kblk_padded = scale_k_padded // 32
         c_k_orig = fx.Index(scale_k_padded)
