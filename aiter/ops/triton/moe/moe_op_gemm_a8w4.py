@@ -3,8 +3,8 @@
 
 import functools
 import itertools
-import json
 import os
+import json
 import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
@@ -17,6 +17,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 
 @functools.lru_cache
@@ -56,6 +57,10 @@ def allocate_output(
     split_k,
     device,
 ):
+    # if the activations are gathered, then M is number of gather indices
+    if gather_indx is not None:
+        M = gather_indx.shape[0]
+    # final output
     if routing_data.n_expts_act == 1 or scatter_indx is None:
         y_rows = M
     else:
@@ -157,6 +162,51 @@ def get_kernel_config_triton(m, n, k, routing_data):
                 num_warps = 8
         else:
             block_n = 128
+            num_warps = 4 if block_m == 128 else 8
+    elif arch == "gfx950":
+        num_stages = 1
+        if block_m == 16:
+            block_n = 128
+            num_warps = 4
+
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
+            # Floor at 64 (was 32): out_mx_quant=True with apply_swiglu requires
+            # OUT_BLOCK_N = BLOCK_N // 2 >= 32. Loop boundary changed to keep
+            # block_n >= 64 for both MX and non-MX paths.
+            while block_n >= 128 and grid < get_num_sms():
+                block_n = block_n // 2
+                grid_m = routing_data.n_blocks(m, block_m)
+                grid_n = triton.cdiv(n, block_n)
+                grid = grid_m * grid_n * split_k
+
+            if k >= 512:
+                block_k = 512
+
+        elif block_m == 32:
+            if n <= 1024:
+                block_n = 128
+                num_warps = 4
+            elif n <= 4096:
+                block_n = 256
+                num_warps = 4
+            else:
+                block_n = 512
+                num_warps = 4
+
+        elif block_m == 64:
+            # V4-Flash prefill-tuned (rocprof brute force v2): for block_m=64,
+            # (bn=128, nw=4, ns=1) gives 2-4x speedup over the previous bn=512/nw=8
+            # default on all four V4-Flash prefill shapes.
+            block_n = 128
+            num_warps = 4
+            num_stages = 1
+
+        else:
+            block_n = 512
+            # routing caps block_m at 128; nw=4 wins ~2x at block_m=128 on gpt-oss
+            # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
             num_warps = 4 if block_m == 128 else 8
     else:
         block_n = 128
@@ -270,9 +320,16 @@ def moe_gemm_a8w4(
     apply_swiglu=False,
     alpha=1.0,
     limit=1.0,
-    add_residual=True,
+    swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
+    # Idea 1: emit (fp8 e4m3, ue8m0 per-1×32 scale) directly from the GEMM
+    # write-back. When out_mx_quant=True, returns (y_fp8, y_scale_ue8m0).
+    # Requires SPLIT_K==1 and no scatter_indx (GEMM1-style).
+    out_mx_quant: bool = False,
+    # External residual to fold into reduce_grouped writeback (saves the
+    # standalone routed+shared elementwise add).
+    residual=None,
 ):
     """
     Y[:, :] = 0.
@@ -326,7 +383,17 @@ def moe_gemm_a8w4(
         reduction_n_matmul = 1
         apply_swiglu_reduction = False
         reduction_n_reduction = 1
-    # allocate output memory
+    # allocate output memory. With out_mx_quant=True, the kernel writes fp8 e4m3
+    # into y; otherwise the requested out_dtype (bf16).
+    if out_mx_quant:
+        assert config["split_k"] == 1, "out_mx_quant requires split_k == 1"
+        assert scatter_indx is None, (
+            "out_mx_quant currently only supported for GEMM1-style (no scatter); "
+            "scatter+combine would need fp8-aware reduce_grouped"
+        )
+        out_dtype = torch.float8_e4m3fn
+    else:
+        out_dtype = out_dtype
     y, y_final = allocate_output(
         M,
         padded_N,
@@ -340,6 +407,18 @@ def moe_gemm_a8w4(
         config["split_k"],
         x.device,
     )
+    # Companion ue8m0 scale buffer for the MXFP8 emit path.
+    if out_mx_quant:
+        n_out = w.shape[-1] // reduction_n_matmul  # post-swiglu width
+        assert n_out % 32 == 0, "out_mx_quant requires N_out % 32 == 0"
+        m_out = y.shape[-2]
+        y_scale = torch.empty((m_out, n_out // 32), dtype=torch.uint8, device=x.device)
+        stride_y_mx_m = y_scale.stride(0)
+        stride_y_mx_n = y_scale.stride(1)
+    else:
+        y_scale = None
+        stride_y_mx_m = 0
+        stride_y_mx_n = 0
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
     expt_data = routing_data.expt_data
@@ -391,7 +470,7 @@ def moe_gemm_a8w4(
             alpha,
             limit,
             reduction_n_matmul,
-            add_residual,
+            swiglu_add_residual,
             routing_data.n_expts_act,
             config["block_m"],
             config["block_n"],
@@ -447,7 +526,7 @@ def moe_gemm_a8w4(
             alpha,
             limit,
             reduction_n_matmul,
-            add_residual,
+            swiglu_add_residual,
             routing_data.n_expts_act,
             config["block_m"],
             config["block_n"],
@@ -465,14 +544,23 @@ def moe_gemm_a8w4(
             waves_per_eu=config["waves_per_eu"],
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
             kpack=config["kpack"],
+            YMxScale=y_scale,
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
         )
 
+    # MXFP8 emit path: scatter_indx is None and split_k==1, so we bypass
+    # reduce_grouped and return (fp8 values, ue8m0 scales) directly.
+    if out_mx_quant:
+        return y.squeeze(0), y_scale
     # Build grouped reduction inputs in a uniform way
     group_indx = (
         None
         if scatter_indx is None
         else scatter_indx.view(-1, routing_data.n_expts_act)
     )
+    # Step 9: external residual fold-in is now wired into reduce_grouped.
     y_final = reduce_grouped(
         y,
         group_indx,
@@ -482,7 +570,8 @@ def moe_gemm_a8w4(
         limit,
         reduction_n_reduction,
         out_dtype=out_dtype,
-        add_residual=add_residual,
+        swiglu_add_residual=swiglu_add_residual,
+        residual=residual,
     )
     return y_final
 
