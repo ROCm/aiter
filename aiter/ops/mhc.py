@@ -117,22 +117,6 @@ def _mhc_fused_fill_splitk(m, valid_splitk, num_cu):
 
 
 def _mhc_fused_config_gfx950_256(m, hidden_size, num_cu):
-    """Tuned config for gfx950 @ 256 CU (MI350).
-
-    Measured rules (n=7168 and n=4096 sweeps, this kernel timed alone):
-    - tile_n is always 32. tile_n=16 (2 n-blocks) never won on this chip; it lost
-      badly at small m (e.g. m=128: 14.8us @ tn=16 vs 10.4us @ tn=32, 1.4x).
-    - tile_k=32 wins until the kernel becomes compute-bound, then tile_k=64 (which
-      forces tile_m=16 for LDS) amortizes loop overhead. The crossover scales with
-      hidden_size: it sat at m~16384 for hidden=7168 and m~8192 for hidden=4096,
-      i.e. tile_k=64 once m >= 2*hidden_size.
-    - tile_m=32 (fn-reuse over two mfma bands) wins whenever the grid still fills
-      the device; else tile_m=16.
-    - on the tile_k=32 path, when the geometric fill lands split_k at 2..4 (large m,
-      ~1 wave with heavy per-block work) a second K-reduction wave (2*split_k) was
-      4-12% faster (measured m=2048,4096 @ hidden=7168/4096). Smaller m (geom>=8)
-      and the largest m (geom=1, one wave already saturates) stayed put.
-    """
     tile_k = 64 if m >= 2 * hidden_size else 32
     if hidden_size % tile_k != 0:
         tile_k = 32 if tile_k == 64 else 64
@@ -155,6 +139,29 @@ def _mhc_fused_config_gfx950_256(m, hidden_size, num_cu):
         # sk=1 at this m but sk=2 is ~2-5% faster (measured m>=8192).
         if splitk < 2 and 2 in valid:
             splitk = 2
+    return splitk, tile_m, tile_n, tile_k
+
+
+def _mhc_fused_config_gfx942_80(m, hidden_size, num_cu):
+    tile_k = 32 if (hidden_size <= 4096 and m <= 128) else 64
+    if hidden_size % tile_k != 0:
+        tile_k = 32 if tile_k == 64 else 64
+
+    valid = _mhc_fused_valid_splitk(hidden_size, tile_k, num_cu)
+    if not valid:
+        return 1, 16, 32, tile_k
+
+    tile_n = 32  # tile_n=16 never wins on this chip
+    tile_m = 16  # tile_m=32 (fn-reuse) never wins on this low-CU part
+    if tile_k == 64:
+        # deep fill: optimum ~= 12.8*num_cu total blocks; small m saturates the cap.
+        m_blocks = (m + 15) // 16
+        ideal = max(1.0, 12.8 * num_cu / m_blocks)
+        splitk = min(valid, key=lambda sk: (abs(math.log(sk) - math.log(ideal)), -sk))
+        if splitk < 2 and 2 in valid:  # large-m underfill; sk>=2 measured faster
+            splitk = 2
+    else:  # tile_k == 32 small-problem path: shallow ~2-wave fill
+        splitk = _mhc_fused_fill_splitk(m, valid, num_cu)
     return splitk, tile_m, tile_n, tile_k
 
 
@@ -204,6 +211,7 @@ def _mhc_fused_config_default(m, hidden_size, num_cu):
 # Each entry: (m, hidden_size, num_cu) -> (splitk, tile_m, tile_n, tile_k).
 _MHC_FUSED_POST_PRE_CONFIG = {
     ("gfx950", 256): _mhc_fused_config_gfx950_256,
+    ("gfx942", 80): _mhc_fused_config_gfx942_80,
 }
 
 
