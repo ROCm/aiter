@@ -4,6 +4,7 @@
 """FlyDSL MOE kernel management: naming, compilation, and high-level API."""
 
 import functools
+import os
 import re
 
 from typing import Dict, Optional
@@ -146,7 +147,10 @@ def get_flydsl_stage2_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     tile_ns = [128, 256] if is_fp4 else [128]
-    tile_ks = [256] if is_fp4 else [128]
+    # fp4 stage2 supports tile_k=128 (pack_K=1 scale sub-group shift path) as
+    # well as 256.  tile_k=128 cleanly tiles K=inter_dim for TP-sharded shapes
+    # whose inter_dim is a multiple of 128 but not 256 (e.g. MiniMax TP4=384).
+    tile_ks = [128, 256] if is_fp4 else [128]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
 
@@ -307,8 +311,6 @@ def compile_flydsl_moe_stage1(
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
         from .moe_common import GateMode
 
-        # model_dim_pad / inter_dim_pad are runtime args passed at launch time
-        # (see _s1_args_fp4); no longer baked into the AOT compile.
         return compile_mixed_moe_gemm1(
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -328,6 +330,8 @@ def compile_flydsl_moe_stage1(
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
             gate_mode=GateMode(gate_mode),
+            model_dim_pad=model_dim_pad,
+            inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
@@ -387,8 +391,6 @@ def compile_flydsl_moe_stage2(
     if b_dtype == "fp4":
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
-        # model_dim_pad / inter_dim_pad are runtime args passed at launch time
-        # (see _s2_args_fp4); no longer baked into the AOT compile.
         return compile_mixed_moe_gemm2(
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -405,6 +407,8 @@ def compile_flydsl_moe_stage2(
             persist_m=persist_m,
             sort_block_m=sort_block_m,
             b_nt=b_nt,
+            model_dim_pad=model_dim_pad,
+            inter_dim_pad=inter_dim_pad,
             xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
         )
@@ -479,8 +483,6 @@ def _s1_args_fp4(
     dev,
     bias=None,
     stream=None,
-    model_dim_pad=0,
-    inter_dim_pad=0,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
@@ -502,8 +504,6 @@ def _s1_args_fp4(
         n_in,
         k_in,
         size_expert_ids_in,
-        model_dim_pad,
-        inter_dim_pad,
         stream,
     )
 
@@ -561,8 +561,6 @@ def _s2_args_fp4(
     dev,
     bias=None,
     stream=None,
-    model_dim_pad=0,
-    inter_dim_pad=0,
 ):
     _bias = (
         bias.view(-1)
@@ -586,8 +584,6 @@ def _s2_args_fp4(
         n_in,
         k_in,
         blocks,
-        model_dim_pad,
-        inter_dim_pad,
         stream,
     )
 
@@ -859,8 +855,6 @@ def flydsl_moe_stage1(
                 if kernel_bias is not None
                 else torch.empty(0, device=dev)
             ),
-            model_dim_pad=model_dim_pad,
-            inter_dim_pad=inter_dim_pad,
         )
     else:
         args = _s1_args_std(
@@ -1062,6 +1056,8 @@ def flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     bias: Optional[torch.Tensor] = None,
+    expert_mask: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1074,12 +1070,22 @@ def flydsl_moe_stage2(
         from sorting/stage1.
     persist: if True, use persistent round-robin mode (grid_y=cu_num);
         if False, use legacy persist_m mode; if None, auto-select.
+
+    expert_mask, topk_ids: when both are provided and mode="reduce", the
+        post-GEMM reduction fuses the EP validity gather
+        ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
+        slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
     """
 
     token_num = inter_states.shape[0]
     E = w2.shape[0]
     model_dim = w2.shape[1]
     inter_dim = inter_states.shape[2]
+
+    # Debug: force stage2 to use the masked reduce epilogue instead of atomic
+    # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
+    if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
+        mode = "reduce"
 
     accumulate = mode != "reduce"
 
@@ -1153,8 +1159,6 @@ def flydsl_moe_stage2(
             m_blocks,
             dev,
             bias=bias,
-            model_dim_pad=model_dim_pad,
-            inter_dim_pad=inter_dim_pad,
         )
     else:
         args = _s2_args_std(
@@ -1197,6 +1201,56 @@ def flydsl_moe_stage2(
     _run_compiled(exe, args)
 
     if not accumulate:
-        torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+        use_mask = expert_mask is not None
+        if use_mask and topk_ids is None:
+            raise ValueError(
+                "topk_ids is required when expert_mask is provided for reduce mode"
+            )
+        # Map torch dtype -> compile_moe_reduction dtype_str
+        if out.dtype == torch.float16:
+            _reduce_dtype_str = "f16"
+        elif out.dtype == torch.bfloat16:
+            _reduce_dtype_str = "bf16"
+        elif out.dtype == torch.float32:
+            _reduce_dtype_str = "f32"
+        else:
+            _reduce_dtype_str = None
+
+        if _reduce_dtype_str is not None:
+            from .kernels.moe_gemm_2stage import compile_moe_reduction
+
+            reduce_exe = compile_moe_reduction(
+                topk=topk,
+                model_dim=model_dim,
+                dtype_str=_reduce_dtype_str,
+                use_mask=use_mask,
+                # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
+                num_experts=int(expert_mask.numel()) if use_mask else 0,
+            )
+            X = target.view(token_num, topk, model_dim)
+            if use_mask:
+                em = expert_mask.to(torch.int32).contiguous()
+                tk = topk_ids.to(torch.int32).contiguous()
+            else:
+                # Placeholders; kernel ignores them when use_mask=False.
+                em = torch.empty(0, device=out.device, dtype=torch.int32)
+                tk = torch.empty(0, device=out.device, dtype=torch.int32)
+            stream = torch.cuda.current_stream()
+            reduce_exe(
+                _ptr_view_safe(X),
+                _ptr_view_safe(out),
+                _ptr_view_safe(em),
+                _ptr_view_safe(tk),
+                token_num,
+                stream,
+            )
+        else:
+            # Unsupported dtype for the masked kernel — fall back to torch.sum.
+            # This drops the EP mask, so only valid for non-EP runs.
+            if use_mask:
+                raise NotImplementedError(
+                    f"Masked moe reduction not supported for dtype {out.dtype}"
+                )
+            torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
 
     return out

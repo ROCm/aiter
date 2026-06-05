@@ -688,9 +688,15 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         TOPK=topk,
     )
 
+    # The blockscale buffer is allocated with padded N (rounded up to
+    # BLOCK_SIZE_N).  Returning the padded view keeps the layout identical to
+    # ``e8m0_shuffle`` so downstream MoE GEMM kernels can use the same padded
+    # scale stride for any ``inter_dim/32``.  Padded columns are zero, so they
+    # contribute no extra signal.
+    padded_N_o = triton.cdiv(N_o, BLOCK_SIZE_N) * BLOCK_SIZE_N
     return (
         x_fp4.view(dtypes.fp4x2),
-        blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o),
+        blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, padded_N_o),
     )
 
 
