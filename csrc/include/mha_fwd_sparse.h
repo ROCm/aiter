@@ -42,4 +42,15 @@ static_assert(sizeof(fmha_fwd_v3_sparse_args) == 704,
 // Sparse dispatcher. Returns the launch time in ms, -1 on unsupported config.
 float fmha_fwd_v3_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
 
+// Sparse mxfp4 sibling. Same kernarg layout, different .co
+// (fwd_hd128_mxfp4_sparse.co) generated from
+// /workspace/mi350_fmha_hd128_mxfp4_sparse.py. Q/K are fp4-packed
+// (caller tensor dtype int8/uint8 with last dim = head_dim/2 = 64
+// for hd=128), V is fp8, Q/K scales are E8M0 per-block uint8 bytes
+// and V descale is fp32 per output channel -- but on the kernel side
+// none of those buffer dtypes are baked into the kernarg, so the
+// dispatcher just forwards base pointers and lets the wrapper
+// validate shapes (see asm_mha_fwd_sparse.cu::fmha_v3_fwd_mxfp4_sparse).
+float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
+
 } // namespace aiter

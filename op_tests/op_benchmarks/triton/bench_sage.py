@@ -22,6 +22,7 @@ from aiter.ops.mha import (
     flash_attn_fp8_pertensor_func,
     flash_attn_i8fp8_pertensor_func,
     flash_attn_i8fp8_sparse_pertensor_func,
+    flash_attn_mxfp4_sparse_pertensor_func,
 )
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
@@ -71,6 +72,7 @@ KernelName = Literal[
     "aiter_i8fp8",
     "aiter_bf16",
     "aiter_asm_sparse",
+    "aiter_asm_sparse_mxfp4",
 ]
 
 ALL_KERNELS: List[str] = [
@@ -88,6 +90,7 @@ FP8_CHECK_KERNELS = {
     "aiter_fp8",
     "aiter_i8fp8",
     "aiter_asm_sparse",
+    "aiter_asm_sparse_mxfp4",
 }
 
 # -----------------------------------------------------------------------------
@@ -182,6 +185,124 @@ def make_asm_sparse_runner(
             q_int8,
             k_int8,
             v_fp8,
+            q_descale,
+            k_descale,
+            v_descale,
+            kv_block_indices,
+            lut_start,
+            lut_count,
+            softmax_scale=softmax_scale,
+        )
+
+    return _run
+
+
+def make_asm_sparse_mxfp4_runner(
+    args: argparse.Namespace,
+    q_bshd: torch.Tensor,
+    k_bshd: torch.Tensor,
+    v_bshd: torch.Tensor,
+    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> Any:
+    """Runner factory for the hand-written ASM block-sparse mxfp4 Sage kernel.
+
+    Mirrors ``make_asm_sparse_runner`` but uses ``sage_quant_mxfp4`` for the
+    fp4-packed Q,K + fp8 V + E8M0 scales contract, and dispatches through
+    ``flash_attn_mxfp4_sparse_pertensor_func`` ->
+    ``aiter.ops.mha.fmha_v3_fwd_mxfp4_sparse`` ->
+    ``aiter::torch_itfs::fmha_v3_fwd_mxfp4_sparse`` ->
+    ``aiter::fmha_fwd_v3_mxfp4_sparse`` -> .co launch
+    (fwd_hd128_mxfp4_sparse.co, kernel symbol
+    _ZN5aiter35fmha_fwd_hd128_mxfp4_sparse_gfx950E).
+
+    The sparse mxfp4 kernel does NOT apply the sage smoothing ``delta_s``
+    correction (the kernarg blob has no slot for it), so we disable
+    q_smoothing here -- enabling it would only affect accuracy reporting,
+    not throughput.
+    """
+    if block_lut is None:
+        raise ValueError(
+            "aiter_asm_sparse_mxfp4 requires --block-sparsity or "
+            "--block-mask-file; the kernel has no dense traversal path."
+        )
+    if args.causal:
+        raise NotImplementedError(
+            "aiter_asm_sparse_mxfp4 does not support causal masking yet."
+        )
+    if args.layout != "bshd":
+        raise ValueError("aiter_asm_sparse_mxfp4 expects --layout=bshd inputs.")
+    if (
+        q_bshd.shape[-1] != ASM_SPARSE_HEAD_DIM
+        or v_bshd.shape[-1] != ASM_SPARSE_HEAD_DIM
+    ):
+        raise ValueError(
+            f"aiter_asm_sparse_mxfp4 is hard-coded to hd={ASM_SPARSE_HEAD_DIM} "
+            f"(got Qd={q_bshd.shape[-1]}, Vd={v_bshd.shape[-1]})."
+        )
+
+    # Same sage_quant_mxfp4 path the Triton mxfp4 backend uses. Hadamard
+    # block rotation is enabled with the same defaults as `sage_mxfp4` so
+    # the quantization noise distribution matches across backends; the
+    # rotation is purely a quantization-quality lever (it does NOT change
+    # the kernel's compute pattern).
+    cfg = get_sage_fwd_configs_mxfp4()
+    fp8_type = aiter.dtypes.fp8
+    fp8_max = torch.finfo(fp8_type).max
+
+    block_r = args.block_r
+    if block_r > q_bshd.shape[-1]:
+        raise ValueError(
+            f"block_r ({block_r}) must be <= head dim ({q_bshd.shape[-1]})"
+        )
+    r = create_hadamard_matrix(block_r, device=q_bshd.device, dtype=q_bshd.dtype) / (
+        block_r**0.5
+    )
+
+    (
+        q_quant,
+        q_descale,
+        k_quant,
+        k_descale,
+        v_quant,
+        v_descale,
+        _delta_s,  # ignored: ASM kernel has no smoothing-bias slot
+    ) = sage_quant_mxfp4(
+        q_bshd,
+        k_bshd,
+        v_bshd,
+        fp8_type,
+        fp8_max,
+        BLKQ=cfg["BLOCK_M"],
+        BLKK=64,
+        layout=args.layout,
+        R=r,
+        BLOCK_R=block_r,
+        q_smoothing=False,  # ASM path doesn't apply delta_s
+    )
+
+    # The ASM kernel reads Q/K as raw bytes; sage_quant_mxfp4 returns them
+    # already byte-packed (last dim = head_dim/2). The wrapper accepts
+    # int8 or uint8 -- whatever sage_quant_mxfp4 emits, it gets passed
+    # through unmodified.
+    q_quant = q_quant.contiguous()
+    k_quant = k_quant.contiguous()
+    v_quant = v_quant.contiguous()
+    q_descale = q_descale.contiguous()
+    k_descale = k_descale.contiguous()
+    v_descale = v_descale.to(torch.float32).contiguous()
+
+    kv_block_indices, lut_start, lut_count = block_lut
+    kv_block_indices = kv_block_indices.to(torch.int32).contiguous()
+    lut_start = lut_start.to(torch.int32).contiguous()
+    lut_count = lut_count.to(torch.int32).contiguous()
+
+    softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
+
+    def _run() -> torch.Tensor:
+        return flash_attn_mxfp4_sparse_pertensor_func(
+            q_quant,
+            k_quant,
+            v_quant,
             q_descale,
             k_descale,
             v_descale,
@@ -418,7 +539,7 @@ def load_block_mask_from_json(
 def kernel_block_sizes(kernel: KernelName) -> Tuple[int, int]:
     if kernel == "sage_mxfp4":
         cfg = get_sage_fwd_configs_mxfp4()
-    elif kernel == "aiter_asm_sparse":
+    elif kernel in ("aiter_asm_sparse", "aiter_asm_sparse_mxfp4"):
         return ASM_SPARSE_BLOCK_M, ASM_SPARSE_BLOCK_N
     else:
         cfg = get_sage_fwd_configs()
@@ -915,6 +1036,11 @@ def make_kernel_runner(
     if args.kernel == "aiter_asm_sparse":
         return make_asm_sparse_runner(args, q_bshd, k_bshd, v_bshd, block_lut)
 
+    if args.kernel == "aiter_asm_sparse_mxfp4":
+        return make_asm_sparse_mxfp4_runner(
+            args, q_bshd, k_bshd, v_bshd, block_lut
+        )
+
     raise ValueError(f"Unsupported kernel: {args.kernel}")
 
 
@@ -1044,11 +1170,15 @@ def benchmark_single_case(
         if explicit_block_attn_mask is not None
         else build_block_mask(args, shape, q.device, loaded_single_mask)
     )
-    # The hand-written ASM sparse kernel has only a sparse traversal path,
-    # so a fully-dense mask still needs a materialized LUT (one entry per
-    # KV block). Triton kernels prefer return_none_if_dense=True so they
-    # can fall back to their fast dense path; keep that for everything else.
-    _return_none_if_dense = args.kernel != "aiter_asm_sparse"
+    # The hand-written ASM sparse kernels (i8fp8 and mxfp4) have only a
+    # sparse traversal path, so a fully-dense mask still needs a
+    # materialized LUT (one entry per KV block). Triton kernels prefer
+    # return_none_if_dense=True so they can fall back to their fast
+    # dense path; keep that for everything else.
+    _return_none_if_dense = args.kernel not in (
+        "aiter_asm_sparse",
+        "aiter_asm_sparse_mxfp4",
+    )
     block_lut = (
         block_attn_mask_to_ragged_lut(
             block_attn_mask, return_none_if_dense=_return_none_if_dense
@@ -1082,7 +1212,13 @@ def benchmark_single_case(
         "sage_fp8",
         "sage_mxfp4",
         "aiter_asm_sparse",
+        "aiter_asm_sparse_mxfp4",
     ):
+        # Per-element size in BYTES for the GB/s memory-bw estimate. mxfp4
+        # is 4 bits/elem = 0.5 B, but element_size in PyTorch is integer.
+        # Using 1 here over-counts mxfp4 bytes by 2x (same as how
+        # sage_mxfp4 is accounted), keeping the comparison apples-to-apples
+        # within the bench's existing convention.
         q_elem_size = 1
         k_elem_size = 1
     else:
@@ -1092,7 +1228,13 @@ def benchmark_single_case(
     v_elem_size = (
         1
         if args.kernel
-        in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8", "aiter_asm_sparse")
+        in (
+            "fav3_fp8",
+            "aiter_fp8",
+            "aiter_i8fp8",
+            "aiter_asm_sparse",
+            "aiter_asm_sparse_mxfp4",
+        )
         else v.element_size()
     )
     mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
@@ -1297,19 +1439,19 @@ def validate_args(args: argparse.Namespace) -> None:
     ):
         logger.warning("MXFP4-specific flags are ignored unless --kernel=sage_mxfp4")
 
-    if args.kernel == "aiter_asm_sparse":
+    if args.kernel in ("aiter_asm_sparse", "aiter_asm_sparse_mxfp4"):
         if args.block_sparsity is None and not args.block_mask_file:
             raise ValueError(
-                "--kernel=aiter_asm_sparse requires --block-sparsity or "
+                f"--kernel={args.kernel} requires --block-sparsity or "
                 "--block-mask-file (the hand-written kernel has no dense path)."
             )
         if args.causal:
             raise ValueError(
-                "--kernel=aiter_asm_sparse does not support --causal yet."
+                f"--kernel={args.kernel} does not support --causal yet."
             )
         if args.layout != "bshd":
             raise ValueError(
-                "--kernel=aiter_asm_sparse expects --layout=bshd "
+                f"--kernel={args.kernel} expects --layout=bshd "
                 "(matches host fmha_fwd_v3_args layout)."
             )
         if args.d not in (0, ASM_SPARSE_HEAD_DIM) or args.dv not in (
@@ -1317,13 +1459,14 @@ def validate_args(args: argparse.Namespace) -> None:
             ASM_SPARSE_HEAD_DIM,
         ):
             raise ValueError(
-                f"--kernel=aiter_asm_sparse is hard-coded to d=dv="
+                f"--kernel={args.kernel} is hard-coded to d=dv="
                 f"{ASM_SPARSE_HEAD_DIM}"
             )
         if args.e2e:
             logger.warning(
-                "--e2e is ignored for aiter_asm_sparse; quantization is always "
-                "included in the runner factory (LUT prep is excluded)."
+                "--e2e is ignored for %s; quantization is always "
+                "included in the runner factory (LUT prep is excluded).",
+                args.kernel,
             )
 
 
@@ -1495,7 +1638,10 @@ def run_block_sparse_repetitions(
     num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
     num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
 
-    _return_none_if_dense = args.kernel != "aiter_asm_sparse"
+    _return_none_if_dense = args.kernel not in (
+        "aiter_asm_sparse",
+        "aiter_asm_sparse_mxfp4",
+    )
     warmup_mask = (
         torch.rand(shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device)
         > args.block_sparsity
@@ -1649,12 +1795,14 @@ def parse_args() -> argparse.Namespace:
             "aiter_i8fp8",
             "aiter_bf16",
             "aiter_asm_sparse",
+            "aiter_asm_sparse_mxfp4",
             "all",
         ],
         help=(
             "Kernel implementation to benchmark. Use 'all' to compare all "
-            "non-sparse backends. 'aiter_asm_sparse' is the hand-written "
-            "PyISA kernel and REQUIRES --block-sparsity (or --block-mask-file)."
+            "non-sparse backends. 'aiter_asm_sparse' (i8fp8) and "
+            "'aiter_asm_sparse_mxfp4' are the hand-written PyISA kernels "
+            "and REQUIRE --block-sparsity (or --block-mask-file)."
         ),
     )
 

@@ -119,8 +119,11 @@ def common_mha_fwd_fake_tensors(
     head_size_v = v.size(3)
     seqlen_k = k.size(1)
 
+    # fp8 and i8fp8 quantized ASM paths both write bf16 outputs.
+    is_i8fp8 = q.dtype == torch.int8 and v.dtype == dtypes.fp8
+    out_writes_bf16 = q.dtype == dtypes.fp8 or is_i8fp8
     if out is not None:
-        if q.dtype != dtypes.fp8:
+        if not out_writes_bf16:
             assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
         assert out.device == q.device, "Output must be on the same device as inputs"
         assert out.stride(-1) == 1, "Output tensor must have contiguous last dimension"
@@ -131,7 +134,7 @@ def common_mha_fwd_fake_tensors(
             head_size_v,
         ), "Output tensor has incorrect shape"
     else:
-        out_dtype = dtypes.bf16 if q.dtype == dtypes.fp8 else q.dtype
+        out_dtype = dtypes.bf16 if out_writes_bf16 else q.dtype
         out = torch.empty(
             (batch_size, seqlen_q, num_heads, head_size_v),
             dtype=out_dtype,
@@ -246,7 +249,10 @@ def gen_fmha_v3_fwd_fake_tensors(
 
 
 @compile_ops(
-    "module_fmha_v3_fwd", fc_name="fmha_v3_fwd", gen_fake=gen_fmha_v3_fwd_fake_tensors
+    "module_fmha_v3_fwd",
+    fc_name="fmha_v3_fwd",
+    gen_fake=gen_fmha_v3_fwd_fake_tensors,
+    mutates_args=[],
 )
 def fmha_v3_fwd(
     q: Tensor,
@@ -301,6 +307,48 @@ def fmha_v3_fwd_sparse(
     q_descale: Tensor,            # [1] or [b, hk], fp32
     k_descale: Tensor,            # [1] or [b, hk], fp32
     v_descale: Tensor,            # [1] or [b, hk], fp32
+    kv_block_indices: Tensor,     # int32
+    lut_start: Tensor,            # int32 [b*hq*num_q_blocks]
+    lut_count: Tensor,            # int32 [b*hq*num_q_blocks]
+    softmax_scale: float,
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]: ...
+
+
+def _gen_fmha_v3_fwd_mxfp4_sparse_fake_tensors(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    softmax_scale: float,
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]:
+    if out is not None:
+        return (out,)
+    # Output is bf16 with the same (b, sq, hq) as Q and v's last dim.
+    b, sq, hq, _ = q.shape
+    head_dim_v = v.shape[-1]
+    return (q.new_empty((b, sq, hq, head_dim_v), dtype=dtypes.bf16),)
+
+
+@compile_ops(
+    "module_fmha_v3_fwd",
+    fc_name="fmha_v3_fwd_mxfp4_sparse",
+    gen_fake=_gen_fmha_v3_fwd_mxfp4_sparse_fake_tensors,
+    mutates_args=[],
+)
+def fmha_v3_fwd_mxfp4_sparse(
+    q: Tensor,                    # [b, sq, hq, hd/2 = 64], int8/uint8 (fp4-packed)
+    k: Tensor,                    # [b, sk, hk, 64], int8/uint8
+    v: Tensor,                    # [b, sk, hk, 128], fp8
+    q_descale: Tensor,            # E8M0 per-block bytes, [b, sq, hq, hd/32 = 4]
+    k_descale: Tensor,            # E8M0 per-block bytes
+    v_descale: Tensor,            # fp32 per output channel, [b*hk, 128]
     kv_block_indices: Tensor,     # int32
     lut_start: Tensor,            # int32 [b*hq*num_q_blocks]
     lut_count: Tensor,            # int32 [b*hq*num_q_blocks]
@@ -3269,6 +3317,63 @@ def flash_attn_i8fp8_sparse_pertensor_func(
     out_padded = outs[0]
     out = out_padded[..., :head_size_v_og]
     return out
+
+
+def flash_attn_mxfp4_sparse_pertensor_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    kv_block_indices: torch.Tensor,
+    lut_start: torch.Tensor,
+    lut_count: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+):
+    """Block-sparse mxfp4 FMHA forward (hd=128, gfx950).
+
+    Sibling of ``flash_attn_i8fp8_sparse_pertensor_func`` that routes to
+    the mxfp4-Q,K * fp8-V hand-written sparse kernel
+    ``fwd_hd128_mxfp4_sparse.co``.
+
+    Args:
+        q: int8/uint8 tensor [b, sq, hq, hd/2 = 64], fp4-packed (bshd).
+        k: int8/uint8 tensor [b, sk, hk, 64], fp4-packed (bshd).
+        v: fp8 tensor       [b, sk, hk, 128] (bshd).
+        q_descale, k_descale: int8/uint8 E8M0 per-block scales.
+        v_descale: fp32 per output channel.
+        kv_block_indices, lut_start, lut_count: int32 LUT produced by
+            aiter.ops.triton.attention.utils.block_attn_mask_to_ragged_lut
+            (return_none_if_dense=False; this kernel has no dense path).
+        softmax_scale: if None, defaults to hd_logical**-0.5 where
+            hd_logical = q.shape[-1] * 2 (fp4-packed).
+
+    Constraints (assert-checked C++-side, see asm_mha_fwd_sparse.cu::
+    fmha_v3_fwd_mxfp4_sparse):
+        sq % 256 == 0, sk % 128 == 0, hq % hk == 0, (hq/hk) is a power of 2,
+        head_dim (logical) == 128, batch mode, non-causal, gfx950.
+
+    Returns:
+        out: bf16 tensor [b, sq, hq, 128], bshd.
+    """
+    if softmax_scale is None:
+        head_dim_logical = q.shape[-1] * 2
+        softmax_scale = head_dim_logical ** (-0.5)
+    outs = fmha_v3_fwd_mxfp4_sparse(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+        float(softmax_scale),
+        None,
+    )
+    return outs[0]
 
 
 def flash_attn_varlen_fp8_pertensor_func(

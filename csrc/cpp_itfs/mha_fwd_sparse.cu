@@ -17,7 +17,9 @@
 namespace aiter {
 
 // Hardcoded for the single shape this kernel currently supports.
-// (BLOCK_M, BLOCK_N) = (256, 128); hd_q = hd_v = 128; i8fp8 -> bf16; non-causal.
+// (BLOCK_M, BLOCK_N) = (256, 128); hd_q = hd_v = 128; non-causal.
+// The mxfp4 sibling shares the SAME 704-byte kernarg layout (sparse args
+// are only the trailing 48-byte LUT pointer block, identical for both).
 static constexpr int      kSparseTileQ = 256;
 static constexpr int      kSparseTileN = 128;
 static constexpr int      kSparseBdx   = 512;
@@ -25,6 +27,10 @@ static constexpr const char* kSparseKernelName =
     "_ZN5aiter35fmha_fwd_hd128_i8fp8_sparse_gfx950E";
 static constexpr const char* kSparseCoName =
     "fmha_v3_fwd/fwd_hd128_i8fp8_sparse.co";
+static constexpr const char* kSparseMxfp4KernelName =
+    "_ZN5aiter35fmha_fwd_hd128_mxfp4_sparse_gfx950E";
+static constexpr const char* kSparseMxfp4CoName =
+    "fmha_v3_fwd/fwd_hd128_mxfp4_sparse.co";
 
 // Pack the 704-byte blob. The first 656 bytes mirror init_fmha_fwd_v3_args
 // (see mha_fwd.cu); the trailing 48 bytes hold the 3 LUT pointers (each 16
@@ -135,6 +141,66 @@ float fmha_fwd_v3_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
 
     // Grid: (num_q_blocks, nhead_q, batch). Same ordering the .py kernel
     // uses for tgid_x/y/z (see process_current_work_sparse()).
+    const int num_q_blocks = (a.seqlen_q + kSparseTileQ - 1) / kSparseTileQ;
+    const int gdx = num_q_blocks;
+    const int gdy = a.nhead_q;
+    const int gdz = a.batch;
+    const int bdx = kSparseBdx;
+
+    return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+        void* args_ptr     = &args;
+        size_t* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz,
+                                 bdx, 1, 1, s_.stream_id_});
+    });
+}
+
+// Block-sparse mxfp4 fmha sibling. Same 704-byte kernarg blob as the
+// i8fp8 sparse path; the only on-device difference is the kernel symbol
+// + .co name. The mxfp4 kernel re-computes its own Q/K E8M0 per-block
+// scale offsets from _s_KV_cur / _s_seq_len / _s_q_head_num so the
+// init_sparse_v3_args path can be reused unchanged -- the kernel does
+// NOT consume args.s_descale_*_Bs / _Hs for mxfp4 (only the base
+// pointers q_descale_ptr / k_descale_ptr / v_descale_ptr matter, which
+// init_sparse_v3_args sets from a.{q,k,v}_descale_ptr).
+float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
+{
+    if(!a.use_asm_v3)
+        return -1;
+
+    const std::string arch_id = get_gpu_arch();
+    if(arch_id != "gfx950")
+    {
+        AITER_LOG_WARNING("fmha_fwd_v3_mxfp4_sparse: only gfx950 is supported "
+                          "(detected arch: " << arch_id << ")");
+        return -1;
+    }
+    // Accept any caller-tag; we keep the dtype tag opaque to the host so
+    // the same dispatcher works whether the wrapper says "mxfp4fp8bf16",
+    // "mxfp4bf16", etc. The validation that Q/K really are fp4-packed
+    // happens in the torch entry (asm_mha_fwd_sparse.cu::fmha_v3_fwd_mxfp4_sparse).
+    if(a.is_group_mode || a.mask_type != 0 || a.has_lse || a.p_drop > 0.f ||
+       a.bias_type != 0)
+    {
+        AITER_LOG_WARNING("fmha_fwd_v3_mxfp4_sparse: unsupported feature combination "
+                          "(group/mask/lse/dropout/bias must all be off)");
+        return -1;
+    }
+
+    if(a.v3_api_check)
+    {
+        return 1;
+    }
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
+        kSparseMxfp4KernelName,
+        [&]() { return AiterAsmKernel(kSparseMxfp4KernelName, kSparseMxfp4CoName); });
+
+    fmha_fwd_v3_sparse_args args{};
+    size_t arg_size = sizeof(args);
+    init_sparse_v3_args(args, a);
+
     const int num_q_blocks = (a.seqlen_q + kSparseTileQ - 1) / kSparseTileQ;
     const int gdx = num_q_blocks;
     const int gdy = a.nhead_q;

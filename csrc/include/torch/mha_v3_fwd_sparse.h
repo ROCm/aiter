@@ -28,5 +28,25 @@ fmha_v3_fwd_sparse(at::Tensor& q,                  // [b, sq, hq, d], int8
                    float softmax_scale,
                    std::optional<at::Tensor> out_ = std::nullopt); // [b, sq, hq, d_v], bf16
 
+// Block-sparse mxfp4 sibling. Q/K are fp4-packed bytes (logical hd=128
+// stored as byte[hd/2]); V is fp8; Q/K scales are E8M0 per-block
+// uint8/int8 bytes; V descale is fp32 per output channel. Same LUT
+// triple as the i8fp8 variant.
+//
+// Kernel: _ZN5aiter35fmha_fwd_hd128_mxfp4_sparse_gfx950E from
+// aiter/hsa/gfx950/fmha_v3_fwd/fwd_hd128_mxfp4_sparse.co.
+std::vector<at::Tensor>
+fmha_v3_fwd_mxfp4_sparse(at::Tensor& q,                  // [b, sq, hq, d/2], int8/uint8
+                        const at::Tensor& k,             // [b, sk, hk, d/2], int8/uint8
+                        const at::Tensor& v,             // [b, sk, hk, d_v], fp8
+                        const at::Tensor& q_descale,     // E8M0 bytes, [b, sq, hq, d/32]
+                        const at::Tensor& k_descale,     // E8M0 bytes, [b, sk, hk, d/32]
+                        const at::Tensor& v_descale,     // fp32 per output channel, [b*hk, d_v]
+                        const at::Tensor& kv_block_indices, // int32
+                        const at::Tensor& lut_start,        // int32 [b*hq*num_q_blocks]
+                        const at::Tensor& lut_count,        // int32 [b*hq*num_q_blocks]
+                        float softmax_scale,
+                        std::optional<at::Tensor> out_ = std::nullopt); // [b, sq, hq, d_v], bf16
+
 } // namespace torch_itfs
 } // namespace aiter
