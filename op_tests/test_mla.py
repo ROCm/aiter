@@ -514,6 +514,7 @@ def test_mla(
             sm_scale,
             use_2d_view=use_2d_view,
             min_kv_seq_len=ctx_lens,
+            return_lse=return_lse,
         )
 
         err = checkAllclose(
@@ -521,14 +522,18 @@ def test_mla(
             out_gluon,
             msg=f"mla_decode-absorb    [golden vs gluon_mla]: {us_gluon_decode:>8.2f} us......",
         )
+        if return_lse and attn_lse is not None:
+            checkAllclose(
+                lse_ref,
+                attn_lse.reshape(total_q, nhead),
+                msg=f"mla_decode-absorb    [lse_ref vs gluon_mla_lse]: {us_gluon_decode:>8.2f} us......",
+            )
         return err, us_gluon_decode
 
     def test_absorb_decode_gluon_bh16(name):
         # Shared bh16bn{64,128} runner. The wrapper dispatches on
         # (nhead, kv dtype): name='bh16bn128' -> cast kv to fp8;
-        # name='bh16bn64' -> keep bf16. Always runs the full decode (stage-1 +
-        # stage-2 reduce). With -lse/--return_lse the kernel also returns the
-        # merged fp32 lse [batch, nhead], validated against lse_ref.
+        # name='bh16bn64' -> keep bf16. -lse also validates the returned lse.
         from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
