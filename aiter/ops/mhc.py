@@ -9,7 +9,7 @@ from aiter import dtypes
 from torch import Tensor
 from typing import Optional
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 
 
@@ -97,43 +97,132 @@ def get_mhc_pre_splitk(m: int, hc_hidden_size: int) -> tuple[int, int]:
     return selected_splitk, selected_tile_k
 
 
-@functools.lru_cache(maxsize=1024)
-def get_mhc_fused_post_pre_splitk(m: int, hidden_size: int) -> tuple[int, int]:
-    """Split-K / tile_k selection for fused post+pre GEMM (K = hidden_size per stream).
-
-    Empirically (gfx950, n=7168) tile_k=32 wins for nearly all m because it enables
-    the tile_m=32 kernel path (fn loaded once, reused across two mfma m-bands), which
-    cuts redundant fn traffic. tile_k=64 (tile_m fixed at 16) only wins once m is large
-    enough to fill the device on its own, i.e. ceil(m/32) >= 2*num_cu, where the kernel
-    is compute-bound and the wider k-tile amortizes loop overhead.
-
-    Split-K targets ~32*num_cu total thread-blocks so the grid fills the device a few
-    waves deep without over-splitting (which shrinks per-block work and adds reduction
-    cost). The chosen split-k is snapped to the nearest value that evenly divides
-    hidden_size/tile_k and keeps at least `prefetch_stages` k-tiles per block.
-    """
-    prefetch_stages = 2
-    num_cu = get_cu_num()
-
-    selected_tile_k = 64 if (m + 31) // 32 >= 2 * num_cu else 32
-    if hidden_size % selected_tile_k != 0:
-        selected_tile_k = 32 if selected_tile_k == 64 else 64
-
-    valid_splitk = [
+def _mhc_fused_valid_splitk(hidden_size, tile_k, num_cu, prefetch_stages=2):
+    return [
         sk
         for sk in range(1, num_cu + 1)
-        if hidden_size % (sk * selected_tile_k) == 0
-        and (hidden_size // sk) >= selected_tile_k * prefetch_stages
+        if hidden_size % (sk * tile_k) == 0
+        and (hidden_size // sk) >= tile_k * prefetch_stages
     ]
-    if not valid_splitk:
-        return 1, selected_tile_k
 
+
+def _mhc_fused_fill_splitk(m, valid_splitk, num_cu):
+    """Pick the split-k whose total grid best fills the device a few waves deep.
+
+    Empirically the optimum sits near total_blocks ~= 32*num_cu, i.e.
+    splitk ~= 32*num_cu/m, snapped (geometrically) to the nearest valid divisor.
+    """
     ideal = max(1.0, 32.0 * num_cu / m)
-    selected_splitk = min(
-        valid_splitk, key=lambda sk: (abs(math.log(sk) - math.log(ideal)), -sk)
-    )
+    return min(valid_splitk, key=lambda sk: (abs(math.log(sk) - math.log(ideal)), -sk))
 
-    return selected_splitk, selected_tile_k
+
+def _mhc_fused_config_gfx950_256(m, hidden_size, num_cu):
+    """Tuned config for gfx950 @ 256 CU (MI350).
+
+    Measured rules (n=7168 and n=4096 sweeps, this kernel timed alone):
+    - tile_n is always 32. tile_n=16 (2 n-blocks) never won on this chip; it lost
+      badly at small m (e.g. m=128: 14.8us @ tn=16 vs 10.4us @ tn=32, 1.4x).
+    - tile_k=32 wins until the kernel becomes compute-bound, then tile_k=64 (which
+      forces tile_m=16 for LDS) amortizes loop overhead. The crossover scales with
+      hidden_size: it sat at m~16384 for hidden=7168 and m~8192 for hidden=4096,
+      i.e. tile_k=64 once m >= 2*hidden_size.
+    - tile_m=32 (fn-reuse over two mfma bands) wins whenever the grid still fills
+      the device; else tile_m=16.
+    - on the tile_k=32 path, when the geometric fill lands split_k at 2..4 (large m,
+      ~1 wave with heavy per-block work) a second K-reduction wave (2*split_k) was
+      4-12% faster (measured m=2048,4096 @ hidden=7168/4096). Smaller m (geom>=8)
+      and the largest m (geom=1, one wave already saturates) stayed put.
+    """
+    tile_k = 64 if m >= 2 * hidden_size else 32
+    if hidden_size % tile_k != 0:
+        tile_k = 32 if tile_k == 64 else 64
+
+    valid = _mhc_fused_valid_splitk(hidden_size, tile_k, num_cu)
+    if not valid:
+        return 1, 16, 32, tile_k
+    splitk = _mhc_fused_fill_splitk(m, valid, num_cu)
+
+    tile_n = 32  # tile_n=16 never wins on this chip
+    if tile_k == 32:
+        # large-m underfill: geom fill at split_k 2..4 leaves ~1 wave; a 2nd
+        # K-reduction wave measured faster. Excludes geom>=8 (small m) and geom=1.
+        if 2 <= splitk <= 4 and (2 * splitk) in valid:
+            splitk = 2 * splitk
+        tile_m = 32 if (m + 31) // 32 * splitk >= num_cu else 16
+    else:  # tile_k == 64: tile_m=32 would overflow LDS, keep 16
+        tile_m = 16
+        # the compute-bound wide-k path wants >=2 K-reduction waves; fill gives
+        # sk=1 at this m but sk=2 is ~2-5% faster (measured m>=8192).
+        if splitk < 2 and 2 in valid:
+            splitk = 2
+    return splitk, tile_m, tile_n, tile_k
+
+
+def _mhc_fused_config_default(m, hidden_size, num_cu):
+    """Generic fallback for untuned chips: pick (split_k, tile_k) by the occupancy
+    scoring search (how many thread-groups fit vs. how many the device can run at
+    once), with tile_m fixed at 16 (single mfma band, no fn-reuse path) to avoid the
+    tile_m=32 regression seen on low-CU parts that aren't tuned yet. tile_n is then
+    chosen to fill the grid."""
+    prefetch_stages = 2
+    tile_m = 16
+    # thread-groups the device can keep in flight per tile_k (smaller tile_k => more)
+    tile_k_tg_dict = {
+        64: 2 * num_cu,
+        32: 4 * num_cu,
+    }
+    num_tg_m = (m + tile_m - 1) // tile_m
+
+    selected_splitk = 1
+    selected_tile_k = 32 if hidden_size % 32 == 0 else 64
+    selected_score = -1.0
+    for tile_k, meanwhile_tg in tile_k_tg_dict.items():
+        if hidden_size % tile_k != 0:
+            continue
+        for splitk in range(1, num_cu + 1):
+            if hidden_size % (splitk * tile_k) != 0 or (hidden_size // splitk) < (
+                tile_k * prefetch_stages
+            ):
+                continue
+            num_tg = num_tg_m * splitk
+            # occupancy fill ratio, penalize the partial last wave (closer to 1 = better)
+            score = num_tg / meanwhile_tg
+            score = score / math.ceil(score)
+            if score > selected_score:
+                selected_splitk = splitk
+                selected_tile_k = tile_k
+                selected_score = score
+            if num_tg > meanwhile_tg * 2:
+                break
+
+    m_blocks = (m + tile_m - 1) // tile_m
+    tile_n = 16 if num_cu * 2 > m_blocks * selected_splitk else 32
+    return selected_splitk, tile_m, tile_n, selected_tile_k
+
+
+# Per-chip tuned config registry, keyed by (gfx_arch, cu_num).
+# Each entry: (m, hidden_size, num_cu) -> (splitk, tile_m, tile_n, tile_k).
+_MHC_FUSED_POST_PRE_CONFIG = {
+    ("gfx950", 256): _mhc_fused_config_gfx950_256,
+}
+
+
+@functools.lru_cache(maxsize=1024)
+def get_mhc_fused_post_pre_config(
+    m: int, hidden_size: int
+) -> tuple[int, int, int, int]:
+    """Select (split_k, tile_m, tile_n, tile_k) for the fused post+pre GEMM.
+
+    Looks up a per-chip tuned policy keyed by (gfx_arch, cu_num); falls back to a
+    conservative default for untuned chips. K = hidden_size per stream.
+    """
+    num_cu = get_cu_num()
+    try:
+        arch = get_gfx_runtime()
+    except Exception:
+        arch = "unknown"
+    policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
+    return policy(m, hidden_size, num_cu)
 
 
 def mhc_pre_fake(
@@ -253,6 +342,8 @@ def mhc_fused_post_pre_gemm_sqrsum(
     post_layer_mix: Tensor,
     comb_res_mix: Tensor,
     fn: Tensor,
+    tile_m: int = 16,  # 16, 32 or 64
+    tile_n: int = 32,  # 16 or 32
     tile_k: int = 32,  # 32 or 64
 ) -> None: ...
 
@@ -340,7 +431,9 @@ def mhc_fused_post_pre(
         f"got {tuple(comb_res_mix.shape)}"
     )
 
-    selected_splitk, selected_tile_k = get_mhc_fused_post_pre_splitk(m, hidden_size)
+    selected_splitk, selected_tile_m, selected_tile_n, selected_tile_k = (
+        get_mhc_fused_post_pre_config(m, hidden_size)
+    )
     n_splits = selected_splitk * hc_mult
     device = layer_input.device
 
@@ -360,6 +453,8 @@ def mhc_fused_post_pre(
         post_layer_mix,
         comb_res_mix,
         fn,
+        selected_tile_m,
+        selected_tile_n,
         selected_tile_k,
     )
 

@@ -2048,6 +2048,8 @@ namespace py = pybind11;
           py::arg("post_layer_mix"),            \
           py::arg("comb_res_mix"),              \
           py::arg("fn"),                        \
+          py::arg("tile_m") = 16,               \
+          py::arg("tile_n") = 32,               \
           py::arg("tile_k") = 32);
 #define CAUSAL_CONV1D_UPDATE_PYBIND                                            \
     m.def("causal_conv1d_update",                                              \
