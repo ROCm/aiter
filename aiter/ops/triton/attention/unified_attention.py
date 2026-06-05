@@ -108,56 +108,29 @@ def select_3d_config(
     num_segments = 0
     attn_stages = 2
     if IS_DEVICE_ARCH_GFX12 and shuffled_kv_cache and head_size < 128:
-        attn_warps = 1
-        waves_per_eu = 2
+        TILE_SIZE = block_size
+        if kv_cache_dtype != torch.uint8:
+            if block_size <= 64:
+                attn_warps = 1
+                waves_per_eu = 2
+            else:
+                attn_warps = 1
+                waves_per_eu = 1
+                attn_stages = 1
+        else:
+            assert block_size == 128, "FP4 KV cache only supports block_size 128"
         occ = waves_per_eu * 4 // attn_warps
         target_num_prgms = 256 * occ
-        if kv_cache_dtype != torch.uint8:
-            TILE_SIZE = min(64, triton.next_power_of_2(block_size))
-        else:
-            TILE_SIZE = 128
-        MAX_SEGMENTS = min(1, math.ceil(max_seqlen_k / max(TILE_SIZE, block_size)))
+        # target_num_prgms = 256 * occ // 8
+        MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
         num_segments = max(1, target_num_prgms // max(1, num_2d_prgms))
         num_segments = min(MAX_SEGMENTS, num_segments)
         num_segments = triton.next_power_of_2(num_segments)
-        print(f"{num_segments=}")
-        # if kv_cache_dtype == torch.bfloat16:
-        #     if num_2d_prgms >= 2048:
-        #         attn_warps = 1
-        #         waves_per_eu = 2
-        #         if IS_DEVICE_ARCH_GFX12:
-        #             num_segments = 1
-        #     else:
-        #         attn_warps = 1
-        #         waves_per_eu = 2
-        #         num_segments = 8
-        # elif kv_cache_dtype == e4m3_dtype:
-        #     if num_2d_prgms >= 2048:
-        #         attn_warps = 1
-        #         waves_per_eu = 2
-        #         if IS_DEVICE_ARCH_GFX12:
-        #             num_segments = 1
-        #     else:
-        #         attn_warps = 1
-        #         waves_per_eu = 2
-        #         num_segments = 8
-        # else:
-        #     assert (
-        #         block_size == 128
-        #     ), "Only block_size == 128 is supported for FP4 KV cache"
-        #     if num_2d_prgms >= 2048:
-        #         attn_warps = 1
-        #         waves_per_eu = 2
-        #         if IS_DEVICE_ARCH_GFX12:
-        #             num_segments = 1
-        #     else:
-        #         attn_warps = 1
-        #         waves_per_eu = 2
-        #         num_segments = 8
+        print(f"{target_num_prgms=} {num_2d_prgms=} {num_segments=}")
 
     occ = waves_per_eu * 4 // attn_warps
     target_num_prgms = target_num_prgms * occ
-    
+
     TILE_SIZE = min(64, triton.next_power_of_2(block_size))
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
@@ -199,7 +172,9 @@ def select_3d_config(
         num_segments = max(1, num_segments // NUM_BLOCKS_GATHER_PER_TILE)
         TILE_SIZE = block_size * NUM_BLOCKS_GATHER_PER_TILE
     elif TILE_SIZE > block_size:
-        assert TILE_SIZE % block_size == 0, "TILE_SIZE needs to be divisible by block_size"
+        assert (
+            TILE_SIZE % block_size == 0
+        ), "TILE_SIZE needs to be divisible by block_size"
         NUM_BLOCKS_GATHER_PER_TILE = TILE_SIZE // block_size
 
     attn_config = {
@@ -209,6 +184,7 @@ def select_3d_config(
         "waves_per_eu": waves_per_eu,
         "num_stages": attn_stages,
     }
+    print(attn_config)
 
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
