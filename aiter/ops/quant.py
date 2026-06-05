@@ -358,7 +358,7 @@ def per_group_quant_hip(
     device = x.device
     if scale is None:
         scale = torch.empty(
-            (*shape[:-1], (shape[-1] + group_size - 1) // group_size), dtype=dtypes.fp32, device=device
+            (*shape[:-1], shape[-1] // group_size), dtype=dtypes.fp32, device=device
         )
     else:
         raise ValueError("unsupported: static per token quant")
@@ -367,14 +367,7 @@ def per_group_quant_hip(
         64,
         128,
     ], f"unsupported group size {group_size=}, only support [32, 64, 128]"
-    # Pad last dim when numel is not divisible by group_size (e.g. inter_dim=160
-    # with Silu topk=9: M*9*160 % 128 != 0 for M%4 != 0). Zero-padding does not
-    # affect absmax scales and the padded quantized values are trimmed afterwards.
-    need_pad = shape[-1] % group_size != 0
-    if need_pad:
-        padded_last = ((shape[-1] + group_size - 1) // group_size) * group_size
-        x = torch.nn.functional.pad(x, (0, padded_last - shape[-1]))
-    y = torch.empty(x.shape, dtype=quant_dtype, device=device)
+    y = torch.empty(shape, dtype=quant_dtype, device=device)
     dynamic_per_token_scaled_quant(
         y,
         x.view(-1, group_size),
@@ -383,8 +376,6 @@ def per_group_quant_hip(
         num_rows=num_rows,
         num_rows_factor=num_rows_factor,
     )
-    if need_pad:
-        y = y[..., :shape[-1]].contiguous()
     return y, scale
 
 
