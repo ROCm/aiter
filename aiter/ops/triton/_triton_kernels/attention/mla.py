@@ -403,11 +403,13 @@ def _mla_decode_fwd_kernel(
     offs_rope_head_dim = tl.arange(0, QK_ROPE_HEAD_DIM)
     offs_t = tl.arange(0, TILE_SIZE)
 
-    offs_kv_lora_shfl = None
-    offs_kv_rope_shfl = None
+    offs_lora_rank_shfl = None
+    offs_rope_head_dim_shfl = None
+    offs_t_shfl = None
     if SHUFFLED_KV_CACHE:
-        offs_kv_lora_shfl = tl.arange(0, TILE_SIZE * KV_LORA_RANK)
-        offs_kv_rope_shfl = tl.arange(0, TILE_SIZE * QK_ROPE_HEAD_DIM)
+        offs_lora_rank_shfl = tl.arange(0, KV_LORA_RANK * 16)
+        offs_rope_head_dim_shfl = tl.arange(0, QK_ROPE_HEAD_DIM * 16)
+        offs_t_shfl = tl.arange(0, TILE_SIZE // 16)
 
     if IS_KV_FP8:
         K_WIDTH: tl.constexpr = 16
@@ -482,12 +484,17 @@ def _mla_decode_fwd_kernel(
                 physical_block_idx * stride_kv_buffer_0
                 + kv_head_idx * stride_kv_buffer_1
             )
-            kv_lora_offset = kv_offset + offs_kv_lora_shfl[None, :] * stride_kv_buffer_3
+            kv_lora_offset = (
+                kv_offset
+                + offs_t_shfl[:, None] * (KV_LORA_RANK * 16) * stride_kv_buffer_3
+                + offs_lora_rank_shfl[None, :] * stride_kv_buffer_3
+            )
 
             k_rope_offset = (
                 kv_offset
-                + (TILE_SIZE * KV_LORA_RANK + offs_kv_rope_shfl)[None, :]
-                * stride_kv_buffer_3
+                + (TILE_SIZE * KV_LORA_RANK) * stride_kv_buffer_3
+                + offs_t_shfl[:, None] * (QK_ROPE_HEAD_DIM * 16) * stride_kv_buffer_3
+                + offs_rope_head_dim_shfl[None, :] * stride_kv_buffer_3
             )
         else:
             kv_offset = (
@@ -639,6 +646,8 @@ def _mla_decode_fwd_reduce_kernel(
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # int
+    FP8_MIN: tl.constexpr = float8_info.min,
+    FP8_MAX: tl.constexpr = float8_info.max,
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -700,10 +709,13 @@ def _mla_decode_fwd_reduce_kernel(
     if out_scale_ptr is not None:
         acc = acc * out_scale
 
+    if output_ptr.type.element_ty.is_fp8():
+        acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+
     # write result
     output_offset = (
         query_token_idx * output_stride_0
         + query_head_idx * output_stride_1
         + tl.arange(0, KV_LORA_RANK)
     )
-    tl.store(output_ptr + output_offset, acc)
+    tl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))

@@ -9,6 +9,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import (
     _moe_gemm_a8w8,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 # -----------------------------------------------------------------------------
@@ -71,7 +72,6 @@ def get_kernel_config(m, n, k, routing_data):
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     arch = get_arch()
-    num_stages = 1 if arch == "gfx950" else 2
 
     split_k = 1
     if block_m == 16:
@@ -92,6 +92,9 @@ def get_kernel_config(m, n, k, routing_data):
         block_n = 256
         block_k = 256
         num_warps = 8
+    num_stages = pick_gemm_num_stages(
+        arch, block_m, block_n, block_k, 8, 8, use_async_padding=True
+    )
 
     ret = {
         "block_m": block_m,
@@ -146,7 +149,7 @@ def moe_gemm_a8w8(
     apply_swiglu=False,
     alpha=1.0,
     limit=1.0,
-    add_residual=True,
+    swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
 ):
@@ -264,7 +267,7 @@ def moe_gemm_a8w8(
         alpha,
         limit,
         reduction_n_matmul,
-        add_residual,
+        swiglu_add_residual,
         routing_data.n_expts_act,
         config["block_m"],
         config["block_n"],
@@ -298,7 +301,7 @@ def moe_gemm_a8w8(
         limit,
         reduction_n_reduction,
         out_dtype=out_dtype,
-        add_residual=add_residual,
+        swiglu_add_residual=swiglu_add_residual,
     )
     return y_final
 

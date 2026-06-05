@@ -1310,7 +1310,9 @@ def _flash_attn_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
-        ret = alibi_slopes is None
+        # fmha v3 is hand-written gfx9 ASM; non-gfx9 must fall back to ck-tile.
+        ret = get_gfx() in ("gfx942", "gfx950")
+        ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (hdim_v == 128)
@@ -2096,7 +2098,10 @@ def _flash_attn_varlen_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
-        ret = alibi_slopes is None
+        # fmha v3 varlen is hand-written gfx9 ASM; non-gfx9 must fall back to
+        # ck-tile (mha_varlen_fwd, the else branch below).
+        ret = get_gfx() in ("gfx942", "gfx950")
+        ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (hdim_v == 128)

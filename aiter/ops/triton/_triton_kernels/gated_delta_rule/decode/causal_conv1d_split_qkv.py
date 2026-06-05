@@ -1009,7 +1009,6 @@ def causal_conv1d_update_split_qkv(
     _, width = weight.shape
     num_cache_lines, _, state_len = conv_state.size()
 
-    # ???? buffer(??????!)
     query = torch.empty(
         (batch, key_dim, seqlen),
         dtype=x.dtype,
@@ -1035,8 +1034,6 @@ def causal_conv1d_update_split_qkv(
 
     BLOCK_N = 256
     grid = (batch, triton.cdiv(dim, BLOCK_N))
-
-    # print(f"@@@@@@@ causal_conv1d_update_split_qkv {dim=}, {BLOCK_N=}, {batch=}")
 
     # Select kernel based on flags
     if use_gluon:
