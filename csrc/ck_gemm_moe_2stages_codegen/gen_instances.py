@@ -345,53 +345,24 @@ A8W8_blockscale_gemm1_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
-        if (inter_dim % 128 != 0 && inter_dim % 64 == 0)
+        if (block_m == 16)
         {{
-            // NPerBlock=64: inter_dim is 64-aligned but not 128-aligned (e.g. tp=4 inter_dim=320)
-            // scale index block_n_id*64/128 (integer div) maps pairs of tiles to one per_1x128 scale
-            if (block_m == 16)
-            {{
-                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 64, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
-            }}
-            else if (block_m == 32)
-            {{
-                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
-            }}
-            else if (block_m == 64)
-            {{
-                // V1 used instead of V3: V3 requires MRepeat>=4, but MPerBlock=64,MWaves=1 gives MRepeat=4 (borderline)
-                // NWaves=4 gives NXdlPerWave=1 (acceptable tradeoff for correctness)
-                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
-            }}
-            else
-            {{
-                TORCH_CHECK(
-                    false,
-                    "Unsupported block_m value for NPerBlock=64 blockscale dispatch: ",
-                    block_m);
-            }}
+            return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else if (block_m == 32)
+        {{
+            return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else if (block_m == 64)
+        {{
+            return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
         }}
         else
         {{
-            if (block_m == 16)
-            {{
-                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
-            }}
-            else if (block_m == 32)
-            {{
-                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
-            }}
-            else if (block_m == 64)
-            {{
-                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
-            }}
-            else
-            {{
-                TORCH_CHECK(
-                    false,
-                    "Unsupported block_m value for moe heuristic dispatch: ",
-                    block_m);
-            }}
+            TORCH_CHECK(
+                false,
+                "Unsupported block_m value for moe heuristic dispatch: ",
+                block_m);
         }}
     }}
 """
