@@ -2,6 +2,7 @@ import torch
 import pytest
 from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import batched_gemm_afp4wfp4
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.utility.fp4_utils import e8m0_to_f32
 from typing import Union
 
 # Note this is specified by the HW and cannot be changed.
@@ -160,12 +161,6 @@ def mxfp4_to_f32(x):
     ]
     mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device="cuda")
     return mxfp4_in_f32[x.long()]
-
-
-def e8m0_to_f32(x):
-    x_f32 = 2 ** ((x - 127).to(torch.float32))
-    x_f32[x_f32 == 128] = float("nan")
-    return x_f32
 
 
 def run_torch(x, w, x_scales, w_scales, dtype):

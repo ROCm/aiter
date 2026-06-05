@@ -7,6 +7,7 @@ from enum import Enum
 from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils import types
+from aiter.utility.fp4_utils import e8m0_to_f32
 from typing import Union
 
 # Debug
@@ -237,12 +238,6 @@ def mxfp4_to_f32(x):
     x[:, 1::2] = x[:, 1::2] >> 4
     mxfp4_in_f32 = torch.tensor(MXFP4_TABLE, dtype=torch.float32, device="cuda")
     return mxfp4_in_f32[x.long()]
-
-
-def e8m0_to_f32(x):
-    x_f32 = 2 ** ((x.to(torch.float32) - 127))
-    x_f32[x == 128] = float("nan")
-    return x_f32
 
 
 def dequantize_fp8(x_quantized, x_scales, dtype=torch.float32):

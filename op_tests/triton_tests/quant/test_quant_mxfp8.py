@@ -14,6 +14,7 @@ from aiter.ops.triton.quant.fused_mxfp8_quant import (
     fused_flatten_mxfp8_quant,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.utility.fp4_utils import e8m0_to_f32
 
 QUANT_BLOCK_SIZE = 32
 LEGACY_BLOCK_SIZE = 128
@@ -48,10 +49,6 @@ def torch_mxfp8_quant_from_fp32(x_fp32: torch.Tensor):
     y_fp8 = qx.to(torch.float8_e4m3fn)
     s = scale_e8m0.reshape(M, Ng)
     return y_fp8, s
-
-
-def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
-    return torch.exp2((x.to(torch.int32) - 127).to(torch.float32))
 
 
 # -----------------------------------------------------------------------------

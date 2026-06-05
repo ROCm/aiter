@@ -10,16 +10,12 @@ from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
 )
 from aiter.ops.shuffle import shuffle_weight
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.utility.fp4_utils import e8m0_to_f32
 
 SCALE_GROUP_SIZE = 32  # A: 1x32 e8m0 scale group
 W_SCALE_K_GROUP = 128  # B: 128 in K direction
 W_SCALE_N_GROUP = 128  # B: 128 in N direction
 FP8_MAX = 448.0  # e4m3 max
-
-
-def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
-    """Decode unsigned-biased e8m0 (uint8) to fp32. Bias 127, value = 2^(b-127)."""
-    return torch.exp2((x.to(torch.int32) - 127).to(torch.float32))
 
 
 def generate_inputs(M: int, N: int, K: int, shuffle: bool = False):
