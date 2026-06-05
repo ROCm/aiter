@@ -472,8 +472,6 @@ def unified_attention(
             segm_expsum = out  # dummy ptr
 
         if IS_DEVICE_ARCH_GFX12 and shuffled_kv_cache:
-            print()
-            print("gluon")
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
@@ -540,8 +538,6 @@ def unified_attention(
                 **attn_config,
             )
         else:
-            print()
-            print("triton")
             kernel_unified_attention_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](

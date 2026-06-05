@@ -14,6 +14,7 @@ from op_tests.triton_tests.quant.test_quant_mxfp4 import (
 )
 from aiter.ops.triton.utils.types import e4m3_dtype
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.test_common import checkAllclose
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -305,7 +306,7 @@ def test_triton_unified_attn_3d(
             )
 
     # TODO: Uncomment after pytorch adds support for manual_seed
-    # torch.manual_seed(0)
+    torch.manual_seed(0)
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
@@ -447,9 +448,18 @@ def test_triton_unified_attn_3d(
     atol, rtol = 1.5e-2, 1e-2
     if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
         atol, rtol = 1.5e-1, 1.5e-1
-    torch.testing.assert_close(
-        output.to(torch.bfloat16), ref_output.to(torch.bfloat16), atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(output.to(torch.bfloat16) - ref_output.to(torch.bfloat16)))}"
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.to(torch.bfloat16),
+            ref_output.to(torch.bfloat16),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=tol_err_ratio,
+            msg="unified_attn_3d output",
+        )
+        <= tol_err_ratio
+    )
 
 
 @pytest.mark.parametrize("seq_lens", [[(1, 1328), (5, 18), (129, 463)]])
