@@ -102,6 +102,9 @@ def select_3d_config(
     shuffled_kv_cache: bool = False,
     NUM_BLOCKS_GATHER_PER_TILE: int = 1,
 ):
+    # TODO: wait for Triton compiler to support ds_load_tr4 before we can include torch.uint8 kv_cache_dtype
+    # assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, torch.uint8, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8})"
+    assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
     reduce_num_warps = 2
     attn_warps = 2
     waves_per_eu = 2
@@ -109,8 +112,16 @@ def select_3d_config(
     attn_stages = 2
     if IS_DEVICE_ARCH_GFX12 and shuffled_kv_cache and head_size < 128:
         TILE_SIZE = block_size
-        if kv_cache_dtype != torch.uint8:
+        if kv_cache_dtype == torch.bfloat16:
             if block_size <= 64:
+                attn_warps = 1
+                waves_per_eu = 2
+            else:
+                attn_warps = 1
+                waves_per_eu = 1
+                attn_stages = 1
+        elif kv_cache_dtype == e4m3_dtype:
+            if block_size <= 128:
                 attn_warps = 1
                 waves_per_eu = 2
             else:
@@ -119,14 +130,13 @@ def select_3d_config(
                 attn_stages = 1
         else:
             assert block_size == 128, "FP4 KV cache only supports block_size 128"
+            attn_warps = 1
+            waves_per_eu = 2
         occ = waves_per_eu * 4 // attn_warps
-        target_num_prgms = 256 * occ
-        # target_num_prgms = 256 * occ // 8
         MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
-        num_segments = max(1, target_num_prgms // max(1, num_2d_prgms))
+        num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
         num_segments = min(MAX_SEGMENTS, num_segments)
         num_segments = triton.next_power_of_2(num_segments)
-        print(f"{target_num_prgms=} {num_2d_prgms=} {num_segments=}")
 
     occ = waves_per_eu * 4 // attn_warps
     target_num_prgms = target_num_prgms * occ
@@ -184,7 +194,6 @@ def select_3d_config(
         "waves_per_eu": waves_per_eu,
         "num_stages": attn_stages,
     }
-    print(attn_config)
 
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
@@ -441,7 +450,7 @@ def unified_attention(
             segm_output = out
             segm_max = out  # dummy ptr
             segm_expsum = out  # dummy ptr
-
+        print(f"{attn_config=}")
         if IS_DEVICE_ARCH_GFX12:
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
