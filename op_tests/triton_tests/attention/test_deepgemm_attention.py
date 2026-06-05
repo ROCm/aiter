@@ -106,8 +106,7 @@ def make_paged_inputs(
     var_ratio: float = 0.0,
     qk_datatype: torch.dtype = dtypes.fp8,
 ):
-    """Build inputs for paged MQA logits kernels.
-    """
+    """Build inputs for paged MQA logits kernels."""
     max_model_len = 2 * avg_kv_length
 
     context_lens = (
@@ -223,11 +222,13 @@ def apply_preshuffle(kv_cache_fp8: torch.Tensor, blocksize: int, index_dim: int)
 
 # Representative shape set: covers single-batch decode, MTP, and multi-batch decode.
 _PAGED_SHAPES = [
+    (1, 1, 64, 128, 345),
     (1, 1, 64, 128, 1024),
     (1, 2, 64, 128, 1024),
     (2, 1, 64, 128, 2048),
     (2, 2, 64, 128, 2048),
     (4, 2, 64, 128, 4096),
+    (4, 2, 64, 128, 4167),
 ]
 
 
@@ -253,12 +254,12 @@ def test_deepgemm_fp8_paged_mqa_logits(
     var_ctx_opt: bool,
     padding: bool,
 ) -> None:
+    torch.manual_seed(0)
+    random.seed(0)
+
     # Non-preshuffle path has no varctx kernel (lacks safe_chunks_per_cta_ptr).
     if var_ctx_opt and not preshuffle:
         pytest.skip("var_ctx_opt requires preshuffle")
-
-    torch.manual_seed(0)
-    random.seed(0)
 
     ChunkK = 128
     WavePerEU = 5
@@ -271,6 +272,7 @@ def test_deepgemm_fp8_paged_mqa_logits(
         avg_kv_length,
         blocksize=blocksize,
         padding=padding,
+        var_ratio=0.9,
     )
 
     q = inputs["q"]
@@ -358,6 +360,7 @@ def test_deepgemm_fp8_paged_mqa_logits_ragged(
         avg_kv_length,
         blocksize=1,
         padding=False,
+        var_ratio=0.9,
     )
 
     q = inputs["q"]
