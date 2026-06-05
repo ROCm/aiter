@@ -753,19 +753,44 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             (E, max_m, model_dim // 32), 127, dtype=torch.uint8, device=device
         )
 
-    _grouped_dbg("start route gather")
-    for e in range(E):
-        mask = flat_experts == e
-        n = int(counts[e].item())
-        if n == 0:
-            continue
-        toks = flat_tokens[mask]
-        grouped_a1[e, :n].copy_(a1_payload[toks])
-        if a1_scale_token_u8 is not None:
-            a1_scale_raw[e, :n].copy_(a1_scale_token_u8[toks])
-        route_tokens[e, :n].copy_(toks)
-        route_weights[e, :n].copy_(flat_weights[mask])
-    _grouped_dbg("route gather done")
+    # One-pass route-gather (default): a single FlyDSL kernel copies each token's
+    # payload/scale into the grouped layout (writing only valid rows, so the
+    # pre-filled a1_scale_raw=127 padding is preserved). Set
+    # AITER_GROUPED_GEMM_NAIVE=1 to fall back to the naive per-expert copy loop.
+    _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
+    if not _use_naive:
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_scatter_copy_token
+
+        _grouped_dbg("start route gather (scatter-copy kernel)")
+        flydsl_moe_scatter_copy_token(
+            a1_payload,
+            a1_scale_token_u8,
+            flat_experts,
+            flat_tokens,
+            flat_weights,
+            counts,
+            E,
+            max_m,
+            grouped_a1=grouped_a1,
+            a1_scale_raw=a1_scale_raw,
+            route_tokens=route_tokens,
+            route_weights=route_weights,
+        )
+        _grouped_dbg("route gather done")
+    else:
+        _grouped_dbg("start route gather (naive)")
+        for e in range(E):
+            mask = flat_experts == e
+            n = int(counts[e].item())
+            if n == 0:
+                continue
+            toks = flat_tokens[mask]
+            grouped_a1[e, :n].copy_(a1_payload[toks])
+            if a1_scale_token_u8 is not None:
+                a1_scale_raw[e, :n].copy_(a1_scale_token_u8[toks])
+            route_tokens[e, :n].copy_(toks)
+            route_weights[e, :n].copy_(flat_weights[mask])
+        _grouped_dbg("route gather done")
 
     grouped_w1 = (w1 if w1.dtype == torch.uint8 else w1.view(torch.uint8)).contiguous()
     grouped_w2 = (w2 if w2.dtype == torch.uint8 else w2.view(torch.uint8)).contiguous()

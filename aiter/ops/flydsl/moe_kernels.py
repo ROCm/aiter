@@ -1580,12 +1580,19 @@ def flydsl_moe_scatter_copy_token(
     counts: torch.Tensor,                      # (E,)
     E: int,
     max_m: int,
+    grouped_a1: Optional[torch.Tensor] = None,    # (E, max_m, Wp) uint8 out
+    a1_scale_raw: Optional[torch.Tensor] = None,  # (E, max_m, Ws) uint8 out
+    route_tokens: Optional[torch.Tensor] = None,  # (E, max_m) long out
+    route_weights: Optional[torch.Tensor] = None, # (E, max_m) dtype out
 ):
     """One-pass route-gather into the grouped layout. Equivalent to the
-    per-expert ``index_add_``-free copy loop in fused_moe.
+    per-expert copy loop in fused_moe.
 
-    Returns (grouped_a1, a1_scale_raw, route_tokens, route_weights). Unused
-    grouped rows are left zero (payload/scale) / zero (route tensors)."""
+    Output tensors may be passed in (the kernel writes only the mapped/valid
+    rows, leaving any pre-existing padding untouched -- e.g. an a1_scale_raw
+    pre-filled with 127). When omitted they are allocated zero-filled.
+
+    Returns (grouped_a1, a1_scale_raw, route_tokens, route_weights)."""
     device = a1_payload.device
     Wp = a1_payload.shape[1]
 
@@ -1599,13 +1606,16 @@ def flydsl_moe_scatter_copy_token(
     dst_src = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
     dst_src[dst_keep] = src_keep.to(torch.int32)
 
-    route_tokens = torch.zeros((E, max_m), dtype=torch.long, device=device)
-    route_weights = torch.zeros((E, max_m), dtype=flat_weights.dtype, device=device)
-    route_tokens.view(-1)[dst_keep] = src_keep
-    route_weights.view(-1)[dst_keep] = w_sorted[keep]
+    if route_tokens is None:
+        route_tokens = torch.zeros((E, max_m), dtype=torch.long, device=device)
+    if route_weights is None:
+        route_weights = torch.zeros((E, max_m), dtype=flat_weights.dtype, device=device)
+    route_tokens.view(-1)[dst_keep] = src_keep.to(route_tokens.dtype)
+    route_weights.view(-1)[dst_keep] = w_sorted[keep].to(route_weights.dtype)
 
     num_dst = E * max_m
-    grouped_a1 = torch.zeros((E, max_m, Wp), dtype=torch.uint8, device=device)
+    if grouped_a1 is None:
+        grouped_a1 = torch.zeros((E, max_m, Wp), dtype=torch.uint8, device=device)
     launch_p = _get_compiled_scatter_copy(Wp)
     launch_p(
         a1_payload.contiguous().view(-1, Wp),
@@ -1615,10 +1625,10 @@ def flydsl_moe_scatter_copy_token(
         stream=torch.cuda.current_stream(),
     )
 
-    a1_scale_raw = None
     if a1_scale_token_u8 is not None:
         Ws = a1_scale_token_u8.shape[1]
-        a1_scale_raw = torch.zeros((E, max_m, Ws), dtype=torch.uint8, device=device)
+        if a1_scale_raw is None:
+            a1_scale_raw = torch.zeros((E, max_m, Ws), dtype=torch.uint8, device=device)
         launch_s = _get_compiled_scatter_copy(Ws)
         launch_s(
             a1_scale_token_u8.contiguous().view(-1, Ws),
