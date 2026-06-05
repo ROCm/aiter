@@ -66,12 +66,12 @@ jobs:
           tar \
             --exclude=".git" \
             --exclude="*/.git" \
-            --exclude="dist" \
-            --exclude="build" \
-            --exclude="aiter_meta" \
-            --exclude="*.egg-info" \
+            --exclude="./dist" \
+            --exclude="./build" \
+            --exclude="./aiter_meta" \
+            --exclude="./*.egg-info" \
             --exclude=".aiter-prebuild.*" \
-            --exclude="triton_wheels" \
+            --exclude="./triton_wheels" \
             --exclude="${SOURCE_ARCHIVE}" \
             -czf "${SOURCE_ARCHIVE}" .
 
