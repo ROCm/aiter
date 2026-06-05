@@ -131,8 +131,15 @@ TESTS = [
         "timeout_minutes": 130,
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm5-mxfp4 --nightly --timeout-per-file 5400",
-        "run_on_pr": True,
-        "run_on_schedule": True,
+        # Disabled pending model staging. Verified failure mode: amd/GLM-5-MXFP4
+        # is NOT on the runner /models cache, so the test falls back to a ~90GB HF
+        # download that does not finish inside the 90-min job timeout (server never
+        # reaches ready; scheduler watchdog timeouts; "Fail. Time elapsed:
+        # 5405s"). NOT a DSA hang or AITER bug. Flip both to True once
+        # amd/GLM-5-MXFP4 is staged on /models (same place DeepSeek-R1-MXFP4 etc.
+        # live) so the gate resolves via GLM5_MXFP4_MODEL_PATH and runs fast.
+        "run_on_pr": False,
+        "run_on_schedule": False,
     },
 ]
 
