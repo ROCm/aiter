@@ -1884,31 +1884,28 @@ namespace aiter {
         MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(block_size, tile_m, tile_n, tile_k, false); \
     }
 
+#define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_CASE(TM, TN, TK) \
+    if (tile_m == TM && tile_n == TN && tile_k == TK) { \
+        MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, TM, TN, TK); \
+    } else
+
+// Explicit (tile_m, tile_n, tile_k) selection. The Python config picker chooses the
+// combo per (arch, cu_num, m); the kernel just instantiates it. Excluded combos:
+// tile_m=64 + tile_k=64 (s_residual = 2*64*hc_mult*64*2B = 64KB, over LDS budget).
 #define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k) \
-    if (tile_k == 32) { \
-        if (cu_num * 2 > m_blocks * split_k) { \
-            int nb = (hc_mult3 + 15) / 16; \
-            if ((m + 31) / 32 * nb * split_k >= cu_num) { \
-                MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 32, 16, 32); \
-            } else { \
-                MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 16, 32); \
-            } \
-        } else { \
-            int nb = (hc_mult3 + 31) / 32; \
-            if ((m + 31) / 32 * nb * split_k >= cu_num) { \
-                MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 32, 32, 32); \
-            } else { \
-                MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 32, 32); \
-            } \
-        } \
-    } else if (tile_k == 64) { \
-        if (cu_num * 2 > m_blocks * split_k) { \
-            MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 16, 64); \
-        } else { \
-            MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 32, 64); \
-        } \
-    } else { \
-        TORCH_CHECK(false, "tile_k must be 32 or 64"); \
+    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_CASE(16, 16, 32) \
+    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_CASE(16, 32, 32) \
+    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_CASE(32, 16, 32) \
+    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_CASE(32, 32, 32) \
+    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_CASE(64, 16, 32) \
+    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_CASE(64, 32, 32) \
+    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_CASE(16, 16, 64) \
+    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_CASE(16, 32, 64) \
+    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_CASE(32, 16, 64) \
+    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_CASE(32, 32, 64) \
+    { \
+        TORCH_CHECK(false, "unsupported (tile_m, tile_n, tile_k) = (", \
+                    tile_m, ", ", tile_n, ", ", tile_k, ")"); \
     }
 
     void mhc_fused_post_pre_gemm_sqrsum(
@@ -1920,6 +1917,8 @@ namespace aiter {
         torch::Tensor& post_layer_mix,  // (m, hc_mult)
         torch::Tensor& comb_res_mix,    // (m, hc_mult, hc_mult)
         torch::Tensor& fn,              // (hc_mult3, hc_mult * hidden_size)
+        int tile_m = 16,
+        int tile_n = 32,
         int tile_k = 32)
     {
         int m = layer_input.size(0);

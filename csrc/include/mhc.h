@@ -54,5 +54,7 @@ void mhc_fused_post_pre_gemm_sqrsum(
     torch::Tensor& post_layer_mix,  // (m, hc_mult)
     torch::Tensor& comb_res_mix,    // (m, hc_mult, hc_mult)
     torch::Tensor& fn,              // (hc_mult3, hc_mult * hidden_size)
+    int tile_m                       = 16,
+    int tile_n                       = 32,
     int tile_k                       = 32);
 } // namespace aiter
