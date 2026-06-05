@@ -33,8 +33,25 @@ GFX942_TRAITS_NAME = "opus_gemm_a16w16_traits"
 # gfx942 a16w16 family supports only the 16x16x16 BF16 MFMA shape.
 VALID_GFX942_BF16_MFMA = {(16, 16, 16)}
 
+# SplitK tags normally use host tile geometry; overrides remap device traits.
+GFX942_SPLITK_TRAITS_OVERRIDES = {
+    "a16w16_em3en4_lds1_pgr2_sk": {
+        "block": (96, 128),
+        "lds_depth": 1,
+    },
+}
+
+
+def _splitk_traits_geometry(k):
+    override = GFX942_SPLITK_TRAITS_OVERRIDES.get(k.kernel_tag)
+    if override is None:
+        return k.B_M, k.B_N, 2
+    trait_bm, trait_bn = override["block"]
+    return trait_bm, trait_bn, override["lds_depth"]
+
 PIPELINE_HEADER_MAP = {
     "a16w16_fused_reduce": _gfx942_pipeline("a16w16_fused_reduce"),
+    "a16w16_em3en4_lds1_pgr2_sk": _gfx942_pipeline("a16w16_em3en4_lds1_pgr2_sk"),
     "a16w16_kbuf1_large_tile": _gfx942_pipeline("a16w16_kbuf1_large_tile"),
     **{nosplit: _gfx942_pipeline(nosplit) for nosplit in _NOSPLIT},
     **{
@@ -48,6 +65,7 @@ TRAITS_NAME_MAP = {tag: GFX942_TRAITS_NAME for tag in _GFX942_A16W16_TAGS}
 
 KARGS_NAME_MAP = {
     "a16w16_fused_reduce": "opus_gemm_splitk_fused_kargs",
+    "a16w16_em3en4_lds1_pgr2_sk": "opus_gemm_splitk_kargs",
     "a16w16_kbuf1_large_tile": "opus_gemm_noscale_kargs",
     **{tag: "opus_gemm_splitk_kargs" for tag in _SPLITK},
     **{tag: "opus_gemm_noscale_kargs" for tag in _NOSPLIT},
@@ -55,6 +73,7 @@ KARGS_NAME_MAP = {
 
 KERNEL_FUNC_MAP = {
     "a16w16_fused_reduce": "gemm_a16w16_fused_reduce_kernel",
+    "a16w16_em3en4_lds1_pgr2_sk": "gemm_a16w16_em3en4_lds1_pgr2_sk_kernel",
     "a16w16_kbuf1_large_tile": "gemm_a16w16_kbuf1_large_tile_kernel",
     # gfx942 paired tags: nosplit_tag's kernel symbol; splitk_tag reuses it.
     **{nosplit: f"gemm_{nosplit}_kernel" for nosplit in W3_KERNEL_PAIRS.keys()},
@@ -95,15 +114,17 @@ def gen_splitk_gfx942_instance(
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
 
-    # gfx942 a16w16_traits: 6 params <BLOCK_SIZE, BLOCK, DTYPE, VEC, TILE, WAVE>.
+    # gfx942 a16w16_traits: 7 params <BLOCK_SIZE, BLOCK, DTYPE, VEC, TILE, WAVE, LDS_DEPTH=2>.
+    trait_bm, trait_bn, lds_depth = _splitk_traits_geometry(k)
     traits_aliases = f"""
 template <typename D_C>
 using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
-    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::seq<{trait_bm}, {trait_bn}, {k.B_K}>,
     opus::tuple<{da}, {db}, fp32_t, fp32_t>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.T_M}, {k.T_N}, 1>,
-    opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>>;
+    opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
+    {lds_depth}>;
 """
 
     # Per-flavor pieces (workspace alloc + reduce dispatch).
@@ -174,9 +195,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     dim3 grid_reduce_v2(v2_align ? (N / (V2_VEC * V2_BS)) : 1, batch * M, 1);
     dim3 block_reduce_v2(V2_BS);
 
-    // V3: multi-row per wg (BLOCK = N_VEC * ROWS_PER_BLOCK = 64, 1 full wave).
-    // Dispatch picks the (N_VEC, ROWS) tuple at runtime; supported set is in
-    // V3_NVEC_ROWS (gen_instances.py).
+    // V3: multi-row per wg; supported tuples are in V3_NVEC_ROWS.
     const int v3_n_vec = N / V2_VEC;
 """
             if v2_enabled
@@ -201,7 +220,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
                     kw = "if" if first else "else if"
                     first = False
                     branches.append(
-                        f"""            {kw} (v2_align && v3_n_vec == {nvec} && (M % {rows} == 0) && split_k == {sk}) {{{{{{{{
+                    f"""            {kw} (v2_align && v3_n_vec == {nvec} && (M % {rows} == 0) && split_k == {sk}) {{{{{{{{
             dim3 grid_v3(1, M / {rows}, batch);
             dim3 block_v3({block_size});
             splitk_reduce_kernel_v3<{sk}, {nvec}, {rows}, V2_VEC, __bf16, {{hb}}, __bf16>
@@ -629,6 +648,7 @@ _GFX942_SPLITK_TAGS = (
     "a16w16_kbuf2v_sk",
     "a16w16_kbuf2v_bk128_sk",
     "a16w16_kbuf1_sk",
+    "a16w16_em3en4_lds1_pgr2_sk",
     "a16w16_fused_reduce",
 )
 for _tag in _GFX942_SPLITK_TAGS:
@@ -652,6 +672,70 @@ for _tag in _GFX942_NOSPLIT_TAGS:
 
 # gfx942 (CDNA3 / MI300X) hardware LDS budget per WG.
 _GFX942_LDS_PER_WG_BYTES = 64 * 1024
+
+
+def _validate_a16w16_em3en4_gfx942(k: OpusGemmInstance):
+    """Validate gfx942 EM3EN4: host 128x96, device 96x128 LDSB1."""
+    errors = []
+
+    if getattr(k, "arch_prefix", "") != "gfx942":
+        errors.append("EM3EN4 LDS1/PGR2 path is gfx942-only")
+    if k.kernel_tag != "a16w16_em3en4_lds1_pgr2_sk":
+        errors.append(f"kernel_tag={k.kernel_tag} must be a16w16_em3en4_lds1_pgr2_sk")
+    # Host tile is 128M x 96N; device traits are remapped to 96 x 128.
+    if k.BLOCK_SIZE != 256 or (k.B_M, k.B_N) != (128, 96) or k.B_K != 128:
+        errors.append(
+            f"BLOCK=({k.BLOCK_SIZE},{k.B_M},{k.B_N},{k.B_K}) must be (256,128,96,128)"
+        )
+    if (k.T_M, k.T_N) != (2, 2):
+        errors.append(f"T=({k.T_M},{k.T_N}) must be (2,2)")
+    if (k.W_M, k.W_N, k.W_K) != (16, 16, 16):
+        errors.append(f"WAVE=({k.W_M},{k.W_N},{k.W_K}) must be (16,16,16)")
+
+    sizeof_da = 2
+    expected_vec = 16 // sizeof_da
+    if k.VEC_A != expected_vec or k.VEC_B != expected_vec:
+        errors.append(f"VEC_A/B must be {expected_vec}")
+    if k.VEC_C != 4:
+        errors.append("VEC_C must be 4 for fp32 workspace stores")
+
+    # Device traits geometry (physical B_M=96, B_N=128).
+    trait_bm, trait_bn = 96, 128
+    smem_linear_wave = WARP_SIZE * expected_vec
+    smem_sub = smem_linear_wave // k.B_K if k.B_K else 0
+    if not smem_sub or trait_bm % smem_sub or trait_bn % smem_sub:
+        errors.append("B_M/B_N must be divisible by smem_sub")
+
+    E_M = trait_bm // (k.W_M * k.T_M)
+    E_N = trait_bn // (k.W_N * k.T_N)
+    E_K = k.B_K // k.W_K
+    if (E_M, E_N) != (3, 4) or E_K not in (4, 8):
+        errors.append(f"E=({E_M},{E_N},{E_K}) must be (3,4,{{4,8}})")
+
+    agpr_per_mfma = (k.W_M * k.W_N) // WARP_SIZE
+    total_agprs = 4 * E_M * E_N * agpr_per_mfma
+    smem_padding = 16
+    total_lds = (trait_bm + trait_bn) * (k.B_K + smem_padding) * sizeof_da
+    if total_lds > _GFX942_LDS_PER_WG_BYTES:
+        errors.append(
+            f"LDS={total_lds // 1024}KiB exceeds {_GFX942_LDS_PER_WG_BYTES // 1024}KiB"
+        )
+
+    if errors:
+        raise ValueError(
+            f"Invalid a16w16_em3en4 instance '{k.name}':\n"
+            + "\n".join(f"  - {e}" for e in errors)
+        )
+
+    return {
+        "E_M": E_M,
+        "E_N": E_N,
+        "E_K": E_K,
+        "agprs": total_agprs,
+        "vgpr_est": 4 * E_K * (E_M + 2 * E_N) + 80,
+        "lds_bytes": total_lds,
+        "min_k": 2 * k.B_K,
+    }
 
 
 def _validate_a16w16_gfx942(k: OpusGemmInstance):

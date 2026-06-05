@@ -64,11 +64,12 @@ SPLITK_REDUCE_FAST_ARCHES = {"gfx942"}
 # split_k values explicitly instantiated for V2 fast-path (covers tuner range 2..10).
 V2_SUPPORTED_SPLITKS = (2, 3, 4, 5, 6, 7, 8, 10)
 
-# V3 reduce: (N_VEC, ROWS_PER_BLOCK), BLOCK = N_VEC * ROWS_PER_BLOCK = 64 (1 wave).
+# V3 reduce: (N_VEC, ROWS_PER_BLOCK), BLOCK = N_VEC * ROWS_PER_BLOCK.
 V3_NVEC_ROWS = (
     (8, 8),  # N=64,  8 rows/wg
     (16, 4),  # N=128, 4 rows/wg
     (32, 2),  # N=256, 2 rows/wg
+    (48, 4),  # N=384, 4 rows/wg, 3 full waves/wg
     (64, 1),  # N=512, 1 row/wg
 )
 # V4 (8, 32) DEAD 2026-05-30: BLOCK=256 4-wave, 0 wall-time benefit (vmcnt contention).
@@ -243,7 +244,10 @@ class opus_gemm_codegen:
     # -- Instance generation --
 
     def gen_instance(self, k: OpusGemmInstance):
-        from codegen.gen_instances_gfx942 import _validate_a16w16_gfx942
+        from codegen.gen_instances_gfx942 import (
+            _validate_a16w16_gfx942,
+            _validate_a16w16_em3en4_gfx942,
+        )
         from codegen.gen_instances_gfx950 import (
             _validate_a16w16,
             _validate_a16w16_flatmm,
@@ -251,6 +255,9 @@ class opus_gemm_codegen:
             _validate_a16w16_mono_tile,
             _validate_a16w16_persistent,
         )
+        gfx942_validators = {
+            "a16w16_em3en4_lds1_pgr2_sk": _validate_a16w16_em3en4_gfx942,
+        }
 
         # gfx950 split-barrier (only "a16w16" tag uses this validator).
         if k.kernel_tag == "a16w16":
@@ -261,10 +268,10 @@ class opus_gemm_codegen:
                 f"  LDS={info['lds_bytes'] // 1024}KiB"
                 f"  K>={info['min_k']}"
             )
-        # gfx942 a16w16 family (nosplit + splitk + fused_reduce); all share
-        # _validate_a16w16_gfx942 -- tag set == _GFX942_A16W16_TAGS.
+        # gfx942 a16w16 family; specialized tags override only the validator.
         elif k.kernel_tag in _GFX942_A16W16_TAGS:
-            info = _validate_a16w16_gfx942(k)
+            validator = gfx942_validators.get(k.kernel_tag, _validate_a16w16_gfx942)
+            info = validator(k)
             print(
                 f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
                 f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
@@ -817,7 +824,7 @@ void
                         "    const float*, __bf16*, int, int, int, int, int,\n"
                         "    const __bf16*, int);\n"
                     )
-                contents += "// V3 (multi-row per wg, BLOCK=64=1 wave) instantiations\n"
+                contents += "// V3 (multi-row per wg, BLOCK=N_VEC*ROWS) instantiations\n"
                 for nvec, rows in V3_NVEC_ROWS:
                     for sk in V2_SUPPORTED_SPLITKS:
                         contents += (

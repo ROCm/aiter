@@ -82,6 +82,8 @@ class OpusGemmInstance:
             parts.insert(tag_at, "splitk_p1")
         elif self.kernel_tag == "a16w16_kbuf2v_bk128_sk":
             parts.insert(tag_at, "splitk_p1_bk128")
+        elif self.kernel_tag == "a16w16_em3en4_lds1_pgr2_sk":
+            parts.insert(tag_at, "splitk_em3en4_lds1_pgr2")
         elif self.kernel_tag == "a16w16_kbuf2v":
             parts.insert(tag_at, "p1")
         elif self.kernel_tag == "a16w16_kbuf2v_bk128":
@@ -579,6 +581,15 @@ def _a16w16_kbuf2v_bk128_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     )
 
 
+def _a16w16_em3en4_lds1_pgr2_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
+    """SplitK EM3EN4: host 128x96, device 96x128 LDSB1."""
+    vec = 16 // 2
+    return OpusGemmInstance(
+        bs, bm, bn, bk, 2, tn, wm, wn, wk, vec, vec, 4, 0, 0, 0,
+        "a16w16_em3en4_lds1_pgr2_sk", ["fp32_t"], arch_prefix="gfx942",
+    )
+
+
 # gfx942 kid registry -- flat two-bucket layout.
 
 gfx942_nosplit_kernels_list = {
@@ -595,6 +606,7 @@ gfx942_splitk_kernels_list = {
     50202: _a16w16_splitk_gfx942        (256, 128,  64,  64,    2, 16, 16, 16, legacy=True),   # legacy 4-phase mid tile
     50203: _a16w16_kbuf2v_bk128_sk_gfx942(256, 64,  64, 128,    2, 16, 16, 16),                # P1 B_K=128 sub-K decomp
     50211: _a16w16_kbuf2v_sk_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),                # P1 depth=2 + V-dbuf
+    50204: _a16w16_em3en4_lds1_pgr2_sk_gfx942 (256, 128,  96, 128,    2, 16, 16, 16),                # EM3EN4 LDS1/PGR2 hipb-orientation (host 128M x 96N)
     50300: _a16w16_splitk_gfx942        (256,  64,  64,  64,    2, 16, 16, 16, fused=True),    # fused-reduce small tile
 }
 
@@ -716,12 +728,13 @@ HEURISTIC_DEFAULT_KIDS_GFX942 = frozenset(
         50200,  # gfx942 splitk          512x128x128x64 16x16x16 (N > 128)
         50201,  # gfx942 splitk          256x64x64x64   16x16x16 (N <= 64)
         50202,  # gfx942 splitk          256x128x64x64  16x16x16 (64 < N <= 128)
-        # Extra gfx942 splitk_fused; not reachable by the heuristic but baked so
-        # opus_gemm_a16w16_tune(id=...) can exercise it and so a f...
+        # Extra gfx942 splitk_fused probes; not reachable by the heuristic but
+        # baked so opus_gemm_a16w16_tune(id=...) can exercise them.
         50300,  # gfx942 splitk_fused    256x64x64x64   16x16x16 (small tile, W3-graft)
         # 50301 dropped 2026-05-30 (E_M=2 incompatible with W3 K-dbuf depth=3)
         50211,  # gfx942 splitk_p1        256x64x64x64  (depth=2 + workspace + reduce, deterministic)
         50203,  # gfx942 splitk_p1_bk128  256x64x64x128 (B_K=128 Option B; dev/bench)
+        50204,  # gfx942 splitk_em3en4_lds1_pgr2 256x128x96x128 hipb-orientation
         # Non-splitK siblings of the corresponding splitK kids.
         50001,  # a16w16_kbuf3        non-splitK sibling of 50201
         50002,  # a16w16_kbuf1    non-splitK sibling of 50202 (E_M=2)

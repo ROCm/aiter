@@ -8,12 +8,15 @@
 
 // Split-barrier a16w16 traits
 
+// Unified gfx942 a16w16 traits.
+// LDS_DEPTH_ selects half-tile ping-pong (2) or full-tile single LDS (1).
 template<int BLOCK_SIZE_,
         typename BLOCK_,
         typename DTYPE_,
         typename VEC_,
         typename TILE_,
-        typename WAVE_>
+        typename WAVE_,
+        int LDS_DEPTH_ = 2>
 struct opus_gemm_a16w16_traits {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
@@ -22,6 +25,7 @@ struct opus_gemm_a16w16_traits {
     using WAVE  = opus::remove_cvref_t<WAVE_>;
 
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
+    static constexpr int LDS_DEPTH = LDS_DEPTH_;
 
     static constexpr int B_M = opus::get<0>(BLOCK{});
     static constexpr int B_N = opus::get<1>(BLOCK{});
@@ -44,8 +48,9 @@ struct opus_gemm_a16w16_traits {
     static constexpr int W_N = opus::get<1>(WAVE{});
     static constexpr int W_K = opus::get<2>(WAVE{});
 
-    static constexpr int HALF_B_M = B_M / 2;
-    static constexpr int HALF_B_N = B_N / 2;
+    // Effective per-buffer tile = full tile / LDS_DEPTH.
+    static constexpr int HALF_B_M = B_M / LDS_DEPTH;
+    static constexpr int HALF_B_N = B_N / LDS_DEPTH;
 
     static_assert(HALF_B_M % (W_M * T_M) == 0);
     static_assert(HALF_B_N % (W_N * T_N) == 0);
