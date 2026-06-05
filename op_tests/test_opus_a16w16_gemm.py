@@ -1,43 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""
-End-to-end test of the a16w16 user-facing entry gemm_a16w16_opus.
-
-This is the single regression entry point for opus a16w16: it drives
-gemm_a16w16_opus end-to-end (Python CSV lookup → C++ tuned lookup →
-heuristic fallback → launcher → kernel), compares against torch.bmm,
-and prints per-shape TFLOPs. The id-based low-level binding
-(opus_gemm_a16w16_tune) is exercised indirectly when the CSV lookup
-hits, and the heuristic dispatch is exercised on miss.
+"""End-to-end regression of gemm_a16w16_opus vs torch.bmm; prints TFLOPs.
 
 Usage:
-
-    # Single shape smoke test (default M=256 N=512 K=256 batch=8):
-    python3 op_tests/test_opus_a16w16_gemm.py
-
-    # Explicit shape:
-    python3 op_tests/test_opus_a16w16_gemm.py -m 128 -n 2048 -k 4096 -b 1
-
-    # Sweep shapes from a CSV (only M/N/K columns are read):
-    python3 op_tests/test_opus_a16w16_gemm.py \\
-        --csv_file aiter/configs/model_configs/gptoss_bf16_untuned_gemm.csv
+    python3 op_tests/test_opus_a16w16_gemm.py [-m M -n N -k K -b B]
+    python3 op_tests/test_opus_a16w16_gemm.py --csv_file <shape_csv>
 """
 
 import argparse
 import sys
 import torch
 
-# opus a16w16 is gfx950-only. Skip cleanly on any other device so this
-# script can sit in the regression set without failing on non-gfx950 CI
-# slots. Reuse opus's own probe (which honours GPU_ARCHS env first, then
-# rocminfo) so this skip stays in lock-step with what aiter.ops.opus does
-# at import time -- otherwise we'd hit the stub's RuntimeError instead of
-# a clean skip when GPU_ARCHS pins a non-supported arch on a gfx950 box.
+# Skip on unsupported arch via the same probe opus uses at import time.
 from aiter.ops.opus._arch import _detect_arch  # noqa: E402
 
-_arch_ok, _detected_gfx = _detect_arch({"gfx950"})
+_arch_ok, _detected_gfx = _detect_arch({"gfx950", "gfx942"})
 if not _arch_ok:
-    print(f"[skip] test_opus_a16w16_gemm requires gfx950 (detected {_detected_gfx!r})")
+    print(
+        f"[skip] test_opus_a16w16_gemm requires gfx950/gfx942 (detected {_detected_gfx!r})"
+    )
     sys.exit(0)
 
 from aiter.test_common import checkAllclose, run_perftest  # noqa: E402
@@ -169,10 +150,6 @@ if __name__ == "__main__":
     if args.csv_file is not None:
         test_a16w16_csv_sweep(args.csv_file, batch=args.batch)
     else:
-        # Ensure K is at least one B_K for the smallest a16w16 kid
-        # (K>=64 suffices for kid 4-5; 128 for kid 6-9; splitk kids
-        # demand K >= pfk*B_K which the heuristic handles). Clamp K
-        # to 128 to make the default smoke invocation work on every
-        # kid the heuristic could pick.
+        # Clamp K>=128 so every kid the heuristic picks has K>=B_K (smallest is 128).
         k_eff = max(args.k, 128)
         test_a16w16(args.batch, args.m, args.n, k_eff, out_dtype=out_dtype)
