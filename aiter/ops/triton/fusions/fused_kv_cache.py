@@ -6,16 +6,18 @@ import triton
 from typing import Tuple
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cat_and_cache_mla_kernel as triton_fused_qk_rope_cat_and_cache_mla_kernel,
-    _fused_qk_rope_reshape_and_cache_kernel,
+    _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
     _fused_qk_rope_cosine_cache_llama_kernel,
 )
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
         _fused_qk_rope_cat_and_cache_mla_kernel as gluon_fused_qk_rope_cat_and_cache_mla_kernel,
+        _fused_qk_rope_reshape_and_cache_kernel as gluon_fused_qk_rope_reshape_and_cache_kernel,
     )
 except:  # noqa: E722
     gluon_fused_qk_rope_cat_and_cache_mla_kernel = None
+    gluon_fused_qk_rope_reshape_and_cache_kernel = None
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -526,7 +528,11 @@ def fused_qk_rope_reshape_and_cache(
 
     n_pid = t * qh + (t_slot - t) * kh
     grid = (n_pid, 1, 1)
-    _fused_qk_rope_reshape_and_cache_kernel[grid](
+    if DEVICE_ARCH == "gfx1250":
+        _kernel = gluon_fused_qk_rope_reshape_and_cache_kernel
+    else:
+        _kernel = triton_fused_qk_rope_reshape_and_cache_kernel
+    _kernel[grid](
         q,
         k,
         v,
