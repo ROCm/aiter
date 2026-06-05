@@ -11,6 +11,7 @@ Key primitives:
 from __future__ import annotations
 from dataclasses import dataclass
 from flydsl._mlir import ir
+from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr import arith as _arith
@@ -849,22 +850,30 @@ def xcd_remap_bx_by_grid(
     _linear_id = bx * gx + by
     _num_wgs = gx * gy
 
-    _c_xcds = fx.Index(num_xcds)
-    _wgs_per_xcd = _num_wgs // _c_xcds
-    _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id // _c_xcds)
+    # Round-robin workgroups across XCDs, distributing the tail remainder over
+    # the first `_r` XCDs so `_wgid` stays a bijection over [0, _num_wgs) even
+    # when `_num_wgs` is not a multiple of `num_xcds` (dropping `_clip` would
+    # collide/skip tiles -> wrong output for those shapes).
+    _c_xcds = fx.arith.constant(num_xcds, index=True)
+    _q = _num_wgs / _c_xcds
+    _r = _num_wgs % _c_xcds
+    _xcd = _linear_id % _c_xcds
+    _in_xcd = _linear_id / _c_xcds
+    _xcd_lt_r = fx.arith.cmpi(CmpIPredicate.ult, _xcd, _r)
+    _clip = fx.arith.select(_xcd_lt_r, _xcd, _r)
+    _wgid = _xcd * _q + _clip + _in_xcd
 
-    _c_wgm = fx.Index(xcd_swizzle).ir_value()
+    _c_wgm = fx.arith.constant(xcd_swizzle, index=True)
     _num_wgid_in_group = _c_wgm * gx
-    _group_id = _wgid // _num_wgid_in_group
+    _group_id = _wgid / _num_wgid_in_group
     _first_pid_m = _group_id * _c_wgm
     _remaining_m = gy - _first_pid_m
-    _group_size_m = (fx.Index(_remaining_m) < fx.Index(_c_wgm)).select(
-        _remaining_m, _c_wgm
-    )
+    _cmp_m = fx.arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
+    _group_size_m = fx.arith.select(_cmp_m, _remaining_m, _c_wgm)
 
     _wgid_in_group = _wgid % _num_wgid_in_group
     new_bx = _first_pid_m + (_wgid_in_group % _group_size_m)
-    new_by = _wgid_in_group // _group_size_m
+    new_by = _wgid_in_group / _group_size_m
     return new_bx, new_by
 
 
