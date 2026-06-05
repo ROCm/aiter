@@ -460,8 +460,6 @@ def _grouped_topk(
     HAS_BIAS: tl.constexpr = False,
     APPLY_RENORM: tl.constexpr = False,
     ROUTED_SCALING: tl.constexpr = 1.0,
-    N_SHARED: tl.constexpr = 0,
-    SHARED_SCORE: tl.constexpr = 1.0,
 ):
     pid = tl.program_id(0)
 
@@ -596,14 +594,12 @@ def _grouped_topk(
     y_weights = tl.sum(tl.where(pos_eq, scores_3d, 0.0), axis=2)  # [BLOCK_M, K_PAD]
 
     # Routed-slot mask: the first N_EXPTS_ACT slots hold the grouped-topk
-    # selection (shared experts, if any, occupy the next N_SHARED slots and
-    # must be excluded from the routed renorm denominator).
+    # selection; the remaining padded slots are masked off.
     k_arange = tl.arange(0, N_EXPTS_ACT_PAD)
     routed_mask = k_arange[None, :] < N_EXPTS_ACT
 
-    # -- 9. Renorm + scale over the ROUTED slots only (mirrors _topk's
-    #       APPLY_RENORM / ROUTED_SCALING and the noaux_tc semantics where the
-    #       always-on shared expert is appended unscaled after renorm).
+    # -- 9. Renorm + scale over the ROUTED slots (mirrors _topk's
+    #       APPLY_RENORM / ROUTED_SCALING).
     if APPLY_RENORM:
         y_f = tl.where(routed_mask, y_weights, 0.0)
         s = tl.sum(y_f, axis=1, keep_dims=True)
@@ -611,20 +607,7 @@ def _grouped_topk(
     elif ROUTED_SCALING != 1.0:
         y_weights = y_weights * ROUTED_SCALING
 
-    # -- 9b. Append fused shared expert(s): always-on, fixed id n_expts_tot+i
-    #        and fixed weight SHARED_SCORE (matches init_aiter_topK_meta_data /
-    #        rocm_aiter_grouped_topk). Placed AFTER renorm so the shared weight
-    #        is not folded into the routed normalization.
-    if N_SHARED > 0:
-        shared_slot = (k_arange[None, :] >= N_EXPTS_ACT) & (
-            k_arange[None, :] < N_EXPTS_ACT + N_SHARED
-        )
-        shared_idx = (n_expts_tot + k_arange - N_EXPTS_ACT)[None, :].to(tl.int32)
-        y_indices = tl.where(shared_slot, shared_idx, y_indices)
-        y_weights = tl.where(shared_slot, SHARED_SCORE, y_weights)
-        real_mask = k_arange[None, :] < (N_EXPTS_ACT + N_SHARED)
-    else:
-        real_mask = routed_mask
+    real_mask = routed_mask
 
     y_values_out = y_weights.to(x_dtype)
 

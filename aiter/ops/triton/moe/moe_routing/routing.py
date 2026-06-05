@@ -265,32 +265,29 @@ def routing(
     num_expert_group: int | None = None,
     topk_group: int | None = None,
     expert_group: torch.Tensor | None = None,
-    num_fused_shared_experts: int = 0,
-    shared_experts_score: float = 1.0,
 ):
     """Routing entry point. ``score_mode`` selects the path:
 
     * ``score_mode is None`` (default) -> the plain flat top-k routing process:
       flat top-k with softmax. ``sm_first`` controls whether softmax is applied
       to the logits before the top-k (``True``) or inside the top-k
-      (``False``). The fused-V4-only arguments (``bias``, ``use_grouped_topk``,
-      ``num_fused_shared_experts`` ...) are ignored on this path.
+      (``False``). The fused-V4-only arguments (``bias``, ``use_grouped_topk``
+      ...) are ignored on this path.
     * ``score_mode is not None`` -> the fused V4 (DeepSeek) routing process:
-      fused score transform + (optionally grouped) top-k + fused shared
-      experts. ``sm_first`` is ignored on this path.
+      fused score transform + (optionally grouped) top-k. ``sm_first`` is
+      ignored on this path.
 
     ``block_m`` is not supplied by the caller: it is derived internally from the
-    raw ``logits`` shape and the originally requested ``n_expts_act`` (before
-    any shared-expert widening).
+    raw ``logits`` shape and the originally requested ``n_expts_act``.
 
     Returns ``(RoutingData, gather_indx, scatter_indx)``.
     """
-    num_tokens, n_routed = logits.shape
+    num_tokens, n_expts_tot = logits.shape
 
     # block_m heuristic from the raw logits shape and the originally requested
     # n_expts_act.
     m = num_tokens * n_expts_act
-    tokens_per_expt = max(1, m // n_routed)
+    tokens_per_expt = max(1, m // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
 
     # ------------------------------------------------------------------
@@ -308,7 +305,6 @@ def routing(
             apply_softmax=not sm_first,
             HIST_BLOCK_M=HIST_BLOCK_M,
         )
-        n_expts_tot = n_routed
         if num_tokens <= 16:
             HIST_BLOCK_M = triton.next_power_of_2(num_tokens)
             sort_fn = sort_tokens_fused
@@ -333,16 +329,11 @@ def routing(
     # ------------------------------------------------------------------
     # fused path: fused routing math + sort (score_mode given)
     # ------------------------------------------------------------------
-    n_shared = num_fused_shared_experts
-    n_expts_tot = n_routed
 
     if use_grouped_topk and num_expert_group != 1:
         assert (
             num_expert_group is not None and topk_group is not None
         ), "use_grouped_topk requires num_expert_group and topk_group"
-
-        # grouped topk is fused to use num fused shared experts as an expert to route into.
-        n_expts_tot += n_shared
 
         expt_scal, expt_indx, bitmatrix = grouped_topk(
             logits,
@@ -355,16 +346,9 @@ def routing(
             bias=bias,
             renorm=renorm,
             routed_scaling_factor=routed_scaling_factor,
-            num_fused_shared_experts=n_shared,
-            shared_experts_score=shared_experts_score,
             HIST_BLOCK_M=32,
         )
-        # Routed top-k + appended shared experts per token.
-        n_expts_act = n_expts_act + n_shared
     else:
-        assert (
-            n_shared == 0
-        ), "fused shared experts are only supported on the grouped-topk path"
         from .topk import topk
 
         expt_scal, expt_indx, bitmatrix = topk(

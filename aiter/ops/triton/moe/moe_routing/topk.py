@@ -21,24 +21,14 @@ def grouped_topk(
     bias: torch.Tensor | None = None,
     renorm: bool = False,
     routed_scaling_factor: float = 1.0,
-    num_fused_shared_experts: int = 0,
-    shared_experts_score: float = 1.0,
 ):
     """Triton grouped top-k expert selection. See module docstring.
 
     Returns ``(y_vals, y_indx, bitmatrix)`` matching the contract of
     ``aiter.ops.triton.moe.moe_routing.topk.topk``:
 
-      - y_vals: ``(n_rows, k + num_fused_shared_experts)`` in ``x.dtype``.
-      - y_indx: ``(n_rows, k + num_fused_shared_experts)`` ``int16``.
-
-    When ``num_fused_shared_experts > 0`` the routed top-k selection occupies
-    the first ``k`` columns and the always-on shared expert(s) occupy the next
-    ``num_fused_shared_experts`` columns — expert id ``n_cols + i``, weight
-    ``shared_experts_score`` (appended after the routed renorm, mirroring
-    ``init_aiter_topK_meta_data`` / ``rocm_aiter_grouped_topk``). The bitmatrix
-    is widened to ``n_cols + num_fused_shared_experts`` columns so ``sort_tokens``
-    counts the shared bucket.
+      - y_vals: ``(n_rows, k)`` in ``x.dtype``.
+      - y_indx: ``(n_rows, k)`` ``int16``.
 
       - bitmatrix: real :class:`Bitmatrix`; same uint32
         ``(n_cols_words, n_rows_pad32).T`` storage / scratchpad layout the
@@ -48,12 +38,8 @@ def grouped_topk(
     assert x.dim() == 2
     n_rows, n_cols = x.shape
     assert n_cols <= 256, f"grouped_topk n_expts_tot ({n_cols}) only supported <= 256"
-    # Fused shared experts are appended (always-on) AFTER the routed selection;
-    # they occupy expert ids [n_cols, n_cols + num_fused_shared_experts).
-    n_shared = num_fused_shared_experts
-    assert n_shared >= 0
-    n_total = n_cols + n_shared  # experts incl. shared (bitmatrix width)
-    k_out = k + n_shared  # output width (routed top-k + shared)
+    n_total = n_cols  # experts (bitmatrix width)
+    k_out = k  # output width (routed top-k)
     assert num_expert_group > 1
     assert (
         num_expert_group <= 16
@@ -165,8 +151,6 @@ def grouped_topk(
         HAS_BIAS=has_bias,
         APPLY_RENORM=renorm,
         ROUTED_SCALING=routed_scaling_factor,
-        N_SHARED=n_shared,
-        SHARED_SCORE=shared_experts_score,
         num_warps=4,
     )
 
