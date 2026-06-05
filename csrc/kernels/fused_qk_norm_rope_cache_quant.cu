@@ -4196,7 +4196,8 @@ namespace aiter {
     }
 
     // ===========================================================================
-    // Fine-grained variant (FlyDSL-style decomposition) -- env-gated (AITER_FUSEDQK_FG)
+    // Fine-grained variant (FlyDSL-style decomposition) -- auto-selected for the
+    // xlarge prefill tier (T >= ~8k, num_tokens <= 65535); ~5-17% faster there.
     // ---------------------------------------------------------------------------
     // One block == one wave (64 threads) == exactly ONE (token, head) tile:
     //   grid.x = num_heads + 1 (head; 0 -> K, 1.. -> Q), grid.y = num_tokens.
@@ -4824,14 +4825,13 @@ void fused_qk_norm_rope_group_quant(
   //     4 dtype combos = 96 instantiations per source dtype (bf16 typical → 96 ko).
   // Q_GROUP_SIZE / Q_SCALE_FP32 are only meaningful when q_out is fp8 (q_dt != kAuto);
   // for bf16 q_out we collapse onto (G=64, e8m0) — the kernel ignores them.
-  // Experimental fine-grained (FlyDSL-style) path: 1 wave per (token, head), block=64,
-  // grid=(num_heads+1, num_tokens). Correct and on-par with the coarse kernel (the
-  // coarse kernel is already at the occupancy cap, so this does not beat it -- see the
-  // kernel-side note). Gated by AITER_FUSEDQK_FG=1 for A/B profiling.
-  static const bool use_finegrained = [] {
-    const char* e = std::getenv("AITER_FUSEDQK_FG");
-    return e && e[0] == '1';
-  }();
+  // Fine-grained (FlyDSL-style) path: 1 wave per (token, head), block=64,
+  // grid=(num_heads+1, num_tokens). Measured on gfx950 (MI355): ~5-17% faster
+  // than the coarse HPW path at large prefill (T >= ~8k) for both bf16 and fp8 Q.
+  // At mid T (256-2048) the coarse path's per-wave head aggregation (one cos/sin
+  // gather reused across HPW heads) wins, so we only switch to FG for the xlarge
+  // tier. grid.y == num_tokens, so cap at 65535 (larger T would need a Y-chunk loop).
+  const bool use_finegrained = use_xlarge_prefill && (num_tokens <= 65535);
   auto launch_all = [&](auto group_size_tag, auto scale_fp32_tag, auto has_qw_tag) {
     constexpr int  head_dim_val      = 512;
     constexpr int  q_group_size_val  = decltype(group_size_tag)::value;
