@@ -178,11 +178,17 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                     {
                         consuming_blocks = remaining_blocks;
                         // This TG can process all of this qo_tile's remaining_blocks to the causal
-                        // boundary
-                        const int32_t partial_o_loc =
-                            (current_block_idx == 0)
-                                ? -1
-                                : (qlen_granularity * partial_tile_idx++); // -1 - no split
+                        // boundary.
+                        // NOTE: previously, when current_block_idx == 0 (a single TG absorbs the
+                        // entire tile without splitting), partial_o_loc was set to the sentinel -1
+                        // and generate_reduce_info skipped the tile, so the reduce kernel never
+                        // wrote final_lse[qo_start:qo_end, :]. Downstream consumers (chunked-context
+                        // prefill in vLLM) then read stale workspace bytes as LSE, causing a
+                        // ~2-3pp gsm8k accuracy regression on DeepSeek-V3 on MI350. Always emit a
+                        // partial slot so mla_reduce_v1 runs (with num_partials == 1 for unsplit
+                        // tiles) and fully populates final_lse. Mirrors the fix landed in
+                        // ROCm/aiter#3542 for the triton-gluon MLA decode NUM_KV_SPLITS==1 path.
+                        const int32_t partial_o_loc = qlen_granularity * partial_tile_idx++;
                         const int32_t kv_end =
                             std::min(kv_start + consuming_blocks,
                                      pages_kv_indptr[current_tile.batch_idx + 1]);
