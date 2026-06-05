@@ -54,6 +54,16 @@ def torch_to_c_types(*args):
             c_args.append(ctypes.cast(arg.data_ptr(), ctypes.c_void_p))
         elif isinstance(arg, torch.cuda.Stream):
             c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
+        elif isinstance(arg, torch.Stream):
+            # During CUDA/HIP graph capture, torch.cuda.current_stream() may
+            # return a base torch.Stream (which lacks the .cuda_stream attr).
+            # Reconstruct a torch.cuda.Stream to recover the raw stream pointer.
+            cuda_stream = torch.cuda.Stream(
+                stream_id=arg.stream_id,
+                device_index=arg.device_index,
+                device_type=arg.device_type,
+            )
+            c_args.append(ctypes.cast(cuda_stream.cuda_stream, ctypes.c_void_p))
         else:
             if type(arg) not in ctypes_map:
                 raise ValueError(f"Unsupported type: {type(arg)}")

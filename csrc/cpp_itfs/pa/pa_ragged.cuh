@@ -23,7 +23,18 @@
   #define __HIP__GFX9__
 #endif
 
-#if defined(__HIP__GFX9__)
+// RDNA4 (Navi4x: gfx1200/gfx1201) uses WMMA matrix cores, isolated from the gfx9
+// MFMA path. Narrowed to gfx1200/gfx1201 on purpose: __GFX12__ is also defined
+// for gfx1250 (a different microarch with its own *_gfx1250 intrinsics).
+// The shared kernel algorithm below is enabled for both gfx9 and RDNA4; the
+// arch-specific matrix primitives are split in pa_common.cuh.
+#if defined(__HIPCC__) && (defined(__gfx1200__) || defined(__gfx1201__))
+  #define __HIP__RDNA4__
+#endif
+
+#if defined(__HIP__GFX9__) || defined(__HIP__RDNA4__)
+
+///////////////////////////////////////
 
 ///////////////////////////////////////
 // grid (num_seqs, num_partitions, num_kv_heads)
