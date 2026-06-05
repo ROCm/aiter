@@ -90,7 +90,9 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
     row_dwords = model_dim // 2            # dwords per grouped_out_flat row (same)
     DWORDS_PER_ITER = BLOCK_THREADS
 
-    @flyc.kernel
+    module_name = f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}"
+
+    @flyc.kernel(name=module_name)
     def moe_gather_reduce_kernel(
         grouped_out_flat: fx.Tensor,  # (E*max_m, model_dim) bf16/f16
         src_rows: fx.Tensor,          # (token_num, topk)    i32

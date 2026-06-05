@@ -217,7 +217,12 @@ def _compile_stage1_finalize_act(
     tmp_stride_e = int(max_m) * int(2 * inter_dim)
     out_stride_e = int(max_m) * int(inter_dim)
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    module_name = (
+        f"moe_stage1_finalize_act_{act}_{out_dtype}"
+        f"_e{experts}_m{max_m}_i{inter_dim}_{stage1_weight_layout}"
+    )
+
+    @flyc.kernel(name=module_name, known_block_size=[block_threads, 1, 1])
     def stage1_finalize_act_kernel(
         arg_y: fx.Tensor,
         arg_tmp: fx.Tensor,
@@ -341,7 +346,12 @@ def _compile_stage1_finalize_act_bias(
     out_stride_e = int(max_m) * int(inter_dim)
     bias_stride_e = int(2 * inter_dim)
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    module_name = (
+        f"moe_stage1_finalize_act_bias_{act}_{out_dtype}"
+        f"_e{experts}_m{max_m}_i{inter_dim}_{stage1_weight_layout}"
+    )
+
+    @flyc.kernel(name=module_name, known_block_size=[block_threads, 1, 1])
     def stage1_finalize_act_bias_kernel(
         arg_y: fx.Tensor,
         arg_tmp: fx.Tensor,

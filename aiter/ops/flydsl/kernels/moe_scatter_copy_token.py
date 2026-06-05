@@ -60,7 +60,9 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         use_dword = False
         n_elems = row_bytes
 
-    @flyc.kernel
+    module_name = f"moe_scatter_copy_token_b{row_bytes}_{'dw' if use_dword else 'by'}"
+
+    @flyc.kernel(name=module_name)
     def scatter_copy_kernel(
         src: fx.Tensor,      # (num_src, row_bytes) uint8
         dst: fx.Tensor,      # (num_dst, row_bytes) uint8
