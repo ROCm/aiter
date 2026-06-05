@@ -1443,7 +1443,6 @@ __device__ __forceinline__ T ar_fusion_epilogue_block_reduce(T val, int block_si
     }
     __syncthreads();
     val = (w_tid < num_warps) ? shared[w_tid] : T(0);
-    __syncthreads();
     val = warpReduceRuntime<functor, T>(val, reduce_width);
     return val;
 }
