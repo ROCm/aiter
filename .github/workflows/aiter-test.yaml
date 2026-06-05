@@ -352,6 +352,7 @@ jobs:
 
       - name: Download test shard lists
         uses: actions/download-artifact@v4
+        timeout-minutes: 15
         with:
           name: aiter_shards
 
@@ -367,12 +368,14 @@ jobs:
 
       - name: Download Aiter wheel artifact
         uses: actions/download-artifact@v4
+        timeout-minutes: 30
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
 
       - name: Download Triton wheel artifact
         uses: actions/download-artifact@v4
+        timeout-minutes: 30
         continue-on-error: true
         with:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
@@ -571,6 +574,7 @@ jobs:
     steps:
       - name: Download all test logs
         uses: actions/download-artifact@v4
+        timeout-minutes: 15
         with:
           pattern: standard-test-log-*-shard-*
           path: .
@@ -622,12 +626,14 @@ jobs:
 
       - name: Download Aiter wheel artifact
         uses: actions/download-artifact@v4
+        timeout-minutes: 30
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
 
       - name: Download Triton wheel artifact
         uses: actions/download-artifact@v4
+        timeout-minutes: 30
         continue-on-error: true
         with:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
@@ -831,6 +837,7 @@ jobs:
 
       - name: Download standard test logs (mi35x only)
         uses: actions/download-artifact@v4
+        timeout-minutes: 15
         continue-on-error: true
         with:
           pattern: standard-test-log-linux-aiter-mi35x-1-shard-*
@@ -885,6 +892,7 @@ jobs:
         id: baseline_pinned
         continue-on-error: true
         uses: dawidd6/action-download-artifact@v3
+        timeout-minutes: 15
         with:
           workflow: aiter-test.yaml
           commit: ${{ github.event.pull_request.base.sha }}
@@ -899,6 +907,7 @@ jobs:
         id: baseline_main
         continue-on-error: true
         uses: dawidd6/action-download-artifact@v3
+        timeout-minutes: 15
         with:
           workflow: aiter-test.yaml
           branch: main

@@ -526,13 +526,10 @@ def test_mla(
     def test_absorb_decode_gluon_bh16(name):
         # Shared bh16bn{64,128} runner. The wrapper dispatches on
         # (nhead, kv dtype): name='bh16bn128' -> cast kv to fp8;
-        # name='bh16bn64' -> keep bf16. When the outer -lse/--return_lse flag is
-        # set, run the stage-1-only (DCP) path: per-GPU stage-1, no intra-GPU
-        # reducev. Host-side LSE-merge over splits validates equivalence to the
-        # unified attention reference.
+        # name='bh16bn64' -> keep bf16. Always runs the full decode (stage-1 +
+        # stage-2 reduce). With -lse/--return_lse the kernel also returns the
+        # merged fp32 lse [batch, nhead], validated against lse_ref.
         from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
-
-        is_1st_stage = return_lse
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
         q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
@@ -551,41 +548,20 @@ def test_mla(
             seq_info = kv_indptr
             use_2d_view = False
 
-        if is_1st_stage:
-            # Stage-1-only: kernel writes per-split (acc, lse); host merges.
-            NUM_KV_SPLITS = 256 // batch_size
-            Dckv = v_head_dim
-            out_buf = torch.empty(
-                (batch_size, nhead, NUM_KV_SPLITS, Dckv),
-                dtype=torch.bfloat16,
-                device=q.device,
-            )
-        else:
-            out_buf = out_gluon.view(batch_size, nhead, v_head_dim)
-
         (_, lse), us_decode = run_perftest(
             mla_decode_gluon,
             q_nope,
             q_pe,
             kv_c,
-            out_buf,
+            out_gluon.view(batch_size, nhead, v_head_dim),
             page_table,
             seq_info,
             sm_scale,
             use_2d_view=use_2d_view,
             kv_scale=1.0,
             min_kv_seq_len=ctx_lens,
-            return_lse=is_1st_stage,
+            return_lse=return_lse,
         )
-
-        if is_1st_stage:
-            # Host-side log-sum-exp merge across splits:
-            #   final = sum_i acc_i * exp(lse_i - max_lse) / sum_i exp(lse_i - max_lse)
-            acc_f = out_buf.float()
-            max_lse = lse.max(dim=-1, keepdim=True).values
-            w = torch.exp(lse - max_lse)
-            merged = (acc_f * w[..., None]).sum(dim=-2) / w.sum(dim=-1, keepdim=True)
-            out_gluon.copy_(merged.view(total_q, nhead, v_head_dim).to(out_dtype))
 
         err = checkAllclose(
             out_ref,
@@ -593,14 +569,17 @@ def test_mla(
             msg=f"mla_decode-absorb    [golden vs gluon_{name}]: {us_decode:>8.2f} us......",
         )
         cal_diff(out_ref, out_gluon, f"out_gluon_{name}", use_fp8=(name == "bh16bn128"))
+        if return_lse and lse is not None:
+            checkAllclose(
+                lse_ref,
+                lse.reshape(total_q, nhead),
+                msg=f"mla_decode-absorb    [lse_ref vs gluon_{name}_lse]: {us_decode:>8.2f} us......",
+            )
         return err, us_decode
 
     err = None
     us_asm_decode = 1e12
-    # The ASM decode baseline has no LSE kernel for these MLA configs (e.g.
-    # nhead<=16 bf16 aborts in get_heuristic_kernel_mla with lse:1); skip it
-    # entirely when -lse is set. The -lse path exercises only the Gluon
-    # stage-1/DCP kernel.
+    # The ASM decode baseline aborts for these MLA configs when lse is requested
     if return_lse:
         pass
     elif (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
@@ -685,17 +664,10 @@ def test_mla(
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
 
-    # Gluon MLA bh16bn64 decode test (gfx950, bf16 Q + bf16 KV, nhead in (4,8,16),
-    # decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
-    # Two modes with different accuracy envelopes, so different gates:
-    #   -lse (DCP stage-1): the cross-split merge runs in fp32 on the host, so it
-    #     meets cal_diff for any batch. Only requirement is non-empty splits:
-    #     NUM_KV_SPLITS = max(1, 256 // batch_size), so ctx >= 256 // batch_size.
-    #     Example: -c 10000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -lse
-    #   full decode: the per-split combine is the in-kernel bf16 stage-2 reduce,
-    #     which only meets cal_diff's strict cos_diff<1e-5 at batch_size==1
-    #     (NUM_KV_SPLITS=256) with min_seq_len_wg >= BLOCK_N*3, i.e.
-    #     ctx >= 256 * 64 * 3 = 49152. Example: -c 49152 -b 1 -n 16,1 -d bf16 -kvd bf16
+    # Gluon MLA bh16bn64 decode test (gfx950, bf16 Q + bf16 KV).
+    # Splits must be non-empty, i.e.
+    # ctx >= NUM_KV_SPLITS = max(1, 256 // batch_size).
+    # Example: -c 10000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 [-lse]
     if (
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
@@ -705,10 +677,8 @@ def test_mla(
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
-        and (
-            (return_lse and 1 <= batch_size <= 256 and ctx_lens >= (256 // batch_size))
-            or (not return_lse and batch_size == 1 and ctx_lens >= 256 * 64 * 3)
-        )
+        and 1 <= batch_size <= 256
+        and ctx_lens >= (256 // batch_size)
     ):
         err_gluon, us_gluon_decode = test_absorb_decode_gluon_bh16("bh16bn64")
         ret["decode:gluon_err"] = err_gluon
