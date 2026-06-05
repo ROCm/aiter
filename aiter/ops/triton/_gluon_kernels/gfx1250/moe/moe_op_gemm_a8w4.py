@@ -126,7 +126,7 @@ def _moe_gemm_a8w4(
     alpha,
     limit,
     ACTIVATION_REDUCTION_N: gl.constexpr,
-    ADD_RESIDUAL: gl.constexpr,
+    SWIGLU_ADD_RESIDUAL: gl.constexpr,
     # MoE config
     N_EXPTS_ACT: gl.constexpr,
     # optimization config
@@ -596,7 +596,7 @@ def _moe_gemm_a8w4(
         acc = acc + bias[None, :]
 
     if APPLY_SWIGLU:
-        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=ADD_RESIDUAL)
+        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
