@@ -130,7 +130,14 @@ def _dump_aot_cache(args, cache_key, num_heads, head_size, blocksize, enable_var
 def run_benchmark(args: argparse.Namespace):
     @triton.testing.perf_report(create_paged_mqa_logits_configs(args))
     def bench_deepgemm_fp8_paged_mqa_logits(
-        batch_size, next_n, num_heads, head_size, avg_kv_length, var_ratio, metric, **kwargs
+        batch_size,
+        next_n,
+        num_heads,
+        head_size,
+        avg_kv_length,
+        var_ratio,
+        metric,
+        **kwargs,
     ):
         torch.manual_seed(0)
         random.seed(0)
@@ -205,7 +212,9 @@ def run_benchmark(args: argparse.Namespace):
             )
             return total_flops / elapsed_us * 1e-6  # TFLOPS = FLOPs / us * 1e-6
         if metric == "bandwidth":
-            mem = _bandwidth_bytes(batch_size, next_n, num_heads, head_size, context_lens)
+            mem = _bandwidth_bytes(
+                batch_size, next_n, num_heads, head_size, context_lens
+            )
             return mem / elapsed_us * 1e-3  # GB/s = B / us * 1e-3
         raise ValueError(f"Unknown metric: {metric}")
 
