@@ -50,7 +50,6 @@ struct to_vector<8>
 
 using WideT                        = fp32x4;
 constexpr int VECTORIZED_READ_SIZE = 16;
-constexpr int WARP_SIZE            = 64;
 
 enum class Phase
 {
@@ -863,7 +862,6 @@ struct to_vector<8>
 
 using WideT                        = fp32x4;
 constexpr int VECTORIZED_READ_SIZE = 16;
-constexpr int WARP_SIZE            = 64;
 
 enum class Phase
 {
