@@ -368,14 +368,14 @@ jobs:
 
       - name: Download Aiter wheel artifact
         uses: actions/download-artifact@v4
-        timeout-minutes: 15
+        timeout-minutes: 30
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
 
       - name: Download Triton wheel artifact
         uses: actions/download-artifact@v4
-        timeout-minutes: 15
+        timeout-minutes: 30
         continue-on-error: true
         with:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
@@ -626,14 +626,14 @@ jobs:
 
       - name: Download Aiter wheel artifact
         uses: actions/download-artifact@v4
-        timeout-minutes: 15
+        timeout-minutes: 30
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
 
       - name: Download Triton wheel artifact
         uses: actions/download-artifact@v4
-        timeout-minutes: 15
+        timeout-minutes: 30
         continue-on-error: true
         with:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
