@@ -119,7 +119,7 @@ def _gemm_a16w16_basic_kernel(
     pid_n = pid // num_pid_m
 
     # Descriptors start at this block's (M, N) offset by biasing the base
-    # pointer — subsequent async_loads use [0, 0] and advance only along K.
+    # pointer — subsequent async_loads use [0, 0] and step only along K.
     a_base = a_ptr + pid_m * BLOCK_M * stride_am
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn
 
@@ -216,21 +216,21 @@ def _gemm_a16w16_basic_kernel(
 
         # Walk the descriptors forward one K tile.
         if PHYSICAL_MK:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K]
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[0, BLOCK_K]
             )
         else:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [BLOCK_K, 0]
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[BLOCK_K, 0]
             )
 
         if PHYSICAL_KN:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [BLOCK_K, 0]
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[BLOCK_K, 0]
             )
         else:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K]
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[0, BLOCK_K]
             )
 
         load_idx += 1
@@ -250,21 +250,21 @@ def _gemm_a16w16_basic_kernel(
 
         # Walk the descriptors forward one K tile.
         if PHYSICAL_MK:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K]
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[0, BLOCK_K]
             )
         else:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [BLOCK_K, 0]
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[BLOCK_K, 0]
             )
 
         if PHYSICAL_KN:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [BLOCK_K, 0]
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[BLOCK_K, 0]
             )
         else:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K]
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[0, BLOCK_K]
             )
 
         load_idx += 1
@@ -1059,7 +1059,7 @@ def _gemm_a16w16_k_subtiling_kernel(
     )
 
 
-@gluon.jit(repr=_gemm_a16w16_lds_pipeline_repr, loop_carried_load_percent=0)
+@gluon.jit(repr=_gemm_a16w16_lds_pipeline_repr)
 def _gemm_a16w16_lds_pipeline_kernel(
     a_ptr,
     b_ptr,
@@ -1109,7 +1109,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
     pid_n = pid // num_pid_m
 
     # Descriptors start at this block's (M, N) offset by biasing the base
-    # pointer — subsequent async_loads use [0, 0] and advance only along K.
+    # pointer — subsequent async_loads use [0, 0] and step only along K.
     a_base = a_ptr + pid_m * BLOCK_M * stride_am
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn
 
@@ -1206,21 +1206,21 @@ def _gemm_a16w16_lds_pipeline_kernel(
 
         # Walk the descriptors forward one K tile.
         if PHYSICAL_MK:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K]
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[0, BLOCK_K]
             )
         else:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [BLOCK_K, 0]
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[BLOCK_K, 0]
             )
 
         if PHYSICAL_KN:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [BLOCK_K, 0]
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[BLOCK_K, 0]
             )
         else:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K]
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[0, BLOCK_K]
             )
 
         load_idx += 1
@@ -1270,21 +1270,21 @@ def _gemm_a16w16_lds_pipeline_kernel(
 
     # Walk the descriptors forward one K tile.
     if PHYSICAL_MK:
-        a_desc = gl.amd.gfx1250.tdm.advance(
-            a_desc, [0, BLOCK_K]
+        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            a_desc, add_offsets=[0, BLOCK_K]
         )
     else:
-        a_desc = gl.amd.gfx1250.tdm.advance(
-            a_desc, [BLOCK_K, 0]
+        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            a_desc, add_offsets=[BLOCK_K, 0]
         )
 
     if PHYSICAL_KN:
-        b_desc = gl.amd.gfx1250.tdm.advance(
-            b_desc, [BLOCK_K, 0]
+        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            b_desc, add_offsets=[BLOCK_K, 0]
         )
     else:
-        b_desc = gl.amd.gfx1250.tdm.advance(
-            b_desc, [0, BLOCK_K]
+        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            b_desc, add_offsets=[0, BLOCK_K]
         )
 
     # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
@@ -1352,21 +1352,21 @@ def _gemm_a16w16_lds_pipeline_kernel(
 
         # Walk the descriptors forward one K tile.
         if PHYSICAL_MK:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K]
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[0, BLOCK_K]
             )
         else:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [BLOCK_K, 0]
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[BLOCK_K, 0]
             )
 
         if PHYSICAL_KN:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [BLOCK_K, 0]
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[BLOCK_K, 0]
             )
         else:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K]
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[0, BLOCK_K]
             )
 
         # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
