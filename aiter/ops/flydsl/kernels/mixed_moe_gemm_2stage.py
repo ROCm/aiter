@@ -4013,11 +4013,12 @@ def compile_mixed_moe_gemm2(
                 scale_opsel_pong = 0
                 if not use_async_copy:
                     store_x_tile_to_lds(x_regs0, lds_base_cur)
-                _async_pending_vmem = k_unroll * num_acc_n + k_unroll_packed * (
-                    pack_K if use_mfma32_k64 else 1
-                ) * (m_repeat_packed + num_acc_n_packed)
+                # Must fully drain VMEM (vmcnt=0) before the MFMA reads the X tile
+                # from LDS: the async global->LDS DMA is slower than the B/scale
+                # VGPR loads, so any partial vmcnt count lets the read race ahead
+                # of the DMA and produces nondeterministic corruption.
                 if use_async_copy:
-                    _barrier(vmcnt=_async_pending_vmem, lgkmcnt=0)
+                    _barrier(vmcnt=0, lgkmcnt=0)
                 else:
                     gpu.barrier()
 
@@ -4079,7 +4080,7 @@ def compile_mixed_moe_gemm2(
                             store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                         hot_loop_scheduler()
                         if use_async_copy:
-                            _barrier(vmcnt=_async_pending_vmem, lgkmcnt=0)
+                            _barrier(vmcnt=0, lgkmcnt=0)
                         else:
                             gpu.barrier()
                         #_barrier()
@@ -4113,7 +4114,7 @@ def compile_mixed_moe_gemm2(
                             store_x_tile_to_lds(x_regs_pong, lds_base_pong)
                         hot_loop_scheduler()
                         if use_async_copy:
-                            _barrier(vmcnt=_async_pending_vmem, lgkmcnt=0)
+                            _barrier(vmcnt=0, lgkmcnt=0)
                         else:
                             gpu.barrier()
                         #_barrier()
@@ -4168,7 +4169,7 @@ def compile_mixed_moe_gemm2(
                         store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
                     if use_async_copy:
-                        _barrier(vmcnt=_async_pending_vmem, lgkmcnt=0)
+                        _barrier(vmcnt=0, lgkmcnt=0)
                     else:
                         gpu.barrier()
                     #_barrier()
