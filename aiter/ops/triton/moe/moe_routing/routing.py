@@ -331,15 +331,18 @@ def routing(
         )
 
     # ------------------------------------------------------------------
-    # fused V4 path: fused routing math + sort (score_mode given)
+    # fused path: fused routing math + sort (score_mode given)
     # ------------------------------------------------------------------
     n_shared = num_fused_shared_experts
-    n_expts_tot = n_routed + n_shared
+    n_expts_tot = n_routed
 
     if use_grouped_topk and num_expert_group != 1:
         assert (
             num_expert_group is not None and topk_group is not None
         ), "use_grouped_topk requires num_expert_group and topk_group"
+
+        # grouped topk is fused to use num fused shared experts as an expert to route into.
+        n_expts_tot += n_shared
 
         expt_scal, expt_indx, bitmatrix = grouped_topk(
             logits,
