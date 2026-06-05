@@ -78,6 +78,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 1,
     CDNA_VERSION: gl.constexpr = 3,
+    IS_GFX1250: gl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_block_q_head = tl.cdiv(heads_num, ChunkQ)
@@ -102,7 +103,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     residual_context = (ChunkK - split_context_length % ChunkK) % ChunkK
 
     NumWarps: gl.constexpr = 4
-    ThreadsPerWarp: gl.constexpr = 64
+    ThreadsPerWarp: gl.constexpr = 32 if IS_GFX1250 else 64
 
     # ===---------------------------------------------------
     # Gluon Layout
@@ -127,7 +128,27 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         order=[1, 0],
     )
 
-    if _Use_2d_instr_shape_mfma_layout:
+    if IS_GFX1250:
+        # gfx1250 (RDNA/WMMA, wave32): 16x16xK fp8 tile. Pick K=128 when the
+        # hidden dim is large enough; fall back to 64 to keep the K-tile within
+        # HiddenDim. warp_bases distributes NumWarps across the N (=ChunkK) axis;
+        # M (=ChunkQ) is shared (warp axis stride 0).
+        FP8_K_DIM: gl.constexpr = 128 if HiddenDim > 64 else 64
+        if NumWarps == 1:
+            warp_bases: gl.constexpr = []
+        elif NumWarps == 2:
+            warp_bases: gl.constexpr = [[0, 1]]
+        elif NumWarps == 4:
+            warp_bases: gl.constexpr = [[0, 1], [0, 2]]
+        else:
+            warp_bases: gl.constexpr = [[0, 1], [0, 2], [0, 4]]
+        mfma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+            version=3,
+            transposed=False,
+            instr_shape=[16, 16, FP8_K_DIM],
+            warp_bases=warp_bases,
+        )
+    elif _Use_2d_instr_shape_mfma_layout:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
             version=CDNA_VERSION,
             instr_shape=[16, 16],
@@ -246,7 +267,10 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         #!=----------------------------
         mfma_k = gl.convert_layout(k.T, mfma_layout_b)
 
-        o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
+        if IS_GFX1250:
+            o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero)
+        else:
+            o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
         o = o * k_scale_f[None, :]
 
         #!=----------------------------
@@ -292,7 +316,10 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     k_scale_f = k_scale_f_next
 
     mfma_k = gl.convert_layout(k.T, mfma_layout_b)
-    o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
+    if IS_GFX1250:
+        o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero)
+    else:
+        o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
 
     o = o * k_scale_f[None, :]
     o = gl.maximum(o, 0.0)
@@ -342,12 +369,13 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 16,
     CDNA_VERSION: gl.constexpr = 3,
+    IS_GFX1250: gl.constexpr = False,
 ):
     # ===---------------------------------------------------
     # Gluon Layout
     # ===---------------------------------------------------
     NumWarps: gl.constexpr = 4
-    ThreadsPerWarp: gl.constexpr = 64
+    ThreadsPerWarp: gl.constexpr = 32 if IS_GFX1250 else 64
 
     ValQMPerThread: gl.constexpr = ChunkQ // (
         NumWarps * ThreadsPerWarp // (HiddenDim // 16)
@@ -359,10 +387,40 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         order=[1, 0],
     )
 
-    ChunkKPerStage: gl.constexpr = ChunkK // 2
+    # ChunkKPerStage shapes the WMMA/MFMA tiles in the preshuffle pipeline below.
+    # On gfx1250 the TDM branch returns before that pipeline, but the gluon
+    # frontend still type-checks the (statically-unreachable) CDNA tail, where
+    # mfma_layout is the WMMA layout. If ChunkKPerStage < 16 there (e.g. the 1:1
+    # case ChunkK==KVBlockSize==16 -> ChunkKPerStage==8), the tail's
+    # gl.zeros((ChunkQ, ChunkKPerStage), layout=WMMA) has an N dim of 8, which is
+    # neither 1 nor >= nDim(16) and trips the "Unsupported tensor shape for given
+    # wmma layout" assert. Pin a compile-safe (runtime-unused) value on gfx1250.
+    if IS_GFX1250:
+        ChunkKPerStage: gl.constexpr = 16
+    else:
+        ChunkKPerStage: gl.constexpr = ChunkK // 2
     MFMAPerWarp: gl.constexpr = ChunkKPerStage // 16 // NumWarps
 
-    if _Use_2d_instr_shape_mfma_layout:
+    if IS_GFX1250:
+        # gfx1250 (RDNA/WMMA, wave32): 16x16xK fp8 tile. The mfma_layout* names
+        # are reused by the TDM block-load branch below, but here they hold WMMA
+        # (not MFMA) layouts -- WMMA is a wave32 instruction.
+        FP8_K_DIM: gl.constexpr = 128 if HiddenDim > 64 else 64
+        if NumWarps == 1:
+            warp_bases: gl.constexpr = []
+        elif NumWarps == 2:
+            warp_bases: gl.constexpr = [[0, 1]]
+        elif NumWarps == 4:
+            warp_bases: gl.constexpr = [[0, 1], [0, 2]]
+        else:
+            warp_bases: gl.constexpr = [[0, 1], [0, 2], [0, 4]]
+        mfma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+            version=3,
+            transposed=False,
+            instr_shape=[16, 16, FP8_K_DIM],
+            warp_bases=warp_bases,
+        )
+    elif _Use_2d_instr_shape_mfma_layout:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
             version=CDNA_VERSION,
             instr_shape=[16, 16],
@@ -387,6 +445,153 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     )
 
     layout_scale: gl.constexpr = gl.SliceLayout(1, mfma_layout)
+
+    # gfx1250 TDM block-load path. ChunkK only partitions context across CTAs
+    # (split units); the inner loop and WMMA tile work at block granularity
+    # (KVBlockSize wide), reusing the proven 1:1 compute shape. ChunkK ==
+    # N_BLK * KVBlockSize, so each split spans an integer number of paged blocks.
+    # Each block is physically non-contiguous in the KV pool (its own runtime
+    # row blk*stride_k_seq + a per-block scale gap), so we async_load one block
+    # per iteration into LDS, then transpose-read it for WMMA. Double-buffered:
+    # prefetch block j+1 into the other buffer before waiting on block j.
+    # Self-contained branch; the CDNA preshuffle pipeline below is untouched.
+    if IS_GFX1250:
+        NUM_BUFFERS: gl.constexpr = 2
+        # Plain contiguous shared layout (no padding/swizzle) so the LDS tile can
+        # be reshaped/permuted to undo shuffle_weight; matches mla.py's shuffled
+        # KV path. TDM still DMAs the block as one contiguous chunk.
+        KV_SHARED: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
+        kv_shared = gl.allocate_shared_memory(
+            KV_buffer.type.element_ty,
+            [NUM_BUFFERS, KVBlockSize, HiddenDim],
+            KV_SHARED,
+        )
+
+        pid = tl.program_id(0)
+        pid_batch, remain_pid = pid % batch_size, pid // batch_size
+        pid_next_n, pid_split_kv = remain_pid % next_n, remain_pid // next_n
+        context_length = gl.load(context_len_ptr + pid_batch)
+
+        context_chunk_num = tl.cdiv(context_length, ChunkK)
+        split_context_chunk_num = context_chunk_num // SplitKV
+        residual_context_chunks = context_chunk_num % SplitKV
+        split_context_start = (
+            pid_split_kv * split_context_chunk_num * ChunkK
+            + min(pid_split_kv, residual_context_chunks) * ChunkK
+        )
+        split_context_length = min(
+            context_length - split_context_start,
+            split_context_chunk_num * ChunkK
+            + (ChunkK if pid_split_kv < residual_context_chunks else 0),
+        )
+        if split_context_length <= 0:
+            return
+
+        q = gl.amd.cdna3.buffer_load(
+            ptr=Q_buffer,
+            offsets=pid_batch * stride_q_batch
+            + pid_next_n * stride_q_next_n
+            + (
+                gl.arange(0, ChunkQ, layout=gl.SliceLayout(1, layout_q))
+                * stride_q_heads
+            )[:, None]
+            + gl.arange(0, HiddenDim, layout=gl.SliceLayout(0, layout_q))[None, :],
+        )
+        scale_weight = gl.amd.cdna3.buffer_load(
+            ptr=weights,
+            offsets=(pid_batch * next_n + pid_next_n) * stride_w_batch
+            + gl.arange(0, ChunkQ, layout=layout_scale),
+        )
+
+        mfma_q = gl.convert_layout(q, mfma_layout_a)
+        zero_acc = gl.zeros((ChunkQ, KVBlockSize), dtype=tl.float32, layout=mfma_layout)
+        col = gl.arange(0, KVBlockSize, layout=gl.SliceLayout(0, mfma_layout))
+
+        n_blocks = tl.cdiv(split_context_length, KVBlockSize)
+        cblk_base = split_context_start // KVBlockSize
+        kv_idx_base = kv_indices + pid_batch * max_block_len + cblk_base
+
+        # Prologue: kick off the async_load for block 0 into buffer 0.
+        blk_cur = gl.load(kv_idx_base)
+        desc_cur = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=KV_buffer + blk_cur * stride_k_seq,
+            shape=(KVBlockSize, HiddenDim),
+            strides=(HiddenDim, 1),
+            block_shape=(KVBlockSize, HiddenDim),
+            layout=KV_SHARED,
+        )
+        gl.amd.gfx1250.tdm.async_load(desc_cur, [0, 0], kv_shared.index(0))
+
+        for j in range(0, n_blocks):
+            buf = j % NUM_BUFFERS
+            context_idx = split_context_start + j * KVBlockSize
+            blk = blk_cur
+
+            # Prefetch block j+1 into the other buffer before waiting on block j.
+            if j + 1 < n_blocks:
+                blk_cur = gl.load(kv_idx_base + (j + 1))
+                desc_cur = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                    base=KV_buffer + blk_cur * stride_k_seq,
+                    shape=(KVBlockSize, HiddenDim),
+                    strides=(HiddenDim, 1),
+                    block_shape=(KVBlockSize, HiddenDim),
+                    layout=KV_SHARED,
+                )
+                gl.amd.gfx1250.tdm.async_load(
+                    desc_cur, [0, 0], kv_shared.index((j + 1) % NUM_BUFFERS)
+                )
+                # Leave exactly the just-issued load (block j+1) in flight.
+                gl.amd.gfx1250.tdm.async_wait(1)
+            else:
+                gl.amd.gfx1250.tdm.async_wait(0)
+
+            # The KV block was written by shuffle_weight(layout=(16,16)), whose
+            # fp8 swizzle maps logical (n, k) to physical row-major
+            # [n//16, k//32, (k//16)%2, n%16, k%16]. Undo it in LDS with a
+            # reshape/permute (mla.py lds_unshuffle pattern) -- pure view work,
+            # no extra data movement -- then transpose-read for WMMA operand B.
+            K_WIDTH: gl.constexpr = 16
+            mfma_k = (
+                kv_shared.index(buf)
+                .reshape(
+                    (
+                        KVBlockSize // 16,
+                        HiddenDim // (2 * K_WIDTH),
+                        2,
+                        16,
+                        K_WIDTH,
+                    )
+                )
+                .permute((0, 3, 1, 2, 4))
+                .reshape((KVBlockSize, HiddenDim))
+                .permute([1, 0])
+                .load(layout=mfma_layout_b)
+            )
+            o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero_acc)
+
+            k_scale_f = gl.amd.cdna3.buffer_load(
+                ptr=scale_buffer,
+                offsets=blk * stride_scale_seq + col,
+            )
+            o = o * k_scale_f[None, :]
+            o = gl.maximum(o, 0.0)
+            o = o * scale_weight[:, None]
+
+            valid = (context_idx + col) <= (context_length - next_n + pid_next_n)
+            o = tl.where(valid[None, :], o, float("-inf"))
+            logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+
+            store_off = context_idx + col
+            gl.amd.cdna3.buffer_store(
+                logits,
+                ptr=OutLogits_buffer,
+                offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
+                + store_off,
+                mask=(store_off >= 0) & (store_off < max_model_len),
+            )
+        return
 
     ContextBlockPerChunkK: gl.constexpr = ChunkK // KVBlockSize
     ChunkKStagePerContextBlock: gl.constexpr = KVBlockSize // ChunkKPerStage
@@ -1172,6 +1377,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 16,
     CDNA_VERSION: gl.constexpr = 3,
+    IS_GFX1250: gl.constexpr = False,
 ):
     # ===---------------------------------------------------
     # Gluon Layout

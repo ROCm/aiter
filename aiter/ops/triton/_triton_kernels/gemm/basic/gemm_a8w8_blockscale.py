@@ -30,6 +30,7 @@ _gemm_a8w8_blockscale_repr = make_kernel_repr(
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
         "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "SPLIT_K_DOT": lambda args: args["BLOCK_SIZE_K"] >= 128,
     }
 )
 @triton.jit(repr=_gemm_a8w8_blockscale_repr)
@@ -70,6 +71,7 @@ def _gemm_a8w8_blockscale_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    SPLIT_K_DOT: tl.constexpr,
     cache_modifier: tl.constexpr,
     num_stages: tl.constexpr,
 ):
@@ -131,17 +133,8 @@ def _gemm_a8w8_blockscale_kernel(
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
         # ^ Number of K blocks within our split-K partition
 
-        # Create pointers for first block of A and B input matrices
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
-        offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-        a_ptrs = a_ptr + (
-            offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
-        )
-        b_ptrs = b_ptr + (
-            offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-        )
 
         # Create pointers for the scales
         offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
@@ -159,34 +152,95 @@ def _gemm_a8w8_blockscale_kernel(
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for k in tl.range(
-            pid_k * num_k_iter, (pid_k + 1) * num_k_iter, num_stages=num_stages
-        ):
-            # Load the next block of A and B, generate a mask by checking the K dimension.
-            # If it is out of bounds, set it to 0.
-            if EVEN_K:
-                a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
-            else:
-                a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
-                )
-                b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
-                )
+        if SPLIT_K_DOT:
+            # Workaround for Triton compiler bug: v_wmma_f32_16x16x128_fp8_fp8
+            # generates incorrect B-operand LDS layout on gfx1250.
+            # Split each K=128 dot into two K=64 dots.
+            HALF_K: tl.constexpr = BLOCK_SIZE_K // 2
+            offs_k_half = tl.arange(0, HALF_K)
+            offs_k_lo = pid_k * SPLITK_BLOCK_SIZE + offs_k_half
+            a_ptrs = a_ptr + (
+                offs_am[:, None] * stride_am + offs_k_lo[None, :] * stride_ak
+            )
+            b_ptrs = b_ptr + (
+                offs_k_lo[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+            )
 
-            a_scale = tl.load(a_scale_ptrs)
-            b_scale = tl.load(b_scale_ptrs)
+            for k in tl.range(
+                pid_k * num_k_iter, (pid_k + 1) * num_k_iter, num_stages=num_stages
+            ):
+                if EVEN_K:
+                    a_lo = tl.load(a_ptrs)
+                    b_lo = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                else:
+                    k_remaining = K - k * BLOCK_SIZE_K
+                    a_lo = tl.load(
+                        a_ptrs, mask=offs_k_half[None, :] < k_remaining, other=0.0
+                    )
+                    b_lo = tl.load(
+                        b_ptrs, mask=offs_k_half[:, None] < k_remaining, other=0.0
+                    )
 
-            # Perform dot operation and apply scale
-            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                a_ptrs += HALF_K * stride_ak
+                b_ptrs += HALF_K * stride_bk
 
-            # Advance the ptrs to the next K block.
-            a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_ptrs += BLOCK_SIZE_K * stride_bk
+                if EVEN_K:
+                    a_hi = tl.load(a_ptrs)
+                    b_hi = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                else:
+                    k_remaining2 = K - k * BLOCK_SIZE_K - HALF_K
+                    a_hi = tl.load(
+                        a_ptrs, mask=offs_k_half[None, :] < k_remaining2, other=0.0
+                    )
+                    b_hi = tl.load(
+                        b_ptrs, mask=offs_k_half[:, None] < k_remaining2, other=0.0
+                    )
 
-            a_scale_ptrs += offs_ks_step * stride_ascale_k
-            b_scale_ptrs += offs_ks_step * stride_bscale_k
+                a_scale = tl.load(a_scale_ptrs)
+                b_scale = tl.load(b_scale_ptrs)
+
+                accumulator += (tl.dot(a_lo, b_lo) + tl.dot(a_hi, b_hi)) * a_scale[:, None] * b_scale[None, :]
+
+                a_ptrs += HALF_K * stride_ak
+                b_ptrs += HALF_K * stride_bk
+
+                a_scale_ptrs += offs_ks_step * stride_ascale_k
+                b_scale_ptrs += offs_ks_step * stride_bscale_k
+        else:
+            # Create pointers for first block of A and B input matrices
+            offs_k = tl.arange(0, BLOCK_SIZE_K)
+            offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
+            a_ptrs = a_ptr + (
+                offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
+            )
+            b_ptrs = b_ptr + (
+                offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+            )
+
+            for k in tl.range(
+                pid_k * num_k_iter, (pid_k + 1) * num_k_iter, num_stages=num_stages
+            ):
+                if EVEN_K:
+                    a = tl.load(a_ptrs)
+                    b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                else:
+                    a = tl.load(
+                        a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                    )
+                    b = tl.load(
+                        b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                    )
+
+                a_scale = tl.load(a_scale_ptrs)
+                b_scale = tl.load(b_scale_ptrs)
+
+                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+
+                a_ptrs += BLOCK_SIZE_K * stride_ak
+                b_ptrs += BLOCK_SIZE_K * stride_bk
+
+                a_scale_ptrs += offs_ks_step * stride_ascale_k
+                b_scale_ptrs += offs_ks_step * stride_bscale_k
 
         c = accumulator.to(c_ptr.type.element_ty)
 
@@ -226,6 +280,7 @@ _gemm_a8w8_blockscale_preshuffle_repr = make_kernel_repr(
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
         "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "SPLIT_K_DOT": lambda args: args["BLOCK_SIZE_K"] >= 128,
     }
 )
 @triton.jit(repr=_gemm_a8w8_blockscale_preshuffle_repr)
@@ -266,6 +321,7 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    SPLIT_K_DOT: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -326,21 +382,9 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
         # ^ Number of K blocks within our split-K partition
 
-        # Create pointers for first block of A and B input matrices
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
-        offs_k_shuffle_arr = tl.arange(0, BLOCK_SIZE_K * 16)
-        offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
-        offs_k_shuffle = pid_k * SPLITK_BLOCK_SIZE * 16 + offs_k_shuffle_arr
-
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n * (BLOCK_SIZE_N // 16) + tl.arange(0, BLOCK_SIZE_N // 16)) % (
             N // 16
-        )
-        a_ptrs = a_ptr + (
-            offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
-        )
-        b_ptrs = b_ptr + (
-            offs_bn[:, None] * stride_bn + offs_k_shuffle[None, :] * stride_bk
         )
 
         # Create pointers for the scales
@@ -360,46 +404,127 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            # Load the next block of A and B, generate a mask by checking the K dimension.
-            # If it is out of bounds, set it to 0.
-            if EVEN_K:
-                a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
-            else:
-                a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
-                )
-                b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
-                )
-
-            b = (
-                b.reshape(
-                    1,
-                    BLOCK_SIZE_N // 16,
-                    BLOCK_SIZE_K // 32,
-                    2,
-                    16,
-                    16,
-                )
-                .permute(0, 1, 4, 2, 3, 5)
-                .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
-                .trans(1, 0)
+        if SPLIT_K_DOT:
+            # Workaround for Triton compiler bug: v_wmma_f32_16x16x128_fp8_fp8
+            # generates incorrect B-operand LDS layout on gfx1250.
+            # Split each K=128 dot into two K=64 dots.
+            HALF_K: tl.constexpr = BLOCK_SIZE_K // 2
+            offs_k_half = tl.arange(0, HALF_K)
+            offs_k_half_shuffle = tl.arange(0, HALF_K * 16)
+            offs_k_lo = pid_k * SPLITK_BLOCK_SIZE + offs_k_half
+            offs_k_lo_shuffle = pid_k * SPLITK_BLOCK_SIZE * 16 + offs_k_half_shuffle
+            a_ptrs = a_ptr + (
+                offs_am[:, None] * stride_am + offs_k_lo[None, :] * stride_ak
+            )
+            b_ptrs = b_ptr + (
+                offs_bn[:, None] * stride_bn + offs_k_lo_shuffle[None, :] * stride_bk
             )
 
-            a_scale = tl.load(a_scale_ptrs)
-            b_scale = tl.load(b_scale_ptrs)
+            for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+                if EVEN_K:
+                    a_lo = tl.load(a_ptrs)
+                    b_lo_raw = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                else:
+                    k_remaining = K - k * BLOCK_SIZE_K
+                    a_lo = tl.load(
+                        a_ptrs, mask=offs_k_half[None, :] < k_remaining, other=0.0
+                    )
+                    b_lo_raw = tl.load(
+                        b_ptrs, mask=offs_k_half_shuffle[:, None] < k_remaining * 16, other=0.0
+                    )
 
-            # Perform dot operation and apply scale
-            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                b_lo = (
+                    b_lo_raw.reshape(
+                        1, BLOCK_SIZE_N // 16, HALF_K // 32, 2, 16, 16,
+                    )
+                    .permute(0, 1, 4, 2, 3, 5)
+                    .reshape(BLOCK_SIZE_N, HALF_K)
+                    .trans(1, 0)
+                )
 
-            # Advance the ptrs to the next K block.
-            a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_ptrs += BLOCK_SIZE_K * 16 * stride_bk
+                a_ptrs += HALF_K * stride_ak
+                b_ptrs += HALF_K * 16 * stride_bk
 
-            a_scale_ptrs += offs_ks_step * stride_ascale_k
-            b_scale_ptrs += offs_ks_step * stride_bscale_k
+                if EVEN_K:
+                    a_hi = tl.load(a_ptrs)
+                    b_hi_raw = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                else:
+                    k_remaining2 = K - k * BLOCK_SIZE_K - HALF_K
+                    a_hi = tl.load(
+                        a_ptrs, mask=offs_k_half[None, :] < k_remaining2, other=0.0
+                    )
+                    b_hi_raw = tl.load(
+                        b_ptrs, mask=offs_k_half_shuffle[:, None] < k_remaining2 * 16, other=0.0
+                    )
+
+                b_hi = (
+                    b_hi_raw.reshape(
+                        1, BLOCK_SIZE_N // 16, HALF_K // 32, 2, 16, 16,
+                    )
+                    .permute(0, 1, 4, 2, 3, 5)
+                    .reshape(BLOCK_SIZE_N, HALF_K)
+                    .trans(1, 0)
+                )
+
+                a_scale = tl.load(a_scale_ptrs)
+                b_scale = tl.load(b_scale_ptrs)
+
+                accumulator += (tl.dot(a_lo, b_lo) + tl.dot(a_hi, b_hi)) * a_scale[:, None] * b_scale[None, :]
+
+                a_ptrs += HALF_K * stride_ak
+                b_ptrs += HALF_K * 16 * stride_bk
+
+                a_scale_ptrs += offs_ks_step * stride_ascale_k
+                b_scale_ptrs += offs_ks_step * stride_bscale_k
+        else:
+            # Create pointers for first block of A and B input matrices
+            offs_k = tl.arange(0, BLOCK_SIZE_K)
+            offs_k_shuffle_arr = tl.arange(0, BLOCK_SIZE_K * 16)
+            offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
+            offs_k_shuffle = pid_k * SPLITK_BLOCK_SIZE * 16 + offs_k_shuffle_arr
+            a_ptrs = a_ptr + (
+                offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
+            )
+            b_ptrs = b_ptr + (
+                offs_bn[:, None] * stride_bn + offs_k_shuffle[None, :] * stride_bk
+            )
+
+            for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+                if EVEN_K:
+                    a = tl.load(a_ptrs)
+                    b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                else:
+                    a = tl.load(
+                        a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                    )
+                    b = tl.load(
+                        b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                    )
+
+                b = (
+                    b.reshape(
+                        1,
+                        BLOCK_SIZE_N // 16,
+                        BLOCK_SIZE_K // 32,
+                        2,
+                        16,
+                        16,
+                    )
+                    .permute(0, 1, 4, 2, 3, 5)
+                    .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
+                    .trans(1, 0)
+                )
+
+                a_scale = tl.load(a_scale_ptrs)
+                b_scale = tl.load(b_scale_ptrs)
+
+                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+
+                a_ptrs += BLOCK_SIZE_K * stride_ak
+                b_ptrs += BLOCK_SIZE_K * 16 * stride_bk
+
+                a_scale_ptrs += offs_ks_step * stride_ascale_k
+                b_scale_ptrs += offs_ks_step * stride_bscale_k
 
         c = accumulator.to(c_ptr.type.element_ty)
 
