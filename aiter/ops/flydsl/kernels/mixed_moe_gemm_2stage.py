@@ -3500,17 +3500,23 @@ def compile_mixed_moe_gemm2(
                 CmpIPredicate.ult, _first_tid, _tokens_i32_guard
             )
 
-            # For tile_m < 32 (pack_M < _scale_pack_m): shift a_scale i32 so the
-            # correct bytes land at the op_sel positions we use. op_sel for A is
-            # ikxdl*_scale_pack_m (= {0,2}), so a plain >>8 places byte[m_half]
-            # and byte[m_half+2] at slots 0 and 2 respectively.
+            # For tile_m < 32 (pack_M < _scale_pack_m): the microscale dword packs
+            # 4 bytes [m0k0, m1k0, m0k1, m1k1]. op_sel for A is ikxdl*pack_M (= {0,1}
+            # for pack_M=1), so we repack byte[m_half] (k0) and byte[m_half+2] (k1)
+            # into slots 0/1 (identical to stage1 _rearrange_a_scale).
             if const_expr(pack_M < _scale_pack_m):
                 _m_off = _mod_pow2(_div_pow2(bx_m, 16), _scale_pack_m)
                 _m_scale_shift_i32 = arith.index_cast(
                     T.i32, _m_off * arith.constant(8, index=True)
                 )
+                _m_scale_shift_hi_i32 = arith.addi(
+                    _m_scale_shift_i32, arith.constant(16, type=T.i32)
+                )
             else:
                 _m_scale_shift_i32 = None
+                _m_scale_shift_hi_i32 = None
+            _c0xFF_s2 = arith.constant(0xFF, type=T.i32)
+            _c8_s2 = arith.constant(8, type=T.i32)
 
             def _moe_gemm2_then_body():
                 # Expert id for this M tile.
@@ -3679,8 +3685,12 @@ def compile_mixed_moe_gemm2(
                     _n_scale_shift_i32 = arith.index_cast(
                         T.i32, _n_off * arith.constant(8, index=True)
                     )
+                    _n_scale_shift_hi_i32 = arith.addi(
+                        _n_scale_shift_i32, arith.constant(16, type=T.i32)
+                    )
                 else:
                     _n_scale_shift_i32 = None
+                    _n_scale_shift_hi_i32 = None
                 n_intra_list = [None] * num_acc_n
                 n_blk_list = [None] * num_acc_n
                 col_g_list = [None] * num_acc_n
@@ -4038,10 +4048,18 @@ def compile_mixed_moe_gemm2(
                                 a_scale_i32, static_position=[0], dynamic_position=[]
                             )
                             if const_expr(_m_scale_shift_i32 is not None):
-                                # op_sel = ikxdl*_scale_pack_m (= {0,2}), so a plain
-                                # >>8 moves byte[m_half],byte[m_half+2] to slots 0,2.
-                                a_scale_val = arith.shrui(
-                                    a_scale_val, _m_scale_shift_i32
+                                # repack byte[m_half] (k0) and byte[m_half+2] (k1)
+                                # into slots 0/1 for op_sel ikxdl*pack_M = {0,1}.
+                                _ak0 = arith.andi(
+                                    arith.shrui(a_scale_val, _m_scale_shift_i32),
+                                    _c0xFF_s2,
+                                )
+                                _ak1 = arith.andi(
+                                    arith.shrui(a_scale_val, _m_scale_shift_hi_i32),
+                                    _c0xFF_s2,
+                                )
+                                a_scale_val = arith.ori(
+                                    _ak0, arith.shli(_ak1, _c8_s2)
                                 )
                             for ni in range_constexpr(num_acc_n_packed):
                                 b_scale_i32 = b_scale[ku128 * num_acc_n_packed + ni]
@@ -4051,8 +4069,18 @@ def compile_mixed_moe_gemm2(
                                     dynamic_position=[],
                                 )
                                 if const_expr(_n_scale_shift_i32 is not None):
-                                    b_scale_val = arith.shrui(
-                                        b_scale_val, _n_scale_shift_i32
+                                    _bk0 = arith.andi(
+                                        arith.shrui(b_scale_val, _n_scale_shift_i32),
+                                        _c0xFF_s2,
+                                    )
+                                    _bk1 = arith.andi(
+                                        arith.shrui(
+                                            b_scale_val, _n_scale_shift_hi_i32
+                                        ),
+                                        _c0xFF_s2,
+                                    )
+                                    b_scale_val = arith.ori(
+                                        _bk0, arith.shli(_bk1, _c8_s2)
                                     )
 
                                 for imxdl in range_constexpr(pack_M):
@@ -4108,9 +4136,9 @@ def compile_mixed_moe_gemm2(
                                                     acc_list[acc_idx],
                                                     cbsz,
                                                     blgp,
-                                                    ikxdl * _scale_pack_m + imxdl,
+                                                    ikxdl * pack_M + imxdl,
                                                     a_scale_val,
-                                                    ikxdl * _scale_pack_n + inxdl,
+                                                    ikxdl * pack_N + inxdl,
                                                     b_scale_val,
                                                 ],
                                             )
@@ -4128,8 +4156,16 @@ def compile_mixed_moe_gemm2(
                 _num_dma_loads = max(
                     1, _eff_bytes_per_buffer // (total_threads * _dma_bytes)
                 )
+                # Number of waves whose DMA chunks land inside the A buffer. When
+                # tile_m < 32 the tile has fewer rows than total_threads can cover,
+                # so the extra waves would DMA past the buffer (clobbering adjacent
+                # LDS). Guard them out.
+                _num_waves_dma = total_threads // _wave_size
+                _dma_valid_waves = max(
+                    1, _eff_bytes_per_buffer // (_wave_size * _dma_bytes)
+                )
 
-                def dma_x_tile_to_lds(base_k, lds_buffer):
+                def _dma_x_tile_body(base_k, lds_buffer):
                     c4_idx = arith.index(4)
                     base_k_div4 = _div_pow2(
                         _div_pow2(base_k, int(a_elem_vec_pack))
@@ -4174,6 +4210,22 @@ def compile_mixed_moe_gemm2(
                             arith.constant(0, type=T.i32),
                             arith.constant(0, type=T.i32),
                         )
+
+                def dma_x_tile_to_lds(base_k, lds_buffer):
+                    if const_expr(_dma_valid_waves >= _num_waves_dma):
+                        _dma_x_tile_body(base_k, lds_buffer)
+                        return
+                    # tile_m < 32: only the first _dma_valid_waves waves hold valid
+                    # tile data; the rest would DMA past the LDS buffer.
+                    _wid_ok = arith.cmpi(
+                        CmpIPredicate.ult,
+                        wave_id,
+                        arith.constant(_dma_valid_waves, index=True),
+                    )
+                    _if_w = scf.IfOp(_wid_ok)
+                    with ir.InsertionPoint(_if_w.then_block):
+                        _dma_x_tile_body(base_k, lds_buffer)
+                        scf.YieldOp([])
 
                 def prefetch_x_to_lds(base_k, lds_buffer):
                     dma_x_tile_to_lds(base_k, lds_buffer)

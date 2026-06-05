@@ -91,6 +91,42 @@ def main():
     print(f"M={M}  gemm1 inter dequant cosine (BM16-inline vs BM32-std): {c:.5f}")
     print(f"  cumsum32={int(b32['cumsum_tensor'].item())} cumsum16={int(b16['cumsum_tensor'].item())}")
 
+    # ---- validate gemm1 inter SCALE: read e8m0[sorted_row, kg] from preshuffle ----
+    K32i = D_INTER // 32  # inter scale kgroups
+
+    def read_scale_preshuffle(buf, nv):
+        b = buf.reshape(-1).view(torch.uint8)
+        NB = (K32i + 7) // 8
+        rows = torch.arange(nv, device=device)
+        kg = torch.arange(K32i, device=device)
+        R = rows[:, None]; KG = kg[None, :]
+        mb = R // 32; mh = (R % 32) // 16; rr = R % 16
+        nb = KG // 8; nh = (KG % 8) // 4; cc = (KG % 8) % 4
+        byte = mh + nh * 2
+        dword = mb * (NB * 64) + nb * 64 + cc * 16 + rr
+        boff = (dword * 4 + byte).reshape(-1).to(torch.int64)
+        return b[boff].reshape(nv, K32i)
+
+    def scale_by_pair(buf, sti, nv):
+        sc = read_scale_preshuffle(buf, nv).to(torch.int64)  # [nv, K32i]
+        r = sti[:nv].to(torch.int64); t = r & 0xFFFFFF; s = r >> 24
+        v = t < M
+        out = torch.zeros((M * topk, K32i), dtype=torch.int64, device=device)
+        key = torch.where(v, t * topk + s, torch.zeros_like(t))
+        out[key] = torch.where(v[:, None], sc, out[key])
+        return out
+
+    sc16 = scale_by_pair(tst_s, b16["sorted_token_ids"], int(b16["cumsum_tensor"].item()))
+    sc32 = scale_by_pair(ref_s, b32["sorted_token_ids"], int(b32["cumsum_tensor"].item()))
+    smatch = (sc16 == sc32).float().mean().item()
+    print(f"  inter SCALE match (BM16 vs BM32, per pair): {smatch*100:.3f}%")
+    dif = (sc16 != sc32)
+    if dif.any():
+        ij = dif.nonzero()[:4]
+        for p in ij:
+            i, j = p.tolist()
+            print(f"    pair {i} kg {j}: bm16={int(sc16[i,j])} bm32={int(sc32[i,j])}")
+
     # ---- gemm2 both paths ----
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
     from aiter import ActivationType, QuantType
@@ -106,6 +142,7 @@ def main():
         w2_scale=w2sv, a2_scale=ref_s, sorted_weights=b32["sorted_weights"], b_nt=2)
 
     g2tn = int(sys.argv[2]) if len(sys.argv) > 2 else 256
+    g2tk = 256
     # torch-recomputed sorted_weights from topk_weight + sorted_token_ids decode
     sti16 = b16["sorted_token_ids"]
     raw = sti16.to(torch.int64)
@@ -123,7 +160,7 @@ def main():
     out16 = torch.zeros((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
     flydsl_moe_stage2(inter_states=tst_q, w2=w2v,
         sorted_token_ids=b16["sorted_token_ids"], sorted_expert_ids=b16["sorted_expert_ids"],
-        num_valid_ids=nv16, topk=topk, out=out16, tile_m=16, tile_n=g2tn, tile_k=256,
+        num_valid_ids=nv16, topk=topk, out=out16, tile_m=16, tile_n=g2tn, tile_k=g2tk,
         a_dtype="fp4", b_dtype="fp4", out_dtype="bf16", mode="atomic",
         w2_scale=w2sv, a2_scale=tst_s, sorted_weights=b16["sorted_weights"],
         b_nt=2, sort_block_m=16)
@@ -167,6 +204,56 @@ def main():
     outf.index_add_(0, torch.where(rvalid, rtid, torch.zeros_like(rtid)),
                     torch.where(rvalid[:, None], contrib, torch.zeros_like(contrib)))
     print(f"  out16-FLAT+torchreduce vs mxref: {cos(outf, mxref):.5f}  norm={outf.float().norm():.2f}")
+
+    # ---- characterize: gemm2@32 FLAT (correct acc) vs gemm2@16 FLAT per (token,slot) ----
+    flat32b = torch.zeros((ms32, D_HIDDEN), dtype=dtypes.bf16, device=device)
+    flydsl_moe_stage2(inter_states=ref_q, w2=w2v,
+        sorted_token_ids=b32["sorted_token_ids"], sorted_expert_ids=b32["sorted_expert_ids"],
+        num_valid_ids=nv32, topk=topk, out=flat32b, tile_m=32, tile_n=256, tile_k=256,
+        a_dtype="fp4", b_dtype="fp4", out_dtype="bf16",
+        w2_scale=w2sv, a2_scale=ref_s, sorted_weights=None, b_nt=2, flat_output=True)
+    torch.cuda.synchronize()
+
+    def flat_by_pair(flatbuf, sti, nv):
+        r = sti[:nv].to(torch.int64); t = r & 0xFFFFFF; s = r >> 24
+        v = t < M
+        out = torch.zeros((M * topk, D_HIDDEN), dtype=torch.float32, device=device)
+        key = torch.where(v, t * topk + s, torch.zeros_like(t))
+        out[key] = torch.where(v[:, None], flatbuf[:nv].float(), out[key])
+        return out
+    f16p = flat_by_pair(flat, b16["sorted_token_ids"], int(b16["cumsum_tensor"].item()))
+    f32p = flat_by_pair(flat32b, b32["sorted_token_ids"], int(b32["cumsum_tensor"].item()))
+    valid_pair = (f32p.abs().sum(1) > 0)
+    fr = (f16p[valid_pair] / (f32p[valid_pair] + 1e-6))
+    print(f"  FLAT per-pair cos: {cos(f16p[valid_pair], f32p[valid_pair]):.5f}")
+    print(f"  FLAT elem ratio f16/f32: mean={fr.mean():.3f} std={fr.std():.3f} "
+          f"med={fr.median():.3f}")
+    # per-column mean ratio (first 8 cols) to see if N-dependent
+    colr = (f16p[valid_pair].mean(0) / (f32p[valid_pair].mean(0).abs() + 1e-6))
+    # per-row(pair) mean ratio variance
+    rowr = f16p[valid_pair].norm(dim=1) / (f32p[valid_pair].norm(dim=1) + 1e-6)
+    print(f"  per-pair norm ratio: mean={rowr.mean():.3f} std={rowr.std():.4f} "
+          f"min={rowr.min():.3f} max={rowr.max():.3f}")
+    # which sorted rows (BM16) are wrong? correlate ratio with row position-in-block
+    sti16b = b16["sorted_token_ids"]; nvv16 = int(b16["cumsum_tensor"].item())
+    rr = sti16b[:nvv16].to(torch.int64); tt = rr & 0xFFFFFF; ss = rr >> 24
+    vv = tt < M
+    rowr16 = flat[:nvv16].float().norm(dim=1)
+    f32_by_pair_norm = f32p.norm(dim=1)
+    pair_key = tt * topk + ss
+    ref_norm = torch.where(vv, f32_by_pair_norm[torch.where(vv, pair_key, torch.zeros_like(pair_key))], torch.ones_like(rowr16))
+    ratio_row = rowr16 / (ref_norm + 1e-6)
+    pos_in_blk = torch.arange(nvv16, device=device) % 16
+    blk_idx = torch.arange(nvv16, device=device) // 16
+    bad = vv & (ratio_row < 0.9)
+    good = vv & (ratio_row >= 0.9)
+    print(f"  valid rows={int(vv.sum())} bad(<0.9)={int(bad.sum())} good={int(good.sum())}")
+    if bad.any():
+        bp = pos_in_blk[bad]
+        print(f"  bad rows pos-in-block: {sorted(set(bp.tolist()))[:20]}")
+        print(f"  good rows pos-in-block: {sorted(set(pos_in_blk[good].tolist()))[:20]}")
+        # block parity (even/odd 16-block within 32-group)
+        print(f"  bad block-idx parity (blk%2): 0->{int(((blk_idx[bad]%2)==0).sum())} 1->{int(((blk_idx[bad]%2)==1).sum())}")
     # per-token norms
     pn32 = out32.float().norm(dim=1)
     pn16 = out16.float().norm(dim=1)
