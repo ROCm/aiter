@@ -612,8 +612,15 @@ def build_mixed_moe_gemm1_kernel(
         expert_rsrc = _ptr_buffer_resource(arg_expert_ids, eid_nbytes_i32)
         bias_rsrc = _ptr_buffer_resource(arg_bias, bias_nbytes) if enable_bias else None
 
-        # Sorted-scale buffer resource for fused mxfp4 quantization
-        _sorted_scale_cols = inter_dim // 32
+        # Sorted-scale buffer resource for fused mxfp4 quantization.
+        # Pad the e8m0 group-N count up to a multiple of 8 (== inter_dim padded
+        # to the next 256), matching the 256-padded scale layout that stage2
+        # reads (scale_k_padded / scale_kblk_padded). This keeps the producer
+        # sorted-scale row stride (`_n32_sort` below) consistent with stage2's
+        # scale descriptor; otherwise stage1 writes stride inter_dim//32 while
+        # stage2 reads the padded stride -> wrong e8m0 bytes -> garbage output
+        # for inter_dim not a multiple of 256 (e.g. 384). No-op when 256-aligned.
+        _sorted_scale_cols = ((inter_dim // 32) + 7) // 8 * 8
         _sorted_scale_cols_i32 = fx.Int32(_sorted_scale_cols)
         sorted_scale_rsrc = None
         if const_expr(_need_sort):
