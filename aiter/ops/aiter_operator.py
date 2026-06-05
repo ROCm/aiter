@@ -56,8 +56,7 @@ def _make_output(input: Tensor, other: Tensor) -> Tensor:
     gen_func=binary_add_build_args,
     gen_fake=binary_out_fake_shape,
 )
-def _add_kernel(input: Tensor, other: Tensor, output: Tensor) -> bool:
-    ...
+def _add_kernel(input: Tensor, other: Tensor, output: Tensor) -> bool: ...
 
 
 @compile_ops(
@@ -67,8 +66,7 @@ def _add_kernel(input: Tensor, other: Tensor, output: Tensor) -> bool:
     gen_func=binary_sub_build_args,
     gen_fake=binary_out_fake_shape,
 )
-def _sub_kernel(input: Tensor, other: Tensor, output: Tensor) -> bool:
-    ...
+def _sub_kernel(input: Tensor, other: Tensor, output: Tensor) -> bool: ...
 
 
 @compile_ops(
@@ -78,8 +76,7 @@ def _sub_kernel(input: Tensor, other: Tensor, output: Tensor) -> bool:
     gen_func=binary_mul_build_args,
     gen_fake=binary_out_fake_shape,
 )
-def _mul_kernel(input: Tensor, other: Tensor, output: Tensor) -> bool:
-    ...
+def _mul_kernel(input: Tensor, other: Tensor, output: Tensor) -> bool: ...
 
 
 @compile_ops(
@@ -89,8 +86,7 @@ def _mul_kernel(input: Tensor, other: Tensor, output: Tensor) -> bool:
     gen_func=binary_div_build_args,
     gen_fake=binary_out_fake_shape,
 )
-def _div_kernel(input: Tensor, other: Tensor, output: Tensor) -> bool:
-    ...
+def _div_kernel(input: Tensor, other: Tensor, output: Tensor) -> bool: ...
 
 
 @compile_ops(
@@ -100,8 +96,7 @@ def _div_kernel(input: Tensor, other: Tensor, output: Tensor) -> bool:
     gen_func=binary_add_build_args,
     gen_fake=binary_inp_fake_shape,
 )
-def _add_kernel_(input: Tensor, other: Tensor) -> bool:
-    ...
+def _add_kernel_(input: Tensor, other: Tensor) -> bool: ...
 
 
 @compile_ops(
@@ -111,8 +106,7 @@ def _add_kernel_(input: Tensor, other: Tensor) -> bool:
     gen_func=binary_sub_build_args,
     gen_fake=binary_inp_fake_shape,
 )
-def _sub_kernel_(input: Tensor, other: Tensor) -> bool:
-    ...
+def _sub_kernel_(input: Tensor, other: Tensor) -> bool: ...
 
 
 @compile_ops(
@@ -122,8 +116,7 @@ def _sub_kernel_(input: Tensor, other: Tensor) -> bool:
     gen_func=binary_mul_build_args,
     gen_fake=binary_inp_fake_shape,
 )
-def _mul_kernel_(input: Tensor, other: Tensor) -> bool:
-    ...
+def _mul_kernel_(input: Tensor, other: Tensor) -> bool: ...
 
 
 @compile_ops(
@@ -133,8 +126,7 @@ def _mul_kernel_(input: Tensor, other: Tensor) -> bool:
     gen_func=binary_div_build_args,
     gen_fake=binary_inp_fake_shape,
 )
-def _div_kernel_(input: Tensor, other: Tensor) -> bool:
-    ...
+def _div_kernel_(input: Tensor, other: Tensor) -> bool: ...
 
 
 def add(input: Tensor, other: Tensor) -> Tensor:
@@ -190,10 +182,8 @@ def div_(input: Tensor, other: Tensor) -> Tensor:
 
 
 @compile_ops("module_aiter_unary", gen_fake=sigmoid_fake_shape)
-def sigmoid(input: Tensor) -> Tensor:
-    ...
+def sigmoid(input: Tensor) -> Tensor: ...
 
 
 @compile_ops("module_aiter_unary", gen_fake=sigmoid_fake_shape)
-def tanh(input: Tensor) -> Tensor:
-    ...
+def tanh(input: Tensor) -> Tensor: ...
