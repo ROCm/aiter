@@ -189,8 +189,8 @@ __device__ __forceinline__ void epilog_store(
 //   un-applies it so the fp32 lands in NATURAL head-dim order in scratch. The
 //   combine pass (op_combine.hpp) does NOT re-swizzle — it reads plane element d as
 //   natural column d — so this function MUST write natural order, exactly like
-//   epilog_store does for its DRAM O. col_base = swz(k_sub*8) is therefore copied
-//   VERBATIM from epilog_store.
+//   epilog_store does for its DRAM O. col_base = swz(k_sub*8) therefore
+//   mirrors epilog_store.
 //
 //   Params:
 //     o_acc_d0/d1     : the two head-dim halves of the output accumulator (in place)
@@ -213,7 +213,7 @@ __device__ __forceinline__ void epilog_store_split(
     float* scratch_o_base,
     float* scratch_lse_base)
 {
-    // --- Ownership math: copied VERBATIM from epilog_store ---
+    // --- Ownership math: mirrors epilog_store ---
     const int lane_id = threadIdx.x & 63;
     const int warp_id = threadIdx.x >> 6;
     const int k_sub   = lane_id >> 5;

@@ -3,7 +3,6 @@
 #include "fused/op_combine.hpp"
 #include "mha_native_launch.h"
 
-// Body verbatim from fmha_native/src/fused/kernel.cpp:110-113.
 __global__ void __launch_bounds__(kBlockSize)
 fmha_fwd_d64_bf16_combine(FmhaFwdCombineParams params) {
     combine_split(params, blockIdx.z, blockIdx.x, blockIdx.y);

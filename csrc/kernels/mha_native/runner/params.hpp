@@ -1,12 +1,8 @@
 // Kernel argument block (kernarg) for the fused FMHA forward shader.
 //
 // This is the single struct passed by value to every fused-kernel entry
-// point (fmha_fwd_d64_bf16_msk{0,1}[_varlen] in src/fused/kernel.cpp).  The
-// benchmark (src/bench_fmha_fwd.cpp) fills it from device pointers + strides
-// computed in FmhaBuffers; the device-side reader is fmha_fwd_d64_device() in
-// src/fused/pipeline.hpp.  It is shared by bench only — the tests drive the
-// kernels through the same path but the CPU/GPU oracles use their own param
-// structs (FmhaParams / GpuRefParams).
+// point (fmha_fwd_d64_bf16_msk{0,1}[_varlen] in the entry .cu files).  The
+// device-side reader is fmha_fwd_d64_device() in fused/pipeline.hpp.
 //
 // Layout note: the field order here IS the kernarg layout the HSACO expects,
 // so do not reorder fields without re-checking the kernel ABI.
@@ -38,8 +34,7 @@ struct FmhaFwdParams {
     // Softmax scale, PRE-MULTIPLIED by log2(e): scale == log2(e)/sqrt(head_dim),
     // NOT a plain 1/sqrt(head_dim).  The kernel's softmax is base-2 (it uses
     // exp2, not exp), so folding log2(e) into the scale converts the natural-e
-    // softmax into the equivalent base-2 form.  See bench_fmha_fwd.cpp
-    // (kLog2e/sqrtf(head_dim)) and op_softmax.hpp.
+    // softmax into the equivalent base-2 form.  See op_softmax.hpp.
     float scale;
 
     // All strides below are in ELEMENTS (BF16 units), not bytes.  For each
@@ -68,9 +63,9 @@ struct FmhaFwdParams {
 // Split-K runs the forward attention G times over disjoint KV ranges, each pass
 // writing a *normalized* fp32 partial output + a per-row natural-log LSE into a
 // "scratch" staging buffer.  The combine pass then reweights those G partials
-// back into the single global-softmax output (see cpu_ref_combine.hpp for the
+// back into the single global-softmax output (see op_combine.hpp for the
 // math) and stores the final BF16 O.  This struct is the by-value argument the
-// combine __global__ (fmha_fwd_d64_bf16_combine in src/fused/kernel.cpp) reads.
+// combine __global__ (fmha_fwd_d64_bf16_combine in the entry .cu files) reads.
 //
 // Scratch layout is "split-major": the G partial planes are the outermost axis,
 // so plane g for the whole (B,Hq,Sq) problem is contiguous before plane g+1.
@@ -93,10 +88,10 @@ struct FmhaFwdCombineParams {
     // combine ALSO writes the exact fp32 convex-combination result (before bf16
     // truncation) here, in NATURAL head-dim order, CONTIGUOUS [B][Hq][Sq][64]:
     //   o_fp32 index (b,h,R,d) = (((b*Hq + h)*Sq + R)*64 + d
-    // This is the un-truncated O the bf16 store rounds — tests compare it to
-    // cpu_ref_combine at ~1e-5 to catch reweight-weight bugs the bf16 (~1e-3)
-    // bound would hide. nullptr (the default for all value-init `cp{}` callers,
-    // e.g. bench + run_combine_e2e) disables it → the bf16 path is byte-identical.
+    // This is the un-truncated O the bf16 store rounds — a caller can check it
+    // at ~1e-5 to catch reweight-weight bugs the bf16 (~1e-3)
+    // bound would hide. nullptr (the default for all value-init `cp{}` callers)
+    // disables it → the bf16 path is byte-identical.
     float* o_fp32 = nullptr;
 };
 
@@ -111,7 +106,7 @@ struct FmhaFwdCombineParams {
 // combine pass (op_combine.hpp) then folds the G partials into the final O.
 //
 // This struct is the by-value argument the split-forward __global__
-// (fmha_fwd_d64_bf16_msk{0,1}_split in kernel.cpp) receives. It simply CARRIES
+// (fmha_fwd_d64_bf16_msk{0,1}_split in the entry .cu files) receives. It simply CARRIES
 // the existing forward kernarg (base) plus the split-only extras; the device
 // function fmha_fwd_d64_device() still takes a `const FmhaFwdParams&` (== base)
 // plus the split inputs as trailing arguments, so the four existing call sites
@@ -133,7 +128,7 @@ struct FmhaFwdSplitParams {
     int num_splits;            // G (KV axis is partitioned into G disjoint ranges)
     // split_idx: which of the G splits this launch handles. The shipping globals
     // DECODE the split index from blockIdx.z (grid z-axis is batch*num_splits;
-    // split_idx = blockIdx.z % num_splits — see kernel.cpp), so this field is
+    // split_idx = blockIdx.z % num_splits — see the entry .cu files), so this field is
     // redundant in the current dispatch; it is kept for completeness so a host
     // caller could instead pass the split index explicitly. The device function
     // takes split_idx as an argument either way.
@@ -142,7 +137,7 @@ struct FmhaFwdSplitParams {
 
 // --- Compile-time tile / launch geometry (D64 BF16 kernel specific) ---
 // These describe how the fused kernel partitions the problem and lays out LDS.
-// The benchmark also reads kM0 (M-tile size) and kBlockSize to build the grid.
+// The host launcher also reads kM0 (M-tile size) and kBlockSize to build the grid.
 // Tile constants (D64 bf16 specific)
 constexpr int kM0 = 128;          // query rows per M-tile (one threadblock's work in Q)
 constexpr int kN0 = 64;           // key columns per K-tile (GEMM0 inner N)

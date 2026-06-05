@@ -3,7 +3,6 @@
 #include "fused/pipeline.hpp"
 #include "mha_native_launch.h"
 
-// Body verbatim from fmha_native/src/fused/kernel.cpp:167-178.
 __global__ void __launch_bounds__(kBlockSize, 4)
 fmha_fwd_d64_bf16_msk1_split(FmhaFwdSplitParams sp) {
     __shared__ char lds[kLdsBytes];

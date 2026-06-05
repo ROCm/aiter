@@ -359,7 +359,7 @@ __device__ __forceinline__ void store_v_to_lds(
 // These are the pre-async-copy K staging path: a synchronous DRAM->VGPR
 // buffer_load_b128 followed by a manual VGPR->LDS store, using a different LDS
 // layout (k_lds_offset). They were called by an old `_device.hpp` entry that has
-// since been removed; nothing in src/ or tests/ references them now (the live K
+// since been removed; nothing in this kernel references them now (the live K
 // staging is async_copy_k_subtile above). New readers can skip this block.
 // ================================================================
 

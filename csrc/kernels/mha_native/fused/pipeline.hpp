@@ -12,8 +12,9 @@
 //
 // ROLE IN THE PIPELINE
 //   fmha_fwd_d64_device<HasMask,IsVarlen> IS the whole FMHA forward pass for one
-//   M-tile (kM0=128 query rows of one batch/head). kernel.cpp's four __global__
-//   entries are thin shells that decode blockIdx and call this. Everything below
+//   M-tile (kM0=128 query rows of one batch/head). The four __global__
+//   entries in the entry .cu files are thin shells that decode blockIdx and call
+//   this. Everything below
 //   orchestrates the helpers in op_lds.hpp / op_gemm.hpp / op_softmax.hpp /
 //   op_epilog.hpp into a software-pipelined loop over the KV tiles.
 //
@@ -100,7 +101,7 @@ constexpr int LdsSeq[4] = {1, 2, 1, 0};
 //   lds      : this block's __shared__ scratch (kLdsBytes; the 3 rotating buffers).
 //   batch_idx/head_idx/m_tile_idx : the tile coordinates (from blockIdx; the
 //                                   causal M-tile reversal already applied in
-//                                   kernel.cpp for the masked entries).
+//                                   the entry .cu files for the masked entries).
 //   --- TRAILING split-only args (defaults keep the four existing call sites
 //       byte-identical: they pass none of these, so non-split callers are
 //       unchanged) ---
@@ -198,7 +199,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         //   seqlen_k_end= raw_end rounded UP to a whole kN0 tile (so the diagonal
         //                 tile itself is still processed; softmax_mask handles the
         //                 partial masking within it), clamped to seqlen_k.
-        // Combined with the heavy-first M-tile reversal in kernel.cpp, this is what
+        // Combined with the heavy-first M-tile reversal in the entry .cu files, this is what
         // makes causal cost ~linear in m_tile.
         int last_q_row = m_tile_idx * kM0 + kM0 - 1;
         if (last_q_row >= seqlen_q) last_q_row = seqlen_q - 1;

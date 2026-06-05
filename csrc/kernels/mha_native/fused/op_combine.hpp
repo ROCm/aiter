@@ -16,7 +16,7 @@
 //   them back into the single global-softmax output, then truncates fp32 -> bf16
 //   and stores the final O.
 //
-// THE MATH (must reproduce cpu_ref_combine exactly; natural-e domain)
+// THE MATH (natural-e domain)
 //   For one output row, given G partials O_g[0..63] and scalars LSE_g:
 //       M       = max_g LSE_g                       (global row max)
 //       w_g     = (LSE_g == -inf) ? 0 : exp(LSE_g - M)   (max-subtract: stable)
@@ -32,9 +32,9 @@
 //   layout BEFORE writing scratch, so the combine consumes already-natural
 //   planes.) Therefore the combine reads scratch plane element d and writes O
 //   column d DIRECTLY: it must NOT run d through swz(). Applying swz here would
-//   permute the columns and break the real-partial (Source B) invariance test.
+//   permute the columns and break the natural-order layout invariant.
 //
-// LAUNCH CONTRACT (mirrors the forward kernel; see test_combine.cpp header)
+// LAUNCH CONTRACT (mirrors the forward kernel)
 //   Grid : dim3(nhead_q, m_tiles, batch)  — one block per (b, h, m_tile),
 //          m_tiles = ceil(seqlen_q / kM0), kM0 = 128 query rows per tile.
 //   Block: kBlockSize (=256) threads.
@@ -56,7 +56,7 @@
 //   The combine struct does not carry the batch count B, but the split-major
 //   g-stride needs it. B == gridDim.z (the grid's batch axis), so we recover it
 //   from the launch geometry. The decode b = blockIdx.z + the batch_stride_o term
-//   make B>1 correct (test_combine's core case is B=1; the e2e tests cover B=2).
+//   make B>1 correct.
 
 // Convex-combination combine for ONE output tile.
 //   p       : combine kernarg block (scratch pointers, O pointer + strides, G).
@@ -84,7 +84,7 @@ __device__ __forceinline__ void combine_split(
     // of the split-major scratch is (B*Hq*Sq) elements for LSE / *64 for O.
     const int B  = gridDim.z;
 
-    // Split-major scratch indices, matching test_combine.cpp's helpers EXACTLY:
+    // Split-major scratch indices (match the split-forward pass EXACTLY):
     //   scratch_o  (g,b,h,R,d) = ((((g*B + b)*Hq + h)*Sq + R)*64 + d
     //   scratch_lse(g,b,h,R)   =  (((g*B + b)*Hq + h)*Sq + R
     // The per-g stride lets us step plane to plane by adding a constant; we keep
@@ -97,9 +97,8 @@ __device__ __forceinline__ void combine_split(
     // num_splits == 1 fast path: a single plane carries the full softmax, so
     // its weight is 1 and the combine is a straight copy. This both (a) avoids
     // the needless exp()/divide and (b) makes the G=1 identity bit-exact: O[d]
-    // is o_part[0][d] truncated to bf16, which is precisely what the test's
-    // identity check expects (it compares against bf16_to_float(float_to_bf16(
-    // o_part[0][d])) at tol 1e-6; our perm-truncation drops the same low 16 bits).
+    // is o_part[0][d] truncated to bf16 (i.e. bf16_to_float(float_to_bf16(
+    // o_part[0][d])); our perm-truncation drops the same low 16 bits).
     // ---------------------------------------------------------------------
     // bf16 truncation selector: pick the HIGH 16 bits of each fp32 (bytes 3,2 and
     // 7,6) — i.e. drop the low mantissa bits == truncation, NOT round-to-nearest.
@@ -114,7 +113,7 @@ __device__ __forceinline__ void combine_split(
 
     // Optional fp32 precision tap (p.o_fp32 != nullptr): the EXACT fp32 result the
     // bf16 store rounds, in its OWN CONTIGUOUS natural-order layout [B][Hq][Sq][64]
-    // (NOT the strided bf16 o_row_base). Tests compare this to cpu_ref_combine at
+    // (NOT the strided bf16 o_row_base). It lets a caller check the reweight at
     // ~1e-5 to catch reweight-weight bugs the bf16 (~1e-3) store tolerance hides.
     const long of_base = (((long)(b * Hq + h) * Sq + R) * kD);
 
@@ -163,11 +162,10 @@ __device__ __forceinline__ void combine_split(
         // Step 2: unnormalized weights w_g = exp(lse_g - M) and their sum.
         // denom > 0 always (the plane with lse_g == M contributes exp(0) = 1),
         // but we still guard the reciprocal.
-        // Accumulate the denominator in DOUBLE precision, mirroring cpu_ref_combine
-        // (which sums denom in double). With wide LSE spreads and large G, fp32
-        // denom drift would otherwise exceed the 1e-3 bf16-store tolerance. Use the
-        // precise expf (NOT the fast __expf intrinsic) so the weights match the
-        // oracle's expf to fp32 ULPs.
+        // Accumulate the denominator in DOUBLE precision. With wide LSE spreads
+        // and large G, fp32 denom drift would otherwise exceed the 1e-3 bf16-store
+        // tolerance. Use the precise expf (NOT the fast __expf intrinsic) so the
+        // weights stay accurate to fp32 ULPs.
         double denom = 0.0;
         // Two passes keep the register footprint tiny (no per-g weight array):
         // first sum the denominator, then re-walk the planes accumulating O.
@@ -208,8 +206,8 @@ __device__ __forceinline__ void combine_split(
     }
 
     // Optional global LSE: L* = M + ln(denom) in natural units. The split-K
-    // bench/e2e callers pass params.lse == nullptr, so this is untested but
-    // implemented for completeness and guarded so a null pointer never faults.
+    // callers pass params.lse == nullptr, so this path is currently unexercised
+    // but implemented for completeness and guarded so a null pointer never faults.
     if (p.lse) {
         // Recompute denom cheaply (kept out of the hot path above to avoid a live
         // register across the O accumulation); M is finite here unless all-empty.

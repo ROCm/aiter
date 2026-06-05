@@ -301,7 +301,7 @@ __device__ __forceinline__ void gemm1_subtile(
 // scalar FMA loop that broadcasts P across lanes with ds_bpermute instead of the
 // P.V MFMA. Both are superseded by gemm0_subtile / gemm1_subtile above. They
 // were called by an old `_device.hpp` entry that has since been removed; nothing
-// in src/ or tests/ references them now (the live pipeline.hpp calls
+// in this kernel references them now (the live pipeline.hpp calls
 // gemm0_subtile). `inline` so they emit no code while uncalled. New readers can
 // skip this block.
 // ================================================================

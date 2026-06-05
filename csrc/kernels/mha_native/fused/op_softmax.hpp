@@ -118,7 +118,7 @@ __device__ __forceinline__ void softmax_mask(
     // than a vector compare. That is INTENTIONALLY left simple — the scalar VALU
     // work is hidden behind the neighboring MFMA pipeline and was verified to be a
     // non-issue. The real causal performance lever is block load-balance (heavy
-    // M-tiles launched first), handled in kernel.cpp, NOT here.
+    // M-tiles launched first), handled in the entry .cu files, NOT here.
     constexpr int offsets[16] = {0,1,2,3,4,5,6,7, 16,17,18,19,20,21,22,23};
     #pragma unroll
     for (int i = 0; i < 16; i++) {
@@ -262,7 +262,7 @@ __device__ __forceinline__ void rescale_o_acc(
 // per register slot instead of a single per-row scalar), and (2) they reduce with
 // a full log2(32) butterfly of ds_bpermutes instead of the single lane^32
 // exchange the TransposedC layout makes sufficient. They were called by an old
-// `_device.hpp` entry that has since been removed; nothing in src/ or tests/
+// `_device.hpp` entry that has since been removed; nothing in this kernel
 // references them now (the live pipeline.hpp uses the scalar softmax_row_max /
 // softmax_row_sum / softmax_exp2 above). `inline` so they emit no code while
 // uncalled. New readers can skip this block.
