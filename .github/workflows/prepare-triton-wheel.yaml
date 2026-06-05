@@ -13,6 +13,16 @@ on:
         required: false
         type: string
         default: triton_wheelhouse
+      checkout-ref:
+        description: Git ref or SHA to check out before preparing artifacts.
+        required: false
+        type: string
+        default: ""
+      source-artifact-name:
+        description: Name of the source archive artifact uploaded for the caller workflow run.
+        required: false
+        type: string
+        default: ""
       retention-days:
         description: Number of days to keep the Triton wheel artifact.
         required: false
@@ -28,6 +38,50 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout-ref || github.sha }}
+
+      - name: Sync submodules for source archive
+        if: ${{ inputs.source-artifact-name != '' }}
+        run: |
+          set -ex
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "Nightly build: syncing latest CK from develop branch..."
+            git submodule set-branch --branch develop 3rdparty/composable_kernel
+            git submodule sync
+            git submodule update --init --recursive --remote --jobs 4
+          else
+            echo "Using pinned CK commit..."
+            git submodule sync
+            git submodule update --init --recursive --depth 1 --jobs 4
+          fi
+          echo "CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"
+
+      - name: Create source archive
+        if: ${{ inputs.source-artifact-name != '' }}
+        run: |
+          set -euo pipefail
+          SOURCE_ARCHIVE=aiter-source.tar.gz
+          rm -f "${SOURCE_ARCHIVE}"
+          tar \
+            --exclude=".git" \
+            --exclude="*/.git" \
+            --exclude="dist" \
+            --exclude="build" \
+            --exclude="aiter_meta" \
+            --exclude="*.egg-info" \
+            --exclude=".aiter-prebuild.*" \
+            --exclude="triton_wheels" \
+            --exclude="${SOURCE_ARCHIVE}" \
+            -czf "${SOURCE_ARCHIVE}" .
+
+      - name: Upload source archive artifact
+        if: ${{ inputs.source-artifact-name != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.source-artifact-name }}
+          path: aiter-source.tar.gz
+          retention-days: ${{ inputs.retention-days }}
 
       - name: Download Triton wheel
         id: download_triton_wheel
