@@ -1,0 +1,10 @@
+The headers under runner/ and fused/ in this directory are VERBATIM copies from:
+
+  repo:   fmha_native
+  commit: f7daf176a581732906d93290d51192a6f7c18c00
+  paths:  src/runner/params.hpp
+          src/fused/{pipeline,op_combine,op_softmax,op_gemm,op_lds,op_epilog}.hpp
+
+Do not edit them in place. To re-sync, re-copy from the upstream commit and update
+the commit SHA above. The hand-written entry/orchestrator .cu files in this directory
+(fmha_fwd_d64_bf16_*.cu, mha_fwd_native_splitkv.cu) are aiter glue and are NOT copied.
