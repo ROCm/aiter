@@ -110,23 +110,27 @@ TESTS = [
         "run_on_schedule": True,
     },
     {
-        # GLM-5.1 (InferenceX MI355X frontier model) SGLang accuracy gate.
-        # Uses SGLang's own registered eval on the amd/aiter-ci branch
-        # (test_glm51_eval_mi35x.py -> suite nightly-amd-8-gpu-mi35x-glm51),
-        # which tests zai-org/GLM-5.1-FP8 with the DSA attention backend at TP=8
-        # (threshold 0.93, enforced inside the test).
-        # NOTE: the MXFP4 TP=2 variant (test_glm51_mxfp4_tp2_gsm8k_mi35x.py) only
-        # exists on sglang main, not amd/aiter-ci, so it cannot be used yet. Once
-        # it lands on amd/aiter-ci, switch to that TP2 gate on do-mi350x-2 to get
-        # off the saturated 8-GPU pool.
+        # GLM-5 MXFP4 (InferenceX MI355X frontier model) SGLang accuracy gate.
+        # MXFP4 is the AITER-critical MoE kernel path, so this is the most
+        # relevant GLM gate for AITER regressions. Uses SGLang's registered eval
+        # on amd/aiter-ci (test_glm5_mxfp4_eval_mi35x.py -> suite
+        # nightly-amd-8-gpu-mi35x-glm5-mxfp4): amd/GLM-5-MXFP4, TP=8, gsm8k
+        # threshold 0.90 (enforced inside the test).
+        # The test reads GLM5_MXFP4_MODEL_PATH, so model_path_env wires the
+        # /models cache automatically (no source patch needed); it falls back to
+        # the HF ~90GB download if the model is not staged on /models.
+        # GLM-5.1 specifics need either the 355GB GLM-5.1-FP8 staged on /models,
+        # or the GLM-5.1-MXFP4 TP=2 test landing on amd/aiter-ci (then move this
+        # gate to TP2 on do-mi350x-2, off the saturated 8-GPU pool).
         "runner": "linux-aiter-do-mi350x-8",
         "label": "MI35X",
-        "model": "GLM-5.1-FP8",
-        "model_id": "zai-org/GLM-5.1-FP8",
+        "model": "GLM-5-MXFP4",
+        "model_id": "amd/GLM-5-MXFP4",
+        "model_path_env": "GLM5_MXFP4_MODEL_PATH",
         "test_type": "Accuracy",
         "timeout_minutes": 130,
         "extra_exec_args": "",
-        "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm51 --nightly --timeout-per-file 5400",
+        "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm5-mxfp4 --nightly --timeout-per-file 5400",
         "run_on_pr": True,
         "run_on_schedule": True,
     },
