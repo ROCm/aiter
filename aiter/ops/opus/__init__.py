@@ -8,8 +8,6 @@ two callables become stubs that raise RuntimeError on invocation, so
 `import aiter` keeps working alongside its 30+ other ops.
 """
 
-import warnings
-
 from ._arch import _detect_arch
 
 _SUPPORTED = {"gfx950", "gfx942"}
@@ -48,12 +46,6 @@ if _arch_ok:
 else:
     # Don't raise ImportError -- aiter/__init__.py's star-import would catch
     # it and silently disable the 30+ subsequent op imports.
-    warnings.warn(
-        f"{_FEATURE} is gfx950-only; detected arch={_detected_arch!r}. "
-        f"opus_gemm_* calls will raise RuntimeError at invocation. {_HINT}",
-        RuntimeWarning,
-        stacklevel=2,
-    )
     gemm_a16w16_opus = _make_unsupported_arch_stub("gemm_a16w16_opus")
     opus_gemm_a16w16_tune = _make_unsupported_arch_stub("opus_gemm_a16w16_tune")
     opus_gemm_workspace_init = _make_unsupported_arch_stub("opus_gemm_workspace_init")

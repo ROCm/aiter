@@ -67,6 +67,7 @@ jobs:
     steps:
       - name: Download documentation artifacts
         uses: actions/download-artifact@v4
+        timeout-minutes: 15
         with:
           name: documentation
           path: ./html
