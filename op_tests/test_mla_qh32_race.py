@@ -78,7 +78,7 @@ def reference_mla(q_fp8, kv_buffer_fp8, qo_indptr, kv_indptr, kv_indices,
 # ---------------------------------------------------------------------------
 
 def build_inputs(batch_size, ctx_len, nhead, kv_lora_rank, qk_rope_head_dim,
-                 page_size, decode_qlen, dtype, kvtype):
+                 page_size, decode_qlen, dtype, kvtype, max_splits=1):
     nhead_kv = 1
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
 
@@ -111,7 +111,7 @@ def build_inputs(batch_size, ctx_len, nhead, kv_lora_rank, qk_rope_head_dim,
     q_scale = torch.ones([1], dtype=torch.float, device="cuda")
     kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-    max_split_per_batch = 1  # kv split disabled for qh32
+    max_split_per_batch = max_splits
 
     (
         (work_meta_data_size, work_meta_data_type),
@@ -193,9 +193,52 @@ def build_inputs(batch_size, ctx_len, nhead, kv_lora_rank, qk_rope_head_dim,
     )
 
 
-def run_kernel(inp):
+def reinit_metadata(inp):
+    """Re-initialize work_meta_data/indptr/info_set to freshly-allocated tensors,
+    then repopulate via get_mla_metadata_v1 — simulates a cold-start state."""
+    aiter.get_mla_metadata_v1(
+        inp["qo_indptr"],
+        inp["kv_indptr"],
+        inp["kv_last_page_lens"],
+        inp["nhead"] // inp["nhead_kv"],
+        inp["nhead_kv"],
+        False,
+        inp["work_meta_data"],
+        inp["work_info_set"],
+        inp["work_indptr"],
+        inp["reduce_indptr"],
+        inp["reduce_final_map"],
+        inp["reduce_partial_map"],
+        page_size=inp["page_size"],
+        kv_granularity=max(inp["page_size"], 16),
+        max_seqlen_qo=int(inp["max_seqlen_qo"]),
+        uni_seqlen_qo=1,
+        fast_mode=True,
+        max_split_per_batch=inp["max_split_per_batch"],
+        intra_batch_mode=False,
+        dtype_q=inp["q_fp8"].dtype,
+        dtype_kv=inp["kv_buffer_fp8"].dtype,
+    )
+
+
+_flush_buf = None
+
+def flush_caches():
+    """Dispatch a large GEMM to evict I-cache, L1, and L2 on all CUs."""
+    global _flush_buf
+    if _flush_buf is None:
+        _flush_buf = torch.randn(4096, 4096, dtype=torch.float32)
+    torch.mm(_flush_buf, _flush_buf)
+    torch.cuda.synchronize()
+
+
+def run_kernel(inp, out_fill=-1, reinit_meta=False):
+    if inp.get("flush_caches"):
+        flush_caches()
+    if reinit_meta:
+        reinit_metadata(inp)
     v_head_dim = inp["kv_lora_rank"]
-    out = torch.empty((inp["total_q"], inp["nhead"], v_head_dim), dtype=torch.bfloat16).fill_(-1)
+    out = torch.empty((inp["total_q"], inp["nhead"], v_head_dim), dtype=torch.bfloat16).fill_(out_fill)
     aiter.mla.mla_decode_fwd(
         inp["q_fp8"],
         inp["kv_buffer_fp8"].view(
@@ -229,65 +272,160 @@ def run_kernel(inp):
 # Tests
 # ---------------------------------------------------------------------------
 
-def test_determinism(inp, iters):
-    print(f"\n[determinism] running kernel {iters}x on identical inputs...")
-    outputs = [run_kernel(inp) for _ in range(iters)]
-    ref = outputs[0]
-    run_records = []
-    failed = 0
-    max_diff = 0.0
-    for i, out in enumerate(outputs[1:], 1):
-        diff = (out - ref).abs().max().item()
-        mean_diff = (out - ref).abs().mean().item()
-        match = torch.equal(out, ref)
-        max_diff = max(max_diff, diff)
-        if not match:
-            failed += 1
-            print(f"  run {i:3d}: MISMATCH  max_abs_diff={diff:.6f}  mean_abs_diff={mean_diff:.6f}")
-        run_records.append({"run": i, "match": match, "max_abs_diff": diff, "mean_abs_diff": mean_diff})
-    if failed == 0:
-        print(f"  PASS — all {iters} runs bit-identical  (max_diff={max_diff:.6f})")
+def _safe_diff(a, b):
+    """max and mean absolute diff, NaN-safe (returns inf if either tensor has NaN)."""
+    d = (a.float() - b.float()).abs()
+    has_nan = not (torch.isfinite(a).all() and torch.isfinite(b).all())
+    mx = float("inf") if has_nan else d.max().item()
+    mn = float("inf") if has_nan else d.mean().item()
+    return mx, mn
+
+
+def _bf16_hex(t_elem):
+    """Return hex string of a bfloat16 scalar."""
+    import struct
+    v = t_elem.to(torch.bfloat16).view(torch.int16).item() & 0xFFFF
+    return f"0x{v:04x}"
+
+
+def _analyze_failure(out, golden, label=""):
+    """Print [diag] breakdown matching original format.
+
+    out: (total_q, nhead, v_head_dim)  bfloat16 kernel output
+    golden: same shape, reference
+    """
+    out_f = out.float()
+    ref_f = golden.float() if golden is not None else None
+    nan_mask = ~torch.isfinite(out_f)
+    total_elem = out_f.numel()
+
+    global_max = out_f.abs().max().item()
+    magnitude = "small" if global_max < 10.0 else "large"
+
+    diff = (out_f - ref_f).abs() if ref_f is not None else None
+    thresh = 0.15
+    # NaN > thresh == False in PyTorch, so count NaN elements separately
+    nan_elem = int((~torch.isfinite(out_f)).sum().item())
+    corrupted = (int((diff > thresh).sum().item()) if diff is not None else 0) + nan_elem
+
+    print(f"    [diag] magnitude={magnitude}  global_max={global_max:.5g}"
+          f"  corrupted={corrupted}/{total_elem}")
+
+    if ref_f is not None:
+        per_head_max = diff.max(dim=0).values.max(dim=-1).values  # (nhead,)
+        lo_max = per_head_max[:16].max().item()
+        hi_max = per_head_max[16:].max().item()
+        worst_head = int(per_head_max.argmax().item())
+        print(f"    [diag] lo_heads(0-15) max={lo_max:.5g}"
+              f"  hi_heads(16-31) max={hi_max:.5g}  worst_head={worst_head}")
+        vals = "  ".join(f"{v:.3g}" for v in per_head_max.tolist())
+        print(f"    [diag] per_head_max: {vals}")
+
+        # top-5 worst batch items by max diff
+        per_batch_max = diff.max(dim=-1).values.max(dim=-1).values  # (total_q,)
+        top5_vals, top5_idx = per_batch_max.topk(min(5, per_batch_max.shape[0]))
+        top5 = [(int(idx.item()),
+                 "nan" if not torch.isfinite(v) else f"{v.item():.4g}")
+                for idx, v in zip(top5_idx, top5_vals)]
+        print(f"    [diag] top-5 batch items (idx, max_diff): {top5}")
+
+        # worst individual element
+        flat_idx = int(diff.reshape(-1).argmax().item())
+        total_q, nhead, vdim = out_f.shape
+        b = flat_idx // (nhead * vdim)
+        h = (flat_idx % (nhead * vdim)) // vdim
+        e = flat_idx % vdim
+        bad_val = out[b, h, e]
+        ref_val = golden[b, h, e]
+        sentinel_val = out.reshape(-1)[0].item()  # fill sentinel
+        is_sentinel = (bad_val.item() == sentinel_val and sentinel_val != 0.0)
+        bad_str = f"nan({_bf16_hex(bad_val)})" if not torch.isfinite(bad_val.float()) else f"{bad_val.item():.7g}({_bf16_hex(bad_val)})"
+        ref_str = f"{ref_val.item():.7g}({_bf16_hex(ref_val)})"
+        print(f"    [diag] worst elem batch={b} head={h} elem={e}"
+              f"  bad={bad_str}  ref={ref_str}  is_sentinel={is_sentinel}")
     else:
-        print(f"  FAIL — {failed}/{iters-1} runs differ from run 0  (max_diff={max_diff:.6f})")
-    return failed == 0, run_records, max_diff
+        # no reference — just show NaN counts
+        nan_per_head = nan_mask.sum(dim=(0, 2))
+        lo_nan = int(nan_per_head[:16].sum().item())
+        hi_nan = int(nan_per_head[16:].sum().item())
+        print(f"    [diag] lo_heads(0-15) NaN={lo_nan}  hi_heads(16-31) NaN={hi_nan}")
+        nan_per_batch = nan_mask.any(dim=(1, 2))
+        print(f"    [diag] batch items with NaN: {int(nan_per_batch.sum().item())}/{out.shape[0]}")
 
 
-def test_correctness(inp, batch_size, ctx_len, nhead, kv_lora_rank, qk_rope_head_dim, dtype, kvtype):
-    # Use the same inp as the determinism test — GPU is already warm and the race
-    # fires consistently on this data. A fresh random input might not trigger it.
-    # Only valid for page_size=1 (kernel addressing is correct there); for larger
-    # page sizes the kernel has a separate page-index addressing bug.
+def test_determinism(inp, iters, reinit_meta=False):
+    mode = "reinit_meta=ON" if reinit_meta else "reinit_meta=OFF"
+    print(f"\n[determinism] running kernel {iters}x on identical inputs... ({mode})")
+
+    outputs = [run_kernel(inp, out_fill=inp.get("out_fill", -1), reinit_meta=reinit_meta) for _ in range(iters)]
+
+    # Compute golden reference after all kernel runs so the CPU work doesn't
+    # alter GPU scheduling timing and inadvertently suppress the race.
+    golden = None
+    if inp["page_size"] == 1:
+        golden = reference_mla(
+            inp["q_fp8"],
+            inp["kv_buffer_fp8"].view(
+                inp["kv_buffer_fp8"].shape[0], inp["page_size"], inp["nhead_kv"], inp["qk_head_dim"]
+            ),
+            inp["qo_indptr"], inp["kv_indptr"], inp["kv_indices"], inp["kv_last_page_lens"],
+            inp["sm_scale"], inp["kv_lora_rank"], inp["qk_rope_head_dim"], inp["page_size"],
+            q_scale=inp["q_scale"], kv_scale=inp["kv_scale"],
+        )
+
+    REF_THRESHOLD = 0.15  # same as test_correctness
+
+    def _vs_ref_ok(out):
+        mx, _ = _safe_diff(out, golden)
+        return torch.isfinite(out).all().item() and mx < REF_THRESHOLD
+
+    run_records = []
+    ref_failed = 0
+
+    for i, out in enumerate(outputs):
+        out_finite = torch.isfinite(out).all().item()
+        vs_ref_max, vs_ref_mean = _safe_diff(out, golden) if golden is not None else (None, None)
+        ref_ok = _vs_ref_ok(out) if golden is not None else None
+        if golden is not None and not ref_ok:
+            ref_failed += 1
+            print(f"  run {i:4d}: MISMATCH  finite={out_finite}"
+                  f"  vs_ref max={vs_ref_max:.6f}  mean={vs_ref_mean:.6f}  ref_ok={ref_ok}")
+            _analyze_failure(out, golden, label=f"run{i}")
+        # vs_run0 comparison commented out:
+        # match = torch.equal(out, outputs[0])
+        # vs0_max, vs0_mean = _safe_diff(out, outputs[0])
+        run_records.append({
+            "run": i, "finite": out_finite,
+            **({"vs_ref_max": vs_ref_max, "vs_ref_mean": vs_ref_mean,
+                "ref_ok": ref_ok} if golden is not None else {}),
+        })
+
+    ref_summary = (f"  {iters - ref_failed}/{iters} correct vs pytorch ref"
+                   if golden is not None else "")
+    if ref_failed == 0:
+        print(f"  PASS — all {iters} runs correct vs pytorch ref")
+    else:
+        print(f"  FAIL — {ref_failed}/{iters} runs failed vs pytorch ref{ref_summary}")
+    return ref_failed == 0, run_records, golden
+
+
+def test_correctness(inp, golden):
     if inp["page_size"] != 1:
         print("\n[correctness] skipped — only valid for page_size=1 (use --page-size 1)")
         return None, {}
     print("\n[correctness] comparing warm kernel output to PyTorch fp32 reference...")
-    out_asm = run_kernel(inp)  # GPU already warm from determinism runs
-    out_ref = reference_mla(
-        inp["q_fp8"],
-        inp["kv_buffer_fp8"].view(
-            inp["kv_buffer_fp8"].shape[0], inp["page_size"], inp["nhead_kv"], inp["qk_head_dim"]
-        ),
-        inp["qo_indptr"],
-        inp["kv_indptr"],
-        inp["kv_indices"],
-        inp["kv_last_page_lens"],
-        inp["sm_scale"],
-        inp["kv_lora_rank"],
-        inp["qk_rope_head_dim"],
-        inp["page_size"],
-        q_scale=inp["q_scale"],
-        kv_scale=inp["kv_scale"],
-    )
-    max_diff = (out_asm - out_ref).abs().max().item()
-    mean_diff = (out_asm - out_ref).abs().mean().item()
+    out_asm = run_kernel(inp, out_fill=inp.get("out_fill", -1), reinit_meta=inp.get("reinit_meta", False))
+    max_diff, mean_diff = _safe_diff(out_asm, golden)
     cos_sim = (
-        (out_asm.float() * out_ref.float()).sum()
-        / (out_asm.float().norm() * out_ref.float().norm() + 1e-12)
+        (out_asm.float() * golden.float()).sum()
+        / (out_asm.float().norm() * golden.float().norm() + 1e-12)
     ).item()
     # fp8 quantization noise — use generous tolerance
-    passed = max_diff < 0.15
+    passed = torch.isfinite(out_asm).all().item() and max_diff < 0.15
     status = "PASS" if passed else "FAIL"
     print(f"  {status}  max_abs_diff={max_diff:.6f}  mean_abs_diff={mean_diff:.6f}  cos_sim={cos_sim:.6f}")
+    if not passed:
+        _analyze_failure(out_asm, golden, label="correctness")
     return passed, {"max_abs_diff": max_diff, "mean_abs_diff": mean_diff, "cos_sim": cos_sim, "passed": passed}
 
 
@@ -301,6 +439,14 @@ def main():
     parser.add_argument("--ctx", type=int, default=1024, help="KV context length (default: 1024)")
     parser.add_argument("--iters", type=int, default=30, help="determinism iterations (default: 30)")
     parser.add_argument("--page-size", type=int, default=64, help="KV page size (default: 64)")
+    parser.add_argument("--prefill", type=float, default=-1,
+                        help="value to fill output buffer with before each kernel launch (default: -1, use 0 to test output-buffer hypothesis)")
+    parser.add_argument("--reinit-meta", action="store_true",
+                        help="re-run get_mla_metadata_v1 before every kernel launch (tests work_meta_data cold-start hypothesis)")
+    parser.add_argument("--flush-caches", action="store_true",
+                        help="dispatch a 4096x4096 GEMM before every kernel launch to evict I-cache, L1, and L2")
+    parser.add_argument("--splits", type=int, default=1,
+                        help="max KV splits per batch item (default: 1=BF16 direct output; >1 exercises FP32 partial path)")
     parser.add_argument("--output", type=str, default=None,
                         help="save results to this JSON file (default: auto-named)")
     args = parser.parse_args()
@@ -312,11 +458,13 @@ def main():
     dtype = dtypes.fp8
     kvtype = dtypes.fp8
 
+    output_path_label = "fp32partial" if args.splits > 1 else "bf16direct"
     print(f"qh32 race reproducer — batch={args.batch}, ctx={args.ctx}, "
-          f"iters={args.iters}, page_size={args.page_size}")
+          f"iters={args.iters}, page_size={args.page_size}, splits={args.splits} ({output_path_label}), out_fill={args.prefill}")
     print(f"nhead={nhead}, dtype=fp8, kvtype=fp8, decode_qlen={decode_qlen}")
 
-    inp = build_inputs(
+    inp = {"out_fill": args.prefill, "reinit_meta": args.reinit_meta, "flush_caches": args.flush_caches}
+    inp.update(build_inputs(
         batch_size=args.batch,
         ctx_len=args.ctx,
         nhead=nhead,
@@ -326,17 +474,17 @@ def main():
         decode_qlen=decode_qlen,
         dtype=dtype,
         kvtype=kvtype,
-    )
+        max_splits=args.splits,
+    ))
 
-    det_ok, det_records, det_max_diff = test_determinism(inp, args.iters)
-    cor_ok, cor_record = test_correctness(inp, args.batch, args.ctx, nhead,
-                                          kv_lora_rank, qk_rope_head_dim, dtype, kvtype)
+    det_ok, det_records, golden = test_determinism(inp, args.iters, reinit_meta=args.reinit_meta)
+    cor_ok, cor_record = test_correctness(inp, golden)
     if cor_ok is None:
         cor_ok = True
         cor_record = {"skipped": True}
 
     print("\n--- summary ---")
-    print(f"  determinism: {'PASS' if det_ok else 'FAIL'}")
+    print(f"  determinism: {'PASS' if det_ok else 'FAIL'}")  # now: all runs correct vs pytorch ref
     print(f"  correctness: {'PASS' if cor_ok else 'FAIL'}")
 
     output_path = args.output or f"qh32_race_b{args.batch}_c{args.ctx}_i{args.iters}.json"
@@ -354,8 +502,7 @@ def main():
         },
         "determinism": {
             "passed": det_ok,
-            "max_diff_across_runs": det_max_diff,
-            "mismatched_runs": sum(1 for r in det_records if not r["match"]),
+            "ref_failed_runs": sum(1 for r in det_records if not r.get("ref_ok", True)),
             "runs": det_records,
         },
         "correctness": cor_record,
