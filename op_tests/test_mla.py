@@ -649,8 +649,9 @@ def test_mla(
 
     # Gluon MLA bh16bn128 decode test (gfx950, bf16 Q + fp8 KV, nhead in (4,8,16),
     # batch=1, decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
-    # NUM_KV_SPLITS=256 hardcoded; wrapper asserts min_kv_seq_len >= NUM_KV_SPLITS
-    # (=256; non-empty splits, num_iter >= 1). Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
+    # Token-bound NUM_KV_SPLITS = min(256, min_kv_seq_len) keeps splits non-empty
+    # for any ctx >= 1, so small kv (1..256) is supported.
+    # Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
     if (
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
@@ -661,7 +662,7 @@ def test_mla(
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
-        and ctx_lens >= 256
+        and ctx_lens >= 1
     ):
         err_gluon, us_gluon_decode = test_absorb_decode_gluon_bh16("bh16bn128")
         ret["decode:gluon_err"] = err_gluon
@@ -670,8 +671,9 @@ def test_mla(
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
 
     # Gluon MLA bh16bn64 decode test (gfx950, bf16 Q + bf16 KV).
-    # Splits must be non-empty, i.e.
-    # ctx >= NUM_KV_SPLITS = max(1, 256 // batch_size).
+    # Block-bound NUM_KV_SPLITS = min(256 // batch_size, cdiv(min_kv_seq_len, 64))
+    # keeps splits non-empty for any ctx >= 1 (collapses to 1 split when
+    # ctx <= 64), so small kv (1..256) is supported.
     # Example: -c 10000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 [-lse]
     if (
         get_gfx() == "gfx950"
@@ -683,7 +685,7 @@ def test_mla(
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
         and 1 <= batch_size <= 256
-        and ctx_lens >= (256 // batch_size)
+        and ctx_lens >= 1
     ):
         err_gluon, us_gluon_decode = test_absorb_decode_gluon_bh16("bh16bn64")
         ret["decode:gluon_err"] = err_gluon
