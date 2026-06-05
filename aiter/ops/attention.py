@@ -814,6 +814,8 @@ def get_ps_metadata_info_v1(
     num_head_k: int,
     max_qlen: int,
     qlen_granularity: int = 256,
+    max_kvlen: int | None = None,
+    kvlen_granularity: int = 128,
 ):
     """
     Returns:
@@ -833,22 +835,24 @@ def get_ps_metadata_info_v1(
     cus_per_cluster = cu_num // num_clusters
 
     max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
+    # When max_kvlen is not provided, fall back to max_qlen (causal-only sizing
+    # where KV length per q-tile is bounded by q length). Noncausal callers
+    # (e.g. chunked-context prefill) must pass the true max KV length per
+    # sequence so per-q-tile KV splits are accounted for.
+    effective_max_kvlen = max_kvlen if max_kvlen is not None else max_qlen
+    max_kv_split_per_qtile = max(1, math.ceil(effective_max_kvlen / kvlen_granularity))
 
     qo_tile_cnt = batch_size * max_qo_split_per_batch
-    # TODO: consider split q to reduce max_works & max_partials
-    max_works = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch * num_head_k
-    # NOTE: the previous max_partials formula assumed unsplit tiles (a single TG
-    # absorbing an entire q-tile) were tagged with partial_o_loc == -1 and thus
-    # contributed zero partial slots. v1_2_host.cuh now always assigns a real
-    # partial_o_loc so mla_reduce_v1 runs for those tiles too (required to
-    # populate final_lse, which downstream chunked-context merges in vLLM
-    # consume). Each work_info entry from one cluster now contributes one
-    # partial slot, so the bound must dominate per-cluster work_info count
-    # rather than just multi-split slots. Per-cluster work_info count is at
-    # most max_works / num_clusters; using (batch_size + cus_per_cluster - 1)
-    # * max_qo_split_per_batch is a tight upper bound that subsumes both the
-    # original split-driven partials and the newly-emitted unsplit-tile slots.
-    max_partials = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch
+    # Per-cluster work entries are bounded by total_units (sum over q-tiles of
+    # their KV-split count) plus one trailing slot per cluster per q-tile from
+    # the scheduler's allocate_work tail. total_units <= qo_tile_cnt *
+    # max_kv_split_per_qtile, so per-cluster work count <= qo_tile_cnt *
+    # (max_kv_split_per_qtile + cus_per_cluster). max_works covers all heads.
+    per_cluster_work = qo_tile_cnt * (max_kv_split_per_qtile + cus_per_cluster)
+    max_works = num_head_k * per_cluster_work
+    # Each work_info entry contributes at most one partial slot. max_partials
+    # bounds the per-head reduce_partial_map.
+    max_partials = per_cluster_work
 
     return (
         (2, torch.uint64),  # work_metadata_ptrs
