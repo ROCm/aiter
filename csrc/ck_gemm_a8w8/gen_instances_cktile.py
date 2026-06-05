@@ -43,6 +43,14 @@ class gemm_a8w8_fwd_codegen:
         self.tune_file = tune_file
 
 
+    def get_tune_dict(self):
+        if os.path.exists(self.tune_file):
+            return build_tune_dict(
+                pd.read_csv(self.tune_file), default_kernels_dict_cktile, kernels_list_cktile
+            )
+        return default_kernels_dict_cktile
+
+
     def gen_code(self, kernels_dict: dict):
         """
         Codegen for cktile gemm a8w8
@@ -77,7 +85,7 @@ class gemm_a8w8_fwd_codegen:
             self.gen_code(kernels_list_cktile)
         else:
             # generate code for tuned kernels from tune_file
-            self.gen_code(self.get_tune_dict(self.tune_file))       
+            self.gen_code(self.get_tune_dict())       
 
 
     def gen_instance(self, k: tileKernelInstance):
@@ -173,8 +181,18 @@ template torch::Tensor
                     )
                 ).write_text(INSTANCE_abF8)
         else:
-            # TODO: finish
-            pass
+            for EDtype in ["TILE_BF16", "TILE_FP16"]:
+                for ABDtype in ["TILE_FP8"]: # I8
+                    for DDtype in ["TILE_FP32", EDtype]:
+                        intsance = INSTANCE_template.format(
+                            name=k.name, dtypes=f"{ABDtype}, {DDtype}, {EDtype}"
+                        )
+                        Path(
+                            os.path.join(
+                                self.instances_path,
+                                f"{k.name}_ab{ABDtype}_d{DDtype}_e{EDtype}.cpp",
+                            )
+                        ).write_text(intsance)
 
 
     def gen_lookup_dict(self, kernels_dict: dict):
@@ -242,14 +260,6 @@ torch::Tensor
             for mnk, k in kernels_dict.items():
                 f.write(MAINFEST_template.format(kernel_name=k.name))
             f.write(MAINFEST_end)
-
-
-def get_tune_dict(tune_dict_csv):
-    if os.path.exists(tune_dict_csv):
-        return build_tune_dict(
-            pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list
-        )
-    return default_kernels_dict
 
 
 if __name__ == "__main__":

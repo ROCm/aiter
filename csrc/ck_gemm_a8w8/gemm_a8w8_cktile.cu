@@ -10,6 +10,8 @@
 #include "gemm_a8w8_cktile_common.cuh"
 #include "gemm_a8w8_cktile_lookup.h"
 #include "gemm_a8w8_cktile_manifest.h"
+#include "gemm_dispatch_utils.h"
+#include "py_itfs_common.h"
 
 
 using RowwiseKernel = torch::Tensor (*)(torch::Tensor&,
@@ -28,7 +30,7 @@ template <typename ABDataType, typename DDataType, typename EDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
     // TODO: fill this:
-    return a8w8_rowwise_cktile_128x128x128_1x4x1_16x16x64_intrawave_0x1x0_1<ABDataType, DDataType, EDataType>;
+    return a8w8_cktile_128x128x128_1x4x1_16x16x64_intrawave_0x1x0_1<ABDataType, DDataType, EDataType>;
 }
 
 // Helper function to return the next largest power of 2
@@ -110,46 +112,46 @@ torch::Tensor gemm_a8w8_cktile(torch::Tensor& XQ,
   int K = XQ.size(1);
   int KBatch = std::pow(2, splitK);
 
-  if (XQ.dtype() == at::ScalarType::Char)
+  // if (XQ.dtype() == at::ScalarType::Char)
+  // {
+  //   if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
+  //   {
+  //     rowwise_dispatch<TILE_I8, TILE_FP32, TILE_FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+  //   }
+  //   else if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
+  //   {
+  //     rowwise_dispatch<TILE_I8, TILE_FP32, TILE_BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+  //   }
+  //   else if (Y.dtype() == at::ScalarType::Half)
+  //   {
+  //     rowwise_dispatch<TILE_I8, TILE_FP16, TILE_FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+  //   }
+  //   else if (Y.dtype() == at::ScalarType::BFloat16)
+  //   {
+  //     rowwise_dispatch<TILE_I8, TILE_BF16, TILE_BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+  //   }
+  //   else
+  //   {
+  //     TORCH_CHECK(false, "Unsupported scales/output dtype!");
+  //   }
+  // }
+  // else
   {
     if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-      rowwise_dispatch<I8, F32, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+      rowwise_dispatch<TILE_FP8, TILE_FP32, TILE_FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
     }
     else if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-      rowwise_dispatch<I8, F32, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+      rowwise_dispatch<TILE_FP8, TILE_FP32, TILE_BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
     }
     else if (Y.dtype() == at::ScalarType::Half)
     {
-      rowwise_dispatch<I8, F16, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+      rowwise_dispatch<TILE_FP8, TILE_FP16, TILE_FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
     }
     else if (Y.dtype() == at::ScalarType::BFloat16)
     {
-      rowwise_dispatch<I8, B16, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-    }
-    else
-    {
-      TORCH_CHECK(false, "Unsupported scales/output dtype!");
-    }
-  }
-  else
-  {
-    if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
-    {
-      rowwise_dispatch<F8, F32, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-    }
-    else if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
-    {
-      rowwise_dispatch<F8, F32, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-    }
-    else if (Y.dtype() == at::ScalarType::Half)
-    {
-      rowwise_dispatch<F8, F16, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-    }
-    else if (Y.dtype() == at::ScalarType::BFloat16)
-    {
-      rowwise_dispatch<F8, B16, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+      rowwise_dispatch<TILE_FP8, TILE_BF16, TILE_BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
     }
     else
     {

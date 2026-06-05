@@ -589,7 +589,6 @@ def gemm_a8w8_CK(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
-
     q_dtype_w = WQ.dtype if WQ.dtype in [dtypes.fp8, dtypes.i8] else dtypes.i8
     ck_config = get_GEMM_config_with_quant_type(
         m, n, k, q_dtype_w, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
@@ -601,7 +600,17 @@ def gemm_a8w8_CK(
             splitK = 0
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     try:
-        return gemm_a8w8_ck(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
+        if ck_config is None:
+            gemm_fn = gemm_a8w8_ck
+        else:
+            libtype = ck_config["libtype"]
+            if libtype == "ck":
+                gemm_fn = gemm_a8w8_ck
+            elif libtype == "cktile":
+                gemm_fn = gemm_a8w8_cktile
+            else:
+                raise RuntimeError(f"Unknown libtype: {libtype}")
+        return gemm_fn(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
     except RuntimeError as e:
         raise RuntimeError(
             f"gemm_a8w8_CK failed for shape M={m}, N={n}, K={k}, "
