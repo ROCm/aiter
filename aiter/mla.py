@@ -1074,6 +1074,12 @@ def mla_decode_fwd_v4_nm(
       (= `num_kv_heads * gqa_ratio`). Adds a virtual K-column of logit
       `sink[h]` to the softmax denominator for head `h`; the same
       value is shared across ALL q_token positions.
+
+      Domain: POST-SCALE logit (matches AITER / FlashInfer / GPT-OSS
+      convention). No per-call conversion required — pass the value
+      directly. e.g. AITER GPT-OSS sink=7.0 maps to `sink_buf[h] = 7.0`.
+      Pass `torch.full((num_heads,), float("-inf"), dtype=fp32)` for
+      "no sink" semantics.
     """
     num_seqs = qo_indptr.shape[0] - 1
     num_heads = q.size(1)

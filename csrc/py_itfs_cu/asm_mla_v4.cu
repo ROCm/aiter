@@ -303,6 +303,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_max_seqlen_q = 1;
         }
     }
+    else if (gqa_ratio == 128 && q_type == "fp8" && kv_type == "fp8")
+    {
+        if(max_seqlen_q == 1)
+        {
+            sub_Q               = 64;
+            config_max_seqlen_q = 1;
+        }
+    }
 
     // ---- CSV lookup-key normalization ---------------------------------------
     // The shipped .co/symbol below the "qseqlen4_gqaratio16" name *also* serves
@@ -317,7 +325,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // affects which CSV row identifies the binary to load.
     int csv_gqa     = gqa_ratio;
     int csv_qseqlen = config_max_seqlen_q;
-    if(gqa_ratio == 64 && q_type == "fp8" && kv_type == "fp8" &&
+    if((gqa_ratio == 64 || gqa_ratio == 128) && q_type == "fp8" && kv_type == "fp8" &&
        config_max_seqlen_q == 1)
     {
         csv_gqa     = 16;

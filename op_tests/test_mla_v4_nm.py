@@ -230,7 +230,9 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
 
     Locks in the *scalar* portion (slot 7 scalar_f, slot 8-12 ints, slot 15
     int) of the kernarg buffer produced by csrc/py_itfs_cu/asm_mla_v4.cu for
-    the canonical qh64/gqa=16/page=1/passes=1/sub_Q=64 config. Any future
+    the canonical qh64/(gqa,qseq)∈{(16,4),(64,1),(128,1)}/page=1/passes=1
+    config (single .co; the C++ alias in asm_mla_v4.cu remaps gqa∈{64,128}
+    to the (gqa=16,qSeqLen=4) CSV row). Any future
     change to the dispatcher that shifts a slot, mis-computes a stride /
     scale, or changes the formula here will trip this test before the golden
     numerical test does.
@@ -743,12 +745,21 @@ def _run_one_point(
     per iter and trips a GPU OOM (the reason the hand-rolled timer used to
     live here).
     """
-    # gqa_ratio * q_seq_logical must equal 64 — the dispatcher's V3-style
-    # heuristic picks sub_Q=64 for the only shipped (gqa=16, fp8/fp8, qseq<=4)
-    # variant; the kernel tile is hardwired around that 64-row qheads block.
-    assert gqa_ratio * q_seq_logical == 64, (
-        f"gqa_ratio({gqa_ratio}) * q_seq_logical({q_seq_logical}) must equal 64 "
-        f"(the kernel-tile invariant baked into the qh64 .co)"
+    # The shipped qh64 .co has a 64 q-row tile; the dispatcher
+    # (csrc/py_itfs_cu/asm_mla_v4.cu) selects sub_Q based on (gqa_ratio,
+    # max_seqlen_q) and computes gdx = ceil(gqa*max_seqlen_q / sub_Q), so a
+    # single .co covers three (gqa, q_seq_logical) entry points:
+    #   (16, 4) — 16 heads × 4 logical-Q rows = 64 → gdx=1
+    #   (64, 1) — 64 heads × 1 logical-Q row  = 64 → gdx=1
+    #   (128,1) — 128 heads × 1 logical-Q row = 128 → gdx=2 (two WGs along head)
+    # The CSV alias in asm_mla_v4.cu remaps gqa∈{64,128} to the (16,4) lookup
+    # row so all three find the same kernel symbol.
+    _SHIPPED_TILE_VARIANTS = {(16, 4), (64, 1), (128, 1)}
+    assert (gqa_ratio, q_seq_logical) in _SHIPPED_TILE_VARIANTS, (
+        f"(gqa_ratio={gqa_ratio}, q_seq_logical={q_seq_logical}) not in shipped "
+        f"variants {_SHIPPED_TILE_VARIANTS} for the qh64 .co. The dispatcher "
+        f"picks sub_Q=64 and launches gdx=ceil(gqa*max_seqlen_q/64) WGs along "
+        f"the head dim; only these three pairs are exercised by CSV+dispatcher."
     )
 
     # Multi-split input guard (checked BEFORE any kernel launch): the .co inner
@@ -990,7 +1001,8 @@ def asm_sparse_attn_v4_paged_decode(
 ):
     """Mirror of ATOM/atom/model_ops/v4_kernels/paged_decode.py::sparse_attn_v4_paged_decode.
 
-    Constraints (current asm variant qh64/qseqlen4/gqa=16):
+    Constraints (current asm variant qh64/qseqlen4 — single .co aliased to
+    (gqa,q_seq_logical) ∈ {(16,4),(64,1),(128,1)}):
       - N (== total tokens) must be a multiple of 4.
       - Tokens are processed in groups of 4 as one "sequence" — tokens [b*4 ..
         (b+1)*4) MUST share the same kv span (i.e., kv_indptr is constant
@@ -1413,10 +1425,12 @@ if __name__ == "__main__":
         "--gqa-ratio",
         type=int,
         default=16,
-        help="num_heads / num_kv_heads. Must satisfy gqa_ratio * q_seq_logical "
-        "== 64 (the qh64 .co's kernel-tile invariant; the dispatcher picks "
-        "sub_Q=64 for our only shipped variant). Registry currently ships "
-        "only gqa_ratio=16; other values will hit 'no shipped variant' at dispatch.",
+        help="num_heads / num_kv_heads. Must satisfy (gqa_ratio, q_seq_logical) "
+        "in {(16,4), (64,1), (128,1)} — the three entry points the qh64 .co's "
+        "tile (64 q-rows) covers via the dispatcher's sub_Q=64 + "
+        "gdx=ceil(gqa*max_seqlen_q/64) launch geometry. The CSV in "
+        "hsa/gfx950/mla_v4/mla_v4_asm.csv ships a single (gqa=16, qSeqLen=4) "
+        "row; asm_mla_v4.cu remaps gqa∈{64,128} to that row at lookup time.",
     )
     parser.add_argument(
         "--attn-sink",
