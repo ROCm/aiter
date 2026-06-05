@@ -453,7 +453,8 @@ def _bench(args: argparse.Namespace) -> None:
         def _thunk():
             _run_grouped_via_fused_moe(**common)
 
-        us, _ = run_perftest(_thunk, num_warmup=args.warmup, num_iters=args.iters)
+        # run_perftest returns (data, avg_us); the timing is the second value.
+        _, us = run_perftest(_thunk, num_warmup=args.warmup, num_iters=args.iters)
         print(f"[bench] {args.data_format}/{args.layout} fused_moe end-to-end us = {us:.2f}",
               flush=True)
     finally:

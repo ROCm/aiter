@@ -490,6 +490,7 @@ def _compile_base_a8w4_gemm(
     stage1_act: str | None = None,
     epilogue_bias: bool = False,
     stage1_weight_layout: str = "gguu",
+    kernel_tag: str = "gemm",
 ):
     compiler = compile_mxfp4_gemm if cfg.data_format == "fp4" else compile_a8w4_gemm
     return compiler(
@@ -519,6 +520,7 @@ def _compile_base_a8w4_gemm(
         stage1_act=stage1_act,
         stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
+        kernel_tag=kernel_tag,
     )
 
 
@@ -571,13 +573,13 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         fused_n = 2 * cfg.inter_dim if cfg.stage1_weight_layout == "gugu" else cfg.inter_dim
         fused_base = _compile_base_a8w4_gemm(
             K=cfg.model_dim, N=fused_n, cfg=cfg, stage1_act=cfg.act,
-            stage1_weight_layout=cfg.stage1_weight_layout)
+            stage1_weight_layout=cfg.stage1_weight_layout, kernel_tag="gemm1")
         fused_base_bias = _compile_base_a8w4_gemm(
             K=cfg.model_dim, N=fused_n, cfg=cfg,
             stage1_act=cfg.act, epilogue_bias=True,
-            stage1_weight_layout=cfg.stage1_weight_layout)
+            stage1_weight_layout=cfg.stage1_weight_layout, kernel_tag="gemm1_bias")
     raw_base = _compile_base_a8w4_gemm(
-        K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg)
+        K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg, kernel_tag="gemm1_raw")
     finalize_act = _compile_stage1_finalize_act(
         experts=cfg.experts,
         max_m=cfg.max_m,
@@ -738,9 +740,11 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         persistent_workers=persistent_workers, data_format=str(data_format),
     )
     _validate_common(cfg)
-    base = _compile_base_a8w4_gemm(K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg)
+    base = _compile_base_a8w4_gemm(
+        K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, kernel_tag="gemm2")
     base_bias = _compile_base_a8w4_gemm(
-        K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, epilogue_bias=True)
+        K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, epilogue_bias=True,
+        kernel_tag="gemm2_bias")
 
     def launch(y, x, w, scale_x, scale_w, masked_m, max_m_arg, model_dim_arg,
                inter_dim_arg, experts_arg, *, stream=None, _gemm_events=None,
