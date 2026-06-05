@@ -186,10 +186,10 @@ def swizzle_scales_gfx1250(data):
 
 def preshuffle_weights_gfx1250(data):
     E, K, N = data.shape
-    data = data.transpose(-1, -2) # [E, N, K]
-    data = data.view(E, N // 16, 16, K // 16, 16) # [E, N // 16, 16, K // 16, 16]
-    data = data.permute(0, 1, 3, 2, 4).contiguous() # [E, N // 16, K // 16, 16, 16]
-    data = data.view(E, N // 16, K * 16) # [E, N // 16, K * 16]
+    data = data.transpose(-1, -2)  # [E, N, K]
+    data = data.view(E, N // 16, 16, K // 16, 16)  # [E, N // 16, 16, K // 16, 16]
+    data = data.permute(0, 1, 3, 2, 4).contiguous()  # [E, N // 16, K // 16, 16, 16]
+    data = data.view(E, N // 16, K * 16)  # [E, N // 16, K * 16]
     return data.transpose(-1, -2)
 
 
@@ -498,7 +498,7 @@ def moe_gemm_a4w4(
         out_dtype=out_dtype,
         add_residual=add_residual,
     )
-    
+
     return y_final
 
 
