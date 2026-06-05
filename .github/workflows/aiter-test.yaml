@@ -351,19 +351,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Download test shard lists
-        id: download_aiter_shards
-        uses: actions/download-artifact@v4
-        timeout-minutes: 15
-        continue-on-error: true
-        with:
-          name: aiter_shards
-
-      - name: Clean up test shard list download before retry
-        if: ${{ steps.download_aiter_shards.outcome == 'failure' }}
-        run: rm -f aiter_shard_*.list
-
-      - name: Retry download test shard lists
-        if: ${{ steps.download_aiter_shards.outcome == 'failure' }}
         uses: actions/download-artifact@v4
         timeout-minutes: 15
         with:
@@ -380,20 +367,6 @@ jobs:
           echo "$AITER_TEST"
 
       - name: Download Aiter wheel artifact
-        id: download_aiter_wheel
-        uses: actions/download-artifact@v4
-        timeout-minutes: 15
-        continue-on-error: true
-        with:
-          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
-          path: aiter_wheels
-
-      - name: Clean up Aiter wheel download before retry
-        if: ${{ steps.download_aiter_wheel.outcome == 'failure' }}
-        run: rm -rf aiter_wheels
-
-      - name: Retry download Aiter wheel artifact
-        if: ${{ steps.download_aiter_wheel.outcome == 'failure' }}
         uses: actions/download-artifact@v4
         timeout-minutes: 15
         with:
@@ -401,20 +374,6 @@ jobs:
           path: aiter_wheels
 
       - name: Download Triton wheel artifact
-        id: download_triton_wheel_artifact
-        uses: actions/download-artifact@v4
-        timeout-minutes: 15
-        continue-on-error: true
-        with:
-          name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
-          path: triton_wheels
-
-      - name: Clean up Triton wheel download before retry
-        if: ${{ steps.download_triton_wheel_artifact.outcome == 'failure' }}
-        run: rm -rf triton_wheels
-
-      - name: Retry download Triton wheel artifact
-        if: ${{ steps.download_triton_wheel_artifact.outcome == 'failure' }}
         uses: actions/download-artifact@v4
         timeout-minutes: 15
         continue-on-error: true
@@ -614,20 +573,6 @@ jobs:
     needs: [standard]
     steps:
       - name: Download all test logs
-        id: download_standard_test_logs
-        uses: actions/download-artifact@v4
-        timeout-minutes: 15
-        continue-on-error: true
-        with:
-          pattern: standard-test-log-*-shard-*
-          path: .
-
-      - name: Clean up standard test logs before retry
-        if: ${{ steps.download_standard_test_logs.outcome == 'failure' }}
-        run: rm -rf standard-test-log-*-shard-*
-
-      - name: Retry download all test logs
-        if: ${{ steps.download_standard_test_logs.outcome == 'failure' }}
         uses: actions/download-artifact@v4
         timeout-minutes: 15
         with:
@@ -680,20 +625,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Download Aiter wheel artifact
-        id: download_multigpu_aiter_wheel
-        uses: actions/download-artifact@v4
-        timeout-minutes: 15
-        continue-on-error: true
-        with:
-          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
-          path: aiter_wheels
-
-      - name: Clean up multi-GPU Aiter wheel download before retry
-        if: ${{ steps.download_multigpu_aiter_wheel.outcome == 'failure' }}
-        run: rm -rf aiter_wheels
-
-      - name: Retry download Aiter wheel artifact
-        if: ${{ steps.download_multigpu_aiter_wheel.outcome == 'failure' }}
         uses: actions/download-artifact@v4
         timeout-minutes: 15
         with:
@@ -701,20 +632,6 @@ jobs:
           path: aiter_wheels
 
       - name: Download Triton wheel artifact
-        id: download_multigpu_triton_wheel_artifact
-        uses: actions/download-artifact@v4
-        timeout-minutes: 15
-        continue-on-error: true
-        with:
-          name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
-          path: triton_wheels
-
-      - name: Clean up multi-GPU Triton wheel download before retry
-        if: ${{ steps.download_multigpu_triton_wheel_artifact.outcome == 'failure' }}
-        run: rm -rf triton_wheels
-
-      - name: Retry download Triton wheel artifact
-        if: ${{ steps.download_multigpu_triton_wheel_artifact.outcome == 'failure' }}
         uses: actions/download-artifact@v4
         timeout-minutes: 15
         continue-on-error: true
@@ -919,20 +836,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download standard test logs (mi35x only)
-        id: download_tuned_op_logs
-        uses: actions/download-artifact@v4
-        timeout-minutes: 15
-        continue-on-error: true
-        with:
-          pattern: standard-test-log-linux-aiter-mi35x-1-shard-*
-          path: /tmp/logs/
-
-      - name: Clean up tuned op logs before retry
-        if: ${{ steps.download_tuned_op_logs.outcome == 'failure' }}
-        run: rm -rf /tmp/logs
-
-      - name: Retry download standard test logs (mi35x only)
-        if: ${{ steps.download_tuned_op_logs.outcome == 'failure' }}
         uses: actions/download-artifact@v4
         timeout-minutes: 15
         continue-on-error: true
