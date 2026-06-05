@@ -2,15 +2,18 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 import torch
 import aiter
 import triton
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     sage_fwd,
     map_dims,
+    triton_bmm_pool_sim_simmean,
+    triton_fill_block_map_kernel,
+    triton_fill_causal_mask,
 )
-
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant
 
 from aiter.ops.triton.utils._triton import arch_info
@@ -78,6 +81,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         config: Optional[dict] = None,
         block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         smooth_k: bool = True,
+        freeze_softmax_max_count: int = -1,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -179,6 +183,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             lut_start=lut_start,
             lut_count=lut_count,
             use_block_sparse=use_block_sparse,
+            freeze_softmax_max_count=freeze_softmax_max_count,
         )
 
         if return_lse:
@@ -210,6 +215,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # config
             None,  # block_lut
             None,  # smooth_k
+            None,  # freeze_softmax_max_count
         )
 
 
@@ -229,6 +235,7 @@ def fav3_sage_wrapper_func(
     config: Optional[dict] = None,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     smooth_k: bool = True,
+    freeze_softmax_max_count: int = -1,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -260,6 +267,9 @@ def fav3_sage_wrapper_func(
                 (kv_block_indices, lut_start, lut_count) from block_attn_mask_to_ragged_lut.
                 When None, dense attention is used.
         smooth_k: Whether to apply k-smoothing to the K tensor
+        freeze_softmax_max_count: number of inner-loop K-block iterations after
+                which the online-softmax running max is frozen (block-sparse only;
+                -1 disables). See fav3_sage_func / build_attention_lut.
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -307,6 +317,7 @@ def fav3_sage_wrapper_func(
         config,
         block_lut,
         smooth_k,
+        freeze_softmax_max_count,
     )
 
 
@@ -330,6 +341,7 @@ def fav3_sage_func(
     lut_start: Optional[torch.Tensor] = None,
     lut_count: Optional[torch.Tensor] = None,
     use_block_sparse: bool = False,
+    freeze_softmax_max_count: int = -1,
 ):
     """
     SageAttention v1.
@@ -355,6 +367,13 @@ def fav3_sage_func(
         lut_start: Optional start index for the ragged LUT
         lut_count: Optional count of the ragged LUT
         use_block_sparse: Whether to use block-sparse attention
+        freeze_softmax_max_count: number of inner-loop K-block iterations after
+                which the online-softmax running max stops being updated. Once
+                frozen, the kernel skips the per-block max reduction and the acc
+                rescale, computing ``p = exp(qk - m)``, ``l += rowsum(p)`` and
+                ``acc += p @ v`` with ``m`` held fixed (VFA-style). ``-1``
+                (default) disables freezing and keeps the exact online softmax.
+                Only takes effect on the block-sparse path.
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -433,6 +452,18 @@ def fav3_sage_func(
 
     window_size_left, window_size_right = int(window_size[0]), int(window_size[1])
     use_sliding_window = window_size_left != -1 or window_size_right != -1
+
+    if use_block_sparse and use_sliding_window:
+        raise NotImplementedError(
+            "Sliding window and block-sparse attention cannot be enabled "
+            "together; set window_size=(-1, -1) when use_block_sparse=True."
+        )
+
+    if freeze_softmax_max_count >= 0 and not use_block_sparse:
+        raise ValueError(
+            "freeze_softmax_max_count is only meaningful with "
+            "use_block_sparse=True; leave it at -1 (disabled) otherwise."
+        )
 
     if use_block_sparse:
         if kv_block_indices is None or lut_start is None or lut_count is None:
@@ -536,6 +567,7 @@ def fav3_sage_func(
         RETURN_SCORES=False,
         USE_SEQUSED=False,
         USE_BLOCK_SPARSE=use_block_sparse,
+        FREEZE_SOFTMAX_MAX_COUNT=freeze_softmax_max_count,
         **config,
     )
 
@@ -543,3 +575,487 @@ def fav3_sage_func(
         return out, softmax_lse
     else:
         return out, None
+
+
+def get_pool_sim_triton_simmean(
+    x: torch.Tensor,
+    block_size: int,
+    simthreshd1: torch.Tensor,
+    attention_scored_only: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Mean-pool each block and flag internally-similar blocks.
+
+    Args:
+        x: ``(B, H, N, D)`` tensor.
+        block_size: number of tokens per block.
+        simthreshd1: ``(H,)`` per-head similarity threshold.
+        attention_scored_only: when ``True``, skip the intra-block similarity
+            test entirely and return ``None`` for ``sim_blocks``.
+
+    Steps:
+        1. Pool (mean) within each block.
+        2. Compute the mean pairwise cosine similarity within each block.
+        3. Flag blocks whose mean self-similarity exceeds ``simthreshd1``.
+
+    Note how the 3rd dimension ``N`` is reduced to ``nblock = N // block_size``;
+    this keeps the downstream block-attention proxy at ``O(nblock^2)`` instead
+    of the full ``O(N^2)``.
+
+    Returns:
+        pool: ``(B, H, nblock, D)`` tensor.
+        sim_blocks: ``(B, H, nblock)`` bool tensor, or ``None`` when
+            ``attention_scored_only`` is set.
+    """
+    x = x.contiguous()
+    B, H, N, D = x.shape
+    nblock = (N + block_size - 1) // block_size  # Number of blocks per feature map
+    pool = torch.empty((B, H, nblock, D), device=x.device, dtype=x.dtype)
+    if attention_scored_only:
+        sim_blocks = None
+        # The kernel needs a valid pointer; pass `pool` as an unused placeholder.
+        sim_arg = pool
+    else:
+        sim_blocks = torch.empty((B, H, nblock), device=x.device, dtype=torch.bool)
+        sim_arg = sim_blocks
+    grid = (B, H, nblock)
+    triton_bmm_pool_sim_simmean[grid](
+        x, pool, sim_arg, simthreshd1, N=N, D=D, BS=block_size, SKIP_SIM=attention_scored_only
+    )
+    return pool, sim_blocks
+
+
+def fill_block_map_triton(
+    final_map: torch.Tensor,
+    num_to_select: torch.Tensor,
+    sorted_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Scatter the top-``num_to_select`` ranked K blocks per (B, H, Q) into ``final_map``."""
+    final_map = final_map.contiguous()
+    num_to_select = num_to_select.contiguous()
+    sorted_indices = sorted_indices.contiguous()
+    B, H, Q, K = final_map.shape
+    grid = (B, H, Q)
+    triton_fill_block_map_kernel[grid](final_map, num_to_select, sorted_indices, K)
+    return final_map
+
+
+def fill_causal_mask_triton(mask: torch.Tensor, BqdivBk: float) -> torch.Tensor:
+    """Fill a 2-D ``(nq, nk)`` block-level causal mask for a Q/K block-size ratio."""
+    assert mask.dim() == 2
+    triton_fill_causal_mask[mask.shape](mask, BqdivBk)
+    return mask
+
+
+def get_block_map_meansim(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    is_causal: bool = False,
+    BLKQ: int = 64,
+    BLKK: int = 64,
+    simthreshd1: float = 0.1,
+    cdfthreshd: float = 0.9,
+    attention_sink: bool = False,
+    attention_scored_only: bool = False,
+) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    """Build a SpargeAttn block-sparse mask via the mean-similarity proxy.
+
+    Mean-pools Q/K into per-block representatives, forms the block-level score
+    ``pooled_q @ pooled_k^T * d**-0.5``, softmaxes over key blocks, and keeps the
+    smallest set of top key blocks whose cumulative probability reaches
+    ``cdfthreshd`` per query block.  Blocks that fail the intra-block similarity
+    test are forced on (their mean is not a faithful summary, so they must be
+    evaluated exactly).
+
+    Args:
+        attention_scored_only: when ``True``, skip the intra-block similarity
+            test and block-selection logic entirely, returning
+            ``(None, pooled_score)`` where ``pooled_score`` is the raw
+            block-level score ``pooled_q @ pooled_k^T * d**-0.5``.
+
+    Returns:
+        A ``(final_map, pooled_score)`` tuple.  ``final_map`` is a
+        ``(B, H, num_q_blocks, num_k_blocks)`` bool mask (or ``None`` when
+        ``attention_scored_only`` is set), and ``pooled_score`` is the
+        block-level score with positions that ``final_map`` masks out set to
+        ``-inf``.
+    """
+    nq = (q.shape[-2] + BLKQ - 1) // BLKQ
+    nk = (k.shape[-2] + BLKK - 1) // BLKK
+    pooled_q, sim_q = get_pool_sim_triton_simmean(q, BLKQ, simthreshd1, attention_scored_only)
+    pooled_k, sim_k = get_pool_sim_triton_simmean(k, BLKK, simthreshd1, attention_scored_only)
+    pooled_score = pooled_q @ pooled_k.transpose(-1, -2) * q.shape[-1] ** -0.5
+    if attention_scored_only:
+        return None, pooled_score
+
+    neg_inf = pooled_score.new_full((), float("-inf"))
+    sim_k = sim_k.unsqueeze(-2).expand(-1, -1, nq, -1)  # faster than repeat
+    sim_q = sim_q.unsqueeze(-1).expand(-1, -1, -1, nk)
+
+    prob = torch.where(sim_k, pooled_score, neg_inf)
+    causal_mask = None
+    if is_causal:
+        causal_mask = fill_causal_mask_triton(
+            torch.empty(nq, nk, device=q.device, dtype=torch.bool), BLKQ / BLKK
+        )
+        prob = torch.where(causal_mask[None, None], prob, neg_inf)
+    prob = prob.softmax(-1)
+
+    # Keep the smallest set of top key blocks whose cumulative mass reaches cdfthreshd.
+    sorted_score = torch.sort(prob, dim=-1, descending=True)
+    cdf = sorted_score.values.cumsum(dim=-1)
+    H, K = cdf.shape[1], cdf.shape[-1]
+    ge = cdf >= cdfthreshd.view(1, H, 1, 1)
+    idx = ge.to(torch.uint8).argmax(dim=-1)
+    num_to_select = torch.where(ge.any(dim=-1), idx, idx.new_full((), K))
+
+    final_map = fill_block_map_triton(
+        torch.zeros_like(prob, dtype=torch.bool), num_to_select, sorted_score.indices
+    )
+    final_map = final_map | ~sim_k | ~sim_q
+    if is_causal:
+        final_map = final_map * causal_mask[None, None]
+    if attention_sink:
+        final_map[:, :, :, 0] = 1
+    return final_map, torch.where(final_map, pooled_score, neg_inf)
+
+
+def _num_text_blocks(text_len: int, block_m: int, block_n: int) -> Tuple[int, int]:
+    """Number of (q, k) blocks spanned by ``text_len`` trailing text tokens."""
+    return (
+        (text_len + block_m - 1) // block_m,
+        (text_len + block_n - 1) // block_n,
+    )
+
+
+def _assemble_full_block_mask(
+    image_block_mask: torch.Tensor,
+    image_len_q: int,
+    image_len_k: int,
+    text_len: int,
+    block_m: int,
+    block_n: int,
+) -> torch.Tensor:
+    """Append dense text rows/columns to an image-only block mask.
+
+    Returns the full ``(B, H, n_iq + n_text_q, n_ik + n_text_k)`` mask in which
+    all Q rows attend to the text K columns, all text Q rows attend to
+    everything, and any partial image/text boundary block is forced dense (so
+    spillover tokens are never dropped).  A no-op when ``text_len == 0``.
+    """
+    if text_len == 0:
+        return image_block_mask
+
+    B, H, n_iq, n_ik = image_block_mask.shape
+    n_text_q, n_text_k = _num_text_blocks(text_len, block_m, block_n)
+
+    full = torch.zeros(
+        (B, H, n_iq + n_text_q, n_ik + n_text_k),
+        dtype=image_block_mask.dtype,
+        device=image_block_mask.device,
+    )
+    full[:, :, :n_iq, :n_ik] = image_block_mask
+    full[:, :, :, -n_text_k:] = True  # every Q row attends to text K cols
+    full[:, :, -n_text_q:, :] = True  # text Q rows attend to everything
+    if image_len_q % block_m != 0:  # partial boundary blocks -> dense
+        full[:, :, image_len_q // block_m, :] = True
+    if image_len_k % block_n != 0:
+        full[:, :, :, image_len_k // block_n] = True
+    return full
+
+
+def block_attn_mask_to_ragged_lut_topn_front(
+    block_attn_mask: torch.Tensor,
+    pooled_score: torch.Tensor,
+    sample_n: int,
+    num_heads: Optional[int] = None,
+    force_front_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build a ragged LUT with the top-``sample_n`` scored K blocks emitted first.
+
+    Like :func:`aiter.ops.triton.attention.utils.block_attn_mask_to_ragged_lut`,
+    this turns a block attention mask into a ragged
+    ``(kv_block_indices, lut_start, lut_count)`` LUT, but within each
+    ``(batch, head, q_block)`` segment it emits blocks in this order:
+
+      1. the ``sample_n`` highest ``pooled_score`` blocks, descending score;
+      2. the ``force_front_mask`` blocks (e.g. text), ascending block index;
+      3. the remaining attended blocks, ascending block index.
+
+    Building the LUT directly from the mask lets us write each segment out in the
+    desired order in a single pass -- no separate reorder of a pre-built LUT, and
+    the result is compactly packed (no over-allocation).
+
+    This pairs with the ``freeze_softmax_max_count`` block-sparse path
+    (:func:`fav3_sage_func`): the online-softmax running max is frozen after the
+    first few inner-loop iterations, so visiting the highest-scoring (and thus
+    likely highest-max) tiles -- plus any always-attended ``force_front`` tiles --
+    first makes the frozen max a tight estimate. See ``fav3_sage_vfa.py`` for the
+    analogous pooled-score top-N block selection.
+
+    Args:
+        block_attn_mask: ``(B, num_q_blocks, num_k_blocks)`` (shared across heads)
+            or ``(B, H, num_q_blocks, num_k_blocks)`` bool mask. True = attend.
+        pooled_score: fp32 ``(B, H, num_q_blocks, num_k_blocks)`` block-level
+            attention score (e.g. from :func:`get_block_map_meansim`). Only blocks
+            that are attended in ``block_attn_mask`` are ever selected.
+        sample_n: number of top-scored tiles to emit first per segment. ``<= 0``
+            emits only the ``force_front`` tiles ahead of the rest.
+        num_heads: number of Q heads; required when ``block_attn_mask`` is 3D.
+        force_front_mask: optional bool mask, same shape/broadcast as
+            ``block_attn_mask``, of blocks to place immediately after the sampled
+            tiles. Excluded from the top-``sample_n`` selection; only the
+            attended ones are emitted.
+
+    Returns:
+        ``kv_block_indices`` (1D int32), ``lut_start`` (1D int32) and
+        ``lut_count`` (1D int32), indexed by
+        ``idx = b * (H * num_q_blocks) + h * num_q_blocks + q_block``.
+    """
+    if block_attn_mask.dim() == 3:
+        if num_heads is None:
+            raise ValueError("num_heads must be provided when block_attn_mask is 3D")
+        B, Q, K = block_attn_mask.shape
+        block_attn_mask = block_attn_mask.unsqueeze(1).expand(B, num_heads, Q, K)
+        if force_front_mask is not None and force_front_mask.dim() == 3:
+            force_front_mask = force_front_mask.unsqueeze(1).expand(B, num_heads, Q, K)
+
+    B, H, Q, K = block_attn_mask.shape
+    assert pooled_score.shape[:3] == (B, H, Q) and pooled_score.shape[-1] == K, (
+        f"pooled_score shape {tuple(pooled_score.shape)} does not match mask "
+        f"{(B, H, Q, K)}"
+    )
+    device = block_attn_mask.device
+
+    attended = block_attn_mask.to(torch.bool)
+    lut_count = attended.sum(-1).to(torch.int32).reshape(-1)
+    lut_start = torch.cumsum(lut_count, 0) - lut_count
+
+    if force_front_mask is None:
+        force_front = torch.zeros_like(attended)
+    else:
+        # Only attended blocks can be emitted at all.
+        force_front = force_front_mask.to(torch.bool).expand(B, H, Q, K) & attended
+
+    neg_inf = pooled_score.new_full((), float("-inf"))
+    masked_score = torch.where(attended, pooled_score.to(torch.float32), neg_inf)
+
+    # Mark the top-``sample_n`` attended, non-force-front blocks per (B, H, Q) row.
+    is_topn = torch.zeros((B, H, Q, K), dtype=torch.bool, device=device)
+    n = min(sample_n, K)
+    if n > 0:
+        sample_score = torch.where(force_front, neg_inf, masked_score)
+        topk = sample_score.topk(n, dim=-1)
+        # A row with fewer than n candidates pads topk with -inf entries; mark
+        # only the finite (genuinely attended, non-force-front) selections.
+        is_topn.scatter_(-1, topk.indices, topk.values > neg_inf)
+
+    # Per-row ordering of the K blocks by (priority, tiebreak):
+    #   0 = attended & top-n      -> descending score (highest-max first)
+    #   1 = attended & force-front -> ascending block index
+    #   2 = attended, the rest    -> ascending block index
+    #   3 = not attended          -> sorts past the per-row count, so dropped
+    col = torch.arange(K, device=device).view(1, 1, 1, K)
+    priority = torch.where(
+        ~attended,
+        3,
+        torch.where(is_topn, 0, torch.where(force_front, 1, 2)),
+    )
+    tiebreak = torch.where(is_topn, -masked_score, col.to(torch.float32))
+
+    # Lexicographic (priority, tiebreak) sort per row via two stable sorts.
+    o1 = torch.argsort(tiebreak, dim=-1, stable=True)
+    order = torch.gather(
+        o1, -1, torch.argsort(torch.gather(priority, -1, o1), dim=-1, stable=True)
+    )
+
+    # The first ``count`` entries of each row are exactly the attended blocks in
+    # the desired order; pack them row-major into the ragged index list.
+    rows = order.reshape(B * H * Q, K)
+    keep = torch.arange(K, device=device)[None, :] < lut_count[:, None]
+    kv_block_indices = rows[keep].to(torch.int32).contiguous()
+    return kv_block_indices, lut_start, lut_count
+
+
+def reorder_lut_topn_to_front(
+    lut: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    pooled_score: torch.Tensor,
+    sample_n: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reorder an existing ragged LUT so top-``sample_n`` scored blocks lead each segment.
+
+    Companion to :func:`block_attn_mask_to_ragged_lut_topn_front` for when you
+    already hold a ragged LUT and no longer have the mask. It permutes the
+    attended K-block indices *within each* ``(batch, head, q_block)`` segment so
+    the ``sample_n`` highest ``pooled_score`` blocks come first (descending
+    score), with the rest kept in their original order. ``lut_start``/
+    ``lut_count`` are returned unchanged.
+
+    Prefer :func:`block_attn_mask_to_ragged_lut_topn_front` when you still have
+    the mask: it builds the ordered LUT in one pass and packs it compactly.
+    """
+    kv_block_indices, lut_start, lut_count = lut
+
+    B, H, Q, K = pooled_score.shape
+    num_segments = lut_count.numel()
+    assert num_segments == B * H * Q, (
+        f"lut_count has {num_segments} segments but pooled_score implies {B * H * Q} "
+        "(B*H*num_q_blocks)"
+    )
+
+    total_valid = int(lut_count.sum().item())
+    if sample_n <= 0 or total_valid == 0:
+        return kv_block_indices, lut_start, lut_count
+
+    device = kv_block_indices.device
+    pooled_flat = pooled_score.reshape(num_segments, K).to(torch.float32)
+
+    # Per-LUT-position segment id and the K-block it currently points at.
+    seg_id = torch.repeat_interleave(
+        torch.arange(num_segments, device=device), lut_count.to(torch.long)
+    )
+    kv_valid = kv_block_indices[:total_valid].to(torch.long)
+
+    # Restrict the top-n proposal to blocks actually present in the LUT so a
+    # finite-but-unattended pooled_score entry can never be selected.
+    attended = torch.zeros((num_segments, K), dtype=torch.bool, device=device)
+    attended[seg_id, kv_valid] = True
+    neg_inf = pooled_flat.new_full((), float("-inf"))
+    masked_score = torch.where(attended, pooled_flat, neg_inf)
+
+    n = min(sample_n, K)
+    topk = masked_score.topk(n, dim=-1)
+    is_topn_flat = torch.zeros((num_segments, K), dtype=torch.bool, device=device)
+    # A segment with fewer than n attended blocks yields -inf padding in topk;
+    # mark only the finite (genuinely attended) selections.
+    is_topn_flat.scatter_(1, topk.indices, topk.values > neg_inf)
+
+    score_pos = pooled_flat[seg_id, kv_valid]
+    is_topn_pos = is_topn_flat[seg_id, kv_valid]
+
+    # Lexicographic sort key (seg_id, priority, tiebreak) built via a cascade of
+    # stable sorts (least-significant first):
+    #   priority: 0 for moved (top-n) tiles, 1 for the rest.
+    #   tiebreak: moved tiles by descending score; the rest by original order.
+    pos = torch.arange(total_valid, device=device)
+    priority = (~is_topn_pos).to(torch.int64)
+    tiebreak = torch.where(is_topn_pos, -score_pos, pos.to(torch.float32))
+
+    o1 = torch.argsort(tiebreak, stable=True)
+    o2 = o1[torch.argsort(priority[o1], stable=True)]
+    final_perm = o2[torch.argsort(seg_id[o2], stable=True)]
+
+    new_kv = kv_block_indices.clone()
+    new_kv[:total_valid] = kv_block_indices[:total_valid][final_perm]
+    return new_kv, lut_start, lut_count
+
+
+def build_attention_lut(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    simthreshd1: float,
+    cdfthreshd: float,
+    mode: str = "both",
+    n_sample: int = 8,
+    is_causal: bool = False,
+    static_block_mask: Optional[torch.Tensor] = None,
+    text_len: int = 0,
+    block_m: int = 128,
+    block_n: int = 128,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], int]:
+    """Build a block-sparse ragged LUT for SpargeAttn and/or VFA.
+
+    One entry point that turns Q/K into a ready-to-use ragged LUT plus the
+    matching ``freeze_softmax_max_count``. ``mode`` selects the block set and
+    ordering:
+
+      * ``"sparge"``: keep only the SpargeAttn-selected (meansim) blocks and emit
+        them in ascending order. ``freeze_softmax_max_count = -1`` (the online
+        softmax max is never frozen); ``n_sample`` is ignored.
+      * ``"vfa"``: keep *all* K blocks (block-causal when ``is_causal``) but
+        front-load the top-``n_sample`` blocks by pooled score, so the frozen max
+        sees the most important tiles first.
+      * ``"both"``: keep only the SpargeAttn-selected blocks *and* front-load the
+        top-``n_sample`` of them by pooled score.
+
+    Text handling (``text_len > 0``): every q-block additionally attends to the
+    trailing dense text K blocks. For ``"vfa"``/``"both"`` those text blocks are
+    appended to the front immediately *after* the ``n_sample`` sampled tiles, and
+    the returned ``freeze_softmax_max_count`` is ``n_sample + n_text_blocks`` so
+    the max is frozen only once both the sampled and text tiles are visited.
+
+    Causality is handled at block granularity (whole K blocks are kept/dropped);
+    the block-sparse kernel does not apply an intra-block diagonal mask.
+
+    Args mirror :func:`compute_sparge_block_mask`, plus ``mode`` and ``n_sample``.
+
+    Returns:
+        ``(block_lut, freeze_softmax_max_count)`` where ``block_lut`` is the
+        ragged ``(kv_block_indices, lut_start, lut_count)`` tuple to pass as
+        ``block_lut`` to :func:`fav3_sage_wrapper_func` (or
+        ``kv_block_indices``/``lut_start``/``lut_count`` to :func:`fav3_sage_func`
+        with ``use_block_sparse=True`` and ``freeze_softmax_max_count=...``).
+    """
+    if mode not in ("vfa", "sparge", "both"):
+        raise ValueError(f"mode must be 'vfa', 'sparge' or 'both', got {mode!r}")
+
+    image_q = q[:, :, : q.shape[2] - text_len, :] if text_len > 0 else q
+    image_k = k[:, :, : k.shape[2] - text_len, :] if text_len > 0 else k
+    image_len_q = q.shape[2] - text_len
+    image_len_k = k.shape[2] - text_len
+    n_text_k = _num_text_blocks(text_len, block_m, block_n)[1] if text_len > 0 else 0
+
+    # "vfa" ranks every block (no sparsity selection), so it only needs the
+    # pooled score; "sparge"/"both" also need the meansim sparsity mask.
+    image_mask, image_score = get_block_map_meansim(
+        image_q,
+        image_k,
+        is_causal=is_causal,
+        BLKQ=block_m,
+        BLKK=block_n,
+        simthreshd1=simthreshd1,
+        cdfthreshd=cdfthreshd,
+        attention_scored_only=(mode == "vfa"),
+    )
+
+    if mode == "vfa":
+        # Keep all blocks (block-causal when requested) as sampling candidates.
+        B, H, n_iq, n_ik = image_score.shape
+        if is_causal:
+            causal = fill_causal_mask_triton(
+                torch.empty(n_iq, n_ik, device=q.device, dtype=torch.bool),
+                block_m / block_n,
+            )
+            image_mask = causal[None, None].expand(B, H, n_iq, n_ik).clone()
+        else:
+            image_mask = torch.ones((B, H, n_iq, n_ik), dtype=torch.bool, device=q.device)
+
+    if static_block_mask is not None:
+        image_mask = image_mask | static_block_mask[None, None, ...]
+
+    full_mask = _assemble_full_block_mask(
+        image_mask, image_len_q, image_len_k, text_len, block_m, block_n
+    )
+
+    if mode == "sparge":
+        return block_attn_mask_to_ragged_lut(full_mask), -1
+
+    # vfa / both: front-load the top-n sampled image tiles, then the dense text
+    # tiles. Scores live only over the image region; text/text-row positions stay
+    # -inf so they are never picked as sampled tiles (text is forced front).
+    B, H, n_iq, n_ik = image_mask.shape
+    n_tq, n_tk = full_mask.shape[-2], full_mask.shape[-1]
+    full_score = full_mask.new_full(
+        (B, H, n_tq, n_tk), float("-inf"), dtype=torch.float32
+    )
+    full_score[:, :, :n_iq, :n_ik] = image_score.to(torch.float32)
+
+    force_front = None
+    if n_text_k > 0:
+        force_front = torch.zeros((B, H, n_tq, n_tk), dtype=torch.bool, device=q.device)
+        force_front[:, :, :, -n_text_k:] = True
+
+    block_lut = block_attn_mask_to_ragged_lut_topn_front(
+        full_mask, full_score, n_sample, force_front_mask=force_front
+    )
+    return block_lut, n_sample + n_text_k

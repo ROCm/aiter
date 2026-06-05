@@ -421,6 +421,131 @@ def block_attn_mask_to_token_mask(
     return attn_mask
 
 
+def _block_sparse_allow_tile(
+    block_attn_mask,
+    q0,
+    q1,
+    k0,
+    k1,
+    BLOCK_M,
+    BLOCK_N,
+    device,
+):
+    """Extract the token-level allow mask for a (q, k) token tile.
+
+    Mirrors ``block_attn_mask_to_token_mask`` but only for the requested
+    token slices so the full (seqlen_q, seqlen_k) mask is never materialized.
+    """
+    nd = block_attn_mask.dim()
+    q_block_idx = (
+        torch.arange(q0, q1, device=device)
+        .div(BLOCK_M, rounding_mode="floor")
+        .clamp(max=block_attn_mask.shape[nd - 2] - 1)
+    )
+    k_block_idx = (
+        torch.arange(k0, k1, device=device)
+        .div(BLOCK_N, rounding_mode="floor")
+        .clamp(max=block_attn_mask.shape[nd - 1] - 1)
+    )
+    if nd == 3:
+        return block_attn_mask[:, q_block_idx, :][:, :, k_block_idx]  # (B, tq, tk)
+    return block_attn_mask[:, :, q_block_idx, :][:, :, :, k_block_idx]  # (B, H, tq, tk)
+
+
+def _attention_ref_block_sparse_tiled(
+    q,
+    k,
+    v,
+    block_attn_mask,
+    BLOCK_M,
+    BLOCK_N,
+    dtype_og,
+    key_padding_mask=None,
+    attn_bias=None,
+    tile_q=4096,
+    tile_k=4096,
+):
+    """Memory-bounded block-sparse reference using flash-attention-style tiling.
+
+    Computes the same result as the dense path without ever materializing the
+    full (batch, nheads, seqlen_q, seqlen_k) scores/softmax matrices, which would
+    OOM for long sequences. Only the output and lse are returned; the dense
+    attention-probability matrix is intentionally not materialized (returned as
+    ``None``). All existing callers discard that entry.
+    """
+    if attn_bias is not None:
+        raise NotImplementedError(
+            "attn_bias is not supported by the tiled block-sparse reference"
+        )
+    b, seqlen_q, h, d = q.shape
+    seqlen_k = k.shape[1]
+    device = q.device
+    scale = 1.0 / math.sqrt(d)
+
+    output = torch.empty((b, seqlen_q, h, d), device=device, dtype=torch.float32)
+    lse = torch.empty((b, h, seqlen_q), device=device, dtype=torch.float32)
+
+    for q0 in range(0, seqlen_q, tile_q):
+        q1 = min(q0 + tile_q, seqlen_q)
+        tq = q1 - q0
+        q_tile = q[:, q0:q1] * scale  # (b, tq, h, d)
+
+        m = torch.full((b, h, tq), float("-inf"), device=device, dtype=torch.float32)
+        l = torch.zeros((b, h, tq), device=device, dtype=torch.float32)
+        acc = torch.zeros((b, h, tq, d), device=device, dtype=torch.float32)
+
+        for k0 in range(0, seqlen_k, tile_k):
+            k1 = min(k0 + tile_k, seqlen_k)
+            k_tile = k[:, k0:k1]  # (b, tk, h, d)
+            v_tile = v[:, k0:k1]
+            scores = torch.einsum("bthd,bshd->bhts", q_tile, k_tile)  # (b, h, tq, tk)
+
+            allow = _block_sparse_allow_tile(
+                block_attn_mask, q0, q1, k0, k1, BLOCK_M, BLOCK_N, device
+            )
+            disallow = ~allow
+            if block_attn_mask.dim() == 3:
+                scores.masked_fill_(rearrange(disallow, "b t s -> b 1 t s"), float("-inf"))
+            else:
+                scores.masked_fill_(disallow, float("-inf"))
+            if key_padding_mask is not None:
+                kpm = key_padding_mask[:, k0:k1]
+                scores.masked_fill_(rearrange(~kpm, "b s -> b 1 1 s"), float("-inf"))
+
+            m_new = torch.maximum(m, scores.amax(dim=-1))
+            # Rows with no allowed keys yet stay at -inf; use a finite surrogate so
+            # exp() does not produce NaNs. Such rows contribute 0 to p / acc / l.
+            m_safe = torch.where(torch.isinf(m_new), torch.zeros_like(m_new), m_new)
+            p = torch.exp(scores - m_safe.unsqueeze(-1))  # (b, h, tq, tk)
+            correction = torch.exp(m - m_safe)  # (b, h, tq)
+
+            l = l * correction + p.sum(dim=-1)
+            acc = acc * correction.unsqueeze(-1) + torch.einsum(
+                "bhts,bshd->bhtd", p, v_tile
+            )
+            m = m_new
+
+        fully_masked = torch.isinf(m)  # (b, h, tq) -> rows with no allowed key
+        l_safe = torch.where(fully_masked, torch.ones_like(l), l)
+        out_tile = acc / l_safe.unsqueeze(-1)  # (b, h, tq, d)
+        out_tile = out_tile.masked_fill(fully_masked.unsqueeze(-1), 0.0)
+        output[:, q0:q1] = rearrange(out_tile, "b h t d -> b t h d")
+
+        lse_tile = torch.where(
+            fully_masked,
+            torch.full_like(m, float("-inf")),
+            m + torch.log(l_safe),
+        )
+        lse[:, :, q0:q1] = lse_tile
+
+    return (output.to(dtype=dtype_og), None, lse.to(dtype=dtype_og))
+
+
+# Above this many elements in the dense (b, h, sq, sk) scores matrix, fall back to
+# the tiled implementation to avoid materializing a multi-GB / OOM tensor.
+_BLOCK_SPARSE_DENSE_ELEM_LIMIT = 512 * 1024 * 1024
+
+
 def attention_ref_block_sparse(
     q,
     k,
@@ -444,6 +569,11 @@ def attention_ref_block_sparse(
     block_attn_mask: 3D (batch, num_q_blocks, num_kv_blocks) or
         4D (batch, num_heads, num_q_blocks, num_kv_blocks) boolean.
     Returns: (output, attention_scores, lse) like attention_ref.
+
+    For long sequences (where the dense (batch, nheads, seqlen_q, seqlen_k) scores
+    matrix would exceed an internal element limit), a memory-bounded tiled path is
+    used. In that case the second return value (the dense attention-probability
+    matrix) is ``None`` since materializing it would OOM.
     """
     assert block_attn_mask.dim() in (3, 4), "block_attn_mask must be 3D or 4D"
     dtype_og = q.dtype
@@ -457,6 +587,26 @@ def attention_ref_block_sparse(
     k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
     d = q.shape[-1]
+
+    dense_elems = q.shape[0] * q.shape[2] * seqlen_q * seqlen_k
+    if (
+        dense_elems > _BLOCK_SPARSE_DENSE_ELEM_LIMIT
+        and query_padding_mask is None
+        and attn_bias is None
+        and dropout_mask is None
+        and softcap == 0.0
+    ):
+        return _attention_ref_block_sparse_tiled(
+            q,
+            k,
+            v,
+            block_attn_mask,
+            BLOCK_M,
+            BLOCK_N,
+            dtype_og,
+            key_padding_mask=key_padding_mask,
+        )
+
     scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
     # Apply block-sparse mask: token_mask True = disallow -> -inf
     allow_mask = block_attn_mask_to_token_mask(

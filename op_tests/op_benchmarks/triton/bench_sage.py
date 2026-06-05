@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import argparse
-import csv
 import glob
 import json
 import logging
@@ -22,30 +21,11 @@ from aiter.ops.mha import flash_attn_func, flash_attn_fp8_pertensor_func
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.fav3_sage import (
+    build_attention_lut,
     fav3_sage_func,
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
-from aiter.ops.triton.attention.fav3_sage_vfa import (
-    compute_m_proxy_topn,
-    compute_m_sampled,
-    fav3_sage_vfa_func,
-    fav3_sage_vfa_wrapper_func,
-)
-
-# VFA m_init mode selection:
-#   GUIDED_SAMPLE=True (default) -> per-(q-block) max over the top-N_SAMPLE_BLOCKS
-#                          K blocks chosen by a SpargeAttn mean-pooled
-#                          block-score, evaluated with real K rows.
-#   GUIDED_SAMPLE=False -> per-row max over N_SAMPLE_BLOCKS uniformly random K
-#                          blocks.
-def _env_flag(name, default):
-    v = os.environ.get(name)
-    return default if v is None else v.lower() in ("1", "true", "yes", "on")
-
-
-GUIDED_SAMPLE = _env_flag("VFA_GUIDED_SAMPLE", True)
-N_SAMPLE_BLOCKS = int(os.environ.get("VFA_N_SAMPLE_BLOCKS", "16"))
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_func,
     fav3_sage_mxfp4_wrapper,
@@ -247,84 +227,85 @@ def kernel_block_sizes(kernel: KernelName) -> Tuple[int, int]:
     return cfg["BLOCK_M"], cfg["BLOCK_N"]
 
 
-def _make_sage_fp8_vfa_runner(
-    args: argparse.Namespace,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    softmax_scale: float,
-    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-) -> Any:
-    """Build a runner for the VFA-on-top-of-sage_fp8 kernel.
+def effective_attn_mode(args: argparse.Namespace) -> Optional[str]:
+    """Resolve the build_attention_lut mode for this run.
 
-    Non-causal only.  ``m_init`` always comes from the sampled/guided block
-    estimators; ``block_lut`` (if given) just restricts the hot loop to the
-    attended K blocks.
+    The mode is derived from the kernel name and ``--sparge``:
+
+    * ``sage_fp8_vfa`` + ``--sparge`` -> ``"both"`` (VFA running-max freeze on a
+      sparge-selected block LUT),
+    * ``sage_fp8_vfa`` (no ``--sparge``) -> ``"vfa"`` (freeze, dense LUT),
+    * any other kernel + ``--sparge`` -> ``"sparge"`` (block selection only).
+
+    Returns ``None`` for the plain dense / mask-driven path.
     """
-    if args.causal:
-        raise NotImplementedError("sage_fp8_vfa does not support causal attention yet")
+    is_vfa = args.kernel == "sage_fp8_vfa"
+    if args.sparge:
+        return "both" if is_vfa else "sparge"
+    if is_vfa:
+        return "vfa"
+    return None
 
-    if args.e2e:
-        return lambda: fav3_sage_vfa_wrapper_func(
-            q,
-            k,
-            v,
-            softmax_scale=softmax_scale,
-            return_lse=False,
-            layout=args.layout,
-            n_sample_blocks=N_SAMPLE_BLOCKS,
-            guided_sample=GUIDED_SAMPLE,
-            block_lut=block_lut,
+
+def _ragged_lut_to_block_mask(
+    block_lut: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    batch: int,
+    hq: int,
+    num_q_blocks: int,
+    num_kv_blocks: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Reconstruct the dense (B, HQ, num_q_blocks, num_kv_blocks) bool mask a LUT encodes."""
+    kv_block_indices, _, lut_count = block_lut
+    num_seg = batch * hq * num_q_blocks
+    total = int(lut_count.sum().item())
+    mask = torch.zeros(num_seg, num_kv_blocks, dtype=torch.bool, device=device)
+    if total > 0:
+        seg = torch.repeat_interleave(
+            torch.arange(num_seg, device=device), lut_count.to(torch.long)
         )
+        mask[seg, kv_block_indices[:total].to(torch.long)] = True
+    return mask.view(batch, hq, num_q_blocks, num_kv_blocks)
 
-    cfg = get_sage_fwd_configs()
-    fp8_type = aiter.dtypes.fp8
-    fp8_max = torch.finfo(fp8_type).max
-    BLKQ, BLKK = cfg["BLOCK_M"], cfg["BLOCK_N"]
 
-    q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale = sage_quant(
-        q,
-        k,
-        v,
-        fp8_type,
-        fp8_max,
-        BLKQ=BLKQ,
-        BLKK=BLKK,
-        sm_scale=softmax_scale,
-        layout=args.layout,
+def build_attn_mode_lut(
+    args: argparse.Namespace,
+    mode: str,
+    q_bhsd: torch.Tensor,
+    k_bhsd: torch.Tensor,
+    device: torch.device,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], int, torch.Tensor]:
+    """Build a VFA/Sparge ragged LUT (+ freeze count) from bhsd Q/K.
+
+    Returns ``(block_lut, freeze_softmax_max_count, block_attn_mask)``.  The mask
+    is reconstructed from the LUT so the ``--compare-to-ref`` block-sparse
+    reference path keeps working.
+    """
+    batch, hq, n_ctx_q, _ = q_bhsd.shape
+    n_ctx_k = k_bhsd.shape[2]
+    block_m, block_n = kernel_block_sizes(args.kernel)
+
+    simthreshd1 = torch.full((hq,), args.simthreshd1, device=device, dtype=torch.float32)
+    cdfthreshd = torch.full((hq,), args.cdfthreshd, device=device, dtype=torch.float32)
+
+    block_lut, freeze = build_attention_lut(
+        q_bhsd,
+        k_bhsd,
+        simthreshd1=simthreshd1,
+        cdfthreshd=cdfthreshd,
+        mode=mode,
+        n_sample=args.n_sample,
+        is_causal=False,
+        block_m=block_m,
+        block_n=block_n,
     )
 
-    kv_idx, lut_s, lut_c, sparse = _unpack_block_lut(block_lut)
-
-    if GUIDED_SAMPLE:
-        m_init = compute_m_proxy_topn(
-            q, k, q_int8, k_int8, q_scale, k_scale,
-            BLKQ=BLKQ, BLKK=BLKK, layout=args.layout,
-            n_blocks=N_SAMPLE_BLOCKS,
-        )
-    else:
-        m_init = compute_m_sampled(
-            q_int8, k_int8, q_scale, k_scale,
-            BLKQ=BLKQ, BLKK=BLKK, layout=args.layout, n_blocks=N_SAMPLE_BLOCKS,
-        )
-
-    return lambda: fav3_sage_vfa_func(
-        q_int8,
-        k_int8,
-        v_fp8,
-        q_scale,
-        k_scale,
-        v_scale,
-        m_init,
-        softmax_scale=softmax_scale,
-        return_lse=False,
-        layout=args.layout,
-        config=cfg,
-        kv_block_indices=kv_idx,
-        lut_start=lut_s,
-        lut_count=lut_c,
-        use_block_sparse=sparse,
+    num_q_blocks = (n_ctx_q + block_m - 1) // block_m
+    num_kv_blocks = (n_ctx_k + block_n - 1) // block_n
+    block_attn_mask = _ragged_lut_to_block_mask(
+        block_lut, batch, hq, num_q_blocks, num_kv_blocks, device
     )
+    return block_lut, freeze, block_attn_mask
 
 
 def maybe_expand_mask(
@@ -349,9 +330,13 @@ def maybe_expand_mask(
 def build_block_mask(
     args: argparse.Namespace,
     shape: ShapeSpec,
-    device: torch.device,
     loaded_single_mask: Optional[LoadedMask],
 ) -> Optional[torch.Tensor]:
+    """Return the block mask loaded from ``--block-mask-file`` (or ``None``).
+
+    Validates that the file mask's block grid matches the benchmark shape and
+    broadcasts it to ``(batch, hq, ...)``.
+    """
     if loaded_single_mask is not None:
         block_m, block_n = kernel_block_sizes(args.kernel)
         expected_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
@@ -368,23 +353,7 @@ def build_block_mask(
 
         return maybe_expand_mask(loaded_single_mask, shape.batch, shape.hq)
 
-    if args.block_sparsity is None:
-        return None
-
-    block_m, block_n = kernel_block_sizes(args.kernel)
-    num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
-    num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
-
-    return (
-        torch.rand(
-            shape.batch,
-            shape.hq,
-            num_q_blocks,
-            num_kv_blocks,
-            device=device,
-        )
-        > args.block_sparsity
-    ).to(torch.bool)
+    return None
 
 
 def sparse_flops_from_lut(
@@ -568,6 +537,7 @@ def make_kernel_runner(
     k: torch.Tensor,
     v: torch.Tensor,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    freeze_softmax_max_count: int = -1,
 ) -> Any:
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
@@ -575,7 +545,9 @@ def make_kernel_runner(
     head_dim = q_bshd.shape[-1]
     softmax_scale = head_dim**-0.5
 
-    if args.kernel == "sage_fp8":
+    # sage_fp8_vfa is now just sage_fp8 driven by a build_attention_lut LUT plus
+    # the matching freeze_softmax_max_count (see effective_attn_mode).
+    if args.kernel in ("sage_fp8", "sage_fp8_vfa"):
         if args.e2e:
             return lambda: fav3_sage_wrapper_func(
                 q,
@@ -586,6 +558,7 @@ def make_kernel_runner(
                 return_lse=False,
                 layout=args.layout,
                 block_lut=block_lut,
+                freeze_softmax_max_count=freeze_softmax_max_count,
             )
 
         cfg = get_sage_fwd_configs()
@@ -621,10 +594,8 @@ def make_kernel_runner(
             lut_start=lut_s,
             lut_count=lut_c,
             use_block_sparse=sparse,
+            freeze_softmax_max_count=freeze_softmax_max_count,
         )
-
-    if args.kernel == "sage_fp8_vfa":
-        return _make_sage_fp8_vfa_runner(args, q, k, v, softmax_scale, block_lut)
 
     if args.kernel == "sage_mxfp4":
         block_r = args.block_r
@@ -764,11 +735,7 @@ def make_reference_output(
     )
     ref = args.ref or "torch"
 
-    if block_attn_mask is not None:
-        if ref != "torch":
-            raise ValueError(
-                "Block sparse comparison currently supports --ref=torch only"
-            )
+    if ref == "torch":
         block_m, block_n = kernel_block_sizes(args.kernel)
         ref_out = attention_ref_block_sparse(
             q_bshd,
@@ -824,37 +791,53 @@ def benchmark_single_case(
     explicit_block_attn_mask: Optional[torch.Tensor] = None,
 ) -> float:
     shape = infer_shape_spec(q, v, args.layout)
-    block_attn_mask = (
+    attn_mode = effective_attn_mode(args)
+    freeze_softmax_max_count = -1
+
+    # An explicit static mask or a --block-mask-file mask is used directly and
+    # wins over the Q/K-derived (--sparge) build.
+    file_mask = (
         explicit_block_attn_mask
         if explicit_block_attn_mask is not None
-        else build_block_mask(args, shape, q.device, loaded_single_mask)
-    )
-    block_lut = (
-        block_attn_mask_to_ragged_lut(block_attn_mask, return_none_if_dense=True)
-        if block_attn_mask is not None
-        else None
+        else build_block_mask(args, shape, loaded_single_mask)
     )
 
-    fn = make_kernel_runner(args, q, k, v, block_lut=block_lut)
+    if file_mask is not None:
+        block_attn_mask = file_mask
+        block_lut = block_attn_mask_to_ragged_lut(
+            block_attn_mask, return_none_if_dense=True
+        )
+    elif attn_mode is not None:
+        # VFA/Sparge: build the ragged LUT (+ freeze count) from the bhsd Q/K
+        # via build_attention_lut, replacing the mask-driven LUT path.
+        q_bhsd, k_bhsd, _ = layout_preprocess(
+            q, k, v, layout=args.layout, target_layout="bhsd"
+        )
+        block_lut, freeze_softmax_max_count, block_attn_mask = build_attn_mode_lut(
+            args, attn_mode, q_bhsd, k_bhsd, q.device
+        )
+    else:
+        block_attn_mask = None
+        block_lut = None
+
+    fn = make_kernel_runner(
+        args, q, k, v, block_lut=block_lut,
+        freeze_softmax_max_count=freeze_softmax_max_count,
+    )
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
     if args.compare_to_ref:
         current_primary = primary_output(fn())
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
-        ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
+        # "vfa" keeps every K block (the LUT is dense), so the right reference is
+        # plain dense attention -- pass no mask so any --ref backend can be used.
+        ref_mask = None if attn_mode == "vfa" else block_attn_mask
+        ref_primary = make_reference_output(args, q, k, v, ref_mask)
         compare_accuracy(current_primary, ref_primary)
-        if args.kernel in ("sage_mxfp4", "sage_fp8"):
-            # FP8/MXFP4 paths are intrinsically noisier than BF16 reference;
-            # use FP8-style tolerances.
-            check_attention_outputs(
-                current_primary, ref_primary, fp8=True, atol=3.0e-1, rtol=2.0e-1
-            )
-        elif args.kernel == "sage_fp8_vfa":
-            # VFA additionally clamps the exp-shift to avoid overflow when
-            # the m_init estimate undershoots true rowmax.  This biases a
-            # handful of weights toward `p == 1`, which shows up as ~0.5-1%
-            # of output elements exceeding the strict FP8 tolerance.  Allow
-            # a higher pass-rate so the benchmark check passes by default.
+        if attn_mode == "vfa" or args.kernel == "sage_fp8_vfa":
+            # VFA freezes the online-softmax running max after the first few
+            # K-block iterations, so a handful of weights drift from the exact
+            # reference.  Allow a higher pass-rate so the check passes by default.
             check_attention_outputs(
                 current_primary,
                 ref_primary,
@@ -862,6 +845,12 @@ def benchmark_single_case(
                 atol=3.0e-1,
                 rtol=2.0e-1,
                 max_diff_percentage=2.0,
+            )
+        elif args.kernel in ("sage_mxfp4", "sage_fp8"):
+            # FP8/MXFP4 paths are intrinsically noisier than BF16 reference;
+            # use FP8-style tolerances.
+            check_attention_outputs(
+                current_primary, ref_primary, fp8=True, atol=3.0e-1, rtol=2.0e-1
             )
         else:
             check_attention_outputs(current_primary, ref_primary, fp8=False)
@@ -930,7 +919,7 @@ def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> List[
 
     if args.metric == "sparseput" and not include_sparse_metric:
         raise ValueError(
-            "sparse_throughput requires --block-sparsity or --block-mask-file"
+            "sparse_throughput requires --sparge or --block-mask-file"
         )
 
     if args.metric not in metric_map:
@@ -951,7 +940,7 @@ def create_single_shape_config(args: argparse.Namespace) -> List[Any]:
     d_head_v = args.dv if args.dv else d_head
 
     include_sparse_metric = (
-        args.block_sparsity is not None or args.block_mask_file is not None
+        args.block_mask_file is not None or effective_attn_mode(args) is not None
     )
     lines = metric_lines(args, include_sparse_metric)
 
@@ -981,7 +970,7 @@ def create_captured_config(
     inputs: List[Dict[str, Any]],
 ) -> List[Any]:
     include_sparse_metric = (
-        args.block_sparsity is not None or args.block_mask_file is not None
+        args.block_mask_file is not None or effective_attn_mode(args) is not None
     )
     lines = metric_lines(args, include_sparse_metric)
 
@@ -1058,20 +1047,34 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.sk <= 0:
         args.sk = args.sq
 
-    if args.block_sparsity is not None and not (0.0 <= args.block_sparsity <= 1.0):
-        raise ValueError(
-            f"--block-sparsity must be in [0,1], got {args.block_sparsity}"
-        )
-
-    if args.block_sparsity is not None and args.block_mask_file:
-        logger.info("Using --block-mask-file; ignoring --block-sparsity")
-
     if args.compare_to_ref and args.ref not in ("torch", "aiter_bf16"):
         raise ValueError("--ref must be one of: torch, aiter_bf16")
 
+    attn_mode = effective_attn_mode(args)
+    if attn_mode is not None:
+        if args.causal:
+            raise NotImplementedError(
+                "--sparge / sage_fp8_vfa does not support causal attention "
+                "(the block-sparse LUT path is non-causal)"
+            )
+        if args.block_mask_file:
+            # The file mask is used directly; only the plain 'sparge' mode accepts
+            # an external mask (vfa/both build a dense/front-loaded LUT from Q/K).
+            if attn_mode != "sparge":
+                raise ValueError(
+                    "--block-mask-file can only be combined with "
+                    "--kernel=sage_fp8 --sparge, not the sage_fp8_vfa kernel"
+                )
+        elif args.kernel not in ("sage_fp8", "sage_fp8_vfa", "all"):
+            # Building the LUT from Q/K (no external mask) needs the sage path.
+            raise ValueError(
+                f"--sparge requires --kernel=sage_fp8 or sage_fp8_vfa, "
+                f"got {args.kernel}"
+            )
+
     if args.kernel == "all":
-        if args.block_sparsity is not None or args.block_mask_file:
-            raise ValueError("--kernel=all does not support block-sparse mode")
+        if args.block_mask_file:
+            raise ValueError("--kernel=all does not support --block-mask-file")
         if args.compare_to_ref:
             raise ValueError("--kernel=all does not support --compare-to-ref")
         if args.load_captured:
@@ -1207,167 +1210,6 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: List[LoadedMask]) -
     bench_mha_masks.run(save_path="." if args.o else None, print_data=True)
 
 
-def run_block_sparse_repetitions(
-    args: argparse.Namespace,
-    loaded_single_mask: Optional[LoadedMask],
-) -> None:
-    if loaded_single_mask is not None:
-        raise ValueError(
-            "--n-repetitions is only supported with random --block-sparsity"
-        )
-
-    if args.load_captured:
-        raise ValueError(
-            "--n-repetitions is supported only with generated random inputs"
-        )
-
-    dtype = arg_to_torch_dtype[args.dtype]
-    device = "cuda"
-
-    q = torch.randn((args.b, args.hq, args.sq, args.d), device=device, dtype=dtype)
-    k = torch.randn((args.b, args.hk, args.sk, args.d), device=device, dtype=dtype)
-    v = torch.randn((args.b, args.hk, args.sk, args.dv), device=device, dtype=dtype)
-    q.requires_grad = False
-    k.requires_grad = False
-    v.requires_grad = False
-    q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=args.layout)
-
-    shape = infer_shape_spec(q, v, args.layout)
-    block_m, block_n = kernel_block_sizes(args.kernel)
-    num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
-    num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
-
-    warmup_mask = (
-        torch.rand(shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device)
-        > args.block_sparsity
-    ).to(torch.bool)
-    warmup_lut = block_attn_mask_to_ragged_lut(warmup_mask, return_none_if_dense=True)
-    fn_warmup = make_kernel_runner(args, q, k, v, block_lut=warmup_lut)
-    triton.testing.do_bench(fn_warmup, warmup=args.warmup, rep=args.rep)
-
-    total_flops = (
-        2.0
-        * shape.batch
-        * shape.hq
-        * shape.n_ctx_q
-        * shape.n_ctx_k
-        * (shape.d_head + shape.d_head_v)
-    )
-
-    latencies_ms: List[float] = []
-    tflops_dense: List[float] = []
-    tflops_effective: List[float] = []
-
-    for _ in range(args.n_repetitions):
-        mask = (
-            torch.rand(
-                shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device
-            )
-            > args.block_sparsity
-        ).to(torch.bool)
-        lut = block_attn_mask_to_ragged_lut(mask, return_none_if_dense=True)
-
-        fn = make_kernel_runner(args, q, k, v, block_lut=lut)
-        ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
-        latencies_ms.append(ms)
-
-        dense_tflops = (total_flops / (ms * 1e-3)) / 1e12
-        tflops_dense.append(dense_tflops)
-
-        sparse_flops, _ = sparse_flops_from_lut(args.kernel, lut, shape)
-        effective_tflops = (sparse_flops / (ms * 1e-3)) / 1e12
-        tflops_effective.append(effective_tflops)
-
-    def stats(x: List[float]) -> Dict[str, float]:
-        t = torch.tensor(x)
-        return {
-            "median": torch.quantile(t, 0.5).item(),
-            "q1": torch.quantile(t, 0.25).item(),
-            "q3": torch.quantile(t, 0.75).item(),
-            "p10": torch.quantile(t, 0.1).item(),
-            "p90": torch.quantile(t, 0.9).item(),
-        }
-
-    st_dense = stats(tflops_dense)
-    st_lat = stats(latencies_ms)
-    st_eff = stats(tflops_effective)
-
-    summary = (
-        f"kernel={args.kernel}, block_sparsity={args.block_sparsity}, n_repetitions={args.n_repetitions}: "
-        f"median_TFLOPS={st_dense['median']:.4f}, Q1={st_dense['q1']:.4f}, Q3={st_dense['q3']:.4f}, "
-        f"p10={st_dense['p10']:.4f}, p90={st_dense['p90']:.4f} | "
-        f"median_latency_ms={st_lat['median']:.4f}, Q1={st_lat['q1']:.4f}, Q3={st_lat['q3']:.4f}, "
-        f"p10={st_lat['p10']:.4f}, p90={st_lat['p90']:.4f} | "
-        f"median_effective_TFLOPS={st_eff['median']:.4f}, Q1={st_eff['q1']:.4f}, "
-        f"Q3={st_eff['q3']:.4f}, p10={st_eff['p10']:.4f}, p90={st_eff['p90']:.4f}"
-    )
-    logger.info(summary)
-    print(summary)
-
-    if args.o:
-        csv_path = "bench_sage_block_sparse_repetitions.csv"
-        file_exists = os.path.isfile(csv_path)
-        with open(csv_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(
-                    [
-                        "kernel",
-                        "BATCH",
-                        "HQ",
-                        "N_CTX_Q",
-                        "N_CTX_K",
-                        "D_HEAD",
-                        "D_HEAD_V",
-                        "block_sparsity",
-                        "n_repetitions",
-                        "median_TFLOPS",
-                        "q1_TFLOPS",
-                        "q3_TFLOPS",
-                        "p10_TFLOPS",
-                        "p90_TFLOPS",
-                        "median_latency_ms",
-                        "q1_latency_ms",
-                        "q3_latency_ms",
-                        "p10_latency_ms",
-                        "p90_latency_ms",
-                        "median_effective_TFLOPS",
-                        "q1_effective_TFLOPS",
-                        "q3_effective_TFLOPS",
-                        "p10_effective_TFLOPS",
-                        "p90_effective_TFLOPS",
-                    ]
-                )
-            writer.writerow(
-                [
-                    args.kernel,
-                    shape.batch,
-                    shape.hq,
-                    shape.n_ctx_q,
-                    shape.n_ctx_k,
-                    shape.d_head,
-                    shape.d_head_v,
-                    args.block_sparsity,
-                    args.n_repetitions,
-                    st_dense["median"],
-                    st_dense["q1"],
-                    st_dense["q3"],
-                    st_dense["p10"],
-                    st_dense["p90"],
-                    st_lat["median"],
-                    st_lat["q1"],
-                    st_lat["q3"],
-                    st_lat["p10"],
-                    st_lat["p90"],
-                    st_eff["median"],
-                    st_eff["q1"],
-                    st_eff["q3"],
-                    st_eff["p10"],
-                    st_eff["p90"],
-                ]
-            )
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Unified SAGE attention benchmark (FAv3, MXFP4, AITER, FP8)",
@@ -1448,22 +1290,43 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--block-sparsity",
-        type=float,
-        default=None,
-        help="Random block sparsity ratio in [0,1]",
+        "--sparge",
+        action="store_true",
+        help="SpargeAttn block sparsity: build the block LUT from Q/K via "
+        "build_attention_lut using --simthreshd1/--cdfthreshd. With "
+        "--kernel=sage_fp8 this runs 'sparge' (block selection only); with "
+        "--kernel=sage_fp8_vfa it runs 'both' (sparge selection + VFA "
+        "running-max freeze). If --block-mask-file is also given, the mask is "
+        "taken from that file instead.",
     )
     parser.add_argument(
         "--block-mask-file",
         type=str,
         default=None,
-        help="JSON file with block masks; takes precedence over --block-sparsity",
+        help="JSON file with block masks. Used directly as the block mask "
+        "(takes precedence over the Q/K-derived --sparge mask).",
+    )
+
+    parser.add_argument(
+        "--n-sample",
+        type=int,
+        default=16,
+        help="Number of top pooled-score K blocks front-loaded per q-block for "
+        "the sage_fp8_vfa kernel (vfa/both)",
     )
     parser.add_argument(
-        "--n-repetitions",
-        type=int,
-        default=None,
-        help="With random block sparsity: run repeated masks and report quantiles",
+        "--simthreshd1",
+        type=float,
+        default=0.1,
+        help="Per-head intra-block similarity threshold for --sparge meansim "
+        "selection",
+    )
+    parser.add_argument(
+        "--cdfthreshd",
+        type=float,
+        default=0.9,
+        help="Per-head cumulative-probability threshold for --sparge "
+        "selection",
     )
 
     parser.add_argument(
@@ -1598,10 +1461,22 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     saved_kernel = args.kernel
     rows: List[Tuple[str, float, float]] = []
 
+    q_bhsd, k_bhsd, _ = layout_preprocess(
+        q, k, v, layout=args.layout, target_layout="bhsd"
+    )
+
     for kernel_name in ALL_KERNELS:
         args.kernel = kernel_name
         try:
-            fn = make_kernel_runner(args, q, k, v, block_lut=None)
+            attn_mode = effective_attn_mode(args)
+            block_lut, freeze = None, -1
+            if attn_mode is not None:
+                block_lut, freeze, _ = build_attn_mode_lut(
+                    args, attn_mode, q_bhsd, k_bhsd, device
+                )
+            fn = make_kernel_runner(
+                args, q, k, v, block_lut=block_lut, freeze_softmax_max_count=freeze
+            )
             ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
             tflops = total_flops / ms * 1e-9
             rows.append((kernel_name, ms, tflops))
@@ -1657,16 +1532,6 @@ def main() -> int:
 
     if args.kernel == "all":
         return run_with_optional_vgpr(args, lambda: run_all_kernels(args))
-
-    if (
-        args.block_sparsity is not None
-        and args.n_repetitions is not None
-        and args.block_mask_file is None
-    ):
-        return run_with_optional_vgpr(
-            args,
-            lambda: run_block_sparse_repetitions(args, loaded_single_mask),
-        )
 
     if args.load_captured:
 

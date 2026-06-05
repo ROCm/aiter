@@ -1,3 +1,4 @@
+from op_tests.test_pa import USE_ALIBI
 import torch
 import triton
 import triton.language as tl
@@ -266,7 +267,14 @@ def _sage_fwd_blocksparse_nomask(
     USE_BIAS: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
     ACCUMULATOR_TYPE,
+    FROZEN_MAX: tl.constexpr = False,
 ):
+    # Interior (non-ragged) block loop. ``FROZEN_MAX`` (constexpr) selects the
+    # softmax mode: False = standard online softmax (update the running max,
+    # rescale acc); True = VFA-style frozen max (m_i held fixed, no rowmax, no
+    # rescale). Because the toggle is a constexpr, each instantiation compiles a
+    # single path, so m_i never has to be carried in two MFMA layouts at once
+    # (the data-dependent version of this did, which the AMD backend can't lower).
     for i in range(n_blocks):
         start_b = tl.load(kv_block_indices + lut_start_val + i)
         start_n = start_b * BLOCK_N
@@ -288,45 +296,37 @@ def _sage_fwd_blocksparse_nomask(
                 v = tl.load(v_ptrs)
 
         # -- compute qk ----
-        # Same optimization as in `_sage_fwd_no_mask`: defer the
-        # (q_descale * k_descale) descale until softmax so it can be fused
-        # with the m_ij subtract into a single FMA. Mathematically equivalent
-        # because scale > 0:
-        #   max(qk_int * scale) == max(qk_int) * scale
-        #   (qk_int * scale) - m_ij == fma(qk_int, scale, -m_ij)
+        # Defer the (q_descale * k_descale) descale until softmax so the fast
+        # path can fold it into the m_ij subtract as a single v_fma. Valid since
+        # scale > 0: max(qk * scale) == max(qk) * scale and
+        # (qk * scale) - m_ij == fma(qk, scale, -m_ij).
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
 
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
         if USE_ALIBI or USE_BIAS:
-            # Bias / alibi live in the scaled domain, materialize scaled qk.
-            qk_scaled = qk_int.to(ACCUMULATOR_TYPE) * scale
+            # Bias / alibi live in the scaled domain, so materialize scaled qk.
+            qk = qk_int.to(ACCUMULATOR_TYPE) * scale
             if USE_ALIBI:
                 q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-                alibi_block = compute_alibi_block(
+                qk += compute_alibi_block(
                     alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
                 )
-                qk_scaled += alibi_block
             if USE_BIAS:
+                qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
                 bias_ptrs = bias_base_ptrs + start_n * stride_bn
-                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-                qk_scaled += bias
-
-            m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
-            if USE_BIAS:
-                q_shifted = tl.where(
-                    m_ij[:, None] == float("-inf"),
-                    float("-inf"),
-                    qk_scaled - m_ij[:, None],
-                )
-            else:
-                q_shifted = qk_scaled - m_ij[:, None]
+                qk += tl.load(bias_ptrs, mask=qk_mask, other=0.0)
+            m_ij = m_i if FROZEN_MAX else tl.maximum(m_i, tl.max(qk, 1))
+            # m_ij may be -inf (frozen row with no valid keys); guard the subtract
+            # so those rows stay -inf instead of becoming NaN.
+            q_shifted = tl.where(
+                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
+            )
         else:
-            # Fast path: keep qk in unscaled f32 and fuse scale into the FMA.
+            # Fast path: keep qk unscaled and fold `scale` into the subtract so
+            # the compiler emits one v_fma (qk * scale - m_ij). Interior blocks
+            # are never row-masked, so m_ij is finite and needs no -inf guard.
             qk = qk_int.to(ACCUMULATOR_TYPE)
-            row_max_unscaled = tl.max(qk, 1)
-            m_ij = tl.maximum(m_i, row_max_unscaled * scale)
+            m_ij = m_i if FROZEN_MAX else tl.maximum(m_i, tl.max(qk, 1) * scale)
             q_shifted = qk * scale - m_ij[:, None]
 
         if USE_EXP2:
@@ -367,23 +367,27 @@ def _sage_fwd_blocksparse_nomask(
                 kv_offs_n[None, :] < seqlen_k
             )
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
-        if USE_BIAS:
-            m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
-        else:
-            m_diff = m_i - m_ij
-        if USE_EXP2:
-            alpha = tl.math.exp2(m_diff)
-        else:
-            alpha = tl.math.exp(m_diff)
-        acc = acc * alpha[:, None]
         if not PRE_LOAD_V:
             if PADDED_HEAD_V:
                 v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
                 v = tl.load(v_ptrs, mask=v_mask, other=0.0)
             else:
                 v = tl.load(v_ptrs)
-        l_i = l_i * alpha + l_ij
-        m_i = m_ij
+        if FROZEN_MAX:
+            # Frozen: m_i held fixed, alpha == 1, so no acc rescale.
+            l_i = l_i + l_ij
+        else:
+            if USE_BIAS:
+                m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+            else:
+                m_diff = m_i - m_ij
+            if USE_EXP2:
+                alpha = tl.math.exp2(m_diff)
+            else:
+                alpha = tl.math.exp(m_diff)
+            acc = acc * alpha[:, None]
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
         acc = tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
     return acc, l_i, m_i
 
@@ -436,7 +440,10 @@ def _sage_fwd_blocksparse_mask(
     USE_BIAS: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
     ACCUMULATOR_TYPE,
+    FROZEN_MAX: tl.constexpr = False,
 ):
+    # Ragged last-block loop. ``FROZEN_MAX`` (constexpr) selects standard online
+    # softmax (False) vs VFA frozen max (True); see _sage_fwd_blocksparse_nomask.
     for i in range(n_blocks):
         start_b = tl.load(kv_block_indices + lut_start_val + i)
         start_n = start_b * BLOCK_N
@@ -460,48 +467,30 @@ def _sage_fwd_blocksparse_mask(
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         # -- compute qk ----
-        # Same optimization as `_sage_fwd_no_mask`: defer the
-        # (q_descale * k_descale) descale until softmax so it can be fused
-        # with the m_ij subtract into a single FMA. Padding positions are
-        # masked to -inf, which is invariant under multiplication by the
-        # positive scale, so we can apply the mask in either domain.
+        # Ragged tail: padding is forced to -inf before softmax, which can leave
+        # a whole row's m_ij == -inf, so the subtract must be guarded by a
+        # tl.where and cannot collapse into a single FMA the way the no-mask loop
+        # does. Since the guard already blocks fusion, keep everything in the
+        # scaled domain so bias/alibi and the fast path share one code path.
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
 
-        if USE_ALIBI or USE_BIAS:
-            # Bias / alibi live in the scaled domain, materialize scaled qk.
-            qk_scaled = qk_int.to(ACCUMULATOR_TYPE) * scale
-            if USE_ALIBI:
-                q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-                alibi_block = compute_alibi_block(
-                    alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
-                )
-                qk_scaled += alibi_block
-            if USE_BIAS:
-                bias_ptrs = bias_base_ptrs + start_n * stride_bn
-                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-                qk_scaled += bias
-            qk_scaled = tl.where(
-                qk_mask, qk_scaled, float("-inf")
-            )  # mask padding before softmax
-            m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
-            q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"),
-                float("-inf"),
-                qk_scaled - m_ij[:, None],
+        qk = qk_int.to(ACCUMULATOR_TYPE) * scale
+        if USE_ALIBI:
+            q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            qk += compute_alibi_block(
+                alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
             )
-        else:
-            # Fast path: keep qk in unscaled f32 and fuse scale into the FMA.
-            qk = qk_int.to(ACCUMULATOR_TYPE)
-            qk = tl.where(qk_mask, qk, float("-inf"))
-            row_max_unscaled = tl.max(qk, 1)
-            m_ij = tl.maximum(m_i, row_max_unscaled * scale)
-            q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"),
-                float("-inf"),
-                qk * scale - m_ij[:, None],
-            )
+        if USE_BIAS:
+            bias_ptrs = bias_base_ptrs + start_n * stride_bn
+            qk += tl.load(bias_ptrs, mask=qk_mask, other=0.0)
+        qk = tl.where(qk_mask, qk, float("-inf"))  # mask padding before softmax
+
+        m_ij = m_i if FROZEN_MAX else tl.maximum(m_i, tl.max(qk, 1))
+        q_shifted = tl.where(
+            m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
+        )
 
         if USE_EXP2:
             p = tl.math.exp2(q_shifted)
@@ -541,12 +530,6 @@ def _sage_fwd_blocksparse_mask(
                 kv_offs_n[None, :] < seqlen_k
             )
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
-        m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
-        if USE_EXP2:
-            alpha = tl.math.exp2(m_diff)
-        else:
-            alpha = tl.math.exp(m_diff)
-        acc = acc * alpha[:, None]
         if not PRE_LOAD_V:
             v_n_mask = kv_offs_n[:, None] < seqlen_k
             if PADDED_HEAD_V:
@@ -554,8 +537,18 @@ def _sage_fwd_blocksparse_mask(
             else:
                 v_mask = v_n_mask
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-        l_i = l_i * alpha + l_ij
-        m_i = m_ij
+        if FROZEN_MAX:
+            # Frozen: m_i held fixed, alpha == 1, so no acc rescale.
+            l_i = l_i + l_ij
+        else:
+            m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+            if USE_EXP2:
+                alpha = tl.math.exp2(m_diff)
+            else:
+                alpha = tl.math.exp(m_diff)
+            acc = acc * alpha[:, None]
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
         acc = tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
     return acc, l_i, m_i
 
@@ -1294,6 +1287,7 @@ def sage_fwd(
     USE_EXP2: tl.constexpr,
     USE_SEQUSED: tl.constexpr,
     USE_BLOCK_SPARSE: tl.constexpr,
+    FREEZE_SOFTMAX_MAX_COUNT: tl.constexpr = -1,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32  # for q*k product
@@ -1710,108 +1704,147 @@ def sage_fwd(
                 ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
             )
     else:
-        # ========== USE_BLOCK_SPARSE: nomask then mask (last block) ==========
+        # ========== USE_BLOCK_SPARSE ==========
+        # Two regimes, selected at compile time by FREEZE_SOFTMAX_MAX_COUNT:
+        #
+        #   FREEZE < 0 (plain sparge): update the running max on every block --
+        #       one nomask loop over the interior blocks, then the ragged last
+        #       block (mask).
+        #
+        #   FREEZE >= 0 (VFA): a warm-up nomask call (FROZEN_MAX=False) updates the
+        #       running max over the first FREEZE blocks, then the same nomask
+        #       function is called again with FROZEN_MAX=True over the remaining
+        #       interior blocks (m_i held fixed -- no rowmax, no acc rescale), and
+        #       the ragged last block runs frozen too. FROZEN_MAX is a constexpr,
+        #       so each call lowers a single path and m_i stays in one MFMA layout
+        #       -- a per-iteration runtime `if freeze` instead made m_i live in two
+        #       MFMA layouts at once, which the AMD backend cannot lower.
         lut_start_val = tl.load(lut_start + lut_idx)
-        acc, l_i, m_i = _sage_fwd_blocksparse_nomask(
-            acc,
-            l_i,
-            m_i,
-            q,
-            k_ptrs,
-            v_ptrs,
-            bias_ptrs,
-            stride_kn,
-            stride_vk,
-            stride_bn,
-            stride_sn,
-            stride_sm,
-            start_m,
-            seqlen_k,
-            seqlen_q,
-            dropout_p,
-            philox_seed,
-            philox_offset_base,
-            SD_MASK,
-            stride_sz,
-            stride_sh,
-            off_z,
-            off_h_q,
-            offs_m,
-            offs_d_qk,
-            offs_d_v,
-            alibi_slope,
-            q_descale,
-            k_descale_offset,
-            stride_ksblk,
-            kv_block_indices,
-            lut_start_val,
-            n_blocks - 1,
-            BLOCK_M,
-            BLOCK_N,
-            PRE_LOAD_V,
-            ENABLE_DROPOUT,
-            PADDED_HEAD_QK,
-            PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK,
-            ACTUAL_BLOCK_DMODEL_V,
-            USE_ALIBI=USE_ALIBI,
-            USE_EXP2=USE_EXP2,
-            USE_BIAS=USE_BIAS,
-            RETURN_SCORES=RETURN_SCORES,
-            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-        )
-        invalid_q_rows = offs_m >= seqlen_q
-        m_i = tl.where(invalid_q_rows, float("-inf"), m_i)
-        l_i = tl.where(invalid_q_rows, 1.0, l_i)
-        acc = tl.where(invalid_q_rows[:, None], 0.0, acc)
-        acc, l_i, m_i = _sage_fwd_blocksparse_mask(
-            acc,
-            l_i,
-            m_i,
-            q,
-            k_ptrs,
-            v_ptrs,
-            bias_ptrs,
-            stride_kn,
-            stride_vk,
-            stride_bn,
-            stride_sn,
-            stride_sm,
-            start_m,
-            seqlen_k,
-            seqlen_q,
-            dropout_p,
-            philox_seed,
-            philox_offset_base,
-            SD_MASK,
-            stride_sz,
-            stride_sh,
-            off_z,
-            off_h_q,
-            offs_m,
-            offs_d_qk,
-            offs_d_v,
-            alibi_slope,
-            q_descale,
-            k_descale_offset,
-            stride_ksblk,
-            kv_block_indices,
-            lut_start_val + (n_blocks - 1),
-            1,
-            BLOCK_M,
-            BLOCK_N,
-            PRE_LOAD_V,
-            ENABLE_DROPOUT,
-            PADDED_HEAD_QK,
-            PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK,
-            ACTUAL_BLOCK_DMODEL_V,
-            USE_ALIBI=USE_ALIBI,
-            USE_EXP2=USE_EXP2,
-            USE_BIAS=USE_BIAS,
-            RETURN_SCORES=RETURN_SCORES,
-            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-        )
+        n_nomask = n_blocks - 1
+
+        if FREEZE_SOFTMAX_MAX_COUNT >= 0:
+            # Number of interior blocks to warm up (update) before freezing.
+            n_warm = tl.minimum(FREEZE_SOFTMAX_MAX_COUNT, n_nomask)
+
+            # Phase 1: warm-up with the updating body (FROZEN_MAX=False).
+            acc, l_i, m_i = _sage_fwd_blocksparse_nomask(
+                acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs,
+                stride_kn, stride_vk, stride_bn, stride_sn, stride_sm,
+                start_m, seqlen_k, seqlen_q,
+                dropout_p, philox_seed, philox_offset_base,
+                SD_MASK, stride_sz, stride_sh, off_z, off_h_q,
+                offs_m, offs_d_qk, offs_d_v, alibi_slope,
+                q_descale, k_descale_offset, stride_ksblk,
+                kv_block_indices, lut_start_val, n_warm,
+                BLOCK_M, BLOCK_N, PRE_LOAD_V, ENABLE_DROPOUT,
+                PADDED_HEAD_QK, PADDED_HEAD_V,
+                ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V,
+                USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, USE_BIAS=USE_BIAS,
+                RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                FROZEN_MAX=False,
+            )
+
+            # Phase 2: same loop, FROZEN_MAX=True, over the remaining interior
+            # blocks (0 trips when there were fewer than FREEZE interior blocks).
+            acc, l_i, m_i = _sage_fwd_blocksparse_nomask(
+                acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs,
+                stride_kn, stride_vk, stride_bn, stride_sn, stride_sm,
+                start_m, seqlen_k, seqlen_q,
+                dropout_p, philox_seed, philox_offset_base,
+                SD_MASK, stride_sz, stride_sh, off_z, off_h_q,
+                offs_m, offs_d_qk, offs_d_v, alibi_slope,
+                q_descale, k_descale_offset, stride_ksblk,
+                kv_block_indices, lut_start_val + n_warm, n_nomask - n_warm,
+                BLOCK_M, BLOCK_N, PRE_LOAD_V, ENABLE_DROPOUT,
+                PADDED_HEAD_QK, PADDED_HEAD_V,
+                ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V,
+                USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, USE_BIAS=USE_BIAS,
+                RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                FROZEN_MAX=True,
+            )
+
+            invalid_q_rows = offs_m >= seqlen_q
+            m_i = tl.where(invalid_q_rows, float("-inf"), m_i)
+            l_i = tl.where(invalid_q_rows, 1.0, l_i)
+            acc = tl.where(invalid_q_rows[:, None], 0.0, acc)
+
+            # Phase 3: ragged last block. Frozen only if the warm-up budget was
+            # exhausted by the interior blocks (n_warm == FREEZE); otherwise there
+            # were too few blocks to freeze, so update it (matches sparge). Each
+            # arm is a single FROZEN_MAX instantiation with consistent layouts, so
+            # the runtime choice does not reintroduce the in-loop cross-layout cast.
+            if n_warm >= FREEZE_SOFTMAX_MAX_COUNT:
+                acc, l_i, m_i = _sage_fwd_blocksparse_mask(
+                    acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs,
+                    stride_kn, stride_vk, stride_bn, stride_sn, stride_sm,
+                    start_m, seqlen_k, seqlen_q,
+                    dropout_p, philox_seed, philox_offset_base,
+                    SD_MASK, stride_sz, stride_sh, off_z, off_h_q,
+                    offs_m, offs_d_qk, offs_d_v, alibi_slope,
+                    q_descale, k_descale_offset, stride_ksblk,
+                    kv_block_indices, lut_start_val + n_nomask, 1,
+                    BLOCK_M, BLOCK_N, PRE_LOAD_V, ENABLE_DROPOUT,
+                    PADDED_HEAD_QK, PADDED_HEAD_V,
+                    ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V,
+                    USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, USE_BIAS=USE_BIAS,
+                    RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                    FROZEN_MAX=True,
+                )
+            else:
+                acc, l_i, m_i = _sage_fwd_blocksparse_mask(
+                    acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs,
+                    stride_kn, stride_vk, stride_bn, stride_sn, stride_sm,
+                    start_m, seqlen_k, seqlen_q,
+                    dropout_p, philox_seed, philox_offset_base,
+                    SD_MASK, stride_sz, stride_sh, off_z, off_h_q,
+                    offs_m, offs_d_qk, offs_d_v, alibi_slope,
+                    q_descale, k_descale_offset, stride_ksblk,
+                    kv_block_indices, lut_start_val + n_nomask, 1,
+                    BLOCK_M, BLOCK_N, PRE_LOAD_V, ENABLE_DROPOUT,
+                    PADDED_HEAD_QK, PADDED_HEAD_V,
+                    ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V,
+                    USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, USE_BIAS=USE_BIAS,
+                    RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                    FROZEN_MAX=False,
+                )
+        else:
+            # Plain sparge: update everywhere (original two-call path).
+            acc, l_i, m_i = _sage_fwd_blocksparse_nomask(
+                acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs,
+                stride_kn, stride_vk, stride_bn, stride_sn, stride_sm,
+                start_m, seqlen_k, seqlen_q,
+                dropout_p, philox_seed, philox_offset_base,
+                SD_MASK, stride_sz, stride_sh, off_z, off_h_q,
+                offs_m, offs_d_qk, offs_d_v, alibi_slope,
+                q_descale, k_descale_offset, stride_ksblk,
+                kv_block_indices, lut_start_val, n_nomask,
+                BLOCK_M, BLOCK_N, PRE_LOAD_V, ENABLE_DROPOUT,
+                PADDED_HEAD_QK, PADDED_HEAD_V,
+                ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V,
+                USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, USE_BIAS=USE_BIAS,
+                RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                FROZEN_MAX=False,
+            )
+            invalid_q_rows = offs_m >= seqlen_q
+            m_i = tl.where(invalid_q_rows, float("-inf"), m_i)
+            l_i = tl.where(invalid_q_rows, 1.0, l_i)
+            acc = tl.where(invalid_q_rows[:, None], 0.0, acc)
+            acc, l_i, m_i = _sage_fwd_blocksparse_mask(
+                acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs,
+                stride_kn, stride_vk, stride_bn, stride_sn, stride_sm,
+                start_m, seqlen_k, seqlen_q,
+                dropout_p, philox_seed, philox_offset_base,
+                SD_MASK, stride_sz, stride_sh, off_z, off_h_q,
+                offs_m, offs_d_qk, offs_d_v, alibi_slope,
+                q_descale, k_descale_offset, stride_ksblk,
+                kv_block_indices, lut_start_val + n_nomask, 1,
+                BLOCK_M, BLOCK_N, PRE_LOAD_V, ENABLE_DROPOUT,
+                PADDED_HEAD_QK, PADDED_HEAD_V,
+                ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V,
+                USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, USE_BIAS=USE_BIAS,
+                RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                FROZEN_MAX=False,
+            )
 
     # ============================================================
     #                        EPILOGUE
@@ -1930,3 +1963,96 @@ def sage_fwd(
         o_ptrs_mask = o_ptrs_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
 
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
+
+
+# ----------------------------------------------------------------------------
+# SpargeAttn-style block-sparse mask construction kernels.
+#
+# These back the host-side helpers in
+# ``aiter/ops/triton/attention/fav3_sage.py``:
+#   * ``triton_bmm_pool_sim_simmean`` -- per-block mean pooling plus an
+#     intra-block self-similarity test (the "meansim" predicate that decides
+#     whether a block is internally coherent enough to be summarized by its
+#     mean).
+#   * ``triton_fill_block_map_kernel`` -- scatters the top-``num_to_select``
+#     ranked K blocks per query block into a dense (B, H, Q, K) bool map.
+#   * ``triton_fill_causal_mask`` -- materializes a block-level causal mask
+#     accounting for a (possibly non-unit) query/key block-size ratio.
+#
+# Reference: "SpargeAttn: Accurate Sparse Attention Accelerating Any Model
+# Inference" (https://arxiv.org/abs/2502.18137).
+
+
+@triton.jit
+def triton_bmm_pool_sim_simmean(
+    x_ptr,
+    pool_ptr,
+    sim_ptr,
+    simthreshd1_ptr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BS: tl.constexpr,
+    SKIP_SIM: tl.constexpr = False,
+):
+    b, h, nb = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    B, H, NB = tl.num_programs(0), tl.num_programs(1), tl.num_programs(2)
+
+    block_offset = b * H * N * D + h * N * D + nb * BS * D
+    xmask = (nb * BS + tl.arange(0, BS)[:, None]) < N
+    x_ptrs = x_ptr + block_offset + tl.arange(0, BS)[:, None] * D + tl.arange(0, D)[None, :]
+    # Load the input block, xmask will return nan for out-of-bound elements
+    x = tl.load(x_ptrs, mask=xmask)
+    BS_ = BS if (N - nb * BS) >= BS else (N - nb * BS)
+
+    x_fp32 = x.to(tl.float32)
+    # Check for NaN values
+    is_nan = x_fp32 != x_fp32
+    x_fp32 = tl.where(is_nan, 0.0, x_fp32)
+
+    pool = tl.sum(x_fp32, axis=0) / BS_
+    pool_block_offset = b * H * NB * D + h * NB * D + nb * D
+    tl.store(pool_ptr + pool_block_offset + tl.arange(0, D), pool)
+
+    if not SKIP_SIM:
+        cur_h1 = tl.load(simthreshd1_ptr + h)
+        x_norm = tl.sqrt(tl.sum(x_fp32 * x_fp32, axis=1, keep_dims=True))
+        x = (x / x_norm).to(tl.float16)  # norm at D dim
+        # Check for NaN values after normalization
+        is_nan = x != x
+        x = tl.where(is_nan, 0.0, x)
+
+        grams = tl.dot(x, tl.trans(x))
+        sum_value = tl.sum(grams).to(tl.float32)
+        cur_sim = (sum_value / (BS_ * BS_)) > cur_h1
+
+        sim_offset = b * H * NB + h * NB + nb
+        tl.store(sim_ptr + sim_offset, cur_sim)
+
+
+@triton.jit
+def triton_fill_block_map_kernel(
+    final_map,
+    num_to_select,
+    sorted_indices,
+    NK: tl.constexpr,
+):
+    b, h, q = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    B, H, Q = tl.num_programs(0), tl.num_programs(1), tl.num_programs(2)
+    cur_num_to_select = tl.load(num_to_select + b * H * Q + h * Q + q)
+    cur_sorted_idx_ptr = sorted_indices + b * H * Q * NK + h * Q * NK + q * NK
+    cur_final_map_ptr = final_map + b * H * Q * NK + h * Q * NK + q * NK
+    # Always select at least one block per query block.
+    cur_num_to_select = (cur_num_to_select + 1) if cur_num_to_select == 0 else cur_num_to_select
+    for i in range(cur_num_to_select):
+        cur_idx = tl.load(cur_sorted_idx_ptr + i)
+        tl.store(cur_final_map_ptr + cur_idx, 1)
+
+
+@triton.jit
+def triton_fill_causal_mask(mask, BqdivBk):
+    q, k = tl.program_id(0), tl.program_id(1)
+    Q, K = tl.num_programs(0), tl.num_programs(1)
+    if k >= (q + 1) * BqdivBk:
+        tl.store(mask + q * K + k, 0)
+    else:
+        tl.store(mask + q * K + k, 1)
