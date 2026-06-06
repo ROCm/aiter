@@ -46,11 +46,8 @@ import functools
 import os
 import sys
 
-_REPO = os.path.join(os.path.dirname(__file__), "FlyDSL")
-_BUILD_PKGS = os.path.join(_REPO, "build-fly", "python_packages")
-for p in [_BUILD_PKGS, os.path.join(_REPO, "python"), os.path.dirname(__file__)]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+if os.path.dirname(__file__) not in sys.path:
+    sys.path.insert(0, os.path.dirname(__file__))
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -915,7 +912,57 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         # THD: skip workgroups whose m_start >= actual_q_len (no valid tokens for this tile).
         # Everything below (Q load / K/V load / core loop / O writeback) is gated by _wg_valid.
         _wg_valid = arith.cmpi(arith.CmpIPredicate.slt, m_start_raw, actual_q_len)
-        _if_wg = scf.IfOp(_raw(_wg_valid))
+        # ---- seqlen_k == 0: zero-fill output for valid Q rows, then skip compute ----
+        _kv_is_zero = arith.cmpi(arith.CmpIPredicate.eq, actual_kv_len,
+                                 _to_raw(arith.constant(0, type=T.i32)))
+        _need_zero = arith.andi(_wg_valid, _kv_is_zero)
+        _if_zero_fill = scf.IfOp(_raw(_need_zero))
+        with _if_then(_if_zero_fill):
+            _i64z = ir.IntegerType.get_signless(64)
+            _glbpz = ir.Type.parse("!llvm.ptr<1>")
+            _i32z = ir.IntegerType.get_signless(32)
+            _v4i32z = ir.VectorType.get([4], _i32z)
+            from flydsl._mlir.dialects import fly as _fly_z
+            _o_raw_z = ptr_O.__extract_to_ir_values__()[0]
+            _o_gp_z = _fly_z.extract_aligned_pointer_as_index(_glbpz, _o_raw_z)
+            _o_base_z = llvm_dialect.ptrtoint(_i64z, _o_gp_z)
+            _tid_z = _mlir_arith.AddIOp(
+                _mlir_arith.MulIOp(
+                    _to_raw(wave_id),
+                    _to_raw(arith.constant(WAVE_SIZE, type=T.i32))).result,
+                _to_raw(lane_id)).result
+            _zero_v4 = _to_raw(arith.constant_vector(0, T.vec(4, T.i32)))
+            _q_rows = _mlir_arith.subi(actual_q_len, m_start_raw)
+            _q_rows_clamped = _mlir_arith.maxsi(
+                _q_rows, _to_raw(arith.constant(0, type=T.i32)))
+            _q_tok_z = _mlir_arith.AddIOp(
+                q_start_tok,
+                _mlir_arith.AddIOp(m_start_raw, _tid_z).result).result
+            _valid_z = _mlir_arith.CmpIOp(
+                _mlir_arith.CmpIPredicate.slt, _tid_z, _q_rows_clamped)
+            _if_valid_z = scf.IfOp(_valid_z)
+            with _if_then(_if_valid_z):
+                _elem_off_z = _mlir_arith.AddIOp(
+                    _mlir_arith.MulIOp(_to_raw(by), stride_o_head).result,
+                    _mlir_arith.MulIOp(_q_tok_z, stride_o_seq).result).result
+                _byte_off_z = _mlir_arith.MulIOp(
+                    _elem_off_z,
+                    _to_raw(arith.constant(2, type=T.i32))).result
+                _byte_off_z64 = _mlir_arith.ExtSIOp(_i64z, _byte_off_z).result
+                _o_addr_z = _mlir_arith.AddIOp(_o_base_z, _byte_off_z64).result
+                for _chunk_z in fx.range_constexpr(V_HDIM // 8):
+                    _chunk_addr = _mlir_arith.AddIOp(
+                        _o_addr_z,
+                        _mlir_arith.ExtSIOp(_i64z,
+                            _to_raw(arith.constant(_chunk_z * 16, type=T.i32))).result).result
+                    _ptr_z = llvm_dialect.inttoptr(_glbpz, _chunk_addr)
+                    llvm_dialect.store(_zero_v4, _ptr_z)
+
+        # Gate the main compute path: need valid Q rows AND non-zero K/V length.
+        _kv_nonzero = arith.cmpi(arith.CmpIPredicate.sgt, actual_kv_len,
+                                  _to_raw(arith.constant(0, type=T.i32)))
+        _wg_valid_compute = arith.andi(_wg_valid, _kv_nonzero)
+        _if_wg = scf.IfOp(_raw(_wg_valid_compute))
         with _if_then(_if_wg):
             # Q resource descriptor with OOB protection (THD: batch is implicit in q_start_tok)
             _q_tok = _mlir_arith.AddIOp(
@@ -1059,7 +1106,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 oob_dg1_list=_v_oob_dg1)
     
             # -- 2d': causal mask on prologue tile (n_start=0) --
-            _apply_causal_mask(all_su_sp_tiles, arith.constant(0, type=T.i32))
+            # Bottom-right aligned: shift n_start by -(sk - sq) so the diagonal
+            # is anchored at the bottom-right corner of the QK matrix.
+            _causal_offset = _mlir_arith.subi(actual_kv_len, actual_q_len)
+            if const_expr(IS_CAUSAL):
+                _pro_causal_n = _mlir_arith.subi(
+                    _to_raw(arith.constant(0, type=T.i32)), _causal_offset)
+                _apply_causal_mask(all_su_sp_tiles, _pro_causal_n)
     
             # -- 2d'': KV OOB mask on prologue tile --
             _apply_kv_oob_mask(all_su_sp_tiles, actual_kv_len)
@@ -1101,16 +1154,30 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
     
             # -- 2f: Prefetch K(tile 1) → K_b if available --
             tile_n_const = _to_raw(arith.constant(TILE_N, type=T.i32))
-            # Causal: K tiles needed = bx + 1. But cap to ceil(actual_kv_len / TILE_N) so
-            # the K TDM loop never reads past the end of the K buffer (THD: per-batch SK
-            # may be smaller than (bx+1)*TILE_N).
-            _bx_plus_1 = _mlir_arith.addi(
-                _to_raw(bx), _to_raw(arith.constant(1, type=T.i32)))
             _kv_tiles_avail = _mlir_arith.divui(
                 _mlir_arith.addi(actual_kv_len,
                     _to_raw(arith.constant(TILE_N - 1, type=T.i32))),
                 tile_n_const)
-            num_tiles = _mlir_arith.minui(_bx_plus_1, _kv_tiles_avail)
+            if const_expr(IS_CAUSAL):
+                # Causal (bottom-right aligned): the last Q row (m_start + TILE_N - 1)
+                # attends to the last K row (actual_kv_len - 1).  The first Q row in
+                # this tile attends to K starting at position
+                #   (actual_kv_len - actual_q_len) + m_start.
+                # So the number of KV tiles needed is:
+                #   ceil(((sk - sq) + (bx+1)*TILE_N) / TILE_N)
+                #   = bx + 1 + ceil((sk - sq) / TILE_N)
+                _sk_sq_diff = _mlir_arith.subi(actual_kv_len, actual_q_len)
+                _sk_sq_tiles = _mlir_arith.divui(
+                    _mlir_arith.addi(_sk_sq_diff,
+                        _to_raw(arith.constant(TILE_N - 1, type=T.i32))),
+                    tile_n_const)
+                _bx_plus_1 = _mlir_arith.addi(
+                    _to_raw(bx), _to_raw(arith.constant(1, type=T.i32)))
+                _causal_tiles = _mlir_arith.addi(_bx_plus_1, _sk_sq_tiles)
+                num_tiles = _mlir_arith.minui(_causal_tiles, _kv_tiles_avail)
+            else:
+                # Non-causal: iterate over all KV tiles.
+                num_tiles = _kv_tiles_avail
             num_tiles_idx = arith.index_cast(T.index, num_tiles)
             # Loop runs N-2 iterations (tiles 1..N-2); endtile handled in epilogue.
             _one_i32_loop = _to_raw(arith.constant(1, type=T.i32))
@@ -2264,10 +2331,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 }
                 _et_o = [[ep_o_tiles[_d][_n] for _n in range(N_PV_WMMA_N)]
                          for _d in range(NUM_MSB)]
-                _et_causal_ns = arith.muli(
-                    arith.subi(arith.index_cast(T.i32, num_tiles_idx),
-                               arith.constant(1, type=T.i32)),
-                    arith.constant(TILE_N, type=T.i32))
+                if const_expr(IS_CAUSAL):
+                    _et_tile_n_start = arith.muli(
+                        arith.subi(arith.index_cast(T.i32, num_tiles_idx),
+                                   arith.constant(1, type=T.i32)),
+                        arith.constant(TILE_N, type=T.i32))
+                    _et_causal_ns = arith.subi(_et_tile_n_start, _causal_offset)
+                else:
+                    _et_causal_ns = None
                 _et_kv_remain = _mlir_arith.subi(
                     actual_kv_len,
                     _mlir_arith.muli(

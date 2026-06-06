@@ -9,14 +9,9 @@ import sys
 import math
 import torch
 
-_KERNEL_DIR = '/app/aiter/aiter/ops/flydsl/kernels/mha_1250'
-_REPO = os.path.join(_KERNEL_DIR, 'FlyDSL')
-_BUILD_PKGS = os.path.join(_REPO, 'build-fly', 'python_packages')
-os.environ.setdefault('FLYDSL_ROOT', _REPO)
 _AITER_ROOT = '/app/aiter'
-for p in [_BUILD_PKGS, os.path.join(_REPO, 'python'), _AITER_ROOT]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+if _AITER_ROOT not in sys.path:
+    sys.path.insert(0, _AITER_ROOT)
 os.environ['ARCH'] = 'gfx1250'
 os.environ['FLYDSL_RUNTIME_ENABLE_CACHE'] = '0'
 os.environ['ENABLE_CK'] = '0'

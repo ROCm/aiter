@@ -26,12 +26,6 @@ def _ensure_kernel_mod():
     global _kernel_mod
     if _kernel_mod is not None:
         return
-    flydsl_root = os.environ.get("FLYDSL_ROOT")
-    if flydsl_root is None:
-        raise RuntimeError("FLYDSL_ROOT not set.")
-    build_py = os.path.join(flydsl_root, "build-fly", "python_packages")
-    if os.path.isdir(build_py) and build_py not in sys.path:
-        sys.path.insert(0, build_py)
     if _KERNEL_DIR not in sys.path:
         sys.path.insert(0, _KERNEL_DIR)
     kernel_file = os.path.join(_KERNEL_DIR, "fmha_kernel_gfx1250.py")
@@ -200,7 +194,7 @@ def flash_attn_varlen_flydsl(
         softmax_scale = 1.0 / (HEAD_DIM_QK ** 0.5)
 
     if out is None:
-        out = torch.zeros(
+        out = torch.empty(
             (total_q_tokens, nheads_q, HEAD_DIM_V),
             dtype=torch.bfloat16, device=q.device,
         )
