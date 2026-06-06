@@ -317,9 +317,15 @@ def mx_sort_fly_gemm1_gemm2(
             D_HIDDEN=D_HIDDEN, D_INTER=D_INTER, MB=BM,
             prologue=1,
         )
+        # bf16_zero_out fuses zero-init of the atomic output buf into the quant
+        # kernel. Only the ATOMIC gemm2 (BM<=32) consumes that buffer; the BM=128
+        # nonatomic paths (bf16flat / mxfp4out) output via flat_out + scatter_reduce
+        # and never touch it, so zeroing a [M, D_HIDDEN] buffer there is pure waste
+        # (~1.6x slower quant at large M). Mirror mx_fn: pass empty when nonatomic.
+        _q_zero = atomic_output_buf if BM != 128 else _empty_bf16(device)
         aiter.mxfp4_moe_quant(
             a_input=hidden_states, a_quant=a_quant, a_scale=a_scale,
-            bf16_zero_out=atomic_output_buf,
+            bf16_zero_out=_q_zero,
             NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM,
         )
         padded_rows = ((max_sorted + 31) // 32) * 32
