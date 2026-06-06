@@ -142,7 +142,12 @@ def compile_mxfp4_gemm2_a4w4(
     # up-front (HIP run_one: load all, then 2-stage drain), removing the
     # mid-loop store/barrier of the serial single-slot path (s_barrier 5 -> 3).
     _g2_a_slots = 2 if BM == 16 else 1
-    _a_slot_stride = BM * lds_stride        # fp4-bytes for one A K-tile slot
+    # BM=16 stages A via direct-to-LDS (raw_ptr_buffer_load_lds, == HIP
+    # issue_a_load_lds): the DMA writes each lane's 16B contiguously, so the LDS
+    # row must be exactly BK/2=128 bytes (HIP s_Aq[BM][BK/2]) and the swizzle goes
+    # into the global read. Other BM keep the reg->ds_write path (256-byte row).
+    _a_lds_stride = (BK // 2) if BM == 16 else lds_stride
+    _a_slot_stride = BM * _a_lds_stride     # fp4-bytes for one A K-tile slot
     _a_lds_bytes = _g2_a_slots * _a_slot_stride
     _acc_lds_elems = BM * BN                # f32 cshuffle buffer
     _lds_a_offset = 0
@@ -330,6 +335,48 @@ def compile_mxfp4_gemm2_a4w4(
                     elem_bytes=elem_bytes,
                 )
 
+        _c8idx = arith.constant(8, index=True)
+        _c16idx = arith.constant(16, index=True)
+        _c2idx = arith.constant(2, index=True)
+        _ptr3 = ir.Type.parse("!llvm.ptr<3>")
+
+        def load_a_directlds_bm16(slot, kt):
+            # HIP issue_a_load_lds (BM=16): waves 0,1 each DMA 8 rows straight to
+            # LDS (raw_ptr_buffer_load_lds), no reg round-trip / ds_write. The DMA
+            # writes lane L's 16B to m0 + L*16 (contiguous), so m0 is the wave row
+            # base and the swizzle (row>>1)*16 goes into the per-lane global read;
+            # lds_load_packs_k64 reads the swizzled col back. (== HIP s_Aq layout)
+            _w_lt2 = arith.cmpi(
+                CmpIPredicate.ult, arith.index_cast(T.i32, wave),
+                arith.constant(2, type=T.i32))
+            _if = scf.IfOp(_w_lt2)
+            with ir.InsertionPoint(_if.then_block):
+                row_off = lane / _c8idx                 # 0..7
+                row = wave * _c8idx + row_off            # 0..15 (wave<2)
+                lib = lane % _c8idx                      # 0..7
+                col_byte = lib * _c16idx                 # 0,16,...,112
+                mask = (row / _c2idx) * _c16idx          # (row>>1)*16 = HIP mask
+                car_row = m_row + row
+                voff = arith.index_cast(
+                    T.i32,
+                    car_row * arith.constant(K // 2, index=True)
+                    + (col_byte ^ mask))
+                m0_idx = (
+                    memref.extract_aligned_pointer_as_index(lds_a)
+                    + arith.constant(slot * _a_slot_stride, index=True)
+                    + wave * arith.constant(64 * 16, index=True))
+                m0_i64 = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, m0_idx))
+                lds_ptr = llvm.inttoptr(_ptr3, m0_i64)
+                rocdl.raw_ptr_buffer_load_lds(
+                    a_rsrc, lds_ptr,
+                    arith.constant(16, type=T.i32),
+                    voff,
+                    arith.constant(kt * (BK // 2), type=T.i32),  # soffset = kt*128
+                    arith.constant(0, type=T.i32),
+                    arith.constant(0, type=T.i32),
+                )
+                scf.YieldOp([])
+
         # (A/B/scale loads + MFMA are issued by the unified K-loop below, after
         #  all tile helpers are defined.)
 
@@ -448,11 +495,25 @@ def compile_mxfp4_gemm2_a4w4(
             return vector.bitcast(vec8_i32, v4)
 
         def lds_load_packs_k64(curr_row, col_base, slot=0):
-            col_swz = swizzle_xor16(curr_row, col_base, k_blocks16)
-            idx_a = crd2idx([curr_row, col_swz], layout_lds)
-            if const_expr(slot != 0):
-                idx_a = idx_a + arith.constant(slot * _a_slot_stride, index=True)
-            loaded = vector.load_op(vec16_x, lds_a, [idx_a])
+            if const_expr(BM == 16):
+                # HIP issue_a_ds_read: 128-byte rows, mask = (row>>1)*16
+                # (lds_swizzle_mask<BK/2>(row) = (row & 14) << 3). Reads the
+                # swizzled LDS col so direct-to-LDS (contiguous write + swizzled
+                # global read) lands the lane's K-data at col_base.
+                mask = (curr_row / arith.index(2)) * _c16
+                col_swz = col_base ^ mask
+                byte_idx = (
+                    curr_row * arith.constant(_a_lds_stride, index=True)
+                    + col_swz
+                    + arith.constant(slot * _a_slot_stride, index=True)
+                )
+                loaded = vector.load_op(vec16_x, lds_a, [byte_idx])
+            else:
+                col_swz = swizzle_xor16(curr_row, col_base, k_blocks16)
+                idx_a = crd2idx([curr_row, col_swz], layout_lds)
+                if const_expr(slot != 0):
+                    idx_a = idx_a + arith.constant(slot * _a_slot_stride, index=True)
+                loaded = vector.load_op(vec16_x, lds_a, [idx_a])
             a_i64x2 = vector.bitcast(vec2_i64, loaded)
             a0 = vector.extract(a_i64x2, static_position=[0], dynamic_position=[])
             a1 = vector.extract(a_i64x2, static_position=[1], dynamic_position=[])
@@ -501,8 +562,10 @@ def compile_mxfp4_gemm2_a4w4(
             # double-buffer up-front, one barrier, then prefetch both B/scale and
             # drain the 2 MFMA stages. Removes the serial mid-loop store/barrier
             # (s_barrier 5 -> 3) and lets the B VMEM overlap the MFMA.
-            store_a_tile(load_a_tile(arith.index(0)), slot=0)
-            store_a_tile(load_a_tile(arith.constant(BK, index=True)), slot=1)
+            # direct-to-LDS A staging for both K-tiles (== HIP issue_a_load_lds),
+            # no buffer_load->reg->ds_write round-trip.
+            load_a_directlds_bm16(0, 0)
+            load_a_directlds_bm16(1, 1)
             gpu.barrier()
             _b0 = load_b_tile(arith.index(0))
             _asc0, _bsc0 = load_scales(arith.index(0))
