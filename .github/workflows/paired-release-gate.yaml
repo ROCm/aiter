@@ -65,9 +65,6 @@ jobs:
             threshold: '0.92'
             extra_args: '--kv_cache_dtype fp8 --trust-remote-code'
             env_vars: '-e HSA_NO_SCRATCH_RECLAIM=1'
-    if: >-
-      inputs.models == 'all' ||
-      contains(inputs.models, matrix.model)
     runs-on: linux-aiter-do-mi350x-8
     timeout-minutes: 90
     env:
