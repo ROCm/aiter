@@ -124,6 +124,9 @@ TESTS = [
         "label": "MI35X",
         "model": "DeepSeek-V3 MoRI-EP",
         "model_id": "deepseek-ai/DeepSeek-V3-0324",
+        "model_path_env": "DEEPEP_MODEL_PATH",
+        "draft_model_id": "lmsys/DeepSeek-V3-NextN",
+        "draft_model_path_env": "DEEPEP_NEXTN_MODEL_PATH",
         "test_type": "Accuracy (MoRI EP + MTP)",
         "timeout_minutes": 150,
         "extra_exec_args": "",
@@ -174,6 +177,20 @@ SGLANG_CI_PATCHES = [
         "path": "test/registered/amd/accuracy/mi35x/test_deepseek_v32_eval_mi35x.py",
         "old": 'model_path="deepseek-ai/DeepSeek-V3.2",',
         "new": 'model_path=os.environ.get("DEEPSEEK_V32_MODEL_PATH", "deepseek-ai/DeepSeek-V3.2"),',
+    },
+    # Make the shared DeepEP test models (used by the MoRI EP suite) resolve from
+    # the /models cache when present, so the predownload step's local copy is
+    # used instead of an inline HF download inside the test step. test_utils.py
+    # already imports os; defaults are unchanged when the env vars are unset.
+    {
+        "path": "python/sglang/test/test_utils.py",
+        "old": 'DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"',
+        "new": 'DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = os.environ.get("DEEPEP_MODEL_PATH", "deepseek-ai/DeepSeek-V3-0324")',
+    },
+    {
+        "path": "python/sglang/test/test_utils.py",
+        "old": 'DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN = "lmsys/DeepSeek-V3-NextN"',
+        "new": 'DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN = os.environ.get("DEEPEP_NEXTN_MODEL_PATH", "lmsys/DeepSeek-V3-NextN")',
     },
 ]
 
@@ -252,26 +269,29 @@ def patch_sglang_checkout() -> None:
 
 def model_env_args() -> None:
     test = json.loads(os.environ["TEST_SPEC"])
-    env_name = test.get("model_path_env")
-    model_id = test.get("model_id")
-    if not env_name or not model_id:
-        return
-
-    model_dir = f"/models/{model_id}"
-    result = subprocess.run(
-        ["docker", "exec", "ci_sglang", "test", "-r", f"{model_dir}/config.json"],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if result.returncode == 0:
-        print(f"Using local model path: {model_dir}", file=sys.stderr)
-        print("-e")
-        print(f"{env_name}={model_dir}")
-    else:
-        print(
-            f"Local model path not readable, using default: {model_id}", file=sys.stderr
+    pairs = [
+        (test.get("model_path_env"), test.get("model_id")),
+        (test.get("draft_model_path_env"), test.get("draft_model_id")),
+    ]
+    for env_name, model_id in pairs:
+        if not env_name or not model_id:
+            continue
+        model_dir = f"/models/{model_id}"
+        result = subprocess.run(
+            ["docker", "exec", "ci_sglang", "test", "-r", f"{model_dir}/config.json"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
+        if result.returncode == 0:
+            print(f"Using local model path: {model_dir}", file=sys.stderr)
+            print("-e")
+            print(f"{env_name}={model_dir}")
+        else:
+            print(
+                f"Local model path not readable, using default: {model_id}",
+                file=sys.stderr,
+            )
 
 
 def main() -> None:

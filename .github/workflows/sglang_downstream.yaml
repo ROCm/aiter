@@ -149,6 +149,25 @@ jobs:
             pip show amd-aiter || pip show aiter
           "
 
+      - name: Predownload model(s) to /models cache
+        if: ${{ matrix.model_id != '' }}
+        timeout-minutes: 180
+        env:
+          MODEL_ID: ${{ matrix.model_id }}
+          DRAFT_MODEL_ID: ${{ matrix.draft_model_id }}
+        run: |
+          set -ex
+          # Decouple the (slow, one-time) model download from the test step, the
+          # same way the ATOM lane does. Downloads into the persistent /models
+          # host cache so model_env_args resolves a local path and the test step
+          # never eats the download time. Idempotent + flocked (see the script).
+          for mid in "${MODEL_ID}" "${DRAFT_MODEL_ID}"; do
+            [ -z "${mid}" ] && continue
+            docker exec \
+              -e HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" \
+              ci_sglang bash /tmp/aiter-under-test/.github/scripts/sglang_predownload.sh "${mid}"
+          done
+
       - name: ${{ matrix.test_type }} Test MI35x (8-GPU ${{ matrix.model }})
         timeout-minutes: ${{ matrix.timeout_minutes }}
         env:
