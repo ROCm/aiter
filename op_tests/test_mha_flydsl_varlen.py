@@ -1,8 +1,8 @@
 """Unit test for FlyDSL MHA varlen kernel on gfx1250.
 
-Tests with THD packed layout and variable-length sequences via cu_seqlens.
-Supports both causal and non-causal modes.
-Uses the production path (flash_attn_varlen_func -> flash_attn_varlen_d192_gfx1250).
+Tests with THD packed layout and variable-length sequences
+via cu_seqlens. Covers causal, non-causal, sq!=sk,
+seqlen_k==0, mixed zero/nonzero batches, and return_lse.
 
 Usage:
     bash run_mha_flydsl_varlen.sh
@@ -187,21 +187,23 @@ if __name__ == "__main__":
     print("FlyDSL MHA Varlen Unit Tests")
     print("=" * 60)
 
-    # (cu_q, cu_k, H) — all combos of causal x return_lse are generated below
+    # (cu_q, cu_k, H)
+    # All combos of causal x return_lse are generated below.
     base_shapes = [
-        # --- original cases ---
+        # --- basic sq == sk ---
         ([0, 128], [0, 128], 1),
         ([0, 184], [0, 184], 128),
         ([0, 341], [0, 341], 128),
         ([0, 5], [0, 5], 128),
+        # --- multi-batch ---
         ([0, 481, 581, 982], [0, 481, 581, 982], 128),
-        # --- from test_flydsl_mha.py: uniform batch shapes ---
+        # --- sq != sk ---
         ([0, 128], [0, 512], 1),
         ([0, 128], [0, 256], 1),
         ([0, 128, 256], [0, 512, 1024], 1),
         ([0, 128], [0, 512], 2),
         ([0, 128, 256], [0, 256, 512], 2),
-        # --- from test_flydsl_seqlen0_noncausal.py: sq << sk (decode-like) ---
+        # --- sq << sk (decode-like) ---
         ([0, 72], [0, 600], 1),
         ([0, 72], [0, 600], 2),
         ([0, 1], [0, 512], 1),
@@ -210,14 +212,23 @@ if __name__ == "__main__":
         ([0, 72, 144], [0, 600, 1200], 2),
         ([0, 1, 129], [0, 512, 1536], 2),
         ([0, 72, 73], [0, 600, 856], 4),
-        # --- from test_flydsl_seqlen0_noncausal.py: noncausal various sq/sk ---
+        # --- noncausal various sq/sk ---
         ([0, 128], [0, 256], 1),
         ([0, 128, 384], [0, 128, 384], 1),
         ([0, 128, 384], [0, 256, 640], 2),
         ([0, 300], [0, 300], 2),
         ([0, 128, 256], [0, 256, 512], 4),
-        # --- from repro_chunked_prefill_mismatch.py: cu_q != cu_k ---
+        # --- cu_q != cu_k (chunked prefill) ---
         ([0, 693, 1385, 1846], [0, 693, 1385, 2086], 128),
+        # --- seqlen_k == 0 (output must be all zeros) ---
+        ([0, 128], [0, 0], 1),
+        ([0, 256], [0, 0], 2),
+        ([0, 128, 256], [0, 0, 0], 1),
+        ([0, 300], [0, 0], 4),
+        # --- mixed seqlen_k == 0 (some batches zero) ---
+        ([0, 128, 256], [0, 0, 128], 1),
+        ([0, 128, 384], [0, 128, 0], 2),
+        ([0, 128, 256, 384], [0, 0, 0, 128], 1),
     ]
     tests = []
     for cu_q, cu_k, H in base_shapes:

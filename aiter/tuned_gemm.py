@@ -136,8 +136,7 @@ def get_GEMM_A16W16_config(
         )
         if config is not None:
             if config["libtype"] == "flydsl":
-                # if is_flydsl_available():
-                if False: 
+                if is_flydsl_available():
                     flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
                         config["kernelName"]
                     )
@@ -292,7 +291,7 @@ def gemm_a16w16(
     gfx = get_gfx()
     _no_asm = gfx.startswith("gfx12")
     libtype = config["libtype"]
-    if _no_asm and libtype in ("asm", "skinny", "hipblaslt", "opus"):
+    if _no_asm and libtype in ("asm", "skinny", "hipblaslt"):
         libtype = "torch"
     solution_idx = config["solidx"] if libtype == config.get("libtype") else 0
     solfunc = solMap[libtype]

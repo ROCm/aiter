@@ -90,10 +90,9 @@ def _fused_max_combine(a1, a2, b1, b2):
 @lru_cache(maxsize=1)
 def get_cdna_version():
     """Get CDNA version lazily to avoid CUDA initialization during import."""
-    arch = arch_info.get_arch()
-    if arch in ["gfx950", "gfx1250"]:
+    if arch_info.get_arch() in ["gfx950"]:
         return 4
-    elif arch in ["gfx942"]:
+    elif arch_info.get_arch() in ["gfx942"]:
         return 3
     else:
         return -1
