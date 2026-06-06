@@ -121,13 +121,17 @@ TESTS = [
         # =128 (the small-buffer regime that exposed the bug), gated on
         # gsm8k >= 0.90. A silent corruption now fails CI loudly.
         #
-        # Scoped to TestLowLatency (deepep low_latency dispatch), verified passing
-        # at gsm8k 0.945. The normal-mode / intra-node classes (TestPureDP,
-        # TestMTP, TestNormal, ...) currently die during CUDA graph capture with
-        # "HIP error 401: hipModuleLaunchKernel(EpDispatchIntraNodeKernel_bf16)"
-        # — tracked separately in ROCm/aiter#3579. Re-add those classes once that
-        # is resolved. (test_moriep_small.py has 8 classes; running all 8 also
-        # blows the 150-min timeout at ~40 min/class.)
+        # DISABLED pending ROCm/aiter#3579. The mori EP dispatch kernel fails
+        # CUDA graph capture with "HIP error 401: hipModuleLaunchKernel" on BOTH
+        # dispatch paths — normal/intra-node (EpDispatchIntraNodeKernel_bf16) and
+        # low_latency (mori dispatch_combine launch_multi). Weights load fine; the
+        # server reaches capture and the mori JIT kernel launch then fails. Only
+        # one run ever passed (gsm8k 0.945, TestLowLatency @ 832966dd); later runs
+        # fail at capture. Likely a mori build skew in the harness (image's mori
+        # vs the AITER under test) or a real capture issue — needs the mori owner.
+        # CI plumbing (predownload to /models, env resolution, class scoping) is
+        # in place and verified; flip run_on_* back on once #3579 is resolved.
+        # test_command kept on TestLowLatency (the closest-to-green class).
         "runner": "linux-aiter-do-mi350x-8",
         "label": "MI35X",
         "model": "DeepSeek-V3 MoRI-EP",
@@ -139,8 +143,8 @@ TESTS = [
         "timeout_minutes": 90,
         "extra_exec_args": "",
         "test_command": "python3 registered/amd/test_moriep_small.py TestLowLatency",
-        "run_on_pr": True,
-        "run_on_schedule": True,
+        "run_on_pr": False,
+        "run_on_schedule": False,
     },
 ]
 
