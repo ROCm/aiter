@@ -704,6 +704,12 @@ def _gfx1250_unified_attention_2d(
     Q_FP8 = q.element_size() == 1
     KV_FP8 = k.element_size() == 1
     ARCH_NAME = arch_info.get_arch()
+    assert loop_variant in [
+        None,
+        0,
+        1,
+        2,
+    ], "Only [None, 0, 1, 2] supported as loop_variant"
     assert ARCH_NAME == "gfx1250", "unified_attention_2d_gfx1250 only supports gfx1250"
     assert softcap == 0, "Softcap is not supported"
     if shuffled_kv_cache:
@@ -737,14 +743,13 @@ def _gfx1250_unified_attention_2d(
     BLOCK_M = 128
     waves_per_eu = 1
     if SLIDING_WINDOW > 0:
-        loop_variant = 0
-    elif loop_variant is None:
-        if shuffled_kv_cache or TILE_SIZE > 32:
-            loop_variant = 2
-        else:
-            loop_variant = 0
-    elif ALL_DECODE:
-        loop_variant = 0
+        sel_loop_variant = 0
+    if shuffled_kv_cache or TILE_SIZE > 32:
+        sel_loop_variant = 2
+    else:
+        sel_loop_variant = 0
+    if ALL_DECODE:
+        sel_loop_variant = 0
         BLOCK_M = (
             16
             if NUM_QUERIES_PER_KV <= 16
@@ -757,6 +762,10 @@ def _gfx1250_unified_attention_2d(
         else:
             num_warps = 1
             waves_per_eu = 2
+
+    # auto mode, otherwise use the provided variant
+    if loop_variant is None:
+        loop_variant = sel_loop_variant
 
     assert (
         TILE_SIZE >= BLOCK_SIZE
