@@ -27,7 +27,7 @@ os.environ.setdefault(
                 "ops",
                 "flydsl",
                 "kernels",
-                "mha_1250",
+                "fmha_gfx1250",
             )
         ),
         "FlyDSL",

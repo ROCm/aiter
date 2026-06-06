@@ -62,7 +62,7 @@ _P2 = [P2_M0, P2_M1, P2_M2, P2_M3]  # pkfma/setup (cheap, 1cy)
 _EXP = [EXP_M0, EXP_M1, EXP_M2, EXP_M3]  # pair_exp (expensive, 3cy)
 
 # ---------------------------------------------------------------------------
-# Constants (must match fmha_core_loop_gfx1250.py)
+# Constants (must match fmha_core_loop.py)
 # ---------------------------------------------------------------------------
 _NUM_MSB = 4
 _GEMM_INST_COUNT = 24  # WMMAs per GEMM1 stage

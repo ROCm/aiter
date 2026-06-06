@@ -2,8 +2,8 @@
  Forward Kernel — gfx1250, Unified Prologue + Core Loop + Dynamic KV Loop.
 
 Integrates:
-  - Prologue (fmha_prologue_gfx1250.py): HW setup, Q load, K/V addr gen
-  - Core loop (fmha_core_loop_gfx1250.py): GEMM1(QK) + GEMM2(PV) interleaved
+  - Prologue (fmha_prologue.py): HW setup, Q load, K/V addr gen
+  - Core loop (fmha_core_loop.py): GEMM1(QK) + GEMM2(PV) interleaved
   - Dynamic scf.for_ loop over KV tiles (tile_n=128, variable kv_seq_len)
 
 Target: gfx1250 (MI450), wave32, 4 waves per TG (1TG), 1024 shared VGPRs.
@@ -66,7 +66,7 @@ from flydsl.compiler.kernel_function import (
     CompilationContext,
 )
 
-from fmha_prologue_gfx1250 import (
+from fmha_prologue import (
     _emit_void,
     _setreg,
     _build_tdm_dgroup1,
@@ -85,7 +85,7 @@ from fmha_prologue_gfx1250 import (
     V_SU_HALF_OFFSET,
 )
 
-from fmha_core_loop_gfx1250 import (
+from fmha_core_loop import (
     _get_types,
     _make_v2f32,
     _pair_k_tiles_for_wmma,
@@ -716,7 +716,7 @@ def _issue_k_loads(ty, kv_lds_addrs, blk, su):
     Returns raw kv_raw[4 msb][N_LDS_PER_MSB] — caller must wait
     (rocdl.s_wait_dscnt(0)) before using the results.
     """
-    from fmha_core_loop_gfx1250 import _atom_ds_load_b128
+    from fmha_core_loop import _atom_ds_load_b128
 
     su_off = (blk * CNT_SU + su) * LDS_K_SU_P_SIZE
     kv_raw = [[None] * N_LDS_PER_MSB for _ in range(NUM_MSB)]

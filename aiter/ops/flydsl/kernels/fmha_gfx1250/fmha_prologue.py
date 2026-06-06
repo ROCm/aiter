@@ -17,7 +17,7 @@ from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, rocdl, vector
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
-from fmha_core_loop_gfx1250 import (
+from fmha_core_loop import (
     QK_HDIM,
     _rocdl_permlanex16,
     _rocdl_exp2,
