@@ -755,20 +755,29 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     route_tokens = rows_to_tokens.view(E, max_m).to(torch.long)
 
     if data_format == "fp4":
-        from aiter.ops.quant import per_1x32_f4_quant
+        # a1 fp4 quant: AITER_GROUPED_GEMM_NAIVE=1 uses the torch reference
+        # per_1x32_f4_quant; =0 (default) uses the fused Triton kernel
+        # per_1x32_f4_quant_triton, which collapses the torch op launch-storm
+        # (the dominant tiny-op hotspot). NOTE: the two are not bit-identical --
+        # their e8m0 block-scale rounding differs by up to 1 exponent step in a
+        # minority of blocks -- so NAIVE on/off differ slightly on the fp4 a1 quant.
+        if _use_naive:
+            from aiter.ops.quant import per_1x32_f4_quant as _a1_f4_quant
+        else:
+            from aiter.ops.quant import per_1x32_f4_quant_triton as _a1_f4_quant
 
         _grouped_dbg("start a1 fp4 quant")
-        a1_quant, a1_scale_token = per_1x32_f4_quant(
+        a1_quant, a1_scale_token = _a1_f4_quant(
             hidden_states, quant_dtype=dtypes.fp4x2, shuffle=False
         )
         _grouped_dbg("a1 fp4 quant done")
         a1_payload = a1_quant.view(torch.uint8).contiguous()
         a1_scale_token_u8 = a1_scale_token.view(torch.uint8).contiguous()
-        grouped_a1 = torch.zeros(
+        grouped_a1 = torch.empty(
             (E, max_m, model_dim // 2), dtype=torch.uint8, device=device
         )
-        a1_scale_raw = torch.full(
-            (E, max_m, model_dim // 32), 127, dtype=torch.uint8, device=device
+        a1_scale_raw = torch.empty(
+            (E, max_m, model_dim // 32), dtype=torch.uint8, device=device
         )
     else:
         # a8w4 stage1 input: per-block-32 mxfp8 quantization (matches the
@@ -797,13 +806,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         a1_scale_token_u8 = (
             scale_e8m0.view(Mtok, model_dim // BLOCK).view(torch.uint8).contiguous()
         )
-        grouped_a1 = torch.zeros(
+        grouped_a1 = torch.empty(
             (E, max_m, model_dim), dtype=torch.uint8, device=device
         )
         # Initial fill with byte=127 (=2^0=1.0) so empty rows in inactive
         # experts decode to scale=1.0 and don't trip the kernel.
-        a1_scale_raw = torch.full(
-            (E, max_m, model_dim // 32), 127, dtype=torch.uint8, device=device
+        a1_scale_raw = torch.empty(
+            (E, max_m, model_dim // 32), dtype=torch.uint8, device=device
         )
 
     # Route-gather: copy each token's payload/scale into the grouped layout,
@@ -862,7 +871,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     )
     _grouped_dbg("scale layout done")
 
-    grouped_a2 = torch.zeros((E, max_m, inter_dim), dtype=dtype, device=device)
+    grouped_a2 = torch.empty((E, max_m, inter_dim), dtype=dtype, device=device)
     stage1_compiler = (
         compile_moe_grouped_gemm1_mxfp4_masked
         if data_format == "fp4"
@@ -946,9 +955,18 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 grouped_a2[e, :n].mul_(route_weights[e, :n].view(-1, 1))
 
     if data_format == "fp4":
-        from aiter.ops.quant import per_1x32_f4_quant
+        # a2 fp4 quant: AITER_GROUPED_GEMM_NAIVE=1 uses the torch reference
+        # per_1x32_f4_quant; =0 (default) uses the fused Triton kernel
+        # per_1x32_f4_quant_triton, which collapses the torch op launch-storm
+        # (the dominant tiny-op hotspot). NOTE: the two are not bit-identical --
+        # their e8m0 block-scale rounding differs by up to 1 exponent step in a
+        # minority of blocks -- so NAIVE on/off differ slightly on the fp4 a2 quant.
+        if _use_naive:
+            from aiter.ops.quant import per_1x32_f4_quant as _a2_f4_quant
+        else:
+            from aiter.ops.quant import per_1x32_f4_quant_triton as _a2_f4_quant
         _grouped_dbg("start a2 fp4 quant")
-        a2_quant, a2_scale_token = per_1x32_f4_quant(
+        a2_quant, a2_scale_token = _a2_f4_quant(
             grouped_a2.view(E * max_m, inter_dim),
             quant_dtype=dtypes.fp4x2,
             shuffle=False,
@@ -973,7 +991,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         a2_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
     )
     _grouped_dbg("a2 scale layout done")
-    grouped_out = torch.zeros((E, max_m, model_dim), dtype=dtype, device=device)
+    grouped_out = torch.empty((E, max_m, model_dim), dtype=dtype, device=device)
     stage2_compiler = (
         compile_moe_grouped_gemm2_mxfp4_masked
         if data_format == "fp4"
@@ -1030,7 +1048,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             flush=True,
         )
 
-    moe_out = torch.zeros((token_num, model_dim), dtype=dtype, device=device)
+    moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     # One-pass gather-reduce epilogue (default): a single FlyDSL kernel gathers
     # each token's topk source rows, weights them, and sums in f32. Set
     # AITER_GROUPED_GEMM_NAIVE=1 to fall back to the naive per-expert
