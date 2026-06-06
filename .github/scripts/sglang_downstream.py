@@ -109,6 +109,28 @@ TESTS = [
         "comment": "Standalone performance job is too long for PR validation.",
         "run_on_schedule": True,
     },
+    {
+        # MoRI expert-parallel accuracy gate. Guards the AITER moe_kernels
+        # stage-2 reduce path on the MoRI EP backend, where a small per-rank
+        # dispatch buffer silently corrupted decode output (gsm8k -> 0 while
+        # output stayed fluent and even ~1.5% faster). Reported by SemiAnalysis
+        # / InferenceX, root-caused to AITER. See sgl-project/sglang#27194.
+        # Runs SGLang's stage-c MoRI EP suite (test_moriep_small.py): DeepSeek-V3
+        # with TP8/EP8/DP8 + dp-attention + --moe-a2a-backend mori +
+        # --attention-backend aiter + MTP, and SGLANG_MORI_NUM_MAX_DISPATCH_
+        # TOKENS_PER_RANK=128 (the small-buffer regime that exposed the bug),
+        # gated on gsm8k >= 0.90. A silent corruption now fails CI loudly.
+        "runner": "linux-aiter-do-mi350x-8",
+        "label": "MI35X",
+        "model": "DeepSeek-V3 MoRI-EP",
+        "model_id": "deepseek-ai/DeepSeek-V3-0324",
+        "test_type": "Accuracy (MoRI EP + MTP)",
+        "timeout_minutes": 150,
+        "extra_exec_args": "",
+        "test_command": "python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --nightly --timeout-per-file 5400",
+        "run_on_pr": True,
+        "run_on_schedule": True,
+    },
 ]
 
 
