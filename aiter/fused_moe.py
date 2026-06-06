@@ -504,6 +504,39 @@ def _grouped_a8w4_prepare_scale_batch(
     ).to(device=device)
 
 
+def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
+    """Pure-torch fallback for ``build_route_maps`` (the atomic FlyDSL kernel).
+
+    Returns the same triple ``(topids_to_rows, rows_to_tokens, masked_m)`` with
+    identical semantics; the only difference is the within-expert ``slot`` order,
+    which is deterministic token-major here (one-hot cumsum) vs. atomic-race in
+    the kernel. Both maps are self-consistent and the grouped GEMM is
+    order-agnostic within an expert, so NAIVE on/off yield identical final output.
+
+      topids_to_rows : (token_num, topk) int32  route -> grouped row
+                       = ``topk_ids[t,k]*max_m + slot``
+      rows_to_tokens : (E*max_m,)        int32  grouped row -> source token (-1 pad)
+      masked_m       : (E,)              int32  rows routed to each expert
+    """
+    import torch.nn.functional as F
+
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    flat_e = topk_ids.reshape(-1).to(torch.long)
+    # slot = number of earlier routes to the same expert (token-major order).
+    slot = F.one_hot(flat_e, E).cumsum(0).gather(1, flat_e[:, None]).squeeze(1) - 1
+    topids_to_rows = (flat_e * max_m + slot).to(torch.int32)
+    # Inverse map: grouped row -> source token (-1 for unused padding rows).
+    rows_to_tokens = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
+    src_tokens = (
+        torch.arange(token_num, device=device, dtype=torch.int32)
+        .repeat_interleave(topk)
+    )
+    rows_to_tokens[topids_to_rows.to(torch.long)] = src_tokens
+    masked_m = torch.bincount(flat_e, minlength=E).to(torch.int32)
+    return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
+
+
 def _maybe_grouped_gfx1250_a8w4_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -699,12 +732,27 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     flat_routes = torch.arange(token_num * topk, device=device, dtype=torch.long)
     flat_tokens = flat_routes // topk
-    flat_weights = topk_weight.reshape(-1).to(dtype)
-    route_tokens = torch.empty((E, max_m), dtype=torch.long, device=device)
     route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
-    # Naive-path fallback for the per-expert GEMM mask. On the optimized path
-    # this is overwritten by build_route_maps (derived from its atomic counters).
-    masked_m = counts.to(torch.int32).to(device=device)
+
+    # Route maps built once, here, for both paths (route -> grouped row, grouped
+    # row -> token, rows-per-expert). AITER_GROUPED_GEMM_NAIVE=0 (default) uses the
+    # single-pass atomic-scatter FlyDSL kernel; =1 uses the pure-torch naive build.
+    # The two differ only in within-expert row order (self-consistent in both), and
+    # the grouped GEMM is order-agnostic per expert, so NAIVE on/off outputs match.
+    _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
+    if _use_naive:
+        topids_to_rows, rows_to_tokens, masked_m = _build_route_maps_naive(
+            topk_ids, E, max_m
+        )
+    else:
+        from aiter.ops.flydsl.moe_kernels import build_route_maps
+
+        topids_to_rows, rows_to_tokens, masked_m = build_route_maps(
+            topk_ids, E, max_m
+        )
+    # Grouped row -> source token, (E, max_m); padding rows (-1) are never read
+    # because the naive epilogues are bounded by per-expert counts.
+    route_tokens = rows_to_tokens.view(E, max_m).to(torch.long)
 
     if data_format == "fp4":
         from aiter.ops.quant import per_1x32_f4_quant
@@ -758,25 +806,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             (E, max_m, model_dim // 32), 127, dtype=torch.uint8, device=device
         )
 
-    # One-pass route-gather (default): a single FlyDSL kernel copies each token's
-    # payload/scale into the grouped layout (writing only valid rows, so the
-    # pre-filled a1_scale_raw=127 padding is preserved). Set
-    # AITER_GROUPED_GEMM_NAIVE=1 to fall back to the naive per-expert copy loop.
-    _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
-    # Per-token gather map (topk_ids -> grouped rows), built once (argsort-free)
-    # and shared by the scatter-copy and gather-reduce kernels below.
-    topids_to_rows = None
+    # Route-gather: copy each token's payload/scale into the grouped layout,
+    # driven by the maps built above (so both paths share the same row order).
+    # AITER_GROUPED_GEMM_NAIVE=0 (default): one FlyDSL scatter-copy kernel pass
+    # (writes only valid rows, preserving the pre-filled a1_scale_raw=127 padding).
+    # =1: pure-torch scatter assignment via topids_to_rows.
     if not _use_naive:
-        from aiter.ops.flydsl.moe_kernels import (
-            flydsl_moe_scatter_copy_token,
-            build_route_maps,
-        )
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_scatter_copy_token
 
-        # Efficient atomic-kernel map build: topids_to_rows (route -> grouped row),
-        # its inverse rows_to_tokens (grouped row -> token), and masked_m (rows per
-        # expert) all in one pass -- masked_m comes from the atomic counters, so
-        # it replaces the separate bincount above.
-        topids_to_rows, rows_to_tokens, masked_m = build_route_maps(topk_ids, E, max_m)
         _grouped_dbg("start route gather (scatter-copy kernel)")
         flydsl_moe_scatter_copy_token(
             a1_payload,
@@ -787,28 +824,23 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             grouped_a1=grouped_a1,
             a1_scale_raw=a1_scale_raw,
         )
-        # route_weights is only consumed by the doweight_stage1 multiply below
-        # (and the naive epilogue); build it from topk_weight only when needed.
-        # route_tokens is naive-only -> not built on the kernel path.
-        if doweight_stage1:
-            route_weights.view(-1)[topids_to_rows.reshape(-1)] = (
-                topk_weight.reshape(-1).to(route_weights.dtype)
-            )
         _grouped_dbg("route gather done")
     else:
         _grouped_dbg("start route gather (naive)")
-        for e in range(E):
-            mask = flat_experts == e
-            n = int(counts[e].item())
-            if n == 0:
-                continue
-            toks = flat_tokens[mask]
-            grouped_a1[e, :n].copy_(a1_payload[toks])
-            if a1_scale_token_u8 is not None:
-                a1_scale_raw[e, :n].copy_(a1_scale_token_u8[toks])
-            route_tokens[e, :n].copy_(toks)
-            route_weights[e, :n].copy_(flat_weights[mask])
+        # grouped_row <- source token, for every route (topids_to_rows are unique
+        # per route, so no aliasing in the scatter assignment).
+        flat_rows = topids_to_rows.reshape(-1).to(torch.long)
+        grouped_a1.view(E * max_m, -1)[flat_rows] = a1_payload[flat_tokens]
+        if a1_scale_token_u8 is not None:
+            a1_scale_raw.view(E * max_m, -1)[flat_rows] = a1_scale_token_u8[flat_tokens]
         _grouped_dbg("route gather done")
+
+    # route_weights (grouped row -> routing weight) is consumed by the
+    # doweight_stage1 multiply below and by the naive gather-reduce epilogue. Build
+    # it from the map unconditionally (one scatter); the kernel epilogue ignores it.
+    route_weights.view(-1)[topids_to_rows.reshape(-1)] = (
+        topk_weight.reshape(-1).to(route_weights.dtype)
+    )
 
     grouped_w1 = (w1 if w1.dtype == torch.uint8 else w1.view(torch.uint8)).contiguous()
     grouped_w2 = (w2 if w2.dtype == torch.uint8 else w2.view(torch.uint8)).contiguous()
@@ -1003,18 +1035,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # each token's topk source rows, weights them, and sums in f32. Set
     # AITER_GROUPED_GEMM_NAIVE=1 to fall back to the naive per-expert
     # ``index_add_`` scatter loop.
-    _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
     if (not _use_naive) and dtype in (dtypes.bf16, dtypes.fp16):
-        from aiter.ops.flydsl.moe_kernels import (
-            flydsl_moe_gather_reduce,
-            build_route_maps,
-        )
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_gather_reduce
 
         _grouped_dbg("start gather-reduce output")
-        # Reuse the per-token gather map built for the route-gather step (shared,
-        # argsort-free); only rebuild if the scatter-copy path didn't run.
-        if topids_to_rows is None:
-            topids_to_rows, _, _ = build_route_maps(topk_ids, E, max_m)
+        # Reuse the per-token gather map built once for the route-gather step.
         # gather_w in the model dtype (bf16/f16); the kernel extends to f32. No
         # f32 cast -- the weight is already bf16/f16, that precision is enough.
         gather_w = (
