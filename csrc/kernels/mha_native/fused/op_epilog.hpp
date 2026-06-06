@@ -159,9 +159,9 @@ __device__ __forceinline__ void epilog_store(
 // ================================================================
 //
 // ROLE IN THE PIPELINE (IsSplit=true ONLY; the IsSplit=false path uses
-// epilog_store above and is untouched)
-//   The split-K forward pass runs the SAME per-block loop as the four existing
-//   entries but over a disjoint KV sub-range ("split"). Instead of bf16-truncating
+// epilog_store above)
+//   The split-K forward pass runs the SAME per-block loop as a full (non-split)
+//   forward but over a disjoint KV sub-range ("split"). Instead of bf16-truncating
 //   O straight to the final tensor, it writes this split's NORMALIZED fp32 partial
 //   output O_g and a per-row natural-log LSE_g into the split-major scratch buffer
 //   (see FmhaFwdSplitParams / FmhaFwdCombineParams). A later combine pass folds

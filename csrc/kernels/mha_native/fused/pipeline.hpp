@@ -11,12 +11,12 @@
 // ================================================================
 //
 // ROLE IN THE PIPELINE
-//   fmha_fwd_d64_device<HasMask,IsVarlen> IS the whole FMHA forward pass for one
-//   M-tile (kM0=128 query rows of one batch/head). The four __global__
-//   entries in the entry .cu files are thin shells that decode blockIdx and call
-//   this. Everything below
-//   orchestrates the helpers in op_lds.hpp / op_gemm.hpp / op_softmax.hpp /
-//   op_epilog.hpp into a software-pipelined loop over the KV tiles.
+//   fmha_fwd_d64_device<HasMask,IsVarlen,IsSplit> IS the whole FMHA forward pass
+//   for one M-tile (kM0=128 query rows of one batch/head). The split __global__
+//   entries (fmha_fwd_d64_bf16_msk{0,1}_split) are thin shells that decode
+//   blockIdx and call this. Everything below orchestrates the helpers in
+//   op_lds.hpp / op_gemm.hpp / op_softmax.hpp / op_epilog.hpp into a
+//   software-pipelined loop over the KV tiles.
 //
 // END-TO-END FLOW (one block):
 //   1. SETUP   — decode lane/warp geometry; resolve Q/K/V/O base pointers and
@@ -91,20 +91,17 @@ constexpr int LdsSeq[4] = {1, 2, 1, 0};
 // One block's full FMHA forward pass over its M-tile.
 //   HasMask  : compile-time. false = boundary mask only; true = causal+boundary.
 //   IsVarlen : compile-time. false = dense batch tensors; true = group/varlen.
-//   IsSplit  : compile-time. false (DEFAULT) = the ordinary forward pass used by
-//              the four existing entries — every split-specific branch below is
-//              `if constexpr`-discarded, so codegen for those entries is byte-for-
-//              byte unchanged. true = split-K: walk only this split's disjoint KV
-//              sub-range and write a normalized fp32 partial (O_g, LSE_g) to the
-//              split-major scratch via epilog_store_split (see op_epilog.hpp).
+//   IsSplit  : compile-time. false (DEFAULT) = ordinary full forward pass: every
+//              split-specific branch below is `if constexpr`-discarded. true =
+//              split-K: walk only this split's disjoint KV sub-range and write a
+//              normalized fp32 partial (O_g, LSE_g) to the split-major scratch via
+//              epilog_store_split (see op_epilog.hpp).
 //   params   : tensor pointers, strides, scale, optional LSE/seqstart arrays.
 //   lds      : this block's __shared__ scratch (kLdsBytes; the 3 rotating buffers).
 //   batch_idx/head_idx/m_tile_idx : the tile coordinates (from blockIdx; the
 //                                   causal M-tile reversal already applied in
 //                                   the entry .cu files for the masked entries).
-//   --- TRAILING split-only args (defaults keep the four existing call sites
-//       byte-identical: they pass none of these, so non-split callers are
-//       unchanged) ---
+//   --- TRAILING split-only args (defaulted so a non-split call can omit them) ---
 //   scratch_o   : split-major fp32 partial-O scratch base (IsSplit only).
 //   scratch_lse : split-major fp32 LSE scratch base (IsSplit only).
 //   num_splits  : G — the KV axis is partitioned into G disjoint ranges.
@@ -214,8 +211,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     int num_total_loop = (seqlen_k_end - seqlen_k_start + kN0 - 1) / kN0;
 
     // ---- SPLIT-K KV-range narrowing (IsSplit=true ONLY) ----
-    // Discarded entirely when IsSplit=false (the four existing entries), so their
-    // loop-bound codegen is unchanged. For a split, partition the FULL tile count
+    // Discarded entirely when IsSplit=false. For a split, partition the FULL tile count
     // computed above into G contiguous chunks and keep only THIS split's chunk:
     //   T (tiles per split) = ceil(num_total_loop_full / num_splits)
     //   this split owns tiles [split_idx*T, min((split_idx+1)*T, full))
@@ -257,8 +253,8 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     // epilog_store_split then just adds the in-plane row/col (abs_m_row*64 + col /
     // abs_m_row). Hq == params.nhead_q. B is not a kernarg field: the split grid's
     // z-axis is batch*num_splits, so B = gridDim.z / num_splits (documented in
-    // FmhaFwdSplitParams). The whole block is if-constexpr-discarded for the four
-    // existing (non-split) entries, so it never touches their codegen.
+    // FmhaFwdSplitParams). The whole block is if-constexpr-discarded when
+    // IsSplit=false.
     float* scratch_o_base   = nullptr;
     float* scratch_lse_base = nullptr;
     if constexpr (IsSplit) {
@@ -482,9 +478,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     // ---- EPILOGUE: normalize O_acc by rsum, store O (+LSE) ----
     // For a split (IsSplit=true) write the NORMALIZED fp32 partial (O_g, LSE_g) to
     // this split's scratch plane via epilog_store_split; the combine pass folds the
-    // G partials later. For the four existing entries (IsSplit=false) the else-
-    // branch is the EXISTING bf16 epilogue, character-for-character, so codegen is
-    // unchanged.
+    // G partials later. For IsSplit=false the else-branch is the bf16 epilogue.
     if constexpr (IsSplit) {
         epilog_store_split(o_acc_d0, o_acc_d1, rsum, rmax, params.scale,
                            seqlen_q, m_tile_idx, scratch_o_base, scratch_lse_base);

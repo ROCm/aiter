@@ -1,8 +1,9 @@
 // Kernel argument block (kernarg) for the fused FMHA forward shader.
 //
-// This is the single struct passed by value to every fused-kernel entry
-// point (fmha_fwd_d64_bf16_msk{0,1}[_varlen] in the entry .cu files).  The
-// device-side reader is fmha_fwd_d64_device() in fused/pipeline.hpp.
+// This is the core forward kernarg: tensors, strides and scale the per-block
+// forward pass reads.  It is embedded as `base` in FmhaFwdSplitParams (the
+// by-value argument of the split entry points) and read on the device by
+// fmha_fwd_d64_device() in fused/pipeline.hpp.
 //
 // Layout note: the field order here IS the kernarg layout the HSACO expects,
 // so do not reorder fields without re-checking the kernel ABI.
@@ -98,7 +99,7 @@ struct FmhaFwdCombineParams {
 // Kernarg block for the split-K *forward* pass (the IsSplit=true variant of the
 // fused forward kernel).
 //
-// Split-K runs the SAME per-block forward pass as the four existing entries, but
+// Split-K runs the SAME per-block forward pass as a full (non-split) forward, but
 // each block walks only a disjoint sub-range of the KV axis (its "split") and,
 // instead of bf16-truncating O straight to the final tensor, writes a NORMALIZED
 // fp32 partial output O_g + a per-row natural-log LSE_g into the split-major
@@ -106,12 +107,10 @@ struct FmhaFwdCombineParams {
 // combine pass (op_combine.hpp) then folds the G partials into the final O.
 //
 // This struct is the by-value argument the split-forward __global__
-// (fmha_fwd_d64_bf16_msk{0,1}_split in the entry .cu files) receives. It simply CARRIES
-// the existing forward kernarg (base) plus the split-only extras; the device
-// function fmha_fwd_d64_device() still takes a `const FmhaFwdParams&` (== base)
-// plus the split inputs as trailing arguments, so the four existing call sites
-// are byte-identical (they pass none of the trailing args and get the defaults).
-// See pipeline.hpp.
+// (fmha_fwd_d64_bf16_msk{0,1}_split in the entry .cu files) receives. It simply
+// CARRIES the core forward kernarg (base) plus the split-only extras; the device
+// function fmha_fwd_d64_device() takes a `const FmhaFwdParams&` (== base) plus
+// the split inputs as trailing arguments. See pipeline.hpp.
 //
 // Scratch layout is the SAME split-major layout FmhaFwdCombineParams documents:
 //   scratch_o  (split_idx,b,h,row,d) =
