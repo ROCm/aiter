@@ -1443,6 +1443,46 @@ def build_gather_reduce_src_rows(
     return (flat_e * max_m + slot).view(token_num, topk).to(torch.int32)
 
 
+@functools.cache
+def _get_compiled_route_maps():
+    """Compile and cache the atomic route -> grouped-row map kernel."""
+    from aiter.ops.flydsl.kernels.moe_route_maps import build_moe_route_maps_module
+
+    return build_moe_route_maps_module()
+
+
+def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int) -> torch.Tensor:
+    """Per-token gather map via a single atomic-scatter kernel (SGLang-style),
+    no host-side argsort / nonzero / one-hot. Returns ``src_rows`` (token_num,
+    topk) int32 = ``topk_ids[t,k]*max_m + slot``.
+
+    The within-expert ``slot`` is claimed by ``atomicAdd`` on a per-expert
+    counter pre-initialized to ``e*max_m``, so the atomic returns the grouped
+    row. Order within an expert is atomic-race order (nondeterministic) but
+    self-consistent -- both scatter-copy (via the inverse) and gather-reduce key
+    off this same map, and the grouped GEMM is order-agnostic within an expert.
+    """
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    topk_ids_i32 = topk_ids.reshape(-1).to(torch.int32).contiguous()
+    atomic_buffer = (
+        torch.arange(E, device=device, dtype=torch.int32) * max_m
+    ).contiguous()
+    c_map = torch.empty(numel, dtype=torch.int32, device=device)
+    grid_blocks = (numel + 255) // 256
+    launch = _get_compiled_route_maps()
+    launch(
+        topk_ids_i32,
+        atomic_buffer,
+        c_map,
+        numel,
+        grid_blocks,
+        stream=torch.cuda.current_stream(),
+    )
+    return c_map.view(token_num, topk)
+
+
 def flydsl_moe_gather_reduce(
     grouped_out: torch.Tensor,  # (E, max_m, model_dim) bf16/f16
     src_rows: torch.Tensor,     # (token_num, topk) int32 grouped flat rows

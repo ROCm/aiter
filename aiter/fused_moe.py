@@ -764,10 +764,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if not _use_naive:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_moe_scatter_copy_token,
-            build_gather_reduce_src_rows,
+            build_route_maps,
         )
 
-        src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E)
+        # Efficient atomic-kernel map build (no host argsort/nonzero/one-hot).
+        src_rows = build_route_maps(topk_ids, E, max_m)
         _grouped_dbg("start route gather (scatter-copy kernel)")
         flydsl_moe_scatter_copy_token(
             a1_payload,
@@ -994,14 +995,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if (not _use_naive) and dtype in (dtypes.bf16, dtypes.fp16):
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_moe_gather_reduce,
-            build_gather_reduce_src_rows,
+            build_route_maps,
         )
 
         _grouped_dbg("start gather-reduce output")
         # Reuse the per-token gather map built for the route-gather step (shared,
         # argsort-free); only rebuild if the scatter-copy path didn't run.
         if src_rows is None:
-            src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E)
+            src_rows = build_route_maps(topk_ids, E, max_m)
         gather_w = (
             torch.ones((token_num, topk), dtype=torch.float32, device=device)
             if doweight_stage1
