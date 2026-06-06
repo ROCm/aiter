@@ -2685,6 +2685,9 @@ def flash_attn_varlen_func(
 
         if get_gfx() == "gfx1250" and q.shape[-1] == 192 and v.shape[-1] == 128 and q.dtype == torch.bfloat16:
             from .flydsl.mha_flydsl import flash_attn_varlen_flydsl
+
+            print(f"[flydsl vs triton] q={list(q.shape)} k={list(k.shape)} v={list(v.shape)} max_sq={max_seqlen_q} max_sk={max_seqlen_k} causal={causal}")
+
             _flydsl_out = torch.empty_like(q[:, :, :v.shape[-1]])
             _flydsl_result = flash_attn_varlen_flydsl(
                 q, k, v, cu_seqlens_q, cu_seqlens_k,
@@ -2714,14 +2717,30 @@ def flash_attn_varlen_func(
             _rtol, _atol = 5e-3, 5e-3
             _close = torch.isclose(_flydsl_out, _o_cmp, rtol=_rtol, atol=_atol)
             if _close.all():
-                print(f"[flydsl vs triton] MATCH  q={list(q.shape)} max_sq={max_seqlen_q} max_sk={max_seqlen_k} causal={causal}")
+                print(f"[flydsl vs triton] MATCH")
             else:
                 _diff = (_flydsl_out.float() - _o_cmp.float()).abs()
                 _num_bad = (~_close).sum().item()
-                print(f"[flydsl vs triton] MISMATCH  q={list(q.shape)} max_sq={max_seqlen_q} max_sk={max_seqlen_k} causal={causal}"
-                      f"  max_err={_diff.max():.6f}  bad={_num_bad}/{_flydsl_out.numel()}")
+                print(f"[flydsl vs triton] MISMATCH  max_err={_diff.max():.6f}  bad={_num_bad}/{_flydsl_out.numel()}")
                 print(f"[flydsl vs triton]   cu_seqlens_q={cu_seqlens_q.tolist()}")
                 print(f"[flydsl vs triton]   cu_seqlens_k={cu_seqlens_k.tolist()}")
+                import os
+                _dump_dir = os.environ.get("FLYDSL_DUMP_DIR", "/tmp/flydsl_dump")
+                os.makedirs(_dump_dir, exist_ok=True)
+                _dump_id = len([f for f in os.listdir(_dump_dir) if f.startswith("mismatch_")])
+                _prefix = f"{_dump_dir}/mismatch_{_dump_id}"
+                torch.save(q, f"{_prefix}_q.pt")
+                torch.save(k, f"{_prefix}_k.pt")
+                torch.save(v, f"{_prefix}_v.pt")
+                torch.save(cu_seqlens_q, f"{_prefix}_cu_seqlens_q.pt")
+                torch.save(cu_seqlens_k, f"{_prefix}_cu_seqlens_k.pt")
+                torch.save(torch.tensor([max_seqlen_q, max_seqlen_k]), f"{_prefix}_seqlens.pt")
+                torch.save(torch.tensor([softmax_scale]), f"{_prefix}_softmax_scale.pt")
+                torch.save(torch.tensor([causal]), f"{_prefix}_causal.pt")
+                torch.save(_flydsl_out, f"{_prefix}_flydsl_out.pt")
+                torch.save(_o_cmp, f"{_prefix}_triton_out.pt")
+                torch.save(_diff, f"{_prefix}_diff.pt")
+                print(f"[flydsl vs triton] dumped to {_prefix}_*.pt")
 
             if return_lse:
                 return (_flydsl_out, _flydsl_lse)
