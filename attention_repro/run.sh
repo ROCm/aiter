@@ -3,18 +3,20 @@ seq_q_l=256
 seq_kv_l=256
 num_heads_q=8
 num_heads_k=1
-head_size=128
+head_size=64
 bs=1
 window_size=0
-block_size=128
+block_size=64
 waves_per_eu=1
 num_warps=4
 block_m=128
 num_buffers=3
 causal=1
-loop_variant=3
-remove_indirect_access=1
-shuffled_kv_cache=0
+loop_variant=-1
+remove_indirect_access=0
+shuffled_kv_cache=1
+q_fp8=0
+kv_fp8=0
 # export LLIR_REMOVE_DS_WAIT_0="loop"
 # export LLIR_REMOVE_BARRIER=1
 rm -rf ~/.triton/cache
@@ -37,4 +39,6 @@ python3 run_kernel.py \
 --bs $bs \
 --seq_q_l $seq_q_l \
 --seq_kv_l $seq_kv_l \
---shuffled_kv_cache $shuffled_kv_cache
+--shuffled_kv_cache $shuffled_kv_cache \
+--q_fp8 $q_fp8 \
+--kv_fp8 $kv_fp8 

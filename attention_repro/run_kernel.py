@@ -9,7 +9,7 @@ import triton.language as tl
 import numpy as np
 import argparse
 from itertools import product
-from unified_attention_2d_merged import (
+from ua_2d_gfx1250_pr import (
     unified_attention as gluon_unified_attention_2d,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
@@ -39,6 +39,8 @@ parser.add_argument('--num_buffers', type=int, default=2, help='')
 parser.add_argument('--loop_variant', type=int, default=1, help='')
 parser.add_argument('--causal', type=int, default=1, help='')
 parser.add_argument('--shuffled_kv_cache', type=int, default=0, help='')
+parser.add_argument('--q_fp8', type=int, default=0, help='')
+parser.add_argument('--kv_fp8', type=int, default=0, help='')
 
 args = parser.parse_args()
 print(args)
@@ -51,11 +53,8 @@ block_size = args.block_size
 soft_cap = None
 seq_lens = [(args.seq_q_l, args.seq_kv_l)] * args.bs
 
-q_dtype = torch.bfloat16
-kv_dtype = torch.bfloat16
-
-# q_dtype = e4m3_dtype
-# kv_dtype = e4m3_dtype
+q_dtype = e4m3_dtype if args.q_fp8 else torch.bfloat16
+kv_dtype = e4m3_dtype if args.kv_fp8 else torch.bfloat16
 
 (query,
 key_cache_orig,
@@ -112,16 +111,8 @@ func = lambda:  gluon_unified_attention_2d(
         v_descale=v_descale,
         sinks=sinks.cuda(),
         output_scale=output_scale,
-        use_tdm=use_tdm,
-        num_kv_blocks=num_kv_blocks,
-        new_kv_layout=new_kv_layout,
-        waves_per_eu=args.waves_per_eu,
         shuffled_kv_cache=args.shuffled_kv_cache,
-        num_warps=args.num_warps,
-        block_m=args.block_m,
-        remove_indirect_access=args.remove_indirect_access,
-        num_buffers=args.num_buffers,
-        loop_variant=args.loop_variant,
+        loop_variant=args.loop_variant if args.loop_variant > -1 else None,
     )
 
 
