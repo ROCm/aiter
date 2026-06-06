@@ -138,16 +138,21 @@ def compile_mxfp4_gemm2_a4w4(
     # context is active).
     lds_stride = BK              # fp4 elems per LDS row (one K-tile, no pad)
     k_blocks16 = (BK * elem_bytes) // 16
-    _a_lds_bytes = BM * lds_stride          # fp4-bytes for one A K-tile
+    # BM=16 uses a 2-slot A LDS double-buffer so both K-tiles can be loaded
+    # up-front (HIP run_one: load all, then 2-stage drain), removing the
+    # mid-loop store/barrier of the serial single-slot path (s_barrier 5 -> 3).
+    _g2_a_slots = 2 if BM == 16 else 1
+    _a_slot_stride = BM * lds_stride        # fp4-bytes for one A K-tile slot
+    _a_lds_bytes = _g2_a_slots * _a_slot_stride
     _acc_lds_elems = BM * BN                # f32 cshuffle buffer
     _lds_a_offset = 0
-    # BM=128 cshuffle acc = 128KB; union it onto the (barrier-dead) A-load LDS to
-    # stay within the 160KB cap (== HIP's LDSPool union).
-    if BM == 128:
-        _lds_acc_offset = 0
-    else:
-        _lds_acc_offset = ((_a_lds_bytes + 15) // 16) * 16
-    allocator.ptr = _lds_acc_offset + _acc_lds_elems * 4
+    # Union the cshuffle accumulator (lds_acc) onto the A-load LDS (lds_a) at
+    # offset 0 (== HIP's LDSLayout union). lds_a is GEMM-loop-only and lds_acc is
+    # epilogue-only, separated by the pre-cshuffle barrier, so they never alias in
+    # time. Without the union FlyDSL stacked them (BM=16 atomic: 20480 vs HIP
+    # 16384), which capped occupancy at 3 blocks/CU instead of 4 (launch_bounds).
+    _lds_acc_offset = 0
+    allocator.ptr = max(_a_lds_bytes, _lds_acc_offset + _acc_lds_elems * 4)
 
     # A-load tiling (a_elem_bytes==1 fp4 convention, 16B dwordx4 loads).
     x_load_bytes = 16
@@ -307,7 +312,8 @@ def compile_mxfp4_gemm2_a4w4(
                 parts.append(vector.bitcast(T.vec(4, i32), v))
             return parts
 
-        def store_a_tile(parts):
+        def store_a_tile(parts, slot=0):
+            _slot_base = arith.constant(slot * _a_slot_stride, index=True)
             for i in range_constexpr(num_x_loads):
                 lds_store_16b_xor16(
                     arith,
@@ -319,14 +325,13 @@ def compile_mxfp4_gemm2_a4w4(
                     col_local_i32=x_col_local[i],
                     tx_c4=arith.index(4),
                     k_blocks16=k_blocks16,
-                    lds_base=arith.index(0),
+                    lds_base=_slot_base,
                     vec_part_i32x4=parts[i],
                     elem_bytes=elem_bytes,
                 )
 
-        _a_parts0 = load_a_tile(arith.index(0))
-        store_a_tile(_a_parts0)
-        gpu.barrier()
+        # (A/B/scale loads + MFMA are issued by the unified K-loop below, after
+        #  all tile helpers are defined.)
 
         # ---- a16w4 B-load (build/test increment 3): exact HIP issue_b_load_j.
         #   base = (e*N_OUT + n_block*256 + wave_n*64 + j*16) * K_HALF   [bytes]
@@ -371,8 +376,6 @@ def compile_mxfp4_gemm2_a4w4(
                     b_j.append((b0, b1))
                 b_tile.append(b_j)
             return b_tile
-
-        _b_tile0 = load_b_tile(arith.index(0))
 
         # ---- scale load (build/test increment 4): make_preshuffle A/B scale.
         #   a_scale dword off = (m_row/_as_chunk_div + sub)*kAS_per_chunk_dw
@@ -427,8 +430,6 @@ def compile_mxfp4_gemm2_a4w4(
                 )
             return a_scs, b_scs
 
-        _a_sc0, _b_scs0 = load_scales(arith.index(0))
-
         # ---- fp4 scaled-MFMA (build/test increment 5) ----
         # MFMA 16x16x128 f8f6f4: a128/b128 = pack_i64x4_to_i32x8(b0,b1,0,0);
         # op_sel selects the e8m0 byte in the make_preshuffle scale dword.
@@ -446,9 +447,11 @@ def compile_mxfp4_gemm2_a4w4(
             v4 = vector.from_elements(vec4_i64, [x0, x1, c0, c0])
             return vector.bitcast(vec8_i32, v4)
 
-        def lds_load_packs_k64(curr_row, col_base):
+        def lds_load_packs_k64(curr_row, col_base, slot=0):
             col_swz = swizzle_xor16(curr_row, col_base, k_blocks16)
             idx_a = crd2idx([curr_row, col_swz], layout_lds)
+            if const_expr(slot != 0):
+                idx_a = idx_a + arith.constant(slot * _a_slot_stride, index=True)
             loaded = vector.load_op(vec16_x, lds_a, [idx_a])
             a_i64x2 = vector.bitcast(vec2_i64, loaded)
             a0 = vector.extract(a_i64x2, static_position=[0], dynamic_position=[])
@@ -458,7 +461,7 @@ def compile_mxfp4_gemm2_a4w4(
         acc_init = arith.constant_vector(0.0, vec4_f32)
         accm = [acc_init] * (m_repeat * num_acc_n)   # mi_idx*num_acc_n + ni_idx
 
-        def mfma_ktile(b_tile, a_scs, b_scs):
+        def mfma_ktile(b_tile, a_scs, b_scs, a_slot=0):
             for k_idx in range_constexpr(2):       # 2 MFMA-K (128) per K-tile
                 ikxdl = k_idx
                 col_base = col_offset_base + arith.constant(
@@ -467,7 +470,7 @@ def compile_mxfp4_gemm2_a4w4(
                 for imxdl in range_constexpr(pack_M):
                     mi_idx = imxdl                  # m_repeat_packed=1
                     curr_row = row_a_lds + arith.constant(mi_idx * 16, index=True)
-                    a0, a1 = lds_load_packs_k64(curr_row, col_base)
+                    a0, a1 = lds_load_packs_k64(curr_row, col_base, slot=a_slot)
                     a128 = _pack_i64x4(a0, a1)
                     # A-scale: one make_preshuffle dword per 32-row sub-chunk
                     # (a_scs[mi//2]); byte = ikxdl*2 + (mi%2). _scale_pack_m=2 is
@@ -492,16 +495,33 @@ def compile_mxfp4_gemm2_a4w4(
                                 ],
                             )
 
-        mfma_ktile(_b_tile0, _a_sc0, _b_scs0)
-
-        # ---- K-tile 1 (build/test increment 5b) ----
-        gpu.barrier()
-        _a_parts1 = load_a_tile(arith.constant(BK, index=True))
-        store_a_tile(_a_parts1)
-        gpu.barrier()
-        _b_tile1 = load_b_tile(arith.index(1))
-        _a_sc1, _b_scs1 = load_scales(arith.index(1))
-        mfma_ktile(_b_tile1, _a_sc1, _b_scs1)
+        # ---- K-loop (K=512 -> 2 K-tiles) ----
+        if const_expr(BM == 16):
+            # HIP run_one structure: stage BOTH K-tiles' A into the 2-slot LDS
+            # double-buffer up-front, one barrier, then prefetch both B/scale and
+            # drain the 2 MFMA stages. Removes the serial mid-loop store/barrier
+            # (s_barrier 5 -> 3) and lets the B VMEM overlap the MFMA.
+            store_a_tile(load_a_tile(arith.index(0)), slot=0)
+            store_a_tile(load_a_tile(arith.constant(BK, index=True)), slot=1)
+            gpu.barrier()
+            _b0 = load_b_tile(arith.index(0))
+            _asc0, _bsc0 = load_scales(arith.index(0))
+            _b1 = load_b_tile(arith.index(1))
+            _asc1, _bsc1 = load_scales(arith.index(1))
+            mfma_ktile(_b0, _asc0, _bsc0, a_slot=0)
+            mfma_ktile(_b1, _asc1, _bsc1, a_slot=1)
+        else:
+            store_a_tile(load_a_tile(arith.index(0)))
+            gpu.barrier()
+            _b_tile0 = load_b_tile(arith.index(0))
+            _a_sc0, _b_scs0 = load_scales(arith.index(0))
+            mfma_ktile(_b_tile0, _a_sc0, _b_scs0)
+            gpu.barrier()
+            store_a_tile(load_a_tile(arith.constant(BK, index=True)))
+            gpu.barrier()
+            _b_tile1 = load_b_tile(arith.index(1))
+            _a_sc1, _b_scs1 = load_scales(arith.index(1))
+            mfma_ktile(_b_tile1, _a_sc1, _b_scs1)
 
         # ---- BM=128 nonatomic bf16 flat epilogue (== apply_bf16_flat_epilog_bm128)
         # write accm straight to bf16 flat_out[max_sorted, N_OUT] per sorted row
@@ -686,22 +706,18 @@ def compile_mxfp4_gemm2_a4w4(
                     + n_block * _c256
                     + col_start
                 )
+                _wv2 = vector.from_elements(T.vec(2, f32), [weight, weight])
                 for s in range_constexpr(4):
                     lds_row_off = row_in_block * c_BN + col_start + arith.constant(
                         s * 64, index=True
                     )
-                    e0 = vector.load_op(
-                        T.vec(1, f32), lds_acc, [lds_row_off]
-                    )
-                    e1 = vector.load_op(
-                        T.vec(1, f32),
-                        lds_acc,
-                        [lds_row_off + arith.constant(1, index=True)],
-                    )
-                    f0 = vector.extract(e0, static_position=[0], dynamic_position=[])
-                    f1 = vector.extract(e1, static_position=[0], dynamic_position=[])
-                    f0w = arith.mulf(f0, weight)
-                    f1w = arith.mulf(f1, weight)
+                    # load the lane's 2 consecutive acc cols as a vec2 and scale by
+                    # weight with a single packed v_pk_mul_f32 (== HIP), instead of
+                    # 2 scalar v_mul_f32. Keeps the f32 pair packed end-to-end.
+                    e = vector.load_op(T.vec(2, f32), lds_acc, [lds_row_off])
+                    fw = arith.mulf(e, _wv2)
+                    f0w = vector.extract(fw, static_position=[0], dynamic_position=[])
+                    f1w = vector.extract(fw, static_position=[1], dynamic_position=[])
                     b0 = arith.trunc_f(T.bf16, f0w)
                     b1 = arith.trunc_f(T.bf16, f1w)
                     pk = vector.from_elements(bf16x2, [b0, b1])
