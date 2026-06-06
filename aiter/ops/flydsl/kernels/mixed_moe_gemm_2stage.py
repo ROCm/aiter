@@ -9,50 +9,51 @@ It is extracted from `tests/kernels/test_moe_gemm.py` so that:
 - `tests/` holds correctness/perf harnesses
 """
 
-import functools
 import os
 from contextlib import contextmanager
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
-from aiter.ops.flydsl.moe_common import (
-    GateMode,
-)  # noqa: F401  re-exported for back-compat
-from aiter.utility.mx_types import (
-    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
-    MxDtypeInt as _D,
-)
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, memref, scf
-from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import (
-    arith,
-    buffer_ops,
-    const_expr,
-    gpu,
-    range_constexpr,
-    rocdl,
-    vector,
-)
-from flydsl.expr.typing import T
+
+from flydsl.expr import range_constexpr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+
+
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from .layout_utils import crd2idx, get as layout_get, idx2crd
-from .mfma_epilogues import c_shuffle_epilog
+from flydsl._mlir import ir
+from flydsl.expr.typing import T
+
+from flydsl.expr import arith, gpu, buffer_ops, vector, rocdl, const_expr
+from flydsl._mlir.dialects import llvm, scf, memref
+from flydsl._mlir.dialects.arith import CmpIPredicate
+
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
+from aiter.utility.mx_types import (
+    MxDtypeInt as _D,
+    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
+)
+
 from .mfma_preshuffle_pipeline import (
     _buffer_load_vec,
     buffer_copy_gmem16_dwordx4,
     lds_store_16b_xor16,
-    lds_store_4b_xor16,
     lds_store_8b_xor16,
+    lds_store_4b_xor16,
     make_preshuffle_b_layout,
     make_preshuffle_scale_layout,
-    swizzle_xor16,
     tile_chunk_coord_i32,
+    swizzle_xor16,
 )
+from .mfma_epilogues import c_shuffle_epilog
+from .layout_utils import crd2idx, idx2crd, get as layout_get
+
+import functools
+
+from aiter.ops.flydsl.moe_common import (
+    GateMode,
+)  # noqa: F401  re-exported for back-compat
 
 
 @contextmanager
