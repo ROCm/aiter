@@ -1420,12 +1420,12 @@ def _get_compiled_gather_reduce(model_dim: int, topk: int, out_dtype: str):
     return build_moe_gather_reduce_module(model_dim, topk, out_dtype)
 
 
-def build_gather_reduce_src_rows(
+def build_topids_to_rows(
     topk_ids: torch.Tensor,  # (token_num, topk) local expert ids in [0, E)
     max_m: int,
     E: int,
 ) -> torch.Tensor:
-    """Per-token gather map: ``src_rows[t,k] = topk_ids[t,k]*max_m + slot``, where
+    """Per-token gather map: ``topids_to_rows[t,k] = topk_ids[t,k]*max_m + slot``, where
     ``slot`` is token ``t``'s within-expert position in token-major route order
     (matching how the route-gather fills each expert). Returns (token_num, topk)
     int32.
@@ -1451,16 +1451,21 @@ def _get_compiled_route_maps():
     return build_moe_route_maps_module()
 
 
-def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int) -> torch.Tensor:
-    """Per-token gather map via a single atomic-scatter kernel (SGLang-style),
-    no host-side argsort / nonzero / one-hot. Returns ``src_rows`` (token_num,
-    topk) int32 = ``topk_ids[t,k]*max_m + slot``.
+def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
+    """Per-token route maps via a single atomic-scatter kernel (SGLang-style),
+    no host-side argsort / nonzero / one-hot. Returns ``(topids_to_rows, rows_to_tokens)``:
+
+      topids_to_rows : (token_num, topk) int32  -- route -> grouped row
+                 = ``topk_ids[t,k]*max_m + slot`` (gather-reduce input)
+      rows_to_tokens  : (E*max_m,)        int32  -- grouped row -> source token
+                 (-1 for unused padding rows; scatter-copy input)
 
     The within-expert ``slot`` is claimed by ``atomicAdd`` on a per-expert
     counter pre-initialized to ``e*max_m``, so the atomic returns the grouped
-    row. Order within an expert is atomic-race order (nondeterministic) but
-    self-consistent -- both scatter-copy (via the inverse) and gather-reduce key
-    off this same map, and the grouped GEMM is order-agnostic within an expert.
+    row. The kernel writes both maps in one pass (topids_to_rows + its inverse rows_to_tokens).
+    Order within an expert is atomic-race order (nondeterministic) but
+    self-consistent -- both maps come from the same run, and the grouped GEMM is
+    order-agnostic within an expert.
     """
     device = topk_ids.device
     token_num, topk = topk_ids.shape
@@ -1469,34 +1474,38 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int) -> torch.Tensor
     atomic_buffer = (
         torch.arange(E, device=device, dtype=torch.int32) * max_m
     ).contiguous()
-    c_map = torch.empty(numel, dtype=torch.int32, device=device)
+    topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
+    rows_to_tokens = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
     grid_blocks = (numel + 255) // 256
     launch = _get_compiled_route_maps()
     launch(
         topk_ids_i32,
         atomic_buffer,
-        c_map,
+        topids_to_rows,
+        rows_to_tokens,
         numel,
+        topk,
         grid_blocks,
         stream=torch.cuda.current_stream(),
     )
-    return c_map.view(token_num, topk)
+    return topids_to_rows.view(token_num, topk), rows_to_tokens
 
 
 def flydsl_moe_gather_reduce(
     grouped_out: torch.Tensor,  # (E, max_m, model_dim) bf16/f16
-    src_rows: torch.Tensor,     # (token_num, topk) int32 grouped flat rows
-    gather_w: torch.Tensor,     # (token_num, topk) per-(token,k) weight
+    topids_to_rows: torch.Tensor,     # (token_num, topk) int32 grouped flat rows
+    gather_w: torch.Tensor,     # (token_num, topk) weight, bf16/f16 (== grouped_out dtype)
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """One-pass gather-reduce epilogue. Thin launcher over a *precomputed* gather
-    map: ``out[t] = sum_k gather_w[t,k] * grouped_out_flat[src_rows[t,k]]``.
+    map: ``out[t] = sum_k gather_w[t,k] * grouped_out_flat[topids_to_rows[t,k]]``.
 
-    The caller builds ``src_rows`` once (see ``build_gather_reduce_src_rows``,
+    The caller builds ``topids_to_rows`` once (see ``build_topids_to_rows``,
     argsort-free) and may share it with the route-gather step; this wrapper does
-    no host-side map building. ``grouped_out`` must be bf16 or f16."""
+    no host-side map building. ``grouped_out`` and ``gather_w`` must be bf16 or
+    f16 (the kernel extends the weight to f32 internally for accumulation)."""
     E, max_m, model_dim = grouped_out.shape
-    token_num, topk = src_rows.shape
+    token_num, topk = topids_to_rows.shape
     device = grouped_out.device
     if grouped_out.dtype == torch.bfloat16:
         out_dtype = "bf16"
@@ -1505,7 +1514,7 @@ def flydsl_moe_gather_reduce(
     else:
         raise ValueError(f"unsupported dtype {grouped_out.dtype}; need bf16/f16")
 
-    # Caller passes src_rows int32 and gather_w f32 (both contiguous); no cast.
+    # Caller passes topids_to_rows int32 and gather_w bf16/f16 (both contiguous).
     grouped_out_flat = grouped_out.contiguous().view(E * max_m, model_dim)
     if out is None:
         out = torch.empty(
@@ -1515,7 +1524,7 @@ def flydsl_moe_gather_reduce(
     launch = _get_compiled_gather_reduce(model_dim, topk, out_dtype)
     launch(
         grouped_out_flat,
-        src_rows,
+        topids_to_rows,
         gather_w,
         out,
         token_num,
@@ -1555,46 +1564,28 @@ def _get_compiled_scatter_copy(row_bytes: int):
 def flydsl_moe_scatter_copy_token(
     a1_payload: torch.Tensor,                  # (token_num, Wp) uint8
     a1_scale_token_u8: Optional[torch.Tensor], # (token_num, Ws) uint8 or None
-    src_rows: torch.Tensor,                    # (token_num, topk) topk_ids->grouped rows
-    topk_weight: torch.Tensor,                 # (token_num, topk) route weights
+    rows_to_tokens: torch.Tensor,              # (E*max_m,) int32 grouped row -> token (-1 pad)
     E: int,
     max_m: int,
     grouped_a1: Optional[torch.Tensor] = None,    # (E, max_m, Wp) uint8 out
     a1_scale_raw: Optional[torch.Tensor] = None,  # (E, max_m, Ws) uint8 out
-    route_tokens: Optional[torch.Tensor] = None,  # (E, max_m) long out
-    route_weights: Optional[torch.Tensor] = None, # (E, max_m) dtype out
 ):
-    """One-pass route-gather into the grouped layout. Equivalent to the
-    per-expert copy loop in fused_moe.
+    """Copy each token's payload (and per-token scale) into the grouped layout,
+    driven by ``rows_to_tokens`` (grouped row -> source token, -1 for padding)
+    from ``build_route_maps``. Pure copy -- one kernel per tensor.
 
-    Driven by the shared ``src_rows`` map (topk_ids -> grouped rows, the same one
-    gather-reduce uses). ``dst_src`` (grouped row -> source token) is its inverse,
-    built with a single scatter -- no argsort, no boolean-mask indexing.
+    route_tokens/route_weights are NOT produced here: they are needed only by the
+    naive epilogue (built in that loop) and, for doweight_stage1, derived on
+    demand by the caller from topk_weight + topids_to_rows.
 
     Output tensors may be passed in (the kernel writes only the mapped/valid
     rows, leaving any pre-existing padding untouched -- e.g. an a1_scale_raw
     pre-filled with 127). When omitted they are allocated zero-filled.
 
-    Returns (grouped_a1, a1_scale_raw, route_tokens, route_weights)."""
+    Returns (grouped_a1, a1_scale_raw)."""
     device = a1_payload.device
     Wp = a1_payload.shape[1]
-    token_num, topk = src_rows.shape
     num_dst = E * max_m
-
-    src_flat = src_rows.reshape(-1).to(torch.long)          # grouped row per route
-    flat_tokens = torch.arange(token_num * topk, device=device) // topk  # token per route
-
-    # dst row -> src token (-1 = unused padding slot, kernel skips it). This is
-    # the inverse of src_rows: scatter each route's token into its grouped row.
-    dst_src = torch.full((num_dst,), -1, dtype=torch.int32, device=device)
-    dst_src[src_flat] = flat_tokens.to(torch.int32)
-
-    if route_tokens is None:
-        route_tokens = torch.zeros((E, max_m), dtype=torch.long, device=device)
-    if route_weights is None:
-        route_weights = torch.zeros((E, max_m), dtype=topk_weight.dtype, device=device)
-    route_tokens.view(-1)[src_flat] = flat_tokens.to(route_tokens.dtype)
-    route_weights.view(-1)[src_flat] = topk_weight.reshape(-1).to(route_weights.dtype)
 
     if grouped_a1 is None:
         grouped_a1 = torch.zeros((E, max_m, Wp), dtype=torch.uint8, device=device)
@@ -1602,7 +1593,7 @@ def flydsl_moe_scatter_copy_token(
     launch_p(
         a1_payload.contiguous().view(-1, Wp),
         grouped_a1.view(num_dst, Wp),
-        dst_src,
+        rows_to_tokens,
         num_dst,
         stream=torch.cuda.current_stream(),
     )
@@ -1615,9 +1606,9 @@ def flydsl_moe_scatter_copy_token(
         launch_s(
             a1_scale_token_u8.contiguous().view(-1, Ws),
             a1_scale_raw.view(num_dst, Ws),
-            dst_src,
+            rows_to_tokens,
             num_dst,
             stream=torch.cuda.current_stream(),
         )
 
-    return grouped_a1, a1_scale_raw, route_tokens, route_weights
+    return grouped_a1, a1_scale_raw

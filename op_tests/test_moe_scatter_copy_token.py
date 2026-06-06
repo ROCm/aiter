@@ -72,7 +72,7 @@ def ref_moe_scatter_copy_token(
 
 
 def _import_flydsl():
-    """Return (flydsl_moe_scatter_copy_token, build_gather_reduce_src_rows).
+    """Return (flydsl_moe_scatter_copy_token, build_topids_to_rows).
 
     Prefer the normal package import. If the full ``aiter`` package can't be
     imported in this environment (e.g. a FLIR build mismatch in unrelated
@@ -82,10 +82,10 @@ def _import_flydsl():
     try:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_moe_scatter_copy_token,
-            build_gather_reduce_src_rows,
+            build_topids_to_rows,
         )
 
-        return flydsl_moe_scatter_copy_token, build_gather_reduce_src_rows
+        return flydsl_moe_scatter_copy_token, build_topids_to_rows
     except Exception:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         base = os.path.join(root, "aiter", "ops", "flydsl")
@@ -104,10 +104,20 @@ def _import_flydsl():
         )
         sys.modules["aiter.ops.flydsl.kernels.moe_scatter_copy_token"] = kern
         mk = _load(os.path.join(base, "moe_kernels.py"), "aiter.ops.flydsl.moe_kernels")
-        return mk.flydsl_moe_scatter_copy_token, mk.build_gather_reduce_src_rows
+        return mk.flydsl_moe_scatter_copy_token, mk.build_topids_to_rows
 
 
-flydsl_moe_scatter_copy_token, build_gather_reduce_src_rows = _import_flydsl()
+flydsl_moe_scatter_copy_token, build_topids_to_rows = _import_flydsl()
+
+
+def _rows_to_tokens_from(topids_to_rows, token_num, topk, E, max_m):
+    """Inverse of topids_to_rows: grouped row -> source token (-1 for padding rows).
+    (In fused_moe this is produced by build_route_maps; here we derive it from the
+    deterministic topids_to_rows for byte-exact testing.)"""
+    flat_tokens = torch.arange(token_num * topk, device="cuda") // topk
+    rows_to_tokens = torch.full((E * max_m,), -1, dtype=torch.int32, device="cuda")
+    rows_to_tokens[topids_to_rows.reshape(-1).long()] = flat_tokens.to(torch.int32)
+    return rows_to_tokens
 
 
 def _build_routing(token_num, topk, E_total, ep, model_dim, fp4, dtype, seed):
@@ -157,17 +167,20 @@ def _run_one(token_num, topk, E_total, ep, model_dim, fp4, dtype, seed=0, name="
         a1_payload, a1_scale, flat_experts, flat_tokens, flat_weights,
         counts, E_local, max_m,
     )
-    # optimized: shared src_rows map (argsort-free) -> scatter-copy kernel
-    src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E_local)
+    # optimized: scatter-copy is a pure copy driven by rows_to_tokens (the inverse
+    # of the deterministic topids_to_rows). It produces only grouped_a1 +
+    # a1_scale_raw (route_tokens/route_weights are not its job anymore).
+    topids_to_rows = build_topids_to_rows(topk_ids, max_m, E_local)
+    rows_to_tokens = _rows_to_tokens_from(topids_to_rows, token_num, topk, E_local, max_m)
     opt = flydsl_moe_scatter_copy_token(
-        a1_payload, a1_scale, src_rows, topk_weight, E_local, max_m,
+        a1_payload, a1_scale, rows_to_tokens, E_local, max_m,
     )
     torch.cuda.synchronize()
 
-    names = ("grouped_a1", "a1_scale_raw", "route_tokens", "route_weights")
+    names = ("grouped_a1", "a1_scale_raw")
     ok = True
     bad = ""
-    for nm, r, o in zip(names, ref, opt):
+    for nm, r, o in zip(names, ref[:2], opt):
         if r is None and o is None:
             continue
         if not torch.equal(r, o):
@@ -210,25 +223,23 @@ def _run_perf(args):
     # valid rows, so a1_scale_raw padding stays 127.
     grouped_a1 = torch.zeros((E_local, max_m, Wp), dtype=torch.uint8, device="cuda")
     a1_scale_raw = torch.full((E_local, max_m, Ws), 127, dtype=torch.uint8, device="cuda")
-    route_tokens = torch.empty((E_local, max_m), dtype=torch.long, device="cuda")
-    route_weights = torch.zeros((E_local, max_m), dtype=dtype, device="cuda")
 
-    # Profile build (argsort-free src_rows) + scatter-copy launch.
-    def _epilogue():
-        src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E_local)
+    topids_to_rows = build_topids_to_rows(topk_ids, max_m, E_local)
+    rows_to_tokens = _rows_to_tokens_from(topids_to_rows, token_num, args.topk, E_local, max_m)
+    # Profile the scatter-copy launch (maps precomputed, as in fused_moe).
+    def bench():
         return flydsl_moe_scatter_copy_token(
-            a1_payload, a1_scale, src_rows, topk_weight, E_local, max_m,
+            a1_payload, a1_scale, rows_to_tokens, E_local, max_m,
             grouped_a1=grouped_a1, a1_scale_raw=a1_scale_raw,
-            route_tokens=route_tokens, route_weights=route_weights,
         )
 
     print(
         f"perf: tok={token_num} E={args.E} topk={args.topk} dim={args.model_dim} "
         f"fp4={int(args.fp4)} Wp={Wp} Ws={Ws} max_m={max_m} "
-        f"-> profiling build_src_rows + scatter_copy"
+        f"-> profiling build_topids_to_rows + scatter_copy"
     )
     _, avg_us = run_perftest(
-        _epilogue, num_iters=args.iters, num_warmup=10, num_rotate_args=1,
+        bench, num_iters=args.iters, num_warmup=10, num_rotate_args=1,
     )
     print(
         f"\n[run_perftest] avg device time: {avg_us:.1f} us/iter "

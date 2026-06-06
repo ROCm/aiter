@@ -23,7 +23,7 @@ Layout / grid
 -------------
 Inputs (all on device):
   grouped_out_flat : (E*max_m, model_dim)  bf16/f16   -- grouped_out viewed flat
-  src_rows         : (token_num, topk)     i32        -- flat source row per (t,k)
+  topids_to_rows         : (token_num, topk)     i32        -- flat source row per (t,k)
   gather_w         : (token_num, topk)     f32        -- weight per (t,k)
   out              : (token_num, model_dim) bf16/f16
 
@@ -95,8 +95,8 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
     @flyc.kernel(name=module_name)
     def moe_gather_reduce_kernel(
         grouped_out_flat: fx.Tensor,  # (E*max_m, model_dim) bf16/f16
-        src_rows: fx.Tensor,          # (token_num, topk)    i32
-        gather_w: fx.Tensor,          # (token_num, topk)    f32
+        topids_to_rows: fx.Tensor,          # (token_num, topk)    i32
+        gather_w: fx.Tensor,          # (token_num, topk)    bf16/f16 (== out_dtype)
         out: fx.Tensor,               # (token_num, model_dim) bf16/f16
         num_tokens: Int32,
     ):
@@ -105,6 +105,7 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
 
         f32 = T.f32
         i32 = T.i32
+        w_dt = T.bf16 if out_dtype == "bf16" else T.f16  # weight native dtype
 
         out_dwords_i32 = arith.constant(out_dwords, type=i32)
         topk_i32 = arith.constant(topk, type=i32)
@@ -116,12 +117,12 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
         _if_tok = scf.IfOp(tok_valid)
         with ir.InsertionPoint(_if_tok.then_block):
             in_rsrc = buffer_ops.create_buffer_resource(grouped_out_flat, max_size=True)
-            rows_rsrc = buffer_ops.create_buffer_resource(src_rows, max_size=True)
+            rows_rsrc = buffer_ops.create_buffer_resource(topids_to_rows, max_size=True)
             w_rsrc = buffer_ops.create_buffer_resource(gather_w, max_size=True)
             out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
             thread_id = ArithValue(tid)
 
-            # Base dword offset of this token's row in src_rows / gather_w
+            # Base dword offset of this token's row in topids_to_rows / gather_w
             # (both are (token_num, topk), 1 dword per element).
             map_base = bid_i32 * topk_i32
             out_row_dw_base = bid_i32 * arith.constant(out_dwords, type=i32)
@@ -145,9 +146,13 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
                                 rows_rsrc, map_off, vec_width=1, dtype=i32
                             )
                         )
+                        # weight is bf16/f16 (its native dtype); extend to f32
                         w_f32 = ArithValue(
-                            buffer_ops.buffer_load(
-                                w_rsrc, map_off, vec_width=1, dtype=f32
+                            arith.extf(
+                                f32,
+                                buffer_ops.buffer_load(
+                                    w_rsrc, map_off, vec_width=1, dtype=w_dt
+                                ),
                             )
                         )
                         src_dw = row_i32 * row_dwords_i32 + dw_idx
@@ -171,7 +176,7 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
     @flyc.jit
     def launch_moe_gather_reduce(
         grouped_out_flat: fx.Tensor,
-        src_rows: fx.Tensor,
+        topids_to_rows: fx.Tensor,
         gather_w: fx.Tensor,
         out: fx.Tensor,
         num_tokens: fx.Int32,
@@ -183,7 +188,7 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
 
         idx_tokens = arith.index_cast(T.index, num_tokens)
         launcher = moe_gather_reduce_kernel(
-            grouped_out_flat, src_rows, gather_w, out, num_tokens
+            grouped_out_flat, topids_to_rows, gather_w, out, num_tokens
         )
         launcher.launch(
             grid=(idx_tokens, 1, 1),

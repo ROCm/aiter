@@ -3,11 +3,11 @@
 
 """Validate the atomic-kernel route map (build_route_maps) used by fused_moe.
 
-build_route_maps (SGLang-style atomic-scatter argsort) produces src_rows
+build_route_maps (SGLang-style atomic-scatter argsort) produces topids_to_rows
 [t,k] = topk_ids[t,k]*max_m + slot with the within-expert slot in atomic-race
 order. We check it is a *valid* mapping (each expert's assigned rows are exactly
 its block [e*max_m, e*max_m+counts[e]), no collisions), and that it is
-set-equivalent to the deterministic build_gather_reduce_src_rows (same rows per
+set-equivalent to the deterministic build_topids_to_rows (same rows per
 expert, possibly different within-expert order).
 
 Usage: python op_tests/test_moe_route_maps.py
@@ -32,10 +32,10 @@ def _import():
     try:
         from aiter.ops.flydsl.moe_kernels import (
             build_route_maps,
-            build_gather_reduce_src_rows,
+            build_topids_to_rows,
         )
 
-        return build_route_maps, build_gather_reduce_src_rows
+        return build_route_maps, build_topids_to_rows
     except Exception:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         base = os.path.join(root, "aiter", "ops", "flydsl")
@@ -54,10 +54,10 @@ def _import():
         )
         sys.modules["aiter.ops.flydsl.kernels.moe_route_maps"] = kern
         mk = _load(os.path.join(base, "moe_kernels.py"), "aiter.ops.flydsl.moe_kernels")
-        return mk.build_route_maps, mk.build_gather_reduce_src_rows
+        return mk.build_route_maps, mk.build_topids_to_rows
 
 
-build_route_maps, build_gather_reduce_src_rows = _import()
+build_route_maps, build_topids_to_rows = _import()
 
 
 def _run_one(token_num, topk, E, seed=0):
@@ -69,16 +69,17 @@ def _run_one(token_num, topk, E, seed=0):
     max_m = int(counts.max().item()) if counts.numel() else 0
     max_m = max(WARP_TILE_M, ((max_m + WARP_TILE_M - 1) // WARP_TILE_M) * WARP_TILE_M)
 
-    src = build_route_maps(topk_ids, E, max_m)
+    src, dst = build_route_maps(topk_ids, E, max_m)
     torch.cuda.synchronize()
     srf = src.reshape(-1).to(torch.long)
     fe = topk_ids.reshape(-1)
+    flat_tokens = (torch.arange(token_num * topk, device="cuda") // topk)
 
     # 1) every route's row is in its expert's block
     in_block = bool(((srf >= fe * max_m) & (srf < fe * max_m + counts[fe])).all().item())
 
     # 2) each expert's rows are exactly {e*max_m .. e*max_m+counts[e]-1} (valid perm)
-    ref = build_gather_reduce_src_rows(topk_ids, max_m, E).reshape(-1).to(torch.long)
+    ref = build_topids_to_rows(topk_ids, max_m, E).reshape(-1).to(torch.long)
     perm_ok = True
     for e in range(E):
         got = torch.sort(srf[fe == e]).values
@@ -87,10 +88,18 @@ def _run_one(token_num, topk, E, seed=0):
             perm_ok = False
             break
 
-    ok = in_block and perm_ok
+    # 3) rows_to_tokens is the exact inverse of topids_to_rows: dst[src[route]] == token(route),
+    #    and padding rows (not targeted by any route) stay -1.
+    inv_ok = bool((dst.long()[srf] == flat_tokens).all().item())
+    valid_mask = torch.zeros(E * max_m, dtype=torch.bool, device="cuda")
+    valid_mask[srf] = True
+    pad_ok = bool((dst[~valid_mask] == -1).all().item())
+
+    ok = in_block and perm_ok and inv_ok and pad_ok
     print(
         f"[{'PASS' if ok else 'FAIL'}] tok={token_num:<5} topk={topk} E={E:<3} "
-        f"max_m={max_m} in_block={in_block} set_eq_deterministic={perm_ok}"
+        f"max_m={max_m} in_block={in_block} set_eq={perm_ok} "
+        f"dst_inverse={inv_ok} pad-1={pad_ok}"
     )
     return ok
 

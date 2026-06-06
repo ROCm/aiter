@@ -58,7 +58,7 @@ def ref_moe_gather_reduce(
 
 
 def _import_flydsl_gather_reduce():
-    """Return (flydsl_moe_gather_reduce, build_gather_reduce_src_rows).
+    """Return (flydsl_moe_gather_reduce, build_topids_to_rows).
 
     Prefer the normal package import. If the full ``aiter`` package can't be
     imported in this environment (e.g. a FLIR build mismatch in unrelated
@@ -68,10 +68,10 @@ def _import_flydsl_gather_reduce():
     try:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_moe_gather_reduce,
-            build_gather_reduce_src_rows,
+            build_topids_to_rows,
         )
 
-        return flydsl_moe_gather_reduce, build_gather_reduce_src_rows
+        return flydsl_moe_gather_reduce, build_topids_to_rows
     except Exception:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         base = os.path.join(root, "aiter", "ops", "flydsl")
@@ -90,10 +90,10 @@ def _import_flydsl_gather_reduce():
         )
         sys.modules["aiter.ops.flydsl.kernels.moe_gather_reduce"] = kern
         mk = _load(os.path.join(base, "moe_kernels.py"), "aiter.ops.flydsl.moe_kernels")
-        return mk.flydsl_moe_gather_reduce, mk.build_gather_reduce_src_rows
+        return mk.flydsl_moe_gather_reduce, mk.build_topids_to_rows
 
 
-flydsl_moe_gather_reduce, build_gather_reduce_src_rows = _import_flydsl_gather_reduce()
+flydsl_moe_gather_reduce, build_topids_to_rows = _import_flydsl_gather_reduce()
 
 
 def _build_grouped_layout(token_num, topk, E_total, ep, model_dim, dtype, seed):
@@ -161,13 +161,13 @@ def _run_one(token_num, topk, E_total, ep, model_dim, dtype, doweight_stage1,
         grouped_out, route_tokens, route_weights, counts, token_num, doweight_stage1
     )
     # optimized: precompute the gather map (argsort-free), then thin launch
-    src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E_local)
+    topids_to_rows = build_topids_to_rows(topk_ids, max_m, E_local)
     gather_w = (
-        torch.ones((token_num, topk), dtype=torch.float32, device="cuda")
+        torch.ones((token_num, topk), dtype=dtype, device="cuda")
         if doweight_stage1
-        else topk_weight.to(torch.float32)
+        else topk_weight.to(dtype)
     )
-    opt = flydsl_moe_gather_reduce(grouped_out, src_rows, gather_w)
+    opt = flydsl_moe_gather_reduce(grouped_out, topids_to_rows, gather_w)
     torch.cuda.synchronize()
 
     ref_f = ref.float()
@@ -216,19 +216,20 @@ def _run_perf(args):
         _build_grouped_layout(token_num, args.topk, args.E, 1, args.model_dim, dtype, 0)
     )
     out = torch.empty((token_num, args.model_dim), dtype=dtype, device="cuda")
-    gather_w = topk_weight.to(torch.float32)
+    gather_w = topk_weight.to(dtype)
 
-    # Profile build (argsort-free src_rows) + thin launch -- the full epilogue.
-    def _epilogue():
-        src_rows = build_gather_reduce_src_rows(topk_ids, max_m, E_local)
-        return flydsl_moe_gather_reduce(grouped_out, src_rows, gather_w, out=out)
+    topids_to_rows = build_topids_to_rows(topk_ids, max_m, E_local)
+
+    # Profile build (argsort-free topids_to_rows) + thin launch -- the full epilogue.
+    def bench():
+        return flydsl_moe_gather_reduce(grouped_out, topids_to_rows, gather_w, out=out)
 
     print(
         f"perf: tok={token_num} E={args.E} topk={args.topk} dim={args.model_dim} "
-        f"max_m={max_m} dtype=bf16 -> profiling build_src_rows + gather_reduce"
+        f"max_m={max_m} dtype=bf16 -> profiling build_topids_to_rows + gather_reduce"
     )
     _, avg_us = run_perftest(
-        _epilogue,
+        bench,
         num_iters=args.iters,
         num_warmup=10,
         num_rotate_args=1,

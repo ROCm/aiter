@@ -760,28 +760,33 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
     # Per-token gather map (topk_ids -> grouped rows), built once (argsort-free)
     # and shared by the scatter-copy and gather-reduce kernels below.
-    src_rows = None
+    topids_to_rows = None
     if not _use_naive:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_moe_scatter_copy_token,
             build_route_maps,
         )
 
-        # Efficient atomic-kernel map build (no host argsort/nonzero/one-hot).
-        src_rows = build_route_maps(topk_ids, E, max_m)
+        # Efficient atomic-kernel map build: both topids_to_rows (route -> grouped row)
+        # and its inverse rows_to_tokens (grouped row -> token) in one pass.
+        topids_to_rows, rows_to_tokens = build_route_maps(topk_ids, E, max_m)
         _grouped_dbg("start route gather (scatter-copy kernel)")
         flydsl_moe_scatter_copy_token(
             a1_payload,
             a1_scale_token_u8,
-            src_rows,
-            topk_weight,
+            rows_to_tokens,
             E,
             max_m,
             grouped_a1=grouped_a1,
             a1_scale_raw=a1_scale_raw,
-            route_tokens=route_tokens,
-            route_weights=route_weights,
         )
+        # route_weights is only consumed by the doweight_stage1 multiply below
+        # (and the naive epilogue); build it from topk_weight only when needed.
+        # route_tokens is naive-only -> not built on the kernel path.
+        if doweight_stage1:
+            route_weights.view(-1)[topids_to_rows.reshape(-1)] = (
+                topk_weight.reshape(-1).to(route_weights.dtype)
+            )
         _grouped_dbg("route gather done")
     else:
         _grouped_dbg("start route gather (naive)")
@@ -1001,14 +1006,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("start gather-reduce output")
         # Reuse the per-token gather map built for the route-gather step (shared,
         # argsort-free); only rebuild if the scatter-copy path didn't run.
-        if src_rows is None:
-            src_rows = build_route_maps(topk_ids, E, max_m)
+        if topids_to_rows is None:
+            topids_to_rows, _ = build_route_maps(topk_ids, E, max_m)
+        # gather_w in the model dtype (bf16/f16); the kernel extends to f32. No
+        # f32 cast -- the weight is already bf16/f16, that precision is enough.
         gather_w = (
-            torch.ones((token_num, topk), dtype=torch.float32, device=device)
+            torch.ones((token_num, topk), dtype=dtype, device=device)
             if doweight_stage1
-            else topk_weight.to(torch.float32)
+            else topk_weight.to(dtype)
         )
-        flydsl_moe_gather_reduce(grouped_out, src_rows, gather_w, out=moe_out)
+        flydsl_moe_gather_reduce(grouped_out, topids_to_rows, gather_w, out=moe_out)
         _grouped_dbg("gather-reduce output done")
     else:
         _grouped_dbg("start scatter output")
