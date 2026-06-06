@@ -22,9 +22,15 @@ Run on the MI308 (gfx942) box:
         --model-dim 2880 --inter-dim 2880 --topk 4 --iters 50
     python op_tests/test_grouped_moe_tinyops_profile.py --naive   # naive route/epilogue
     python op_tests/test_grouped_moe_tinyops_profile.py --doweight
+    python op_tests/test_grouped_moe_tinyops_profile.py --mode a4w4  # fp4 act + fp4 weight
 
 Note: this exercises AITER_GROUPED_GEMM_NAIVE=0 (the optimized kernels) by
 default; pass --naive to compare the per-expert Python loops.
+
+--mode selects the quant recipe (both share the same packed-fp4 weight layout,
+so only ``q_dtype_a`` differs and it flips fused_moe's data_format):
+    a8w4 (default): fp8 activation + fp4 weight  (data_format="a8w4")
+    a4w4          : fp4 activation + fp4 weight  (data_format="fp4")
 """
 
 import argparse
@@ -131,6 +137,9 @@ def main():
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--naive", action="store_true",
                     help="use the per-expert Python loops (AITER_GROUPED_GEMM_NAIVE=1)")
+    ap.add_argument("--mode", choices=["a8w4", "a4w4"], default="a8w4",
+                    help="quant recipe: a8w4=fp8 act+fp4 weight (default), "
+                         "a4w4=fp4 act+fp4 weight")
     ap.add_argument("--doweight", action="store_true", help="doweight_stage1=True")
     ap.add_argument("--rotate", type=int, default=1,
                     help="num_rotate_args for run_perftest (1 = no input rotation)")
@@ -154,6 +163,10 @@ def main():
 
     device = "cuda"
     dtype = torch.bfloat16
+    # a8w4: fp8 activation; a4w4: fp4 activation. The weight is packed fp4 in both
+    # (q_dtype_w=fp4x2), so only q_dtype_a changes -- fused_moe derives
+    # data_format ("a8w4" vs "fp4") from this pair.
+    q_dtype_a = dtypes.fp8 if args.mode == "a8w4" else dtypes.fp4x2
     inp = _build_inputs(
         args.tokens, args.E, args.topk, args.model_dim, args.inter_dim, dtype, device
     )
@@ -171,7 +184,7 @@ def main():
             dtype=dtype,
             activation=ActivationType.Silu,
             quant_type=QuantType.per_1x32,
-            q_dtype_a=dtypes.fp8,
+            q_dtype_a=q_dtype_a,
             q_dtype_w=dtypes.fp4x2,
             isG1U1=True,
             doweight_stage1=args.doweight,
@@ -193,7 +206,7 @@ def main():
             "(AITER_FORCE_GFX1250=1), and that q_dtype_a/q_dtype_w are fp8/fp4x2."
         )
     print(
-        f"config: tokens={args.tokens} E={args.E} topk={args.topk} "
+        f"config: mode={args.mode} tokens={args.tokens} E={args.E} topk={args.topk} "
         f"model_dim={args.model_dim} inter_dim={args.inter_dim} "
         f"naive={int(args.naive)} doweight={int(args.doweight)} -> out {tuple(out.shape)}"
     )
