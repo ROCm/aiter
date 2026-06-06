@@ -126,7 +126,14 @@ def make_mx_sort_fly_fn(hidden, topk_ids, topk_weight, w):
     so the kernel trace matches mx_fn except the two gemm names.
     """
     M = hidden.shape[0]
-    BM = 16 if M <= 128 else 32
+    # mirror mx_fn BM regime: 16 (small-M inline), 32 (mid), 128 (large-M
+    # nonatomic mxfp4out + scatter_reduce_q).
+    if M <= 128:
+        BM = 16
+    elif M < 1024:
+        BM = 32
+    else:
+        BM = 128
 
     def fn():
         return mx_sort_fly_gemm1_gemm2(

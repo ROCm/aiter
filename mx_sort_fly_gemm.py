@@ -131,11 +131,43 @@ def _fly_gemm2(*, cumsum_tensor, inter_sorted_quant, inter_sorted_shuffled_scale
         experts=NE, model_dim=D_HIDDEN, inter_dim=D_INTER, topk=topk, BM=BM
     )
     total_m_blocks = max_sorted // BM
+    _e = _empty_u8(out_buf.device)
     launcher(
         _fly_ptr(out_buf), _fly_ptr(inter_sorted_quant), _fly_ptr(w2),
         _fly_ptr(inter_sorted_shuffled_scale), _fly_ptr(w2_scale),
         _fly_ptr(sorted_token_ids), _fly_ptr(sorted_expert_ids),
         _fly_ptr(sorted_weights), _fly_ptr(cumsum_tensor),
+        _fly_ptr(_e), _fly_ptr(_e),   # flat_q, flat_scale (unused in atomic)
+        int(M), int(max_sorted), int(total_m_blocks),
+    )
+
+
+def _fly_gemm2_mxfp4out(*, cumsum_tensor, inter_sorted_quant,
+                        inter_sorted_shuffled_scale, w2, w2_scale,
+                        sorted_expert_ids, flat_out_q, flat_out_scale,
+                        M, max_sorted):
+    """FlyDSL gemm2 BM=128 nonatomic-mxfp4out backend: down-proj -> per-row fp4
+    flat_out_q [max_sorted, N_OUT/2] + flat_out_scale [max_sorted, N_OUT/32]
+    (row-major); topk reduce is done afterwards by mxfp4_moe_scatter_reduce_q.
+    """
+    from aiter.ops.flydsl.kernels.mxfp4_a4w4_gemm import compile_mxfp4_gemm2_a4w4
+
+    NE = w2.shape[0]
+    D_HIDDEN = w2.shape[1]
+    D_INTER = w2.shape[2] * 2
+    BM = 128
+    launcher = compile_mxfp4_gemm2_a4w4(
+        experts=NE, model_dim=D_HIDDEN, inter_dim=D_INTER, topk=9, BM=BM,
+        mxfp4out=True,
+    )
+    total_m_blocks = max_sorted // BM
+    _e = _empty_u8(flat_out_q.device)
+    launcher(
+        _fly_ptr(_e), _fly_ptr(inter_sorted_quant), _fly_ptr(w2),
+        _fly_ptr(inter_sorted_shuffled_scale), _fly_ptr(w2_scale),
+        _fly_ptr(_e), _fly_ptr(sorted_expert_ids), _fly_ptr(_e),
+        _fly_ptr(cumsum_tensor),
+        _fly_ptr(flat_out_q), _fly_ptr(flat_out_scale),
         int(M), int(max_sorted), int(total_m_blocks),
     )
 
@@ -177,6 +209,9 @@ def mx_sort_fly_gemm1_gemm2(
         kernelName1 = (
             f"mxfp4_moe_g1_a4w4_NE{NE}_H{D_HIDDEN}_E{D_INTER}_BM16_INLINEQUANT"
         )
+    elif BM == 128:
+        # HIP BM=128 gemm1 has no _NT suffix (gen_instances); fly parses BM from it.
+        kernelName1 = f"mxfp4_moe_g1_a4w4_NE{NE}_H{D_HIDDEN}_E{D_INTER}_BM128"
     else:
         kernelName1 = f"mxfp4_moe_g1_a4w4_NE{NE}_H{D_HIDDEN}_E{D_INTER}_BM{BM}_NT"
     kernelName2 = (
@@ -276,7 +311,31 @@ def mx_sort_fly_gemm1_gemm2(
         kernelName1=kernelName1,
     )
 
-    # ── gemm2 (swappable, atomic) ─────────────────────────────────────────
+    # ── BM=128: nonatomic-mxfp4out gemm2 + HIP scatter_reduce_q (mx_fn large-M
+    #    path). gemm2 writes per-sorted-row fp4 flat_out; scatter_reduce_q gathers
+    #    via reverse_sorted and does the topk-weighted reduce into out[M, H]. ────
+    if BM == 128:
+        flat_out_q = torch.empty(
+            (max_sorted, D_HIDDEN // 2), device=device, dtype=torch.uint8)
+        flat_out_scale = torch.empty(
+            (max_sorted, D_HIDDEN // 32), device=device, dtype=torch.uint8)
+        _fly_gemm2_mxfp4out(
+            cumsum_tensor=cumsum_tensor,
+            inter_sorted_quant=inter_sorted_quant,
+            inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+            w2=w2, w2_scale=w2_scale, sorted_expert_ids=sorted_expert_ids,
+            flat_out_q=flat_out_q, flat_out_scale=flat_out_scale,
+            M=M, max_sorted=max_sorted,
+        )
+        out = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
+        aiter.mxfp4_moe_scatter_reduce_q(
+            flat_out_q=flat_out_q, flat_out_scale=flat_out_scale,
+            reverse_sorted=reverse_sorted, sorted_weights=sorted_weights,
+            out=out, NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM,
+        )
+        return out
+
+    # ── gemm2 (swappable, atomic; BM in {16,32}) ──────────────────────────
     gemm2_backend(
         cumsum_tensor=cumsum_tensor,
         inter_sorted_quant=inter_sorted_quant,
