@@ -34,6 +34,22 @@ WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
 
+def is_2d_gluon_available(
+    q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
+):
+    use_gluon_2d = (
+        IS_DEVICE_ARCH_GFX12
+        and _unified_attention_gluon_kernel_2d is not None
+        and not softcap
+        and not use_qq_bias
+        and not use_alibi_slopes
+        and q_dtype != torch.uint8
+        and kv_cache_dtype != torch.uint8
+        and q_dtype == kv_cache_dtype
+    )
+    return use_gluon_2d
+
+
 def select_2d_config(
     block_size,
     head_size,
@@ -354,15 +370,8 @@ def unified_attention(
 
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
         # sinks / output_scale / shuffled_kv_cache)
-        use_gluon_2d = (
-            IS_DEVICE_ARCH_GFX12
-            and _unified_attention_gluon_kernel_2d is not None
-            and softcap == 0
-            and not use_qq_bias
-            and not use_alibi_slopes
-            and q_dtype != torch.uint8
-            and kv_cache_dtype != torch.uint8
-            and q_dtype == kv_cache_dtype
+        use_gluon_2d = is_2d_gluon_available(
+            q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
         )
         if use_gluon_2d:
             _gfx1250_unified_attention_2d(
@@ -717,9 +726,9 @@ def _gfx1250_unified_attention_2d(
 
     SLIDING_WINDOW = 1 + window_size[0]
     ALL_DECODE = max_seqlen_q == 1
-
+    NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
     num_warps = 4
-    block_m = 128
+    BLOCK_M = 128
     waves_per_eu = 1
     if SLIDING_WINDOW > 0:
         loop_variant = 0
@@ -727,20 +736,24 @@ def _gfx1250_unified_attention_2d(
         if shuffled_kv_cache or TILE_SIZE > 32:
             loop_variant = 2
         else:
-            loop_variant = 1 
+            loop_variant = 0
     if ALL_DECODE:
         loop_variant = 0
+        BLOCK_M = (
+            16 if NUM_QUERIES_PER_KV <= 16 else triton.next_power_of_2(NUM_QUERIES_PER_KV)
+        )
         TILE_SIZE = 128
-        block_m = 16
         num_warps = 1
         waves_per_eu = 2
 
-
-
     num_buffers = 2 if loop_variant == 0 else 3
-    BLOCK_M = block_m
-    NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
+    # Upper bound on the number of tiles with partial mask
+    query_span = (BLOCK_M - 1) // NUM_QUERIES_PER_KV + 1
+    max_mask_tiles = max(1, (query_span + TILE_SIZE - 1) // TILE_SIZE)
+    # other variants do at most 2 masking at the end of loop
+    if max_mask_tiles > 2:
+        loop_variant = 0
     total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
     NUM_WARPS = num_warps
     kv_size = k.nelement() * k.element_size()

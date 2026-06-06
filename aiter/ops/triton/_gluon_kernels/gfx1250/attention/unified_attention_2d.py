@@ -12,7 +12,7 @@ triton_version = Version(triton.__version__)
 
 float8_info = torch.finfo(e4m3_dtype)
 
-_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.NONE)
+_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
 
 @gluon.jit
@@ -797,7 +797,7 @@ class AttentionProgram:
         safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
 
-        QK_scale = cfg.RCP_LN2 * cfg.SOFTMAX_SCALE
+        QK_scale: gl.float32 = cfg.RCP_LN2 * cfg.SOFTMAX_SCALE
 
         if q_descale_ptr is not None:
             QK_scale = QK_scale * gl.load(q_descale_ptr)
