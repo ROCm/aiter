@@ -74,7 +74,7 @@ def _if_then(if_op):
 from flydsl.utils.smem_allocator import SmemAllocator
 
 from fmha_prologue_gfx1250 import (
-    _raw, _asm_void, _setreg, _build_tdm_dgroup1, _split_i64_to_lo_hi,
+    _asm_void, _setreg, _build_tdm_dgroup1, _split_i64_to_lo_hi,
     _phase4_q_load_flydsl,
     _phase5_head_index_div_flydsl,
     _compute_k_global_addr, _compute_v_global_addr,
@@ -154,7 +154,7 @@ def _extract_lds_base_i32(memref_base):
     """Extract i32 LDS address from SmemAllocator memref base."""
     from flydsl._mlir.dialects import memref as _memref_d
     idx = _memref_d.extract_aligned_pointer_as_index(memref_base)
-    return _raw(arith.index_cast(T.i32, idx))
+    return arith.unwrap(arith.index_cast(T.i32, idx))
 
 
 def _build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
@@ -174,37 +174,37 @@ def _build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
     Previous layout put dh0 and dh1 in DIFFERENT banks, causing alternating
     0x02↔0x03 / 0x42↔0x43 etc. switches on every consecutive V load pair.
     """
-    lane_lo = _raw(arith.andi(lane_id, arith.constant(0xF, type=T.i32)))
-    lane_hi = _raw(arith.shrui(lane_id, arith.constant(4, type=T.i32)))
+    lane_lo = arith.unwrap(arith.andi(lane_id, arith.constant(0xF, type=T.i32)))
+    lane_hi = arith.unwrap(arith.shrui(lane_id, arith.constant(4, type=T.i32)))
 
-    k_lane_off = _raw(arith.addi(
+    k_lane_off = arith.unwrap(arith.addi(
         arith.muli(lane_lo, arith.constant(K_ROW_BYTES, type=T.i32)),
         arith.muli(lane_hi, arith.constant(16, type=T.i32))))
 
-    k_dh0 = _raw(arith.addi(k_base_i32, k_lane_off))
-    k_dh1 = _raw(arith.addi(k_dh0, arith.constant(K_SU_HALF_OFFSET, type=T.i32)))
+    k_dh0 = arith.unwrap(arith.addi(k_base_i32, k_lane_off))
+    k_dh1 = arith.unwrap(arith.addi(k_dh0, arith.constant(K_SU_HALF_OFFSET, type=T.i32)))
 
-    lane_and_7 = _raw(arith.andi(lane_id, arith.constant(7, type=T.i32)))
-    lane_shr4 = _raw(arith.shrui(lane_id, arith.constant(4, type=T.i32)))
-    v_row = _raw(arith.addi(
+    lane_and_7 = arith.unwrap(arith.andi(lane_id, arith.constant(7, type=T.i32)))
+    lane_shr4 = arith.unwrap(arith.shrui(lane_id, arith.constant(4, type=T.i32)))
+    v_row = arith.unwrap(arith.addi(
         lane_and_7,
         arith.shli(lane_shr4, arith.constant(3, type=T.i32))))
 
-    lane_shr3 = _raw(arith.shrui(lane_id, arith.constant(3, type=T.i32)))
-    v_sub_col = _raw(arith.shli(
+    lane_shr3 = arith.unwrap(arith.shrui(lane_id, arith.constant(3, type=T.i32)))
+    v_sub_col = arith.unwrap(arith.shli(
         arith.andi(lane_shr3, arith.constant(1, type=T.i32)),
         arith.constant(4, type=T.i32)))
 
-    v_lane_off = _raw(arith.addi(
+    v_lane_off = arith.unwrap(arith.addi(
         arith.muli(v_row, arith.constant(V_ROW_BYTES, type=T.i32)),
         v_sub_col))
 
-    v_dh0 = _raw(arith.addi(v_base_i32, v_lane_off))
-    v_dh1 = _raw(arith.addi(v_dh0, arith.constant(V_SU_HALF_OFFSET, type=T.i32)))
+    v_dh0 = arith.unwrap(arith.addi(v_base_i32, v_lane_off))
+    v_dh1 = arith.unwrap(arith.addi(v_dh0, arith.constant(V_SU_HALF_OFFSET, type=T.i32)))
 
     K_COL_D_HALF = QK_HDIM * KV_BPP // 2
-    k_dh0_hi = _raw(arith.addi(k_dh0, arith.constant(K_COL_D_HALF, type=T.i32)))
-    k_dh1_hi = _raw(arith.addi(k_dh1, arith.constant(K_COL_D_HALF, type=T.i32)))
+    k_dh0_hi = arith.unwrap(arith.addi(k_dh0, arith.constant(K_COL_D_HALF, type=T.i32)))
+    k_dh1_hi = arith.unwrap(arith.addi(k_dh1, arith.constant(K_COL_D_HALF, type=T.i32)))
 
     rocdl.sched_barrier(0)
 
@@ -221,8 +221,8 @@ def _build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
         if extra == 0:
             v_dh0_b, v_dh1_b = v_dh0, v_dh1
         else:
-            v_dh0_b = _raw(arith.addi(v_dh0, arith.constant(extra, type=T.i32)))
-            v_dh1_b = _raw(arith.addi(v_dh1, arith.constant(extra, type=T.i32)))
+            v_dh0_b = arith.unwrap(arith.addi(v_dh0, arith.constant(extra, type=T.i32)))
+            v_dh1_b = arith.unwrap(arith.addi(v_dh1, arith.constant(extra, type=T.i32)))
         v_addrs += [set_vgpr_bank(v_dh0_b, msb), set_vgpr_bank(v_dh1_b, msb)]
 
     return [
@@ -250,7 +250,7 @@ def _build_tdm_descs(dg1, addr_i64, stride_adv_i64,
     cur_addr = addr_i64
     descs = []
     for su in range(n_su):
-        lds_off = _raw(arith.addi(lds_base, arith.constant(su * su_p_size, type=T.i32)))
+        lds_off = arith.unwrap(arith.addi(lds_base, arith.constant(su * su_p_size, type=T.i32)))
         addr_lo, addr_hi = _split_i64_to_lo_hi(cur_addr)
         dg0 = vector.from_elements(T.vec(4, T.i32), [pred, lds_off, addr_lo, addr_hi])
         descs.append((dg0, _dg1_list[su]))
@@ -268,11 +268,10 @@ def _issue_tdm_from_descs(descs):
 
 
 def _per_warp_oob_dim1(total_rows_i32, wave_id, rows_per_warp=8):
-    from flydsl.expr.arith import _to_raw
-    wave_off = _to_raw(arith.muli(wave_id, arith.constant(rows_per_warp, type=T.i32)))
+    wave_off = arith.unwrap(arith.muli(wave_id, arith.constant(rows_per_warp, type=T.i32)))
     remaining = arith.subi(total_rows_i32, wave_off)
-    clamped_lo = arith.maxsi(remaining, _to_raw(arith.constant(0, type=T.i32)))
-    return arith.minsi(clamped_lo, _to_raw(arith.constant(rows_per_warp, type=T.i32)))
+    clamped_lo = arith.maxsi(remaining, arith.unwrap(arith.constant(0, type=T.i32)))
+    return arith.minsi(clamped_lo, arith.unwrap(arith.constant(rows_per_warp, type=T.i32)))
 
 
 def _make_kv_dg1_with_oob(config_bf16, dim0_elems, dim1_rows,
@@ -325,8 +324,6 @@ def _tdm_load_k_only(
 
     Per-warp: 4 warps × 8 rows = 32 rows per SU, 4 SUs total.
     """
-    from flydsl.expr.arith import _to_raw
-
     i64 = ir.IntegerType.get_signless(64)
 
     # dim0_valid=QK_HDIM(192): only read 192 bf16 from global per row.
@@ -338,7 +335,7 @@ def _tdm_load_k_only(
     _DIM1_ROWS = 8           # rows per warp
 
     _K_CONFIG_BF16 = (1 << 16) | _K_TDM_CONFIG
-    stride_k_seq_elems = _to_raw(arith.shrui(
+    stride_k_seq_elems = arith.unwrap(arith.shrui(
         stride_k_seq, arith.constant(1, type=T.i32)))
 
     k_dg1 = oob_dg1_list if oob_dg1_list is not None else vector.from_elements(
@@ -354,18 +351,18 @@ def _tdm_load_k_only(
 
     # Per-warp global offset: wave_id * 8 * stride_k_seq bytes
     k_addr = _compute_k_global_addr(ptr_K, k_offset, wave_id,
-                                     _to_raw(arith.muli(
+                                     arith.unwrap(arith.muli(
                                          arith.constant(8, type=T.i32),
                                          stride_k_seq)))
 
     # Per-warp LDS offset: wave_id * 8 * K_ROW_BYTES
-    wid_i32 = _to_raw(wave_id)
+    wid_i32 = arith.unwrap(wave_id)
     lds_warp_off = arith.muli(
         wid_i32,
-        _raw(arith.constant(8 * K_ROW_BYTES, type=T.i32)))
+        arith.unwrap(arith.constant(8 * K_ROW_BYTES, type=T.i32)))
     lds_base_with_warp = arith.addi(lds_base_i32, lds_warp_off)
 
-    k_stride_adv = arith.extsi(i64, _to_raw(stride_k_32))
+    k_stride_adv = arith.extsi(i64, arith.unwrap(stride_k_32))
 
     _tdm_load_kv_blk(KV_K, k_dg1, k_addr, k_stride_adv,
                       lds_base_with_warp, LDS_K_SU_P_SIZE, CNT_SU)
@@ -386,14 +383,12 @@ def _tdm_load_v_only(
     4 TDM loads (SU 0-3). Per-warp distribution: 4 warps each load
     8 rows of the 32-row SU, writing to their own LDS sub-region.
     """
-    from flydsl.expr.arith import _to_raw
-
     i64 = ir.IntegerType.get_signless(64)
 
     _V_CONFIG_BF16 = (1 << 16) | _V_TDM_CONFIG
     _DIM0_ELEMS = 128  # D dimension in bf16 elements
     _DIM1_ROWS = 8     # rows per warp
-    stride_v_seq_elems = _to_raw(arith.shrui(
+    stride_v_seq_elems = arith.unwrap(arith.shrui(
         stride_v_seq, arith.constant(1, type=T.i32)))
     v_dg1 = oob_dg1_list if oob_dg1_list is not None else vector.from_elements(
         T.vec(8, T.i32),
@@ -407,17 +402,17 @@ def _tdm_load_v_only(
          arith.constant(0, type=T.i32)])
 
     v_addr = _compute_v_global_addr(ptr_V, v_offset, wave_id,
-                                     _to_raw(arith.muli(
+                                     arith.unwrap(arith.muli(
                                          arith.constant(8, type=T.i32),
                                          stride_v_seq)))
 
-    wid_i32 = _to_raw(wave_id)
+    wid_i32 = arith.unwrap(wave_id)
     lds_warp_off = arith.muli(
         wid_i32,
-        _raw(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
+        arith.unwrap(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
     lds_base_with_warp = arith.addi(lds_base_i32, lds_warp_off)
 
-    v_stride_adv = arith.extsi(i64, _to_raw(stride_v_32))
+    v_stride_adv = arith.extsi(i64, arith.unwrap(stride_v_32))
 
     _tdm_load_kv_blk(KV_V, v_dg1, v_addr, v_stride_adv,
                       lds_base_with_warp, LDS_V_SU_P_SIZE, CNT_SU)
@@ -453,24 +448,24 @@ def _manual_load_k_to_lds(
 
     tid = arith.addi(
         arith.muli(
-            _raw(wave_id),
-            _raw(arith.constant(WAVE_SIZE, type=T.i32))),
-        _raw(lane_id))
-    stride_i64 = arith.extsi(i64, _raw(stride_k_seq))
-    c16 = _raw(arith.constant(16, type=T.i32))
-    k_row_c = _raw(arith.constant(K_ROW_BYTES, type=T.i32))
+            arith.unwrap(wave_id),
+            arith.unwrap(arith.constant(WAVE_SIZE, type=T.i32))),
+        arith.unwrap(lane_id))
+    stride_i64 = arith.extsi(i64, arith.unwrap(stride_k_seq))
+    c16 = arith.unwrap(arith.constant(16, type=T.i32))
+    k_row_c = arith.unwrap(arith.constant(K_ROW_BYTES, type=T.i32))
 
     N_CHUNKS_PER_ROW = (QK_HDIM * KV_BPP) // 16
-    c_chunks = _raw(arith.constant(N_CHUNKS_PER_ROW, type=T.i32))
+    c_chunks = arith.unwrap(arith.constant(N_CHUNKS_PER_ROW, type=T.i32))
     TOTAL_CHUNKS = SU_K_N * N_CHUNKS_PER_ROW
     N_ITERS = (TOTAL_CHUNKS + BLOCK_SIZE - 1) // BLOCK_SIZE
 
     for su in fx.range_constexpr(CNT_SU):
-        su_row_c = _raw(arith.constant(su * SU_K_N, type=T.i32))
-        su_lds_c = _raw(arith.constant(su * LDS_K_SU_P_SIZE, type=T.i32))
+        su_row_c = arith.unwrap(arith.constant(su * SU_K_N, type=T.i32))
+        su_lds_c = arith.unwrap(arith.constant(su * LDS_K_SU_P_SIZE, type=T.i32))
         for j in fx.range_constexpr(N_ITERS):
             p = arith.addi(
-                tid, _raw(arith.constant(j * BLOCK_SIZE, type=T.i32)))
+                tid, arith.unwrap(arith.constant(j * BLOCK_SIZE, type=T.i32)))
             row = arith.divui(p, c_chunks)
             chunk = arith.remui(p, c_chunks)
 
@@ -522,21 +517,21 @@ def _manual_load_v_to_lds(
 
     tid = arith.addi(
         arith.muli(
-            _raw(wave_id),
-            _raw(arith.constant(WAVE_SIZE, type=T.i32))),
-        _raw(lane_id))
-    stride_i64 = arith.extsi(i64, _raw(stride_v_seq))
-    c16 = _raw(arith.constant(16, type=T.i32))
-    c4_shift = _raw(arith.constant(4, type=T.i32))
-    c15_mask = _raw(arith.constant(15, type=T.i32))
-    v_row_c = _raw(arith.constant(V_ROW_BYTES, type=T.i32))
+            arith.unwrap(wave_id),
+            arith.unwrap(arith.constant(WAVE_SIZE, type=T.i32))),
+        arith.unwrap(lane_id))
+    stride_i64 = arith.extsi(i64, arith.unwrap(stride_v_seq))
+    c16 = arith.unwrap(arith.constant(16, type=T.i32))
+    c4_shift = arith.unwrap(arith.constant(4, type=T.i32))
+    c15_mask = arith.unwrap(arith.constant(15, type=T.i32))
+    v_row_c = arith.unwrap(arith.constant(V_ROW_BYTES, type=T.i32))
 
     for su in fx.range_constexpr(CNT_SU):
-        su_row_c = _raw(arith.constant(su * SU_K_N, type=T.i32))
-        su_lds_c = _raw(arith.constant(su * LDS_V_SU_P_SIZE, type=T.i32))
+        su_row_c = arith.unwrap(arith.constant(su * SU_K_N, type=T.i32))
+        su_lds_c = arith.unwrap(arith.constant(su * LDS_V_SU_P_SIZE, type=T.i32))
         for j in fx.range_constexpr(4):
             p = arith.addi(
-                tid, _raw(arith.constant(j * BLOCK_SIZE, type=T.i32)))
+                tid, arith.unwrap(arith.constant(j * BLOCK_SIZE, type=T.i32)))
             row = arith.shrui(p, c4_shift)
             chunk = arith.andi(p, c15_mask)
 
@@ -579,8 +574,6 @@ def _tdm_prime_full_tile(
     Blocking — waits for all TDM to complete before returning.
     k_lds_base_i32/v_lds_base_i32: i32 LDS base addresses from SmemAllocator.
     """
-    from flydsl.expr.arith import _to_raw
-
     i64 = ir.IntegerType.get_signless(64)
 
     k_dg1 = _build_tdm_dgroup1(_K_TDM_CONFIG, stride_k_seq)
@@ -589,8 +582,8 @@ def _tdm_prime_full_tile(
     k_addr = _compute_k_global_addr(ptr_K, k_offset, wave_id, stride_k_32)
     v_addr = _compute_v_global_addr(ptr_V, v_offset, wave_id, stride_v_32)
 
-    k_stride_adv = arith.extsi(i64, _to_raw(stride_k_32))
-    v_stride_adv = arith.extsi(i64, _to_raw(stride_v_32))
+    k_stride_adv = arith.extsi(i64, arith.unwrap(stride_k_32))
+    v_stride_adv = arith.extsi(i64, arith.unwrap(stride_v_32))
 
     # K: 4 SUs (tile_n=128)
     _tdm_load_kv_blk(KV_K, k_dg1, k_addr, k_stride_adv,
@@ -689,17 +682,16 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
           [56..59] ping-pong bases: k_cur, v_cur, k_next, v_next (i32)
         Total: 60 SSA values carried across iterations.
         """
-        from flydsl.expr.arith import _to_raw
-        scalar_f = _to_raw(scalar_f)
-        stride_q_seq = _to_raw(stride_q_seq)
-        stride_k_seq = _to_raw(stride_k_seq)
-        stride_v_seq = _to_raw(stride_v_seq)
-        stride_o_seq = _to_raw(stride_o_seq)
-        stride_q_head = _to_raw(stride_q_head)
-        stride_k_head = _to_raw(stride_k_head)
-        stride_v_head = _to_raw(stride_v_head)
-        stride_o_head = _to_raw(stride_o_head)
-        gqa = _to_raw(gqa)
+        scalar_f = arith.unwrap(scalar_f)
+        stride_q_seq = arith.unwrap(stride_q_seq)
+        stride_k_seq = arith.unwrap(stride_k_seq)
+        stride_v_seq = arith.unwrap(stride_v_seq)
+        stride_o_seq = arith.unwrap(stride_o_seq)
+        stride_q_head = arith.unwrap(stride_q_head)
+        stride_k_head = arith.unwrap(stride_k_head)
+        stride_v_head = arith.unwrap(stride_v_head)
+        stride_o_head = arith.unwrap(stride_o_head)
+        gqa = arith.unwrap(gqa)
 
         # Per-head byte strides are now runtime parameters (stride_q/k/v/o_head).
         # actual_q_len / actual_kv_len are derived later from cu_seqlens (THD).
@@ -729,9 +721,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         _raw_bx = arith.index_cast(T.i32, gpu.block_id("x"))   # raw batch
         _raw_by = arith.index_cast(T.i32, gpu.block_id("y"))   # raw m-block
         _raw_bz = arith.index_cast(T.i32, gpu.block_id("z"))   # raw head
-        _gdx = _to_raw(gpu.grid_dim.x)      # B
-        _gdy = _to_raw(gpu.grid_dim.y)      # M
-        _gdz = _to_raw(gpu.grid_dim.z)      # H
+        _gdx = arith.unwrap(gpu.grid_dim.x)      # B
+        _gdy = arith.unwrap(gpu.grid_dim.y)      # M
+        _gdz = arith.unwrap(gpu.grid_dim.z)      # H
         # flat wgid
         _wgid = arith.addi(arith.addi(
             _raw_bx,
@@ -773,18 +765,18 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             _raw_t = ptr_tensor.__extract_to_ir_values__()[0]
             _base_ptr = _fly_cu.extract_aligned_pointer_as_index(_glb_ptr_ty, _raw_t)
             _base_i64 = llvm_dialect.ptrtoint(_i64_ty, _base_ptr)
-            _byte_off = arith.muli(idx_i32, _to_raw(arith.constant(4, type=T.i32)))
+            _byte_off = arith.muli(idx_i32, arith.unwrap(arith.constant(4, type=T.i32)))
             _byte_off_64 = arith.extsi(_i64_ty, _byte_off)
             _addr_i64 = arith.addi(_base_i64, _byte_off_64)
             _addr_ptr = llvm_dialect.inttoptr(_glb_ptr_ty, _addr_i64)
             return llvm_dialect.load(_i32_ty, _addr_ptr)
     
-        _bz_raw = _to_raw(bz)
-        _bz1_raw = arith.addi(_bz_raw, _to_raw(arith.constant(1, type=T.i32)))
-        q_start_tok = _raw(rocdl.readfirstlane(T.i32, _load_cu_seqlen(ptr_cu_seqlens_q, _bz_raw)))
-        q_end_tok   = _raw(rocdl.readfirstlane(T.i32, _load_cu_seqlen(ptr_cu_seqlens_q, _bz1_raw)))
-        k_start_tok = _raw(rocdl.readfirstlane(T.i32, _load_cu_seqlen(ptr_cu_seqlens_k, _bz_raw)))
-        k_end_tok   = _raw(rocdl.readfirstlane(T.i32, _load_cu_seqlen(ptr_cu_seqlens_k, _bz1_raw)))
+        _bz_raw = arith.unwrap(bz)
+        _bz1_raw = arith.addi(_bz_raw, arith.unwrap(arith.constant(1, type=T.i32)))
+        q_start_tok = arith.unwrap(rocdl.readfirstlane(T.i32, _load_cu_seqlen(ptr_cu_seqlens_q, _bz_raw)))
+        q_end_tok   = arith.unwrap(rocdl.readfirstlane(T.i32, _load_cu_seqlen(ptr_cu_seqlens_q, _bz1_raw)))
+        k_start_tok = arith.unwrap(rocdl.readfirstlane(T.i32, _load_cu_seqlen(ptr_cu_seqlens_k, _bz_raw)))
+        k_end_tok   = arith.unwrap(rocdl.readfirstlane(T.i32, _load_cu_seqlen(ptr_cu_seqlens_k, _bz1_raw)))
         actual_q_len  = arith.subi(q_end_tok, q_start_tok)
         actual_kv_len = arith.subi(k_end_tok, k_start_tok)
     
@@ -804,13 +796,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     _bnd_fx = arith.addi(_base, arith.constant(_off, type=T.i32))
                     _v8 = su_sp_tiles[_su][_msb][0]
                     for _e in fx.range_constexpr(8):
-                        _e_idx = _to_raw(arith.constant(_e, type=T.i32))
+                        _e_idx = arith.unwrap(arith.constant(_e, type=T.i32))
                         _cmp_fx = arith.cmpi(arith.CmpIPredicate.slt,
                                              _bnd_fx, arith.constant(_e, type=T.i32))
                         _elem_raw = llvm_dialect.extractelement(_v8, _e_idx)
                         _elem_fx = arith.bitcast(T.f32, _elem_raw)
                         _mval_fx = arith.select(_cmp_fx, _neg_inf_c, _elem_fx)
-                        _v8 = llvm_dialect.insertelement(_v8, _to_raw(_mval_fx), _e_idx)
+                        _v8 = llvm_dialect.insertelement(_v8, arith.unwrap(_mval_fx), _e_idx)
                     su_sp_tiles[_su][_msb][0] = _v8
     
         def _apply_kv_oob_mask(su_sp_tiles, kv_remain_raw):
@@ -818,7 +810,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             _f32 = ir.F32Type.get()
             def _c(v):
                 return arith.constant(v, type=T.i32)
-            _lane_hi = arith.shrui(_to_raw(lane_id), _c(4))
+            _lane_hi = arith.shrui(arith.unwrap(lane_id), _c(4))
             _lane_hi_x8 = arith.muli(_lane_hi, _c(8))
             _base = arith.subi(arith.subi(kv_remain_raw, _c(1)), _lane_hi_x8)
             _neg_inf = arith.constant(float('-inf'), type=T.f32)
@@ -838,20 +830,20 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         # ================================================================
         # OOB protection: pre-compute per-block dg1 lists for TDM loads
         # ================================================================
-        _stride_k_elems_oob = _to_raw(arith.shrui(
+        _stride_k_elems_oob = arith.unwrap(arith.shrui(
             stride_k_seq, arith.constant(1, type=T.i32)))
-        _stride_v_elems_oob = _to_raw(arith.shrui(
+        _stride_v_elems_oob = arith.unwrap(arith.shrui(
             stride_v_seq, arith.constant(1, type=T.i32)))
         _K_CFG_OOB = (1 << 16) | _K_TDM_CONFIG
         _V_CFG_OOB = (1 << 16) | _V_TDM_CONFIG
-        m_start_raw = _to_raw(m_start)
+        m_start_raw = arith.unwrap(m_start)
     
         _k_oob_dg1 = [
             _make_kv_dg1_with_oob(
                 _K_CFG_OOB, QK_HDIM, 8, _stride_k_elems_oob,
                 _per_warp_oob_dim1(
                     arith.subi(actual_kv_len,
-                        _to_raw(arith.constant(_su * 32, type=T.i32))),
+                        arith.unwrap(arith.constant(_su * 32, type=T.i32))),
                     wave_id, 8),
                 dim0_stride=200)
             for _su in range(CNT_SU)
@@ -861,14 +853,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
                 _per_warp_oob_dim1(
                     arith.subi(actual_kv_len,
-                        _to_raw(arith.constant(_su * 32, type=T.i32))),
+                        arith.unwrap(arith.constant(_su * 32, type=T.i32))),
                     wave_id, 8))
             for _su in range(CNT_SU)
         ]
         # THD: clamp q_remain to ≥ 0 so excess workgroups (m_start >= actual_q_len) write nothing.
         _q_remain_raw = arith.subi(actual_q_len, m_start_raw)
         _q_remain_o = arith.maxsi(
-            _q_remain_raw, _to_raw(arith.constant(0, type=T.i32)))
+            _q_remain_raw, arith.unwrap(arith.constant(0, type=T.i32)))
         _o_oob_dim1 = _per_warp_oob_dim1(_q_remain_o, wave_id, 32)
     
         # THD: skip workgroups whose m_start >= actual_q_len (no valid tokens for this tile).
@@ -876,9 +868,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         _wg_valid = arith.cmpi(arith.CmpIPredicate.slt, m_start_raw, actual_q_len)
         # ---- seqlen_k == 0: zero-fill output for valid Q rows, then skip compute ----
         _kv_is_zero = arith.cmpi(arith.CmpIPredicate.eq, actual_kv_len,
-                                 _to_raw(arith.constant(0, type=T.i32)))
+                                 arith.unwrap(arith.constant(0, type=T.i32)))
         _need_zero = arith.andi(_wg_valid, _kv_is_zero)
-        _if_zero_fill = scf.IfOp(_raw(_need_zero))
+        _if_zero_fill = scf.IfOp(arith.unwrap(_need_zero))
         with _if_then(_if_zero_fill):
             _i64z = ir.IntegerType.get_signless(64)
             _glbpz = ir.Type.parse("!llvm.ptr<1>")
@@ -890,13 +882,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             _o_base_z = llvm_dialect.ptrtoint(_i64z, _o_gp_z)
             _tid_z = arith.addi(
                 arith.muli(
-                    _to_raw(wave_id),
-                    _to_raw(arith.constant(WAVE_SIZE, type=T.i32))),
-                _to_raw(lane_id))
-            _zero_v4 = _to_raw(arith.constant_vector(0, T.vec(4, T.i32)))
+                    arith.unwrap(wave_id),
+                    arith.unwrap(arith.constant(WAVE_SIZE, type=T.i32))),
+                arith.unwrap(lane_id))
+            _zero_v4 = arith.unwrap(arith.constant_vector(0, T.vec(4, T.i32)))
             _q_rows = arith.subi(actual_q_len, m_start_raw)
             _q_rows_clamped = arith.maxsi(
-                _q_rows, _to_raw(arith.constant(0, type=T.i32)))
+                _q_rows, arith.unwrap(arith.constant(0, type=T.i32)))
             _q_tok_z = arith.addi(
                 q_start_tok,
                 arith.addi(m_start_raw, _tid_z))
@@ -904,34 +896,34 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             _if_valid_z = scf.IfOp(_valid_z)
             with _if_then(_if_valid_z):
                 _elem_off_z = arith.addi(
-                    arith.muli(_to_raw(by), stride_o_head),
+                    arith.muli(arith.unwrap(by), stride_o_head),
                     arith.muli(_q_tok_z, stride_o_seq))
                 _byte_off_z = arith.muli(
                     _elem_off_z,
-                    _to_raw(arith.constant(2, type=T.i32)))
+                    arith.unwrap(arith.constant(2, type=T.i32)))
                 _byte_off_z64 = arith.extsi(_i64z, _byte_off_z)
                 _o_addr_z = arith.addi(_o_base_z, _byte_off_z64)
                 for _chunk_z in fx.range_constexpr(V_HDIM // 8):
                     _chunk_addr = arith.addi(
                         _o_addr_z,
                         arith.extsi(_i64z,
-                            _to_raw(arith.constant(_chunk_z * 16, type=T.i32))))
+                            arith.unwrap(arith.constant(_chunk_z * 16, type=T.i32))))
                     _ptr_z = llvm_dialect.inttoptr(_glbpz, _chunk_addr)
                     llvm_dialect.store(_zero_v4, _ptr_z)
 
         # Gate the main compute path: need valid Q rows AND non-zero K/V length.
         _kv_nonzero = arith.cmpi(arith.CmpIPredicate.sgt, actual_kv_len,
-                                  _to_raw(arith.constant(0, type=T.i32)))
+                                  arith.unwrap(arith.constant(0, type=T.i32)))
         _wg_valid_compute = arith.andi(_wg_valid, _kv_nonzero)
-        _if_wg = scf.IfOp(_raw(_wg_valid_compute))
+        _if_wg = scf.IfOp(arith.unwrap(_wg_valid_compute))
         with _if_then(_if_wg):
             # Q resource descriptor with OOB protection (THD: batch is implicit in q_start_tok)
             _q_tok = arith.addi(
                 q_start_tok,
-                arith.muli(_to_raw(bx), _to_raw(arith.constant(128, type=T.i32))))
+                arith.muli(arith.unwrap(bx), arith.unwrap(arith.constant(128, type=T.i32))))
             q_offset = arith.addi(
                 arith.muli(_q_tok, stride_q_seq),
-                arith.muli(_to_raw(by), stride_q_head))
+                arith.muli(arith.unwrap(by), stride_q_head))
             _q_num_bytes = arith.muli(q_end_tok, stride_q_seq)
             q_rsrc = buffer_ops.create_buffer_resource(
                 ptr_Q, num_records_bytes=_q_num_bytes)
@@ -939,7 +931,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # Q load → q_frags[4 bank][2 frag] v16bf16
             # Pass q_offset (byte offset for this workgroup's Q tile) so WG>0 reads correct rows
             q_frags_raw = _phase4_q_load_flydsl(
-                lane_id, _raw(q_rsrc), stride_q_seq, wave_id,
+                lane_id, arith.unwrap(q_rsrc), stride_q_seq, wave_id,
                 q_tile_offset_bytes=q_offset)
             rocdl.sched_barrier(0)
     
@@ -962,10 +954,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # THD: K/V batch offset = k_start_tok * stride_{k,v}_seq
             k_offset = arith.addi(
                 arith.muli(k_start_tok, stride_k_seq),
-                arith.muli(_to_raw(head_index), stride_k_head))
+                arith.muli(arith.unwrap(head_index), stride_k_head))
             v_offset = arith.addi(
                 arith.muli(k_start_tok, stride_v_seq),
-                arith.muli(_to_raw(head_index), stride_v_head))
+                arith.muli(arith.unwrap(head_index), stride_v_head))
     
             # SmemAllocator bases → i32 LDS addresses
             k_a_base_i32 = _extract_lds_base_i32(_lds_alloc_k_a.get_base())
@@ -986,8 +978,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # SGPR state: softmax scale
             log2e_val = arith.constant(1.4426950408889634, type=T.f32)
             scale = arith.mulf(log2e_val, scalar_f)
-            idx_0 = _to_raw(arith.constant(0, type=T.i32))
-            idx_1 = _to_raw(arith.constant(1, type=T.i32))
+            idx_0 = arith.unwrap(arith.constant(0, type=T.i32))
+            idx_1 = arith.unwrap(arith.constant(1, type=T.i32))
             v2f32_ty = ty['v2f32']
             pair_undef = llvm_dialect.mlir_undef(v2f32_ty)
             pair_v = llvm_dialect.insertelement(pair_undef, scale, idx_0)
@@ -1011,9 +1003,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             #
             # No PV in prologue. PART2 + PV run in core_loop iterations.
     
-            zero_f32 = _to_raw(arith.constant(0.0, type=T.f32))
-            neg_inf = _to_raw(arith.constant(float('-inf'), type=T.f32))
-            zero_v8f32 = _to_raw(arith.constant_vector(0.0, T.vec(8, T.f32)))
+            zero_f32 = arith.unwrap(arith.constant(0.0, type=T.f32))
+            neg_inf = arith.unwrap(arith.constant(float('-inf'), type=T.f32))
+            zero_v8f32 = arith.unwrap(arith.constant_vector(0.0, T.vec(8, T.f32)))
     
             # -- 2a: Load K(tile 0) → K_a (ping buffer) --
             rocdl.sched_barrier(0)
@@ -1046,7 +1038,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             _causal_offset = arith.subi(actual_kv_len, actual_q_len)
             if const_expr(IS_CAUSAL):
                 _pro_causal_n = arith.subi(
-                    _to_raw(arith.constant(0, type=T.i32)), _causal_offset)
+                    arith.unwrap(arith.constant(0, type=T.i32)), _causal_offset)
                 _apply_causal_mask(all_su_sp_tiles, _pro_causal_n)
     
             # -- 2d'': KV OOB mask on prologue tile --
@@ -1088,10 +1080,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     _op()
     
             # -- 2f: Prefetch K(tile 1) → K_b if available --
-            tile_n_const = _to_raw(arith.constant(TILE_N, type=T.i32))
+            tile_n_const = arith.unwrap(arith.constant(TILE_N, type=T.i32))
             _kv_tiles_avail = arith.divui(
                 arith.addi(actual_kv_len,
-                    _to_raw(arith.constant(TILE_N - 1, type=T.i32))),
+                    arith.unwrap(arith.constant(TILE_N - 1, type=T.i32))),
                 tile_n_const)
             if const_expr(IS_CAUSAL):
                 # Causal (bottom-right aligned): the last Q row (m_start + TILE_N - 1)
@@ -1102,10 +1094,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _sk_sq_diff = arith.subi(actual_kv_len, actual_q_len)
                 _sk_sq_tiles = arith.divui(
                     arith.addi(_sk_sq_diff,
-                        _to_raw(arith.constant(TILE_N - 1, type=T.i32))),
+                        arith.unwrap(arith.constant(TILE_N - 1, type=T.i32))),
                     tile_n_const)
                 _bx_plus_1 = arith.addi(
-                    _to_raw(bx), _to_raw(arith.constant(1, type=T.i32)))
+                    arith.unwrap(bx), arith.unwrap(arith.constant(1, type=T.i32)))
                 _causal_tiles = arith.addi(_bx_plus_1, _sk_sq_tiles)
                 num_tiles = arith.minui(_causal_tiles, _kv_tiles_avail)
             else:
@@ -1113,7 +1105,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 num_tiles = _kv_tiles_avail
             num_tiles_idx = arith.index_cast(T.index, num_tiles)
             # Loop runs N-2 iterations (tiles 1..N-2); endtile handled in epilogue.
-            _one_i32_loop = _to_raw(arith.constant(1, type=T.i32))
+            _one_i32_loop = arith.unwrap(arith.constant(1, type=T.i32))
             num_tiles_minus1 = arith.subi(num_tiles, _one_i32_loop)
             num_tiles_minus1_idx = arith.index_cast(T.index, num_tiles_minus1)
     
@@ -1121,15 +1113,15 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # For num_tiles=1 (128x128), K_b is never used (loop runs 0 iterations).
             rocdl.sched_barrier(0)
             _k_tile1_stride = arith.muli(tile_n_const, stride_k_seq)
-            _k_tile1_offset = arith.addi(_to_raw(k_offset), _k_tile1_stride)
+            _k_tile1_offset = arith.addi(arith.unwrap(k_offset), _k_tile1_stride)
             _kv_remain_t1 = arith.subi(actual_kv_len,
-                _to_raw(arith.constant(TILE_N, type=T.i32)))
+                arith.unwrap(arith.constant(TILE_N, type=T.i32)))
             _k_tile1_oob_dg1 = [
                 _make_kv_dg1_with_oob(
                     _K_CFG_OOB, QK_HDIM, 8, _stride_k_elems_oob,
                     _per_warp_oob_dim1(
                         arith.subi(_kv_remain_t1,
-                            _to_raw(arith.constant(_su * 32, type=T.i32))),
+                            arith.unwrap(arith.constant(_su * 32, type=T.i32))),
                         wave_id, 8),
                     dim0_stride=200)
                 for _su in range(CNT_SU)
@@ -1161,9 +1153,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             for _m in fx.range_constexpr(NUM_MSB):
                 for _i in fx.range_constexpr(N_SP_PAIRS):
                     pro_partial_sp_lo_flat.append(llvm_dialect.extractelement(
-                        sp_pairs_all_pro[_m][_i], _raw(arith.constant(0, type=T.i32))))
+                        sp_pairs_all_pro[_m][_i], arith.unwrap(arith.constant(0, type=T.i32))))
                     pro_partial_sp_hi_flat.append(llvm_dialect.extractelement(
-                        sp_pairs_all_pro[_m][_i], _raw(arith.constant(1, type=T.i32))))
+                        sp_pairs_all_pro[_m][_i], arith.unwrap(arith.constant(1, type=T.i32))))
             pro_partial_sp_flat = pro_partial_sp_lo_flat + pro_partial_sp_hi_flat
             # exp_delta from PART2 setup (used by first core_loop iteration's O rescale).
             pro_exp_delta = [softmax_state_pro['exp_delta'][_m]
@@ -1274,10 +1266,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 has_tdm_v_g1 = gemm1_tdm_is_v and (tdm_v_offset is not None)
     
                 if has_tdm_k_g1:
-                    from flydsl.expr.arith import _to_raw
                     i64 = ir.IntegerType.get_signless(64)
                     _K_CFG = (1 << 16) | _K_TDM_CONFIG
-                    _stride_k_elems = _to_raw(arith.shrui(
+                    _stride_k_elems = arith.unwrap(arith.shrui(
                         stride_k_seq, arith.constant(1, type=T.i32)))
                     if const_expr(loop_k_oob_dg1 is not None):
                         k_dg1 = loop_k_oob_dg1
@@ -1294,14 +1285,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                              arith.constant(0, type=T.i32)])
                     k_addr = _compute_k_global_addr(
                         ptr_K, tdm_k_offset, wave_id,
-                        _to_raw(arith.muli(
+                        arith.unwrap(arith.muli(
                             arith.constant(8, type=T.i32), stride_k_seq)))
                     k_stride_adv = arith.extsi(
-                        i64, _to_raw(stride_k_32))
-                    _wid_k = _to_raw(wave_id)
+                        i64, arith.unwrap(stride_k_32))
+                    _wid_k = arith.unwrap(wave_id)
                     _k_warp_off = arith.muli(
                         _wid_k,
-                        _raw(arith.constant(8 * K_ROW_BYTES, type=T.i32)))
+                        arith.unwrap(arith.constant(8 * K_ROW_BYTES, type=T.i32)))
                     _k_lds_base = arith.addi(tdm_k_target, _k_warp_off)
                     k_descs = _build_tdm_descs(
                         k_dg1, k_addr, k_stride_adv,
@@ -1310,10 +1301,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     tdm_state['k_desc_idx'] = 0
     
                 if has_tdm_v_g1:
-                    from flydsl.expr.arith import _to_raw
                     i64 = ir.IntegerType.get_signless(64)
                     _V_CFG = (1 << 16) | _V_TDM_CONFIG
-                    _stride_v_elems = _to_raw(arith.shrui(
+                    _stride_v_elems = arith.unwrap(arith.shrui(
                         stride_v_seq, arith.constant(1, type=T.i32)))
                     if const_expr(endtile_v_dg1 is not None):
                         v_dg1 = endtile_v_dg1
@@ -1330,14 +1320,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                              arith.constant(0, type=T.i32)])
                     v_addr = _compute_v_global_addr(
                         ptr_V, tdm_v_offset, wave_id,
-                        _to_raw(arith.muli(
+                        arith.unwrap(arith.muli(
                             arith.constant(8, type=T.i32), stride_v_seq)))
                     v_stride_adv = arith.extsi(
-                        i64, _to_raw(stride_v_32))
-                    _wid_v = _to_raw(wave_id)
+                        i64, arith.unwrap(stride_v_32))
+                    _wid_v = arith.unwrap(wave_id)
                     _v_warp_off = arith.muli(
                         _wid_v,
-                        _raw(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
+                        arith.unwrap(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
                     _v_lds_base = arith.addi(tdm_v_target, _v_warp_off)
                     v_descs = _build_tdm_descs(
                         v_dg1, v_addr, v_stride_adv,
@@ -1370,7 +1360,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     for _ii in fx.range_constexpr(8):
                         _edv = llvm_dialect.insertelement(
                             _edv, ia_exp_delta[_dm],
-                            _raw(arith.constant(_ii, type=T.i32)))
+                            arith.unwrap(arith.constant(_ii, type=T.i32)))
                     _ed_v8.append(_edv)
                 # _o_rescale_by_stage[s] = list of closures for GEMM1 stage s
                 _o_rescale_by_stage = []
@@ -1484,10 +1474,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # Main-loop mode: GEMM2 loads V(i) -> V_next
                 has_tdm_v_g2 = (not gemm1_tdm_is_v) and (tdm_v_offset is not None)
                 if has_tdm_v_g2:
-                    from flydsl.expr.arith import _to_raw
                     i64 = ir.IntegerType.get_signless(64)
                     _V_CFG = (1 << 16) | _V_TDM_CONFIG
-                    _stride_v_elems = _to_raw(arith.shrui(
+                    _stride_v_elems = arith.unwrap(arith.shrui(
                         stride_v_seq, arith.constant(1, type=T.i32)))
                     if const_expr(loop_v_oob_dg1 is not None):
                         v_dg1 = loop_v_oob_dg1
@@ -1504,14 +1493,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                              arith.constant(0, type=T.i32)])
                     v_addr = _compute_v_global_addr(
                         ptr_V, tdm_v_offset, wave_id,
-                        _to_raw(arith.muli(
+                        arith.unwrap(arith.muli(
                             arith.constant(8, type=T.i32), stride_v_seq)))
                     v_stride_adv = arith.extsi(
-                        i64, _to_raw(stride_v_32))
-                    _wid_v = _to_raw(wave_id)
+                        i64, arith.unwrap(stride_v_32))
+                    _wid_v = arith.unwrap(wave_id)
                     _v_warp_off = arith.muli(
                         _wid_v,
-                        _raw(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
+                        arith.unwrap(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
                     _v_lds_base = arith.addi(tdm_v_target, _v_warp_off)
                     v_descs = _build_tdm_descs(
                         v_dg1, v_addr, v_stride_adv,
@@ -1576,10 +1565,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         _hi_c = g2_sp_hi_cache[_psm][_psi]
                         if const_expr(_lo_c is None):
                             _lo_c = llvm_dialect.extractelement(
-                                sp_pairs_current[_psm][_psi], _raw(arith.constant(0, type=T.i32)))
+                                sp_pairs_current[_psm][_psi], arith.unwrap(arith.constant(0, type=T.i32)))
                         if const_expr(_hi_c is None):
                             _hi_c = llvm_dialect.extractelement(
-                                sp_pairs_current[_psm][_psi], _raw(arith.constant(1, type=T.i32)))
+                                sp_pairs_current[_psm][_psi], arith.unwrap(arith.constant(1, type=T.i32)))
                         partial_sp_lo_out.append(_lo_c)
                         partial_sp_hi_out.append(_hi_c)
     
@@ -1636,10 +1625,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # Since m_start = bx * TILE_N this equals bx + floor(_causal_offset / TILE_N).
                 # Clamp to [1, num_tiles-1) since loop 1 starts at tile 1.
                 _first_causal_tile = arith.addi(
-                    _to_raw(bx),
+                    arith.unwrap(bx),
                     arith.divui(_causal_offset, tile_n_const))
                 _first_causal_tile = arith.maxsi(
-                    _first_causal_tile, _to_raw(arith.constant(1, type=T.i32)))
+                    _first_causal_tile, arith.unwrap(arith.constant(1, type=T.i32)))
                 _first_causal_tile = arith.minui(
                     _first_causal_tile, num_tiles_minus1)
                 _first_causal_tile_idx = arith.index_cast(
@@ -1734,7 +1723,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 }
 
                 # ---- Build TDM state (zero placeholder for memload=False) ----
-                _zero_i32 = _to_raw(arith.constant(0, type=T.i32))
+                _zero_i32 = arith.unwrap(arith.constant(0, type=T.i32))
 
                 def _mk_zero_v4i32():
                     return vector.broadcast(ty['v4i32'], _zero_i32)
@@ -1756,13 +1745,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
                 tile_n_stride_v = arith.muli(tile_n_const, stride_v_seq)
                 cur_v_advance = arith.muli(tile_idx_i32, tile_n_stride_v)
-                cur_v_offset = arith.addi(_to_raw(v_offset), cur_v_advance)
+                cur_v_offset = arith.addi(arith.unwrap(v_offset), cur_v_advance)
 
                 next_tile = arith.addi(
-                    tile_idx_i32, _to_raw(arith.constant(1, type=T.i32)))
+                    tile_idx_i32, arith.unwrap(arith.constant(1, type=T.i32)))
                 tile_n_stride_k = arith.muli(tile_n_const, stride_k_seq)
                 next_k_advance = arith.muli(next_tile, tile_n_stride_k)
-                next_k_offset = arith.addi(_to_raw(k_offset), next_k_advance)
+                next_k_offset = arith.addi(arith.unwrap(k_offset), next_k_advance)
 
                 # ---- Per-tile OOB dg1 for K prefetch and V load ----
                 _loop_v_remain = arith.subi(
@@ -1773,7 +1762,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
                         _per_warp_oob_dim1(
                             arith.subi(_loop_v_remain,
-                                _to_raw(arith.constant(_su * 32, type=T.i32))),
+                                arith.unwrap(arith.constant(_su * 32, type=T.i32))),
                             wave_id, 8))
                     for _su in range(CNT_SU)
                 ]
@@ -1785,7 +1774,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         _K_CFG_OOB, QK_HDIM, 8, _stride_k_elems_oob,
                         _per_warp_oob_dim1(
                             arith.subi(_loop_k_remain,
-                                _to_raw(arith.constant(_su * 32, type=T.i32))),
+                                arith.unwrap(arith.constant(_su * 32, type=T.i32))),
                             wave_id, 8),
                         dim0_stride=200)
                     for _su in range(CNT_SU)
@@ -1928,7 +1917,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     'sp_pairs_prev': ia_partial_sp_pairs,
                 }
 
-                _zero_i32 = _to_raw(arith.constant(0, type=T.i32))
+                _zero_i32 = arith.unwrap(arith.constant(0, type=T.i32))
 
                 def _mk_zero_v4i32():
                     return vector.broadcast(ty['v4i32'], _zero_i32)
@@ -1949,13 +1938,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
                 tile_n_stride_v = arith.muli(tile_n_const, stride_v_seq)
                 cur_v_advance = arith.muli(tile_idx_i32, tile_n_stride_v)
-                cur_v_offset = arith.addi(_to_raw(v_offset), cur_v_advance)
+                cur_v_offset = arith.addi(arith.unwrap(v_offset), cur_v_advance)
 
                 next_tile = arith.addi(
-                    tile_idx_i32, _to_raw(arith.constant(1, type=T.i32)))
+                    tile_idx_i32, arith.unwrap(arith.constant(1, type=T.i32)))
                 tile_n_stride_k = arith.muli(tile_n_const, stride_k_seq)
                 next_k_advance = arith.muli(next_tile, tile_n_stride_k)
-                next_k_offset = arith.addi(_to_raw(k_offset), next_k_advance)
+                next_k_offset = arith.addi(arith.unwrap(k_offset), next_k_advance)
 
                 _loop_v_remain = arith.subi(
                     actual_kv_len,
@@ -1965,7 +1954,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
                         _per_warp_oob_dim1(
                             arith.subi(_loop_v_remain,
-                                _to_raw(arith.constant(_su * 32, type=T.i32))),
+                                arith.unwrap(arith.constant(_su * 32, type=T.i32))),
                             wave_id, 8))
                     for _su in range(CNT_SU)
                 ]
@@ -1977,7 +1966,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         _K_CFG_OOB, QK_HDIM, 8, _stride_k_elems_oob,
                         _per_warp_oob_dim1(
                             arith.subi(_loop_k_remain,
-                                _to_raw(arith.constant(_su * 32, type=T.i32))),
+                                arith.unwrap(arith.constant(_su * 32, type=T.i32))),
                             wave_id, 8),
                         dim0_stride=200)
                     for _su in range(CNT_SU)
@@ -2103,9 +2092,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             ep_kv_lds_addrs_next = _build_kv_lds_addrs(lane_id, ep_k_next_base, ep_v_next_base)
     
             # V(N-1) global offset for endtile GEMM1 TDM.
-            _num_tiles_m1_ep = arith.subi(num_tiles, _to_raw(arith.constant(1, type=T.i32)))
+            _num_tiles_m1_ep = arith.subi(num_tiles, arith.unwrap(arith.constant(1, type=T.i32)))
             ep_v_endtile_offset = arith.addi(
-                _to_raw(v_offset),
+                arith.unwrap(v_offset),
                 arith.muli(arith.muli(_num_tiles_m1_ep, tile_n_const), stride_v_seq))
     
             # ia_exp_delta for endtile core_loop: exp_delta from last loop GEMM2.
@@ -2166,7 +2155,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     _edv8 = llvm_dialect.mlir_undef(_vf8)
                     for _i in fx.range_constexpr(8):
                         _edv8 = llvm_dialect.insertelement(
-                            _edv8, _ed, _raw(arith.constant(_i, type=T.i32)))
+                            _edv8, _ed, arith.unwrap(arith.constant(_i, type=T.i32)))
                     for _n in fx.range_constexpr(N_PV_WMMA_N):
                         o_tiles[_msb][_n] = arith.mulf(o_tiles[_msb][_n], _edv8)
     
@@ -2188,8 +2177,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _lmf = list(sfx['local_max'])
                 for _mb in fx.range_constexpr(0, NUM_MSB, 2):
                     _sm = arith.addf(_rsf[_mb], _rsf[_mb + 1])
-                    _slo = _to_raw(arith.constant(0x76543210, type=T.i32))
-                    _shi = _to_raw(arith.constant(0xfedcba98, type=T.i32))
+                    _slo = arith.unwrap(arith.constant(0x76543210, type=T.i32))
+                    _shi = arith.unwrap(arith.constant(0xfedcba98, type=T.i32))
                     _pm = _rocdl_permlanex16(ty['f32'], _sm, _sm, _slo, _shi, False, False)
                     _sf = arith.addf(_sm, _pm)
                     _rsf[_mb] = _sf
@@ -2213,12 +2202,12 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     _lse_base_i64 = _llvm_lse.ptrtoint(_i64_lse, _lse_base)
 
                     _wv_lse = rocdl.wave_id()
-                    _lane_lo_lse = _to_raw(arith.andi(lane_id, arith.constant(15, type=T.i32)))
+                    _lane_lo_lse = arith.unwrap(arith.andi(lane_id, arith.constant(15, type=T.i32)))
 
                     _lse_bx128 = arith.muli(
-                        _to_raw(bx), _to_raw(arith.constant(128, type=T.i32)))
+                        arith.unwrap(bx), arith.unwrap(arith.constant(128, type=T.i32)))
                     _lse_wv32 = arith.muli(
-                        _wv_lse, _to_raw(arith.constant(WV_SUBQD, type=T.i32)))
+                        _wv_lse, arith.unwrap(arith.constant(WV_SUBQD, type=T.i32)))
                     _lse_base_row = arith.addi(_lse_bx128, _lse_wv32)
 
                     for _msb_lse in [0, 2]:
@@ -2227,7 +2216,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                             _lse_base_row,
                             arith.addi(
                                 _lane_lo_lse,
-                                _to_raw(arith.constant(_msb_off, type=T.i32))))
+                                arith.unwrap(arith.constant(_msb_off, type=T.i32))))
                         _lse_valid = arith.cmpi(arith.CmpIPredicate.slt, _seq_pos, actual_q_len)
                         _lse_if = scf.IfOp(_lse_valid)
                         with _if_then(_lse_if):
@@ -2236,10 +2225,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                             # elem_off = tok * nheads + head
                             _lse_elem_off = arith.addi(
                                 arith.muli(_lse_tok, _gdz),
-                                _to_raw(by))
+                                arith.unwrap(by))
                             _lse_byte_off = arith.muli(
                                 _lse_elem_off,
-                                _to_raw(arith.constant(4, type=T.i32)))
+                                arith.unwrap(arith.constant(4, type=T.i32)))
                             _lse_byte_off_i64 = arith.extsi(_i64_lse, _lse_byte_off)
                             _lse_addr = arith.addi(_lse_base_i64, _lse_byte_off_i64)
                             _lse_ptr = _llvm_lse.inttoptr(_glbpt_lse, _lse_addr)
@@ -2250,7 +2239,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     _rv8 = llvm_dialect.mlir_undef(_v8f32)
                     for _i in fx.range_constexpr(8):
                         _rv8 = llvm_dialect.insertelement(
-                            _rv8, _rcp, _raw(arith.constant(_i, type=T.i32)))
+                            _rv8, _rcp, arith.unwrap(arith.constant(_i, type=T.i32)))
                     _mb16 = []
                     for _n in fx.range_constexpr(N_PV_WMMA_N):
                         _mb16.append(arith.truncf(_v8bf16, arith.mulf(o_tiles[_msb][_n], _rv8)))
@@ -2267,19 +2256,19 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _v4i32t = ir.VectorType.get([4], _i32t)
                 _db32 = _extract_lds_base_i32(_lds_alloc_v_a.get_base())
                 _dw = arith.addi(_db32,
-                    arith.muli(_to_raw(wave_id),
-                        _raw(arith.constant(LDS_D_WV_SIZE, type=T.i32))))
-                _llo = _raw(arith.andi(lane_id, arith.constant(15, type=T.i32)))
-                _lhi = _raw(arith.shrui(lane_id, arith.constant(4, type=T.i32)))
+                    arith.muli(arith.unwrap(wave_id),
+                        arith.unwrap(arith.constant(LDS_D_WV_SIZE, type=T.i32))))
+                _llo = arith.unwrap(arith.andi(lane_id, arith.constant(15, type=T.i32)))
+                _lhi = arith.unwrap(arith.shrui(lane_id, arith.constant(4, type=T.i32)))
                 _loff = arith.addi(
-                    arith.muli(_llo, _raw(arith.constant(TDM_D_TILE_DIM0, type=T.i32))),
-                    arith.muli(_lhi, _raw(arith.constant(16, type=T.i32))))
+                    arith.muli(_llo, arith.unwrap(arith.constant(TDM_D_TILE_DIM0, type=T.i32))),
+                    arith.muli(_lhi, arith.unwrap(arith.constant(16, type=T.i32))))
                 for _msb in fx.range_constexpr(NUM_MSB):
                     for _n in fx.range_constexpr(N_PV_WMMA_N):
                         _ioff = ((_msb // 2) * 16 * TDM_D_TILE_DIM0 + (_msb % 2) * 128 + _n * 32)
                         _la = arith.addi(
                             arith.addi(_dw, _loff),
-                            _raw(arith.constant(_ioff, type=T.i32)))
+                            arith.unwrap(arith.constant(_ioff, type=T.i32)))
                         llvm_dialect.store(
                             vector.bitcast(_v4i32t, _obf16[_msb][_n]),
                             llvm_dialect.inttoptr(_ldst, _la), volatile_=True)
@@ -2294,9 +2283,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _o_tok = arith.addi(
                     arith.addi(
                         q_start_tok,
-                        arith.muli(bx, _raw(arith.constant(128, type=T.i32))),
+                        arith.muli(bx, arith.unwrap(arith.constant(128, type=T.i32))),
                     ),
-                    arith.muli(_wsgpr, _raw(arith.constant(WV_SUBQD, type=T.i32))),
+                    arith.muli(_wsgpr, arith.unwrap(arith.constant(WV_SUBQD, type=T.i32))),
                 )
                 _o_elem_off = arith.addi(
                     arith.muli(by, stride_o_head),
@@ -2305,17 +2294,17 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _o_raw = ptr_O.__extract_to_ir_values__()[0]
                 _o_gp = _fly2.extract_aligned_pointer_as_index(_glbpt, _o_raw)
                 _o64 = _llvm2.ptrtoint(_i64t, _o_gp)
-                _boff32 = arith.muli(_o_elem_off, _raw(arith.constant(2, type=T.i32)))
+                _boff32 = arith.muli(_o_elem_off, arith.unwrap(arith.constant(2, type=T.i32)))
                 _boff64 = arith.extsi(_i64t, _boff32)
                 _oadr64 = arith.addi(_o64, _boff64)
                 _alo, _ahi = _split_i64_to_lo_hi(_oadr64)
                 _olds2 = arith.addi(
                     _extract_lds_base_i32(_lds_alloc_v_a.get_base()),
-                    arith.muli(_wsgpr, _raw(arith.constant(LDS_D_WV_SIZE, type=T.i32))))
+                    arith.muli(_wsgpr, arith.unwrap(arith.constant(LDS_D_WV_SIZE, type=T.i32))))
                 _dg0 = vector.from_elements(T.vec(4, T.i32),
-                    [_raw(arith.constant(1, type=T.i32)), _olds2, _alo, _ahi])
-                _g0 = _raw(arith.constant((1 << 16) | 0, type=T.i32))
-                _g1 = _raw(arith.constant((128 & 0xFFFF) << 16, type=T.i32))
+                    [arith.unwrap(arith.constant(1, type=T.i32)), _olds2, _alo, _ahi])
+                _g0 = arith.unwrap(arith.constant((1 << 16) | 0, type=T.i32))
+                _g1 = arith.unwrap(arith.constant((128 & 0xFFFF) << 16, type=T.i32))
                 _i32_o = ir.IntegerType.get_signless(32)
                 _td1_lo_o = arith.andi(_o_oob_dim1,
                     arith.constant(0xFFFF, type=T.i32))
@@ -2323,11 +2312,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     arith.shli(_td1_lo_o,
                         arith.constant(16, type=T.i32)),
                     arith.constant((128>>16)&0xFFFF, type=T.i32))
-                _g3 = _raw(arith.constant(((32>>16)&0xFFFF)|((128&0xFFFF)<<16), type=T.i32))
-                _g4 = _raw(arith.constant(32 & 0xFFFF, type=T.i32))
+                _g3 = arith.unwrap(arith.constant(((32>>16)&0xFFFF)|((128&0xFFFF)<<16), type=T.i32))
+                _g4 = arith.unwrap(arith.constant(32 & 0xFFFF, type=T.i32))
                 _g5 = stride_o_seq
-                _g6 = _raw(arith.constant(0, type=T.i32))
-                _g7 = _raw(arith.constant(0, type=T.i32))
+                _g6 = arith.unwrap(arith.constant(0, type=T.i32))
+                _g7 = arith.unwrap(arith.constant(0, type=T.i32))
                 _dg1 = vector.from_elements(T.vec(8, T.i32), [_g0,_g1,_g2,_g3,_g4,_g5,_g6,_g7])
                 tdm_ops.tensor_store_2d(tdm_ops.TDMDescriptor2D(_dg0, _dg1))
                 tdm_ops.tensor_wait(0)
@@ -2358,7 +2347,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 }
                 # DBG: row_sums entering endtile core_loop (= ep_row_sums from loop_results)
     
-                _et_z = _to_raw(arith.constant(0, type=T.i32))
+                _et_z = arith.unwrap(arith.constant(0, type=T.i32))
                 _et_tdm = {
                     'v_g0': vector.broadcast(ty['v4i32'], _et_z),
                     'v_g1': vector.broadcast(ty['v8i32'], _et_z),
@@ -2379,14 +2368,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _et_kv_remain = arith.subi(
                     actual_kv_len,
                     arith.muli(
-                        arith.subi(num_tiles, _to_raw(arith.constant(1, type=T.i32))),
+                        arith.subi(num_tiles, arith.unwrap(arith.constant(1, type=T.i32))),
                         tile_n_const))
                 _et_v_oob_dg1 = [
                     _make_kv_dg1_with_oob(
                         _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
                         _per_warp_oob_dim1(
                             arith.subi(_et_kv_remain,
-                                _to_raw(arith.constant(_su * 32, type=T.i32))),
+                                arith.unwrap(arith.constant(_su * 32, type=T.i32))),
                             wave_id, 8))
                     for _su in range(CNT_SU)
                 ]

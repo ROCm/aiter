@@ -13,6 +13,12 @@ import sys
 import math
 import torch
 
+import aiter
+
+if aiter.get_gfx() != "gfx1250":
+    print(f"Skipping: test requires gfx1250 (current: {aiter.get_gfx()})")
+    sys.exit(0)
+
 _KERNEL_DIR = os.path.join(
     os.path.dirname(__file__), "..", "aiter", "ops", "flydsl", "kernels", "mha_1250")
 _KERNEL_DIR = os.path.abspath(_KERNEL_DIR)

@@ -35,21 +35,18 @@ from flydsl.expr.primitive import const_expr, range_constexpr
 # Local rocdl primitive wrappers (until merged into upstream FlyDSL)
 # ============================================================================
 
-def _to_ir(v):
-    return arith.unwrap(v) if hasattr(v, 'unwrap') else v
-
 def _rocdl_exp2(res, arg, **kw):
-    return rocdl_dialect.exp2(res=res, arg=_to_ir(arg), **kw)
+    return rocdl_dialect.exp2(res=res, arg=arith.unwrap(arg), **kw)
 
 def _rocdl_permlanex16(res, old, src0, src1, src2, fi, bound_control, **kw):
     return rocdl_dialect.permlanex16(
-        res=res, old=_to_ir(old), src0=_to_ir(src0),
-        src1=_to_ir(src1), src2=_to_ir(src2),
+        res=res, old=arith.unwrap(old), src0=arith.unwrap(src0),
+        src1=arith.unwrap(src1), src2=arith.unwrap(src2),
         fi=fi, bound_control=bound_control, **kw)
 
 def _rocdl_fmax3(a, b, c):
-    m = llvm_dialect.intr_maxnum(_to_ir(a), _to_ir(b))
-    return llvm_dialect.intr_maxnum(m, _to_ir(c))
+    m = llvm_dialect.intr_maxnum(arith.unwrap(a), arith.unwrap(b))
+    return llvm_dialect.intr_maxnum(m, arith.unwrap(c))
 
 # ============================================================================
 # Constants (from SP3)
@@ -180,10 +177,6 @@ PV_GEMM_INST_COUNT = NUM_MSB * PV_K_ITERS * N_PV_WMMA_N  # 16
 # Inline ASM Helpers
 # ============================================================================
 
-def _raw(val):
-    return arith.unwrap(val)
-
-
 def _asm_void(asm_str, operands=None, constraints="", **kwargs):
     llvm_dialect.inline_asm(
         None, operands or [], asm_str, constraints,
@@ -201,7 +194,7 @@ def _sched_barrier(mask=0):
 
     mask=0: barrier for ALL instruction types (VMEM, VALU, LDS, SALU, etc.).
     """
-    mask_val = _raw(arith.constant(mask, type=T.i32))
+    mask_val = arith.unwrap(arith.constant(mask, type=T.i32))
     llvm_dialect.call_intrinsic(
         None, "llvm.amdgcn.sched.barrier",
         [mask_val], [], [])
@@ -233,7 +226,7 @@ def set_vgpr_bank(raw_val, bank: int):
     if const_expr(not _USE_BANK_HINTS):
         return raw_val
     val_type = raw_val.type
-    bank_val = _raw(arith.constant(bank, type=T.i32))
+    bank_val = arith.unwrap(arith.constant(bank, type=T.i32))
     return llvm_dialect.call_intrinsic(
         val_type, "llvm.amdgcn.set.vgpr.bank",
         [raw_val, bank_val], [], [])
@@ -244,8 +237,8 @@ def set_vgpr_bank_offset(raw_val, bank: int, offset: int):
     if const_expr(not _USE_BANK_HINTS):
         return raw_val
     val_type = raw_val.type
-    bank_val   = _raw(arith.constant(bank,   type=T.i32))
-    offset_val = _raw(arith.constant(offset, type=T.i32))
+    bank_val   = arith.unwrap(arith.constant(bank,   type=T.i32))
+    offset_val = arith.unwrap(arith.constant(offset, type=T.i32))
     return llvm_dialect.call_intrinsic(
         val_type, "llvm.amdgcn.set.vgpr.bank.offset",
         [raw_val, bank_val, offset_val], [], [])
@@ -280,8 +273,8 @@ def _get_types():
 
 def _make_v2f32(lo, hi, bank=0):
     v2f32_ty = ir.VectorType.get([2], ir.F32Type.get())
-    idx_0 = _raw(arith.constant(0, type=T.i32))
-    idx_1 = _raw(arith.constant(1, type=T.i32))
+    idx_0 = arith.unwrap(arith.constant(0, type=T.i32))
+    idx_1 = arith.unwrap(arith.constant(1, type=T.i32))
     undef = llvm_dialect.mlir_undef(v2f32_ty)
     v = llvm_dialect.insertelement(undef, lo, idx_0)
     v = llvm_dialect.insertelement(v, hi, idx_1)
@@ -289,8 +282,8 @@ def _make_v2f32(lo, hi, bank=0):
 
 
 def _split_v2f32(pair):
-    idx_0 = _raw(arith.constant(0, type=T.i32))
-    idx_1 = _raw(arith.constant(1, type=T.i32))
+    idx_0 = arith.unwrap(arith.constant(0, type=T.i32))
+    idx_1 = arith.unwrap(arith.constant(1, type=T.i32))
     lo = llvm_dialect.extractelement(pair, idx_0)
     hi = llvm_dialect.extractelement(pair, idx_1)
     return lo, hi
@@ -365,7 +358,7 @@ def _pack_v2bf16_to_v16bf16(ty, v2bf16_list, bank):
 def _atom_wmma_init(ty, src_a, src_b, bank_dst):
     _sched_barrier(0)
     zero = vector.broadcast(ty['v8f32'],
-                                    _raw(arith.constant(0.0, type=T.f32)))
+                                    arith.unwrap(arith.constant(0.0, type=T.f32)))
 
     result = rocdl_dialect.wmma_f32_16x16x32_bf16(
         ty['v8f32'], src_a, src_b, zero,
@@ -395,8 +388,8 @@ def _atom_wmma_accum(ty, src_a, src_b, acc, bank_dst):
 def _atom_ds_load_b128(ty, addr, offset_val, bank):
 
     _sched_barrier(0)
-    off = _raw(arith.constant(offset_val, type=T.i32))
-    ptr = llvm_dialect.inttoptr(ty['lds_ptr'], _raw(arith.addi(addr, off)))
+    off = arith.unwrap(arith.constant(offset_val, type=T.i32))
+    ptr = llvm_dialect.inttoptr(ty['lds_ptr'], arith.unwrap(arith.addi(addr, off)))
     raw = llvm_dialect.load(ty['v4i32'], ptr)
     banked = set_vgpr_bank(raw, bank)
     _sched_barrier(0)
@@ -407,8 +400,8 @@ def _atom_ds_load_b128(ty, addr, offset_val, bank):
 def _atom_ds_load_tr16_b128(ty, addr, offset_val, bank):
 
     _sched_barrier(0)
-    off = _raw(arith.constant(offset_val, type=T.i32))
-    ptr = llvm_dialect.inttoptr(ty['lds_ptr'], _raw(arith.addi(addr, off)))
+    off = arith.unwrap(arith.constant(offset_val, type=T.i32))
+    ptr = llvm_dialect.inttoptr(ty['lds_ptr'], arith.unwrap(arith.addi(addr, off)))
     raw = rocdl.ds_load_tr16_b128(ty['v8bf16'], ptr)
     banked = set_vgpr_bank(raw, bank)
     _sched_barrier(0)
@@ -421,15 +414,15 @@ def _atom_ds_load_tr16_b128(ty, addr, offset_val, bank):
 def _atom_tdm_load(ty, s_g0, s_g1):
 
     _sched_barrier(0)
-    zero_i32 = _raw(arith.constant(0, type=T.i32))
+    zero_i32 = arith.unwrap(arith.constant(0, type=T.i32))
     null_v4 = llvm_dialect.mlir_undef(ty['v4i32'])
     for i in range_constexpr(4):
         null_v4 = llvm_dialect.insertelement(
-            null_v4, zero_i32, _raw(arith.constant(i, type=T.i32)))
+            null_v4, zero_i32, arith.unwrap(arith.constant(i, type=T.i32)))
     null_v8 = llvm_dialect.mlir_undef(ty['v8i32'])
     for i in range_constexpr(8):
         null_v8 = llvm_dialect.insertelement(
-            null_v8, zero_i32, _raw(arith.constant(i, type=T.i32)))
+            null_v8, zero_i32, arith.unwrap(arith.constant(i, type=T.i32)))
     rocdl.tensor_load_to_lds(s_g0, s_g1, null_v4, null_v4, null_v8, 0)
     _sched_barrier(0)
 
@@ -855,8 +848,8 @@ def _build_softmax_part2_ops(ty, msb, blk, sp_pairs, ss, sgpr,
         ss['old_max'][b] = _atom_mov_b32(ss['local_max'][b], b)
         _sched_barrier(0)
         v2f32_ty = ir.VectorType.get([2], ir.F32Type.get())
-        idx_0 = _raw(arith.constant(0, type=T.i32))
-        idx_1 = _raw(arith.constant(1, type=T.i32))
+        idx_0 = arith.unwrap(arith.constant(0, type=T.i32))
+        idx_1 = arith.unwrap(arith.constant(1, type=T.i32))
         undef = llvm_dialect.mlir_undef(v2f32_ty)
         _scl = sgpr['s_log2e_scl']
         v = llvm_dialect.insertelement(undef, _scl, idx_0)
@@ -952,8 +945,8 @@ def _build_softmax_part2_ops(ty, msb, blk, sp_pairs, ss, sgpr,
                 exp_lo = _rocdl_exp2(ir.F32Type.get(), lo)
                 _sched_barrier(0)
                 undef = llvm_dialect.mlir_undef(v2f32_ty)
-                v = llvm_dialect.insertelement(undef, exp_lo, _raw(arith.constant(0, type=T.i32)))
-                v = llvm_dialect.insertelement(v, hi, _raw(arith.constant(1, type=T.i32)))
+                v = llvm_dialect.insertelement(undef, exp_lo, arith.unwrap(arith.constant(0, type=T.i32)))
+                v = llvm_dialect.insertelement(v, hi, arith.unwrap(arith.constant(1, type=T.i32)))
                 sp_pairs[pidx] = v
                 if const_expr(_clo is not None):
                     _clo[pidx] = exp_lo  # standalone f32 scalar for yield
@@ -966,8 +959,8 @@ def _build_softmax_part2_ops(ty, msb, blk, sp_pairs, ss, sgpr,
                 exp_hi = _rocdl_exp2(ir.F32Type.get(), hi)
                 _sched_barrier(0)
                 undef = llvm_dialect.mlir_undef(v2f32_ty)
-                v = llvm_dialect.insertelement(undef, lo, _raw(arith.constant(0, type=T.i32)))
-                v = llvm_dialect.insertelement(v, exp_hi, _raw(arith.constant(1, type=T.i32)))
+                v = llvm_dialect.insertelement(undef, lo, arith.unwrap(arith.constant(0, type=T.i32)))
+                v = llvm_dialect.insertelement(v, exp_hi, arith.unwrap(arith.constant(1, type=T.i32)))
                 sp_pairs[pidx] = v
                 if const_expr(_chi is not None):
                     _chi[pidx] = exp_hi  # standalone f32 scalar for yield
@@ -1086,7 +1079,7 @@ def _build_softmax_part0_ops(ty, msb, sp_pairs, ss, sgpr):
         if const_expr(sp_f32[offset] is None):
             sp_f32[offset] = llvm_dialect.extractelement(
                 sp_pairs[offset // 2],
-                _raw(arith.constant(offset % 2, type=T.i32)))
+                arith.unwrap(arith.constant(offset % 2, type=T.i32)))
         return sp_f32[offset]
 
     # Phase 1: initial max3 per valid group (4 ops)
@@ -1136,7 +1129,7 @@ def _build_softmax_part0_ops(ty, msb, sp_pairs, ss, sgpr):
 
     # Phase 5 perm_prep (op18): bank-change add_f32+0, reads tmps[0] from merge2
     tmps_perm = [None]
-    _zero_f32 = _raw(arith.constant(0.0, type=T.f32))
+    _zero_f32 = arith.unwrap(arith.constant(0.0, type=T.f32))
     def op_perm_prep(b=bank, z=_zero_f32):
         dst_bank = (b + 2) % NUM_MSB
         tmps_perm[0] = _atom_add_f32(tmps[0], z, dst_bank)
@@ -1144,8 +1137,8 @@ def _build_softmax_part0_ops(ty, msb, sp_pairs, ss, sgpr):
 
     # Phase 6 perm_exec (op19): permlanex16, reads tmps_perm[0] from perm_prep
     def op_perm(b=bank):
-        sel_lo = _raw(arith.constant(0x76543210, type=T.i32))
-        sel_hi = _raw(arith.constant(0xfedcba98, type=T.i32))
+        sel_lo = arith.unwrap(arith.constant(0x76543210, type=T.i32))
+        sel_hi = arith.unwrap(arith.constant(0xfedcba98, type=T.i32))
         dst_bank = (b + 2) % NUM_MSB
         tmps[1] = _atom_permlanex16(tmps_perm[0], sel_lo, sel_hi, dst_bank)
     ops.append(op_perm)
@@ -1645,7 +1638,7 @@ def _cl_su_v3_stage_gemm2(
             _v = llvm_dialect.mlir_undef(ty['v8f32'])
             for _i in range_constexpr(8):
                 _v = llvm_dialect.insertelement(
-                    _v, _ed, _raw(arith.constant(_i, type=T.i32)))
+                    _v, _ed, arith.unwrap(arith.constant(_i, type=T.i32)))
             _o_rescale_ed_v8[d_msb] = _v
 
     def _emit_o_rescale_tile(d_msb, n):
@@ -1948,9 +1941,9 @@ def _fill_sp_pairs_for_su(sp_pairs_all, su_sp_tiles_one, su_idx):
         v8 = su_sp_tiles_one[msb][0]
         for i in range_constexpr(_pairs_per_su):
             lo = llvm_dialect.extractelement(
-                v8, _raw(arith.constant(i * 2, type=T.i32)))
+                v8, arith.unwrap(arith.constant(i * 2, type=T.i32)))
             hi = llvm_dialect.extractelement(
-                v8, _raw(arith.constant(i * 2 + 1, type=T.i32)))
+                v8, arith.unwrap(arith.constant(i * 2 + 1, type=T.i32)))
             pair_idx = su_idx * _pairs_per_su + i
             v2 = _make_v2f32(lo, hi, bank=msb)
             if const_expr(msb > 0):
@@ -1984,9 +1977,9 @@ def _sp_tiles_to_sp_pairs(su_sp_tiles_list):
             v8 = su_sp_tiles_list[su][msb][0]
             for i in range_constexpr(4):
                 lo = llvm_dialect.extractelement(
-                    v8, _raw(arith.constant(i * 2, type=T.i32)))
+                    v8, arith.unwrap(arith.constant(i * 2, type=T.i32)))
                 hi = llvm_dialect.extractelement(
-                    v8, _raw(arith.constant(i * 2 + 1, type=T.i32)))
+                    v8, arith.unwrap(arith.constant(i * 2 + 1, type=T.i32)))
                 pair_idx = su * 4 + i
                 v2 = _make_v2f32(lo, hi, bank=msb)
                 if const_expr(msb > 0):
