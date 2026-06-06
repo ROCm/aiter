@@ -1478,10 +1478,20 @@ def get_2stage_cfgs(
         if _a_type == "fp8":
             kn1 = f"{kn1}_gui"
             _base_kn1 = f"{_base_kn1}_gui"
-        if get_flydsl_kernel_params(kn1) is None:
+        kn1_params = get_flydsl_kernel_params(kn1)
+        if kn1_params is None:
             kn1 = _base_kn1
-        if get_flydsl_kernel_params(kn2) is None:
+            kn1_params = get_flydsl_kernel_params(kn1)
+        kn2_params = get_flydsl_kernel_params(kn2)
+        if kn2_params is None:
             kn2 = _base_kn2
+            kn2_params = get_flydsl_kernel_params(kn2)
+        if kn1_params is None or kn2_params is None:
+            raise ValueError(f"Invalid FlyDSL heuristic kernels: {kn1=}, {kn2=}")
+        # Keep split metadata tied to the actual FlyDSL stage1 kernel instead
+        # of a generic heuristic or sentinel, so fused_moe_2stages can make
+        # quantization decisions that match the launched kernel.
+        _stage1_k_batch = int(kn1_params.get("k_batch", 1))
 
         logger.warning(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
@@ -1503,7 +1513,7 @@ def get_2stage_cfgs(
                 model_dim_pad=hidden_pad,
             ),
             _tile_m,
-            -1,  # split_k = -1
+            _stage1_k_batch,
             False,
             has_bias=enable_bias,
             stage2_has_bias=enable_bias,
