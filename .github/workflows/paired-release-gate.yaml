@@ -1,0 +1,200 @@
+name: Paired Release Validation Gate
+
+# Multi-model GSM8K accuracy + perf gate for a paired AITER+ATOM container
+# image. Runs each model in parallel on its own DO MI350X runner (8 GPUs).
+#
+# Designed for the AITER+ATOM bi-weekly paired-release pilot. Dispatch on a
+# candidate container image and get a 5-model GSM8K verdict in ~20 min wall
+# (vs ~50-60 min serial on a single node).
+#
+# Container contract: image must have ATOM source + AITER wheel + matching
+# triton/flydsl pre-installed. The workflow does NOT install AITER from source.
+#
+# Verified container: rocm/atom-dev:atom0.1.4-rc0-aiter0.1.15-rc0
+
+on:
+  workflow_dispatch:
+    inputs:
+      container:
+        description: 'Paired ATOM+AITER container image'
+        required: true
+        default: 'rocm/atom-dev:atom0.1.4-rc0-aiter0.1.15-rc0'
+      models:
+        description: 'Comma-separated subset (or "all")'
+        required: false
+        default: 'all'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.container }}
+  cancel-in-progress: false
+
+jobs:
+  accuracy:
+    name: Accuracy (${{ matrix.model }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: dsr1
+            model_path: "/models/deepseek-ai/DeepSeek-R1-0528"
+            tp: 8
+            threshold: '0.94'
+            extra_args: '--kv_cache_dtype fp8'
+            env_vars: ''
+          - model: minimax
+            model_path: "/models/MiniMaxAI/MiniMax-M2.5"
+            tp: 2
+            threshold: '0.92'
+            extra_args: '--kv_cache_dtype fp8 --trust-remote-code'
+            env_vars: '-e HSA_NO_SCRATCH_RECLAIM=1'
+          - model: qwen3
+            model_path: "/models/Qwen/Qwen3-235B-A22B-FP8"
+            tp: 8
+            threshold: '0.87'
+            extra_args: '--kv_cache_dtype fp8 --enable-expert-parallel'
+            env_vars: '-e ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1'
+          - model: glm5
+            model_path: "/models/zai-org/GLM-5-FP8"
+            tp: 8
+            threshold: '0.93'
+            extra_args: '--kv_cache_dtype fp8'
+            env_vars: ''
+          - model: kimi
+            model_path: "/models/amd/Kimi-K2.5-MXFP4"
+            tp: 4
+            threshold: '0.92'
+            extra_args: '--kv_cache_dtype fp8 --trust-remote-code'
+            env_vars: '-e HSA_NO_SCRATCH_RECLAIM=1'
+    if: >-
+      inputs.models == 'all' ||
+      contains(inputs.models, matrix.model)
+    runs-on: linux-aiter-do-mi350x-8
+    timeout-minutes: 90
+    env:
+      CONTAINER_IMAGE: ${{ inputs.container }}
+      INSTANCE: "paired_gate_${{ matrix.model }}_${{ github.run_id }}"
+      MODEL_NAME: ${{ matrix.model }}
+      MODEL_PATH: ${{ matrix.model_path }}
+      TP: ${{ matrix.tp }}
+      THRESHOLD: ${{ matrix.threshold }}
+      EXTRA_ARGS: ${{ matrix.extra_args }}
+
+    steps:
+      - name: Pull paired container
+        run: |
+          echo "Pulling ${CONTAINER_IMAGE}"
+          docker pull "${CONTAINER_IMAGE}"
+
+      - name: Start container with GPUs + /models
+        run: |
+          docker ps -aq -f name=${INSTANCE} | xargs -r docker stop | xargs -r docker rm
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker run -dt \
+            --device=/dev/kfd $DEVICE_FLAG \
+            --ipc=host --group-add video --shm-size=64G --privileged \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 \
+            --network=host \
+            ${{ matrix.env_vars }} \
+            -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
+            -v /models:/models \
+            --name ${INSTANCE} \
+            ${CONTAINER_IMAGE} sleep infinity
+          echo "Container ${INSTANCE} started"
+          docker exec ${INSTANCE} bash -c "pip show amd-aiter | grep -E '^Name|^Version'; pip show flydsl | grep Version; pip show triton | grep Version; cd /app/ATOM && git describe --tags 2>/dev/null || git log --oneline -1"
+
+      - name: Launch ATOM server + lm_eval gsm8k
+        timeout-minutes: 75
+        run: |
+          set -uo pipefail
+          docker exec ${INSTANCE} bash -lc "
+            set -uo pipefail
+            cd /tmp
+            mkdir -p /tmp/${MODEL_NAME}_out
+            SLOG=/tmp/${MODEL_NAME}_out/server.log
+            echo '== launching ATOM server for ${MODEL_NAME} =='
+            echo 'model=${MODEL_PATH} tp=${TP} extra=${EXTRA_ARGS}'
+            python -m atom.entrypoints.openai_server \\
+              --model '${MODEL_PATH}' -tp ${TP} ${EXTRA_ARGS} > \$SLOG 2>&1 &
+            SVPID=\$!
+            echo '== waiting for health =='
+            ready=0
+            for i in \$(seq 1 1800); do
+              if curl -fsS http://localhost:8000/health >/dev/null 2>&1; then
+                ready=1; break
+              fi
+              if ! kill -0 \$SVPID 2>/dev/null; then
+                echo 'SERVER DIED'; tail -n 60 \$SLOG; exit 4
+              fi
+              sleep 1
+            done
+            [ \$ready -eq 1 ] || { echo SERVER_NOT_READY; tail -n 60 \$SLOG; exit 5; }
+            echo \"SERVER READY after \${i}s\"
+
+            # Warmup
+            curl -s http://localhost:8000/v1/completions \\
+              -H 'Content-Type: application/json' \\
+              -d \"{\\\"model\\\":\\\"${MODEL_PATH}\\\",\\\"prompt\\\":\\\"hi\\\",\\\"max_tokens\\\":1}\" >/dev/null
+
+            echo '== lm_eval gsm8k 3-shot =='
+            pip install -q lm-eval 2>/dev/null
+            lm_eval --model local-completions \\
+              --model_args model='${MODEL_PATH}',base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \\
+              --tasks gsm8k --num_fewshot 3 \\
+              --output_path /tmp/${MODEL_NAME}_out/acc 2>&1 | tee /tmp/${MODEL_NAME}_out/accuracy.txt
+
+            kill \$SVPID 2>/dev/null || true; sleep 3
+            pkill -9 -f atom.entrypoints 2>/dev/null || true
+            pkill -9 -f multiprocessing.spawn 2>/dev/null || true
+
+            rf=\$(find /tmp/${MODEL_NAME}_out/acc -name '*.json' 2>/dev/null | head -1)
+            [ -z \"\$rf\" ] && { echo NO_RESULT_JSON; exit 6; }
+            val=\$(python3 -c \"import json;d=json.load(open('\$rf'));print(d['results']['gsm8k']['exact_match,flexible-extract'])\")
+            echo \"${MODEL_NAME}_FLEX_EXTRACT=\${val}\"
+          " 2>&1 | tee ${MODEL_NAME}_output.txt
+
+      - name: Gate on threshold
+        run: |
+          val=$(grep -oE "${MODEL_NAME}_FLEX_EXTRACT=[0-9.]+" ${MODEL_NAME}_output.txt | tail -1 | cut -d= -f2)
+          if [ -z "$val" ]; then
+            echo "ERROR: no ${MODEL_NAME}_FLEX_EXTRACT in output"; exit 2
+          fi
+          echo "${MODEL_NAME} flexible-extract=${val} threshold=${THRESHOLD}"
+          if awk -v v="$val" -v t="${THRESHOLD}" 'BEGIN{exit (v<t)?0:1}'; then
+            echo "ACCURACY FAIL: ${val} < ${THRESHOLD}"; exit 1
+          fi
+          echo "ACCURACY PASS: ${val} >= ${THRESHOLD}"
+
+      - name: Upload model output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paired-gate-${{ matrix.model }}-${{ github.run_id }}
+          path: |
+            ${{ env.MODEL_NAME }}_output.txt
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker stop ${INSTANCE} 2>/dev/null || true
+          docker rm ${INSTANCE} 2>/dev/null || true
+
+  summary:
+    name: Paired Gate Summary
+    needs: accuracy
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Render result table
+        run: |
+          echo "## Paired Release Validation Gate" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Container**: \`${{ inputs.container }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Overall**: ${{ needs.accuracy.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "See per-model job logs for SCORE values." >> $GITHUB_STEP_SUMMARY
