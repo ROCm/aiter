@@ -1473,7 +1473,7 @@ def _flash_attn_forward(
             # grad path needs a real rng_state tensor (dropout=0 -> no-dropout path).
             rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
             return out_, softmax_lse, S_dmask, rng_state
-        # ns == 1 -> fall through to the existing dispatch
+        # ns <= 1 (0 = heuristic fallback, 1 = forced no-split) -> existing dispatch
     # can_impl_fmha_native() False -> num_splits ignored, existing dispatch
     if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
         out_, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
