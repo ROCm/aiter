@@ -619,6 +619,532 @@ def compile_mxfp4_gemm2_a4w4(
     return launch_gemm2
 
 
+def _f32_to_e2m1(x_f32):
+    """Software f32 -> fp4(e2m1) 4-bit int (matches HIP cvt + fp4_utils:
+    saturate / denormal / round-to-nearest-even)."""
+    T_i32 = T.i32
+    qx = x_f32.bitcast(T_i32)
+    s = qx & arith.constant(0x80000000, type=T_i32)
+    qx_abs = qx & arith.constant(0x7FFFFFFF, type=T_i32)
+    c_3F8 = arith.constant(0x3F800000, type=T_i32)
+    c_40C = arith.constant(0x40C00000, type=T_i32)
+    c_4A8 = arith.constant(0x4A800000, type=T_i32)
+    dmask = arith.cmpi(CmpIPredicate.ult, qx_abs, c_3F8)
+    nmask = arith.andi(
+        arith.cmpi(CmpIPredicate.ult, qx_abs, c_40C),
+        arith.cmpi(CmpIPredicate.uge, qx_abs, c_3F8),
+    )
+    dn = qx_abs.bitcast(T.f32) + c_4A8.bitcast(T.f32)
+    dnx = dn.bitcast(T_i32) - c_4A8
+    modd = (qx_abs >> arith.constant(22, type=T_i32)) & arith.constant(1, type=T_i32)
+    nx = (qx_abs + arith.constant(0xC11FFFFF, type=T_i32) + modd) >> arith.constant(
+        22, type=T_i32
+    )
+    e2 = arith.select(nmask, nx, arith.constant(0x7, type=T_i32))
+    e2 = arith.select(dmask, dnx, e2)
+    return (s >> arith.constant(28, type=T_i32)) | e2
+
+
+@functools.lru_cache(maxsize=None)
+def compile_mxfp4_gemm1_a4w4(
+    *,
+    experts: int,
+    model_dim: int,   # D_HIDDEN (gemm1 contraction K) = 7168
+    inter_dim: int,   # D_INTER  (gemm1 output inter)  = 512
+    topk: int,
+    BM: int,          # 16 (inline) or 32
+    use_nt: bool = True,
+    inline_quant: bool = False,
+):
+    """Fresh FlyDSL gemm1 drop-in for mxfp4_moe_gemm1_a4w4 (gate/up a16w4 +
+    SiLU*mul + per-32 fp4 requant).  K=D_HIDDEN, N_OUT=2*D_INTER (gate+up
+    interleaved), output inter = D_INTER fp4 (sorted) + make_preshuffle scale.
+
+    Simplest-correct first: NT path (pre-quant A_q), simple K-loop, software
+    f32->fp4 requant (HW cvt.scalef32.pk_fp4 isn't exposed in rocdl).
+    """
+    assert BM in (16, 32), "gemm1 here supports BM in {16,32}"
+
+    K = model_dim                # 7168 (contraction)
+    N_OUT = 2 * inter_dim        # 1024 (gate+up)
+    N_INTER = inter_dim          # 512  (output inter)
+    K_HALF = K // 2
+    BN = 256
+    BK = 256
+    K_TILES = K // BK            # 28
+    num_n_blocks = N_OUT // BN   # 4
+    num_waves = 4
+    total_threads = num_waves * 64
+    pack_M = BM // 16
+    a_elem_vec_pack = 2
+    elem_bytes = 1
+    cbsz = 4
+    blgp = 4
+    _scale_pack_m = 2
+    b_nt = 2
+
+    # B-scale (gate/up a16w4) — kBS_* over N_OUT=2*D_INTER.
+    _bsc = make_preshuffle_scale_bases(n_out=N_OUT, k=K, experts=experts)
+    kBS_per_expert_dw = _bsc["per_expert_dw"]
+    kBS_stride_n0_dw = _bsc["stride_n0_dw"]
+    kBS_stride_k0_dw = _bsc["stride_k0_dw"]   # 64
+    # A-scale (activation, K=D_HIDDEN) chunk = 28 K-tiles.
+    kAS_c_k1 = (K // 32) // 4 // 2
+    kAS_per_chunk_dw = 1 * kAS_c_k1 * 64
+    _as_chunk_div = 32                          # gemm1 A-scale: chunk = m_row/32
+    _mni_n0 = BN // 16 // 2
+    _mni_wn = BN // 64 // 2
+
+    # output inter requant make_preshuffle (kAS over N_INTER).
+    kOS_c_k1 = (N_INTER // 32) // 4 // 2
+    kOS_per_chunk_dw = 1 * kOS_c_k1 * 64
+
+    gpu_arch = get_arch()
+    allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem_g1")
+
+    lds_stride = BK
+    k_blocks16 = (BK * elem_bytes) // 16
+    _a_lds_bytes = BM * lds_stride
+    _acc_lds_elems = BM * BN
+    _lds_a_offset = 0
+    _lds_acc_offset = ((_a_lds_bytes + 15) // 16) * 16
+    allocator.ptr = _lds_acc_offset + _acc_lds_elems * 4
+
+    # A-load tiling (gather rows via m_indices; per-K-tile, 16B dwordx4 loads).
+    x_load_bytes = 16
+    num_x_loads = (BM * BK * elem_bytes) // total_threads // x_load_bytes
+    chunk_i32 = x_load_bytes // 4
+    tile_k_dwords = (BK * elem_bytes) // (4 * a_elem_vec_pack)
+    c_k_div4 = (K // a_elem_vec_pack) * elem_bytes // 4   # A_q row stride (dwords)
+
+    module_name = (
+        f"mxfp4_g1_a4w4_E{experts}_K{K}_N{N_OUT}_TOPK{topk}_BM{BM}"
+        f"_{'IQ' if inline_quant else 'NT'}_v0"
+    )
+
+    @flyc.kernel
+    def gemm1_kernel(
+        arg_a: fx.Pointer,           # A_q [max_sorted, K/2] fp4 (pre-quant)
+        arg_a_scale: fx.Pointer,     # A_scale (make_preshuffle, sorted)
+        arg_b: fx.Pointer,           # B_ps_q (w12) [E, N_OUT, K/2] fp4 a16w4
+        arg_b_scale: fx.Pointer,     # B_ps_scale (make_preshuffle)
+        arg_sorted_expert_ids: fx.Pointer,
+        arg_cumsum: fx.Pointer,
+        arg_m_indices: fx.Pointer,
+        arg_aq_out: fx.Pointer,      # inter_sorted_quant [max_sorted, N_INTER/2]
+        arg_ascale_out: fx.Pointer,  # inter_sorted_shuffled_scale
+        arg_hidden: fx.Pointer,      # hidden_states [M, K] bf16 (inline quant)
+        i32_tokens: fx.Int32,
+        i32_max_sorted: fx.Int32,
+    ):
+        i32 = T.i32
+        f32 = T.f32
+        vec16_x = T.vec(16, T.i8)
+        vec2_i64 = T.vec(2, T.i64)
+        vec4_i64 = T.vec(4, T.i64)
+        vec8_i32 = T.vec(8, T.i32)
+        vec4_f32 = T.vec(4, T.f32)
+        layout_lds = fx.make_layout((BM, lds_stride), (lds_stride, 1))
+
+        tx = gpu.thread_id("x")
+        m_block = gpu.block_id("x")
+        n_block = gpu.block_id("y")
+        coord_wl = idx2crd(tx, fx.make_layout((num_waves, 64), (64, 1)))
+        wave = layout_get(coord_wl, 0)
+        lane = layout_get(coord_wl, 1)
+        coord_l16 = idx2crd(lane, fx.make_layout((4, 16), (16, 1)))
+        lane_div_16 = layout_get(coord_l16, 0)
+        lane_mod_16 = layout_get(coord_l16, 1)
+        wave_n = wave
+
+        c_tokens = arith.index_cast(ir.IndexType.get(), i32_tokens.ir_value())
+        c_max_sorted = arith.index_cast(
+            ir.IndexType.get(), i32_max_sorted.ir_value()
+        )
+
+        # A_q is per-token a_quant [M, K/2] (NOT sorted): bound by M so that
+        # padding rows whose gathered token >= M clamp to 0 (OOB buffer load).
+        a_nbytes = arith.index_cast(
+            T.i32, c_tokens * arith.constant(K_HALF, index=True)
+        )
+        a_rsrc = _ptr_buffer_resource(arg_a, a_nbytes)
+        b_rsrc = _ptr_buffer_resource(
+            arg_b, arith.constant(experts * N_OUT * K_HALF, type=T.i32)
+        )
+        aqout_nbytes = arith.index_cast(
+            T.i32, c_max_sorted * arith.constant(N_INTER // 2, index=True)
+        )
+        aqout_rsrc = _ptr_buffer_resource(arg_aq_out, aqout_nbytes)
+        eid_rsrc = _ptr_buffer_resource(
+            arg_sorted_expert_ids,
+            arith.index_cast(
+                T.i32, (c_max_sorted / arith.constant(BM, index=True))
+                * arith.constant(4, index=True),
+            ),
+        )
+
+        expert_i32 = buffer_ops.buffer_load(
+            eid_rsrc, m_block, vec_width=1, dtype=T.i32
+        )
+        m_row = m_block * arith.constant(BM, index=True)
+
+        lds_base = allocator.get_base()
+        lds_a = SmemPtr(lds_base, _lds_a_offset, T.i8, shape=(_a_lds_bytes,)).get()
+        lds_acc = SmemPtr(
+            lds_base, _lds_acc_offset, T.f32, shape=(_acc_lds_elems,)
+        ).get()
+
+        # ---- gemm1 GEMM (increment 2): A-load(gather) + a16w4 gate/up B-load
+        # + A/B scale + K=K_TILES fp4 MFMA -> accm[kMChunks][4]. ----
+        m_idx_rsrc = _ptr_buffer_resource(
+            arg_m_indices,
+            arith.index_cast(T.i32, c_max_sorted * arith.constant(4, index=True)),
+        )
+        a_scale_nbytes = arith.index_cast(
+            T.i32,
+            (c_max_sorted / arith.constant(32, index=True)
+             + arith.constant(2, index=True))
+            * arith.constant(kAS_per_chunk_dw * 4, index=True),
+        )
+        a_scale_rsrc = _ptr_buffer_resource(arg_a_scale, a_scale_nbytes)
+        b_scale_rsrc = _ptr_buffer_resource(
+            arg_b_scale,
+            arith.constant(experts * kBS_per_expert_dw * 4, type=T.i32),
+        )
+        e_idx = arith.index_cast(ir.IndexType.get(), expert_i32)
+        _c256 = arith.constant(256, index=True)
+        _c64 = arith.constant(64, index=True)
+        _c16 = arith.constant(16, index=True)
+        _c2048 = arith.constant(2048, index=True)
+        _cKH = arith.constant(K_HALF, index=True)
+        _cN = arith.constant(N_OUT, index=True)
+
+        # A-load tiling + per-row token gather (m_indices[m_row + row_local]).
+        tx_i32_base = tx * arith.constant(chunk_i32, index=True)
+        layout_x_tile = fx.make_layout((BM, tile_k_dwords), (tile_k_dwords, 1))
+        x_row_local = []
+        x_col_local = []
+        x_row_base_div4 = []
+        for i in range_constexpr(num_x_loads):
+            _rl, _cl = tile_chunk_coord_i32(
+                arith, tx_i32_base=tx_i32_base, i=i,
+                total_threads=total_threads, layout_tile_div4=layout_x_tile,
+                chunk_i32=chunk_i32,
+            )
+            x_row_local.append(_rl)
+            x_col_local.append(_cl)
+            _tok = buffer_ops.buffer_load(
+                m_idx_rsrc, m_row + _rl, vec_width=1, dtype=T.i32
+            )
+            _tok_idx = arith.index_cast(ir.IndexType.get(), _tok)
+            x_row_base_div4.append(_tok_idx * arith.constant(c_k_div4, index=True))
+
+        def load_a_tile(kt):
+            base_k_div4 = arith.constant(kt * tile_k_dwords, index=True)
+            parts = []
+            for i in range_constexpr(num_x_loads):
+                idx = x_row_base_div4[i] + base_k_div4 + x_col_local[i]
+                v = buffer_copy_gmem16_dwordx4(
+                    buffer_ops, vector, elem_type=T.i8, idx_i32=idx,
+                    rsrc=a_rsrc, vec_elems=16,
+                )
+                parts.append(vector.bitcast(T.vec(4, i32), v))
+            return parts
+
+        def store_a_tile(parts):
+            for i in range_constexpr(num_x_loads):
+                lds_store_16b_xor16(
+                    arith, vector, lds_memref=lds_a, vec16_ty=vec16_x,
+                    layout_lds=layout_lds, row_local=x_row_local[i],
+                    col_local_i32=x_col_local[i], tx_c4=arith.index(4),
+                    k_blocks16=k_blocks16, lds_base=arith.index(0),
+                    vec_part_i32x4=parts[i], elem_bytes=elem_bytes,
+                )
+
+        def load_b_tile(kt):
+            b_tile = []
+            for j in range_constexpr(4):
+                n_off = (
+                    n_block * _c256 + wave_n * _c64
+                    + arith.constant(j * 16, index=True)
+                )
+                base_bytes = (e_idx * _cN + n_off) * _cKH
+                v_voff = (
+                    lane_div_16 * _c256 + lane_mod_16 * _c16
+                    + arith.constant(kt * 2048, index=True)
+                )
+                base_dw = (base_bytes + v_voff) / arith.index(4)
+                b_j = []
+                for sub in range_constexpr(2):
+                    off = base_dw + arith.constant(sub * 256, index=True)
+                    v16 = buffer_ops.buffer_load(
+                        b_rsrc, off, vec_width=4, dtype=i32, cache_modifier=b_nt
+                    )
+                    i64x2 = vector.bitcast(vec2_i64, v16)
+                    b0 = vector.extract(i64x2, static_position=[0], dynamic_position=[])
+                    b1 = vector.extract(i64x2, static_position=[1], dynamic_position=[])
+                    b_j.append((b0, b1))
+                b_tile.append(b_j)
+            return b_tile
+
+        _scale_lane_dw = lane_div_16 * _c16 + lane_mod_16
+        _chunk_base = m_row / arith.constant(32, index=True)
+        _mni_base = (
+            n_block * arith.constant(_mni_n0, index=True)
+            + wave_n * arith.constant(_mni_wn, index=True)
+        )
+
+        def load_a_scale(kt):
+            a_base = (
+                _chunk_base * arith.constant(kAS_per_chunk_dw, index=True)
+                + arith.constant(kt * 64, index=True) + _scale_lane_dw
+            )
+            return buffer_ops.buffer_load(
+                a_scale_rsrc, a_base, vec_width=1, dtype=T.i32, cache_modifier=0
+            )
+
+        def load_b_scale(kt):
+            b_scs = []
+            for mw in range_constexpr(2):
+                b_base = (
+                    e_idx * arith.constant(kBS_per_expert_dw, index=True)
+                    + (_mni_base + arith.constant(mw, index=True))
+                    * arith.constant(kBS_stride_n0_dw, index=True)
+                    + arith.constant(kt * 64, index=True) + _scale_lane_dw
+                )
+                b_scs.append(buffer_ops.buffer_load(
+                    b_scale_rsrc, b_base, vec_width=1, dtype=T.i32, cache_modifier=0
+                ))
+            return b_scs
+
+        # MFMA setup
+        row_a_lds = lane_mod_16
+        col_offset_base = lane_div_16 * _c16
+        m_repeat = BM // 16
+        num_acc_n = BN // num_waves // 16     # 4
+        num_acc_n_packed = num_acc_n // 2     # 2
+        pack_N = 2
+
+        def _pack_i64x4(x0, x1):
+            c0 = arith.constant(0, type=T.i64)
+            v4 = vector.from_elements(vec4_i64, [x0, x1, c0, c0])
+            return vector.bitcast(vec8_i32, v4)
+
+        def lds_load_packs_k64(curr_row, col_base):
+            col_swz = swizzle_xor16(curr_row, col_base, k_blocks16)
+            idx_a = crd2idx([curr_row, col_swz], layout_lds)
+            loaded = vector.load_op(vec16_x, lds_a, [idx_a])
+            a_i64x2 = vector.bitcast(vec2_i64, loaded)
+            a0 = vector.extract(a_i64x2, static_position=[0], dynamic_position=[])
+            a1 = vector.extract(a_i64x2, static_position=[1], dynamic_position=[])
+            return a0, a1
+
+        acc_init = arith.constant_vector(0.0, vec4_f32)
+        accm = [acc_init] * (m_repeat * num_acc_n)
+
+        def mfma_ktile(b_tile, a_sc, b_scs):
+            for k_idx in range_constexpr(2):
+                ikxdl = k_idx
+                col_base = col_offset_base + arith.constant(
+                    (k_idx * 128) // a_elem_vec_pack, index=True
+                )
+                for imxdl in range_constexpr(pack_M):
+                    mi_idx = imxdl
+                    curr_row = row_a_lds + arith.constant(mi_idx * 16, index=True)
+                    a0, a1 = lds_load_packs_k64(curr_row, col_base)
+                    a128 = _pack_i64x4(a0, a1)
+                    op_sel_a = ikxdl * _scale_pack_m + imxdl
+                    for ni in range_constexpr(num_acc_n_packed):
+                        b_scale_val = b_scs[ni]
+                        for inxdl in range_constexpr(pack_N):
+                            ni_idx = ni * pack_N + inxdl
+                            b0, b1 = b_tile[ni_idx][k_idx]
+                            b128 = _pack_i64x4(b0, b1)
+                            op_sel_b = ikxdl * pack_N + inxdl
+                            acc_idx = mi_idx * num_acc_n + ni_idx
+                            accm[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                                vec4_f32,
+                                [a128, b128, accm[acc_idx], cbsz, blgp,
+                                 op_sel_a, a_sc, op_sel_b, b_scale_val],
+                            )
+
+        for kt in range_constexpr(K_TILES):
+            if const_expr(kt > 0):
+                gpu.barrier()
+            store_a_tile(load_a_tile(kt))
+            gpu.barrier()
+            mfma_ktile(load_b_tile(kt), load_a_scale(kt), load_b_scale(kt))
+
+        # ---- SiLU*mul + fp4 requant epilogue (increment 3) ----
+        ascale_out_rsrc = _ptr_buffer_resource(
+            arg_ascale_out,
+            arith.index_cast(
+                T.i32,
+                (c_max_sorted / arith.constant(32, index=True)
+                 + arith.constant(2, index=True))
+                * arith.constant(kOS_per_chunk_dw * 4, index=True),
+            ),
+        )
+        gpu.barrier()
+        c_BN = arith.constant(BN, index=True)
+        _c128 = arith.constant(128, index=True)
+        _c32idx = arith.constant(32, index=True)
+        # cshuffle: accm[i][J] -> lds_acc; J even=gate (col), J odd=up (128+col)
+        for i in range_constexpr(m_repeat):
+            row_base = arith.constant(i * 16, index=True) + lane_div_16 * arith.constant(
+                4, index=True
+            )
+            for J in range_constexpr(num_acc_n):
+                is_up = (J % 2) == 1
+                J_local = J // 2
+                col_local = (
+                    wave_n * _c32idx
+                    + arith.constant(J_local * 16, index=True)
+                    + lane_mod_16
+                )
+                lds_col = (col_local + _c128) if is_up else col_local
+                acc_v = accm[i * num_acc_n + J]
+                for v in range_constexpr(4):
+                    lds_idx = (row_base + arith.constant(v, index=True)) * c_BN + lds_col
+                    val = vector.extract(acc_v, static_position=[v], dynamic_position=[])
+                    vv = vector.from_elements(T.vec(1, f32), [val])
+                    vector.store(vv, lds_acc, [lds_idx], alignment=4)
+        gpu.barrier()
+
+        # read gate/up, SiLU*mul, per-32 amax(DPP) -> fp4 + e8m0
+        m_lane = tx / _c16
+        n_lane = tx % _c16
+        wave_grp = n_lane / arith.index(4)
+        kk = n_lane % arith.index(4)
+        M_REPS = BM // 16
+        _neg_log2e = arith.constant(-1.4426950408889634, type=f32)
+        _one_f = arith.constant(1.0, type=f32)
+        _c7fff = arith.constant(0x7FFFFFFF, type=i32)
+        _c2e21 = arith.constant(0x200000, type=i32)
+        _quarter = arith.constant(0.25, type=f32)
+        _c254i = arith.constant(254, type=i32)
+        K_G2_HALF = N_INTER // 2
+        scales_per_mr = []
+        for mr in range_constexpr(M_REPS):
+            row_local = arith.constant(mr * 16, index=True) + m_lane
+            gate_col0 = wave_grp * _c32idx + kk * arith.index(8)
+            results = []
+            for e in range_constexpr(8):
+                gcol = gate_col0 + arith.constant(e, index=True)
+                g = vector.extract(
+                    vector.load_op(T.vec(1, f32), lds_acc, [row_local * c_BN + gcol]),
+                    static_position=[0], dynamic_position=[],
+                )
+                u = vector.extract(
+                    vector.load_op(
+                        T.vec(1, f32), lds_acc, [row_local * c_BN + gcol + _c128]
+                    ),
+                    static_position=[0], dynamic_position=[],
+                )
+                t = g * _neg_log2e
+                emu = llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [t], [], [])
+                sig = llvm.call_intrinsic(
+                    f32, "llvm.amdgcn.rcp.f32", [_one_f + emu], [], []
+                )
+                results.append((g * sig) * u)
+            # amax over 8 + quad (kk) cross-lane reduction
+            local_max = (results[0].bitcast(i32) & _c7fff).bitcast(f32)
+            for e in range_constexpr(1, 8):
+                local_max = arith.maximumf(
+                    local_max, (results[e].bitcast(i32) & _c7fff).bitcast(f32)
+                )
+            local_max = arith.maximumf(local_max, local_max.shuffle_xor(1, 64))
+            local_max = arith.maximumf(local_max, local_max.shuffle_xor(2, 64))
+            quant_scale = ((local_max.bitcast(i32) + _c2e21).bitcast(f32)) * _quarter
+            sb_raw = quant_scale.bitcast(i32) >> arith.constant(23, type=i32)
+            scales_per_mr.append(arith.minsi(sb_raw, _c254i))
+            packed = None
+            for e in range_constexpr(8):
+                fp4 = _f32_to_e2m1(arith.divf(results[e], quant_scale))
+                if const_expr(e % 2 == 0):
+                    byte_b = fp4
+                else:
+                    byte_b = byte_b | (fp4 << arith.constant(4, type=i32))
+                    sh = byte_b << arith.constant((e // 2) * 8, type=i32)
+                    packed = sh if packed is None else (packed | sh)
+            byte_pos = (
+                n_block * arith.constant(64, index=True)
+                + wave_grp * _c16 + kk * arith.index(4)
+            )
+            out_row = m_row + row_local
+            aq_off = out_row * arith.constant(K_G2_HALF, index=True) + byte_pos
+            buffer_ops.buffer_store(
+                packed, aqout_rsrc, aq_off, offset_is_bytes=True
+            )
+
+        # scale store (kk==0): make_preshuffle inter scale
+        kk_i32 = arith.index_cast(i32, kk)
+        is_w = arith.cmpi(CmpIPredicate.eq, kk_i32, arith.constant(0, type=i32))
+        _ifw = scf.IfOp(is_w)
+        with ir.InsertionPoint(_ifw.then_block):
+            ku = n_block / arith.index(2)
+            ikxdl = n_block % arith.index(2)
+            ikxdl_b = arith.index_cast(i32, ikxdl)
+            dword_off = (
+                m_block * arith.constant(kOS_per_chunk_dw, index=True)
+                + ku * _c64 + wave_grp * _c16 + m_lane
+            )
+            sc_byte = dword_off * arith.index(4) + arith.index_cast(
+                ir.IndexType.get(), ikxdl_b * arith.constant(2, type=i32)
+            )
+            if const_expr(BM == 16):
+                s0 = arith.TruncIOp(T.i8, scales_per_mr[0])
+                buffer_ops.buffer_store(
+                    s0, ascale_out_rsrc, sc_byte, offset_is_bytes=True
+                )
+            else:
+                pair = arith.TruncIOp(
+                    T.i16,
+                    scales_per_mr[0]
+                    | (scales_per_mr[1] << arith.constant(8, type=i32)),
+                )
+                buffer_ops.buffer_store(
+                    pair, ascale_out_rsrc, sc_byte, offset_is_bytes=True
+                )
+            scf.YieldOp([])
+
+    @flyc.jit
+    def launch_gemm1(
+        arg_a: fx.Pointer,
+        arg_a_scale: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_b_scale: fx.Pointer,
+        arg_sorted_expert_ids: fx.Pointer,
+        arg_cumsum: fx.Pointer,
+        arg_m_indices: fx.Pointer,
+        arg_aq_out: fx.Pointer,
+        arg_ascale_out: fx.Pointer,
+        arg_hidden: fx.Pointer,
+        i32_tokens: fx.Int32,
+        i32_max_sorted: fx.Int32,
+        i32_total_m_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        gx = arith.index_cast(ir.IndexType.get(), i32_total_m_blocks.ir_value())
+        gemm1_kernel(
+            arg_a, arg_a_scale, arg_b, arg_b_scale,
+            arg_sorted_expert_ids, arg_cumsum, arg_m_indices,
+            arg_aq_out, arg_ascale_out, arg_hidden,
+            i32_tokens, i32_max_sorted,
+        ).launch(
+            grid=(gx, num_n_blocks, 1),
+            block=(total_threads, 1, 1),
+            smem=65536,
+            stream=stream,
+        )
+
+    return launch_gemm1
+
+
 def get_arch():
     from flydsl.runtime.device import get_rocm_arch
     return get_rocm_arch()

@@ -76,6 +76,39 @@ def _fly_ptr(t):
     return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
 
+def _fly_gemm1(*, cumsum_tensor, a_quant, a_scale_sorted_shuffled, w1, w1_scale,
+               sorted_expert_ids, m_indices, inter_sorted_quant,
+               inter_sorted_shuffled_scale, hidden_states, kernelName1):
+    """Fresh FlyDSL gemm1 backend (drop-in for mxfp4_moe_gemm1_a4w4).
+
+    gate/up a16w4 GEMM + SiLU*mul + per-32 fp4 requant. NT path (pre-quant A_q)
+    validated; INLINEQUANT (BM=16) is WIP.
+    """
+    from aiter.ops.flydsl.kernels.mxfp4_a4w4_gemm import compile_mxfp4_gemm1_a4w4
+
+    NE = w1.shape[0]
+    D_HIDDEN = w1.shape[2]            # w1 [E, 2*D_INTER, D_HIDDEN]
+    D_INTER = w1.shape[1] // 2
+    M = hidden_states.shape[0]
+    BM = int(kernelName1.split("_BM")[1].split("_")[0])
+    inline_quant = "INLINEQUANT" in kernelName1
+    max_sorted = inter_sorted_quant.shape[0]
+    launcher = compile_mxfp4_gemm1_a4w4(
+        experts=NE, model_dim=D_HIDDEN, inter_dim=D_INTER, topk=9, BM=BM,
+        use_nt=not inline_quant, inline_quant=inline_quant,
+    )
+    # launch only valid blocks (matches HIP grid = cumsum/BM); avoids padding
+    # blocks with garbage expert_id / m_indices.
+    total_m_blocks = int(cumsum_tensor.item()) // BM
+    launcher(
+        _fly_ptr(a_quant), _fly_ptr(a_scale_sorted_shuffled), _fly_ptr(w1),
+        _fly_ptr(w1_scale), _fly_ptr(sorted_expert_ids), _fly_ptr(cumsum_tensor),
+        _fly_ptr(m_indices), _fly_ptr(inter_sorted_quant),
+        _fly_ptr(inter_sorted_shuffled_scale), _fly_ptr(hidden_states),
+        int(M), int(max_sorted), int(total_m_blocks),
+    )
+
+
 def _fly_gemm2(*, cumsum_tensor, inter_sorted_quant, inter_sorted_shuffled_scale,
                w2, w2_scale, sorted_token_ids, sorted_expert_ids, sorted_weights,
                out_buf, M, max_sorted, kernelName2):
