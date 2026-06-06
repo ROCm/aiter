@@ -92,7 +92,7 @@ def test_kernel_name_roundtrips():
     [
         (256, 256, 256),
         (512, 1024, 512),
-        (1, 4096, 4096),  # decode: M=1 (padded internally, no NaN)
+        (1, 4096, 4096),  # decode: M=1 (ragged, kernel OOB-clips; no host pad)
         (333, 576, 1024),  # ragged M, N=576 (tile_n=64 divides it)
         (17, 64, 512),  # tiny ragged M, small N
     ],
@@ -147,6 +147,47 @@ def test_split_k(split_k, monkeypatch):
     rel, cos = _metrics(out, out_sk1)
     assert rel < 1e-3, f"split_k={split_k} drifts from sk1 (rel L1={rel})"
     assert cos > 0.9999, f"split_k={split_k} drifts from sk1 (cos={cos})"
+
+
+@pytest.mark.parametrize("split_k", [2, 4])
+@pytest.mark.parametrize("M", [17, 100, 257])
+def test_ragged_m_split_k(M, split_k, monkeypatch):
+    """Ragged M with split-k exercises the per-lane (row < M) atomic predicate."""
+    _inject_tuned_config(monkeypatch, _kernel_name(128, 128, 128, 2, split_k=split_k))
+    torch.manual_seed(0)
+    N, K = 256, 1024  # K/(split_k*tile_k) integral; chunk holds >= 2 buffers
+    aq, bq, a_scale, b_scale = _quant(M, N, K)
+    ref = _ref(aq, bq, a_scale, b_scale, torch.bfloat16)
+    out = aiter.gemm_a8w8_bpreshuffle(
+        aq, shuffle_weight(bq, layout=(16, 16)), a_scale, b_scale, dtype=torch.bfloat16
+    )
+    assert out.shape == (M, N)
+    _, cos = _metrics(out, ref)
+    assert cos > 0.99, f"cosine={cos} too low (ragged M={M}, split_k={split_k})"
+
+
+def test_vendored_oob_path(monkeypatch):
+    """Force the vendored OOB descriptor builder (the older-flydsl fallback) and
+    verify ragged-M correctness, even when the installed flydsl has native OOB.
+
+    Uses a tile config no other test compiles so the cached kernel is built fresh
+    through the vendored path while ``_TDM_HAS_OOB`` is patched off.
+    """
+    import aiter.ops.flydsl.kernels.gemm_fp8fp4_gfx1250 as kmod
+
+    monkeypatch.setattr(kmod, "_TDM_HAS_OOB", False)
+    _inject_tuned_config(monkeypatch, _kernel_name(64, 64, 128, 2))
+    torch.manual_seed(0)
+    M, N, K = 100, 256, 512  # ragged M -> partial last M-tile via vendored desc
+    aq, bq, a_scale, b_scale = _quant(M, N, K)
+    ref = _ref(aq, bq, a_scale, b_scale, torch.bfloat16)
+    out = aiter.gemm_a8w8_bpreshuffle(
+        aq, shuffle_weight(bq, layout=(16, 16)), a_scale, b_scale, dtype=torch.bfloat16
+    )
+    assert out.shape == (M, N)
+    rel, cos = _metrics(out, ref)
+    assert cos > 0.99, f"cosine={cos} too low (vendored OOB path)"
+    assert rel < 0.05, f"rel L1={rel} too high (vendored OOB path)"
 
 
 def test_cluster(monkeypatch):

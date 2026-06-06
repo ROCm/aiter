@@ -6,9 +6,10 @@
 aiter.gemm_a8w8_bpreshuffle routes here when its tuned kernelName starts with
 ``flydsl_bpreshuffle_wmma_`` (gfx1250 has no MFMA preshuffle kernel). Runs the
 vendored gemm_fp8fp4_gfx1250 WMMA kernel in ptpc scale mode: C = (A*sa) @ (B*sb)^T
-with fp32 per-token sa[M] / per-channel sb[N] applied in the epilogue. N/K are not
-padded (must divide the tile); M is padded to tile_m when ragged, since the kernel
-reads a full tile_m rows per workgroup (M=1 would otherwise read past A/sa -> NaN).
+with fp32 per-token sa[M] / per-channel sb[N] applied in the epilogue. N/K must
+divide the tile; M may be non-tile-aligned (ragged) with no host padding — the
+kernel clips A/A-scale loads and the C store to the runtime M via hardware
+out-of-bounds handling (split-k predicates the atomic add per-lane on row < M).
 """
 
 from __future__ import annotations
@@ -125,21 +126,14 @@ def run_preshuffle_gemm_a8_gfx1250(
     sa = _as_1d_fp32(x_scale, M, "x_scale")
     sb = _as_1d_fp32(w_scale, N, "w_scale")
 
-    # M padded to tile_m when ragged (kernel reads a full tile_m rows/wg).
-    padded_m = ((M + tile_m - 1) // tile_m) * tile_m
-    if padded_m == M:
-        a_dev = XQ.contiguous()
-        sa_dev = sa
-    else:
-        a_dev = torch.zeros((padded_m, K), dtype=XQ.dtype, device=XQ.device)
-        a_dev[:M] = XQ
-        sa_dev = torch.ones((padded_m,), dtype=torch.float32, device=sa.device)
-        sa_dev[:M] = sa
-
+    # Ragged M needs no host padding: the kernel clips A/A-scale loads and the C
+    # store to the runtime M via hardware out-of-bounds, so A and the scales pass
+    # through unchanged. Only N/K must divide the tile (checked above).
+    a_dev = XQ.contiguous()
     b_dev = WQ.contiguous()
 
     exe = _compile_ptpc_gemm(
-        M=padded_m,
+        M=M,
         N=N,
         K=K,
         data_format="fp8",
@@ -157,12 +151,11 @@ def run_preshuffle_gemm_a8_gfx1250(
     )
 
     if accumulate_fp32:
-        # fp32 atomic-accumulation scratch (zeroed; narrowed into Out below).
-        out_buf = torch.zeros((padded_m, N), dtype=torch.float32, device=Out.device)
-    elif padded_m == M:
-        out_buf = Out.contiguous()
+        # fp32 atomic-accumulation scratch: zeroed because the split-k atomic add
+        # accumulates into it (per-lane predicated on row < M), cast into Out below.
+        out_buf = torch.zeros((M, N), dtype=torch.float32, device=Out.device)
     else:
-        out_buf = torch.empty((padded_m, N), dtype=Out.dtype, device=Out.device)
+        out_buf = Out.contiguous()
 
     stream = _fx.Stream(torch.cuda.current_stream(device=a_dev.device))
     _run_compiled(
@@ -170,15 +163,15 @@ def run_preshuffle_gemm_a8_gfx1250(
         out_buf.view(-1),
         _to_uint8(a_dev),
         _to_uint8(b_dev),
-        sa_dev.contiguous().view(-1),
+        sa.contiguous().view(-1),
         sb.contiguous().view(-1),
-        padded_m,
+        M,
         N,
         stream,
     )
 
     if out_buf.data_ptr() != Out.data_ptr():
-        Out.copy_(out_buf[:M])
+        Out.copy_(out_buf)
     return Out
 
 

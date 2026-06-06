@@ -91,10 +91,11 @@ default_kernels_dict = {
 
 def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     """N must divide tile_n (N is never padded); K must divide split_k*tile_k, and
-    each split-k chunk must hold >= num_buffers K-tiles to fill the pipeline. M is
-    padded to tile_m, so ragged M is fine without a cluster; a cluster needs an
-    evenly divisible grid and only pays off for M, N >= 4096.
-    (LDS is bounded at build time, so it is not re-checked here.)
+    each split-k chunk must hold >= num_buffers K-tiles to fill the pipeline. M may
+    be ragged — the kernel clips loads/stores to M via hardware out-of-bounds, so no
+    M divisibility is required (a cluster just rounds the M-grid up and OOB-clips the
+    extra tiles). A cluster still needs N cluster-tile-divisible and only pays off
+    for M, N >= 4096. (LDS is bounded at build time, so it is not re-checked here.)
     """
     if N % ki.tile_n != 0 or K % (ki.split_k * ki.tile_k) != 0:
         return False
@@ -103,6 +104,6 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     if ki.cluster_m > 1 or ki.cluster_n > 1:
         if M < 4096 or N < 4096:
             return False
-        if M % (ki.cluster_m * ki.tile_m) != 0 or N % (ki.cluster_n * ki.tile_n) != 0:
+        if N % (ki.cluster_n * ki.tile_n) != 0:
             return False
     return True

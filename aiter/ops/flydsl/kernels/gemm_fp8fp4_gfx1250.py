@@ -13,7 +13,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly, llvm
+from flydsl._mlir.dialects import fly, llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
@@ -57,17 +57,36 @@ def _s_prefetch_inst_burst(num_pages: int, page_bytes: int = 4096):
     _llvm.inline_asm(None, [], "\n".join(lines), "", has_side_effects=True)
 
 
-# compatible with no early_timeout descriptor
-_TDM_HAS_EARLY_TIMEOUT = (
-    "early_timeout" in inspect.signature(tdm_ops.make_tensor_descriptor_2d).parameters
-)
+# Feature-detect the installed flydsl's TDM descriptor builder. Older pinned
+# flydsl predates these args; we apply each only when supported and otherwise
+# fall back to the vendored OOB-capable builder for the non-tile-aligned-M path.
+_TDM_SIG_PARAMS = inspect.signature(tdm_ops.make_tensor_descriptor_2d).parameters
+_TDM_HAS_EARLY_TIMEOUT = "early_timeout" in _TDM_SIG_PARAMS
+_TDM_HAS_OOB = "oob_outer_bound" in _TDM_SIG_PARAMS
 
 
-def _make_tdm_desc(*, early_timeout=False, **kwargs):
-    """Build a TDM descriptor, applying early_timeout only when supports it."""
-    if _TDM_HAS_EARLY_TIMEOUT:
-        kwargs["early_timeout"] = early_timeout
-    return tdm_ops.make_tensor_descriptor_2d(**kwargs)
+def _make_tdm_desc(*, early_timeout=False, oob_outer_bound=None, **kwargs):
+    """Build a TDM descriptor across flydsl versions.
+
+    ``early_timeout`` / ``oob_outer_bound`` are passed to the native builder
+    only when it supports them. When ``oob_outer_bound`` is needed (ragged M)
+    but the installed flydsl lacks it, the vendored builder in ``tdm_oob`` is
+    used — it carries the OOB logic so the non-tile-aligned-M GEMM path works
+    against the older flydsl this build pins.
+    """
+    if _TDM_HAS_OOB:
+        return tdm_ops.make_tensor_descriptor_2d(
+            early_timeout=early_timeout, oob_outer_bound=oob_outer_bound, **kwargs
+        )
+    if oob_outer_bound is None:
+        if _TDM_HAS_EARLY_TIMEOUT:
+            kwargs["early_timeout"] = early_timeout
+        return tdm_ops.make_tensor_descriptor_2d(**kwargs)
+    from .tdm_oob import make_tensor_descriptor_2d as _make_tensor_descriptor_2d_oob
+
+    return _make_tensor_descriptor_2d_oob(
+        early_timeout=early_timeout, oob_outer_bound=oob_outer_bound, **kwargs
+    )
 
 
 # Common constants
@@ -716,6 +735,7 @@ def compile_fp8fp4_gemm(
                 workgroup_mask=a_mcast_mask,
                 atomic_barrier_enable=atomic_barrier_enable,
                 early_timeout=True,
+                oob_outer_bound=i32_m,
             )
 
         def make_desc_b(memref, k_base):
@@ -754,6 +774,7 @@ def compile_fp8fp4_gemm(
                 lds_byte_offset=arith.index(row_start * lds_a_stride_bytes),
                 atomic_barrier_enable=atomic_barrier_enable,
                 early_timeout=True,
+                oob_outer_bound=i32_m,
             )
 
         def make_desc_b_half(memref, k_base, n_half: int):
@@ -2351,12 +2372,18 @@ def compile_fp8fp4_gemm(
             addr_idx = 0
             for acc_idx, vec_base, m_off, wn in _sub_tiles:
                 sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
-                if const_expr(_bf16_out):
-                    addr_idx += _atomic_add_acc_vec8_to_buffer(sub8, addrs[addr_idx])
-                else:
-                    addr_idx += _atomic_add_acc_vec8_to_buffer(
-                        sub8, addrs[addr_idx : addr_idx + 2]
-                    )
+                n_slots = 1 if _bf16_out else 2
+                addr_arg = (
+                    addrs[addr_idx] if _bf16_out else addrs[addr_idx : addr_idx + 2]
+                )
+                # Atomics use a raw global ptr (no num_records clip), so predicate
+                # per-lane to skip rows >= M.
+                row = blk_m + warp_m_base + arith.index(m_off) + lane16
+                if_op = scf.IfOp(row < m_idx, [], has_else=False)
+                with ir.InsertionPoint(if_op.then_block):
+                    _atomic_add_acc_vec8_to_buffer(sub8, addr_arg)
+                    scf.YieldOp([])
+                addr_idx += n_slots
 
         def grouped_accs_to_row_major(accs_grouped):
             row_major = [None] * n_accs
@@ -2565,6 +2592,7 @@ def compile_fp8fp4_gemm(
                 num_warps=1,
                 lds_byte_offset=d_warp_off_sgpr,
                 for_store=True,
+                oob_outer_bound=i32_m,
             )
 
         # TDM descriptor lane layout: dgroup0 = [predicate, lds_addr, addr_lo, addr_hi].
@@ -3121,7 +3149,7 @@ def compile_fp8fp4_gemm(
             _ptpc_sa, _ptpc_sb = _ptpc_scale_box[0]
             accs = epilogue_apply_ptpc_scale(accs, _ptpc_sa, _ptpc_sb)
 
-        if const_expr(use_tdm_store):
+        def _emit_tdm_store():
             if const_expr(d_need_epilogue_fence):
                 _pipeline_fence(outstanding=0)
             rocdl.sched_barrier(0)
@@ -3129,7 +3157,8 @@ def compile_fp8fp4_gemm(
             rocdl.s_wait_dscnt(0)
             tdm_ops.tensor_store_2d(d_desc)
             tdm_ops.tensor_wait(0)
-        else:
+
+        def _emit_buffer_store():
             rocdl.sched_barrier(0)
             if const_expr(epi_addrs_box[0] is None):
                 epi_addrs_box[0] = epilogue_prepare_addrs()
@@ -3137,6 +3166,21 @@ def compile_fp8fp4_gemm(
                 epilogue_atomic_adds(accs, epi_addrs_box[0])
             else:
                 epilogue_stores(accs, epi_addrs_box[0])
+
+        if const_expr(use_tdm_store):
+            # Full M-tiles take the fast TDM store; the partial last M-tile
+            # (rows >= M) falls back to the buffer store, whose num_records clip
+            # drops the OOB rows.
+            full_tile = (blk_m + arith.index(tile_m)) <= m_idx
+            if_op = scf.IfOp(full_tile, [], has_else=True)
+            with ir.InsertionPoint(if_op.then_block):
+                _emit_tdm_store()
+                scf.YieldOp([])
+            with ir.InsertionPoint(if_op.else_block):
+                _emit_buffer_store()
+                scf.YieldOp([])
+        else:
+            _emit_buffer_store()
 
     cache_tag = (
         data_format,
@@ -3186,6 +3230,11 @@ def compile_fp8fp4_gemm(
         gx = (i32_m + (tile_m - 1)) // tile_m
         gy = (i32_n + (tile_n - 1)) // tile_n
         gz = split_k
+
+        if const_expr(use_cluster):
+            # Cluster launch needs a cluster-divisible grid; the extra M-tiles
+            # are fully OOB (rows >= M) and the kernel clips them.
+            gx = ((gx + (cluster_m - 1)) // cluster_m) * cluster_m
 
         cluster_arg = (cluster_m, cluster_n, 1) if use_cluster else None
         kernel_mxscale_gemm(
