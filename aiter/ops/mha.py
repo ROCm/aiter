@@ -232,12 +232,16 @@ def gen_mha_fwd_native_splitkv_fake_tensors(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     batch_size, seqlen_q, nhead_q, hdim = q.shape
     o = (
-        torch.empty((batch_size, seqlen_q, nhead_q, hdim), dtype=q.dtype, device=q.device)
+        torch.empty(
+            (batch_size, seqlen_q, nhead_q, hdim), dtype=q.dtype, device=q.device
+        )
         if out is None
         else out
     )
     if return_lse:
-        lse = torch.empty((batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device)
+        lse = torch.empty(
+            (batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+        )
     else:
         lse = torch.empty((0,), dtype=torch.float32, device=q.device)
     return o, lse
@@ -1420,9 +1424,7 @@ def _flash_attn_forward(
         # bias/alibi/swa/dropout/sink/fp8/varlen. See design doc.
         ret = get_gfx() == "gfx942"
         ret = ret and (
-            q.dtype == dtypes.bf16
-            and k.dtype == dtypes.bf16
-            and v.dtype == dtypes.bf16
+            q.dtype == dtypes.bf16 and k.dtype == dtypes.bf16 and v.dtype == dtypes.bf16
         )
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         ret = ret and (hdim_q == 64 and hdim_v == 64)
@@ -1463,7 +1465,9 @@ def _flash_attn_forward(
             )
         )
         if ns > 1:
-            assert ns <= (seqlen_k + 63) // 64, (  # ceil(seqlen_k/64); don't silently clamp
+            assert (
+                ns <= (seqlen_k + 63) // 64
+            ), (  # ceil(seqlen_k/64); don't silently clamp
                 f"num_splits={ns} too large for seqlen_k={seqlen_k}"
             )
             out_, softmax_lse = mha_fwd_native_splitkv(
