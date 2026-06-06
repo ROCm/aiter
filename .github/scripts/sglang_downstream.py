@@ -127,7 +127,7 @@ TESTS = [
         "test_type": "Accuracy (MoRI EP + MTP)",
         "timeout_minutes": 150,
         "extra_exec_args": "",
-        "test_command": "python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --nightly --timeout-per-file 5400",
+        "test_command": "python3 registered/amd/test_moriep_small.py",
         "run_on_pr": True,
         "run_on_schedule": True,
     },
