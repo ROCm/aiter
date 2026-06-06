@@ -1105,10 +1105,13 @@ def flydsl_moe_stage2(
                 dtype=torch_out_dtype,
                 device=inter_states.device,
             )
-        alloc_fn = torch.zeros if accumulate else torch.empty
-        out = alloc_fn(
-            (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
-        )
+        else:
+            alloc_fn = torch.zeros if accumulate else torch.empty
+            out = alloc_fn(
+                (token_num, model_dim),
+                dtype=torch_out_dtype,
+                device=inter_states.device,
+            )
 
     dev = inter_states.device
     flat_a_scale = (
