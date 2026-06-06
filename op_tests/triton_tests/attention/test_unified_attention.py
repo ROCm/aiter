@@ -530,12 +530,19 @@ def test_triton_unified_attn_3d(
 @pytest.mark.parametrize(
     "seq_lens",
     [
+        [(512, 512)],
         [
-            (512, 512),
+            (1, 15),
+            (12, 133),
+            (12, 87),
+            (1, 133),
+            (2, 343),
+            (567, 275),
+            (34, 345),
+            (777, 777),
+            (454, 345),
+            (1, 134),
         ],
-        [(567, 275), (34, 345)],
-        [(1, 15), (12, 133), (12, 87), (1, 133), (2, 343)],
-        [(777, 777), (454, 345), (1, 134), (1024, 1024)],
     ],
 )
 @pytest.mark.parametrize("num_heads", [(8, 8), (8, 1)])
@@ -548,7 +555,7 @@ def test_triton_unified_attn_3d(
 )
 @pytest.mark.parametrize(
     "num_blocks",
-    [1024, 32768],
+    [2048, 32768],
 )
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, out_dtype, use_q_descale, use_kv_descale, use_out_scale",

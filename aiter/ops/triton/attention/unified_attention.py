@@ -740,22 +740,27 @@ def _gfx1250_unified_attention_2d(
     if ALL_DECODE:
         loop_variant = 0
         BLOCK_M = (
-            16 if NUM_QUERIES_PER_KV <= 16 else triton.next_power_of_2(NUM_QUERIES_PER_KV)
+            16
+            if NUM_QUERIES_PER_KV <= 16
+            else triton.next_power_of_2(NUM_QUERIES_PER_KV)
         )
         TILE_SIZE = 128
         num_warps = 1
         waves_per_eu = 2
 
-    num_buffers = 2 if loop_variant == 0 else 3
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
-    # Upper bound on the number of tiles with partial mask
+    # Upper bound on masked tiles. +1 because the causal diagonal isnt
+    # tile-aligned, the query_span-wide band sits at an arbitrary key offset
+    # and can spill into one extra tile
     query_span = (BLOCK_M - 1) // NUM_QUERIES_PER_KV + 1
-    max_mask_tiles = max(1, (query_span + TILE_SIZE - 1) // TILE_SIZE)
+    max_mask_tiles = (query_span + TILE_SIZE - 1) // TILE_SIZE + 1
     # other variants do at most 2 masking at the end of loop
     if max_mask_tiles > 2:
         loop_variant = 0
     total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
     NUM_WARPS = num_warps
+    num_buffers = 2 if loop_variant == 0 else 3
+
     kv_size = k.nelement() * k.element_size()
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = ARCH_NAME != "gfx1250" and kv_size <= MAX_INT32
