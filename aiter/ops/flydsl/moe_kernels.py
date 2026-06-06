@@ -6,7 +6,6 @@
 import functools
 import os
 import re
-
 from typing import Dict, Optional
 
 import torch
@@ -1074,13 +1073,7 @@ def flydsl_moe_stage2(
 
     return_per_slot: when True, return the raw per-(token, slot) output as a
         contiguous (token_num, topk, model_dim) tensor without applying the
-        topk reduction. Forces accumulate=False internally regardless of
-        ``mode``. The caller can recover the combined result via
-        ``(out * topk_weight.unsqueeze(-1)).sum(dim=1)`` when ``sorted_weights``
-        was not applied inside the kernel.
-        If ``out`` is provided, it must be a contiguous 3D tensor of shape
-        (token_num, topk, model_dim) on the same device and dtype as the
-        kernel output; it is zero-initialized before launch.
+        topk reduction.
 
     expert_mask, topk_ids: when both are provided and mode="reduce", the
         post-GEMM reduction fuses the EP validity gather
@@ -1100,8 +1093,6 @@ def flydsl_moe_stage2(
 
     accumulate = mode != "reduce"
     if return_per_slot:
-        # Per-slot mode always uses the direct-store kernel path; the topk
-        # reduction is the caller's responsibility.
         accumulate = False
 
     if a_dtype == "fp4":
@@ -1133,9 +1124,7 @@ def flydsl_moe_stage2(
                     f"{inter_states.device}; got {out.device}"
                 )
             if not out.is_contiguous():
-                raise ValueError(
-                    "return_per_slot=True requires out to be contiguous"
-                )
+                raise ValueError("return_per_slot=True requires out to be contiguous")
             out.zero_()
     elif out is None:
         alloc_fn = torch.zeros if accumulate else torch.empty
