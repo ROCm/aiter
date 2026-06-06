@@ -39,7 +39,6 @@ Causal mask always on. num_tiles = bx + 1 (triangular).
     tdm 192
 """
 
-
 from __future__ import annotations
 
 import functools
@@ -68,39 +67,63 @@ from flydsl.compiler.kernel_function import (
 )
 
 from fmha_prologue_gfx1250 import (
-    _emit_void, _setreg, _build_tdm_dgroup1,
+    _emit_void,
+    _setreg,
+    _build_tdm_dgroup1,
     _split_i64_to_lo_hi,
     _phase4_q_load_flydsl,
     _phase5_head_index_div_flydsl,
-    _compute_k_global_addr, _compute_v_global_addr,
-    BLOCK_SIZE, K_TILE_N,
-    _K_TDM_CONFIG, _V_TDM_CONFIG,
-    K_ROW_BYTES, V_ROW_BYTES,
-    K_SU_HALF_OFFSET, V_SU_HALF_OFFSET,
+    _compute_k_global_addr,
+    _compute_v_global_addr,
+    BLOCK_SIZE,
+    K_TILE_N,
+    _K_TDM_CONFIG,
+    _V_TDM_CONFIG,
+    K_ROW_BYTES,
+    V_ROW_BYTES,
+    K_SU_HALF_OFFSET,
+    V_SU_HALF_OFFSET,
 )
 
 from fmha_core_loop_gfx1250 import (
-    _get_types, _make_v2f32,
+    _get_types,
+    _make_v2f32,
     _pair_k_tiles_for_wmma,
     _load_v_two_sus_from_lds,
     _pair_v_tiles_for_wmma,
-    _qk_pure_su, _pv_pure_su,
-    _load_k_su_from_lds, _sp_tiles_to_sp_pairs,
+    _qk_pure_su,
+    _pv_pure_su,
+    _load_k_su_from_lds,
+    _sp_tiles_to_sp_pairs,
     _softmax_part01_only,
     _build_p_tiles_from_softmax,
-    _cl_su_v3_stage, _cl_su_v3_stage_gemm2,
+    _cl_su_v3_stage,
+    _cl_su_v3_stage_gemm2,
     _build_all_softmax_part2_ops,
     _build_all_softmax_gemm2_ops,
     _atom_s_wait_dscnt,
-    NUM_MSB, WAVE_SIZE,
-    Q_WMMA_PER_MSB, N_WMMA_K_TILES,
-    N_LDS_PER_MSB, N_LDS_V_PER_MSB,
-    N_SP_PAIRS, N_PV_WMMA_N, CNT_SU,
-    SU_K_N, LDS_K_SU_P_SIZE, LDS_V_SU_P_SIZE,
-    KV_K, KV_V, KV_NONE,
-    LDS_INST_COUNT, ALU_STAGES,
-    ALU_PER_STAGE, RLTS_LEN,
-    QK_HDIM, V_HDIM, KV_BPP,
+    NUM_MSB,
+    WAVE_SIZE,
+    Q_WMMA_PER_MSB,
+    N_WMMA_K_TILES,
+    N_LDS_PER_MSB,
+    N_LDS_V_PER_MSB,
+    N_SP_PAIRS,
+    N_PV_WMMA_N,
+    CNT_SU,
+    SU_K_N,
+    LDS_K_SU_P_SIZE,
+    LDS_V_SU_P_SIZE,
+    KV_K,
+    KV_V,
+    KV_NONE,
+    LDS_INST_COUNT,
+    ALU_STAGES,
+    ALU_PER_STAGE,
+    RLTS_LEN,
+    QK_HDIM,
+    V_HDIM,
+    KV_BPP,
     PART2_SPLIT,
     PART2_SETUP_A,
     _rocdl_permlanex16,
@@ -116,19 +139,15 @@ def _if_then(if_op):
             yield if_op.then_block
         finally:
             blk = if_op.then_block
-            if (
-                (not blk.operations)
-                or not isinstance(
-                    blk.operations[-1], scf.YieldOp
-                )
-            ):
+            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
                 scf.YieldOp([])
+
 
 # ============================================================================
 # Constants
 # ============================================================================
 
-TILE_N = K_TILE_N      # 128 — KV tile width
+TILE_N = K_TILE_N  # 128 — KV tile width
 
 # ============================================================================
 # SmemAllocators — 4 separate LDS regions for K/V ping-pong
@@ -154,10 +173,10 @@ _lds_alloc_v_b = SmemAllocator(None, arch="gfx1250", global_sym_name="smem_v_b")
 # 0x9000, last buffer — no segment padding
 _lds_alloc_v_b.ptr = CNT_SU * LDS_V_SU_P_SIZE
 
-TDM_D_TILE_DIM0 = 128 * 2   # 256 bytes per LDS row
+TDM_D_TILE_DIM0 = 128 * 2  # 256 bytes per LDS row
 TDM_D_TENSOR_DIM0 = 128 * 2
 WV_SUBQD = 32
-LDS_D_WV_SIZE = WV_SUBQD * TDM_D_TILE_DIM0 + 1024   # 9216 bytes per wave
+LDS_D_WV_SIZE = WV_SUBQD * TDM_D_TILE_DIM0 + 1024  # 9216 bytes per wave
 
 _lds_allocator = _lds_alloc_k_a
 
@@ -166,9 +185,11 @@ _lds_allocator = _lds_alloc_k_a
 # LDS base extraction helper
 # ============================================================================
 
+
 def _extract_lds_base_i32(memref_base):
     """Extract i32 LDS address from SmemAllocator memref base."""
     from flydsl._mlir.dialects import memref as _memref_d
+
     idx = _memref_d.extract_aligned_pointer_as_index(memref_base)
     return arith.unwrap(arith.index_cast(T.i32, idx))
 
@@ -192,36 +213,48 @@ def _build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
     lane_lo = arith.unwrap(arith.andi(lane_id, arith.constant(0xF, type=T.i32)))
     lane_hi = arith.unwrap(arith.shrui(lane_id, arith.constant(4, type=T.i32)))
 
-    k_lane_off = arith.unwrap(arith.addi(
-        arith.muli(lane_lo, arith.constant(K_ROW_BYTES, type=T.i32)),
-        arith.muli(lane_hi, arith.constant(16, type=T.i32))))
+    k_lane_off = arith.unwrap(
+        arith.addi(
+            arith.muli(lane_lo, arith.constant(K_ROW_BYTES, type=T.i32)),
+            arith.muli(lane_hi, arith.constant(16, type=T.i32)),
+        )
+    )
 
     k_dh0 = arith.unwrap(arith.addi(k_base_i32, k_lane_off))
-    k_dh1 = arith.unwrap(arith.addi(
-        k_dh0,
-        arith.constant(K_SU_HALF_OFFSET, type=T.i32),
-    ))
+    k_dh1 = arith.unwrap(
+        arith.addi(
+            k_dh0,
+            arith.constant(K_SU_HALF_OFFSET, type=T.i32),
+        )
+    )
 
     lane_and_7 = arith.unwrap(arith.andi(lane_id, arith.constant(7, type=T.i32)))
     lane_shr4 = arith.unwrap(arith.shrui(lane_id, arith.constant(4, type=T.i32)))
-    v_row = arith.unwrap(arith.addi(
-        lane_and_7,
-        arith.shli(lane_shr4, arith.constant(3, type=T.i32))))
+    v_row = arith.unwrap(
+        arith.addi(lane_and_7, arith.shli(lane_shr4, arith.constant(3, type=T.i32)))
+    )
 
     lane_shr3 = arith.unwrap(arith.shrui(lane_id, arith.constant(3, type=T.i32)))
-    v_sub_col = arith.unwrap(arith.shli(
-        arith.andi(lane_shr3, arith.constant(1, type=T.i32)),
-        arith.constant(4, type=T.i32)))
+    v_sub_col = arith.unwrap(
+        arith.shli(
+            arith.andi(lane_shr3, arith.constant(1, type=T.i32)),
+            arith.constant(4, type=T.i32),
+        )
+    )
 
-    v_lane_off = arith.unwrap(arith.addi(
-        arith.muli(v_row, arith.constant(V_ROW_BYTES, type=T.i32)),
-        v_sub_col))
+    v_lane_off = arith.unwrap(
+        arith.addi(
+            arith.muli(v_row, arith.constant(V_ROW_BYTES, type=T.i32)), v_sub_col
+        )
+    )
 
     v_dh0 = arith.unwrap(arith.addi(v_base_i32, v_lane_off))
-    v_dh1 = arith.unwrap(arith.addi(
-        v_dh0,
-        arith.constant(V_SU_HALF_OFFSET, type=T.i32),
-    ))
+    v_dh1 = arith.unwrap(
+        arith.addi(
+            v_dh0,
+            arith.constant(V_SU_HALF_OFFSET, type=T.i32),
+        )
+    )
 
     K_COL_D_HALF = QK_HDIM * KV_BPP // 2
     k_dh0_hi = arith.unwrap(arith.addi(k_dh0, arith.constant(K_COL_D_HALF, type=T.i32)))
@@ -233,7 +266,7 @@ def _build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
     # all 8 V SSA values are genuinely distinct → one bank hint each → no
     # allocator conflict.  _build_lds_v_schedule omits these from offset field.
     _V_COL_GROUP = (N_LDS_V_PER_MSB // 2) * 32  # 64 bytes (V_HDIM=128)
-    _V_D_HALF    = V_HDIM * KV_BPP // 2         # 128 bytes
+    _V_D_HALF = V_HDIM * KV_BPP // 2  # 128 bytes
     _V_MSB_EXTRA = [0, _V_D_HALF, _V_COL_GROUP, _V_D_HALF + _V_COL_GROUP]
 
     v_addrs = []
@@ -248,8 +281,8 @@ def _build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
 
     return [
         # K addresses [0..3]: each is a distinct SSA value → one bank hint each
-        set_vgpr_bank(k_dh0,    0),
-        set_vgpr_bank(k_dh1,    1),
+        set_vgpr_bank(k_dh0, 0),
+        set_vgpr_bank(k_dh1, 1),
         set_vgpr_bank(k_dh0_hi, 2),
         set_vgpr_bank(k_dh1_hi, 3),
         # V addresses [4..11]: 8 distinct SSA values, two per MSB bank
@@ -260,8 +293,8 @@ def _build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
 # TDM Priming — Load full tile_n=128 of K+V into LDS
 # ============================================================================
 
-def _build_tdm_descs(dg1, addr_i64, stride_adv_i64,
-                     lds_base, su_p_size, n_su):
+
+def _build_tdm_descs(dg1, addr_i64, stride_adv_i64, lds_base, su_p_size, n_su):
     """Build per-SU TDM descriptors [(dg0, dg1)] without issuing loads.
 
     dg1 can be a single v8i32 (shared across SUs) or a list of n_su v8i32.
@@ -271,10 +304,12 @@ def _build_tdm_descs(dg1, addr_i64, stride_adv_i64,
     cur_addr = addr_i64
     descs = []
     for su in range(n_su):
-        lds_off = arith.unwrap(arith.addi(
-            lds_base,
-            arith.constant(su * su_p_size, type=T.i32),
-        ))
+        lds_off = arith.unwrap(
+            arith.addi(
+                lds_base,
+                arith.constant(su * su_p_size, type=T.i32),
+            )
+        )
         addr_lo, addr_hi = _split_i64_to_lo_hi(cur_addr)
         dg0 = vector.from_elements(T.vec(4, T.i32), [pred, lds_off, addr_lo, addr_hi])
         descs.append((dg0, _dg1_list[su]))
@@ -292,10 +327,12 @@ def _issue_tdm_from_descs(descs):
 
 
 def _per_warp_oob_dim1(total_rows_i32, wave_id, rows_per_warp=8):
-    wave_off = arith.unwrap(arith.muli(
-        wave_id,
-        arith.constant(rows_per_warp, type=T.i32),
-    ))
+    wave_off = arith.unwrap(
+        arith.muli(
+            wave_id,
+            arith.constant(rows_per_warp, type=T.i32),
+        )
+    )
     remaining = arith.subi(total_rows_i32, wave_off)
     clamped_lo = arith.maxsi(
         remaining,
@@ -303,50 +340,50 @@ def _per_warp_oob_dim1(total_rows_i32, wave_id, rows_per_warp=8):
     )
     return arith.minsi(
         clamped_lo,
-        arith.unwrap(
-            arith.constant(rows_per_warp, type=T.i32)
-        ),
+        arith.unwrap(arith.constant(rows_per_warp, type=T.i32)),
     )
 
 
-def _make_kv_dg1_with_oob(config_bf16, dim0_elems, dim1_rows,
-                          stride_seq_elems, oob_dim1_raw,
-                          dim0_stride=None):
+def _make_kv_dg1_with_oob(
+    config_bf16, dim0_elems, dim1_rows, stride_seq_elems, oob_dim1_raw, dim0_stride=None
+):
     _i32 = ir.IntegerType.get_signless(32)
-    _td1_lo = arith.andi(oob_dim1_raw,
-        arith.constant(0xFFFF, type=T.i32))
-    _sgpr2 = arith.shli(_td1_lo,
-        arith.constant(16, type=T.i32))
+    _td1_lo = arith.andi(oob_dim1_raw, arith.constant(0xFFFF, type=T.i32))
+    _sgpr2 = arith.shli(_td1_lo, arith.constant(16, type=T.i32))
     if dim0_stride is None:
         dim0_stride = dim0_elems
     return vector.from_elements(
         T.vec(8, T.i32),
-        [arith.constant(config_bf16, type=T.i32),
-         arith.constant(dim0_elems << 16, type=T.i32),
-         _sgpr2,
-         arith.constant(dim0_stride << 16, type=T.i32),
-         arith.constant(dim1_rows, type=T.i32),
-         stride_seq_elems,
-         arith.constant(0, type=T.i32),
-         arith.constant(0, type=T.i32)])
+        [
+            arith.constant(config_bf16, type=T.i32),
+            arith.constant(dim0_elems << 16, type=T.i32),
+            _sgpr2,
+            arith.constant(dim0_stride << 16, type=T.i32),
+            arith.constant(dim1_rows, type=T.i32),
+            stride_seq_elems,
+            arith.constant(0, type=T.i32),
+            arith.constant(0, type=T.i32),
+        ],
+    )
 
 
-def _tdm_load_kv_blk(kv_type, dg1, addr_i64, stride_adv_i64,
-                      lds_base, su_p_size, n_su):
+def _tdm_load_kv_blk(kv_type, dg1, addr_i64, stride_adv_i64, lds_base, su_p_size, n_su):
     """Issue n_su TDM loads for one blk of K or V data.
 
     Each TDM load covers one SU. After all loads, issues barrier.
     dg1 can be a single v8i32 or a list of n_su v8i32 (per-SU OOB).
     """
-    descs = _build_tdm_descs(dg1, addr_i64, stride_adv_i64,
-                             lds_base, su_p_size, n_su)
+    descs = _build_tdm_descs(dg1, addr_i64, stride_adv_i64, lds_base, su_p_size, n_su)
     _issue_tdm_from_descs(descs)
 
 
 def _tdm_load_k_only(
-    ptr_K, k_offset,
-    stride_k_seq, stride_k_32,
-    wave_id, lds_base_i32,
+    ptr_K,
+    k_offset,
+    stride_k_seq,
+    stride_k_32,
+    wave_id,
+    lds_base_i32,
     oob_dg1_list=None,
 ):
     """Load one tile_n=128 of K into LDS via TDM (K only, no V).
@@ -365,42 +402,53 @@ def _tdm_load_k_only(
     # dim0_stride=200: LDS inner stride = 200*2=400B = K_ROW_BYTES.
     # Previous dim0_valid=200 caused OOB reads for the last head of the last
     # token (16 extra bytes past valid K allocation).
-    _DIM0_VALID = QK_HDIM    # 192 — global read width
-    _DIM0_STRIDE = 200       # LDS row stride in elements
-    _DIM1_ROWS = 8           # rows per warp
+    _DIM0_VALID = QK_HDIM  # 192 — global read width
+    _DIM0_STRIDE = 200  # LDS row stride in elements
+    _DIM1_ROWS = 8  # rows per warp
 
     _K_CONFIG_BF16 = (1 << 16) | _K_TDM_CONFIG
-    stride_k_seq_elems = arith.unwrap(arith.shrui(
-        stride_k_seq, arith.constant(1, type=T.i32)))
+    stride_k_seq_elems = arith.unwrap(
+        arith.shrui(stride_k_seq, arith.constant(1, type=T.i32))
+    )
 
-    k_dg1 = oob_dg1_list if oob_dg1_list is not None else vector.from_elements(
-        T.vec(8, T.i32),
-        [arith.constant(_K_CONFIG_BF16, type=T.i32),
-         arith.constant(_DIM0_VALID << 16, type=T.i32),
-         arith.constant(_DIM1_ROWS << 16, type=T.i32),
-         arith.constant(_DIM0_STRIDE << 16, type=T.i32),
-         arith.constant(_DIM1_ROWS, type=T.i32),
-         stride_k_seq_elems,
-         arith.constant(0, type=T.i32),
-         arith.constant(0, type=T.i32)])
+    k_dg1 = (
+        oob_dg1_list
+        if oob_dg1_list is not None
+        else vector.from_elements(
+            T.vec(8, T.i32),
+            [
+                arith.constant(_K_CONFIG_BF16, type=T.i32),
+                arith.constant(_DIM0_VALID << 16, type=T.i32),
+                arith.constant(_DIM1_ROWS << 16, type=T.i32),
+                arith.constant(_DIM0_STRIDE << 16, type=T.i32),
+                arith.constant(_DIM1_ROWS, type=T.i32),
+                stride_k_seq_elems,
+                arith.constant(0, type=T.i32),
+                arith.constant(0, type=T.i32),
+            ],
+        )
+    )
 
     # Per-warp global offset: wave_id * 8 * stride_k_seq bytes
-    k_addr = _compute_k_global_addr(ptr_K, k_offset, wave_id,
-                                     arith.unwrap(arith.muli(
-                                         arith.constant(8, type=T.i32),
-                                         stride_k_seq)))
+    k_addr = _compute_k_global_addr(
+        ptr_K,
+        k_offset,
+        wave_id,
+        arith.unwrap(arith.muli(arith.constant(8, type=T.i32), stride_k_seq)),
+    )
 
     # Per-warp LDS offset: wave_id * 8 * K_ROW_BYTES
     wid_i32 = arith.unwrap(wave_id)
     lds_warp_off = arith.muli(
-        wid_i32,
-        arith.unwrap(arith.constant(8 * K_ROW_BYTES, type=T.i32)))
+        wid_i32, arith.unwrap(arith.constant(8 * K_ROW_BYTES, type=T.i32))
+    )
     lds_base_with_warp = arith.addi(lds_base_i32, lds_warp_off)
 
     k_stride_adv = arith.extsi(i64, arith.unwrap(stride_k_32))
 
-    _tdm_load_kv_blk(KV_K, k_dg1, k_addr, k_stride_adv,
-                      lds_base_with_warp, LDS_K_SU_P_SIZE, CNT_SU)
+    _tdm_load_kv_blk(
+        KV_K, k_dg1, k_addr, k_stride_adv, lds_base_with_warp, LDS_K_SU_P_SIZE, CNT_SU
+    )
 
     rocdl.s_wait_tensorcnt(0)
     rocdl.s_barrier_signal(-1)
@@ -408,9 +456,12 @@ def _tdm_load_k_only(
 
 
 def _tdm_load_v_only(
-    ptr_V, v_offset,
-    stride_v_seq, stride_v_32,
-    wave_id, lds_base_i32,
+    ptr_V,
+    v_offset,
+    stride_v_seq,
+    stride_v_32,
+    wave_id,
+    lds_base_i32,
     oob_dg1_list=None,
 ):
     """Load one tile_n=128 of V into LDS via TDM (V only, no K).
@@ -422,35 +473,46 @@ def _tdm_load_v_only(
 
     _V_CONFIG_BF16 = (1 << 16) | _V_TDM_CONFIG
     _DIM0_ELEMS = 128  # D dimension in bf16 elements
-    _DIM1_ROWS = 8     # rows per warp
-    stride_v_seq_elems = arith.unwrap(arith.shrui(
-        stride_v_seq, arith.constant(1, type=T.i32)))
-    v_dg1 = oob_dg1_list if oob_dg1_list is not None else vector.from_elements(
-        T.vec(8, T.i32),
-        [arith.constant(_V_CONFIG_BF16, type=T.i32),
-         arith.constant(_DIM0_ELEMS << 16, type=T.i32),
-         arith.constant(_DIM1_ROWS << 16, type=T.i32),
-         arith.constant(_DIM0_ELEMS << 16, type=T.i32),
-         arith.constant(_DIM1_ROWS, type=T.i32),
-         stride_v_seq_elems,
-         arith.constant(0, type=T.i32),
-         arith.constant(0, type=T.i32)])
+    _DIM1_ROWS = 8  # rows per warp
+    stride_v_seq_elems = arith.unwrap(
+        arith.shrui(stride_v_seq, arith.constant(1, type=T.i32))
+    )
+    v_dg1 = (
+        oob_dg1_list
+        if oob_dg1_list is not None
+        else vector.from_elements(
+            T.vec(8, T.i32),
+            [
+                arith.constant(_V_CONFIG_BF16, type=T.i32),
+                arith.constant(_DIM0_ELEMS << 16, type=T.i32),
+                arith.constant(_DIM1_ROWS << 16, type=T.i32),
+                arith.constant(_DIM0_ELEMS << 16, type=T.i32),
+                arith.constant(_DIM1_ROWS, type=T.i32),
+                stride_v_seq_elems,
+                arith.constant(0, type=T.i32),
+                arith.constant(0, type=T.i32),
+            ],
+        )
+    )
 
-    v_addr = _compute_v_global_addr(ptr_V, v_offset, wave_id,
-                                     arith.unwrap(arith.muli(
-                                         arith.constant(8, type=T.i32),
-                                         stride_v_seq)))
+    v_addr = _compute_v_global_addr(
+        ptr_V,
+        v_offset,
+        wave_id,
+        arith.unwrap(arith.muli(arith.constant(8, type=T.i32), stride_v_seq)),
+    )
 
     wid_i32 = arith.unwrap(wave_id)
     lds_warp_off = arith.muli(
-        wid_i32,
-        arith.unwrap(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
+        wid_i32, arith.unwrap(arith.constant(8 * V_ROW_BYTES, type=T.i32))
+    )
     lds_base_with_warp = arith.addi(lds_base_i32, lds_warp_off)
 
     v_stride_adv = arith.extsi(i64, arith.unwrap(stride_v_32))
 
-    _tdm_load_kv_blk(KV_V, v_dg1, v_addr, v_stride_adv,
-                      lds_base_with_warp, LDS_V_SU_P_SIZE, CNT_SU)
+    _tdm_load_kv_blk(
+        KV_V, v_dg1, v_addr, v_stride_adv, lds_base_with_warp, LDS_V_SU_P_SIZE, CNT_SU
+    )
 
     rocdl.s_wait_tensorcnt(0)
     rocdl.s_barrier_signal(-1)
@@ -458,8 +520,12 @@ def _tdm_load_v_only(
 
 
 def _manual_load_k_to_lds(
-    ptr_K, k_offset_raw, stride_k_seq,
-    lane_id, wave_id, lds_base_i32,
+    ptr_K,
+    k_offset_raw,
+    stride_k_seq,
+    lane_id,
+    wave_id,
+    lds_base_i32,
 ):
     """Load K tile (4 SUs × 32 rows × K_ROW_BYTES) to LDS via flat_load + ds_write.
 
@@ -484,9 +550,10 @@ def _manual_load_k_to_lds(
 
     tid = arith.addi(
         arith.muli(
-            arith.unwrap(wave_id),
-            arith.unwrap(arith.constant(WAVE_SIZE, type=T.i32))),
-        arith.unwrap(lane_id))
+            arith.unwrap(wave_id), arith.unwrap(arith.constant(WAVE_SIZE, type=T.i32))
+        ),
+        arith.unwrap(lane_id),
+    )
     stride_i64 = arith.extsi(i64, arith.unwrap(stride_k_seq))
     c16 = arith.unwrap(arith.constant(16, type=T.i32))
     k_row_c = arith.unwrap(arith.constant(K_ROW_BYTES, type=T.i32))
@@ -501,26 +568,21 @@ def _manual_load_k_to_lds(
         su_lds_c = arith.unwrap(arith.constant(su * LDS_K_SU_P_SIZE, type=T.i32))
         for j in fx.range_constexpr(N_ITERS):
             p = arith.addi(
-                tid, arith.unwrap(arith.constant(j * BLOCK_SIZE, type=T.i32)))
+                tid, arith.unwrap(arith.constant(j * BLOCK_SIZE, type=T.i32))
+            )
             row = arith.divui(p, c_chunks)
             chunk = arith.remui(p, c_chunks)
 
             global_row = arith.addi(su_row_c, row)
-            g_row_off = arith.muli(
-                arith.extsi(i64, global_row), stride_i64)
-            g_chunk_off = arith.extsi(
-                i64, arith.muli(chunk, c16))
-            g_addr = arith.addi(
-                k_base_i64,
-                arith.addi(g_row_off, g_chunk_off))
+            g_row_off = arith.muli(arith.extsi(i64, global_row), stride_i64)
+            g_chunk_off = arith.extsi(i64, arith.muli(chunk, c16))
+            g_addr = arith.addi(k_base_i64, arith.addi(g_row_off, g_chunk_off))
             gptr = llvm_dialect.inttoptr(glb_ptr_type, g_addr)
             data = llvm_dialect.load(v4i32_ty, gptr)
 
             lds_row_off = arith.muli(row, k_row_c)
             lds_chunk_off = arith.muli(chunk, c16)
-            lds_off = arith.addi(
-                su_lds_c,
-                arith.addi(lds_row_off, lds_chunk_off))
+            lds_off = arith.addi(su_lds_c, arith.addi(lds_row_off, lds_chunk_off))
             lds_addr = arith.addi(lds_base_i32, lds_off)
             lptr = llvm_dialect.inttoptr(lds_ptr_type, lds_addr)
             llvm_dialect.store(data, lptr)
@@ -531,8 +593,12 @@ def _manual_load_k_to_lds(
 
 
 def _manual_load_v_to_lds(
-    ptr_V, v_offset_raw, stride_v_seq,
-    lane_id, wave_id, lds_base_i32,
+    ptr_V,
+    v_offset_raw,
+    stride_v_seq,
+    lane_id,
+    wave_id,
+    lds_base_i32,
 ):
     """Load V tile (4 SUs × 32 rows × 256B) to LDS via flat_load + ds_write.
 
@@ -554,9 +620,10 @@ def _manual_load_v_to_lds(
 
     tid = arith.addi(
         arith.muli(
-            arith.unwrap(wave_id),
-            arith.unwrap(arith.constant(WAVE_SIZE, type=T.i32))),
-        arith.unwrap(lane_id))
+            arith.unwrap(wave_id), arith.unwrap(arith.constant(WAVE_SIZE, type=T.i32))
+        ),
+        arith.unwrap(lane_id),
+    )
     stride_i64 = arith.extsi(i64, arith.unwrap(stride_v_seq))
     c16 = arith.unwrap(arith.constant(16, type=T.i32))
     c4_shift = arith.unwrap(arith.constant(4, type=T.i32))
@@ -568,26 +635,21 @@ def _manual_load_v_to_lds(
         su_lds_c = arith.unwrap(arith.constant(su * LDS_V_SU_P_SIZE, type=T.i32))
         for j in fx.range_constexpr(4):
             p = arith.addi(
-                tid, arith.unwrap(arith.constant(j * BLOCK_SIZE, type=T.i32)))
+                tid, arith.unwrap(arith.constant(j * BLOCK_SIZE, type=T.i32))
+            )
             row = arith.shrui(p, c4_shift)
             chunk = arith.andi(p, c15_mask)
 
             global_row = arith.addi(su_row_c, row)
-            g_row_off = arith.muli(
-                arith.extsi(i64, global_row), stride_i64)
-            g_chunk_off = arith.extsi(
-                i64, arith.muli(chunk, c16))
-            g_addr = arith.addi(
-                v_base_i64,
-                arith.addi(g_row_off, g_chunk_off))
+            g_row_off = arith.muli(arith.extsi(i64, global_row), stride_i64)
+            g_chunk_off = arith.extsi(i64, arith.muli(chunk, c16))
+            g_addr = arith.addi(v_base_i64, arith.addi(g_row_off, g_chunk_off))
             gptr = llvm_dialect.inttoptr(glb_ptr_type, g_addr)
             data = llvm_dialect.load(v4i32_ty, gptr)
 
             lds_row_off = arith.muli(row, v_row_c)
             lds_chunk_off = arith.muli(chunk, c16)
-            lds_off = arith.addi(
-                su_lds_c,
-                arith.addi(lds_row_off, lds_chunk_off))
+            lds_off = arith.addi(su_lds_c, arith.addi(lds_row_off, lds_chunk_off))
             lds_addr = arith.addi(lds_base_i32, lds_off)
             lptr = llvm_dialect.inttoptr(lds_ptr_type, lds_addr)
             llvm_dialect.store(data, lptr)
@@ -598,12 +660,17 @@ def _manual_load_v_to_lds(
 
 
 def _tdm_prime_full_tile(
-    ptr_K, ptr_V,
-    k_offset, v_offset,
-    stride_k_seq, stride_v_seq,
-    stride_k_32, stride_v_32,
+    ptr_K,
+    ptr_V,
+    k_offset,
+    v_offset,
+    stride_k_seq,
+    stride_v_seq,
+    stride_k_32,
+    stride_v_32,
     wave_id,
-    k_lds_base_i32, v_lds_base_i32,
+    k_lds_base_i32,
+    v_lds_base_i32,
 ):
     """Load one full tile_n=128 of K and V into LDS via TDM.
 
@@ -623,12 +690,14 @@ def _tdm_prime_full_tile(
     v_stride_adv = arith.extsi(i64, arith.unwrap(stride_v_32))
 
     # K: 4 SUs (tile_n=128)
-    _tdm_load_kv_blk(KV_K, k_dg1, k_addr, k_stride_adv,
-                      k_lds_base_i32, LDS_K_SU_P_SIZE, CNT_SU)
+    _tdm_load_kv_blk(
+        KV_K, k_dg1, k_addr, k_stride_adv, k_lds_base_i32, LDS_K_SU_P_SIZE, CNT_SU
+    )
 
     # V: 4 SUs
-    _tdm_load_kv_blk(KV_V, v_dg1, v_addr, v_stride_adv,
-                      v_lds_base_i32, LDS_V_SU_P_SIZE, CNT_SU)
+    _tdm_load_kv_blk(
+        KV_V, v_dg1, v_addr, v_stride_adv, v_lds_base_i32, LDS_V_SU_P_SIZE, CNT_SU
+    )
 
     # Wait for all TDM loads
     rocdl.s_wait_tensorcnt(0)
@@ -639,6 +708,7 @@ def _tdm_prime_full_tile(
 # ============================================================================
 # Initial K load from LDS — provides kv_tiles for core_loop entry
 # ============================================================================
+
 
 def _issue_k_loads(ty, kv_lds_addrs, blk, su):
     """Issue ds_load_b128 for one SU of K. Does NOT wait.
@@ -653,8 +723,7 @@ def _issue_k_loads(ty, kv_lds_addrs, blk, su):
     for msb in range(NUM_MSB):
         for v_idx in range(N_LDS_PER_MSB):
             offset = v_idx * 32 + su_off
-            kv_raw[msb][v_idx] = _atom_ds_load_b128(
-                ty, kv_lds_addrs[msb], offset, msb)
+            kv_raw[msb][v_idx] = _atom_ds_load_b128(ty, kv_lds_addrs[msb], offset, msb)
     return kv_raw
 
 
@@ -677,6 +746,7 @@ def _load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
 # ============================================================================
 # Unified FMHA Kernel
 # ============================================================================
+
 
 @functools.lru_cache(maxsize=None)
 def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
@@ -739,14 +809,12 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         # SECTION 1: Prologue — HW Setup + Q Load + Address Gen
         # ================================================================
 
-        _setreg(2074, 2)   # WAVE_SCHED_MODE = 2
+        _setreg(2074, 2)  # WAVE_SCHED_MODE = 2
         rocdl.s_nop(0)
 
         tx = arith.index_cast(T.i32, gpu.thread_id("x"))
         lane_id = arith.andi(tx, arith.constant(31, type=T.i32))
         wave_id = arith.shrui(tx, arith.constant(5, type=T.i32))
-
-
 
         # Grid layout: [B, num_m, H] — batch on x, m-block on y, head on z.
         # Software XCD remap (HipKittens style):
@@ -755,17 +823,17 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         #   XCD i gets wgids [i*(NUM_WGS/8) .. (i+1)*(NUM_WGS/8)-1]
         # → workgroups with nearby new_wgid share the same XCD → K/V cache locality.
         _NUM_XCDS = arith.constant(8, type=T.i32)
-        _raw_bx = arith.index_cast(T.i32, gpu.block_id("x"))   # raw batch
-        _raw_by = arith.index_cast(T.i32, gpu.block_id("y"))   # raw m-block
-        _raw_bz = arith.index_cast(T.i32, gpu.block_id("z"))   # raw head
-        _gdx = arith.unwrap(gpu.grid_dim.x)      # B
-        _gdy = arith.unwrap(gpu.grid_dim.y)      # M
-        _gdz = arith.unwrap(gpu.grid_dim.z)      # H
+        _raw_bx = arith.index_cast(T.i32, gpu.block_id("x"))  # raw batch
+        _raw_by = arith.index_cast(T.i32, gpu.block_id("y"))  # raw m-block
+        _raw_bz = arith.index_cast(T.i32, gpu.block_id("z"))  # raw head
+        _gdx = arith.unwrap(gpu.grid_dim.x)  # B
+        _gdy = arith.unwrap(gpu.grid_dim.y)  # M
+        _gdz = arith.unwrap(gpu.grid_dim.z)  # H
         # flat wgid
-        _wgid = arith.addi(arith.addi(
-            _raw_bx,
-            arith.muli(_gdx, _raw_by)),
-            arith.muli(arith.muli(_gdx, _gdy), _raw_bz))
+        _wgid = arith.addi(
+            arith.addi(_raw_bx, arith.muli(_gdx, _raw_by)),
+            arith.muli(arith.muli(_gdx, _gdy), _raw_bz),
+        )
         # total workgroups
         _num_wgs = arith.muli(arith.muli(_gdx, _gdy), _gdz)
         # Guard: only remap when num_wgs is a positive multiple of NUM_XCDS.
@@ -774,21 +842,23 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         _wgs_per_xcd = arith.divui(_num_wgs, _NUM_XCDS)
         _num_wgs_rem = arith.remui(_num_wgs, _NUM_XCDS)
         _is_gt = arith.cmpi(arith.CmpIPredicate.ugt, _num_wgs, _NUM_XCDS)
-        _is_mul = arith.cmpi(arith.CmpIPredicate.eq,
-                             _num_wgs_rem, arith.constant(0, type=T.i32))
+        _is_mul = arith.cmpi(
+            arith.CmpIPredicate.eq, _num_wgs_rem, arith.constant(0, type=T.i32)
+        )
         _do_remap = arith.andi(_is_gt, _is_mul)
         _new_wgid_remapped = arith.addi(
             arith.muli(arith.remui(_wgid, _NUM_XCDS), _wgs_per_xcd),
-            arith.divui(_wgid, _NUM_XCDS))
+            arith.divui(_wgid, _NUM_XCDS),
+        )
         _new_wgid = arith.select(_do_remap, _new_wgid_remapped, _wgid)
         # decompose back to 3D: x = new%gdx, y = (new/gdx)%gdy, z = new/(gdx*gdy)
         _new_bx = arith.remui(_new_wgid, _gdx)
         _new_tmp = arith.divui(_new_wgid, _gdx)
         _new_by = arith.remui(_new_tmp, _gdy)
         _new_bz = arith.divui(_new_tmp, _gdy)
-        bz = _new_bx    # batch    (grid.x)
-        bx = _new_by    # m-block  (grid.y)
-        by = _new_bz    # head     (grid.z)
+        bz = _new_bx  # batch    (grid.x)
+        bx = _new_by  # m-block  (grid.y)
+        by = _new_bz  # head     (grid.z)
 
         m_start = arith.muli(bx, arith.constant(TILE_N, type=T.i32))
 
@@ -811,35 +881,45 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
         _bz_raw = arith.unwrap(bz)
         _bz1_raw = arith.addi(_bz_raw, arith.unwrap(arith.constant(1, type=T.i32)))
-        q_start_tok = arith.unwrap(rocdl.readfirstlane(
-            T.i32,
-            _load_cu_seqlen(ptr_cu_seqlens_q, _bz_raw),
-        ))
-        q_end_tok = arith.unwrap(rocdl.readfirstlane(
-            T.i32,
-            _load_cu_seqlen(ptr_cu_seqlens_q, _bz1_raw),
-        ))
-        k_start_tok = arith.unwrap(rocdl.readfirstlane(
-            T.i32,
-            _load_cu_seqlen(ptr_cu_seqlens_k, _bz_raw),
-        ))
-        k_end_tok = arith.unwrap(rocdl.readfirstlane(
-            T.i32,
-            _load_cu_seqlen(ptr_cu_seqlens_k, _bz1_raw),
-        ))
-        actual_q_len  = arith.subi(q_end_tok, q_start_tok)
+        q_start_tok = arith.unwrap(
+            rocdl.readfirstlane(
+                T.i32,
+                _load_cu_seqlen(ptr_cu_seqlens_q, _bz_raw),
+            )
+        )
+        q_end_tok = arith.unwrap(
+            rocdl.readfirstlane(
+                T.i32,
+                _load_cu_seqlen(ptr_cu_seqlens_q, _bz1_raw),
+            )
+        )
+        k_start_tok = arith.unwrap(
+            rocdl.readfirstlane(
+                T.i32,
+                _load_cu_seqlen(ptr_cu_seqlens_k, _bz_raw),
+            )
+        )
+        k_end_tok = arith.unwrap(
+            rocdl.readfirstlane(
+                T.i32,
+                _load_cu_seqlen(ptr_cu_seqlens_k, _bz1_raw),
+            )
+        )
+        actual_q_len = arith.subi(q_end_tok, q_start_tok)
         actual_kv_len = arith.subi(k_end_tok, k_start_tok)
 
         def _apply_causal_mask(su_sp_tiles, n_start_fx):
             _lane_lo = arith.andi(lane_id, arith.constant(15, type=T.i32))
             _lane_hi_x8 = arith.muli(
                 arith.shrui(lane_id, arith.constant(4, type=T.i32)),
-                arith.constant(8, type=T.i32))
+                arith.constant(8, type=T.i32),
+            )
             _wave_x32 = arith.muli(wave_id, arith.constant(32, type=T.i32))
             _base = arith.addi(
                 arith.addi(arith.subi(m_start, n_start_fx), _wave_x32),
-                arith.subi(_lane_lo, _lane_hi_x8))
-            _neg_inf_c = arith.constant(float('-inf'), type=T.f32)
+                arith.subi(_lane_lo, _lane_hi_x8),
+            )
+            _neg_inf_c = arith.constant(float("-inf"), type=T.f32)
             for _su in fx.range_constexpr(CNT_SU):
                 for _msb in fx.range_constexpr(NUM_MSB):
                     _off = (_msb // 2) * 16 - _su * 32 - (_msb % 2) * 16
@@ -865,12 +945,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         def _apply_kv_oob_mask(su_sp_tiles, kv_remain_raw):
             _i32 = ir.IntegerType.get_signless(32)
             _f32 = ir.F32Type.get()
+
             def _c(v):
                 return arith.constant(v, type=T.i32)
+
             _lane_hi = arith.shrui(arith.unwrap(lane_id), _c(4))
             _lane_hi_x8 = arith.muli(_lane_hi, _c(8))
             _base = arith.subi(arith.subi(kv_remain_raw, _c(1)), _lane_hi_x8)
-            _neg_inf = arith.constant(float('-inf'), type=T.f32)
+            _neg_inf = arith.constant(float("-inf"), type=T.f32)
             for _su in fx.range_constexpr(CNT_SU):
                 for _msb in fx.range_constexpr(NUM_MSB):
                     _col_base_val = _su * 32 + (_msb % 2) * 16
@@ -887,38 +969,57 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         # ================================================================
         # OOB protection: pre-compute per-block dg1 lists for TDM loads
         # ================================================================
-        _stride_k_elems_oob = arith.unwrap(arith.shrui(
-            stride_k_seq, arith.constant(1, type=T.i32)))
-        _stride_v_elems_oob = arith.unwrap(arith.shrui(
-            stride_v_seq, arith.constant(1, type=T.i32)))
+        _stride_k_elems_oob = arith.unwrap(
+            arith.shrui(stride_k_seq, arith.constant(1, type=T.i32))
+        )
+        _stride_v_elems_oob = arith.unwrap(
+            arith.shrui(stride_v_seq, arith.constant(1, type=T.i32))
+        )
         _K_CFG_OOB = (1 << 16) | _K_TDM_CONFIG
         _V_CFG_OOB = (1 << 16) | _V_TDM_CONFIG
         m_start_raw = arith.unwrap(m_start)
 
         _k_oob_dg1 = [
             _make_kv_dg1_with_oob(
-                _K_CFG_OOB, QK_HDIM, 8, _stride_k_elems_oob,
+                _K_CFG_OOB,
+                QK_HDIM,
+                8,
+                _stride_k_elems_oob,
                 _per_warp_oob_dim1(
-                    arith.subi(actual_kv_len,
-                        arith.unwrap(arith.constant(_su * 32, type=T.i32))),
-                    wave_id, 8),
-                dim0_stride=200)
+                    arith.subi(
+                        actual_kv_len,
+                        arith.unwrap(arith.constant(_su * 32, type=T.i32)),
+                    ),
+                    wave_id,
+                    8,
+                ),
+                dim0_stride=200,
+            )
             for _su in range(CNT_SU)
         ]
         _v_oob_dg1 = [
             _make_kv_dg1_with_oob(
-                _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
+                _V_CFG_OOB,
+                128,
+                8,
+                _stride_v_elems_oob,
                 _per_warp_oob_dim1(
-                    arith.subi(actual_kv_len,
-                        arith.unwrap(arith.constant(_su * 32, type=T.i32))),
-                    wave_id, 8))
+                    arith.subi(
+                        actual_kv_len,
+                        arith.unwrap(arith.constant(_su * 32, type=T.i32)),
+                    ),
+                    wave_id,
+                    8,
+                ),
+            )
             for _su in range(CNT_SU)
         ]
         # THD: clamp q_remain to ≥ 0 so excess workgroups (m_start >= actual_q_len)
         # write nothing.
         _q_remain_raw = arith.subi(actual_q_len, m_start_raw)
         _q_remain_o = arith.maxsi(
-            _q_remain_raw, arith.unwrap(arith.constant(0, type=T.i32)))
+            _q_remain_raw, arith.unwrap(arith.constant(0, type=T.i32))
+        )
         _o_oob_dim1 = _per_warp_oob_dim1(_q_remain_o, wave_id, 32)
 
         # THD: skip workgroups whose m_start >= actual_q_len (no valid tokens for this
@@ -927,8 +1028,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         # _wg_valid.
         _wg_valid = arith.cmpi(arith.CmpIPredicate.slt, m_start_raw, actual_q_len)
         # ---- seqlen_k == 0: zero-fill output for valid Q rows, then skip compute ----
-        _kv_is_zero = arith.cmpi(arith.CmpIPredicate.eq, actual_kv_len,
-                                 arith.unwrap(arith.constant(0, type=T.i32)))
+        _kv_is_zero = arith.cmpi(
+            arith.CmpIPredicate.eq,
+            actual_kv_len,
+            arith.unwrap(arith.constant(0, type=T.i32)),
+        )
         _need_zero = arith.andi(_wg_valid, _kv_is_zero)
         _if_zero_fill = scf.IfOp(arith.unwrap(_need_zero))
         with _if_then(_if_zero_fill):
@@ -937,43 +1041,52 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             _i32z = ir.IntegerType.get_signless(32)
             _v4i32z = ir.VectorType.get([4], _i32z)
             from flydsl._mlir.dialects import fly as _fly_z
+
             _o_raw_z = ptr_O.__extract_to_ir_values__()[0]
             _o_gp_z = _fly_z.extract_aligned_pointer_as_index(_glbpz, _o_raw_z)
             _o_base_z = llvm_dialect.ptrtoint(_i64z, _o_gp_z)
             _tid_z = arith.addi(
                 arith.muli(
                     arith.unwrap(wave_id),
-                    arith.unwrap(arith.constant(WAVE_SIZE, type=T.i32))),
-                arith.unwrap(lane_id))
+                    arith.unwrap(arith.constant(WAVE_SIZE, type=T.i32)),
+                ),
+                arith.unwrap(lane_id),
+            )
             _zero_v4 = arith.unwrap(arith.constant_vector(0, T.vec(4, T.i32)))
             _q_rows = arith.subi(actual_q_len, m_start_raw)
             _q_rows_clamped = arith.maxsi(
-                _q_rows, arith.unwrap(arith.constant(0, type=T.i32)))
-            _q_tok_z = arith.addi(
-                q_start_tok,
-                arith.addi(m_start_raw, _tid_z))
+                _q_rows, arith.unwrap(arith.constant(0, type=T.i32))
+            )
+            _q_tok_z = arith.addi(q_start_tok, arith.addi(m_start_raw, _tid_z))
             _valid_z = arith.cmpi(arith.CmpIPredicate.slt, _tid_z, _q_rows_clamped)
             _if_valid_z = scf.IfOp(_valid_z)
             with _if_then(_if_valid_z):
                 _elem_off_z = arith.addi(
                     arith.muli(arith.unwrap(by), stride_o_head),
-                    arith.muli(_q_tok_z, stride_o_seq))
+                    arith.muli(_q_tok_z, stride_o_seq),
+                )
                 _byte_off_z = arith.muli(
-                    _elem_off_z,
-                    arith.unwrap(arith.constant(2, type=T.i32)))
+                    _elem_off_z, arith.unwrap(arith.constant(2, type=T.i32))
+                )
                 _byte_off_z64 = arith.extsi(_i64z, _byte_off_z)
                 _o_addr_z = arith.addi(_o_base_z, _byte_off_z64)
                 for _chunk_z in fx.range_constexpr(V_HDIM // 8):
                     _chunk_addr = arith.addi(
                         _o_addr_z,
-                        arith.extsi(_i64z,
-                            arith.unwrap(arith.constant(_chunk_z * 16, type=T.i32))))
+                        arith.extsi(
+                            _i64z,
+                            arith.unwrap(arith.constant(_chunk_z * 16, type=T.i32)),
+                        ),
+                    )
                     _ptr_z = llvm_dialect.inttoptr(_glbpz, _chunk_addr)
                     llvm_dialect.store(_zero_v4, _ptr_z)
 
         # Gate the main compute path: need valid Q rows AND non-zero K/V length.
-        _kv_nonzero = arith.cmpi(arith.CmpIPredicate.sgt, actual_kv_len,
-                                  arith.unwrap(arith.constant(0, type=T.i32)))
+        _kv_nonzero = arith.cmpi(
+            arith.CmpIPredicate.sgt,
+            actual_kv_len,
+            arith.unwrap(arith.constant(0, type=T.i32)),
+        )
         _wg_valid_compute = arith.andi(_wg_valid, _kv_nonzero)
         _if_wg = scf.IfOp(arith.unwrap(_wg_valid_compute))
         with _if_then(_if_wg):
@@ -983,23 +1096,28 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 q_start_tok,
                 arith.muli(
                     arith.unwrap(bx),
-                    arith.unwrap(
-                        arith.constant(128, type=T.i32)
-                    ),
-                ))
+                    arith.unwrap(arith.constant(128, type=T.i32)),
+                ),
+            )
             q_offset = arith.addi(
                 arith.muli(_q_tok, stride_q_seq),
-                arith.muli(arith.unwrap(by), stride_q_head))
+                arith.muli(arith.unwrap(by), stride_q_head),
+            )
             _q_num_bytes = arith.muli(q_end_tok, stride_q_seq)
             q_rsrc = buffer_ops.create_buffer_resource(
-                ptr_Q, num_records_bytes=_q_num_bytes)
+                ptr_Q, num_records_bytes=_q_num_bytes
+            )
 
             # Q load → q_frags[4 bank][2 frag] v16bf16
             # Pass q_offset (byte offset for this workgroup's Q tile) so WG>0 reads
             # correct rows
             q_frags_raw = _phase4_q_load_flydsl(
-                lane_id, arith.unwrap(q_rsrc), stride_q_seq, wave_id,
-                q_tile_offset_bytes=q_offset)
+                lane_id,
+                arith.unwrap(q_rsrc),
+                stride_q_seq,
+                wave_id,
+                q_tile_offset_bytes=q_offset,
+            )
             rocdl.sched_barrier(0)
 
             # Bridge prologue q_frags[4 bank][frags_per_bank] → core loop q_tiles[4
@@ -1013,16 +1131,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # frags_per_bank = len(q_frags_raw[0]) = Q_WMMA_PER_MSB//2 (3 for 192-dim)
             _frags_per_bank = len(q_frags_raw[0])  # e.g. 3 for 192-dim, 2 for 128-dim
             q_frags = [[None] * Q_WMMA_PER_MSB for _ in range(NUM_MSB)]
-            _pad = [None] * (
-                Q_WMMA_PER_MSB - 2 * _frags_per_bank
-            )
-            q_frags[0] = (
-                q_frags_raw[0] + q_frags_raw[1] + _pad
-            )
-            q_frags[2] = (
-                q_frags_raw[2] + q_frags_raw[3] + _pad
-            )
-
+            _pad = [None] * (Q_WMMA_PER_MSB - 2 * _frags_per_bank)
+            q_frags[0] = q_frags_raw[0] + q_frags_raw[1] + _pad
+            q_frags[2] = q_frags_raw[2] + q_frags_raw[3] + _pad
 
             # Head index (for GQA)
             head_index = _phase5_head_index_div_flydsl(by, gqa)
@@ -1031,10 +1142,12 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # THD: K/V batch offset = k_start_tok * stride_{k,v}_seq
             k_offset = arith.addi(
                 arith.muli(k_start_tok, stride_k_seq),
-                arith.muli(arith.unwrap(head_index), stride_k_head))
+                arith.muli(arith.unwrap(head_index), stride_k_head),
+            )
             v_offset = arith.addi(
                 arith.muli(k_start_tok, stride_v_seq),
-                arith.muli(arith.unwrap(head_index), stride_v_head))
+                arith.muli(arith.unwrap(head_index), stride_v_head),
+            )
 
             # SmemAllocator bases → i32 LDS addresses
             k_a_base_i32 = _extract_lds_base_i32(_lds_alloc_k_a.get_base())
@@ -1057,14 +1170,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             scale = arith.mulf(log2e_val, scalar_f)
             idx_0 = arith.unwrap(arith.constant(0, type=T.i32))
             idx_1 = arith.unwrap(arith.constant(1, type=T.i32))
-            v2f32_ty = ty['v2f32']
+            v2f32_ty = ty["v2f32"]
             pair_undef = llvm_dialect.mlir_undef(v2f32_ty)
             pair_v = llvm_dialect.insertelement(pair_undef, scale, idx_0)
             scale_pair = llvm_dialect.insertelement(pair_v, scale, idx_1)
 
             sgpr_state = {
-                's_log2e_scl': scale,
-                's_log2e_scl_pair': scale_pair,
+                "s_log2e_scl": scale,
+                "s_log2e_scl_pair": scale_pair,
             }
 
             # ================================================================
@@ -1080,15 +1193,20 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # No PV in prologue. PART2 + PV run in core_loop iterations.
 
             zero_f32 = arith.unwrap(arith.constant(0.0, type=T.f32))
-            neg_inf = arith.unwrap(arith.constant(float('-inf'), type=T.f32))
+            neg_inf = arith.unwrap(arith.constant(float("-inf"), type=T.f32))
             zero_v8f32 = arith.unwrap(arith.constant_vector(0.0, T.vec(8, T.f32)))
 
             # -- 2a: Load K(tile 0) → K_a (ping buffer) --
             rocdl.sched_barrier(0)
             _tdm_load_k_only(
-                ptr_K, k_offset, stride_k_seq, stride_k_32,
-                wave_id, k_a_base_i32,
-                oob_dg1_list=_k_oob_dg1)
+                ptr_K,
+                k_offset,
+                stride_k_seq,
+                stride_k_32,
+                wave_id,
+                k_a_base_i32,
+                oob_dg1_list=_k_oob_dg1,
+            )
             rocdl.sched_barrier(0)
 
             # -- 2b: QK_pure for all 4 SUs --
@@ -1101,12 +1219,16 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 fresh_sp = _qk_pure_su(ty, 0, su, q_frags, kv_tiles_su, fresh_sp)
                 all_su_sp_tiles.append(fresh_sp)
 
-
             # -- 2c: Load V(tile 0) → V_a (ping buffer) --
             _tdm_load_v_only(
-                ptr_V, v_offset, stride_v_seq, stride_v_32,
-                wave_id, v_a_base_i32,
-                oob_dg1_list=_v_oob_dg1)
+                ptr_V,
+                v_offset,
+                stride_v_seq,
+                stride_v_32,
+                wave_id,
+                v_a_base_i32,
+                oob_dg1_list=_v_oob_dg1,
+            )
 
             # -- 2d': causal mask on prologue tile (n_start=0) --
             # Bottom-right aligned: shift n_start by -(sk - sq) so the diagonal
@@ -1114,7 +1236,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             _causal_offset = arith.subi(actual_kv_len, actual_q_len)
             if const_expr(IS_CAUSAL):
                 _pro_causal_n = arith.subi(
-                    arith.unwrap(arith.constant(0, type=T.i32)), _causal_offset)
+                    arith.unwrap(arith.constant(0, type=T.i32)), _causal_offset
+                )
                 _apply_causal_mask(all_su_sp_tiles, _pro_causal_n)
 
             # -- 2d'': KV OOB mask on prologue tile --
@@ -1127,22 +1250,21 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # Pin each MSB's scalar state to its own VGPR bank for the
             # "全-bankN" (0x00/0x55/0xAA/0xFF) MSB allocation pattern.
             softmax_state_pro = {
-                'old_max': [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
-                'local_max': [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
-                'delta': [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
-                'exp_delta': [None] * NUM_MSB,
-                'cur_max_log2e': [None] * NUM_MSB,
-                'cur_max_log2e_1': [None] * NUM_MSB,
-                'cur_max_log2e_scalar': [None] * NUM_MSB,
-                'cur_max_log2e_dup': [None] * NUM_MSB,
-                'vgpr_log2e_scl_pair': [None] * NUM_MSB,
-                'exp_delta_dup': [None] * NUM_MSB,
-                'row_sums': [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
-                'p_bf16': [[], [], [], []],
-                'sp_pairs_prev': sp_pairs_all_pro,
+                "old_max": [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
+                "local_max": [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
+                "delta": [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
+                "exp_delta": [None] * NUM_MSB,
+                "cur_max_log2e": [None] * NUM_MSB,
+                "cur_max_log2e_1": [None] * NUM_MSB,
+                "cur_max_log2e_scalar": [None] * NUM_MSB,
+                "cur_max_log2e_dup": [None] * NUM_MSB,
+                "vgpr_log2e_scl_pair": [None] * NUM_MSB,
+                "exp_delta_dup": [None] * NUM_MSB,
+                "row_sums": [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
+                "p_bf16": [[], [], [], []],
+                "sp_pairs_prev": sp_pairs_all_pro,
             }
-            _softmax_part01_only(
-                ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state)
+            _softmax_part01_only(ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state)
 
             # -- 2e': PART2 first half for tile 0 --
             # Runs ops 0..PART2_SPLIT-1: setup(7)+pkfma(16)+pair_exp(8) = 31 ops/MSB.
@@ -1152,7 +1274,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # pro_exp_delta seeds the O-rescale iter_arg for the first core_loop
             # iteration.
             _pro_part2_ops = _build_all_softmax_part2_ops(
-                ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state)
+                ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state
+            )
             for _m in fx.range_constexpr(NUM_MSB):
                 for _op in _pro_part2_ops[_m][:PART2_SPLIT]:
                     _op()
@@ -1160,9 +1283,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # -- 2f: Prefetch K(tile 1) → K_b if available --
             tile_n_const = arith.unwrap(arith.constant(TILE_N, type=T.i32))
             _kv_tiles_avail = arith.divui(
-                arith.addi(actual_kv_len,
-                    arith.unwrap(arith.constant(TILE_N - 1, type=T.i32))),
-                tile_n_const)
+                arith.addi(
+                    actual_kv_len, arith.unwrap(arith.constant(TILE_N - 1, type=T.i32))
+                ),
+                tile_n_const,
+            )
             if const_expr(IS_CAUSAL):
                 # Causal (bottom-right aligned): the last Q row (m_start + TILE_N - 1)
                 # attends to the last K row (actual_kv_len - 1).  The first Q row in
@@ -1171,11 +1296,15 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # So the number of KV tiles needed is:
                 _sk_sq_diff = arith.subi(actual_kv_len, actual_q_len)
                 _sk_sq_tiles = arith.divui(
-                    arith.addi(_sk_sq_diff,
-                        arith.unwrap(arith.constant(TILE_N - 1, type=T.i32))),
-                    tile_n_const)
+                    arith.addi(
+                        _sk_sq_diff,
+                        arith.unwrap(arith.constant(TILE_N - 1, type=T.i32)),
+                    ),
+                    tile_n_const,
+                )
                 _bx_plus_1 = arith.addi(
-                    arith.unwrap(bx), arith.unwrap(arith.constant(1, type=T.i32)))
+                    arith.unwrap(bx), arith.unwrap(arith.constant(1, type=T.i32))
+                )
                 _causal_tiles = arith.addi(_bx_plus_1, _sk_sq_tiles)
                 num_tiles = arith.minui(_causal_tiles, _kv_tiles_avail)
             else:
@@ -1192,22 +1321,36 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             rocdl.sched_barrier(0)
             _k_tile1_stride = arith.muli(tile_n_const, stride_k_seq)
             _k_tile1_offset = arith.addi(arith.unwrap(k_offset), _k_tile1_stride)
-            _kv_remain_t1 = arith.subi(actual_kv_len,
-                arith.unwrap(arith.constant(TILE_N, type=T.i32)))
+            _kv_remain_t1 = arith.subi(
+                actual_kv_len, arith.unwrap(arith.constant(TILE_N, type=T.i32))
+            )
             _k_tile1_oob_dg1 = [
                 _make_kv_dg1_with_oob(
-                    _K_CFG_OOB, QK_HDIM, 8, _stride_k_elems_oob,
+                    _K_CFG_OOB,
+                    QK_HDIM,
+                    8,
+                    _stride_k_elems_oob,
                     _per_warp_oob_dim1(
-                        arith.subi(_kv_remain_t1,
-                            arith.unwrap(arith.constant(_su * 32, type=T.i32))),
-                        wave_id, 8),
-                    dim0_stride=200)
+                        arith.subi(
+                            _kv_remain_t1,
+                            arith.unwrap(arith.constant(_su * 32, type=T.i32)),
+                        ),
+                        wave_id,
+                        8,
+                    ),
+                    dim0_stride=200,
+                )
                 for _su in range(CNT_SU)
             ]
             _tdm_load_k_only(
-                ptr_K, _k_tile1_offset, stride_k_seq, stride_k_32,
-                wave_id, k_b_base_i32,
-                oob_dg1_list=_k_tile1_oob_dg1)
+                ptr_K,
+                _k_tile1_offset,
+                stride_k_seq,
+                stride_k_32,
+                wave_id,
+                k_b_base_i32,
+                oob_dg1_list=_k_tile1_oob_dg1,
+            )
             rocdl.sched_barrier(0)
 
             # -- 2g: Load K(su=0) from K_b for core_loop entry --
@@ -1216,14 +1359,18 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # Prologue results: PART0+PART1+PART2 first half done.
             # old_max = local_max (set by PART2 setup op0); row_sums rescaled
             # (×exp_delta).
-            pro_old_max = [softmax_state_pro['old_max'][m]
-                           for m in fx.range_constexpr(NUM_MSB)]
-            pro_row_sums = [softmax_state_pro['row_sums'][m]
-                            for m in fx.range_constexpr(NUM_MSB)]
-            pro_local_max = [softmax_state_pro['local_max'][m]
-                             for m in fx.range_constexpr(NUM_MSB)]
-            pro_delta = [softmax_state_pro['delta'][m]
-                         for m in fx.range_constexpr(NUM_MSB)]
+            pro_old_max = [
+                softmax_state_pro["old_max"][m] for m in fx.range_constexpr(NUM_MSB)
+            ]
+            pro_row_sums = [
+                softmax_state_pro["row_sums"][m] for m in fx.range_constexpr(NUM_MSB)
+            ]
+            pro_local_max = [
+                softmax_state_pro["local_max"][m] for m in fx.range_constexpr(NUM_MSB)
+            ]
+            pro_delta = [
+                softmax_state_pro["delta"][m] for m in fx.range_constexpr(NUM_MSB)
+            ]
 
             # Partial sp_pairs after first half: yield as separate lo+hi f32 scalars.
             # Prologue runs pair_exp sequentially (correct v2f32), so extractelement is
@@ -1232,18 +1379,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             pro_partial_sp_hi_flat = []
             for _m in fx.range_constexpr(NUM_MSB):
                 for _i in fx.range_constexpr(N_SP_PAIRS):
-                    _idx0 = arith.unwrap(
-                        arith.constant(0, type=T.i32)
-                    )
+                    _idx0 = arith.unwrap(arith.constant(0, type=T.i32))
                     pro_partial_sp_lo_flat.append(
                         llvm_dialect.extractelement(
                             sp_pairs_all_pro[_m][_i],
                             _idx0,
                         )
                     )
-                    _idx1 = arith.unwrap(
-                        arith.constant(1, type=T.i32)
-                    )
+                    _idx1 = arith.unwrap(arith.constant(1, type=T.i32))
                     pro_partial_sp_hi_flat.append(
                         llvm_dialect.extractelement(
                             sp_pairs_all_pro[_m][_i],
@@ -1253,8 +1396,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             pro_partial_sp_flat = pro_partial_sp_lo_flat + pro_partial_sp_hi_flat
             # exp_delta from PART2 setup (used by first core_loop iteration's O
             # rescale).
-            pro_exp_delta = [softmax_state_pro['exp_delta'][_m]
-                             for _m in fx.range_constexpr(NUM_MSB)]
+            pro_exp_delta = [
+                softmax_state_pro["exp_delta"][_m] for _m in fx.range_constexpr(NUM_MSB)
+            ]
 
             # Flatten kv_tiles_init[4 msb][2] → 8 v16bf16
             kv_flat_init = []
@@ -1280,22 +1424,21 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             #
             # O tiles start as zeros (no PV in prologue).
 
-
             def _core_loop(
                 ty,
                 memload,
-                q_tiles,        # [4 msb][Q_WMMA_PER_MSB] v16bf16 — Q data
-                kv_tiles,       # [4 msb][2] v16bf16 — paired K tiles for WMMA
-                sp_tiles,       # [4 msb][1] v8f32 — QK accumulators
+                q_tiles,  # [4 msb][Q_WMMA_PER_MSB] v16bf16 — Q data
+                kv_tiles,  # [4 msb][2] v16bf16 — paired K tiles for WMMA
+                sp_tiles,  # [4 msb][1] v8f32 — QK accumulators
                 # [4 d_msb][N_PV_WMMA_N] v8f32 -- O accum
                 o_tiles,
                 # [8] i32 -- [K_cur[0:4] + V_cur[4:8]]
                 kv_lds_addrs,
-                tdm_state,      # TDM SGPR descriptors
+                tdm_state,  # TDM SGPR descriptors
                 # Softmax state (old_max, local_max, etc.)
                 softmax_state,
-                sgpr_state,     # SGPR refs (s_log2e_scl)
-                gemm2=True,     # run GEMM2 stages?
+                sgpr_state,  # SGPR refs (s_log2e_scl)
+                gemm2=True,  # run GEMM2 stages?
                 # V global offset for TDM (cur -> next V)
                 tdm_v_offset=None,
                 # K global offset for TDM (next -> next K)
@@ -1337,7 +1480,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
                 Returns: (sp_tiles, kv_tiles, o_tiles, su_sp_tiles_list).
                 """
-                _atom_s_wait_dscnt(LDS_INST_COUNT // 2)   # s_wait_dscnt 0x8
+                _atom_s_wait_dscnt(LDS_INST_COUNT // 2)  # s_wait_dscnt 0x8
 
                 v_tiles_out = None
                 blk = 0
@@ -1346,7 +1489,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # GEMM1 (QK): 4 stages (SU 0..3)
                 # Interleave PART2 on sp_pairs_prev during GEMM1 stages.
                 # ================================================================
-                sp_pairs_all = softmax_state.get('sp_pairs_prev', None)
+                sp_pairs_all = softmax_state.get("sp_pairs_prev", None)
                 if const_expr(sp_pairs_all is None):
                     sp_pairs_all = [[None] * N_SP_PAIRS for _ in range(NUM_MSB)]
 
@@ -1354,7 +1497,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # if const_expr(sp_pairs_all[2][0] is not None):
 
                 softmax_ops_by_msb = _build_all_softmax_part2_ops(
-                    ty, 0, sp_pairs_all, softmax_state, sgpr_state)
+                    ty, 0, sp_pairs_all, softmax_state, sgpr_state
+                )
                 # Second half starts at PART2_SPLIT; first half ran in previous GEMM2.
                 softmax_idx_by_msb = [PART2_SPLIT] * NUM_MSB
 
@@ -1365,9 +1509,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # correctly-rescaled value from the previous GEMM2's PART2 first half.
                 for _m in fx.range_constexpr(NUM_MSB):
                     # ops 0..5, skip op 6
-                    for _i in fx.range_constexpr(
-                        PART2_SETUP_A - 1
-                    ):
+                    for _i in fx.range_constexpr(PART2_SETUP_A - 1):
                         softmax_ops_by_msb[_m][_i]()
 
                 # Build TDM descriptors for GEMM1 stages 0-1.
@@ -1379,83 +1521,107 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 if has_tdm_k_g1:
                     i64 = ir.IntegerType.get_signless(64)
                     _K_CFG = (1 << 16) | _K_TDM_CONFIG
-                    _stride_k_elems = arith.unwrap(arith.shrui(
-                        stride_k_seq, arith.constant(1, type=T.i32)))
+                    _stride_k_elems = arith.unwrap(
+                        arith.shrui(stride_k_seq, arith.constant(1, type=T.i32))
+                    )
                     if const_expr(loop_k_oob_dg1 is not None):
                         k_dg1 = loop_k_oob_dg1
                     else:
                         k_dg1 = vector.from_elements(
                             T.vec(8, T.i32),
-                            [arith.constant(_K_CFG, type=T.i32),
-                             arith.constant(QK_HDIM << 16, type=T.i32),
-                             arith.constant(8 << 16, type=T.i32),
-                             arith.constant(200 << 16, type=T.i32),
-                             arith.constant(8, type=T.i32),
-                             _stride_k_elems,
-                             arith.constant(0, type=T.i32),
-                             arith.constant(0, type=T.i32)])
+                            [
+                                arith.constant(_K_CFG, type=T.i32),
+                                arith.constant(QK_HDIM << 16, type=T.i32),
+                                arith.constant(8 << 16, type=T.i32),
+                                arith.constant(200 << 16, type=T.i32),
+                                arith.constant(8, type=T.i32),
+                                _stride_k_elems,
+                                arith.constant(0, type=T.i32),
+                                arith.constant(0, type=T.i32),
+                            ],
+                        )
                     k_addr = _compute_k_global_addr(
-                        ptr_K, tdm_k_offset, wave_id,
-                        arith.unwrap(arith.muli(
-                            arith.constant(8, type=T.i32), stride_k_seq)))
-                    k_stride_adv = arith.extsi(
-                        i64, arith.unwrap(stride_k_32))
+                        ptr_K,
+                        tdm_k_offset,
+                        wave_id,
+                        arith.unwrap(
+                            arith.muli(arith.constant(8, type=T.i32), stride_k_seq)
+                        ),
+                    )
+                    k_stride_adv = arith.extsi(i64, arith.unwrap(stride_k_32))
                     _wid_k = arith.unwrap(wave_id)
                     _k_warp_off = arith.muli(
                         _wid_k,
-                        arith.unwrap(arith.constant(8 * K_ROW_BYTES, type=T.i32)))
+                        arith.unwrap(arith.constant(8 * K_ROW_BYTES, type=T.i32)),
+                    )
                     _k_lds_base = arith.addi(tdm_k_target, _k_warp_off)
                     k_descs = _build_tdm_descs(
-                        k_dg1, k_addr, k_stride_adv,
-                        _k_lds_base, LDS_K_SU_P_SIZE, CNT_SU)
-                    tdm_state['k_descs'] = k_descs
-                    tdm_state['k_desc_idx'] = 0
+                        k_dg1,
+                        k_addr,
+                        k_stride_adv,
+                        _k_lds_base,
+                        LDS_K_SU_P_SIZE,
+                        CNT_SU,
+                    )
+                    tdm_state["k_descs"] = k_descs
+                    tdm_state["k_desc_idx"] = 0
 
                 if has_tdm_v_g1:
                     i64 = ir.IntegerType.get_signless(64)
                     _V_CFG = (1 << 16) | _V_TDM_CONFIG
-                    _stride_v_elems = arith.unwrap(arith.shrui(
-                        stride_v_seq, arith.constant(1, type=T.i32)))
+                    _stride_v_elems = arith.unwrap(
+                        arith.shrui(stride_v_seq, arith.constant(1, type=T.i32))
+                    )
                     if const_expr(endtile_v_dg1 is not None):
                         v_dg1 = endtile_v_dg1
                     else:
                         v_dg1 = vector.from_elements(
                             T.vec(8, T.i32),
-                            [arith.constant(_V_CFG, type=T.i32),
-                             arith.constant(128 << 16, type=T.i32),
-                             arith.constant(8 << 16, type=T.i32),
-                             arith.constant(128 << 16, type=T.i32),
-                             arith.constant(8, type=T.i32),
-                             _stride_v_elems,
-                             arith.constant(0, type=T.i32),
-                             arith.constant(0, type=T.i32)])
+                            [
+                                arith.constant(_V_CFG, type=T.i32),
+                                arith.constant(128 << 16, type=T.i32),
+                                arith.constant(8 << 16, type=T.i32),
+                                arith.constant(128 << 16, type=T.i32),
+                                arith.constant(8, type=T.i32),
+                                _stride_v_elems,
+                                arith.constant(0, type=T.i32),
+                                arith.constant(0, type=T.i32),
+                            ],
+                        )
                     v_addr = _compute_v_global_addr(
-                        ptr_V, tdm_v_offset, wave_id,
-                        arith.unwrap(arith.muli(
-                            arith.constant(8, type=T.i32), stride_v_seq)))
-                    v_stride_adv = arith.extsi(
-                        i64, arith.unwrap(stride_v_32))
+                        ptr_V,
+                        tdm_v_offset,
+                        wave_id,
+                        arith.unwrap(
+                            arith.muli(arith.constant(8, type=T.i32), stride_v_seq)
+                        ),
+                    )
+                    v_stride_adv = arith.extsi(i64, arith.unwrap(stride_v_32))
                     _wid_v = arith.unwrap(wave_id)
                     _v_warp_off = arith.muli(
                         _wid_v,
-                        arith.unwrap(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
+                        arith.unwrap(arith.constant(8 * V_ROW_BYTES, type=T.i32)),
+                    )
                     _v_lds_base = arith.addi(tdm_v_target, _v_warp_off)
                     v_descs = _build_tdm_descs(
-                        v_dg1, v_addr, v_stride_adv,
-                        _v_lds_base, LDS_V_SU_P_SIZE, CNT_SU)
-                    tdm_state['v_descs'] = v_descs
-                    tdm_state['v_desc_idx'] = 0
+                        v_dg1,
+                        v_addr,
+                        v_stride_adv,
+                        _v_lds_base,
+                        LDS_V_SU_P_SIZE,
+                        CNT_SU,
+                    )
+                    tdm_state["v_descs"] = v_descs
+                    tdm_state["v_desc_idx"] = 0
 
                 _g1_tdm_type = (
-                    KV_K if has_tdm_k_g1
-                    else KV_V if has_tdm_v_g1
-                    else KV_NONE
+                    KV_K if has_tdm_k_g1 else KV_V if has_tdm_v_g1 else KV_NONE
                 )
                 stage_configs = [
                     (0, _g1_tdm_type, KV_K, blk, 1),
                     (1, _g1_tdm_type, KV_K, blk, 2),
-                    (2, KV_NONE,      KV_K, blk, 3),
-                    (3, KV_NONE,      KV_V, blk, 0),
+                    (2, KV_NONE, KV_K, blk, 3),
+                    (3, KV_NONE, KV_V, blk, 0),
                 ]
 
                 su_sp_tiles_list = []
@@ -1474,31 +1640,36 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # Build broadcast v8f32 for each MSB's exp_delta
                 _ed_v8 = []
                 for _dm in fx.range_constexpr(NUM_MSB):
-                    _edv = llvm_dialect.mlir_undef(ty['v8f32'])
+                    _edv = llvm_dialect.mlir_undef(ty["v8f32"])
                     for _ii in fx.range_constexpr(8):
                         _edv = llvm_dialect.insertelement(
-                            _edv, ia_exp_delta[_dm],
-                            arith.unwrap(arith.constant(_ii, type=T.i32)))
+                            _edv,
+                            ia_exp_delta[_dm],
+                            arith.unwrap(arith.constant(_ii, type=T.i32)),
+                        )
                     _ed_v8.append(_edv)
                 # _o_rescale_by_stage[s] = list of closures for GEMM1 stage s
                 _o_rescale_by_stage = []
                 # s = tile index = stage index
                 for _s in fx.range_constexpr(N_PV_WMMA_N):
                     _stage_closures = []
-                    for _dm in fx.range_constexpr(NUM_MSB):      # 4 closures per stage
+                    for _dm in fx.range_constexpr(NUM_MSB):  # 4 closures per stage
+
                         def _mk_rescale(dm=_dm, nn=_s, ev8=_ed_v8[_dm]):
                             def _op():
                                 o_tiles[dm][nn] = arith.mulf(o_tiles[dm][nn], ev8)
+
                             return _op
+
                         _stage_closures.append(_mk_rescale())
                     _o_rescale_by_stage.append(_stage_closures)
 
-                for stage_idx, (g_su, t_type, l_type, l_blk, l_su) in \
-                        enumerate(stage_configs):
+                for stage_idx, (g_su, t_type, l_type, l_blk, l_su) in enumerate(
+                    stage_configs
+                ):
 
                     _n_lds = N_LDS_V_PER_MSB if l_type == KV_V else N_LDS_PER_MSB
-                    kv_tiles_next_raw = [
-                        [None] * _n_lds for _ in range(NUM_MSB)]
+                    kv_tiles_next_raw = [[None] * _n_lds for _ in range(NUM_MSB)]
 
                     softmax_stage = (stage_idx + 4) % ALU_STAGES
                     budget_per_msb = ALU_PER_STAGE[softmax_stage] // NUM_MSB
@@ -1509,38 +1680,44 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     #           avoiding WMMA-induced register collision for banks 2,3.
                     softmax_budget = [budget_per_msb, budget_per_msb, 0, 0]
 
-                    is_barrier_stage = (
-                        stage_idx == 2
-                        and (has_tdm_k_g1 or has_tdm_v_g1)
-                    )
+                    is_barrier_stage = stage_idx == 2 and (has_tdm_k_g1 or has_tdm_v_g1)
 
                     # Distribute O_resc across all 4 GEMM1 stages (1
                     # tile/MSB per stage).
                     stage_o_rescale = _o_rescale_by_stage[stage_idx]
 
                     sp_tiles, kv_tiles_next_raw = _cl_su_v3_stage(
-                        ty, stage_idx,
-                        blk, g_su,
-                        t_type, blk, g_su,
-                        l_type, l_blk, l_su,
-                        q_tiles, kv_tiles, sp_tiles,
-                        kv_lds_addrs, kv_tiles_next_raw,
-                        softmax_ops_by_msb, softmax_idx_by_msb,
+                        ty,
+                        stage_idx,
+                        blk,
+                        g_su,
+                        t_type,
+                        blk,
+                        g_su,
+                        l_type,
+                        l_blk,
+                        l_su,
+                        q_tiles,
+                        kv_tiles,
+                        sp_tiles,
+                        kv_lds_addrs,
+                        kv_tiles_next_raw,
+                        softmax_ops_by_msb,
+                        softmax_idx_by_msb,
                         softmax_budget,
                         tdm_state,
                         tdm_barrier=is_barrier_stage,
                         o_rescale_ops=stage_o_rescale,
                     )
 
-                    su_sp_tiles_list.append([
-                        [sp_tiles[msb][0]] for msb in range(NUM_MSB)
-                    ])
+                    su_sp_tiles_list.append(
+                        [[sp_tiles[msb][0]] for msb in range(NUM_MSB)]
+                    )
 
                     if const_expr(l_type == KV_K):
                         kv_tiles = _pair_k_tiles_for_wmma(kv_tiles_next_raw, ty)
                     else:
                         v_tiles_out = kv_tiles_next_raw
-
 
                 if const_expr(not gemm2):
                     return sp_tiles, kv_tiles, o_tiles, su_sp_tiles_list
@@ -1551,9 +1728,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
                 # 1. Flush any remaining PART2 second-half ops
                 for msb in fx.range_constexpr(NUM_MSB):
-                    for op in softmax_ops_by_msb[msb][softmax_idx_by_msb[msb]:]:
+                    for op in softmax_ops_by_msb[msb][softmax_idx_by_msb[msb] :]:
                         op()
-
 
                 # DBG: row_sums after GEMM1 second-half (sum_accum done), before GEMM2
                 # PART0+1 rescale
@@ -1576,11 +1752,16 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # g2_sp_lo/hi_cache: f32 scalar caches populated by EXP token dispatch,
                 # bypassing unreliable v2f32 insertelement under WMMA register pressure.
                 (
-                    g2_ops_by_rid, _,
-                    g2_sp_lo_cache, g2_sp_hi_cache,
+                    g2_ops_by_rid,
+                    _,
+                    g2_sp_lo_cache,
+                    g2_sp_hi_cache,
                 ) = _build_all_softmax_gemm2_ops(
-                    ty, blk, sp_pairs_current,
-                    softmax_state, sgpr_state,
+                    ty,
+                    blk,
+                    sp_pairs_current,
+                    softmax_state,
+                    sgpr_state,
                 )
                 # P0/P1 dispatched via schedule tokens (P0 tokens in stages 0-1).
                 # Starts from op 0; token dispatch happens AFTER each WMMA's
@@ -1611,37 +1792,50 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 if has_tdm_v_g2:
                     i64 = ir.IntegerType.get_signless(64)
                     _V_CFG = (1 << 16) | _V_TDM_CONFIG
-                    _stride_v_elems = arith.unwrap(arith.shrui(
-                        stride_v_seq, arith.constant(1, type=T.i32)))
+                    _stride_v_elems = arith.unwrap(
+                        arith.shrui(stride_v_seq, arith.constant(1, type=T.i32))
+                    )
                     if const_expr(loop_v_oob_dg1 is not None):
                         v_dg1 = loop_v_oob_dg1
                     else:
                         v_dg1 = vector.from_elements(
                             T.vec(8, T.i32),
-                            [arith.constant(_V_CFG, type=T.i32),
-                             arith.constant(128 << 16, type=T.i32),
-                             arith.constant(8 << 16, type=T.i32),
-                             arith.constant(128 << 16, type=T.i32),
-                             arith.constant(8, type=T.i32),
-                             _stride_v_elems,
-                             arith.constant(0, type=T.i32),
-                             arith.constant(0, type=T.i32)])
+                            [
+                                arith.constant(_V_CFG, type=T.i32),
+                                arith.constant(128 << 16, type=T.i32),
+                                arith.constant(8 << 16, type=T.i32),
+                                arith.constant(128 << 16, type=T.i32),
+                                arith.constant(8, type=T.i32),
+                                _stride_v_elems,
+                                arith.constant(0, type=T.i32),
+                                arith.constant(0, type=T.i32),
+                            ],
+                        )
                     v_addr = _compute_v_global_addr(
-                        ptr_V, tdm_v_offset, wave_id,
-                        arith.unwrap(arith.muli(
-                            arith.constant(8, type=T.i32), stride_v_seq)))
-                    v_stride_adv = arith.extsi(
-                        i64, arith.unwrap(stride_v_32))
+                        ptr_V,
+                        tdm_v_offset,
+                        wave_id,
+                        arith.unwrap(
+                            arith.muli(arith.constant(8, type=T.i32), stride_v_seq)
+                        ),
+                    )
+                    v_stride_adv = arith.extsi(i64, arith.unwrap(stride_v_32))
                     _wid_v = arith.unwrap(wave_id)
                     _v_warp_off = arith.muli(
                         _wid_v,
-                        arith.unwrap(arith.constant(8 * V_ROW_BYTES, type=T.i32)))
+                        arith.unwrap(arith.constant(8 * V_ROW_BYTES, type=T.i32)),
+                    )
                     _v_lds_base = arith.addi(tdm_v_target, _v_warp_off)
                     v_descs = _build_tdm_descs(
-                        v_dg1, v_addr, v_stride_adv,
-                        _v_lds_base, LDS_V_SU_P_SIZE, CNT_SU)
-                    tdm_state['v_descs'] = v_descs
-                    tdm_state['v_desc_idx'] = 0
+                        v_dg1,
+                        v_addr,
+                        v_stride_adv,
+                        _v_lds_base,
+                        LDS_V_SU_P_SIZE,
+                        CNT_SU,
+                    )
+                    tdm_state["v_descs"] = v_descs
+                    tdm_state["v_desc_idx"] = 0
 
                 # stage tuple: (gemm_su, lds_type, lds_blk, lds_su, tdm_type,
                 # tdm_barrier)
@@ -1652,14 +1846,19 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     (3, KV_K, blk, 0, KV_NONE, False),
                 ]
 
-                for stage_idx, (g_su, l_type, l_blk, l_su, t_type, barrier) in \
-                        enumerate(g2_stage_configs):
+                for stage_idx, (
+                    g_su,
+                    l_type,
+                    l_blk,
+                    l_su,
+                    t_type,
+                    barrier,
+                ) in enumerate(g2_stage_configs):
 
                     p_tiles_su = p_tiles_computed[g_su]
 
                     _n_lds = N_LDS_V_PER_MSB if l_type == KV_V else N_LDS_PER_MSB
-                    kv_tiles_next_raw = [
-                        [None] * _n_lds for _ in range(NUM_MSB)]
+                    kv_tiles_next_raw = [[None] * _n_lds for _ in range(NUM_MSB)]
 
                     if const_expr(l_type == KV_K):
                         g2_addrs = (
@@ -1671,27 +1870,32 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         g2_addrs = kv_lds_addrs
 
                     o_tiles, kv_tiles_next_raw = _cl_su_v3_stage_gemm2(
-                        ty, stage_idx,
-                        blk, g_su,
-                        l_type, l_blk, l_su,
-                        v_tiles_paired, p_tiles_su, o_tiles,
-                        g2_addrs, kv_tiles_next_raw,
-                        g2_ops_by_rid, g2_rid_idx,
+                        ty,
+                        stage_idx,
+                        blk,
+                        g_su,
+                        l_type,
+                        l_blk,
+                        l_su,
+                        v_tiles_paired,
+                        p_tiles_su,
+                        o_tiles,
+                        g2_addrs,
+                        kv_tiles_next_raw,
+                        g2_ops_by_rid,
+                        g2_rid_idx,
                         tdm_state=tdm_state,
                         tdm_type=t_type,
                         tdm_barrier=barrier,
                         o_rescale_exp_delta=(
-                            _o_rescale_exp_delta
-                            if stage_idx == 0 else None
+                            _o_rescale_exp_delta if stage_idx == 0 else None
                         ),
                     )
 
                     if const_expr(l_type == KV_V):
-                        v_tiles_paired = _pair_v_tiles_for_wmma(
-                            kv_tiles_next_raw, ty)
+                        v_tiles_paired = _pair_v_tiles_for_wmma(kv_tiles_next_raw, ty)
                     else:
                         kv_tiles = _pair_k_tiles_for_wmma(kv_tiles_next_raw, ty)
-
 
                 # DBG: GEMM2 (O acc) — lane 0, wave 0
 
@@ -1709,17 +1913,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         _lo_c = g2_sp_lo_cache[_psm][_psi]
                         _hi_c = g2_sp_hi_cache[_psm][_psi]
                         if const_expr(_lo_c is None):
-                            _c0 = arith.unwrap(
-                                arith.constant(0, type=T.i32)
-                            )
+                            _c0 = arith.unwrap(arith.constant(0, type=T.i32))
                             _lo_c = llvm_dialect.extractelement(
                                 sp_pairs_current[_psm][_psi],
                                 _c0,
                             )
                         if const_expr(_hi_c is None):
-                            _c1 = arith.unwrap(
-                                arith.constant(1, type=T.i32)
-                            )
+                            _c1 = arith.unwrap(arith.constant(1, type=T.i32))
                             _hi_c = llvm_dialect.extractelement(
                                 sp_pairs_current[_psm][_psi],
                                 _c1,
@@ -1727,16 +1927,18 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         partial_sp_lo_out.append(_lo_c)
                         partial_sp_hi_out.append(_hi_c)
 
-                partial_ed_out = [softmax_state['exp_delta'][_m]
-                                  for _m in fx.range_constexpr(NUM_MSB)]
+                partial_ed_out = [
+                    softmax_state["exp_delta"][_m] for _m in fx.range_constexpr(NUM_MSB)
+                ]
                 return (
-                    sp_tiles, kv_tiles, o_tiles,
+                    sp_tiles,
+                    kv_tiles,
+                    o_tiles,
                     su_sp_tiles_list,
                     partial_sp_lo_out,
                     partial_sp_hi_out,
                     partial_ed_out,
                 )
-
 
             # ================================================================
             # Init iter_args layout (dynamic — offsets depend on N_WMMA_K_TILES):
@@ -1752,27 +1954,34 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             #                      (PART2 first half output, double-buffered pipeline)
             #   [24+KV+92..+95]    exp_delta[4] f32                     = 4 values
             # ================================================================
-            _KV_SIZE = NUM_MSB * N_WMMA_K_TILES   # 12 for 192-dim, 8 for 128-dim
-            _OFF_LOCAL_MAX = 24 + _KV_SIZE        # 36 for 192-dim
-            _OFF_DELTA     = _OFF_LOCAL_MAX + NUM_MSB
-            _OFF_SP        = _OFF_DELTA + NUM_MSB
-            _OFF_PP        = _OFF_SP + CNT_SU * NUM_MSB
-            _OFF_PSP       = _OFF_PP + 4                  # partial_sp lo: 64 f32
-            _PSP_SIZE      = NUM_MSB * N_SP_PAIRS         # = 64 (lo half)
-            _OFF_PSP_HI    = _OFF_PSP + _PSP_SIZE         # partial_sp hi: 64 f32
-            _OFF_PED       = _OFF_PSP_HI + _PSP_SIZE      # exp_delta: 4 f32
+            _KV_SIZE = NUM_MSB * N_WMMA_K_TILES  # 12 for 192-dim, 8 for 128-dim
+            _OFF_LOCAL_MAX = 24 + _KV_SIZE  # 36 for 192-dim
+            _OFF_DELTA = _OFF_LOCAL_MAX + NUM_MSB
+            _OFF_SP = _OFF_DELTA + NUM_MSB
+            _OFF_PP = _OFF_SP + CNT_SU * NUM_MSB
+            _OFF_PSP = _OFF_PP + 4  # partial_sp lo: 64 f32
+            _PSP_SIZE = NUM_MSB * N_SP_PAIRS  # = 64 (lo half)
+            _OFF_PSP_HI = _OFF_PSP + _PSP_SIZE  # partial_sp hi: 64 f32
+            _OFF_PED = _OFF_PSP_HI + _PSP_SIZE  # exp_delta: 4 f32
             o_flat_init = [zero_v8f32] * (NUM_MSB * N_PV_WMMA_N)
 
             # Ping-pong bases for iteration 1:
             #   K_cur = K_b (tile 1 K), V_cur = V_a (tile 0 V)
             #   K_next = K_a (TDM K target), V_next = V_b (TDM V target)
-            pp_init = [k_b_base_i32, v_a_base_i32,
-                       k_a_base_i32, v_b_base_i32]
+            pp_init = [k_b_base_i32, v_a_base_i32, k_a_base_i32, v_b_base_i32]
 
-            init_args = (o_flat_init + pro_old_max + pro_row_sums
-                         + kv_flat_init + pro_local_max + pro_delta
-                         + sp_flat_init + pp_init
-                         + pro_partial_sp_flat + pro_exp_delta)
+            init_args = (
+                o_flat_init
+                + pro_old_max
+                + pro_row_sums
+                + kv_flat_init
+                + pro_local_max
+                + pro_delta
+                + sp_flat_init
+                + pp_init
+                + pro_partial_sp_flat
+                + pro_exp_delta
+            )
 
             # ---- Split point for causal loops (chunked-prefill: sq < sk) ----
             # Tiles below _first_causal_tile are fully under the diagonal and
@@ -1787,14 +1996,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # TILE_N).
                 # Clamp to [1, num_tiles-1) since loop 1 starts at tile 1.
                 _first_causal_tile = arith.addi(
-                    arith.unwrap(bx),
-                    arith.divui(_causal_offset, tile_n_const))
+                    arith.unwrap(bx), arith.divui(_causal_offset, tile_n_const)
+                )
                 _first_causal_tile = arith.maxsi(
-                    _first_causal_tile, arith.unwrap(arith.constant(1, type=T.i32)))
-                _first_causal_tile = arith.minui(
-                    _first_causal_tile, num_tiles_minus1)
-                _first_causal_tile_idx = arith.index_cast(
-                    T.index, _first_causal_tile)
+                    _first_causal_tile, arith.unwrap(arith.constant(1, type=T.i32))
+                )
+                _first_causal_tile = arith.minui(_first_causal_tile, num_tiles_minus1)
+                _first_causal_tile_idx = arith.index_cast(T.index, _first_causal_tile)
             else:
                 _first_causal_tile_idx = num_tiles_minus1_idx
 
@@ -1816,11 +2024,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     row = []
                     for n in fx.range_constexpr(N_PV_WMMA_N):
                         _idx = d * N_PV_WMMA_N + n
-                        row.append(
-                            set_vgpr_bank(
-                                o_tiles_flat[_idx], d
-                            )
-                        )
+                        row.append(set_vgpr_bank(o_tiles_flat[_idx], d))
                     o_tiles.append(row)
 
                 ia_old_max = [
@@ -1833,50 +2037,34 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 ]
 
                 kv_tiles_flat = [
-                    iter_args[24 + i]
-                    for i in fx.range_constexpr(_KV_SIZE)
+                    iter_args[24 + i] for i in fx.range_constexpr(_KV_SIZE)
                 ]
                 kv_tiles = []
                 for msb in fx.range_constexpr(NUM_MSB):
                     row = []
                     for k in fx.range_constexpr(N_WMMA_K_TILES):
                         _ki = msb * N_WMMA_K_TILES + k
-                        row.append(
-                            set_vgpr_bank(
-                                kv_tiles_flat[_ki], msb
-                            )
-                        )
+                        row.append(set_vgpr_bank(kv_tiles_flat[_ki], msb))
                     kv_tiles.append(row)
 
                 ia_local_max = [
-                    set_vgpr_bank(
-                        iter_args[_OFF_LOCAL_MAX + i], i
-                    )
+                    set_vgpr_bank(iter_args[_OFF_LOCAL_MAX + i], i)
                     for i in fx.range_constexpr(NUM_MSB)
                 ]
                 ia_delta = [
-                    set_vgpr_bank(
-                        iter_args[_OFF_DELTA + i], i
-                    )
+                    set_vgpr_bank(iter_args[_OFF_DELTA + i], i)
                     for i in fx.range_constexpr(NUM_MSB)
                 ]
 
                 ia_sp_flat = [
-                    iter_args[_OFF_SP + i]
-                    for i in fx.range_constexpr(
-                        CNT_SU * NUM_MSB
-                    )
+                    iter_args[_OFF_SP + i] for i in fx.range_constexpr(CNT_SU * NUM_MSB)
                 ]
                 prev_su_sp_tiles = []
                 for su in fx.range_constexpr(CNT_SU):
                     msb_list = []
                     for msb in fx.range_constexpr(NUM_MSB):
                         _si = su * NUM_MSB + msb
-                        msb_list.append([
-                            set_vgpr_bank(
-                                ia_sp_flat[_si], msb
-                            )
-                        ])
+                        msb_list.append([set_vgpr_bank(ia_sp_flat[_si], msb)])
                     prev_su_sp_tiles.append(msb_list)
 
                 # Unpack ping-pong bases
@@ -1887,7 +2075,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
                 # Build per-lane LDS addresses from ping-pong bases
                 kv_lds_addrs_cur = _build_kv_lds_addrs(
-                    lane_id, ia_k_cur_base, ia_v_cur_base,
+                    lane_id,
+                    ia_k_cur_base,
+                    ia_v_cur_base,
                 )
                 kv_lds_addrs_next = _build_kv_lds_addrs(
                     lane_id,
@@ -1898,25 +2088,26 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # ---- Unpack partial_sp_pairs: reconstruct
                 # v2f32 from separate lo+hi f32 scalars ----
                 ia_partial_sp_lo = [
-                    iter_args[_OFF_PSP + i]
-                    for i in fx.range_constexpr(_PSP_SIZE)
+                    iter_args[_OFF_PSP + i] for i in fx.range_constexpr(_PSP_SIZE)
                 ]
                 ia_partial_sp_hi = [
-                    iter_args[_OFF_PSP_HI + i]
-                    for i in fx.range_constexpr(_PSP_SIZE)
+                    iter_args[_OFF_PSP_HI + i] for i in fx.range_constexpr(_PSP_SIZE)
                 ]
                 ia_exp_delta = [
-                    set_vgpr_bank(
-                        iter_args[_OFF_PED + i], i
-                    )
+                    set_vgpr_bank(iter_args[_OFF_PED + i], i)
                     for i in fx.range_constexpr(NUM_MSB)
                 ]
 
                 ia_partial_sp_pairs = []
                 for _m in fx.range_constexpr(NUM_MSB):
-                    msb_pairs = [_make_v2f32(ia_partial_sp_lo[_m * N_SP_PAIRS + _i],
-                                             ia_partial_sp_hi[_m * N_SP_PAIRS + _i], _m)
-                                 for _i in fx.range_constexpr(N_SP_PAIRS)]
+                    msb_pairs = [
+                        _make_v2f32(
+                            ia_partial_sp_lo[_m * N_SP_PAIRS + _i],
+                            ia_partial_sp_hi[_m * N_SP_PAIRS + _i],
+                            _m,
+                        )
+                        for _i in fx.range_constexpr(N_SP_PAIRS)
+                    ]
                     ia_partial_sp_pairs.append(msb_pairs)
 
                 # ---- SP tiles: zero accumulators (fresh each iteration) ----
@@ -1925,37 +2116,37 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     sp_tiles.append([set_vgpr_bank(zero_v8f32, msb)])
 
                 softmax_state = {
-                    'old_max': list(ia_old_max),
-                    'local_max': list(ia_local_max),
-                    'delta': list(ia_delta),
-                    'exp_delta': [None] * NUM_MSB,
-                    'cur_max_log2e': [None] * NUM_MSB,
-                    'cur_max_log2e_1': [None] * NUM_MSB,
-                    'cur_max_log2e_scalar': [None] * NUM_MSB,
-                    'cur_max_log2e_dup': [None] * NUM_MSB,
-                    'vgpr_log2e_scl_pair': [None] * NUM_MSB,
-                    'exp_delta_dup': [None] * NUM_MSB,
-                    'row_sums': list(ia_row_sums),
-                    'p_bf16': [[], [], [], []],
-                    'sp_pairs_prev': ia_partial_sp_pairs,
+                    "old_max": list(ia_old_max),
+                    "local_max": list(ia_local_max),
+                    "delta": list(ia_delta),
+                    "exp_delta": [None] * NUM_MSB,
+                    "cur_max_log2e": [None] * NUM_MSB,
+                    "cur_max_log2e_1": [None] * NUM_MSB,
+                    "cur_max_log2e_scalar": [None] * NUM_MSB,
+                    "cur_max_log2e_dup": [None] * NUM_MSB,
+                    "vgpr_log2e_scl_pair": [None] * NUM_MSB,
+                    "exp_delta_dup": [None] * NUM_MSB,
+                    "row_sums": list(ia_row_sums),
+                    "p_bf16": [[], [], [], []],
+                    "sp_pairs_prev": ia_partial_sp_pairs,
                 }
 
                 # ---- Build TDM state (zero placeholder for memload=False) ----
                 _zero_i32 = arith.unwrap(arith.constant(0, type=T.i32))
 
                 def _mk_zero_v4i32():
-                    return vector.broadcast(ty['v4i32'], _zero_i32)
+                    return vector.broadcast(ty["v4i32"], _zero_i32)
 
                 def _mk_zero_v8i32():
-                    return vector.broadcast(ty['v8i32'], _zero_i32)
+                    return vector.broadcast(ty["v8i32"], _zero_i32)
 
                 tdm_state = {
-                    'v_g0': _mk_zero_v4i32(),
-                    'v_g1': _mk_zero_v8i32(),
-                    'k_g0': _mk_zero_v4i32(),
-                    'k_g1': _mk_zero_v8i32(),
-                    'v_salu_queue': [],
-                    'k_salu_queue': [],
+                    "v_g0": _mk_zero_v4i32(),
+                    "v_g1": _mk_zero_v8i32(),
+                    "k_g0": _mk_zero_v4i32(),
+                    "k_g1": _mk_zero_v8i32(),
+                    "v_salu_queue": [],
+                    "k_salu_queue": [],
                 }
 
                 # ---- Compute TDM offsets ----
@@ -1966,50 +2157,75 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 cur_v_offset = arith.addi(arith.unwrap(v_offset), cur_v_advance)
 
                 next_tile = arith.addi(
-                    tile_idx_i32, arith.unwrap(arith.constant(1, type=T.i32)))
+                    tile_idx_i32, arith.unwrap(arith.constant(1, type=T.i32))
+                )
                 tile_n_stride_k = arith.muli(tile_n_const, stride_k_seq)
                 next_k_advance = arith.muli(next_tile, tile_n_stride_k)
                 next_k_offset = arith.addi(arith.unwrap(k_offset), next_k_advance)
 
                 # ---- Per-tile OOB dg1 for K prefetch and V load ----
                 _loop_v_remain = arith.subi(
-                    actual_kv_len,
-                    arith.muli(tile_idx_i32, tile_n_const))
+                    actual_kv_len, arith.muli(tile_idx_i32, tile_n_const)
+                )
                 _loop_v_oob_dg1 = [
                     _make_kv_dg1_with_oob(
-                        _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
+                        _V_CFG_OOB,
+                        128,
+                        8,
+                        _stride_v_elems_oob,
                         _per_warp_oob_dim1(
-                            arith.subi(_loop_v_remain,
-                                arith.unwrap(arith.constant(_su * 32, type=T.i32))),
-                            wave_id, 8))
+                            arith.subi(
+                                _loop_v_remain,
+                                arith.unwrap(arith.constant(_su * 32, type=T.i32)),
+                            ),
+                            wave_id,
+                            8,
+                        ),
+                    )
                     for _su in range(CNT_SU)
                 ]
                 _loop_k_remain = arith.subi(
-                    actual_kv_len,
-                    arith.muli(next_tile, tile_n_const))
+                    actual_kv_len, arith.muli(next_tile, tile_n_const)
+                )
                 _loop_k_oob_dg1 = [
                     _make_kv_dg1_with_oob(
-                        _K_CFG_OOB, QK_HDIM, 8, _stride_k_elems_oob,
+                        _K_CFG_OOB,
+                        QK_HDIM,
+                        8,
+                        _stride_k_elems_oob,
                         _per_warp_oob_dim1(
-                            arith.subi(_loop_k_remain,
-                                arith.unwrap(arith.constant(_su * 32, type=T.i32))),
-                            wave_id, 8),
-                        dim0_stride=200)
+                            arith.subi(
+                                _loop_k_remain,
+                                arith.unwrap(arith.constant(_su * 32, type=T.i32)),
+                            ),
+                            wave_id,
+                            8,
+                        ),
+                        dim0_stride=200,
+                    )
                     for _su in range(CNT_SU)
                 ]
 
                 # ---- Core loop: no causal mask ----
                 (
-                    sp_out, kv_out, o_tiles,
+                    sp_out,
+                    kv_out,
+                    o_tiles,
                     su_sp_tiles_out,
                     _partial_sp_lo_out,
                     _partial_sp_hi_out,
                     _partial_ed_out,
                 ) = _core_loop(
-                    ty, False,
-                    q_frags, kv_tiles, sp_tiles,
+                    ty,
+                    False,
+                    q_frags,
+                    kv_tiles,
+                    sp_tiles,
                     o_tiles,
-                    kv_lds_addrs_cur, tdm_state, softmax_state, sgpr_state,
+                    kv_lds_addrs_cur,
+                    tdm_state,
+                    softmax_state,
+                    sgpr_state,
                     gemm2=True,
                     tdm_v_offset=cur_v_offset,
                     tdm_v_target=ia_v_next_base,
@@ -2027,38 +2243,54 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     for n in fx.range_constexpr(N_PV_WMMA_N):
                         new_o.append(o_tiles[d][n])
 
-                new_max = [softmax_state['old_max'][i]
-                           for i in fx.range_constexpr(NUM_MSB)]
-                new_sums = [softmax_state['row_sums'][i]
-                            for i in fx.range_constexpr(NUM_MSB)]
-
+                new_max = [
+                    softmax_state["old_max"][i] for i in fx.range_constexpr(NUM_MSB)
+                ]
+                new_sums = [
+                    softmax_state["row_sums"][i] for i in fx.range_constexpr(NUM_MSB)
+                ]
 
                 kv_out_flat = []
                 for msb in fx.range_constexpr(NUM_MSB):
                     for k in fx.range_constexpr(N_WMMA_K_TILES):
                         kv_out_flat.append(kv_out[msb][k])
 
-                new_local_max = [softmax_state['local_max'][i]
-                                 for i in fx.range_constexpr(NUM_MSB)]
-                new_delta = [softmax_state['delta'][i]
-                             for i in fx.range_constexpr(NUM_MSB)]
+                new_local_max = [
+                    softmax_state["local_max"][i] for i in fx.range_constexpr(NUM_MSB)
+                ]
+                new_delta = [
+                    softmax_state["delta"][i] for i in fx.range_constexpr(NUM_MSB)
+                ]
 
                 sp_out_flat = []
                 for su in fx.range_constexpr(CNT_SU):
                     for msb in fx.range_constexpr(NUM_MSB):
                         sp_out_flat.append(su_sp_tiles_out[su][msb][0])
 
-                pp_swapped = [ia_k_next_base, ia_v_next_base,
-                              ia_k_cur_base, ia_v_cur_base]
+                pp_swapped = [
+                    ia_k_next_base,
+                    ia_v_next_base,
+                    ia_k_cur_base,
+                    ia_v_cur_base,
+                ]
 
                 new_partial_sp_flat = _partial_sp_lo_out + _partial_sp_hi_out
-                new_exp_delta = [_partial_ed_out[_m]
-                                 for _m in fx.range_constexpr(NUM_MSB)]
+                new_exp_delta = [
+                    _partial_ed_out[_m] for _m in fx.range_constexpr(NUM_MSB)
+                ]
 
-                yield (new_o + new_max + new_sums
-                       + kv_out_flat + new_local_max + new_delta
-                       + sp_out_flat + pp_swapped
-                       + new_partial_sp_flat + new_exp_delta)
+                yield (
+                    new_o
+                    + new_max
+                    + new_sums
+                    + kv_out_flat
+                    + new_local_max
+                    + new_delta
+                    + sp_out_flat
+                    + pp_swapped
+                    + new_partial_sp_flat
+                    + new_exp_delta
+                )
 
             # ================================================================
             # SECTION 3b: Main KV loop — causal tiles [_first_causal_tile, num_tiles-1)
@@ -2076,11 +2308,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     row = []
                     for n in fx.range_constexpr(N_PV_WMMA_N):
                         _idx = d * N_PV_WMMA_N + n
-                        row.append(
-                            set_vgpr_bank(
-                                o_tiles_flat[_idx], d
-                            )
-                        )
+                        row.append(set_vgpr_bank(o_tiles_flat[_idx], d))
                     o_tiles.append(row)
 
                 ia_old_max = [
@@ -2093,50 +2321,34 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 ]
 
                 kv_tiles_flat = [
-                    iter_args[24 + i]
-                    for i in fx.range_constexpr(_KV_SIZE)
+                    iter_args[24 + i] for i in fx.range_constexpr(_KV_SIZE)
                 ]
                 kv_tiles = []
                 for msb in fx.range_constexpr(NUM_MSB):
                     row = []
                     for k in fx.range_constexpr(N_WMMA_K_TILES):
                         _ki = msb * N_WMMA_K_TILES + k
-                        row.append(
-                            set_vgpr_bank(
-                                kv_tiles_flat[_ki], msb
-                            )
-                        )
+                        row.append(set_vgpr_bank(kv_tiles_flat[_ki], msb))
                     kv_tiles.append(row)
 
                 ia_local_max = [
-                    set_vgpr_bank(
-                        iter_args[_OFF_LOCAL_MAX + i], i
-                    )
+                    set_vgpr_bank(iter_args[_OFF_LOCAL_MAX + i], i)
                     for i in fx.range_constexpr(NUM_MSB)
                 ]
                 ia_delta = [
-                    set_vgpr_bank(
-                        iter_args[_OFF_DELTA + i], i
-                    )
+                    set_vgpr_bank(iter_args[_OFF_DELTA + i], i)
                     for i in fx.range_constexpr(NUM_MSB)
                 ]
 
                 ia_sp_flat = [
-                    iter_args[_OFF_SP + i]
-                    for i in fx.range_constexpr(
-                        CNT_SU * NUM_MSB
-                    )
+                    iter_args[_OFF_SP + i] for i in fx.range_constexpr(CNT_SU * NUM_MSB)
                 ]
                 prev_su_sp_tiles = []
                 for su in fx.range_constexpr(CNT_SU):
                     msb_list = []
                     for msb in fx.range_constexpr(NUM_MSB):
                         _si = su * NUM_MSB + msb
-                        msb_list.append([
-                            set_vgpr_bank(
-                                ia_sp_flat[_si], msb
-                            )
-                        ])
+                        msb_list.append([set_vgpr_bank(ia_sp_flat[_si], msb)])
                     prev_su_sp_tiles.append(msb_list)
 
                 ia_k_cur_base = iter_args[_OFF_PP]
@@ -2156,25 +2368,26 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 )
 
                 ia_partial_sp_lo = [
-                    iter_args[_OFF_PSP + i]
-                    for i in fx.range_constexpr(_PSP_SIZE)
+                    iter_args[_OFF_PSP + i] for i in fx.range_constexpr(_PSP_SIZE)
                 ]
                 ia_partial_sp_hi = [
-                    iter_args[_OFF_PSP_HI + i]
-                    for i in fx.range_constexpr(_PSP_SIZE)
+                    iter_args[_OFF_PSP_HI + i] for i in fx.range_constexpr(_PSP_SIZE)
                 ]
                 ia_exp_delta = [
-                    set_vgpr_bank(
-                        iter_args[_OFF_PED + i], i
-                    )
+                    set_vgpr_bank(iter_args[_OFF_PED + i], i)
                     for i in fx.range_constexpr(NUM_MSB)
                 ]
 
                 ia_partial_sp_pairs = []
                 for _m in fx.range_constexpr(NUM_MSB):
-                    msb_pairs = [_make_v2f32(ia_partial_sp_lo[_m * N_SP_PAIRS + _i],
-                                             ia_partial_sp_hi[_m * N_SP_PAIRS + _i], _m)
-                                 for _i in fx.range_constexpr(N_SP_PAIRS)]
+                    msb_pairs = [
+                        _make_v2f32(
+                            ia_partial_sp_lo[_m * N_SP_PAIRS + _i],
+                            ia_partial_sp_hi[_m * N_SP_PAIRS + _i],
+                            _m,
+                        )
+                        for _i in fx.range_constexpr(N_SP_PAIRS)
+                    ]
                     ia_partial_sp_pairs.append(msb_pairs)
 
                 sp_tiles = []
@@ -2182,36 +2395,36 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     sp_tiles.append([set_vgpr_bank(zero_v8f32, msb)])
 
                 softmax_state = {
-                    'old_max': list(ia_old_max),
-                    'local_max': list(ia_local_max),
-                    'delta': list(ia_delta),
-                    'exp_delta': [None] * NUM_MSB,
-                    'cur_max_log2e': [None] * NUM_MSB,
-                    'cur_max_log2e_1': [None] * NUM_MSB,
-                    'cur_max_log2e_scalar': [None] * NUM_MSB,
-                    'cur_max_log2e_dup': [None] * NUM_MSB,
-                    'vgpr_log2e_scl_pair': [None] * NUM_MSB,
-                    'exp_delta_dup': [None] * NUM_MSB,
-                    'row_sums': list(ia_row_sums),
-                    'p_bf16': [[], [], [], []],
-                    'sp_pairs_prev': ia_partial_sp_pairs,
+                    "old_max": list(ia_old_max),
+                    "local_max": list(ia_local_max),
+                    "delta": list(ia_delta),
+                    "exp_delta": [None] * NUM_MSB,
+                    "cur_max_log2e": [None] * NUM_MSB,
+                    "cur_max_log2e_1": [None] * NUM_MSB,
+                    "cur_max_log2e_scalar": [None] * NUM_MSB,
+                    "cur_max_log2e_dup": [None] * NUM_MSB,
+                    "vgpr_log2e_scl_pair": [None] * NUM_MSB,
+                    "exp_delta_dup": [None] * NUM_MSB,
+                    "row_sums": list(ia_row_sums),
+                    "p_bf16": [[], [], [], []],
+                    "sp_pairs_prev": ia_partial_sp_pairs,
                 }
 
                 _zero_i32 = arith.unwrap(arith.constant(0, type=T.i32))
 
                 def _mk_zero_v4i32():
-                    return vector.broadcast(ty['v4i32'], _zero_i32)
+                    return vector.broadcast(ty["v4i32"], _zero_i32)
 
                 def _mk_zero_v8i32():
-                    return vector.broadcast(ty['v8i32'], _zero_i32)
+                    return vector.broadcast(ty["v8i32"], _zero_i32)
 
                 tdm_state = {
-                    'v_g0': _mk_zero_v4i32(),
-                    'v_g1': _mk_zero_v8i32(),
-                    'k_g0': _mk_zero_v4i32(),
-                    'k_g1': _mk_zero_v8i32(),
-                    'v_salu_queue': [],
-                    'k_salu_queue': [],
+                    "v_g0": _mk_zero_v4i32(),
+                    "v_g1": _mk_zero_v8i32(),
+                    "k_g0": _mk_zero_v4i32(),
+                    "k_g1": _mk_zero_v8i32(),
+                    "v_salu_queue": [],
+                    "k_salu_queue": [],
                 }
 
                 tile_idx_i32 = arith.index_cast(T.i32, tile_idx)
@@ -2221,34 +2434,51 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 cur_v_offset = arith.addi(arith.unwrap(v_offset), cur_v_advance)
 
                 next_tile = arith.addi(
-                    tile_idx_i32, arith.unwrap(arith.constant(1, type=T.i32)))
+                    tile_idx_i32, arith.unwrap(arith.constant(1, type=T.i32))
+                )
                 tile_n_stride_k = arith.muli(tile_n_const, stride_k_seq)
                 next_k_advance = arith.muli(next_tile, tile_n_stride_k)
                 next_k_offset = arith.addi(arith.unwrap(k_offset), next_k_advance)
 
                 _loop_v_remain = arith.subi(
-                    actual_kv_len,
-                    arith.muli(tile_idx_i32, tile_n_const))
+                    actual_kv_len, arith.muli(tile_idx_i32, tile_n_const)
+                )
                 _loop_v_oob_dg1 = [
                     _make_kv_dg1_with_oob(
-                        _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
+                        _V_CFG_OOB,
+                        128,
+                        8,
+                        _stride_v_elems_oob,
                         _per_warp_oob_dim1(
-                            arith.subi(_loop_v_remain,
-                                arith.unwrap(arith.constant(_su * 32, type=T.i32))),
-                            wave_id, 8))
+                            arith.subi(
+                                _loop_v_remain,
+                                arith.unwrap(arith.constant(_su * 32, type=T.i32)),
+                            ),
+                            wave_id,
+                            8,
+                        ),
+                    )
                     for _su in range(CNT_SU)
                 ]
                 _loop_k_remain = arith.subi(
-                    actual_kv_len,
-                    arith.muli(next_tile, tile_n_const))
+                    actual_kv_len, arith.muli(next_tile, tile_n_const)
+                )
                 _loop_k_oob_dg1 = [
                     _make_kv_dg1_with_oob(
-                        _K_CFG_OOB, QK_HDIM, 8, _stride_k_elems_oob,
+                        _K_CFG_OOB,
+                        QK_HDIM,
+                        8,
+                        _stride_k_elems_oob,
                         _per_warp_oob_dim1(
-                            arith.subi(_loop_k_remain,
-                                arith.unwrap(arith.constant(_su * 32, type=T.i32))),
-                            wave_id, 8),
-                        dim0_stride=200)
+                            arith.subi(
+                                _loop_k_remain,
+                                arith.unwrap(arith.constant(_su * 32, type=T.i32)),
+                            ),
+                            wave_id,
+                            8,
+                        ),
+                        dim0_stride=200,
+                    )
                     for _su in range(CNT_SU)
                 ]
 
@@ -2258,16 +2488,24 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
                 # ---- Core loop: with causal mask ----
                 (
-                    sp_out, kv_out, o_tiles,
+                    sp_out,
+                    kv_out,
+                    o_tiles,
                     su_sp_tiles_out,
                     _partial_sp_lo_out,
                     _partial_sp_hi_out,
                     _partial_ed_out,
                 ) = _core_loop(
-                    ty, False,
-                    q_frags, kv_tiles, sp_tiles,
+                    ty,
+                    False,
+                    q_frags,
+                    kv_tiles,
+                    sp_tiles,
                     o_tiles,
-                    kv_lds_addrs_cur, tdm_state, softmax_state, sgpr_state,
+                    kv_lds_addrs_cur,
+                    tdm_state,
+                    softmax_state,
+                    sgpr_state,
                     gemm2=True,
                     tdm_v_offset=cur_v_offset,
                     tdm_v_target=ia_v_next_base,
@@ -2286,38 +2524,54 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     for n in fx.range_constexpr(N_PV_WMMA_N):
                         new_o.append(o_tiles[d][n])
 
-                new_max = [softmax_state['old_max'][i]
-                           for i in fx.range_constexpr(NUM_MSB)]
-                new_sums = [softmax_state['row_sums'][i]
-                            for i in fx.range_constexpr(NUM_MSB)]
-
+                new_max = [
+                    softmax_state["old_max"][i] for i in fx.range_constexpr(NUM_MSB)
+                ]
+                new_sums = [
+                    softmax_state["row_sums"][i] for i in fx.range_constexpr(NUM_MSB)
+                ]
 
                 kv_out_flat = []
                 for msb in fx.range_constexpr(NUM_MSB):
                     for k in fx.range_constexpr(N_WMMA_K_TILES):
                         kv_out_flat.append(kv_out[msb][k])
 
-                new_local_max = [softmax_state['local_max'][i]
-                                 for i in fx.range_constexpr(NUM_MSB)]
-                new_delta = [softmax_state['delta'][i]
-                             for i in fx.range_constexpr(NUM_MSB)]
+                new_local_max = [
+                    softmax_state["local_max"][i] for i in fx.range_constexpr(NUM_MSB)
+                ]
+                new_delta = [
+                    softmax_state["delta"][i] for i in fx.range_constexpr(NUM_MSB)
+                ]
 
                 sp_out_flat = []
                 for su in fx.range_constexpr(CNT_SU):
                     for msb in fx.range_constexpr(NUM_MSB):
                         sp_out_flat.append(su_sp_tiles_out[su][msb][0])
 
-                pp_swapped = [ia_k_next_base, ia_v_next_base,
-                              ia_k_cur_base, ia_v_cur_base]
+                pp_swapped = [
+                    ia_k_next_base,
+                    ia_v_next_base,
+                    ia_k_cur_base,
+                    ia_v_cur_base,
+                ]
 
                 new_partial_sp_flat = _partial_sp_lo_out + _partial_sp_hi_out
-                new_exp_delta = [_partial_ed_out[_m]
-                                 for _m in fx.range_constexpr(NUM_MSB)]
+                new_exp_delta = [
+                    _partial_ed_out[_m] for _m in fx.range_constexpr(NUM_MSB)
+                ]
 
-                yield (new_o + new_max + new_sums
-                       + kv_out_flat + new_local_max + new_delta
-                       + sp_out_flat + pp_swapped
-                       + new_partial_sp_flat + new_exp_delta)
+                yield (
+                    new_o
+                    + new_max
+                    + new_sums
+                    + kv_out_flat
+                    + new_local_max
+                    + new_delta
+                    + sp_out_flat
+                    + pp_swapped
+                    + new_partial_sp_flat
+                    + new_exp_delta
+                )
 
             # ================================================================
             # SECTION 4: Epilogue — post_process + div_cvt + write_out
@@ -2351,15 +2605,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 for i in fx.range_constexpr(NUM_MSB)
             ]
             ep_local_max = [
-                set_vgpr_bank(
-                    loop_results[_OFF_LOCAL_MAX + i], i
-                )
+                set_vgpr_bank(loop_results[_OFF_LOCAL_MAX + i], i)
                 for i in fx.range_constexpr(NUM_MSB)
             ]
             ep_delta = [
-                set_vgpr_bank(
-                    loop_results[_OFF_DELTA + i], i
-                )
+                set_vgpr_bank(loop_results[_OFF_DELTA + i], i)
                 for i in fx.range_constexpr(NUM_MSB)
             ]
 
@@ -2367,44 +2617,44 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             ep_k_cur_base = loop_results[_OFF_PP]
             ep_v_cur_base = loop_results[_OFF_PP + 1]
             ep_kv_lds_addrs = _build_kv_lds_addrs(
-                lane_id, ep_k_cur_base, ep_v_cur_base,
+                lane_id,
+                ep_k_cur_base,
+                ep_v_cur_base,
             )
 
             # ---- 4b: Unpack partial_sp_pairs:
             # reconstruct v2f32 from separate lo+hi f32 ----
             ep_partial_sp_lo = [
-                loop_results[_OFF_PSP + i]
-                for i in fx.range_constexpr(_PSP_SIZE)
+                loop_results[_OFF_PSP + i] for i in fx.range_constexpr(_PSP_SIZE)
             ]
             ep_partial_sp_hi = [
-                loop_results[_OFF_PSP_HI + i]
-                for i in fx.range_constexpr(_PSP_SIZE)
+                loop_results[_OFF_PSP_HI + i] for i in fx.range_constexpr(_PSP_SIZE)
             ]
             ep_partial_sp_pairs = []
             for _m in fx.range_constexpr(NUM_MSB):
-                ep_pairs = [_make_v2f32(ep_partial_sp_lo[_m * N_SP_PAIRS + _i],
-                                        ep_partial_sp_hi[_m * N_SP_PAIRS + _i], _m)
-                            for _i in fx.range_constexpr(N_SP_PAIRS)]
+                ep_pairs = [
+                    _make_v2f32(
+                        ep_partial_sp_lo[_m * N_SP_PAIRS + _i],
+                        ep_partial_sp_hi[_m * N_SP_PAIRS + _i],
+                        _m,
+                    )
+                    for _i in fx.range_constexpr(N_SP_PAIRS)
+                ]
                 ep_partial_sp_pairs.append(ep_pairs)
 
             # ---- 4b': Extra state for endtile (N>=2) ----
             # K(N-1) fragments from loop (GEMM2 stage 3 loaded from K_next).
             ep_kv_tiles_flat = [
-                loop_results[24 + _i]
-                for _i in fx.range_constexpr(_KV_SIZE)
+                loop_results[24 + _i] for _i in fx.range_constexpr(_KV_SIZE)
             ]
             ep_kv_tiles = []
             for _m in fx.range_constexpr(NUM_MSB):
                 _row = [
                     set_vgpr_bank(
-                        ep_kv_tiles_flat[
-                            _m * N_WMMA_K_TILES + _k
-                        ],
+                        ep_kv_tiles_flat[_m * N_WMMA_K_TILES + _k],
                         _m,
                     )
-                    for _k in fx.range_constexpr(
-                        N_WMMA_K_TILES
-                    )
+                    for _k in fx.range_constexpr(N_WMMA_K_TILES)
                 ]
                 ep_kv_tiles.append(_row)
 
@@ -2425,17 +2675,19 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             )
             ep_v_endtile_offset = arith.addi(
                 arith.unwrap(v_offset),
-                arith.muli(arith.muli(_num_tiles_m1_ep, tile_n_const), stride_v_seq))
+                arith.muli(arith.muli(_num_tiles_m1_ep, tile_n_const), stride_v_seq),
+            )
 
             # ia_exp_delta for endtile core_loop: exp_delta from last loop GEMM2.
-            ia_exp_delta = [set_vgpr_bank(loop_results[_OFF_PED + _m], _m)
-                            for _m in fx.range_constexpr(NUM_MSB)]
+            ia_exp_delta = [
+                set_vgpr_bank(loop_results[_OFF_PED + _m], _m)
+                for _m in fx.range_constexpr(NUM_MSB)
+            ]
 
             # ---- 4c: s_wait_idle + barrier ----
             _emit_void("s_wait_idle")
             rocdl.s_barrier_signal(-1)
             rocdl.s_barrier_wait(-1)
-
 
             # ---- 4c': _ep_finish — PART2 + PV_pure + div_cvt + TDM store D ----
             # o_tiles:           [[v8f32]*N_PV_WMMA_N]*NUM_MSB — accumulated O
@@ -2450,22 +2702,30 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # delta_in:          [f32]*NUM_MSB                 — delta (for PART2 setup)
             # row_sums_in:       [f32]*NUM_MSB                 — row_sums accumulated
             # to this point
-            def _ep_finish(o_tiles, sp_pairs_in, exp_delta_rescale, v_base_for_pv,
-                           old_max_in, local_max_in, delta_in, row_sums_in):
+            def _ep_finish(
+                o_tiles,
+                sp_pairs_in,
+                exp_delta_rescale,
+                v_base_for_pv,
+                old_max_in,
+                local_max_in,
+                delta_in,
+                row_sums_in,
+            ):
                 sfx = {
-                    'old_max':          list(old_max_in),
-                    'local_max':        list(local_max_in),
-                    'delta':            list(delta_in),
-                    'exp_delta':        [None] * NUM_MSB,
-                    'cur_max_log2e':    [None] * NUM_MSB,
-                    'cur_max_log2e_1':  [None] * NUM_MSB,
-                    'cur_max_log2e_scalar': [None] * NUM_MSB,
-                    'cur_max_log2e_dup':[None] * NUM_MSB,
-                    'vgpr_log2e_scl_pair': [None] * NUM_MSB,
-                    'exp_delta_dup':    [None] * NUM_MSB,
-                    'row_sums':         list(row_sums_in),
-                    'p_bf16':           [[], [], [], []],
-                    'sp_pairs_prev':    sp_pairs_in,
+                    "old_max": list(old_max_in),
+                    "local_max": list(local_max_in),
+                    "delta": list(delta_in),
+                    "exp_delta": [None] * NUM_MSB,
+                    "cur_max_log2e": [None] * NUM_MSB,
+                    "cur_max_log2e_1": [None] * NUM_MSB,
+                    "cur_max_log2e_scalar": [None] * NUM_MSB,
+                    "cur_max_log2e_dup": [None] * NUM_MSB,
+                    "vgpr_log2e_scl_pair": [None] * NUM_MSB,
+                    "exp_delta_dup": [None] * NUM_MSB,
+                    "row_sums": list(row_sums_in),
+                    "p_bf16": [[], [], [], []],
+                    "sp_pairs_prev": sp_pairs_in,
                 }
                 # DBG: print row_sums_in at ep_finish entry
 
@@ -2473,7 +2733,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # MSBs 0,1: pairs 0-3 already exp'd by GEMM2 EXP tokens → start from
                 # PART2_SPLIT.
                 _p2ops = _build_all_softmax_part2_ops(
-                    ty, 0, sp_pairs_in, sfx, sgpr_state,
+                    ty,
+                    0,
+                    sp_pairs_in,
+                    sfx,
+                    sgpr_state,
                 )
                 for _m in fx.range_constexpr(NUM_MSB):
                     for _i in fx.range_constexpr(PART2_SETUP_A - 1):  # ops 0..6
@@ -2491,11 +2755,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     _ed = exp_delta_rescale[_msb]
                     _edv8 = llvm_dialect.mlir_undef(_vf8)
                     for _i in fx.range_constexpr(8):
-                        _ci = arith.unwrap(
-                            arith.constant(_i, type=T.i32)
-                        )
+                        _ci = arith.unwrap(arith.constant(_i, type=T.i32))
                         _edv8 = llvm_dialect.insertelement(
-                            _edv8, _ed, _ci,
+                            _edv8,
+                            _ed,
+                            _ci,
                         )
                     for _n in fx.range_constexpr(N_PV_WMMA_N):
                         o_tiles[_msb][_n] = arith.mulf(o_tiles[_msb][_n], _edv8)
@@ -2506,29 +2770,39 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     _sb = _sp * 2
                     _vr0, _vr1 = _load_v_two_sus_from_lds(ty, _kv_pv, 0, _sb, _sb + 1)
                     o_tiles = _pv_pure_su(
-                        ty, 0, _sb,
+                        ty,
+                        0,
+                        _sb,
                         _pair_v_tiles_for_wmma(_vr0, ty),
-                        p_tiles[_sb], o_tiles,
+                        p_tiles[_sb],
+                        o_tiles,
                     )
                     o_tiles = _pv_pure_su(
-                        ty, 0, _sb + 1,
+                        ty,
+                        0,
+                        _sb + 1,
                         _pair_v_tiles_for_wmma(_vr1, ty),
-                        p_tiles[_sb + 1], o_tiles,
+                        p_tiles[_sb + 1],
+                        o_tiles,
                     )
-
 
                 # 4d: div_cvt
                 _v8f32 = ir.VectorType.get([8], ir.F32Type.get())
                 _v8bf16 = ir.VectorType.get([8], ir.BF16Type.get())
-                _rsf = list(sfx['row_sums'])
-                _lmf = list(sfx['local_max'])
+                _rsf = list(sfx["row_sums"])
+                _lmf = list(sfx["local_max"])
                 for _mb in fx.range_constexpr(0, NUM_MSB, 2):
                     _sm = arith.addf(_rsf[_mb], _rsf[_mb + 1])
                     _slo = arith.unwrap(arith.constant(0x76543210, type=T.i32))
-                    _shi = arith.unwrap(arith.constant(0xfedcba98, type=T.i32))
+                    _shi = arith.unwrap(arith.constant(0xFEDCBA98, type=T.i32))
                     _pm = _rocdl_permlanex16(
-                        ty['f32'], _sm, _sm,
-                        _slo, _shi, False, False,
+                        ty["f32"],
+                        _sm,
+                        _sm,
+                        _slo,
+                        _shi,
+                        False,
+                        False,
                     )
                     _sf = arith.addf(_sm, _pm)
                     _rsf[_mb] = _sf
@@ -2537,7 +2811,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _lse_vals = [None] * NUM_MSB
                 for _msb in fx.range_constexpr(NUM_MSB):
                     _mxs = arith.mulf(_lmf[_msb], scalar_f)
-                    _lgs = rocdl.log(ty['f32'], _rsf[_msb])
+                    _lgs = rocdl.log(ty["f32"], _rsf[_msb])
                     _lse_vals[_msb] = arith.addf(arith.mulf(_lgs, _l2e), _mxs)
 
                 # Store LSE to global: ptr_LSE layout (total_q, nheads) fp32
@@ -2546,14 +2820,12 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     # lane_lo + msb_off
                     from flydsl._mlir.dialects import fly as _fly_lse
                     from flydsl._mlir.dialects import llvm as _llvm_lse
+
                     _i64_lse = ir.IntegerType.get_signless(64)
                     _glbpt_lse = ir.Type.parse("!llvm.ptr<1>")
                     _lse_raw = ptr_LSE.__extract_to_ir_values__()[0]
-                    _lse_base = (
-                        _fly_lse
-                        .extract_aligned_pointer_as_index(
-                            _glbpt_lse, _lse_raw
-                        )
+                    _lse_base = _fly_lse.extract_aligned_pointer_as_index(
+                        _glbpt_lse, _lse_raw
                     )
                     _lse_base_i64 = _llvm_lse.ptrtoint(_i64_lse, _lse_base)
 
@@ -2566,9 +2838,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     )
 
                     _lse_bx128 = arith.muli(
-                        arith.unwrap(bx), arith.unwrap(arith.constant(128, type=T.i32)))
+                        arith.unwrap(bx), arith.unwrap(arith.constant(128, type=T.i32))
+                    )
                     _lse_wv32 = arith.muli(
-                        _wv_lse, arith.unwrap(arith.constant(WV_SUBQD, type=T.i32)))
+                        _wv_lse, arith.unwrap(arith.constant(WV_SUBQD, type=T.i32))
+                    )
                     _lse_base_row = arith.addi(_lse_bx128, _lse_wv32)
 
                     for _msb_lse in [0, 2]:
@@ -2577,10 +2851,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                             _lse_base_row,
                             arith.addi(
                                 _lane_lo_lse,
-                                arith.unwrap(arith.constant(_msb_off, type=T.i32))))
+                                arith.unwrap(arith.constant(_msb_off, type=T.i32)),
+                            ),
+                        )
                         _lse_valid = arith.cmpi(
                             arith.CmpIPredicate.slt,
-                            _seq_pos, actual_q_len,
+                            _seq_pos,
+                            actual_q_len,
                         )
                         _lse_if = scf.IfOp(_lse_valid)
                         with _if_then(_lse_if):
@@ -2588,34 +2865,35 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                             _lse_tok = arith.addi(q_start_tok, _seq_pos)
                             # elem_off = tok * nheads + head
                             _lse_elem_off = arith.addi(
-                                arith.muli(_lse_tok, _gdz),
-                                arith.unwrap(by))
+                                arith.muli(_lse_tok, _gdz), arith.unwrap(by)
+                            )
                             _lse_byte_off = arith.muli(
                                 _lse_elem_off,
-                                arith.unwrap(arith.constant(4, type=T.i32)))
+                                arith.unwrap(arith.constant(4, type=T.i32)),
+                            )
                             _lse_byte_off_i64 = arith.extsi(_i64_lse, _lse_byte_off)
                             _lse_addr = arith.addi(_lse_base_i64, _lse_byte_off_i64)
                             _lse_ptr = _llvm_lse.inttoptr(_glbpt_lse, _lse_addr)
                             _llvm_lse.store(_lse_vals[_msb_lse], _lse_ptr)
                 _obf16 = []
                 for _msb in fx.range_constexpr(NUM_MSB):
-                    _rcp = rocdl.rcp(ty['f32'], _rsf[_msb])
+                    _rcp = rocdl.rcp(ty["f32"], _rsf[_msb])
                     _rv8 = llvm_dialect.mlir_undef(_v8f32)
                     for _i in fx.range_constexpr(8):
-                        _ci = arith.unwrap(
-                            arith.constant(_i, type=T.i32)
-                        )
+                        _ci = arith.unwrap(arith.constant(_i, type=T.i32))
                         _rv8 = llvm_dialect.insertelement(
-                            _rv8, _rcp, _ci,
+                            _rv8,
+                            _rcp,
+                            _ci,
                         )
                     _mb16 = []
                     for _n in fx.range_constexpr(N_PV_WMMA_N):
-                        _mb16.append(arith.truncf(
-                            _v8bf16,
-                            arith.mulf(
-                                o_tiles[_msb][_n], _rv8
-                            ),
-                        ))
+                        _mb16.append(
+                            arith.truncf(
+                                _v8bf16,
+                                arith.mulf(o_tiles[_msb][_n], _rv8),
+                            )
+                        )
                     _obf16.append(_mb16)
 
                 # Barrier: ensure all waves finish PV before any wave writes D to V_a
@@ -2632,53 +2910,52 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _db32 = _extract_lds_base_i32(_lds_alloc_v_a.get_base())
                 _dw_wv = arith.muli(
                     arith.unwrap(wave_id),
-                    arith.unwrap(
-                        arith.constant(
-                            LDS_D_WV_SIZE, type=T.i32
-                        )
-                    ),
+                    arith.unwrap(arith.constant(LDS_D_WV_SIZE, type=T.i32)),
                 )
                 _dw = arith.addi(_db32, _dw_wv)
-                _llo = arith.unwrap(arith.andi(
-                    lane_id,
-                    arith.constant(15, type=T.i32),
-                ))
-                _lhi = arith.unwrap(arith.shrui(
-                    lane_id,
-                    arith.constant(4, type=T.i32),
-                ))
+                _llo = arith.unwrap(
+                    arith.andi(
+                        lane_id,
+                        arith.constant(15, type=T.i32),
+                    )
+                )
+                _lhi = arith.unwrap(
+                    arith.shrui(
+                        lane_id,
+                        arith.constant(4, type=T.i32),
+                    )
+                )
                 _loff = arith.addi(
                     arith.muli(
                         _llo,
-                        arith.unwrap(arith.constant(
-                            TDM_D_TILE_DIM0, type=T.i32
-                        )),
+                        arith.unwrap(arith.constant(TDM_D_TILE_DIM0, type=T.i32)),
                     ),
                     arith.muli(
                         _lhi,
-                        arith.unwrap(
-                            arith.constant(16, type=T.i32)
-                        ),
+                        arith.unwrap(arith.constant(16, type=T.i32)),
                     ),
                 )
                 for _msb in fx.range_constexpr(NUM_MSB):
                     for _n in fx.range_constexpr(N_PV_WMMA_N):
                         _ioff = (
-                            (_msb // 2) * 16
-                            * TDM_D_TILE_DIM0
+                            (_msb // 2) * 16 * TDM_D_TILE_DIM0
                             + (_msb % 2) * 128
                             + _n * 32
                         )
                         _la = arith.addi(
                             arith.addi(_dw, _loff),
-                            arith.unwrap(arith.constant(_ioff, type=T.i32)))
+                            arith.unwrap(arith.constant(_ioff, type=T.i32)),
+                        )
                         llvm_dialect.store(
                             vector.bitcast(_v4i32t, _obf16[_msb][_n]),
-                            llvm_dialect.inttoptr(_ldst, _la), volatile_=True)
+                            llvm_dialect.inttoptr(_ldst, _la),
+                            volatile_=True,
+                        )
                 _emit_void("s_wait_dscnt 0x0")
                 _wsgpr = rocdl.wave_id()
                 from flydsl._mlir.dialects import fly as _fly2
                 from flydsl._mlir.dialects import llvm as _llvm2
+
                 _i64t = ir.IntegerType.get_signless(64)
                 _glbpt = ir.Type.parse("!llvm.ptr<1>")
                 # THD O element offset:
@@ -2688,20 +2965,12 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         q_start_tok,
                         arith.muli(
                             bx,
-                            arith.unwrap(
-                                arith.constant(
-                                    128, type=T.i32
-                                )
-                            ),
+                            arith.unwrap(arith.constant(128, type=T.i32)),
                         ),
                     ),
                     arith.muli(
                         _wsgpr,
-                        arith.unwrap(
-                            arith.constant(
-                                WV_SUBQD, type=T.i32
-                            )
-                        ),
+                        arith.unwrap(arith.constant(WV_SUBQD, type=T.i32)),
                     ),
                 )
                 _o_elem_off = arith.addi(
@@ -2713,9 +2982,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _o64 = _llvm2.ptrtoint(_i64t, _o_gp)
                 _boff32 = arith.muli(
                     _o_elem_off,
-                    arith.unwrap(
-                        arith.constant(2, type=T.i32)
-                    ),
+                    arith.unwrap(arith.constant(2, type=T.i32)),
                 )
                 _boff64 = arith.extsi(_i64t, _boff32)
                 _oadr64 = arith.addi(_o64, _boff64)
@@ -2724,36 +2991,28 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     _extract_lds_base_i32(_lds_alloc_v_a.get_base()),
                     arith.muli(
                         _wsgpr,
-                        arith.unwrap(arith.constant(
-                            LDS_D_WV_SIZE, type=T.i32
-                        )),
+                        arith.unwrap(arith.constant(LDS_D_WV_SIZE, type=T.i32)),
                     ),
                 )
                 _dg0 = vector.from_elements(
                     T.vec(4, T.i32),
                     [
-                        arith.unwrap(
-                            arith.constant(1, type=T.i32)
-                        ),
-                        _olds2, _alo, _ahi,
+                        arith.unwrap(arith.constant(1, type=T.i32)),
+                        _olds2,
+                        _alo,
+                        _ahi,
                     ],
                 )
                 _g0 = arith.unwrap(arith.constant((1 << 16) | 0, type=T.i32))
                 _g1 = arith.unwrap(arith.constant((128 & 0xFFFF) << 16, type=T.i32))
                 _i32_o = ir.IntegerType.get_signless(32)
-                _td1_lo_o = arith.andi(_o_oob_dim1,
-                    arith.constant(0xFFFF, type=T.i32))
+                _td1_lo_o = arith.andi(_o_oob_dim1, arith.constant(0xFFFF, type=T.i32))
                 _g2 = arith.ori(
-                    arith.shli(_td1_lo_o,
-                        arith.constant(16, type=T.i32)),
-                    arith.constant((128>>16)&0xFFFF, type=T.i32))
-                _g3_val = (
-                    ((32 >> 16) & 0xFFFF)
-                    | ((128 & 0xFFFF) << 16)
+                    arith.shli(_td1_lo_o, arith.constant(16, type=T.i32)),
+                    arith.constant((128 >> 16) & 0xFFFF, type=T.i32),
                 )
-                _g3 = arith.unwrap(
-                    arith.constant(_g3_val, type=T.i32)
-                )
+                _g3_val = ((32 >> 16) & 0xFFFF) | ((128 & 0xFFFF) << 16)
+                _g3 = arith.unwrap(arith.constant(_g3_val, type=T.i32))
                 _g4 = arith.unwrap(arith.constant(32 & 0xFFFF, type=T.i32))
                 _g5 = stride_o_seq
                 _g6 = arith.unwrap(arith.constant(0, type=T.i32))
@@ -2761,8 +3020,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _dg1 = vector.from_elements(
                     T.vec(8, T.i32),
                     [
-                        _g0, _g1, _g2, _g3,
-                        _g4, _g5, _g6, _g7,
+                        _g0,
+                        _g1,
+                        _g2,
+                        _g3,
+                        _g4,
+                        _g5,
+                        _g6,
+                        _g7,
                     ],
                 )
                 tdm_ops.tensor_store_2d(tdm_ops.TDMDescriptor2D(_dg0, _dg1))
@@ -2780,40 +3045,50 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     for _m in fx.range_constexpr(NUM_MSB)
                 ]
                 _et_sfx = {
-                    'old_max':          list(ep_old_max),
-                    'local_max':        list(ep_local_max),
-                    'delta':            list(ep_delta),
-                    'exp_delta':        [None] * NUM_MSB,
-                    'cur_max_log2e':    [None] * NUM_MSB,
-                    'cur_max_log2e_1':  [None] * NUM_MSB,
-                    'cur_max_log2e_scalar': [None] * NUM_MSB,
-                    'cur_max_log2e_dup':[None] * NUM_MSB,
-                    'vgpr_log2e_scl_pair': [None] * NUM_MSB,
-                    'exp_delta_dup':    [None] * NUM_MSB,
-                    'row_sums':         list(ep_row_sums),
-                    'p_bf16':           [[], [], [], []],
-                    'sp_pairs_prev':    [[ep_partial_sp_pairs[_m][_i]
-                                          for _i in fx.range_constexpr(N_SP_PAIRS)]
-                                         for _m in fx.range_constexpr(NUM_MSB)],
+                    "old_max": list(ep_old_max),
+                    "local_max": list(ep_local_max),
+                    "delta": list(ep_delta),
+                    "exp_delta": [None] * NUM_MSB,
+                    "cur_max_log2e": [None] * NUM_MSB,
+                    "cur_max_log2e_1": [None] * NUM_MSB,
+                    "cur_max_log2e_scalar": [None] * NUM_MSB,
+                    "cur_max_log2e_dup": [None] * NUM_MSB,
+                    "vgpr_log2e_scl_pair": [None] * NUM_MSB,
+                    "exp_delta_dup": [None] * NUM_MSB,
+                    "row_sums": list(ep_row_sums),
+                    "p_bf16": [[], [], [], []],
+                    "sp_pairs_prev": [
+                        [
+                            ep_partial_sp_pairs[_m][_i]
+                            for _i in fx.range_constexpr(N_SP_PAIRS)
+                        ]
+                        for _m in fx.range_constexpr(NUM_MSB)
+                    ],
                 }
                 # DBG: row_sums entering endtile core_loop (= ep_row_sums from
                 # loop_results)
 
                 _et_z = arith.unwrap(arith.constant(0, type=T.i32))
                 _et_tdm = {
-                    'v_g0': vector.broadcast(ty['v4i32'], _et_z),
-                    'v_g1': vector.broadcast(ty['v8i32'], _et_z),
-                    'k_g0': vector.broadcast(ty['v4i32'], _et_z),
-                    'k_g1': vector.broadcast(ty['v8i32'], _et_z),
-                    'v_salu_queue': [], 'k_salu_queue': [],
+                    "v_g0": vector.broadcast(ty["v4i32"], _et_z),
+                    "v_g1": vector.broadcast(ty["v8i32"], _et_z),
+                    "k_g0": vector.broadcast(ty["v4i32"], _et_z),
+                    "k_g1": vector.broadcast(ty["v8i32"], _et_z),
+                    "v_salu_queue": [],
+                    "k_salu_queue": [],
                 }
-                _et_o = [[ep_o_tiles[_d][_n] for _n in range(N_PV_WMMA_N)]
-                         for _d in range(NUM_MSB)]
+                _et_o = [
+                    [ep_o_tiles[_d][_n] for _n in range(N_PV_WMMA_N)]
+                    for _d in range(NUM_MSB)
+                ]
                 if const_expr(IS_CAUSAL):
                     _et_tile_n_start = arith.muli(
-                        arith.subi(arith.index_cast(T.i32, num_tiles_idx),
-                                   arith.constant(1, type=T.i32)),
-                        arith.constant(TILE_N, type=T.i32))
+                        arith.subi(
+                            arith.index_cast(T.i32, num_tiles_idx),
+                            arith.constant(1, type=T.i32),
+                        ),
+                        arith.constant(TILE_N, type=T.i32),
+                    )
                     _et_causal_ns = arith.subi(_et_tile_n_start, _causal_offset)
                 else:
                     _et_causal_ns = None
@@ -2822,27 +3097,39 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     arith.muli(
                         arith.subi(
                             num_tiles,
-                            arith.unwrap(
-                                arith.constant(
-                                    1, type=T.i32
-                                )
-                            ),
+                            arith.unwrap(arith.constant(1, type=T.i32)),
                         ),
-                        tile_n_const))
+                        tile_n_const,
+                    ),
+                )
                 _et_v_oob_dg1 = [
                     _make_kv_dg1_with_oob(
-                        _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
+                        _V_CFG_OOB,
+                        128,
+                        8,
+                        _stride_v_elems_oob,
                         _per_warp_oob_dim1(
-                            arith.subi(_et_kv_remain,
-                                arith.unwrap(arith.constant(_su * 32, type=T.i32))),
-                            wave_id, 8))
+                            arith.subi(
+                                _et_kv_remain,
+                                arith.unwrap(arith.constant(_su * 32, type=T.i32)),
+                            ),
+                            wave_id,
+                            8,
+                        ),
+                    )
                     for _su in range(CNT_SU)
                 ]
                 _, _, _et_o, _, _et_psp_lo, _et_psp_hi, _et_ped = _core_loop(
-                    ty, False,
-                    q_frags, ep_kv_tiles, _et_sp_t,
+                    ty,
+                    False,
+                    q_frags,
+                    ep_kv_tiles,
+                    _et_sp_t,
                     _et_o,
-                    ep_kv_lds_addrs, _et_tdm, _et_sfx, sgpr_state,
+                    ep_kv_lds_addrs,
+                    _et_tdm,
+                    _et_sfx,
+                    sgpr_state,
                     gemm2=True,
                     tdm_v_offset=ep_v_endtile_offset,
                     tdm_v_target=ep_v_next_base,
@@ -2860,23 +3147,32 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # Reconstruct v2f32 sp_pairs for _ep_finish from safe f32 lo+hi scalars.
                 _et_psp = []
                 for _rpsm in fx.range_constexpr(NUM_MSB):
-                    _rpairs = [_make_v2f32(_et_psp_lo[_rpsm * N_SP_PAIRS + _rpi],
-                                           _et_psp_hi[_rpsm * N_SP_PAIRS + _rpi], _rpsm)
-                               for _rpi in fx.range_constexpr(N_SP_PAIRS)]
+                    _rpairs = [
+                        _make_v2f32(
+                            _et_psp_lo[_rpsm * N_SP_PAIRS + _rpi],
+                            _et_psp_hi[_rpsm * N_SP_PAIRS + _rpi],
+                            _rpsm,
+                        )
+                        for _rpi in fx.range_constexpr(N_SP_PAIRS)
+                    ]
                     _et_psp.append(_rpairs)
                 rocdl.s_wait_tensorcnt(0)
                 rocdl.s_barrier_signal(-1)
                 rocdl.s_barrier_wait(-1)
                 _ep_finish(
-                    _et_o, _et_psp, _et_ped, ep_v_next_base,
-                    _et_sfx['old_max'], _et_sfx['local_max'],
-                    _et_sfx['delta'], _et_sfx['row_sums'],
+                    _et_o,
+                    _et_psp,
+                    _et_ped,
+                    ep_v_next_base,
+                    _et_sfx["old_max"],
+                    _et_sfx["local_max"],
+                    _et_sfx["delta"],
+                    _et_sfx["row_sums"],
                 )
             else:  # N=1: original epilogue flow
                 _ep_finish(
                     [
-                        [ep_o_tiles[_d][_n]
-                         for _n in range(N_PV_WMMA_N)]
+                        [ep_o_tiles[_d][_n] for _n in range(N_PV_WMMA_N)]
                         for _d in range(NUM_MSB)
                     ],
                     ep_partial_sp_pairs,
@@ -2909,16 +3205,20 @@ def _patch_reusable_slot_specs():
     from flydsl.expr.numeric import Float32, Float64
 
     if not hasattr(Float32, "_reusable_slot_spec"):
+
         @classmethod
         def _f32_slot_spec(cls, arg):
             return ctypes.c_float, lambda a: a.value if hasattr(a, "value") else a
+
         Float32._reusable_slot_spec = _f32_slot_spec
         Float32._reusable_ctype = ctypes.c_float
 
     if not hasattr(Float64, "_reusable_slot_spec"):
+
         @classmethod
         def _f64_slot_spec(cls, arg):
             return ctypes.c_double, lambda a: a.value if hasattr(a, "value") else a
+
         Float64._reusable_slot_spec = _f64_slot_spec
         Float64._reusable_ctype = ctypes.c_double
 
@@ -2967,18 +3267,35 @@ def _ensure_kernel(is_causal: bool, return_lse: bool = False):
             _lds_alloc_v_a.finalize()
             _lds_alloc_v_b.finalize()
 
-        num_tg = arith.index_cast(T.index, arith.ceildivui(
-            arith.unwrap(max_seqlen_q), arith.constant(BLOCK_M, type=T.i32)))
+        num_tg = arith.index_cast(
+            T.index,
+            arith.ceildivui(
+                arith.unwrap(max_seqlen_q), arith.constant(BLOCK_M, type=T.i32)
+            ),
+        )
         grid_x = arith.index_cast(T.index, batch_size)
         grid_z = arith.index_cast(T.index, num_heads)
 
         launcher = kernel(
-            ptr_O, ptr_Q, ptr_K, ptr_V, ptr_LSE,
-            ptr_cu_seqlens_q, ptr_cu_seqlens_k,
+            ptr_O,
+            ptr_Q,
+            ptr_K,
+            ptr_V,
+            ptr_LSE,
+            ptr_cu_seqlens_q,
+            ptr_cu_seqlens_k,
             scalar_f,
-            stride_q_seq, stride_k_seq, stride_v_seq, stride_o_seq,
-            stride_q_head, stride_k_head, stride_v_head, stride_o_head,
-            gqa, max_seqlen_q, max_seqlen_k,
+            stride_q_seq,
+            stride_k_seq,
+            stride_v_seq,
+            stride_o_seq,
+            stride_q_head,
+            stride_k_head,
+            stride_v_head,
+            stride_o_head,
+            gqa,
+            max_seqlen_q,
+            max_seqlen_k,
         )
         launcher.launch(
             grid=(grid_x, num_tg, grid_z),
@@ -3013,12 +3330,10 @@ def flash_attn_varlen_d192_gfx1250(
 ):
     assert q.dtype == torch.bfloat16, f"Expected bf16, got {q.dtype}"
     assert q.shape[-1] == HEAD_DIM_QK, (
-        f"Expected headdim_qk={HEAD_DIM_QK},"
-        f" got {q.shape[-1]}"
+        f"Expected headdim_qk={HEAD_DIM_QK}," f" got {q.shape[-1]}"
     )
     assert v.shape[-1] == HEAD_DIM_V, (
-        f"Expected headdim_v={HEAD_DIM_V},"
-        f" got {v.shape[-1]}"
+        f"Expected headdim_v={HEAD_DIM_V}," f" got {v.shape[-1]}"
     )
 
     total_q_tokens = q.shape[0]
@@ -3028,12 +3343,13 @@ def flash_attn_varlen_d192_gfx1250(
     gqa = nheads_q // nheads_k
 
     if softmax_scale is None:
-        softmax_scale = 1.0 / (HEAD_DIM_QK ** 0.5)
+        softmax_scale = 1.0 / (HEAD_DIM_QK**0.5)
 
     if out is None:
         out = torch.empty(
             (total_q_tokens, nheads_q, HEAD_DIM_V),
-            dtype=torch.bfloat16, device=q.device,
+            dtype=torch.bfloat16,
+            device=q.device,
         )
     if return_lse:
         lse = torch.zeros(
@@ -3058,13 +3374,27 @@ def flash_attn_varlen_d192_gfx1250(
     _run_compiled(
         _launch_fns[(bool(causal), bool(return_lse))],
         (
-            out, q, k, v, lse,
-            cu_seqlens_q, cu_seqlens_k,
+            out,
+            q,
+            k,
+            v,
+            lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
             softmax_scale,
-            stride_q_seq, stride_k_seq, stride_v_seq, stride_o_seq,
-            stride_q_head, stride_k_head, stride_v_head, stride_o_head,
-            gqa, max_seqlen_q, max_seqlen_k,
-            nheads_q, batch,
+            stride_q_seq,
+            stride_k_seq,
+            stride_v_seq,
+            stride_o_seq,
+            stride_q_head,
+            stride_k_head,
+            stride_v_head,
+            stride_o_head,
+            gqa,
+            max_seqlen_q,
+            max_seqlen_k,
+            nheads_q,
+            batch,
         ),
     )
 

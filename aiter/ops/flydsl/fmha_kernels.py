@@ -243,15 +243,9 @@ def flydsl_flash_attn_varlen_func(
         and q.dtype == torch.bfloat16
     ):
         assert bias is None, "FlyDSL MHA does not support bias"
-        assert alibi_slopes is None, (
-            "FlyDSL MHA does not support alibi_slopes"
-        )
-        assert not deterministic, (
-            "FlyDSL MHA does not support deterministic"
-        )
-        assert not return_attn_probs, (
-            "FlyDSL MHA does not support return_attn_probs"
-        )
+        assert alibi_slopes is None, "FlyDSL MHA does not support alibi_slopes"
+        assert not deterministic, "FlyDSL MHA does not support deterministic"
+        assert not return_attn_probs, "FlyDSL MHA does not support return_attn_probs"
         assert sink is None, "FlyDSL MHA does not support sink"
         # gfx1250 — varlen THD, D_qk=192 D_v=128, bf16
         if out is None:

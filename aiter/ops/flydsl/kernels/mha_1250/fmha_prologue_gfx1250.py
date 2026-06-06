@@ -18,7 +18,9 @@ from flydsl.expr import arith, rocdl, vector
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from fmha_core_loop_gfx1250 import (
-    QK_HDIM, _rocdl_permlanex16, _rocdl_exp2,
+    QK_HDIM,
+    _rocdl_permlanex16,
+    _rocdl_exp2,
     set_vgpr_bank,
 )
 
@@ -32,20 +34,20 @@ BLOCK_SIZE = WAVE_SIZE * NUM_WAVES
 
 Q_TILE_M = 128
 Q_TILE_D = QK_HDIM  # = 192
-K_TILE_N = 128       # TDM load tile = compute tile (N=128)
-K_COMPUTE_N = 128    # compute tile (QK WMMA uses SU0+SU1)
+K_TILE_N = 128  # TDM load tile = compute tile (N=128)
+K_COMPUTE_N = 128  # compute tile (QK WMMA uses SU0+SU1)
 K_SU_SIZE = 64
-NUM_K_SU = 2         # TDM loads 2 SUs (= compute)
+NUM_K_SU = 2  # TDM loads 2 SUs (= compute)
 NUM_K_SU_COMPUTE = 2
 
 # TDM dim0=200 -> LDS inner stride = 200*2 = 400B
 # (2-way bank conflicts)
 K_ROW_BYTES = 400
 V_ROW_BYTES = 288
-K_SU_HALF_OFFSET = 0x1900   # 16 * K_ROW_BYTES = 16 * 400 = 6400
+K_SU_HALF_OFFSET = 0x1900  # 16 * K_ROW_BYTES = 16 * 400 = 6400
 V_SU_HALF_OFFSET = 0x1200
-V_LDS_OFFSET = 0x8800       # after 2 K SUs: 2×0x4400
-PINGPONG_OFFSET = 0x11800   # one-ping: K(0x8800)+V(0x9000)
+V_LDS_OFFSET = 0x8800  # after 2 K SUs: 2×0x4400
+PINGPONG_OFFSET = 0x11800  # one-ping: K(0x8800)+V(0x9000)
 K_SU1_OFFSET = 0x4400
 V_SU1_OFFSET = 0x4800
 
@@ -66,17 +68,29 @@ GROUP_CONFIG = [
 
 # Accumulator column base for causal mask
 ACC_COL_BASE = {
-    (0, 0): 0, (0, 1): 16, (2, 0): 64, (2, 1): 80,
-    (1, 0): 8, (1, 1): 24, (3, 0): 72, (3, 1): 88,
-    (0, 2): 32, (0, 3): 48, (2, 2): 96, (2, 3): 112,
-    (1, 2): 40, (1, 3): 56, (3, 2): 104, (3, 3): 120,
+    (0, 0): 0,
+    (0, 1): 16,
+    (2, 0): 64,
+    (2, 1): 80,
+    (1, 0): 8,
+    (1, 1): 24,
+    (3, 0): 72,
+    (3, 1): 88,
+    (0, 2): 32,
+    (0, 3): 48,
+    (2, 2): 96,
+    (2, 3): 112,
+    (1, 2): 40,
+    (1, 3): 56,
+    (3, 2): 104,
+    (3, 3): 120,
 }
 
 # TDM config constants.
 # K: dim0=192 (QK_HDIM), no padding. QK_HDIM=192 is not a multiple of any
 # power-of-2 pad_interval that fits in one pad per row, so we skip padding to
 # avoid the continuous-stream rotation bug. No bank-conflict padding for K.
-_K_TDM_CONFIG = (1 << 16)  # data_size=1 (bf16), pad_enable=0
+_K_TDM_CONFIG = 1 << 16  # data_size=1 (bf16), pad_enable=0
 # V: dim0=128, pad_interval=128 elems=64dwords → enc_interval=5, 32B pad → enc_amount=7
 _V_TDM_CONFIG = (1 << 20) | (5 << 22) | (7 << 25)
 
@@ -87,20 +101,22 @@ _V_TDM_CONFIG = (1 << 20) | (5 << 22) | (7 << 25)
 
 _NUW_ATTR = None
 
+
 def _get_nuw():
     global _NUW_ATTR
     if _NUW_ATTR is None:
         _NUW_ATTR = ir.Attribute.parse("#arith.overflow<nuw>")
     return _NUW_ATTR
 
+
 def _add_nuw(a, b):
     """arith.addi with nuw flag — enables gfx1250 buffer offset folding."""
     return arith.unwrap(arith.addi(a, b, overflow_flags=_get_nuw()))
 
+
 def _mul_nuw(a, b):
     """arith.muli with nuw flag — preserves nuw through constant folding."""
     return arith.unwrap(arith.muli(a, b, overflow_flags=_get_nuw()))
-
 
 
 def _acc_bank(g_idx, tile):
@@ -112,9 +128,11 @@ def _permlanex16_f32(src):
     i32_ty = ir.IntegerType.get_signless(32)
     src_i32 = arith.bitcast(i32_ty, src)
     result_i32 = llvm_dialect.inline_asm(
-        i32_ty, [src_i32],
+        i32_ty,
+        [src_i32],
         "v_permlanex16_b32 $0, $1, 0, 0",
-        "=v,0", has_side_effects=True,
+        "=v,0",
+        has_side_effects=True,
     )
     return arith.bitcast(ir.F32Type.get(), result_i32)
 
@@ -129,12 +147,13 @@ def _setreg(hwreg_enc, value):
 
 def _emit_void(inst_str, operands=None, constraints="", **kwargs):
     llvm_dialect.inline_asm(
-        None, operands or [], inst_str, constraints,
-        has_side_effects=True, **kwargs)
+        None, operands or [], inst_str, constraints, has_side_effects=True, **kwargs
+    )
 
 
 def _s_wait_tensorcnt(cnt):
     from flydsl.expr import rocdl as _rocdl_expr
+
     _rocdl_expr.s_wait_tensorcnt(cnt)
 
 
@@ -164,7 +183,10 @@ def make_wmma_frag_bf16(vec4_lo, vec4_hi):
 
 
 def _phase4_q_load_flydsl(
-    lane_id, q_rsrc, stride_q_seq, wave_id,
+    lane_id,
+    q_rsrc,
+    stride_q_seq,
+    wave_id,
     q_tile_offset_bytes=None,
 ):
     """Load Q tile (QK_HDIM x TG_Q_ROWS bf16) ->
@@ -177,10 +199,11 @@ def _phase4_q_load_flydsl(
     lane_hi = arith.shrui(lane_id, arith.constant(4, type=T.i32))
     base = arith.addi(
         arith.muli(lane_lo, stride_q_seq),
-        arith.muli(lane_hi, arith.constant(16, type=T.i32)))
+        arith.muli(lane_hi, arith.constant(16, type=T.i32)),
+    )
     wave_off = arith.muli(
-        arith.muli(wave_id, arith.constant(32, type=T.i32)),
-        stride_q_seq)
+        arith.muli(wave_id, arith.constant(32, type=T.i32)), stride_q_seq
+    )
     q_byte_off = arith.addi(base, wave_off)
 
     q_elem_off = arith.shrui(q_byte_off, arith.constant(2, type=T.i32))
@@ -190,9 +213,7 @@ def _phase4_q_load_flydsl(
     aux_zero = arith.unwrap(arith.constant(0, type=T.i32))
 
     four_i32 = arith.unwrap(arith.constant(4, type=T.i32))
-    q_base_bytes = _mul_nuw(
-        arith.unwrap(q_elem_off), four_i32
-    )
+    q_base_bytes = _mul_nuw(arith.unwrap(q_elem_off), four_i32)
     if q_tile_offset_bytes is not None:
         q_base_bytes = _add_nuw(q_tile_offset_bytes, q_base_bytes)
     stride_16_bytes = arith.unwrap(
@@ -200,11 +221,11 @@ def _phase4_q_load_flydsl(
     )
 
     # K-half byte offset = QK_HDIM bytes (splits K cols in half per bank pair)
-    _K_HALF_BYTES = QK_HDIM               # 192 for 192-dim, 128 for 128-dim
+    _K_HALF_BYTES = QK_HDIM  # 192 for 192-dim, 128 for 128-dim
     # Each bank covers half of QK_HDIM: QK_HDIM/2 elements / WMMA_K(32) = frags_per_bank
     # = 3 for 192-dim (96 K cols / 32 = 3), 2 for 128-dim
     _FRAGS_PER_BANK = (QK_HDIM // 2) // 32
-    _LOADS_PER_BANK = _FRAGS_PER_BANK * 2   # 2 raw loads per v16bf16 frag
+    _LOADS_PER_BANK = _FRAGS_PER_BANK * 2  # 2 raw loads per v16bf16 frag
 
     bank_offsets_bytes = [
         arith.unwrap(arith.constant(0, type=T.i32)),
@@ -212,9 +233,7 @@ def _phase4_q_load_flydsl(
         stride_16_bytes,
         _add_nuw(
             stride_16_bytes,
-            arith.unwrap(
-                arith.constant(_K_HALF_BYTES, type=T.i32)
-            ),
+            arith.unwrap(arith.constant(_K_HALF_BYTES, type=T.i32)),
         ),
     ]
 
@@ -231,12 +250,11 @@ def _phase4_q_load_flydsl(
             else:
                 voff = _add_nuw(
                     bank_voff,
-                    arith.unwrap(
-                        arith.constant(i * 32, type=T.i32)
-                    ),
+                    arith.unwrap(arith.constant(i * 32, type=T.i32)),
                 )
             loaded = rocdl.raw_ptr_buffer_load(
-                vec4i32_ty, q_rsrc, voff, soff_zero, aux_zero)
+                vec4i32_ty, q_rsrc, voff, soff_zero, aux_zero
+            )
             bank_loads.append(set_vgpr_bank(loaded, bank))
         rocdl.sched_barrier(0)
         bank_frags = []
@@ -255,7 +273,8 @@ def _phase9a_k_lds_addr_gen(lane_id, wave_id):
     lane_hi = arith.shrui(lane_id, arith.constant(4, type=T.i32))
     base = arith.addi(
         arith.muli(lane_lo, arith.constant(K_ROW_BYTES, type=T.i32)),
-        arith.muli(lane_hi, arith.constant(16, type=T.i32)))
+        arith.muli(lane_hi, arith.constant(16, type=T.i32)),
+    )
 
     seg1 = arith.addi(base, arith.constant(K_SU_HALF_OFFSET, type=T.i32))
     seg2 = arith.addi(base, arith.constant(PINGPONG_OFFSET, type=T.i32))
@@ -264,7 +283,8 @@ def _phase9a_k_lds_addr_gen(lane_id, wave_id):
     wave_is_odd = arith.cmpi(
         arith.CmpIPredicate.ne,
         arith.andi(wave_id, arith.constant(1, type=T.i32)),
-        arith.constant(0, type=T.i32))
+        arith.constant(0, type=T.i32),
+    )
 
     a0 = arith.unwrap(arith.select(wave_is_odd, seg2, base))
     a1 = arith.unwrap(arith.select(wave_is_odd, seg3, seg1))
@@ -290,13 +310,13 @@ def _phase9b_v_lds_addr_gen(lane_id, wave_id):
     lane_shr3 = arith.shrui(lane_id, arith.constant(3, type=T.i32))
     sub_col = arith.shli(
         arith.andi(lane_shr3, arith.constant(1, type=T.i32)),
-        arith.constant(4, type=T.i32))
+        arith.constant(4, type=T.i32),
+    )
 
     addr_base = arith.addi(
-        arith.addi(
-            arith.muli(row, arith.constant(V_ROW_BYTES, type=T.i32)),
-            sub_col),
-        arith.constant(V_LDS_OFFSET, type=T.i32))
+        arith.addi(arith.muli(row, arith.constant(V_ROW_BYTES, type=T.i32)), sub_col),
+        arith.constant(V_LDS_OFFSET, type=T.i32),
+    )
     addr_half = arith.addi(addr_base, arith.constant(V_SU_HALF_OFFSET, type=T.i32))
 
     seg2_a = arith.addi(addr_base, arith.constant(PINGPONG_OFFSET, type=T.i32))
@@ -305,7 +325,8 @@ def _phase9b_v_lds_addr_gen(lane_id, wave_id):
     wave_is_odd = arith.cmpi(
         arith.CmpIPredicate.ne,
         arith.andi(wave_id, arith.constant(1, type=T.i32)),
-        arith.constant(0, type=T.i32))
+        arith.constant(0, type=T.i32),
+    )
 
     s0_a = arith.unwrap(arith.select(wave_is_odd, seg2_a, addr_base))
     s0_h = arith.unwrap(arith.select(wave_is_odd, seg2_h, addr_half))
@@ -398,8 +419,12 @@ def _qk_wmma_64_flydsl(k_frags, q_frags):
                         k_frags[k_bank][k_frag_idx],
                         q_frags[q_bank][q_frag],
                         c_operand,
-                        signA=False, signB=False, modC=0,
-                        reuseA=False, reuseB=False)
+                        signA=False,
+                        signB=False,
+                        modC=0,
+                        reuseA=False,
+                        reuseB=False,
+                    )
                     accs[key] = set_vgpr_bank(result.result, acc_bank)
                 rocdl.sched_barrier(0)
     return accs
@@ -408,7 +433,7 @@ def _qk_wmma_64_flydsl(k_frags, q_frags):
 def _causal_mask_flydsl(accs, row_pos, su_col_offset=0):
     """Apply causal mask: if row < col, set to -inf."""
 
-    neg_inf_raw = arith.unwrap(arith.constant(float('-inf'), type=T.f32))
+    neg_inf_raw = arith.unwrap(arith.constant(float("-inf"), type=T.f32))
 
     for key in accs:
         g_idx, tile = key
@@ -419,8 +444,11 @@ def _causal_mask_flydsl(accs, row_pos, su_col_offset=0):
         for i in fx.range_constexpr(8):
             col = col_base + i
             elem = vector.extract(acc, [], static_position=[i])
-            cmp = arith.unwrap(arith.cmpi(arith.CmpIPredicate.slt, row_pos,
-                                   arith.constant(col, type=T.i32)))
+            cmp = arith.unwrap(
+                arith.cmpi(
+                    arith.CmpIPredicate.slt, row_pos, arith.constant(col, type=T.i32)
+                )
+            )
             masked = llvm_dialect.select(cmp, neg_inf_raw, elem)
             acc = vector.insert(masked, acc, [], static_position=[i])
 
@@ -439,7 +467,7 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
     """
 
     f32 = ir.F32Type.get()
-    neg_inf_raw = arith.unwrap(arith.constant(float('-inf'), type=T.f32))
+    neg_inf_raw = arith.unwrap(arith.constant(float("-inf"), type=T.f32))
     zero_raw = arith.unwrap(arith.constant(0.0, type=T.f32))
     s_zero = arith.unwrap(arith.constant(0, type=T.i32))
 
@@ -476,9 +504,7 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
     row_sum = {}
     for bank in fx.range_constexpr(4):
         neg_ms = set_vgpr_bank(
-            arith.negf(
-                arith.mulf(global_max, softmax_scale_raw)
-            ),
+            arith.negf(arith.mulf(global_max, softmax_scale_raw)),
             bank,
         )
         scale_b = set_vgpr_bank(softmax_scale_raw, bank)
@@ -513,13 +539,16 @@ def _phase6_compute_lds_offsets(wave_id):
 
     k_lds_base = arith.addi(
         arith.muli(wid_odd, arith.constant(PINGPONG_OFFSET, type=T.i32)),
-        arith.muli(wid_half, arith.constant(0x2200, type=T.i32)))
+        arith.muli(wid_half, arith.constant(0x2200, type=T.i32)),
+    )
 
     v_lds_base = arith.addi(
         arith.addi(
             arith.constant(V_LDS_OFFSET, type=T.i32),
-            arith.muli(wid_odd, arith.constant(PINGPONG_OFFSET, type=T.i32))),
-        arith.muli(wid_half, arith.constant(0x2400, type=T.i32)))
+            arith.muli(wid_odd, arith.constant(PINGPONG_OFFSET, type=T.i32)),
+        ),
+        arith.muli(wid_half, arith.constant(0x2400, type=T.i32)),
+    )
 
     return k_lds_base, v_lds_base
 
@@ -528,31 +557,31 @@ def _build_tdm_dgroup1(config_val, stride_i32):
     """Build TDM GROUP1 descriptor (vec<8xi32>)."""
     return vector.from_elements(
         T.vec(8, T.i32),
-        [arith.constant(config_val, type=T.i32),
-         arith.constant(256 << 16, type=T.i32),
-         arith.constant(0, type=T.i32),
-         arith.constant(256 << 16, type=T.i32),
-         arith.constant(32, type=T.i32),
-         stride_i32,
-         arith.constant(0, type=T.i32),
-         arith.constant(0, type=T.i32)])
+        [
+            arith.constant(config_val, type=T.i32),
+            arith.constant(256 << 16, type=T.i32),
+            arith.constant(0, type=T.i32),
+            arith.constant(256 << 16, type=T.i32),
+            arith.constant(32, type=T.i32),
+            stride_i32,
+            arith.constant(0, type=T.i32),
+            arith.constant(0, type=T.i32),
+        ],
+    )
 
 
 def _split_i64_to_lo_hi(val_i64):
     i32 = ir.IntegerType.get_signless(32)
     lo = arith.trunci(i32, val_i64)
-    hi_shifted = arith.shrui(
-        val_i64,
-        arith.constant(32, type=T.i64))
+    hi_shifted = arith.shrui(val_i64, arith.constant(32, type=T.i64))
     hi_raw = arith.trunci(i32, hi_shifted)
-    hi = arith.ori(
-        hi_raw,
-        arith.constant(-2147483648, type=T.i32))
+    hi = arith.ori(hi_raw, arith.constant(-2147483648, type=T.i32))
     return lo, hi
 
 
 def _compute_k_global_addr(arg_K, k_offset, wave_id, stride_k_32):
     from flydsl._mlir.dialects import fly as _fly_d
+
     i64 = ir.IntegerType.get_signless(64)
     glb_ptr_type = ir.Type.parse("!llvm.ptr<1>")
 
@@ -571,6 +600,7 @@ def _compute_k_global_addr(arg_K, k_offset, wave_id, stride_k_32):
 
 def _compute_v_global_addr(arg_V, v_offset, wave_id, stride_v_32):
     from flydsl._mlir.dialects import fly as _fly_d
+
     i64 = ir.IntegerType.get_signless(64)
     glb_ptr_type = ir.Type.parse("!llvm.ptr<1>")
 
@@ -597,8 +627,12 @@ def _k_tdm_setup(arg_K, k_offset, stride_k_seq, stride_k_32, wave_id):
 
 
 def _k_tdm_issue_pair(
-    k_dgroup1, addr_i64, stride_adv_i64,
-    lds_off_0, lds_off_1, wait_count=1,
+    k_dgroup1,
+    addr_i64,
+    stride_adv_i64,
+    lds_off_0,
+    lds_off_1,
+    wait_count=1,
 ):
     """Issue 2 K TDM loads. Returns addr after the 2nd load (for next pair)."""
     pred = arith.constant(1, type=T.i32)
@@ -620,8 +654,12 @@ def _k_tdm_issue_pair(
 
 
 def _phase_first_v_tdm_flydsl(
-    arg_V, v_offset, v_lds_base,
-    stride_v_seq, stride_v_32, wave_id,
+    arg_V,
+    v_offset,
+    v_lds_base,
+    stride_v_seq,
+    stride_v_32,
+    wave_id,
 ):
     """Issue 2 V TDM copies (Global → LDS) for V block 0."""
     i64 = ir.IntegerType.get_signless(64)
@@ -648,7 +686,7 @@ def _phase_first_v_tdm_flydsl(
 
 def _phase7_softmax_init_flydsl():
     """Init softmax state: row_max=-inf, row_sum=0 across 4 banks."""
-    neg_inf = arith.unwrap(arith.constant(float('-inf'), type=T.f32))
+    neg_inf = arith.unwrap(arith.constant(float("-inf"), type=T.f32))
     zero = arith.unwrap(arith.constant(0.0, type=T.f32))
     row_max = {}
     row_sum = {}
@@ -671,8 +709,12 @@ def _phase8_zero_o_accum_flydsl():
 
 
 def _phase_v_tdm_blk1_flydsl(
-    arg_V, v_offset, v_lds_base,
-    stride_v_seq, stride_v_32, wave_id,
+    arg_V,
+    v_offset,
+    v_lds_base,
+    stride_v_seq,
+    stride_v_32,
+    wave_id,
 ):
     """V TDM block 1 (2 copies)."""
     i64 = ir.IntegerType.get_signless(64)
@@ -706,4 +748,3 @@ def _phase_v_tdm_blk1_flydsl(
 
 # ============================================================================
 # Main Kernel
-
