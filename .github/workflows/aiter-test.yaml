@@ -434,6 +434,16 @@ jobs:
           echo "$AITER_TEST"
 
       - name: Download Aiter wheel artifact
+        id: download_aiter_wheel
+        uses: actions/download-artifact@v4
+        timeout-minutes: 30
+        continue-on-error: true
+        with:
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
+          path: aiter_wheels
+
+      - name: Retry Download Aiter wheel artifact
+        if: ${{ steps.download_aiter_wheel.outcome != 'success' }}
         uses: actions/download-artifact@v4
         timeout-minutes: 30
         with:
@@ -692,6 +702,16 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Download Aiter wheel artifact
+        id: download_aiter_wheel_multigpu
+        uses: actions/download-artifact@v4
+        timeout-minutes: 30
+        continue-on-error: true
+        with:
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
+          path: aiter_wheels
+
+      - name: Retry Download Aiter wheel artifact
+        if: ${{ steps.download_aiter_wheel_multigpu.outcome != 'success' }}
         uses: actions/download-artifact@v4
         timeout-minutes: 30
         with:
