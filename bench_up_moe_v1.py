@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import os
 import sys
 from dataclasses import dataclass
@@ -18,7 +19,11 @@ from aiter.ops.shuffle import (
 )
 from aiter.utility.fp4_utils import e8m0_shuffle
 
-from mx_sort_fly_gemm import mx_sort_fly_gemm1_gemm2_flydsl
+from mx_sort_fly_gemm import (
+    mx_sort_fly_gemm1_gemm2,
+    _fly_gemm1,
+    _fly_gemm2,
+)
  
  
 @dataclass(frozen=True)
@@ -33,11 +38,18 @@ KIMI = Shape(NE=385, H=7168, INTER=512, TOPK=9)
  
  
 def build_weights(shape: Shape, device, seed=0):
+    # Fully deterministic across runs: drive every randn from an explicit
+    # torch.Generator (isolated from the global RNG state) seeded with `seed`.
     torch.manual_seed(seed)
+    g = torch.Generator(device=device).manual_seed(seed)
     ne, h, inter = shape.NE, shape.H, shape.INTER
     torch_quant = aiter.get_torch_quant(QuantType.per_1x32)
-    w1 = torch.randn((ne, 2 * inter, h), dtype=dtypes.bf16, device=device) / 10
-    w2 = torch.randn((ne, h, inter), dtype=dtypes.bf16, device=device) / 10
+    w1 = torch.randn(
+        (ne, 2 * inter, h), generator=g, dtype=dtypes.bf16, device=device
+    ) / 10
+    w2 = torch.randn(
+        (ne, h, inter), generator=g, dtype=dtypes.bf16, device=device
+    ) / 10
     w1_qt, w1_scale = torch_quant(w1, quant_dtype=dtypes.fp4x2)
     w2_qt, w2_scale = torch_quant(w2, quant_dtype=dtypes.fp4x2)
  
@@ -66,13 +78,17 @@ def build_weights(shape: Shape, device, seed=0):
  
  
 def build_inputs(shape: Shape, M: int, device, seed=1):
+    # Fully deterministic across runs: every randn is driven by an explicit
+    # torch.Generator seeded with `seed` (hidden and routing use separate
+    # streams, both seeded identically, isolated from the global RNG state).
     torch.manual_seed(seed)
     ne, h, topk = shape.NE, shape.H, shape.TOPK
-    hidden = torch.randn((M, h), dtype=dtypes.bf16, device=device) / 10
+    gh = torch.Generator(device=device).manual_seed(seed)
+    g = torch.Generator(device=device).manual_seed(seed)
+    hidden = torch.randn((M, h), generator=gh, dtype=dtypes.bf16, device=device) / 10
     n_routed = ne - 1
     shared_id = ne - 1
     n_topk_routed = topk - 1
-    g = torch.Generator(device=device).manual_seed(seed)
     bias = torch.randn(n_routed, generator=g, device=device) * 0.5
     scores = torch.randn(M, n_routed, generator=g, device=device) + bias
     routed_w, routed_ids = torch.topk(scores.softmax(-1), n_topk_routed, dim=-1)
@@ -101,14 +117,19 @@ def make_fn(hidden, topk_ids, topk_weight, w):
 
 
 def make_mx_sort_fly_fn(hidden, topk_ids, topk_weight, w):
-    """mxfp4 sort/quant kernels + FlyDSL a4w4 gemm1/gemm2.
+    """mx_fn sort (+ BM=16 inline-quant / BM=32 separate quant) prologue + fresh
+    FlyDSL a4w4 gemm1/gemm2 drop-ins.
 
-    Sort prologue uses mx_fn's mxfp4 kernels; the FlyDSL gemm reads the FlyDSL
-    preshuffle of the weights (``w`` = fly_w).
+    Reuses mx_fn's sort/quant kernels verbatim; gemm1/gemm2 are the new
+    ``compile_mxfp4_gemm{1,2}_a4w4`` kernels reading the SAME a16w4 ``mx_w``
+    layout (drop-in). BM regime mirrors mx_fn (BM=16 small-M, BM=32 large-M),
+    so the kernel trace matches mx_fn except the two gemm names.
     """
+    M = hidden.shape[0]
+    BM = 16 if M <= 128 else 32
 
     def fn():
-        return mx_sort_fly_gemm1_gemm2_flydsl(
+        return mx_sort_fly_gemm1_gemm2(
             hidden,
             w["w1"],
             w["w2"],
@@ -117,6 +138,9 @@ def make_mx_sort_fly_fn(hidden, topk_ids, topk_weight, w):
             topk=topk_ids.shape[1],
             w1_scale=w["w1_scale"],
             w2_scale=w["w2_scale"],
+            BM=BM,
+            gemm1_backend=_fly_gemm1,
+            gemm2_backend=_fly_gemm2,
         )
 
     return fn
@@ -130,6 +154,15 @@ def cosine(a, b):
         a = a[mask]
         b = b[mask]
     return torch.nn.functional.cosine_similarity(a, b, dim=0).item()
+
+
+def tensor_hash(*tensors):
+    """Stable content hash of one or more tensors (first 16 hex chars)."""
+    hh = hashlib.sha256()
+    for t in tensors:
+        b = t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+        hh.update(b)
+    return hh.hexdigest()[:16]
  
  
 def main():
@@ -137,12 +170,24 @@ def main():
     parser.add_argument("-M", "--M-list", default="4,8,16,32,64,128,256")
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument(
+        "--hash", action="store_true",
+        help="print stable content hashes of weights/inputs/outputs (for "
+             "reproducibility checks across runs)",
+    )
     args = parser.parse_args()
  
     device = torch.device("cuda")
     shape = KIMI
     fly_w, mx_w = build_weights(shape, device)
     print(f"GPU: {torch.cuda.get_device_name(0)}")
+    if args.hash:
+        print(
+            "weights hash: "
+            f"mx_w1={tensor_hash(mx_w['w1'])} mx_w2={tensor_hash(mx_w['w2'])} "
+            f"mx_w1s={tensor_hash(mx_w['w1_scale'])} "
+            f"mx_w2s={tensor_hash(mx_w['w2_scale'])}"
+        )
     print(
         f"Shape Kimi-K2.5 TP=4: NE={shape.NE} H={shape.H} "
         f"INTER={shape.INTER} TOPK={shape.TOPK}"
@@ -155,15 +200,26 @@ def main():
     print("-" * 105)
     for M in [int(x) for x in args.M_list.split(",")]:
         hidden, topk_ids, topk_weight = build_inputs(shape, M, device)
+        if args.hash:
+            print(
+                f"[M={M}] input hash: hidden={tensor_hash(hidden)} "
+                f"topk_ids={tensor_hash(topk_ids)} "
+                f"topk_weight={tensor_hash(topk_weight)}"
+            )
         fly_fn = make_fn(hidden, topk_ids, topk_weight, fly_w)
         mx_fn = make_fn(hidden, topk_ids, topk_weight, mx_w)
         mx_sort_fly_gemm1_gemm2_fn = make_mx_sort_fly_fn(
-            hidden, topk_ids, topk_weight, fly_w
+            hidden, topk_ids, topk_weight, mx_w
         )
         mx_out = mx_fn().clone()
         fly_out = fly_fn().clone()
         msfg_out = mx_sort_fly_gemm1_gemm2_fn().clone()
         torch.cuda.synchronize()
+        if args.hash:
+            print(
+                f"[M={M}] output hash: mxfp4={tensor_hash(mx_out)} "
+                f"flydsl={tensor_hash(fly_out)} msfg={tensor_hash(msfg_out)}"
+            )
         cos = cosine(mx_out, fly_out)
         cos_msfg = cosine(mx_out, msfg_out)
         _, mx_us = run_perftest(mx_fn, num_warmup=args.warmup, num_iters=args.iters)

@@ -655,6 +655,8 @@ def compile_mxfp4_gemm1_a4w4(
     BM: int,          # 16 (inline) or 32
     use_nt: bool = True,
     inline_quant: bool = False,
+    debug_bf16: bool = False,   # write raw silu*mul (bf16) instead of fp4 requant
+    debug_scaled: bool = False, # debug: write results*inv_scale (pre-e2m1) bf16
 ):
     """Fresh FlyDSL gemm1 drop-in for mxfp4_moe_gemm1_a4w4 (gate/up a16w4 +
     SiLU*mul + per-32 fp4 requant).  K=D_HIDDEN, N_OUT=2*D_INTER (gate+up
@@ -709,6 +711,13 @@ def compile_mxfp4_gemm1_a4w4(
     _lds_a_offset = 0
     _lds_acc_offset = ((_a_lds_bytes + 15) // 16) * 16
     allocator.ptr = _lds_acc_offset + _acc_lds_elems * 4
+    # inline-quant A-scale staging LDS: one e8m0 per (row, k-group) in its OWN
+    # dword to avoid LDS byte-store RMW races. [BM, K/32-per-tile=8] dwords.
+    _lds_ascale_offset = ((allocator.ptr + 15) // 16) * 16
+    _lds_ascale_dwords = BM * 8
+    _lds_ascale_bytes = _lds_ascale_dwords * 4
+    if inline_quant:
+        allocator.ptr = _lds_ascale_offset + _lds_ascale_bytes
 
     # A-load tiling (gather rows via m_indices; per-K-tile, 16B dwordx4 loads).
     x_load_bytes = 16
@@ -719,7 +728,7 @@ def compile_mxfp4_gemm1_a4w4(
 
     module_name = (
         f"mxfp4_g1_a4w4_E{experts}_K{K}_N{N_OUT}_TOPK{topk}_BM{BM}"
-        f"_{'IQ' if inline_quant else 'NT'}_v0"
+        f"_{'IQ' if inline_quant else 'NT'}_{'dbg' if debug_bf16 else 'q'}_v0"
     )
 
     @flyc.kernel
@@ -772,7 +781,10 @@ def compile_mxfp4_gemm1_a4w4(
             arg_b, arith.constant(experts * N_OUT * K_HALF, type=T.i32)
         )
         aqout_nbytes = arith.index_cast(
-            T.i32, c_max_sorted * arith.constant(N_INTER // 2, index=True)
+            T.i32,
+            c_max_sorted * arith.constant(
+                (N_INTER * 2) if debug_bf16 else (N_INTER // 2), index=True
+            ),
         )
         aqout_rsrc = _ptr_buffer_resource(arg_aq_out, aqout_nbytes)
         eid_rsrc = _ptr_buffer_resource(
@@ -825,6 +837,7 @@ def compile_mxfp4_gemm1_a4w4(
         x_row_local = []
         x_col_local = []
         x_row_base_div4 = []
+        x_row_token = []
         for i in range_constexpr(num_x_loads):
             _rl, _cl = tile_chunk_coord_i32(
                 arith, tx_i32_base=tx_i32_base, i=i,
@@ -837,7 +850,20 @@ def compile_mxfp4_gemm1_a4w4(
                 m_idx_rsrc, m_row + _rl, vec_width=1, dtype=T.i32
             )
             _tok_idx = arith.index_cast(ir.IndexType.get(), _tok)
+            x_row_token.append(_tok_idx)
             x_row_base_div4.append(_tok_idx * arith.constant(c_k_div4, index=True))
+
+        # inline-quant resources (hidden + A-scale staging LDS)
+        if const_expr(inline_quant):
+            hidden_rsrc = _ptr_buffer_resource(
+                arg_hidden,
+                arith.index_cast(
+                    T.i32, c_tokens * arith.constant(K * 2, index=True)
+                ),
+            )
+            lds_ascale_i32 = SmemPtr(
+                lds_base, _lds_ascale_offset, T.i32, shape=(_lds_ascale_dwords,)
+            ).get()
 
         def load_a_tile(kt):
             base_k_div4 = arith.constant(kt * tile_k_dwords, index=True)
@@ -860,6 +886,78 @@ def compile_mxfp4_gemm1_a4w4(
                     k_blocks16=k_blocks16, lds_base=arith.index(0),
                     vec_part_i32x4=parts[i], elem_bytes=elem_bytes,
                 )
+
+        # inline bf16->fp4 quant: gather hidden[token], per-lane amax over the
+        # lane's 32-K-group, e8m0 + software fp4 -> lds_a; e8m0 -> lds_ascale.
+        _c0x7f = arith.constant(0x7FFFFFFF, type=i32)
+        _khalf_dw = K // 2          # hidden row stride (dwords; K bf16 = K/2 dw)
+
+        def load_a_tile_inline(kt):
+            parts = []
+            for i in range_constexpr(num_x_loads):
+                token = x_row_token[i]
+                col_dw = x_col_local[i]
+                hbase = (
+                    token * arith.constant(_khalf_dw, index=True)
+                    + arith.constant(kt * 128, index=True)
+                    + col_dw * arith.index(4)
+                )
+                d_list = []
+                f32v = []
+                for j in range_constexpr(4):
+                    vv = buffer_ops.buffer_load(
+                        hidden_rsrc, hbase + arith.constant(j * 4, index=True),
+                        vec_width=4, dtype=i32,
+                    )
+                    for kk in range_constexpr(4):
+                        d = vector.extract(
+                            vv, static_position=[kk], dynamic_position=[]
+                        )
+                        d_list.append(d)
+                        f32v.append((d << arith.constant(16, type=i32)).bitcast(f32))
+                        f32v.append(
+                            (d & arith.constant(-0x10000, type=i32)).bitcast(f32)
+                        )
+                amax = (f32v[0].bitcast(i32) & _c0x7f).bitcast(f32)
+                for kk in range_constexpr(1, 32):
+                    amax = arith.maximumf(
+                        amax, (f32v[kk].bitcast(i32) & _c0x7f).bitcast(f32)
+                    )
+                max_i = amax.bitcast(i32)
+                exp_field = (
+                    (max_i + arith.constant(0x200000, type=i32))
+                    >> arith.constant(23, type=i32)
+                ) & arith.constant(0xFF, type=i32)
+                e8m0 = arith.minsi(
+                    arith.maxsi(exp_field - arith.constant(2, type=i32),
+                                arith.constant(0, type=i32)),
+                    arith.constant(254, type=i32),
+                )
+                # qs = 2^(e8m0-127); HW cvt divides bf16 by qs -> fp4 (16 instrs)
+                qs = (e8m0 << arith.constant(23, type=i32)).bitcast(f32)
+                vec2bf16 = T.vec(2, T.bf16)
+                dwords = []
+                for dd in range_constexpr(4):
+                    pk = arith.constant(0, type=i32)
+                    for idx in range_constexpr(4):
+                        src = vector.bitcast(
+                            vec2bf16,
+                            vector.from_elements(T.vec(1, i32), [d_list[dd * 4 + idx]]),
+                        )
+                        pk = llvm.call_intrinsic(
+                            i32, "llvm.amdgcn.cvt.scalef32.pk.fp4.bf16",
+                            [pk, src, qs, arith.constant(idx, type=i32)], [], [],
+                        )
+                    dwords.append(pk)
+                parts.append(vector.from_elements(T.vec(4, i32), dwords))
+                # e8m0 -> its OWN dword lds_ascale_i32[row*8 + group] (no race)
+                group = col_dw / arith.index(4)
+                asc_idx = x_row_local[i] * arith.index(8) + group
+                vector.store(
+                    vector.from_elements(T.vec(1, i32), [e8m0]),
+                    lds_ascale_i32, [asc_idx], alignment=4,
+                )
+            return parts
 
         def load_b_tile(kt):
             b_tile = []
@@ -895,13 +993,25 @@ def compile_mxfp4_gemm1_a4w4(
         )
 
         def load_a_scale(kt):
+            # returns [a_sc_k0, a_sc_k1] (one A-scale dword per MFMA-K)
+            if const_expr(inline_quant):
+                out = []
+                for k_idx in range_constexpr(2):
+                    group = arith.constant(k_idx * 4, index=True) + lane_div_16
+                    asc_idx = lane_mod_16 * arith.index(8) + group
+                    v = vector.load_op(T.vec(1, i32), lds_ascale_i32, [asc_idx])
+                    out.append(
+                        vector.extract(v, static_position=[0], dynamic_position=[])
+                    )
+                return out
             a_base = (
                 _chunk_base * arith.constant(kAS_per_chunk_dw, index=True)
                 + arith.constant(kt * 64, index=True) + _scale_lane_dw
             )
-            return buffer_ops.buffer_load(
+            dw = buffer_ops.buffer_load(
                 a_scale_rsrc, a_base, vec_width=1, dtype=T.i32, cache_modifier=0
             )
+            return [dw, dw]
 
         def load_b_scale(kt):
             b_scs = []
@@ -942,9 +1052,10 @@ def compile_mxfp4_gemm1_a4w4(
         acc_init = arith.constant_vector(0.0, vec4_f32)
         accm = [acc_init] * (m_repeat * num_acc_n)
 
-        def mfma_ktile(b_tile, a_sc, b_scs):
+        def mfma_ktile(b_tile, a_sc_per_k, b_scs):
             for k_idx in range_constexpr(2):
                 ikxdl = k_idx
+                a_sc = a_sc_per_k[k_idx]
                 col_base = col_offset_base + arith.constant(
                     (k_idx * 128) // a_elem_vec_pack, index=True
                 )
@@ -953,7 +1064,10 @@ def compile_mxfp4_gemm1_a4w4(
                     curr_row = row_a_lds + arith.constant(mi_idx * 16, index=True)
                     a0, a1 = lds_load_packs_k64(curr_row, col_base)
                     a128 = _pack_i64x4(a0, a1)
-                    op_sel_a = ikxdl * _scale_pack_m + imxdl
+                    # inline: per-k e8m0 in byte 0 (op_sel 0); NT: make_preshuffle
+                    op_sel_a = 0 if const_expr(inline_quant) else (
+                        ikxdl * _scale_pack_m + imxdl
+                    )
                     for ni in range_constexpr(num_acc_n_packed):
                         b_scale_val = b_scs[ni]
                         for inxdl in range_constexpr(pack_N):
@@ -968,19 +1082,47 @@ def compile_mxfp4_gemm1_a4w4(
                                  op_sel_a, a_sc, op_sel_b, b_scale_val],
                             )
 
+        # device-side grid guard: kernel is launched with a fixed max grid
+        # (max_sorted/BM); read cumsum on-device and skip padding blocks whose
+        # m_row >= cumsum so we neither read cumsum back to the host (no per-iter
+        # .item() DtoH + sync) nor waste the GEMM/epilogue on padding blocks.
+        # (debug_bf16 keeps the un-guarded body: its const_expr early-return at
+        #  the scale store would leave the scf.if then-block unterminated.)
+        # const_expr -> compile-time Python if (NOT scf_if_dispatch), so _guard_ip
+        # stays in the kernel-builder scope and is visible to the close below.
+        if const_expr(not debug_bf16):
+            _cumsum_rsrc = _ptr_buffer_resource(
+                arg_cumsum, arith.constant(4, type=i32)
+            )
+            _num_valid = buffer_ops.buffer_load(
+                _cumsum_rsrc, arith.constant(0, index=True), vec_width=1, dtype=i32
+            )
+            _m_row_i32 = arith.index_cast(i32, m_row)
+            _blk_valid = arith.cmpi(CmpIPredicate.ult, _m_row_i32, _num_valid)
+            _guard_if = scf.IfOp(_blk_valid)
+            _guard_ip = ir.InsertionPoint(_guard_if.then_block)
+            _guard_ip.__enter__()
+
         for kt in range_constexpr(K_TILES):
             if const_expr(kt > 0):
                 gpu.barrier()
-            store_a_tile(load_a_tile(kt))
+            if const_expr(inline_quant):
+                store_a_tile(load_a_tile_inline(kt))
+            else:
+                store_a_tile(load_a_tile(kt))
             gpu.barrier()
             mfma_ktile(load_b_tile(kt), load_a_scale(kt), load_b_scale(kt))
 
         # ---- SiLU*mul + fp4 requant epilogue (increment 3) ----
+        # NB: output inter-scale chunk granularity = m_block = m_row/BM, so the
+        # rsrc num_records bound must be max_sorted/BM (+slack), NOT /32. With /32
+        # the upper half of BM=16 scale stores went out-of-bounds and were dropped
+        # by the hardware -> sort-dependent garbage scales (non-deterministic e2e).
         ascale_out_rsrc = _ptr_buffer_resource(
             arg_ascale_out,
             arith.index_cast(
                 T.i32,
-                (c_max_sorted / arith.constant(32, index=True)
+                (c_max_sorted / arith.constant(BM, index=True)
                  + arith.constant(2, index=True))
                 * arith.constant(kOS_per_chunk_dw * 4, index=True),
             ),
@@ -1053,31 +1195,67 @@ def compile_mxfp4_gemm1_a4w4(
                 local_max = arith.maximumf(
                     local_max, (results[e].bitcast(i32) & _c7fff).bitcast(f32)
                 )
-            local_max = arith.maximumf(local_max, local_max.shuffle_xor(1, 64))
-            local_max = arith.maximumf(local_max, local_max.shuffle_xor(2, 64))
-            quant_scale = ((local_max.bitcast(i32) + _c2e21).bitcast(f32)) * _quarter
-            sb_raw = quant_scale.bitcast(i32) >> arith.constant(23, type=i32)
-            scales_per_mr.append(arith.minsi(sb_raw, _c254i))
-            packed = None
-            for e in range_constexpr(8):
-                fp4 = _f32_to_e2m1(arith.divf(results[e], quant_scale))
-                if const_expr(e % 2 == 0):
-                    byte_b = fp4
+            _c64i = arith.constant(64, type=i32)
+            local_max = arith.maximumf(
+                local_max, local_max.shuffle_xor(arith.constant(1, type=i32), _c64i)
+            )
+            local_max = arith.maximumf(
+                local_max, local_max.shuffle_xor(arith.constant(2, type=i32), _c64i)
+            )
+            # HIP quant_scale (non-pow2) + HW cvt -> bit-exact with HIP:
+            #   quant_scale = uint(amax + 0x200000) * 0.25
+            #   e8m0 = min(uint(quant_scale) >> 23, 254)
+            #   fp4 = cvt_scalef32_pk_fp4_f32(results, quant_scale)
+            amax_i = local_max.bitcast(i32)
+            quant_scale = ((amax_i + _c2e21).bitcast(f32)) * _quarter
+            e8m0_biased = arith.minsi(
+                quant_scale.bitcast(i32) >> arith.constant(23, type=i32), _c254i
+            )
+            scales_per_mr.append(e8m0_biased)
+            if const_expr(debug_bf16):
+                col0 = n_block * _c128 + wave_grp * _c32idx + kk * arith.index(8)
+                dbg_base = (m_row + row_local) * arith.constant(
+                    N_INTER, index=True
+                ) + col0
+                if const_expr(debug_scaled):
+                    bf16_vals = [
+                        arith.trunc_f(T.bf16, arith.divf(results[e], quant_scale))
+                        for e in range_constexpr(8)
+                    ]
                 else:
-                    byte_b = byte_b | (fp4 << arith.constant(4, type=i32))
-                    sh = byte_b << arith.constant((e // 2) * 8, type=i32)
-                    packed = sh if packed is None else (packed | sh)
+                    bf16_vals = [arith.trunc_f(T.bf16, results[e])
+                                 for e in range_constexpr(8)]
+                v8 = vector.from_elements(T.vec(8, T.bf16), bf16_vals)
+                buffer_ops.buffer_store(
+                    v8, aqout_rsrc, dbg_base * arith.index(2), offset_is_bytes=True
+                )
+                continue
+            packed = arith.constant(0, type=i32)
+            for k in range_constexpr(4):
+                packed = llvm.call_intrinsic(
+                    i32, "llvm.amdgcn.cvt.scalef32.pk.fp4.f32",
+                    [packed, results[2 * k], results[2 * k + 1], quant_scale,
+                     arith.constant(k, type=i32)], [], [],
+                )
             byte_pos = (
                 n_block * arith.constant(64, index=True)
                 + wave_grp * _c16 + kk * arith.index(4)
             )
             out_row = m_row + row_local
             aq_off = out_row * arith.constant(K_G2_HALF, index=True) + byte_pos
-            buffer_ops.buffer_store(
-                packed, aqout_rsrc, aq_off, offset_is_bytes=True
+            _aqout_base = arith.index_cast(
+                ir.IndexType.get(), fx.ptrtoint(arg_aq_out)
+            )
+            _aq_addr = arith.index_cast(T.i64, _aqout_base + aq_off)
+            _aq_ptr = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _aq_addr)
+            llvm.StoreOp(
+                packed._value if hasattr(packed, "_value") else packed,
+                _aq_ptr, alignment=4,
             )
 
         # scale store (kk==0): make_preshuffle inter scale
+        if const_expr(debug_bf16):
+            return
         kk_i32 = arith.index_cast(i32, kk)
         is_w = arith.cmpi(CmpIPredicate.eq, kk_i32, arith.constant(0, type=i32))
         _ifw = scf.IfOp(is_w)
@@ -1107,6 +1285,11 @@ def compile_mxfp4_gemm1_a4w4(
                     pair, ascale_out_rsrc, sc_byte, offset_is_bytes=True
                 )
             scf.YieldOp([])
+
+        # close the device-side grid guard opened before the GEMM loop.
+        if const_expr(not debug_bf16):
+            scf.YieldOp([])
+            _guard_ip.__exit__(None, None, None)
 
     @flyc.jit
     def launch_gemm1(

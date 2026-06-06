@@ -87,7 +87,8 @@ def _fly_gemm1(*, cumsum_tensor, a_quant, a_scale_sorted_shuffled, w1, w1_scale,
     from aiter.ops.flydsl.kernels.mxfp4_a4w4_gemm import compile_mxfp4_gemm1_a4w4
 
     NE = w1.shape[0]
-    D_HIDDEN = w1.shape[2]            # w1 [E, 2*D_INTER, D_HIDDEN]
+    # w1 is a16w4 fp4x2-packed [E, 2*D_INTER, D_HIDDEN/2]; last dim is K/2.
+    D_HIDDEN = w1.shape[2] * 2        # contraction K = D_HIDDEN
     D_INTER = w1.shape[1] // 2
     M = hidden_states.shape[0]
     BM = int(kernelName1.split("_BM")[1].split("_")[0])
@@ -97,9 +98,11 @@ def _fly_gemm1(*, cumsum_tensor, a_quant, a_scale_sorted_shuffled, w1, w1_scale,
         experts=NE, model_dim=D_HIDDEN, inter_dim=D_INTER, topk=9, BM=BM,
         use_nt=not inline_quant, inline_quant=inline_quant,
     )
-    # launch only valid blocks (matches HIP grid = cumsum/BM); avoids padding
-    # blocks with garbage expert_id / m_indices.
-    total_m_blocks = int(cumsum_tensor.item()) // BM
+    # device-side grid: launch the fixed max grid (max_sorted/BM, host-known) and
+    # let the kernel read cumsum on-device, early-returning padding blocks whose
+    # m_row >= cumsum. Avoids reading cumsum back to host (the per-iter .item()
+    # DtoH + host<->device sync that serialized sort->gemm1).
+    total_m_blocks = max_sorted // BM
     launcher(
         _fly_ptr(a_quant), _fly_ptr(a_scale_sorted_shuffled), _fly_ptr(w1),
         _fly_ptr(w1_scale), _fly_ptr(sorted_expert_ids), _fly_ptr(cumsum_tensor),
