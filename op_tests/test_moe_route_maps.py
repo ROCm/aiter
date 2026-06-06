@@ -69,8 +69,10 @@ def _run_one(token_num, topk, E, seed=0):
     max_m = int(counts.max().item()) if counts.numel() else 0
     max_m = max(WARP_TILE_M, ((max_m + WARP_TILE_M - 1) // WARP_TILE_M) * WARP_TILE_M)
 
-    src, dst = build_route_maps(topk_ids, E, max_m)
+    src, dst, masked_m = build_route_maps(topk_ids, E, max_m)
     torch.cuda.synchronize()
+    # masked_m (from the atomic counters) must equal bincount(topk_ids).
+    masked_m_ok = bool(torch.equal(masked_m, counts.to(torch.int32)))
     srf = src.reshape(-1).to(torch.long)
     fe = topk_ids.reshape(-1)
     flat_tokens = (torch.arange(token_num * topk, device="cuda") // topk)
@@ -95,11 +97,11 @@ def _run_one(token_num, topk, E, seed=0):
     valid_mask[srf] = True
     pad_ok = bool((dst[~valid_mask] == -1).all().item())
 
-    ok = in_block and perm_ok and inv_ok and pad_ok
+    ok = in_block and perm_ok and inv_ok and pad_ok and masked_m_ok
     print(
         f"[{'PASS' if ok else 'FAIL'}] tok={token_num:<5} topk={topk} E={E:<3} "
         f"max_m={max_m} in_block={in_block} set_eq={perm_ok} "
-        f"dst_inverse={inv_ok} pad-1={pad_ok}"
+        f"dst_inverse={inv_ok} pad-1={pad_ok} masked_m={masked_m_ok}"
     )
     return ok
 

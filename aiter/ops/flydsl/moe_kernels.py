@@ -1453,27 +1453,33 @@ def _get_compiled_route_maps():
 
 def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
     """Per-token route maps via a single atomic-scatter kernel (SGLang-style),
-    no host-side argsort / nonzero / one-hot. Returns ``(topids_to_rows, rows_to_tokens)``:
+    no host-side argsort / nonzero / one-hot. Returns
+    ``(topids_to_rows, rows_to_tokens, masked_m)``:
 
       topids_to_rows : (token_num, topk) int32  -- route -> grouped row
                  = ``topk_ids[t,k]*max_m + slot`` (gather-reduce input)
       rows_to_tokens  : (E*max_m,)        int32  -- grouped row -> source token
                  (-1 for unused padding rows; scatter-copy input)
+      masked_m        : (E,)              int32  -- rows routed to each expert
+                 (== bincount(topk_ids), the per-expert GEMM mask)
 
     The within-expert ``slot`` is claimed by ``atomicAdd`` on a per-expert
     counter pre-initialized to ``e*max_m``, so the atomic returns the grouped
-    row. The kernel writes both maps in one pass (topids_to_rows + its inverse rows_to_tokens).
-    Order within an expert is atomic-race order (nondeterministic) but
-    self-consistent -- both maps come from the same run, and the grouped GEMM is
-    order-agnostic within an expert.
+    row. The kernel writes both maps in one pass (topids_to_rows + its inverse
+    rows_to_tokens), and the final counter value ``e*max_m + counts[e]`` yields
+    ``masked_m`` for free (counts[e] = atomic_buffer[e] - e*max_m), avoiding a
+    separate ``bincount`` reduction. Order within an expert is atomic-race order
+    (nondeterministic) but self-consistent -- both maps come from the same run,
+    and the grouped GEMM is order-agnostic within an expert.
     """
     device = topk_ids.device
     token_num, topk = topk_ids.shape
     numel = token_num * topk
     topk_ids_i32 = topk_ids.reshape(-1).to(torch.int32).contiguous()
-    atomic_buffer = (
-        torch.arange(E, device=device, dtype=torch.int32) * max_m
-    ).contiguous()
+    # ``base[e] = e*max_m`` is both the atomic counter's start value and the
+    # offset we subtract afterwards to recover per-expert counts.
+    base = (torch.arange(E, device=device, dtype=torch.int32) * max_m).contiguous()
+    atomic_buffer = base.clone()
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
     rows_to_tokens = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
     grid_blocks = (numel + 255) // 256
@@ -1488,7 +1494,10 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
         grid_blocks,
         stream=torch.cuda.current_stream(),
     )
-    return topids_to_rows.view(token_num, topk), rows_to_tokens
+    # After the kernel, atomic_buffer[e] == e*max_m + counts[e]; subtract the
+    # base to get masked_m (no bincount, no device->host sync).
+    masked_m = atomic_buffer - base
+    return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
 
 
 def flydsl_moe_gather_reduce(

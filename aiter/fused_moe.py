@@ -690,7 +690,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
         raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
     counts = torch.bincount(flat_experts, minlength=E)
-    max_m = int(counts.max().item()) if counts.numel() else 0
+    # Static upper bound: each token routes at most one row per expert, so no
+    # expert can receive more than token_num rows. Using this avoids the
+    # ``counts.max().item()`` device->host sync that stalled the launch stream.
+    max_m = token_num
     max_m = max(warp_tile_m, ((max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m)
     _grouped_dbg(f"routing counts done max_m={max_m}")
 
@@ -699,6 +702,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     flat_weights = topk_weight.reshape(-1).to(dtype)
     route_tokens = torch.empty((E, max_m), dtype=torch.long, device=device)
     route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
+    # Naive-path fallback for the per-expert GEMM mask. On the optimized path
+    # this is overwritten by build_route_maps (derived from its atomic counters).
     masked_m = counts.to(torch.int32).to(device=device)
 
     if data_format == "fp4":
@@ -767,9 +772,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             build_route_maps,
         )
 
-        # Efficient atomic-kernel map build: both topids_to_rows (route -> grouped row)
-        # and its inverse rows_to_tokens (grouped row -> token) in one pass.
-        topids_to_rows, rows_to_tokens = build_route_maps(topk_ids, E, max_m)
+        # Efficient atomic-kernel map build: topids_to_rows (route -> grouped row),
+        # its inverse rows_to_tokens (grouped row -> token), and masked_m (rows per
+        # expert) all in one pass -- masked_m comes from the atomic counters, so
+        # it replaces the separate bincount above.
+        topids_to_rows, rows_to_tokens, masked_m = build_route_maps(topk_ids, E, max_m)
         _grouped_dbg("start route gather (scatter-copy kernel)")
         flydsl_moe_scatter_copy_token(
             a1_payload,
@@ -1007,7 +1014,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         # Reuse the per-token gather map built for the route-gather step (shared,
         # argsort-free); only rebuild if the scatter-copy path didn't run.
         if topids_to_rows is None:
-            topids_to_rows, _ = build_route_maps(topk_ids, E, max_m)
+            topids_to_rows, _, _ = build_route_maps(topk_ids, E, max_m)
         # gather_w in the model dtype (bf16/f16); the kernel extends to f32. No
         # f32 cast -- the weight is already bf16/f16, that precision is enough.
         gather_w = (
