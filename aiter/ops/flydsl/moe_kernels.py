@@ -1091,23 +1091,20 @@ def flydsl_moe_stage2(
     if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
         mode = "reduce"
 
-    accumulate = mode != "reduce"
-    if return_per_slot:
-        accumulate = False
+    accumulate = mode != "reduce" and not return_per_slot
 
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
-    if return_per_slot:
-        per_slot_shape = (token_num, topk, model_dim)
-        if out is None:
+
+    if out is None:
+        if return_per_slot:
             out = torch.empty(
-                per_slot_shape,
+                (token_num, topk, model_dim),
                 dtype=torch_out_dtype,
                 device=inter_states.device,
             )
-    elif out is None:
         alloc_fn = torch.zeros if accumulate else torch.empty
         out = alloc_fn(
             (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
