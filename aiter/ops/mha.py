@@ -7,7 +7,7 @@ import torch
 from torch import Generator, Tensor
 
 from ..jit.core import CK_DIR, AITER_META_DIR, ENABLE_CK, compile_ops
-from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
@@ -1293,11 +1293,51 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
-def _native_splitkv_heuristic(batch, nhead_q, seqlen_k, hdim_q):
-    # Phase-1: hardcoded special case only. seqlen_q-independent (decode shapes hit too).
-    if batch == 1 and nhead_q == 2 and hdim_q == 64 and seqlen_k >= 38912:
-        return 4
-    return 1
+def _native_splitkv_heuristic(batch, nhead_q, seqlen_q, seqlen_k, num_cu):
+    # Pick split-KV group count G for the native D64 kernel; G == 0 falls back to
+    # the CK non-split-KV kernel. Tuned on 100 measured shapes
+    # (fmha_native scripts/splitkv_heuristic.py).
+    # nwg = workgroups (occupancy); skvt = KV tiles (reduction work to split).
+    # Tile sizes are the kernel block geometry: kM0=128 query, kN0=64 key.
+    SQ_TILE = 128
+    KV_TILE = 64
+
+    def snap(x):
+        # Largest split in {2,4,8,16} that is <= x (0 if none).
+        g = 0
+        for c in (2, 4, 8, 16):
+            if c <= x:
+                g = c
+        return g
+
+    sqt = (seqlen_q + SQ_TILE - 1) // SQ_TILE
+    skvt = (seqlen_k + KV_TILE - 1) // KV_TILE
+    nwg = batch * nhead_q * sqt
+
+    # Cap G so each split keeps enough KV tiles to amortize combine cost.
+    kvdiv = 10 if nwg < 24 else 28
+    kv_cap = snap(skvt / kvdiv)
+
+    # Regime A -- undersubscribed: split to fill the machine, capped by KV work.
+    if nwg < num_cu:
+        occ_cap = snap(3.5 * num_cu / nwg)
+        return min(occ_cap, kv_cap)
+
+    # Regime B -- saturated: batch >= 2 has ample independent work, split is loss.
+    if batch >= 2:
+        return 0
+
+    # batch == 1: a small split hides the long per-CU KV reduction, but only if
+    # KV is long enough relative to oversubscription.
+    over = nwg / num_cu
+    if skvt < 10 * over and over < 30:
+        return 0
+
+    # Modest split; fewer heads leave more headroom, extreme corner splits more.
+    g = 4 if nhead_q <= 8 else 2
+    if over >= 30:
+        g = max(g, snap(skvt / 160))
+    return min(g, kv_cap) if kv_cap > 0 else 0
 
 
 def _flash_attn_forward(
@@ -1418,7 +1458,9 @@ def _flash_attn_forward(
         ns = (
             num_splits
             if num_splits >= 1
-            else _native_splitkv_heuristic(batch_size, nhead_q, seqlen_k, hdim_q)
+            else _native_splitkv_heuristic(
+                batch_size, nhead_q, seqlen_q, seqlen_k, get_cu_num()
+            )
         )
         if ns > 1:
             assert ns <= (seqlen_k + 63) // 64, (  # ceil(seqlen_k/64); don't silently clamp
