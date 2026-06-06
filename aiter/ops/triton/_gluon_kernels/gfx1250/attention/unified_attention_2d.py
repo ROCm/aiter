@@ -5,10 +5,7 @@ from triton.language.core import _aggregate as aggregate
 from aiter.ops.triton.utils.types import e4m3_dtype
 import triton.language as tl
 from triton.language.core import PropagateNan
-import triton
-from packaging.version import Version
-
-triton_version = Version(triton.__version__)
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 float8_info = torch.finfo(e4m3_dtype)
 
@@ -153,10 +150,12 @@ class AttentionConfig:
         self.LOOP_VARIANT = gl.constexpr(LOOP_VARIANT)
         self.USE_SINKS = gl.constexpr(USE_SINKS)
 
-        # calculate how many masked tiles we need, upper bound
+        # Upper bound on masked tiles. +1 because the causal diagonal isnt
+        # tile-aligned, the query_span-wide band sits at an arbitrary key offset
+        # and can spill into one extra tile
         QUERY_SPAN = gl.constexpr((self.BLOCK_M - 1) // self.NUM_QUERIES_PER_KV + 1)
         self.NUM_MASKED_TILES = gl.constexpr(
-            max(1, ((QUERY_SPAN + self.TILE_SIZE - 1) // self.TILE_SIZE))
+            (QUERY_SPAN + self.TILE_SIZE - 1) // self.TILE_SIZE + 1
         )
         assert NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
 
@@ -1697,7 +1696,26 @@ def find_seq_idx(
     return left - 1
 
 
-@gluon.jit
+unified_attention_gluon_kernel_2d_repr = make_kernel_repr(
+    "_unified_attention_gluon_kernel_2d",
+    [
+        "NUM_QUERY_HEADS",
+        "NUM_KV_HEADS",
+        "BLOCK_SIZE",
+        "TILE_SIZE",
+        "HEAD_SIZE",
+        "SLIDING_WINDOW",
+        "ALL_DECODE",
+        "SHUFFLED_KV_CACHE",
+        "NUM_BUFFERS",
+        "BLOCK_M",
+        "num_warps",
+        "waves_per_eu",
+    ],
+)
+
+
+@gluon.jit(repr=unified_attention_gluon_kernel_2d_repr)
 def _unified_attention_gluon_kernel_2d(
     query_ptr,  # [num_tokens, num_query_heads, head_size]
     key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
@@ -1927,6 +1945,13 @@ def _unified_attention_gluon_kernel_2d(
             (NUM_BUFFERS == 2) | (NUM_BUFFERS == 3),
             "For loop variant 1, NUM_BUFFERS should be 2 or 3",
         )
+        # Variants 1/2 only mask the last 2 tiles; anything needing more must
+        # route to variant 0. Only matters for the causal prefill path.
+        if cfg.CAUSAL and not cfg.ALL_DECODE:
+            gl.static_assert(
+                cfg.NUM_MASKED_TILES <= 2,
+                "loop variant 1 handles <=2 masked tiles; use loop variant 0",
+            )
         acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
         M, L, acc = attention_loop_reordered(pgm, kv_loader, q, M, L, acc)
 
@@ -1935,6 +1960,13 @@ def _unified_attention_gluon_kernel_2d(
             (NUM_BUFFERS == 2) | (NUM_BUFFERS == 3),
             "For loop variant 3, NUM_BUFFERS should be 2 or 3",
         )
+        # Variants 1/2 only mask the last 2 tiles; anything needing more must
+        # route to variant 0. Only matters for the causal prefill path.
+        if cfg.CAUSAL and not cfg.ALL_DECODE:
+            gl.static_assert(
+                cfg.NUM_MASKED_TILES <= 2,
+                "loop variant 2 handles <=2 masked tiles; use loop variant 0",
+            )
         acc0 = gl.zeros(
             [BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout
         )
