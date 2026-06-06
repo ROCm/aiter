@@ -56,16 +56,20 @@ jobs:
         include:
           - python_version: "3.10"
             docker_image: "rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0"
+            build_enabled: ${{ github.ref == 'refs/heads/main' }}
           - python_version: "3.12"
             docker_image: "rocm/pytorch:latest"
+            build_enabled: true
     steps:
       # ---- Common steps (fork and non-fork) ----
       - name: Checkout code
+        if: ${{ matrix.build_enabled }}
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Sync submodules for wheel build
+        if: ${{ matrix.build_enabled }}
         run: |
           set -ex
           if [ "${{ github.event_name }}" = "schedule" ]; then
@@ -81,7 +85,7 @@ jobs:
           echo "CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"
 
       - name: Docker login
-        if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
+        if: ${{ matrix.build_enabled && (!github.event.pull_request || !github.event.pull_request.head.repo.fork) }}
         env:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
@@ -99,6 +103,7 @@ jobs:
           exit 0
 
       - name: Build Aiter wheel in base container
+        if: ${{ matrix.build_enabled }}
         run: |
           set -euo pipefail
           docker run --rm \
@@ -142,7 +147,7 @@ jobs:
             '
 
       - name: Summarize Aiter prebuild
-        if: ${{ always() }}
+        if: ${{ always() && matrix.build_enabled }}
         run: |
           set -euo pipefail
           if [ ! -f .aiter-prebuild.env ]; then
@@ -161,6 +166,7 @@ jobs:
             --end "${PREBUILD_END}"
 
       - name: Verify prebuilt kernels in wheel
+        if: ${{ matrix.build_enabled }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -194,6 +200,7 @@ jobs:
           PY
 
       - name: Upload wheel as artifact
+        if: ${{ matrix.build_enabled }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py${{ matrix.python_version }}
