@@ -9,7 +9,7 @@ Integrates:
 Target: gfx1250 (MI450), wave32, 4 waves per TG (1TG), 1024 shared VGPRs.
 Causal mask always on. num_tiles = bx + 1 (triangular).
 
-    sp3 core_loop
+    core_loop
     tile n = 128
     4 stages  perstage 1msb vgprbank
 
@@ -68,7 +68,7 @@ from flydsl.compiler.kernel_function import (
 )
 
 from fmha_prologue_gfx1250 import (
-    _asm_void, _setreg, _build_tdm_dgroup1,
+    _emit_void, _setreg, _build_tdm_dgroup1,
     _split_i64_to_lo_hi,
     _phase4_q_load_flydsl,
     _phase5_head_index_div_flydsl,
@@ -184,7 +184,6 @@ def _build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
                 msb=2: [8]=v_dh0(b2), [9]=v_dh1(b2)
                 msb=3: [10]=v_dh0(b3),[11]=v_dh1(b3)
 
-    SP3 insight (_v_V_lds_addr[msb] and _v_V_lds_addr1[msb] are both in bank msb):
     When dst, addr_dh0 and addr_dh1 are all in bank_msb, cal_set_msb produces
     MSB=0x00/0x55/0xAA/0xFF (全-bankN) → zero s_set_vgpr_msb within each MSB group.
     Previous layout put dh0 and dh1 in DIFFERENT banks, causing alternating
@@ -1072,7 +1071,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # SECTION 2: Prologue — Tile 0 QK + Partial Softmax (no PV)
             # ================================================================
             #
-            # Matches SP3 init (L3346-3456) adapted for tile_n=128:
             #   1. TDM K(tile 0, 4 SUs) → wait → QK_pure (64 WMMAs)
             #   2. TDM V(tile 0, 4 SUs) — overlapped with softmax
             #   3. sp_tiles → sp_pairs → softmax PART0+PART1 only (no PART2)
@@ -1125,8 +1123,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # -- 2d: sp_tiles → sp_pairs --
             sp_pairs_all_pro = _sp_tiles_to_sp_pairs(all_su_sp_tiles)
 
-            # -- 2e: Softmax PART0+PART1 only (no PART2, matches SP3 stages 0..3) --
-            # Pin each MSB's scalar state to its own VGPR bank to match SP3's
+            # -- 2e: Softmax PART0+PART1 only (no PART2) --
+            # Pin each MSB's scalar state to its own VGPR bank for the
             # "全-bankN" (0x00/0x55/0xAA/0xFF) MSB allocation pattern.
             softmax_state_pro = {
                 'old_max': [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
@@ -1146,7 +1144,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             _softmax_part01_only(
                 ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state)
 
-            # -- 2e': PART2 first half for tile 0 (mirrors SP3 prologue stages 0-3) --
+            # -- 2e': PART2 first half for tile 0 --
             # Runs ops 0..PART2_SPLIT-1: setup(7)+pkfma(16)+pair_exp(8) = 31 ops/MSB.
             # 4 MSBs × 8 pair_exp = 32 pair_exp + 4 exp_delta (unavoidable pipeline
             # overhead).
@@ -1274,7 +1272,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # SECTION 3: Dynamic KV Loop — scf.for_ from tile 1
             # ================================================================
             #
-            # SP3-aligned pipeline:
+            # Pipeline layout:
             #   - K in LDS is one tile AHEAD of V in LDS
             #   - Prologue loaded K(tile 0)+V(tile 0), did QK, prefetched K(tile 1)
             #   - Iteration i: GEMM1 on K(tile i+1), GEMM2 on V(tile i)
@@ -1462,14 +1460,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
                 su_sp_tiles_list = []
 
-                # SP3-style O rescale: all 4 MSBs across GEMM1 stages 0-3.
+                # O rescale: all 4 MSBs across GEMM1 stages 0-3.
                 # Each stage dispatches N_PV_WMMA_N closures (1 tile per MSB, 4 MSBs
                 # total
                 # = N_PV_WMMA_N * NUM_MSB closures per stage), running at the last N
                 # WMMAs.
-                # This removes O_resc from GEMM2 stage 0 entirely, matching SP3's
-                # pattern
-                # where exp+O_resc+cvt interleave throughout GEMM1 (QK) stages.
+                # This removes O_resc from GEMM2 stage 0 entirely — exp+O_resc+cvt
+                # interleave throughout GEMM1 (QK) stages.
                 #
                 # Stage assignment: stage s handles tile n=s for all 4 MSBs.
                 #   stage 0 → n=0 (all MSBs), stage 1 → n=1, stage 2 → n=2, stage 3 →
@@ -1517,7 +1514,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         and (has_tdm_k_g1 or has_tdm_v_g1)
                     )
 
-                    # SP3-style: distribute O_resc across all 4 GEMM1 stages (1
+                    # Distribute O_resc across all 4 GEMM1 stages (1
                     # tile/MSB per stage).
                     stage_o_rescale = _o_rescale_by_stage[stage_idx]
 
@@ -1561,7 +1558,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # DBG: row_sums after GEMM1 second-half (sum_accum done), before GEMM2
                 # PART0+1 rescale
 
-                # SP3-style: O_resc moved entirely to GEMM1 stages — no O_resc in GEMM2.
+                # O_resc moved entirely to GEMM1 stages — no O_resc in GEMM2.
                 _o_rescale_exp_delta = None
 
                 # ================================================================
@@ -1811,7 +1808,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 iter_args=init_args,
             ):
                 # ---- Unpack iter_args ----
-                # Pin each MSB's values to bank=d/msb to match SP3's full-bank MSB
+                # Pin each MSB's values to bank=d/msb for full-bank MSB
                 # pattern.
                 o_tiles_flat = [iter_args[i] for i in fx.range_constexpr(16)]
                 o_tiles = []
@@ -2326,7 +2323,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # SECTION 4: Epilogue — post_process + div_cvt + write_out
             # ================================================================
             #
-            # Matches SP3 L4924-4946:
             #   fmha_post_process(is_odd):
             #     softmax stages 4..7 (PART2) → complete last tile's softmax
             #     LDS V(su=0..3) → PV_pure (64 WMMAs)
@@ -2338,7 +2334,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # For tile_n=128: blk=0 always, no is_odd branching.
 
             # ---- 4a: Unpack loop results ----
-            # Pin each MSB's values to bank=d/msb to match SP3's full-bank MSB pattern.
+            # Pin each MSB's values to bank=d/msb for full-bank MSB pattern.
             ep_o_tiles = []
             for d in fx.range_constexpr(NUM_MSB):
                 row = []
@@ -2436,7 +2432,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                             for _m in fx.range_constexpr(NUM_MSB)]
 
             # ---- 4c: s_wait_idle + barrier ----
-            _asm_void("s_wait_idle")
+            _emit_void("s_wait_idle")
             rocdl.s_barrier_signal(-1)
             rocdl.s_barrier_wait(-1)
 
@@ -2679,7 +2675,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         llvm_dialect.store(
                             vector.bitcast(_v4i32t, _obf16[_msb][_n]),
                             llvm_dialect.inttoptr(_ldst, _la), volatile_=True)
-                _asm_void("s_wait_dscnt 0x0")
+                _emit_void("s_wait_dscnt 0x0")
                 _wsgpr = rocdl.wave_id()
                 from flydsl._mlir.dialects import fly as _fly2
                 from flydsl._mlir.dialects import llvm as _llvm2

@@ -127,9 +127,9 @@ def _setreg(hwreg_enc, value):
     llvm_dialect.call_intrinsic(None, "llvm.amdgcn.s.setreg", [imm, val], [], [])
 
 
-def _asm_void(asm_str, operands=None, constraints="", **kwargs):
+def _emit_void(inst_str, operands=None, constraints="", **kwargs):
     llvm_dialect.inline_asm(
-        None, operands or [], asm_str, constraints,
+        None, operands or [], inst_str, constraints,
         has_side_effects=True, **kwargs)
 
 
@@ -325,7 +325,7 @@ def _phase9b_v_lds_addr_gen(lane_id, wave_id):
 def _phase9d_k_lds_load_flydsl(k_addrs, lds_offset=0):
     """Load K from LDS → k_frags[4][8].
 
-    SP3 ordering: half(SU) outer → bank inner, matching lds_K_blk_su pattern.
+    Ordering: half(SU) outer → bank inner, matching lds_K_blk_su pattern.
     tile0_bank0(8) → tile0_bank1(8) → ... → tile1_bank0(8) → ...
 
     Two-pass: all 64 ds_loads → wait + hw barrier → frag building.
@@ -367,7 +367,7 @@ def _phase9d_k_lds_load_flydsl(k_addrs, lds_offset=0):
 def _qk_wmma_64_flydsl(k_frags, q_frags):
     """64 WMMAs → accs dict {(g_idx, tile): vec<8xf32>} with bank hints.
 
-    SP3 QK_WMMA_INTERLEAVE=1 ordering: g_idx → k_step → tile(0,1,2,3).
+    QK_WMMA_INTERLEAVE=1 ordering: g_idx → k_step → tile(0,1,2,3).
     g_idx 0,1 = SU0 (frags 0-3), g_idx 2,3 = SU1 (frags 4-7).
     Tile ordering: (acc_pair0,n=0), (acc_pair0,n=1), (acc_pair1,n=0), (acc_pair1,n=1)
     avoids consecutive WMMAs with same SRCC/SRCD bank.

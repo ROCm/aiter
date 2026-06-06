@@ -1,6 +1,6 @@
 """D128 BF16 FMHA Forward Core Loop — GEMM1 (QK) Only — gfx1250 FlyDSL.
 
-Translates SP3 core_loop stages 0-3 (GEMM1/QK) + cl_su_V3 interleaving.
+Translates core_loop stages 0-3 (GEMM1/QK) + cl_su_V3 interleaving.
 Target: align with BF16_FMHA_FWD_D128_1TG_4W_32mx4_256nx1_cas_brd_rxy.s L1701-~2400.
 
 GEMM2 (PV) stages 4-7 are handled by a separate agent.
@@ -8,7 +8,7 @@ GEMM2 (PV) stages 4-7 are handled by a separate agent.
 Architecture:
   1. Atomic primitives: one instruction per function (no per-atom barriers)
   2. Schedule builders: compile-time lists of WMMA / LDS / softmax ops
-  3. cl_su_V3 interleaving engine: dispatches ops following SP3 slot tables
+  3. cl_su_V3 interleaving engine: dispatches ops following slot tables
   4. core_loop: stages 0-3 (QK) + mask placeholder
 
 Target: gfx1250, wave32, 4 waves (1TG), 1024 shared VGPRs (256 per bank).
@@ -51,7 +51,7 @@ def _rocdl_fmax3(a, b, c):
     return llvm_dialect.intr_maxnum(m, arith.unwrap(c))
 
 # ============================================================================
-# Constants (from SP3)
+# Constants
 # ============================================================================
 
 WAVE_SIZE = 32
@@ -162,7 +162,7 @@ GEMM1_VALU_PER_PHASE = 3
 
 N_SP_PAIRS = VPS_MSB_SP // 2  # 16 v2f32 pairs per MSB (compact, no -inf padding)
 
-# GEMM2 PV constants (SP3 L1942-1944, adapted for SU_K_N=32)
+# GEMM2 PV constants
 GEMM2 = 1   # PV
 N_V_MSB = 2                     # v_msb = d_msb % 2, only 2 V banks needed
 N_PV_WMMA_N = 4                 # D_MSB_N / WMMA_N = 64 / 16
@@ -177,18 +177,18 @@ PV_GEMM_INST_COUNT = NUM_MSB * PV_K_ITERS * N_PV_WMMA_N  # 16
 
 
 # ============================================================================
-# Inline ASM Helpers
+# Low-level Helpers
 # ============================================================================
 
-def _asm_void(asm_str, operands=None, constraints="", **kwargs):
+def _emit_void(inst_str, operands=None, constraints="", **kwargs):
     llvm_dialect.inline_asm(
-        None, operands or [], asm_str, constraints,
+        None, operands or [], inst_str, constraints,
         has_side_effects=True, **kwargs)
 
 
-def _asm_result(result_type, asm_str, operands=None, constraints="", **kwargs):
+def _emit_result(result_type, inst_str, operands=None, constraints="", **kwargs):
     return llvm_dialect.inline_asm(
-        result_type, operands or [], asm_str, constraints,
+        result_type, operands or [], inst_str, constraints,
         has_side_effects=True, **kwargs)
 
 
@@ -434,28 +434,28 @@ def _atom_tdm_load(ty, s_g0, s_g1):
 
 def _atom_tdm_addr_inc(s_g0_2, s_inc_bytes):
 
-    _asm_void("s_lshl2_add_u32 $0, $1, $0",
+    _emit_void("s_lshl2_add_u32 $0, $1, $0",
               [s_g0_2, s_inc_bytes], "=s,s,0")
 
 
 def _atom_tdm_addr_carry(s_g0_3):
 
-    _asm_void("s_add_co_ci_u32 $0, $0, 0", [s_g0_3], "=s,0")
+    _emit_void("s_add_co_ci_u32 $0, $0, 0", [s_g0_3], "=s,0")
 
 
 def _atom_tdm_dim1_dec(s_g1_2, dec_amount):
 
-    _asm_void(f"s_sub_co_i32 $0, $0, {dec_amount}", [s_g1_2], "=s,0")
+    _emit_void(f"s_sub_co_i32 $0, $0, {dec_amount}", [s_g1_2], "=s,0")
 
 
 def _atom_tdm_dim1_clamp(s_g1_2):
 
-    _asm_void("s_max_i32 $0, $0, 0", [s_g1_2], "=s,0")
+    _emit_void("s_max_i32 $0, $0, 0", [s_g1_2], "=s,0")
 
 
 def _atom_tdm_next_lds_addr(s_lds_part_offset, next_offset):
 
-    result = _asm_result(ir.IntegerType.get_signless(32),
+    result = _emit_result(ir.IntegerType.get_signless(32),
                          f"s_add_co_i32 $0, $1, {next_offset}",
                          [s_lds_part_offset], "=s,s")
 
@@ -464,11 +464,11 @@ def _atom_tdm_next_lds_addr(s_lds_part_offset, next_offset):
 
 def _atom_tdm_set_lds_addr(s_g0, s_addr):
 
-    _asm_void("s_mov_b32 $0, $1", [s_g0, s_addr], "=s,s")
+    _emit_void("s_mov_b32 $0, $1", [s_g0, s_addr], "=s,s")
 
 
 # --- Scalar Softmax VALU (f32) ---
-# Use MLIR native ops instead of inline ASM to give LLVM full visibility
+# Use MLIR native ops to give LLVM full visibility
 # into register lifetimes, avoiding unnecessary spills to scratch.
 
 def _atom_exp_f32(src, bank):
@@ -536,7 +536,7 @@ def _atom_add_f32(src0, src1, bank):
 def _atom_max3_num_f32(src0, src1, src2, bank):
 
     _sched_barrier(0)
-    """v_max3_num_f32 via rocdl.fmax3 — native, no inline asm."""
+    """v_max3_num_f32 via rocdl.fmax3 — native."""
     result = _rocdl_fmax3(src0, src1, src2)
     banked = set_vgpr_bank(result, bank)
     _sched_barrier(0)
@@ -747,7 +747,8 @@ def _build_lds_k_schedule(blk, su):
 def _build_lds_v_schedule(blk, su):
     """Build 16 LDS load descriptors for V data (ds_load_tr16_b128).
 
-    SP3 uses 2 MSBs × 8 loads each (VPS_MSB_KV=32).  FlyDSL uses 4 MSBs × 4
+    The reference kernel uses 2 MSBs x 8 loads each (VPS_MSB_KV=32).
+    FlyDSL uses 4 MSBs x 4
     loads each (VPS_MSB_KV=16).  MSBs 0,2 map to V-bank 0 (D cols 0-63) and
     MSBs 1,3 map to V-bank 1 (D cols 64-127).  Within each bank, MSBs 0/1
     cover the first 32 columns and MSBs 2/3 cover the second 32 columns via
@@ -772,7 +773,7 @@ def _build_lds_v_schedule(blk, su):
 
 
 # ============================================================================
-# Slot Scheduling Tables (from SP3 L3573-3707)
+# Slot Scheduling Tables
 # ============================================================================
 
 def _get_lds_slots(stage, gemm_idx, cycle23,
@@ -835,7 +836,7 @@ def _build_softmax_part2_ops(ty, msb, blk, sp_pairs, ss, sgpr,
     ops = []
     bank = msb
 
-    # --- Setup phase (8 ops, SP3 L2354-2414) ---
+    # --- Setup phase (8 ops) ---
     # exp_delta is at op[2] — included in GEMM2 first half (< PART2_SPLIT=32).
     # This is required: partial_ed_out carries exp_delta as iter_arg for the next
     # tile's O-rescale. 4 exp_delta total (1/MSB) are unavoidable pipeline overhead.
@@ -846,10 +847,9 @@ def _build_softmax_part2_ops(ty, msb, blk, sp_pairs, ss, sgpr,
     # SGPR->VGPR copy (which would cause s_delay_alu or
     # v_nop).
     #
-    # IMPORTANT: use plain MLIR insertelement — NOT inline ASM — so that the
+    # IMPORTANT: use plain MLIR insertelement so that the
     # set_vgpr_bank_offset hint can freely direct the register allocator to the target
-    # physical register.  Inline ASM's "=v" constraint locks the output register BEFORE
-    # the hint fires, making the bank hint a no-op and the v_mov_b64 dead code.
+    # physical register.
     #
     # CSE-safety: each bank (b) passes a different argument to set_vgpr_bank_offset /
     # set_vgpr_bank, so CSE never merges the four copies.  LLVM allocates each at its
@@ -1191,8 +1191,7 @@ def _build_softmax_part0_ops(ty, msb, sp_pairs, ss, sgpr):
 def _build_softmax_part1_ops(ty, ss, sgpr):
     """Build 8 PART1 closures for cross-MSB merge + delta.
 
-    SP3 fmha_softmax_pure_issue_rlts PART1 (L2280-2339):
-      2 max3 (pair merge, old_max 3rd arg forces VOP3) + 2 mov + 4 fma
+    Layout: 2 max3 (pair merge, old_max 3rd arg forces VOP3) + 2 mov + 4 fma
 
     Returns (ops_list, per_msb_assignment):
       ops_list: 8 closures
@@ -1234,7 +1233,6 @@ def _build_softmax_part1_ops(ty, ss, sgpr):
     msb_assign.append(3)
 
     # fma delta[msb] = preMaxLog2eScl[msb] - local_max[msb] * log2e_scl
-    # SP3 order: [0, 2, 1, 3]
     for msb in [0, 2, 1, 3]:
         def op_fma_delta(b=msb):
             ss['delta'][b] = _atom_fma_f32_neg_src0(
@@ -1420,7 +1418,7 @@ def _emit_lds_load(ty, lds_op, kv_lds_addrs, kv_tiles_out):
         tile = _atom_ds_load_b128(ty, addr, offset, msb)
     else:
         half_p = lds_op['half_p']
-        # SP3 style: kv_lds_addrs[4 + msb*2 + half_p] — both dh0 and dh1 for
+        # kv_lds_addrs[4 + msb*2 + half_p] — both dh0 and dh1 for
         # this MSB are in bank=msb, so dst/addr/addr are all same bank →
         # s_set_vgpr_msb stays constant within each MSB's load group.
         addr = kv_lds_addrs[NUM_MSB + msb * 2 + (1 if half_p else 0)]
@@ -1921,7 +1919,7 @@ def _load_v_two_sus_from_lds(ty, kv_lds_addrs, blk, su0, su1):
     grouped by MSB (all MSB-0 loads first, then MSB-1, …, then MSB-3),
     followed by a single s_wait_dscnt.
 
-    SP3 insight: within each MSB group every load uses the same address
+    Within each MSB group every load uses the same address
     bank (= bank_msb) and the same dst bank (= bank_msb), so
     s_set_vgpr_msb only changes at the three MSB-group boundaries →
     4 MSB contexts total instead of 8 with two back-to-back single-SU calls.
@@ -2063,7 +2061,7 @@ def _softmax_pure(ty, blk, sp_pairs_all, softmax_state, sgpr_state):
 
 
 def _softmax_part01_only(ty, blk, sp_pairs_all, softmax_state, sgpr_state):
-    """Run PART0 + PART1 only (no PART2). Matches SP3 init stages 0..3 core work.
+    """Run PART0 + PART1 only (no PART2), for init stages 0..3 core work.
 
     After this call:
       - softmax_state['local_max'][msb] = max of sp_pairs for each MSB
@@ -2180,7 +2178,7 @@ def _softmax_part2_only(ty, blk, sp_pairs_all, softmax_state, sgpr_state,
                         skip_rescale_sum=False):
     """Run PART2 only (run_ids 5-8): rescale, exp, sum, cvt → p_bf16.
 
-    Matches SP3 post_process softmax stages 4..7 (is_first=0).
+    Runs post-process softmax stages 4..7 (is_first=0).
     After this call, softmax_state['p_bf16'] has the bf16 softmax output
     ready for PV GEMM.
     """
@@ -2342,7 +2340,7 @@ def _core_loop(
     # ================================================================
     # fmha_mask placeholder (no causal mask)
     # ================================================================
-    _asm_void("s_nop 0")
+    _emit_void("s_nop 0")
 
     # ================================================================
     # GEMM2 (PV): 4 stages (SU 0..3)
