@@ -166,7 +166,7 @@ def fail_on_aot_cache_miss(
                     exe._ensure_sig()
                     bound = exe._sig.bind(*compile_args)
                     bound.apply_defaults()
-                    last_cache_key[id(exe)] = exe._make_cache_key(bound.arguments)
+                    last_cache_key[id(exe)] = exe._build_full_cache_key(bound.arguments)
                 except Exception:
                     pass
                 return orig_run_compiled(exe, compile_args)
