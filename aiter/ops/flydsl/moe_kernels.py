@@ -1102,30 +1102,11 @@ def flydsl_moe_stage2(
     if return_per_slot:
         per_slot_shape = (token_num, topk, model_dim)
         if out is None:
-            out = torch.zeros(
+            out = torch.empty(
                 per_slot_shape,
                 dtype=torch_out_dtype,
                 device=inter_states.device,
             )
-        else:
-            if tuple(out.shape) != per_slot_shape:
-                raise ValueError(
-                    f"return_per_slot=True requires out.shape == "
-                    f"{per_slot_shape}; got {tuple(out.shape)}"
-                )
-            if out.dtype != torch_out_dtype:
-                raise ValueError(
-                    f"return_per_slot=True requires out.dtype == "
-                    f"{torch_out_dtype}; got {out.dtype}"
-                )
-            if out.device != inter_states.device:
-                raise ValueError(
-                    f"return_per_slot=True requires out.device == "
-                    f"{inter_states.device}; got {out.device}"
-                )
-            if not out.is_contiguous():
-                raise ValueError("return_per_slot=True requires out to be contiguous")
-            out.zero_()
     elif out is None:
         alloc_fn = torch.zeros if accumulate else torch.empty
         out = alloc_fn(
@@ -1170,8 +1151,6 @@ def flydsl_moe_stage2(
     target = out
     if not accumulate:
         if return_per_slot:
-            # `out` is the contiguous (token_num, topk, model_dim) buffer that the
-            # caller will receive. Pass its flat view to the kernel; same memory.
             target = out.view(-1)
         else:
             target = torch.empty(
