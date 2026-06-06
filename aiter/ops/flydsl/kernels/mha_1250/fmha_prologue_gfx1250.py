@@ -17,7 +17,10 @@ from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, rocdl, vector
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
-from fmha_core_loop_gfx1250 import QK_HDIM
+from fmha_core_loop_gfx1250 import (
+    QK_HDIM, _rocdl_permlanex16, _rocdl_exp2,
+    set_vgpr_bank, set_vgpr_bank_offset,
+)
 
 # ============================================================================
 # Constants
@@ -100,30 +103,6 @@ def _mul_nuw(a, b):
     """arith.muli with nuw flag — preserves nuw through constant folding."""
     return _raw(arith.muli(a, b, overflow_flags=_get_nuw()))
 
-
-def set_vgpr_bank(raw_val, bank: int):
-    return raw_val
-    val_type = raw_val.type
-    bank_val = _raw(arith.constant(bank, type=T.i32))
-    return llvm_dialect.call_intrinsic(
-        val_type, "llvm.amdgcn.set.vgpr.bank",
-        [raw_val, bank_val], [], [])
-
-
-def set_vgpr_bank_offset(raw_val, bank: int, offset: int):
-    """Pin raw_val to a specific physical register: HWIdx = bank*256 + offset.
-
-    Emits llvm.amdgcn.set.vgpr.bank.offset which the pre-RA pass converts to a
-    BankOffsetHint — a single-candidate hint that is much stronger than the
-    256-candidate BankHint produced by set_vgpr_bank.
-    """
-    return raw_val
-    val_type = raw_val.type
-    bank_val   = _raw(arith.constant(bank,   type=T.i32))
-    offset_val = _raw(arith.constant(offset, type=T.i32))
-    return llvm_dialect.call_intrinsic(
-        val_type, "llvm.amdgcn.set.vgpr.bank.offset",
-        [raw_val, bank_val, offset_val], [], [])
 
 
 def _acc_bank(g_idx, tile):
@@ -462,7 +441,7 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
     # ---- Cross-lane permlanex16 + cross-bank max → global_max ----
     for bank in fx.range_constexpr(4):
         val = max_per_bank[bank]
-        xchg = rocdl.permlanex16(f32, val, val, s_zero, s_zero, False, False)
+        xchg = _rocdl_permlanex16(f32, val, val, s_zero, s_zero, False, False)
         max_per_bank[bank] = set_vgpr_bank(arith.maxnumf(val, xchg), bank)
 
     cross01 = arith.maxnumf(max_per_bank[0], max_per_bank[1])
@@ -481,8 +460,7 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
             for i in fx.range_constexpr(8):
                 elem = vector.extract(acc, [], static_position=[i])
                 x = llvm_dialect.intr_fma(elem, scale_b, neg_ms)
-                from flydsl._mlir.dialects import rocdl as _rocdl_hw
-                exp_val = _rocdl_hw.exp2(f32, x)
+                exp_val = _rocdl_exp2(f32, x)
                 running_sum = arith.addf(running_sum, exp_val)
         row_sum[bank] = set_vgpr_bank(running_sum, bank)
         rocdl.sched_barrier(0)

@@ -74,7 +74,7 @@ def _if_then(if_op):
 from flydsl.utils.smem_allocator import SmemAllocator
 
 from fmha_prologue_gfx1250 import (
-    _raw, _asm_void, set_vgpr_bank, _setreg, _build_tdm_dgroup1, _split_i64_to_lo_hi,
+    _raw, _asm_void, _setreg, _build_tdm_dgroup1, _split_i64_to_lo_hi,
     _phase4_q_load_flydsl,
     _phase5_head_index_div_flydsl,
     _compute_k_global_addr, _compute_v_global_addr,
@@ -106,6 +106,8 @@ from fmha_core_loop_gfx1250 import (
     QK_HDIM, V_HDIM, KV_BPP,
     PART2_SPLIT,
     PART2_SETUP_A,
+    _rocdl_permlanex16,
+    set_vgpr_bank,
 )
 
 # ============================================================================
@@ -2188,7 +2190,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     _sm = arith.addf(_rsf[_mb], _rsf[_mb + 1])
                     _slo = _to_raw(arith.constant(0x76543210, type=T.i32))
                     _shi = _to_raw(arith.constant(0xfedcba98, type=T.i32))
-                    _pm = rocdl.permlanex16(ty['f32'], _sm, _sm, _slo, _shi, False, False)
+                    _pm = _rocdl_permlanex16(ty['f32'], _sm, _sm, _slo, _shi, False, False)
                     _sf = arith.addf(_sm, _pm)
                     _rsf[_mb] = _sf
                     _rsf[_mb + 1] = _sf

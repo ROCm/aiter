@@ -32,6 +32,26 @@ from flydsl.expr.typing import T
 from flydsl.expr.primitive import const_expr, range_constexpr
 
 # ============================================================================
+# Local rocdl primitive wrappers (until merged into upstream FlyDSL)
+# ============================================================================
+
+def _to_ir(v):
+    return arith.unwrap(v) if hasattr(v, 'unwrap') else v
+
+def _rocdl_exp2(res, arg, **kw):
+    return rocdl_dialect.exp2(res=res, arg=_to_ir(arg), **kw)
+
+def _rocdl_permlanex16(res, old, src0, src1, src2, fi, bound_control, **kw):
+    return rocdl_dialect.permlanex16(
+        res=res, old=_to_ir(old), src0=_to_ir(src0),
+        src1=_to_ir(src1), src2=_to_ir(src2),
+        fi=fi, bound_control=bound_control, **kw)
+
+def _rocdl_fmax3(a, b, c):
+    m = llvm_dialect.intr_maxnum(_to_ir(a), _to_ir(b))
+    return llvm_dialect.intr_maxnum(m, _to_ir(c))
+
+# ============================================================================
 # Constants (from SP3)
 # ============================================================================
 
@@ -212,7 +232,6 @@ LOG2E_PAIR_OFFSET = 206
 def set_vgpr_bank(raw_val, bank: int):
     if const_expr(not _USE_BANK_HINTS):
         return raw_val
-    return raw_val
     val_type = raw_val.type
     bank_val = _raw(arith.constant(bank, type=T.i32))
     return llvm_dialect.call_intrinsic(
@@ -224,7 +243,6 @@ def set_vgpr_bank_offset(raw_val, bank: int, offset: int):
     """Pin raw_val to HWIdx = bank*256+offset (single-candidate BankOffsetHint)."""
     if const_expr(not _USE_BANK_HINTS):
         return raw_val
-    return raw_val
     val_type = raw_val.type
     bank_val   = _raw(arith.constant(bank,   type=T.i32))
     offset_val = _raw(arith.constant(offset, type=T.i32))
@@ -458,10 +476,8 @@ def _atom_tdm_set_lds_addr(s_g0, s_addr):
 def _atom_exp_f32(src, bank):
 
     _sched_barrier(0)
-    """v_exp_f32 = 2^x via rocdl.exp2 — maps directly to hardware."""
-    from flydsl._mlir.dialects import rocdl as _rocdl_hw
     f32 = ir.F32Type.get()
-    result = _rocdl_hw.exp2(f32, src)
+    result = _rocdl_exp2(f32, src)
     banked = set_vgpr_bank(result, bank)
     _sched_barrier(0)
 
@@ -523,7 +539,7 @@ def _atom_max3_num_f32(src0, src1, src2, bank):
 
     _sched_barrier(0)
     """v_max3_num_f32 via rocdl.fmax3 — native, no inline asm."""
-    result = rocdl.fmax3(src0, src1, src2)
+    result = _rocdl_fmax3(src0, src1, src2)
     banked = set_vgpr_bank(result, bank)
     _sched_barrier(0)
 
@@ -544,7 +560,7 @@ def _atom_permlanex16(src, s_sel0, s_sel1, bank):
     i32_ty = ir.IntegerType.get_signless(32)
     f32_ty = ir.F32Type.get()
     src_i32 = llvm_dialect.bitcast(i32_ty, src)
-    r = rocdl.permlanex16(i32_ty, src_i32, src_i32, s_sel0, s_sel1,
+    r = _rocdl_permlanex16(i32_ty, src_i32, src_i32, s_sel0, s_sel1,
                            False, False)
     r_f32 = llvm_dialect.bitcast(f32_ty, r)
     # Use bank+2 so tmps[1] is in a DIFFERENT bank from tmps[0] (which is in `bank`).
@@ -933,8 +949,7 @@ def _build_softmax_part2_ops(ty, msb, blk, sp_pairs, ss, sgpr,
                 lo, hi = _split_v2f32(sp_pairs[pidx])
                 v2f32_ty = ir.VectorType.get([2], ir.F32Type.get())
                 _sched_barrier(0)
-                from flydsl._mlir.dialects import rocdl as _rocdl_exp
-                exp_lo = _rocdl_exp.exp2(ir.F32Type.get(), lo)
+                exp_lo = _rocdl_exp2(ir.F32Type.get(), lo)
                 _sched_barrier(0)
                 undef = llvm_dialect.mlir_undef(v2f32_ty)
                 v = llvm_dialect.insertelement(undef, exp_lo, _raw(arith.constant(0, type=T.i32)))
@@ -948,8 +963,7 @@ def _build_softmax_part2_ops(ty, msb, blk, sp_pairs, ss, sgpr,
                 lo, hi = _split_v2f32(sp_pairs[pidx])
                 v2f32_ty = ir.VectorType.get([2], ir.F32Type.get())
                 _sched_barrier(0)
-                from flydsl._mlir.dialects import rocdl as _rocdl_exp
-                exp_hi = _rocdl_exp.exp2(ir.F32Type.get(), hi)
+                exp_hi = _rocdl_exp2(ir.F32Type.get(), hi)
                 _sched_barrier(0)
                 undef = llvm_dialect.mlir_undef(v2f32_ty)
                 v = llvm_dialect.insertelement(undef, lo, _raw(arith.constant(0, type=T.i32)))
