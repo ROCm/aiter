@@ -18,7 +18,7 @@ os.environ["ENABLE_CK"] = "0"
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from aiter.ops.flydsl.mha_flydsl import flash_attn_varlen_flydsl
+from aiter.ops.flydsl.mha_flydsl import flash_attn_varlen_d192_gfx1250
 from aiter.ops.triton.attention.mha import (
     flash_attn_varlen_func as flash_attn_varlen_func_triton,
 )
@@ -75,7 +75,7 @@ def run_one(seed, seqs_q, seqs_k, H, causal, data_mode='randn'):
         cu_q[i + 1] = cu_q[i] + seqs_q[i]
         cu_k[i + 1] = cu_k[i] + seqs_k[i]
 
-    out_fly = flash_attn_varlen_flydsl(
+    out_fly = flash_attn_varlen_d192_gfx1250(
         q, k, v, cu_q, cu_k,
         max_seqlen_q=max_sq, max_seqlen_k=max_sk,
         softmax_scale=scale, causal=causal,

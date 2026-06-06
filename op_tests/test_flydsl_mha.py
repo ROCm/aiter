@@ -30,7 +30,7 @@ def ref_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, sm_scale):
 
 
 def run_test(batch, nheads, seqlen_q, seqlen_k):
-    from aiter.ops.flydsl.mha_flydsl import flash_attn_varlen_flydsl
+    from aiter.ops.flydsl.mha_flydsl import flash_attn_varlen_d192_gfx1250
 
     HEAD_QK = 192
     HEAD_V = 128
@@ -47,7 +47,7 @@ def run_test(batch, nheads, seqlen_q, seqlen_k):
 
     ref = ref_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, sm_scale)
 
-    out = flash_attn_varlen_flydsl(
+    out = flash_attn_varlen_d192_gfx1250(
         q, k, v, cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q=seqlen_q,
         max_seqlen_k=seqlen_k,

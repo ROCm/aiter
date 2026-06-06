@@ -80,8 +80,6 @@ def _ensure_kernel(is_causal: bool, return_lse: bool = False):
     _lds_alloc_v_b = mod._lds_alloc_v_b
     _BLOCK_SIZE = mod.BLOCK_SIZE
 
-    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!enter")
-
     @flyc.jit
     def _launch(
         ptr_O: fx.Tensor,
@@ -152,7 +150,7 @@ def _run_compiled(exe, args):
         cf(*args)
 
 
-def flash_attn_varlen_flydsl(
+def flash_attn_varlen_d192_gfx1250(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,

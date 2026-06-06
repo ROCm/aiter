@@ -14,7 +14,7 @@ os.environ["ENABLE_CK"] = "0"
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from aiter.ops.flydsl.mha_flydsl import flash_attn_varlen_flydsl
+from aiter.ops.flydsl.mha_flydsl import flash_attn_varlen_d192_gfx1250
 
 HEAD_QK = 192
 HEAD_V = 128
@@ -81,7 +81,7 @@ def test_seqlen_k_zero():
         cu_q = torch.arange(0, (B + 1) * SQ, SQ, dtype=torch.int32, device='cuda')
         cu_k = torch.zeros(B + 1, dtype=torch.int32, device='cuda')  # all zeros
 
-        out = flash_attn_varlen_flydsl(
+        out = flash_attn_varlen_d192_gfx1250(
             q, k, v, cu_q, cu_k,
             max_seqlen_q=SQ, max_seqlen_k=0,
             softmax_scale=scale, causal=True,
@@ -124,7 +124,7 @@ def test_causal_sq_small():
             cu_q[i + 1] = cu_q[i] + seqs_q[i]
             cu_k[i + 1] = cu_k[i] + seqs_k[i]
 
-        out = flash_attn_varlen_flydsl(
+        out = flash_attn_varlen_d192_gfx1250(
             q, k, v, cu_q, cu_k,
             max_seqlen_q=max_sq, max_seqlen_k=max_sk,
             softmax_scale=scale, causal=True,
@@ -163,7 +163,7 @@ def test_seqlen_k_zero_mixed():
             cu_q[i + 1] = cu_q[i] + seqs_q[i]
             cu_k[i + 1] = cu_k[i] + seqs_k[i]
 
-        out = flash_attn_varlen_flydsl(
+        out = flash_attn_varlen_d192_gfx1250(
             q, k, v, cu_q, cu_k,
             max_seqlen_q=max_sq, max_seqlen_k=max_sk,
             softmax_scale=scale, causal=causal,
@@ -215,7 +215,7 @@ def test_noncausal():
             cu_q[i + 1] = cu_q[i] + seqs_q[i]
             cu_k[i + 1] = cu_k[i] + seqs_k[i]
 
-        out = flash_attn_varlen_flydsl(
+        out = flash_attn_varlen_d192_gfx1250(
             q, k, v, cu_q, cu_k,
             max_seqlen_q=max_sq, max_seqlen_k=max_sk,
             softmax_scale=scale, causal=False,

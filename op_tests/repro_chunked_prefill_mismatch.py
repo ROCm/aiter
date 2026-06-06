@@ -17,7 +17,7 @@ os.environ["ENABLE_CK"] = "0"
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from aiter.ops.flydsl.mha_flydsl import flash_attn_varlen_flydsl
+from aiter.ops.flydsl.mha_flydsl import flash_attn_varlen_d192_gfx1250
 
 HEAD_QK = 192
 HEAD_V = 128
@@ -116,7 +116,7 @@ for i in range(B):
 print(f"\ncu_q={cu_q.cpu().tolist()}  cu_k={cu_k.cpu().tolist()}")
 print(f"max_sq={max_sq}  max_sk={max_sk}  H={H}  causal=True\n")
 
-out = flash_attn_varlen_flydsl(
+out = flash_attn_varlen_d192_gfx1250(
     q, k, v, cu_q, cu_k,
     max_seqlen_q=max_sq, max_seqlen_k=max_sk,
     softmax_scale=scale, causal=True,
@@ -139,7 +139,7 @@ v1 = torch.randn(sk_single, H, HEAD_V, dtype=torch.bfloat16, device='cuda')
 cu_q1 = torch.tensor([0, sq_single], dtype=torch.int32, device='cuda')
 cu_k1 = torch.tensor([0, sk_single], dtype=torch.int32, device='cuda')
 
-out1 = flash_attn_varlen_flydsl(
+out1 = flash_attn_varlen_d192_gfx1250(
     q1, k1, v1, cu_q1, cu_k1,
     max_seqlen_q=sq_single, max_seqlen_k=sk_single,
     softmax_scale=scale, causal=True,
