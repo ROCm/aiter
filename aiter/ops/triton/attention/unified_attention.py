@@ -701,8 +701,8 @@ def _gfx1250_unified_attention_2d(
     NUM_Q_HEADS = q.shape[1]
     HEAD_SIZE = q.shape[2]
     num_blocks = k.shape[0]
-    # Q_FP8 = q.element_size() == 1
-    # KV_FP8 = k.element_size() == 1
+    Q_FP8 = q.element_size() == 1
+    KV_FP8 = k.element_size() == 1
     ARCH_NAME = arch_info.get_arch()
     assert ARCH_NAME == "gfx1250", "unified_attention_2d_gfx1250 only supports gfx1250"
     assert softcap == 0, "Softcap is not supported"
@@ -756,7 +756,7 @@ def _gfx1250_unified_attention_2d(
             TILE_SIZE = 256
         else:
             num_warps = 1
-            waves_per_eu = 2    
+            waves_per_eu = 2
 
     assert (
         TILE_SIZE >= BLOCK_SIZE
