@@ -91,9 +91,10 @@ def compile_mxfp4_gemm2_a4w4(
     model_dim: int,   # N_OUT (down-proj output) = 7168
     inter_dim: int,   # K (down-proj contraction) = 512
     topk: int,
-    BM: int,          # 16/32 (atomic) or 128 (nonatomic mxfp4out)
+    BM: int,          # 16/32 (atomic) or 128 (nonatomic bf16flat / mxfp4out)
     b_nt: int = 2,
-    mxfp4out: bool = False,   # True: BM=128 per-row fp4 flat output + scatter_reduce_q
+    mxfp4out: bool = False,   # BM=128 per-row fp4 flat_out_q/scale + scatter_reduce_q
+    bf16flat: bool = False,   # BM=128 per-row bf16 flat_out + scatter_reduce
 ):
     """Compile a fresh FlyDSL gemm2 that is a drop-in for mxfp4_moe_gemm2_a4w4
     (atomic epilogue, BM in {16,32}). Returns the @flyc.jit launcher.
@@ -102,8 +103,9 @@ def compile_mxfp4_gemm2_a4w4(
     fp4, sorted-direct) into LDS, loop K (K/256 tiles), fp4 scaled-MFMA into
     accm, then cshuffle->LDS and atomic acc*weight into out[token].
     """
-    if mxfp4out:
-        assert BM == 128, "mxfp4out gemm2 is BM=128 only"
+    assert not (mxfp4out and bf16flat), "pick one nonatomic mode"
+    if mxfp4out or bf16flat:
+        assert BM == 128, "nonatomic gemm2 (bf16flat/mxfp4out) is BM=128 only"
     else:
         assert BM in (16, 32), "atomic gemm2 supports BM in {16,32} here"
     assert inter_dim == 512, "gemm2 contract: K==512"
@@ -166,9 +168,9 @@ def compile_mxfp4_gemm2_a4w4(
     # (BM=16) -- matches what gemm1 wrote. NOT BM (BM=128 would read the wrong chunk).
     _as_chunk_div = min(BM, 32)
 
+    _g2tag = "mxout" if mxfp4out else ("bf16flat" if bf16flat else "atomic")
     module_name = (
-        f"mxfp4_g2_a4w4_E{experts}_K{K}_N{N_OUT}_TOPK{topk}_BM{BM}"
-        f"_{'mxout' if mxfp4out else 'atomic'}_v0"
+        f"mxfp4_g2_a4w4_E{experts}_K{K}_N{N_OUT}_TOPK{topk}_BM{BM}_{_g2tag}_v0"
     )
 
     @flyc.kernel
@@ -500,6 +502,38 @@ def compile_mxfp4_gemm2_a4w4(
         _b_tile1 = load_b_tile(arith.index(1))
         _a_sc1, _b_scs1 = load_scales(arith.index(1))
         mfma_ktile(_b_tile1, _a_sc1, _b_scs1)
+
+        # ---- BM=128 nonatomic bf16 flat epilogue (== apply_bf16_flat_epilog_bm128)
+        # write accm straight to bf16 flat_out[max_sorted, N_OUT] per sorted row
+        # (no LDS, no quant, no weight); mxfp4_moe_scatter_reduce does the topk
+        # reduce. Done before the cshuffle so it isn't paid for this mode. ----
+        if const_expr(bf16flat):
+            _flat_base = arith.index_cast(ir.IndexType.get(), fx.ptrtoint(arg_out))
+            _cN_out = arith.constant(N_OUT, index=True)
+            for i in range_constexpr(m_repeat):
+                for j in range_constexpr(num_acc_n):
+                    gn = (n_block * _c256 + wave_n * _c64
+                          + arith.constant(j * 16, index=True) + lane_mod_16)
+                    acc_v = accm[i * num_acc_n + j]
+                    for v in range_constexpr(4):
+                        row = (m_row + arith.constant(i * 16, index=True)
+                               + lane_div_16 * arith.index(4)
+                               + arith.constant(v, index=True))
+                        val = vector.extract(
+                            acc_v, static_position=[v], dynamic_position=[])
+                        bf = arith.trunc_f(T.bf16, val)
+                        off = (row * _cN_out + gn) * arith.index(2)
+                        _ptr = llvm.inttoptr(
+                            ir.Type.parse("!llvm.ptr<1>"),
+                            arith.index_cast(T.i64, _flat_base + off))
+                        llvm.StoreOp(
+                            bf._value if hasattr(bf, "_value") else bf,
+                            _ptr, alignment=2)
+            # match atomic/mxfp4out epilogues: a workgroup barrier before exit so
+            # the GEMM's LDS (lds_a) reads are all retired before the workgroup
+            # frees its 128KB LDS for the next (FlyDSL) kernel on the CU.
+            gpu.barrier()
+            return
 
         # ---- cshuffle + atomic epilogue (build/test increment 6) ----
         # accm[mi*4+J][v]  ->  lds_acc[(mi*16 + lane/16*4 + v)*BN + col],

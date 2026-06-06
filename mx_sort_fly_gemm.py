@@ -172,6 +172,51 @@ def _fly_gemm2_mxfp4out(*, cumsum_tensor, inter_sorted_quant,
     )
 
 
+def _fly_gemm2_bf16flat(*, cumsum_tensor, inter_sorted_quant,
+                        inter_sorted_shuffled_scale, w2, w2_scale,
+                        sorted_expert_ids, flat_out, M, max_sorted):
+    """FlyDSL gemm2 BM=128 nonatomic-bf16 backend: down-proj -> per-sorted-row
+    bf16 flat_out [max_sorted, N_OUT]; topk reduce done by mxfp4_moe_scatter_reduce.
+    """
+    from aiter.ops.flydsl.kernels.mxfp4_a4w4_gemm import compile_mxfp4_gemm2_a4w4
+
+    NE = w2.shape[0]
+    D_HIDDEN = w2.shape[1]
+    D_INTER = w2.shape[2] * 2
+    BM = 128
+    launcher = compile_mxfp4_gemm2_a4w4(
+        experts=NE, model_dim=D_HIDDEN, inter_dim=D_INTER, topk=9, BM=BM,
+        bf16flat=True,
+    )
+    total_m_blocks = max_sorted // BM
+    _e = _empty_u8(flat_out.device)
+    launcher(
+        _fly_ptr(flat_out), _fly_ptr(inter_sorted_quant), _fly_ptr(w2),
+        _fly_ptr(inter_sorted_shuffled_scale), _fly_ptr(w2_scale),
+        _fly_ptr(_e), _fly_ptr(sorted_expert_ids), _fly_ptr(_e),
+        _fly_ptr(cumsum_tensor), _fly_ptr(_e), _fly_ptr(_e),
+        int(M), int(max_sorted), int(total_m_blocks),
+    )
+
+
+def _mxfn_regime(M):
+    """Return (BM, g2_mode) matching mx_fn's CSV selection for the Kimi shape:
+      padded_M<=128       -> (16, atomic)    inline_quant
+      padded_M in 256..2048 -> (32, atomic)  threestage
+      padded_M==4096      -> (128, bf16flat) threestage nonatomic bf16 + scatter_reduce
+      padded_M>=8192      -> (128, mxfp4out) threestage nonatomic mxfp4out + scatter_reduce_q
+    """
+    from aiter.fused_moe import get_padded_M
+    pm = int(get_padded_M(M))
+    if pm <= 128:
+        return 16, "atomic"
+    if pm <= 2048:
+        return 32, "atomic"
+    if pm <= 4096:
+        return 128, "bf16flat"
+    return 128, "mxfp4out"
+
+
 def mx_sort_fly_gemm1_gemm2(
     hidden_states,
     w1,            # [E, 2*D_INTER, D_HIDDEN] packed MXFP4 (mx_w / a16w4 layout)
@@ -183,10 +228,13 @@ def mx_sort_fly_gemm1_gemm2(
     w1_scale=None,
     w2_scale=None,
     BM=32,
+    g2_mode=None,        # BM=128: "bf16flat" or "mxfp4out" (None -> derive from M)
     gemm1_backend=None,
     gemm2_backend=None,
 ):
-    """mxfp4 sort prologue + swappable gemm1/gemm2 (BM32 / threestage / atomic).
+    """mxfp4 sort prologue + swappable gemm1/gemm2, mirroring mx_fn's per-M regime:
+      BM=16 inline+atomic / BM=32 threestage+atomic / BM=128 threestage+nonatomic
+      (bf16flat+scatter_reduce or mxfp4out+scatter_reduce_q).
 
     Returns out_buf [M, D_HIDDEN] bf16 (== mx_fn output).
     """
@@ -311,10 +359,29 @@ def mx_sort_fly_gemm1_gemm2(
         kernelName1=kernelName1,
     )
 
-    # ── BM=128: nonatomic-mxfp4out gemm2 + HIP scatter_reduce_q (mx_fn large-M
-    #    path). gemm2 writes per-sorted-row fp4 flat_out; scatter_reduce_q gathers
-    #    via reverse_sorted and does the topk-weighted reduce into out[M, H]. ────
+    # ── BM=128 nonatomic (mx_fn large-M): gemm2 stages per-sorted-row flat_out,
+    #    then HIP scatter_reduce(_q) gathers via reverse_sorted + topk-weighted
+    #    reduce into out[M, H]. bf16flat (4096) vs mxfp4out (>=8192) per CSV. ────
     if BM == 128:
+        if g2_mode is None:
+            g2_mode = _mxfn_regime(M)[1]
+        if g2_mode == "bf16flat":
+            flat_out = torch.empty(
+                (max_sorted, D_HIDDEN), device=device, dtype=dtypes.bf16)
+            _fly_gemm2_bf16flat(
+                cumsum_tensor=cumsum_tensor,
+                inter_sorted_quant=inter_sorted_quant,
+                inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+                w2=w2, w2_scale=w2_scale, sorted_expert_ids=sorted_expert_ids,
+                flat_out=flat_out, M=M, max_sorted=max_sorted,
+            )
+            out = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
+            aiter.mxfp4_moe_scatter_reduce(
+                flat_out=flat_out, reverse_sorted=reverse_sorted,
+                sorted_weights=sorted_weights, out=out,
+                NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM,
+            )
+            return out
         flat_out_q = torch.empty(
             (max_sorted, D_HIDDEN // 2), device=device, dtype=torch.uint8)
         flat_out_scale = torch.empty(

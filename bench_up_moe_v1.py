@@ -3,6 +3,7 @@ import hashlib
 import os
 import sys
 from dataclasses import dataclass
+from itertools import combinations
  
 # sys.path.insert(0, os.environ.get("AITER_REPO", "/tmp/aiter-pr3470"))
  
@@ -23,6 +24,7 @@ from mx_sort_fly_gemm import (
     mx_sort_fly_gemm1_gemm2,
     _fly_gemm1,
     _fly_gemm2,
+    _mxfn_regime,
 )
  
  
@@ -126,14 +128,8 @@ def make_mx_sort_fly_fn(hidden, topk_ids, topk_weight, w):
     so the kernel trace matches mx_fn except the two gemm names.
     """
     M = hidden.shape[0]
-    # mirror mx_fn BM regime: 16 (small-M inline), 32 (mid), 128 (large-M
-    # nonatomic mxfp4out + scatter_reduce_q).
-    if M <= 128:
-        BM = 16
-    elif M < 1024:
-        BM = 32
-    else:
-        BM = 128
+    # mirror mx_fn's exact CSV regime (BM + gemm2 mode) for this shape.
+    BM, g2_mode = _mxfn_regime(M)
 
     def fn():
         return mx_sort_fly_gemm1_gemm2(
@@ -146,6 +142,7 @@ def make_mx_sort_fly_fn(hidden, topk_ids, topk_weight, w):
             w1_scale=w["w1_scale"],
             w2_scale=w["w2_scale"],
             BM=BM,
+            g2_mode=g2_mode,
             gemm1_backend=_fly_gemm1,
             gemm2_backend=_fly_gemm2,
         )
@@ -170,6 +167,38 @@ def tensor_hash(*tensors):
         b = t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
         hh.update(b)
     return hh.hexdigest()[:16]
+
+
+BENCHMARK_LABELS = {
+    "mx": "mxfp4 tuned",
+    "fly": "flydsl tuned",
+    "msfg": "mxsort+flygemm",
+}
+
+
+def parse_benchmarks(values):
+    selected = []
+    valid = set(BENCHMARK_LABELS)
+    for value in values:
+        for item in value.split(","):
+            name = item.strip()
+            if not name:
+                continue
+            if name == "all":
+                for benchmark in BENCHMARK_LABELS:
+                    if benchmark not in selected:
+                        selected.append(benchmark)
+                continue
+            if name not in valid:
+                choices = ", ".join([*sorted(valid), "all"])
+                raise argparse.ArgumentTypeError(
+                    f"unknown benchmark '{name}', choose from: {choices}"
+                )
+            if name not in selected:
+                selected.append(name)
+    if len(selected) not in (2, 3):
+        raise argparse.ArgumentTypeError("select exactly 2 or 3 benchmarks")
+    return selected
  
  
 def main():
@@ -178,11 +207,24 @@ def main():
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument(
+        "--benchmarks",
+        nargs="+",
+        default=["mx", "fly", "msfg"],
+        help=(
+            "benchmarks to run: choose any 2 or all 3 from mx, fly, msfg, all; "
+            "accepts either space-separated or comma-separated values"
+        ),
+    )
+    parser.add_argument(
         "--hash", action="store_true",
         help="print stable content hashes of weights/inputs/outputs (for "
              "reproducibility checks across runs)",
     )
     args = parser.parse_args()
+    try:
+        selected_benchmarks = parse_benchmarks(args.benchmarks)
+    except argparse.ArgumentTypeError as e:
+        parser.error(str(e))
  
     device = torch.device("cuda")
     shape = KIMI
@@ -199,12 +241,20 @@ def main():
         f"Shape Kimi-K2.5 TP=4: NE={shape.NE} H={shape.H} "
         f"INTER={shape.INTER} TOPK={shape.TOPK}"
     )
-    print(
-        f"\n{'M':>6} | {'mxfp4 tuned us':>15} | {'flydsl tuned us':>16} | "
-        f"{'mxsort+flygemm us':>18} | {'fly/mx':>8} | {'msfg/mx':>8} | "
-        f"{'cos':>7} | {'cos_msfg':>9}"
-    )
-    print("-" * 105)
+    print("Selected benchmarks: " + ", ".join(selected_benchmarks))
+
+    time_headers = [f"{BENCHMARK_LABELS[name]} us" for name in selected_benchmarks]
+    pair_headers = []
+    for left, right in combinations(selected_benchmarks, 2):
+        pair_headers.append(f"{right}/{left}")
+        pair_headers.append(f"cos {right}/{left}")
+    header = f"\n{'M':>6}"
+    for name in time_headers:
+        header += f" | {name:>18}"
+    for name in pair_headers:
+        header += f" | {name:>13}"
+    print(header)
+    print("-" * len(header))
     for M in [int(x) for x in args.M_list.split(",")]:
         hidden, topk_ids, topk_weight = build_inputs(shape, M, device)
         if args.hash:
@@ -218,26 +268,30 @@ def main():
         mx_sort_fly_gemm1_gemm2_fn = make_mx_sort_fly_fn(
             hidden, topk_ids, topk_weight, mx_w
         )
-        mx_out = mx_fn().clone()
-        fly_out = fly_fn().clone()
-        msfg_out = mx_sort_fly_gemm1_gemm2_fn().clone()
+        benchmark_fns = {
+            "mx": mx_fn,
+            "fly": fly_fn,
+            "msfg": mx_sort_fly_gemm1_gemm2_fn,
+        }
+        outputs = {name: benchmark_fns[name]().clone() for name in selected_benchmarks}
         torch.cuda.synchronize()
         if args.hash:
-            print(
-                f"[M={M}] output hash: mxfp4={tensor_hash(mx_out)} "
-                f"flydsl={tensor_hash(fly_out)} msfg={tensor_hash(msfg_out)}"
+            hashes = " ".join(
+                f"{name}={tensor_hash(outputs[name])}" for name in selected_benchmarks
             )
-        cos = cosine(mx_out, fly_out)
-        cos_msfg = cosine(mx_out, msfg_out)
-        _, mx_us = run_perftest(mx_fn, num_warmup=args.warmup, num_iters=args.iters)
-        _, fly_us = run_perftest(fly_fn, num_warmup=args.warmup, num_iters=args.iters)
-        _, mx_sort_fly_gemm1_gemm2_us = run_perftest(mx_sort_fly_gemm1_gemm2_fn, num_warmup=args.warmup, num_iters=args.iters)
-        print(
-            f"{M:>6} | {mx_us:>15.1f} | {fly_us:>16.1f} | "
-            f"{mx_sort_fly_gemm1_gemm2_us:>18.1f} | {fly_us / mx_us:>7.2f}x | "
-            f"{mx_sort_fly_gemm1_gemm2_us / mx_us:>7.2f}x | {cos:>7.4f} | {cos_msfg:>9.4f}",
-            flush=True,
-        )
+            print(f"[M={M}] output hash: {hashes}")
+        timings = {}
+        for name in selected_benchmarks:
+            _, timings[name] = run_perftest(
+                benchmark_fns[name], num_warmup=args.warmup, num_iters=args.iters
+            )
+        row = f"{M:>6}"
+        for name in selected_benchmarks:
+            row += f" | {timings[name]:>18.1f}"
+        for left, right in combinations(selected_benchmarks, 2):
+            row += f" | {timings[right] / timings[left]:>12.2f}x"
+            row += f" | {cosine(outputs[left], outputs[right]):>13.4f}"
+        print(row, flush=True)
  
  
 if __name__ == "__main__":
