@@ -70,6 +70,40 @@ def _mxfp4_gemm2_hip(*, cumsum_tensor, inter_sorted_quant, inter_sorted_shuffled
     )
 
 
+def _fly_ptr(t):
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+
+
+def _fly_gemm2(*, cumsum_tensor, inter_sorted_quant, inter_sorted_shuffled_scale,
+               w2, w2_scale, sorted_token_ids, sorted_expert_ids, sorted_weights,
+               out_buf, M, max_sorted, kernelName2):
+    """Fresh FlyDSL gemm2 backend (drop-in for mxfp4_moe_gemm2_a4w4, atomic).
+
+    Consumes the *exact* HIP gemm2 inputs (a16w4 w2, make_preshuffle scales,
+    sorted inter A_q, sorted ids/weights); validated cos 0.9999 vs HIP.
+    """
+    from aiter.ops.flydsl.kernels.mxfp4_a4w4_gemm import compile_mxfp4_gemm2_a4w4
+
+    NE = w2.shape[0]
+    D_HIDDEN = w2.shape[1]            # N_OUT
+    D_INTER = w2.shape[2] * 2         # K (w2 [E, D_HIDDEN, D_INTER//2] uint8)
+    topk = int(kernelName2.split("TOPK")[1].split("_")[0])
+    BM = int(kernelName2.split("_BM")[1].split("_")[0])
+    launcher = compile_mxfp4_gemm2_a4w4(
+        experts=NE, model_dim=D_HIDDEN, inter_dim=D_INTER, topk=topk, BM=BM
+    )
+    total_m_blocks = max_sorted // BM
+    launcher(
+        _fly_ptr(out_buf), _fly_ptr(inter_sorted_quant), _fly_ptr(w2),
+        _fly_ptr(inter_sorted_shuffled_scale), _fly_ptr(w2_scale),
+        _fly_ptr(sorted_token_ids), _fly_ptr(sorted_expert_ids),
+        _fly_ptr(sorted_weights), _fly_ptr(cumsum_tensor),
+        int(M), int(max_sorted), int(total_m_blocks),
+    )
+
+
 def mx_sort_fly_gemm1_gemm2(
     hidden_states,
     w1,            # [E, 2*D_INTER, D_HIDDEN] packed MXFP4 (mx_w / a16w4 layout)
@@ -99,8 +133,16 @@ def mx_sort_fly_gemm1_gemm2(
     D_INTER = w1.shape[1] // 2
     M = hidden_states.shape[0]
 
-    # codegen'd HIP kernel names for this shape (BM32, atomic, no scatter_reduce)
-    kernelName1 = f"mxfp4_moe_g1_a4w4_NE{NE}_H{D_HIDDEN}_E{D_INTER}_BM{BM}_NT"
+    # codegen'd HIP kernel names for this shape (atomic, no scatter_reduce).
+    # BM=16 has no separate-quant gemm1 — only the inline-quant variant exists,
+    # so the small-M path fuses quant into gemm1 (prologue=0, no sort_scales).
+    inline_quant = (BM == 16)
+    if inline_quant:
+        kernelName1 = (
+            f"mxfp4_moe_g1_a4w4_NE{NE}_H{D_HIDDEN}_E{D_INTER}_BM16_INLINEQUANT"
+        )
+    else:
+        kernelName1 = f"mxfp4_moe_g1_a4w4_NE{NE}_H{D_HIDDEN}_E{D_INTER}_BM{BM}_NT"
     kernelName2 = (
         f"mxfp4_moe_g2_a4w4_NE{NE}_H{D_HIDDEN}_E{D_INTER}_TOPK{topk}_BM{BM}_ATOMIC_NT"
     )
@@ -124,39 +166,55 @@ def mx_sort_fly_gemm1_gemm2(
     a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
     a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
 
-    # atomic gemm2 output buffer (zero-init'd by quant kernel below)
+    # atomic gemm2 output buffer (zero-init'd via bf16_zero_out in sort/quant)
     atomic_output_buf = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
 
-    # ── threestage sort + quant + sort_scales (mx_fn's sort-related kernels) ──
-    aiter.mxfp4_moe_sort(
-        topk_ids=topk_ids, topk_weight=topk_weight,
-        sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
-        cumsum_tensor=cumsum_tensor, reverse_sorted=reverse_sorted,
-        sorted_weights=sorted_weights,
-        masked_m=masked_m, m_indices=m_indices,
-        bf16_zero_out=_empty_bf16(device),
-        bf16_zero_workspace=_empty_bf16(device),
-        M_logical=M, NE=NE, TOPK=topk,
-        D_HIDDEN=D_HIDDEN, D_INTER=D_INTER, MB=BM,
-        prologue=1,
-    )
-    aiter.mxfp4_moe_quant(
-        a_input=hidden_states, a_quant=a_quant, a_scale=a_scale,
-        bf16_zero_out=atomic_output_buf,
-        NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM,
-    )
-    padded_rows = ((max_sorted + 31) // 32) * 32
-    cols = D_HIDDEN // 32
-    a_scale_sorted_shuffled = torch.empty(
-        (padded_rows * cols * 2,), device=device, dtype=torch.uint8)
-    aiter.mxfp4_moe_sort_scales(
-        a_scale=a_scale,
-        sorted_token_ids=sorted_token_ids,
-        cumsum_tensor=cumsum_tensor,
-        a_scale_sorted_shuffled=a_scale_sorted_shuffled,
-        NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, D_INTER=D_INTER,
-        MB=BM, max_sorted=max_sorted,
-    )
+    # ── sort (+ quant + sort_scales for threestage; gemm1 fuses quant for
+    #    inline-quant). mirrors aiter.fused_moe._mxfp4_moe_run. ─────────────
+    if inline_quant:
+        aiter.mxfp4_moe_sort(
+            topk_ids=topk_ids, topk_weight=topk_weight,
+            sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=cumsum_tensor, reverse_sorted=reverse_sorted,
+            sorted_weights=sorted_weights,
+            masked_m=masked_m, m_indices=m_indices,
+            bf16_zero_out=atomic_output_buf,
+            bf16_zero_workspace=_empty_bf16(device),
+            M_logical=M, NE=NE, TOPK=topk,
+            D_HIDDEN=D_HIDDEN, D_INTER=D_INTER, MB=BM,
+            prologue=0,
+        )
+        a_scale_sorted_shuffled = _empty_u8(device)
+    else:
+        aiter.mxfp4_moe_sort(
+            topk_ids=topk_ids, topk_weight=topk_weight,
+            sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=cumsum_tensor, reverse_sorted=reverse_sorted,
+            sorted_weights=sorted_weights,
+            masked_m=masked_m, m_indices=m_indices,
+            bf16_zero_out=_empty_bf16(device),
+            bf16_zero_workspace=_empty_bf16(device),
+            M_logical=M, NE=NE, TOPK=topk,
+            D_HIDDEN=D_HIDDEN, D_INTER=D_INTER, MB=BM,
+            prologue=1,
+        )
+        aiter.mxfp4_moe_quant(
+            a_input=hidden_states, a_quant=a_quant, a_scale=a_scale,
+            bf16_zero_out=atomic_output_buf,
+            NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM,
+        )
+        padded_rows = ((max_sorted + 31) // 32) * 32
+        cols = D_HIDDEN // 32
+        a_scale_sorted_shuffled = torch.empty(
+            (padded_rows * cols * 2,), device=device, dtype=torch.uint8)
+        aiter.mxfp4_moe_sort_scales(
+            a_scale=a_scale,
+            sorted_token_ids=sorted_token_ids,
+            cumsum_tensor=cumsum_tensor,
+            a_scale_sorted_shuffled=a_scale_sorted_shuffled,
+            NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, D_INTER=D_INTER,
+            MB=BM, max_sorted=max_sorted,
+        )
 
     # ── gemm1 (swappable) ─────────────────────────────────────────────────
     inter_sorted_quant = torch.empty(
