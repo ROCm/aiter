@@ -113,10 +113,28 @@ jobs:
             cd /tmp
             mkdir -p /tmp/${MODEL_NAME}_out
             SLOG=/tmp/${MODEL_NAME}_out/server.log
+
+            # Resolve model path: prefer local /models cache, fall back to HF repo id.
+            # DO runners do NOT yet have /models populated for the paired-release matrix
+            # (only model_path layout assumed by ATOM repos). HF fallback lets the job
+            # still run if HF_TOKEN is set; it just costs the first-pull download time.
+            EFFECTIVE_MODEL='${MODEL_PATH}'
+            if [ ! -d \"${MODEL_PATH}\" ] && [ ! -e \"${MODEL_PATH}/config.json\" ]; then
+              HF_REPO=\$(echo '${MODEL_PATH}' | sed 's|^/models/||')
+              echo \"WARN: ${MODEL_PATH} not in container — falling back to HF repo '\$HF_REPO'\"
+              if [ -z \"\${HF_TOKEN:-}\" ]; then
+                echo 'HF_TOKEN unset; cannot fetch from HuggingFace. Aborting.'
+                exit 7
+              fi
+              EFFECTIVE_MODEL=\"\$HF_REPO\"
+            else
+              echo \"Using local model cache at ${MODEL_PATH}\"
+            fi
+
             echo '== launching ATOM server for ${MODEL_NAME} =='
-            echo 'model=${MODEL_PATH} tp=${TP} extra=${EXTRA_ARGS}'
+            echo \"model=\$EFFECTIVE_MODEL tp=${TP} extra=${EXTRA_ARGS}\"
             python -m atom.entrypoints.openai_server \\
-              --model '${MODEL_PATH}' -tp ${TP} ${EXTRA_ARGS} > \$SLOG 2>&1 &
+              --model \"\$EFFECTIVE_MODEL\" -tp ${TP} ${EXTRA_ARGS} > \$SLOG 2>&1 &
             SVPID=\$!
             echo '== waiting for health =='
             ready=0
@@ -135,12 +153,12 @@ jobs:
             # Warmup
             curl -s http://localhost:8000/v1/completions \\
               -H 'Content-Type: application/json' \\
-              -d \"{\\\"model\\\":\\\"${MODEL_PATH}\\\",\\\"prompt\\\":\\\"hi\\\",\\\"max_tokens\\\":1}\" >/dev/null
+              -d \"{\\\"model\\\":\\\"\$EFFECTIVE_MODEL\\\",\\\"prompt\\\":\\\"hi\\\",\\\"max_tokens\\\":1}\" >/dev/null
 
             echo '== lm_eval gsm8k 3-shot =='
             pip install -q lm-eval 2>/dev/null
             lm_eval --model local-completions \\
-              --model_args model='${MODEL_PATH}',base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \\
+              --model_args model=\"\$EFFECTIVE_MODEL\",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \\
               --tasks gsm8k --num_fewshot 3 \\
               --output_path /tmp/${MODEL_NAME}_out/acc 2>&1 | tee /tmp/${MODEL_NAME}_out/accuracy.txt
 
