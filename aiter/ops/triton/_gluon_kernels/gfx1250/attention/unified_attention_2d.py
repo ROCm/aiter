@@ -157,9 +157,10 @@ class AttentionConfig:
         self.NUM_MASKED_TILES = gl.constexpr(
             (QUERY_SPAN + self.TILE_SIZE - 1) // self.TILE_SIZE + 1
         )
-        assert NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
-
-        if NUM_WARPS == 2:
+        assert NUM_WARPS == 1 or NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
+        if NUM_WARPS == 1:
+            warp_bases = []
+        elif NUM_WARPS == 2:
             warp_bases = [[1, 0]]
         elif NUM_WARPS == 4:
             warp_bases = [[1, 0], [2, 0]]
@@ -1709,6 +1710,7 @@ unified_attention_gluon_kernel_2d_repr = make_kernel_repr(
         "SHUFFLED_KV_CACHE",
         "NUM_BUFFERS",
         "BLOCK_M",
+        "LOOP_VARIANT",
         "num_warps",
         "waves_per_eu",
     ],

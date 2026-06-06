@@ -730,23 +730,37 @@ def _gfx1250_unified_attention_2d(
     num_warps = 4
     BLOCK_M = 128
     waves_per_eu = 1
+    SLIDING_WINDOW = 1 + window_size[0]
+    ALL_DECODE = max_seqlen_q == 1
+    NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
+    num_warps = 4
+    BLOCK_M = 128
+    waves_per_eu = 1
     if SLIDING_WINDOW > 0:
         loop_variant = 0
-    elif not loop_variant:
+    elif loop_variant is None:
         if shuffled_kv_cache or TILE_SIZE > 32:
             loop_variant = 2
         else:
             loop_variant = 0
-    if ALL_DECODE:
+    elif ALL_DECODE:
         loop_variant = 0
         BLOCK_M = (
             16
             if NUM_QUERIES_PER_KV <= 16
             else triton.next_power_of_2(NUM_QUERIES_PER_KV)
         )
-        TILE_SIZE = 128
-        num_warps = 1
-        waves_per_eu = 2
+        if Q_FP8 and KV_FP8:
+            num_warps = 1
+            waves_per_eu = 2
+            TILE_SIZE = 256
+        else:
+            num_warps = 1
+            waves_per_eu = 2    
+
+    assert (
+        TILE_SIZE >= BLOCK_SIZE
+    ), f"TILE_SIZE={TILE_SIZE} must be multiple of PAGE_SIZE={BLOCK_SIZE}"
 
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
     # Upper bound on masked tiles. +1 because the causal diagonal isnt
