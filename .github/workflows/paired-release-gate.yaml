@@ -100,7 +100,7 @@ jobs:
             -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
             -v /models:/models \
             --name ${INSTANCE} \
-            ${CONTAINER_IMAGE} sleep infinity
+            --entrypoint=sleep ${CONTAINER_IMAGE} infinity
           echo "Container ${INSTANCE} started"
           docker exec ${INSTANCE} bash -c "pip show amd-aiter | grep -E '^Name|^Version'; pip show flydsl | grep Version; pip show triton | grep Version; cd /app/ATOM && git describe --tags 2>/dev/null || git log --oneline -1"
 
