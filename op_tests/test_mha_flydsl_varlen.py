@@ -8,54 +8,13 @@ Usage:
     bash run_mha_flydsl_varlen.sh
 """
 
+import math
 import os
 import sys
-import math
-
-# Environment setup must precede aiter imports
-os.environ["ARCH"] = "gfx1250"
-os.environ["FLYDSL_RUNTIME_ENABLE_CACHE"] = "0"
-os.environ["ENABLE_CK"] = "0"
-os.environ.setdefault(
-    "FLYDSL_ROOT",
-    os.path.join(
-        os.path.abspath(
-            os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "aiter",
-                "ops",
-                "flydsl",
-                "kernels",
-                "fmha_gfx1250",
-            )
-        ),
-        "FlyDSL",
-    ),
-)
-sys.path.insert(
-    0,
-    os.path.abspath(
-        os.path.join(os.path.dirname(__file__), ".."),
-    ),
-)
-sys.path.insert(
-    0,
-    os.path.join(
-        os.environ["FLYDSL_ROOT"],
-        "python",
-    ),
-)
-sys.path.insert(
-    0,
-    os.path.join(
-        os.environ["FLYDSL_ROOT"],
-        "build-fly",
-        "python_packages",
-    ),
-)
 
 import torch
+
+os.environ.setdefault("ENABLE_CK", "0")
 
 import aiter
 from aiter.ops.mha import flash_attn_varlen_func
@@ -286,3 +245,129 @@ if __name__ == "__main__":
     print(f"\n{'='*60}")
     print(f"{n_pass}/{len(tests)} passed")
     print(f"{'='*60}")
+
+    # ----------------------------------------------------------
+    # Performance comparison: FlyDSL vs Triton
+    # ----------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("FlyDSL vs Triton Performance Comparison")
+    print("=" * 60)
+
+    from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_kernel import (
+        flash_attn_varlen_d192_gfx1250,
+    )
+    from aiter.ops.triton.attention.mha import (
+        flash_attn_varlen_func as triton_varlen_func,
+    )
+
+    bench_shapes = [
+        # (B, H, SQ, SK, causal)
+        (1, 128, 128, 128, False),
+        (1, 128, 512, 512, False),
+        (1, 128, 512, 512, True),
+        (1, 128, 1024, 1024, True),
+        (4, 128, 256, 256, True),
+        (1, 128, 128, 2048, False),
+        (1, 128, 1, 512, False),
+    ]
+
+    WARMUP, REPEAT = 2, 5
+
+    for B, H, SQ, SK, causal in bench_shapes:
+        cu_q = list(range(0, (B + 1) * SQ, SQ))
+        cu_k = list(range(0, (B + 1) * SK, SK))
+        total_q, total_k = cu_q[-1], cu_k[-1]
+        scale = 1.0 / math.sqrt(HEAD_DIM_QK)
+        device = torch.device("cuda")
+
+        torch.manual_seed(0)
+        q = torch.randn(
+            total_q,
+            H,
+            HEAD_DIM_QK,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        k = torch.randn(
+            total_k,
+            H,
+            HEAD_DIM_QK,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        v = torch.randn(
+            total_k,
+            H,
+            HEAD_DIM_V,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        cu_q_t = torch.tensor(
+            cu_q,
+            dtype=torch.int32,
+            device=device,
+        )
+        cu_k_t = torch.tensor(
+            cu_k,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        def run_flydsl():
+            out = torch.empty_like(q[:, :, :HEAD_DIM_V])
+            return flash_attn_varlen_d192_gfx1250(
+                q,
+                k,
+                v,
+                cu_q_t,
+                cu_k_t,
+                SQ,
+                SK,
+                softmax_scale=scale,
+                causal=causal,
+                out=out,
+            )
+
+        def run_triton():
+            return triton_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_q_t,
+                cu_seqlens_k=cu_k_t,
+                max_seqlen_q=SQ,
+                max_seqlen_k=SK,
+                softmax_scale=scale,
+                causal=causal,
+            )
+
+        for _ in range(WARMUP):
+            run_flydsl()
+            run_triton()
+        torch.cuda.synchronize()
+
+        torch.cuda.synchronize()
+        t0 = torch.cuda.Event(enable_timing=True)
+        t1 = torch.cuda.Event(enable_timing=True)
+        t0.record()
+        for _ in range(REPEAT):
+            run_flydsl()
+        t1.record()
+        torch.cuda.synchronize()
+        fly_ms = t0.elapsed_time(t1) / REPEAT
+
+        t0.record()
+        for _ in range(REPEAT):
+            run_triton()
+        t1.record()
+        torch.cuda.synchronize()
+        tri_ms = t0.elapsed_time(t1) / REPEAT
+
+        speedup = tri_ms / fly_ms if fly_ms > 0 else float("inf")
+        tag = f"B={B} H={H} sq={SQ} sk={SK}" f" causal={causal}"
+        print(
+            f"  [{tag}]  "
+            f"flydsl={fly_ms:.3f}ms  "
+            f"triton={tri_ms:.3f}ms  "
+            f"speedup={speedup:.2f}x"
+        )
