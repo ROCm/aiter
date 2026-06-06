@@ -2421,3 +2421,182 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 )
 
     return fmha_fwd_kernel
+
+
+# ============================================================================
+# Launch wrapper + PyTorch entry point
+# ============================================================================
+
+import torch
+from flydsl.compiler.kernel_function import CompilationContext
+
+HEAD_DIM_QK = 192
+HEAD_DIM_V = 128
+BLOCK_M = 128
+KV_TILE_N = 128
+BPP = 2  # bytes per element (bf16)
+
+_launch_fns = {}  # {(is_causal, return_lse): launch_fn}
+
+
+def _patch_reusable_slot_specs():
+    import ctypes
+    from flydsl.expr.numeric import Float32, Float64
+
+    if not hasattr(Float32, "_reusable_slot_spec"):
+        @classmethod
+        def _f32_slot_spec(cls, arg):
+            return ctypes.c_float, lambda a: a.value if hasattr(a, "value") else a
+        Float32._reusable_slot_spec = _f32_slot_spec
+        Float32._reusable_ctype = ctypes.c_float
+
+    if not hasattr(Float64, "_reusable_slot_spec"):
+        @classmethod
+        def _f64_slot_spec(cls, arg):
+            return ctypes.c_double, lambda a: a.value if hasattr(a, "value") else a
+        Float64._reusable_slot_spec = _f64_slot_spec
+        Float64._reusable_ctype = ctypes.c_double
+
+
+def _ensure_kernel(is_causal: bool, return_lse: bool = False):
+    key = (is_causal, return_lse)
+    if key in _launch_fns:
+        return
+
+    _patch_reusable_slot_specs()
+
+    kernel = compile_fmha_fwd(is_causal=is_causal, return_lse=return_lse)
+
+    @flyc.jit
+    def _launch(
+        ptr_O: fx.Pointer,
+        ptr_Q: fx.Pointer,
+        ptr_K: fx.Pointer,
+        ptr_V: fx.Pointer,
+        ptr_LSE: fx.Pointer,
+        ptr_cu_seqlens_q: fx.Pointer,
+        ptr_cu_seqlens_k: fx.Pointer,
+        scalar_f: fx.Float32,
+        stride_q_seq: fx.Int32,
+        stride_k_seq: fx.Int32,
+        stride_v_seq: fx.Int32,
+        stride_o_seq: fx.Int32,
+        stride_q_head: fx.Int32,
+        stride_k_head: fx.Int32,
+        stride_v_head: fx.Int32,
+        stride_o_head: fx.Int32,
+        gqa: fx.Int32,
+        max_seqlen_q: fx.Int32,
+        max_seqlen_k: fx.Int32,
+        num_heads: fx.Int32,
+        batch_size: fx.Int32,
+    ):
+        _lds_alloc_k_a.finalized = False
+        _lds_alloc_k_b.finalized = False
+        _lds_alloc_v_a.finalized = False
+        _lds_alloc_v_b.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            _lds_alloc_k_a.finalize()
+            _lds_alloc_k_b.finalize()
+            _lds_alloc_v_a.finalize()
+            _lds_alloc_v_b.finalize()
+
+        num_tg = arith.index_cast(T.index, arith.ceildivui(
+            arith.unwrap(max_seqlen_q), arith.constant(BLOCK_M, type=T.i32)))
+        grid_x = arith.index_cast(T.index, batch_size)
+        grid_z = arith.index_cast(T.index, num_heads)
+
+        launcher = kernel(
+            ptr_O, ptr_Q, ptr_K, ptr_V, ptr_LSE,
+            ptr_cu_seqlens_q, ptr_cu_seqlens_k,
+            scalar_f,
+            stride_q_seq, stride_k_seq, stride_v_seq, stride_o_seq,
+            stride_q_head, stride_k_head, stride_v_head, stride_o_head,
+            gqa, max_seqlen_q, max_seqlen_k,
+        )
+        launcher.launch(
+            grid=(grid_x, num_tg, grid_z),
+            block=(BLOCK_SIZE, 1, 1),
+        )
+
+    _launch.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
+    _launch_fns[key] = _launch
+
+
+def _run_compiled(exe, args):
+    cf = getattr(exe, "_cf", None)
+    if cf is None:
+        cf = flyc.compile(exe, *args)
+        exe._cf = cf
+    else:
+        cf(*args)
+
+
+def flash_attn_varlen_d192_gfx1250(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale=None,
+    causal=False,
+    out=None,
+    return_lse=False,
+):
+    assert q.dtype == torch.bfloat16, f"Expected bf16, got {q.dtype}"
+    assert q.shape[-1] == HEAD_DIM_QK, f"Expected headdim_qk={HEAD_DIM_QK}, got {q.shape[-1]}"
+    assert v.shape[-1] == HEAD_DIM_V, f"Expected headdim_v={HEAD_DIM_V}, got {v.shape[-1]}"
+
+    total_q_tokens = q.shape[0]
+    batch = cu_seqlens_q.shape[0] - 1
+    nheads_q = q.shape[1]
+    nheads_k = k.shape[1]
+    gqa = nheads_q // nheads_k
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / (HEAD_DIM_QK ** 0.5)
+
+    if out is None:
+        out = torch.empty(
+            (total_q_tokens, nheads_q, HEAD_DIM_V),
+            dtype=torch.bfloat16, device=q.device,
+        )
+    if return_lse:
+        lse = torch.zeros(
+            (total_q_tokens, nheads_q), dtype=torch.float32, device=q.device
+        )
+    else:
+        lse = torch.zeros(
+            (batch, nheads_q, max_seqlen_q), dtype=torch.float32, device=q.device
+        )
+
+    stride_q_seq = q.stride(0) * BPP
+    stride_k_seq = k.stride(0) * BPP
+    stride_v_seq = v.stride(0) * BPP
+    stride_o_seq = out.stride(0)
+    stride_q_head = q.stride(1) * BPP
+    stride_k_head = k.stride(1) * BPP
+    stride_v_head = v.stride(1) * BPP
+    stride_o_head = out.stride(1)
+
+    _ensure_kernel(bool(causal), bool(return_lse))
+
+    _run_compiled(
+        _launch_fns[(bool(causal), bool(return_lse))],
+        (
+            out, q, k, v, lse,
+            cu_seqlens_q, cu_seqlens_k,
+            softmax_scale,
+            stride_q_seq, stride_k_seq, stride_v_seq, stride_o_seq,
+            stride_q_head, stride_k_head, stride_v_head, stride_o_head,
+            gqa, max_seqlen_q, max_seqlen_k,
+            nheads_q, batch,
+        ),
+    )
+
+    if return_lse:
+        return out, lse
+    return out

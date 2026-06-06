@@ -57,7 +57,7 @@ def run_repro(dump_dir):
     print()
 
     # Run flydsl
-    from aiter.ops.flydsl.mha_flydsl import flash_attn_varlen_d192_gfx1250
+    from aiter.ops.flydsl.kernels.mha_1250.fmha_kernel_gfx1250 import flash_attn_varlen_d192_gfx1250
     out_fly = torch.empty(S, H, Dv, dtype=torch.bfloat16, device='cuda')
     flash_attn_varlen_d192_gfx1250(q, k, v, cu_q, cu_k, max_sq, max_sk,
                              softmax_scale=scale, causal=causal, out=out_fly)

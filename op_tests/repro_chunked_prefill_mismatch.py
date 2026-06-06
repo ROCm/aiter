@@ -17,7 +17,7 @@ os.environ["ENABLE_CK"] = "0"
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from aiter.ops.flydsl.mha_flydsl import flash_attn_varlen_d192_gfx1250
+from aiter.ops.flydsl.kernels.mha_1250.fmha_kernel_gfx1250 import flash_attn_varlen_d192_gfx1250
 
 HEAD_QK = 192
 HEAD_V = 128

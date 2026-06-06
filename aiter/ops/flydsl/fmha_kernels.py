@@ -28,9 +28,11 @@ import torch
 import torch.nn.functional as F
 
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
+from .kernels.mha_1250.fmha_kernel_gfx1250 import flash_attn_varlen_d192_gfx1250
 
 __all__ = [
     "flydsl_flash_attn_func",
+    "flydsl_flash_attn_varlen_func",
 ]
 
 
@@ -204,3 +206,103 @@ def flydsl_flash_attn_func(
     if seq_len_pad != seq_len_real:
         return o_p[:, :seq_len_real, :, :].contiguous()
     return o_p
+
+
+# ============================================================================
+# gfx1250 (MI450) — varlen THD layout, D_qk=192 D_v=128, bf16
+# ============================================================================
+
+_FLYDSL_COMPARE_TRITON = True
+
+
+def flydsl_flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    return_lse: bool = False,
+    dropout_p: float = 0.0,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+    out=None,
+    sink=None,
+):
+    """FlyDSL MHA forward, varlen THD layout.
+
+    Returns the result if FlyDSL can handle this configuration,
+    otherwise returns None so the caller falls through to Triton/CK.
+    """
+    from ...jit.utils.chip_info import get_gfx
+
+    if not (
+        get_gfx() == "gfx1250"
+        and q.shape[-1] == 192
+        and v.shape[-1] == 128
+        and q.dtype == torch.bfloat16
+    ):
+        return None
+
+    print(
+        f"[flydsl] q={list(q.shape)} k={list(k.shape)} v={list(v.shape)} "
+        f"max_sq={max_seqlen_q} max_sk={max_seqlen_k} causal={causal} "
+        f"cu_q={cu_seqlens_q.tolist()} cu_k={cu_seqlens_k.tolist()}"
+    )
+
+    _flydsl_out = torch.empty_like(q[:, :, : v.shape[-1]])
+    _flydsl_result = flash_attn_varlen_d192_gfx1250(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        out=_flydsl_out,
+        return_lse=return_lse,
+    )
+    if return_lse:
+        _flydsl_out, _flydsl_lse = _flydsl_result
+    else:
+        _flydsl_out = _flydsl_result
+
+    if _FLYDSL_COMPARE_TRITON:
+        from .triton_mha_cmp import compare_with_triton
+
+        compare_with_triton(
+            _flydsl_out,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            block_table=block_table,
+            out=out,
+            sink=sink,
+        )
+
+    print("[flydsl] returning flydsl output")
+    if return_lse:
+        return (_flydsl_out, _flydsl_lse)
+    return _flydsl_out
