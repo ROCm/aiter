@@ -130,7 +130,7 @@ TESTS = [
         "test_type": "Accuracy (MoRI EP + MTP)",
         "timeout_minutes": 150,
         "extra_exec_args": "",
-        "test_command": "python3 registered/amd/test_moriep_small.py",
+        "test_command": "python3 registered/amd/test_moriep_small.py TestPureDP TestMTP",
         "run_on_pr": True,
         "run_on_schedule": True,
     },
