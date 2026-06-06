@@ -2720,6 +2720,8 @@ def flash_attn_varlen_func(
                 _num_bad = (~_close).sum().item()
                 print(f"[flydsl vs triton] MISMATCH  q={list(q.shape)} max_sq={max_seqlen_q} max_sk={max_seqlen_k} causal={causal}"
                       f"  max_err={_diff.max():.6f}  bad={_num_bad}/{_flydsl_out.numel()}")
+                print(f"[flydsl vs triton]   cu_seqlens_q={cu_seqlens_q.tolist()}")
+                print(f"[flydsl vs triton]   cu_seqlens_k={cu_seqlens_k.tolist()}")
 
             if return_lse:
                 return (_flydsl_out, _flydsl_lse)

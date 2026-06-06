@@ -1749,10 +1749,36 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                          + kv_flat_init + pro_local_max + pro_delta
                          + sp_flat_init + pp_init
                          + pro_partial_sp_flat + pro_exp_delta)
-    
-            for tile_idx, iter_args, loop_results in scf.for_(
+
+            # ---- Split point for causal loops (chunked-prefill: sq < sk) ----
+            # Tiles below _first_causal_tile are fully under the diagonal and
+            # need no causal mask.  Tiles at or above it cross the diagonal.
+            # When sq == sk, _first_causal_tile == num_tiles so loop 1 covers
+            # everything and loop 2 runs zero iterations — no regression.
+            if const_expr(IS_CAUSAL):
+                # Tile t is fully below the diagonal when
+                #   (t+1)*TILE_N - 1 <= _causal_offset + m_start
+                # i.e. t < floor((_causal_offset + m_start) / TILE_N) + 1
+                # Since m_start = bx * TILE_N this equals bx + floor(_causal_offset / TILE_N).
+                # Clamp to [1, num_tiles-1) since loop 1 starts at tile 1.
+                _first_causal_tile = _mlir_arith.addi(
+                    _to_raw(bx),
+                    _mlir_arith.divui(_causal_offset, tile_n_const))
+                _first_causal_tile = _mlir_arith.maxsi(
+                    _first_causal_tile, _to_raw(arith.constant(1, type=T.i32)))
+                _first_causal_tile = _mlir_arith.minui(
+                    _first_causal_tile, num_tiles_minus1)
+                _first_causal_tile_idx = arith.index_cast(
+                    T.index, _first_causal_tile)
+            else:
+                _first_causal_tile_idx = num_tiles_minus1_idx
+
+            # ================================================================
+            # SECTION 3a: Main KV loop — non-causal tiles [1, _first_causal_tile)
+            # ================================================================
+            for tile_idx, iter_args, loop1_results in scf.for_(
                 arith.index(1),
-                num_tiles_minus1_idx,   # tiles 1..N-2; endtile handled in epilogue
+                _first_causal_tile_idx,
                 arith.index(1),
                 iter_args=init_args,
             ):
@@ -1765,10 +1791,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     for n in fx.range_constexpr(N_PV_WMMA_N):
                         row.append(set_vgpr_bank(o_tiles_flat[d * N_PV_WMMA_N + n], d))
                     o_tiles.append(row)
-    
+
                 ia_old_max = [set_vgpr_bank(iter_args[16 + i], i) for i in fx.range_constexpr(NUM_MSB)]
                 ia_row_sums = [set_vgpr_bank(iter_args[20 + i], i) for i in fx.range_constexpr(NUM_MSB)]
-    
+
                 kv_tiles_flat = [iter_args[24 + i]
                                  for i in fx.range_constexpr(_KV_SIZE)]
                 kv_tiles = []
@@ -1777,10 +1803,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     for k in fx.range_constexpr(N_WMMA_K_TILES):
                         row.append(set_vgpr_bank(kv_tiles_flat[msb * N_WMMA_K_TILES + k], msb))
                     kv_tiles.append(row)
-    
+
                 ia_local_max = [set_vgpr_bank(iter_args[_OFF_LOCAL_MAX + i], i) for i in fx.range_constexpr(NUM_MSB)]
                 ia_delta = [set_vgpr_bank(iter_args[_OFF_DELTA + i], i) for i in fx.range_constexpr(NUM_MSB)]
-    
+
                 ia_sp_flat = [iter_args[_OFF_SP + i]
                               for i in fx.range_constexpr(CNT_SU * NUM_MSB)]
                 prev_su_sp_tiles = []
@@ -1789,36 +1815,34 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     for msb in fx.range_constexpr(NUM_MSB):
                         msb_list.append([set_vgpr_bank(ia_sp_flat[su * NUM_MSB + msb], msb)])
                     prev_su_sp_tiles.append(msb_list)
-    
+
                 # Unpack ping-pong bases
                 ia_k_cur_base = iter_args[_OFF_PP]
                 ia_v_cur_base = iter_args[_OFF_PP + 1]
                 ia_k_next_base = iter_args[_OFF_PP + 2]
                 ia_v_next_base = iter_args[_OFF_PP + 3]
-    
+
                 # Build per-lane LDS addresses from ping-pong bases
                 kv_lds_addrs_cur = _build_kv_lds_addrs(lane_id, ia_k_cur_base, ia_v_cur_base)
                 kv_lds_addrs_next = _build_kv_lds_addrs(lane_id, ia_k_next_base, ia_v_next_base)
-    
+
                 # ---- Unpack partial_sp_pairs: reconstruct v2f32 from separate lo+hi f32 scalars ----
-                # lo values at [_OFF_PSP .. _OFF_PSP+_PSP_SIZE), hi at [_OFF_PSP_HI .. _OFF_PSP_HI+_PSP_SIZE)
                 ia_partial_sp_lo = [iter_args[_OFF_PSP + i]     for i in fx.range_constexpr(_PSP_SIZE)]
                 ia_partial_sp_hi = [iter_args[_OFF_PSP_HI + i]  for i in fx.range_constexpr(_PSP_SIZE)]
                 ia_exp_delta = [set_vgpr_bank(iter_args[_OFF_PED + i], i) for i in fx.range_constexpr(NUM_MSB)]
-    
-                # Reconstruct v2f32 from f32 scalars in sequential context (no WMMA pressure → correct).
+
                 ia_partial_sp_pairs = []
                 for _m in fx.range_constexpr(NUM_MSB):
                     msb_pairs = [_make_v2f32(ia_partial_sp_lo[_m * N_SP_PAIRS + _i],
                                              ia_partial_sp_hi[_m * N_SP_PAIRS + _i], _m)
                                  for _i in fx.range_constexpr(N_SP_PAIRS)]
                     ia_partial_sp_pairs.append(msb_pairs)
-    
+
                 # ---- SP tiles: zero accumulators (fresh each iteration) ----
                 sp_tiles = []
                 for msb in fx.range_constexpr(NUM_MSB):
                     sp_tiles.append([set_vgpr_bank(zero_v8f32, msb)])
-    
+
                 softmax_state = {
                     'old_max': list(ia_old_max),
                     'local_max': list(ia_local_max),
@@ -1832,18 +1856,18 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     'exp_delta_dup': [None] * NUM_MSB,
                     'row_sums': list(ia_row_sums),
                     'p_bf16': [[], [], [], []],
-                    'sp_pairs_prev': ia_partial_sp_pairs,  # partial (after PART2 first half)
+                    'sp_pairs_prev': ia_partial_sp_pairs,
                 }
-    
+
                 # ---- Build TDM state (zero placeholder for memload=False) ----
                 _zero_i32 = _to_raw(arith.constant(0, type=T.i32))
-    
+
                 def _mk_zero_v4i32():
                     return vector_dialect.broadcast(ty['v4i32'], _zero_i32)
-    
+
                 def _mk_zero_v8i32():
                     return vector_dialect.broadcast(ty['v8i32'], _zero_i32)
-    
+
                 tdm_state = {
                     'v_g0': _mk_zero_v4i32(),
                     'v_g1': _mk_zero_v8i32(),
@@ -1852,10 +1876,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     'v_salu_queue': [],
                     'k_salu_queue': [],
                 }
-    
+
                 # ---- Compute TDM offsets ----
-                # GEMM1 loads K(tile_idx+1) -> K_next (stage 2 wait + stage 3 ds_load)
-                # GEMM2 loads V(tile_idx) -> V_next (stage 2 wait)
                 tile_idx_i32 = arith.index_cast(T.i32, tile_idx)
 
                 tile_n_stride_v = _mlir_arith.muli(tile_n_const, stride_v_seq)
@@ -1869,7 +1891,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 next_k_offset = _mlir_arith.addi(_to_raw(k_offset), next_k_advance)
 
                 # ---- Per-tile OOB dg1 for K prefetch and V load ----
-                # V(tile_idx): remaining = actual_kv_len - tile_idx * TILE_N
                 _loop_v_remain = _mlir_arith.subi(
                     actual_kv_len,
                     _mlir_arith.muli(tile_idx_i32, tile_n_const))
@@ -1882,7 +1903,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                             wave_id, 8))
                     for _su in range(CNT_SU)
                 ]
-                # K(tile_idx+1): remaining = actual_kv_len - (tile_idx+1) * TILE_N
                 _loop_k_remain = _mlir_arith.subi(
                     actual_kv_len,
                     _mlir_arith.muli(next_tile, tile_n_const))
@@ -1897,70 +1917,254 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     for _su in range(CNT_SU)
                 ]
 
-                # ---- Core loop: GEMM1(QK)+TDM_K + softmax + GEMM2(PV)+TDM_V ----
+                # ---- Core loop: no causal mask ----
                 sp_out, kv_out, o_tiles, su_sp_tiles_out, _partial_sp_lo_out, _partial_sp_hi_out, _partial_ed_out = _core_loop(
                     ty, False,
                     q_frags, kv_tiles, sp_tiles,
                     o_tiles,
                     kv_lds_addrs_cur, tdm_state, softmax_state, sgpr_state,
                     gemm2=True,
-                    tdm_v_offset=cur_v_offset,   # GEMM2 loads V(tile_idx)
+                    tdm_v_offset=cur_v_offset,
                     tdm_v_target=ia_v_next_base,
-                    tdm_k_offset=next_k_offset,  # GEMM1 loads K(tile_idx+1)
+                    tdm_k_offset=next_k_offset,
                     tdm_k_target=ia_k_next_base,
                     kv_lds_addrs_next=kv_lds_addrs_next,
                     gemm1_tdm_is_v=False,
                     loop_k_oob_dg1=_loop_k_oob_dg1,
                     loop_v_oob_dg1=_loop_v_oob_dg1,
                 )
-    
+
                 # ---- Yield updated state with ping-pong swap ----
                 new_o = []
                 for d in fx.range_constexpr(NUM_MSB):
                     for n in fx.range_constexpr(N_PV_WMMA_N):
                         new_o.append(o_tiles[d][n])
-    
+
                 new_max = [softmax_state['old_max'][i]
                            for i in fx.range_constexpr(NUM_MSB)]
                 new_sums = [softmax_state['row_sums'][i]
                             for i in fx.range_constexpr(NUM_MSB)]
-    
-    
+
+
                 kv_out_flat = []
                 for msb in fx.range_constexpr(NUM_MSB):
                     for k in fx.range_constexpr(N_WMMA_K_TILES):
                         kv_out_flat.append(kv_out[msb][k])
-    
+
                 new_local_max = [softmax_state['local_max'][i]
                                  for i in fx.range_constexpr(NUM_MSB)]
                 new_delta = [softmax_state['delta'][i]
                              for i in fx.range_constexpr(NUM_MSB)]
-    
+
                 sp_out_flat = []
                 for su in fx.range_constexpr(CNT_SU):
                     for msb in fx.range_constexpr(NUM_MSB):
                         sp_out_flat.append(su_sp_tiles_out[su][msb][0])
-    
-                # Ping-pong swap: next→cur, cur→next
+
                 pp_swapped = [ia_k_next_base, ia_v_next_base,
                               ia_k_cur_base, ia_v_cur_base]
-    
-                # DBG: print sp_pairs just before yield, wave 0 lane 0
-                # _yld_w0 = arith.cmpi(arith.CmpIPredicate.eq, wave_id, arith.constant(0, type=T.i32))
-                # _yld_c0 = arith.andi(arith.cmpi(arith.CmpIPredicate.eq, lane_id, arith.constant(0, type=T.i32)), _yld_w0)
-                # for _ym in [2, 3]:
-                    # for _yp in [2, 3]:
-                        # _yhi = llvm_dialect.extractelement(_partial_sp_out[_ym][_yp], _raw(arith.constant(1, type=T.i32)))
-                        # _ylo = llvm_dialect.extractelement(_partial_sp_out[_ym][_yp], _raw(arith.constant(0, type=T.i32)))
-                        # if _yld_c0:
-                            # fx.printf(f"YLD m={_ym} p={_yp} lo={{}}\n", _ylo)
-                            # fx.printf(f"YLD m={_ym} p={_yp} hi={{}}\n", _yhi)
-    
-                # Use lo+hi flat lists returned from _core_loop (safe f32 scalars from EXP token cache)
+
                 new_partial_sp_flat = _partial_sp_lo_out + _partial_sp_hi_out
                 new_exp_delta = [_partial_ed_out[_m]
                                  for _m in fx.range_constexpr(NUM_MSB)]
-    
+
+                yield (new_o + new_max + new_sums
+                       + kv_out_flat + new_local_max + new_delta
+                       + sp_out_flat + pp_swapped
+                       + new_partial_sp_flat + new_exp_delta)
+
+            # ================================================================
+            # SECTION 3b: Main KV loop — causal tiles [_first_causal_tile, num_tiles-1)
+            # ================================================================
+            for tile_idx, iter_args, loop_results in scf.for_(
+                _first_causal_tile_idx,
+                num_tiles_minus1_idx,
+                arith.index(1),
+                iter_args=loop1_results,
+            ):
+                # ---- Unpack iter_args ----
+                o_tiles_flat = [iter_args[i] for i in fx.range_constexpr(16)]
+                o_tiles = []
+                for d in fx.range_constexpr(NUM_MSB):
+                    row = []
+                    for n in fx.range_constexpr(N_PV_WMMA_N):
+                        row.append(set_vgpr_bank(o_tiles_flat[d * N_PV_WMMA_N + n], d))
+                    o_tiles.append(row)
+
+                ia_old_max = [set_vgpr_bank(iter_args[16 + i], i) for i in fx.range_constexpr(NUM_MSB)]
+                ia_row_sums = [set_vgpr_bank(iter_args[20 + i], i) for i in fx.range_constexpr(NUM_MSB)]
+
+                kv_tiles_flat = [iter_args[24 + i]
+                                 for i in fx.range_constexpr(_KV_SIZE)]
+                kv_tiles = []
+                for msb in fx.range_constexpr(NUM_MSB):
+                    row = []
+                    for k in fx.range_constexpr(N_WMMA_K_TILES):
+                        row.append(set_vgpr_bank(kv_tiles_flat[msb * N_WMMA_K_TILES + k], msb))
+                    kv_tiles.append(row)
+
+                ia_local_max = [set_vgpr_bank(iter_args[_OFF_LOCAL_MAX + i], i) for i in fx.range_constexpr(NUM_MSB)]
+                ia_delta = [set_vgpr_bank(iter_args[_OFF_DELTA + i], i) for i in fx.range_constexpr(NUM_MSB)]
+
+                ia_sp_flat = [iter_args[_OFF_SP + i]
+                              for i in fx.range_constexpr(CNT_SU * NUM_MSB)]
+                prev_su_sp_tiles = []
+                for su in fx.range_constexpr(CNT_SU):
+                    msb_list = []
+                    for msb in fx.range_constexpr(NUM_MSB):
+                        msb_list.append([set_vgpr_bank(ia_sp_flat[su * NUM_MSB + msb], msb)])
+                    prev_su_sp_tiles.append(msb_list)
+
+                ia_k_cur_base = iter_args[_OFF_PP]
+                ia_v_cur_base = iter_args[_OFF_PP + 1]
+                ia_k_next_base = iter_args[_OFF_PP + 2]
+                ia_v_next_base = iter_args[_OFF_PP + 3]
+
+                kv_lds_addrs_cur = _build_kv_lds_addrs(lane_id, ia_k_cur_base, ia_v_cur_base)
+                kv_lds_addrs_next = _build_kv_lds_addrs(lane_id, ia_k_next_base, ia_v_next_base)
+
+                ia_partial_sp_lo = [iter_args[_OFF_PSP + i]     for i in fx.range_constexpr(_PSP_SIZE)]
+                ia_partial_sp_hi = [iter_args[_OFF_PSP_HI + i]  for i in fx.range_constexpr(_PSP_SIZE)]
+                ia_exp_delta = [set_vgpr_bank(iter_args[_OFF_PED + i], i) for i in fx.range_constexpr(NUM_MSB)]
+
+                ia_partial_sp_pairs = []
+                for _m in fx.range_constexpr(NUM_MSB):
+                    msb_pairs = [_make_v2f32(ia_partial_sp_lo[_m * N_SP_PAIRS + _i],
+                                             ia_partial_sp_hi[_m * N_SP_PAIRS + _i], _m)
+                                 for _i in fx.range_constexpr(N_SP_PAIRS)]
+                    ia_partial_sp_pairs.append(msb_pairs)
+
+                sp_tiles = []
+                for msb in fx.range_constexpr(NUM_MSB):
+                    sp_tiles.append([set_vgpr_bank(zero_v8f32, msb)])
+
+                softmax_state = {
+                    'old_max': list(ia_old_max),
+                    'local_max': list(ia_local_max),
+                    'delta': list(ia_delta),
+                    'exp_delta': [None] * NUM_MSB,
+                    'cur_max_log2e': [None] * NUM_MSB,
+                    'cur_max_log2e_1': [None] * NUM_MSB,
+                    'cur_max_log2e_scalar': [None] * NUM_MSB,
+                    'cur_max_log2e_dup': [None] * NUM_MSB,
+                    'vgpr_log2e_scl_pair': [None] * NUM_MSB,
+                    'exp_delta_dup': [None] * NUM_MSB,
+                    'row_sums': list(ia_row_sums),
+                    'p_bf16': [[], [], [], []],
+                    'sp_pairs_prev': ia_partial_sp_pairs,
+                }
+
+                _zero_i32 = _to_raw(arith.constant(0, type=T.i32))
+
+                def _mk_zero_v4i32():
+                    return vector_dialect.broadcast(ty['v4i32'], _zero_i32)
+
+                def _mk_zero_v8i32():
+                    return vector_dialect.broadcast(ty['v8i32'], _zero_i32)
+
+                tdm_state = {
+                    'v_g0': _mk_zero_v4i32(),
+                    'v_g1': _mk_zero_v8i32(),
+                    'k_g0': _mk_zero_v4i32(),
+                    'k_g1': _mk_zero_v8i32(),
+                    'v_salu_queue': [],
+                    'k_salu_queue': [],
+                }
+
+                tile_idx_i32 = arith.index_cast(T.i32, tile_idx)
+
+                tile_n_stride_v = _mlir_arith.muli(tile_n_const, stride_v_seq)
+                cur_v_advance = _mlir_arith.muli(tile_idx_i32, tile_n_stride_v)
+                cur_v_offset = _mlir_arith.addi(_to_raw(v_offset), cur_v_advance)
+
+                next_tile = _mlir_arith.addi(
+                    tile_idx_i32, _to_raw(arith.constant(1, type=T.i32)))
+                tile_n_stride_k = _mlir_arith.muli(tile_n_const, stride_k_seq)
+                next_k_advance = _mlir_arith.muli(next_tile, tile_n_stride_k)
+                next_k_offset = _mlir_arith.addi(_to_raw(k_offset), next_k_advance)
+
+                _loop_v_remain = _mlir_arith.subi(
+                    actual_kv_len,
+                    _mlir_arith.muli(tile_idx_i32, tile_n_const))
+                _loop_v_oob_dg1 = [
+                    _make_kv_dg1_with_oob(
+                        _V_CFG_OOB, 128, 8, _stride_v_elems_oob,
+                        _per_warp_oob_dim1(
+                            _mlir_arith.subi(_loop_v_remain,
+                                _to_raw(arith.constant(_su * 32, type=T.i32))),
+                            wave_id, 8))
+                    for _su in range(CNT_SU)
+                ]
+                _loop_k_remain = _mlir_arith.subi(
+                    actual_kv_len,
+                    _mlir_arith.muli(next_tile, tile_n_const))
+                _loop_k_oob_dg1 = [
+                    _make_kv_dg1_with_oob(
+                        _K_CFG_OOB, QK_HDIM, 8, _stride_k_elems_oob,
+                        _per_warp_oob_dim1(
+                            _mlir_arith.subi(_loop_k_remain,
+                                _to_raw(arith.constant(_su * 32, type=T.i32))),
+                            wave_id, 8),
+                        dim0_stride=200)
+                    for _su in range(CNT_SU)
+                ]
+
+                # ---- Causal mask for this tile ----
+                _loop_tile_n_start = _mlir_arith.muli(tile_idx_i32, tile_n_const)
+                _loop_causal_ns = _mlir_arith.subi(_loop_tile_n_start, _causal_offset)
+
+                # ---- Core loop: with causal mask ----
+                sp_out, kv_out, o_tiles, su_sp_tiles_out, _partial_sp_lo_out, _partial_sp_hi_out, _partial_ed_out = _core_loop(
+                    ty, False,
+                    q_frags, kv_tiles, sp_tiles,
+                    o_tiles,
+                    kv_lds_addrs_cur, tdm_state, softmax_state, sgpr_state,
+                    gemm2=True,
+                    tdm_v_offset=cur_v_offset,
+                    tdm_v_target=ia_v_next_base,
+                    tdm_k_offset=next_k_offset,
+                    tdm_k_target=ia_k_next_base,
+                    kv_lds_addrs_next=kv_lds_addrs_next,
+                    gemm1_tdm_is_v=False,
+                    causal_n_start=_loop_causal_ns,
+                    loop_k_oob_dg1=_loop_k_oob_dg1,
+                    loop_v_oob_dg1=_loop_v_oob_dg1,
+                )
+
+                # ---- Yield updated state with ping-pong swap ----
+                new_o = []
+                for d in fx.range_constexpr(NUM_MSB):
+                    for n in fx.range_constexpr(N_PV_WMMA_N):
+                        new_o.append(o_tiles[d][n])
+
+                new_max = [softmax_state['old_max'][i]
+                           for i in fx.range_constexpr(NUM_MSB)]
+                new_sums = [softmax_state['row_sums'][i]
+                            for i in fx.range_constexpr(NUM_MSB)]
+
+
+                kv_out_flat = []
+                for msb in fx.range_constexpr(NUM_MSB):
+                    for k in fx.range_constexpr(N_WMMA_K_TILES):
+                        kv_out_flat.append(kv_out[msb][k])
+
+                new_local_max = [softmax_state['local_max'][i]
+                                 for i in fx.range_constexpr(NUM_MSB)]
+                new_delta = [softmax_state['delta'][i]
+                             for i in fx.range_constexpr(NUM_MSB)]
+
+                sp_out_flat = []
+                for su in fx.range_constexpr(CNT_SU):
+                    for msb in fx.range_constexpr(NUM_MSB):
+                        sp_out_flat.append(su_sp_tiles_out[su][msb][0])
+
+                pp_swapped = [ia_k_next_base, ia_v_next_base,
+                              ia_k_cur_base, ia_v_cur_base]
+
+                new_partial_sp_flat = _partial_sp_lo_out + _partial_sp_hi_out
+                new_exp_delta = [_partial_ed_out[_m]
+                                 for _m in fx.range_constexpr(NUM_MSB)]
+
                 yield (new_o + new_max + new_sums
                        + kv_out_flat + new_local_max + new_delta
                        + sp_out_flat + pp_swapped
