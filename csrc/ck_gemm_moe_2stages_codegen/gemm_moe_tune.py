@@ -74,6 +74,18 @@ TUNE_MOE_EXPERT_BALANCE = (
 COS_DIFF_THRESHOLD = 1e-1
 
 
+def _unpack_tag(tag):
+    """Defensively pull ``(stage, kname, blockM)`` out of a task tag.
+
+    Tags are normally ``(info, stage, kname, blockM)`` 4-tuples, but a failed
+    candidate can surface a bare ``info`` tuple instead. Diagnostics must never
+    crash the whole tuning run, so fall back to placeholders on any mismatch.
+    """
+    if isinstance(tag, (tuple, list)) and len(tag) == 4:
+        return tag[1], tag[2], tag[3]
+    return "?", str(tag), "?"
+
+
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
     """Map ``knl_name`` -> 0/1 when the manifest has a ``flat`` column.
 
@@ -158,6 +170,25 @@ class FmoeTuner(TunerCommon):
             action="store_true",
             required=False,
             help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
+        )
+        # Opt-in benchmark depth for the *tuning* sweep. Default (None) is a no-op:
+        # the per-candidate kwargs stay {} so run_perftest uses its own defaults
+        # (num_iters=101, num_warmup=2) exactly as before -- output identical.
+        # Lowering these trades fidelity for speed; the IQR outlier filter only
+        # engages above ~30 iters, so a floor of 40 is enforced to keep timings
+        # stable enough that the selected winner does not flip on near-ties.
+        self.parser.add_argument(
+            "--tune_iters",
+            type=int,
+            default=None,
+            help="Override run iters for the tuning sweep only (default: unchanged / 101). "
+            "Values below 40 are clamped to 40 to stay above the IQR-filter threshold.",
+        )
+        self.parser.add_argument(
+            "--tune_warmup",
+            type=int,
+            default=None,
+            help="Override warmup iters for the tuning sweep only (default: unchanged / 2).",
         )
 
     @staticmethod
@@ -2233,31 +2264,6 @@ class FmoeTuner(TunerCommon):
             True,  # bpreshuffle
         )
 
-        is_fp8_blockscale = (
-            q_type == QuantType.per_1x128
-            and q_dtype_a == dtypes.fp8
-            and q_dtype_w == dtypes.fp8
-        )
-        ck_stage1_splitk_kernels = {}
-        splitk_list = []
-        if is_fp8_blockscale:
-            tilek = 128
-            for _sk in range(2, 9):
-                if (model_dim % _sk == 0) and ((model_dim // _sk) % tilek == 0):
-                    splitk_list.append(_sk)
-            if splitk_list:
-                _, ck_stage1_splitk_kernels = get_gemm1_kernels_list(
-                    dtype2str_dict[q_dtype_a],
-                    dtype2str_dict[q_dtype_w],
-                    dtype2str_dict[dtype],
-                    False,
-                    int(q_type),
-                    str(act_type).split(".")[-1].lower(),
-                    doweight_stage1,
-                    True,  # bpreshuffle
-                    splitk=True,
-                )
-
         _, ck_stage2_kernels = get_gemm2_kernels_list(
             dtype2str_dict[q_dtype_a],
             dtype2str_dict[q_dtype_w],
@@ -3418,13 +3424,39 @@ class FmoeTuner(TunerCommon):
                 f"stage1 asm tasks is {len(tasks)}, tasks_ck is {len(tasks_ck)}, task_1stage is {len(task_1stage)}"
             )
         all_tasks = tasks + tasks_ck + task_1stage
-        # Record dispatched cases
+
+        # Opt-in benchmark depth: stamp a custom (num_iters, num_warmup) onto
+        # every candidate's kwargs slot (index 5). With neither flag set this is
+        # a no-op -- the slot stays {} and run_perftest uses its own 101/2
+        # defaults, byte-identical to before.
+        if args.tune_iters is not None or args.tune_warmup is not None:
+            _depth = {}
+            if args.tune_iters is not None:
+                _depth["num_iters"] = max(40, args.tune_iters)
+            if args.tune_warmup is not None:
+                _depth["num_warmup"] = max(0, args.tune_warmup)
+            all_tasks = [
+                tuple(t[:5])
+                + ({**(t[5] if len(t) > 5 and isinstance(t[5], dict) else {}), **_depth},)
+                + tuple(t[6:])
+                for t in all_tasks
+            ]
+
+        # Record dispatched cases. Candidates are kept as independent tasks and
+        # spread across all GPUs (shape_grouped=False): each candidate generates
+        # its own data on its GPU and is benchmarked in parallel. NOTE: an
+        # earlier attempt to dedup the per-candidate generate_data by grouping
+        # same-(shape,stage,blockM) candidates onto one process was a measured
+        # ~2.4x REGRESSION -- datagen is already cheaply parallelized here, and
+        # forcing a group to share it serializes its (dominant, uneven) kernel
+        # benchmarks onto a single GPU. Do not re-group without solving the load
+        # balance / data-locality trade-off.
         dispatched = {}
         for i, task in enumerate(all_tasks):
             tag = task[0]  # (info, stage, kname, blockM)
             dispatched[i] = tag
             if args.verbose:
-                _, stage, kname, blockM = tag
+                stage, kname, blockM = _unpack_tag(tag)
                 print(f"  [dispatch] task {i}: {stage} {kname} blockM={blockM}")
 
         in_data.append((len(all_tasks), ()))
@@ -3452,7 +3484,7 @@ class FmoeTuner(TunerCommon):
             if failed_cases:
                 print(f"\n[tune] {len(failed_cases)} of {len(rets)} tasks failed:")
                 for i, tag, us, err in failed_cases:
-                    _, stage, kname, blockM = tag
+                    stage, kname, blockM = _unpack_tag(tag)
                     reason = "timeout/hang" if us == float("inf") else "crash/error"
                     print(f"  task {i}: {stage} {kname} blockM={blockM} -> {reason}")
             else:

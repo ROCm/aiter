@@ -9,6 +9,15 @@ from aiter import dtypes
 from aiter import logger
 
 
+# Worker-registration rendezvous bounds. The barrier wait must comfortably
+# exceed worst-case cold worker startup (process spawn + torch/aiter re-import)
+# so it only ever trips on a genuinely dead worker, never a slow-but-healthy
+# one. Without these bounds, one worker dying before it reaches the barrier
+# strands every survivor -- and the parent .get() -- forever.
+REGISTRATION_BARRIER_TIMEOUT = 120  # seconds, bounds get_pid's barrier.wait
+REGISTRATION_GET_TIMEOUT = 180  # seconds, bounds the parent's .get of a pid
+
+
 def _is_mapping_error(exc: BaseException) -> bool:
     return isinstance(exc, KeyError)
 
@@ -295,8 +304,24 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             return [(tasks[0] if tasks else "unknown", float("inf"), 1.0)]
 
 
-def get_pid():
-    time.sleep(3)
+def get_pid(barrier=None):
+    # Rendezvous so that each of the mp_num registration tasks lands on a
+    # distinct worker: every worker that picks up a get_pid task blocks at the
+    # barrier until all mp_num parties have arrived, then returns its own PID
+    # immediately. This replaces a blind time.sleep(3) that only *probabilistically*
+    # kept every worker busy long enough to avoid one worker draining two tasks.
+    # The resulting {pid: gpu_id} map is identical; only the wait is removed.
+    #
+    # The wait is BOUNDED: if a peer worker dies before reaching the barrier
+    # (segfault while re-importing torch, OOM-kill, SIGKILL), an unbounded
+    # wait() would strand every surviving worker -- and then the parent's
+    # .get() -- forever. On timeout or a broken barrier we just return our own
+    # pid, degrading to "register whoever showed up" instead of hanging.
+    if barrier is not None:
+        try:
+            barrier.wait(timeout=REGISTRATION_BARRIER_TIMEOUT)
+        except Exception:
+            pass
     return mp.current_process().pid
 
 
@@ -390,10 +415,38 @@ def mp_tuner(
             for k in task_indices
         }
 
+    def register_gpu_map(pids):
+        """Collect worker pids into {pid: gpu_id}, bounding each .get so a dead
+        registration worker can never hang the parent. A worker that fails to
+        register just leaves a gap; its tasks later surface as mapping errors
+        and get retried via the pool-restart path -- strictly better than a
+        permanent hang."""
+        gmap = {}
+        for i, el in enumerate(pids):
+            try:
+                pid = el.get(timeout=REGISTRATION_GET_TIMEOUT)
+            except Exception as e:
+                print(
+                    f"[registration] worker {i + start_idx} did not register "
+                    f"({type(e).__name__}: {e}); continuing without it"
+                )
+                continue
+            gmap[pid] = i + start_idx
+        return gmap
+
+    # Barrier-based worker registration: exactly mp_num get_pid tasks each
+    # rendezvous so they land on mp_num distinct workers (one PID per worker),
+    # then return at once. Reused (auto-reset) for the restart block below.
+    registration_manager = mp.Manager()
+    registration_barrier = registration_manager.Barrier(mp_num)
+
     # Create initial pool and submit all tasks
     pool = mp.Pool(processes=parallel_num)
-    pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
-    gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
+    pids = [
+        pool.apply_async(get_pid, args=(registration_barrier,))
+        for i in range(start_idx, mp_num)
+    ]
+    gpu_map = register_gpu_map(pids)
     rets_dict = submit_tasks(pool, gpu_map, range(len(task_group)))
     # Convert to list for compatibility with existing code
     rets = [rets_dict[k] for k in range(len(task_group))]
@@ -405,7 +458,7 @@ def mp_tuner(
 
     # Track start time for each task
     task_start_times = {k: time.time() for k, _ in remaining_tasks}
-    check_interval = 10  # Check every 10 seconds for responsive polling
+    check_interval = 1  # Check every 1 second for responsive polling
 
     timeout_msg = (
         f"timeout={timeout}s each" if timeout is not None else "no timeout limit"
@@ -564,9 +617,14 @@ def mp_tuner(
             # Create new pool
             pool = mp.Pool(processes=parallel_num)
 
-            # Recreate gpu_map for new processes (new PIDs)
-            pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
-            gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
+            # Recreate gpu_map for new processes (new PIDs).
+            # Reuse the same barrier (it auto-resets after mp_num waits) so the
+            # restarted workers register exactly as the initial ones did.
+            pids = [
+                pool.apply_async(get_pid, args=(registration_barrier,))
+                for i in range(start_idx, mp_num)
+            ]
+            gpu_map = register_gpu_map(pids)
 
             # Resubmit remaining tasks
             remaining_task_indices = [k for k, _ in remaining_tasks]
@@ -588,7 +646,7 @@ def mp_tuner(
 
         # Small sleep to avoid busy waiting
         if remaining_tasks:
-            time.sleep(1)
+            time.sleep(0.2)
 
     # Reconstruct results in original task order
     result = []
@@ -610,6 +668,12 @@ def mp_tuner(
         pool.join()
     except Exception as e:
         print(f"Warning: Error during pool cleanup: {e}")
+
+    # Tear down the registration barrier's manager process.
+    try:
+        registration_manager.shutdown()
+    except Exception as e:
+        print(f"Warning: Error during registration manager cleanup: {e}")
 
     # Print summary
     if failed_tasks:
