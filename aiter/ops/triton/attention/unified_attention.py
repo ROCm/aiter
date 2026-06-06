@@ -684,7 +684,7 @@ def _gfx1250_unified_attention_2d(
         loop_variant:
             0=plain double buffered version,
             1=2-stage version,
-            2=4 stage version
+            2=4-stage version
     """
     # useful for debugging when needed
     remove_indirect_access = False
@@ -715,22 +715,30 @@ def _gfx1250_unified_attention_2d(
         num_kv_blocks & (num_kv_blocks - 1) == 0
     ), "num_kv_blocks must be a power of 2"
 
-    # NOTE: SLIDING_WINDOW must be computed before the loop-variant gating below,
-    # which branches on it.
     SLIDING_WINDOW = 1 + window_size[0]
+    ALL_DECODE = max_seqlen_q == 1
+
     num_warps = 4
     block_m = 128
     waves_per_eu = 1
     if SLIDING_WINDOW > 0:
         loop_variant = 0
-        num_buffers = 2
     elif not loop_variant:
-        loop_variant = 3
-        num_buffers = 2
+        if shuffled_kv_cache or TILE_SIZE > 32:
+            loop_variant = 2
+        else:
+            loop_variant = 1 
+    if ALL_DECODE:
+        loop_variant = 0
+        TILE_SIZE = 128
+        block_m = 16
+        num_warps = 1
+        waves_per_eu = 2
+
+
 
     num_buffers = 2 if loop_variant == 0 else 3
     BLOCK_M = block_m
-    ALL_DECODE = max_seqlen_q == 1
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
     total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
