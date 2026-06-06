@@ -19,7 +19,7 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from fmha_core_loop_gfx1250 import (
     QK_HDIM, _rocdl_permlanex16, _rocdl_exp2,
-    set_vgpr_bank, set_vgpr_bank_offset,
+    set_vgpr_bank,
 )
 
 # ============================================================================
@@ -38,7 +38,9 @@ K_SU_SIZE = 64
 NUM_K_SU = 2         # TDM loads 2 SUs (= compute)
 NUM_K_SU_COMPUTE = 2
 
-K_ROW_BYTES = 400   # TDM dim0=200 → LDS inner stride = 200*2 = 400B (2-way bank conflicts)
+# TDM dim0=200 -> LDS inner stride = 200*2 = 400B
+# (2-way bank conflicts)
+K_ROW_BYTES = 400
 V_ROW_BYTES = 288
 K_SU_HALF_OFFSET = 0x1900   # 16 * K_ROW_BYTES = 16 * 400 = 6400
 V_SU_HALF_OFFSET = 0x1200
@@ -161,8 +163,12 @@ def make_wmma_frag_bf16(vec4_lo, vec4_hi):
 # ============================================================================
 
 
-def _phase4_q_load_flydsl(lane_id, q_rsrc, stride_q_seq, wave_id, q_tile_offset_bytes=None):
-    """Load Q tile (QK_HDIM × TG_Q_ROWS bf16) → q_frags[4][Q_FRAGS_PER_BANK] with bank hints.
+def _phase4_q_load_flydsl(
+    lane_id, q_rsrc, stride_q_seq, wave_id,
+    q_tile_offset_bytes=None,
+):
+    """Load Q tile (QK_HDIM x TG_Q_ROWS bf16) ->
+    q_frags[4][Q_FRAGS_PER_BANK] with bank hints.
 
     For QK_HDIM=192: 6 loads per bank (3 frags × 2 loads each), bank1 offset=192 bytes.
     For QK_HDIM=128: 4 loads per bank (2 frags × 2 loads each), bank1 offset=128 bytes.
@@ -183,22 +189,33 @@ def _phase4_q_load_flydsl(lane_id, q_rsrc, stride_q_seq, wave_id, q_tile_offset_
     soff_zero = arith.unwrap(arith.constant(0, type=T.i32))
     aux_zero = arith.unwrap(arith.constant(0, type=T.i32))
 
-    q_base_bytes = _mul_nuw(arith.unwrap(q_elem_off), arith.unwrap(arith.constant(4, type=T.i32)))
+    four_i32 = arith.unwrap(arith.constant(4, type=T.i32))
+    q_base_bytes = _mul_nuw(
+        arith.unwrap(q_elem_off), four_i32
+    )
     if q_tile_offset_bytes is not None:
         q_base_bytes = _add_nuw(q_tile_offset_bytes, q_base_bytes)
-    stride_16_bytes = arith.unwrap(arith.muli(stride_q_seq, arith.constant(16, type=T.i32)))
+    stride_16_bytes = arith.unwrap(
+        arith.muli(stride_q_seq, arith.constant(16, type=T.i32))
+    )
 
     # K-half byte offset = QK_HDIM bytes (splits K cols in half per bank pair)
     _K_HALF_BYTES = QK_HDIM               # 192 for 192-dim, 128 for 128-dim
     # Each bank covers half of QK_HDIM: QK_HDIM/2 elements / WMMA_K(32) = frags_per_bank
-    _FRAGS_PER_BANK = (QK_HDIM // 2) // 32  # = 3 for 192-dim (96 K cols / 32 = 3), 2 for 128-dim
+    # = 3 for 192-dim (96 K cols / 32 = 3), 2 for 128-dim
+    _FRAGS_PER_BANK = (QK_HDIM // 2) // 32
     _LOADS_PER_BANK = _FRAGS_PER_BANK * 2   # 2 raw loads per v16bf16 frag
 
     bank_offsets_bytes = [
         arith.unwrap(arith.constant(0, type=T.i32)),
         arith.unwrap(arith.constant(_K_HALF_BYTES, type=T.i32)),
         stride_16_bytes,
-        _add_nuw(stride_16_bytes, arith.unwrap(arith.constant(_K_HALF_BYTES, type=T.i32))),
+        _add_nuw(
+            stride_16_bytes,
+            arith.unwrap(
+                arith.constant(_K_HALF_BYTES, type=T.i32)
+            ),
+        ),
     ]
 
     q_frags = []
@@ -212,7 +229,12 @@ def _phase4_q_load_flydsl(lane_id, q_rsrc, stride_q_seq, wave_id, q_tile_offset_
             if i == 0:
                 voff = bank_voff
             else:
-                voff = _add_nuw(bank_voff, arith.unwrap(arith.constant(i * 32, type=T.i32)))
+                voff = _add_nuw(
+                    bank_voff,
+                    arith.unwrap(
+                        arith.constant(i * 32, type=T.i32)
+                    ),
+                )
             loaded = rocdl.raw_ptr_buffer_load(
                 vec4i32_ty, q_rsrc, voff, soff_zero, aux_zero)
             bank_loads.append(set_vgpr_bank(loaded, bank))
@@ -315,7 +337,12 @@ def _phase9d_k_lds_load_flydsl(k_addrs, lds_offset=0):
         half_off = half_idx * K_D_HALF_OFFSET + lds_offset
         for bank in fx.range_constexpr(4):
             for i in fx.range_constexpr(NUM_K_LOADS_PER_HALF):
-                byte_off = arith.unwrap(arith.constant(half_off + i * K_LOAD_STRIDE, type=T.i32))
+                byte_off = arith.unwrap(
+                    arith.constant(
+                        half_off + i * K_LOAD_STRIDE,
+                        type=T.i32,
+                    )
+                )
                 loaded = lds_load_b128(k_addrs[bank], byte_off)
                 all_bank_loads[half_idx][bank].append(set_vgpr_bank(loaded, bank))
 
@@ -448,7 +475,12 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
     # ---- Per-bank: fma(elem, scale, -ms) → exp2 → row_sum ----
     row_sum = {}
     for bank in fx.range_constexpr(4):
-        neg_ms = set_vgpr_bank(arith.negf(arith.mulf(global_max, softmax_scale_raw)), bank)
+        neg_ms = set_vgpr_bank(
+            arith.negf(
+                arith.mulf(global_max, softmax_scale_raw)
+            ),
+            bank,
+        )
         scale_b = set_vgpr_bank(softmax_scale_raw, bank)
         running_sum = set_vgpr_bank(zero_raw, bank)
         for key in tiles_by_bank[bank]:
@@ -508,7 +540,6 @@ def _build_tdm_dgroup1(config_val, stride_i32):
 
 def _split_i64_to_lo_hi(val_i64):
     i32 = ir.IntegerType.get_signless(32)
-    i64 = ir.IntegerType.get_signless(64)
     lo = arith.trunci(i32, val_i64)
     hi_shifted = arith.shrui(
         val_i64,
@@ -565,7 +596,10 @@ def _k_tdm_setup(arg_K, k_offset, stride_k_seq, stride_k_32, wave_id):
     return k_dgroup1, k_addr_i64, stride_adv_i64
 
 
-def _k_tdm_issue_pair(k_dgroup1, addr_i64, stride_adv_i64, lds_off_0, lds_off_1, wait_count=1):
+def _k_tdm_issue_pair(
+    k_dgroup1, addr_i64, stride_adv_i64,
+    lds_off_0, lds_off_1, wait_count=1,
+):
     """Issue 2 K TDM loads. Returns addr after the 2nd load (for next pair)."""
     pred = arith.constant(1, type=T.i32)
     cur_addr = addr_i64
@@ -585,7 +619,10 @@ def _k_tdm_issue_pair(k_dgroup1, addr_i64, stride_adv_i64, lds_off_0, lds_off_1,
     return arith.addi(cur_addr, stride_adv_i64)
 
 
-def _phase_first_v_tdm_flydsl(arg_V, v_offset, v_lds_base, stride_v_seq, stride_v_32, wave_id):
+def _phase_first_v_tdm_flydsl(
+    arg_V, v_offset, v_lds_base,
+    stride_v_seq, stride_v_32, wave_id,
+):
     """Issue 2 V TDM copies (Global → LDS) for V block 0."""
     i64 = ir.IntegerType.get_signless(64)
     v_dgroup1 = _build_tdm_dgroup1(_V_TDM_CONFIG, stride_v_seq)
@@ -633,7 +670,10 @@ def _phase8_zero_o_accum_flydsl():
     return o_accs
 
 
-def _phase_v_tdm_blk1_flydsl(arg_V, v_offset, v_lds_base, stride_v_seq, stride_v_32, wave_id):
+def _phase_v_tdm_blk1_flydsl(
+    arg_V, v_offset, v_lds_base,
+    stride_v_seq, stride_v_32, wave_id,
+):
     """V TDM block 1 (2 copies)."""
     i64 = ir.IntegerType.get_signless(64)
     v_dgroup1 = _build_tdm_dgroup1(_V_TDM_CONFIG, stride_v_seq)

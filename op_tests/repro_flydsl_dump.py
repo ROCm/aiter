@@ -6,7 +6,6 @@ Usage:
 
 import os
 import sys
-import math
 import torch
 
 _AITER_ROOT = '/app/aiter'
@@ -57,7 +56,9 @@ def run_repro(dump_dir):
     print()
 
     # Run flydsl
-    from aiter.ops.flydsl.kernels.mha_1250.fmha_kernel_gfx1250 import flash_attn_varlen_d192_gfx1250
+    from aiter.ops.flydsl.kernels.mha_1250.fmha_kernel_gfx1250 import (
+        flash_attn_varlen_d192_gfx1250,
+    )
     out_fly = torch.empty(S, H, Dv, dtype=torch.bfloat16, device='cuda')
     flash_attn_varlen_d192_gfx1250(q, k, v, cu_q, cu_k, max_sq, max_sk,
                              softmax_scale=scale, causal=causal, out=out_fly)
@@ -113,7 +114,13 @@ def run_repro(dump_dir):
     print('=== flydsl vs triton (reproduced) ===')
     ft_diff = (out_fly_f - out_tri_f).abs()
     bad_ft = (~torch.isclose(out_fly_f, out_tri_f, rtol=1e-2, atol=1e-2)).sum().item()
-    print(f'max={ft_diff.max():.6f}  mean={ft_diff.mean():.6f}  bad={bad_ft}/{out_fly_f.numel()} ({bad_ft/out_fly_f.numel()*100:.1f}%)')
+    n = out_fly_f.numel()
+    pct = bad_ft / n * 100
+    print(
+        f'max={ft_diff.max():.6f}  '
+        f'mean={ft_diff.mean():.6f}  '
+        f'bad={bad_ft}/{n} ({pct:.1f}%)'
+    )
 
     # Compare with original dump
     if 'out_flydsl' in t and 'out_triton' in t:
@@ -121,12 +128,31 @@ def run_repro(dump_dir):
         orig_tri = t['out_triton'].float()
         print()
         print('=== vs original dump ===')
-        print(f'flydsl repro vs dump_flydsl: max_diff={( out_fly_f - orig_fly).abs().max():.6f}')
-        print(f'triton repro vs dump_triton: max_diff={( out_tri_f - orig_tri).abs().max():.6f}')
-        print(f'flydsl repro vs dump_triton: max_diff={( out_fly_f - orig_tri).abs().max():.6f}')
+        d1 = (out_fly_f - orig_fly).abs().max()
+        d2 = (out_tri_f - orig_tri).abs().max()
+        d3 = (out_fly_f - orig_tri).abs().max()
+        print(
+            f'flydsl repro vs dump_flydsl: '
+            f'max_diff={d1:.6f}'
+        )
+        print(
+            f'triton repro vs dump_triton: '
+            f'max_diff={d2:.6f}'
+        )
+        print(
+            f'flydsl repro vs dump_triton: '
+            f'max_diff={d3:.6f}'
+        )
 
-        bad_orig = (~torch.isclose(orig_fly, orig_tri, rtol=1e-2, atol=1e-2)).sum().item()
-        print(f'dump_flydsl vs dump_triton:  bad={bad_orig}/{orig_fly.numel()} ({bad_orig/orig_fly.numel()*100:.1f}%)')
+        bad_orig = (~torch.isclose(
+            orig_fly, orig_tri, rtol=1e-2, atol=1e-2
+        )).sum().item()
+        n_orig = orig_fly.numel()
+        pct_orig = bad_orig / n_orig * 100
+        print(
+            f'dump_flydsl vs dump_triton:  '
+            f'bad={bad_orig}/{n_orig} ({pct_orig:.1f}%)'
+        )
 
 
 if __name__ == '__main__':

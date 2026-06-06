@@ -25,4 +25,8 @@ def compare_with_triton(
     else:
         diff = (flydsl_out.float() - o_cmp.float()).abs()
         num_bad = (~close).sum().item()
-        print(f"[flydsl vs triton] MISMATCH  max_err={diff.max():.6f}  bad={num_bad}/{flydsl_out.numel()}")
+        print(
+            f"[flydsl vs triton] MISMATCH  "
+            f"max_err={diff.max():.6f}  "
+            f"bad={num_bad}/{flydsl_out.numel()}"
+        )

@@ -18,7 +18,9 @@ os.environ["ENABLE_CK"] = "0"
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from aiter.ops.flydsl.kernels.mha_1250.fmha_kernel_gfx1250 import flash_attn_varlen_d192_gfx1250
+from aiter.ops.flydsl.kernels.mha_1250.fmha_kernel_gfx1250 import (
+    flash_attn_varlen_d192_gfx1250,
+)
 from aiter.ops.triton.attention.mha import (
     flash_attn_varlen_func as flash_attn_varlen_func_triton,
 )
@@ -131,7 +133,6 @@ def main():
         seed = rng.randint(0, 2**31 - 1)
 
         # Focused on log pattern: sq==sk, single batch, H=128, causal
-        B = 1
         causal = True
         H = 128
         sq = rng.randint(400, 900)
@@ -168,8 +169,12 @@ def main():
         for f in failures:
             mode = f.get('data_mode', '?')
             if 'error' in f:
-                print(f"  seed={f['seed']}  sq={f['seqs_q']} sk={f['seqs_k']} "
-                      f"H={f['H']} causal={f['causal']} mode={mode}  ERROR: {f['error']}")
+                print(
+                    f"  seed={f['seed']}  "
+                    f"sq={f['seqs_q']} sk={f['seqs_k']} "
+                    f"H={f['H']} causal={f['causal']} "
+                    f"mode={mode}  ERROR: {f['error']}"
+                )
             else:
                 print(f"  seed={f['seed']}  sq={f['seqs_q']} sk={f['seqs_k']} "
                       f"H={f['H']} causal={f['causal']} mode={mode}  "

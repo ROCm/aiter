@@ -11,33 +11,44 @@ Usage:
 import os
 import sys
 import math
-import torch
 
-import aiter
-
-if aiter.get_gfx() != "gfx1250":
-    print(f"Skipping: test requires gfx1250 (current: {aiter.get_gfx()})")
-    sys.exit(0)
-
-_KERNEL_DIR = os.path.join(
-    os.path.dirname(__file__), "..", "aiter", "ops", "flydsl", "kernels", "mha_1250")
-_KERNEL_DIR = os.path.abspath(_KERNEL_DIR)
-
-_REPO = os.path.join(_KERNEL_DIR, "FlyDSL")
-_BUILD_PKGS = os.path.join(_REPO, "build-fly", "python_packages")
-os.environ.setdefault("FLYDSL_ROOT", _REPO)
-
-_AITER_ROOT = os.path.join(os.path.dirname(__file__), "..")
-_AITER_ROOT = os.path.abspath(_AITER_ROOT)
-for p in [_BUILD_PKGS, os.path.join(_REPO, "python"), _AITER_ROOT]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
+# Environment setup must precede aiter imports
 os.environ["ARCH"] = "gfx1250"
 os.environ["FLYDSL_RUNTIME_ENABLE_CACHE"] = "0"
 os.environ["ENABLE_CK"] = "0"
+os.environ.setdefault(
+    "FLYDSL_ROOT",
+    os.path.join(
+        os.path.abspath(os.path.join(
+            os.path.dirname(__file__), "..",
+            "aiter", "ops", "flydsl", "kernels",
+            "mha_1250",
+        )),
+        "FlyDSL",
+    ),
+)
+sys.path.insert(0, os.path.abspath(
+    os.path.join(os.path.dirname(__file__), ".."),
+))
+sys.path.insert(0, os.path.join(
+    os.environ["FLYDSL_ROOT"], "python",
+))
+sys.path.insert(0, os.path.join(
+    os.environ["FLYDSL_ROOT"],
+    "build-fly", "python_packages",
+))
 
+import torch
+
+import aiter
 from aiter.ops.mha import flash_attn_varlen_func
+
+if aiter.get_gfx() != "gfx1250":
+    print(
+        "Skipping: test requires gfx1250 "
+        f"(current: {aiter.get_gfx()})"
+    )
+    sys.exit(0)
 
 HEAD_DIM_QK = 192
 HEAD_DIM_V = 128
@@ -46,7 +57,6 @@ HEAD_DIM_V = 128
 def _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False):
     """PyTorch reference for varlen THD layout, per-batch."""
     B = len(cu_q) - 1
-    H = q.shape[1]
     outs = []
     lses = []
     for b in range(B):
@@ -57,7 +67,14 @@ def _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False):
         vb = v[cu_k[b]:cu_k[b+1]].float()
         qk = torch.bmm(qb.permute(1,0,2), kb.permute(1,2,0)) * scale
         if causal:
-            mask = torch.triu(torch.ones(sq, sk, device=qk.device, dtype=torch.bool), diagonal=sk - sq + 1)
+            mask = torch.triu(
+                torch.ones(
+                    sq, sk,
+                    device=qk.device,
+                    dtype=torch.bool,
+                ),
+                diagonal=sk - sq + 1,
+            )
             qk = qk.masked_fill(mask.unsqueeze(0), float('-inf'))
         if return_lse:
             lse_b = torch.logsumexp(qk, dim=-1)
@@ -122,7 +139,10 @@ def run_varlen_test(cu_q_list, cu_k_list, H=1, causal=False, return_lse=False):
     seqs = [cu_q[i+1] - cu_q[i] for i in range(B)]
     tag = f"B={B} H={H} seqs={seqs} causal={causal} lse={return_lse}"
 
-    ref_result = _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=causal, return_lse=return_lse)
+    ref_result = _ref_mha_varlen(
+        q, k, v, cu_q, cu_k, scale,
+        causal=causal, return_lse=return_lse,
+    )
     if return_lse:
         ref, ref_lses = ref_result
     else:
@@ -214,7 +234,8 @@ if __name__ == "__main__":
                 n_pass += 1
         except Exception as e:
             print(f"  [seqs={seqs} causal={causal} lse={return_lse}] ERROR: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
 
     print(f"\n{'='*60}")
     print(f"{n_pass}/{len(tests)} passed")

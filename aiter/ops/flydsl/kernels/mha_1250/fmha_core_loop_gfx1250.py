@@ -21,15 +21,17 @@ from fmha_schedule_gfx1250 import (
     g1_row_idx, g2_row_idx,
     PART2_EXP_START,   # ops index where pair_exp starts (=23)
 )
-_P2_BASE  = 5   # run_id offset for PART2 pkfma (rid 5..8 → MSB 0..3)
-_EXP_BASE = 19  # token base for EXP_Mx (19..22 → MSB 0..3, draws from pair_exp)
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl.expr import arith, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.expr.primitive import const_expr, range_constexpr
+
+# run_id offset for PART2 pkfma (rid 5..8 → MSB 0..3)
+_P2_BASE = 5
+# token base for EXP_Mx (19..22 → MSB 0..3, draws from pair_exp)
+_EXP_BASE = 19
 
 # ============================================================================
 # Local rocdl primitive wrappers (until merged into upstream FlyDSL)
@@ -127,7 +129,8 @@ EXP_PER_MSB_TO_G2 = 8          # pair_exp ops per MSB moved to GEMM2 (pairs 0..3
 # GEMM2 first half — it MUST be computed in GEMM2 because partial_ed_out carries
 # it as an iter_arg for the next tile's O-rescale. Cannot be deferred to GEMM1.
 # So GEMM2 has 4 exp_delta + 32 pair_exp = 36 exp total (4 is necessary overhead).
-PART2_SETUP_A = 8               # total setup ops (save_old_max..broadcast_dup..rescale_sum)
+# total setup ops (save_old_max..broadcast_dup..rescale_sum)
+PART2_SETUP_A = 8
 PART2_SPLIT = 24 + EXP_PER_MSB_TO_G2   # = 32: setup(8)+pkfma(16)+pair_exp(8)
 PART2_G2_SPLIT = PART2_SPLIT           # GEMM2 truncation limit (mirrors PART2_SPLIT)
 GEMM1_EXP_OPS = VPS_MSB_SP - EXP_PER_MSB_TO_G2  # = 24: pair_exp remaining in GEMM1
@@ -190,9 +193,11 @@ def _asm_result(result_type, asm_str, operands=None, constraints="", **kwargs):
 
 
 def _sched_barrier(mask=0):
-    """Emit llvm.amdgcn.sched.barrier — prevents instruction reordering across this point.
+    """Emit llvm.amdgcn.sched.barrier.
 
-    mask=0: barrier for ALL instruction types (VMEM, VALU, LDS, SALU, etc.).
+    Prevents instruction reordering across this point.
+    mask=0: barrier for ALL instruction types
+    (VMEM, VALU, LDS, SALU, etc.).
     """
     mask_val = arith.unwrap(arith.constant(mask, type=T.i32))
     llvm_dialect.call_intrinsic(
@@ -643,10 +648,13 @@ def _atom_wgp_barrier():
 def _build_qk_wmma_schedule(blk, su):
     """Build ordered list of GEMM_INST_COUNT WMMA parameter tuples for QK GEMM.
 
-    SU_K_N=32: 2 N-tiles distributed across 4 MSBs via D-dimension.
-    For QK_HDIM=192: loop order: msb_idx(2) × k(6) × sp_msb(2) × n(1) × m(1) = 24.
-    KV MSB remapping: k_msb = (k//K_FRAGS_PER_MSB)*2 + sp_msb%2, k_frag = k%K_FRAGS_PER_MSB.
-    K_FRAGS_PER_MSB = (QK_HDIM // WMMA_K) // 2 = 3 for 192-dim.
+    SU_K_N=32: 2 N-tiles distributed across 4 MSBs via D-dim.
+    For QK_HDIM=192: loop order:
+      msb_idx(2) x k(6) x sp_msb(2) x n(1) x m(1) = 24.
+    KV MSB remapping:
+      k_msb = (k//K_FRAGS_PER_MSB)*2 + sp_msb%2,
+      k_frag = k%K_FRAGS_PER_MSB.
+    K_FRAGS_PER_MSB = (QK_HDIM // WMMA_K) // 2 = 3 for 192.
     """
     sp_pingpong = blk % 2
     k_pingpong = su % 2
@@ -833,8 +841,10 @@ def _build_softmax_part2_ops(ty, msb, blk, sp_pairs, ss, sgpr,
     # tile's O-rescale. 4 exp_delta total (1/MSB) are unavoidable pipeline overhead.
 
     # 0. old_max[msb] = local_max[msb]
-    # Pre-materialize s_log2e_scl into a per-bank VGPR v2f32 early (GEMM1 start) so
-    # pk_fma doesn't need a lazy SGPR→VGPR copy (which would cause s_delay_alu or v_nop).
+    # Pre-materialize s_log2e_scl into a per-bank VGPR v2f32
+    # early (GEMM1 start) so pk_fma doesn't need a lazy
+    # SGPR->VGPR copy (which would cause s_delay_alu or
+    # v_nop).
     #
     # IMPORTANT: use plain MLIR insertelement — NOT inline ASM — so that the
     # set_vgpr_bank_offset hint can freely direct the register allocator to the target
@@ -945,8 +955,14 @@ def _build_softmax_part2_ops(ty, msb, blk, sp_pairs, ss, sgpr,
                 exp_lo = _rocdl_exp2(ir.F32Type.get(), lo)
                 _sched_barrier(0)
                 undef = llvm_dialect.mlir_undef(v2f32_ty)
-                v = llvm_dialect.insertelement(undef, exp_lo, arith.unwrap(arith.constant(0, type=T.i32)))
-                v = llvm_dialect.insertelement(v, hi, arith.unwrap(arith.constant(1, type=T.i32)))
+                _idx0 = arith.unwrap(
+                    arith.constant(0, type=T.i32))
+                _idx1 = arith.unwrap(
+                    arith.constant(1, type=T.i32))
+                v = llvm_dialect.insertelement(
+                    undef, exp_lo, _idx0)
+                v = llvm_dialect.insertelement(
+                    v, hi, _idx1)
                 sp_pairs[pidx] = v
                 if const_expr(_clo is not None):
                     _clo[pidx] = exp_lo  # standalone f32 scalar for yield
@@ -959,8 +975,14 @@ def _build_softmax_part2_ops(ty, msb, blk, sp_pairs, ss, sgpr,
                 exp_hi = _rocdl_exp2(ir.F32Type.get(), hi)
                 _sched_barrier(0)
                 undef = llvm_dialect.mlir_undef(v2f32_ty)
-                v = llvm_dialect.insertelement(undef, lo, arith.unwrap(arith.constant(0, type=T.i32)))
-                v = llvm_dialect.insertelement(v, exp_hi, arith.unwrap(arith.constant(1, type=T.i32)))
+                _idx0 = arith.unwrap(
+                    arith.constant(0, type=T.i32))
+                _idx1 = arith.unwrap(
+                    arith.constant(1, type=T.i32))
+                v = llvm_dialect.insertelement(
+                    undef, lo, _idx0)
+                v = llvm_dialect.insertelement(
+                    v, exp_hi, _idx1)
                 sp_pairs[pidx] = v
                 if const_expr(_chi is not None):
                     _chi[pidx] = exp_hi  # standalone f32 scalar for yield
@@ -998,7 +1020,9 @@ def _build_softmax_part2_ops(ty, msb, blk, sp_pairs, ss, sgpr,
 
     for j in range_constexpr(2):
         def op_sum_l1(j_val=j, b=bank):
-            sum_l1[j_val] = _atom_pk_add_f32(sum_l0[j_val * 2], sum_l0[j_val * 2 + 1], b)
+            sum_l1[j_val] = _atom_pk_add_f32(
+                sum_l0[j_val * 2],
+                sum_l0[j_val * 2 + 1], b)
         ops.append(op_sum_l1)
 
     def op_sum_l2(b=bank):
@@ -1038,7 +1062,9 @@ def _build_all_softmax_part2_ops(ty, blk, sp_pairs_all,
 # Softmax PART0 + PART1 Builder (runs during GEMM2 stages)
 # ============================================================================
 
-PART0_INSTS = 22   # per MSB: tree-max (16) + merge2 (1) + perm-prep (1) + perm-exec (1) + mul (1) + cur-max (1) + merge1 (1)
+# per MSB: tree-max(16) + merge2(1) + perm-prep(1)
+#   + perm-exec(1) + mul(1) + cur-max(1) + merge1(1)
+PART0_INSTS = 22
 PART1_INSTS = 8    # cross-MSB merge + delta (total, not per MSB)
 RLTS_LEN = 9       # run-ids: 0-3 PART0, 4 PART1, 5-8 PART2
 
@@ -1269,10 +1295,13 @@ def _build_all_softmax_gemm2_ops(ty, blk, sp_pairs_all,
     # Each stage has 16 WMMAs × 4 slots = 64 (−4 for dswait) ≈ 60 usable slots.
     # PART0: 10/MSB in stage 0 (40 total), 11/MSB in stage 1 (44 total) → fits in 60.
     # PART1: budget opened in stage 1 (dispatches once all PART0 rids exhaust, filling
-    #   the last 2-4 WMMAs of stage 1 that were previously naked); stage 2 catches overflow.
-    # PART2: stages 2-3. In stage 2, lds_done=False also dispatches PART2 per-MSB
-    #   (rids 5..8) in parallel with V LDS loads (see stage>=2 check in _dispatch_softmax_gemm2),
-    #   spreading PART2 across 8 lds phases instead of crowding lds_done=True.
+    #   the last 2-4 WMMAs of stage 1 that were previously
+    #   naked); stage 2 catches overflow.
+    # PART2: stages 2-3. In stage 2, lds_done=False also
+    #   dispatches PART2 per-MSB (rids 5..8) in parallel
+    #   with V LDS loads (see stage>=2 check in
+    #   _dispatch_softmax_gemm2), spreading PART2 across
+    #   8 lds phases instead of crowding lds_done=True.
     rid_budget = [[0]*RLTS_LEN for _ in range_constexpr(4)]
 
     # Stage 0: PART0 first chunk (10/MSB = 40 total).
@@ -1311,7 +1340,8 @@ def _build_all_softmax_gemm2_ops(ty, blk, sp_pairs_all,
         remaining_budget = ALU_PER_STAGE[2] - p0c * NUM_MSB
     else:
         remaining_budget = ALU_PER_STAGE[2]
-    rid_budget[2][4] = min(PART1_INSTS, remaining_budget)  # fallback in case stage 1 left some
+    # fallback in case stage 1 left some
+    rid_budget[2][4] = min(PART1_INSTS, remaining_budget)
     # Do NOT subtract PART1 from remaining_budget: PART1 is typically done in stage 1,
     # so those budget slots are available to PART2 dispatch at runtime.
     p2_budget_2 = remaining_budget // NUM_MSB
@@ -1439,7 +1469,9 @@ def _cl_su_v3_stage(
     softmax_budget,
     tdm_state,
     tdm_barrier=False,
-    o_rescale_ops=None,  # optional list of O-tile rescale closures (16 per stage, 1 pk_mul each)
+    # optional list of O-tile rescale closures
+    # (16 per stage, 1 pk_mul each)
+    o_rescale_ops=None,
 ):
     """One fully interleaved GEMM1 (QK) pipeline stage (SU_K_N=32).
 
@@ -1491,7 +1523,13 @@ def _cl_su_v3_stage(
             _sched_barrier(0)
 
         # TDM barrier signal (mandatory, non-scheduled)
-        if const_expr(tdm_barrier and gemm_idx == GEMM_INST_COUNT - BARRIER_SIGNAL_AHEAD - 1):
+        _g1_barrier_idx = (
+            GEMM_INST_COUNT - BARRIER_SIGNAL_AHEAD - 1
+        )
+        if const_expr(
+            tdm_barrier
+            and gemm_idx == _g1_barrier_idx
+        ):
             _atom_s_wait_tensorcnt(4)
             rocdl.s_barrier_signal(-1)
 
@@ -1696,7 +1734,12 @@ def _cl_su_v3_stage_gemm2(
                 tdm_state[f'{tdm_key}_desc_idx'] = _tdm_di
                 _sched_barrier(0)
 
-        if const_expr(tdm_barrier and gemm_idx == PV_GEMM_INST_COUNT - BARRIER_SIGNAL_AHEAD - 1):
+        _pv_barrier_idx = (
+            PV_GEMM_INST_COUNT - BARRIER_SIGNAL_AHEAD - 1
+        )
+        if const_expr(
+            tdm_barrier and gemm_idx == _pv_barrier_idx
+        ):
             _atom_s_wait_tensorcnt(4)
             rocdl.s_barrier_signal(-1)
 
@@ -1710,7 +1753,10 @@ def _cl_su_v3_stage_gemm2(
                 if const_expr(0 <= _tok < RLTS_LEN):        # P0/P1/P2_pkfma
                     _rid = _tok
                     if const_expr(5 <= _rid <= 8):
-                        if rid_idx[_rid] < PART2_EXP_START and rid_idx[_rid] < len(ops_by_rid[_rid]):
+                        if (
+                            rid_idx[_rid] < PART2_EXP_START
+                            and rid_idx[_rid] < len(ops_by_rid[_rid])
+                        ):
                             ops_by_rid[_rid][rid_idx[_rid]]()
                             rid_idx[_rid] += 1
                     else:
@@ -1753,7 +1799,10 @@ def _cl_su_v3_stage_gemm2(
                 if const_expr(0 <= _tok < RLTS_LEN):
                     _rid = _tok
                     if const_expr(5 <= _rid <= 8):
-                        if rid_idx[_rid] < PART2_EXP_START and rid_idx[_rid] < len(ops_by_rid[_rid]):
+                        if (
+                            rid_idx[_rid] < PART2_EXP_START
+                            and rid_idx[_rid] < len(ops_by_rid[_rid])
+                        ):
                             ops_by_rid[_rid][rid_idx[_rid]]()
                             rid_idx[_rid] += 1
                     else:
@@ -2037,8 +2086,10 @@ def _softmax_part01_only(ty, blk, sp_pairs_all, softmax_state, sgpr_state):
     #   op 20:    mul      (independent: old_max * log2e_scl)
     #   op 21:    cur_max  (max3, reads perm_exec result)
     #
-    # To eliminate all s_delay_alu in the chain merge1→merge2→perm_prep→perm_exec→cur_max,
-    # each consecutive pair needs 4+ intervening VALU (= dep at position 5+, not tracked).
+    # To eliminate all s_delay_alu in the chain
+    # merge1->merge2->perm_prep->perm_exec->cur_max,
+    # each consecutive pair needs 4+ intervening VALU
+    # (= dep at position 5+, not tracked).
     # Strategy: dispatch 5 column-major groups separated by a SINGLE mul from ONE MSB
     # as filler. This gives exactly 4 intervening between each dep pair:
     #
@@ -2047,7 +2098,8 @@ def _softmax_part01_only(ty, blk, sp_pairs_all, softmax_state, sgpr_state):
     #   cur_max(M0..M3)
     #
     # Verification (worst case = same-MSB chain):
-    #   merge1(Mi) at pos P → merge2(Mi) at pos P+5: 4 intervening → DEP_5 (not tracked) ✓
+    #   merge1(Mi) at pos P -> merge2(Mi) at pos P+5:
+    #     4 intervening -> DEP_5 (not tracked)
     #   merge2(Mi) at pos Q → perm_prep(Mi) at pos Q+5: 4 intervening ✓
     #   perm_prep(Mi) at pos R → perm_exec(Mi) at pos R+5: 4 intervening ✓
     #   perm_exec(Mi) at pos S → cur_max(Mi) at pos S+5: 4 intervening ✓
@@ -2066,28 +2118,32 @@ def _softmax_part01_only(ty, blk, sp_pairs_all, softmax_state, sgpr_state):
     for rid in range_constexpr(NUM_MSB):
         ops_by_rid[rid][16]()
     _sched_barrier(0)
-    ops_by_rid[0][_MUL]()            # mul(M0) filler: 4 intervening between merge1 and merge2
+    # mul(M0) filler: 4 intervening between merge1/merge2
+    ops_by_rid[0][_MUL]()
     _sched_barrier(0)
 
     # merge2 column-major
     for rid in range_constexpr(NUM_MSB):
         ops_by_rid[rid][17]()
     _sched_barrier(0)
-    ops_by_rid[1][_MUL]()            # mul(M1) filler: 4 intervening between merge2 and perm_prep
+    # mul(M1) filler: 4 between merge2/perm_prep
+    ops_by_rid[1][_MUL]()
     _sched_barrier(0)
 
     # perm_prep column-major
     for rid in range_constexpr(NUM_MSB):
         ops_by_rid[rid][18]()
     _sched_barrier(0)
-    ops_by_rid[2][_MUL]()            # mul(M2) filler: 4 intervening between perm_prep and perm_exec
+    # mul(M2) filler: 4 between perm_prep/perm_exec
+    ops_by_rid[2][_MUL]()
     _sched_barrier(0)
 
     # perm_exec column-major
     for rid in range_constexpr(NUM_MSB):
         ops_by_rid[rid][19]()
     _sched_barrier(0)
-    ops_by_rid[3][_MUL]()            # mul(M3) filler: 4 intervening between perm_exec and cur_max
+    # mul(M3) filler: 4 between perm_exec/cur_max
+    ops_by_rid[3][_MUL]()
     _sched_barrier(0)
 
     # cur_max column-major

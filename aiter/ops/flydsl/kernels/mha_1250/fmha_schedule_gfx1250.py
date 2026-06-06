@@ -46,7 +46,8 @@ V_M0, V_M1, V_M2, V_M3     = 13, 14, 15, 16 # V tile ds_load_tr16_b128 by MSB
 O_RESC0 = 17   # O-rescale v2f32 sub-op (1 v_pk_mul_f32 per token; 16 tokens per stage)
 TDM     = 18   # tensor_load_to_lds
 
-# PART2 boundary: ops[0..PART2_EXP_START-1] = setup+pkfma (cheap), ops[PART2_EXP_START..] = exp
+# PART2 boundary: ops[0..PART2_EXP_START-1] = setup+pkfma
+# (cheap), ops[PART2_EXP_START..] = exp
 PART2_EXP_START = 24   # = PART2_SETUP_A(8) + pkfma(16)
 
 _P2_BASE  = 5
@@ -69,7 +70,9 @@ _PV_GEMM_INST_COUNT= 16   # WMMAs per GEMM2 stage
 _N_LDS_PER_MSB     = 6    # K tile loads per MSB per stage (QK_HDIM=192)
 _N_LDS_V_PER_MSB   = 4    # V tile loads per MSB per stage (V_HDIM=128)
 _TDM_PER_STAGE     = 2    # tensor_load_to_lds per stage
-_N_PV_WMMA_N       = 4    # O-rescale tile groups per GEMM1 stage (16 tokens = 4 MSBs × 4 sub-ops)
+# O-rescale tile groups per GEMM1 stage
+# (16 tokens = 4 MSBs x 4 sub-ops)
+_N_PV_WMMA_N       = 4
 _NUM_G1_STAGES     = 4
 _NUM_G2_STAGES     = 4
 
@@ -93,13 +96,20 @@ def row_cycles(row: List[int], cy_p2: int = 1) -> int:
     """
     total = 0
     for t in row:
-        if t == TDM:           total += 4
-        elif t == O_RESC0:     total += 1
-        elif 19 <= t <= 22:    total += 3   # EXP_Mx: pair_exp (3cy)
-        elif 5 <= t <= 8:      total += 1   # P2_Mx: pkfma/setup (1cy)
-        elif 9 <= t <= 16:     total += 1   # K or V load (1cy)
-        elif 0 <= t <= 4:      total += 1   # P0, P1 (1cy)
-        else:                  total += 1
+        if t == TDM:
+            total += 4
+        elif t == O_RESC0:
+            total += 1
+        elif 19 <= t <= 22:
+            total += 3  # EXP_Mx: pair_exp (3cy)
+        elif 5 <= t <= 8:
+            total += 1  # P2_Mx: pkfma/setup (1cy)
+        elif 9 <= t <= 16:
+            total += 1  # K or V load (1cy)
+        elif 0 <= t <= 4:
+            total += 1  # P0, P1 (1cy)
+        else:
+            total += 1
     return total
 
 
@@ -309,7 +319,8 @@ def _build_gemm1_stage(stage_idx: int,
         for lw in range(k_start, k_load_end):
             for _ in range(4):   # 4 cheap tokens: 3cy loads + 4cy = 7cy
                 if ti < len(p2_flat):
-                    rows[lw].append(p2_flat[ti]); ti += 1
+                    rows[lw].append(p2_flat[ti])
+                    ti += 1
 
     # ---- Distribute remaining tokens into post-load WMMAs ----
     # Compute per-WMMA count dynamically so ALL tokens are scheduled (no post-tail).
@@ -327,13 +338,15 @@ def _build_gemm1_stage(stage_idx: int,
         if row_w in o_rows:
             # O_RESC0 WMMA: 1 P2 + 4 O_RESC0
             if ti < len(p2_flat):
-                row.append(p2_flat[ti]); ti += 1
+                row.append(p2_flat[ti])
+                ti += 1
             row.extend([O_RESC0] * 4)
         else:
             # Regular WMMA: per_wmma P2 tokens (auto-sized to fit all remaining)
             for _ in range(per_wmma):
                 if ti < len(p2_flat):
-                    row.append(p2_flat[ti]); ti += 1
+                    row.append(p2_flat[ti])
+                    ti += 1
         rows[row_w] = row
 
     return rows
@@ -464,12 +477,15 @@ def _build_gemm2_stage(stage_idx: int,
         p01_want = min(p01_per_wmma, len(p01_flat) - p01_i, slots)
         added = 0
         while added < p01_want and p01_i < len(p01_flat):
-            row.append(p01_flat[p01_i]); p01_i += 1; added += 1
+            row.append(p01_flat[p01_i])
+            p01_i += 1
+            added += 1
 
         # Remaining slots → EXP (up to 2)
         exp_slots = min(_MAX_EXP, slots - added, len(exp_flat) - exp_i)
         for _ in range(exp_slots):
-            row.append(exp_flat[exp_i]); exp_i += 1
+            row.append(exp_flat[exp_i])
+            exp_i += 1
 
     return rows
 
@@ -494,105 +510,105 @@ def build_gemm1_schedule() -> List[List[int]]:
     # 4 independently-placeable tokens per stage (1 per MSB closure).
     sched = [
         # ---- Stage 0 (G0): K+TDM, exp=10/MSB ----
-        [TDM, TDM, P2_M0],                                                            # G0w00
-        [K_M0, K_M0, K_M0, O_RESC0],                                    # G0w01
-        [K_M0, K_M0, K_M0, P2_M0, P2_M0],                                    # G0w02
-        [K_M1, K_M1, K_M1, P2_M1, P2_M1],                                    # G0w03
-        [K_M1, K_M1, K_M1, P2_M1, P2_M1],                                    # G0w04
-        [K_M2, K_M2, K_M2, P2_M2, P2_M2],                                    # G0w05
-        [K_M2, K_M2, K_M2, P2_M2, P2_M0],                                    # G0w06
-        [K_M3, K_M3, K_M3, P2_M3, P2_M3],                                    # G0w07
-        [K_M3, K_M3, K_M3, P2_M3],                                    # G0w08
-        [P2_M0, P2_M0],                                                        # G0w09
-        [P2_M0, P2_M0],                                                        # G0w10
-        [P2_M1, P2_M1],                                                        # G0w11
-        [P2_M1, P2_M1],                                                        # G0w12
-        [P2_M1, O_RESC0],                                                        # G0w13
-        [P2_M1, P2_M0],                         # G0w14
-        [P2_M2, P2_M3],                         # G0w15
-        [P2_M2, O_RESC0],                         # G0w16
-        [P2_M2, O_RESC0],                         # G0w17
-        [P2_M0, P2_M0],                                                        # G0w18
-        [P2_M0, P2_M0],                                                        # G0w19
-        [P2_M0, P2_M0],                                                        # G0w20
-        [P2_M0, P2_M0],                                                        # G0w21
-        [P2_M0, P2_M0],                                                        # G0w22
-        [P2_M0, P2_M2],                                                                     # G0w23
+        [TDM, TDM, P2_M0],  # G0w00
+        [K_M0, K_M0, K_M0, O_RESC0],  # G0w01
+        [K_M0, K_M0, K_M0, P2_M0, P2_M0],  # G0w02
+        [K_M1, K_M1, K_M1, P2_M1, P2_M1],  # G0w03
+        [K_M1, K_M1, K_M1, P2_M1, P2_M1],  # G0w04
+        [K_M2, K_M2, K_M2, P2_M2, P2_M2],  # G0w05
+        [K_M2, K_M2, K_M2, P2_M2, P2_M0],  # G0w06
+        [K_M3, K_M3, K_M3, P2_M3, P2_M3],  # G0w07
+        [K_M3, K_M3, K_M3, P2_M3],  # G0w08
+        [P2_M0, P2_M0],  # G0w09
+        [P2_M0, P2_M0],  # G0w10
+        [P2_M1, P2_M1],  # G0w11
+        [P2_M1, P2_M1],  # G0w12
+        [P2_M1, O_RESC0],  # G0w13
+        [P2_M1, P2_M0],  # G0w14
+        [P2_M2, P2_M3],  # G0w15
+        [P2_M2, O_RESC0],  # G0w16
+        [P2_M2, O_RESC0],  # G0w17
+        [P2_M0, P2_M0],  # G0w18
+        [P2_M0, P2_M0],  # G0w19
+        [P2_M0, P2_M0],  # G0w20
+        [P2_M0, P2_M0],  # G0w21
+        [P2_M0, P2_M0],  # G0w22
+        [P2_M0, P2_M2],  # G0w23
         # ---- Stage 1 (G1): K+TDM, exp=10/MSB ----
-        [TDM, TDM, P2_M2],                                                            # G1w00
-        [K_M0, K_M0, K_M0, O_RESC0],                                    # G1w01
-        [K_M0, K_M0, K_M0, P2_M0],                                    # G1w02
-        [K_M1, K_M1, K_M1, P2_M1, P2_M1],                                    # G1w03
-        [K_M1, K_M1, K_M1, P2_M1, P2_M1],                                    # G1w04
-        [K_M2, K_M2, K_M2, P2_M2, P2_M2],                                    # G1w05
-        [K_M2, K_M2, K_M2, P2_M2, P2_M2],                                    # G1w06
-        [K_M3, K_M3, K_M3, P2_M3],                                    # G1w07
-        [K_M3, K_M3, K_M3, P2_M3],                                    # G1w08
-        [P2_M3, P2_M3],                                                        # G1w09
-        [P2_M3, P2_M3],                                                        # G1w10
-        [P2_M3, P2_M3],                                                        # G1w11
-        [P2_M1, P2_M1],                                                        # G1w12
-        [P2_M1, P2_M1],                                                        # G1w13
-        [P2_M1, P2_M2],                         # G1w14
-        [P2_M1, O_RESC0],                         # G1w15
-        [P2_M2, O_RESC0],                         # G1w16
-        [P2_M2, O_RESC0],                         # G1w17
-        [P2_M2, P2_M2],                                                        # G1w18
-        [P2_M2, P2_M2],                                                        # G1w19
-        [P2_M3, P2_M3],                                                        # G1w20
-        [P2_M3, P2_M3],                                                        # G1w21
-        [P2_M3, P2_M3],                                                        # G1w22
-        [P2_M3, P2_M0],                                                                     # G1w23
+        [TDM, TDM, P2_M2],  # G1w00
+        [K_M0, K_M0, K_M0, O_RESC0],  # G1w01
+        [K_M0, K_M0, K_M0, P2_M0],  # G1w02
+        [K_M1, K_M1, K_M1, P2_M1, P2_M1],  # G1w03
+        [K_M1, K_M1, K_M1, P2_M1, P2_M1],  # G1w04
+        [K_M2, K_M2, K_M2, P2_M2, P2_M2],  # G1w05
+        [K_M2, K_M2, K_M2, P2_M2, P2_M2],  # G1w06
+        [K_M3, K_M3, K_M3, P2_M3],  # G1w07
+        [K_M3, K_M3, K_M3, P2_M3],  # G1w08
+        [P2_M3, P2_M3],  # G1w09
+        [P2_M3, P2_M3],  # G1w10
+        [P2_M3, P2_M3],  # G1w11
+        [P2_M1, P2_M1],  # G1w12
+        [P2_M1, P2_M1],  # G1w13
+        [P2_M1, P2_M2],  # G1w14
+        [P2_M1, O_RESC0],  # G1w15
+        [P2_M2, O_RESC0],  # G1w16
+        [P2_M2, O_RESC0],  # G1w17
+        [P2_M2, P2_M2],  # G1w18
+        [P2_M2, P2_M2],  # G1w19
+        [P2_M3, P2_M3],  # G1w20
+        [P2_M3, P2_M3],  # G1w21
+        [P2_M3, P2_M3],  # G1w22
+        [P2_M3, P2_M0],  # G1w23
         # ---- Stage 2 (G2): K, exp=4/MSB + cheap=21/MSB ----
-        [K_M0, K_M0, K_M0, P2_M0, P2_M3],                                    # G2w00
-        [K_M0, K_M0, K_M0, P2_M0, P2_M2],                                    # G2w01
-        [K_M1, K_M1, K_M1, P2_M1, P2_M1],                                    # G2w02
-        [K_M1, K_M1, K_M1, P2_M1, P2_M1],                                    # G2w03
-        [K_M2, K_M2, K_M2, P2_M2, P2_M2],                                    # G2w04
-        [K_M2, K_M2, K_M2, P2_M2, P2_M2],                                    # G2w05
-        [K_M3, K_M3, K_M3, P2_M3, P2_M3],                                    # G2w06
-        [K_M3, K_M3, K_M3, P2_M3, P2_M3],                                    # G2w07
-        [P2_M0, P2_M0, P2_M0, P2_M0, P2_M0, P2_M0],                  # G2w08
-        [P2_M0, P2_M0, P2_M0, P2_M0, P2_M0, P2_M0, P2_M0],                  # G2w09
-        [P2_M0, P2_M0, P2_M0, P2_M0, P2_M0, P2_M0, P2_M0],                  # G2w10
-        [P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1],                  # G2w11
-        [P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1],                  # G2w12
-        [P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1],                  # G2w13
-        [P2_M2, P2_M2, O_RESC0],                         # G2w14
-        [P2_M2, P2_M2, O_RESC0],                         # G2w15
-        [P2_M2, P2_M2, O_RESC0],                         # G2w16
-        [P2_M3, P2_M3, O_RESC0],                         # G2w17
-        [P2_M2, P2_M2, P2_M2, P2_M2, P2_M2, P2_M2],                  # G2w18
-        [P2_M2, P2_M2, P2_M2, P2_M2, P2_M2, P2_M2],                  # G2w19
-        [P2_M2, P2_M2, P2_M2, P2_M3, P2_M3, P2_M3],                  # G2w20
-        [P2_M3, P2_M3, P2_M3, P2_M3, P2_M3, P2_M3],                  # G2w21
-        [P2_M3, P2_M3, P2_M3, P2_M3, P2_M3, P2_M3],                  # G2w22
-        [P2_M0, P2_M0, P2_M0, P2_M0, P2_M3, P2_M3],                                                # G2w23
+        [K_M0, K_M0, K_M0, P2_M0, P2_M3],  # G2w00
+        [K_M0, K_M0, K_M0, P2_M0, P2_M2],  # G2w01
+        [K_M1, K_M1, K_M1, P2_M1, P2_M1],  # G2w02
+        [K_M1, K_M1, K_M1, P2_M1, P2_M1],  # G2w03
+        [K_M2, K_M2, K_M2, P2_M2, P2_M2],  # G2w04
+        [K_M2, K_M2, K_M2, P2_M2, P2_M2],  # G2w05
+        [K_M3, K_M3, K_M3, P2_M3, P2_M3],  # G2w06
+        [K_M3, K_M3, K_M3, P2_M3, P2_M3],  # G2w07
+        [P2_M0, P2_M0, P2_M0, P2_M0, P2_M0, P2_M0],  # G2w08
+        [P2_M0, P2_M0, P2_M0, P2_M0, P2_M0, P2_M0, P2_M0],  # G2w09
+        [P2_M0, P2_M0, P2_M0, P2_M0, P2_M0, P2_M0, P2_M0],  # G2w10
+        [P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1],  # G2w11
+        [P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1],  # G2w12
+        [P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1],  # G2w13
+        [P2_M2, P2_M2, O_RESC0],  # G2w14
+        [P2_M2, P2_M2, O_RESC0],  # G2w15
+        [P2_M2, P2_M2, O_RESC0],  # G2w16
+        [P2_M3, P2_M3, O_RESC0],  # G2w17
+        [P2_M2, P2_M2, P2_M2, P2_M2, P2_M2, P2_M2],  # G2w18
+        [P2_M2, P2_M2, P2_M2, P2_M2, P2_M2, P2_M2],  # G2w19
+        [P2_M2, P2_M2, P2_M2, P2_M3, P2_M3, P2_M3],  # G2w20
+        [P2_M3, P2_M3, P2_M3, P2_M3, P2_M3, P2_M3],  # G2w21
+        [P2_M3, P2_M3, P2_M3, P2_M3, P2_M3, P2_M3],  # G2w22
+        [P2_M0, P2_M0, P2_M0, P2_M0, P2_M3, P2_M3],  # G2w23
         # ---- Stage 3 (G3): V, cheap=33/MSB ----
-        [V_M0, V_M0, P2_M0, P2_M0],                     # G3w00
-        [V_M0, V_M0, P2_M0, P2_M0],                                  # G3w01
-        [V_M1, V_M1, P2_M1, P2_M1],                     # G3w02
-        [V_M1, V_M1, P2_M1, P2_M1, P2_M2],                                  # G3w03
-        [V_M2, V_M2, P2_M2, P2_M2],                     # G3w04
-        [V_M2, V_M2, P2_M2, P2_M2],                                  # G3w05
-        [V_M3, V_M3, P2_M3, P2_M3],                     # G3w06
-        [V_M3, V_M3, P2_M3, P2_M1],                                  # G3w07
-        [P2_M1, P2_M1, P2_M3],           # G3w08
-        [P2_M1, P2_M0],           # G3w09
-        [P2_M1, P2_M3],           # G3w10
-        [P2_M1, P2_M0, P2_M3],           # G3w11
-        [P2_M2, P2_M3],           # G3w12
-        [P2_M2, P2_M2],           # G3w13
-        [P2_M3, P2_M3],                         # G3w14
-        [P2_M3, P2_M3, P2_M1],                         # G3w15
-        [O_RESC0, P2_M2],                          # G3w16
-        [O_RESC0, P2_M2],                                                       # G3w17
-        [O_RESC0, P2_M2, P2_M0],           # G3w18
+        [V_M0, V_M0, P2_M0, P2_M0],  # G3w00
+        [V_M0, V_M0, P2_M0, P2_M0],  # G3w01
+        [V_M1, V_M1, P2_M1, P2_M1],  # G3w02
+        [V_M1, V_M1, P2_M1, P2_M1, P2_M2],  # G3w03
+        [V_M2, V_M2, P2_M2, P2_M2],  # G3w04
+        [V_M2, V_M2, P2_M2, P2_M2],  # G3w05
+        [V_M3, V_M3, P2_M3, P2_M3],  # G3w06
+        [V_M3, V_M3, P2_M3, P2_M1],  # G3w07
+        [P2_M1, P2_M1, P2_M3],  # G3w08
+        [P2_M1, P2_M0],  # G3w09
+        [P2_M1, P2_M3],  # G3w10
+        [P2_M1, P2_M0, P2_M3],  # G3w11
+        [P2_M2, P2_M3],  # G3w12
+        [P2_M2, P2_M2],  # G3w13
+        [P2_M3, P2_M3],  # G3w14
+        [P2_M3, P2_M3, P2_M1],  # G3w15
+        [O_RESC0, P2_M2],  # G3w16
+        [O_RESC0, P2_M2],  # G3w17
+        [O_RESC0, P2_M2, P2_M0],  # G3w18
         [O_RESC0, P2_M2, P2_M3],  # G3w19
-        [P2_M0 ,P2_M3, P2_M1],           # G3w20
-        [P2_M0],           # G3w21
-        [P2_M3],           # G3w22
-        [],           # G3w23
+        [P2_M0 ,P2_M3, P2_M1],  # G3w20
+        [P2_M0],  # G3w21
+        [P2_M3],  # G3w22
+        [],  # G3w23
     ]
     assert len(sched) == 96
     return sched
@@ -621,73 +637,73 @@ def build_gemm2_schedule() -> List[List[int]]:
     # Token order per row: ds_loads first (V_Mx/K_Mx), then ALU (P0/P1/P2/EXP).
     sched.extend([
         # ---- Stage 0 (G0): V+TDM, P0=10/MSB ----
-        [TDM, TDM, P0_M0, P0_M0, P0_M0],                                                            # G0w00
-        [V_M0, V_M0, P0_M0, P0_M0, P0_M0],                            # G0w01
-        [V_M0, V_M0, P0_M0, P0_M0, P0_M0],                            # G0w02
-        [V_M1, V_M1, P0_M1, P0_M1, P0_M1, P0_M1],                            # G0w03
-        [V_M1, V_M1, P0_M1, P0_M1, P0_M1, P0_M1],                            # G0w04
-        [V_M2, V_M2, P0_M2, P0_M2, P0_M2, P0_M2],                            # G0w05
-        [V_M2, V_M2, P0_M2, P0_M2, P0_M2, P0_M2],                            # G0w06
-        [V_M3, V_M3, P0_M3, P0_M3, P0_M3, P0_M3],                            # G0w07
-        [V_M3, V_M3, P0_M3, P0_M3, P0_M3, P0_M3],                            # G0w08
-        [P0_M0, P0_M2, P0_M2, P0_M2, P0_M3],                                                        # G0w09
-        [P0_M0, P0_M1, P0_M1, P0_M3],                                                        # G0w10
-        [P0_M0, P0_M0, P0_M0, P0_M0, P0_M1],                                                        # G0w11
-        [P0_M0, P0_M1, P0_M1, P0_M2, P0_M2],                                                        # G0w12
-        [P0_M1, P0_M2, P0_M2, P0_M3, P0_M3],                                                        # G0w13
-        [P0_M2, P0_M3, P0_M3, P0_M1, P0_M1],                                                        # G0w14
-        [P0_M3, P0_M3],                                                        # G0w15
+        [TDM, TDM, P0_M0, P0_M0, P0_M0],  # G0w00
+        [V_M0, V_M0, P0_M0, P0_M0, P0_M0],  # G0w01
+        [V_M0, V_M0, P0_M0, P0_M0, P0_M0],  # G0w02
+        [V_M1, V_M1, P0_M1, P0_M1, P0_M1, P0_M1],  # G0w03
+        [V_M1, V_M1, P0_M1, P0_M1, P0_M1, P0_M1],  # G0w04
+        [V_M2, V_M2, P0_M2, P0_M2, P0_M2, P0_M2],  # G0w05
+        [V_M2, V_M2, P0_M2, P0_M2, P0_M2, P0_M2],  # G0w06
+        [V_M3, V_M3, P0_M3, P0_M3, P0_M3, P0_M3],  # G0w07
+        [V_M3, V_M3, P0_M3, P0_M3, P0_M3, P0_M3],  # G0w08
+        [P0_M0, P0_M2, P0_M2, P0_M2, P0_M3],  # G0w09
+        [P0_M0, P0_M1, P0_M1, P0_M3],  # G0w10
+        [P0_M0, P0_M0, P0_M0, P0_M0, P0_M1],  # G0w11
+        [P0_M0, P0_M1, P0_M1, P0_M2, P0_M2],  # G0w12
+        [P0_M1, P0_M2, P0_M2, P0_M3, P0_M3],  # G0w13
+        [P0_M2, P0_M3, P0_M3, P0_M1, P0_M1],  # G0w14
+        [P0_M3, P0_M3],  # G0w15
         # ---- Stage 1 (G1): V+TDM, P0=12/MSB + P1=8 ----
-        [TDM, TDM, P0_M0],                                                            # G1w00
-        [V_M0, V_M0, P0_M0, P0_M1, P0_M2, P0_M3],                            # G1w01
-        [V_M0, V_M0, P0_M0, P0_M1, P0_M2, P0_M3],                            # G1w02
-        [V_M1, V_M1, P0_M1, P0_M0, P0_M2, P0_M3],                            # G1w03
-        [V_M1, V_M1, P0_M1, P0_M0],                            # G1w04
-        [V_M2, V_M2, P0_M2, P0_M2, P0_M1],                            # G1w05
-        [V_M2, V_M2, P0_M2, P0_M0, P0_M1],                            # G1w06
-        [V_M3, V_M3, P0_M3],                            # G1w07
-        [V_M3, V_M3, P0_M3, P0_M3],                            # G1w08
-        [P1, P1, P1, P1],                          # G1w09
-        [P1, P1, P1, P1],                                         # G1w10
-        [P2_M1, P2_M1, P2_M1, P2_M1, P2_M2, P2_M2, P2_M2, P2_M2],                                         # G1w11
-        [P2_M0, P2_M0, P2_M0, P2_M0, P2_M3, P2_M3, P2_M3, P2_M3],                                         # G1w12
-        [P2_M0, P2_M1, P2_M2, P2_M3],                                                      # G1w13
-        [P2_M0, P2_M1, P2_M2, P2_M3, P2_M0, P2_M1, P2_M2, P2_M3],                                                      # G1w14
-        [P2_M0, P2_M1, P2_M2, P2_M3],                                                                     # G1w15
+        [TDM, TDM, P0_M0],  # G1w00
+        [V_M0, V_M0, P0_M0, P0_M1, P0_M2, P0_M3],  # G1w01
+        [V_M0, V_M0, P0_M0, P0_M1, P0_M2, P0_M3],  # G1w02
+        [V_M1, V_M1, P0_M1, P0_M0, P0_M2, P0_M3],  # G1w03
+        [V_M1, V_M1, P0_M1, P0_M0],  # G1w04
+        [V_M2, V_M2, P0_M2, P0_M2, P0_M1],  # G1w05
+        [V_M2, V_M2, P0_M2, P0_M0, P0_M1],  # G1w06
+        [V_M3, V_M3, P0_M3],  # G1w07
+        [V_M3, V_M3, P0_M3, P0_M3],  # G1w08
+        [P1, P1, P1, P1],  # G1w09
+        [P1, P1, P1, P1],  # G1w10
+        [P2_M1, P2_M1, P2_M1, P2_M1, P2_M2, P2_M2, P2_M2, P2_M2],  # G1w11
+        [P2_M0, P2_M0, P2_M0, P2_M0, P2_M3, P2_M3, P2_M3, P2_M3],  # G1w12
+        [P2_M0, P2_M1, P2_M2, P2_M3],  # G1w13
+        [P2_M0, P2_M1, P2_M2, P2_M3, P2_M0, P2_M1, P2_M2, P2_M3],  # G1w14
+        [P2_M0, P2_M1, P2_M2, P2_M3],  # G1w15
         # ---- Stage 2 (G2): V, P2=24/MSB ----
-        [V_M0, V_M0, P2_M0, P2_M0, P2_M0],                            # G2w00
-        [V_M0, V_M0, P2_M0, P2_M0, P2_M0],                            # G2w01
-        [V_M1, V_M1, P2_M1, P2_M2, P2_M2],                            # G2w02
-        [V_M1, V_M1, P2_M1, P2_M2, P2_M2],                            # G2w03
-        [V_M2, V_M2, P2_M2, P2_M1, P2_M1],                            # G2w04
-        [V_M2, V_M2, P2_M2, P2_M1, P2_M1],                            # G2w05
-        [V_M3, V_M3, P2_M3, P2_M3, P2_M3, P2_M3],                            # G2w06
-        [V_M3, V_M3, P2_M3, P2_M3, P2_M3],                            # G2w07
-        [P2_M0, P2_M0, P2_M0, P2_M0, P2_M0, P2_M0],    # G2w08
-        [P2_M0, P2_M0, P2_M0, P2_M1],           # G2w09
-        [P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1],    # G2w10
-        [P2_M1, P2_M1, P2_M1, P2_M2, P2_M2],           # G2w11
-        [P2_M2, P2_M2, P2_M2, P2_M2, P2_M2, P2_M2],    # G2w12
-        [P2_M3, P2_M3, P2_M3],           # G2w13
-        [P2_M3, P2_M3, P2_M3, P2_M3],    # G2w14
-        [P2_M0, P2_M0, P2_M1, P2_M1],                                         # G2w15
+        [V_M0, V_M0, P2_M0, P2_M0, P2_M0],  # G2w00
+        [V_M0, V_M0, P2_M0, P2_M0, P2_M0],  # G2w01
+        [V_M1, V_M1, P2_M1, P2_M2, P2_M2],  # G2w02
+        [V_M1, V_M1, P2_M1, P2_M2, P2_M2],  # G2w03
+        [V_M2, V_M2, P2_M2, P2_M1, P2_M1],  # G2w04
+        [V_M2, V_M2, P2_M2, P2_M1, P2_M1],  # G2w05
+        [V_M3, V_M3, P2_M3, P2_M3, P2_M3, P2_M3],  # G2w06
+        [V_M3, V_M3, P2_M3, P2_M3, P2_M3],  # G2w07
+        [P2_M0, P2_M0, P2_M0, P2_M0, P2_M0, P2_M0],  # G2w08
+        [P2_M0, P2_M0, P2_M0, P2_M1],  # G2w09
+        [P2_M1, P2_M1, P2_M1, P2_M1, P2_M1, P2_M1],  # G2w10
+        [P2_M1, P2_M1, P2_M1, P2_M2, P2_M2],  # G2w11
+        [P2_M2, P2_M2, P2_M2, P2_M2, P2_M2, P2_M2],  # G2w12
+        [P2_M3, P2_M3, P2_M3],  # G2w13
+        [P2_M3, P2_M3, P2_M3, P2_M3],  # G2w14
+        [P2_M0, P2_M0, P2_M1, P2_M1],  # G2w15
         # ---- Stage 3 (G3): K, EXP=8/MSB ----
-        [K_M0, K_M0, K_M0, EXP_M0, EXP_M0],                                  # G3w00
-        [K_M0, K_M0, K_M0, EXP_M0],                                  # G3w01
-        [K_M1, K_M1, K_M1, EXP_M1, EXP_M1],                                  # G3w02
-        [K_M1, K_M1, K_M1, EXP_M1, EXP_M1],                                  # G3w03
-        [K_M2, K_M2, K_M2, P2_M2, EXP_M2],                                  # G3w04
-        [K_M2, K_M2, K_M2, P2_M2, EXP_M2],                                  # G3w05
-        [K_M3, K_M3, K_M3, P2_M3, EXP_M3],                                  # G3w06
-        [K_M3, K_M3, K_M3, P2_M3, EXP_M3],                                  # G3w07
-        [EXP_M0, EXP_M0, EXP_M0],                                                     # G3w08
-        [EXP_M0, EXP_M0, EXP_M1],                                                     # G3w09
-        [EXP_M1, EXP_M1, EXP_M1],                                                     # G3w10
-        [EXP_M3, EXP_M3, EXP_M3],                                                     # G3w11
-        [EXP_M2, EXP_M2, EXP_M2],                                                     # G3w12
-        [EXP_M2, EXP_M2, EXP_M2],                                                     # G3w13
-        [EXP_M3, EXP_M3, EXP_M3],                                                     # G3w14
-        [],                                                     # G3w15
+        [K_M0, K_M0, K_M0, EXP_M0, EXP_M0],  # G3w00
+        [K_M0, K_M0, K_M0, EXP_M0],  # G3w01
+        [K_M1, K_M1, K_M1, EXP_M1, EXP_M1],  # G3w02
+        [K_M1, K_M1, K_M1, EXP_M1, EXP_M1],  # G3w03
+        [K_M2, K_M2, K_M2, P2_M2, EXP_M2],  # G3w04
+        [K_M2, K_M2, K_M2, P2_M2, EXP_M2],  # G3w05
+        [K_M3, K_M3, K_M3, P2_M3, EXP_M3],  # G3w06
+        [K_M3, K_M3, K_M3, P2_M3, EXP_M3],  # G3w07
+        [EXP_M0, EXP_M0, EXP_M0],  # G3w08
+        [EXP_M0, EXP_M0, EXP_M1],  # G3w09
+        [EXP_M1, EXP_M1, EXP_M1],  # G3w10
+        [EXP_M3, EXP_M3, EXP_M3],  # G3w11
+        [EXP_M2, EXP_M2, EXP_M2],  # G3w12
+        [EXP_M2, EXP_M2, EXP_M2],  # G3w13
+        [EXP_M3, EXP_M3, EXP_M3],  # G3w14
+        [],  # G3w15
     ])
     assert len(sched) == 64
     return sched
@@ -731,7 +747,8 @@ def print_schedule(schedule, name, wmma_per_stage):
         stage = i // wmma_per_stage
         wmma = i % wmma_per_stage
         counts = {}
-        for t in row: counts[t] = counts.get(t, 0) + 1
+        for t in row:
+            counts[t] = counts.get(t, 0) + 1
         summary = ' '.join(f'{_TOKEN_NAMES.get(t,str(t))}:{n}'
                            for t,n in sorted(counts.items()))
         names = [_TOKEN_NAMES.get(t, str(t)) for t in row]
@@ -746,7 +763,9 @@ def validate_schedule(schedule, name):
 # CSV schedule tool
 # ---------------------------------------------------------------------------
 # Workflow:
-#   1. Export current schedule: save_schedule_to_csv(GEMM1_SCHEDULE, GEMM2_SCHEDULE, 'sched.csv')
+#   1. Export current schedule:
+#      save_schedule_to_csv(
+#          GEMM1_SCHEDULE, GEMM2_SCHEDULE, 'sched.csv')
 #   2. Edit sched.csv manually (token names or integers, space-separated per row)
 #   3. Reload: g1, g2 = parse_schedule_from_csv('sched.csv')
 #   4. Validate: validate_schedule(g1, 'GEMM1'); validate_schedule(g2, 'GEMM2')
@@ -772,7 +791,11 @@ def save_schedule_to_csv(
 ) -> None:
     """Export GEMM1+GEMM2 schedules to a CSV file for manual editing."""
     with open(filename, 'w', newline='') as f:
-        f.write('# FMHA schedule — edit tokens column, then reload with parse_schedule_from_csv\n')
+        f.write(
+            '# FMHA schedule -- edit tokens column,'
+            ' then reload with'
+            ' parse_schedule_from_csv\n'
+        )
         f.write('# Token names: ' + '  '.join(
             f'{v}={k}' for k, v in sorted(_TOKEN_NAMES.items())) + '\n')
         f.write('gemm,stage,wmma,tokens\n')
@@ -806,7 +829,9 @@ def parse_schedule_from_csv(filename: str):
             parts = line.split(',', 3)
             if len(parts) < 3:
                 raise ValueError(
-                    f'{filename}:{lineno}: expected gemm,stage,wmma[,tokens], got {line!r}')
+                    f'{filename}:{lineno}: expected '
+                    f'gemm,stage,wmma[,tokens], '
+                    f'got {line!r}')
             gemm  = int(parts[0])
             stage = int(parts[1])
             wmma  = int(parts[2])
@@ -829,16 +854,23 @@ def parse_schedule_from_csv(filename: str):
                 idx = stage * _GEMM_INST_COUNT + wmma
                 if not (0 <= idx < len(g1)):
                     raise ValueError(
-                        f'{filename}:{lineno}: GEMM1 stage={stage} wmma={wmma} out of range')
+                        f'{filename}:{lineno}: GEMM1 '
+                        f'stage={stage} wmma={wmma} '
+                        f'out of range')
                 g1[idx] = tokens
             elif gemm == 2:
                 idx = stage * _PV_GEMM_INST_COUNT + wmma
                 if not (0 <= idx < len(g2)):
                     raise ValueError(
-                        f'{filename}:{lineno}: GEMM2 stage={stage} wmma={wmma} out of range')
+                        f'{filename}:{lineno}: GEMM2 '
+                        f'stage={stage} wmma={wmma} '
+                        f'out of range')
                 g2[idx] = tokens
             else:
-                raise ValueError(f'{filename}:{lineno}: gemm must be 1 or 2, got {gemm}')
+                raise ValueError(
+                    f'{filename}:{lineno}: '
+                    f'gemm must be 1 or 2, got {gemm}'
+                )
 
     return g1, g2
 
