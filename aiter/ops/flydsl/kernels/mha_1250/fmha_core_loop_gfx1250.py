@@ -27,7 +27,6 @@ _EXP_BASE = 19  # token base for EXP_Mx (19..22 → MSB 0..3, draws from pair_ex
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
-from flydsl._mlir.dialects import vector as vector_dialect
 from flydsl.expr import arith, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.expr.primitive import const_expr, range_constexpr
@@ -347,7 +346,7 @@ def _pack_v2bf16_to_v16bf16(ty, v2bf16_list, bank):
 
 def _atom_wmma_init(ty, src_a, src_b, bank_dst):
     _sched_barrier(0)
-    zero = vector_dialect.broadcast(ty['v8f32'],
+    zero = vector.broadcast(ty['v8f32'],
                                     _raw(arith.constant(0.0, type=T.f32)))
 
     result = rocdl_dialect.wmma_f32_16x16x32_bf16(
@@ -390,10 +389,9 @@ def _atom_ds_load_b128(ty, addr, offset_val, bank):
 def _atom_ds_load_tr16_b128(ty, addr, offset_val, bank):
 
     _sched_barrier(0)
-    from flydsl._mlir.dialects import rocdl as _rocdl
     off = _raw(arith.constant(offset_val, type=T.i32))
     ptr = llvm_dialect.inttoptr(ty['lds_ptr'], _raw(arith.addi(addr, off)))
-    raw = _rocdl.ds_load_tr16_b128(ty['v8bf16'], ptr)
+    raw = rocdl.ds_load_tr16_b128(ty['v8bf16'], ptr)
     banked = set_vgpr_bank(raw, bank)
     _sched_barrier(0)
 
@@ -405,7 +403,6 @@ def _atom_ds_load_tr16_b128(ty, addr, offset_val, bank):
 def _atom_tdm_load(ty, s_g0, s_g1):
 
     _sched_barrier(0)
-    from flydsl._mlir.dialects import rocdl as _rocdl
     zero_i32 = _raw(arith.constant(0, type=T.i32))
     null_v4 = llvm_dialect.mlir_undef(ty['v4i32'])
     for i in range_constexpr(4):
@@ -415,7 +412,7 @@ def _atom_tdm_load(ty, s_g0, s_g1):
     for i in range_constexpr(8):
         null_v8 = llvm_dialect.insertelement(
             null_v8, zero_i32, _raw(arith.constant(i, type=T.i32)))
-    _rocdl.tensor_load_to_lds(s_g0, s_g1, null_v4, null_v4, null_v8, 0)
+    rocdl.tensor_load_to_lds(s_g0, s_g1, null_v4, null_v4, null_v8, 0)
     _sched_barrier(0)
 
 
@@ -462,9 +459,9 @@ def _atom_exp_f32(src, bank):
 
     _sched_barrier(0)
     """v_exp_f32 = 2^x via rocdl.exp2 — maps directly to hardware."""
-    from flydsl._mlir.dialects import rocdl as _rocdl
+    from flydsl._mlir.dialects import rocdl as _rocdl_hw
     f32 = ir.F32Type.get()
-    result = _rocdl.exp2(f32, src)
+    result = _rocdl_hw.exp2(f32, src)
     banked = set_vgpr_bank(result, bank)
     _sched_barrier(0)
 
@@ -546,9 +543,8 @@ def _atom_permlanex16(src, s_sel0, s_sel1, bank):
     _sched_barrier(0)
     i32_ty = ir.IntegerType.get_signless(32)
     f32_ty = ir.F32Type.get()
-    from flydsl._mlir.dialects import rocdl as _rocdl
     src_i32 = llvm_dialect.bitcast(i32_ty, src)
-    r = _rocdl.permlanex16(i32_ty, src_i32, src_i32, s_sel0, s_sel1,
+    r = rocdl.permlanex16(i32_ty, src_i32, src_i32, s_sel0, s_sel1,
                            False, False)
     r_f32 = llvm_dialect.bitcast(f32_ty, r)
     # Use bank+2 so tmps[1] is in a DIFFERENT bank from tmps[0] (which is in `bank`).
@@ -613,15 +609,13 @@ def _atom_cvt_pk_bf16_f32(a, bank):
 def _atom_s_wait_dscnt(cnt):
 
     _sched_barrier(0)
-    from flydsl._mlir.dialects import rocdl as _rocdl
-    _rocdl.s_wait_dscnt(cnt)
+    rocdl.s_wait_dscnt(cnt)
     _sched_barrier(0)
 
 
 def _atom_s_wait_tensorcnt(cnt):
     _sched_barrier(0)
-    from flydsl._mlir.dialects import rocdl as _rocdl
-    _rocdl.s_wait_tensorcnt(cnt)
+    rocdl.s_wait_tensorcnt(cnt)
     _sched_barrier(0)
 
 

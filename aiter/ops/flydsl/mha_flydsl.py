@@ -82,13 +82,13 @@ def _ensure_kernel(is_causal: bool, return_lse: bool = False):
 
     @flyc.jit
     def _launch(
-        ptr_O: fx.Tensor,
-        ptr_Q: fx.Tensor,
-        ptr_K: fx.Tensor,
-        ptr_V: fx.Tensor,
-        ptr_LSE: fx.Tensor,
-        ptr_cu_seqlens_q: fx.Tensor,
-        ptr_cu_seqlens_k: fx.Tensor,
+        ptr_O: fx.Pointer,
+        ptr_Q: fx.Pointer,
+        ptr_K: fx.Pointer,
+        ptr_V: fx.Pointer,
+        ptr_LSE: fx.Pointer,
+        ptr_cu_seqlens_q: fx.Pointer,
+        ptr_cu_seqlens_k: fx.Pointer,
         scalar_f: fx.Float32,
         stride_q_seq: fx.Int32,
         stride_k_seq: fx.Int32,

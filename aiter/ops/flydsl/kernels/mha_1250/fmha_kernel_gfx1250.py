@@ -53,9 +53,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl._mlir.dialects import rocdl as _rocdl
 from flydsl._mlir.dialects import scf
-from flydsl._mlir.dialects import vector as vector_dialect
 from flydsl.expr import arith, buffer_ops, gpu, rocdl, vector
 from flydsl.expr.primitive import const_expr
 from flydsl.expr.rocdl import tdm_ops
@@ -388,7 +386,6 @@ def _tdm_load_v_only(
     """
     from flydsl.expr.arith import _to_raw
 
-    i32 = ir.IntegerType.get_signless(32)
     i64 = ir.IntegerType.get_signless(64)
 
     _V_CONFIG_BF16 = (1 << 16) | _V_TDM_CONFIG
@@ -441,7 +438,6 @@ def _manual_load_k_to_lds(
     """
     from flydsl._mlir.dialects import fly as _fly_d
 
-    i32 = ir.IntegerType.get_signless(32)
     i64 = ir.IntegerType.get_signless(64)
     v4i32_ty = ir.VectorType.get([4], i32)
     glb_ptr_type = ir.Type.parse("!llvm.ptr<1>")
@@ -511,7 +507,6 @@ def _manual_load_v_to_lds(
     """
     from flydsl._mlir.dialects import fly as _fly_d
 
-    i32 = ir.IntegerType.get_signless(32)
     i64 = ir.IntegerType.get_signless(64)
     v4i32_ty = ir.VectorType.get([4], i32)
     glb_ptr_type = ir.Type.parse("!llvm.ptr<1>")
@@ -659,13 +654,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def fmha_fwd_kernel(
-        ptr_O: fx.Tensor,
-        ptr_Q: fx.Tensor,
-        ptr_K: fx.Tensor,
-        ptr_V: fx.Tensor,
-        ptr_LSE: fx.Tensor,
-        ptr_cu_seqlens_q: fx.Tensor,
-        ptr_cu_seqlens_k: fx.Tensor,
+        ptr_O: fx.Pointer,
+        ptr_Q: fx.Pointer,
+        ptr_K: fx.Pointer,
+        ptr_V: fx.Pointer,
+        ptr_LSE: fx.Pointer,
+        ptr_cu_seqlens_q: fx.Pointer,
+        ptr_cu_seqlens_k: fx.Pointer,
         scalar_f: fx.Float32,
         stride_q_seq: fx.Int32,
         stride_k_seq: fx.Int32,
@@ -703,8 +698,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         stride_v_head = _to_raw(stride_v_head)
         stride_o_head = _to_raw(stride_o_head)
         gqa = _to_raw(gqa)
-        max_seqlen_q_raw = _to_raw(max_seqlen_q)
-        max_seqlen_k_raw = _to_raw(max_seqlen_k)
 
         # Per-head byte strides are now runtime parameters (stride_q/k/v/o_head).
         # actual_q_len / actual_kv_len are derived later from cu_seqlens (THD).
@@ -716,21 +709,17 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         # ================================================================
     
         _setreg(2074, 2)   # WAVE_SCHED_MODE = 2
-        _rocdl.s_nop(0)
+        rocdl.s_nop(0)
     
         tx = arith.index_cast(T.i32, gpu.thread_id("x"))
         lane_id = arith.andi(tx, arith.constant(31, type=T.i32))
         wave_id = arith.shrui(tx, arith.constant(5, type=T.i32))
     
-        # bx = arith.index_cast(T.i32, gpu.block_id("y"))
-        # by = arith.index_cast(T.i32, gpu.block_id("x"))
-        # bz = arith.index_cast(T.i32, gpu.block_id("z"))
     
     
         # Grid layout: [B, num_m, H] — batch on x, m-block on y, head on z.
         # Software XCD remap (HipKittens style):
         #   flat wgid = raw_x + gdx*(raw_y + gdy*raw_z)
-        #   new_wgid  = (wgid % NUM_XCDS) * (NUM_WGS / NUM_XCDS) + wgid / NUM_XCDS
         # This converts hardware round-robin XCD assignment to chunked assignment:
         #   XCD i gets wgids [i*(NUM_WGS/8) .. (i+1)*(NUM_WGS/8)-1]
         # → workgroups with nearby new_wgid share the same XCD → K/V cache locality.
@@ -748,7 +737,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             arith.muli(arith.muli(_gdx, _gdy), _raw_bz))
         # total workgroups
         _num_wgs = arith.muli(arith.muli(_gdx, _gdy), _gdz)
-        # remap: new = (wgid % 8) * (total/8) + wgid/8
         # Guard: only remap when num_wgs is a positive multiple of NUM_XCDS.
         # Otherwise (num_wgs/8 truncates), the formula maps distinct wgids to
         # the same new_wgid → workgroup collision and skipped tiles.
@@ -964,8 +952,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             q_frags[0] = q_frags_raw[0] + q_frags_raw[1] + [None] * (Q_WMMA_PER_MSB - 2 * _frags_per_bank)
             q_frags[2] = q_frags_raw[2] + q_frags_raw[3] + [None] * (Q_WMMA_PER_MSB - 2 * _frags_per_bank)
     
-            #     from flydsl._mlir.dialects import arith as _qa
-            #             if const_expr(q_frags[_qm][_qf] is not None):
     
             # Head index (for GQA)
             head_index = _phase5_head_index_div_flydsl(by, gqa)
@@ -1111,8 +1097,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # this tile attends to K starting at position
                 #   (actual_kv_len - actual_q_len) + m_start.
                 # So the number of KV tiles needed is:
-                #   ceil(((sk - sq) + (bx+1)*TILE_N) / TILE_N)
-                #   = bx + 1 + ceil((sk - sq) / TILE_N)
                 _sk_sq_diff = arith.subi(actual_kv_len, actual_q_len)
                 _sk_sq_tiles = arith.divui(
                     arith.addi(_sk_sq_diff,
@@ -1751,10 +1735,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _zero_i32 = _to_raw(arith.constant(0, type=T.i32))
 
                 def _mk_zero_v4i32():
-                    return vector_dialect.broadcast(ty['v4i32'], _zero_i32)
+                    return vector.broadcast(ty['v4i32'], _zero_i32)
 
                 def _mk_zero_v8i32():
-                    return vector_dialect.broadcast(ty['v8i32'], _zero_i32)
+                    return vector.broadcast(ty['v8i32'], _zero_i32)
 
                 tdm_state = {
                     'v_g0': _mk_zero_v4i32(),
@@ -1945,10 +1929,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _zero_i32 = _to_raw(arith.constant(0, type=T.i32))
 
                 def _mk_zero_v4i32():
-                    return vector_dialect.broadcast(ty['v4i32'], _zero_i32)
+                    return vector.broadcast(ty['v4i32'], _zero_i32)
 
                 def _mk_zero_v8i32():
-                    return vector_dialect.broadcast(ty['v8i32'], _zero_i32)
+                    return vector.broadcast(ty['v8i32'], _zero_i32)
 
                 tdm_state = {
                     'v_g0': _mk_zero_v4i32(),
@@ -2204,7 +2188,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     _sm = arith.addf(_rsf[_mb], _rsf[_mb + 1])
                     _slo = _to_raw(arith.constant(0x76543210, type=T.i32))
                     _shi = _to_raw(arith.constant(0xfedcba98, type=T.i32))
-                    _pm = _rocdl.permlanex16(ty['f32'], _sm, _sm, _slo, _shi, False, False)
+                    _pm = rocdl.permlanex16(ty['f32'], _sm, _sm, _slo, _shi, False, False)
                     _sf = arith.addf(_sm, _pm)
                     _rsf[_mb] = _sf
                     _rsf[_mb + 1] = _sf
@@ -2212,7 +2196,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _lse_vals = [None] * NUM_MSB
                 for _msb in fx.range_constexpr(NUM_MSB):
                     _mxs = arith.mulf(_lmf[_msb], scalar_f)
-                    _lgs = _rocdl.log(ty['f32'], _rsf[_msb])
+                    _lgs = rocdl.log(ty['f32'], _rsf[_msb])
                     _lse_vals[_msb] = arith.addf(arith.mulf(_lgs, _l2e), _mxs)
 
                 # Store LSE to global: ptr_LSE layout (total_q, nheads) fp32
@@ -2260,7 +2244,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                             _llvm_lse.store(_lse_vals[_msb_lse], _lse_ptr)
                 _obf16 = []
                 for _msb in fx.range_constexpr(NUM_MSB):
-                    _rcp = _rocdl.rcp(ty['f32'], _rsf[_msb])
+                    _rcp = rocdl.rcp(ty['f32'], _rsf[_msb])
                     _rv8 = llvm_dialect.mlir_undef(_v8f32)
                     for _i in fx.range_constexpr(8):
                         _rv8 = llvm_dialect.insertelement(
@@ -2374,10 +2358,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
     
                 _et_z = _to_raw(arith.constant(0, type=T.i32))
                 _et_tdm = {
-                    'v_g0': vector_dialect.broadcast(ty['v4i32'], _et_z),
-                    'v_g1': vector_dialect.broadcast(ty['v8i32'], _et_z),
-                    'k_g0': vector_dialect.broadcast(ty['v4i32'], _et_z),
-                    'k_g1': vector_dialect.broadcast(ty['v8i32'], _et_z),
+                    'v_g0': vector.broadcast(ty['v4i32'], _et_z),
+                    'v_g1': vector.broadcast(ty['v8i32'], _et_z),
+                    'k_g0': vector.broadcast(ty['v4i32'], _et_z),
+                    'k_g1': vector.broadcast(ty['v8i32'], _et_z),
                     'v_salu_queue': [], 'k_salu_queue': [],
                 }
                 _et_o = [[ep_o_tiles[_d][_n] for _n in range(N_PV_WMMA_N)]
@@ -2428,7 +2412,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                                            _et_psp_hi[_rpsm * N_SP_PAIRS + _rpi], _rpsm)
                                for _rpi in fx.range_constexpr(N_SP_PAIRS)]
                     _et_psp.append(_rpairs)
-                _rocdl.s_wait_tensorcnt(0)
+                rocdl.s_wait_tensorcnt(0)
                 rocdl.s_barrier_signal(-1)
                 rocdl.s_barrier_wait(-1)
                 _ep_finish(

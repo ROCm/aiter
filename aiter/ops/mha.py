@@ -2712,7 +2712,7 @@ def flash_attn_varlen_func(
             block_table=block_table, out=out, sink=sink_ptr,
         )
 
-    o = FlashAttnVarlenFunc.apply(
+    return lashAttnVarlenFunc.apply(
         q,
         k,
         v,
@@ -2740,7 +2740,6 @@ def flash_attn_varlen_func(
         how_v3_bf16_cvt,
         sink_ptr,
     )
-    return o
 
 
 def mha_batch_prefill_fake_tensors(

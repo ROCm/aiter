@@ -11,14 +11,12 @@ Reference: BF16_FMHA_FWD_D128_1TG_4W_32mx4_256nx1_cas_brd_rxy.s
 
 from __future__ import annotations
 
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import arith, buffer_ops, gpu, rocdl, vector
+from flydsl.expr import arith, rocdl, vector
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
-from flydsl._mlir.dialects import rocdl as _rocdl
 from fmha_core_loop_gfx1250 import QK_HDIM
 
 # ============================================================================
@@ -240,7 +238,7 @@ def _phase4_q_load_flydsl(lane_id, q_rsrc, stride_q_seq, wave_id, q_tile_offset_
                 voff = bank_voff
             else:
                 voff = _add_nuw(bank_voff, _raw(arith.constant(i * 32, type=T.i32)))
-            loaded = _rocdl.raw_ptr_buffer_load(
+            loaded = rocdl.raw_ptr_buffer_load(
                 vec4i32_ty, q_rsrc, voff, soff_zero, aux_zero)
             bank_loads.append(set_vgpr_bank(loaded, bank))
         rocdl.sched_barrier(0)
@@ -407,7 +405,6 @@ def _qk_wmma_64_flydsl(k_frags, q_frags):
 
 def _causal_mask_flydsl(accs, row_pos, su_col_offset=0):
     """Apply causal mask: if row < col, set to -inf."""
-    from flydsl._mlir.dialects import vector as vector_dialect
 
     neg_inf_raw = _raw(arith.constant(float('-inf'), type=T.f32))
 
@@ -419,11 +416,11 @@ def _causal_mask_flydsl(accs, row_pos, su_col_offset=0):
 
         for i in fx.range_constexpr(8):
             col = col_base + i
-            elem = vector_dialect.extract(acc, [], static_position=[i])
+            elem = vector.extract(acc, [], static_position=[i])
             cmp = _raw(arith.cmpi(arith.CmpIPredicate.slt, row_pos,
                                    arith.constant(col, type=T.i32)))
             masked = llvm_dialect.select(cmp, neg_inf_raw, elem)
-            acc = vector_dialect.insert(masked, acc, [], static_position=[i])
+            acc = vector.insert(masked, acc, [], static_position=[i])
 
         accs[key] = set_vgpr_bank(acc, bank)
     return accs
@@ -438,7 +435,6 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
 
     Returns (row_max, row_sum).
     """
-    from flydsl._mlir.dialects import vector as vector_dialect
 
     f32 = ir.F32Type.get()
     neg_inf_raw = _raw(arith.constant(float('-inf'), type=T.f32))
@@ -458,7 +454,7 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
         for key in tiles_by_bank[bank]:
             acc = accs[key]
             for i in fx.range_constexpr(8):
-                elem = vector_dialect.extract(acc, [], static_position=[i])
+                elem = vector.extract(acc, [], static_position=[i])
                 running_max = arith.maxnumf(running_max, elem)
         max_per_bank[bank] = set_vgpr_bank(running_max, bank)
         rocdl.sched_barrier(0)
@@ -466,7 +462,7 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
     # ---- Cross-lane permlanex16 + cross-bank max → global_max ----
     for bank in fx.range_constexpr(4):
         val = max_per_bank[bank]
-        xchg = _rocdl.permlanex16(f32, val, val, s_zero, s_zero, False, False)
+        xchg = rocdl.permlanex16(f32, val, val, s_zero, s_zero, False, False)
         max_per_bank[bank] = set_vgpr_bank(arith.maxnumf(val, xchg), bank)
 
     cross01 = arith.maxnumf(max_per_bank[0], max_per_bank[1])
@@ -483,9 +479,10 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
         for key in tiles_by_bank[bank]:
             acc = accs[key]
             for i in fx.range_constexpr(8):
-                elem = vector_dialect.extract(acc, [], static_position=[i])
+                elem = vector.extract(acc, [], static_position=[i])
                 x = llvm_dialect.intr_fma(elem, scale_b, neg_ms)
-                exp_val = _rocdl.exp2(f32, x)
+                from flydsl._mlir.dialects import rocdl as _rocdl_hw
+                exp_val = _rocdl_hw.exp2(f32, x)
                 running_sum = arith.addf(running_sum, exp_val)
         row_sum[bank] = set_vgpr_bank(running_sum, bank)
         rocdl.sched_barrier(0)
@@ -550,7 +547,7 @@ def _split_i64_to_lo_hi(val_i64):
 
 
 def _compute_k_global_addr(arg_K, k_offset, wave_id, stride_k_32):
-    from flydsl._mlir.dialects import fly as _fly_d, arith as std_arith
+    from flydsl._mlir.dialects import fly as _fly_d
     from flydsl.expr.arith import _to_raw
 
     i64 = ir.IntegerType.get_signless(64)
@@ -570,7 +567,7 @@ def _compute_k_global_addr(arg_K, k_offset, wave_id, stride_k_32):
 
 
 def _compute_v_global_addr(arg_V, v_offset, wave_id, stride_v_32):
-    from flydsl._mlir.dialects import fly as _fly_d, arith as std_arith
+    from flydsl._mlir.dialects import fly as _fly_d
     from flydsl.expr.arith import _to_raw
 
     i64 = ir.IntegerType.get_signless(64)
@@ -705,222 +702,4 @@ def _phase_v_tdm_blk1_flydsl(arg_V, v_offset, v_lds_base, stride_v_seq, stride_v
 
 # ============================================================================
 # Main Kernel
-# ============================================================================
-
-@flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
-def fmha_fwd_prologue(
-    ptr_O: fx.Tensor,
-    ptr_Q: fx.Tensor,
-    ptr_K: fx.Tensor,
-    ptr_V: fx.Tensor,
-    ptr_LSE: fx.Tensor,
-    scalar_f: fx.Float32,
-    q_seq_len: fx.Int32,
-    stride_q_seq: fx.Int32,
-    stride_q_tg: fx.Int32,
-    stride_q_head: fx.Int32,
-    stride_q_batch: fx.Int32,
-    gqa: fx.Int32,
-    stride_k_seq: fx.Int32,
-    stride_k_head: fx.Int32,
-    stride_k_batch: fx.Int32,
-    opt: fx.Int32,
-    lse: fx.Int32,
-    kv_seq_len: fx.Int32,
-    qk_head_dim: fx.Int32,
-    v_head_dim: fx.Int32,
-    q_head_num: fx.Int32,
-    stride_v_seq: fx.Int32,
-    stride_v_head: fx.Int32,
-    stride_v_batch: fx.Int32,
-    stride_o_seq: fx.Int32,
-    stride_o_head: fx.Int32,
-    stride_o_batch: fx.Int32,
-):
-    from flydsl.expr.arith import _to_raw
-
-    scalar_f = _to_raw(scalar_f)
-    q_seq_len = _to_raw(q_seq_len)
-    stride_q_seq = _to_raw(stride_q_seq)
-    stride_q_tg = _to_raw(stride_q_tg)
-    stride_q_head = _to_raw(stride_q_head)
-    stride_q_batch = _to_raw(stride_q_batch)
-    gqa = _to_raw(gqa)
-    stride_k_seq = _to_raw(stride_k_seq)
-    stride_k_head = _to_raw(stride_k_head)
-    stride_k_batch = _to_raw(stride_k_batch)
-    opt = _to_raw(opt)
-    lse = _to_raw(lse)
-    kv_seq_len = _to_raw(kv_seq_len)
-    qk_head_dim = _to_raw(qk_head_dim)
-    v_head_dim = _to_raw(v_head_dim)
-    q_head_num = _to_raw(q_head_num)
-    stride_v_seq = _to_raw(stride_v_seq)
-    stride_v_head = _to_raw(stride_v_head)
-    stride_v_batch = _to_raw(stride_v_batch)
-    stride_o_seq = _to_raw(stride_o_seq)
-    stride_o_head = _to_raw(stride_o_head)
-    stride_o_batch = _to_raw(stride_o_batch)
-
-    # ---- Phase 1-3: Hardware setup + IDs + Q address ----
-
-    _setreg(2074, 2)  # WAVE_SCHED_MODE[1:0] = 2
-    _rocdl.s_nop(0)
-
-    tx = arith.index_cast(T.i32, gpu.thread_id("x"))
-    lane_id = arith.andi(tx, arith.constant(31, type=T.i32))
-    wave_id = arith.shrui(tx, arith.constant(5, type=T.i32))
-
-    bx = arith.index_cast(T.i32, gpu.block_id("y"))
-    by = arith.index_cast(T.i32, gpu.block_id("x"))
-    bz = arith.index_cast(T.i32, gpu.block_id("z"))
-
-    q_offset = arith.addi(
-        arith.addi(arith.muli(bz, stride_q_batch), arith.muli(by, stride_q_head)),
-        arith.muli(bx, stride_q_tg))
-
-    q_nbytes = arith.muli(q_seq_len, stride_q_seq)
-    q_rsrc = buffer_ops.create_buffer_resource(
-        ptr_Q, max_size=False,
-        num_records_bytes=arith.index_cast(T.index, q_nbytes))
-
-    # ---- Phase 4: Q Load — FlyDSL ----
-
-    q_frags = _phase4_q_load_flydsl(lane_id, _raw(q_rsrc), stride_q_seq, wave_id)
-    rocdl.sched_barrier(0)
-
-    # ---- Phase 5: Head Index Division ----
-
-    head_index = _phase5_head_index_div_flydsl(by, gqa)
-
-    # ---- Phase 6: K/V Base + TDM Descriptors ----
-
-    k_offset = arith.addi(arith.muli(bz, stride_k_batch),
-                           arith.muli(head_index, stride_k_head))
-    v_offset = arith.addi(arith.muli(bz, stride_v_batch),
-                           arith.muli(head_index, stride_v_head))
-
-    k_lds_base, v_lds_base = _phase6_compute_lds_offsets(wave_id)
-
-    # ---- Phase 7/8: Softmax Init + O Zero — FlyDSL ----
-
-    _row_max_init, _row_sum_init = _phase7_softmax_init_flydsl()
-    _o_accs = _phase8_zero_o_accum_flydsl()
-
-    # ---- Phase 9: K Addr Gen + TDM + LDS Load + QK WMMA ----
-
-    rocdl.sched_barrier(0)
-    k_addrs = _phase9a_k_lds_addr_gen(lane_id, wave_id)
-    _phase9b_v_lds_addr_gen(lane_id, wave_id)
-
-    stride_k_32 = arith.muli(arith.constant(32, type=T.i32), stride_k_seq)
-    rocdl.sched_barrier(0)
-
-    # ---- Phase 9c-0: K TDM pair 0 (tiles 0+1) ----
-
-    k_dgroup1, k_addr_i64, stride_adv_i64 = _k_tdm_setup(
-        ptr_K, k_offset, stride_k_seq, stride_k_32, wave_id)
-    lds_off_0 = _raw(k_lds_base)
-    lds_off_1 = _raw(arith.addi(k_lds_base, arith.constant(K_SU1_OFFSET, type=T.i32)))
-    next_addr = _k_tdm_issue_pair(
-        k_dgroup1, k_addr_i64, stride_adv_i64, lds_off_0, lds_off_1, wait_count=1)
-
-    # ---- Phase 9d: K ds_load SU0+SU1 + WMMA (64 WMMAs, tile_n=128) ----
-
-    rocdl.sched_barrier(0)
-    k_frags = _phase9d_k_lds_load_flydsl(k_addrs, lds_offset=0)
-    accs = _qk_wmma_64_flydsl(k_frags, q_frags)
-    rocdl.sched_barrier(0)
-
-    # ---- Phase 11: V TDM Block 0 — FlyDSL ----
-
-    stride_v_32 = arith.muli(arith.constant(32, type=T.i32), stride_v_seq)
-    rocdl.sched_barrier(0)
-    _phase_first_v_tdm_flydsl(ptr_V, v_offset, v_lds_base, stride_v_seq, stride_v_32, wave_id)
-    rocdl.sched_barrier(0)
-
-    # ---- Softmax — FlyDSL (tile_n=128, single accs) ----
-    log2e = arith.constant(1.4426950408889634, type=T.f32)
-    softmax_scale_raw = arith.mulf(log2e, scalar_f)
-
-    row_max, row_sum = _softmax_complete_flydsl(accs, softmax_scale_raw)
-
-    # N=128: V block 0 already covers all 128 V columns, no block 1 needed
-
-
-if __name__ == "__main__":
-    import os
-    os.environ.setdefault("FLYDSL_GPU_ARCH", "gfx1250")
-    os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
-    os.environ.setdefault("COMPILE_ONLY", "1")
-
-    import torch
-    arch = os.environ.get("FLYDSL_GPU_ARCH", "gfx1250")
-
-    B, H, S_q, S_kv, D = 1, 1, 128, 256, 128
-    dtype = torch.bfloat16
-
-    Q = torch.zeros(B * H * S_q * D, dtype=dtype)
-    K = torch.zeros(B * H * S_kv * D, dtype=dtype)
-    V = torch.zeros(B * H * S_kv * D, dtype=dtype)
-    O = torch.zeros(B * H * S_q * D, dtype=dtype)
-    LSE = torch.zeros(B * H * S_q, dtype=torch.float32)
-
-    stride_q_seq = D
-    stride_q_head = S_q * D
-    stride_q_batch = H * S_q * D
-    stride_q_tg = stride_q_batch
-    stride_k_seq = D
-    stride_k_head = S_kv * D
-    stride_k_batch = H * S_kv * D
-    stride_v_seq = D
-    stride_v_head = S_kv * D
-    stride_v_batch = H * S_kv * D
-    stride_o_seq = D
-    stride_o_head = S_q * D
-    stride_o_batch = H * S_q * D
-
-    @flyc.jit
-    def launch_prologue(
-        ptr_O: fx.Tensor, ptr_Q: fx.Tensor, ptr_K: fx.Tensor,
-        ptr_V: fx.Tensor, ptr_LSE: fx.Tensor,
-        scalar_f: fx.Float32, q_seq_len: fx.Int32,
-        stride_q_seq: fx.Int32, stride_q_tg: fx.Int32,
-        stride_q_head: fx.Int32, stride_q_batch: fx.Int32,
-        gqa: fx.Int32,
-        stride_k_seq: fx.Int32, stride_k_head: fx.Int32,
-        stride_k_batch: fx.Int32,
-        opt: fx.Int32, lse: fx.Int32,
-        kv_seq_len: fx.Int32, qk_head_dim: fx.Int32,
-        v_head_dim: fx.Int32, q_head_num: fx.Int32,
-        stride_v_seq: fx.Int32, stride_v_head: fx.Int32,
-        stride_v_batch: fx.Int32,
-        stride_o_seq: fx.Int32, stride_o_head: fx.Int32,
-        stride_o_batch: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        fmha_fwd_prologue(
-            ptr_O, ptr_Q, ptr_K, ptr_V, ptr_LSE,
-            scalar_f, q_seq_len,
-            stride_q_seq, stride_q_tg, stride_q_head, stride_q_batch,
-            gqa,
-            stride_k_seq, stride_k_head, stride_k_batch,
-            opt, lse,
-            kv_seq_len, qk_head_dim, v_head_dim, q_head_num,
-            stride_v_seq, stride_v_head, stride_v_batch,
-            stride_o_seq, stride_o_head, stride_o_batch,
-        ).launch(grid=(1, H, B), block=(BLOCK_SIZE, 1, 1), stream=stream)
-
-    launch_prologue(
-        O, Q, K, V, LSE,
-        1.0 / (D ** 0.5),
-        S_q,
-        stride_q_seq, stride_q_tg, stride_q_head, stride_q_batch,
-        1,
-        stride_k_seq, stride_k_head, stride_k_batch,
-        0, 0,
-        S_kv, D, D, H,
-        stride_v_seq, stride_v_head, stride_v_batch,
-        stride_o_seq, stride_o_head, stride_o_batch,
-    )
 
