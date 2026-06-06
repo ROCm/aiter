@@ -24,14 +24,11 @@ from fmha_schedule_gfx1250 import (
 _P2_BASE  = 5   # run_id offset for PART2 pkfma (rid 5..8 → MSB 0..3)
 _EXP_BASE = 19  # token base for EXP_Mx (19..22 → MSB 0..3, draws from pair_exp)
 
-import flydsl.compiler as flyc
-import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import vector as vector_dialect
-from flydsl.expr import arith, gpu, rocdl, vector
-from flydsl.expr import math as fx_math
+from flydsl.expr import arith, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.expr.primitive import const_expr, range_constexpr
 
@@ -96,7 +93,6 @@ DSWAIT_OCCUPY_WHOLE_WMMA = 1
 WAIT_DSCNT0 = 0
 TDM_ALL_WAVES = 1
 BARRIER_SIGNAL_AHEAD = 0
-# BARRIER_SIGNAL_AHEAD = 3
 TDM_LOADS_PER_STAGE = 2
 TDM_WAIT_CNT = TDM_LOADS_PER_STAGE * 2  # total loads across 2 stages
 QK_WMMA_INTERLEAVE = 1
@@ -186,7 +182,6 @@ def _sched_barrier(mask=0):
 
     mask=0: barrier for ALL instruction types (VMEM, VALU, LDS, SALU, etc.).
     """
-    i32_ty = ir.IntegerType.get_signless(32)
     mask_val = _raw(arith.constant(mask, type=T.i32))
     llvm_dialect.call_intrinsic(
         None, "llvm.amdgcn.sched.barrier",
@@ -327,11 +322,6 @@ def _pack_v2bf16_to_v16bf16(ty, v2bf16_list, bank):
 
     Uses vector.shuffle to concatenate pairs pairwise until we reach v16bf16.
     """
-    bf16_ty = ir.BF16Type.get()
-    v4bf16_ty = ir.VectorType.get([4], bf16_ty)
-    v8bf16_ty = ir.VectorType.get([8], bf16_ty)
-    v16bf16_ty = ir.VectorType.get([16], bf16_ty)
-
     # Stage 1: 8 v2bf16 → 4 v4bf16
     v4s = []
     for i in range_constexpr(4):
@@ -429,12 +419,10 @@ def _atom_tdm_load(ty, s_g0, s_g1):
     _sched_barrier(0)
 
 
-
 def _atom_tdm_addr_inc(s_g0_2, s_inc_bytes):
 
     _asm_void("s_lshl2_add_u32 $0, $1, $0",
               [s_g0_2, s_inc_bytes], "=s,s,0")
-
 
 
 def _atom_tdm_addr_carry(s_g0_3):
@@ -442,17 +430,14 @@ def _atom_tdm_addr_carry(s_g0_3):
     _asm_void("s_add_co_ci_u32 $0, $0, 0", [s_g0_3], "=s,0")
 
 
-
 def _atom_tdm_dim1_dec(s_g1_2, dec_amount):
 
     _asm_void(f"s_sub_co_i32 $0, $0, {dec_amount}", [s_g1_2], "=s,0")
 
 
-
 def _atom_tdm_dim1_clamp(s_g1_2):
 
     _asm_void("s_max_i32 $0, $0, 0", [s_g1_2], "=s,0")
-
 
 
 def _atom_tdm_next_lds_addr(s_lds_part_offset, next_offset):
@@ -467,7 +452,6 @@ def _atom_tdm_next_lds_addr(s_lds_part_offset, next_offset):
 def _atom_tdm_set_lds_addr(s_g0, s_addr):
 
     _asm_void("s_mov_b32 $0, $1", [s_g0, s_addr], "=s,s")
-
 
 
 # --- Scalar Softmax VALU (f32) ---
@@ -490,8 +474,7 @@ def _atom_exp_f32(src, bank):
 def _atom_mul_f32(src0, src1, bank):
 
     _sched_barrier(0)
-    from flydsl._mlir.dialects import arith as arith_dialect
-    result = arith_dialect.mulf(src0, src1)
+    result = arith.mulf(src0, src1)
     banked = set_vgpr_bank(result, bank)
     _sched_barrier(0)
 
@@ -532,8 +515,7 @@ def _atom_mov_b32(src, bank):
 def _atom_add_f32(src0, src1, bank):
 
     _sched_barrier(0)
-    from flydsl._mlir.dialects import arith as arith_dialect
-    r = arith_dialect.addf(src0, src1)
+    r = arith.addf(src0, src1)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
 
@@ -596,8 +578,7 @@ def _atom_pk_add_f32(a, b, bank):
 
     """v_pk_add_f32 via arith.addf on v2f32."""
     _sched_barrier(0)
-    from flydsl._mlir.dialects import arith as arith_dialect
-    r = arith_dialect.addf(a, b)
+    r = arith.addf(a, b)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
 
@@ -608,8 +589,7 @@ def _atom_pk_mul_f32(a, b, bank):
 
     """v_pk_mul_f32 via arith.mulf on v2f32."""
     _sched_barrier(0)
-    from flydsl._mlir.dialects import arith as arith_dialect
-    r = arith_dialect.mulf(a, b)
+    r = arith.mulf(a, b)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
 
@@ -620,9 +600,8 @@ def _atom_cvt_pk_bf16_f32(a, bank):
 
     """v_cvt_pk_bf16_f32 via arith.truncf v2f32 → v2bf16."""
     _sched_barrier(0)
-    from flydsl._mlir.dialects import arith as arith_dialect
     v2bf16_ty = ir.VectorType.get([2], ir.BF16Type.get())
-    r = arith_dialect.truncf(v2bf16_ty, a)
+    r = arith.truncf(v2bf16_ty, a)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
 
@@ -639,13 +618,11 @@ def _atom_s_wait_dscnt(cnt):
     _sched_barrier(0)
 
 
-
 def _atom_s_wait_tensorcnt(cnt):
     _sched_barrier(0)
     from flydsl._mlir.dialects import rocdl as _rocdl
     _rocdl.s_wait_tensorcnt(cnt)
     _sched_barrier(0)
-
 
 
 def _atom_wgp_barrier():
@@ -654,9 +631,6 @@ def _atom_wgp_barrier():
     rocdl.s_barrier_signal(-1)
     rocdl.s_barrier_wait(0xffff)
     _sched_barrier(0)
-
-
-
 
 
 # ============================================================================
@@ -725,7 +699,6 @@ def _build_pv_wmma_schedule(blk, su):
     two sibling sp_msbs (2*m_tile and 2*m_tile+1) along K_pv (= N_qk).
     """
     sp_pingpong = blk % 2
-    v_pingpong = su % 2
     sp_off = sp_pingpong * VPS_MSB_SP + 8 * su
 
     schedule = []
@@ -1473,7 +1446,6 @@ def _cl_su_v3_stage(
     using per-MSB softmax budgets from ALU_CNT_STAGE tables.
     """
     has_tdm = tdm_type != KV_NONE
-    softmax_stage = (stage + 4) % ALU_STAGES
 
     wmma_schedule = _build_qk_wmma_schedule(gemm_blk, gemm_su)
 
@@ -1675,8 +1647,7 @@ def _cl_su_v3_stage_gemm2(
         _ed_v8 = _o_rescale_ed_v8[d_msb]
         if _ed_v8 is None:
             return
-        from flydsl._mlir.dialects import arith as _o_arith
-        o_tiles[d_msb][n] = _o_arith.mulf(o_tiles[d_msb][n], _ed_v8)
+        o_tiles[d_msb][n] = arith.mulf(o_tiles[d_msb][n], _ed_v8)
 
     if const_expr(stage == 0):
         _sched_barrier(0)
@@ -1725,7 +1696,6 @@ def _cl_su_v3_stage_gemm2(
                 _sched_barrier(0)
 
         if const_expr(tdm_barrier and gemm_idx == PV_GEMM_INST_COUNT - BARRIER_SIGNAL_AHEAD - 1):
-            # _atom_s_wait_tensorcnt(TDM_WAIT_CNT)
             _atom_s_wait_tensorcnt(4)
             rocdl.s_barrier_signal(-1)
 
@@ -1816,7 +1786,6 @@ def _cl_su_v3_stage_gemm2(
         _sched_barrier(0)
 
     return o_tiles, kv_tiles_next
-
 
 
 # ============================================================================

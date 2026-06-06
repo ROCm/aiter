@@ -771,7 +771,6 @@ def save_schedule_to_csv(
     filename: str,
 ) -> None:
     """Export GEMM1+GEMM2 schedules to a CSV file for manual editing."""
-    import csv as _csv
     with open(filename, 'w', newline='') as f:
         f.write('# FMHA schedule — edit tokens column, then reload with parse_schedule_from_csv\n')
         f.write('# Token names: ' + '  '.join(
@@ -844,28 +843,9 @@ def parse_schedule_from_csv(filename: str):
     return g1, g2
 
 
-# ---------------------------------------------------------------------------
-# CSV override: rename schedule_g2_ref.csv to schedule_g2_override.csv to
-# activate.  This lets manual CSV edits take effect without touching Python.
-# NOTE: pair_exp (EXP tokens) REQUIRES the corresponding MSB's P2 pkfma ops
-# to have run first (they write sp_pairs[] which pair_exp reads). EXP in
-# stages 0-1 WILL CRASH because pkfma doesn't start until stage 2.
-# ---------------------------------------------------------------------------
-# import os as _os
-# print_schedule(GEMM2_SCHEDULE, 'GEMM2_SCHEDULE_PRE', _PV_GEMM_INST_COUNT)
-# _g2_csv = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'schedule_g2_ref.csv')
-# if _os.path.exists(_g2_csv):
-#     _, _g2_override = parse_schedule_from_csv(_g2_csv)
-#     if any(_g2_override):          # at least one row was provided
-#         GEMM2_SCHEDULE = _g2_override
-
-
 if __name__ == '__main__':
     validate_schedule(GEMM1_SCHEDULE, 'GEMM1')
     validate_schedule(GEMM2_SCHEDULE, 'GEMM2')
     print_schedule(GEMM1_SCHEDULE, 'GEMM1_SCHEDULE', _GEMM_INST_COUNT)
     print_schedule(GEMM2_SCHEDULE, 'GEMM2_SCHEDULE', _PV_GEMM_INST_COUNT)
     print(f"\nTotal rows: {len(GEMM1_SCHEDULE)+len(GEMM2_SCHEDULE)}")
-
-    # Uncomment to export default schedule as CSV for manual editing:
-    # save_schedule_to_csv(GEMM1_SCHEDULE, GEMM2_SCHEDULE, 'schedule_default.csv')
