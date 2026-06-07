@@ -169,10 +169,23 @@ def main():
 
     os.environ["AITER_GROUPED_GEMM_NAIVE"] = "1" if args.naive else "0"
 
-    # Stub the MI450 GEMM (unless --real-gemm), then import the function under
-    # test. With --real-gemm the genuine gfx1250 stage1/stage2 kernels run, so
-    # the grouped GEMMs show up in the per-kernel breakdown (gfx1250 HW only).
-    if not args.real_gemm:
+    # Decide whether to run the real grouped GEMMs or the no-op stub.
+    # On real gfx1250/MI450 HW the genuine stage1/stage2 kernels can compile and
+    # run, so call the real grouped_gemm (the whole point on this box). The stub
+    # exists only for non-gfx1250 boxes (e.g. MI308/gfx942) where the MI450 GEMM
+    # cannot run; there we keep stubbing so the host-side tiny-ops still profile.
+    from aiter.jit.utils.chip_info import get_gfx
+
+    on_gfx1250 = get_gfx() == "gfx1250"
+    real_gemm = args.real_gemm or on_gfx1250
+    if real_gemm and not args.real_gemm:
+        print("[info] detected gfx1250 HW -> running real grouped GEMMs "
+              "(pass --real-gemm explicitly to silence this)")
+
+    # Stub the MI450 GEMM (unless running real GEMMs), then import the function
+    # under test. With real GEMMs the genuine gfx1250 stage1/stage2 kernels run,
+    # so the grouped GEMMs show up in the per-kernel breakdown (gfx1250 HW only).
+    if not real_gemm:
         _install_grouped_gemm_stub()
     import torch
     from aiter import ActivationType, QuantType, dtypes

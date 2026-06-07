@@ -11,6 +11,7 @@ calling convention while the underlying A8W4 GEMM owns TDM/WMMA_SCALE codegen.
 from __future__ import annotations
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -117,27 +118,65 @@ def _make_m_tile_prefix(
     return prefix
 
 
-def _make_m_tile_map(masked_m: torch.Tensor, cfg: _GroupedA8W4Config) -> torch.Tensor:
-    valid_m = masked_m[: cfg.experts].to(dtype=torch.int32)
-    valid_m = valid_m.clamp(min=0, max=cfg.max_m)
-    valid_tiles = (
-        torch.div(
+@functools.cache
+def _get_compiled_m_tile_map():
+    """Compile and cache the FlyDSL m-tile-map packing kernel."""
+    from aiter.ops.flydsl.kernels.moe_m_tile_map import build_moe_m_tile_map_module
+
+    return build_moe_m_tile_map_module()
+
+
+def _make_m_tile_map(
+    masked_m: torch.Tensor,
+    cfg: _GroupedA8W4Config,
+    m_tile_prefix: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Packed grouped-persistent M-tile schedule.
+
+    ``m_tile_map[prefix[e] + j] = e*max_m_tiles + j`` for every valid tile ``j``
+    of expert ``e``.
+
+    AITER_GROUPED_GEMM_NAIVE=1 uses the original host packing (a
+    ``valid_tiles.cpu().tolist()`` device->host sync + Python comprehension,
+    returning an exactly-sized tensor). =0 (default) uses the FlyDSL kernel: it
+    fills a max-sized (``E*max_m_tiles``) buffer driven by ``m_tile_prefix`` with
+    no host sync. The persistent GEMM reads only ``m_tile_map[0 : prefix[E]]``
+    (total tile count comes from ``prefix[E]``), so both forms are equivalent to
+    the consumer.
+    """
+    max_m_tiles = (cfg.max_m + cfg.tile_m - 1) // cfg.tile_m
+
+    if os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1":
+        valid_m = masked_m[:cfg.experts].to(dtype=torch.int32)
+        valid_m = valid_m.clamp(min=0, max=cfg.max_m)
+        valid_tiles = torch.div(
             valid_m + (cfg.tile_m - 1),
             cfg.tile_m,
             rounding_mode="floor",
-        )
-        .cpu()
-        .tolist()
+        ).cpu().tolist()
+        packed = [
+            expert * max_m_tiles + local_tile
+            for expert, count in enumerate(valid_tiles)
+            for local_tile in range(int(count))
+        ]
+        if not packed:
+            packed = [0]
+        return torch.tensor(packed, device=masked_m.device, dtype=torch.int32)
+
+    if m_tile_prefix is None:
+        m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
+    m_tile_map = torch.empty(
+        cfg.experts * max_m_tiles, device=masked_m.device, dtype=torch.int32
     )
-    max_m_tiles = (cfg.max_m + cfg.tile_m - 1) // cfg.tile_m
-    packed = [
-        expert * max_m_tiles + local_tile
-        for expert, count in enumerate(valid_tiles)
-        for local_tile in range(int(count))
-    ]
-    if not packed:
-        packed = [0]
-    return torch.tensor(packed, device=masked_m.device, dtype=torch.int32)
+    launch = _get_compiled_m_tile_map()
+    launch(
+        m_tile_prefix,
+        m_tile_map,
+        int(cfg.experts),
+        int(max_m_tiles),
+        stream=torch.cuda.current_stream(),
+    )
+    return m_tile_map
 
 
 def _check_rank(name: str, tensor: torch.Tensor, rank: int) -> None:
@@ -813,7 +852,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
             m_tile_map = _m_tile_map
             if m_tile_map is None:
-                m_tile_map = _make_m_tile_map(masked_m, cfg)
+                m_tile_map = _make_m_tile_map(masked_m, cfg, m_tile_prefix)
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if use_fused_gemm:
@@ -1034,7 +1073,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
             m_tile_map = _m_tile_map
             if m_tile_map is None:
-                m_tile_map = _make_m_tile_map(masked_m, cfg)
+                m_tile_map = _make_m_tile_map(masked_m, cfg, m_tile_prefix)
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if bias is not None:
