@@ -54,6 +54,12 @@ from .mixed_moe_gemm_dispatch import (
 )
 from .layout_utils import crd2idx, idx2crd, get as layout_get
 
+from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
+from aiter.utility.mx_types import (
+    MxDtypeInt as _D,
+    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
+)
+
 from aiter.ops.flydsl.moe_common import (
     GateMode,
 )  # noqa: F401  re-exported for back-compat
@@ -1901,8 +1907,18 @@ def build_mixed_moe_gemm1_kernel(
 
             _c0_f32 = fx.Float32(0.0).ir_value()
 
-            _fp_headroom = 2 if _need_fp4 else (8 if _need_fp8 else 0)
-            _c_headroom_i32 = fx.Int32(_fp_headroom)
+            # NV ROUND_UP / torchao RCEIL block-scale formula
+            # (``ceil_pow2(amax / max_pos)``); FP8 dtype follows the HW
+            # FP8 variant (gfx942 e4m3fnuz max=240, gfx950+ e4m3fn max=448).
+            _mx_dtype = (
+                _D.FP4_E2M1
+                if _need_fp4
+                else (
+                    (_D.FP8_E4M3_FNUZ if gpu_arch == "gfx942" else _D.FP8_E4M3)
+                    if _need_fp8
+                    else _D.FP4_E2M1
+                )
+            )
 
             if const_expr(_need_sort):
                 (
@@ -1945,16 +1961,16 @@ def build_mixed_moe_gemm1_kernel(
                         peer = local_max.shuffle_xor(off, 64)
                         local_max = local_max.maximumf(peer)
 
-                    max_i32 = local_max.bitcast(T.i32)
-                    # Match fp4_utils.f32_to_e8m0(max_abs / 4): round the
-                    # exponent at the 1.5x threshold before dropping mantissa.
-                    max_rounded = (max_i32 + 0x400000) & fx.Int32(0xFF800000)
-                    exp_field = max_rounded >> 23
-                    # keep raw: no ArithValue/fx signed-integer-max equivalent
-                    e8m0_biased = arith.maxsi(exp_field - _c_headroom_i32, _c0_i32)
+                    # Same formula for FP4 / FP8; only ``max_pos`` differs
+                    # (selected by ``_mx_dtype``).
+                    e8m0_biased = emit_mx_e8m0_scale(
+                        local_max, mode=_DEFAULT_MODE, dtype=_mx_dtype
+                    )
 
-                    quant_exp = 254 - e8m0_biased
-                    quant_scale = arith.bitcast(T.f32, raw_value(quant_exp << 23))
+                    quant_exp = arith.constant(254, type=T.i32) - e8m0_biased
+                    quant_scale = (
+                        quant_exp << arith.constant(23, type=T.i32)
+                    ).bitcast(T.f32)
 
                     if const_expr(_need_fp4):
                         fp4_vals = []
