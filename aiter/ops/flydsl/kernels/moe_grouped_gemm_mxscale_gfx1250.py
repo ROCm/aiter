@@ -3,7 +3,7 @@
 
 """Grouped/masked MoE MXScale GEMM helpers for gfx1250.
 
-Initial A8W4 grouped support reuses the tuned gemm_fp8fp4_gfx1250
+Initial A8W4 grouped support reuses the tuned gemm_mxscale_gfx1250
 compile_a8w4_gemm schedule per expert.  The wrapper keeps the grouped/masked
 calling convention while the underlying A8W4 GEMM owns TDM/WMMA_SCALE codegen.
 """
@@ -24,7 +24,10 @@ from flydsl.expr import arith, buffer_ops, const_expr, gpu
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels.gemm_fp8fp4_gfx1250 import compile_a8w4_gemm, compile_mxfp4_gemm
+from aiter.ops.flydsl.kernels.gemm_mxscale_gfx1250 import (
+    compile_a8w4_gemm,
+    compile_mxfp4_gemm,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 
@@ -150,7 +153,7 @@ def _pack_factors(cfg: _GroupedA8W4Config) -> tuple[int, int]:
 
 
 def _preshuffled_scale_shape(rows: int, k_dim: int, warp_tile: int, tile_k: int) -> tuple[int, int]:
-    # Matches tests.kernels.test_gemm_fp8fp4_gfx1250.preshuffle_e8m0_scale.
+    # Matches tests.kernels.test_gemm_mxscale_gfx1250.preshuffle_e8m0_scale.
     k_scale = int(k_dim) // 32
     scale_k_per_tile = int(tile_k) // 32
     if k_scale % scale_k_per_tile != 0:

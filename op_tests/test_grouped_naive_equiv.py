@@ -47,7 +47,7 @@ def _import():
         flydsl_moe_gather_reduce,
         flydsl_moe_scatter_copy_token,
     )
-    from aiter.fused_moe import _build_route_maps_naive
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import _build_route_maps_naive
 
     return (
         build_route_maps,

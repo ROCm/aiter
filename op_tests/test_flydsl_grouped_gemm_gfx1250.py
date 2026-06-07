@@ -42,6 +42,8 @@ from aiter.fused_moe import (  # noqa: E402
     fused_moe,
     torch_moe_stage1,
     torch_moe_stage2,
+)
+from aiter.ops.flydsl.grouped_moe_gfx1250 import (  # noqa: E402
     _grouped_a8w4_prepare_scale_batch,
 )
 from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402
@@ -54,6 +56,9 @@ pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
 SCALE_BLOCK = 32
 DEFAULT_SCALE_BYTE = 127  # e8m0 byte for 2^0 = 1.0
+VERIFY_TOL_A4W4 = 0.02
+VERIFY_TOL_A8W4 = 0.02
+VERIFY_TOL_ALL_ONES = 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -380,17 +385,16 @@ def _sanity_check(
     layout: str = "gguu",
     activation: ActivationType = ActivationType.Swiglu,
     swiglu_limit: float = 7.0,
-    tol: float = 0.4,
+    tol: float = VERIFY_TOL_A4W4,
     all_ones: bool = False,
 ) -> None:
     """Tiny shape; compare grouped FlyDSL vs PyTorch fp32 ref.
 
-    ``tol=0.4`` is the expected rel_l2 ceiling on **random uint8 mxfp4
+    ``tol=0.02`` is the expected rel_l2 ceiling on **random uint8 mxfp4
     weights + random hidden_states**. fp32 reference + mxfp4/mxfp8
-    quantised path naturally diverge at this scale; on real model
-    weights (smoother distributions) the gap drops to ~0.02. The point
-    of this sanity is to catch *catastrophic* regressions (rel_l2 >> 1
-    means kernel is doing the wrong thing entirely).
+    quantised path naturally diverge at this scale, but the grouped path
+    should stay close when it uses the same MXFP4 quantization contract as
+    the reference.
     """
     _require_gfx1250()
     out, ref = _run_grouped_via_fused_moe(
@@ -493,8 +497,14 @@ def main() -> None:
 
     if args.scenario == "verify":
         activation = ActivationType.Swiglu if args.act == "swiglu" else ActivationType.Silu
+        tol = (
+            VERIFY_TOL_ALL_ONES
+            if args.all_ones
+            else VERIFY_TOL_A8W4 if args.data_format == "a8w4"
+            else VERIFY_TOL_A4W4
+        )
         _sanity_check(args.data_format, layout=args.layout,
-                      tol=0.01 if args.all_ones else 0.01,
+                      tol=tol,
                       activation=activation,
                       swiglu_limit=args.swiglu_limit,
                       all_ones=args.all_ones)

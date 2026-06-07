@@ -61,7 +61,7 @@ def main():
     from torch.utils._python_dispatch import TorchDispatchMode
     from aiter import ActivationType, QuantType, dtypes
     from aiter.ops.flydsl.moe_common import GateMode
-    from aiter.fused_moe import _maybe_grouped_gfx1250_a8w4_moe
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import _maybe_grouped_gfx1250_a8w4_moe
 
     class OpSourceTracer(TorchDispatchMode):
         def __init__(self):

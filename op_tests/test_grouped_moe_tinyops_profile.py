@@ -3,7 +3,7 @@
 
 """Profile the host-side "tiny operators" in the grouped gfx1250 MoE path.
 
-``aiter/fused_moe.py::_maybe_grouped_gfx1250_a8w4_moe`` is the gfx1250/MI450
+``aiter/ops/flydsl/grouped_moe_gfx1250.py::_maybe_grouped_gfx1250_a8w4_moe`` is the gfx1250/MI450
 grouped a8w4/a4w4 path. The two heavy grouped GEMMs (stage1/stage2) are
 MI450-only and cannot compile/run on MI308 (gfx942). This test STUBS those two
 GEMMs out (without modifying fused_moe.py) so the *rest* of the function -- the
@@ -165,7 +165,7 @@ def main():
     import torch
     from aiter import ActivationType, QuantType, dtypes
     from aiter.ops.flydsl.moe_common import GateMode
-    from aiter.fused_moe import _maybe_grouped_gfx1250_a8w4_moe
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import _maybe_grouped_gfx1250_a8w4_moe
     from aiter.test_common import run_perftest
 
     device = "cuda"
