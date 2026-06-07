@@ -3,7 +3,7 @@
 
 """Grouped/masked MoE MXScale GEMM helpers for gfx1250.
 
-Initial A8W4 grouped support reuses the tuned gemm_fp8fp4_gfx1250
+Initial A8W4 grouped support reuses the tuned gemm_mxscale_gfx1250
 compile_a8w4_gemm schedule per expert.  The wrapper keeps the grouped/masked
 calling convention while the underlying A8W4 GEMM owns TDM/WMMA_SCALE codegen.
 """
@@ -24,7 +24,10 @@ from flydsl.expr import arith, buffer_ops, const_expr, gpu
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels.gemm_fp8fp4_gfx1250 import compile_a8w4_gemm, compile_mxfp4_gemm
+from aiter.ops.flydsl.kernels.gemm_mxscale_gfx1250 import (
+    compile_a8w4_gemm,
+    compile_mxfp4_gemm,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 
@@ -150,7 +153,7 @@ def _pack_factors(cfg: _GroupedA8W4Config) -> tuple[int, int]:
 
 
 def _preshuffled_scale_shape(rows: int, k_dim: int, warp_tile: int, tile_k: int) -> tuple[int, int]:
-    # Matches tests.kernels.test_gemm_fp8fp4_gfx1250.preshuffle_e8m0_scale.
+    # Matches tests.kernels.test_gemm_mxscale_gfx1250.preshuffle_e8m0_scale.
     k_scale = int(k_dim) // 32
     scale_k_per_tile = int(tile_k) // 32
     if k_scale % scale_k_per_tile != 0:
@@ -217,7 +220,12 @@ def _compile_stage1_finalize_act(
     tmp_stride_e = int(max_m) * int(2 * inter_dim)
     out_stride_e = int(max_m) * int(inter_dim)
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    module_name = (
+        f"moe_stage1_finalize_act_{act}_{out_dtype}"
+        f"_e{experts}_m{max_m}_i{inter_dim}_{stage1_weight_layout}"
+    )
+
+    @flyc.kernel(name=module_name, known_block_size=[block_threads, 1, 1])
     def stage1_finalize_act_kernel(
         arg_y: fx.Tensor,
         arg_tmp: fx.Tensor,
@@ -341,7 +349,12 @@ def _compile_stage1_finalize_act_bias(
     out_stride_e = int(max_m) * int(inter_dim)
     bias_stride_e = int(2 * inter_dim)
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    module_name = (
+        f"moe_stage1_finalize_act_bias_{act}_{out_dtype}"
+        f"_e{experts}_m{max_m}_i{inter_dim}_{stage1_weight_layout}"
+    )
+
+    @flyc.kernel(name=module_name, known_block_size=[block_threads, 1, 1])
     def stage1_finalize_act_bias_kernel(
         arg_y: fx.Tensor,
         arg_tmp: fx.Tensor,
@@ -490,6 +503,7 @@ def _compile_base_a8w4_gemm(
     stage1_act: str | None = None,
     epilogue_bias: bool = False,
     stage1_weight_layout: str = "gguu",
+    kernel_tag: str = "gemm",
 ):
     compiler = compile_mxfp4_gemm if cfg.data_format == "fp4" else compile_a8w4_gemm
     return compiler(
@@ -519,6 +533,7 @@ def _compile_base_a8w4_gemm(
         stage1_act=stage1_act,
         stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
+        kernel_tag=kernel_tag,
     )
 
 
@@ -571,13 +586,13 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         fused_n = 2 * cfg.inter_dim if cfg.stage1_weight_layout == "gugu" else cfg.inter_dim
         fused_base = _compile_base_a8w4_gemm(
             K=cfg.model_dim, N=fused_n, cfg=cfg, stage1_act=cfg.act,
-            stage1_weight_layout=cfg.stage1_weight_layout)
+            stage1_weight_layout=cfg.stage1_weight_layout, kernel_tag="gemm1")
         fused_base_bias = _compile_base_a8w4_gemm(
             K=cfg.model_dim, N=fused_n, cfg=cfg,
             stage1_act=cfg.act, epilogue_bias=True,
-            stage1_weight_layout=cfg.stage1_weight_layout)
+            stage1_weight_layout=cfg.stage1_weight_layout, kernel_tag="gemm1_bias")
     raw_base = _compile_base_a8w4_gemm(
-        K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg)
+        K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg, kernel_tag="gemm1_raw")
     finalize_act = _compile_stage1_finalize_act(
         experts=cfg.experts,
         max_m=cfg.max_m,
@@ -738,9 +753,11 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         persistent_workers=persistent_workers, data_format=str(data_format),
     )
     _validate_common(cfg)
-    base = _compile_base_a8w4_gemm(K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg)
+    base = _compile_base_a8w4_gemm(
+        K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, kernel_tag="gemm2")
     base_bias = _compile_base_a8w4_gemm(
-        K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, epilogue_bias=True)
+        K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, epilogue_bias=True,
+        kernel_tag="gemm2_bias")
 
     def launch(y, x, w, scale_x, scale_w, masked_m, max_m_arg, model_dim_arg,
                inter_dim_arg, experts_arg, *, stream=None, _gemm_events=None,
