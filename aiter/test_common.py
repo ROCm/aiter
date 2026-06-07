@@ -89,10 +89,6 @@ def perftest(
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
                 if use_cuda_event:
-                    # Skip the torch.profiler path and return the CUDA-event
-                    # average (us/iter). torch.profiler / ROCTracer can miss
-                    # JIT-dispatched kernels (e.g. FlyDSL hipModuleLaunchKernel),
-                    # making get_trace_perf unreliable for them.
                     return data, avg
 
             with tpf.profile(
