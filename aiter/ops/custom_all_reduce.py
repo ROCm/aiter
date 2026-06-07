@@ -80,6 +80,21 @@ def fused_allreduce_rmsnorm(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def fused_allreduce_rmsnorm_pad(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    reg_ptr: int,
+    reg_bytes: int,
+    use_1stage: bool,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def fused_allreduce_rmsnorm_quant(
     _fa: int,
     inp: torch.Tensor,
@@ -106,6 +121,23 @@ def fused_allreduce_rmsnorm_quant_per_group(
     w: torch.Tensor,
     eps: float,
     group_size: int,
+    reg_ptr: int,
+    reg_bytes: int,
+    use_1stage: bool,
+    bf16_out_ptr: int = 0,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def fused_allreduce_rmsnorm_mxfp4_quant(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    scale_out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
     reg_ptr: int,
     reg_bytes: int,
     use_1stage: bool,
