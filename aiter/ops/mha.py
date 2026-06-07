@@ -422,9 +422,7 @@ def fmha_fwd_with_sink_varlen_asm(
             (total_q, q_head_num, v_head_dim), dtype=q.dtype, device=q.device
         )
 
-    lse = torch.empty(
-        (total_q, q_head_num, 1), dtype=torch.float32, device=q.device
-    )
+    lse = torch.empty((total_q, q_head_num, 1), dtype=torch.float32, device=q.device)
 
     _fmha_fwd_with_sink_varlen_asm(
         q,

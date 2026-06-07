@@ -124,9 +124,7 @@ def _ref_varlen(q, k, v, cu_q, cu_k, *, is_causal: bool, sink: Optional[torch.Te
         k0, k1 = cuk[b], cuk[b + 1]
         if q1 == q0:
             continue
-        ob, lb = _attn_one(
-            q[q0:q1], k[k0:k1], v[k0:k1], is_causal=is_causal, sink=sink
-        )
+        ob, lb = _attn_one(q[q0:q1], k[k0:k1], v[k0:k1], is_causal=is_causal, sink=sink)
         out[q0:q1] = ob
         lse[q0:q1] = lb
     return out, lse
@@ -140,7 +138,9 @@ def make_varlen_packed(
     Uses equal q/k seqlens per batch (standard varlen self-attention).
     """
     torch.manual_seed(seed)
-    cu = torch.tensor([0] + list(torch.tensor(seqlens).cumsum(0).tolist()), dtype=torch.int32)
+    cu = torch.tensor(
+        [0] + list(torch.tensor(seqlens).cumsum(0).tolist()), dtype=torch.int32
+    )
     total = int(cu[-1].item())
     q = torch.randn(total, hq, d, dtype=torch.bfloat16, device=device)
     k = torch.randn(total, hk, d, dtype=torch.bfloat16, device=device)
@@ -164,14 +164,16 @@ def make_varlen_packed(
         # multi-batch, mixed (some unaligned) seqlens
         (64, 8, 1, [128, 256, 384]),
         (128, 8, 1, [128, 256, 384]),
-        (64, 8, 2, [100, 200, 300]),     # unaligned + GQA
+        (64, 8, 2, [100, 200, 300]),  # unaligned + GQA
         (128, 8, 2, [100, 200, 300]),
         # GQA-heavy, larger
         (64, 64, 8, [512, 1024]),
         (128, 64, 4, [512, 1024]),
     ],
 )
-def test_fmha_fwd_with_sink_varlen_asm_correctness(head_dim, hq, hk, seqlens, is_causal):
+def test_fmha_fwd_with_sink_varlen_asm_correctness(
+    head_dim, hq, hk, seqlens, is_causal
+):
     device = "cuda"
     q, k, v, cu = make_varlen_packed(seqlens, hq, hk, head_dim, head_dim, device=device)
     cu_q = cu
@@ -232,11 +234,21 @@ def test_fmha_fwd_with_sink_varlen_asm_perf(head_dim, is_causal):
 
     us = _bench(
         aiter.fmha_fwd_with_sink_varlen_asm,
-        q, k, v, cu, cu, max_seqlen_q, scale, is_causal, False,
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q,
+        scale,
+        is_causal,
+        False,
         sink=sink,
     )
     # Causal FLOPs summed over batches (each ~ 2 * hq * s^2 * 2d / 2).
     flops = sum(2.0 * hq * s * s * (2 * head_dim) / 2.0 for s in seqlens)
     tflops = flops / (us * 1e-6) / 1e12
-    print(f"[perf varlen] d={head_dim} causal={is_causal} seqlens={seqlens}: {us:.1f}us, {tflops:.2f} TFLOPS")
+    print(
+        f"[perf varlen] d={head_dim} causal={is_causal} seqlens={seqlens}: {us:.1f}us, {tflops:.2f} TFLOPS"
+    )
     assert us > 0.0 and math.isfinite(tflops)
