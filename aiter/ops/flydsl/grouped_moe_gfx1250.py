@@ -268,18 +268,24 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     flat_experts = topk_ids.reshape(-1)
     if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
         raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
-    # Size each expert block for the actual busiest expert.
-    counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
-    raw_max_m = int(counts.max().item()) if counts.numel() else 0
-    max_m = raw_max_m
+    # Static upper bound: each token routes at most one row per expert, so no
+    # expert can receive more than token_num rows. Using this avoids the
+    # ``counts.max().item()`` device->host sync that stalls the launch stream
+    # (masked_m from build_route_maps still bounds the real per-expert work).
+    max_m = token_num
     max_m = max(warp_tile_m, ((max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m)
-    _grouped_dbg(f"routing counts done raw_max_m={raw_max_m} max_m={max_m}")
+    _grouped_dbg(f"routing max_m={max_m}")
 
     # Build route maps once. The fast path uses the FlyDSL atomic-scatter kernel;
     # the naive path keeps a deterministic torch fallback for tests/debug.
     _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
-    # masked_m drives the GEMM; counts is only for fallback/debug code.
+    # Per-expert counts are only consumed by the naive epilogues, the doweight
+    # multiply, and the optional dump (masked_m drives the GEMM). Build it only on
+    # the naive path so the fast path skips the bincount (two int reductions + a
+    # host sync); the lazy fallbacks below recompute it if ever needed.
+    counts = None
     if _use_naive:
+        counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
         topids_to_rows, rows_to_tokens, masked_m = _build_route_maps_naive(
             topk_ids, E, max_m
         )
@@ -297,8 +303,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # because the naive epilogues are bounded by per-expert counts.
 
     if data_format == "fp4":
-        # Use the reference MXFP4 quantization contract for a4w4 accuracy.
-        from aiter.ops.quant import per_1x32_f4_quant as _a1_f4_quant
+        # a1 fp4 quant: AITER_GROUPED_GEMM_NAIVE=1 uses the torch reference
+        # per_1x32_f4_quant; =0 (default) uses the fused Triton kernel
+        # per_1x32_f4_quant_triton, which collapses the torch op launch-storm
+        # (the dominant tiny-op hotspot). NOTE: the two are not bit-identical --
+        # their e8m0 block-scale rounding differs by up to 1 exponent step in a
+        # minority of blocks -- so NAIVE on/off differ slightly on the fp4 a1 quant.
+        if _use_naive:
+            from aiter.ops.quant import per_1x32_f4_quant as _a1_f4_quant
+        else:
+            from aiter.ops.quant import per_1x32_f4_quant_triton as _a1_f4_quant
 
         _grouped_dbg("start a1 fp4 quant")
         a1_quant, a1_scale_token = _a1_f4_quant(
@@ -474,8 +488,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 grouped_a2[e, :n].mul_(route_weights[e, :n].view(-1, 1))
 
     if data_format == "fp4":
-        # Keep stage2 quantization on the same contract as stage1.
-        from aiter.ops.quant import per_1x32_f4_quant as _a2_f4_quant
+        # a2 fp4 quant: same NAIVE gating as a1 -- torch reference on NAIVE=1,
+        # fused Triton kernel on NAIVE=0 (default). Not bit-identical (e8m0 scale
+        # rounding differs by <=1 exponent step), so NAIVE on/off differ slightly.
+        if _use_naive:
+            from aiter.ops.quant import per_1x32_f4_quant as _a2_f4_quant
+        else:
+            from aiter.ops.quant import per_1x32_f4_quant_triton as _a2_f4_quant
 
         _grouped_dbg("start a2 fp4 quant")
         a2_quant, a2_scale_token = _a2_f4_quant(

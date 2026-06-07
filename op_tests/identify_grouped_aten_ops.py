@@ -93,40 +93,28 @@ def main():
             gate_mode=GateMode.SEPARATED,
         )
 
-    # warmup (triton compile, caches) so the profiled run is steady-state
+    # warmup (triton compile, caches) so the traced run is steady-state
     for _ in range(3):
         call()
     torch.cuda.synchronize()
 
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True
-    ) as prof:
+    # One traced call: TorchDispatchMode records every aten op with its live
+    # Python stack -> innermost aiter source line.
+    tracer = OpSourceTracer()
+    with tracer:
         call()
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
-    # Aggregate aten ops by (op, innermost aiter source line).
-    agg = {}
-    for ev in prof.events():
-        if not ev.name.startswith("aten::"):
-            continue
-        loc = _innermost_aiter_frame(ev.stack)
-        dev_us = getattr(ev, "self_device_time_total", 0) or getattr(
-            ev, "cuda_time_total", 0
-        )
-        k = (ev.name, loc)
-        a = agg.setdefault(k, [0, 0.0])
-        a[0] += 1
-        a[1] += float(dev_us)
-
-    rows = sorted(agg.items(), key=lambda kv: kv[1][1], reverse=True)
+    # Aggregate by (op, source line), sorted by call count.
+    rows = sorted(tracer.agg.items(), key=lambda kv: kv[1], reverse=True)
     print(
         f"\nmode={args.mode} naive={int(args.naive)}  "
-        f"aten ops attributed to source (sorted by device us)\n"
+        f"aten ops attributed to source (sorted by count)\n"
     )
-    print(f"{'aten op':28} {'count':>5}  {'dev_us':>8}   source")
-    print("-" * 88)
-    for (op, loc), (cnt, us) in rows:
-        print(f"{op:28} {cnt:5d}  {us:8.1f}   {loc}")
+    print(f"{'aten op':28} {'count':>5}   source")
+    print("-" * 80)
+    for (op, loc), cnt in rows:
+        print(f"{op:28} {cnt:5d}   {loc}")
 
 
 if __name__ == "__main__":
