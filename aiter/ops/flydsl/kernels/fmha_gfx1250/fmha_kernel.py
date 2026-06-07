@@ -1080,6 +1080,31 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     )
                     _ptr_z = llvm_dialect.inttoptr(_glbpz, _chunk_addr)
                     llvm_dialect.store(_zero_v4, _ptr_z)
+                # LSE = -inf for seqlen_k==0 rows
+                if const_expr(RETURN_LSE):
+                    from flydsl._mlir.dialects import fly as _fly_zl
+                    from flydsl._mlir.dialects import llvm as _llvm_zl
+
+                    _neg_inf_zl = arith.unwrap(
+                        arith.constant(float("-inf"), type=T.f32)
+                    )
+                    _lse_raw_z = ptr_LSE.__extract_to_ir_values__()[0]
+                    _lse_gp_z = _fly_zl.extract_aligned_pointer_as_index(
+                        _glbpz, _lse_raw_z
+                    )
+                    _lse_base_z = llvm_dialect.ptrtoint(_i64z, _lse_gp_z)
+                    # lse layout: (total_q, nheads), elem_off = tok * nheads + head
+                    _lse_elem_z = arith.addi(
+                        arith.muli(_q_tok_z, _gdz), arith.unwrap(by)
+                    )
+                    _lse_byte_z = arith.muli(
+                        _lse_elem_z,
+                        arith.unwrap(arith.constant(4, type=T.i32)),
+                    )
+                    _lse_byte_z64 = arith.extsi(_i64z, _lse_byte_z)
+                    _lse_addr_z = arith.addi(_lse_base_z, _lse_byte_z64)
+                    _lse_ptr_z = _llvm_zl.inttoptr(_glbpz, _lse_addr_z)
+                    _llvm_zl.store(_neg_inf_zl, _lse_ptr_z)
 
         # Gate the main compute path: need valid Q rows AND non-zero K/V length.
         _kv_nonzero = arith.cmpi(
@@ -3352,11 +3377,11 @@ def flash_attn_varlen_d192_gfx1250(
             device=q.device,
         )
     if return_lse:
-        lse = torch.zeros(
+        lse = torch.empty(
             (total_q_tokens, nheads_q), dtype=torch.float32, device=q.device
         )
     else:
-        lse = torch.zeros(
+        lse = torch.empty(
             (batch, nheads_q, max_seqlen_q), dtype=torch.float32, device=q.device
         )
 
