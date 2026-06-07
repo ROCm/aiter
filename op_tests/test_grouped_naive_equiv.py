@@ -72,9 +72,10 @@ def _make_topk_ids(token_num, topk, E, seed):
     ).to(torch.int32)
 
 
-def _static_max_m(token_num):
-    # Same static upper bound fused_moe uses (token_num rounded up to WARP_TILE_M).
-    return max(WARP_TILE_M, ((token_num + WARP_TILE_M - 1) // WARP_TILE_M) * WARP_TILE_M)
+def _max_m_from_topk_ids(topk_ids, E):
+    counts = torch.bincount(topk_ids.reshape(-1).long(), minlength=E)
+    raw_max_m = int(counts.max().item()) if counts.numel() else 0
+    return max(WARP_TILE_M, ((raw_max_m + WARP_TILE_M - 1) // WARP_TILE_M) * WARP_TILE_M)
 
 
 def _check_maps_equiv(topk_ids, E, max_m):
@@ -157,12 +158,13 @@ def _check_gather_equiv(topk_ids, topk_weight, E, max_m, maps):
     return torch.equal(outs[0], outs[1]), outs
 
 
-def _run_one(token_num, topk, E, seed):
-    topk_ids = _make_topk_ids(token_num, topk, E, seed)
+def _run_one(token_num, topk, E, seed, topk_ids=None):
+    if topk_ids is None:
+        topk_ids = _make_topk_ids(token_num, topk, E, seed)
     gen = torch.Generator(device="cuda").manual_seed(seed + 100)
     w = torch.rand(token_num, topk, generator=gen, device="cuda")
     w = w / w.sum(-1, keepdim=True)
-    max_m = _static_max_m(token_num)
+    max_m = _max_m_from_topk_ids(topk_ids, E)
 
     maps_ok, maps = _check_maps_equiv(topk_ids, E, max_m)
     scat_ok = _check_scatter_equiv(topk_ids, E, max_m, maps)
@@ -191,6 +193,8 @@ def main():
     all_ok = True
     for i, (tn, topk, E) in enumerate(configs):
         all_ok &= _run_one(tn, topk, E, seed=i)
+    skew_topk_ids = torch.zeros((8, 4), dtype=torch.int32, device="cuda")
+    all_ok &= _run_one(8, 4, 8, seed=len(configs), topk_ids=skew_topk_ids)
     print("\nALL PASS (NAIVE 0/1 equivalent)" if all_ok else "\nSOME FAILED")
     sys.exit(0 if all_ok else 1)
 

@@ -16,11 +16,7 @@ from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
-# Opt-in switch for the gfx1250 FlyDSL MoE grouped-GEMM path. When unset (or "0"),
-# the dispatcher skips ``_maybe_grouped_gfx1250_a8w4_moe`` entirely and falls back
-# to the default 2-stage flow. Set ``AITER_USE_GROUPED_GEMM=1`` to enable the
-# grouped-GEMM mode (still subject to the other eligibility checks inside the
-# helper, e.g. dtype / activation / gfx1250 dispatch / FlyDSL availability).
+# Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 
 
@@ -35,9 +31,7 @@ def _grouped_a8w4_preshuffle_e8m0_scale(
     warp_tile: int,
     scale_k_per_tile: int = 4,
 ) -> torch.Tensor:
-    # Batched over the expert axis: scale is (E, rows, k_scale) and the result
-    # is (E, rows // wmma_rep, k_scale * wmma_rep). The preshuffle only touches
-    # the (rows, k_scale) axes, so E rides along as a leading batch dim.
+    # Preshuffle row/k-scale axes; experts stay as the leading batch dim.
     scale = scale.view(torch.uint8).contiguous()
     E, _, k_scale = scale.shape
     wmma_rep = int(warp_tile) // 16
@@ -78,19 +72,7 @@ def _grouped_a8w4_prepare_scale_batch(
 
 
 def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
-    """Pure-torch fallback for ``build_route_maps`` (the atomic FlyDSL kernel).
-
-    Returns the same triple ``(topids_to_rows, rows_to_tokens, masked_m)`` with
-    identical semantics; the only difference is the within-expert ``slot`` order,
-    which is deterministic token-major here (one-hot cumsum) vs. atomic-race in
-    the kernel. Both maps are self-consistent and the grouped GEMM is
-    order-agnostic within an expert, so NAIVE on/off yield identical final output.
-
-      topids_to_rows : (token_num, topk) int32  route -> grouped row
-                       = ``topk_ids[t,k]*max_m + slot``
-      rows_to_tokens : (E*max_m,)        int32  grouped row -> source token (-1 pad)
-      masked_m       : (E,)              int32  rows routed to each expert
-    """
+    """Torch fallback for route -> grouped-row maps."""
     import torch.nn.functional as F
 
     device = topk_ids.device
@@ -188,10 +170,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
     )
     _grouped_dbg("enter grouped helper")
-    # Master opt-in switch: only enter the gfx1250 FlyDSL grouped-GEMM mode
-    # when AITER_USE_GROUPED_GEMM is explicitly enabled. The legacy
-    # AITER_DISABLE_GROUPED_A8W4 kill-switch is still honoured for users who
-    # want to force-disable the path even after opting in.
+    # Main opt-in plus legacy kill switch.
     if not _use_grouped_gemm_enabled():
         _grouped_dbg("AITER_USE_GROUPED_GEMM not enabled; skip grouped mode")
         return None
@@ -216,12 +195,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if gate_mode not in (GateMode.SEPARATED, GateMode.INTERLEAVE):
         _grouped_dbg(f"unsupported gate_mode={gate_mode}")
         return None
-    # Default: derive stage1_weight_layout from gate_mode
-    #   SEPARATED -> GGUU, INTERLEAVE -> GUGU
-    # ``AITER_GROUPED_STAGE1_WEIGHT_LAYOUT={gguu,gugu}`` lets callers override
-    # this when the physical weight layout doesn't match the gate_mode
-    # convention (e.g. running gpt-oss GUGU weights through a SEPARATED
-    # dispatch path for diagnostics, or feeding GGUU weights into INTERLEAVE).
+    # Default layout follows gate_mode; env override is for diagnostics.
     env_stage1_layout = (
         os.environ.get("AITER_GROUPED_STAGE1_WEIGHT_LAYOUT", "").strip().lower()
     )
@@ -237,8 +211,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
     else:
         stage1_weight_layout = "gugu" if gate_mode == GateMode.INTERLEAVE else "gguu"
-    # G/U mode dump: gate_mode (SEPARATED/INTERLEAVE) -> stage1 weight layout.
-    # GUGU = interleaved [gate0,up0,gate1,up1,...]; GGUU = concatenated [gate|up].
+    # Log the stage1 gate/up layout used by the grouped kernel.
     logger.info(
         "[MoE-GUMODE] gate_mode=%s -> stage1_weight_layout=%s (%s)",
         gate_mode.name,
@@ -288,37 +261,27 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg("imports done")
     device = hidden_states.device
     token_num, topk = topk_ids.shape
-    tile_m, tile_n, tile_k = 16, 64, 128
-    m_warp, n_warp = 1, 2
+    tile_m, tile_n, tile_k = 16, 256, 256
+    m_warp, n_warp = 1, 4
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
 
-    # topk_ids is already an integer tensor; bincount and the bounds checks below
-    # work on it directly, so skip the int64 upcast (saves a per-call cast/copy).
+    # topk_ids is already an integer tensor; keep one flattened view for routing.
     flat_experts = topk_ids.reshape(-1)
     if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
         raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
-    # Static upper bound: each token routes at most one row per expert, so no
-    # expert can receive more than token_num rows. Using this avoids the
-    # ``counts.max().item()`` device->host sync that stalled the launch stream.
-    max_m = token_num
+    # Size each expert block for the actual busiest expert.
+    counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
+    raw_max_m = int(counts.max().item()) if counts.numel() else 0
+    max_m = raw_max_m
     max_m = max(warp_tile_m, ((max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m)
-    _grouped_dbg(f"routing counts done max_m={max_m}")
+    _grouped_dbg(f"routing counts done raw_max_m={raw_max_m} max_m={max_m}")
 
-    # Route maps built once, here, for both paths (route -> grouped row, grouped
-    # row -> token, rows-per-expert). AITER_GROUPED_GEMM_NAIVE=0 (default) uses the
-    # single-pass atomic-scatter FlyDSL kernel; =1 uses the pure-torch naive build.
-    # The two differ only in within-expert row order (self-consistent in both), and
-    # the grouped GEMM is order-agnostic per expert, so NAIVE on/off outputs match.
+    # Build route maps once. The fast path uses the FlyDSL atomic-scatter kernel;
+    # the naive path keeps a deterministic torch fallback for tests/debug.
     _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
-    # Per-expert row counts are only consumed by the naive epilogues (the GEMM
-    # mask itself comes from build_route_maps' masked_m). On the NAIVE=0 fast
-    # path we skip the bincount entirely (two int reductions + a device->host
-    # sync). doweight_stage1 needs counts for its per-expert multiply, so it is
-    # only supported on the naive path.
-    counts = None
+    # masked_m drives the GEMM; counts is only for fallback/debug code.
     if _use_naive:
-        counts = torch.bincount(flat_experts, minlength=E)
         topids_to_rows, rows_to_tokens, masked_m = _build_route_maps_naive(
             topk_ids, E, max_m
         )
@@ -338,9 +301,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # because the naive epilogues are bounded by per-expert counts.
 
     if data_format == "fp4":
-        # Keep a4w4 on the reference MXFP4 quantization path. The Triton
-        # variant rounds e8m0 block scales differently and causes visible
-        # end-to-end rel_l2 drift in the grouped MoE path.
+        # Use the reference MXFP4 quantization contract for a4w4 accuracy.
         from aiter.ops.quant import per_1x32_f4_quant as _a1_f4_quant
 
         _grouped_dbg("start a1 fp4 quant")
@@ -357,10 +318,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             (E, max_m, model_dim // 32), dtype=torch.uint8, device=device
         )
     else:
-        # a8w4 stage1 input: per-block-32 mxfp8 quantization (matches the
-        # FlyDSL UT _per_1x32_fp8_quant). The legacy code did a direct
-        # ``hidden_states.to(fp8)`` + scale=127 (=2^0=1.0) which discards
-        # the activation magnitude and produces wrong stage1 output.
+        # a8w4 stage1 input: per-block-32 MXFP8 quantization.
         from aiter.utility import fp4_utils as _aiter_fp4u
 
         BLOCK = 32
@@ -386,17 +344,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_a1 = torch.empty(
             (E, max_m, model_dim), dtype=torch.uint8, device=device
         )
-        # Initial fill with byte=127 (=2^0=1.0) so empty rows in inactive
-        # experts decode to scale=1.0 and don't trip the kernel.
+        # Padding rows decode with scale=1.0.
         a1_scale_raw = torch.empty(
             (E, max_m, model_dim // 32), dtype=torch.uint8, device=device
         )
 
-    # Route-gather: copy each token's payload/scale into the grouped layout,
-    # driven by the maps built above (so both paths share the same row order).
-    # AITER_GROUPED_GEMM_NAIVE=0 (default): one FlyDSL scatter-copy kernel pass
-    # (writes only valid rows, preserving the pre-filled a1_scale_raw=127 padding).
-    # =1: pure-torch scatter assignment via topids_to_rows.
+    # Route-gather into the grouped per-expert layout.
     if not _use_naive:
         from aiter.ops.flydsl.moe_kernels import flydsl_moe_scatter_copy_token
 
@@ -413,19 +366,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("route gather done")
     else:
         _grouped_dbg("start route gather (naive)")
-        # Per-route source token (token-major); naive-path only.
+        # Naive torch route-gather.
         flat_routes = torch.arange(token_num * topk, device=device, dtype=torch.long)
         flat_tokens = flat_routes // topk
-        # grouped_row <- source token, for every route (topids_to_rows are unique
-        # per route, so no aliasing in the scatter assignment).
         flat_rows = topids_to_rows.reshape(-1).to(torch.long)
         grouped_a1.view(E * max_m, -1)[flat_rows] = a1_payload[flat_tokens]
         if a1_scale_token_u8 is not None:
             a1_scale_raw.view(E * max_m, -1)[flat_rows] = a1_scale_token_u8[flat_tokens]
-        # route_weights (grouped row -> routing weight) is consumed by the
-        # doweight_stage1 multiply below and the naive gather epilogue. Both run
-        # only on the naive path, so build it here (the kernel epilogue uses
-        # topk_weight directly and never touches route_weights).
+        # Only the naive epilogue needs grouped row weights.
         route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
         route_weights.view(-1)[topids_to_rows.reshape(-1)] = (
             topk_weight.reshape(-1).to(route_weights.dtype)
@@ -435,10 +383,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     grouped_w1 = (w1 if w1.dtype == torch.uint8 else w1.view(torch.uint8)).contiguous()
     grouped_w2 = (w2 if w2.dtype == torch.uint8 else w2.view(torch.uint8)).contiguous()
     _grouped_dbg("weight layout done")
-    # Reshape flat rank-2 scales to the rank-3 shape the masked grouped kernel
-    # expects: (E, rows//wmma_rep, (k/32)*wmma_rep) with wmma_rep = warp_tile_n//16.
-    #   stage1 (w1): (E, 2*inter_dim//wmma_rep, (model_dim/32)*wmma_rep)
-    #   stage2 (w2): (E, model_dim//wmma_rep,   (inter_dim/32)*wmma_rep)
+    # Weight scales are already preshuffled per expert.
     _wmma_rep = warp_tile_n // 16
     grouped_w1_scale = w1_scale.reshape(
         E, (2 * inter_dim) // _wmma_rep, (model_dim // 32) * _wmma_rep
@@ -499,17 +444,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg("[crash-probe] after stage1 sync OK, unsort")
     _grouped_dbg("[crash-probe] after stage1 sync OK")
 
-    # Dump stage1 output (grouped_a2) reshaped to (num_token, topk, inter_dim).
-    # grouped_a2 is laid out per-expert as (E, max_m, inter_dim); to recover the
-    # per-token/per-topk view we gather each token's row from the expert it was
-    # routed to. We only support num_token==1 decoding here (each active expert
-    # holds exactly one row at index 0), and topk is already known.
+    # Optional single-token stage1 dump.
     _dump_a2 = os.environ.get("AITER_GROUPED_DUMP_A2", "0")
     if _dump_a2 not in ("", "0", "false", "False"):
         if token_num == 1:
-            # experts this single token was routed to: (topk,)
             _routed_experts = topk_ids[0].to(torch.long)
-            # (topk, inter_dim) -> (num_token=1, topk, inter_dim)
             _a2_tt = grouped_a2[_routed_experts, 0].view(token_num, topk, inter_dim)
             print(
                 f"[dump] grouped_a2 (num_token, topk, inter_dim)="
@@ -530,16 +469,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             )
 
     if doweight_stage1:
-        # doweight_stage1 only reaches here on the naive path (NAIVE=0 raised
-        # above), so counts is populated.
+        # doweight_stage1 is only supported on the naive path.
         for e in range(E):
             n = int(counts[e].item())
             if n:
                 grouped_a2[e, :n].mul_(route_weights[e, :n].view(-1, 1))
 
     if data_format == "fp4":
-        # Keep stage2 quantization bit-compatible with the reference path too;
-        # mismatched e8m0 scale rounding here compounds the a4w4 error.
+        # Keep stage2 quantization on the same contract as stage1.
         from aiter.ops.quant import per_1x32_f4_quant as _a2_f4_quant
 
         _grouped_dbg("start a2 fp4 quant")
@@ -633,17 +570,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
 
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
-    # One-pass gather-reduce epilogue (default): a single FlyDSL kernel gathers
-    # each token's topk source rows, weights them, and sums in f32. Set
-    # AITER_GROUPED_GEMM_NAIVE=1 to fall back to the naive per-expert
-    # ``index_add_`` scatter loop.
+    # Fast epilogue gathers/reduces grouped rows back to token order.
     if (not _use_naive) and dtype in (dtypes.bf16, dtypes.fp16):
         from aiter.ops.flydsl.moe_kernels import flydsl_moe_gather_reduce
 
         _grouped_dbg("start gather-reduce output")
-        # Reuse the per-token gather map built once for the route-gather step.
-        # gather_w in the model dtype (bf16/f16); the kernel extends to f32. No
-        # f32 cast -- the weight is already bf16/f16, that precision is enough.
+        # Reuse the route map; the kernel accumulates in f32.
         gather_w = (
             torch.ones((token_num, topk), dtype=dtype, device=device)
             if doweight_stage1
@@ -653,8 +585,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("gather-reduce output done")
     else:
         _grouped_dbg("start scatter output")
-        # Reached on the naive path, or on a non-bf16/fp16 dtype with NAIVE=0
-        # (where counts was not built) -- compute it on demand in the latter case.
+        # Naive fallback epilogue.
         if counts is None:
             counts = torch.bincount(flat_experts, minlength=E)
         for e in range(E):

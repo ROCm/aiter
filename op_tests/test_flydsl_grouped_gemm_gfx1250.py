@@ -90,11 +90,11 @@ def _grouped_scale(
     experts: int,
     rows: int,
     k_dim: int,
-    tile_n: int = 64,
-    n_warp: int = 2,
-    tile_k: int = 128,
+    tile_n: int = 256,
+    n_warp: int = 4,
+    tile_k: int = 256,
 ) -> torch.Tensor:
-    """Wrap ``_grouped_a8w4_prepare_scale_batch`` with the canonical kernel knobs."""
+    """Prepare grouped e8m0 scales for the test kernel."""
     return _grouped_a8w4_prepare_scale_batch(
         scale_raw.contiguous().cuda().view(dtypes.fp8_e8m0),
         experts=experts,
@@ -331,20 +331,27 @@ def _run_grouped_via_fused_moe(
         w1_arg = w1_grouped  # uint8 -> grouped helper sets q_dtype_a=fp8
         w2_arg = w2_grouped
 
+    hidden_dev = hidden.cuda()
+    topk_w_dev = topk_w.cuda()
+    topk_id_dev = topk_id.cuda()
+    bias1_dev = bias1.float().cuda()
+    bias1_phys_dev = bias1_phys.float().cuda()
+    bias2_dev = bias2.float().cuda()
+
     saved = os.environ.get("AITER_USE_GROUPED_GEMM")
     os.environ["AITER_USE_GROUPED_GEMM"] = "1"
     try:
         grouped_out = fused_moe(
-            hidden.cuda(),
+            hidden_dev,
             w1_arg, w2_arg,
-            topk_w.cuda(),
-            topk_id.cuda(),
+            topk_w_dev,
+            topk_id_dev,
             activation=activation,
             quant_type=QuantType.per_1x32,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
-            bias1=bias1_phys.float().cuda(),
-            bias2=bias2.float().cuda(),
+            bias1=bias1_phys_dev,
+            bias2=bias2_dev,
             gate_mode=gate_mode.value,
             dtype=dtypes.bf16,
             swiglu_limit=swiglu_limit,
@@ -360,10 +367,10 @@ def _run_grouped_via_fused_moe(
         # Reference always uses GGUU logical inputs (layouts are numerically
         # equivalent; only physical packing differs).
         ref = _torch_moe_ref(
-            hidden.cuda(),
-            w1_logical, w1_scale_raw, bias1.cuda(),
-            w2_logical, w2_scale_raw, bias2.cuda(),
-            topk_w.cuda(), topk_id.cuda(),
+            hidden_dev,
+            w1_logical, w1_scale_raw, bias1_dev,
+            w2_logical, w2_scale_raw, bias2_dev,
+            topk_w_dev, topk_id_dev,
             data_format=data_format,
             activation=activation, swiglu_limit=swiglu_limit,
         ).to(grouped_out.dtype)
@@ -382,6 +389,11 @@ def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 def _sanity_check(
     data_format: str,
     *,
+    experts: int = 4,
+    tokens: int = 8,
+    topk: int = 2,
+    model_dim: int = 256,
+    inter_dim: int = 256,
     layout: str = "gguu",
     activation: ActivationType = ActivationType.Swiglu,
     swiglu_limit: float = 7.0,
@@ -398,8 +410,11 @@ def _sanity_check(
     """
     _require_gfx1250()
     out, ref = _run_grouped_via_fused_moe(
-        experts=4, tokens=8, topk=2,
-        model_dim=256, inter_dim=256,
+        experts=experts,
+        tokens=tokens,
+        topk=topk,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
         data_format=data_format,
         layout=layout,
         activation=activation,
@@ -442,20 +457,21 @@ def _bench(args: argparse.Namespace) -> None:
     saved = os.environ.get("AITER_USE_GROUPED_GEMM")
     os.environ["AITER_USE_GROUPED_GEMM"] = "1"
     try:
-        common = dict(
-            experts=args.experts, tokens=args.tokens, topk=args.topk,
+        fused_case, _ = _prepare_grouped_moe_case(
+            experts=args.experts,
+            tokens=args.tokens,
+            topk=args.topk,
             model_dim=args.model_dim, inter_dim=args.inter_dim,
             data_format=args.data_format,
             layout=args.layout,
             activation=activation,
             swiglu_limit=args.swiglu_limit,
-            verify=False,
         )
-        _run_grouped_via_fused_moe(**common)  # warmup / JIT
+        _invoke_grouped_fused_moe(fused_case)  # warmup / JIT
         torch.cuda.synchronize()
 
         def _thunk():
-            _run_grouped_via_fused_moe(**common)
+            return _invoke_grouped_fused_moe(fused_case)
 
         # run_perftest returns (data, avg_us); the timing is the second value.
         _, us = run_perftest(_thunk, num_warmup=args.warmup, num_iters=args.iters)
@@ -494,6 +510,12 @@ def main() -> None:
                              "scale=127 (=2^0), bias=0. Expect rel_l2 < 0.01 since both "
                              "grouped and ref see the exact same dequantised values.")
     args = parser.parse_args()
+    if args.model_dim < 512 or args.inter_dim < 512:
+        raise SystemExit(
+            f"model_dim ({args.model_dim}) and inter_dim ({args.inter_dim}) must be "
+            "at least 512 for the grouped GEMM kernels (tile_k=256 requires at "
+            "least two K tiles)."
+        )
 
     if args.scenario == "verify":
         activation = ActivationType.Swiglu if args.act == "swiglu" else ActivationType.Silu
@@ -504,6 +526,11 @@ def main() -> None:
             else VERIFY_TOL_A4W4
         )
         _sanity_check(args.data_format, layout=args.layout,
+                      experts=args.experts,
+                      tokens=args.tokens,
+                      topk=args.topk,
+                      model_dim=args.model_dim,
+                      inter_dim=args.inter_dim,
                       tol=tol,
                       activation=activation,
                       swiglu_limit=args.swiglu_limit,
