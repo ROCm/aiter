@@ -23,6 +23,7 @@ Run on the MI308 (gfx942) box:
     python op_tests/test_grouped_moe_tinyops_profile.py --naive   # naive route/epilogue
     python op_tests/test_grouped_moe_tinyops_profile.py --doweight
     python op_tests/test_grouped_moe_tinyops_profile.py --mode a4w4  # fp4 act + fp4 weight
+    python op_tests/test_grouped_moe_tinyops_profile.py --real-gemm  # run real GEMMs (gfx1250 HW)
 
 Note: this exercises AITER_GROUPED_GEMM_NAIVE=0 (the optimized kernels) by
 default; pass --naive to compare the per-expert Python loops.
@@ -143,6 +144,9 @@ def main():
     ap.add_argument("--doweight", action="store_true", help="doweight_stage1=True")
     ap.add_argument("--rotate", type=int, default=1,
                     help="num_rotate_args for run_perftest (1 = no input rotation)")
+    ap.add_argument("--real-gemm", action="store_true",
+                    help="do NOT stub the grouped GEMMs -- run the real MI450/"
+                         "gfx1250 stage1/stage2 kernels (requires gfx1250 HW)")
     args = ap.parse_args()
 
     if args.model_dim % 128 != 0 or args.inter_dim % 128 != 0:
@@ -153,8 +157,11 @@ def main():
 
     os.environ["AITER_GROUPED_GEMM_NAIVE"] = "1" if args.naive else "0"
 
-    # Stub the MI450 GEMM, then import the function under test.
-    _install_grouped_gemm_stub()
+    # Stub the MI450 GEMM (unless --real-gemm), then import the function under
+    # test. With --real-gemm the genuine gfx1250 stage1/stage2 kernels run, so
+    # the grouped GEMMs show up in the per-kernel breakdown (gfx1250 HW only).
+    if not args.real_gemm:
+        _install_grouped_gemm_stub()
     import torch
     from aiter import ActivationType, QuantType, dtypes
     from aiter.ops.flydsl.moe_common import GateMode
