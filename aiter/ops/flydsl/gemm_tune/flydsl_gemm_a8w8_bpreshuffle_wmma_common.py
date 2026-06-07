@@ -13,30 +13,42 @@ kept in the candidate schema/name but fixed to (1, 1).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
 
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import wmma_kernel_name
+from aiter.ops.flydsl.utils import get_shared_memory_per_block
 
 WMMA = 16  # WMMA M/N tile granularity
 WARP = 2  # default m_warp / n_warp for WmmaKernelInstance
-LDS_BYTES = 320 * 1024  # gfx1250 shared-memory capacity (== device limit)
+LDS_BYTES = get_shared_memory_per_block(fallback_gfx="gfx1250")
 _MAX_WARP_TILE = 128
 
-# Mirror the ptpc fp8 LDS layout in gemm_fp8fp4_gfx1250.compile_fp8fp4_gemm so the
-# candidate filter matches the kernel's real allocation. fp8 packs 1 byte/elem
-# (packed_tile_k == tile_k); ptpc keeps no scale pool in LDS. Keep in sync with
-# that file's LDS_PAD_A_BYTES / LDS_PAD_D_BYTES / elem_bytes_d.
+# Mirror the ptpc fp8 LDS layout
 _LDS_PAD_A_BYTES = 16
 _LDS_PAD_D_BYTES = 16
 _ELEM_BYTES_D = 2  # bf16 / f16 output
 
-_TILE_M = (16, 32, 64, 256)
-_TILE_N = (32, 64, 128, 256)
-_TILE_K = (128, 256)
-_NUM_BUFFERS = (3, 4)
-_SPLIT_K = (1, 2, 4, 8)
-_WARP_COMBOS = ((1, 2), (2, 2), (1, 4))
-_CLUSTER = ((1, 1),)  # Keep cluster in candidates/name.
+# Columns: (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers), grouped by M regime
+# fmt: off
+_CURATED_INSTANCES = (
+    # small M (decode / token-gen): thin tile_m, wide tile_n, deep tile_k
+    ( 16,  64, 256, 1, 2, 4), ( 16,  64, 512, 1, 2, 4), ( 16,  96, 256, 1, 2, 4),
+    ( 16, 128, 256, 1, 2, 4), ( 16, 128, 512, 1, 2, 4), ( 16, 192, 256, 1, 2, 4),
+    ( 16, 256, 256, 1, 4, 4), ( 16, 512, 128, 1, 4, 4),
+    # M=32
+    ( 32,  64, 256, 2, 2, 4), ( 32,  64, 512, 2, 2, 4), ( 32, 128, 256, 2, 2, 4),
+    ( 32, 192, 256, 2, 2, 4), ( 32, 256, 256, 2, 4, 4),
+    # M=64
+    ( 64,  64, 256, 2, 2, 4), ( 64, 128, 128, 2, 2, 4), ( 64, 192, 128, 2, 2, 4),
+    ( 64, 256, 128, 2, 4, 4), ( 64, 512, 128, 1, 4, 3),
+    # M=128
+    (128, 128, 128, 2, 2, 4), (128, 192, 128, 2, 2, 4), (128, 256, 128, 2, 4, 4),
+    (128, 512, 128, 2, 4, 3),
+    # large M (compute bound): big square tiles, shallow tile_k
+    (256,  64, 128, 2, 1, 4), (256, 128, 128, 2, 2, 4), (256, 192, 128, 2, 2, 4),
+    (256, 256, 128, 2, 2, 4), (256, 256, 128, 4, 4, 3), (256, 512, 128, 2, 4, 3),
+)
+# fmt: on
+_SPLIT_K = (1, 2, 4)
 
 
 @dataclass
@@ -67,9 +79,8 @@ class WmmaKernelInstance:
 
 
 def _tile_valid(tm: int, tn: int, tk: int, mw: int, nw: int) -> bool:
-    # Mirrors the kernel's warp_tile_m/n constraints: each must be a multiple of
-    # WMMA (16) and at most _MAX_WARP_TILE (per-wave VGPR/accumulator budget; see
-    # the _MAX_WARP_TILE note). block_threads = mw*nw*32 <= 1024 (mw*nw <= 32).
+    # Each warp tile must be a multiple of WMMA (16) and <= _MAX_WARP_TILE (VGPR
+    # budget); tk a multiple of 128; block_threads = mw*nw*32 <= 1024.
     return (
         tm % (mw * WMMA) == 0
         and tn % (nw * WMMA) == 0
@@ -85,15 +96,12 @@ def _align_up(value: int, align: int) -> int:
 
 
 def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
-    """LDS bytes the ptpc fp8 WMMA kernel actually allocates for ``ki``.
+    """LDS bytes the ptpc fp8 WMMA kernel allocates for ``ki`` (must not under-estimate:
+    an overflowing tile would pass the filter and fault at launch).
 
-    Replicates the per-stage arena layout: each stage holds the A data pool
-    (rows padded by LDS_PAD_A_BYTES) followed by the 16-aligned B data pool (no
-    ptpc scale pool), the stage is 128- then 1024-aligned, and the arena is that
-    pitch times num_buffers. The split_k==1 epilogue also needs a TDM-store D
-    buffer, which can exceed the arena for small tiles, so take the max. The
-    estimate must be exact/conservative: an under-estimate would let an
-    overflowing tile through the candidate filter and fault the GPU at launch.
+    Per-stage arena: A pool (rows padded by LDS_PAD_A_BYTES) + 16-aligned B pool, the
+    stage 128- then 1024-aligned, times num_buffers. The split_k==1 epilogue also needs
+    a TDM-store D buffer that can exceed the arena for small tiles, so take the max.
     """
     lds_a_data = ki.tile_m * (ki.tile_k + _LDS_PAD_A_BYTES)
     lds_b_data = ki.tile_n * ki.tile_k
@@ -113,16 +121,16 @@ def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
 def _build_kernels_list():
     kl = {}
     idx = 0
-    for nb, sk, (cm, cn), (mw, nw), tm, tn, tk in product(
-        _NUM_BUFFERS, _SPLIT_K, _CLUSTER, _WARP_COMBOS, _TILE_M, _TILE_N, _TILE_K
-    ):
-        if not _tile_valid(tm, tn, tk, mw, nw):
-            continue
-        ki = WmmaKernelInstance(tm, tn, tk, nb, sk, cm, cn, mw, nw)
-        if kernel_instance_estimated_lds_bytes(ki) > LDS_BYTES:
-            continue
-        kl[idx] = ki
-        idx += 1
+    for tm, tn, tk, mw, nw, nb in _CURATED_INSTANCES:
+        assert _tile_valid(  # an invalid curated entry is a typo -- fail loudly
+            tm, tn, tk, mw, nw
+        ), f"invalid curated instance: tile=({tm},{tn},{tk}) warp=({mw},{nw})"
+        for sk in _SPLIT_K:
+            ki = WmmaKernelInstance(tm, tn, tk, nb, sk, 1, 1, mw, nw)
+            if kernel_instance_estimated_lds_bytes(ki) > LDS_BYTES:
+                continue
+            kl[idx] = ki
+            idx += 1
     return kl
 
 
@@ -130,11 +138,9 @@ kernels_list: dict[int, WmmaKernelInstance] = _build_kernels_list()
 
 
 def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
-    """N must divide tile_n (N is never padded); K must divide split_k*tile_k, and
-    each split-k chunk must hold >= num_buffers K-tiles to fill the pipeline. M may
-    be ragged — the kernel clips loads/stores to M via hardware out-of-bounds, so no
-    M divisibility is required (a cluster just rounds the M-grid up and OOB-clips the
-    extra tiles). A cluster still needs N cluster-tile-divisible.
+    """N must divide tile_n; K must divide split_k*tile_k with >= num_buffers K-tiles
+    per chunk. M may be ragged (kernel OOB-clips, no divisibility needed). A cluster
+    also needs N divisible by cluster_n*tile_n.
     """
     if N % ki.tile_n != 0 or K % (ki.split_k * ki.tile_k) != 0:
         return False

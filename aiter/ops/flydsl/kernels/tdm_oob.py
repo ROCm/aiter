@@ -83,6 +83,35 @@ def make_tensor_descriptor_2d(
     outer_tile, inner_tile = tile_shape
     outer_off, inner_off = global_offset
 
+    # The outer (leading-dim) stride may be a compile-time int or a runtime
+    # i32/index ir.Value (strided A/C, e.g. a row-slice whose row pitch exceeds
+    # the logical inner extent). Normalise to an index value for address math and
+    # an i32 value for the descriptor's stride field (sgpr5).
+    if isinstance(outer_stride, int):
+        outer_stride_idx = arith.index(outer_stride)
+        outer_stride_is_runtime = False
+    else:
+        os_val = (
+            outer_stride.ir_value()
+            if hasattr(outer_stride, "ir_value")
+            else outer_stride
+        )
+        if not isinstance(os_val, ir.Value):
+            raise TypeError(
+                f"outer stride must be int or i32/index ir.Value, "
+                f"got {type(outer_stride).__name__}"
+            )
+        if isinstance(os_val.type, ir.IndexType):
+            # Wrap raw ir.Value so it supports the _ArithValue ops below (*, cast).
+            outer_stride_idx = _ArithValue(os_val)
+        elif isinstance(os_val.type, ir.IntegerType) and os_val.type.width == 32:
+            outer_stride_idx = arith.index_cast(T.index, os_val)
+        else:
+            raise TypeError(
+                f"outer stride ir.Value must be index or i32, got {os_val.type}"
+            )
+        outer_stride_is_runtime = True
+
     # -- Warp distribution --
     warps_per_dim, block_per_warp = compute_warp_distribution(
         [outer_tile, inner_tile],
@@ -112,7 +141,7 @@ def make_tensor_descriptor_2d(
     a_raw = global_ptr.__extract_to_ir_values__()[0]
     glb_ptr = _fly_d.extract_aligned_pointer_as_index(glb_ptr_type, a_raw)
     glb_base_i64 = _ArithValue(llvm_dialect.ptrtoint(i64, glb_ptr))
-    glb_elem_off = (outer_off + warp_off_outer) * arith.index(outer_stride) + (
+    glb_elem_off = (outer_off + warp_off_outer) * outer_stride_idx + (
         inner_off + warp_off_inner
     ) * arith.index(inner_stride)
     glb_byte_off = glb_elem_off * arith.index(elem_bytes)
@@ -266,7 +295,11 @@ def make_tensor_descriptor_2d(
     g1_s4 = arith.constant(tile_d1 & 0xFFFF, type=T.i32)
 
     # sgpr5: tensor_dim0_stride (low 32 bits) — stride of outermost dim
-    g1_s5 = arith.constant(stride0 & 0xFFFFFFFF, type=T.i32)
+    if outer_stride_is_runtime:
+        # Runtime leading-dim stride: truncate the index to i32 (strides < 2^31).
+        g1_s5 = arith.index_cast(T.i32, outer_stride_idx)
+    else:
+        g1_s5 = arith.constant(stride0 & 0xFFFFFFFF, type=T.i32)
 
     # sgpr6-7: for 2D, no higher-dim strides
     g1_s6 = arith.constant(0, type=T.i32)

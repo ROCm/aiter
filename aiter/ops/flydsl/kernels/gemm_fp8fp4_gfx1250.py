@@ -66,30 +66,23 @@ _TDM_HAS_OOB = "oob_outer_bound" in _TDM_SIG_PARAMS
 
 
 def _make_tdm_desc(*, early_timeout=False, oob_outer_bound=None, **kwargs):
-    """Build a TDM descriptor across flydsl versions.
+    """Build a 2D TDM descriptor, transparently across flydsl versions."""
+    strides = kwargs.get("strides")
+    runtime_stride = strides is not None and not isinstance(strides[0], int)
+    needs_oob = oob_outer_bound is not None
 
-    ``early_timeout`` / ``oob_outer_bound`` are passed to the native builder
-    only when it supports them. When ``oob_outer_bound`` is needed (ragged M)
-    but the installed flydsl lacks it, the vendored builder in ``tdm_oob`` is
-    used — it carries the OOB logic so the non-tile-aligned-M GEMM path works
-    against the older flydsl this build pins.
-    """
-    if _TDM_HAS_OOB:
-        if _TDM_HAS_EARLY_TIMEOUT:
-            kwargs["early_timeout"] = early_timeout
-        return tdm_ops.make_tensor_descriptor_2d(
-            oob_outer_bound=oob_outer_bound, **kwargs
+    if runtime_stride or (needs_oob and not _TDM_HAS_OOB):
+        from .tdm_oob import make_tensor_descriptor_2d as _vendored_make_desc
+
+        return _vendored_make_desc(
+            early_timeout=early_timeout, oob_outer_bound=oob_outer_bound, **kwargs
         )
-    if oob_outer_bound is None:
-        if _TDM_HAS_EARLY_TIMEOUT:
-            kwargs["early_timeout"] = early_timeout
-        return tdm_ops.make_tensor_descriptor_2d(**kwargs)
-    # Vendored builder always supports early_timeout (pass it explicitly).
-    from .tdm_oob import make_tensor_descriptor_2d as _make_tensor_descriptor_2d_oob
 
-    return _make_tensor_descriptor_2d_oob(
-        early_timeout=early_timeout, oob_outer_bound=oob_outer_bound, **kwargs
-    )
+    if _TDM_HAS_OOB:
+        kwargs["oob_outer_bound"] = oob_outer_bound
+    if _TDM_HAS_EARLY_TIMEOUT:
+        kwargs["early_timeout"] = early_timeout
+    return tdm_ops.make_tensor_descriptor_2d(**kwargs)
 
 
 # Common constants
@@ -109,7 +102,6 @@ def compile_fp8fp4_gemm(
     *,
     data_format: str = "fp4",
     scale_mode: str = "mxscale",
-    M: int = 0,
     N: int = 0,
     K: int,
     tile_m: int = 128,
@@ -148,7 +140,9 @@ def compile_fp8fp4_gemm(
         ptpc:    scale_A [M], scale_B [N] fp32
 
     Returns a JitFunction:
-        launch_fn(arg_c, arg_a, arg_b, arg_a_scale, arg_b_scale, M, N, stream)
+        launch_fn(arg_c, arg_a, arg_b, arg_a_scale, arg_b_scale, M, N, lda, ldc, stream)
+    where lda / ldc are the runtime leading-dim strides (in elements) of A / C.
+    Pass lda == K and ldc == N for dense (contiguous) tensors.
     """
     if data_format not in ("fp4", "fp8", "a8w4"):
         raise ValueError(
@@ -630,6 +624,8 @@ def compile_fp8fp4_gemm(
         arg_b_scale: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_lda: fx.Int32,
+        i32_ldc: fx.Int32,
     ):
         # Enable back-to-back WMMA issue (SCHED_MODE bit[4] = DISABLE_VALU_STALL)
         rocdl.disable_xdl_arb_stall()
@@ -711,7 +707,14 @@ def compile_fp8fp4_gemm(
                 return a, b
 
         m_idx = fx.Index(i32_m)
-        n_stride = arith.index(N)
+        # Leading-dim strides arrive at runtime (strided A / C); the dense path
+        # passes lda == K and ldc == N, giving byte-identical addressing. A's
+        # stride is in packed-A elements (== lda for fp8 where PACK_FACTOR_A == 1).
+        if const_expr(PACK_FACTOR_A == 1):
+            lda_packed = fx.Index(i32_lda)
+        else:
+            lda_packed = fx.Index(i32_lda) / arith.index(PACK_FACTOR_A)
+        n_stride = fx.Index(i32_ldc)
         c_nrec = m_idx * n_stride * arith.index(elem_bytes_d)
         c_rsrc = buffer_ops.create_buffer_resource(arg_c, num_records_bytes=c_nrec)
         c_global_ptr_type = ir.Type.parse("!llvm.ptr<1>")
@@ -729,7 +732,7 @@ def compile_fp8fp4_gemm(
                 lds_memref=memref,
                 global_offset=(blk_m, k_packed_off),
                 tensor_shape=(tile_m, packed_tile_k_a),
-                strides=(K_packed_a, 1),
+                strides=(lda_packed, 1),
                 tile_shape=(tile_m, packed_tile_k_a),
                 elem_bytes=1,
                 pad_interval=packed_tile_k_a,
@@ -767,7 +770,7 @@ def compile_fp8fp4_gemm(
                 lds_memref=memref,
                 global_offset=(blk_m + arith.index(row_start), k_packed_off),
                 tensor_shape=(tile_m, packed_tile_k_a),
-                strides=(K_packed_a, 1),
+                strides=(lda_packed, 1),
                 tile_shape=(ab_split_a_rows, packed_tile_k_a),
                 elem_bytes=1,
                 pad_interval=packed_tile_k_a,
@@ -2598,7 +2601,7 @@ def compile_fp8fp4_gemm(
                 lds_memref=d_lds_base_ptr,
                 global_offset=(blk_m + warp_m_off_sgpr, blk_n + warp_n_off_sgpr),
                 tensor_shape=(warp_tile_m, warp_tile_n),
-                strides=(N, 1),
+                strides=(n_stride, 1),
                 tile_shape=(warp_tile_m, warp_tile_n),
                 elem_bytes=elem_bytes_d,
                 pad_interval=warp_tile_n,
@@ -3233,6 +3236,8 @@ def compile_fp8fp4_gemm(
         arg_b_scale: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_lda: fx.Int32,
+        i32_ldc: fx.Int32,
         stream: fx.Stream,
     ):
         _ = cache_tag
@@ -3259,6 +3264,8 @@ def compile_fp8fp4_gemm(
             arg_b_scale,
             i32_m,
             i32_n,
+            i32_lda,
+            i32_ldc,
             value_attrs={
                 "rocdl.waves_per_eu": effective_waves_per_eu,
                 "rocdl.cluster_dims": (
@@ -3299,7 +3306,6 @@ def compile_a8w4_gemm(**kw):
 
 def compile_ptpc_gemm(
     *,
-    M: int = 0,
     N: int = 0,
     K: int,
     data_format: str = "fp8",
@@ -3338,7 +3344,6 @@ def compile_ptpc_gemm(
         fp8_schedule="auto",
         scale_load_path="tdm",
         use_tdm_store=(split_k == 1),
-        M=M,
         N=N,
         K=K,
         tile_m=tile_m,

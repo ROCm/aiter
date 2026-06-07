@@ -3,13 +3,15 @@
 
 """gfx1250 (WMMA) backend for the FlyDSL a8w8 bpreshuffle GEMM.
 
-aiter.gemm_a8w8_bpreshuffle routes here when its tuned kernelName starts with
-``flydsl_bpreshuffle_wmma_`` (gfx1250 has no MFMA preshuffle kernel). Runs the
-vendored gemm_fp8fp4_gfx1250 WMMA kernel in ptpc scale mode: C = (A*sa) @ (B*sb)^T
-with fp32 per-token sa[M] / per-channel sb[N] applied in the epilogue. N/K must
-divide the tile; M may be non-tile-aligned (ragged) with no host padding — the
-kernel clips A/A-scale loads and the C store to the runtime M via hardware
-out-of-bounds handling (split-k predicates the atomic add per-lane on row < M).
+aiter.gemm_a8w8_bpreshuffle's FlyDSL path runs here on gfx1250 (no MFMA preshuffle
+kernel); the tuned kernelName (prefix ``flydsl_bpreshuffle_wmma_``) encodes the tile
+config. Computes C = (A*sa) @ (B*sb)^T via the vendored gemm_fp8fp4_gfx1250 WMMA
+kernel, fp32 per-token sa[M] / per-channel sb[N] applied in the epilogue.
+
+N/K must divide the tile; M may be ragged (no host padding) — the kernel clips
+loads/stores to the runtime M via hardware OOB, predicating split-k's atomic add
+per-lane on row < M. A/C may be strided (lda/ldc passed at runtime, no copy) when
+the inner dim is unit-stride; B is preshuffled into its own contiguous buffer.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ _fx = None
 _WMMA_K = 128
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
+_MAX_SPLIT_K = 4
 
 
 def _lazy_import():
@@ -53,10 +56,6 @@ def _as_1d_fp32(scale: Tensor, length: int, name: str) -> Tensor:
     if flat.dtype != torch.float32:
         flat = flat.to(torch.float32)
     return flat.contiguous()
-
-
-def _to_uint8(t: Tensor) -> Tensor:
-    return t.contiguous().view(torch.uint8).view(-1)
 
 
 def run_preshuffle_gemm_a8_gfx1250(
@@ -114,8 +113,11 @@ def run_preshuffle_gemm_a8_gfx1250(
     cluster_m = max(1, int(cluster_m))
     cluster_n = max(1, int(cluster_n))
 
-    accumulate_fp32 = split_k > 1
-    kernel_out_dtype = "f32" if accumulate_fp32 else out_dtype
+    if split_k > _MAX_SPLIT_K:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] split_k={split_k} exceeds the bf16/f16 atomic-add "
+            f"precision cap of {_MAX_SPLIT_K}"
+        )
 
     # Validate (tuned names always pass); fail loudly rather than silently clamp.
     nb = int(num_buffers)
@@ -140,15 +142,7 @@ def run_preshuffle_gemm_a8_gfx1250(
     sa = _as_1d_fp32(x_scale, M, "x_scale")
     sb = _as_1d_fp32(w_scale, N, "w_scale")
 
-    # Ragged M needs no host padding: the kernel clips A/scale loads and the C
-    # store to runtime M via hardware OOB.
-    a_dev = XQ.contiguous()
-    b_dev = WQ.contiguous()
-
-    # M is unused at compile time (runtime i32_m drives everything), so compile with
-    # M=0 to cache one kernel per (N, K, config) and reuse it across all M.
     exe = _compile_ptpc_gemm(
-        M=0,
         N=N,
         K=K,
         data_format="fp8",
@@ -161,32 +155,29 @@ def run_preshuffle_gemm_a8_gfx1250(
         waves_per_eu=(None if waves_per_eu <= 0 else waves_per_eu),
         cluster_m=cluster_m,
         cluster_n=cluster_n,
-        out_dtype=kernel_out_dtype,
+        out_dtype=out_dtype,
         split_k=split_k,
     )
 
-    if accumulate_fp32:
-        # fp32 split-k atomic-accumulation scratch (zeroed; cast into Out below).
-        out_buf = torch.zeros((M, N), dtype=torch.float32, device=Out.device)
-    else:
-        out_buf = Out.contiguous()
+    lda = XQ.stride(0)
+    ldc = Out.stride(0)
+    if split_k > 1:
+        Out.zero_()  # split-k atomic-accumulates into Out
 
-    stream = _fx.Stream(torch.cuda.current_stream(device=a_dev.device))
-    # sa/sb are already contiguous 1-D fp32 (see _as_1d_fp32).
+    stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
     _run_compiled(
         exe,
-        out_buf.view(-1),
-        _to_uint8(a_dev),
-        _to_uint8(b_dev),
+        Out,
+        XQ.view(torch.uint8),
+        WQ.view(torch.uint8),
         sa.view(-1),
         sb.view(-1),
         M,
         N,
+        lda,
+        ldc,
         stream,
     )
-
-    if out_buf.data_ptr() != Out.data_ptr():
-        Out.copy_(out_buf)
     return Out
 
 
