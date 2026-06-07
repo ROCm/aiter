@@ -57,8 +57,17 @@ def rms_rel_err(ref, out):
 
 
 def make_sched2_metadata(
-    batch, kv_head_num, gqa, qo_indptr, kv_indptr, context_lens,
-    block_size, qlen_granularity, available_tgs, device, is_causal=False,
+    batch,
+    kv_head_num,
+    gqa,
+    qo_indptr,
+    kv_indptr,
+    context_lens,
+    block_size,
+    qlen_granularity,
+    available_tgs,
+    device,
+    is_causal=False,
 ):
     """Python port of sched2 common_ps.h generate_metadata + generate_reduce_info
     (the convention the SP3 PA_DECODE kernel was authored against).
@@ -88,7 +97,9 @@ def make_sched2_metadata(
             lqs, lqe = q_off, min(q_off + qlen_granularity, qo_len)
             ekv = min(kv_len - qo_len + lqe, kv_len) if is_causal else kv_len
             num_units = ceil_div(ekv, kvlen_granularity)
-            qtiles.append([b, lqs + qo[b], lqe + qo[b], num_units * blocks_per_unit, ekv])
+            qtiles.append(
+                [b, lqs + qo[b], lqe + qo[b], num_units * blocks_per_unit, ekv]
+            )
             total_units += num_units
             q_off += qlen_granularity
 
@@ -104,7 +115,11 @@ def make_sched2_metadata(
             qhs, qhe = kho * qhead_granularity, (kho + 1) * qhead_granularity
             qhr = ((qhe & 0xFFFF) << 16) | (qhs & 0xFFFF)
             sv_tile, sv_block, sv_pidx = cur_tile, cur_block, partial_tile_idx
-            cap = (average + 1) * blocks_per_unit if tg < reminder else average * blocks_per_unit
+            cap = (
+                (average + 1) * blocks_per_unit
+                if tg < reminder
+                else average * blocks_per_unit
+            )
             while cur_tile < len(qtiles) and cap > 0:
                 bt, qs, qe, nblk, ekv = qtiles[cur_tile]
                 remaining_blocks = nblk - cur_block
@@ -155,8 +170,11 @@ def make_sched2_metadata(
     split_rows = (max(plocs_all) + qlen_granularity) if plocs_all else 1
 
     def _t(lst):
-        return torch.tensor(lst, dtype=torch.int32, device=device) if lst \
+        return (
+            torch.tensor(lst, dtype=torch.int32, device=device)
+            if lst
             else torch.zeros(0, dtype=torch.int32, device=device)
+        )
 
     return (
         torch.tensor(work_indptr, dtype=torch.int32, device=device),
@@ -168,7 +186,9 @@ def make_sched2_metadata(
     )
 
 
-def cpu_reduce(out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_partial_map, gqa):
+def cpu_reduce(
+    out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_partial_map, gqa
+):
     """Host reduce (matches aiter csrc/kernels/mla/reduce.cu, natural log):
         global_lse = max_lse + log(sum exp(lse - max_lse))
         out        = sum_p partial_o_p * exp(lse_p - global_lse)
@@ -205,8 +225,18 @@ def cpu_reduce(out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_
 
 
 def ref_pa_decode(
-    Q, K, V, kv_indices, kv_indptr, context_lens, gqa,
-    query_scale, key_scale, value_scale, softmax_scale, sink=None,
+    Q,
+    K,
+    V,
+    kv_indices,
+    kv_indptr,
+    context_lens,
+    gqa,
+    query_scale,
+    key_scale,
+    value_scale,
+    softmax_scale,
+    sink=None,
 ):
     """Torch host reference for the gfx1250 PA-decode kernel (no sink, mtp=0).
 
@@ -234,11 +264,21 @@ def ref_pa_decode(
     mtp = qlen - 1
     device = Q.device
     s_eff = query_scale * key_scale * softmax_scale
-    sink_hg = (sink.float().view(kv_head_num, gqa) * s_eff) if sink is not None else None
+    sink_hg = (
+        (sink.float().view(kv_head_num, gqa) * s_eff) if sink is not None else None
+    )
 
     # K[p,h,d//16,tok,d%16] -> K_tm[p,h,tok,d];  V[p,h,tok//16,d,tok%16] -> V_tm[p,h,tok,d]
-    K_tm = K.float().permute(0, 1, 3, 2, 4).reshape(num_pages, kv_head_num, page_size, head_dim)
-    V_tm = V.float().permute(0, 1, 2, 4, 3).reshape(num_pages, kv_head_num, page_size, head_dim)
+    K_tm = (
+        K.float()
+        .permute(0, 1, 3, 2, 4)
+        .reshape(num_pages, kv_head_num, page_size, head_dim)
+    )
+    V_tm = (
+        V.float()
+        .permute(0, 1, 2, 4, 3)
+        .reshape(num_pages, kv_head_num, page_size, head_dim)
+    )
     Qf = Q.float()  # [batch, qlen, kv_head, gqa, head_dim]
     out = torch.empty_like(Qf)
 
@@ -252,15 +292,21 @@ def ref_pa_decode(
         # scl_log2e applied to Q.K, and value_scale at finalize).  Scaling the
         # operands first changes the fp32 accumulation magnitude and diverges
         # badly for large scales (the dot sums ~scale^2 terms instead of ~1).
-        Kc = K_tm[tok_page, :, tok_off, :]     # [ctx, kv_head, head_dim] raw
-        Vc = V_tm[tok_page, :, tok_off, :]     # [ctx, kv_head, head_dim] raw
+        Kc = K_tm[tok_page, :, tok_off, :]  # [ctx, kv_head, head_dim] raw
+        Vc = V_tm[tok_page, :, tok_off, :]  # [ctx, kv_head, head_dim] raw
         for ql in range(qlen):
-            valid = max(min(ctx - mtp + ql, ctx), 1)   # SP3 causal border (no +1)
+            valid = max(min(ctx - mtp + ql, ctx), 1)  # SP3 causal border (no +1)
             q = Qf[b, ql]  # [kv_head, gqa, head_dim] raw
-            logits = torch.einsum("hgd,thd->hgt", q, Kc[:valid]) * s_eff  # raw dot, then scale
+            logits = (
+                torch.einsum("hgd,thd->hgt", q, Kc[:valid]) * s_eff
+            )  # raw dot, then scale
             if sink_hg is not None:
-                logits = torch.cat([logits, sink_hg.unsqueeze(-1)], dim=-1)  # +1 sink logit
-                w = torch.softmax(logits.float(), dim=-1)[..., :valid]       # drop sink weight
+                logits = torch.cat(
+                    [logits, sink_hg.unsqueeze(-1)], dim=-1
+                )  # +1 sink logit
+                w = torch.softmax(logits.float(), dim=-1)[
+                    ..., :valid
+                ]  # drop sink weight
             else:
                 w = torch.softmax(logits.float(), dim=-1)
             out[b, ql] = torch.einsum("hgt,thd->hgd", w, Vc[:valid]) * value_scale
@@ -269,19 +315,47 @@ def ref_pa_decode(
 
 @perftest(num_rotate_args=1)
 def run_pa_stage(
-    Q, K, V, kv_indices, context_lens, softmax_scale, kv_indptr,
-    gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
-    work_indptr, work_info, split_o, split_lse, sink,
+    Q,
+    K,
+    V,
+    kv_indices,
+    context_lens,
+    softmax_scale,
+    kv_indptr,
+    gqa,
+    mtp,
+    query_scale,
+    key_scale,
+    value_scale,
+    qo_indptr,
+    work_indptr,
+    work_info,
+    split_o,
+    split_lse,
+    sink,
 ):
     # PA stage: direct-to-O for non-split work items, partials -> split_o/split_lse
     # for split (multi-page) ones (merged on host by cpu_reduce).  sink=None ->
     # wrapper fills a -inf no-op buffer (kernel always reads the sink slot).
     return aiter.pa_decode_bf16_asm(
-        Q, K, V, kv_indices, context_lens, softmax_scale, kv_indptr,
-        gqa=gqa, mtp=mtp,
-        query_scale=query_scale, key_scale=key_scale, value_scale=value_scale,
-        qo_indptr=qo_indptr, work_indptr=work_indptr, work_info=work_info,
-        split_o=split_o, split_lse=split_lse, sink=sink,
+        Q,
+        K,
+        V,
+        kv_indices,
+        context_lens,
+        softmax_scale,
+        kv_indptr,
+        gqa=gqa,
+        mtp=mtp,
+        query_scale=query_scale,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        qo_indptr=qo_indptr,
+        work_indptr=work_indptr,
+        work_info=work_info,
+        split_o=split_o,
+        split_lse=split_lse,
+        sink=sink,
     )
 
 
@@ -306,7 +380,9 @@ def test_pa_decode(
     gqa = PA_GQA_RATIO
     head_dim = PA_HEAD_DIM
     page_size = PA_PAGE_SIZE
-    assert mtp < PA_TILE_Q // gqa, f"kernel requires mtp < {PA_TILE_Q // gqa}, got {mtp}"
+    assert (
+        mtp < PA_TILE_Q // gqa
+    ), f"kernel requires mtp < {PA_TILE_Q // gqa}, got {mtp}"
     qlen_with_mtp = mtp + 1
     q_head_num = kv_head_num * gqa
     device = "cuda"
@@ -330,8 +406,10 @@ def test_pa_decode(
 
     max_blocks_per_seq = ceil_div(int(seq_lens_kv.max().item()), page_size)
     max_blocks = max_blocks_per_seq * batch
-    block_tables = torch.randperm(max_blocks, device=device).to(torch.int32).reshape(
-        batch, max_blocks_per_seq
+    block_tables = (
+        torch.randperm(max_blocks, device=device)
+        .to(torch.int32)
+        .reshape(batch, max_blocks_per_seq)
     )
     actual_blocks = ceil_div(seq_lens_kv, page_size)
     kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=device)
@@ -345,21 +423,48 @@ def test_pa_decode(
 
     num_phys_pages = max_blocks
     # Keep magnitudes modest so FP8 e4m3 represents them well.
-    Q = (0.5 * torch.randn(batch, qlen_with_mtp, kv_head_num, gqa, head_dim, device=device)).to(fp8)
-    K = (0.5 * torch.randn(num_phys_pages, kv_head_num, head_dim // 16, page_size, 16, device=device)).to(fp8)
-    V = (0.5 * torch.randn(num_phys_pages, kv_head_num, page_size // 16, head_dim, 16, device=device)).to(fp8)
+    Q = (
+        0.5
+        * torch.randn(batch, qlen_with_mtp, kv_head_num, gqa, head_dim, device=device)
+    ).to(fp8)
+    K = (
+        0.5
+        * torch.randn(
+            num_phys_pages, kv_head_num, head_dim // 16, page_size, 16, device=device
+        )
+    ).to(fp8)
+    V = (
+        0.5
+        * torch.randn(
+            num_phys_pages, kv_head_num, page_size // 16, head_dim, 16, device=device
+        )
+    ).to(fp8)
 
     # ---- sched2-convention split-KV metadata + scratch (host reduce; gfx1250 reduce WIP) ----
     num_cu = torch.cuda.get_device_properties(device).multi_processor_count
     (
-        work_indptr, work_info,
-        reduce_indptr, reduce_final_map, reduce_partial_map, split_rows,
+        work_indptr,
+        work_info,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        split_rows,
     ) = make_sched2_metadata(
-        batch, kv_head_num, gqa, qo_indptr, kv_indptr, seq_lens_kv,
-        page_size, qlen_with_mtp, num_cu, device,
+        batch,
+        kv_head_num,
+        gqa,
+        qo_indptr,
+        kv_indptr,
+        seq_lens_kv,
+        page_size,
+        qlen_with_mtp,
+        num_cu,
+        device,
     )
     # -inf lse / 0 o so any split the kernel leaves unwritten is inert in reduce.
-    split_o = torch.zeros((split_rows, 1, q_head_num, head_dim), dtype=dtypes.fp32, device=device)
+    split_o = torch.zeros(
+        (split_rows, 1, q_head_num, head_dim), dtype=dtypes.fp32, device=device
+    )
     split_lse = torch.full(
         (split_rows, 1, q_head_num, 1), float("-inf"), dtype=dtypes.fp32, device=device
     )
@@ -374,18 +479,49 @@ def test_pa_decode(
         sink = torch.full((q_head_num,), -1.0e30, dtype=dtypes.fp32, device=device)
 
     out, us = run_pa_stage(
-        Q, K, V, kv_indices, seq_lens_kv, softmax_scale, kv_indptr,
-        gqa, mtp, query_scale, key_scale, value_scale, qo_indptr,
-        work_indptr, work_info, split_o, split_lse, sink,
+        Q,
+        K,
+        V,
+        kv_indices,
+        seq_lens_kv,
+        softmax_scale,
+        kv_indptr,
+        gqa,
+        mtp,
+        query_scale,
+        key_scale,
+        value_scale,
+        qo_indptr,
+        work_indptr,
+        work_info,
+        split_o,
+        split_lse,
+        sink,
     )
     torch.cuda.synchronize()
     out = cpu_reduce(
-        out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_partial_map, gqa,
+        out,
+        split_o,
+        split_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        gqa,
     )
 
     ref = ref_pa_decode(
-        Q, K, V, kv_indices, kv_indptr, seq_lens_kv, gqa,
-        query_scale, key_scale, value_scale, softmax_scale, sink,
+        Q,
+        K,
+        V,
+        kv_indices,
+        kv_indptr,
+        seq_lens_kv,
+        gqa,
+        query_scale,
+        key_scale,
+        value_scale,
+        softmax_scale,
+        sink,
     )
 
     # Per-element check (detailed report) + RMS/peak (the kernel's actual
@@ -479,7 +615,10 @@ for batch, kv_head_num, ctx_len, mtp in itertools.product(
     args.batch_size, args.kv_head_num, args.ctx_len, args.mtp
 ):
     ret = test_pa_decode(
-        batch, kv_head_num, ctx_len, mtp,
+        batch,
+        kv_head_num,
+        ctx_len,
+        mtp,
         tuple(args.scales) if args.scales is not None else None,
         args.varlen,
         args.sink,
