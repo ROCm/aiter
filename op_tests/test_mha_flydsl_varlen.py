@@ -394,7 +394,6 @@ if __name__ == "__main__":
             ([0, 256, 512, 768, 1024], [0, 256, 512, 768, 1024], 128),
             ([0, 128], [0, 2048], 128),
             ([0, 1], [0, 512], 128),
-
         ]
 
     causal_list = [causal_filter] if causal_filter is not None else [False, True]

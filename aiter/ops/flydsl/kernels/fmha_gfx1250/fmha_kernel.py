@@ -3274,6 +3274,7 @@ def _ensure_kernel(is_causal: bool, return_lse: bool = False):
         max_seqlen_k: fx.Int32,
         num_heads: fx.Int32,
         batch_size: fx.Int32,
+        stream: fx.Stream,
     ):
         _lds_alloc_k_a.finalized = False
         _lds_alloc_k_b.finalized = False
@@ -3319,6 +3320,7 @@ def _ensure_kernel(is_causal: bool, return_lse: bool = False):
         launcher.launch(
             grid=(grid_x, num_tg, grid_z),
             block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
         )
 
     _launch.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
@@ -3414,6 +3416,7 @@ def flash_attn_varlen_d192_gfx1250(
             max_seqlen_k,
             nheads_q,
             batch,
+            torch.cuda.current_stream(),
         ),
     )
 
