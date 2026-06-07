@@ -16,7 +16,7 @@ Target: gfx1250, wave32, 4 waves (1TG), 1024 shared VGPRs (256 per bank).
 
 from __future__ import annotations
 
-from fmha_schedule import (
+from .fmha_schedule import (
     GEMM1_SCHEDULE,
     GEMM2_SCHEDULE,
     g1_row_idx,

@@ -42,12 +42,6 @@ Causal mask always on. num_tiles = bx + 1 (triangular).
 from __future__ import annotations
 
 import functools
-import os
-import sys
-
-if os.path.dirname(__file__) not in sys.path:
-    sys.path.insert(0, os.path.dirname(__file__))
-
 from contextlib import contextmanager
 
 import torch
@@ -66,7 +60,7 @@ from flydsl.compiler.kernel_function import (
     CompilationContext,
 )
 
-from fmha_prologue import (
+from .fmha_prologue import (
     _emit_void,
     _setreg,
     _build_tdm_dgroup1,
@@ -85,7 +79,7 @@ from fmha_prologue import (
     V_SU_HALF_OFFSET,
 )
 
-from fmha_core_loop import (
+from .fmha_core_loop import (
     _get_types,
     _make_v2f32,
     _pair_k_tiles_for_wmma,
@@ -716,7 +710,7 @@ def _issue_k_loads(ty, kv_lds_addrs, blk, su):
     Returns raw kv_raw[4 msb][N_LDS_PER_MSB] — caller must wait
     (rocdl.s_wait_dscnt(0)) before using the results.
     """
-    from fmha_core_loop import _atom_ds_load_b128
+    from .fmha_core_loop import _atom_ds_load_b128
 
     su_off = (blk * CNT_SU + su) * LDS_K_SU_P_SIZE
     kv_raw = [[None] * N_LDS_PER_MSB for _ in range(NUM_MSB)]
