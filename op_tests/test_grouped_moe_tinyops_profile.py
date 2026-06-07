@@ -179,8 +179,10 @@ def main():
     on_gfx1250 = get_gfx() == "gfx1250"
     real_gemm = args.real_gemm or on_gfx1250
     if real_gemm and not args.real_gemm:
-        print("[info] detected gfx1250 HW -> running real grouped GEMMs "
-              "(pass --real-gemm explicitly to silence this)")
+        print(
+            "[info] detected gfx1250 HW -> running real grouped GEMMs "
+            "(pass --real-gemm explicitly to silence this)"
+        )
 
     # Stub the MI450 GEMM (unless running real GEMMs), then import the function
     # under test. With real GEMMs the genuine gfx1250 stage1/stage2 kernels run,

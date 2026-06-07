@@ -31,7 +31,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith
 from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue
+from flydsl.expr.arith import ArithValue, CmpIPredicate, _to_raw
 from flydsl.compiler.kernel_function import CompilationContext
 
 from flydsl._mlir import ir
@@ -54,7 +54,7 @@ def build_moe_m_tile_map_module():
     @flyc.kernel(name="moe_m_tile_map")
     def m_tile_map_kernel(
         m_tile_prefix: fx.Tensor,  # (E+1,) int32
-        m_tile_map: fx.Tensor,     # (E*max_m_tiles,) int32 out
+        m_tile_map: fx.Tensor,  # (E*max_m_tiles,) int32 out
         experts: Int32,
         max_m_tiles: Int32,
     ):
@@ -106,12 +106,96 @@ def build_moe_m_tile_map_module():
             pass
 
         gx = arith.constant(1, index=True)
-        m_tile_map_kernel(
-            m_tile_prefix, m_tile_map, experts, max_m_tiles
-        ).launch(
+        m_tile_map_kernel(m_tile_prefix, m_tile_map, experts, max_m_tiles).launch(
             grid=(gx, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
     return launch_m_tile_map
+
+
+def build_moe_m_tile_prefix_map_module():
+    """Return a JIT launcher that fills prefix and map from ``masked_m``.
+
+    This replaces the host torch path:
+      clamp -> add -> div -> cumsum -> Python map packing.
+    """
+
+    @flyc.kernel(name="moe_m_tile_prefix_map")
+    def m_tile_prefix_map_kernel(
+        masked_m: fx.Tensor,
+        m_tile_prefix: fx.Tensor,
+        m_tile_map: fx.Tensor,
+        experts: Int32,
+        max_m: Int32,
+        tile_m: Int32,
+        max_m_tiles: Int32,
+    ):
+        i32 = T.i32
+        idx_t = ir.IndexType.get()
+        masked_rsrc = buffer_ops.create_buffer_resource(masked_m, max_size=True)
+        prefix_rsrc = buffer_ops.create_buffer_resource(m_tile_prefix, max_size=True)
+        map_rsrc = buffer_ops.create_buffer_resource(m_tile_map, max_size=True)
+
+        zero = arith.constant(0, type=i32)
+        one = arith.constant(1, type=i32)
+        buffer_ops.buffer_store(zero, prefix_rsrc, zero)
+
+        e_for = scf.ForOp(
+            arith.constant(0, index=True),
+            arith.index_cast(idx_t, experts),
+            arith.constant(1, index=True),
+            [zero],
+        )
+        with ir.InsertionPoint(e_for.body):
+            e_i32 = arith.index_cast(i32, e_for.induction_variable)
+            running = e_for.inner_iter_args[0]
+            raw_m = buffer_ops.buffer_load(masked_rsrc, e_i32, vec_width=1, dtype=i32)
+            below_zero = arith.cmpi(CmpIPredicate.slt, raw_m, zero)
+            above_max = arith.cmpi(CmpIPredicate.sgt, raw_m, _to_raw(max_m))
+            valid_m = arith.select(below_zero, zero, raw_m)
+            valid_m = arith.select(above_max, _to_raw(max_m), valid_m)
+            tiles_num = ArithValue(valid_m) + ArithValue(tile_m) - one
+            tiles = arith.divsi(_to_raw(tiles_num), _to_raw(tile_m))
+            next_running = ArithValue(running) + ArithValue(tiles)
+            buffer_ops.buffer_store(next_running, prefix_rsrc, ArithValue(e_i32) + one)
+
+            tile_base = ArithValue(e_i32) * ArithValue(max_m_tiles)
+            j_for = scf.ForOp(
+                arith.constant(0, index=True),
+                arith.index_cast(idx_t, tiles),
+                arith.constant(1, index=True),
+            )
+            with ir.InsertionPoint(j_for.body):
+                j_i32 = arith.index_cast(i32, j_for.induction_variable)
+                pos = ArithValue(running) + ArithValue(j_i32)
+                val = ArithValue(tile_base) + ArithValue(j_i32)
+                buffer_ops.buffer_store(val, map_rsrc, pos)
+                scf.YieldOp([])
+            scf.YieldOp([next_running])
+
+    @flyc.jit
+    def launch_m_tile_prefix_map(
+        masked_m: fx.Tensor,
+        m_tile_prefix: fx.Tensor,
+        m_tile_map: fx.Tensor,
+        experts: fx.Int32,
+        max_m: fx.Int32,
+        tile_m: fx.Int32,
+        max_m_tiles: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            pass
+
+        m_tile_prefix_map_kernel(
+            masked_m, m_tile_prefix, m_tile_map, experts, max_m, tile_m, max_m_tiles
+        ).launch(
+            grid=(arith.constant(1, index=True), 1, 1),
+            block=(1, 1, 1),
+            stream=stream,
+        )
+
+    return launch_m_tile_prefix_map

@@ -236,6 +236,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     try:
         from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (
+            _GroupedA8W4Config,
+            _make_m_tile_prefix_map,
             compile_moe_grouped_gemm1_a8w4_masked,
             compile_moe_grouped_gemm2_a8w4_masked,
             compile_moe_grouped_gemm1_mxfp4_masked,
@@ -244,6 +246,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     except Exception as vendored_exc:
         try:
             from kernels.moe_grouped_gemm_mxscale_gfx1250 import (
+                _GroupedA8W4Config,
+                _make_m_tile_prefix_map,
                 compile_moe_grouped_gemm1_a8w4_masked,
                 compile_moe_grouped_gemm2_a8w4_masked,
                 compile_moe_grouped_gemm1_mxfp4_masked,
@@ -308,6 +312,38 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         topids_to_rows, rows_to_tokens, masked_m = build_route_maps(topk_ids, E, max_m)
     # Grouped row -> source token, (E, max_m); padding rows (-1) are never read
     # because the naive epilogues are bounded by per-expert counts.
+    out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
+    m_tile_prefix = None
+    m_tile_map = None
+    if not _use_naive:
+        _m_tile_cfg = _GroupedA8W4Config(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            max_m=max_m,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
+            num_buffers=2,
+            waves_per_eu=None,
+            out_dtype=out_dtype_str,
+            use_tdm_store=True,
+            inst_prefetch=False,
+            wave_specialized_tdm=False,
+            split_k=1,
+            cluster_m=1,
+            cluster_n=1,
+            use_scale_opsel=False,
+            expert_sched_mode=False,
+            grouped_persistent_m=True,
+            persistent_workers=None,
+            data_format=data_format,
+            act="swiglu" if activation == ActivationType.Swiglu else "silu",
+            stage1_weight_layout=stage1_weight_layout,
+        )
+        m_tile_prefix, m_tile_map = _make_m_tile_prefix_map(masked_m, _m_tile_cfg)
 
     if data_format == "fp4":
         # a1 fp4 quant: AITER_GROUPED_GEMM_NAIVE=1 uses the torch reference
@@ -433,7 +469,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         tile_k=tile_k,
         m_warp=m_warp,
         n_warp=n_warp,
-        out_dtype="bf16" if dtype == dtypes.bf16 else "f16",
+        out_dtype=out_dtype_str,
         num_buffers=2,
         expert_sched_mode=False,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
@@ -457,7 +493,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         model_dim,
         E,
         stream=torch.cuda.current_stream(),
-        bias=bias1.to(dtype) if bias1 is not None else None,
+        _m_tile_prefix=m_tile_prefix,
+        _m_tile_map=m_tile_map,
+        bias=_bias1_arg,
     )
     torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage1 sync OK, unsort")
@@ -546,7 +584,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         tile_k=tile_k,
         m_warp=m_warp,
         n_warp=n_warp,
-        out_dtype="bf16" if dtype == dtypes.bf16 else "f16",
+        out_dtype=out_dtype_str,
         num_buffers=2,
         expert_sched_mode=False,
     )
@@ -568,7 +606,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         inter_dim,
         E,
         stream=torch.cuda.current_stream(),
-        bias=bias2.to(dtype) if bias2 is not None else None,
+        _m_tile_prefix=m_tile_prefix,
+        _m_tile_map=m_tile_map,
+        bias=_bias2_arg,
     )
     torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage2 sync OK")

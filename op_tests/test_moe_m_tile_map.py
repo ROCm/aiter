@@ -30,9 +30,7 @@ def _ref_packed(masked_m, experts, max_m, tile_m):
     valid_tiles = ((valid_m + (tile_m - 1)) // tile_m).cpu().tolist()
     max_m_tiles = (max_m + tile_m - 1) // tile_m
     packed = [
-        e * max_m_tiles + j
-        for e, c in enumerate(valid_tiles)
-        for j in range(int(c))
+        e * max_m_tiles + j for e, c in enumerate(valid_tiles) for j in range(int(c))
     ]
     return packed, max_m_tiles
 
@@ -47,7 +45,9 @@ def _run_one(experts, max_m, tile_m, dist, seed=0):
 
     gen = torch.Generator(device="cuda").manual_seed(seed)
     if dist == "rand":
-        masked_m = torch.randint(0, max_m + 1, (experts,), generator=gen, device="cuda").to(torch.int32)
+        masked_m = torch.randint(
+            0, max_m + 1, (experts,), generator=gen, device="cuda"
+        ).to(torch.int32)
     elif dist == "empty":
         masked_m = torch.zeros(experts, dtype=torch.int32, device="cuda")
     elif dist == "full":

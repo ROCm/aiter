@@ -69,7 +69,7 @@ def compare(M, N, dtype, seed=0):
     max_exp_delta = int(ds.max().item()) if s_tot else 0
     scale_bounded = max_exp_delta <= 1
 
-    status = "IDENTICAL" if (y_eq and s_eq) else f"DIFFERS(<=1exp)"
+    status = "IDENTICAL" if (y_eq and s_eq) else "DIFFERS(<=1exp)"
     ok = scale_bounded  # bit-identical is allowed but not required
     print(
         f"[{'PASS' if ok else 'FAIL'}] {str(dtype):14} {M}x{N}: {status} | "
