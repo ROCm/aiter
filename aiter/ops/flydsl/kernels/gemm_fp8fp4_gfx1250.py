@@ -1086,8 +1086,11 @@ def compile_fp8fp4_gemm(
                         fmtB=0,
                     )
                 else:
-                    # for compatibility, use the following no-scale wmma instead future
-                    # accs[idx] = rocdl.wmma_f32_16x16x128_fp8_fp8(T.vec(8, T.f32), b_frag, a_frag, accs[idx])
+                    # PTPC-FP8 needs no per-K scaling. We emit the scaled f8f6f4 op
+                    # with an identity E8M0 scale (0x7F = 2^0 = 1.0) for toolchain
+                    # compatibility; it is numerically equivalent to the dedicated
+                    # no-scale op. Future: switch to the equivalent no-scale wmma:
+                    #   accs[idx] = rocdl.wmma_f32_16x16x128_fp8_fp8(T.vec(8, T.f32), b_frag, a_frag, accs[idx])
                     accs[idx] = rocdl.wmma_scale_f32_16x16x128_f8f6f4(
                         T.vec(8, T.f32),
                         b_frag,
@@ -2399,8 +2402,16 @@ def compile_fp8fp4_gemm(
         def epilogue_load_ptpc_scales():
             # PTPC scales: sa[M] per-token (scalar per wm), sb[N] per-channel
             # (8 contiguous N cols per wn). Both fp32, constant along K.
-            sa_rsrc = buffer_ops.create_buffer_resource(arg_a_scale, max_size=False)
-            sb_rsrc = buffer_ops.create_buffer_resource(arg_b_scale, max_size=False)
+            # The scale memrefs are dynamically shaped, so max_size=False would fall
+            # back to a max-sized descriptor and disable hardware OOB. Derive
+            # num_records from runtime M / compile-time N (fp32 = 4 bytes) so the
+            # partial last M-tile clips rows >= M (and cols >= N) to 0.
+            sa_rsrc = buffer_ops.create_buffer_resource(
+                arg_a_scale, num_records_bytes=m_idx * arith.index(4)
+            )
+            sb_rsrc = buffer_ops.create_buffer_resource(
+                arg_b_scale, num_records_bytes=N * 4
+            )
             sa = []
             for wm in range_constexpr(wmma_m_rep):
                 row = blk_m + warp_m_base + arith.index(wm * WMMA_M) + lane16
