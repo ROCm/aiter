@@ -28,6 +28,22 @@ HEAD_DIM_QK = 192
 HEAD_DIM_V = 128
 
 
+def _time_fn(fn, warmup, repeat):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    latencies = []
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    for _ in range(repeat):
+        start_event.record()
+        fn()
+        end_event.record()
+        end_event.synchronize()
+        latencies.append(start_event.elapsed_time(end_event))
+    return sum(latencies) / len(latencies)
+
+
 def _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False):
     """PyTorch reference for varlen THD layout, per-batch."""
     B = len(cu_q) - 1
@@ -99,21 +115,8 @@ def run_varlen_test(
             return_lse=return_lse,
         )
 
-    for _ in range(warmup):
-        result = _run()
-    torch.cuda.synchronize()
-
-    latencies = []
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    for _ in range(repeat):
-        start_event.record()
-        result = _run()
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
-
-    avg_ms = sum(latencies) / len(latencies)
+    avg_ms = _time_fn(_run, warmup, repeat)
+    result = _run()
 
     if return_lse:
         o, lse = result
@@ -409,21 +412,6 @@ if __name__ == "__main__":
         from aiter.ops.triton.attention.mha import (
             flash_attn_varlen_func as triton_varlen_func,
         )
-
-    def _time_fn(fn, warmup, repeat):
-        for _ in range(warmup):
-            fn()
-        torch.cuda.synchronize()
-        latencies = []
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        for _ in range(repeat):
-            start_event.record()
-            fn()
-            end_event.record()
-            end_event.synchronize()
-            latencies.append(start_event.elapsed_time(end_event))
-        return sum(latencies) / len(latencies)
 
     n_pass = 0
     collected = []
