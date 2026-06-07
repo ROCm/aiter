@@ -829,9 +829,36 @@ def xcd_remap_bx_by(
     _c_tm = fx.arith.constant(tile_m, index=True)
     _gx = fx.arith.constant(N // tile_n, index=True)
     _gy = (c_m + _c_tm - _c1) / _c_tm
-    return xcd_remap_bx_by_grid(
-        bx, by, _gx, _gy, xcd_swizzle=xcd_swizzle, num_xcds=num_xcds
-    )
+
+    _linear_id = bx * _gx + by
+    _num_wgs = _gx * _gy
+
+    # Round-robin workgroups across XCDs, distributing the tail remainder over
+    # the first `_r` XCDs so `_wgid` stays a bijection over [0, _num_wgs) even
+    # when `_num_wgs` is not a multiple of `num_xcds` (dropping `_clip` would
+    # collide/skip tiles -> wrong output for those shapes). This matches main's
+    # preshuffle remap; mixed_moe uses the no-clip variant below.
+    _c_xcds = fx.arith.constant(num_xcds, index=True)
+    _q = _num_wgs / _c_xcds
+    _r = _num_wgs % _c_xcds
+    _xcd = _linear_id % _c_xcds
+    _in_xcd = _linear_id / _c_xcds
+    _xcd_lt_r = fx.arith.cmpi(CmpIPredicate.ult, _xcd, _r)
+    _clip = fx.arith.select(_xcd_lt_r, _xcd, _r)
+    _wgid = _xcd * _q + _clip + _in_xcd
+
+    _c_wgm = fx.arith.constant(xcd_swizzle, index=True)
+    _num_wgid_in_group = _c_wgm * _gx
+    _group_id = _wgid / _num_wgid_in_group
+    _first_pid_m = _group_id * _c_wgm
+    _remaining_m = _gy - _first_pid_m
+    _cmp_m = fx.arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
+    _group_size_m = fx.arith.select(_cmp_m, _remaining_m, _c_wgm)
+
+    _wgid_in_group = _wgid % _num_wgid_in_group
+    new_bx = _first_pid_m + (_wgid_in_group % _group_size_m)
+    new_by = _wgid_in_group / _group_size_m
+    return new_bx, new_by
 
 
 def xcd_remap_bx_by_grid(
@@ -843,37 +870,33 @@ def xcd_remap_bx_by_grid(
     xcd_swizzle: int,
     num_xcds: int = 8,
 ):
-    """Remap (bx, by) when grid extents (gx, gy) are already computed."""
+    """Remap (bx, by) when grid extents (gx, gy) are already computed.
+
+    No-clip variant used by mixed_moe (matches main's inline persistent-loop
+    remap). preshuffle uses the remainder-distributing ``xcd_remap_bx_by``.
+    """
     if xcd_swizzle <= 0:
         return bx, by
 
     _linear_id = bx * gx + by
     _num_wgs = gx * gy
 
-    # Round-robin workgroups across XCDs, distributing the tail remainder over
-    # the first `_r` XCDs so `_wgid` stays a bijection over [0, _num_wgs) even
-    # when `_num_wgs` is not a multiple of `num_xcds` (dropping `_clip` would
-    # collide/skip tiles -> wrong output for those shapes).
-    _c_xcds = fx.arith.constant(num_xcds, index=True)
-    _q = _num_wgs / _c_xcds
-    _r = _num_wgs % _c_xcds
-    _xcd = _linear_id % _c_xcds
-    _in_xcd = _linear_id / _c_xcds
-    _xcd_lt_r = fx.arith.cmpi(CmpIPredicate.ult, _xcd, _r)
-    _clip = fx.arith.select(_xcd_lt_r, _xcd, _r)
-    _wgid = _xcd * _q + _clip + _in_xcd
+    _c_xcds = fx.Index(num_xcds)
+    _wgs_per_xcd = _num_wgs // _c_xcds
+    _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id // _c_xcds)
 
-    _c_wgm = fx.arith.constant(xcd_swizzle, index=True)
+    _c_wgm = fx.Index(xcd_swizzle).ir_value()
     _num_wgid_in_group = _c_wgm * gx
-    _group_id = _wgid / _num_wgid_in_group
+    _group_id = _wgid // _num_wgid_in_group
     _first_pid_m = _group_id * _c_wgm
     _remaining_m = gy - _first_pid_m
-    _cmp_m = fx.arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
-    _group_size_m = fx.arith.select(_cmp_m, _remaining_m, _c_wgm)
+    _group_size_m = (fx.Index(_remaining_m) < fx.Index(_c_wgm)).select(
+        _remaining_m, _c_wgm
+    )
 
     _wgid_in_group = _wgid % _num_wgid_in_group
     new_bx = _first_pid_m + (_wgid_in_group % _group_size_m)
-    new_by = _wgid_in_group / _group_size_m
+    new_by = _wgid_in_group // _group_size_m
     return new_bx, new_by
 
 
