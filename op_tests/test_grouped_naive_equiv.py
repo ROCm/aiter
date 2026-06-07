@@ -68,14 +68,19 @@ def _import():
 def _make_topk_ids(token_num, topk, E, seed):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     return torch.stack(
-        [torch.randperm(E, generator=gen, device="cuda")[:topk] for _ in range(token_num)]
+        [
+            torch.randperm(E, generator=gen, device="cuda")[:topk]
+            for _ in range(token_num)
+        ]
     ).to(torch.int32)
 
 
 def _max_m_from_topk_ids(topk_ids, E):
     counts = torch.bincount(topk_ids.reshape(-1).long(), minlength=E)
     raw_max_m = int(counts.max().item()) if counts.numel() else 0
-    return max(WARP_TILE_M, ((raw_max_m + WARP_TILE_M - 1) // WARP_TILE_M) * WARP_TILE_M)
+    return max(
+        WARP_TILE_M, ((raw_max_m + WARP_TILE_M - 1) // WARP_TILE_M) * WARP_TILE_M
+    )
 
 
 def _check_maps_equiv(topk_ids, E, max_m):
@@ -114,8 +119,12 @@ def _check_scatter_equiv(topk_ids, E, max_m, maps):
     token_num, topk = topk_ids.shape
     dim = 256  # bytes per token (multiple of 32)
     gen = torch.Generator(device="cuda").manual_seed(123)
-    x = torch.randint(0, 256, (token_num, dim), dtype=torch.uint8, device="cuda", generator=gen)
-    sc = torch.randint(0, 256, (token_num, dim // 32), dtype=torch.uint8, device="cuda", generator=gen)
+    x = torch.randint(
+        0, 256, (token_num, dim), dtype=torch.uint8, device="cuda", generator=gen
+    )
+    sc = torch.randint(
+        0, 256, (token_num, dim // 32), dtype=torch.uint8, device="cuda", generator=gen
+    )
 
     ok = True
     for r2t in (r2t_k, r2t_n):
@@ -145,13 +154,17 @@ def _check_gather_equiv(topk_ids, topk_weight, E, max_m, maps):
     dim = 512
     gen = torch.Generator(device="cuda").manual_seed(7)
     # per-route contribution = "expert output for this token"
-    contrib = torch.randn(token_num, topk, dim, generator=gen, device="cuda", dtype=torch.bfloat16)
+    contrib = torch.randn(
+        token_num, topk, dim, generator=gen, device="cuda", dtype=torch.bfloat16
+    )
     w = topk_weight.to(torch.bfloat16)
 
     outs = []
     for t2r in (t2r_k, t2r_n):
         grouped_out = torch.zeros((E, max_m, dim), dtype=torch.bfloat16, device="cuda")
-        grouped_out.view(E * max_m, dim)[t2r.reshape(-1).long()] = contrib.reshape(-1, dim)
+        grouped_out.view(E * max_m, dim)[t2r.reshape(-1).long()] = contrib.reshape(
+            -1, dim
+        )
         moe = gather_reduce(grouped_out, t2r, w)
         torch.cuda.synchronize()
         outs.append(moe)

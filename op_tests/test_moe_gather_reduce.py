@@ -35,10 +35,10 @@ WARP_TILE_M = 16  # tile_m // m_warp in the grouped a8w4/a4w4 path
 # ``index_add_`` loop the optimized FlyDSL kernel must reproduce.
 # ---------------------------------------------------------------------------
 def ref_moe_gather_reduce(
-    grouped_out,    # (E, max_m, model_dim)
-    route_tokens,   # (E, max_m) long  -- dest token per grouped row
+    grouped_out,  # (E, max_m, model_dim)
+    route_tokens,  # (E, max_m) long  -- dest token per grouped row
     route_weights,  # (E, max_m)       -- route weight per grouped row
-    counts,         # (E,)             -- valid rows per expert
+    counts,  # (E,)             -- valid rows per expert
     token_num,
     doweight_stage1,
 ):
@@ -114,8 +114,10 @@ def _build_grouped_layout(token_num, topk, E_total, ep, model_dim, dtype, seed):
 
     # Each token routes to topk distinct LOCAL experts (the real-path contract).
     topk_ids = torch.stack(
-        [torch.randperm(E_local, generator=gen, device="cuda")[:topk]
-         for _ in range(token_num)]
+        [
+            torch.randperm(E_local, generator=gen, device="cuda")[:topk]
+            for _ in range(token_num)
+        ]
     ).to(torch.long)
     topk_weight = torch.rand(
         (token_num, topk), generator=gen, device="cuda", dtype=torch.float32
@@ -145,16 +147,31 @@ def _build_grouped_layout(token_num, topk, E_total, ep, model_dim, dtype, seed):
     grouped_out = torch.randn(
         (E_local, max_m, model_dim), generator=gen, device="cuda", dtype=torch.float32
     ).to(dtype)
-    return (grouped_out, topk_ids, topk_weight, route_tokens, route_weights,
-            counts, max_m, E_local)
-
-
-def _run_one(token_num, topk, E_total, ep, model_dim, dtype, doweight_stage1,
-             seed=0, name=""):
-    (grouped_out, topk_ids, topk_weight, route_tokens, route_weights,
-     counts, max_m, E_local) = _build_grouped_layout(
-        token_num, topk, E_total, ep, model_dim, dtype, seed
+    return (
+        grouped_out,
+        topk_ids,
+        topk_weight,
+        route_tokens,
+        route_weights,
+        counts,
+        max_m,
+        E_local,
     )
+
+
+def _run_one(
+    token_num, topk, E_total, ep, model_dim, dtype, doweight_stage1, seed=0, name=""
+):
+    (
+        grouped_out,
+        topk_ids,
+        topk_weight,
+        route_tokens,
+        route_weights,
+        counts,
+        max_m,
+        E_local,
+    ) = _build_grouped_layout(token_num, topk, E_total, ep, model_dim, dtype, seed)
 
     # reference: scatter (index_add_) using route_tokens/route_weights
     ref = ref_moe_gather_reduce(
@@ -212,7 +229,7 @@ def _run_perf(args):
 
     token_num = args.tokens[0] if args.tokens else 1
     dtype = torch.bfloat16
-    (grouped_out, topk_ids, topk_weight, _rt, _rw, counts, max_m, E_local) = (
+    grouped_out, topk_ids, topk_weight, _rt, _rw, counts, max_m, E_local = (
         _build_grouped_layout(token_num, args.topk, args.E, 1, args.model_dim, dtype, 0)
     )
     out = torch.empty((token_num, args.model_dim), dtype=dtype, device="cuda")
@@ -242,17 +259,34 @@ def _run_perf(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("-t", "--tokens", type=int, action="append", default=None,
-                    help="token counts for the real-world sweep (decode=1, prefill=N)")
-    ap.add_argument("--tp", type=int, action="append", default=None,
-                    help="tensor/expert-parallel degrees (default: 1 and 8)")
+    ap.add_argument(
+        "-t",
+        "--tokens",
+        type=int,
+        action="append",
+        default=None,
+        help="token counts for the real-world sweep (decode=1, prefill=N)",
+    )
+    ap.add_argument(
+        "--tp",
+        type=int,
+        action="append",
+        default=None,
+        help="tensor/expert-parallel degrees (default: 1 and 8)",
+    )
     ap.add_argument("--dtype", choices=["bf16", "f16", "both"], default="both")
-    ap.add_argument("--skip-generic", action="store_true",
-                    help="run only the real-world model shapes")
+    ap.add_argument(
+        "--skip-generic",
+        action="store_true",
+        help="run only the real-world model shapes",
+    )
     # --perf: profile flydsl_moe_gather_reduce with test_common.run_perftest and
     # dump the per-op breakdown (the host-side hot loop) via AITER_LOG_MORE.
-    ap.add_argument("--perf", action="store_true",
-                    help="profile the gather-reduce hot loop instead of correctness")
+    ap.add_argument(
+        "--perf",
+        action="store_true",
+        help="profile the gather-reduce hot loop instead of correctness",
+    )
     ap.add_argument("--E", type=int, default=32, help="[--perf] experts")
     ap.add_argument("--topk", type=int, default=8, help="[--perf] topk")
     ap.add_argument("--model-dim", type=int, default=4096, help="[--perf] model dim")
@@ -277,15 +311,17 @@ def main():
     # Generic correctness sweep (small shapes, edge cases), single rank.
     if not args.skip_generic:
         for tn in [1, 7, 128]:
-            for (E, topk) in [(8, 1), (8, 2), (32, 8)]:
+            for E, topk in [(8, 1), (8, 2), (32, 8)]:
                 for model_dim in [512, 4096]:
                     for dt in dtypes:
                         for dw1 in (False, True):
-                            configs.append((tn, topk, E, 1, model_dim, dt, dw1, "generic"))
+                            configs.append(
+                                (tn, topk, E, 1, model_dim, dt, dw1, "generic")
+                            )
 
     # Real-world model shapes at TP1 and TP8 (experts sharded by TP), decode and
     # a prefill batch. bf16 is the deployment dtype for these models.
-    for (name, hidden, E_total, topk) in REAL_MODELS:
+    for name, hidden, E_total, topk in REAL_MODELS:
         for tp in tps:
             for tn in tokens:
                 for dw1 in (False, True):
