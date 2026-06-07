@@ -28,6 +28,7 @@ _WMMA_K = 128
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
 
+
 def _lazy_import():
     global _compile_ptpc_gemm, _run_compiled, _fx
     if _compile_ptpc_gemm is not None:
