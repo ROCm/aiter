@@ -19,6 +19,7 @@ from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import wmma_kernel_name
 WMMA = 16  # WMMA M/N tile granularity
 WARP = 2  # default m_warp / n_warp for WmmaKernelInstance
 LDS_BYTES = 320 * 1024  # gfx1250 shared-memory capacity (== device limit)
+_MAX_WARP_TILE = 128
 
 # Mirror the ptpc fp8 LDS layout in gemm_fp8fp4_gfx1250.compile_fp8fp4_gemm so the
 # candidate filter matches the kernel's real allocation. fp8 packs 1 byte/elem
@@ -31,8 +32,8 @@ _ELEM_BYTES_D = 2  # bf16 / f16 output
 _TILE_M = (16, 32, 64, 256)
 _TILE_N = (32, 64, 128, 256)
 _TILE_K = (128, 256)
-_NUM_BUFFERS = (4,)
-_SPLIT_K = (1, 2, 4)
+_NUM_BUFFERS = (3, 4)
+_SPLIT_K = (1, 2, 4, 8)
 # (m_warp, n_warp): wave-specialized ptpc requires m_warp*n_warp >= 2, and
 # block_threads = m_warp*n_warp*32 <= 1024 (m_warp*n_warp <= 32). m_warp=1 with a
 # small tile_m wins for decode (small M); m_warp=2 serves larger M; n_warp=4 helps
@@ -70,10 +71,13 @@ class WmmaKernelInstance:
 
 def _tile_valid(tm: int, tn: int, tk: int, mw: int, nw: int) -> bool:
     # Mirrors the kernel's warp_tile_m/n constraints: each must be a multiple of
-    # WMMA (16). block_threads = mw*nw*32 <= 1024 (mw*nw <= 32).
+    # WMMA (16) and at most _MAX_WARP_TILE (per-wave VGPR/accumulator budget; see
+    # the _MAX_WARP_TILE note). block_threads = mw*nw*32 <= 1024 (mw*nw <= 32).
     return (
         tm % (mw * WMMA) == 0
         and tn % (nw * WMMA) == 0
+        and tm // mw <= _MAX_WARP_TILE
+        and tn // nw <= _MAX_WARP_TILE
         and tk % 128 == 0
         and mw * nw <= 32
     )
