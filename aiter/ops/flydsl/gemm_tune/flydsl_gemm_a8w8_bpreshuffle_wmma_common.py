@@ -6,7 +6,8 @@
 gfx1250 has no MFMA preshuffle kernel; it runs the vendored gemm_fp8fp4_gfx1250
 WMMA kernel (ptpc) via ``bpreshuffle_gemm_gfx1250``. This is the WMMA counterpart
 of ``flydsl_gemm_a8w8_bpreshuffle_common`` (which serves gfx942/gfx950 MFMA), with
-its own perf knobs — num_buffers, split_k, cluster — and kernelName format.
+its own perf knobs (num_buffers and split_k) and kernelName format. Cluster is
+kept in the candidate schema/name but fixed to (1, 1).
 """
 
 from __future__ import annotations
@@ -34,12 +35,8 @@ _TILE_N = (32, 64, 128, 256)
 _TILE_K = (128, 256)
 _NUM_BUFFERS = (3, 4)
 _SPLIT_K = (1, 2, 4, 8)
-# (m_warp, n_warp): wave-specialized ptpc requires m_warp*n_warp >= 2, and
-# block_threads = m_warp*n_warp*32 <= 1024 (m_warp*n_warp <= 32). m_warp=1 with a
-# small tile_m wins for decode (small M); m_warp=2 serves larger M; n_warp=4 helps
-# very wide N. Add (1, 4) / (4, 2) here if a shape benefits.
-_WARP_COMBOS = ((1, 2), (2, 2), (2, 4))
-_CLUSTER = ((1, 1),)  # cluster_m * cluster_n <= 16
+_WARP_COMBOS = ((1, 2), (2, 2), (1, 4))
+_CLUSTER = ((1, 1),)  # Keep cluster in candidates/name.
 
 
 @dataclass
@@ -137,16 +134,13 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     each split-k chunk must hold >= num_buffers K-tiles to fill the pipeline. M may
     be ragged — the kernel clips loads/stores to M via hardware out-of-bounds, so no
     M divisibility is required (a cluster just rounds the M-grid up and OOB-clips the
-    extra tiles). A cluster still needs N cluster-tile-divisible and only pays off
-    for M, N >= 4096. (LDS is bounded at build time, so it is not re-checked here.)
+    extra tiles). A cluster still needs N cluster-tile-divisible.
     """
     if N % ki.tile_n != 0 or K % (ki.split_k * ki.tile_k) != 0:
         return False
     if (K // ki.split_k) // ki.tile_k < ki.num_buffers:
         return False
     if ki.cluster_m > 1 or ki.cluster_n > 1:
-        if M < 4096 or N < 4096:
-            return False
         if N % (ki.cluster_n * ki.tile_n) != 0:
             return False
     return True
