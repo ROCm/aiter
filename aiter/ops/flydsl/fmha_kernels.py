@@ -236,31 +236,39 @@ def flydsl_flash_attn_varlen_func(
     """
     from ...jit.utils.chip_info import get_gfx
 
-    if (
+    # FlyDSL handles only plain MHA. Any unsupported feature (bias, alibi, sink,
+    # dropout, sliding window, paging, probs/deterministic) falls through to
+    # CK/Triton instead of being silently dropped.
+    supported = (
         get_gfx() == "gfx1250"
         and q.shape[-1] == 192
         and v.shape[-1] == 128
         and q.dtype == torch.bfloat16
-    ):
-        assert bias is None, "FlyDSL MHA does not support bias"
-        assert alibi_slopes is None, "FlyDSL MHA does not support alibi_slopes"
-        assert not deterministic, "FlyDSL MHA does not support deterministic"
-        assert not return_attn_probs, "FlyDSL MHA does not support return_attn_probs"
-        assert sink is None, "FlyDSL MHA does not support sink"
-        # gfx1250 — varlen THD, D_qk=192 D_v=128, bf16
-        if out is None:
-            out = torch.empty_like(q[:, :, : v.shape[-1]])
-        return flash_attn_varlen_d192_gfx1250(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            out=out,
-            return_lse=return_lse,
-        )
-    return None
+        and dropout_p == 0.0
+        and tuple(window_size[:2]) == (-1, -1)
+        and block_table is None
+        and bias is None
+        and alibi_slopes is None
+        and sink is None
+        and not deterministic
+        and not return_attn_probs
+    )
+    if not supported:
+        return None
+
+    # gfx1250 — varlen THD, D_qk=192 D_v=128, bf16
+    if out is None:
+        out = torch.empty_like(q[:, :, : v.shape[-1]])
+    return flash_attn_varlen_d192_gfx1250(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        out=out,
+        return_lse=return_lse,
+    )
