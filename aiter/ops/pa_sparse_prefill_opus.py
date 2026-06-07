@@ -225,7 +225,9 @@ def pa_sparse_prefill_opus_fp8(
     dev = q_nope.device
 
     q_bf16 = torch.empty((n, h, _FP8_FULL), dtype=torch.bfloat16, device=dev)
-    unified_kv_bf16 = torch.empty((total_pages, _FP8_FULL), dtype=torch.bfloat16, device=dev)
+    unified_kv_bf16 = torch.empty(
+        (total_pages, _FP8_FULL), dtype=torch.bfloat16, device=dev
+    )
     kv_bf16 = torch.empty((total_tokens, _FP8_FULL), dtype=torch.bfloat16, device=dev)
     if out is None:
         out = torch.empty((n, h, _FP8_FULL), dtype=torch.bfloat16, device=dev)
@@ -300,7 +302,9 @@ def pa_sparse_prefill_opus_fp8_fused(
     """
     gfx = get_gfx_runtime()
     if gfx != "gfx950":
-        raise RuntimeError(f"pa_sparse_prefill_opus_fp8_fused requires gfx950, got {gfx}")
+        raise RuntimeError(
+            f"pa_sparse_prefill_opus_fp8_fused requires gfx950, got {gfx}"
+        )
     if q_nope.dtype != torch.float8_e4m3fn:
         raise RuntimeError(f"q_nope must be fp8 e4m3fn, got {q_nope.dtype}")
     n, h = q_nope.size(0), q_nope.size(1)
@@ -309,12 +313,22 @@ def pa_sparse_prefill_opus_fp8_fused(
     if out is None:
         out = torch.empty((n, h, _FP8_FULL), dtype=torch.bfloat16, device=q_nope.device)
     pa_sparse_prefill_opus_fp8_fused_fwd(
-        q_nope, q_rope, q_scale,
-        unified_kv_nope, unified_kv_rope, unified_kv_scale,
-        kv_nope, kv_rope, kv_scale,
-        kv_indices_prefix, kv_indptr_prefix,
-        kv_indices_extend, kv_indptr_extend,
-        attn_sink, out, float(softmax_scale),
+        q_nope,
+        q_rope,
+        q_scale,
+        unified_kv_nope,
+        unified_kv_rope,
+        unified_kv_scale,
+        kv_nope,
+        kv_rope,
+        kv_scale,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        out,
+        float(softmax_scale),
     )
     return out
 

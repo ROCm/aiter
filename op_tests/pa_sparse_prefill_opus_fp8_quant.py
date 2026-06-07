@@ -46,9 +46,7 @@ def cast_scale_to_ue8m0(scale: torch.Tensor) -> torch.Tensor:
     Matches test_mla_v4_nm.py::_cast_scale_inv_to_ue8m0 :
         2 ** ceil(log2(clamp_min(scale, 1e-4)))
     """
-    return torch.pow(
-        2.0, torch.clamp_min(scale, 1e-4).log2().ceil()
-    ).to(torch.float32)
+    return torch.pow(2.0, torch.clamp_min(scale, 1e-4).log2().ceil()).to(torch.float32)
 
 
 def quantize_to_v4_fp8(x_bf16: torch.Tensor):
@@ -58,7 +56,9 @@ def quantize_to_v4_fp8(x_bf16: torch.Tensor):
     Per 64-tile of NOPE: ``scale = ue8m0(amax / fp8_max)``,
     ``nope_fp8 = (tile / scale).to(fp8)``. ROPE is the trailing 64 dims, kept BF16.
     """
-    assert x_bf16.shape[-1] == D_FULL, f"expected last dim {D_FULL}, got {x_bf16.shape[-1]}"
+    assert (
+        x_bf16.shape[-1] == D_FULL
+    ), f"expected last dim {D_FULL}, got {x_bf16.shape[-1]}"
     fp8 = _fp8_dtype()
     fp8_max = torch.finfo(fp8).max
 
@@ -101,7 +101,9 @@ if __name__ == "__main__":
     assert torch.all((scale.log2().round() - scale.log2()).abs() < 1e-5)
     deq = dequantize_v4_fp8(nope_q, rope, scale)
     # rope is lossless (bf16->bf16)
-    assert torch.allclose(deq[..., D_NOPE:], x[..., D_NOPE:].to(torch.float32).to(torch.bfloat16))
+    assert torch.allclose(
+        deq[..., D_NOPE:], x[..., D_NOPE:].to(torch.float32).to(torch.bfloat16)
+    )
     # nope within fp8 quant error of the per-tile range
     err = (deq[..., :D_NOPE].float() - x[..., :D_NOPE].float()).abs()
     rel = err / (x[..., :D_NOPE].float().abs() + 1e-3)
