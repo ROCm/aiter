@@ -85,6 +85,23 @@ def _use_grouped_gemm_enabled() -> bool:
     return os.environ.get("AITER_USE_GROUPED_GEMM", "1") in _TRUTHY_ENV
 
 
+def _use_grouped_persistent_m() -> bool:
+    """Select the grouped-GEMM tiling mode (default: persistent).
+
+    The persistent ("grouped_persistent_m") kernel needs a per-launch tile
+    schedule (m_tile_prefix + m_tile_map). Building m_tile_map does a host
+    round-trip (``.cpu().tolist()`` + ``torch.tensor(..., device=...)`` in
+    ``moe_grouped_gemm_mxscale_gfx1250._make_m_tile_map``), i.e. one Memcpy DtoH
+    + one Memcpy HtoD per stage launch. The non-persistent kernel takes
+    ``masked_m`` directly and skips that round-trip entirely, at the cost of
+    launching the full ``max_m`` tile grid per expert (padding tiles masked off).
+
+    Set ``AITER_GROUPED_GEMM_PERSISTENT=0`` to opt into the non-persistent mode
+    (no host round-trip); default ``1`` keeps the persistent kernel.
+    """
+    return os.environ.get("AITER_GROUPED_GEMM_PERSISTENT", "1") in _TRUTHY_ENV
+
+
 def _moe_sorting_torch_gfx1250(
     topk_ids,
     topk_weights,
@@ -885,6 +902,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg("scale layout done")
 
     grouped_a2 = torch.empty((E, max_m, inter_dim), dtype=dtype, device=device)
+    # Persistent (default) vs non-persistent grouped-GEMM tiling. Non-persistent
+    # (AITER_GROUPED_GEMM_PERSISTENT=0) skips the per-launch m_tile_map host
+    # round-trip (Memcpy DtoH+HtoD per stage); see _use_grouped_persistent_m.
+    grouped_persistent_m = _use_grouped_persistent_m()
     stage1_compiler = (
         compile_moe_grouped_gemm1_mxfp4_masked
         if data_format == "fp4"
@@ -906,6 +927,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         expert_sched_mode=False,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
+        grouped_persistent_m=grouped_persistent_m,
     )
     _grouped_dbg("stage1 compile done; start launch")
     _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
@@ -1026,6 +1048,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         out_dtype="bf16" if dtype == dtypes.bf16 else "f16",
         num_buffers=2,
         expert_sched_mode=False,
+        grouped_persistent_m=grouped_persistent_m,
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None
