@@ -338,7 +338,7 @@ def _gemm_a16w16_basic_kernel(
         offs_bias = pid_n * BLOCK_N + gl.arange(
             0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
         )
-        bias_vals = gl.load(bias_ptr + offs_bias)
+        bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
         accumulator = accumulator + bias_vals[None, :]
 
     # Activation
@@ -618,7 +618,7 @@ def _gemm_a16w16_warp_priority_kernel(
         offs_bias = pid_n * BLOCK_N + gl.arange(
             0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
         )
-        bias_vals = gl.load(bias_ptr + offs_bias)
+        bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
         accumulator = accumulator + bias_vals[None, :]
 
     # Activation
@@ -1035,7 +1035,7 @@ def _gemm_a16w16_k_subtiling_kernel(
         offs_bias = pid_n * BLOCK_N + gl.arange(
             0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
         )
-        bias_vals = gl.load(bias_ptr + offs_bias)
+        bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
         accumulator = accumulator + bias_vals[None, :]
 
     # Activation
@@ -1457,7 +1457,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
         offs_bias = pid_n * BLOCK_N + gl.arange(
             0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
         )
-        bias_vals = gl.load(bias_ptr + offs_bias)
+        bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
         accumulator = accumulator + bias_vals[None, :]
 
     # Activation
@@ -1576,6 +1576,42 @@ def gemm_a16w16_gfx1250(
         x = torch.nn.functional.pad(x, (0, pad_size))
         w = torch.nn.functional.pad(w, (0, pad_size))
         K = K_padded
+
+    # Clamp the software-pipeline depth to the number of K-tiles.
+    #
+    # The prologue/epilogue walk a fixed number of K-tiles determined by
+    # NUM_BUFFERS, independent of how many real tiles exist. If NUM_BUFFERS
+    # exceeds that count the descriptor base advances past the end of K while
+    # its bound stays stale (add_offsets never shrinks it), so TDM OOB
+    # zero-fill cannot fire and the WMMA consumes garbage. Cap the depth at the
+    # real tile count. Variants differ in reach and in the minimum depth they
+    # require:
+    #   basic / warp_priority / k_subtiling : reach num_k_tiles -> cap = num_k_tiles
+    #   lds_pipeline : preloads one tile ahead (needs num_k_tiles >= NB + 1)
+    #                  -> cap = num_k_tiles - 1
+    num_k_tiles = triton.cdiv(K, BLOCK_K)
+    _MIN_BUFFERS = {"basic": 1, "warp_priority": 3, "k_subtiling": 2, "lds_pipeline": 2}
+    _DEPTH_SLACK = {"lds_pipeline": 1}
+
+    # Fall back to the basic kernel when the requested variant cannot satisfy
+    # its minimum pipeline depth for this K. The deeper variants reach more
+    # K-tiles (lds_pipeline preloads one tile ahead) and assert a minimum
+    # NUM_BUFFERS, so for few K-tiles they cannot run correctly. The basic
+    # kernel has no such floor (min depth 1) and is valid for every K, so we
+    # downgrade rather than error -- callers require a functional result for
+    # any shape, and a slower-but-correct kernel is acceptable.
+    depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
+    if depth_cap < _MIN_BUFFERS[kernel_type]:
+        needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
+        _LOGGER.info(
+            f"GEMM_A16W16 [gluon/gfx1250]: kernel_type='{kernel_type}' needs "
+            f"num_k_tiles>={needed} but num_k_tiles={num_k_tiles} "
+            f"(K={K}, BLOCK_K={BLOCK_K}); falling back to kernel_type='basic'."
+        )
+        kernel_type = "basic"
+        depth_cap = num_k_tiles  # basic: depth slack 0, min depth 1
+
+    NUM_BUFFERS = min(NUM_BUFFERS, depth_cap)
 
     w = w.T
 
