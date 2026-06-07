@@ -566,11 +566,15 @@ def compile_mxfp4_gemm2_a4w4(
             # no buffer_load->reg->ds_write round-trip.
             load_a_directlds_bm16(0, 0)
             load_a_directlds_bm16(1, 1)
-            gpu.barrier()
+            # issue B (gate/up weights, the bulk of VMEM) + scales BEFORE the
+            # barrier so their latency overlaps the A direct-LDS DMA (== HIP:
+            # all loads issued, then the drain barrier only waits for the A DMA
+            # while B stays in flight, gated per-MFMA by vmcnt).
             _b0 = load_b_tile(arith.index(0))
             _asc0, _bsc0 = load_scales(arith.index(0))
             _b1 = load_b_tile(arith.index(1))
             _asc1, _bsc1 = load_scales(arith.index(1))
+            gpu.barrier()
             mfma_ktile(_b0, _asc0, _bsc0, a_slot=0)
             mfma_ktile(_b1, _asc1, _bsc1, a_slot=1)
         else:
