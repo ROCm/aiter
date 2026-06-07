@@ -719,10 +719,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
 
-    flat_experts = topk_ids.reshape(-1).to(torch.long)
+    # topk_ids is already an integer tensor; bincount and the bounds checks below
+    # work on it directly, so skip the int64 upcast (saves a per-call cast/copy).
+    flat_experts = topk_ids.reshape(-1)
     if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
         raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
-    counts = torch.bincount(flat_experts, minlength=E)
     # Static upper bound: each token routes at most one row per expert, so no
     # expert can receive more than token_num rows. Using this avoids the
     # ``counts.max().item()`` device->host sync that stalled the launch stream.
@@ -730,21 +731,30 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     max_m = max(warp_tile_m, ((max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m)
     _grouped_dbg(f"routing counts done max_m={max_m}")
 
-    flat_routes = torch.arange(token_num * topk, device=device, dtype=torch.long)
-    flat_tokens = flat_routes // topk
-    route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
-
     # Route maps built once, here, for both paths (route -> grouped row, grouped
     # row -> token, rows-per-expert). AITER_GROUPED_GEMM_NAIVE=0 (default) uses the
     # single-pass atomic-scatter FlyDSL kernel; =1 uses the pure-torch naive build.
     # The two differ only in within-expert row order (self-consistent in both), and
     # the grouped GEMM is order-agnostic per expert, so NAIVE on/off outputs match.
     _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
+    # Per-expert row counts are only consumed by the naive epilogues (the GEMM
+    # mask itself comes from build_route_maps' masked_m). On the NAIVE=0 fast
+    # path we skip the bincount entirely (two int reductions + a device->host
+    # sync). doweight_stage1 needs counts for its per-expert multiply, so it is
+    # only supported on the naive path.
+    counts = None
     if _use_naive:
+        counts = torch.bincount(flat_experts, minlength=E)
         topids_to_rows, rows_to_tokens, masked_m = _build_route_maps_naive(
             topk_ids, E, max_m
         )
+        route_tokens = rows_to_tokens.view(E, max_m).to(torch.long)
     else:
+        if doweight_stage1:
+            raise NotImplementedError(
+                "doweight_stage1 is only supported on the grouped NAIVE path; "
+                "set AITER_GROUPED_GEMM_NAIVE=1"
+            )
         from aiter.ops.flydsl.moe_kernels import build_route_maps
 
         topids_to_rows, rows_to_tokens, masked_m = build_route_maps(
@@ -752,7 +762,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
     # Grouped row -> source token, (E, max_m); padding rows (-1) are never read
     # because the naive epilogues are bounded by per-expert counts.
-    route_tokens = rows_to_tokens.view(E, max_m).to(torch.long)
 
     if data_format == "fp4":
         # a1 fp4 quant: AITER_GROUPED_GEMM_NAIVE=1 uses the torch reference
@@ -836,20 +845,24 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("route gather done")
     else:
         _grouped_dbg("start route gather (naive)")
+        # Per-route source token (token-major); naive-path only.
+        flat_routes = torch.arange(token_num * topk, device=device, dtype=torch.long)
+        flat_tokens = flat_routes // topk
         # grouped_row <- source token, for every route (topids_to_rows are unique
         # per route, so no aliasing in the scatter assignment).
         flat_rows = topids_to_rows.reshape(-1).to(torch.long)
         grouped_a1.view(E * max_m, -1)[flat_rows] = a1_payload[flat_tokens]
         if a1_scale_token_u8 is not None:
             a1_scale_raw.view(E * max_m, -1)[flat_rows] = a1_scale_token_u8[flat_tokens]
+        # route_weights (grouped row -> routing weight) is consumed by the
+        # doweight_stage1 multiply below and the naive gather epilogue. Both run
+        # only on the naive path, so build it here (the kernel epilogue uses
+        # topk_weight directly and never touches route_weights).
+        route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
+        route_weights.view(-1)[topids_to_rows.reshape(-1)] = (
+            topk_weight.reshape(-1).to(route_weights.dtype)
+        )
         _grouped_dbg("route gather done")
-
-    # route_weights (grouped row -> routing weight) is consumed by the
-    # doweight_stage1 multiply below and by the naive gather-reduce epilogue. Build
-    # it from the map unconditionally (one scatter); the kernel epilogue ignores it.
-    route_weights.view(-1)[topids_to_rows.reshape(-1)] = (
-        topk_weight.reshape(-1).to(route_weights.dtype)
-    )
 
     grouped_w1 = (w1 if w1.dtype == torch.uint8 else w1.view(torch.uint8)).contiguous()
     grouped_w2 = (w2 if w2.dtype == torch.uint8 else w2.view(torch.uint8)).contiguous()
@@ -949,6 +962,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             )
 
     if doweight_stage1:
+        # doweight_stage1 only reaches here on the naive path (NAIVE=0 raised
+        # above), so counts is populated.
         for e in range(E):
             n = int(counts[e].item())
             if n:
@@ -1041,7 +1056,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         "no",
         "off",
     ):
-        _e0 = int(torch.nonzero(counts > 0)[0].item()) if (counts > 0).any() else 0
+        _dump_counts = (
+            counts if counts is not None else torch.bincount(flat_experts, minlength=E)
+        )
+        _e0 = (
+            int(torch.nonzero(_dump_counts > 0)[0].item())
+            if (_dump_counts > 0).any()
+            else 0
+        )
         print(
             f"  aiter   grouped_out_stage2[e0={_e0},0,:10]="
             f"{grouped_out[_e0, 0].float()[:10].tolist()} (pre route-weight)",
@@ -1069,6 +1091,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("gather-reduce output done")
     else:
         _grouped_dbg("start scatter output")
+        # Reached on the naive path, or on a non-bf16/fp16 dtype with NAIVE=0
+        # (where counts was not built) -- compute it on demand in the latter case.
+        if counts is None:
+            counts = torch.bincount(flat_experts, minlength=E)
         for e in range(E):
             n = int(counts[e].item())
             if n == 0:

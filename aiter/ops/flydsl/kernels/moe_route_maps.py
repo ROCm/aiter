@@ -8,9 +8,10 @@ Computes two maps for the grouped MoE layout:
                    k-th expert occupies = ``expert*max_m + slot``
   rows_to_tokens : its inverse, grouped row -> source token
 
-The within-expert ``slot`` is claimed via a global ``atomicAdd`` on a per-expert
-counter pre-initialized to ``e*max_m`` (so the atomic returns the grouped row
-directly) -- no host-side argsort / nonzero / one-hot.
+The within-expert ``slot`` is claimed via a global ``atomicAdd(1)`` on a
+per-expert counter initialized to 0; the kernel forms the grouped row in-place
+as ``slot + e*max_m`` -- no host-side argsort / nonzero / one-hot, and no
+host-side offset array (the final counter is ``counts[e]`` directly).
 
 One thread per route (grid covers ceil(numel/BLOCK)). The within-expert order is
 atomic-race order (nondeterministic), which is fine: scatter-copy and
@@ -36,24 +37,26 @@ def build_moe_route_maps_module():
     """Return a JIT launcher computing the route maps in one pass.
 
     Launcher: ``(topk_ids, atomic_buffer, topids_to_rows, rows_to_tokens, numel,
-    topk, grid_blocks, stream=...)``
+    topk, max_m, grid_blocks, stream=...)``
       topk_ids       : (numel,)   int32  flattened expert ids
-      atomic_buffer  : (E,)       int32  pre-init to e*max_m (mutated)
+      atomic_buffer  : (E,)       int32  per-expert counter, init 0 (mutated ->
+                       counts[e] after the run)
       topids_to_rows : (numel,)   int32  out: grouped row per route
       rows_to_tokens : (E*max_m,) int32  out: source token per grouped row
                        (pre-init -1 for padding rows the kernel never writes)
 
-    One pass: ``topids_to_rows[i] = start`` (route -> grouped row) and its
-    inverse ``rows_to_tokens[start] = i // topk`` (grouped row -> token).
+    One pass: ``topids_to_rows[i] = slot + e*max_m`` (route -> grouped row) and
+    its inverse ``rows_to_tokens[row] = i // topk`` (grouped row -> token).
     """
     @flyc.kernel(name="moe_route_maps")
     def route_maps_kernel(
         topk_ids: fx.Tensor,       # (numel,) int32
-        atomic_buffer: fx.Tensor,  # (E,) int32, pre-init e*max_m
+        atomic_buffer: fx.Tensor,  # (E,) int32, init 0
         topids_to_rows: fx.Tensor,          # (numel,) int32 out: route -> grouped row
         rows_to_tokens: fx.Tensor,          # (E*max_m,) int32 out: grouped row -> token
         numel: Int32,
         topk: Int32,
+        max_m: Int32,
     ):
         i32 = T.i32
         route = ArithValue(fx.block_idx.x) * arith.constant(
@@ -75,8 +78,8 @@ def build_moe_route_maps_module():
             ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
             ptr = ptr._value if hasattr(ptr, "_value") else ptr
 
-            # atomicAdd(&atomic_buffer[e], 1) -> grouped row (buffer pre-init e*max_m)
-            start = llvm.AtomicRMWOp(
+            # atomicAdd(&atomic_buffer[e], 1) -> within-expert slot (buffer init 0)
+            slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
                 ptr,
                 arith.constant(1, type=i32),
@@ -85,10 +88,13 @@ def build_moe_route_maps_module():
                 alignment=4,
             ).result
 
+            # grouped row = slot + e*max_m (offset applied here, not host-side)
+            row = ArithValue(slot) + ArithValue(e) * ArithValue(max_m)
+
             # topids_to_rows[route] = grouped row;  rows_to_tokens[grouped row] = token (= route//topk)
-            buffer_ops.buffer_store(start, c_rsrc, route)
+            buffer_ops.buffer_store(row, c_rsrc, route)
             token = arith.divui(route, ArithValue(topk))
-            buffer_ops.buffer_store(token, a_rsrc, start)
+            buffer_ops.buffer_store(token, a_rsrc, row)
             scf.YieldOp([])
 
     @flyc.jit
@@ -99,6 +105,7 @@ def build_moe_route_maps_module():
         rows_to_tokens: fx.Tensor,
         numel: fx.Int32,
         topk: fx.Int32,
+        max_m: fx.Int32,
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -107,7 +114,7 @@ def build_moe_route_maps_module():
             pass
 
         gx = arith.index_cast(T.index, grid_blocks)
-        route_maps_kernel(topk_ids, atomic_buffer, topids_to_rows, rows_to_tokens, numel, topk).launch(
+        route_maps_kernel(topk_ids, atomic_buffer, topids_to_rows, rows_to_tokens, numel, topk, max_m).launch(
             grid=(gx, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,

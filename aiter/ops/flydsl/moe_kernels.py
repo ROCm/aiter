@@ -1463,23 +1463,24 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
       masked_m        : (E,)              int32  -- rows routed to each expert
                  (== bincount(topk_ids), the per-expert GEMM mask)
 
-    The within-expert ``slot`` is claimed by ``atomicAdd`` on a per-expert
-    counter pre-initialized to ``e*max_m``, so the atomic returns the grouped
-    row. The kernel writes both maps in one pass (topids_to_rows + its inverse
-    rows_to_tokens), and the final counter value ``e*max_m + counts[e]`` yields
-    ``masked_m`` for free (counts[e] = atomic_buffer[e] - e*max_m), avoiding a
-    separate ``bincount`` reduction. Order within an expert is atomic-race order
-    (nondeterministic) but self-consistent -- both maps come from the same run,
-    and the grouped GEMM is order-agnostic within an expert.
+    The within-expert ``slot`` is claimed by ``atomicAdd(1)`` on a per-expert
+    counter initialized to 0; the kernel forms the grouped row in-place as
+    ``slot + e*max_m`` (one int mul-add per thread, hidden behind the atomic).
+    It writes both maps in one pass (topids_to_rows + its inverse
+    rows_to_tokens), and the final counter value is exactly ``counts[e]`` -- so
+    ``masked_m`` is the counter itself, no bincount and no host-side
+    ``arange``/``clone``/``sub`` to build or strip an offset. Order within an
+    expert is atomic-race order (nondeterministic) but self-consistent -- both
+    maps come from the same run, and the grouped GEMM is order-agnostic per
+    expert.
     """
     device = topk_ids.device
     token_num, topk = topk_ids.shape
     numel = token_num * topk
     topk_ids_i32 = topk_ids.reshape(-1).to(torch.int32).contiguous()
-    # ``base[e] = e*max_m`` is both the atomic counter's start value and the
-    # offset we subtract afterwards to recover per-expert counts.
-    base = (torch.arange(E, device=device, dtype=torch.int32) * max_m).contiguous()
-    atomic_buffer = base.clone()
+    # Per-expert counter starts at 0; the kernel applies the e*max_m offset, so
+    # after the run this buffer holds counts[e] directly == masked_m.
+    atomic_buffer = torch.zeros(E, dtype=torch.int32, device=device)
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
     rows_to_tokens = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
     grid_blocks = (numel + 255) // 256
@@ -1491,12 +1492,12 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
         rows_to_tokens,
         numel,
         topk,
+        max_m,
         grid_blocks,
         stream=torch.cuda.current_stream(),
     )
-    # After the kernel, atomic_buffer[e] == e*max_m + counts[e]; subtract the
-    # base to get masked_m (no bincount, no device->host sync).
-    masked_m = atomic_buffer - base
+    # atomic_buffer[e] == counts[e] now; it is masked_m, no further math.
+    masked_m = atomic_buffer
     return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
 
 
