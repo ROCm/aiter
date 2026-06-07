@@ -25,7 +25,6 @@ def _use_grouped_gemm_enabled() -> bool:
     return os.environ.get("AITER_USE_GROUPED_GEMM", "1") in _TRUTHY_ENV
 
 
-
 def _grouped_a8w4_preshuffle_e8m0_scale(
     scale: torch.Tensor,
     warp_tile: int,
@@ -83,10 +82,9 @@ def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
     topids_to_rows = (flat_e * max_m + slot).to(torch.int32)
     # Inverse map: grouped row -> source token (-1 for unused padding rows).
     rows_to_tokens = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
-    src_tokens = (
-        torch.arange(token_num, device=device, dtype=torch.int32)
-        .repeat_interleave(topk)
-    )
+    src_tokens = torch.arange(
+        token_num, device=device, dtype=torch.int32
+    ).repeat_interleave(topk)
     rows_to_tokens[topids_to_rows.to(torch.long)] = src_tokens
     masked_m = torch.bincount(flat_e, minlength=E).to(torch.int32)
     return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
@@ -294,9 +292,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             )
         from aiter.ops.flydsl.moe_kernels import build_route_maps
 
-        topids_to_rows, rows_to_tokens, masked_m = build_route_maps(
-            topk_ids, E, max_m
-        )
+        topids_to_rows, rows_to_tokens, masked_m = build_route_maps(topk_ids, E, max_m)
     # Grouped row -> source token, (E, max_m); padding rows (-1) are never read
     # because the naive epilogues are bounded by per-expert counts.
 
@@ -377,8 +373,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             a1_scale_raw.view(E * max_m, -1)[flat_rows] = a1_scale_token_u8[flat_tokens]
         # Only the naive epilogue needs grouped row weights.
         route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
-        route_weights.view(-1)[topids_to_rows.reshape(-1)] = (
-            topk_weight.reshape(-1).to(route_weights.dtype)
+        route_weights.view(-1)[topids_to_rows.reshape(-1)] = topk_weight.reshape(-1).to(
+            route_weights.dtype
         )
         _grouped_dbg("route gather done")
 
@@ -605,4 +601,3 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         f"[{impl_name}] used grouped FlyDSL {data_format} path: tokens={token_num}, topk={topk}, E={E}, max_m={max_m}"
     )
     return moe_out
-
