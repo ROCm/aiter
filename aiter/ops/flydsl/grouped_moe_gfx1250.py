@@ -266,8 +266,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     # topk_ids is already an integer tensor; keep one flattened view for routing.
     flat_experts = topk_ids.reshape(-1)
-    if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
-        raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
+    # Expert-id range validation is a debug-only safety check: at decode sizes it
+    # issues ~6 tiny launches/iter (lt+ge compare_scalar, two any() reductions)
+    # plus a device->host sync from the `or` -- a real hotspot relative to the
+    # tiny grouped work. Gate it behind AITER_GROUPED_DEBUG so production skips it
+    # (topk_ids is already produced in-range by the router); set the env to 1 to
+    # re-enable the check when diagnosing bad route ids.
+    if os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
+        if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
+            raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
     # Static upper bound: each token routes at most one row per expert, so no
     # expert can receive more than token_num rows. Using this avoids the
     # ``counts.max().item()`` device->host sync that stalls the launch stream
