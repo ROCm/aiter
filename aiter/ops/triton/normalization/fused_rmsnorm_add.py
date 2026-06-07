@@ -7,15 +7,9 @@ import torch
 import triton
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
-    _gluon_fused_rms_kernel,
-)
-from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add import (
-    _triton_fused_rms_kernel,
-)
 
 
-def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
+def _fused_rmsnorm_core(x, weight, epsilon, res1):
     """Shared RMSNorm (+ optional residual add) launcher.
 
     Returns ``(out, out_res1)`` where ``out_res1`` is ``None`` when ``res1`` is
@@ -40,17 +34,28 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
             res1.dtype == x.dtype
         ), f"res1 dtype {res1.dtype} must match x dtype {x.dtype}"
 
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+
     BLOCK_SIZE_N = max(triton.next_power_of_2(N), 32)
     out1 = torch.empty((M, N), dtype=x.dtype, device=x.device)
     out_res1 = None
     res1_stride_m = 0
     out_res1_stride_m = 0
     if res1 is not None:
+        if not res1.is_contiguous():
+            res1 = res1.contiguous()
         out_res1 = torch.empty((M, N), dtype=x.dtype, device=x.device)
         res1_stride_m = res1.stride(0)
         out_res1_stride_m = out_res1.stride(0)
 
     if get_arch() == "gfx1250":
+        from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
+            _gluon_fused_rms_kernel,
+        )
+
         BLOCK_SIZE_M = 1
         grid = (triton.cdiv(M, BLOCK_SIZE_M),)
         _gluon_fused_rms_kernel[grid](
@@ -71,6 +76,10 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
             FIRST_INPUT_RES=(res1 is not None),
         )
     else:
+        from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add import (
+            _triton_fused_rms_kernel,
+        )
+
         grid = (M,)
         _triton_fused_rms_kernel[grid](
             x,
@@ -102,7 +111,7 @@ def _fused_rmsnorm_fake(
 def _fused_rmsnorm(
     x: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> torch.Tensor:
-    out1, _ = _fused_rmsnorm_add_core(x, weight, epsilon, None)
+    out1, _ = _fused_rmsnorm_core(x, weight, epsilon, None)
     return out1
 
 
@@ -116,7 +125,7 @@ def _fused_rmsnorm_add_fake(
 def _fused_rmsnorm_add(
     x: torch.Tensor, weight: torch.Tensor, epsilon: float, res1: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    out1, out_res1 = _fused_rmsnorm_add_core(x, weight, epsilon, res1)
+    out1, out_res1 = _fused_rmsnorm_core(x, weight, epsilon, res1)
     return out1, out_res1
 
 
