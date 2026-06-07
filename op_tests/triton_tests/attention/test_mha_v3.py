@@ -174,6 +174,49 @@ def _generate_block_kvcache(
     return k_cache, v_cache, block_table, k_cache_paged, v_cache_paged, num_blocks
 
 
+def _generate_interleaved_block_kvcache(
+    seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype
+):
+    """Paged KV cache stored block-major with K and V interleaved per block
+    ([num_blocks, 2, block_size, nheads_k, d]) -- the layout vLLM hybrid
+    attention+mamba models use.
+
+    The per-component K/V caches are *non-contiguous* views of the backing
+    buffer: their block stride is ``2 * block_size * nheads_k * d`` (twice what a
+    contiguous ``[num_blocks, block_size, nheads_k, d]`` cache would have). This
+    is the case the split-K decode kernel must honor by reading the real
+    ``stride(0)`` instead of assuming ``block_size * slot_stride``.
+    """
+    num_blocks = math.ceil(seqlen_k / paged_kv_block_size) * batch_size * 3
+    kv_cache_paged = torch.randn(
+        num_blocks,
+        2,
+        paged_kv_block_size,
+        nheads_k,
+        d,
+        device=device,
+        dtype=dtype,
+    )
+    k_cache_paged = kv_cache_paged[:, 0]  # non-contiguous view, stride(0) = 2*...
+    v_cache_paged = kv_cache_paged[:, 1]
+    block_table = rearrange(
+        torch.randperm(num_blocks, dtype=torch.int32, device=device),
+        "(b nblocks) -> b nblocks",
+        b=batch_size,
+    )
+    k_cache = rearrange(
+        k_cache_paged[block_table.to(dtype=torch.long).flatten()],
+        "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+        b=batch_size,
+    )[:, :seqlen_k]
+    v_cache = rearrange(
+        v_cache_paged[block_table.to(dtype=torch.long).flatten()],
+        "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+        b=batch_size,
+    )[:, :seqlen_k]
+    return k_cache, v_cache, block_table, k_cache_paged, v_cache_paged, num_blocks
+
+
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])
 @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
@@ -344,6 +387,145 @@ def test_flash_attn_kvcache(
     assert our_max_diff <= mult * pt_max_diff + 1e-5, (
         f"Output max diff {our_max_diff:.6e} exceeds "
         f"{mult}x Pytorch baseline diff {pt_max_diff:.6e} + 1e-5"
+    )
+
+
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("paged_kv_block_size", [16, 256])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (1, 339),
+        (3, 1024),
+        (17, 156),
+    ],
+)
+@pytest.mark.parametrize("d", [64, 128])
+def test_flash_attn_kvcache_noncontiguous_paged(
+    seqlen_q,
+    seqlen_k,
+    d,
+    paged_kv_block_size,
+    causal,
+    mha_type,
+):
+    """Paged decode against a non-contiguous (K/V-interleaved) paged cache.
+
+    Regression guard for the split-K decode kernel previously hard-coding the
+    paged block stride as ``block_size * slot_stride`` (contiguous-only). With an
+    interleaved ``[num_blocks, 2, block_size, nheads_k, d]`` cache the real block
+    stride is ``2 * block_size * nheads_k * d``; before the fix the kernel read
+    K/V-straddling block memory and produced garbage attention. The dense
+    reference is gathered from the same paged buffer, so this pins correct
+    numerics for any regular paged layout, contiguous or interleaved.
+    """
+    dtype = torch.bfloat16
+    device = "cuda"
+    torch.random.manual_seed(SEED)
+    torch.cuda.manual_seed(SEED)
+    batch_size = 2
+    nheads = 6
+    nheads_k = nheads if mha_type == "mha" else 3
+    assert nheads % nheads_k == 0
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+
+    (
+        k_cache,
+        v_cache,
+        block_table,
+        k_cache_paged,
+        v_cache_paged,
+        num_blocks,
+    ) = _generate_interleaved_block_kvcache(
+        seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype
+    )
+
+    # Sanity: the views must really be non-contiguous (block stride == 2x), else
+    # this test would silently degrade to the contiguous case and stop guarding
+    # the fix.
+    assert not k_cache_paged.is_contiguous()
+    assert not v_cache_paged.is_contiguous()
+    assert k_cache_paged.stride(0) == 2 * paged_kv_block_size * nheads_k * d
+
+    cache_seqlens = torch.randint(
+        1, seqlen_k + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+
+    arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
+    key_padding_mask = arange < rearrange(cache_seqlens, "b -> b 1")
+
+    k_cache_rep = repeat(k_cache, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+    v_cache_rep = repeat(v_cache, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache_paged,
+        v_cache_paged,
+        cache_seqlens=cache_seqlens,
+        page_table=block_table,
+        causal=causal,
+    )
+    torch.cuda.synchronize()
+    if isinstance(out, tuple):
+        out = out[0]
+    out = out.to(dtype)
+
+    out_ref, _ = attention_ref(
+        q,
+        k_cache_rep,
+        v_cache_rep,
+        None,
+        key_padding_mask,
+        None,
+        0.0,
+        None,
+        causal=causal,
+        window_size=(-1, -1),
+    )
+    out_pt, _ = attention_ref(
+        q,
+        k_cache_rep,
+        v_cache_rep,
+        None,
+        key_padding_mask,
+        None,
+        0.0,
+        None,
+        causal=causal,
+        window_size=(-1, -1),
+        upcast=False,
+        reorder_ops=True,
+    )
+
+    pt_max_diff = (out_pt - out_ref).abs().max().item()
+    our_max_diff = (out - out_ref).abs().max().item()
+    mult = 3
+    assert our_max_diff <= mult * pt_max_diff + 1e-5, (
+        f"Non-contiguous paged output max diff {our_max_diff:.6e} exceeds "
+        f"{mult}x Pytorch baseline diff {pt_max_diff:.6e} + 1e-5"
+    )
+
+    # The exact same data laid out in a *contiguous* paged cache must produce the
+    # same result -- this directly pins the kernel to the real block stride
+    # rather than the contiguous-only assumption.
+    out_contig = flash_attn_with_kvcache(
+        q,
+        k_cache_paged.contiguous(),
+        v_cache_paged.contiguous(),
+        cache_seqlens=cache_seqlens,
+        page_table=block_table,
+        causal=causal,
+    )
+    torch.cuda.synchronize()
+    if isinstance(out_contig, tuple):
+        out_contig = out_contig[0]
+    out_contig = out_contig.to(dtype)
+    contig_diff = (out - out_contig).abs().max().item()
+    assert contig_diff < 1e-5, (
+        f"Non-contiguous vs contiguous paged cache differ by {contig_diff:.6e} "
+        "(> 1e-5): the kernel is not honoring the real paged block stride"
     )
 
 
