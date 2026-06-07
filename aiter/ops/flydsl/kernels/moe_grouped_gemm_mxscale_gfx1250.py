@@ -11,6 +11,7 @@ calling convention while the underlying A8W4 GEMM owns TDM/WMMA_SCALE codegen.
 from __future__ import annotations
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -118,17 +119,40 @@ def _make_m_tile_map(
     cfg: _GroupedA8W4Config,
     m_tile_prefix: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Packed grouped-persistent M-tile schedule, built on-device.
+    """Packed grouped-persistent M-tile schedule.
 
     ``m_tile_map[prefix[e] + j] = e*max_m_tiles + j`` for every valid tile ``j``
-    of expert ``e``. Driven by ``m_tile_prefix`` (cumulative tile counts); the
-    persistent GEMM reads only ``m_tile_map[0 : prefix[E]]`` (it takes the total
-    tile count from ``prefix[E]``), so the buffer is sized to the max
-    ``E*max_m_tiles`` and trailing rows are never read. No device->host sync.
+    of expert ``e``.
+
+    AITER_GROUPED_GEMM_NAIVE=1 uses the original host packing (a
+    ``valid_tiles.cpu().tolist()`` device->host sync + Python comprehension,
+    returning an exactly-sized tensor). =0 (default) uses the FlyDSL kernel: it
+    fills a max-sized (``E*max_m_tiles``) buffer driven by ``m_tile_prefix`` with
+    no host sync. The persistent GEMM reads only ``m_tile_map[0 : prefix[E]]``
+    (total tile count comes from ``prefix[E]``), so both forms are equivalent to
+    the consumer.
     """
+    max_m_tiles = (cfg.max_m + cfg.tile_m - 1) // cfg.tile_m
+
+    if os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1":
+        valid_m = masked_m[:cfg.experts].to(dtype=torch.int32)
+        valid_m = valid_m.clamp(min=0, max=cfg.max_m)
+        valid_tiles = torch.div(
+            valid_m + (cfg.tile_m - 1),
+            cfg.tile_m,
+            rounding_mode="floor",
+        ).cpu().tolist()
+        packed = [
+            expert * max_m_tiles + local_tile
+            for expert, count in enumerate(valid_tiles)
+            for local_tile in range(int(count))
+        ]
+        if not packed:
+            packed = [0]
+        return torch.tensor(packed, device=masked_m.device, dtype=torch.int32)
+
     if m_tile_prefix is None:
         m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
-    max_m_tiles = (cfg.max_m + cfg.tile_m - 1) // cfg.tile_m
     m_tile_map = torch.empty(
         cfg.experts * max_m_tiles, device=masked_m.device, dtype=torch.int32
     )

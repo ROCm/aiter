@@ -65,23 +65,30 @@ def _run_one(experts, max_m, tile_m, dist, seed=0):
     total = len(ref_packed)
 
     prefix = _make_m_tile_prefix(masked_m, cfg)
-    m_tile_map = _make_m_tile_map(masked_m, cfg, prefix)
+    prefix_total = int(prefix[experts].item())  # device-side total the GEMM uses
+
+    # NAIVE=1: original host packing (exactly-sized tensor).
+    os.environ["AITER_GROUPED_GEMM_NAIVE"] = "1"
+    naive_map = _make_m_tile_map(masked_m, cfg, prefix)
+    # NAIVE=0: FlyDSL kernel (max-sized buffer, valid prefix [0:total]).
+    os.environ["AITER_GROUPED_GEMM_NAIVE"] = "0"
+    kernel_map = _make_m_tile_map(masked_m, cfg, prefix)
     torch.cuda.synchronize()
 
-    # prefix[E] is the device-side total tile count the GEMM uses.
-    prefix_total = int(prefix[experts].item())
     total_ok = prefix_total == total
-    # buffer must be sized to the max E*max_m_tiles
-    size_ok = m_tile_map.numel() == experts * max_m_tiles
-    # the valid prefix of the kernel output must match the reference packing
-    got = m_tile_map[:total].cpu().tolist()
-    pack_ok = got == ref_packed
+    # kernel buffer sized to the max; naive tensor sized to total (or 1 if empty)
+    size_ok = kernel_map.numel() == experts * max_m_tiles
+    # both must reproduce the reference packing on their valid prefix
+    naive_ok = naive_map[:total].cpu().tolist() == ref_packed
+    kernel_ok = kernel_map[:total].cpu().tolist() == ref_packed
+    # naive empty-case returns [0]; kernel reads nothing (total=0) -> both fine
+    naive_empty_ok = (total > 0) or (naive_map.cpu().tolist() == [0])
 
-    ok = total_ok and size_ok and pack_ok
+    ok = total_ok and size_ok and naive_ok and kernel_ok and naive_empty_ok
     print(
         f"[{'PASS' if ok else 'FAIL'}] E={experts:<4} max_m={max_m:<4} tile_m={tile_m:<3} "
         f"dist={dist:<6} total={total:<5} prefix_total={prefix_total:<5} "
-        f"size={size_ok} pack={pack_ok}"
+        f"size={size_ok} naive={naive_ok} kernel={kernel_ok}"
     )
     return ok
 
