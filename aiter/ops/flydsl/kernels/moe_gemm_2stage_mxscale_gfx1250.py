@@ -33,6 +33,7 @@ from kernels.moe_gemm_2stage_common_gfx1250 import (
     _require_gfx1250,
 )
 
+
 @functools.lru_cache(maxsize=64)
 def _compile_stage1_mxscale_kernel_impl(
     *,
@@ -60,7 +61,6 @@ def _compile_stage1_mxscale_kernel_impl(
     cluster_m: int = 1,
     cluster_n: int = 1,
     k_batch: int = 1,
-
     enable_bias: bool = False,
     act: str = "silu",
 ):
@@ -71,27 +71,47 @@ def _compile_stage1_mxscale_kernel_impl(
     from flydsl._mlir.dialects import llvm as llvm_dialect
     from flydsl._mlir.dialects import memref, scf
     from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl.expr import arith, buffer_ops, const_expr, gpu, idx2crd, range_constexpr, rocdl, tdm_ops, vector
+    from flydsl.expr import (
+        arith,
+        buffer_ops,
+        const_expr,
+        gpu,
+        idx2crd,
+        range_constexpr,
+        rocdl,
+        tdm_ops,
+        vector,
+    )
     from flydsl.expr.typing import T
-    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, get_op_result_or_value
+    from flydsl.utils.smem_allocator import (
+        SmemAllocator,
+        SmemPtr,
+        get_op_result_or_value,
+    )
 
     tp = _compute_mxscale_tiling(
-        data_format=data_format, K=int(model_dim),
-        tile_m=int(tile_m), tile_n=int(tile_n), tile_k=int(tile_k),
-        m_warp=int(m_warp), n_warp=int(n_warp), out_dtype=out_dtype,
-        num_buffers=int(num_buffers), cluster_m=int(cluster_m),
-        cluster_n=int(cluster_n), stage_name="stage1",
+        data_format=data_format,
+        K=int(model_dim),
+        tile_m=int(tile_m),
+        tile_n=int(tile_n),
+        tile_k=int(tile_k),
+        m_warp=int(m_warp),
+        n_warp=int(n_warp),
+        out_dtype=out_dtype,
+        num_buffers=int(num_buffers),
+        cluster_m=int(cluster_m),
+        cluster_n=int(cluster_n),
+        stage_name="stage1",
     )
     is_fp4, is_a8w4 = tp["is_fp4"], tp["is_a8w4"]
     PACK_FACTOR_A, PACK_FACTOR_B = tp["PACK_FACTOR_A"], tp["PACK_FACTOR_B"]
     ACC_VEC_SIZE = tp["ACC_VEC_SIZE"]
     DS_LOADS_PER_A_FRAG = tp["DS_LOADS_PER_A_FRAG"]
-    WMMA_M, WMMA_N, WMMA_K = tp["WMMA_M"], tp["WMMA_N"], tp["WMMA_K"]
+    WMMA_M, WMMA_N = tp["WMMA_M"], tp["WMMA_N"]
     SCALE_BLOCK, SCALES_PER_WMMA = tp["SCALE_BLOCK"], tp["SCALES_PER_WMMA"]
     WAVE_SIZE = tp["WAVE_SIZE"]
     LDS_PAD_A_BYTES, LDS_PAD_B_BYTES = tp["LDS_PAD_A_BYTES"], tp["LDS_PAD_B_BYTES"]
     use_cluster = tp["use_cluster"]
-    K = tp["K"]
     K_packed_a, K_packed_b = tp["K_packed_a"], tp["K_packed_b"]
     packed_tile_k_a, packed_tile_k_b = tp["packed_tile_k_a"], tp["packed_tile_k_b"]
     K_scale, scale_k_per_tile = tp["K_scale"], tp["scale_k_per_tile"]
@@ -101,11 +121,12 @@ def _compile_stage1_mxscale_kernel_impl(
     k_wmma_steps, n_accs = tp["k_wmma_steps"], tp["n_accs"]
     num_k_tiles = tp["num_k_tiles"]
     b_scale_load_rep = tp["b_scale_load_rep"]
-    interleaved_scale_cols_b = tp["interleaved_scale_cols_b"]
     lds_a_stride_bytes = tp["lds_a_stride_bytes"]
-    lds_b_stride_bytes = tp["lds_b_stride_bytes"]
     lds_a_data_bytes, lds_b_data_bytes = tp["lds_a_data_bytes"], tp["lds_b_data_bytes"]
-    lds_a_scale_bytes, lds_b_scale_bytes = tp["lds_a_scale_bytes"], tp["lds_b_scale_bytes"]
+    lds_a_scale_bytes, lds_b_scale_bytes = (
+        tp["lds_a_scale_bytes"],
+        tp["lds_b_scale_bytes"],
+    )
     interleaved_scale_cols_a = tp["interleaved_scale_cols_a"]
 
     N = int(inter_dim)
@@ -113,19 +134,22 @@ def _compile_stage1_mxscale_kernel_impl(
     _act_kind = str(act).strip().lower()
     if _act_kind not in ("silu", "swiglu"):
         raise ValueError(
-            f"stage1 mxscale: unsupported act={act!r}; expected 'silu' or 'swiglu'")
+            f"stage1 mxscale: unsupported act={act!r}; expected 'silu' or 'swiglu'"
+        )
     _enable_bias = bool(enable_bias)
     _is_splitk = int(k_batch) > 1
     if _is_splitk:
         if int(model_dim) % int(k_batch) != 0:
             raise ValueError(
                 f"split-K requires model_dim divisible by k_batch, "
-                f"got model_dim={model_dim}, k_batch={k_batch}")
+                f"got model_dim={model_dim}, k_batch={k_batch}"
+            )
         _k_per_batch = int(model_dim) // int(k_batch)
         if _k_per_batch % int(tile_k) != 0:
             raise ValueError(
                 f"split-K requires (model_dim // k_batch) divisible by tile_k, "
-                f"got k_per_batch={_k_per_batch}, tile_k={tile_k}")
+                f"got k_per_batch={_k_per_batch}, tile_k={tile_k}"
+            )
         if bool(use_tdm_store):
             raise ValueError("split-K stage1 does not support use_tdm_store")
         if bool(wave_specialized_tdm):
@@ -133,30 +157,36 @@ def _compile_stage1_mxscale_kernel_impl(
         if bool(doweight_stage1):
             raise ValueError(
                 "split-K stage1 does not support fused doweight_stage1; "
-                "apply routing weight in the external reduction kernel")
+                "apply routing weight in the external reduction kernel"
+            )
 
         if _act_kind != "silu":
             raise ValueError(
                 "split-K stage1 fuses activation in the external reduction "
                 "kernel; only act='silu' is supported. Disable split-K "
-                "(k_batch=1) to use SwiGLU.")
+                "(k_batch=1) to use SwiGLU."
+            )
         _s1_out = str(out_dtype).strip().lower()
         if _s1_out not in ("f16", "fp16", "half", "bf16", "bfloat16"):
             raise ValueError(
                 f"split-K stage1 only supports fp16/bf16 output (x2 atomic fadd), "
-                f"got out_dtype={out_dtype!r}")
+                f"got out_dtype={out_dtype!r}"
+            )
         num_k_tiles_per_bz = _k_per_batch // int(tile_k)
     else:
         _k_per_batch = int(model_dim)
         num_k_tiles_per_bz = num_k_tiles
 
-    _merge_gate_up_tdm = bool((data_format in ("fp8", "a8w4")) and (N % int(tile_n) == 0))
+    _merge_gate_up_tdm = bool(
+        (data_format in ("fp8", "a8w4")) and (N % int(tile_n) == 0)
+    )
     num_warps_s1 = int(m_warp) * int(n_warp)
     _tdm_loader_waves = 2 if _merge_gate_up_tdm else 4
     if bool(wave_specialized_tdm):
         if num_warps_s1 < _tdm_loader_waves:
             raise ValueError(
-                f"wave_specialized_tdm requires at least {_tdm_loader_waves} waves, got {num_warps_s1}")
+                f"wave_specialized_tdm requires at least {_tdm_loader_waves} waves, got {num_warps_s1}"
+            )
     tdm_desc_num_warps = 1 if bool(wave_specialized_tdm) else num_warps_s1
     effective_waves_per_eu = waves_per_eu
     if use_cluster and effective_waves_per_eu is None:
@@ -178,15 +208,20 @@ def _compile_stage1_mxscale_kernel_impl(
     _use_pipeline = int(num_buffers) >= 2
     if _use_pipeline:
         from kernels.gemm_common_gfx1250 import (
-            pipeline_fence, pipeline_fence_signal, pipeline_fence_wait,
+            pipeline_fence,
+            pipeline_fence_signal,
+            pipeline_fence_wait,
         )
+
         if _merge_gate_up_tdm:
             _B_TDM_PER_STEP = 1 if bool(wave_specialized_tdm) else 2
         else:
             _B_TDM_PER_STEP = 1 if bool(wave_specialized_tdm) else 4
         _pp = _compute_pipeline_plan(
-            num_k_tiles=num_k_tiles_per_bz, num_buffers=int(num_buffers),
-            B_TDM_PER_STEP=_B_TDM_PER_STEP, tile_m=int(tile_m),
+            num_k_tiles=num_k_tiles_per_bz,
+            num_buffers=int(num_buffers),
+            B_TDM_PER_STEP=_B_TDM_PER_STEP,
+            tile_m=int(tile_m),
             use_tdm_gather=use_tdm_gather,
             use_tdm_gather_as=_use_tdm_gather_as,
             wave_specialized_tdm=wave_specialized_tdm,
@@ -195,10 +230,8 @@ def _compile_stage1_mxscale_kernel_impl(
         pre_loaded = _pp["pre_loaded"]
         loop_iters = _pp["loop_iters"]
         _tail_start = _pp["tail_start"]
-        extra = _pp["extra"]
         _A_GATHER_GROUPS = _pp["A_GATHER_GROUPS"]
         _AS_GATHER_GROUPS = _pp["AS_GATHER_GROUPS"]
-        TDM_PER_STEP = _pp["TDM_PER_STEP"]
         _fence_outstanding = _pp["fence_outstanding"]
         _tail_plan = _pp["tail_plan"]
     from kernels.gemm_common_gfx1250 import workgroup_barrier
@@ -217,18 +250,34 @@ def _compile_stage1_mxscale_kernel_impl(
     off_bu_list, off_bsu_list = [], []
     off_bg_pair_list, off_bs_pair_list = [], []
     for _buf_i in range(_nb):
-        _o = alloc._align(alloc.ptr, 16); alloc.ptr = _o + lds_a_data_bytes; off_ag_list.append(_o)
+        _o = alloc._align(alloc.ptr, 16)
+        alloc.ptr = _o + lds_a_data_bytes
+        off_ag_list.append(_o)
         if _merge_gate_up_tdm:
-            _o = alloc._align(alloc.ptr, 16); alloc.ptr = _o + 2 * lds_b_data_bytes; off_bg_pair_list.append(_o)
+            _o = alloc._align(alloc.ptr, 16)
+            alloc.ptr = _o + 2 * lds_b_data_bytes
+            off_bg_pair_list.append(_o)
         else:
-            _o = alloc._align(alloc.ptr, 16); alloc.ptr = _o + lds_b_data_bytes; off_bg_list.append(_o)
-        _o = alloc._align(alloc.ptr, 16); alloc.ptr = _o + lds_a_scale_bytes; off_as_list.append(_o)
+            _o = alloc._align(alloc.ptr, 16)
+            alloc.ptr = _o + lds_b_data_bytes
+            off_bg_list.append(_o)
+        _o = alloc._align(alloc.ptr, 16)
+        alloc.ptr = _o + lds_a_scale_bytes
+        off_as_list.append(_o)
         if _merge_gate_up_tdm:
-            _o = alloc._align(alloc.ptr, 16); alloc.ptr = _o + 2 * lds_b_scale_bytes; off_bs_pair_list.append(_o)
+            _o = alloc._align(alloc.ptr, 16)
+            alloc.ptr = _o + 2 * lds_b_scale_bytes
+            off_bs_pair_list.append(_o)
         else:
-            _o = alloc._align(alloc.ptr, 16); alloc.ptr = _o + lds_b_scale_bytes; off_bs_list.append(_o)
-            _o = alloc._align(alloc.ptr, 16); alloc.ptr = _o + lds_b_data_bytes; off_bu_list.append(_o)
-            _o = alloc._align(alloc.ptr, 16); alloc.ptr = _o + lds_b_scale_bytes; off_bsu_list.append(_o)
+            _o = alloc._align(alloc.ptr, 16)
+            alloc.ptr = _o + lds_b_scale_bytes
+            off_bs_list.append(_o)
+            _o = alloc._align(alloc.ptr, 16)
+            alloc.ptr = _o + lds_b_data_bytes
+            off_bu_list.append(_o)
+            _o = alloc._align(alloc.ptr, 16)
+            alloc.ptr = _o + lds_b_scale_bytes
+            off_bsu_list.append(_o)
 
     lds_tid_bytes = int(tile_m) * 4
     off_tid = alloc._align(alloc.ptr, 16)
@@ -236,9 +285,13 @@ def _compile_stage1_mxscale_kernel_impl(
 
     if bool(use_tdm_store):
         from kernels.gemm_common_gfx1250 import store_acc_vec8_to_lds
+
         _ds1 = _compute_tdm_store_layout(
-            warp_tile_m=warp_tile_m, warp_tile_n=warp_tile_n,
-            num_warps=num_warps_s1, WMMA_N=WMMA_N, use_pipeline=_use_pipeline,
+            warp_tile_m=warp_tile_m,
+            warp_tile_n=warp_tile_n,
+            num_warps=num_warps_s1,
+            WMMA_N=WMMA_N,
+            use_pipeline=_use_pipeline,
         )
         total_d_bytes_s1 = _ds1["total_d_bytes"]
         lds_d_row_stride_s1 = _ds1["lds_d_row_stride"]
@@ -264,7 +317,6 @@ def _compile_stage1_mxscale_kernel_impl(
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
         arg_num_valid_ids: fx.Tensor,
-
         arg_bias: fx.Tensor,
         i32_tokens_in: fx.Int32,
         i32_inter_in: fx.Int32,
@@ -275,19 +327,26 @@ def _compile_stage1_mxscale_kernel_impl(
 
         _keep_const_expr_ref = const_expr
         if const_expr(inst_prefetch):
-            if arith.cmpi(arith.CmpIPredicate.eq, rocdl.wave_id(),
-                          arith.constant(0, type=T.i32)):
-                _prefetch_lines = ["s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 8, 1), 1"]
+            if arith.cmpi(
+                arith.CmpIPredicate.eq, rocdl.wave_id(), arith.constant(0, type=T.i32)
+            ):
+                _prefetch_lines = [
+                    "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 8, 1), 1"
+                ]
                 for _pg in range_constexpr(10):
                     _prefetch_lines.append(
-                        f"s_prefetch_inst_pc_rel {_pg * 4096}, s0, 31")
+                        f"s_prefetch_inst_pc_rel {_pg * 4096}, s0, 31"
+                    )
                 llvm_dialect.inline_asm(
-                    None, [],
+                    None,
+                    [],
                     "\n".join(_prefetch_lines),
-                    "", has_side_effects=True,
+                    "",
+                    has_side_effects=True,
                 )
         llvm_dialect.inline_asm(
-            None, [],
+            None,
+            [],
             "s_setreg_imm32_b32 hwreg(26, 4, 1), 1",
             "",
             has_side_effects=True,
@@ -317,32 +376,48 @@ def _compile_stage1_mxscale_kernel_impl(
         eid_nbytes = size_expert_ids * arith.index(4)
         x_nbytes = tokens_idx * arith.index(K_packed_a)
         sx_nbytes = tokens_idx * arith.index(K_scale)
-        w_rows = arith.index(int(experts * (2 * N)))
-        w_nbytes = w_rows * arith.index(K_packed_b)
-        sw_nbytes = w_rows * arith.index(K_scale)
 
-        sorted_rsrc = buffer_ops.create_buffer_resource(arg_sorted_token_ids, max_size=False, num_records_bytes=sorted_nbytes)
-        eid_rsrc = buffer_ops.create_buffer_resource(arg_expert_ids, max_size=False, num_records_bytes=eid_nbytes)
-        x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=False, num_records_bytes=x_nbytes)
-        sx_rsrc = buffer_ops.create_buffer_resource(arg_scale_x, max_size=False, num_records_bytes=sx_nbytes)
-        w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False, num_records_bytes=w_nbytes)
-        sw_rsrc = buffer_ops.create_buffer_resource(arg_scale_w, max_size=False, num_records_bytes=sw_nbytes)
+        sorted_rsrc = buffer_ops.create_buffer_resource(
+            arg_sorted_token_ids, max_size=False, num_records_bytes=sorted_nbytes
+        )
+        eid_rsrc = buffer_ops.create_buffer_resource(
+            arg_expert_ids, max_size=False, num_records_bytes=eid_nbytes
+        )
+        x_rsrc = buffer_ops.create_buffer_resource(
+            arg_x, max_size=False, num_records_bytes=x_nbytes
+        )
+        sx_rsrc = buffer_ops.create_buffer_resource(
+            arg_scale_x, max_size=False, num_records_bytes=sx_nbytes
+        )
         out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
         tw_rsrc = buffer_ops.create_buffer_resource(arg_sorted_weights, max_size=True)
 
         bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
 
-        eid_i32 = buffer_ops.buffer_load(eid_rsrc, arith.index_cast(T.i32, by), vec_width=1, dtype=T.i32)
-        eid_ok0 = arith.cmpi(arith.CmpIPredicate.sge, eid_i32, arith.constant(0, type=T.i32))
-        eid_ok1 = arith.cmpi(arith.CmpIPredicate.slt, eid_i32, arith.constant(int(experts), type=T.i32))
+        eid_i32 = buffer_ops.buffer_load(
+            eid_rsrc, arith.index_cast(T.i32, by), vec_width=1, dtype=T.i32
+        )
+        eid_ok0 = arith.cmpi(
+            arith.CmpIPredicate.sge, eid_i32, arith.constant(0, type=T.i32)
+        )
+        eid_ok1 = arith.cmpi(
+            arith.CmpIPredicate.slt, eid_i32, arith.constant(int(experts), type=T.i32)
+        )
         block_row_start = arith.index_cast(T.i32, by * arith.index(int(route_tile_m)))
-        block_in_valid = arith.cmpi(arith.CmpIPredicate.slt, block_row_start, num_valid_i32)
+        block_in_valid = arith.cmpi(
+            arith.CmpIPredicate.slt, block_row_start, num_valid_i32
+        )
         block_ok = arith.andi(block_in_valid, arith.andi(eid_ok0, eid_ok1))
 
-        layout_thr = _make_moe_wave_layout(m_warp=m_warp, n_warp=n_warp, WAVE_SIZE=WAVE_SIZE, fx=fx)
+        layout_thr = _make_moe_wave_layout(
+            m_warp=m_warp, n_warp=n_warp, WAVE_SIZE=WAVE_SIZE, fx=fx
+        )
         thr_coord = idx2crd(tx, layout_thr)
         wave_m_idx, wave_n_idx, lane_kgrp, lane16 = (
-            fx.get(thr_coord, 0), fx.get(thr_coord, 1), fx.get(thr_coord, 2), fx.get(thr_coord, 3)
+            fx.get(thr_coord, 0),
+            fx.get(thr_coord, 1),
+            fx.get(thr_coord, 2),
+            fx.get(thr_coord, 3),
         )
         warp_m_base = wave_m_idx * arith.index(warp_tile_m)
         warp_n_base = wave_n_idx * arith.index(warp_tile_n)
@@ -351,7 +426,8 @@ def _compile_stage1_mxscale_kernel_impl(
         if const_expr(use_cluster):
             _local_x, _local_y = gpu.compute_cluster_position()
             _a_mcast_mask, b_mcast_mask = gpu.compute_mcast_masks(
-                _local_x, _local_y, int(cluster_m), int(cluster_n))
+                _local_x, _local_y, int(cluster_m), int(cluster_n)
+            )
         else:
             b_mcast_mask = 0
 
@@ -361,55 +437,99 @@ def _compile_stage1_mxscale_kernel_impl(
         lds_bu_bufs, lds_bsu_bufs = [], []
         lds_bg_pair_bufs, lds_bs_pair_bufs = [], []
         for _bi in range_constexpr(_nb):
-            lds_ag_bufs.append(get_op_result_or_value(
-                SmemPtr(base_ptr, off_ag_list[_bi], T.i8, shape=(lds_a_data_bytes,)).get()))
-            lds_as_bufs.append(get_op_result_or_value(
-                SmemPtr(base_ptr, off_as_list[_bi], T.i8, shape=(lds_a_scale_bytes,)).get()))
+            lds_ag_bufs.append(
+                get_op_result_or_value(
+                    SmemPtr(
+                        base_ptr, off_ag_list[_bi], T.i8, shape=(lds_a_data_bytes,)
+                    ).get()
+                )
+            )
+            lds_as_bufs.append(
+                get_op_result_or_value(
+                    SmemPtr(
+                        base_ptr, off_as_list[_bi], T.i8, shape=(lds_a_scale_bytes,)
+                    ).get()
+                )
+            )
             if const_expr(_merge_gate_up_tdm):
-                lds_bg_pair_bufs.append(get_op_result_or_value(
-                    SmemPtr(base_ptr, off_bg_pair_list[_bi], T.i8, shape=(2 * lds_b_data_bytes,)).get()))
-                lds_bs_pair_bufs.append(get_op_result_or_value(
-                    SmemPtr(base_ptr, off_bs_pair_list[_bi], T.i8, shape=(2 * lds_b_scale_bytes,)).get()))
+                lds_bg_pair_bufs.append(
+                    get_op_result_or_value(
+                        SmemPtr(
+                            base_ptr,
+                            off_bg_pair_list[_bi],
+                            T.i8,
+                            shape=(2 * lds_b_data_bytes,),
+                        ).get()
+                    )
+                )
+                lds_bs_pair_bufs.append(
+                    get_op_result_or_value(
+                        SmemPtr(
+                            base_ptr,
+                            off_bs_pair_list[_bi],
+                            T.i8,
+                            shape=(2 * lds_b_scale_bytes,),
+                        ).get()
+                    )
+                )
             else:
-                lds_bg_bufs.append(get_op_result_or_value(
-                    SmemPtr(base_ptr, off_bg_list[_bi], T.i8, shape=(lds_b_data_bytes,)).get()))
-                lds_bs_bufs.append(get_op_result_or_value(
-                    SmemPtr(base_ptr, off_bs_list[_bi], T.i8, shape=(lds_b_scale_bytes,)).get()))
-                lds_bu_bufs.append(get_op_result_or_value(
-                    SmemPtr(base_ptr, off_bu_list[_bi], T.i8, shape=(lds_b_data_bytes,)).get()))
-                lds_bsu_bufs.append(get_op_result_or_value(
-                    SmemPtr(base_ptr, off_bsu_list[_bi], T.i8, shape=(lds_b_scale_bytes,)).get()))
+                lds_bg_bufs.append(
+                    get_op_result_or_value(
+                        SmemPtr(
+                            base_ptr, off_bg_list[_bi], T.i8, shape=(lds_b_data_bytes,)
+                        ).get()
+                    )
+                )
+                lds_bs_bufs.append(
+                    get_op_result_or_value(
+                        SmemPtr(
+                            base_ptr, off_bs_list[_bi], T.i8, shape=(lds_b_scale_bytes,)
+                        ).get()
+                    )
+                )
+                lds_bu_bufs.append(
+                    get_op_result_or_value(
+                        SmemPtr(
+                            base_ptr, off_bu_list[_bi], T.i8, shape=(lds_b_data_bytes,)
+                        ).get()
+                    )
+                )
+                lds_bsu_bufs.append(
+                    get_op_result_or_value(
+                        SmemPtr(
+                            base_ptr,
+                            off_bsu_list[_bi],
+                            T.i8,
+                            shape=(lds_b_scale_bytes,),
+                        ).get()
+                    )
+                )
 
         lds_tid = SmemPtr(base_ptr, off_tid, T.i32, shape=(int(tile_m),)).get()
 
         if const_expr(bool(use_tdm_store)):
             from kernels.gemm_common_gfx1250 import get_lds_memref
+
             d_lds_f16_count_s1 = total_d_bytes_s1 // 2
-            d_smem_s1 = SmemPtr(base_ptr, d_output_off_s1, T.f16,
-                                shape=(d_lds_f16_count_s1,))
+            d_smem_s1 = SmemPtr(
+                base_ptr, d_output_off_s1, T.f16, shape=(d_lds_f16_count_s1,)
+            )
             d_lds_buffer_s1 = get_lds_memref(d_smem_s1)
             warp_lds_off_s1 = (
-                (wave_m_idx * arith.index(int(n_warp)) + wave_n_idx)
-                * arith.index(_warp_d_elems_s1)
-            )
+                wave_m_idx * arith.index(int(n_warp)) + wave_n_idx
+            ) * arith.index(_warp_d_elems_s1)
             d_lane_base_s1 = (
                 warp_lds_off_s1
                 + lane16 * arith.index(_lds_d_stride_elems_s1)
                 + lane_kgrp * arith.index(4 * elem_bytes_d_s1)
             )
             wave_id_idx_s1 = arith.index_cast(T.index, rocdl.wave_id())
-            d_warp_off_sgpr_s1 = (
-                wave_id_idx_s1 * arith.index(warp_d_bytes_s1)
-                + arith.index(d_output_off_s1)
-            )
-            warp_m_off_sgpr_s1 = (
-                (wave_id_idx_s1 / arith.index(int(n_warp)))
-                * arith.index(warp_tile_m)
-            )
+            d_warp_off_sgpr_s1 = wave_id_idx_s1 * arith.index(
+                warp_d_bytes_s1
+            ) + arith.index(d_output_off_s1)
             warp_n_off_sgpr_s1 = (
-                (wave_id_idx_s1 % arith.index(int(n_warp)))
-                * arith.index(warp_tile_n)
-            )
+                wave_id_idx_s1 % arith.index(int(n_warp))
+            ) * arith.index(warp_tile_n)
 
         def silu(x):
             t = x * (-1.4426950408889634)
@@ -428,7 +548,11 @@ def _compile_stage1_mxscale_kernel_impl(
             rounds = (total + block_threads - 1) // block_threads
             for it in range(rounds):
                 elem = tx + fx.Index(it * block_threads)
-                in_range = arith.cmpi(arith.CmpIPredicate.ult, arith.index_cast(T.i32, elem), arith.constant(total, type=T.i32))
+                in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult,
+                    arith.index_cast(T.i32, elem),
+                    arith.constant(total, type=T.i32),
+                )
                 _if_elem = scf.IfOp(in_range)
                 with ir.InsertionPoint(_if_elem.then_block):
                     row = elem // arith.index(int(packed_tile_k_a))
@@ -438,9 +562,19 @@ def _compile_stage1_mxscale_kernel_impl(
                     tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
                     tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
                     load_ok = tok_ok
-                    x_idx = tok * arith.constant(K_packed_a, type=T.i32) + arith.index_cast(T.i32, k_packed_base + col)
-                    x_idx_safe = arith.select(load_ok, x_idx, arith.constant(0, type=T.i32))
-                    x_val = arith.select(load_ok, buffer_ops.buffer_load(x_rsrc, x_idx_safe, vec_width=1, dtype=T.i8), arith.constant(0, type=T.i8))
+                    x_idx = tok * arith.constant(
+                        K_packed_a, type=T.i32
+                    ) + arith.index_cast(T.i32, k_packed_base + col)
+                    x_idx_safe = arith.select(
+                        load_ok, x_idx, arith.constant(0, type=T.i32)
+                    )
+                    x_val = arith.select(
+                        load_ok,
+                        buffer_ops.buffer_load(
+                            x_rsrc, x_idx_safe, vec_width=1, dtype=T.i8
+                        ),
+                        arith.constant(0, type=T.i8),
+                    )
                     lds_idx = row * arith.index(lds_a_stride_bytes) + col
                     v1 = vector.from_elements(T.vec(1, T.i8), [x_val])
                     vector.store(v1, target_lds, [lds_idx], alignment=1)
@@ -460,7 +594,8 @@ def _compile_stage1_mxscale_kernel_impl(
         def _preload_sorted_ids_to_lds():
             """Preload tile_m sorted_token_ids entries into ``lds_tid`` (once per CTA)."""
             _tid_in_range = arith.cmpi(
-                arith.CmpIPredicate.ult, tx, fx.Index(int(tile_m)))
+                arith.CmpIPredicate.ult, tx, fx.Index(int(tile_m))
+            )
             _if_tid = scf.IfOp(_tid_in_range)
             with ir.InsertionPoint(_if_tid.then_block):
                 _tx_i32 = arith.index_cast(T.i32, tx)
@@ -472,12 +607,13 @@ def _compile_stage1_mxscale_kernel_impl(
                     arith.constant(int(route_tile_m), type=T.i32),
                 )
                 _in_valid = arith.cmpi(
-                    arith.CmpIPredicate.slt, _sorted_i32, num_valid_i32)
+                    arith.CmpIPredicate.slt, _sorted_i32, num_valid_i32
+                )
                 _row_valid = arith.andi(_in_route, _in_valid)
-                _row_safe_i32 = arith.select(
-                    _row_valid, _sorted_i32, block_row_start)
+                _row_safe_i32 = arith.select(_row_valid, _sorted_i32, block_row_start)
                 _raw = buffer_ops.buffer_load(
-                    sorted_rsrc, _row_safe_i32, vec_width=1, dtype=T.i32)
+                    sorted_rsrc, _row_safe_i32, vec_width=1, dtype=T.i32
+                )
                 _sentinel = arith.constant(-1, type=T.i32)
                 _val = arith.select(_row_valid, _raw, _sentinel)
                 _vec1 = vector.from_elements(T.vec(1, T.i32), [_val])
@@ -516,7 +652,8 @@ def _compile_stage1_mxscale_kernel_impl(
                 _store_valid_i32 = arith.select(_row_fully_ok, _one_i32, _zero_i32)
                 _a_store_valids.append(rocdl.readfirstlane(T.i32, _store_valid_i32))
                 _out_row_safe = arith.select(
-                    _row_fully_ok, _out_row,
+                    _row_fully_ok,
+                    _out_row,
                     _safe_row,
                 )
                 _out_row_sgpr = rocdl.readfirstlane(T.i32, _out_row_safe)
@@ -531,7 +668,9 @@ def _compile_stage1_mxscale_kernel_impl(
         def _get_tokens_sgpr():
             nonlocal _a_tokens_sgpr
             if const_expr(_a_tokens_sgpr is None):
-                _tok_i32 = arith.index_cast(T.i32, arith.index_cast(T.index, i32_tokens_in))
+                _tok_i32 = arith.index_cast(
+                    T.i32, arith.index_cast(T.index, i32_tokens_in)
+                )
                 _a_tokens_sgpr = rocdl.readfirstlane(T.i32, _tok_i32)
             return _a_tokens_sgpr
 
@@ -556,9 +695,11 @@ def _compile_stage1_mxscale_kernel_impl(
             for _gi in range_constexpr(_TDM_GATHER_GROUPS):
                 _start = _gi * _TDM_GATHER_CHUNK
                 _cnt = min(_TDM_GATHER_CHUNK, int(tile_m) - _start)
-                _row_indices = _a_tok_ids[_start:_start + _cnt]
-                _valid_count = _sum_i32_values(_a_load_valids[_start:_start + _cnt])
-                _has_valid = arith.cmpi(arith.CmpIPredicate.sgt, _valid_count, _zero_i32)
+                _row_indices = _a_tok_ids[_start : _start + _cnt]
+                _valid_count = _sum_i32_values(_a_load_valids[_start : _start + _cnt])
+                _has_valid = arith.cmpi(
+                    arith.CmpIPredicate.sgt, _valid_count, _zero_i32
+                )
                 _issue_pred = _has_valid
                 if const_expr(wave_specialized_tdm):
                     _gather_owner = _gi % _tdm_loader_waves
@@ -593,16 +734,20 @@ def _compile_stage1_mxscale_kernel_impl(
                     _per_buf.append(_base_desc)
                 _descs.append(_per_buf)
 
-                _base_addr_lo.append(vector.extract(
-                    _per_buf[0].dgroup0,
-                    static_position=[2],
-                    dynamic_position=[],
-                ))
-                _base_addr_hi.append(vector.extract(
-                    _per_buf[0].dgroup0,
-                    static_position=[3],
-                    dynamic_position=[],
-                ))
+                _base_addr_lo.append(
+                    vector.extract(
+                        _per_buf[0].dgroup0,
+                        static_position=[2],
+                        dynamic_position=[],
+                    )
+                )
+                _base_addr_hi.append(
+                    vector.extract(
+                        _per_buf[0].dgroup0,
+                        static_position=[3],
+                        dynamic_position=[],
+                    )
+                )
 
             _a_gather_cache["desc"] = _descs
             _a_gather_cache["pred"] = _preds
@@ -611,7 +756,9 @@ def _compile_stage1_mxscale_kernel_impl(
 
         def issue_a_load_tdm_gather(k_base, buf_idx):
             """Hot path: advance addr_lo on the precomputed gather descriptor."""
-            k_packed_base = k_base if PACK_FACTOR_A == 1 else k_base // fx.Index(PACK_FACTOR_A)
+            k_packed_base = (
+                k_base if PACK_FACTOR_A == 1 else k_base // fx.Index(PACK_FACTOR_A)
+            )
             _k_byte_off_i32 = arith.index_cast(T.i32, k_packed_base)
             _descs = _a_gather_cache["desc"]
             _preds = _a_gather_cache["pred"]
@@ -675,10 +822,7 @@ def _compile_stage1_mxscale_kernel_impl(
                     _extract_desc_addr_hi(d) for d in _bs_pair
                 ]
             else:
-                _eid_row = (
-                    arith.index_cast(T.index, eid_i32)
-                    * arith.index(int(2 * N))
-                )
+                _eid_row = arith.index_cast(T.index, eid_i32) * arith.index(int(2 * N))
                 _n_gate = _eid_row + blk_n
                 _n_up = _eid_row + blk_n + arith.index(int(N))
                 _bg = [
@@ -714,18 +858,15 @@ def _compile_stage1_mxscale_kernel_impl(
         def _b_data_k_byte_off(k_base):
 
             _k_packed_b = (
-                k_base if PACK_FACTOR_B == 1
-                else k_base // fx.Index(PACK_FACTOR_B)
+                k_base if PACK_FACTOR_B == 1 else k_base // fx.Index(PACK_FACTOR_B)
             )
             if const_expr(is_fp4):
                 return arith.index_cast(T.i32, _k_packed_b)
-            return arith.index_cast(
-                T.i32, _k_packed_b * fx.Index(16))
+            return arith.index_cast(T.i32, _k_packed_b * fx.Index(16))
 
         def _b_scale_k_byte_off(k_base):
 
-            return arith.index_cast(
-                T.i32, k_base // fx.Index(SCALE_BLOCK))
+            return arith.index_cast(T.i32, k_base // fx.Index(SCALE_BLOCK))
 
         def make_desc_as(k_base):
             return k_base / arith.index(SCALE_BLOCK)
@@ -753,13 +894,14 @@ def _compile_stage1_mxscale_kernel_impl(
                         fused = _load_fused_from_lds(row)
                         tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
                         tok_ok = arith.cmpi(
-                            arith.CmpIPredicate.ult, tok, i32_tokens_in,
+                            arith.CmpIPredicate.ult,
+                            tok,
+                            i32_tokens_in,
                         )
                         if const_expr(_as_layout_rowmajor):
-                            lds_idx = (
-                                row * arith.index(_row_bytes)
-                                + ksc_blk * arith.index(_blk_bytes)
-                            )
+                            lds_idx = row * arith.index(
+                                _row_bytes
+                            ) + ksc_blk * arith.index(_blk_bytes)
                         else:
                             warp_row_idx = row / arith.index(warp_tile_m)
                             local_row = row % arith.index(warp_tile_m)
@@ -769,22 +911,16 @@ def _compile_stage1_mxscale_kernel_impl(
                                 warp_row_idx * arith.index(WMMA_M) + lane_row
                             )
                             lds_idx = (
-                                global_lds_row
-                                * arith.index(interleaved_scale_cols_a)
-                                + ksc_blk
-                                * arith.index(wmma_m_rep * SCALES_PER_WMMA)
+                                global_lds_row * arith.index(interleaved_scale_cols_a)
+                                + ksc_blk * arith.index(wmma_m_rep * SCALES_PER_WMMA)
                                 + local_wm_idx * arith.index(SCALES_PER_WMMA)
                             )
                         _if_ok = scf.IfOp(tok_ok, has_else=True)
                         with ir.InsertionPoint(_if_ok.then_block):
-                            chunk_off = (
-                                k_scale_base
-                                + ksc_blk * arith.index(_blk_bytes)
-                            )
-                            sx_idx = (
-                                tok * arith.constant(K_scale, type=T.i32)
-                                + arith.index_cast(T.i32, chunk_off)
-                            )
+                            chunk_off = k_scale_base + ksc_blk * arith.index(_blk_bytes)
+                            sx_idx = tok * arith.constant(
+                                K_scale, type=T.i32
+                            ) + arith.index_cast(T.i32, chunk_off)
                             sx_raw = buffer_ops.buffer_load(
                                 sx_rsrc,
                                 arith.shrui(
@@ -799,7 +935,9 @@ def _compile_stage1_mxscale_kernel_impl(
                                 vector.from_elements(T.vec(1, T.i32), [sx_raw]),
                             )
                             vector.store(
-                                sx_vec, target_lds, [lds_idx],
+                                sx_vec,
+                                target_lds,
+                                [lds_idx],
                                 alignment=_blk_bytes,
                             )
                             scf.YieldOp([])
@@ -812,7 +950,9 @@ def _compile_stage1_mxscale_kernel_impl(
                                 ),
                             )
                             vector.store(
-                                fill_vec, target_lds, [lds_idx],
+                                fill_vec,
+                                target_lds,
+                                [lds_idx],
                                 alignment=_blk_bytes,
                             )
                             scf.YieldOp([])
@@ -835,15 +975,23 @@ def _compile_stage1_mxscale_kernel_impl(
                         fused = _load_fused_from_lds(row)
                         tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
                         tok_ok = arith.cmpi(
-                            arith.CmpIPredicate.ult, tok, i32_tokens_in,
+                            arith.CmpIPredicate.ult,
+                            tok,
+                            i32_tokens_in,
                         )
                         load_ok = tok_ok
                         ksc_off = k_scale_base + ksc
-                        sx_idx = tok * arith.constant(K_scale, type=T.i32) + arith.index_cast(T.i32, ksc_off)
-                        sx_idx_safe = arith.select(load_ok, sx_idx, arith.constant(0, type=T.i32))
+                        sx_idx = tok * arith.constant(
+                            K_scale, type=T.i32
+                        ) + arith.index_cast(T.i32, ksc_off)
+                        sx_idx_safe = arith.select(
+                            load_ok, sx_idx, arith.constant(0, type=T.i32)
+                        )
                         sx_val = arith.select(
                             load_ok,
-                            buffer_ops.buffer_load(sx_rsrc, sx_idx_safe, vec_width=1, dtype=T.i8),
+                            buffer_ops.buffer_load(
+                                sx_rsrc, sx_idx_safe, vec_width=1, dtype=T.i8
+                            ),
                             arith.constant(127, type=T.i8),
                         )
                         if is_fp4:
@@ -853,7 +1001,9 @@ def _compile_stage1_mxscale_kernel_impl(
                             local_row = row % arith.index(warp_tile_m)
                             lane_row = local_row % arith.index(WMMA_M)
                             local_wm_idx = local_row / arith.index(WMMA_M)
-                            global_lds_row = warp_row_idx * arith.index(WMMA_M) + lane_row
+                            global_lds_row = (
+                                warp_row_idx * arith.index(WMMA_M) + lane_row
+                            )
                             ksc_blk = ksc / arith.index(SCALES_PER_WMMA)
                             ksc_sub = ksc % arith.index(SCALES_PER_WMMA)
                             lds_idx = (
@@ -874,11 +1024,13 @@ def _compile_stage1_mxscale_kernel_impl(
             for _gi in range_constexpr(_TDM_GATHER_GROUPS):
                 _start = _gi * _TDM_GATHER_CHUNK
                 _cnt = min(_TDM_GATHER_CHUNK, int(tile_m) - _start)
-                _row_indices = _a_tok_ids[_start:_start + _cnt]
-                _valid_count = _sum_i32_values(_a_load_valids[_start:_start + _cnt])
+                _row_indices = _a_tok_ids[_start : _start + _cnt]
+                _valid_count = _sum_i32_values(_a_load_valids[_start : _start + _cnt])
                 _lds_off = fx.Index(_start * _as_row_bytes)
                 _has_valid = arith.cmpi(
-                    arith.CmpIPredicate.sgt, _valid_count, _zero_i32,
+                    arith.CmpIPredicate.sgt,
+                    _valid_count,
+                    _zero_i32,
                 )
                 _issue_pred = _has_valid
                 if wave_specialized_tdm:
@@ -913,55 +1065,82 @@ def _compile_stage1_mxscale_kernel_impl(
         def make_desc_b(lds_b_mem, n_off, k_base):
             if const_expr(is_fp4):
                 return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_w, lds_memref=lds_b_mem,
+                    global_ptr=arg_w,
+                    lds_memref=lds_b_mem,
                     global_offset=(n_off, k_base / arith.index(PACK_FACTOR_B)),
                     tensor_shape=(int(tile_n), int(packed_tile_k_b)),
                     strides=(K_packed_b, 1),
                     tile_shape=(int(tile_n), int(packed_tile_k_b)),
-                    elem_bytes=1, pad_interval=int(packed_tile_k_b), pad_amount=LDS_PAD_B_BYTES,
-                    num_warps=tdm_desc_num_warps, workgroup_mask=b_mcast_mask)
+                    elem_bytes=1,
+                    pad_interval=int(packed_tile_k_b),
+                    pad_amount=LDS_PAD_B_BYTES,
+                    num_warps=tdm_desc_num_warps,
+                    workgroup_mask=b_mcast_mask,
+                )
             return tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=arg_w, lds_memref=lds_b_mem,
-                global_offset=(n_off / arith.index(16), (k_base / arith.index(PACK_FACTOR_B)) * arith.index(16)),
+                global_ptr=arg_w,
+                lds_memref=lds_b_mem,
+                global_offset=(
+                    n_off / arith.index(16),
+                    (k_base / arith.index(PACK_FACTOR_B)) * arith.index(16),
+                ),
                 tensor_shape=(int(experts * (2 * N) // 16), int(K_packed_b * 16)),
                 strides=(K_packed_b * 16, 1),
                 tile_shape=(int(tile_n // 16), int(packed_tile_k_b * 16)),
                 elem_bytes=1,
-                pad_interval=0, pad_amount=0,
+                pad_interval=0,
+                pad_amount=0,
                 num_warps=tdm_desc_num_warps,
-                workgroup_mask=b_mcast_mask)
+                workgroup_mask=b_mcast_mask,
+            )
 
         def make_desc_b_pair(lds_b_mem, n_off, k_base):
             return tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=arg_w, lds_memref=lds_b_mem,
-                global_offset=(n_off / arith.index(16), (k_base / arith.index(PACK_FACTOR_B)) * arith.index(16)),
+                global_ptr=arg_w,
+                lds_memref=lds_b_mem,
+                global_offset=(
+                    n_off / arith.index(16),
+                    (k_base / arith.index(PACK_FACTOR_B)) * arith.index(16),
+                ),
                 tensor_shape=(int(experts * (2 * N) // 16), int(K_packed_b * 16)),
                 strides=(K_packed_b * 16, 1),
                 tile_shape=(int((2 * tile_n) // 16), int(packed_tile_k_b * 16)),
                 elem_bytes=1,
-                pad_interval=0, pad_amount=0,
+                pad_interval=0,
+                pad_amount=0,
                 num_warps=tdm_desc_num_warps,
-                workgroup_mask=b_mcast_mask)
+                workgroup_mask=b_mcast_mask,
+            )
 
         def make_desc_bs(lds_bs_mem, n_off, k_base):
             return tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=arg_scale_w, lds_memref=lds_bs_mem,
+                global_ptr=arg_scale_w,
+                lds_memref=lds_bs_mem,
                 global_offset=(n_off, k_base / arith.index(SCALE_BLOCK)),
                 tensor_shape=(int(tile_n), int(scale_k_per_tile)),
                 strides=(K_scale, 1),
                 tile_shape=(int(tile_n), int(scale_k_per_tile)),
-                elem_bytes=1, pad_interval=0, pad_amount=0,
-                num_warps=tdm_desc_num_warps, workgroup_mask=b_mcast_mask)
+                elem_bytes=1,
+                pad_interval=0,
+                pad_amount=0,
+                num_warps=tdm_desc_num_warps,
+                workgroup_mask=b_mcast_mask,
+            )
 
         def make_desc_bs_pair(lds_bs_mem, n_off, k_base):
             return tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=arg_scale_w, lds_memref=lds_bs_mem,
+                global_ptr=arg_scale_w,
+                lds_memref=lds_bs_mem,
                 global_offset=(n_off, k_base / arith.index(SCALE_BLOCK)),
                 tensor_shape=(int(2 * tile_n), int(scale_k_per_tile)),
                 strides=(K_scale, 1),
                 tile_shape=(int(2 * tile_n), int(scale_k_per_tile)),
-                elem_bytes=1, pad_interval=0, pad_amount=0,
-                num_warps=tdm_desc_num_warps, workgroup_mask=b_mcast_mask)
+                elem_bytes=1,
+                pad_interval=0,
+                pad_amount=0,
+                num_warps=tdm_desc_num_warps,
+                workgroup_mask=b_mcast_mask,
+            )
 
         def _stage1_pair_row_base():
             _eid_row = arith.index_cast(T.index, eid_i32) * arith.index(int(2 * N))
@@ -969,10 +1148,18 @@ def _compile_stage1_mxscale_kernel_impl(
             return _eid_row + _tile_idx * arith.index(int(2 * tile_n))
 
         _ldrs = _make_mxscale_data_loaders(
-            tiling=tp, warp_m_base=warp_m_base, warp_n_base=warp_n_base,
-            wave_n_idx=wave_n_idx, lane16=lane16, lane_kgrp=lane_kgrp,
-            ir=ir, arith=arith, vector=vector, llvm_dialect=llvm_dialect,
-            T=T, range_constexpr=range_constexpr,
+            tiling=tp,
+            warp_m_base=warp_m_base,
+            warp_n_base=warp_n_base,
+            wave_n_idx=wave_n_idx,
+            lane16=lane16,
+            lane_kgrp=lane_kgrp,
+            ir=ir,
+            arith=arith,
+            vector=vector,
+            llvm_dialect=llvm_dialect,
+            T=T,
+            range_constexpr=range_constexpr,
         )
         _lds_load_b128 = _ldrs["_lds_load_b128"]
         load_data_frag = _ldrs["load_data_frag"]
@@ -997,8 +1184,7 @@ def _compile_stage1_mxscale_kernel_impl(
             b_data_bases = _precompute_b_data_bases()
             if const_expr(_merge_gate_up_tdm):
                 b_u_data_bases = [
-                    _base + arith.index(lds_b_data_bytes)
-                    for _base in b_data_bases
+                    _base + arith.index(lds_b_data_bytes) for _base in b_data_bases
                 ]
             else:
                 b_u_data_bases = b_data_bases
@@ -1006,8 +1192,7 @@ def _compile_stage1_mxscale_kernel_impl(
             bs_bases = _precompute_b_scale_lane_bases()
             if const_expr(_merge_gate_up_tdm):
                 bsu_bases = [
-                    _base + arith.index(lds_b_scale_bytes)
-                    for _base in bs_bases
+                    _base + arith.index(lds_b_scale_bytes) for _base in bs_bases
                 ]
             else:
                 bsu_bases = bs_bases
@@ -1036,37 +1221,60 @@ def _compile_stage1_mxscale_kernel_impl(
                     _gate_bs_buf = lds_bs_bufs[buf_idx]
                     _up_bs_buf = lds_bsu_bufs[buf_idx]
 
-                b_g = [load_b_frag(_gate_b_buf, b_data_bases, wn, ks)
-                       for wn in range_constexpr(wmma_n_rep)]
-                b_u = [load_b_frag(_up_b_buf, b_u_data_bases, wn, ks)
-                       for wn in range_constexpr(wmma_n_rep)]
+                b_g = [
+                    load_b_frag(_gate_b_buf, b_data_bases, wn, ks)
+                    for wn in range_constexpr(wmma_n_rep)
+                ]
+                b_u = [
+                    load_b_frag(_up_b_buf, b_u_data_bases, wn, ks)
+                    for wn in range_constexpr(wmma_n_rep)
+                ]
                 if const_expr(is_fp4):
-                    as_v = [load_scale_i32(lds_as_bufs[buf_idx], as_bases[wm], ks)
-                            for wm in range_constexpr(wmma_m_rep)]
-                    bs_gv = [load_scale_i32(_gate_bs_buf, bs_bases[bi], ks)
-                             for bi in range_constexpr(b_scale_load_rep)]
-                    bs_uv = [load_scale_i32(_up_bs_buf, bsu_bases[bi], ks)
-                             for bi in range_constexpr(b_scale_load_rep)]
+                    as_v = [
+                        load_scale_i32(lds_as_bufs[buf_idx], as_bases[wm], ks)
+                        for wm in range_constexpr(wmma_m_rep)
+                    ]
+                    bs_gv = [
+                        load_scale_i32(_gate_bs_buf, bs_bases[bi], ks)
+                        for bi in range_constexpr(b_scale_load_rep)
+                    ]
+                    bs_uv = [
+                        load_scale_i32(_up_bs_buf, bsu_bases[bi], ks)
+                        for bi in range_constexpr(b_scale_load_rep)
+                    ]
                 else:
-                    as_v = load_scale_b128(lds_as_bufs[buf_idx], as_bases[0],
-                                           wmma_m_rep, ks)
-                    bs_gv = [load_scale_i32(_gate_bs_buf, bs_bases[wn], ks)
-                             for wn in range_constexpr(wmma_n_rep)]
-                    bs_uv = [load_scale_i32(_up_bs_buf, bsu_bases[wn], ks)
-                             for wn in range_constexpr(wmma_n_rep)]
+                    as_v = load_scale_b128(
+                        lds_as_bufs[buf_idx], as_bases[0], wmma_m_rep, ks
+                    )
+                    bs_gv = [
+                        load_scale_i32(_gate_bs_buf, bs_bases[wn], ks)
+                        for wn in range_constexpr(wmma_n_rep)
+                    ]
+                    bs_uv = [
+                        load_scale_i32(_up_bs_buf, bsu_bases[wn], ks)
+                        for wn in range_constexpr(wmma_n_rep)
+                    ]
                 return b_g, bs_gv, b_u, bs_uv, as_v
 
             def emit_wmma(accs, wm, wn, a_frag, b_frags, a_scales, b_scales):
                 _mxscale_emit_wmma(
-                    accs=accs, wm=wm, wn=wn,
-                    a_frag=a_frag, b_frags=b_frags,
-                    a_scales=a_scales, b_scales=b_scales,
-                    is_fp4=is_fp4, is_a8w4=is_a8w4,
+                    accs=accs,
+                    wm=wm,
+                    wn=wn,
+                    a_frag=a_frag,
+                    b_frags=b_frags,
+                    a_scales=a_scales,
+                    b_scales=b_scales,
+                    is_fp4=is_fp4,
+                    is_a8w4=is_a8w4,
                     use_scale_opsel=False,
-                    rocdl=rocdl, T=T,
+                    rocdl=rocdl,
+                    T=T,
                 )
 
-            def _emit_rows(acg_in, acu_in, start_wm, a_frags, b_g, b_u, a_scales, bs_g, bs_u):
+            def _emit_rows(
+                acg_in, acu_in, start_wm, a_frags, b_g, b_u, a_scales, bs_g, bs_u
+            ):
                 for frag_i in range_constexpr(len(a_frags)):
                     wm = start_wm + frag_i
                     for wn_raw in range_constexpr(wmma_n_rep):
@@ -1089,10 +1297,13 @@ def _compile_stage1_mxscale_kernel_impl(
                         _mid_emit_wn = _front_wn - 1
                 _did_mid = False
                 for ks in range_constexpr(k_wmma_steps):
-                    b_g, bs_gv, b_u, bs_uv, as_v = _load_gate_up_b_and_scales(buf_idx, ks)
+                    b_g, bs_gv, b_u, bs_uv, as_v = _load_gate_up_b_and_scales(
+                        buf_idx, ks
+                    )
                     for wm in range_constexpr(wmma_m_rep):
-                        a_frag = load_data_frag(lds_ag_bufs[buf_idx],
-                                                a_data_bases[wm], ks)
+                        a_frag = load_data_frag(
+                            lds_ag_bufs[buf_idx], a_data_bases[wm], ks
+                        )
                         for wn_raw in range_constexpr(wmma_n_rep):
                             wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                             emit_wmma(acg, wm, wn, a_frag, b_g, as_v, bs_gv)
@@ -1127,8 +1338,7 @@ def _compile_stage1_mxscale_kernel_impl(
                     for wm in range_constexpr(_front_wm)
                 ]
                 _use_partial_drain = (
-                    next_bs_info is not None
-                    and _front_wm * wmma_n_rep >= 4
+                    next_bs_info is not None and _front_wm * wmma_n_rep >= 4
                 )
 
                 if const_expr(_use_partial_drain):
@@ -1176,26 +1386,50 @@ def _compile_stage1_mxscale_kernel_impl(
                 current_g = list(acg)
                 current_u = list(acu)
                 if const_expr(k_wmma_steps == 1):
-                    b_g, bs_gv, b_u, bs_uv, as_v = _load_gate_up_b_and_scales(buf_idx, 0)
+                    b_g, bs_gv, b_u, bs_uv, as_v = _load_gate_up_b_and_scales(
+                        buf_idx, 0
+                    )
                     current_g, current_u, _ = _a_streaming_compute(
-                        current_g, current_u, buf_idx,
-                        b_g, bs_gv, b_u, bs_uv, as_v, 0,
+                        current_g,
+                        current_u,
+                        buf_idx,
+                        b_g,
+                        bs_gv,
+                        b_u,
+                        bs_uv,
+                        as_v,
+                        0,
                         mid_compute_callback=mid_compute_callback,
                     )
                 else:
-                    b_g, bs_gv, b_u, bs_uv, as_v = _load_gate_up_b_and_scales(buf_idx, 0)
+                    b_g, bs_gv, b_u, bs_uv, as_v = _load_gate_up_b_and_scales(
+                        buf_idx, 0
+                    )
                     for ks in range_constexpr(k_wmma_steps - 1):
                         _mid_cb = mid_compute_callback if ks == 0 else None
                         current_g, current_u, _next = _a_streaming_compute(
-                            current_g, current_u, buf_idx,
-                            b_g, bs_gv, b_u, bs_uv, as_v, ks,
+                            current_g,
+                            current_u,
+                            buf_idx,
+                            b_g,
+                            bs_gv,
+                            b_u,
+                            bs_uv,
+                            as_v,
+                            ks,
                             next_bs_info=(buf_idx, ks + 1),
                             mid_compute_callback=_mid_cb,
                         )
                         b_g, bs_gv, b_u, bs_uv, as_v = _next
                     current_g, current_u, _ = _a_streaming_compute(
-                        current_g, current_u, buf_idx,
-                        b_g, bs_gv, b_u, bs_uv, as_v,
+                        current_g,
+                        current_u,
+                        buf_idx,
+                        b_g,
+                        bs_gv,
+                        b_u,
+                        bs_uv,
+                        as_v,
                         k_wmma_steps - 1,
                     )
                 return current_g, current_u
@@ -1241,7 +1475,9 @@ def _compile_stage1_mxscale_kernel_impl(
                             _tdm_wave_id,
                             arith.constant(_value_idx, type=T.i32),
                         )
-                        _selected = arith.select(_is_wave, values[_value_idx], _selected)
+                        _selected = arith.select(
+                            _is_wave, values[_value_idx], _selected
+                        )
                     return _selected
 
                 def _tdm_desc_lds_addr(desc):
@@ -1327,9 +1563,8 @@ def _compile_stage1_mxscale_kernel_impl(
                         _scale_adv_i32,
                     )
                 else:
-                    _eid_row = (
-                        arith.index_cast(T.index, eid_i32)
-                        * arith.index(int(2 * N))
+                    _eid_row = arith.index_cast(T.index, eid_i32) * arith.index(
+                        int(2 * N)
                     )
                     _n_gate_init = _eid_row + blk_n
                     _n_up_init = _eid_row + blk_n + arith.index(int(N))
@@ -1437,12 +1672,15 @@ def _compile_stage1_mxscale_kernel_impl(
                 _tdm_zero_addr_lo = arith.constant(0, type=T.i32)
                 _active_stage_desc_base = [
                     tdm_ops.TDMDescriptor2D(
-                        vector.from_elements(T.vec(4, T.i32), [
-                            _tdm_pred,
-                            _active_stage_lds_addr[i],
-                            _tdm_zero_addr_lo,
-                            _active_addr_hi,
-                        ]),
+                        vector.from_elements(
+                            T.vec(4, T.i32),
+                            [
+                                _tdm_pred,
+                                _active_stage_lds_addr[i],
+                                _tdm_zero_addr_lo,
+                                _active_addr_hi,
+                            ],
+                        ),
                         _active_dgroup1,
                     )
                     for i in range_constexpr(_nb)
@@ -1461,14 +1699,14 @@ def _compile_stage1_mxscale_kernel_impl(
                         )
                         scf.YieldOp([])
                     _next_addr_lo, _next_addr_hi = tdm_ops.add_addr_with_carry(
-                        curr_addr_lo, curr_addr_hi, _active_adv_i32,
+                        curr_addr_lo,
+                        curr_addr_hi,
+                        _active_adv_i32,
                     )
 
                     return (
-                        arith.select(
-                            _is_loader_wave, _next_addr_lo, curr_addr_lo),
-                        arith.select(
-                            _is_loader_wave, _next_addr_hi, curr_addr_hi),
+                        arith.select(_is_loader_wave, _next_addr_lo, curr_addr_lo),
+                        arith.select(_is_loader_wave, _next_addr_hi, curr_addr_hi),
                     )
 
             if const_expr(_use_tdm_gather_a):
@@ -1488,14 +1726,16 @@ def _compile_stage1_mxscale_kernel_impl(
                             _b_desc_cache["bg_pair_addr_lo"][buf_idx],
                             _b_desc_cache["bg_pair_addr_hi"][buf_idx],
                             _k_data_off,
-                        ))
+                        )
+                    )
                     tdm_ops.tensor_load_2d(
                         tdm_ops.update_tensor_descriptor_2d_addr64(
                             _b_desc_cache["bs_pair"][buf_idx],
                             _b_desc_cache["bs_pair_addr_lo"][buf_idx],
                             _b_desc_cache["bs_pair_addr_hi"][buf_idx],
                             _k_scale_off,
-                        ))
+                        )
+                    )
                 else:
                     tdm_ops.tensor_load_2d(
                         tdm_ops.update_tensor_descriptor_2d_addr64(
@@ -1503,28 +1743,32 @@ def _compile_stage1_mxscale_kernel_impl(
                             _b_desc_cache["bg_addr_lo"][buf_idx],
                             _b_desc_cache["bg_addr_hi"][buf_idx],
                             _k_data_off,
-                        ))
+                        )
+                    )
                     tdm_ops.tensor_load_2d(
                         tdm_ops.update_tensor_descriptor_2d_addr64(
                             _b_desc_cache["bu"][buf_idx],
                             _b_desc_cache["bu_addr_lo"][buf_idx],
                             _b_desc_cache["bu_addr_hi"][buf_idx],
                             _k_data_off,
-                        ))
+                        )
+                    )
                     tdm_ops.tensor_load_2d(
                         tdm_ops.update_tensor_descriptor_2d_addr64(
                             _b_desc_cache["bs"][buf_idx],
                             _b_desc_cache["bs_addr_lo"][buf_idx],
                             _b_desc_cache["bs_addr_hi"][buf_idx],
                             _k_scale_off,
-                        ))
+                        )
+                    )
                     tdm_ops.tensor_load_2d(
                         tdm_ops.update_tensor_descriptor_2d_addr64(
                             _b_desc_cache["bsu"][buf_idx],
                             _b_desc_cache["bsu_addr_lo"][buf_idx],
                             _b_desc_cache["bsu_addr_hi"][buf_idx],
                             _k_scale_off,
-                        ))
+                        )
+                    )
 
             def _issue_scalar_loads(k_base, buf_idx):
                 if const_expr(_use_tdm_gather_a):
@@ -1543,11 +1787,15 @@ def _compile_stage1_mxscale_kernel_impl(
             def _compute_with_mid_loads(acg, acu, buf_idx, mid_load_callback=None):
                 if const_expr(_use_scheduled_compute):
                     return _compute_k_tile_scheduled(
-                        acg, acu, buf_idx,
+                        acg,
+                        acu,
+                        buf_idx,
                         mid_compute_callback=mid_load_callback,
                     )
                 return _compute_k_tile(
-                    acg, acu, buf_idx,
+                    acg,
+                    acu,
+                    buf_idx,
                     mid_compute_callback=mid_load_callback,
                 )
 
@@ -1562,9 +1810,8 @@ def _compile_stage1_mxscale_kernel_impl(
                     active_b_addr_hi = _active_addr_hi
                     for kt in range_constexpr(num_k_tiles_per_bz):
                         k_base = _k_off(fx.Index(kt * int(tile_k)))
-                        active_b_addr_lo, active_b_addr_hi = (
-                            _issue_active_b_tdm_only(
-                                0, active_b_addr_lo, active_b_addr_hi)
+                        active_b_addr_lo, active_b_addr_hi = _issue_active_b_tdm_only(
+                            0, active_b_addr_lo, active_b_addr_hi
                         )
                         _issue_scalar_loads(k_base, 0)
                         tdm_ops.tensor_wait(0)
@@ -1585,38 +1832,36 @@ def _compile_stage1_mxscale_kernel_impl(
                     active_b_addr_lo = _active_addr_lo
                     active_b_addr_hi = _active_addr_hi
                     for _pi in range_constexpr(pre_loaded):
-                        active_b_addr_lo, active_b_addr_hi = (
-                            _issue_active_b_tdm_only(
-                                _pi, active_b_addr_lo, active_b_addr_hi)
+                        active_b_addr_lo, active_b_addr_hi = _issue_active_b_tdm_only(
+                            _pi, active_b_addr_lo, active_b_addr_hi
                         )
-                        _issue_scalar_loads(
-                            _k_off(fx.Index(_pi * int(tile_k))), _pi)
+                        _issue_scalar_loads(_k_off(fx.Index(_pi * int(tile_k))), _pi)
                 else:
                     for _pi in range_constexpr(pre_loaded):
-                        _issue_all_loads(
-                            _k_off(fx.Index(_pi * int(tile_k))), _pi)
+                        _issue_all_loads(_k_off(fx.Index(_pi * int(tile_k))), _pi)
                 pipeline_fence(outstanding=0, use_cluster=use_cluster)
 
                 if const_expr(loop_iters > 0):
                     if const_expr(wave_specialized_tdm):
 
                         _init = (
-                            list(acc_g) + list(acc_u)
+                            list(acc_g)
+                            + list(acc_u)
                             + [active_b_addr_lo, active_b_addr_hi]
                         )
                         for _li, _st in fx.range(0, loop_iters, 1, init=_init):
                             _ag = list(_st[:n_accs])
-                            _au = list(_st[n_accs:2 * n_accs])
+                            _au = list(_st[n_accs : 2 * n_accs])
                             _cur_b_addr_lo = _st[2 * n_accs]
                             _cur_b_addr_hi = _st[2 * n_accs + 1]
                             for _bi in range_constexpr(_nb):
                                 _lb = (_bi + _nb - 1) % _nb
-                                _kt = (_li * fx.Index(_nb)
-                                       + fx.Index(pre_loaded + _bi))
+                                _kt = _li * fx.Index(_nb) + fx.Index(pre_loaded + _bi)
                                 _kb = _k_off(_kt * fx.Index(int(tile_k)))
                                 pipeline_fence_signal(
                                     outstanding=_fence_outstanding,
-                                    use_cluster=use_cluster)
+                                    use_cluster=use_cluster,
+                                )
                                 pipeline_fence_wait(use_cluster=use_cluster)
                                 _cur_b_addr_lo, _cur_b_addr_hi = (
                                     _issue_active_b_tdm_only(
@@ -1640,26 +1885,25 @@ def _compile_stage1_mxscale_kernel_impl(
                                 if const_expr(_use_scheduled_compute):
                                     _hot_loop_scheduler_scheduled()
                             _res = yield (
-                                list(_ag) + list(_au)
-                                + [_cur_b_addr_lo, _cur_b_addr_hi]
+                                list(_ag) + list(_au) + [_cur_b_addr_lo, _cur_b_addr_hi]
                             )
                         acc_g = list(_res[:n_accs])
-                        acc_u = list(_res[n_accs:2 * n_accs])
+                        acc_u = list(_res[n_accs : 2 * n_accs])
                         active_b_addr_lo = _res[2 * n_accs]
                         active_b_addr_hi = _res[2 * n_accs + 1]
                     else:
                         _init = list(acc_g) + list(acc_u)
                         for _li, _st in fx.range(0, loop_iters, 1, init=_init):
                             _ag = list(_st[:n_accs])
-                            _au = list(_st[n_accs:2 * n_accs])
+                            _au = list(_st[n_accs : 2 * n_accs])
                             for _bi in range_constexpr(_nb):
                                 _lb = (_bi + _nb - 1) % _nb
-                                _kt = (_li * fx.Index(_nb)
-                                       + fx.Index(pre_loaded + _bi))
+                                _kt = _li * fx.Index(_nb) + fx.Index(pre_loaded + _bi)
                                 _kb = _k_off(_kt * fx.Index(int(tile_k)))
                                 pipeline_fence_signal(
                                     outstanding=_fence_outstanding,
-                                    use_cluster=use_cluster)
+                                    use_cluster=use_cluster,
+                                )
                                 pipeline_fence_wait(use_cluster=use_cluster)
                                 _issue_b_tdm_only(_kb, _lb)
 
@@ -1678,7 +1922,7 @@ def _compile_stage1_mxscale_kernel_impl(
                                     _hot_loop_scheduler_scheduled()
                             _res = yield list(_ag) + list(_au)
                         acc_g = list(_res[:n_accs])
-                        acc_u = list(_res[n_accs:2 * n_accs])
+                        acc_u = list(_res[n_accs : 2 * n_accs])
 
                 if const_expr(loop_iters > 0):
                     pipeline_fence(outstanding=0, use_cluster=use_cluster)
@@ -1690,25 +1934,23 @@ def _compile_stage1_mxscale_kernel_impl(
                 for _ls, _cs, _out in _tail_plan:
                     if const_expr(_out == -1):
                         if const_expr(_tail_had_load):
-                            pipeline_fence(outstanding=0,
-                                           use_cluster=use_cluster)
+                            pipeline_fence(outstanding=0, use_cluster=use_cluster)
                         if const_expr(_use_scheduled_compute):
                             rocdl.sched_barrier(0)
-                            acc_g, acc_u = _compute_k_tile_scheduled(
-                                acc_g, acc_u, _cs)
+                            acc_g, acc_u = _compute_k_tile_scheduled(acc_g, acc_u, _cs)
                             _hot_loop_scheduler_scheduled()
                         else:
-                            acc_g, acc_u = _compute_k_tile(
-                                acc_g, acc_u, _cs)
+                            acc_g, acc_u = _compute_k_tile(acc_g, acc_u, _cs)
                     else:
-                        pipeline_fence_signal(outstanding=_out,
-                                              use_cluster=use_cluster)
+                        pipeline_fence_signal(outstanding=_out, use_cluster=use_cluster)
                         pipeline_fence_wait(use_cluster=use_cluster)
                         if const_expr(_ls is not None):
                             _tail_had_load = True
-                            _tkb = _k_off(fx.Index(
-                                (_tail_start + pre_loaded + _tail_li)
-                                * int(tile_k)))
+                            _tkb = _k_off(
+                                fx.Index(
+                                    (_tail_start + pre_loaded + _tail_li) * int(tile_k)
+                                )
+                            )
                             _tail_li += 1
                             if const_expr(wave_specialized_tdm):
                                 active_b_addr_lo, active_b_addr_hi = (
@@ -1738,11 +1980,11 @@ def _compile_stage1_mxscale_kernel_impl(
                             if const_expr(_use_scheduled_compute):
                                 rocdl.sched_barrier(0)
                                 acc_g, acc_u = _compute_k_tile_scheduled(
-                                    acc_g, acc_u, _cs)
+                                    acc_g, acc_u, _cs
+                                )
                                 _hot_loop_scheduler_scheduled()
                             else:
-                                acc_g, acc_u = _compute_k_tile(
-                                    acc_g, acc_u, _cs)
+                                acc_g, acc_u = _compute_k_tile(acc_g, acc_u, _cs)
 
             out_elem_ty = _moe_out_elem_ty(out_dtype, T)
 
@@ -1757,22 +1999,28 @@ def _compile_stage1_mxscale_kernel_impl(
                     _row_in_route = arith.cmpi(
                         arith.CmpIPredicate.ult,
                         arith.index_cast(T.i32, _row_local),
-                        arith.constant(int(route_tile_m), type=T.i32))
+                        arith.constant(int(route_tile_m), type=T.i32),
+                    )
                     if const_expr(bool(doweight_stage1)):
                         _sorted_safe = arith.select(
-                            _row_in_route, _sorted_i32,
-                            arith.index_cast(T.i32,
-                                by * arith.index(int(route_tile_m))))
+                            _row_in_route,
+                            _sorted_i32,
+                            arith.index_cast(
+                                T.i32, by * arith.index(int(route_tile_m))
+                            ),
+                        )
                         _tw = buffer_ops.buffer_load(
-                            tw_rsrc, _sorted_safe, vec_width=1, dtype=T.f32)
+                            tw_rsrc, _sorted_safe, vec_width=1, dtype=T.f32
+                        )
                         _sc = arith.select(
-                            _row_in_route, _tw,
-                            arith.constant(0.0, type=T.f32))
+                            _row_in_route, _tw, arith.constant(0.0, type=T.f32)
+                        )
                     else:
                         _sc = arith.select(
                             _row_in_route,
                             arith.constant(1.0, type=T.f32),
-                            arith.constant(0.0, type=T.f32))
+                            arith.constant(0.0, type=T.f32),
+                        )
                     _scale_per_wm_s1.append(_sc)
 
                 if const_expr(d_need_epilogue_fence_s1):
@@ -1786,53 +2034,68 @@ def _compile_stage1_mxscale_kernel_impl(
                     _wm_idx = _m_off // WMMA_M
                     _sc = _scale_per_wm_s1[_wm_idx]
                     _sub8g = _extract_sub8(
-                        acc_g[_acc_idx], _vec_base,
+                        acc_g[_acc_idx],
+                        _vec_base,
                         vector=vector,
                         range_constexpr=range_constexpr,
-                        ACC_VEC_SIZE=ACC_VEC_SIZE)
+                        ACC_VEC_SIZE=ACC_VEC_SIZE,
+                    )
                     _sub8u = _extract_sub8(
-                        acc_u[_acc_idx], _vec_base,
+                        acc_u[_acc_idx],
+                        _vec_base,
                         vector=vector,
                         range_constexpr=range_constexpr,
-                        ACC_VEC_SIZE=ACC_VEC_SIZE)
+                        ACC_VEC_SIZE=ACC_VEC_SIZE,
+                    )
                     _col_base_s1 = (
-                        blk_n + warp_n_base + fx.Index(_wn * WMMA_N)
-                        + lane_kgrp * fx.Index(8))
+                        blk_n
+                        + warp_n_base
+                        + fx.Index(_wn * WMMA_N)
+                        + lane_kgrp * fx.Index(8)
+                    )
                     _fused = []
                     for _vi in range_constexpr(8):
                         _vg = vector.extract(
-                            _sub8g,
-                            static_position=[_vi],
-                            dynamic_position=[])
+                            _sub8g, static_position=[_vi], dynamic_position=[]
+                        )
                         _vu = vector.extract(
-                            _sub8u,
-                            static_position=[_vi],
-                            dynamic_position=[])
+                            _sub8u, static_position=[_vi], dynamic_position=[]
+                        )
                         if const_expr(_enable_bias):
                             _col_i32_s1 = arith.index_cast(
-                                T.i32, _col_base_s1 + fx.Index(_vi))
+                                T.i32, _col_base_s1 + fx.Index(_vi)
+                            )
                             _bg = buffer_ops.buffer_load(
                                 bias_rsrc,
                                 _bias_row_base_i32_s1 + _col_i32_s1,
-                                vec_width=1, dtype=T.f32)
+                                vec_width=1,
+                                dtype=T.f32,
+                            )
                             _bu = buffer_ops.buffer_load(
                                 bias_rsrc,
                                 _bias_row_base_i32_s1 + i32_inter_in + _col_i32_s1,
-                                vec_width=1, dtype=T.f32)
+                                vec_width=1,
+                                dtype=T.f32,
+                            )
                             _vg = _vg + _bg
                             _vu = _vu + _bu
                         if const_expr(_act_kind == "swiglu"):
-                            _y = _emit_swiglu(_vg, _vu, arith=arith, rocdl=rocdl, T=T) * _sc
+                            _y = (
+                                _emit_swiglu(_vg, _vu, arith=arith, rocdl=rocdl, T=T)
+                                * _sc
+                            )
                         else:
                             _y = silu(_vg) * _vu * _sc
                         _fused.append(_y)
-                    _fused_sub8 = vector.from_elements(
-                        T.vec(8, T.f32), _fused)
-                    _imm = (_m_off * _lds_d_stride_elems_s1
-                            + _wn * _n_col_d_elems_s1)
+                    _fused_sub8 = vector.from_elements(T.vec(8, T.f32), _fused)
+                    _imm = _m_off * _lds_d_stride_elems_s1 + _wn * _n_col_d_elems_s1
                     store_acc_vec8_to_lds(
-                        d_lds_buffer_s1, d_lane_base_s1, _imm,
-                        _fused_sub8, out_elem=out_elem_ty)
+                        d_lds_buffer_s1,
+                        d_lane_base_s1,
+                        _imm,
+                        _fused_sub8,
+                        out_elem=out_elem_ty,
+                    )
 
                 rocdl.s_wait_dscnt(0)
 
@@ -1846,47 +2109,55 @@ def _compile_stage1_mxscale_kernel_impl(
                     _ds_cnt = min(_d_store_chunk, warp_tile_m - _ds_start)
 
                     _ds_start_in_tile = _dsi * _d_store_chunk + rocdl.readfirstlane(
-                        T.i32, arith.index_cast(T.i32, warp_m_base))
+                        T.i32, arith.index_cast(T.i32, warp_m_base)
+                    )
 
                     _ds_indices = []
                     _ds_valids = []
                     for _wi in range_constexpr(int(m_warp)):
                         _tile_row = _wi * warp_tile_m + _ds_start
-                        _warp_indices = _a_out_row_ids[_tile_row:_tile_row + _ds_cnt]
-                        _warp_valids = _a_store_valids[_tile_row:_tile_row + _ds_cnt]
+                        _warp_indices = _a_out_row_ids[_tile_row : _tile_row + _ds_cnt]
+                        _warp_valids = _a_store_valids[_tile_row : _tile_row + _ds_cnt]
                         if const_expr(_wi == 0):
                             _ds_indices = list(_warp_indices)
                             _ds_valids = list(_warp_valids)
                         else:
                             _is_this_warp = arith.cmpi(
                                 arith.CmpIPredicate.eq,
-                                rocdl.wave_id() % fx.Int32(int(n_warp * m_warp) // int(n_warp)),
-                                fx.Int32(_wi))
+                                rocdl.wave_id()
+                                % fx.Int32(int(n_warp * m_warp) // int(n_warp)),
+                                fx.Int32(_wi),
+                            )
 
                             _is_this_warp = arith.cmpi(
                                 arith.CmpIPredicate.eq,
                                 arith.index_cast(T.i32, wave_m_idx),
-                                fx.Int32(_wi))
+                                fx.Int32(_wi),
+                            )
                             for _ii in range_constexpr(len(_ds_indices)):
                                 _ds_indices[_ii] = arith.select(
-                                    _is_this_warp,
-                                    _warp_indices[_ii],
-                                    _ds_indices[_ii])
+                                    _is_this_warp, _warp_indices[_ii], _ds_indices[_ii]
+                                )
                                 _ds_valids[_ii] = arith.select(
-                                    _is_this_warp,
-                                    _warp_valids[_ii],
-                                    _ds_valids[_ii])
+                                    _is_this_warp, _warp_valids[_ii], _ds_valids[_ii]
+                                )
 
-                    _ds_lds_off = arith.index(
-                        _ds_start * lds_d_row_stride_s1) + d_warp_off_sgpr_s1
+                    _ds_lds_off = (
+                        arith.index(_ds_start * lds_d_row_stride_s1)
+                        + d_warp_off_sgpr_s1
+                    )
 
-                    _col_byte_off = (blk_n + warp_n_off_sgpr_s1) * arith.index(elem_bytes_d_s1)
+                    _col_byte_off = (blk_n + warp_n_off_sgpr_s1) * arith.index(
+                        elem_bytes_d_s1
+                    )
 
                     _pad_elems = LDS_PAD_D_BYTES_s1 // elem_bytes_d_s1
                     _store_tile_w = warp_tile_n + _pad_elems
                     _ds_valid_count = _sum_i32_values(_ds_valids)
                     _zero_i32 = arith.constant(0, type=T.i32)
-                    _has_store = arith.cmpi(arith.CmpIPredicate.sgt, _ds_valid_count, _zero_i32)
+                    _has_store = arith.cmpi(
+                        arith.CmpIPredicate.sgt, _ds_valid_count, _zero_i32
+                    )
                     _if_store = scf.IfOp(_has_store)
                     with ir.InsertionPoint(_if_store.then_block):
                         _d_store_desc = tdm_ops.make_tensor_gather_descriptor(
@@ -1909,13 +2180,22 @@ def _compile_stage1_mxscale_kernel_impl(
                         scf.YieldOp([])
                 tdm_ops.tensor_wait(0)
             else:
+
                 def _load_gate_up_sub8(acc_idx, vec_base):
                     return (
                         _extract_sub8(
-                            acc_g[acc_idx], vec_base, vector=vector, range_constexpr=range_constexpr, ACC_VEC_SIZE=ACC_VEC_SIZE
+                            acc_g[acc_idx],
+                            vec_base,
+                            vector=vector,
+                            range_constexpr=range_constexpr,
+                            ACC_VEC_SIZE=ACC_VEC_SIZE,
                         ),
                         _extract_sub8(
-                            acc_u[acc_idx], vec_base, vector=vector, range_constexpr=range_constexpr, ACC_VEC_SIZE=ACC_VEC_SIZE
+                            acc_u[acc_idx],
+                            vec_base,
+                            vector=vector,
+                            range_constexpr=range_constexpr,
+                            ACC_VEC_SIZE=ACC_VEC_SIZE,
                         ),
                     )
 
@@ -2022,10 +2302,20 @@ def _compile_stage1_mxscale_kernel_impl(
         gx = (inter_in + fx.Index(int(tile_n) - 1)) // fx.Index(int(tile_n))
         gy = size_expert_ids_in
         launcher = moe_mxscale_stage1_single(
-            arg_out, arg_x, arg_w, arg_scale_x, arg_scale_w,
-            arg_sorted_token_ids, arg_expert_ids, arg_sorted_weights, arg_num_valid_ids,
+            arg_out,
+            arg_x,
+            arg_w,
+            arg_scale_x,
+            arg_scale_w,
+            arg_sorted_token_ids,
+            arg_expert_ids,
+            arg_sorted_weights,
+            arg_num_valid_ids,
             arg_bias,
-            i32_tokens_in, i32_inter_in, i32_k_in, i32_size_expert_ids_in,
+            i32_tokens_in,
+            i32_inter_in,
+            i32_k_in,
+            i32_size_expert_ids_in,
         )
         _cluster_arg = (int(cluster_m), int(cluster_n), 1) if use_cluster else None
         _finalize_alloc_and_launch_2d(
@@ -2048,6 +2338,7 @@ def _compile_stage1_mxscale_kernel_impl(
         }
 
     return launch_mxscale_stage1_single
+
 
 @functools.lru_cache(maxsize=64)
 def _compile_stage2_mxscale_kernel_impl(
@@ -2076,7 +2367,6 @@ def _compile_stage2_mxscale_kernel_impl(
     wave_specialized_tdm: bool = False,
     cluster_m: int = 1,
     cluster_n: int = 1,
-
     enable_bias: bool = False,
 ):
     """Compile mxscale stage2 single kernel (route-pack + TDM + WMMA_SCALE + epilog)."""
@@ -2086,36 +2376,59 @@ def _compile_stage2_mxscale_kernel_impl(
     from flydsl._mlir.dialects import llvm as llvm_dialect
     from flydsl._mlir.dialects import memref, scf
     from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl.expr import arith, buffer_ops, const_expr, gpu, idx2crd, range_constexpr, rocdl, tdm_ops, vector
+    from flydsl.expr import (
+        arith,
+        buffer_ops,
+        const_expr,
+        gpu,
+        idx2crd,
+        range_constexpr,
+        rocdl,
+        tdm_ops,
+        vector,
+    )
     from flydsl.expr.typing import T
-    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, get_op_result_or_value
+    from flydsl.utils.smem_allocator import (
+        SmemAllocator,
+        SmemPtr,
+        get_op_result_or_value,
+    )
 
     if bool(use_tdm_store) and bool(accumulate):
-        raise ValueError("use_tdm_store is not compatible with accumulate=True in moe mxscale stage2")
+        raise ValueError(
+            "use_tdm_store is not compatible with accumulate=True in moe mxscale stage2"
+        )
     _enable_bias = bool(enable_bias)
     if _enable_bias and bool(use_tdm_store):
 
         raise ValueError(
             "stage2 mxscale: enable_bias=True is not supported with "
-            "use_tdm_store=True; use the standard scatter-store path.")
+            "use_tdm_store=True; use the standard scatter-store path."
+        )
 
     tp = _compute_mxscale_tiling(
-        data_format=data_format, K=int(inter_dim),
-        tile_m=int(tile_m), tile_n=int(tile_n), tile_k=int(tile_k),
-        m_warp=int(m_warp), n_warp=int(n_warp), out_dtype=out_dtype,
-        num_buffers=int(num_buffers), cluster_m=int(cluster_m),
-        cluster_n=int(cluster_n), stage_name="stage2",
+        data_format=data_format,
+        K=int(inter_dim),
+        tile_m=int(tile_m),
+        tile_n=int(tile_n),
+        tile_k=int(tile_k),
+        m_warp=int(m_warp),
+        n_warp=int(n_warp),
+        out_dtype=out_dtype,
+        num_buffers=int(num_buffers),
+        cluster_m=int(cluster_m),
+        cluster_n=int(cluster_n),
+        stage_name="stage2",
     )
     is_fp4, is_a8w4 = tp["is_fp4"], tp["is_a8w4"]
     PACK_FACTOR_A, PACK_FACTOR_B = tp["PACK_FACTOR_A"], tp["PACK_FACTOR_B"]
     ACC_VEC_SIZE = tp["ACC_VEC_SIZE"]
     DS_LOADS_PER_A_FRAG = tp["DS_LOADS_PER_A_FRAG"]
-    WMMA_M, WMMA_N, WMMA_K = tp["WMMA_M"], tp["WMMA_N"], tp["WMMA_K"]
+    WMMA_M, WMMA_N = tp["WMMA_M"], tp["WMMA_N"]
     SCALE_BLOCK, SCALES_PER_WMMA = tp["SCALE_BLOCK"], tp["SCALES_PER_WMMA"]
     WAVE_SIZE = tp["WAVE_SIZE"]
     LDS_PAD_A_BYTES, LDS_PAD_B_BYTES = tp["LDS_PAD_A_BYTES"], tp["LDS_PAD_B_BYTES"]
     use_cluster = tp["use_cluster"]
-    K = tp["K"]
     K_packed_a, K_packed_b = tp["K_packed_a"], tp["K_packed_b"]
     packed_tile_k_a, packed_tile_k_b = tp["packed_tile_k_a"], tp["packed_tile_k_b"]
     K_scale, scale_k_per_tile = tp["K_scale"], tp["scale_k_per_tile"]
@@ -2125,11 +2438,12 @@ def _compile_stage2_mxscale_kernel_impl(
     k_wmma_steps, n_accs = tp["k_wmma_steps"], tp["n_accs"]
     num_k_tiles = tp["num_k_tiles"]
     b_scale_load_rep = tp["b_scale_load_rep"]
-    interleaved_scale_cols_b = tp["interleaved_scale_cols_b"]
     lds_a_stride_bytes = tp["lds_a_stride_bytes"]
-    lds_b_stride_bytes = tp["lds_b_stride_bytes"]
     lds_a_data_bytes, lds_b_data_bytes = tp["lds_a_data_bytes"], tp["lds_b_data_bytes"]
-    lds_a_scale_bytes, lds_b_scale_bytes = tp["lds_a_scale_bytes"], tp["lds_b_scale_bytes"]
+    lds_a_scale_bytes, lds_b_scale_bytes = (
+        tp["lds_a_scale_bytes"],
+        tp["lds_b_scale_bytes"],
+    )
     interleaved_scale_cols_a = tp["interleaved_scale_cols_a"]
 
     N_total = int(model_dim)
@@ -2137,7 +2451,8 @@ def _compile_stage2_mxscale_kernel_impl(
     if bool(wave_specialized_tdm):
         if num_warps < 2:
             raise ValueError(
-                f"wave_specialized_tdm requires at least 2 waves (B + B_scale), got {num_warps}")
+                f"wave_specialized_tdm requires at least 2 waves (B + B_scale), got {num_warps}"
+            )
     _tdm_loader_waves = 2
     tdm_desc_num_warps = 1 if bool(wave_specialized_tdm) else num_warps
     effective_waves_per_eu = waves_per_eu
@@ -2156,12 +2471,17 @@ def _compile_stage2_mxscale_kernel_impl(
     _use_pipeline = int(num_buffers) >= 2
     if _use_pipeline:
         from kernels.gemm_common_gfx1250 import (
-            pipeline_fence, pipeline_fence_signal, pipeline_fence_wait,
+            pipeline_fence,
+            pipeline_fence_signal,
+            pipeline_fence_wait,
         )
+
         _B_TDM_PER_STEP = 1 if bool(wave_specialized_tdm) else 2
         _pp = _compute_pipeline_plan(
-            num_k_tiles=num_k_tiles, num_buffers=int(num_buffers),
-            B_TDM_PER_STEP=_B_TDM_PER_STEP, tile_m=int(tile_m),
+            num_k_tiles=num_k_tiles,
+            num_buffers=int(num_buffers),
+            B_TDM_PER_STEP=_B_TDM_PER_STEP,
+            tile_m=int(tile_m),
             use_tdm_gather=use_tdm_gather,
             use_tdm_gather_as=_use_tdm_gather_as,
             wave_specialized_tdm=wave_specialized_tdm,
@@ -2170,10 +2490,8 @@ def _compile_stage2_mxscale_kernel_impl(
         pre_loaded = _pp["pre_loaded"]
         loop_iters = _pp["loop_iters"]
         _tail_start = _pp["tail_start"]
-        extra = _pp["extra"]
         _A_GATHER_GROUPS = _pp["A_GATHER_GROUPS"]
         _AS_GATHER_GROUPS = _pp["AS_GATHER_GROUPS"]
-        TDM_PER_STEP = _pp["TDM_PER_STEP"]
         _fence_outstanding = _pp["fence_outstanding"]
         _tail_plan = _pp["tail_plan"]
     from kernels.gemm_common_gfx1250 import workgroup_barrier
@@ -2208,12 +2526,15 @@ def _compile_stage2_mxscale_kernel_impl(
 
     if bool(use_tdm_store):
         from kernels.gemm_common_gfx1250 import store_acc_vec8_to_lds
+
         _ds2 = _compute_tdm_store_layout(
-            warp_tile_m=warp_tile_m, warp_tile_n=warp_tile_n,
-            num_warps=num_warps, WMMA_N=WMMA_N, use_pipeline=_use_pipeline,
+            warp_tile_m=warp_tile_m,
+            warp_tile_n=warp_tile_n,
+            num_warps=num_warps,
+            WMMA_N=WMMA_N,
+            use_pipeline=_use_pipeline,
         )
         total_d_bytes = _ds2["total_d_bytes"]
-        lds_d_row_stride = _ds2["lds_d_row_stride"]
         warp_d_bytes = _ds2["warp_d_bytes"]
         d_output_off = _ds2["d_output_off"]
         _lds_d_stride_elems = _ds2["lds_d_stride_elems"]
@@ -2240,7 +2561,6 @@ def _compile_stage2_mxscale_kernel_impl(
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
         arg_num_valid_ids: fx.Tensor,
-
         arg_bias: fx.Tensor,
         i32_tokens_in: fx.Int32,
         i32_n_in: fx.Int32,
@@ -2251,19 +2571,26 @@ def _compile_stage2_mxscale_kernel_impl(
 
         _keep_const_expr_ref = const_expr
         if const_expr(inst_prefetch):
-            if arith.cmpi(arith.CmpIPredicate.eq, rocdl.wave_id(),
-                          arith.constant(0, type=T.i32)):
-                _prefetch_lines = ["s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 8, 1), 1"]
+            if arith.cmpi(
+                arith.CmpIPredicate.eq, rocdl.wave_id(), arith.constant(0, type=T.i32)
+            ):
+                _prefetch_lines = [
+                    "s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 8, 1), 1"
+                ]
                 for _pg in range_constexpr(10):
                     _prefetch_lines.append(
-                        f"s_prefetch_inst_pc_rel {_pg * 4096}, s0, 31")
+                        f"s_prefetch_inst_pc_rel {_pg * 4096}, s0, 31"
+                    )
                 llvm_dialect.inline_asm(
-                    None, [],
+                    None,
+                    [],
                     "\n".join(_prefetch_lines),
-                    "", has_side_effects=True,
+                    "",
+                    has_side_effects=True,
                 )
         llvm_dialect.inline_asm(
-            None, [],
+            None,
+            [],
             "s_setreg_imm32_b32 hwreg(26, 4, 1), 1",
             "",
             has_side_effects=True,
@@ -2290,35 +2617,53 @@ def _compile_stage2_mxscale_kernel_impl(
         x_rows = tokens_idx * arith.index(int(topk))
         x_nbytes = x_rows * arith.index(K_packed_a)
         sx_nbytes = x_rows * arith.index(K_scale)
-        w_rows = arith.index(int(experts)) * n_idx
-        w_nbytes = w_rows * arith.index(K_packed_b)
-        sw_nbytes = w_rows * arith.index(K_scale)
         out_nbytes = tokens_idx * n_idx * arith.index(2)
         if const_expr(not bool(accumulate)):
             out_nbytes = x_rows * n_idx * arith.index(2)
 
-        sorted_rsrc = buffer_ops.create_buffer_resource(arg_sorted_token_ids, max_size=False, num_records_bytes=sorted_nbytes)
-        eid_rsrc = buffer_ops.create_buffer_resource(arg_expert_ids, max_size=False, num_records_bytes=eid_nbytes)
-        x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=False, num_records_bytes=x_nbytes)
-        sx_rsrc = buffer_ops.create_buffer_resource(arg_scale_x, max_size=False, num_records_bytes=sx_nbytes)
-        w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False, num_records_bytes=w_nbytes)
-        sw_rsrc = buffer_ops.create_buffer_resource(arg_scale_w, max_size=False, num_records_bytes=sw_nbytes)
-        out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=False, num_records_bytes=out_nbytes)
+        sorted_rsrc = buffer_ops.create_buffer_resource(
+            arg_sorted_token_ids, max_size=False, num_records_bytes=sorted_nbytes
+        )
+        eid_rsrc = buffer_ops.create_buffer_resource(
+            arg_expert_ids, max_size=False, num_records_bytes=eid_nbytes
+        )
+        x_rsrc = buffer_ops.create_buffer_resource(
+            arg_x, max_size=False, num_records_bytes=x_nbytes
+        )
+        sx_rsrc = buffer_ops.create_buffer_resource(
+            arg_scale_x, max_size=False, num_records_bytes=sx_nbytes
+        )
+        out_rsrc = buffer_ops.create_buffer_resource(
+            arg_out, max_size=False, num_records_bytes=out_nbytes
+        )
         tw_rsrc = buffer_ops.create_buffer_resource(arg_sorted_weights, max_size=True)
 
         bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
 
-        eid_i32 = buffer_ops.buffer_load(eid_rsrc, arith.index_cast(T.i32, by), vec_width=1, dtype=T.i32)
-        eid_ok0 = arith.cmpi(arith.CmpIPredicate.sge, eid_i32, arith.constant(0, type=T.i32))
-        eid_ok1 = arith.cmpi(arith.CmpIPredicate.slt, eid_i32, arith.constant(int(experts), type=T.i32))
+        eid_i32 = buffer_ops.buffer_load(
+            eid_rsrc, arith.index_cast(T.i32, by), vec_width=1, dtype=T.i32
+        )
+        eid_ok0 = arith.cmpi(
+            arith.CmpIPredicate.sge, eid_i32, arith.constant(0, type=T.i32)
+        )
+        eid_ok1 = arith.cmpi(
+            arith.CmpIPredicate.slt, eid_i32, arith.constant(int(experts), type=T.i32)
+        )
         block_row_start = arith.index_cast(T.i32, by * arith.index(int(route_tile_m)))
-        block_in_valid = arith.cmpi(arith.CmpIPredicate.slt, block_row_start, num_valid_i32)
+        block_in_valid = arith.cmpi(
+            arith.CmpIPredicate.slt, block_row_start, num_valid_i32
+        )
         block_ok = arith.andi(block_in_valid, arith.andi(eid_ok0, eid_ok1))
 
-        layout_thr = _make_moe_wave_layout(m_warp=m_warp, n_warp=n_warp, WAVE_SIZE=WAVE_SIZE, fx=fx)
+        layout_thr = _make_moe_wave_layout(
+            m_warp=m_warp, n_warp=n_warp, WAVE_SIZE=WAVE_SIZE, fx=fx
+        )
         thr_coord = idx2crd(tx, layout_thr)
         wave_m_idx, wave_n_idx, lane_kgrp, lane16 = (
-            fx.get(thr_coord, 0), fx.get(thr_coord, 1), fx.get(thr_coord, 2), fx.get(thr_coord, 3)
+            fx.get(thr_coord, 0),
+            fx.get(thr_coord, 1),
+            fx.get(thr_coord, 2),
+            fx.get(thr_coord, 3),
         )
         warp_m_base = wave_m_idx * arith.index(warp_tile_m)
         warp_n_base = wave_n_idx * arith.index(warp_tile_n)
@@ -2327,7 +2672,8 @@ def _compile_stage2_mxscale_kernel_impl(
         if const_expr(use_cluster):
             _local_x, _local_y = gpu.compute_cluster_position()
             _a_mcast_mask, b_mcast_mask = gpu.compute_mcast_masks(
-                _local_x, _local_y, int(cluster_m), int(cluster_n))
+                _local_x, _local_y, int(cluster_m), int(cluster_n)
+            )
         else:
             b_mcast_mask = 0
 
@@ -2350,31 +2696,27 @@ def _compile_stage2_mxscale_kernel_impl(
 
         if const_expr(bool(use_tdm_store)):
             from kernels.gemm_common_gfx1250 import get_lds_memref
+
             d_lds_f16_count = total_d_bytes // 2
-            d_smem = SmemPtr(base_ptr, d_output_off, T.f16,
-                             shape=(d_lds_f16_count,))
+            d_smem = SmemPtr(base_ptr, d_output_off, T.f16, shape=(d_lds_f16_count,))
             d_lds_buffer = get_lds_memref(d_smem)
             warp_lds_off = (
-                (wave_m_idx * arith.index(int(n_warp)) + wave_n_idx)
-                * arith.index(_warp_d_elems)
-            )
+                wave_m_idx * arith.index(int(n_warp)) + wave_n_idx
+            ) * arith.index(_warp_d_elems)
             d_lane_base = (
                 warp_lds_off
                 + lane16 * arith.index(_lds_d_stride_elems)
                 + lane_kgrp * arith.index(4 * elem_bytes_d)
             )
             wave_id_idx = arith.index_cast(T.index, rocdl.wave_id())
-            d_warp_off_sgpr = (
-                wave_id_idx * arith.index(warp_d_bytes)
-                + arith.index(d_output_off)
+            d_warp_off_sgpr = wave_id_idx * arith.index(warp_d_bytes) + arith.index(
+                d_output_off
             )
-            warp_m_off_sgpr = (
-                (wave_id_idx / arith.index(int(n_warp)))
-                * arith.index(warp_tile_m)
+            warp_m_off_sgpr = (wave_id_idx / arith.index(int(n_warp))) * arith.index(
+                warp_tile_m
             )
-            warp_n_off_sgpr = (
-                (wave_id_idx % arith.index(int(n_warp)))
-                * arith.index(warp_tile_n)
+            warp_n_off_sgpr = (wave_id_idx % arith.index(int(n_warp))) * arith.index(
+                warp_tile_n
             )
             d_desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_out,
@@ -2420,7 +2762,8 @@ def _compile_stage2_mxscale_kernel_impl(
         def _preload_sorted_ids_to_lds():
             """Preload tile_m sorted_token_ids entries into ``lds_tid`` (once per CTA)."""
             _tid_in_range = arith.cmpi(
-                arith.CmpIPredicate.ult, tx, fx.Index(int(tile_m)))
+                arith.CmpIPredicate.ult, tx, fx.Index(int(tile_m))
+            )
             _if_tid = scf.IfOp(_tid_in_range)
             with ir.InsertionPoint(_if_tid.then_block):
                 _tx_i32 = arith.index_cast(T.i32, tx)
@@ -2432,12 +2775,13 @@ def _compile_stage2_mxscale_kernel_impl(
                     arith.constant(int(route_tile_m), type=T.i32),
                 )
                 _in_valid = arith.cmpi(
-                    arith.CmpIPredicate.slt, _sorted_i32, num_valid_i32)
+                    arith.CmpIPredicate.slt, _sorted_i32, num_valid_i32
+                )
                 _row_valid = arith.andi(_in_route, _in_valid)
-                _row_safe_i32 = arith.select(
-                    _row_valid, _sorted_i32, block_row_start)
+                _row_safe_i32 = arith.select(_row_valid, _sorted_i32, block_row_start)
                 _raw = buffer_ops.buffer_load(
-                    sorted_rsrc, _row_safe_i32, vec_width=1, dtype=T.i32)
+                    sorted_rsrc, _row_safe_i32, vec_width=1, dtype=T.i32
+                )
                 _sentinel = arith.constant(-1, type=T.i32)
                 _val = arith.select(_row_valid, _raw, _sentinel)
                 _vec1 = vector.from_elements(T.vec(1, T.i32), [_val])
@@ -2478,7 +2822,11 @@ def _compile_stage2_mxscale_kernel_impl(
             rounds = (total + block_threads - 1) // block_threads
             for it in range(rounds):
                 elem = tx + fx.Index(it * block_threads)
-                in_range = arith.cmpi(arith.CmpIPredicate.ult, arith.index_cast(T.i32, elem), arith.constant(total, type=T.i32))
+                in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult,
+                    arith.index_cast(T.i32, elem),
+                    arith.constant(total, type=T.i32),
+                )
                 _if_elem = scf.IfOp(in_range)
                 with ir.InsertionPoint(_if_elem.then_block):
                     row = elem // arith.index(int(packed_tile_k_a))
@@ -2488,14 +2836,26 @@ def _compile_stage2_mxscale_kernel_impl(
                     tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
                     slot = fused >> arith.constant(24, type=T.i32)
                     tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
-                    slot_ok0 = arith.cmpi(arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32))
+                    slot_ok0 = arith.cmpi(
+                        arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32)
+                    )
                     slot_ok1 = arith.cmpi(arith.CmpIPredicate.slt, slot, c_topk_i32)
                     ts = tok * c_topk_i32 + slot
                     ts_ok = arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
                     load_ok = ts_ok
-                    x_idx = ts * arith.constant(K_packed_a, type=T.i32) + arith.index_cast(T.i32, k_packed_base + col)
-                    x_idx_safe = arith.select(load_ok, x_idx, arith.constant(0, type=T.i32))
-                    x_val = arith.select(load_ok, buffer_ops.buffer_load(x_rsrc, x_idx_safe, vec_width=1, dtype=T.i8), arith.constant(0, type=T.i8))
+                    x_idx = ts * arith.constant(
+                        K_packed_a, type=T.i32
+                    ) + arith.index_cast(T.i32, k_packed_base + col)
+                    x_idx_safe = arith.select(
+                        load_ok, x_idx, arith.constant(0, type=T.i32)
+                    )
+                    x_val = arith.select(
+                        load_ok,
+                        buffer_ops.buffer_load(
+                            x_rsrc, x_idx_safe, vec_width=1, dtype=T.i8
+                        ),
+                        arith.constant(0, type=T.i8),
+                    )
                     lds_idx = row * arith.index(lds_a_stride_bytes) + col
                     v1 = vector.from_elements(T.vec(1, T.i8), [x_val])
                     vector.store(v1, target_lds, [lds_idx], alignment=1)
@@ -2515,9 +2875,11 @@ def _compile_stage2_mxscale_kernel_impl(
             for _gi in range_constexpr(_TDM_GATHER_GROUPS):
                 _start = _gi * _TDM_GATHER_CHUNK
                 _cnt = min(_TDM_GATHER_CHUNK, int(tile_m) - _start)
-                _row_indices = _a_row_ids[_start:_start + _cnt]
-                _valid_count = _sum_i32_values(_a_row_valids[_start:_start + _cnt])
-                _has_valid = arith.cmpi(arith.CmpIPredicate.sgt, _valid_count, _zero_i32)
+                _row_indices = _a_row_ids[_start : _start + _cnt]
+                _valid_count = _sum_i32_values(_a_row_valids[_start : _start + _cnt])
+                _has_valid = arith.cmpi(
+                    arith.CmpIPredicate.sgt, _valid_count, _zero_i32
+                )
                 _issue_pred = _has_valid
                 if const_expr(wave_specialized_tdm):
                     _gather_owner = _gi % _tdm_loader_waves
@@ -2551,16 +2913,20 @@ def _compile_stage2_mxscale_kernel_impl(
                     )
                     _per_buf.append(_base_desc)
                 _descs.append(_per_buf)
-                _base_addr_lo.append(vector.extract(
-                    _per_buf[0].dgroup0,
-                    static_position=[2],
-                    dynamic_position=[],
-                ))
-                _base_addr_hi.append(vector.extract(
-                    _per_buf[0].dgroup0,
-                    static_position=[3],
-                    dynamic_position=[],
-                ))
+                _base_addr_lo.append(
+                    vector.extract(
+                        _per_buf[0].dgroup0,
+                        static_position=[2],
+                        dynamic_position=[],
+                    )
+                )
+                _base_addr_hi.append(
+                    vector.extract(
+                        _per_buf[0].dgroup0,
+                        static_position=[3],
+                        dynamic_position=[],
+                    )
+                )
 
             _a_gather_cache["desc"] = _descs
             _a_gather_cache["pred"] = _preds
@@ -2569,7 +2935,9 @@ def _compile_stage2_mxscale_kernel_impl(
 
         def issue_a_load_tdm_gather(k_base, buf_idx):
             """Hot path: carry-safe advance of the precomputed gather descriptor."""
-            k_packed_base = k_base if PACK_FACTOR_A == 1 else k_base // fx.Index(PACK_FACTOR_A)
+            k_packed_base = (
+                k_base if PACK_FACTOR_A == 1 else k_base // fx.Index(PACK_FACTOR_A)
+            )
             _k_byte_off_i32 = arith.index_cast(T.i32, k_packed_base)
             _descs = _a_gather_cache["desc"]
             _preds = _a_gather_cache["pred"]
@@ -2615,22 +2983,26 @@ def _compile_stage2_mxscale_kernel_impl(
                         tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
                         slot = fused >> arith.constant(24, type=T.i32)
                         tok_ok = arith.cmpi(
-                            arith.CmpIPredicate.ult, tok, i32_tokens_in,
+                            arith.CmpIPredicate.ult,
+                            tok,
+                            i32_tokens_in,
                         )
                         slot_ok0 = arith.cmpi(
-                            arith.CmpIPredicate.sge, slot,
+                            arith.CmpIPredicate.sge,
+                            slot,
                             arith.constant(0, type=T.i32),
                         )
                         slot_ok1 = arith.cmpi(
-                            arith.CmpIPredicate.slt, slot, c_topk_i32,
+                            arith.CmpIPredicate.slt,
+                            slot,
+                            c_topk_i32,
                         )
                         ts = tok * c_topk_i32 + slot
                         ts_ok = arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
                         if const_expr(_as_layout_rowmajor):
-                            lds_idx = (
-                                row * arith.index(_row_bytes)
-                                + ksc_blk * arith.index(_blk_bytes)
-                            )
+                            lds_idx = row * arith.index(
+                                _row_bytes
+                            ) + ksc_blk * arith.index(_blk_bytes)
                         else:
                             warp_row_idx = row / arith.index(warp_tile_m)
                             local_row = row % arith.index(warp_tile_m)
@@ -2640,22 +3012,16 @@ def _compile_stage2_mxscale_kernel_impl(
                                 warp_row_idx * arith.index(WMMA_M) + lane_row
                             )
                             lds_idx = (
-                                global_lds_row
-                                * arith.index(interleaved_scale_cols_a)
-                                + ksc_blk
-                                * arith.index(wmma_m_rep * SCALES_PER_WMMA)
+                                global_lds_row * arith.index(interleaved_scale_cols_a)
+                                + ksc_blk * arith.index(wmma_m_rep * SCALES_PER_WMMA)
                                 + local_wm_idx * arith.index(SCALES_PER_WMMA)
                             )
                         _if_ok = scf.IfOp(ts_ok, has_else=True)
                         with ir.InsertionPoint(_if_ok.then_block):
-                            chunk_off = (
-                                k_scale_base
-                                + ksc_blk * arith.index(_blk_bytes)
-                            )
-                            sx_idx = (
-                                ts * arith.constant(K_scale, type=T.i32)
-                                + arith.index_cast(T.i32, chunk_off)
-                            )
+                            chunk_off = k_scale_base + ksc_blk * arith.index(_blk_bytes)
+                            sx_idx = ts * arith.constant(
+                                K_scale, type=T.i32
+                            ) + arith.index_cast(T.i32, chunk_off)
                             sx_raw = buffer_ops.buffer_load(
                                 sx_rsrc,
                                 arith.shrui(
@@ -2670,7 +3036,9 @@ def _compile_stage2_mxscale_kernel_impl(
                                 vector.from_elements(T.vec(1, T.i32), [sx_raw]),
                             )
                             vector.store(
-                                sx_vec, target_lds, [lds_idx],
+                                sx_vec,
+                                target_lds,
+                                [lds_idx],
                                 alignment=_blk_bytes,
                             )
                             scf.YieldOp([])
@@ -2683,7 +3051,9 @@ def _compile_stage2_mxscale_kernel_impl(
                                 ),
                             )
                             vector.store(
-                                fill_vec, target_lds, [lds_idx],
+                                fill_vec,
+                                target_lds,
+                                [lds_idx],
                                 alignment=_blk_bytes,
                             )
                             scf.YieldOp([])
@@ -2706,17 +3076,25 @@ def _compile_stage2_mxscale_kernel_impl(
                         tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
                         slot = fused >> arith.constant(24, type=T.i32)
                         tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
-                        slot_ok0 = arith.cmpi(arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32))
+                        slot_ok0 = arith.cmpi(
+                            arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32)
+                        )
                         slot_ok1 = arith.cmpi(arith.CmpIPredicate.slt, slot, c_topk_i32)
                         ts = tok * c_topk_i32 + slot
                         ts_ok = arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
                         load_ok = ts_ok
                         ksc_off = k_scale_base + ksc
-                        sx_idx = ts * arith.constant(K_scale, type=T.i32) + arith.index_cast(T.i32, ksc_off)
-                        sx_idx_safe = arith.select(load_ok, sx_idx, arith.constant(0, type=T.i32))
+                        sx_idx = ts * arith.constant(
+                            K_scale, type=T.i32
+                        ) + arith.index_cast(T.i32, ksc_off)
+                        sx_idx_safe = arith.select(
+                            load_ok, sx_idx, arith.constant(0, type=T.i32)
+                        )
                         sx_val = arith.select(
                             load_ok,
-                            buffer_ops.buffer_load(sx_rsrc, sx_idx_safe, vec_width=1, dtype=T.i8),
+                            buffer_ops.buffer_load(
+                                sx_rsrc, sx_idx_safe, vec_width=1, dtype=T.i8
+                            ),
                             arith.constant(127, type=T.i8),
                         )
                         if is_fp4:
@@ -2726,7 +3104,9 @@ def _compile_stage2_mxscale_kernel_impl(
                             local_row = row % arith.index(warp_tile_m)
                             lane_row = local_row % arith.index(WMMA_M)
                             local_wm_idx = local_row / arith.index(WMMA_M)
-                            global_lds_row = warp_row_idx * arith.index(WMMA_M) + lane_row
+                            global_lds_row = (
+                                warp_row_idx * arith.index(WMMA_M) + lane_row
+                            )
                             ksc_blk = ksc / arith.index(SCALES_PER_WMMA)
                             ksc_sub = ksc % arith.index(SCALES_PER_WMMA)
                             lds_idx = (
@@ -2747,11 +3127,13 @@ def _compile_stage2_mxscale_kernel_impl(
             for _gi in range_constexpr(_TDM_GATHER_GROUPS):
                 _start = _gi * _TDM_GATHER_CHUNK
                 _cnt = min(_TDM_GATHER_CHUNK, int(tile_m) - _start)
-                _row_indices = _a_row_ids[_start:_start + _cnt]
-                _valid_count = _sum_i32_values(_a_row_valids[_start:_start + _cnt])
+                _row_indices = _a_row_ids[_start : _start + _cnt]
+                _valid_count = _sum_i32_values(_a_row_valids[_start : _start + _cnt])
                 _lds_off = fx.Index(_start * _as_row_bytes)
                 _has_valid = arith.cmpi(
-                    arith.CmpIPredicate.sgt, _valid_count, _zero_i32,
+                    arith.CmpIPredicate.sgt,
+                    _valid_count,
+                    _zero_i32,
                 )
                 _issue_pred = _has_valid
                 if wave_specialized_tdm:
@@ -2786,33 +3168,49 @@ def _compile_stage2_mxscale_kernel_impl(
         def make_desc_b(n_off, k_base, target_lds):
             if const_expr(is_fp4):
                 return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_w, lds_memref=target_lds,
+                    global_ptr=arg_w,
+                    lds_memref=target_lds,
                     global_offset=(n_off, k_base / arith.index(PACK_FACTOR_B)),
                     tensor_shape=(int(tile_n), int(packed_tile_k_b)),
                     strides=(K_packed_b, 1),
                     tile_shape=(int(tile_n), int(packed_tile_k_b)),
-                    elem_bytes=1, pad_interval=int(packed_tile_k_b), pad_amount=LDS_PAD_B_BYTES,
-                    num_warps=tdm_desc_num_warps, workgroup_mask=b_mcast_mask)
+                    elem_bytes=1,
+                    pad_interval=int(packed_tile_k_b),
+                    pad_amount=LDS_PAD_B_BYTES,
+                    num_warps=tdm_desc_num_warps,
+                    workgroup_mask=b_mcast_mask,
+                )
             return tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=arg_w, lds_memref=target_lds,
-                global_offset=(n_off / arith.index(16), (k_base / arith.index(PACK_FACTOR_B)) * arith.index(16)),
+                global_ptr=arg_w,
+                lds_memref=target_lds,
+                global_offset=(
+                    n_off / arith.index(16),
+                    (k_base / arith.index(PACK_FACTOR_B)) * arith.index(16),
+                ),
                 tensor_shape=(int(N_total // 16), int(K_packed_b * 16)),
                 strides=(int(K_packed_b * 16), 1),
                 tile_shape=(int(tile_n // 16), int(packed_tile_k_b * 16)),
                 elem_bytes=1,
-                pad_interval=0, pad_amount=0,
+                pad_interval=0,
+                pad_amount=0,
                 num_warps=tdm_desc_num_warps,
-                workgroup_mask=b_mcast_mask)
+                workgroup_mask=b_mcast_mask,
+            )
 
         def make_desc_bs(n_off, k_base, target_lds):
             return tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=arg_scale_w, lds_memref=target_lds,
+                global_ptr=arg_scale_w,
+                lds_memref=target_lds,
                 global_offset=(n_off, k_base / arith.index(SCALE_BLOCK)),
                 tensor_shape=(int(tile_n), int(scale_k_per_tile)),
                 strides=(K_scale, 1),
                 tile_shape=(int(tile_n), int(scale_k_per_tile)),
-                elem_bytes=1, pad_interval=0, pad_amount=0,
-                num_warps=tdm_desc_num_warps, workgroup_mask=b_mcast_mask)
+                elem_bytes=1,
+                pad_interval=0,
+                pad_amount=0,
+                num_warps=tdm_desc_num_warps,
+                workgroup_mask=b_mcast_mask,
+            )
 
         _b_desc_cache = {}
 
@@ -2855,17 +3253,14 @@ def _compile_stage2_mxscale_kernel_impl(
         def _b_data_k_byte_off(k_base):
 
             _k_packed_b = (
-                k_base if PACK_FACTOR_B == 1
-                else k_base // fx.Index(PACK_FACTOR_B)
+                k_base if PACK_FACTOR_B == 1 else k_base // fx.Index(PACK_FACTOR_B)
             )
             if const_expr(is_fp4):
                 return arith.index_cast(T.i32, _k_packed_b)
-            return arith.index_cast(
-                T.i32, _k_packed_b * fx.Index(16))
+            return arith.index_cast(T.i32, _k_packed_b * fx.Index(16))
 
         def _b_scale_k_byte_off(k_base):
-            return arith.index_cast(
-                T.i32, k_base // fx.Index(SCALE_BLOCK))
+            return arith.index_cast(T.i32, k_base // fx.Index(SCALE_BLOCK))
 
         def issue_b_load(k_base, target_lds_b, target_lds_bs):
             eid_idx = arith.index_cast(T.index, eid_i32)
@@ -2874,10 +3269,18 @@ def _compile_stage2_mxscale_kernel_impl(
             tdm_ops.tensor_load_2d(make_desc_bs(n_off, k_base, target_lds_bs))
 
         _ldrs = _make_mxscale_data_loaders(
-            tiling=tp, warp_m_base=warp_m_base, warp_n_base=warp_n_base,
-            wave_n_idx=wave_n_idx, lane16=lane16, lane_kgrp=lane_kgrp,
-            ir=ir, arith=arith, vector=vector, llvm_dialect=llvm_dialect,
-            T=T, range_constexpr=range_constexpr,
+            tiling=tp,
+            warp_m_base=warp_m_base,
+            warp_n_base=warp_n_base,
+            wave_n_idx=wave_n_idx,
+            lane16=lane16,
+            lane_kgrp=lane_kgrp,
+            ir=ir,
+            arith=arith,
+            vector=vector,
+            llvm_dialect=llvm_dialect,
+            T=T,
+            range_constexpr=range_constexpr,
         )
         _lds_load_b128 = _ldrs["_lds_load_b128"]
         load_data_frag = _ldrs["load_data_frag"]
@@ -2917,12 +3320,18 @@ def _compile_stage2_mxscale_kernel_impl(
 
             def emit_wmma(accs, wm, wn, a_frag, b_frags, a_scales, b_scales):
                 _mxscale_emit_wmma(
-                    accs=accs, wm=wm, wn=wn,
-                    a_frag=a_frag, b_frags=b_frags,
-                    a_scales=a_scales, b_scales=b_scales,
-                    is_fp4=is_fp4, is_a8w4=is_a8w4,
+                    accs=accs,
+                    wm=wm,
+                    wn=wn,
+                    a_frag=a_frag,
+                    b_frags=b_frags,
+                    a_scales=a_scales,
+                    b_scales=b_scales,
+                    is_fp4=is_fp4,
+                    is_a8w4=is_a8w4,
                     use_scale_opsel=False,
-                    rocdl=rocdl, T=T,
+                    rocdl=rocdl,
+                    T=T,
                 )
 
             def _compute_k_tile(accs_in, buf_idx, mid_compute_callback=None):
@@ -2941,21 +3350,31 @@ def _compile_stage2_mxscale_kernel_impl(
                         _mid_emit_wn = _front_wn - 1
                 _did_mid = False
                 for ks in range_constexpr(k_wmma_steps):
-                    b_v = [load_b_frag(lds_b_bufs[buf_idx], b_data_bases, wn, ks)
-                           for wn in range_constexpr(wmma_n_rep)]
+                    b_v = [
+                        load_b_frag(lds_b_bufs[buf_idx], b_data_bases, wn, ks)
+                        for wn in range_constexpr(wmma_n_rep)
+                    ]
                     if const_expr(is_fp4):
-                        as_v = [load_scale_i32(lds_as_bufs[buf_idx], as_bases[wm], ks)
-                                for wm in range_constexpr(wmma_m_rep)]
-                        bs_v = [load_scale_i32(lds_bs_bufs[buf_idx], bs_bases[bi], ks)
-                                for bi in range_constexpr(b_scale_load_rep)]
+                        as_v = [
+                            load_scale_i32(lds_as_bufs[buf_idx], as_bases[wm], ks)
+                            for wm in range_constexpr(wmma_m_rep)
+                        ]
+                        bs_v = [
+                            load_scale_i32(lds_bs_bufs[buf_idx], bs_bases[bi], ks)
+                            for bi in range_constexpr(b_scale_load_rep)
+                        ]
                     else:
-                        as_v = load_scale_b128(lds_as_bufs[buf_idx], as_bases[0],
-                                               wmma_m_rep, ks)
-                        bs_v = [load_scale_i32(lds_bs_bufs[buf_idx], bs_bases[wn], ks)
-                                for wn in range_constexpr(wmma_n_rep)]
+                        as_v = load_scale_b128(
+                            lds_as_bufs[buf_idx], as_bases[0], wmma_m_rep, ks
+                        )
+                        bs_v = [
+                            load_scale_i32(lds_bs_bufs[buf_idx], bs_bases[wn], ks)
+                            for wn in range_constexpr(wmma_n_rep)
+                        ]
                     for wm in range_constexpr(wmma_m_rep):
-                        a_frag = load_data_frag(lds_a_bufs[buf_idx],
-                                                a_data_bases[wm], ks)
+                        a_frag = load_data_frag(
+                            lds_a_bufs[buf_idx], a_data_bases[wm], ks
+                        )
                         for wn in range_constexpr(wmma_n_rep):
                             emit_wmma(accs_in, wm, wn, a_frag, b_v, as_v, bs_v)
                             if const_expr(
@@ -2970,18 +3389,27 @@ def _compile_stage2_mxscale_kernel_impl(
                 return accs_in
 
             def _load_b_and_scales(buf_idx, ks):
-                b_v = [load_b_frag(lds_b_bufs[buf_idx], b_data_bases, wn, ks)
-                       for wn in range_constexpr(wmma_n_rep)]
+                b_v = [
+                    load_b_frag(lds_b_bufs[buf_idx], b_data_bases, wn, ks)
+                    for wn in range_constexpr(wmma_n_rep)
+                ]
                 if const_expr(is_fp4):
-                    as_v = [load_scale_i32(lds_as_bufs[buf_idx], as_bases[wm], ks)
-                            for wm in range_constexpr(wmma_m_rep)]
-                    bs_v = [load_scale_i32(lds_bs_bufs[buf_idx], bs_bases[bi], ks)
-                            for bi in range_constexpr(b_scale_load_rep)]
+                    as_v = [
+                        load_scale_i32(lds_as_bufs[buf_idx], as_bases[wm], ks)
+                        for wm in range_constexpr(wmma_m_rep)
+                    ]
+                    bs_v = [
+                        load_scale_i32(lds_bs_bufs[buf_idx], bs_bases[bi], ks)
+                        for bi in range_constexpr(b_scale_load_rep)
+                    ]
                 else:
-                    as_v = load_scale_b128(lds_as_bufs[buf_idx], as_bases[0],
-                                           wmma_m_rep, ks)
-                    bs_v = [load_scale_i32(lds_bs_bufs[buf_idx], bs_bases[wn], ks)
-                            for wn in range_constexpr(wmma_n_rep)]
+                    as_v = load_scale_b128(
+                        lds_as_bufs[buf_idx], as_bases[0], wmma_m_rep, ks
+                    )
+                    bs_v = [
+                        load_scale_i32(lds_bs_bufs[buf_idx], bs_bases[wn], ks)
+                        for wn in range_constexpr(wmma_n_rep)
+                    ]
                 return b_v, bs_v, as_v
 
             def _emit_rows(accs_in, start_wm, a_frags, b_frags, a_scales, b_scales):
@@ -2989,7 +3417,15 @@ def _compile_stage2_mxscale_kernel_impl(
                     wm = start_wm + frag_i
                     for wn_raw in range_constexpr(wmma_n_rep):
                         wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
-                        emit_wmma(accs_in, wm, wn, a_frags[frag_i], b_frags, a_scales, b_scales)
+                        emit_wmma(
+                            accs_in,
+                            wm,
+                            wn,
+                            a_frags[frag_i],
+                            b_frags,
+                            a_scales,
+                            b_scales,
+                        )
 
             def _a_streaming_compute(
                 accs_in,
@@ -3008,8 +3444,7 @@ def _compile_stage2_mxscale_kernel_impl(
                     for wm in range_constexpr(_front_wm)
                 ]
                 _use_partial_drain = (
-                    next_bs_info is not None
-                    and _front_wm * wmma_n_rep >= 4
+                    next_bs_info is not None and _front_wm * wmma_n_rep >= 4
                 )
 
                 if const_expr(_use_partial_drain):
@@ -3214,12 +3649,15 @@ def _compile_stage2_mxscale_kernel_impl(
                 _tdm_zero_addr_lo = arith.constant(0, type=T.i32)
                 _active_stage_desc_base = [
                     tdm_ops.TDMDescriptor2D(
-                        vector.from_elements(T.vec(4, T.i32), [
-                            _tdm_pred,
-                            _active_stage_lds_addr[i],
-                            _tdm_zero_addr_lo,
-                            _active_addr_hi,
-                        ]),
+                        vector.from_elements(
+                            T.vec(4, T.i32),
+                            [
+                                _tdm_pred,
+                                _active_stage_lds_addr[i],
+                                _tdm_zero_addr_lo,
+                                _active_addr_hi,
+                            ],
+                        ),
                         _active_dgroup1,
                     )
                     for i in range_constexpr(_nb)
@@ -3238,13 +3676,13 @@ def _compile_stage2_mxscale_kernel_impl(
                         )
                         scf.YieldOp([])
                     _next_addr_lo, _next_addr_hi = tdm_ops.add_addr_with_carry(
-                        curr_addr_lo, curr_addr_hi, _active_adv_i32,
+                        curr_addr_lo,
+                        curr_addr_hi,
+                        _active_adv_i32,
                     )
                     return (
-                        arith.select(
-                            _is_loader_wave, _next_addr_lo, curr_addr_lo),
-                        arith.select(
-                            _is_loader_wave, _next_addr_hi, curr_addr_hi),
+                        arith.select(_is_loader_wave, _next_addr_lo, curr_addr_lo),
+                        arith.select(_is_loader_wave, _next_addr_hi, curr_addr_hi),
                     )
 
             if const_expr(_use_tdm_gather_a):
@@ -3263,14 +3701,16 @@ def _compile_stage2_mxscale_kernel_impl(
                         _b_desc_cache["b_addr_lo"][buf_idx],
                         _b_desc_cache["b_addr_hi"][buf_idx],
                         _k_data_off,
-                    ))
+                    )
+                )
                 tdm_ops.tensor_load_2d(
                     tdm_ops.update_tensor_descriptor_2d_addr64(
                         _b_desc_cache["bs"][buf_idx],
                         _b_desc_cache["bs_addr_lo"][buf_idx],
                         _b_desc_cache["bs_addr_hi"][buf_idx],
                         _k_scale_off,
-                    ))
+                    )
+                )
 
             def _issue_scalar_loads(k_base, buf_idx):
                 if const_expr(_use_tdm_gather_a):
@@ -3289,11 +3729,13 @@ def _compile_stage2_mxscale_kernel_impl(
             def _compute_with_mid_loads(accs_in, buf_idx, mid_load_callback=None):
                 if const_expr(_use_scheduled_compute):
                     return _compute_k_tile_scheduled(
-                        accs_in, buf_idx,
+                        accs_in,
+                        buf_idx,
                         mid_compute_callback=mid_load_callback,
                     )
                 return _compute_k_tile(
-                    accs_in, buf_idx,
+                    accs_in,
+                    buf_idx,
                     mid_compute_callback=mid_load_callback,
                 )
 
@@ -3304,9 +3746,8 @@ def _compile_stage2_mxscale_kernel_impl(
                     active_b_addr_hi = _active_addr_hi
                     for kt in range_constexpr(num_k_tiles):
                         k_base = fx.Index(kt * int(tile_k))
-                        active_b_addr_lo, active_b_addr_hi = (
-                            _issue_active_b_tdm_only(
-                                0, active_b_addr_lo, active_b_addr_hi)
+                        active_b_addr_lo, active_b_addr_hi = _issue_active_b_tdm_only(
+                            0, active_b_addr_lo, active_b_addr_hi
                         )
                         _issue_scalar_loads(k_base, 0)
                         tdm_ops.tensor_wait(0)
@@ -3327,9 +3768,8 @@ def _compile_stage2_mxscale_kernel_impl(
                     active_b_addr_lo = _active_addr_lo
                     active_b_addr_hi = _active_addr_hi
                     for _pi in range_constexpr(pre_loaded):
-                        active_b_addr_lo, active_b_addr_hi = (
-                            _issue_active_b_tdm_only(
-                                _pi, active_b_addr_lo, active_b_addr_hi)
+                        active_b_addr_lo, active_b_addr_hi = _issue_active_b_tdm_only(
+                            _pi, active_b_addr_lo, active_b_addr_hi
                         )
                         _issue_scalar_loads(fx.Index(_pi * int(tile_k)), _pi)
                 else:
@@ -3340,22 +3780,19 @@ def _compile_stage2_mxscale_kernel_impl(
                 if const_expr(loop_iters > 0):
                     if const_expr(wave_specialized_tdm):
 
-                        _init = (
-                            list(acc)
-                            + [active_b_addr_lo, active_b_addr_hi]
-                        )
+                        _init = list(acc) + [active_b_addr_lo, active_b_addr_hi]
                         for _li, _st in fx.range(0, loop_iters, 1, init=_init):
                             _acc = list(_st[:n_accs])
                             _cur_b_addr_lo = _st[n_accs]
                             _cur_b_addr_hi = _st[n_accs + 1]
                             for _bi in range_constexpr(_nb):
                                 _lb = (_bi + _nb - 1) % _nb
-                                _kt = (_li * fx.Index(_nb)
-                                       + fx.Index(pre_loaded + _bi))
+                                _kt = _li * fx.Index(_nb) + fx.Index(pre_loaded + _bi)
                                 _kb = _kt * fx.Index(int(tile_k))
                                 pipeline_fence_signal(
                                     outstanding=_fence_outstanding,
-                                    use_cluster=use_cluster)
+                                    use_cluster=use_cluster,
+                                )
                                 pipeline_fence_wait(use_cluster=use_cluster)
 
                                 _cur_b_addr_lo, _cur_b_addr_hi = (
@@ -3378,25 +3815,26 @@ def _compile_stage2_mxscale_kernel_impl(
                                 )
                                 if const_expr(_use_scheduled_compute):
                                     _hot_loop_scheduler_scheduled()
-                            _res = yield (
-                                list(_acc)
-                                + [_cur_b_addr_lo, _cur_b_addr_hi]
-                            )
+                            _res = yield (list(_acc) + [_cur_b_addr_lo, _cur_b_addr_hi])
                         acc = list(_res[:n_accs])
                         active_b_addr_lo = _res[n_accs]
                         active_b_addr_hi = _res[n_accs + 1]
                     else:
                         _init = list(acc)
                         for _li, _st in fx.range(0, loop_iters, 1, init=_init):
-                            _acc = list(_st[:n_accs]) if isinstance(_st, (list, tuple)) else [_st]
+                            _acc = (
+                                list(_st[:n_accs])
+                                if isinstance(_st, (list, tuple))
+                                else [_st]
+                            )
                             for _bi in range_constexpr(_nb):
                                 _lb = (_bi + _nb - 1) % _nb
-                                _kt = (_li * fx.Index(_nb)
-                                       + fx.Index(pre_loaded + _bi))
+                                _kt = _li * fx.Index(_nb) + fx.Index(pre_loaded + _bi)
                                 _kb = _kt * fx.Index(int(tile_k))
                                 pipeline_fence_signal(
                                     outstanding=_fence_outstanding,
-                                    use_cluster=use_cluster)
+                                    use_cluster=use_cluster,
+                                )
                                 pipeline_fence_wait(use_cluster=use_cluster)
 
                                 _issue_b_tdm_only(_kb, _lb)
@@ -3414,7 +3852,11 @@ def _compile_stage2_mxscale_kernel_impl(
                                 if const_expr(_use_scheduled_compute):
                                     _hot_loop_scheduler_scheduled()
                             _res = yield list(_acc)
-                        acc = list(_res[:n_accs]) if isinstance(_res, (list, tuple)) else [_res]
+                        acc = (
+                            list(_res[:n_accs])
+                            if isinstance(_res, (list, tuple))
+                            else [_res]
+                        )
 
                 if const_expr(loop_iters > 0):
                     pipeline_fence(outstanding=0, use_cluster=use_cluster)
@@ -3426,8 +3868,7 @@ def _compile_stage2_mxscale_kernel_impl(
                 for _ls, _cs, _out in _tail_plan:
                     if const_expr(_out == -1):
                         if const_expr(_tail_had_load):
-                            pipeline_fence(outstanding=0,
-                                           use_cluster=use_cluster)
+                            pipeline_fence(outstanding=0, use_cluster=use_cluster)
                         if const_expr(_use_scheduled_compute):
                             rocdl.sched_barrier(0)
                             acc = _compute_k_tile_scheduled(acc, _cs)
@@ -3435,14 +3876,13 @@ def _compile_stage2_mxscale_kernel_impl(
                         else:
                             acc = _compute_k_tile(acc, _cs)
                     else:
-                        pipeline_fence_signal(outstanding=_out,
-                                              use_cluster=use_cluster)
+                        pipeline_fence_signal(outstanding=_out, use_cluster=use_cluster)
                         pipeline_fence_wait(use_cluster=use_cluster)
                         if const_expr(_ls is not None):
                             _tail_had_load = True
                             _tkb = fx.Index(
-                                (_tail_start + pre_loaded + _tail_li)
-                                * int(tile_k))
+                                (_tail_start + pre_loaded + _tail_li) * int(tile_k)
+                            )
                             _tail_li += 1
 
                             if const_expr(wave_specialized_tdm):
@@ -3489,23 +3929,28 @@ def _compile_stage2_mxscale_kernel_impl(
                     _row_in_route = arith.cmpi(
                         arith.CmpIPredicate.ult,
                         arith.index_cast(T.i32, _row_local),
-                        arith.constant(int(route_tile_m), type=T.i32))
+                        arith.constant(int(route_tile_m), type=T.i32),
+                    )
                     _row_in_valid = arith.cmpi(
-                        arith.CmpIPredicate.slt, _sorted_i32, num_valid_i32)
+                        arith.CmpIPredicate.slt, _sorted_i32, num_valid_i32
+                    )
                     _row_ok = arith.andi(_row_in_route, _row_in_valid)
                     if const_expr(bool(doweight_stage2)):
                         _sorted_safe = arith.select(
-                            _row_ok, _sorted_i32, block_row_start)
+                            _row_ok, _sorted_i32, block_row_start
+                        )
                         _tw = buffer_ops.buffer_load(
-                            tw_rsrc, _sorted_safe, vec_width=1, dtype=T.f32)
+                            tw_rsrc, _sorted_safe, vec_width=1, dtype=T.f32
+                        )
                         _sc = arith.select(
-                            _row_ok, _tw,
-                            arith.constant(0.0, type=T.f32))
+                            _row_ok, _tw, arith.constant(0.0, type=T.f32)
+                        )
                     else:
                         _sc = arith.select(
                             _row_ok,
                             arith.constant(1.0, type=T.f32),
-                            arith.constant(0.0, type=T.f32))
+                            arith.constant(0.0, type=T.f32),
+                        )
                     _scale_per_wm.append(_sc)
 
                 if const_expr(d_need_epilogue_fence):
@@ -3516,31 +3961,40 @@ def _compile_stage2_mxscale_kernel_impl(
                     _wm_idx = _m_off // WMMA_M
                     _sc = _scale_per_wm[_wm_idx]
                     _sub8 = _extract_sub8(
-                        acc[_acc_idx], _vec_base,
+                        acc[_acc_idx],
+                        _vec_base,
                         vector=vector,
                         range_constexpr=range_constexpr,
-                        ACC_VEC_SIZE=ACC_VEC_SIZE)
+                        ACC_VEC_SIZE=ACC_VEC_SIZE,
+                    )
                     _scaled = []
                     for _vi in range_constexpr(8):
                         _v = vector.extract(
-                            _sub8,
-                            static_position=[_vi],
-                            dynamic_position=[])
+                            _sub8, static_position=[_vi], dynamic_position=[]
+                        )
                         _scaled.append(_v * _sc)
-                    _scaled_sub8 = vector.from_elements(
-                        T.vec(8, T.f32), _scaled)
+                    _scaled_sub8 = vector.from_elements(T.vec(8, T.f32), _scaled)
                     _imm = _m_off * _lds_d_stride_elems + _wn * _n_col_d_elems
                     store_acc_vec8_to_lds(
-                        d_lds_buffer, d_lane_base, _imm, _scaled_sub8,
-                        out_elem=out_elem_ty)
+                        d_lds_buffer,
+                        d_lane_base,
+                        _imm,
+                        _scaled_sub8,
+                        out_elem=out_elem_ty,
+                    )
 
                 rocdl.s_wait_dscnt(0)
                 tdm_ops.tensor_store_2d(d_desc)
                 tdm_ops.tensor_wait(0)
             else:
+
                 def _load_sub8(acc_idx, vec_base):
                     return _extract_sub8(
-                        acc[acc_idx], vec_base, vector=vector, range_constexpr=range_constexpr, ACC_VEC_SIZE=ACC_VEC_SIZE
+                        acc[acc_idx],
+                        vec_base,
+                        vector=vector,
+                        range_constexpr=range_constexpr,
+                        ACC_VEC_SIZE=ACC_VEC_SIZE,
                     )
 
                 _emit_stage2_store_epilogue(
@@ -3607,10 +4061,20 @@ def _compile_stage2_mxscale_kernel_impl(
         gx = (n_in + fx.Index(int(tile_n) - 1)) // fx.Index(int(tile_n))
         gy = size_expert_ids_in
         launcher = moe_mxscale_stage2_single(
-            arg_out, arg_x, arg_w, arg_scale_x, arg_scale_w,
-            arg_sorted_token_ids, arg_expert_ids, arg_sorted_weights, arg_num_valid_ids,
+            arg_out,
+            arg_x,
+            arg_w,
+            arg_scale_x,
+            arg_scale_w,
+            arg_sorted_token_ids,
+            arg_expert_ids,
+            arg_sorted_weights,
+            arg_num_valid_ids,
             arg_bias,
-            i32_tokens_in, i32_n_in, i32_k_in, i32_size_expert_ids_in,
+            i32_tokens_in,
+            i32_n_in,
+            i32_k_in,
+            i32_size_expert_ids_in,
         )
         _cluster_arg = (int(cluster_m), int(cluster_n), 1) if use_cluster else None
         _finalize_alloc_and_launch_2d(
@@ -3632,6 +4096,7 @@ def _compile_stage2_mxscale_kernel_impl(
         }
 
     return launch_mxscale_stage2_single
+
 
 @functools.lru_cache(maxsize=1024)
 def _compile_moe_mxscale_gemm(
@@ -3659,7 +4124,6 @@ def _compile_moe_mxscale_gemm(
     cluster_m: int = 1,
     cluster_n: int = 1,
     k_batch: int = 1,
-
     enable_bias: bool = False,
     act: str = "silu",
 ):
@@ -3672,28 +4136,46 @@ def _compile_moe_mxscale_gemm(
             "expected 'fp4', 'fp8', or 'a8w4'"
         )
 
-    single_tile_m, single_tile_n, single_m_warp, single_n_warp = _pick_mxscale_launch_shape(
-        in_dtype, int(tile_m), int(tile_n),
+    single_tile_m, single_tile_n, single_m_warp, single_n_warp = (
+        _pick_mxscale_launch_shape(
+            in_dtype,
+            int(tile_m),
+            int(tile_n),
+        )
     )
     common = dict(
-        model_dim=int(model_dim), inter_dim=int(inter_dim),
-        experts=int(experts), topk=int(topk),
+        model_dim=int(model_dim),
+        inter_dim=int(inter_dim),
+        experts=int(experts),
+        topk=int(topk),
         route_tile_m=int(tile_m),
-        tile_m=int(single_tile_m), tile_n=int(single_tile_n), tile_k=int(tile_k),
-        m_warp=int(single_m_warp), n_warp=int(single_n_warp),
-        out_dtype=out_dtype, waves_per_eu=waves_per_eu, data_format=in_dtype,
-        expert_sched_mode=expert_sched_mode, num_buffers=int(num_buffers),
+        tile_m=int(single_tile_m),
+        tile_n=int(single_tile_n),
+        tile_k=int(tile_k),
+        m_warp=int(single_m_warp),
+        n_warp=int(single_n_warp),
+        out_dtype=out_dtype,
+        waves_per_eu=waves_per_eu,
+        data_format=in_dtype,
+        expert_sched_mode=expert_sched_mode,
+        num_buffers=int(num_buffers),
         use_tdm_gather=bool(use_tdm_gather),
         use_tdm_gather_as=bool(use_tdm_gather_as),
         use_tdm_store=bool(use_tdm_store),
-        inst_prefetch=bool(inst_prefetch), wave_specialized_tdm=bool(wave_specialized_tdm),
-        cluster_m=int(cluster_m), cluster_n=int(cluster_n),
+        inst_prefetch=bool(inst_prefetch),
+        wave_specialized_tdm=bool(wave_specialized_tdm),
+        cluster_m=int(cluster_m),
+        cluster_n=int(cluster_n),
     )
 
     if stage == 1:
         exe = _compile_stage1_mxscale_kernel_impl(
-            doweight_stage1=bool(doweight), k_batch=int(k_batch),
-            enable_bias=bool(enable_bias), act=str(act), **common)
+            doweight_stage1=bool(doweight),
+            k_batch=int(k_batch),
+            enable_bias=bool(enable_bias),
+            act=str(act),
+            **common,
+        )
         if (
             int(k_batch) == 1
             and in_dtype in ("fp8", "a8w4")
@@ -3701,35 +4183,70 @@ def _compile_moe_mxscale_gemm(
         ):
             return _Stage1GateUpPackedWrapper(
                 exe,
-                experts=int(experts), inter_dim=int(inter_dim),
+                experts=int(experts),
+                inter_dim=int(inter_dim),
                 tile_n=int(single_tile_n),
-                packed_cols_w=(int(model_dim) // 2) if in_dtype == "a8w4" else int(model_dim),
+                packed_cols_w=(
+                    (int(model_dim) // 2) if in_dtype == "a8w4" else int(model_dim)
+                ),
                 packed_cols_scale=int(model_dim) // 32,
             )
         return exe
 
     if int(k_batch) != 1:
         raise ValueError(
-            "split-K (k_batch>1) is only supported on stage1 for MXScale MoE")
+            "split-K (k_batch>1) is only supported on stage1 for MXScale MoE"
+        )
 
     return _compile_stage2_mxscale_kernel_impl(
-        doweight_stage2=bool(doweight), accumulate=bool(accumulate),
-        enable_bias=bool(enable_bias), **common,
+        doweight_stage2=bool(doweight),
+        accumulate=bool(accumulate),
+        enable_bias=bool(enable_bias),
+        **common,
     )
 
-def compile_moe_gemm1(*, doweight_stage1, group_size=-1, use_cshuffle_epilog=None,
-                      k_batch=1, enable_bias=False, act="silu", **kw):
-    return _compile_moe_mxscale_gemm(
-        stage=1, doweight=doweight_stage1, k_batch=int(k_batch),
-        enable_bias=bool(enable_bias), act=str(act), **kw)
 
-def compile_moe_gemm2(*, doweight_stage2, accumulate=True, group_size=-1,
-                      use_cshuffle_epilog=None, enable_bias=False, **kw):
+def compile_moe_gemm1(
+    *,
+    doweight_stage1,
+    group_size=-1,
+    use_cshuffle_epilog=None,
+    k_batch=1,
+    enable_bias=False,
+    act="silu",
+    **kw,
+):
     return _compile_moe_mxscale_gemm(
-        stage=2, doweight=doweight_stage2, accumulate=accumulate,
-        enable_bias=bool(enable_bias), **kw)
+        stage=1,
+        doweight=doweight_stage1,
+        k_batch=int(k_batch),
+        enable_bias=bool(enable_bias),
+        act=str(act),
+        **kw,
+    )
 
-def compile_moe_gemm2_ex(*, mode=MoeGemm2Mode.ATOMIC, valid_mask=None, zero_intermediate=True, **kw):
+
+def compile_moe_gemm2(
+    *,
+    doweight_stage2,
+    accumulate=True,
+    group_size=-1,
+    use_cshuffle_epilog=None,
+    enable_bias=False,
+    **kw,
+):
+    return _compile_moe_mxscale_gemm(
+        stage=2,
+        doweight=doweight_stage2,
+        accumulate=accumulate,
+        enable_bias=bool(enable_bias),
+        **kw,
+    )
+
+
+def compile_moe_gemm2_ex(
+    *, mode=MoeGemm2Mode.ATOMIC, valid_mask=None, zero_intermediate=True, **kw
+):
     if mode == MoeGemm2Mode.REDUCE:
         gemm2_exe = compile_moe_gemm2(accumulate=False, **kw)
         out_s = str(kw.get("out_dtype", "f16")).strip().lower()
@@ -3740,13 +4257,18 @@ def compile_moe_gemm2_ex(*, mode=MoeGemm2Mode.ATOMIC, valid_mask=None, zero_inte
         else:
             dtype_str = "f32"
         reduce_exe = compile_moe_reduction(
-            topk=kw["topk"], model_dim=kw["model_dim"],
-            dtype_str=dtype_str, use_mask=(valid_mask is not None),
+            topk=kw["topk"],
+            model_dim=kw["model_dim"],
+            dtype_str=dtype_str,
+            use_mask=(valid_mask is not None),
         )
         from kernels.moe_gemm_2stage import _MoeGemm2ReduceWrapper
+
         return _MoeGemm2ReduceWrapper(
-            gemm2_exe=gemm2_exe, reduce_exe=reduce_exe,
-            topk=kw["topk"], model_dim=kw["model_dim"],
+            gemm2_exe=gemm2_exe,
+            reduce_exe=reduce_exe,
+            topk=kw["topk"],
+            model_dim=kw["model_dim"],
             out_dtype_str=dtype_str,
             use_mask=(valid_mask is not None),
             zero_intermediate=zero_intermediate,

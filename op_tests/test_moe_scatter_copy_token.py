@@ -38,12 +38,12 @@ WARP_TILE_M = 16  # tile_m // m_warp in the grouped a8w4/a4w4 path
 # optimized FlyDSL kernel must reproduce, byte for byte.
 # ---------------------------------------------------------------------------
 def ref_moe_scatter_copy_token(
-    a1_payload,          # (token_num, Wp) uint8
-    a1_scale_token_u8,   # (token_num, Ws) uint8 or None
-    flat_experts,        # (token_num*topk,) long
-    flat_tokens,         # (token_num*topk,) long
-    flat_weights,        # (token_num*topk,) dtype
-    counts,              # (E,)
+    a1_payload,  # (token_num, Wp) uint8
+    a1_scale_token_u8,  # (token_num, Ws) uint8 or None
+    flat_experts,  # (token_num*topk,) long
+    flat_tokens,  # (token_num*topk,) long
+    flat_weights,  # (token_num*topk,) dtype
+    counts,  # (E,)
     E,
     max_m,
 ):
@@ -133,8 +133,10 @@ def _build_routing(token_num, topk, E_total, ep, model_dim, fp4, dtype, seed):
     assert topk <= E_local, f"need topk<=E_local, got topk={topk} E_local={E_local}"
 
     topk_ids = torch.stack(
-        [torch.randperm(E_local, generator=gen, device="cuda")[:topk]
-         for _ in range(token_num)]
+        [
+            torch.randperm(E_local, generator=gen, device="cuda")[:topk]
+            for _ in range(token_num)
+        ]
     ).to(torch.long)
     topk_weight = torch.rand(
         (token_num, topk), generator=gen, device="cuda", dtype=torch.float32
@@ -148,32 +150,64 @@ def _build_routing(token_num, topk, E_total, ep, model_dim, fp4, dtype, seed):
     max_m = int(counts.max().item()) if counts.numel() else 0
     max_m = max(WARP_TILE_M, ((max_m + WARP_TILE_M - 1) // WARP_TILE_M) * WARP_TILE_M)
 
-    Wp = (model_dim // 2) if fp4 else model_dim   # a4w4 packs 2 fp4 per byte
-    Ws = model_dim // 32                          # per-32 e8m0 scale, 1 byte each
-    a1_payload = torch.randint(0, 256, (token_num, Wp), dtype=torch.uint8, device="cuda")
+    Wp = (model_dim // 2) if fp4 else model_dim  # a4w4 packs 2 fp4 per byte
+    Ws = model_dim // 32  # per-32 e8m0 scale, 1 byte each
+    a1_payload = torch.randint(
+        0, 256, (token_num, Wp), dtype=torch.uint8, device="cuda"
+    )
     a1_scale = torch.randint(0, 256, (token_num, Ws), dtype=torch.uint8, device="cuda")
-    return (a1_payload, a1_scale, topk_ids, topk_weight, flat_experts,
-            flat_tokens, flat_weights, counts, E_local, max_m)
+    return (
+        a1_payload,
+        a1_scale,
+        topk_ids,
+        topk_weight,
+        flat_experts,
+        flat_tokens,
+        flat_weights,
+        counts,
+        E_local,
+        max_m,
+    )
 
 
 def _run_one(token_num, topk, E_total, ep, model_dim, fp4, dtype, seed=0, name=""):
-    (a1_payload, a1_scale, topk_ids, topk_weight, flat_experts,
-     flat_tokens, flat_weights, counts, E_local, max_m) = _build_routing(
-        token_num, topk, E_total, ep, model_dim, fp4, dtype, seed
-    )
+    (
+        a1_payload,
+        a1_scale,
+        topk_ids,
+        topk_weight,
+        flat_experts,
+        flat_tokens,
+        flat_weights,
+        counts,
+        E_local,
+        max_m,
+    ) = _build_routing(token_num, topk, E_total, ep, model_dim, fp4, dtype, seed)
 
     # reference: per-expert copy loop using flat routing
     ref = ref_moe_scatter_copy_token(
-        a1_payload, a1_scale, flat_experts, flat_tokens, flat_weights,
-        counts, E_local, max_m,
+        a1_payload,
+        a1_scale,
+        flat_experts,
+        flat_tokens,
+        flat_weights,
+        counts,
+        E_local,
+        max_m,
     )
     # optimized: scatter-copy is a pure copy driven by rows_to_tokens (the inverse
     # of the deterministic topids_to_rows). It produces only grouped_a1 +
     # a1_scale_raw (route_tokens/route_weights are not its job anymore).
     topids_to_rows = build_topids_to_rows(topk_ids, max_m, E_local)
-    rows_to_tokens = _rows_to_tokens_from(topids_to_rows, token_num, topk, E_local, max_m)
+    rows_to_tokens = _rows_to_tokens_from(
+        topids_to_rows, token_num, topk, E_local, max_m
+    )
     opt = flydsl_moe_scatter_copy_token(
-        a1_payload, a1_scale, rows_to_tokens, E_local, max_m,
+        a1_payload,
+        a1_scale,
+        rows_to_tokens,
+        E_local,
+        max_m,
     )
     torch.cuda.synchronize()
 
@@ -214,23 +248,43 @@ def _run_perf(args):
 
     token_num = args.tokens[0] if args.tokens else 1
     dtype = torch.bfloat16
-    (a1_payload, a1_scale, topk_ids, topk_weight, _fe, _ft, _fw,
-     counts, E_local, max_m) = _build_routing(
+    (
+        a1_payload,
+        a1_scale,
+        topk_ids,
+        topk_weight,
+        _fe,
+        _ft,
+        _fw,
+        counts,
+        E_local,
+        max_m,
+    ) = _build_routing(
         token_num, args.topk, args.E, 1, args.model_dim, args.fp4, dtype, 0
     )
     Wp, Ws = a1_payload.shape[1], a1_scale.shape[1]
     # Pre-allocated output buffers (as fused_moe passes them): kernel writes only
     # valid rows, so a1_scale_raw padding stays 127.
     grouped_a1 = torch.zeros((E_local, max_m, Wp), dtype=torch.uint8, device="cuda")
-    a1_scale_raw = torch.full((E_local, max_m, Ws), 127, dtype=torch.uint8, device="cuda")
+    a1_scale_raw = torch.full(
+        (E_local, max_m, Ws), 127, dtype=torch.uint8, device="cuda"
+    )
 
     topids_to_rows = build_topids_to_rows(topk_ids, max_m, E_local)
-    rows_to_tokens = _rows_to_tokens_from(topids_to_rows, token_num, args.topk, E_local, max_m)
+    rows_to_tokens = _rows_to_tokens_from(
+        topids_to_rows, token_num, args.topk, E_local, max_m
+    )
+
     # Profile the scatter-copy launch (maps precomputed, as in fused_moe).
     def bench():
         return flydsl_moe_scatter_copy_token(
-            a1_payload, a1_scale, rows_to_tokens, E_local, max_m,
-            grouped_a1=grouped_a1, a1_scale_raw=a1_scale_raw,
+            a1_payload,
+            a1_scale,
+            rows_to_tokens,
+            E_local,
+            max_m,
+            grouped_a1=grouped_a1,
+            a1_scale_raw=a1_scale_raw,
         )
 
     print(
@@ -239,7 +293,10 @@ def _run_perf(args):
         f"-> profiling build_topids_to_rows + scatter_copy"
     )
     _, avg_us = run_perftest(
-        bench, num_iters=args.iters, num_warmup=10, num_rotate_args=1,
+        bench,
+        num_iters=args.iters,
+        num_warmup=10,
+        num_rotate_args=1,
     )
     print(
         f"\n[run_perftest] avg device time: {avg_us:.1f} us/iter "
@@ -254,12 +311,17 @@ def main():
     ap.add_argument("--skip-generic", action="store_true")
     # --perf: profile flydsl_moe_scatter_copy_token with run_perftest and dump
     # the per-op breakdown (host-side hot loop) via AITER_LOG_MORE.
-    ap.add_argument("--perf", action="store_true",
-                    help="profile the scatter-copy hot loop instead of correctness")
+    ap.add_argument(
+        "--perf",
+        action="store_true",
+        help="profile the scatter-copy hot loop instead of correctness",
+    )
     ap.add_argument("--E", type=int, default=32, help="[--perf] experts")
     ap.add_argument("--topk", type=int, default=8, help="[--perf] topk")
     ap.add_argument("--model-dim", type=int, default=4096, help="[--perf] model dim")
-    ap.add_argument("--fp4", action="store_true", help="[--perf] a4w4 payload (Wp=dim/2)")
+    ap.add_argument(
+        "--fp4", action="store_true", help="[--perf] a4w4 payload (Wp=dim/2)"
+    )
     ap.add_argument("--iters", type=int, default=50, help="[--perf] run_perftest iters")
     args = ap.parse_args()
 
@@ -278,14 +340,14 @@ def main():
     # scale widths, a8w4 + a4w4 payloads, single rank.
     if not args.skip_generic:
         for tn in [1, 7, 128]:
-            for (E, topk) in [(8, 1), (8, 2), (32, 8)]:
+            for E, topk in [(8, 1), (8, 2), (32, 8)]:
                 # 512 -> Ws=16 (dword); 2880 -> Ws=90 (byte tail)
                 for model_dim in [512, 2880]:
                     for fp4 in (False, True):
                         configs.append((tn, topk, E, 1, model_dim, fp4, "generic"))
 
     # Real-world shapes at TP1 and TP8, decode + prefill batch, a8w4 + a4w4.
-    for (name, hidden, E_total, topk) in REAL_MODELS:
+    for name, hidden, E_total, topk in REAL_MODELS:
         for tp in tps:
             for tn in tokens:
                 for fp4 in (False, True):

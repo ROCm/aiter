@@ -48,12 +48,13 @@ def build_moe_route_maps_module():
     One pass: ``topids_to_rows[i] = slot + e*max_m`` (route -> grouped row) and
     its inverse ``rows_to_tokens[row] = i // topk`` (grouped row -> token).
     """
+
     @flyc.kernel(name="moe_route_maps")
     def route_maps_kernel(
-        topk_ids: fx.Tensor,       # (numel,) int32
+        topk_ids: fx.Tensor,  # (numel,) int32
         atomic_buffer: fx.Tensor,  # (E,) int32, init 0
-        topids_to_rows: fx.Tensor,          # (numel,) int32 out: route -> grouped row
-        rows_to_tokens: fx.Tensor,          # (E*max_m,) int32 out: grouped row -> token
+        topids_to_rows: fx.Tensor,  # (numel,) int32 out: route -> grouped row
+        rows_to_tokens: fx.Tensor,  # (E*max_m,) int32 out: grouped row -> token
         numel: Int32,
         topk: Int32,
         max_m: Int32,
@@ -114,7 +115,9 @@ def build_moe_route_maps_module():
             pass
 
         gx = arith.index_cast(T.index, grid_blocks)
-        route_maps_kernel(topk_ids, atomic_buffer, topids_to_rows, rows_to_tokens, numel, topk, max_m).launch(
+        route_maps_kernel(
+            topk_ids, atomic_buffer, topids_to_rows, rows_to_tokens, numel, topk, max_m
+        ).launch(
             grid=(gx, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,

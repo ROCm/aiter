@@ -671,8 +671,8 @@ def _run_compiled(exe, args):
 
 _MXSCALE_FORMAT_PACK = {
     # in_dtype: (pack_a, pack_b, weight_is_preshuffled)
-    "fp4":  (2, 2, False),
-    "fp8":  (1, 1, True),
+    "fp4": (2, 2, False),
+    "fp8": (1, 1, True),
     "a8w4": (1, 2, True),
 }
 
@@ -725,7 +725,9 @@ def _mxscale_pad_cache_put(key, value):
         # Too big to cache without blowing the budget; skip entirely.
         return
     # Evict oldest entries (FIFO) until the new one fits within the byte budget.
-    while (_MXSCALE_PAD_CACHE_BYTES + nbytes) > _MXSCALE_PAD_CACHE_MAX_BYTES and _MXSCALE_PAD_CACHE:
+    while (
+        _MXSCALE_PAD_CACHE_BYTES + nbytes
+    ) > _MXSCALE_PAD_CACHE_MAX_BYTES and _MXSCALE_PAD_CACHE:
         oldest_key = next(iter(_MXSCALE_PAD_CACHE))
         evicted = _MXSCALE_PAD_CACHE.pop(oldest_key)
         _MXSCALE_PAD_CACHE_BYTES -= int(evicted.numel()) * int(evicted.element_size())
@@ -737,8 +739,9 @@ def _mxscale_align_up(x: int, align: int) -> int:
     return ((int(x) + int(align) - 1) // int(align)) * int(align)
 
 
-def _mxscale_pick_tile_n(default_tile_n: int, *required_divisors: int,
-                         in_dtype: str = "fp8", align: int = 16) -> int:
+def _mxscale_pick_tile_n(
+    default_tile_n: int, *required_divisors: int, in_dtype: str = "fp8", align: int = 16
+) -> int:
     """Largest tile_n <= default_tile_n that divides every N dim in
     ``required_divisors`` and is a multiple of ``align`` (bumped to 32 for
     fp4, which uses WMMA_N_EFF=32).
@@ -759,8 +762,9 @@ def _mxscale_pick_tile_n(default_tile_n: int, *required_divisors: int,
     return align
 
 
-def _mxscale_zero_pad_last(t: torch.Tensor, delta: int, value: int = 0,
-                            cache: bool = False) -> torch.Tensor:
+def _mxscale_zero_pad_last(
+    t: torch.Tensor, delta: int, value: int = 0, cache: bool = False
+) -> torch.Tensor:
     """Append ``delta`` elements of ``value`` along the last dim (default 0).
 
     ``torch.nn.functional.pad`` does not implement some 1-byte float dtypes
@@ -793,9 +797,9 @@ def _mxscale_zero_pad_last(t: torch.Tensor, delta: int, value: int = 0,
     return padded
 
 
-def _mxscale_pad_weight_k(w: torch.Tensor, delta_bytes: int,
-                          weight_is_preshuffled: bool,
-                          cache: bool = True) -> torch.Tensor:
+def _mxscale_pad_weight_k(
+    w: torch.Tensor, delta_bytes: int, weight_is_preshuffled: bool, cache: bool = True
+) -> torch.Tensor:
     """Zero-pad a weight tensor of shape ``(E, N, K/pack_b)`` on the K-byte
     (last) dim.
 
@@ -836,9 +840,7 @@ def _mxscale_pad_weight_k(w: torch.Tensor, delta_bytes: int,
     # tile-columns along the K-tile dim (dim 2).
     tile_view = w_u8.view(E, N // 16, K_old // 16, 16, 16)
     delta_tiles = int(delta_bytes) // 16
-    padded = torch.nn.functional.pad(
-        tile_view, (0, 0, 0, 0, 0, delta_tiles)
-    )
+    padded = torch.nn.functional.pad(tile_view, (0, 0, 0, 0, 0, delta_tiles))
     padded = padded.contiguous().view(E, N, K_old + int(delta_bytes))
     if padded.dtype != orig_dtype:
         padded = padded.view(orig_dtype)
@@ -1568,8 +1570,8 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
 
 def flydsl_moe_gather_reduce(
     grouped_out: torch.Tensor,  # (E, max_m, model_dim) bf16/f16
-    topids_to_rows: torch.Tensor,     # (token_num, topk) int32 grouped flat rows
-    gather_w: torch.Tensor,     # (token_num, topk) weight, bf16/f16 (== grouped_out dtype)
+    topids_to_rows: torch.Tensor,  # (token_num, topk) int32 grouped flat rows
+    gather_w: torch.Tensor,  # (token_num, topk) weight, bf16/f16 (== grouped_out dtype)
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """One-pass gather-reduce epilogue. Thin launcher over a *precomputed* gather
@@ -1637,12 +1639,12 @@ def _get_compiled_scatter_copy(row_bytes: int):
 
 
 def flydsl_moe_scatter_copy_token(
-    a1_payload: torch.Tensor,                  # (token_num, Wp) uint8
-    a1_scale_token_u8: Optional[torch.Tensor], # (token_num, Ws) uint8 or None
-    rows_to_tokens: torch.Tensor,              # (E*max_m,) int32 grouped row -> token (-1 pad)
+    a1_payload: torch.Tensor,  # (token_num, Wp) uint8
+    a1_scale_token_u8: Optional[torch.Tensor],  # (token_num, Ws) uint8 or None
+    rows_to_tokens: torch.Tensor,  # (E*max_m,) int32 grouped row -> token (-1 pad)
     E: int,
     max_m: int,
-    grouped_a1: Optional[torch.Tensor] = None,    # (E, max_m, Wp) uint8 out
+    grouped_a1: Optional[torch.Tensor] = None,  # (E, max_m, Wp) uint8 out
     a1_scale_raw: Optional[torch.Tensor] = None,  # (E, max_m, Ws) uint8 out
 ):
     """Copy each token's payload (and per-token scale) into the grouped layout,

@@ -46,8 +46,9 @@ def _pick_fp4_warp_shape(tile_m: int, tile_n: int) -> tuple[int, int]:
     )
 
 
-def _pick_fp16_single_launch_shape(route_tile_m: int, route_tile_n: int,
-                                    max_total_warps: int = 0) -> tuple[int, int, int, int]:
+def _pick_fp16_single_launch_shape(
+    route_tile_m: int, route_tile_n: int, max_total_warps: int = 0
+) -> tuple[int, int, int, int]:
     """Pick launch shape for fp16 stage1 single-kernel path.
 
     Single-kernel path should follow route tile size (not backend-expanded 128x*)
@@ -87,25 +88,37 @@ def _bf16_to_f16_wrapper(fp16_exe, x_arg: int, w_arg: int):
     def wrapper(*args, **kwargs):
         args = list(args)
         for idx in (x_arg, w_arg):
-            if idx < len(args) and hasattr(args[idx], 'dtype') and args[idx].dtype == torch.bfloat16:
+            if (
+                idx < len(args)
+                and hasattr(args[idx], "dtype")
+                and args[idx].dtype == torch.bfloat16
+            ):
                 args[idx] = args[idx].to(torch.float16)
         return fp16_exe(*args, **kwargs)
 
-    for attr in ('mode',):
+    for attr in ("mode",):
         if hasattr(fp16_exe, attr):
             setattr(wrapper, attr, getattr(fp16_exe, attr))
     return wrapper
 
 
-def _pick_mxscale_launch_shape(data_format: str, route_tile_m: int, tile_n: int) -> tuple[int, int, int, int]:
+def _pick_mxscale_launch_shape(
+    data_format: str, route_tile_m: int, tile_n: int
+) -> tuple[int, int, int, int]:
     if data_format not in ("fp4", "fp8", "a8w4"):
-        raise ValueError(f"data_format must be 'fp4', 'fp8', or 'a8w4', got {data_format!r}")
+        raise ValueError(
+            f"data_format must be 'fp4', 'fp8', or 'a8w4', got {data_format!r}"
+        )
     if data_format == "fp4":
         single_tile_m = _align_up(int(route_tile_m), 16)
         single_tile_n = _align_up(int(tile_n), 32)
-        single_m_warp, single_n_warp = _pick_fp4_warp_shape(single_tile_m, single_tile_n)
+        single_m_warp, single_n_warp = _pick_fp4_warp_shape(
+            single_tile_m, single_tile_n
+        )
         return single_tile_m, single_tile_n, single_m_warp, single_n_warp
-    return _pick_fp16_single_launch_shape(int(route_tile_m), int(tile_n), max_total_warps=8)
+    return _pick_fp16_single_launch_shape(
+        int(route_tile_m), int(tile_n), max_total_warps=8
+    )
 
 
 def _make_moe_wave_layout(*, m_warp: int, n_warp: int, WAVE_SIZE: int, fx):
@@ -123,7 +136,9 @@ def _make_wmma_sub_tiles(
         for wn in range(wmma_n_rep):
             if is_fp4:
                 for half in range(2):
-                    sub_tiles.append((wm * wmma_n_rep + wn, half * 8, wm * WMMA_M, wn * 2 + half))
+                    sub_tiles.append(
+                        (wm * wmma_n_rep + wn, half * 8, wm * WMMA_M, wn * 2 + half)
+                    )
             else:
                 sub_tiles.append((wm * wmma_n_rep + wn, 0, wm * WMMA_M, wn))
     return sub_tiles
@@ -139,8 +154,20 @@ def _extract_sub8(acc, vec_base: int, *, vector, range_constexpr, ACC_VEC_SIZE: 
     return vector.shuffle(acc, acc, [vec_base + i for i in range_constexpr(8)])
 
 
-def _finalize_alloc_and_launch_2d(*, ctx, alloc, launcher, gx, gy, block_threads: int, stream, waves_per_eu, ir,
-                                  cluster=None, gz=1):
+def _finalize_alloc_and_launch_2d(
+    *,
+    ctx,
+    alloc,
+    launcher,
+    gx,
+    gy,
+    block_threads: int,
+    stream,
+    waves_per_eu,
+    ir,
+    cluster=None,
+    gz=1,
+):
     with ir.InsertionPoint(ctx.gpu_module_body):
         alloc.finalized = False
         alloc.finalize()
@@ -152,7 +179,8 @@ def _finalize_alloc_and_launch_2d(*, ctx, alloc, launcher, gx, gy, block_threads
                 )
             if cluster is not None:
                 op.attributes["rocdl.cluster_dims"] = ir.StringAttr.get(
-                    f"{cluster[0]},{cluster[1]},{cluster[2]}")
+                    f"{cluster[0]},{cluster[1]},{cluster[2]}"
+                )
     launcher.launch(
         grid=(gx, gy, gz),
         block=(block_threads, 1, 1),
@@ -248,11 +276,17 @@ def _emit_stage1_gate_up_epilogue(
     _use_bias = bias_rsrc is not None and eid_i32 is not None
     _use_swiglu = str(act_kind).lower() == "swiglu"
     if _use_swiglu and rocdl is None:
-        raise ValueError("_emit_stage1_gate_up_epilogue: act_kind='swiglu' requires rocdl")
+        raise ValueError(
+            "_emit_stage1_gate_up_epilogue: act_kind='swiglu' requires rocdl"
+        )
     c_topk_i32 = arith.constant(int(topk), type=T.i32)
     c2_n_i32 = arith.constant(2, type=T.i32)
-    default_block_row_start = arith.index_cast(T.i32, by * arith.index(int(route_tile_m)))
-    row_base_i32 = block_row_start if block_row_start is not None else default_block_row_start
+    default_block_row_start = arith.index_cast(
+        T.i32, by * arith.index(int(route_tile_m))
+    )
+    row_base_i32 = (
+        block_row_start if block_row_start is not None else default_block_row_start
+    )
     if _use_bias:
         # Each expert's bias slab is (gate || up), 2*inter_dim f32 entries.
         # Index gate at column ``c`` as eid * 2*inter + c, and up as
@@ -272,7 +306,9 @@ def _emit_stage1_gate_up_epilogue(
         if num_valid_i32 is None:
             row_ok_meta = row_in_route
         else:
-            row_in_valid = arith.cmpi(arith.CmpIPredicate.slt, sorted_i32, num_valid_i32)
+            row_in_valid = arith.cmpi(
+                arith.CmpIPredicate.slt, sorted_i32, num_valid_i32
+            )
             row_ok_meta = arith.andi(row_in_route, row_in_valid)
         sorted_safe = arith.select(
             row_ok_meta,
@@ -282,15 +318,27 @@ def _emit_stage1_gate_up_epilogue(
         if _use_lds:
             fused = memref.load(lds_tid, [row_local])
         else:
-            fused = buffer_ops.buffer_load(sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32)
+            fused = buffer_ops.buffer_load(
+                sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32
+            )
         tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
         slot = fused >> arith.constant(24, type=T.i32)
         tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
-        slot_ok0 = arith.cmpi(arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32))
-        slot_ok1 = arith.cmpi(arith.CmpIPredicate.slt, slot, arith.constant(int(topk), type=T.i32))
-        row_ok = arith.andi(row_ok_meta, arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1)))
+        slot_ok0 = arith.cmpi(
+            arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32)
+        )
+        slot_ok1 = arith.cmpi(
+            arith.CmpIPredicate.slt, slot, arith.constant(int(topk), type=T.i32)
+        )
+        row_ok = arith.andi(
+            row_ok_meta, arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
+        )
         sub8g, sub8u = load_gate_up_sub8(acc_idx, vec_base)
-        tw = buffer_ops.buffer_load(tw_rsrc, sorted_safe, vec_width=1, dtype=T.f32) if bool(doweight_stage1) else arith.constant(1.0, type=T.f32)
+        tw = (
+            buffer_ops.buffer_load(tw_rsrc, sorted_safe, vec_width=1, dtype=T.f32)
+            if bool(doweight_stage1)
+            else arith.constant(1.0, type=T.f32)
+        )
         col_base = blk_n + warp_n_base + fx.Index(wn * WMMA_N) + lane_kgrp * fx.Index(8)
         for vi in range_constexpr(8):
             col = col_base + fx.Index(vi)
@@ -303,11 +351,14 @@ def _emit_stage1_gate_up_epilogue(
                 vu = vector.extract(sub8u, static_position=[vi], dynamic_position=[])
                 if _use_bias:
                     bg = buffer_ops.buffer_load(
-                        bias_rsrc, bias_row_base_i32 + col_i32,
-                        vec_width=1, dtype=T.f32)
+                        bias_rsrc, bias_row_base_i32 + col_i32, vec_width=1, dtype=T.f32
+                    )
                     bu = buffer_ops.buffer_load(
-                        bias_rsrc, bias_row_base_i32 + i32_inter_in + col_i32,
-                        vec_width=1, dtype=T.f32)
+                        bias_rsrc,
+                        bias_row_base_i32 + i32_inter_in + col_i32,
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
                     vg = vg + bg
                     vu = vu + bu
                 if _use_swiglu:
@@ -317,8 +368,7 @@ def _emit_stage1_gate_up_epilogue(
                 if bool(doweight_stage1):
                     y = y * tw
                 out_v = arith.trunc_f(out_elem_ty, y)
-                out_idx = ((tok * c_topk_i32 + slot) * i32_inter_in
-                           + col_i32)
+                out_idx = (tok * c_topk_i32 + slot) * i32_inter_in + col_i32
                 buffer_ops.buffer_store(out_v, out_rsrc, out_idx)
                 scf.YieldOp([])
 
@@ -386,9 +436,13 @@ def _emit_stage1_gate_up_splitk_epilogue(
     mask_even_i32 = arith.constant(0xFFFFFFFE, type=T.i32)
 
     def atomic_add_x2(val_x2, byte_off_i32):
-        rocdl.raw_ptr_buffer_atomic_fadd(val_x2, out_rsrc, byte_off_i32, zero_i32, zero_i32)
+        rocdl.raw_ptr_buffer_atomic_fadd(
+            val_x2, out_rsrc, byte_off_i32, zero_i32, zero_i32
+        )
 
-    inter_stride_i32 = i32_inter_in * c2_i32  # row stride for [tokens*topk, 2*inter_dim]
+    inter_stride_i32 = (
+        i32_inter_in * c2_i32
+    )  # row stride for [tokens*topk, 2*inter_dim]
     if _use_bias:
         # Each expert's bias slab is gate||up = 2*inter_dim f32 entries.
         # Per-K-slice bias contribution must be scaled by 1/k_batch so the
@@ -416,13 +470,19 @@ def _emit_stage1_gate_up_splitk_epilogue(
         if _use_lds:
             fused = memref.load(lds_tid, [row_local])
         else:
-            fused = buffer_ops.buffer_load(sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32)
+            fused = buffer_ops.buffer_load(
+                sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32
+            )
         tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
         slot = fused >> arith.constant(24, type=T.i32)
         tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
-        slot_ok0 = arith.cmpi(arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32))
+        slot_ok0 = arith.cmpi(
+            arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32)
+        )
         slot_ok1 = arith.cmpi(arith.CmpIPredicate.slt, slot, c_topk_i32)
-        row_ok = arith.andi(row_ok_meta, arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1)))
+        row_ok = arith.andi(
+            row_ok_meta, arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
+        )
 
         sub8g, sub8u = load_gate_up_sub8(acc_idx, vec_base)
         col_base = blk_n + warp_n_base + fx.Index(wn * WMMA_N) + lane_kgrp * fx.Index(8)
@@ -445,12 +505,24 @@ def _emit_stage1_gate_up_splitk_epilogue(
                 vg1 = vector.extract(sub8g, static_position=[vi1], dynamic_position=[])
                 vg1 = arith.select(col1_ok, vg1, arith.constant(0.0, type=T.f32))
                 if _use_bias:
-                    bg0 = buffer_ops.buffer_load(
-                        bias_rsrc, bias_row_base_i32 + col0_i32,
-                        vec_width=1, dtype=T.f32) * bias_scale_const
-                    bg1 = buffer_ops.buffer_load(
-                        bias_rsrc, bias_row_base_i32 + col1_i32,
-                        vec_width=1, dtype=T.f32) * bias_scale_const
+                    bg0 = (
+                        buffer_ops.buffer_load(
+                            bias_rsrc,
+                            bias_row_base_i32 + col0_i32,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                        * bias_scale_const
+                    )
+                    bg1 = (
+                        buffer_ops.buffer_load(
+                            bias_rsrc,
+                            bias_row_base_i32 + col1_i32,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                        * bias_scale_const
+                    )
                     bg1 = arith.select(col1_ok, bg1, arith.constant(0.0, type=T.f32))
                     vg0 = vg0 + bg0
                     vg1 = vg1 + bg1
@@ -467,12 +539,24 @@ def _emit_stage1_gate_up_splitk_epilogue(
                 vu1 = vector.extract(sub8u, static_position=[vi1], dynamic_position=[])
                 vu1 = arith.select(col1_ok, vu1, arith.constant(0.0, type=T.f32))
                 if _use_bias:
-                    bu0 = buffer_ops.buffer_load(
-                        bias_rsrc, bias_row_base_i32 + i32_inter_in + col0_i32,
-                        vec_width=1, dtype=T.f32) * bias_scale_const
-                    bu1 = buffer_ops.buffer_load(
-                        bias_rsrc, bias_row_base_i32 + i32_inter_in + col1_i32,
-                        vec_width=1, dtype=T.f32) * bias_scale_const
+                    bu0 = (
+                        buffer_ops.buffer_load(
+                            bias_rsrc,
+                            bias_row_base_i32 + i32_inter_in + col0_i32,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                        * bias_scale_const
+                    )
+                    bu1 = (
+                        buffer_ops.buffer_load(
+                            bias_rsrc,
+                            bias_row_base_i32 + i32_inter_in + col1_i32,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                        * bias_scale_const
+                    )
                     bu1 = arith.select(col1_ok, bu1, arith.constant(0.0, type=T.f32))
                     vu0 = vu0 + bu0
                     vu1 = vu1 + bu1
@@ -547,7 +631,9 @@ def _emit_stage2_store_epilogue(
     mask_even_i32 = arith.constant(0xFFFFFFFE, type=T.i32)
 
     def atomic_add_x2(val_x2, byte_off_i32):
-        rocdl.raw_ptr_buffer_atomic_fadd(val_x2, out_rsrc, byte_off_i32, zero_i32, zero_i32)
+        rocdl.raw_ptr_buffer_atomic_fadd(
+            val_x2, out_rsrc, byte_off_i32, zero_i32, zero_i32
+        )
 
     if _use_bias:
         # bias[e, n] f32; flat index = e * model_dim + n. Routing-weight
@@ -566,23 +652,37 @@ def _emit_stage2_store_epilogue(
         sorted_row = by * arith.index(int(tile_m)) + row_local
         row_i32 = arith.index_cast(T.i32, row_local)
         sorted_i32 = arith.index_cast(T.i32, sorted_row)
-        row_in_route = arith.cmpi(arith.CmpIPredicate.ult, row_i32, arith.constant(int(route_tile_m), type=T.i32))
+        row_in_route = arith.cmpi(
+            arith.CmpIPredicate.ult,
+            row_i32,
+            arith.constant(int(route_tile_m), type=T.i32),
+        )
         row_in_valid = arith.cmpi(arith.CmpIPredicate.slt, sorted_i32, num_valid_i32)
         row_ok = arith.andi(row_in_route, row_in_valid)
         sorted_safe = arith.select(row_ok, sorted_i32, block_row_start)
         if _use_lds:
             fused = memref.load(lds_tid, [row_local])
         else:
-            fused = buffer_ops.buffer_load(sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32)
+            fused = buffer_ops.buffer_load(
+                sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32
+            )
         tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
         slot = fused >> arith.constant(24, type=T.i32)
         tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
-        slot_ok0 = arith.cmpi(arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32))
+        slot_ok0 = arith.cmpi(
+            arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32)
+        )
         slot_ok1 = arith.cmpi(arith.CmpIPredicate.slt, slot, c_topk_i32)
-        row_store_ok = arith.andi(row_ok, arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1)))
+        row_store_ok = arith.andi(
+            row_ok, arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
+        )
         ts = tok * c_topk_i32 + slot
         sub8 = load_sub8(acc_idx, vec_base)
-        tw = buffer_ops.buffer_load(tw_rsrc, sorted_safe, vec_width=1, dtype=T.f32) if bool(doweight_stage2) else arith.constant(1.0, type=T.f32)
+        tw = (
+            buffer_ops.buffer_load(tw_rsrc, sorted_safe, vec_width=1, dtype=T.f32)
+            if bool(doweight_stage2)
+            else arith.constant(1.0, type=T.f32)
+        )
         col_base = blk_n + warp_n_base + fx.Index(wn * WMMA_N) + lane_kgrp * fx.Index(8)
         if bool(accumulate):
             for vpair in range_constexpr(4):
@@ -597,8 +697,12 @@ def _emit_stage2_store_epilogue(
                 out_ok = arith.andi(row_store_ok, col0_ok)
                 _if_out = scf.IfOp(out_ok)
                 with ir.InsertionPoint(_if_out.then_block):
-                    v0 = vector.extract(sub8, static_position=[vi0], dynamic_position=[])
-                    v1 = vector.extract(sub8, static_position=[vi1], dynamic_position=[])
+                    v0 = vector.extract(
+                        sub8, static_position=[vi0], dynamic_position=[]
+                    )
+                    v1 = vector.extract(
+                        sub8, static_position=[vi1], dynamic_position=[]
+                    )
                     if bool(doweight_stage2):
                         v0 = v0 * tw
                         v1 = v1 * tw
@@ -613,12 +717,24 @@ def _emit_stage2_store_epilogue(
                         # reference (bias added per slot, weight applied
                         # in stage1).
                         bias_w = bias_scale_const * tw
-                        b0 = buffer_ops.buffer_load(
-                            bias_rsrc, bias_row_base_i32 + col0_i32,
-                            vec_width=1, dtype=T.f32) * bias_w
-                        b1 = buffer_ops.buffer_load(
-                            bias_rsrc, bias_row_base_i32 + col1_i32,
-                            vec_width=1, dtype=T.f32) * bias_w
+                        b0 = (
+                            buffer_ops.buffer_load(
+                                bias_rsrc,
+                                bias_row_base_i32 + col0_i32,
+                                vec_width=1,
+                                dtype=T.f32,
+                            )
+                            * bias_w
+                        )
+                        b1 = (
+                            buffer_ops.buffer_load(
+                                bias_rsrc,
+                                bias_row_base_i32 + col1_i32,
+                                vec_width=1,
+                                dtype=T.f32,
+                            )
+                            * bias_w
+                        )
                         v0 = v0 + b0
                         v1 = v1 + b1
                     v1 = arith.select(col1_ok, v1, arith.constant(0.0, type=T.f32))
@@ -646,8 +762,11 @@ def _emit_stage2_store_epilogue(
                         # scales by ``tw`` to keep per-slot semantics
                         # consistent with torch_moe_stage2.
                         b = buffer_ops.buffer_load(
-                            bias_rsrc, bias_row_base_i32 + col_i32,
-                            vec_width=1, dtype=T.f32) * (bias_scale_const * tw)
+                            bias_rsrc,
+                            bias_row_base_i32 + col_i32,
+                            vec_width=1,
+                            dtype=T.f32,
+                        ) * (bias_scale_const * tw)
                         v = v + b
                     out_idx = ts * i32_n_in + col_i32
                     out_v = arith.trunc_f(out_elem_ty, v)
@@ -655,14 +774,18 @@ def _emit_stage2_store_epilogue(
                     scf.YieldOp([])
 
 
-def _pack_stage1_gate_up_tiles(tensor, *, experts: int, inter_dim: int, tile_n: int, cols: int):
+def _pack_stage1_gate_up_tiles(
+    tensor, *, experts: int, inter_dim: int, tile_n: int, cols: int
+):
     """Pack stage1 gate/up rows into [gate_tile0, up_tile0, gate_tile1, up_tile1, ...]."""
     import torch
 
     if tensor is None:
         return None
     if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"Expected torch.Tensor for stage1 gate/up packing, got {type(tensor)!r}")
+        raise TypeError(
+            f"Expected torch.Tensor for stage1 gate/up packing, got {type(tensor)!r}"
+        )
     if tensor.numel() == 0:
         return tensor
     elems_per_expert = int(2 * inter_dim) * int(cols)
@@ -681,9 +804,11 @@ def _pack_stage1_gate_up_tiles(tensor, *, experts: int, inter_dim: int, tile_n: 
         )
 
     tensor_3d = tensor.contiguous().view(int(experts), int(2 * inter_dim), int(cols))
-    gate = tensor_3d[:, :int(inter_dim), :]
-    up = tensor_3d[:, int(inter_dim):, :]
-    gate_tiles = gate.view(int(experts), int(inter_dim // tile_n), int(tile_n), int(cols))
+    gate = tensor_3d[:, : int(inter_dim), :]
+    up = tensor_3d[:, int(inter_dim) :, :]
+    gate_tiles = gate.view(
+        int(experts), int(inter_dim // tile_n), int(tile_n), int(cols)
+    )
     up_tiles = up.view(int(experts), int(inter_dim // tile_n), int(tile_n), int(cols))
     packed = torch.cat((gate_tiles, up_tiles), dim=2)
     return packed.view(expected_rows, int(cols))
@@ -715,7 +840,14 @@ class _Stage1GateUpPackedWrapper:
                 setattr(self, attr, getattr(stage1_exe, attr))
 
     def _get_packed_operands(self, arg_w, arg_scale_w):
-        key = (arg_w.data_ptr(), arg_scale_w.data_ptr() if hasattr(arg_scale_w, 'data_ptr') else id(arg_scale_w))
+        key = (
+            arg_w.data_ptr(),
+            (
+                arg_scale_w.data_ptr()
+                if hasattr(arg_scale_w, "data_ptr")
+                else id(arg_scale_w)
+            ),
+        )
         cached = self._cache.get(key)
         if cached is not None:
             return cached[0]
@@ -757,7 +889,9 @@ class _Stage1GateUpPackedWrapper:
 
 def _mxscale_format_config(data_format: str) -> dict[str, int | bool]:
     if data_format not in ("fp4", "fp8", "a8w4"):
-        raise ValueError(f"data_format must be 'fp4', 'fp8', or 'a8w4', got {data_format!r}")
+        raise ValueError(
+            f"data_format must be 'fp4', 'fp8', or 'a8w4', got {data_format!r}"
+        )
     is_fp4 = data_format == "fp4"
     is_a8w4 = data_format == "a8w4"
     pack_factor_a = 1 if not is_fp4 else 2
@@ -793,7 +927,9 @@ def _mxscale_precompute_preshuffled_b_data_bases(
     k_tile_off = lane_kgrp * arith.index(256)
     bases = []
     for wn in range_constexpr(wmma_n_rep):
-        ngroup_off = n_group_base * arith.index(ngroup_stride) + arith.index(wn * ngroup_stride)
+        ngroup_off = n_group_base * arith.index(ngroup_stride) + arith.index(
+            wn * ngroup_stride
+        )
         bases.append(ngroup_off + row_off + k_tile_off)
     return bases
 
@@ -952,6 +1088,7 @@ def _mxscale_lds_ptr(lds_buffer, byte_offset, *, ir, arith, T):
     from flydsl._mlir.dialects import llvm as _llvm, memref as _memref
     from flydsl.expr.arith import _to_raw as _raw
     from flydsl.expr.arith import ArithValue as _AV
+
     lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
     raw_memref = arith.unwrap(lds_buffer)
     lds_base = _memref.extract_aligned_pointer_as_index(raw_memref)
@@ -964,7 +1101,8 @@ def _mxscale_lds_load_b128(lds_buffer, byte_offset, *, ir, arith, T, llvm_dialec
     """Load a vec4<i32> (16 bytes) from LDS at the given byte offset."""
     ptr_val = _mxscale_lds_ptr(lds_buffer, byte_offset, ir=ir, arith=arith, T=T)
     return llvm_dialect.load(
-        ir.VectorType.get([4], ir.IntegerType.get_signless(32)), ptr_val,
+        ir.VectorType.get([4], ir.IntegerType.get_signless(32)),
+        ptr_val,
     )
 
 
@@ -1043,8 +1181,11 @@ def _mxscale_emit_wmma(
     if is_fp4:
         accs[idx] = rocdl.wmma_scale_f32_32x16x128_f4(
             T.vec(16, T.f32),
-            b_frags[wn], a_frag, accs[idx],
-            b_scales[wn * 2], a_scales[a_scale_idx],
+            b_frags[wn],
+            a_frag,
+            accs[idx],
+            b_scales[wn * 2],
+            a_scales[a_scale_idx],
             scaleAType=0,
             scaleBType=a_opsel,
         )
@@ -1058,8 +1199,11 @@ def _mxscale_emit_wmma(
         b_opsel = 0
     accs[idx] = rocdl.wmma_scale_f32_16x16x128_f8f6f4(
         T.vec(8, T.f32),
-        b_frags[wn], a_frag, accs[idx],
-        b_scales[b_scale_idx], a_scales[a_scale_idx],
+        b_frags[wn],
+        a_frag,
+        accs[idx],
+        b_scales[b_scale_idx],
+        a_scales[a_scale_idx],
         fmtA=4 if is_a8w4 else 0,
         fmtB=0,
         scaleAType=b_opsel,
@@ -1155,22 +1299,36 @@ def _compute_mxscale_tiling(
     interleaved_scale_cols_a = wmma_m_rep * scale_k_per_tile
 
     return dict(
-        is_fp4=is_fp4, is_a8w4=is_a8w4,
-        PACK_FACTOR_A=PACK_FACTOR_A, PACK_FACTOR_B=PACK_FACTOR_B,
-        ACC_VEC_SIZE=ACC_VEC_SIZE, WMMA_N_EFF=WMMA_N_EFF,
+        is_fp4=is_fp4,
+        is_a8w4=is_a8w4,
+        PACK_FACTOR_A=PACK_FACTOR_A,
+        PACK_FACTOR_B=PACK_FACTOR_B,
+        ACC_VEC_SIZE=ACC_VEC_SIZE,
+        WMMA_N_EFF=WMMA_N_EFF,
         DS_LOADS_PER_A_FRAG=DS_LOADS_PER_A_FRAG,
-        WMMA_M=WMMA_M, WMMA_N=WMMA_N, WMMA_K=WMMA_K,
-        SCALE_BLOCK=SCALE_BLOCK, SCALES_PER_WMMA=SCALES_PER_WMMA,
+        WMMA_M=WMMA_M,
+        WMMA_N=WMMA_N,
+        WMMA_K=WMMA_K,
+        SCALE_BLOCK=SCALE_BLOCK,
+        SCALES_PER_WMMA=SCALES_PER_WMMA,
         WAVE_SIZE=WAVE_SIZE,
-        LDS_PAD_A_BYTES=LDS_PAD_A_BYTES, LDS_PAD_B_BYTES=LDS_PAD_B_BYTES,
+        LDS_PAD_A_BYTES=LDS_PAD_A_BYTES,
+        LDS_PAD_B_BYTES=LDS_PAD_B_BYTES,
         use_cluster=use_cluster,
-        K=K, K_packed_a=K_packed_a, K_packed_b=K_packed_b,
-        packed_tile_k_a=packed_tile_k_a, packed_tile_k_b=packed_tile_k_b,
-        K_scale=K_scale, scale_k_per_tile=scale_k_per_tile,
+        K=K,
+        K_packed_a=K_packed_a,
+        K_packed_b=K_packed_b,
+        packed_tile_k_a=packed_tile_k_a,
+        packed_tile_k_b=packed_tile_k_b,
+        K_scale=K_scale,
+        scale_k_per_tile=scale_k_per_tile,
         block_threads=block_threads,
-        warp_tile_m=warp_tile_m, warp_tile_n=warp_tile_n,
-        wmma_m_rep=wmma_m_rep, wmma_n_rep=wmma_n_rep,
-        k_wmma_steps=k_wmma_steps, n_accs=n_accs,
+        warp_tile_m=warp_tile_m,
+        warp_tile_n=warp_tile_n,
+        wmma_m_rep=wmma_m_rep,
+        wmma_n_rep=wmma_n_rep,
+        k_wmma_steps=k_wmma_steps,
+        n_accs=n_accs,
         num_k_tiles=num_k_tiles,
         b_scale_load_rep=b_scale_load_rep,
         interleaved_scale_cols_b=interleaved_scale_cols_b,
@@ -1212,14 +1370,14 @@ def _compute_pipeline_plan(
     if bool(wave_specialized_tdm):
         if bool(use_tdm_gather):
             A_GATHER_TDM_PER_STEP = (
-                (A_GATHER_GROUPS + tdm_loader_waves - 1) // tdm_loader_waves
-            )
+                A_GATHER_GROUPS + tdm_loader_waves - 1
+            ) // tdm_loader_waves
         else:
             A_GATHER_TDM_PER_STEP = 0
         if bool(use_tdm_gather_as):
             AS_GATHER_TDM_PER_STEP = (
-                (AS_GATHER_GROUPS + tdm_loader_waves - 1) // tdm_loader_waves
-            )
+                AS_GATHER_GROUPS + tdm_loader_waves - 1
+            ) // tdm_loader_waves
         else:
             AS_GATHER_TDM_PER_STEP = 0
     else:
@@ -1229,8 +1387,7 @@ def _compute_pipeline_plan(
     fence_outstanding = TDM_PER_STEP * (int(num_buffers) - 2)
     base_tail_plan = make_tail_plan(int(num_buffers), pre_loaded, extra)
     tail_plan = [
-        (ls, cs, o * TDM_PER_STEP // 2 if o > 0 else o)
-        for ls, cs, o in base_tail_plan
+        (ls, cs, o * TDM_PER_STEP // 2 if o > 0 else o) for ls, cs, o in base_tail_plan
     ]
     if num_k_tiles < int(num_buffers):
         raise ValueError(
@@ -1315,87 +1472,143 @@ def _make_mxscale_data_loaders(
 
     def _lds_load_b128(lds_buffer, byte_offset):
         return _mxscale_lds_load_b128(
-            lds_buffer, byte_offset,
-            ir=ir, arith=arith, T=T, llvm_dialect=llvm_dialect,
+            lds_buffer,
+            byte_offset,
+            ir=ir,
+            arith=arith,
+            T=T,
+            llvm_dialect=llvm_dialect,
         )
 
     def load_data_frag(lds_buffer, lane_base, ks):
         return _mxscale_load_data_frag(
-            lds_buffer=lds_buffer, lane_base=lane_base, ks=ks,
-            PACK_FACTOR_A=PACK_FACTOR_A, WMMA_K=WMMA_K, is_fp4=is_fp4,
-            _lds_load_b128=_lds_load_b128, arith=arith, vector=vector,
+            lds_buffer=lds_buffer,
+            lane_base=lane_base,
+            ks=ks,
+            PACK_FACTOR_A=PACK_FACTOR_A,
+            WMMA_K=WMMA_K,
+            is_fp4=is_fp4,
+            _lds_load_b128=_lds_load_b128,
+            arith=arith,
+            vector=vector,
         )
 
     def load_b_frag(lds_buffer, b_lane_bases, wn, ks):
         if is_fp4:
             return _mxscale_load_rowmajor_b_frag(
-                lds_buffer=lds_buffer, b_lane_bases=b_lane_bases,
-                wn=wn, ks=ks,
-                PACK_FACTOR_B=PACK_FACTOR_B, WMMA_K=WMMA_K,
-                _lds_load_b128=_lds_load_b128, arith=arith, vector=vector,
+                lds_buffer=lds_buffer,
+                b_lane_bases=b_lane_bases,
+                wn=wn,
+                ks=ks,
+                PACK_FACTOR_B=PACK_FACTOR_B,
+                WMMA_K=WMMA_K,
+                _lds_load_b128=_lds_load_b128,
+                arith=arith,
+                vector=vector,
             )
         return _mxscale_load_preshuffled_b_frag(
-            lds_buffer=lds_buffer, b_lane_bases=b_lane_bases,
-            wn=wn, ks=ks,
-            is_fp4=is_fp4, is_a8w4=is_a8w4,
-            PACK_FACTOR_B=PACK_FACTOR_B, WMMA_K=WMMA_K,
-            _lds_load_b128=_lds_load_b128, arith=arith, vector=vector,
+            lds_buffer=lds_buffer,
+            b_lane_bases=b_lane_bases,
+            wn=wn,
+            ks=ks,
+            is_fp4=is_fp4,
+            is_a8w4=is_a8w4,
+            PACK_FACTOR_B=PACK_FACTOR_B,
+            WMMA_K=WMMA_K,
+            _lds_load_b128=_lds_load_b128,
+            arith=arith,
+            vector=vector,
         )
 
     def load_scale_i32(lds_buffer, scale_base, ks):
         return _mxscale_load_scale_i32(
-            lds_buffer=lds_buffer, scale_base=scale_base, ks=ks,
+            lds_buffer=lds_buffer,
+            scale_base=scale_base,
+            ks=ks,
             SCALES_PER_WMMA=SCALES_PER_WMMA,
-            llvm_dialect=llvm_dialect, ir=ir, arith=arith, T=T,
+            llvm_dialect=llvm_dialect,
+            ir=ir,
+            arith=arith,
+            T=T,
         )
 
     def _precompute_a_data_bases():
         return _mxscale_precompute_a_data_bases(
-            warp_m_base=warp_m_base, lane16=lane16, lane_kgrp=lane_kgrp,
-            lds_a_stride_bytes=lds_a_stride_bytes, wmma_m_rep=wmma_m_rep,
-            WMMA_M=WMMA_M, is_fp4=is_fp4,
-            arith=arith, range_constexpr=range_constexpr,
+            warp_m_base=warp_m_base,
+            lane16=lane16,
+            lane_kgrp=lane_kgrp,
+            lds_a_stride_bytes=lds_a_stride_bytes,
+            wmma_m_rep=wmma_m_rep,
+            WMMA_M=WMMA_M,
+            is_fp4=is_fp4,
+            arith=arith,
+            range_constexpr=range_constexpr,
         )
 
     def _precompute_b_data_bases():
         if is_fp4:
             return _mxscale_precompute_rowmajor_b_data_bases(
-                warp_n_base=warp_n_base, lane16=lane16, lane_kgrp=lane_kgrp,
-                lds_b_stride_bytes=lds_b_stride_bytes, wmma_n_rep=wmma_n_rep,
-                WMMA_N=WMMA_N, arith=arith, range_constexpr=range_constexpr,
+                warp_n_base=warp_n_base,
+                lane16=lane16,
+                lane_kgrp=lane_kgrp,
+                lds_b_stride_bytes=lds_b_stride_bytes,
+                wmma_n_rep=wmma_n_rep,
+                WMMA_N=WMMA_N,
+                arith=arith,
+                range_constexpr=range_constexpr,
             )
         return _mxscale_precompute_preshuffled_b_data_bases(
-            packed_tile_k_b=packed_tile_k_b, warp_tile_n=warp_tile_n,
-            wave_n_idx=wave_n_idx, lane16=lane16, lane_kgrp=lane_kgrp,
-            wmma_n_rep=wmma_n_rep, arith=arith, range_constexpr=range_constexpr,
+            packed_tile_k_b=packed_tile_k_b,
+            warp_tile_n=warp_tile_n,
+            wave_n_idx=wave_n_idx,
+            lane16=lane16,
+            lane_kgrp=lane_kgrp,
+            wmma_n_rep=wmma_n_rep,
+            arith=arith,
+            range_constexpr=range_constexpr,
         )
 
     def _precompute_a_scale_lane_bases():
         if is_fp4:
             return _mxscale_precompute_rowmajor_scale_lane_bases(
-                warp_base=warp_m_base, lane16=lane16,
-                scale_k_per_tile=scale_k_per_tile, reps=wmma_m_rep,
-                WMMA_DIM=WMMA_M, arith=arith, range_constexpr=range_constexpr,
+                warp_base=warp_m_base,
+                lane16=lane16,
+                scale_k_per_tile=scale_k_per_tile,
+                reps=wmma_m_rep,
+                WMMA_DIM=WMMA_M,
+                arith=arith,
+                range_constexpr=range_constexpr,
             )
         return _mxscale_precompute_a_scale_lane_bases(
-            warp_m_base=warp_m_base, lane16=lane16,
+            warp_m_base=warp_m_base,
+            lane16=lane16,
             wmma_m_rep=wmma_m_rep,
-            interleaved_scale_cols_a=interleaved_scale_cols_a, arith=arith,
+            interleaved_scale_cols_a=interleaved_scale_cols_a,
+            arith=arith,
         )
 
     def _precompute_b_scale_lane_bases():
         return _mxscale_precompute_rowmajor_scale_lane_bases(
-            warp_base=warp_n_base, lane16=lane16,
-            scale_k_per_tile=scale_k_per_tile, reps=wmma_n_rep * 2,
-            WMMA_DIM=WMMA_N, arith=arith, range_constexpr=range_constexpr,
+            warp_base=warp_n_base,
+            lane16=lane16,
+            scale_k_per_tile=scale_k_per_tile,
+            reps=wmma_n_rep * 2,
+            WMMA_DIM=WMMA_N,
+            arith=arith,
+            range_constexpr=range_constexpr,
         )
 
     def load_scale_b128(lds_buffer, scale_base, reps, ks=0):
         return _mxscale_load_scale_b128(
-            lds_buffer=lds_buffer, scale_base=scale_base,
-            reps=reps, ks=ks, SCALES_PER_WMMA=SCALES_PER_WMMA,
+            lds_buffer=lds_buffer,
+            scale_base=scale_base,
+            reps=reps,
+            ks=ks,
+            SCALES_PER_WMMA=SCALES_PER_WMMA,
             _lds_load_b128=_lds_load_b128,
-            arith=arith, vector=vector, range_constexpr=range_constexpr,
+            arith=arith,
+            vector=vector,
+            range_constexpr=range_constexpr,
         )
 
     return dict(

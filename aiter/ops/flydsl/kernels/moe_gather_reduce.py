@@ -85,9 +85,8 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
     """
     assert model_dim % 2 == 0, "model_dim must be even (2 elems per dword)"
     assert out_dtype in ("bf16", "f16")
-    elem_bytes = 2
-    out_dwords = model_dim // 2            # dwords per output row
-    row_dwords = model_dim // 2            # dwords per grouped_out_flat row (same)
+    out_dwords = model_dim // 2  # dwords per output row
+    row_dwords = model_dim // 2  # dwords per grouped_out_flat row (same)
     DWORDS_PER_ITER = BLOCK_THREADS
 
     module_name = f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}"
@@ -95,9 +94,9 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
     @flyc.kernel(name=module_name)
     def moe_gather_reduce_kernel(
         grouped_out_flat: fx.Tensor,  # (E*max_m, model_dim) bf16/f16
-        topids_to_rows: fx.Tensor,          # (token_num, topk)    i32
-        gather_w: fx.Tensor,          # (token_num, topk)    bf16/f16 (== out_dtype)
-        out: fx.Tensor,               # (token_num, model_dim) bf16/f16
+        topids_to_rows: fx.Tensor,  # (token_num, topk)    i32
+        gather_w: fx.Tensor,  # (token_num, topk)    bf16/f16 (== out_dtype)
+        out: fx.Tensor,  # (token_num, model_dim) bf16/f16
         num_tokens: Int32,
     ):
         bid = fx.block_idx.x
