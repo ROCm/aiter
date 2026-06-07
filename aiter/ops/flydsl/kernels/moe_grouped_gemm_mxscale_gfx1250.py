@@ -102,6 +102,15 @@ def _to_int(value) -> int:
     return int(value)
 
 
+def _is_stream_capturing() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except RuntimeError:
+        return False
+
+
 def _make_m_tile_prefix(
     masked_m: torch.Tensor, cfg: _GroupedA8W4Config
 ) -> torch.Tensor:
@@ -169,23 +178,35 @@ def _make_m_tile_map(
     if os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1":
         valid_m = masked_m[: cfg.experts].to(dtype=torch.int32)
         valid_m = valid_m.clamp(min=0, max=cfg.max_m)
-        valid_tiles = (
-            torch.div(
-                valid_m + (cfg.tile_m - 1),
-                cfg.tile_m,
-                rounding_mode="floor",
-            )
-            .cpu()
-            .tolist()
+        valid_tiles = torch.div(
+            valid_m + (cfg.tile_m - 1),
+            cfg.tile_m,
+            rounding_mode="floor",
         )
-        packed = [
-            expert * max_m_tiles + local_tile
-            for expert, count in enumerate(valid_tiles)
-            for local_tile in range(int(count))
-        ]
-        if not packed:
-            packed = [0]
-        return torch.tensor(packed, device=masked_m.device, dtype=torch.int32)
+        device = masked_m.device
+        tile_counts = valid_tiles.to(torch.long)
+        expert_ids = torch.repeat_interleave(
+            torch.arange(cfg.experts, device=device, dtype=torch.int32),
+            tile_counts,
+        )
+        prefix = torch.empty((cfg.experts + 1,), device=device, dtype=torch.int32)
+        prefix[0].zero_()
+        torch.cumsum(valid_tiles, dim=0, out=prefix[1:])
+        start_offsets = torch.repeat_interleave(
+            prefix[:-1].to(torch.long), tile_counts
+        ).to(torch.int32)
+        total_tiles = valid_tiles.sum()
+        global_idx = (
+            torch.cumsum(
+                torch.ones(total_tiles, device=device, dtype=torch.int32), dim=0
+            )
+            - 1
+        )
+        local_tiles = global_idx - start_offsets
+        packed = expert_ids * max_m_tiles + local_tiles
+        if not _is_stream_capturing() and packed.numel() == 0:
+            packed = torch.zeros(1, device=device, dtype=torch.int32)
+        return packed
 
     if m_tile_prefix is None:
         m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)

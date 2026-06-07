@@ -25,6 +25,15 @@ def _use_grouped_gemm_enabled() -> bool:
     return os.environ.get("AITER_USE_GROUPED_GEMM", "1") in _TRUTHY_ENV
 
 
+def _is_stream_capturing() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except RuntimeError:
+        return False
+
+
 def _grouped_a8w4_preshuffle_e8m0_scale(
     scale: torch.Tensor,
     warp_tile: int,
@@ -209,8 +218,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
     else:
         stage1_weight_layout = "gugu" if gate_mode == GateMode.INTERLEAVE else "gguu"
-    # Log the stage1 gate/up layout used by the grouped kernel.
-    logger.info(
+    # Log the stage1 gate/up layout used by the grouped kernel (debug only).
+    logger.debug(
         "[MoE-GUMODE] gate_mode=%s -> stage1_weight_layout=%s (%s)",
         gate_mode.name,
         stage1_weight_layout,
@@ -270,21 +279,29 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     # topk_ids is already an integer tensor; keep one flattened view for routing.
     flat_experts = topk_ids.reshape(-1)
+    _capturing = _is_stream_capturing()
     # Expert-id range validation is a debug-only safety check: at decode sizes it
     # issues ~6 tiny launches/iter (lt+ge compare_scalar, two any() reductions)
     # plus a device->host sync from the `or` -- a real hotspot relative to the
     # tiny grouped work. Gate it behind AITER_GROUPED_DEBUG so production skips it
     # (topk_ids is already produced in-range by the router); set the env to 1 to
-    # re-enable the check when diagnosing bad route ids.
-    if os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
+    # re-enable the check when diagnosing bad route ids. Skip entirely during
+    # CUDAGraph capture (dynamic control flow / sync).
+    if not _capturing and os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    ):
         if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
             raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
     # Static upper bound: each token routes at most one row per expert, so no
     # expert can receive more than token_num rows. Using this avoids the
     # ``counts.max().item()`` device->host sync that stalls the launch stream
     # (masked_m from build_route_maps still bounds the real per-expert work).
-    max_m = token_num
-    max_m = max(warp_tile_m, ((max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m)
+    # CUDAGraph buckets have static token_num/topk; per-expert count <= token_num*topk.
+    raw_max_m = token_num * topk if _capturing else token_num
+    max_m = max(warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m)
     _grouped_dbg(f"routing max_m={max_m}")
 
     # Build route maps once. The fast path uses the FlyDSL atomic-scatter kernel;
@@ -315,7 +332,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
     m_tile_prefix = None
     m_tile_map = None
-    if not _use_naive:
+    # Persistent-M builds a compact m_tile_map with dynamic PyTorch ops that
+    # HIP CUDAGraph capture rejects; use the flat-grid launcher instead.
+    _grouped_persistent_m = not _capturing
+    if not _use_naive and _grouped_persistent_m:
         _m_tile_cfg = _GroupedA8W4Config(
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -472,6 +492,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         out_dtype=out_dtype_str,
         num_buffers=2,
         expert_sched_mode=False,
+        grouped_persistent_m=_grouped_persistent_m,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
     )
@@ -479,7 +500,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
     if _bias1_arg is not None and _bias1_arg.dtype != dtype:
         _bias1_arg = _bias1_arg.to(dtype)
-    torch.cuda.synchronize()
+    if not _capturing:
+        torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage1 tokens={token_num} max_m={max_m} E={E}")
     stage1(
         grouped_a2,
@@ -497,7 +519,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_map=m_tile_map,
         bias=_bias1_arg,
     )
-    torch.cuda.synchronize()
+    if not _capturing:
+        torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage1 sync OK, unsort")
     _grouped_dbg("[crash-probe] after stage1 sync OK")
 
@@ -556,7 +579,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             .contiguous()
             .view(E, max_m, inter_dim // 32)
         )
-        torch.cuda.synchronize()
+        if not _capturing:
+            torch.cuda.synchronize()
         _grouped_dbg("[crash-probe] after a2 fp4 quant sync OK")
     else:
         grouped_a2_payload = grouped_a2.to(dtypes.fp8).view(torch.uint8).contiguous()
@@ -587,12 +611,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         out_dtype=out_dtype_str,
         num_buffers=2,
         expert_sched_mode=False,
+        grouped_persistent_m=_grouped_persistent_m,
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None
     if _bias2_arg is not None and _bias2_arg.dtype != dtype:
         _bias2_arg = _bias2_arg.to(dtype)
-    torch.cuda.synchronize()
+    if not _capturing:
+        torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage2 tokens={token_num} max_m={max_m} E={E}")
     stage2(
         grouped_out,
@@ -610,7 +636,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_map=m_tile_map,
         bias=_bias2_arg,
     )
-    torch.cuda.synchronize()
+    if not _capturing:
+        torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage2 sync OK")
     if os.environ.get("MOE_DUMP_INTER", "").strip().lower() not in (
         "",
@@ -663,7 +690,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("scatter output done")
     impl_name = "grouped_a4w4" if data_format == "fp4" else "grouped_a8w4"
     os.environ["AITER_LAST_FUSED_MOE_IMPL"] = impl_name
-    logger.info(
+    logger.debug(
         f"[{impl_name}] used grouped FlyDSL {data_format} path: tokens={token_num}, topk={topk}, E={E}, max_m={max_m}"
     )
     return moe_out
