@@ -1634,7 +1634,7 @@ def gemm_a16w16_gfx1250(
         )
 
     if y is None:
-        y = torch.empty((M, N), dtype=dtype).cuda()
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     warp_bases = [(0, 1)]
     for i in range(int(math.log2(num_warps // 2))):
