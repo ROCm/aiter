@@ -377,6 +377,130 @@ def _run_grouped_via_fused_moe(
     return grouped_out, ref
 
 
+def _prepare_grouped_moe_case(
+    *,
+    experts: int,
+    tokens: int,
+    topk: int,
+    model_dim: int,
+    inter_dim: int,
+    data_format: str,
+    layout: str = "gguu",
+    activation: ActivationType = ActivationType.Swiglu,
+    swiglu_limit: float = 7.0,
+    use_bias: bool = True,
+    seed: int = 0,
+    all_ones: bool = False,
+):
+    if data_format not in ("a4w4", "a8w4"):
+        raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
+    if layout not in ("gguu", "gugu"):
+        raise ValueError(f"layout must be gguu or gugu, got {layout!r}")
+
+    K = model_dim
+    I = inter_dim
+    K_pack = K // 2
+    I_pack = I // 2
+
+    if all_ones:
+        w1_logical = torch.full((experts, 2 * I, K_pack), 0x22, dtype=torch.uint8)
+        w2_logical = torch.full((experts, K, I_pack), 0x22, dtype=torch.uint8)
+        w1_scale_raw = _full_scale(experts, 2 * I, K // SCALE_BLOCK)
+        w2_scale_raw = _full_scale(experts, K, I // SCALE_BLOCK)
+        bias1 = torch.zeros((experts, 2 * I))
+        bias2 = torch.zeros((experts, K))
+        hidden = torch.ones((tokens, K), dtype=torch.bfloat16)
+    else:
+        w1_logical = _pattern_packed(experts, 2 * I, K_pack, seed=seed + 17)
+        w2_logical = _pattern_packed(experts, K, I_pack, seed=seed + 47)
+        w1_scale_raw = _full_scale(experts, 2 * I, K // SCALE_BLOCK)
+        w2_scale_raw = _full_scale(experts, K, I // SCALE_BLOCK)
+        if use_bias:
+            bg = torch.Generator(device="cpu").manual_seed(seed + 91)
+            bias1 = (torch.randn((experts, 2 * I), generator=bg) * 1e-3).float()
+            bias2 = (torch.randn((experts, K), generator=bg) * 1e-3).float()
+        else:
+            bias1 = torch.zeros((experts, 2 * I))
+            bias2 = torch.zeros((experts, K))
+        hg = torch.Generator(device="cpu").manual_seed(seed + 123)
+        hidden = (torch.randn((tokens, K), generator=hg) * 0.5).to(torch.bfloat16)
+
+    topk_id, topk_w = _balanced_topk(tokens, topk, experts)
+    topk_w = topk_w.to(torch.bfloat16)
+
+    if layout == "gugu":
+        w1_phys = _gguu_to_gugu_rows(w1_logical)
+        w1_scale_phys = _gguu_to_gugu_rows(w1_scale_raw)
+        bias1_phys = _gguu_to_gugu_rows(bias1)
+        gate_mode = GateMode.INTERLEAVE
+    else:
+        w1_phys = w1_logical
+        w1_scale_phys = w1_scale_raw
+        bias1_phys = bias1
+        gate_mode = GateMode.SEPARATED
+
+    w1_grouped = shuffle_weight(w1_phys, layout=(16, 16)).cuda()
+    w2_grouped = shuffle_weight(w2_logical, layout=(16, 16)).cuda()
+    w1_scale = _grouped_scale(w1_scale_phys, experts=experts, rows=2 * I, k_dim=K)
+    w2_scale = _grouped_scale(w2_scale_raw, experts=experts, rows=K, k_dim=I)
+
+    if data_format == "a4w4":
+        w1_arg = w1_grouped.view(dtypes.fp4x2)
+        w2_arg = w2_grouped.view(dtypes.fp4x2)
+    else:
+        w1_arg = w1_grouped
+        w2_arg = w2_grouped
+
+    fused_case = {
+        "hidden_states": hidden.cuda(),
+        "w1": w1_arg,
+        "w2": w2_arg,
+        "topk_weight": topk_w.cuda(),
+        "topk_ids": topk_id.cuda(),
+        "activation": activation,
+        "w1_scale": w1_scale,
+        "w2_scale": w2_scale,
+        "bias1": bias1_phys.float().cuda(),
+        "bias2": bias2.float().cuda(),
+        "gate_mode": gate_mode.value,
+        "swiglu_limit": swiglu_limit,
+    }
+    ref_case = {
+        "hidden": fused_case["hidden_states"],
+        "w1_logical": w1_logical,
+        "w1_scale_raw": w1_scale_raw,
+        "bias1": bias1.float().cuda(),
+        "w2_logical": w2_logical,
+        "w2_scale_raw": w2_scale_raw,
+        "bias2": fused_case["bias2"],
+        "topk_weight": fused_case["topk_weight"],
+        "topk_ids": fused_case["topk_ids"],
+        "data_format": data_format,
+        "activation": activation,
+        "swiglu_limit": swiglu_limit,
+    }
+    return fused_case, ref_case
+
+
+def _invoke_grouped_fused_moe(fused_case):
+    return fused_moe(
+        fused_case["hidden_states"],
+        fused_case["w1"],
+        fused_case["w2"],
+        fused_case["topk_weight"],
+        fused_case["topk_ids"],
+        activation=fused_case["activation"],
+        quant_type=QuantType.per_1x32,
+        w1_scale=fused_case["w1_scale"],
+        w2_scale=fused_case["w2_scale"],
+        bias1=fused_case["bias1"],
+        bias2=fused_case["bias2"],
+        gate_mode=fused_case["gate_mode"],
+        dtype=dtypes.bf16,
+        swiglu_limit=fused_case["swiglu_limit"],
+    )
+
+
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     diff = (actual.float() - expected.float()).norm()
     base = expected.float().norm().clamp(min=1e-12)
@@ -397,6 +521,7 @@ def _sanity_check(
     layout: str = "gguu",
     activation: ActivationType = ActivationType.Swiglu,
     swiglu_limit: float = 7.0,
+    use_bias: bool = True,
     tol: float = VERIFY_TOL_A4W4,
     all_ones: bool = False,
 ) -> None:
@@ -419,6 +544,7 @@ def _sanity_check(
         layout=layout,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        use_bias=use_bias,
         verify=True,
         all_ones=all_ones,
     )
@@ -461,11 +587,13 @@ def _bench(args: argparse.Namespace) -> None:
             experts=args.experts,
             tokens=args.tokens,
             topk=args.topk,
-            model_dim=args.model_dim, inter_dim=args.inter_dim,
+            model_dim=args.model_dim,
+            inter_dim=args.inter_dim,
             data_format=args.data_format,
             layout=args.layout,
             activation=activation,
             swiglu_limit=args.swiglu_limit,
+            use_bias=not args.no_bias,
         )
         _invoke_grouped_fused_moe(fused_case)  # warmup / JIT
         torch.cuda.synchronize()
@@ -505,6 +633,8 @@ def main() -> None:
                         help="stage1 activation: silu => silu(gate)*up; "
                              "swiglu => gpt-oss swiglu with clamp/alpha/residual")
     parser.add_argument("--swiglu-limit", type=float, default=7.0)
+    parser.add_argument("--no-bias", action="store_true",
+                        help="run with zero stage1/stage2 bias tensors")
     parser.add_argument("--all-ones", action="store_true",
                         help="(verify only) hidden=1, weight bytes=0x22 (=+1.0), "
                              "scale=127 (=2^0), bias=0. Expect rel_l2 < 0.01 since both "
@@ -534,6 +664,7 @@ def main() -> None:
                       tol=tol,
                       activation=activation,
                       swiglu_limit=args.swiglu_limit,
+                      use_bias=not args.no_bias,
                       all_ones=args.all_ones)
         return
     _bench(args)

@@ -328,7 +328,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         blk = a1_flat.view(-1, BLOCK)
         blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
         max_abs = blk.abs().amax(dim=1)
-        scale_e8m0 = _aiter_fp4u.f32_to_e8m0(max_abs / DTYPE_MAX)
+        scale_e8m0 = _aiter_fp4u.f32_to_mx_e8m0_scale(
+            max_abs, dtype=_aiter_fp4u.MxDtypeInt.FP8_E4M3
+        )
         scale_f32 = _aiter_fp4u.e8m0_to_f32(scale_e8m0)
         scale_f32 = torch.nan_to_num(scale_f32, nan=1.0, posinf=1.0, neginf=1.0)
         scale_f32[scale_f32 == 0] = 1.0

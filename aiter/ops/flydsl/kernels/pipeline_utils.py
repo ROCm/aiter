@@ -1,4 +1,4 @@
-"""Shared pipeline utilities for gfx1250 GEMM kernels. """
+"""Shared pipeline utilities for gfx1250 GEMM kernels."""
 
 
 def make_tail_plan(num_buffers, pre_loaded, extra):
@@ -16,24 +16,22 @@ def make_tail_plan(num_buffers, pre_loaded, extra):
     plan = []
     for i in range(steps):
         compute_stage = (
-            i if i < pre_loaded
-            else (i - pre_loaded + num_buffers - 1) % num_buffers
+            i if i < pre_loaded else (i - pre_loaded + num_buffers - 1) % num_buffers
         )
-        load_stage = (
-            (i + num_buffers - 1) % num_buffers if i < extra
-            else None
-        )
-        is_last = (i == steps - 1)
+        load_stage = (i + num_buffers - 1) % num_buffers if i < extra else None
+        is_last = i == steps - 1
         if is_last:
             outstanding = -1
         else:
             j = i + 1
             next_compute = (
-                j if j < pre_loaded
+                j
+                if j < pre_loaded
                 else (j - pre_loaded + num_buffers - 1) % num_buffers
             )
             outstanding = (
-                2 * (num_buffers - 2) if (load_stage is not None and load_stage != next_compute)
+                2 * (num_buffers - 2)
+                if (load_stage is not None and load_stage != next_compute)
                 else 0
             )
         plan.append((load_stage, compute_stage, outstanding))
@@ -59,7 +57,9 @@ def tdm_epilogue_fence_threshold_bytes(*, stage_base_off, tail_plan, loop_iters,
     if extra > 0:
         stages_after_last_full_fence = [tail_plan[-1][1]]
     elif loop_iters > 0:
-        stages_after_last_full_fence = [compute_stage for _, compute_stage, _ in tail_plan]
+        stages_after_last_full_fence = [
+            compute_stage for _, compute_stage, _ in tail_plan
+        ]
     else:
         stages_after_last_full_fence = [tail_plan[-1][1]]
 
