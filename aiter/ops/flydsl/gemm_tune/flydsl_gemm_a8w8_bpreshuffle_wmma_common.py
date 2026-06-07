@@ -113,10 +113,6 @@ def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
     return arena_bytes
 
 
-def max_lds_bytes_for_tune() -> int:
-    return LDS_BYTES
-
-
 def _build_kernels_list():
     kl = {}
     idx = 0
@@ -134,13 +130,6 @@ def _build_kernels_list():
 
 
 kernels_list: dict[int, WmmaKernelInstance] = _build_kernels_list()
-
-default_kernels_dict = {
-    (-1): WmmaKernelInstance(128, 128, 128, 2),
-    (-2): WmmaKernelInstance(32, 64, 128, 2),
-    (-3): WmmaKernelInstance(64, 128, 128, 2),
-    (-4): WmmaKernelInstance(128, 256, 128, 2),
-}
 
 
 def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:

@@ -79,7 +79,6 @@ def make_tensor_descriptor_2d(
     """
     from flydsl._mlir.dialects import fly as _fly_d
 
-    outer_size, inner_size = tensor_shape
     outer_stride, inner_stride = strides
     outer_tile, inner_tile = tile_shape
     outer_off, inner_off = global_offset

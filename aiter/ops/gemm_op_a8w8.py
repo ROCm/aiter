@@ -128,7 +128,8 @@ def gemm_a8w8_bpreshuffle_flydsl(
     config: dict,
 ) -> Tensor:
     kernel_name = str(config.get("kernelName", ""))
-    if kernel_name.startswith("flydsl_bpreshuffle_wmma_"):
+    # gfx1250 runs the WMMA ptpc backend; other archs use the MFMA preshuffle path.
+    if get_gfx() == "gfx1250":
         from .flydsl.bpreshuffle_gemm_gfx1250 import run_gemm_a8w8_bpreshuffle_gfx1250
 
         return run_gemm_a8w8_bpreshuffle_gfx1250(

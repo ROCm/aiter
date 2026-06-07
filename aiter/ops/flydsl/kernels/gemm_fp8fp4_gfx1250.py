@@ -75,13 +75,16 @@ def _make_tdm_desc(*, early_timeout=False, oob_outer_bound=None, **kwargs):
     against the older flydsl this build pins.
     """
     if _TDM_HAS_OOB:
+        if _TDM_HAS_EARLY_TIMEOUT:
+            kwargs["early_timeout"] = early_timeout
         return tdm_ops.make_tensor_descriptor_2d(
-            early_timeout=early_timeout, oob_outer_bound=oob_outer_bound, **kwargs
+            oob_outer_bound=oob_outer_bound, **kwargs
         )
     if oob_outer_bound is None:
         if _TDM_HAS_EARLY_TIMEOUT:
             kwargs["early_timeout"] = early_timeout
         return tdm_ops.make_tensor_descriptor_2d(**kwargs)
+    # Vendored builder always supports early_timeout (pass it explicitly).
     from .tdm_oob import make_tensor_descriptor_2d as _make_tensor_descriptor_2d_oob
 
     return _make_tensor_descriptor_2d_oob(

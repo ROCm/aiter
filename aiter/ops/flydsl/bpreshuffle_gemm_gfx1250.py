@@ -28,7 +28,6 @@ _WMMA_K = 128
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
 
-
 def _lazy_import():
     global _compile_ptpc_gemm, _run_compiled, _fx
     if _compile_ptpc_gemm is not None:
@@ -117,24 +116,36 @@ def run_preshuffle_gemm_a8_gfx1250(
     accumulate_fp32 = split_k > 1
     kernel_out_dtype = "f32" if accumulate_fp32 else out_dtype
 
-    # Pipeline depth needs >= 1 K tile per buffer (per split-k chunk).
-    num_k_tiles = (K // split_k) // tile_k
-    nb = max(2, min(int(num_buffers), num_k_tiles))
+    # Validate (tuned names always pass); fail loudly rather than silently clamp.
+    nb = int(num_buffers)
     if nb not in _SUPPORTED_NUM_BUFFERS:
-        nb = max(b for b in _SUPPORTED_NUM_BUFFERS if b <= nb)
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] num_buffers must be one of {_SUPPORTED_NUM_BUFFERS}, "
+            f"got {nb}"
+        )
+    if K % (split_k * tile_k) != 0:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] K={K} must be divisible by split_k*tile_k="
+            f"{split_k}*{tile_k}={split_k * tile_k}"
+        )
+    # Each split-k chunk must hold >= num_buffers K-tiles to fill the pipeline.
+    num_k_tiles = (K // split_k) // tile_k
+    if num_k_tiles < nb:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] {nb}-buffer pipeline needs >= {nb} K-tiles per "
+            f"split-k chunk, got {num_k_tiles} (K={K}, split_k={split_k}, tile_k={tile_k})"
+        )
 
     sa = _as_1d_fp32(x_scale, M, "x_scale")
     sb = _as_1d_fp32(w_scale, N, "w_scale")
 
-    # Ragged M needs no host padding: the kernel clips A/A-scale loads and the C
-    # store to the runtime M via hardware out-of-bounds, so A and the scales pass
-    # through unchanged. Only N/K must divide the tile (checked above).
+    # Ragged M needs no host padding: the kernel clips A/scale loads and the C
+    # store to runtime M via hardware OOB.
     a_dev = XQ.contiguous()
     b_dev = WQ.contiguous()
 
-    # Compile-time M is unused for codegen (the kernel reads the runtime i32_m for
-    # all bounds/grid), so compile with M=0: the kernel is cached (lru_cache) per
-    # (N, K, config) and reused across every M instead of recompiling per M.
+    # M is unused at compile time (runtime i32_m drives everything), so compile with
+    # M=0 to cache one kernel per (N, K, config) and reuse it across all M.
     exe = _compile_ptpc_gemm(
         M=0,
         N=N,
@@ -154,8 +165,7 @@ def run_preshuffle_gemm_a8_gfx1250(
     )
 
     if accumulate_fp32:
-        # fp32 atomic-accumulation scratch: zeroed because the split-k atomic add
-        # accumulates into it (per-lane predicated on row < M), cast into Out below.
+        # fp32 split-k atomic-accumulation scratch (zeroed; cast into Out below).
         out_buf = torch.zeros((M, N), dtype=torch.float32, device=Out.device)
     else:
         out_buf = Out.contiguous()
