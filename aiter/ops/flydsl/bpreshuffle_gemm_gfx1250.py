@@ -132,8 +132,11 @@ def run_preshuffle_gemm_a8_gfx1250(
     a_dev = XQ.contiguous()
     b_dev = WQ.contiguous()
 
+    # Compile-time M is unused for codegen (the kernel reads the runtime i32_m for
+    # all bounds/grid), so compile with M=0: the kernel is cached (lru_cache) per
+    # (N, K, config) and reused across every M instead of recompiling per M.
     exe = _compile_ptpc_gemm(
-        M=M,
+        M=0,
         N=N,
         K=K,
         data_format="fp8",
@@ -158,13 +161,14 @@ def run_preshuffle_gemm_a8_gfx1250(
         out_buf = Out.contiguous()
 
     stream = _fx.Stream(torch.cuda.current_stream(device=a_dev.device))
+    # sa/sb are already contiguous 1-D fp32 (see _as_1d_fp32).
     _run_compiled(
         exe,
         out_buf.view(-1),
         _to_uint8(a_dev),
         _to_uint8(b_dev),
-        sa.contiguous().view(-1),
-        sb.contiguous().view(-1),
+        sa.view(-1),
+        sb.view(-1),
         M,
         N,
         stream,
@@ -175,10 +179,11 @@ def run_preshuffle_gemm_a8_gfx1250(
     return Out
 
 
-# flydsl_bpreshuffle_wmma_t{tm}x{tn}x{tk}_nb{nb}_sk{sk}_cm{cm}_cn{cn}
+# flydsl_bpreshuffle_wmma_t{tm}x{tn}x{tk}_mw{mw}_nw{nw}_nb{nb}_sk{sk}_cm{cm}_cn{cn}
 _KERNEL_NAME_RE = re.compile(
     r"^flydsl_bpreshuffle_wmma_"
     r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
+    r"mw(?P<m_warp>\d+)_nw(?P<n_warp>\d+)_"
     r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_"
     r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)$"
 )
@@ -193,10 +198,13 @@ def wmma_kernel_name(
     split_k: int,
     cluster_m: int,
     cluster_n: int,
+    m_warp: int,
+    n_warp: int,
 ) -> str:
     return (
         f"flydsl_bpreshuffle_wmma_t{tile_m}x{tile_n}x{tile_k}_"
-        f"nb{num_buffers}_sk{split_k}_cm{cluster_m}_cn{cluster_n}"
+        f"mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk{split_k}_"
+        f"cm{cluster_m}_cn{cluster_n}"
     )
 
 
@@ -231,4 +239,6 @@ def run_gemm_a8w8_bpreshuffle_gfx1250(
         split_k=cfg["split_k"],
         cluster_m=cfg["cluster_m"],
         cluster_n=cfg["cluster_n"],
+        m_warp=cfg["m_warp"],
+        n_warp=cfg["n_warp"],
     )

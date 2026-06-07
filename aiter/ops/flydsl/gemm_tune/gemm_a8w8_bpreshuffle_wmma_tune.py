@@ -78,6 +78,8 @@ def run_gemm(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
         split_k=ki.split_k,
         cluster_m=ki.cluster_m,
         cluster_n=ki.cluster_n,
+        m_warp=ki.m_warp,
+        n_warp=ki.n_warp,
     )
     return out
 

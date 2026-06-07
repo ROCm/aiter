@@ -26,7 +26,15 @@ pytestmark = pytest.mark.skipif(
 
 
 def _kernel_name(
-    tile_m, tile_n, tile_k, num_buffers, split_k=1, cluster_m=1, cluster_n=1
+    tile_m,
+    tile_n,
+    tile_k,
+    num_buffers,
+    split_k=1,
+    cluster_m=1,
+    cluster_n=1,
+    m_warp=2,
+    n_warp=2,
 ):
     return wmma_kernel_name(
         tile_m=tile_m,
@@ -36,6 +44,8 @@ def _kernel_name(
         split_k=split_k,
         cluster_m=cluster_m,
         cluster_n=cluster_n,
+        m_warp=m_warp,
+        n_warp=n_warp,
     )
 
 
@@ -75,16 +85,17 @@ def test_kernel_name_roundtrips():
     )
 
     assert kernels_list, "WMMA catalogue is empty"
-    ki = kernels_list[0]
-    cfg = parse_wmma_kernel_name(ki.name)
-    assert cfg is not None, f"cannot parse {ki.name}"
-    assert (cfg["tile_m"], cfg["tile_n"], cfg["tile_k"]) == (
-        ki.tile_m,
-        ki.tile_n,
-        ki.tile_k,
-    )
-    assert cfg["num_buffers"] == ki.num_buffers and cfg["split_k"] == ki.split_k
-    assert cfg["cluster_m"] == ki.cluster_m and cfg["cluster_n"] == ki.cluster_n
+    for ki in kernels_list.values():
+        cfg = parse_wmma_kernel_name(ki.name)
+        assert cfg is not None, f"cannot parse {ki.name}"
+        assert (cfg["tile_m"], cfg["tile_n"], cfg["tile_k"]) == (
+            ki.tile_m,
+            ki.tile_n,
+            ki.tile_k,
+        )
+        assert cfg["num_buffers"] == ki.num_buffers and cfg["split_k"] == ki.split_k
+        assert cfg["cluster_m"] == ki.cluster_m and cfg["cluster_n"] == ki.cluster_n
+        assert cfg["m_warp"] == ki.m_warp and cfg["n_warp"] == ki.n_warp
 
 
 @pytest.mark.parametrize(
@@ -164,6 +175,28 @@ def test_ragged_m_split_k(M, split_k, monkeypatch):
     assert out.shape == (M, N)
     _, cos = _metrics(out, ref)
     assert cos > 0.99, f"cosine={cos} too low (ragged M={M}, split_k={split_k})"
+
+
+@pytest.mark.parametrize(
+    "m_warp,n_warp,tile_m,tile_n",
+    [(1, 2, 16, 32), (1, 4, 16, 64), (2, 2, 32, 32), (2, 4, 32, 64)],
+)
+def test_warp_configs(m_warp, n_warp, tile_m, tile_n, monkeypatch):
+    """m_warp/n_warp are tunable; m_warp=1 small-tile_m configs serve decode."""
+    _inject_tuned_config(
+        monkeypatch,
+        _kernel_name(tile_m, tile_n, 256, 2, m_warp=m_warp, n_warp=n_warp),
+    )
+    torch.manual_seed(0)
+    M, N, K = 1, 256, 512
+    aq, bq, a_scale, b_scale = _quant(M, N, K)
+    ref = _ref(aq, bq, a_scale, b_scale, torch.bfloat16)
+    out = aiter.gemm_a8w8_bpreshuffle(
+        aq, shuffle_weight(bq, layout=(16, 16)), a_scale, b_scale, dtype=torch.bfloat16
+    )
+    assert out.shape == (M, N)
+    _, cos = _metrics(out, ref)
+    assert cos > 0.99, f"cosine={cos} low (mw{m_warp} nw{n_warp} t{tile_m}x{tile_n})"
 
 
 def test_vendored_oob_path(monkeypatch):
