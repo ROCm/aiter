@@ -63,7 +63,10 @@ build_route_maps, build_topids_to_rows = _import()
 def _run_one(token_num, topk, E, seed=0):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     topk_ids = torch.stack(
-        [torch.randperm(E, generator=gen, device="cuda")[:topk] for _ in range(token_num)]
+        [
+            torch.randperm(E, generator=gen, device="cuda")[:topk]
+            for _ in range(token_num)
+        ]
     ).to(torch.long)
     counts = torch.bincount(topk_ids.reshape(-1), minlength=E)
     max_m = int(counts.max().item()) if counts.numel() else 0
@@ -75,17 +78,21 @@ def _run_one(token_num, topk, E, seed=0):
     masked_m_ok = bool(torch.equal(masked_m, counts.to(torch.int32)))
     srf = src.reshape(-1).to(torch.long)
     fe = topk_ids.reshape(-1)
-    flat_tokens = (torch.arange(token_num * topk, device="cuda") // topk)
+    flat_tokens = torch.arange(token_num * topk, device="cuda") // topk
 
     # 1) every route's row is in its expert's block
-    in_block = bool(((srf >= fe * max_m) & (srf < fe * max_m + counts[fe])).all().item())
+    in_block = bool(
+        ((srf >= fe * max_m) & (srf < fe * max_m + counts[fe])).all().item()
+    )
 
     # 2) each expert's rows are exactly {e*max_m .. e*max_m+counts[e]-1} (valid perm)
     ref = build_topids_to_rows(topk_ids, max_m, E).reshape(-1).to(torch.long)
     perm_ok = True
     for e in range(E):
         got = torch.sort(srf[fe == e]).values
-        exp = torch.sort(ref[fe == e]).values  # same expected set as the deterministic build
+        exp = torch.sort(
+            ref[fe == e]
+        ).values  # same expected set as the deterministic build
         if not torch.equal(got, exp):
             perm_ok = False
             break
@@ -108,10 +115,16 @@ def _run_one(token_num, topk, E, seed=0):
 
 def main():
     ap = argparse.ArgumentParser()
-    args = ap.parse_args()
+    ap.parse_args()
     configs = [
-        (1, 1, 8), (1, 8, 32), (7, 2, 8), (13, 3, 8), (128, 8, 32),
-        (256, 8, 256), (32, 4, 16), (1, 4, 4),
+        (1, 1, 8),
+        (1, 8, 32),
+        (7, 2, 8),
+        (13, 3, 8),
+        (128, 8, 32),
+        (256, 8, 256),
+        (32, 4, 16),
+        (1, 4, 4),
     ]
     all_ok = True
     for i, (tn, topk, E) in enumerate(configs):

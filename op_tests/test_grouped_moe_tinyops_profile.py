@@ -39,7 +39,6 @@ import os
 import sys
 import types
 
-
 # ---------------------------------------------------------------------------
 # Env: opt into the grouped path and force the gfx1250 arch gate to pass on
 # MI308. These are read by fused_moe at call time, so setting them here is fine.
@@ -85,7 +84,6 @@ def _build_inputs(token_num, E, topk, model_dim, inter_dim, dtype, device, seed=
     """Synthetic a8w4 grouped-MoE inputs (shapes that pass the eligibility gates
     and satisfy the host-side scale reshapes; GEMM math is stubbed)."""
     import torch
-    from aiter import dtypes
 
     g = torch.Generator(device=device).manual_seed(seed)
     hidden_states = torch.randn(
@@ -136,17 +134,31 @@ def main():
     ap.add_argument("--inter-dim", type=int, default=4096)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
-    ap.add_argument("--naive", action="store_true",
-                    help="use the per-expert Python loops (AITER_GROUPED_GEMM_NAIVE=1)")
-    ap.add_argument("--mode", choices=["a8w4", "a4w4"], default="a8w4",
-                    help="quant recipe: a8w4=fp8 act+fp4 weight (default), "
-                         "a4w4=fp4 act+fp4 weight")
+    ap.add_argument(
+        "--naive",
+        action="store_true",
+        help="use the per-expert Python loops (AITER_GROUPED_GEMM_NAIVE=1)",
+    )
+    ap.add_argument(
+        "--mode",
+        choices=["a8w4", "a4w4"],
+        default="a8w4",
+        help="quant recipe: a8w4=fp8 act+fp4 weight (default), "
+        "a4w4=fp4 act+fp4 weight",
+    )
     ap.add_argument("--doweight", action="store_true", help="doweight_stage1=True")
-    ap.add_argument("--rotate", type=int, default=1,
-                    help="num_rotate_args for run_perftest (1 = no input rotation)")
-    ap.add_argument("--real-gemm", action="store_true",
-                    help="do NOT stub the grouped GEMMs -- run the real MI450/"
-                         "gfx1250 stage1/stage2 kernels (requires gfx1250 HW)")
+    ap.add_argument(
+        "--rotate",
+        type=int,
+        default=1,
+        help="num_rotate_args for run_perftest (1 = no input rotation)",
+    )
+    ap.add_argument(
+        "--real-gemm",
+        action="store_true",
+        help="do NOT stub the grouped GEMMs -- run the real MI450/"
+        "gfx1250 stage1/stage2 kernels (requires gfx1250 HW)",
+    )
     args = ap.parse_args()
 
     if args.model_dim % 128 != 0 or args.inter_dim % 128 != 0:

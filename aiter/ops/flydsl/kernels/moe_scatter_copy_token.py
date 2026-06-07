@@ -64,8 +64,8 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
 
     @flyc.kernel(name=module_name)
     def scatter_copy_kernel(
-        src: fx.Tensor,      # (num_src, row_bytes) uint8
-        dst: fx.Tensor,      # (num_dst, row_bytes) uint8
+        src: fx.Tensor,  # (num_src, row_bytes) uint8
+        dst: fx.Tensor,  # (num_dst, row_bytes) uint8
         dst_src: fx.Tensor,  # (num_dst,) int32  -- src row per dst row, -1=skip
         num_dst: Int32,
     ):
@@ -85,9 +85,7 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
             srow = ArithValue(
                 buffer_ops.buffer_load(map_rsrc, bid_i32, vec_width=1, dtype=i32)
             )
-            row_ok = arith.cmpi(
-                CmpIPredicate.sge, srow, arith.constant(0, type=i32)
-            )
+            row_ok = arith.cmpi(CmpIPredicate.sge, srow, arith.constant(0, type=i32))
             _if_row = scf.IfOp(row_ok)
             with ir.InsertionPoint(_if_row.then_block):
                 src_rsrc = buffer_ops.create_buffer_resource(src, max_size=True)

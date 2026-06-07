@@ -67,13 +67,21 @@ def _validate_common(cfg: _GroupedA8W4Config) -> None:
     if cfg.num_buffers not in (2, 3, 4):
         raise ValueError(f"num_buffers must be 2, 3 or 4, got {cfg.num_buffers}")
     if cfg.data_format not in ("a8w4", "fp4"):
-        raise ValueError(f"data_format must be 'a8w4' or 'fp4', got {cfg.data_format!r}")
+        raise ValueError(
+            f"data_format must be 'a8w4' or 'fp4', got {cfg.data_format!r}"
+        )
     if cfg.model_dim % 32 != 0:
-        raise ValueError(f"model_dim must be divisible by 32 for MXScale scales, got {cfg.model_dim}")
+        raise ValueError(
+            f"model_dim must be divisible by 32 for MXScale scales, got {cfg.model_dim}"
+        )
     if cfg.inter_dim % 32 != 0:
-        raise ValueError(f"inter_dim must be divisible by 32 for MXScale scales, got {cfg.inter_dim}")
+        raise ValueError(
+            f"inter_dim must be divisible by 32 for MXScale scales, got {cfg.inter_dim}"
+        )
     if cfg.tile_k % 128 != 0:
-        raise ValueError(f"tile_k must be a multiple of 128 for MXScale WMMA_SCALE, got {cfg.tile_k}")
+        raise ValueError(
+            f"tile_k must be a multiple of 128 for MXScale WMMA_SCALE, got {cfg.tile_k}"
+        )
     if cfg.split_k < 1:
         raise ValueError(f"split_k must be >= 1, got {cfg.split_k}")
     if cfg.act not in ("silu", "swiglu"):
@@ -83,7 +91,9 @@ def _validate_common(cfg: _GroupedA8W4Config) -> None:
             f"stage1_weight_layout must be 'gguu' or 'gugu', got {cfg.stage1_weight_layout!r}"
         )
     if cfg.grouped_persistent_m and (cfg.cluster_m != 1 or cfg.cluster_n != 1):
-        raise ValueError("grouped_persistent_m currently requires cluster_m=cluster_n=1")
+        raise ValueError(
+            "grouped_persistent_m currently requires cluster_m=cluster_n=1"
+        )
 
 
 def _to_int(value) -> int:
@@ -92,8 +102,10 @@ def _to_int(value) -> int:
     return int(value)
 
 
-def _make_m_tile_prefix(masked_m: torch.Tensor, cfg: _GroupedA8W4Config) -> torch.Tensor:
-    valid_m = masked_m[:cfg.experts].to(dtype=torch.int32)
+def _make_m_tile_prefix(
+    masked_m: torch.Tensor, cfg: _GroupedA8W4Config
+) -> torch.Tensor:
+    valid_m = masked_m[: cfg.experts].to(dtype=torch.int32)
     valid_m = valid_m.clamp(min=0, max=cfg.max_m)
     valid_tiles = torch.div(
         valid_m + (cfg.tile_m - 1),
@@ -182,11 +194,17 @@ def _check_bias_args(
         return
     _check_rank(name, bias, 2)
     if tuple(bias.shape) != expected_shape:
-        raise ValueError(f"{name} shape must be {expected_shape}, got {tuple(bias.shape)}")
+        raise ValueError(
+            f"{name} shape must be {expected_shape}, got {tuple(bias.shape)}"
+        )
     if bias.dtype != output.dtype:
-        raise ValueError(f"{name} dtype must match output dtype {output.dtype}, got {bias.dtype}")
+        raise ValueError(
+            f"{name} dtype must match output dtype {output.dtype}, got {bias.dtype}"
+        )
     if bias.device != output.device:
-        raise ValueError(f"{name} device must match output device {output.device}, got {bias.device}")
+        raise ValueError(
+            f"{name} device must match output device {output.device}, got {bias.device}"
+        )
 
 
 def _pack_factors(cfg: _GroupedA8W4Config) -> tuple[int, int]:
@@ -195,43 +213,67 @@ def _pack_factors(cfg: _GroupedA8W4Config) -> tuple[int, int]:
     return 1, 2
 
 
-def _preshuffled_scale_shape(rows: int, k_dim: int, warp_tile: int, tile_k: int) -> tuple[int, int]:
+def _preshuffled_scale_shape(
+    rows: int, k_dim: int, warp_tile: int, tile_k: int
+) -> tuple[int, int]:
     # Matches tests.kernels.test_gemm_mxscale_gfx1250.preshuffle_e8m0_scale.
     k_scale = int(k_dim) // 32
     scale_k_per_tile = int(tile_k) // 32
     if k_scale % scale_k_per_tile != 0:
-        raise ValueError(f"K scale columns must be divisible by tile_k/32, got {k_scale} and {scale_k_per_tile}")
+        raise ValueError(
+            f"K scale columns must be divisible by tile_k/32, got {k_scale} and {scale_k_per_tile}"
+        )
     wmma_rep = int(warp_tile) // 16
     if wmma_rep < 1:
         raise ValueError(f"warp_tile must be >= 16, got {warp_tile}")
     if int(rows) % wmma_rep != 0:
-        raise ValueError(f"scale rows must be divisible by wmma_rep={wmma_rep}, got {rows}")
+        raise ValueError(
+            f"scale rows must be divisible by wmma_rep={wmma_rep}, got {rows}"
+        )
     return int(rows) // wmma_rep, k_scale * wmma_rep
 
 
-def _check_stage1_args(y, x, w, scale_x, scale_w, masked_m, cfg: _GroupedA8W4Config) -> None:
+def _check_stage1_args(
+    y, x, w, scale_x, scale_w, masked_m, cfg: _GroupedA8W4Config
+) -> None:
     _check_rank("y", y, 3)
     _check_rank("x", x, 3)
     _check_rank("w", w, 3)
     _check_rank("scale_x", scale_x, 3)
     _check_rank("scale_w", scale_w, 3)
     if tuple(y.shape) != (cfg.experts, cfg.max_m, cfg.inter_dim):
-        raise ValueError(f"y shape must be {(cfg.experts, cfg.max_m, cfg.inter_dim)}, got {tuple(y.shape)}")
+        raise ValueError(
+            f"y shape must be {(cfg.experts, cfg.max_m, cfg.inter_dim)}, got {tuple(y.shape)}"
+        )
     pack_a, pack_b = _pack_factors(cfg)
     if tuple(x.shape) != (cfg.experts, cfg.max_m, cfg.model_dim // pack_a):
-        raise ValueError(f"x shape must be {(cfg.experts, cfg.max_m, cfg.model_dim // pack_a)}, got {tuple(x.shape)}")
+        raise ValueError(
+            f"x shape must be {(cfg.experts, cfg.max_m, cfg.model_dim // pack_a)}, got {tuple(x.shape)}"
+        )
     if tuple(w.shape) != (cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // pack_b):
-        raise ValueError(f"w shape must be {(cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // pack_b)}, got {tuple(w.shape)}")
+        raise ValueError(
+            f"w shape must be {(cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // pack_b)}, got {tuple(w.shape)}"
+        )
     warp_tile_m = cfg.tile_m // cfg.m_warp
     warp_tile_n = cfg.tile_n // cfg.n_warp
-    scale_x_shape = _preshuffled_scale_shape(cfg.max_m, cfg.model_dim, warp_tile_m, cfg.tile_k)
-    scale_w_shape = _preshuffled_scale_shape(2 * cfg.inter_dim, cfg.model_dim, warp_tile_n, cfg.tile_k)
+    scale_x_shape = _preshuffled_scale_shape(
+        cfg.max_m, cfg.model_dim, warp_tile_m, cfg.tile_k
+    )
+    scale_w_shape = _preshuffled_scale_shape(
+        2 * cfg.inter_dim, cfg.model_dim, warp_tile_n, cfg.tile_k
+    )
     if tuple(scale_x.shape) != (cfg.experts, *scale_x_shape):
-        raise ValueError(f"scale_x shape must be {(cfg.experts, *scale_x_shape)}, got {tuple(scale_x.shape)}")
+        raise ValueError(
+            f"scale_x shape must be {(cfg.experts, *scale_x_shape)}, got {tuple(scale_x.shape)}"
+        )
     if tuple(scale_w.shape) != (cfg.experts, *scale_w_shape):
-        raise ValueError(f"scale_w shape must be {(cfg.experts, *scale_w_shape)}, got {tuple(scale_w.shape)}")
+        raise ValueError(
+            f"scale_w shape must be {(cfg.experts, *scale_w_shape)}, got {tuple(scale_w.shape)}"
+        )
     if masked_m.numel() < cfg.experts:
-        raise ValueError(f"masked_m must contain at least {cfg.experts} entries, got {masked_m.numel()}")
+        raise ValueError(
+            f"masked_m must contain at least {cfg.experts} entries, got {masked_m.numel()}"
+        )
 
 
 def _apply_gate_up(gate: torch.Tensor, up: torch.Tensor, act: str) -> torch.Tensor:
@@ -257,7 +299,9 @@ def _compile_stage1_finalize_act(
     if act not in ("silu", "swiglu"):
         raise ValueError(f"stage1 finalize act must be silu/swiglu, got {act!r}")
     if stage1_weight_layout not in ("gguu", "gugu"):
-        raise ValueError(f"stage1 finalize layout must be gguu/gugu, got {stage1_weight_layout!r}")
+        raise ValueError(
+            f"stage1 finalize layout must be gguu/gugu, got {stage1_weight_layout!r}"
+        )
     block_threads = 256
     total_elems = int(experts) * int(max_m) * int(inter_dim)
     tmp_stride_e = int(max_m) * int(2 * inter_dim)
@@ -297,8 +341,8 @@ def _compile_stage1_finalize_act(
             col = rem0 - row * arith.index(inter_dim)
 
             valid_m = buffer_ops.buffer_load(
-                masked_rsrc, arith.index_cast(T.i32, e),
-                vec_width=1, dtype=T.i32)
+                masked_rsrc, arith.index_cast(T.i32, e), vec_width=1, dtype=T.i32
+            )
             row_ok = arith.cmpi(
                 arith.CmpIPredicate.slt,
                 arith.index_cast(T.i32, row),
@@ -306,8 +350,9 @@ def _compile_stage1_finalize_act(
             )
             if_row = scf.IfOp(row_ok, results_=[], has_else=False)
             with ir.InsertionPoint(if_row.then_block):
-                tmp_row_base = e * arith.index(tmp_stride_e) \
-                    + row * arith.index(2 * inter_dim)
+                tmp_row_base = e * arith.index(tmp_stride_e) + row * arith.index(
+                    2 * inter_dim
+                )
                 if const_expr(stage1_weight_layout == "gugu"):
                     gate_off = tmp_row_base + col * arith.index(2)
                     up_off = gate_off + arith.index(1)
@@ -315,11 +360,17 @@ def _compile_stage1_finalize_act(
                     gate_off = tmp_row_base + col
                     up_off = gate_off + arith.index(inter_dim)
                 gate_h = buffer_ops.buffer_load(
-                    tmp_rsrc, arith.index_cast(T.i32, gate_off),
-                    vec_width=1, dtype=elem_ty)
+                    tmp_rsrc,
+                    arith.index_cast(T.i32, gate_off),
+                    vec_width=1,
+                    dtype=elem_ty,
+                )
                 up_h = buffer_ops.buffer_load(
-                    tmp_rsrc, arith.index_cast(T.i32, up_off),
-                    vec_width=1, dtype=elem_ty)
+                    tmp_rsrc,
+                    arith.index_cast(T.i32, up_off),
+                    vec_width=1,
+                    dtype=elem_ty,
+                )
                 g = gate_h.extf(T.f32)
                 u = up_h.extf(T.f32)
                 one = arith.constant(1.0, type=T.f32)
@@ -332,16 +383,20 @@ def _compile_stage1_finalize_act(
                     u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                     t = g * alpha * neg_log2e
                     emu = llvm.call_intrinsic(
-                        T.f32, "llvm.amdgcn.exp2.f32", [t], [], [])
+                        T.f32, "llvm.amdgcn.exp2.f32", [t], [], []
+                    )
                     sig = llvm.call_intrinsic(
-                        T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], [])
+                        T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], []
+                    )
                     out_f = g * sig * (u + one)
                 else:
                     t = g * neg_log2e
                     emu = llvm.call_intrinsic(
-                        T.f32, "llvm.amdgcn.exp2.f32", [t], [], [])
+                        T.f32, "llvm.amdgcn.exp2.f32", [t], [], []
+                    )
                     sig = llvm.call_intrinsic(
-                        T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], [])
+                        T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], []
+                    )
                     out_f = g * sig * u
                 out_h = arith.trunc_f(elem_ty, out_f)
                 buffer_ops.buffer_store(out_h, y_rsrc, linear_i32)
@@ -358,8 +413,9 @@ def _compile_stage1_finalize_act(
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             pass
-        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) \
-            / arith.index(block_threads)
+        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) / arith.index(
+            block_threads
+        )
         launcher = stage1_finalize_act_kernel(arg_y, arg_tmp, arg_masked_m)
         launcher.launch(
             grid=(_raw(gx), 1, 1),
@@ -385,7 +441,9 @@ def _compile_stage1_finalize_act_bias(
     if act not in ("silu", "swiglu"):
         raise ValueError(f"stage1 finalize act must be silu/swiglu, got {act!r}")
     if stage1_weight_layout not in ("gguu", "gugu"):
-        raise ValueError(f"stage1 finalize layout must be gguu/gugu, got {stage1_weight_layout!r}")
+        raise ValueError(
+            f"stage1 finalize layout must be gguu/gugu, got {stage1_weight_layout!r}"
+        )
     block_threads = 256
     total_elems = int(experts) * int(max_m) * int(inter_dim)
     tmp_stride_e = int(max_m) * int(2 * inter_dim)
@@ -428,8 +486,8 @@ def _compile_stage1_finalize_act_bias(
             col = rem0 - row * arith.index(inter_dim)
 
             valid_m = buffer_ops.buffer_load(
-                masked_rsrc, arith.index_cast(T.i32, e),
-                vec_width=1, dtype=T.i32)
+                masked_rsrc, arith.index_cast(T.i32, e), vec_width=1, dtype=T.i32
+            )
             row_ok = arith.cmpi(
                 arith.CmpIPredicate.slt,
                 arith.index_cast(T.i32, row),
@@ -437,8 +495,9 @@ def _compile_stage1_finalize_act_bias(
             )
             if_row = scf.IfOp(row_ok, results_=[], has_else=False)
             with ir.InsertionPoint(if_row.then_block):
-                tmp_row_base = e * arith.index(tmp_stride_e) \
-                    + row * arith.index(2 * inter_dim)
+                tmp_row_base = e * arith.index(tmp_stride_e) + row * arith.index(
+                    2 * inter_dim
+                )
                 bias_row_base = e * arith.index(bias_stride_e)
                 if const_expr(stage1_weight_layout == "gugu"):
                     gate_off = tmp_row_base + col * arith.index(2)
@@ -451,17 +510,29 @@ def _compile_stage1_finalize_act_bias(
                     gate_bias_off = bias_row_base + col
                     up_bias_off = gate_bias_off + arith.index(inter_dim)
                 gate_h = buffer_ops.buffer_load(
-                    tmp_rsrc, arith.index_cast(T.i32, gate_off),
-                    vec_width=1, dtype=elem_ty)
+                    tmp_rsrc,
+                    arith.index_cast(T.i32, gate_off),
+                    vec_width=1,
+                    dtype=elem_ty,
+                )
                 up_h = buffer_ops.buffer_load(
-                    tmp_rsrc, arith.index_cast(T.i32, up_off),
-                    vec_width=1, dtype=elem_ty)
+                    tmp_rsrc,
+                    arith.index_cast(T.i32, up_off),
+                    vec_width=1,
+                    dtype=elem_ty,
+                )
                 gate_bias_h = buffer_ops.buffer_load(
-                    bias_rsrc, arith.index_cast(T.i32, gate_bias_off),
-                    vec_width=1, dtype=elem_ty)
+                    bias_rsrc,
+                    arith.index_cast(T.i32, gate_bias_off),
+                    vec_width=1,
+                    dtype=elem_ty,
+                )
                 up_bias_h = buffer_ops.buffer_load(
-                    bias_rsrc, arith.index_cast(T.i32, up_bias_off),
-                    vec_width=1, dtype=elem_ty)
+                    bias_rsrc,
+                    arith.index_cast(T.i32, up_bias_off),
+                    vec_width=1,
+                    dtype=elem_ty,
+                )
                 g = gate_h.extf(T.f32) + gate_bias_h.extf(T.f32)
                 u = up_h.extf(T.f32) + up_bias_h.extf(T.f32)
                 one = arith.constant(1.0, type=T.f32)
@@ -474,16 +545,20 @@ def _compile_stage1_finalize_act_bias(
                     u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                     t = g * alpha * neg_log2e
                     emu = llvm.call_intrinsic(
-                        T.f32, "llvm.amdgcn.exp2.f32", [t], [], [])
+                        T.f32, "llvm.amdgcn.exp2.f32", [t], [], []
+                    )
                     sig = llvm.call_intrinsic(
-                        T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], [])
+                        T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], []
+                    )
                     out_f = g * sig * (u + one)
                 else:
                     t = g * neg_log2e
                     emu = llvm.call_intrinsic(
-                        T.f32, "llvm.amdgcn.exp2.f32", [t], [], [])
+                        T.f32, "llvm.amdgcn.exp2.f32", [t], [], []
+                    )
                     sig = llvm.call_intrinsic(
-                        T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], [])
+                        T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], []
+                    )
                     out_f = g * sig * u
                 out_h = arith.trunc_f(elem_ty, out_f)
                 buffer_ops.buffer_store(out_h, y_rsrc, linear_i32)
@@ -501,10 +576,12 @@ def _compile_stage1_finalize_act_bias(
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             pass
-        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) \
-            / arith.index(block_threads)
+        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) / arith.index(
+            block_threads
+        )
         launcher = stage1_finalize_act_bias_kernel(
-            arg_y, arg_tmp, arg_bias, arg_masked_m)
+            arg_y, arg_tmp, arg_bias, arg_masked_m
+        )
         launcher.launch(
             grid=(_raw(gx), 1, 1),
             block=(block_threads, 1, 1),
@@ -514,29 +591,48 @@ def _compile_stage1_finalize_act_bias(
     return launch_stage1_finalize_act_bias
 
 
-def _check_stage2_args(y, x, w, scale_x, scale_w, masked_m, cfg: _GroupedA8W4Config) -> None:
+def _check_stage2_args(
+    y, x, w, scale_x, scale_w, masked_m, cfg: _GroupedA8W4Config
+) -> None:
     _check_rank("y", y, 3)
     _check_rank("x", x, 3)
     _check_rank("w", w, 3)
     _check_rank("scale_x", scale_x, 3)
     _check_rank("scale_w", scale_w, 3)
     if tuple(y.shape) != (cfg.experts, cfg.max_m, cfg.model_dim):
-        raise ValueError(f"y shape must be {(cfg.experts, cfg.max_m, cfg.model_dim)}, got {tuple(y.shape)}")
+        raise ValueError(
+            f"y shape must be {(cfg.experts, cfg.max_m, cfg.model_dim)}, got {tuple(y.shape)}"
+        )
     pack_a, pack_b = _pack_factors(cfg)
     if tuple(x.shape) != (cfg.experts, cfg.max_m, cfg.inter_dim // pack_a):
-        raise ValueError(f"x shape must be {(cfg.experts, cfg.max_m, cfg.inter_dim // pack_a)}, got {tuple(x.shape)}")
+        raise ValueError(
+            f"x shape must be {(cfg.experts, cfg.max_m, cfg.inter_dim // pack_a)}, got {tuple(x.shape)}"
+        )
     if tuple(w.shape) != (cfg.experts, cfg.model_dim, cfg.inter_dim // pack_b):
-        raise ValueError(f"w shape must be {(cfg.experts, cfg.model_dim, cfg.inter_dim // pack_b)}, got {tuple(w.shape)}")
+        raise ValueError(
+            f"w shape must be {(cfg.experts, cfg.model_dim, cfg.inter_dim // pack_b)}, got {tuple(w.shape)}"
+        )
     warp_tile_m = cfg.tile_m // cfg.m_warp
     warp_tile_n = cfg.tile_n // cfg.n_warp
-    scale_x_shape = _preshuffled_scale_shape(cfg.max_m, cfg.inter_dim, warp_tile_m, cfg.tile_k)
-    scale_w_shape = _preshuffled_scale_shape(cfg.model_dim, cfg.inter_dim, warp_tile_n, cfg.tile_k)
+    scale_x_shape = _preshuffled_scale_shape(
+        cfg.max_m, cfg.inter_dim, warp_tile_m, cfg.tile_k
+    )
+    scale_w_shape = _preshuffled_scale_shape(
+        cfg.model_dim, cfg.inter_dim, warp_tile_n, cfg.tile_k
+    )
     if tuple(scale_x.shape) != (cfg.experts, *scale_x_shape):
-        raise ValueError(f"scale_x shape must be {(cfg.experts, *scale_x_shape)}, got {tuple(scale_x.shape)}")
+        raise ValueError(
+            f"scale_x shape must be {(cfg.experts, *scale_x_shape)}, got {tuple(scale_x.shape)}"
+        )
     if tuple(scale_w.shape) != (cfg.experts, *scale_w_shape):
-        raise ValueError(f"scale_w shape must be {(cfg.experts, *scale_w_shape)}, got {tuple(scale_w.shape)}")
+        raise ValueError(
+            f"scale_w shape must be {(cfg.experts, *scale_w_shape)}, got {tuple(scale_w.shape)}"
+        )
     if masked_m.numel() < cfg.experts:
-        raise ValueError(f"masked_m must contain at least {cfg.experts} entries, got {masked_m.numel()}")
+        raise ValueError(
+            f"masked_m must contain at least {cfg.experts} entries, got {masked_m.numel()}"
+        )
+
 
 def _compile_base_a8w4_gemm(
     *,
@@ -610,15 +706,30 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     data_format: str = "a8w4",
 ):
     cfg = _GroupedA8W4Config(
-        model_dim=int(model_dim), inter_dim=int(inter_dim), experts=int(experts),
-        max_m=int(max_m), tile_m=int(tile_m), tile_n=int(tile_n), tile_k=int(tile_k),
-        m_warp=int(m_warp), n_warp=int(n_warp), num_buffers=int(num_buffers),
-        waves_per_eu=waves_per_eu, out_dtype=str(out_dtype), use_tdm_store=bool(use_tdm_store),
-        inst_prefetch=bool(inst_prefetch), wave_specialized_tdm=bool(wave_specialized_tdm),
+        model_dim=int(model_dim),
+        inter_dim=int(inter_dim),
+        experts=int(experts),
+        max_m=int(max_m),
+        tile_m=int(tile_m),
+        tile_n=int(tile_n),
+        tile_k=int(tile_k),
+        m_warp=int(m_warp),
+        n_warp=int(n_warp),
+        num_buffers=int(num_buffers),
+        waves_per_eu=waves_per_eu,
+        out_dtype=str(out_dtype),
+        use_tdm_store=bool(use_tdm_store),
+        inst_prefetch=bool(inst_prefetch),
+        wave_specialized_tdm=bool(wave_specialized_tdm),
         split_k=int(split_k),
-        cluster_m=int(cluster_m), cluster_n=int(cluster_n), use_scale_opsel=bool(use_scale_opsel),
-        expert_sched_mode=bool(expert_sched_mode), grouped_persistent_m=bool(grouped_persistent_m),
-        persistent_workers=persistent_workers, data_format=str(data_format), act=str(act),
+        cluster_m=int(cluster_m),
+        cluster_n=int(cluster_n),
+        use_scale_opsel=bool(use_scale_opsel),
+        expert_sched_mode=bool(expert_sched_mode),
+        grouped_persistent_m=bool(grouped_persistent_m),
+        persistent_workers=persistent_workers,
+        data_format=str(data_format),
+        act=str(act),
         stage1_weight_layout=str(stage1_weight_layout),
     )
     _validate_common(cfg)
@@ -626,16 +737,29 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     fused_base_bias = None
     fused_n = cfg.inter_dim
     if cfg.split_k == 1:
-        fused_n = 2 * cfg.inter_dim if cfg.stage1_weight_layout == "gugu" else cfg.inter_dim
+        fused_n = (
+            2 * cfg.inter_dim if cfg.stage1_weight_layout == "gugu" else cfg.inter_dim
+        )
         fused_base = _compile_base_a8w4_gemm(
-            K=cfg.model_dim, N=fused_n, cfg=cfg, stage1_act=cfg.act,
-            stage1_weight_layout=cfg.stage1_weight_layout, kernel_tag="gemm1")
+            K=cfg.model_dim,
+            N=fused_n,
+            cfg=cfg,
+            stage1_act=cfg.act,
+            stage1_weight_layout=cfg.stage1_weight_layout,
+            kernel_tag="gemm1",
+        )
         fused_base_bias = _compile_base_a8w4_gemm(
-            K=cfg.model_dim, N=fused_n, cfg=cfg,
-            stage1_act=cfg.act, epilogue_bias=True,
-            stage1_weight_layout=cfg.stage1_weight_layout, kernel_tag="gemm1_bias")
+            K=cfg.model_dim,
+            N=fused_n,
+            cfg=cfg,
+            stage1_act=cfg.act,
+            epilogue_bias=True,
+            stage1_weight_layout=cfg.stage1_weight_layout,
+            kernel_tag="gemm1_bias",
+        )
     raw_base = _compile_base_a8w4_gemm(
-        K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg, kernel_tag="gemm1_raw")
+        K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg, kernel_tag="gemm1_raw"
+    )
     finalize_act = _compile_stage1_finalize_act(
         experts=cfg.experts,
         max_m=cfg.max_m,
@@ -653,10 +777,28 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         stage1_weight_layout=cfg.stage1_weight_layout,
     )
 
-    def launch(y, x, w, scale_x, scale_w, masked_m, max_m_arg, inter_dim_arg,
-               model_dim_arg, experts_arg, *, stream=None, _gemm_events=None,
-               _m_tile_prefix=None, _m_tile_map=None, _tmp=None, _skip_epilogue=False,
-               bias=None, _debug_tmp_sentinel=None, _debug_tmp_out=None):
+    def launch(
+        y,
+        x,
+        w,
+        scale_x,
+        scale_w,
+        masked_m,
+        max_m_arg,
+        inter_dim_arg,
+        model_dim_arg,
+        experts_arg,
+        *,
+        stream=None,
+        _gemm_events=None,
+        _m_tile_prefix=None,
+        _m_tile_map=None,
+        _tmp=None,
+        _skip_epilogue=False,
+        bias=None,
+        _debug_tmp_sentinel=None,
+        _debug_tmp_out=None,
+    ):
         """If `_gemm_events=(start, end)` is given, those cuda.Events are
         recorded immediately before / after the GEMM kernel launch only, so the
         caller can measure pure GEMM device time excluding prefix-sum and
@@ -671,8 +813,15 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             (before the silu(gate)*up epilogue) is appended so the caller can
             inspect raw GEMM output statistics.
         """
-        if int(max_m_arg) != cfg.max_m or int(inter_dim_arg) != cfg.inter_dim or int(model_dim_arg) != cfg.model_dim or int(experts_arg) != cfg.experts:
-            raise ValueError("runtime dimensions must match compile-time grouped A8W4 stage1 config")
+        if (
+            int(max_m_arg) != cfg.max_m
+            or int(inter_dim_arg) != cfg.inter_dim
+            or int(model_dim_arg) != cfg.model_dim
+            or int(experts_arg) != cfg.experts
+        ):
+            raise ValueError(
+                "runtime dimensions must match compile-time grouped A8W4 stage1 config"
+            )
         _check_stage1_args(y, x, w, scale_x, scale_w, masked_m, cfg)
         _check_bias_args("bias", bias, (cfg.experts, 2 * cfg.inter_dim), y)
         if stream is None:
@@ -690,7 +839,9 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             if tmp is None:
                 tmp = torch.empty(
                     (cfg.experts, cfg.max_m, 2 * cfg.inter_dim),
-                    device=y.device, dtype=y.dtype)
+                    device=y.device,
+                    dtype=y.dtype,
+                )
             if _debug_tmp_sentinel is not None:
                 tmp.fill_(float(_debug_tmp_sentinel))
             if cfg.split_k > 1:
@@ -707,19 +858,50 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             if use_fused_gemm:
                 if bias is not None:
                     _run_compiled(
-                        fused_gemm, y, x, w, scale_x, scale_w, bias,
-                        masked_m, m_tile_prefix, m_tile_map,
-                        cfg.max_m, fused_n, stream)
+                        fused_gemm,
+                        y,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        bias,
+                        masked_m,
+                        m_tile_prefix,
+                        m_tile_map,
+                        cfg.max_m,
+                        fused_n,
+                        stream,
+                    )
                 else:
                     _run_compiled(
-                        fused_gemm, y, x, w, scale_x, scale_w,
-                        masked_m, m_tile_prefix, m_tile_map,
-                        cfg.max_m, fused_n, stream)
+                        fused_gemm,
+                        y,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        masked_m,
+                        m_tile_prefix,
+                        m_tile_map,
+                        cfg.max_m,
+                        fused_n,
+                        stream,
+                    )
             else:
                 _run_compiled(
-                    raw_base, tmp, x, w, scale_x, scale_w,
-                    masked_m, m_tile_prefix, m_tile_map,
-                    cfg.max_m, 2 * cfg.inter_dim, stream)
+                    raw_base,
+                    tmp,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    masked_m,
+                    m_tile_prefix,
+                    m_tile_map,
+                    cfg.max_m,
+                    2 * cfg.inter_dim,
+                    stream,
+                )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
         else:
@@ -728,16 +910,44 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             if use_fused_gemm:
                 if bias is not None:
                     _run_compiled(
-                        fused_gemm, y, x, w, scale_x, scale_w, bias, masked_m,
-                        cfg.max_m, fused_n, stream)
+                        fused_gemm,
+                        y,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        bias,
+                        masked_m,
+                        cfg.max_m,
+                        fused_n,
+                        stream,
+                    )
                 else:
                     _run_compiled(
-                        fused_gemm, y, x, w, scale_x, scale_w, masked_m,
-                        cfg.max_m, fused_n, stream)
+                        fused_gemm,
+                        y,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        masked_m,
+                        cfg.max_m,
+                        fused_n,
+                        stream,
+                    )
             else:
                 _run_compiled(
-                    raw_base, tmp, x, w, scale_x, scale_w, masked_m,
-                    cfg.max_m, 2 * cfg.inter_dim, stream)
+                    raw_base,
+                    tmp,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    masked_m,
+                    cfg.max_m,
+                    2 * cfg.inter_dim,
+                    stream,
+                )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
         if use_fused_gemm:
@@ -785,30 +995,71 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     data_format: str = "a8w4",
 ):
     cfg = _GroupedA8W4Config(
-        model_dim=int(model_dim), inter_dim=int(inter_dim), experts=int(experts),
-        max_m=int(max_m), tile_m=int(tile_m), tile_n=int(tile_n), tile_k=int(tile_k),
-        m_warp=int(m_warp), n_warp=int(n_warp), num_buffers=int(num_buffers),
-        waves_per_eu=waves_per_eu, out_dtype=str(out_dtype), use_tdm_store=bool(use_tdm_store),
-        inst_prefetch=bool(inst_prefetch), wave_specialized_tdm=bool(wave_specialized_tdm),
+        model_dim=int(model_dim),
+        inter_dim=int(inter_dim),
+        experts=int(experts),
+        max_m=int(max_m),
+        tile_m=int(tile_m),
+        tile_n=int(tile_n),
+        tile_k=int(tile_k),
+        m_warp=int(m_warp),
+        n_warp=int(n_warp),
+        num_buffers=int(num_buffers),
+        waves_per_eu=waves_per_eu,
+        out_dtype=str(out_dtype),
+        use_tdm_store=bool(use_tdm_store),
+        inst_prefetch=bool(inst_prefetch),
+        wave_specialized_tdm=bool(wave_specialized_tdm),
         split_k=int(split_k),
-        cluster_m=int(cluster_m), cluster_n=int(cluster_n), use_scale_opsel=bool(use_scale_opsel),
-        expert_sched_mode=bool(expert_sched_mode), grouped_persistent_m=bool(grouped_persistent_m),
-        persistent_workers=persistent_workers, data_format=str(data_format),
+        cluster_m=int(cluster_m),
+        cluster_n=int(cluster_n),
+        use_scale_opsel=bool(use_scale_opsel),
+        expert_sched_mode=bool(expert_sched_mode),
+        grouped_persistent_m=bool(grouped_persistent_m),
+        persistent_workers=persistent_workers,
+        data_format=str(data_format),
     )
     _validate_common(cfg)
     base = _compile_base_a8w4_gemm(
-        K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, kernel_tag="gemm2")
+        K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, kernel_tag="gemm2"
+    )
     base_bias = _compile_base_a8w4_gemm(
-        K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, epilogue_bias=True,
-        kernel_tag="gemm2_bias")
+        K=cfg.inter_dim,
+        N=cfg.model_dim,
+        cfg=cfg,
+        epilogue_bias=True,
+        kernel_tag="gemm2_bias",
+    )
 
-    def launch(y, x, w, scale_x, scale_w, masked_m, max_m_arg, model_dim_arg,
-               inter_dim_arg, experts_arg, *, stream=None, _gemm_events=None,
-               _m_tile_prefix=None, _m_tile_map=None, bias=None):
+    def launch(
+        y,
+        x,
+        w,
+        scale_x,
+        scale_w,
+        masked_m,
+        max_m_arg,
+        model_dim_arg,
+        inter_dim_arg,
+        experts_arg,
+        *,
+        stream=None,
+        _gemm_events=None,
+        _m_tile_prefix=None,
+        _m_tile_map=None,
+        bias=None,
+    ):
         """If `_gemm_events=(start, end)` is given, record around the GEMM
         kernel launch only -- excludes prefix-sum prep work."""
-        if int(max_m_arg) != cfg.max_m or int(model_dim_arg) != cfg.model_dim or int(inter_dim_arg) != cfg.inter_dim or int(experts_arg) != cfg.experts:
-            raise ValueError("runtime dimensions must match compile-time grouped A8W4 stage2 config")
+        if (
+            int(max_m_arg) != cfg.max_m
+            or int(model_dim_arg) != cfg.model_dim
+            or int(inter_dim_arg) != cfg.inter_dim
+            or int(experts_arg) != cfg.experts
+        ):
+            raise ValueError(
+                "runtime dimensions must match compile-time grouped A8W4 stage2 config"
+            )
         _check_stage2_args(y, x, w, scale_x, scale_w, masked_m, cfg)
         _check_bias_args("bias", bias, (cfg.experts, cfg.model_dim), y)
         if stream is None:
@@ -827,13 +1078,35 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 _gemm_events[0].record(stream)
             if bias is not None:
                 _run_compiled(
-                    gemm, y, x, w, scale_x, scale_w, bias,
-                    masked_m, m_tile_prefix, m_tile_map,
-                    cfg.max_m, cfg.model_dim, stream)
+                    gemm,
+                    y,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    bias,
+                    masked_m,
+                    m_tile_prefix,
+                    m_tile_map,
+                    cfg.max_m,
+                    cfg.model_dim,
+                    stream,
+                )
             else:
                 _run_compiled(
-                    gemm, y, x, w, scale_x, scale_w, masked_m, m_tile_prefix, m_tile_map,
-                    cfg.max_m, cfg.model_dim, stream)
+                    gemm,
+                    y,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    masked_m,
+                    m_tile_prefix,
+                    m_tile_map,
+                    cfg.max_m,
+                    cfg.model_dim,
+                    stream,
+                )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
         else:
@@ -841,12 +1114,31 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 _gemm_events[0].record(stream)
             if bias is not None:
                 _run_compiled(
-                    gemm, y, x, w, scale_x, scale_w, bias, masked_m,
-                    cfg.max_m, cfg.model_dim, stream)
+                    gemm,
+                    y,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    bias,
+                    masked_m,
+                    cfg.max_m,
+                    cfg.model_dim,
+                    stream,
+                )
             else:
                 _run_compiled(
-                    gemm, y, x, w, scale_x, scale_w, masked_m,
-                    cfg.max_m, cfg.model_dim, stream)
+                    gemm,
+                    y,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    masked_m,
+                    cfg.max_m,
+                    cfg.model_dim,
+                    stream,
+                )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
         return y
