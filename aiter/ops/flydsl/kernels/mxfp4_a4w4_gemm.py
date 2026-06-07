@@ -566,6 +566,11 @@ def compile_mxfp4_gemm2_a4w4(
             # no buffer_load->reg->ds_write round-trip.
             load_a_directlds_bm16(0, 0)
             load_a_directlds_bm16(1, 1)
+            # sched fence (== HIP gemm2 issue path: sched_barrier(0) right after
+            # the A direct-LDS DMA): pin the A loads ahead of the B/scale loads so
+            # the scheduler cannot sink B (or MFMA) above the A DMA. mask 0 = no
+            # instruction may cross. Keeps the load cluster -> MFMA cluster split.
+            rocdl.sched_barrier(0)
             # issue B (gate/up weights, the bulk of VMEM) + scales BEFORE the
             # barrier so their latency overlaps the A direct-LDS DMA (== HIP:
             # all loads issued, then the drain barrier only waits for the A DMA
