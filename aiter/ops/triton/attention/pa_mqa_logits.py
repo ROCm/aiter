@@ -506,6 +506,7 @@ def deepgemm_fp8_paged_mqa_logits(
         )
         if triton_version >= Version("3.5.0"):
             cdna_version = get_cdna_version()
+            is_gfx1250 = get_gfx() == "gfx1250"
             kernel[grid](
                 batch_size,
                 next_n,
@@ -533,6 +534,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 KVBlockSize,
                 hidden_dim,
                 cdna_version,
+                is_gfx1250,
             )
         else:  #  load AOT compiled gluon kernel
             assert triton_version < Version(
