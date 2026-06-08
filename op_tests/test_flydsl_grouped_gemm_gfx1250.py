@@ -65,6 +65,11 @@ VERIFY_TOL_ALL_ONES = 0.01
 # Environment / arch guards
 # ---------------------------------------------------------------------------
 def _require_gfx1250() -> None:
+    # AITER_FORCE_GFX1250=1 forces the grouped path on other archs (e.g. gfx942)
+    # to exercise the tiny operators with the GEMM mocked (default; pass
+    # --real-gemm to call the real gfx1250 kernel instead).
+    if os.environ.get("AITER_FORCE_GFX1250", "0") in ("1", "true", "True", "yes"):
+        return
     try:
         from flydsl.runtime.device import get_rocm_arch
     except Exception as exc:
@@ -650,6 +655,38 @@ def _bench(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def _mock_grouped_gemm() -> None:
+    """Run the grouped MoE path without the gfx1250-only kernels.
+
+    Two patches let the tiny operators (route maps, scatter/gather, quant,
+    scale preshuffle, m-tile map, gather-reduce) run on any arch (e.g. gfx942
+    via AITER_FORCE_GFX1250=1):
+
+    1. Replace the grouped WMMA GEMM compilers with no-op launchers -- the GEMM
+       executes nothing; stage outputs are left as-is.
+    2. Route the fp4 a1/a2 quant through the Triton implementation, since the
+       HIP ``per_1x32_f4_quant_hip`` has no fp4x2 output support off gfx1250.
+
+    The library imports all these names at call time, so patching the source
+    modules is enough -- no library edits required.
+    """
+    import aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 as gk
+    import aiter.ops.quant as q
+
+    def _noop_compile(*_a, **_k):
+        return lambda *_a, **_k: None
+
+    for _name in (
+        "compile_moe_grouped_gemm1_a8w4_masked",
+        "compile_moe_grouped_gemm2_a8w4_masked",
+        "compile_moe_grouped_gemm1_mxfp4_masked",
+        "compile_moe_grouped_gemm2_mxfp4_masked",
+    ):
+        setattr(gk, _name, _noop_compile)
+
+    q.per_1x32_f4_quant_hip = q.per_1x32_f4_quant_triton
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=("bench", "verify"), default="bench")
@@ -682,6 +719,12 @@ def main() -> None:
         help="run with zero stage1/stage2 bias tensors",
     )
     parser.add_argument(
+        "--real-gemm",
+        action="store_true",
+        help="call the real grouped WMMA GEMM kernel (gfx1250 only). Default: "
+        "mock the GEMM (no-op) so the tiny operators run on any arch.",
+    )
+    parser.add_argument(
         "--all-ones",
         action="store_true",
         help="(verify only) hidden=1, weight bytes=0x22 (=+1.0), "
@@ -689,6 +732,8 @@ def main() -> None:
         "grouped and ref see the exact same dequantised values.",
     )
     args = parser.parse_args()
+    if not args.real_gemm:
+        _mock_grouped_gemm()
     if args.model_dim < 512 or args.inter_dim < 512:
         raise SystemExit(
             f"model_dim ({args.model_dim}) and inter_dim ({args.inter_dim}) must be "
