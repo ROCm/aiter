@@ -551,6 +551,7 @@ def moe_gemm_a8w4(
             XCD_SWIZZLE=config["xcd_swizzle"],
             NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            PRESHUFFLED=preshuffled,
             MASK_K_LIMIT=K % config["block_k"],
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
