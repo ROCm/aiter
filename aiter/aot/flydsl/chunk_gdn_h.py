@@ -7,10 +7,10 @@
 
 Reads the offline-tuned BV lookup table
 ``aiter/ops/flydsl/chunk_gdn_h_tuned.csv`` (the same file consumed at
-runtime by ``_lookup_tuned_bv`` in ``linear_attention_prefill_kernels``),
-extracts every unique compile-time configuration, and pre-compiles it
-into the FlyDSL disk cache so that the first inference call does not pay
-the JIT cost.
+runtime by ``_lookup_csv_bv`` / ``_heuristic_bv`` in
+``linear_attention_prefill_kernels``), extracts every unique compile-time
+configuration, and pre-compiles it into the FlyDSL disk cache so that the
+first inference call does not pay the JIT cost.
 
 Each csv row is compiled twice -- once with ``STATE_DTYPE_BF16=False``
 (legacy f32-state runtime path) and once with ``STATE_DTYPE_BF16=True``

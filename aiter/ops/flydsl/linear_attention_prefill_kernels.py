@@ -21,7 +21,7 @@ from __future__ import annotations
 import csv
 import functools
 import math
-import os
+import warnings
 from pathlib import Path
 
 import torch
@@ -120,7 +120,28 @@ def _load_tuned_bv_map() -> dict[tuple, tuple[int, float]]:
                 except (KeyError, TypeError, ValueError):
                     continue
                 prev = out.get(key)
-                if prev is None or dur < prev[1]:
+                if prev is None:
+                    out[key] = (bv, dur)
+                    continue
+                # Ambiguity guard: the lookup key intentionally omits the
+                # use_g/use_gk/use_h0/store_fs/save_vn/wu_contig switches (they
+                # are not tuned as independent BV dimensions today). If a future
+                # csv edit introduces two rows that share this key but disagree
+                # on BV, the min-duration row silently wins -- which could be a
+                # row tuned under a different switch combo than the caller's.
+                # Surface it so the csv author can decide whether the switch
+                # belongs in the key.
+                if bv != prev[0]:
+                    warnings.warn(
+                        "FlyDSL K5 tuned csv: conflicting BV for shape key "
+                        f"{key}: BV={prev[0]} (dur={prev[1]:.1f}) vs BV={bv} "
+                        f"(dur={dur:.1f}); keeping the lower-duration row. If "
+                        "these rows differ only by a use_*/store_fs/save_vn/"
+                        "wu_contig switch, consider adding that switch to the "
+                        "lookup key.",
+                        stacklevel=2,
+                    )
+                if dur < prev[1]:
                     out[key] = (bv, dur)
     except OSError:
         # No csv on disk (e.g. trimmed deployment): rule-only path.
@@ -493,62 +514,6 @@ def _target_bv_for_shape(
     if is_varlen and H == 16 and T_flat >= 32768 and N >= 7:
         return 64
     return None
-
-
-@functools.lru_cache(maxsize=4096)
-def _lookup_tuned_bv(
-    dtype_str,
-    K,
-    V,
-    BT,
-    H,
-    Hg,
-    T_flat,
-    N,
-    use_g,
-    use_gk,
-    use_h0,
-    store_fs,
-    save_vn,
-    is_varlen,
-    wu_contig,
-    min_seqlen=None,
-):
-    """Select ``BV`` with the rule-based grid/CU heuristic.
-
-    The heuristic is a pure function of its scalar arguments, so we
-    memoize it. The argument set has finite cardinality in practice
-    (a few dozen unique shapes per workload), so ``lru_cache`` of
-    4k entries is more than enough to make this a permanent hit
-    after warm-up. Reduces the heuristic chain from ~0.83us to
-    ~0.15us per call.
-
-    ``min_seqlen`` (smallest segment length in a varlen batch) is part
-    of the cache key because the N=2 "balanced-split" carve-out in
-    ``_target_bv_for_shape`` distinguishes "head ~= T/2" from
-    "head << T"; two shapes with the same (T_flat, N) but different
-    min_seqlen can pick different BVs.
-    """
-    del (
-        dtype_str,
-        K,
-        BT,
-        use_g,
-        use_gk,
-        use_h0,
-        store_fs,
-        save_vn,
-        wu_contig,
-    )
-    return _heuristic_bv(
-        H=H,
-        Hg=Hg,
-        V=V,
-        T_flat=T_flat,
-        N=N,
-        is_varlen=is_varlen,
-        min_seqlen=min_seqlen,
-    )
 
 
 def _heuristic_bv(
