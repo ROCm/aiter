@@ -819,7 +819,7 @@ parser.add_argument(
     "--num_splits",
     type=int,
     default=0,
-    help="native split-K num_splits (0=heuristic, >=1 forces native if capable)",
+    help="native split-K num_splits (0=auto/heuristic, 1=disable split-K, >=2 forces native if capable)",
 )
 if __name__ == "__main__":
     args = parser.parse_args()

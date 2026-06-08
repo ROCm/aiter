@@ -1456,6 +1456,7 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_q", cu_seqlens_q)
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
+    assert num_splits >= 0, f"num_splits must be >= 0 (0=auto), got {num_splits}"
     if can_impl_fmha_native():
         ns = (
             num_splits
@@ -2121,6 +2122,10 @@ def flash_attn_func(
            (they might not have the right scaling).
         cu_seqlens_q: (batch_size + 1,). The cumulative sequence lengths of the query sequences.
         cu_seqlens_kv: (batch_size + 1,). The cumulative sequence lengths of the key/value sequences.
+        num_splits: int. Number of key/value splits for the native split-K forward path.
+            0 (default) lets aiter decide via a heuristic; 1 disables split-K (uses the
+            standard CK/ASM dispatch); >=2 forces the native split-K kernel with that many
+            splits when that path is applicable, otherwise num_splits is ignored.
     Return:
         out: (batch_size, seqlen, nheads, headdim_v).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
