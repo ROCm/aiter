@@ -162,6 +162,32 @@ struct pa_sparse_prefill_fp8_kargs
     float softmax_scale;
 };
 
+// Compile-time tile config for the fused fp8 (v4-layout) prefill kernel.
+// Head dim DFULL = DNOPE (fp8, per-KTSZ-tile e8m0 scale) + DROPE (bf16).
+// One warp handles a QTILE-head tile; up to MAX_WARPS independent head-tiles
+// per block. KVTILE must be a multiple of 16; DNOPE a multiple of KTSZ.
+template <int Q_TILE_       = 16,
+          int KV_TILE_      = 32,
+          int D_NOPE_       = 448,
+          int D_ROPE_       = 64,
+          int KV_SCALE_TILE_ = 64,
+          int MAX_WARPS_    = 4>
+struct pa_prefill_fp8_traits
+{
+    static constexpr int QTILE     = Q_TILE_;
+    static constexpr int KVTILE    = KV_TILE_;
+    static constexpr int DNOPE     = D_NOPE_;
+    static constexpr int DROPE     = D_ROPE_;
+    static constexpr int DFULL     = D_NOPE_ + D_ROPE_;
+    static constexpr int KTSZ      = KV_SCALE_TILE_;
+    static constexpr int NTILE     = D_NOPE_ / KV_SCALE_TILE_;
+    static constexpr int NSUB      = KV_TILE_ / 16;
+    static constexpr int MAX_WARPS = MAX_WARPS_;
+    static constexpr int WARP_SIZE = 64;
+    static_assert(D_NOPE_ % KV_SCALE_TILE_ == 0, "DNOPE must be a multiple of KTSZ");
+    static_assert(KV_TILE_ % 16 == 0, "KVTILE must be a multiple of 16");
+};
+
 // Compile-time tile/MFMA configuration for the 16mx8_32nx1 variant (T_M=NUM_WARPS,
 // T_N=1). Used when H > 32. KV_TILE=32, NUM_WARPS=8, BLOCK_SIZE=512.
 template <int Q_TILE_SIZE_  = 16,
@@ -325,6 +351,7 @@ __global__ void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs kargs);
 template <class Traits>
 __global__ void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs kargs);
 __global__ void pa_v4_fp8_dequant_kernel(pa_v4_dequant_kargs kargs);
+template <class Traits>
 __global__ void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs);
 
 // Pull in the device kernel template bodies only on the gfx950 device pass.
@@ -340,6 +367,7 @@ __global__ void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs)
 __global__ void pa_v4_fp8_dequant_kernel(pa_v4_dequant_kargs)
 {
 }
+template <class Traits>
 __global__ void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs)
 {
 }
@@ -400,32 +428,34 @@ __global__ void pa_v4_fp8_dequant_kernel(pa_v4_dequant_kargs kargs)
 // ============================================================================
 namespace pa_fp8_fused {
 
-constexpr int QTILE  = 16;
-constexpr int KVTILE = 32;  // occupancy-bound: larger tiles -> more VGPRs -> slower
-constexpr int DNOPE  = 448;
-constexpr int DROPE  = 64;
-constexpr int DFULL  = 512;
-constexpr int KTSZ   = 64;   // e8m0 tile size along nope
-constexpr int NTILE  = 7;    // DNOPE / KTSZ
-constexpr int NSUB   = KVTILE / 16; // 2
-
 using fp8x8_t  = opus::fp8x8_t;
 using bf16x8_t = opus::bf16x8_t;
 using fp32x4_t = opus::vector_t<float, 4>;
 
 }  // namespace pa_fp8_fused
 
+template <class Traits>
 __global__ __launch_bounds__(256, 1)
 void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs)
 {
     using namespace opus;
     using namespace pa_fp8_fused;
+    using T = opus::remove_cvref_t<Traits>;
+    constexpr int QTILE = T::QTILE;
+    constexpr int KVTILE = T::KVTILE;
+    constexpr int DNOPE = T::DNOPE;
+    constexpr int DROPE = T::DROPE;
+    constexpr int DFULL = T::DFULL;
+    constexpr int KTSZ = T::KTSZ;
+    constexpr int NTILE = T::NTILE;
+    constexpr int NSUB = T::NSUB;
+    constexpr int MAXW = T::MAX_WARPS;
     constexpr float LOG2_E = 1.44269504089f;
 
     const int qtok = blockIdx.x;
     const int hblk = blockIdx.y;
     const int H    = kargs.H;
-    const int nwarp   = blockDim.x / 64;   // 1..4 independent head-tiles / block
+    const int nwarp   = blockDim.x / 64;   // 1..MAXW independent head-tiles / block
     const int warp_id = threadIdx.x / 64;
     const int h0   = (hblk * nwarp + warp_id) * QTILE;  // exact: nwarp | (H/16)
     const int lane = threadIdx.x % 64;     // 0..63 within warp
@@ -437,12 +467,12 @@ void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs)
     const bf16_t* q_rope = reinterpret_cast<const bf16_t*>(kargs.q_rope);
     const float*  q_scale = kargs.q_scale;
 
-    // ---- smem (per-warp slices; sized for up to 4 warps) ----
-    __shared__ float  sS_all[4 * QTILE * KVTILE];
-    __shared__ bf16_t sP_all[4 * QTILE * KVTILE];
-    __shared__ float  s_m_all[4 * QTILE];
-    __shared__ float  s_l_all[4 * QTILE];
-    __shared__ float  s_corr_all[4 * QTILE];
+    // ---- smem (per-warp slices; sized for up to MAX_WARPS warps) ----
+    __shared__ float  sS_all[MAXW * QTILE * KVTILE];
+    __shared__ bf16_t sP_all[MAXW * QTILE * KVTILE];
+    __shared__ float  s_m_all[MAXW * QTILE];
+    __shared__ float  s_l_all[MAXW * QTILE];
+    __shared__ float  s_corr_all[MAXW * QTILE];
     float*  sS     = sS_all + warp_id * (QTILE * KVTILE);
     bf16_t* sP     = sP_all + warp_id * (QTILE * KVTILE);
     float*  s_m    = s_m_all + warp_id * QTILE;

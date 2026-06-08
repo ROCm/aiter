@@ -285,15 +285,18 @@ void pa_sparse_prefill_opus_fp8_fused_fwd(aiter_tensor_t& q_nope,
 
     HipDeviceGuard guard(q_nope.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
-    // Pack up to 4 independent head-tiles per block (more resident waves to hide
+    // v4 layout: 448 nope + 64 rope, e8m0 scale per 64-elem tile, KV tile 32,
+    // up to MAX_WARPS=4 independent head-tiles/block.
+    using Traits = pa_prefill_fp8_traits<16, 32, 448, 64, 64, 4>;
+    // Pack up to MAX_WARPS head-tiles per block (more resident waves to hide
     // memory latency). nwarp must divide H/16 so every warp maps to a valid head.
-    const int htiles = H / 16;
+    const int htiles = H / Traits::QTILE;
     int nwarp = 1;
-    for (int nw = 4; nw >= 1; --nw) {
+    for (int nw = Traits::MAX_WARPS; nw >= 1; --nw) {
         if (htiles % nw == 0) { nwarp = nw; break; }
     }
     dim3 grid(N, htiles / nwarp, 1);
-    dim3 block(nwarp * 64);
-    pa_prefill_fp8_fused_kernel<<<grid, block, 0, stream>>>(kargs);
+    dim3 block(nwarp * Traits::WARP_SIZE);
+    pa_prefill_fp8_fused_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
