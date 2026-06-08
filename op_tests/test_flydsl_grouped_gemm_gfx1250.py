@@ -79,6 +79,20 @@ def _require_gfx1250() -> None:
         pytest.skip(f"requires gfx1250, got {arch!r}")
 
 
+def _is_gfx1250() -> bool:
+    """True when the running device is actually gfx1250 (real GEMM works there).
+
+    Drives the ``--real-gemm`` default: real kernels run on real gfx1250, the
+    mock is for exercising the tiny operators off-arch (e.g. gfx942 forced via
+    AITER_FORCE_GFX1250=1). Detection uses the actual device arch, independent
+    of AITER_FORCE_GFX1250 (which only relaxes the pytest arch guard).
+    """
+    try:
+        return "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName.lower()
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Weight / scale preshuffle helpers (mandatory for the grouped path)
 #
@@ -720,9 +734,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--real-gemm",
-        action="store_true",
-        help="call the real grouped WMMA GEMM kernel (gfx1250 only). Default: "
-        "mock the GEMM (no-op) so the tiny operators run on any arch.",
+        action=argparse.BooleanOptionalAction,
+        default=_is_gfx1250(),
+        help="call the real grouped WMMA GEMM kernel. Default: on for real "
+        "gfx1250, off elsewhere (mock the GEMM as a no-op so the tiny "
+        "operators run on any arch). Use --no-real-gemm to force the mock.",
     )
     parser.add_argument(
         "--all-ones",
