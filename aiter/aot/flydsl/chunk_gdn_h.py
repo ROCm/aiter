@@ -180,7 +180,6 @@ def _compile_executable_to_cache(exe, *args) -> None:
 def _compile_chunk_gdn_h_to_cache(
     *,
     dtype: str,
-    arch: str,
     K: int,
     V: int,
     BT: int,
@@ -201,8 +200,7 @@ def _compile_chunk_gdn_h_to_cache(
 
     import torch
 
-    has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
-    dev = torch.device("cuda") if has_cuda else torch.device("cpu")
+    dev = torch.device("cpu")
     torch_dtype = _torch_dtype_for_kernel(dtype)
     state_dtype = torch.bfloat16 if state_bf16 else torch.float32
 
@@ -231,7 +229,7 @@ def _compile_chunk_gdn_h_to_cache(
     cu_seqlens = torch.zeros((N + 1,), device=dev, dtype=torch.int32)
     chunk_offsets = torch.zeros((N + 1,), device=dev, dtype=torch.int32)
 
-    stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
+    stream = fx.Stream(0)
 
     launch_fn = compile_chunk_gated_delta_h(
         K=K,
@@ -323,12 +321,15 @@ def compile_one_config(
         "compile_arch": aot_arch,
     }
 
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
     t0 = time.time()
     try:
-        with override_env("ARCH", aot_arch), override_env("FLYDSL_GPU_ARCH", aot_arch):
+        with override_env("ARCH", aot_arch), override_env(
+            "FLYDSL_GPU_ARCH", aot_arch
+        ), FakeTensorMode():
             _compile_chunk_gdn_h_to_cache(
                 dtype=dtype,
-                arch=aot_arch,
                 K=K,
                 V=V,
                 BT=BT,

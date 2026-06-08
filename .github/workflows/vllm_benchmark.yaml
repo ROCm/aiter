@@ -19,6 +19,7 @@ env:
   DOCKER_PULL_MAX_ATTEMPTS: "3"
   DOCKER_PULL_RETRY_DELAY_SECONDS: "10"
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-whl-${{ github.run_id }}
+  TRITON_WHEEL_ARTIFACT_NAME: triton_wheelhouse
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -97,7 +98,6 @@ jobs:
               pip uninstall -y aiter amd-aiter || true
               pip config set global.default-timeout 60
               pip config set global.retries 10
-              pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
               pip install -r requirements.txt
               pip install --upgrade pandas pyzmq einops numpy==1.26.2
               pip install --upgrade "pybind11>=3.0.1"
@@ -115,6 +115,19 @@ jobs:
           path: dist/*.whl
           retention-days: 14
 
+  prepare_triton_wheel:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    needs: check-signal
+    uses: ./.github/workflows/prepare-triton-wheel.yaml
+    with:
+      docker-image: rocm/vllm-dev:nightly
+      artifact-name: triton_wheelhouse
+      retention-days: 3
+
   vllm_benchmark:
     name: vLLM Benchmark (8 GPU)
     timeout-minutes: 60
@@ -123,7 +136,7 @@ jobs:
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    needs: build_aiter_wheel
+    needs: [build_aiter_wheel, prepare_triton_wheel]
     runs-on: aiter-8gpu-runner
     strategy:
       fail-fast: false
@@ -156,9 +169,18 @@ jobs:
 
       - name: Download Aiter wheel artifact
         uses: actions/download-artifact@v4
+        timeout-minutes: 30
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
+
+      - name: Download Triton wheel artifact
+        uses: actions/download-artifact@v4
+        timeout-minutes: 30
+        continue-on-error: true
+        with:
+          name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
+          path: triton_wheels
 
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
@@ -209,6 +231,7 @@ jobs:
               $MODEL_MOUNT \
               -v "${{ github.workspace }}:/workspace" -w /workspace \
               -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} -e VLLM_ROCM_USE_AITER=1 \
+              -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
               ${{ matrix.extra_env_args }} \
               ${{ env.BASE_IMAGE }} bash -lc "
                 set -euo pipefail
@@ -219,8 +242,12 @@ jobs:
                   exit 1
                 fi
                 ls -lh /workspace/aiter_wheels
+                bash ./.github/scripts/install_triton.sh
+                pip show triton
                 pip uninstall -y aiter amd-aiter || true
-                pip install --no-deps \"\${wheels[0]}\"
+                pip config set global.default-timeout 60
+                pip config set global.retries 10
+                pip install \"\${wheels[0]}\"
                 pip show amd-aiter || pip show aiter
                 if [ -d \"/models/${{ matrix.model }}\" ]; then
                   model_path=\"/models/${{ matrix.model }}\"

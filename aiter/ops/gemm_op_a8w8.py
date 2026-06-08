@@ -127,10 +127,17 @@ def gemm_a8w8_bpreshuffle_flydsl(
     Out: Tensor,
     config: dict,
 ) -> Tensor:
+    kernel_name = str(config.get("kernelName", ""))
+    if kernel_name.startswith("flydsl_bpreshuffle_wmma_"):
+        from .flydsl.bpreshuffle_gemm_gfx1250 import run_gemm_a8w8_bpreshuffle_gfx1250
+
+        return run_gemm_a8w8_bpreshuffle_gfx1250(
+            XQ, WQ, x_scale, w_scale, Out, kernel_name
+        )
+
     from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 
-    kernel_name = config.get("kernelName", "")
-    parsed = _parse_flydsl_kernel_name(str(kernel_name))
+    parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
     tm, tn, tk, lds, csh, acp, wpe, xcd = parsed
@@ -312,6 +319,19 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
 ) -> None: ...
 
 
+# Ref on https://github.com/ROCm/aiter/blob/1be4ee9f70a7a7de5e9f57de2c0ecb9d13ed5983/aiter/ops/gemm_op_a16w16.py#L37-L57
+@functools.lru_cache(maxsize=1024)
+def get_zero_bias_buf_keyed(
+    device: torch.device, stream_id: int, out_shape: int
+) -> Tensor:
+    return torch.zeros(1, out_shape, dtype=torch.float32, device=device)
+
+
+def get_zero_bias_buf(B: Tensor) -> Tensor:
+    stream = torch.cuda.current_stream(B.device)
+    return get_zero_bias_buf_keyed(B.device, stream.cuda_stream, B.shape[0])
+
+
 def gemm_a8w8_blockscale_bpreshuffle_asm(
     A: Tensor,
     B: Tensor,
@@ -325,7 +345,7 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     zero_bias_buf: Optional[Tensor] = None,
 ) -> Tensor:
     if bias is None and zero_bias_buf is None:
-        zero_bias_buf = torch.zeros(1, B.shape[0], dtype=torch.float32, device=A.device)
+        zero_bias_buf = get_zero_bias_buf(B)
     _gemm_a8w8_blockscale_bpreshuffle_asm(
         A,
         B,
@@ -807,7 +827,7 @@ def gfx950_a8w8_blockscale_ASM(
     assert dtype in [
         dtypes.bf16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
-    return gfx950_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
+    return gfx950_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)  # noqa: F821
 
 
 def gen_gemm_a8w8_tune_fake_tensors(

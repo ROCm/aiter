@@ -138,6 +138,7 @@ def test_mla(
     decode_qlen,
     split_per_batch=None,
     return_lse=False,
+    sequential_page_indices=False,
 ):
     ret = {}
 
@@ -161,9 +162,14 @@ def test_mla(
         seq_lens_kv.fill_(ctx_lens)
         seq_lens_qo.fill_(ctx_lens)
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
-    kv_indices = torch.randint(
-        0, num_page, (kv_indptr[-1].item() + 10000,), dtype=torch.int
-    )
+    if sequential_page_indices:
+        # page_id == logical token index; needs pool >= ctx and byte offset can exceed 2^32
+        num_page = max(num_page, kv_indptr[-1].item() + 10000)
+    n_kv_idx = kv_indptr[-1].item() + 10000
+    if sequential_page_indices:
+        kv_indices = torch.arange(n_kv_idx, dtype=torch.int)
+    else:
+        kv_indices = torch.randint(0, num_page, (n_kv_idx,), dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
     max_seqlen_kv = seq_lens_kv.max().item()
@@ -508,6 +514,7 @@ def test_mla(
             sm_scale,
             use_2d_view=use_2d_view,
             min_kv_seq_len=ctx_lens,
+            return_lse=return_lse,
         )
 
         err = checkAllclose(
@@ -515,11 +522,18 @@ def test_mla(
             out_gluon,
             msg=f"mla_decode-absorb    [golden vs gluon_mla]: {us_gluon_decode:>8.2f} us......",
         )
+        if return_lse and attn_lse is not None:
+            checkAllclose(
+                lse_ref,
+                attn_lse.reshape(total_q, nhead),
+                msg=f"mla_decode-absorb    [lse_ref vs gluon_mla_lse]: {us_gluon_decode:>8.2f} us......",
+            )
         return err, us_gluon_decode
 
     def test_absorb_decode_gluon_bh16(name):
-        # Shared bh16bn{64,128} runner. The wrapper dispatches on (nhead, kv dtype):
-        # name='bh16bn128' -> cast kv to fp8; name='bh16bn64' -> keep bf16.
+        # Shared bh16bn{64,128} runner. The wrapper dispatches on
+        # (nhead, kv dtype): name='bh16bn128' -> cast kv to fp8;
+        # name='bh16bn64' -> keep bf16. -lse also validates the returned lse.
         from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
@@ -539,7 +553,7 @@ def test_mla(
             seq_info = kv_indptr
             use_2d_view = False
 
-        (attn_logits, attn_lse), us_decode = run_perftest(
+        (_, lse), us_decode = run_perftest(
             mla_decode_gluon,
             q_nope,
             q_pe,
@@ -551,6 +565,7 @@ def test_mla(
             use_2d_view=use_2d_view,
             kv_scale=1.0,
             min_kv_seq_len=ctx_lens,
+            return_lse=return_lse,
         )
 
         err = checkAllclose(
@@ -559,11 +574,20 @@ def test_mla(
             msg=f"mla_decode-absorb    [golden vs gluon_{name}]: {us_decode:>8.2f} us......",
         )
         cal_diff(out_ref, out_gluon, f"out_gluon_{name}", use_fp8=(name == "bh16bn128"))
+        if return_lse and lse is not None:
+            checkAllclose(
+                lse_ref,
+                lse.reshape(total_q, nhead),
+                msg=f"mla_decode-absorb    [lse_ref vs gluon_{name}_lse]: {us_decode:>8.2f} us......",
+            )
         return err, us_decode
 
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
+    # The ASM decode baseline aborts for these MLA configs when lse is requested
+    if return_lse:
+        pass
+    elif (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
         16,
         32,
         64,
@@ -588,11 +612,8 @@ def test_mla(
     ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
     ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
 
-    # Gluon MLA decode test (bf16 only, nhead in (64,128), decode_qlen=1,
-    # head_dim_ckv=512, head_dim_kpe=64, batch in (64,128,256), page_size=1).
-    # NUM_KV_SPLITS is auto-picked by the wrapper so the launch fills ~256
-    # workgroups; the per-split min seq_len bound depends on it. Mirror the
-    # picker here to gate ctx_lens precisely.
+    # Gluon MLA decode test
+    # Example: -c 16384 -b 64 128 -n 64,1 128,1 -d bf16 -kvd bf16
     NUM_XCDS_GFX950 = 8
     BLOCK_H_GLUON = 64
     if (
@@ -623,10 +644,8 @@ def test_mla(
             ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
             ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
 
-    # Gluon MLA bh16bn128 decode test (gfx950, bf16 Q + fp8 KV, nhead in (4,8,16),
-    # batch=1, decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
-    # NUM_KV_SPLITS=256 hardcoded; kernel asserts min_kv_seq_len // 256 >= BLOCK_N*3,
-    # i.e. min_kv_seq_len >= 98304. Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
+    # Gluon MLA bh16bn128 decode test
+    # Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
     if (
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
@@ -637,7 +656,7 @@ def test_mla(
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
-        and ctx_lens >= 256 * 128 * 3
+        and ctx_lens >= 1
     ):
         err_gluon, us_gluon_decode = test_absorb_decode_gluon_bh16("bh16bn128")
         ret["decode:gluon_err"] = err_gluon
@@ -645,21 +664,19 @@ def test_mla(
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
 
-    # Gluon MLA bh16bn64 decode test (gfx950, bf16 Q + bf16 KV, nhead in (4,8,16),
-    # batch=1, decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
-    # NUM_KV_SPLITS=256 hardcoded; kernel asserts min_kv_seq_len // 256 >= BLOCK_N*3,
-    # i.e. min_kv_seq_len >= 49152. Example: -c 3000000 -b 1 -n 16,1 -d bf16 -kvd bf16
+    # Gluon MLA bh16bn64 decode test
+    # Example: -c 10000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 [-lse]
     if (
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
         and kvtype == torch.bfloat16
         and nhead <= 16
         and decode_qlen == 1
-        and batch_size == 1
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
-        and ctx_lens >= 256 * 64 * 3
+        and 1 <= batch_size <= 256
+        and ctx_lens >= 1
     ):
         err_gluon, us_gluon_decode = test_absorb_decode_gluon_bh16("bh16bn64")
         ret["decode:gluon_err"] = err_gluon
@@ -801,6 +818,12 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
+parser.add_argument(
+    "--sequential-page-indices",
+    action="store_true",
+    help="""Use kv_indices[i]=i (sequential physical page id) instead of random pages.
+    Expands KV pool to cover ctx length (tests 64-bit page_idx * stride).""",
+)
 
 
 args = parser.parse_args()
@@ -826,6 +849,7 @@ for nhead, decode_qlen in args.nhead:
                 decode_qlen=decode_qlen,
                 split_per_batch=split_per_batch,
                 return_lse=args.return_lse,
+                sequential_page_indices=args.sequential_page_indices,
             )
             df.append(ret)
     df = pd.DataFrame(df)
