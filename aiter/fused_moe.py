@@ -2336,16 +2336,21 @@ def cktile_moe_stage1(
                         torch.cuda.current_stream(),
                     ),
                 )
+            elif activation == ActivationType.Silu:
+                NLane = 16
+                N0 = inter_dim // NLane
+                flat = valid_out.view(-1, N0, 2, NLane)
+                deinterleaved = flat.permute(0, 2, 1, 3).contiguous().view(
+                    -1, inter_dim * 2
+                )
+                aiter.silu_and_mul(out, deinterleaved)
             else:
                 NLane = 16
                 N0 = inter_dim // NLane
                 flat = valid_out.view(-1, N0, 2, NLane)
                 gate = flat[:, :, 0, :].reshape(-1, inter_dim)
                 up = flat[:, :, 1, :].reshape(-1, inter_dim)
-                if activation == ActivationType.Gelu:
-                    out.view(-1, inter_dim).copy_(torch.nn.functional.gelu(gate) * up)
-                else:
-                    out.view(-1, inter_dim).copy_(torch.nn.functional.silu(gate) * up)
+                out.view(-1, inter_dim).copy_(torch.nn.functional.gelu(gate) * up)
         else:
             if bias1 is not None and topk_ids is None:
                 raise ValueError(
