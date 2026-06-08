@@ -7,6 +7,7 @@ dispatcher does not carry gfx1250-specific implementation details.
 """
 
 import os
+import csv
 
 from typing import Optional
 
@@ -18,6 +19,115 @@ from aiter.ops.flydsl.moe_common import GateMode
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
+_GROUPED_CONFIG_CACHE = {}
+
+
+def _as_bool(value, default: bool) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip() in _TRUTHY_ENV
+
+
+def _as_int(value, default: int | None) -> int | None:
+    if value is None or str(value).strip() == "":
+        return default
+    return int(value)
+
+
+def _dtype_name(dtype) -> str:
+    if dtype is torch.bfloat16 or dtype == dtypes.bf16:
+        return "torch.bfloat16"
+    if dtype is torch.float16 or dtype == dtypes.fp16:
+        return "torch.float16"
+    return str(dtype)
+
+
+def _enum_name(value) -> str:
+    if hasattr(value, "name"):
+        return f"{type(value).__name__}.{value.name}"
+    return str(value)
+
+
+def _load_grouped_config_rows():
+    cfg_path = os.environ.get("AITER_CONFIG_GROUPED_FMOE")
+    if not cfg_path:
+        try:
+            from aiter.jit.core import AITER_CONFIGS
+
+            cfg_path = AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE
+        except Exception:
+            cfg_path = ""
+    cached = _GROUPED_CONFIG_CACHE.get(cfg_path)
+    if cached is not None:
+        return cached
+    rows = []
+    for path in str(cfg_path).split(os.pathsep):
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, newline="") as f:
+            rows.extend(csv.DictReader(f))
+    _GROUPED_CONFIG_CACHE[cfg_path] = rows
+    return rows
+
+
+def _find_grouped_config(
+    *,
+    token_num: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    activation,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    quant_type,
+    gate_mode,
+):
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    keys = {
+        "cu_num": str(get_cu_num()),
+        "token": str(int(token_num)),
+        "model_dim": str(int(model_dim)),
+        "inter_dim": str(int(inter_dim)),
+        "expert": str(int(experts)),
+        "topk": str(int(topk)),
+        "act_type": _enum_name(activation),
+        "dtype": _dtype_name(dtype),
+        "q_dtype_a": str(q_dtype_a),
+        "q_dtype_w": str(q_dtype_w),
+        "q_type": _enum_name(quant_type),
+        "gate_mode": _enum_name(gate_mode),
+    }
+    rows = _load_grouped_config_rows()
+
+    def _matches(row, *, require_cu_num: bool):
+        for k, v in keys.items():
+            if k == "cu_num" and not require_cu_num:
+                continue
+            if row.get(k) and str(row.get(k)).strip() != v:
+                return False
+        return True
+
+    matches = [row for row in rows if _matches(row, require_cu_num=True)]
+    if not matches:
+        matches = [row for row in rows if _matches(row, require_cu_num=False)]
+    if not matches:
+        if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        ):
+            print(
+                f"[grouped-gemm-debug] no grouped CSV config match for {keys}; "
+                f"loaded_rows={len(rows)}",
+                flush=True,
+            )
+        return None
+    matches.sort(key=lambda r: float(r.get("us") or 0.0))
+    return matches[0]
 
 
 def _use_grouped_gemm_enabled() -> bool:
@@ -272,8 +382,38 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg("imports done")
     device = hidden_states.device
     token_num, topk = topk_ids.shape
-    tile_m, tile_n, tile_k = 16, 256, 256
+    tile_m, tile_n, tile_k = 64, 256, 256
     m_warp, n_warp = 1, 4
+    num_buffers = 2
+    grouped_persistent_m = True
+    persistent_workers = None
+    cfg_row = _find_grouped_config(
+        token_num=token_num,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        activation=activation,
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        quant_type=quant_type,
+        gate_mode=gate_mode,
+    )
+    if cfg_row is not None:
+        tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
+        n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
+        num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
+        grouped_persistent_m = _as_bool(
+            cfg_row.get("grouped_persistent_m"), grouped_persistent_m
+        )
+        persistent_workers = _as_int(cfg_row.get("persistent_workers"), None)
+        stage1_weight_layout = (
+            cfg_row.get("stage1_weight_layout") or stage1_weight_layout
+        )
+        _grouped_dbg(f"using grouped CSV config: {cfg_row}")
+    tile_n = int(n_warp) * 64
+    tile_k = 256
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
 
@@ -295,14 +435,27 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     ):
         if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
             raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
-    # Static upper bound: each token routes at most one row per expert, so no
-    # expert can receive more than token_num rows. Using this avoids the
-    # ``counts.max().item()`` device->host sync that stalls the launch stream
-    # (masked_m from build_route_maps still bounds the real per-expert work).
-    # CUDAGraph buckets have static token_num/topk; per-expert count <= token_num*topk.
-    raw_max_m = token_num * topk if _capturing else token_num
-    max_m = max(warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m)
-    _grouped_dbg(f"routing max_m={max_m}")
+    # Default to a static CSV/bucketed max_m. Exact per-call max_m requires a
+    # device->host sync (`counts.max().item()`), so keep it behind an opt-in
+    # switch for benchmarking/tuning.
+    counts = None
+    use_actual_max_m = (not _capturing) and os.environ.get(
+        "AITER_GROUPED_USE_ACTUAL_MAX_M", "0"
+    ) in _TRUTHY_ENV
+    if use_actual_max_m:
+        counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
+        raw_max_m = int(counts.max().item()) if counts.numel() else 0
+    else:
+        # Static upper bound: each token routes at most one row per expert, so no
+        # expert can receive more than token_num rows. CUDAGraph buckets have
+        # static token_num/topk; per-expert count <= token_num*topk.
+        raw_max_m = token_num * topk if _capturing else token_num
+    if (not use_actual_max_m) and cfg_row is not None:
+        raw_max_m = _as_int(cfg_row.get("max_m"), raw_max_m)
+    max_m = max(
+        warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
+    )
+    _grouped_dbg(f"routing max_m={max_m} actual={use_actual_max_m}")
 
     # Build route maps once. The fast path uses the FlyDSL atomic-scatter kernel;
     # the naive path keeps a deterministic torch fallback for tests/debug.
@@ -311,9 +464,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # multiply, and the optional dump (masked_m drives the GEMM). Build it only on
     # the naive path so the fast path skips the bincount (two int reductions + a
     # host sync); the lazy fallbacks below recompute it if ever needed.
-    counts = None
     if _use_naive:
-        counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
+        if counts is None:
+            counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
         topids_to_rows, rows_to_tokens, masked_m = _build_route_maps_naive(
             topk_ids, E, max_m
         )
@@ -332,10 +485,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
     m_tile_prefix = None
     m_tile_map = None
-    # Persistent-M builds a compact m_tile_map with dynamic PyTorch ops that
-    # HIP CUDAGraph capture rejects; use the flat-grid launcher instead.
-    _grouped_persistent_m = not _capturing
-    if not _use_naive and _grouped_persistent_m:
+    # Persistent-M needs m_tile_prefix/m_tile_map. Skip both when disabled by
+    # CSV/config, and force flat-grid launch during HIP CUDAGraph capture.
+    effective_grouped_persistent_m = bool(grouped_persistent_m) and not _capturing
+    if not _use_naive and effective_grouped_persistent_m:
         _m_tile_cfg = _GroupedA8W4Config(
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -346,7 +499,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             tile_k=tile_k,
             m_warp=m_warp,
             n_warp=n_warp,
-            num_buffers=2,
+            num_buffers=num_buffers,
             waves_per_eu=None,
             out_dtype=out_dtype_str,
             use_tdm_store=True,
@@ -357,8 +510,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             cluster_n=1,
             use_scale_opsel=False,
             expert_sched_mode=False,
-            grouped_persistent_m=True,
-            persistent_workers=None,
+            grouped_persistent_m=effective_grouped_persistent_m,
+            persistent_workers=persistent_workers,
             data_format=data_format,
             act="swiglu" if activation == ActivationType.Swiglu else "silu",
             stage1_weight_layout=stage1_weight_layout,
@@ -490,9 +643,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         m_warp=m_warp,
         n_warp=n_warp,
         out_dtype=out_dtype_str,
-        num_buffers=2,
+        num_buffers=num_buffers,
         expert_sched_mode=False,
-        grouped_persistent_m=_grouped_persistent_m,
+        grouped_persistent_m=effective_grouped_persistent_m,
+        persistent_workers=persistent_workers,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
     )
@@ -609,9 +763,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         m_warp=m_warp,
         n_warp=n_warp,
         out_dtype=out_dtype_str,
-        num_buffers=2,
+        num_buffers=num_buffers,
         expert_sched_mode=False,
-        grouped_persistent_m=_grouped_persistent_m,
+        grouped_persistent_m=effective_grouped_persistent_m,
+        persistent_workers=persistent_workers,
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None
