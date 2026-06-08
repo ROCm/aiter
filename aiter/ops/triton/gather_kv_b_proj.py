@@ -6,6 +6,7 @@ import torch
 from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
     _next_pow2,
     _triton_gather_kv_b_proj,
+    _triton_gather_kv_b_proj_fp4,
 )
 
 
@@ -23,7 +24,12 @@ def gather_kv_b_proj(
 ):
     num_block, block_size, hidden_dim = k_buffer.shape
     batch_size = kv_indptr.shape[0] - 1
-    weight_n, weight_k = kv_proj_weight.shape
+    weight_n, packed_weight_k = kv_proj_weight.shape
+    fp4_weight_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    is_fp4_weight = (
+        fp4_weight_dtype is not None and kv_proj_weight.dtype == fp4_weight_dtype
+    )
+    weight_k = packed_weight_k * 2 if is_fp4_weight else packed_weight_k
     total_kv_k, tp_k_head_num_k, qk_nope_pe_dim = k_prefix.shape
     total_kv_v, tp_k_head_num_v, v_head_dim = v_prefix.shape
 
@@ -55,8 +61,28 @@ def gather_kv_b_proj(
             scale_n, scale_k = kv_proj_scale.shape
             scale_k_granularity = weight_k // scale_k
             scale_n_granularity = weight_n // scale_n
-            assert scale_k_granularity == 128
-            assert scale_n_granularity == 128
+            if is_fp4_weight:
+                if weight_preshuffle:
+                    assert scale_k >= (weight_k + 31) // 32, (
+                        "Preshuffled FP4 gather_kv_b_proj expects padded per-1x32 scale columns, "
+                        f"got scale cols {scale_k} for logical K {weight_k}"
+                    )
+                    assert scale_n >= weight_n, (
+                        "Preshuffled FP4 gather_kv_b_proj expects padded per-output-row MXFP4 scales, "
+                        f"got scale rows {scale_n} for weight rows {weight_n}"
+                    )
+                else:
+                    assert scale_k_granularity == 32, (
+                        "FP4 gather_kv_b_proj expects per-1x32 weight scales, "
+                        f"got K granularity {scale_k_granularity}"
+                    )
+                    assert scale_n_granularity == 1, (
+                        "FP4 gather_kv_b_proj expects per-output-row MXFP4 scales, "
+                        f"got N granularity {scale_n_granularity}"
+                    )
+            else:
+                assert scale_k_granularity == 128
+                assert scale_n_granularity == 128
 
     ChunkK = 16 if k_buffer.dtype in [torch.float16, torch.bfloat16] else 32
 
@@ -68,6 +94,33 @@ def gather_kv_b_proj(
     padded_v = _next_pow2(v_head_dim)
 
     grid = (batch_size * tp_k_head_num_k,)
+    if is_fp4_weight:
+        _triton_gather_kv_b_proj_fp4[grid](
+            batch_size,
+            k_buffer,
+            k_scale,
+            kv_indptr,
+            kv_indices,
+            kv_prefix_sum_context_lens,
+            kv_proj_weight.view(torch.uint8),
+            kv_proj_scale.view(torch.uint8),
+            k_prefix,
+            v_prefix,
+            KBlockSize=block_size,
+            TpNumHeads=tp_k_head_num_k,
+            QkNopeHeadDim=qk_nope_head_dim,
+            VHeadDim=v_head_dim,
+            KV_CDim=weight_k,
+            KV_PeDim=qk_nope_pe_dim - qk_nope_head_dim,
+            ChunkK=ChunkK,
+            PaddedK=padded_k,
+            PaddedV=padded_v,
+            ScaleCols=scale_k if not no_scale and not per_row_scale else 1,
+            WEIGHT_PRESHUFFLE=weight_preshuffle,
+            num_stages=3,
+        )
+        return
+
     _triton_gather_kv_b_proj[grid](
         batch_size,
         k_buffer,
