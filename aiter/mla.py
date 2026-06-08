@@ -655,7 +655,7 @@ def mla_prefill_ps_fwd(
         final_lse,
     )
 
-    return output.view(total_s, nhead, v_head_dim), attn_lse
+    return output.view(total_s, nhead, v_head_dim), final_lse
 
 
 @triton.jit
