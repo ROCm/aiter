@@ -221,20 +221,6 @@ namespace py = pybind11;
 
 #define ATTENTION_PYBIND m.def("paged_attention_rocm", &paged_attention);
 
-#define ATTENTION_RAGGED_PYBIND                                   \
-    m.def("paged_attention_ragged",                               \
-          &paged_attention_ragged,                                \
-          "paged_attention_ragged(Tensor! out, Tensor exp_sums,"  \
-          "                Tensor max_logits, Tensor tmp_out,"    \
-          "                Tensor query, Tensor key_cache,"       \
-          "                Tensor value_cache, int num_kv_heads," \
-          "                float scale, Tensor block_tables,"     \
-          "                Tensor context_lens, int block_size,"  \
-          "                int max_context_len,"                  \
-          "                Tensor? alibi_slopes,"                 \
-          "                str kv_cache_dtype,"                   \
-          "                float k_scale, float v_scale) -> ()");
-
 #define BATCHED_GEMM_A8W8_PYBIND            \
     m.def("batched_gemm_a8w8",              \
           &batched_gemm_a8w8,               \
@@ -2128,6 +2114,28 @@ namespace py = pybind11;
           py::arg("cache_seqlens")      = torch::Tensor(),                     \
           py::arg("conv_state_indices") = torch::Tensor(),                     \
           py::arg("pad_slot_id")        = -1);
+
+#define CHUNK_GDR_FWD_H_PYBIND                                              \
+    m.def("chunk_gated_delta_rule_fwd_h_hip",                               \
+          &aiter::chunk_gated_delta_rule_fwd_h_hip,                         \
+          "chunk_gated_delta_rule_fwd_h (HIP)",                             \
+          py::arg("k"),                                                     \
+          py::arg("w"),                                                     \
+          py::arg("u"),                                                     \
+          py::arg("g"),                                                     \
+          py::arg("gk"),                                                    \
+          py::arg("initial_state"),                                         \
+          py::arg("cu_seqlens"),                                            \
+          py::arg("chunk_offsets"),                                         \
+          py::arg("h"),                                                     \
+          py::arg("v_new"),                                                 \
+          py::arg("final_state"),                                           \
+          py::arg("selected_bv"),                                           \
+          py::arg("has_initial_state"),                                     \
+          py::arg("output_final_state"),                                    \
+          py::arg("save_new_value"),                                        \
+          py::arg("use_exp2"),                                              \
+          py::arg("g_head_major") = false);
 
 #define FUSED_SPLIT_GDR_UPDATE_PYBIND                                 \
     m.def("fused_split_gdr_update",                                   \

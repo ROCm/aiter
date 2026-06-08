@@ -129,10 +129,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     )
 
     if IS_GFX1250:
-        # gfx1250 (RDNA/WMMA, wave32): 16x16xK fp8 tile. Pick K=128 when the
-        # hidden dim is large enough; fall back to 64 to keep the K-tile within
-        # HiddenDim. warp_bases distributes NumWarps across the N (=ChunkK) axis;
-        # M (=ChunkQ) is shared (warp axis stride 0).
         FP8_K_DIM: gl.constexpr = 128 if HiddenDim > 64 else 64
         if NumWarps == 1:
             warp_bases: gl.constexpr = []
@@ -387,14 +383,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         order=[1, 0],
     )
 
-    # ChunkKPerStage shapes the WMMA/MFMA tiles in the preshuffle pipeline below.
-    # On gfx1250 the TDM branch returns before that pipeline, but the gluon
-    # frontend still type-checks the (statically-unreachable) CDNA tail, where
-    # mfma_layout is the WMMA layout. If ChunkKPerStage < 16 there (e.g. the 1:1
-    # case ChunkK==KVBlockSize==16 -> ChunkKPerStage==8), the tail's
-    # gl.zeros((ChunkQ, ChunkKPerStage), layout=WMMA) has an N dim of 8, which is
-    # neither 1 nor >= nDim(16) and trips the "Unsupported tensor shape for given
-    # wmma layout" assert. Pin a compile-safe (runtime-unused) value on gfx1250.
     if IS_GFX1250:
         ChunkKPerStage: gl.constexpr = 16
     else:
@@ -402,9 +390,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     MFMAPerWarp: gl.constexpr = ChunkKPerStage // 16 // NumWarps
 
     if IS_GFX1250:
-        # gfx1250 (RDNA/WMMA, wave32): 16x16xK fp8 tile. The mfma_layout* names
-        # are reused by the TDM block-load branch below, but here they hold WMMA
-        # (not MFMA) layouts -- WMMA is a wave32 instruction.
         FP8_K_DIM: gl.constexpr = 128 if HiddenDim > 64 else 64
         if NumWarps == 1:
             warp_bases: gl.constexpr = []
@@ -446,20 +431,8 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
     layout_scale: gl.constexpr = gl.SliceLayout(1, mfma_layout)
 
-    # gfx1250 TDM block-load path. ChunkK only partitions context across CTAs
-    # (split units); the inner loop and WMMA tile work at block granularity
-    # (KVBlockSize wide), reusing the proven 1:1 compute shape. ChunkK ==
-    # N_BLK * KVBlockSize, so each split spans an integer number of paged blocks.
-    # Each block is physically non-contiguous in the KV pool (its own runtime
-    # row blk*stride_k_seq + a per-block scale gap), so we async_load one block
-    # per iteration into LDS, then transpose-read it for WMMA. Double-buffered:
-    # prefetch block j+1 into the other buffer before waiting on block j.
-    # Self-contained branch; the CDNA preshuffle pipeline below is untouched.
     if IS_GFX1250:
         NUM_BUFFERS: gl.constexpr = 2
-        # Plain contiguous shared layout (no padding/swizzle) so the LDS tile can
-        # be reshaped/permuted to undo shuffle_weight; matches mla.py's shuffled
-        # KV path. TDM still DMAs the block as one contiguous chunk.
         KV_SHARED: gl.constexpr = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
@@ -547,11 +520,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             else:
                 gl.amd.gfx1250.tdm.async_wait(0)
 
-            # The KV block was written by shuffle_weight(layout=(16,16)), whose
-            # fp8 swizzle maps logical (n, k) to physical row-major
-            # [n//16, k//32, (k//16)%2, n%16, k%16]. Undo it in LDS with a
-            # reshape/permute (mla.py lds_unshuffle pattern) -- pure view work,
-            # no extra data movement -- then transpose-read for WMMA operand B.
             K_WIDTH: gl.constexpr = 16
             mfma_k = (
                 kv_shared.index(buf)

@@ -254,6 +254,7 @@ jobs:
 
       - name: Build the ATOM test image
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
+        timeout-minutes: 30
         run: |
           docker build --network=host \
             --no-cache \

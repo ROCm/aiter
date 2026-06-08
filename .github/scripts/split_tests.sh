@@ -76,6 +76,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_fused_qk_norm_rope_cache_quant.py]=446
     FILE_TIMES[op_tests/test_topk_plain.py]=403
     FILE_TIMES[op_tests/test_rope.py]=396
+    FILE_TIMES[op_tests/test_gated_delta_rule.py]=318
     FILE_TIMES[op_tests/test_topk_per_row.py]=272
     FILE_TIMES[op_tests/test_concat_cache_mla.py]=232
     FILE_TIMES[op_tests/test_moe_topk_gating.py]=198
@@ -239,13 +240,29 @@ fi
 
 get_time() {
     local abs="$1"
+    local seconds
     # FILE_TIMES keys use full path (e.g. op_tests/test_mla.py), so look up with abs
     if [[ -n "${FILE_TIMES[$abs]+x}" ]]; then
-        echo "${FILE_TIMES[$abs]}"
+        seconds="${FILE_TIMES[$abs]}"
     else
-        echo 15
+        seconds=15
+    fi
+
+    if [[ -n "${MEMORY_WEIGHT_FLOOR[$abs]+x}" && "$seconds" -lt "${MEMORY_WEIGHT_FLOOR[$abs]}" ]]; then
+        echo "${MEMORY_WEIGHT_FLOOR[$abs]}"
+    else
+        echo "$seconds"
     fi
 }
+
+# Some tests have short wall time but high peak memory usage. Give them a
+# scheduling weight floor so the greedy splitter avoids packing them together.
+declare -A MEMORY_WEIGHT_FLOOR
+if [[ "$TEST_TYPE" == "aiter" ]]; then
+    MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_qk_norm_rope_quant.py]=300
+    MEMORY_WEIGHT_FLOOR[op_tests/test_kvcache.py]=300
+    MEMORY_WEIGHT_FLOOR[op_tests/test_mla_prefill_ps.py]=300
+fi
 
 # ------------------------------
 # LPT greedy allocation: sort first then distribute
