@@ -943,12 +943,16 @@ def compile_mxfp4_gemm1_a4w4(
 
     lds_stride = BK
     k_blocks16 = (BK * elem_bytes) // 16
-    # Inline-quant BM=16 uses a 2-slot A LDS double-buffer so the next tile's
-    # quant write does not race the current tile's MFMA read, removing the
-    # pre-quant barrier (s_barrier 57 -> ~30, aligned with HIP's pipelined loop).
-    _a_slots = 2 if (inline_quant and BM == 16) else 1
+    # Inline-quant BM=16: 3 A-LDS slots (== HIP kAStages=3) for the 2-stage
+    # pipeline (read_slot=OFFSET%3, write_slot=(OFFSET+2)%3, inflight=(OFFSET+1)%3
+    # all distinct -> no WAR). 3*4096 A + 3*128dw ascale = 13824B, still union'd
+    # under the 16384B cshuffle acc, so occupancy is unchanged vs the 2-slot form.
+    _a_slots = 3 if (inline_quant and BM == 16) else 1
     _a_slot_stride = BM * lds_stride            # bytes per A LDS slot
-    _ascale_slot_dwords = BM * 8                # dwords per A-scale LDS slot
+    # A-scale LDS: BM=16 uses HIP's packed-byte layout (256B = 64 dwords / tile,
+    # 2 e8m0 packed per quant-lane dword at byte0/byte2). BM>=32 keeps the
+    # dword-per-e8m0 staging written by load_a_tile_inline (BM*8 dwords).
+    _ascale_slot_dwords = 64 if (inline_quant and BM == 16) else (BM * 8)
     _a_lds_bytes = _a_slots * _a_slot_stride
     _acc_lds_elems = BM * BN
     _lds_a_offset = 0
@@ -977,6 +981,33 @@ def compile_mxfp4_gemm1_a4w4(
         f"_{'IQ' if inline_quant else 'NT'}_{'dbg' if debug_bf16 else 'q'}_v0"
     )
 
+    # =====================================================================
+    # HIP reference: csrc/kernels/mxfp4_moe/gemm_a4w4/gemm1_a4w4.cuh
+    #   template<int MAX_M, int NUM_EXPERTS, int K, int N_OUT, int BM,
+    #            bool kUseNT=false, bool kInlineQuant=false, int kXcdSwizzle=0>
+    #   __launch_bounds__(256, (BM==128)?1:((BM==16)?3:2)) kernel(...)
+    # This FlyDSL kernel = the BM=16, kInlineQuant=true, kUseNT=false
+    # instantiation (M<=16 inline-quant gate/up GEMM). The HIP body is
+    # `run_one(m_block_idx, n_block_idx, e)`; the dispatcher at the bottom of
+    # the HIP kernel maps blockIdx.x -> (m_block_idx, n_block_idx). FlyDSL
+    # instead launches a 2-D grid (block_id x = m, y = n), so run_one's body
+    # maps directly to this kernel body. Line-by-line HIP correspondence is
+    # given in the comments below ("HIP:" tags).
+    #
+    # Signature  (FlyDSL arg            <-> HIP kernel param):
+    #   arg_a               <-> const __hip_fp4x2_storage_t* A_q
+    #   arg_a_scale         <-> const __amd_scale_t*         A_scale
+    #   arg_b               <-> const __hip_fp4x2_storage_t* B_ps_q   (w12)
+    #   arg_b_scale         <-> const __amd_scale_t*         B_ps_scale
+    #   arg_sorted_expert_ids <-> const int* sorted_expert_ids
+    #   arg_cumsum          <-> const int* cumsum_tensor
+    #   arg_m_indices       <-> const int* m_indices
+    #   arg_aq_out          <-> uint8_t* A_q_out      (inter_sorted_quant)
+    #   arg_ascale_out      <-> uint8_t* A_scale_out  (inter_sorted_shuffled_scale)
+    #   arg_hidden          <-> const __hip_bfloat16* hidden_states
+    #   i32_tokens          <-> int n_tokens
+    #   i32_max_sorted      <-> MAX_M (host-side buffer bound; HIP is constexpr)
+    # =====================================================================
     @flyc.kernel
     def gemm1_kernel(
         arg_a: fx.Pointer,           # A_q [max_sorted, K/2] fp4 (pre-quant)
@@ -1001,15 +1032,24 @@ def compile_mxfp4_gemm1_a4w4(
         vec4_f32 = T.vec(4, T.f32)
         layout_lds = fx.make_layout((BM, lds_stride), (lds_stride, 1))
 
+        # HIP: const int tid = threadIdx.x; const int wave = tid/64; lane = tid%64;
+        #      const int wave_n = wave; m_block_idx = pid/num_n, n_block_idx = pid%num_n.
+        # GRID: HIP-style 1-D pid -> (m,n) decode (NOT a 2-D grid). With a 2-D grid
+        # the hardware interleaved valid + padding blocks per n-column and clustered
+        # 2 valid blocks onto some CUs -> straggler CUs (occupancy.json: CU5/CU6 ran
+        # 2 concurrent valid blocks, ~117k vs ~73k) -> slower kernel at small M.
+        # A 1-D pid keeps the valid blocks CONTIGUOUS (pid < valid_m*num_n) so they
+        # spread 1-per-CU like HIP.
         tx = gpu.thread_id("x")
-        m_block = gpu.block_id("x")
-        n_block = gpu.block_id("y")
+        _pid = gpu.block_id("x")
+        m_block = _pid / arith.constant(num_n_blocks, index=True)
+        n_block = _pid % arith.constant(num_n_blocks, index=True)
         coord_wl = idx2crd(tx, fx.make_layout((num_waves, 64), (64, 1)))
         wave = layout_get(coord_wl, 0)
         lane = layout_get(coord_wl, 1)
         coord_l16 = idx2crd(lane, fx.make_layout((4, 16), (16, 1)))
-        lane_div_16 = layout_get(coord_l16, 0)
-        lane_mod_16 = layout_get(coord_l16, 1)
+        lane_div_16 = layout_get(coord_l16, 0)   # HIP: lane/16 (lds_col group)
+        lane_mod_16 = layout_get(coord_l16, 1)   # HIP: lane%16 (lds_row)
         wave_n = wave
 
         c_tokens = arith.index_cast(ir.IndexType.get(), i32_tokens.ir_value())
@@ -1017,13 +1057,21 @@ def compile_mxfp4_gemm1_a4w4(
             ir.IndexType.get(), i32_max_sorted.ir_value()
         )
 
+        # HIP make_buffer_rsrc(...) block (gemm1_a4w4.cuh:81-97):
+        #   A_q_rsrc       = make_buffer_rsrc(A_q,  n_tokens*K_HALF*sizeof(fp4x2))
+        #   B_ps_q_rsrc    = make_buffer_rsrc(B_ps_q, E*N_OUT*K_HALF*sizeof(fp4x2))
+        #   A_scale_rsrc   = make_buffer_rsrc(A_scale, (MAX_M/32)*kAS_per_chunk_dw*4)
+        #   B_ps_scale_rsrc= make_buffer_rsrc(B_ps_scale, E*kBS_per_expert_dw*4)
+        #   hidden_rsrc    = make_buffer_rsrc(hidden_states, n_tokens*K*sizeof(bf16))
+        # (inline-quant reads hidden via hidden_rsrc; the pre-quant A_q path is
+        #  unused here. The descriptor size bounds OOB rows -> hardware returns 0.)
         # A_q is per-token a_quant [M, K/2] (NOT sorted): bound by M so that
         # padding rows whose gathered token >= M clamp to 0 (OOB buffer load).
         a_nbytes = arith.index_cast(
             T.i32, c_tokens * arith.constant(K_HALF, index=True)
         )
         a_rsrc = _ptr_buffer_resource(arg_a, a_nbytes)
-        b_rsrc = _ptr_buffer_resource(
+        b_rsrc = _ptr_buffer_resource(   # HIP B_ps_q_rsrc
             arg_b, arith.constant(experts * N_OUT * K_HALF, type=T.i32)
         )
         aqout_nbytes = arith.index_cast(
@@ -1041,11 +1089,17 @@ def compile_mxfp4_gemm1_a4w4(
             ),
         )
 
+        # HIP: const int e = __ldg(&sorted_expert_ids[m_block_idx]);
+        #      const int m_row = m_block_idx * BM;
         expert_i32 = buffer_ops.buffer_load(
             eid_rsrc, m_block, vec_width=1, dtype=T.i32
         )
         m_row = m_block * arith.constant(BM, index=True)
 
+        # HIP LDS union (gemm1_a4w4.cuh:99-109): a single __shared__ pool reused
+        # by (1) the A direct-to-LDS staging buffer (lds_a) and (2) the cshuffle
+        # accumulator scratch (lds_acc). FlyDSL mirrors this with one lds_base and
+        # two views at _lds_a_offset / _lds_acc_offset (sizes unioned, not summed).
         lds_base = allocator.get_base()
         lds_a = SmemPtr(lds_base, _lds_a_offset, T.i8, shape=(_a_lds_bytes,)).get()
         lds_acc = SmemPtr(
@@ -1054,6 +1108,8 @@ def compile_mxfp4_gemm1_a4w4(
 
         # ---- gemm1 GEMM (increment 2): A-load(gather) + a16w4 gate/up B-load
         # + A/B scale + K=K_TILES fp4 MFMA -> accm[kMChunks][4]. ----
+        # HIP: m_indices is read directly (m_indices[m_row + ...]); A_scale_rsrc /
+        # B_ps_scale_rsrc are the make_buffer_rsrc(...) from gemm1_a4w4.cuh:86-90.
         m_idx_rsrc = _ptr_buffer_resource(
             arg_m_indices,
             arith.index_cast(T.i32, c_max_sorted * arith.constant(4, index=True)),
@@ -1078,6 +1134,9 @@ def compile_mxfp4_gemm1_a4w4(
         _cN = arith.constant(N_OUT, index=True)
 
         # A-load tiling + per-row token gather (m_indices[m_row + row_local]).
+        # HIP non-inline equivalent: cached_actual_row[] in run_one (gemm1_a4w4.cuh
+        # :383-400) caches m_indices once; issue_a_load_lds then uses it as the
+        # gather base. (Inline-quant uses iq_token_hrow() below instead.)
         tx_i32_base = tx * arith.constant(chunk_i32, index=True)
         layout_x_tile = fx.make_layout((BM, tile_k_dwords), (tile_k_dwords, 1))
         x_row_local = []
@@ -1111,6 +1170,11 @@ def compile_mxfp4_gemm1_a4w4(
                 lds_base, _lds_ascale_offset, T.i32, shape=(_lds_ascale_dwords,)
             ).get()
 
+        # HIP issue_a_load_lds (gemm1_a4w4.cuh:121-146): the pre-quant A path that
+        # buffer_load_lds's the sorted A_q fp4 directly into s_Aq. FlyDSL splits it
+        # into load_a_tile (VMEM gather to regs) + store_a_tile (xor16 -> lds_a).
+        # Both are UNUSED in the inline-quant BM=16 path (iq_load/iq_finish write
+        # lds_a directly); kept for the non-inline / debug paths.
         def load_a_tile(kt):
             base_k_div4 = arith.constant(kt * tile_k_dwords, index=True)
             parts = []
@@ -1133,6 +1197,12 @@ def compile_mxfp4_gemm1_a4w4(
                     vec_part_i32x4=parts[i], elem_bytes=elem_bytes,
                 )
 
+        # HIP inline_quant_kt (gemm1_a4w4.cuh:209-259), NON-split prologue form:
+        # gather hidden[token], compute the MX-block amax, e8m0 + 4x HW cvt -> fp4,
+        # write lds_a + lds_ascale. This per-thread variant covers a full 32-K
+        # block alone (16 cvt + 4 b128); the K-loop uses the split iq_load/iq_finish
+        # (8 cvt + 2 b128/thread, == HIP) instead. Kept only as a reference / for
+        # the non-pipelined else-branch.
         # inline bf16->fp4 quant: gather hidden[token], per-lane amax over the
         # lane's 32-K-group, e8m0 + software fp4 -> lds_a; e8m0 -> lds_ascale.
         _c0x7f = arith.constant(0x7FFFFFFF, type=i32)
@@ -1227,24 +1297,31 @@ def compile_mxfp4_gemm1_a4w4(
             return vector.bitcast(_vec2_i16, vector.from_elements(_vec1_i32, [x]))
 
         def _dpp_quad_amax(amax):
-            # quad reduction over the 4 consecutive lanes of an MX block via
-            # v_mov_b32_dpp (pure VALU, == HIP inline_quant_dpp_quad_amax). Using
-            # DPP (not shuffle_xor->ds_swizzle) avoids LDS-unit contention with the
-            # A-staging ds_read/ds_write.
+            # HIP inline_quant_dpp_quad_amax: quad reduction over the 4 lanes of an
+            # MX block. HIP IR is umax.i32(x, update.dpp.i32(x)), which LLVM ISel
+            # FUSES into a single v_max_u32_dpp. We MUST do the max in the u32
+            # INTEGER domain to get that fusion: amax holds |value| (>=0), and for
+            # non-negative floats the u32 bit pattern is monotonic, so maxui on the
+            # bits == maxf (numerically identical). The previous f32 maximumf form
+            # did NOT fuse -> emitted v_mov_b32_dpp + v_maximum3_f32 (2x the VALU);
+            # this matches HIP's 112 v_max_u32_dpp exactly.
             AV = type(amax)
             ai = amax.bitcast(i32)
             p = rocdl.update_dpp(_i32ty, ai, ai, 0xB1, 0xF, 0xF, True)
-            amax = amax.maximumf(AV(p).bitcast(f32))
-            ai = amax.bitcast(i32)
+            ai = arith.maxui(ai, AV(p))                       # -> v_max_u32_dpp
             p = rocdl.update_dpp(_i32ty, ai, ai, 0x4E, 0xF, 0xF, True)
-            return amax.maximumf(AV(p).bitcast(f32))
+            ai = arith.maxui(ai, AV(p))                       # -> v_max_u32_dpp
+            return ai.bitcast(f32)
 
+        # HIP cached_row_inline (gemm1_a4w4.cuh:402-410):
+        #   const int rcls = wave*4 + (lane/16);
+        #   cached_row_inline[s] = m_indices[m_row + s*16 + rcls];  // s=0 for BM=16
         # token-row gather is loop-invariant (same A-row across all K-tiles), so
         # hoist it out of the K-loop: HIP caches it once (cached_row_inline). The
         # per-tile gather had each K-tile re-load m_indices, and its vmcnt(0) wait
         # drained the prefetched B (defeating the B double-buffer).
         def iq_token_hrow():
-            row = wave * _c4idx + lane_div_16              # 0..15  (HIP r)
+            row = wave * _c4idx + lane_div_16              # 0..15  (HIP r/rcls)
             tok = buffer_ops.buffer_load(
                 m_idx_rsrc, m_row + row, vec_width=1, dtype=T.i32
             )
@@ -1253,26 +1330,51 @@ def compile_mxfp4_gemm1_a4w4(
                 * arith.constant(_khalf_dw, index=True)
             )
 
+        # HIP inline_quant_load_kt (gemm1_a4w4.cuh:197-208) -- the LOAD half:
+        #   v_voff = row_token*(K*2) + ((lane>>2)&3)*64 + (lane&3)*16;  // bytes
+        #   s_soff = kt*(BK*2) + B128_IDX*256;
+        #   return raw_buffer_load_b128(hidden_rsrc, v_voff, s_soff, 0);
+        # FlyDSL byte offset = hrow*4 + kt*512 + b128*256 + (lane%16)*16, and
+        # (lane%16)*16 == ((lane>>2)&3)*64 + (lane&3)*16 (the same lane[3:0]*16),
+        # so the per-lane hidden address is BIT-IDENTICAL to HIP; both lower to
+        # buffer_load_dwordx4. b128 loop == HIP's two B128_IDX 0/1 calls.
         # Split quant into LOAD (issue the 2 b128 hidden VMEM loads) and FINISH
         # (amax + DPP + cvt + LDS store). The pipelined K-loop issues iq_load for
         # the next tile, runs the current tile's MFMA cluster (hiding the hidden
         # load latency), then runs iq_finish -- so the amax's vmcnt wait lands
         # after MFMA instead of stalling it (HIP load_kt / finish_kt split).
         def iq_load(kt, hrow):
+            # HIP inline_quant_load_kt: v_voff = row_token*(K*2) + lane part (per
+            # lane), s_soff = kt*(BK*2) + B128*256 (scalar). The per-lane voffset
+            # (hrow + lane%16*4 dwords) is kt/b128-independent (CSE'd once); the
+            # kt*512+b128*256-byte offset goes to the scalar soffset, so no per-load
+            # vector address add.
+            off = hrow + lane_mod_16 * _c4idx          # dwords (buffer x4 -> bytes)
             vvs = []
             for b128 in range_constexpr(2):
-                col_dw = arith.constant(b128 * 16, index=True) + lane_mod_16
-                hbase = (
-                    hrow + arith.constant(kt * 128, index=True)
-                    + col_dw * _c4idx
-                )
                 vvs.append(buffer_ops.buffer_load(
-                    hidden_rsrc, hbase, vec_width=4, dtype=i32))
+                    hidden_rsrc, off, vec_width=4, dtype=i32,
+                    soffset_bytes=(kt * 512 + b128 * 256)))
             return vvs
 
+        # HIP inline_quant_finish_kt (gemm1_a4w4.cuh:268-310) -- the FINISH half:
+        #   hm[j]=h_dw[j]&0x7FFF7FFF; m01=pkmax_u16(hm0,hm1); m23=pkmax_u16(hm2,hm3);
+        #   m0123=pkmax_u16(m01,m23); local_amax=max(lo,hi);
+        #   amax=dpp_quad_amax(local_amax); e8m0=encode_e8m0(amax); qs=2^(e8m0<<23);
+        #   pk = 4x cvt_scalef32_pk_fp4_bf16(h_dw, qs); s_Aq[slot][r][swz]=pk;
+        #   s_Ascale[...]=e8m0.
+        # FlyDSL matches op-for-op: arith.maxui on vec2(i16) == v_pk_max_u16,
+        # _dpp_quad_amax == inline_quant_dpp_quad_amax (fused v_max_u32_dpp 0xB1/0x4E),
+        # the e8m0 exp-extract is bit-exact vs encode_e8m0, and the 4 cvt intrinsics
+        # are identical. (FlyDSL does amax in f32 bits via m<<16; the bf16 exponent
+        # lands in the f32 exponent field, so the e8m0 result is unchanged.)
         def iq_finish(row, vvs, slot=0):
             _a_slot_off = arith.constant(slot * _a_slot_stride, index=True)
             _sc_slot_off = arith.constant(slot * _ascale_slot_dwords, index=True)
+            # HIP inline_quant pack path: accumulate the 2 b128 e8m0 into one u32
+            # (byte0 = b128 0, byte2 = b128 1 == HIP pack_byte = B128_IDX*2+SUB,
+            # SUB=0) and write it once after the loop (inline_quant_pack_write).
+            scale_accum = arith.constant(0, type=i32)
             for b128 in range_constexpr(2):
                 # col_dw (fp4 dword col 0..31) = B128*16 + lane_mod_16
                 col_dw = arith.constant(b128 * 16, index=True) + lane_mod_16
@@ -1290,12 +1392,14 @@ def compile_mxfp4_gemm1_a4w4(
                 p01 = arith.maxui(_v2i16(d_list[0] & _m7f), _v2i16(d_list[1] & _m7f))
                 p23 = arith.maxui(_v2i16(d_list[2] & _m7f), _v2i16(d_list[3] & _m7f))
                 p = arith.maxui(p01, p23)              # vec2(i16): [max lo, max hi]
-                packed = vector.extract(
-                    vector.bitcast(_vec1_i32, p),
-                    static_position=[0], dynamic_position=[])
-                m = arith.maxui(
-                    packed & arith.constant(0xFFFF, type=i32),
-                    packed >> arith.constant(16, type=i32))
+                # lo/hi 16-bit combine as a u16 max (== HIP
+                # max((uint16_t)(m&0xFFFF), (uint16_t)(m>>16))): max the two i16
+                # lanes of p directly. This emits v_max_u16(_sdwa) like HIP rather
+                # than v_max_u32_sdwa (the prior i32 mask+shift form). Both are
+                # bit-equal here (values <= 0x7FFF after the sign-clear).
+                p_lo = vector.extract(p, static_position=[0], dynamic_position=[])
+                p_hi = vector.extract(p, static_position=[1], dynamic_position=[])
+                m = arith.extui(i32, arith.maxui(p_lo, p_hi))
                 # bf16(|amax|) -> f32 bits, then quad reduce over the 4 lanes.
                 amax = (m << arith.constant(16, type=i32)).bitcast(f32)
                 amax = _dpp_quad_amax(amax)
@@ -1330,40 +1434,76 @@ def compile_mxfp4_gemm1_a4w4(
                 v4i8 = vector.bitcast(
                     _vec4_i8, vector.from_elements(_vec1_i32, [pk]))
                 vector.store(v4i8, lds_a, [byte_idx], alignment=4)
-                # e8m0 -> lds_ascale_i32[row*8 + block] (block = col_dw//4); the 4
-                # quad lanes hold the same scale, so the write is idempotent.
-                block = col_dw / _c4idx
-                asc_idx = row * arith.index(8) + block + _sc_slot_off
-                vector.store(
-                    vector.from_elements(_vec1_i32, [e8m0]),
-                    lds_ascale_i32, [asc_idx], alignment=4,
+                # accumulate e8m0 into scale_accum byte (b128*2): == HIP
+                # scale_accum |= e8m0 << (pack_byte*8), pack_byte = B128_IDX*2.
+                scale_accum = scale_accum | (
+                    e8m0 << arith.constant(b128 * 16, type=i32))
+            # HIP inline_quant_pack_write: one packed dword per quant-lane at
+            #   lane_tgt = ((lane>>2)&3)*16 + r_in_chunk   (r_in_chunk == row);
+            # the 4 quad lanes share scale_accum so the write is idempotent. This
+            # lowers to ds_write_b32 x1/tile (vs the prior 2x dword-per-e8m0) and
+            # is read back as one dword by load_a_scale (ds_read_b32, op_sel byte).
+            lane_hi = lane_mod_16 / _c4idx              # (lane>>2)&3
+            asc_idx = lane_hi * _c16 + row + _sc_slot_off
+            vector.store(
+                vector.from_elements(_vec1_i32, [scale_accum]),
+                lds_ascale_i32, [asc_idx], alignment=4,
+            )
+
+        # HIP issue_b_load_j<K_C>(b_sub, j) (gemm1_a4w4.cuh:312-320):
+        #   v_voff = (lane/16)*256 + (lane%16)*16 + K_C*2048;     // bytes
+        #   buffer_load_b128_imm<   0>(b_sub[j][0], B_ps_q_rsrc, v_voff, b_load_s_base[j]);
+        #   buffer_load_b128_imm<1024>(b_sub[j][1], B_ps_q_rsrc, v_voff, b_load_s_base[j]);
+        # with b_load_s_base[j] = (e*N_OUT + n_block*BN + wave_n*(BN/4) + j*16)*(K/2).
+        # FlyDSL is identical: base_bytes==b_load_s_base[j], v_voff matches, and the
+        # sub=0/1 loads (+256 dwords = +1024 bytes) == the imm 0/1024. Each is a
+        # buffer_load_dwordx4 (kUseNT aux via b_nt). 4 j x 2 sub = 8 b128 / tile.
+        # HIP issue_b_load_j<K_C>(b_sub, j): one n-output J = 2 b128 (sub 0/1).
+        # ADDRESSING (== HIP): the per-j base is a wave-uniform SCALAR soffset
+        # b_load_s_base[j] (readfirstlane), the lane part is one shared voffset
+        # vreg, and the tile/sub offsets fold into the buffer imm. This removes the
+        # per-load vector address arithmetic (v_or/v_add/v_lshl) FlyDSL used when it
+        # materialized the full voffset per (j,kt,sub) into a vreg.
+        #   b_load_s_base[j] = (e*N_OUT + n_block*256 + wave_n*64 + j*16) * K_HALF  [bytes]
+        _b_base_j = [
+            rocdl.readfirstlane(
+                T.i32,
+                arith.index_cast(
+                    T.i32,
+                    (e_idx * _cN + n_block * _c256 + wave_n * _c64
+                     + arith.constant(j * 16, index=True)) * _cKH,
+                ),
+            )
+            for j in range_constexpr(4)
+        ]
+        # lane voffset in ELEMENTS (buffer_load multiplies by 4):
+        #   (lane/16*256 + lane%16*16) / 4 = lane/16*64 + lane%16*4
+        _b_voff_lane = arith.index_cast(
+            T.i32, lane_div_16 * _c64 + lane_mod_16 * _c4idx)
+
+        # Split out so the 2-stage K-loop can interleave one issue_b_load_j after
+        # each per-J MFMA cluster (== HIP run_one cuh:529-543).
+        def load_b_tile_j(kt, j):
+            sb = _b_base_j[j]                                   # scalar soffset (bytes)
+            # voff_kt shared across the 4 j of a tile (CSE -> 1 vreg/tile); the
+            # kt*2048-byte part lives in the vreg (exceeds the 4KB imm), the
+            # sub*1024-byte part folds into the buffer imm offset.
+            voff_kt = _b_voff_lane + arith.constant(kt * 512, type=T.i32)
+            b_j = []
+            for sub in range_constexpr(2):
+                off = voff_kt + arith.constant(sub * 256, type=T.i32)
+                v16 = buffer_ops.buffer_load(
+                    b_rsrc, off, vec_width=4, dtype=i32, cache_modifier=b_nt,
+                    soffset_bytes=sb,
                 )
+                i64x2 = vector.bitcast(vec2_i64, v16)
+                b0 = vector.extract(i64x2, static_position=[0], dynamic_position=[])
+                b1 = vector.extract(i64x2, static_position=[1], dynamic_position=[])
+                b_j.append((b0, b1))
+            return b_j
 
         def load_b_tile(kt):
-            b_tile = []
-            for j in range_constexpr(4):
-                n_off = (
-                    n_block * _c256 + wave_n * _c64
-                    + arith.constant(j * 16, index=True)
-                )
-                base_bytes = (e_idx * _cN + n_off) * _cKH
-                v_voff = (
-                    lane_div_16 * _c256 + lane_mod_16 * _c16
-                    + arith.constant(kt * 2048, index=True)
-                )
-                base_dw = (base_bytes + v_voff) / arith.index(4)
-                b_j = []
-                for sub in range_constexpr(2):
-                    off = base_dw + arith.constant(sub * 256, index=True)
-                    v16 = buffer_ops.buffer_load(
-                        b_rsrc, off, vec_width=4, dtype=i32, cache_modifier=b_nt
-                    )
-                    i64x2 = vector.bitcast(vec2_i64, v16)
-                    b0 = vector.extract(i64x2, static_position=[0], dynamic_position=[])
-                    b1 = vector.extract(i64x2, static_position=[1], dynamic_position=[])
-                    b_j.append((b0, b1))
-                b_tile.append(b_j)
-            return b_tile
+            return [load_b_tile_j(kt, j) for j in range_constexpr(4)]
 
         _scale_lane_dw = lane_div_16 * _c16 + lane_mod_16
         _chunk_base = m_row / arith.constant(32, index=True)
@@ -1372,8 +1512,29 @@ def compile_mxfp4_gemm1_a4w4(
             + wave_n * arith.constant(_mni_wn, index=True)
         )
 
+        # HIP issue_a_scale_ds_read (gemm1_a4w4.cuh:188-195) [inline+NT both read
+        # the A-scale from LDS here]:
+        #   lds_dw = sub*kAS_per_chunk_dw + kt*64 + (lane/16)*16 + (lane%16);
+        #   a_scale_aiter[sub] = *(int*)&s_Ascale[lds_dw*4];     // ds_read_b32
+        # DIVERGENCE (intentional): for inline-quant FlyDSL reads from a SEPARATE
+        # lds_ascale_i32 buffer with a dword-per-e8m0 layout (asc_idx = row*8 +
+        # block), written idempotently by iq_finish, instead of HIP's packed-byte
+        # s_Ascale. This avoids the sub-dword store races that HIP resolves with
+        # the inline_quant_pack_write path. The e8m0 value handed to the MFMA `sa`
+        # operand is identical; both lower to ds_read_b32. The NT branch below is
+        # the buffer-load form == HIP issue_a_scale_load (165-186).
         def load_a_scale(kt, slot=0):
-            # returns [a_sc_k0, a_sc_k1] (one A-scale dword per MFMA-K)
+            # HIP issue_a_scale_ds_read (cuh:188-195), BM=16 packed layout: read
+            # ONE dword (4 e8m0); the MFMA op_sel_a selects the byte (k0 -> 0,
+            # k1 -> 2). lds_dw_inner = (lane/16)*16 + (lane%16). ds_read_b32 x1.
+            if const_expr(inline_quant and BM == 16):
+                _sc_slot_off = arith.constant(
+                    slot * _ascale_slot_dwords, index=True)
+                asc_idx = lane_div_16 * _c16 + lane_mod_16 + _sc_slot_off
+                v = vector.load_op(T.vec(1, i32), lds_ascale_i32, [asc_idx])
+                return vector.extract(v, static_position=[0], dynamic_position=[])
+            # BM>=32 inline: dword-per-e8m0 staging (load_a_tile_inline writer),
+            # returns [a_sc_k0, a_sc_k1] (one A-scale dword per MFMA-K).
             if const_expr(inline_quant):
                 _sc_slot_off = arith.constant(
                     slot * _ascale_slot_dwords, index=True)
@@ -1401,17 +1562,31 @@ def compile_mxfp4_gemm1_a4w4(
                 ))
             return a_scs
 
+        # HIP issue_b_scale_load<K_C>(bs_sub) (gemm1_a4w4.cuh:322-332): scalar
+        # per-mw base soffset + shared lane voffset + kt offset (== B-load style).
+        #   b_scale_s_base[mw] = (e*kBS_per_expert_dw + (mni_base+mw)*kBS_stride_n0_dw)*4
+        _bs_base_mw = [
+            rocdl.readfirstlane(
+                T.i32,
+                arith.index_cast(
+                    T.i32,
+                    (e_idx * arith.constant(kBS_per_expert_dw, index=True)
+                     + (_mni_base + arith.constant(mw, index=True))
+                     * arith.constant(kBS_stride_n0_dw, index=True))
+                    * arith.index(4),
+                ),
+            )
+            for mw in range_constexpr(2)
+        ]
+        _bs_voff_lane = arith.index_cast(T.i32, _scale_lane_dw)   # elements (x4 -> bytes)
+
         def load_b_scale(kt):
             b_scs = []
+            voff_kt = _bs_voff_lane + arith.constant(kt * 64, type=T.i32)  # CSE/tile
             for mw in range_constexpr(2):
-                b_base = (
-                    e_idx * arith.constant(kBS_per_expert_dw, index=True)
-                    + (_mni_base + arith.constant(mw, index=True))
-                    * arith.constant(kBS_stride_n0_dw, index=True)
-                    + arith.constant(kt * 64, index=True) + _scale_lane_dw
-                )
                 b_scs.append(buffer_ops.buffer_load(
-                    b_scale_rsrc, b_base, vec_width=1, dtype=T.i32, cache_modifier=0
+                    b_scale_rsrc, voff_kt, vec_width=1, dtype=T.i32, cache_modifier=0,
+                    soffset_bytes=_bs_base_mw[mw],
                 ))
             return b_scs
 
@@ -1428,6 +1603,13 @@ def compile_mxfp4_gemm1_a4w4(
             v4 = vector.from_elements(vec4_i64, [x0, x1, c0, c0])
             return vector.bitcast(vec8_i32, v4)
 
+        # HIP issue_a_ds_read (gemm1_a4w4.cuh:148-163), inner load:
+        #   lane_row=lane%16; lane_col=(lane/16)*16; mask=lds_swizzle_mask<BK/2>(lane_row);
+        #   lds_col = (lane_col + k*64) ^ mask;
+        #   a[i][k] = *(i32x4*)&s_Aq[slot][lane_row + i*16][lds_col];  // ds_read_b128
+        # FlyDSL col_base = lane_div_16*16 + (k_idx*128)//a_elem_vec_pack (==k*64) and
+        # swizzle_xor16(curr_row, col_base) == (lane_col + k*64) ^ mask, so the per-lane
+        # LDS address is identical; vector.load_op(vec16) lowers to ds_read_b128.
         def lds_load_packs_k64(curr_row, col_base, slot=0):
             col_swz = swizzle_xor16(curr_row, col_base, k_blocks16)
             idx_a = crd2idx([curr_row, col_swz], layout_lds)
@@ -1442,6 +1624,20 @@ def compile_mxfp4_gemm1_a4w4(
         acc_init = arith.constant_vector(0.0, vec4_f32)
         accm = [acc_init] * (m_repeat * num_acc_n)
 
+        # HIP issue_mfma_cluster<J,kInit>(slot) (gemm1_a4w4.cuh:334-375), BM==16:
+        #   sa = a_scale_aiter[0]; sb = b_scale_v[slot][J/2];
+        #   mfma_f4f4_vgpr<0, 0+J%2>(accm[0][J], a[0][0], b[slot][J][0], sa, sb);  // k0
+        #   mfma_f4f4_vgpr<2, 2+J%2>(accm[0][J], a[0][1], b[slot][J][1], sa, sb);  // k1
+        # mfma_ktile runs ALL 8 MFMA of the tile (k_idx x ni x inxdl). The per-MFMA
+        # operands/op_sel/accumulator are bit-identical to HIP (op_sel_b = k_idx*2 +
+        # J%2, acc_idx = J, sa/sb same). TWO ISA-PATTERN DIVERGENCES vs HIP (the
+        # main remaining gemm1 alignment gap, see isa_compare):
+        #   (1) ISSUE ORDER: FlyDSL is K-major (k0:{J0..3}, k1:{J0..3}); HIP is
+        #       N-major (per J: k0,k1). Same 8 MFMA, different interleave.
+        #   (2) B-LOAD INTERLEAVE: HIP issues issue_b_load_j(J) BETWEEN the 4 per-J
+        #       MFMA clusters (sched_barrier-fenced) so B VMEM overlaps MFMA at a
+        #       fine grain; FlyDSL prefetches the whole next B-tile (load_b_tile
+        #       (kt+1)) before mfma_ktile, relying on the scheduler to overlap.
         def mfma_ktile(b_tile, a_sc_per_k, b_scs, a_slot=0):
             for k_idx in range_constexpr(2):
                 ikxdl = k_idx
@@ -1475,6 +1671,48 @@ def compile_mxfp4_gemm1_a4w4(
                                  op_sel_a, a_sc, op_sel_b, b_scale_val],
                             )
 
+        # HIP issue_a_ds_read (cuh:148-163): read the tile's A once (BM=16 -> 1
+        # m-chunk, 2 k128) and reuse across the 4 per-J MFMA clusters. Returns
+        # [a_k0, a_k1] (each a packed i32x8 A operand). Used by the HIP-faithful
+        # 2-stage loop; mfma_ktile above (non-BM16 / else path) reads inline.
+        def read_a_tile(a_slot=0):
+            a_k = []
+            for k_idx in range_constexpr(2):
+                col_base = col_offset_base + arith.constant(
+                    (k_idx * 128) // a_elem_vec_pack, index=True
+                )
+                a0, a1 = lds_load_packs_k64(row_a_lds, col_base, slot=a_slot)
+                a_k.append(_pack_i64x4(a0, a1))
+            return a_k
+
+        # HIP issue_mfma_cluster<J,kInit>(slot) (cuh:334-345), BM=16: ONE n-output
+        # J = 2 MFMA (k0: op_sel_a=0; k1: op_sel_a=0 on FlyDSL's per-k a_sc dword),
+        # op_sel_b = k_idx*2 + J%2, accumulating into accm[J]. Issued N-major (one
+        # J at a time) so the K-loop can fence it with sched_barrier/s_setprio and
+        # interleave issue_b_load_j(J) right after -- byte-for-byte HIP's cluster.
+        def mfma_cluster_J(a_k, b_J, a_sc, b_scs, J):
+            ni = J // pack_N
+            inxdl = J % pack_N
+            b_scale_val = b_scs[ni]
+            for k_idx in range_constexpr(2):
+                a128 = a_k[k_idx]
+                # HIP: k0 uses op_sel_a=0 (scale byte0), k1 op_sel_a=2 (byte2) of
+                # the SAME packed A-scale dword a_sc.
+                op_sel_a = k_idx * 2
+                b0, b1 = b_J[k_idx]
+                b128 = _pack_i64x4(b0, b1)
+                op_sel_b = k_idx * pack_N + inxdl
+                accm[J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    vec4_f32,
+                    [a128, b128, accm[J], cbsz, blgp,
+                     op_sel_a, a_sc, op_sel_b, b_scale_val],
+                )
+
+        # HIP grid dispatcher (gemm1_a4w4.cuh:573-592): pid=blockIdx.x is decoded to
+        # (m_block_idx, n_block_idx); blocks whose m_row >= cumsum_tensor[0] are
+        # padding and return early. FlyDSL keeps the 2-D grid and replicates the
+        # padding skip with an on-device cumsum guard (scf.if) so no cumsum value is
+        # copied back to the host.
         # device-side grid guard: kernel is launched with a fixed max grid
         # (max_sorted/BM); read cumsum on-device and skip padding blocks whose
         # m_row >= cumsum so we neither read cumsum back to the host (no per-iter
@@ -1497,41 +1735,70 @@ def compile_mxfp4_gemm1_a4w4(
             _guard_ip.__enter__()
 
         if const_expr(inline_quant and BM == 16):
-            # Software-pipelined K-loop (HIP run_one style):
-            #  - A 2-slot LDS double-buffer: quant(kt+1) writes the OTHER slot
-            #    while MFMA(kt) reads its slot, so only ONE barrier/iter is needed
-            #    (vs 2 in the serial loop): s_barrier 57 -> ~30.
-            #  - B + B-scale prefetched into registers one tile ahead so their
-            #    VMEM latency overlaps the current tile's MFMA cluster (B = the
-            #    bulk of gemm1 memory traffic), instead of stalling MFMA on B-load.
-            _iq_row, _iq_hrow = iq_token_hrow()
-            iq_finish(_iq_row, iq_load(0, _iq_hrow), slot=0)
-            b_pf = load_b_tile(0)
-            bsc_pf = load_b_scale(0)
-            for kt in range_constexpr(K_TILES):
-                gpu.barrier()
-                cur_a = kt % _a_slots
-                # prefetch next tile's hidden (loads only; finish runs post-MFMA)
-                if const_expr(kt + 1 < K_TILES):
-                    hv_next = iq_load(kt + 1, _iq_hrow)
-                b_cur = b_pf
-                bsc_cur = bsc_pf
-                asc_cur = load_a_scale(kt, slot=cur_a)
-                if const_expr(kt + 1 < K_TILES):
-                    b_pf = load_b_tile(kt + 1)
-                    bsc_pf = load_b_scale(kt + 1)
-                # NOTE: s_setprio around the MFMA cluster was tried and REVERTED:
-                # at small M the gemm1 grid is occupancy-light (≈1 block/CU), so
-                # there is no second wave-group for the priority boost to help;
-                # s_setprio also acts as a scheduling boundary that blocked the
-                # scheduler from hoisting B/hidden loads early, pushing s_waitcnt
-                # 131 -> 203 and slowing fly gemm1 (~31us -> ~36us).
-                mfma_ktile(b_cur, asc_cur, bsc_cur, a_slot=cur_a)
-                # finish quant for next tile AFTER MFMA: the hidden loads issued
-                # above are by now in flight behind the MFMA cluster, so the
-                # amax's vmcnt wait no longer stalls the MFMA pipeline.
-                if const_expr(kt + 1 < K_TILES):
-                    iq_finish(_iq_row, hv_next, slot=(kt + 1) % _a_slots)
+            # ===== HIP-faithful run_one K-loop (gemm1_a4w4.cuh:434-565) =====
+            # Byte-for-byte port of HIP's 2-STAGE software pipeline:
+            #   kStages=2 (B + A-quant 2 tiles ahead), kAStages=3 (_a_slots),
+            #   kUnroll=K_TILES-2=26, then a separate 2-iter drain.
+            #   read_slot = OFFSET % 3, write_slot = (OFFSET+2) % 3,
+            #   slot_b     = OFFSET % 2   (all distinct -> no WAR).
+            # Each tile's 4 n-output MFMA clusters are issued N-major (one J at a
+            # time), fenced with sched_barrier + s_setprio(1)/(0), and a single
+            # issue_b_load_j(K_C, J) is interleaved right after each cluster so B
+            # VMEM overlaps MFMA at HIP's exact granularity.
+            _AS = _a_slots                                     # 3 == kAStages
+            _iq_row, _iq_hrow = iq_token_hrow()                # HIP cached_row_inline
+            # ---- PROLOGUE: stages 0,1 (== cuh:434-463) ----
+            # COUPLE load+process per stage (== HIP inline_quant_kt: load hidden,
+            # then amax+cvt+store right after). HIP only SPLITS load/finish in the
+            # main loop (to hide hidden-load latency behind MFMA); the prologue has
+            # no MFMA to hide behind, so it couples. Coupling keeps the hidden
+            # load's use-distance short so the scheduler does NOT defer the
+            # token-dependent hidden loads behind the (dependency-free) B loads --
+            # i.e. hidden stays among the oldest VMEM, so the prologue amax's vmcnt
+            # drains only the hidden (not the 16 B). (Batching iq_load for all
+            # stages then iq_finish made hidden's use-distance long -> scheduler
+            # issued B first -> amax over-waited vmcnt down to 4.)
+            b_slot = [None, None]                              # HIP b[kStages][4][2]
+            bsc_slot = [None, None]                            # HIP b_scale_v[kStages][2]
+            for K_C in range_constexpr(2):                     # static_for<0,kStages>
+                iq_finish(_iq_row, iq_load(K_C, _iq_hrow), slot=K_C)  # inline_quant_kt
+                b_slot[K_C] = load_b_tile(K_C)                 # issue_b_load_j(K_C, 0..3)
+                bsc_slot[K_C] = load_b_scale(K_C)              # issue_b_scale_load(K_C)
+            # ---- MAIN LOOP: OFFSET 0..K_TILES-3 (== cuh:465-552) ----
+            for off in range_constexpr(K_TILES - 2):          # static_for<0,kUnroll>
+                K_C = off + 2
+                read_slot = off % _AS
+                write_slot = K_C % _AS
+                slot_b = off % 2
+                gpu.barrier()                                 # __syncthreads() (472)
+                a_k = read_a_tile(a_slot=read_slot)           # issue_a_ds_read(read_slot)
+                asc_cur = load_a_scale(off, slot=read_slot)   # issue_a_scale_ds_read(OFFSET)
+                hv = iq_load(K_C, _iq_hrow)                    # inline_quant_load_kt(K_C) [2 ahead]
+                rocdl.sched_barrier(0)                         # cuh:527
+                b_cur = b_slot[slot_b]
+                bsc_cur = bsc_slot[slot_b]
+                for J in range_constexpr(4):                  # cuh:529-543 for-J
+                    rocdl.sched_barrier(0)
+                    rocdl.s_setprio(1)
+                    mfma_cluster_J(a_k, b_cur[J], asc_cur, bsc_cur, J)  # issue_mfma_cluster<J>
+                    rocdl.s_setprio(0)
+                    rocdl.sched_barrier(0)
+                    b_slot[slot_b][J] = load_b_tile_j(K_C, J)  # issue_b_load_j(K_C, J) -> slot_b
+                    rocdl.sched_barrier(0)
+                bsc_slot[slot_b] = load_b_scale(K_C)           # issue_b_scale_load(K_C)
+                iq_finish(_iq_row, hv, slot=write_slot)        # inline_quant_finish_kt(write_slot,K_C)
+            # ---- DRAIN: last kStages tiles (== cuh:554-565) ----
+            for s in range_constexpr(2):                       # static_for<0,kStages>
+                kt = K_TILES - 2 + s
+                read_slot = kt % _AS
+                slot_b = kt % 2
+                gpu.barrier()                                 # __syncthreads() (559)
+                a_k = read_a_tile(a_slot=read_slot)           # issue_a_ds_read(kt%3)
+                asc_cur = load_a_scale(kt, slot=read_slot)    # issue_a_scale_ds_read(kt)
+                b_cur = b_slot[slot_b]
+                bsc_cur = bsc_slot[slot_b]
+                for J in range_constexpr(4):                  # 4x issue_mfma_cluster<J>
+                    mfma_cluster_J(a_k, b_cur[J], asc_cur, bsc_cur, J)
         else:
             for kt in range_constexpr(K_TILES):
                 if const_expr(kt > 0):
@@ -1543,6 +1810,13 @@ def compile_mxfp4_gemm1_a4w4(
                 gpu.barrier()
                 mfma_ktile(load_b_tile(kt), load_a_scale(kt), load_b_scale(kt))
 
+        # ===== HIP apply_cshuffle_quant_epilog<N_OUT,BM> (mxfp4_epilogs.hpp:21-145)
+        # called at gemm1_a4w4.cuh:567-570 after the final __syncthreads(). FlyDSL
+        # inlines the same three phases:
+        #   (1) cshuffle accm -> lds_acc          (hpp:39-53)
+        #   (2) SiLU*mul + amax(DPP) + e8m0 + 4x cvt_pk_fp4_f32 + nt store (hpp:57-122)
+        #   (3) kk==0 A-scale store               (hpp:124-144)
+        # =====
         # ---- SiLU*mul + fp4 requant epilogue (increment 3) ----
         # output inter-scale chunk granularity = 16 rows (BM=16) or 32 rows
         # (BM>=32, kSubBlocks 32-row sub-chunks). The rsrc num_records bound must
@@ -1561,6 +1835,10 @@ def compile_mxfp4_gemm1_a4w4(
         c_BN = arith.constant(BN, index=True)
         _c128 = arith.constant(128, index=True)
         _c32idx = arith.constant(32, index=True)
+        # Phase (1) cshuffle == HIP hpp:39-53:
+        #   row_base = i*16 + (lane/16)*4; col_local = wave_n*32 + (J/2)*16 + lane%16;
+        #   lds_col = (J%2)? 128+col_local : col_local;
+        #   lds_acc[(row_base+v)*BN + lds_col] = accm[i][J][v];   (v=0..3)
         # cshuffle: accm[i][J] -> lds_acc; J even=gate (col), J odd=up (128+col)
         for i in range_constexpr(m_repeat):
             row_base = arith.constant(i * 16, index=True) + lane_div_16 * arith.constant(
@@ -1583,6 +1861,10 @@ def compile_mxfp4_gemm1_a4w4(
                     vector.store(vv, lds_acc, [lds_idx], alignment=4)
         gpu.barrier()
 
+        # Phase (2) == HIP hpp:57-122: read gate/up, SiLU*mul (silu_mul_fast =
+        # g*rcp(1+exp2(-log2e*g))*u), amax over 8 + DPP quad (0xB1,0x4E), e8m0 via
+        # (amax+0x200000)*0.25 >> 23, 4x cvt_scalef32_pk_fp4_f32, nontemporal store.
+        # m_lane=tid/16, n_lane=tid%16, wave_grp=n_lane/4, kk=n_lane%4 == HIP (62-65).
         # read gate/up, SiLU*mul, per-32 amax(DPP) -> fp4 + e8m0
         m_lane = tx / _c16
         n_lane = tx % _c16
@@ -1625,13 +1907,17 @@ def compile_mxfp4_gemm1_a4w4(
                 local_max = arith.maximumf(
                     local_max, (results[e].bitcast(i32) & _c7fff).bitcast(f32)
                 )
-            _c64i = arith.constant(64, type=i32)
-            local_max = arith.maximumf(
-                local_max, local_max.shuffle_xor(arith.constant(1, type=i32), _c64i)
-            )
-            local_max = arith.maximumf(
-                local_max, local_max.shuffle_xor(arith.constant(2, type=i32), _c64i)
-            )
+            # quad cross-lane amax via DPP mov (== HIP epilogue mov_dpp 0xB1/0x4E +
+            # fmaxf, mxfp4_epilogs.hpp:96-101), not shuffle_xor which lowers to
+            # ds_swizzle_b32. Keeps the cross-lane reduce on the VALU/DPP path.
+            _e_i32ty = ir.IntegerType.get_signless(32)
+            _LMV = type(local_max)
+            _lm_i = local_max.bitcast(i32)
+            _p = rocdl.update_dpp(_e_i32ty, _lm_i, _lm_i, 0xB1, 0xF, 0xF, True)
+            local_max = arith.maximumf(local_max, _LMV(_p).bitcast(f32))
+            _lm_i = local_max.bitcast(i32)
+            _p = rocdl.update_dpp(_e_i32ty, _lm_i, _lm_i, 0x4E, 0xF, 0xF, True)
+            local_max = arith.maximumf(local_max, _LMV(_p).bitcast(f32))
             # HIP quant_scale (non-pow2) + HW cvt -> bit-exact with HIP:
             #   quant_scale = uint(amax + 0x200000) * 0.25
             #   e8m0 = min(uint(quant_scale) >> 23, 254)
@@ -1683,7 +1969,9 @@ def compile_mxfp4_gemm1_a4w4(
                 _aq_ptr, alignment=4,
             )
 
-        # scale store (kk==0): make_preshuffle inter scale
+        # Phase (3) == HIP hpp:124-144: scale store (kk==0): make_preshuffle inter
+        # scale. ku = n_block>>1, ikxdl = n_block&1; BM=16 writes the LOW byte only
+        # (dword_off*4 + ikxdl*2), BM>=32 packs the e8m0 pair of rows {2sub,2sub+1}.
         if const_expr(debug_bf16):
             return
         kk_i32 = arith.index_cast(i32, kk)
@@ -1757,13 +2045,23 @@ def compile_mxfp4_gemm1_a4w4(
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
         gx = arith.index_cast(ir.IndexType.get(), i32_total_m_blocks.ir_value())
+        # 1-D grid of total tiles (= total_m_blocks * num_n_blocks), decoded to
+        # (m,n) on-device as m=pid/num_n, n=pid%num_n (== HIP). Keeps valid blocks
+        # contiguous in pid for even 1-per-CU distribution (vs the 2-D grid that
+        # clustered valid blocks onto some CUs -> straggler CUs at small M).
+        g_total = gx * arith.constant(num_n_blocks, index=True)
         gemm1_kernel(
             arg_a, arg_a_scale, arg_b, arg_b_scale,
             arg_sorted_expert_ids, arg_cumsum, arg_m_indices,
             arg_aq_out, arg_ascale_out, arg_hidden,
             i32_tokens, i32_max_sorted,
+            # Pin occupancy to match HIP __launch_bounds__(256, 3): emit the
+            # LLVM "amdgpu-waves-per-eu"="3" function attribute (via the
+            # rocdl.waves_per_eu gpu.func attr -> rocdl-attach-target). Without
+            # it FlyDSL left waves_per_eu unset (compiler default ~4 from VGPR).
+            # value_attrs={"rocdl.waves_per_eu": 3},
         ).launch(
-            grid=(gx, num_n_blocks, 1),
+            grid=(g_total, 1, 1),
             block=(total_threads, 1, 1),
             # LDS lives in the allocator's static group-segment global (== allocator.ptr,
             # 128KB for BM=128 via the union); no extra dynamic LDS. smem= is additive
