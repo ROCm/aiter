@@ -777,7 +777,7 @@ def flydsl_moe_stage1(
 
     if _is_splitk:
         torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
-        tmp_out = torch.zeros(
+        tmp_out = torch.empty(
             (token_num, topk, inter_dim * 2), dtype=torch_tmp_out_dtype, device=dev
         )
     else:
