@@ -18,8 +18,11 @@ For an end-to-end GDN forward that uses this K5 wrapper, call
 
 from __future__ import annotations
 
+import csv
 import functools
 import math
+import os
+from pathlib import Path
 
 import torch
 import triton
@@ -44,7 +47,6 @@ __all__ = [
 
 # -- K5 host wrapper (FlyDSL kernel + rule-based BV selection) ------------
 
-_compiled_kernels = {}
 _BV_CANDIDATES = [16, 32, 64]
 _DEFAULT_BV = 16
 
@@ -60,6 +62,113 @@ _IS_GFX950 = get_rocm_arch().split(":")[0].startswith("gfx950")
 # gfx950 has 256 CUs. Used as the fallback CU count when the live device
 # query is unavailable (e.g. CPU-only meta runs).
 _GFX950_CU_COUNT = 256
+
+# ---------------------------------------------------------------------------
+# Tuned-csv BV lookup (csv-best preferred, rule-based fallback)
+# ---------------------------------------------------------------------------
+# Offline-tuned table mapping a shape family to its measured-best BV. This is
+# the SAME csv the AOT path (``aiter/aot/flydsl/chunk_gdn_h.py``) uses as its
+# pre-compile seed list. At runtime we consult it FIRST for an exact-match
+# best BV; on a miss (the table is sparse -- a few dozen rows) we fall back to
+# the rule-based ``_target_bv_for_shape`` / CU-fill heuristic, so coverage is
+# never worse than the pure-rule path.
+#
+# Built once per process (mirrors ``GDR_GLOBAL_CONFIG_MAP`` in
+# ``linear_attention_kernels``): we keep, per key, the BV of the row with the
+# smallest measured ``duration``.
+_TUNED_BV_CSV = (
+    Path(__file__).resolve().parent / "chunk_gdn_h_tuned.csv"
+)
+# key = (arch, dtype, K, V, BT, H, Hg, T_flat, N, is_varlen) -> (BV, duration)
+_TUNED_BV_MAP: dict[tuple, tuple[int, float]] | None = None
+
+
+def _parse_csv_bool(s: str) -> bool:
+    return str(s).strip() in ("True", "true", "1", "yes")
+
+
+def _load_tuned_bv_map() -> dict[tuple, tuple[int, float]]:
+    """Parse ``chunk_gdn_h_tuned.csv`` into a best-BV lookup, once per process.
+
+    Keeps the BV from the minimum-``duration`` row for each shape-family key.
+    Malformed rows are skipped so a partially hand-edited csv can never break
+    the runtime path (we just fall back to the rule for those shapes).
+    """
+    global _TUNED_BV_MAP
+    if _TUNED_BV_MAP is not None:
+        return _TUNED_BV_MAP
+
+    out: dict[tuple, tuple[int, float]] = {}
+    try:
+        with open(_TUNED_BV_CSV, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    key = (
+                        row["arch"],
+                        row["dtype"],
+                        int(row["K"]),
+                        int(row["V"]),
+                        int(row["BT"]),
+                        int(row["H"]),
+                        int(row["Hg"]),
+                        int(row["T_flat"]),
+                        int(row["N"]),
+                        _parse_csv_bool(row["is_varlen"]),
+                    )
+                    bv = int(row["BV"])
+                    dur = float(row["duration"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                prev = out.get(key)
+                if prev is None or dur < prev[1]:
+                    out[key] = (bv, dur)
+    except OSError:
+        # No csv on disk (e.g. trimmed deployment): rule-only path.
+        pass
+
+    _TUNED_BV_MAP = out
+    return out
+
+
+def _lookup_csv_bv(
+    *,
+    dtype_str: str | None,
+    K: int | None,
+    BT: int | None,
+    H: int,
+    Hg: int,
+    V: int,
+    T_flat: int,
+    N: int,
+    is_varlen: bool,
+) -> int | None:
+    """Exact-match best BV from the tuned csv, or ``None`` on miss.
+
+    Returns ``None`` whenever any key field needed to form the csv key is
+    unavailable (``dtype_str`` / ``K`` / ``BT`` are optional on the
+    ``_heuristic_bv`` signature for backward compatibility), so callers that
+    don't pass them simply skip straight to the rule-based path.
+    """
+    if dtype_str is None or K is None or BT is None:
+        return None
+    table = _load_tuned_bv_map()
+    if not table:
+        return None
+    hit = table.get(
+        (
+            get_rocm_arch(),
+            dtype_str,
+            K,
+            V,
+            BT,
+            H,
+            Hg,
+            T_flat,
+            N,
+            is_varlen,
+        )
+    )
+    return hit[0] if hit is not None else None
 
 
 @functools.lru_cache(maxsize=None)
@@ -452,8 +561,25 @@ def _heuristic_bv(
     is_varlen: bool,
     min_seqlen: int | None = None,
     device_index: int | None = None,
+    dtype_str: str | None = None,
+    K: int | None = None,
+    BT: int | None = None,
 ) -> int:
-    """Pick a sensible BV for the requested shape. Pure function: no IO, no state.
+    """Pick a sensible BV for the requested shape.
+
+    Selection order:
+      1. Exact-match best BV from the offline-tuned csv
+         (``chunk_gdn_h_tuned.csv``), when the full key is available and the
+         row's BV is legal for this ``V``. This gives the measured optimum
+         for shapes that were actually swept.
+      2. Otherwise the rule-based heuristic below (CTA/CU grid-fill plus the
+         trace-calibrated carve-outs), which generalizes to shapes the sparse
+         csv does not cover.
+
+    The function performs a cheap one-time csv parse on first call and is
+    otherwise pure w.r.t. its scalar arguments; the result is consumed only
+    on the ``_build_plan`` cold path (one call per unique plan key), so the
+    csv parse / lookup never touches the hot launch path.
 
     Rules calibrated against a 27-point sweep matrix on gfx950 (20 in-csv
     shapes + 7 csv-uncovered probes). The 27 points span H in
@@ -502,6 +628,18 @@ def _heuristic_bv(
         V (rare: V<16 or V not divisible by 16), falls back to the
         largest legal candidate, then finally to ``_DEFAULT_BV``.
     """
+    # 1. csv-best exact match (preferred). Only honoured when the row's BV is
+    #    legal for this V; an out-of-range / non-divisor BV in a hand-edited
+    #    csv silently falls through to the rule rather than launching a bad
+    #    grid.
+    csv_bv = _lookup_csv_bv(
+        dtype_str=dtype_str, K=K, BT=BT,
+        H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen,
+    )
+    if csv_bv is not None and csv_bv in _legal_bv_candidates(V):
+        return csv_bv
+
+    # 2. rule-based fallback (generalizes beyond the sparse csv).
     target_bv = _target_bv_for_shape(
         H=H, Hg=Hg, T_flat=T_flat, N=N, is_varlen=is_varlen,
         min_seqlen=min_seqlen,
@@ -517,6 +655,7 @@ def _heuristic_bv(
     return _select_bv_for_grid(H=H, V=V, N=N, target_ctas=target_ctas)
 
 
+@functools.lru_cache(maxsize=None)
 def _get_or_compile(
     K,
     V,
@@ -534,42 +673,30 @@ def _get_or_compile(
     state_bf16=False,
     g_log2_scaled=False,
 ):
-    cache_key = (
-        K,
-        V,
-        BT,
-        BV,
-        H,
-        Hg,
-        use_g,
-        use_gk,
-        use_h0,
-        store_fs,
-        save_vn,
-        is_varlen,
-        wu_contig,
-        state_bf16,
-        g_log2_scaled,
+    """Compile (and cache) the K5 kernel for one compile-time config.
+
+    Cached via ``lru_cache`` keyed on the full compile-time constant set,
+    mirroring the gemm/moe/gdr_decode flydsl ops. ``maxsize=None`` because
+    the number of distinct configs is naturally bounded by the compile-time
+    constant combinations.
+    """
+    return compile_chunk_gated_delta_h(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
     )
-    if cache_key not in _compiled_kernels:
-        _compiled_kernels[cache_key] = compile_chunk_gated_delta_h(
-            K=K,
-            V=V,
-            BT=BT,
-            BV=BV,
-            H=H,
-            Hg=Hg,
-            USE_G=use_g,
-            USE_GK=use_gk,
-            USE_INITIAL_STATE=use_h0,
-            STORE_FINAL_STATE=store_fs,
-            SAVE_NEW_VALUE=save_vn,
-            IS_VARLEN=is_varlen,
-            WU_CONTIGUOUS=wu_contig,
-            STATE_DTYPE_BF16=state_bf16,
-            G_IS_LOG2_SCALED=g_log2_scaled,
-        )
-    return _compiled_kernels[cache_key]
 
 
 def _resolve_state_dtype(initial_state, state_dtype):
@@ -655,6 +782,7 @@ def _build_plan(
         H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen,
         min_seqlen=min_seqlen,
         device_index=k.device.index if k.device.type == "cuda" else -1,
+        dtype_str=str(k.dtype), K=K, BT=BT,
     )
 
     launch_fn = _get_or_compile(
