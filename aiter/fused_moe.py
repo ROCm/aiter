@@ -2340,8 +2340,8 @@ def cktile_moe_stage1(
                 NLane = 16
                 N0 = inter_dim // NLane
                 flat = valid_out.view(-1, N0, 2, NLane)
-                deinterleaved = flat.permute(0, 2, 1, 3).contiguous().view(
-                    -1, inter_dim * 2
+                deinterleaved = (
+                    flat.permute(0, 2, 1, 3).contiguous().view(-1, inter_dim * 2)
                 )
                 aiter.silu_and_mul(out, deinterleaved)
             else:
