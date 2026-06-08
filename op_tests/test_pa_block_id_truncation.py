@@ -225,13 +225,22 @@ def _build_kv_cache(q_dtype_str="bf16", kv_quant="noquant"):
 
     # K layout: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
     k_cache = torch.zeros(
-        NUM_BLOCKS, NUM_KV_HEADS, HEAD_DIM // x, BLOCK_SIZE, x,
-        dtype=dtype, device="cuda",
+        NUM_BLOCKS,
+        NUM_KV_HEADS,
+        HEAD_DIM // x,
+        BLOCK_SIZE,
+        x,
+        dtype=dtype,
+        device="cuda",
     )
     # V layout: [num_blocks, num_kv_heads, head_dim, block_size]
     v_cache = torch.zeros(
-        NUM_BLOCKS, NUM_KV_HEADS, HEAD_DIM, BLOCK_SIZE,
-        dtype=dtype, device="cuda",
+        NUM_BLOCKS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        BLOCK_SIZE,
+        dtype=dtype,
+        device="cuda",
     )
 
     for block_id, sig, _label in _FINGERPRINTS:
@@ -358,11 +367,21 @@ def test_pa_fwd_asm_block_id_no_truncation(
         )
     k_cache, v_cache, k_scale, v_scale = _build_kv_cache(q_dtype, kv_quant)
     actual = _run_pa_fwd_asm(
-        k_cache, v_cache, k_scale, v_scale, block_id, max_qlen=max_qlen,
-        kv_quant=kv_quant, num_q_heads=NUM_Q_HEADS, q_dtype_str=q_dtype,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        block_id,
+        max_qlen=max_qlen,
+        kv_quant=kv_quant,
+        num_q_heads=NUM_Q_HEADS,
+        q_dtype_str=q_dtype,
     )
     _assert_block_id_fingerprint(
-        actual, expected_sig, block_id, kv_quant,
+        actual,
+        expected_sig,
+        block_id,
+        kv_quant,
         f"{q_dtype}/gqa8/{kv_quant}/{kernel_label}/{label}",
     )
 
@@ -383,11 +402,21 @@ def test_pa_fwd_asm_block_id_no_truncation_gqa16(
     dispatcher rejects with a hard abort. Both are unrelated to the >4GB fix."""
     k_cache, v_cache, k_scale, v_scale = _build_kv_cache(q_dtype, "noquant")
     actual = _run_pa_fwd_asm(
-        k_cache, v_cache, k_scale, v_scale, block_id, max_qlen=1,
-        kv_quant="noquant", num_q_heads=GQA16_Q_HEADS, q_dtype_str=q_dtype,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        block_id,
+        max_qlen=1,
+        kv_quant="noquant",
+        num_q_heads=GQA16_Q_HEADS,
+        q_dtype_str=q_dtype,
     )
     _assert_block_id_fingerprint(
-        actual, expected_sig, block_id, "noquant",
+        actual,
+        expected_sig,
+        block_id,
+        "noquant",
         f"{q_dtype}/gqa16/noquant/qlen1/{label}",
     )
 
@@ -410,12 +439,22 @@ def test_pa_fwd_asm_block_id_no_truncation_fp8_uhp(
     test via pa_fwd_asm; same for the int8 `_2tg_4w` decode path.)"""
     k_cache, v_cache, k_scale, v_scale = _build_kv_cache(q_dtype, "fp8")
     actual = _run_pa_fwd_asm(
-        k_cache, v_cache, k_scale, v_scale, block_id, max_qlen=1,
-        kv_quant="fp8", num_q_heads=NUM_Q_HEADS, q_dtype_str=q_dtype,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        block_id,
+        max_qlen=1,
+        kv_quant="fp8",
+        num_q_heads=NUM_Q_HEADS,
+        q_dtype_str=q_dtype,
         high_precision=2,
     )
     _assert_block_id_fingerprint(
-        actual, expected_sig, block_id, "fp8",
+        actual,
+        expected_sig,
+        block_id,
+        "fp8",
         f"{q_dtype}/gqa8/fp8_uhp/qlen1/{label}",
     )
 
@@ -431,13 +470,30 @@ if __name__ == "__main__":
     print(f"  V cache {tuple(v_cache.shape)} = {v_cache.numel() * 2 / 1e9:.2f} GB")
     print()
 
-    def _report(tag, kq, vq, ks, vs, max_qlen, kv_quant, num_q_heads, q_dtype,
-                high_precision=None):
+    def _report(
+        tag,
+        kq,
+        vq,
+        ks,
+        vs,
+        max_qlen,
+        kv_quant,
+        num_q_heads,
+        q_dtype,
+        high_precision=None,
+    ):
         print(f"=== {tag} ===")
         for block_id, expected, label in _FINGERPRINTS:
             actual = _run_pa_fwd_asm(
-                kq, vq, ks, vs, block_id, max_qlen=max_qlen, kv_quant=kv_quant,
-                num_q_heads=num_q_heads, q_dtype_str=q_dtype,
+                kq,
+                vq,
+                ks,
+                vs,
+                block_id,
+                max_qlen=max_qlen,
+                kv_quant=kv_quant,
+                num_q_heads=num_q_heads,
+                q_dtype_str=q_dtype,
                 high_precision=high_precision,
             )
             status = "OK" if abs(actual - expected) < _ABS_TOL[kv_quant] else "BUG"
@@ -462,19 +518,41 @@ if __name__ == "__main__":
                     continue  # int8 non-MTP decode unsupported; covered via MTP.
                 _report(
                     f"{q_dtype} / gqa8 / {kv_quant} / {kernel_label} (max_qlen={max_qlen})",
-                    kq, vq, ks, vs, max_qlen, kv_quant, NUM_Q_HEADS, q_dtype,
+                    kq,
+                    vq,
+                    ks,
+                    vs,
+                    max_qlen,
+                    kv_quant,
+                    NUM_Q_HEADS,
+                    q_dtype,
                 )
         # fp8 ultra-high-precision decode kernel (_2tg_4w_uhp via high_precision=2).
         kq, vq, ks, vs = _build_kv_cache(q_dtype, "fp8")
         _report(
             f"{q_dtype} / gqa8 / fp8_uhp / qlen1_non_MTP (max_qlen=1, hp=2)",
-            kq, vq, ks, vs, 1, "fp8", NUM_Q_HEADS, q_dtype, high_precision=2,
+            kq,
+            vq,
+            ks,
+            vs,
+            1,
+            "fp8",
+            NUM_Q_HEADS,
+            q_dtype,
+            high_precision=2,
         )
         # gqa16 family: noquant + qlen1 only (see test docstring for why).
         kq, vq, ks, vs = _build_kv_cache(q_dtype, "noquant")
         _report(
             f"{q_dtype} / gqa16 / noquant / qlen1_non_MTP (max_qlen=1)",
-            kq, vq, ks, vs, 1, "noquant", GQA16_Q_HEADS, q_dtype,
+            kq,
+            vq,
+            ks,
+            vs,
+            1,
+            "noquant",
+            GQA16_Q_HEADS,
+            q_dtype,
         )
 
     # ---- Performance comparison ----
