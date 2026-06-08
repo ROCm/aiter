@@ -397,14 +397,18 @@ def fused_moe_(
     ):
         q_dtype_a = dtypes.fp8
     bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
+    force_bf16_act = os.environ.get("AITER_MOE_FORCE_BF16_ACT", "0") == "1"
     if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
     elif quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
-            q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
+            if force_bf16_act:
+                q_dtype_a = dtypes.bf16
+            else:
+                q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
-            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
+            if force_bf16_act or get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
             else:
                 q_dtype_a = dtypes.fp8
