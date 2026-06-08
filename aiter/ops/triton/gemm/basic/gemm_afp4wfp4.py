@@ -471,6 +471,7 @@ def gemm_afp4wfp4_preshuffle(
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
             get_gemm_afp4wfp4_preshuffle_layouts,
+            get_gemm_afp4wfp4_preshuffle_layouts_cga,
         )
 
         grid = lambda META: (  # noqa: E731
@@ -488,12 +489,25 @@ def gemm_afp4wfp4_preshuffle(
         k_tiles = triton.cdiv(K_bytes, BLOCK_K_BYTES)
         config["NUM_BUFFERS"] = min(config["NUM_BUFFERS"], k_tiles)
 
-        layouts = get_gemm_afp4wfp4_preshuffle_layouts(
-            config["num_warps"],
-            config["BLOCK_SIZE_M"],
-            config["BLOCK_SIZE_N"],
-            config["BLOCK_SIZE_K"],
-        )
+        # num_ctas > 1 uses the multicast (CGA) layout builder; num_ctas == 1 uses
+        # the plain single-CTA builder (its single shared_S serves both scale
+        # buffers, matching the kernel's shared_AS / shared_BS params).
+        if config["num_ctas"] > 1:
+            layouts = get_gemm_afp4wfp4_preshuffle_layouts_cga(
+                config["num_warps"],
+                config["BLOCK_SIZE_M"],
+                config["BLOCK_SIZE_N"],
+                config["BLOCK_SIZE_K"],
+                config["num_ctas"],
+            )
+        else:
+            layouts = get_gemm_afp4wfp4_preshuffle_layouts(
+                config["num_warps"],
+                config["BLOCK_SIZE_M"],
+                config["BLOCK_SIZE_N"],
+                config["BLOCK_SIZE_K"],
+            )
+            layouts["shared_AS"] = layouts["shared_BS"] = layouts.pop("shared_S")
 
         # Kernel consumes preshuffled scales directly (address math inverts the shuffle in registers)
         assert M >= 32, "gluon mxfp4 preshuffle path requires M >= 32"
