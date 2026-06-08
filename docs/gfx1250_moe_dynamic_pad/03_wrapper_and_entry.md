@@ -1,7 +1,7 @@
 # 03 · wrapper + 入口层 plumbing
 
-status: not-started
-owner: (认领后署名)
+status: in-progress
+owner: claude-agent
 依赖:`02`(需要 kernel 新增的 `i32_k_valid`/`i32_n_valid` 标量签名最终确定)
 
 涉及文件:

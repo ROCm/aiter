@@ -14,13 +14,16 @@ status: living-doc(贯穿全程,各 agent 回写结论)
 
 ### R2 · TDM 2D store 越界是否 drop?  【阻塞 02 的 N-pad TDM-store 路径】
 - 决定能否保留 TDM-store 快路径、免逐列谓词。由 `01` microbench (b) 确认。
-- 结论:**dim0(innermost/列)DROP ✓,dim1(outermost/行)WRITES THROUGH ✗**
+- 结论(**已更新 2026-06-08**):**dim0(innermost/列)DROP ✓,dim1(outermost/行)DROP ✓**
   - valid_inner(dim0)= store 越界列被丢弃,全局不写入。
-  - valid_outer(dim1)= store 越界行**照样写入**,tensor_dim1 对 store 不做 OOB mask。
-  - ⇒ N-pad 方案取决于 N 落在 dim0 还是 dim1:
-    - **若 N 是 dim0(innermost)**:TDM store + valid_inner OOB 可用,保留快路径。
-    - **若 N 是 dim1(outermost)**:需 grid 裁剪(少 launch 纯 pad tile)或回退
-      scalar buffer store + 逐列谓词。
+  - valid_outer(dim1)= store 越界行**也被丢弃**。
+  - ⚠️ 早期(旧版 tdm_ops)曾测到 dim1 WRITES THROUGH,根因是 **num_warps>1 时 valid_outer 是全局行数、
+    但 descriptor base 已是 per-warp 偏移**,warp2/3 的 tdim1 永不触发 OOB。
+  - 现 flydsl `make_tensor_descriptor_2d` 已内部做 per-warp 修正
+    `tdim1 = max(0, valid_outer - warp_off_outer)`(`tdm_ops.py:384-398`,dim0 同理 `:369-383`)。
+  - 复测:`verify_store_oob_warp.py`,num_warps=1 与 num_warps=4 **均 DROP**。
+  - ⇒ **限制解除**:无论 N 落在 dim0 还是 dim1,N-pad 都可用 TDM store + `valid_inner`/`valid_outer`
+    OOB 丢弃越界列/行,**全程保留 TDM-store 快路径**,不需要逐列谓词或回退 scalar store。
 
 ### R3 · OOB 参考系
 - bound 是相对 descriptor 折叠基址的 **remaining**(`K_valid - k_base`),还是全局 origin?
@@ -83,7 +86,7 @@ status: living-doc(贯穿全程,各 agent 回写结论)
 
 ## 结论回写区(各 agent 更新)
 - R1 load OOB: **ZERO-FILL**(compile-time + runtime SSA 均确认)
-- R2 store OOB: **dim0(innermost)DROP, dim1(outermost)WRITES THROUGH**
+- R2 store OOB: **dim0(innermost)DROP ✓, dim1(outermost)DROP ✓**(2026-06-08 复测;per-warp 修正后两个方向都丢弃,限制解除)
 - R3 参考系: **RELATIVE TO DESCRIPTOR BASE**(remaining,不是全局 origin)
 - R4 生产 kernel 文件: ______
 - R5 scale 简化是否成立: ______(R1 成立 ⇒ scale 越界无所谓,因为 data=0 ⇒ 0×2^scale=0)

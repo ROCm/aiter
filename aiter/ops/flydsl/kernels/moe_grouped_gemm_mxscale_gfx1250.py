@@ -841,6 +841,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         _tmp=None,
         _skip_epilogue=False,
         bias=None,
+        k_valid=None,
+        n_valid=None,
         _debug_tmp_sentinel=None,
         _debug_tmp_out=None,
     ):
@@ -871,6 +873,15 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         _check_bias_args("bias", bias, (cfg.experts, 2 * cfg.inter_dim), y)
         if stream is None:
             stream = torch.cuda.current_stream()
+        k_valid_val = k_valid if k_valid is not None else cfg.model_dim
+        # N-pad: stage1 stores via the fused-activation scalar epilogue (the
+        # TDM-store valid_inner path is not taken when activation is fused), so
+        # the GEMM-kernel i32_n_valid is effectively a no-op here.  Pass each
+        # call's own N so the store descriptor's OOB bound equals the tile width
+        # (no drop).  Stage1's intermediate padding columns are harmless: stage2
+        # zero-fills them via its K-pad (k_valid) during the contraction.
+        n_valid_fused = n_valid if n_valid is not None else fused_n
+        n_valid_raw = n_valid if n_valid is not None else 2 * cfg.inter_dim
         fused_gemm = fused_base_bias if bias is not None else fused_base
         use_fused_gemm = (
             fused_gemm is not None
@@ -915,6 +926,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         m_tile_map,
                         cfg.max_m,
                         fused_n,
+                        k_valid_val,
+                        n_valid_fused,
                         stream,
                     )
                 else:
@@ -930,6 +943,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         m_tile_map,
                         cfg.max_m,
                         fused_n,
+                        k_valid_val,
+                        n_valid_fused,
                         stream,
                     )
             else:
@@ -945,6 +960,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     m_tile_map,
                     cfg.max_m,
                     2 * cfg.inter_dim,
+                    k_valid_val,
+                    n_valid_raw,
                     stream,
                 )
             if _gemm_events is not None:
@@ -965,6 +982,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         masked_m,
                         cfg.max_m,
                         fused_n,
+                        k_valid_val,
+                        n_valid_fused,
                         stream,
                     )
                 else:
@@ -978,6 +997,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         masked_m,
                         cfg.max_m,
                         fused_n,
+                        k_valid_val,
+                        n_valid_fused,
                         stream,
                     )
             else:
@@ -991,6 +1012,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     masked_m,
                     cfg.max_m,
                     2 * cfg.inter_dim,
+                    k_valid_val,
+                    n_valid_raw,
                     stream,
                 )
             if _gemm_events is not None:
@@ -1093,6 +1116,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         _m_tile_prefix=None,
         _m_tile_map=None,
         bias=None,
+        k_valid=None,
+        n_valid=None,
     ):
         """If `_gemm_events=(start, end)` is given, record around the GEMM
         kernel launch only -- excludes prefix-sum prep work."""
@@ -1109,6 +1134,10 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         _check_bias_args("bias", bias, (cfg.experts, cfg.model_dim), y)
         if stream is None:
             stream = torch.cuda.current_stream()
+        k_valid_val = k_valid if k_valid is not None else cfg.inter_dim
+        # N-pad: stage2 output width is model_dim; drop OOB columns beyond the
+        # valid model dim.  Defaults to a no-op (n_valid == model_dim).
+        n_valid_val = n_valid if n_valid is not None else cfg.model_dim
         if cfg.split_k > 1:
             y.zero_()
         gemm = base_bias if bias is not None else base
@@ -1135,6 +1164,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     m_tile_map,
                     cfg.max_m,
                     cfg.model_dim,
+                    k_valid_val,
+                    n_valid_val,
                     stream,
                 )
             else:
@@ -1150,6 +1181,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     m_tile_map,
                     cfg.max_m,
                     cfg.model_dim,
+                    k_valid_val,
+                    n_valid_val,
                     stream,
                 )
             if _gemm_events is not None:
@@ -1169,6 +1202,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     masked_m,
                     cfg.max_m,
                     cfg.model_dim,
+                    k_valid_val,
+                    n_valid_val,
                     stream,
                 )
             else:
@@ -1182,6 +1217,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     masked_m,
                     cfg.max_m,
                     cfg.model_dim,
+                    k_valid_val,
+                    n_valid_val,
                     stream,
                 )
             if _gemm_events is not None:

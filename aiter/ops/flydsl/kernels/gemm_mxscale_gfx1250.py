@@ -447,6 +447,29 @@ def compile_mxscale_gemm(
         compute_schedule_kind == COMPUTE_SCHEDULE_FP4_COL_BAND
     )
     needs_grouped_row_masked_store = grouped_masked_m and (M % tile_m != 0)
+
+    def _update_dgroup1_tdim0(dgroup1, new_tdim0_i32):
+        """Replace tensor_dim0 in a dgroup1 vector<8xi32>, keep all other fields.
+
+        Encoding (ISA):
+          g1_s1[31:16] = tensor_dim0[15:0]
+          g1_s2[15:0]  = tensor_dim0[31:16]
+        """
+        s1 = vector.extract(dgroup1, static_position=[1], dynamic_position=[])
+        s2 = vector.extract(dgroup1, static_position=[2], dynamic_position=[])
+        s1_cleared = arith.andi(s1, arith.constant(0x0000FFFF, type=T.i32))
+        td0_lo = arith.andi(new_tdim0_i32, arith.constant(0xFFFF, type=T.i32))
+        s1_new = arith.ori(s1_cleared, arith.shli(td0_lo, arith.constant(16, type=T.i32)))
+        s2_cleared = arith.andi(s2, arith.constant(0xFFFF0000, type=T.i32))
+        td0_hi = arith.andi(
+            arith.shrui(new_tdim0_i32, arith.constant(16, type=T.i32)),
+            arith.constant(0xFFFF, type=T.i32),
+        )
+        s2_new = arith.ori(s2_cleared, td0_hi)
+        dg1 = vector.insert(s1_new, dgroup1, static_position=[1], dynamic_position=[])
+        dg1 = vector.insert(s2_new, dg1, static_position=[2], dynamic_position=[])
+        return dg1
+
     kernel_tag_mode = str(kernel_tag).replace("-", "_")
 
     if use_fp4_bank_friendly_schedule:
@@ -483,6 +506,8 @@ def compile_mxscale_gemm(
         arg_m_tile_map: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_k_valid: fx.Int32,
+        i32_n_valid: fx.Int32,
     ):
         # Enable back-to-back WMMA issue (SCHED_MODE bit[4] = DISABLE_VALU_STALL)
         rocdl.disable_xdl_arb_stall()
@@ -580,7 +605,7 @@ def compile_mxscale_gemm(
                 bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
             zero_i32 = arith.constant(0, type=T.i32)
 
-            def make_desc_a(memref, k_base):
+            def make_desc_a(memref, k_base, k_remaining=None):
                 k_packed_off = k_base / arith.index(PACK_FACTOR_A)
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_a,
@@ -595,9 +620,10 @@ def compile_mxscale_gemm(
                     num_warps=tdm_desc_num_warps,
                     workgroup_mask=a_mcast_mask,
                     atomic_barrier_enable=atomic_barrier_enable,
+                    valid_inner=k_remaining,
                 )
 
-            def make_desc_b(memref, k_base, n_offset=0):
+            def make_desc_b(memref, k_base, n_offset=0, k_remaining=None):
                 k_packed_off = k_base / arith.index(PACK_FACTOR_B)
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_b,
@@ -616,6 +642,7 @@ def compile_mxscale_gemm(
                     num_warps=tdm_desc_num_warps,
                     workgroup_mask=b_mcast_mask,
                     atomic_barrier_enable=atomic_barrier_enable,
+                    valid_inner=k_remaining,
                 )
 
             def make_desc_as(memref, k_base):
@@ -1884,6 +1911,25 @@ def compile_mxscale_gemm(
                 ) + arith.index(d_output_off)
                 warp_m_off_sgpr = wave_m_idx * arith.index(warp_tile_m)
                 warp_n_off_sgpr = wave_n_idx * arith.index(warp_tile_n)
+                # N-pad: clamp this warp's store columns to the valid output
+                # width.  N is the innermost (dim0) descriptor dim, and store
+                # OOB on dim0 = DROP (microbench-confirmed).  The descriptor base
+                # is already offset to this warp's column start, so pass the
+                # *remaining* valid columns from that base (R3: OOB is relative
+                # to the folded descriptor base).  num_warps=1 here, so flydsl
+                # uses valid_inner directly as tdim0 without further warp_off
+                # correction.  Callers that don't want any drop pass
+                # i32_n_valid == N, which makes this a no-op (tdim0 == tile).
+                _store_base_n = arith.index_cast(
+                    T.i32, blk_n + warp_n_off_sgpr
+                )
+                _zero_i32_nv = arith.constant(0, type=T.i32)
+                _n_rem_raw = arith.subi(i32_n_valid.ir_value(), _store_base_n)
+                _n_rem = arith.select(
+                    arith.cmpi(arith.CmpIPredicate.sgt, _n_rem_raw, _zero_i32_nv),
+                    _n_rem_raw,
+                    _zero_i32_nv,
+                )
                 d_desc = tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_c,
                     lds_memref=d_lds_base_ptr,
@@ -1900,6 +1946,7 @@ def compile_mxscale_gemm(
                     num_warps=1,
                     lds_byte_offset=d_warp_off_sgpr,
                     for_store=True,
+                    valid_inner=_n_rem,
                 )
 
             # Precompute LDS addresses for TDM descriptor switching
@@ -1957,12 +2004,38 @@ def compile_mxscale_gemm(
                         )
                     )
 
-            desc_a_init = make_desc_a(stages_a_mem[0], split_k_base)
-            desc_b_init = make_desc_b(stages_b_mem[0], split_k_base)
+            k_valid_raw = i32_k_valid.ir_value()
+            _k_base_i32 = arith.index_cast(T.i32, split_k_base)
+            _k_rem_raw = arith.subi(k_valid_raw, _k_base_i32)
+            _zero_i32_kv = arith.constant(0, type=T.i32)
+            _k_rem_clamped = arith.select(
+                arith.cmpi(arith.CmpIPredicate.sgt, _k_rem_raw, _zero_i32_kv),
+                _k_rem_raw,
+                _zero_i32_kv,
+            )
+            if const_expr(PACK_FACTOR_A > 1):
+                k_rem_a_init = arith.shrui(
+                    _k_rem_clamped, arith.constant(1, type=T.i32)
+                )
+            else:
+                k_rem_a_init = _k_rem_clamped
+            if const_expr(PACK_FACTOR_B > 1):
+                _k_rem_packed_b = arith.shrui(
+                    _k_rem_clamped, arith.constant(1, type=T.i32)
+                )
+            else:
+                _k_rem_packed_b = _k_rem_clamped
+            k_rem_b_init = arith.muli(
+                _k_rem_packed_b,
+                arith.constant(16, type=T.i32),
+            )
+
+            desc_a_init = make_desc_a(stages_a_mem[0], split_k_base, k_remaining=k_rem_a_init)
+            desc_b_init = make_desc_b(stages_b_mem[0], split_k_base, k_remaining=k_rem_b_init)
             desc_as_init = make_desc_as(stages_as_mem[0], split_k_base)
             desc_bs_init = make_desc_bs(stages_bs_mem[0], split_k_base)
             if const_expr(stage1_dual_b):
-                desc_b_up_init = make_desc_b(stages_b_up_mem[0], split_k_base, N)
+                desc_b_up_init = make_desc_b(stages_b_up_mem[0], split_k_base, N, k_remaining=k_rem_b_init)
                 desc_bs_up_init = make_desc_bs(stages_bs_up_mem[0], split_k_base, N)
 
             adv_a_i32 = arith.constant(tile_k // PACK_FACTOR_A, type=T.i32)
@@ -2072,8 +2145,10 @@ def compile_mxscale_gemm(
                         dynamic_position=[],
                     )
 
-                dgroup1_a = desc_a_init.dgroup1
-                dgroup1_b = desc_b_init.dgroup1
+                dgroup1_a_base = desc_a_init.dgroup1
+                dgroup1_b_base = desc_b_init.dgroup1
+                dgroup1_a = dgroup1_a_base
+                dgroup1_b = dgroup1_b_base
                 if const_expr(stage1_dual_b):
                     dgroup1_b_up = desc_b_up_init.dgroup1
                 dgroup1_as = desc_as_init.dgroup1
@@ -2086,6 +2161,17 @@ def compile_mxscale_gemm(
                     wrapped = arith.cmpi(arith.CmpIPredicate.ult, new_lo, lo)
                     hi_inc = arith.addi(hi, arith.constant(1, type=T.i32))
                     return new_lo, arith.select(wrapped, hi_inc, hi)
+
+                def _advance_k_rem(rem, adv):
+                    new_rem = arith.subi(rem, adv)
+                    return arith.select(
+                        arith.cmpi(arith.CmpIPredicate.sgt, new_rem, _zero_i32_kv),
+                        new_rem,
+                        _zero_i32_kv,
+                    )
+
+                cur_k_rem_a = k_rem_a_init
+                cur_k_rem_b = k_rem_b_init
 
             # Prologue
             if const_expr(wave_specialized_tdm):
@@ -2174,6 +2260,12 @@ def compile_mxscale_gemm(
                         addr_lo_bs_up, addr_hi_bs_up = _advance_addr(
                             addr_lo_bs_up, addr_hi_bs_up, adv_bs_i32
                         )
+                    cur_k_rem_a = _advance_k_rem(cur_k_rem_a, adv_a_i32)
+                    cur_k_rem_b = _advance_k_rem(cur_k_rem_b, adv_b_i32)
+                    dgroup1_a = _update_dgroup1_tdim0(dgroup1_a_base, cur_k_rem_a)
+                    dgroup1_b = _update_dgroup1_tdim0(dgroup1_b_base, cur_k_rem_b)
+                    if const_expr(stage1_dual_b):
+                        dgroup1_b_up = _update_dgroup1_tdim0(dgroup1_b_base, cur_k_rem_b)
 
             pipeline_fence(
                 outstanding=TDM_LOADS_PER_STEP * (num_buffers - 2),
@@ -2243,6 +2335,7 @@ def compile_mxscale_gemm(
                     accs = list(results[:n_accs])
                     active_addr_lo = results[n_accs]
                 else:
+                    _k_rem_iter_args = [cur_k_rem_a, cur_k_rem_b]
                     if const_expr(stage1_dual_b):
                         init_args = (
                             list(accs)
@@ -2261,6 +2354,7 @@ def compile_mxscale_gemm(
                                 addr_lo_bs_up,
                                 addr_hi_bs_up,
                             ]
+                            + _k_rem_iter_args
                         )
                     else:
                         init_args = list(accs) + [
@@ -2272,7 +2366,7 @@ def compile_mxscale_gemm(
                             addr_hi_as,
                             addr_lo_bs,
                             addr_hi_bs,
-                        ]
+                        ] + _k_rem_iter_args
 
                     for loop_iter, state in range(0, loop_iters, 1, init=init_args):
                         accs_in = list(state[:n_accs])
@@ -2291,6 +2385,8 @@ def compile_mxscale_gemm(
                             cur_hi_bs = state[_state_off + 9]
                             cur_lo_bs_up = state[_state_off + 10]
                             cur_hi_bs_up = state[_state_off + 11]
+                            loop_k_rem_a = state[_state_off + 12]
+                            loop_k_rem_b = state[_state_off + 13]
                         else:
                             cur_lo_a = state[n_accs]
                             cur_hi_a = state[n_accs + 1]
@@ -2300,6 +2396,8 @@ def compile_mxscale_gemm(
                             cur_hi_as = state[n_accs + 5]
                             cur_lo_bs = state[n_accs + 6]
                             cur_hi_bs = state[n_accs + 7]
+                            loop_k_rem_a = state[n_accs + 8]
+                            loop_k_rem_b = state[n_accs + 9]
 
                         for buf_idx in range_constexpr(num_buffers):
                             load_stage = (buf_idx + num_buffers - 1) % num_buffers
@@ -2325,10 +2423,12 @@ def compile_mxscale_gemm(
                                     [cur_lo_as, cur_hi_as],
                                     [cur_lo_bs, cur_hi_bs],
                                 ]
+                            _k_rem_box = [loop_k_rem_a, loop_k_rem_b]
 
                             def _mid_tdm_nws(
                                 _ls=load_stage,
                                 _ab=addr_boxes,
+                                _kr=_k_rem_box,
                                 _k_off=(
                                     split_k_base
                                     + arith.index(pre_loaded * tile_k)
@@ -2392,16 +2492,18 @@ def compile_mxscale_gemm(
                                             _ab[5][1],
                                         ],
                                     )
+                                _cur_dg1_a = _update_dgroup1_tdim0(dgroup1_a_base, _kr[0])
+                                _cur_dg1_b = _update_dgroup1_tdim0(dgroup1_b_base, _kr[1])
                                 issue_tdm_loads(
-                                    tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a),
-                                    tdm_ops.TDMDescriptor2D(dg0_b, dgroup1_b),
+                                    tdm_ops.TDMDescriptor2D(dg0_a, _cur_dg1_a),
+                                    tdm_ops.TDMDescriptor2D(dg0_b, _cur_dg1_b),
                                     tdm_ops.TDMDescriptor2D(dg0_as, dgroup1_as),
                                     tdm_ops.TDMDescriptor2D(dg0_bs, dgroup1_bs),
                                     wave_specialized=wave_specialized_tdm,
                                 )
                                 if const_expr(stage1_dual_b):
                                     tdm_ops.tensor_load_2d(
-                                        tdm_ops.TDMDescriptor2D(dg0_b_up, dgroup1_b_up)
+                                        tdm_ops.TDMDescriptor2D(dg0_b_up, _cur_dg1_b)
                                     )
                                     tdm_ops.tensor_load_2d(
                                         tdm_ops.TDMDescriptor2D(
@@ -2434,6 +2536,8 @@ def compile_mxscale_gemm(
                                     _ab[3][0], _ab[3][1] = _advance_addr(
                                         _ab[3][0], _ab[3][1], adv_bs_i32
                                     )
+                                _kr[0] = _advance_k_rem(_kr[0], adv_a_i32)
+                                _kr[1] = _advance_k_rem(_kr[1], adv_b_i32)
                                 _l2_prefetch(_k_off)
 
                             rocdl.sched_barrier(0)
@@ -2472,6 +2576,8 @@ def compile_mxscale_gemm(
                                 cur_hi_as = addr_boxes[2][1]
                                 cur_lo_bs = addr_boxes[3][0]
                                 cur_hi_bs = addr_boxes[3][1]
+                            loop_k_rem_a = _k_rem_box[0]
+                            loop_k_rem_b = _k_rem_box[1]
                             hot_loop_scheduler_scheduled()
 
                         if const_expr(stage1_dual_b):
@@ -2492,6 +2598,7 @@ def compile_mxscale_gemm(
                                     cur_lo_bs_up,
                                     cur_hi_bs_up,
                                 ]
+                                + [loop_k_rem_a, loop_k_rem_b]
                             )
                         else:
                             _yield_values = list(accs_in) + [
@@ -2503,7 +2610,7 @@ def compile_mxscale_gemm(
                                 cur_hi_as,
                                 cur_lo_bs,
                                 cur_hi_bs,
-                            ]
+                            ] + [loop_k_rem_a, loop_k_rem_b]
                         results = yield _yield_values
 
                     accs = list(results[:n_accs])
@@ -2522,6 +2629,8 @@ def compile_mxscale_gemm(
                         addr_hi_bs = results[_res_off + 9]
                         addr_lo_bs_up = results[_res_off + 10]
                         addr_hi_bs_up = results[_res_off + 11]
+                        cur_k_rem_a = results[_res_off + 12]
+                        cur_k_rem_b = results[_res_off + 13]
                     else:
                         addr_lo_a = results[n_accs]
                         addr_hi_a = results[n_accs + 1]
@@ -2531,6 +2640,8 @@ def compile_mxscale_gemm(
                         addr_hi_as = results[n_accs + 5]
                         addr_lo_bs = results[n_accs + 6]
                         addr_hi_bs = results[n_accs + 7]
+                        cur_k_rem_a = results[n_accs + 8]
+                        cur_k_rem_b = results[n_accs + 9]
 
             # Tail -- same acc_mixed pattern: fence at top, TDM mid-compute.
             if const_expr(loop_iters > 0):
@@ -2623,13 +2734,36 @@ def compile_mxscale_gemm(
                                 + arith.index(pre_loaded * tile_k)
                                 + loop_iters * arith.index(num_buffers * tile_k)
                             )
+                            _tail_load_k_i32 = arith.index_cast(T.i32, _tail_load_k)
+                            _tail_k_rem_raw = arith.subi(k_valid_raw, _tail_load_k_i32)
+                            _tail_k_rem = arith.select(
+                                arith.cmpi(arith.CmpIPredicate.sgt, _tail_k_rem_raw, _zero_i32_kv),
+                                _tail_k_rem_raw,
+                                _zero_i32_kv,
+                            )
+                            if const_expr(PACK_FACTOR_A > 1):
+                                _tail_k_rem_a = arith.shrui(
+                                    _tail_k_rem, arith.constant(1, type=T.i32)
+                                )
+                            else:
+                                _tail_k_rem_a = _tail_k_rem
+                            if const_expr(PACK_FACTOR_B > 1):
+                                _tail_k_rem_packed_b = arith.shrui(
+                                    _tail_k_rem, arith.constant(1, type=T.i32)
+                                )
+                            else:
+                                _tail_k_rem_packed_b = _tail_k_rem
+                            _tail_k_rem_b = arith.muli(
+                                _tail_k_rem_packed_b,
+                                arith.constant(16, type=T.i32),
+                            )
 
                             def _tail_mid_nws(_ls=_load_stage, _ab=_tail_ab):
-                                _desc_a = make_desc_a(stages_a_mem[_ls], _tail_load_k)
-                                _desc_b = make_desc_b(stages_b_mem[_ls], _tail_load_k)
+                                _desc_a = make_desc_a(stages_a_mem[_ls], _tail_load_k, k_remaining=_tail_k_rem_a)
+                                _desc_b = make_desc_b(stages_b_mem[_ls], _tail_load_k, k_remaining=_tail_k_rem_b)
                                 if const_expr(stage1_dual_b):
                                     _desc_b_up = make_desc_b(
-                                        stages_b_up_mem[_ls], _tail_load_k, N
+                                        stages_b_up_mem[_ls], _tail_load_k, N, k_remaining=_tail_k_rem_b
                                     )
                                 _desc_as = make_desc_as(
                                     stages_as_mem[_ls], _tail_load_k
@@ -2808,7 +2942,7 @@ def compile_mxscale_gemm(
     # Bump this when changing generated IR in ways not otherwise reflected in
     # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
     # reusing a previously compiled kernel after source-only descriptor fixes.
-    tdm_store_descriptor_version = 29
+    tdm_store_descriptor_version = 31
 
     # M/N are compile-time constants used throughout the generated IR
     # (B_TOTAL_N, C_N, grid dimensions, output/bias strides, scale descriptor
@@ -2859,6 +2993,8 @@ def compile_mxscale_gemm(
         arg_b_scale: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_k_valid: fx.Int32,
+        i32_n_valid: fx.Int32,
         stream: fx.Stream,
     ):
         _ = cache_tag
@@ -2887,6 +3023,8 @@ def compile_mxscale_gemm(
             arg_c,
             i32_m,
             i32_n,
+            i32_k_valid,
+            i32_n_valid,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -2920,6 +3058,8 @@ def compile_mxscale_gemm(
         arg_masked_m: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_k_valid: fx.Int32,
+        i32_n_valid: fx.Int32,
         stream: fx.Stream,
     ):
         _ = cache_tag
@@ -2948,6 +3088,8 @@ def compile_mxscale_gemm(
             arg_masked_m,
             i32_m,
             i32_n,
+            i32_k_valid,
+            i32_n_valid,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -2983,6 +3125,8 @@ def compile_mxscale_gemm(
         arg_m_tile_map: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_k_valid: fx.Int32,
+        i32_n_valid: fx.Int32,
         stream: fx.Stream,
     ):
         _ = cache_tag
@@ -3008,6 +3152,8 @@ def compile_mxscale_gemm(
             arg_m_tile_map,
             i32_m,
             i32_n,
+            i32_k_valid,
+            i32_n_valid,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3035,6 +3181,8 @@ def compile_mxscale_gemm(
         arg_bias: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_k_valid: fx.Int32,
+        i32_n_valid: fx.Int32,
         stream: fx.Stream,
     ):
         _ = cache_tag
@@ -3063,6 +3211,8 @@ def compile_mxscale_gemm(
             arg_c,
             i32_m,
             i32_n,
+            i32_k_valid,
+            i32_n_valid,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3097,6 +3247,8 @@ def compile_mxscale_gemm(
         arg_masked_m: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_k_valid: fx.Int32,
+        i32_n_valid: fx.Int32,
         stream: fx.Stream,
     ):
         _ = cache_tag
@@ -3125,6 +3277,8 @@ def compile_mxscale_gemm(
             arg_masked_m,
             i32_m,
             i32_n,
+            i32_k_valid,
+            i32_n_valid,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3161,6 +3315,8 @@ def compile_mxscale_gemm(
         arg_m_tile_map: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_k_valid: fx.Int32,
+        i32_n_valid: fx.Int32,
         stream: fx.Stream,
     ):
         _ = cache_tag
@@ -3186,6 +3342,8 @@ def compile_mxscale_gemm(
             arg_m_tile_map,
             i32_m,
             i32_n,
+            i32_k_valid,
+            i32_n_valid,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(

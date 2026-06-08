@@ -1,7 +1,7 @@
 # 02 · kernel 改动(gemm_mxscale_gfx1250.py)
 
-status: not-started
-owner: (认领后署名)
+status: in-progress
+owner: claude-agent
 依赖:`01`(需要 `make_tensor_descriptor_2d` 的新 `valid_inner/valid_outer` API + OOB 语义结论)
 
 目标文件:`/root/00_code/aiter/aiter/ops/flydsl/kernels/gemm_mxscale_gfx1250.py`

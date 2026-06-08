@@ -247,6 +247,38 @@ def _gguu_to_gugu_rows(t: torch.Tensor) -> torch.Tensor:
     return torch.stack([g, u], dim=2).flatten(1, 2).contiguous()
 
 
+def _apply_mxfp4_padding(
+    w1_logical: torch.Tensor,
+    w1_scale_raw: torch.Tensor,
+    bias1: torch.Tensor,
+    w2_logical: torch.Tensor,
+    w2_scale_raw: torch.Tensor,
+    bias2: torch.Tensor,
+    hidden: torch.Tensor,
+    *,
+    inter_dim: int,
+    hidden_pad: int,
+    intermediate_pad: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Zero out the padding regions of mxfp4-packed weights, scales, biases, and hidden."""
+    if hidden_pad > 0:
+        hp2 = hidden_pad // 2
+        w1_logical[:, :, -hp2:] = 0
+        w2_logical[:, -hidden_pad:, :] = 0
+        hidden[:, -hidden_pad:] = 0
+    if intermediate_pad > 0:
+        ip2 = intermediate_pad // 2
+        w1_logical[:, inter_dim - intermediate_pad : inter_dim, :] = 0
+        w1_logical[:, 2 * inter_dim - intermediate_pad :, :] = 0
+        w1_scale_raw[:, inter_dim - intermediate_pad : inter_dim, :] = 0
+        w1_scale_raw[:, 2 * inter_dim - intermediate_pad :, :] = 0
+        bias1[:, inter_dim - intermediate_pad : inter_dim] = 0
+        bias1[:, 2 * inter_dim - intermediate_pad :] = 0
+        w2_logical[:, :, -ip2:] = 0
+    return w1_logical, w1_scale_raw, bias1, w2_logical, w2_scale_raw, bias2, hidden
+
+
 # ---------------------------------------------------------------------------
 # Core runner: build inputs, invoke fused_moe, optionally compare to ref
 # ---------------------------------------------------------------------------
@@ -265,6 +297,8 @@ def _run_grouped_via_fused_moe(
     verify: bool = False,
     seed: int = 0,
     all_ones: bool = False,  # debug: hidden=1, weight bytes=0x22 (=+1.0/+1.0), scale=127, bias=0
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Build mxfp4 weights + balanced routing, dispatch through ``fused_moe``.
 
@@ -312,6 +346,17 @@ def _run_grouped_via_fused_moe(
         # Activations: bf16; fused_moe handles the dispatched quant internally.
         hg = torch.Generator(device="cpu").manual_seed(seed + 123)
         hidden = (torch.randn((tokens, K), generator=hg) * 0.5).to(torch.bfloat16)
+
+    # Apply padding: zero out trailing elements in the padded regions.
+    if hidden_pad > 0 or intermediate_pad > 0:
+        w1_logical, w1_scale_raw, bias1, w2_logical, w2_scale_raw, bias2, hidden = (
+            _apply_mxfp4_padding(
+                w1_logical, w1_scale_raw, bias1,
+                w2_logical, w2_scale_raw, bias2, hidden,
+                inter_dim=inter, hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+            )
+        )
 
     # Routing: round-robin balanced.
     topk_id, topk_w = _balanced_topk(tokens, topk, experts)
@@ -368,6 +413,8 @@ def _run_grouped_via_fused_moe(
             gate_mode=gate_mode.value,
             dtype=dtypes.bf16,
             swiglu_limit=swiglu_limit,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
         )
     finally:
         if saved is None:
@@ -410,6 +457,8 @@ def _prepare_grouped_moe_case(
     use_bias: bool = True,
     seed: int = 0,
     all_ones: bool = False,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
 ):
     if data_format not in ("a4w4", "a8w4"):
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
@@ -443,6 +492,16 @@ def _prepare_grouped_moe_case(
             bias2 = torch.zeros((experts, K))
         hg = torch.Generator(device="cpu").manual_seed(seed + 123)
         hidden = (torch.randn((tokens, K), generator=hg) * 0.5).to(torch.bfloat16)
+
+    if hidden_pad > 0 or intermediate_pad > 0:
+        w1_logical, w1_scale_raw, bias1, w2_logical, w2_scale_raw, bias2, hidden = (
+            _apply_mxfp4_padding(
+                w1_logical, w1_scale_raw, bias1,
+                w2_logical, w2_scale_raw, bias2, hidden,
+                inter_dim=inter, hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+            )
+        )
 
     topk_id, topk_w = _balanced_topk(tokens, topk, experts)
     topk_w = topk_w.to(torch.bfloat16)
@@ -483,6 +542,8 @@ def _prepare_grouped_moe_case(
         "bias2": bias2.float().cuda(),
         "gate_mode": gate_mode.value,
         "swiglu_limit": swiglu_limit,
+        "hidden_pad": hidden_pad,
+        "intermediate_pad": intermediate_pad,
     }
     ref_case = {
         "hidden": fused_case["hidden_states"],
@@ -517,6 +578,8 @@ def _invoke_grouped_fused_moe(fused_case):
         gate_mode=fused_case["gate_mode"],
         dtype=dtypes.bf16,
         swiglu_limit=fused_case["swiglu_limit"],
+        hidden_pad=fused_case.get("hidden_pad", 0),
+        intermediate_pad=fused_case.get("intermediate_pad", 0),
     )
 
 
@@ -543,6 +606,8 @@ def _sanity_check(
     use_bias: bool = True,
     tol: float = VERIFY_TOL_A4W4,
     all_ones: bool = False,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
 ) -> None:
     """Tiny shape; compare grouped FlyDSL vs PyTorch fp32 ref.
 
@@ -566,10 +631,15 @@ def _sanity_check(
         use_bias=use_bias,
         verify=True,
         all_ones=all_ones,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
     )
     rel = _rel_l2(out, ref)
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
-    tag = f"{data_format} {layout} {act}{' all_ones' if all_ones else ''}"
+    pad_tag = ""
+    if hidden_pad or intermediate_pad:
+        pad_tag = f" hp={hidden_pad} ip={intermediate_pad}"
+    tag = f"{data_format} {layout} {act}{' all_ones' if all_ones else ''}{pad_tag}"
     print(
         f"[sanity {tag}] rel_l2 grouped vs ref = {rel:.4e} "
         f"(grouped_norm={float(out.float().norm()):.4e} ref_norm={float(ref.float().norm()):.4e})",
@@ -586,6 +656,22 @@ def test_grouped_a4w4_silu_matches_torch_ref(layout):
 @pytest.mark.parametrize("layout", ["gguu", "gugu"])
 def test_grouped_a4w4_swiglu_matches_torch_ref(layout):
     _sanity_check("a4w4", layout=layout, activation=ActivationType.Swiglu)
+
+
+@pytest.mark.parametrize("layout", ["gguu", "gugu"])
+def test_grouped_a4w4_silu_padded_matches_torch_ref(layout):
+    _sanity_check(
+        "a4w4", layout=layout, activation=ActivationType.Silu,
+        hidden_pad=64, intermediate_pad=64,
+    )
+
+
+@pytest.mark.parametrize("layout", ["gguu", "gugu"])
+def test_grouped_a4w4_swiglu_padded_matches_torch_ref(layout):
+    _sanity_check(
+        "a4w4", layout=layout, activation=ActivationType.Swiglu,
+        hidden_pad=64, intermediate_pad=64,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +704,8 @@ def _bench(args: argparse.Namespace) -> None:
             activation=activation,
             swiglu_limit=args.swiglu_limit,
             use_bias=not args.no_bias,
+            hidden_pad=args.hidden_pad,
+            intermediate_pad=args.intermediate_pad,
         )
         _invoke_grouped_fused_moe(fused_case)  # warmup / JIT
         torch.cuda.synchronize()
@@ -679,6 +767,10 @@ def main() -> None:
         "scale=127 (=2^0), bias=0. Expect rel_l2 < 0.01 since both "
         "grouped and ref see the exact same dequantised values.",
     )
+    parser.add_argument("--hidden-pad", type=int, default=0,
+                        help="number of trailing zero-pad elements along model_dim (must be multiple of 32)")
+    parser.add_argument("--intermediate-pad", type=int, default=0,
+                        help="number of trailing zero-pad elements along inter_dim (must be multiple of 32)")
     args = parser.parse_args()
     if args.model_dim < 512 or args.inter_dim < 512:
         raise SystemExit(
@@ -709,6 +801,8 @@ def main() -> None:
             swiglu_limit=args.swiglu_limit,
             use_bias=not args.no_bias,
             all_ones=args.all_ones,
+            hidden_pad=args.hidden_pad,
+            intermediate_pad=args.intermediate_pad,
         )
         return
     _bench(args)
