@@ -77,6 +77,31 @@ else:
     enable_jit_gluon_pa_mqa_logits_kernel = False
 
 
+def _stage1_chunkq_splitkv(
+    batch_size: int,
+    next_n: int,
+    heads: int,
+    ChunkQ: int,
+    TotalCuCount: int,
+    WavePerEU: int,
+):
+    assert batch_size > 0, f"batch_size must be positive, got {batch_size}"
+    assert next_n > 0, f"next_n must be positive, got {next_n}"
+    assert heads > 0, f"heads must be positive, got {heads}"
+    assert ChunkQ > 0, f"ChunkQ must be positive, got {ChunkQ}"
+    assert TotalCuCount > 0, f"TotalCuCount must be positive, got {TotalCuCount}"
+    assert WavePerEU > 0, f"WavePerEU must be positive, got {WavePerEU}"
+
+    if heads < ChunkQ:
+        ChunkQ = heads
+
+    assert heads % ChunkQ == 0, f"heads {heads} must be divisible by ChunkQ {ChunkQ}"
+
+    TileQCount = batch_size * next_n * (heads // ChunkQ)
+    SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
+    return ChunkQ, SplitKV
+
+
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
     q_fp8: torch.Tensor,  # dtype = float8
     kv_cache_fp8: torch.Tensor,  # dtype = float8
@@ -195,8 +220,9 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, max_blk_len = kv_indices.size()
 
-    TileQCount = batch_size * next_n * (heads // ChunkQ)
-    SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
+    ChunkQ, SplitKV = _stage1_chunkq_splitkv(
+        batch_size, next_n, heads, ChunkQ, TotalCuCount, WavePerEU
+    )
 
     kv_cache_fp8, kv_cache_scale = (
         kv_cache_fp8[..., :hidden_dim],
@@ -212,7 +238,6 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         "HiddenDim": hidden_dim,
         "SplitKV": SplitKV,
     }
-    assert heads % config["ChunkQ"] == 0
 
     grid = (batch_size * next_n * (heads // config["ChunkQ"] * SplitKV),)
     _deepgemm_fp8_paged_mqa_logits_stage1[grid](
