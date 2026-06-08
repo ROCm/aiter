@@ -409,27 +409,30 @@ def _moe_gemm_a8w4_decode(
     read_idx = 0
     write_idx = 0
     for _ in gl.static_range(NUM_BUFFERS - 1):
+        idx_K = write_idx * BLOCK_K
+        idx_W = write_idx * PACKED_BLOCK_K_W
+        idx_MX = write_idx * PACKED_MX_BLOCK
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
-            [off_w_n, write_idx * PACKED_BLOCK_K_W],
+            [off_w_n, idx_W],
             w_buffer.index(write_idx % NUM_BUFFERS),
         )
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
-                [off_x_m, write_idx * BLOCK_K],
+                [off_x_m, idx_K],
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
-                write_idx * BLOCK_K,
+                idx_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
             w_scales_desc,
-            [off_w_n_scale, write_idx * PACKED_MX_BLOCK],
+            [off_w_n_scale, idx_MX],
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
@@ -446,28 +449,30 @@ def _moe_gemm_a8w4_decode(
     num_k_iter = tl.cdiv(K, BLOCK_K)
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     for k in range(num_k_iter - (NUM_BUFFERS - 1)):
-
+        idx_K = write_idx * BLOCK_K
+        idx_W = write_idx * PACKED_BLOCK_K_W
+        idx_MX = write_idx * PACKED_MX_BLOCK
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
-            [off_w_n, write_idx * PACKED_BLOCK_K_W],
+            [off_w_n, idx_W],
             w_buffer.index(write_idx % NUM_BUFFERS),
         )
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
-                [off_x_m, write_idx * BLOCK_K],
+                [off_x_m, idx_K],
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
-                write_idx * BLOCK_K,
+                idx_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
             w_scales_desc,
-            [off_w_n_scale, write_idx * PACKED_MX_BLOCK],
+            [off_w_n_scale, idx_MX],
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
@@ -482,11 +487,12 @@ def _moe_gemm_a8w4_decode(
         write_idx += 1
 
         gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS * NUM_TDM_OPS - 1)
-        cur_w = (
-            w_buffer.index(read_idx % NUM_BUFFERS)
-            .permute((1, 0))
-            .load(layout=DOT_LAYOUT_W)
-        )
+        w_buffer_slice = w_buffer.index(read_idx % NUM_BUFFERS)
+        if PRESHUFFLED:
+            w_buffer_slice = unshuffle_weight_gfx1250(
+                w_buffer_slice, BLOCK_N, NATIVE_BLOCK_K_W
+            )
+        cur_w = w_buffer_slice.permute((1, 0)).load(layout=DOT_LAYOUT_W)
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
         if is_x_microscaled:
@@ -549,11 +555,12 @@ def _moe_gemm_a8w4_decode(
             (NUM_BUFFERS - 1 - k_ep) * NUM_TDM_OPS - 1 + TDM_BIAS_WAIT
         )
 
-        cur_w = (
-            w_buffer.index(read_idx % NUM_BUFFERS)
-            .permute((1, 0))
-            .load(layout=DOT_LAYOUT_W)
-        )
+        w_buffer_slice = w_buffer.index(read_idx % NUM_BUFFERS)
+        if PRESHUFFLED:
+            w_buffer_slice = unshuffle_weight_gfx1250(
+                w_buffer_slice, BLOCK_N, NATIVE_BLOCK_K_W
+            )
+        cur_w = w_buffer_slice.permute((1, 0)).load(layout=DOT_LAYOUT_W)
 
         gl.amd.gfx1250.tdm.async_wait(
             (NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS + TDM_BIAS_WAIT
@@ -915,6 +922,7 @@ def _moe_gemm_a8w4_prefill(
         offs_xs_k = gl.arange(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
         )
+        mask_xs_m = offs_xs_m < M
         if GatherIndx is None:
             XMxScale += start_m * stride_x_mx_m
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -988,6 +996,8 @@ def _moe_gemm_a8w4_prefill(
             async_copy.global_to_shared(
                 x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 xs_ptrs_base + xs_k.to(index_type)[None, :],
+                mask=mask_xs_m[:, None],
+                other=0.0,
             )
             async_copy.commit_group()
         write_idx += 1
@@ -1002,11 +1012,12 @@ def _moe_gemm_a8w4_prefill(
 
     # Register pre-load prologue: wait for tile 0 then read it into cur_x/cur_w/cur_w_scales.
     cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
-    cur_w = (
-        w_buffer.index(read_idx % NUM_BUFFERS)
-        .permute((1, 0))
-        .load(layout=DOT_LAYOUT_W)
-    )
+    w_buffer_slice = w_buffer.index(read_idx % NUM_BUFFERS)
+    if PRESHUFFLED:
+        w_buffer_slice = unshuffle_weight_gfx1250(
+            w_buffer_slice, BLOCK_N, NATIVE_BLOCK_K_W
+        )
+    cur_w = w_buffer_slice.permute((1, 0)).load(layout=DOT_LAYOUT_W)
     w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         w_scales_buffer_slice = unswizzle_mx_scale_gfx1250(
@@ -1074,11 +1085,12 @@ def _moe_gemm_a8w4_prefill(
             async_copy.wait_group(NUM_BUFFERS - 1)
 
         next_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
-        next_w = (
-            w_buffer.index(read_idx % NUM_BUFFERS)
-            .permute((1, 0))
-            .load(layout=DOT_LAYOUT_W)
-        )
+        w_buffer_slice = w_buffer.index(read_idx % NUM_BUFFERS)
+        if PRESHUFFLED:
+            w_buffer_slice = unshuffle_weight_gfx1250(
+                w_buffer_slice, BLOCK_N, NATIVE_BLOCK_K_W
+            )
+        next_w = w_buffer_slice.permute((1, 0)).load(layout=DOT_LAYOUT_W)
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
             w_scales_buffer_slice = unswizzle_mx_scale_gfx1250(
@@ -1143,11 +1155,12 @@ def _moe_gemm_a8w4_prefill(
             async_copy.wait_group(NUM_BUFFERS - 2 - k_ep)
 
         next_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
-        next_w = (
-            w_buffer.index(read_idx % NUM_BUFFERS)
-            .permute((1, 0))
-            .load(layout=DOT_LAYOUT_W)
-        )
+        w_buffer_slice = w_buffer.index(read_idx % NUM_BUFFERS)
+        if PRESHUFFLED:
+            w_buffer_slice = unshuffle_weight_gfx1250(
+                w_buffer_slice, BLOCK_N, NATIVE_BLOCK_K_W
+            )
+        next_w = w_buffer_slice.permute((1, 0)).load(layout=DOT_LAYOUT_W)
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
             w_scales_buffer_slice = unswizzle_mx_scale_gfx1250(
