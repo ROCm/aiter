@@ -420,7 +420,7 @@ def mhc_fused_post_pre(
     hc_mult = residual_in.size(1)
     hidden_size = residual_in.size(2)
 
-    if not force_fused and m > 64:
+    if not force_fused and m >= 1024:
         next_residual = torch.empty_like(residual_in)
         mhc_post(
             next_residual,
@@ -473,7 +473,7 @@ def mhc_fused_post_pre(
     selected_splitk, selected_tile_m, selected_tile_n, selected_tile_k = (
         get_mhc_fused_post_pre_config(m, hidden_size)
     )
-    n_splits = selected_splitk * hc_mult
+    n_splits = selected_splitk
     device = layer_input.device
 
     gemm_out_pad = torch.empty(

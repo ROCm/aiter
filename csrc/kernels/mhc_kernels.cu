@@ -1681,7 +1681,7 @@ namespace aiter {
 
         DTYPE_I* x_ptr = x + idx * x_stride;
         float* fn_ptr  = fn + n_idx * hc_hidden_size;
-        float* out_ptr = out + (static_cast<int64_t>((k_split_idx * hc_mult + warp_id) * m + idx)) * out_stride + n_idx;
+        float* out_ptr = out + (static_cast<int64_t>(k_split_idx * m + idx)) * out_stride + n_idx;
         int residual_stride = hc_hidden_size;
         int fn_stride = hc_hidden_size;
         DTYPE_I* residual_ptr = residual + idx * residual_stride;
@@ -1887,19 +1887,70 @@ namespace aiter {
             compute_store_tile(i, v_fn0);
         }
 
-        if (n_idx == 0) {
+        // Reduce v_cf (gemm_out_mul) and sqrsum across the hc_mult warps in LDS so
+        // only warp 0 writes a single (split_k) partial, instead of each warp
+        // writing its own (split_k * hc_mult) partial. The hc_mult sum is part of
+        // the GEMM K-contraction (sum over hc_mult*hidden); summing the per-head
+        // warp results here completes it. For a fixed lane_id every warp holds a
+        // contribution to the SAME output element (same idx/n_idx tile + lane->
+        // row/col mapping), so the cross-warp sum is the head reduction.
+        // Reuse s_residual as scratch (dead after the k_loop); cast to float.
+        float* s_red = reinterpret_cast<float*>(s_residual);
+        static constexpr int v_per_lane = m_repeat * repeat_n * ovec;
+        __syncthreads();
+        // warps 1..hc_mult-1 deposit their v_cf, warp 0 reads and accumulates.
+        if (warp_id != 0) {
+            int base = (warp_id - 1) * warp_size * v_per_lane + lane_id * v_per_lane;
+            int c = 0;
+            for (int b = 0; b < m_repeat; b++)
+                for (int n = 0; n < repeat_n; n++)
+                    for (int e = 0; e < ovec; e++)
+                        s_red[base + c++] = v_cf[b][n][e];
+        }
+        __syncthreads();
+        if (warp_id == 0) {
+            for (int w = 0; w < hc_mult - 1; w++) {
+                int base = w * warp_size * v_per_lane + lane_id * v_per_lane;
+                int c = 0;
+                for (int b = 0; b < m_repeat; b++)
+                    for (int n = 0; n < repeat_n; n++)
+                        for (int e = 0; e < ovec; e++)
+                            v_cf[b][n][e] += s_red[base + c++];
+            }
             for (int b = 0; b < m_repeat; b++) {
-                float sqrsum_ = cross_row_sum_4(sqrsum_part[b], lane_id);
-                if (lane_id < mfma_m && (b * mfma_m + lane_id < m_oob)) {
-                    sqrsum[(hc_mult * k_split_idx + warp_id) * m + idx + b * mfma_m + lane_id] = sqrsum_;
+                int gc_offset = (b * mfma_m + lane_id % mfma_m) * out_stride + (lane_id / mfma_m) * ovec;
+                for (int n = 0; n < repeat_n; n++) {
+                    store_vector_nbytes<float, float, 4, 16, 0, false>(g_o, v_cf[b][n], gc_offset + n * mfma_n);
                 }
             }
         }
 
-        for (int b = 0; b < m_repeat; b++) {
-            int gc_offset = (b * mfma_m + lane_id % mfma_m) * out_stride + (lane_id / mfma_m) * ovec;
-            for (int n = 0; n < repeat_n; n++) {
-                store_vector_nbytes<float, float, 4, 16, 0, false>(g_o, v_cf[b][n], gc_offset + n * mfma_n);
+        if (n_idx == 0) {
+            float sqrsum_w[m_repeat];
+            for (int b = 0; b < m_repeat; b++) {
+                sqrsum_w[b] = cross_row_sum_4(sqrsum_part[b], lane_id);
+            }
+            // Deposit per-warp sqrsum (lane_id < mfma_m holds the reduced rows),
+            // then warp 0 sums across warps. Reuse s_red at a disjoint offset past
+            // the v_cf scratch region.
+            float* s_sq = s_red + (hc_mult - 1) * warp_size * v_per_lane;
+            __syncthreads();
+            if (warp_id != 0 && lane_id < mfma_m) {
+                for (int b = 0; b < m_repeat; b++) {
+                    s_sq[((warp_id - 1) * mfma_m + lane_id) * m_repeat + b] = sqrsum_w[b];
+                }
+            }
+            __syncthreads();
+            if (warp_id == 0 && lane_id < mfma_m) {
+                for (int b = 0; b < m_repeat; b++) {
+                    float acc = sqrsum_w[b];
+                    for (int w = 0; w < hc_mult - 1; w++) {
+                        acc += s_sq[(w * mfma_m + lane_id) * m_repeat + b];
+                    }
+                    if (b * mfma_m + lane_id < m_oob) {
+                        sqrsum[k_split_idx * m + idx + b * mfma_m + lane_id] = acc;
+                    }
+                }
             }
         }
     }
@@ -1963,8 +2014,8 @@ namespace aiter {
     }
 
     void mhc_fused_post_pre_gemm_sqrsum(
-        torch::Tensor& gemm_out_mul,    // (split_k * hc_mult, m, hc_mult3)
-        torch::Tensor& gemm_out_sqrsum, // (split_k * hc_mult, m)
+        torch::Tensor& gemm_out_mul,    // (split_k, m, hc_mult3)
+        torch::Tensor& gemm_out_sqrsum, // (split_k, m)
         torch::Tensor& next_residual,   // (m, hc_mult, hidden_size)
         torch::Tensor& layer_input,     // (m, hidden_size)
         torch::Tensor& residual_in,     // (m, hc_mult, hidden_size)
@@ -1982,7 +2033,7 @@ namespace aiter {
         int hc_hidden_size = fn.size(1);
         int x_stride = layer_input.stride(0);
         int out_stride = gemm_out_mul.stride(1);
-        int split_k = gemm_out_sqrsum.size(0) / hc_mult;
+        int split_k = gemm_out_sqrsum.size(0);
         const int res_stride = residual_in.stride(0);
         const int fn_stride = fn.stride(0);
 
@@ -1999,10 +2050,10 @@ namespace aiter {
                     fn_stride);
         TORCH_CHECK(hc_hidden_size == hc_mult * hidden_size,
                     "fn K dim must equal hc_mult * hidden_size");
-        TORCH_CHECK(gemm_out_mul.size(0) == split_k * hc_mult,
-                    "gemm_out_mul dim0 must be split_k * hc_mult");
-        TORCH_CHECK(gemm_out_sqrsum.size(0) == split_k * hc_mult,
-                    "gemm_out_sqrsum dim0 must be split_k * hc_mult");
+        TORCH_CHECK(gemm_out_mul.size(0) == split_k,
+                    "gemm_out_mul dim0 must be split_k");
+        TORCH_CHECK(gemm_out_sqrsum.size(0) == split_k,
+                    "gemm_out_sqrsum dim0 must be split_k");
         TORCH_CHECK(gemm_out_mul.size(1) == m && gemm_out_sqrsum.size(1) == m,
                     "gemm outputs must have size m on dim1");
         TORCH_CHECK(gemm_out_mul.size(2) == hc_mult3, "gemm_out_mul last dim must be hc_mult3");

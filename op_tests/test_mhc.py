@@ -22,10 +22,6 @@ except ImportError:
     triton_mhc_post_pre = None
     _HAS_TRITON_MHC_POST_PRE = False
 
-try:
-    from op_tests.triton_tests.utils.mhc_ref import mhc_post_torch
-except ImportError:
-    mhc_post_torch = None
 
 # Triton ``mhc_post_pre`` is only validated for M <= 4096 (hangs on larger M).
 TRITON_MHC_POST_PRE_MAX_M = 4096
@@ -703,14 +699,7 @@ def mhc_post_pre_ref(
     norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Unfused torch reference: mhc_post then mhc_pre."""
-    if mhc_post_torch is not None:
-        next_residual = mhc_post_torch(
-            layer_input, residual_in, post_layer_mix, comb_res_mix
-        )
-    else:
-        next_residual = mhc_post_ref(
-            layer_input, residual_in, post_layer_mix, comb_res_mix
-        )
+    next_residual = mhc_post_ref(layer_input, residual_in, post_layer_mix, comb_res_mix)
     post_mix, comb_mix, layer_input_out = mhc_pre_ref(
         next_residual,
         fn,
@@ -869,10 +858,7 @@ def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False):
     # print(f"next_residual_fused: {next_residual_fused}")
 
     run_triton = (
-        _HAS_TRITON_MHC_POST_PRE
-        and not fuse_rmsnorm
-        and m <= TRITON_MHC_POST_PRE_MAX_M
-        and False
+        _HAS_TRITON_MHC_POST_PRE and not fuse_rmsnorm and m <= TRITON_MHC_POST_PRE_MAX_M
     )
     if fuse_rmsnorm:
         aiter.logger.info(
