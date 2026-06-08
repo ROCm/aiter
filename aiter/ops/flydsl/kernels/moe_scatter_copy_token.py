@@ -18,9 +18,16 @@ to its source token row via a precomputed ``dst_src`` map (``-1`` => leave the
 destination untouched, i.e. an unused padding slot). One thread-block per
 destination row copies the whole row; threads stride over the row's elements.
 
-The copy is byte-exact: rows whose byte width is a multiple of 4 are copied as
-i32 dwords (fast); otherwise (e.g. a per-32 scale row of 90 bytes) they are
-copied as i8 bytes. Source and destination rows share the same byte width.
+The copy is byte-exact. We pick the widest vectorized buffer op whose access
+size divides ``row_bytes`` (which keeps every row base naturally aligned), using
+the same fallback ladder as the MoE GEMM X-load path:
+
+    row_bytes % 16 == 0 -> dwordx4 (16B / vec4 i32)   -- fastest
+    row_bytes %  8 == 0 -> dwordx2 ( 8B / vec2 i32)
+    row_bytes %  4 == 0 -> dword   ( 4B / scalar i32)
+    otherwise           -> byte    ( 1B / scalar i8)   -- e.g. a 90B scale row
+
+Source and destination rows share the same byte width.
 
 Grid  : (num_dst_rows, 1, 1)   -- num_dst_rows = E * max_m
 Block : (BLOCK_THREADS, 1, 1)
@@ -52,15 +59,25 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
     ``dst_src`` is an int32 (num_dst,) map from dst row -> src row (-1 to skip).
     """
     assert row_bytes > 0
-    # i32 dword copy when the row is 4-byte aligned, else i8 byte copy.
-    if row_bytes % 4 == 0:
-        use_dword = True
-        n_elems = row_bytes // 4
+    # Fallback ladder (mirrors moe_gemm_2stage X-load): pick the widest buffer op
+    # whose access size divides row_bytes. Because each width divides row_bytes,
+    # every row base (row * row_bytes) is naturally aligned for that width, and the
+    # row is covered by a whole number of units with no in-row remainder.
+    if row_bytes % 16 == 0:
+        vec_width, unit_bytes, use_dword, width_tag = 4, 16, True, "dwx4"
+    elif row_bytes % 8 == 0:
+        vec_width, unit_bytes, use_dword, width_tag = 2, 8, True, "dwx2"
+    elif row_bytes % 4 == 0:
+        vec_width, unit_bytes, use_dword, width_tag = 1, 4, True, "dw"
     else:
-        use_dword = False
-        n_elems = row_bytes
+        vec_width, unit_bytes, use_dword, width_tag = 1, 1, False, "by"
 
-    module_name = f"moe_scatter_copy_token_b{row_bytes}_{'dw' if use_dword else 'by'}"
+    # Number of vectorized copy units (buffer ops) per row, and the per-row stride
+    # measured in copy-dtype elements (i32 when dword*, i8 otherwise).
+    n_units = row_bytes // unit_bytes
+    row_stride_elems = row_bytes // 4 if use_dword else row_bytes
+
+    module_name = f"moe_scatter_copy_token_b{row_bytes}_{width_tag}"
 
     @flyc.kernel(name=module_name)
     def scatter_copy_kernel(
@@ -76,7 +93,8 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         tid = fx.thread_idx.x
         num_dst_i32 = ArithValue(num_dst)
         bid_i32 = ArithValue(bid)
-        n_elems_i32 = arith.constant(n_elems, type=i32)
+        n_units_i32 = arith.constant(n_units, type=i32)
+        row_stride_i32 = arith.constant(row_stride_elems, type=i32)
 
         dst_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_dst_i32)
         _if_dst = scf.IfOp(dst_valid)
@@ -91,19 +109,31 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
                 src_rsrc = buffer_ops.create_buffer_resource(src, max_size=True)
                 dst_rsrc = buffer_ops.create_buffer_resource(dst, max_size=True)
                 tid_i32 = ArithValue(tid)
-                # Element base of each row (i32 elems if dword, bytes if i8).
-                src_base = srow * n_elems_i32
-                dst_base = bid_i32 * n_elems_i32
+                # Element base of each row, in copy-dtype elements (i32 if dword*, i8 otherwise).
+                src_base = srow * row_stride_i32
+                dst_base = bid_i32 * row_stride_i32
 
                 for it in range_constexpr(
-                    (n_elems + BLOCK_THREADS - 1) // BLOCK_THREADS
+                    (n_units + BLOCK_THREADS - 1) // BLOCK_THREADS
                 ):
-                    eidx = tid_i32 + arith.constant(it * BLOCK_THREADS, type=i32)
-                    e_ok = arith.cmpi(CmpIPredicate.ult, eidx, n_elems_i32)
-                    _if_e = scf.IfOp(e_ok)
-                    with ir.InsertionPoint(_if_e.then_block):
+                    # Each unit copies `vec_width` copy-dtype elements via one buffer op
+                    # (dwordx4 / dwordx2 / dword / byte). Threads stride over the row's units.
+                    uidx = tid_i32 + arith.constant(it * BLOCK_THREADS, type=i32)
+                    u_ok = arith.cmpi(CmpIPredicate.ult, uidx, n_units_i32)
+                    _if_u = scf.IfOp(u_ok)
+                    with ir.InsertionPoint(_if_u.then_block):
+                        # vec_width is a build-time constant, so resolve the unit->element
+                        # offset with a Python ternary (avoid a kernel-level `if` statement).
+                        eidx = (
+                            uidx
+                            if vec_width == 1
+                            else uidx * arith.constant(vec_width, type=i32)
+                        )
                         v = buffer_ops.buffer_load(
-                            src_rsrc, src_base + eidx, vec_width=1, dtype=cdt
+                            src_rsrc,
+                            src_base + eidx,
+                            vec_width=vec_width,
+                            dtype=cdt,
                         )
                         buffer_ops.buffer_store(v, dst_rsrc, dst_base + eidx)
                         scf.YieldOp([])
