@@ -306,7 +306,6 @@ def gemm_a16w16(
         scaleAB=scale_a is not None or scale_b is not None,
         bpreshuffle=bpreshuffle,
     )
-    gfx = get_gfx()
     _no_asm = _is_gfx12()
     libtype = config["libtype"]
     if _no_asm and libtype in ("asm", "skinny", "hipblaslt", "flydsl", "opus"):
