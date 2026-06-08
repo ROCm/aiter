@@ -827,10 +827,10 @@ def main():
         help="Use mxfp8 microscaled activation instead of static fp8 (default: False).",
     )
     # PRESHUFFLE
-    # parser.add_argument(
-    #     "--preshuffled", action=argparse.BooleanOptionalAction, default=True,
-    #     help="Use preshuffled weights instead of shuffled weights (default: False).",
-    # )
+    parser.add_argument(
+        "--preshuffled", action=argparse.BooleanOptionalAction, default=True,
+        help="Use preshuffled weights instead of shuffled weights (default: False).",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -870,11 +870,13 @@ def main():
     routing_data, gather_idx, scatter_idx = routing(logits, args.n_expts_act)
 
     config = get_kernel_config_gluon(args.M, args.N, args.K, routing_data)
+    pipeline = "decode" if config["block_m"] == 16 else "prefill"
     print(
         f"  Config: block_m={config['block_m']}, block_n={config['block_n']}, "
         f"block_k={config['block_k']}, num_warps={config['num_warps']}, "
         f"num_buffers={config['num_buffers']}"
     )
+    print(f"  Pipeline: {pipeline} (gluon)" if arch == "gfx1250" else "  Pipeline: triton")
     routing_data.gate_scal = None
     gather_idx = gather_idx if args.do_gather else None
     scatter_idx = scatter_idx if args.do_scatter else None
@@ -894,8 +896,8 @@ def main():
 
     w_tri, w_scale_tri = downcast_to_mxfp(w_bf16, torch.uint8, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
-    # if args.preshuffled:
-    #     w_tri = preshuffle_weights_gfx1250(w_tri)
+    if args.preshuffled:
+        w_tri = preshuffle_weights_gfx1250(w_tri)
 
     swizzle_mx_scale = None
     if args.hbm_swizzling:
@@ -961,7 +963,7 @@ def main():
         quant_static_scale = ref_y.abs().max().float() / 448.0
         out_dtype = torch.float8_e4m3fn
 
-    # print("Preshuffled:", args.preshuffled)
+    print("Preshuffled:", args.preshuffled)
     tri_y = moe_gemm_a8w4(
         x_tri,
         w_tri,
@@ -977,9 +979,7 @@ def main():
         swizzle_mx_scale,
         out_dtype,
         args.apply_swiglu,
-        unpadded_N=N_padded,
-        unpadded_K=K_padded,
-        # preshuffled=args.preshuffled,
+        preshuffled=args.preshuffled,
     )
     if args.fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
@@ -1005,7 +1005,7 @@ def main():
     print(f"RMS relative error = {rms_err} (threshold = {rmstol})")
     if max_err > maxtol or rms_err > rmstol:
         raise AssertionError("Wrapper test failed against reference")
-    print("Test completed successfully")
+    print(f"Test completed successfully ({pipeline} pipeline)")
     return 0
 
 
