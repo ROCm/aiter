@@ -13,7 +13,10 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.2.0"
+FLYDSL_VERSION = "flydsl==0.2.0.dev20260608+c957349"
+FLYDSL_FIND_LINKS = (
+    "https://rocm.frameworks-devreleases.amd.com/whl/gfx942-gfx950/flydsl/"
+)
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -56,7 +59,7 @@ def is_develop_mode():
     return False
 
 
-if not AITER_TRITON_ONLY and is_develop_mode():
+if not IS_WINDOWS and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
         from packaging.version import Version
@@ -64,15 +67,20 @@ if not AITER_TRITON_ONLY and is_develop_mode():
         if Version(pkg_version("flydsl")) != Version(FLYDSL_VERSION.split("==")[1]):
             raise ImportError("version mismatch")
     except Exception:
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                FLYDSL_VERSION,
-            ]
-        )
+        try:
+            subprocess.check_call(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--find-links",
+                    FLYDSL_FIND_LINKS,
+                    FLYDSL_VERSION,
+                ]
+            )
+        except Exception:
+            pass
 
 
 def _is_triton_installed():
@@ -471,7 +479,7 @@ else:
         "einops",
         "psutil",
         "packaging",
-        FLYDSL_VERSION,
+        "flydsl>=0.2.0.dev20260608",
     ]
 
 setup(
