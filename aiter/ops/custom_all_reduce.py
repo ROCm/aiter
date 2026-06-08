@@ -60,6 +60,7 @@ def fused_allreduce_rmsnorm(
     out: torch.Tensor,
     w: torch.Tensor,
     eps: float,
+    weight_bias: float = 0.0,
     reg_buffer: Optional[torch.Tensor] = None,
 ) -> None: ...
 

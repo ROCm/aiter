@@ -1100,6 +1100,7 @@ __global__ void __launch_bounds__(tnum, 1)
                                     T* __restrict__ results,
                                     T* __restrict__ weight,
                                     float eps,
+                                    float weight_bias,
                                     int rank,
                                     int m,
                                     int n)
@@ -1148,7 +1149,7 @@ __global__ void __launch_bounds__(tnum, 1)
             for(int i = 0; i < pack_size; ++i)
             {
                 float x_f32          = rms_inp_f32[n_iter].data[i];
-                float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+                float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]) + weight_bias;
                 rmsnorm_inp.data[i]  = ck_tile::type_convert<T>(x_f32);
                 rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
             }
@@ -1170,6 +1171,7 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                                                                      T* __restrict__ results,
                                                                      T* __restrict__ weight,
                                                                      float eps,
+                                                                     float weight_bias,
                                                                      int rank,
                                                                      int m,
                                                                      int n)
@@ -1223,7 +1225,7 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                 for(int i = 0; i < pack_size; ++i)
                 {
                     float x_f32          = rms_inp_f32[n_iter].data[i];
-                    float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+                    float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]) + weight_bias;
                     rmsnorm_inp.data[i]  = ck_tile::type_convert<T>(x_f32);
                     rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
                 }
@@ -1243,6 +1245,7 @@ __global__ void __launch_bounds__(256, 1)
                                    T* __restrict__ results,
                                    T* __restrict__ weight,
                                    float eps,
+                                   float weight_bias,
                                    int rank,
                                    int m,
                                    int n)
@@ -1291,7 +1294,7 @@ __global__ void __launch_bounds__(256, 1)
             for(int i = 0; i < pack_size; ++i)
             {
                 float x_f32          = rms_inp_f32[n_iter].data[i];
-                float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+                float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]) + weight_bias;
                 rmsnorm_inp.data[i]  = ck_tile::type_convert<T>(x_f32);
                 rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
             }
@@ -1822,6 +1825,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    T* output,
                                    T* weight,
                                    float eps,
+                                   float weight_bias,
                                    int m,
                                    int n)
 {
@@ -1875,7 +1879,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);       \
         setGrid(naive_grid_size, kernel_ptr);                                   \
         template_kernel<<<grid, block, 0, stream>>>(                            \
-            sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
+            sg_, residual_inp, residual_out, output, weight, eps, weight_bias, rank_, m, n); \
     } while(0)
 
     if(n_bytes % 1024 == 0)

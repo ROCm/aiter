@@ -50,6 +50,7 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              torch::Tensor& out,
                              torch::Tensor& w,
                              float eps,
+                             float weight_bias,
                              std::optional<torch::Tensor> reg_buffer);
 
 void dispose(fptr_t _fa);
