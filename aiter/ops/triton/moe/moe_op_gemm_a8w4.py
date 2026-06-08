@@ -207,9 +207,8 @@ def get_kernel_config_triton(m, n, k, routing_data):
             num_stages = 1
 
         else:
-            # Cap by N: BN=512 wasted work on small-N and busted the 160 KB
-            # LDS budget under TRITON_HIP_USE_ASYNC_COPY=ON (AMD overlay
-            # default on gfx950). Tuned shapes bypass this via JSON.
+            # Cap by N: BN=512 wasted compute on small-N shapes (e.g. N=256
+            # → 50% pad, grid_n=1). Tuned shapes bypass this via JSON.
             block_n = min(triton.next_power_of_2(n), 256)
             # routing caps block_m at 128; nw=4 wins ~2x at block_m=128 on gpt-oss
             # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
@@ -220,7 +219,9 @@ def get_kernel_config_triton(m, n, k, routing_data):
         # gpt-oss W4A8 MoE shapes by 30-40% vs the JSON-tuned ns=2 winners; the
         # block_m==64 branch keeps its rocprof-tuned ns=1 override.
         if block_m != 64:
-            num_stages = pick_gemm_num_stages(arch, block_m, block_n, block_k, 8, 4)
+            num_stages = pick_gemm_num_stages(
+                arch, block_m, block_n, block_k, 8, 4, use_async_padding=True
+            )
     else:
         block_n = 128
         num_warps = 4
