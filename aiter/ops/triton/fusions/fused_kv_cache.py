@@ -15,11 +15,13 @@ try:
         _fused_qk_rope_cat_and_cache_mla_kernel as gluon_fused_qk_rope_cat_and_cache_mla_kernel,
         _fused_qk_rope_cat_and_cache_mla_kernel_BLOCK as gluon_fused_qk_rope_cat_and_cache_mla_kernel_BLOCK,
         _fused_qk_rope_reshape_and_cache_kernel as gluon_fused_qk_rope_reshape_and_cache_kernel,
+        _fused_qk_rope_reshape_and_cache_kernel_LOOP as gluon_fused_qk_rope_reshape_and_cache_kernel_LOOP,
     )
 except:  # noqa: E722
     gluon_fused_qk_rope_cat_and_cache_mla_kernel = None
     gluon_fused_qk_rope_cat_and_cache_mla_kernel_BLOCK = None
     gluon_fused_qk_rope_reshape_and_cache_kernel = None
+    gluon_fused_qk_rope_reshape_and_cache_kernel_LOOP = None
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -550,13 +552,26 @@ def fused_qk_rope_reshape_and_cache(
     if DEVICE_ARCH == "gfx1250" and kv_cache_dtype != torch.uint8:
         if t >= 256:
             BLOCK_T = 8
+            BLOCK_T_NUM_ITR = 1
         elif t >= 8:
             BLOCK_T = 8
+            BLOCK_T_NUM_ITR = 1
         else:
             BLOCK_T = 4
-        _kernel = gluon_fused_qk_rope_reshape_and_cache_kernel
-        n_pid = triton.cdiv(t, BLOCK_T) * qh + triton.cdiv(t_slot - t, BLOCK_T) * kh
-        _extra_args = {"BLOCK_T": BLOCK_T}
+            BLOCK_T_NUM_ITR = 1
+        chunk = BLOCK_T * BLOCK_T_NUM_ITR
+        n_pid = (
+            triton.cdiv(t, chunk) * qh
+            + triton.cdiv(t_slot - t, chunk) * kh
+        )
+        # Use the _LOOP variant only when we actually have an inner static
+        # loop to run; the regular kernel is leaner for BLOCK_T_NUM_ITR == 1.
+        if BLOCK_T_NUM_ITR > 1:
+            _kernel = gluon_fused_qk_rope_reshape_and_cache_kernel_LOOP
+            _extra_args = {"BLOCK_T": BLOCK_T, "BLOCK_T_NUM_ITR": BLOCK_T_NUM_ITR}
+        else:
+            _kernel = gluon_fused_qk_rope_reshape_and_cache_kernel
+            _extra_args = {"BLOCK_T": BLOCK_T}
     else:
         n_pid = t * qh + (t_slot - t) * kh
         _kernel = triton_fused_qk_rope_reshape_and_cache_kernel
