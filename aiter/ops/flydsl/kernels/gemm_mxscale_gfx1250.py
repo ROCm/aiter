@@ -515,14 +515,7 @@ def compile_mxscale_gemm(
             tile_m
         )
 
-        def _emit_tile(
-            batch_idx,
-            bx_local,
-            by_local,
-            bz,
-            tile_valid_override=None,
-            valid_m_override=None,
-        ):
+        def _emit_tile(batch_idx, bx_local, by_local, bz, tile_valid_override=None):
             blk_m = bx_local * arith.index(tile_m)
             blk_n = by_local * arith.index(tile_n)
             split_k_base = bz * arith.index(split_k_chunk)
@@ -533,30 +526,24 @@ def compile_mxscale_gemm(
             tile_valid = arith.constant(1, type=ir.IntegerType.get_signless(1))
             valid_m_i32 = i32_m.ir_value()
             if const_expr(grouped_masked_m):
-                if valid_m_override is not None:
-                    valid_m_i32 = valid_m_override
-                else:
-                    masked_m_rsrc = buffer_ops.create_buffer_resource(
-                        arg_masked_m, max_size=True
-                    )
-                    valid_m_i32 = buffer_ops.buffer_load(
-                        masked_m_rsrc,
-                        arith.index_cast(T.i32, batch_idx),
-                        vec_width=1,
-                        dtype=T.i32,
-                    )
+                masked_m_rsrc = buffer_ops.create_buffer_resource(
+                    arg_masked_m, max_size=True
+                )
+                valid_m_i32 = buffer_ops.buffer_load(
+                    masked_m_rsrc,
+                    arith.index_cast(T.i32, batch_idx),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
                 if const_expr(grouped_persistent_m):
                     if tile_valid_override is not None:
                         tile_valid = tile_valid_override
                 else:
-                    if tile_valid_override is not None:
-                        tile_valid = tile_valid_override
-                    else:
-                        tile_valid = arith.cmpi(
-                            arith.CmpIPredicate.slt,
-                            arith.index_cast(T.i32, blk_m),
-                            valid_m_i32,
-                        )
+                    tile_valid = arith.cmpi(
+                        arith.CmpIPredicate.slt,
+                        arith.index_cast(T.i32, blk_m),
+                        valid_m_i32,
+                    )
 
             if const_expr(use_cluster):
                 local_x, local_y = gpu.compute_cluster_position()
@@ -2816,40 +2803,12 @@ def compile_mxscale_gemm(
                     if split_k > 1
                     else arith.index(0)
                 )
-            if const_expr(grouped_masked_m):
-                masked_m_rsrc = buffer_ops.create_buffer_resource(
-                    arg_masked_m, max_size=True
-                )
-                valid_m_i32 = buffer_ops.buffer_load(
-                    masked_m_rsrc,
-                    arith.index_cast(T.i32, batch_idx),
-                    vec_width=1,
-                    dtype=T.i32,
-                )
-                blk_m = bx_local * arith.index(tile_m)
-                tile_active = arith.cmpi(
-                    arith.CmpIPredicate.slt,
-                    arith.index_cast(T.i32, blk_m),
-                    valid_m_i32,
-                )
-                tile_if = scf.IfOp(tile_active, results_=[], has_else=False)
-                with ir.InsertionPoint(tile_if.then_block):
-                    _emit_tile(
-                        batch_idx,
-                        bx_local,
-                        by,
-                        bz,
-                        tile_valid_override=tile_active,
-                        valid_m_override=valid_m_i32,
-                    )
-                    scf.YieldOp([])
-            else:
-                _emit_tile(batch_idx, bx_local, by, bz)
+            _emit_tile(batch_idx, bx_local, by, bz)
 
     # Bump this when changing generated IR in ways not otherwise reflected in
     # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
     # reusing a previously compiled kernel after source-only descriptor fixes.
-    tdm_store_descriptor_version = 30
+    tdm_store_descriptor_version = 29
 
     # M/N are compile-time constants used throughout the generated IR
     # (B_TOTAL_N, C_N, grid dimensions, output/bias strides, scale descriptor
