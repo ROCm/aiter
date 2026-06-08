@@ -127,10 +127,17 @@ def gemm_a8w8_bpreshuffle_flydsl(
     Out: Tensor,
     config: dict,
 ) -> Tensor:
+    kernel_name = str(config.get("kernelName", ""))
+    if kernel_name.startswith("flydsl_bpreshuffle_wmma_"):
+        from .flydsl.bpreshuffle_gemm_gfx1250 import run_gemm_a8w8_bpreshuffle_gfx1250
+
+        return run_gemm_a8w8_bpreshuffle_gfx1250(
+            XQ, WQ, x_scale, w_scale, Out, kernel_name
+        )
+
     from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 
-    kernel_name = config.get("kernelName", "")
-    parsed = _parse_flydsl_kernel_name(str(kernel_name))
+    parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
     tm, tn, tk, lds, csh, acp, wpe, xcd = parsed
@@ -930,7 +937,7 @@ def gfx950_a8w8_blockscale_ASM(
     assert dtype in [
         dtypes.bf16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
-    return gfx950_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
+    return gfx950_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)  # noqa: F821
 
 
 def gen_gemm_a8w8_tune_fake_tensors(
