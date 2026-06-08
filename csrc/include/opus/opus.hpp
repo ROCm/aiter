@@ -1552,7 +1552,17 @@ OPUS_D index_t block_id_z()  { return __builtin_amdgcn_workgroup_id_z(); }
 OPUS_D index_t block_size_x() { return __builtin_amdgcn_workgroup_size_x(); }
 OPUS_D index_t block_size_y() { return __builtin_amdgcn_workgroup_size_y(); }
 OPUS_D index_t block_size_z() { return __builtin_amdgcn_workgroup_size_z(); }
-OPUS_D index_t grid_size_x()  { return __builtin_amdgcn_grid_size_x(); }
+#if defined(__gfx1250__)
+OPUS_D index_t cluster_workgroup_id_x() {return __builtin_amdgcn_cluster_workgroup_id_x();}
+OPUS_D index_t cluster_workgroup_id_y() {return __builtin_amdgcn_cluster_workgroup_id_y();}
+OPUS_D index_t cluster_workgroup_id_z() {return __builtin_amdgcn_cluster_workgroup_id_z();}
+OPUS_D index_t cluster_workgroup_flat_id() {return __builtin_amdgcn_cluster_workgroup_flat_id();}
+OPUS_D index_t cluster_id_x() {return __builtin_amdgcn_cluster_id_x();}
+OPUS_D index_t cluster_id_y() {return __builtin_amdgcn_cluster_id_y();}
+OPUS_D index_t cluster_id_z() {return __builtin_amdgcn_cluster_id_z();}
+#endif
+// grid x-z switch to cluster_id when cluster enable in gfx1250
+OPUS_D index_t grid_size_x()  { return __builtin_amdgcn_grid_size_x(); } 
 OPUS_D index_t grid_size_y()  { return __builtin_amdgcn_grid_size_y(); }
 OPUS_D index_t grid_size_z()  { return __builtin_amdgcn_grid_size_z(); }
 OPUS_D void    sync_threads() { __builtin_amdgcn_s_barrier(); }
@@ -1614,6 +1624,42 @@ OPUS_D unsigned int lane_id() {
     if constexpr (get_warp_size() == 32) return __builtin_amdgcn_mbcnt_lo(-1, 0);
     else return __builtin_amdgcn_mbcnt_hi(-1, __builtin_amdgcn_mbcnt_lo(-1, 0));
 }
+
+//gfx1250 only feature
+#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+OPUS_D unsigned int waveid_in_workgroup()
+{
+    unsigned int wave_id; asm volatile("s_bfe_u32 %0, ttmp8, 0x50019" : "=s"(wave_id)); return wave_id;
+}
+
+//Named Barrier define
+#define DECLARE_NAMED_BARRIERS() \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_1; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_2; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_3; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_4; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_5; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_6; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_7; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_8; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_9; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_10; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_11; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_12; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_13; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_14; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_15; 
+
+OPUS_D void s_barrier_init_ptr(
+    __amdgpu_named_workgroup_barrier_t *bar, uint32_t member_cnt) {
+    __builtin_amdgcn_s_barrier_init(bar, member_cnt);
+}
+
+OPUS_D void s_barrier_join_ptr(
+    __amdgpu_named_workgroup_barrier_t *bar) {
+    __builtin_amdgcn_s_barrier_join(bar);
+}
+#endif
 
 // cross-lane shuffle via ds_bpermute (no hip_runtime.h dependency)
 template<typename T>
@@ -2242,12 +2288,24 @@ struct tcopy_window {
         extent0=o0+td0; extent1=o1+td1; materialize_desc_initial();
     }
 
+    // Toolchain skew: older llvm signature is 5-operand (committed default); some newer / patched
+    // llvm builds require an extra all-zero int32x8_t before cpol. Define
+    // OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA=1 at compile time to pass it.
+#ifndef OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA
+#define OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA 0
+#endif
+#if OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA
+#define OPUS_TCOPY_SG_EXTRA_ARG , impl::tcopy_sg_extra_vec{0, 0, 0, 0, 0, 0, 0, 0}
+#else
+#define OPUS_TCOPY_SG_EXTRA_ARG
+#endif
+
     template<int cpol = cache_pol>
     OPUS_D void load_to_lds() const {
         if constexpr (ndim == 2)
-            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tcopy_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tcopy_sg1_vec, desc.sg1), impl::tcopy_sg2_vec{0,0,0,0}, impl::tcopy_sg3_vec{0,0,0,0}, impl::tcopy_sg_extra_vec{0,0,0,0,0,0,0,0}, cpol);
+            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tcopy_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tcopy_sg1_vec, desc.sg1), impl::tcopy_sg2_vec{0,0,0,0}, impl::tcopy_sg3_vec{0,0,0,0} OPUS_TCOPY_SG_EXTRA_ARG, cpol);
         else
-            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tcopy_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tcopy_sg1_vec, desc.sg1), __builtin_bit_cast(impl::tcopy_sg2_vec, desc.sg2), __builtin_bit_cast(impl::tcopy_sg3_vec, desc.sg3), impl::tcopy_sg_extra_vec{0,0,0,0,0,0,0,0}, cpol);
+            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tcopy_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tcopy_sg1_vec, desc.sg1), __builtin_bit_cast(impl::tcopy_sg2_vec, desc.sg2), __builtin_bit_cast(impl::tcopy_sg3_vec, desc.sg3) OPUS_TCOPY_SG_EXTRA_ARG, cpol);
     }
 
     // move(d0..d4, lds): per-dim signed deltas + lds byte delta. 0_I args are compile-time elided.
