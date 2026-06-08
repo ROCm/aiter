@@ -34,7 +34,14 @@ std::vector<at::Tensor> mha_fwd_native_splitkv(
     double softmax_scale, bool causal, bool return_lse, int64_t num_splits)
 {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q/k/v must be HIP tensors");
-    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "native splitkv is bf16 only");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && k.scalar_type() == at::kBFloat16 &&
+                    v.scalar_type() == at::kBFloat16,
+                "native splitkv is bf16 only");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+                "q/k/v must be 4-D BSHD tensors");
+    // Kernel indexes D contiguously and only uses batch/seqlen/head strides.
+    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1,
+                "q/k/v last dim must be contiguous");
 
     // aiter layout is BSHD: (B, S, H, D).
     const int B  = q.size(0);
@@ -44,6 +51,8 @@ std::vector<at::Tensor> mha_fwd_native_splitkv(
     const int Sk = k.size(1);
     const int Hk = k.size(2);
     TORCH_CHECK(D == 64 && v.size(3) == 64, "native splitkv is D64 only");
+    // GQA grouping assumes Hk divides Hq; Hk > Hq would divide by zero on device.
+    TORCH_CHECK(Hk > 0 && Hq % Hk == 0, "nhead_q must be a multiple of nhead_k");
     const int G = static_cast<int>(num_splits);
     TORCH_CHECK(G >= 1, "num_splits must be >= 1");
 
