@@ -1,18 +1,34 @@
 {
-    "M_LEQ_512": {
-        "BLOCK_M": 64,
-        "BLOCK_N": 64,
+    "M_LEQ_32": {
+        "BLOCK_M": 16,
+        "BLOCK_N": 32,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 3,
+        "NUM_BUFFERS": 5,
         "num_warps": 2,
         "L2_PREFETCH_DISTANCE": 0
     },
-    "any": {
-        "BLOCK_M": 32,
+    "M_LEQ_128": {
+        "BLOCK_M": 64,
+        "BLOCK_N": 64,
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 4,
+        "num_warps": 4,
+        "L2_PREFETCH_DISTANCE": 0
+    },
+    "M_LEQ_512": {
+        "BLOCK_M": 64,
         "BLOCK_N": 64,
         "BLOCK_K": 64,
         "NUM_BUFFERS": 5,
         "num_warps": 2,
+        "L2_PREFETCH_DISTANCE": 0
+    },
+    "any": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 3,
+        "num_warps": 8,
         "L2_PREFETCH_DISTANCE": 0
     }
 }
