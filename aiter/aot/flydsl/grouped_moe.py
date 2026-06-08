@@ -52,6 +52,8 @@ def parse_csv(csv_path: str):
                 "m_warp": int(row.get("m_warp") or 1),
                 "n_warp": n_warp,
                 "num_buffers": int(row.get("num_buffers") or 2),
+                "split_k1": int(row.get("split_k1") or 1),
+                "split_k2": int(row.get("split_k2") or 1),
                 "out_dtype": "bf16" if row.get("dtype") == "torch.bfloat16" else "f16",
                 "grouped_persistent_m": _as_bool(row.get("grouped_persistent_m"), True),
                 "persistent_workers": _as_int(row.get("persistent_workers"), None),
@@ -107,7 +109,6 @@ def compile_one_config(**job):
         num_buffers=job["num_buffers"],
         grouped_persistent_m=job["grouped_persistent_m"],
         persistent_workers=job["persistent_workers"],
-        data_format=job["data_format"],
     )
     masked_m = torch.full(
         (job["experts"],), job["max_m"], dtype=torch.int32, device=dev
@@ -143,6 +144,7 @@ def compile_one_config(**job):
         exe1 = compiler1(
             act=job["act"],
             stage1_weight_layout=job["stage1_weight_layout"],
+            split_k=job["split_k1"],
             **common,
         )
         exe1(
@@ -158,7 +160,7 @@ def compile_one_config(**job):
             job["experts"],
             stream=0,
         )
-        exe2 = compiler2(**common)
+        exe2 = compiler2(split_k=job["split_k2"], **common)
         exe2(
             y2,
             x2,
