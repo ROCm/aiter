@@ -303,6 +303,8 @@ def test_mla_prefill(
         num_head_k=num_head_kv,
         max_qlen=max_qlen,
         qlen_granularity=qlen_granularity,
+        max_kvlen=seq_lens_kv.max().item(),
+        kvlen_granularity=kvlen_granularity,
     )
     work_metadata_ptrs = torch.empty(
         work_meta_data_size, dtype=work_meta_data_type, device=device
