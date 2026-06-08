@@ -114,7 +114,8 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
 
     int in_bpe = 2;
     int out_bpe = 2;
-    if(a.data_type == "fp8bf16" || a.data_type == "i8fp8bf16" || a.data_type == "mxfp4bf16")
+    if(a.data_type == "fp8bf16" || a.data_type == "i8fp8bf16" ||
+        a.data_type == "mxfp4bf16" || a.data_type == "mxfp6bf16")
     {
         in_bpe = 1;
         args.ptr_q_descale = a.q_descale_ptr;
@@ -214,7 +215,8 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 
     if((a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
        (a.data_type != "bf16" && a.data_type != "fp8bf16" && 
-        a.data_type != "i8fp8bf16" && a.data_type != "mxfp4bf16") ||
+        a.data_type != "i8fp8bf16" && a.data_type != "mxfp4bf16" &&
+        a.data_type != "mxfp6bf16") ||
        (a.bias_type != 0) || (a.p_drop > 0.f) || ((arch_id != "gfx942") && (arch_id != "gfx950")))
     {
         AITER_LOG_WARNING("unsupported condition in fwd_v3!!! data type: " << a.data_type);

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 
+import numpy as np
 import torch
 import triton
 
@@ -41,7 +42,12 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
     sage_quant,
     sage_quant_mxfp4,
+    rotation_smooth_qk,
 )
+from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
+    sage_quant_v_kernel,
+)
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.test_mha_common import attention_ref, attention_ref_block_sparse
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -70,6 +76,7 @@ KernelName = Literal[
     "aiter_fp8",
     "aiter_i8fp8",
     "aiter_mxfp4",
+    "aiter_mxfp6",
     "aiter_bf16",
 ]
 
@@ -79,16 +86,18 @@ ALL_KERNELS: List[str] = [
     "aiter_fp8",
     "aiter_i8fp8",
     "aiter_mxfp4",
+    "aiter_mxfp6",
     "aiter_bf16",
 ]
 
-FP8_CHECK_KERNELS = {
+QUANT_KERNELS = {
     "sage_fp8",
     "sage_mxfp4",
     "fav3_fp8",
     "aiter_fp8",
     "aiter_i8fp8",
     "aiter_mxfp4",
+    "aiter_mxfp6",
 }
 
 
@@ -148,6 +157,60 @@ def primary_output(result: Any) -> Any:
     return result
 
 
+def _generate_transformer_qkv(
+    batch: int,
+    hq: int,
+    hk: int,
+    sq: int,
+    sk: int,
+    d_head: int,
+    d_head_v: int,
+    device: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Realistic LLM activations: RMS-norm + per-channel log-normal scales + shared low-rank Q/K component + V outlier dims/tokens. Returns fp32 q/k/v.
+    q = torch.randn((batch, hq, sq, d_head), device=device, dtype=torch.float32)
+    k = torch.randn((batch, hk, sk, d_head), device=device, dtype=torch.float32)
+    v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=torch.float32)
+
+    q = q / q.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+    k = k / k.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+    v = v / v.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+
+    q_channel_scale = torch.exp(
+        0.35 * torch.randn((1, hq, 1, d_head), device=device)
+    ).clamp(0.35, 2.5)
+    k_channel_scale = torch.exp(
+        0.35 * torch.randn((1, hk, 1, d_head), device=device)
+    ).clamp(0.35, 2.5)
+    v_channel_scale = torch.exp(
+        0.45 * torch.randn((1, hk, 1, d_head_v), device=device)
+    ).clamp(0.25, 3.5)
+    q = q * q_channel_scale
+    k = k * k_channel_scale
+    v = v * v_channel_scale
+
+    shared_heads = min(hq, hk)
+    shared_seq = min(sq, sk)
+    shared_d = min(d_head, d_head_v)
+    if shared_heads > 0 and shared_seq > 0:
+        shared = torch.randn(
+            (batch, shared_heads, shared_seq, shared_d),
+            device=device,
+            dtype=torch.float32,
+        )
+        q[:, :shared_heads, :shared_seq, :shared_d] += 0.35 * shared
+        k[:, :shared_heads, :shared_seq, :shared_d] += 0.35 * shared
+
+    num_v_outlier_dims = max(1, d_head_v // 16)
+    v_outlier_dims = torch.randperm(d_head_v, device=device)[:num_v_outlier_dims]
+    v[..., v_outlier_dims] *= 4.0
+    num_v_outlier_tokens = max(1, sk // 128)
+    v_outlier_tokens = torch.randperm(sk, device=device)[:num_v_outlier_tokens]
+    v[:, :, v_outlier_tokens, :] *= 2.5
+
+    return q, k, v
+
+
 def generate_test_tensors(
     batch: int,
     hq: int,
@@ -160,11 +223,26 @@ def generate_test_tensors(
     device: str,
     distribution: str,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # "normal": plain iid Gaussian Q/K/V -- the simplest smoke-test inputs.
     if distribution == "normal":
         q = torch.randn((batch, hq, sq, d_head), device=device, dtype=dtype)
         k = torch.randn((batch, hk, sk, d_head), device=device, dtype=dtype)
         v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=dtype)
         return q, k, v
+
+    # "sink": realistic StreamingLLM-style pattern where a few leading "sink" tokens attract most attention mass -- peaked yet in-distribution for long context.
+    if distribution == "sink":
+        q, k, v = _generate_transformer_qkv(
+            batch, hq, hk, sq, sk, d_head, d_head_v, device
+        )
+        g = torch.nn.functional.normalize(
+            torch.randn((batch, 1, 1, d_head), device=device, dtype=torch.float32),
+            dim=-1,
+        )
+        num_sinks = min(sk, 4)
+        k[:, :, :num_sinks, :] += 12.0 * g
+        q = q + 3.0 * g
+        return q.to(dtype), k.to(dtype), v.to(dtype)
 
     if distribution == "underflow":
         # Reproduces the fp8 underflow tile-skip regression on the microbench.
@@ -259,46 +337,8 @@ def generate_test_tensors(
     if distribution != "transformer":
         raise ValueError(f"Unsupported input distribution: {distribution}")
 
-    q = torch.randn((batch, hq, sq, d_head), device=device, dtype=torch.float32)
-    k = torch.randn((batch, hk, sk, d_head), device=device, dtype=torch.float32)
-    v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=torch.float32)
-
-    q = q / q.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
-    k = k / k.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
-    v = v / v.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
-
-    q_channel_scale = torch.exp(
-        0.35 * torch.randn((1, hq, 1, d_head), device=device)
-    ).clamp(0.35, 2.5)
-    k_channel_scale = torch.exp(
-        0.35 * torch.randn((1, hk, 1, d_head), device=device)
-    ).clamp(0.35, 2.5)
-    v_channel_scale = torch.exp(
-        0.45 * torch.randn((1, hk, 1, d_head_v), device=device)
-    ).clamp(0.25, 3.5)
-    q = q * q_channel_scale
-    k = k * k_channel_scale
-    v = v * v_channel_scale
-
-    shared_heads = min(hq, hk)
-    shared_seq = min(sq, sk)
-    shared_d = min(d_head, d_head_v)
-    if shared_heads > 0 and shared_seq > 0:
-        shared = torch.randn(
-            (batch, shared_heads, shared_seq, shared_d),
-            device=device,
-            dtype=torch.float32,
-        )
-        q[:, :shared_heads, :shared_seq, :shared_d] += 0.35 * shared
-        k[:, :shared_heads, :shared_seq, :shared_d] += 0.35 * shared
-
-    num_v_outlier_dims = max(1, d_head_v // 16)
-    v_outlier_dims = torch.randperm(d_head_v, device=device)[:num_v_outlier_dims]
-    v[..., v_outlier_dims] *= 4.0
-    num_v_outlier_tokens = max(1, sk // 128)
-    v_outlier_tokens = torch.randperm(sk, device=device)[:num_v_outlier_tokens]
-    v[:, :, v_outlier_tokens, :] *= 2.5
-
+    # "transformer": realistic LLM activation statistics (see _generate_transformer_qkv).
+    q, k, v = _generate_transformer_qkv(batch, hq, hk, sq, sk, d_head, d_head_v, device)
     return q.to(dtype), k.to(dtype), v.to(dtype)
 
 
@@ -677,6 +717,232 @@ def make_torch_ref_runner(
     )
 
 
+# mxfp6 kernel (fp6 Q,K + fp6/fp8 V). Built offline by mi350_fmha_hd128_mxfp6.py
+# with its OWN symbol (_ZN5aiter28fmha_fwd_hd128_mxfp6_gfx950E) and OWN config row
+# (dtype "mxfp6bf16"), so it has a dedicated .co slot (fwd_hd128_mxfp6.co) and
+# coexists with aiter_mxfp4 -- no overlay. The C++ dispatch routes 96-wide
+# (fp6-packed) q/k to this slot automatically. The .co is loaded straight from the
+# AITER hsa dir like every other kernel; to swap kernels, copy your build over
+# hsa/gfx950/fmha_v3_fwd/fwd_hd128_mxfp6.co.
+
+
+def _deployed_mxfp4_co_path() -> str:
+    from aiter.jit.core import get_asm_dir
+
+    return os.path.join(get_asm_dir(), "fmha_v3_fwd", "fwd_hd128_mxfp4.co")
+
+
+# By default the fp6 FMHA encoding lives IN-TREE (aiter.ops.triton.quant.
+# mxfp6_fmha_pack). Set AITER_MXFP6_PACK=/path/to/packer.py to override with an
+# external packer module by path.
+_MXFP6_PACK_PATH = os.environ.get("AITER_MXFP6_PACK")
+_host_fp6_pack_mod = None
+
+
+def _load_host_fp6_pack():
+    """Return the MXFP6-E2M3 host packer module (cached).
+
+    Uses the in-tree aiter packer by default; honors AITER_MXFP6_PACK to load an
+    external packer module by path."""
+    global _host_fp6_pack_mod
+    if _host_fp6_pack_mod is None:
+        if _MXFP6_PACK_PATH:
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location(
+                "host_fp6_pack", _MXFP6_PACK_PATH
+            )
+            if spec is None or spec.loader is None:
+                raise FileNotFoundError(
+                    f"host fp6 packer not found at {_MXFP6_PACK_PATH}; "
+                    "unset AITER_MXFP6_PACK to use the in-tree packer."
+                )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        else:
+            from aiter.ops.triton.quant import mxfp6_fmha_pack as mod
+        _host_fp6_pack_mod = mod
+    return _host_fp6_pack_mod
+
+
+def _sage_quant_mxfp6(
+    q,
+    k,
+    v,
+    FP8_TYPE,
+    FP8_MAX,
+    BLKQ,
+    BLKK,
+    sm_scale=None,
+    q_smoothing=False,
+    layout="bshd",
+    R=None,
+    BLOCK_R=32,
+    qk_packer=None,
+):
+    """MXFP6-E2M3 QK quantize for the aiter_mxfp6 bench path.
+
+    Local copy of sage_quant_mxfp4's body so the shared production wrapper
+    (sage_attention_quant_wrappers.sage_quant_mxfp4) stays untouched. When
+    qk_packer is supplied, Q/K are packed to MXFP6-E2M3 (both QK MFMA operands in
+    fp6) instead of the fp4 (e2m1) downcast; V quant (sage_quant_v_kernel) and
+    delta_s are identical to the mxfp4 path."""
+    v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
+    assert layout == "bshd", f"aiter_mxfp6 bench path expects bshd, got {layout}"
+    b, qo_len, h_qo, head_dim = q.shape
+    _, kv_len, h_kv, _ = v.shape
+    stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
+        v.stride(0),
+        v.stride(2),
+        v.stride(1),
+        v.stride(3),
+    )
+    K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
+
+    v_scale = v.abs().amax(dim=1).to(torch.float32) / FP8_MAX
+    grid = (b * h_kv * K_NUM_BLKS,)
+
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+
+    q, k, delta_s = rotation_smooth_qk(
+        q,
+        k,
+        BLKQ,
+        R=R,
+        BLOCK_R=BLOCK_R,
+        q_smoothing=q_smoothing,
+        layout=layout,
+        sm_scale=(sm_scale * 1.4426950408889634),
+    )
+
+    sage_quant_v_kernel[grid](
+        v,
+        v_fp8,
+        v_scale,
+        stride_bz_v,
+        stride_h_v,
+        stride_seq_v,
+        stride_d_v,
+        v_scale.stride(0),
+        v_scale.stride(1),
+        b,
+        h_kv,
+        K_NUM_BLKS,
+        kv_len,
+        D=head_dim,
+        BLK_K=BLKK,
+        num_stages=3,
+        num_warps=8,
+    )
+
+    if qk_packer is not None:
+        q_fp4, q_scale = qk_packer(q)
+        k_fp4, k_scale = qk_packer(k)
+    else:
+        q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
+        k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
+
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
+
+
+def _build_fp6_qk_packer(device):
+    """Return a packer: rotated/smoothed float Q|K [...,128] -> (uint8 [...,96]
+    interleaved MXFP6-E2M3 data, uint8 [...,4] E8M0 scale) on `device`.
+
+    GPU (Triton) pack by default: byte-identical to the host numpy packer for
+    bf16/fp16/fp32 Q/K (v/2^E is an exponent shift, exact in fp32) and runs every
+    do_bench iteration cheaply on the rotated tensors. Set AITER_MXFP6_QK_TRITON=0
+    to fall back to the (memoized) CPU numpy round-trip."""
+    hp = _load_host_fp6_pack()
+    _use_triton = (
+        os.environ.get("AITER_MXFP6_QK_TRITON", "1") != "0"
+        and getattr(hp, "_HAVE_TRITON", False)
+        and hasattr(hp, "quantize_fp6_lastdim_triton")
+    )
+    if _use_triton:
+
+        def _packer(t: torch.Tensor):
+            return hp.quantize_fp6_lastdim_triton(t)
+
+        return _packer
+
+    _cache: dict = {}
+
+    def _packer(t: torch.Tensor):
+        key = (t.data_ptr(), tuple(t.shape), t.dtype)
+        hit = _cache.get(key)
+        if hit is not None:
+            return hit
+        arr = t.detach().to(torch.float32).cpu().numpy()
+        packed, scale = hp.quantize_fp6_lastdim(arr)
+        out = (
+            torch.from_numpy(packed).to(device),
+            torch.from_numpy(scale).to(device),
+        )
+        _cache[key] = out
+        return out
+
+    return _packer
+
+
+def _build_hostv_v_packer(device):
+    """Return a packer: fp8 V [b, sk, h_kv, d] -> strided uint8 V tensor in the
+    kernel's native-fp6 d-major tile-flat HBM layout.
+
+    The packed buffer is contiguous [b, h_kv, n_tiles*12800] uint8; it is exposed
+    to flash_attn_mxfp4_func as a [b, sk, h_kv, d] tensor via as_strided with the
+    kernel's byte strides (v_Seqs=100, v_Hs=n_tiles*12800, v_Bs=h_kv*v_Hs). The
+    last dim keeps size d (=128) so the C++ derives the correct output extent and
+    the contiguous-last-dim check passes; the kernel does its own tile-flat
+    addressing and ignores the per-token/per-d element strides.
+
+    Packs the RAW fp8 V magnitudes (NO per-channel descale); the per-channel
+    v_descale is applied in the kernel epilogue, exactly as in the in-kernel
+    ("both") path -- so this is numerically a layout change only.
+
+    Memoized on the input tensor identity (do_bench reuses fixed tensors)."""
+    hp = _load_host_fp6_pack()
+    _cache: dict = {}
+    # GPU (Triton) V pack by default: byte-identical to the host packer but ~1000x
+    # faster (no CPU round-trip). Set AITER_MXFP6_V_TRITON=0 to force the host pack.
+    _use_triton = os.environ.get("AITER_MXFP6_V_TRITON", "1") != "0"
+
+    def _packer(v_fp8: torch.Tensor):
+        key = (v_fp8.data_ptr(), tuple(v_fp8.shape), v_fp8.dtype)
+        hit = _cache.get(key)
+        if hit is not None:
+            return hit
+        b, sk, h_kv, d = v_fp8.shape
+        assert sk % 128 == 0, f"hostv requires seqlen_k % 128 == 0, got {sk}"
+        n_tiles = sk // 128
+        if _use_triton and getattr(hp, "_HAVE_TRITON", False):
+            # Triton GPU packer: returns torch uint8 [b, h_kv, n_tiles*12800] on
+            # the V device; no CPU transpose / round-trip.
+            packed_t = hp.quantize_fp6_v_clean_triton(v_fp8, tile=128)
+            packed_flat = packed_t.reshape(-1)  # device uint8, contiguous
+        else:
+            # Host (numpy) fallback: byte-identical to the Triton packer.
+            v_f = v_fp8.detach().to(torch.float32).cpu().numpy()  # [b, sk, h_kv, d]
+            v_dmajor = np.transpose(v_f, (0, 2, 3, 1))  # [b, h_kv, d, sk]
+            packed = hp.quantize_fp6_v_clean(v_dmajor, tile=128)
+            # packed: uint8 [b, h_kv, n_tiles*12800]
+            packed_flat = torch.from_numpy(np.ascontiguousarray(packed).reshape(-1))
+        tile_bytes = d * 96 + d * 4  # 12800 for d=128
+        v_hs = n_tiles * tile_bytes
+        v_bs = h_kv * v_hs
+        # as_strided can read up to (sk-1)*100 + (h_kv-1)*v_hs + (d-1) which
+        # slightly exceeds b*v_bs; pad the storage tail so the view is in-bounds.
+        buf = torch.empty(b * v_bs + 256, dtype=torch.uint8, device=packed_flat.device)
+        buf[: packed_flat.numel()] = packed_flat
+        buf = buf.to(device)
+        v_view = buf.as_strided((b, sk, h_kv, d), (v_bs, 100, v_hs, 1))
+        _cache[key] = v_view
+        return v_view
+
+    return _packer
+
+
 def make_kernel_runner(
     args: argparse.Namespace,
     q: torch.Tensor,
@@ -960,6 +1226,86 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
         )
 
+    if args.kernel == "aiter_mxfp6":
+        # mxfp6 path: Q,K are packed fp6 [.,.,.,96] and V is packed to the
+        # kernel's native-fp6 d-major tile-flat layout. The C++ dispatch routes
+        # the fp6 q/k to the DEDICATED fwd_hd128_mxfp6.co slot (own symbol/config),
+        # loaded straight from the AITER hsa dir, so aiter_mxfp4 and aiter_mxfp6
+        # coexist with no overlay.
+        cfg = get_sage_fwd_configs_mxfp4()
+        fp8_type = aiter.dtypes.fp8
+        fp8_max = torch.finfo(fp8_type).max
+
+        block_r = args.block_r
+        if block_r > q_bshd.shape[-1]:
+            raise ValueError(
+                f"block_r ({block_r}) must be <= head dim ({q_bshd.shape[-1]})"
+            )
+        r = create_hadamard_matrix(
+            block_r, device=q_bshd.device, dtype=q_bshd.dtype
+        ) / (block_r**0.5)
+
+        # Build the fp6 QK and V packers ONCE (they memoize per input tensor);
+        # rebuilding them inside _quantize_mxfp6 would discard the cache every
+        # do_bench iteration.
+        _mxfp6_qk_packer = _build_fp6_qk_packer(q_bshd.device)
+        _mxfp6_v_packer = _build_hostv_v_packer(q_bshd.device)
+        # fp6fp8 validation mode: QK stays fp6 but V is passed as raw FP8 (E4M3)
+        # with a per-channel fp32 descale (the mxfp4/fp8 PV back-end), bypassing
+        # the native-fp6 V packer. Used to validate the fp6fp8 kernel deployed
+        # into the mxfp6 .co slot (the mxfp6bf16 C++ route has in_bpe=1 and reads
+        # the V stride from the tensor, so an fp8 V flows through unchanged).
+        _fp6fp8_mode = os.environ.get("AITER_FP6FP8", "0") != "0"
+
+        def _quantize_mxfp6():
+            return _sage_quant_mxfp6(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                fp8_type,
+                fp8_max,
+                BLKQ=cfg["BLOCK_M"],
+                BLKK=64,
+                layout="bshd",
+                R=r,
+                BLOCK_R=block_r,
+                sm_scale=softmax_scale,
+                q_smoothing=args.qsmooth,
+                qk_packer=_mxfp6_qk_packer,
+            )
+
+        def _run_aiter_mxfp6():
+            q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale, _delta_s = (
+                _quantize_mxfp6()
+            )
+            v_arg = v_fp8 if _fp6fp8_mode else _mxfp6_v_packer(v_fp8)
+            return flash_attn_mxfp4_func(
+                q_fp4,
+                k_fp4,
+                v_arg,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                softmax_scale=softmax_scale,
+            )
+
+        if args.e2e:
+            return _run_aiter_mxfp6
+
+        q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale, _delta_s = (
+            _quantize_mxfp6()
+        )
+        v_arg = v_fp8 if _fp6fp8_mode else _mxfp6_v_packer(v_fp8)
+        return lambda: flash_attn_mxfp4_func(
+            q_fp4,
+            k_fp4,
+            v_arg,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            softmax_scale=softmax_scale,
+        )
+
     if args.kernel == "fav3_fp8":
         return make_fav3_fp8_runner(
             q_bshd,
@@ -1000,7 +1346,7 @@ def compute_accuracy_metrics(
 
 
 def fp8_max_diff_percentage(args: argparse.Namespace) -> float:
-    if args.input_distribution == "transformer":
+    if args.input_distribution in ("transformer", "sink"):
         return 2.0
     return 0.5
 
@@ -1010,8 +1356,17 @@ def check_output_against_reference(
     current: torch.Tensor,
     reference: torch.Tensor,
 ) -> None:
+    # Guard against NaN/Inf in the kernel output before any accuracy stats are
+    # computed (a non-finite output silently wrecks cosine/MAE and is the usual
+    # symptom of softmax tail overflow -- see the "latesink" input distribution).
+    n_nan = int(torch.isnan(current).sum().item())
+    n_inf = int(torch.isinf(current).sum().item())
+    if n_nan or n_inf:
+        print(f"[NAN-CHECK] FAIL kernel={args.kernel} nan={n_nan} inf={n_inf}")
+    else:
+        print(f"[NAN-CHECK] PASS kernel={args.kernel} (output finite)")
     compare_accuracy(current, reference)
-    if args.kernel in FP8_CHECK_KERNELS:
+    if args.kernel in QUANT_KERNELS:
         check_attention_outputs(
             current,
             reference,
@@ -1128,6 +1483,7 @@ def benchmark_single_case(
         "aiter_fp8",
         "aiter_i8fp8",
         "aiter_mxfp4",
+        "aiter_mxfp6",
         "sage_fp8",
         "sage_mxfp4",
     ):
@@ -1139,7 +1495,8 @@ def benchmark_single_case(
 
     v_elem_size = (
         1
-        if args.kernel in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8", "aiter_mxfp4")
+        if args.kernel
+        in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8", "aiter_mxfp4", "aiter_mxfp6")
         else v.element_size()
     )
     mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
@@ -1335,15 +1692,18 @@ def validate_args(args: argparse.Namespace) -> None:
         "aiter_fp8",
         "aiter_i8fp8",
         "aiter_mxfp4",
+        "aiter_mxfp6",
     )
 
     if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
 
-    if args.kernel not in ("sage_mxfp4", "all") and (
+    if args.kernel not in ("sage_mxfp4", "aiter_mxfp4", "aiter_mxfp6", "all") and (
         args.qsmooth or args.hadamard_rotate is False
     ):
-        logger.warning("MXFP4-specific flags are ignored unless --kernel=sage_mxfp4")
+        logger.warning(
+            "MXFP4/6-specific flags are ignored unless --kernel=sage/aiter_mxfp4/6"
+        )
 
 
 def run_benchmark_generated(
@@ -1662,6 +2022,7 @@ def parse_args() -> argparse.Namespace:
             "aiter_fp8",
             "aiter_i8fp8",
             "aiter_mxfp4",
+            "aiter_mxfp6",
             "aiter_bf16",
             "all",
         ],
@@ -1685,8 +2046,12 @@ def parse_args() -> argparse.Namespace:
         "--input-distribution",
         type=str,
         default="transformer",
-        choices=["normal", "transformer", "underflow", "latesink"],
-        help="Distribution used for generated Q/K/V tensors",
+        choices=["normal", "transformer", "sink", "underflow", "latesink"],
+        help=(
+            "Distribution used for generated Q/K/V tensors. 'sink' is a realistic "
+            "StreamingLLM attention sink pattern; 'underflow'/'latesink' are "
+            "adversarial fp8 tile-skip / frozen-max rollback regression tripwires."
+        ),
     )
     parser.add_argument(
         "--qk-clip",
@@ -1793,6 +2158,12 @@ def parse_args() -> argparse.Namespace:
         help="(MXFP4 only) Enable Q smoothing",
     )
 
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed torch RNG for reproducible Q/K/V generation (default: nondeterministic)",
+    )
     parser.add_argument(
         "--rep",
         type=int,
