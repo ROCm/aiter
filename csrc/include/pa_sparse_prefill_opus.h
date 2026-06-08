@@ -305,14 +305,19 @@ struct pa_prefill_16mx8_fp8_traits
     static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
 
-    // smem geometry from the KV storage dtype (fp8 => 1 byte).
-    static constexpr int D_128B_SIZE = 128 / sizeof(D_KV);  // 128 for fp8
+    // smem geometry mirrors the bf16 (D_ATTN) ELEMENT layout exactly: the fp8 KV
+    // tile is a 1-byte-per-element copy of the bf16 layout, so async_load(fp8) +
+    // u_rk read deliver the SAME (lane,e)->(n,d) the bf16 MFMA b-operand expects
+    // (the MFMA is bf16; fp8 is dequanted at the read, AFTER placement). Geometry
+    // is therefore derived from sizeof(D_ATTN); only smem_size_bytes uses D_KV.
+    static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);  // 64 (elements/chunk)
+    static_assert(VEC_KV == 16 / sizeof(D_ATTN), "VEC_KV must match bf16 layout");
     static_assert(VEC_KV * (int)sizeof(D_KV) <= 16, "KV load must be <= 16B");
-    static constexpr int smem_linear_wave   = WARP_SIZE * 16 / sizeof(D_KV);  // 1024
-    static constexpr int smem_n_per_wave    = smem_linear_wave / D_128B_SIZE; // 8
-    static constexpr int smem_n_rpt         = KV_TILE_SIZE / smem_n_per_wave; // 4
-    static constexpr int smem_d_rpt         = D_TILE_SIZE / D_128B_SIZE;      // 4
-    static constexpr int smem_padding_32B   = 32 / sizeof(D_KV);             // 32
+    static constexpr int smem_linear_wave   = WARP_SIZE * 16 / sizeof(D_ATTN); // 512
+    static constexpr int smem_n_per_wave    = smem_linear_wave / D_128B_SIZE;  // 8
+    static constexpr int smem_n_rpt         = KV_TILE_SIZE / smem_n_per_wave;  // 4
+    static constexpr int smem_d_rpt         = D_TILE_SIZE / D_128B_SIZE;       // 8
+    static constexpr int smem_padding_32B   = 32 / sizeof(D_ATTN);            // 16
     static constexpr int smem_kv_tile_elems =
         smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
 
