@@ -326,7 +326,7 @@ void mla_decode_stage1_asm_fwd(
             } else if((max_seqlen_q == 2) && persistent){
                 config_max_seqlen_q = 2;
                 sub_Q = 128;
-            } else if((max_seqlen_q == 1) && persistent){
+            } else if((max_seqlen_q == 1) && persistent && (batch >= 32)){
                 config_max_seqlen_q = 1;
                 sub_Q = 32;
             } else {
