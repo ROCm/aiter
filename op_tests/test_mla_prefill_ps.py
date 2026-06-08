@@ -231,12 +231,13 @@ def test_mla_prefill(
     block_size: int,
     varlen: bool = False,
     is_causal: bool = True,
+    qo_len: Optional[int] = None,
     load_metadata: Optional[bool] = False,
     dump_metadata: Optional[bool] = False,
     profile_ps: Optional[bool] = False,
     skip_reference: Optional[bool] = False,
 ):
-    ret = {}
+    ret = {"qo_len": qo_len if qo_len is not None else ctx_lens}
     out_dtype = torch.bfloat16
     device = "cuda:0"
     torch.set_default_device(device)
@@ -256,7 +257,16 @@ def test_mla_prefill(
             )
     else:
         seq_lens_kv.fill_(ctx_lens)
-    seq_lens_qo = seq_lens_kv.clone()
+    if qo_len is None:
+        seq_lens_qo = seq_lens_kv.clone()
+    else:
+        # Chunked-prefill regime: qo_len < kv_len, exercises non-causal context
+        # attention path where new queries attend to a longer cached context.
+        seq_lens_qo = torch.full((batch_size,), qo_len, dtype=torch.int)
+        assert (seq_lens_qo <= seq_lens_kv).all(), (
+            f"qo_len ({qo_len}) must be <= every seq_lens_kv "
+            f"(min={seq_lens_kv.min().item()})"
+        )
     max_qlen = seq_lens_qo.max().item()
 
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -685,6 +695,18 @@ parser.add_argument(
           --causal false  # [False]""",
 )
 parser.add_argument(
+    "--qo_len",
+    type=lambda v: None if v.lower() == "none" else int(v),
+    nargs="*",
+    default=[None],
+    help="""Query length per sequence (chunked-prefill regime).
+    When unset or "none", qo_len = kv_len (square Q x K, original behavior).
+    When set, exercises the non-causal context-attention path used by vLLM
+    chunked prefill, where new queries attend to a longer cached context.
+    e.g.: --qo_len 64
+          --qo_len none 8 64""",
+)
+parser.add_argument(
     "--load_metadata",
     action="store_true",
     help="""load metadata by metadata_map Default: False.
@@ -726,6 +748,7 @@ for (
     batch_size,
     block_size,
     varlen,
+    qo_len,
 ) in itertools.product(
     args.causal,
     args.num_heads,
@@ -735,7 +758,11 @@ for (
     args.batch_size,
     args.block_size,
     args.varlen,
+    args.qo_len,
 ):
+    if qo_len is not None and qo_len > ctx_len:
+        # Skip invalid combos in the sweep rather than asserting mid-run.
+        continue
     ret = test_mla_prefill(
         ctx_len,
         batch_size,
@@ -747,6 +774,7 @@ for (
         block_size,
         varlen,
         is_causal,
+        qo_len=qo_len,
         load_metadata=args.load_metadata,
         dump_metadata=args.dump_metadata,
         profile_ps=args.profile,
