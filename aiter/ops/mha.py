@@ -1310,7 +1310,9 @@ def _flash_attn_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
-        ret = alibi_slopes is None
+        # fmha v3 is hand-written gfx9 ASM; non-gfx9 must fall back to ck-tile.
+        ret = get_gfx() in ("gfx942", "gfx950")
+        ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (hdim_v == 128)
@@ -2096,7 +2098,10 @@ def _flash_attn_varlen_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
-        ret = alibi_slopes is None
+        # fmha v3 varlen is hand-written gfx9 ASM; non-gfx9 must fall back to
+        # ck-tile (mha_varlen_fwd, the else branch below).
+        ret = get_gfx() in ("gfx942", "gfx950")
+        ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (hdim_v == 128)
@@ -2689,6 +2694,33 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    # FlyDSL path — returns result if supported, None otherwise
+    from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
+
+    _flydsl_result = flydsl_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_lse=return_lse,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+        block_table=block_table,
+        out=out,
+        sink=sink_ptr,
+    )
+    if _flydsl_result is not None:
+        return _flydsl_result
+
     if not ENABLE_CK:
         from .triton.attention.mha import (
             flash_attn_varlen_func as flash_attn_varlen_func_triton,
