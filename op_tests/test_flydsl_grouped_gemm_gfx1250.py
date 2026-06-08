@@ -136,19 +136,20 @@ def _torch_moe_ref(
     def _per_1x32_fp8_dequant(x: torch.Tensor) -> torch.Tensor:
         """Mirror grouped a8w4's per-block-32 MXFP8 input quant, then dequant."""
         block = 32
-        dtype_max = 240.0
+        dtype_max = 448.0
         x_shape = x.shape
         flat = x.contiguous().view(-1, x_shape[-1]).float()
         blk = flat.view(-1, block)
         blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
         max_abs = blk.abs().amax(dim=1)
-        scale_e8m0 = fp4_utils.f32_to_e8m0(max_abs / dtype_max)
+        scale_e8m0 = fp4_utils.f32_to_mx_e8m0_scale(
+            max_abs, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
+        )
         scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0)
         scale_f32 = torch.nan_to_num(scale_f32, nan=1.0, posinf=1.0, neginf=1.0)
         scale_f32[scale_f32 == 0] = 1.0
         q_f32 = (blk / scale_f32.unsqueeze(1)).clamp(min=-dtype_max, max=dtype_max)
-        q_u8 = fp4_utils._f32_to_floatx_unpacked(q_f32.contiguous().view(-1), 4, 3)
-        q = q_u8.view(dtypes.fp8).to(torch.float32).view_as(blk)
+        q = q_f32.contiguous().to(dtypes.fp8).to(torch.float32).view_as(blk)
         return (q * scale_f32.unsqueeze(1)).view(x_shape).to(x.dtype)
 
     w1_scale = w1_scale_raw.cuda().view(dtypes.fp8_e8m0)
@@ -392,8 +393,9 @@ def _run_grouped_via_fused_moe(
     topk_w_dev = topk_w.cuda()
     topk_id_dev = topk_id.cuda()
     bias1_dev = bias1.float().cuda()
-    bias1_phys_dev = bias1_phys.float().cuda()
-    bias2_dev = bias2.float().cuda()
+    bias1_phys_dev = bias1_phys.float().cuda() if use_bias else None
+    bias2_dev = bias2.float().cuda() if use_bias else None
+    ref_bias2_dev = bias2.float().cuda()
 
     saved = os.environ.get("AITER_USE_GROUPED_GEMM")
     os.environ["AITER_USE_GROUPED_GEMM"] = "1"
@@ -433,7 +435,7 @@ def _run_grouped_via_fused_moe(
             bias1_dev,
             w2_logical,
             w2_scale_raw,
-            bias2_dev,
+            ref_bias2_dev,
             topk_w_dev,
             topk_id_dev,
             data_format=data_format,
@@ -475,8 +477,8 @@ def _prepare_grouped_moe_case(
         w2_logical = torch.full((experts, K, inter_pack), 0x22, dtype=torch.uint8)
         w1_scale_raw = _full_scale(experts, 2 * inter, K // SCALE_BLOCK)
         w2_scale_raw = _full_scale(experts, K, inter // SCALE_BLOCK)
-        bias1 = torch.zeros((experts, 2 * inter))
-        bias2 = torch.zeros((experts, K))
+        bias1 = torch.zeros((experts, 2 * inter), dtype=torch.bfloat16)
+        bias2 = torch.zeros((experts, K), dtype=torch.bfloat16)
         hidden = torch.ones((tokens, K), dtype=torch.bfloat16)
     else:
         w1_logical = _pattern_packed(experts, 2 * inter, K_pack, seed=seed + 17)
@@ -485,11 +487,13 @@ def _prepare_grouped_moe_case(
         w2_scale_raw = _full_scale(experts, K, inter // SCALE_BLOCK)
         if use_bias:
             bg = torch.Generator(device="cpu").manual_seed(seed + 91)
-            bias1 = (torch.randn((experts, 2 * inter), generator=bg) * 1e-3).float()
-            bias2 = (torch.randn((experts, K), generator=bg) * 1e-3).float()
+            bias1 = (torch.randn((experts, 2 * inter), generator=bg) * 1e-3).to(
+                torch.bfloat16
+            )
+            bias2 = (torch.randn((experts, K), generator=bg) * 1e-3).to(torch.bfloat16)
         else:
-            bias1 = torch.zeros((experts, 2 * inter))
-            bias2 = torch.zeros((experts, K))
+            bias1 = torch.zeros((experts, 2 * inter), dtype=torch.bfloat16)
+            bias2 = torch.zeros((experts, K), dtype=torch.bfloat16)
         hg = torch.Generator(device="cpu").manual_seed(seed + 123)
         hidden = (torch.randn((tokens, K), generator=hg) * 0.5).to(torch.bfloat16)
 
@@ -529,6 +533,11 @@ def _prepare_grouped_moe_case(
         w1_arg = w1_grouped
         w2_arg = w2_grouped
 
+    fused_bias1 = bias1_phys.cuda() if use_bias else None
+    fused_bias2 = bias2.cuda() if use_bias else None
+    ref_bias1 = bias1.float().cuda()
+    ref_bias2 = bias2.float().cuda()
+
     fused_case = {
         "hidden_states": hidden.cuda(),
         "w1": w1_arg,
@@ -538,8 +547,8 @@ def _prepare_grouped_moe_case(
         "activation": activation,
         "w1_scale": w1_scale,
         "w2_scale": w2_scale,
-        "bias1": bias1_phys.float().cuda(),
-        "bias2": bias2.float().cuda(),
+        "bias1": fused_bias1,
+        "bias2": fused_bias2,
         "gate_mode": gate_mode.value,
         "swiglu_limit": swiglu_limit,
         "hidden_pad": hidden_pad,
@@ -549,10 +558,10 @@ def _prepare_grouped_moe_case(
         "hidden": fused_case["hidden_states"],
         "w1_logical": w1_logical,
         "w1_scale_raw": w1_scale_raw,
-        "bias1": bias1.float().cuda(),
+        "bias1": ref_bias1,
         "w2_logical": w2_logical,
         "w2_scale_raw": w2_scale_raw,
-        "bias2": fused_case["bias2"],
+        "bias2": ref_bias2,
         "topk_weight": fused_case["topk_weight"],
         "topk_ids": fused_case["topk_ids"],
         "data_format": data_format,
