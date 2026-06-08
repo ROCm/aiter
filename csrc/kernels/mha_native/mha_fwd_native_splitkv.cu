@@ -62,6 +62,11 @@ std::vector<at::Tensor> mha_fwd_native_splitkv(
     at::Tensor o;
     if (out_opt.has_value() && out_opt->defined()) {
         o = out_opt.value();
+        TORCH_CHECK(o.scalar_type() == at::kBFloat16, "out must be bf16");
+        TORCH_CHECK(o.device() == q.device(), "out must be on the same device as q");
+        TORCH_CHECK(o.dim() == 4 && o.size(0) == B && o.size(1) == Sq &&
+                        o.size(2) == Hq && o.size(3) == D,
+                    "out must have shape (B, Sq, Hq, D)");
         TORCH_CHECK(o.stride(-1) == 1, "out last dim must be contiguous");
     } else {
         o = at::empty({B, Sq, Hq, D}, opts_bf16);
