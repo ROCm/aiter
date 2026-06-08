@@ -8001,8 +8001,19 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             }
             else
             {
+                // K/V interleaved per block -> index with the cache's real per-block stride (k_block_stride).
+                const int block_id        = static_cast<int>(slot_id / block_size);
+                const int block_offset    = static_cast<int>(slot_id % block_size);
+                const int64_t slot_size   = static_cast<int64_t>(num_heads_k) * HEAD_SIZE;
+                const int64_t block_stride = (k_block_stride != 0)
+                                                 ? k_block_stride
+                                                 : static_cast<int64_t>(block_size) * slot_size;
+
                 const int64_t offset =
-                    (slot_id * num_heads_k + head_id_k) * HEAD_SIZE + access_id_in_head;
+                    block_id * block_stride       // -> start of this block's K
+                    + block_offset * slot_size    // -> this token's slot in the block
+                    + head_id_k * HEAD_SIZE       // -> this KV head within the slot
+                    + access_id_in_head;          // -> this element within the head
                 out_kv_vec.store(k_cache + offset);
             }
             if(k_out != nullptr)
@@ -8037,8 +8048,19 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
         }
         else
         {
+            // Same scheme as the K path above, for the V cache.
+            const int block_id        = static_cast<int>(slot_id / block_size);
+            const int block_offset    = static_cast<int>(slot_id % block_size);
+            const int64_t slot_size   = static_cast<int64_t>(num_heads_v) * HEAD_SIZE;
+            const int64_t block_stride = (v_block_stride != 0)
+                                             ? v_block_stride
+                                             : static_cast<int64_t>(block_size) * slot_size;
+
             const int64_t offset =
-                (slot_id * num_heads_v + head_id_v) * HEAD_SIZE + access_id_in_head;
+                block_id * block_stride       // -> start of this block's V
+                + block_offset * slot_size    // -> this token's slot in the block
+                + head_id_v * HEAD_SIZE       // -> this KV head within the slot
+                + access_id_in_head;          // -> this element within the head
             out_kv_vec.store(v_cache + offset);
         }
         if(v_out != nullptr)
