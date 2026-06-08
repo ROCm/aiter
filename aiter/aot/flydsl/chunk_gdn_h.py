@@ -180,7 +180,6 @@ def _compile_executable_to_cache(exe, *args) -> None:
 def _compile_chunk_gdn_h_to_cache(
     *,
     dtype: str,
-    arch: str,
     K: int,
     V: int,
     BT: int,
@@ -322,12 +321,15 @@ def compile_one_config(
         "compile_arch": aot_arch,
     }
 
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
     t0 = time.time()
     try:
-        with override_env("ARCH", aot_arch), override_env("FLYDSL_GPU_ARCH", aot_arch):
+        with override_env("ARCH", aot_arch), override_env(
+            "FLYDSL_GPU_ARCH", aot_arch
+        ), FakeTensorMode():
             _compile_chunk_gdn_h_to_cache(
                 dtype=dtype,
-                arch=aot_arch,
                 K=K,
                 V=V,
                 BT=BT,
