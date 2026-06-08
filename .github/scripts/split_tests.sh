@@ -35,6 +35,8 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     TEST_DIR="op_tests"
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     TEST_DIR="op_tests/triton_tests"
+elif [[ "$TEST_TYPE" == "flydsl" ]]; then
+    TEST_DIR="op_tests/flydsl_tests"
 else
     echo "Unknown test type: $TEST_TYPE" >&2
     exit 1
@@ -52,6 +54,8 @@ TEST_DIR="${TEST_DIR%/}"
 if [[ "$TEST_TYPE" == "aiter" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f | LC_ALL=C sort)
 elif [[ "$TEST_TYPE" == "triton" ]]; then
+    mapfile -t ALL_FILES < <(find "$TEST_DIR" -name 'test_*.py' -type f | LC_ALL=C sort)
+elif [[ "$TEST_TYPE" == "flydsl" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -name 'test_*.py' -type f | LC_ALL=C sort)
 fi
 if [[ ${#ALL_FILES[@]} -eq 0 ]]; then
@@ -243,6 +247,13 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/test_kv_cache.py]=1
     FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_topk.py]=1
     FILE_TIMES[op_tests/triton_tests/triton_metadata_redirect/test_metadata_redirect.py]=1
+elif [[ "$TEST_TYPE" == "flydsl" ]]; then
+    echo "FlyDSL test files:"
+    # Correctness-only wall time (TestPerformance is excluded by the CI -k
+    # filter). Unknown files fall back to the 15s default in get_time().
+    FILE_TIMES[op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py]=120
+    FILE_TIMES[op_tests/flydsl_tests/test_flydsl_fmha.py]=60
+    FILE_TIMES[op_tests/flydsl_tests/test_silu_and_mul_fq.py]=30
 fi
 
 get_time() {
