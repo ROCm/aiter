@@ -99,6 +99,41 @@ def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, None, dtype)
 
 
+@perftest(num_iters=TEST_NUM_ITERS, num_rotate_args=1, use_cuda_event=True)
+def run_gemm_flydsl_gfx1250(
+    x,
+    weightshuffle,
+    x_scale,
+    w_scale,
+    out,
+    tile,
+    num_buffers,
+    split_k,
+    m_warp,
+    n_warp,
+    cluster,
+):
+    from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
+        run_preshuffle_gemm_a8_gfx1250,
+    )
+
+    run_preshuffle_gemm_a8_gfx1250(
+        x,
+        weightshuffle,
+        x_scale,
+        w_scale,
+        out,
+        *tile,
+        num_buffers=num_buffers,
+        split_k=split_k,
+        m_warp=m_warp,
+        n_warp=n_warp,
+        cluster_m=cluster[0],
+        cluster_n=cluster[1],
+    )
+    return out
+
+
 @perftest()
 def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
@@ -370,6 +405,115 @@ def test_normal_gemm_a8w8_pertoken_quant(
     return df
 
 
+@benchmark()
+def test_gemm_flydsl_feature(
+    dtype,
+    m,
+    n,
+    k,
+    tile_m=128,
+    tile_n=128,
+    tile_k=128,
+    num_buffers=4,
+    split_k=1,
+    m_warp=2,
+    n_warp=2,
+    cluster_m=1,
+    cluster_n=1,
+    variant="dense",
+):
+    """One gfx1250 FlyDSL feature case (ragged M, strided A/C, split-k, or
+    warp/cluster) via the WMMA backend."""
+    torch.manual_seed(0)
+    x = torch.randn((m, k), dtype=dtype, device="cuda") * 2.0
+    weight = torch.randn((n, k), dtype=dtype, device="cuda") * 2.0
+    x, x_scale = aiter.pertoken_quant(x, quant_dtype=dtypes.fp8)
+    weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=dtypes.fp8)
+    weightshuffle = shuffle_weight(weight, layout=(16, 16))
+    a, _ = run_torch(x, weight, x_scale, w_scale, None, dtype)
+
+    xin = x
+    if variant == "strided_a":
+        big = torch.empty(m, k + 64, dtype=x.dtype, device="cuda")
+        big[:, :k].copy_(x)
+        xin = big[:, :k]
+    if variant == "strided_c":
+        out = torch.full((m, n + 64), -1.0, dtype=dtype, device="cuda")[:, :n]
+    else:
+        out = torch.empty(m, n, dtype=dtype, device="cuda")
+
+    f, us = run_gemm_flydsl_gfx1250(
+        xin,
+        weightshuffle,
+        x_scale,
+        w_scale,
+        out,
+        (tile_m, tile_n, tile_k),
+        num_buffers,
+        split_k,
+        m_warp,
+        n_warp,
+        (cluster_m, cluster_n),
+    )
+
+    tol = 2e-2 if split_k > 1 else 1e-2
+    err = float(checkAllclose(a, f, rtol=tol, atol=tol, printLog=False))
+    bound = 0.10 if split_k > 1 else 0.05
+    return {
+        "us": round(us, 2),
+        "tflops": round(2 * m * n * k / us / 1e6, 1),
+        "err": round(err, 4),
+        "pass": bool(err <= bound),
+    }
+
+
+def test_gemm_flydsl_gfx1250_features(l_dtype):
+    """gfx1250 FlyDSL feature pass: cases the production dispatch can't reach
+    (ragged M, strided A/C, split-k, warp/cluster)."""
+    dt = l_dtype[0]
+    cases = [
+        dict(m=17, n=256, k=1024, num_buffers=2, variant="dense"),
+        dict(m=100, n=256, k=1024, num_buffers=2, split_k=2, variant="dense"),
+        dict(m=257, n=256, k=1024, num_buffers=2, split_k=4, variant="dense"),
+        dict(m=128, n=256, k=1024, num_buffers=2, variant="strided_a"),
+        dict(m=128, n=256, k=1024, num_buffers=2, split_k=2, variant="strided_c"),
+        dict(
+            m=1,
+            n=256,
+            k=512,
+            tile_m=16,
+            tile_n=32,
+            tile_k=256,
+            num_buffers=2,
+            m_warp=1,
+            n_warp=2,
+        ),
+        dict(
+            m=1,
+            n=256,
+            k=512,
+            tile_m=32,
+            tile_n=64,
+            tile_k=256,
+            num_buffers=2,
+            m_warp=2,
+            n_warp=4,
+        ),
+        dict(m=512, n=512, k=512, num_buffers=2, cluster_m=2, cluster_n=2),
+    ]
+    rows = []
+    for c in cases:
+        try:
+            rows.append(test_gemm_flydsl_feature(dt, **c))
+        except Exception as e:  # noqa: BLE001
+            rows.append({"dtype": dt, **c, "pass": False, "note": str(e)[:50]})
+    df = pd.DataFrame(rows)
+    aiter.logger.info(
+        "gfx1250 flydsl feature checks (markdown):\n%s", df.to_markdown(index=False)
+    )
+    return df
+
+
 def test_skinny_gemm_a8w8_pertoken_quant():
     # seed = 8779
     # torch.manual_seed(seed)
@@ -614,10 +758,16 @@ if not args.no_legacy:
             )
         )
 
-    df = test_normal_gemm_a8w8_pertoken_quant(
-        args.dtype, args.quantDtype, args.mnk, args.pad_a
-    )
-    test_skinny_gemm_a8w8_pertoken_quant()
+    if get_gfx() == "gfx1250":
+        df = test_normal_gemm_a8w8_pertoken_quant(
+            args.dtype, [dtypes.fp8], args.mnk, args.pad_a, skip_ck=True
+        )
+        test_gemm_flydsl_gfx1250_features(args.dtype)
+    else:
+        df = test_normal_gemm_a8w8_pertoken_quant(
+            args.dtype, args.quantDtype, args.mnk, args.pad_a
+        )
+        test_skinny_gemm_a8w8_pertoken_quant()
 
     if args.output and df is not None:
         os.makedirs(args.output, exist_ok=True)
