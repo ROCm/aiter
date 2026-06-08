@@ -136,6 +136,8 @@ def _gen_unified_attention_fwd_kernel_fake(
     max_seqlen_q_override: int = 0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    is_paged: bool = True,
+    kv_start_len: Optional[torch.Tensor] = None,
 ) -> None:
     return None
 
@@ -169,6 +171,8 @@ def _unified_attention_fwd_kernel(
     max_seqlen_q_override: int = 0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    is_paged: bool = True,
+    kv_start_len: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 
@@ -429,6 +433,13 @@ def unified_attention_fwd(
     # is_top_left=false)`
     window_size_left: int = -1,
     window_size_right: int = -1,
+    # Contiguous (THD) KV path. When is_paged=False, block_tables is ignored
+    # and K/V are read from packed [total_kv, num_kv_heads, head] tensors
+    # (passed as 4-D [total_kv, 1, num_kv_heads, head]); kv_start_len is the
+    # cu_seqlens of the KV cache ([num_seqs+1], int32). Split-KV is not wired
+    # for the contiguous path here — the caller drives single-launch.
+    is_paged: bool = True,
+    kv_start_len: Optional[torch.Tensor] = None,
 ) -> None:
     explicit_override = (
         num_splits > 1
@@ -462,6 +473,8 @@ def unified_attention_fwd(
             max_seqlen_q,
             window_size_left,
             window_size_right,
+            is_paged,
+            kv_start_len,
         )
         return
 
@@ -493,6 +506,8 @@ def unified_attention_fwd(
             max_seqlen_q,
             window_size_left,
             window_size_right,
+            is_paged,
+            kv_start_len,
         )
         return
 
@@ -533,5 +548,7 @@ def unified_attention_fwd(
         max_seqlen_q,
         window_size_left,
         window_size_right,
+        is_paged,
+        kv_start_len,
     )
     _combine_splits(output, o_acc, lse_acc)

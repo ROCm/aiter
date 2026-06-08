@@ -32,7 +32,7 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   # A trivial config drives the JIT build of the whole module.
   AITER_REBUILD=1 ${MAX_JOBS:+MAX_JOBS=$MAX_JOBS} python3 "$TEST" \
       -b 1 -sq 512 -sk 512 --num-heads 8,1 --head-size 128 --block-size 16 \
-      --dtype bf16 --num-blocks auto --no-triton --no-pagedkv --no-ck-fa --seed 42 \
+      --dtype bf16 --num-blocks auto --no-triton --seed 42 \
       >/tmp/ua_build_$$.log 2>&1
   if [[ ! -f "$SO" ]]; then
     echo "!!! BUILD FAILED: $SO not produced. Tail of log:"; tail -25 /tmp/ua_build_$$.log; exit 2
@@ -78,8 +78,8 @@ pass=0; fail=0
 for cfg in "${mat[@]}"; do
   set -- $cfg
   out=$(python3 "$TEST" -b $2 -sq $3 -sk $4 --num-heads $5 --head-size 128 \
-        --block-size $6 --dtype $1 --num-blocks auto --no-triton --no-pagedkv \
-        --no-ck-fa --seed 42 2>&1)
+        --block-size $6 --dtype $1 --num-blocks auto --no-triton \
+        --seed 42 2>&1)
   verdict=$(echo "$out" | grep -iE "CK +vs ref:" | tail -1 | grep -oiE "PASS|FAIL")
   delta=$(echo "$out" | grep -iE "max abs delta" | tail -1 | sed 's/\[aiter\] *//')
   printf "  %-26s %-5s %s\n" "$7" "${verdict:-ERR}" "$delta"

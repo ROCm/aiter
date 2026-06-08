@@ -39,4 +39,8 @@ void unified_attention_fwd(
     // Sliding-window attention bounds in vLLM/Flash-Attention semantics. A
     // value of -1 means "unbounded" on that side.
     int window_size_left  = -1,
-    int window_size_right = -1);
+    int window_size_right = -1,
+    // Contiguous (THD) KV path. is_paged=false ignores block_tables and reads
+    // packed K/V using kv_start_len (cu_seqlens of the KV cache, [num_seqs+1]).
+    bool is_paged                            = true,
+    std::optional<torch::Tensor> kv_start_len = std::nullopt);

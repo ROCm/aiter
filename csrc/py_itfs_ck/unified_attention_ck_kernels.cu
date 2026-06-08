@@ -44,7 +44,14 @@ void unified_attention_fwd(
     // The mapping into the kernel's (window_size_left, window_size_right,
     // is_top_left) triple lives below — see the "Mask + SWA plumbing" block.
     int window_size_left,
-    int window_size_right)
+    int window_size_right,
+    // Contiguous (THD) KV path. When is_paged is false the kernel ignores
+    // block_tables and reads K/V from a packed [total_kv, num_kv_heads, head]
+    // layout (passed as 4-D [total_kv, 1, num_kv_heads, head]); each sequence's
+    // KV start comes from kv_start_len (cu_seqlens of the KV cache,
+    // [num_seqs+1], int32) instead of the per-page indirection.
+    bool is_paged,
+    std::optional<torch::Tensor> kv_start_len)
 {
     auto dtype = query.dtype();
     // FP8 path: Q is FP8E4M3 (e4m3fn on gfx950 / e4m3fnuz on gfx942). The
@@ -153,6 +160,18 @@ void unified_attention_fwd(
     args.seq_lens_ptr       = seq_lens.data_ptr<int32_t>();
     args.query_start_len_ptr = query_start_len.data_ptr<int32_t>();
     args.num_seqs            = num_seqs;
+
+    // Contiguous (THD) KV: no block_tables; each sequence's KV start token comes
+    // from kv_start_len (cu_seqlens of the KV cache). Required when !is_paged.
+    args.is_paged = is_paged;
+    if (!is_paged) {
+        TORCH_CHECK(kv_start_len.has_value(),
+                    "unified_attention: is_paged=false requires kv_start_len "
+                    "(cu_seqlens_kv, [num_seqs+1], int32)");
+        TORCH_CHECK(kv_start_len->dtype() == torch::kInt32,
+                    "kv_start_len must be int32");
+        args.kv_start_len_ptr = kv_start_len->data_ptr<int32_t>();
+    }
 
     // Graph-capture-safe max_seqlen_q estimation (no GPU→CPU copy).
     //   - Caller-provided override (>0) wins — lets the wrapper pick a tighter
