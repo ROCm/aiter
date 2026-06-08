@@ -428,8 +428,8 @@ def _prepare_grouped_moe_case(
         w2_logical = torch.full((experts, K, inter_pack), 0x22, dtype=torch.uint8)
         w1_scale_raw = _full_scale(experts, 2 * inter, K // SCALE_BLOCK)
         w2_scale_raw = _full_scale(experts, K, inter // SCALE_BLOCK)
-        bias1 = torch.zeros((experts, 2 * inter))
-        bias2 = torch.zeros((experts, K))
+        bias1 = torch.zeros((experts, 2 * inter), dtype=torch.bfloat16)
+        bias2 = torch.zeros((experts, K), dtype=torch.bfloat16)
         hidden = torch.ones((tokens, K), dtype=torch.bfloat16)
     else:
         w1_logical = _pattern_packed(experts, 2 * inter, K_pack, seed=seed + 17)
@@ -438,11 +438,13 @@ def _prepare_grouped_moe_case(
         w2_scale_raw = _full_scale(experts, K, inter // SCALE_BLOCK)
         if use_bias:
             bg = torch.Generator(device="cpu").manual_seed(seed + 91)
-            bias1 = (torch.randn((experts, 2 * inter), generator=bg) * 1e-3).float()
-            bias2 = (torch.randn((experts, K), generator=bg) * 1e-3).float()
+            bias1 = (torch.randn((experts, 2 * inter), generator=bg) * 1e-3).to(
+                torch.bfloat16
+            )
+            bias2 = (torch.randn((experts, K), generator=bg) * 1e-3).to(torch.bfloat16)
         else:
-            bias1 = torch.zeros((experts, 2 * inter))
-            bias2 = torch.zeros((experts, K))
+            bias1 = torch.zeros((experts, 2 * inter), dtype=torch.bfloat16)
+            bias2 = torch.zeros((experts, K), dtype=torch.bfloat16)
         hg = torch.Generator(device="cpu").manual_seed(seed + 123)
         hidden = (torch.randn((tokens, K), generator=hg) * 0.5).to(torch.bfloat16)
 
@@ -472,8 +474,8 @@ def _prepare_grouped_moe_case(
         w1_arg = w1_grouped
         w2_arg = w2_grouped
 
-    fused_bias1 = bias1_phys.float().cuda() if use_bias else None
-    fused_bias2 = bias2.float().cuda() if use_bias else None
+    fused_bias1 = bias1_phys.cuda() if use_bias else None
+    fused_bias2 = bias2.cuda() if use_bias else None
     ref_bias1 = bias1.float().cuda()
     ref_bias2 = bias2.float().cuda()
 
