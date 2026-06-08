@@ -450,46 +450,29 @@ namespace aiter {
         static constexpr int rms_split_unroll = 4;
         float* gemm_out_sqrsum_ptr = gemm_out_sqrsum + m_idx;
         auto buffer_gemm_out_sqrsum = opus::make_gmem<float>(gemm_out_sqrsum_ptr, (m * n_splits - m_idx) * sizeof(float));
-        float rms_acc[num_rows] = {0.0f};
-        for(int split_base = threadIdx.x; split_base < n_splits; split_base += block_size * rms_split_unroll) {
-            #pragma unroll
-            for(int u = 0; u < rms_split_unroll; u++) {
-                const int split_idx = split_base + u * block_size;
-                rms_load_t v = load<num_rows>(buffer_gemm_out_sqrsum, split_idx * m);
-                #pragma unroll
-                for(int j = 0; j < num_rows; j++) {
-                    rms_acc[j] += v[j];
-                }
-            }
-        }
-        #pragma unroll
-        for(int j = 0; j < num_rows; j++) {
-            rms_acc[j] = wave_reduce<float, decltype(sum_f), warp_size, false>(rms_acc[j], sum_f);
-        }
-        if(lane_id == warp_size - 1) {
-            #pragma unroll
-            for(int j = 0; j < num_rows; j++) {
-                s_pre_rms_partial[warp_id + j * warp_num_pow2] = rms_acc[j];
-            }
-        }
-        __syncthreads();
-        float rms[num_rows];
-        constexpr int hc_mult3_reduce_warp_num = (warp_num_pow2 * num_rows + warp_size - 1) / warp_size;
-        if(warp_id < hc_mult3_reduce_warp_num) {
-            float sum = 0.0f;
-            if(lane_id < warp_num_pow2 * num_rows && lane_id % warp_num_pow2 < warp_num) {
-                sum = s_pre_rms_partial[lane_id];
-            }
-            sum = multithread_reduce(sum, sum_f, warp_num_pow2);
-            sum = rsqrtf(sum / (hidden_size * hc_mult) + rms_eps);
-            for(int j = 0; j < num_rows; j++) {
-                rms[j] = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, sum), j * warp_num_pow2));
-            }
-        }
-
-        // load gemm_out_mul and accumulate to s_hc_mult3
         float* gemm_out_mul_ptr = gemm_out_mul + m_idx * gemm_out_mul_stride;
         auto buffer_gemm_out_mul = opus::make_gmem<float>(gemm_out_mul_ptr, (n_splits * m - m_idx) * gemm_out_mul_stride * sizeof(float));
+        // Issue the sqrsum load(s) WITHOUT consuming them yet, so the gemm_out_mul
+        // loads below can be issued back-to-back and both HBM read streams are in
+        // flight together. Consuming here (rms_acc += v) would force an s_waitcnt
+        // before the gemm loads, serializing the two exposed latencies. Each thread
+        // loads at most one split in the common case (n_splits <= block_size); a tail
+        // accumulator covers the rare n_splits > block_size case.
+        float rms_acc[num_rows] = {0.0f};
+        rms_load_t v_sq;
+        #pragma unroll
+        for(int j = 0; j < num_rows; j++) { v_sq[j] = 0.0f; }
+        const bool has_sq0 = threadIdx.x < n_splits;
+        if(has_sq0) {
+            v_sq = load<num_rows>(buffer_gemm_out_sqrsum, threadIdx.x * m);
+        }
+        for(int split_idx = threadIdx.x + block_size; split_idx < n_splits; split_idx += block_size) {
+            rms_load_t vt = load<num_rows>(buffer_gemm_out_sqrsum, split_idx * m);
+            #pragma unroll
+            for(int j = 0; j < num_rows; j++) { rms_acc[j] += vt[j]; }
+        }
+        // gemm_out_mul load + accumulate (issued right after the sqrsum loads above so
+        // the two HBM read streams overlap; consumed before the rms reduce).
         if (threadIdx.x < reduce_active_threads) {
             int split_lane = threadIdx.x / hc_mult3_threads;
             int vec_group = threadIdx.x % hc_mult3_threads;
@@ -524,7 +507,39 @@ namespace aiter {
                     v_gemm_out_mul[j];
             }
         }
+        // consume the deferred sqrsum load now (its latency overlapped the gemm loads)
+        if(has_sq0) {
+            #pragma unroll
+            for(int j = 0; j < num_rows; j++) { rms_acc[j] += v_sq[j]; }
+        }
+        // rms reduce (sqrsum partials already in registers above)
+        #pragma unroll
+        for(int j = 0; j < num_rows; j++) {
+            rms_acc[j] = wave_reduce<float, decltype(sum_f), warp_size, false>(rms_acc[j], sum_f);
+        }
+        if(lane_id == warp_size - 1) {
+            #pragma unroll
+            for(int j = 0; j < num_rows; j++) {
+                s_pre_rms_partial[warp_id + j * warp_num_pow2] = rms_acc[j];
+            }
+        }
+        // Single barrier covers both the s_pre_rms_partial writes (rms) and the
+        // s_hc_mult3_partial writes (gemm_out_mul); both are consumed after it.
         __syncthreads();
+        float rms[num_rows];
+        constexpr int hc_mult3_reduce_warp_num = (warp_num_pow2 * num_rows + warp_size - 1) / warp_size;
+        if(warp_id < hc_mult3_reduce_warp_num) {
+            float sum = 0.0f;
+            if(lane_id < warp_num_pow2 * num_rows && lane_id % warp_num_pow2 < warp_num) {
+                sum = s_pre_rms_partial[lane_id];
+            }
+            sum = multithread_reduce(sum, sum_f, warp_num_pow2);
+            sum = rsqrtf(sum / (hidden_size * hc_mult) + rms_eps);
+            for(int j = 0; j < num_rows; j++) {
+                rms[j] = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, sum), j * warp_num_pow2));
+            }
+        }
+
         if (threadIdx.x < num_rows * hc_mult3) {
             int row_idx = threadIdx.x / hc_mult3;
             int hc_idx = threadIdx.x % hc_mult3;
@@ -626,7 +641,7 @@ namespace aiter {
         }
         else if (k_offset == 0 && sinkhorn_repeat > 0){
             // _pre_split_mixes_fwd (post & comb)
-            float post_mix_v;
+            float post_mix_v = 0.0f;
             if (lane_id < num_rows * hc_mult) {
                 post_mix_v = s_hc_mult3[lane_id / hc_mult * hc_mult3 + lane_id % hc_mult + hc_mult];
                 post_mix_v = sigmoid(post_mix_v * hc_scale[1] + hc_base[lane_id % hc_mult + hc_mult]) * hc_post_mult_value;
@@ -636,7 +651,7 @@ namespace aiter {
             }
 
             static_assert(num_rows * hc_mult2 <= warp_size, "num_rows * num_rows * hc_mult * hc_mult < warp_size");
-            float comb_mix_v;
+            float comb_mix_v = 0.0f;
             if (lane_id < num_rows * hc_mult2) {
                 comb_mix_v = s_hc_mult3[lane_id / hc_mult2 * hc_mult3 + lane_id % hc_mult2 + 2 * hc_mult];
                 comb_mix_v =comb_mix_v * hc_scale[2] + hc_base[lane_id % hc_mult2 + 2 * hc_mult];
@@ -653,9 +668,9 @@ namespace aiter {
 
             for(int i = 0; i < sinkhorn_repeat - 1; i++) {
                 row_sum = reduce_in_4threads(comb_mix_v, sum_f);
-                comb_mix_v = comb_mix_v / (row_sum + hc_sinkhorn_eps);
+                comb_mix_v = comb_mix_v * __builtin_amdgcn_rcpf(row_sum) + hc_sinkhorn_eps;
                 col_sum = reduce_cross_4threads(comb_mix_v, sum_f);
-                comb_mix_v = comb_mix_v / (col_sum + hc_sinkhorn_eps);
+                comb_mix_v = comb_mix_v * __builtin_amdgcn_rcpf(col_sum) + hc_sinkhorn_eps;
             }
 
             if (lane_id / hc_mult2 < m_oob) {
@@ -1154,48 +1169,32 @@ namespace aiter {
         static constexpr int rms_split_unroll = 4;
         float* gemm_out_sqrsum_ptr = gemm_out_sqrsum + m_idx;
         auto buffer_gemm_out_sqrsum = opus::make_gmem<float>(gemm_out_sqrsum_ptr, (m * n_splits - m_idx) * sizeof(float));
-        float rms_acc[num_rows] = {0.0f};
-        for(int split_base = threadIdx.x; split_base < n_splits; split_base += block_size * rms_split_unroll) {
-            #pragma unroll
-            for(int u = 0; u < rms_split_unroll; u++) {
-                const int split_idx = split_base + u * block_size;
-                if(split_idx < n_splits) {
-                    rms_load_t v = load<num_rows>(buffer_gemm_out_sqrsum, split_idx * m);
-                    #pragma unroll
-                    for(int j = 0; j < num_rows; j++) {
-                        rms_acc[j] += v[j];
-                    }
-                }
-            }
-        }
-        #pragma unroll
-        for(int j = 0; j < num_rows; j++) {
-            rms_acc[j] = wave_reduce<float, decltype(sum_f), warp_size, false>(rms_acc[j], sum_f);
-        }
-        if(lane_id == warp_size - 1) {
-            #pragma unroll
-            for(int j = 0; j < num_rows; j++) {
-                s_pre_rms_partial[warp_id + j * warp_num_pow2] = rms_acc[j];
-            }
-        }
-        __syncthreads();
-        float rms[num_rows];
-        constexpr int hc_mult3_reduce_warp_num = (warp_num_pow2 * num_rows + warp_size - 1) / warp_size;
-        if(warp_id < hc_mult3_reduce_warp_num) {
-            float sum = 0.0f;
-            if(lane_id < warp_num_pow2 * num_rows && lane_id % warp_num_pow2 < warp_num) {
-                sum = s_pre_rms_partial[lane_id];
-            }
-            sum = multithread_reduce(sum, sum_f, warp_num_pow2);
-            sum = rsqrtf(sum / (hidden_size * hc_mult) + rms_eps);
-            for(int j = 0; j < num_rows; j++) {
-                rms[j] = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, sum), j * warp_num_pow2));
-            }
-        }
-
-        // load gemm_out_mul and accumulate to s_hc_mult3
         float* gemm_out_mul_ptr = gemm_out_mul + m_idx * gemm_out_mul_stride;
         auto buffer_gemm_out_mul = opus::make_gmem<float>(gemm_out_mul_ptr, (n_splits * m - m_idx) * gemm_out_mul_stride * sizeof(float));
+        // Issue the sqrsum load(s) WITHOUT consuming them yet, so the gemm_out_mul
+        // loads below can be issued back-to-back and both HBM read streams are in
+        // flight together. Consuming here (rms_acc += v) would force an s_waitcnt
+        // before the gemm loads, serializing the two exposed latencies. Each thread
+        // loads at most one split in the common case (n_splits <= block_size); a tail
+        // accumulator covers the rare n_splits > block_size case.
+        float rms_acc[num_rows] = {0.0f};
+        rms_load_t v_sq;
+        #pragma unroll
+        for(int j = 0; j < num_rows; j++) { v_sq[j] = 0.0f; }
+        const bool has_sq0 = threadIdx.x < n_splits;
+        if(has_sq0) {
+            v_sq = load<num_rows>(buffer_gemm_out_sqrsum, threadIdx.x * m);
+        }
+        // tail: only iterates when n_splits > block_size (not the case for tuned
+        // configs here); these loads ARE consumed inline since they are off the
+        // critical path.
+        for(int split_idx = threadIdx.x + block_size; split_idx < n_splits; split_idx += block_size) {
+            rms_load_t vt = load<num_rows>(buffer_gemm_out_sqrsum, split_idx * m);
+            #pragma unroll
+            for(int j = 0; j < num_rows; j++) { rms_acc[j] += vt[j]; }
+        }
+        // gemm_out_mul load + accumulate (issued right after the sqrsum loads above so
+        // the two HBM read streams overlap; consumed before the rms reduce).
         if (threadIdx.x < reduce_active_threads) {
             int split_lane = threadIdx.x / hc_mult3_threads;
             int vec_group = threadIdx.x % hc_mult3_threads;
@@ -1230,16 +1229,54 @@ namespace aiter {
                     v_gemm_out_mul[j];
             }
         }
+        // consume the deferred sqrsum load now (its latency overlapped the gemm loads)
+        if(has_sq0) {
+            #pragma unroll
+            for(int j = 0; j < num_rows; j++) { rms_acc[j] += v_sq[j]; }
+        }
+        // rms reduce (sqrsum partials already in registers above)
+        #pragma unroll
+        for(int j = 0; j < num_rows; j++) {
+            rms_acc[j] = wave_reduce<float, decltype(sum_f), warp_size, false>(rms_acc[j], sum_f);
+        }
+        if(lane_id == warp_size - 1) {
+            #pragma unroll
+            for(int j = 0; j < num_rows; j++) {
+                s_pre_rms_partial[warp_id + j * warp_num_pow2] = rms_acc[j];
+            }
+        }
+        // Single barrier covers both the s_pre_rms_partial writes (rms) and the
+        // s_hc_mult3_partial writes (gemm_out_mul); both are consumed after it.
         __syncthreads();
+        float rms[num_rows];
+        constexpr int hc_mult3_reduce_warp_num = (warp_num_pow2 * num_rows + warp_size - 1) / warp_size;
+        if(warp_id < hc_mult3_reduce_warp_num) {
+            float sum = 0.0f;
+            if(lane_id < warp_num_pow2 * num_rows && lane_id % warp_num_pow2 < warp_num) {
+                sum = s_pre_rms_partial[lane_id];
+            }
+            sum = multithread_reduce(sum, sum_f, warp_num_pow2);
+            sum = rsqrtf(sum / (hidden_size * hc_mult) + rms_eps);
+            for(int j = 0; j < num_rows; j++) {
+                rms[j] = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, sum), j * warp_num_pow2));
+            }
+        }
+
         if (threadIdx.x < num_rows * hc_mult3) {
             int row_idx = threadIdx.x / hc_mult3;
             int hc_idx = threadIdx.x % hc_mult3;
-            float v_gemm_out_mul = 0.0f;
+            // Summing reduce_splits_per_round (~53) LDS values. Use several
+            // independent accumulators so the dependent fp-add chain is ~N/ACC deep
+            // instead of N, exposing ILP (the LDS loads are independent addresses).
+            constexpr int RED_ACC = 4;
+            float v_acc[RED_ACC] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const int red_base = row_idx * hc_mult3 + hc_idx;
             #pragma unroll
             for(int split_lane = 0; split_lane < reduce_splits_per_round; split_lane++) {
-                v_gemm_out_mul +=
-                    s_hc_mult3_partial[split_lane * num_rows * hc_mult3 + row_idx * hc_mult3 + hc_idx];
+                v_acc[split_lane % RED_ACC] +=
+                    s_hc_mult3_partial[split_lane * num_rows * hc_mult3 + red_base];
             }
+            float v_gemm_out_mul = (v_acc[0] + v_acc[1]) + (v_acc[2] + v_acc[3]);
             if (row_idx < m_oob) {
                 s_hc_mult3[threadIdx.x] = v_gemm_out_mul * rms[row_idx];
             } else {
@@ -1442,7 +1479,7 @@ namespace aiter {
         }
         else if (sinkhorn_repeat > 0){
             // _pre_split_mixes_fwd (post & comb)
-            float post_mix_v;
+            float post_mix_v = 0.0f;
             if (lane_id < num_rows * hc_mult) {
                 post_mix_v = s_hc_mult3[lane_id / hc_mult * hc_mult3 + lane_id % hc_mult + hc_mult];
                 post_mix_v = sigmoid(post_mix_v * hc_scale[1] + hc_base[lane_id % hc_mult + hc_mult]) * hc_post_mult_value;
@@ -1452,7 +1489,7 @@ namespace aiter {
             }
 
             static_assert(num_rows * hc_mult2 <= warp_size, "num_rows * num_rows * hc_mult * hc_mult < warp_size");
-            float comb_mix_v;
+            float comb_mix_v = 0.0f;
             if (lane_id < num_rows * hc_mult2) {
                 comb_mix_v = s_hc_mult3[lane_id / hc_mult2 * hc_mult3 + lane_id % hc_mult2 + 2 * hc_mult];
                 comb_mix_v =comb_mix_v * hc_scale[2] + hc_base[lane_id % hc_mult2 + 2 * hc_mult];
@@ -1469,9 +1506,9 @@ namespace aiter {
 
             for(int i = 0; i < sinkhorn_repeat - 1; i++) {
                 row_sum = reduce_in_4threads(comb_mix_v, sum_f);
-                comb_mix_v = comb_mix_v / (row_sum + hc_sinkhorn_eps);
+                comb_mix_v = comb_mix_v * __builtin_amdgcn_rcpf(row_sum) + hc_sinkhorn_eps;
                 col_sum = reduce_cross_4threads(comb_mix_v, sum_f);
-                comb_mix_v = comb_mix_v / (col_sum + hc_sinkhorn_eps);
+                comb_mix_v = comb_mix_v * __builtin_amdgcn_rcpf(col_sum) + hc_sinkhorn_eps;
             }
 
             if (lane_id / hc_mult2 < m_oob) {
@@ -1480,7 +1517,7 @@ namespace aiter {
         }
     }
 
-#define MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL_(block_size, hc_mult, num_rows, hidden_size, residual_block, norm_block, use_nt) \
+#define MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(block_size, hc_mult, num_rows, hidden_size, residual_block, norm_block, use_nt) \
     TORCH_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
     TORCH_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
     TORCH_CHECK(hidden_size % norm_block == 0, "hidden_size must be divisible by norm_block"); \
@@ -1518,22 +1555,39 @@ namespace aiter {
         ); \
     });
 
-#define MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(block_size, hc_mult, num_rows, hidden_size, residual_block, norm_block) \
-    if (m >= 8 * cu_num) { \
-        MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL_(block_size, hc_mult, num_rows, hidden_size, residual_block, norm_block, true); \
-    } else { \
-        MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL_(block_size, hc_mult, num_rows, hidden_size, residual_block, norm_block, false); \
-    }
-
 #define MHC_PRE_BIG_FUSE_RM_KERNEL_DISPATCH(m) \
     if (hidden_size == 7168) { \
-        MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 4), 4, 2, 7168, 512, 512); \
+        if (m < 4 * cu_num) { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 4), 4, 1, 7168, 1024, 1024, false); \
+        } else if (m <= 8 * cu_num) { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 4), 4, 2, 7168, 512, 512, false); \
+        } else { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 4), 4, 2, 7168, 512, 512, true); \
+        } \
     } else if (hidden_size == 4096) { \
-        MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 4), 4, 2, 4096, 512, 512); \
+        if (m < 4 * cu_num) { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 4), 4, 1, 4096, 1024, 1024, false); \
+        } else if (m <= 8 * cu_num) { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 4), 4, 2, 4096, 512, 512, false); \
+        } else { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 4), 4, 2, 4096, 512, 512, true); \
+        } \
     } else if (hidden_size == 2560) { \
-        MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 4), 4, 2, 2560, 256, 512); \
+        if (m < 4 * cu_num) { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 4), 4, 1, 2560, 512, 512, false); \
+        } else if (m <= 8 * cu_num) { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 4), 4, 2, 2560, 256, 512, false); \
+        } else { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 4), 4, 2, 2560, 256, 512, true); \
+        } \
     } else if (hidden_size == 1280) { \
-        MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 2), 4, 2, 1280, 256, 128); \
+        if (m < 4 * cu_num) { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 2), 4, 1, 1280, 256, 128, false); \
+        } else if (m <= 8 * cu_num) { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 2), 4, 2, 1280, 256, 128, false); \
+        } else { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 2), 4, 2, 1280, 256, 128, true); \
+        } \
     } else { \
         TORCH_CHECK(false, "hidden_size only supports 7168 and 4096"); \
     }
