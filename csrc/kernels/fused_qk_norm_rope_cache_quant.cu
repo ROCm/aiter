@@ -3651,7 +3651,8 @@ namespace aiter {
     // RoPE on the PE tail (bf16, written to a separate k_pe_out buffer).
     //
     // Caller responsibilities:
-    //   - One wave per token (64 lanes, vec_size = 8 for bf16/fp16 / 4 for fp32).
+    //   - One wave per token (WARP_SIZE lanes; vec_size = HEAD_DIM/WARP_SIZE). Caller must
+    //     launch tokens_per_block * WARP_SIZE threads (wave_id = threadIdx.x/WARP_SIZE).
     //   - cos_ptr/sin_ptr are pre-offset by positions[token_idx]*(pe_dim/2) so the
     //     helper does NOT touch the positions tensor. Both QK and K-only callers
     //     compute the offset once; the helper just uses the resulting pointers.
@@ -3678,10 +3679,16 @@ namespace aiter {
       constexpr int32_t head_size = HEAD_DIM;
       constexpr int32_t pe_dim    = PE_DIM;
       constexpr int32_t nope_dim  = head_size - pe_dim;
-      constexpr int32_t vec_size_i = std::is_same_v<scalar_t, float> ? 4 : 8;
+      // Elements/lane to cover one head in a single wave = HEAD_DIM/WARP_SIZE
+      // (wave64: 8; wave32: 16). WARP_SIZE is the device-resolved wavefront size; safe in
+      // this __device__ constexpr (using it in __launch_bounds__/template args would trip
+      // the host-pass ICE trap). fp32 is dead code; cap at 4 (no 32B opus float vector).
+      constexpr int32_t kWave = WARP_SIZE;
+      constexpr int32_t vec_size_i =
+          std::is_same_v<scalar_t, float> ? 4 : ((HEAD_DIM / 8 <= kWave) ? 8 : 16);
       constexpr int32_t vec_size_o = vec_size_i;
       constexpr uint32_t nope_vec  = nope_dim / vec_size_o;
-      constexpr uint32_t vec_stride = 64;
+      constexpr uint32_t vec_stride = kWave;
       constexpr int32_t nope_offset = 0;            // V4 layout: nope-first
       constexpr int32_t pe_tid_start = nope_vec;
       constexpr int32_t pe_tid_end   = pe_tid_start + (pe_dim / vec_size_i);
@@ -3694,35 +3701,27 @@ namespace aiter {
       // Disabled for fp32 (worse cache-line utilization). See aiter_opus_plus.h::GROUP_NT.
       constexpr int32_t IN_LOAD_AUX = (sizeof(scalar_t) < 4) ? GROUP_NT : 0;
 
-      // ---- Compile-time invariants ----
-      // Wave-level layout: each lane owns vec_size_i contiguous elements via
-      // tid*vec_size_i. Full-head coverage requires head_size/vec_size_i <= 64,
-      // i.e. head_dim<=512 for bf16/fp16 and head_dim<=256 for fp32. We do NOT
-      // static_assert this: the dispatch macro instantiates fp32 even when the
-      // host runtime never reaches it (dead-code), and a hard assert would
-      // break compile for those unused paths. The runtime dispatch table
-      // (KV_K_ONLY_DISPATCH_TABLE) is the source of truth for valid combos.
-      static_assert(head_size % vec_size_i == 0,
-                    "head_dim must be divisible by vec_size_i (8 for bf16/fp16, 4 for fp32)");
-      static_assert(pe_dim < head_size && pe_dim > 0, "pe_dim must be in (0, head_dim)");
-      static_assert(pe_dim % vec_size_i == 0,
-                    "pe_dim must be divisible by vec_size_i so a whole vec lives in one lane");
-      // NoPE side: group-quant requires the nope region to split evenly into groups,
-      // and the within-group DPP reduce is a power-of-2 lane butterfly:
-      static_assert(nope_dim % GROUP_SIZE == 0,
-                    "nope_dim (= head_dim - pe_dim) must be divisible by GROUP_SIZE");
-      static_assert(GROUP_SIZE % vec_size_i == 0,
-                    "GROUP_SIZE must be a multiple of vec_size_i so a full lane vec stays in one group");
+      // ---- Compile-time invariants on the dispatch-table template params (zero runtime
+      // cost; user-shape validation lives in the host entry). Each lane owns vec_size_i
+      // contiguous elems, one wave covers the head -> head_size/vec_size_i <= WARP_SIZE.
+      // No upper-bound assert: fp32 (head<=256) is dead-code-instantiated by the macro.
+      static_assert(head_size % vec_size_i == 0 && pe_dim % vec_size_i == 0
+                    && GROUP_SIZE % vec_size_i == 0,
+                    "head_dim / pe_dim / GROUP_SIZE must each be divisible by vec_size_i");
+      static_assert(pe_dim > 0 && pe_dim < head_size && nope_dim % GROUP_SIZE == 0,
+                    "need 0 < pe_dim < head_dim and (head_dim - pe_dim) % GROUP_SIZE == 0");
       static_assert(reduce_thread_size >= 1 && reduce_thread_size <= 64
                     && (reduce_thread_size & (reduce_thread_size - 1)) == 0,
-                    "GROUP_SIZE/vec_size_i must be a power of 2 in [1, 64]");
-      // NeoX rotation pairs lanes via __shfl_xor(half_pe_threads); requires
-      // pe_dim/vec_size_i >= 2 so we have at least one (x, y) pair.
+                    "GROUP_SIZE/vec_size_i (within-group DPP reduce width) must be a pow2 in [1,64]");
       static_assert(pe_dim / vec_size_i >= 2,
-                    "pe_dim/vec_size_i must be >= 2 for the NeoX __shfl_xor pairing to be well-defined");
+                    "pe_dim/vec_size_i must be >= 2 for the NeoX __shfl_xor pairing");
 
       using opus_vec_i = opus::vector_t<scalar_t, vec_size_i>;
       using opus_vec_o = opus::vector_t<cache_t, vec_size_o>;
+      // Raw opus buffer.load<N>/store<N> emit a single instruction (<=16B b128), so the
+      // wave32 16-wide vec (32B) has no overload. load_vector_nbytes/store_vector split
+      // into b128 chunks; pick the largest chunk dividing the per-lane byte count.
+      constexpr int32_t in_chunk_bytes = (vec_size_i * sizeof(scalar_t)) % 16 == 0 ? 16 : 8;
 
       // ---- Pointers / buffer descriptors (single KV head: per-head strides vanish) ----
       // int64 base offsets: token_idx * stride can exceed INT32_MAX for large prefill
@@ -3746,13 +3745,16 @@ namespace aiter {
       // mean(x^2) divisor is correct).
       const bool is_nope_thread = (tid < nope_vec);  // V4 nope-first
 
-      opus_vec_i vec_kv = buffer_kv.template load<vec_size_i, IN_LOAD_AUX>(tid * vec_size_i);
+      opus_vec_i vec_kv =
+          load_vector_nbytes<scalar_t, vec_size_i, in_chunk_bytes, IN_LOAD_AUX>(
+              buffer_kv, tid * vec_size_i);
       // Bounds-safe k_weight load: use buffer descriptor (OOB returns 0) so head_dim
       // < 64*vec_size_i works (e.g. head_dim=128/192/256/384) without raw-pointer OOB
       // faults on the trailing idle lanes. NT/SLC|GLC NOT applied here -- k_weight
       // has heavy temporal reuse across tokens so we want it to live in L1.
       auto buffer_kw = opus::make_gmem<scalar_t>(k_weight, head_size * sizeof(scalar_t));
-      opus_vec_i vec_k_weight = buffer_kw.template load<vec_size_i>(tid * vec_size_i);
+      opus_vec_i vec_k_weight =
+          load_vector_nbytes<scalar_t, vec_size_i, in_chunk_bytes>(buffer_kw, tid * vec_size_i);
 
       // ---- Prefetch cos/sin for the PE lanes BEFORE the RMSNorm reduce ----
       // The cos/sin gather (indexed by positions[token]) is a scattered global
@@ -3865,18 +3867,18 @@ namespace aiter {
           for (int i = 0; i < vec_size_i; i++) {
             vec_out[i] = opus::cast<cache_t>(k_normed[i] * inv_scale);
           }
-          buffer_o.template store<vec_size_o>(vec_out, nope_out_offset);
+          store_vector<cache_t, cache_t, vec_size_o>(buffer_o, vec_out, nope_out_offset);
         }
       } else {
         // bf16/fp16/fp32 cache: just store the normed value (no quant).
         if (is_nope_thread) {
           const uint32_t nope_out_offset = tid * vec_size_i;  // nope-first
-          opus_vec_i vec_out_k;
+          opus_vec_o vec_out_k;
           #pragma unroll
           for (int i = 0; i < vec_size_i; i++) {
-            vec_out_k[i] = static_cast<scalar_t>(k_normed[i]);
+            vec_out_k[i] = static_cast<cache_t>(k_normed[i]);
           }
-          buffer_o.template store<vec_size_o>(vec_out_k, nope_out_offset);
+          store_vector<cache_t, cache_t, vec_size_o>(buffer_o, vec_out_k, nope_out_offset);
         }
       }
 
@@ -3922,7 +3924,7 @@ namespace aiter {
               bool is_neox,
               // --- NEW (flydsl-alignment) compile-time options ---
               int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
-              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1>
+              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1, int WAVE = 64>
     __device__ void fuse_qk_norm_rope_group_quant_cache_kernel_impl(
         const scalar_t* __restrict__ q,       // [num_tokens, num_heads, head_dim]
         const scalar_t* __restrict__ kv,      // [num_tokens, (k_num_heads,) head_dim]
@@ -3943,7 +3945,12 @@ namespace aiter {
       constexpr int32_t head_size = HEAD_DIM;
       constexpr int32_t pe_dim = 64;
       constexpr int32_t nope_dim = head_size - pe_dim;
-      constexpr int32_t vec_size_i = std::is_same_v<scalar_t, float> ? 4 : 8;
+      // Elements/lane to cover one head with a single wave = HEAD_DIM/WAVE
+      // (wave64: 8 for head=512; wave32: 16). WAVE is a plain int template param
+      // (set by host dispatch), so this is constexpr-safe (no WarpSizeValue host-pass trap).
+      // fp32 is a dead-code instantiation; cap at 4 (no 32-byte opus float vector).
+      constexpr int32_t vec_size_i =
+          std::is_same_v<scalar_t, float> ? 4 : ((HEAD_DIM / 8 <= WAVE) ? 8 : 16);
       constexpr int32_t vec_size_o = vec_size_i;
       constexpr uint32_t nope_vec = nope_dim / vec_size_o;
       constexpr uint32_t vec_stride = 64;
@@ -4253,7 +4260,7 @@ namespace aiter {
     template <typename scalar_t, typename cache_t, typename query_t,
               vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt, bool is_neox,
               int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
-              int HEAD_DIM = 512>
+              int HEAD_DIM = 512, int WAVE = 64>
     __device__ void fuse_qk_norm_rope_finegrained_impl(
         const scalar_t* __restrict__ q,
         const scalar_t* __restrict__ kv,
@@ -4278,7 +4285,12 @@ namespace aiter {
       constexpr int32_t head_size = HEAD_DIM;
       constexpr int32_t pe_dim = 64;
       constexpr int32_t nope_dim = head_size - pe_dim;
-      constexpr int32_t vec_size_i = std::is_same_v<scalar_t, float> ? 4 : 8;
+      // Elements/lane to cover one head with a single wave = HEAD_DIM/WAVE
+      // (wave64: 8 for head=512; wave32: 16). WAVE is a plain int template param
+      // (set by host dispatch), so this is constexpr-safe (no WarpSizeValue host-pass trap).
+      // fp32 is a dead-code instantiation; cap at 4 (no 32-byte opus float vector).
+      constexpr int32_t vec_size_i =
+          std::is_same_v<scalar_t, float> ? 4 : ((HEAD_DIM / 8 <= WAVE) ? 8 : 16);
       constexpr int32_t vec_size_o = vec_size_i;
       constexpr uint32_t nope_vec = nope_dim / vec_size_o;
       constexpr int32_t nope_offset = 0;            // V4 layout: nope-first
@@ -4986,10 +4998,10 @@ __device__ void fuse_kv_norm_rope_group_quant_cache_kernel_impl(
       token_idx, tid);
 }
 
-// __global__ wrapper: dispatches the runtime is_neox flag to a compile-time
-// template parameter so the inner impl can use ``if constexpr`` branches. The
-// kernel deliberately mirrors fuse_qk_norm_rope_group_quant_cache_kernel's
-// launch-bound calculus (TOKENS_PER_BLOCK waves * 64 threads/wave).
+// __global__ wrapper: dispatches the runtime is_neox flag to a compile-time template arg.
+// __launch_bounds__ uses the literal wave64 width as the MAX block size; on wave32 the
+// host launches the smaller TOKENS_PER_BLOCK*32 block (still within [1, TPB*64]), so the
+// bound holds for both. Literal because WARP_SIZE is not an ICE in the host compile pass.
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt,
           int HEAD_DIM = 512, int PE_DIM = 64, int GROUP_SIZE = 64,
           int TOKENS_PER_BLOCK = 1>
@@ -5043,9 +5055,9 @@ void fuse_kv_norm_rope_group_quant_cache_kernel(
 namespace aiter {
 
 // Supported (head_dim, pe_dim, group_size) triples for the K-only kernel.
+// vec_size_i = HEAD_DIM/WARP_SIZE elements/lane (8 wave64, 16 wave32; 4 for fp32).
 // Constraints (enforced as static_asserts inside the K helper):
-//   - head_dim % vec_size_i == 0  (vec_size_i = 8 for bf16/fp16, 4 for fp32)
-//   - head_dim / vec_size_i <= 64 (one wave covers the full head)
+//   - head_dim % vec_size_i == 0  and  head_dim / vec_size_i <= WARP_SIZE
 //   - pe_dim < head_dim and pe_dim % vec_size_i == 0
 //   - (head_dim - pe_dim) % group_size == 0
 //   - group_size / vec_size_i is a power-of-2 in [1, 64]
@@ -5140,6 +5152,8 @@ void fused_kv_norm_rope_group_quant(
   // there is nothing to gain from a finer launch heuristic here.
   int num_CUs;
   hipDeviceGetAttribute(&num_CUs, hipDeviceAttributeMultiprocessorCount, kv.device_id);
+  // Device wavefront size (64 GFX9 / 32 else), queried at runtime for the block dim.
+  const int warp_size = static_cast<int>(get_warp_size_func());
   constexpr int PREFILL_TOKENS_PER_BLOCK = 4;
   constexpr int MIN_OVERSUBSCRIPTION     = 4;
   const int prefill_blocks =
@@ -5156,16 +5170,18 @@ void fused_kv_norm_rope_group_quant(
     constexpr int head_dim_val   = decltype(head_dim_tag)::value;
     constexpr int pe_dim_val     = decltype(pe_dim_tag)::value;
     constexpr int group_size_val = decltype(group_size_tag)::value;
+    // Block dim = tokens_per_block * (runtime) warp_size, matching the in-kernel
+    // wave_id = threadIdx.x / WARP_SIZE decomposition on both wave64 and wave32.
     if (use_decode_path) {
       constexpr int tokens_per_block_val = 1;
       dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val);
-      dim3 block(tokens_per_block_val * 64);
+      dim3 block(tokens_per_block_val * warp_size);
       DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(kv.dtype(), kv_cache_dtype,
                                               CALL_FUSED_KV_NORM_ROPE_GROUP_QUANT_CACHE);
     } else {
       constexpr int tokens_per_block_val = PREFILL_TOKENS_PER_BLOCK;
       dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val);
-      dim3 block(tokens_per_block_val * 64);
+      dim3 block(tokens_per_block_val * warp_size);
       DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(kv.dtype(), kv_cache_dtype,
                                               CALL_FUSED_KV_NORM_ROPE_GROUP_QUANT_CACHE);
     }
