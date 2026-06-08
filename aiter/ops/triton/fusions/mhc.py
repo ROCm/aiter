@@ -682,23 +682,11 @@ def mhc_post_pre(
 
     # --- Launch 1: fused post + partial pre GEMM/sqrsum, one CTA per (M-tile, C-tile).
     grid_split = (triton.cdiv(M, BLOCK_M), NUM_KSPLIT)
-    if _MHC_BACKEND_ENV == "triton":
-        _post_pre_kernel = triton_mhc_post_pre_split_kernel
-    elif _MHC_BACKEND_ENV == "gluon":
-        if gluon_mhc_post_pre_split_kernel is None:
-            raise RuntimeError(
-                "MHC_POST_PRE_BACKEND=gluon but gluon kernel is unavailable "
-                f"for arch {DEVICE_ARCH}"
-            )
+    if DEVICE_ARCH == "gfx1250":
         _post_pre_kernel = gluon_mhc_post_pre_split_kernel
     else:
-        _post_pre_kernel = (
-            gluon_mhc_post_pre_split_kernel
-            if (
-                DEVICE_ARCH == "gfx1250" and gluon_mhc_post_pre_split_kernel is not None
-            )
-            else triton_mhc_post_pre_split_kernel
-        )
+        _post_pre_kernel = triton_mhc_post_pre_split_kernel
+
     _post_pre_kernel[grid_split](
         layer_input,
         residual_in,
