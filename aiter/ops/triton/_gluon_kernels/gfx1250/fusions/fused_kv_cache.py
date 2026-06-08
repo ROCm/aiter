@@ -1548,6 +1548,9 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     SH_2D,
                 )
                 gl.amd.gfx1250.tdm.async_store(zeros_desc, [t_start, 0], zeros_smem)
+                gl.amd.gfx1250.tdm.async_wait(2)
+            else:
+                gl.amd.gfx1250.tdm.async_wait(1)
 
             # 2D rope on k.
             k_pe_in = k_smem.load(L_T_PE)

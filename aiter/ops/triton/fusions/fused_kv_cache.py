@@ -551,8 +551,8 @@ def fused_qk_rope_reshape_and_cache(
     # one path (BLOCK_T > 1). uint8/NVFP4 still falls back to the Triton
     # kernel (no NVFP4 support in the 2D gluon kernel yet).
     if DEVICE_ARCH == "gfx1250" and kv_cache_dtype != torch.uint8:
-        if t >= 256:
-            BLOCK_T = 8
+        if t >= 2048:
+            BLOCK_T = 32
             BLOCK_T_NUM_ITR = 1
         elif t >= 8:
             BLOCK_T = 8
