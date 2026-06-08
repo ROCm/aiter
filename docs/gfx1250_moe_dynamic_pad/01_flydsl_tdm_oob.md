@@ -1,7 +1,7 @@
 # 01 · flydsl TDM 2D 接通 runtime OOB(关键路径 / 阻塞项)
 
-status: not-started
-owner: (认领后署名)
+status: done
+owner: claude-agent
 
 > 这是整个动态 pad 方案的地基。在本任务确认 OOB 语义之前,`02`/`03` 的设计都是假设性的。
 

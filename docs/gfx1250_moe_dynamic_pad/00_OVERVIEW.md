@@ -79,7 +79,7 @@ Tensor / scale 形状按 padded dim 分配(已经是这样,不改)。
 
 ## 状态板(各 agent 更新)
 
-- [ ] 01 flydsl: 2D descriptor 接通 runtime tensor bound + OOB microbench 验证
+- [x] 01 flydsl: 2D descriptor 接通 runtime tensor bound + OOB microbench 验证
 - [ ] 02 kernel: 新增 runtime 标量 + 描述符传 remaining + K/N pad + grid
 - [ ] 03 wrapper/entry: 停止清零 pad,透传 valid dims 到 launch
 - [ ] 05 验证: 数值对拍(对照 CDNA / 无 pad 基线)+ 性能
