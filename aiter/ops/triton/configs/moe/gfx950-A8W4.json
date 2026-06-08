@@ -143,14 +143,6 @@
         "num_warps": 4,
         "waves_per_eu": 0
     },
-    "bm16_n2880_k360": {
-        "BLOCK_SIZE_K": 128,
-        "BLOCK_SIZE_N": 64,
-        "matrix_instr_nonkdim": 16,
-        "num_stages": 3,
-        "num_warps": 4,
-        "waves_per_eu": 0
-    },
     "bm16_n2880_k720": {
         "BLOCK_SIZE_K": 128,
         "BLOCK_SIZE_N": 64,
