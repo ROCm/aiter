@@ -13,10 +13,12 @@ from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
         _fused_qk_rope_cat_and_cache_mla_kernel as gluon_fused_qk_rope_cat_and_cache_mla_kernel,
+        _fused_qk_rope_cat_and_cache_mla_kernel_BLOCK as gluon_fused_qk_rope_cat_and_cache_mla_kernel_BLOCK,
         _fused_qk_rope_reshape_and_cache_kernel as gluon_fused_qk_rope_reshape_and_cache_kernel,
     )
 except:  # noqa: E722
     gluon_fused_qk_rope_cat_and_cache_mla_kernel = None
+    gluon_fused_qk_rope_cat_and_cache_mla_kernel_BLOCK = None
     gluon_fused_qk_rope_reshape_and_cache_kernel = None
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -256,13 +258,26 @@ def fused_qk_rope_cat_and_cache_mla(
     assert (
         kv_cache_stride_d == 1
     ), "The stride of the last dimension of KV cache must be 1"
-
-    n_pid = b * qh + (b_slot - b) * kh
-    grid = (n_pid, 1, 1)
+    
     if DEVICE_ARCH == "gfx1250":
-        _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
+        if b >= 8 and kv_cache_dtype != torch.uint8:
+            BLOCK_T = 1
+        else:
+            BLOCK_T = 1
+        
+        if BLOCK_T > 1:
+            n_pid = triton.cdiv(b, BLOCK_T) * qh + triton.cdiv(b_slot - b, BLOCK_T) * kh
+            _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel_BLOCK
+            _extra_args = {"BLOCK_T": BLOCK_T}
+        else:
+            n_pid = b * qh + (b_slot - b) * kh
+            _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
+            _extra_args = {}
     else:
+        n_pid = b * qh + (b_slot - b) * kh
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
+        _extra_args = {}
+    grid = (n_pid, 1, 1)
 
     _kernel[grid](
         q_nope,
@@ -281,6 +296,7 @@ def fused_qk_rope_cat_and_cache_mla(
         b,
         b_slot,
         num_decode_toks_for_zeros,
+        cos.shape[0],
         *q_nope.stride(),
         *q_pe.stride(),
         *k_nope.stride(),
@@ -312,6 +328,7 @@ def fused_qk_rope_cat_and_cache_mla(
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         UPCAST_OPERAND=upcast_operand,
         num_warps=1,
+        **_extra_args,
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
