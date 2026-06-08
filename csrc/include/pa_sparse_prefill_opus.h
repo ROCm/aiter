@@ -441,23 +441,14 @@ void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs)
     using namespace opus;
     using namespace pa_fp8_fused;
     using T = opus::remove_cvref_t<Traits>;
-    constexpr int QTILE = T::QTILE;
-    constexpr int KVTILE = T::KVTILE;
-    constexpr int DNOPE = T::DNOPE;
-    constexpr int DROPE = T::DROPE;
-    constexpr int DFULL = T::DFULL;
-    constexpr int KTSZ = T::KTSZ;
-    constexpr int NTILE = T::NTILE;
-    constexpr int NSUB = T::NSUB;
-    constexpr int MAXW = T::MAX_WARPS;
     constexpr float LOG2_E = 1.44269504089f;
 
     const int qtok = blockIdx.x;
     const int hblk = blockIdx.y;
     const int H    = kargs.H;
-    const int nwarp   = blockDim.x / 64;   // 1..MAXW independent head-tiles / block
+    const int nwarp   = blockDim.x / 64;   // 1..MAX_WARPS independent head-tiles / block
     const int warp_id = threadIdx.x / 64;
-    const int h0   = (hblk * nwarp + warp_id) * QTILE;  // exact: nwarp | (H/16)
+    const int h0   = (hblk * nwarp + warp_id) * T::QTILE;  // exact: nwarp | (H/16)
     const int lane = threadIdx.x % 64;     // 0..63 within warp
     const int ml   = lane % 16;            // A/B load row within tile
     const int kg   = lane / 16;            // 0..3 : K sub-block (8 wide)
@@ -468,27 +459,27 @@ void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs)
     const float*  q_scale = kargs.q_scale;
 
     // ---- smem (per-warp slices; sized for up to MAX_WARPS warps) ----
-    __shared__ float  sS_all[MAXW * QTILE * KVTILE];
-    __shared__ bf16_t sP_all[MAXW * QTILE * KVTILE];
-    __shared__ float  s_m_all[MAXW * QTILE];
-    __shared__ float  s_l_all[MAXW * QTILE];
-    __shared__ float  s_corr_all[MAXW * QTILE];
-    float*  sS     = sS_all + warp_id * (QTILE * KVTILE);
-    bf16_t* sP     = sP_all + warp_id * (QTILE * KVTILE);
-    float*  s_m    = s_m_all + warp_id * QTILE;
-    float*  s_l    = s_l_all + warp_id * QTILE;
-    float*  s_corr = s_corr_all + warp_id * QTILE;
+    __shared__ float  sS_all[T::MAX_WARPS * T::QTILE * T::KVTILE];
+    __shared__ bf16_t sP_all[T::MAX_WARPS * T::QTILE * T::KVTILE];
+    __shared__ float  s_m_all[T::MAX_WARPS * T::QTILE];
+    __shared__ float  s_l_all[T::MAX_WARPS * T::QTILE];
+    __shared__ float  s_corr_all[T::MAX_WARPS * T::QTILE];
+    float*  sS     = sS_all + warp_id * (T::QTILE * T::KVTILE);
+    bf16_t* sP     = sP_all + warp_id * (T::QTILE * T::KVTILE);
+    float*  s_m    = s_m_all + warp_id * T::QTILE;
+    float*  s_l    = s_l_all + warp_id * T::QTILE;
+    float*  s_corr = s_corr_all + warp_id * T::QTILE;
 
-    // ---- load Q for the 16-head tile (reused across all KV tiles) ----
+    // ---- load Q for the QTILE-head tile (reused across all KV tiles) ----
     // A-load row = head ml; per nope tile t, sub-chunk kk; q_rope likewise.
-    fp8x8_t  q8[NTILE][2];
+    fp8x8_t  q8[T::NTILE][2];
     bf16x8_t qr[2];
     const int q_head = h0 + ml;
-    const fp8_t*  qn_ptr = q_nope + (size_t)(qtok * H + q_head) * DNOPE;
-    const bf16_t* qr_ptr = q_rope + (size_t)(qtok * H + q_head) * DROPE;
-    for (int t = 0; t < NTILE; ++t)
+    const fp8_t*  qn_ptr = q_nope + (size_t)(qtok * H + q_head) * T::DNOPE;
+    const bf16_t* qr_ptr = q_rope + (size_t)(qtok * H + q_head) * T::DROPE;
+    for (int t = 0; t < T::NTILE; ++t)
         for (int kk = 0; kk < 2; ++kk) {
-            int kb = t * KTSZ + kk * 32 + kg * 8;
+            int kb = t * T::KTSZ + kk * 32 + kg * 8;
 #pragma unroll
             for (int j = 0; j < 8; ++j) q8[t][kk][j] = qn_ptr[kb + j];
         }
@@ -498,17 +489,17 @@ void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs)
         for (int j = 0; j < 8; ++j) qr[kk][j] = qr_ptr[kb + j];
     }
     // q_scale for the 4 OUTPUT heads this lane owns: (kg*4 + i), all NTILE tiles.
-    float qsc[4][NTILE];
+    float qsc[4][T::NTILE];
     for (int i = 0; i < 4; ++i)
-        for (int t = 0; t < NTILE; ++t)
-            qsc[i][t] = q_scale[(size_t)(qtok * H + (h0 + kg * 4 + i)) * NTILE + t];
+        for (int t = 0; t < T::NTILE; ++t)
+            qsc[i][t] = q_scale[(size_t)(qtok * H + (h0 + kg * 4 + i)) * T::NTILE + t];
 
     // ---- O accumulator (fp32) + online state ----
-    // v_o[dsub*4 + i] = O[head=kg*4+i][d = dsub*16 + ml]; 32 dsub * 4 = 128 / lane.
-    float v_o[DFULL / 16 * 4];
+    // v_o[dsub*4 + i] = O[head=kg*4+i][d = dsub*16 + ml]; (DFULL/16) dsub * 4 / lane.
+    float v_o[T::DFULL / 16 * 4];
 #pragma unroll
-    for (int e = 0; e < DFULL / 16 * 4; ++e) v_o[e] = 0.f;
-    if (lane < QTILE) { s_m[lane] = -1e30f; s_l[lane] = 0.f; }
+    for (int e = 0; e < T::DFULL / 16 * 4; ++e) v_o[e] = 0.f;
+    if (lane < T::QTILE) { s_m[lane] = -1e30f; s_l[lane] = 0.f; }
     __builtin_amdgcn_s_barrier();
 
     // ---- per-segment accumulate ----
@@ -517,25 +508,25 @@ void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs)
         const int beg = indptr[qtok];
         const int end = indptr[qtok + 1];
         const int vlen = end - beg;
-        const int ntiles = (vlen + KVTILE - 1) / KVTILE;
+        const int ntiles = (vlen + T::KVTILE - 1) / T::KVTILE;
 
         for (int tile = 0; tile < ntiles; ++tile) {
-            // ---- QK: produce sS[16,32] ----
-            for (int s = 0; s < NSUB; ++s) {
-                int col = s * 16 + ml;                 // KV column within tile
-                int pos = tile * KVTILE + s * 16 + ml; // position in segment
+            // ---- QK: produce sS[QTILE, KVTILE] ----
+            for (int s = 0; s < T::NSUB; ++s) {
+                int col = s * 16 + ml;                    // KV column within tile
+                int pos = tile * T::KVTILE + s * 16 + ml; // position in segment
                 int valid = (pos < vlen);
                 int row = valid ? indices[beg + pos] : 0;
-                const fp8_t*  kn = kn_base + (size_t)row * DNOPE;
-                const bf16_t* kr = kr_base + (size_t)row * DROPE;
-                const float*  ks = ksc_base + (size_t)row * NTILE;
+                const fp8_t*  kn = kn_base + (size_t)row * T::DNOPE;
+                const bf16_t* kr = kr_base + (size_t)row * T::DROPE;
+                const float*  ks = ksc_base + (size_t)row * T::NTILE;
 
                 float acc[4] = {0.f, 0.f, 0.f, 0.f};
                 // nope: fp8 MFMA per 64-tile + sw scale
-                for (int t = 0; t < NTILE; ++t) {
+                for (int t = 0; t < T::NTILE; ++t) {
                     fp32x4_t vc{0.f, 0.f, 0.f, 0.f};
                     for (int kk = 0; kk < 2; ++kk) {
-                        int kb = t * KTSZ + kk * 32 + kg * 8;
+                        int kb = t * T::KTSZ + kk * 32 + kg * 8;
                         fp8x8_t b_reg;
 #pragma unroll
                         for (int j = 0; j < 8; ++j) b_reg[j] = kn[kb + j];
@@ -561,26 +552,26 @@ void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs)
                 // store to sS: row = output head kg*4+i, col
 #pragma unroll
                 for (int i = 0; i < 4; ++i)
-                    sS[(kg * 4 + i) * KVTILE + col] = valid ? acc[i] : -1e30f;
+                    sS[(kg * 4 + i) * T::KVTILE + col] = valid ? acc[i] : -1e30f;
             }
             __builtin_amdgcn_s_barrier();
 
-            // ---- online softmax (lanes 0..15 own one head each) ----
-            if (lane < QTILE) {
+            // ---- online softmax (lanes 0..QTILE-1 own one head each) ----
+            if (lane < T::QTILE) {
                 int head = lane;
                 float mx = s_m[head];
 #pragma unroll
-                for (int c = 0; c < KVTILE; ++c) {
-                    float v = sS[head * KVTILE + c];
+                for (int c = 0; c < T::KVTILE; ++c) {
+                    float v = sS[head * T::KVTILE + c];
                     if (v > -1e29f) mx = max(mx, v * temp);
                 }
                 float corr = __builtin_amdgcn_exp2f(s_m[head] - mx);
                 float ltile = 0.f;
 #pragma unroll
-                for (int c = 0; c < KVTILE; ++c) {
-                    float v = sS[head * KVTILE + c];
+                for (int c = 0; c < T::KVTILE; ++c) {
+                    float v = sS[head * T::KVTILE + c];
                     float p = (v > -1e29f) ? __builtin_amdgcn_exp2f(v * temp - mx) : 0.f;
-                    sP[head * KVTILE + c] = (bf16_t)p;
+                    sP[head * T::KVTILE + c] = (bf16_t)p;
                     ltile += p;
                 }
                 s_l[head] = s_l[head] * corr + ltile;
@@ -593,22 +584,22 @@ void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs)
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 float corr = s_corr[kg * 4 + i];
-                for (int dsub = 0; dsub < DFULL / 16; ++dsub)
+                for (int dsub = 0; dsub < T::DFULL / 16; ++dsub)
                     v_o[dsub * 4 + i] *= corr;
             }
 
-            // ---- PV: O[16,512] += P[16,KVTILE] @ V[KVTILE,512], V dequant INLINE ----
+            // ---- PV: O += P[QTILE,KVTILE] @ V[KVTILE,DFULL], V dequant INLINE ----
             // (no LDS V staging: each V[n][d] is consumed by exactly one lane.)
             // KVTILE = KC * 32 contraction chunks; each lane's chunk c needs KV
             // rows n = c*32 + kg*8 + j (j=0..7).
-            constexpr int KC = KVTILE / 32;
+            constexpr int KC = T::KVTILE / 32;
             const unsigned char* kn_bytes = reinterpret_cast<const unsigned char*>(kn_base);
             int vrow[KC][8];
 #pragma unroll
             for (int c = 0; c < KC; ++c)
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    int pos = tile * KVTILE + c * 32 + kg * 8 + j;
+                    int pos = tile * T::KVTILE + c * 32 + kg * 8 + j;
                     vrow[c][j] = (pos < vlen) ? indices[beg + pos] : -1;
                 }
             bf16x8_t p_reg[KC];
@@ -616,9 +607,9 @@ void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs)
             for (int c = 0; c < KC; ++c)
 #pragma unroll
                 for (int j = 0; j < 8; ++j)
-                    p_reg[c][j] = sP[ml * KVTILE + c * 32 + kg * 8 + j];
+                    p_reg[c][j] = sP[ml * T::KVTILE + c * 32 + kg * 8 + j];
 
-            for (int dsub = 0; dsub < DFULL / 16; ++dsub) {
+            for (int dsub = 0; dsub < T::DFULL / 16; ++dsub) {
                 int d = dsub * 16 + ml;
                 fp32x4_t vc{0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -629,12 +620,12 @@ void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs)
                         int row = vrow[c][j];
                         float val = 0.f;
                         if (row >= 0) {
-                            if (d < DNOPE) {
+                            if (d < T::DNOPE) {
                                 float f = __builtin_amdgcn_cvt_f32_fp8(
-                                    (int)kn_bytes[(size_t)row * DNOPE + d], 0);
-                                val = f * ksc_base[(size_t)row * NTILE + (d / KTSZ)];
+                                    (int)kn_bytes[(size_t)row * T::DNOPE + d], 0);
+                                val = f * ksc_base[(size_t)row * T::NTILE + (d / T::KTSZ)];
                             } else {
-                                val = (float)kr_base[(size_t)row * DROPE + (d - DNOPE)];
+                                val = (float)kr_base[(size_t)row * T::DROPE + (d - T::DNOPE)];
                             }
                         }
                         v_reg[j] = (bf16_t)val;
@@ -666,9 +657,9 @@ void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs)
         float alpha = __builtin_amdgcn_exp2f(s_m[head] - m_final);
         float l_final = s_l[head] * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);
         float o_scale = (l_final > 0.f) ? (alpha / l_final) : 0.f;
-        for (int dsub = 0; dsub < DFULL / 16; ++dsub) {
+        for (int dsub = 0; dsub < T::DFULL / 16; ++dsub) {
             float o = v_o[dsub * 4 + i] * o_scale;
-            out[((size_t)(qtok * H + (h0 + head)) * DFULL) + dsub * 16 + ml] = (bf16_t)o;
+            out[((size_t)(qtok * H + (h0 + head)) * T::DFULL) + dsub * 16 + ml] = (bf16_t)o;
         }
     }
 }
