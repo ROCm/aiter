@@ -1,46 +1,58 @@
-"""DeepGEMM-style clean FP8 einsum for gfx950 — v2 pipeline (preshuffle-style).
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-Reference shape: H=8 D=8192 R=8192 B=2048, tm=128 tn=128 tk=256, bsw=4,
-sx+sy in LDS, B in regs via pingpong → ~1896 TF peak.
+"""Clean, submission-ready FP8 blockscaled batched einsum for gfx950 / MI355X.
+
+Computes  Z[b,h,d] = sum_r X[b,h,r] * Y[h,d,r]   (einsum 'bhr,hdr->bhd')
+in FP8 e4m3 with DeepGEMM-style packed-UE8M0 per-128-K block scales.
+
+This is the "reg-B" path: the proven-correct and peak-performant pipeline.
+  - A (X tile)  : gmem -> LDS via raw_ptr_buffer_load_lds (compiler intrinsic,
+                  no register transit; swizzle-the-source for bank-conflict-free
+                  ds_read). Double-buffered ping/pong across K-tiles.
+  - B (Y tile)  : gmem -> registers via load_b_tile (carried across iters).
+  - sx (X scale): staged once per WG to a small LDS slab, then read per K-tile.
+  - sy (Y scale): gmem -> registers per K-tile (tiny; packed UE8M0).
+  - Scale fed DIRECTLY to the MFMA (packed UE8M0 via the opsel byte index).
+  - Workgroup barrier sits AFTER compute_tile (WAR protection on the ping/pong
+    A LDS slab — the next K-tile's DMA must not overwrite a slab still being
+    read by a slower wave).
+
+Supports: bf16 output (default) and in-kernel D-128 group fp8 quant output
+(quant_output=True), each with optional split-K accumulation (split_k>1).
 
 Public entry points (all in this module):
   compile_fp8_einsum_clean_ue8m0(*, H, D, R, tile_m, tile_n, tile_k,
                                  block_swizzle_n=0, quant_output=False,
-                                 quant_transpose_scale=False)
+                                 quant_transpose_scale=False, split_k=1)
       Underlying factory. Returns a launcher for either bf16 output (default)
-      or in-kernel D-128 group fp8 quant output (quant_output=True).
+      or in-kernel D-128 group fp8 quant output (quant_output=True). split_k>1
+      returns a host wrapper that accumulates fp32 partials then casts to bf16.
 
   compile_fp8_einsum_clean_ue8m0_qz(*, H, D, R, ..., transpose_scale=False)
-      Convenience wrapper — calls the underlying factory with
-      quant_output=True. The qz launcher signature adds `arg_sz`
-      (fp32 D-128 group scale) between `arg_z` and `arg_x`.
+      Convenience wrapper — quant_output=True. The qz launcher signature adds
+      `arg_sz` (fp32 D-128 group scale) between `arg_z` and `arg_x`.
+
+  compile_fp8_einsum_clean_ue8m0_qz_splitk(*, H, D, R, ..., split_k)
+      qz + split-K convenience wrapper.
 
   compile_fp8_einsum_clean_ue8m0_auto(*, H, D, R, B=None, ...)
   compile_fp8_einsum_clean_ue8m0_qz_auto(*, H, D, R, B=None, ...)
-      Autotune-dispatched: looks up the best (tile_m, tile_n, tile_k, bsw)
-      from the per-shape table at the top of this file and forwards to the
-      underlying factory. Use these by default unless you need to override
-      the tile.
+      Autotune-dispatched: looks up the best
+      (tile_m, tile_n, tile_k, bsw, split_k) from the per-shape table at the top
+      of this file and forwards to the underlying factory. Use these by default
+      unless you need to override the tile.
 
-The experimental ni-rotated variant lives in fp8_einsum_clean.py as
-`compile_fp8_einsum_clean_ue8m0_ni_rotated` (not used by autotune dispatch).
+  fp8_einsum(x, y, sx, sy, *, out_dtype=..., ...)
+      User-facing entry: validates, compiles+caches, allocates output, launches.
 
 ABI (DeepGEMM SM100 packed-UE8M0):
-  arg_z : bf16 (B, H, D)
+  arg_z : bf16 (B, H, D)                  (qz: fp8 e4m3 (B, H, D) + arg_sz)
   arg_x : fp8 e4m3 (B, H, R)             — caller pre-quantizes
   arg_y : fp8 e4m3 preshuffled per head, layout (n0, k0, klane=4, nlane=16, kpack=16)
   arg_sx: int32 (B, H, R // 512)         — 4 packed UE8M0 bytes per i32 along K
   arg_sy: int32 (H, D // 128, R // 512)  — same packing along K
   i32_b : runtime batch size
-
-V2 pipeline (preshuffle-style async pingpong, scale-in-MFMA):
-  - async-A: raw_ptr_buffer_load_lds with swizzle-the-source (no reg transit)
-  - B, sx_i32, sy_i32 all carried in registers across iters
-  - Scale fed DIRECTLY to MFMA (packed UE8M0 via opsel byte index)
-  - a0_prefetch: first A pack of NEXT tile pre-loaded from LDS to regs before
-    next-iter MFMA fires (hides 1 ds_read from the inner-loop critical path)
-  - Unrolled pingpong: each loop iter handles 2 K-tiles
-  - Single waitcnt per half: vmcnt(N_b+N_sx+N_sy)+lgkmcnt(0) AFTER compute_tile
 """
 
 import torch
@@ -74,158 +86,154 @@ from .mfma_preshuffle_pipeline import (
 # Regenerate by running the autotune scripts above and pasting winners here.
 # These tiles have been validated for correctness + were time-best on
 _AUTOTUNE_WINNERS_BF16 = {
-    # (H,  D,    R,    B    ) -> (tm, tn, tk, bsw)
-    # ─────────────────────────────────────────────────────────────────────
-    # V4-Pro wo_a grouped LoRA: (H=G=n_local_groups, D=o_lora_rank=1024,
-    # R=d_per_group=4096). G = 16 / tp_size, so H sweeps {2, 4, 8, 16}
-    # covers TP=8, 4, 2, 1 respectively. Tuned 2026-05-27 on MI355X.
-    # ─────────────────────────────────────────────────────────────────────
-    # H=16 D=1024 R=4096 dynamic-B sweep  (TP=1)
-    (16, 1024, 4096, 1): (32, 128, 256, 2),
-    (16, 1024, 4096, 2): (32, 128, 256, 8),
-    (16, 1024, 4096, 4): (32, 128, 256, 0),
-    (16, 1024, 4096, 8): (32, 128, 256, 2),
-    (16, 1024, 4096, 16): (32, 128, 256, 0),
-    (16, 1024, 4096, 32): (32, 128, 256, 8),
-    (16, 1024, 4096, 64): (64, 128, 256, 0),
-    (16, 1024, 4096, 128): (64, 128, 256, 0),
-    (16, 1024, 4096, 256): (128, 128, 256, 0),
-    (16, 1024, 4096, 512): (64, 256, 128, 2),
-    (16, 1024, 4096, 1024): (64, 256, 128, 4),
-    (16, 1024, 4096, 4096): (128, 128, 128, 8),
-    (16, 1024, 4096, 8192): (128, 128, 128, 4),
-    (16, 1024, 4096, 16384): (128, 128, 128, 4),
-    (16, 1024, 4096, 32768): (128, 128, 128, 4),
-    # H=8 D=1024 R=4096  (TP=2)
-    (8, 1024, 4096, 1): (32, 128, 256, 8),       # 5 TF
-    (8, 1024, 4096, 2): (32, 128, 256, 0),       # 10 TF
-    (8, 1024, 4096, 4): (32, 128, 256, 0),       # 19 TF
-    (8, 1024, 4096, 8): (64, 128, 512, 4),       # 38 TF
-    (8, 1024, 4096, 16): (64, 128, 256, 4),      # 76 TF
-    (8, 1024, 4096, 32): (64, 128, 512, 0),      # 153 TF
-    (8, 1024, 4096, 64): (32, 128, 512, 0),      # 303 TF
-    (8, 1024, 4096, 128): (64, 128, 512, 8),     # 581 TF
-    (8, 1024, 4096, 256): (64, 128, 512, 2),     # 940 TF
-    (8, 1024, 4096, 512): (64, 256, 128, 2),     # 1336 TF
-    (8, 1024, 4096, 1024): (128, 128, 256, 4),   # 1807 TF
-    (8, 1024, 4096, 4096): (128, 128, 128, 8),   # 1795 TF
-    (8, 1024, 4096, 8192): (128, 128, 128, 4),   # 1683 TF
-    (8, 1024, 4096, 16384): (128, 128, 128, 8),  # 1806 TF
-    # H=4 D=1024 R=4096  (TP=4)
-    (4, 1024, 4096, 1): (32, 128, 128, 2),       # 2 TF
-    (4, 1024, 4096, 2): (32, 128, 256, 8),       # 5 TF
-    (4, 1024, 4096, 4): (32, 128, 128, 2),       # 9 TF
-    (4, 1024, 4096, 8): (32, 128, 256, 8),       # 19 TF
-    (4, 1024, 4096, 16): (32, 128, 512, 0),      # 38 TF
-    (4, 1024, 4096, 32): (32, 128, 128, 2),      # 76 TF
-    (4, 1024, 4096, 64): (32, 128, 256, 4),      # 153 TF
-    (4, 1024, 4096, 128): (64, 128, 256, 0),     # 304 TF
-    (4, 1024, 4096, 256): (32, 128, 512, 4),     # 609 TF
-    (4, 1024, 4096, 512): (64, 128, 512, 4),     # 1036 TF
-    (4, 1024, 4096, 1024): (64, 128, 256, 4),    # 1417 TF
-    (4, 1024, 4096, 4096): (64, 256, 128, 2),    # 1759 TF
-    (4, 1024, 4096, 8192): (128, 128, 128, 4),   # 1815 TF
-    (4, 1024, 4096, 16384): (128, 128, 128, 4),  # 1681 TF
-    # H=2 D=1024 R=4096  (TP=8). Re-tuned 2026-05-28 with a wider grid
-    # (tile_m ∈ {16, 32, 64, 128}, tile_k ∈ {128, 256, 512}, bsw ∈ {0, 2, 4, 8}).
-    # Small-B values (B ≤ ~128) are LAUNCH-BOUND on this shape (kernel launch
-    # floor ≈ 13-14 μs > compute time), so tile choice barely moves the needle
-    # there — the listed config is the marginal winner within bench noise.
-    # The real wins are at B ≥ 1024 where compute dominates.
-    (2, 1024, 4096, 1): (64, 128, 512, 8),       # 1 TF (launch-bound)
-    (2, 1024, 4096, 2): (32, 128, 128, 2),       # 2 TF
-    (2, 1024, 4096, 4): (64, 128, 128, 2),       # 5 TF
-    (2, 1024, 4096, 8): (64, 128, 256, 8),       # 9 TF
-    (2, 1024, 4096, 16): (32, 128, 256, 0),      # 18 TF
-    (2, 1024, 4096, 32): (32, 128, 256, 8),      # 36 TF
-    (2, 1024, 4096, 64): (32, 128, 128, 2),      # 72 TF
-    (2, 1024, 4096, 128): (32, 128, 128, 2),     # 141 TF
-    (2, 1024, 4096, 256): (64, 128, 512, 0),     # 285 TF
-    (2, 1024, 4096, 512): (32, 128, 512, 2),     # 576 TF
-    (2, 1024, 4096, 1024): (64, 128, 256, 4),    # 1038 TF
-    (2, 1024, 4096, 4096): (128, 128, 256, 0),   # 1857 TF (was 1832 TF)
-    (2, 1024, 4096, 8192): (128, 128, 256, 8),   # 1815 TF (was 1823 TF; tile changed)
-    (2, 1024, 4096, 16384): (128, 128, 256, 8),  # 2036 TF (was 1771 TF; +15%)
-    # H=8 D=R=8192 peak shapes (not a V4 shape; DSV3 prefill)
-    (8, 8192, 8192, 128): (128, 128, 256, 0),
-    (8, 8192, 8192, 512): (128, 256, 128, 0),
-    (8, 8192, 8192, 2048): (128, 128, 256, 2),
+    # (H,  D,    R,    B    ) -> (tm, tn, tk, bsw, split_k)
+    # Retuned 2026-06-08 by rocprof COLD-CACHE kernel time (autotune_ready.py
+    # --cold: 512MB cache flush between reps, median duration). Cold-cache
+    # reflects real workloads where other kernels evict the inputs from L2.
+    # NOTE: supersedes a 2026-06-07 table whose small-B split_k>=2 winners
+    # (e.g. H2 B64 sk4@6.48us) were NOT reproducible under a fresh cold measure
+    # — they re-measure ~12-16us and split_k=1 actually wins at small B. The
+    # stale numbers had skewed the qz1/qz2 crossover (it borrows these configs
+    # for the qz2 GEMM). split_k>1 now wins only at a few tiny B.
+    # H=16 D=1024 R=4096 (TP=1)
+    (16, 1024, 4096, 1): (32, 64, 256, 0, 1),
+    (16, 1024, 4096, 2): (32, 64, 256, 0, 1),
+    (16, 1024, 4096, 4): (32, 64, 256, 0, 1),
+    (16, 1024, 4096, 8): (32, 64, 256, 0, 1),
+    (16, 1024, 4096, 16): (32, 64, 256, 0, 1),
+    (16, 1024, 4096, 32): (32, 64, 256, 0, 1),
+    (16, 1024, 4096, 64): (32, 64, 256, 4, 1),
+    (16, 1024, 4096, 128): (64, 64, 256, 4, 1),
+    (16, 1024, 4096, 256): (128, 64, 256, 4, 1),
+    (16, 1024, 4096, 512): (128, 128, 256, 4, 1),
+    (16, 1024, 4096, 1024): (128, 128, 128, 4, 1),
+    (16, 1024, 4096, 4096): (128, 128, 256, 4, 1),
+    (16, 1024, 4096, 8192): (128, 128, 256, 4, 1),
+    (16, 1024, 4096, 16384): (128, 128, 256, 4, 1),
+    (16, 1024, 4096, 32768): (128, 128, 256, 4, 1),
+    # H=8 D=1024 R=4096 (TP=2)
+    (8, 1024, 4096, 1): (32, 64, 256, 0, 1),
+    (8, 1024, 4096, 2): (32, 64, 512, 0, 1),
+    (8, 1024, 4096, 4): (32, 64, 512, 0, 1),
+    (8, 1024, 4096, 8): (32, 64, 256, 4, 1),
+    (8, 1024, 4096, 16): (32, 64, 256, 4, 1),
+    (8, 1024, 4096, 32): (32, 64, 256, 4, 1),
+    (8, 1024, 4096, 64): (32, 64, 256, 4, 1),
+    (8, 1024, 4096, 128): (64, 64, 256, 4, 1),
+    (8, 1024, 4096, 256): (64, 64, 256, 4, 1),
+    (8, 1024, 4096, 512): (128, 64, 256, 4, 1),
+    (8, 1024, 4096, 1024): (128, 128, 128, 4, 1),
+    (8, 1024, 4096, 4096): (128, 128, 256, 4, 1),
+    (8, 1024, 4096, 8192): (128, 128, 256, 4, 1),
+    (8, 1024, 4096, 16384): (128, 128, 256, 4, 1),
+    # H=4 D=1024 R=4096 (TP=4)
+    (4, 1024, 4096, 1): (32, 64, 512, 4, 4),
+    (4, 1024, 4096, 2): (32, 64, 512, 0, 4),
+    (4, 1024, 4096, 4): (32, 64, 512, 0, 1),
+    (4, 1024, 4096, 8): (32, 64, 512, 0, 1),
+    (4, 1024, 4096, 16): (32, 64, 512, 0, 1),
+    (4, 1024, 4096, 32): (32, 64, 512, 4, 1),
+    (4, 1024, 4096, 64): (32, 64, 512, 4, 1),
+    (4, 1024, 4096, 128): (32, 64, 512, 4, 1),
+    (4, 1024, 4096, 256): (32, 64, 256, 4, 1),
+    (4, 1024, 4096, 512): (64, 64, 256, 4, 1),
+    (4, 1024, 4096, 1024): (128, 64, 256, 4, 1),
+    (4, 1024, 4096, 4096): (128, 128, 256, 4, 1),
+    (4, 1024, 4096, 8192): (128, 128, 256, 4, 1),
+    (4, 1024, 4096, 16384): (128, 128, 256, 4, 1),
+    # H=2 D=1024 R=4096 (TP=8)
+    (2, 1024, 4096, 1): (64, 64, 256, 4, 8),
+    (2, 1024, 4096, 2): (32, 64, 512, 0, 1),
+    (2, 1024, 4096, 4): (64, 64, 512, 0, 4),
+    (2, 1024, 4096, 8): (32, 64, 512, 4, 4),
+    (2, 1024, 4096, 16): (32, 64, 512, 0, 1),
+    (2, 1024, 4096, 32): (32, 64, 512, 0, 1),
+    (2, 1024, 4096, 64): (32, 64, 512, 0, 1),
+    (2, 1024, 4096, 128): (32, 64, 512, 4, 1),
+    (2, 1024, 4096, 256): (32, 64, 512, 4, 1),
+    (2, 1024, 4096, 512): (32, 64, 512, 4, 1),
+    (2, 1024, 4096, 1024): (64, 128, 256, 4, 1),
+    (2, 1024, 4096, 4096): (128, 128, 256, 0, 1),
+    (2, 1024, 4096, 8192): (128, 128, 256, 4, 1),
+    (2, 1024, 4096, 16384): (128, 128, 256, 8, 1),
+    # H=8 D=8192 R=8192
+    (8, 8192, 8192, 128): (128, 128, 256, 0, 1),
+    (8, 8192, 8192, 512): (128, 128, 256, 0, 1),
+    (8, 8192, 8192, 2048): (128, 128, 256, 0, 1),
 }
 
 _AUTOTUNE_WINNERS_QZ = {
-    # ─────────────────────────────────────────────────────────────────────
-    # V4-Pro wo_a (FP8 output, transpose_scale=True). Same per-shape tiles
-    # as the BF16 sweep — the qz epilogue only adds a per-D128 amax + cast
-    # at output time, which doesn't change the K-loop tile economics.
-    # qz constraints: tile_n in {128, 256}; entries with tile_n=512 below
-    # would fail to compile in qz mode and are excluded.
-    # ─────────────────────────────────────────────────────────────────────
-    # H=16 D=1024 R=4096 dynamic-B sweep  (TP=1)
-    (16, 1024, 4096, 1): (32, 128, 256, 2),
-    (16, 1024, 4096, 2): (32, 128, 256, 8),
+    # (H,  D,    R,    B    ) -> (tm, tn, tk, bsw)   FP8 (qz) output path.
+    # Retuned 2026-06-08 by rocprof COLD-CACHE kernel time (autotune_ready.py),
+    # after the qz2 path dropped its host contiguous()+eltwise+D2D overhead.
+    # QZ: tile_n in {128,256}, split_k=1 (per-WG amax cannot reduce across
+    # split-K). bsw may be nonzero (4th field); split_k defaults to 1 in lookup.
+    # H=16 D=1024 R=4096 (TP=1)
+    # H=16 D=1024 R=4096 (TP=1)
+    (16, 1024, 4096, 1): (32, 128, 256, 0),
+    (16, 1024, 4096, 2): (32, 128, 256, 0),
     (16, 1024, 4096, 4): (32, 128, 256, 0),
-    (16, 1024, 4096, 8): (32, 128, 256, 2),
+    (16, 1024, 4096, 8): (32, 128, 256, 0),
     (16, 1024, 4096, 16): (32, 128, 256, 0),
-    (16, 1024, 4096, 32): (32, 128, 256, 8),
-    (16, 1024, 4096, 64): (64, 128, 256, 0),
-    (16, 1024, 4096, 128): (64, 128, 256, 0),
-    (16, 1024, 4096, 256): (128, 128, 256, 0),
-    (16, 1024, 4096, 512): (64, 256, 128, 2),
-    (16, 1024, 4096, 1024): (64, 256, 128, 4),
-    (16, 1024, 4096, 4096): (128, 128, 128, 8),
-    (16, 1024, 4096, 8192): (128, 128, 128, 4),
-    (16, 1024, 4096, 16384): (128, 128, 128, 4),
-    (16, 1024, 4096, 32768): (128, 128, 128, 4),
-    # H=8 D=1024 R=4096  (TP=2). Tiles match _AUTOTUNE_WINNERS_BF16 with
-    # tile_n constrained to {128, 256} for qz.
-    (8, 1024, 4096, 1): (32, 128, 256, 8),
+    (16, 1024, 4096, 32): (32, 128, 256, 0),
+    (16, 1024, 4096, 64): (32, 128, 256, 0),
+    (16, 1024, 4096, 128): (32, 128, 256, 2),
+    (16, 1024, 4096, 256): (64, 256, 512, 2),
+    (16, 1024, 4096, 512): (128, 256, 256, 2),
+    (16, 1024, 4096, 1024): (256, 256, 128, 4),
+    (16, 1024, 4096, 4096): (256, 256, 128, 4),
+    (16, 1024, 4096, 8192): (64, 256, 128, 2),
+    (16, 1024, 4096, 16384): (64, 256, 128, 2),
+    (16, 1024, 4096, 32768): (64, 256, 128, 2),
+    # H=8 D=1024 R=4096 (TP=2)
+    (8, 1024, 4096, 1): (32, 128, 256, 0),
     (8, 1024, 4096, 2): (32, 128, 256, 0),
     (8, 1024, 4096, 4): (32, 128, 256, 0),
-    (8, 1024, 4096, 8): (64, 128, 256, 4),
-    (8, 1024, 4096, 16): (64, 128, 256, 4),
-    (8, 1024, 4096, 32): (64, 128, 256, 0),
+    (8, 1024, 4096, 8): (32, 128, 256, 0),
+    (8, 1024, 4096, 16): (32, 128, 256, 0),
+    (8, 1024, 4096, 32): (32, 128, 256, 0),
     (8, 1024, 4096, 64): (32, 128, 256, 0),
-    (8, 1024, 4096, 128): (64, 128, 256, 8),
-    (8, 1024, 4096, 256): (64, 128, 256, 2),
-    (8, 1024, 4096, 512): (64, 256, 128, 2),
-    (8, 1024, 4096, 1024): (128, 128, 256, 4),
-    (8, 1024, 4096, 4096): (128, 128, 128, 8),
-    (8, 1024, 4096, 8192): (128, 128, 128, 4),
-    (8, 1024, 4096, 16384): (128, 128, 128, 8),
-    # H=4 D=1024 R=4096  (TP=4)
-    (4, 1024, 4096, 1): (32, 128, 128, 2),
-    (4, 1024, 4096, 2): (32, 128, 256, 8),
-    (4, 1024, 4096, 4): (32, 128, 128, 2),
+    (8, 1024, 4096, 128): (32, 128, 256, 2),
+    (8, 1024, 4096, 256): (32, 128, 256, 2),
+    (8, 1024, 4096, 512): (64, 128, 256, 2),
+    (8, 1024, 4096, 1024): (128, 256, 256, 2),
+    (8, 1024, 4096, 4096): (256, 256, 128, 4),
+    (8, 1024, 4096, 8192): (64, 256, 128, 4),
+    (8, 1024, 4096, 16384): (64, 256, 128, 2),
+    # H=4 D=1024 R=4096 (TP=4)
+    (4, 1024, 4096, 1): (32, 128, 256, 0),
+    (4, 1024, 4096, 2): (32, 128, 256, 0),
+    (4, 1024, 4096, 4): (32, 128, 256, 0),
     (4, 1024, 4096, 8): (32, 128, 256, 8),
     (4, 1024, 4096, 16): (32, 128, 256, 0),
-    (4, 1024, 4096, 32): (32, 128, 128, 2),
-    (4, 1024, 4096, 64): (32, 128, 256, 4),
-    (4, 1024, 4096, 128): (64, 128, 256, 0),
-    (4, 1024, 4096, 256): (32, 128, 256, 4),
-    (4, 1024, 4096, 512): (64, 128, 256, 4),
-    (4, 1024, 4096, 1024): (64, 128, 256, 4),
+    (4, 1024, 4096, 32): (32, 128, 256, 0),
+    (4, 1024, 4096, 64): (32, 128, 256, 8),
+    (4, 1024, 4096, 128): (32, 128, 256, 2),
+    (4, 1024, 4096, 256): (32, 128, 256, 2),
+    (4, 1024, 4096, 512): (32, 128, 256, 2),
+    (4, 1024, 4096, 1024): (64, 256, 256, 0),
     (4, 1024, 4096, 4096): (64, 256, 128, 2),
-    (4, 1024, 4096, 8192): (128, 128, 128, 4),
-    (4, 1024, 4096, 16384): (128, 128, 128, 4),
-    # H=2 D=1024 R=4096  (TP=8)
-    (2, 1024, 4096, 1): (32, 128, 128, 2),
-    (2, 1024, 4096, 2): (32, 128, 256, 2),
-    (2, 1024, 4096, 4): (32, 128, 128, 8),
-    (2, 1024, 4096, 8): (64, 128, 128, 0),
-    (2, 1024, 4096, 16): (32, 128, 128, 2),
-    (2, 1024, 4096, 32): (32, 128, 128, 2),
-    (2, 1024, 4096, 64): (32, 128, 128, 8),
-    (2, 1024, 4096, 128): (32, 128, 256, 8),
-    (2, 1024, 4096, 256): (32, 128, 256, 4),
+    (4, 1024, 4096, 8192): (64, 256, 128, 2),
+    (4, 1024, 4096, 16384): (128, 256, 256, 4),
+    # H=2 D=1024 R=4096 (TP=8)
+    (2, 1024, 4096, 1): (32, 128, 256, 8),
+    (2, 1024, 4096, 2): (32, 128, 256, 0),
+    (2, 1024, 4096, 4): (32, 128, 256, 0),
+    (2, 1024, 4096, 8): (32, 128, 256, 0),
+    (2, 1024, 4096, 16): (32, 128, 256, 0),
+    (2, 1024, 4096, 32): (32, 128, 256, 0),
+    (2, 1024, 4096, 64): (32, 128, 256, 0),
+    (2, 1024, 4096, 128): (32, 128, 256, 0),
+    (2, 1024, 4096, 256): (32, 128, 256, 0),
     (2, 1024, 4096, 512): (32, 128, 256, 4),
-    (2, 1024, 4096, 1024): (64, 128, 256, 4),
-    (2, 1024, 4096, 4096): (128, 128, 128, 0),
-    (2, 1024, 4096, 8192): (64, 256, 128, 4),
+    (2, 1024, 4096, 1024): (32, 128, 256, 4),
+    (2, 1024, 4096, 4096): (64, 256, 128, 0),
+    (2, 1024, 4096, 8192): (64, 256, 128, 2),
     (2, 1024, 4096, 16384): (128, 128, 256, 8),
-    # H=8 D=R=8192 peak shapes
-    (8, 8192, 8192, 128): (128, 128, 128, 0),
-    (8, 8192, 8192, 512): (128, 128, 256, 0),
-    (8, 8192, 8192, 2048): (128, 128, 256, 4),
+    # H=8 D=8192 R=8192
+    (8, 8192, 8192, 128): (128, 256, 256, 2),
+    (8, 8192, 8192, 512): (128, 128, 128, 0),
+    (8, 8192, 8192, 2048): (256, 256, 128, 2),
 }
 
 
@@ -269,6 +277,26 @@ def _autotune_lookup(table, H, D, R, B):
     return table[(H, D, R, chosen_b)], note
 
 
+def _unpack_winner(entry):
+    """Normalize a winners-table value to (tm, tn, tk, bsw, split_k).
+
+    Backward-compatible: 4-tuples (tm,tn,tk,bsw) default split_k=1; 5-tuples
+    carry the tuned split_k; legacy 6-tuples (tm,tn,tk,bsw,sk,ns) drop the
+    obsolete num_stages field.
+    """
+    if len(entry) == 6:
+        tm, tn, tk, bsw, sk, _ns = entry
+        return (tm, tn, tk, bsw, sk)
+    if len(entry) == 5:
+        return entry
+    if len(entry) == 4:
+        tm, tn, tk, bsw = entry
+        return (tm, tn, tk, bsw, 1)
+    raise ValueError(
+        f"autotune winner entry must be a 4-, 5-, or 6-tuple, got {entry!r}"
+    )
+
+
 def compile_fp8_einsum_clean_ue8m0_auto(
     *,
     H: int,
@@ -308,7 +336,13 @@ def compile_fp8_einsum_clean_ue8m0_auto(
           H=16, D=1024, R=4096, quant_output=True, quant_transpose_scale=True)
     """
     table = _AUTOTUNE_WINNERS_QZ if quant_output else _AUTOTUNE_WINNERS_BF16
-    (tm, tn, tk, bsw), _ = _autotune_lookup(table, H, D, R, B)
+    entry, _ = _autotune_lookup(table, H, D, R, B)
+    tm, tn, tk, bsw, sk = _unpack_winner(entry)
+    # split_k applies to the bf16 path only (qz is split_k=1; its in-kernel
+    # amax epilogue can't span split-K partitions — the QZ split-K win is
+    # handled separately by the 2-pass qz_splitk path).
+    if quant_output:
+        sk = 1
     return compile_fp8_einsum_clean_ue8m0(
         H=H,
         D=D,
@@ -319,7 +353,82 @@ def compile_fp8_einsum_clean_ue8m0_auto(
         block_swizzle_n=bsw,
         quant_output=quant_output,
         quant_transpose_scale=quant_transpose_scale,
+        split_k=sk,
     )
+
+
+# QZ method selection: shapes where the 2-pass QZ (qz2 = bf16 GEMM +
+# per_group_quant, exactly TWO kernels) beats the single-pass in-kernel QZ
+# (qz1) by rocprof kernel time. qz2 wins in the occupancy-starved regime (small
+# B, low H); qz1 wins once the GEMM fills the GPU. Missing (H,D,R,B) -> use qz1
+# (single-pass). Measured 2026-06-08 on MI355X (card 0) by qz_crossover.py,
+# rocprof cold cache, with the qz2 path down to 2 kernels (no contiguous/
+# eltwise/D2D intermediates).
+#
+# Value encoding:
+#   _QZ_BF16_SK1        -> qz2 wins here, but at split_k==1, whose GEMM config
+#                          IS the bf16 winner. We do NOT duplicate the tile —
+#                          dispatch resolves it from _AUTOTUNE_WINNERS_BF16 at
+#                          lookup time, so the qz2 split_k==1 GEMM tile stays
+#                          auto-synced with the bf16 table on every re-tune.
+#   (tm, tn, tk, sk>1)  -> a genuinely split-K config, tuned/stored explicitly
+#                          (the only QZ-specific configs that need their own
+#                          entry; split_k==1 always just reuses bf16).
+#
+# Dispatch rules: (1) qz2 must beat qz1 by >= 5% (sub-margin wins are within
+# cold-cache noise / a weak qz1 tile, not a real 2-pass advantage); (2)
+# monotonic-crossover guard — once qz1 wins at some B for an (H,D,R), every
+# larger B uses qz1 too. Result: a clean contiguous small-B region. qz2 wins to
+# B<=256 at H=2, B<=128 at H=4, and B<=2 at H=8; H=16 and large D,R -> qz1.
+_QZ_BF16_SK1 = "bf16_sk1"  # marker: use the bf16 winner tile at split_k=1
+_QZ_SPLITK_WINNERS: dict[tuple[int, int, int, int], tuple | str] = {
+    # (H,    D,    R,    B ) -> (tm, tn, tk, split_k>1)  OR  _QZ_BF16_SK1.
+    (2, 1024, 4096, 1): (64, 64, 256, 8),
+    (2, 1024, 4096, 2): _QZ_BF16_SK1,
+    (2, 1024, 4096, 4): (64, 64, 512, 4),
+    (2, 1024, 4096, 8): (32, 64, 512, 4),
+    (2, 1024, 4096, 16): _QZ_BF16_SK1,
+    (2, 1024, 4096, 32): _QZ_BF16_SK1,
+    (2, 1024, 4096, 64): _QZ_BF16_SK1,
+    (2, 1024, 4096, 128): _QZ_BF16_SK1,
+    (2, 1024, 4096, 256): _QZ_BF16_SK1,
+    (4, 1024, 4096, 1): (32, 64, 512, 4),
+    (4, 1024, 4096, 2): (32, 64, 512, 4),
+    (4, 1024, 4096, 4): _QZ_BF16_SK1,
+    (4, 1024, 4096, 8): _QZ_BF16_SK1,
+    (4, 1024, 4096, 16): _QZ_BF16_SK1,
+    (4, 1024, 4096, 32): _QZ_BF16_SK1,
+    (4, 1024, 4096, 64): _QZ_BF16_SK1,
+    (4, 1024, 4096, 128): _QZ_BF16_SK1,
+    (8, 1024, 4096, 1): _QZ_BF16_SK1,
+    (8, 1024, 4096, 2): _QZ_BF16_SK1,
+}
+
+
+def _qz_splitk_lookup(H, D, R, B):
+    """Return the qz2 GEMM config (tm, tn, tk, split_k) for (H,D,R,B), or None
+    to use qz1.
+
+    Exact match only for B (the qz1/qz2 crossover is B-sensitive); for an
+    untuned B we conservatively fall through to qz1 (single-pass, always valid).
+
+    Marker resolution: a value of `_QZ_BF16_SK1` means "qz2 wins here, but with
+    split_k==1, whose GEMM config is exactly the bf16 winner" — so we resolve
+    the tile from `_AUTOTUNE_WINNERS_BF16` at lookup time instead of duplicating
+    it. This keeps the qz2 split_k==1 GEMM tile auto-synced with the bf16 table
+    (only the genuinely-split-K, split_k>1 configs are stored explicitly here).
+    """
+    val = _QZ_SPLITK_WINNERS.get((H, D, R, B))
+    if val is None:
+        return None
+    if val is _QZ_BF16_SK1:
+        # Reuse the bf16 winner's tile at split_k=1 (always valid, exact B).
+        bf = _AUTOTUNE_WINNERS_BF16.get((H, D, R, B))
+        if bf is None:
+            return None  # no bf16 entry -> fall through to qz1 (safe)
+        tm, tn, tk, _bsw, _sk = _unpack_winner(bf)
+        return (tm, tn, tk, 1)
+    return val
 
 
 def compile_fp8_einsum_clean_ue8m0_qz_auto(
@@ -330,12 +439,36 @@ def compile_fp8_einsum_clean_ue8m0_qz_auto(
     B: int | None = None,
     transpose_scale: bool = False,
 ):
-    """Convenience wrapper: autotune-dispatch qz variant.
+    """Autotune-dispatch QZ (fp8-output) variant.
 
-    Equivalent to `compile_fp8_einsum_clean_ue8m0_auto(..., quant_output=True,
-    quant_transpose_scale=transpose_scale)`.
+    Picks per-shape between:
+      - qz2 (2-pass split-K: split-K GEMM -> fp32/bf16 -> per_group_quant_hip)
+        when (H,D,R,B) is in `_QZ_SPLITK_WINNERS` (occupancy-starved small-B).
+      - qz1 (single-pass in-kernel quant) otherwise (the default, always valid).
+
+    Returns a RETURNS-tensors launcher (no caller output buffers, no copies):
+      launch(x, y, sx, sy, B, stream) -> (z_fp8, sz)
+    qz2 returns per_group_quant_hip's tensors directly; qz1 allocates z/sz
+    internally and returns them (the in-kernel quant writes them in place).
     """
-    return compile_fp8_einsum_clean_ue8m0_auto(
+    sk_cfg = _qz_splitk_lookup(H, D, R, B) if B is not None else None
+    if sk_cfg is not None:
+        # qz2 2-pass split-K — already returns (z_fp8, sz).
+        tm, tn, tk, sk = sk_cfg
+        return compile_fp8_einsum_clean_ue8m0_qz_splitk(
+            H=H,
+            D=D,
+            R=R,
+            tile_m=tm,
+            tile_n=tn,
+            tile_k=tk,
+            split_k=sk,
+            transpose_scale=transpose_scale,
+        )
+    # qz1 single-pass: wrap the buffer-ABI launcher to allocate + return.
+    import torch as _torch
+
+    _qz1 = compile_fp8_einsum_clean_ue8m0_auto(
         H=H,
         D=D,
         R=R,
@@ -343,6 +476,21 @@ def compile_fp8_einsum_clean_ue8m0_qz_auto(
         quant_output=True,
         quant_transpose_scale=transpose_scale,
     )
+
+    def _qz1_return(arg_x, arg_y, arg_sx, arg_sy, i32_b, stream):
+        Bb = int(i32_b)
+        dev = arg_x.device
+        z = _torch.empty((Bb, H, D), dtype=_torch.float8_e4m3fn, device=dev)
+        if transpose_scale:
+            # (H, D//128, B) — matches the HIP per_group_quant transpose layout
+            # (the qz2 path), so qz1/qz2 return identical transposed scales.
+            sz = _torch.empty((H, D // 128, Bb), dtype=_torch.float32, device=dev)
+        else:
+            sz = _torch.empty((Bb, H, D // 128), dtype=_torch.float32, device=dev)
+        _qz1(z, sz, arg_x, arg_y, arg_sx, arg_sy, i32_b, stream)
+        return z, sz
+
+    return _qz1_return
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -383,10 +531,10 @@ def fp8_einsum(
       transpose_scale: only meaningful when ``out_dtype == torch.float8_e4m3fn``.
                        When True the scale tensor is laid out as
                        ``(H, D // 128, B)`` instead of the default
-                       ``(B, H, D // 128)``. Memory is ``(H*D/128, B)``
-                       contiguous (the H and D-128-group axes lead, batch
-                       innermost), so a consumer that wants a column-major
-                       ``(B, H*D/128)`` scale can ``.view()`` it with no copy.
+                       ``(B, H, D // 128)``. Memory is ``(H, D//128, B)``
+                       contiguous, matching the HIP per_group_quant transpose
+                       layout (fed a ``(B, H*D)`` view) so the qz1 and qz2 paths
+                       return identical transposed scales.
       stream: CUDA stream; defaults to the current stream.
 
     Returns:
@@ -461,27 +609,17 @@ def fp8_einsum(
             kernel = compile_fp8_einsum_clean_ue8m0_auto(H=H, D=D, R=R, B=B)
         _FP8_EINSUM_KERNEL_CACHE[cache_key] = kernel
 
-    # ── Allocate outputs ──
-    device = x_fp8.device
-    if is_qz:
-        z = torch.empty(B, H, D, dtype=torch.float8_e4m3fn, device=device)
-        if transpose_scale:
-            # (H, D//128, B): H and D-128-group axes lead, batch innermost.
-            # Memory is (H*D/128, B) contiguous → a column-major (B, H*D/128)
-            # scale view with no copy for downstream blockscale-GEMM consumers.
-            sz = torch.empty(H, D // 128, B, dtype=torch.float32, device=device)
-        else:
-            sz = torch.empty(B, H, D // 128, dtype=torch.float32, device=device)
-    else:
-        z = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
-        sz = None
-
     # ── Launch ──
     if stream is None:
         stream = torch.cuda.current_stream()
+    device = x_fp8.device
     if is_qz:
-        kernel(z, sz, x_fp8, y_pre, sx, sy, B, stream)
+        # QZ dispatch returns (z_fp8, sz) directly (qz1 allocs internally; qz2
+        # returns per_group_quant_hip's tensors) — no caller buffers, no copy.
+        z, sz = kernel(x_fp8, y_pre, sx, sy, B, stream)
     else:
+        z = torch.empty(B, H, D, dtype=torch.bfloat16, device=device)
+        sz = None
         kernel(z, x_fp8, y_pre, sx, sy, B, stream)
     return z, sz
 
@@ -497,6 +635,7 @@ def compile_fp8_einsum_clean_ue8m0(
     block_swizzle_n: int = 0,
     quant_output: bool = False,
     quant_transpose_scale: bool = False,
+    split_k: int = 1,
 ):
     """Compile DeepGEMM-style clean fp8 einsum (v2 pipeline).
 
@@ -511,18 +650,19 @@ def compile_fp8_einsum_clean_ue8m0(
         `compile_fp8_einsum_clean_ue8m0_qz()` simply calls this factory
         with `quant_output=True`.
       quant_transpose_scale: when True with `quant_output=True`, the scale
-        tensor `arg_sz` is laid out as `(H, D // 128, B)` fp32 (H and the
-        D-128-group axis lead, batch innermost) rather than the default
-        `(B, H, D//128)`. Memory is `(H*D/128, B)` contiguous, so a downstream
-        blockscale GEMM can read it directly as a column-major `(B, H*D/128)`
-        `x_scale` with no `permute().contiguous()` copy. Requires
-        `quant_output=True`.
+        tensor `arg_sz` is laid out as `(H, D // 128, B)` fp32 rather than the
+        default `(B, H, D//128)`. Memory is `(H, D//128, B)` contiguous. This
+        matches the HIP per_group_quant transpose layout (fed a `(B, H*D)`
+        view), so the qz1 (in-kernel) and qz2 (2-pass split-K) paths return the
+        SAME transposed scale for any shape. Requires `quant_output=True`.
 
     Returns: launcher with signature
       bf16 mode: launch(z_bf16, x_fp8, y_pre, sx_i32, sy_i32, B, stream)
       qz   mode: launch(z_fp8, sz_fp32, x_fp8, y_pre, sx_i32, sy_i32, B, stream)
 
     Note: lds_stage param dropped — only ping/pong is supported in v2.
+    B is gmem->reg ("reg-B"); A/sx staged to LDS via raw_ptr_buffer_load_lds;
+    sy gmem->reg per K-tile. This is the proven-correct, peak path.
     """
     if quant_output:
         # Cross-WG amax not supported in v1: each WG owns 1 or 2 D-128 blocks.
@@ -537,17 +677,86 @@ def compile_fp8_einsum_clean_ue8m0(
         raise ValueError(f"tile_k must be a multiple of 128, got {tile_k}")
     if tile_m < 16 or (tile_m % 16) != 0:
         raise ValueError(f"tile_m must be positive multiple of 16, got {tile_m}")
-    if tile_n % 128 != 0:
+    # tile_n granularity: full N-128-block (mult of 128) OR 64 (shares a
+    # 128-block scale with its sibling 64-tile). The 4-wave×16-N MFMA split
+    # needs tile_n >= 64 (n_per_wave = tile_n/4 >= 16). qz requires {128,256}.
+    if tile_n == 64:
+        if quant_output:
+            raise ValueError("tile_n=64 not supported for quant_output (qz).")
+    elif tile_n % 128 != 0:
         raise ValueError(
-            f"tile_n must be a multiple of 128 (N-128-block granularity). "
-            f"Got tile_n={tile_n}."
+            f"tile_n must be 64 or a multiple of 128 (N-128-block / shared "
+            f"scale granularity). Got tile_n={tile_n}."
         )
-    if tile_n < 128:
-        raise ValueError(f"tile_n must be >= 128, got {tile_n}")
+    if tile_n < 64:
+        raise ValueError(f"tile_n must be >= 64, got {tile_n}")
     if R % tile_k != 0:
         raise ValueError(f"R={R} must be divisible by tile_k={tile_k}")
     if D % tile_n != 0:
         raise ValueError(f"D={D} must be divisible by tile_n={tile_n}")
+    # ── split-K validation ──────────────────────────────────────
+    # split_k partitions the R/tile_k K-tile loop across gridZ; each CTA
+    # computes a partial sum over its K-slice and atomicAdds into an fp32
+    # workspace, which a tiny cast pass then writes to bf16 Z. split_k=1 is
+    # the original single-CTA-walks-all-K path (bit-exact, zero overhead).
+    _num_k_tiles = R // tile_k
+    if split_k < 1:
+        raise ValueError(f"split_k must be >= 1, got {split_k}")
+    # Uneven split-K: K is partitioned in 512-element blocks distributed evenly
+    # across split_k CTAs (need NOT divide the tile count). Requirements:
+    #   - at least one 512-block per CTA: split_k <= R//512.
+    #   - a 512-block must be a whole number of tiles: (tile_k//128) | 4
+    #     (i.e. tile_k <= 512). This keeps slices 512-aligned so the MFMA opsel
+    #     byte stays compile-time constant.
+    if split_k > 1:
+        _n512_chk = R // 512
+        if split_k > _n512_chk:
+            raise ValueError(
+                f"split_k={split_k} exceeds R//512={_n512_chk} (cannot give "
+                f"every CTA a 512-block). R={R}."
+            )
+        if 4 % (tile_k // 128) != 0:
+            raise ValueError(
+                f"split_k requires tile_k <= 512 ((tile_k//128) must divide 4); "
+                f"got tile_k={tile_k}."
+            )
+        # UNEVEN split-K (split_k does not divide R//512) is UNSUPPORTED: the
+        # phantom-guard path that handles ragged slices has a pipeline race at
+        # small (1-512-block) slices that intermittently drops partials. Even
+        # split_k (a divisor of R//512) is the only validated/correct path, and
+        # every autotuned winner uses an even split_k (2/4/8). Reject uneven to
+        # guarantee no silent wrong results.
+        if _n512_chk % split_k != 0:
+            raise ValueError(
+                f"uneven split_k unsupported: split_k={split_k} must divide "
+                f"R//512={_n512_chk} (use an even divisor, e.g. "
+                f"{[d for d in range(2, _n512_chk + 1) if _n512_chk % d == 0]})."
+            )
+    if split_k > 1 and quant_output:
+        raise ValueError(
+            "split_k>1 is only implemented for the bf16-output path "
+            "(quant_output=False) in v1."
+        )
+    # ── pipeline depth ──────────────────────────────────────────
+    # Fixed 2-stage prefetch:
+    #   split_k==1 -> hand-unrolled ping/pong driver.
+    #   split_k>1  -> 2-stage rotating-buffer driver with the uneven-split-K
+    #                 phantom-guard. (The old deep N-stage `num_stages>2`
+    #                 capability was removed — autotune never picked it.)
+    # The smallest CTA must walk >= 2 K-tiles to prefetch. With uneven split-K
+    # the smallest slice has floor(R//512 / split_k) 512-blocks.
+    _tiles_per_512block_v = 4 // (tile_k // 128)
+    if split_k > 1:
+        _min_512_v = (R // 512) // split_k  # floor = smallest CTA's 512-blocks
+        _min_tiles_per_cta = _min_512_v * _tiles_per_512block_v
+    else:
+        _min_tiles_per_cta = _num_k_tiles
+    if _min_tiles_per_cta < 2:
+        raise ValueError(
+            f"smallest per-CTA K-tile count={_min_tiles_per_cta} < 2 "
+            f"(uneven split_k={split_k}); the 2-stage prefetch needs >=2. "
+            f"Reduce split_k."
+        )
     if R % 512 != 0:
         raise ValueError(
             f"R={R} must be divisible by 512 (packed UE8M0 needs 4 K-128 "
@@ -576,6 +785,10 @@ def compile_fp8_einsum_clean_ue8m0(
                 f"block_swizzle_n={block_swizzle_n} must divide gy="
                 f"D/tile_n={_gy_static}."
             )
+    # Encode split_k so distinct configs get distinct kernel symbols (needed
+    # to attribute rocprof per-config kernel durations).
+    if split_k > 1:
+        KERNEL_NAME += f"_sk{split_k}"
 
     # Threading
     total_threads = 256
@@ -591,29 +804,44 @@ def compile_fp8_einsum_clean_ue8m0(
             f"tile_m={tile_m}, tile_k={tile_k}"
         )
     bytes_per_thread_a = bytes_a_per_tile // total_threads
-    a_load_bytes = 16
-    if bytes_per_thread_a % a_load_bytes != 0:
+    # A async-DMA chunk width per lane. raw_ptr_buffer_load_lds only legalizes
+    # 16 B (dwordx4) and 4 B (dword) on this backend (the 8 B / s64 form fails
+    # "Do not know how to expand"). So prefer 16 B for peak DMA efficiency, and
+    # fall back to 4 B chunks (more, smaller DMAs) when bytes_per_thread_a is
+    # not a multiple of 16 — e.g. tile_m=16, tile_k=128 -> 8 B/thread = 2x4 B.
+    # This unlocks the smallest tile_m for tiny-B shapes.
+    if bytes_per_thread_a % 16 == 0:
+        a_load_bytes = 16
+    elif bytes_per_thread_a % 4 == 0:
+        a_load_bytes = 4
+    else:
         raise ValueError(
-            f"bytes_per_thread_a={bytes_per_thread_a} must be divisible by 16"
+            f"bytes_per_thread_a={bytes_per_thread_a} must be a multiple of "
+            f"4 (tile_m*tile_k/{total_threads}; got tile_m={tile_m}, "
+            f"tile_k={tile_k})."
         )
     num_a_loads = bytes_per_thread_a // a_load_bytes
 
-    # B bytes (preshuffled fp8)
+    # B bytes (preshuffled fp8). tile_k_bytes_b also sets the A-LDS stride below.
     tile_k_bytes_b = tile_k * elem_bytes_b
     bytes_b_per_tile = tile_n * tile_k_bytes_b
     bytes_per_thread_b = bytes_b_per_tile // total_threads
     b_load_bytes = 16
+    # Per-thread B vmem load count. The K-loop's pre-compute barrier keeps the
+    # next tile's (num_a_loads + num_b_loads) A+B loads in flight rather than
+    # fully draining HBM. See _bar_keep in the driver.
     num_b_loads = bytes_per_thread_b // b_load_bytes
 
-    # LDS allocators (always ping/pong)
+    # LDS allocators. Two physical allocators (smem0/smem1) for bank
+    # separation; the 2 stages map to ping(smem1)/pong(smem0).
     allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem0")
     allocator_ping = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem1")
-    lds_stage = 2  # hardcoded — v2 always ping/pong
+    lds_stage = 2
 
     def _alloc_per_stage(byte_size, stages):
         offsets, allocs = [], []
         for s in range(stages):
-            alloc = allocator_pong if s == 0 else allocator_ping
+            alloc = allocator_pong if (s % 2) == 0 else allocator_ping
             off = alloc._align(alloc.ptr, 16)
             alloc.ptr = off + byte_size
             offsets.append(off)
@@ -628,23 +856,12 @@ def compile_fp8_einsum_clean_ue8m0(
     )
     lds_a_fp8_k_blocks16 = lds_a_fp8_stride_bytes // 16
 
-    # B fp8 is kept in registers (gmem→regs via load_b_tile); no LDS slab.
+    # B fp8 is kept in registers (gmem->regs via load_b_tile) — "reg-B". This is
+    # the proven-correct, peak path; no B LDS slab.
 
-    # Number of N-128-blocks per WG (= tile_n / 128). At tile_n=128 this is
-    # 1 (the original assumption); at tile_n=256, 2; etc.
-    n_blocks_per_tile = tile_n // 128
-
-    # sy LDS slab — persistent per WG, loaded once in prologue.
-    # sy is `(H, D//128, R//512)` i32; per WG we pick 1 head + n_blocks_per_tile
-    # N-128-blocks. Layout (row-major):
-    #   slot(nb_idx, k_packed_idx) = nb_idx * (R/512) + k_packed_idx
-    # Bytes: n_blocks_per_tile * (R/512) * 4. At tn=128 R=8192: 1*16*4 = 64.
-    # At tn=256 R=8192: 2*16*4 = 128.
-    _sy_lds_per_nb = R // 512  # i32 entries per N-128-block
-    _sy_lds_count = n_blocks_per_tile * _sy_lds_per_nb
-    _sy_lds_bytes = _sy_lds_count * 4
-    sy_lds_offset = allocator_pong._align(allocator_pong.ptr, 16)
-    allocator_pong.ptr = sy_lds_offset + max(16, _sy_lds_bytes)
+    # sy (Y scales) are NOT staged in LDS — loaded gmem->reg per K-tile in
+    # prefetch_sy_tile (tiny). gmem layout (H, D//128, R//512) i32; see
+    # _sy_per_n128 / _sy_per_head below.
 
     # sx LDS slab — persistent per WG, loaded once in prologue.
     # sx is `(B, H, R//512)` i32; per WG we need rows bx_m..bx_m+tile_m-1 of
@@ -695,6 +912,9 @@ def compile_fp8_einsum_clean_ue8m0(
         _qz_waves_per_d128 = 0
         _qz_amax_count = 0
         qz_amax_lds_offset = 0
+
+    # sy (Y scales) are loaded gmem->reg per K-tile (prefetch_sy_tile); no LDS
+    # slab. sx (X scales) are staged once to an LDS slab in the prologue.
 
     # CDNA4 / gfx950 (MI355X): 160 KB LDS per CU.
     # (CDNA3 / MI300X was 64 KB; the older value here was a stale copy.)
@@ -749,6 +969,8 @@ def compile_fp8_einsum_clean_ue8m0(
         arg_sx,
         arg_sy,
         i32_b,
+        arg_signal=None,
+        arg_semaphore=None,
     ):
         Vec = fx.Vector
         fp8_dtype = fx.Float8E4M3FN
@@ -758,6 +980,72 @@ def compile_fp8_einsum_clean_ue8m0(
         tx = gpu.thread_id("x")
         bx_raw = gpu.block_id("x")
         by_raw = gpu.block_id("y")
+
+        # split-K: gridZ indexes the K-partition this CTA owns. K is partitioned
+        # in units of 512-element blocks (= 4 K-128-groups = _tiles_per_512block
+        # tiles), distributed as evenly as possible across split_k CTAs so split_k
+        # need NOT divide the tile count (uneven slices: the first `rem` CTAs get
+        # one extra 512-block). Every slice starts on a 512 boundary, so the MFMA
+        # opsel byte (k_block_global % 4) stays compile-time constant (it depends
+        # only on the relative tile index walked in the loop).
+        #
+        #   n512        = R // 512                      (total 512-blocks)
+        #   base, rem   = divmod(n512, split_k)
+        #   my512       = base + (1 if kz < rem else 0) (this CTA's 512-blocks)
+        #   start512    = kz*base + min(kz, rem)        (this CTA's first block)
+        #   tiles/512blk= 4 // (tile_k//128)            (must be integer)
+        # kt0          = start512 * tiles_per_512block  (runtime, this CTA's base)
+        # _max_tiles   = ceil(n512/split_k)*tiles_per_512block  (compile-time
+        #                loop bound; CTAs with fewer tiles predicate the tail off)
+        _n512 = R // 512
+        _k128_per_tile = tile_k // 128
+        if (4 % _k128_per_tile) != 0:
+            # a 512-block must be a whole number of tiles for clean slicing
+            raise ValueError(
+                f"split_k requires tile_k <= 512 (tile_k//128 must divide 4); "
+                f"got tile_k={tile_k}."
+            )
+        _tiles_per_512block = 4 // _k128_per_tile
+        _base512, _rem512 = divmod(_n512, split_k)
+        import math as _math
+
+        _max_512 = _math.ceil(_n512 / split_k) if split_k > 1 else _n512
+        _max_tiles = _max_512 * _tiles_per_512block
+        if const_expr(split_k > 1):
+            kz = gpu.block_id("z")
+            # my512 = base + (kz < rem ? 1 : 0); start512 = kz*base + min(kz,rem)
+            _extra = fx.arith.select(
+                fx.arith.cmpi(
+                    fx.arith.CmpIPredicate.slt,
+                    fx.Int32(kz).ir_value(),
+                    fx.Int32(_rem512).ir_value(),
+                ),
+                fx.Int32(1).ir_value(),
+                fx.Int32(0).ir_value(),
+            )
+            _extra = fx.Index(fx.Int32(_extra))
+            _min_kz_rem = fx.arith.select(
+                fx.arith.cmpi(
+                    fx.arith.CmpIPredicate.slt,
+                    fx.Int32(kz).ir_value(),
+                    fx.Int32(_rem512).ir_value(),
+                ),
+                fx.Int32(kz).ir_value(),
+                fx.Int32(_rem512).ir_value(),
+            )
+            _min_kz_rem = fx.Index(fx.Int32(_min_kz_rem))
+            _my512 = fx.Index(_base512) + _extra
+            _start512 = kz * fx.Index(_base512) + _min_kz_rem
+            kt0 = _start512 * fx.Index(_tiles_per_512block)
+            _my_tiles = _my512 * fx.Index(_tiles_per_512block)  # runtime trip count
+            # scale-slot offset in packed-i32 (R/512) units = start512 (1 i32 per
+            # 512-block) — exact, no rounding (slice is 512-aligned).
+            kt0_k128_packed = _start512
+        else:
+            kz = fx.Index(0)
+            kt0 = fx.Index(0)
+            kt0_k128_packed = fx.Index(0)
+            _my_tiles = fx.Index(_max_tiles)
 
         gx_per_h = (c_b + (tile_m - 1)) // tile_m
         gx = gx_per_h * fx.Index(H)
@@ -782,6 +1070,14 @@ def compile_fp8_einsum_clean_ue8m0(
         bx_m = bx_m_idx * tile_m
         by_n = by * tile_n
 
+        # split-K: per-output-tile index into the signal/semaphore scratch.
+        # Uses POST-swizzle (bx, by) — the true output-tile identity — which is
+        # independent of kz, so all `split_k` K-slice CTAs of one tile agree on
+        # the same index. gy = D // tile_n; total tiles = gx * gy.
+        if const_expr(split_k > 1):
+            _gy_tiles = fx.Index(D // tile_n)
+            signal_idx = bx * _gy_tiles + by  # fx.Index, output-tile linear id
+
         # ── LDS pointers ───────────────────────────────────────────────
         base_ptr_pong = allocator_pong.get_base()
         base_ptr_ping = allocator_ping.get_base()
@@ -799,15 +1095,7 @@ def compile_fp8_einsum_clean_ue8m0(
         lds_a_ping = lds_a_fp8_stages[1]
 
         # B fp8 is carried in registers via load_b_tile (gmem→regs); no LDS.
-
-        # sy LDS slab — persistent, R/512 i32 entries (max R/512 = 16 at R=8192).
-        _sy_lds_ptr = SmemPtr(
-            base_ptr_pong,
-            sy_lds_offset,
-            fx.Int32.ir_type,
-            shape=(max(4, _sy_lds_count),),
-        )
-        lds_sy = _sy_lds_ptr.get()
+        # sy (Y scales) are loaded gmem→reg per K-tile (prefetch_sy_tile); no LDS.
 
         # sx LDS slab — persistent, tile_m * R/512 i32 entries.
         _sx_lds_ptr = SmemPtr(
@@ -841,8 +1129,14 @@ def compile_fp8_einsum_clean_ue8m0(
             arg_sx, max_size=False, num_records_bytes=_sx_nrec
         )
         sy_rsrc = buffer_ops.create_buffer_resource(arg_sy, max_size=True)
-        # qz: fp8 byte output (1 B/elem). bf16: 2 B/elem.
-        _z_bytes_per_elem = 1 if quant_output else 2
+        # qz: fp8 byte output (1 B/elem). bf16 (incl. split-K): 2 B/elem. split-K
+        # reduces DIRECTLY in bf16 into arg_z via global_atomic_pk_add_bf16 — the
+        # first K-slice CTA device-zeros each output tile, then all K-slice CTAs
+        # packed-bf16-atomic-add their partials. No fp32 workspace, no host copy.
+        if quant_output:
+            _z_bytes_per_elem = 1
+        else:
+            _z_bytes_per_elem = 2
         _z_nrec = fx.Int64(c_b * (H * D * _z_bytes_per_elem))
         z_rsrc = buffer_ops.create_buffer_resource(
             arg_z, max_size=False, num_records_bytes=_z_nrec
@@ -856,7 +1150,7 @@ def compile_fp8_einsum_clean_ue8m0(
             sz_rsrc = None
 
         # ── Wave/lane decomposition ──────────────────────────────────
-        layout_wave_lane = fx.make_layout((4, wave_size), (64, 1))
+        layout_wave_lane = fx.make_layout((num_waves, wave_size), (wave_size, 1))
         coord_wave_lane = fx.idx2crd(tx, layout_wave_lane)
         wave_id = fx.get(coord_wave_lane, 0)
         lane_id = fx.get(coord_wave_lane, 1)
@@ -866,7 +1160,8 @@ def compile_fp8_einsum_clean_ue8m0(
         lane_div_16 = fx.get(coord_lane16, 0)
         lane_mod_16 = fx.get(coord_lane16, 1)
 
-        # N-tile column indexing per wave
+        # N-tile column indexing per wave (wave owns N-cols
+        # [wave_id*n_per_wave, +n_per_wave)).
         n_tile_base = wave_id * n_per_wave
         n_blk_list = []
         n_intra_list = []
@@ -874,6 +1169,8 @@ def compile_fp8_einsum_clean_ue8m0(
             global_n_in_head = by_n + n_tile_base + (i * 16) + lane_mod_16
             n_blk_list.append(global_n_in_head // 16)
             n_intra_list.append(global_n_in_head % 16)
+
+        _scale_base_packed = kt0_k128_packed
 
         _b_stride_n0_c = fx.Index(_stride_n0)
         _b_stride_k0_c = fx.Index(_stride_k0)
@@ -886,9 +1183,12 @@ def compile_fp8_einsum_clean_ue8m0(
         stride_b_z = H * D
 
         # ── A async copy: gmem → LDS direct (swizzle-the-source) ──────
+        # Chunk width in dwords (4 for 16 B, 2 for 8 B). tx_i32_base spaces
+        # each lane by chunk_i32 dwords so lanes tile contiguous dword runs.
+        _a_chunk_i32 = a_load_bytes // 4
         tile_k_dwords = tile_k // 4
         c4 = fx.Index(4)
-        tx_i32_base = tx * c4
+        tx_i32_base = tx * fx.Index(_a_chunk_i32)
         layout_a_tile_div4 = fx.make_layout((tile_m, tile_k_dwords), (tile_k_dwords, 1))
 
         def a_tile_chunk_coord(i):
@@ -898,16 +1198,17 @@ def compile_fp8_einsum_clean_ue8m0(
                 i=i,
                 total_threads=total_threads,
                 layout_tile_div4=layout_a_tile_div4,
+                chunk_i32=_a_chunk_i32,
             )
 
         x_head_elem_off = bx_h * fx.Index(R)
         _lds_a_fp8_k_dim_c = fx.Index(lds_a_fp8_stride_bytes)
         _lds_a_fp8_k_blocks16_c = fx.Index(lds_a_fp8_k_blocks16)
 
-        # async-A constants
-        _a_async_load_bytes = 16  # vec4 i32 per lane per chunk
-        _a_wave_bytes_per_chunk = wave_size * _a_async_load_bytes  # 1024
-        _a_chunk_stride_bytes = total_threads * _a_async_load_bytes  # 4096
+        # async-A constants (adaptive: 16 B = dwordx4, or 8 B = dwordx2)
+        _a_async_load_bytes = a_load_bytes
+        _a_wave_bytes_per_chunk = wave_size * _a_async_load_bytes
+        _a_chunk_stride_bytes = total_threads * _a_async_load_bytes
 
         def load_a_tile_to_lds_async(base_k_elem, lds_buffer):
             """Issue async DMA: A gmem → LDS using swizzle-the-source.
@@ -1082,108 +1383,66 @@ def compile_fp8_einsum_clean_ue8m0(
                 v1 = Vec.from_elements([sx_val], fx.Int32)
                 v1.store(lds_sx, [slot_id])
 
-        def prefetch_sx_tile(kt):
-            """Return list[m_repeat][groups_per_tile] of i32 IR values
-            read from the persistent LDS sx slab.
-
-            Per (mi, g): lane G needs sx for row `bx_m + mi*16 + lane_mod_16`
-            and K-128-group `kt*(tile_k/128) + g`. LDS slot:
-                slot = (mi*16 + lane_mod_16) * (R/512) + (k_block_global // 4)
-            byte_in_i32 = k_block_global % 4 (consumed by compute_tile's opsel).
-            """
-            sx_per_mi = []
-            for mi in range_constexpr(m_repeat):
-                row_in_tile = lane_mod_16 + fx.Index(mi * 16)
-                sx_for_mi = []
-                for g in range_constexpr(groups_per_tile):
-                    k_block_global_int = kt * (tile_k // 128) + g
-                    k_packed_idx = k_block_global_int // 4
-                    slot = row_in_tile * fx.Index(_sx_lds_per_row) + fx.Index(
-                        k_packed_idx
-                    )
-                    v = Vec.load(
-                        Vec.make_type(1, fx.Int32),
-                        lds_sx,
-                        [slot],
-                    )
-                    sx_for_mi.append(v[0].ir_value())
-                sx_per_mi.append(sx_for_mi)
-            return sx_per_mi
-
-        # ── sy LDS load-once-per-WG ──────────────────────────────────
-        # sy is `(H, D//128, R//512)` i32. For this WG we need one head
-        # (bx_h) and n_blocks_per_tile = tile_n/128 consecutive N-128-blocks
-        # starting at by * n_blocks_per_tile. Slab layout:
-        #   slot(nb_idx, k_packed_idx) = nb_idx * (R/512) + k_packed_idx
-        # Total i32s: n_blocks_per_tile * (R/512). At tn=128 R=8192: 16.
-        # At tn=256 R=8192: 32. Tiny; load once.
-        #
-        # Distribution: thread tx loads slot tx (if tx < _sy_lds_count),
-        # decomposed to (nb_idx = tx // (R/512), k_packed_idx = tx % (R/512)).
-        # For shapes where _sy_lds_count <= total_threads, threads with
-        # tx >= _sy_lds_count just no-op (don't store).
-        def load_sy_to_lds():
-            """Issue all sy loads + store into LDS. One-time per WG.
-            Caller must barrier before any read from `lds_sy`.
-            """
-            for slot_id in range_constexpr(_sy_lds_count):
-                nb_idx = slot_id // _sy_lds_per_nb
-                k_packed_idx = slot_id % _sy_lds_per_nb
-                # WG-global N-128-block = by * n_blocks_per_tile + nb_idx
-                n_block_global = by * fx.Index(n_blocks_per_tile) + fx.Index(nb_idx)
-                sy_gmem_idx = (
-                    bx_h * fx.Index(_sy_per_head)
-                    + n_block_global * fx.Index(_sy_per_n128)
-                    + fx.Index(k_packed_idx)
-                )
-                sy_val = buffer_ops.buffer_load(
-                    sy_rsrc,
-                    fx.Int32(sy_gmem_idx),
-                    vec_width=1,
-                    dtype=fx.Int32,
-                )
-                v1 = Vec.from_elements([sy_val], fx.Int32)
-                v1.store(lds_sy, [fx.Index(slot_id)])
+        # sy (Y scales) are loaded gmem->reg per K-tile directly in
+        # prefetch_sy_tile below — NOT staged in LDS (tiny: num_acc_n*
+        # groups_per_tile i32/lane). gmem layout: (H, D//128, R//512) i32.
+        n_blocks_per_tile = max(1, tile_n // 128)
 
         def prefetch_sy_tile(kt):
-            """Return list[num_acc_n][groups_per_tile] of i32 IR values
-            read from the persistent LDS sy slab.
+            """Load this K-tile's sy (Y) scales gmem->reg, FLAT layout. Each entry
+            is ONE ue8m0 byte BROADCAST to all 4 byte lanes of the i32.
 
-            Per (ni, g):
-              n_col_in_tile = wave_id * n_per_wave + ni * 16 + lane_mod_16
-              n_block_idx_local = n_col_in_tile // 128   (relative to this WG)
-              k_block_global_int = kt * (tile_k//128) + g
-              k_packed_idx = k_block_global_int // 4
-              slot = n_block_idx_local * (R/512) + k_packed_idx
-              byte_in_i32 = k_block_global_int % 4  (consumed by compute_tile)
+            Loads (tile_n//128) * groups_per_tile i32 — one per (N-128 block in
+            the CTA-tile, K-128 group). sy is PACKED ue8m0 (one i32 = 4 K-128
+            groups, 1 byte each). A single ue8m0 byte is the scale for the whole
+            128(N)×128(K) block, so we extract the K-correct byte (k_global % 4,
+            CONSTEXPR) and broadcast it to all 4 lanes (byte * 0x01010101). Then
+            the MFMA reads the correct scale from ANY lane → opselB is don't-care
+            (we pass 0).
 
-            Note: lane_mod_16 is < 16 < 128, so within one (ni), all lanes
-            have the same n_block_idx_local. We compute it once per (ni).
+            Flat index:  sy_flat[nb + g * (tile_n//128)]   nb in [0,tile_n//128)
+            CTA-tile's first N-128 block = by*tile_n//128; block nb at +nb.
+            Distinct packed-i32 (k_global//4) are loaded once and reused.
             """
-            sy_per_ni = []
-            for ni in range_constexpr(num_acc_n):
-                # n_block_idx_local for this ni (wave-uniform within ni).
-                # = (wave_id * n_per_wave + ni * 16) // 128
-                # since lane_mod_16 < 16 < 128 doesn't shift the // 128 result.
-                n_col_in_tile_wave_uniform = wave_id * fx.Index(n_per_wave) + fx.Index(
-                    ni * 16
-                )
-                n_block_idx_local = n_col_in_tile_wave_uniform // fx.Index(128)
-                sy_for_ni = []
-                for g in range_constexpr(groups_per_tile):
-                    k_block_global_int = kt * (tile_k // 128) + g
-                    k_packed_idx = k_block_global_int // 4
-                    slot = n_block_idx_local * fx.Index(_sy_lds_per_nb) + fx.Index(
-                        k_packed_idx
-                    )
-                    v = Vec.load(
-                        Vec.make_type(1, fx.Int32),
-                        lds_sy,
-                        [slot],
-                    )
-                    sy_for_ni.append(v[0].ir_value())
-                sy_per_ni.append(sy_for_ni)
-            return sy_per_ni
+            tile_n_block0 = by * fx.Index(tile_n) // fx.Index(128)
+            _loaded = {}  # (nb, k_packed) -> raw packed i32 (loaded once)
+            sy_flat = []
+            for g in range_constexpr(groups_per_tile):
+                k_block_global_int = kt * (tile_k // 128) + g
+                k_packed_idx = k_block_global_int // 4
+                byte_in_i32 = k_block_global_int % 4  # constexpr
+                for nb in range_constexpr(n_blocks_per_tile):
+                    key = (nb, k_packed_idx)
+                    if key not in _loaded:
+                        if True:
+                            sy_gmem_idx = (
+                                bx_h * fx.Index(_sy_per_head)
+                                + (tile_n_block0 + fx.Index(nb))
+                                * fx.Index(_sy_per_n128)
+                                + fx.Index(k_packed_idx)
+                                + _scale_base_packed
+                            )
+                            _loaded[key] = buffer_ops.buffer_load(
+                                sy_rsrc,
+                                fx.Int32(sy_gmem_idx),
+                                vec_width=1,
+                                dtype=fx.Int32,
+                            )
+                    packed = _loaded[key]
+                    # K-correct ue8m0 byte -> bits[7:0] (constexpr shift+mask)
+                    if const_expr(byte_in_i32 == 0):
+                        one_byte = fx.arith.andi(packed, fx.Int32(0xFF).ir_value())
+                    else:
+                        one_byte = fx.arith.andi(
+                            fx.arith.shrui(
+                                packed, fx.Int32(byte_in_i32 * 8).ir_value()
+                            ),
+                            fx.Int32(0xFF).ir_value(),
+                        )
+                    # broadcast that byte to all 4 lanes: byte * 0x01010101
+                    sy_bcast = fx.arith.muli(one_byte, fx.Int32(0x01010101).ir_value())
+                    sy_flat.append(sy_bcast)
+            return sy_flat  # sy_flat[nb + g*(tile_n//128)], ue8m0 in every lane
 
         # ── MFMA + scale ──────────────────────────────────────────
         mfma_res_ty = Vec.make_type(4, fx.Float32)
@@ -1204,17 +1463,36 @@ def compile_fp8_einsum_clean_ue8m0(
             fp8_col_bytes = lane_div_16 * 16  # g=0
             return lds_load_a_packs_k64(fp8_row, fp8_col_bytes, lds_buffer)
 
+        def lds_load_sa(mi, k_packed_idx):
+            """Load one sx (A-scale) packed i32 from the LDS slab for this lane's
+            row (bx_m + mi*16 + lane_mod_16) and K packed-i32 `k_packed_idx`.
+            Called inside compute_tile's mi-loop right after the A LDS fetch.
+            slot = row_in_tile * (R/512) + k_packed_idx (+ split-K base).
+            The MFMA opsel byte (k_global % 4) picks the right ue8m0 (sx packed).
+
+            NOTE (ATT-tested): an inline-asm `ds_read_b32` here (to hide the read
+            from the compiler's alias analysis vs the opaque inline-asm B `... lds`
+            DMA) does NOT remove the conservative vmcnt(0): the compiler simply
+            relocates the guard to the next VISIBLE LDS read (the A-tile b128
+            reads) — the vmcnt(0)->ds_read count stayed 8, total stall rose
+            ~6.86M->7.46M, and perf dropped (1128->1040 TF) because the opaque
+            read breaks the sx/MFMA double-buffer overlap. The guard is
+            structural to having any opaque `... lds` DMA inflight, so we keep
+            the plain compiler ds_read (better scheduling) and accept the vmcnt.
+            """
+            slot = (
+                (lane_mod_16 + fx.Index(mi * 16)) * fx.Index(_sx_lds_per_row)
+                + fx.Index(k_packed_idx)
+                + _scale_base_packed
+            )
+            return Vec.load(Vec.make_type(1, fx.Int32), lds_sx, [slot])[0].ir_value()
+
         # ── compute_tile (scaled MFMA, no promote) ───────────────
-        # kt is the compile-time K-tile index for this call.
-        # sx_per_mi, sy_per_ni are pre-loaded scale regs (carried across iters).
-        # a0_prefetch is the optional (a0, a1) tuple for (mi=0, g=0, ku=0..1)
-        # — when supplied, the first MFMA's A skips ds_read.
         def compute_tile(
             accs_in,
             b_tile_in,
             kt,
             fp8_lds_buffer,
-            sx_per_mi,
             sy_per_ni,
             a0_prefetch=None,
         ):
@@ -1227,9 +1505,40 @@ def compile_fp8_einsum_clean_ue8m0(
             current_accs = list(accs_in)
             rocdl.iglp_opt(2)
 
+            # sy_per_ni is the FLAT sy list from prefetch_sy_tile, indexed
+            # sy_flat[nb + g*(tile_n//128)]. nb = ni's tile-local N-128 block =
+            # (wave_id*n_per_wave + ni*16)//128. At tn<=256 a wave fits one
+            # block so nb is the SAME for all ni in a wave; pick it once (runtime
+            # via wave_id). n_blocks_per_tile is 1 (tn128) or 2 (tn256).
+            sy_flat = sy_per_ni
+            if const_expr(n_blocks_per_tile == 1):
+                _wave_nb = None
+            else:
+                _wave_nb = fx.Int32(wave_id * fx.Index(n_per_wave) // fx.Index(128))
+
+            def _sy_at(g):
+                # return sy_flat[_wave_nb + g*n_blocks_per_tile]
+                if const_expr(n_blocks_per_tile == 1):
+                    return sy_flat[g]  # nb==0
+                base = g * n_blocks_per_tile
+                sel = sy_flat[base + 0]
+                for nb in range_constexpr(1, n_blocks_per_tile):
+                    is_nb = fx.arith.cmpi(
+                        fx.arith.CmpIPredicate.eq,
+                        _wave_nb.ir_value(),
+                        fx.Int32(nb).ir_value(),
+                    )
+                    sel = fx.arith.select(is_nb, sy_flat[base + nb], sel)
+                return sel
+
+            a_128_list = [None, None]
+            sx_i32_list = [None, None]
             for g in range_constexpr(groups_per_tile):
                 k_block_global_int = kt * (tile_k // 128) + g
-                byte_in_i32 = k_block_global_int % 4
+                byte_in_i32 = k_block_global_int % 4  # for sx opsel (sx packed)
+                # sy: byte already extracted in prefetch_sy_tile -> bits[7:0];
+                # _sy_at picks this wave's N-128 block from the flat list.
+                sy_i32_g = _sy_at(g)
 
                 fp8_group_col_base = g * 128
 
@@ -1240,28 +1549,47 @@ def compile_fp8_einsum_clean_ue8m0(
                 b_pc = b_tile_in[ku_base + 2]
                 b_pd = b_tile_in[ku_base + 3]
 
+                # sx LDS slot for this (mi,g): row*(R/512) + k_packed (+ splitk
+                # base). k_packed/byte are constexpr (kt,g). Loaded inside the
+                # mi loop right after the A-from-LDS fetch (below).
+                k_packed_idx = k_block_global_int // 4
+                fp8_col_bytes_0 = fp8_group_col_base + lane_div_16 * 16
+                fp8_col_bytes_1 = fp8_col_bytes_0 + 64
+                # (mi=0, g=0) first pack-pair (a0,a1) may be PREFETCHED by the
+                # driver (lds_a0_prefetch) after the barrier, so the first MFMA
+                # skips its ds_read. a0_prefetch carries exactly (a0,a1) for
+                # (mi=0, g=0, col=fp8_col_bytes_0); (a2,a3) is still loaded here.
+                if const_expr(g == 0) and a0_prefetch is not None:
+                    a0, a1 = a0_prefetch
+                else:
+                    a0, a1 = lds_load_a_packs_k64(
+                        lane_mod_16,
+                        fp8_col_bytes_0,
+                        fp8_lds_buffer,
+                    )
+                a2, a3 = lds_load_a_packs_k64(
+                    lane_mod_16,
+                    fp8_col_bytes_1,
+                    fp8_lds_buffer,
+                )
+                a_128_list[0] = pack_i64x4_to_i32x8(a0, a1, a2, a3)
+                sx_i32_list[0] = lds_load_sa(0, k_packed_idx)
                 for mi in range_constexpr(m_repeat):
-                    fp8_row = lane_mod_16 + (mi * 16)
+                    mi_next = mi + 1
+                    fp8_row = lane_mod_16 + (mi_next * 16)
 
-                    fp8_col_bytes_0 = fp8_group_col_base + lane_div_16 * 16
-                    fp8_col_bytes_1 = fp8_col_bytes_0 + 64
-
-                    if const_expr((a0_prefetch is not None) and (g == 0) and (mi == 0)):
-                        a0, a1 = a0_prefetch
-                    else:
-                        a0, a1 = lds_load_a_packs_k64(
-                            fp8_row,
-                            fp8_col_bytes_0,
-                            fp8_lds_buffer,
-                        )
+                    a0, a1 = lds_load_a_packs_k64(
+                        fp8_row,
+                        fp8_col_bytes_0,
+                        fp8_lds_buffer,
+                    )
                     a2, a3 = lds_load_a_packs_k64(
                         fp8_row,
                         fp8_col_bytes_1,
                         fp8_lds_buffer,
                     )
-                    a128 = pack_i64x4_to_i32x8(a0, a1, a2, a3)
-
-                    sx_i32 = sx_per_mi[mi][g]
+                    a_128_list[mi_next % 2] = pack_i64x4_to_i32x8(a0, a1, a2, a3)
+                    sx_i32_list[mi_next % 2] = lds_load_sa(mi_next, k_packed_idx)
 
                     for ni in range_constexpr(num_acc_n):
                         b128 = pack_i64x4_to_i32x8(
@@ -1270,21 +1598,23 @@ def compile_fp8_einsum_clean_ue8m0(
                             b_pc[ni],
                             b_pd[ni],
                         )
-                        sy_i32 = sy_per_ni[ni][g]
+                        sy_i32 = sy_i32_g
                         acc_idx = mi * num_acc_n + ni
                         current_accs[acc_idx] = mfma_fp8_k128(
                             mfma_res_ty,
                             [
-                                a128,
+                                a_128_list[mi % 2],
                                 b128,
                                 current_accs[acc_idx],
                                 0,
                                 0,  # cbsz, blgp
                                 byte_in_i32,
-                                sx_i32,  # opsel_a, scale_a
-                                byte_in_i32,
+                                sx_i32_list[
+                                    mi % 2
+                                ],  # opsel_a, scale_a (sx still packed)
+                                0,
                                 sy_i32,
-                            ],  # opsel_b, scale_b
+                            ],  # opsel_b=0: sy byte pre-extracted to bits[7:0]
                         )
 
             return current_accs
@@ -1303,6 +1633,204 @@ def compile_fp8_einsum_clean_ue8m0(
                     val_bf16 = fx.BFloat16(val)
                     idx_out = idx_base + (ni * 16)
                     buffer_ops.buffer_store(val_bf16, z_rsrc, idx_out)
+
+            mfma_epilog(
+                use_cshuffle=False,
+                arith=fx.arith,
+                range_constexpr=range_constexpr,
+                m_repeat=m_repeat,
+                lane_div_16=lane_div_16,
+                bx_m=bx_m,
+                body_row=body_row,
+            )
+
+        def store_output_splitk(final_accs):
+            # split-K reduction, DEVICE-ZEROED, reduce DIRECTLY in bf16 into arg_z
+            # (the real bf16 output) — no fp32 workspace, no host copy. Pattern
+            # ported from splitk_hgemm.py (zero_c / split_k_barrier / packed-bf16
+            # atomic write-back). Sequence per output tile (bx,by):
+            #   1. zero_c(): the kz==0 CTA zeros this tile in arg_z, then raises
+            #      signal[tile]; every other kz CTA spin-waits on signal so it
+            #      never atomic-adds into not-yet-zeroed memory.
+            #   2. all kz CTAs packed-bf16-atomic-add their partials into arg_z.
+            #   3. the last arriver (semaphore counts to split_k-1) resets
+            #      signal[tile]=semaphore[tile]=0 so the scratch is reusable.
+            from flydsl._mlir.dialects import llvm as _llvm
+            from flydsl._mlir.dialects import scf as _scf
+            from flydsl._mlir import ir as _ir
+            from flydsl._mlir.dialects import arith as _arith
+
+            def _ptr1(base_tensor, elem_idx, elem_bytes):
+                # Build an !llvm.ptr<1> (global) at base_tensor + elem_idx*bytes.
+                # extract_base_index returns a raw index ir.Value; wrap it so the
+                # byte-offset add happens in flydsl, then hand the index to
+                # create_llvm_ptr (it casts index->i64->ptr internally).
+                base = fx.Index(buffer_ops.extract_base_index(base_tensor))
+                addr = base + fx.Index(elem_idx) * fx.Index(elem_bytes)
+                p = buffer_ops.create_llvm_ptr(addr.ir_value(), address_space=1)
+                return p._value if hasattr(p, "_value") else p
+
+            _tid0 = _arith.cmpi(
+                _arith.CmpIPredicate.eq,
+                fx.Int32(tx).ir_value(),
+                fx.Int32(0).ir_value(),
+            )
+
+            def zero_c():
+                # kz==0 zeros this output tile in arg_z (bf16), then raises signal.
+                cond_kz0 = _arith.cmpi(
+                    _arith.CmpIPredicate.eq,
+                    fx.Int32(kz).ir_value(),
+                    fx.Int32(0).ir_value(),
+                )
+                if_kz0 = _scf.IfOp(cond_kz0, results_=[], has_else=False)
+                with _ir.InsertionPoint(if_kz0.then_block):
+                    z0 = fx.BFloat16(0.0)
+
+                    def body_zero(*, mi, ii, row_in_tile, row):
+                        col_base_n = by_n + n_tile_base + lane_mod_16
+                        idx_base = (
+                            row * fx.Index(stride_b_z) + z_head_elem_off + col_base_n
+                        )
+                        for ni in range_constexpr(num_acc_n):
+                            idx_out = idx_base + (ni * 16)
+                            buffer_ops.buffer_store(z0, z_rsrc, idx_out)
+
+                    mfma_epilog(
+                        use_cshuffle=False,
+                        arith=fx.arith,
+                        range_constexpr=range_constexpr,
+                        m_repeat=m_repeat,
+                        lane_div_16=lane_div_16,
+                        bx_m=bx_m,
+                        body_row=body_zero,
+                    )
+                    gpu.barrier()
+                    # tid==0 publishes signal=1 (cache-bypassing store, sc0 sc1).
+                    if_t0 = _scf.IfOp(_tid0, results_=[], has_else=False)
+                    with _ir.InsertionPoint(if_t0.then_block):
+                        sig_ptr = _ptr1(arg_signal, signal_idx, 4)
+                        _llvm.InlineAsmOp(
+                            None,
+                            [sig_ptr, _arith.constant(fx.Int32.ir_type, 1)],
+                            "global_store_dword $0, $1, off sc0 sc1",
+                            "v,v",
+                            has_side_effects=True,
+                        )
+                        _scf.YieldOp([])
+                    gpu.barrier()
+                    _scf.YieldOp([])
+
+            def split_k_barrier():
+                # Every CTA: spin until signal[tile]!=0 (tile is zeroed), then
+                # count arrivals; the last arriver clears signal+semaphore.
+                if_t0 = _scf.IfOp(_tid0, results_=[], has_else=False)
+                with _ir.InsertionPoint(if_t0.then_block):
+                    init0 = _arith.constant(fx.Int32.ir_type, 0)
+                    w = _scf.WhileOp([fx.Int32.ir_type], [init0])
+                    before = _ir.Block.create_at_start(w.before, [fx.Int32.ir_type])
+                    after = _ir.Block.create_at_start(w.after, [fx.Int32.ir_type])
+                    with _ir.InsertionPoint(before):
+                        cur = before.arguments[0]
+                        need = _arith.CmpIOp(
+                            _arith.CmpIPredicate.eq,
+                            cur,
+                            _arith.constant(fx.Int32.ir_type, 0),
+                        ).result
+                        _scf.ConditionOp(need, [cur])
+                    with _ir.InsertionPoint(after):
+                        sig_ptr = _ptr1(arg_signal, signal_idx, 4)
+                        data = _llvm.InlineAsmOp(
+                            fx.Int32.ir_type,
+                            [sig_ptr],
+                            "global_load_dword $0, $1, off sc1",
+                            "=v,v",
+                            has_side_effects=True,
+                        ).result
+                        rocdl.s_waitcnt(0)
+                        _scf.YieldOp([data])
+                    _scf.YieldOp([])
+                rocdl.sched_barrier(0)
+                gpu.barrier()
+                # last arriver resets scratch (so signal/semaphore are reusable).
+                if_t0b = _scf.IfOp(_tid0, results_=[], has_else=False)
+                with _ir.InsertionPoint(if_t0b.then_block):
+                    sem_ptr = _ptr1(arg_semaphore, signal_idx, 4)
+                    arrive = _llvm.AtomicRMWOp(
+                        _llvm.AtomicBinOp.add,
+                        sem_ptr,
+                        _arith.constant(fx.Int32.ir_type, 1),
+                        _llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    ).result
+                    cond_last = _arith.cmpi(
+                        _arith.CmpIPredicate.eq,
+                        arrive,
+                        fx.Int32(split_k - 1).ir_value(),
+                    )
+                    if_last = _scf.IfOp(cond_last, results_=[], has_else=False)
+                    with _ir.InsertionPoint(if_last.then_block):
+                        sem_ptr2 = _ptr1(arg_semaphore, signal_idx, 4)
+                        sig_ptr2 = _ptr1(arg_signal, signal_idx, 4)
+                        _llvm.InlineAsmOp(
+                            None,
+                            [sem_ptr2, _arith.constant(fx.Int32.ir_type, 0)],
+                            "global_store_dword $0, $1, off sc0 sc1",
+                            "v,v",
+                            has_side_effects=True,
+                        )
+                        _llvm.InlineAsmOp(
+                            None,
+                            [sig_ptr2, _arith.constant(fx.Int32.ir_type, 0)],
+                            "global_store_dword $0, $1, off sc0 sc1",
+                            "v,v",
+                            has_side_effects=True,
+                        )
+                        _scf.YieldOp([])
+                    _scf.YieldOp([])
+                gpu.barrier()
+
+            zero_c()
+            split_k_barrier()
+
+            def body_row(*, mi, ii, row_in_tile, row):
+                col_base_n = by_n + n_tile_base + lane_mod_16
+                idx_base = row * fx.Index(stride_b_z) + z_head_elem_off + col_base_n
+                for ni in range_constexpr(num_acc_n):
+                    acc_idx = mi * num_acc_n + ni
+                    val = Vec(final_accs[acc_idx])[ii]  # fp32 partial
+                    v_bf16 = fx.BFloat16(val)
+                    idx_out = idx_base + (ni * 16)
+                    # Zero-partner packed bf16 atomic: each owned element sits at
+                    # an even/odd bf16 slot (col stride 16 is even -> parity tracks
+                    # lane_mod_16 parity). The lane writes [v,0] into the lo half
+                    # if idx_out is even, else [0,v] into the hi half, targeting
+                    # the shared 32-bit dword (idx_out//2)*4. The two lanes that
+                    # share a dword each do a full packed 32-bit atomic RMW adding
+                    # their half + 0 -> compose correctly. Lowers to the native
+                    # gfx950 buffer_atomic_pk_add_bf16 (probe-verified).
+                    z0 = fx.BFloat16(0.0)
+                    is_even = _arith.cmpi(
+                        _arith.CmpIPredicate.eq,
+                        (fx.Index(idx_out) % fx.Index(2)).ir_value(),
+                        fx.Index(0).ir_value(),
+                    )
+                    lo = fx.BFloat16(
+                        _arith.select(is_even, v_bf16.ir_value(), z0.ir_value())
+                    )
+                    hi = fx.BFloat16(
+                        _arith.select(is_even, z0.ir_value(), v_bf16.ir_value())
+                    )
+                    pair = Vec.from_elements([lo, hi], fx.BFloat16)
+                    dword_byte = (fx.Index(idx_out) // fx.Index(2)) * fx.Index(4)
+                    rocdl.raw_ptr_buffer_atomic_fadd(
+                        pair.ir_value(),
+                        z_rsrc,
+                        fx.Int32(dword_byte).ir_value(),
+                        fx.Int32(0).ir_value(),
+                        fx.Int32(0).ir_value(),
+                    )
 
             mfma_epilog(
                 use_cshuffle=False,
@@ -1557,13 +2085,14 @@ def compile_fp8_einsum_clean_ue8m0(
                     else:  # tile_n == 256
                         d128_global = by * fx.Index(2) + d128_owner_v
                     if quant_transpose_scale:
-                        # Layout (H, D//128, B): memory (H*D/128, B) contiguous,
-                        # for a no-copy column-major (B, H*D/128) scale view
-                        # downstream. sz_idx = h*(D//128 * B) + d128*B + b.
+                        # Layout (H, D//128, B): memory (H, D//128, B) contiguous.
+                        # This MATCHES the HIP per_group_quant transpose layout
+                        # used by the qz2 2-pass path (which feeds HIP a (B, H*D)
+                        # view -> bytes (h*(D//128)+d128, b)), so qz1 and qz2
+                        # return the SAME transposed scale for any (H, D, R, B).
+                        # sz_idx = h*(D//128)*B + d128*B + b.
                         sz_idx = (
-                            bx_h * (fx.Index(D // 128) * c_b)
-                            + d128_global * c_b
-                            + row
+                            bx_h * fx.Index(D // 128) * c_b + d128_global * c_b + row
                         )
                     else:
                         # Layout (B, H, D//128) — sz_idx = b*(H*D//128) + h*(D//128) + d128
@@ -1605,174 +2134,222 @@ def compile_fp8_einsum_clean_ue8m0(
         # Picks the right epilogue based on mode.
         if quant_output:
             store_output = store_output_qz
+        elif const_expr(split_k > 1):
+            store_output = store_output_splitk
         else:
             store_output = store_output_bf16
 
-        # ── K-loop driver: unrolled pingpong (preshuffle-style) ──
-        # We mirror preshuffle_gemm's structure:
-        #   prologue: load tile-0 into pong, prefetch a0_pong from pong
-        #   loop iter k in 0..num_tiles-2 (step 2):
-        #     ── half-pong→ping ──
-        #     issue async A tile (k+1) → ping
-        #     b_ping, sx_ping, sy_ping = load (k+1)
-        #     compute_tile on (b_pong, lds_pong, sx_pong, sy_pong, a0_pong)
-        #     s_waitcnt(vmcnt=N_keep, lgkmcnt=0); barrier
-        #     a0_ping = prefetch first A pack from ping
-        #     ── half-ping→pong ──
-        #     issue async A tile (k+2) → pong
-        #     b_pong, sx_pong, sy_pong = load (k+2)
-        #     compute_tile on (b_ping, lds_ping, sx_ping, sy_ping, a0_ping)
-        #     s_waitcnt(...); barrier
-        #     a0_pong = prefetch first A pack from pong
-        #   epilog: depends on parity of num_tiles
+        # ── K-loop driver: ONE unified 2-stage ping/pong driver ─────────
+        # This single driver serves BOTH split_k==1 and split_k>1. The two used
+        # to be separate (a hand-unrolled ping/pong for split_k==1 and a generic
+        # rotating-buffer loop for split_k>1); they shared the load/compute/a0
+        # sequence, so they are merged here. The only per-path differences are
+        # selected by const_expr(split_k > 1):
         #
-        # Note: We also tried a single-barrier-per-iter variant (load both
-        # pong+ping in prologue, drain both DMAs with one barrier). It
-        # regressed 1.6-5.4% — ATT showed the extra barrier was actually
-        # cheaper than the increased compute/MFMA stall + gmem-load stall
-        # caused by the larger barrier wait window.
-        # Archived in att_1barrier_regression/.
-        # n_vmem_keep counts B sync gmem loads (in vmcnt queue) that
-        # should remain in flight when we hit the post-compute barrier.
-        n_vmem_keep = num_b_loads
+        #   * BARRIER placement. gpu.barrier() is replaced by rocdl.s_barrier()
+        #     throughout this driver — we let the backend SIInsertWaitcnts pass
+        #     insert vmcnt/lgkmcnt rather than hardcoding the conservative
+        #     vmcnt(0) lgkmcnt(0) fence that gpu.barrier() implies.
+        #       - split_k==1: ONE barrier AFTER each compute_tile (publishes the
+        #         already-issued NEXT tile's A-DMA + WAR-protects the slab the
+        #         next load will overwrite). This is the proven schedule — a
+        #         single-barrier-per-iter variant regressed 1.6-5.4%.
+        #       - split_k>1 : additionally a PRE-compute barrier (publish THIS
+        #         tile's A-LDS before reading it), matching the former split-K
+        #         driver's two-barriers-per-tile partial-drain schedule.
+        #
+        #   * PHANTOM GUARD for uneven split-K. _clamp_kt keeps phantom (out-of-
+        #     slice) tile loads in-bounds; _guarded() masks their compute via a
+        #     select on (kt < _my_tiles). Both compile to no-ops when _even
+        #     (always true for split_k==1 and for even split-K), so split_k==1 is
+        #     byte-for-byte the old hand-unrolled driver plus the s_barrier swap.
+        #
+        #   * K addressing. _k_off() already adds the runtime slice base kt0 when
+        #     split_k>1 and is identity when ==1, so it is used uniformly.
 
-        # s_waitcnt encoding: vmcnt=N_keep, expcnt=max, lgkmcnt=0.
-        def _waitcnt_vmcnt_lgkm0(vmc):
-            vm_lo = vmc & 0xF
-            vm_hi = (vmc >> 4) & 0x3
-            return vm_lo | (7 << 4) | (0 << 8) | (vm_hi << 14)
+        # ── workgroup barrier ──────────────────────────────────────
+        # We emit `s_waitcnt vmcnt(N)` + `s_barrier` via inline asm (the same
+        # idiom as splitk_hgemm.__barrier), letting the compiler manage lgkmcnt.
+        # Using bare rocdl.s_barrier() (no explicit vmcnt) NaNs at tk=256/bsw=0:
+        # the backend under-drains the gmem→LDS A-DMA before the cross-wave read.
+        #
+        # The barrier must publish the slab the NEXT compute reads (its A-DMA must
+        # retire) but should NOT fully drain HBM — the NEXT tile's A loads, issued
+        # just before this barrier, can stay in flight. From the ISA, the compiler
+        # itself re-establishes exactly `vmcnt(num_a_loads)` right after our
+        # barrier (the next tile's A-DMA count), then does the LDS reads. So
+        # draining to `vmcnt(num_a_loads)` retires the slab-publish A-DMA (older,
+        # in-order vmcnt) while keeping the next tile's A-DMA pipelined — instead
+        # of the full `vmcnt(0)` drain that stalls the load pipeline.
+        #
+        from flydsl._mlir.dialects import llvm as _llvm_bar
 
-        _waitcnt_imm = _waitcnt_vmcnt_lgkm0(n_vmem_keep)
+        # next tile's A+B load count to keep in flight at the pre-compute barrier.
+        _bar_keep_vmcnt = num_a_loads + num_b_loads
+
+        def _waitcnt_barrier(vmcnt):
+            _llvm_bar.InlineAsmOp(
+                None,
+                [],
+                f"s_waitcnt vmcnt({vmcnt})\n\ts_barrier",
+                "",
+                has_side_effects=True,
+            )
+
+        # _even: True for split_k==1 and for K-slices that divide evenly. When
+        # True, _clamp_kt / _guarded compile out (no phantom tail).
+        _even = (split_k == 1) or ((R // 512) % split_k == 0)
+
+        def _clamp_kt(kt):
+            # Relative tile index for the A/B/scale LOADS. Even slices: identity,
+            # returning the RAW Python int `kt` so _k_off folds the offset at
+            # compile time (same as the old hand-unrolled path). Uneven: clamp
+            # phantom tiles (kt >= my_tiles) to the last real tile (runtime
+            # fx.Index) so they load valid in-slice data (no OOB); their compute
+            # contribution is masked by _guarded below.
+            if const_expr(_even):
+                return kt
+            in_range = fx.arith.cmpi(
+                fx.arith.CmpIPredicate.slt,
+                fx.Int32(fx.Index(kt)).ir_value(),
+                fx.Int32(_my_tiles).ir_value(),
+            )
+            last = _my_tiles - fx.Index(1)
+            return fx.Index(
+                fx.Int32(
+                    fx.arith.select(
+                        in_range,
+                        fx.Int32(fx.Index(kt)).ir_value(),
+                        fx.Int32(last).ir_value(),
+                    )
+                )
+            )
+
+        def _guarded(new_accs, old_accs, kt):
+            # Accept new_accs only if tile kt is real (kt < my_tiles), else keep
+            # old (phantom tiles contribute nothing). No-op when _even.
+            if const_expr(_even):
+                return new_accs
+            real = fx.arith.cmpi(
+                fx.arith.CmpIPredicate.slt,
+                fx.Int32(fx.Index(kt)).ir_value(),
+                fx.Int32(_my_tiles).ir_value(),
+            )
+            return [
+                Vec(fx.arith.select(real, Vec(na).ir_value(), Vec(oa).ir_value()))
+                for na, oa in zip(new_accs, old_accs)
+            ]
 
         Vec_init = fx.Vector.filled(4, 0.0, fx.Float32)
         accs = [Vec_init] * (num_acc_n * m_repeat)
-        # Per-WG K-tile loop length: R / tile_k.
-        num_tiles = R // tile_k
-
-        def _k_off(base_elem_int):
-            return fx.Index(base_elem_int)
-
-        # 1896 TF reference: B is gmem→regs (sync), A is gmem→LDS (async).
-        # Per-iter pattern:
-        #   issue async A (next k) → ping
-        #   sync-load B (next k) → b_ping regs
-        #   compute_tile on (b_pong regs, lds_a_pong)
-        #   s_waitcnt(vmcnt=N_b, lgkmcnt=0) + barrier
-        load_sx_to_lds()
-        load_sy_to_lds()
-        load_a_tile_to_lds_async(_k_off(0), lds_a_pong)
-        b_pong = load_b_tile(_k_off(0))
-        gpu.barrier()
-        sx_pong = prefetch_sx_tile(0)
-        sy_pong = prefetch_sy_tile(0)
-        a0_pong = lds_a0_prefetch(lds_a_pong)
-
-        if const_expr(num_tiles == 1):
-            accs = compute_tile(
-                accs,
-                b_pong,
-                0,
-                lds_a_pong,
-                sx_pong,
-                sy_pong,
-                a0_prefetch=a0_pong,
-            )
+        # Per-CTA K-tile loop length.
+        #   split_k==1: full K = R/tile_k.
+        #   split_k>1 : the guarded loop runs _max_tiles iterations (compile-
+        #     time); each CTA does its runtime _my_tiles and predicates the rest
+        #     (uneven slices). _my_tiles == _max_tiles for even slices.
+        if const_expr(split_k > 1):
+            num_tiles = _max_tiles
         else:
-            if const_expr(num_tiles % 2 == 1):
-                _loop_end_excl = num_tiles - 1
+            num_tiles = _num_k_tiles
+
+        def _k_off(base_elem):
+            # base_elem is rel_kt*tile_k — either a Python int (even/split_k==1,
+            # constexpr-foldable) or an fx.Index (uneven split-K clamped index).
+            # fx.Index(x) accepts both (int -> constant; Index -> passthrough).
+            if const_expr(split_k > 1):
+                return kt0 * fx.Index(tile_k) + fx.Index(base_elem)
+            return fx.Index(base_elem)
+
+        load_sx_to_lds()
+        # sy is loaded gmem->reg per K-tile in prefetch_sy_tile (no LDS slab).
+
+        # ── Unified ping/pong driver (split_k==1 AND split_k>1) ──────────
+        # B is gmem→regs (sync), A is gmem→LDS (async), double-buffered
+        # ping/pong. Per tile (see _step):
+        #   load_a_sync(next) ; load_b(next)
+        #   s_waitcnt vmcnt(num_a+num_b) ; barrier()   # keep next A+B in flight,
+        #       drain older -> publishes the CURRENT slab
+        #   fetch_sy(cur) ; fetch_a0(cur)              # sx is read in compute_tile
+        #   compute_tile(cur)
+        #   barrier()                                  # WAR: cur read before reuse
+        # The SAME schedule serves both split_k==1 and split_k>1. sy + a0 are
+        # fetched for the CURRENT tile right before compute (not prefetched
+        # ahead). _load_ab() applies the phantom clamp (no-op when even) so
+        # phantom split-K tiles never read OOB; _guarded() masks their compute.
+        # compute_tile's `kt` is the constexpr relative tile index in all cases
+        # (absolute K folded via kt0/_scale_base_packed outside).
+
+        def _load_ab(lds_slab, kt):
+            # Issue ONLY the A gmem→LDS DMA + B gmem→reg for relative tile `kt`.
+            # sx is read from LDS inside compute_tile (prefetch_sx_tile is a
+            # no-op); sy + a0 are fetched for the CURRENT tile right before
+            # compute (see _step). _clamp_kt keeps phantom split-K loads in-bounds.
+            ck = _clamp_kt(kt)
+            a_off = _k_off(ck * tile_k)
+            load_a_tile_to_lds_async(a_off, lds_slab)
+            return load_b_tile(a_off)
+
+        # Per-tile pipeline, exactly:
+        #   load_a_sync(next) ; load_b(next)
+        #   s_waitcnt vmcnt(num_a + num_b) ; s_barrier   # keep next A+B in
+        #       flight, drain older -> publishes CURRENT slab
+        #   fetch_sx(cur) [no-op] ; fetch_sy(cur) ; fetch_a0(cur)
+        #   compute_tile(cur)
+        #   s_barrier                                    # WAR only (bare)
+        # The pre-compute barrier publishes the CURRENT slab (loaded one step
+        # earlier); the NEXT tile's A+B, just issued, stay pipelined because the
+        # vmcnt keep doesn't drain them. The trailing bare s_barrier WAR-protects
+        # the current slab before the next iteration's load overwrites it (no
+        # vmem fence needed there).
+        def _step(accs, cur, cur_lds, b_cur, nxt, nxt_lds):
+            if nxt is not None:
+                b_nxt = _load_ab(nxt_lds, nxt)
+                _waitcnt_barrier(
+                    _bar_keep_vmcnt
+                )  # vmcnt(num_a+num_b): keep next A+B, publish cur
             else:
-                _loop_end_excl = num_tiles - 2
+                b_nxt = None
+                _waitcnt_barrier(
+                    0
+                )  # last tile: drain to publish cur (no next loads to keep)
+            sy_cur = prefetch_sy_tile(cur)
+            a0_cur = lds_a0_prefetch(cur_lds)
+            accs = _guarded(
+                compute_tile(accs, b_cur, cur, cur_lds, sy_cur, a0_prefetch=a0_cur),
+                accs,
+                cur,
+            )
+            rocdl.s_barrier()
+            return accs, b_nxt
 
-            for kt_base in range_constexpr(0, _loop_end_excl, 2):
-                next_k1 = _k_off((kt_base + 1) * tile_k)
-                load_a_tile_to_lds_async(next_k1, lds_a_ping)
-                b_ping = load_b_tile(next_k1)
-                sx_ping = prefetch_sx_tile(kt_base + 1)
-                sy_ping = prefetch_sy_tile(kt_base + 1)
-
-                accs = compute_tile(
-                    accs,
-                    b_pong,
-                    kt_base,
-                    lds_a_pong,
-                    sx_pong,
-                    sy_pong,
-                    a0_prefetch=a0_pong,
-                )
-
-                rocdl.s_waitcnt(_waitcnt_imm)
-                gpu.barrier()
-                a0_ping = lds_a0_prefetch(lds_a_ping)
-
-                next_k2 = _k_off((kt_base + 2) * tile_k)
-                load_a_tile_to_lds_async(next_k2, lds_a_pong)
-                b_pong = load_b_tile(next_k2)
-                sx_pong = prefetch_sx_tile(kt_base + 2)
-                sy_pong = prefetch_sy_tile(kt_base + 2)
-
-                accs = compute_tile(
-                    accs,
-                    b_ping,
-                    kt_base + 1,
-                    lds_a_ping,
-                    sx_ping,
-                    sy_ping,
-                    a0_prefetch=a0_ping,
-                )
-
-                rocdl.s_waitcnt(_waitcnt_imm)
-                gpu.barrier()
-                a0_pong = lds_a0_prefetch(lds_a_pong)
-
-            if const_expr(num_tiles % 2 == 1):
-                accs = compute_tile(
-                    accs,
-                    b_pong,
-                    _loop_end_excl,
-                    lds_a_pong,
-                    sx_pong,
-                    sy_pong,
-                    a0_prefetch=a0_pong,
-                )
-            else:
-                next_k1 = _k_off((_loop_end_excl + 1) * tile_k)
-                load_a_tile_to_lds_async(next_k1, lds_a_ping)
-                b_ping = load_b_tile(next_k1)
-                sx_ping = prefetch_sx_tile(_loop_end_excl + 1)
-                sy_ping = prefetch_sy_tile(_loop_end_excl + 1)
-
-                accs = compute_tile(
-                    accs,
-                    b_pong,
-                    _loop_end_excl,
-                    lds_a_pong,
-                    sx_pong,
-                    sy_pong,
-                    a0_prefetch=a0_pong,
-                )
-
-                rocdl.s_waitcnt(_waitcnt_imm)
-                gpu.barrier()
-                a0_ping = lds_a0_prefetch(lds_a_ping)
-
-                accs = compute_tile(
-                    accs,
-                    b_ping,
-                    _loop_end_excl + 1,
-                    lds_a_ping,
-                    sx_ping,
-                    sy_ping,
-                    a0_prefetch=a0_ping,
-                )
+        # Prologue: issue tile-0's A+B into pong (publish happens in _step's
+        # pre-compute barrier).
+        b_cur = _load_ab(lds_a_pong, 0)
+        for kt in range_constexpr(0, num_tiles):
+            cur_lds = lds_a_pong if (kt % 2 == 0) else lds_a_ping
+            nxt_lds = lds_a_ping if (kt % 2 == 0) else lds_a_pong
+            nxt = (kt + 1) if (kt + 1) < num_tiles else None
+            accs, b_cur = _step(accs, kt, cur_lds, b_cur, nxt, nxt_lds)
 
         store_output(accs)
 
     # ── Kernel + host launcher ───────────────────────────────
-    # The qz path threads arg_sz as a second tensor right after arg_z; the
-    # bf16 path omits it. We declare both kernels statically (flydsl's
-    # @flyc.kernel inspects the function signature at decoration time), then
-    # wrap each in a launch helper. The bodies are identical apart from the
-    # `arg_sz` argument plumbed through to `_kernel_body`.
+    # ── ONE unified kernel + jit, with thin per-variant Python launchers ──
+    # All three output modes (bf16, qz, bf16 split-K) trace the SAME _kernel_body
+    # and use the SAME grid, differing only in which extra tensors they consume:
+    #   qz       -> arg_sz   (D-128 group scale, written by the in-kernel quant)
+    #   split-K  -> arg_signal + arg_semaphore (device-zero/atomic-reduce scratch)
+    # flydsl's @flyc.kernel builds the func signature from the runtime arg VALUES
+    # and REJECTS None in a tensor slot, so rather than three signatures we
+    # declare ONE kernel taking the full superset of 8 tensors and pass tiny
+    # DUMMY tensors for the slots a given variant doesn't use. The dummies are
+    # never dereferenced: _kernel_body is called with Python `None` for the
+    # unused slots (quant_output / split_k are compile-time constants here), so
+    # the corresponding branches are not traced. The external launcher ABI is
+    # unchanged — the thin wrappers below keep the exact positional signatures
+    # callers already use.
+
+    import torch as _torch
 
     def _finalize_allocators():
         allocator_pong.finalized = False
@@ -1786,75 +2363,265 @@ def compile_fp8_einsum_clean_ue8m0(
 
     def _launch_grid(i32_b):
         gx_per_h = (i32_b + (tile_m - 1)) // tile_m
-        return (gx_per_h * H, D // tile_n, 1)
+        # gridZ = split_k: each Z-CTA reduces one K-slice via atomicAdd.
+        return (gx_per_h * H, D // tile_n, split_k)
+
+    @flyc.kernel
+    def kernel_gemm(
+        arg_z: fx.Tensor,
+        arg_sz: fx.Tensor,
+        arg_x: fx.Tensor,
+        arg_y: fx.Tensor,
+        arg_sx: fx.Tensor,
+        arg_sy: fx.Tensor,
+        arg_signal: fx.Tensor,
+        arg_semaphore: fx.Tensor,
+        i32_b: fx.Int32,
+    ):
+        # Pass None (not the dummy tensor) for slots this config doesn't use, so
+        # _kernel_body's trace-time `is None` gates fire and the dummy is never
+        # traced/dereferenced. quant_output / split_k are closure constants.
+        _kernel_body(
+            arg_z,
+            arg_sz if quant_output else None,
+            arg_x,
+            arg_y,
+            arg_sx,
+            arg_sy,
+            i32_b,
+            arg_signal if split_k > 1 else None,
+            arg_semaphore if split_k > 1 else None,
+        )
+
+    @flyc.jit
+    def launch_gemm(
+        arg_z: fx.Tensor,
+        arg_sz: fx.Tensor,
+        arg_x: fx.Tensor,
+        arg_y: fx.Tensor,
+        arg_sx: fx.Tensor,
+        arg_sy: fx.Tensor,
+        arg_signal: fx.Tensor,
+        arg_semaphore: fx.Tensor,
+        i32_b: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _finalize_allocators()
+        kernel_gemm._func.__name__ = KERNEL_NAME
+        launcher = kernel_gemm(
+            arg_z,
+            arg_sz,
+            arg_x,
+            arg_y,
+            arg_sx,
+            arg_sy,
+            arg_signal,
+            arg_semaphore,
+            i32_b,
+        )
+        launcher.launch(
+            grid=_launch_grid(i32_b), block=(total_threads, 1, 1), stream=stream
+        )
+
+    # 1-element read-only dummy per device for unused kernel arg slots (never
+    # written/read by the kernel; only satisfies flydsl's no-None rule).
+    _dummy_cache: dict = {}
+
+    def _dummy(device):
+        d = _dummy_cache.get(device.index)
+        if d is None:
+            _dummy_cache[device.index] = d = _torch.zeros(
+                1, dtype=_torch.float32, device=device
+            )
+        return d
 
     if quant_output:
-
-        @flyc.kernel
-        def kernel_gemm(
-            arg_z: fx.Tensor,
-            arg_sz: fx.Tensor,
-            arg_x: fx.Tensor,
-            arg_y: fx.Tensor,
-            arg_sx: fx.Tensor,
-            arg_sy: fx.Tensor,
-            i32_b: fx.Int32,
-        ):
-            _kernel_body(arg_z, arg_sz, arg_x, arg_y, arg_sx, arg_sy, i32_b)
-
-        @flyc.jit
-        def launch_gemm(
-            arg_z: fx.Tensor,
-            arg_sz: fx.Tensor,
-            arg_x: fx.Tensor,
-            arg_y: fx.Tensor,
-            arg_sx: fx.Tensor,
-            arg_sy: fx.Tensor,
-            i32_b: fx.Int32,
-            stream: fx.Stream,
-        ):
-            _finalize_allocators()
-            kernel_gemm._func.__name__ = KERNEL_NAME
-            launcher = kernel_gemm(
+        # qz: launch(z_fp8, sz_fp32, x, y, sx, sy, B, stream). signal/semaphore
+        # unused -> dummies.
+        def qz_launch(arg_z, arg_sz, arg_x, arg_y, arg_sx, arg_sy, i32_b, stream):
+            stream = getattr(stream, "cuda_stream", stream)
+            dummy = _dummy(arg_z.device)
+            launch_gemm(
                 arg_z,
                 arg_sz,
                 arg_x,
                 arg_y,
                 arg_sx,
                 arg_sy,
+                dummy,
+                dummy,
                 i32_b,
+                int(stream),
             )
-            launcher.launch(grid=_launch_grid(i32_b), block=(256, 1, 1), stream=stream)
 
-    else:
+        return qz_launch
 
-        @flyc.kernel
-        def kernel_gemm(
-            arg_z: fx.Tensor,
-            arg_x: fx.Tensor,
-            arg_y: fx.Tensor,
-            arg_sx: fx.Tensor,
-            arg_sy: fx.Tensor,
-            i32_b: fx.Int32,
-        ):
-            _kernel_body(arg_z, None, arg_x, arg_y, arg_sx, arg_sy, i32_b)
+    if split_k > 1:
+        # bf16 split-K: device-zeroed, packed-bf16-atomic reduction directly into
+        # the bf16 output arg_z (NO fp32 workspace / host zero / copy). The first
+        # K-slice CTA zeros each output tile, a signal/semaphore spin-wait barrier
+        # orders the zero before the atomics, and the last arriver resets the
+        # scratch so it is reusable across calls. arg_sz unused -> dummy.
+        # ABI unchanged: split_k_launch(z_bf16, x, y, sx, sy, B, stream).
 
-        @flyc.jit
-        def launch_gemm(
-            arg_z: fx.Tensor,
-            arg_x: fx.Tensor,
-            arg_y: fx.Tensor,
-            arg_sx: fx.Tensor,
-            arg_sy: fx.Tensor,
-            i32_b: fx.Int32,
-            stream: fx.Stream,
-        ):
-            _finalize_allocators()
-            kernel_gemm._func.__name__ = KERNEL_NAME
-            launcher = kernel_gemm(arg_z, arg_x, arg_y, arg_sx, arg_sy, i32_b)
-            launcher.launch(grid=_launch_grid(i32_b), block=(256, 1, 1), stream=stream)
+        # Persistent per-tile scratch (signal + semaphore), zeroed ONCE and
+        # self-reset by the last CTA each launch -> reusable. Keyed by
+        # (device, num_tiles). num_tiles MUST equal the device grid gx*gy.
+        _splitk_scratch: dict = {}
 
-    return launch_gemm
+        def _get_scratch(device, num_tiles):
+            key = (device.index, num_tiles)
+            t = _splitk_scratch.get(key)
+            if t is None:
+                signal = _torch.zeros(num_tiles, dtype=_torch.int32, device=device)
+                semaphore = _torch.zeros(num_tiles, dtype=_torch.int32, device=device)
+                _splitk_scratch[key] = t = (signal, semaphore)
+            return t
+
+        def split_k_launch(arg_z, arg_x, arg_y, arg_sx, arg_sy, i32_b, stream):
+            B = int(i32_b)
+            # Accept a raw HIP stream int or a torch.cuda.Stream object.
+            stream = getattr(stream, "cuda_stream", stream)
+            # Per-tile scratch count = device grid gx*gy =
+            #   (ceil(B/tile_m)*H) * (D//tile_n). Keep this formula IN SYNC with
+            #   _launch_grid / the device signal_idx, or the indexing corrupts.
+            gx_per_h = (B + (tile_m - 1)) // tile_m
+            num_tiles = gx_per_h * H * (D // tile_n)
+            signal, semaphore = _get_scratch(arg_z.device, num_tiles)
+            # Device self-zeros the output + scratch ordering is fully on-device,
+            # so we just launch on the caller's stream (no side stream / events).
+            launch_gemm(
+                arg_z,
+                _dummy(arg_z.device),
+                arg_x,
+                arg_y,
+                arg_sx,
+                arg_sy,
+                signal,
+                semaphore,
+                i32_b,
+                int(stream),
+            )
+
+        return split_k_launch
+
+    # bf16, split_k == 1: launch(z_bf16, x, y, sx, sy, B, stream). sz + scratch
+    # all unused -> dummies.
+    def bf16_launch(arg_z, arg_x, arg_y, arg_sx, arg_sy, i32_b, stream):
+        stream = getattr(stream, "cuda_stream", stream)
+        dummy = _dummy(arg_z.device)
+        launch_gemm(
+            arg_z,
+            dummy,
+            arg_x,
+            arg_y,
+            arg_sx,
+            arg_sy,
+            dummy,
+            dummy,
+            i32_b,
+            int(stream),
+        )
+
+    return bf16_launch
+
+
+def compile_fp8_einsum_clean_ue8m0_qz_splitk(
+    *,
+    H: int,
+    D: int,
+    R: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    split_k: int,
+    block_swizzle_n: int = 0,
+    transpose_scale: bool = False,
+):
+    """2-PASS split-K fp8 (QZ) output.
+
+    Pass 1: the bf16-split-K GEMM (quant_output=False, split_k>1) writes the
+      COMPLETE fp32 output into a workspace via gridZ atomic reduction. This
+      gives QZ the same CTA multiplication / occupancy that bf16 split-K gets
+      (and allows tile_n<128 — the per-D128 amax is deferred to pass 2).
+    Pass 2: a torch quant pass reads the complete fp32 workspace, computes the
+      per-(B,H,D//128) amax, scale = amax/448, and casts to fp8 e4m3 + sz.
+      Because it sees the FULL summed output, the amax is correct (unlike the
+      in-kernel QZ epilogue, which can't span split-K partitions).
+
+    ABI (same as compile_fp8_einsum_clean_ue8m0_qz):
+      launch(z_fp8, sz_fp32, x_fp8, y_pre, sx_i32, sy_i32, B, stream)
+      sz layout: (B, H, D//128), or (H, D//128, B) if transpose_scale.
+    """
+    import torch as _torch
+    from aiter.ops.quant import per_group_quant_hip as _pgq
+    from aiter.utility import dtypes as _dtypes
+
+    # Pass-1 GEMM: the bf16-output split-K kernel (gridZ atomic -> fp32
+    # workspace internally -> cast to bf16). Gives QZ the same CTA
+    # multiplication bf16 split-K gets, and allows tile_n<128 (amax deferred).
+    _gemm = compile_fp8_einsum_clean_ue8m0(
+        H=H,
+        D=D,
+        R=R,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        block_swizzle_n=block_swizzle_n,
+        quant_output=False,
+        split_k=split_k,
+    )
+
+    def launch(arg_x, arg_y, arg_sx, arg_sy, i32_b, stream):
+        """2-pass split-K QZ. RETURNS (z_fp8, sz) — no output buffers / copies.
+        ABI: (x_fp8, y_pre, sx_i32, sy_i32, B, stream) -> (z_fp8, sz).
+        """
+        B = int(i32_b)
+        dev = arg_x.device
+        # pass 1: split-K GEMM -> COMPLETE bf16 output, written DIRECTLY into zb
+        # via device-zeroed packed-bf16 atomic reduction (no fp32 workspace, no
+        # host zero/cast/copy). `_gemm` (split_k_launch) launches on the caller's
+        # `stream`; `_pgq` below runs on the current torch stream (== caller's),
+        # so pass 2 is naturally ordered after pass 1 — no extra fence needed.
+        zb = _torch.empty((B, H, D), dtype=_torch.bfloat16, device=dev)
+        _gemm(zb, arg_x, arg_y, arg_sx, arg_sy, i32_b, stream)
+        # pass 2: fused per-D128 fp8 group-quant (aiter HIP kernel, 1 launch);
+        # allocates+returns z_fp8 & sz directly (no copy). Sees the complete
+        # output -> per-D128 amax is correct.
+        #
+        # per_group_quant_hip's shuffle_scale (transpose_scale) writes the scale
+        # TRANSPOSED as flat (groups, M) for a 2D (M, N) input, where groups =
+        # N//128 (group axis OUTER) and M is the leading axis. To get the target
+        # (H, D//128, B) layout with NO host permute/.contiguous() copy, feed the
+        # 2D view (B, H*D): then M = B and the group axis spans H*(D//128) with H
+        # OUTER (D is zb's contiguous inner axis), so the flat byte order is
+        # (h*(D//128) + d128, b) == (H, D//128, B) exactly. qz1's in-kernel
+        # transpose epilogue writes the SAME (H, D//128, B) layout, so both
+        # paths agree.
+        if transpose_scale:
+            z_fp8_2d, sz = _pgq(
+                zb.view(B, H * D),
+                quant_dtype=_dtypes.fp8,
+                group_size=128,
+                transpose_scale=True,
+            )
+            # HIP returns sz.shape=(B, H*D//128) but the BYTES are
+            # (H*(D//128), B); reinterpret to the true (H, D//128, B) layout. z
+            # is unaffected by the scale shuffle — reshape it back to (B, H, D).
+            z_fp8 = z_fp8_2d.view(B, H, D)
+            sz = sz.view(H, D // 128, B)
+        else:
+            z_fp8, sz = _pgq(
+                zb.view(B * H, D),
+                quant_dtype=_dtypes.fp8,
+                group_size=128,
+                transpose_scale=False,
+            )
+            z_fp8 = z_fp8.view(B, H, D)
+            sz = sz.view(B, H, D // 128)
+        return z_fp8, sz
+
+    return launch
 
 
 def compile_fp8_einsum_clean_ue8m0_qz(
@@ -1890,9 +2657,9 @@ def compile_fp8_einsum_clean_ue8m0_qz(
     Args:
       transpose_scale: when True, scale is stored in `(H, D // 128, B)` layout
         instead of the default `(B, H, D // 128)`. Mirrors the
-        `transpose_scale` option of `aiter.ops.quant.per_group_quant_hip` —
-        useful when the scale will be re-consumed by a downstream kernel
-        that wants the D-group axis on the outside.
+        `transpose_scale` option of `aiter.ops.quant.per_group_quant_hip` (fed
+        a `(B, H*D)` view) — useful when the scale will be re-consumed by a
+        downstream kernel that wants the per-head D-group axes on the outside.
 
     Restriction (v1): tile_n in {128, 256}. tile_n=128 → 1 D-128 block per WG
     (all 4 waves contribute). tile_n=256 → 2 D-128 blocks (2 waves each).
