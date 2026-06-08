@@ -39,6 +39,15 @@ except Exception:
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
+def _is_gfx12() -> bool:
+    return get_gfx().startswith("gfx12")
+
+
+def _gfx12_default_libtype() -> str:
+    # gfx1250 lacks ASM/skinny/hipblaslt/flydsl BF16 GEMM support; use Triton.
+    return "triton"
+
+
 extensions_created = False
 untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
 tune_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
@@ -136,7 +145,9 @@ def get_GEMM_A16W16_config(
         )
         if config is not None:
             if config["libtype"] == "flydsl":
-                if is_flydsl_available():
+                if _is_gfx12():
+                    config = None
+                elif is_flydsl_available():
                     flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
                         config["kernelName"]
                     )
@@ -148,6 +159,13 @@ def get_GEMM_A16W16_config(
                         config = None
                 else:
                     config = None
+            elif _is_gfx12() and config["libtype"] in (
+                "asm",
+                "skinny",
+                "hipblaslt",
+                "opus",
+            ):
+                config = None
             if config is None:
                 continue
             if AITER_LOG_TUNED_CONFIG:
@@ -162,9 +180,9 @@ def get_GEMM_A16W16_config(
     if config is None:
         default_config = {}
         gfx = get_gfx()
-        # gfx12: no ASM/skinny/hipblaslt kernels, use torch
+        # gfx12 (gfx1250): no ASM/skinny/hipblaslt/flydsl kernels, use Triton
         if gfx.startswith("gfx12"):
-            default_config["libtype"] = "torch"
+            default_config["libtype"] = _gfx12_default_libtype()
             default_config["solidx"] = 0
         elif bpreshuffle:
             default_config["bpreshuffle"] = True
@@ -289,10 +307,12 @@ def gemm_a16w16(
         bpreshuffle=bpreshuffle,
     )
     gfx = get_gfx()
-    _no_asm = gfx.startswith("gfx12")
+    _no_asm = _is_gfx12()
     libtype = config["libtype"]
-    if _no_asm and libtype in ("asm", "skinny", "hipblaslt"):
-        libtype = "torch"
+    if _no_asm and libtype in ("asm", "skinny", "hipblaslt", "flydsl", "opus"):
+        libtype = _gfx12_default_libtype()
+    elif _no_asm and libtype == "torch":
+        libtype = _gfx12_default_libtype()
     solution_idx = config["solidx"] if libtype == config.get("libtype") else 0
     solfunc = solMap[libtype]
     out = solfunc(
