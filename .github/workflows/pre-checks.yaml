@@ -46,21 +46,8 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip3 install ruff
-      - name: Install reviewdog
-        uses: reviewdog/action-setup@e04ffabe3898a0af8d0fb1af00c188831c4b5893
-      - name: Run ruff with reviewdog
-        env:
-          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REVIEWDOG_REPORTER: ${{ github.event_name == 'pull_request' && 'github-pr-review' || 'github-check' }}
-          REVIEWDOG_FILTER_MODE: ${{ github.event_name == 'pull_request' && 'diff_context' || 'nofilter' }}
+      - name: Run ruff
         run: |
           ruff check . \
-            --output-format=rdjson \
-            --exit-zero \
-            --no-fix \
-          | reviewdog \
-            -f=rdjson \
-            -name="ruff" \
-            -reporter="${REVIEWDOG_REPORTER}" \
-            -filter-mode="${REVIEWDOG_FILTER_MODE}" \
-            -fail-on-error=true
+            --output-format=github \
+            --no-fix
