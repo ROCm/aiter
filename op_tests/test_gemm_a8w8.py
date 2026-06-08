@@ -424,7 +424,6 @@ def test_gemm_flydsl_feature(
 ):
     """One gfx1250 FlyDSL feature case (ragged M, strided A/C, split-k, or
     warp/cluster) via the WMMA backend."""
-    torch.manual_seed(0)
     x = torch.randn((m, k), dtype=dtype, device="cuda") * 2.0
     weight = torch.randn((n, k), dtype=dtype, device="cuda") * 2.0
     x, x_scale = aiter.pertoken_quant(x, quant_dtype=dtypes.fp8)
