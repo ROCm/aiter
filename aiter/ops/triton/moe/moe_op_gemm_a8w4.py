@@ -207,7 +207,10 @@ def get_kernel_config_triton(m, n, k, routing_data):
             num_stages = 1
 
         else:
-            block_n = 512
+            # Cap by N: BN=512 wasted work on small-N and busted the 160 KB
+            # LDS budget under TRITON_HIP_USE_ASYNC_COPY=ON (AMD overlay
+            # default on gfx950). Tuned shapes bypass this via JSON.
+            block_n = min(triton.next_power_of_2(n), 256)
             # routing caps block_m at 128; nw=4 wins ~2x at block_m=128 on gpt-oss
             # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
             num_warps = 4 if block_m == 128 else 8
@@ -378,6 +381,11 @@ def moe_gemm_a8w4(
         config = get_kernel_config_gluon(M, N, K, routing_data)
     else:
         config = get_kernel_config_triton(M, N, K, routing_data)
+    # CDNA4 swizzle requires BLOCK_K % 256 == 0; some tuned small-K entries
+    # pick BK<256 for utilization. Clamp only when swizzle is requested so
+    # StridedLayout callers keep their tuned BK<256.
+    if swizzle_mx_scale == "CDNA4_SCALE" and config["block_k"] < 256:
+        config["block_k"] = 256
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
