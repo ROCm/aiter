@@ -4,8 +4,10 @@
 """Unit tests for FlyDSL Linear Attention Prefill (chunk_gated_delta_h) regressions.
 
 Usage:
-    HIP_VISIBLE_DEVICES=7 pytest -sv aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformance -s
-    HIP_VISIBLE_DEVICES=7 python -m pytest aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-16k-aws" -v -s
+    rm -rf ~/.triton/cache
+    export GATED_DELTA_RULE_TRITON_AUTOTUNE=1
+    HIP_VISIBLE_DEVICES=7 pytest -sv op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -s
+    HIP_VISIBLE_DEVICES=7 python -m pytest op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-16k-aws" -v -s
 """
 
 from __future__ import annotations

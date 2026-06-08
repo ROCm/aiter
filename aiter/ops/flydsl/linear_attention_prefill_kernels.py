@@ -24,6 +24,7 @@ import math
 import torch
 import triton
 
+from flydsl.runtime.device import get_rocm_arch
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_chunk_offsets,
@@ -46,6 +47,40 @@ __all__ = [
 _compiled_kernels = {}
 _BV_CANDIDATES = [16, 32, 64]
 _DEFAULT_BV = 16
+
+# The trace-calibrated BV carve-outs in ``_target_bv_for_shape`` were swept
+# exclusively on gfx950 (V=128, BT=64, 256 CUs). They assume gfx950's CU
+# count and wave-occupancy behavior, so they are gated to gfx950 -- on any
+# other arch the carve-outs return ``None`` and the generic CU-fill default
+# applies instead (matches the pre-calibration behavior, no regression).
+# ``get_rocm_arch()`` may return a feature-suffixed string like
+# ``gfx950:sramecc+:xnack-``; normalize before matching.
+_IS_GFX950 = get_rocm_arch().split(":")[0].startswith("gfx950")
+
+# gfx950 has 256 CUs. Used as the fallback CU count when the live device
+# query is unavailable (e.g. CPU-only meta runs).
+_GFX950_CU_COUNT = 256
+
+
+@functools.lru_cache(maxsize=None)
+def _cu_count(device_index: int) -> int:
+    """Number of compute units (CTA "wave" width) for the target device.
+
+    The grid-fill heuristic targets "one wave of CTAs over the device's
+    CUs"; the wave width is the CU count, which is arch/SKU-specific (256
+    on gfx950, but differs on gfx942 and others). We read it from the live
+    device properties (``multi_processor_count``) instead of hardcoding
+    256, falling back to the gfx950 value only when the query fails.
+    """
+    try:
+        idx = device_index if device_index >= 0 else torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(idx)
+        cu = int(getattr(props, "multi_processor_count", 0) or 0)
+        if cu > 0:
+            return cu
+    except Exception:
+        pass
+    return _GFX950_CU_COUNT
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +309,13 @@ def _target_bv_for_shape(
           you actually measured;
       (b) the "no data -> return None" fallthrough at the end of each
           branch so untested combos can't silently regress.
+
+    All carve-outs below were swept on gfx950 only, so they are skipped on
+    other arches (``_IS_GFX950`` guard) -- non-gfx950 falls through to the
+    generic CU-fill default, preserving the pre-calibration behavior.
     """
+    if not _IS_GFX950:
+        return None
     if is_varlen and H == 32 and Hg == 16:
         if N == 2:
             # Calibrated range: T_flat in [2000, 25000]. Two flips
@@ -410,6 +451,7 @@ def _heuristic_bv(
     N: int,
     is_varlen: bool,
     min_seqlen: int | None = None,
+    device_index: int | None = None,
 ) -> int:
     """Pick a sensible BV for the requested shape. Pure function: no IO, no state.
 
@@ -423,7 +465,8 @@ def _heuristic_bv(
         reduces per-CTA overhead; smaller BV exposes more CTAs for CU
         utilization.
 
-      * ``is_varlen=False`` -- target one wave of CTAs over gfx950's 256 CUs.
+      * ``is_varlen=False`` -- target one wave of CTAs over the device's CUs
+        (live ``multi_processor_count``; 256 on gfx950).
 
       * ``is_varlen=True`` -- the target grid depends on (H, T_local) jointly:
           H <= 8:
@@ -463,9 +506,14 @@ def _heuristic_bv(
         H=H, Hg=Hg, T_flat=T_flat, N=N, is_varlen=is_varlen,
         min_seqlen=min_seqlen,
     )
-    target_ctas = (
-        _grid_ctas(H=H, V=V, N=N, BV=target_bv) if target_bv is not None else 256
-    )
+    if target_bv is not None:
+        target_ctas = _grid_ctas(H=H, V=V, N=N, BV=target_bv)
+    else:
+        # Generic default: target one wave of CTAs over the device's CUs.
+        # Use the live CU count (256 on gfx950, differs on other arches)
+        # rather than a hardcoded gfx950 value.
+        idx = device_index if device_index is not None else -1
+        target_ctas = _cu_count(idx)
     return _select_bv_for_grid(H=H, V=V, N=N, target_ctas=target_ctas)
 
 
@@ -606,6 +654,7 @@ def _build_plan(
     BV = _heuristic_bv(
         H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen,
         min_seqlen=min_seqlen,
+        device_index=k.device.index if k.device.type == "cuda" else -1,
     )
 
     launch_fn = _get_or_compile(
