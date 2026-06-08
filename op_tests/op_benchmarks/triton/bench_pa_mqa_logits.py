@@ -16,7 +16,7 @@ from aiter.test_common import run_perftest
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
-from op_tests.triton_tests.attention.test_deepgemm_attention import (
+from op_tests.triton_tests.attention.test_pa_mqa_logits import (
     apply_preshuffle,
     make_paged_inputs,
 )
@@ -315,7 +315,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    # The varctx schedule is only valid on the preshuffle kernel path; passing a
+    # VarCtxSchedule to the base kernel breaks compile (signature mismatch).
+    # Mirrors the test's `var_ctx_opt requires preshuffle` skip.
+    if args.var_ctx_opt and not args.kv_preshuffle:
+        parser.error("--var_ctx_opt requires --kv_preshuffle")
+    return args
 
 
 def main() -> None:
