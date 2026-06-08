@@ -78,7 +78,7 @@ struct opus_gemm_a16w16_traits {
 
 #ifndef OPUS_GEMM_NOSCALE_KARGS_DEFINED
 #define OPUS_GEMM_NOSCALE_KARGS_DEFINED
-// Shared kargs struct between a16w16 nosplit launchers (kbuf1_large_tile / kbuf1 / kbuf3 / kbuf2v /
+// Shared kargs struct between a16w16 nosplit launchers (kbuf1_large_tile / kbuf1 / kbuf2v /
 // kbuf2v_bk128) and a8w8 noscal...
 struct opus_gemm_noscale_kargs {
     const void* __restrict__ ptr_a;
@@ -105,7 +105,7 @@ struct opus_gemm_noscale_kargs {
 struct opus_gemm_splitk_kargs {
     const void* __restrict__ ptr_a;         // bf16 [B, M, K]
     const void* __restrict__ ptr_b;         // bf16 [B, N, K] (pre-transposed)
-    void*       __restrict__ ptr_workspace; // fp32 [split_k, B, padded_M, padded_N]
+    void*       __restrict__ ptr_workspace; // splitK workspace [split_k, B, padded_M, padded_N]
     void*       __restrict__ ptr_c;         // bf16 [B, M, N] final output (reduce kernel writes)
     const void* __restrict__ ptr_bias;      // unused (reserved)
     int m;

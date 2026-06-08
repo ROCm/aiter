@@ -77,9 +77,28 @@ from opus_gemm_common import (
 OCCUPANCY_TILE_BM = 128
 OCCUPANCY_TILE_BN = 128
 
+BF16WS_EXACT_REDUCE_SHAPES = (
+    (64, 8),
+    (128, 4),
+    (256, 2),
+    (512, 1),
+    (1024, 4),
+    (1024, 2),
+    (1024, 1),
+    (2048, 1),
+)
+
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-int(a) // int(b))
+
+
+def _kid_uses_bf16_workspace(k_inst):
+    return getattr(k_inst, "splitk_workspace_dtype", "fp32_t") == "bf16_t"
+
+
+def _kid_rejects_outdtype(k_inst, out_dtype):
+    return _kid_uses_bf16_workspace(k_inst) and out_dtype is not dtypes.bf16
 
 
 def _flatmm_splitk_pfk(k) -> int:
@@ -215,12 +234,20 @@ def kid_rejects_shape(k_inst, M, N, K):
     B_K = k_inst.B_K
     loops = _ceil_div(K, B_K)
 
+    if _kid_uses_bf16_workspace(k_inst):
+        padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
+        if loops < 2 or K % B_K != 0 or padded_N != N:
+            return True
+        return not any(
+            N == n_exact and M % rows == 0
+            for n_exact, rows in BF16WS_EXACT_REDUCE_SHAPES
+        )
+
     if k_inst.kernel_tag in (
         "a16w16",
         "a16w16_kbuf1_large_tile",
         "a16w16_kbuf2v",
         "a16w16_kbuf2v_bk128",
-        "a16w16_kbuf3",
         "a16w16_kbuf1",
     ):
         # Non-splitK a16w16 family all share the same (loops-2)%2==0 K-dbuf parity + mfma layout
@@ -326,7 +353,7 @@ def kid_rejects_bias(k_inst, bias):
       * persistent / flatmm-non-splitk (HAS_BIAS=false hardcoded in pipelines)
       * gfx942 SB kid 50000 (HAS_BIAS path removed 2026-06-02; was dead code)
       * gfx942 splitk family (kid 50200+): silently ignored bias
-      * gfx942 non-splitK siblings (50001/02/03/11): no bias path
+      * gfx942 non-splitK siblings (50002/03/11): no bias path
     """
     if not bias:
         return False
@@ -1604,15 +1631,10 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     dtypes.bf16: "bf16_t",
                     dtypes.fp32: "fp32_t",
                 }
-                _is_splitk_tag = k_inst.kernel_tag in (
-                    "a16w16_flatmm_splitk",
-                    "a16w16_kbuf3_sk",
-                    "a16w16_kbuf1_sk",
-                    "a16w16_kbuf2v_sk",
-                    "a16w16_kbuf2v_bk128_sk",
-                    "a16w16_em3en4_lds1_pgr2_sk",
-                )
+                _is_splitk_tag = kid in SPLITK_KIDS
                 _need = _OUT_TORCH_TO_CTYPE.get(out_dtype)
+                if _kid_rejects_outdtype(k_inst, out_dtype):
+                    continue
                 if (
                     not _is_splitk_tag
                     and _need is not None
@@ -1621,14 +1643,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     continue
 
                 # SplitK candidate set per shape+kid.
-                if k_inst.kernel_tag in (
-                    "a16w16_flatmm_splitk",
-                    "a16w16_kbuf3_sk",
-                    "a16w16_kbuf1_sk",
-                    "a16w16_kbuf2v_sk",
-                    "a16w16_kbuf2v_bk128_sk",
-                    "a16w16_em3en4_lds1_pgr2_sk",
-                ):
+                if kid in SPLITK_KIDS:
                     splitK_range = candidate_splitK(M, N, K, batch, cu_num, k_inst)
                 else:
                     splitK_range = [0]

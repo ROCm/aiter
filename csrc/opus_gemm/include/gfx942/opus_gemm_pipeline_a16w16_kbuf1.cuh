@@ -2,7 +2,7 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // BF16 a16w16 4-phase legacy (gfx942). Unified <Traits,Kargs> emits 50002
-// (noscale_kargs, direct C) and 50200/50202 (splitk_kargs, fp32 workspace).
+// (noscale_kargs, direct C) and splitK kids (splitk_kargs, workspace + reduce).
 #pragma once
 
 #include <array>
@@ -245,7 +245,7 @@ void gemm_a16w16_kbuf1_kernel(Kargs kargs) {
         phase_compute<T>(v_a[1], v_b[1], acc_11);
     }
 
-    // STORE: splitK ? workspace fp32 sc0+nt; nosplit ? bf16 store_if to C.
+    // STORE: splitK ? workspace sc0+nt; nosplit ? store_if to C.
     {
         typename decltype(mma)::vtype_c v_c[2][2];
         v_c[0][0] = agpr_to_vgpr<N_SUB>(acc_00);

@@ -16,7 +16,7 @@
 #include "opus_gemm_asm_mma16x16x16.cuh"
 #include "opus_gemm_helpers_a16w16.cuh"
 
-// Build a "fake" 50211-style traits with B_K=64 from a B_K=128 trait T.
+// Build a 50201-style traits view with B_K=64 from a B_K=128 trait T.
 template<typename T>
 struct bk64_traits_view {
     static constexpr int BLOCK_SIZE = T::BLOCK_SIZE;

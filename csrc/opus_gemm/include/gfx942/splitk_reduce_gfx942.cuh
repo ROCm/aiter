@@ -173,10 +173,11 @@ __global__ void splitk_reduce_kernel_fallback(
 }
 
 // Exact-N row-block fast path: static split_k unroll, no N tail/OOB.
-template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_ = 8, typename D_OUT = __bf16,
+template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_ = 8,
+         typename D_WS = float, typename D_OUT = __bf16,
          bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT>
 __global__ void splitk_reduce_kernel_exact_n_rowblock(
-    const float* __restrict__ workspace,
+    const D_WS*  __restrict__ workspace,
     D_OUT*       __restrict__ c_out,
     int M, int N, int batch,
     int padded_M, int padded_N,
@@ -189,6 +190,8 @@ __global__ void splitk_reduce_kernel_exact_n_rowblock(
     constexpr int BLOCK = N_VEC * ROWS_PER_BLOCK;
     constexpr bool HAS_BIAS = HAS_BIAS_;
     using D_BIAS = D_BIAS_;
+    static_assert(sizeof(D_WS) == 2 || sizeof(D_WS) == 4,
+                  "exact-N row-block reduce supports fp32/bf16 workspace");
 
     constexpr int STEP = 16 / sizeof(D_OUT);
     static_assert(STEP * sizeof(D_OUT) == 16);
@@ -225,7 +228,7 @@ __global__ void splitk_reduce_kernel_exact_n_rowblock(
     const long split_stride = (long)batch * padded_M * padded_N;
 
     auto g_ws = opus::make_gmem(workspace,
-                                (unsigned int)(split_stride * SPLIT_K * sizeof(float)));
+                                (unsigned int)(split_stride * SPLIT_K * sizeof(D_WS)));
 
     opus::vector_t<float, VEC> acc;
     #pragma unroll
@@ -235,11 +238,26 @@ __global__ void splitk_reduce_kernel_exact_n_rowblock(
     #pragma unroll
     for (int s = 0; s < SPLIT_K; ++s) {
         int ws_idx = ws_row_base + (int)(s * split_stride);
-        #pragma unroll
-        for (int g = 0; g < VEC / 4; ++g) {
-            auto v4 = g_ws.template load<4>(ws_idx + g * 4);
+        if constexpr (sizeof(D_WS) == 2 && VEC % 8 == 0) {
             #pragma unroll
-            for (int j = 0; j < 4; ++j) acc[g * 4 + j] += v4[j];
+            for (int g = 0; g < VEC / 8; ++g) {
+                auto v8 = g_ws.template load<8>(ws_idx + g * 8);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    acc[g * 8 + j] += static_cast<float>(v8[j]);
+                }
+            }
+        } else {
+            static_assert(VEC % 4 == 0,
+                          "exact-N row-block reduce fp32 path needs VEC % 4 == 0");
+            #pragma unroll
+            for (int g = 0; g < VEC / 4; ++g) {
+                auto v4 = g_ws.template load<4>(ws_idx + g * 4);
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[g * 4 + j] += static_cast<float>(v4[j]);
+                }
+            }
         }
     }
 

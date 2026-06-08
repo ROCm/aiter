@@ -11,9 +11,8 @@ file + one new import; entry point itself is arch-agnostic.
 
 WARP_SIZE = 64
 
-# Paired W3 kernels (nosplit_tag -> splitk_tag) share one <Traits, Kargs> template.
+# Paired gfx942 kernels (nosplit_tag -> splitk_tag) share one <Traits, Kargs> template.
 W3_KERNEL_PAIRS = {
-    "a16w16_kbuf3": "a16w16_kbuf3_sk",
     "a16w16_kbuf2v": "a16w16_kbuf2v_sk",
     "a16w16_kbuf2v_bk128": "a16w16_kbuf2v_bk128_sk",
     "a16w16_kbuf1": "a16w16_kbuf1_sk",

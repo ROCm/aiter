@@ -41,6 +41,8 @@ GFX942_SPLITK_TRAITS_OVERRIDES = {
     },
 }
 
+GFX942_SPLITK_TAGS = _SPLITK + ("a16w16_em3en4_lds1_pgr2_sk",)
+
 
 def _splitk_traits_geometry(k):
     override = GFX942_SPLITK_TRAITS_OVERRIDES.get(k.kernel_tag)
@@ -48,6 +50,18 @@ def _splitk_traits_geometry(k):
         return k.B_M, k.B_N, 2
     trait_bm, trait_bn = override["block"]
     return trait_bm, trait_bn, override["lds_depth"]
+
+
+def _splitk_workspace_types(k):
+    dtype = getattr(k, "splitk_workspace_dtype", "fp32_t")
+    if dtype == "bf16_t":
+        return "bf16_t", "__bf16"
+    return "fp32_t", "float"
+
+
+def _uses_bf16_workspace(k):
+    return getattr(k, "splitk_workspace_dtype", "fp32_t") == "bf16_t"
+
 
 PIPELINE_HEADER_MAP = {
     "a16w16_em3en4_lds1_pgr2_sk": _gfx942_pipeline("a16w16_em3en4_lds1_pgr2_sk"),
@@ -98,9 +112,9 @@ EXACT_N_ROWBLOCK_REDUCE_CONFIGS = (
 def splitk_reduce_extra_forward_decls():
     return (
         "template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_,\n"
-        "         typename D_OUT, bool HAS_BIAS_, typename D_BIAS_>\n"
+        "         typename D_WS, typename D_OUT, bool HAS_BIAS_, typename D_BIAS_>\n"
         "__global__ void splitk_reduce_kernel_exact_n_rowblock(\n"
-        "    const float* workspace, D_OUT* c_out,\n"
+        "    const D_WS* workspace, D_OUT* c_out,\n"
         "    int M, int N, int batch,\n"
         "    int padded_M, int padded_N,\n"
         "    const D_BIAS_* bias, int stride_bias_batch);\n"
@@ -111,14 +125,15 @@ def splitk_reduce_extra_device_instantiations():
     contents = "// Exact-N row-block reduce instantiations (BLOCK=N_VEC*ROWS)\n"
     for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS:
         for sk in SPLITK_REDUCE_SUPPORTED_SPLITKS:
-            contents += (
-                f"template __global__ void splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, __bf16, true,  __bf16>(\n"
-                "    const float*, __bf16*, int, int, int, int, int,\n"
-                "    const __bf16*, int);\n"
-                f"template __global__ void splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, __bf16, false, __bf16>(\n"
-                "    const float*, __bf16*, int, int, int, int, int,\n"
-                "    const __bf16*, int);\n"
-            )
+            for ws_type in ("float", "__bf16"):
+                contents += (
+                    f"template __global__ void splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, {ws_type}, __bf16, true,  __bf16>(\n"
+                    f"    const {ws_type}*, __bf16*, int, int, int, int, int,\n"
+                    "    const __bf16*, int);\n"
+                    f"template __global__ void splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, {ws_type}, __bf16, false, __bf16>(\n"
+                    f"    const {ws_type}*, __bf16*, int, int, int, int, int,\n"
+                    "    const __bf16*, int);\n"
+                )
     return contents
 
 
@@ -157,13 +172,15 @@ def gen_splitk_gfx942_instance(
     kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
+    bf16ws = _uses_bf16_workspace(k)
+    workspace_dtype, workspace_ptr_type = _splitk_workspace_types(k)
     # gfx942 a16w16_traits: 7 params <BLOCK_SIZE, BLOCK, DTYPE, VEC, TILE, WAVE, LDS_DEPTH=2>.
     trait_bm, trait_bn, lds_depth = _splitk_traits_geometry(k)
     traits_aliases = f"""
 template <typename D_C>
 using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{trait_bm}, {trait_bn}, {k.B_K}>,
-    opus::tuple<{da}, {db}, fp32_t, fp32_t>,
+    opus::tuple<{da}, {db}, {workspace_dtype}, fp32_t>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.T_M}, {k.T_N}, 1>,
     opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
@@ -203,9 +220,9 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
                     f"""            {kw} (reduce_rowblock_align && N == {n_exact} && (M % {rows} == 0) && split_k == {sk}) {{{{{{{{
             dim3 grid_rowblock(1, M / {rows}, batch);
             dim3 block_rowblock({block_size});
-            splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, __bf16, {{hb}}, __bf16>
+            splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, {workspace_ptr_type}, __bf16, {{hb}}, __bf16>
                 <<<grid_rowblock, block_rowblock, 0, stream>>>(
-                    reinterpret_cast<const float*>(ptr_workspace_),
+                    reinterpret_cast<const {workspace_ptr_type}*>(ptr_workspace_),
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     M, N, batch, padded_M, padded_N,
                     {{bias_arg}});
@@ -236,6 +253,26 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     bf16_f = _baseline_call("__bf16", False, "                ")
     fp32_t = _baseline_call("float", True, "            ")
     fp32_f = _baseline_call("float", False, "            ")
+    bf16_y_check = ""
+    bf16ws_reduce_check = ""
+    if bf16ws:
+        n_conditions = " || ".join(
+            f"(N == {vec * nvec} && (M % {rows} == 0))"
+            for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS
+        )
+        sk_conditions = " || ".join(
+            f"split_k == {sk}" for sk in SPLITK_REDUCE_SUPPORTED_SPLITKS
+        )
+        bf16_y_check = (
+            "    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,\n"
+            f'    "{err_label} bf16 workspace currently supports only bf16 Y");\n'
+        )
+        bf16ws_reduce_check = f"""
+    AITER_CHECK(padded_N == N && ({n_conditions}),
+    "{err_label} bf16 workspace requires an exact-N row-block reduce shape");
+    AITER_CHECK({sk_conditions},
+    "{err_label} bf16 workspace requires an instantiated split_k");
+"""
     reduce_launch = f"""
     constexpr int REDUCE_VEC = 16;
     constexpr int REDUCE_BS  = 64;
@@ -269,6 +306,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 #include "aiter_tensor.h"
 #include "aiter_stream.h"
 #include <optional>
+#include <type_traits>
 #endif
 #ifdef OPUS_FUSED_HOST_TU
 #include "{traits_header}"
@@ -288,13 +326,14 @@ void
     int splitK)
 {{{{
     static_assert(std::is_same<D_C, fp32_t>::value,
-    "{err_label} main kernel uses fp32 workspace; D_C template param must be fp32_t");
+    "{err_label} splitK launcher uses the fp32 tune-dispatch table");
 
     int batch = XQ.size(0);
     int M = XQ.size(1);
     int N = WQ.size(1);
     int K = XQ.size(2);
 
+{bf16_y_check}
     AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
             || Y.dtype() == AITER_DTYPE_fp32,
     "{err_label} requires Y dtype bf16 or fp32");
@@ -379,10 +418,11 @@ void
     int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
     int padded_M    = num_tiles_m * {k.B_M};
     int padded_N    = num_tiles_n * {k.B_N};
+{bf16ws_reduce_check}
 
     auto stream = aiter::getCurrentHIPStream();
     size_t ws_bytes = (size_t)split_k * (size_t)batch
-                * (size_t)padded_M * (size_t)padded_N * sizeof(float);
+                * (size_t)padded_M * (size_t)padded_N * sizeof(typename Traits::D_C);
     static thread_local void*  ws_cached_ptr   = nullptr;
     static thread_local size_t ws_cached_bytes = 0;
     if (ws_cached_ptr == nullptr || ws_bytes > ws_cached_bytes)
@@ -441,6 +481,7 @@ void
         kargs_explicit_param,
     )
 
+
 def gen_a16w16_nosplit_gfx942_instance(
     cg,
     k,
@@ -459,7 +500,7 @@ def gen_a16w16_nosplit_gfx942_instance(
     A16W16_TUNE_TAGS,
     **_unused,
 ):
-    """gfx942 a16w16 non-splitK launcher emit (kbuf1_large_tile / kbuf3 / kbuf2v /
+    """gfx942 a16w16 non-splitK launcher emit (kbuf1_large_tile / kbuf2v /
     kbuf2v_bk128 / kbuf1 / wave_k_coop)."""
     kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
@@ -602,20 +643,12 @@ void
 
 # ---------- Self-register at import time ----------
 # gfx942 splitk family.
-_GFX942_SPLITK_TAGS = (
-    "a16w16_kbuf3_sk",
-    "a16w16_kbuf2v_sk",
-    "a16w16_kbuf2v_bk128_sk",
-    "a16w16_kbuf1_sk",
-    "a16w16_em3en4_lds1_pgr2_sk",
-)
-for _tag in _GFX942_SPLITK_TAGS:
+for _tag in GFX942_SPLITK_TAGS:
     register_emit("gfx942", _tag, gen_splitk_gfx942_instance)
 
 # gfx942 a16w16 non-splitK family.
 _GFX942_NOSPLIT_TAGS = (
     "a16w16_kbuf1_large_tile",
-    "a16w16_kbuf3",
     "a16w16_kbuf2v",
     "a16w16_kbuf2v_bk128",
     "a16w16_kbuf1",
