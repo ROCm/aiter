@@ -356,10 +356,10 @@ def cmdGenFunc_mha_varlen_fwd(
             filter_fwd_splitkv2 += "_bf16*"
         if 0.0 < logits_soft_cap:
             md_name += "_logits"
-            filter_fwd += "_logits*"
+            filter_fwd_splitkv2 += "_logits*"
         else:
             md_name += "_nlogits"
-            filter_fwd += "_nlogits*"
+            filter_fwd_splitkv2 += "_nlogits*"
         if bias is not None:
             md_name += "_bias"
             filter_fwd_splitkv2 += "_bias*"
@@ -2105,6 +2105,12 @@ def _flash_attn_varlen_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and logits_soft_cap == 0.0
+        # The v3 ASM varlen ("group") fwd kernel reads K/V as a contiguous
+        # [total_k, ...] buffer and has no block_table / paged indirection —
+        # feeding it a paged pool faults (OOB GPU memory access). Paged
+        # attention must route to the CK ck_tile fwd_splitkv `_pagedkv`
+        # split-KV kernel instead.
+        ret = ret and (block_table is None)
         # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table
         # (1,2,4,8,16); arbitrary divisor ratios route to CK.
         if is_fmha_v3_fp8():

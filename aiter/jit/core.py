@@ -831,6 +831,12 @@ def build_module(
 
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
+        # Opt-in extra device flags for profiling/analysis builds, e.g.
+        #   AITER_EXTRA_HIP_FLAGS="-gline-tables-only"
+        # to embed DWARF line tables (ISA->source) without changing -O3 codegen.
+        _extra_hip_env = os.environ.get("AITER_EXTRA_HIP_FLAGS", "").strip()
+        if _extra_hip_env:
+            flags_hip += _extra_hip_env.split()
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags

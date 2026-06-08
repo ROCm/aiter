@@ -15,7 +15,10 @@ CK kernel actually supports:
                                   on top of a bf16 source — vLLM / SGLang's
                                   recipe; the same convention the CK FP8
                                   problem traits resolve at compile time.
-  * num_heads  ∈ {(4,4), (8,1), (16,2), (64,8)}  — MHA + GQA-{2,8}
+  * num_heads  ∈ {(4,4), (16,2), (64,8), (12,2)}  — MHA + GQA-8 + GQA-6.
+                 GQA-6 (12/2) is a *non-dividing* ratio (kBlockM % qpkv != 0)
+                 that exercises the "KV token co-owned by two query tiles"
+                 split-KV partition path; see _REGRESSION_FIXTURES.
   * mask       ∈ {bottom-right causal, top-left causal, no-mask} ×
                  (window_size_left, window_size_right) ∈ any FA/vLLM
                  SWA pair. The default `(mask_type=2, window=(-1,-1))`
@@ -48,6 +51,14 @@ Examples:
   # the cartesian-grid mode.
   python op_tests/test_unified_attention_ck.py --swa-fixtures all
   python op_tests/test_unified_attention_ck.py --swa-fixtures smoke fp8
+
+  # Regression fixtures (`_REGRESSION_FIXTURES`): minimal bug-repro shapes
+  # that run by DEFAULT (appended to the default/full grid) so a previously
+  # fixed bug can never silently regress. When you fix a UA kernel bug, add
+  # the smallest shape that triggers it to `_REGRESSION_FIXTURES`. They can
+  # also be run in isolation, or skipped on a focused grid run:
+  python op_tests/test_unified_attention_ck.py --swa-fixtures regression
+  python op_tests/test_unified_attention_ck.py --no-regression
 
   # Single-shape mode — replaces the standalone ua-test-scripts/test_single_shape.py
   # for ad-hoc correctness/perf checks; expands to one seq_lens batch of
@@ -107,6 +118,13 @@ def _pick_fp8_dtype() -> torch.dtype:
 DEFAULT_NUM_HEADS: List[Tuple[int, int]] = [
     (16, 2),   # GQA-8 (8 query heads per kv head)
     (64, 8),   # GQA-8 at the production shape
+    # GQA-6: a *non-dividing* ratio (kBlockM % num_queries_per_kv != 0).
+    # The dividing ratios above (qpkv=8, and MHA qpkv=1 in --full) leave the
+    # "token co-owned by two query tiles" path untested — that path had a
+    # split-KV partitioning bug (see _REGRESSION_FIXTURES). Keep at least one
+    # non-dividing ratio in every grid so the co-ownership masking/partition
+    # arithmetic is always exercised.
+    (12, 2),   # GQA-6 (non-dividing: 6 query heads per kv head)
 ]
 DEFAULT_HEAD_SIZES: List[int] = [64, 128]
 DEFAULT_BLOCK_SIZES: List[int] = [16, 32, 64]
@@ -134,6 +152,7 @@ FULL_NUM_HEADS: List[Tuple[int, int]] = [
     (4, 4),    # MHA
     (16, 2),   # GQA-8
     (64, 8),   # GQA-8 (production)
+    (12, 2),   # GQA-6 (non-dividing: kBlockM % qpkv != 0 — see DEFAULT_NUM_HEADS)
 ]
 FULL_NUM_BLOCKS: List[int] = [2048, 32768]
 FULL_SEQ_LENS: List[List[Tuple[int, int]]] = [
@@ -888,12 +907,66 @@ _FP8_SWA_FIXTURES: List[SwaFixture] = [
                (8, 1), 128, 64, 2, 64, 0, q_dtype="fp8", category="fp8"),
 ]
 
+# ----------------------------------------------------------------------------
+# Regression fixtures. Each entry pins the minimal shape that reproduces a
+# bug we've already found + fixed, so the fix can never silently regress.
+#
+# POLICY: when you fix a UA kernel bug, add the smallest shape that triggers
+# it here (with a comment naming the bug). Unlike the SWA fixtures these run
+# by DEFAULT (in --full and the default grid; skipped only with
+# --no-regression or --quick), because a regression guard that you have to
+# remember to opt into is a regression guard that rots.
+#
+# They reuse SwaFixture purely as a shape container; mask_type=2 + window
+# (-1,-1) is plain bottom-right causal (no SWA), matching the bug repros.
+# ----------------------------------------------------------------------------
+_REGRESSION_FIXTURES: List[SwaFixture] = [
+    # --- split-KV + causal + non-dividing GQA (kBlockM % num_qpkv != 0) ---
+    # Bug: a KV token co-owned by two query tiles (which only happens when
+    # num_queries_per_kv does NOT divide the query-tile height) was assigned
+    # its split partition from the per-tile causal horizon. Under split-KV the
+    # two owning tiles then reduced different KV ranges for that token, so the
+    # combine step merged partials over disjoint ranges -> a ~1-row error that
+    # showed up as wrong values / NaN. Fixed by partitioning splits over the
+    # causal-independent full block count. qpkv=6 (12/2) is the canonical
+    # non-dividing ratio; q=1 + long sk + small batch forces num_splits>1 so
+    # the split path is actually taken. Covers d128/d64, bf16/fp8.
+    SwaFixture("regr splitkv GQA-6 decode d128 bf16",
+               [(1, 8192)] * 4, (12, 2), 128, 16, 2, -1, -1,
+               num_blocks=4096, category="regression"),
+    SwaFixture("regr splitkv GQA-6 decode d128 fp8",
+               [(1, 8192)] * 4, (12, 2), 128, 32, 2, -1, -1,
+               q_dtype="fp8", num_blocks=2048, category="regression"),
+    SwaFixture("regr splitkv GQA-6 decode d64 bf16",
+               [(1, 8192)] * 4, (12, 2), 64, 16, 2, -1, -1,
+               num_blocks=4096, category="regression"),
+    # Other non-dividing ratios (qpkv=5, qpkv=3) at an even longer sk / batch=2
+    # so num_splits saturates higher — guards the partition arithmetic across
+    # different co-ownership strides, not just qpkv=6.
+    SwaFixture("regr splitkv GQA-5 decode d128 bf16",
+               [(1, 16384)] * 2, (10, 2), 128, 16, 2, -1, -1,
+               num_blocks=4096, category="regression"),
+    SwaFixture("regr splitkv GQA-3 decode d128 bf16",
+               [(1, 16384)] * 2, (6, 2), 128, 16, 2, -1, -1,
+               num_blocks=4096, category="regression"),
+    # Prefill (num_splits=1) + non-dividing GQA + causal: exercises the same
+    # tile co-ownership masking on the non-split path so a fix that only
+    # patched the split partition (or vice-versa) is still caught.
+    SwaFixture("regr prefill GQA-6 d128 bf16",
+               [(2048, 2048)] * 2, (12, 2), 128, 16, 2, -1, -1,
+               num_blocks=512, category="regression"),
+    SwaFixture("regr prefill GQA-6 d128 fp8",
+               [(2048, 2048)] * 2, (12, 2), 128, 32, 2, -1, -1,
+               q_dtype="fp8", num_blocks=256, category="regression"),
+]
+
 SWA_FIXTURE_GROUPS: dict = {
-    "smoke":     _SMOKE_SWA_FIXTURES,
-    "edge":      _EDGE_SWA_FIXTURES,
-    "gptoss":    _GPTOSS_SWA_FIXTURES,
-    "non-align": _NONALIGN_SWA_FIXTURES,
-    "fp8":       _FP8_SWA_FIXTURES,
+    "smoke":      _SMOKE_SWA_FIXTURES,
+    "edge":       _EDGE_SWA_FIXTURES,
+    "gptoss":     _GPTOSS_SWA_FIXTURES,
+    "non-align":  _NONALIGN_SWA_FIXTURES,
+    "fp8":        _FP8_SWA_FIXTURES,
+    "regression": _REGRESSION_FIXTURES,
 }
 
 
@@ -1060,11 +1133,210 @@ def run_triton(
     return out
 
 
+# ----------------------------------------------------------------------------
+# CK paged-KV prefill backend (`fmha_fwd_pagedkv` via aiter.mha_batch_prefill_func).
+#
+# This is the *legacy* CK paged-KV path — the production split-KV/prefill
+# kernel the unified-attention kernel is meant to replace. Wiring it into the
+# same harness gives a real apples-to-apples head-to-head (same inputs, same
+# reference, same @perftest rotation) for both decode (sq=1) and prefill
+# (sq=sk) regimes.
+#
+# Layout translation: the UA test carries paging as `block_tables`
+# [num_seqs, max_blocks_per_seq] + per-seq `kv_lens`. mha_batch_prefill_func
+# wants the SGLang-style ragged form (`kv_indptr`, `kv_page_indices`,
+# `kv_last_page_lens`); `_build_pagedkv_layout` converts between them. The K/V
+# caches themselves ([num_blocks, block_size, num_kv_heads, head_size], linear
+# 4-D) are consumed as-is — same physical tensors the UA kernel reads.
+# ----------------------------------------------------------------------------
+def _build_pagedkv_layout(block_tables, kv_lens_list, block_size, device):
+    """Translate (block_tables, per-seq kv_lens) → the ragged
+    (kv_indptr, kv_page_indices, kv_last_page_lens) triple that
+    mha_batch_prefill_func expects."""
+    used = [(kv + block_size - 1) // block_size for kv in kv_lens_list]
+    kv_indptr = torch.tensor(
+        [0] + used, dtype=torch.int32, device=device
+    ).cumsum(0, dtype=torch.int32)
+    parts = [block_tables[i, : used[i]] for i in range(len(used))]
+    kv_page_indices = torch.cat(parts).to(torch.int32) if parts else torch.empty(
+        0, dtype=torch.int32, device=device
+    )
+    kv_last_page_lens = torch.tensor(
+        [((kv - 1) % block_size) + 1 for kv in kv_lens_list],
+        dtype=torch.int32, device=device,
+    )
+    return kv_indptr, kv_page_indices, kv_last_page_lens
+
+
+@perftest()
+def run_ck_pagedkv(
+    query,
+    key_cache,
+    value_cache,
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    block_tables,
+    kv_lens_list,
+    cu_seqlens_q,
+    *,
+    q_descale,
+    k_descale,
+    v_descale,
+    scale,
+    max_query_len,
+    max_kv_len,
+    block_size,
+    mask_type,
+    window_size_left=-1,
+    window_size_right=-1,
+):
+    device = query.device
+    fp8 = q_fp8 is not None
+    q = q_fp8 if fp8 else query
+    k = k_fp8 if fp8 else key_cache
+    v = v_fp8 if fp8 else value_cache
+
+    kv_indptr, kv_page_indices, kv_last_page_lens = _build_pagedkv_layout(
+        block_tables, kv_lens_list, block_size, device
+    )
+
+    def _descale_t(x):
+        # fp8 path takes per-tensor descales as [1] fp32 tensors; bf16/fp16
+        # path leaves them None.
+        return (
+            torch.tensor([x], dtype=dtypes.fp32, device=device) if fp8 else None
+        )
+
+    out = aiter.mha_batch_prefill_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        kv_indptr,
+        kv_page_indices,
+        max_query_len,
+        max_kv_len,
+        softmax_scale=scale,
+        # UA mask_type: 0=none, 1=top-left, 2=bottom-right causal. The CK
+        # batch-prefill kernel only exposes a single (bottom-right-aligned)
+        # causal flag, so both causal variants map to causal=True; the
+        # top-left-vs-bottom-right divergence is only observable when sq>1
+        # AND sq!=sk (flagged by the correctness check, not silently hidden).
+        causal=(mask_type != 0),
+        window_size=(window_size_left, window_size_right),
+        kv_last_page_lens=kv_last_page_lens,
+        q_descale=_descale_t(q_descale),
+        k_descale=_descale_t(k_descale),
+        v_descale=_descale_t(v_descale),
+    )
+    return out
+
+
+def _repage_kv(key_cache, value_cache, block_tables, kv_lens_list, src_bs,
+               device, dst_bs=128):
+    """Re-page the same *logical* K/V into `dst_bs`-sized pages.
+
+    The CK split-KV paged path requires page_size % 128 == 0, but UA caps at
+    64 — so the two backends can't share one paged pool. This gathers the
+    logical K/V each sequence sees through `block_tables` (identical values
+    UA reads) and lays them out in fresh 128-token pages with a new block
+    table. Because the underlying values are unchanged, the shared torch
+    reference still applies. Runs once per config, outside the @perftest
+    timed region.
+    """
+    num_seqs = len(kv_lens_list)
+    nkv, d = key_cache.shape[2], key_cache.shape[3]
+    dst_blocks_per_seq = [(kv + dst_bs - 1) // dst_bs for kv in kv_lens_list]
+    total_dst = sum(dst_blocks_per_seq)
+    pool = max(total_dst * 2, total_dst + 1)
+    new_k = torch.zeros(pool, dst_bs, nkv, d, dtype=key_cache.dtype, device=device)
+    new_v = torch.zeros_like(new_k)
+    perm = torch.randperm(pool, device=device)[:total_dst].to(torch.int32)
+    max_dst = max(dst_blocks_per_seq) if dst_blocks_per_seq else 1
+    new_bt = torch.zeros(num_seqs, max_dst, dtype=torch.int32, device=device)
+    cursor = 0
+    for i in range(num_seqs):
+        kv = kv_lens_list[i]
+        src_blocks = (kv + src_bs - 1) // src_bs
+        phys = block_tables[i, :src_blocks].to(torch.long)
+        log_k = key_cache[phys].reshape(src_blocks * src_bs, nkv, d)[:kv]
+        log_v = value_cache[phys].reshape(src_blocks * src_bs, nkv, d)[:kv]
+        for b in range(dst_blocks_per_seq[i]):
+            dst_idx = int(perm[cursor]); cursor += 1
+            new_bt[i, b] = dst_idx
+            s, e = b * dst_bs, min((b + 1) * dst_bs, kv)
+            new_k[dst_idx, : e - s] = log_k[s:e]
+            new_v[dst_idx, : e - s] = log_v[s:e]
+    return new_k, new_v, new_bt
+
+
+# ----------------------------------------------------------------------------
+# Paged-decode baseline: aiter's flash_attn_with_kvcache (the standard FA v2
+# KV-cache API). This is the fairer head-to-head for *decode* than the
+# prefill-only batch_prefill kernel — it consumes the same paged K/V pool +
+# block_table and does its own internal split-KV. (The CK ck_tile
+# fwd_splitkv `_pagedkv` path that flash_attn_varlen_func routes to is
+# currently non-dispatching for group-mode paged decode; the v3 ASM varlen
+# kernel has no paged path at all. So we use the kvcache API here.)
+# Labelled `ckfa` in the report for backward-compat with existing columns.
+#
+# Constraint: flash_attn_with_kvcache wants a dense (batch, seqlen_q, ...)
+# query, so this leg is pure-decode only (one query token per sequence —
+# the caller guards `query_len == 1`). Page size is unconstrained (works at
+# 16/32/64/128), so no re-paging is needed; the comparison runs on the same
+# pool UA reads.
+#
+# Layout: q [num_seqs, 1, hq, d]; paged K/V [num_blocks, page, hk, d]
+# consumed as-is; per-batch context lengths via cache_seqlens; block_tables
+# map logical→physical pages.
+# ----------------------------------------------------------------------------
+@perftest()
+def run_ck_fa_paged(
+    query,
+    key_cache,
+    value_cache,
+    block_tables,
+    kv_lens_t,
+    *,
+    scale,
+    mask_type,
+    window_size_left=-1,
+    window_size_right=-1,
+):
+    from aiter.ops.triton.attention.mha import flash_attn_with_kvcache
+
+    num_seqs = block_tables.shape[0]
+    total_q, hq, d = query.shape
+    # Pure-decode: total_q == num_seqs (one token per sequence). Reshape the
+    # ragged [total_q, hq, d] query into the dense [b, sq=1, hq, d] layout the
+    # kvcache API expects.
+    sq = total_q // num_seqs
+    q = query.view(num_seqs, sq, hq, d)
+
+    out = flash_attn_with_kvcache(
+        q,
+        key_cache,
+        value_cache,
+        cache_seqlens=kv_lens_t.to(torch.int32),
+        softmax_scale=scale,
+        causal=(mask_type != 0),
+        window_size=(window_size_left, window_size_right),
+        block_table=block_tables,
+    )
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    return out.reshape(total_q, hq, d)
+
+
 def _ck_dispatch_supported(cfg: CaseConfig) -> Optional[str]:
     """Return None if the kernel can run this config, else a skip reason."""
     if cfg.head_size not in (64, 128):
         return f"head_size={cfg.head_size} not in CK instances"
-    if cfg.block_size not in (16, 32, 64):
+    # page_size=128 is served by the runtime-page-size catch-all on every
+    # variant; d128 decode also has a compile-time-pinned ps128 menu (bf16)
+    # so we can compare to the legacy split-KV kernel on equal page geometry.
+    if cfg.block_size not in (16, 32, 64, 128):
         return f"block_size={cfg.block_size} not in CK instances"
     if cfg.q_dtype == "fp8" and cfg.block_size < 32:
         return "fp8 path requires block_size >= 32"
@@ -1091,6 +1363,8 @@ def test_unified_attention_ck(
     seed: int = 0,
     device: str = "cuda",
     run_triton_backend: bool = True,
+    run_pagedkv_backend: bool = False,
+    run_ckfa_backend: bool = False,
     skip_reference: bool = False,
     allow_splitkv: bool = True,
     # SWA mask config. Defaults reduce to plain bottom-right causal
@@ -1176,13 +1450,76 @@ def test_unified_attention_ck(
                 aiter.logger.info(f"Triton run failed for {cfg}: {e}")
                 out_triton = None
 
+    # CK legacy paged-KV (fmha_fwd_pagedkv via mha_batch_prefill_func). Same
+    # inputs / reference as the UA leg. Guarded by try/except because not
+    # every (head_size, block_size, dtype) the UA sweep covers has a
+    # generated batch-prefill instance — a missing instance should degrade to
+    # "pagedkv leg skipped for this shape", not abort the whole sweep.
+    time_pagedkv = None
+    out_pagedkv = None
+    pagedkv_skipped_reason = None
+    if run_pagedkv_backend:
+        try:
+            out_pagedkv, time_pagedkv = run_ck_pagedkv(
+                t["query"], t["key_cache"], t["value_cache"],
+                t["q_fp8"], t["k_fp8"], t["v_fp8"],
+                t["block_tables"], t["kv_lens_list"], t["cu_seqlens_q"],
+                q_descale=t["q_descale"], k_descale=t["k_descale"],
+                v_descale=t["v_descale"],
+                scale=t["scale"], max_query_len=t["max_query_len"],
+                max_kv_len=t["max_kv_len"], block_size=cfg.block_size,
+                mask_type=mask_type,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+            )
+        except Exception as e:
+            pagedkv_skipped_reason = str(e).splitlines()[0][:160]
+            aiter.logger.info(f"CK paged-KV run failed for {cfg}: {e}")
+            out_pagedkv = None
+
+    # CK split-KV paged (flash_attn_varlen_func + block_table). Same guard
+    # rationale as the batch-prefill leg.
+    time_ckfa = None
+    out_ckfa = None
+    ckfa_skipped_reason = None
+    # flash_attn_varlen_func has no fp8 descale args, so the CK-FA leg is
+    # bf16/fp16-only; fp8 configs skip it cleanly.
+    # NOTE: this leg is opt-in (`--ck-fa`) and EXPERIMENTAL — for paged
+    # decode the public API routes to the v3 ASM kernel, and the paged
+    # block_table layout it expects here is not yet validated (observed GPU
+    # memory-access faults, which abort the process uncatchably). Off by
+    # default so the batch-prefill comparison stays crash-safe.
+    if run_ckfa_backend and cfg.q_dtype == "fp8":
+        ckfa_skipped_reason = "kvcache decode baseline is bf16/fp16 only"
+    elif run_ckfa_backend and any(ql != 1 for ql in t["query_lens"]):
+        # flash_attn_with_kvcache needs a dense (b, sq) query; only pure
+        # decode (one token per sequence) maps cleanly.
+        ckfa_skipped_reason = "kvcache decode baseline requires query_len==1"
+    elif run_ckfa_backend:
+        try:
+            # flash_attn_with_kvcache reads the same paged pool UA does (any
+            # page size), so no re-paging — a true apples-to-apples decode
+            # comparison on the identical block_table.
+            out_ckfa, time_ckfa = run_ck_fa_paged(
+                t["query"], t["key_cache"], t["value_cache"],
+                t["block_tables"], t["kv_lens"],
+                scale=t["scale"],
+                mask_type=mask_type,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+            )
+        except Exception as e:
+            ckfa_skipped_reason = str(e).splitlines()[0][:160]
+            aiter.logger.info(f"kvcache decode baseline run failed for {cfg}: {e}")
+            out_ckfa = None
+
     # Reference (torch). The reference always consumes the high-precision
     # source tensors — quantisation noise shows up in both kernels' outputs
     # but never in the reference, which is the convention the upstream
     # Triton test uses too.
     atol = 1.5e-1 if cfg.q_dtype == "fp8" else 1.5e-2
     rtol = 1.5e-1 if cfg.q_dtype == "fp8" else 1e-2
-    ck_passed = triton_passed = None
+    ck_passed = triton_passed = pagedkv_passed = ckfa_passed = None
     if not skip_reference:
         ref = ref_paged_attn(
             t["query"], t["key_cache"], t["value_cache"],
@@ -1201,8 +1538,29 @@ def test_unified_attention_ck(
                 ref, out_triton, atol=atol, rtol=rtol,
                 msg=f"Triton vs ref     | {cfg} | {time_triton:>8.2f} us",
             ) == 0
+        if out_pagedkv is not None:
+            pagedkv_passed = checkAllclose(
+                ref, out_pagedkv, atol=atol, rtol=rtol,
+                msg=f"PagedKV vs ref    | {cfg} | {time_pagedkv:>8.2f} us",
+            ) == 0
+            # Apples-to-apples: the perf comparison is only fair if UA and the
+            # legacy kernel compute the *same* output. Report the direct
+            # max-abs / mean-abs delta between the two kernel outputs (not just
+            # each vs the loose torch reference).
+            d = (out_ck.float() - out_pagedkv.float()).abs()
+            aiter.logger.info(
+                f"UA vs PagedKV diff | {cfg} | "
+                f"max={d.max().item():.4e} mean={d.mean().item():.4e}"
+            )
+        if out_ckfa is not None:
+            ckfa_passed = checkAllclose(
+                ref, out_ckfa, atol=atol, rtol=rtol,
+                msg=f"CK-FA  vs ref     | {cfg} | {time_ckfa:>8.2f} us",
+            ) == 0
 
     speedup = (time_triton / time_ck) if (time_triton is not None) else None
+    pagedkv_speedup = (time_pagedkv / time_ck) if (time_pagedkv is not None) else None
+    ckfa_speedup = (time_ckfa / time_ck) if (time_ckfa is not None) else None
     # num_splits surfaces what the transparent split-KV wrapper picked
     # for this shape. Single-shape mode tags the report with it so any
     # perf surprise can be attributed to the combine-kernel path vs the
@@ -1212,10 +1570,19 @@ def test_unified_attention_ck(
     return {
         "ck_us":       round(time_ck, 2),
         "triton_us":   round(time_triton, 2) if time_triton is not None else None,
+        "pagedkv_us":  round(time_pagedkv, 2) if time_pagedkv is not None else None,
+        "ckfa_us":     round(time_ckfa, 2) if time_ckfa is not None else None,
         "ck_vs_tri":   round(speedup, 2) if speedup is not None else None,
+        # >1 means CK-UA is faster than the legacy kernel.
+        "ck_vs_pkv":   round(pagedkv_speedup, 2) if pagedkv_speedup is not None else None,
+        "ck_vs_ckfa":  round(ckfa_speedup, 2) if ckfa_speedup is not None else None,
         "ck_pass":     ck_passed,
         "triton_pass": triton_passed,
+        "pagedkv_pass": pagedkv_passed,
+        "ckfa_pass":   ckfa_passed,
         "triton_skip": triton_skipped_reason,
+        "pagedkv_skip": pagedkv_skipped_reason,
+        "ckfa_skip":   ckfa_skipped_reason,
         "num_splits":  num_splits,
         "status":      "ok",
     }
@@ -1340,6 +1707,25 @@ def main():
                              "ON in single-shape mode, OFF for grid runs. "
                              "Use --no-triton to force off (e.g. CK-only "
                              "regression sweeps) or --triton to force on.")
+    parser.add_argument("--pagedkv", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="Compare against the legacy CK paged-KV kernel "
+                             "(fmha_fwd_pagedkv via mha_batch_prefill_func). "
+                             "Default: ON in single-shape mode, OFF for grid "
+                             "runs. This is the kernel the unified-attention "
+                             "kernel is meant to beat — `ck_vs_pkv > 1` means "
+                             "UA wins. Not every (head_size, block_size, "
+                             "dtype) has a generated batch-prefill instance; "
+                             "missing ones are reported in `pagedkv_skip`.")
+    parser.add_argument("--ck-fa", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="EXPERIMENTAL, default OFF. Also compare against "
+                             "CK's split-KV paged path (flash_attn_varlen_func "
+                             "+ block_table), re-paging K/V to 128-token pages. "
+                             "For paged decode the public API routes to the v3 "
+                             "ASM kernel whose paged layout is not yet "
+                             "validated here and can fault the GPU (aborting "
+                             "the process), so keep it off unless debugging.")
     parser.add_argument("--no-reference", action="store_true",
                         help="Skip the torch reference (perf-only run).")
     parser.add_argument("--no-splitkv", action="store_true",
@@ -1347,6 +1733,13 @@ def main():
                              "transparent split-KV wrapper). Useful for "
                              "measuring the kernel directly without the "
                              "combine overhead.")
+    parser.add_argument("--no-regression", action="store_true",
+                        help="Skip the always-on _REGRESSION_FIXTURES guard "
+                             "(bug-repro shapes appended to the default/full "
+                             "grid). Useful for targeted debugging runs where "
+                             "you only want your own --num-heads/--seq-lens "
+                             "shapes. Has no effect in --quick / --swa-fixtures "
+                             "/ single-shape mode.")
     # SWA axes. `--window` extends the cartesian grid with one extra
     # dimension: each (window_size_left, window_size_right) pair adds
     # one row per other-axis cell. `(-1, -1)` is the no-SWA baseline,
@@ -1373,11 +1766,13 @@ def main():
     parser.add_argument("--swa-fixtures", type=str, nargs="*",
                         default=None,
                         choices=["smoke", "edge", "gptoss", "non-align",
-                                 "fp8", "all"],
+                                 "fp8", "regression", "all"],
                         help="Run the curated SWA shape+window fixtures "
                              "instead of the cartesian grid. Each "
                              "category is a self-contained shape sweep; "
-                             "'all' expands to every category.")
+                             "'all' expands to every category. The "
+                             "'regression' category is the bug-repro guard "
+                             "that also runs by default in grid mode.")
     parser.add_argument("--swa-filter", type=str, default=None,
                         help="Substring filter on the SWA fixture name "
                              "(used with --swa-fixtures).")
@@ -1468,6 +1863,10 @@ def main():
 
     # Resolve the mode-dependent Triton default (see CLI comment).
     run_triton = args.triton if args.triton is not None else single_shape
+    # Same mode-dependent default for the legacy paged-KV comparison.
+    run_pagedkv = args.pagedkv if args.pagedkv is not None else single_shape
+    # CK-FA split-KV leg is opt-in only (experimental, can fault — see flag).
+    run_ckfa = bool(args.ck_fa)
 
     # Pool sizing. Single-shape (bench) mode auto-sizes the physical KV pool
     # to a realistic, oversubscribed value (see `_auto_num_blocks`) so a
@@ -1581,6 +1980,8 @@ def main():
                 fx.dtype, fx.q_dtype, fx.num_blocks,
                 seed=args.seed,
                 run_triton_backend=run_triton,
+                run_pagedkv_backend=run_pagedkv,
+                run_ckfa_backend=run_ckfa,
                 skip_reference=args.no_reference,
                 allow_splitkv=not args.no_splitkv,
                 mask_type=fx.mask_type,
@@ -1608,6 +2009,8 @@ def main():
                                             seq_lens, nh, hd, bs, dt, qd, nb,
                                             seed=args.seed,
                                             run_triton_backend=run_triton,
+                                            run_pagedkv_backend=run_pagedkv,
+                                            run_ckfa_backend=run_ckfa,
                                             skip_reference=args.no_reference,
                                             allow_splitkv=not args.no_splitkv,
                                             mask_type=mt,
@@ -1629,6 +2032,33 @@ def main():
                                         gc.collect()
                                         torch.cuda.empty_cache()
 
+        # ---- Always-on regression guard -----------------------------------
+        # Append the bug-repro fixtures to every default/full grid run (skip
+        # --quick smoke runs and explicit --no-regression). These are
+        # self-contained shapes — deliberately NOT filtered by the grid
+        # --num-heads/--block-size/--dtype overrides — so the guard stays
+        # comprehensive regardless of how the rest of the grid is sliced.
+        if not args.quick and not args.no_regression and not single_shape:
+            for fx in _REGRESSION_FIXTURES:
+                ret = test_unified_attention_ck(
+                    fx.seq_lens, fx.num_heads, fx.head_size, fx.block_size,
+                    fx.dtype, fx.q_dtype, fx.num_blocks,
+                    seed=args.seed,
+                    run_triton_backend=run_triton,
+                    run_pagedkv_backend=run_pagedkv,
+                    run_ckfa_backend=run_ckfa,
+                    skip_reference=args.no_reference,
+                    allow_splitkv=not args.no_splitkv,
+                    mask_type=fx.mask_type,
+                    window_size_left=fx.window_size_left,
+                    window_size_right=fx.window_size_right,
+                )
+                ret["swa_fixture"]  = fx.name
+                ret["swa_category"] = fx.category
+                rows.append(ret)
+                gc.collect()
+                torch.cuda.empty_cache()
+
     if single_shape:
         dt0, qd0 = dtype_pairs[0]
         _print_single_shape_report(rows[0], seq_lens_grid[0], num_heads_cfg[0],
@@ -1643,6 +2073,7 @@ def main():
         # the ones that are constant across rows to keep the table
         # readable.
         for noise_col in ("seed", "device", "run_triton_backend",
+                           "run_pagedkv_backend", "run_ckfa_backend",
                            "skip_reference", "allow_splitkv"):
             if noise_col in df.columns:
                 df = df.drop(columns=[noise_col])
@@ -1744,15 +2175,29 @@ def _print_single_shape_report(
     print("Correctness (vs torch reference):")
     ck_p = row.get("ck_pass")
     tr_p = row.get("triton_pass")
+    pkv_p = row.get("pagedkv_pass")
     if ck_p is not None:
         print(f"  CK     vs ref:  {'PASS' if ck_p else 'FAIL'}")
     if tr_p is not None:
         print(f"  Triton vs ref:  {'PASS' if tr_p else 'FAIL'}")
+    if pkv_p is not None:
+        print(f"  PagedKV vs ref: {'PASS' if pkv_p else 'FAIL'}")
+    pkv_skip = row.get("pagedkv_skip")
+    if pkv_skip:
+        print(f"  PagedKV:        SKIPPED ({pkv_skip})")
+    ckfa_p = row.get("ckfa_pass")
+    if ckfa_p is not None:
+        print(f"  CK-FA  vs ref:  {'PASS' if ckfa_p else 'FAIL'}")
+    ckfa_skip = row.get("ckfa_skip")
+    if ckfa_skip:
+        print(f"  CK-FA:          SKIPPED ({ckfa_skip})")
 
     print("-" * 80)
     print("Timing (median of @perftest iters):")
     ck_us = row.get("ck_us")
     tr_us = row.get("triton_us")
+    pkv_us = row.get("pagedkv_us")
+    ckfa_us = row.get("ckfa_us")
     if ck_us is not None:
         ms = ck_us / 1e3
         tflops = (flops / 1e12) / (ms / 1e3)
@@ -1767,10 +2212,32 @@ def _print_single_shape_report(
         print(f"  Triton time    = {ms:8.4f} ms")
         print(f"  Triton Bandwidth={bw:8.2f} GB/s")
         print(f"  Triton TFLOPs  = {tflops:8.2f}")
+    if pkv_us is not None:
+        ms = pkv_us / 1e3
+        tflops = (flops / 1e12) / (ms / 1e3)
+        bw = mem_gb / (ms / 1e3)
+        print(f"  PagedKV time   = {ms:8.4f} ms")
+        print(f"  PagedKV Bandwidth={bw:8.2f} GB/s")
+        print(f"  PagedKV TFLOPs = {tflops:8.2f}")
+    if ckfa_us is not None:
+        ms = ckfa_us / 1e3
+        tflops = (flops / 1e12) / (ms / 1e3)
+        bw = mem_gb / (ms / 1e3)
+        print(f"  CK-FA time     = {ms:8.4f} ms")
+        print(f"  CK-FA Bandwidth= {bw:8.2f} GB/s")
+        print(f"  CK-FA TFLOPs   = {tflops:8.2f}")
     if ck_us is not None and tr_us is not None:
         speedup = tr_us / ck_us
-        winner = "CK" if speedup >= 1.0 else "Triton"
-        print(f"  Speedup        = {speedup:.3f}x ({winner} wins)")
+        winner = "CK-UA" if speedup >= 1.0 else "Triton"
+        print(f"  UA vs Triton   = {speedup:.3f}x ({winner} wins)")
+    if ck_us is not None and pkv_us is not None:
+        speedup = pkv_us / ck_us
+        winner = "CK-UA" if speedup >= 1.0 else "PagedKV"
+        print(f"  UA vs PagedKV  = {speedup:.3f}x ({winner} wins)")
+    if ck_us is not None and ckfa_us is not None:
+        speedup = ckfa_us / ck_us
+        winner = "CK-UA" if speedup >= 1.0 else "CK-FA"
+        print(f"  UA vs CK-FA    = {speedup:.3f}x ({winner} wins)")
     print("=" * 80)
 
 
