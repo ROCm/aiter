@@ -64,6 +64,7 @@ def get_GEMM_A16W16_config_():
         gemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
         gemm_dict = gemm_dict.set_index(
             [
+                "gfx",
                 "cu_num",
                 "M",
                 "N",
