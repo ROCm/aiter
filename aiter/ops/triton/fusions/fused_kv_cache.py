@@ -142,6 +142,8 @@ def fused_qk_rope_cat_and_cache_mla(
     bk, kh, dk_nope = k_nope.shape
     bk2, kh2, dk2 = k_pe.shape
     kv_cache_dtype = kv_cache.dtype
+    d_freq = cos.shape[-1]
+    max_embd_pos = cos.shape[0]
     assert kv_cache_dtype in [
         torch.bfloat16,
         e4m3_dtype,
@@ -190,7 +192,6 @@ def fused_qk_rope_cat_and_cache_mla(
             dk_nope + d_pe == d_cache
         ), "D dimension of k_nope and k_pe should be summed up to be the D dimension of kv_cache"
     assert qh % kh == 0, "Q heads must be multiple of H heads"
-    d_freq = cos.shape[-1]
     assert (d_freq == d_pe // 2) or (
         d_freq == d_pe
     ), "cos/sin last dim should be the same or half of the qk last dim"
@@ -260,13 +261,13 @@ def fused_qk_rope_cat_and_cache_mla(
     assert (
         kv_cache_stride_d == 1
     ), "The stride of the last dimension of KV cache must be 1"
-    
-    if DEVICE_ARCH == "gfx1250":
-        if b >= 8 and kv_cache_dtype != torch.uint8:
+
+    if DEVICE_ARCH == "gfx1250" and kv_cache_dtype != torch.uint8:
+        if b >= 8:
             BLOCK_T = 1
         else:
             BLOCK_T = 1
-        
+
         if BLOCK_T > 1:
             n_pid = triton.cdiv(b, BLOCK_T) * qh + triton.cdiv(b_slot - b, BLOCK_T) * kh
             _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel_BLOCK
@@ -298,7 +299,7 @@ def fused_qk_rope_cat_and_cache_mla(
         b,
         b_slot,
         num_decode_toks_for_zeros,
-        cos.shape[0],
+        max_embd_pos,
         *q_nope.stride(),
         *q_pe.stride(),
         *k_nope.stride(),
@@ -560,10 +561,7 @@ def fused_qk_rope_reshape_and_cache(
             BLOCK_T = 4
             BLOCK_T_NUM_ITR = 1
         chunk = BLOCK_T * BLOCK_T_NUM_ITR
-        n_pid = (
-            triton.cdiv(t, chunk) * qh
-            + triton.cdiv(t_slot - t, chunk) * kh
-        )
+        n_pid = triton.cdiv(t, chunk) * qh + triton.cdiv(t_slot - t, chunk) * kh
         # Use the _LOOP variant only when we actually have an inner static
         # loop to run; the regular kernel is leaner for BLOCK_T_NUM_ITR == 1.
         if BLOCK_T_NUM_ITR > 1:
