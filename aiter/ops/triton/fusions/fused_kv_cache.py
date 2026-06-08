@@ -382,6 +382,8 @@ def fused_qk_rope_reshape_and_cache(
     SCALE_K_WIDTH = 4
     x_cache = 8
     value_shuffle_layout = False
+    max_embd_pos = cos.shape[0]
+    d_freq = cos.shape[-1]
     if kv_cache_dtype == torch.uint8:
         # always shuffled
         t_cache, kh_cache, block_size, d_cache = key_cache.shape
@@ -450,7 +452,6 @@ def fused_qk_rope_reshape_and_cache(
         block_size
     ), "block_size should be power of 2"
     assert qh % kh == 0, "Q heads must be multiple of H heads"
-    d_freq = cos.shape[-1]
     assert (d_freq == d // 2) or (
         d_freq == d
     ), "cos/sin last dim should be the same or half of the qk last dim"
@@ -526,12 +527,24 @@ def fused_qk_rope_reshape_and_cache(
         value_cache_stride_slot_chunk = 0
         value_cache_stride_x = 0
 
-    n_pid = t * qh + (t_slot - t) * kh
-    grid = (n_pid, 1, 1)
-    if DEVICE_ARCH == "gfx1250":
+    # On gfx1250 the gluon 2D kernel handles all bf16/fp8 cache layouts in
+    # one path (BLOCK_T > 1). uint8/NVFP4 still falls back to the Triton
+    # kernel (no NVFP4 support in the 2D gluon kernel yet).
+    if DEVICE_ARCH == "gfx1250" and kv_cache_dtype != torch.uint8:
+        if t >= 256:
+            BLOCK_T = 8
+        elif t >= 8:
+            BLOCK_T = 8
+        else:
+            BLOCK_T = 4
         _kernel = gluon_fused_qk_rope_reshape_and_cache_kernel
+        n_pid = triton.cdiv(t, BLOCK_T) * qh + triton.cdiv(t_slot - t, BLOCK_T) * kh
+        _extra_args = {"BLOCK_T": BLOCK_T}
     else:
+        n_pid = t * qh + (t_slot - t) * kh
         _kernel = triton_fused_qk_rope_reshape_and_cache_kernel
+        _extra_args = {}
+    grid = (n_pid, 1, 1)
     _kernel[grid](
         q,
         k,
@@ -548,6 +561,7 @@ def fused_qk_rope_reshape_and_cache(
         zeros_out,
         t,
         t_slot,
+        max_embd_pos,
         *q.stride(),
         *k.stride(),
         *v.stride(),
@@ -589,6 +603,7 @@ def fused_qk_rope_reshape_and_cache(
         HAVE_ZEROS=output_zeros,
         UPCAST_OPERAND=upcast_operand,
         num_warps=1,
+        **_extra_args,
     )
 
     if zeros_out is not None:
