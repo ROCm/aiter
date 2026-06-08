@@ -426,20 +426,11 @@ __global__ void pa_v4_fp8_dequant_kernel(pa_v4_dequant_kargs kargs)
 //   PV: dequant V (nope*scale ++ rope) -> bf16 smem, bf16 16x16x32 MFMA.
 // One block = one query token x a 16-head tile, 64 lanes (1 wave).
 // ============================================================================
-namespace pa_fp8_fused {
-
-using fp8x8_t  = opus::fp8x8_t;
-using bf16x8_t = opus::bf16x8_t;
-using fp32x4_t = opus::vector_t<float, 4>;
-
-}  // namespace pa_fp8_fused
-
 template <class Traits>
 __global__ __launch_bounds__(256, 1)
 void pa_prefill_fp8_fused_kernel(pa_sparse_prefill_fp8_kargs kargs)
 {
-    using namespace opus;
-    using namespace pa_fp8_fused;
+    using namespace opus;  // fp8x8_t / bf16x8_t / fp32x4_t etc. come from here
     using T = opus::remove_cvref_t<Traits>;
     constexpr float LOG2_E = 1.44269504089f;
 
