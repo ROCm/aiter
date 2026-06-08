@@ -117,11 +117,12 @@ def get_GEMM_A16W16_config(
     cu_num = get_cu_num()
     padded_M = M
     config = None
-
+    gfx = get_gfx()
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         config = cfg.get(
             (
+                gfx,
                 cu_num,
                 padded_M,
                 N,
@@ -161,7 +162,6 @@ def get_GEMM_A16W16_config(
 
     if config is None:
         default_config = {}
-        gfx = get_gfx()
         # gfx12: no ASM/skinny/hipblaslt kernels, use torch
         if gfx.startswith("gfx12"):
             default_config["libtype"] = "torch"
