@@ -43,6 +43,21 @@
     CHECK_TH_CUDA(x);  \
     CHECK_CONTIGUOUS(x)
 
+// Like is_contiguous() but ignoring dim 0 (permits an interleaved block stride, e.g. vLLM unbind(1)).
+static inline bool is_contiguous_from_dim1(const aiter_tensor_t& t)
+{
+    if(t.numel() == 0)
+        return true;
+    int64_t expected = 1;
+    for(int d = t.dim() - 1; d >= 1; --d)
+    {
+        if(t.size(d) != 1 && t.stride(d) != expected)
+            return false;
+        expected *= t.size(d);
+    }
+    return true;
+}
+
 namespace aiter {
 /** Map q/k/v tensor strides to logical [token, head, dim] element strides (PyTorch strides are in
  * elements). */
@@ -758,6 +773,10 @@ __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
                 if(k_scale_global < k_scale_val)
                 {
                     // k_cache layout: [num_blocks, num_heads_k, head_size//X, page_size, X]
+                    // TODO(stride-aware): this assumes a contiguous block stride
+                    // (block_idx * page_size * num_heads_k * head_dim). Mirror the
+                    // runtime per-block-stride fix from the pts shuffle path when this
+                    // kernel must support non-contiguous (e.g. vLLM unbind(1)) caches.
                     int64_t cache_base = block_idx * page_size * num_heads_k * head_dim +
                                          headIdx * head_dim * page_size;
                     float rescale            = k_scale_global * inv_scale_val;
@@ -2929,7 +2948,13 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
 {
     AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
                 cos_sin.is_contiguous());
-    AITER_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && slot_mapping.is_contiguous());
+    AITER_CHECK(slot_mapping.is_contiguous());
+    if(!(k_cache.is_contiguous() && v_cache.is_contiguous()))
+    {
+        // Non-contiguous block dim (e.g. vLLM [num_blocks, 2, ...] after unbind(1)) is OK as long as each block is internally contiguous.
+        AITER_CHECK(is_contiguous_from_dim1(k_cache) && is_contiguous_from_dim1(v_cache),
+                    "k_cache/v_cache must be contiguous within a block (dims >= 1)");
+    }
     HipDeviceGuard device_guard(qkv.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     auto kv_cache_dtype      = k_cache.dtype();
@@ -2937,6 +2962,9 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
     AITER_CHECK(positions.dim() == 1, "positions must be 1D");
     float per_tensor_k_scale_ = *reinterpret_cast<float*>(per_tensor_k_scale.data_ptr());
     float per_tensor_v_scale_ = *reinterpret_cast<float*>(per_tensor_v_scale.data_ptr());
+    // Per-block (dim-0) stride: == num_heads_k*HEAD_SIZE*block_size when contiguous (old formula); larger for an interleaved [num_blocks, 2, ...] cache.
+    int64_t k_cache_block_stride = k_cache.stride(0);
+    int64_t v_cache_block_stride = v_cache.stride(0);
     VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
         qkv_dtype, "fused_qk_norm_rope_cache_pts_quant_shuffle", [&] {
             using T = scalar_t;
@@ -2975,7 +3003,9 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                     use_shuffle_layout,
                     block_size,
                     x,
-                    rotary_dim);
+                    rotary_dim,
+                    k_cache_block_stride,
+                    v_cache_block_stride);
             }
             else
             {
@@ -3020,7 +3050,9 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             use_shuffle_layout,
                             block_size,
                             x,
-                            rotary_dim);
+                            rotary_dim,
+                            k_cache_block_stride,
+                            v_cache_block_stride);
                     }
                     else
                     {
@@ -3061,7 +3093,9 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             use_shuffle_layout,
                             block_size,
                             x,
-                            rotary_dim);
+                            rotary_dim,
+                            k_cache_block_stride,
+                            v_cache_block_stride);
                     }
                 }
                 else
