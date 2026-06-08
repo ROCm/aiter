@@ -474,6 +474,8 @@ def get_GEMM_config_with_quant_type(
                 msg = f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}!"
                 if "libtype" in config:
                     msg += f" libtype is {config['libtype']}!"
+                if "kernelName" in config:
+                    msg += f" kernelName is {config['kernelName']} (kernelId {config.get('kernelId')})!"
                 logger.info(msg)
             break
     if config is None:
