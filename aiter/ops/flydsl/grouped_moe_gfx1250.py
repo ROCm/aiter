@@ -519,16 +519,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         m_tile_prefix, m_tile_map = _make_m_tile_prefix_map(masked_m, _m_tile_cfg)
 
     if data_format == "fp4":
-        # a1 fp4 quant: AITER_GROUPED_GEMM_NAIVE=1 uses the torch reference
-        # per_1x32_f4_quant; =0 (default) uses the fused Triton kernel
-        # per_1x32_f4_quant_triton, which collapses the torch op launch-storm
-        # (the dominant tiny-op hotspot). NOTE: the two are not bit-identical --
-        # their e8m0 block-scale rounding differs by up to 1 exponent step in a
-        # minority of blocks -- so NAIVE on/off differ slightly on the fp4 a1 quant.
+        # a1 fp4 quant: AITER_GROUPED_GEMM_NAIVE=1 uses the torch reference;
+        # the fast path uses the HIP MXFP4 quant kernel so its e8m0 rounding
+        # matches the production HIP quant contract.
         if _use_naive:
             from aiter.ops.quant import per_1x32_f4_quant as _a1_f4_quant
         else:
-            from aiter.ops.quant import per_1x32_f4_quant_triton as _a1_f4_quant
+            from aiter.ops.quant import per_1x32_f4_quant_hip as _a1_f4_quant
 
         _grouped_dbg("start a1 fp4 quant")
         a1_quant, a1_scale_token = _a1_f4_quant(
@@ -711,12 +708,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     if data_format == "fp4":
         # a2 fp4 quant: same NAIVE gating as a1 -- torch reference on NAIVE=1,
-        # fused Triton kernel on NAIVE=0 (default). Not bit-identical (e8m0 scale
-        # rounding differs by <=1 exponent step), so NAIVE on/off differ slightly.
+        # HIP MXFP4 quant on the fast path.
         if _use_naive:
             from aiter.ops.quant import per_1x32_f4_quant as _a2_f4_quant
         else:
-            from aiter.ops.quant import per_1x32_f4_quant_triton as _a2_f4_quant
+            from aiter.ops.quant import per_1x32_f4_quant_hip as _a2_f4_quant
 
         _grouped_dbg("start a2 fp4 quant")
         a2_quant, a2_scale_token = _a2_f4_quant(
