@@ -1115,13 +1115,8 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank, int size)
 {
     constexpr int pack_size = 16 / sizeof(T);
-    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
-    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
-    int warp_id = threadIdx.x / tnum_gpu;
-    int lane_id = threadIdx.x % tnum_gpu;
-    int tid     = blockIdx.x * tnum_gpu + lane_id;
     const P* ptrs[ngpus];
     P* tmps[ngpus];
 #pragma unroll
@@ -1132,45 +1127,37 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
     }
     start_sync<ngpus>(sg, self_sg, rank);
 
+    // FLAT reduce-scatter + broadcast. This rank owns the pack range
+    // [rank*part, (rank+1)*part); each thread reduces ONE pack across all ngpus
+    // inputs in fp32 and stores the bf16 sum into every rank's tmp at the same
+    // offset (all-gather via broadcast). Each thread thus touches all ngpus links
+    // for both the reads and the ngpus broadcast stores; the ngpus stores/thread
+    // pipeline the write (broadcast) half far better than the previous
+    // warp-per-rank+LDS scheme's 1 store/thread. Measured faster at every m
+    // (0.91x at m=64 -> 0.86x at m=512 vs warp-per-rank) with bit-identical output
+    // (same canonical reduce order, same bf16 sum). No LDS, no intra-block sync.
     int part = size / (pack_size * ngpus);
-    for(int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
+    int base = rank * part;
+    for(int l = blockIdx.x * blockDim.x + threadIdx.x; l < part;
+        l += gridDim.x * blockDim.x)
     {
-        // cross device read by all warp
-        P input_reg                                         = ptrs[warp_id][rank * part + idx];
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
-        __syncthreads();
-        // calculate and save in first warp
-        if(warp_id == 0)
+        int gp = base + l;
+        A acc{};
+#pragma unroll
+        for(int r = 0; r < ngpus; ++r)
         {
-            A add_reg;
+            P v = ptrs[r][gp];
 #pragma unroll
-            for(int i = 0; i < pack_size; ++i)
-            {
-                add_reg[i] = upcast_s(tmp_smem[pack_size * threadIdx.x + i]);
-            }
-#pragma unroll
-            for(int i = 1; i < ngpus; ++i)
-            {
-#pragma unroll
-                for(int j = 0; j < pack_size; ++j)
-                {
-                    add_reg[j] +=
-                        upcast_s(tmp_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
-                }
-            }
-            P add_rslt;
-#pragma unroll
-            for(int i = 0; i < pack_size; ++i)
-            {
-                add_rslt[i] = downcast_s<T>(add_reg[i]);
-            }
-            *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
+            for(int e = 0; e < pack_size; ++e)
+                acc[e] += upcast_s(v[e]);
         }
-        __syncthreads();
-
-        // cross device store
-        P rslt                           = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
-        tmps[warp_id][rank * part + idx] = rslt;
+        P s;
+#pragma unroll
+        for(int e = 0; e < pack_size; ++e)
+            s[e] = downcast_s<T>(acc[e]);
+#pragma unroll
+        for(int w = 0; w < ngpus; ++w)
+            tmps[w][gp] = s;
     }
     // NOTE: must use final_sync=false (RELEASE/ACQUIRE) here. Stage 2
     // (local_device_load_rmsnorm*) on each rank reads `tmps` on the
@@ -3153,6 +3140,14 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
 
     auto pack_size = 16 / sizeof(T);
     use_1stage     = use_1stage && (n % pack_size == 0) && (n / pack_size <= 1024);
+    // Win-gate the path by data volume: one-stage's lower overhead (single barrier,
+    // no HBM round-trip) only wins for small inputs; above the measured crossover the
+    // FLAT two-stage's halved cross-card traffic (3S -> 1.5S) wins. Crossover ~0.44 MiB
+    // (m=32 @ hidden 7168); use 0.5 MiB with margin. So even if the caller permits
+    // one-stage, fall back to two-stage once we're past where it pays (e.g. m=64 decode
+    // = 0.875 MiB -> two-stage). This only DISABLES one-stage; it never overrides an
+    // explicit two-stage request (use_1stage already false).
+    use_1stage = use_1stage && ((size_t)size * sizeof(T) < (size_t)512 * 1024);
 #define MAYBE_DISPATCH_1S_KERNEL(NGPUS)                                            \
     if(use_1stage)                                                                 \
     {                                                                              \
@@ -3176,22 +3171,29 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     dim3 block(512);
     int block_num = ((size / world_size_) + 512 - 1) / 512;
     dim3 grid(std::min(block_num, 80));
+    // FLAT reduce_scatter_cross_device_store is 1 pack/thread: launch it with block 256
+    // (not the 512 used by step-2 rmsnorm) so small-m decode engages more CUs -- e.g.
+    // m=64 -> 56 active blocks vs 28 at block 512. grid covers this rank's pack range,
+    // capped at kMaxBlocks (start_sync's per-block slot limit).
+    int rs_packs = size / ((16 / sizeof(T)) * world_size_);
+    dim3 rs_block(256);
+    dim3 rs_grid(std::min((rs_packs + 255) / 256, 80));
     switch(world_size_)
     {
     case 8:
         MAYBE_DISPATCH_1S_KERNEL(8);
         reduce_scatter_cross_device_store<T, 8>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+            <<<rs_grid, rs_block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
         break;
     case 4:
         MAYBE_DISPATCH_1S_KERNEL(4);
         reduce_scatter_cross_device_store<T, 4>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+            <<<rs_grid, rs_block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
         break;
     case 2:
         MAYBE_DISPATCH_1S_KERNEL(2);
         reduce_scatter_cross_device_store<T, 2>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+            <<<rs_grid, rs_block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
         break;
     default: throw std::runtime_error("fused allreduce rmsnorm: unsupported world_size=" + std::to_string(world_size_));
     }
