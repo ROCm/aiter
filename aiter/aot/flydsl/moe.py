@@ -38,6 +38,7 @@ from aiter.aot.flydsl.common import (
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
+    _ptr_view_safe,
     _run_compiled,
     _s1_args_fp4,
     _s1_args_std,
@@ -579,13 +580,13 @@ def _precompile_to_cache(
                 _run_compiled(
                     silu_fused,
                     (
-                        tmp_out.view(-1, inter_dim * 2),
-                        out.view(-1).view(torch.uint8),
-                        out_scale_sorted_flat,
-                        sorted_token_ids,
-                        num_valid_ids,
-                        sorted_token_ids.view(-1),
-                        torch.empty(0, device=dev, dtype=torch.float32),
+                        _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
+                        _ptr_view_safe(out.view(-1).view(torch.uint8)),
+                        _ptr_view_safe(out_scale_sorted_flat),
+                        _ptr_view_safe(sorted_token_ids),
+                        _ptr_view_safe(num_valid_ids),
+                        _ptr_view_safe(sorted_token_ids.view(-1)),
+                        _ptr_view_safe(torch.empty(0, device=dev, dtype=torch.float32)),
                         tokens,
                         sorted_token_ids.shape[0],
                         0,
