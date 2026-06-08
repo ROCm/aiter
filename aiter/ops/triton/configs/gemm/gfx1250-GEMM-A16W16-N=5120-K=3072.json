@@ -8,7 +8,7 @@
         "L2_PREFETCH_DISTANCE": 0
     },
     "any": {
-        "BLOCK_M": 64,
+        "BLOCK_M": 32,
         "BLOCK_N": 64,
         "BLOCK_K": 64,
         "NUM_BUFFERS": 5,
