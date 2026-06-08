@@ -1090,6 +1090,7 @@ def flydsl_moe_stage2(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     mfma_variant: Optional[str] = None,
+    zero_intermediate: bool = True,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1154,7 +1155,15 @@ def flydsl_moe_stage2(
 
     target = out
     if not accumulate:
-        target = torch.empty(
+        # Reduce mode writes one row per *valid* (token, slot) into a
+        # [token*topk, model_dim] scratch and then sums over topk. When some
+        # slots can be left unwritten (EP: slots routed to non-local experts;
+        # or variable-length dispatch) the scratch must be zero-initialized,
+        # otherwise those uninitialized rows corrupt the sum. When every slot is
+        # written (dense, non-EP) the GEMM fully overwrites the scratch, so the
+        # (large) zeroing can be skipped via zero_intermediate=False.
+        alloc_reduce = torch.zeros if zero_intermediate else torch.empty
+        target = alloc_reduce(
             (token_num * topk * model_dim,),
             device=out.device,
             dtype=out.dtype,

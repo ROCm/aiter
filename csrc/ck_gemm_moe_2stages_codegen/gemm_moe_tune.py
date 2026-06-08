@@ -479,6 +479,16 @@ class FmoeTuner(TunerCommon):
         if kparams.get("mode", "atomic") == "atomic":
             moe_buf.zero_()
 
+        # Align reduce-mode's intermediate zeroing cost with the deployment
+        # scenario. Default is TP (non-EP): production skips the (large)
+        # intermediate zero (see flydsl_moe_stage2's zero_intermediate), so
+        # reduce candidates are tuned without it. Set
+        # AITER_FMOE_TUNE_ZERO_INTERMEDIATE=1 to tune for EP, where the zero is
+        # required and must be charged in the timing.
+        zero_intermediate = (
+            os.getenv("AITER_FMOE_TUNE_ZERO_INTERMEDIATE", "0") == "1"
+        )
+
         sort_block_m = kparams.get("sort_block_m", 0)
         persist = kparams.get("persist", False)
         return flydsl_moe_stage2(
@@ -505,6 +515,7 @@ class FmoeTuner(TunerCommon):
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
             mfma_variant=kparams.get("mfma_variant", None),
+            zero_intermediate=zero_intermediate,
         )
 
     @staticmethod

@@ -618,6 +618,12 @@ def fused_moe_(
             fc1_smooth_scale=fc1_smooth_scale,
             W1_R=W1_R,
             W2_R=W2_R,
+            # Only EP (non-local experts) or variable-length dispatch can leave
+            # reduce-mode scratch rows unwritten; dense runs overwrite all rows
+            # and can skip the zeroing.
+            stage2_zero_intermediate=(
+                expert_mask is not None or num_local_tokens is not None
+            ),
         )
 
 
@@ -1051,6 +1057,9 @@ def _flydsl_stage2_wrapper(
         # Keep stage2 persist behavior aligned with kernel naming.
         # For migrated old kernels (non `_persist` names), force legacy non-persistent path.
         persist=parsed.get("persist", False),
+        # reduce-mode scratch only needs zeroing when slots may be unwritten
+        # (EP / variable dispatch); default True keeps direct callers safe.
+        zero_intermediate=_kwargs.get("zero_intermediate", True),
     )
 
 
@@ -1630,6 +1639,10 @@ def fused_moe_2stages(
     fc1_smooth_scale=None,  # shared [model_dim]
     W1_R=None,
     W2_R=None,
+    # FlyDSL reduce-mode stage2: whether the [token*topk, model] scratch must be
+    # zero-initialized (True when some (token, slot) rows may be left unwritten,
+    # i.e. EP or variable-length dispatch). Ignored by non-FlyDSL stage2 impls.
+    stage2_zero_intermediate: bool = True,
 ):
     quant_func = get_quant(quant_type)
     q_type2 = quant_type if q_type2 is None else QuantType(q_type2)
@@ -1838,6 +1851,10 @@ def fused_moe_2stages(
     ):
         extra_stage1_args["bias1"] = bias1
         extra_stage2_args["bias2"] = bias2
+    # Only the FlyDSL stage2 wrapper understands zero_intermediate; gate the
+    # kwarg so non-FlyDSL stage2 impls (CK/asm) never receive it.
+    if getattr(metadata.stage2, "func", None) is _flydsl_stage2_wrapper:
+        extra_stage2_args["zero_intermediate"] = stage2_zero_intermediate
     a2 = metadata.stage1(
         a1,
         w1,
