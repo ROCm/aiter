@@ -42,7 +42,7 @@ struct opus_gemm_a16w16_traits {
     static constexpr int T_K = opus::get<2>(TILE{});
 
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N * T_K);
-    static_assert(T_K == 1);
+    // T_K > 1 is used by the wave-K-coop pipeline; splitK/SB paths use T_K=1.
 
     static constexpr int W_M = opus::get<0>(WAVE{});
     static constexpr int W_N = opus::get<1>(WAVE{});
@@ -54,11 +54,11 @@ struct opus_gemm_a16w16_traits {
 
     static_assert(HALF_B_M % (W_M * T_M) == 0);
     static_assert(HALF_B_N % (W_N * T_N) == 0);
-    static_assert(B_K % (W_K * T_K) == 0);
+    static_assert(B_K % W_K == 0);
 
     static constexpr int E_M = HALF_B_M / (W_M * T_M);
     static constexpr int E_N = HALF_B_N / (W_N * T_N);
-    static constexpr int E_K = B_K / (W_K * T_K);
+    static constexpr int E_K = B_K / W_K;
 
     static constexpr int VEC_A = opus::get<0>(VEC{});
     static constexpr int VEC_B = opus::get<1>(VEC{});
@@ -122,36 +122,5 @@ struct opus_gemm_splitk_kargs {
     int stride_ws_batch;    // = padded_M * padded_N
     int stride_c_batch;
     int stride_bias_batch;
-};
-#endif
-
-#ifndef OPUS_GEMM_SPLITK_FUSED_KARGS_GFX942_DEFINED
-#define OPUS_GEMM_SPLITK_FUSED_KARGS_GFX942_DEFINED
-// Fused splitK (single-kernel atomic-style reduce via cooperative tile flags).
-// Extends opus_gemm_splitk_kargs with ptr_flags + cooperative_reduce mode.
-struct opus_gemm_splitk_fused_kargs {
-    const void* __restrict__ ptr_a;         // bf16 [B, M, K]
-    const void* __restrict__ ptr_b;         // bf16 [B, N, K] (pre-transposed)
-    void*       __restrict__ ptr_workspace; // fp32 [split_k, B, padded_M, padded_N]
-    void*       __restrict__ ptr_c;         // bf16 [B, M, N] output
-    const void* __restrict__ ptr_bias;      // unused (reserved for future bias fusion)
-    unsigned int* __restrict__ ptr_flags;   // [B * num_tiles_m * num_tiles_n], init to 0
-    int m;
-    int n;
-    int k;
-    int batch;
-    int split_k;
-    int stride_a;
-    int stride_b;
-    int stride_ws;          // = padded_N
-    int stride_c;           // = N
-    int stride_a_batch;
-    int stride_b_batch;
-    int stride_ws_batch;    // = padded_M * padded_N
-    int stride_c_batch;
-    int stride_bias_batch;
-    // 1 = all split_k WGs of each tile cooperate on the reduce (each WG handles a slice of REDUCE_ITERS);
-    // requires grid_total_wgs <= ...
-    int cooperative_reduce;
 };
 #endif

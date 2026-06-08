@@ -2,7 +2,7 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // a16w16 family heuristic dispatcher (gfx942). See opus_gemm_common.py for
-// the full kid catalogue (50000 / 50001-3 / 50011 / 50200-3 / 50211 / 50300).
+// the full kid catalogue (50000 / 50001-3 / 50011 / 50200-4 / 50211 / 50300).
 #pragma once
 
 #include <optional>
@@ -28,16 +28,6 @@ opus_gemm_gfx942_512x128x128x64_2x4_16x16x16_0x0x0(
 template <typename D_C>
 void
 opus_gemm_gfx942_splitk_legacy_512x128x128x64_2x4_16x16x16_0x0x0(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> bias,
-    int splitK);
-
-// kid 301: splitk_fused BS=512, B_M=128, B_N=128, B_K=64, T_M=2, T_N=4, MFMA=16x16x16
-template <typename D_C>
-void
-opus_gemm_gfx942_splitk_fused_512x128x128x64_2x4_16x16x16_0x0x0(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,

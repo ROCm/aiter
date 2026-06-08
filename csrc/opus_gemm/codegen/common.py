@@ -22,7 +22,11 @@ _NOSPLIT = tuple(W3_KERNEL_PAIRS.keys())
 _SPLITK = tuple(W3_KERNEL_PAIRS.values())
 _GFX942_A16W16_TAGS = (
     _SPLITK
-    + ("a16w16_fused_reduce", "a16w16_em3en4_lds1_pgr2_sk", "a16w16_kbuf1_large_tile")
+    + (
+        "a16w16_em3en4_lds1_pgr2_sk",
+        "a16w16_kbuf1_large_tile",
+        "a16w16_wave_k_coop",
+    )
     + _NOSPLIT
 )
 _A16W16_TAGS = (

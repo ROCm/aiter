@@ -413,17 +413,13 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
     except Exception:
         pass  # unknown arch -> keep legacy multi-arch behaviour
 
-    # Step 6: drop known-bad kids permanently (silent garbage; see PLAN.md G2/G3).
+    # Step 6: drop known-bad kids permanently.
     cands = cands - _OPUS_PERMA_BAD_KIDS
     return cands
 
 
-# Kids we never want tuner to probe (correctness FAIL on multiple shape niches).
-# See plan PLAN.md G2: 50300 fused_reduce 49% splitK case FAIL on 1024x64x7168
-# (memory [[opus-50300-silent-garbage]]). Kept in source + heuristic-default
-# (so opus_gemm_a16w16_tune(id=50300) debug path still works) but excluded
-# from tune candidate search.
-_OPUS_PERMA_BAD_KIDS = frozenset({50300})
+# Kids we never want tuner to probe.
+_OPUS_PERMA_BAD_KIDS = frozenset()
 
 
 def _ensure_kids_compiled(candidate_kids):
@@ -1612,7 +1608,6 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     "a16w16_flatmm_splitk",
                     "a16w16_kbuf3_sk",
                     "a16w16_kbuf1_sk",
-                    "a16w16_fused_reduce",
                     "a16w16_kbuf2v_sk",
                     "a16w16_kbuf2v_bk128_sk",
                     "a16w16_em3en4_lds1_pgr2_sk",
@@ -1630,7 +1625,6 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     "a16w16_flatmm_splitk",
                     "a16w16_kbuf3_sk",
                     "a16w16_kbuf1_sk",
-                    "a16w16_fused_reduce",
                     "a16w16_kbuf2v_sk",
                     "a16w16_kbuf2v_bk128_sk",
                     "a16w16_em3en4_lds1_pgr2_sk",

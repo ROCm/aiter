@@ -76,14 +76,14 @@ class OpusGemmInstance:
             parts.insert(tag_at, "splitk")
         elif self.kernel_tag == "a16w16_kbuf1_sk":
             parts.insert(tag_at, "splitk_legacy")
-        elif self.kernel_tag == "a16w16_fused_reduce":
-            parts.insert(tag_at, "splitk_fused")
         elif self.kernel_tag == "a16w16_kbuf2v_sk":
             parts.insert(tag_at, "splitk_p1")
         elif self.kernel_tag == "a16w16_kbuf2v_bk128_sk":
             parts.insert(tag_at, "splitk_p1_bk128")
         elif self.kernel_tag == "a16w16_em3en4_lds1_pgr2_sk":
             parts.insert(tag_at, "splitk_em3en4_lds1_pgr2")
+        elif self.kernel_tag == "a16w16_wave_k_coop":
+            parts.insert(tag_at, "wkc")
         elif self.kernel_tag == "a16w16_kbuf2v":
             parts.insert(tag_at, "p1")
         elif self.kernel_tag == "a16w16_kbuf2v_bk128":
@@ -499,20 +499,9 @@ def _a16w16_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     )
 
 
-def _a16w16_splitk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk, fused=False, legacy=False):
-    """Factory for gfx942 a16w16 splitk kid instances.
-
-    fused=False legacy=False -> tag "a16w16_kbuf3_sk"        (W3 K-dbuf depth=3 + V-dbuf, E_M==1 only)
-    fused=False legacy=True  -> tag "a16w16_kbuf1_sk" (4-phase split-barrier, E_M>=2 OK)
-    fused=True               -> tag "a16w16_fused_reduce"  (fused reduce, E_M==1 only)
-    """
+def _a16w16_splitk_tag_gfx942(bs, bm, bn, bk, tn, wm, wn, wk, tag):
+    """Factory for gfx942 splitK kids that write fp32 workspace + reduce."""
     vec = 16 // 2  # bf16
-    if fused:
-        tag = "a16w16_fused_reduce"
-    elif legacy:
-        tag = "a16w16_kbuf1_sk"
-    else:
-        tag = "a16w16_kbuf3_sk"
     return OpusGemmInstance(
         bs, bm, bn, bk,
         2, tn,
@@ -522,6 +511,20 @@ def _a16w16_splitk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk, fused=False, legacy=Fa
         tag,
         ["fp32_t"],
         arch_prefix="gfx942",
+    )
+
+
+def _a16w16_kbuf3_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
+    """SplitK W3 K-dbuf depth=3 + V-dbuf, E_M==1 only."""
+    return _a16w16_splitk_tag_gfx942(
+        bs, bm, bn, bk, tn, wm, wn, wk, "a16w16_kbuf3_sk"
+    )
+
+
+def _a16w16_kbuf1_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
+    """SplitK 4-phase split-barrier, E_M>=2 OK."""
+    return _a16w16_splitk_tag_gfx942(
+        bs, bm, bn, bk, tn, wm, wn, wk, "a16w16_kbuf1_sk"
     )
 
 
@@ -581,6 +584,15 @@ def _a16w16_kbuf2v_bk128_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     )
 
 
+def _a16w16_wave_k_coop_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
+    """Wave-K-cooperative small-M/N kid; tn partitions waves over N."""
+    vec = 16 // 2
+    return OpusGemmInstance(
+        bs, bm, bn, bk, 1, tn, wm, wn, wk, vec, vec, 4, 0, 0, 0,
+        "a16w16_wave_k_coop", ["bf16_t"], arch_prefix="gfx942",
+    )
+
+
 def _a16w16_em3en4_lds1_pgr2_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     """SplitK EM3EN4: host 128x96, device 96x128 LDSB1."""
     vec = 16 // 2
@@ -598,19 +610,23 @@ gfx942_nosplit_kernels_list = {
     50002: _a16w16_kbuf1_gfx942 (256, 128,  64,  64,    2, 16, 16, 16),   # legacy 4-phase E_M=2 sibling of 50202
     50003: _a16w16_kbuf2v_bk128_gfx942(256, 64,  64, 128,    2, 16, 16, 16),   # P1 B_K=128 sibling of 50203
     50011: _a16w16_p1_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),   # P1 depth=2 sibling of 50211
+    50300: _a16w16_wave_k_coop_gfx942(512, 16, 16, 64,    1, 16, 16, 16),  # wave-K-coop 16x16, T_K=8
+    50301: _a16w16_wave_k_coop_gfx942(512, 16, 32, 32,    1, 16, 16, 16),  # WKC 16x32, B_K=32
+    50302: _a16w16_wave_k_coop_gfx942(512, 32, 16, 64,    1, 16, 16, 16),  # WKC 32x16, aliased partial
+    50303: _a16w16_wave_k_coop_gfx942(256, 32, 32, 64,    1, 16, 16, 16),  # WKC 32x32, T_K=4
 }
 
 gfx942_splitk_kernels_list = {
-    50200: _a16w16_splitk_gfx942        (512, 128, 128,  64,    4, 16, 16, 16, legacy=True),   # legacy 4-phase large tile
-    50201: _a16w16_splitk_gfx942        (256,  64,  64,  64,    2, 16, 16, 16),                # W3 depth=3 small-MN
-    50202: _a16w16_splitk_gfx942        (256, 128,  64,  64,    2, 16, 16, 16, legacy=True),   # legacy 4-phase mid tile
+    50200: _a16w16_kbuf1_sk_gfx942      (512, 128, 128,  64,    4, 16, 16, 16),                # legacy 4-phase large tile
+    50201: _a16w16_kbuf3_sk_gfx942      (256,  64,  64,  64,    2, 16, 16, 16),                # W3 depth=3 small-MN
+    50202: _a16w16_kbuf1_sk_gfx942      (256, 128,  64,  64,    2, 16, 16, 16),                # legacy 4-phase mid tile
     50203: _a16w16_kbuf2v_bk128_sk_gfx942(256, 64,  64, 128,    2, 16, 16, 16),                # P1 B_K=128 sub-K decomp
     50211: _a16w16_kbuf2v_sk_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),                # P1 depth=2 + V-dbuf
     50204: _a16w16_em3en4_lds1_pgr2_sk_gfx942 (256, 128,  96, 128,    2, 16, 16, 16),                # EM3EN4 LDS1/PGR2 hipb-orientation (host 128M x 96N)
-    50300: _a16w16_splitk_gfx942        (256,  64,  64,  64,    2, 16, 16, 16, fused=True),    # fused-reduce small tile
+    50205: _a16w16_kbuf1_sk_gfx942      (512,  64, 128,  64,    4, 16, 16, 16),                # legacy 4-phase M64 x N128
 }
 
-# NOTE: 50402 (a16w16_naive_64x64) was removed -- 32.85us never matched 50400's
+# NOTE: 50402 (a16w16_naive_64x64) was removed -- 32.85us never matched WKC's
 # 11.88us on tuned shapes (bf16_tuned_ge...
 
 gfx942_kernels_list = {**gfx942_nosplit_kernels_list, **gfx942_splitk_kernels_list}
@@ -668,7 +684,7 @@ NON_SPLITK_KIDS = (
     | frozenset(a16w16_persistent_kernels_list_nooob.keys())
     | frozenset(a16w16_persistent_kernels_list_cpol_nooob.keys())
     | frozenset(a16w16_mono_tile_kernels_list.keys())
-    | frozenset(gfx942_nosplit_kernels_list.keys())  # 50000/50001/50002/50003/50011
+    | frozenset(gfx942_nosplit_kernels_list.keys())  # 50000/50001/50002/50003/50011/50300
 )
 
 # 4g_safe kid families. Per-WG-tight BR sizing -- selectable for any shape
@@ -728,13 +744,14 @@ HEURISTIC_DEFAULT_KIDS_GFX942 = frozenset(
         50200,  # gfx942 splitk          512x128x128x64 16x16x16 (N > 128)
         50201,  # gfx942 splitk          256x64x64x64   16x16x16 (N <= 64)
         50202,  # gfx942 splitk          256x128x64x64  16x16x16 (64 < N <= 128)
-        # Extra gfx942 splitk_fused probes; not reachable by the heuristic but
-        # baked so opus_gemm_a16w16_tune(id=...) can exercise them.
-        50300,  # gfx942 splitk_fused    256x64x64x64   16x16x16 (small tile, W3-graft)
-        # 50301 dropped 2026-05-30 (E_M=2 incompatible with W3 K-dbuf depth=3)
+        50300,  # gfx942 wave_k_coop      512x16x16x64 T_K=8
+        50301,  # gfx942 wave_k_coop      512x16x32x32 T_K=8
+        50302,  # gfx942 wave_k_coop      512x32x16x64 T_K=8
+        50303,  # gfx942 wave_k_coop      256x32x32x64 T_K=4
         50211,  # gfx942 splitk_p1        256x64x64x64  (depth=2 + workspace + reduce, deterministic)
         50203,  # gfx942 splitk_p1_bk128  256x64x64x128 (B_K=128 Option B; dev/bench)
         50204,  # gfx942 splitk_em3en4_lds1_pgr2 256x128x96x128 hipb-orientation
+        50205,  # gfx942 splitk_legacy    512x64x128x64 16x16x16
         # Non-splitK siblings of the corresponding splitK kids.
         50001,  # a16w16_kbuf3        non-splitK sibling of 50201
         50002,  # a16w16_kbuf1    non-splitK sibling of 50202 (E_M=2)

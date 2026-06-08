@@ -51,32 +51,14 @@ TRAITS_HEADER_MAP = {
     **get_arch_map("gfx942", "traits_header"),
 }
 
-# Per-tag splitk reduce header (splitk_fused omitted: in-kernel reduce).
-SPLITK_REDUCE_HEADER_MAP = {
-    "a16w16_flatmm_splitk": "gfx950/splitk_reduce_gfx950.cuh",
-    "a16w16_kbuf3_sk": "gfx942/splitk_reduce_gfx942.cuh",
-    "a16w16_kbuf1_sk": "gfx942/splitk_reduce_gfx942.cuh",
-}
-
-# Arches that expose the V2/V3 fast-path reduce kernels.
-SPLITK_REDUCE_FAST_ARCHES = {"gfx942"}
-
-# split_k values explicitly instantiated for V2 fast-path (covers tuner range 2..10).
-V2_SUPPORTED_SPLITKS = (2, 3, 4, 5, 6, 7, 8, 10)
-
-# V3 reduce: (N_VEC, ROWS_PER_BLOCK), BLOCK = N_VEC * ROWS_PER_BLOCK.
-V3_NVEC_ROWS = (
-    (8, 8),  # N=64,  8 rows/wg
-    (16, 4),  # N=128, 4 rows/wg
-    (32, 2),  # N=256, 2 rows/wg
-    (48, 4),  # N=384, 4 rows/wg, 3 full waves/wg
-    (64, 1),  # N=512, 1 row/wg
-)
-# V4 (8, 32) DEAD 2026-05-30: BLOCK=256 4-wave, 0 wall-time benefit (vmcnt contention).
-
 KERNEL_FUNC_MAP = {
     **get_arch_map("gfx950", "kernel_func"),
     **get_arch_map("gfx942", "kernel_func"),
+}
+
+SPLITK_REDUCE_EXTRA_MAP = {
+    "gfx950": get_arch_map("gfx950", "splitk_reduce_extra"),
+    "gfx942": get_arch_map("gfx942", "splitk_reduce_extra"),
 }
 
 
@@ -111,7 +93,6 @@ NOSCALE_TAGS = A16W16_TUNE_TAGS | {"a8w8"}
 # Splitk tags forced to <fp32_t> in lookup (main kernel writes fp32 workspace).
 SPLITK_TAGS = {
     "a16w16_flatmm_splitk",
-    "a16w16_fused_reduce",
     *_SPLITK,
 }
 
@@ -245,8 +226,9 @@ class opus_gemm_codegen:
 
     def gen_instance(self, k: OpusGemmInstance):
         from codegen.gen_instances_gfx942 import (
-            _validate_a16w16_gfx942,
             _validate_a16w16_em3en4_gfx942,
+            _validate_a16w16_gfx942,
+            _validate_a16w16_wave_k_coop_gfx942,
         )
         from codegen.gen_instances_gfx950 import (
             _validate_a16w16,
@@ -255,9 +237,6 @@ class opus_gemm_codegen:
             _validate_a16w16_mono_tile,
             _validate_a16w16_persistent,
         )
-        gfx942_validators = {
-            "a16w16_em3en4_lds1_pgr2_sk": _validate_a16w16_em3en4_gfx942,
-        }
 
         # gfx950 split-barrier (only "a16w16" tag uses this validator).
         if k.kernel_tag == "a16w16":
@@ -270,8 +249,12 @@ class opus_gemm_codegen:
             )
         # gfx942 a16w16 family; specialized tags override only the validator.
         elif k.kernel_tag in _GFX942_A16W16_TAGS:
-            validator = gfx942_validators.get(k.kernel_tag, _validate_a16w16_gfx942)
-            info = validator(k)
+            if k.kernel_tag == "a16w16_em3en4_lds1_pgr2_sk":
+                info = _validate_a16w16_em3en4_gfx942(k)
+            elif k.kernel_tag == "a16w16_wave_k_coop":
+                info = _validate_a16w16_wave_k_coop_gfx942(k)
+            else:
+                info = _validate_a16w16_gfx942(k)
             print(
                 f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
                 f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
@@ -345,12 +328,6 @@ class opus_gemm_codegen:
             A8W8_SCALE_HOST_EXTRA=A8W8_SCALE_HOST_EXTRA,
             A16W16_TUNE_TAGS=A16W16_TUNE_TAGS,
             BIAS_HOST_VALIDATE=self.BIAS_HOST_VALIDATE,
-            SPLITK_REDUCE_FAST_ARCHES=SPLITK_REDUCE_FAST_ARCHES,
-            V3_NVEC_ROWS=V3_NVEC_ROWS,
-            V2_SUPPORTED_SPLITKS=V2_SUPPORTED_SPLITKS,
-            # fused flag -- only consumed by gfx942 splitk emit. Forced True
-            # for fused_reduce, False otherwise.
-            fused=(k.kernel_tag == "a16w16_fused_reduce"),
         )
         dispatch_emit(self, k, **emit_kwargs)
 
@@ -643,34 +620,25 @@ void
             if arch == "gfx950":
                 _fwd_ws_decl = '#include "gfx950/opus_gemm_traits_a16w16_gfx950.cuh"\n'
                 _fwd_ws_arg = "const opus_splitk_ws_handle* ws_handle"
+                _reduce_kernel = "splitk_reduce_kernel"
             else:
                 _fwd_ws_decl = ""
                 _fwd_ws_arg = "const float* workspace"
+                _reduce_kernel = "splitk_reduce_kernel_fallback"
+            extra_reduce = SPLITK_REDUCE_EXTRA_MAP.get(arch, {})
+            extra_forward_decls = extra_reduce.get("forward_decls", lambda: "")()
             forward_decls = (
                 "// Forward declaration only. Specialisations live in per-arch device TUs.\n"
                 f"{_fwd_ws_decl}"
                 "template<int VEC_, int BLOCK_, typename D_OUT,\n"
                 "         bool HAS_BIAS_, typename D_BIAS_,\n"
                 "         bool HAS_OOB_>\n"
-                "__global__ void splitk_reduce_kernel(\n"
+                f"__global__ void {_reduce_kernel}(\n"
                 f"    {_fwd_ws_arg}, D_OUT* c_out,\n"
                 "    int split_k, int M, int N, int batch,\n"
                 "    int padded_M, int padded_N,\n"
                 "    const D_BIAS_* bias, int stride_bias_batch);\n"
-                "template<int SPLIT_K, int VEC_, int BLOCK_, typename D_OUT,\n"
-                "         bool HAS_BIAS_, typename D_BIAS_>\n"
-                "__global__ void splitk_reduce_kernel_v2(\n"
-                "    const float* workspace, D_OUT* c_out,\n"
-                "    int M, int N, int batch,\n"
-                "    int padded_M, int padded_N,\n"
-                "    const D_BIAS_* bias, int stride_bias_batch);\n"
-                "template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_,\n"
-                "         typename D_OUT, bool HAS_BIAS_, typename D_BIAS_>\n"
-                "__global__ void splitk_reduce_kernel_v3(\n"
-                "    const float* workspace, D_OUT* c_out,\n"
-                "    int M, int N, int batch,\n"
-                "    int padded_M, int padded_N,\n"
-                "    const D_BIAS_* bias, int stride_bias_batch);\n"
+                f"{extra_forward_decls}"
             )
             contents = (
                 "// SPDX-License-Identifier: MIT\n"
@@ -751,18 +719,15 @@ void
             single TU's GPU code, not against per-splitk-TU copies).
 
         The reduce kernel template lives in splitk_reduce_{arch}.cuh,
-        with one header per arch. Both headers define the same
-        `splitk_reduce_kernel` template (arch-guarded internally), so the
-        TU only ever includes one. We pick a kid-driven arch when at
-        least one kid of that arch has an indep-reduce splitk kid in the
-        build; otherwise we fall back to gfx950 (legacy default).
+        with one header per arch. gfx950 keeps the legacy
+        `splitk_reduce_kernel` name; gfx942 names its baseline path
+        `splitk_reduce_kernel_fallback` because exact-N row-block reduce
+        is the preferred fast path when its constraints hold.
         """
         # Bucket present archs from splitk kids.
         present_archs = set()
         for row in self._device_instantiations:
             name = row["kid_name"]
-            if "splitk_fused" in name or "splitk_atomic" in name:
-                continue
             for arch_prefix in ("gfx942", "gfx950"):
                 if f"opus_gemm_{arch_prefix}_splitk_" in name:
                     present_archs.add(arch_prefix)
@@ -780,6 +745,11 @@ void
                 if reduce_arch == "gfx950"
                 else "const float*"
             )
+            reduce_kernel = (
+                "splitk_reduce_kernel"
+                if reduce_arch == "gfx950"
+                else "splitk_reduce_kernel_fallback"
+            )
             contents = (
                 "// SPDX-License-Identifier: MIT\n"
                 "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
@@ -787,54 +757,37 @@ void
                 f"// Auto-generated per-arch reduce TU ({reduce_arch}). See gen_instances.py:_emit_splitk_reduce_tu.\n"
                 f'#include "{reduce_header}"\n'
                 "// HAS_OOB=true variants\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16, true>(\n"
+                f"template __global__ void {reduce_kernel}<16, 64, __bf16, true,  __bf16, true>(\n"
                 f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
                 f"    const __bf16*, int);\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16, true>(\n"
+                f"template __global__ void {reduce_kernel}<16, 64, __bf16, false, __bf16, true>(\n"
                 f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
                 f"    const __bf16*, int);\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float,  true>(\n"
+                f"template __global__ void {reduce_kernel}<16, 64, float,  true,  float,  true>(\n"
                 f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
                 f"    const float*,  int);\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, float,  false, float,  true>(\n"
-                f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-                f"    const float*,  int);\n"
-                "// HAS_OOB=false variants\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16, false>(\n"
-                f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-                f"    const __bf16*, int);\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16, false>(\n"
-                f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-                f"    const __bf16*, int);\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float,  false>(\n"
-                f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-                f"    const float*,  int);\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, float,  false, float,  false>(\n"
+                f"template __global__ void {reduce_kernel}<16, 64, float,  false, float,  true>(\n"
                 f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
                 f"    const float*,  int);\n"
             )
-            if reduce_arch in SPLITK_REDUCE_FAST_ARCHES:
-                contents += "// V2 (split_k static-unroll, no OOB) instantiations -- gfx942 only\n"
-                for sk in V2_SUPPORTED_SPLITKS:
-                    contents += (
-                        f"template __global__ void splitk_reduce_kernel_v2<{sk}, 8, 8, __bf16, true,  __bf16>(\n"
-                        "    const float*, __bf16*, int, int, int, int, int,\n"
-                        "    const __bf16*, int);\n"
-                        f"template __global__ void splitk_reduce_kernel_v2<{sk}, 8, 8, __bf16, false, __bf16>(\n"
-                        "    const float*, __bf16*, int, int, int, int, int,\n"
-                        "    const __bf16*, int);\n"
-                    )
-                contents += "// V3 (multi-row per wg, BLOCK=N_VEC*ROWS) instantiations\n"
-                for nvec, rows in V3_NVEC_ROWS:
-                    for sk in V2_SUPPORTED_SPLITKS:
-                        contents += (
-                            f"template __global__ void splitk_reduce_kernel_v3<{sk}, {nvec}, {rows}, 8, __bf16, true,  __bf16>(\n"
-                            "    const float*, __bf16*, int, int, int, int, int,\n"
-                            "    const __bf16*, int);\n"
-                            f"template __global__ void splitk_reduce_kernel_v3<{sk}, {nvec}, {rows}, 8, __bf16, false, __bf16>(\n"
-                            "    const float*, __bf16*, int, int, int, int, int,\n"
-                            "    const __bf16*, int);\n"
-                        )
+            if reduce_arch == "gfx950":
+                contents += (
+                    "// HAS_OOB=false variants\n"
+                    f"template __global__ void {reduce_kernel}<16, 64, __bf16, true,  __bf16, false>(\n"
+                    f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
+                    f"    const __bf16*, int);\n"
+                    f"template __global__ void {reduce_kernel}<16, 64, __bf16, false, __bf16, false>(\n"
+                    f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
+                    f"    const __bf16*, int);\n"
+                    f"template __global__ void {reduce_kernel}<16, 64, float,  true,  float,  false>(\n"
+                    f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
+                    f"    const float*,  int);\n"
+                    f"template __global__ void {reduce_kernel}<16, 64, float,  false, float,  false>(\n"
+                    f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
+                    f"    const float*,  int);\n"
+                )
+            extra_reduce = SPLITK_REDUCE_EXTRA_MAP.get(reduce_arch, {})
+            contents += extra_reduce.get("device_instantiations", lambda: "")()
             Path(
                 os.path.join(
                     self.instances_path, f"splitk_reduce_{reduce_arch}.device.cu"
@@ -864,11 +817,7 @@ void
         # host TU will never reference any...
         needs_reduce_tu = any(
             ("flatmm_splitk" in row["kid_name"])
-            or (
-                "_splitk_" in row["kid_name"]
-                and "splitk_fused" not in row["kid_name"]
-                and "splitk_atomic" not in row["kid_name"]
-            )
+            or ("_splitk_" in row["kid_name"])
             for row in self._device_instantiations
         )
         if needs_reduce_tu:

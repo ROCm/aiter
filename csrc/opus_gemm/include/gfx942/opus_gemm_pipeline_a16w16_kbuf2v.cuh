@@ -223,6 +223,7 @@ void gemm_a16w16_kbuf2v_kernel(Kargs kargs) {
         v_b[1][ST] = load<T::VEC_B>(s_b[2 + ST], u_rb);
     };
 
+    #pragma unroll 4
     for (; tile < outer_end; tile += 2) {
         sub_iter(opus::number<0>{}, tile);
         sub_iter(opus::number<1>{}, tile);
