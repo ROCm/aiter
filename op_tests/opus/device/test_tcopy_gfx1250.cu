@@ -12,37 +12,18 @@
  *   - LDS is double-buffered (2-deep ping-pong); s_wait_tensorcnt(1) keeps the
  *     prefetch in flight while the current tile is consumed.
  *
- * Named barriers (was named_barrier.hpp in the demon_gcn source) are inlined.
+ * Named barriers / waveid / sync helpers come from opus/opus.hpp.
  */
 
 #ifdef __HIP_DEVICE_COMPILE__
 // ── Device pass ─────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
+#include "opus/hip_minimal.hpp"
 
 #if defined(__gfx1250__)
 
-// Inlined named-barrier helpers (formerly demon_gcn/wmma_opus_rdna4/named_barrier.hpp).
-// Variables must be __shared__ inside the kernel so the compiler tracks
-// NAMED_BAR_CNT correctly.
-#define DECLARE_NAMED_BARRIERS()                                                   \
-    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_1;                        \
-    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_2;                        \
-    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_3;
-
-__device__ __forceinline__ void s_barrier_init_ptr(__amdgpu_named_workgroup_barrier_t* bar, uint32_t member_cnt) { __builtin_amdgcn_s_barrier_init(bar, member_cnt); }
-__device__ __forceinline__ void s_barrier_join_ptr(__amdgpu_named_workgroup_barrier_t* bar)                      { __builtin_amdgcn_s_barrier_join(bar); }
-
-// Inlined Fp16x16Packer (subset of reg_access_uitls.h).
-union Fp16x16Packer {
-    opus::fp16x16_t vec16;
-    opus::fp16x8_t  vec8[2];
-};
-
-__device__ __forceinline__ int waveid_in_workgroup() {
-    int wave_id;
-    asm volatile("s_bfe_u32 %0, ttmp8, 0x50019" : "=s"(wave_id));
-    return wave_id;
-}
+// Fp16x16Packer: f16x16 <-> f16x8[2] view, for wmma_f16_16x16x32_f16 src/dst packing.
+union Fp16x16Packer { opus::fp16x16_t vec16; opus::fp16x8_t vec8[2]; };
 
 __global__ __launch_bounds__(256, 2) __cluster_dims__(2, 1, 1)
 void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
@@ -61,7 +42,7 @@ void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
     constexpr int32_t consumerSubWarpNum   = 4;
     DECLARE_NAMED_BARRIERS();
 
-    const int      wave_id                = waveid_in_workgroup();
+    const int      wave_id                = static_cast<int>(waveid_in_workgroup());
     const int      sub_consumer_wave_id   = wave_id % 4;
     const uint32_t cluster_workgroup_id_x = __builtin_amdgcn_cluster_workgroup_id_x();
     const int32_t  c_cluster_offset_elems = static_cast<int32_t>(cluster_workgroup_id_x) * Block_N;
@@ -92,8 +73,7 @@ void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
     if (wave_id < 4) {
         if (wave_id < 2) {
             // Producer A (cluster multicast)
-            __builtin_amdgcn_s_barrier_signal(-1);
-            __builtin_amdgcn_s_barrier_wait(-1);
+            sync_workgroup();
 
             WinA win_a;
             const uintptr_t wave_lds_off = static_cast<uintptr_t>(wave_id) * 16 * (Block_K + 8) * sizeof(fp16_t);
@@ -125,8 +105,7 @@ void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
             }
         } else {
             // Producer B (per-WG, no multicast)
-            __builtin_amdgcn_s_barrier_signal(-1);
-            __builtin_amdgcn_s_barrier_wait(-1);
+            sync_workgroup();
 
             WinB win_b;
             const uintptr_t wave_lds_off = static_cast<uintptr_t>(wave_id - 2) * 16 * (Block_K + 8) * sizeof(fp16_t);
@@ -164,8 +143,7 @@ void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
     else {
         s_barrier_init_ptr(&__nbar_1, 4);
         s_barrier_init_ptr(&__nbar_2, 4);
-        __builtin_amdgcn_s_barrier_signal(-1);
-        __builtin_amdgcn_s_barrier_wait(-1);
+        sync_workgroup();
 
         constexpr int32_t AKSldPack    = 16 / static_cast<int32_t>(sizeof(fp16_t));
         constexpr int32_t AKSldLane    = 16 / AKSldPack;
@@ -192,7 +170,7 @@ void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
 
         const int32_t sub_consumer_wave_m = sub_consumer_wave_id / 2;
         const int32_t sub_consumer_wave_n = sub_consumer_wave_id % 2;
-        const int32_t lid                 = static_cast<int32_t>(opus::lane_id());
+        const int32_t lid                 = static_cast<int32_t>(lane_id());
         const int32_t a_lane_m            = lid / AMSldLane;
         const int32_t a_lane_n            = lid % AMSldLane;
         const int32_t b_lane_m            = lid / BSldNLane;

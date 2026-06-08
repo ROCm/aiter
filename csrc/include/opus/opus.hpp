@@ -12,6 +12,7 @@
 // clang-format off
 #include <type_traits>
 #include <utility>
+#include <cstdint>
 
 #ifndef OPUS_ENABLE_RUNTIME_QUERY
 #define OPUS_ENABLE_RUNTIME_QUERY 0
@@ -1562,7 +1563,7 @@ OPUS_D index_t cluster_id_y() {return __builtin_amdgcn_cluster_id_y();}
 OPUS_D index_t cluster_id_z() {return __builtin_amdgcn_cluster_id_z();}
 #endif
 // grid x-z switch to cluster_id when cluster enable in gfx1250
-OPUS_D index_t grid_size_x()  { return __builtin_amdgcn_grid_size_x(); } 
+OPUS_D index_t grid_size_x()  { return __builtin_amdgcn_grid_size_x(); }
 OPUS_D index_t grid_size_y()  { return __builtin_amdgcn_grid_size_y(); }
 OPUS_D index_t grid_size_z()  { return __builtin_amdgcn_grid_size_z(); }
 OPUS_D void    sync_threads() { __builtin_amdgcn_s_barrier(); }
@@ -1627,10 +1628,7 @@ OPUS_D unsigned int lane_id() {
 
 //gfx1250 only feature
 #if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
-OPUS_D unsigned int waveid_in_workgroup()
-{
-    unsigned int wave_id; asm volatile("s_bfe_u32 %0, ttmp8, 0x50019" : "=s"(wave_id)); return wave_id;
-}
+OPUS_D unsigned int waveid_in_workgroup() { unsigned int wave_id; asm volatile("s_bfe_u32 %0, ttmp8, 0x50019" : "=s"(wave_id)); return wave_id; }
 
 //Named Barrier define
 #define DECLARE_NAMED_BARRIERS() \
@@ -1650,15 +1648,10 @@ OPUS_D unsigned int waveid_in_workgroup()
     __shared__ __amdgpu_named_workgroup_barrier_t __nbar_14; \
     __shared__ __amdgpu_named_workgroup_barrier_t __nbar_15; 
 
-OPUS_D void s_barrier_init_ptr(
-    __amdgpu_named_workgroup_barrier_t *bar, uint32_t member_cnt) {
-    __builtin_amdgcn_s_barrier_init(bar, member_cnt);
-}
-
-OPUS_D void s_barrier_join_ptr(
-    __amdgpu_named_workgroup_barrier_t *bar) {
-    __builtin_amdgcn_s_barrier_join(bar);
-}
+OPUS_D void s_barrier_init_ptr(__amdgpu_named_workgroup_barrier_t* bar, uint32_t member_cnt) { __builtin_amdgcn_s_barrier_init(bar, member_cnt); }
+OPUS_D void s_barrier_join_ptr(__amdgpu_named_workgroup_barrier_t* bar)                      { __builtin_amdgcn_s_barrier_join(bar); }
+OPUS_D void sync_cluster()   { __builtin_amdgcn_s_barrier_signal(-3); __builtin_amdgcn_s_barrier_wait(-3); }
+OPUS_D void sync_workgroup() { __builtin_amdgcn_s_barrier_signal(-1); __builtin_amdgcn_s_barrier_wait(-1); }
 #endif
 
 // cross-lane shuffle via ds_bpermute (no hip_runtime.h dependency)
@@ -2176,7 +2169,7 @@ template<bool En> struct tcopy_dim_state {};
 template<>        struct tcopy_dim_state<true> { uint32_t extent=0; uint64_t stride=0; uint32_t origin=0; };
 
 // saturating_sub via pure SALU (s_sub_co_u32 + s_cselect_b32); avoids v_sub_nc_u32 clamp which
-OPUS_H_D inline uint32_t tcopy_saturating_sub(uint32_t e, uint32_t o) {
+OPUS_H_D uint32_t tcopy_saturating_sub(uint32_t e, uint32_t o) {
 #if defined(__HIP_DEVICE_COMPILE__) || defined(__AMDGCN__)
     uint32_t es = __builtin_amdgcn_readfirstlane(e), os = __builtin_amdgcn_readfirstlane(o), r;
     asm("s_sub_co_u32 %0, %1, %2\n\ts_cselect_b32 %0, 0, %0" : "=s"(r) : "s"(es), "s"(os) : "scc"); return r;
@@ -2288,9 +2281,7 @@ struct tcopy_window {
         extent0=o0+td0; extent1=o1+td1; materialize_desc_initial();
     }
 
-    // Toolchain skew: older llvm signature is 5-operand (committed default); some newer / patched
-    // llvm builds require an extra all-zero int32x8_t before cpol. Define
-    // OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA=1 at compile time to pass it.
+    // -DOPUS_TCOPY_BUILTIN_HAS_SG_EXTRA=1 → 6-operand tensor_load_to_lds (newer/patched llvm); default = 5-operand (CI llvm).
 #ifndef OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA
 #define OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA 0
 #endif
