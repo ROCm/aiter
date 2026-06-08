@@ -537,8 +537,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_a1 = torch.empty(
             (E, max_m, model_dim // 2), dtype=torch.uint8, device=device
         )
-        a1_scale_raw = torch.empty(
-            (E, max_m, model_dim // 32), dtype=torch.uint8, device=device
+        # Only the naive path needs the row-major scale buffer; the fast path
+        # gathers + preshuffles the scale in one fused kernel (no a1_scale_raw).
+        a1_scale_raw = (
+            torch.empty((E, max_m, model_dim // 32), dtype=torch.uint8, device=device)
+            if _use_naive
+            else None
         )
     else:
         # a8w4 stage1 input: per-block-32 MXFP8 quantization.
@@ -569,26 +573,42 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_a1 = torch.empty(
             (E, max_m, model_dim), dtype=torch.uint8, device=device
         )
-        # Padding rows decode with scale=1.0.
-        a1_scale_raw = torch.empty(
-            (E, max_m, model_dim // 32), dtype=torch.uint8, device=device
+        # Padding rows decode with scale=1.0. Only the naive path needs the
+        # row-major scale buffer; the fast path fuses gather + preshuffle.
+        a1_scale_raw = (
+            torch.empty((E, max_m, model_dim // 32), dtype=torch.uint8, device=device)
+            if _use_naive
+            else None
         )
 
     # Route-gather into the grouped per-expert layout.
     if not _use_naive:
-        from aiter.ops.flydsl.moe_kernels import flydsl_moe_scatter_copy_token
+        from aiter.ops.flydsl.moe_kernels import (
+            flydsl_moe_scatter_copy_token,
+            flydsl_moe_scatter_preshuffle_scale,
+        )
 
         _grouped_dbg("start route gather (scatter-copy kernel)")
+        # Payload route-gather only; the e8m0 scale is route-gathered AND
+        # preshuffled into the WMMA layout in one fused pass below (no
+        # intermediate row-major a1_scale_raw + separate permute).
         flydsl_moe_scatter_copy_token(
             a1_payload,
-            a1_scale_token_u8,
+            None,
             rows_to_tokens,
             E,
             max_m,
             grouped_a1=grouped_a1,
-            a1_scale_raw=a1_scale_raw,
         )
-        _grouped_dbg("route gather done")
+        grouped_a1_scale = flydsl_moe_scatter_preshuffle_scale(
+            a1_scale_token_u8,
+            rows_to_tokens,
+            E,
+            max_m,
+            wmma_rep=warp_tile_m // 16,
+            scale_k_per_tile=tile_k // 32,
+        )
+        _grouped_dbg("route gather + scale preshuffle done")
     else:
         _grouped_dbg("start route gather (naive)")
         # Naive torch route-gather.
@@ -602,6 +622,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
         route_weights.view(-1)[topids_to_rows.reshape(-1)] = topk_weight.reshape(-1).to(
             route_weights.dtype
+        )
+        grouped_a1_scale = _grouped_a8w4_preshuffle_e8m0_scale(
+            a1_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
         )
         _grouped_dbg("route gather done")
 
@@ -617,9 +640,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         E, model_dim // _wmma_rep, (inter_dim // 32) * _wmma_rep
     )
 
-    grouped_a1_scale = _grouped_a8w4_preshuffle_e8m0_scale(
-        a1_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
-    )
+    # grouped_a1_scale is produced above: fused gather+preshuffle (fast path) or
+    # scatter + _grouped_a8w4_preshuffle_e8m0_scale (naive path).
     _grouped_dbg("scale layout done")
 
     grouped_a2 = torch.empty((E, max_m, inter_dim), dtype=dtype, device=device)
@@ -737,9 +759,22 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         a2_scale_raw = torch.full(
             (E, max_m, inter_dim // 32), 127, dtype=torch.uint8, device=device
         )
-    grouped_a2_scale = _grouped_a8w4_preshuffle_e8m0_scale(
-        a2_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
-    )
+    if _use_naive:
+        grouped_a2_scale = _grouped_a8w4_preshuffle_e8m0_scale(
+            a2_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
+        )
+    else:
+        # a2_scale_raw is already grouped row-major (no route-gather), so use the
+        # in-kernel preshuffle (gather-less fused version, like stage1).
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_preshuffle_scale
+
+        grouped_a2_scale = flydsl_moe_preshuffle_scale(
+            a2_scale_raw,
+            E,
+            max_m,
+            wmma_rep=warp_tile_m // 16,
+            scale_k_per_tile=tile_k // 32,
+        )
     _grouped_dbg("a2 scale layout done")
     grouped_out = torch.empty((E, max_m, model_dim), dtype=dtype, device=device)
     stage2_compiler = (
