@@ -3641,6 +3641,15 @@ namespace aiter {
         int q_scale_stride_0, q_scale_stride_1;
         int num_tokens;
         int num_heads;  // V4 MQA: num_kv_heads is hardcoded to 1 (blockIdx.y==0 is the K wave)
+        // --- K-only paged-cache write (fused_kv_norm_rope_group_quant) ---
+        // When the K-only kernel writes into a paged cache via slot_mapping, the
+        // dest row is block*block_stride + off*row_stride, with block = slot/page_size,
+        // off = slot%page_size. Both the nope+scale cache and the rope cache are paged
+        // [num_blocks, page_size, entry] (MQA, no NK dim); row strides are their .stride(1).
+        // Unused by the QK kernel (token-contiguous).
+        int page_size;
+        int kcache_block_stride, kcache_row_stride;  // nope+scale paged cache
+        int krope_block_stride, krope_row_stride;     // rope paged cache
     };
 
     // ============================================================================
@@ -3673,7 +3682,12 @@ namespace aiter {
         const scalar_t* __restrict__ sin_ptr,    // pre-offset by positions[token_idx]
         float eps,
         const MlaKernelParams& __restrict__ params,
-        int32_t token_idx, int32_t tid)
+        int32_t token_idx, int32_t tid,
+        // Precomputed destination byte/elem offsets for the two output buffers.
+        // QK passes token_idx*stride (token-contiguous); the K-only kernel passes
+        // the paged slot offset (block*block_stride + off*row_stride) so the same
+        // body writes either layout without branching on paging here.
+        int64_t out_cache_offset, int64_t out_rope_offset)
     {
       // ---- Compile-time constants (collapsed by the compiler at every callsite) ----
       constexpr int32_t head_size = HEAD_DIM;
@@ -3726,7 +3740,7 @@ namespace aiter {
       // ---- Pointers / buffer descriptors (single KV head: per-head strides vanish) ----
       // int64 base offsets: token_idx * stride can exceed INT32_MAX for large prefill
       // chunks (e.g. T=65536 / H=128 -> ~4.3e9 elements); strides stay 32-bit.
-      const int64_t kv_cache_offset = static_cast<int64_t>(token_idx) * params.token_stride;
+      const int64_t kv_cache_offset = out_cache_offset;  // dest row (token-contig or paged slot)
       const int64_t token_kv_base   = static_cast<int64_t>(token_idx) * params.kv_stride_0;
 
       const scalar_t* kv_ptr = kv + token_kv_base;
@@ -3883,9 +3897,7 @@ namespace aiter {
       }
 
       // ---- Step 4 (pe threads only): RoPE on the normed bf16 -> separate k_pe_out ----
-      const int64_t token_kpe_out_base =
-          static_cast<int64_t>(token_idx) * params.k_pe_out_stride_0;
-      scalar_t* k_out_rope = k_pe_out + token_kpe_out_base;  // single KV head
+      scalar_t* k_out_rope = k_pe_out + out_rope_offset;  // dest row (token-contig or paged slot)
       if (is_pe_lane) {
         const int32_t pe_local_tid = tid - pe_tid_start;  // 0..(pe_dim/vec_size_i - 1)
         if constexpr (is_neox) {
@@ -4000,9 +4012,14 @@ namespace aiter {
       // ============ K Processing: RMS Norm over full head_dim, group quant nope, RoPE pe ============
       if (is_k_wave) {
         // Delegate to the shared K-wave body (also used by the K-only kernel).
+        // QK path is token-contiguous: dest row = token_idx * stride (no paging).
+        const int64_t out_cache_offset =
+            static_cast<int64_t>(token_idx) * params.token_stride;
+        const int64_t out_rope_offset =
+            static_cast<int64_t>(token_idx) * params.k_pe_out_stride_0;
         k_wave_norm_rope_group_quant_impl<scalar_t, cache_t, kv_dt, is_neox, HEAD_DIM>(
             kv, kv_cache, k_pe_out, k_weight, cos_ptr, sin_ptr, eps, params,
-            token_idx, static_cast<int32_t>(tid));
+            token_idx, static_cast<int32_t>(tid), out_cache_offset, out_rope_offset);
       } else { // Q processing — multi-head loop
       // ============ Q Processing: RMS norm + optional q_weight + RoPE + optional fp8 group quant ============
       // Layout: every thread `tid` owns elements [tid*vec_size_i .. tid*vec_size_i+vec_size_i).
@@ -4637,11 +4654,11 @@ namespace aiter {
                <<<grid, block, 0, stream>>>(                                                             \
                  reinterpret_cast<const KV_T*>(q.data_ptr()),                                            \
                  reinterpret_cast<const KV_T*>(kv.data_ptr()),                                           \
-                 reinterpret_cast<KV_T*>(k_pe_out.data_ptr()),                                           \
+                 reinterpret_cast<KV_T*>(k_rope_buff.data_ptr()),                                        \
                  reinterpret_cast<const KV_T*>(k_weight.data_ptr()),                                     \
                  reinterpret_cast<const KV_T*>(q_weight_ptr),                                            \
-                 reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                                        \
-                 reinterpret_cast<QUERY_T*>(q_out.data_ptr()),                                           \
+                 reinterpret_cast<CACHE_T*>(k_nope_scale_buff.data_ptr()),                               \
+                 reinterpret_cast<QUERY_T*>(q_nope_scale_buff.data_ptr()),                               \
                  reinterpret_cast<void*>(q_scale_ptr),                                                   \
                  reinterpret_cast<KV_T*>(q_rope_out_ptr),                                                \
                  reinterpret_cast<const int64_t*>(positions.data_ptr()),                                 \
@@ -4659,11 +4676,11 @@ namespace aiter {
                <<<grid, block, 0, stream>>>(                                                             \
                  reinterpret_cast<const KV_T*>(q.data_ptr()),                                            \
                  reinterpret_cast<const KV_T*>(kv.data_ptr()),                                           \
-                 reinterpret_cast<KV_T*>(k_pe_out.data_ptr()),                                           \
+                 reinterpret_cast<KV_T*>(k_rope_buff.data_ptr()),                                        \
                  reinterpret_cast<const KV_T*>(k_weight.data_ptr()),                                     \
                  reinterpret_cast<const KV_T*>(q_weight_ptr),                                            \
-                 reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                                        \
-                 reinterpret_cast<QUERY_T*>(q_out.data_ptr()),                                           \
+                 reinterpret_cast<CACHE_T*>(k_nope_scale_buff.data_ptr()),                               \
+                 reinterpret_cast<QUERY_T*>(q_nope_scale_buff.data_ptr()),                               \
                  reinterpret_cast<void*>(q_scale_ptr),                                                   \
                  reinterpret_cast<KV_T*>(q_rope_out_ptr),                                                \
                  reinterpret_cast<const int64_t*>(positions.data_ptr()),                                 \
@@ -4676,22 +4693,22 @@ namespace aiter {
 namespace aiter {
 
 void fused_qk_norm_rope_group_quant(
-    aiter_tensor_t& q,             // [num_tokens, num_heads, head_dim]
-    aiter_tensor_t& kv,            // [num_tokens, (k_num_heads,) head_dim]
-    aiter_tensor_t& k_pe_out,      // [num_tokens, (k_num_heads,) pe_dim] (RoPE'd output)
-    aiter_tensor_t& k_weight,      // [head_dim] RMSNorm weights
-    aiter_tensor_t& kv_cache,      // [num_tokens, (num_kv_heads,) entry_bytes] token-contiguous
-    aiter_tensor_t& q_out,         // [num_tokens, num_heads, head_dim] bf16 OR fp8 output
-    aiter_tensor_t& positions,     // [num_tokens]
-    aiter_tensor_t& cos_cache,     // [max_position, rot_dim//2]
-    aiter_tensor_t& sin_cache,     // [max_position, rot_dim//2]
-    double eps,                    // epsilon for RMS norm
+    aiter_tensor_t& q,                  // [num_tokens, num_heads, head_dim]
+    aiter_tensor_t& kv,                 // [num_tokens, (k_num_heads,) head_dim]
+    aiter_tensor_t& k_rope_buff,        // [num_tokens, (k_num_heads,) pe_dim] bf16 (RoPE'd K-PE)
+    aiter_tensor_t& k_weight,           // [head_dim] RMSNorm weights
+    aiter_tensor_t& k_nope_scale_buff,  // [num_tokens, (num_kv_heads,) entry_bytes] K nope+scale
+    aiter_tensor_t& q_nope_scale_buff,  // [num_tokens, num_heads, head_dim] bf16 (full Q) OR fp8 (nope+scale)
+    aiter_tensor_t& positions,          // [num_tokens]
+    aiter_tensor_t& cos_cache,          // [max_position, rot_dim//2]
+    aiter_tensor_t& sin_cache,          // [max_position, rot_dim//2]
+    double eps,                         // epsilon for RMS norm
     bool is_neox,
     std::optional<aiter_tensor_t> q_weight,
     std::optional<aiter_tensor_t> q_scale,
     int64_t quant_group_size,
     const std::string& scale_dtype,
-    std::optional<aiter_tensor_t> q_rope_out)
+    std::optional<aiter_tensor_t> q_rope_buff)
 {
   int num_tokens = q.size(0);
   int head_dim   = kv.size(-1);
@@ -4700,7 +4717,7 @@ void fused_qk_norm_rope_group_quant(
 
   AITER_CHECK(q.dim() == 3, "q must be 3D [num_tokens, num_heads, head_dim]");
   AITER_CHECK(q.size(-1) == head_dim, "q head_dim must equal kv head_dim");
-  AITER_CHECK(q_out.size(2) == head_dim, "q_out last dim must match head_dim");
+  AITER_CHECK(q_nope_scale_buff.size(2) == head_dim, "q_nope_scale_buff last dim must match head_dim");
   AITER_CHECK(k_weight.size(0) == head_dim, "k_weight size must match head_dim");
   AITER_CHECK(kv.stride(-1) == 1, "kv stride(-1) must be equal to 1");
 
@@ -4714,20 +4731,20 @@ void fused_qk_norm_rope_group_quant(
   }
   // q_out_type: "auto" = bf16/same-as-input, "fp8" = group-quantised fp8
   std::string q_out_type = "auto";
-  if (q_out.dtype() == AITER_DTYPE_fp8) {
+  if (q_nope_scale_buff.dtype() == AITER_DTYPE_fp8) {
     q_out_type = "fp8";
   }
   const bool q_is_fp8 = (q_out_type == "fp8");
-  // fp8 Q mirrors K: q_out is the q_nope_scale_buff (nope fp8 + inline dup e8m0 scale),
-  // and the rotated Q-PE goes to the separate q_rope_out (bf16). The e8m0 scale is
-  // written inline, so a separate q_scale tensor is no longer required.
+  // fp8 Q mirrors K: q_nope_scale_buff holds nope fp8 + inline dup e8m0 scale, and the
+  // rotated Q-PE goes to the separate q_rope_buff (bf16). The e8m0 scale is written
+  // inline, so a separate q_scale tensor is no longer required.
   if (q_is_fp8) {
     AITER_CHECK(quant_group_size == 32 || quant_group_size == 64 || quant_group_size == 128,
                 "quant_group_size must be one of {32, 64, 128}, got ", quant_group_size);
     AITER_CHECK(head_dim % quant_group_size == 0,
                 "head_dim must be divisible by quant_group_size");
-    AITER_CHECK(q_rope_out.has_value(),
-                "q_rope_out (rotated Q-PE bf16 buffer) is required when q_out is fp8");
+    AITER_CHECK(q_rope_buff.has_value(),
+                "q_rope_buff (rotated Q-PE bf16 buffer) is required when Q is fp8");
   }
 
   // DeepSeek V4 is MQA: exactly one KV head. The dense kernel hardcodes this
@@ -4739,28 +4756,28 @@ void fused_qk_norm_rope_group_quant(
 
   int q_stride_0          = q.stride(0);
   int q_stride_1          = q.stride(1);
-  int q_out_stride_0      = q_out.stride(0);
-  int q_out_stride_1      = q_out.stride(1);
-  // fp8-Q rope_buff (separate rotated Q-PE, bf16). 0 when absent (bf16 Q).
-  const bool has_q_rope   = q_rope_out.has_value();
-  int q_rope_out_stride_0 = has_q_rope ? static_cast<int>(q_rope_out->stride(0)) : 0;
-  int q_rope_out_stride_1 = (has_q_rope && q_rope_out->dim() == 3)
-                            ? static_cast<int>(q_rope_out->stride(1)) : 0;
-  // Dense kv_cache: [num_tokens, (num_kv_heads,) entry]. token_stride = per-token stride;
-  // kv_cache_stride_h = per-kv-head stride (0 when num_kv_heads collapsed / 2D).
-  int token_stride        = kv_cache.stride(0);
+  int q_out_stride_0      = q_nope_scale_buff.stride(0);
+  int q_out_stride_1      = q_nope_scale_buff.stride(1);
+  // fp8-Q rope buff (separate rotated Q-PE, bf16). 0 when absent (bf16 Q).
+  const bool has_q_rope   = q_rope_buff.has_value();
+  int q_rope_out_stride_0 = has_q_rope ? static_cast<int>(q_rope_buff->stride(0)) : 0;
+  int q_rope_out_stride_1 = (has_q_rope && q_rope_buff->dim() == 3)
+                            ? static_cast<int>(q_rope_buff->stride(1)) : 0;
+  // Dense k_nope_scale_buff: [num_tokens, (num_kv_heads,) entry]. token_stride = per-token
+  // stride; kv_cache_stride_h = per-kv-head stride (0 when num_kv_heads collapsed / 2D).
+  int token_stride        = k_nope_scale_buff.stride(0);
   int kv_stride_0         = kv.stride(0);
   int kv_stride_1         = (kv.dim() == 3) ? kv.stride(1) : 0;
-  int k_pe_out_stride_0   = k_pe_out.stride(0);
-  int k_pe_out_stride_1   = (k_pe_out.dim() == 3) ? k_pe_out.stride(1) : 0;
-  int kv_cache_stride_h   = (kv_cache.dim() >= 3) ? kv_cache.stride(1) : 0;
+  int k_pe_out_stride_0   = k_rope_buff.stride(0);
+  int k_pe_out_stride_1   = (k_rope_buff.dim() == 3) ? k_rope_buff.stride(1) : 0;
+  int kv_cache_stride_h   = (k_nope_scale_buff.dim() >= 3) ? k_nope_scale_buff.stride(1) : 0;
 
   HipDeviceGuard device_guard(kv.device_id);
   const hipStream_t stream = aiter::getCurrentHIPStream();
 
-  // Determine KV cache dtype from the kv_cache tensor itself.
+  // Determine KV cache dtype from the k_nope_scale_buff tensor itself.
   std::string kv_cache_dtype = "auto";
-  const AiterDtype cache_dt = kv_cache.dtype();
+  const AiterDtype cache_dt = k_nope_scale_buff.dtype();
   if (cache_dt == AITER_DTYPE_fp32 ||
       cache_dt == AITER_DTYPE_fp16 ||
       cache_dt == AITER_DTYPE_bf16) {
@@ -4803,7 +4820,7 @@ void fused_qk_norm_rope_group_quant(
   // --- Pointer locals used by CALL macro ---
   void* q_weight_ptr   = has_q_weight ? q_weight->data_ptr()   : nullptr;
   void* q_scale_ptr    = (q_is_fp8 && q_scale.has_value()) ? q_scale->data_ptr() : nullptr;
-  void* q_rope_out_ptr = has_q_rope   ? q_rope_out->data_ptr() : nullptr;
+  void* q_rope_out_ptr = has_q_rope   ? q_rope_buff->data_ptr() : nullptr;
 
   int num_CUs;
   hipDeviceGetAttribute(&num_CUs, hipDeviceAttributeMultiprocessorCount, kv.device_id);
@@ -4967,13 +4984,14 @@ template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt,
           bool is_neox, int HEAD_DIM = 512, int PE_DIM = 64,
           int GROUP_SIZE = 64, int TOKENS_PER_BLOCK = 1>
 __device__ void fuse_kv_norm_rope_group_quant_cache_kernel_impl(
-    const scalar_t* __restrict__ kv,         // [num_tokens, (NK=1,) head_dim]
-    scalar_t*       __restrict__ k_pe_out,   // [num_tokens, (NK=1,) pe_dim] bf16
-    const scalar_t* __restrict__ k_weight,   // [head_dim]
-    cache_t*        __restrict__ kv_cache,   // [num_tokens, (NK=1,) head_dim] fp8
-    const int64_t*  __restrict__ positions,  // [num_tokens]
-    const scalar_t* __restrict__ cos_cache,  // [max_position, pe_dim/2]
-    const scalar_t* __restrict__ sin_cache,  // [max_position, pe_dim/2]
+    const scalar_t* __restrict__ kv,           // [num_tokens, (NK=1,) head_dim]
+    scalar_t*       __restrict__ k_rope_buff,  // paged rope cache [num_blocks, page_size, pe_dim] bf16 (MQA)
+    const scalar_t* __restrict__ k_weight,     // [head_dim]
+    cache_t*        __restrict__ k_nope_scale_buff,  // paged nope+scale cache [num_blocks, page_size, head_dim] fp8 (MQA)
+    const int64_t*  __restrict__ positions,    // [num_tokens]
+    const int64_t*  __restrict__ slot_mapping, // [num_tokens] flat slot = block*page_size + offset
+    const scalar_t* __restrict__ cos_cache,    // [max_position, pe_dim/2]
+    const scalar_t* __restrict__ sin_cache,    // [max_position, pe_dim/2]
     float eps,
     const MlaKernelParams& __restrict__ params)
 {
@@ -4983,6 +5001,18 @@ __device__ void fuse_kv_norm_rope_group_quant_cache_kernel_impl(
   const int32_t  token_idx =
       static_cast<int32_t>(blockIdx.x) * TOKENS_PER_BLOCK + wave_id;
   if (token_idx >= params.num_tokens) return;
+
+  // Paged destination: slot_mapping[token] is the flat slot into the paged
+  // cache; split into (block, offset) so a padded block stride (kcache_block_stride
+  // != page_size*row_stride) is honored. A negative slot marks a skipped token.
+  const int64_t slot = slot_mapping[token_idx];
+  if (slot < 0) return;
+  const int64_t block  = slot / params.page_size;
+  const int64_t offset = slot % params.page_size;
+  const int64_t out_cache_offset =
+      block * params.kcache_block_stride + offset * params.kcache_row_stride;
+  const int64_t out_rope_offset =
+      block * params.krope_block_stride + offset * params.krope_row_stride;
 
   // RoPE cos/sin pointers (per-token, shared by the wave). Tables are laid out
   // [max_pos, PE_DIM/2] (GPT-J reuse-front-part style), so each token-row is
@@ -4994,8 +5024,8 @@ __device__ void fuse_kv_norm_rope_group_quant_cache_kernel_impl(
 
   k_wave_norm_rope_group_quant_impl<scalar_t, cache_t, kv_dt, is_neox,
                                     HEAD_DIM, PE_DIM, GROUP_SIZE>(
-      kv, kv_cache, k_pe_out, k_weight, cos_ptr, sin_ptr, eps, params,
-      token_idx, tid);
+      kv, k_nope_scale_buff, k_rope_buff, k_weight, cos_ptr, sin_ptr, eps, params,
+      token_idx, tid, out_cache_offset, out_rope_offset);
 }
 
 // __global__ wrapper: dispatches the runtime is_neox flag to a compile-time template arg.
@@ -5008,10 +5038,11 @@ template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt,
 __global__ __launch_bounds__(TOKENS_PER_BLOCK * 64, 512 / (TOKENS_PER_BLOCK * 64))
 void fuse_kv_norm_rope_group_quant_cache_kernel(
     const scalar_t* __restrict__ kv,
-    scalar_t*       __restrict__ k_pe_out,
+    scalar_t*       __restrict__ k_rope_buff,
     const scalar_t* __restrict__ k_weight,
-    cache_t*        __restrict__ kv_cache,
+    cache_t*        __restrict__ k_nope_scale_buff,
     const int64_t*  __restrict__ positions,
+    const int64_t*  __restrict__ slot_mapping,
     const scalar_t* __restrict__ cos_cache,
     const scalar_t* __restrict__ sin_cache,
     float eps,
@@ -5022,12 +5053,14 @@ void fuse_kv_norm_rope_group_quant_cache_kernel(
     fuse_kv_norm_rope_group_quant_cache_kernel_impl<scalar_t, cache_t, kv_dt, true,
                                                     HEAD_DIM, PE_DIM, GROUP_SIZE,
                                                     TOKENS_PER_BLOCK>(
-        kv, k_pe_out, k_weight, kv_cache, positions, cos_cache, sin_cache, eps, params);
+        kv, k_rope_buff, k_weight, k_nope_scale_buff, positions, slot_mapping,
+        cos_cache, sin_cache, eps, params);
   } else {
     fuse_kv_norm_rope_group_quant_cache_kernel_impl<scalar_t, cache_t, kv_dt, false,
                                                     HEAD_DIM, PE_DIM, GROUP_SIZE,
                                                     TOKENS_PER_BLOCK>(
-        kv, k_pe_out, k_weight, kv_cache, positions, cos_cache, sin_cache, eps, params);
+        kv, k_rope_buff, k_weight, k_nope_scale_buff, positions, slot_mapping,
+        cos_cache, sin_cache, eps, params);
   }
 }
 
@@ -5042,10 +5075,11 @@ void fuse_kv_norm_rope_group_quant_cache_kernel(
                 head_dim_val, pe_dim_val, group_size_val, tokens_per_block_val>                  \
               <<<grid, block, 0, stream>>>(                                                      \
                 reinterpret_cast<const KV_T*>(kv.data_ptr()),                                    \
-                reinterpret_cast<KV_T*>(k_pe_out.data_ptr()),                                    \
+                reinterpret_cast<KV_T*>(k_rope_buff.data_ptr()),                                 \
                 reinterpret_cast<const KV_T*>(k_weight.data_ptr()),                              \
-                reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                                 \
+                reinterpret_cast<CACHE_T*>(k_nope_scale_buff.data_ptr()),                        \
                 reinterpret_cast<const int64_t*>(positions.data_ptr()),                          \
+                reinterpret_cast<const int64_t*>(slot_mapping.data_ptr()),                       \
                 reinterpret_cast<const KV_T*>(cos_cache.data_ptr()),                             \
                 reinterpret_cast<const KV_T*>(sin_cache.data_ptr()),                             \
                 static_cast<float>(eps),                                                         \
@@ -5073,20 +5107,22 @@ namespace aiter {
 
 
 void fused_kv_norm_rope_group_quant(
-    aiter_tensor_t& kv,            // [num_tokens, (NK=1,) head_dim]
-    aiter_tensor_t& k_pe_out,      // [num_tokens, (NK=1,) pe_dim] bf16 (RoPE'd output)
-    aiter_tensor_t& k_weight,      // [head_dim] RMSNorm weights
-    aiter_tensor_t& kv_cache,      // [num_tokens, (NK=1,) head_dim] fp8 (or bf16/fp16)
-    aiter_tensor_t& positions,     // [num_tokens]
-    aiter_tensor_t& cos_cache,     // [max_position, rot_dim//2]
-    aiter_tensor_t& sin_cache,     // [max_position, rot_dim//2]
+    aiter_tensor_t& kv,                 // [num_tokens, (NK=1,) head_dim]
+    aiter_tensor_t& k_rope_buff,        // paged rope cache [num_blocks, page_size, rot_dim] bf16 (MQA)
+    aiter_tensor_t& k_weight,           // [head_dim] RMSNorm weights
+    aiter_tensor_t& k_nope_scale_buff,  // paged nope+scale cache [num_blocks, page_size, head_dim] fp8 (MQA)
+    aiter_tensor_t& positions,          // [num_tokens]
+    aiter_tensor_t& slot_mapping,       // [num_tokens] int64 flat slot = block*page_size + offset
+    aiter_tensor_t& cos_cache,          // [max_position, rot_dim//2]
+    aiter_tensor_t& sin_cache,          // [max_position, rot_dim//2]
     double eps,
     bool is_neox,
     int64_t quant_group_size,
     const std::string& scale_dtype)
 {
   // V4-Pro Attention.forward path A: KV-only fused RMSNorm + RoPE + 1xG e8m0
-  // group-quant. NK is hardcoded to 1 (MLA latent KV).
+  // group-quant, scattered into a PAGED KV cache via slot_mapping. NK is
+  // hardcoded to 1 (MLA latent KV).
 
   const int num_tokens = kv.size(0);
   const int head_dim   = kv.size(-1);
@@ -5098,6 +5134,17 @@ void fused_kv_norm_rope_group_quant(
   AITER_CHECK(scale_dtype == "e8m0",
               "fused_kv_norm_rope_group_quant currently only supports scale_dtype='e8m0', got ",
               scale_dtype);
+  AITER_CHECK(slot_mapping.size(0) == num_tokens,
+              "slot_mapping must have num_tokens entries; got ", slot_mapping.size(0),
+              " vs num_tokens=", num_tokens);
+  // Paged caches: [num_blocks, page_size, entry] (MQA, no NK dim). page_size = dim 1; both
+  // caches must share it (indexed by the same slot). Row stride = stride(1).
+  AITER_CHECK(k_nope_scale_buff.dim() >= 2 && k_rope_buff.dim() >= 2,
+              "paged caches must be at least [num_blocks, page_size, ...]");
+  const int page_size = static_cast<int>(k_nope_scale_buff.size(1));
+  AITER_CHECK(k_rope_buff.size(1) == page_size,
+              "k_rope_buff page_size (", k_rope_buff.size(1),
+              ") must match k_nope_scale_buff page_size (", page_size, ")");
 
   const int num_kv_heads = (kv.dim() == 3) ? static_cast<int>(kv.size(1)) : 1;
   AITER_CHECK(num_kv_heads == 1,
@@ -5110,24 +5157,26 @@ void fused_kv_norm_rope_group_quant(
               "(head_dim - rot_dim) must be divisible by quant_group_size; got nope_dim=",
               nope_dim, " group_size=", group_size);
 
-  // Strides (only the K-relevant fields are used; the rest of MlaKernelParams
-  // is zero-filled but kept for struct-layout compat with the QK kernel).
+  // Strides. The K-only paged path uses kv_stride_* (input) + the paged-cache
+  // block/row strides below; the rest of MlaKernelParams is zero-filled (kept
+  // for struct-layout compat with the QK kernel).
   aiter::MlaKernelParams mla_params{};
-  mla_params.token_stride        = kv_cache.stride(0);
-  mla_params.kv_cache_stride_h   = (kv_cache.dim() >= 3) ? kv_cache.stride(1) : 0;
   mla_params.kv_stride_0         = kv.stride(0);
   mla_params.kv_stride_1         = (kv.dim() == 3) ? kv.stride(1) : 0;
-  mla_params.k_pe_out_stride_0   = k_pe_out.stride(0);
-  mla_params.k_pe_out_stride_1   = (k_pe_out.dim() == 3) ? k_pe_out.stride(1) : 0;
   mla_params.num_tokens          = num_tokens;
   mla_params.num_heads           = 0;  // K-only kernel: no Q heads
+  mla_params.page_size           = page_size;
+  mla_params.kcache_block_stride = k_nope_scale_buff.stride(0);
+  mla_params.kcache_row_stride   = k_nope_scale_buff.stride(1);
+  mla_params.krope_block_stride  = k_rope_buff.stride(0);
+  mla_params.krope_row_stride    = k_rope_buff.stride(1);
 
   HipDeviceGuard device_guard(kv.device_id);
   const hipStream_t stream = aiter::getCurrentHIPStream();
 
   // KV cache dtype dispatch (auto / fp8). Same map as the QK entry.
   std::string kv_cache_dtype = "auto";
-  const AiterDtype cache_dt = kv_cache.dtype();
+  const AiterDtype cache_dt = k_nope_scale_buff.dtype();
   if (cache_dt == AITER_DTYPE_fp32 ||
       cache_dt == AITER_DTYPE_fp16 ||
       cache_dt == AITER_DTYPE_bf16) {

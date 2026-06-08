@@ -14,14 +14,14 @@ quantized). Token-contiguous outputs, no slot_mapping / paged cache. Q mirrors
 K when fp8; bf16 Q stays a plain [.,H,512] rotated tensor (ATOM sparse_attn default).
 
 K outputs (v4 nm asm reader layout), per (token, kv_head):
-    nope_scale_buff [T, NK, 512] fp8:
+    k_nope_scale_buff [T, NK, 512] fp8:
         [0   : 448)  nope fp8
         [448 : 462)  e8m0 scale, 14 B = 7 groups each written twice (s0,s0,..,s6,s6)
         [462 : 512)  pad (zero)
-    rope_buff       [T, NK, 64]  bf16:  rotated K-PE (not quantized)
+    k_rope_buff       [T, NK, 64]  bf16:  rotated K-PE (not quantized)
 
-Q outputs (fp8): same split -- q_out is q_nope_scale_buff [T, H, 512], plus a
-separate q_rope_buff [T, H, 64] bf16. bf16 Q: q_out is [T, H, 512] bf16, no q_rope_buff.
+Q outputs (fp8): same split -- q_nope_scale_buff [T, H, 512], plus a separate
+q_rope_buff [T, H, 64] bf16. bf16 Q: q_nope_scale_buff is [T, H, 512] bf16, no q_rope_buff.
 
 Usage:
     python op_tests/test_fused_qk_norm_rope_group_quant.py
@@ -149,7 +149,7 @@ def test_fused_qk_norm_rope_group_quant(
     nope = D - RD
     eps = 1e-6
     n_groups = nope // G  # e8m0 scale groups over the NoPE part (7 for D=512, G=64)
-    entry = D  # nope_scale_buff is 512 B (head_dim): nope(448) + 14 dup e8m0 + pad
+    entry = D  # k_nope_scale_buff is 512 B (head_dim): nope(448) + 14 dup e8m0 + pad
 
     cos, sin = _cos_sin(max(T, 64) + 4, RD, torch.bfloat16)
     pos = torch.randint(0, cos.shape[0] - 1, (T,), dtype=torch.int64, device=_DEV)
@@ -163,8 +163,8 @@ def test_fused_qk_norm_rope_group_quant(
     )
 
     # Kernel + perf (pre-allocate outputs so we time the kernel, not torch.empty)
-    # fp8 Q: q_out is q_nope_scale_buff (512 B, zeroed pad) + separate q_rope_buff bf16.
-    q_out = (
+    # fp8 Q: q_nope_scale_buff (512 B, zeroed pad) + separate q_rope_buff bf16.
+    q_nope_scale_buff = (
         torch.zeros(T, H, entry, dtype=_FP8, device=_DEV)
         if q_fp8
         else torch.empty(T, H, D, dtype=torch.bfloat16, device=_DEV)
@@ -172,9 +172,9 @@ def test_fused_qk_norm_rope_group_quant(
     q_rope_buff = (
         torch.empty(T, H, RD, dtype=torch.bfloat16, device=_DEV) if q_fp8 else None
     )
-    nope_scale_buff = torch.zeros(T, NK, entry, dtype=_FP8, device=_DEV)
-    rope_buff = torch.empty(T, NK, RD, dtype=torch.bfloat16, device=_DEV)
-    (q_out, q_rope_buff, nope_scale_buff, rope_buff), us = run_perftest(
+    k_nope_scale_buff = torch.zeros(T, NK, entry, dtype=_FP8, device=_DEV)
+    k_rope_buff = torch.empty(T, NK, RD, dtype=torch.bfloat16, device=_DEV)
+    (q_nope_scale_buff, q_rope_buff, k_nope_scale_buff, k_rope_buff), us = run_perftest(
         aiter.fused_qk_norm_rope_group_quant,
         q,
         kv,
@@ -185,10 +185,10 @@ def test_fused_qk_norm_rope_group_quant(
         eps,
         is_neox=is_neox,
         q_out_dtype=(_FP8 if q_fp8 else torch.bfloat16),
-        q_out=q_out,
+        q_nope_scale_buff=q_nope_scale_buff,
         q_rope_buff=q_rope_buff,
-        nope_scale_buff=nope_scale_buff,
-        rope_buff=rope_buff,
+        k_nope_scale_buff=k_nope_scale_buff,
+        k_rope_buff=k_rope_buff,
         quant_group_size=G,
         scale_dtype="e8m0",
     )
@@ -196,12 +196,12 @@ def test_fused_qk_norm_rope_group_quant(
     # --- Accuracy ---
     # Q: fp8 -> dequant vs fp8 ref; bf16 -> direct compare (Q not quantized)
     if q_fp8:
-        # fp8 Q mirrors K: q_out = nope fp8 [0:nope) + inline dup e8m0 scale [nope:nope+2*n_groups);
-        # rotated Q-PE bf16 in the separate q_rope_buff.
+        # fp8 Q mirrors K: q_nope_scale_buff = nope fp8 [0:nope) + inline dup e8m0 scale
+        # [nope:nope+2*n_groups); rotated Q-PE bf16 in the separate q_rope_buff.
         assert q_rope_buff is not None, "fp8 Q must produce q_rope_buff"
-        q_nope_got = q_out[..., :nope]
+        q_nope_got = q_nope_scale_buff[..., :nope]
         q_scale_pairs = (
-            q_out.view(torch.uint8)[..., nope : nope + 2 * n_groups]
+            q_nope_scale_buff.view(torch.uint8)[..., nope : nope + 2 * n_groups]
             .contiguous()
             .reshape(T, H, n_groups, 2)
         )
@@ -235,17 +235,21 @@ def test_fused_qk_norm_rope_group_quant(
         )
     else:
         assert q_rope_buff is None, "bf16 Q must NOT produce q_rope_buff"
-        assert q_out.dtype == torch.bfloat16
+        assert q_nope_scale_buff.dtype == torch.bfloat16
         err_q = checkAllclose(
-            q_out.float(), ref_q_bf16.float(), atol=0.02, rtol=0.01, msg="Q bf16"
+            q_nope_scale_buff.float(),
+            ref_q_bf16.float(),
+            atol=0.02,
+            rtol=0.01,
+            msg="Q bf16",
         )
 
-    # K nope fp8 from nope_scale_buff[..., 0:nope]; e8m0 scale @[nope:nope+2*n_groups),
+    # K nope fp8 from k_nope_scale_buff[..., 0:nope]; e8m0 scale @[nope:nope+2*n_groups),
     # written as each tile-scale duplicated x2 (s0,s0,s1,s1,...). Take the first of
     # each pair for dequant; verify BOTH halves equal the reference scale.
-    k_nope_got = nope_scale_buff[..., :nope]
+    k_nope_got = k_nope_scale_buff[..., :nope]
     k_scale_pairs = (
-        nope_scale_buff.view(torch.uint8)[..., nope : nope + 2 * n_groups]
+        k_nope_scale_buff.view(torch.uint8)[..., nope : nope + 2 * n_groups]
         .contiguous()
         .reshape(T, NK, n_groups, 2)
     )
@@ -273,9 +277,9 @@ def test_fused_qk_norm_rope_group_quant(
         msg="K scale e8m0 dup",
     )
 
-    # K pe bf16 (NOT quantized) from the separate rope_buff
+    # K pe bf16 (NOT quantized) from the separate k_rope_buff
     err_kpe = checkAllclose(
-        rope_buff.float(), ref_k_pe.float(), atol=0.01, rtol=0.01, msg="K-pe bf16"
+        k_rope_buff.float(), ref_k_pe.float(), atol=0.01, rtol=0.01, msg="K-pe bf16"
     )
 
     # --- flydsl perf comparison ---

@@ -14,8 +14,10 @@ DeepSeek-V4-Pro ``model.py`` (lines 682-686)::
     act_quant(kv[..., :-rd], 64, ..., inplace=True) # FP8 1xG e8m0 on NoPE only
 
 V4-Pro layout: NoPE fp8 (1x64 e8m0 group scale), PE bf16 (NOT quantized).
-Token-contiguous outputs, no slot_mapping / paged cache. NK (num_kv_heads) is
-1 (MLA latent KV), matching the kernel's MQA hard-coding.
+Outputs are scattered into a PAGED KV cache via slot_mapping (caches shaped
+[num_blocks, page_size, NK, entry]); the test uses a random permutation of
+distinct slots and gathers rows back for the accuracy check. NK (num_kv_heads)
+is 1 (MLA latent KV), matching the kernel's MQA hard-coding.
 
 NOTE: the wrapper currently issues a dummy bf16 Q wave alongside the K wave
 (see ``aiter/ops/fused_qk_norm_rope_cache_quant.py::fused_kv_norm_rope_group_quant``),
@@ -148,23 +150,44 @@ def test_fused_kv_norm_rope_group_quant(T, D, RD, *, is_neox, G):
         kv, kv_weight, cos, sin, pos, eps, is_neox=is_neox, group_size=G
     )
 
-    # Kernel: pre-allocate outputs so we time the kernel, not torch.zeros.
-    nope_scale_buff = torch.zeros(T, NK, entry, dtype=_FP8, device=_DEV)
-    rope_buff = torch.empty(T, NK, RD, dtype=torch.bfloat16, device=_DEV)
-    (nope_scale_buff, rope_buff), us = run_perftest(
+    # Paged KV cache + slot_mapping. Use a random permutation of distinct slots
+    # (no collisions) so the test exercises a non-identity paged scatter. Caches
+    # are [num_blocks, page_size, entry] (MQA: no num_kv_heads dim); the kernel
+    # writes each token to slot_mapping[token] = block*page_size + offset.
+    # Zero-init so unwritten slots AND each entry's trailing pad read back as zero
+    # (asm-reader contract).
+    page_size = 1
+    num_blocks = (T + page_size - 1) // page_size + 1  # a little slack
+    num_slots = num_blocks * page_size
+    slot_mapping = torch.randperm(num_slots, device=_DEV)[:T].to(torch.int64)
+    k_nope_scale_buff = torch.zeros(
+        num_blocks, page_size, entry, dtype=_FP8, device=_DEV
+    )
+    k_rope_buff = torch.zeros(
+        num_blocks, page_size, RD, dtype=torch.bfloat16, device=_DEV
+    )
+    (k_nope_scale_buff, k_rope_buff), us = run_perftest(
         aiter.fused_kv_norm_rope_group_quant,
         kv,
         kv_weight,
         pos,
+        slot_mapping,
         cos,
         sin,
         eps,
+        k_nope_scale_buff,
+        k_rope_buff,
         is_neox=is_neox,
         quant_group_size=G,
         scale_dtype="e8m0",
-        nope_scale_buff=nope_scale_buff,
-        rope_buff=rope_buff,
     )
+
+    # Gather per-token rows back from the paged cache via slot_mapping, then add
+    # back the unit NK axis the token-indexed accuracy check expects ([T, NK, ...]).
+    nope_scale_buff = k_nope_scale_buff.view(num_slots, entry)[slot_mapping].unsqueeze(
+        1
+    )
+    rope_buff = k_rope_buff.view(num_slots, RD)[slot_mapping].unsqueeze(1)
 
     # --- Accuracy ---
     # K nope fp8 from nope_scale_buff[..., 0:nope]; e8m0 scale @[nope:nope+2*n_groups),
