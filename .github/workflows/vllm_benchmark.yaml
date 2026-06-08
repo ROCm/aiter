@@ -245,6 +245,8 @@ jobs:
                 bash ./.github/scripts/install_triton.sh
                 pip show triton
                 pip uninstall -y aiter amd-aiter || true
+                pip config set global.default-timeout 60
+                pip config set global.retries 10
                 pip install \"\${wheels[0]}\"
                 pip show amd-aiter || pip show aiter
                 if [ -d \"/models/${{ matrix.model }}\" ]; then
