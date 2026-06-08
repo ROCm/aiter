@@ -391,9 +391,9 @@ def test_fmoe(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
     if strict_accuracy:
-        assert not (err != 0 and logits_diff > 0.01), (
-            f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
-        )
+        assert not (
+            err != 0 and logits_diff > 0.01
+        ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
     elif err != 0 and logits_diff > 0.01:
         logging.warning(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
