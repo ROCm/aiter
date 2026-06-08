@@ -344,6 +344,7 @@ def ref_masked_attention_v4(
     out_dtype: torch.dtype,
     is_causal: bool = True,
     causal_diagonal: int = None,
+    attn_sink: torch.Tensor = None,  # optional [h_q] fp32 per-head sink logit
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     attn = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     if is_causal:
@@ -356,10 +357,22 @@ def ref_masked_attention_v4(
         )
         attn = attn + bias
 
-    lse = attn.logsumexp(dim=-1)
-    m = attn.max(dim=-1).values
-    attn_exp = torch.exp(attn - m.unsqueeze(-1))
-    l = attn_exp.sum(-1)  # noqa: E741
+    # Sink: virtual K column with constant logit, zero V. Inflates the
+    # softmax denominator but contributes nothing to the V numerator.
+    # attn: [h, q, k]; attn_sink: [h] -> broadcast to [h, q, 1].
+    if attn_sink is not None:
+        sink = attn_sink.to(torch.float32).to(attn.device).view(-1, 1, 1)
+        attn_aug = torch.cat([attn, sink.expand(-1, attn.shape[1], 1)], dim=-1)
+        lse = attn_aug.logsumexp(dim=-1)
+        m = attn_aug.max(dim=-1).values
+        attn_exp = torch.exp(attn - m.unsqueeze(-1))  # NOTE: only over real K
+        sink_exp = torch.exp(sink - m.unsqueeze(-1))  # [h, q, 1]
+        l = attn_exp.sum(-1) + sink_exp.squeeze(-1)  # noqa: E741
+    else:
+        lse = attn.logsumexp(dim=-1)
+        m = attn.max(dim=-1).values
+        attn_exp = torch.exp(attn - m.unsqueeze(-1))
+        l = attn_exp.sum(-1)  # noqa: E741
     out = torch.einsum("hqk,khd->qhd", attn_exp, value.float())
     out = out / l.transpose(0, 1).unsqueeze(-1)
     return out.to(out_dtype), lse
@@ -398,6 +411,7 @@ def torch_mla_extend_v4_silver(
     sm_scale,
     out_dtype,
     is_causal: bool = True,
+    attn_sink: torch.Tensor = None,
 ):
     """
     Reference whose inputs match the ASM kernel's exactly: a single 576-byte
@@ -426,6 +440,7 @@ def torch_mla_extend_v4_silver(
         sm_scale,
         out_dtype,
         is_causal=is_causal,
+        attn_sink=attn_sink,
     )
 
 
@@ -439,6 +454,7 @@ def torch_mla_extend_v4(
     sm_scale,
     out_dtype,
     is_causal: bool = True,
+    attn_sink: torch.Tensor = None,  # optional [nhead] fp32
 ):
     """V4 paged-attention reference. K and V are the same tensor (full d_qk slice)."""
     qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
@@ -454,7 +470,13 @@ def torch_mla_extend_v4(
         kvi = kvs[i].flatten(0, 1)[:real_kv_len]  # [s_k, 1, d_qk]
         # In v4: K and V both use the full d_qk slice (nope+rope).
         o, lse = ref_masked_attention_v4(
-            qs[i], kvi, kvi, sm_scale, out_dtype, is_causal=is_causal
+            qs[i],
+            kvi,
+            kvi,
+            sm_scale,
+            out_dtype,
+            is_causal=is_causal,
+            attn_sink=attn_sink,
         )
         outs.append(o)
         lses.append(lse)
@@ -475,6 +497,7 @@ def torch_mla_v4_split_kv(
     work_info_set,
     work_indptr,
     is_causal=True,
+    attn_sink: torch.Tensor = None,  # only applied on first split of each batch
 ):
     num_page, page_size, _, d_qk = kv_silver_bf16.shape
     total_q, nheads, _ = q_silver_bf16.shape
@@ -523,6 +546,20 @@ def torch_mla_v4_split_kv(
                 q_local_start - kv_local_start + cur_real_kv_seq_len - total_q_len
             )
 
+        # Sink: same fold-rule as the kernel -- apply on OutputFinal
+        # (partial_qo_loc == -1, single split) OR on the LAST split of this
+        # batch element. kv_offset == 0 iff this split's kv_end coincides
+        # with the batch tail (planner sets
+        # kv_offset = curr_kv_end - work_info.kv_end). Last-vs-first is
+        # mathematically equivalent for the reducer combine; last-split is
+        # cheaper on the kernel side (no extra kv_indptr load).
+        is_last_split = kv_offset == 0
+        work_sink = (
+            attn_sink
+            if (attn_sink is not None and (partial_qo_loc == -1 or is_last_split))
+            else None
+        )
+
         o, lse = ref_masked_attention_v4(
             slice_q,
             slice_k,
@@ -531,6 +568,7 @@ def torch_mla_v4_split_kv(
             out_dtype,
             is_causal=is_causal,
             causal_diagonal=causal_diagonal,
+            attn_sink=work_sink,
         )
 
         if partial_qo_loc == -1:
@@ -572,6 +610,7 @@ def test_mla_v4(
     varlen,
     decode_qlen,
     max_split_per_batch,
+    use_attn_sink: bool = False,
 ):
     gfx = get_gfx()
     if gfx not in ["gfx950"]:
@@ -665,6 +704,14 @@ def test_mla_v4(
         is_causal=True,
     )
 
+    # ---- attention sink (optional, per-head bias logit) ----
+    # Random small-magnitude sink so the augmented denominator differs
+    # meaningfully from the no-sink one but doesn't dominate (which would
+    # collapse the V output toward zero and trivialize the check).
+    attn_sink = None
+    if use_attn_sink:
+        attn_sink = torch.randn(nhead, dtype=torch.float32) * 0.5
+
     # ---- silver reference (kernel-shaped inputs: 576-byte packed FP8 + BF16 rope) ----
     out_silver, lse_silver = torch_mla_extend_v4_silver(
         q_packed,
@@ -678,6 +725,7 @@ def test_mla_v4(
         sm_scale,
         out_dtype=out_dtype,
         is_causal=True,
+        attn_sink=attn_sink,
     )
 
     # Quantization-induced drift between golden and silver -- this is the
@@ -821,6 +869,7 @@ def test_mla_v4(
             reduce_final_map,
             reduce_partial_map,
             sm_scale=sm_scale,
+            attn_sink=attn_sink,
         )
         ret["v40_us"] = us_v40_decode
         err = checkAllclose(
@@ -849,6 +898,7 @@ def test_mla_v4(
             work_info_set,
             work_indptr,
             is_causal=True,
+            attn_sink=attn_sink,
         )
 
         if partial_out_ref.shape[0] > 0:
@@ -948,6 +998,11 @@ parser.add_argument(
     action="store_true",
     help="Variable kv seqlens. Default: False",
 )
+parser.add_argument(
+    "--attn_sink",
+    action="store_true",
+    help="Test attention sink (per-head bias logit). Default: False",
+)
 
 args = parser.parse_args()
 
@@ -964,6 +1019,7 @@ for nhead, decode_qlen in args.nhead:
             varlen=args.varlen,
             decode_qlen=decode_qlen,
             max_split_per_batch=max_split_per_batch,
+            use_attn_sink=args.attn_sink,
         )
         if ret is None:
             continue

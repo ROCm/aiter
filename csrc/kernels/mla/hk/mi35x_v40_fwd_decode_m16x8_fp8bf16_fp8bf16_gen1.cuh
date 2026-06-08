@@ -9,6 +9,8 @@
 #include "hk_mla_v40_buffer_managers_gen1.cuh"
 #include "mla.h"
 #include <assert.h>
+#include <limits>
+#include <optional>
 
 using namespace hk_mla;
 
@@ -186,8 +188,21 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
     // num_wave_group = qseqlen = kBlockM / num_qheads
     // waves_per_head = num_qheads / kTileM
     // causal_offset = num_wave_group - 1 - (warp_idx / waves_per_head)
-    const int32_t log2_num_qheads     = __builtin_amdgcn_readfirstlane(params.log2_num_qheads);
-    const int32_t num_qheads          = 1 << log2_num_qheads;
+    const int32_t log2_num_qheads = __builtin_amdgcn_readfirstlane(params.log2_num_qheads);
+    const int32_t num_qheads      = 1 << log2_num_qheads;
+
+    // Per-lane attention sink logit. Loaded once at kernel entry: it depends
+    // only on (warp_idx, lane_idx), not on work_idx, so it lives in a VGPR
+    // for the kernel's lifetime. When p_attn_sink is null, substitute -inf
+    // so exp(sink - row_max) = 0 -> the epilogue's row_sum_e += sink_term
+    // becomes a no-op. num_qheads is a power of 2 in {16,32,64,128} (see
+    // outer wrapper check).
+    const uint32_t head_idx =
+        (warp_idx * 16u + (lane_idx & 15u)) & (static_cast<uint32_t>(num_qheads) - 1u);
+    const float attn_sink = (params.p_attn_sink == nullptr)
+                                ? -std::numeric_limits<float>::infinity()
+                                : params.p_attn_sink[head_idx];
+
     const int32_t num_wave_group      = T::kBlockM >> log2_num_qheads; // qseqlen
     const int32_t log2_waves_per_head = log2_num_qheads - 4;           // log2(kTileM) = 4
     const int32_t qpos_off_from_last  = num_wave_group - 1 - (warp_idx >> log2_waves_per_head);
@@ -250,6 +265,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
 
     for(int32_t work_idx = work_start_idx; work_idx < work_end_idx; ++work_idx)
     {
+        const int32_t batch_idx = __builtin_amdgcn_readfirstlane(
+            params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 0]);
         const int32_t partial_qo_loc = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 1]);
         const int32_t qo_start = __builtin_amdgcn_readfirstlane(
@@ -264,6 +281,17 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
         const int32_t kv_offset = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 6]);
 
+        // "Last split of this batch" -- the planner sets
+        // kv_offset = curr_kv_end - work_info.kv_end (metadata/v1_2_device.cuh
+        // L202/L214), so kv_offset == 0 iff this split's kv_end coincides
+        // with the batch tail. Used by the epilogue sink fold: only the
+        // LAST split inflates row_sum_e with the sink term, so the reducer
+        // routes the sink contribution into the global denominator exactly
+        // once. Last-vs-first is mathematically equivalent (reducer combines
+        // lses commutatively); last-split is cheaper -- no extra kv_indptr
+        // load (kv_offset is already in scope above).
+        const bool is_last_split = (kv_offset == 0);
+
         // Convert work_info page bounds to TOKEN space. When kPageSize == 1
         // pages == tokens. When kPageSize > 1 and this is the batch tail
         // (kv_offset == 0), clip the last page with kv_last_page_lens[batch].
@@ -277,8 +305,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
         }
         else
         {
-            const int32_t batch_idx = __builtin_amdgcn_readfirstlane(
-                params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 0]);
             const int32_t last_page_len =
                 __builtin_amdgcn_readfirstlane(params.p_kv_last_page_lens[batch_idx]);
             kv_end = (kv_end_page - 1) * T::kPageSize + last_page_len;
@@ -941,6 +967,22 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
             // work_idx's KV prologue writes to p_lds_kv_curr).
             if constexpr(kDoEpilogue)
             {
+                // ---- Attention-sink fold ----
+                // Apply on OutputFinal (single-split == global) OR on the
+                // LAST split of this batch element. By inflating exactly
+                // one split's row_sum_e (and thus its lse), the reducer's
+                // sum_k exp(lse_k - global_lse) * out_k formula naturally
+                // routes exp(sink) into the global denominator exactly once
+                // while contributing 0 to the V numerator.
+                //
+                // attn_sink is a per-lane VGPR loaded once at kernel entry
+                // (-inf if p_attn_sink is null, so exp(...)=0 -> no-op).
+                if(kEpilogueType == PvGemmEpilogueType::OutputFinal || is_last_split)
+                {
+                    const float sink_term = __builtin_amdgcn_exp2f((attn_sink - row_max) * log2e);
+                    row_sum_e += sink_term;
+                }
+
                 const comp_t reci_row_sum_e = 1.0f / row_sum_e;
                 hk::mul_vgpr(oaccu, oaccu, reci_row_sum_e);
 
@@ -1334,7 +1376,6 @@ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& query,
                                                          aiter_tensor_t& kv_buffer,
                                                          aiter_tensor_t& kv_buffer_rope,
                                                          const aiter_tensor_t& qo_indptr,
-                                                         const aiter_tensor_t& kv_indptr,
                                                          const aiter_tensor_t& kv_page_indices,
                                                          const aiter_tensor_t& kv_last_page_lens,
                                                          const aiter_tensor_t& work_indptr,
@@ -1343,7 +1384,8 @@ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& query,
                                                          const float softmax_scale,
                                                          aiter_tensor_t& split_output,
                                                          aiter_tensor_t& split_lse,
-                                                         aiter_tensor_t& final_output)
+                                                         aiter_tensor_t& final_output,
+                                                         const float* p_attn_sink)
 {
     // Shape / dtype / rank checks live ONCE in the outer dispatcher
     // (hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1) so we don't
@@ -1370,6 +1412,8 @@ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& query,
         // metadata
         reinterpret_cast<int32_t*>(work_indptr.data_ptr()),
         reinterpret_cast<int32_t*>(work_info_set.data_ptr()),
+        // optional per-head attention sink ([num_qheads] fp32, or nullptr)
+        p_attn_sink,
         // outputs
         reinterpret_cast<typename Traits::out_t*>(final_output.data_ptr()),
         reinterpret_cast<float*>(split_output.data_ptr()),
@@ -1390,7 +1434,6 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& quer
                                                             aiter_tensor_t& kv_buffer,
                                                             aiter_tensor_t& kv_buffer_rope,
                                                             const aiter_tensor_t& qo_indptr,
-                                                            const aiter_tensor_t& kv_indptr,
                                                             const aiter_tensor_t& kv_page_indices,
                                                             const aiter_tensor_t& kv_last_page_lens,
                                                             const aiter_tensor_t& work_indptr,
@@ -1399,7 +1442,8 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& quer
                                                             const float softmax_scale,
                                                             aiter_tensor_t& split_output,
                                                             aiter_tensor_t& split_lse,
-                                                            aiter_tensor_t& final_output)
+                                                            aiter_tensor_t& final_output,
+                                                            std::optional<aiter_tensor_t> attn_sink)
 {
     HipDeviceGuard device_guard(final_output.device_id);
 
@@ -1556,6 +1600,23 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& quer
                 "kv_page_indices must be 1-D, got rank ",
                 kv_page_indices.dim());
 
+    // Optional attention sink: [num_qheads] fp32. Disabled when absent.
+    const float* p_attn_sink = nullptr;
+    if(attn_sink.has_value())
+    {
+        const aiter_tensor_t& s = attn_sink.value();
+        AITER_CHECK(s.dtype() == AITER_DTYPE_fp32,
+                    "attn_sink must be fp32, got ",
+                    AiterDtype_to_str(s.dtype()));
+        AITER_CHECK(s.dim() == 1, "attn_sink must be 1-D, got rank ", s.dim());
+        AITER_CHECK(s.size(0) == num_qheads,
+                    "attn_sink.size(0) must equal num_qheads=",
+                    num_qheads,
+                    ", got ",
+                    s.size(0));
+        p_attn_sink = reinterpret_cast<const float*>(s.data_ptr());
+    }
+
 #define DISPATCH_PAGE_SIZE(PageSize)                                                   \
     case PageSize: {                                                                   \
         using Traits = HkMlaV40DecodeFwdTraits<hk::fp8e4m3,                            \
@@ -1573,7 +1634,6 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& quer
                                                                     kv_buffer,         \
                                                                     kv_buffer_rope,    \
                                                                     qo_indptr,         \
-                                                                    kv_indptr,         \
                                                                     kv_page_indices,   \
                                                                     kv_last_page_lens, \
                                                                     work_indptr,       \
@@ -1582,7 +1642,8 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& quer
                                                                     softmax_scale,     \
                                                                     split_output,      \
                                                                     split_lse,         \
-                                                                    final_output);     \
+                                                                    final_output,      \
+                                                                    p_attn_sink);      \
         break;                                                                         \
     }
 

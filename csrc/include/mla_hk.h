@@ -8,6 +8,7 @@
 //   v4.0: csrc/kernels/mla/hk_v40_decode_fwd.cu
 
 #include "aiter_tensor.h"
+#include <optional>
 
 void hk_mla_v32_decode_fwd(aiter_tensor_t& query,
                            aiter_tensor_t& kv_buffer,
@@ -35,7 +36,6 @@ void hk_mla_v40_decode_fwd(aiter_tensor_t& query,
                            aiter_tensor_t& kv_buffer,
                            aiter_tensor_t& kv_buffer_rope,
                            const aiter_tensor_t& qo_indptr,
-                           const aiter_tensor_t& kv_indptr,
                            const aiter_tensor_t& kv_page_indices,
                            const aiter_tensor_t& kv_last_page_lens,
                            const aiter_tensor_t& work_indptr,
@@ -44,4 +44,5 @@ void hk_mla_v40_decode_fwd(aiter_tensor_t& query,
                            const float softmax_scale,
                            aiter_tensor_t& split_output,
                            aiter_tensor_t& split_lse,
-                           aiter_tensor_t& final_output);
+                           aiter_tensor_t& final_output,
+                           std::optional<aiter_tensor_t> attn_sink);

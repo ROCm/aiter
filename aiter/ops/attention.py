@@ -1531,7 +1531,6 @@ def hk_mla_v40_decode_fwd(
     # [num_page, page_size, num_kv_heads=1, 64]   BF16
     kv_buffer_rope: torch.Tensor,
     qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
     kv_page_indices: torch.Tensor,
     kv_last_page_lens: torch.Tensor,
     work_indptr: torch.Tensor,
@@ -1541,4 +1540,5 @@ def hk_mla_v40_decode_fwd(
     split_output: torch.Tensor,
     split_lse: torch.Tensor,
     final_output: torch.Tensor,
+    attn_sink: Optional[torch.Tensor] = None,
 ) -> None: ...

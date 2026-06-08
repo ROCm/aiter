@@ -569,6 +569,7 @@ def mla_v40_decode_fwd(
     reduce_partial_map,
     sm_scale=None,  # default 1.0/sqrt(512)
     return_lse=False,
+    attn_sink=None,  # optional [nhead] fp32: per-head sink logit (virtual K, zero V)
 ):
     """
     V4.0 MLA decode router. Picks a suitable backend (HK persistent today;
@@ -576,6 +577,12 @@ def mla_v40_decode_fwd(
     target chip. Writes attention output into `o` in-place; returns
     `(logits, final_lse)` for the caller (final_lse is None unless
     return_lse=True).
+
+    attn_sink (optional): [nhead] fp32. Per-head bias logit treated as a
+    virtual K column with zero V. The kernel folds it into the LAST
+    split's running denominator (gated by kv_offset == 0); the reducer's
+    standard formula then routes exp(sink) into the global denominator
+    exactly once.
     """
     device = q.device
     total_s, nhead, v_head_dim = o.shape
@@ -636,7 +643,6 @@ def mla_v40_decode_fwd(
             kv_buffer,
             kv_buffer_rope,
             qo_indptr,
-            kv_indptr,
             kv_indices,
             kv_last_page_lens,
             work_indptr,
@@ -646,27 +652,8 @@ def mla_v40_decode_fwd(
             logits,
             attn_lse,
             o,
+            attn_sink,
         )
-        import os as _os
-
-        if _os.environ.get("V40_PROBE", ""):
-            _l = logits.float()
-            _a = attn_lse.float()
-            print(f"[V40_PROBE] logits shape={tuple(_l.shape)} dtype={_l.dtype}")
-            print(
-                f"[V40_PROBE] logits nan%={(_l.isnan().float().mean().item()*100):.2f} "
-                f"inf%={(_l.isinf().float().mean().item()*100):.2f} "
-                f"min={_l[~_l.isnan()&~_l.isinf()].min().item() if (~_l.isnan()&~_l.isinf()).any() else float('nan'):.4g} "
-                f"max={_l[~_l.isnan()&~_l.isinf()].max().item() if (~_l.isnan()&~_l.isinf()).any() else float('nan'):.4g}"
-            )
-            print(
-                f"[V40_PROBE] lse nan%={(_a.isnan().float().mean().item()*100):.2f} "
-                f"inf%={(_a.isinf().float().mean().item()*100):.2f} "
-                f"min={_a[~_a.isnan()&~_a.isinf()].min().item() if (~_a.isnan()&~_a.isinf()).any() else float('nan'):.4g} "
-                f"max={_a[~_a.isnan()&~_a.isinf()].max().item() if (~_a.isnan()&~_a.isinf()).any() else float('nan'):.4g}"
-            )
-            print(f"[V40_PROBE] logits[0,0,0,:8] = {_l[0,0,0,:8].cpu().tolist()}")
-            print(f"[V40_PROBE] lse[0,0,:8,0]    = {_a[0,0,:8,0].cpu().tolist()}")
     else:
         # TODO: dispatch to asm / triton / gluon / flydsl V4.0 backends once
         # they land. Today HK is the only available implementation.

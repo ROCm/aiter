@@ -217,6 +217,16 @@ struct HkMlaV40DecodeFwdParams
     const int32_t* p_work_indptr;
     const int32_t* p_work_info_set;
 
+    // optional per-head attention sink logit ([num_qheads], fp32). nullptr -> no
+    // sink (kernel substitutes -inf so exp(sink-row_max) = 0 -> row_sum_e
+    // unchanged). When non-null, folded into row_sum_e on the OutputFinal path
+    // OR the LAST split of this batch (gated by kv_offset == 0, which the
+    // metadata planner sets when this split's kv_end is the batch tail). The
+    // reducer's exp(lse_k - global_lse) factor then routes the sink
+    // contribution into the global denominator exactly once. Sink contributes
+    // 0 to the V numerator.
+    const float* p_attn_sink;
+
     // outputs (raw device pointers; OManager constructs HK buffer-resource
     // wrappers around these internally for the pinned-VGPR buffer_store path).
     typename Traits::out_t* p_final_output; // [1, total_q, kBlockM, kVoHeadDim]

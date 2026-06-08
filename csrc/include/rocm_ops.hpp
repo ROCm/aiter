@@ -2216,7 +2216,6 @@ namespace py = pybind11;
           py::arg("kv_buffer"),                               \
           py::arg("kv_buffer_rope"),                          \
           py::arg("qo_indptr"),                               \
-          py::arg("kv_indptr"),                               \
           py::arg("kv_page_indices"),                         \
           py::arg("kv_last_page_lens"),                       \
           py::arg("work_indptr"),                             \
@@ -2225,4 +2224,5 @@ namespace py = pybind11;
           py::arg("softmax_scale"),                           \
           py::arg("split_output"),                            \
           py::arg("split_lse"),                               \
-          py::arg("final_output"));
+          py::arg("final_output"),                            \
+          py::arg("attn_sink") = py::none());
