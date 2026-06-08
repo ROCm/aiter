@@ -253,10 +253,27 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     VarCtxOpt: bool = False,
 ):
     gfx_version = get_gfx()
-    assert gfx_version == "gfx942" or gfx_version == "gfx950"
+    assert gfx_version in ("gfx942", "gfx950", "gfx1250")
+    is_gfx1250 = gfx_version == "gfx1250"
+    if is_gfx1250:
+        if Preshuffle:
+            assert KVBlockSize > 1 and ChunkK % KVBlockSize == 0, (
+                f"gfx1250 preshuffle (TDM block-load) requires KVBlockSize>1 "
+                f"and ChunkK % KVBlockSize == 0 (ChunkK = N*KVBlockSize); got "
+                f"KVBlockSize={KVBlockSize}, ChunkK={ChunkK}."
+            )
+        else:
+            assert KVBlockSize == 1, (
+                f"gfx1250 base kernel requires KVBlockSize==1; got "
+                f"KVBlockSize={KVBlockSize}. Use Preshuffle=True for "
+                f"KVBlockSize>1 (TDM block-load)."
+            )
     cdna_version = get_cdna_version()
-    target = GPUTarget("hip", gfx_version, 64)
+    warp_size = 32 if is_gfx1250 else 64
+    target = GPUTarget("hip", gfx_version, warp_size)
 
+    # gfx942 uses the AMD fnuz e4m3 variant (*fp8e4b8); gfx950 and gfx1250 use
+    # the OCP/IEEE e4m3 variant (*fp8e4nv), matching utils.types.get_fp8_dtypes.
     gfx_fp8_pointer = "*fp8e4b8" if gfx_version == "gfx942" else "*fp8e4nv"
 
     fn_signature = {
@@ -293,16 +310,18 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["KVBlockSize"] = "constexpr"
     fn_signature["HiddenDim"] = "constexpr"
     fn_signature["CDNA_VERSION"] = "constexpr"
+    fn_signature["IS_GFX1250"] = "constexpr"
 
+    effective_wave_per_eu = 1 if is_gfx1250 and not Preshuffle else WavePerEU
     options = {
         "num_warps": 4,
-        "waves_per_eu": WavePerEU,
+        "waves_per_eu": effective_wave_per_eu,
         "num_stages": 2,
         "num_ctas": 1,
         "cluster_dims": [1, 1, 1],
         "arch": gfx_version,
         "backend_name": "hip",
-        "warp_size": 64,
+        "warp_size": warp_size,
         "name": (
             "_gluon_deepgemm_fp8_paged_mqa_logits"
             if not Preshuffle
@@ -336,6 +355,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             "KVBlockSize": KVBlockSize,
             "HiddenDim": HiddenDim,
             "CDNA_VERSION": cdna_version,
+            "IS_GFX1250": is_gfx1250,
         },
         attrs={
             (2,): [["tt.divisibility", 16]],  # heads_num
@@ -436,6 +456,9 @@ def deepgemm_fp8_paged_mqa_logits(
     num_block, block_Size, _, index_dim = kv_cache.size()
     _, max_block_len = kv_indices.size()
 
+    if get_gfx() == "gfx1250" and not Preshuffle:
+        WavePerEU = 1
+
     TileQCount = batch_size * next_n
     SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
 
@@ -453,6 +476,15 @@ def deepgemm_fp8_paged_mqa_logits(
     )
     kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
     kv_cache_scale = kv_cache_scale.view(torch.float32)
+
+    if VarCtxSchedule is not None and get_gfx() == "gfx1250":
+        import warnings
+
+        warnings.warn(
+            "VarCtx schedule is not implemented on gfx1250 yet; ignoring it and "
+            "falling back to the non-varctx preshuffle path."
+        )
+        VarCtxSchedule = None
 
     VarCtxOpt = VarCtxSchedule is not None
     if VarCtxOpt:

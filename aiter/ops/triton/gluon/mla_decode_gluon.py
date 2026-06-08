@@ -626,20 +626,26 @@ def _mla_decode_gluon(
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
     else:
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
+
+    ### store lse
+    blocked_lse: gl.constexpr = gl.BlockedLayout(size_per_thread=[1], threads_per_warp=[64], warps_per_cta=[4], order=[0])
+    cur_head_lse = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=blocked_lse)
     if RETURN_LSE and NUM_KV_SPLITS == 1:
         # split==1: single split is the whole sequence, so its lse is the final lse.
-        offs_final_lse = cur_batch * stride_final_lse_b + cur_head_o * stride_final_lse_h
+        offs_final_lse = cur_batch * stride_final_lse_b + cur_head_lse * stride_final_lse_h
         lse = e_max + gl.log(e_sum)
+        lse = gl.convert_layout(lse, blocked_lse)
         if NHEAD < BLOCK_H:
-            gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=(cur_head_o < NHEAD))
+            gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=(cur_head_lse < NHEAD))
         else:
             gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse)
     elif NUM_KV_SPLITS > 1:
         # per-split lse for stage-2 reduce.
-        offs_mid_lse = cur_batch * stride_mid_lse_b + cur_head_o * stride_mid_lse_h + split_kv_id * stride_mid_lse_s
+        offs_mid_lse = cur_batch * stride_mid_lse_b + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_s
         lse = e_max + gl.log(e_sum)
+        lse = gl.convert_layout(lse, blocked_lse)
         if NHEAD < BLOCK_H:
-            gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=(cur_head_o < NHEAD))
+            gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=(cur_head_lse < NHEAD))
         else:
             gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse)
 # fmt: on
@@ -799,22 +805,24 @@ def mla_decode_gluon(
         BLOCK_N = 128 if REGIME == "bh16bn128" else 64
         kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
         NUM_XCDS = 1  # unused by 2-D split grid mapping
-        # 2-D grid (batch, split); float-floor keeps total WGs = B * NUM_KV_SPLITS
-        # <= 256 (one MI350 wave). For batch_size=1 this is 256, matching the
-        # original single-batch layout.
-        NUM_KV_SPLITS = max(1, 256 // batch_size)
+        # 2-D grid (batch, split). Both bh16 regimes support num_iter in {1, 2, ...}
+        # (no gl.assume(num_iter >= 3) in the kernel); the only correctness need is
+        # that every split is non-empty (floor split size = min_kv_seq_len //
+        # NUM_KV_SPLITS >= 1). Each clamp below keeps NUM_KV_SPLITS <= min_kv_seq_len,
         if REGIME == "bh16bn128":
-            # fp8 path is not generalized to multi-batch.
             assert (
                 batch_size == 1
             ), f"mla_decode_gluon[bh16bn128] requires batch_size=1, got {batch_size}"
-        # The bh16 regimes support the general case num_iter in {1, 2, ...} (no
-        # gl.assume(num_iter >= 3) in the kernel), so the only requirement is that
-        # every split is non-empty: floor split size >= 1, i.e. min_kv_seq_len >=
-        # NUM_KV_SPLITS. Holds for both full-decode and return_lse modes.
-        assert (
-            min_kv_seq_len >= NUM_KV_SPLITS
-        ), f"mla_decode_gluon[{REGIME}] requires min_kv_seq_len >= NUM_KV_SPLITS (= max(1, 256//B) = {NUM_KV_SPLITS}), got {min_kv_seq_len}"
+            NUM_KV_SPLITS = max(1, min(256 // batch_size, min_kv_seq_len))
+        else:  # bh16bn64
+            # Fill ~256 WGs (total WGs = B * NUM_KV_SPLITS <= 256, one MI350 wave),
+            # but never split a sequence into more blocks than it has: bound by the
+            # shortest seq's block count so every split holds >= 1 block (no wasted
+            # partial-block MFMA). For min_kv_seq_len <= BLOCK_N this collapses to
+            # NUM_KV_SPLITS=1, i.e. one WG per batch computing the whole (short) seq.
+            NUM_KV_SPLITS = max(
+                1, min(256 // batch_size, triton.cdiv(min_kv_seq_len, BLOCK_N))
+            )
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
