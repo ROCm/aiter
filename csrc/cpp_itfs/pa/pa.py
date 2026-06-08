@@ -65,8 +65,10 @@ def validate_paged_attention_rocm_buffers(
 ):
     op_name = "paged_attention_rocm"
     max_num_partitions = math.ceil(max_context_len / partition_size)
-    max_context_len_val = int(context_lens.max().item())
-    min_blocks_per_seq = math.ceil(max_context_len_val / block_size)
+    # Use the launch-time upper bound rather than reading context_lens data.
+    # context_lens may live on GPU, and scalar extraction would force a sync
+    # and introduce tensor-data-dependent Python in torch.compile paths.
+    min_blocks_per_seq = math.ceil(max_context_len / block_size)
 
     def _check_partition_dim(name, tensor):
         if tensor.dim() < 3:
@@ -93,7 +95,7 @@ def validate_paged_attention_rocm_buffers(
     if block_tables.size(1) < min_blocks_per_seq:
         raise ValueError(
             f"{op_name}: block_tables.size(1)={block_tables.size(1)} is too small "
-            f"for max context_len={max_context_len_val} and block_size={block_size}; "
+            f"for max_context_len={max_context_len} and block_size={block_size}; "
             f"need at least {min_blocks_per_seq} block-table entries per sequence"
         )
     if context_lens.size(0) != block_tables.size(0):
