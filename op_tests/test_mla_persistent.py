@@ -430,6 +430,7 @@ def torch_mla_extend_split_kv(
 
     num_page, page_size, nhead_kv, _ = kvc_cache.shape
     total_q, nheads, _ = q.shape
+    bs = qo_indptr.shape[0] - 1
     dev = kvc_cache.device
     is_fp8_q = q.dtype == dtypes.fp8
     is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
