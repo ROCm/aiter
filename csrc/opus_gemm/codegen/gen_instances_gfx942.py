@@ -114,7 +114,7 @@ def splitk_reduce_extra_forward_decls():
         "template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_,\n"
         "         typename D_WS, typename D_OUT, bool HAS_BIAS_, typename D_BIAS_>\n"
         "__global__ void splitk_reduce_kernel_exact_n_rowblock(\n"
-        "    const D_WS* workspace, D_OUT* c_out,\n"
+        "    const opus_splitk_ws_handle* ws_handle, D_OUT* c_out,\n"
         "    int M, int N, int batch,\n"
         "    int padded_M, int padded_N,\n"
         "    const D_BIAS_* bias, int stride_bias_batch);\n"
@@ -128,10 +128,10 @@ def splitk_reduce_extra_device_instantiations():
             for ws_type in ("float", "__bf16"):
                 contents += (
                     f"template __global__ void splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, {ws_type}, __bf16, true,  __bf16>(\n"
-                    f"    const {ws_type}*, __bf16*, int, int, int, int, int,\n"
+                    "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int,\n"
                     "    const __bf16*, int);\n"
                     f"template __global__ void splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, {ws_type}, __bf16, false, __bf16>(\n"
-                    f"    const {ws_type}*, __bf16*, int, int, int, int, int,\n"
+                    "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int,\n"
                     "    const __bf16*, int);\n"
                 )
     return contents
@@ -222,7 +222,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
             dim3 block_rowblock({block_size});
             splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, {workspace_ptr_type}, __bf16, {{hb}}, __bf16>
                 <<<grid_rowblock, block_rowblock, 0, stream>>>(
-                    reinterpret_cast<const {workspace_ptr_type}*>(ptr_workspace_),
+                    ws_handle_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     M, N, batch, padded_M, padded_N,
                     {{bias_arg}});
@@ -243,7 +243,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         return (
             f"{indent}splitk_reduce_kernel_fallback<REDUCE_VEC, REDUCE_BS, {dtype}, {hb}, {dtype}, true>\n"
             f"{indent}    <<<grid_reduce, block_reduce, 0, stream>>>(\n"
-            f"{indent}        reinterpret_cast<const float*>(ptr_workspace_),\n"
+            f"{indent}        ws_handle_,\n"
             f"{indent}        reinterpret_cast<{dtype}*>(Y.data_ptr()),\n"
             f"{indent}        split_k, M, N, batch, padded_M, padded_N,"
             f"{bias_args}"
@@ -421,35 +421,38 @@ void
 {bf16ws_reduce_check}
 
     auto stream = aiter::getCurrentHIPStream();
-    size_t ws_bytes = (size_t)split_k * (size_t)batch
-                * (size_t)padded_M * (size_t)padded_N * sizeof(typename Traits::D_C);
-    static thread_local void*  ws_cached_ptr   = nullptr;
-    static thread_local size_t ws_cached_bytes = 0;
-    if (ws_cached_ptr == nullptr || ws_bytes > ws_cached_bytes)
-    {{
     hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
     HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
-    AITER_CHECK(capture_status == hipStreamCaptureStatusNone,
-        "{err_label} workspace cache miss inside HIP graph capture is not "
-        "supported. Run the launcher once eagerly with the same shape "
-        "before capturing the graph.");
+    const bool capturing = (capture_status != hipStreamCaptureStatusNone);
+    extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
+    auto* ws_handle_ = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
 
-    if (ws_cached_ptr != nullptr)
+    size_t ws_bytes = (size_t)split_k * (size_t)batch
+                * (size_t)padded_M * (size_t)padded_N * sizeof(typename Traits::D_C);
+    if (ws_handle_->ptr == nullptr || ws_bytes > ws_handle_->bytes)
+    {{
+    AITER_CHECK(!capturing,
+        "{err_label} workspace grow inside HIP graph capture is not "
+        "supported. Call aiter.opus_gemm_workspace_init() on the capture "
+        "stream and warm with the largest expected GEMM before capturing.");
+
+    if (ws_handle_->ptr != nullptr)
     {{
         HIP_CALL(hipDeviceSynchronize());
-        HIP_CALL(hipFree(ws_cached_ptr));
+        HIP_CALL(hipFree(ws_handle_->ptr));
     }}
     const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
     size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
-    HIP_CALL(hipMalloc(&ws_cached_ptr, grow_bytes));
-    ws_cached_bytes = grow_bytes;
+    void* new_ptr = nullptr;
+    HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
+    ws_handle_->ptr = new_ptr;
+    ws_handle_->bytes = grow_bytes;
     }}
-    void* ptr_workspace_ = ws_cached_ptr;
 
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a         = XQ.data_ptr();
     kargs.ptr_b         = WQ.data_ptr();
-    kargs.ptr_workspace = ptr_workspace_;
+    kargs.ws_handle     = ws_handle_;
     kargs.ptr_c         = Y.data_ptr();
     kargs.ptr_bias      = ptr_bias_;
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;

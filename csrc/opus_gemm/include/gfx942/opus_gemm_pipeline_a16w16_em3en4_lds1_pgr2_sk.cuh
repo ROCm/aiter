@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-// gfx942 EM3EN4 LDS1/PGR2 splitK pipeline (kid 50204).
+// gfx942 EM3EN4 LDS1/PGR2 splitK pipeline (kid 10204).
 // Device geometry is 96x128x128; host tile is 128M x 96N via A/B swap.
 #pragma once
 
@@ -617,7 +617,7 @@ void gemm_a16w16_em3en4_lds1_pgr2_sk_kernel(opus_gemm_splitk_kargs kargs) {
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_a)
                          + batch_id * kargs.stride_a_batch + row * kargs.stride_a + k_start,
                          ((kargs.m - row) * kargs.stride_a - k_start) * sizeof(D_B));
-    auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_workspace)
+    auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ws_handle->ptr)
                          + (size_t)split_id * kargs.batch * kargs.stride_ws_batch
                          + (size_t)batch_id * kargs.stride_ws_batch
                          + (size_t)row * kargs.stride_ws

@@ -477,12 +477,11 @@ a16w16_mono_tile_kernels_list_4g_safe = {
 
 
 # -- gfx942 kernel lists ------------------------------------------------ Kid offset: gfx942
-# kids live in the 50000+ range so the...
-GFX942_KID_OFFSET = 50000
+GFX942_KID_OFFSET = 10000
 
 
 def _a16w16_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
-    """Factory for gfx942 a16w16 kbuf1-large-tile kid instances (kid 50000,
+    """Factory for gfx942 a16w16 kbuf1-large-tile kid instances (kid 10000,
     MFMA 16x16x16). Same algorithm family as kbuf1 (4-phase, 2 barriers/iter)
     but with a larger tile + BS=512 + inline LDS-staged epilogue.
     """
@@ -536,7 +535,7 @@ def _a16w16_kbuf1_sk_bf16ws_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
 
 # gfx942 P1-family non-splitK factories (siblings of corresponding splitK kids).
 def _a16w16_p1_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
-    """Non-splitK P1 (K-dbuf depth=2 + V-dbuf), sibling of 50201."""
+    """Non-splitK P1 (K-dbuf depth=2 + V-dbuf), sibling of 10201."""
     vec = 16 // 2  # bf16
     return OpusGemmInstance(
         bs, bm, bn, bk, 2, tn, wm, wn, wk, vec, vec, 4, 0, 0, 0,
@@ -545,7 +544,7 @@ def _a16w16_p1_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
 
 
 def _a16w16_kbuf2v_bk128_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
-    """Non-splitK P1 + B_K=128 sub-K decomp, sibling of 50203."""
+    """Non-splitK P1 + B_K=128 sub-K decomp, sibling of 10203."""
     vec = 16 // 2
     return OpusGemmInstance(
         bs, bm, bn, bk, 2, tn, wm, wn, wk, vec, vec, 4, 0, 0, 0,
@@ -554,7 +553,7 @@ def _a16w16_kbuf2v_bk128_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
 
 
 def _a16w16_kbuf1_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
-    """Non-splitK 4-phase legacy (E_M=2 supported), sibling of 50202."""
+    """Non-splitK 4-phase legacy (E_M=2 supported), sibling of 10202."""
     vec = 16 // 2
     return OpusGemmInstance(
         bs, bm, bn, bk, 2, tn, wm, wn, wk, vec, vec, 4, 0, 0, 0,
@@ -601,27 +600,27 @@ def _a16w16_em3en4_lds1_pgr2_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
 # gfx942 kid registry -- flat two-bucket layout.
 
 gfx942_nosplit_kernels_list = {
-    50000: _a16w16_gfx942        (512, 128, 128,  64,    4, 16, 16, 16),   # kbuf1_large_tile (4-phase, big tile)
-    50001: _a16w16_p1_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),   # P1 depth=2 sibling of 50201
-    50002: _a16w16_kbuf1_gfx942 (256, 128,  64,  64,    2, 16, 16, 16),   # legacy 4-phase E_M=2 sibling of 50202
-    50003: _a16w16_kbuf2v_bk128_gfx942(256, 64,  64, 128,    2, 16, 16, 16),   # P1 B_K=128 sibling of 50203
-    50300: _a16w16_wave_k_coop_gfx942(512, 16, 16, 64,    1, 16, 16, 16),  # wave-K-coop 16x16, T_K=8
-    50301: _a16w16_wave_k_coop_gfx942(512, 16, 32, 32,    1, 16, 16, 16),  # WKC 16x32, B_K=32
-    50302: _a16w16_wave_k_coop_gfx942(512, 32, 16, 64,    1, 16, 16, 16),  # WKC 32x16, aliased partial
-    50303: _a16w16_wave_k_coop_gfx942(256, 32, 32, 64,    1, 16, 16, 16),  # WKC 32x32, T_K=4
+    10000: _a16w16_gfx942        (512, 128, 128,  64,    4, 16, 16, 16),   # kbuf1_large_tile (4-phase, big tile)
+    10001: _a16w16_p1_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),   # P1 depth=2 sibling of 10201
+    10002: _a16w16_kbuf1_gfx942 (256, 128,  64,  64,    2, 16, 16, 16),   # legacy 4-phase E_M=2 sibling of 10202
+    10003: _a16w16_kbuf2v_bk128_gfx942(256, 64,  64, 128,    2, 16, 16, 16),   # P1 B_K=128 sibling of 10203
+    10300: _a16w16_wave_k_coop_gfx942(512, 16, 16, 64,    1, 16, 16, 16),  # wave-K-coop 16x16, T_K=8
+    10301: _a16w16_wave_k_coop_gfx942(512, 16, 32, 32,    1, 16, 16, 16),  # WKC 16x32, B_K=32
+    10302: _a16w16_wave_k_coop_gfx942(512, 32, 16, 64,    1, 16, 16, 16),  # WKC 32x16, aliased partial
+    10303: _a16w16_wave_k_coop_gfx942(256, 32, 32, 64,    1, 16, 16, 16),  # WKC 32x32, T_K=4
 }
 
 gfx942_splitk_kernels_list = {
-    50200: _a16w16_kbuf1_sk_gfx942      (512, 128, 128,  64,    4, 16, 16, 16),                # legacy 4-phase large tile
-    50201: _a16w16_kbuf2v_sk_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),                # P1 depth=2 + V-dbuf
-    50202: _a16w16_kbuf1_sk_gfx942      (256, 128,  64,  64,    2, 16, 16, 16),                # legacy 4-phase mid tile
-    50203: _a16w16_kbuf2v_bk128_sk_gfx942(256, 64,  64, 128,    2, 16, 16, 16),                # P1 B_K=128 sub-K decomp
-    50204: _a16w16_em3en4_lds1_pgr2_sk_gfx942 (256, 128,  96, 128,    2, 16, 16, 16),                # EM3EN4 LDS1/PGR2 hipb-orientation (host 128M x 96N)
-    50205: _a16w16_kbuf1_sk_gfx942      (512,  64, 128,  64,    4, 16, 16, 16),                # legacy 4-phase M64 x N128
-    50210: _a16w16_kbuf1_sk_bf16ws_gfx942(512, 128, 128,  64,    4, 16, 16, 16),                # legacy 4-phase large tile + bf16 workspace
+    10200: _a16w16_kbuf1_sk_gfx942      (512, 128, 128,  64,    4, 16, 16, 16),                # legacy 4-phase large tile
+    10201: _a16w16_kbuf2v_sk_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),                # P1 depth=2 + V-dbuf
+    10202: _a16w16_kbuf1_sk_gfx942      (256, 128,  64,  64,    2, 16, 16, 16),                # legacy 4-phase mid tile
+    10203: _a16w16_kbuf2v_bk128_sk_gfx942(256, 64,  64, 128,    2, 16, 16, 16),                # P1 B_K=128 sub-K decomp
+    10204: _a16w16_em3en4_lds1_pgr2_sk_gfx942 (256, 128,  96, 128,    2, 16, 16, 16),                # EM3EN4 LDS1/PGR2 hipb-orientation (host 128M x 96N)
+    10205: _a16w16_kbuf1_sk_gfx942      (512,  64, 128,  64,    4, 16, 16, 16),                # legacy 4-phase M64 x N128
+    10210: _a16w16_kbuf1_sk_bf16ws_gfx942(512, 128, 128,  64,    4, 16, 16, 16),                # legacy 4-phase large tile + bf16 workspace
 }
 
-# NOTE: 50402 (a16w16_naive_64x64) was removed -- 32.85us never matched WKC's
+# NOTE: 10402 (a16w16_naive_64x64) was removed -- 32.85us never matched WKC's
 # 11.88us on tuned shapes (bf16_tuned_ge...
 
 gfx942_kernels_list = {**gfx942_nosplit_kernels_list, **gfx942_splitk_kernels_list}
@@ -679,7 +678,7 @@ NON_SPLITK_KIDS = (
     | frozenset(a16w16_persistent_kernels_list_nooob.keys())
     | frozenset(a16w16_persistent_kernels_list_cpol_nooob.keys())
     | frozenset(a16w16_mono_tile_kernels_list.keys())
-    | frozenset(gfx942_nosplit_kernels_list.keys())  # 50000/50001/50002/50003/50300
+    | frozenset(gfx942_nosplit_kernels_list.keys())  # 10000/10001/10002/10003/10300
 )
 
 # 4g_safe kid families. Per-WG-tight BR sizing -- selectable for any shape
@@ -735,25 +734,30 @@ HEURISTIC_DEFAULT_KIDS_GFX950 = frozenset(
 HEURISTIC_DEFAULT_KIDS_GFX942 = frozenset(
     {
         # gfx942 heuristic dispatcher fallbacks.
-        50000,  # gfx942 split-barrier    512x128x128x64 16x16x16 (large problem)
-        50001,  # gfx942 p1               256x64x64x64
-        50002,  # gfx942 legacy           256x128x64x64
-        50003,  # gfx942 p1_bk128         256x64x64x128
-        50200,  # gfx942 splitk          512x128x128x64 16x16x16 (N > 128)
-        50201,  # gfx942 splitk_p1        256x64x64x64  (depth=2 + workspace + reduce)
-        50202,  # gfx942 splitk          256x128x64x64  16x16x16 (64 < N <= 128)
-        50203,  # gfx942 splitk_p1_bk128  256x64x64x128 (B_K=128 Option B; dev/bench)
-        50204,  # gfx942 splitk_em3en4_lds1_pgr2 256x128x96x128 hipb-orientation
-        50205,  # gfx942 splitk_legacy    512x64x128x64 16x16x16
-        50210,  # gfx942 splitk_legacy_bf16ws 512x128x128x64
-        50300,  # gfx942 wave_k_coop     512x16x16x64 T_K=8
-        50301,  # gfx942 wave_k_coop     512x16x32x32 T_K=8
-        50302,  # gfx942 wave_k_coop     512x32x16x64 T_K=8
-        50303,  # gfx942 wave_k_coop     256x32x32x64 T_K=4
+        10000,  # gfx942 split-barrier    512x128x128x64 16x16x16 (large problem)
+        10001,  # gfx942 p1               256x64x64x64
+        10002,  # gfx942 legacy           256x128x64x64
+        10003,  # gfx942 p1_bk128         256x64x64x128
+        10200,  # gfx942 splitk          512x128x128x64 16x16x16 (N > 128)
+        10201,  # gfx942 splitk_p1        256x64x64x64  (depth=2 + workspace + reduce)
+        10202,  # gfx942 splitk          256x128x64x64  16x16x16 (64 < N <= 128)
+        10203,  # gfx942 splitk_p1_bk128  256x64x64x128 (B_K=128 Option B; dev/bench)
+        10204,  # gfx942 splitk_em3en4_lds1_pgr2 256x128x96x128 hipb-orientation
+        10205,  # gfx942 splitk_legacy    512x64x128x64 16x16x16
+        10210,  # gfx942 splitk_legacy_bf16ws 512x128x128x64
+        10300,  # gfx942 wave_k_coop     512x16x16x64 T_K=8
+        10301,  # gfx942 wave_k_coop     512x16x32x32 T_K=8
+        10302,  # gfx942 wave_k_coop     512x32x16x64 T_K=8
+        10303,  # gfx942 wave_k_coop     256x32x32x64 T_K=4
     }
 )
 
 HEURISTIC_DEFAULT_KIDS = HEURISTIC_DEFAULT_KIDS_GFX950 | HEURISTIC_DEFAULT_KIDS_GFX942
+
+HEURISTIC_DEFAULT_KIDS_BY_ARCH = {
+    "gfx950": HEURISTIC_DEFAULT_KIDS_GFX950,
+    "gfx942": HEURISTIC_DEFAULT_KIDS_GFX942,
+}
 
 
 def heuristic_kids_for_arch(arches):
@@ -768,10 +772,8 @@ def heuristic_kids_for_arch(arches):
         return HEURISTIC_DEFAULT_KIDS
     arches = {a.lower() for a in arches}
     out = frozenset()
-    if "gfx950" in arches:
-        out = out | HEURISTIC_DEFAULT_KIDS_GFX950
-    if "gfx942" in arches:
-        out = out | HEURISTIC_DEFAULT_KIDS_GFX942
+    for arch in arches:
+        out = out | HEURISTIC_DEFAULT_KIDS_BY_ARCH.get(arch, frozenset())
     return out
 
 

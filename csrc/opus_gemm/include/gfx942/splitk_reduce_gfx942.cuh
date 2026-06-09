@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Split-K reduce kernel (gfx942): tile-agnostic; sums an fp32 workspace across the split-K axis,
-// casts fp32 -> D_OUT, and writes ...
+// Split-K reduce kernels (gfx942): sum workspace partials across split-K and write C[B, M, N].
 #pragma once
 
 #include "../opus_gemm_utils.cuh"
+#include "opus_gemm_traits_a16w16.cuh"  // opus_splitk_ws_handle
 #include <cstdint>
 
 template<int VEC_ = 16, int BLOCK_ = 64, typename D_OUT = __bf16,
          bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT,
          bool HAS_OOB_ = true>
 __global__ void splitk_reduce_kernel_fallback(
-    const float* __restrict__ workspace,
+    const opus_splitk_ws_handle* __restrict__ ws_handle,
     D_OUT*       __restrict__ c_out,
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
@@ -45,6 +45,7 @@ __global__ void splitk_reduce_kernel_fallback(
 
     const int b = bm_id / M;
     const int m = bm_id - b * M;
+    const float* workspace = reinterpret_cast<const float*>(ws_handle->ptr);
 
     opus::vector_t<float, VEC> bias_fp32;
     if constexpr (HAS_BIAS) {
@@ -177,7 +178,7 @@ template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_ = 8,
          typename D_WS = float, typename D_OUT = __bf16,
          bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT>
 __global__ void splitk_reduce_kernel_exact_n_rowblock(
-    const D_WS*  __restrict__ workspace,
+    const opus_splitk_ws_handle* __restrict__ ws_handle,
     D_OUT*       __restrict__ c_out,
     int M, int N, int batch,
     int padded_M, int padded_N,
@@ -206,6 +207,7 @@ __global__ void splitk_reduce_kernel_exact_n_rowblock(
     const int n_vec   = tid - row_off * N_VEC;
     const int m       = bm_blk * ROWS_PER_BLOCK + row_off;
     const int n_base  = n_vec * VEC;
+    const D_WS* workspace = reinterpret_cast<const D_WS*>(ws_handle->ptr);
 
     opus::vector_t<float, VEC> bias_fp32;
     if constexpr (HAS_BIAS) {

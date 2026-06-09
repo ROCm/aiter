@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// gfx942 wave-K-cooperative pipeline (kid 50300).
+// gfx942 wave-K-cooperative pipeline (kid 10300).
 //
 // Target small-shape tiles: one WG owns a small (M, N) output tile; all waves
 // within the WG split across K (T_K=BLOCK_SIZE/64) and accumulate into

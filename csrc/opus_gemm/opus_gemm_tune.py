@@ -250,8 +250,8 @@ def kid_rejects_shape(k_inst, M, N, K):
         "a16w16_kbuf2v_bk128",
         "a16w16_kbuf1",
     ):
-        # Non-splitK a16w16 family all share the same (loops-2)%2==0 K-dbuf parity + mfma layout
-        # constraints as a16w16 (50000).
+        # Non-splitK a16w16 family all share the same K-dbuf parity +
+        # MFMA layout constraints as a16w16 (10000).
         if loops < 2 or (loops % 2 != 0):
             return True
         if N % 16 != 0:
@@ -351,9 +351,9 @@ def kid_rejects_bias(k_inst, bias):
       * gfx950 a16w16_flatmm_splitk (kid 200..299 + nooob mirror)
     Rejected:
       * persistent / flatmm-non-splitk (HAS_BIAS=false hardcoded in pipelines)
-      * gfx942 SB kid 50000 (HAS_BIAS path removed 2026-06-02; was dead code)
-      * gfx942 splitk family (kid 50200+): silently ignored bias
-      * gfx942 non-splitK siblings (50002/03/11): no bias path
+      * gfx942 SB kid 10000 (HAS_BIAS path removed 2026-06-02; was dead code)
+      * gfx942 splitk family (kid 10200+): silently ignored bias
+      * gfx942 non-splitK siblings (10002/03/11): no bias path
     """
     if not bias:
         return False
@@ -1191,7 +1191,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             type=str,
             default=None,
             help="Comma-separated kid id(s) to restrict the sweep to "
-            "(e.g. --kid 50201 or --kid 50200,50201). Kids must still pass "
+            "(e.g. --kid 10201 or --kid 10200,10201). Kids must still pass "
             "the host-side shape / bias / outdtype filters; rejected kids "
             "are dropped with a log line. Compile sidecar is auto-expanded "
             "to cover the requested kids if needed.",

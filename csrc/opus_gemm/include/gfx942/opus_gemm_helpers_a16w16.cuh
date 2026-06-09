@@ -215,7 +215,7 @@ inline __device__ auto make_layout_sb(int lane_id, int wave_id_m, int wave_id_n)
         opus::unfold_p_coord(sb_block_dim, opus::tuple{wave_id_m, wave_id_n, lane_id}));
 }
 
-// wave_id_n split divisor = T_M (kid 50000 a16w16_kbuf1_large_tile).
+// wave_id_n split divisor = T_M (kid 10000 a16w16_kbuf1_large_tile).
 template<typename T>
 inline __device__ auto make_layout_rb_wave_m_major(int lane_id, int wave_id_n) {
     constexpr int total_ds_b_reads = T::E_K * T::W_N * T::W_K / (opus::get_warp_size() * T::VEC_B);

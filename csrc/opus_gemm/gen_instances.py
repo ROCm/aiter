@@ -61,6 +61,45 @@ SPLITK_REDUCE_EXTRA_MAP = {
     "gfx942": get_arch_map("gfx942", "splitk_reduce_extra"),
 }
 
+SPLITK_REDUCE_ABI_MAP = {
+    "gfx950": {
+        "forward_decl_include": '#include "gfx950/opus_gemm_traits_a16w16_gfx950.cuh"\n',
+        "kernel": "splitk_reduce_kernel",
+        "ws_arg": "const opus_splitk_ws_handle* ws_handle",
+        "ws_type": "const opus_splitk_ws_handle*",
+        "baseline_has_oob": (True, False),
+    },
+    "gfx942": {
+        "forward_decl_include": '#include "gfx942/opus_gemm_traits_a16w16.cuh"\n',
+        "kernel": "splitk_reduce_kernel_fallback",
+        "ws_arg": "const opus_splitk_ws_handle* ws_handle",
+        "ws_type": "const opus_splitk_ws_handle*",
+        "baseline_has_oob": (True,),
+    },
+}
+
+SPLITK_REDUCE_ARCHES = tuple(SPLITK_REDUCE_ABI_MAP)
+LEGACY_OPUS_ARCH = "gfx950"
+
+
+def _splitk_reduce_baseline_instantiations(reduce_kernel, ws_ptr_type, has_oob):
+    has_oob_str = "true" if has_oob else "false"
+    return (
+        f"// HAS_OOB={has_oob_str} variants\n"
+        f"template __global__ void {reduce_kernel}<16, 64, __bf16, true,  __bf16, {has_oob_str}>(\n"
+        f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
+        f"    const __bf16*, int);\n"
+        f"template __global__ void {reduce_kernel}<16, 64, __bf16, false, __bf16, {has_oob_str}>(\n"
+        f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
+        f"    const __bf16*, int);\n"
+        f"template __global__ void {reduce_kernel}<16, 64, float,  true,  float,  {has_oob_str}>(\n"
+        f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
+        f"    const float*,  int);\n"
+        f"template __global__ void {reduce_kernel}<16, 64, float,  false, float,  {has_oob_str}>(\n"
+        f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
+        f"    const float*,  int);\n"
+    )
+
 
 def _pipeline_header_for(k):
     if getattr(k, "is_4g_safe", False):
@@ -587,8 +626,7 @@ void
         """Emit per-arch HOST translation units (one .cu per arch).
 
         Splitting by arch lets each TU's reduce-kernel forward decl match
-        its arch's launcher emit signature: gfx950 launchers pass
-        ws_handle* to splitk_reduce_kernel, gfx942 launchers pass float*.
+        its arch's launcher emit signature.
         In mixed-arch builds (GPU_ARCHS=gfx942;gfx950) a single host TU
         would force one signature for both arches -> no matching function
         for the other arch's launcher -> link / compile fail.
@@ -603,10 +641,10 @@ void
         # kid_name prefix `opus_gemm_<arch>_*`; legacy kid names without
         # explicit arch prefix default to gfx950 (matches kid_arch).
         def _kid_name_arch(kid_name):
-            for ap in ("gfx942", "gfx950"):
+            for ap in SPLITK_REDUCE_ARCHES:
                 if kid_name.startswith(f"opus_gemm_{ap}_"):
                     return ap
-            return "gfx950"
+            return LEGACY_OPUS_ARCH
 
         host_by_arch = {}
         for row in self._host_instantiations:
@@ -616,25 +654,17 @@ void
         for arch, rows in host_by_arch.items():
             impl_includes = sorted({row["kid_name"] for row in rows})
             host_body = "".join(row["host_decl"] for row in rows)
-            # gfx950 splitk launcher passes ws_handle*; gfx942 passes raw float*.
-            if arch == "gfx950":
-                _fwd_ws_decl = '#include "gfx950/opus_gemm_traits_a16w16_gfx950.cuh"\n'
-                _fwd_ws_arg = "const opus_splitk_ws_handle* ws_handle"
-                _reduce_kernel = "splitk_reduce_kernel"
-            else:
-                _fwd_ws_decl = ""
-                _fwd_ws_arg = "const float* workspace"
-                _reduce_kernel = "splitk_reduce_kernel_fallback"
+            reduce_abi = SPLITK_REDUCE_ABI_MAP[arch]
             extra_reduce = SPLITK_REDUCE_EXTRA_MAP.get(arch, {})
             extra_forward_decls = extra_reduce.get("forward_decls", lambda: "")()
             forward_decls = (
                 "// Forward declaration only. Specialisations live in per-arch device TUs.\n"
-                f"{_fwd_ws_decl}"
+                f"{reduce_abi['forward_decl_include']}"
                 "template<int VEC_, int BLOCK_, typename D_OUT,\n"
                 "         bool HAS_BIAS_, typename D_BIAS_,\n"
                 "         bool HAS_OOB_>\n"
-                f"__global__ void {_reduce_kernel}(\n"
-                f"    {_fwd_ws_arg}, D_OUT* c_out,\n"
+                f"__global__ void {reduce_abi['kernel']}(\n"
+                f"    {reduce_abi['ws_arg']}, D_OUT* c_out,\n"
                 "    int split_k, int M, int N, int batch,\n"
                 "    int padded_M, int padded_N,\n"
                 "    const D_BIAS_* bias, int stride_bias_batch);\n"
@@ -728,64 +758,33 @@ void
         present_archs = set()
         for row in self._device_instantiations:
             name = row["kid_name"]
-            for arch_prefix in ("gfx942", "gfx950"):
+            for arch_prefix in SPLITK_REDUCE_ARCHES:
                 if f"opus_gemm_{arch_prefix}_splitk_" in name:
                     present_archs.add(arch_prefix)
                     break
             else:
                 if "splitk" in name:
-                    present_archs.add("gfx950")
+                    present_archs.add(LEGACY_OPUS_ARCH)
 
-        # Emit one reduce device TU per arch (each arch's reduce kernel
-        # ABI is different: gfx942 = float*, gfx950 = ws_handle*).
+        # Emit one reduce device TU per arch.
         for reduce_arch in sorted(present_archs):
             reduce_header = f"{reduce_arch}/splitk_reduce_{reduce_arch}.cuh"
-            ws_ptr_type = (
-                "const opus_splitk_ws_handle*"
-                if reduce_arch == "gfx950"
-                else "const float*"
-            )
-            reduce_kernel = (
-                "splitk_reduce_kernel"
-                if reduce_arch == "gfx950"
-                else "splitk_reduce_kernel_fallback"
-            )
+            reduce_abi = SPLITK_REDUCE_ABI_MAP[reduce_arch]
+            ws_ptr_type = reduce_abi["ws_type"]
+            reduce_kernel = reduce_abi["kernel"]
             contents = (
                 "// SPDX-License-Identifier: MIT\n"
                 "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
                 "//\n"
                 f"// Auto-generated per-arch reduce TU ({reduce_arch}). See gen_instances.py:_emit_splitk_reduce_tu.\n"
                 f'#include "{reduce_header}"\n'
-                "// HAS_OOB=true variants\n"
-                f"template __global__ void {reduce_kernel}<16, 64, __bf16, true,  __bf16, true>(\n"
-                f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-                f"    const __bf16*, int);\n"
-                f"template __global__ void {reduce_kernel}<16, 64, __bf16, false, __bf16, true>(\n"
-                f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-                f"    const __bf16*, int);\n"
-                f"template __global__ void {reduce_kernel}<16, 64, float,  true,  float,  true>(\n"
-                f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-                f"    const float*,  int);\n"
-                f"template __global__ void {reduce_kernel}<16, 64, float,  false, float,  true>(\n"
-                f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-                f"    const float*,  int);\n"
-            )
-            if reduce_arch == "gfx950":
-                contents += (
-                    "// HAS_OOB=false variants\n"
-                    f"template __global__ void {reduce_kernel}<16, 64, __bf16, true,  __bf16, false>(\n"
-                    f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-                    f"    const __bf16*, int);\n"
-                    f"template __global__ void {reduce_kernel}<16, 64, __bf16, false, __bf16, false>(\n"
-                    f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-                    f"    const __bf16*, int);\n"
-                    f"template __global__ void {reduce_kernel}<16, 64, float,  true,  float,  false>(\n"
-                    f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-                    f"    const float*,  int);\n"
-                    f"template __global__ void {reduce_kernel}<16, 64, float,  false, float,  false>(\n"
-                    f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-                    f"    const float*,  int);\n"
+                + "".join(
+                    _splitk_reduce_baseline_instantiations(
+                        reduce_kernel, ws_ptr_type, has_oob
+                    )
+                    for has_oob in reduce_abi["baseline_has_oob"]
                 )
+            )
             extra_reduce = SPLITK_REDUCE_EXTRA_MAP.get(reduce_arch, {})
             contents += extra_reduce.get("device_instantiations", lambda: "")()
             Path(
@@ -816,8 +815,7 @@ void
         # Only emit the standalone reduce TU if the build actually has a splitk kid (otherwise the fused
         # host TU will never reference any...
         needs_reduce_tu = any(
-            ("flatmm_splitk" in row["kid_name"])
-            or ("_splitk_" in row["kid_name"])
+            ("flatmm_splitk" in row["kid_name"]) or ("_splitk_" in row["kid_name"])
             for row in self._device_instantiations
         )
         if needs_reduce_tu:
@@ -955,7 +953,7 @@ if __name__ == "__main__":
         "a16w16_flatmm": a16w16_flatmm_kernels_list,
         "a16w16_flatmm_splitk": a16w16_flatmm_splitk_kernels_list,
         "a16w16_mono_tile": a16w16_mono_tile_kernels_list,
-        # gfx942 kid range (50000+); two-bucket registry: nosplit + splitk.
+        # gfx942 kid range (10000+); two-bucket registry: nosplit + splitk.
         "gfx942_nosplit": gfx942_nosplit_kernels_list,
         "gfx942_splitk": gfx942_splitk_kernels_list,
     }

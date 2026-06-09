@@ -101,11 +101,19 @@ struct opus_gemm_noscale_kargs {
 
 #ifndef OPUS_GEMM_SPLITK_KARGS_GFX942_DEFINED
 #define OPUS_GEMM_SPLITK_KARGS_GFX942_DEFINED
+#ifndef OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
+#define OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
+struct opus_splitk_ws_handle {
+    void*         ptr;
+    unsigned long bytes;
+};
+#endif
+
 // Shared kargs for splitK pipelines (splitk / splitk_p1 / splitk_legacy / splitk_p1_bk128).
 struct opus_gemm_splitk_kargs {
     const void* __restrict__ ptr_a;         // bf16 [B, M, K]
     const void* __restrict__ ptr_b;         // bf16 [B, N, K] (pre-transposed)
-    void*       __restrict__ ptr_workspace; // splitK workspace [split_k, B, padded_M, padded_N]
+    const opus_splitk_ws_handle* __restrict__ ws_handle; // deref at kernel entry
     void*       __restrict__ ptr_c;         // bf16 [B, M, N] final output (reduce kernel writes)
     const void* __restrict__ ptr_bias;      // unused (reserved)
     int m;

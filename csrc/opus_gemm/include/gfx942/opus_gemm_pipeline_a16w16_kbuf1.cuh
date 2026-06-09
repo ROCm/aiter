@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// BF16 a16w16 4-phase legacy (gfx942). Unified <Traits,Kargs> emits 50002
+// BF16 a16w16 4-phase legacy (gfx942). Unified <Traits,Kargs> emits 10002
 // (noscale_kargs, direct C) and splitK kids (splitk_kargs, workspace + reduce).
 #pragma once
 
@@ -71,7 +71,7 @@ void gemm_a16w16_kbuf1_kernel(Kargs kargs) {
 
     auto g_c = [&]() {
         if constexpr (IS_SPLITK) {
-            return make_gmem(reinterpret_cast<D_C*>(kargs.ptr_workspace)
+            return make_gmem(reinterpret_cast<D_C*>(kargs.ws_handle->ptr)
                              + (size_t)split_id  * kargs.batch * kargs.stride_ws_batch
                              + (size_t)batch_id  * kargs.stride_ws_batch
                              + (size_t)row       * kargs.stride_ws
