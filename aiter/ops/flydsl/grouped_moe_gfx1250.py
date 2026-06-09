@@ -439,8 +439,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     ):
         if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
             raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
-    # Default to a static CSV/bucketed max_m. Exact per-call max_m requires a
-    # device->host sync (`counts.max().item()`), so keep it behind an opt-in
+    # Default max_m comes directly from token_num. Exact per-call max_m requires
+    # a device->host sync (`counts.max().item()`), so keep it behind an opt-in
     # switch for benchmarking/tuning.
     counts = None
     use_actual_max_m = (not _capturing) and os.environ.get(
@@ -453,9 +453,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         # Static upper bound: each token routes at most one row per expert, so no
         # expert can receive more than token_num rows. CUDAGraph buckets have
         # static token_num/topk; per-expert count <= token_num*topk.
-        raw_max_m = token_num * topk if _capturing else token_num
-    if (not use_actual_max_m) and cfg_row is not None:
-        raw_max_m = _as_int(cfg_row.get("max_m"), raw_max_m)
+        raw_max_m = token_num
     max_m = max(
         warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
     )

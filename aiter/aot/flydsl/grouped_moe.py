@@ -45,7 +45,7 @@ def parse_csv(csv_path: str):
                 "model_dim": int(row["model_dim"]),
                 "inter_dim": int(row["inter_dim"]),
                 "experts": int(row["expert"]),
-                "max_m": int(row["max_m"]),
+                "max_m": int(row["token"]),
                 "tile_m": int(row.get("tile_m") or 64),
                 "tile_n": n_warp * _WARP_TILE_N,
                 "tile_k": _TILE_K,
