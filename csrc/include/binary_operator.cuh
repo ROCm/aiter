@@ -16,12 +16,9 @@
  */
 #pragma once
 #include "aiter_hip_common.h"
-#include "dispatch_utils.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/all.h>
-#include <torch/extension.h>
-#include <torch/torch.h>
+#include "aiter_tensor.h"
+#include "aiter_dispatch.h"
+#include "aiter_stream.h"
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -31,20 +28,12 @@ namespace aiter {
 template <typename T, typename Operation>
 inline __device__ T performOperation(T a, T b);
 
-template <typename Operation>
-torch::Tensor aten_compute(torch::Tensor& input, torch::Tensor& other);
-
 struct AddOp
 {
     template <typename T>
     inline __device__ static T apply(T a, T b)
     {
         return a + b;
-    }
-
-    static torch::Tensor compute(torch::Tensor& input, torch::Tensor& other)
-    {
-        return torch::add(input, other);
     }
 };
 
@@ -55,11 +44,6 @@ struct SubOp
     {
         return a - b;
     }
-
-    static torch::Tensor compute(torch::Tensor& input, torch::Tensor& other)
-    {
-        return torch::sub(input, other);
-    }
 };
 
 struct MulOp
@@ -69,11 +53,6 @@ struct MulOp
     {
         return a * b;
     }
-
-    static torch::Tensor compute(torch::Tensor& input, torch::Tensor& other)
-    {
-        return torch::mul(input, other);
-    }
 };
 
 struct DivOp
@@ -81,13 +60,7 @@ struct DivOp
     template <typename T>
     inline __device__ static T apply(T a, T b)
     {
-        // assert(b == static_cast<T>(0));
         return a / b;
-    }
-
-    static torch::Tensor compute(torch::Tensor& input, torch::Tensor& other)
-    {
-        return torch::div(input, other);
     }
 };
 
@@ -123,30 +96,6 @@ inline __device__ T performOperation(T a, T b)
         {
             return Operation::apply(a, b);
         }
-    }
-    else
-    {
-        static_assert(false, "Unsupported operation");
-    }
-}
-template <typename Operation>
-torch::Tensor aten_compute(torch::Tensor& input, torch::Tensor& other)
-{
-    if constexpr(std::is_same_v<Operation, AddOp>)
-    {
-        return Operation::compute(input, other);
-    }
-    else if constexpr(std::is_same_v<Operation, SubOp>)
-    {
-        return Operation::compute(input, other);
-    }
-    else if constexpr(std::is_same_v<Operation, MulOp>)
-    {
-        return Operation::compute(input, other);
-    }
-    else if constexpr(std::is_same_v<Operation, DivOp>)
-    {
-        return Operation::compute(input, other);
     }
     else
     {
@@ -1389,11 +1338,11 @@ __global__ void operator_contiguous_big_tile_kernel(const void* __restrict a,
 }
 } // namespace aiter
 
-__inline__ std::vector<int64_t> broadcastShapes(const torch::Tensor& tensor1,
-                                                const torch::Tensor& tensor2)
+__inline__ std::vector<int64_t> broadcastShapes(const aiter_tensor_t& tensor1,
+                                                const aiter_tensor_t& tensor2)
 {
-    auto shape1 = tensor1.sizes().vec();
-    auto shape2 = tensor2.sizes().vec();
+    std::vector<int64_t> shape1(tensor1.shape, tensor1.shape + tensor1.ndim);
+    std::vector<int64_t> shape2(tensor2.shape, tensor2.shape + tensor2.ndim);
 
     int64_t max_dim = std::max(shape1.size(), shape2.size());
     shape1.insert(shape1.begin(), max_dim - shape1.size(), 1);
@@ -1431,10 +1380,10 @@ template <typename Operation, class _T0, class _T1>
 struct BinaryOperationPattern<1, Operation, _T0, _T1>
 {
     static void
-    apply(torch::Tensor& input, torch::Tensor& other, torch::Tensor& output, bool order_flag)
+    apply(aiter_tensor_t& input, aiter_tensor_t& other, aiter_tensor_t& output, bool order_flag)
     {
         int dim     = input.dim();
-        auto shape  = output.sizes().vec();
+        auto shape  = std::vector<int64_t>(output.shape, output.shape + output.ndim);
         void* buf_a = reinterpret_cast<void*>(input.data_ptr());
         void* buf_b = reinterpret_cast<void*>(other.data_ptr());
         void* buf_c = reinterpret_cast<void*>(output.data_ptr());
@@ -1455,12 +1404,12 @@ struct BinaryOperationPattern<1, Operation, _T0, _T1>
                            ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
         const dim3 grid_dim(grid_x, 1, 1);
         const dim3 block_dim(256, 1, 1);
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        const hipStream_t stream = aiter::getCurrentHIPStream();
         bool types_match         = typeid(_T0) == typeid(_T1);
 
         if(order_flag)
         {
-            VLLM_DISPATCH_FLOATING_TYPES(output.scalar_type(), "operator_tn_big_tile_kernel", [&] {
+            VLLM_DISPATCH_FLOATING_TYPES_rmTorch(output.dtype(), "operator_tn_big_tile_kernel", [&] {
                 aiter::operator_tn_big_tile_kernel<scalar_t,
                                                    256,
                                                    BIG_TILE_SIZE_N,
@@ -1475,7 +1424,7 @@ struct BinaryOperationPattern<1, Operation, _T0, _T1>
         }
         else
         {
-            VLLM_DISPATCH_FLOATING_TYPES(output.scalar_type(), "operator_tn_big_tile_kernel", [&] {
+            VLLM_DISPATCH_FLOATING_TYPES_rmTorch(output.dtype(), "operator_tn_big_tile_kernel", [&] {
                 aiter::operator_tn_big_tile_kernel<scalar_t,
                                                    256,
                                                    BIG_TILE_SIZE_N,
@@ -1496,10 +1445,10 @@ template <typename Operation, class _T0, class _T1>
 struct BinaryOperationPattern<2, Operation, _T0, _T1>
 {
     static void
-    apply(torch::Tensor& input, torch::Tensor& other, torch::Tensor& output, bool order_flag)
+    apply(aiter_tensor_t& input, aiter_tensor_t& other, aiter_tensor_t& output, bool order_flag)
     {
         int dim    = input.dim();
-        auto shape = output.sizes().vec();
+        auto shape = std::vector<int64_t>(output.shape, output.shape + output.ndim);
 
         void* buf_a      = reinterpret_cast<void*>(input.data_ptr());
         void* buf_b      = reinterpret_cast<void*>(other.data_ptr());
@@ -1514,7 +1463,7 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
             N = shape[0] * shape[1] * shape[2];
             K = shape[3];
         }
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        const hipStream_t stream = aiter::getCurrentHIPStream();
         bool types_match         = typeid(_T0) == typeid(_T1);
 
         const uint32_t rows = 8;
@@ -1546,8 +1495,8 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
             const dim3 grid_dim(grid_x, 1, 1);
             if(order_flag)
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcastK_unroll_vectorize_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcastK_unroll_vectorize_naive", [&] {
                         aiter::operator_bcastK_unroll_vectorize_naive<scalar_t,
                                                                       rows,
                                                                       Operation,
@@ -1560,8 +1509,8 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
             }
             else
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcastK_unroll_vectorize_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcastK_unroll_vectorize_naive", [&] {
                         aiter::operator_bcastK_unroll_vectorize_naive<scalar_t,
                                                                       rows,
                                                                       Operation,
@@ -1587,8 +1536,8 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
             const dim3 grid_dim(grid_x, 1, 1);
             if(order_flag)
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcast_scalar_unroll_vectorize_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcast_scalar_unroll_vectorize_naive", [&] {
                         aiter::operator_bcast_scalar_unroll_vectorize_naive<scalar_t,
                                                                             rows,
                                                                             Operation,
@@ -1600,8 +1549,8 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
             }
             else
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcast_scalar_unroll_vectorize_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcast_scalar_unroll_vectorize_naive", [&] {
                         aiter::operator_bcast_scalar_unroll_vectorize_naive<scalar_t,
                                                                             rows,
                                                                             Operation,
@@ -1621,8 +1570,8 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
 
             if(order_flag)
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcast_tile_kernel", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcast_tile_kernel", [&] {
                         aiter::operator_bcast_tile_kernel<scalar_t, rows, Operation, true, _T0, _T1>
                             <<<grid_dim, block_dim, 0, stream>>>(
                                 buf_a, buf_b, buf_c, M, N, K, types_match);
@@ -1630,8 +1579,8 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
             }
             else
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcast_tile_kernel", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcast_tile_kernel", [&] {
                         aiter::
                             operator_bcast_tile_kernel<scalar_t, rows, Operation, false, _T1, _T0>
                             <<<grid_dim, block_dim, 0, stream>>>(
@@ -1651,8 +1600,8 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
 
             if(order_flag)
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcast_big_tile_kernel", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcast_big_tile_kernel", [&] {
                         aiter::operator_bcast_big_tile_kernel<scalar_t,
                                                               256,
                                                               BIG_TILE_SIZE_N,
@@ -1668,8 +1617,8 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
             }
             else
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcast_big_tile_kernel", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcast_big_tile_kernel", [&] {
                         aiter::operator_bcast_big_tile_kernel<scalar_t,
                                                               256,
                                                               BIG_TILE_SIZE_N,
@@ -1692,10 +1641,10 @@ template <typename Operation, class _T0, class _T1>
 struct BinaryOperationPattern<3, Operation, _T0, _T1>
 {
     static void
-    apply(torch::Tensor& input, torch::Tensor& other, torch::Tensor& output, bool order_flag)
+    apply(aiter_tensor_t& input, aiter_tensor_t& other, aiter_tensor_t& output, bool order_flag)
     {
         int dim     = input.dim();
-        auto shape  = output.sizes().vec();
+        auto shape  = std::vector<int64_t>(output.shape, output.shape + output.ndim);
         void* buf_a = reinterpret_cast<void*>(input.data_ptr());
         void* buf_b = reinterpret_cast<void*>(other.data_ptr());
         void* buf_c = reinterpret_cast<void*>(output.data_ptr());
@@ -1721,7 +1670,7 @@ struct BinaryOperationPattern<3, Operation, _T0, _T1>
                      ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
         const dim3 grid_dim(grid_x, 1, 1);
         const dim3 block_dim(256, 1, 1);
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        const hipStream_t stream = aiter::getCurrentHIPStream();
         bool types_match         = typeid(_T0) == typeid(_T1);
         constexpr int rows       = 8;
         int vec_size             = 16 / output.element_size();
@@ -1744,8 +1693,8 @@ struct BinaryOperationPattern<3, Operation, _T0, _T1>
             const dim3 block_dim(256, 1, 1);
             if(order_flag)
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcastM1K_unroll_kernel", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcastM1K_unroll_kernel", [&] {
                         aiter::operator_bcastM1K_unroll_kernel<scalar_t,
                                                                rows,
                                                                Operation,
@@ -1758,8 +1707,8 @@ struct BinaryOperationPattern<3, Operation, _T0, _T1>
             }
             else
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcastM1K_unroll_kernel", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcastM1K_unroll_kernel", [&] {
                         aiter::operator_bcastM1K_unroll_kernel<scalar_t,
                                                                rows,
                                                                Operation,
@@ -1775,8 +1724,8 @@ struct BinaryOperationPattern<3, Operation, _T0, _T1>
         {
             if(order_flag)
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcast1_big_tile_kernel", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcast1_big_tile_kernel", [&] {
                         aiter::operator_bcast1_big_tile_kernel<scalar_t,
                                                                256,
                                                                BIG_TILE_SIZE_N,
@@ -1792,8 +1741,8 @@ struct BinaryOperationPattern<3, Operation, _T0, _T1>
             }
             else
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcast1_big_tile_kernel", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcast1_big_tile_kernel", [&] {
                         aiter::operator_bcast1_big_tile_kernel<scalar_t,
                                                                256,
                                                                BIG_TILE_SIZE_N,
@@ -1816,10 +1765,10 @@ template <typename Operation, class _T0, class _T1>
 struct BinaryOperationPattern<5, Operation, _T0, _T1>
 {
     static void
-    apply(torch::Tensor& input, torch::Tensor& other, torch::Tensor& output, bool order_flag)
+    apply(aiter_tensor_t& input, aiter_tensor_t& other, aiter_tensor_t& output, bool order_flag)
     {
         int dim     = input.dim();
-        auto shape  = output.sizes().vec();
+        auto shape  = std::vector<int64_t>(output.shape, output.shape + output.ndim);
         void* buf_a = reinterpret_cast<void*>(input.data_ptr());
         void* buf_b = reinterpret_cast<void*>(other.data_ptr());
         void* buf_c = reinterpret_cast<void*>(output.data_ptr());
@@ -1830,7 +1779,7 @@ struct BinaryOperationPattern<5, Operation, _T0, _T1>
         int num_elements         = output.numel();
         int vec_size             = 16 / output.element_size();
         constexpr uint32_t row   = 8;
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        const hipStream_t stream = aiter::getCurrentHIPStream();
         bool types_match         = typeid(_T0) == typeid(_T1);
 
         // optimize kernel
@@ -1856,8 +1805,8 @@ struct BinaryOperationPattern<5, Operation, _T0, _T1>
             const dim3 block_dim(wg, 1, 1);
             if(order_flag)
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcastMN1_unroll_vec_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcastMN1_unroll_vec_naive", [&] {
                         aiter::operator_bcastMN1_unroll_vec_naive<scalar_t,
                                                                   row,
                                                                   Operation,
@@ -1870,8 +1819,8 @@ struct BinaryOperationPattern<5, Operation, _T0, _T1>
             }
             else
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcastMN1_unroll_vec_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcastMN1_unroll_vec_naive", [&] {
                         aiter::operator_bcastMN1_unroll_vec_naive<scalar_t,
                                                                   row,
                                                                   Operation,
@@ -1890,7 +1839,7 @@ struct BinaryOperationPattern<5, Operation, _T0, _T1>
             const dim3 grid_dim((num_elements + 256 - 1) / 256, 1, 1);
             if(order_flag)
             {
-                VLLM_DISPATCH_FLOATING_TYPES(output.scalar_type(), "operator_bcastMN1_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(output.dtype(), "operator_bcastMN1_naive", [&] {
                     aiter::operator_bcastMN1_naive<scalar_t, row, Operation, true, _T0, _T1>
                         <<<grid_dim, block_dim, 0, stream>>>(
                             buf_a, buf_b, buf_c, forward_dim, bcast_dim, types_match);
@@ -1898,7 +1847,7 @@ struct BinaryOperationPattern<5, Operation, _T0, _T1>
             }
             else
             {
-                VLLM_DISPATCH_FLOATING_TYPES(output.scalar_type(), "operator_bcastMN1_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(output.dtype(), "operator_bcastMN1_naive", [&] {
                     aiter::operator_bcastMN1_naive<scalar_t, row, Operation, false, _T0, _T1>
                         <<<grid_dim, block_dim, 0, stream>>>(
                             buf_b, buf_a, buf_c, forward_dim, bcast_dim, types_match);
@@ -1913,10 +1862,10 @@ template <typename Operation, class _T0, class _T1>
 struct BinaryOperationPattern<6, Operation, _T0, _T1>
 {
     static void
-    apply(torch::Tensor& input, torch::Tensor& other, torch::Tensor& output, bool order_flag)
+    apply(aiter_tensor_t& input, aiter_tensor_t& other, aiter_tensor_t& output, bool order_flag)
     {
         int dim     = output.dim();
-        auto shape  = output.sizes().vec();
+        auto shape  = std::vector<int64_t>(output.shape, output.shape + output.ndim);
         void* buf_a = reinterpret_cast<void*>(input.data_ptr());
         void* buf_b = reinterpret_cast<void*>(other.data_ptr());
         void* buf_c = reinterpret_cast<void*>(output.data_ptr());
@@ -1928,7 +1877,7 @@ struct BinaryOperationPattern<6, Operation, _T0, _T1>
         int num_elements         = output.numel();
         int vec_size             = 16 / output.element_size();
         constexpr uint32_t row   = 8;
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        const hipStream_t stream = aiter::getCurrentHIPStream();
         bool types_match         = typeid(_T0) == typeid(_T1);
 
         // optimize kernel
@@ -1953,8 +1902,8 @@ struct BinaryOperationPattern<6, Operation, _T0, _T1>
             const dim3 block_dim(wg, 1, 1);
             if(order_flag)
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcast1N1_unroll_vec_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcast1N1_unroll_vec_naive", [&] {
                         aiter::operator_bcast1N1_unroll_vec_naive<scalar_t,
                                                                   row,
                                                                   Operation,
@@ -1967,8 +1916,8 @@ struct BinaryOperationPattern<6, Operation, _T0, _T1>
             }
             else
             {
-                VLLM_DISPATCH_FLOATING_TYPES(
-                    output.scalar_type(), "operator_bcast1N1_unroll_vec_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                    output.dtype(), "operator_bcast1N1_unroll_vec_naive", [&] {
                         aiter::operator_bcast1N1_unroll_vec_naive<scalar_t,
                                                                   row,
                                                                   Operation,
@@ -1987,7 +1936,7 @@ struct BinaryOperationPattern<6, Operation, _T0, _T1>
             const dim3 grid_dim((num_elements + 256 - 1) / 256, 1, 1);
             if(order_flag)
             {
-                VLLM_DISPATCH_FLOATING_TYPES(output.scalar_type(), "operator_bcast1N1_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(output.dtype(), "operator_bcast1N1_naive", [&] {
                     aiter::operator_bcast1N1_naive<scalar_t, row, Operation, true, _T0, _T1>
                         <<<grid_dim, block_dim, 0, stream>>>(
                             buf_a, buf_b, buf_c, m, n, k, types_match);
@@ -1995,7 +1944,7 @@ struct BinaryOperationPattern<6, Operation, _T0, _T1>
             }
             else
             {
-                VLLM_DISPATCH_FLOATING_TYPES(output.scalar_type(), "operator_bcast1N1_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(output.dtype(), "operator_bcast1N1_naive", [&] {
                     aiter::operator_bcast1N1_naive<scalar_t, row, Operation, false, _T0, _T1>
                         <<<grid_dim, block_dim, 0, stream>>>(
                             buf_b, buf_a, buf_c, m, n, k, types_match);
@@ -2011,10 +1960,10 @@ template <typename Operation, class _T0, class _T1>
 struct BinaryOperationPattern<7, Operation, _T0, _T1>
 {
     static void
-    apply(torch::Tensor& input, torch::Tensor& other, torch::Tensor& output, bool order_flag)
+    apply(aiter_tensor_t& input, aiter_tensor_t& other, aiter_tensor_t& output, bool order_flag)
     {
         int dim     = output.dim();
-        auto shape  = output.sizes().vec();
+        auto shape  = std::vector<int64_t>(output.shape, output.shape + output.ndim);
         void* buf_a = reinterpret_cast<void*>(input.data_ptr());
         void* buf_b = reinterpret_cast<void*>(other.data_ptr());
         void* buf_c = reinterpret_cast<void*>(output.data_ptr());
@@ -2026,7 +1975,7 @@ struct BinaryOperationPattern<7, Operation, _T0, _T1>
         int num_elements         = output.numel();
         int vec_size             = 16 / output.element_size();
         constexpr uint32_t row   = 8;
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        const hipStream_t stream = aiter::getCurrentHIPStream();
         bool types_match         = typeid(_T0) == typeid(_T1);
 
         // optimize kernel
@@ -2096,8 +2045,8 @@ struct BinaryOperationPattern<7, Operation, _T0, _T1>
     case case_row: {                                                                   \
         if(!need_pad)                                                                  \
         {                                                                              \
-            VLLM_DISPATCH_FLOATING_TYPES(                                              \
-                output.scalar_type(), "operator_bcastN11_unroll_vec_naive", [&] {      \
+            VLLM_DISPATCH_FLOATING_TYPES_rmTorch(                                              \
+                output.dtype(), "operator_bcastN11_unroll_vec_naive", [&] {      \
                     aiter::operator_bcastN11_unroll_vec_naive<scalar_t,                \
                                                               case_row,                \
                                                               Operation,               \
@@ -2110,8 +2059,8 @@ struct BinaryOperationPattern<7, Operation, _T0, _T1>
         }                                                                              \
         else                                                                           \
         {                                                                              \
-            VLLM_DISPATCH_FLOATING_TYPES(                                              \
-                output.scalar_type(), "operator_bcastN11_unroll_vec_pad", [&] {        \
+            VLLM_DISPATCH_FLOATING_TYPES_rmTorch(                                              \
+                output.dtype(), "operator_bcastN11_unroll_vec_pad", [&] {        \
                     aiter::operator_bcastN11_unroll_vec_pad<scalar_t,                  \
                                                             case_row,                  \
                                                             Operation,                 \
@@ -2162,7 +2111,7 @@ struct BinaryOperationPattern<7, Operation, _T0, _T1>
             const dim3 grid_dim((num_elements + 256 - 1) / 256, 1, 1);
             if(order_flag)
             {
-                VLLM_DISPATCH_FLOATING_TYPES(output.scalar_type(), "operator_bcastN11_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(output.dtype(), "operator_bcastN11_naive", [&] {
                     aiter::operator_bcastN11_naive<scalar_t, row, Operation, true, _T0, _T1>
                         <<<grid_dim, block_dim, 0, stream>>>(
                             buf_a, buf_b, buf_c, m, n, k, types_match);
@@ -2170,7 +2119,7 @@ struct BinaryOperationPattern<7, Operation, _T0, _T1>
             }
             else
             {
-                VLLM_DISPATCH_FLOATING_TYPES(output.scalar_type(), "operator_bcastN11_naive", [&] {
+                VLLM_DISPATCH_FLOATING_TYPES_rmTorch(output.dtype(), "operator_bcastN11_naive", [&] {
                     aiter::operator_bcastN11_naive<scalar_t, row, Operation, false, _T0, _T1>
                         <<<grid_dim, block_dim, 0, stream>>>(
                             buf_b, buf_a, buf_c, m, n, k, types_match);
@@ -2185,10 +2134,10 @@ template <typename Operation, class _T0, class _T1>
 struct BinaryOperationPattern<4, Operation, _T0, _T1>
 {
     static void
-    apply(torch::Tensor& input, torch::Tensor& other, torch::Tensor& output, bool order_flag)
+    apply(aiter_tensor_t& input, aiter_tensor_t& other, aiter_tensor_t& output, bool order_flag)
     {
         int dim    = input.dim();
-        auto shape = output.sizes().vec();
+        auto shape = std::vector<int64_t>(output.shape, output.shape + output.ndim);
 
         const uint32_t rows = 8;
         void* buf_a         = reinterpret_cast<void*>(input.data_ptr());
@@ -2220,7 +2169,7 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
             }
         }
 
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        const hipStream_t stream = aiter::getCurrentHIPStream();
         bool types_match         = typeid(_T0) == typeid(_T1);
         int vec                  = 16 / output.element_size();
         hipDevice_t dev;
@@ -2235,7 +2184,7 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
             const int grid_x      = (num_elements / vec + wg - 1) / wg;
             const dim3 grid_dim(grid_x, 1, 1);
             const dim3 block_dim(wg, 1, 1);
-            VLLM_DISPATCH_FLOATING_TYPES(output.scalar_type(), "operator_element_kernel", [&] {
+            VLLM_DISPATCH_FLOATING_TYPES_rmTorch(output.dtype(), "operator_element_kernel", [&] {
                 aiter::operator_element_kernel<scalar_t, Operation, _T0, _T1>
                     <<<grid_dim, block_dim, 0, stream>>>(
                         buf_a, buf_b, buf_c, num_elements, types_match);
@@ -2253,8 +2202,8 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
             grid_x = grid_x < num_cu * occupancy ? grid_x : num_cu * occupancy;
             const dim3 grid_dim(grid_x, 1, 1);
             const dim3 block_dim(wg, 1, 1);
-            VLLM_DISPATCH_FLOATING_TYPES(
-                output.scalar_type(), "operator_contiguous_kernel_naive", [&] {
+            VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                output.dtype(), "operator_contiguous_kernel_naive", [&] {
                     aiter::
                         operator_contiguous_kernel_naive<scalar_t, rows, Operation, true, _T0, _T1>
                         <<<grid_dim, block_dim, 0, stream>>>(
@@ -2268,7 +2217,7 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
             const dim3 grid_dim(grid_x, 1, 1);
             const dim3 block_dim(wg, 1, 1);
 
-            VLLM_DISPATCH_FLOATING_TYPES(output.scalar_type(), "operator_contiguous_kernel", [&] {
+            VLLM_DISPATCH_FLOATING_TYPES_rmTorch(output.dtype(), "operator_contiguous_kernel", [&] {
                 aiter::operator_contiguous_kernel<scalar_t, rows, Operation, true, _T0, _T1>
                     <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K, types_match);
             });
@@ -2284,8 +2233,8 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
             const dim3 grid_dim(grid_x, 1, 1);
             const dim3 block_dim(wg, 1, 1);
 
-            VLLM_DISPATCH_FLOATING_TYPES(
-                output.scalar_type(), "operator_contiguous_big_tile_kernel", [&] {
+            VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+                output.dtype(), "operator_contiguous_big_tile_kernel", [&] {
                     aiter::operator_contiguous_big_tile_kernel<scalar_t,
                                                                256,
                                                                BIG_TILE_SIZE_N,
@@ -2303,15 +2252,15 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
 };
 
 template <int pattern, typename Operation, class _T0, class _T1>
-void binary_operation_process(torch::Tensor& input,
-                              torch::Tensor& other,
-                              torch::Tensor& output,
+void binary_operation_process(aiter_tensor_t& input,
+                              aiter_tensor_t& other,
+                              aiter_tensor_t& output,
                               bool order_flag)
 {
     BinaryOperationPattern<pattern, Operation, _T0, _T1>::apply(input, other, output, order_flag);
 }
 
-void binary_op_dispatch(const std::string& op_type,
-                        torch::Tensor& input,
-                        torch::Tensor& other,
-                        torch::Tensor& output);
+bool binary_op_dispatch(const std::string& op_type,
+                        aiter_tensor_t& input,
+                        aiter_tensor_t& other,
+                        aiter_tensor_t& output);
