@@ -6,3 +6,5 @@ rocprof_analysis/
 *.csv
 *.json
 *.log
+# standalone driver build artifacts (compiled exe + per-TU objects)
+standalone/build/
