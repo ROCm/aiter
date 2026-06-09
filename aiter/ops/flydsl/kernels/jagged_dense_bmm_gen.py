@@ -326,5 +326,10 @@ def jagged_dense_bmm(
     matrix shape (B_groups * N, K), then dispatches to the per-shape kernel."""
     N = B.shape[0] // n_groups
     K = B.shape[1]
-    launch = _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS)
+    # Shape-dependent BLOCK_K: for small reduction K (<=256) a 2-iter K-loop with
+    # BLOCK_K=128 has fewer barriers and wins (~4% on K=256 shapes); for larger K
+    # the deeper BLOCK_K=64 pipeline keeps occupancy and is faster. (BLOCK_K=256
+    # is unsafe: the 2-stage double-buffer epilogue mis-accumulates a single tile.)
+    block_k = 128 if K <= 256 else BLOCK_K
+    launch = _build_launcher(N, K, BLOCK_M, BLOCK_N, block_k, STAGES_A, THREADS)
     return launch(C, A, B, BIAS, SEQ_OFFSETS, n_groups, max_seq_len, stream=stream)
