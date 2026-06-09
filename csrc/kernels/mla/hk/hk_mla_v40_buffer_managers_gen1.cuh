@@ -262,23 +262,30 @@ class QManager8to16bitsV1
         const uint32_t scale_row   = lane_idx & 15u;
         const uint32_t v_off_scale = scale_row * kPackedNopeStride;
 
-        // opus' buffer_load_lds builtin hardcodes i_offset = 0, so the V32
-        // trick of folding kColInRecord into i_off (and pre-subtracting it
-        // from the LDS dst) doesn't apply. Route kColInRecord through s_os
-        // instead -- still wave-uniform (no extra v_off vgpr), and the LDS
-        // dst becomes the plain staging-buffer base (no head-pad needed for
-        // this routine, though kLdsHeadPadBytes is kept for API stability).
-        //
-        // opus' make_gmem ext_vector_type rejects __hip_fp8_e4m3; use a
-        // same-width scalar proxy (uint8_t). 16 B per call -> vec=16.
-        auto g_q_nope = opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_warp));
-        void* p_dst   = reinterpret_cast<void*>(p_lds_warp_staging + kStagingI);
-        g_q_nope.template async_load<16>(p_dst, v_off, /*s_os=*/kColInRecord);
+        // Call __builtin_amdgcn_raw_ptr_buffer_load_lds directly so we
+        // can (a) use opus' cached_rsrc (__amdgpu_buffer_rsrc_t) without
+        // any cast and (b) pass a non-zero i_off. Opus' async_load
+        // wrapper hardcodes i_off=0; HK's hk::llvm_amdgcn_raw_buffer_load_lds
+        // exposes i_off but takes hk::i32x4 (forcing a separate rsrc
+        // setup or a reinterpret_cast that spills). The imm offset adds
+        // to BOTH gmem and LDS, so pre-subtract kColInRecord from the
+        // LDS dst to cancel its contribution there. Requires
+        // kLdsHeadPadBytes of pad before p_lds_q so warp 0's dst stays
+        // >= 0 (static_assert in kernel body).
+        auto g_q_nope =
+            opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_warp));
+        __builtin_amdgcn_raw_ptr_buffer_load_lds(
+            g_q_nope.cached_rsrc,
+            (hk::as3_uint32_ptr)(p_lds_warp_staging + kStagingI - kColInRecord),
+            /*size=*/16,
+            v_off,
+            /*s_off=*/0u,
+            /*i_off=*/static_cast<int>(kColInRecord),
+            /*aux=*/0);
 
         // Scale: 1 byte/lane via opus' load<1, uint8>. Stored as uint32_t so
-        // e8m0_to_f32's `asm volatile` consumer has the v-class operand it
-        // needs. The asm volatile is what anchors cross-BB ordering against
-        // the builtin load -- see [[v40-e8m0-to-f32-asm-required]].
+        // e8m0_to_f32's asm volatile consumer has the v-class operand it needs.
+        // Shares cached_rsrc with the LDS load above.
         s_dw = static_cast<uint32_t>(
             g_q_nope.template load<1>(v_off_scale, /*s_os=*/kScaleByteInRec)[0]);
     }
@@ -542,16 +549,16 @@ class QManager8to16bitsV1
         const uintptr_t p_dst_hi_adj =
             p_lds_q + sub_block_byte_offset(warp_idx, kColTileHi) + lds_off - 16u;
 
-        const hk::i32x4 srsrc = hk::make_srsrc(p_q_rope_warp, 0xffffffff);
-        hk::llvm_amdgcn_raw_buffer_load_lds(
-            srsrc, (hk::as3_uint32_ptr)(p_dst_lo), 16, v_off_lo, 0, 0, 0);
-        hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                            (hk::as3_uint32_ptr)(p_dst_hi_adj),
-                                            16,
-                                            v_off_lo,
-                                            0,
-                                            /*i_off=*/16,
-                                            0);
+        auto g_q_rope =
+            opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_rope_warp));
+        __builtin_amdgcn_raw_ptr_buffer_load_lds(
+            g_q_rope.cached_rsrc,
+            (hk::as3_uint32_ptr)(p_dst_lo),
+            /*size=*/16, v_off_lo, /*s_off=*/0u, /*i_off=*/0, /*aux=*/0);
+        __builtin_amdgcn_raw_ptr_buffer_load_lds(
+            g_q_rope.cached_rsrc,
+            (hk::as3_uint32_ptr)(p_dst_hi_adj),
+            /*size=*/16, v_off_lo, /*s_off=*/0u, /*i_off=*/16, /*aux=*/0);
     }
 
     public:
@@ -995,12 +1002,6 @@ class KvManager8to16bitsV1
 
             if(in_bounds)
             {
-                // RoPE branch via opus::gmem.async_load. opus's async_load
-                // builtin hardcodes i_offset=0, so the +16-byte delta we used
-                // to fold into i_off has to live in v_os now (one extra lane
-                // computation; trivial on the RoPE path which only fires on
-                // waves 5,7).
-                //
                 // Bank-conflict swizzle (vmem-load-side, matches the LDS-dst
                 // XOR-by-32 the NoPE writer applies for sub-tile-rows 1,3 of
                 // each 16-row sub-block). buffer_load_lds places lane t at
@@ -1010,25 +1011,31 @@ class KvManager8to16bitsV1
                 // Sub-tile-of-8 perm [0,2,4,6,1,3,5,7] (vmem-src side).
                 // Each LDS sub-tile k holds data sub-tile perm^{-1}(k):
                 // lo (sb=14, q) <- data cols 16q..+7; hi (sb=15, q) <- data
-                // cols 16q+8..+15. Base v_off_lo = row*64 + col_quad_swz*16
-                // bf16 elements; hi adds +8 bf16 (= +16 bytes).
+                // cols 16q+8..+15. Base v_off_lo = row*128 + col_quad_swz*32
+                // bytes; hi adds +16 bytes, routed through the buffer_load_lds
+                // imm `offset:` field (adds to BOTH vmem and LDS -- we
+                // pre-subtract 16 from p_dst_hi_adj to cancel on the LDS
+                // side, landing the hi load at sub_block(rt, 15)).
                 const uint32_t col_group_swz = col_group ^ (((lane_idx >> 4) & 1u) << 1);
-                const uint32_t v_off_lo_elems =
-                    static_cast<uint32_t>(row_kv_ld) * (kRopeStride / sizeof(hk::bf16)) +
-                    col_group_swz * (32u / sizeof(hk::bf16));
+                const uint32_t v_off_lo =
+                    static_cast<uint32_t>(row_kv_ld) * kRopeStride + col_group_swz * 32u;
 
-                // Use uint16_t as a 2-byte proxy for bf16: opus' vector_type
-                // ext_vector_type rejects __hip_bfloat16 on gfx950. Same
-                // element width -> identical addressing.
-                auto g_rope =
-                    opus::make_gmem<uint16_t>(reinterpret_cast<const uint16_t*>(p_kv_buf_rope));
-                void* p_dst_lo = reinterpret_cast<void*>(
-                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileLo) + lane_idx * 16u);
-                void* p_dst_hi = reinterpret_cast<void*>(
-                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileHi) + lane_idx * 16u);
-                // 16 B per call = 8 elems of uint16_t.
-                g_rope.template async_load<8>(p_dst_lo, v_off_lo_elems);
-                g_rope.template async_load<8>(p_dst_hi, v_off_lo_elems + 8u);
+                const uintptr_t p_dst_lo =
+                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileLo) + lane_idx * 16u;
+                const uintptr_t p_dst_hi_adj =
+                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileHi) +
+                    lane_idx * 16u - 16u;
+
+                auto g_kv_rope = opus::make_gmem<uint8_t>(
+                    reinterpret_cast<const uint8_t*>(p_kv_buf_rope));
+                __builtin_amdgcn_raw_ptr_buffer_load_lds(
+                    g_kv_rope.cached_rsrc,
+                    (hk::as3_uint32_ptr)(p_dst_lo),
+                    /*size=*/16, v_off_lo, /*s_off=*/0u, /*i_off=*/0, /*aux=*/0);
+                __builtin_amdgcn_raw_ptr_buffer_load_lds(
+                    g_kv_rope.cached_rsrc,
+                    (hk::as3_uint32_ptr)(p_dst_hi_adj),
+                    /*size=*/16, v_off_lo, /*s_off=*/0u, /*i_off=*/16, /*aux=*/0);
             }
             else
             {
