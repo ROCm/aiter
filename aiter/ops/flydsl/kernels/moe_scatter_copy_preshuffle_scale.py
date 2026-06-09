@@ -130,9 +130,9 @@ def build_moe_scatter_copy_preshuffle_scale_module(
     assert row_bytes % scale_k_per_tile == 0, "scale_k_per_tile must divide row"
 
     # Compile-time tile geometry (mirrors _grouped_a8w4_preshuffle_e8m0_scale).
-    src_dwords = row_bytes // 4               # k_groups * k_wmma_steps (dwords/row)
-    rows_per_tile = wmma_rep * 16             # grouped rows per row-tile
-    dpr = src_dwords * wmma_rep               # dst dwords per output row
+    src_dwords = row_bytes // 4  # k_groups * k_wmma_steps (dwords/row)
+    rows_per_tile = wmma_rep * 16  # grouped rows per row-tile
+    dpr = src_dwords * wmma_rep  # dst dwords per output row
     # The contiguous (wmma_rep, 4) dst block is wmma_rep dwords. Buffer ops cap at
     # dwordx4 (128b), so store it in chunks of `store_vw` (largest of {4,2,1}
     # dividing wmma_rep); wmma_rep in {1,2,4} is a single chunk, 8 -> two dwordx4.
@@ -148,9 +148,7 @@ def build_moe_scatter_copy_preshuffle_scale_module(
     units_per_tile = 16 * src_dwords * n_chunks
 
     _g = "g" if gather else "p"
-    module_name = (
-        f"moe_scatter_preshuffle_scale_b{row_bytes}_r{wmma_rep}_k{scale_k_per_tile}_{_g}"
-    )
+    module_name = f"moe_scatter_preshuffle_scale_b{row_bytes}_r{wmma_rep}_k{scale_k_per_tile}_{_g}"
 
     @flyc.kernel(name=module_name)
     def scatter_preshuffle_kernel(
@@ -191,7 +189,9 @@ def build_moe_scatter_copy_preshuffle_scale_module(
         src_rsrc = buffer_ops.create_buffer_resource(src, max_size=True)
         dst_rsrc = buffer_ops.create_buffer_resource(dst, max_size=True)
 
-        for it in range_constexpr((units_per_tile + BLOCK_THREADS - 1) // BLOCK_THREADS):
+        for it in range_constexpr(
+            (units_per_tile + BLOCK_THREADS - 1) // BLOCK_THREADS
+        ):
             unit = tid + arith.constant(it * BLOCK_THREADS, type=i32)
             u_ok = arith.cmpi(CmpIPredicate.ult, unit, c_units)
             _if_u = scf.IfOp(u_ok)
@@ -205,12 +205,7 @@ def build_moe_scatter_copy_preshuffle_scale_module(
                 out_row = tile_out_row0 + lane
                 w_base = chunk * c_store_vw  # first wmma_rep row of this chunk
                 # col = sd*wmma_rep + chunk*store_vw  (+ j for j in [0, store_vw))
-                dst_off = (
-                    expert_dword_base
-                    + out_row * c_dpr
-                    + sd * c_wmma_rep
-                    + w_base
-                )
+                dst_off = expert_dword_base + out_row * c_dpr + sd * c_wmma_rep + w_base
 
                 # Collect this chunk's store_vw dwords (one per wmma_rep row). The
                 # gather/identity choice is resolved in the plain helper, so no
@@ -218,9 +213,7 @@ def build_moe_scatter_copy_preshuffle_scale_module(
                 elems = []
                 for j in range_constexpr(store_vw):
                     grow = (
-                        row_base
-                        + (w_base + arith.constant(j, type=i32)) * c16
-                        + lane
+                        row_base + (w_base + arith.constant(j, type=i32)) * c16 + lane
                     )
                     elems.append(
                         _emit_preshuffle_dword(

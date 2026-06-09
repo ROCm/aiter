@@ -1713,7 +1713,9 @@ def flydsl_moe_scatter_preshuffle_scale(
     *,
     wmma_rep: int,
     scale_k_per_tile: int,
-    grouped_a1_scale: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+    grouped_a1_scale: Optional[
+        torch.Tensor
+    ] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
 ):
     """Route-gather each token's e8m0 scale row AND preshuffle it into the WMMA
     layout in a single kernel pass -- fusing ``flydsl_moe_scatter_copy_token``'s
@@ -1726,9 +1728,9 @@ def flydsl_moe_scatter_preshuffle_scale(
     device = a1_scale_token_u8.device
     Ws = a1_scale_token_u8.shape[1]
     rows_per_tile = wmma_rep * 16
-    assert max_m % rows_per_tile == 0, (
-        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
-    )
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
     tiles_per_expert = max_m // rows_per_tile
 
     if grouped_a1_scale is None:
@@ -1767,9 +1769,9 @@ def flydsl_moe_preshuffle_scale(
     device = scale_grouped_u8.device
     Ws = scale_grouped_u8.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert max_m % rows_per_tile == 0, (
-        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
-    )
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
     tiles_per_expert = max_m // rows_per_tile
 
     if out is None:

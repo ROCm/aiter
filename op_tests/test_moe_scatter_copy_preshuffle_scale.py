@@ -63,7 +63,9 @@ def _padded_max_m(token_num, warp_tile_m):
     return max(warp_tile_m, ((raw + warp_tile_m - 1) // warp_tile_m) * warp_tile_m)
 
 
-def _reference(a1_scale_token_u8, rows_to_tokens, E, max_m, warp_tile_m, scale_k_per_tile):
+def _reference(
+    a1_scale_token_u8, rows_to_tokens, E, max_m, warp_tile_m, scale_k_per_tile
+):
     device = a1_scale_token_u8.device
     Ws = a1_scale_token_u8.shape[1]
     a1_scale_raw = torch.zeros((E, max_m, Ws), dtype=torch.uint8, device=device)
@@ -75,8 +77,17 @@ def _reference(a1_scale_token_u8, rows_to_tokens, E, max_m, warp_tile_m, scale_k
     )
 
 
-def _run_case(model_dim, warp_tile_m, scale_k_per_tile, token_num, topk, E, pattern,
-              init="zero", seed=0):
+def _run_case(
+    model_dim,
+    warp_tile_m,
+    scale_k_per_tile,
+    token_num,
+    topk,
+    E,
+    pattern,
+    init="zero",
+    seed=0,
+):
     device = "cuda"
     Ws = model_dim // 32
     wmma_rep = warp_tile_m // 16
@@ -125,8 +136,8 @@ def _run_case(model_dim, warp_tile_m, scale_k_per_tile, token_num, topk, E, patt
 # generated matrix (>100 cases sweeping the full geometry + routing space)
 # --------------------------------------------------------------------------- #
 _MODEL_DIMS = [256, 512, 1024, 2048, 4096, 7168, 8192]
-_WARP_TILES = [16, 32, 64, 128]           # wmma_rep = 1, 2, 4, 8
-_SKPTS = [4, 8, 16]                        # k_wmma_steps = 1, 2, 4
+_WARP_TILES = [16, 32, 64, 128]  # wmma_rep = 1, 2, 4, 8
+_SKPTS = [4, 8, 16]  # k_wmma_steps = 1, 2, 4
 
 # (token_num, topk, E): single token, empty experts, full experts, primes, many tiles.
 _SHAPES = [
@@ -142,7 +153,7 @@ _SHAPES = [
     (64, 8, 32),
     (128, 6, 64),
     (200, 4, 32),
-    (257, 8, 128),   # prime-ish token_num, many tiles
+    (257, 8, 128),  # prime-ish token_num, many tiles
 ]
 _PATTERNS = ["randperm", "single", "skew"]
 
@@ -153,7 +164,7 @@ def _gen_geometries():
         Ws = md // 32
         for wt in _WARP_TILES:
             for sk in _SKPTS:
-                if Ws % sk != 0:        # scale_k_per_tile must divide Ws
+                if Ws % sk != 0:  # scale_k_per_tile must divide Ws
                     continue
                 geos.append((md, wt, sk))
     return geos
@@ -198,11 +209,11 @@ def test_scatter_preshuffle_scale_matrix(cfg):
 @pytest.mark.parametrize(
     "cfg",
     [
-        (256, 128, 8, 1, 1, 1, "single"),    # wmma_rep=8, single row, one expert
-        (512, 64, 8, 1, 1, 8, "randperm"),   # one token, mostly-empty experts
-        (7168, 64, 8, 200, 8, 64, "skew"),   # production-ish odd Ws=224
+        (256, 128, 8, 1, 1, 1, "single"),  # wmma_rep=8, single row, one expert
+        (512, 64, 8, 1, 1, 8, "randperm"),  # one token, mostly-empty experts
+        (7168, 64, 8, 200, 8, 64, "skew"),  # production-ish odd Ws=224
         (1024, 32, 16, 257, 4, 32, "randperm"),  # k_wmma_steps=4, many tiles
-        (256, 16, 4, 128, 1, 4, "single"),   # wmma_rep=1 (scalar store), full expert
+        (256, 16, 4, 128, 1, 4, "single"),  # wmma_rep=1 (scalar store), full expert
     ],
 )
 def test_init_variants(cfg, init):
