@@ -152,8 +152,11 @@ def shuffle_scale(
     # MXFP4 constants
     K_Pack = 2
     N_Pack = 2
+
+    # gfx1250 uses wave32; K_Lane = warp_size // N_Lane = 32 // 16 = 2
+    warp_size = 32
     N_Lane = 16
-    K_Lane = 64 // N_Lane  # 4
+    K_Lane = warp_size // N_Lane  # 2
 
     # Basic dimensions
     K1 = k_ // K_Pack // K_Lane  # k_ // 8

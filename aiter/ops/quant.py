@@ -15,9 +15,12 @@ from ..utility import dtypes, fp4_utils
 from ..utility.mx_types import (
     MX_DEFAULT_ROUND_MODE,
     MxDtypeInt,
-    MxScaleRoundMode,
     MxScaleRoundModeInt,
 )
+try:
+    from ..utility.mx_types import MxScaleRoundMode
+except ImportError:
+    MxScaleRoundMode = MxScaleRoundModeInt  # fallback when pybind .so lacks it
 from . import triton
 from .enum import ActivationType, QuantType
 from ..jit.utils.chip_info import get_cu_num, get_gfx

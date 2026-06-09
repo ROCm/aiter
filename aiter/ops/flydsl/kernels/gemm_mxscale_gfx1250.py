@@ -826,7 +826,6 @@ def compile_mxscale_gemm(
                 warp_lds_row = warp_base / arith.index(reps) + lane16
                 base = warp_lds_row * arith.index(interleaved_cols)
                 if const_expr(is_fp4 or is_a8w4):
-                    # FP4/A8W4: always add lane_kgrp offset (no opsel on BScale)
                     base = base + lane_kgrp * arith.index(SCALES_PER_WMMA)
                 else:
                     # FP8: conditional on opsel
@@ -899,7 +898,8 @@ def compile_mxscale_gemm(
                         a_scales = a_scales_all
                 else:
                     # FP8/A8W4 16x16: both scales support op_sel
-                    if const_expr(use_scale_opsel):
+                    # A8W4 always uses opsel (N_Pack=2 packed layout).
+                    if const_expr(is_a8w4 or use_scale_opsel):
                         b_scales = b_scales_all[::2]
                         a_scales = a_scales_all[::2]
                     else:
@@ -910,7 +910,8 @@ def compile_mxscale_gemm(
             def _emit_wmma(accs, wm, wn, a_frag, b_frags, a_scales, b_scales):
                 """Emit one WMMA instruction (format-specific)."""
                 idx = wm * wmma_n_rep + wn
-                if const_expr(use_scale_opsel):
+                # A8W4 always uses opsel (N_Pack=2 packed scale layout).
+                if const_expr(is_a8w4 or use_scale_opsel):
                     a_scale_idx = wm // 2
                     a_opsel = wm % 2
                 else:
@@ -931,7 +932,8 @@ def compile_mxscale_gemm(
                     )
                 else:
                     # 16x16x128 WMMA: A8W4 (fmtA=FP4) or FP8 (fmtA=FP8)
-                    if const_expr(use_scale_opsel):
+                    # A8W4 always uses opsel; FP8 conditional on use_scale_opsel.
+                    if const_expr(is_a8w4 or use_scale_opsel):
                         b_scale_idx = wn // 2
                         b_opsel = wn % 2
                     else:

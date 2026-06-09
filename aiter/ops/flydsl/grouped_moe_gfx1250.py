@@ -150,14 +150,40 @@ def _grouped_a8w4_preshuffle_e8m0_scale(
     scale_k_per_tile: int = 4,
 ) -> torch.Tensor:
     # Preshuffle row/k-scale axes; experts stay as the leading batch dim.
+    #
+    # Adapted from shuffle_scale(is_guinterleave=False): N_Pack is innermost (stride=1)
+    # so scaleBType selects even bytes (opsel=0 → wm=even) vs odd bytes (opsel=1 → wm=odd).
+    # kgrp=0/1 are separated by lane_kgrp * SCALES_PER_WMMA = 4-byte offset (kgrp at stride=4).
+    #
+    # Per-lane DWORD layout (innermost first): N_Pack(2), K_Pack(2), kgrp(2), wm_pair, kws, kg
+    #   byte 0: N_Pack=0(wm=even), K_Pack=0 → wm=even, K-group 0 of kgrp=0
+    #   byte 1: N_Pack=1(wm=odd),  K_Pack=0 → wm=odd,  K-group 0 of kgrp=0
+    #   byte 2: N_Pack=0(wm=even), K_Pack=1 → wm=even, K-group 1 of kgrp=0
+    #   byte 3: N_Pack=1(wm=odd),  K_Pack=1 → wm=odd,  K-group 1 of kgrp=0
+    #   byte 4: (kgrp=1, same N_Pack/K_Pack pattern for K-groups 2,3)
     scale = scale.view(torch.uint8).contiguous()
     E, _, k_scale = scale.shape
     wmma_rep = int(warp_tile) // 16
     k_groups = k_scale // scale_k_per_tile
-    k_wmma_steps = scale_k_per_tile // 4
-    g = scale.view(E, -1, wmma_rep, 16, k_groups, k_wmma_steps, 4)
-    g = g.permute(0, 1, 3, 4, 5, 2, 6).contiguous()
-    return g.reshape(E, -1, k_groups * k_wmma_steps * wmma_rep * 4)
+    k_wmma_steps = scale_k_per_tile // 4  # = scale_k_per_tile // SCALES_PER_WMMA
+
+    if wmma_rep < 2:
+        # Single tile (wmma_rep=1, e.g. activation scale with warp_tile_m=16):
+        # No N_Pack packing — simple row-first layout, same as original preshuffle.
+        # kgrp offset is removed in the kernel; hardware handles K-subrange automatically.
+        g = scale.view(E, -1, 1, 16, k_groups, k_wmma_steps, 4)
+        g = g.permute(0, 1, 3, 4, 5, 2, 6).contiguous()
+        return g.reshape(E, -1, k_scale)
+
+    # wmma_rep >= 2: NP-innermost shuffle_scale layout.
+    # Per-lane DWORD (innermost first): NP(2), kpack(2), kgrp(2), wm_pair, kws, kg
+    #   even bytes (NP=0): wm=even K-groups → opsel=0
+    #   odd  bytes (NP=1): wm=odd  K-groups → opsel=1
+    g = scale.view(E, -1, wmma_rep // 2, 2, 16, k_groups, k_wmma_steps, 2, 2)
+    #              E  Ms  wm_pair        NP  l16  kg        kws            kgrp kpack
+    g = g.permute(0, 1, 4, 5, 6, 2, 7, 8, 3).contiguous()
+    #             E  Ms  l16  kg  kws  wm  kgrp kpack NP(innermost)
+    return g.reshape(E, -1, k_scale * wmma_rep)
 
 
 def _grouped_a8w4_prepare_scale_batch(

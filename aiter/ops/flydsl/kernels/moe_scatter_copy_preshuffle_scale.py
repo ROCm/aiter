@@ -12,15 +12,18 @@ WMMA layout the masked grouped GEMM consumes. Previously this was two passes:
     1. scatter-copy   a1_scale_token_u8[tok] -> a1_scale_raw[e, m]   (row-major)
     2. preshuffle     a1_scale_raw -> grouped_a1_scale              (torch permute)
 
-where ``preshuffle`` (``_grouped_a8w4_preshuffle_e8m0_scale``) is the reshape::
+where ``preshuffle`` (``_grouped_a8w4_preshuffle_e8m0_scale``) produces the
+N_Pack=2 layout::
 
-    g = scale.view(E, -1, wmma_rep, 16, k_groups, k_wmma_steps, 4)
-    g = g.permute(0, 1, 3, 4, 5, 2, 6).contiguous()
+    g = scale.view(E, -1, wmma_rep//2, 2, 16, k_groups, k_wmma_steps, 2, 2)
+    g = g.permute(0, 1, 4, 5, 6, 2, 7, 8, 3).contiguous()
     grouped = g.reshape(E, max_m // wmma_rep, k_scale * wmma_rep)
 
-i.e. for a source byte at ``(w, lane, kg, ks, kw)`` inside one row-tile of
-``(wmma_rep, 16)`` rows it lands at ``(lane, kg, ks, w, kw)``. The permute is
-*tile-local*: nothing crosses a ``wmma_rep*16`` row boundary.
+Each 4-byte DWORD packs two consecutive wm tiles (N_Pack=2) with NP-innermost
+byte interleaving: [asm0_k0, asm1_k0, asm0_k1, asm1_k1].
+kgrp=0 and kgrp=1 are separated by 4 bytes (SCALES_PER_WMMA), which matches
+the existing ``lane_kgrp * SCALES_PER_WMMA`` LDS offset.  The WMMA instruction
+uses ``scaleBType = wm % 2`` (opsel) to select even/odd bytes.
 
 This kernel fuses the two passes: it gathers each token's scale row and writes
 it straight into the preshuffled layout, dropping the intermediate
@@ -28,34 +31,19 @@ it straight into the preshuffled layout, dropping the intermediate
 
 Layout / index math
 -------------------
-``Ws = k_scale = model_dim // 32`` scale bytes per row. The scale row is copied
-as dword (4-byte) units: ``src_dwords = Ws // 4 = k_groups * k_wmma_steps``,
-where the innermost 4 (``kw``) is exactly one dword and is contiguous in *both*
-source and destination.
+``Ws = k_scale = model_dim // 32`` scale bytes per row. ``src_dwords = Ws // 4``
+(one dword = 4 K-scale bytes = kgrp×kpack grid).
 
-The permute only relocates the ``wmma_rep`` axis next to the trailing ``4``, so
-in the output the innermost ``(wmma_rep, 4)`` is a *contiguous* ``wmma_rep*4``-
-byte block (``wmma_rep`` dwords). We give that whole block to one thread: it
-gathers the ``wmma_rep`` source dwords (one per source token-row, the only
-scattered part) into a register vector and issues a single ``dwordx{wmma_rep}``
-store (a 16B ``dwordx4`` when ``wmma_rep == 4`` -- the widest/fastest op). The
-permute is thus done in registers; the store is fully vectorized.
-
-One thread-block handles one row-tile (``wmma_rep*16`` grouped rows) of one
-expert -- a 2D grid ``(tiles_per_expert, E)``. One work item == one
-``(lane, sd)`` with ``sd = kg*k_wmma_steps + ks`` in ``[0, src_dwords)``:
+One work item == one ``(lane, sd, wm_pair)`` where ``wm_pair`` indexes pairs of
+consecutive wm tiles:
 
     out_row   = tile*16 + lane
-    dst_dword = e*(max_m*src_dwords) + out_row*(src_dwords*wmma_rep) + sd*wmma_rep
-    for w in range(wmma_rep):                      # the contiguous wmma_rep axis
-        grow  = e*max_m + tile*(wmma_rep*16) + w*16 + lane
-        srow  = rows_to_tokens[grow]               # source token (-1 => padding)
-        vec[w] = (srow >= 0) ? src[srow, sd] : 0   # 0 for padding lanes
-    store vec  (wmma_rep dwords) at dst_dword
-
-Padding lanes are written as 0 (matching the zero-init reference / harmless to
-the masked GEMM, which never reads padding rows). The whole output is written
-once -- same write volume as the old ``contiguous()`` permute it replaces.
+    dst_base  = e*(max_m*src_dwords) + out_row*(src_dwords*wmma_rep)
+    dst_dword = dst_base + sd*wmma_rep + wm_pair*2   (kgrp=0 at +0, kgrp=1 at +1)
+    grow0 = ... + wm_pair*2*16 + lane              # wm=even
+    grow1 = grow0 + 16                              # wm=odd
+    src0 = src[token(grow0), sd]; src1 = src[token(grow1), sd]
+    store [kgrp0_dword, kgrp1_dword] at dst_dword  (dwordx2)
 
 Grid  : (tiles_per_expert, E, 1)   -- tiles_per_expert = max_m // (wmma_rep*16)
 Block : (BLOCK_THREADS, 1, 1)
@@ -125,27 +113,24 @@ def build_moe_scatter_copy_preshuffle_scale_module(
     ``rows_to_tokens`` is int32 (E*max_m,) grouped row -> token (-1 skip).
     """
     assert row_bytes > 0 and row_bytes % 4 == 0, "scale row must be dword-aligned"
-    assert wmma_rep >= 1, "wmma_rep must be >= 1"
+    assert wmma_rep >= 2 and wmma_rep % 2 == 0, "wmma_rep must be even (>= 2)"
     assert scale_k_per_tile % 4 == 0, "scale_k_per_tile must be a multiple of 4"
     assert row_bytes % scale_k_per_tile == 0, "scale_k_per_tile must divide row"
 
     # Compile-time tile geometry (mirrors _grouped_a8w4_preshuffle_e8m0_scale).
+    #
+    # NP-innermost layout: each DWORD packs 2 wm tiles (N_Pack=2).  Layout per
+    # lane16 row (innermost first): N_Pack(2) x kpack(2) x kgrp(2) x wm_pair x kws x kg
+    # kgrp=0/1 are separated by SCALES_PER_WMMA=4 bytes.
+    #
+    # One work item == one (lane, sd, wm_pair): gathers wm_even and wm_odd source
+    # dwords and stores 2 output dwords (kgrp=0 and kgrp=1).
     src_dwords = row_bytes // 4               # k_groups * k_wmma_steps (dwords/row)
     rows_per_tile = wmma_rep * 16             # grouped rows per row-tile
     dpr = src_dwords * wmma_rep               # dst dwords per output row
-    # The contiguous (wmma_rep, 4) dst block is wmma_rep dwords. Buffer ops cap at
-    # dwordx4 (128b), so store it in chunks of `store_vw` (largest of {4,2,1}
-    # dividing wmma_rep); wmma_rep in {1,2,4} is a single chunk, 8 -> two dwordx4.
-    if wmma_rep % 4 == 0:
-        store_vw = 4
-    elif wmma_rep % 2 == 0:
-        store_vw = 2
-    else:
-        store_vw = 1
-    n_chunks = wmma_rep // store_vw
-    # One work item == one (lane, sd, chunk): it writes `store_vw` contiguous dst
-    # dwords as one dwordx{store_vw} store.
-    units_per_tile = 16 * src_dwords * n_chunks
+    wm_pairs = wmma_rep // 2
+    # Each work item writes 2 dwords (dwordx2 store).
+    units_per_tile = 16 * src_dwords * wm_pairs
 
     _g = "g" if gather else "p"
     module_name = (
@@ -160,7 +145,7 @@ def build_moe_scatter_copy_preshuffle_scale_module(
         max_m: Int32,
     ):
         i32 = T.i32
-        vec_ty = ir.VectorType.get([store_vw], i32) if store_vw > 1 else None
+        vec2_ty = ir.VectorType.get([2], i32)
 
         tile = ArithValue(fx.block_idx.x)
         e = ArithValue(fx.block_idx.y)
@@ -171,22 +156,20 @@ def build_moe_scatter_copy_preshuffle_scale_module(
         c_src_dwords = arith.constant(src_dwords, type=i32)
         c_dpr = arith.constant(dpr, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
-        c_n_chunks = arith.constant(n_chunks, type=i32)
-        c_store_vw = arith.constant(store_vw, type=i32)
+        c_wm_pairs = arith.constant(wm_pairs, type=i32)
         c_units = arith.constant(units_per_tile, type=i32)
         c16 = arith.constant(16, type=i32)
         c0 = arith.constant(0, type=i32)
+        c_0xFF = arith.constant(0xFF, type=i32)
+        c_0xFF00 = arith.constant(0xFF00, type=i32)
+        c_8i = arith.constant(8, type=i32)
+        c_16i = arith.constant(16, type=i32)
 
-        # Per-tile bases (runtime e/tile/max_m, compile-time geometry).
-        # grouped src-row base of this tile's first row.
+        # Per-tile bases
         row_base = e * max_m_i32 + tile * c_rows_per_tile
-        # dst dword base of this expert+tile (out_row 0 of the tile).
-        # expert stride (dwords) = max_m * src_dwords; tile adds 16 out-rows.
         expert_dword_base = e * (max_m_i32 * c_src_dwords)
         tile_out_row0 = tile * c16
 
-        # Created unconditionally (no in-body `if`): for gather=False the launcher
-        # passes a placeholder for rows_to_tokens and the helper never reads it.
         map_rsrc = buffer_ops.create_buffer_resource(rows_to_tokens, max_size=True)
         src_rsrc = buffer_ops.create_buffer_resource(src, max_size=True)
         dst_rsrc = buffer_ops.create_buffer_resource(dst, max_size=True)
@@ -196,43 +179,51 @@ def build_moe_scatter_copy_preshuffle_scale_module(
             u_ok = arith.cmpi(CmpIPredicate.ult, unit, c_units)
             _if_u = scf.IfOp(u_ok)
             with ir.InsertionPoint(_if_u.then_block):
-                # Decode (lane, sd, chunk) with chunk innermost so consecutive
-                # threads write consecutive dst dwords (coalesced).
-                chunk = unit % c_n_chunks
-                t2 = unit // c_n_chunks
+                # Decode (lane, sd, wm_pair) — wm_pair innermost for coalescing.
+                wm_pair = unit % c_wm_pairs
+                t2 = unit // c_wm_pairs
                 sd = t2 % c_src_dwords
                 lane = t2 // c_src_dwords
                 out_row = tile_out_row0 + lane
-                w_base = chunk * c_store_vw  # first wmma_rep row of this chunk
-                # col = sd*wmma_rep + chunk*store_vw  (+ j for j in [0, store_vw))
+
+                # dst offset: sd*wmma_rep + wm_pair*2 (kgrp=0 and kgrp=1 adjacent)
                 dst_off = (
                     expert_dword_base
                     + out_row * c_dpr
                     + sd * c_wmma_rep
-                    + w_base
+                    + wm_pair * arith.constant(2, type=i32)
                 )
 
-                # Collect this chunk's store_vw dwords (one per wmma_rep row). The
-                # gather/identity choice is resolved in the plain helper, so no
-                # build-time `if` appears inside this rewritten kernel body.
-                elems = []
-                for j in range_constexpr(store_vw):
-                    grow = (
-                        row_base
-                        + (w_base + arith.constant(j, type=i32)) * c16
-                        + lane
-                    )
-                    elems.append(
-                        _emit_preshuffle_dword(
-                            gather, map_rsrc, src_rsrc, grow, sd, c_src_dwords, c0
-                        )
-                    )
+                # Gather source dwords for wm=even (wm_pair*2) and wm=odd (wm_pair*2+1).
+                grow0 = row_base + wm_pair * arith.constant(2 * 16, type=i32) + lane
+                grow1 = grow0 + c16
+                src0 = _emit_preshuffle_dword(
+                    gather, map_rsrc, src_rsrc, grow0, sd, c_src_dwords, c0
+                )
+                src1 = _emit_preshuffle_dword(
+                    gather, map_rsrc, src_rsrc, grow1, sd, c_src_dwords, c0
+                )
 
-                if store_vw == 1:
-                    buffer_ops.buffer_store(elems[0], dst_rsrc, dst_off)
-                else:
-                    vec = vector.from_elements(vec_ty, elems)
-                    buffer_ops.buffer_store(vec, dst_rsrc, dst_off)
+                # NP-innermost byte interleave into two output DWORDs:
+                #   kgrp=0: [src0[0], src1[0], src0[1], src1[1]]  = [asm0k0, asm1k0, asm0k1, asm1k1]
+                #   kgrp=1: [src0[2], src1[2], src0[3], src1[3]]  = [asm0k2, asm1k2, asm0k3, asm1k3]
+                dst_kgrp0 = arith.ori(
+                    arith.ori(arith.andi(src0, c_0xFF),
+                              arith.shli(arith.andi(src1, c_0xFF), c_8i)),
+                    arith.ori(arith.shli(arith.andi(src0, c_0xFF00), c_8i),
+                              arith.shli(arith.andi(src1, c_0xFF00), c_16i)),
+                )
+                s0h = arith.shrui(src0, c_16i)
+                s1h = arith.shrui(src1, c_16i)
+                dst_kgrp1 = arith.ori(
+                    arith.ori(arith.andi(s0h, c_0xFF),
+                              arith.shli(arith.andi(s1h, c_0xFF), c_8i)),
+                    arith.ori(arith.shli(arith.andi(s0h, c_0xFF00), c_8i),
+                              arith.shli(arith.andi(s1h, c_0xFF00), c_16i)),
+                )
+
+                vec = vector.from_elements(vec2_ty, [dst_kgrp0, dst_kgrp1])
+                buffer_ops.buffer_store(vec, dst_rsrc, dst_off)
                 scf.YieldOp([])
 
     if gather:
