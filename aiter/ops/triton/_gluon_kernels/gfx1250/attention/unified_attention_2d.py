@@ -1463,13 +1463,12 @@ def attention_loop_tensor_subtile_split(
         # --- S1: QK sub 0 + SM1-A ---
         qk0 = pgm.compute_qk_subtile(k0_s)
         if MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3:
-            kv_loader.load_v_to_shared(
-                next2_physical_block_idx, buffer_id=buf_tile_next2
-            )
-            # N=3: K store slot is distinct from live ds_reads, so issue early
             kv_loader.load_k_to_shared(
                 next3_physical_block_idx,
                 buffer_id=buf_tile_cur if cfg.NUM_BUFFERS == 3 else buf_tile_next,
+            )
+            kv_loader.load_v_to_shared(
+                next2_physical_block_idx, buffer_id=buf_tile_next2
             )
         v = kv_loader.load_v_from_shared(
             wait_count=2,
