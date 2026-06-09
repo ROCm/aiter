@@ -29,6 +29,41 @@ def moe_smoothquant_fwd(
 ) -> None: ...
 
 
+@compile_ops("module_fp4_quant_hip")
+def _quantize_fp4_e8m0_per_channel_kblock_hip(
+    packed: Tensor, scale_byte: Tensor, v: Tensor, kblock_size: int = 32
+) -> None: ...
+
+
+def quantize_fp4_e8m0_per_channel_kblock_hip(
+    v: Tensor, kblock_size: int = 32
+) -> Tuple[Tensor, Tensor]:
+    """Quantize ``v`` to packed FP4 E2M1 with per-channel/per-kblock E8M0 scale.
+
+    Args:
+        v: Contiguous or strided bf16 CUDA tensor with shape ``(BH, T, D)``.
+        kblock_size: Token block size, one of 16, 32, or 64.
+
+    Returns:
+        ``(packed, scale_byte)`` where ``packed`` has shape ``(BH, T, D // 2)``
+        and ``scale_byte`` has shape ``(BH, T // kblock_size, D)``.
+    """
+    assert v.ndim == 3, f"Expected v as (BH, T, D), got {v.ndim}D"
+    assert v.is_cuda, "v must be on CUDA/HIP"
+    assert v.dtype == torch.bfloat16, f"v must be bfloat16, got {v.dtype}"
+    assert kblock_size in (16, 32, 64), "kblock_size must be one of 16, 32, 64"
+
+    BH, T, D = v.shape
+    assert T % kblock_size == 0, f"T={T} must be divisible by kblock_size={kblock_size}"
+    assert D % 2 == 0, f"D={D} must be even"
+
+    v = v.contiguous()
+    packed = torch.empty((BH, T, D // 2), dtype=torch.uint8, device=v.device)
+    scale_byte = torch.empty((BH, T // kblock_size, D), dtype=torch.uint8, device=v.device)
+    _quantize_fp4_e8m0_per_channel_kblock_hip(packed, scale_byte, v, kblock_size)
+    return packed, scale_byte
+
+
 # following are pure torch implement
 @functools.lru_cache()
 def get_dtype_max(dtype):
