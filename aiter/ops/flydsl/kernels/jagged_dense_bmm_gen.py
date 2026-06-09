@@ -452,18 +452,18 @@ def jagged_dense_bmm(
 
     xcd_c / xcd_w are the chiplet (XCD) remap knobs (C and W); they are baked
     into the compiled kernel, so each distinct (shape, xcd_c, xcd_w) memoizes a
-    separate kernel. When left as None they default based on `uniform_seqlen`:
+    separate kernel. When left as None they default per (K, uniform_seqlen):
 
-      uniform_seqlen=True  -> weight-size-dependent C (XCD_C_*), W=XCD_W. The
-        remap clusters a group's M-tiles on one XCD's L2 (+~5% on D=512). This is
-        the right default for benchmark/headline shapes where every group has the
-        same number of M-tiles (M_i == max_seq_len).
-      uniform_seqlen=False -> the remap is DISABLED (C=1, W=1, which makes
-        _xcd_remap the exact identity). Under a varlen / skewed M_i distribution
-        (real deployment, M_i ~ 0.95*Uniform(1,max_seq_len)) the remap REGRESSES
-        ~2%: with the per-tile early-exit, clustering a group's M-tiles onto one
-        XCD also clusters its skipped no-op tiles, causing XCD load imbalance,
-        while the hardware's round-robin (identity) spreads real work evenly.
+      K > 256 (large weight): remap ALWAYS ON (C=XCD_C_LARGE_K, W=XCD_W),
+        regardless of uniform_seqlen. It clusters a group's M-tiles on one XCD's
+        L2 (+~5-6% on D=512 uniform; re-measured +~2% on D=512 varlen too -- the
+        Dense[b] L2-reuse win outweighs the early-exit XCD imbalance once the
+        weight is large enough to be worth caching).
+      K <= 256 (small weight): remap ON only for uniform_seqlen=True
+        (C=XCD_C_SMALL_K, W=XCD_W); for varlen it falls back to identity (C=1,
+        W=1, _xcd_remap is the exact identity). On small weights the remap is only
+        ~neutral under skew, so round-robin (identity) is the safe default and
+        avoids any early-exit XCD load imbalance.
 
     An explicit xcd_c / xcd_w always overrides the gate. use_mfma_k32 selects the
     CDNA4 16x16x32 bf16 atom; defaults to auto-detect (on gfx950, off gfx942)."""
@@ -474,15 +474,19 @@ def jagged_dense_bmm(
     # the deeper BLOCK_K=64 pipeline keeps occupancy and is faster. (BLOCK_K=256
     # is unsafe: the 2-stage double-buffer epilogue mis-accumulates a single tile.)
     block_k = 128 if K <= 256 else BLOCK_K
-    # XCD remap defaults, gated on M_i uniformity (see docstring). Identity
-    # (C=1,W=1) disables the remap for the varlen case where it regresses.
+    # XCD remap defaults (see docstring). Large weight (K>256): remap on for both
+    # uniform and varlen (the Dense[b] L2-reuse win holds under skew). Small weight
+    # (K<=256): remap on only for uniform; identity (C=1,W=1) under skew where it's
+    # ~neutral and round-robin avoids early-exit imbalance.
     if xcd_c is None:
-        if uniform_seqlen:
-            xcd_c = XCD_C_SMALL_K if K <= 256 else XCD_C_LARGE_K
+        if K > 256:
+            xcd_c = XCD_C_LARGE_K
+        elif uniform_seqlen:
+            xcd_c = XCD_C_SMALL_K
         else:
             xcd_c = 1
     if xcd_w is None:
-        xcd_w = XCD_W if uniform_seqlen else 1
+        xcd_w = 1 if xcd_c == 1 else XCD_W
     if use_mfma_k32 is None:
         use_mfma_k32 = _use_mfma_k32()
     bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
