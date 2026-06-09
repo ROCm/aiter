@@ -79,7 +79,7 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def get_kernel_config_triton(m, n, k, routing_data):
+def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -113,14 +113,14 @@ def get_kernel_config_triton(m, n, k, routing_data):
     # Look for a tuned entry with the same (N, K) but any block_m — the tile
     # geometry and num_stages from that entry are a better starting point than
     # a generic default, and avoid regressing to num_stages=1 on gfx950.
-    # Skip BLOCK_K<256 entries: CDNA4 unswizzle can't compile them.
+    # Under CDNA4 swizzle, skip BLOCK_K<256 entries since unswizzle can't compile them.
     dispatch = _get_a8w4_dispatch(arch)
     proxy = next(
         (
             v
             for bm in (16, 32, 64, 128)
             if (v := dispatch.get(f"bm{bm}_n{n}_k{k}")) is not None
-            and v.get("BLOCK_SIZE_K", 0) >= 256
+            and (swizzle_mx_scale != "CDNA4_SCALE" or v.get("BLOCK_SIZE_K", 0) >= 256)
         ),
         None,
     )
@@ -381,7 +381,7 @@ def moe_gemm_a8w4(
     if use_gluon:
         config = get_kernel_config_gluon(M, N, K, routing_data)
     else:
-        config = get_kernel_config_triton(M, N, K, routing_data)
+        config = get_kernel_config_triton(M, N, K, routing_data, swizzle_mx_scale)
     # CDNA4 swizzle requires BLOCK_K % 256 == 0; some tuned small-K entries
     # pick BK<256 for utilization. Clamp only when swizzle is requested so
     # StridedLayout callers keep their tuned BK<256.
