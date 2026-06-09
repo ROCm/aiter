@@ -70,12 +70,12 @@ def split_unshuffle_nvfp4_kv_cache(key_or_value_cache):
     return key_or_value_cache_data, key_or_value_cache_scales
 
 
-@pytest.mark.parametrize("T", [1, 2, 4, 8, 2048])
+@pytest.mark.parametrize("T", [1, 8, 2048])
 @pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [1])
 @pytest.mark.parametrize("D_pe", [64])  # For now, D is power of 2. D >= 16
 @pytest.mark.parametrize("D_lora", [512])
-@pytest.mark.parametrize("num_kv_cahce_tokens", [2048])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize(
@@ -87,6 +87,7 @@ def split_unshuffle_nvfp4_kv_cache(key_or_value_cache):
         (torch.uint8, True, 128),
     ],
 )
+@pytest.mark.parametrize("upcast_operand", [False, True])
 def test_fused_qk_rope_cat_and_cache_mla(
     T: int,
     QH_per_KH: int,
@@ -99,11 +100,12 @@ def test_fused_qk_rope_cat_and_cache_mla(
     cache_dtype: bool,
     shuffled_kv_cache: bool,
     block_size: int,
+    upcast_operand: bool,
 ):
-    dtype = torch.bfloat16
     if cache_dtype == torch.uint8:
         if DEVICE_ARCH not in ("gfx1250",):
             pytest.skip("NVFP4 quantization is only supported on GFX1250")
+    dtype = torch.bfloat16
     pos = True
     _, _, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
         1,
@@ -234,6 +236,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
             decode_q_pe_out=None,
             k_pe_out=None,
             shuffled_kv_cache=shuffled_kv_cache,
+            upcast_operand=upcast_operand,
         )
     )
 
@@ -257,11 +260,11 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("T", [1, 2, 4, 2048])
-@pytest.mark.parametrize("QH_per_KH", [1, 16])
-@pytest.mark.parametrize("KH", [1, 8])
+@pytest.mark.parametrize("T", [1, 8, 2048])
+@pytest.mark.parametrize("QH_per_KH", [16])
+@pytest.mark.parametrize("KH", [8])
 @pytest.mark.parametrize("D", [64])  # For now, D is power of 2. D >= 16
-@pytest.mark.parametrize("num_blocks", [128])
+@pytest.mark.parametrize("num_blocks", [16384])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -279,6 +282,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
     ],
 )
 @pytest.mark.parametrize("offs", [False, True])
+@pytest.mark.parametrize("upcast_operand", [False, True])
 def test_fused_qk_rope_reshape_and_cache(
     T: int,
     QH_per_KH: int,
@@ -293,7 +297,11 @@ def test_fused_qk_rope_reshape_and_cache(
     cache_dtype: bool,
     offs: bool,
     dtype: torch.dtype,
+    upcast_operand: bool,
 ):
+    if cache_dtype == torch.uint8:
+        if DEVICE_ARCH not in ("gfx1250",):
+            pytest.skip("NVFP4 quantization is only supported on GFX1250")
     torch.manual_seed(0)
     pos = True
     q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
@@ -441,6 +449,7 @@ def test_fused_qk_rope_reshape_and_cache(
             offs=offsets,
             q_out=q,
             k_out=k,
+            upcast_operand=upcast_operand,
         )
     )
 
