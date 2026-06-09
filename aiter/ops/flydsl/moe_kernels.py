@@ -335,6 +335,79 @@ def get_flydsl_stage2_kernels_bf16(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_fp8(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for a8w8 stage1 configs (a=fp8, w=fp8).
+
+    Per-token activation scale + per-output-channel weight scale (QuantType
+    per_Token / per_Tensor). Weights use the same shuffle_weight((16,16)) layout
+    as bf16/CK; weight scale is flat [E, 2*inter_dim] f32 (logical order, no
+    shuffle). tile_n must divide inter_dim (g1u1 gate/up pairing); tile_n=64
+    covers inter_dim not a multiple of 128 (e.g. 192).
+    """
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "fp8"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [64, 128]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
+                kernels[name] = {
+                    "stage": 1,
+                    "a_dtype": a_dtype,
+                    "b_dtype": b_dtype,
+                    "out_dtype": out_dtype,
+                    "tile_m": tm,
+                    "tile_n": tn,
+                    "tile_k": tk,
+                    "MPerBlock": tm,
+                    "in_dtype": "fp8",
+                    "k_batch": 1,
+                }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_fp8(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for a8w8 stage2 configs (a=fp8, w=fp8).
+
+    Per-(token,slot) activation scale + per-output-channel weight scale
+    ([E, model_dim] f32). tile_k=64 covers inter_dim not a multiple of 128.
+    """
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "fp8"
+    tile_ks = [64, 128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    modes = ["atomic"]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    base_params = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "in_dtype": "fp8",
+                    }
+                    kernels[base_name] = base_params
+                    kernels[base_name + "_persist"] = {**base_params, "persist": True}
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
@@ -350,6 +423,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_bf16(out))
+    # a8w8 (a=fp8, w=fp8, QuantType.per_Token / per_Tensor) configs
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_fp8(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_fp8(out))
 
 
 _register_all_configs()
@@ -454,6 +531,26 @@ def compile_flydsl_moe_stage1(
             use_cshuffle_epilog=_use_cshuffle,
             k_batch=k_batch,
         )
+    elif a_dtype == "fp8" and b_dtype == "fp8":
+        # a8w8 (per_Token / per_Tensor): fp8 activations x fp8 weights, per-token
+        # activation scale + per-output-channel f32 weight scale.
+        from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        _use_cshuffle = None if k_batch > 1 else False
+        return compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            in_dtype="fp8",
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=_use_cshuffle,
+            k_batch=k_batch,
+        )
     else:
         raise ValueError(
             f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
@@ -539,6 +636,24 @@ def compile_flydsl_moe_stage2(
             tile_k=tile_k,
             doweight_stage2=doweight_stage2,
             in_dtype="bf16",
+            out_dtype=out_dtype,
+            accumulate=accumulate,
+        )
+    elif a_dtype == "fp8" and b_dtype == "fp8":
+        # a8w8 (per_Token / per_Tensor): fp8 activations x fp8 weights, per-(token,
+        # slot) activation scale + per-output-channel f32 weight scale.
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+        return compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype="fp8",
             out_dtype=out_dtype,
             accumulate=accumulate,
         )
@@ -900,6 +1015,26 @@ def flydsl_moe_stage1(
     flat_w_scale = (
         w1_scale.view(-1) if w1_scale is not None else torch.empty(0, device=dev)
     )
+    # a8w8 per_Tensor: the kernel reads a per-token activation scale [token_num]
+    # and a per-output-channel weight scale [E, 2*inter_dim] (logical order). For
+    # per_Tensor the caller passes a scalar activation scale and a per-expert
+    # weight scale [E, 1]; broadcast them up so the fp8 epilogue indexing is valid.
+    # (per_Token already arrives full-size, so these are no-ops there.)
+    if a_dtype == "fp8" and b_dtype == "fp8":
+        _two_inter = w1.shape[1]
+        if a1_scale is not None and flat_a_scale.numel() == 1:
+            flat_a_scale = flat_a_scale.expand(token_num).contiguous()
+        if w1_scale is not None:
+            _wn = flat_w_scale.numel()
+            if _wn == E:  # per-expert -> per-channel
+                flat_w_scale = (
+                    flat_w_scale.view(E, 1)
+                    .expand(E, _two_inter)
+                    .reshape(-1)
+                    .contiguous()
+                )
+            elif _wn == 1:  # per-tensor -> per-channel
+                flat_w_scale = flat_w_scale.expand(E * _two_inter).contiguous()
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -1205,6 +1340,24 @@ def flydsl_moe_stage2(
     flat_w_scale = (
         w2_scale.view(-1) if w2_scale is not None else torch.empty(0, device=dev)
     )
+    # a8w8 per_Tensor: kernel reads per-(token,slot) activation scale
+    # [token_num*topk] and per-output-channel weight scale [E, model_dim]. For
+    # per_Tensor the caller passes a scalar act scale and per-expert weight scale
+    # [E, 1]; broadcast up. (per_Token already arrives full-size -> no-op.)
+    if a_dtype == "fp8" and b_dtype == "fp8":
+        if a2_scale is not None and flat_a_scale.numel() == 1:
+            flat_a_scale = flat_a_scale.expand(token_num * topk).contiguous()
+        if w2_scale is not None:
+            _wn = flat_w_scale.numel()
+            if _wn == E:  # per-expert -> per-channel
+                flat_w_scale = (
+                    flat_w_scale.view(E, 1)
+                    .expand(E, model_dim)
+                    .reshape(-1)
+                    .contiguous()
+                )
+            elif _wn == 1:  # per-tensor -> per-channel
+                flat_w_scale = flat_w_scale.expand(E * model_dim).contiguous()
     sw = (
         sorted_weights
         if sorted_weights is not None
