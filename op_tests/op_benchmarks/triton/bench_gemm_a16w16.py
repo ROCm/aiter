@@ -23,7 +23,7 @@ import triton
 import math
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
     gemm_a16w16,
-    _resolve_backend,
+    _is_gluon_available,
 )
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
@@ -185,7 +185,7 @@ def run_benchmark(args, defaults):
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
 
-    backend = _resolve_backend(args.backend)
+    backend = args.backend or ("gluon" if _is_gluon_available() else "triton")
     print(f"Using backend: {backend}")
 
     if args.model:

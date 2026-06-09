@@ -21,31 +21,14 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 
 
 def _is_gluon_available():
-    """Check if gluon backend is available for the current GPU architecture."""
+    """Check if the gluon backend is available for the current GPU architecture."""
     try:
-        arch = get_arch()
-        return any(supported in arch for supported in _GLUON_SUPPORTED_ARCHS)
+        return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
     except Exception:
         return False
 
 
-def _resolve_backend(backend: Optional[str]) -> str:
-    """Resolve backend selection: None -> auto-detect, else validate."""
-    if backend is None:
-        return "gluon" if _is_gluon_available() else "triton"
-    backend = backend.lower()
-    assert backend in (
-        "triton",
-        "gluon",
-    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
-    if backend == "gluon":
-        assert (
-            _is_gluon_available()
-        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-    return backend
-
-
-def _gemm_a16w16_triton(
+def gemm_a16w16(
     x,
     w,
     bias: Optional[torch.Tensor] = None,
@@ -54,8 +37,59 @@ def _gemm_a16w16_triton(
     config: Optional[dict] = None,
     activation: Optional[str] = None,
     skip_reduce: Optional[bool] = False,
+    kernel_type: str = "basic",
+    backend: Optional[str] = None,
 ):
-    """Triton backend implementation of A16W16 GEMM."""
+    """
+    Computes 16 bit matrix multiplication Y = X @ W^T
+
+    Uses the gluon backend automatically on supported architectures (gfx1250)
+    and the triton backend everywhere else. Pass ``backend`` to force a choice.
+
+    Args:
+        x (torch.Tensor): Input matrix with shape (M, K).
+        w (torch.Tensor): Weight matrix with shape (N, K), internally transposed.
+        bias (Optional[torch.Tensor]): Bias vector with shape (N,).
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[dict]): Kernel tuning parameters.
+        activation (Optional[str]): Activation function ("gelu", "gelu_tanh", "silu",
+            "silu_exp2", "relu").
+        skip_reduce (Optional[bool]): [triton only] Skip reduction of split-K partial
+            results. Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
+        kernel_type (str): [gluon only] Kernel variant ("basic", "lds_pipeline").
+        backend (Optional[str]): "triton", "gluon", or None (auto-detect).
+
+    Returns:
+        torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
+    """
+    if backend is None:
+        backend = "gluon" if _is_gluon_available() else "triton"
+    backend = backend.lower()
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
+    if backend == "gluon":
+        assert (
+            _is_gluon_available()
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_a16w16_gfx1250 import (
+            gemm_a16w16_gfx1250,
+        )
+
+        return gemm_a16w16_gfx1250(
+            x,
+            w,
+            bias=bias,
+            dtype=dtype,
+            y=y,
+            config=config,
+            activation=activation,
+            kernel_type=kernel_type,
+        )
+
     _LOGGER.info(f"GEMM_A16W16 [triton]: x={tuple(x.shape)} w={tuple(w.shape)}")
 
     assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
@@ -142,92 +176,3 @@ def _gemm_a16w16_triton(
         )
 
     return y
-
-
-def _gemm_a16w16_gluon(
-    x,
-    w,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    activation: Optional[str] = None,
-    kernel_type: str = "basic",
-):
-    """Gluon backend implementation of A16W16 GEMM (gfx1250)."""
-    from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_a16w16_gfx1250 import (
-        gemm_a16w16_gfx1250,
-    )
-
-    return gemm_a16w16_gfx1250(
-        x,
-        w,
-        bias=bias,
-        dtype=dtype,
-        y=y,
-        config=config,
-        activation=activation,
-        kernel_type=kernel_type,
-    )
-
-
-def gemm_a16w16(
-    x,
-    w,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    activation: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
-    kernel_type: str = "basic",
-    backend: Optional[str] = None,
-):
-    """
-    Computes 16 bit matrix multiplication Y = X @ W^T
-
-    Dispatches to the triton or gluon backend based on the ``backend`` argument.
-    When ``backend`` is ``None`` (default), gluon is used automatically on
-    supported architectures (gfx1250) and triton everywhere else.
-
-    Args:
-        x (torch.Tensor): Input matrix with shape (M, K).
-        w (torch.Tensor): Weight matrix with shape (N, K), internally transposed.
-        bias (Optional[torch.Tensor]): Bias vector with shape (N,).
-        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
-        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
-        config (Optional[dict]): Kernel tuning parameters.
-        activation (Optional[str]): Activation function ("gelu", "gelu_tanh", "silu",
-            "silu_exp2", "relu").
-        skip_reduce (Optional[bool]): [triton only] Skip reduction of split-K partial
-            results. Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
-        kernel_type (str): [gluon only] Kernel variant ("basic", "lds_pipeline").
-        backend (Optional[str]): "triton", "gluon", or None (auto-detect).
-
-    Returns:
-        torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
-    """
-    resolved = _resolve_backend(backend)
-
-    if resolved == "gluon":
-        return _gemm_a16w16_gluon(
-            x,
-            w,
-            bias=bias,
-            dtype=dtype,
-            y=y,
-            config=config,
-            activation=activation,
-            kernel_type=kernel_type,
-        )
-    else:
-        return _gemm_a16w16_triton(
-            x,
-            w,
-            bias=bias,
-            dtype=dtype,
-            y=y,
-            config=config,
-            activation=activation,
-            skip_reduce=skip_reduce,
-        )
