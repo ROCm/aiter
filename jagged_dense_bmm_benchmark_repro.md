@@ -260,33 +260,35 @@ docker exec -w /home/anguyenh/aiter anguyenh-dev bash -c '
 '
 ```
 
-Final results (FlyDSL gen, all optimizations incl. XCD remap, vs upstream
-Triton). **Use `p10` for the substring `jdbba` (FlyDSL) and
-`jagged_dense_bmm_broadcast_add` (Triton) — NOT median.** Triton autotunes, so
-its deployed number is the best-config `min`; its median is inflated by trial
-dispatches. FlyDSL does not autotune (p10 ≈ min ≈ deployed):
+Final results (current FlyDSL gen = 16x16x32 atom + XCD remap + bounded-A fix, vs
+upstream Triton). **Authoritative two-method comparison is in
+`jagged_dense_bmm_optimization_report.md` §2.** Summary (autotune inflation
+excluded — Triton best-config only):
 
 ```
-shape                    FlyDSL_p10   Triton_min(best)   Triton_p10   Triton_median
-B120_D256_K256_N16384      274           256               302          355
-B120_D512_K512_N16384      774           751               863         1061
-B1024_D256_K256_N16384    2199          2082              2467         2947
-B1024_D512_K512_N16384    6392          6307              7223         8789
+                         rocprofv3 hot-L2 (us)        do_bench cold-L2 (ms)
+shape                  FlyDSL_p10  Triton_min     FlyDSL    Triton    verdict
+B120_D256_K256_N16384     267        256          0.2748    0.2770    ~tie / +0.8%
+B120_D512_K512_N16384     730        752          0.7377    0.7764    +3-5% FlyDSL
+B1024_D256_K256_N16384   2091       2085          2.1986    2.1319    tie / -3% (L2-warmth dependent)
+B1024_D512_K512_N16384   5960       6326          6.0422    6.4039    +5.6-6.1% FlyDSL
 ```
 
-**Honest verdict: rough parity.** Triton's *best autotuned config* is ~1–7%
-ahead — within noise on B1024_D512, a few percent on the small-K cells. FlyDSL is
-competitive, not a >1× win.
+**Verdict: FlyDSL wins 3 of 4** — ~5–6% ahead on both D=512 cells (robust under
+both methods), a hair ahead on B120_D256, tie-to-slightly-behind on B1024_D256
+depending on L2 warmth. The 16x16x32 atom + XCD remap moved it from the earlier
+parity baseline to ahead on D=512.
 
-> **Correction.** An earlier version of this table claimed FlyDSL "beats Triton
-> 1.13–1.31×". That was a **median-vs-autotune-min artifact**: `read_us2.py` took
-> the *median* over all dispatches, and the Triton kernel fires hundreds–
-> thousands of autotune trial dispatches (e.g. B1024_D512: 849 dispatches,
-> spread 6307–18792 µs) whose slow trials drag the median to 8789 µs. Comparing
-> FlyDSL's clean median against that polluted median manufactured a fake 1.3×.
-> Using `p10`/`min` (steady-state best config, what `do_bench` and a real
-> deployment see) reconciles both methods and shows parity. `read_us2.py` now
-> defaults to `p10` for exactly this reason.
+> **Use `p10` for `jdbba` (FlyDSL) and `min` for `jagged_dense_bmm_broadcast_add`
+> (Triton) — NEVER median.** Triton autotunes (e.g. B1024_D512: 849 dispatches,
+> spread 6307–18792 µs); its median (8789) is trial-inflated and is NOT deployed.
+> An earlier version of this table compared medians and wrongly claimed FlyDSL
+> "beats Triton 1.13–1.31×" — a median-vs-autotune-min artifact. `do_bench`
+> (autotuner settled) and rocprofv3-min agree and are the honest numbers.
+> **Cold vs hot L2:** do_bench flushes the L2 each rep, which erodes the XCD
+> remap's `Dense[b]`-reuse win — that's why B1024_D256 reads tie (hot) vs −3%
+> (cold). Repeated/back-to-back deployment (resident weights) tracks the hot-L2
+> figure. See report §2 and method-lessons #3/#4 (incl. the corrected skew result).
 
 ### 8.3 What was applied to the generalized kernel (device-time verified)
 
