@@ -246,7 +246,9 @@ max_seq_len=16384. Per group: `(M_i × D) · (D × K_bench) → (M_i × K_bench)
 
 Harness: `op_tests/flydsl_tests/bench_headline_worker.py` (args
 `<flydsl|triton> B D Kout Mi`, warmup+30 launches) + `read_us2.py`
-(`python read_us2.py <rocprof_outdir> jdbba` → median µs). Example:
+(`python read_us2.py <rocprof_outdir> <substr> p10` → 10th-percentile µs). Note
+the kernel-name substring differs by provider: `jdbba` for FlyDSL,
+`jagged_dense_bmm_broadcast_add` for the Triton kernel. Example:
 
 ```bash
 docker exec -w /home/anguyenh/aiter anguyenh-dev bash -c '
@@ -254,24 +256,37 @@ docker exec -w /home/anguyenh/aiter anguyenh-dev bash -c '
   PYTHONPATH=/home/anguyenh/aiter:$PYTHONPATH \
     rocprofv3 --kernel-trace -d /tmp/h -o trace -- \
     python op_tests/flydsl_tests/bench_headline_worker.py flydsl 120 512 512 7680
-  python op_tests/flydsl_tests/read_us2.py /tmp/h jdbba
+  python op_tests/flydsl_tests/read_us2.py /tmp/h jdbba p10
 '
 ```
 
-Final results (FlyDSL gen, all optimizations applied, vs upstream Triton):
+Final results (FlyDSL gen, all optimizations incl. XCD remap, vs upstream
+Triton). **Use `p10` for the substring `jdbba` (FlyDSL) and
+`jagged_dense_bmm_broadcast_add` (Triton) — NOT median.** Triton autotunes, so
+its deployed number is the best-config `min`; its median is inflated by trial
+dispatches. FlyDSL does not autotune (p10 ≈ min ≈ deployed):
 
 ```
-shape                    FlyDSL_us   Triton_us   speedup(tri/fly)
-B120_D256_K256_N16384     312.5       352         1.13x
-B120_D512_K512_N16384     841.0      1060         1.26x
-B1024_D256_K256_N16384   2294.1      2994         1.31x
-B1024_D512_K512_N16384   6843.2      8828         1.29x
+shape                    FlyDSL_p10   Triton_min(best)   Triton_p10   Triton_median
+B120_D256_K256_N16384      274           256               302          355
+B120_D512_K512_N16384      774           751               863         1061
+B1024_D256_K256_N16384    2199          2082              2467         2947
+B1024_D512_K512_N16384    6392          6307              7223         8789
 ```
 
-**The generalized FlyDSL kernel beats upstream Triton on all four headline cells
-(1.13–1.31×).** This inverts the prototype/toy-shape picture (§4.2), where FlyDSL
-appeared slower — that was an artifact of launch-bound tiny shapes; at production
-scale the layout-API kernel is compute/memory-bound and wins.
+**Honest verdict: rough parity.** Triton's *best autotuned config* is ~1–7%
+ahead — within noise on B1024_D512, a few percent on the small-K cells. FlyDSL is
+competitive, not a >1× win.
+
+> **Correction.** An earlier version of this table claimed FlyDSL "beats Triton
+> 1.13–1.31×". That was a **median-vs-autotune-min artifact**: `read_us2.py` took
+> the *median* over all dispatches, and the Triton kernel fires hundreds–
+> thousands of autotune trial dispatches (e.g. B1024_D512: 849 dispatches,
+> spread 6307–18792 µs) whose slow trials drag the median to 8789 µs. Comparing
+> FlyDSL's clean median against that polluted median manufactured a fake 1.3×.
+> Using `p10`/`min` (steady-state best config, what `do_bench` and a real
+> deployment see) reconciles both methods and shows parity. `read_us2.py` now
+> defaults to `p10` for exactly this reason.
 
 ### 8.3 What was applied to the generalized kernel (device-time verified)
 
@@ -288,6 +303,20 @@ scale the layout-API kernel is compute/memory-bound and wins.
   in the public entry. K=256 prefers a 2-iter K-loop (fewer barriers); K=512 keeps
   the deeper BLOCK_K=64 pipeline for occupancy. `BLOCK_K=256` is UNSAFE — the
   2-stage double-buffer epilogue silently mis-accumulates a single K-tile.
+- **Chiplet (XCD) block-ID remap (+~5% on D=512, gap-closer vs Triton).**
+  HipKittens Algorithm 1: a launch-time block-ID remap (`_xcd_remap`) that
+  inverts the hardware's round-robin XCD assignment so a group's M-tiles (which
+  all share that group's `Dense[b]` weight) co-locate on one XCD's private 4 MB
+  L2. Diagnosis that motivated it: B1024_D512 was memory-bound with **L2 hit
+  49.3%** and **DRAM read traffic ≈ 44× the model minimum** — `Dense[b]` was
+  being re-fetched from HBM by its scattered M-tiles. After remap: **L2 hit
+  49→76%, DRAM read requests −67%, device time −5.3%** (B1024_D512). Two knobs:
+  `W` (window height, =8, flat optimum) and `C` (XCD chunk size), which is
+  **weight-size dependent** — small reduction K (≤256, small `Dense[b]` fits one
+  XCD's L2 in a small chunk) wants `C=32` and *regresses* with large C (the
+  L2-greedy / LLC-starvation trap); larger K wants `C=60`. Verified `cos=1.0`
+  and win-or-neutral on all four headline shapes. Occupancy probe confirmed this
+  was the right lever over ping-pong / multi-wave interleave (see §8.5).
 
 ### 8.4 DEAD ENDS at real shapes (do not repeat)
 
@@ -306,8 +335,33 @@ scale the layout-API kernel is compute/memory-bound and wins.
 
 ### 8.5 Next opportunities
 
-The remaining store-side bottleneck is the bf16 LDS write in the C-shuffle (the
-readback + global store are already wide). Cross-block Dense[b] L2 reuse via a
-chiplet/XCD grid remap is the largest untried lever for the B1024 cells. The
-skew-tolerant persistent/sorted grid is the follow-up for the non-uniform
-deployment `M_i` distribution.
+**Bound:** the kernel is **memory-bandwidth-bound** at these shapes. Roofline:
+all four cells sit below the MI355X ridge (AI 126–248 FLOP/B < 312), at 32–48% of
+peak HBM. Occupancy probe (B1024_D512): 84 VGPR, 32 KB LDS/block → resource
+ceiling 5 waves/SIMD, **achieved 2.8 waves/SIMD**; `MemUnitStalled` 23%,
+`VALUBusy` 19% (ALU idle, not compute-bound).
+
+**Ruled out by the probe:**
+- **Ping-pong / 8-wave / 4-wave interleave** — SKIP. The kernel is occupancy-
+  resource-limited (LDS+VGPR), not latency-bound; more waves can't fit (32 KB
+  LDS already caps at ~5 blk/CU) and can't fix a 49% L2 miss. `STAGES_A=2`
+  already provides the 2-stage A pipeline. Both roofline and the stall counters
+  agree latency is not the wall — traffic is.
+- **Different MFMA atom (16×16×32, 32×32×16)** — low value; compute is only
+  ~25% of peak, so a faster MMA can't move a memory-bound kernel.
+
+**Done since:** the XCD remap (§8.3) — the lever this section previously flagged
+as "largest untried" — landed at +5% on D=512.
+
+**Still open:**
+- **Per-shape `C` autotune** — current defaults (`C=32` for K≤256, `C=60` for
+  K>256, `W=8`) are from a 5-point sweep; a finer sweep per deployment shape may
+  add a little.
+- **Raise arithmetic intensity above the 312 ridge** — larger `BLOCK_M` reuses
+  each weight load more, but hits the occupancy cliff at `BLOCK_M=256` (§8.4).
+  A 2× over Triton is not reachable by scheduling alone at bf16; it would need a
+  byte-cutting change (e.g. fp8 weights), which changes the numerics contract.
+- **Skew-tolerant persistent/sorted grid** — follow-up for the non-uniform
+  deployment `M_i` distribution (irrelevant for the uniform headline shapes).
+- **C-shuffle LDS write** — the bf16 LDS store in the epilogue is the remaining
+  store-side cost (the readback + global store are already wide).

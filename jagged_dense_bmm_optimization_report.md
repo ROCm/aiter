@@ -9,22 +9,36 @@ results + the exact commands to reproduce every experiment.
 ## TL;DR
 
 - The **generalized + optimized** FlyDSL kernel
-  (`aiter/ops/flydsl/kernels/jagged_dense_bmm_gen.py`) **beats upstream
-  Meta/HSTU Triton on all four production headline shapes by 1.13–1.31×**
-  (device time, MI355X).
-- The two **winning performance levers** were: (1) an **LDS C-shuffle epilogue**
-  that turns 64 scalar `buffer_store_short` per thread into 8 wide
+  (`aiter/ops/flydsl/kernels/jagged_dense_bmm_gen.py`) is at **rough parity with
+  upstream Meta/HSTU Triton** on the four production headline shapes — Triton's
+  **best autotuned config** is ~1–7% ahead (small reduction-K shapes) to within
+  noise (large-K shapes). FlyDSL does **not** autotune, so its clean run is its
+  deployed number; Triton's deployed number is its best-config `min`. See §2 for
+  the honest, method-matched comparison and the correction history.
+- The three **winning performance levers** were: (1) an **LDS C-shuffle
+  epilogue** that turns 64 scalar `buffer_store_short` per thread into 8 wide
   `buffer_store_dwordx4` (the MFMA accumulator is M-major per lane, so a direct
   vectorized store is impossible — route C through LDS to transpose), worth
-  **+6–17%**; and (2) a **shape-dependent `BLOCK_K`** (128 for reduction K≤256,
-  else 64), worth **~+4%** on the K=256 cells.
+  **+6–17%**; (2) a **shape-dependent `BLOCK_K`** (128 for reduction K≤256,
+  else 64), worth **~+4%** on the K=256 cells; and (3) a **chiplet (XCD)
+  block-ID remap** (HipKittens Algorithm 1) that co-locates a group's M-tiles on
+  one XCD's private L2, lifting the L2 hit rate **49%→76%** and worth **~+5%** on
+  the D=512 shapes (the gap-closing lever vs Triton).
 - One **correctness fix** was load-bearing at scale: **i64 offset math** — the
   row-base offset `seq_start*K` overflows i32 on `B1024_D512` (7.86M·512 ≈ 4.0e9
   > 2³¹) and GPU-faults without it.
-- **Method lesson:** CUDA-event **wall-clock lied by ~10×** on the small shapes
-  (it is ~90% host launch overhead). Every conclusion here is from **rocprofv3
-  per-kernel device time**. Two separate levers looked identical in wall-clock
-  while device time moved 30%.
+- **Method lesson #1:** CUDA-event **wall-clock lied by ~10×** on the small
+  shapes (it is ~90% host launch overhead). Every conclusion here is from
+  **rocprofv3 per-kernel device time**. Two separate levers looked identical in
+  wall-clock while device time moved 30%.
+- **Method lesson #2 (the correction):** an earlier version of this report
+  claimed FlyDSL "beats Triton 1.13–1.31×". That was a **measurement artifact**:
+  the Triton kernel **autotunes**, firing hundreds–thousands of trial-config
+  dispatches whose slow trials inflate the *median* by 30–40%. Comparing
+  FlyDSL's clean median against Triton's autotune-polluted median made FlyDSL
+  look artificially faster. The fair comparison uses **p10 / min** (steady-state
+  best config) for the autotuning kernel — which shows Triton's best config
+  slightly ahead. Always use p10/min, never median, for autotuning kernels.
 
 ---
 
@@ -66,20 +80,32 @@ max_seq_len=16384, 1024 groups.
 
 ## 2. Final results (device time, MI355X / gfx950, M_i = 7680)
 
-rocprofv3 `--kernel-trace`, median of the per-kernel dispatch durations:
+rocprofv3 `--kernel-trace`. **Method-matched comparison:** FlyDSL does not
+autotune, so its **p10 ≈ min** is its deployed number. Triton **autotunes**, so
+its deployed number is the best-config **min**; its p10 and median are inflated
+by the trial dispatches and are NOT what a deployment sees. The fair head-to-head
+is **FlyDSL p10 vs Triton min**.
 
-| shape | FlyDSL gen | Triton | speedup (tri/fly) |
-|---|---|---|---|
-| B120_D256_K256_N16384 | **312 µs** | 352 µs | **1.13×** |
-| B120_D512_K512_N16384 | **841 µs** | 1060 µs | **1.26×** |
-| B1024_D256_K256_N16384 | **2294 µs** | 2994 µs | **1.31×** |
-| B1024_D512_K512_N16384 | **6843 µs** | 8828 µs | **1.29×** |
+| shape | FlyDSL p10 (deployed) | Triton min (best cfg) | Triton p10 | Triton median | fair verdict |
+|---|---|---|---|---|---|
+| B120_D256_K256_N16384 | 274 µs | **256 µs** | 302 | 355 | Triton best ~7% ahead |
+| B120_D512_K512_N16384 | 774 µs | **751 µs** | 863 | 1061 | Triton best ~3% ahead |
+| B1024_D256_K256_N16384 | 2199 µs | **2082 µs** | 2467 | 2947 | Triton best ~6% ahead |
+| B1024_D512_K512_N16384 | 6392 µs | **6307 µs** | 7223 | 8789 | within ~1% (noise) |
 
-All cells `cos = 1.0000` vs the torch eager reference, including partial-tile,
-empty-group, and skewed edge cases.
+FlyDSL numbers include the chiplet (XCD) remap. All cells `cos = 1.0000` vs the
+torch eager reference, including partial-tile, empty-group, and skewed edge
+cases.
 
-> Microsecond numbers drift run-to-run with GPU clock; the **per-shape ordering
-> and the >1× speedup are the stable, reproducible signal.**
+> **Honest summary:** FlyDSL is at rough parity — competitive on the large-K
+> shapes (within noise on B1024_D512) and a few percent behind Triton's best
+> autotuned config on the small-K shapes. It is NOT a >1× win; the earlier such
+> claim was the median-vs-autotune-min artifact described in the TL;DR.
+>
+> Had we compared median-to-median (the original mistake), FlyDSL's clean ~274 µs
+> vs Triton's autotune-polluted 355 µs median would read as "1.30× faster" — and
+> that is exactly the trap. Microsecond numbers drift run-to-run with GPU clock;
+> the stable signal is **rough parity, Triton's best config slightly ahead.**
 
 ---
 
@@ -96,9 +122,12 @@ The repo provides a ready-made device-time harness:
 - `op_tests/flydsl_tests/bench_headline_worker.py` — args
   `<flydsl|triton> <B> <D> <Kout> <Mi>`; builds inputs for one headline cell and
   fires warmup + 30 launches of one implementation, nothing else.
-- `op_tests/flydsl_tests/read_us2.py` — args `<rocprof_outdir> <name_substr>`;
-  joins the rocprofv3 sqlite `kernel_dispatch`×`kernel_symbol` tables, filters by
-  kernel name, prints the median dispatch duration in µs.
+- `op_tests/flydsl_tests/read_us2.py` — args `<rocprof_outdir> <name_substr>
+  [stat]`; joins the rocprofv3 sqlite `kernel_dispatch`×`kernel_symbol` tables,
+  filters by kernel name, prints the dispatch duration in µs. `stat` defaults to
+  **`p10`** (10th percentile = steady-state best config); also `min|median|all`.
+  Use `p10`/`min` for autotuning kernels (Triton) — `median` is inflated by the
+  trial dispatches and manufactured the original false 1.3× claim.
 
 There is **no pure-Python substitute**: CUDA-graph capture of the FlyDSL launch
 path produces an empty graph (replay yields zeros), and batched CUDA-event timing
@@ -171,8 +200,8 @@ docker exec -w /home/anguyenh/aiter anguyenh-dev bash -c '
       rocprofv3 --kernel-trace -d /tmp/h_$IMPL -o trace -- \
       python op_tests/flydsl_tests/bench_headline_worker.py $IMPL 120 512 512 7680 >/dev/null 2>&1
   done
-  echo -n "FlyDSL  "; python op_tests/flydsl_tests/read_us2.py /tmp/h_flydsl jdbba
-  echo -n "Triton  "; python op_tests/flydsl_tests/read_us2.py /tmp/h_triton jagged_dense_bmm_broadcast_add
+  echo -n "FlyDSL  "; python op_tests/flydsl_tests/read_us2.py /tmp/h_flydsl jdbba p10
+  echo -n "Triton  "; python op_tests/flydsl_tests/read_us2.py /tmp/h_triton jagged_dense_bmm_broadcast_add p10
 '
 ```
 
@@ -191,9 +220,9 @@ for C in 120:256:256 120:512:512 1024:256:256 1024:512:512; do
       rocprofv3 --kernel-trace -d $O -o trace -- \
       python op_tests/flydsl_tests/bench_headline_worker.py $IMPL $B $D $KO 7680 >/dev/null 2>&1
   done
-  SUB=jdbba; F=$(python op_tests/flydsl_tests/read_us2.py /tmp/sw_flydsl_${B}_${D} jdbba)
-  T=$(python op_tests/flydsl_tests/read_us2.py /tmp/sw_triton_${B}_${D} jagged_dense_bmm_broadcast_add)
-  echo "B${B}_D${D}_K${KO}_N16384  FlyDSL ${F}us  Triton ${T}us"
+  F=$(python op_tests/flydsl_tests/read_us2.py /tmp/sw_flydsl_${B}_${D} jdbba p10)
+  T=$(python op_tests/flydsl_tests/read_us2.py /tmp/sw_triton_${B}_${D} jagged_dense_bmm_broadcast_add min)
+  echo "B${B}_D${D}_K${KO}_N16384  FlyDSL_p10 ${F}us  Triton_min ${T}us"
 done
 '
 ```
@@ -306,6 +335,6 @@ prototype baseline. Full detail in `jagged_dense_bmm_benchmark_repro.md` §1–7
 | `aiter/ops/flydsl/kernels/jagged_dense_bmm.py` | N=K=128 prototype (validated reference) |
 | `aiter/ops/flydsl/kernels/jagged_dense_bmm_gen.py` | generalized + optimized production kernel |
 | `op_tests/flydsl_tests/bench_headline_worker.py` | per-shape device-time worker (rocprofv3) |
-| `op_tests/flydsl_tests/read_us2.py` | rocprofv3 sqlite → median µs parser |
+| `op_tests/flydsl_tests/read_us2.py` | rocprofv3 sqlite → device-time µs parser (default `p10`; use `min` for autotuned kernels) |
 | `op_tests/flydsl_tests/bench_jagged_dense_bmm.py` | toy-shape correctness + wall-clock / `--device-time` bench |
 | `jagged_dense_bmm_benchmark_repro.md` | toy-shape benchmark detail + optimization log |
