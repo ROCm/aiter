@@ -1,18 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import triton
 import math
-from typing import Optional, Dict
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-_LOGGER = AiterTritonLogger()
 
 _GLUON_REPR_KEYS = [
     "BLOCK_M",
@@ -32,11 +24,6 @@ _gemm_a16w16_basic_repr = make_kernel_repr(
 _gemm_a16w16_lds_pipeline_repr = make_kernel_repr(
     "_gemm_a16w16_gfx1250_lds_pipeline_kernel", _GLUON_REPR_KEYS
 )
-
-
-def _get_config(M: int, N: int, K: int):
-    config, is_tuned = get_gemm_config("GEMM-A16W16", M, N, K)
-    return config, is_tuned
 
 
 def create_shared_layouts(
@@ -65,6 +52,20 @@ def create_shared_layouts(
         )
 
     return (SHARED_LAYOUT_A, SHARED_LAYOUT_B)
+
+
+def create_wmma_layouts(num_warps):
+    warp_bases = [(0, 1)]
+    for i in range(int(math.log2(num_warps // 2))):
+        warp_bases.append((1 << i, 0))
+    warp_bases = tuple(warp_bases)
+
+    wmma_layout = gl.amd.AMDWMMALayout(
+        version=3, transposed=True, warp_bases=warp_bases, instr_shape=[16, 16, 32]
+    )
+    operand_a = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=8)
+    operand_b = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=8)
+    return (wmma_layout, operand_a, operand_b)
 
 
 @gluon.jit(repr=_gemm_a16w16_basic_repr)
@@ -707,194 +708,3 @@ _KERNEL_MAP = {
     "basic": _gemm_a16w16_basic_kernel,
     "lds_pipeline": _gemm_a16w16_lds_pipeline_kernel,
 }
-
-
-def gemm_a16w16_gfx1250(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: torch.dtype = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[Dict] = None,
-    activation: Optional[str] = None,
-    kernel_type: str = "basic",
-):
-    """
-    Compute 16 bit gemm y = x @ w^T + bias using gluon (gfx1250).
-
-    Args:
-        x: Input tensor of shape (M, K)
-        w: Weight tensor of shape (N, K), internally transposed
-        bias: Optional bias tensor of shape (N,)
-        dtype: Output data type
-        y: Optional pre-allocated output tensor
-        config: Kernel tuning parameters:
-            - BLOCK_M: Tile size in M dimension (default: 128)
-            - BLOCK_N: Tile size in N dimension (default: 128)
-            - BLOCK_K: Tile size in K dimension (default: 32)
-            - NUM_BUFFERS: Pipeline stages (default: 2)
-            - num_warps: Warps per block (default: 8)
-        activation: Activation function ("gelu", "gelu_tanh", "silu", "silu_exp2", "relu")
-        kernel_type: Kernel variant to use:
-            - "basic": Simple pipelining with async TDM loads (default)
-            - "lds_pipeline": Manually pipelines LDS loads across K-tiles; places
-              load_shared_relaxed for tile i+1 before wmma for tile i so the
-              hardware LDS unit and matrix unit run in parallel (requires NUM_BUFFERS >= 2,
-              NUM_BUFFERS >= 3 recommended)
-
-    Returns:
-        Output tensor of shape (M, N)
-    """
-
-    assert (
-        kernel_type in _KERNEL_MAP
-    ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_KERNEL_MAP.keys())}"
-
-    _LOGGER.info(
-        f"GEMM_A16W16 [gluon/gfx1250]: x={tuple(x.shape)} w={tuple(w.shape)} kernel={kernel_type}"
-    )
-
-    assert x.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    ), f"Activations (x) must be fp16 or bf16, got {x.dtype}"
-    assert w.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
-    assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
-
-    M, K = x.shape
-    N, _ = w.shape
-
-    if config is None:
-        config, _ = _get_config(M, N, K)
-
-    BLOCK_M = config["BLOCK_M"]
-    BLOCK_N = config["BLOCK_N"]
-    BLOCK_K = config["BLOCK_K"]
-    NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
-    num_warps = config["num_warps"]
-
-    # Pad K to be divisible by block k so tdm loads never read out of bounds
-    K_padded = triton.cdiv(K, BLOCK_K) * BLOCK_K
-    if K_padded != K:
-        pad_size = K_padded - K
-        x = torch.nn.functional.pad(x, (0, pad_size))
-        w = torch.nn.functional.pad(w, (0, pad_size))
-        K = K_padded
-
-    # Clamp the software-pipeline depth to the number of K-tiles.
-    #
-    # The prologue/epilogue walk a fixed number of K-tiles determined by
-    # NUM_BUFFERS, independent of how many real tiles exist. If NUM_BUFFERS
-    # exceeds that count the descriptor base advances past the end of K while
-    # its bound stays stale (add_offsets never shrinks it), so TDM OOB
-    # zero-fill cannot fire and the WMMA consumes garbage. Cap the depth at the
-    # real tile count. Variants differ in reach and in the minimum depth they
-    # require:
-    #   basic : reaches num_k_tiles -> cap = num_k_tiles
-    #   lds_pipeline : preloads one tile ahead (needs num_k_tiles >= NB + 1)
-    #                  -> cap = num_k_tiles - 1
-    num_k_tiles = triton.cdiv(K, BLOCK_K)
-    _MIN_BUFFERS = {"basic": 1, "lds_pipeline": 2}
-    _DEPTH_SLACK = {"lds_pipeline": 1}
-
-    # Fall back to the basic kernel when the requested variant cannot satisfy
-    # its minimum pipeline depth for this K. The deeper variants reach more
-    # K-tiles (lds_pipeline preloads one tile ahead) and assert a minimum
-    # NUM_BUFFERS, so for few K-tiles they cannot run correctly. The basic
-    # kernel has no such floor (min depth 1) and is valid for every K, so we
-    # downgrade rather than error -- callers require a functional result for
-    # any shape, and a slower-but-correct kernel is acceptable.
-    depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
-    if depth_cap < _MIN_BUFFERS[kernel_type]:
-        needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
-        _LOGGER.info(
-            f"GEMM_A16W16 [gluon/gfx1250]: kernel_type='{kernel_type}' needs "
-            f"num_k_tiles>={needed} but num_k_tiles={num_k_tiles} "
-            f"(K={K}, BLOCK_K={BLOCK_K}); falling back to kernel_type='basic'."
-        )
-        kernel_type = "basic"
-        depth_cap = num_k_tiles  # basic: depth slack 0, min depth 1
-
-    NUM_BUFFERS = min(NUM_BUFFERS, depth_cap)
-
-    w = w.T
-
-    if x.stride(1) == 1:
-        physical_mk = True
-    elif x.stride(0) == 1:
-        physical_mk = False
-    else:
-        raise ValueError(
-            f"x must be contiguous in at least one dimension, got strides {x.stride()}"
-        )
-
-    if w.stride(1) == 1:
-        physical_kn = True
-    elif w.stride(0) == 1:
-        physical_kn = False
-    else:
-        raise ValueError(
-            f"w must be contiguous in at least one dimension, got strides {w.stride()}"
-        )
-
-    if y is None:
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
-
-    warp_bases = [(0, 1)]
-    for i in range(int(math.log2(num_warps // 2))):
-        warp_bases.append((1 << i, 0))
-    warp_bases = tuple(warp_bases)
-
-    wmma_layout = gl.amd.AMDWMMALayout(
-        version=3, transposed=True, warp_bases=warp_bases, instr_shape=[16, 16, 32]
-    )
-
-    operand_a = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=8)
-    operand_b = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=8)
-
-    shared_layouts = create_shared_layouts(
-        BLOCK_M, BLOCK_N, BLOCK_K, physical_mk, physical_kn
-    )
-    shared_a, shared_b = shared_layouts[0], shared_layouts[1]
-
-    num_tiles_m = triton.cdiv(M, BLOCK_M)
-    num_tiles_n = triton.cdiv(N, BLOCK_N)
-    grid = (num_tiles_m * num_tiles_n, 1)
-
-    kernel_fn = _KERNEL_MAP[kernel_type]
-
-    kernel_fn[grid](
-        x,
-        w,
-        y,
-        bias,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        y.stride(0),
-        y.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        NUM_BUFFERS=NUM_BUFFERS,
-        PHYSICAL_MK=physical_mk,
-        PHYSICAL_KN=physical_kn,
-        SHARED_LAYOUT_A=shared_a,
-        SHARED_LAYOUT_B=shared_b,
-        WMMA_LAYOUT=wmma_layout,
-        OPERAND_LAYOUT_A=operand_a,
-        OPERAND_LAYOUT_B=operand_b,
-        activation=_get_activation_from_str(activation) if activation else None,
-        USE_ACTIVATION=activation is not None,
-        ADD_BIAS=(bias is not None),
-        num_warps=num_warps,
-    )
-
-    return y

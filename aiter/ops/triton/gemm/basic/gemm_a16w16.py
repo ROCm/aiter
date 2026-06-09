@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
@@ -76,19 +77,142 @@ def gemm_a16w16(
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
         from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_a16w16_gfx1250 import (
-            gemm_a16w16_gfx1250,
+            _KERNEL_MAP,
+            create_shared_layouts,
+            create_wmma_layouts,
         )
 
-        return gemm_a16w16_gfx1250(
+        assert (
+            kernel_type in _KERNEL_MAP
+        ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_KERNEL_MAP.keys())}"
+        _LOGGER.info(
+            f"GEMM_A16W16 [gluon/gfx1250]: x={tuple(x.shape)} w={tuple(w.shape)} "
+            f"kernel={kernel_type}"
+        )
+        assert x.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ), f"Activations (x) must be fp16 or bf16, got {x.dtype}"
+        assert w.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
+        assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
+
+        M, K = x.shape
+        N, _ = w.shape
+
+        if config is None:
+            config, _ = get_gemm_config("GEMM-A16W16", M, N, K)
+
+        BLOCK_M = config["BLOCK_M"]
+        BLOCK_N = config["BLOCK_N"]
+        BLOCK_K = config["BLOCK_K"]
+        NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
+        num_warps = config["num_warps"]
+
+        # Pad K to be divisible by block k so tdm loads never read out of bounds
+        K_padded = triton.cdiv(K, BLOCK_K) * BLOCK_K
+        if K_padded != K:
+            pad_size = K_padded - K
+            x = torch.nn.functional.pad(x, (0, pad_size))
+            w = torch.nn.functional.pad(w, (0, pad_size))
+            K = K_padded
+
+        # Clamp the software-pipeline depth to the number of K-tiles.
+        #
+        # The prologue/epilogue walk a fixed number of K-tiles determined by
+        # NUM_BUFFERS, independent of how many real tiles exist. If NUM_BUFFERS
+        # exceeds that count the descriptor base advances past the end of K while
+        # its bound stays stale (add_offsets never shrinks it), so TDM OOB
+        # zero-fill cannot fire and the WMMA consumes garbage. Cap the depth at the
+        # real tile count. Variants differ in reach and in the minimum depth they
+        # require:
+        #   basic : reaches num_k_tiles -> cap = num_k_tiles
+        #   lds_pipeline : preloads one tile ahead (needs num_k_tiles >= NB + 1)
+        #                  -> cap = num_k_tiles - 1
+        num_k_tiles = triton.cdiv(K, BLOCK_K)
+        _MIN_BUFFERS = {"basic": 1, "lds_pipeline": 2}
+        _DEPTH_SLACK = {"lds_pipeline": 1}
+
+        # Fall back to the basic kernel when the requested variant cannot satisfy
+        # its minimum pipeline depth for this K. The basic kernel has no such floor
+        # (min depth 1) and is valid for every K, so we downgrade rather than error.
+        depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
+        if depth_cap < _MIN_BUFFERS[kernel_type]:
+            needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
+            _LOGGER.info(
+                f"GEMM_A16W16 [gluon/gfx1250]: kernel_type='{kernel_type}' needs "
+                f"num_k_tiles>={needed} but num_k_tiles={num_k_tiles} "
+                f"(K={K}, BLOCK_K={BLOCK_K}); falling back to kernel_type='basic'."
+            )
+            kernel_type = "basic"
+            depth_cap = num_k_tiles  # basic: depth slack 0, min depth 1
+
+        NUM_BUFFERS = min(NUM_BUFFERS, depth_cap)
+
+        w = w.T
+
+        if x.stride(1) == 1:
+            physical_mk = True
+        elif x.stride(0) == 1:
+            physical_mk = False
+        else:
+            raise ValueError(
+                f"x must be contiguous in at least one dimension, got strides {x.stride()}"
+            )
+
+        if w.stride(1) == 1:
+            physical_kn = True
+        elif w.stride(0) == 1:
+            physical_kn = False
+        else:
+            raise ValueError(
+                f"w must be contiguous in at least one dimension, got strides {w.stride()}"
+            )
+
+        if y is None:
+            y = torch.empty((M, N), dtype=dtype, device=x.device)
+
+        wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
+        shared_a, shared_b = create_shared_layouts(
+            BLOCK_M, BLOCK_N, BLOCK_K, physical_mk, physical_kn
+        )
+
+        grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
+
+        _KERNEL_MAP[kernel_type][grid](
             x,
             w,
-            bias=bias,
-            dtype=dtype,
-            y=y,
-            config=config,
-            activation=activation,
-            kernel_type=kernel_type,
+            y,
+            bias,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            y.stride(0),
+            y.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            NUM_BUFFERS=NUM_BUFFERS,
+            PHYSICAL_MK=physical_mk,
+            PHYSICAL_KN=physical_kn,
+            SHARED_LAYOUT_A=shared_a,
+            SHARED_LAYOUT_B=shared_b,
+            WMMA_LAYOUT=wmma_layout,
+            OPERAND_LAYOUT_A=operand_a,
+            OPERAND_LAYOUT_B=operand_b,
+            activation=_get_activation_from_str(activation) if activation else None,
+            USE_ACTIVATION=activation is not None,
+            ADD_BIAS=(bias is not None),
+            num_warps=num_warps,
         )
+
+        return y
 
     _LOGGER.info(f"GEMM_A16W16 [triton]: x={tuple(x.shape)} w={tuple(w.shape)}")
 
