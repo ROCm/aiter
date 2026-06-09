@@ -503,18 +503,18 @@ std::tuple<bool, ArgParser> create_args(int argc, char** argv)
 // ---------------------------------------------------------------------------
 // CPU forward-attention reference
 //
-// Matches _ref_attn() in op_tests/test_fmha_fwd_with_sink_asm.py:
+// Matches _ref_attn() in op_tests/test_fmha_fwd_with_sink_asm.py.
+// Works in the SCALED-LOGIT domain (scale = 1/sqrt(d) applied first).
 //
-//   S[b,h,m,n] = sum_d Q[b,m,h,d] * K[b,n,hk,d]         (raw, no scale)
-//   causal mask: S[b,h,m,n] = -inf  if n > m + (sk - sq) (bottom-right)
-//   max_total[b,h,m] = max(S[b,h,m,:])
-//   if has_sink: max_total = max(max_total, sink_raw[h])
-//                where sink_raw = sink_user * sqrt(d)  (post-scale -> raw)
-//   denom = sum_n exp((S - max_total) * scale)
-//         + (has_sink ? exp((sink_raw - max_total) * scale) : 0)
-//   P[b,h,m,n] = exp((S - max_total) * scale) / denom
+//   scores[b,h,m,n] = scale * sum_d Q[b,m,h,d] * K[b,n,hk,d]
+//   causal (bottom-right): scores = -inf if n > m + (sk - sq)
+//   max_total = max(scores[visible])
+//   if has_sink: max_total = max(max_total, sink_user[h])
+//                sink_user is already in scaled domain — no sqrt(d) needed
+//   denom = sum_n exp(scores - max_total) + (has_sink ? exp(sink_user - max_total) : 0)
+//   P[b,h,m,n] = exp(scores - max_total) / denom
 //   O[b,m,h,v] = sum_n P[b,h,m,n] * V[b,n,hk,v]
-//   LSE[b,h,m]  = max_total * scale + log(denom)
+//   LSE[b,h,m]  = max_total + log(denom)   (no extra * scale)
 //
 // All tensors stored bshd: HostTensor shape [b,s,h,d] or [b,h,s].
 // Accumulation in fp32.  GQA: Q head h uses K/V head (h / (nhead / nhead_k)).
@@ -539,54 +539,56 @@ void cpu_fwd_ref(
     bool  has_sink)
 {
     const int ratio         = nhead / nhead_k;
-    const int causal_offset = seqlen_k - seqlen_q; // bottom-right causal
+    // Bottom-right causal: mask n if n > m + (sk - sq).
+    // When sq == sk, this reduces to standard top-left (n > m).
+    const int causal_offset = seqlen_k - seqlen_q;
 
     for(int b = 0; b < batch; ++b)
     {
         for(int h = 0; h < nhead; ++h)
         {
-            const int   hk       = h / ratio;
-            const float sink_raw = has_sink
-                ? (to_float<F32>(sink_host(h)) * std::sqrt(static_cast<float>(hdim)))
-                : 0.f;
+            const int   hk           = h / ratio;
+            // sink_user is in the scaled-logit domain (same as scores = Q@K^T * scale).
+            // Passed verbatim — no sqrt(d) conversion.
+            const float sink_scaled  = has_sink ? to_float<F32>(sink_host(h)) : 0.f;
 
             for(int m = 0; m < seqlen_q; ++m)
             {
-                // Step 1: S = Q[b,m,h,:] @ K[b,:,hk,:]^T  (raw, no scale)
-                std::vector<float> s(seqlen_k);
+                // Step 1: scores = (Q[b,m,h,:] @ K[b,:,hk,:]^T) * scale
+                std::vector<float> scores(seqlen_k);
                 for(int n = 0; n < seqlen_k; ++n)
                 {
                     if(is_causal && n > m + causal_offset)
                     {
-                        s[n] = -std::numeric_limits<float>::infinity();
+                        scores[n] = -std::numeric_limits<float>::infinity();
                         continue;
                     }
                     float acc = 0.f;
                     for(int d = 0; d < hdim; ++d)
                         acc += to_float<BF16>(q_host(b, m, h,  d)) *
                                to_float<BF16>(k_host(b, n, hk, d));
-                    s[n] = acc;
+                    scores[n] = acc * scale;  // scale applied here
                 }
 
-                // Step 2: max_total (with optional sink)
-                float max_total = s[0];
+                // Step 2: max_total (with optional sink in scaled domain)
+                float max_total = scores[0];
                 for(int n = 1; n < seqlen_k; ++n)
-                    if(s[n] > max_total) max_total = s[n];
-                if(has_sink && sink_raw > max_total)
-                    max_total = sink_raw;
+                    if(scores[n] > max_total) max_total = scores[n];
+                if(has_sink && sink_scaled > max_total)
+                    max_total = sink_scaled;
 
-                // Step 3: unnormalized softmax + denom; s[] reused as P (unnorm).
+                // Step 3: unnormalized softmax + denom
                 float denom = 0.f;
                 for(int n = 0; n < seqlen_k; ++n)
                 {
-                    float v = std::isfinite(s[n])
-                                  ? std::exp((s[n] - max_total) * scale)
+                    float v = std::isfinite(scores[n])
+                                  ? std::exp(scores[n] - max_total)
                                   : 0.f;
-                    s[n]  = v;
+                    scores[n] = v;
                     denom += v;
                 }
                 if(has_sink)
-                    denom += std::exp((sink_raw - max_total) * scale);
+                    denom += std::exp(sink_scaled - max_total);
                 if(denom == 0.f) denom = 1.f; // guard fully-masked rows
 
                 // Step 4: O = P @ V
@@ -594,12 +596,12 @@ void cpu_fwd_ref(
                 {
                     float acc = 0.f;
                     for(int n = 0; n < seqlen_k; ++n)
-                        acc += (s[n] / denom) * to_float<BF16>(v_host(b, n, hk, dv));
+                        acc += (scores[n] / denom) * to_float<BF16>(v_host(b, n, hk, dv));
                     o_ref(b, m, h, dv) = from_float<BF16>(acc);
                 }
 
-                // Step 5: LSE = max_total * scale + log(denom)
-                lse_ref(b, h, m) = from_float<F32>(max_total * scale + std::log(denom));
+                // Step 5: LSE = max_total + log(denom)  (no extra * scale)
+                lse_ref(b, h, m) = from_float<F32>(max_total + std::log(denom));
             }
         }
     }
@@ -701,6 +703,20 @@ bool run_bench(const ArgParser& arg)
     q_buf.ToDevice(q_host.data());
     k_buf.ToDevice(k_host.data());
     v_buf.ToDevice(v_host.data());
+    // Zero-initialise output and LSE before the kernel call.  The ASM kernel
+    // may read the current O/LSE as an initial value when accumulating across
+    // KV-tiles (analogous to how PyTorch's torch.empty returns zero-filled
+    // GPU memory on ROCm).  Without this, hipMalloc garbage corrupts the
+    // accumulation and produces wrong results for multi-tile K sequences.
+    out_buf.SetZero();
+    {
+        // lse_buf must start at -inf (log-sum-exp identity: exp(-inf)=0 contributes
+        // nothing), NOT 0 (exp(0)=1 would inflate every denominator by +1).
+        const float neg_inf = -std::numeric_limits<float>::infinity();
+        std::vector<float> neg_inf_buf(lse_bytes / sizeof(float), neg_inf);
+        HIP_CHECK(hipMemcpy(lse_buf.GetDeviceBuffer(), neg_inf_buf.data(),
+                            lse_bytes, hipMemcpyHostToDevice));
+    }
     if(has_sink)
         sink_buf.ToDevice(sink_host.data());
     else
@@ -773,18 +789,26 @@ bool run_bench(const ArgParser& arg)
               << ", s:" << seqlen_q << "/" << seqlen_k << ", d:" << hdim
               << ", scale:" << scale << sink_str << std::flush;
 
-    // ---- Warmup ----
+    // ---- Warmup (re-init buffers each call so merge state doesn't accumulate) ----
     for(int i = 0; i < warmup; ++i)
+    {
+        out_buf.SetZero();
+        lse_buf.SetZero();
         run_kernel();
+    }
     HIP_CHECK(hipStreamSynchronize(stream));
 
-    // ---- Timed run (HIP events) ----
+    // ---- Timed run (re-init each iter to match single-call semantics) ----
     hipEvent_t ev_start, ev_stop;
     HIP_CHECK(hipEventCreate(&ev_start));
     HIP_CHECK(hipEventCreate(&ev_stop));
     HIP_CHECK(hipEventRecord(ev_start, stream));
     for(int i = 0; i < repeat; ++i)
+    {
+        out_buf.SetZero();
+        lse_buf.SetZero();
         run_kernel();
+    }
     HIP_CHECK(hipEventRecord(ev_stop, stream));
     HIP_CHECK(hipEventSynchronize(ev_stop));
     float elapsed_ms = 0.f;
@@ -805,6 +829,19 @@ bool run_bench(const ArgParser& arg)
     {
         std::cout << std::endl;
         return true;
+    }
+
+    // ---- Validation run: single call from -inf/0 initial state ----
+    // lse_buf = -inf (log-sum-exp identity), out_buf = 0, then exactly ONE kernel call.
+    // This prevents multiple-call accumulation from corrupting the LSE comparison.
+    {
+        out_buf.SetZero();
+        const float neg_inf = -std::numeric_limits<float>::infinity();
+        std::vector<float> ni(lse_bytes / sizeof(float), neg_inf);
+        HIP_CHECK(hipMemcpy(lse_buf.GetDeviceBuffer(), ni.data(),
+                            lse_bytes, hipMemcpyHostToDevice));
+        run_kernel();
+        HIP_CHECK(hipStreamSynchronize(stream));
     }
 
     // ---- CPU reference ----
