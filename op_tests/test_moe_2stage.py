@@ -752,7 +752,7 @@ def _iter_legacy_cases():
     ) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
         triple = (quant_type, aq_dtype, wq_dtype)
 
-        if triple in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
+        if triple == _PER1X32_BF16_FP4:
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
                 for m in args.tokenNum:
                     yield _kw(
@@ -768,6 +768,23 @@ def _iter_legacy_cases():
                         hidden_pad=hidden_pad,
                         intermediate_pad=intermediate_pad,
                     ), extras
+        elif triple == _PER1X32_FP8_FP4:
+            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+                for act_type in args.act:
+                    for m in args.tokenNum:
+                        yield _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            hidden_pad=hidden_pad,
+                            intermediate_pad=intermediate_pad,
+                        ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
                 for act_type in args.act:
