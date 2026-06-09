@@ -38,22 +38,16 @@ THREADS = 256
 # --- HipKittens Algorithm 1 chiplet (XCD) block-ID remap knobs ---
 # MI355X / CDNA4 has 8 XCDs; the hardware routes raw block id `xy` to XCD
 # `xy % NXCD`. We invert that round-robin so a group's M-tiles (which all share
-# that group's Dense[b] weight matrix) co-locate on the same XCD's private L2,
-# cutting the redundant HBM re-reads of Dense[b]. Measured: L2 hit 49->76% and
-# -5% device time on the D=512 shapes (the bigger the reduction K / weight, the
-# bigger the win). The sweet-spot chunk size C is weight-size dependent: small K
-# (small weight, fits one XCD's L2 in a small chunk) wants small C; larger K
-# wants a larger chunk -- see XCD_C below. W=8 is a flat optimum across shapes.
+# that group's Dense[b] weight matrix) co-locate on the same XCD's private L2.
 NXCD = 8
-XCD_W = 8  # knob W: window height (M-tiles) for the 2D windowed traversal
-XCD_C_SMALL_K = 32  # knob C for reduction K <= 256 (small weight)
-XCD_C_LARGE_K = 60  # knob C for reduction K  > 256 (large weight)
+XCD_C = 16  # knob C: # consecutive logical blocks forced onto the same XCD
+XCD_W = 8   # knob W: window height (M-tiles) for the 2D windowed traversal
 
 
 def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
-    """HipKittens Algorithm 1 remap. `xy` is the raw hardware linear block id
-    (fx.Int32, uniform across the wave). `num_rows`, `num_cols`, `C`, `W`, `nXCD`
-    are compile-time Python ints. Returns (row, col) output-tile coords, both
+    """Algorithm 1 remap. `xy` is the raw hardware linear block id (fx.Int32,
+    uniform across the wave). `num_rows`, `num_cols`, `C`, `W`, `nXCD` are
+    compile-time Python ints. Returns (row, col) output-tile coords, both
     uniform fx.Int32. row in [0, num_rows), col in [0, num_cols).
 
     Logical 2D tile grid for THIS kernel: row = global M-tile index
@@ -65,10 +59,10 @@ def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
     Both phases are exact permutations of [0, num_rows*num_cols) for ANY total /
     C / W (phase 1 identity-maps the non-(nXCD*C)-divisible tail; phase 2's
     min() window tail handles num_rows % W != 0), so the remap never drops or
-    duplicates an output tile -- verified by cos=1.0 across all headline shapes.
+    duplicates an output tile -- verified by check_xcd_perm.py and cos=1.0.
     """
     total = num_rows * num_cols  # compile-time
-    period = nXCD * C  # compile-time
+    period = nXCD * C            # compile-time
     prefix = total - (total % period)  # largest [0,prefix) divisible by period
     xy = fx.Int32(xy)
     cnXCD = fx.Int32(nXCD)
@@ -131,12 +125,14 @@ def make_bounded_buffer_tensor(tensor, num_records_bytes):
 
 
 @functools.lru_cache(maxsize=None)
-def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES, N_GROUPS, XCD_C, XCD_W):
+def _build_launcher(
+    N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES, N_GROUPS, XCD_C, XCD_W
+):
     """Build (and memoize) a launch wrapper specialized to this (N, K, tiling).
     N (output) and K (reduction) are baked in as closure constants. BM_TILES
     (= ceil(max_seq_len/BLOCK_M)) and N_GROUPS are also baked in so the chiplet
     (XCD) block-ID remap dimensions are compile-time; this makes each distinct
-    (shape, XCD_C, XCD_W) memoize its own compiled kernel."""
+    (shape, XCD_C, XCD_W) get its own compiled kernel."""
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
     # Logical 2D tile grid for the chiplet remap: rows = all M-tiles of all
     # groups stacked (group-major), cols = N column-tiles of one group.
@@ -148,10 +144,10 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
 
     @flyc.kernel
     def jdbba_kernel(
-        C: fx.Tensor,  # out    (L, N)   bf16
-        A: fx.Tensor,  # jagged (L, K)   bf16
-        B: fx.Tensor,  # dense  (B_groups * N, K) bf16 (pre-transposed, tall)
-        BIAS: fx.Tensor,  # bias   (B_groups * N,)   bf16
+        C: fx.Tensor,            # out    (L, N)   bf16
+        A: fx.Tensor,            # jagged (L, K)   bf16
+        B: fx.Tensor,            # dense  (B_groups * N, K) bf16 (pre-transposed, tall)
+        BIAS: fx.Tensor,         # bias   (B_groups * N,)   bf16
         SEQ_OFFSETS: fx.Tensor,  # (B_groups + 1,) int32
         tiled_mma: fx.TiledMma,
         tiled_copy_g2s_A: fx.TiledCopy,
@@ -178,8 +174,12 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
 
         # --- Device group resolution (read seq_offsets[b], seq_offsets[b+1]) ---
         seq_rsrc = fx.buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
-        seq_start = fx.buffer_ops.buffer_load(seq_rsrc, fx.Int32(off_b), vec_width=1, dtype=fx.T.i32())
-        seq_end = fx.buffer_ops.buffer_load(seq_rsrc, fx.Int32(off_b) + fx.Int32(1), vec_width=1, dtype=fx.T.i32())
+        seq_start = fx.buffer_ops.buffer_load(
+            seq_rsrc, fx.Int32(off_b), vec_width=1, dtype=fx.T.i32()
+        )
+        seq_end = fx.buffer_ops.buffer_load(
+            seq_rsrc, fx.Int32(off_b) + fx.Int32(1), vec_width=1, dtype=fx.T.i32()
+        )
         # Scalarize: keep M_b and all derived offsets / the C descriptor uniform
         # (SGPR), else the divergent C descriptor forces an epilogue store waterfall.
         seq_start = fx.rocdl.readfirstlane(fx.T.i32(), seq_start)
@@ -211,9 +211,7 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
 
             # Broadcast bias: group b's (N,) slice viewed as (BLOCK_M, N) M-stride 0.
             bias_elem_off = fx.Int32(off_b) * fx.Int32(N)
-            BIAS_g = fx.make_view(
-                fx.add_offset(fx.get_iter(BIAS), fx.make_int_tuple(bias_elem_off)), fx.get_layout(BIAS)
-            )
+            BIAS_g = fx.make_view(fx.add_offset(fx.get_iter(BIAS), fx.make_int_tuple(bias_elem_off)), fx.get_layout(BIAS))
             BIAS_buf = fx.rocdl.make_buffer_tensor(BIAS_g, max_size=True)
             gBias2d = fx.make_view(fx.get_iter(BIAS_buf), fx.make_layout((BLOCK_M, N), (0, 1)))
             gBias = fx.flat_divide(gBias2d, (BLOCK_M, BLOCK_N))[None, None, 0, block_n_idx]  # (BM, BN)
@@ -234,7 +232,7 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
             sA = fx.make_view(fx.get_dyn_shared(fx.BFloat16), composed_layout_A)  # (BM, BK, STAGES_A)
 
             thr_gA_k = thr_copy_g2s_A.partition_S(gA_k)  # (VA, VM, VK, k)
-            thr_sA = thr_copy_g2s_A.partition_D(sA)  # (VA, VM, VK, STAGES_A)
+            thr_sA = thr_copy_g2s_A.partition_D(sA)      # (VA, VM, VK, STAGES_A)
             thr_sA_s2r = thr_copy_s2r_A.partition_S(sA)  # (VA, VM, VK, STAGES_A)
             thr_gB_k = thr_copy_g2r_B.partition_S(gB_k)  # (VB, VN, VK, k)
 
@@ -344,8 +342,8 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
 
             # Re-read N-contiguous from LDS and wide-store to global.
             thr_copy_s2g_C = tiled_copy_s2g_C.get_slice(tid)
-            thr_sC_read = thr_copy_s2g_C.partition_S(sC)  # (V, VM, VN)
-            thr_gC = thr_copy_s2g_C.partition_D(gC)  # (V, VM, VN) global
+            thr_sC_read = thr_copy_s2g_C.partition_S(sC)   # (V, VM, VN)
+            thr_gC = thr_copy_s2g_C.partition_D(gC)        # (V, VM, VN) global
             cs_frag = fx.make_fragment_like(thr_sC_read)
             fx.copy(fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16), thr_sC_read, cs_frag)
             fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16), cs_frag, thr_gC)
@@ -378,8 +376,8 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
         # O4 C-shuffle store copy: row-major (BLOCK_M, BLOCK_N), 8 bf16 / thread
         # along N (128b) so the global store coalesces to buffer_store_dwordx4.
         c_val = 8  # 16B / bf16
-        c_thrs_n = BLOCK_N // c_val  # threads along N
-        c_thrs_m = THREADS // c_thrs_n  # threads along M
+        c_thrs_n = BLOCK_N // c_val          # threads along N
+        c_thrs_m = THREADS // c_thrs_n       # threads along M
         tiled_copy_s2g_C = fx.make_tiled_copy(
             fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16),
             fx.make_layout(((c_thrs_n, c_thrs_m), (1, c_val)), ((c_thrs_m * c_val, 1), (1, c_thrs_m))),
@@ -406,7 +404,7 @@ def jagged_dense_bmm(
     n_groups: int,
     max_seq_len: int,
     stream: fx.Stream = fx.Stream(None),
-    xcd_c: int | None = None,
+    xcd_c: int = XCD_C,
     xcd_w: int = XCD_W,
 ):
     """Public entry. Derives N (output) and K (reduction) from the tall dense B
@@ -414,8 +412,7 @@ def jagged_dense_bmm(
 
     xcd_c / xcd_w are the chiplet (XCD) remap knobs (C and W); they are baked
     into the compiled kernel, so each distinct (shape, xcd_c, xcd_w) memoizes a
-    separate kernel. xcd_c defaults to a weight-size-dependent value (see the
-    XCD_C_* module constants)."""
+    separate kernel."""
     N = B.shape[0] // n_groups
     K = B.shape[1]
     # Shape-dependent BLOCK_K: for small reduction K (<=256) a 2-iter K-loop with
@@ -423,11 +420,8 @@ def jagged_dense_bmm(
     # the deeper BLOCK_K=64 pipeline keeps occupancy and is faster. (BLOCK_K=256
     # is unsafe: the 2-stage double-buffer epilogue mis-accumulates a single tile.)
     block_k = 128 if K <= 256 else BLOCK_K
-    # Weight-size-dependent XCD chunk: small reduction K -> small Dense[b] that
-    # fits one XCD's L2 in a small chunk (large C starves the shared LLC); larger
-    # K wants the bigger chunk. Swept per headline shape.
-    if xcd_c is None:
-        xcd_c = XCD_C_SMALL_K if K <= 256 else XCD_C_LARGE_K
     bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
-    launch = _build_launcher(N, K, BLOCK_M, BLOCK_N, block_k, STAGES_A, THREADS, bm, n_groups, xcd_c, xcd_w)
+    launch = _build_launcher(
+        N, K, BLOCK_M, BLOCK_N, block_k, STAGES_A, THREADS, bm, n_groups, xcd_c, xcd_w
+    )
     return launch(C, A, B, BIAS, SEQ_OFFSETS, n_groups, max_seq_len, stream=stream)
