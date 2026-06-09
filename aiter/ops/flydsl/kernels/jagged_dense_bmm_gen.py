@@ -58,7 +58,7 @@ def _use_mfma_k32(arch: str | None = None) -> bool:
 NXCD = 8
 XCD_W = 8  # knob W: window height (M-tiles) for the 2D windowed traversal
 XCD_C_SMALL_K = 32  # knob C for reduction K <= 256 (small weight)
-XCD_C_LARGE_K = 60  # knob C for reduction K  > 256 (large weight)
+XCD_C_LARGE_K = 120  # knob C for reduction K  > 256 (large weight; autotuned)
 
 
 def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
