@@ -82,9 +82,22 @@ def bscale_bytes_for(ne, n_out):
 
 
 def ascale_bytes(BM, max_m=MAX_M):
-    """A_scale buffer-resource num_bytes (kAS_bound_div=BM, atomic mode):
-    (max_m/BM) * kAS_per_chunk_dw * 4."""
-    return (max_m // BM) * kAS_per_chunk_dw * 4
+    """A_scale buffer-resource num_bytes.
+
+    The A_scale read stride is one ``kAS_per_chunk_dw*4`` (512B) chunk per
+    ``chunk_div`` A rows, where ``chunk_div = 16 if BM==16 else 32`` (see the
+    ``chunk_base = m_row // chunk_div`` addressing in ``_gemm2_body``). The
+    resource bound MUST divide ``max_m`` by that read granularity -- NOT by BM.
+
+    For BM in {64,128} the chunk granularity (32) is smaller than BM, so the
+    old ``max_m // BM`` under-sized the resource by ``BM/32x`` and clamped
+    A_scale reads (-> 0) for every sorted row past ``max_m*32/BM``. That
+    silently zeroed the gemm2 output of the trailing sorted rows -- i.e. the
+    high-id experts incl. the always-on shared expert -- so large-M MoE
+    (BM128 nonatomic / mxfp4out) lost accuracy (e.g. KIMI cos 0.68 @ M=16384,
+    0.05 @ M=32768) while smaller M that stayed under the bound looked fine."""
+    chunk_div = 16 if BM == 16 else 32
+    return (max_m // chunk_div) * kAS_per_chunk_dw * 4
 
 
 # Back-compat KIMI defaults (NE=385, N_OUT=7168, MAX_M=655360).
