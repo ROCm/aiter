@@ -1610,6 +1610,21 @@ class FmoeTuner(TunerCommon):
             a2_qt, a2_scale = aiter.pertoken_quant(
                 ref1.view(hidden_states.shape[0], -1, 128), quant_dtype=AQDType
             )
+        elif quant_type == QuantType.per_1x32:
+            # per_1x32 stage-2 activation quant depends on the activation scheme,
+            # which is encoded by the (already-quantized) stage-1 input dtype:
+            #   bf16/fp16 -> a16w4 (activations not quantized)
+            #   fp8       -> a8w4  (MX-FP8 block quant)
+            #   fp4x2     -> a4w4  (MX-FP4 block quant)
+            # get_torch_quant(per_1x32) is fp4-only, so dispatch explicitly.
+            if AQDType in (dtypes.bf16, dtypes.fp16):
+                a2_qt, a2_scale = ref1.to(AQDType), None
+            elif AQDType == dtypes.fp8:
+                a2_qt, a2_scale = torch_dynamic_mxfp8_quant(ref1)
+            else:
+                a2_qt, a2_scale = aiter.get_torch_quant(quant_type)(
+                    ref1, quant_dtype=AQDType
+                )
         else:
             torch_quant = aiter.get_torch_quant(quant_type)
             a2_qt, a2_scale = torch_quant(ref1, quant_dtype=AQDType)
@@ -3235,9 +3250,13 @@ class FmoeTuner(TunerCommon):
                     a1_scale = None
                 elif (
                     q_type == QuantType.per_1x32
-                    and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+                    and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
                     and q_dtype_w == dtypes.fp4x2
                 ):
+                    # a16w4 & a8w4: the torch reference runs the activation in
+                    # bf16 (no quant); matches op_tests/test_moe_2stage.py. fp8
+                    # must be included here, else it falls through to the fp4-only
+                    # per_1x32 quantizer and asserts.
                     a1_qt = hidden.to(dtype)
                     a1_scale = None
                 else:
@@ -3260,10 +3279,18 @@ class FmoeTuner(TunerCommon):
                     num_warmup=args.warmup,
                     num_iters=args.iters,
                 )
+                # a16wi4: per_1x32_i4_quant stores int4 in an int8 container.
+                # The torch reference detects int4 weights by the i4x2 dtype, so
+                # pass an i4x2-reinterpreted view to the reference only (the kernel
+                # path above consumes the int8 w*_qt). Mirrors op_tests/test_moe_2stage.py.
+                w1_qt_ref, w2_qt_ref = w1_qt, w2_qt
+                if q_type == QuantType.per_1x32 and w1_qt.dtype == dtypes.i8:
+                    w1_qt_ref = w1_qt.view(dtypes.i4x2)
+                    w2_qt_ref = w2_qt.view(dtypes.i4x2)
                 ref = self.torch_moe_2stages(
                     a1_qt,
-                    w1_qt,
-                    w2_qt,
+                    w1_qt_ref,
+                    w2_qt_ref,
                     topk_weights,
                     topk_ids,
                     a1_scale=a1_scale,

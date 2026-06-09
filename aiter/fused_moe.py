@@ -1078,7 +1078,7 @@ def get_2stage_cfgs(
         inter_dim,
         expert,
         topk,
-        activation,
+        str(activation),
         str(dtype),
         str(q_dtype_a),
         str(q_dtype_w),
