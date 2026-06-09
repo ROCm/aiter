@@ -9,10 +9,6 @@ from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-from aiter.ops.triton._gluon_kernels.utils.prefetch import (
-    gemm_l2_prefetch,
-    gemm_l2_prefetch_prologue,
-)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -27,7 +23,6 @@ _GLUON_REPR_KEYS = [
     "PHYSICAL_KN",
     "USE_ACTIVATION",
     "ADD_BIAS",
-    "L2_PREFETCH_DISTANCE",
 ]
 
 _gemm_a16w16_basic_repr = make_kernel_repr(
@@ -101,10 +96,7 @@ def _gemm_a16w16_basic_kernel(
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
-    L2_PREFETCH_DISTANCE: gl.constexpr,
 ):
-    USE_L2_PREFETCH: gl.constexpr = L2_PREFETCH_DISTANCE > 0
-
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_M)
     pid_m = pid % num_pid_m
@@ -180,23 +172,6 @@ def _gemm_a16w16_basic_kernel(
 
     accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
-    # L2 prefetch helpers compute offsets relative to the descriptor's current
-    # position. Since the per-block (M, N) offset is baked into the base, we
-    # pass 0 for off_am/off_bn/load_idx so off_k is purely a K-direction delta.
-    if USE_L2_PREFETCH:
-        gemm_l2_prefetch_prologue(
-            L2_PREFETCH_DISTANCE,
-            0,
-            a_desc,
-            b_desc,
-            0,
-            0,
-            BLOCK_K,
-            NUM_BUFFERS,
-            not PHYSICAL_MK,
-            not PHYSICAL_KN,
-        )
-
     # Fill the pipeline
     for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
@@ -260,19 +235,6 @@ def _gemm_a16w16_basic_kernel(
             )
 
         load_idx += 1
-
-        if USE_L2_PREFETCH:
-            gemm_l2_prefetch(
-                L2_PREFETCH_DISTANCE - 1,
-                0,
-                a_desc,
-                b_desc,
-                0,
-                0,
-                BLOCK_K,
-                not PHYSICAL_MK,
-                not PHYSICAL_KN,
-            )
 
         if PHYSICAL_MK:
             cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -383,7 +345,6 @@ def _gemm_a16w16_lds_pipeline_kernel(
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
-    L2_PREFETCH_DISTANCE: gl.constexpr,
 ):
     """Local-load pipelining across K-tiles.
 
@@ -395,7 +356,6 @@ def _gemm_a16w16_lds_pipeline_kernel(
     fully before each ds_read batch (async_wait(0)), but the ds_read/wmma
     overlap is still preserved.  NUM_BUFFERS >= 3 is recommended.
     """
-    USE_L2_PREFETCH: gl.constexpr = L2_PREFETCH_DISTANCE > 0
     gl.static_assert(NUM_BUFFERS >= 2, "lds_pipeline kernel requires NUM_BUFFERS >= 2")
 
     pid = gl.program_id(axis=0)
@@ -472,23 +432,6 @@ def _gemm_a16w16_lds_pipeline_kernel(
     compute_idx = 0
 
     accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
-
-    # L2 prefetch helpers compute offsets relative to the descriptor's current
-    # position. Since the per-block (M, N) offset is baked into the base, we
-    # pass 0 for off_am/off_bn/load_idx so off_k is purely a K-direction delta.
-    if USE_L2_PREFETCH:
-        gemm_l2_prefetch_prologue(
-            L2_PREFETCH_DISTANCE,
-            0,
-            a_desc,
-            b_desc,
-            0,
-            0,
-            BLOCK_K,
-            NUM_BUFFERS,
-            not PHYSICAL_MK,
-            not PHYSICAL_KN,
-        )
 
     # TDM prologue: fill the pipeline with NUM_BUFFERS-1 tiles
     for _ in gl.static_range(NUM_BUFFERS):
@@ -589,19 +532,6 @@ def _gemm_a16w16_lds_pipeline_kernel(
 
     load_idx += 1
 
-    if USE_L2_PREFETCH:
-        gemm_l2_prefetch(
-            L2_PREFETCH_DISTANCE - 1,
-            0,
-            a_desc,
-            b_desc,
-            0,
-            0,
-            BLOCK_K,
-            not PHYSICAL_MK,
-            not PHYSICAL_KN,
-        )
-
     # Pre-load the NEXT tile's operands into registers *before* the WMMA
     # below.  The hardware can run LDS reads and the matrix unit in
     # parallel, hiding the ds_read latency inside the WMMA execution.
@@ -670,19 +600,6 @@ def _gemm_a16w16_lds_pipeline_kernel(
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
         load_idx += 1
-
-        if USE_L2_PREFETCH:
-            gemm_l2_prefetch(
-                L2_PREFETCH_DISTANCE - 1,
-                0,
-                a_desc,
-                b_desc,
-                0,
-                0,
-                BLOCK_K,
-                not PHYSICAL_MK,
-                not PHYSICAL_KN,
-            )
 
         # Pre-load the NEXT tile's operands into registers *before* the WMMA
         # below.  The hardware can run LDS reads and the matrix unit in
@@ -858,7 +775,6 @@ def gemm_a16w16_gfx1250(
     BLOCK_K = config["BLOCK_K"]
     NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
     num_warps = config["num_warps"]
-    L2_PREFETCH_DISTANCE = config.get("L2_PREFETCH_DISTANCE", 0)
 
     # Pad K to be divisible by block k so tdm loads never read out of bounds
     K_padded = triton.cdiv(K, BLOCK_K) * BLOCK_K
@@ -978,7 +894,6 @@ def gemm_a16w16_gfx1250(
         activation=_get_activation_from_str(activation) if activation else None,
         USE_ACTIVATION=activation is not None,
         ADD_BIAS=(bias is not None),
-        L2_PREFETCH_DISTANCE=L2_PREFETCH_DISTANCE,
         num_warps=num_warps,
     )
 

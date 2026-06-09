@@ -4,7 +4,6 @@
         "BLOCK_N": 32,
         "BLOCK_K": 256,
         "NUM_BUFFERS": 5,
-        "num_warps": 2,
-        "L2_PREFETCH_DISTANCE": 0
+        "num_warps": 2
     }
 }
