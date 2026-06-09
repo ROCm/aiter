@@ -281,11 +281,27 @@ def test_fmha_fwd_with_sink_varlen_asm_via_flash_attn_varlen_func(head_dim, is_c
     sink = _d64_sink(hq, device) if head_dim == 64 else None
 
     out_direct, lse_direct = run_kernel(
-        q, k, v, cu, cu, max_seqlen_q, scale=scale, is_causal=is_causal, sink=sink,
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q,
+        scale=scale,
+        is_causal=is_causal,
+        sink=sink,
         via="ops",
     )
     out_via, lse_via = run_kernel(
-        q, k, v, cu, cu, max_seqlen_q, scale=scale, is_causal=is_causal, sink=sink,
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max_seqlen_q,
+        scale=scale,
+        is_causal=is_causal,
+        sink=sink,
         via="public",
     )
 
