@@ -744,7 +744,7 @@ def _gfx1250_unified_attention_2d(
     waves_per_eu = 1
     if SLIDING_WINDOW > 0:
         sel_loop_variant = 0
-    if shuffled_kv_cache or TILE_SIZE > 32:
+    elif shuffled_kv_cache or TILE_SIZE > 32:
         sel_loop_variant = 2
     else:
         sel_loop_variant = 0
