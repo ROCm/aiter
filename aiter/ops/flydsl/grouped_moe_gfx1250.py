@@ -385,9 +385,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     tile_m, tile_n, tile_k = 64, 256, 256
     m_warp, n_warp = 1, 4
     num_buffers = 2
-    split_k1 = 1
-    split_k2 = 1
-    grouped_persistent_m = False
+    grouped_persistent_m = True
     persistent_workers = None
     cfg_row = _find_grouped_config(
         token_num=token_num,
@@ -406,8 +404,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
         n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
         num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
-        split_k1 = _as_int(cfg_row.get("split_k1"), split_k1)
-        split_k2 = _as_int(cfg_row.get("split_k2"), split_k2)
         grouped_persistent_m = _as_bool(
             cfg_row.get("grouped_persistent_m"), grouped_persistent_m
         )
@@ -522,18 +518,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
         m_tile_prefix, m_tile_map = _make_m_tile_prefix_map(masked_m, _m_tile_cfg)
 
-    def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
-        from aiter.ops.triton.quant import dynamic_mxfp8_quant
-
-        y, scale = dynamic_mxfp8_quant(
-            x.contiguous().view(-1, last_dim), quant_dtype=dtypes.fp8
-        )
-        payload = y.view(torch.uint8).contiguous().view(*x.shape)
-        scale_u8 = (
-            scale.view(*x.shape[:-1], last_dim // 32).view(torch.uint8).contiguous()
-        )
-        return payload, scale_u8
-
     if data_format == "fp4":
         # a1 fp4 quant: AITER_GROUPED_GEMM_NAIVE=1 uses the torch reference;
         # the fast path uses the HIP MXFP4 quant kernel so its e8m0 rounding
@@ -562,8 +546,29 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
     else:
         # a8w4 stage1 input: per-block-32 MXFP8 quantization.
-        a1_payload, a1_scale_token_u8 = _quantize_mxfp8_payload(
-            hidden_states, model_dim
+        from aiter.utility import fp4_utils as _aiter_fp4u
+
+        BLOCK = 32
+        DTYPE_MAX = 240.0
+        a1_flat = hidden_states.contiguous().view(-1, model_dim).float()
+        Mtok = a1_flat.shape[0]
+        blk = a1_flat.view(-1, BLOCK)
+        blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
+        max_abs = blk.abs().amax(dim=1)
+        scale_e8m0 = _aiter_fp4u.f32_to_mx_e8m0_scale(
+            max_abs, dtype=_aiter_fp4u.MxDtypeInt.FP8_E4M3
+        )
+        scale_f32 = _aiter_fp4u.e8m0_to_f32(scale_e8m0)
+        scale_f32 = torch.nan_to_num(scale_f32, nan=1.0, posinf=1.0, neginf=1.0)
+        scale_f32[scale_f32 == 0] = 1.0
+        y_f32 = blk / scale_f32.unsqueeze(1)
+        y_f32 = torch.clamp(y_f32, min=-DTYPE_MAX, max=DTYPE_MAX)
+        a1_bytes = _aiter_fp4u._f32_to_floatx_unpacked(
+            y_f32.contiguous().view(-1), 4, 3
+        )
+        a1_payload = a1_bytes.view(torch.uint8).contiguous().view(Mtok, model_dim)
+        a1_scale_token_u8 = (
+            scale_e8m0.view(Mtok, model_dim // BLOCK).view(torch.uint8).contiguous()
         )
         grouped_a1 = torch.empty(
             (E, max_m, model_dim), dtype=torch.uint8, device=device
@@ -658,7 +663,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         n_warp=n_warp,
         out_dtype=out_dtype_str,
         num_buffers=num_buffers,
-        split_k=split_k1,
         expert_sched_mode=False,
         grouped_persistent_m=effective_grouped_persistent_m,
         persistent_workers=persistent_workers,
@@ -751,10 +755,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             torch.cuda.synchronize()
         _grouped_dbg("[crash-probe] after a2 fp4 quant sync OK")
     else:
-        # a8w4 stage2 input also needs per-block-32 MXFP8 scale; SiLU outputs
-        # can exceed unit-scale fp8 and direct casts may encode NaNs.
-        grouped_a2_payload, a2_scale_raw = _quantize_mxfp8_payload(
-            grouped_a2, inter_dim
+        grouped_a2_payload = grouped_a2.to(dtypes.fp8).view(torch.uint8).contiguous()
+        a2_scale_raw = torch.full(
+            (E, max_m, inter_dim // 32), 127, dtype=torch.uint8, device=device
         )
     if _use_naive:
         grouped_a2_scale = _grouped_a8w4_preshuffle_e8m0_scale(
@@ -792,7 +795,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         n_warp=n_warp,
         out_dtype=out_dtype_str,
         num_buffers=num_buffers,
-        split_k=split_k2,
         expert_sched_mode=False,
         grouped_persistent_m=effective_grouped_persistent_m,
         persistent_workers=persistent_workers,
