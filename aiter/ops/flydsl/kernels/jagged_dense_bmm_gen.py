@@ -454,16 +454,18 @@ def jagged_dense_bmm(
     into the compiled kernel, so each distinct (shape, xcd_c, xcd_w) memoizes a
     separate kernel. When left as None they default per (K, uniform_seqlen):
 
-      K > 256 (large weight): remap ALWAYS ON (C=XCD_C_LARGE_K, W=XCD_W),
-        regardless of uniform_seqlen. It clusters a group's M-tiles on one XCD's
-        L2 (+~5-6% on D=512 uniform; re-measured +~2% on D=512 varlen too -- the
-        Dense[b] L2-reuse win outweighs the early-exit XCD imbalance once the
-        weight is large enough to be worth caching).
-      K <= 256 (small weight): remap ON only for uniform_seqlen=True
-        (C=XCD_C_SMALL_K, W=XCD_W); for varlen it falls back to identity (C=1,
-        W=1, _xcd_remap is the exact identity). On small weights the remap is only
-        ~neutral under skew, so round-robin (identity) is the safe default and
-        avoids any early-exit XCD load imbalance.
+      uniform_seqlen=True: remap ON. K>256 uses C=XCD_C_LARGE_K, K<=256 uses
+        C=XCD_C_SMALL_K; W=XCD_W. Clustering a group's M-tiles on one XCD's L2
+        gives +~5-8% (the bigger the reduction K / weight, the bigger the win),
+        because every M-tile is occupied so the chiplets stay balanced.
+      uniform_seqlen=False (SKEW): remap OFF (identity C=1, W=1) for ALL K. Under
+        skew the per-group M_i are wildly uneven (~20-30% empty groups), so
+        clustering a group's M-tiles onto a single XCD OVERLOADS that chiplet
+        while others idle -- a load-imbalance penalty that swamps the L2-reuse
+        win. Measured on D=512 skew: remap-off is 1.4-1.6x FASTER than remap-on
+        (the earlier "+2% on D512 varlen" note was wrong). Round-robin (identity)
+        spreads the surviving tiles evenly across all 8 XCDs, which is what skew
+        needs. (An explicit xcd_c still overrides this.)
 
     An explicit xcd_c / xcd_w always overrides the gate. use_mfma_k32 selects the
     CDNA4 16x16x32 bf16 atom; defaults to auto-detect (on gfx950, off gfx942)."""
@@ -474,17 +476,19 @@ def jagged_dense_bmm(
     # the deeper BLOCK_K=64 pipeline keeps occupancy and is faster. (BLOCK_K=256
     # is unsafe: the 2-stage double-buffer epilogue mis-accumulates a single tile.)
     block_k = 128 if K <= 256 else BLOCK_K
-    # XCD remap defaults (see docstring). Large weight (K>256): remap on for both
-    # uniform and varlen (the Dense[b] L2-reuse win holds under skew). Small weight
-    # (K<=256): remap on only for uniform; identity (C=1,W=1) under skew where it's
-    # ~neutral and round-robin avoids early-exit imbalance.
+    # XCD remap defaults (see docstring). Remap ON only for uniform seqlens, where
+    # every M-tile is occupied so chiplets stay balanced and the Dense[b] L2-reuse
+    # win lands. Under SKEW the remap clusters a group's M-tiles onto one XCD and
+    # overloads it while others idle (load imbalance >> L2 reuse), so fall back to
+    # identity (C=1, W=1) round-robin for ALL K. Measured: remap-off is 1.4-1.6x
+    # faster than remap-on on D=512 skew.
     if xcd_c is None:
-        if K > 256:
-            xcd_c = XCD_C_LARGE_K
-        elif uniform_seqlen:
-            xcd_c = XCD_C_SMALL_K
-        else:
+        if not uniform_seqlen:
             xcd_c = 1
+        elif K > 256:
+            xcd_c = XCD_C_LARGE_K
+        else:
+            xcd_c = XCD_C_SMALL_K
     if xcd_w is None:
         xcd_w = 1 if xcd_c == 1 else XCD_W
     if use_mfma_k32 is None:

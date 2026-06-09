@@ -30,6 +30,18 @@ results + the exact commands to reproduce every experiment.
 - One **correctness fix** was load-bearing at scale: **i64 offset math** — the
   row-base offset `seq_start*K` overflows i32 on `B1024_D512` (7.86M·512 ≈ 4.0e9
   > 2³¹) and GPU-faults without it.
+- **Skew is now within ~5–7% of Triton on all four shapes.** Under the real HSTU
+  varlen distribution (`M_i = max_seq_len·U⁴`, ~27% empty groups) the production
+  dispatch (`jagged_dense_bmm_dispatch_v2.py`) runs **0.93–0.95× of Triton**
+  (do_bench, Mi=7680, all cos=1.0): B120_D256 0.94×, B120_D512 0.94×, B1024_D256
+  0.95×, B1024_D512 0.93×. This was 0.79–0.83× on the D512 cells until the
+  **XCD-remap-under-skew fix** (see method lesson #4): the remap now defaults OFF
+  for skew, which spreads the surviving tiles round-robin across all 8 XCDs instead
+  of overloading one. Reading Triton's kernel source settled the question of *why*
+  it led: it uses the **identical** static `(cdiv(N,BN), cdiv(max_seq_len,BM), B)`
+  grid + bare `if start_m >= seq_len: return` early-exit we do — it does nothing
+  special for skew. The residual ~5–7% is autotuning of tile/warp/stage params; we
+  are HBM-bandwidth-bound, near the traffic floor. See §2.1.
 - **Method lesson #1:** CUDA-event **wall-clock lied by ~10×** on the small
   shapes (it is ~90% host launch overhead). Every conclusion here is from
   **rocprofv3 per-kernel device time**. Two separate levers looked identical in
@@ -48,16 +60,19 @@ results + the exact commands to reproduce every experiment.
   `Dense[b]`*, so a cold-L2 flush erodes it: B1024_D256 reads tie (hot) vs −3%
   (cold). Quote both and state which the deployment resembles (repeated calls with
   resident weights → hot).
-- **Method lesson #4 (skew finding reversed on the current kernel):** an earlier
-  experiment on a *pre-fix clone* found the XCD remap *regressed* ~2% under varlen
-  M_i (early-exit clusters no-op tiles → XCD imbalance). Re-measured on the
-  **current** kernel (after the bounded-A fix + 16x16x32 atom), the remap is
-  ~2% **faster** under skew on B1024_D512 (C=60: ~3086 µs vs OFF ~3155 µs, 3
-  seeds) and neutral on B1024_D256. The reversal is because the old clone was
-  different code (the unbounded-A OOB perturbed timing). **Conclusion (now folded
-  into the gate): remap stays ON for K>256 regardless of `uniform_seqlen` (the
-  Dense[b] L2-reuse win holds under skew); K≤256 falls back to identity only
-  under skew (where it's ~neutral).**
+- **Method lesson #4 (XCD remap must be OFF under skew — the load-bearing skew
+  fix):** the XCD remap clusters a group's M-tiles onto one XCD for `Dense[b]` L2
+  reuse. That wins on **uniform** (every tile occupied → chiplets balanced) but is
+  a large **loss under skew**: with ~27% empty groups and wildly uneven `M_i`, the
+  remap overloads a few chiplets while the rest idle. Measured with `do_bench`
+  (cold-L2, the deployment-representative bench), remap-OFF is **1.4–1.6× faster**
+  than remap-ON on D512 skew (B120_D512 0.300→0.183 ms; B1024_D512 1.796→1.270 ms;
+  cos=1.0). An earlier note in this report claimed the remap was "~2% faster under
+  skew" — that was **wrong** (a hot-L2 `--kernel-trace` artifact that flattered the
+  L2-reuse win; under cold-L2 do_bench the chiplet imbalance dominates).
+  **Conclusion (folded into the default gate): remap ON only when `uniform_seqlen`;
+  identity (C=1, W=1) round-robin for ALL K under skew.** This single default flip
+  moved D512 skew from 0.79–0.83× to 0.93–0.94× of Triton.
 
 ---
 
@@ -155,6 +170,54 @@ skewed edge cases.
 > The fair number is Triton's **min** (best config = what deploys) or do_bench
 > (autotuner settled). `read_us2.py` defaults to **p10**, and for Triton you must
 > read **min** — never median.
+
+---
+
+## 2.1 Varlen (skew) results
+
+The §2 tables are **uniform** `M_i = max_seq_len` (the controlled baseline with
+zero tail-tile waste). The real HSTU deployment is **skewed**:
+`M_i = max_seq_len · U(0,1)⁴` with ~20–28% empty groups plus one full and one
+near-full group. Both FlyDSL and Triton use the same static `max_seq_len`
+M-envelope grid + bare early-exit (verified by reading Triton's source). The
+production dispatch (`jagged_dense_bmm_dispatch_v2.py`) under skew defaults to the
+**static gen kernel with the XCD remap OFF** (round-robin across all 8 XCDs); the
+one exception is the small-weight / large-B cell (`output_n≤256 AND
+n_groups≥1024`, i.e. B1024_D256), routed to the **persistent on-device
+problem-visitor** kernel (`jagged_dense_bmm_persist_dev.py`, builds a per-group
+cumulative tile-count prefix `CUM` on the GPU — zero host sync — and pulls only
+occupied tiles), where it wins ~1.13× over static and ties Triton. The numbers
+below are **end-to-end through the dispatch** (`do_bench`, autotuner settled).
+
+| shape | meanMi | empty% | FlyDSL (ms) | Triton (ms) | FlyDSL vs Triton |
+|---|---|---|---|---|---|
+| B120_D256_K256_N16384 | 1268 | 27% | 0.0768 | 0.0724 | −6% behind |
+| B120_D512_K512_N16384 | 1268 | 27% | 0.1806 | 0.1705 | **−6% behind** |
+| B1024_D256_K256_N16384 | 1174 | 28% | 0.4518 | 0.4298 | −5% behind |
+| B1024_D512_K512_N16384 | 1174 | 28% | 1.2668 | 1.1836 | **−7% behind** |
+
+All cells `cos = 1.0000`. Measured 2026-06-09 (MI355X / gfx950, seed 1234), after
+the XCD-remap-under-skew fix.
+
+> **Summary (skew):** FlyDSL is within **0.93–0.95× of Triton** on all four skewed
+> shapes — a tight band, down from 0.79–0.83× worst-case before the remap fix. The
+> load-bearing change was turning the XCD remap OFF under skew (it overloads single
+> chiplets when groups are uneven; see method lesson #4), worth 1.4–1.6× on the
+> D512 cells. The persistent scheduler is kept only for B1024_D256, where its
+> occupied-tile-only traversal beats the static grid. The residual ~5–7% gap is
+> Triton's autotuning of tile/warp/stage params; both kernels run the same
+> algorithm and we are at the HBM-bandwidth floor (see §6 for the only remaining
+> lever, fp8 weights, which would break the bf16 contract).
+
+Reproduce (both regimes, dispatched path, end-to-end):
+
+```bash
+docker exec -e MPLBACKEND=Agg -e HIP_VISIBLE_DEVICES=4 \
+  -e PYTHONPATH=/home/anguyenh/aiter:/home/anguyenh/generative-recommenders \
+  -w /home/anguyenh/aiter anguyenh-dev \
+  python op_tests/flydsl_tests/bench_jdbba_vs_triton.py --regime both -test
+# --regime {uniform,skew,both}; --seed S sweeps the skew RNG; -test prints cos-sim.
+```
 
 ---
 
@@ -315,9 +378,12 @@ docker exec -e MPLBACKEND=Agg \
 ### 4.6 XCD remap under varlen skew — §2 method-lesson #4
 
 Compares remap OFF (xcd_c=1, exact identity) vs remap ON (xcd_c=C) on a skewed
-M_i ~ 0.95·Uniform(1, max_seq_len) distribution. Confirms the remap helps D=512
-(and is neutral on D=256) on the current kernel — the reversal of the earlier
-pre-fix-clone finding.
+M_i ~ 0.95·Uniform(1, max_seq_len) distribution. Confirms the remap **hurts** under
+skew — remap-OFF is 1.4–1.6× faster on D=512 (cold-L2 do_bench) — because clustering
+a group's M-tiles onto one XCD overloads it when groups are uneven. This is why the
+default gate disables the remap whenever `uniform_seqlen=False`. (Note: a hot-L2
+`--kernel-trace` run flatters the remap's L2 reuse and can show a misleading small
+win; the deployment is cold-L2-representative, so do_bench is authoritative here.)
 
 ```bash
 docker exec -e HIP_VISIBLE_DEVICES=4 \
@@ -331,7 +397,7 @@ docker exec -e HIP_VISIBLE_DEVICES=4 \
     echo "$lbl: p10=$(python3 read_us2.py $td jdbba p10) us"
   done'
 # bench_skew_gen.py args: <B> <D> <Kout> <max_seq_len> <xcd_c> [seed]
-# (sweep seeds 1234/7/99 to see the ~2% D512 win is consistent)
+# (sweep seeds 1234/7/99 to see the remap-OFF D512 win is consistent)
 ```
 
 ---
@@ -413,8 +479,15 @@ prototype baseline. Full detail in `jagged_dense_bmm_benchmark_repro.md` §1–7
   scoped project, not a tweak.
 - **Store-side residual** — the C-shuffle's bf16 LDS *write* is the next small
   bottleneck (readback and global store are already wide). Minor.
-- **Skew-tolerant grid** — a persistent/sorted-grid variant for the non-uniform
-  deployment `M_i ~ 0.95·Uniform(1, N)` distribution.
+- **Varlen gap mostly closed; residual is autotuning, not algorithm.** After the
+  XCD-remap-under-skew fix the dispatched path is **0.93–0.95× of Triton** on all
+  four skewed shapes (§2.1). Triton uses the *same* static-grid + early-exit
+  algorithm we do (confirmed from source), so there is no scheduler trick to copy;
+  the remaining ~5–7% is Triton's per-shape autotuning of tile/warp/stage params
+  against our fixed 128×128 / 4-warp / 2-stage config. Tested and rejected on D512
+  skew: 3-stage pipeline (neutral — bandwidth-bound, not latency-bound) and
+  BLOCK_N=256 (regresses on gfx950). fp8 weights (below) are the only lever with
+  real headroom, and they cut the binding `Dense[b]` traffic in both regimes.
 
 ### Confirmed dead ends (do not re-run — see `jagged_dense_bmm_followup_experiments.md`)
 
@@ -432,7 +505,10 @@ zero gain when memory-bound). The 16×16×32 atom is the one atom change that he
 | File | Role |
 |---|---|
 | `aiter/ops/flydsl/kernels/jagged_dense_bmm.py` | N=K=128 prototype (validated reference) |
-| `aiter/ops/flydsl/kernels/jagged_dense_bmm_gen.py` | generalized + optimized production kernel |
+| `aiter/ops/flydsl/kernels/jagged_dense_bmm_gen.py` | generalized + optimized production kernel (uniform: remap ON; skew: remap OFF) |
+| `aiter/ops/flydsl/kernels/jagged_dense_bmm_persist_dev.py` | persistent on-device problem-visitor kernel (B1024_D256-class skew only) |
+| `aiter/ops/flydsl/jagged_dense_bmm_dispatch_v2.py` | production dispatch: uniform→gen remap-on; skew→gen remap-off, except B1024_D256→persistent |
+| `op_tests/flydsl_tests/bench_jdbba_vs_triton.py` | uniform+skew FlyDSL-vs-Triton comparison (dispatched, end-to-end) |
 | `op_tests/flydsl_tests/bench_headline_worker.py` | per-shape device-time worker (rocprofv3) |
 | `op_tests/flydsl_tests/read_us2.py` | rocprofv3 sqlite → device-time µs parser (default `p10`; use `min` for autotuned kernels) |
 | `op_tests/flydsl_tests/bench_jagged_dense_bmm.py` | toy-shape correctness + wall-clock / `--device-time` bench |

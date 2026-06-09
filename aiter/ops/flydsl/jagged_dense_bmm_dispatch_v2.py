@@ -300,23 +300,27 @@ def jagged_dense_bmm_dispatched(
     if stream is None:
         stream = fx.Stream(None)
 
-    # --- Skew + size gate: pick the kernel variant ---
-    # On SKEWED (varlen) sequence lengths the static-grid kernel launches a full
-    # max_seq_len M-envelope per group and early-exits most blocks -> waste. The
-    # persistent problem-visitor variant (on-device CUM prefix, no host sync)
-    # pulls only occupied tiles and is ~1.2-1.3x faster end-to-end on skew than
-    # OUR OWN static-grid kernel for the D512 / larger shapes (NOT vs Triton --
-    # measured 2026-06-09 Triton still wins skew 0.79-0.97x, see
-    # op_tests/flydsl_tests/bench_jdbba_vs_triton.py). BUT it loses on tiny
-    # problems (the launch + CUM-build
-    # overhead dominates a sub-100us kernel) and regresses ~44% on UNIFORM data
-    # (it forfeits the static grid's XCD-remap L2 reuse). So: persistent only when
-    # NON-uniform AND the problem is big enough to amortize. Threshold = total
-    # output elements; the tiny B120_D256-class (n_groups*output_n*max_seq_len
-    # small) stays on the static kernel. Measured: persist wins at B>=1024 or
-    # output_n>=512; the B120_D256 cell (the lone loser) falls below this bar.
+    # --- Skew gate: pick the kernel variant ---
+    # Under SKEW the right default is the STATIC kernel with the XCD remap turned
+    # OFF (round-robin), which spreads the surviving tiles evenly across all 8 XCDs
+    # (the gen kernel does this automatically for uniform_seqlen=False). That beats
+    # both remap-on AND the persistent scheduler on every skew shape EXCEPT one.
+    #
+    # The lone exception is the small-weight / large-B cell (output_n<=256 AND
+    # n_groups>=1024, e.g. B1024_D256): there the persistent problem-visitor variant
+    # (on-device CUM prefix, no host sync) wins ~1.13x over static remap-off and
+    # essentially ties Triton, because with a small Dense[b] weight and many groups
+    # the static grid's per-group max_seq_len M-envelope early-exit waste dominates,
+    # and persist's occupied-tile-only traversal recovers it. For the D512 shapes
+    # the static remap-off path is faster than persist (1.13-1.20x), so they fall
+    # through. (Measured 2026-06-09, op_tests/flydsl_tests/bench_jdbba_vs_triton.py.)
     total_out = n_groups * output_n * max_seq_len
-    use_persist = (not uniform_seqlen) and (n_groups >= 1024 or output_n >= 512) and total_out >= (256 * 256 * 4096)
+    use_persist = (
+        (not uniform_seqlen)
+        and output_n <= 256
+        and n_groups >= 1024
+        and total_out >= (256 * 256 * 4096)
+    )
     if use_persist:
         return jagged_dense_bmm_persist(C, A, B, BIAS, SEQ_OFFSETS, n_groups, max_seq_len, stream=stream)
 
