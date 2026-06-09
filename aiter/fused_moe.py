@@ -4,7 +4,6 @@
 import functools
 import os
 import re
-import sys
 
 from dataclasses import dataclass
 from typing import Callable, Optional
