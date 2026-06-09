@@ -487,10 +487,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
     m_tile_prefix = None
     m_tile_map = None
-    # Persistent-M needs m_tile_prefix/m_tile_map. Skip both when disabled by
-    # CSV/config, and force flat-grid launch during HIP CUDAGraph capture.
+    m_tile_count_bound = None
+    # Capture cannot replay a launch grid whose size depends on device-side
+    # masked_m. Build a compact device map anyway, and use token_num*topk as the
+    # fixed launch upper bound for non-persistent graph capture.
     effective_grouped_persistent_m = bool(grouped_persistent_m) and not _capturing
-    if not _use_naive and effective_grouped_persistent_m:
+    if not _use_naive:
         _m_tile_cfg = _GroupedA8W4Config(
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -519,6 +521,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             stage1_weight_layout=stage1_weight_layout,
         )
         m_tile_prefix, m_tile_map = _make_m_tile_prefix_map(masked_m, _m_tile_cfg)
+        if not effective_grouped_persistent_m:
+            m_tile_count_bound = token_num * topk
 
     def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
         from aiter.ops.triton.quant import dynamic_mxfp8_quant
@@ -684,6 +688,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         stream=torch.cuda.current_stream(),
         _m_tile_prefix=m_tile_prefix,
         _m_tile_map=m_tile_map,
+        _m_tile_count_bound=m_tile_count_bound,
         bias=_bias1_arg,
     )
     if not _capturing:
@@ -816,6 +821,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         stream=torch.cuda.current_stream(),
         _m_tile_prefix=m_tile_prefix,
         _m_tile_map=m_tile_map,
+        _m_tile_count_bound=m_tile_count_bound,
         bias=_bias2_arg,
     )
     if not _capturing:

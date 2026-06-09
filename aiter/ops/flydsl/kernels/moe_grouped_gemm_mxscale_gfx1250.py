@@ -686,6 +686,7 @@ def _compile_base_a8w4_gemm(
     cfg: _GroupedA8W4Config,
     stage1_act: str | None = None,
     epilogue_bias: bool = False,
+    grouped_compact_m: bool = False,
     stage1_weight_layout: str = "gguu",
     kernel_tag: str = "gemm",
 ):
@@ -713,6 +714,7 @@ def _compile_base_a8w4_gemm(
         batch_count=cfg.experts,
         grouped_masked_m=True,
         grouped_persistent_m=cfg.grouped_persistent_m,
+        grouped_compact_m=grouped_compact_m,
         persistent_workers=cfg.persistent_workers,
         stage1_act=stage1_act,
         stage1_weight_layout=stage1_weight_layout,
@@ -780,6 +782,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     _validate_common(cfg)
     fused_base = None
     fused_base_bias = None
+    fused_base_compact = None
+    fused_base_compact_bias = None
     fused_n = cfg.inter_dim
     if cfg.split_k == 1:
         fused_n = (
@@ -802,8 +806,39 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             stage1_weight_layout=cfg.stage1_weight_layout,
             kernel_tag="gemm1_bias",
         )
+        if not cfg.grouped_persistent_m:
+            fused_base_compact = _compile_base_a8w4_gemm(
+                K=cfg.model_dim,
+                N=fused_n,
+                cfg=cfg,
+                stage1_act=cfg.act,
+                stage1_weight_layout=cfg.stage1_weight_layout,
+                grouped_compact_m=True,
+                kernel_tag="gemm1_compact",
+            )
+            fused_base_compact_bias = _compile_base_a8w4_gemm(
+                K=cfg.model_dim,
+                N=fused_n,
+                cfg=cfg,
+                stage1_act=cfg.act,
+                epilogue_bias=True,
+                stage1_weight_layout=cfg.stage1_weight_layout,
+                grouped_compact_m=True,
+                kernel_tag="gemm1_compact_bias",
+            )
     raw_base = _compile_base_a8w4_gemm(
         K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg, kernel_tag="gemm1_raw"
+    )
+    raw_base_compact = (
+        _compile_base_a8w4_gemm(
+            K=cfg.model_dim,
+            N=2 * cfg.inter_dim,
+            cfg=cfg,
+            grouped_compact_m=True,
+            kernel_tag="gemm1_raw_compact",
+        )
+        if not cfg.grouped_persistent_m
+        else None
     )
     finalize_act = _compile_stage1_finalize_act(
         experts=cfg.experts,
@@ -838,6 +873,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         _gemm_events=None,
         _m_tile_prefix=None,
         _m_tile_map=None,
+        _m_tile_count_bound=None,
         _tmp=None,
         _skip_epilogue=False,
         bias=None,
@@ -872,12 +908,21 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         if stream is None:
             stream = torch.cuda.current_stream()
         fused_gemm = fused_base_bias if bias is not None else fused_base
+        compact_fused_gemm = (
+            fused_base_compact_bias if bias is not None else fused_base_compact
+        )
+        use_compact_m = (
+            _m_tile_prefix is not None
+            and _m_tile_map is not None
+            and _m_tile_count_bound is not None
+        )
         use_fused_gemm = (
             fused_gemm is not None
             and _tmp is None
             and not _skip_epilogue
             and _debug_tmp_sentinel is None
             and _debug_tmp_out is None
+            and (not use_compact_m or compact_fused_gemm is not None)
         )
         tmp = _tmp
         if not use_fused_gemm:
@@ -952,7 +997,58 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         else:
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
-            if use_fused_gemm:
+            if use_compact_m:
+                if use_fused_gemm:
+                    if bias is not None:
+                        _run_compiled(
+                            compact_fused_gemm,
+                            y,
+                            x,
+                            w,
+                            scale_x,
+                            scale_w,
+                            bias,
+                            masked_m,
+                            _m_tile_prefix,
+                            _m_tile_map,
+                            int(_m_tile_count_bound),
+                            cfg.max_m,
+                            fused_n,
+                            stream,
+                        )
+                    else:
+                        _run_compiled(
+                            compact_fused_gemm,
+                            y,
+                            x,
+                            w,
+                            scale_x,
+                            scale_w,
+                            masked_m,
+                            _m_tile_prefix,
+                            _m_tile_map,
+                            int(_m_tile_count_bound),
+                            cfg.max_m,
+                            fused_n,
+                            stream,
+                        )
+                else:
+                    _run_compiled(
+                        raw_base_compact,
+                        tmp,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        masked_m,
+                        _m_tile_prefix,
+                        _m_tile_map,
+                        int(_m_tile_count_bound),
+                        cfg.max_m,
+                        2 * cfg.inter_dim,
+                        stream,
+                    )
+            elif use_fused_gemm:
                 if bias is not None:
                     _run_compiled(
                         fused_gemm,
@@ -1075,6 +1171,29 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         epilogue_bias=True,
         kernel_tag="gemm2_bias",
     )
+    base_compact = (
+        _compile_base_a8w4_gemm(
+            K=cfg.inter_dim,
+            N=cfg.model_dim,
+            cfg=cfg,
+            grouped_compact_m=True,
+            kernel_tag="gemm2_compact",
+        )
+        if not cfg.grouped_persistent_m
+        else None
+    )
+    base_compact_bias = (
+        _compile_base_a8w4_gemm(
+            K=cfg.inter_dim,
+            N=cfg.model_dim,
+            cfg=cfg,
+            epilogue_bias=True,
+            grouped_compact_m=True,
+            kernel_tag="gemm2_compact_bias",
+        )
+        if not cfg.grouped_persistent_m
+        else None
+    )
 
     def launch(
         y,
@@ -1092,6 +1211,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         _gemm_events=None,
         _m_tile_prefix=None,
         _m_tile_map=None,
+        _m_tile_count_bound=None,
         bias=None,
     ):
         """If `_gemm_events=(start, end)` is given, record around the GEMM
@@ -1112,6 +1232,12 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         if cfg.split_k > 1:
             y.zero_()
         gemm = base_bias if bias is not None else base
+        compact_gemm = base_compact_bias if bias is not None else base_compact
+        use_compact_m = (
+            _m_tile_prefix is not None
+            and _m_tile_map is not None
+            and _m_tile_count_bound is not None
+        )
         if cfg.grouped_persistent_m:
             m_tile_prefix = _m_tile_prefix
             if m_tile_prefix is None:
@@ -1157,7 +1283,41 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         else:
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
-            if bias is not None:
+            if use_compact_m:
+                if bias is not None:
+                    _run_compiled(
+                        compact_gemm,
+                        y,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        bias,
+                        masked_m,
+                        _m_tile_prefix,
+                        _m_tile_map,
+                        int(_m_tile_count_bound),
+                        cfg.max_m,
+                        cfg.model_dim,
+                        stream,
+                    )
+                else:
+                    _run_compiled(
+                        compact_gemm,
+                        y,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        masked_m,
+                        _m_tile_prefix,
+                        _m_tile_map,
+                        int(_m_tile_count_bound),
+                        cfg.max_m,
+                        cfg.model_dim,
+                        stream,
+                    )
+            elif bias is not None:
                 _run_compiled(
                     gemm,
                     y,

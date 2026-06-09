@@ -12,7 +12,6 @@ It is extracted from `tests/kernels/test_moe_gemm.py` so that:
 - `tests/` holds correctness/perf harnesses
 """
 
-import logging
 import os
 import functools
 from contextlib import contextmanager

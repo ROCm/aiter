@@ -79,6 +79,7 @@ def compile_mxscale_gemm(
     batch_count: int = 1,
     grouped_masked_m: bool = False,
     grouped_persistent_m: bool = False,
+    grouped_compact_m: bool = False,
     persistent_workers: int | None = None,
     stage1_act: str | None = None,
     stage1_weight_layout: str = "gguu",
@@ -123,6 +124,10 @@ def compile_mxscale_gemm(
         raise ValueError("grouped_masked_m requires batch_count > 1")
     if grouped_persistent_m and not grouped_masked_m:
         raise ValueError("grouped_persistent_m requires grouped_masked_m=True")
+    if grouped_compact_m and not grouped_masked_m:
+        raise ValueError("grouped_compact_m requires grouped_masked_m=True")
+    if grouped_compact_m and grouped_persistent_m:
+        raise ValueError("grouped_compact_m is only for non-persistent grouped GEMM")
     stage1_act_mode = None if stage1_act in (None, "", "none") else str(stage1_act)
     stage1_weight_layout_mode = str(stage1_weight_layout)
     if stage1_weight_layout_mode not in ("gguu", "gugu"):
@@ -2799,52 +2804,111 @@ def compile_mxscale_gemm(
             scf.YieldOp([cur_active])
             _for_ip.__exit__(None, None, None)
         else:
-            if const_expr(batch_count > 1):
-                flat_bx = arith.index_cast(T.index, _raw(gpu.block_idx.x))
-                batch_idx = flat_bx / m_tiles_per_batch
-                bx_local = flat_bx - batch_idx * m_tiles_per_batch
-                bz = (
-                    arith.index_cast(T.index, _raw(gpu.block_idx.z))
-                    if split_k > 1
-                    else arith.index(0)
+            if const_expr(grouped_compact_m):
+                prefix_rsrc = buffer_ops.create_buffer_resource(
+                    arg_m_tile_prefix, max_size=True
                 )
-            else:
-                batch_idx = arith.index(0)
-                bx_local = bx
-                bz = (
-                    arith.index_cast(T.index, _raw(gpu.block_idx.z))
-                    if split_k > 1
-                    else arith.index(0)
+                map_rsrc = buffer_ops.create_buffer_resource(
+                    arg_m_tile_map, max_size=True
                 )
-            if const_expr(grouped_masked_m):
                 masked_m_rsrc = buffer_ops.create_buffer_resource(
                     arg_masked_m, max_size=True
                 )
-                valid_m_i32 = buffer_ops.buffer_load(
-                    masked_m_rsrc,
-                    arith.index_cast(T.i32, batch_idx),
-                    vec_width=1,
-                    dtype=T.i32,
+                flat_m_tile = arith.index_cast(T.index, _raw(gpu.block_idx.x))
+                n_tile = arith.index_cast(T.index, _raw(gpu.block_idx.y))
+                split_k_id = (
+                    arith.index_cast(T.index, _raw(gpu.block_idx.z))
+                    if split_k > 1
+                    else arith.index(0)
                 )
-                blk_m = bx_local * arith.index(tile_m)
-                tile_active = arith.cmpi(
-                    arith.CmpIPredicate.slt,
-                    arith.index_cast(T.i32, blk_m),
-                    valid_m_i32,
+                idx_n = arith.index_cast(T.index, i32_n.ir_value())
+                n_tiles_per_batch = (idx_n + arith.index(tile_n - 1)) / arith.index(
+                    tile_n
                 )
+                max_m_tiles_per_batch = (M + tile_m - 1) // tile_m
+                total_m_tiles_i32 = buffer_ops.buffer_load(
+                    prefix_rsrc, batch_count, vec_width=1, dtype=T.i32
+                )
+                total_m_tiles_idx = arith.index_cast(T.index, total_m_tiles_i32)
+                m_tile_in_range = arith.cmpi(
+                    arith.CmpIPredicate.slt, flat_m_tile, total_m_tiles_idx
+                )
+                n_tile_in_range = arith.cmpi(
+                    arith.CmpIPredicate.slt, n_tile, n_tiles_per_batch
+                )
+                tile_active = arith.andi(m_tile_in_range, n_tile_in_range)
                 tile_if = scf.IfOp(tile_active, results_=[], has_else=False)
                 with ir.InsertionPoint(tile_if.then_block):
+                    map_entry_i32 = buffer_ops.buffer_load(
+                        map_rsrc, flat_m_tile, vec_width=1, dtype=T.i32
+                    )
+                    map_entry = arith.index_cast(T.index, map_entry_i32)
+                    batch_idx = map_entry / arith.index(max_m_tiles_per_batch)
+                    bx_local = map_entry - batch_idx * arith.index(
+                        max_m_tiles_per_batch
+                    )
+                    valid_m_i32 = buffer_ops.buffer_load(
+                        masked_m_rsrc,
+                        arith.index_cast(T.i32, batch_idx),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
                     _emit_tile(
                         batch_idx,
                         bx_local,
-                        by,
-                        bz,
+                        n_tile,
+                        split_k_id,
                         tile_valid_override=tile_active,
                         valid_m_override=valid_m_i32,
                     )
                     scf.YieldOp([])
             else:
-                _emit_tile(batch_idx, bx_local, by, bz)
+                if const_expr(batch_count > 1):
+                    flat_bx = arith.index_cast(T.index, _raw(gpu.block_idx.x))
+                    batch_idx = flat_bx / m_tiles_per_batch
+                    bx_local = flat_bx - batch_idx * m_tiles_per_batch
+                    bz = (
+                        arith.index_cast(T.index, _raw(gpu.block_idx.z))
+                        if split_k > 1
+                        else arith.index(0)
+                    )
+                else:
+                    batch_idx = arith.index(0)
+                    bx_local = bx
+                    bz = (
+                        arith.index_cast(T.index, _raw(gpu.block_idx.z))
+                        if split_k > 1
+                        else arith.index(0)
+                    )
+                if const_expr(grouped_masked_m):
+                    masked_m_rsrc = buffer_ops.create_buffer_resource(
+                        arg_masked_m, max_size=True
+                    )
+                    valid_m_i32 = buffer_ops.buffer_load(
+                        masked_m_rsrc,
+                        arith.index_cast(T.i32, batch_idx),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                    blk_m = bx_local * arith.index(tile_m)
+                    tile_active = arith.cmpi(
+                        arith.CmpIPredicate.slt,
+                        arith.index_cast(T.i32, blk_m),
+                        valid_m_i32,
+                    )
+                    tile_if = scf.IfOp(tile_active, results_=[], has_else=False)
+                    with ir.InsertionPoint(tile_if.then_block):
+                        _emit_tile(
+                            batch_idx,
+                            bx_local,
+                            by,
+                            bz,
+                            tile_valid_override=tile_active,
+                            valid_m_override=valid_m_i32,
+                        )
+                        scf.YieldOp([])
+                else:
+                    _emit_tile(batch_idx, bx_local, by, bz)
 
     # Bump this when changing generated IR in ways not otherwise reflected in
     # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
@@ -2883,6 +2947,7 @@ def compile_mxscale_gemm(
         batch_count,
         grouped_masked_m,
         grouped_persistent_m,
+        grouped_compact_m,
         _persistent_workers,
         stage1_act_mode,
         stage1_weight_layout_mode,
@@ -2987,6 +3052,68 @@ def compile_mxscale_gemm(
             arg_masked_m,
             arg_masked_m,
             arg_masked_m,
+            i32_m,
+            i32_n,
+        )
+        for op in ctx.gpu_module_body.operations:
+            if const_expr(
+                hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
+            ):
+                if const_expr(effective_waves_per_eu is not None):
+                    _wpe = int(effective_waves_per_eu)
+                    if const_expr(_wpe >= 1):
+                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                            ir.IntegerType.get_signless(32), _wpe
+                        )
+                if const_expr(use_cluster):
+                    op.attributes["rocdl.cluster_dims"] = ir.StringAttr.get(
+                        f"{cluster_m},{cluster_n},1"
+                    )
+        cluster_arg = (cluster_m, cluster_n, 1) if use_cluster else None
+        launcher.launch(
+            grid=(gx, gy, gz),
+            block=(block_threads, 1, 1),
+            stream=stream,
+            cluster=cluster_arg,
+        )
+
+    @flyc.jit
+    def launch_mxscale_gemm_masked_compact(
+        arg_c: fx.Tensor,
+        arg_a: fx.Tensor,
+        arg_b: fx.Tensor,
+        arg_a_scale: fx.Tensor,
+        arg_b_scale: fx.Tensor,
+        arg_masked_m: fx.Tensor,
+        arg_m_tile_prefix: fx.Tensor,
+        arg_m_tile_map: fx.Tensor,
+        i32_m_tile_bound: fx.Int32,
+        i32_m: fx.Int32,
+        i32_n: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _ = cache_tag
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            arena_alloc.finalized = False
+            arena_alloc.finalize()
+
+        idx_m_tiles = arith.index_cast(T.index, i32_m_tile_bound.ir_value())
+        idx_n = arith.index_cast(T.index, i32_n.ir_value())
+        gx = idx_m_tiles
+        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gz = split_k
+
+        launcher = kernel_mxscale_gemm(
+            arg_c,
+            arg_a,
+            arg_b,
+            arg_a_scale,
+            arg_b_scale,
+            arg_c,
+            arg_masked_m,
+            arg_m_tile_prefix,
+            arg_m_tile_map,
             i32_m,
             i32_n,
         )
@@ -3190,6 +3317,69 @@ def compile_mxscale_gemm(
         )
 
     @flyc.jit
+    def launch_mxscale_gemm_masked_compact_bias(
+        arg_c: fx.Tensor,
+        arg_a: fx.Tensor,
+        arg_b: fx.Tensor,
+        arg_a_scale: fx.Tensor,
+        arg_b_scale: fx.Tensor,
+        arg_bias: fx.Tensor,
+        arg_masked_m: fx.Tensor,
+        arg_m_tile_prefix: fx.Tensor,
+        arg_m_tile_map: fx.Tensor,
+        i32_m_tile_bound: fx.Int32,
+        i32_m: fx.Int32,
+        i32_n: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _ = cache_tag
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            arena_alloc.finalized = False
+            arena_alloc.finalize()
+
+        idx_m_tiles = arith.index_cast(T.index, i32_m_tile_bound.ir_value())
+        idx_n = arith.index_cast(T.index, i32_n.ir_value())
+        gx = idx_m_tiles
+        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gz = split_k
+
+        launcher = kernel_mxscale_gemm(
+            arg_c,
+            arg_a,
+            arg_b,
+            arg_a_scale,
+            arg_b_scale,
+            arg_bias,
+            arg_masked_m,
+            arg_m_tile_prefix,
+            arg_m_tile_map,
+            i32_m,
+            i32_n,
+        )
+        for op in ctx.gpu_module_body.operations:
+            if const_expr(
+                hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
+            ):
+                if const_expr(effective_waves_per_eu is not None):
+                    _wpe = int(effective_waves_per_eu)
+                    if const_expr(_wpe >= 1):
+                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                            ir.IntegerType.get_signless(32), _wpe
+                        )
+                if const_expr(use_cluster):
+                    op.attributes["rocdl.cluster_dims"] = ir.StringAttr.get(
+                        f"{cluster_m},{cluster_n},1"
+                    )
+        cluster_arg = (cluster_m, cluster_n, 1) if use_cluster else None
+        launcher.launch(
+            grid=(gx, gy, gz),
+            block=(block_threads, 1, 1),
+            stream=stream,
+            cluster=cluster_arg,
+        )
+
+    @flyc.jit
     def launch_mxscale_gemm_masked_persistent_bias(
         arg_c: fx.Tensor,
         arg_a: fx.Tensor,
@@ -3251,6 +3441,9 @@ def compile_mxscale_gemm(
         launch_mxscale_gemm_masked.compile_hints["llvm_options"] = {
             "amdgpu-expert-scheduling-mode": True,
         }
+        launch_mxscale_gemm_masked_compact.compile_hints["llvm_options"] = {
+            "amdgpu-expert-scheduling-mode": True,
+        }
         launch_mxscale_gemm_masked_persistent.compile_hints["llvm_options"] = {
             "amdgpu-expert-scheduling-mode": True,
         }
@@ -3258,6 +3451,9 @@ def compile_mxscale_gemm(
             "amdgpu-expert-scheduling-mode": True,
         }
         launch_mxscale_gemm_masked_bias.compile_hints["llvm_options"] = {
+            "amdgpu-expert-scheduling-mode": True,
+        }
+        launch_mxscale_gemm_masked_compact_bias.compile_hints["llvm_options"] = {
             "amdgpu-expert-scheduling-mode": True,
         }
         launch_mxscale_gemm_masked_persistent_bias.compile_hints["llvm_options"] = {
@@ -3269,14 +3465,22 @@ def compile_mxscale_gemm(
             return (
                 launch_mxscale_gemm_masked_persistent_bias
                 if grouped_persistent_m
-                else launch_mxscale_gemm_masked_bias
+                else (
+                    launch_mxscale_gemm_masked_compact_bias
+                    if grouped_compact_m
+                    else launch_mxscale_gemm_masked_bias
+                )
             )
         return launch_mxscale_gemm_bias
     if grouped_masked_m:
         return (
             launch_mxscale_gemm_masked_persistent
             if grouped_persistent_m
-            else launch_mxscale_gemm_masked
+            else (
+                launch_mxscale_gemm_masked_compact
+                if grouped_compact_m
+                else launch_mxscale_gemm_masked
+            )
         )
     return launch_mxscale_gemm
 
