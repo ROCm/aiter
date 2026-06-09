@@ -241,6 +241,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
         prefill_support: bool = False,
         x_pad_to_multiple: int = 0,
+        weight_bias: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from aiter.dist.device_communicators.custom_all_reduce import (
             can_pack_2d_last_dim_slice,
@@ -293,6 +294,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 eps,
                 use_1stage,
                 out_hidden_dim=out_n,
+                weight_bias=weight_bias,
             )
             assert out is not None
             assert res_out is not None
@@ -313,6 +315,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 use_1stage,
                 out_hidden_dim=out_n,
                 prefill_support=prefill_support,
+                weight_bias=weight_bias,
             )
             assert out is not None
             assert res_out is not None
@@ -325,6 +328,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # the fallback path only needs the valid hidden region for RMSNorm.
             ar_out = ar_out[..., :n].contiguous()
 
+        effective_weight = weight_ if weight_bias == 0.0 else weight_ + weight_bias
         if use_general_path or x_pad_to_multiple > 0 or input_n != n:
             # The custom fused AR+RMS kernel still falls back here for strided rows
             # or when custom all-reduce is unavailable for padded outputs.
@@ -340,7 +344,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             res_inp_2d = res_inp_.reshape(-1, res_inp_.shape[-1])
             out_2d, residual_out_2d = fused_add_rmsnorm_pad(
                 ar_out_2d,
-                weight_,
+                effective_weight,
                 eps,
                 res_inp_2d,
                 x_pad_to_multiple=x_pad_to_multiple,
@@ -359,7 +363,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             ar_out,
             res_inp_,
             residual_out,
-            weight_,
+            effective_weight,
             eps,
             0,
         )

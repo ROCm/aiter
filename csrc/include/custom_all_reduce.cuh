@@ -1368,6 +1368,7 @@ __global__ void __launch_bounds__(tnum, 1)
                                     T* __restrict__ results,
                                     T* __restrict__ weight,
                                     float eps,
+                                    float weight_bias,
                                     int rank,
                                     int m,
                                     int n)
@@ -1416,7 +1417,7 @@ __global__ void __launch_bounds__(tnum, 1)
             for(int i = 0; i < pack_size; ++i)
             {
                 float x_f32     = rms_inp_f32[n_iter][i];
-                float w_f32     = upcast_s(w_arr[n_iter][i]);
+                float w_f32     = upcast_s(w_arr[n_iter][i]) + weight_bias;
                 rmsnorm_inp[i]  = downcast_s<T>(x_f32);
                 rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
             }
@@ -1438,6 +1439,7 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                                                                      T* __restrict__ results,
                                                                      T* __restrict__ weight,
                                                                      float eps,
+                                                                     float weight_bias,
                                                                      int rank,
                                                                      int m,
                                                                      int n,
@@ -1495,7 +1497,7 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                 for(int i = 0; i < pack_size; ++i)
                 {
                     float x_f32     = rms_inp_f32[n_iter][i];
-                    float w_f32     = upcast_s(w_arr[n_iter][i]);
+                    float w_f32     = upcast_s(w_arr[n_iter][i]) + weight_bias;
                     rmsnorm_inp[i]  = downcast_s<T>(x_f32);
                     rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
                 }
@@ -1522,6 +1524,7 @@ __global__ void __launch_bounds__(256, 1)
                                    T* __restrict__ results,
                                    T* __restrict__ weight,
                                    float eps,
+                                   float weight_bias,
                                    int rank,
                                    int m,
                                    int n)
@@ -1570,7 +1573,7 @@ __global__ void __launch_bounds__(256, 1)
             for(int i = 0; i < pack_size; ++i)
             {
                 float x_f32     = rms_inp_f32[n_iter][i];
-                float w_f32     = upcast_s(w_arr[n_iter][i]);
+                float w_f32     = upcast_s(w_arr[n_iter][i]) + weight_bias;
                 rmsnorm_inp[i]  = downcast_s<T>(x_f32);
                 rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
             }
@@ -1612,7 +1615,13 @@ template <typename P,
           int PACK_SIZE,
           int WARP_SIZE = 32>
 __device__ __forceinline__ void
-ar_fusion_epilogue_rms_norm(O& out, A& in, P& weight, float eps, int hidden_dim, int block_size)
+ar_fusion_epilogue_rms_norm(O& out,
+                            A& in,
+                            P& weight,
+                            float eps,
+                            int hidden_dim,
+                            int block_size,
+                            float weight_bias = 0.0f)
 {
     __shared__ float s_val;
     float acc = 0.f;
@@ -1631,7 +1640,7 @@ ar_fusion_epilogue_rms_norm(O& out, A& in, P& weight, float eps, int hidden_dim,
 #pragma unroll
     for(int i = 0; i < PACK_SIZE; ++i)
     {
-        float out_ = in[i] * s_val * upcast_s(weight[i]);
+        float out_ = in[i] * s_val * (upcast_s(weight[i]) + weight_bias);
         out[i]     = downcast_s<OT>(out_);
     }
 }
@@ -1786,13 +1795,14 @@ __device__ __forceinline__ void ar_fusion_epilogue(A& in,
                                                    int block_size,
                                                    OutT* __restrict__ output,
                                                    float* __restrict__ scale_out,
-                                                   bool active = true)
+                                                   bool active = true,
+                                                   float weight_bias = 0.0f)
 {
     if constexpr(std::is_same_v<T, OutT>)
     {
         P out;
         ar_fusion_epilogue_rms_norm<P, A, P, T, PACK_SIZE>(
-            out, in, weight, eps, hidden_dim, block_size);
+            out, in, weight, eps, hidden_dim, block_size, weight_bias);
         if(active)
             *reinterpret_cast<P*>(output + idx) = out;
     }
@@ -1803,7 +1813,7 @@ __device__ __forceinline__ void ar_fusion_epilogue(A& in,
         OP out_quant;
         A out;
         ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE>(
-            out, in, weight, eps, hidden_dim, block_size);
+            out, in, weight, eps, hidden_dim, block_size, weight_bias);
         float amax  = ar_fusion_epilogue_reduce_abs_max<A, PACK_SIZE>(out, block_size);
         float scale = amax == 0.f ? 1.f : amax / FP8_UPBOUND;
         out_quant   = packQuant<opus::fp32_t, PACK_SIZE>(out, scale);
@@ -1906,7 +1916,8 @@ __global__ void __launch_bounds__(1024, 1)
                                    int input_hidden_dim,
                                    int hidden_dim,
                                    int out_hidden_dim,
-                                   float eps)
+                                   float eps,
+                                   float weight_bias)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
@@ -1992,7 +2003,8 @@ __global__ void __launch_bounds__(1024, 1)
         padded_block_size,
         output,
         scale_out,
-        active);
+        active,
+        weight_bias);
     if(active_tail)
     {
         OP zero_pack{};
@@ -2351,7 +2363,8 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                              int hidden_dim,
                                              int out_hidden_dim,
                                              float eps,
-                                             hipStream_t stream)
+                                             hipStream_t stream,
+                                             float weight_bias = 0.0f)
 {
     constexpr int PACK_SIZE  = 16 / sizeof(T);
     constexpr int WARP_SIZE  = 32;
@@ -2379,7 +2392,8 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                                     input_hidden_dim,
                                                     hidden_dim,
                                                     out_hidden_dim,
-                                                    eps);
+                                                    eps,
+                                                    weight_bias);
 }
 
 template <typename T, int ngpus, int WARP_SIZE>
@@ -3745,6 +3759,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    T* output,
                                    T* weight,
                                    float eps,
+                                   float weight_bias,
                                    int m,
                                    int input_hidden_dim,
                                    int n,
@@ -3797,7 +3812,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                                              n,                    \
                                                              out_n,                \
                                                              eps,                  \
-                                                             stream);              \
+                                                             stream,               \
+                                                             weight_bias);         \
         return;                                                                    \
     }
 
@@ -3841,7 +3857,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);              \
         setGrid(naive_grid_size, kernel_ptr);                                          \
         template_kernel<<<grid, block, 0, stream>>>(                                   \
-            sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, out_n); \
+            sg_, residual_inp, residual_out, output, weight, eps, weight_bias, rank_, m, n, out_n); \
     } while(0)
 
 #define launch_fused_allreduce_rmsnorm(template_kernel)                         \
@@ -3850,7 +3866,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);       \
         setGrid(naive_grid_size, kernel_ptr);                                   \
         template_kernel<<<grid, block, 0, stream>>>(                            \
-            sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
+            sg_, residual_inp, residual_out, output, weight, eps, weight_bias, rank_, m, n); \
     } while(0)
 
     // n_packs = number of vectorized elements per row
