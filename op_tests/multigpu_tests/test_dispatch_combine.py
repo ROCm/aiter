@@ -369,4 +369,6 @@ if __name__ == "__main__":
     for quant_type in quant_types:
         for dtype in l_dtype:
             for shape in l_shape:
-                test_dispatch_combine(8, shape, dtype, args.experts, args.topk, quant_type)
+                test_dispatch_combine(
+                    8, shape, dtype, args.experts, args.topk, quant_type
+                )

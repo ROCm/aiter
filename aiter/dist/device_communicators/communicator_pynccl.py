@@ -93,6 +93,7 @@ class PyNcclCommunicator:
         # (torch.distributed.all_reduce via device_group) which works correctly.
         # Set AITER_PYNCCL_SKIP=1 to activate this workaround.
         import os as _os
+
         if _os.environ.get("AITER_PYNCCL_SKIP", "0") == "1":
             self.available = False
             self.disabled = True
