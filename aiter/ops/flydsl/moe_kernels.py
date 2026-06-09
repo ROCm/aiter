@@ -1689,3 +1689,103 @@ def flydsl_moe_scatter_copy_token(
         )
 
     return grouped_a1, a1_scale_raw
+
+
+@functools.cache
+def _get_compiled_scatter_preshuffle_scale(
+    row_bytes: int, wmma_rep: int, scale_k_per_tile: int, gather: bool = True
+):
+    """Compile and cache the WMMA-preshuffle scale kernel (with/without gather)."""
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_preshuffle_scale import (
+        build_moe_scatter_copy_preshuffle_scale_module,
+    )
+
+    return build_moe_scatter_copy_preshuffle_scale_module(
+        row_bytes, wmma_rep, scale_k_per_tile, gather=gather
+    )
+
+
+def flydsl_moe_scatter_preshuffle_scale(
+    a1_scale_token_u8: torch.Tensor,  # (token_num, Ws) uint8
+    rows_to_tokens: torch.Tensor,  # (E*max_m,) int32 grouped row -> token (-1 pad)
+    E: int,
+    max_m: int,
+    *,
+    wmma_rep: int,
+    scale_k_per_tile: int,
+    grouped_a1_scale: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+):
+    """Route-gather each token's e8m0 scale row AND preshuffle it into the WMMA
+    layout in a single kernel pass -- fusing ``flydsl_moe_scatter_copy_token``'s
+    scale copy with ``_grouped_a8w4_preshuffle_e8m0_scale``.
+
+    ``max_m`` must be a multiple of ``wmma_rep*16`` (the grouped path pads it to
+    a multiple of ``warp_tile_m``). Padding rows (``rows_to_tokens == -1``) are
+    left untouched -- the masked GEMM never reads them, matching the previous
+    uninitialized ``a1_scale_raw`` behaviour. Returns ``grouped_a1_scale``."""
+    device = a1_scale_token_u8.device
+    Ws = a1_scale_token_u8.shape[1]
+    rows_per_tile = wmma_rep * 16
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
+    tiles_per_expert = max_m // rows_per_tile
+
+    if grouped_a1_scale is None:
+        grouped_a1_scale = torch.empty(
+            (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
+        )
+
+    launch = _get_compiled_scatter_preshuffle_scale(
+        Ws, wmma_rep, scale_k_per_tile, True
+    )
+    launch(
+        a1_scale_token_u8.contiguous().view(-1, Ws),
+        grouped_a1_scale.view(E * (max_m // wmma_rep), Ws * wmma_rep),
+        rows_to_tokens,
+        max_m,
+        E,
+        tiles_per_expert,
+        stream=torch.cuda.current_stream(),
+    )
+    return grouped_a1_scale
+
+
+def flydsl_moe_preshuffle_scale(
+    scale_grouped_u8: torch.Tensor,  # (E, max_m, Ws) or (E*max_m, Ws) uint8
+    E: int,
+    max_m: int,
+    *,
+    wmma_rep: int,
+    scale_k_per_tile: int,
+    out: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+):
+    """Preshuffle an already-grouped row-major e8m0 scale into the WMMA layout in
+    one kernel pass -- the in-kernel equivalent of the torch
+    ``_grouped_a8w4_preshuffle_e8m0_scale`` permute (used by stage2, where the
+    scale is already grouped so no route-gather is needed). Returns ``out``."""
+    device = scale_grouped_u8.device
+    Ws = scale_grouped_u8.shape[-1]
+    rows_per_tile = wmma_rep * 16
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
+    tiles_per_expert = max_m // rows_per_tile
+
+    if out is None:
+        out = torch.empty(
+            (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
+        )
+
+    launch = _get_compiled_scatter_preshuffle_scale(
+        Ws, wmma_rep, scale_k_per_tile, False
+    )
+    launch(
+        scale_grouped_u8.contiguous().view(E * max_m, Ws),
+        out.view(E * (max_m // wmma_rep), Ws * wmma_rep),
+        max_m,
+        E,
+        tiles_per_expert,
+        stream=torch.cuda.current_stream(),
+    )
+    return out
