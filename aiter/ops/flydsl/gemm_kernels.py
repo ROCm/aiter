@@ -17,6 +17,7 @@ import flydsl.expr as fx
 import flydsl.compiler as flyc
 from aiter import logger
 from flydsl.runtime.device import get_rocm_arch
+from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 from aiter.jit.utils.chip_info import get_gfx
 
@@ -84,22 +85,14 @@ def _ptr_view_safe(t: torch.Tensor):
 # and higher split-K values are now capped at 8 for better accuracy.
 HGEMM_TILE_N_OPTIONS = (64, 128, 256)
 HGEMM_TILE_K_OPTIONS = (64, 128, 256)
-HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 96, 128, 256)
-HGEMM_STAGE_OPTIONS = (2, 3, 4, 5)
+HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 80, 96, 128, 256)
+HGEMM_STAGE_OPTIONS = tuple([i for i in range(2, 9)])
 HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 14))
 HGEMM_MAX_SPLIT_K = 13
 HGEMM_WARP_SHAPE_OPTIONS = [
-    (wm, wn, wk) for wm, wn, wk in product([1, 2, 4], repeat=3) if wm * wn * wk <= 8
+    (wm, wn, wk) for wm, wn, wk in product([1, 2, 4], repeat=3) if wm * wn * wk <= 16
 ]
 KERNEL_CONFIG_VARIANTS = [
-    {
-        "block_m_warps": wm,
-        "block_n_warps": wn,
-        "block_k_warps": wk,
-        "b_to_lds": False,
-    }
-    for wm, wn, wk in HGEMM_WARP_SHAPE_OPTIONS
-] + [
     {
         "block_m_warps": wm,
         "block_n_warps": wn,
@@ -319,6 +312,46 @@ def _validate_hgemm_inputs(
     return m, n, k
 
 
+def selection_filter(m, n, k, kwargs):
+    TILE_M = kwargs["TILE_M"]
+    TILE_N = kwargs["TILE_N"]
+    TILE_K = kwargs["TILE_K"]
+    STAGES = kwargs["STAGES"]
+    SPLIT_K = kwargs["SPLIT_K"]
+    BLOCK_M_WARPS = kwargs["BLOCK_M_WARPS"]
+    BLOCK_N_WARPS = kwargs["BLOCK_N_WARPS"]
+    BLOCK_K_WARPS = kwargs["BLOCK_K_WARPS"]
+    B_TO_LDS = kwargs.get("B_TO_LDS", True)
+    GPU_ARCH = get_rocm_arch()
+    DTYPE_BYTES = 2
+
+    def get_stage_smem_use(stages_):
+        SMEM_USE = stages_ * TILE_M * TILE_K * DTYPE_BYTES
+        if B_TO_LDS:
+            SMEM_USE += stages_ * TILE_N * TILE_K * DTYPE_BYTES
+        SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * TILE_M * TILE_N * DTYPE_BYTES)
+        return SMEM_USE
+
+    smem_use_s0 = get_stage_smem_use(STAGES)
+    # smem_use_s1 = get_stage_smem_use(STAGES + 3)
+    smem_cap = SMEM_CAPACITY_MAP[GPU_ARCH]
+    if not (smem_use_s0 <= smem_cap):
+        return False
+    if m >= 4096 and n >= 4096 and k >= 4096:
+        if not (
+            TILE_M == 256
+            and TILE_N == 256
+            and TILE_K == 64
+            and STAGES == 2
+            and SPLIT_K == 1
+            and BLOCK_M_WARPS == 2
+            and BLOCK_N_WARPS == 4
+            and BLOCK_K_WARPS == 1
+        ):
+            return False
+    return True
+
+
 def _validate_hgemm_tiling(
     m: int,
     n: int,
@@ -336,7 +369,21 @@ def _validate_hgemm_tiling(
     block_k_warps: int,
     b_to_lds: bool,
 ) -> None:
-    del m
+    config = {
+        "TILE_M": tile_m,
+        "TILE_N": tile_n,
+        "TILE_K": tile_k,
+        "STAGES": stages,
+        "SPLIT_K": split_k,
+        "BLOCK_M_WARPS": block_m_warps,
+        "BLOCK_N_WARPS": block_n_warps,
+        "BLOCK_K_WARPS": block_k_warps,
+        "B_TO_LDS": b_to_lds,
+    }
+    if not selection_filter(m, n, k, config):
+        raise ValueError(
+            f"Invalid tiling configuration for m={m} n={n} k={k}: {config}"
+        )
 
     if tile_m < 1 or tile_n < 1 or tile_k < 1:
         raise ValueError(
@@ -685,6 +732,7 @@ def _check_split_k_semaphore_capacity(
         )
 
 
+@functools.lru_cache(maxsize=16384)
 def _compile_flydsl_hgemm(
     dtype: str,
     m: int,

@@ -16,18 +16,19 @@ non-contiguous views whose `.stride()` reflects the underlying memory.
 
 Sink convention
 ---------------
-D64 (_rxy_sink) kernels compile ENABLE_SINK=1.  An explicit sink tensor
-[q_head_num] fp32 (AITER post-scale) is required.
+`sink` ([q_head_num] fp32) is passed to the kernel verbatim -- it is the
+per-Q-head logit value the kernel consumes directly (no host-side scaling).
+This matches aiter's CK convention (test_mha_common.attention_ref): the sink
+is an extra "virtual KV token" with a zero value vector, whose score is the
+sink logit in the SAME scaled domain as Q·K^T * softmax_scale.
 
-Sink mechanism (from common_fmha.h::fmha_merge_sink_rowwise):
-  After computing standard softmax numerators/denominators, the sink acts as
-  an additional "virtual KV token" with zero value vector.  It only adds to
-  the softmax denominator:
-      new_max    = max(max_attn_raw, sink_raw)
-      sink_term  = exp2((sink_raw - new_max) * scale * log2e)
+Sink mechanism (zero-value virtual KV column):
+  After computing standard softmax numerators/denominators, the sink only
+  adds to the softmax denominator (contributes 0 to the output):
+      new_max    = max(max_scores, sink)
+      sink_term  = exp(sink - new_max)
       denom      = denom * rescale + sink_term
-      numer      = numer * rescale     # sink contributes 0 to output
-  In AITER/post-scale convention: sink_raw = sink_user * sqrt(head_dim).
+  where max_scores / scores are already in the scaled (softmax_scale) domain.
 """
 
 from __future__ import annotations
@@ -111,13 +112,15 @@ def _ref_attn(q, k, v, *, is_causal: bool, sink: "Optional[torch.Tensor]" = None
     """bshd-in / bshd-out attention reference, sink optional.  Pure-einsum
     fp32 implementation; lse is returned in fp32 (matches kernel's output).
 
-    Math:  attn  = Q @ K^T,   scale = 1/sqrt(d),
-           denom = sum(exp((attn - max) * scale))
-                 [+ exp((sink_raw - max) * scale)],
-           out   = (exp((attn - max) * scale) / denom) @ V,
-           lse   = max * scale + log(denom).
-    sink (optional): [hq] fp32, AITER post-scale; converted internally to
-                     pre-scale raw via x sqrt(d) to match kernel ABI.
+    Math:  scores = (Q @ K^T) * scale,   scale = 1/sqrt(d),
+           denom  = sum(exp(scores - max)) [+ exp(sink - max)],
+           out    = (exp(scores - max) / denom) @ V,
+           lse    = max + log(denom).
+    sink (optional): [hq] fp32, a per-Q-head logit in the SAME (scaled) domain
+                     as `scores` -- it is passed to the kernel verbatim (no
+                     host-side scaling), matching aiter's CK convention
+                     (test_mha_common.attention_ref): sink is an extra
+                     zero-value KV column appended to the scaled scores.
     """
     b, sq, hq, d = q.shape
     _, sk, hk, _ = k.shape
@@ -126,30 +129,29 @@ def _ref_attn(q, k, v, *, is_causal: bool, sink: "Optional[torch.Tensor]" = None
         v = v.repeat_interleave(hq // hk, dim=2)
     qf, kf, vf = q.float(), k.float(), v.float()
     scale = 1.0 / math.sqrt(d)
-    attn = torch.einsum("bshd,bkhd->bhsk", qf, kf)
+    # Work entirely in the scaled-logit domain so the sink (which the kernel
+    # consumes verbatim) lines up with the scores.
+    scores = torch.einsum("bshd,bkhd->bhsk", qf, kf) * scale
     if is_causal:
         m = torch.triu(
             torch.ones(sq, sk, dtype=torch.bool, device=q.device), sk - sq + 1
         )
-        attn = attn.masked_fill(m, float("-inf"))
-    max_attn, _ = attn.max(dim=-1)
+        scores = scores.masked_fill(m, float("-inf"))
+    max_attn, _ = scores.max(dim=-1)
     if sink is not None:
-        sink_raw = sink.float() * math.sqrt(d)
-        sink_raw_bhs = sink_raw[None, :, None].expand(b, hq, sq)
-        max_total = torch.maximum(max_attn, sink_raw_bhs)
+        sink_bhs = sink.float()[None, :, None].expand(b, hq, sq)
+        max_total = torch.maximum(max_attn, sink_bhs)
     else:
         max_total = max_attn
-    denom_real = torch.exp((attn - max_total.unsqueeze(-1)) * scale).sum(dim=-1)
+    denom_real = torch.exp(scores - max_total.unsqueeze(-1)).sum(dim=-1)
     if sink is not None:
-        sink_term = torch.exp((sink_raw_bhs - max_total) * scale)
+        sink_term = torch.exp(sink_bhs - max_total)
         denom_total = denom_real + sink_term
     else:
         denom_total = denom_real
-    probs = torch.exp((attn - max_total.unsqueeze(-1)) * scale) / denom_total.unsqueeze(
-        -1
-    )
+    probs = torch.exp(scores - max_total.unsqueeze(-1)) / denom_total.unsqueeze(-1)
     out = torch.einsum("bhsk,bkhd->bshd", probs, vf).to(q.dtype)
-    lse = torch.log(denom_total) + max_total * scale
+    lse = torch.log(denom_total) + max_total
     return out, lse
 
 
@@ -503,36 +505,6 @@ def test_fmha_fwd_with_sink_asm_ops_layer():
 
     _cmp(out_kernel, out_ref, rtol=1e-2, atol=1e-2)
     _cmp(lse_asm, lse_ref, rtol=1e-2, atol=1e-2)
-
-
-def test_fmha_fwd_with_sink_asm_d64_requires_sink():
-    """Direct ops-layer call without sink on D64 must raise the C++ check.
-
-    Note: through aiter.flash_attn_func, can_impl_fmha_fwd_with_sink_asm()
-    routes D64 + sink_ptr=None to the CK fallback (the D64 _rxy_sink kernel
-    compiles ENABLE_SINK=1 and has no "skip sink" mode; auto-filling a
-    zero sink would change "no sink" semantics by adding an extra
-    exp(-max*scale) term to the softmax denominator).  So this error path
-    is unreachable from the public API — we exercise it via the
-    lower-level ops stub here.
-    """
-    device = "cuda"
-    q, k, v = make_qkv_bshd(
-        layout=0,
-        sq=128,
-        sk=2048,
-        batch=1,
-        hq=4,
-        hk=4,
-        d=64,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    scale = 1.0 / math.sqrt(64)
-    # is_causal=True because only causal kernels are registered in the CSV;
-    # the error path being tested (D64 + sink=None) is orthogonal to causal.
-    with pytest.raises(RuntimeError, match="D64.*sink"):
-        aiter.fmha_fwd_with_sink_asm(q, k, v, scale, True, True, sink=None)
 
 
 # ---------------------------------------------------------------------------

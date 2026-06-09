@@ -130,10 +130,10 @@ AITER_CTYPES_ERROR_DEF
 // lse  : [batch, q_head_num, q_seq_len] fp32.  Always required by kernel ABI
 //        (kernel may touch ptr_LSE even when return_lse=0); pass a buffer of
 //        the right size regardless of whether you read it.
-// sink : [q_head_num] fp32 in the kernel's pre-scale raw-logit domain.
-//        Required for D64 (ENABLE_SINK=1).  For D128 (ENABLE_SINK=0) the
-//        slot must still be a valid non-null pointer of the right size, but
-//        contents are ignored — pass a zero buffer.
+// sink : [q_head_num] fp32, passed through verbatim to the kernel (the value
+//        the kernel consumes directly — no host-side scaling).  Optional:
+//        may be null; whether the kernel reads it is decided inside the .co
+//        (ENABLE_SINK).  When non-null it must be 1-D fp32 of size q_head_num.
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmha_fwd_with_sink_asm,
     (aiter_tensor_t* q,
@@ -151,8 +151,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // ---- null + multi-GPU safety -----------------------------------------
     // Validate pointers BEFORE touching anything on the device, so the
     // device_guard below can safely read q->device_id.
-    AITER_CHECK(q && k && v && out && lse && sink,
-                "fmha_fwd_with_sink_asm: q/k/v/out/lse/sink must all be non-null");
+    AITER_CHECK(q && k && v && out && lse,
+                "fmha_fwd_with_sink_asm: q/k/v/out/lse must all be non-null");
 
     // Pin current HIP device to q.device() for the duration of this call.
     //
@@ -183,8 +183,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 "fmha_fwd_with_sink_asm: out must be bf16");
     AITER_CHECK(lse->dtype() == AITER_DTYPE_fp32,
                 "fmha_fwd_with_sink_asm: lse must be fp32");
-    AITER_CHECK(sink->dtype() == AITER_DTYPE_fp32,
-                "fmha_fwd_with_sink_asm: sink must be fp32");
+    // sink is optional: the kernel (.co) decides whether it consumes it.
+    // Validate dtype only when a sink buffer is actually provided.
+    if (sink)
+    {
+        AITER_CHECK(sink->dtype() == AITER_DTYPE_fp32,
+                    "fmha_fwd_with_sink_asm: sink must be fp32");
+    }
 
     AITER_CHECK(q->dim() == 4 && k->dim() == 4 && v->dim() == 4,
                 "fmha_fwd_with_sink_asm: q/k/v must be 4-D tensors (bshd shape)");
@@ -225,8 +230,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 (int)lse->size(2) == q_seq_len,
                 "fmha_fwd_with_sink_asm: lse shape must be [batch, q_head_num, q_seq_len]");
 
-    AITER_CHECK(sink->dim() == 1 && (int)sink->size(0) == q_head_num,
-                "fmha_fwd_with_sink_asm: sink must be 1-D with size q_head_num (", q_head_num, ")");
+    if (sink)
+    {
+        AITER_CHECK(sink->dim() == 1 && (int)sink->size(0) == q_head_num,
+                    "fmha_fwd_with_sink_asm: sink must be 1-D with size q_head_num (", q_head_num, ")");
+    }
 
     const int gqa       = q_head_num / kv_head_num;
     const int mask_flag = is_causal ? 1 : 0;
@@ -295,7 +303,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.d_hs       = stride_o_head;
     args.d_bas      = stride_o_batch;
     args.lse_hs     = stride_lse_head;
-    args.sink_addr  = sink->data_ptr();
+    args.sink_addr  = sink ? sink->data_ptr() : nullptr;
 
     size_t arg_size = sizeof(args);
 

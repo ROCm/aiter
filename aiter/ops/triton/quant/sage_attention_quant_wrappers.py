@@ -207,6 +207,7 @@ def sage_quant(
     sm_scale=None,
     layout="bshd",
     smooth_k=True,
+    return_lse=False,
 ):
     """
     Quantize Q and K tensors to INT8 with per-block scaling.
@@ -214,19 +215,27 @@ def sage_quant(
     Args:
         q: Query tensor
         k: Key tensor
-        km: Optional pre-computed K smoothing factors (if None and smooth_k=True, will be computed)
+        v: Value tensor
+        FP8_TYPE: Floating-point type for the quantized V tensor
+        FP8_MAX: Maximum value for the quantized V tensor
         BLKQ: Block size for Q quantization
         BLKK: Block size for K quantization
         sm_scale: Softmax scale factor (defaults to head_dim^-0.5)
         layout: Either "bshd" or "bhsd"
         smooth_k: Whether to apply SageAttention-style smoothing to K tensor (default: True)
-
+        return_lse: If True, additionally return a per-query-row LSE correction
+            term that compensates for K smoothing (default: False)
     Returns:
         q_int8: Quantized Q tensor
         q_scale: Per-block scales for Q
         k_int8: Quantized K tensor
         k_scale: Per-block scales for K
-        k_smooth: K smoothing factors applied (or None if smooth_k=False)
+        v_fp8: Quantized V tensor
+        v_scale: Per-(B,H,D) scales for V
+        delta_lse (only when return_lse=True): float32 (B, H_q, S_q) tensor;
+            add it to the attention kernel's softmax_lse to recover the LSE
+            that would be produced for un-smoothed K. Required for correct
+            FA-style merging across ring-attention shards.
     """
     q_int8 = torch.empty_like(q, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty_like(k, dtype=torch.int8, device=k.device)
@@ -250,9 +259,13 @@ def sage_quant(
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
-    # Apply K tensor smoothing following SageAttention approach
+    # Apply K tensor smoothing following SageAttention approach.
+    # Retain k_mean so we can compute the LSE correction when return_lse=True.
     if smooth_k:
-        k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+        k_mean = k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+        k = k - k_mean
+    else:
+        k_mean = None
 
     q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
@@ -311,7 +324,35 @@ def sage_quant(
         num_warps=8,
     )
 
-    return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale
+    if not return_lse:
+        return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale
+
+    # K-smoothing shifts every qk_ij by a row-wise constant
+    #     delta_i = sm_scale * Q_i . k_mean^T
+    # so the kernel's softmax_lse is offset by -delta_i relative to the LSE
+    # an un-smoothed K would produce. Return delta so the caller can add it
+    # back.
+    if k_mean is None:
+        delta_lse = torch.zeros((b, h_qo, qo_len), device=q.device, dtype=torch.float32)
+    else:
+        if layout == "bhsd":
+            q_bhsd = q
+            kmean_bhsd = k_mean
+        else:  # bshd
+            q_bhsd = q.transpose(1, 2)
+            kmean_bhsd = k_mean.transpose(1, 2)
+
+        if h_qo != h_kv:
+            assert (
+                h_qo % h_kv == 0
+            ), f"GQA ratio must be integer, got h_qo={h_qo}, h_kv={h_kv}"
+            kmean_bhsd = kmean_bhsd.repeat_interleave(h_qo // h_kv, dim=1)
+
+        delta_lse = (q_bhsd.to(torch.float32) * kmean_bhsd.to(torch.float32)).sum(
+            dim=-1
+        ) * sm_scale
+
+    return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, delta_lse
 
 
 def rotation_smooth_qk(
