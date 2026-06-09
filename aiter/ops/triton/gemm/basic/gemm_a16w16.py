@@ -201,8 +201,7 @@ def gemm_a16w16(
             "silu_exp2", "relu").
         skip_reduce (Optional[bool]): [triton only] Skip reduction of split-K partial
             results. Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
-        kernel_type (str): [gluon only] Kernel variant ("basic", "warp_priority",
-            "k_subtiling").
+        kernel_type (str): [gluon only] Kernel variant ("basic", "lds_pipeline").
         backend (Optional[str]): "triton", "gluon", or None (auto-detect).
 
     Returns:
