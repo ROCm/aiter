@@ -108,6 +108,7 @@ void opus_gemm(
   std::optional<aiter_tensor_t> w_scale,
   std::optional<aiter_tensor_t> bias)
 {
+  aiter_detail::g_aiter_can_throw = true;
   AITER_CHECK(XQ.dim() == 3, "XQ must be 3D [batch, M, K]");
   AITER_CHECK(WQ.dim() == 3, "WQ must be 3D [batch, N, K]");
   AITER_CHECK(Y.dim() == 3, "Y must be 3D [batch, M, N]");
@@ -248,6 +249,7 @@ void opus_gemm_a16w16_tune(
     int kernelId,
     int splitK)
 {
+  aiter_detail::g_aiter_can_throw = true;
   AITER_CHECK(XQ.dim() == 3, "XQ must be 3D [batch, M, K]");
   AITER_CHECK(WQ.dim() == 3, "WQ must be 3D [batch, N, K]");
   AITER_CHECK(Y.dim() == 3, "Y must be 3D [batch, M, N]");
