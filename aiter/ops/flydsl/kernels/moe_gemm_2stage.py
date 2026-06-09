@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 
 """MoE GEMM stage1/stage2 kernel implementations (FlyDSL MFMA FP8).
 
@@ -312,7 +312,7 @@ def compile_moe_gemm1(
         f"_abi3"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
     ).replace("-", "_")
 
-    # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
+    # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Reuse the same LDS bytes for both:
     # - ping-pong X tiles (2 * tile_m * lds_stride bytes)
     # - optional epilogue CShuffle tile (tile_m * tile_n f16 -> 2 * tile_m * tile_n bytes)
@@ -1025,7 +1025,7 @@ def compile_moe_gemm1(
                         )
 
                     if const_expr(is_int4_bf16 or is_int4_bf16_groupwise):
-                        # W4A16: deferred dequant — unpack int4->bf16 right before MFMA
+                        # W4A16: deferred dequant -- unpack int4->bf16 right before MFMA
                         # to minimize VGPR lifetime of dequantized bf16 values.
                         _pending_gate_up = None
                         for ku in range_constexpr(k_unroll):
@@ -1144,7 +1144,7 @@ def compile_moe_gemm1(
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
 
-                                if (
+                                if const_expr(
                                     (a0_prefetch is not None)
                                     and (ku == 0)
                                     and (mi == 0)
@@ -1243,17 +1243,17 @@ def compile_moe_gemm1(
                 # 1) int4 + groupwise scale (is_int4_bf16_groupwise):
                 #    [(packed_w4, scale), (packed_w4, scale), ...]   per ni
                 #    Each ni has a (packed_weights, groupwise_scale) pair.
-                #    Flattened as: [packed_0..N, scale_0..N]  → 2 * num_acc_n values
+                #    Flattened as: [packed_0..N, scale_0..N]  -> 2 * num_acc_n values
                 #
                 # 2) int4_bf16 without groupwise scale (int4_bf16_single_field):
                 #    [raw_i64, raw_i64, ...]   per ni
                 #    Single packed i64 per ni, already contains both weight halves.
-                #    Flattened as: [raw_0..N]  → 1 * num_acc_n values
+                #    Flattened as: [raw_0..N]  -> 1 * num_acc_n values
                 #
-                # 3) fp8/int8/bf16/fp16 (default — two register packs per ku):
+                # 3) fp8/int8/bf16/fp16 (default -- two register packs per ku):
                 #    (packs_even_list, packs_odd_list)
                 #    Two lists of num_acc_n regs for even/odd MFMA operands.
-                #    Flattened as: [even_0..N, odd_0..N]  → 2 * num_acc_n values
+                #    Flattened as: [even_0..N, odd_0..N]  -> 2 * num_acc_n values
                 #
                 int4_bf16_single_field = is_int4_bf16 and not is_int4_bf16_groupwise
                 _fields_per_ku = 1 if int4_bf16_single_field else 2
@@ -1264,14 +1264,14 @@ def compile_moe_gemm1(
                     flat = []
                     for ku_entry in b_tile:
                         if is_int4_bf16_groupwise:
-                            # [(packed, scale), ...] → [packed_0..N, scale_0..N]
+                            # [(packed, scale), ...] -> [packed_0..N, scale_0..N]
                             flat.extend(t[0] for t in ku_entry)
                             flat.extend(t[1] for t in ku_entry)
                         elif int4_bf16_single_field:
-                            # [raw_i64, ...] → [raw_0..N]
+                            # [raw_i64, ...] -> [raw_0..N]
                             flat.extend(ku_entry)
                         else:
-                            # (packs_even, packs_odd) → [even_0..N, odd_0..N]
+                            # (packs_even, packs_odd) -> [even_0..N, odd_0..N]
                             flat.extend(ku_entry[0])
                             flat.extend(ku_entry[1])
                     return flat
@@ -1465,7 +1465,7 @@ def compile_moe_gemm1(
                 # Uses EVec=4 (buffer store "x4" of fp16 elements).
                 use_cshuffle_epilog_flag = _use_cshuffle_epilog
 
-                # ─── Split-K epilogue: two-pass gate/up with atomic fadd ───
+                # --- Split-K epilogue: two-pass gate/up with atomic fadd ---
                 # bf16 split-K uses bf16 atomics; other dtypes use f32 atomics.
                 if const_expr(_is_splitk):
                     if const_expr(lds_out is None):
@@ -1510,7 +1510,7 @@ def compile_moe_gemm1(
                         """Write scaled partial sums to LDS (no silu, no doweight)."""
                         _acc = _split_k_acc[0]
                         _sw = _split_k_sw_vals[0]
-                        # Load per-row scale_x (sx) — same logic as normal epilogue.
+                        # Load per-row scale_x (sx) -- same logic as normal epilogue.
                         fused2 = buffer_ops.buffer_load(
                             sorted_rsrc, row, vec_width=1, dtype=T.i32
                         )
@@ -1949,7 +1949,7 @@ def compile_moe_gemm1(
                     body_row=_stage1_store_row,
                 )
 
-    # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
+    # -- Host launcher (flyc.jit + .launch) --------------------------------
     @flyc.jit
     def launch_moe_gemm1(
         arg_out: fx.Pointer,
@@ -2165,8 +2165,8 @@ def compile_moe_gemm2(
     )
     pad_k = 0 if _ck_lds128 else 8
     lds_stride = tile_k + pad_k
-    # gfx950+ has buffer_atomic_pk_add_bf16 → bf16 can use buffer atomics (same as f16).
-    # gfx942 only has global_atomic_pk_add_bf16 → must use global atomics with raw pointer.
+    # gfx950+ has buffer_atomic_pk_add_bf16 -> bf16 can use buffer atomics (same as f16).
+    # gfx942 only has global_atomic_pk_add_bf16 -> must use global atomics with raw pointer.
     _has_buffer_atomic_bf16 = str(gpu_arch).startswith(("gfx95", "gfx12"))
     _needs_global_atomic_bf16 = out_is_bf16 and not _has_buffer_atomic_bf16
     if out_is_bf16:
@@ -2223,9 +2223,9 @@ def compile_moe_gemm2(
         f"_abi2"  # mask sentinel token ids on loads/stores to avoid illegal address faults
     ).replace("-", "_")
 
-    # ── CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel
+    # -- CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel
     # because the AST rewriter intercepts `if` statements inside kernel bodies and
-    # turns them into closure dispatches, which breaks variable reassignment) ────
+    # turns them into closure dispatches, which breaks variable reassignment) ----
     _cshuffle_nlane = 32
     if bool(accumulate):
         _e_vec = 2
@@ -2237,7 +2237,7 @@ def compile_moe_gemm2(
                 f"tile_n={tile_n} must be divisible by {_cshuffle_stride} when accumulate=False"
             )
 
-    # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
+    # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(elem_bytes)
     lds_out_bytes = (
         2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
@@ -2962,7 +2962,7 @@ def compile_moe_gemm2(
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
 
-                                if (
+                                if const_expr(
                                     (a0_prefetch is not None)
                                     and (ku == 0)
                                     and (mi == 0)
@@ -3534,7 +3534,7 @@ def compile_moe_gemm2(
             with _if_then(_if_blk):
                 _moe_gemm2_then_body()
 
-    # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
+    # -- Host launcher (flyc.jit + .launch) --------------------------------
     @flyc.jit
     def launch_moe_gemm2(
         arg_out: fx.Pointer,
@@ -3673,7 +3673,7 @@ def compile_moe_reduction(
             tile_idx = gpu.block_id("y")
             tid = gpu.thread_id("x")
 
-            # Guard: token in range (Index is unsigned → auto ult)
+            # Guard: token in range (Index is unsigned -> auto ult)
             tok_ok = token_idx < m_tokens
             _if_tok = scf.IfOp(tok_ok)
             with _if_then(_if_tok):
@@ -3683,11 +3683,11 @@ def compile_moe_reduction(
 
                 col_base = tile_idx * c_tile_cols + tid * c_vecw
 
-                # Guard: any work in bounds (Index < → ult)
+                # Guard: any work in bounds (Index < -> ult)
                 col_ok = col_base < c_model_dim
                 _if_col = scf.IfOp(col_ok)
                 with _if_then(_if_col):
-                    # Fast path: full vector in-bounds (Index <= → ule)
+                    # Fast path: full vector in-bounds (Index <= -> ule)
                     end_ok = col_base + c_vecw <= c_model_dim
                     _if_full = scf.IfOp(end_ok, has_else=True)
                     with _if_then(_if_full):
@@ -3733,7 +3733,7 @@ def compile_moe_reduction(
                                     vec_c = vec_e
                                 acc_vecs[si] = acc_vecs[si] + vec_c
 
-                        # ── Store results ──
+                        # -- Store results --
                         for si in range_constexpr(n_sub):
                             out_vec = acc_vecs[si]
                             if const_expr(elem_bits < 32):
@@ -3794,7 +3794,7 @@ def compile_moe_reduction(
                                 y_idx_i32 = fx.Int32(token_idx * c_model_dim + col)
                                 buffer_ops.buffer_store(out, y_rsrc, y_idx_i32)
 
-    # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
+    # -- Host launcher (flyc.jit + .launch) --------------------------------
     tile_size = BLOCK_SIZE * VEC_WIDTH
     gy_static = (model_dim + tile_size - 1) // tile_size
 

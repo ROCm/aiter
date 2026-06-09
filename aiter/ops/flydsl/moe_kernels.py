@@ -260,6 +260,81 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for bf16-dense stage1 configs (a=bf16, w=bf16,
+    QuantType.No -- no quant, no scale).
+
+    tile_n=64 is included because stage1 g1u1 pairs the up-projection column as
+    ``row_up = row_gate + inter_dim`` and launches the N-grid over gate columns
+    only (``inter_dim // tile_n`` blocks). tile_n must therefore DIVIDE inter_dim,
+    otherwise a tile straddles the gate/up boundary and reads out of bounds
+    (e.g. inter_dim=192 with tile_n=128 -> NaN). 192 = 3*64 needs tile_n=64.
+    """
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "bf16"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [64, 128]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
+                kernels[name] = {
+                    "stage": 1,
+                    "a_dtype": a_dtype,
+                    "b_dtype": b_dtype,
+                    "out_dtype": out_dtype,
+                    "tile_m": tm,
+                    "tile_n": tn,
+                    "tile_k": tk,
+                    "MPerBlock": tm,
+                    "in_dtype": "bf16",
+                    "k_batch": 1,
+                }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for bf16-dense stage2 configs.
+
+    tile_k=64 is included so inter_dim values that are not a multiple of 128
+    (e.g. 192 = 3*64) have an exact-fitting contraction tile for gemm2
+    (gemm2 contraction K == inter_dim).
+    """
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "bf16"
+    tile_ks = [64, 128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    modes = ["atomic"]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    base_params = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "in_dtype": "bf16",
+                    }
+                    kernels[base_name] = base_params
+                    kernels[base_name + "_persist"] = {**base_params, "persist": True}
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
@@ -271,6 +346,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+    # bf16-dense (a=bf16, w=bf16, QuantType.No) configs
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_bf16(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_bf16(out))
 
 
 _register_all_configs()
@@ -356,6 +435,25 @@ def compile_flydsl_moe_stage1(
             scale_is_bf16=True,
             k_batch=k_batch,
         )
+    elif a_dtype == "bf16" and b_dtype == "bf16":
+        # bf16-dense (QuantType.No): bf16 activations x bf16 weights, no scale.
+        from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        _use_cshuffle = None if k_batch > 1 else False
+        return compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            in_dtype="bf16",
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=_use_cshuffle,
+            k_batch=k_batch,
+        )
     else:
         raise ValueError(
             f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
@@ -426,6 +524,23 @@ def compile_flydsl_moe_stage2(
             out_dtype=out_dtype,
             accumulate=accumulate,
             scale_is_bf16=True,
+        )
+    elif a_dtype == "bf16" and b_dtype == "bf16":
+        # bf16-dense (QuantType.No): bf16 activations x bf16 weights, no scale.
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+        return compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype="bf16",
+            out_dtype=out_dtype,
+            accumulate=accumulate,
         )
     else:
         raise ValueError(
@@ -629,7 +744,7 @@ def _run_compiled(exe, args):
     except Exception:
         # JitFunction.__call__ leaks ir.Context on compilation failure,
         # causing all subsequent JitFunction calls to take a wrong code path
-        # (self.func(*args) without CompilationContext → gpu_module_body error).
+        # (self.func(*args) without CompilationContext -> gpu_module_body error).
         # Clean up leaked contexts to isolate failures.
         try:
             from flydsl._mlir import ir
