@@ -8001,10 +8001,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             }
             else
             {
-                // K/V are interleaved per block, so index with the cache's real
-                // per-block stride (k_block_stride); contiguous fallback if 0.
-                // offset = block_id*block_stride + block_offset*slot_size
-                //          + head_id*head_size + elem_in_head
+                // K/V are interleaved per block, so index with the cache's real per-block stride (k_block_stride)
+                // offset = block_id*block_stride + block_offset*slot_size + head_id*head_size + elem_in_head
                 const int block_id         = static_cast<int>(slot_id / block_size);
                 const int block_offset     = static_cast<int>(slot_id % block_size);
                 const int64_t slot_size    = static_cast<int64_t>(num_heads_k) * HEAD_SIZE;

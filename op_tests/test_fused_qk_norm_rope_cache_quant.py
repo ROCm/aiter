@@ -2941,6 +2941,15 @@ parser.add_argument(
     e.g.: --qkv_dtypes bf16""",
 )
 parser.add_argument(
+    "--shuffle_layouts",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True, False],
+    help="""Shuffle layouts for the parity sweep: True (x-packed shuffle) and/or
+    False (contiguous); both honor the cache's per-block stride.
+    e.g.: --shuffle_layouts false""",
+)
+parser.add_argument(
     "-d",
     "--dtype",
     type=dtypes.str2Dtype,
@@ -3181,7 +3190,7 @@ if __name__ == "__main__":
                                     else partial_rotary_configs[head_size]
                                 )
                                 for num_tokens in args.parity_tokens:
-                                    for use_shuffle_layout in (True, False):
+                                    for use_shuffle_layout in args.shuffle_layouts:
                                         df.append(
                                             test_pts_quant_shuffle_block_layout_parity(
                                                 qkv_dtype,
