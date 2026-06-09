@@ -8,8 +8,15 @@ import torch
 
 from aiter.test_common import checkAllclose, run_perftest
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter import dtypes
+from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA device is required"
+)
 
 
 def ref_gather_kv_b_proj(
@@ -137,6 +144,12 @@ def ref_gather_kv_b_proj(
         v_prefix_tp[context_start:context_end, :] = v_proj_tp
 
     return (k_prefix, v_prefix)
+
+
+def _dequant_mxfp4_weight(weight_fp4: torch.Tensor, scale_e8m0: torch.Tensor):
+    weight_f32 = mxfp4_to_f32(weight_fp4.view(torch.uint8))
+    scale_f32 = e8m0_to_f32(scale_e8m0.view(torch.uint8)).repeat_interleave(32, dim=1)
+    return weight_f32 * scale_f32
 
 
 def _make_kv_test_data(
@@ -764,6 +777,100 @@ def test_gather_kv_b_proj_asymmetric_dims(
 
     checkAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2)
     checkAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not arch_info.is_fp4_avail(), reason="MXFP4 not supported on this architecture"
+)
+@pytest.mark.parametrize("weight_preshuffle", [False, True])
+@pytest.mark.parametrize("k_buffer_type", [torch.bfloat16, dtypes.fp8])
+def test_gather_kv_b_proj_mxfp4_weight(k_buffer_type, weight_preshuffle):
+    """Validate the FP4 MXFP4 kv_b_proj path against a dequantized torch reference."""
+    fp4_weight_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_weight_dtype is None:
+        pytest.skip("torch.float4_e2m1fn_x2 is unavailable")
+
+    torch.manual_seed(0)
+    random.seed(0)
+    batch_size = 2
+    block_size = 1
+    avg_kv_length = 32
+    kv_c_dim = 512
+    kv_pe_dim = 64
+    qk_nope_head_dim = 128
+    v_head_dim = 128
+    tp_k_head_num = 1
+    device = "cuda"
+    weight_n = tp_k_head_num * (qk_nope_head_dim + v_head_dim)
+
+    (
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        _context_lens,
+        _num_block,
+    ) = _make_kv_test_data(
+        batch_size,
+        block_size,
+        avg_kv_length,
+        kv_c_dim,
+        kv_pe_dim,
+        k_buffer_type,
+        device,
+    )
+
+    weight_src = torch.randn(
+        (weight_n, kv_c_dim), device=device, dtype=torch.bfloat16
+    )
+    kv_proj_weight_u8, kv_proj_scale = torch_dynamic_mxfp4_quant(weight_src)
+    kv_proj_weight_ref = _dequant_mxfp4_weight(kv_proj_weight_u8, kv_proj_scale)
+
+    k_ref, v_ref = ref_gather_kv_b_proj(
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        kv_proj_weight_ref,
+        torch.ones(weight_n, device=device, dtype=torch.float32),
+        qk_nope_head_dim=qk_nope_head_dim,
+        v_head_dim=v_head_dim,
+    )
+
+    total_kv = kv_prefix_sum_context_lens[-1].item()
+    k_prefix = torch.zeros(
+        (total_kv, tp_k_head_num * (qk_nope_head_dim + kv_pe_dim)),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_prefix = torch.zeros(
+        (total_kv, tp_k_head_num * v_head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    kv_proj_weight = kv_proj_weight_u8.view(fp4_weight_dtype)
+    if weight_preshuffle:
+        kv_proj_weight = shuffle_weight(kv_proj_weight)
+        kv_proj_scale = shuffle_scale(kv_proj_scale)
+
+    gather_kv_b_proj(
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        kv_proj_weight,
+        kv_proj_scale,
+        k_prefix.view(-1, tp_k_head_num, qk_nope_head_dim + kv_pe_dim),
+        v_prefix.view(-1, tp_k_head_num, v_head_dim),
+        weight_preshuffle=weight_preshuffle,
+    )
+
+    checkAllclose(k_ref, k_prefix, atol=1e-1, rtol=1e-1)
+    checkAllclose(v_ref, v_prefix, atol=1e-1, rtol=1e-1)
 
 
 if __name__ == "__main__":
