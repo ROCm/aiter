@@ -84,6 +84,7 @@ def compile_mxscale_gemm(
     stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
     kernel_tag: str = "gemm",
+    n_valid: int | None = None,
 ):
     """Compile an MXFP4 or MXFP8 GEMM kernel with TDM async copy.
 
@@ -448,6 +449,40 @@ def compile_mxscale_gemm(
     )
     needs_grouped_row_masked_store = grouped_masked_m and (M % tile_m != 0)
     kernel_tag_mode = str(kernel_tag).replace("-", "_")
+
+    # Static pad (compile-time): n_valid is the *valid* (unpadded) extent along
+    # the N (output-column) dim.  When it is smaller than N the trailing
+    # [n_valid:N) region is treated as out-of-bounds by the TDM store
+    # hardware (col-drop), which lets the kernel ignore padding columns without
+    # a separate tail path.  Resolved to a compile-time constant and baked into
+    # cache_tag so the aligned/no-pad case (n_valid == N) emits ZERO extra
+    # instructions -- the OOB machinery below is entirely const_expr-gated.
+    n_valid_eff = N if n_valid is None else int(n_valid)
+    if not (0 < n_valid_eff <= N):
+        raise ValueError(f"n_valid must be in (0, {N}], got {n_valid!r}")
+    n_pad = n_valid_eff < N
+
+    # N-pad grid skip: trailing N tiles whose columns lie entirely in the
+    # padded region [n_valid_eff, N) never store live output (the TDM store
+    # drops every column).  Clamp the launched N-tile count to the tiles that
+    # still cover valid columns -- the same grid-clamp trick used by
+    # mixed_moe_gemm_2stage's N-direction padding -- so those dead tiles are
+    # never scheduled instead of running a full GEMM tile only to drop it.
+    # The boundary (last live) tile keeps its TDM OOB column drop.
+    n_grid_tiles_full = (N + tile_n - 1) // tile_n
+    n_grid_tiles = (n_valid_eff + tile_n - 1) // tile_n
+    if cluster_n > 1:
+        # Preserve cluster grid divisibility along N.
+        n_grid_tiles = _align_up(n_grid_tiles, cluster_n)
+    n_grid_tiles = min(n_grid_tiles, n_grid_tiles_full)
+
+    def _n_grid_dim(idx_n):
+        """N-tile grid extent.  With N-pad active, return the compile-time
+        clamped tile count (dead trailing tiles skipped); otherwise the
+        runtime ceil(N / tile_n)."""
+        if const_expr(n_pad):
+            return arith.index(n_grid_tiles)
+        return (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
 
     if use_fp4_bank_friendly_schedule:
         _bank_half_wm = wmma_m_rep // 2
@@ -1897,6 +1932,26 @@ def compile_mxscale_gemm(
                 ) + arith.index(d_output_off)
                 warp_m_off_sgpr = wave_m_idx * arith.index(warp_tile_m)
                 warp_n_off_sgpr = wave_n_idx * arith.index(warp_tile_n)
+                # N-pad (static): clamp this warp's store columns to the valid
+                # output width.  N is the innermost (dim0) descriptor dim and a
+                # store OOB on dim0 DROPs.  The descriptor base is already offset
+                # to this warp's column start, so we pass the *remaining* valid
+                # columns from that base.  num_warps=1 here, so flydsl uses
+                # valid_inner directly as tdim0.  Gated by const_expr(n_pad): the
+                # aligned case keeps the original (no valid_inner) descriptor.
+                if const_expr(n_pad):
+                    _store_base_n = arith.index_cast(T.i32, blk_n + warp_n_off_sgpr)
+                    _zero_i32_nv = arith.constant(0, type=T.i32)
+                    _n_rem_raw = arith.subi(
+                        arith.constant(n_valid_eff, type=T.i32), _store_base_n
+                    )
+                    _n_rem = arith.select(
+                        arith.cmpi(arith.CmpIPredicate.sgt, _n_rem_raw, _zero_i32_nv),
+                        _n_rem_raw,
+                        _zero_i32_nv,
+                    )
+                else:
+                    _n_rem = None
                 d_desc = tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_c,
                     lds_memref=d_lds_base_ptr,
@@ -1913,6 +1968,7 @@ def compile_mxscale_gemm(
                     num_warps=1,
                     lds_byte_offset=d_warp_off_sgpr,
                     for_store=True,
+                    valid_inner=_n_rem,
                 )
 
             # Precompute LDS addresses for TDM descriptor switching
@@ -2638,11 +2694,15 @@ def compile_mxscale_gemm(
                             )
 
                             def _tail_mid_nws(_ls=_load_stage, _ab=_tail_ab):
-                                _desc_a = make_desc_a(stages_a_mem[_ls], _tail_load_k)
-                                _desc_b = make_desc_b(stages_b_mem[_ls], _tail_load_k)
+                                _desc_a = make_desc_a(
+                                    stages_a_mem[_ls], _tail_load_k,
+                                )
+                                _desc_b = make_desc_b(
+                                    stages_b_mem[_ls], _tail_load_k,
+                                )
                                 if const_expr(stage1_dual_b):
                                     _desc_b_up = make_desc_b(
-                                        stages_b_up_mem[_ls], _tail_load_k, N
+                                        stages_b_up_mem[_ls], _tail_load_k, N,
                                     )
                                 _desc_as = make_desc_as(
                                     stages_as_mem[_ls], _tail_load_k
@@ -2737,7 +2797,7 @@ def compile_mxscale_gemm(
             worker_id = arith.index_cast(T.index, _raw(gpu.block_idx.y))
             grid_size = arith.index(_persistent_workers)
             idx_n = arith.index_cast(T.index, i32_n.ir_value())
-            n_tiles_per_batch = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
+            n_tiles_per_batch = _n_grid_dim(idx_n)
             max_m_tiles_per_batch = (M + tile_m - 1) // tile_m
 
             # Total M tile count = prefix[batch_count].
@@ -2849,18 +2909,23 @@ def compile_mxscale_gemm(
     # Bump this when changing generated IR in ways not otherwise reflected in
     # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
     # reusing a previously compiled kernel after source-only descriptor fixes.
-    tdm_store_descriptor_version = 30
+    tdm_store_descriptor_version = 32
 
     # M/N are compile-time constants used throughout the generated IR
     # (B_TOTAL_N, C_N, grid dimensions, output/bias strides, scale descriptor
     # shapes). They must be part of the JIT cache key; otherwise a kernel first
     # compiled for a small inter_dim can be incorrectly reused for a larger
     # grouped MoE shape (e.g. DS TP1 I=2048), causing OOB accesses.
+    #
+    # n_valid_eff is the static N-pad extent and MUST be in the key: kernels
+    # compiled for the aligned (no-pad) shape generate different IR (no OOB
+    # machinery) than the padded variant of the same M/N/K.
     cache_tag = (
         data_format,
         M,
         N,
         K,
+        n_valid_eff,
         tile_m,
         tile_n,
         tile_k,
@@ -2913,7 +2978,7 @@ def compile_mxscale_gemm(
         gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
         if const_expr(batch_count > 1):
             gx = gx * batch_count
-        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gy = _raw(_n_grid_dim(idx_n))
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
@@ -2974,7 +3039,7 @@ def compile_mxscale_gemm(
         gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
         if const_expr(batch_count > 1):
             gx = gx * batch_count
-        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gy = _raw(_n_grid_dim(idx_n))
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
@@ -3033,7 +3098,7 @@ def compile_mxscale_gemm(
             arena_alloc.finalize()
 
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        gx = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
+        gx = _n_grid_dim(idx_n)
         gy = arith.index(_persistent_workers)
         gz = split_k
 
@@ -3089,7 +3154,7 @@ def compile_mxscale_gemm(
         gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
         if const_expr(batch_count > 1):
             gx = gx * batch_count
-        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gy = _raw(_n_grid_dim(idx_n))
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
@@ -3151,7 +3216,7 @@ def compile_mxscale_gemm(
         gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
         if const_expr(batch_count > 1):
             gx = gx * batch_count
-        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gy = _raw(_n_grid_dim(idx_n))
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
@@ -3211,7 +3276,7 @@ def compile_mxscale_gemm(
             arena_alloc.finalize()
 
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        gx = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
+        gx = _n_grid_dim(idx_n)
         gy = arith.index(_persistent_workers)
         gz = split_k
 

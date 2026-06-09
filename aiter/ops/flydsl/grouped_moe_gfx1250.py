@@ -304,10 +304,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("bias1 and bias not none")
         # return None
     if hidden_pad != 0 or intermediate_pad != 0:
-        hidden_pad = 0
-        intermediate_pad = 0
-        _grouped_dbg("haspad")
-        # return None
+        _grouped_dbg(
+            f"pad enabled: hidden_pad={hidden_pad}, "
+            f"intermediate_pad={intermediate_pad}"
+        )
     if not isG1U1 or quant_type != QuantType.per_1x32:
         _grouped_dbg("not g1u1 or not 1x32")
         return None
@@ -667,6 +667,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         persistent_workers=persistent_workers,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
     )
     _grouped_dbg("stage1 compile done; start launch")
     _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
@@ -777,6 +779,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
     _grouped_dbg("a2 scale layout done")
     grouped_out = torch.empty((E, max_m, model_dim), dtype=dtype, device=device)
+    if hidden_pad > 0:
+        # Stage2 store-drops the model_dim padding columns (N-pad via TDM OOB),
+        # so they are never written.  The output epilogue (gather/reduce or
+        # naive scatter) reads the full padded model_dim, so zero the padding
+        # slice once to feed it a deterministic 0 instead of uninitialized
+        # garbage in the unused [model_dim - hidden_pad : model_dim] region.
+        grouped_out[..., model_dim - hidden_pad :].zero_()
     stage2_compiler = (
         compile_moe_grouped_gemm2_mxfp4_masked
         if data_format == "fp4"
@@ -799,6 +808,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         expert_sched_mode=False,
         grouped_persistent_m=effective_grouped_persistent_m,
         persistent_workers=persistent_workers,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None
