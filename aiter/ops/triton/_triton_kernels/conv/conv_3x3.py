@@ -4,6 +4,7 @@
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from .helpers import CONV_AUTOTUNE_ENABLED
 from ..activation import _relu, _relu6, _gelu_tanh
 
@@ -20,7 +21,33 @@ def _get_config_cblocked(shape_key=None, M=None):
     return get_conv_config("CONV-3X3-CBLOCKED", shape_key=shape_key, M=M)
 
 
-@triton.jit
+_conv2d_3x3_nhwc_kernel_repr = make_kernel_repr(
+    "_conv2d_3x3_nhwc_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_C",
+        "GROUP_SIZE_M",
+        "HAS_BIAS",
+        "ACTIVATION",
+    ],
+)
+
+
+_conv2d_3x3_cblocked_kernel_repr = make_kernel_repr(
+    "_conv2d_3x3_cblocked_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_C",
+        "GROUP_SIZE_M",
+        "HAS_BIAS",
+        "ACTIVATION",
+    ],
+)
+
+
+@triton.jit(repr=_conv2d_3x3_nhwc_kernel_repr)
 def _conv2d_3x3_nhwc_kernel(
     X,
     W3,
@@ -152,7 +179,7 @@ def _conv2d_3x3_nhwc_kernel(
     )
 
 
-@triton.jit
+@triton.jit(repr=_conv2d_3x3_cblocked_kernel_repr)
 def _conv2d_3x3_cblocked_kernel(
     X,
     W3,

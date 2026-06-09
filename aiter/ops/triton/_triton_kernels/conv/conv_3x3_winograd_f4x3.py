@@ -4,6 +4,7 @@
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from .helpers import CONV_AUTOTUNE_ENABLED
 from ..activation import _relu, _relu6, _gelu_tanh
 
@@ -32,7 +33,44 @@ def _get_config_fused(shape_key=None, M=None):
     return get_conv_config("CONV-WINO-F4X3-FUSED", shape_key=shape_key, M=M)
 
 
-@triton.jit
+_winograd_f4x3_input_transform_kernel_repr = make_kernel_repr(
+    "_winograd_f4x3_input_transform_kernel",
+    ["BLOCK_C", "LAYOUT"],
+)
+
+
+_winograd_f4x3_cblocked_input_transform_kernel_repr = make_kernel_repr(
+    "_winograd_f4x3_cblocked_input_transform_kernel",
+    ["BLOCK_C"],
+)
+
+
+_winograd_f4x3_batched_gemm_kernel_repr = make_kernel_repr(
+    "_winograd_f4x3_batched_gemm_kernel",
+    ["BLOCK_M", "BLOCK_N", "BLOCK_K", "GROUP_SIZE_M"],
+)
+
+
+_winograd_f4x3_output_transform_kernel_repr = make_kernel_repr(
+    "_winograd_f4x3_output_transform_kernel",
+    ["BLOCK_K", "HAS_BIAS", "ACTIVATION", "LAYOUT"],
+)
+
+
+_winograd_f4x3_fused_gemm_output_kernel_repr = make_kernel_repr(
+    "_winograd_f4x3_fused_gemm_output_kernel",
+    [
+        "BLOCK_T",
+        "BLOCK_K",
+        "BLOCK_C",
+        "HAS_BIAS",
+        "ACTIVATION",
+        "LAYOUT",
+    ],
+)
+
+
+@triton.jit(repr=_winograd_f4x3_input_transform_kernel_repr)
 def _winograd_f4x3_input_transform_kernel(
     X,
     V,
@@ -381,7 +419,7 @@ def _winograd_f4x3_input_transform_kernel(
     tl.store(v_base + 35 * stride_v_alpha, v55, mask=c_store_mask)
 
 
-@triton.jit
+@triton.jit(repr=_winograd_f4x3_cblocked_input_transform_kernel_repr)
 def _winograd_f4x3_cblocked_input_transform_kernel(
     X,
     V,
@@ -716,7 +754,7 @@ def _winograd_f4x3_cblocked_input_transform_kernel(
     tl.store(v_base + 35 * stride_v_alpha, v55, mask=c_store_mask)
 
 
-@triton.jit
+@triton.jit(repr=_winograd_f4x3_batched_gemm_kernel_repr)
 def _winograd_f4x3_batched_gemm_kernel(
     V,
     U,
@@ -791,7 +829,7 @@ def _winograd_f4x3_batched_gemm_kernel(
     tl.store(m_ptrs, acc, mask=m_mask)
 
 
-@triton.jit
+@triton.jit(repr=_winograd_f4x3_output_transform_kernel_repr)
 def _winograd_f4x3_output_transform_kernel(
     M_in,
     BIAS,
@@ -1062,7 +1100,7 @@ def _winograd_f4x3_output_transform_kernel(
                         )
 
 
-@triton.jit
+@triton.jit(repr=_winograd_f4x3_fused_gemm_output_kernel_repr)
 def _winograd_f4x3_fused_gemm_output_kernel(
     V,
     U,
