@@ -51,6 +51,17 @@ def perftest(
     needTrace=False,
     use_cuda_event=False,
 ):
+    # Profiling override: under counter-replay tools (e.g. rocprof-compute) the
+    # default 101 iters makes each replay pass slow. Setting AITER_PERF_ITERS /
+    # AITER_PERF_WARMUP shrinks the timed loop without touching call sites. No
+    # effect when unset, so normal benchmarking is unchanged.
+    _env_iters = os.environ.get("AITER_PERF_ITERS")
+    if _env_iters is not None:
+        num_iters = int(_env_iters)
+    _env_warmup = os.environ.get("AITER_PERF_WARMUP")
+    if _env_warmup is not None:
+        num_warmup = int(_env_warmup)
+
     def decorator(func):
         def wrapper(*args, **kwargs):
             num = num_rotate_args

@@ -1080,6 +1080,36 @@ def get_args_of_build(ops_name: str, exclude=[]):
         # Use a fresh copy so keys from previous modules don't leak
         result = dict(d_opt_build_args)
         result.update(d_ops)
+
+        # Opt-in slim build for profiling: AITER_UA_TRACE_INSTANCES names the
+        # unified-attention instance(s) we actually want as real GPU kernels
+        # (comma-listed path substrings, e.g. "d128_fp8_nmask_nopage"). Every
+        # OTHER UA instance TU is still compiled+linked (the runtime dispatch
+        # switch references all of them, so dropping srcs => undefined symbol at
+        # load), but with -DUA_STUB_INSTANCE so it emits only a trivial host
+        # stub (returns {false,-1}) and NO device kernel. Result: the loaded
+        # code object contains ~1 kernel instead of ~610, so rocprofv3 ATT
+        # disassembly drops from ~110s to ~1s. Non-built shapes fail gracefully
+        # ("no matching kernel instance"). Scoped to UA `/instances/` files.
+        _ua_keep = os.environ.get("AITER_UA_TRACE_INSTANCES", "").strip()
+        if _ua_keep:
+            pats = [p for p in _ua_keep.split(",") if p]
+            per_src = dict(result.get("flags_extra_hip_per_source", {}) or {})
+            srcs = result.get("srcs", [])
+            stubbed = 0
+            for src in srcs:
+                s = str(src)
+                if "42_unified_attention" in s and "/instances/" in s:
+                    if not any(p in s for p in pats):
+                        per_src[s] = list(per_src.get(s, [])) + ["-DUA_STUB_INSTANCE"]
+                        stubbed += 1
+            if stubbed:
+                logger.warning(
+                    f"[UA trace-slim] AITER_UA_TRACE_INSTANCES={_ua_keep!r}: "
+                    f"stubbed {stubbed} UA instance TUs (kept real: {pats}); "
+                    f"non-built shapes will fail with 'no matching kernel'."
+                )
+                result["flags_extra_hip_per_source"] = per_src
         return result
 
     with open(this_dir + "/optCompilerConfig.json", "r") as file:
