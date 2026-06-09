@@ -105,11 +105,15 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS):
 
         if start_m < M_b:
             # --- Per-group rebasing ---
-            a_row_off = fx.Int32(seq_start) * fx.Int32(K)
-            c_row_off = fx.Int32(seq_start) * fx.Int32(N)
+            # i64 offset math: seq_start can reach ~L (millions of rows), so
+            # seq_start*K / seq_start*N overflow i32 at large shapes (e.g.
+            # B1024_D512: 7.86M*512 = 4.0e9 > 2^31). Cast to i64 BEFORE the
+            # stride multiply so the product is computed in 64-bit.
+            a_row_off = fx.Int64(seq_start) * fx.Int64(K)
+            c_row_off = fx.Int64(seq_start) * fx.Int64(N)
             A_g = fx.make_view(fx.add_offset(fx.get_iter(A), fx.make_int_tuple(a_row_off)), fx.get_layout(A))
             C_g = fx.make_view(fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_row_off)), fx.get_layout(C))
-            b_row_off = fx.Int32(off_b) * fx.Int32(N) * fx.Int32(K)
+            b_row_off = fx.Int64(off_b) * fx.Int64(N) * fx.Int64(K)
             B_g = fx.make_view(fx.add_offset(fx.get_iter(B), fx.make_int_tuple(b_row_off)), fx.get_layout(B))
 
             A_buf = fx.rocdl.make_buffer_tensor(A_g, max_size=True)
