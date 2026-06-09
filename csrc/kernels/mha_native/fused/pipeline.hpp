@@ -39,7 +39,7 @@
 //                DRAM, optionally write LSE (op_epilog).
 //
 // ONLINE SOFTMAX (Milakov), carried across tiles in three scalars per row:
-//     rmax — running max of scaled scores seen so far (seed -5000 ~ -inf)
+//     rmax — running max of scaled scores seen so far
 //     rsum — running denominator (sum of exp2 probabilities)
 //     o_acc_d0/d1 — running numerator (sum of P.V), in TransposedC layout
 //   When a tile raises the max from rmax to m_new, every earlier contribution is
@@ -341,10 +341,9 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             q_regs[kstep] = v4i{0, 0, 0, 0};
     }
 
-    // Online-softmax running state for this lane's row. rmax seeded well below any
-    // real score (-5000, not -inf, so the first fmax/rescale stay finite). rsum
-    // starts empty.
-    float rmax = -5000.0f;
+    // Finite rmax seed below any realizable raw score, so a real score always wins
+    // the running max; -inf would make a fully-masked row NaN instead of O=0/LSE=-inf.
+    float rmax = -1e30f;
     float rsum = 0.0f;
 
     // kv_offset = absolute key row of the current tile's first key.
