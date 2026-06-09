@@ -260,7 +260,8 @@ def use_2d_kernel(
 ):
     # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
     if IS_DEVICE_ARCH_GFX12:
-        return not all_decode
+        return (sliding_window > 0) or (not all_decode)
+
     return (
         (sliding_window > 0)
         or (max_seqlen_k <= 512)
