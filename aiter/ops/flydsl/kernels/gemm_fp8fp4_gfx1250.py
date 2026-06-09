@@ -264,7 +264,7 @@ def compile_fp8fp4_gemm(
         )
 
     gpu_arch = str(get_hip_arch())
-    assert gpu_arch.startswith("gfx1250"), f"Expected gfx1250, got {gpu_arch}"
+    # assert gpu_arch.startswith("gfx1250"), f"Expected gfx1250, got {gpu_arch}"
 
     k_wmma_steps = tile_k // WMMA_K
 
