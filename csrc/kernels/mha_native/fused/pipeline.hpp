@@ -64,14 +64,28 @@
 //   k_sub = lane_id>>5 (0/1, the 32-lane half); m_row = (lane_id&31)+32*warp_id
 //   is this lane's query row within the M-tile (TransposedC: one M-row per lane).
 
-// Build an untyped byte buffer SRD over a DRAM tensor base. num_records is left
-// at 0xFFFFFFFF (max) so the hardware bounds-check never trips on in-range
-// accesses; 0x00027000 is the CDNA data-format word for a raw byte buffer used by
-// the raw_buffer_load builtins. Per-access bounds come from the byte voffset the
-// callers compute.
-__device__ __forceinline__ __amdgpu_buffer_rsrc_t make_buffer_resource(const void* base) {
+// Build an untyped byte buffer SRD over a DRAM tensor base. num_records is the
+// VALID byte extent of the region from `base`: the hardware bounds-check then
+// returns 0 for any access at or beyond it. This is load-bearing for the partial
+// tail tile (seqlen_k % kN0 != 0): the K/V tile loop walks a full kN0-wide tile
+// even when the last tile has fewer real keys, so the padding rows (row >=
+// seqlen_k) read PAST the tensor. Without a real bound those reads return whatever
+// is in adjacent memory (e.g. a freed NaN block), and the masked-but-still-summed
+// P(=0)*V term computes 0*NaN = NaN in GEMM1, poisoning O_acc. Bounding the SRD
+// makes those OOB reads return 0 instead. 0x00027000 is the CDNA data-format word
+// for a raw byte buffer used by the raw_buffer_load builtins.
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t make_buffer_resource(const void* base,
+                                                                       unsigned num_records) {
     return __builtin_amdgcn_make_buffer_rsrc(
-        const_cast<void*>(base), 0, 0xFFFFFFFF, 0x00027000);
+        const_cast<void*>(base), 0, num_records, 0x00027000);
+}
+
+// Clamp a 64-bit byte extent to the 32-bit num_records field. Real test tensors
+// are far under 4 GiB per (b,h) region; the clamp only matters for pathologically
+// large tensors, where it degrades back to "no bounds check" rather than truncating
+// a valid access.
+__device__ __forceinline__ unsigned clamp_num_records(int64_t bytes) {
+    return (bytes < (int64_t)0xFFFFFFFFu) ? (unsigned)bytes : 0xFFFFFFFFu;
 }
 
 // LDS buffer rotation for the four staging slots used within one tile iteration.
@@ -175,10 +189,17 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     }
 
     // Buffer SRDs the raw_buffer_load builtins read through (O's SRD is built
-    // separately inside the epilogue).
-    auto srd_q = make_buffer_resource(q_base);
-    auto srd_k = make_buffer_resource(k_base);
-    auto srd_v = make_buffer_resource(v_base);
+    // separately inside the epilogue). Each SRD is bounded to the valid byte extent
+    // of this (b,h) tensor region so the partial-tail-tile padding rows (row >=
+    // seqlen_q / seqlen_k) read 0 rather than out-of-bounds garbage. Q rows are
+    // already guarded (OOB rows load zeros), but bounding it too costs nothing and
+    // keeps the three paths uniform. Extent = #rows * row_stride(elements) * 2 bytes.
+    auto srd_q = make_buffer_resource(
+        q_base, clamp_num_records((int64_t)seqlen_q * params.stride_q * 2));
+    auto srd_k = make_buffer_resource(
+        k_base, clamp_num_records((int64_t)seqlen_k * params.stride_k * 2));
+    auto srd_v = make_buffer_resource(
+        v_base, clamp_num_records((int64_t)seqlen_k * params.stride_v * 2));
 
     // ---- KV loop bounds ----
     // mask_shift aligns the causal diagonal when seqlen_k != seqlen_q: query row r
