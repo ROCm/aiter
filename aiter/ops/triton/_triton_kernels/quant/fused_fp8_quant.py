@@ -287,10 +287,16 @@ def _fused_flatten_fp8_group_quant_kernel(
     n1 = tl.program_id(1)
 
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N2 // QUANT_BLOCK_SIZE
+    # In the flattened (M, N1 * N2) output, each n1 segment is exactly N2 wide
+    # (not BLOCK_SIZE_N2), so stride between n1 segments must use N2 — otherwise
+    # non-power-of-2 N2 (e.g. 7168) over-strides the output (and at the last n1
+    # walks past the row boundary, causing OOB writes).
+    n2_groups = tl.cdiv(N2, QUANT_BLOCK_SIZE)
 
     n2_offs = tl.arange(0, BLOCK_SIZE_N2)
+    x_mask = n2_offs < N2
     x_offs = m * x_stride_m + n1 * x_stride_n1 + n2_offs * x_stride_n2
-    x = tl.load(x_ptr + x_offs, mask=n2_offs < N2)
+    x = tl.load(x_ptr + x_offs, mask=x_mask, other=0.0)
 
     out, out_block_scales = _fp8_quant_op(
         x, 1, BLOCK_SIZE_N2, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
@@ -299,17 +305,17 @@ def _fused_flatten_fp8_group_quant_kernel(
     out_block_scales = tl.ravel(out_block_scales)
 
     tl.store(
-        out_ptr + m * out_stride_m + (n1 * BLOCK_SIZE_N2 + n2_offs) * out_stride_n,
+        out_ptr + m * out_stride_m + (n1 * N2 + n2_offs) * out_stride_n,
         out.to(out_ptr.dtype.element_ty),
-        mask=n2_offs < N2,
+        mask=x_mask,
     )
     block_scale_offs = tl.arange(0, NUM_QUANT_BLOCKS)
     tl.store(
         out_scales_ptr
         + m * out_scales_stride_m
-        + (n1 * NUM_QUANT_BLOCKS + block_scale_offs) * out_scales_stride_n,
+        + (n1 * n2_groups + block_scale_offs) * out_scales_stride_n,
         out_block_scales.to(out_scales_ptr.dtype.element_ty),
-        mask=block_scale_offs < tl.cdiv(N2, QUANT_BLOCK_SIZE),
+        mask=block_scale_offs < n2_groups,
     )
 
 
