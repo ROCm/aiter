@@ -44,6 +44,10 @@ from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402
 from aiter.ops.shuffle import shuffle_weight  # noqa: E402
 from aiter.utility import dtypes  # noqa: E402
 
+# Official production router (the same one bench_moe_gemm_a8w4.py and ATOM use).
+from aiter.ops.triton.moe.moe_routing.routing import routing  # noqa: E402
+from aiter.ops.triton.moe.moe_routing.topk import topk  # noqa: E402
+
 # FlyDSL-side: reuse the grouped path's builders/runner + the shared reference.
 from op_tests.test_flydsl_grouped_gemm_gfx1250 import (  # noqa: E402
     _require_gfx1250,
@@ -59,7 +63,7 @@ from op_tests.test_flydsl_grouped_gemm_gfx1250 import (  # noqa: E402
 from op_tests.triton_tests.moe.test_moe_gemm_a8w4_e2e import (  # noqa: E402
     _make_case,
     _ref_from_case,
-    _prepare_from_case,
+    _prepare_gluon_inputs,
     _run_gluon_stages,
     _config_from_args,
 )
@@ -151,7 +155,10 @@ def _compare(args: argparse.Namespace) -> None:
         flush=True,
     )
 
-    # One shared logical case for both paths.
+    # One shared logical case (weights / hidden / bias). Its balanced-topk
+    # routing fields are overwritten below with the OFFICIAL router's output so
+    # both paths and the reference consume the exact same expert assignment +
+    # softmax gate weights that a real deployment (bench/ATOM) would produce.
     case = _make_case(
         experts=args.experts,
         tokens=args.tokens,
@@ -161,8 +168,21 @@ def _compare(args: argparse.Namespace) -> None:
         use_bias=not args.no_bias,
     )
 
+    # Shared router logits. topk() gives the (T, topk) expert ids + softmax
+    # weights that feed fused_moe and the reference; routing() gives the
+    # RoutingData + gather/scatter the gluon kernel consumes. Both come from the
+    # SAME logits, so the two paths are routed identically (verified: hist match,
+    # gate_scal == expt_scal as a multiset).
+    torch.manual_seed(0)
+    logits = torch.randn(
+        args.tokens, args.experts, dtype=torch.float16, device="cuda"
+    )
+    expt_scal, expt_indx, _ = topk(logits, args.topk, apply_softmax=True)
+    case["topk_id"] = expt_indx.to(torch.int32)
+    case["topk_w"] = expt_scal.to(torch.float32)
+
     # Shared reference (decodes the GGUU logical weights at fp32, mxfp8 act
-    # quant matched to dtype_max=448 / e4m3fn).
+    # quant matched to dtype_max=448 / e4m3fn), now on the official routing.
     ref = _ref_from_case(case).to(torch.bfloat16)
 
     # ---- FlyDSL grouped path ----
@@ -203,10 +223,43 @@ def _compare(args: argparse.Namespace) -> None:
             os.environ["AITER_USE_GROUPED_GEMM"] = saved
 
     # ---- gluon path ----
+    # Weight prep (transpose / scale swizzle / H2D) is one-time setup, kept OUT
+    # of the timed region. The OFFICIAL routing() call is kept INSIDE the timed
+    # thunk so the gluon path is charged for routing the same way fused_moe is
+    # (its route-map build is internal and unavoidably timed). This mirrors
+    # bench_moe_gemm_a8w4.py / ATOM, which call routing() per forward.
     gluon_cfg = _config_from_args(args)
-    prep = _prepare_from_case(case, args.block_m)
+    topk_id_dev = case["topk_id"].cuda()
+    topk_w_dev = case["topk_w"].cuda()
+
+    def _gluon_prep_with(routing_out):
+        return _prepare_gluon_inputs(
+            hidden=case["hidden"],
+            w1_packed=case["w1_packed"],
+            w1_scale_raw=case["w1_scale_raw"],
+            bias1=case["bias1"],
+            w2_packed=case["w2_packed"],
+            w2_scale_raw=case["w2_scale_raw"],
+            bias2=case["bias2"],
+            topk_id=topk_id_dev,
+            topk_w=topk_w_dev,
+            experts=args.experts,
+            model_dim=args.model_dim,
+            inter_dim=args.inter_dim,
+            block_m_override=args.block_m,
+            routing_override=routing_out,
+        )
+
+    # Pre-build the weight-side prep once with a throwaway routing, then reuse
+    # only its weight tensors; routing is recomputed per-iter inside the thunk.
+    base_prep = _gluon_prep_with(routing(logits, args.topk))
 
     def _gluon_thunk():
+        rdata, gather_indx, scatter_indx = routing(logits, args.topk)
+        prep = dict(base_prep)
+        prep["rdata"] = rdata
+        prep["gather_indx"] = gather_indx
+        prep["scatter_indx"] = scatter_indx
         return _run_gluon_stages(prep, gluon_cfg)
 
     gluon_out = _gluon_thunk().to(torch.bfloat16)

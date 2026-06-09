@@ -236,11 +236,22 @@ def _prepare_gluon_inputs(
     model_dim,
     inter_dim,
     block_m_override: int | None = None,
+    routing_override: tuple | None = None,
 ) -> dict:
-    """One-time, NOT timed: everything that a serving path would precompute."""
-    rdata, gather_indx, scatter_indx = _build_routing_from_ids(
-        topk_id, topk_w, experts, block_m_override=block_m_override
-    )
+    """One-time, NOT timed: everything that a serving path would precompute.
+
+    ``routing_override``: optional ``(rdata, gather_indx, scatter_indx)`` to use
+    instead of reconstructing routing from ``topk_id/topk_w``. The compare
+    harness passes the official ``routing()`` output here so the gluon path uses
+    the same (production) router as bench/ATOM; when None we fall back to the
+    deterministic torch reconstruction for standalone correctness tests.
+    """
+    if routing_override is not None:
+        rdata, gather_indx, scatter_indx = routing_override
+    else:
+        rdata, gather_indx, scatter_indx = _build_routing_from_ids(
+            topk_id, topk_w, experts, block_m_override=block_m_override
+        )
     w1_k, w1_scale_k, bias1_k = _prep_w1_kernel(
         w1_packed, w1_scale_raw, bias1, gugu=True
     )
