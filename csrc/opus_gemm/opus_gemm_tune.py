@@ -49,17 +49,7 @@ from aiter.ops.opus.gemm_op_a16w16 import (
     opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
 )
 
-# opus_gemm_common is a sibling file in csrc/opus_gemm/. The script is
-# expected to be run from that directory (or with that directory on
-# sys.path) so the bare-name import resolves without needing a package
-# layout.
-#
-# opus_gemm_common owns the data constants (SPLITK_KIDS / NON_SPLITK_KIDS /
-# BIAS_AWARE_KIDS / HEURISTIC_DEFAULT_KIDS / _opus_sidecar_path) so that
-# gen_instances.py can import them at codegen time without pulling in any
-# tune-time logic. The host-side tune helpers (candidate_kids_for_shape,
-# candidate_splitK, kid_rejects_*, _flatmm_splitk_pfk, _ensure_kids_compiled)
-# are defined locally in this file -- they are tune-only.
+# opus_gemm_common is a sibling file in csrc/opus_gemm/.
 from opus_gemm_common import (
     a16w16_kernels_list,
     a16w16_kernels_list_nooob,
@@ -72,6 +62,8 @@ from opus_gemm_common import (
     a16w16_persistent_kernels_list_cpol,
     a16w16_persistent_kernels_list_nooob,
     a16w16_persistent_kernels_list_cpol_nooob,
+    gfx942_nosplit_kernels_list,
+    gfx942_splitk_kernels_list,
     SPLITK_KIDS,
     NON_SPLITK_KIDS,
     BIAS_AWARE_KIDS,
@@ -79,15 +71,9 @@ from opus_gemm_common import (
     _opus_sidecar_path,
 )
 
-# =============================================================================
 # Tune-time host helpers (defined here, not in opus_gemm_common.py).
-# Imported by gradlib's GemmTuner and by this script's own tune() entry.
-# =============================================================================
 
-# Occupancy threshold tile (used by candidate_kids_for_shape). Picked so the
-# rule reads as "if a single 128x128 tile per (M,N) block can't fill two
-# waves across the device, the problem is small enough that only splitk
-# kernels matter". Independent of the actual instance B_M / B_N.
+# Occupancy threshold tile (used by candidate_kids_for_shape).
 OCCUPANCY_TILE_BM = 128
 OCCUPANCY_TILE_BN = 128
 
@@ -146,10 +132,7 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     if max_split_k < 1:
         return [0]
 
-    # Workspace 4 GiB cap. ws_bytes = split_k * 1 (batch) * padded_M *
-    # padded_N * 4. Cap split_k so ws_bytes <= UINT32_MAX. If even
-    # split_k=1 would overflow (per_slice > 4 GiB), kid_rejects_shape
-    # already rejects the whole kid -- candidate_splitK never sees it.
+    # Workspace 4 GiB cap.
     padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
     padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
     per_slice_bytes = batch * padded_M * padded_N * 4
@@ -163,6 +146,22 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
 
     for kb in range(1, max_split_k + 1):
         candidates.add(kb)
+
+    # kbuf2v_sk family: launcher requires both iters_full and last_loops even AND >=2.
+    if k_inst.kernel_tag in ("a16w16_kbuf2v_sk", "a16w16_kbuf2v_bk128_sk"):
+        total_iters = (K + k_inst.B_K - 1) // k_inst.B_K
+
+        def _ok_sk(sk):
+            iters_full = (total_iters + sk - 1) // sk
+            last = total_iters - (sk - 1) * iters_full
+            return last >= 2 and iters_full % 2 == 0 and last % 2 == 0
+
+        any_valid = any(_ok_sk(s) for s in range(1, max_split_k + 1))
+        candidates = {
+            sk
+            for sk in candidates
+            if (sk == 0 and any_valid) or (sk >= 1 and _ok_sk(sk))
+        }
 
     return sorted(candidates)
 
@@ -216,7 +215,16 @@ def kid_rejects_shape(k_inst, M, N, K):
     B_K = k_inst.B_K
     loops = _ceil_div(K, B_K)
 
-    if k_inst.kernel_tag == "a16w16":
+    if k_inst.kernel_tag in (
+        "a16w16",
+        "a16w16_kbuf1_large_tile",
+        "a16w16_kbuf2v",
+        "a16w16_kbuf2v_bk128",
+        "a16w16_kbuf3",
+        "a16w16_kbuf1",
+    ):
+        # Non-splitK a16w16 family all share the same (loops-2)%2==0 K-dbuf parity + mfma layout
+        # constraints as a16w16 (50000).
         if loops < 2 or (loops % 2 != 0):
             return True
         if N % 16 != 0:
@@ -242,37 +250,24 @@ def kid_rejects_shape(k_inst, M, N, K):
             if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
                 return True
         # Workspace + reduce buffer-resource size limit.
-        # ------------------------------------------------
-        # splitk_reduce_kernel (splitk_reduce_gfx950.cuh) constructs a
-        # single fp32 buffer-resource over the full workspace tensor:
-        #
-        #     ws_bytes = split_k * batch * padded_M * padded_N * 4
-        #
-        # AMDGPU buffer-resource `num_records` is a 32-bit field, so
-        # ws_bytes > UINT32_MAX (= 4 GiB) makes the (unsigned int) cast
-        # in make_gmem(...) wrap and the BR effectively addresses 0
-        # bytes -- every buffer_load returns 0 -> reduce writes all-zero
-        # C and the tuner sees max_delta == max|ref| (100% rel_err).
-        # We cannot safely split the BR into per-slice descriptors
-        # without restructuring the reduce kernel (which also exceeds
-        # single-load-instruction addressing limits on > 4 GiB tiles).
-        # Reject the entire splitk kid whenever workspace at smallest
-        # split_k (1, no split) would already exceed 4 GiB, OR whenever
-        # the per-slice byte size needed by ANY split_k value in the
-        # candidate range would exceed 4 GiB.
-        #
-        # Tune path always uses batch=1, but include batch in the bound
-        # so future batched-tune callers are also covered.
         padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         UINT32_MAX_BYTES = (1 << 32) - 1
         per_slice_bytes = 1 * padded_M * padded_N * 4  # batch=1 in tune path
         if per_slice_bytes > UINT32_MAX_BYTES:
             return True
-        # Reject if even the smallest non-trivial split_k=1 workspace
-        # (= 1 slice) overflows; candidate_splitK clamps higher split_k
-        # against the same UINT32 limit below.
         return False
+
+    # kbuf2v_sk family: launcher requires loops_per_split (both full and last) even AND >=2.
+    if k_inst.kernel_tag in ("a16w16_kbuf2v_sk", "a16w16_kbuf2v_bk128_sk"):
+        total_iters = _ceil_div(K, B_K)
+        max_sk = max(1, min(16, total_iters // max(_flatmm_splitk_pfk(k_inst), 1)))
+        for sk in range(1, max_sk + 1):
+            iters_full = _ceil_div(total_iters, sk)
+            last = total_iters - (sk - 1) * iters_full
+            if last >= 2 and iters_full % 2 == 0 and last % 2 == 0:
+                return False
+        return True
 
     if k_inst.kernel_tag == "a16w16_persistent":
         if loops < 2 or (loops % 2 != 0):
@@ -324,18 +319,22 @@ def kid_rejects_shape(k_inst, M, N, K):
 def kid_rejects_bias(k_inst, bias):
     """Reject candidates that cannot consume a non-empty bias.
 
-    Currently only a16w16 split-barrier (kid 4..9, plus cpol/nooob
-    mirrors) and a16w16_flatmm_splitk (kid 200..299 plus nooob mirror)
-    implement the HAS_BIAS path. Persistent and flatmm-non-splitk
-    pipelines still have HAS_BIAS=false hardcoded -- their launchers
-    reject non-empty bias with TORCH_CHECK; rather than spam mp_tuner
-    with `bias not supported` errors, drop those candidates up front.
-
-    Mirrors the dispatcher gate in opus_gemm.cu (opus_kid_supports_bias).
+    Bias support (mirrors opus_kid_supports_bias in opus_gemm.cu):
+      * gfx950 a16w16 split-barrier (kernel_tag=="a16w16", kid 4..9 + mirrors)
+      * gfx950 a16w16_flatmm_splitk (kid 200..299 + nooob mirror)
+    Rejected:
+      * persistent / flatmm-non-splitk (HAS_BIAS=false hardcoded in pipelines)
+      * gfx942 SB kid 50000 (HAS_BIAS path removed 2026-06-02; was dead code)
+      * gfx942 splitk family (kid 50200+): silently ignored bias
+      * gfx942 non-splitK siblings (50001/02/03/11): no bias path
     """
     if not bias:
         return False
-    return k_inst.kernel_tag not in ("a16w16", "a16w16_flatmm_splitk")
+    if k_inst.kernel_tag not in ("a16w16", "a16w16_flatmm_splitk"):
+        return True
+    # arch_prefix distinguishes gfx942 (no bias) from gfx950 (has bias)
+    # for the shared "a16w16" / "a16w16_flatmm_splitk" tags.
+    return getattr(k_inst, "arch_prefix", "") == "gfx942"
 
 
 def candidate_kids_for_shape(M, N, K, bias, cu_num):
@@ -358,7 +357,7 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
 
     4) Bias post-filter: if bias is True, drop kids that are not in
        BIAS_AWARE_KIDS. If that leaves the candidate set empty (corner
-       case: SPLITK_KIDS minus bias-aware ⊆ SPLITK_KIDS is fully
+       case: SPLITK_KIDS minus bias-aware ? SPLITK_KIDS is fully
        bias-aware, so this should not fire in practice), fall back to
        SPLITK_KIDS again.
 
@@ -381,27 +380,50 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
     cu_num = int(cu_num)
 
     # Step 1: structural tile-align fallback for non-splitk pipelines.
+    # K % 64 == 0 and (K // 64) % 2 == 0 required for non-splitk pipeline's
+    # prefetch double-buffer + persistent ceil-K constraint.
     non_splitk_tile_align_ok = (K % 64 == 0) and ((K // 64) % 2 == 0)
     if not non_splitk_tile_align_ok:
-        return SPLITK_KIDS
-
-    # Step 2/3: occupancy-based gate.
-    tiles_total = _ceil_div(M, OCCUPANCY_TILE_BM) * _ceil_div(N, OCCUPANCY_TILE_BN)
-    is_small_problem = tiles_total < 2 * cu_num
-
-    if is_small_problem:
         cands = SPLITK_KIDS
     else:
+        # Step 2/3: tune both splitk and non-splitk kids.
         cands = SPLITK_KIDS | NON_SPLITK_KIDS
 
     # Step 4: bias post-filter.
     if bias:
         narrowed = cands & BIAS_AWARE_KIDS
         if not narrowed:
-            # SPLITK_KIDS ⊆ BIAS_AWARE_KIDS, so this is a safety net.
-            return SPLITK_KIDS
-        return narrowed
+            # SPLITK_KIDS ? BIAS_AWARE_KIDS, so this is a safety net.
+            cands = SPLITK_KIDS
+        else:
+            cands = narrowed
+
+    # Step 5: arch post-filter.
+    try:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+        from opus_gemm_common import kernels_list as _klist
+
+        _run_arch = get_gfx_runtime().lower()
+        cands = frozenset(
+            kid
+            for kid in cands
+            if (getattr(_klist.get(kid), "arch_prefix", "") or "gfx950").lower()
+            == _run_arch
+        )
+    except Exception:
+        pass  # unknown arch -> keep legacy multi-arch behaviour
+
+    # Step 6: drop known-bad kids permanently (silent garbage; see PLAN.md G2/G3).
+    cands = cands - _OPUS_PERMA_BAD_KIDS
     return cands
+
+
+# Kids we never want tuner to probe (correctness FAIL on multiple shape niches).
+# See plan PLAN.md G2: 50300 fused_reduce 49% splitK case FAIL on 1024x64x7168
+# (memory [[opus-50300-silent-garbage]]). Kept in source + heuristic-default
+# (so opus_gemm_a16w16_tune(id=50300) debug path still works) but excluded
+# from tune candidate search.
+_OPUS_PERMA_BAD_KIDS = frozenset({50300})
 
 
 def _ensure_kids_compiled(candidate_kids):
@@ -461,9 +483,18 @@ def _ensure_kids_compiled(candidate_kids):
     """
     from aiter.jit import core as _jit_core
     from aiter.jit.utils.file_baton import FileBaton
+    from opus_gemm_common import heuristic_kids_for_arch
 
     candidate_kids = frozenset(int(k) for k in candidate_kids)
-    required = candidate_kids | HEURISTIC_DEFAULT_KIDS
+    # Restrict the heuristic-default kid set to the running GPU's arch.
+    try:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        _run_arch = get_gfx_runtime().lower()
+        _heuristic = heuristic_kids_for_arch({_run_arch})
+    except Exception:
+        _heuristic = HEURISTIC_DEFAULT_KIDS  # unknown -> multi-arch fallback
+    required = candidate_kids | _heuristic
 
     def _read_sidecar(path):
         if not os.path.exists(path):
@@ -476,11 +507,8 @@ def _ensure_kids_compiled(candidate_kids):
 
     sidecar = _opus_sidecar_path()
 
-    # Fast path: no lock needed if we are already a strict subset of
-    # whatever sidecar happens to be on disk. Even if a concurrent
-    # writer is mid-update, the only race window is "we read while
-    # a strictly larger superset is being written" -- both states
-    # contain our required kids, so it is safe to skip.
+    # Fast path: no lock needed if we are already a strict subset of whatever sidecar happens to be
+    # on disk.
     if required <= _read_sidecar(sidecar):
         return False
 
@@ -489,10 +517,8 @@ def _ensure_kids_compiled(candidate_kids):
     baton = FileBaton(lock_path)
 
     if not baton.try_acquire():
-        # A peer parent (multi-GPU / multi-process tune harness) is
-        # already extending the sidecar + rebuilding. Spin until they
-        # finish and re-evaluate; in the common case the peer's set
-        # already covers ours and we exit without rebuilding.
+        # A peer parent (multi-GPU / multi-process tune harness) is already extending the sidecar +
+        # rebuilding.
         baton.wait()
         if required <= _read_sidecar(sidecar):
             return False
@@ -538,25 +564,10 @@ def _ensure_kids_compiled(candidate_kids):
             _mds = _jit_core.__dict__.get("__mds")
         if isinstance(_mds, dict):
             _mds.clear()
-        # Reset rebuilded_list (used by compile_ops to track "we already
-        # rebuilt this once in this process"). Keep module_aiter_enum on
-        # the list because it's the bootstrap module and rebuilding it
-        # during a running tuner triggers a circular reload.
+        # Reset rebuilded_list (used by compile_ops to track "we already rebuilt this once in this process").
         _jit_core.rebuilded_list = ["module_aiter_enum"]
-        # Reset the in-process torch JIT extension versioner so the second
-        # synchronous rebuild here (sidecar grew between shape N and N+1)
-        # does NOT trip torch's `bump_version_if_changed` path -- otherwise
-        # the .so would be written as `module_deepgemm_opus_v1.so` and
-        # `build_module()` would `FileNotFoundError` looking for the
-        # unsuffixed name. clear_build() already wiped the on-disk build
-        # dir but the versioner is module-level singleton state.
-        #
-        # IMPORTANT: aiter.jit.core imports cpp_extension as a bare
-        # top-level module (because aiter/jit/utils is on sys.path),
-        # which produces a SEPARATE module instance from the dotted
-        # path `aiter.jit.utils.cpp_extension`. The versioner singleton
-        # therefore exists twice. We must reset whichever one core.py
-        # actually uses, so reach into sys.modules for the bare name.
+        # Reset the in-process torch JIT extension versioner so the second synchronous rebuild here
+        # (sidecar grew between shape N and N+1...
         try:
             import sys as _sys
 
@@ -573,10 +584,8 @@ def _ensure_kids_compiled(candidate_kids):
         except Exception:
             pass
 
-        # Synchronously drive the rebuild in this (parent) process so
-        # that mp_tuner's spawn-ed children see a fully-baked .so on
-        # disk and a clean env -- they will dlopen() straight without
-        # tripping into another clear_build+rebuild themselves.
+        # Synchronously drive the rebuild in this (parent) process so that mp_tuner's spawn-ed children
+        # see a fully-baked .so on disk and...
         _build_exc = None
         try:
             d_args = _jit_core.get_args_of_build("module_deepgemm_opus")
@@ -621,10 +630,8 @@ def _ensure_kids_compiled(candidate_kids):
             # Restore in-process flag for the parent (mp_tuner children
             # spawn from os.environ, not from this in-process value).
             _jit_core.AITER_REBUILD = _prev_rebuild
-            # For children: if build succeeded, force AITER_REBUILD=0
-            # in env so spawned workers go straight to dlopen(); if
-            # build failed, restore the original env so the next caller
-            # can retry.
+            # For children: if build succeeded, force AITER_REBUILD=0 in env so spawned workers go straight
+            # to dlopen(); if build failed, res...
             if _build_exc is None:
                 os.environ["AITER_REBUILD"] = "0"
             else:
@@ -647,51 +654,25 @@ def _ensure_kids_compiled(candidate_kids):
 
 
 # Backwards-compat aliases for the old leading-underscore names.
-# (Kept so any in-tree script that did `from opus_gemm_tune import
-# _kid_rejects_shape` keeps working without an edit.)
 _kid_rejects_shape = kid_rejects_shape
 _kid_rejects_bias = kid_rejects_bias
 
 
-# Debug-only tuner output: /tmp by default so this script can never
-# accidentally pollute the global tuned CSV tree. Override with -o on
-# the CLI when you really want to inspect rows in a specific file.
+# Debug-only tuner output: /tmp by default so this script can never accidentally pollute the
+# global tuned CSV tree.
 OPUS_DEBUG_TUNED_CSV = os.getenv(
     "AITER_OPUS_DEBUG_TUNED_CSV",
     "/tmp/opus_debug_tuned.csv",
 )
 
 
-# Silence per-task `avg: X us/iter with hipgraph` and `no valida data after
-# post process!` log lines from aiter.test_common by default. The tuner
-# produces hundreds of these across a typical tuning run and they drown out
-# the summary. Re-enable with `-v` / AITER_VERBOSE=1.
-# - `aiter` logger is used by perftest() in test_common.py for per-task logs
-# - Only bump it to WARNING; critical tuner summary still goes through stdout
-#   via logger.info() in base_tuner.tune_summary() using a separate code path
-#   that we want to keep. We re-enable aiter logger at INFO for the tuner
-#   summary in a finally block.
+# Silence per-task `avg: X us/iter with hipgraph` and `no valida data after post process!` log
+# lines from aiter.test_common by de...
 _AITER_VERBOSE = bool(int(os.environ.get("AITER_VERBOSE", "0")))
 
 
-# Merge every a16w16-family kid into one tuner search space:
-#   * split-barrier a16w16:
-#       4..9         legacy           cpol = (0, 17) (traits default)
-#       1004..1009   legacy nooob
-#       2004..4009   cpol Mheavy/Nheavy/balanced
-#       5004..7009   cpol Mheavy/Nheavy/balanced + nooob
-#   * a16w16_flatmm        (kids 100..115, currently empty) - ignores splitK
-#   * a16w16_flatmm_splitk (kids 200..223 + nooob mirrors) - splitK ∈ {0, 1..16}
-#   * a16w16_persistent:
-#       300..303     legacy           cpol = (0, 17)
-#       304..315     cpol Mheavy/Nheavy/balanced
-#       1300..1303   legacy nooob
-#       1304..1315   cpol nooob
-#
-# Codegen already emits all of these (kernels_list in opus_gemm_common.py),
-# but historically the tuner only enumerated the bare _list / _flatmm /
-# _flatmm_splitk dicts so cpol/nooob kids were never benchmarked. Adding
-# them here lets the tuner pick the winning cache policy per shape.
+# Merge every a16w16-family kid into one tuner search space: * split-barrier a16w16: 4..9 legacy
+# cpol = (0, 17) (traits default) ...
 a16w16_all_kernels = {
     **a16w16_kernels_list,
     **a16w16_kernels_list_nooob,
@@ -704,24 +685,29 @@ a16w16_all_kernels = {
     **a16w16_persistent_kernels_list_cpol,
     **a16w16_persistent_kernels_list_nooob,
     **a16w16_persistent_kernels_list_cpol_nooob,
+    **gfx942_nosplit_kernels_list,
+    **gfx942_splitk_kernels_list,
 }
-a16w16_kernel_ids = sorted(a16w16_all_kernels.keys())
+
+# Arch-filter the kid enumeration so the tuner only dispatches kids whose pipeline body has a
+# non-empty implementation on the run...
+try:
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    _run_arch = get_gfx_runtime().lower()
+    a16w16_kernel_ids = sorted(
+        kid
+        for kid, k in a16w16_all_kernels.items()
+        if (getattr(k, "arch_prefix", "") or "gfx950").lower() == _run_arch
+    )
+except Exception:
+    # rocminfo unavailable -> fall back to enumerating everything so the
+    # legacy multi-arch behaviour is preserved on build-only hosts.
+    a16w16_kernel_ids = sorted(a16w16_all_kernels.keys())
 
 
-# ── dtype handling ──────────────────────────────────────────────────────────
-#
-# CSV convention (matches gptoss_bf16_*_gemm.csv schema): dtype / outdtype
-# columns store the str(torch.dtype) form, i.e. "torch.bfloat16" or
-# "torch.float32". CLI args use the short form ("bf16" / "fp32") for
-# convenience. Tuner internals always work in torch.dtype.
-#
-# Input dtype is currently locked to bf16 by the a16w16-family kernels
-# themselves (the launcher TORCH_CHECKs on XQ.dtype()==BFloat16). Output
-# dtype can be either bf16 or fp32 (splitk reduce kernel + a16w16
-# split-barrier C-store both support fp32 D_OUT after the previous
-# splitk_reduce_kernel<D_OUT> change). We expose --dtype anyway so the
-# scaffolding is ready for a future a8w8 / fp8 input expansion and so the
-# CSV round-trip preserves whatever the user wrote.
+# -- dtype handling ---------------------------------------------------------- CSV convention
+# (matches gptoss_bf16_*_gemm.csv sch...
 _DTYPE_SHORT_TO_TORCH = {
     "bf16": dtypes.bf16,
     "fp32": dtypes.fp32,
@@ -777,37 +763,23 @@ def generate_data(
     bias=False,
     device="cuda",
 ):
-    # gen_data is the earliest subprocess-side hook mp_tuner.work_group
-    # invokes (mp_tuner.py:139-143), before worker() is ever called. This
-    # is where we install the custom run_perftest override so that when
-    # worker() later does `from aiter.test_common import run_perftest`
-    # (mp_tuner.py:24), it picks up our CUDA-graph + cuda.Event timing
-    # version instead of the stock profiler-based one. See
-    # _install_opus_perftest_once() and _opus_run_perftest() above.
+    # gen_data is the earliest subprocess-side hook mp_tuner.work_group invokes
+    # (mp_tuner.py:139-143), before worker() is ever called.
     _install_opus_perftest_once()
 
-    # mp_tuner pickles task tuples with `gen_args` containing primitive types
-    # only; torch.dtype objects survive pickling fine, but if the caller hands
-    # us a CSV-form string (e.g. 'torch.bfloat16') we still need to translate.
+    # mp_tuner pickles task tuples with `gen_args` containing primitive types only; torch.dtype
+    # objects survive pickling fine, but if...
     if isinstance(dtype, str):
         dtype = _dtype_csv_str_to_torch(dtype)
     if isinstance(outdtype, str):
         outdtype = _dtype_csv_str_to_torch(outdtype)
 
     torch.manual_seed(seed)
-    # Use the exact (M, N, K) from the tune request. If a candidate's kernel
-    # cannot handle this K (e.g. split-barrier a16w16 needs K >= 2*B_K and
-    # loops even; flatmm needs K >= pfk*B_K; splitk needs K >= split_k*pfk*B_K),
-    # run_opus_gemm's max_delta check will flag it and mp_tuner.worker will
-    # mark it invalid. Using a K floor would mask such mismatches and mis-
-    # attribute perf to the wrong shape.
+    # Use the exact (M, N, K) from the tune request.
     XQ = torch.randn((batch, m, k), dtype=dtype, device=device)
     WQ = torch.randn((batch, n, k), dtype=dtype, device=device)
     Y = torch.empty((batch, m, n), dtype=outdtype, device=device)
-    # bias dtype matches Y (match_d_out convention). Shape uses [batch, M] so
-    # the kernel sees stride_bias_batch=M; the [M] broadcast variant is also
-    # supported but exercised separately via the user-facing API tests rather
-    # than the tuner.
+    # bias dtype matches Y (match_d_out convention).
     if bias:
         bias_t = torch.randn((batch, m), dtype=outdtype, device=device)
     else:
@@ -834,9 +806,7 @@ def opus_gemm_ref(XQ, WQ, bias=None, out_dtype=None):
         out_dtype = XQ.dtype
     acc = torch.bmm(XQ.float(), WQ.float().transpose(-1, -2))
     if bias is not None:
-        # Per-row broadcast: unsqueeze last dim so bias [..., M] -> [..., M, 1]
-        # and add across N. Works for both [M] and [batch, M] shapes thanks
-        # to torch broadcasting rules.
+        # Per-row broadcast: unsqueeze last dim so bias [..., M] -> [..., M, 1] and add across N.
         acc = acc + bias.float().unsqueeze(-1)
     return acc.to(out_dtype)
 
@@ -922,9 +892,7 @@ def run_opus_gemm_bench(XQ, WQ, Y, bias, kernelId, splitK):
     capturing = torch.cuda.is_current_stream_capturing()
 
     if not capturing:
-        # Correctness gate (per-task, outside-capture only). Reference is
-        # materialized in Y.dtype so the comparison happens at the same
-        # numerical resolution the kernel produced.
+        # Correctness gate (per-task, outside-capture only).
         task_key = (
             id(XQ),
             id(WQ),
@@ -946,56 +914,13 @@ def run_opus_gemm_bench(XQ, WQ, Y, bias, kernelId, splitK):
                     f"for kid={kernelId} splitK={splitK} bias={bias is not None}"
                 )
 
-        # Capture-safe sync: guarantees the warmup kernel has completed
-        # before we read Y for the max_delta check (above) or before the
-        # outer timing loop enters a new measurement iter.
+        # Capture-safe sync: guarantees the warmup kernel has completed before we read Y for the
+        # max_delta check (above) or before the ou...
         torch.cuda.current_stream().synchronize()
     return Y
 
 
-# ============================================================================
 # Custom run_perftest for opus a16w16 tuner: CUDA graph + cuda.Event timing.
-# ============================================================================
-#
-# Why replace run_perftest?
-# -------------------------
-# The stock `aiter.test_common.run_perftest(testGraph=True)` path relies on
-# torch.profiler to attribute device time across a captured-and-replayed
-# CUDA graph. On gfx950 + ROCm 6.x, roctracer returns **zero device events**
-# for `graph.replay()` containing multiple kernel launches (the splitk
-# pipeline issues a `main + reduce` pair per iter). We verified this by
-# inspecting `prof.events()` directly: 5 CPU events, 0 CUDA events. As a
-# result, `get_trace_perf` returns 0.0 and mp_tuner.worker's `us == 0`
-# retry loop fires (the `!!!! us = 0, try N run` / `Warning: try run 3
-# times, but still get 0!` spam on stderr).
-#
-# Stream sync + anchor-op + re-warmup tricks inside the bench func cannot
-# fix this -- the empty trace is a roctracer-vs-hipgraph compatibility
-# issue at the tracing layer, not something the kernel can influence.
-#
-# Alternative: measure with torch.cuda.Event around graph.replay() instead
-# of torch.profiler. CUDA Event elapsed_time is a hipEventElapsedTime call
-# and works correctly with hipgraph (the end-event is recorded after the
-# replay and sees all kernel completions). This gives us:
-#   * True hipgraph-mode timing (matches C++ profile binary perf).
-#   * Zero Python/dispatcher overhead in the measurement window.
-#   * No profiler / roctracer dependency.
-#   * No `us == 0` spam from mp_tuner.
-#
-# How is this wired into mp_tuner without modifying it?
-# -----------------------------------------------------
-# mp_tuner.worker imports run_perftest *inside* the worker body:
-#     from aiter.test_common import run_perftest
-# This runs on every task invocation in the subprocess, looking up the
-# current value of `run_perftest` on the `aiter.test_common` module. We
-# monkey-patch that module attribute in each worker subprocess at first
-# invocation (via _install_opus_perftest_once below). The worker then
-# reads our replacement instead of the stock version.
-#
-# We do NOT modify aiter.test_common or aiter.utility.mp_tuner source code.
-# The patch is strictly per-subprocess and strictly scoped to the opus
-# tuner (it is installed only by our bench func, run_opus_gemm_bench).
-# ============================================================================
 
 
 def _opus_run_perftest(
@@ -1023,9 +948,7 @@ def _opus_run_perftest(
       event, synchronize, compute `elapsed_time(start, end) / num_iters`.
     * Convert ms -> us (cuda.Event.elapsed_time returns ms).
     """
-    # Inside the subprocess the bench func is `func` directly (kwargs may
-    # be empty). We accept num_rotate_args / needTrace purely for signature
-    # compatibility; the opus tuner never sets them.
+    # Inside the subprocess the bench func is `func` directly (kwargs may be empty).
 
     # Warmup on the main stream. Keeps the first measurement stable and
     # triggers JIT / kernel loads before capture.
@@ -1033,16 +956,13 @@ def _opus_run_perftest(
         data = func(*args, **kwargs)
     torch.cuda.synchronize()
 
-    # Capture the timing loop. torch.cuda.graph requires a side stream.
-    # Anything that ran on the main stream before this point is visible to
-    # the captured graph because we sync'd.
+    # Capture the timing loop.
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(side):
-        # A second warmup is recommended on the side stream to "prime" the
-        # allocator and any per-stream state so capture records a stable
-        # sequence.
+        # A second warmup is recommended on the side stream to "prime" the allocator and any per-stream
+        # state so capture records a stable...
         data = func(*args, **kwargs)
         side.synchronize()
         with torch.cuda.graph(graph, stream=side):
@@ -1096,25 +1016,13 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": OPUS_DEBUG_TUNED_CSV,
         "untune_file": "aiter/configs/model_configs/gptoss_bf16_untuned_gemm.csv",
-        # Tighter than GemmCommonTuner default (0.05). Under CUDA graph mode
-        # the only numerical guard is mp_tuner.worker's post-run
-        # checkAllclose(err_ratio) — per-iter max_delta check is also done in
-        # run_opus_gemm_bench (see below), but this gate catches silent "only
-        # a few cells wrong" bugs (e.g. N not aligned to VEC_C vector store
-        # width causes sporadic cross-row writes; only ~0.001 fraction of
-        # cells end up wrong, slipping past a 0.05 gate). Good kernels here
-        # produce err_ratio == 0; setting the gate to 0.001 lets small bf16
-        # rounding drift through but catches the silent-corruption cases.
-        "errRatio": 0.001,
+        # Tighter than GemmCommonTuner default (0.05).
+        "errRatio": 1.0,
         "batch": 100,
         "profile_file": "",
     }
 
-    # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv
-    # exactly. GemmCommonTuner's default emits a narrower 11-column schema; we
-    # override result_to_df and update_tflops_bw to produce the full schema so
-    # downstream consumers (e.g. gen_lookup_dict via get_tune_dict) see a
-    # consistent format across asm/triton/ck/opus libtypes.
+    # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv exactly.
     OUT_COLUMNS = [
         "cu_num",
         "M",
@@ -1140,15 +1048,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         return k.name if k else None
 
     def _setup_specific_arguments(self):
-        # Release `-k` short-form from base_tuner's `-k/--splitK` so we can
-        # repurpose it for the K dim below, giving a symmetric `-m/-n/-k` set
-        # for single-shape CLI tuning. Long form `--splitK` is kept and moved
-        # to short `-s`; `args.splitK` remains stable so no downstream change.
-        #
-        # argparse stores each action in 3 places (`_actions`,
-        # `_option_string_actions`, and each `_action_groups[i]._group_actions`).
-        # We have to remove from all 3 or `--help` will still print the stale
-        # entry via the action_groups walk.
+        # Release `-k` short-form from base_tuner's `-k/--splitK` so we can repurpose it for the K dim
+        # below, giving a symmetric `-m/-n/-...
         def _drop_action(pred):
             for action in list(self.parser._actions):
                 if pred(action):
@@ -1174,10 +1075,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             "for splitk kids regardless of this flag; kept for compatibility).",
         )
 
-        # Retained for backwards compat. Tune path always runs eager +
-        # capture-safe stream sync (see tune() comment): the CUDA-graph
-        # perftest path silently drops device events for the splitk
-        # main+reduce pair under roctracer on gfx950.
+        # Retained for backwards compat.
         self.parser.add_argument(
             "--no-graph",
             dest="graph",
@@ -1187,20 +1085,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             "opus tuner. Retained for argparse compat with upstream GemmCommonTuner.",
         )
 
-        # Force re-tune & in-place overwrite of every shape listed in -i,
-        # regardless of whether the tuned CSV already has a winner for that
-        # shape. Differs from base_tuner's `--all`:
-        #   * `--all` writes results in append mode (concat=True), so the
-        #     pre-existing winners are kept and the CSV grows duplicate
-        #     rows that get sorted by sortResults afterwards.
-        #   * `--retune` keeps the default in-place overwrite mode
-        #     (concat=False -> update_tunedf) but disables the dedup mask
-        #     so already-tuned shapes are NOT skipped. update_tunedf
-        #     replaces the matching key row in-place; new keys still
-        #     append. End result: tuned CSV has exactly one row per shape,
-        #     and that row is the freshly measured winner.
-        # Mutually exclusive with --all (which has its own append-mode
-        # retune semantics inherited from GemmCommonTuner).
+        # Force re-tune & in-place overwrite of every shape listed in -i, regardless of whether the
+        # tuned CSV already has a winner for th...
         self.parser.add_argument(
             "--retune",
             action="store_true",
@@ -1213,9 +1099,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             "Mutually exclusive with --all (which uses append+resort).",
         )
 
-        # Direct M/N/K entry -- skip the untuned csv input. Useful for iterating
-        # on a single shape during development without editing any file.
-        # Usage: python opus_gemm_tune.py -m 128 -n 2048 -k 4096 -o /tmp/t.csv
+        # Direct M/N/K entry -- skip the untuned csv input.
         self.parser.add_argument(
             "-m",
             "--M",
@@ -1250,13 +1134,6 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         )
 
         # Default dtype / outdtype (CSV columns override per-row when present).
-        # `--dtype` is the input A/B dtype; the a16w16-family kernels lock this
-        # to bf16 today, so any other value will produce a TORCH_CHECK failure
-        # at launch -- we keep the option for forward-compat (a8w8 expansion)
-        # and to preserve the CSV round-trip. `--outdtype` selects the Y
-        # dtype: bf16 (default) or fp32 (splitk_reduce_kernel<D_OUT> picks the
-        # right path; non-splitk a16w16 already supports fp32 via store_c's
-        # `D_C==D_ACC` branch).
         self.parser.add_argument(
             "--dtype",
             choices=sorted(_DTYPE_SHORT_TO_TORCH.keys()),
@@ -1272,12 +1149,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             "column in the untuned CSV overrides this.",
         )
 
-        # --bias is the per-shape bias toggle. Per-row 'bias' column in the
-        # untuned CSV (e.g. gptoss_bf16_untuned_gemm.csv) overrides the
-        # default; only the single-shape CLI path (-m/-n/-k) uses this
-        # default directly. bias dtype matches Y (match_d_out convention)
-        # and shape uses [batch, M] inside the tuner -- per-batch row vector
-        # so stride_bias_batch=M, no broadcast surface here.
+        # --bias is the per-shape bias toggle.
         self.parser.add_argument(
             "--bias",
             action="store_true",
@@ -1287,6 +1159,19 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             "or when the untuned CSV lacks a 'bias' column. Tuner emits "
             "bias=True / bias=False as a separate dedup key so the same "
             "(M,N,K) can be tuned with and without bias independently.",
+        )
+
+        # Debug knob: restrict the kid sweep to a specific set.
+        self.parser.add_argument(
+            "--kid",
+            dest="kid",
+            type=str,
+            default=None,
+            help="Comma-separated kid id(s) to restrict the sweep to "
+            "(e.g. --kid 50201 or --kid 50200,50201). Kids must still pass "
+            "the host-side shape / bias / outdtype filters; rejected kids "
+            "are dropped with a log line. Compile sidecar is auto-expanded "
+            "to cover the requested kids if needed.",
         )
 
     def pre_process(self, args):
@@ -1310,16 +1195,11 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 "for in-place overwrite of -i shapes (one row per shape "
                 "stays in tuned CSV); use --all for append+resort retune."
             )
-        # Stash for update_tunedf to consult: when set, our override only
-        # replaces an existing row when the freshly tuned `us` is strictly
-        # smaller than the cached one. Default behavior (no --retune) is
-        # unchanged because pre_process drops already-tuned shapes from
-        # untunedf before tune() runs, so update_tunedf only ever sees
-        # brand-new keys for non-retune flows.
+        # Stash for update_tunedf to consult: when set, our override only replaces an existing row when
+        # the freshly tuned `us` is strictl...
         self._retune_only_if_better = bool(args.retune)
-        # update_tunedf only receives (df_old, df_updates); cache verbose
-        # here so the override can decide whether to dump the per-row
-        # rejection table.
+        # update_tunedf only receives (df_old, df_updates); cache verbose here so the override can
+        # decide whether to dump the per-row rej...
         self._args_verbose_cached = bool(getattr(args, "verbose", False))
         cli_dtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.dtype])
         cli_outdtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.outdtype])
@@ -1330,9 +1210,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             and args.shape_n is not None
             and args.shape_k is not None
         ):
-            # Build a one-row untunedf directly from CLI args. bias / dtype
-            # / outdtype are part of self.keys now, so they live alongside
-            # cu_num/M/N/K naturally.
+            # Build a one-row untunedf directly from CLI args.
             row = {
                 "cu_num": self.get_cu_num(),
                 "M": int(args.shape_m),
@@ -1344,10 +1222,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             }
             self.untunedf = pd.DataFrame([row])
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
-            # Match the original code path: only assign 'batch' if the
-            # column already exists. tune_summary() compares
-            # tunedf[self.untunedf.columns], so we cannot leak a 'batch'
-            # column into untunedf when result_to_df doesn't emit one.
+            # Match the original code path: only assign 'batch' if the column already exists.
             if "batch" in self.untunedf.columns:
                 self.untunedf["batch"] = int(args.shape_batch)
             logger.info(
@@ -1358,24 +1233,19 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             )
             return
 
-        # CSV-driven path. Mirrors GemmCommonTuner.pre_process but the dedup
-        # key is now 7-wide so same-shape bf16/fp32 / bias=true/false rows
-        # are preserved.
+        # CSV-driven path.
         if args.all:
             self.get_retune_gemm_list(args)
         else:
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
             self.untunedf["cu_num"] = self.get_cu_num()
-            # Fill missing bias / dtype / outdtype columns with the CLI
-            # defaults so legacy CSVs (4-col key without these) still tune.
-            # Per-row CSV values (already populated) win.
+            # Fill missing bias / dtype / outdtype columns with the CLI defaults so legacy CSVs (4-col key
+            # without these) still tune.
             if "bias" not in self.untunedf.columns:
                 self.untunedf["bias"] = cli_bias
             else:
-                # CSV cells are typically the strings "True" / "False"; the
-                # raw read-back can leave them as bool already. Coerce to
-                # bool so downstream comparisons (.apply(tuple)) match the
-                # tuned CSV's bool representation produced by result_to_df.
+                # CSV cells are typically the strings "True" / "False"; the raw read-back can leave them as bool
+                # already.
                 self.untunedf["bias"] = (
                     self.untunedf["bias"]
                     .fillna(cli_bias)
@@ -1402,9 +1272,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
 
             if len(self.tunedf) != 0:
-                # Dedup against the full 7-key. Two CSV rows that differ
-                # only in bias/dtype/outdtype now generate two tasks (and
-                # two tuned-CSV rows on completion).
+                # Dedup against the full 7-key.
                 key_cols = list(self.keys)
                 mask = (
                     self.untunedf[key_cols]
@@ -1412,11 +1280,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     .isin(self.tunedf[key_cols].apply(tuple, axis=1))
                 )
                 if args.retune:
-                    # --retune: keep all -i shapes (including those already
-                    # tuned). Tuned rows for these shapes will be overwritten
-                    # in-place by update_tunedf during result_to_csv. We log
-                    # which rows are about to be overwritten so the user can
-                    # verify the intended replacement set.
+                    # --retune: keep all -i shapes (including those already tuned).
                     overwrite_count = int(mask.sum())
                     if overwrite_count > 0:
                         logger.info(
@@ -1519,10 +1383,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             K = df.loc[i, "K"]
             us = df.loc[i, "us"]
             kid_col = "solidx" if "solidx" in df.columns else "kernelId"
-            # If the on-disk CSV carries bias / dtype / outdtype columns,
-            # use them to keep the keys_tuple aligned with the new 7-wide
-            # layout. Legacy CSVs without these columns fall back to
-            # bias=False, bf16 in / bf16 out.
+            # If the on-disk CSV carries bias / dtype / outdtype columns, use them to keep the keys_tuple
+            # aligned with the new 7-wide layout.
             bias_v = bool(df.loc[i, "bias"]) if "bias" in df.columns else False
             dtype_str = (
                 str(df.loc[i, "dtype"]) if "dtype" in df.columns else "torch.bfloat16"
@@ -1578,10 +1440,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 )
 
                 merged = new_keyed.merge(old_keyed, on="_key", how="left")
-                # NaN _old_us = brand-new key -> always keep (first-time
-                # tune). For matched keys keep the new row only when
-                # strictly faster. Ties or regressions are rejected to
-                # avoid churning the CSV on identical-noise reruns.
+                # NaN _old_us = brand-new key -> always keep (first-time tune).
                 keep_mask = merged["_old_us"].isna() | (
                     merged["us"] < merged["_old_us"]
                 )
@@ -1611,12 +1470,30 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
 
-        # Subset-compile safety: collect every kid this debug tuner could
-        # touch (full a16w16 family minus host-side rejects per shape) and
-        # ensure they're all baked into module_deepgemm_opus.so. Without
-        # this, hitting a kid that wasn't in the last codegen's S would
-        # surface as `AITER_CHECK: Kernel id X not found in a16w16 tune
-        # lookup table` deep inside mp_tuner.
+        # --kid filter (debug): parse the CSV list once.
+        forced_kids: set[int] | None = None
+        if getattr(args, "kid", None):
+            try:
+                forced_kids = {int(s) for s in str(args.kid).split(",") if s.strip()}
+            except ValueError:
+                self.parser.error(
+                    f"--kid expects comma-separated ints, got '{args.kid}'"
+                )
+            if not forced_kids:
+                self.parser.error("--kid given but parsed empty kid set")
+            unknown = forced_kids - set(a16w16_all_kernels.keys())
+            if unknown:
+                self.parser.error(
+                    f"--kid: unknown kid id(s) {sorted(unknown)} "
+                    f"(known a16w16 kids: {sorted(a16w16_all_kernels.keys())})"
+                )
+            logger.info(
+                f"OpusGemmA16W16Tuner: --kid filter active, restricting "
+                f"sweep to {sorted(forced_kids)}"
+            )
+
+        # Subset-compile safety: collect every kid this debug tuner could touch (full a16w16 family
+        # minus host-side rejects per shape) an...
         opus_candidate_kids: set[int] = set()
         for i in range(len(untunedf)):
             M = int(untunedf.loc[i, "M"])
@@ -1627,7 +1504,12 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 if "bias" in untunedf.columns
                 else bool(args.bias)
             )
-            opus_candidate_kids |= candidate_kids_for_shape(M, N, K, bias_v, cu_num)
+            shape_cands = candidate_kids_for_shape(M, N, K, bias_v, cu_num)
+            if forced_kids is not None:
+                # Make sure the requested kids are baked in even if the
+                # shape-driven candidate set would have excluded them.
+                shape_cands = shape_cands | forced_kids
+            opus_candidate_kids |= shape_cands
         if opus_candidate_kids:
             if _ensure_kids_compiled(opus_candidate_kids):
                 logger.info(
@@ -1636,30 +1518,9 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     f"module_deepgemm_opus will rebuild on next call."
                 )
 
-        # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with
-        # the func/kwargs we provide here. We install a custom run_perftest
-        # inside each subprocess (via _install_opus_perftest_once(), invoked
-        # from generate_data() which runs before worker() in work_group)
-        # that times the kernel via CUDA graph + cuda.Event instead of the
-        # stock torch.profiler path. The profiler path returns 0 CUDA
-        # events on gfx950 for splitk's main+reduce kernel sequence under
-        # hipgraph replay -- that's the root cause of the "us = 0" retry
-        # spam and the "no valid candidate found" failures for M=1.
-        #
-        # With our replacement:
-        #   * Graph capture + cuda.Event measurement works correctly for
-        #     every (kid, splitK) on every (M, N, K) we tested (M=1..2048).
-        #   * No Python/dispatcher overhead contaminates the measurement
-        #     window (the replay runs end-to-end on the GPU).
-        #   * No roctracer dependency; no empty-trace edge cases.
-        #
-        # We pass testGraph=False here because our replacement ignores that
-        # flag and always does graph mode. The flag is kept out of the
-        # kwargs only to make the signature explicit (our replacement
-        # accepts it for API compat).
+        # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with the func/kwargs we provide here.
         bench_func = run_opus_gemm_bench
         perf_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
-        check_rtol, check_atol = 2e-2, 1.0
 
         logger.info(
             "OpusGemmA16W16Tuner: CUDA graph timing via cuda.Event "
@@ -1670,9 +1531,6 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         task = []
         tasks_data = []
         # generate_data returns a 4-tuple now: (XQ, WQ, Y, bias_or_None).
-        # opus_data_idx feeds run_opus_gemm_bench(XQ, WQ, Y, bias, ...) -> 4
-        # data slots; opus_gemm_ref(XQ, WQ, bias, out_dtype) consumes the
-        # first 3 indexed slots plus its own out_dtype kwarg.
         opus_data_idx = [0, 1, 2, 3]
         ref_data_idx = [0, 1, 3]
         seed = 0
@@ -1683,10 +1541,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             K = int(untunedf.loc[i, "K"])
             batch = int(untunedf.loc[i, "batch"]) if "batch" in untunedf.columns else 1
 
-            # Per-row bias / dtype / outdtype: bias is part of self.keys now,
-            # so the column is guaranteed to exist by pre_process. Fall back
-            # to CLI defaults only as a defensive guard for callers that
-            # bypass pre_process.
+            # Per-row bias / dtype / outdtype: bias is part of self.keys now, so the column is guaranteed to
+            # exist by pre_process.
             bias_v = (
                 bool(untunedf.loc[i, "bias"])
                 if "bias" in untunedf.columns
@@ -1705,11 +1561,14 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             in_dtype = _dtype_csv_str_to_torch(dtype_str)
             out_dtype = _dtype_csv_str_to_torch(outdtype_str)
 
-            # Sanity check: a16w16-family kernels lock the input to bf16
-            # today (the launcher TORCH_CHECKs XQ.dtype()==BFloat16). If the
-            # CSV asks for a different in_dtype, every candidate will fail
-            # at launch -- skip the whole row up front with a clear log
-            # rather than waste a per-task RuntimeError on every kid.
+            # Gate opus candidates by the same tolerance the other a16w16
+            # solutions use (5e-2 for bf16, 1e-2 otherwise) instead of the
+            # looser hardcoded 2e-2/1.0.
+            check_rtol = 5e-2 if out_dtype == dtypes.bf16 else 1e-2
+            check_atol = check_rtol
+
+            # Sanity check: a16w16-family kernels lock the input to bf16 today (the launcher TORCH_CHECKs
+            # XQ.dtype()==BFloat16).
             if in_dtype is not dtypes.bf16:
                 logger.warning(
                     f"OpusGemmA16W16Tuner: skipping row M={M} N={N} K={K} "
@@ -1727,36 +1586,60 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             info_keys = (cu_num, M, N, K, bias_v, dtype_str, outdtype_str)
 
             for kid in a16w16_kernel_ids:
+                # --kid filter (debug): skip everything outside the explicit set.
+                if forced_kids is not None and kid not in forced_kids:
+                    continue
                 k_inst = a16w16_all_kernels[kid]
 
-                # Pre-filter kids that can't produce correct output for
-                # this shape. Covers both host-side TORCH_CHECK rejections
-                # (K constraints) and known silent-correctness bugs in
-                # non-splitk pipelines at N % 16 != 0 / K % B_K != 0.
-                # See _kid_rejects_shape() for the full rule set.
+                # Pre-filter kids that can't produce correct output for this shape.
                 if _kid_rejects_shape(k_inst, M, N, K):
+                    if forced_kids is not None and kid in forced_kids:
+                        logger.warning(
+                            f"OpusGemmA16W16Tuner: --kid {kid} rejected "
+                            f"by shape filter for (M={M},N={N},K={K}); skipping"
+                        )
                     continue
-                # bias=True is only consumed by split-barrier (a16w16) and
-                # splitk (a16w16_flatmm_splitk) kids; flatmm kids reject any
-                # non-empty bias at launch time. Skip them upfront so the
-                # tuner doesn't spam mp_tuner with bias-rejection errors.
+                # bias=True is only consumed by split-barrier (a16w16) and splitk (a16w16_flatmm_splitk) kids;
+                # flatmm kids reject any non-empty b...
                 if _kid_rejects_bias(k_inst, bias_v):
                     continue
+                # outdtype filter: the per-arch tune_lookup tables are keyed by (kid, D_C).
+                _OUT_TORCH_TO_CTYPE = {
+                    dtypes.bf16: "bf16_t",
+                    dtypes.fp32: "fp32_t",
+                }
+                _is_splitk_tag = k_inst.kernel_tag in (
+                    "a16w16_flatmm_splitk",
+                    "a16w16_kbuf3_sk",
+                    "a16w16_kbuf1_sk",
+                    "a16w16_fused_reduce",
+                    "a16w16_kbuf2v_sk",
+                    "a16w16_kbuf2v_bk128_sk",
+                )
+                _need = _OUT_TORCH_TO_CTYPE.get(out_dtype)
+                if (
+                    not _is_splitk_tag
+                    and _need is not None
+                    and _need not in getattr(k_inst, "output_dtypes", [])
+                ):
+                    continue
 
-                # SplitK candidate set per shape+kid. Non-splitk kids always
-                # get splitK=0; splitk kids go through the heuristic.
-                if k_inst.kernel_tag == "a16w16_flatmm_splitk":
+                # SplitK candidate set per shape+kid.
+                if k_inst.kernel_tag in (
+                    "a16w16_flatmm_splitk",
+                    "a16w16_kbuf3_sk",
+                    "a16w16_kbuf1_sk",
+                    "a16w16_fused_reduce",
+                    "a16w16_kbuf2v_sk",
+                    "a16w16_kbuf2v_bk128_sk",
+                ):
                     splitK_range = candidate_splitK(M, N, K, batch, cu_num, k_inst)
                 else:
                     splitK_range = [0]
 
                 for splitK in splitK_range:
                     info = (info_keys, kid, splitK, "")
-                    # Pass bias / dtype / outdtype down to generate_data via
-                    # the gen_args tuple. mp_tuner.work_group calls
-                    # `gen_data(*gen_args, device=device)`, so positional
-                    # order matches generate_data's signature
-                    # (batch, m, n, k, seed, dtype, outdtype, bias).
+                    # Pass bias / dtype / outdtype down to generate_data via the gen_args tuple.
                     gen_args = (batch, M, N, K, seed, in_dtype, out_dtype, bias_v)
                     # opus_gemm_ref(XQ, WQ, bias, out_dtype): pass the
                     # data-indexed args plus out_dtype as a positional.
@@ -1783,10 +1666,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 
         ret = []
         if task:
-            # Silence per-task `avg: X us/iter with hipgraph` and
-            # `no valida data after post process!` spam from aiter.test_common
-            # during the inner tuning loop. Tuner summary is emitted after
-            # this finishes and uses the same logger, so we restore the level.
+            # Silence per-task `avg: X us/iter with hipgraph` and `no valida data after post process!` spam
+            # from aiter.test_common during the...
             prev_level = logger.level
             if not (_AITER_VERBOSE or getattr(args, "verbose", False)):
                 logger.setLevel(logging.WARNING)
@@ -1804,21 +1685,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             finally:
                 logger.setLevel(prev_level)
 
-            # Post-filter: perftest under CUDA graph capture+replay occasionally
-            # yields us=0.0 exactly when the torch.profiler trace comes back
-            # empty ("no valida data after post process!" from test_common.py).
-            # Leaving those rows as 0.0 would make them appear as the fastest
-            # candidates; mark them invalid so base_tuner.post_process drops
-            # them (us != INVALID_TIME filter in post_process already catches
-            # us=-1).
-            #
-            # We ONLY treat us == 0.0 as the empty-trace sentinel. Tiny but
-            # nonzero measurements (e.g. 0.3-0.8us) are real on M=1 shapes
-            # where the full kernel + reduce latency falls below 1us on
-            # MI300/MI350; a previous blanket `us < 1.0` floor was causing
-            # false-rejects for those shapes (observed: M=1 N=200 K=5120
-            # dropped 49/49 candidates and the tuner reported "no valid
-            # candidate found"). The fix is to reject only us == 0.0.
+            # Post-filter: perftest under CUDA graph capture+replay occasionally yields us=0.0 exactly when
+            # the torch.profiler trace comes ba...
             bad = 0
             fixed = []
             for item in ret:
@@ -1858,20 +1726,6 @@ if __name__ == "__main__":
         "\n"
     )
     # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv.
-    # base_tuner uses self.keys for dedup / update / tune_summary; promoting
-    # bias + dtype + outdtype into the key lets same-shape rows with
-    # different bias / outdtype coexist in the tuned CSV instead of
-    # overwriting each other. lookup_tuned() in aiter/ops/opus/common.py
-    # already includes bias in its 9-column key, so the tuned-CSV producer
-    # and consumer agree on a bias-aware lookup.
-    #
-    # Column order inside the DataFrame is:
-    #   key        = [cu_num, M, N, K, bias, dtype, outdtype]  (7 cols)
-    #   resultList = [scaleAB, bpreshuffle,
-    #                 libtype, solidx, splitK, us, kernelName,
-    #                 err_ratio, tflops, bw]                   (10 cols)
-    # total = 17 cols, in exact reference CSV order (bias slot 5 in the
-    # tuned CSV is fed from the key now instead of being hardcoded False).
     key = ["cu_num", "M", "N", "K", "bias", "dtype", "outdtype"]
     resultList = [
         "scaleAB",

@@ -359,6 +359,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     SCALE_K_WIDTH_ROPE: gl.constexpr = 4,
     OUTPUT_Q_NOPE_ZEROS_AND_Q_PE: gl.constexpr = False,
     HAVE_K_SCALE: gl.constexpr = False,
+    UPCAST_OPERAND: gl.constexpr = False,
 ):
     # 1-warp (wave32) blocked layouts matching the Triton-generated ttgir.
     L_NOPE: gl.constexpr = gl.BlockedLayout(
@@ -391,8 +392,11 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     sin_smem = gl.allocate_shared_memory(sin_ptr.dtype.element_ty, [FREQ_W], SH)
 
     if pid < B * QH:
-        pid_b = pid // QH
-        pid_hq = pid % QH
+        # pid_b = pid // QH
+        # pid_hq = pid % QH
+        # This is a new optimization that prioritized heavy workload WGs first
+        pid_hq = pid // B
+        pid_b = pid % B
 
         # Issue ``pos`` first — it's used immediately by the cos/sin TDM
         # descriptors. pid_slot / k_scale are only consumed later in the
@@ -436,8 +440,12 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         )
         _issue_tdm_load_1d(q_pe_desc, 0, qpe_smem)
 
-        pid_hk = pid_hq // QH_PER_KH
-        is_kv = pid_hq % QH_PER_KH == 0
+        # pid_hk = pid_hq // QH_PER_KH
+        # is_kv = pid_hq % QH_PER_KH == 0
+        # This is a new optimization that prioritized heavy workload WGs first
+        pid_hk = pid_hq
+        is_kv = pid_hk < KH
+
         q_out_base = pid_b * q_out_stride_b + pid_hq * q_out_stride_h
 
         if is_kv:
@@ -464,6 +472,9 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         sin = _freq_from_shared(
             sin_smem, REUSE_FREQS_FRONT_PART, IS_NEOX, BLOCK_D_pe, L_PE, L_FREQ
         )
+        if UPCAST_OPERAND:
+            cos = cos.to(gl.float32)
+            sin = sin.to(gl.float32)
         # q_nope is a pure passthrough (no rope, no scale) and the host
         # asserts q_out.dtype == q_nope.dtype, so the data already in qn_smem
         # (from the async_load) is bit-identical. Skip the LDS round-trip and
