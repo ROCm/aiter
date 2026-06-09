@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 )
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 
 def select_2d_config(
@@ -22,6 +23,9 @@ def select_2d_config(
     max_seqlen_k,
     num_queries_per_kv,
     num_2d_prgms,
+    q_dtype,
+    kv_cache_dtype,
+    shuffled_kv_cache,
 ):
     arch = get_arch()
 
@@ -54,6 +58,15 @@ def select_2d_config(
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
 
+    if shuffled_kv_cache:
+        if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+            assert (
+                block_size >= 32
+            ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+        TILE_SIZE = block_size
+    elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+        TILE_SIZE = max(32, TILE_SIZE)
+
     return {
         "BLOCK_M": BLOCK_M,
         "BLOCK_Q": BLOCK_Q,
@@ -65,12 +78,28 @@ def select_2d_config(
 
 
 def select_3d_config(
-    head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms
+    head_size,
+    block_size,
+    element_size,
+    max_seqlen_k,
+    target_num_prgms,
+    num_2d_prgms,
+    q_dtype=None,
+    kv_cache_dtype=None,
+    shuffled_kv_cache=False,
 ):
     reduce_num_warps = 2
     attn_warps = 2
     TILE_SIZE = min(64, triton.next_power_of_2(block_size))
-    # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+    if shuffled_kv_cache:
+        if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+            assert (
+                block_size >= 32
+            ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+        TILE_SIZE = block_size
+    elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+        TILE_SIZE = max(32, TILE_SIZE)
+
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
@@ -93,7 +122,6 @@ def select_3d_config(
         "waves_per_eu": 2,
     }
     return attn_config, reduce_config
-
 
 def use_2d_kernel(
     head_size,
@@ -133,6 +161,7 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    shuffled_kv_cache: bool = False,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -143,12 +172,20 @@ def unified_attention(
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
-    block_size = v.shape[1]
+    q_dtype = q.dtype
+    kv_cache_dtype = k.dtype
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
-    num_kv_heads = k.shape[2]
-    num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
+    if shuffled_kv_cache:
+        # K: [num_blocks, num_kv_heads, head_size // x, block_size, x]
+        # V: [num_blocks, num_kv_heads, block_size // x, head_size, x]
+        _, num_kv_heads, _, block_size, k_width = k.shape
+    else:
+        block_size = v.shape[1]
+        num_kv_heads = k.shape[2]
+        k_width = 16 if kv_cache_dtype == e4m3_dtype else 8
+    num_queries_per_kv = num_query_heads // num_kv_heads
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -188,6 +225,9 @@ def unified_attention(
             max_seqlen_k,
             num_queries_per_kv,
             num_2d_prgms,
+            q_dtype,
+            kv_cache_dtype,
+            shuffled_kv_cache,
         )
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
@@ -240,6 +280,8 @@ def unified_attention(
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
             ALL_DECODE=ALL_DECODE,
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
+            K_WIDTH=k_width,
             **config,
         )
 
@@ -251,6 +293,9 @@ def unified_attention(
             max_seqlen_k,
             target_num_prgms,
             num_2d_prgms,
+            q_dtype,
+            kv_cache_dtype,
+            shuffled_kv_cache,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         segm_output = torch.empty(
@@ -320,6 +365,8 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
+            K_WIDTH=k_width,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
