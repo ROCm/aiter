@@ -282,6 +282,8 @@ def _run_grouped_via_fused_moe(
     use_bias: bool = True,
     verify: bool = False,
     seed: int = 0,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
     all_ones: bool = False,  # debug: hidden=1, weight bytes=0x22 (=+1.0/+1.0), scale=127, bias=0
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Build mxfp4 weights + balanced routing, dispatch through ``fused_moe``.
@@ -330,6 +332,25 @@ def _run_grouped_via_fused_moe(
         # Activations: bf16; fused_moe handles the dispatched quant internally.
         hg = torch.Generator(device="cpu").manual_seed(seed + 123)
         hidden = (torch.randn((tokens, K), generator=hg) * 0.5).to(torch.bfloat16)
+
+    # Static padding: model_dim / inter_dim are the *physical* (padded) dims; the
+    # valid hidden / intermediate sizes are model_dim - hidden_pad and
+    # inter_dim - intermediate_pad. The grouped kernels skip the padded K tail in
+    # the contraction and store-drop the padded model_dim output columns. Zero the
+    # logical tensors' padding regions so the PyTorch reference -- which always
+    # evaluates the full padded dims -- produces the identical result the kernel
+    # does, letting us compare the full output:
+    #   * hidden K-pad -> 0 so stage1's reference K-contraction ignores it.
+    #   * w2 inter K-pad cols -> 0 so stage2's reference ignores the (garbage)
+    #     stage1 intermediate-pad output the kernel never reads.
+    #   * w2 model_dim N-pad rows + bias2 pad -> 0 so the reference's padded
+    #     output columns are 0, matching the kernel's store-dropped (zeroed) tail.
+    if hidden_pad:
+        hidden[:, K - hidden_pad :] = 0
+        w2_logical[:, K - hidden_pad :, :] = 0
+        bias2[:, K - hidden_pad :] = 0
+    if intermediate_pad:
+        w2_logical[:, :, inter_pack - intermediate_pad // 2 :] = 0
 
     # Routing: round-robin balanced.
     topk_id, topk_w = _balanced_topk(tokens, topk, experts)
@@ -387,6 +408,8 @@ def _run_grouped_via_fused_moe(
             gate_mode=gate_mode.value,
             dtype=dtypes.bf16,
             swiglu_limit=swiglu_limit,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
         )
     finally:
         if saved is None:
@@ -428,6 +451,8 @@ def _prepare_grouped_moe_case(
     swiglu_limit: float = 7.0,
     use_bias: bool = True,
     seed: int = 0,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
     all_ones: bool = False,
 ):
     if data_format not in ("a4w4", "a8w4"):
@@ -509,6 +534,8 @@ def _prepare_grouped_moe_case(
         "bias2": fused_bias2,
         "gate_mode": gate_mode.value,
         "swiglu_limit": swiglu_limit,
+        "hidden_pad": hidden_pad,
+        "intermediate_pad": intermediate_pad,
     }
     ref_case = {
         "hidden": fused_case["hidden_states"],
@@ -543,6 +570,8 @@ def _invoke_grouped_fused_moe(fused_case):
         gate_mode=fused_case["gate_mode"],
         dtype=dtypes.bf16,
         swiglu_limit=fused_case["swiglu_limit"],
+        hidden_pad=fused_case["hidden_pad"],
+        intermediate_pad=fused_case["intermediate_pad"],
     )
 
 
@@ -568,6 +597,8 @@ def _sanity_check(
     swiglu_limit: float = 7.0,
     use_bias: bool = True,
     tol: float = VERIFY_TOL_A4W4,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
     all_ones: bool = False,
 ) -> None:
     """Tiny shape; compare grouped FlyDSL vs PyTorch fp32 ref.
@@ -591,11 +622,18 @@ def _sanity_check(
         swiglu_limit=swiglu_limit,
         use_bias=use_bias,
         verify=True,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
         all_ones=all_ones,
     )
     rel = _rel_l2(out, ref)
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
-    tag = f"{data_format} {layout} {act}{' all_ones' if all_ones else ''}"
+    pad_tag = (
+        f" pad(h={hidden_pad},i={intermediate_pad})"
+        if (hidden_pad or intermediate_pad)
+        else ""
+    )
+    tag = f"{data_format} {layout} {act}{pad_tag}{' all_ones' if all_ones else ''}"
     print(
         f"[sanity {tag}] rel_l2 grouped vs ref = {rel:.4e} "
         f"(grouped_norm={float(out.float().norm()):.4e} ref_norm={float(ref.float().norm()):.4e})",
@@ -626,6 +664,7 @@ def _bench(args: argparse.Namespace) -> None:
         f"[bench] data_format={args.data_format} layout={args.layout} act={args.act} "
         f"E={args.experts} T={args.tokens} topk={args.topk} "
         f"K={args.model_dim} I={args.inter_dim} "
+        f"hidden_pad={args.hidden_pad} intermediate_pad={args.intermediate_pad} "
         f"warmup={args.warmup} iters={args.iters}",
         flush=True,
     )
@@ -644,6 +683,8 @@ def _bench(args: argparse.Namespace) -> None:
             activation=activation,
             swiglu_limit=args.swiglu_limit,
             use_bias=not args.no_bias,
+            hidden_pad=args.hidden_pad,
+            intermediate_pad=args.intermediate_pad,
         )
         _invoke_grouped_fused_moe(fused_case)  # warmup / JIT
         torch.cuda.synchronize()
@@ -729,6 +770,24 @@ def main() -> None:
     )
     parser.add_argument("--swiglu-limit", type=float, default=7.0)
     parser.add_argument(
+        "--hidden-pad",
+        type=int,
+        default=0,
+        help="trailing static padding of model_dim (a multiple of 32, < model_dim). "
+        "model_dim is the *physical* hidden size; the valid hidden size is "
+        "model_dim - hidden_pad. The grouped kernels skip this K tail in stage1 "
+        "and store-drop it from the stage2 output.",
+    )
+    parser.add_argument(
+        "--intermediate-pad",
+        type=int,
+        default=0,
+        help="trailing static padding of inter_dim (a multiple of 32, < inter_dim). "
+        "inter_dim is the *physical* intermediate size; the valid intermediate "
+        "size is inter_dim - intermediate_pad. The grouped kernels skip this K "
+        "tail in stage2.",
+    )
+    parser.add_argument(
         "--no-bias",
         action="store_true",
         help="run with zero stage1/stage2 bias tensors",
@@ -756,6 +815,20 @@ def main() -> None:
             "at least 512 for the grouped GEMM kernels (tile_k=256 requires at "
             "least two K tiles)."
         )
+    for _name, _pad, _dim in (
+        ("--hidden-pad", args.hidden_pad, args.model_dim),
+        ("--intermediate-pad", args.intermediate_pad, args.inter_dim),
+    ):
+        if _pad < 0 or _pad >= _dim:
+            raise SystemExit(f"{_name} ({_pad}) must be in [0, {_dim}).")
+        if _pad % 32 != 0:
+            raise SystemExit(f"{_name} ({_pad}) must be a multiple of 32.")
+    if args.model_dim - args.hidden_pad < 512 or args.inter_dim - args.intermediate_pad < 512:
+        raise SystemExit(
+            f"valid model_dim ({args.model_dim - args.hidden_pad}) and valid "
+            f"inter_dim ({args.inter_dim - args.intermediate_pad}) must each be at "
+            "least 512 after subtracting the pad (tile_k=256 requires two K tiles)."
+        )
 
     if args.scenario == "verify":
         activation = (
@@ -778,6 +851,8 @@ def main() -> None:
             activation=activation,
             swiglu_limit=args.swiglu_limit,
             use_bias=not args.no_bias,
+            hidden_pad=args.hidden_pad,
+            intermediate_pad=args.intermediate_pad,
             all_ones=args.all_ones,
         )
         return
