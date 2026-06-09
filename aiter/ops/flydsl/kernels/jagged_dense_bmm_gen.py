@@ -211,9 +211,15 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
             b_row_off = fx.Int64(off_b) * fx.Int64(N) * fx.Int64(K)
             B_g = fx.make_view(fx.add_offset(fx.get_iter(B), fx.make_int_tuple(b_row_off)), fx.get_layout(B))
 
-            A_buf = fx.rocdl.make_buffer_tensor(A_g, max_size=True)
+            # Bound A and C to M_b rows so the hardware OOB-drops the partial
+            # bottom-tile accesses. A is allocated exactly L rows, so the LAST
+            # group's partial tile (M_b not a multiple of BLOCK_M) would otherwise
+            # read up to BLOCK_M-1 rows past the allocation end via the unbounded
+            # max_size descriptor -- a data-dependent OOB that GPU-faults when
+            # those rows land on an unmapped page. Bounding drops them (read as 0,
+            # harmless: the matching output rows are masked out of the C store).
+            A_buf = make_bounded_buffer_tensor(A_g, fx.Int64(fx.Int32(M_b) * fx.Int32(K) * fx.Int32(2)))
             B_buf = fx.rocdl.make_buffer_tensor(B_g, max_size=True)
-            # Bound C to M_b rows so the hardware OOB-drops partial-tile stores.
             C_buf = make_bounded_buffer_tensor(C_g, fx.Int64(fx.Int32(M_b) * fx.Int32(N) * fx.Int32(2)))
 
             gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[None, None, block_m_idx, None]  # (BM, BK, k)
