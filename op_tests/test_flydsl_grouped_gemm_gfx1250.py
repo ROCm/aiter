@@ -136,13 +136,16 @@ def _torch_moe_ref(
     def _per_1x32_fp8_dequant(x: torch.Tensor) -> torch.Tensor:
         """Mirror grouped a8w4's per-block-32 MXFP8 input quant, then dequant."""
         block = 32
-        dtype_max = 240.0
+        dtype_max = 448.0 #240.0
         x_shape = x.shape
         flat = x.contiguous().view(-1, x_shape[-1]).float()
         blk = flat.view(-1, block)
         blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
         max_abs = blk.abs().amax(dim=1)
-        scale_e8m0 = fp4_utils.f32_to_e8m0(max_abs / dtype_max)
+        #scale_e8m0 = fp4_utils.f32_to_e8m0(max_abs / dtype_max)
+        scale_e8m0 = fp4_utils.f32_to_mx_e8m0_scale(
+                  max_abs, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
+              )
         scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0)
         scale_f32 = torch.nan_to_num(scale_f32, nan=1.0, posinf=1.0, neginf=1.0)
         scale_f32[scale_f32 == 0] = 1.0
