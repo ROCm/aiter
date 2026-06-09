@@ -419,8 +419,13 @@ def mhc_fused_post_pre(
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
     hidden_size = residual_in.size(2)
+    arch = get_gfx_runtime()
+    fused_m_upper_bound = {
+        "gfx950": 1024,
+        "gfx942": 128,
+    }[arch]
 
-    if not force_fused and m >= 1024:
+    if not force_fused and m >= fused_m_upper_bound:
         next_residual = torch.empty_like(residual_in)
         mhc_post(
             next_residual,
