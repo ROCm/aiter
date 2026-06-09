@@ -1902,8 +1902,8 @@ def e2m1_packed_to_fp(
 unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
     "_unified_attention_gluon_kernel_3d",
     [
-        "num_query_heads",
-        "num_queries_per_kv",
+        "NUM_QUERY_HEADS",
+        "NUM_KV_HEADS",
         "BLOCK_SIZE",
         "TILE_SIZE",
         "HEAD_SIZE",
