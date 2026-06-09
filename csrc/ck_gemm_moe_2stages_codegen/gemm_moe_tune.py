@@ -3424,7 +3424,9 @@ class FmoeTuner(TunerCommon):
             tag = task[0]  # (info, stage, kname, blockM)
             dispatched[i] = tag
             if args.verbose:
-                _, stage, kname, blockM = tag
+                # task_1stage uses (info, stage, kname, blockM, flat_flag); others
+                # use (info, stage, kname, blockM). Accept both lengths.
+                _, stage, kname, blockM, *_extra = tag
                 print(f"  [dispatch] task {i}: {stage} {kname} blockM={blockM}")
 
         in_data.append((len(all_tasks), ()))
@@ -3452,7 +3454,9 @@ class FmoeTuner(TunerCommon):
             if failed_cases:
                 print(f"\n[tune] {len(failed_cases)} of {len(rets)} tasks failed:")
                 for i, tag, us, err in failed_cases:
-                    _, stage, kname, blockM = tag
+                    # task_1stage tag is (info, stage, kname, blockM, flat_flag);
+                    # 2-stage tag is (info, stage, kname, blockM). Accept both.
+                    _, stage, kname, blockM, *_extra = tag
                     reason = "timeout/hang" if us == float("inf") else "crash/error"
                     print(f"  task {i}: {stage} {kname} blockM={blockM} -> {reason}")
             else:

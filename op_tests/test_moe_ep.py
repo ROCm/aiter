@@ -15,11 +15,18 @@ from aiter.fused_moe import (
 )
 
 from aiter.fused_moe_bf16_asm import asm_moe
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import (
+    shuffle_weight,
+    shuffle_weight_a16w4,
+    shuffle_scale_a16w4,
+)
 from aiter import ActivationType
+from aiter import QuantType
+from aiter.ops.flydsl.moe_common import GateMode
 from aiter import pertoken_quant
 from aiter import dtypes
 from aiter import get_gfx
+from aiter.utility import fp4_utils
 import argparse
 
 BLOCK_SIZE_M = 32
@@ -39,6 +46,7 @@ def torch_moe_test(
     fc1_smooth_scale=None,  # [expert, 1, model_dim]
     fc2_smooth_scale=None,  # [expert, 1, inter_dim]
     expert_mask=None,
+    activation=ActivationType.Silu,
 ):
     return torch_moe(
         hidden_states,
@@ -51,6 +59,7 @@ def torch_moe_test(
         fc1_smooth_scale,
         fc2_smooth_scale,
         expert_mask,
+        activation=activation,
     )
 
 
@@ -350,11 +359,194 @@ def test_fmoe_ep(
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
 
 
+# ---------------------------------------------------------------------------
+# EP end-to-end with per_1x32 mxfp4 (a8w4 / a4w4) via fused_moe
+# ---------------------------------------------------------------------------
+
+
+def _per_1x32_mxfp4_quant(w):
+    torch_quant = aiter.get_torch_quant(QuantType.per_1x32)
+    w_qt, w_scale = torch_quant(w, quant_dtype=dtypes.fp4x2)
+    w_qt = w_qt.view(w.shape[0], w.shape[1], w.shape[2] // 2)
+    return w_qt, w_scale
+
+
+def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
+    """1 - cosine-similarity in double; matches test_moe_2stage.calc_diff."""
+    x, y = x.double(), y.double()
+    denom = (x * x + y * y).sum()
+    return float(1 - 2 * (x * y).sum() / denom)
+
+
+summary_table = []
+
+
+def test_fmoe_ep_mxfp4(
+    quant_label, token, model_dim, inter_dim, E, topk, shared_E=2, ep=8
+):
+    """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
+    quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}."""
+    if get_gfx() not in ["gfx950"]:
+        print(f"skip {quant_label}: mxfp4 requires gfx950, got {get_gfx()}")
+        return
+
+    ep_id = ep - 1
+    expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
+    expert_mask[ep_id * (E // ep) : (ep_id + 1) * E // ep] = 1
+    local_E = int(torch.sum(expert_mask).item())
+    fake_expertid = expert_mask.numel() - 1
+    expert_mask[-1] = 0
+    expert_mask[E:-1] = 1
+
+    dtype = dtypes.bf16
+    input_ = torch.randn((token, model_dim), dtype=dtype, device="cuda")
+    score = torch.randn((token, E), dtype=dtype, device="cuda")
+
+    total_topk_ids = torch.empty(
+        (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
+    )
+    ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
+    shared_expert_ids = [E + i for i in range(shared_E + 1)]
+    s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
+    for i in range(ep_id, MAX_TOKENS, ep):
+        s_topk_ids_list[i] = shared_expert_ids
+    s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=dtypes.i32, device="cuda")
+
+    total_topk_weights = torch.empty(
+        (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
+    )
+    ns_topk_weights, s_topk_weights = total_topk_weights.split(
+        [topk, shared_E + 1], dim=1
+    )
+    s_topk_weights[:] = 0.1
+    fused_topk(input_, score, topk, True, ns_topk_ids, ns_topk_weights)
+    topk_ids = total_topk_ids[:token]
+    topk_weights = total_topk_weights[:token]
+
+    total_local = local_E + shared_E
+    w1 = (
+        torch.randn((total_local, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
+        / 10
+    )
+    w2 = (
+        torch.randn((total_local, model_dim, inter_dim), dtype=dtype, device="cuda")
+        / 10
+    )
+
+    w1_qt, w1_scale = _per_1x32_mxfp4_quant(w1)
+    w2_qt, w2_scale = _per_1x32_mxfp4_quant(w2)
+
+    # Reference uses the dequantized mxfp4 weights so the comparison is
+    # apples-to-apples (kernel sees the same quantized values). Mirrors the
+    # mxfp4_to_f32 + e8m0_to_f32 dequant in aiter/fused_moe.py:2018-2021 and
+    # the quantized-weight reference path in test_moe_2stage.py:333-345.
+    def _dequant(w_qt, w_scale, orig_shape):
+        wf = fp4_utils.mxfp4_to_f32(w_qt).view(*orig_shape)
+        sf = fp4_utils.e8m0_to_f32(w_scale).view(orig_shape[0], orig_shape[1], -1)
+        sf = sf.unsqueeze(-1).expand(-1, -1, -1, 32).reshape(*orig_shape)
+        return (wf * sf).to(dtype)
+
+    w1_deq = _dequant(w1_qt, w1_scale, w1.shape)
+    w2_deq = _dequant(w2_qt, w2_scale, w2.shape)
+    ref, _ = torch_moe_test(
+        input_,
+        w1_deq,
+        w2_deq,
+        topk_weights,
+        topk_ids,
+        expert_mask=expert_mask,
+    )
+
+    if quant_label == "a8w4_mxfp4":
+        # a8w4 (fp8 activations, mxfp4 weights): use the CK a16w4 layout —
+        # weights interleaved on N (gate/up) — paired with gate_mode=INTERLEAVE
+        # at the call site. The FlyDSL fp4 (16,16) shuffle is separated and
+        # would mis-route gate/up here.
+        w1_a = shuffle_weight_a16w4(w1_qt, 16, True)
+        w1_s = shuffle_scale_a16w4(w1_scale, total_local, True)
+        w2_a = shuffle_weight_a16w4(w2_qt, 16, False)
+        w2_s = shuffle_scale_a16w4(w2_scale, total_local, False)
+    elif quant_label == "a4w4_mxfp4":
+        # a4w4 (fp4 activations, mxfp4 weights): FlyDSL fp4/fp4 layout —
+        # shuffle (16,16) + e8m0 scale shuffle, gate/up separated. Matches
+        # test_moe_2stage.py:251-255 and pairs with gate_mode=SEPARATED.
+        w1_a = shuffle_weight(w1_qt, layout=(16, 16))
+        w2_a = shuffle_weight(w2_qt, layout=(16, 16))
+        w1_s = fp4_utils.e8m0_shuffle(w1_scale)
+        w2_s = fp4_utils.e8m0_shuffle(w2_scale)
+        w1_a.is_shuffled = True
+        w2_a.is_shuffled = True
+    else:
+        raise ValueError(f"unknown quant_label: {quant_label}")
+
+    # a4w4: Silu + SEPARATED -> FlyDSL fp4/fp4 (AITER_FLYDSL_FORCE=1 drops the
+    # Swiglu gate). a8w4: Silu + INTERLEAVE -> q_dtype_a auto-picker selects
+    # fp8 on gfx950 (fused_moe.py:357-361), and since the L1261 CK-Tile
+    # pre-emption requires Swiglu, Silu falls through to the
+    # swiglu_mxfp4_flydsl branch (with FLYDSL_FORCE=1) and lands on
+    # flydsl_moe1_afp8_wfp4_... Needs AITER_BF16_FP8_MOE_BOUND<=token.
+    if quant_label == "a8w4_mxfp4":
+        act = ActivationType.Silu
+        gate_mode = GateMode.INTERLEAVE.value
+    else:
+        act = ActivationType.Silu
+        gate_mode = GateMode.SEPARATED.value
+    out, us = run_perftest(
+        fused_moe,
+        input_,
+        w1_a,
+        w2_a,
+        topk_weights,
+        topk_ids,
+        expert_mask=expert_mask,
+        activation=act,
+        gate_mode=gate_mode,
+        quant_type=QuantType.per_1x32,
+        w1_scale=w1_s,
+        w2_scale=w2_s,
+        num_warmup=3,
+        num_iters=16,
+    )
+
+    err = checkAllclose(
+        ref,
+        out,
+        atol=5e-2,
+        rtol=5e-2,
+        msg=f"{quant_label} ep={ep} token={token} model_dim={model_dim} "
+        f"inter_dim={inter_dim} E={E} topk={topk}",
+    )
+
+    diff = (ref - out).float()
+    abs_err = diff.abs()
+    abs_mean = abs_err.mean().item()
+    abs_max = abs_err.max().item()
+    rel_mean = (abs_err / (ref.float().abs() + 1e-6)).mean().item()
+    logits_diff = _calc_diff(ref, out)
+
+    summary_table.append(
+        {
+            "quant": quant_label,
+            "token": token,
+            "model_dim": model_dim,
+            "inter_dim": inter_dim,
+            "E": E,
+            "topk": topk,
+            "ep": ep,
+            "us": round(us, 2),
+            "logits_diff": round(logits_diff, 6),
+            "abs_mean": round(abs_mean, 4),
+            "abs_max": round(abs_max, 4),
+            "rel_mean": round(rel_mean, 4),
+            "checkAllclose_err": err,
+        }
+    )
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="select test",
 )
-
 parser.add_argument(
     "-t",
     "--test",
@@ -368,6 +560,8 @@ parser.add_argument(
         "g1u0_int8smoothquant",
         "g1u1_int8smoothquant",
         "g1u1_fp8smoothquant",
+        "g1u1_a8w4_mxfp4",
+        "g1u1_a4w4_mxfp4",
     ],
     help="""Select test to run.
     e.g.: -t g1u1_int8quant
@@ -377,7 +571,9 @@ parser.add_argument(
           or -t g1u1_fp8quant
           or -t g1u0_int8smoothquant (only runs on gfx942)
           or -t g1u1_int8smoothquant
-          or -t g1u1_fp8smoothquant""",
+          or -t g1u1_fp8smoothquant
+          or -t g1u1_a8w4_mxfp4          (EP, per_1x32 mxfp4 a8w4, gfx950)
+          or -t g1u1_a4w4_mxfp4          (EP, per_1x32 mxfp4 a4w4, gfx950)""",
 )
 parser.add_argument(
     "-d",
@@ -563,6 +759,22 @@ for test in args.test:
                                 shared_E=0,
                                 ep=ep,
                             )
+    elif test in ("g1u1_a8w4_mxfp4", "g1u1_a4w4_mxfp4"):
+        label = "a8w4_mxfp4" if test == "g1u1_a8w4_mxfp4" else "a4w4_mxfp4"
+        for m in args.token:
+            for hdim in args.hidden_dim:
+                for idim in args.inter_dim:
+                    for ep in args.expert_parallelism:
+                        test_fmoe_ep_mxfp4(
+                            label,
+                            m,
+                            hdim,
+                            idim,
+                            args.expert,
+                            args.topk,
+                            shared_E=0,
+                            ep=ep,
+                        )
     elif test == "g1u1_fp8smoothquant":
         for dtype in args.dtype:
             for m in args.token:
@@ -585,3 +797,15 @@ for test in args.test:
                             )
     else:
         raise ValueError(f"Unknown test: {test}")
+
+if summary_table:
+    try:
+        import pandas as pd
+
+        _df = pd.DataFrame(summary_table)
+        print("\nmoe_ep_mxfp4 summary (markdown):")
+        print(_df.to_markdown(index=False))
+    except Exception as _e:
+        print(f"[summary] pandas unavailable ({_e}); raw rows:")
+        for _row in summary_table:
+            print(_row)

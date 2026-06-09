@@ -9,9 +9,14 @@ from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_reshape_and_cache_kernel,
     _fused_qk_rope_cosine_cache_llama_kernel,
 )
-from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
-    _fused_qk_rope_cat_and_cache_mla_kernel as gluon_fused_qk_rope_cat_and_cache_mla_kernel,
-)
+
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
+        _fused_qk_rope_cat_and_cache_mla_kernel as gluon_fused_qk_rope_cat_and_cache_mla_kernel,
+    )
+except:  # noqa: E722
+    gluon_fused_qk_rope_cat_and_cache_mla_kernel = None
+
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -41,6 +46,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     k_pe_out: torch.Tensor = None,
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
+    upcast_operand: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
@@ -99,6 +105,7 @@ def fused_qk_rope_cat_and_cache_mla(
     k_pe_out: torch.Tensor = None,
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
+    upcast_operand: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
@@ -301,6 +308,7 @@ def fused_qk_rope_cat_and_cache_mla(
         SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
         OUTPUT_Q_NOPE_ZEROS_AND_Q_PE=(num_decode_toks_for_zeros > 0),
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
+        UPCAST_OPERAND=upcast_operand,
         num_warps=1,
     )
 
@@ -327,6 +335,7 @@ def fused_qk_rope_reshape_and_cache(
     k_out: torch.Tensor = None,
     output_zeros: bool = True,
     zeros_out: torch.Tensor = None,
+    upcast_operand: bool = False,
 ):
     """
     Perform RoPE on q and k and along the last dimension and copy k and v in to key_cache and value_cache inplace
@@ -551,25 +560,6 @@ def fused_qk_rope_reshape_and_cache(
         value_cache_stride_b,
         value_cache_stride_slot_chunk,
         value_cache_stride_x,
-        # key_cache.stride(0) if not flash_layout else key_cache.stride(0),
-        # key_cache.stride(1) if not flash_layout else key_cache.stride(2),
-        # key_cache.stride(2) if not flash_layout else key_cache.stride(3),
-        # key_cache.stride(3) if not flash_layout else key_cache.stride(1),
-        # key_cache.stride(4) if not flash_layout else 0,
-        # value_cache.stride(0) if not flash_layout else value_cache.stride(0),
-        # value_cache.stride(1) if not flash_layout else value_cache.stride(2),
-        # (
-        #     value_cache.stride(3)
-        #     if (not flash_layout and value_shuffle_layout)
-        #     else (value_cache.stride(2) if not flash_layout else value_cache.stride(3))
-        # ),
-        # (
-        #     0
-        #     if (not flash_layout and value_shuffle_layout)
-        #     else (value_cache.stride(3) if not flash_layout else value_cache.stride(1))
-        # ),
-        # value_cache.stride(2) if (not flash_layout and value_shuffle_layout) else 0,
-        # value_cache.stride(4) if (not flash_layout and value_shuffle_layout) else 0,
         zeros_out.stride(0) if zeros_out is not None else 0,
         zeros_out.stride(1) if zeros_out is not None else 0,
         zeros_out.stride(2) if zeros_out is not None else 0,
@@ -591,6 +581,7 @@ def fused_qk_rope_reshape_and_cache(
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         HAVE_V_SCALE=(v_scale is not None and apply_scale),
         HAVE_ZEROS=output_zeros,
+        UPCAST_OPERAND=upcast_operand,
         num_warps=1,
     )
 
