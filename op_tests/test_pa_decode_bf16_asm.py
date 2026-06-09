@@ -56,6 +56,32 @@ def rms_rel_err(ref, out):
     return ((a - b).pow(2).mean().sqrt() / mag).item()
 
 
+PA_FP8_MAX = (
+    448.0  # OCP E4M3 (non-FNUZ, bias=7) max finite — the kernel's P-quant clamp.
+)
+
+
+def quant_fp8_p_per_row(w):
+    """Round softmax weights P to FP8 e4m3 with a per-row (per-query) max scale, to
+    match the kernel's second WMMA.
+
+    The SP3 kernel (and csim's golden single_work_decode) quantize the attention
+    probabilities to FP8 before the P@V matmul: per row r it forms
+    scale_r = max_t|P[r,t]| / 448, casts P/scale_r to e4m3, runs the FP8 matmul,
+    then dequants by scale_r.  The fp32 reference skipped this, so it sat below the
+    kernel's accuracy and the kernel's FP8-P rounding read as error.
+
+    `w` has the token dim last ([..., t]); the per-row max is taken over t.  Note
+    this equals quantizing the *unnormalized* exp() values: the softmax sum cancels
+    through scale_r, and the row max element (exp(0)=1 before normalize) maps to 448.
+    Single-shot over the whole context, so for >256-token rows it is a close (not
+    bit-exact) model of the kernel's per-256-tile rescaled quant."""
+    amax = w.abs().amax(dim=-1, keepdim=True).clamp_min(1e-20)
+    scale = amax / PA_FP8_MAX
+    w_fp8 = (w / scale).clamp(-PA_FP8_MAX, PA_FP8_MAX).to(fp8).float()
+    return w_fp8 * scale
+
+
 def make_sched2_metadata(
     batch,
     kv_head_num,
@@ -245,6 +271,11 @@ def ref_pa_decode(
     with the per-tensor scales, then does softmax attention per (batch, kv_head,
     gqa) over the whole context (multi-page via kv_indptr/kv_indices) -> bf16.
 
+    The softmax probabilities P are rounded to FP8 e4m3 (per-row max scale) before
+    the P@V product via quant_fp8_p_per_row, mirroring the kernel's second WMMA
+    (and csim's single_work_decode golden); skipping it leaves the reference more
+    accurate than the kernel, so the kernel's FP8-P rounding shows up as error.
+
     For mtp>0 the SP3 kernel applies a per-MTP-position causal border (var CAUSAL,
     setup_mask_border): query position i (0..mtp) attends only to the first
     `seq_len - mtp + i` tokens (token p masked when p >= border).  Note this is
@@ -309,6 +340,10 @@ def ref_pa_decode(
                 ]  # drop sink weight
             else:
                 w = torch.softmax(logits.float(), dim=-1)
+            # Match the kernel: the P@V WMMA quantizes the real-token probabilities
+            # to FP8 per-row (after the sink is dropped — the sink has no value), so
+            # quant here, not before, to mirror it.
+            w = quant_fp8_p_per_row(w)
             out[b, ql] = torch.einsum("hgt,thd->hgd", w, Vc[:valid]) * value_scale
     return out.to(torch.bfloat16)
 
