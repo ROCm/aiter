@@ -232,74 +232,14 @@ def _cu_count(device_index: int) -> int:
 #      upstream ``@tensor_cache`` evicts an entry the int32 copy is freed
 #      automatically (no ``id``-recycling hazard, unlike a global dict).
 #
-#   2. ``_get_dummy``: per-device cached scalar tensors for the
-#      ``cu_seqlens is None`` (batched) path. The original code allocated a
-#      fresh ``torch.empty(1, dtype=fp32)`` plus two ``dummy.to(int32)``
-#      casts on every call; those are pure overhead because the kernel never
-#      reads them when ``IS_VARLEN=False``. We hand back a single shared
-#      tensor per (device, dtype) instead.
+#   2. Null-arg launch placeholder: on the ``cu_seqlens is None`` (batched)
+#      path the kernel reads neither ``cu_seqlens`` nor ``chunk_offsets``
+#      (and the ``use_*`` guards skip the optional gate/state loads), but
+#      ``@flyc.jit`` still requires a real tensor in every slot. A local
+#      ``torch.empty(0)`` (one per forward, MoE-style) satisfies that
+#      without any global cache.
 _INT32_ATTR = "_flydsl_int32_view"
 _PROLOGUE_ATTR = "_flydsl_prologue_cache"
-_FAST_PLAN_ATTR = "_flydsl_fast_plan"
-_dummy_tensors: dict[tuple[int, torch.dtype], torch.Tensor] = {}
-
-# Per-shape "launch plan" cache. The plan packs every shape/flag-derived
-# product (BV, launch_fn, grid dims, int32-view offsets, dummies, stream,
-# output-buffer shapes, ...) into a single tuple, so a hot-path call that
-# hits the cache reduces to: one dict lookup, three ``new_empty`` calls and
-# the actual ``launch_fn`` invocation. See ``_build_plan`` / ``_plan_key``
-# for the exact contract. Bounded by ``_PLAN_CACHE_MAX`` to keep dict
-# overhead constant even if a caller drives many unique shapes.
-_plan_cache: dict[tuple, tuple] = {}
-_PLAN_CACHE_MAX = 1024
-# Hot-path bool/int flag packing. Bits 0..7 encode the eight Python flags
-# that vary per call; bits 8..15 encode chunk_size (BT, typically 64);
-# bits 16..23 encode num_decodes; bits 24..31 encode num_decode_tokens.
-# Packing into a single Python int removes seven 1-byte tuple slots from
-# the plan key (each costing ~250ns to hash on 17-tuple), which is the
-# single largest chunk of the ~5us plan-key-construction overhead.
-def _pack_flags(
-    use_g, use_gk, use_h0, output_final_state, save_new_value,
-    g_log2_scaled, state_bf16, is_varlen,
-    chunk_size, num_decodes, num_decode_tokens,
-):
-    return (
-        (use_g & 1)
-        | ((use_gk & 1) << 1)
-        | ((use_h0 & 1) << 2)
-        | ((output_final_state & 1) << 3)
-        | ((save_new_value & 1) << 4)
-        | ((g_log2_scaled & 1) << 5)
-        | ((state_bf16 & 1) << 6)
-        | ((is_varlen & 1) << 7)
-        | ((chunk_size & 0xFF) << 8)
-        | ((num_decodes & 0xFF) << 16)
-        | ((num_decode_tokens & 0xFFFF) << 24)
-    )
-# Stream lookup is one of the most expensive host-side calls in the K5
-# launch path (~2us per ``torch.cuda.current_stream()``). Caller code in
-# this repo only ever uses the default stream, so we cache the per-device
-# default stream object once and re-use it across forwards. If a caller
-# switches streams between launches they should clear the cache; we treat
-# that as an unusual enough case to be explicit about ("attach to default
-# stream" is the path that 100% of production callers take today).
-_default_stream_cache: dict[int, "torch.cuda.Stream"] = {}
-
-
-def _current_stream(device: torch.device) -> "torch.cuda.Stream":
-    """Cached ``torch.cuda.current_stream(device)`` for the hot launch path.
-
-    The underlying CUDA driver query is ~2us per call; caching elides it
-    after the first forward (the kernel launch itself uses the returned
-    object, so it must remain a real ``torch.cuda.Stream`` and not a raw
-    handle).
-    """
-    idx = device.index if device.type == "cuda" else -1
-    s = _default_stream_cache.get(idx)
-    if s is None:
-        s = torch.cuda.current_stream(device)
-        _default_stream_cache[idx] = s
-    return s
 
 
 def _as_int32(t: torch.Tensor) -> torch.Tensor:
@@ -338,13 +278,19 @@ def _resolve_prologue(
     ``prepare_rebased_cu_seqlens`` is already ``@tensor_cache``-decorated, so
     every call is "just" a tuple compare + dict lookup. That is still
     ~0.55us each via the upstream Python wrapper (≈1.7us total across the
-    three calls), so we collapse them into a single 4-tuple attached
+    three calls), so we collapse them into a single tuple attached
     directly to ``cu_seqlens`` (keyed by ``(BT, num_decodes,
     num_decode_tokens)``). After the first forward on a given
     ``cu_seqlens`` tensor, this is one ``getattr`` + one dict get on a
     tiny dict, ~0.15us.
 
-    Returns ``(NT, chunk_offsets, kernel_cu_seqlens, N)``.
+    The exact minimum segment length (``min_seqlen``) is cached here too.
+    Reading it requires a ``min().item()`` host<->device sync (~5us), but the
+    sync is paid once per ``cu_seqlens`` tensor, not per forward. That lets
+    the BV heuristic keep the min-based balanced-split carve-outs without a
+    separate launch-plan cache.
+
+    Returns ``(NT, chunk_offsets, kernel_cu_seqlens, N, min_seqlen)``.
     """
     cache_key = (BT, num_decodes, num_decode_tokens)
     cache = getattr(cu_seqlens, _PROLOGUE_ATTR, None)
@@ -369,27 +315,15 @@ def _resolve_prologue(
         cu_seqlens, num_decodes, num_decode_tokens
     )
     N = len(kernel_cu_seqlens) - 1
-    result = (NT, chunk_offsets, kernel_cu_seqlens, N)
+    if N >= 1:
+        seg_lens = kernel_cu_seqlens[1:] - kernel_cu_seqlens[:-1]
+        min_seqlen = int(seg_lens.min().item())
+    else:
+        min_seqlen = None
+    result = (NT, chunk_offsets, kernel_cu_seqlens, N, min_seqlen)
     if cache is not None:
         cache[cache_key] = result
     return result
-
-
-def _get_dummy(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Return a shared 1-element scalar tensor for null-arg launches.
-
-    Used to satisfy ``@flyc.jit``'s no-``None`` requirement on the batched
-    path where the kernel reads neither ``cu_seqlens`` nor ``chunk_offsets``
-    (and the various ``use_*`` guards in the kernel body also skip the
-    corresponding loads). Returning the same tensor avoids allocator and
-    dispatch overhead on every forward.
-    """
-    key = (device.index if device.type == "cuda" else -1, dtype)
-    out = _dummy_tensors.get(key)
-    if out is None:
-        out = torch.empty(1, device=device, dtype=dtype)
-        _dummy_tensors[key] = out
-    return out
 
 
 def _legal_bv_candidates(V: int) -> list[int]:
@@ -428,11 +362,15 @@ def _target_bv_for_shape(
 
     Args:
         min_seqlen: smallest segment length in the (varlen) batch, i.e.
-            ``min(cu_seqlens[1:] - cu_seqlens[:-1])``. Optional; some
-            sub-rules (e.g. the N=2 "balanced-split" carve-out below)
-            need this to distinguish "head ~= T/2" from "head << T".
-            When None, those sub-rules fall through to the previous
-            T_flat-only logic.
+            ``min(cu_seqlens[1:] - cu_seqlens[:-1])``. Used by the
+            "balanced-split" carve-outs to distinguish "segments ~= T/N each"
+            from "one dominant segment + small tails" -- a distinction the
+            average length cannot make (a balanced and a skewed split can
+            share the same average), so the EXACT min is required. The
+            caller computes it once and caches it on the ``cu_seqlens``
+            tensor (see ``_resolve_prologue``) so the per-forward path pays
+            no ``.item()`` host<->device sync. When None, those sub-rules
+            fall through to the T_flat-only logic.
 
     If you extend this rule, please keep:
       (a) every return statement guarded by an explicit T_flat range
@@ -541,10 +479,10 @@ def _heuristic_bv(
          trace-calibrated carve-outs), which generalizes to shapes the sparse
          csv does not cover.
 
-    The function performs a cheap one-time csv parse on first call and is
-    otherwise pure w.r.t. its scalar arguments; the result is consumed only
-    on the ``_build_plan`` cold path (one call per unique plan key), so the
-    csv parse / lookup never touches the hot launch path.
+    The csv table is parsed once per process, then this is just an exact-key
+    dict lookup plus scalar arithmetic. It runs once per forward (MoE/GEMM-
+    style host recompute), while expensive inputs such as the exact
+    ``min_seqlen`` are cached separately by ``_resolve_prologue``.
 
     Rules calibrated against a 27-point sweep matrix on gfx950 (20 in-csv
     shapes + 7 csv-uncovered probes). The 27 points span H in
@@ -685,134 +623,6 @@ def _resolve_state_dtype(initial_state, state_dtype):
     return resolved
 
 
-def _build_plan(
-    *,
-    k,
-    w,
-    u,
-    cu_seqlens,
-    chunk_size,
-    use_g,
-    use_gk,
-    use_h0,
-    output_final_state,
-    save_new_value,
-    g_log2_scaled,
-    state_bf16,
-    resolved_state_dtype,
-    num_decodes,
-    num_decode_tokens,
-    wu_contiguous,
-):
-    """Pre-compute every shape/flag-derived product the hot path needs.
-
-    Called once per unique ``_plan_key``; the returned tuple is stored
-    verbatim in ``_plan_cache``. All fields are immutable (ints, tensors
-    with stable identity, the compiled ``launch_fn``), so reuse across
-    forwards is safe as long as the plan key is honored.
-    """
-    B, T, _Hg, K = k.shape
-    H = w.shape[1]
-    V = u.shape[-1]
-    T_flat = w.shape[2]
-    Hg = _Hg
-    BT = chunk_size
-
-    assert K <= 256
-
-    if cu_seqlens is None:
-        N = B
-        NT = triton.cdiv(T, BT)
-        chunk_offsets = None
-        kernel_cu_seqlens = None
-        is_varlen = False
-        min_seqlen = None
-    else:
-        NT, chunk_offsets, kernel_cu_seqlens, N = _resolve_prologue(
-            cu_seqlens, BT, num_decodes, num_decode_tokens
-        )
-        is_varlen = True
-        # Smallest segment length, used by ``_target_bv_for_shape``'s
-        # N=2 "balanced-split" carve-out. ``_build_plan`` is a cold path
-        # (one call per unique ``_plan_key``; subsequent forwards on the
-        # same shape hit ``_plan_cache``), so the host-side .min() +
-        # .item() sync (~5us) is paid once per shape, not per forward.
-        if N >= 1:
-            seg_lens = kernel_cu_seqlens[1:] - kernel_cu_seqlens[:-1]
-            min_seqlen = int(seg_lens.min().item())
-        else:
-            min_seqlen = None
-
-    BV = _heuristic_bv(
-        H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen,
-        min_seqlen=min_seqlen,
-        device_index=k.device.index if k.device.type == "cuda" else -1,
-        dtype_str=str(k.dtype), K=K, BT=BT,
-    )
-
-    launch_fn = _get_or_compile(
-        K,
-        V,
-        BT,
-        BV,
-        H,
-        Hg,
-        use_g,
-        use_gk,
-        use_h0,
-        output_final_state,
-        save_new_value,
-        is_varlen,
-        wu_contiguous,
-        state_bf16=state_bf16,
-        g_log2_scaled=g_log2_scaled,
-    )
-
-    fp32_dummy = _get_dummy(k.device, torch.float32)
-    int32_dummy = _get_dummy(k.device, torch.int32)
-    cu_arg = (
-        _as_int32(kernel_cu_seqlens)
-        if kernel_cu_seqlens is not None
-        else int32_dummy
-    )
-    co_arg = (
-        _as_int32(chunk_offsets) if chunk_offsets is not None else int32_dummy
-    )
-    stream = _current_stream(k.device)
-
-    grid_v = triton.cdiv(V, BV)
-    grid_nh = N * H
-
-    # Output-buffer shapes/dtypes (sizes are ints, allocator is called per
-    # forward against these on the hot path).
-    h_shape = (B, NT, H, V, K)
-    vn_shape = (B, H, T_flat, V)
-    vn_dtype = u.dtype
-    fs_shape = (N, H, V, K) if output_final_state else None
-    fs_dtype = resolved_state_dtype if output_final_state else None
-
-    # Tuple (not dict) so the hot path uses constant-index access instead of
-    # string hashing for every field.
-    return (
-        launch_fn,
-        fp32_dummy,
-        cu_arg,
-        co_arg,
-        stream,
-        T,
-        T_flat,
-        N,
-        grid_v,
-        grid_nh,
-        h_shape,
-        vn_shape,
-        vn_dtype,
-        fs_shape,
-        fs_dtype,
-        save_new_value,
-    )
-
-
 def chunk_gated_delta_rule_fwd_h_flydsl(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -873,128 +683,101 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         (h, v_new, final_state) in VK-ordered layout (``[..., V, K]`` on the
         last two dims).
 
-    BV-tile selection is rule-based. ``chunk_gdn_h_tuned.csv`` remains an AOT
-    seed list for pre-compilation, but runtime BV selection does not read it.
+    BV-tile selection prefers an exact match from ``chunk_gdn_h_tuned.csv``
+    (the same file AOT uses as its pre-compilation seed list), then falls
+    back to the rule-based heuristic for shapes the sparse csv does not cover.
     """
-    # Hot path overview: every shape/flag-derived product (BV, launch_fn,
-    # grid dims, int32-view offsets, output-buffer shapes, ...) is packed
-    # into a per-shape ``plan`` tuple stored in ``_plan_cache``. A repeat
-    # call on a previously seen shape reduces to: one dict lookup, three
-    # ``new_empty`` calls and the actual launcher.
-    #
-    # Two-level cache:
-    #
-    #   L1: a single (validate_tuple, plan) attached to ``k`` itself.
-    #       Hit cost: one ``getattr`` + one tuple ``==`` (~0.4us).
-    #       Validity: identity of (w, u, g, gk, h0, cu_seqlens) plus all
-    #       flags. Caller code that drives a stable shape with stable
-    #       tensor objects (KV-cache style decoding loops, prefill warm
-    #       loops) hits L1 100% of the time after warmup.
-    #
-    #   L2: shape/flag-keyed plan cache. Used when L1 misses. The key is
-    #       a packed-flags int + tensor shapes + dtypes + cu_seqlens id;
-    #       this still works when callers swap tensor objects between
-    #       forwards (e.g. autograd reallocation) as long as the *shapes*
-    #       are stable.
+    # All shape/flag-derived launch products (BV, launch_fn, grid dims,
+    # output-buffer shapes, ...) are recomputed inline per forward, MoE/GEMM-
+    # style: no per-shape launch-plan cache. This is affordable because each
+    # individually-expensive input is itself cached -- the compiled kernel via
+    # ``_get_or_compile`` (lru_cache), the varlen prologue + exact
+    # ``min_seqlen`` via the per-cu_seqlens cache in ``_resolve_prologue``, and
+    # the int32 offset views via ``_as_int32``. Everything else here is cheap
+    # host-side arithmetic.
 
-    is_varlen = cu_seqlens is not None
     use_g = g is not None
     use_gk = gk is not None
     use_h0 = initial_state is not None
     g_log2_scaled = bool(use_exp2)
 
-    # state_bf16 derivation, inlined and cache-friendly. The full
-    # ``_resolve_state_dtype`` (with its raise paths for bad dtypes /
-    # conflicts) runs only on L2 miss; on the hot path we only do the
-    # ``is None`` checks and a dtype ``==`` compare.
-    if initial_state is not None:
-        _state_dtype = initial_state.dtype
-    elif state_dtype is not None:
-        _state_dtype = state_dtype
-    else:
-        _state_dtype = torch.float32
-    state_bf16 = _state_dtype is torch.bfloat16
+    # State-dtype validation: cheap, and raises on bad / conflicting dtypes.
+    # ``state_bf16`` is the only derived bit the compile key needs.
+    resolved_state_dtype = _resolve_state_dtype(initial_state, state_dtype)
+    state_bf16 = resolved_state_dtype is torch.bfloat16
 
-    flags = _pack_flags(
-        use_g, use_gk, use_h0, output_final_state, save_new_value,
-        g_log2_scaled, state_bf16, is_varlen,
-        chunk_size, num_decodes, num_decode_tokens,
+    B, T, Hg, K = k.shape
+    H = w.shape[1]
+    V = u.shape[-1]
+    T_flat = w.shape[2]
+    BT = chunk_size
+
+    assert K <= 256
+
+    if cu_seqlens is None:
+        N = B
+        NT = triton.cdiv(T, BT)
+        chunk_offsets = None
+        kernel_cu_seqlens = None
+        is_varlen = False
+        min_seqlen = None
+    else:
+        # The exact ``min_seqlen`` comes from the per-``cu_seqlens`` cache, so
+        # its ``.item()`` host<->device sync is paid once per cu_seqlens tensor
+        # (not per forward) -- letting the heuristic use the exact min without
+        # a per-call stall and without a launch-plan cache.
+        NT, chunk_offsets, kernel_cu_seqlens, N, min_seqlen = _resolve_prologue(
+            cu_seqlens, BT, num_decodes, num_decode_tokens
+        )
+        is_varlen = True
+
+    BV = _heuristic_bv(
+        H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen,
+        min_seqlen=min_seqlen,
+        device_index=k.device.index if k.device.type == "cuda" else -1,
+        dtype_str=str(k.dtype), K=K, BT=BT,
     )
 
-    # L1: per-tensor fast path. validate-tuple compares identities of
-    # every co-input that could change BETWEEN forwards on the same plan
-    # (shapes/dtypes are implicitly fixed because k itself is fixed).
-    fast = getattr(k, _FAST_PLAN_ATTR, None)
-    fast_key = (flags, id(w), id(u), id(g), id(gk),
-                id(initial_state), id(cu_seqlens), id(state_dtype))
-    if fast is not None and fast[0] == fast_key:
-        plan = fast[1]
-    else:
-        # L2: shape/flag-keyed plan cache. Resolve state_dtype properly
-        # here so caller-facing errors are NOT swallowed by L1's identity
-        # match (since L1 only hits when initial_state identity matches,
-        # any new tensor with a bad dtype combination forces L2 and gets
-        # validated).
-        resolved_state_dtype = _resolve_state_dtype(initial_state, state_dtype)
-        plan_key = (
-            k.shape, w.shape, u.shape,
-            k.dtype, u.dtype,
-            k.device.index if k.device.type == "cuda" else -1,
-            flags,
-            id(cu_seqlens) if cu_seqlens is not None else 0,
-        )
-        plan = _plan_cache.get(plan_key)
-        if plan is None:
-            if len(_plan_cache) >= _PLAN_CACHE_MAX:
-                _plan_cache.clear()
-            plan = _build_plan(
-                k=k, w=w, u=u, cu_seqlens=cu_seqlens,
-                chunk_size=chunk_size,
-                use_g=use_g, use_gk=use_gk, use_h0=use_h0,
-                output_final_state=output_final_state,
-                save_new_value=save_new_value,
-                g_log2_scaled=g_log2_scaled,
-                state_bf16=state_bf16,
-                resolved_state_dtype=resolved_state_dtype,
-                num_decodes=num_decodes,
-                num_decode_tokens=num_decode_tokens,
-                wu_contiguous=True,
-            )
-            _plan_cache[plan_key] = plan
-        # Stash on k so the next forward with the same co-input identities
-        # bypasses the L2 lookup entirely. Best-effort: tensor subclasses
-        # that disallow ad-hoc attrs simply skip the L1 install.
-        try:
-            object.__setattr__(k, _FAST_PLAN_ATTR, (fast_key, plan))
-        except (AttributeError, TypeError):
-            pass
+    launch_fn = _get_or_compile(
+        K, V, BT, BV, H, Hg,
+        use_g, use_gk, use_h0,
+        output_final_state, save_new_value,
+        is_varlen, True,
+        state_bf16=state_bf16,
+        g_log2_scaled=g_log2_scaled,
+    )
 
-    (
-        launch_fn,
-        fp32_dummy,
-        cu_arg,
-        co_arg,
-        stream,
-        T_plan,
-        T_flat_plan,
-        N_plan,
-        grid_v,
-        grid_nh,
-        h_shape,
-        vn_shape,
-        vn_dtype,
-        fs_shape,
-        fs_dtype,
-        save_vn,
-    ) = plan
+    # Null-arg placeholder for the @flyc.jit slots the kernel ignores on this
+    # path (one local scalar tensor allocated per forward, MoE-style -- no
+    # global cache). Sized 1 (not 0) so its ``data_ptr()`` is always a valid
+    # non-null device address for the launcher's unused arg slots.
+    dummy = torch.empty(1, device=k.device, dtype=torch.float32)
+    int32_dummy = dummy.to(torch.int32) if not is_varlen else None
+    cu_arg = (
+        _as_int32(kernel_cu_seqlens)
+        if kernel_cu_seqlens is not None
+        else int32_dummy
+    )
+    co_arg = (
+        _as_int32(chunk_offsets) if chunk_offsets is not None else int32_dummy
+    )
+    stream = torch.cuda.current_stream(k.device)
 
-    # G contiguity guard. The shape check is omitted on the hot path:
-    # ``T_flat`` is part of the plan key (via w.shape), so a mismatched
-    # ``g.shape[-1]`` against a previously seen plan can only happen if
-    # the caller breaks the documented [B, H, T_flat] contract -- in
-    # which case strides will diverge and ``is_contiguous()`` is enough
-    # to catch the common modes (transposed view, slice). Keeping just
-    # ``is_contiguous`` keeps the safety net for ~50ns instead of ~1us.
+    grid_v = triton.cdiv(V, BV)
+    grid_nh = N * H
+
+    h_shape = (B, NT, H, V, K)
+    vn_shape = (B, H, T_flat, V)
+    vn_dtype = u.dtype
+    fs_shape = (N, H, V, K) if output_final_state else None
+    fs_dtype = resolved_state_dtype if output_final_state else None
+    save_vn = save_new_value
+
+    # G contiguity guard. We only check ``is_contiguous`` (not the full
+    # shape): a mismatched ``g.shape[-1]`` vs ``w.shape[2]`` (T_flat) can
+    # only happen if the caller breaks the documented [B, H, T_flat]
+    # contract -- in which case strides diverge and ``is_contiguous()``
+    # catches the common modes (transposed view, slice) for ~50ns.
     if g is not None and not g.is_contiguous():
         raise AssertionError(
             "FlyDSL K5: ``g`` must be contiguous (head-major [B, H, T_flat] "
@@ -1020,16 +803,16 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         u,
         w,
         v_new_buf,
-        g if g is not None else fp32_dummy,
-        gk if gk is not None else fp32_dummy,
+        g if g is not None else dummy,
+        gk if gk is not None else dummy,
         h,
-        initial_state if initial_state is not None else fp32_dummy,
-        final_state if final_state is not None else fp32_dummy,
+        initial_state if initial_state is not None else dummy,
+        final_state if final_state is not None else dummy,
         cu_arg,
         co_arg,
-        T_plan,
-        T_flat_plan,
-        N_plan,
+        T,
+        T_flat,
+        N,
         grid_v,
         grid_nh,
         stream,
