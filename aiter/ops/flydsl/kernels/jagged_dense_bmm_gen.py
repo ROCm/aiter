@@ -80,6 +80,7 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS):
         SEQ_OFFSETS: fx.Tensor,  # (B_groups + 1,) int32
         tiled_mma: fx.TiledMma,
         tiled_copy_g2s_A: fx.TiledCopy,
+        tiled_copy_s2g_C: fx.TiledCopy,
     ):
         tid = fx.thread_idx.x
         pid_mn, _, off_b = fx.block_idx
@@ -214,16 +215,24 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS):
             run_pipeline_stage(read_stage=1, next_k=None, read_next=False)
 
             # --- Epilogue: fp32 accumulators -> bf16, broadcast bias, masked store ---
+            # O4 LDS C-shuffle: the MFMA accumulator layout is M-major per lane
+            # (a lane's contiguous fragment elements map to different output ROWS,
+            # stride N in global). A direct vectorized N store is therefore
+            # impossible from the fragment, so the baseline emitted 64
+            # buffer_store_short (scalar 2-byte) per thread -- 38-62% of runtime
+            # at these memory-bound shapes. We route C through LDS to transpose
+            # the layout: write the fragment to a row-major shared C tile in its
+            # natural MFMA layout, barrier, then re-read N-contiguous (8 bf16 /
+            # thread) and store with buffer_store_dwordx4 (128b) to global.
             mma_frag_C_bf16 = fx.make_fragment_like(mma_frag_C, fx.BFloat16.ir_type)
-            thr_copy_r2g_C = fx.make_tiled_copy_C(
-                fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16), tiled_mma
+            thr_copy_r2s_C = fx.make_tiled_copy_C(
+                fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16), tiled_mma
             ).get_slice(tid)
-            mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C_bf16)
-            thr_gC = thr_copy_r2g_C.partition_S(gC)
+            mma_frag_C_retile = thr_copy_r2s_C.retile(mma_frag_C_bf16)
 
-            # Load this thread's bias slice (same partition as C) into fp32 and add
-            # to the accumulator before the bf16 truncation (broadcast over rows).
-            thr_gBias = thr_copy_r2g_C.partition_S(gBias)
+            # Broadcast bias (read once via the natural MFMA layout) and fold into
+            # the fragment before the LDS write.
+            thr_gBias = thr_copy_r2s_C.partition_S(gBias)
             bias_frag = fx.make_fragment_like(thr_gBias)
             fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16), thr_gBias, bias_frag)
             bias_f32 = fx.arith.ExtFOp(fx.T.VectorType.get([C_FRAG_LEN], fx.T.f32()), bias_frag.load()).result
@@ -233,7 +242,28 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS):
                     fx.arith.addf(mma_frag_C.load(), bias_f32),
                 )
             )
-            fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16), mma_frag_C_retile, thr_gC)
+
+            # Row-major shared C tile, reusing the dynamic shared memory that held
+            # the A staging buffers (smem sized to max of the two).
+            sC = fx.make_view(
+                fx.get_dyn_shared(fx.BFloat16),
+                fx.make_ordered_layout((BLOCK_M, BLOCK_N), (1, 0)),
+            )  # (BM, BN) row-major
+            thr_sC = thr_copy_r2s_C.partition_D(sC)  # natural MFMA layout into LDS
+
+            # The A staging LDS reads (s2r) for the last K-tile must be done before
+            # we overwrite that memory with C; the main-loop barrier guarantees it.
+            fx.gpu.barrier()
+            fx.copy(fx.make_copy_atom(fx.UniversalCopy16b(), fx.BFloat16), mma_frag_C_retile, thr_sC)
+            fx.gpu.barrier()
+
+            # Re-read N-contiguous from LDS and wide-store to global.
+            thr_copy_s2g_C = tiled_copy_s2g_C.get_slice(tid)
+            thr_sC_read = thr_copy_s2g_C.partition_S(sC)   # (V, VM, VN)
+            thr_gC = thr_copy_s2g_C.partition_D(gC)        # (V, VM, VN) global
+            cs_frag = fx.make_fragment_like(thr_sC_read)
+            fx.copy(fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16), thr_sC_read, cs_frag)
+            fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16), cs_frag, thr_gC)
 
     @flyc.jit
     def _launch(
@@ -260,9 +290,23 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS):
             fx.make_tile(thrs_row, BLOCK_K),
         )
 
+        # O4 C-shuffle store copy: row-major (BLOCK_M, BLOCK_N), 8 bf16 / thread
+        # along N (128b) so the global store coalesces to buffer_store_dwordx4.
+        c_val = 8  # 16B / bf16
+        c_thrs_n = BLOCK_N // c_val          # threads along N
+        c_thrs_m = THREADS // c_thrs_n       # threads along M
+        tiled_copy_s2g_C = fx.make_tiled_copy(
+            fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16),
+            fx.make_layout(((c_thrs_n, c_thrs_m), (1, c_val)), ((c_thrs_m * c_val, 1), (1, c_thrs_m))),
+            fx.make_tile(c_thrs_m, BLOCK_N),
+        )
+
+        # smem holds either A double-buffer staging or the row-major C tile.
+        epi_smem_bytes = max(smem_bytes, BLOCK_M * BLOCK_N * 2)
+
         bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
-        jdbba_kernel(C, A, B, BIAS, SEQ_OFFSETS, tiled_mma, tiled_copy_g2s_A).launch(
-            grid=(bm * N_BLOCKS, 1, n_groups), block=(THREADS, 1, 1), smem=smem_bytes, stream=stream
+        jdbba_kernel(C, A, B, BIAS, SEQ_OFFSETS, tiled_mma, tiled_copy_g2s_A, tiled_copy_s2g_C).launch(
+            grid=(bm * N_BLOCKS, 1, n_groups), block=(THREADS, 1, 1), smem=epi_smem_bytes, stream=stream
         )
 
     return _launch
