@@ -916,9 +916,7 @@ def _moe_gemm_a8w4_prefill(
         offs_xs_m = off_x_m + gl.arange(
             0, BLOCK_M, layout=gl.SliceLayout(1, X_SCALES_LOAD_LAYOUT)
         )
-        offs_xs_m = gl.max_contiguous(
-            gl.multiple_of(offs_xs_m % M, BLOCK_M), BLOCK_M
-        )
+        offs_xs_m = gl.max_contiguous(gl.multiple_of(offs_xs_m % M, BLOCK_M), BLOCK_M)
         offs_xs_k = gl.arange(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
         )
