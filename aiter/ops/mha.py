@@ -1431,7 +1431,13 @@ def _flash_attn_forward(
         ret = ret and (seqlen_q > 0 and seqlen_k > 0)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (bias is None) and (alibi_slopes is None)
-        ret = ret and (not swa)
+        # Native has only two mask modes: full (causal=False) and full causal
+        # (causal=True). Require the exact no-window sentinel -- `not swa` is too
+        # loose because swa only tests >0, so a finite 0 window (e.g.
+        # window_size=(-1, 0), which is semantically causal) would slip through and
+        # be computed as unmasked. Any window/sink restriction falls back to CK/ASM.
+        ret = ret and (window_size_left == -1 and window_size_right == -1)
+        ret = ret and (sink_size == 0)
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
         ret = ret and (sink_ptr is None)
         ret = ret and (nhead_q % nhead_k == 0)
