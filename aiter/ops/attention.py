@@ -444,9 +444,9 @@ def pa_decode_bf16_asm(
     kv_indptr: torch.Tensor,
     gqa: int = 8,
     mtp: int = 0,
-    query_scale: float = 1.0,
-    key_scale: float = 1.0,
-    value_scale: float = 1.0,
+    query_scale: float | torch.Tensor = 1.0,
+    key_scale: float | torch.Tensor = 1.0,
+    value_scale: float | torch.Tensor = 1.0,
     qo_indptr: Optional[torch.Tensor] = None,
     work_indptr: Optional[torch.Tensor] = None,
     work_info: Optional[torch.Tensor] = None,
@@ -476,12 +476,20 @@ def pa_decode_bf16_asm(
     if out is None:
         out = torch.empty(Q.shape, dtype=torch.bfloat16, device=device)
 
-    q_scale = torch.tensor([query_scale], dtype=torch.float32, device=device)
+    def _scale_tensor(scale: float | torch.Tensor, multiplier: float = 1.0):
+        if isinstance(scale, torch.Tensor):
+            scale = scale.to(device=device, dtype=torch.float32).reshape(-1)[:1]
+            if multiplier != 1.0:
+                scale = scale * multiplier
+            return scale.contiguous()
+        return torch.tensor(
+            [float(scale) * multiplier], dtype=torch.float32, device=device
+        )
+
+    q_scale = _scale_tensor(query_scale)
     # Fold the attention softmax scale into key_scale (matches pa_ps.cpp).
-    k_scale = torch.tensor(
-        [key_scale * softmax_scale], dtype=torch.float32, device=device
-    )
-    v_scale = torch.tensor([value_scale], dtype=torch.float32, device=device)
+    k_scale = _scale_tensor(key_scale, softmax_scale)
+    v_scale = _scale_tensor(value_scale)
 
     if sink is None:
         # The kernel is compiled sink-enabled (always reads + merges the sink
