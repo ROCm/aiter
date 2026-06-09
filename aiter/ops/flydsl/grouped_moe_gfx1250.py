@@ -621,14 +621,26 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             max_m,
             grouped_a1=grouped_a1,
         )
-        grouped_a1_scale = flydsl_moe_scatter_preshuffle_scale(
-            a1_scale_token_u8,
-            rows_to_tokens,
-            E,
-            max_m,
-            wmma_rep=warp_tile_m // 16,
-            scale_k_per_tile=tile_k // 32,
-        )
+        _wmma_rep = warp_tile_m // 16
+        if _wmma_rep >= 2:
+            grouped_a1_scale = flydsl_moe_scatter_preshuffle_scale(
+                a1_scale_token_u8,
+                rows_to_tokens,
+                E,
+                max_m,
+                wmma_rep=_wmma_rep,
+                scale_k_per_tile=tile_k // 32,
+            )
+        else:
+            Ws = model_dim // 32
+            _a1_raw = torch.zeros((E, max_m, Ws), dtype=torch.uint8, device=device)
+            _valid = rows_to_tokens >= 0
+            _rows = torch.nonzero(_valid, as_tuple=False).squeeze(1)
+            _toks = rows_to_tokens[_rows].to(torch.long)
+            _a1_raw.view(E * max_m, Ws)[_rows] = a1_scale_token_u8[_toks]
+            grouped_a1_scale = _grouped_a8w4_preshuffle_e8m0_scale(
+                _a1_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
+            )
         _grouped_dbg("route gather + scale preshuffle done")
     else:
         _grouped_dbg("start route gather (naive)")
