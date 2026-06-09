@@ -2342,9 +2342,69 @@ def _flash_attn_varlen_forward(
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         return ret
 
+    def can_impl_fmha_fwd_with_sink_varlen_asm():
+        # gfx1250 ASM bf16 packed/varlen forward (fmha_fwd_with_sink_varlen_asm).
+        # Packed THD (batch folded into the token axis); no dropout / swa /
+        # quant / alibi / bias / paged (block_table) / logits-soft-cap.  Sink
+        # logits (per-Q-head fp32) supported; sink-token (sink_size) not.
+        ret = get_gfx() == "gfx1250"
+        ret = ret and (q.dtype == dtypes.bf16)
+        ret = ret and (hdim_q in (64, 128))
+        ret = ret and (hdim_v == hdim_q)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (not swa)
+        ret = ret and (sink_size == 0)
+        ret = ret and (alibi_slopes is None and bias is None)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (logits_soft_cap == 0.0)
+        ret = ret and (block_table is None)
+        # The varlen ASM wrapper carries no physical-padding arrays; route any
+        # padded-cu request to CK (mha_varlen_fwd) which understands them.
+        ret = ret and (cu_seqlens_q_padded is None and cu_seqlens_k_padded is None)
+        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
+        # Per-hdim sink eligibility (mirrors the fixed-batch path):
+        #   D128 (`_rxy`) binaries compile ENABLE_SINK=0 and ignore the sink
+        #   buffer, so routing a caller's sink_ptr to them would silently drop
+        #   the sink term -- fall back to CK whenever sink_ptr is set.
+        #   D64  (`_rxy_sink`) binaries compile ENABLE_SINK=1 and ALWAYS read
+        #   SINK, so calling with sink_ptr=None would dereference a null pointer
+        #   -- require an explicit sink for D64 and fall back to CK otherwise.
+        if hdim_q == 128:
+            ret = ret and (sink_ptr is None)
+        elif hdim_q == 64:
+            ret = ret and (sink_ptr is not None)
+        return ret
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
-    if can_impl_fmha_v3_fwd():
+    if can_impl_fmha_fwd_with_sink_varlen_asm():
+        # gfx1250 packed/varlen ASM bf16 path.  q/k/v are packed THD; the kernel
+        # requires dense packing (the wrapper calls `.contiguous()` defensively)
+        # and carries no strides.  softmax_scale is forwarded as-is (the kernel
+        # applies it internally to Q·K^T).  sink_ptr is passed through verbatim;
+        # `can_impl_fmha_fwd_with_sink_varlen_asm` already enforces the per-hdim
+        # (D128→no sink, D64→sink) contract so we never feed a null sink to a
+        # D64 binary that unconditionally reads it.
+        out, lse_asm = fmha_fwd_with_sink_varlen_asm(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            float(softmax_scale),
+            bool(causal),
+            True,
+            sink_ptr,
+            out,
+        )
+        # The ASM kernel writes packed lse (total_q, nheads, 1); the varlen API
+        # convention (mha_varlen_fwd) is (nheads, total_q).  Reshape so callers
+        # and the autograd backward see a consistent layout regardless of path.
+        softmax_lse = lse_asm.squeeze(-1).transpose(0, 1).contiguous()
+        S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    elif can_impl_fmha_v3_fwd():
         out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
             q,
             k,

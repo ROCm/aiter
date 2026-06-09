@@ -150,6 +150,57 @@ def make_varlen_packed(
 
 
 # ---------------------------------------------------------------------------
+# Kernel entry points (mirrors test_fmha_fwd_with_sink_asm.run_kernel).
+# ---------------------------------------------------------------------------
+
+
+def run_kernel(
+    q,
+    k,
+    v,
+    cu_q,
+    cu_k,
+    max_seqlen_q,
+    *,
+    scale: float,
+    is_causal: bool,
+    sink: Optional[torch.Tensor] = None,
+    via: str = "ops",
+):
+    """Call the varlen kernel and return (out, lse) with lse shaped
+    (total_q, nheads) to match the in-file `_ref_varlen` reference.
+
+    via = "ops"     → low-level aiter.fmha_fwd_with_sink_varlen_asm
+                      (lse is packed (total_q, nheads, 1))
+    via = "public"  → public aiter.flash_attn_varlen_func (dispatcher → asm
+                      path); the varlen API returns lse as (nheads, total_q).
+    """
+    if via == "ops":
+        out, lse = aiter.fmha_fwd_with_sink_varlen_asm(
+            q, k, v, cu_q, cu_k, max_seqlen_q, scale, is_causal, True, sink=sink
+        )
+        return out, lse.squeeze(-1)  # (total_q, nheads, 1) -> (total_q, nheads)
+    if via == "public":
+        # q/k seqlens are equal in these tests, so max_seqlen_k == max_seqlen_q.
+        r = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max_seqlen_q,
+            max_seqlen_q,
+            softmax_scale=scale,
+            causal=is_causal,
+            return_lse=True,
+            sink_ptr=sink,
+        )
+        # public varlen lse is (nheads, total_q) -> (total_q, nheads)
+        return r[0], r[1].transpose(0, 1).contiguous()
+    raise ValueError(f"unknown via={via!r}")
+
+
+# ---------------------------------------------------------------------------
 # Correctness
 # ---------------------------------------------------------------------------
 
@@ -184,10 +235,20 @@ def test_fmha_fwd_with_sink_varlen_asm_correctness(
     # D64 -> exercise sink; D128 -> kernel ignores sink (pass None).
     sink = _d64_sink(hq, device) if head_dim == 64 else None
 
-    out_k, lse_k = aiter.fmha_fwd_with_sink_varlen_asm(
-        q, k, v, cu_q, cu_k, max_seqlen_q, scale, is_causal, True, sink=sink
+    # Drive the public API (aiter.flash_attn_varlen_func), which dispatches
+    # to the fmha_fwd_with_sink_varlen_asm branch on gfx1250.
+    out_k, lse_k = run_kernel(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max_seqlen_q,
+        scale=scale,
+        is_causal=is_causal,
+        sink=sink,
+        via="public",
     )
-    lse_k = lse_k.squeeze(-1)  # (total_q, nheads, 1) -> (total_q, nheads)
 
     msg = f"d={head_dim} hq={hq} hk={hk} seqlens={seqlens}"
     _ok = out_k.detach().float().cpu()
@@ -198,6 +259,48 @@ def test_fmha_fwd_with_sink_varlen_asm_correctness(
 
     _cmp(out_k, out_ref, rtol=1e-2, atol=1e-2, msg=f"out mismatch [{msg}]")
     _cmp(lse_k, lse_ref, rtol=1e-2, atol=1e-2, msg=f"lse mismatch [{msg}]")
+
+
+# ---------------------------------------------------------------------------
+# Integration test: aiter.flash_attn_varlen_func -> _flash_attn_varlen_forward
+# dispatcher -> fmha_fwd_with_sink_varlen_asm branch.  Verifies the public-API
+# path on gfx1250 matches a direct ops-layer call bit-for-bit (same kernel,
+# same args) — the lse layout differs (ops: (total_q, nheads); public:
+# (nheads, total_q)) but run_kernel normalizes both to (total_q, nheads).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("is_causal", [True])
+def test_fmha_fwd_with_sink_varlen_asm_via_flash_attn_varlen_func(head_dim, is_causal):
+    device = "cuda"
+    hq, hk, seqlens = 8, 1, [128, 256, 384]
+    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, head_dim, head_dim, device=device)
+    max_seqlen_q = max(seqlens)
+    scale = 1.0 / math.sqrt(head_dim)
+    sink = _d64_sink(hq, device) if head_dim == 64 else None
+
+    out_direct, lse_direct = run_kernel(
+        q, k, v, cu, cu, max_seqlen_q, scale=scale, is_causal=is_causal, sink=sink,
+        via="ops",
+    )
+    out_via, lse_via = run_kernel(
+        q, k, v, cu, cu, max_seqlen_q, scale=scale, is_causal=is_causal, sink=sink,
+        via="public",
+    )
+
+    # Same kernel, same args -> bit-identical (cast to fp32 to avoid bf16
+    # element-wise hang in some ROCm builds).
+    do = (out_via.float() - out_direct.float()).abs().max().item()
+    dl = (lse_via.float() - lse_direct.float()).abs().max().item()
+    assert do == 0.0, (
+        f"flash_attn_varlen_func != fmha_fwd_with_sink_varlen_asm "
+        f"(d={head_dim}, causal={is_causal})  max|dO|={do}"
+    )
+    assert dl == 0.0, (
+        f"lse via flash_attn_varlen_func != direct "
+        f"(d={head_dim}, causal={is_causal})  max|dLSE|={dl}"
+    )
 
 
 # ---------------------------------------------------------------------------
