@@ -76,7 +76,7 @@ def gemm_a16w16(
         assert (
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-        from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_a16w16_gfx1250 import (
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
             _KERNEL_MAP,
             create_shared_layouts,
             create_wmma_layouts,
