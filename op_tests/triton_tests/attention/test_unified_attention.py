@@ -644,36 +644,31 @@ def test_triton_unified_attn(
         use_q_descale=use_q_descale,
         use_kv_descale=use_kv_descale,
         use_out_scale=use_out_scale,
-        device="cpu",
+        device="cuda",
     )
 
-    def to_cuda(t):
-        return t.to("cuda") if t is not None else None
-
-    output = to_cuda(output)
     unified_attention(
-        q=to_cuda(query),
-        k=to_cuda(key_cache),
-        v=to_cuda(value_cache),
+        q=query,
+        k=key_cache,
+        v=value_cache,
         out=output,
-        cu_seqlens_q=to_cuda(cu_query_lens),
-        seqused_k=to_cuda(kv_lens),
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
         max_seqlen_q=max_query_len,
         max_seqlen_k=max_kv_len,
         softmax_scale=scale,
         causal=True,
         window_size=window_size,
-        block_table=to_cuda(block_tables),
+        block_table=block_tables,
         softcap=soft_cap if soft_cap is not None else 0,
-        q_descale=to_cuda(q_descale),
-        k_descale=to_cuda(k_descale),
-        v_descale=to_cuda(v_descale),
-        sinks=to_cuda(sinks),
-        output_scale=to_cuda(output_scale),
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        output_scale=output_scale,
         shuffled_kv_cache=shuffled_kv_cache,
     )
 
-    # The reference runs on CPU using the unshuffled KV
     ref_output = ref_paged_attn(
         query=query,
         key_cache=key_cache_orig,
@@ -696,7 +691,7 @@ def test_triton_unified_attn(
     is_fp8 = kv_dtype.itemsize == 1 or q_dtype.itemsize == 1
     if is_fp8:
         atol, rtol = 1.5e-1, 1.5e-1
-    output = output.to(torch.float32).cpu()
+    output = output.to(torch.float32)
     ref_output = ref_output.to(torch.float32)
     if is_fp8 and use_gluon_2d and (use_kv_descale or use_q_descale):
         # For fp8 allow up to 1% of elements to fall outside tolerance.
