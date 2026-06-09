@@ -227,7 +227,8 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     elif kind is OpKind.GEMM:
         from .gemm import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.GROUPED_MOE:
-        from .grouped_moe import DEFAULT_CSVS, parse_csv
+        # from .grouped_moe import DEFAULT_CSVS, parse_csv
+        return []
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
     else:
@@ -244,7 +245,9 @@ def _compile_one(kind: OpKind, job: dict[str, Any]) -> tuple[OpKind, dict[str, A
     elif kind is OpKind.GEMM:
         from .gemm import compile_one_config
     elif kind is OpKind.GROUPED_MOE:
-        from .grouped_moe import compile_one_config
+        # grouped_moe AOT not wired up yet; return trivial result so no
+        # job is ever actually compiled (no jobs are collected either).
+        return kind, {}
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import compile_one_config
     else:
