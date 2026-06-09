@@ -7,23 +7,26 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-import aiter
 import torch
 
+import aiter
+
 # from aiter import get_torch_quant as get_quant
-from aiter import ActivationType, QuantType, dtypes
+from aiter import (
+    ActivationType,
+    QuantType,
+    dtypes,
+    fused_dynamic_mxfp4_quant_moe_sort,
+    fused_dynamic_mxfp8_quant_moe_sort,
+    logger,
+    mxfp4_moe_sort_fwd,
+)
 from aiter import get_hip_quant as get_quant
-from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter import (
-    fused_dynamic_mxfp4_quant_moe_sort,
-    fused_dynamic_mxfp8_quant_moe_sort,
-    mxfp4_moe_sort_fwd,
-)
+from aiter.ops.flydsl.utils import is_flydsl_available
 
 BLOCK_SIZE_M = 32
 
@@ -374,7 +377,7 @@ def fused_moe_(
 
     # Backend opt-in via shuffle_kind tag on w1: tells get_2stage_cfgs to
     # prefer CSV rows tagged with this backend (e.g., "mxfp4_moe") over the
-    # default untagged rows. None / missing attribute → default CSV lookup.
+    # default untagged rows. None / missing attribute -> default CSV lookup.
     shuffle_kind = getattr(w1, "shuffle_kind", None)
 
     metadata = get_2stage_cfgs(
@@ -961,9 +964,9 @@ def _flydsl_stage2_wrapper(
 
 # Kernel names follow the codegen scheme enumerated in
 # csrc/kernels/mxfp4_moe/gemm_a4w4/codegen/gen_instances.py
-# (enumerate_g1_instances / enumerate_g2_instances) — each name uniquely
+# (enumerate_g1_instances / enumerate_g2_instances) -- each name uniquely
 # identifies one template instance (NE / D_HIDDEN / D_INTER / BM / variant).
-# The "E{n}" tag inside the name encodes D_INTER (per-shard inter_dim) —
+# The "E{n}" tag inside the name encodes D_INTER (per-shard inter_dim) --
 # the single-letter "E" is kept for brevity and does NOT mean expert count.
 _MXFP4_G1_KNAME_RE = re.compile(
     r"^mxfp4_moe_g1_a4w4_NE(?P<ne>\d+)_H(?P<h>\d+)_E(?P<d_inter>\d+)"
@@ -993,16 +996,16 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
         # bare _INLINEQUANT = NT (read-once); _INLINEQUANT_CACHED = cached.
         use_nt = m.group("iq_cached") is None
     else:
-        use_nt = variant == "NT"   # BM=32 cshuffle: _NT vs _CACHED
+        use_nt = variant == "NT"  # BM=32 cshuffle: _NT vs _CACHED
     return {
-        "BM":        int(m.group("bm")),
-        "NE":        int(m.group("ne")),
-        "H":         int(m.group("h")),
-        "D_INTER":   int(m.group("d_inter")),
-        "splitk":    sk is not None,
-        "kSplitK":   int(sk) if sk else 0,
+        "BM": int(m.group("bm")),
+        "NE": int(m.group("ne")),
+        "H": int(m.group("h")),
+        "D_INTER": int(m.group("d_inter")),
+        "splitk": sk is not None,
+        "kSplitK": int(sk) if sk else 0,
         "inline_quant": inline_quant,
-        "use_nt":    use_nt,
+        "use_nt": use_nt,
     }
 
 
@@ -1013,18 +1016,18 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
     sk = m.group("sk")
     variant = m.group("variant")
     return {
-        "BM":         int(m.group("bm")),
-        "NE":         int(m.group("ne")),
-        "H":          int(m.group("h")),
-        "D_INTER":    int(m.group("d_inter")),
-        "TOPK":       int(m.group("topk")) if m.group("topk") else None,
-        "splitk":     sk is not None,
-        "kSplitK":    int(sk) if sk else 0,
-        "atomic":     variant == "ATOMIC",
-        "use_nt":     m.group("nt") == "NT",   # non-temporal B load (atomic only)
+        "BM": int(m.group("bm")),
+        "NE": int(m.group("ne")),
+        "H": int(m.group("h")),
+        "D_INTER": int(m.group("d_inter")),
+        "TOPK": int(m.group("topk")) if m.group("topk") else None,
+        "splitk": sk is not None,
+        "kSplitK": int(sk) if sk else 0,
+        "atomic": variant == "ATOMIC",
+        "use_nt": m.group("nt") == "NT",  # non-temporal B load (atomic only)
         # _MXFP4OUT (nonatomic only): gemm2 stages flat_out as packed fp4+e8m0 and
         # scatter_reduce reads it back as mxfp4 (the mxfp4-intermediate path).
-        "mxfp4out":   m.group("mxfp4out") == "MXFP4OUT",
+        "mxfp4out": m.group("mxfp4out") == "MXFP4OUT",
     }
 
 
@@ -1040,10 +1043,18 @@ def _empty_u8(device):
     return torch.empty((0,), dtype=torch.uint8, device=device)
 
 
+def _mxfp4_scale_u8(scale):
+    """FlyDSL ? DLPack ?? fp4/e8m0 dtype code;????? uint8 view(? HIP
+    reinterpret_cast ????)??? uint8 / None ??????"""
+    if scale is not None and scale.element_size() == 1 and scale.dtype != torch.uint8:
+        return scale.view(torch.uint8)
+    return scale
+
+
 def _mxfp4_moe_run(
     hidden_states,
-    w1,            # [E, 2*d_inter, d_hidden] packed MXFP4 (uint8 or float4_e2m1fn_x2)
-    w2,            # [E, d_hidden, d_inter]   packed MXFP4
+    w1,  # [E, 2*d_inter, d_hidden] packed MXFP4 (uint8 or float4_e2m1fn_x2)
+    w2,  # [E, d_hidden, d_inter]   packed MXFP4
     topk_ids,
     topk_weight,
     topk,
@@ -1065,60 +1076,62 @@ def _mxfp4_moe_run(
     q_dtype_a=None,
     q_dtype_w=None,
 ):
-    # ── Parse kernel names + read shapes ──────────────────────────────
+    # -- Parse kernel names + read shapes ------------------------------
     p1 = _parse_mxfp4_g1_kname(kernelName1)
     p2 = _parse_mxfp4_g2_kname(kernelName2)
     BM = p1["BM"]
     inline_quant = p1["inline_quant"]
-    atomic   = p2["atomic"]
+    atomic = p2["atomic"]
     prologue_name = "inline_quant" if inline_quant else "threestage"
 
-    # FlyDSL gemm1 opt-in tag（须在任何 w1.view 之前读，view 后的新对象不带属性）。
+    # FlyDSL gemm1/gemm2 opt-in tag(???? w1/w2.view ???,view ?????????)?
     gemm1_backend = getattr(w1, "gemm1_backend", None)
+    gemm2_backend = getattr(w2, "gemm2_backend", None)
 
     # MXFP4 weights pack 2 nibbles/byte. ATOM may pass float4_e2m1fn_x2;
-    # normalize to uint8 — kernels read raw bytes either way.
+    # normalize to uint8 -- kernels read raw bytes either way.
     if w1.element_size() == 1 and w1.dtype != torch.uint8:
         w1 = w1.view(torch.uint8)
     if w2.element_size() == 1 and w2.dtype != torch.uint8:
         w2 = w2.view(torch.uint8)
 
-    NE       = w1.shape[0]
+    NE = w1.shape[0]
     D_HIDDEN = hidden_states.shape[1]
     # D_INTER == per-shard MoE inter_dim = moe_intermediate_size / TP_size.
     # w1 stacks gate||up along N, so w1.shape[1] = 2 * D_INTER.
-    D_INTER  = w1.shape[1] // 2
+    D_INTER = w1.shape[1] // 2
     M, _ = hidden_states.shape
-    device   = hidden_states.device
+    device = hidden_states.device
 
     if expert_mask is not None:
         raise NotImplementedError("mxfp4_moe: expert_mask (EP) not supported yet")
 
-    # ── max_sorted: tight upper bound on cumsum (sum over experts of
-    #     round_up(count_e, BM)). Drives all sort buffer sizes ─────────────
-    active     = min(NE, M * topk)
+    # -- max_sorted: tight upper bound on cumsum (sum over experts of
+    #     round_up(count_e, BM)). Drives all sort buffer sizes -------------
+    active = min(NE, M * topk)
     cumsum_max = M * topk + active * (BM - 1)
     max_sorted = ((cumsum_max + BM - 1) // BM) * BM
 
-    # ── Path-shared sort buffers ───────────────────────────────────────
-    sorted_token_ids  = torch.empty((max_sorted,),         device=device, dtype=dtypes.i32)
-    sorted_expert_ids = torch.empty((max_sorted // BM,),   device=device, dtype=dtypes.i32)
-    cumsum_tensor     = torch.empty((1,),                  device=device, dtype=dtypes.i32)
-    reverse_sorted    = torch.empty((M * topk,),           device=device, dtype=dtypes.i32)
-    sorted_weights    = torch.empty((max_sorted,),         device=device, dtype=dtypes.fp32)
-    masked_m          = torch.empty((NE,),                 device=device, dtype=dtypes.i32)
-    m_indices         = torch.empty((max_sorted,),         device=device, dtype=dtypes.i32)
+    # -- Path-shared sort buffers ---------------------------------------
+    sorted_token_ids = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
+    sorted_expert_ids = torch.empty(
+        (max_sorted // BM,), device=device, dtype=dtypes.i32
+    )
+    cumsum_tensor = torch.empty((1,), device=device, dtype=dtypes.i32)
+    reverse_sorted = torch.empty((M * topk,), device=device, dtype=dtypes.i32)
+    sorted_weights = torch.empty((max_sorted,), device=device, dtype=dtypes.fp32)
+    masked_m = torch.empty((NE,), device=device, dtype=dtypes.i32)
+    m_indices = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
 
-    # ── Quant buffers. inline_quant path leaves these as placeholders
-    #    (g1's kInlineQuant generates a_q / a_scale itself). ─────────────
-    a_quant = torch.empty((M, D_HIDDEN // 2),  device=device, dtype=torch.uint8)
+    # -- Quant buffers. inline_quant path leaves these as placeholders
+    #    (g1's kInlineQuant generates a_q / a_scale itself). -------------
+    a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
     a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
 
-    # ── Output buffer for atomic mode (pre-zeroed via bf16_zero_out
-    #    plumbed into the sort_quant / sort kernel). ─────────────────────
+    # -- Output buffer for atomic mode (pre-zeroed via bf16_zero_out
+    #    plumbed into the sort_quant / sort kernel). ---------------------
     if atomic:
-        atomic_output_buf = torch.empty(
-            (M, D_HIDDEN), dtype=dtypes.bf16, device=device)
+        atomic_output_buf = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
     else:
         atomic_output_buf = None
 
@@ -1126,76 +1139,106 @@ def _mxfp4_moe_run(
     # parallel with sort / quant. None for non-atomic.
     bf16_zero = atomic_output_buf if atomic else _empty_bf16(device)
 
-    # ── Sort + (optional) quant ───────────────────────────────────────
+    # -- Sort + (optional) quant ---------------------------------------
     if prologue_name == "threestage":
         aiter.mxfp4_moe_sort(
-            topk_ids=topk_ids, topk_weight=topk_weight,
-            sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
-            cumsum_tensor=cumsum_tensor, reverse_sorted=reverse_sorted,
+            topk_ids=topk_ids,
+            topk_weight=topk_weight,
+            sorted_token_ids=sorted_token_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=cumsum_tensor,
+            reverse_sorted=reverse_sorted,
             sorted_weights=sorted_weights,
-            masked_m=masked_m, m_indices=m_indices,
+            masked_m=masked_m,
+            m_indices=m_indices,
             bf16_zero_out=_empty_bf16(device),
             bf16_zero_workspace=_empty_bf16(device),
-            M_logical=M, NE=NE, TOPK=topk,
-            D_HIDDEN=D_HIDDEN, D_INTER=D_INTER, MB=BM,
+            M_logical=M,
+            NE=NE,
+            TOPK=topk,
+            D_HIDDEN=D_HIDDEN,
+            D_INTER=D_INTER,
+            MB=BM,
             prologue=1,
         )
         aiter.mxfp4_moe_quant(
-            a_input=hidden_states, a_quant=a_quant, a_scale=a_scale,
+            a_input=hidden_states,
+            a_quant=a_quant,
+            a_scale=a_scale,
             bf16_zero_out=bf16_zero,
-            NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM,
+            NE=NE,
+            TOPK=topk,
+            D_HIDDEN=D_HIDDEN,
+            MB=BM,
         )
-    else:  # inline_quant: no separate quant launch — gemm1 does it
+    else:  # inline_quant: no separate quant launch -- gemm1 does it
         aiter.mxfp4_moe_sort(
-            topk_ids=topk_ids, topk_weight=topk_weight,
-            sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
-            cumsum_tensor=cumsum_tensor, reverse_sorted=reverse_sorted,
+            topk_ids=topk_ids,
+            topk_weight=topk_weight,
+            sorted_token_ids=sorted_token_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=cumsum_tensor,
+            reverse_sorted=reverse_sorted,
             sorted_weights=sorted_weights,
-            masked_m=masked_m, m_indices=m_indices,
+            masked_m=masked_m,
+            m_indices=m_indices,
             bf16_zero_out=bf16_zero,
             bf16_zero_workspace=_empty_bf16(device),
-            M_logical=M, NE=NE, TOPK=topk,
-            D_HIDDEN=D_HIDDEN, D_INTER=D_INTER, MB=BM,
+            M_logical=M,
+            NE=NE,
+            TOPK=topk,
+            D_HIDDEN=D_HIDDEN,
+            D_INTER=D_INTER,
+            MB=BM,
             prologue=0,
         )
     if prologue_name != "inline_quant":
         padded_rows = ((max_sorted + 31) // 32) * 32
         cols = D_HIDDEN // 32
         a_scale_sorted_shuffled = torch.empty(
-            (padded_rows * cols * 2,), device=device, dtype=torch.uint8)
+            (padded_rows * cols * 2,), device=device, dtype=torch.uint8
+        )
         aiter.mxfp4_moe_sort_scales(
             a_scale=a_scale,
             sorted_token_ids=sorted_token_ids,
             cumsum_tensor=cumsum_tensor,
             a_scale_sorted_shuffled=a_scale_sorted_shuffled,
-            NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, D_INTER=D_INTER,
-            MB=BM, max_sorted=max_sorted,
+            NE=NE,
+            TOPK=topk,
+            D_HIDDEN=D_HIDDEN,
+            D_INTER=D_INTER,
+            MB=BM,
+            max_sorted=max_sorted,
         )
     else:
         # inline_quant: pass a tiny placeholder. gemm1 won't read it.
         a_scale_sorted_shuffled = _empty_u8(device)
 
-    # ── gemm1: A_q × w1 → inter (packed MXFP4, sorted layout) ──────────
+    # -- gemm1: A_q x w1 -> inter (packed MXFP4, sorted layout) ----------
     inter_sorted_quant = torch.empty(
-        (max_sorted, D_INTER // 2), device=device, dtype=torch.uint8)
+        (max_sorted, D_INTER // 2), device=device, dtype=torch.uint8
+    )
     BM_MIN = 64
-    inter_scale_cols   = D_INTER // 32
-    inter_scale_bytes  = max_sorted * (1024 // BM_MIN) * 4
-    inter_scale_rows   = (inter_scale_bytes + inter_scale_cols - 1) // inter_scale_cols
-    inter_scale_rows   = (inter_scale_rows + 31) // 32 * 32
+    inter_scale_cols = D_INTER // 32
+    inter_scale_bytes = max_sorted * (1024 // BM_MIN) * 4
+    inter_scale_rows = (inter_scale_bytes + inter_scale_cols - 1) // inter_scale_cols
+    inter_scale_rows = (inter_scale_rows + 31) // 32 * 32
     inter_sorted_shuffled_scale = torch.empty(
-        (inter_scale_rows, inter_scale_cols), device=device, dtype=torch.uint8)
+        (inter_scale_rows, inter_scale_cols), device=device, dtype=torch.uint8
+    )
 
     if gemm1_backend == "flydsl":
         from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
-        # FlyDSL 经 DLPack 拒绝 fp4/e8m0 dtype code；按裸字节传 uint8 view（与 HIP
-        # reinterpret_cast 字节一致）。仅在本分支 view，HIP 分支保持原样不变。
+        # FlyDSL ? DLPack ?? fp4/e8m0 dtype code;????? uint8 view(? HIP
+        # reinterpret_cast ????)?????? view,HIP ?????????
         w1_scale_u8 = (
             w1_scale.view(torch.uint8)
-            if (w1_scale is not None
+            if (
+                w1_scale is not None
                 and w1_scale.element_size() == 1
-                and w1_scale.dtype != torch.uint8)
+                and w1_scale.dtype != torch.uint8
+            )
             else w1_scale
         )
         flydsl_mxfp4_gemm1(
@@ -1233,106 +1276,194 @@ def _mxfp4_moe_run(
             kernelName=kernelName1,
         )
 
-    # ── gemm2: inter × w2 → flat_out / atomic-added output ─────────────
+    # -- gemm2: inter x w2 -> flat_out / atomic-added output -------------
     if atomic:
         # Atomic path: gemm2 packed-adds into atomic_output_buf with
         # sorted_weights applied inside; scatter_reduce unnecessary.
         out_buf = atomic_output_buf
     else:
-        # ── MXFP4-intermediate path — CSV-driven via a `_MXFP4OUT` g2 kernel ──
+        # -- MXFP4-intermediate path -- CSV-driven via a `_MXFP4OUT` g2 kernel --
         # When the tuned CSV selects `..._BM128_NONATOMIC_MXFP4OUT`, gemm2 stages
         # flat_out as packed fp4 + e8m0 (mxfp4-out epilog) so the scatter_reduce
-        # reads ~3.8x less → ~2.25x on that kernel. The per-expert gemm2 output is
+        # reads ~3.8x less -> ~2.25x on that kernel. The per-expert gemm2 output is
         # quantized to 4-bit BEFORE the topk reduce (lossy), so the CSV only enables
         # it for M buckets where the reduce win beats the gemm2 epilog overhead
-        # (cold full-MoE crossover ≈ M 8192 on Kimi — the CSV is the M-gate). Only
-        # the codegen'd Kimi/DSR nonatomic shapes (NE∈{257,385}, H=7168, E=512) have
+        # (cold full-MoE crossover ? M 8192 on Kimi -- the CSV is the M-gate). Only
+        # the codegen'd Kimi/DSR nonatomic shapes (NE?{257,385}, H=7168, E=512) have
         # the gemm2-mxfp4out + scatter_reduce_q kernels.
         mxfp4out = p2.get("mxfp4out", False)
-        _mx_shape_ok = (BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385))
+        _mx_shape_ok = (
+            BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
+        )
 
-        # DEBUG (AITER_MXFP4_INTERMEDIATE=2): software-sim oracle — gemm2 → bf16,
+        # DEBUG (AITER_MXFP4_INTERMEDIATE=2): software-sim oracle -- gemm2 -> bf16,
         # quant_mxfp4_hip round-trip (the same before-sum 4-bit quant the kernel
-        # does), then the stock bf16 reduce. gsm8k(oracle) == gsm8k(mxfp4out) ⟹ the
+        # does), then the stock bf16 reduce. gsm8k(oracle) == gsm8k(mxfp4out) ? the
         # kernels are correct and any loss is inherent to the before-sum quant.
         if _mx_shape_ok and int(os.environ.get("AITER_MXFP4_INTERMEDIATE", "0")) == 2:
             from aiter.ops.quant import quant_mxfp4_hip
             from aiter.utility import fp4_utils
+
             out_buf = torch.zeros(
-                (max_sorted, D_HIDDEN), dtype=dtypes.bf16, device=device)
+                (max_sorted, D_HIDDEN), dtype=dtypes.bf16, device=device
+            )
             aiter.mxfp4_moe_gemm2_a4w4(
-                cumsum_tensor=cumsum_tensor, inter_sorted_quant=inter_sorted_quant,
+                cumsum_tensor=cumsum_tensor,
+                inter_sorted_quant=inter_sorted_quant,
                 inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
-                w3_shuffled_quant=w2, w3_shuffled_scale=w2_scale,
-                sorted_token_ids=sorted_token_ids, sorted_expert_ids=sorted_expert_ids,
-                sorted_weights=sorted_weights, flat_out=out_buf,
-                M_logical=M, max_sorted=max_sorted,
-                kernelName=kernelName2.replace("_MXFP4OUT", ""))
+                w3_shuffled_quant=w2,
+                w3_shuffled_scale=w2_scale,
+                sorted_token_ids=sorted_token_ids,
+                sorted_expert_ids=sorted_expert_ids,
+                sorted_weights=sorted_weights,
+                flat_out=out_buf,
+                M_logical=M,
+                max_sorted=max_sorted,
+                kernelName=kernelName2.replace("_MXFP4OUT", ""),
+            )
             pk, sc = quant_mxfp4_hip(out_buf, group_size=32)
-            deq = (fp4_utils.mxfp4_to_f32(pk.view(torch.uint8))
-                   * fp4_utils.e8m0_to_f32(sc.view(torch.uint8)).float()
-                       .repeat_interleave(32, dim=-1))
+            deq = fp4_utils.mxfp4_to_f32(pk.view(torch.uint8)) * fp4_utils.e8m0_to_f32(
+                sc.view(torch.uint8)
+            ).float().repeat_interleave(32, dim=-1)
             out_buf = deq.to(dtypes.bf16)
             out = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
             aiter.mxfp4_moe_scatter_reduce(
-                flat_out=out_buf, reverse_sorted=reverse_sorted,
-                sorted_weights=sorted_weights, out=out,
-                NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM)
+                flat_out=out_buf,
+                reverse_sorted=reverse_sorted,
+                sorted_weights=sorted_weights,
+                out=out,
+                NE=NE,
+                TOPK=topk,
+                D_HIDDEN=D_HIDDEN,
+                MB=BM,
+            )
             return out
 
         if mxfp4out and _mx_shape_ok:
             flat_out_q = torch.empty(
-                (max_sorted, D_HIDDEN // 2), dtype=torch.uint8, device=device)
+                (max_sorted, D_HIDDEN // 2), dtype=torch.uint8, device=device
+            )
             flat_out_scale = torch.empty(
-                (max_sorted, D_HIDDEN // 32), dtype=torch.uint8, device=device)
-            aiter.mxfp4_moe_gemm2_a4w4_mxfp4out(
-                cumsum_tensor=cumsum_tensor,
-                inter_sorted_quant=inter_sorted_quant,
-                inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
-                w3_shuffled_quant=w2, w3_shuffled_scale=w2_scale,
-                sorted_expert_ids=sorted_expert_ids,
-                flat_out_q=flat_out_q, flat_out_scale=flat_out_scale,
-                NE=NE, D_HIDDEN=D_HIDDEN, D_INTER=D_INTER, max_sorted=max_sorted)
+                (max_sorted, D_HIDDEN // 32), dtype=torch.uint8, device=device
+            )
+            if gemm2_backend == "flydsl":
+                from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
+
+                flydsl_mxfp4_gemm2(
+                    inter_sorted_quant=inter_sorted_quant,
+                    inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+                    w2_u8=w2,
+                    w2_scale_u8=_mxfp4_scale_u8(w2_scale),
+                    sorted_expert_ids=sorted_expert_ids,
+                    cumsum_tensor=cumsum_tensor,
+                    sorted_token_ids=sorted_token_ids,
+                    sorted_weights=sorted_weights,
+                    flat_out=flat_out_q,
+                    flat_out_scale=flat_out_scale,
+                    M_logical=M,
+                    max_sorted=max_sorted,
+                    BM=p2["BM"],
+                    use_nt=p2["use_nt"],
+                    atomic=False,
+                    mxfp4out=True,
+                    NE=NE,
+                    D_HIDDEN=D_HIDDEN,
+                    D_INTER=D_INTER,
+                    topk=topk,
+                )
+            else:
+                aiter.mxfp4_moe_gemm2_a4w4_mxfp4out(
+                    cumsum_tensor=cumsum_tensor,
+                    inter_sorted_quant=inter_sorted_quant,
+                    inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+                    w3_shuffled_quant=w2,
+                    w3_shuffled_scale=w2_scale,
+                    sorted_expert_ids=sorted_expert_ids,
+                    flat_out_q=flat_out_q,
+                    flat_out_scale=flat_out_scale,
+                    NE=NE,
+                    D_HIDDEN=D_HIDDEN,
+                    D_INTER=D_INTER,
+                    max_sorted=max_sorted,
+                )
             out = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
             aiter.mxfp4_moe_scatter_reduce_q(
-                flat_out_q=flat_out_q, flat_out_scale=flat_out_scale,
-                reverse_sorted=reverse_sorted, sorted_weights=sorted_weights,
-                out=out, NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM)
+                flat_out_q=flat_out_q,
+                flat_out_scale=flat_out_scale,
+                reverse_sorted=reverse_sorted,
+                sorted_weights=sorted_weights,
+                out=out,
+                NE=NE,
+                TOPK=topk,
+                D_HIDDEN=D_HIDDEN,
+                MB=BM,
+            )
             return out
 
-        # `_MXFP4OUT` requested on an unsupported shape → drop it, run bf16.
+        # `_MXFP4OUT` requested on an unsupported shape -> drop it, run bf16.
         if mxfp4out:
             kernelName2 = kernelName2.replace("_MXFP4OUT", "")
 
         # Non-atomic bf16: per-sorted-row staging; scatter_reduce afterwards.
-        out_buf = torch.empty(
-            (max_sorted, D_HIDDEN), dtype=dtypes.bf16, device=device)
+        out_buf = torch.empty((max_sorted, D_HIDDEN), dtype=dtypes.bf16, device=device)
 
-    aiter.mxfp4_moe_gemm2_a4w4(
-        cumsum_tensor=cumsum_tensor,
-        inter_sorted_quant=inter_sorted_quant,
-        inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
-        w3_shuffled_quant=w2,
-        w3_shuffled_scale=w2_scale,
-        sorted_token_ids=sorted_token_ids,
-        sorted_expert_ids=sorted_expert_ids,
-        sorted_weights=sorted_weights,
-        flat_out=out_buf,
-        M_logical=M, max_sorted=max_sorted,
-        kernelName=kernelName2,
-    )
+    if gemm2_backend == "flydsl":
+        from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
+
+        # FlyDSL ? DLPack ?? fp4/e8m0 dtype code;????? uint8 view(? HIP
+        # reinterpret_cast ????)?????? view,HIP ?????????
+        # ????? atomic (BM16/32/64) ? nonatomic bf16 (BM128) ?? epilog?
+        flydsl_mxfp4_gemm2(
+            inter_sorted_quant=inter_sorted_quant,
+            inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+            w2_u8=w2,
+            w2_scale_u8=_mxfp4_scale_u8(w2_scale),
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=cumsum_tensor,
+            sorted_token_ids=sorted_token_ids,
+            sorted_weights=sorted_weights,
+            flat_out=out_buf,
+            M_logical=M,
+            max_sorted=max_sorted,
+            BM=p2["BM"],
+            use_nt=p2["use_nt"],
+            atomic=atomic,
+            mxfp4out=False,
+            NE=NE,
+            D_HIDDEN=D_HIDDEN,
+            D_INTER=D_INTER,
+            topk=topk,
+        )
+    else:
+        aiter.mxfp4_moe_gemm2_a4w4(
+            cumsum_tensor=cumsum_tensor,
+            inter_sorted_quant=inter_sorted_quant,
+            inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+            w3_shuffled_quant=w2,
+            w3_shuffled_scale=w2_scale,
+            sorted_token_ids=sorted_token_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            sorted_weights=sorted_weights,
+            flat_out=out_buf,
+            M_logical=M,
+            max_sorted=max_sorted,
+            kernelName=kernelName2,
+        )
 
     if atomic:
         return out_buf
 
-    # ── scatter_reduce: per-(token, topk-slot) flat_out → per-token out ──
+    # -- scatter_reduce: per-(token, topk-slot) flat_out -> per-token out --
     out = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
     aiter.mxfp4_moe_scatter_reduce(
         flat_out=out_buf,
         reverse_sorted=reverse_sorted,
         sorted_weights=sorted_weights,
         out=out,
-        NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM,
+        NE=NE,
+        TOPK=topk,
+        D_HIDDEN=D_HIDDEN,
+        MB=BM,
     )
     return out
 
@@ -1360,7 +1491,7 @@ def get_2stage_cfgs(
     """
     `shuffle_kind`: if set (e.g., "mxfp4_moe"), prefer CSV rows tagged with
     this backend (`_tag == shuffle_kind`) over the default untagged rows;
-    fall back to untagged on miss. None → current behaviour (untagged only).
+    fall back to untagged on miss. None -> current behaviour (untagged only).
     Used to let a model-specific backend (mxfp4_moe et al.) ship its own
     tuned rows alongside the existing default tuning without dedup conflict.
     """
@@ -1392,7 +1523,7 @@ def get_2stage_cfgs(
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == tag]
         elif tag != "":
-            # CSV has no `_tag` column → no tagged rows exist.
+            # CSV has no `_tag` column -> no tagged rows exist.
             return ({}, {})
 
         # Primary dict: keep original act_type for exact-match lookup.
