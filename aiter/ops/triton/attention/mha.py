@@ -64,7 +64,10 @@ def _flash_attn_forward(
 
     if bias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
-    if window_size_left != -1 or window_size_right != -1:
+    # window_size=(-1, 0) is how TE/Megatron encodes a plain causal mask; causality is
+    # handled by the `causal` flag here, so treat it like full (-1, -1). Only a real
+    # left sliding window (window_size_left >= 0) is genuinely unsupported.
+    if window_size_left != -1 or window_size_right not in (-1, 0):
         raise ValueError("Sliding Window is not supported yet in the Triton Backend")
 
     # FP8

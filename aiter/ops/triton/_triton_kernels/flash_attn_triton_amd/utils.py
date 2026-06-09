@@ -60,6 +60,7 @@ RDNA_ARCHS = frozenset(
         "gfx1151",
         "gfx1200",
         "gfx1201",
+        "gfx1250",
     }
 )
 FP8_ARCHS = frozenset({"gfx942", "gfx950"})
