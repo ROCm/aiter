@@ -334,10 +334,14 @@ def _mla_decode_gluon(
     # split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
     #
     # NEW: floor per_split with the last split absorbing the remainder
-    # (remainder = seq mod NUM_KV_SPLITS, in [0, NUM_KV_SPLITS)). Combined with
-    # the wrapper bound min_kv_seq_len >= NUM_KV_SPLITS this guarantees every
-    # split is non-empty (split_len >= floor >= 1, hence num_iter >= 1); bh64
-    # additionally bounds min_kv_seq_len so num_iter >= 3 for its gl.assume.
+    # (remainder = seq mod NUM_KV_SPLITS, in [0, NUM_KV_SPLITS)). When the caller's
+    # min_kv_seq_len is a true lower bound on cur_batch_seq_len, NUM_KV_SPLITS <=
+    # min_kv_seq_len <= cur_batch_seq_len so every split is non-empty (split_len >=
+    # floor >= 1, hence num_iter >= 1); bh64 additionally bounds min_kv_seq_len so
+    # num_iter >= 3 for its gl.assume. 
+    # When NUM_KV_SPLITS > cur_batch_seq_len, the leading splits become empty 
+    # (floor==0, num_iter==0); the store epilogue emits neutral acc=0/lse=-inf
+    # for those so the stage-2 reduce ignores them.
     # Trade-off: at seqs just above the wrapper minimum the last CU does up to
     # ~(floor + NUM_KV_SPLITS - 1)/floor more work than the others.
     kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
@@ -622,6 +626,9 @@ def _mla_decode_gluon(
     acc *= kv_scale
     rcp = 1.0 / e_sum
     stored_value = (acc * rcp[:, None]).to(dtype)
+
+    if num_iter == 0:
+        stored_value = gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=dtype, layout=mfma_layout)
     if NHEAD < BLOCK_H:
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
     else:
@@ -642,8 +649,11 @@ def _mla_decode_gluon(
     elif NUM_KV_SPLITS > 1:
         # per-split lse for stage-2 reduce.
         offs_mid_lse = cur_batch * stride_mid_lse_b + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_s
-        lse = e_max + gl.log(e_sum)
-        lse = gl.convert_layout(lse, blocked_lse)
+        if num_iter == 0:
+            lse = gl.full([BLOCK_H], float("-inf"), dtype=gl.float32, layout=blocked_lse)
+        else:
+            lse = e_max + gl.log(e_sum)
+            lse = gl.convert_layout(lse, blocked_lse)
         if NHEAD < BLOCK_H:
             gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=(cur_head_lse < NHEAD))
         else:
@@ -683,15 +693,18 @@ def _mla_softmax_reducev_kernel(
     e_max = -float("inf")
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
 
-    # all splits non-empty (floor-with-remainder-on-last), so merge unconditionally.
+    # Splits may be empty when NUM_KV_SPLITS exceeds the seq len.
+    # Stage-1 marks those with lse=-inf; the tl.where guards give them zero weight. 
+    # Both guards are required: split 0 can be the empty one, so e_max starts at 
+    # -inf and an unguarded exp(-inf - (-inf)) = exp(nan) would poison the merge. 
     for split_kv_id in range(0, NUM_KV_SPLITS):
         logits = tl.load(Logits + offs_l + split_kv_id * stride_l_s)
         logits_1 = tl.load(Mid_lse + offs_ml + split_kv_id * stride_ml_s)
 
         n_e_max = tl.maximum(logits_1, e_max)
-        old_scale = tl.exp(e_max - n_e_max)
+        old_scale = tl.where(e_max == -float("inf"), 0.0, tl.exp(e_max - n_e_max))
         acc *= old_scale
-        exp_logic = tl.exp(logits_1 - n_e_max)
+        exp_logic = tl.where(logits_1 == -float("inf"), 0.0, tl.exp(logits_1 - n_e_max))
         acc += exp_logic * logits
 
         e_sum = e_sum * old_scale + exp_logic
