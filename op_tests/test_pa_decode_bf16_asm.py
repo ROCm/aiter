@@ -93,7 +93,7 @@ def make_sched2_metadata(
     qlen_granularity,
     available_tgs,
     device,
-    is_causal=False,
+    is_causal=True,
 ):
     """Python port of sched2 common_ps.h generate_metadata + generate_reduce_info
     (the convention the SP3 PA_DECODE kernel was authored against).
@@ -326,7 +326,18 @@ def ref_pa_decode(
         Kc = K_tm[tok_page, :, tok_off, :]  # [ctx, kv_head, head_dim] raw
         Vc = V_tm[tok_page, :, tok_off, :]  # [ctx, kv_head, head_dim] raw
         for ql in range(qlen):
-            valid = max(min(ctx - mtp + ql, ctx), 1)  # SP3 causal border (no +1)
+            # SP3 causal border (no +1): MTP position ql attends to the first
+            # `ctx - mtp + ql` tokens.  When this is <= 0 the row is FULLY masked
+            # (no valid KV) and the kernel outputs 0 (max-init / L=0 guard).  Do
+            # NOT clamp to a minimum of 1 here: that makes the reference attend to
+            # token 0 and diverge from the GPU for tiny kv_seq_len + mtp>0 (e.g.
+            # kv_seq_len=1, mtp=2 -> MTP rows 0,1 are fully masked: GPU=0, but a
+            # clamped ref would expect V[0]).  The emu host (pa_setNEG_INF_MQA)
+            # masks these rows to 0, which is why the same case passes on emu.
+            valid = min(ctx - mtp + ql, ctx)
+            if valid <= 0:
+                out[b, ql] = 0
+                continue
             q = Qf[b, ql]  # [kv_head, gqa, head_dim] raw
             logits = (
                 torch.einsum("hgd,thd->hgt", q, Kc[:valid]) * s_eff
