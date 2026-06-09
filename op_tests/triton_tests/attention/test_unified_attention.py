@@ -443,7 +443,6 @@ def test_triton_unified_attn_3d(
 
     # TODO: Uncomment after pytorch adds support for manual_seed
     torch.manual_seed(0)
-    num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
 
     (
