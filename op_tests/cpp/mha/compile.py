@@ -12,12 +12,20 @@ from jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_META_DIR  # noqa
 
 FWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}"]
 BWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}"]
+# codegen for ASM FWD with sink (gfx1250 bf16 kernels in hsa/gfx1250/fmha_fwd_bf16/)
+FWD_SINK_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_fwd_bf16 --output_dir {{}}"]
 
 
 def cmdGenFunc_mha_fwd(ck_exclude: bool):
     if ck_exclude:
-        srcs = [f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu"]
-        blob_gen_cmd = []
+        srcs = [
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu",
+            # ASM FWD with sink dispatcher (gfx1250 bf16); provides
+            # fmha_fwd_with_sink_asm C-ABI entry point used by
+            # benchmark_mha_fwd_v3.cpp
+            f"{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_fwd_with_sink.cu",
+        ]
+        blob_gen_cmd = list(FWD_SINK_CODEGEN_CMD)
     else:
         srcs = [
             f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu",
@@ -33,9 +41,13 @@ def cmdGenFunc_mha_fwd(ck_exclude: bool):
     flag_use_v3 = (
         "-DFAV3_ON=1 -DENABLE_CK=0" if ck_exclude else "-DFAV3_ON=1 -DFAV2_ON=1"
     )
+    # Use a separate library name for the CK-excluded (gfx1250 / ASM-only) path
+    # so its JIT blob directory never collides with the full CK build of libmha_fwd.
+    # Both share the compile_mha_fwd entry point but produce distinct .so files.
+    md_name = "libmha_fwd_asm" if ck_exclude else "libmha_fwd"
     return {
         "srcs": srcs,
-        "md_name": "libmha_fwd",
+        "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
         "flags_extra_cc": [flag_use_v3],
         "torch_exclude": True,
