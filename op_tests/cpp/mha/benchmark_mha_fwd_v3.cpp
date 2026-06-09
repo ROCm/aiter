@@ -22,8 +22,15 @@
 //             ignore sink contents; a zero-filled buffer is still passed.
 //
 // Not supported: fp16, group/varlen mode, bias, dropout, sliding-window (non-causal).
+//
+// GPU tensor management:
+//   Uses plain hipMalloc/hipFree (DeviceMem) with manually-filled aiter_tensor_t
+//   descriptors.  AiterTensor from aiter_tensor.h is intentionally NOT used:
+//   that RAII class depends on PyTorch's HIP runtime being pre-initialized,
+//   which is not guaranteed in a standalone C++ host.  An explicit hipInit(0)
+//   at program start ensures a stable HIP context before any hipMalloc calls.
 
-#include "aiter_tensor.h" // AiterTensor, aiter_tensor_t, AiterDtype, HipDeviceGuard
+#include "aiter_enum.h" // AiterDtype enum + AiterDtype_element_size()
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -49,10 +56,36 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
+// aiter_tensor_t: POD descriptor for a GPU tensor.
+// Copied from csrc/include/aiter_tensor.h to avoid pulling in aiter_hip_common.h
+// (which transitively includes ck_tile_shim.h and other headers that are not
+// needed in a standalone C++ host).
+// ---------------------------------------------------------------------------
+
+struct aiter_tensor_t
+{
+    void*       ptr;        // device data pointer
+    std::size_t numel_;     // total number of elements
+    int         ndim;       // number of dimensions (up to 8)
+    int64_t     shape[8];   // size of each dimension
+    int64_t     strides[8]; // stride of each dimension (in elements)
+    AiterDtype  dtype_;     // data type
+    int         device_id;  // GPU device index
+
+    // accessors matching the torch::Tensor API expected by the .cu dispatcher
+    int64_t     size(int i)      const { return (i < 0) ? shape[ndim + i]   : shape[i]; }
+    int64_t     stride(int i)    const { return (i < 0) ? strides[ndim + i] : strides[i]; }
+    void*       data_ptr()       const { return ptr; }
+    std::size_t numel()          const { return numel_; }
+    int         dim()            const { return ndim; }
+    AiterDtype  dtype()          const { return dtype_; }
+    std::size_t element_size()   const { return AiterDtype_element_size(dtype_); }
+};
+
+// ---------------------------------------------------------------------------
 // C-ABI declaration for the ASM FWD with sink entry point.
-// Defined in csrc/py_itfs_cu/asm_fmha_fwd_with_sink.cu, linked via libmha_fwd.so.
-// The AITER_CTYPES_DEFINE_ENTRYPOINT_VOID macro generates an extern "C" int
-// wrapper; returns 0 on success, -1 on error (error string in TLS).
+// Defined in csrc/py_itfs_cu/asm_fmha_fwd_with_sink.cu, linked via libmha_fwd_asm.so.
+// Returns 0 on success, -1 on error (error string in TLS via aiter_get_last_error).
 // ---------------------------------------------------------------------------
 extern "C" int fmha_fwd_with_sink_asm(aiter_tensor_t* q,
                                        aiter_tensor_t* k,
@@ -65,7 +98,7 @@ extern "C" int fmha_fwd_with_sink_asm(aiter_tensor_t* q,
                                        int             return_lse,
                                        hipStream_t     stream);
 
-// TLS error accessors from the same .so (AITER_CTYPES_ERROR_DEF).
+// TLS error accessors (AITER_CTYPES_ERROR_DEF in asm_fmha_fwd_with_sink.cu).
 extern "C" const char* aiter_get_last_error();
 extern "C" void        aiter_clear_last_error();
 
@@ -89,39 +122,117 @@ extern "C" void        aiter_clear_last_error();
 #endif
 
 // ---------------------------------------------------------------------------
+// DeviceMem: simple RAII wrapper for hipMalloc / hipFree.
+// Avoids any dependency on PyTorch or the aiter JIT infrastructure.
+// ---------------------------------------------------------------------------
+
+class DeviceMem
+{
+  public:
+    DeviceMem() = default;
+    explicit DeviceMem(std::size_t bytes) { Realloc(bytes); }
+    ~DeviceMem()
+    {
+        if(buf_)
+            (void)hipFree(buf_);
+    }
+    DeviceMem(const DeviceMem&)            = delete;
+    DeviceMem& operator=(const DeviceMem&) = delete;
+
+    void Realloc(std::size_t bytes)
+    {
+        if(buf_)
+        {
+            HIP_CHECK(hipFree(buf_));
+            buf_ = nullptr;
+        }
+        size_ = bytes;
+        if(bytes > 0)
+            HIP_CHECK(hipMalloc(&buf_, bytes));
+    }
+
+    void ToDevice(const void* src) const
+    {
+        if(src && buf_ && size_)
+            HIP_CHECK(hipMemcpy(buf_, src, size_, hipMemcpyHostToDevice));
+    }
+
+    void FromDevice(void* dst) const
+    {
+        if(dst && buf_ && size_)
+            HIP_CHECK(hipMemcpy(dst, buf_, size_, hipMemcpyDeviceToHost));
+    }
+
+    void SetZero()
+    {
+        if(buf_ && size_)
+            HIP_CHECK(hipMemset(buf_, 0, size_));
+    }
+
+    void*       GetDeviceBuffer() const { return buf_; }
+    std::size_t GetBufferSize()   const { return size_; }
+
+  private:
+    void*       buf_  = nullptr;
+    std::size_t size_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// make_tensor_desc: build a contiguous row-major aiter_tensor_t descriptor.
+// Strides are in elements (not bytes); the dispatcher multiplies by element_size.
+// ---------------------------------------------------------------------------
+
+template <typename... Dims>
+inline aiter_tensor_t make_tensor_desc(void*      ptr,
+                                        AiterDtype dtype,
+                                        int        device_id,
+                                        Dims...    dims)
+{
+    static_assert(sizeof...(dims) <= 8,
+                  "aiter_tensor_t supports at most 8 dimensions");
+    aiter_tensor_t t{};
+    t.ptr       = ptr;
+    t.dtype_    = dtype;
+    t.device_id = device_id;
+    t.ndim      = static_cast<int>(sizeof...(dims));
+
+    const int64_t dim_arr[] = {static_cast<int64_t>(dims)...};
+    t.numel_ = 1;
+    for(int i = 0; i < t.ndim; ++i)
+    {
+        t.shape[i] = dim_arr[i];
+        t.numel_ *= static_cast<std::size_t>(dim_arr[i]);
+    }
+
+    // Row-major contiguous strides in elements (matches PyTorch convention).
+    if(t.ndim > 0)
+    {
+        t.strides[t.ndim - 1] = 1;
+        for(int i = t.ndim - 2; i >= 0; --i)
+            t.strides[i] = t.strides[i + 1] * t.shape[i + 1];
+    }
+    return t;
+}
+
+// ---------------------------------------------------------------------------
 // Dtype <-> float conversions
 // ---------------------------------------------------------------------------
 
 template <typename T>
 inline float to_float(T x);
 template <>
-inline float to_float<float>(float x)
-{
-    return x;
-}
+inline float to_float<float>(float x) { return x; }
 template <>
-inline float to_float<__half>(__half x)
-{
-    return __half2float(x);
-}
+inline float to_float<__half>(__half x) { return __half2float(x); }
 template <>
-inline float to_float<__hip_bfloat16>(__hip_bfloat16 x)
-{
-    return static_cast<float>(x);
-}
+inline float to_float<__hip_bfloat16>(__hip_bfloat16 x) { return static_cast<float>(x); }
 
 template <typename T>
 inline T from_float(float x);
 template <>
-inline float from_float<float>(float x)
-{
-    return x;
-}
+inline float from_float<float>(float x) { return x; }
 template <>
-inline __half from_float<__half>(float x)
-{
-    return __float2half_rn(x);
-}
+inline __half from_float<__half>(float x) { return __float2half_rn(x); }
 template <>
 inline __hip_bfloat16 from_float<__hip_bfloat16>(float x)
 {
@@ -180,20 +291,15 @@ class HostTensor
         const index_t ii[] = {static_cast<index_t>(idxs)...};
         std::size_t   off  = 0;
         for(std::size_t i = 0; i < sizeof...(idxs); ++i)
-            off += static_cast<std::size_t>(ii[i]) * static_cast<std::size_t>(strides_[i]);
+            off += static_cast<std::size_t>(ii[i]) *
+                   static_cast<std::size_t>(strides_[i]);
         return off;
     }
 
     template <typename... Idxs>
-    T& operator()(Idxs... idxs)
-    {
-        return data_[offset(idxs...)];
-    }
+    T& operator()(Idxs... idxs) { return data_[offset(idxs...)]; }
     template <typename... Idxs>
-    const T& operator()(Idxs... idxs) const
-    {
-        return data_[offset(idxs...)];
-    }
+    const T& operator()(Idxs... idxs) const { return data_[offset(idxs...)]; }
 
   private:
     std::vector<index_t> shape_;
@@ -267,8 +373,7 @@ bool check_err(const HostTensor<T>&   out,
         double a = static_cast<double>(to_float<T>(out.data()[i]));
         double b = static_cast<double>(to_float<Ref>(ref.data()[i]));
         double d = std::fabs(a - b);
-        if(d > max_abs)
-            max_abs = d;
+        if(d > max_abs) max_abs = d;
         sq_err += d * d;
         sq_ref += b * b;
         if(d > atol + rtol * std::fabs(b))
@@ -293,9 +398,7 @@ bool check_err(const HostTensor<T>&   out,
 class ArgParser
 {
   public:
-    void insert(const std::string& key,
-                const std::string& def,
-                const std::string& help)
+    void insert(const std::string& key, const std::string& def, const std::string& help)
     {
         if(map_.count(key) == 0)
             map_[key] = def;
@@ -335,10 +438,10 @@ class ArgParser
         return true;
     }
 
-    std::string get_str(const std::string& k) const { return get(k); }
-    int         get_int(const std::string& k) const { return std::stoi(get(k)); }
+    std::string get_str(const std::string& k)   const { return get(k); }
+    int         get_int(const std::string& k)   const { return std::stoi(get(k)); }
     float       get_float(const std::string& k) const { return std::stof(get(k)); }
-    bool        get_bool(const std::string& k) const { return get_int(k) != 0; }
+    bool        get_bool(const std::string& k)  const { return get_int(k) != 0; }
 
   private:
     std::string get(const std::string& k) const
@@ -414,8 +517,7 @@ std::tuple<bool, ArgParser> create_args(int argc, char** argv)
 //   LSE[b,h,m]  = max_total * scale + log(denom)
 //
 // All tensors stored bshd: HostTensor shape [b,s,h,d] or [b,h,s].
-// Accumulation in fp32.
-// GQA: Q head h uses K/V head (h / (nhead / nhead_k)).
+// Accumulation in fp32.  GQA: Q head h uses K/V head (h / (nhead / nhead_k)).
 // ---------------------------------------------------------------------------
 
 template <typename BF16, typename F32>
@@ -436,27 +538,21 @@ void cpu_fwd_ref(
     bool  is_causal,
     bool  has_sink)
 {
-    const int ratio = nhead / nhead_k;
-    // Bottom-right causal: mask n if n > m + (sk - sq).
-    // sq == sk => n > m (standard causal).
-    const int causal_offset = seqlen_k - seqlen_q;
+    const int ratio         = nhead / nhead_k;
+    const int causal_offset = seqlen_k - seqlen_q; // bottom-right causal
 
     for(int b = 0; b < batch; ++b)
     {
         for(int h = 0; h < nhead; ++h)
         {
-            const int hk = h / ratio;
-
-            // Convert sink from AITER post-scale domain to raw logit.
-            const float sink_raw =
-                has_sink
-                    ? (to_float<F32>(sink_host(h)) *
-                       std::sqrt(static_cast<float>(hdim)))
-                    : 0.f;
+            const int   hk       = h / ratio;
+            const float sink_raw = has_sink
+                ? (to_float<F32>(sink_host(h)) * std::sqrt(static_cast<float>(hdim)))
+                : 0.f;
 
             for(int m = 0; m < seqlen_q; ++m)
             {
-                // --- Step 1: S = Q[b,m,h,:] @ K[b,:,hk,:]^T (no scale) ---
+                // Step 1: S = Q[b,m,h,:] @ K[b,:,hk,:]^T  (raw, no scale)
                 std::vector<float> s(seqlen_k);
                 for(int n = 0; n < seqlen_k; ++n)
                 {
@@ -472,46 +568,38 @@ void cpu_fwd_ref(
                     s[n] = acc;
                 }
 
-                // --- Step 2: max_total (including optional sink) ---
+                // Step 2: max_total (with optional sink)
                 float max_total = s[0];
                 for(int n = 1; n < seqlen_k; ++n)
-                    if(s[n] > max_total)
-                        max_total = s[n];
+                    if(s[n] > max_total) max_total = s[n];
                 if(has_sink && sink_raw > max_total)
                     max_total = sink_raw;
 
-                // --- Step 3: unnormalized softmax + denominator ---
-                // Reuse s[] as unnormalized P values.
+                // Step 3: unnormalized softmax + denom; s[] reused as P (unnorm).
                 float denom = 0.f;
                 for(int n = 0; n < seqlen_k; ++n)
                 {
-                    // Masked / -inf positions → 0 (matches kernel behavior).
                     float v = std::isfinite(s[n])
                                   ? std::exp((s[n] - max_total) * scale)
                                   : 0.f;
-                    s[n] = v;
+                    s[n]  = v;
                     denom += v;
                 }
                 if(has_sink)
                     denom += std::exp((sink_raw - max_total) * scale);
+                if(denom == 0.f) denom = 1.f; // guard fully-masked rows
 
-                // Guard fully-masked rows (denom == 0).
-                if(denom == 0.f)
-                    denom = 1.f;
-
-                // --- Step 4: O = P @ V ---
+                // Step 4: O = P @ V
                 for(int dv = 0; dv < hdim; ++dv)
                 {
                     float acc = 0.f;
                     for(int n = 0; n < seqlen_k; ++n)
-                        acc += (s[n] / denom) *
-                               to_float<BF16>(v_host(b, n, hk, dv));
+                        acc += (s[n] / denom) * to_float<BF16>(v_host(b, n, hk, dv));
                     o_ref(b, m, h, dv) = from_float<BF16>(acc);
                 }
 
-                // --- Step 5: LSE = max_total * scale + log(denom) ---
-                lse_ref(b, h, m) =
-                    from_float<F32>(max_total * scale + std::log(denom));
+                // Step 5: LSE = max_total * scale + log(denom)
+                lse_ref(b, h, m) = from_float<F32>(max_total * scale + std::log(denom));
             }
         }
     }
@@ -530,18 +618,15 @@ bool run_bench(const ArgParser& arg)
     const int  batch         = arg.get_int("b");
     int        nhead         = arg.get_int("h");
     int        nhead_k       = arg.get_int("h_k");
-    if(nhead_k < 0)
-        nhead_k = nhead;
+    if(nhead_k < 0) nhead_k = nhead;
     if(nhead % nhead_k != 0)
     {
-        std::cerr << "nhead=" << nhead << " must be a multiple of nhead_k=" << nhead_k
-                  << std::endl;
+        std::cerr << "nhead=" << nhead << " must be a multiple of nhead_k=" << nhead_k << std::endl;
         return false;
     }
     int seqlen_q = arg.get_int("s");
     int seqlen_k = arg.get_int("s_k");
-    if(seqlen_k < 0)
-        seqlen_k = seqlen_q;
+    if(seqlen_k < 0) seqlen_k = seqlen_q;
     const int hdim = arg.get_int("d");
     if(hdim != 64 && hdim != 128)
     {
@@ -556,8 +641,8 @@ bool run_bench(const ArgParser& arg)
     const bool  is_causal = arg.get_bool("causal");
     const float sink_val  = arg.get_float("sink");
 
-    // D64 kernels compile ENABLE_SINK=1: must receive a non-null sink tensor.
-    // D128 kernels compile ENABLE_SINK=0: sink contents ignored; zero buffer is fine.
+    // D64 kernels: ENABLE_SINK=1, must receive a valid (non-null) sink tensor.
+    // D128 kernels: ENABLE_SINK=0, sink contents ignored; zero buffer is fine.
     const bool has_sink = (hdim == 64);
 
     const int init_method = arg.get_int("init");
@@ -569,8 +654,7 @@ bool run_bench(const ArgParser& arg)
     HostTensor<BF16> q_host({batch, seqlen_q, nhead,   hdim});
     HostTensor<BF16> k_host({batch, seqlen_k, nhead_k, hdim});
     HostTensor<BF16> v_host({batch, seqlen_k, nhead_k, hdim});
-    // sink: [nhead] fp32 in AITER post-scale domain
-    HostTensor<F32>  sink_host({nhead});
+    HostTensor<F32>  sink_host({nhead}); // AITER post-scale domain
 
     std::mt19937 eng(static_cast<unsigned>(seed_val));
     if(init_method == 0)
@@ -597,54 +681,65 @@ bool run_bench(const ArgParser& arg)
         fill_constant(k_host, 0.25f);
         fill_constant(v_host, 0.25f);
     }
-    // D64: fill sink with sink_val (same value across all heads for simplicity).
-    // D128: leave zeros; kernel ignores sink contents.
     fill_constant(sink_host, has_sink ? sink_val : 0.f);
 
-    // ---- GPU tensors via AiterTensor ----
-    // AiterTensor::empty() allocates contiguous row-major GPU memory and fills
-    // the aiter_tensor_t descriptor (shape, strides, dtype, device_id) that
-    // fmha_fwd_with_sink_asm reads directly.
+    // ---- GPU buffers (plain hipMalloc via DeviceMem) ----
+    const std::size_t q_bytes    = q_host.bytes();
+    const std::size_t k_bytes    = k_host.bytes();
+    const std::size_t v_bytes    = v_host.bytes();
+    const std::size_t out_bytes  = q_bytes;  // same shape as q
+    const std::size_t lse_bytes  = (std::size_t)batch * nhead * seqlen_q * sizeof(F32);
+    const std::size_t sink_bytes = (std::size_t)nhead * sizeof(F32);
+
+    DeviceMem q_buf(q_bytes);
+    DeviceMem k_buf(k_bytes);
+    DeviceMem v_buf(v_bytes);
+    DeviceMem out_buf(out_bytes);
+    DeviceMem lse_buf(lse_bytes);
+    DeviceMem sink_buf(sink_bytes);
+
+    q_buf.ToDevice(q_host.data());
+    k_buf.ToDevice(k_host.data());
+    v_buf.ToDevice(v_host.data());
+    if(has_sink)
+        sink_buf.ToDevice(sink_host.data());
+    else
+        sink_buf.SetZero();
+
+    // ---- Tensor descriptors (contiguous bshd, strides in elements) ----
     int device_id = 0;
     HIP_CHECK(hipGetDevice(&device_id));
 
-    AiterTensor q_dev   = AiterTensor::empty({batch, seqlen_q, nhead,   hdim},
-                                             AITER_DTYPE_bf16, device_id);
-    AiterTensor k_dev   = AiterTensor::empty({batch, seqlen_k, nhead_k, hdim},
-                                             AITER_DTYPE_bf16, device_id);
-    AiterTensor v_dev   = AiterTensor::empty({batch, seqlen_k, nhead_k, hdim},
-                                             AITER_DTYPE_bf16, device_id);
-    AiterTensor out_dev = AiterTensor::empty({batch, seqlen_q, nhead,   hdim},
-                                             AITER_DTYPE_bf16, device_id);
-    // lse layout required by kernel ABI: [batch, q_head_num, q_seq_len] fp32
-    AiterTensor lse_dev  = AiterTensor::empty({batch, nhead, seqlen_q},
-                                              AITER_DTYPE_fp32, device_id);
-    // sink: [nhead] fp32.  D64 filled with sink_val; D128 zeros (ignored).
-    AiterTensor sink_dev = AiterTensor::zeros({nhead}, AITER_DTYPE_fp32, device_id);
-
-    // Upload inputs to device
-    HIP_CHECK(hipMemcpy(q_dev.data_ptr(),    q_host.data(),
-                        q_host.bytes(),    hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(k_dev.data_ptr(),    k_host.data(),
-                        k_host.bytes(),    hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(v_dev.data_ptr(),    v_host.data(),
-                        v_host.bytes(),    hipMemcpyHostToDevice));
-    if(has_sink)
-        HIP_CHECK(hipMemcpy(sink_dev.data_ptr(), sink_host.data(),
-                            sink_host.bytes(), hipMemcpyHostToDevice));
+    // q/k/v/out shape: [batch, seq, head, hdim]  bshd contiguous
+    aiter_tensor_t q_desc = make_tensor_desc(
+        q_buf.GetDeviceBuffer(), AITER_DTYPE_bf16, device_id,
+        batch, seqlen_q, nhead, hdim);
+    aiter_tensor_t k_desc = make_tensor_desc(
+        k_buf.GetDeviceBuffer(), AITER_DTYPE_bf16, device_id,
+        batch, seqlen_k, nhead_k, hdim);
+    aiter_tensor_t v_desc = make_tensor_desc(
+        v_buf.GetDeviceBuffer(), AITER_DTYPE_bf16, device_id,
+        batch, seqlen_k, nhead_k, hdim);
+    aiter_tensor_t out_desc = make_tensor_desc(
+        out_buf.GetDeviceBuffer(), AITER_DTYPE_bf16, device_id,
+        batch, seqlen_q, nhead, hdim);
+    // lse shape required by kernel ABI: [batch, q_head_num, q_seq_len] fp32
+    aiter_tensor_t lse_desc = make_tensor_desc(
+        lse_buf.GetDeviceBuffer(), AITER_DTYPE_fp32, device_id,
+        batch, nhead, seqlen_q);
+    // sink shape: [q_head_num] fp32
+    aiter_tensor_t sink_desc = make_tensor_desc(
+        sink_buf.GetDeviceBuffer(), AITER_DTYPE_fp32, device_id,
+        nhead);
 
     hipStream_t stream = nullptr; // default (null) stream
 
-    // Lambda that calls the ASM kernel and aborts on error
     auto run_kernel = [&]() {
         aiter_clear_last_error();
         int ret = fmha_fwd_with_sink_asm(
-            &q_dev, &k_dev, &v_dev,
-            &out_dev, &lse_dev, &sink_dev,
-            scale,
-            is_causal ? 1 : 0,
-            1 /*return_lse*/,
-            stream);
+            &q_desc, &k_desc, &v_desc,
+            &out_desc, &lse_desc, &sink_desc,
+            scale, is_causal ? 1 : 0, 1 /*return_lse*/, stream);
         if(ret != 0)
         {
             const char* err = aiter_get_last_error();
@@ -655,40 +750,28 @@ bool run_bench(const ArgParser& arg)
     };
 
     // ---- FLOPs / bandwidth estimate ----
-    // FWD has 2 matrix multiplications per head:
-    //   GEMM0: Q @ K^T  => 2 * sq * sk * hdim MACs
-    //   GEMM1: P @ V    => 2 * sq * sk * hdim MACs
+    // FWD: 2 GEMMs (Q@K^T + P@V), each 2*sq*sk*hdim MACs per head.
     std::size_t flop =
-        4ULL * static_cast<std::size_t>(batch)   *
-               static_cast<std::size_t>(nhead)   *
-               static_cast<std::size_t>(seqlen_q) *
-               static_cast<std::size_t>(seqlen_k) *
-               static_cast<std::size_t>(hdim);
-    if(is_causal)
-        flop /= 2;
+        4ULL * (std::size_t)batch * (std::size_t)nhead *
+               (std::size_t)seqlen_q * (std::size_t)seqlen_k * (std::size_t)hdim;
+    if(is_causal) flop /= 2;
 
     // Bytes: Q + O + LSE per q-head; K + V per kv-head.
     std::size_t num_byte =
-        static_cast<std::size_t>(batch) *
-        (static_cast<std::size_t>(nhead) *
-             (static_cast<std::size_t>(seqlen_q) * hdim * sizeof(BF16)   // Q
-              + static_cast<std::size_t>(seqlen_q) * hdim * sizeof(BF16) // O
-              + static_cast<std::size_t>(seqlen_q) * sizeof(F32))        // LSE
-         + static_cast<std::size_t>(nhead_k) *
-             (static_cast<std::size_t>(seqlen_k) * hdim * sizeof(BF16)   // K
-              + static_cast<std::size_t>(seqlen_k) * hdim * sizeof(BF16))); // V
+        (std::size_t)batch *
+        ((std::size_t)nhead   * ((std::size_t)seqlen_q * hdim * sizeof(BF16)   // Q
+                                + (std::size_t)seqlen_q * hdim * sizeof(BF16)  // O
+                                + (std::size_t)seqlen_q        * sizeof(F32))  // LSE
+        + (std::size_t)nhead_k * ((std::size_t)seqlen_k * hdim * sizeof(BF16)  // K
+                                 + (std::size_t)seqlen_k * hdim * sizeof(BF16))); // V
 
     // ---- Print benchmark header ----
     std::string sink_str =
         has_sink ? (", sink=" + std::to_string(sink_val)) : ", sink=none(D128)";
     std::cout << "[bf16|bshd|causal=" << is_causal << "]"
-              << " b:" << batch
-              << ", h:" << nhead << "/" << nhead_k
-              << ", s:" << seqlen_q << "/" << seqlen_k
-              << ", d:" << hdim
-              << ", scale:" << scale
-              << sink_str
-              << std::flush;
+              << " b:" << batch << ", h:" << nhead << "/" << nhead_k
+              << ", s:" << seqlen_q << "/" << seqlen_k << ", d:" << hdim
+              << ", scale:" << scale << sink_str << std::flush;
 
     // ---- Warmup ----
     for(int i = 0; i < warmup; ++i)
@@ -727,22 +810,18 @@ bool run_bench(const ArgParser& arg)
     // ---- CPU reference ----
     HostTensor<BF16> o_ref  ({batch, seqlen_q, nhead, hdim});
     HostTensor<F32>  lse_ref({batch, nhead,    seqlen_q});
-
     cpu_fwd_ref<BF16, F32>(
-        q_host, k_host, v_host, sink_host,
-        o_ref, lse_ref,
+        q_host, k_host, v_host, sink_host, o_ref, lse_ref,
         batch, nhead, nhead_k, seqlen_q, seqlen_k, hdim,
         scale, is_causal, has_sink);
 
     // ---- Copy kernel outputs to host ----
     HostTensor<BF16> out_got({batch, seqlen_q, nhead, hdim});
     HostTensor<F32>  lse_got({batch, nhead,    seqlen_q});
-    HIP_CHECK(hipMemcpy(out_got.data(), out_dev.data_ptr(),
-                        out_got.bytes(), hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(lse_got.data(), lse_dev.data_ptr(),
-                        lse_got.bytes(), hipMemcpyDeviceToHost));
+    out_buf.FromDevice(out_got.data());
+    lse_buf.FromDevice(lse_got.data());
 
-    // ---- Validate (rtol=atol=1e-2 matching Python test thresholds) ----
+    // ---- Validate (rtol=atol=1e-2, matching Python test thresholds) ----
     const double rtol = 1e-2;
     const double atol = 1e-2;
     bool ok_out = check_err<BF16, BF16>(out_got, o_ref,   "[out]", rtol, atol);
@@ -759,6 +838,12 @@ bool run_bench(const ArgParser& arg)
 
 int main(int argc, char** argv)
 {
+    // Force explicit HIP context creation before any hipMalloc calls.
+    // Without this, the implicit context created inside hipMalloc can be
+    // unreliable in a standalone C++ host (no PyTorch runtime pre-init),
+    // causing later hipMalloc / hipMemcpy calls to fail with illegal-access.
+    HIP_CHECK(hipInit(0));
+
     auto [ok, arg] = create_args(argc, argv);
     if(!ok)
         return -1;

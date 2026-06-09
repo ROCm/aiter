@@ -14,10 +14,11 @@
 #   bash smoke_test_fwd_sink.sh
 #
 # Environment:
-#   AITER_ASM_DIR  -- directory containing the hsa/{arch}/ subdirectory with
-#                     the compiled .co kernel objects.  Typically set to the
-#                     repo root so the kernel loader finds hsa/gfx1250/fmha_fwd_bf16/*.co
-#                     Example: export AITER_ASM_DIR=/path/to/aiter/repo
+#   AITER_ASM_DIR  -- path to the hsa/ directory inside the repo.  The kernel
+#                     loader appends "/<arch>/<co_name>" to locate .co files, so
+#                     this must be the hsa/ dir, NOT the repo root.
+#                     If unset, the script auto-detects it from its own location.
+#                     Example: export AITER_ASM_DIR=/path/to/aiter/hsa
 
 set -e
 
@@ -27,13 +28,22 @@ if [ -z "$EXE" ]; then
     exit 1
 fi
 
+# AITER_ASM_DIR must point to the repo's hsa/ directory so that AiterAsmKernel
+# can locate hsa/gfx1250/fmha_fwd_bf16/*.co at runtime.
+# Auto-detect from the script location (op_tests/cpp/mha → repo root is ../../../).
+if [ -z "$AITER_ASM_DIR" ]; then
+    _SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    _REPO_ROOT=$(cd "$_SCRIPT_DIR/../../.." && pwd)
+    export AITER_ASM_DIR="$_REPO_ROOT/hsa"
+fi
+
 # Quick validation run (low warmup/repeat to keep wall time short).
 COMMON_ARGS="-v=1 -causal=1 -warmup=2 -repeat=3"
 
 echo "============================================================"
 echo " Smoke test: benchmark_mha_fwd_v3 (fmha_fwd_with_sink_asm)"
 echo " EXE: $EXE"
-echo " AITER_ASM_DIR: ${AITER_ASM_DIR:-(unset, using embedded HSA)}"
+echo " AITER_ASM_DIR: $AITER_ASM_DIR"
 echo "============================================================"
 
 run_all() {
