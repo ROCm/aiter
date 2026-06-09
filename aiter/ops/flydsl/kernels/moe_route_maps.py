@@ -22,7 +22,6 @@ order-agnostic within ``[0, counts[e])``.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith
-from flydsl.expr import const_expr
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
@@ -34,23 +33,17 @@ from flydsl.expr import buffer_ops
 BLOCK_THREADS = 256
 
 
-def build_moe_route_maps_module(input_i64=False):
+def build_moe_route_maps_module():
     """Return a JIT launcher computing the route maps in one pass.
-
-    Args:
-        input_i64: When True, ``topk_ids`` is int64 and the kernel truncates
-            to int32 internally. When False (default), ``topk_ids`` must be
-            int32.
 
     Launcher: ``(topk_ids, atomic_buffer, topids_to_rows, rows_to_tokens, numel,
     topk, max_m, grid_blocks, stream=...)``
-      topk_ids       : (numel,)   int32/int64  flattened expert ids
+      topk_ids       : (numel,)   int32  flattened expert ids
       atomic_buffer  : (E,)       int32  per-expert counter, init 0 (mutated ->
                        counts[e] after the run)
       topids_to_rows : (numel,)   int32  out: grouped row per route
       rows_to_tokens : (E*max_m,) int32  out: source token per grouped row
-                       (padding rows are NOT initialised by this kernel;
-                       the downstream scatter-copy uses masked_m to skip them)
+                       (pre-init -1 for padding rows the kernel never writes)
 
     One pass: ``topids_to_rows[i] = slot + e*max_m`` (route -> grouped row) and
     its inverse ``rows_to_tokens[row] = i // topk`` (grouped row -> token).
@@ -58,7 +51,7 @@ def build_moe_route_maps_module(input_i64=False):
 
     @flyc.kernel(name="moe_route_maps")
     def route_maps_kernel(
-        topk_ids: fx.Tensor,  # (numel,) int32/int64
+        topk_ids: fx.Tensor,  # (numel,) int32
         atomic_buffer: fx.Tensor,  # (E,) int32, init 0
         topids_to_rows: fx.Tensor,  # (numel,) int32 out: route -> grouped row
         rows_to_tokens: fx.Tensor,  # (E*max_m,) int32 out: grouped row -> token
@@ -77,11 +70,7 @@ def build_moe_route_maps_module(input_i64=False):
             c_rsrc = buffer_ops.create_buffer_resource(topids_to_rows, max_size=True)
             a_rsrc = buffer_ops.create_buffer_resource(rows_to_tokens, max_size=True)
 
-            if const_expr(input_i64):
-                e_raw = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=T.i64)
-                e = arith.trunci(i32, e_raw)
-            else:
-                e = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
+            e = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
 
             # &atomic_buffer[e] : base address + e*4 bytes -> llvm global ptr
             base_idx = buffer_ops.extract_base_index(atomic_buffer, address_space=1)
@@ -127,8 +116,7 @@ def build_moe_route_maps_module(input_i64=False):
 
         gx = arith.index_cast(T.index, grid_blocks)
         route_maps_kernel(
-            topk_ids, atomic_buffer, topids_to_rows, rows_to_tokens,
-            numel, topk, max_m
+            topk_ids, atomic_buffer, topids_to_rows, rows_to_tokens, numel, topk, max_m
         ).launch(
             grid=(gx, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
