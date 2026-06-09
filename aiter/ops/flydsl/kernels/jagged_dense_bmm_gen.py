@@ -27,6 +27,7 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.runtime.device import get_rocm_arch
 
 # Default tiling (override via the factory args).
 BLOCK_M = 128
@@ -34,6 +35,16 @@ BLOCK_N = 128
 BLOCK_K = 64
 STAGES_A = 2
 THREADS = 256
+
+
+def _use_mfma_k32(arch: str | None = None) -> bool:
+    """CDNA4 (gfx950) has v_mfma_f32_16x16x32_bf16 (twice the K per instruction
+    vs the gfx942 16x16x16 atom). It halves MFMA issue and is ~4-7% faster here,
+    bit-exact. gfx942/MI300 lacks the 32-K atom, so fall back to 16x16x16."""
+    if arch is None:
+        arch = get_rocm_arch()
+    return bool(arch) and arch.lower().startswith("gfx95")
+
 
 # --- HipKittens Algorithm 1 chiplet (XCD) block-ID remap knobs ---
 # MI355X / CDNA4 has 8 XCDs; the hardware routes raw block id `xy` to XCD
@@ -131,12 +142,12 @@ def make_bounded_buffer_tensor(tensor, num_records_bytes):
 
 
 @functools.lru_cache(maxsize=None)
-def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES, N_GROUPS, XCD_C, XCD_W):
+def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES, N_GROUPS, XCD_C, XCD_W, USE_MFMA_K32):
     """Build (and memoize) a launch wrapper specialized to this (N, K, tiling).
     N (output) and K (reduction) are baked in as closure constants. BM_TILES
     (= ceil(max_seq_len/BLOCK_M)) and N_GROUPS are also baked in so the chiplet
     (XCD) block-ID remap dimensions are compile-time; this makes each distinct
-    (shape, XCD_C, XCD_W) memoize its own compiled kernel."""
+    (shape, XCD_C, XCD_W, USE_MFMA_K32) memoize its own compiled kernel."""
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
     # Logical 2D tile grid for the chiplet remap: rows = all M-tiles of all
     # groups stacked (group-major), cols = N column-tiles of one group.
@@ -273,11 +284,20 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
                         thr_sA_s2r[None, None, block_k_iter, read_stage],
                         mma_frag_A_retile[None, None, block_k_iter],
                     )
+                    # K=32 atom: one atom spans tile_K_perm=32, so the fragment K
+                    # dim is FLAT (index by block_k_iter). The K=16 atom packs 2
+                    # atoms per 32-wide perm group -> hierarchical (None, iter).
+                    if fx.const_expr(USE_MFMA_K32):
+                        frag_A_k = mma_frag_A[None, None, block_k_iter]
+                        frag_B_k = mma_frag_B[None, None, block_k_iter, read_stage]
+                    else:
+                        frag_A_k = mma_frag_A[None, None, (None, block_k_iter)]
+                        frag_B_k = mma_frag_B[None, None, (None, block_k_iter), read_stage]
                     fx.gemm(
                         tiled_mma,
                         mma_frag_C,
-                        mma_frag_A[None, None, (None, block_k_iter)],
-                        mma_frag_B[None, None, (None, block_k_iter), read_stage],
+                        frag_A_k,
+                        frag_B_k,
                         mma_frag_C,
                         traversal_order=fx.GemmTraversalOrder.KNM,
                     )
@@ -361,11 +381,21 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
         max_seq_len: int,
         stream: fx.Stream = fx.Stream(None),
     ):
-        tiled_mma = fx.make_tiled_mma(
-            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
-            fx.make_layout((1, 4, 1), (0, 1, 0)),
-            fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
-        )
+        # MFMA atom: CDNA4 (gfx950) uses the 16x16x32 bf16 atom (one 32-wide-K
+        # atom covers tile_K_perm=32 -> K-permute (8,4),(1,8), flat fragment K).
+        # gfx942 falls back to 16x16x16 (2 atoms per 32-wide perm -> (4,4,2)).
+        if fx.const_expr(USE_MFMA_K32):
+            tiled_mma = fx.make_tiled_mma(
+                fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16)),
+                fx.make_layout((1, 4, 1), (0, 1, 0)),
+                fx.make_tile(None, None, fx.make_layout((8, 4), (1, 8))),
+            )
+        else:
+            tiled_mma = fx.make_tiled_mma(
+                fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+                fx.make_layout((1, 4, 1), (0, 1, 0)),
+                fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
+            )
         val_per_thr = 8  # 16B / bf16
         thrs_col = BLOCK_K // val_per_thr
         thrs_row = THREADS // thrs_col
@@ -408,6 +438,7 @@ def jagged_dense_bmm(
     stream: fx.Stream = fx.Stream(None),
     xcd_c: int | None = None,
     xcd_w: int = XCD_W,
+    use_mfma_k32: bool | None = None,
 ):
     """Public entry. Derives N (output) and K (reduction) from the tall dense B
     matrix shape (B_groups * N, K), then dispatches to the per-shape kernel.
@@ -415,7 +446,8 @@ def jagged_dense_bmm(
     xcd_c / xcd_w are the chiplet (XCD) remap knobs (C and W); they are baked
     into the compiled kernel, so each distinct (shape, xcd_c, xcd_w) memoizes a
     separate kernel. xcd_c defaults to a weight-size-dependent value (see the
-    XCD_C_* module constants)."""
+    XCD_C_* module constants). use_mfma_k32 selects the CDNA4 16x16x32 bf16 atom;
+    defaults to auto-detect (on for gfx950, off for gfx942)."""
     N = B.shape[0] // n_groups
     K = B.shape[1]
     # Shape-dependent BLOCK_K: for small reduction K (<=256) a 2-iter K-loop with
@@ -428,6 +460,10 @@ def jagged_dense_bmm(
     # K wants the bigger chunk. Swept per headline shape.
     if xcd_c is None:
         xcd_c = XCD_C_SMALL_K if K <= 256 else XCD_C_LARGE_K
+    if use_mfma_k32 is None:
+        use_mfma_k32 = _use_mfma_k32()
     bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
-    launch = _build_launcher(N, K, BLOCK_M, BLOCK_N, block_k, STAGES_A, THREADS, bm, n_groups, xcd_c, xcd_w)
+    launch = _build_launcher(
+        N, K, BLOCK_M, BLOCK_N, block_k, STAGES_A, THREADS, bm, n_groups, xcd_c, xcd_w, use_mfma_k32
+    )
     return launch(C, A, B, BIAS, SEQ_OFFSETS, n_groups, max_seq_len, stream=stream)
