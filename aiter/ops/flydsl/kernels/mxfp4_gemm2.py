@@ -238,13 +238,15 @@ def compile_gemm2_a4w4_port(
       "nonatomic_mxfp4" -> flat per-sorted-row fp4 (q + e8m0 scale) write (BM128)
     """
     _atomic = epilog == "atomic"
-    # The BM128 non-atomic bf16 epilog uses a hybrid persistent grid (one-shot for
-    # small launches, NUM_CU workgroups grid-striding for large) -- its cheap,
-    # high-occupancy epilog lets cross-tile pipelining hide the next tile's loads.
-    # The atomic and mxfp4out paths stay one-shot: atomic is already faster than
-    # HIP, and mxfp4out's heavy LDS-cshuffle epilog (130KB LDS, 1 block/CU) has no
-    # spare occupancy to benefit from persistence.
-    _persistent = epilog == "nonatomic"
+    # The BM128 non-atomic epilogs use a hybrid persistent grid (one-shot for small
+    # launches, NUM_CU workgroups grid-striding for large). Even though the heavy
+    # mxfp4-out epilog is LDS-bound to 1 block/CU (no occupancy slack), persistence
+    # still wins at large M: it collapses the launch from tens of thousands of
+    # one-shot WGs (each re-running the prologue) to NUM_CU WGs, and lets the
+    # compiler overlap the next tile's A->LDS HBM loads with the current tile's
+    # epilog. This mirrors the prebuilt HIP gemm2 (256 persistent WGs); profiling
+    # showed the old one-shot mxfp4out path ~8-9% slower than HIP at M>=16384.
+    _persistent = epilog in ("nonatomic", "nonatomic_mxfp4")
     kmchunks(BM)
     _slot_bytes = saq_slot_bytes(BM)
     BM * BN
