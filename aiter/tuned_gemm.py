@@ -292,7 +292,7 @@ def gemm_a16w16(
     gfx = get_gfx()
     _no_asm = gfx.startswith("gfx12")
     libtype = config["libtype"]
-    if _no_asm and libtype in ("asm", "skinny", "hipblaslt"):
+    if _no_asm and libtype in ("asm", "skinny", "hipblaslt", "opus"):
         libtype = "torch"
     solution_idx = config["solidx"] if libtype == config.get("libtype") else 0
     solfunc = solMap[libtype]
