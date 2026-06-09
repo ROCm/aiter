@@ -2,7 +2,11 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from ..jit.utils.chip_info import get_gfx
-from ..ops.enum import QuantType, ActivationType
+
+# NOTE: QuantType/ActivationType come from a JIT-compiled C++ module, so importing
+# them at module load triggers a build. That breaks Triton-only mode (no toolchain)
+# where this module is imported purely for its torch dtype constants. They are only
+# needed by str2Dtype/str2ActivationType, so import them lazily inside those.
 from .aiter_types import aiter_dtypes, aiter_tensor_t
 import argparse
 
@@ -123,6 +127,8 @@ def str2Dtype(v):
         elif s in d_dtypes:
             return d_dtypes[s]
         else:
+            from ..ops.enum import QuantType
+
             # Case-insensitive lookup for QuantType
             s_lower = s.lower()
             for name in dir(QuantType):
@@ -142,4 +148,6 @@ def str2Dtype(v):
 
 def str2ActivationType(s):
     """Convert string to ActivationType."""
+    from ..ops.enum import ActivationType
+
     return getattr(ActivationType, s.capitalize())

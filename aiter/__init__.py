@@ -72,6 +72,12 @@ if os.path.isdir(_flydsl_cache) and "FLYDSL_RUNTIME_CACHE_DIR" not in os.environ
 
 if AITER_TRITON_ONLY:
     logger.info("Triton ops only: CK and HIP ops (and their JIT build) are skipped.")
+    # Triton ops reference aiter.dtypes (e.g. ops/triton/quant), so it must be
+    # available here. dtypes only needs torch + chip_info (no CK/HIP build), but
+    # chip_info imports helper modules from jit/utils via sys.path -- normally set
+    # up by jit.core, which is skipped in Triton-only mode, so do it here.
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "jit", "utils"))
+    from .utility import dtypes as dtypes  # noqa: E402
 elif AITER_AOT_IMPORT:
     from .jit import core as core  # noqa: E402
 else:
