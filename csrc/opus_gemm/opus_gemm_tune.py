@@ -1521,7 +1521,6 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with the func/kwargs we provide here.
         bench_func = run_opus_gemm_bench
         perf_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
-        check_rtol, check_atol = 2e-2, 1.0
 
         logger.info(
             "OpusGemmA16W16Tuner: CUDA graph timing via cuda.Event "
@@ -1561,6 +1560,12 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             )
             in_dtype = _dtype_csv_str_to_torch(dtype_str)
             out_dtype = _dtype_csv_str_to_torch(outdtype_str)
+
+            # Gate opus candidates by the same tolerance the other a16w16
+            # solutions use (5e-2 for bf16, 1e-2 otherwise) instead of the
+            # looser hardcoded 2e-2/1.0.
+            check_rtol = 5e-2 if out_dtype == dtypes.bf16 else 1e-2
+            check_atol = check_rtol
 
             # Sanity check: a16w16-family kernels lock the input to bf16 today (the launcher TORCH_CHECKs
             # XQ.dtype()==BFloat16).
