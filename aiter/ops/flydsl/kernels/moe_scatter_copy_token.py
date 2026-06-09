@@ -83,8 +83,10 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
     def scatter_copy_kernel(
         src: fx.Tensor,  # (num_src, row_bytes) uint8
         dst: fx.Tensor,  # (num_dst, row_bytes) uint8
-        dst_src: fx.Tensor,  # (num_dst,) int32  -- src row per dst row, -1=skip
+        dst_src: fx.Tensor,  # (num_dst,) int32  -- src row per dst row
+        masked_m: fx.Tensor,  # (E,) int32  -- valid row count per expert
         num_dst: Int32,
+        max_m: Int32,
     ):
         i32 = T.i32
         cdt = T.i32 if use_dword else T.i8
@@ -93,23 +95,29 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         tid = fx.thread_idx.x
         num_dst_i32 = ArithValue(num_dst)
         bid_i32 = ArithValue(bid)
+        max_m_i32 = ArithValue(max_m)
         n_units_i32 = arith.constant(n_units, type=i32)
         row_stride_i32 = arith.constant(row_stride_elems, type=i32)
 
         dst_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_dst_i32)
         _if_dst = scf.IfOp(dst_valid)
         with ir.InsertionPoint(_if_dst.then_block):
-            map_rsrc = buffer_ops.create_buffer_resource(dst_src, max_size=True)
-            srow = ArithValue(
-                buffer_ops.buffer_load(map_rsrc, bid_i32, vec_width=1, dtype=i32)
+            expert = arith.divui(bid_i32, max_m_i32)
+            slot = ArithValue(bid_i32) - ArithValue(expert) * max_m_i32
+            mm_rsrc = buffer_ops.create_buffer_resource(masked_m, max_size=True)
+            count = ArithValue(
+                buffer_ops.buffer_load(mm_rsrc, expert, vec_width=1, dtype=i32)
             )
-            row_ok = arith.cmpi(CmpIPredicate.sge, srow, arith.constant(0, type=i32))
+            row_ok = arith.cmpi(CmpIPredicate.ult, slot, count)
             _if_row = scf.IfOp(row_ok)
             with ir.InsertionPoint(_if_row.then_block):
+                map_rsrc = buffer_ops.create_buffer_resource(dst_src, max_size=True)
+                srow = ArithValue(
+                    buffer_ops.buffer_load(map_rsrc, bid_i32, vec_width=1, dtype=i32)
+                )
                 src_rsrc = buffer_ops.create_buffer_resource(src, max_size=True)
                 dst_rsrc = buffer_ops.create_buffer_resource(dst, max_size=True)
                 tid_i32 = ArithValue(tid)
-                # Element base of each row, in copy-dtype elements (i32 if dword*, i8 otherwise).
                 src_base = srow * row_stride_i32
                 dst_base = bid_i32 * row_stride_i32
 
@@ -145,7 +153,9 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         src: fx.Tensor,
         dst: fx.Tensor,
         dst_src: fx.Tensor,
+        masked_m: fx.Tensor,
         num_dst: fx.Int32,
+        max_m: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -153,7 +163,7 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
             pass
 
         idx_dst = arith.index_cast(T.index, num_dst)
-        launcher = scatter_copy_kernel(src, dst, dst_src, num_dst)
+        launcher = scatter_copy_kernel(src, dst, dst_src, masked_m, num_dst, max_m)
         launcher.launch(
             grid=(idx_dst, 1, 1),
             block=(BLOCK_THREADS, 1, 1),

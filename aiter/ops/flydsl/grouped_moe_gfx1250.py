@@ -591,6 +591,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             a1_payload,
             None,
             rows_to_tokens,
+            masked_m,
             E,
             max_m,
             grouped_a1=grouped_a1,
