@@ -1073,6 +1073,9 @@ def _mxfp4_moe_run(
     atomic   = p2["atomic"]
     prologue_name = "inline_quant" if inline_quant else "threestage"
 
+    # FlyDSL gemm1 opt-in tag（须在任何 w1.view 之前读，view 后的新对象不带属性）。
+    gemm1_backend = getattr(w1, "gemm1_backend", None)
+
     # MXFP4 weights pack 2 nibbles/byte. ATOM may pass float4_e2m1fn_x2;
     # normalize to uint8 — kernels read raw bytes either way.
     if w1.element_size() == 1 and w1.dtype != torch.uint8:
@@ -1183,19 +1186,52 @@ def _mxfp4_moe_run(
     inter_sorted_shuffled_scale = torch.empty(
         (inter_scale_rows, inter_scale_cols), device=device, dtype=torch.uint8)
 
-    aiter.mxfp4_moe_gemm1_a4w4(
-        cumsum_tensor=cumsum_tensor,
-        a_quant=a_quant,
-        a_scale_sorted_shuffled=a_scale_sorted_shuffled,
-        w12_shuffled_quant=w1,
-        w12_shuffled_scale=w1_scale,
-        sorted_expert_ids=sorted_expert_ids,
-        m_indices=m_indices,
-        inter_sorted_quant=inter_sorted_quant,
-        inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
-        hidden_states=hidden_states,
-        kernelName=kernelName1,
-    )
+    if gemm1_backend == "flydsl":
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
+
+        # FlyDSL 经 DLPack 拒绝 fp4/e8m0 dtype code；按裸字节传 uint8 view（与 HIP
+        # reinterpret_cast 字节一致）。仅在本分支 view，HIP 分支保持原样不变。
+        w1_scale_u8 = (
+            w1_scale.view(torch.uint8)
+            if (w1_scale is not None
+                and w1_scale.element_size() == 1
+                and w1_scale.dtype != torch.uint8)
+            else w1_scale
+        )
+        flydsl_mxfp4_gemm1(
+            a_quant=a_quant,
+            a_scale_sorted_shuffled=a_scale_sorted_shuffled,
+            w1_u8=w1,
+            w1_scale_u8=w1_scale_u8,
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=cumsum_tensor,
+            m_indices=m_indices,
+            inter_sorted_quant=inter_sorted_quant,
+            inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+            hidden_states=hidden_states,
+            n_tokens=M,
+            BM=BM,
+            use_nt=p1["use_nt"],
+            inline_quant=inline_quant,
+            NE=NE,
+            D_HIDDEN=D_HIDDEN,
+            D_INTER=D_INTER,
+            topk=topk,
+        )
+    else:
+        aiter.mxfp4_moe_gemm1_a4w4(
+            cumsum_tensor=cumsum_tensor,
+            a_quant=a_quant,
+            a_scale_sorted_shuffled=a_scale_sorted_shuffled,
+            w12_shuffled_quant=w1,
+            w12_shuffled_scale=w1_scale,
+            sorted_expert_ids=sorted_expert_ids,
+            m_indices=m_indices,
+            inter_sorted_quant=inter_sorted_quant,
+            inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+            hidden_states=hidden_states,
+            kernelName=kernelName1,
+        )
 
     # ── gemm2: inter × w2 → flat_out / atomic-added output ─────────────
     if atomic:
