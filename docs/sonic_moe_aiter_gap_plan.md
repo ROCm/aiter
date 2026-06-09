@@ -108,3 +108,18 @@ Current practical priority:
 3. Promote only verified tuned rows.
 4. Decide between CK/FlyDSL/ASM extension and a new Opus grouped MoE only after
    the bottleneck is stable across shapes.
+
+## Phase 5: ROCprof and Dataflow Prototype
+
+Use `op_tests/op_benchmarks/run_sonic_moe_rocprof.py` to profile the current
+best rows:
+
+```bash
+python op_tests/op_benchmarks/run_sonic_moe_rocprof.py \
+  --output-root /app/yifehuan_temp/data/sonic_moe_mi355_latest/rocprof \
+  --sweep-csv /app/yifehuan_temp/data/sonic_moe_mi355_latest/sonic_moe_mi355_stage_sweep.csv
+```
+
+The runner stores raw rocprofv3 CSVs, command logs, status, and generated
+`rocprof_stage_summary.csv/md` under the selected output root. The current
+MI355X pass is summarized in `docs/sonic_moe_rocprof_dataflow_plan.md`.
