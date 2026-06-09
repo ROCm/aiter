@@ -443,17 +443,30 @@ def jagged_dense_bmm(
     max_seq_len: int,
     stream: fx.Stream = fx.Stream(None),
     xcd_c: int | None = None,
-    xcd_w: int = XCD_W,
+    xcd_w: int | None = None,
     use_mfma_k32: bool | None = None,
+    uniform_seqlen: bool = True,
 ):
     """Public entry. Derives N (output) and K (reduction) from the tall dense B
     matrix shape (B_groups * N, K), then dispatches to the per-shape kernel.
 
     xcd_c / xcd_w are the chiplet (XCD) remap knobs (C and W); they are baked
     into the compiled kernel, so each distinct (shape, xcd_c, xcd_w) memoizes a
-    separate kernel. xcd_c defaults to a weight-size-dependent value (see the
-    XCD_C_* module constants). use_mfma_k32 selects the CDNA4 16x16x32 bf16 atom;
-    defaults to auto-detect (on for gfx950, off for gfx942)."""
+    separate kernel. When left as None they default based on `uniform_seqlen`:
+
+      uniform_seqlen=True  -> weight-size-dependent C (XCD_C_*), W=XCD_W. The
+        remap clusters a group's M-tiles on one XCD's L2 (+~5% on D=512). This is
+        the right default for benchmark/headline shapes where every group has the
+        same number of M-tiles (M_i == max_seq_len).
+      uniform_seqlen=False -> the remap is DISABLED (C=1, W=1, which makes
+        _xcd_remap the exact identity). Under a varlen / skewed M_i distribution
+        (real deployment, M_i ~ 0.95*Uniform(1,max_seq_len)) the remap REGRESSES
+        ~2%: with the per-tile early-exit, clustering a group's M-tiles onto one
+        XCD also clusters its skipped no-op tiles, causing XCD load imbalance,
+        while the hardware's round-robin (identity) spreads real work evenly.
+
+    An explicit xcd_c / xcd_w always overrides the gate. use_mfma_k32 selects the
+    CDNA4 16x16x32 bf16 atom; defaults to auto-detect (on gfx950, off gfx942)."""
     N = B.shape[0] // n_groups
     K = B.shape[1]
     # Shape-dependent BLOCK_K: for small reduction K (<=256) a 2-iter K-loop with
@@ -461,11 +474,15 @@ def jagged_dense_bmm(
     # the deeper BLOCK_K=64 pipeline keeps occupancy and is faster. (BLOCK_K=256
     # is unsafe: the 2-stage double-buffer epilogue mis-accumulates a single tile.)
     block_k = 128 if K <= 256 else BLOCK_K
-    # Weight-size-dependent XCD chunk: small reduction K -> small Dense[b] that
-    # fits one XCD's L2 in a small chunk (large C starves the shared LLC); larger
-    # K wants the bigger chunk. Swept per headline shape.
+    # XCD remap defaults, gated on M_i uniformity (see docstring). Identity
+    # (C=1,W=1) disables the remap for the varlen case where it regresses.
     if xcd_c is None:
-        xcd_c = XCD_C_SMALL_K if K <= 256 else XCD_C_LARGE_K
+        if uniform_seqlen:
+            xcd_c = XCD_C_SMALL_K if K <= 256 else XCD_C_LARGE_K
+        else:
+            xcd_c = 1
+    if xcd_w is None:
+        xcd_w = XCD_W if uniform_seqlen else 1
     if use_mfma_k32 is None:
         use_mfma_k32 = _use_mfma_k32()
     bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
