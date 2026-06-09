@@ -187,3 +187,12 @@ benchmark option:
 If P1 does not move stage2 MFMA or traffic, skip to P2/P3. If P1 helps
 materially, keep the two-stage design and optimize layout before building a
 larger fused kernel.
+
+Status: the sentinel-layout test and `--a2-layout current|sorted` benchmark
+option have been added. The sorted path validates correctness, but because it
+uses an explicit A2 pack plus a generic Triton fp32-atomic stage2, it is slower
+than current CK. The useful result is that Python shape/stride changes are not
+enough: current CK stage2 uses `sorted_token_ids` for both A2 read row and final
+output row. A production sorted-A2 path needs a CK/ASM stage2 variant with
+separate A-row and C-row indexing, followed by a stage1 variant that writes
+sorted A2 directly.

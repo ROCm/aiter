@@ -30,6 +30,7 @@ from bench_sonic_moe_breakdown import (  # noqa: E402
     maybe_int,
     route_stats,
 )
+from sonic_moe_a2_layout import pack_a2_sorted, sorted_stage2_triton  # noqa: E402
 
 import aiter  # noqa: E402
 from aiter.fused_moe import (  # noqa: E402
@@ -82,6 +83,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--a2-layout",
+        choices=["current", "sorted"],
+        default="current",
+        help=(
+            "current uses AITER CK stage2. sorted packs A2 into sorted row order "
+            "and runs an experimental Triton stage2 reader."
+        ),
+    )
+    parser.add_argument("--sorted-stage2-block-n", type=int, default=64)
+    parser.add_argument("--sorted-stage2-block-k", type=int, default=64)
     parser.add_argument(
         "--skip-direct",
         action="store_true",
@@ -181,7 +193,7 @@ def main() -> None:
         f"shape=T{token},H{hidden},I{intermediate},E{experts},K{topk}, "
         f"dtype={dtype}, activation={args.activation.value}, routing={args.routing}, "
         f"rounding_tile={args.rounding_tile}, block_size_m={args.block_size_m}, "
-        f"dispatch_policy={args.dispatch_policy}"
+        f"dispatch_policy={args.dispatch_policy}, a2_layout={args.a2_layout}"
     )
 
     moe, x = _make_moe(
@@ -273,6 +285,8 @@ def main() -> None:
     stage1_ms = None
     stage2_ms = None
     one_stage_ms = None
+    a2_pack_ms = None
+    sorted_stage2_backend = ""
 
     def run_one_stage() -> torch.Tensor:
         s_ids, s_weights, s_expert_ids, n_valid_ids, out_buf = sort_once()
@@ -323,30 +337,63 @@ def main() -> None:
 
         stage1_ms, a2_for_stage2 = bench_cuda(run_stage1, args.warmup, args.iters)
 
-        # Pure stage2 kernel timing. Output is intentionally reused; the final
-        # correctness path below uses a fresh sorting output.
-        stage2_out = (
-            moe_buf
-            if moe_buf.numel() != 0
-            else torch.empty((token, model_dim), dtype=dtype_out, device=x.device)
-        )
+        if args.a2_layout == "sorted":
+            if q_type != QuantType.No:
+                raise ValueError("sorted A2 prototype only supports QuantType.No")
 
-        def run_stage2() -> torch.Tensor:
-            metadata.stage2(
-                a2_for_stage2,
-                w1,
-                w2,
-                sorted_ids,
-                sorted_expert_ids,
-                num_valid_ids,
-                stage2_out,
-                topk,
-                w2_scale=None,
-                a2_scale=None,
-                block_m=block_m,
-                sorted_weights=sorted_weights,
+            a2_pack_ms, a2_for_stage2_sorted = bench_cuda(
+                lambda: pack_a2_sorted(
+                    a2_for_stage2, sorted_ids, num_valid_ids, topk
+                ),
+                args.warmup,
+                args.iters,
             )
-            return stage2_out
+            sorted_stage2_backend = "triton_sorted_atomic_fp32"
+            stage2_out = torch.zeros(
+                (token, model_dim), dtype=torch.float32, device=x.device
+            )
+
+            def run_stage2() -> torch.Tensor:
+                return sorted_stage2_triton(
+                    a2_for_stage2_sorted,
+                    w2,
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    token,
+                    topk,
+                    block_m=block_m,
+                    block_n=args.sorted_stage2_block_n,
+                    block_k=args.sorted_stage2_block_k,
+                    out=stage2_out,
+                )
+
+        else:
+            # Pure stage2 kernel timing. Output is intentionally reused; the final
+            # correctness path below uses a fresh sorting output.
+            stage2_out = (
+                moe_buf
+                if moe_buf.numel() != 0
+                else torch.empty((token, model_dim), dtype=dtype_out, device=x.device)
+            )
+
+            def run_stage2() -> torch.Tensor:
+                metadata.stage2(
+                    a2_for_stage2,
+                    w1,
+                    w2,
+                    sorted_ids,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    stage2_out,
+                    topk,
+                    w2_scale=None,
+                    a2_scale=None,
+                    block_m=block_m,
+                    sorted_weights=sorted_weights,
+                )
+                return stage2_out
 
         stage2_ms, _ = bench_cuda(run_stage2, args.warmup, args.iters)
 
@@ -375,21 +422,42 @@ def main() -> None:
             )
             if out_buf.numel() == 0:
                 out_buf = torch.empty((token, model_dim), dtype=dtype_out, device=x.device)
-            metadata.stage2(
-                a2,
-                w1,
-                w2,
-                s_ids,
-                s_expert_ids,
-                n_valid_ids,
-                out_buf,
-                topk,
-                w2_scale=None,
-                a2_scale=None,
-                block_m=block_m,
-                sorted_weights=s_weights,
-            )
-            stage_out = out_buf
+            if args.a2_layout == "sorted":
+                a2_sorted = pack_a2_sorted(a2, s_ids, n_valid_ids, topk)
+                out_fp32 = torch.zeros(
+                    (token, model_dim), dtype=torch.float32, device=x.device
+                )
+                sorted_stage2_triton(
+                    a2_sorted,
+                    w2,
+                    s_ids,
+                    s_weights,
+                    s_expert_ids,
+                    n_valid_ids,
+                    token,
+                    topk,
+                    block_m=block_m,
+                    block_n=args.sorted_stage2_block_n,
+                    block_k=args.sorted_stage2_block_k,
+                    out=out_fp32,
+                )
+                stage_out = out_fp32.to(dtype_out)
+            else:
+                metadata.stage2(
+                    a2,
+                    w1,
+                    w2,
+                    s_ids,
+                    s_expert_ids,
+                    n_valid_ids,
+                    out_buf,
+                    topk,
+                    w2_scale=None,
+                    a2_scale=None,
+                    block_m=block_m,
+                    sorted_weights=s_weights,
+                )
+                stage_out = out_buf
         torch.cuda.synchronize()
         diff = (direct_out.float() - stage_out.float()).abs()
         max_abs = float(diff.max().item())
@@ -401,6 +469,7 @@ def main() -> None:
         else {
             "moe_sorting_ms": sorting_ms,
             "stage1_ms": stage1_ms,
+            **({"a2_pack_ms": a2_pack_ms} if a2_pack_ms is not None else {}),
             "stage2_ms": stage2_ms,
         }
     )
@@ -432,6 +501,9 @@ def main() -> None:
         print(f"stage1_ms={stage1_ms:.4f}")
     if stage2_ms is not None:
         print(f"stage2_ms={stage2_ms:.4f}")
+    if a2_pack_ms is not None:
+        print(f"a2_pack_ms={a2_pack_ms:.4f}")
+        print(f"sorted_stage2_backend={sorted_stage2_backend}")
     if direct_ms is not None:
         print(f"direct_fused_moe_ms={direct_ms:.4f}")
         print(f"direct_fused_moe_expert_tflops={direct_tflops:.2f}")
@@ -457,6 +529,7 @@ def main() -> None:
         print(f"direct_stage_max_abs={max_abs:.6e}")
         print(f"direct_stage_mean_abs={mean_abs:.6e}")
 
+    effective_stage2_backend = sorted_stage2_backend or meta["stage2_backend"]
     result = {
         "shape": [token, hidden, intermediate, experts, topk],
         "shape_str": f"{token},{hidden},{intermediate},{experts},{topk}",
@@ -466,6 +539,12 @@ def main() -> None:
         "activation": args.activation.value,
         "aiter_activation": str(aiter_activation),
         "routing": args.routing,
+        "a2_layout": args.a2_layout,
+        "a2_pack_ms": a2_pack_ms,
+        "sorted_stage2_backend": sorted_stage2_backend,
+        "effective_stage2_backend": effective_stage2_backend,
+        "sorted_stage2_block_n": args.sorted_stage2_block_n,
+        "sorted_stage2_block_k": args.sorted_stage2_block_k,
         "rounding_tile": args.rounding_tile,
         "dispatch_policy": args.dispatch_policy,
         "cu_num": get_cu_num(),

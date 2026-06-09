@@ -123,3 +123,25 @@ python op_tests/op_benchmarks/run_sonic_moe_rocprof.py \
 The runner stores raw rocprofv3 CSVs, command logs, status, and generated
 `rocprof_stage_summary.csv/md` under the selected output root. The current
 MI355X pass is summarized in `docs/sonic_moe_rocprof_dataflow_plan.md`.
+
+## Phase 6: A2 Layout Prototype
+
+Use `--a2-layout current|sorted` in the stage breakdown or sweep scripts:
+
+```bash
+python op_tests/op_benchmarks/bench_sonic_moe_stage_sweep.py \
+  --shape 32768,4096,512,128,8 \
+  --shape 32768,4096,1024,128,8 \
+  --shape 32768,4096,1024,256,8 \
+  --a2-layout current,sorted \
+  --routing balanced \
+  --block-m 128 \
+  --dispatch-policy 0 \
+  --check-correctness
+```
+
+The sorted path is a correctness/dataflow probe: current CK stage1 writes
+normal A2, the benchmark packs it into sorted row order, then a standalone
+Triton fp32-atomic stage2 consumes sorted A2. It is intentionally not the final
+kernel. The current MI355X result is summarized in
+`docs/sonic_moe_a2_layout_prototype.md`.

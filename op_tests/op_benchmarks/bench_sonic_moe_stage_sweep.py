@@ -21,6 +21,7 @@ RESULT_FIELDS = [
     "shape_str",
     "dtype",
     "activation",
+    "a2_layout",
     "routing",
     "rounding_tile",
     "block_m",
@@ -35,9 +36,16 @@ RESULT_FIELDS = [
     "stage_sum_expert_tflops",
     "stage_over_direct",
     "sorting_plus_stage_gap_ms",
+    "direct_stage_max_abs",
+    "direct_stage_mean_abs",
     "moe_sorting_ms",
     "stage1_ms",
     "stage2_ms",
+    "a2_pack_ms",
+    "sorted_stage2_backend",
+    "effective_stage2_backend",
+    "sorted_stage2_block_n",
+    "sorted_stage2_block_k",
     "one_stage_ms",
     "bottleneck",
     "bottleneck_share",
@@ -109,6 +117,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shape", action="append", default=None, help="T,H,I,E,K")
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument("--activation", default="swiglu")
+    parser.add_argument("--a2-layout", default="current")
+    parser.add_argument("--sorted-stage2-block-n", type=int, default=64)
+    parser.add_argument("--sorted-stage2-block-k", type=int, default=64)
     parser.add_argument("--routing", default="topk,rounded,balanced")
     parser.add_argument("--block-m", default="auto,32,64,128")
     parser.add_argument("--dispatch-policy", default="0")
@@ -179,6 +190,7 @@ def _run_one(
     ksplit: str | None,
     use_nt: str | None,
     ck_sorting: str | None,
+    a2_layout: str,
     args: argparse.Namespace,
 ) -> tuple[dict[str, Any], str]:
     env = os.environ.copy()
@@ -200,6 +212,12 @@ def _run_one(
         args.dtype,
         "--activation",
         args.activation,
+        "--a2-layout",
+        a2_layout,
+        "--sorted-stage2-block-n",
+        str(args.sorted_stage2_block_n),
+        "--sorted-stage2-block-k",
+        str(args.sorted_stage2_block_k),
         "--routing",
         routing,
         "--block-size-m",
@@ -233,6 +251,7 @@ def _run_one(
         "shape_str": shape,
         "dtype": args.dtype,
         "activation": args.activation,
+        "a2_layout": a2_layout,
         "routing": routing,
         "block_m": block_m,
         "dispatch_policy": dispatch_policy,
@@ -280,6 +299,7 @@ def _best_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             tuple(row.get("shape", [])),
             row.get("dtype"),
             row.get("activation"),
+            row.get("a2_layout", "current"),
             row.get("routing"),
         )
         prev = best.get(key)
@@ -330,13 +350,14 @@ def _print_best(rows: list[dict[str, Any]]) -> None:
     ok.sort(key=lambda row: float(row["stage_sum_ms"]))
     print("\nBEST")
     print(
-        "rank shape routing block_m policy ksplit_env use_nt ck_sorting "
-        "direct_ms stage_ms tflops bottleneck share tile_eff a2_rw_mib"
+        "rank shape a2_layout routing block_m policy ksplit_env use_nt ck_sorting "
+        "direct_ms stage_ms pack_ms tflops bottleneck share tile_eff a2_rw_mib"
     )
     for idx, row in enumerate(ok[:20], start=1):
         print(
             f"{idx} "
             f"{row.get('shape_str')} "
+            f"{row.get('a2_layout', 'current')} "
             f"{row.get('routing')} "
             f"{row.get('block_m')} "
             f"{row.get('dispatch_policy')} "
@@ -345,6 +366,7 @@ def _print_best(rows: list[dict[str, Any]]) -> None:
             f"{row.get('ck_sorting_env')} "
             f"{_fmt(row.get('direct_fused_moe_ms'))} "
             f"{_fmt(row.get('stage_sum_ms'))} "
+            f"{_fmt(row.get('a2_pack_ms'))} "
             f"{_fmt(row.get('stage_sum_expert_tflops'), 2)} "
             f"{row.get('bottleneck', 'NA')} "
             f"{_fmt(row.get('bottleneck_share'), 3)} "
@@ -360,6 +382,7 @@ def main() -> None:
         "32768,4096,1024,128,8",
     ]
     routings = _csv(args.routing)
+    a2_layouts = _csv(args.a2_layout)
     block_ms = _csv(args.block_m)
     dispatch_policies = _csv(args.dispatch_policy)
     ksplit_values = _env_values(args.ksplit)
@@ -373,6 +396,7 @@ def main() -> None:
     for idx, combo in enumerate(
         product(
             shapes,
+            a2_layouts,
             routings,
             block_ms,
             dispatch_policies,
@@ -382,10 +406,10 @@ def main() -> None:
         ),
         start=1,
     ):
-        shape, routing, block_m, dispatch_policy, ksplit, use_nt, ck_sorting = combo
+        shape, a2_layout, routing, block_m, dispatch_policy, ksplit, use_nt, ck_sorting = combo
         print(
             "RUN "
-            f"{idx} shape={shape} routing={routing} block_m={block_m} "
+            f"{idx} shape={shape} a2_layout={a2_layout} routing={routing} block_m={block_m} "
             f"policy={dispatch_policy} ksplit={ksplit or 'default'} "
             f"use_nt={use_nt or 'default'} ck_sorting={ck_sorting or 'default'}",
             flush=True,
@@ -398,12 +422,13 @@ def main() -> None:
             ksplit,
             use_nt,
             ck_sorting,
+            a2_layout,
             args,
         )
         if args.log_dir is not None:
             log_name = (
                 f"{idx:04d}_{shape.replace(',', 'x')}_{routing}_"
-                f"bm{block_m}_p{dispatch_policy}_ks{ksplit or 'd'}_"
+                f"a2{a2_layout}_bm{block_m}_p{dispatch_policy}_ks{ksplit or 'd'}_"
                 f"nt{use_nt or 'd'}_cks{ck_sorting or 'd'}.log"
             )
             log_path = args.log_dir / log_name
@@ -417,6 +442,7 @@ def main() -> None:
                 "  "
                 f"direct_ms={_fmt(result.get('direct_fused_moe_ms'))} "
                 f"stage_ms={_fmt(result.get('stage_sum_ms'))} "
+                f"pack_ms={_fmt(result.get('a2_pack_ms'))} "
                 f"tflops={_fmt(result.get('stage_sum_expert_tflops'), 2)} "
                 f"bottleneck={result.get('bottleneck')} "
                 f"share={_fmt(result.get('bottleneck_share'), 3)} "
@@ -434,7 +460,7 @@ def main() -> None:
         tuned_rows = [
             _tuned_row(row, args.active_tuned_rows)
             for row in _best_rows(results)
-            if row.get("shape")
+            if row.get("shape") and row.get("a2_layout", "current") == "current"
         ]
         _write_csv(args.tuned_csv, tuned_rows, TUNED_FMOE_FIELDS)
         print(f"wrote_tuned_csv={args.tuned_csv}")
