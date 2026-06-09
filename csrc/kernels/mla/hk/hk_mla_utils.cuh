@@ -116,8 +116,8 @@ struct HkMlaV32DecodeFwdParams
 
 // V4.0 traits: NOPE and ROPE live in separate buffers (FP8 NOPE + BF16 ROPE on
 // both Q and KV sides). The Q/KV NOPE buffer is *packed* per V4 layout into
-// kQkPackedNopeBytes bytes per token (NOPE 448 + duplicated E8M0 scale 16 +
-// padding). ROPE retains its native 64-element BF16 layout.
+// kQkPackedNopeBytes bytes per token (NOPE 448 + duplicated E8M0 scale 14 +
+// unused trailing pad). ROPE retains its native 64-element BF16 layout.
 template <typename q_nope_t_,
           typename q_rope_t_,
           typename kv_nope_t_,
@@ -142,12 +142,15 @@ struct HkMlaV40DecodeFwdTraits
     static constexpr int32_t kQkRopeHeadDim = 64;
     static constexpr int32_t kQkHeadDim     = kQkNopeHeadDim + kQkRopeHeadDim;
     static constexpr int32_t kVoHeadDim     = kQkHeadDim;
-    // V4 NOPE on-disk packing: NOPE 448 FP8 + dup-E8M0 16 + zero pad 112 = 576
-    // bytes per token. Stored in a buffer whose element type is q_nope_t_, so
-    // the trailing-axis element count = 576 / sizeof(q_nope_t_). For FP8 that
-    // is 576 elements; for any future widening we still express the layout as
-    // a byte budget here.
-    static constexpr int32_t kQkPackedNopeBytes = 576;
+    // V4 NOPE on-disk packing: NOPE 448 FP8 + dup-E8M0 14 (= 448/32 byte slots,
+    // one per 32-elt sub-tile; scales[2i] == scales[2i+1] because the actual
+    // quant tile is 64 elts) + unused trailing 50 B (contents undefined --
+    // the kernel never reads bytes [462, 512)) = 512 bytes per token. Stored
+    // in a buffer whose element type is q_nope_t_, so the trailing-axis
+    // element count = 512 / sizeof(q_nope_t_). For FP8 that is 512 elements;
+    // for any future widening we still express the layout as a byte budget
+    // here.
+    static constexpr int32_t kQkPackedNopeBytes = 512;
     static_assert(kQkPackedNopeBytes % sizeof(q_nope_t_) == 0,
                   "kQkPackedNopeBytes must be a multiple of sizeof(q_nope_t_).");
     static_assert(kQkPackedNopeBytes % sizeof(kv_nope_t_) == 0,

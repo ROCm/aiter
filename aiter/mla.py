@@ -548,13 +548,13 @@ def mla_decode_fwd(
 # V4.0 layout constants (mirrored from op_tests/test_mla_v4_persistent.py).
 _V40_DIM_NOPE = 448
 _V40_DIM_ROPE = 64
-_V40_DIM_QK_PACKED = 576  # NOPE 448 + dup-E8M0 16 + zero pad 112
+_V40_DIM_QK_PACKED = 512  # NOPE 448 + dup-E8M0 14 + unused trailing pad 50
 
 
 def mla_v40_decode_fwd(
-    q,  # [total_q, nhead, 576]                         FP8 (NOPE+scale+pad)
+    q,  # [total_q, nhead, 512]                         FP8 (NOPE+scale+pad)
     q_rope,  # [total_q, nhead, 64]                          BF16
-    kv_buffer,  # [num_page, page_size, 1, 576]                 FP8
+    kv_buffer,  # [num_page, page_size, 1, 512]                 FP8
     kv_buffer_rope,  # [num_page, page_size, 1, 64]                  BF16
     o,  # [total_q, nhead, 512]                         BF16
     qo_indptr,

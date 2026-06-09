@@ -10,8 +10,9 @@ the kernel comparison can be wired in once available).
 
 V4 layout per token (logical):
   - nope:  448 elements, FP8 (e4m3fnuz on gfx94x, e4m3fn on gfx95x)
-  - scale:   7 active E8M0 scales (1 per 64 nope elements) padded to 8
-             uint8 bytes (bpad8). The kernel reads these bytes directly via
+  - scale:   7 E8M0 scales (1 per 64-elt quant tile), stored duplicated
+             as 14 uint8 bytes (scale[2i]==scale[2i+1]; kernel reads at
+             /32 granularity). Consumed by
              v_mfma_scale_f32_{16x16x128,32x32x64}_f8f6f4 (byte B -> 2^(B-127)).
   - rope:   64 elements, BF16
   - d_qk = 448 + 64 = 512
@@ -51,27 +52,23 @@ V4_DIM_ROPE = 64  # BF16 rope elements per token
 V4_DIM_QK = V4_DIM_NOPE + V4_DIM_ROPE  # 512
 V4_DIM_V = V4_DIM_QK  # PV uses the full nope+rope slice
 V4_TILE = 64  # nope elements covered by one ue8m0 scale
-V4_NUM_TILES = V4_DIM_NOPE // V4_TILE  # 7   (active scales)
-# ASM kernel stores scales bpad8: kDimScale = kDimNope/64 + 1 = 8 slots per
-# token, with the last slot zero-padded. See /jruan/doc/hw_ss_team_test/kl/mla/
-# mla_v4.h:17 (`kDimScale = 8`) and :146 (`(kDimNope/64 + 1)` indexing).
-V4_DIM_SCALE = V4_NUM_TILES + 1  # 8   (storage slots, "bpad8")
-# Packed Q/KV layout the ASM kernel actually reads (one FP8 byte per element):
-#   stride per token = args.dim(512) + args.k_rotary(64) = 576 bytes
+V4_NUM_TILES = V4_DIM_NOPE // V4_TILE  # 7   (active scales: one per 64-elt quant tile)
+# Storage granularity is half the quant tile -- 32 elts per byte slot -- with
+# scale[2i] == scale[2i+1] (the "duplicate" pattern; consumer reads the byte
+# at (col/32) and always gets the correct per-64-tile scale). No bpad: the
+# 14 = 448/32 byte slots fit exactly, no padding inside the scale region.
+V4_DIM_SCALE_DUP = V4_DIM_NOPE // (V4_TILE // 2)  # 14 bytes (post-duplicate_each)
+# Packed Q/KV layout the kernel reads (one FP8 byte per element):
+#   stride per token = 512 bytes
 #   bytes [0   , 448): NOPE FP8 (kDimNope)
-#   bytes [448 , 464): E8M0 scales duplicated (kDimScale*2 = 16; each bpad8 byte
-#                      written twice -- mirrors poc_kl `duplicate_each`)
-#   bytes [464 , 512): zero pad (48 bytes; fills out kDimNope+kDimRope=512)
-#   bytes [512 , 576): zero pad (64 bytes; "over-copy" region from poc_kl's
-#                      hipMemcpy past buf_size_Q -- we zero-fill for determinism)
-# See /jruan/doc/hw_ss_team_test/kl/mla/mla_v4.h:245 (`duplicate_each`) and :290
-# (`concat_buffers_fast(... kDimScale*2)`); also op_tests/test_mla_v4_nm.py
-# (DIM_QK_PACKED=576) and op_tests/test_mla_v4_nm_golden.py docstring.
-V4_DIM_QK_PACKED = 576
-V4_DIM_SCALE_DUP = V4_DIM_SCALE * 2  # 16 bytes (post-duplicate_each)
+#   bytes [448 , 462): 14 duplicated E8M0 scales (one byte per 32-elt sub-tile;
+#                      scale[2i] == scale[2i+1] since the actual quant is per-64)
+#   bytes [462 , 512): 50 bytes unused trailing pad (contents undefined --
+#                      the kernel never reads this region)
+V4_DIM_QK_PACKED = 512
 V4_PACK_OFF_NOPE = 0
 V4_PACK_OFF_SCALE = V4_DIM_NOPE  # 448
-V4_PACK_OFF_PAD = V4_DIM_NOPE + V4_DIM_SCALE_DUP  # 464
+V4_PACK_OFF_PAD = V4_DIM_NOPE + V4_DIM_SCALE_DUP  # 462
 # FP8 |max| differs between archs: e4m3fn (gfx95x) = 448, e4m3fnuz (gfx94x) = 240.
 # The sglang reference uses 448 (assumes e4m3fn); we look it up from torch.finfo
 # so the per-tile scale lands inside the representable range on either arch.
@@ -175,13 +172,13 @@ def quantize_v4_nope_bpad8(
     nope_fp32: torch.Tensor,  # [..., V4_DIM_NOPE]
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Per-tile (64 elt) E8M0 quantization with bpad8 storage. Returns
-    (nope_fp8, scale_e8m0_bpad8, nope_dq_bf16):
+    Per-tile (64 elt) E8M0 quantization. Returns (nope_fp8, scale_e8m0,
+    nope_dq_bf16):
       - nope_fp8: [..., 448]  FP8
-      - scale_e8m0_bpad8: [..., 8]  uint8 E8M0 bytes (7 active + 1 zero pad);
-        the kernel feeds these directly to v_mfma_scale_f32_*_f8f6f4.
+      - scale_e8m0: [..., 7]  uint8 E8M0 bytes (one per 64-elt quant tile).
+        The packer below duplicates each byte to land 14 bytes in the
+        on-disk record (kernel reads at /32 granularity).
       - nope_dq_bf16: [..., 448]  bf16 round-trip the BF16 MFMA actually sees.
-    Mirrors `fp8e4m3_mul_fp8e8m0_bpad8_to_bf16` in mla_v4.h:124.
     """
     fp8_amax = float(torch.finfo(dtypes.fp8).max)
     leading = nope_fp32.shape[:-1]
@@ -195,12 +192,8 @@ def quantize_v4_nope_bpad8(
         .reshape(*leading, V4_DIM_NOPE)
     )
 
-    # Pack to uint8 E8M0 with bpad8 (8 bytes/token, last slot = 0).
-    active_scale_e8m0 = fp32_pow2_to_e8m0(active_scale_pow2)  # [..., 7] uint8
-    scale_e8m0 = torch.zeros(
-        (*leading, V4_DIM_SCALE), dtype=torch.uint8, device=nope_fp32.device
-    )
-    scale_e8m0[..., :V4_NUM_TILES] = active_scale_e8m0
+    # Pack to uint8 E8M0 (7 bytes/token, one per quant tile).
+    scale_e8m0 = fp32_pow2_to_e8m0(active_scale_pow2)  # [..., 7] uint8
 
     nope_dq_bf16 = (
         (
@@ -230,13 +223,11 @@ def quantize_v4_q(
 
 
 # ---------------------------------------------------------------------------
-# Kernel-shaped (packed) Q/KV layout. Mirrors poc_kl
-# `v4_detail::init_host_buffers` (mla_v4.h:250) which builds the 576-byte/token
-# tensor the ASM kernel reads via:
-#   1. duplicate_each(descale_*_new) -> descale_*_450  (8 -> 16 bytes/token)
-#   2. concat(NOPE, descale_*_450)                     -> 448 + 16 = 464 bytes
-#   3. concat(step2, zeros)                            -> 464 + 48 = 512 bytes
-#   4. allocate full 576-byte stride; trailing 64 bytes are unused over-copy
+# Kernel-shaped (packed) Q/KV layout, 512 bytes per token:
+#   1. NOPE                              -> 448 bytes
+#   2. duplicate_each(scale_e8m0)        -> 14 bytes (7 scales x 2 dup)
+#   3. unused trailing pad               -> 50 bytes (contents undefined)
+# Total: 448 + 14 + 50 = 512 bytes/token.
 # ---------------------------------------------------------------------------
 def _duplicate_each_lastdim(x: torch.Tensor) -> torch.Tensor:
     """[..., N] -> [..., 2*N] with each element written twice; mirrors
@@ -246,14 +237,16 @@ def _duplicate_each_lastdim(x: torch.Tensor) -> torch.Tensor:
 
 def pack_v4_nope_scale(
     nope_fp8: torch.Tensor,  # [..., 448]   FP8 (1 byte/elem)
-    scale_e8m0_bpad8: torch.Tensor,  # [..., 8]     uint8 E8M0 (bpad8)
+    scale_e8m0: torch.Tensor,  # [..., 7]    uint8 E8M0 (one byte per 64-elt quant tile)
 ) -> torch.Tensor:
-    """Pack NOPE + duplicated E8M0 scale + zero pad into a single 576-byte
-    per-token FP8 tensor matching the ASM kernel's read stride."""
+    """Pack NOPE + duplicated E8M0 scale into a single 512-byte per-token FP8
+    tensor matching the kernel's read stride. The 7 input scale bytes are
+    written twice each (14 bytes total) so the kernel can read at /32
+    granularity. Trailing 50 bytes are unused (contents undefined)."""
     leading = nope_fp8.shape[:-1]
     assert nope_fp8.shape[-1] == V4_DIM_NOPE
-    assert scale_e8m0_bpad8.shape[-1] == V4_DIM_SCALE
-    assert scale_e8m0_bpad8.shape[:-1] == leading
+    assert scale_e8m0.shape[-1] == V4_NUM_TILES
+    assert scale_e8m0.shape[:-1] == leading
 
     packed = torch.zeros(
         (*leading, V4_DIM_QK_PACKED), dtype=torch.uint8, device=nope_fp8.device
@@ -262,26 +255,26 @@ def pack_v4_nope_scale(
         torch.uint8
     )
     packed[..., V4_PACK_OFF_SCALE : V4_PACK_OFF_SCALE + V4_DIM_SCALE_DUP] = (
-        _duplicate_each_lastdim(scale_e8m0_bpad8)
+        _duplicate_each_lastdim(scale_e8m0)
     )
-    # bytes [V4_PACK_OFF_PAD:V4_DIM_QK_PACKED] left zero (48 + 64 over-copy).
+    # bytes [V4_PACK_OFF_PAD:V4_DIM_QK_PACKED] left uninitialized (50 bytes).
     return packed.view(dtypes.fp8)
 
 
 def unpack_v4_nope_scale(
-    packed: torch.Tensor,  # [..., 576]   FP8
+    packed: torch.Tensor,  # [..., 512]   FP8
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Inverse of pack_v4_nope_scale; recovers (nope_fp8, scale_e8m0_bpad8).
+    """Inverse of pack_v4_nope_scale; recovers (nope_fp8, scale_e8m0).
     Reads the *first* of each duplicated scale byte pair."""
     pb = packed.view(torch.uint8)
     nope_fp8 = pb[..., V4_PACK_OFF_NOPE : V4_PACK_OFF_NOPE + V4_DIM_NOPE].view(
         packed.dtype
     )
     scale_dup = pb[..., V4_PACK_OFF_SCALE : V4_PACK_OFF_SCALE + V4_DIM_SCALE_DUP]
-    scale_e8m0_bpad8 = scale_dup.reshape(*scale_dup.shape[:-1], V4_DIM_SCALE, 2)[
+    scale_e8m0 = scale_dup.reshape(*scale_dup.shape[:-1], V4_NUM_TILES, 2)[
         ..., 0
     ].contiguous()
-    return nope_fp8, scale_e8m0_bpad8
+    return nope_fp8, scale_e8m0
 
 
 def init_v4_kv_cache(
@@ -291,15 +284,14 @@ def init_v4_kv_cache(
     """
     Build a paged KV cache from a single fp32 source. Returns both the
     "golden" pure-bf16 buffer (no fp8 anywhere) and the kernel-shaped
-    (FP8 nope + bpad8 scale + BF16 rope) buffers.
+    (FP8 nope + E8M0 scale + BF16 rope) buffers.
 
     Returns:
       - kv_buffer_bf16      [num_page, page_size, 1, d_qk=512]  golden ref
                                                                 (bf16 cast of fp32)
       - kv_nope_fp8         [num_page, page_size, 1, 448]       FP8 nope
-      - kv_nope_scale_e8m0  [num_page, page_size, 1, 8]         uint8 E8M0 bytes
-                                                                (bpad8: 7 active,
-                                                                 last slot = 0)
+      - kv_nope_scale_e8m0  [num_page, page_size, 1, 7]         uint8 E8M0 bytes
+                                                                (one per 64-elt quant tile)
       - kv_rope_bf16        [num_page, page_size, 1, 64]        BF16 rope
     """
     nope_fp32 = torch.randn((num_page, page_size, 1, V4_DIM_NOPE), dtype=torch.float32)
@@ -315,7 +307,7 @@ def init_v4_kv_cache(
 
 def dequant_v4_kv(
     nope_fp8: torch.Tensor,  # [num_page, page_size, 1, 448]
-    scale_e8m0: torch.Tensor,  # [num_page, page_size, 1, 8]  uint8 (bpad8)
+    scale_e8m0: torch.Tensor,  # [num_page, page_size, 1, 7]  uint8 E8M0 (per 64-elt tile)
     rope_bf16: torch.Tensor,  # [num_page, page_size, 1, 64]
 ) -> torch.Tensor:
     """Reassemble [num_page, page_size, 1, d_qk=512] in fp32 from the 3 buffers."""
@@ -399,10 +391,10 @@ def _v4_dequant_nope_bpad8(
 
 def torch_mla_extend_v4_silver(
     # Q (per-token, kernel layout): NOPE 448 FP8 + dup-scale 16 + zero pad 112
-    q_packed,  # [total_q, nhead, 576]              FP8
+    q_packed,  # [total_q, nhead, 512]              FP8
     q_rope_bf16,  # [total_q, nhead, 64]               BF16
     # KV (paged, kernel layout)
-    kv_packed,  # [num_page, page_size, 1, 576]      FP8
+    kv_packed,  # [num_page, page_size, 1, 512]      FP8
     kv_rope_bf16,  # [num_page, page_size, 1, 64]       BF16
     qo_indptr,
     kv_indptr,
@@ -414,7 +406,7 @@ def torch_mla_extend_v4_silver(
     attn_sink: torch.Tensor = None,
 ):
     """
-    Reference whose inputs match the ASM kernel's exactly: a single 576-byte
+    Reference whose inputs match the ASM kernel's exactly: a single 512-byte
     packed FP8 tensor per Q/KV stream (NOPE bytes + duplicated E8M0 scale +
     zero pad) plus a separate BF16 rope tensor. Internally splits the packed
     buffer into (nope_fp8, scale_bpad8) via `unpack_v4_nope_scale`, dequants
@@ -684,7 +676,7 @@ def test_mla_v4(
     q_nope_fp8, q_nope_scale_e8m0, q_rope_bf16, _ = quantize_v4_q(q)
     q_rope_bf16 = q_rope_bf16.contiguous()
 
-    # Pack Q/KV into the 576-byte/token kernel layout (NOPE + dup-scale + zero
+    # Pack Q/KV into the 512-byte/token kernel layout (NOPE + dup-scale + unused pad
     # pad). This is the exact byte stream mla.py will hand to the ASM kernel
     # once the v4 wrapper lands; build it here so the silver path already
     # consumes the same bytes (it splits NOPE/scale back out internally).
@@ -712,7 +704,7 @@ def test_mla_v4(
     if use_attn_sink:
         attn_sink = torch.randn(nhead, dtype=torch.float32) * 0.5
 
-    # ---- silver reference (kernel-shaped inputs: 576-byte packed FP8 + BF16 rope) ----
+    # ---- silver reference (kernel-shaped inputs: 512-byte packed FP8 + BF16 rope) ----
     out_silver, lse_silver = torch_mla_extend_v4_silver(
         q_packed,
         q_rope_bf16,
