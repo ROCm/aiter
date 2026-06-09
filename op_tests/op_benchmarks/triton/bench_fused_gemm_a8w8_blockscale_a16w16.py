@@ -1,4 +1,3 @@
-import sys
 import torch
 import triton
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
@@ -231,4 +230,4 @@ def main(args: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
