@@ -304,8 +304,11 @@ def jagged_dense_bmm_dispatched(
     # On SKEWED (varlen) sequence lengths the static-grid kernel launches a full
     # max_seq_len M-envelope per group and early-exits most blocks -> waste. The
     # persistent problem-visitor variant (on-device CUM prefix, no host sync)
-    # pulls only occupied tiles and is 1.4-1.6x faster end-to-end on skew for the
-    # D512 / larger shapes. BUT it loses on tiny problems (the launch + CUM-build
+    # pulls only occupied tiles and is ~1.2-1.3x faster end-to-end on skew than
+    # OUR OWN static-grid kernel for the D512 / larger shapes (NOT vs Triton --
+    # measured 2026-06-09 Triton still wins skew 0.79-0.97x, see
+    # op_tests/flydsl_tests/bench_jdbba_vs_triton.py). BUT it loses on tiny
+    # problems (the launch + CUM-build
     # overhead dominates a sub-100us kernel) and regresses ~44% on UNIFORM data
     # (it forfeits the static grid's XCD-remap L2 reuse). So: persistent only when
     # NON-uniform AND the problem is big enough to amortize. Threshold = total
