@@ -75,6 +75,7 @@ _BV_CANDIDATES = [16, 32, 64]
 def _legal_bv_candidates(V: int) -> list[int]:
     return [c for c in _BV_CANDIDATES if c <= V and V % c == 0]
 
+
 # Default tuned table lives next to the kernel host wrapper.
 _DEFAULT_CSV = (
     Path(__file__).resolve().parents[2] / "ops" / "flydsl" / "chunk_gdn_h_tuned.csv"

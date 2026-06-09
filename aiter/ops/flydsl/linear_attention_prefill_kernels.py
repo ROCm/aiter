@@ -76,9 +76,7 @@ _GFX950_CU_COUNT = 256
 # Built once per process (mirrors ``GDR_GLOBAL_CONFIG_MAP`` in
 # ``linear_attention_kernels``): we keep, per key, the BV of the row with the
 # smallest measured ``duration``.
-_TUNED_BV_CSV = (
-    Path(__file__).resolve().parent / "chunk_gdn_h_tuned.csv"
-)
+_TUNED_BV_CSV = Path(__file__).resolve().parent / "chunk_gdn_h_tuned.csv"
 # key = (arch, dtype, K, V, BT, H, Hg, T_flat, N, is_varlen) -> (BV, duration)
 _TUNED_BV_MAP: dict[tuple, tuple[int, float]] | None = None
 
@@ -347,7 +345,12 @@ def _select_bv_for_grid(*, H: int, V: int, N: int, target_ctas: int) -> int:
 
 
 def _target_bv_for_shape(
-    *, H: int, Hg: int, T_flat: int, N: int, is_varlen: bool,
+    *,
+    H: int,
+    Hg: int,
+    T_flat: int,
+    N: int,
+    is_varlen: bool,
     min_seqlen: int | None = None,
 ) -> int | None:
     """Return the calibrated BV regime before legality/grid adjustment.
@@ -438,11 +441,7 @@ def _target_bv_for_shape(
             # boundary: min_seg <= 2384 -> BV=32 still wins, min_seg
             # >= 3000 -> BV=64 wins; no regression observed on the
             # skewed-split cluster (which has min_seg << 3000).
-            if (
-                T_flat >= 10000
-                and min_seqlen is not None
-                and min_seqlen >= 3000
-            ):
+            if T_flat >= 10000 and min_seqlen is not None and min_seqlen >= 3000:
                 return 64
             if 8000 <= T_flat <= 30000:
                 return 32
@@ -536,15 +535,26 @@ def _heuristic_bv(
     #    csv silently falls through to the rule rather than launching a bad
     #    grid.
     csv_bv = _lookup_csv_bv(
-        dtype_str=dtype_str, K=K, BT=BT,
-        H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen,
+        dtype_str=dtype_str,
+        K=K,
+        BT=BT,
+        H=H,
+        Hg=Hg,
+        V=V,
+        T_flat=T_flat,
+        N=N,
+        is_varlen=is_varlen,
     )
     if csv_bv is not None and csv_bv in _legal_bv_candidates(V):
         return csv_bv
 
     # 2. rule-based fallback (generalizes beyond the sparse csv).
     target_bv = _target_bv_for_shape(
-        H=H, Hg=Hg, T_flat=T_flat, N=N, is_varlen=is_varlen,
+        H=H,
+        Hg=Hg,
+        T_flat=T_flat,
+        N=N,
+        is_varlen=is_varlen,
         min_seqlen=min_seqlen,
     )
     if target_bv is not None:
@@ -732,17 +742,33 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         is_varlen = True
 
     BV = _heuristic_bv(
-        H=H, Hg=Hg, V=V, T_flat=T_flat, N=N, is_varlen=is_varlen,
+        H=H,
+        Hg=Hg,
+        V=V,
+        T_flat=T_flat,
+        N=N,
+        is_varlen=is_varlen,
         min_seqlen=min_seqlen,
         device_index=k.device.index if k.device.type == "cuda" else -1,
-        dtype_str=str(k.dtype), K=K, BT=BT,
+        dtype_str=str(k.dtype),
+        K=K,
+        BT=BT,
     )
 
     launch_fn = _get_or_compile(
-        K, V, BT, BV, H, Hg,
-        use_g, use_gk, use_h0,
-        output_final_state, save_new_value,
-        is_varlen, True,
+        K,
+        V,
+        BT,
+        BV,
+        H,
+        Hg,
+        use_g,
+        use_gk,
+        use_h0,
+        output_final_state,
+        save_new_value,
+        is_varlen,
+        True,
         state_bf16=state_bf16,
         g_log2_scaled=g_log2_scaled,
     )
@@ -754,13 +780,9 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     dummy = torch.empty(1, device=k.device, dtype=torch.float32)
     int32_dummy = dummy.to(torch.int32) if not is_varlen else None
     cu_arg = (
-        _as_int32(kernel_cu_seqlens)
-        if kernel_cu_seqlens is not None
-        else int32_dummy
+        _as_int32(kernel_cu_seqlens) if kernel_cu_seqlens is not None else int32_dummy
     )
-    co_arg = (
-        _as_int32(chunk_offsets) if chunk_offsets is not None else int32_dummy
-    )
+    co_arg = _as_int32(chunk_offsets) if chunk_offsets is not None else int32_dummy
     stream = torch.cuda.current_stream(k.device)
 
     grid_v = triton.cdiv(V, BV)
