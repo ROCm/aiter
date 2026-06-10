@@ -702,6 +702,9 @@ def _mock_grouped_gemm() -> None:
 
 
 def main() -> None:
+    if not is_gfx1250():
+        print("skipping: requires gfx1250")
+        sys.exit(0)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=("bench", "verify"), default="bench")
     parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
