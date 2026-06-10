@@ -55,7 +55,6 @@ class gemm_a8w8_fwd_codegen:
         """
         Codegen for cktile gemm a8w8
         """
-
         # generate instances code
         for _, k in kernels_dict.items():
             self.gen_instance(k)
@@ -94,7 +93,7 @@ class gemm_a8w8_fwd_codegen:
 
 #include "gemm_a8w8_cktile_common.cuh"
 
-template <typename ABDataType, typename DDataType, typename EDataType = DDataType>
+template <typename ABDataType, typename DDataType, typename EDataType, bool HasBias>
 torch::Tensor
 {k.name}(
     torch::Tensor &XQ,
@@ -130,7 +129,7 @@ torch::Tensor
             {str(k.AQRowMajor).lower()}>;
 
     // Run kernel instance.
-    return gemm_a8w8_cktile_impl<ABDataType, DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, k_batch);
+    return gemm_a8w8_cktile_impl<ABDataType, DDataType, EDataType, HasBias, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, k_batch);
 """
 
         TILE_INSTANCE_IMPL_str = TILE_INSTANCE_IMPL.replace(
@@ -162,7 +161,7 @@ template torch::Tensor
             # I8 instances
             for EDtype in ["TILE_BF16"]:
                 INSTANCE_abI8 = INSTANCE_template.format(
-                    name=k.name, dtypes=f"TILE_I8, TILE_BF16, {EDtype}"
+                    name=k.name, dtypes=f"TILE_I8, TILE_BF16, {EDtype}, false"
                 )
                 Path(
                     os.path.join(
@@ -173,7 +172,7 @@ template torch::Tensor
             # F8 instances
             for EDtype in ["TILE_BF16"]:
                 INSTANCE_abF8 = INSTANCE_template.format(
-                    name=k.name, dtypes=f"TILE_FP8, TILE_FP32, {EDtype}"
+                    name=k.name, dtypes=f"TILE_FP8, TILE_FP32, {EDtype}, false"
                 )
                 Path(
                     os.path.join(
@@ -185,7 +184,7 @@ template torch::Tensor
                 for ABDtype in ["TILE_FP8", "TILE_I8"]:
                     for DDtype in ["TILE_FP32", EDtype]:
                         intsance = INSTANCE_template.format(
-                            name=k.name, dtypes=f"{ABDtype}, {DDtype}, {EDtype}"
+                            name=k.name, dtypes=f"{ABDtype}, {DDtype}, {EDtype}, true"
                         )
                         Path(
                             os.path.join(
@@ -202,12 +201,12 @@ template torch::Tensor
 
 #ifdef USE_ROCM
 
-#define GENERATE_LOOKUP_TABLE(ABTYPE, DTYPE, ETYPE)                                                                                      \\
+#define GENERATE_LOOKUP_TABLE(ABTYPE, DTYPE, ETYPE, HasBias)                                                                                      \\
    {                                                                                                                             \\"""
 
         LOOKUP_template = """
        {{{MNK},                                                                                                       \\
-        {kernel_name}<ABTYPE, DTYPE, ETYPE>}},                       \\"""
+        {kernel_name}<ABTYPE, DTYPE, ETYPE, HasBias>}},                       \\"""
 
         LOOKUP_end = """
    }
@@ -239,7 +238,7 @@ template torch::Tensor
 #include <torch/extension.h>
 """
         MAINFEST_template = """
-template <typename ABDataType, typename DDataType, typename EDataType>
+template <typename ABDataType, typename DDataType, typename EDataType, bool HasBias>
 torch::Tensor
 {kernel_name}(
     torch::Tensor &XQ,

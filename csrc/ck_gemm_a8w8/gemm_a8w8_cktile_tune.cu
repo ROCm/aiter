@@ -37,7 +37,7 @@ RowwiseKernel rowwise_dispatch(int id)
   // First check if this shape is available in the direct lookup.
   static const auto lookup = []
   {
-    return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(ABDataType, DDataType, EDataType)};
+    return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(ABDataType, DDataType, EDataType, false)};
   }();
 
   TORCH_CHECK(id < lookup.size(),
