@@ -23,8 +23,6 @@ SHAPES = [
     (257,  7168,      512,      9),  # DSR
 ]
 
-MAX_M = 655360
-
 # XCD-swizzle group sizes to enumerate for BM=128 paths (large-M targets).
 # 0 = no remap (baseline). 1 = step-1-only (= legacy remap_xcd). Positive N =
 # flydsl-style 2-step remap with M-major group size N.
@@ -131,7 +129,7 @@ def _g1_body(ne, h, e, bm, *, use_nt=False, inline_quant=False, xcd_swizzle=0):
     if inline_quant:
         return (
             f"    aiter::mxfp4_moe::gemm1::launch<\n"
-            f"        {MAX_M}, {ne}, {h}, {n_out}, /*BM*/{bm},\n"
+            f"        {ne}, {h}, {n_out}, /*BM*/{bm},\n"
             f"        /*kUseNT*/{str(use_nt).lower()},\n"
             f"        /*kInlineQuant*/true,\n"
             f"        /*kXcdSwizzle*/{xcd_swizzle}>(\n"
@@ -143,7 +141,7 @@ def _g1_body(ne, h, e, bm, *, use_nt=False, inline_quant=False, xcd_swizzle=0):
         return (
             f"    (void)hidden_ptr;\n"
             f"    aiter::mxfp4_moe::gemm1::launch<\n"
-            f"        {MAX_M}, {ne}, {h}, {n_out}, /*BM*/{bm},\n"
+            f"        {ne}, {h}, {n_out}, /*BM*/{bm},\n"
             f"        /*kUseNT*/{str(use_nt).lower()},\n"
             f"        /*kInlineQuant*/false,\n"
             f"        /*kXcdSwizzle*/{xcd_swizzle}>(\n"
@@ -156,7 +154,7 @@ def _g1_body(ne, h, e, bm, *, use_nt=False, inline_quant=False, xcd_swizzle=0):
 def _g2_atomic_body(ne, h, e, topk, bm, *, use_nt=False, xcd_swizzle=0):
     return (
         f"    aiter::mxfp4_moe::gemm2::launch_atomic<\n"
-        f"        {MAX_M}, {ne}, {e}, {h}, {topk}, /*BM*/{bm},\n"
+        f"        {ne}, {e}, {h}, {topk}, /*BM*/{bm},\n"
         f"        /*kUseNT*/{str(use_nt).lower()},\n"
         f"        /*kXcdSwizzle*/{xcd_swizzle}>(\n"
         f"            stream, A_q, A_scale, B_q, B_scale,\n"
@@ -168,7 +166,7 @@ def _g2_atomic_body(ne, h, e, topk, bm, *, use_nt=False, xcd_swizzle=0):
 def _g2_nonatomic_body(ne, h, e, *, xcd_swizzle=0):
     return (
         f"    aiter::mxfp4_moe::gemm2::launch_nonatomic<\n"
-        f"        {MAX_M}, {ne}, {e}, {h}, /*kXcdSwizzle*/{xcd_swizzle}>(\n"
+        f"        {ne}, {e}, {h}, /*kXcdSwizzle*/{xcd_swizzle}>(\n"
         f"            stream, A_q, A_scale, B_q, B_scale,\n"
         f"            sorted_expert_ids, cumsum, max_sorted, bf16_out);"
     )

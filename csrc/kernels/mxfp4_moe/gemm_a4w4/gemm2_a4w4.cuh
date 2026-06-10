@@ -48,7 +48,7 @@ struct alignas(16) LDSLayout</*kAtomic=*/false, BM, BK, BN, kStages, kAS_LDS_slo
     alignas(16) uint8_t               s_Ascale[kStages][kAS_LDS_slot_bytes];
 };
 
-template <int MAX_M, int NUM_EXPERTS, int K, int N_OUT, int TOPK, int BM,
+template <int NUM_EXPERTS, int K, int N_OUT, int TOPK, int BM,
           EpilogPolicy kEpilog,
           bool kUseNT = false,
           int kXcdSwizzle = 0,
@@ -67,6 +67,7 @@ kernel(
     const int*                   __restrict__ sorted_token_ids,
     const float*                 __restrict__ sorted_weights,
     int                                       M,
+    int                                       max_sorted,
     __hip_bfloat16*              __restrict__ out_bf16,
     uint8_t*                     __restrict__ flat_out_scale)
 {
@@ -113,14 +114,14 @@ kernel(
     const int lane   = tid % 64;
 
     const buffer_rsrc_t A_q_rsrc =
-        make_buffer_rsrc(A_q, (uint32_t)(MAX_M * K_HALF * sizeof(__hip_fp4x2_storage_t)));
+        make_buffer_rsrc(A_q, (uint32_t)((long long)max_sorted * K_HALF * sizeof(__hip_fp4x2_storage_t)));
     const buffer_rsrc_t B_q_rsrc =
         make_buffer_rsrc(B_q,
             (uint32_t)((long long)NUM_EXPERTS * N_OUT * K_HALF * sizeof(__hip_fp4x2_storage_t)));
     constexpr int kAS_bound_div = kAtomic ? BM_GRID : 32;
     const buffer_rsrc_t A_scale_rsrc =
         make_buffer_rsrc(A_scale,
-            (uint32_t)((long long)(MAX_M / kAS_bound_div) * kAS_per_chunk_dw * 4));
+            (uint32_t)((long long)(max_sorted / kAS_bound_div) * kAS_per_chunk_dw * 4));
     const buffer_rsrc_t B_scale_rsrc =
         make_buffer_rsrc(B_scale, (uint32_t)((long long)NUM_EXPERTS * kBS_per_expert_dw * 4));
 
@@ -451,7 +452,7 @@ kernel(
     }
 }
 
-template <int MAX_M, int NUM_EXPERTS, int K, int N_OUT, int TOPK, int BM,
+template <int NUM_EXPERTS, int K, int N_OUT, int TOPK, int BM,
           bool kUseNT = false, int kXcdSwizzle = 0>
 inline void launch_atomic(
     hipStream_t stream,
@@ -468,7 +469,8 @@ inline void launch_atomic(
     const int max_m_blocks =
         (M * TOPK + NUM_EXPERTS * (BM_GRID - 1) + BM_GRID - 1) / BM_GRID;
     const int grid = max_m_blocks * num_n_blocks;
-    kernel<MAX_M, NUM_EXPERTS, K, N_OUT, TOPK, BM,
+    const int max_sorted = max_m_blocks * BM;  // runtime A_q/A_scale bound (replaces MAX_M)
+    kernel<NUM_EXPERTS, K, N_OUT, TOPK, BM,
            EpilogPolicy::Atomic, kUseNT, kXcdSwizzle>
         <<<grid, 256, 0, stream>>>(
             reinterpret_cast<const __hip_fp4x2_storage_t*>(A_q),
@@ -477,12 +479,12 @@ inline void launch_atomic(
             reinterpret_cast<const __amd_scale_t*>(B_scale),
             sorted_expert_ids, cumsum_tensor,
             sorted_token_ids, sorted_weights,
-            M,
+            M, max_sorted,
             reinterpret_cast<__hip_bfloat16*>(out),
             /*flat_out_scale=*/nullptr);
 }
 
-template <int MAX_M, int NUM_EXPERTS, int K, int N_OUT, int kXcdSwizzle = 0>
+template <int NUM_EXPERTS, int K, int N_OUT, int kXcdSwizzle = 0>
 inline void launch_nonatomic(
     hipStream_t stream,
     const void* A_q,    const void* A_scale,
@@ -496,7 +498,7 @@ inline void launch_nonatomic(
     const int max_m_blocks = (max_sorted + BM - 1) / BM;
     const int total_work   = max_m_blocks * num_n_blocks;
     const int grid = (total_work < NUM_CU) ? total_work : NUM_CU;
-    kernel<MAX_M, NUM_EXPERTS, K, N_OUT, /*TOPK=*/9, BM,
+    kernel<NUM_EXPERTS, K, N_OUT, /*TOPK=*/9, BM,
            EpilogPolicy::Nonatomic, /*kUseNT=*/false,
            kXcdSwizzle>
         <<<grid, 256, 0, stream>>>(
@@ -506,12 +508,12 @@ inline void launch_nonatomic(
             reinterpret_cast<const __amd_scale_t*>(B_scale),
             sorted_expert_ids, cumsum_tensor,
             /*sorted_token_ids=*/nullptr, /*sorted_weights=*/nullptr,
-            /*M=*/0,
+            /*M=*/0, max_sorted,
             reinterpret_cast<__hip_bfloat16*>(flat_out),
             /*flat_out_scale=*/nullptr);
 }
 
-template <int MAX_M, int NUM_EXPERTS, int K, int N_OUT, int kXcdSwizzle = 0>
+template <int NUM_EXPERTS, int K, int N_OUT, int kXcdSwizzle = 0>
 inline void launch_nonatomic_mxfp4(
     hipStream_t stream,
     const void* A_q,    const void* A_scale,
@@ -526,7 +528,7 @@ inline void launch_nonatomic_mxfp4(
     const int max_m_blocks = (max_sorted + BM - 1) / BM;
     const int total_work   = max_m_blocks * num_n_blocks;
     const int grid = (total_work < NUM_CU) ? total_work : NUM_CU;
-    kernel<MAX_M, NUM_EXPERTS, K, N_OUT, /*TOPK=*/9, BM,
+    kernel<NUM_EXPERTS, K, N_OUT, /*TOPK=*/9, BM,
            EpilogPolicy::Nonatomic, /*kUseNT=*/false,
            kXcdSwizzle, /*kMxfp4Out=*/true>
         <<<grid, 256, 0, stream>>>(
@@ -536,7 +538,7 @@ inline void launch_nonatomic_mxfp4(
             reinterpret_cast<const __amd_scale_t*>(B_scale),
             sorted_expert_ids, cumsum_tensor,
             /*sorted_token_ids=*/nullptr, /*sorted_weights=*/nullptr,
-            /*M=*/0,
+            /*M=*/0, max_sorted,
             reinterpret_cast<__hip_bfloat16*>(flat_out_q),
             reinterpret_cast<uint8_t*>(flat_out_scale));
 }
