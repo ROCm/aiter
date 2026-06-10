@@ -7,7 +7,6 @@ from aiter.test_common import (
     benchmark,
     run_perftest,
 )
-import gc
 import torch
 import aiter
 from aiter import dtypes
@@ -955,67 +954,55 @@ _mode_group.add_argument(
     help="Fuse RMSNorm into mhc_pre / mhc_post_pre HIP paths (mutually exclusive with --hc_head).",
 )
 
-args = parser.parse_args()
+if __name__ == "__main__":
+    args = parser.parse_args()
 
-df = []
-for dtype in args.dtype:
-    for hidden_size in args.hidden_size:
-        for m in args.m:
-            for hc_mult in [4]:
-                ret = test_mhc_pre(
-                    m=m,
-                    hidden_size=hidden_size,
-                    hc_mult=hc_mult,
-                    test_hc_head=args.hc_head,
-                    fuse_rmsnorm=args.fuse_rmsnorm,
-                )
-                df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
-
-if not args.hc_head:
     df = []
     for dtype in args.dtype:
         for hidden_size in args.hidden_size:
             for m in args.m:
                 for hc_mult in [4]:
-                    ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
+                    ret = test_mhc_pre(
+                        m=m,
+                        hidden_size=hidden_size,
+                        hc_mult=hc_mult,
+                        test_hc_head=args.hc_head,
+                        fuse_rmsnorm=args.fuse_rmsnorm,
+                    )
                     df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
-    aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
+    aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
 
-    df = []
-    for dtype in args.dtype:
-        for hidden_size in args.hidden_size:
-            for m in args.m:
-                for hc_mult in [4]:
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    try:
+    if not args.hc_head:
+        df = []
+        for dtype in args.dtype:
+            for hidden_size in args.hidden_size:
+                for m in args.m:
+                    for hc_mult in [4]:
+                        ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
+                        df.append(ret)
+        df = pd.DataFrame(df)
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
+
+        df = []
+        for dtype in args.dtype:
+            for hidden_size in args.hidden_size:
+                for m in args.m:
+                    for hc_mult in [4]:
                         ret = test_mhc_post_pre(
                             m=m,
                             hidden_size=hidden_size,
                             hc_mult=hc_mult,
                             fuse_rmsnorm=args.fuse_rmsnorm,
                         )
-                    except torch.OutOfMemoryError as e:
-                        aiter.logger.warning(
-                            "OOM mhc_post_pre M=%s hidden_size=%s: %s",
-                            m,
-                            hidden_size,
-                            e,
-                        )
-                        continue
-                    if ret.get("skipped"):
-                        continue
-                    df.append(ret)
-                    torch.cuda.empty_cache()
-                    gc.collect()
-    if df:
-        df = pd.DataFrame(df)
-        df_md = df.to_markdown(index=False)
-        aiter.logger.info("mhc_post_pre summary (markdown):\n%s", df_md)
-    else:
-        aiter.logger.info("mhc_post_pre: all cases skipped")
+                        if ret.get("skipped"):
+                            continue
+                        df.append(ret)
+        if df:
+            df = pd.DataFrame(df)
+            df_md = df.to_markdown(index=False)
+            aiter.logger.info("mhc_post_pre summary (markdown):\n%s", df_md)
+        else:
+            aiter.logger.info("mhc_post_pre: all cases skipped")
