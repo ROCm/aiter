@@ -93,9 +93,39 @@ def gather_kv_b_proj(
     padded_v = _next_pow2(v_head_dim)
 
     grid = (batch_size * tp_k_head_num_k,)
-    kernel_weight = kv_proj_weight.view(torch.uint8) if is_fp4_weight else kv_proj_weight
-    kernel_scale = kv_proj_scale.view(torch.uint8) if is_fp4_weight else kv_proj_scale
-    scale_cols = scale_k if is_fp4_weight and not no_scale and not per_row_scale else 1
+    if is_fp4_weight:
+        # Use the actual output token count, not kv_indices capacity. Serving
+        # paths may pass a preallocated kv_indices buffer that is much larger
+        # than the valid range described by kv_indptr/k_prefix.
+        max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
+        fp4_grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
+        _triton_gather_kv_b_proj[fp4_grid](
+            batch_size,
+            k_buffer,
+            k_scale,
+            kv_indptr,
+            kv_indices,
+            kv_prefix_sum_context_lens,
+            kv_proj_weight.view(torch.uint8),
+            kv_proj_scale.view(torch.uint8),
+            k_prefix,
+            v_prefix,
+            KBlockSize=block_size,
+            TpNumHeads=tp_k_head_num_k,
+            QkNopeHeadDim=qk_nope_head_dim,
+            VHeadDim=v_head_dim,
+            KV_CDim=weight_k,
+            KV_PeDim=qk_nope_pe_dim - qk_nope_head_dim,
+            ChunkK=ChunkK,
+            PaddedK=padded_k,
+            PaddedV=padded_v,
+            ScaleCols=scale_k if not no_scale and not per_row_scale else 1,
+            IS_FP4=True,
+            WEIGHT_PRESHUFFLE=weight_preshuffle,
+            num_stages=3,
+        )
+        return
+
     _triton_gather_kv_b_proj[grid](
         batch_size,
         k_buffer,
@@ -103,8 +133,8 @@ def gather_kv_b_proj(
         kv_indptr,
         kv_indices,
         kv_prefix_sum_context_lens,
-        kernel_weight,
-        kernel_scale,
+        kv_proj_weight,
+        kv_proj_scale,
         k_prefix,
         v_prefix,
         KBlockSize=block_size,
@@ -116,8 +146,7 @@ def gather_kv_b_proj(
         ChunkK=ChunkK,
         PaddedK=padded_k,
         PaddedV=padded_v,
-        ScaleCols=scale_cols,
-        IS_FP4=is_fp4_weight,
+        IS_FP4=False,
         WEIGHT_PRESHUFFLE=weight_preshuffle,
         PER_ROW_SCALE=per_row_scale,
         NO_SCALE=no_scale,
