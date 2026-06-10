@@ -49,7 +49,7 @@
       "winners": {
         "B1024D256K256N7680": {
           "b_to_lds": false,
-          "cos": 0.999999,
+          "cos": 1.0,
           "default_p10_us": 2085.13,
           "m_warps": 4,
           "n_warps": 1,
@@ -58,9 +58,10 @@
           "tile_m": 128,
           "tile_n": 128,
           "use_mfma_k32": true,
-          "waves_per_eu": 0,
+          "waves_per_eu": 1,
           "xcd_c": 32,
-          "xcd_w": 8
+          "xcd_w": 8,
+          "source": "wpe-probe (gfx950 MI355X, 2026-06-10): do_bench cold-L2 uniform, waves_per_eu=1 -> ~2.13ms vs ~2.20ms (all wpe>0 trials beat all baseline trials, ~2.6%), cos=1.0. _wpe_probe via CompilationContext.compile_hints. Occupancy hint on the overhead-bound D256 shape."
         },
         "B1024D512K512N7680": {
           "b_to_lds": false,

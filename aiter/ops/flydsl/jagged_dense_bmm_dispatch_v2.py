@@ -386,4 +386,5 @@ def jagged_dense_bmm_dispatched(
         uniform_seqlen=uniform_seqlen,
         block_m=cfg.get("tile_m") if uniform_seqlen else None,
         block_n=cfg.get("tile_n") if uniform_seqlen else None,
+        waves_per_eu=int(cfg.get("waves_per_eu") or 0) if uniform_seqlen else 0,
     )

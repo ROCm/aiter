@@ -27,6 +27,7 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 
 # Default tiling (override via the factory args).
@@ -142,7 +143,7 @@ def make_bounded_buffer_tensor(tensor, num_records_bytes):
 
 
 @functools.lru_cache(maxsize=None)
-def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES, N_GROUPS, XCD_C, XCD_W, USE_MFMA_K32):
+def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES, N_GROUPS, XCD_C, XCD_W, USE_MFMA_K32, WAVES_PER_EU=0):
     """Build (and memoize) a launch wrapper specialized to this (N, K, tiling).
     N (output) and K (reduction) are baked in as closure constants. BM_TILES
     (= ceil(max_seq_len/BLOCK_M)) and N_GROUPS are also baked in so the chiplet
@@ -426,9 +427,15 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
         epi_smem_bytes = max(smem_bytes, BLOCK_M * BLOCK_N * 2)
 
         bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
-        jdbba_kernel(C, A, B, BIAS, SEQ_OFFSETS, tiled_mma, tiled_copy_g2s_A, tiled_copy_s2g_C).launch(
-            grid=(bm * N_BLOCKS, 1, n_groups), block=(THREADS, 1, 1), smem=epi_smem_bytes, stream=stream
-        )
+        if WAVES_PER_EU:
+            with CompilationContext.compile_hints({"waves_per_eu": WAVES_PER_EU}):
+                jdbba_kernel(C, A, B, BIAS, SEQ_OFFSETS, tiled_mma, tiled_copy_g2s_A, tiled_copy_s2g_C).launch(
+                    grid=(bm * N_BLOCKS, 1, n_groups), block=(THREADS, 1, 1), smem=epi_smem_bytes, stream=stream
+                )
+        else:
+            jdbba_kernel(C, A, B, BIAS, SEQ_OFFSETS, tiled_mma, tiled_copy_g2s_A, tiled_copy_s2g_C).launch(
+                grid=(bm * N_BLOCKS, 1, n_groups), block=(THREADS, 1, 1), smem=epi_smem_bytes, stream=stream
+            )
 
     return _launch
 
@@ -448,6 +455,7 @@ def jagged_dense_bmm(
     uniform_seqlen: bool = True,
     block_m: int | None = None,
     block_n: int | None = None,
+    waves_per_eu: int = 0,
 ):
     """Public entry. Derives N (output) and K (reduction) from the tall dense B
     matrix shape (B_groups * N, K), then dispatches to the per-shape kernel.
@@ -499,6 +507,6 @@ def jagged_dense_bmm(
     bnn = BLOCK_N if block_n is None else block_n
     bm = (max_seq_len + bmn - 1) // bmn
     launch = _build_launcher(
-        N, K, bmn, bnn, block_k, STAGES_A, THREADS, bm, n_groups, xcd_c, xcd_w, use_mfma_k32
+        N, K, bmn, bnn, block_k, STAGES_A, THREADS, bm, n_groups, xcd_c, xcd_w, use_mfma_k32, waves_per_eu
     )
     return launch(C, A, B, BIAS, SEQ_OFFSETS, n_groups, max_seq_len, stream=stream)
