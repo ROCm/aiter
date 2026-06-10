@@ -39,11 +39,11 @@ def _epilog_of(atomic, mxfp4out):
 
 
 @functools.cache
-def _get_compiled_mxfp4_gemm2_port(BM, use_nt, NE, N_OUT, epilog):
+def _get_compiled_mxfp4_gemm2_port(BM, use_nt, NE, N_OUT, epilog, D_INTER):
     from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
 
     return compile_gemm2_a4w4_port(
-        BM=BM, use_nt=use_nt, NE=NE, N_OUT=N_OUT, epilog=epilog
+        BM=BM, use_nt=use_nt, NE=NE, N_OUT=N_OUT, epilog=epilog, D_INTER=D_INTER
     )
 
 
@@ -55,12 +55,21 @@ def _dummy_out_scale(device_index):
 def _assert_supported(*, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, atomic, mxfp4out):
     from .kernels import mxfp4_gemm2 as port
 
-    # gemm2 ?? K=512 (contraction = inter_dim);prebuilt HIP ??? H=7168?
-    # NE?{257,385}?TOPK=9?????????? HIP ??,fail-loud?
-    if D_INTER != port.K or D_HIDDEN != port.N_OUT or NE not in (257, 385):
+    # gemm2 contraction K = inter_dim = D_INTER. The kernel (BK=256) supports any
+    # D_INTER % 256 == 0 (KIMI/DSR 512 keeps the original fully-unrolled fast path;
+    # >512 uses the streaming K-loop). D_HIDDEN (= model_dim / output) must equal the
+    # prebuilt HIP H=7168, and NE in {257,385}, TOPK=9 -- fail-loud otherwise.
+    if D_INTER % port.BK != 0:
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm2 contraction D_INTER (=inter_dim) must be a "
+            f"multiple of {port.BK}; D_INTER not divisible by {port.BK} (e.g. "
+            f"384/192) is not supported by this BK={port.BK} kernel "
+            f"(got D_INTER={D_INTER})"
+        )
+    if D_HIDDEN != port.N_OUT or NE not in (257, 385):
         raise NotImplementedError(
             f"flydsl mxfp4 gemm2 ??? Kimi/DSR ?? "
-            f"(NE?(257,385), H={port.N_OUT}, INTER={port.K}),"
+            f"(NE?(257,385), H={port.N_OUT}),"
             f"?? (NE={NE}, H={D_HIDDEN}, INTER={D_INTER}, TOPK={topk})"
         )
     epilog = _epilog_of(atomic, mxfp4out)
@@ -110,7 +119,7 @@ def flydsl_mxfp4_gemm2(
         mxfp4out=mxfp4out,
     )
     epilog = _epilog_of(atomic, mxfp4out)
-    launch = _get_compiled_mxfp4_gemm2_port(BM, use_nt, NE, D_HIDDEN, epilog)
+    launch = _get_compiled_mxfp4_gemm2_port(BM, use_nt, NE, D_HIDDEN, epilog, D_INTER)
 
     # grid ?? = max_m_blocks(kernel ???? cumsum ???????)?
     max_m_blocks = (max_sorted + BM - 1) // BM

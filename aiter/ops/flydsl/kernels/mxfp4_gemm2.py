@@ -15,6 +15,16 @@ The port mirrors gemm2_a4w4.cuh's atomic path instruction-for-instruction:
   * ``s_waitcnt vmcnt(23/22)`` + ``s_barrier`` cross-wave fences.
   * K=512 = 2 K-tiles fully unrolled; 32 (BM32) / 16 (BM16) MFMAs.
   * atomic bf16 epilog: LDS cshuffle -> ``global.atomic.fadd.v2bf16`` * topk weight.
+
+The contraction dim K(=inter_dim=D_INTER) is parametrized via ``compile_gemm2_a4w4_port(D_INTER=...)``.
+KIMI/DSR (D_INTER=512 -> K_TILES_TOTAL=2) keeps the original fully-unrolled, all-
+tiles-preloaded fast path byte-for-byte. For D_INTER>512 (K_TILES_TOTAL>2; e.g.
+minimax 768->3, 2048->8) the kernel switches to a streaming double-buffered K-loop
+(prologue preloads kStages=2 tiles, a main loop streams tiles [kStages,
+K_TILES_TOTAL) while MFMA-ing, a drain processes the last kStages) -- mirroring
+mxfp4_gemm1.py. Constraint: D_INTER % BK(256) == 0 (covers 512/768/1024/1536/
+2048/3072); inter_dim not divisible by 256 (e.g. 384/192) is NOT supported by this
+BK=256 kernel.
 """
 
 import flydsl.compiler as flyc
@@ -30,14 +40,15 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 # -- shape constants (BM-independent) -----------------------------------------
 MAX_M = 655360
 NE = 385
-K = 512  # gemm2 contraction = inter_dim
+K = 512  # gemm2 contraction = inter_dim (DEFAULT / KIMI; per-shape value comes
+#          from the compile arg D_INTER. All K-derived sizes are computed from the
+#          arg via the *_for() helpers below; these module globals are the KIMI
+#          defaults so existing importers (and the test) keep working unchanged.)
 N_OUT = 7168  # default gemm2 output dim = model_dim (per-shape value comes from the compile arg)
 
 BN = 256
 BK = 256
-K_HALF = K // 2  # 256 packed-fp4 bytes along K
-KH_TILE = BK // 2  # 128 packed bytes per K-tile
-K_TILES_TOTAL = K // BK  # 2
+KH_TILE = BK // 2  # 128 packed bytes per K-tile (BK-derived, K-independent)
 kStages = 2
 NUM_CU = 256  # persistent-grid workgroup count (matches gemm2_a4w4.cuh NUM_CU).
 # Measured: 1 workgroup/CU (grid == NUM_CU) is optimal; over-subscribing the
@@ -47,41 +58,73 @@ NUM_CU = 256  # persistent-grid workgroup count (matches gemm2_a4w4.cuh NUM_CU).
 # None -> let the backend choose (rocdl.barrier); an int forces s_waitcnt vmcnt(N).
 _NONATOMIC_KLOOP_VMCNT = 16
 
-# scale-layout consts (mirror gemm2_a4w4.cuh)
-kBS_c_k1 = (K // 32) // 4 // 2  # 2
+# scale-layout consts (mirror gemm2_a4w4.cuh). K-independent stride:
 kBS_stride_k0_dw = 64
-kBS_stride_n0_dw = kBS_c_k1 * 64  # 128
-kAS_c_k1 = (K // 32) // 4 // 2  # 2
-kAS_per_chunk_dw = kAS_c_k1 * 64  # 128
 
 
-# -- shape-parametrized sizes (K=512 fixed; NE/N_OUT/MAX_M vary per instance) --
-# N_OUT must be a multiple of 256 (BN); the mxfp4 gemm2 hard-requires K==512.
+# -- K-derived sizes (parametrized over the contraction dim K = inter_dim = D_INTER)
+# K MUST be a multiple of BK(256). The *_for() helpers mirror gemm1's pattern so the
+# KIMI default (K=512) path is byte-for-byte identical to the old module globals.
+def k_half_for(k):
+    return k // 2  # packed-fp4 bytes along K (KIMI: 256)
+
+
+def k_tiles_total_for(k):
+    return k // BK  # KIMI: 2
+
+
+def kunroll_for(k):
+    # streaming main-loop trip count (K_TILES_TOTAL>2 path): prologue issues kStages
+    # tiles, the main loop processes tiles [0, kUnroll) while streaming tiles
+    # [kStages, kStages+kUnroll), and the drain processes the final kStages tiles.
+    # Full gap-free coverage requires EXACTLY kUnroll = K_TILES_TOTAL - kStages.
+    return k_tiles_total_for(k) - kStages
+
+
+def kbs_c_k1_for(k):
+    return (k // 32) // 4 // 2  # KIMI: 2
+
+
+def kbs_stride_n0_dw_for(k):
+    return kbs_c_k1_for(k) * 64  # KIMI: 128
+
+
+def kas_c_k1_for(k):
+    return (k // 32) // 4 // 2  # KIMI: 2
+
+
+def kas_per_chunk_dw_for(k):
+    return kas_c_k1_for(k) * 64  # KIMI: 128
+
+
+# -- shape-parametrized sizes (NE/N_OUT/MAX_M/K vary per instance) --
+# N_OUT must be a multiple of 256 (BN).
 def num_n_blocks_for(n_out):
     return n_out // 256
 
 
-def kbs_per_expert_dw_for(n_out):
-    return (n_out // 16 // 2) * kBS_stride_n0_dw
+def kbs_per_expert_dw_for(n_out, k=K):
+    # depends on BOTH N_OUT (via N_OUT//16//2) AND K (via kBS_stride_n0_dw).
+    return (n_out // 16 // 2) * kbs_stride_n0_dw_for(k)
 
 
-def aq_bytes_for(max_m):
-    return max_m * K_HALF
+def aq_bytes_for(max_m, k=K):
+    return max_m * k_half_for(k)
 
 
-def bq_bytes_for(ne, n_out):
-    return ne * n_out * K_HALF
+def bq_bytes_for(ne, n_out, k=K):
+    return ne * n_out * k_half_for(k)
 
 
-def bscale_bytes_for(ne, n_out):
-    return ne * kbs_per_expert_dw_for(n_out) * 4
+def bscale_bytes_for(ne, n_out, k=K):
+    return ne * kbs_per_expert_dw_for(n_out, k) * 4
 
 
-def ascale_bytes(BM, max_m=MAX_M):
+def ascale_bytes(BM, max_m=MAX_M, k=K):
     """A_scale buffer-resource num_bytes.
 
-    The A_scale read stride is one ``kAS_per_chunk_dw*4`` (512B) chunk per
-    ``chunk_div`` A rows, where ``chunk_div = 16 if BM==16 else 32`` (see the
+    The A_scale read stride is one ``kAS_per_chunk_dw*4`` chunk per ``chunk_div``
+    A rows, where ``chunk_div = 16 if BM==16 else 32`` (see the
     ``chunk_base = m_row // chunk_div`` addressing in ``_gemm2_body``). The
     resource bound MUST divide ``max_m`` by that read granularity -- NOT by BM.
 
@@ -93,7 +136,17 @@ def ascale_bytes(BM, max_m=MAX_M):
     (BM128 nonatomic / mxfp4out) lost accuracy (e.g. KIMI cos 0.68 @ M=16384,
     0.05 @ M=32768) while smaller M that stayed under the bound looked fine."""
     chunk_div = 16 if BM == 16 else 32
-    return (max_m // chunk_div) * kAS_per_chunk_dw * 4
+    return (max_m // chunk_div) * kas_per_chunk_dw_for(k) * 4
+
+
+# KIMI defaults (back-compat module globals; equal to the *_for(K) helpers).
+K_HALF = k_half_for(K)  # 256
+K_TILES_TOTAL = k_tiles_total_for(K)  # 2
+kUnroll = kunroll_for(K)  # 0
+kBS_c_k1 = kbs_c_k1_for(K)  # 2
+kBS_stride_n0_dw = kbs_stride_n0_dw_for(K)  # 128
+kAS_c_k1 = kas_c_k1_for(K)  # 2
+kAS_per_chunk_dw = kas_per_chunk_dw_for(K)  # 128
 
 
 def saq_slot_bytes(BM):
@@ -190,15 +243,18 @@ def _lds_swizzle_mask(row):
     return (row & fx.Int32(14)) << fx.Int32(3)
 
 
-def _issue_a_load_lds(aq_rsrc, saq, slot, kt, car, lane, slot_bytes, lds_row):
+def _issue_a_load_lds(
+    aq_rsrc, saq, slot, kt, car, lane, slot_bytes, lds_row, k_half=K_HALF
+):
     """Issue one A->LDS chunk load (one wave's 8 rows for one (K-tile=slot,
     M-subblock)) via ``raw.ptr.buffer.load.lds`` into s_Aq[slot][lds_row]. ``car``
-    is the cached actual row, ``lds_row = wave*rows_per_wave + sub*8``. Caller
-    loops slot (K-tile) outer, sub inner (matching HIP), and gates on
+    is the cached actual row, ``lds_row = wave*rows_per_wave + sub*8``. ``k_half``
+    is the per-row A byte stride (= K//2, parametrized over the contraction dim).
+    Caller loops slot (K-tile) outer, sub inner (matching HIP), and gates on
     ``wave < n_load_waves``. Side-effecting -> not sunk past the cumsum branch."""
     lane_mod_8 = lane % fx.Int32(8)
     mask = _lds_swizzle_mask(lds_row + (lane // fx.Int32(8)))
-    voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + car * fx.Int32(K // 2)
+    voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + car * fx.Int32(k_half)
     base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(saq.get()))
     off_i32 = fx.Int32(slot * slot_bytes) + lds_row * fx.Int32(KH_TILE)
     lds_ptr = _lds_ptr3(base_i32, off_i32)
@@ -214,12 +270,16 @@ def _issue_a_load_lds(aq_rsrc, saq, slot, kt, car, lane, slot_bytes, lds_row):
 
 
 def compile_gemm2_a4w4_port(
-    BM=32, use_nt=False, NE=NE, N_OUT=N_OUT, MAX_M=MAX_M, epilog="atomic"
+    BM=32, use_nt=False, NE=NE, N_OUT=N_OUT, MAX_M=MAX_M, epilog="atomic", D_INTER=K
 ):
     """Compile the gemm2 a4w4 port for a given shape / specialization / epilog.
 
-    Shape params (K=512 is fixed by the mxfp4 gemm2 kernel; TOPK is upstream and
-    not used in the gemm2 body): NE (experts), N_OUT (model_dim, %256), MAX_M.
+    Shape params (TOPK is upstream and not used in the gemm2 body):
+      NE (experts), N_OUT (model_dim, %256), MAX_M,
+      D_INTER (= contraction dim K = inter_dim, %BK(256); KIMI/DSR default 512).
+    For D_INTER==512 (K_TILES_TOTAL==2) the original fully-unrolled all-tiles-
+    preloaded fast path is used (byte-for-byte identical). For D_INTER>512 the
+    streaming double-buffered K-loop (prologue/main/drain) is used.
     Specialization: BM in {16,32,64} (atomic) or 128 (nonatomic), kUseNT.
     epilog:
       "atomic"          -> LDS cshuffle + global_atomic_fadd x sorted_weights (BM16/32/64)
@@ -228,6 +288,15 @@ def compile_gemm2_a4w4_port(
       "nonatomic_mxfp4" -> flat per-sorted-row fp4 (q + e8m0 scale) write (BM128)
     """
     _atomic = epilog == "atomic"
+    # K = contraction dim = inter_dim. Parametrized; defaults to KIMI/DSR's 512.
+    _K = D_INTER
+    assert _K % BK == 0, (
+        f"D_INTER (gemm2 contraction K = inter_dim) must be a multiple of {BK}, "
+        f"got {_K}; inter_dim not divisible by {BK} (e.g. 384/192) is not "
+        f"supported by this BK={BK} kernel"
+    )
+    _K_HALF = k_half_for(_K)
+    _K_TILES_TOTAL = k_tiles_total_for(_K)
     # The BM128 non-atomic epilogs use a hybrid persistent grid (one-shot for small
     # launches, NUM_CU workgroups grid-striding for large). Even though the heavy
     # mxfp4-out epilog is LDS-bound to 1 block/CU (no occupancy slack), persistence
@@ -240,10 +309,21 @@ def compile_gemm2_a4w4_port(
     kmchunks(BM)
     _slot_bytes = saq_slot_bytes(BM)
     BM * BN
+    # Number of LDS A-slots (s_Aq stages). The K_TILES_TOTAL==2 fast path preloads
+    # all 2 tiles into 2 slots (double buffer). The streaming K_TILES_TOTAL>2 path
+    # uses 3 slots (triple buffer) so the per-iteration read-slot (tile kt) and
+    # write-slot (tile kt+kStages, streamed in) never alias -- the read tile maps to
+    # kt%3 and the streamed tile to (kt+2)%3, which differ for all kt. (gemm1 uses
+    # the same kAStages=3 triple-buffer for its streaming non-128 path.)
+    _aStages = kStages if _K_TILES_TOTAL == kStages else 3
     # atomic / mxfp4 epilog reuses LDS for the cshuffle (BM*BN f32); nonatomic
-    # bf16 writes direct, so only s_Aq (kStages slots) is needed.
-    _lds_bytes = lds_bytes(BM) if epilog != "nonatomic" else kStages * _slot_bytes
-    _aq_bytes = aq_bytes_for(MAX_M)
+    # bf16 writes direct, so only s_Aq (_aStages slots) is needed.
+    _lds_bytes = (
+        max(lds_bytes(BM), _aStages * _slot_bytes)
+        if epilog != "nonatomic"
+        else _aStages * _slot_bytes
+    )
+    _aq_bytes = aq_bytes_for(MAX_M, _K)
     _num_n_blocks = num_n_blocks_for(N_OUT)
     _n_load_waves, _rows_per_wave, _kSubBlocks = tiling(
         BM
@@ -253,7 +333,9 @@ def compile_gemm2_a4w4_port(
         "nonatomic": "nonatomic",
         "nonatomic_mxfp4": "nonatomic_mxfp4",
     }[epilog]
-    _tag = f"ne{NE}_h{N_OUT}_bm{BM}{'_nt' if use_nt else ''}_{_epi_tag}"
+    # Tag with the inter (K) so specializations with different contraction dims get
+    # distinct kernel/smem symbols (KIMI i512 keeps the original numeric layout).
+    _tag = f"ne{NE}_h{N_OUT}_i{_K}_bm{BM}{'_nt' if use_nt else ''}_{_epi_tag}"
     _name = f"gemm2_a4w4_port_{_tag}"
 
     allocator = SmemAllocator(
@@ -288,19 +370,30 @@ def compile_gemm2_a4w4_port(
             arg_aq, max_size=False, num_records_bytes=fx.Index(_aq_bytes)
         )
         saq = SmemPtr(
-            allocator.get_base(), lds_off, T.i8, shape=(kStages * _slot_bytes,)
+            allocator.get_base(), lds_off, T.i8, shape=(_aStages * _slot_bytes,)
         )
 
         # Issue A->LDS for a tile's m_block. raw.ptr.buffer.load.lds is
         # side-effecting (writes LDS). Loop K-tile (slot) outer, M-subblock (sub)
         # inner, matching HIP.
+        # Preload the first kStages K-tiles (== ALL tiles when K_TILES_TOTAL==2 /
+        # KIMI; == prologue for the streaming K_TILES_TOTAL>2 path). slot == kt here
+        # because the prologue tiles are 0..kStages-1.
         def _issue_all_a_loads(m_row0):
             for slot in range_constexpr(kStages):  # slot == K-tile index for preload
                 for sub in range_constexpr(_kSubBlocks):
                     lds_row = wave * fx.Int32(_rows_per_wave) + fx.Int32(sub * 8)
                     car = m_row0 + lds_row + (lane // fx.Int32(8))
                     _issue_a_load_lds(
-                        aq_rsrc, saq, slot, slot, car, lane, _slot_bytes, lds_row
+                        aq_rsrc,
+                        saq,
+                        slot,
+                        slot,
+                        car,
+                        lane,
+                        _slot_bytes,
+                        lds_row,
+                        k_half=_K_HALF,
                     )
 
         def _run_tile(tile_i32):
@@ -325,6 +418,9 @@ def compile_gemm2_a4w4_port(
                 N_OUT,
                 MAX_M,
                 epilog,
+                aq_rsrc=aq_rsrc,
+                D_INTER=_K,
+                aStages=_aStages,
             )
 
         # total_m_blocks = cumsum[0] / BM ; bound = total_m_blocks * _num_n_blocks
@@ -484,17 +580,31 @@ def _gemm2_body(
     N_OUT,
     MAX_M,
     epilog,
+    *,
+    aq_rsrc=None,
+    D_INTER=K,
+    aStages=kStages,
 ):
     _atomic = epilog == "atomic"
+    _aStages = aStages
     _kMChunks = kmchunks(BM)
     _slot_bytes = saq_slot_bytes(BM)
     _lds_acc_floats = BM * BN
-    _ascale_bytes = ascale_bytes(BM, MAX_M)
-    _bq_bytes = bq_bytes_for(NE, N_OUT)
-    _bscale_bytes = bscale_bytes_for(NE, N_OUT)
-    _kbs_per_expert_dw = kbs_per_expert_dw_for(N_OUT)
+    # K-derived sizes (parametrized over the contraction dim K = inter_dim = D_INTER).
+    _K = D_INTER
+    _K_HALF = k_half_for(_K)
+    _K_TILES_TOTAL = k_tiles_total_for(_K)  # KIMI: 2
+    _kUnroll = kunroll_for(_K)  # streaming main-loop trips (KIMI: 0)
+    _kAS_per_chunk_dw = kas_per_chunk_dw_for(_K)
+    _kBS_stride_n0_dw = kbs_stride_n0_dw_for(_K)
+    _ascale_bytes = ascale_bytes(BM, MAX_M, _K)
+    _bq_bytes = bq_bytes_for(NE, N_OUT, _K)
+    _bscale_bytes = bscale_bytes_for(NE, N_OUT, _K)
+    _kbs_per_expert_dw = kbs_per_expert_dw_for(N_OUT, _K)
     _num_n_blocks = num_n_blocks_for(N_OUT)
-    _kSubBlocks = tiling(BM)[2]  # BM16/32: 1, BM64: 2, BM128: 4
+    _n_load_waves, _rows_per_wave, _kSubBlocks = tiling(
+        BM
+    )  # BM16/32:1, BM64:2, BM128:4
     b_aux = 2 if use_nt else 0  # NT: B_q loads carry aux=2 (non-temporal hint)
 
     # block -> (m_block_idx, n_block_idx) ; e = sorted_expert_ids[m_block_idx]
@@ -518,7 +628,7 @@ def _gemm2_body(
 
     # -- LDS base ------------------------------------------------------------
     lds_base = allocator.get_base()
-    saq = SmemPtr(lds_base, lds_off, T.i8, shape=(kStages * _slot_bytes,))
+    saq = SmemPtr(lds_base, lds_off, T.i8, shape=(_aStages * _slot_bytes,))
     # lds_acc (cshuffle scratch) only used by atomic / mxfp4 epilogs.
     lds_acc = (
         SmemPtr(lds_base, lds_off, T.f32, shape=(_lds_acc_floats,))
@@ -537,7 +647,7 @@ def _gemm2_body(
             + n_block_idx * fx.Int32(BN)
             + wave * fx.Int32(BN // 4)
             + fx.Int32(j * 16)
-        ) * fx.Int32(K_HALF)
+        ) * fx.Int32(_K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     mni_base = n_block_idx * fx.Int32(BN // 16 // 2) + wave * fx.Int32(BN // 64 // 2)
@@ -545,7 +655,7 @@ def _gemm2_body(
     for mw in range_constexpr(2):
         v = (
             e * fx.Int32(_kbs_per_expert_dw)
-            + (mni_base + fx.Int32(mw)) * fx.Int32(kBS_stride_n0_dw)
+            + (mni_base + fx.Int32(mw)) * fx.Int32(_kBS_stride_n0_dw)
         ) * fx.Int32(4)
         b_scale_s_base.append(rocdl.readfirstlane(T.i32, v))
 
@@ -554,59 +664,73 @@ def _gemm2_body(
     a_scale_s_base = [
         rocdl.readfirstlane(
             T.i32,
-            (chunk_base + fx.Int32(sub)) * fx.Int32(kAS_per_chunk_dw) * fx.Int32(4),
+            (chunk_base + fx.Int32(sub)) * fx.Int32(_kAS_per_chunk_dw) * fx.Int32(4),
         )
         for sub in range_constexpr(_kSubBlocks)
     ]
 
-    # -- a_scale (atomic) : v_voff = ((lane/16)*16 + lane%16)*4 ; per sub-block -
     v_voff_scale = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
-    a_scale_v = [[None, None] for _ in range(_kSubBlocks)]
-    for sub in range_constexpr(_kSubBlocks):
-        for ku in range_constexpr(2):
-            a_scale_v[sub][ku] = buffer_ops.buffer_load(
+
+    # -- per-K-tile scale / B load helpers (K-tile offset is K-independent:
+    #    A-scale & B-scale = kt*256 bytes; B_q = kt*2048 bytes) -----------------
+    def load_a_scale_tile(kt):
+        # a_scale_v[sub] for K-tile kt (atomic): ((lane/16)*16 + lane%16)*4 + kt*256
+        out = [None] * _kSubBlocks
+        for sub in range_constexpr(_kSubBlocks):
+            out[sub] = buffer_ops.buffer_load(
                 ascale_rsrc,
-                (v_voff_scale + fx.Int32(ku * 256)) // fx.Int32(4),
+                (v_voff_scale + fx.Int32(kt * 256)) // fx.Int32(4),
                 vec_width=1,
                 dtype=T.i32,
                 soffset_bytes=a_scale_s_base[sub],
             )
+        return out
 
-    # -- b_scale ku0/ku1 ------------------------------------------------------
-    b_scale_v = [[None, None], [None, None]]
-    for ku in range_constexpr(2):
-        imm = ku * (kBS_stride_k0_dw * 4)
+    def load_b_scale_tile(kt):
+        # b_scale[mw] for K-tile kt: v_voff + kt*(kBS_stride_k0_dw*4)
+        imm = kt * (kBS_stride_k0_dw * 4)
+        out = [None, None]
         for mw in range_constexpr(2):
-            v = buffer_ops.buffer_load(
+            out[mw] = buffer_ops.buffer_load(
                 bscale_rsrc,
                 (v_voff_scale + fx.Int32(imm)) // fx.Int32(4),
                 vec_width=1,
                 dtype=T.i32,
                 soffset_bytes=b_scale_s_base[mw],
             )
-            b_scale_v[ku][mw] = v
+        return out
 
-    # -- B loads (NT: cache_modifier=2) : v_voff = (lane/16)*256 + (lane%16)*16 + K_BYTE
-    b = [[[None, None] for _ in range(4)] for _ in range(2)]
-    for kc in range_constexpr(2):
-        k_byte = kc * 2048
+    def load_b_tile(kt):
+        # b[j][half] for K-tile kt: (lane/16)*256 + (lane%16)*16 + kt*2048 (+ half*1024)
         v_voff_b = (
             (lane_div_16 * fx.Int32(256))
             + (lane_mod_16 * fx.Int32(16))
-            + fx.Int32(k_byte)
+            + fx.Int32(kt * 2048)
         )
+        out = [[None, None] for _ in range(4)]
         for j in range_constexpr(4):
             for half in range_constexpr(2):
-                imm = half * 1024
                 frag = buffer_ops.buffer_load(
                     bq_rsrc,
-                    (v_voff_b + fx.Int32(imm)) // fx.Int32(4),
+                    (v_voff_b + fx.Int32(half * 1024)) // fx.Int32(4),
                     vec_width=4,
                     dtype=T.i32,
                     cache_modifier=b_aux,
                     soffset_bytes=b_load_s_base[j],
                 )
-                b[kc][j][half] = Vec(frag)
+                out[j][half] = Vec(frag)
+        return out
+
+    # -- streaming A->LDS: issue K-tile `kt` into LDS slot `slot` (K_TILES_TOTAL>2
+    #    only; the K_TILES_TOTAL==2 prologue is preloaded by the kernel). Mirrors
+    #    gemm1.issue_a_load_lds: m_row-derived cached rows + lds_swizzle. -------
+    def issue_a_load_lds(slot, kt):
+        for sub in range_constexpr(_kSubBlocks):
+            lds_row = wave * fx.Int32(_rows_per_wave) + fx.Int32(sub * 8)
+            car = m_row + lds_row + (lane // fx.Int32(8))
+            _issue_a_load_lds(
+                aq_rsrc, saq, slot, kt, car, lane, _slot_bytes, lds_row, k_half=_K_HALF
+            )
 
     # -- ds_read(slot) -> a[i][k] (i32x4) ; i in [0,kMChunks) -----------------
     def issue_a_ds_read(slot):
@@ -634,13 +758,13 @@ def _gemm2_body(
     zero4 = Vec.filled(4, 0.0, fx.Float32)
     accm = [[None, None, None, None] for _ in range(_kMChunks)]
 
-    def mfma_cluster(slot, a, a_scale_sub, b_scale_slot, init):
+    def mfma_cluster(b_tile, a, a_scale_sub, b_scale_slot, init):
         for J in range_constexpr(4):
             mni = J // 2
             in_b = J % 2
             sb = b_scale_slot[mni]
-            b_J0 = b[slot][J][0]
-            b_J1 = b[slot][J][1]
+            b_J0 = b_tile[J][0]
+            b_J1 = b_tile[J][1]
             for sub in range_constexpr(_kSubBlocks):
                 sa = a_scale_sub[sub]
                 i0 = sub * 2
@@ -674,17 +798,18 @@ def _gemm2_body(
                         [a[i1][1], b_J1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb],
                     )
 
-    # -- K loop (2 stages, fully unrolled) ------------------------------------
-    for S in range_constexpr(kStages):
-        kt = K_TILES_TOTAL - kStages + S
-        slot = kt % kStages
+    # -- K-loop fence helper (shared by fast + streaming paths) ---------------
+    # `S` selects the atomic path's hand-tuned vmcnt (23 on the first drained tile,
+    # 22 after). For the streaming main loop there is an extra in-flight A->LDS
+    # store per iter (the next tile), so the vmcnt budget shifts -- pass vmcnt_atomic
+    # explicitly there.
+    def _kloop_fence(vmcnt_atomic):
         if const_expr(_atomic):
             # atomic: explicit vmcnt-tuned cross-wave fence (loads land before ds_read).
-            vmcnt = 23 if S == 0 else 22
             llvm.inline_asm(
                 res=None,
                 operands_=[],
-                asm_string=f"s_waitcnt vmcnt({vmcnt})",
+                asm_string=f"s_waitcnt vmcnt({vmcnt_atomic})",
                 constraints="",
                 has_side_effects=True,
             )
@@ -705,9 +830,60 @@ def _gemm2_body(
                 has_side_effects=True,
             )
             _s_barrier_bare()
-        a = issue_a_ds_read(slot)
-        a_scale_sub = [a_scale_v[sub][kt] for sub in range_constexpr(_kSubBlocks)]
-        mfma_cluster(slot, a, a_scale_sub, b_scale_v[slot], init=(S == 0))
+
+    if const_expr(_K_TILES_TOTAL == kStages):
+        # -- KIMI/DSR fast path: K_TILES_TOTAL==2, fully unrolled, ALL tiles
+        #    preloaded by the kernel. Byte-for-byte identical to the original
+        #    K=512 port: load all B + scales upfront, then the unrolled 2-stage
+        #    K-loop (vmcnt 23 then 22) with no streaming A->LDS. -----------------
+        a_scale_v = [load_a_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
+        b_scale_v = [load_b_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
+        b = [load_b_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
+        for S in range_constexpr(kStages):
+            kt = _K_TILES_TOTAL - kStages + S
+            slot = kt % kStages
+            _kloop_fence(23 if S == 0 else 22)
+            a = issue_a_ds_read(slot)
+            a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
+            mfma_cluster(b[slot], a, a_scale_sub, b_scale_v[slot], init=(S == 0))
+    else:
+        # -- streaming double-buffered K-loop (K_TILES_TOTAL>2): the kernel
+        #    preloaded tiles 0..kStages-1 (prologue) into the kStages LDS slots.
+        #    B-q + scales for ALL tiles are loaded into registers up front (they
+        #    are not LDS-bound; matches the fast path's upfront B/scale loads).
+        #    The main loop processes tiles [0, kUnroll) while streaming the next
+        #    tile [kStages, K_TILES_TOTAL) into the freed LDS slot; the drain
+        #    processes the final kStages tiles. Mirrors mxfp4_gemm1's K-loop. ----
+        a_scale_v = [load_a_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
+        b_scale_v = [load_b_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
+        b = [load_b_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
+
+        # main loop: OFFSET in [0, kUnroll). Process tile kt=OFFSET (read from LDS
+        # slot kt%_aStages), and stream the next tile next_kt=kStages+OFFSET into
+        # slot next_kt%_aStages. With _aStages=3 (triple buffer) read-slot and
+        # write-slot never alias, so the streamed load cannot clobber the tile this
+        # iteration is reading. A loop-top barrier (inside _kloop_fence) guards the
+        # cross-iteration reuse of each slot.
+        for OFFSET in range_constexpr(_kUnroll):
+            kt = OFFSET
+            slot = kt % _aStages
+            next_kt = kStages + OFFSET
+            write_slot = next_kt % _aStages
+            _kloop_fence(23 if OFFSET == 0 else 22)
+            a = issue_a_ds_read(slot)
+            # stream next tile's A into the freed slot (overlaps with the mfma).
+            issue_a_load_lds(write_slot, next_kt)
+            a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
+            mfma_cluster(b[kt], a, a_scale_sub, b_scale_v[kt], init=(OFFSET == 0))
+
+        # drain: final kStages tiles (already in LDS, no further streaming).
+        for S in range_constexpr(kStages):
+            kt = _K_TILES_TOTAL - kStages + S
+            slot = kt % _aStages
+            _kloop_fence(22)
+            a = issue_a_ds_read(slot)
+            a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
+            mfma_cluster(b[kt], a, a_scale_sub, b_scale_v[kt], init=False)
 
     # -- epilog ---------------------------------------------------------------
     saq._view_cache = None
