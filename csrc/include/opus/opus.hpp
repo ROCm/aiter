@@ -1672,7 +1672,7 @@ struct gmem {
         using type = vector_type<vec>;
 #if defined(__gfx1250__)
         // gfx1250: global_load_async_to_lds (global addressing, not buffer rsrc).
-        // VGLOBAL.IOFFSET is a 24-bit signed offset that must be positive (sp3 MI400 ?13.2): range [0, 2^23 - 1].
+        // VGLOBAL.IOFFSET is a 24-bit signed offset that must be positive (sp3 MI400 §13.2): range [0, 2^23 - 1].
         static_assert(ios >= 0 && ios <= (1 << 23) - 1, "_async_load: ios exceeds gfx1250 VGLOBAL IOFFSET range [0, 2^23 - 1]");
         #define GPTR_(T, p) ((__attribute__((address_space(1))) T*)(p))
         #define LPTR_(T, p) ((OPUS_LDS_ADDR T*)(p))
@@ -1688,7 +1688,7 @@ struct gmem {
         #undef GPTR_
         #undef LPTR_
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__)   // CDNA: buffer-load lands directly in LDS (vmem-to-lds-load-insts).
-        // CDNA MUBUF.OFFSET is a 12-bit unsigned byte offset (sp3 MI350 ?7.2): range [0, 2^12 - 1].
+        // CDNA MUBUF.OFFSET is a 12-bit unsigned byte offset (sp3 MI350 §7.2): range [0, 2^12 - 1].
         static_assert(ios >= 0 && ios <= (1 << 12) - 1, "_async_load: ios exceeds CDNA MUBUF OFFSET range [0, 2^12 - 1]");
 #if __clang_major__ >= 20    // clang 20+ raw_ptr builtin (rocm 7.0+)
         if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, ios, aux); }
