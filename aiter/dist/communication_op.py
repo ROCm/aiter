@@ -79,6 +79,25 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     )
 
 
+def tensor_model_parallel_fused_allreduce_rmsnorm_fp32(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    prefill_support: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Plain fused AR+RMSNorm that also returns an fp32 mirror of the normed
+    output: ``(bf16_out, bf16_residual, fp32_out)``."""
+    _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm_fp32")
+    return get_tp_group().fused_allreduce_rmsnorm_fp32(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        prefill_support,
+    )
+
+
 def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     input_: torch.Tensor,
     residual_inp_: torch.Tensor,

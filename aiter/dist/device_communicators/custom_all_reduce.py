@@ -749,6 +749,7 @@ class CustomAllreduce:
         use_1stage: bool = False,
         post_per_token_quant: bool = False,
         out_hidden_dim: int = 0,
+        emit_fp32: bool = False,
     ):
         valid_dim = w.numel()
         if res_out is None:
@@ -764,6 +765,15 @@ class CustomAllreduce:
                     inp.shape[:-1] + (out_dim,), dtype=inp.dtype, device=inp.device
                 )
             assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+            # Optional fp32 mirror of the normed output (same logical shape as
+            # `out`). Lets consumers skip a separate .float() cast.
+            fp32_out = None
+            fp32_out_ptr = 0
+            if emit_fp32:
+                fp32_out = torch.empty(
+                    out.shape, dtype=torch.float32, device=inp.device
+                )
+                fp32_out_ptr = int(fp32_out.data_ptr())
             if inp.shape[-1] == valid_dim and out.shape[-1] == inp.shape[-1]:
                 ops.fused_allreduce_rmsnorm(
                     self._ptr,
@@ -776,8 +786,12 @@ class CustomAllreduce:
                     reg,
                     reg_bytes,
                     use_1stage,
+                    fp32_out_ptr,
                 )
             else:
+                # pad path: fp32 mirror not plumbed (only used for padded
+                # output widths, which the fp32-consumer paths do not request).
+                assert not emit_fp32, "emit_fp32 is not supported with padded output"
                 ops.fused_allreduce_rmsnorm_pad(
                     self._ptr,
                     inp,
@@ -790,6 +804,8 @@ class CustomAllreduce:
                     reg_bytes,
                     use_1stage,
                 )
+            if emit_fp32:
+                return out, res_out, fp32_out
             return out, res_out
         else:
             if out is None:
@@ -822,6 +838,7 @@ class CustomAllreduce:
         eps: float,
         use_1stage: bool,
         out_hidden_dim: int = 0,
+        emit_fp32: bool = False,
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -836,21 +853,28 @@ class CustomAllreduce:
                     registered=True,
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
+                    emit_fp32=emit_fp32,
                 )
             else:
                 out_dim = out_hidden_dim or input.shape[-1]
-                return (
-                    torch.zeros(
-                        input.shape[:-1] + (out_dim,),
-                        dtype=input.dtype,
-                        device=input.device,
-                    ),
-                    torch.zeros(
-                        input.shape[:-1] + (weight.numel(),),
-                        dtype=input.dtype,
-                        device=input.device,
-                    ),
+                out_dummy = torch.zeros(
+                    input.shape[:-1] + (out_dim,),
+                    dtype=input.dtype,
+                    device=input.device,
                 )
+                res_dummy = torch.zeros(
+                    input.shape[:-1] + (weight.numel(),),
+                    dtype=input.dtype,
+                    device=input.device,
+                )
+                if emit_fp32:
+                    fp32_dummy = torch.zeros(
+                        input.shape[:-1] + (out_dim,),
+                        dtype=torch.float32,
+                        device=input.device,
+                    )
+                    return out_dummy, res_dummy, fp32_dummy
+                return out_dummy, res_dummy
         else:
             return self.fused_ar_rms(
                 input,
@@ -860,6 +884,7 @@ class CustomAllreduce:
                 registered=False,
                 use_1stage=use_1stage,
                 out_hidden_dim=out_hidden_dim,
+                emit_fp32=emit_fp32,
             )
 
     def custom_fused_ar_rms_packed_input(

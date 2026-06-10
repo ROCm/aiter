@@ -164,6 +164,52 @@ def fused_allreduce_rmsnorm_(
     )
 
 
+def fused_allreduce_rmsnorm_fp32_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Returns (bf16_out, bf16_residual_out, fp32_out). The fp32 mirror has the
+    # same logical shape as the bf16 output.
+    n = w.shape[-1]
+    out = torch.empty(inp.shape[:-1] + (n,), dtype=inp.dtype, device=inp.device)
+    res_out = torch.empty_like(res_inp)
+    fp32_out = torch.empty(
+        inp.shape[:-1] + (n,), dtype=torch.float32, device=inp.device
+    )
+    return out, res_out, fp32_out
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fp32_fake)
+def fused_allreduce_rmsnorm_fp32_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Plain fused AR+RMSNorm that ALSO emits an fp32 mirror of the normed
+    output, so consumers (e.g. the MoE router gate) can skip a .float() cast.
+    Registered as a separate op (3 outputs) so the 2-output
+    ``fused_allreduce_rmsnorm_`` contract is untouched."""
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_out_place(
+        inp,
+        res_inp,
+        w,
+        eps,
+        prefill_support,
+        emit_fp32=True,
+    )
+
+
 def fused_allreduce_rmsnorm_quant_fake(
     inp: torch.Tensor,
     res_inp: torch.Tensor,
@@ -548,6 +594,26 @@ class GroupCoordinator:
             x_pad_to_multiple=x_pad_to_multiple,
         )
 
+    def fused_allreduce_rmsnorm_fp32(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Plain fused AR+RMSNorm that also returns an fp32 mirror of the normed
+        # output: (bf16_out, bf16_residual, fp32_out). Traceable under
+        # torch.compile via the registered fused_allreduce_rmsnorm_fp32_ op.
+        return fused_allreduce_rmsnorm_fp32_(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_name=self.unique_name,
+            prefill_support=prefill_support,
+        )
+
     def fused_allreduce_rmsnorm_quant(
         self,
         input_: torch.Tensor,
@@ -667,6 +733,7 @@ class GroupCoordinator:
         eps: float,
         prefill_support: bool = False,
         x_pad_to_multiple: int = 0,
+        emit_fp32: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -677,6 +744,7 @@ class GroupCoordinator:
             eps,
             prefill_support,
             x_pad_to_multiple=x_pad_to_multiple,
+            emit_fp32=emit_fp32,
         )
 
     def _fused_allreduce_rmsnorm_quant_out_place(

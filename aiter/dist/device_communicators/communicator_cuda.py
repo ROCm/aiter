@@ -241,6 +241,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
         prefill_support: bool = False,
         x_pad_to_multiple: int = 0,
+        emit_fp32: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from aiter.dist.device_communicators.custom_all_reduce import (
             can_pack_2d_last_dim_slice,
@@ -286,14 +287,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and can_use_custom_ar
             and ca_comm.should_custom_ar(input_, prefill_support)
         ):
-            out, res_out = ca_comm.custom_fused_ar_rms(
+            result = ca_comm.custom_fused_ar_rms(
                 input_,
                 res_inp_,
                 weight_,
                 eps,
                 use_1stage,
                 out_hidden_dim=out_n,
+                emit_fp32=emit_fp32,
             )
+            if emit_fp32:
+                out, res_out, fp32_out = result
+                assert out is not None and res_out is not None and fp32_out is not None
+                return out, res_out, fp32_out
+            out, res_out = result
             assert out is not None
             assert res_out is not None
             return out, res_out
@@ -316,6 +323,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             assert out is not None
             assert res_out is not None
+            if emit_fp32:
+                return out, res_out, out.float()
             return out, res_out
 
         input_for_ar = input_ if input_is_weak_contiguous else input_.contiguous()
@@ -347,6 +356,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             out = out_2d.reshape(input_.shape[:-1] + (out_2d.shape[-1],))
             residual_out = residual_out_2d.reshape(res_inp_.shape)
+            if emit_fp32:
+                return out, residual_out, out.float()
             return out, residual_out
 
         # call split kernel
@@ -363,6 +374,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             eps,
             0,
         )
+        if emit_fp32:
+            return out, residual_out, out.float()
         return out, residual_out
 
     def fused_allreduce_rmsnorm_quant(

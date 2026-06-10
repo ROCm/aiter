@@ -1213,7 +1213,8 @@ __global__ void __launch_bounds__(tnum, 1)
                                     float eps,
                                     int rank,
                                     int m,
-                                    int n)
+                                    int n,
+                                    float* __restrict__ fp32_output = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1255,17 +1256,23 @@ __global__ void __launch_bounds__(tnum, 1)
         {
             P rmsnorm_rslt;
             P rmsnorm_inp;
+            using FA = opus::vector_t<opus::fp32_t, pack_size>;
+            FA rmsnorm_rslt_f32;
 #pragma unroll
             for(int i = 0; i < pack_size; ++i)
             {
-                float x_f32     = rms_inp_f32[n_iter][i];
-                float w_f32     = upcast_s(w_arr[n_iter][i]);
-                rmsnorm_inp[i]  = downcast_s<T>(x_f32);
-                rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
+                float x_f32       = rms_inp_f32[n_iter][i];
+                float w_f32       = upcast_s(w_arr[n_iter][i]);
+                float normed_f32  = x_f32 * w_f32 * denom;
+                rmsnorm_inp[i]    = downcast_s<T>(x_f32);
+                rmsnorm_rslt[i]   = downcast_s<T>(normed_f32);
+                rmsnorm_rslt_f32[i] = normed_f32;
             }
             int write_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
             *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
             *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
+            if(fp32_output != nullptr)
+                *(reinterpret_cast<FA*>(fp32_output) + write_idx) = rmsnorm_rslt_f32;
         }
     }
 }
@@ -1284,7 +1291,8 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                                                                      int rank,
                                                                      int m,
                                                                      int n,
-                                                                     int out_hidden_dim)
+                                                                     int out_hidden_dim,
+                                                                     float* __restrict__ fp32_output = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1334,18 +1342,24 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
             {
                 P rmsnorm_rslt;
                 P rmsnorm_inp;
+                using FA = opus::vector_t<opus::fp32_t, pack_size>;
+                FA rmsnorm_rslt_f32;
 #pragma unroll
                 for(int i = 0; i < pack_size; ++i)
                 {
-                    float x_f32     = rms_inp_f32[n_iter][i];
-                    float w_f32     = upcast_s(w_arr[n_iter][i]);
-                    rmsnorm_inp[i]  = downcast_s<T>(x_f32);
-                    rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
+                    float x_f32      = rms_inp_f32[n_iter][i];
+                    float w_f32      = upcast_s(w_arr[n_iter][i]);
+                    float normed_f32 = x_f32 * w_f32 * denom;
+                    rmsnorm_inp[i]   = downcast_s<T>(x_f32);
+                    rmsnorm_rslt[i]  = downcast_s<T>(normed_f32);
+                    rmsnorm_rslt_f32[i] = normed_f32;
                 }
                 int read_idx         = bid * in_pack_count + n_iter * tnum + threadIdx.x;
                 int output_write_idx = bid * out_pack_count + n_iter * tnum + threadIdx.x;
                 *(reinterpret_cast<P*>(results) + output_write_idx) = rmsnorm_rslt;
                 *(reinterpret_cast<P*>(residual_out) + read_idx)    = rmsnorm_inp;
+                if(fp32_output != nullptr)
+                    *(reinterpret_cast<FA*>(fp32_output) + output_write_idx) = rmsnorm_rslt_f32;
             }
         }
         for(int tail_offset = threadIdx.x; tail_offset < tail_pack_count; tail_offset += blockDim.x)
@@ -1629,15 +1643,30 @@ __device__ __forceinline__ void ar_fusion_epilogue(A& in,
                                                    int block_size,
                                                    OutT* __restrict__ output,
                                                    float* __restrict__ scale_out,
-                                                   bool active = true)
+                                                   bool active            = true,
+                                                   float* __restrict__ fp32_output = nullptr)
 {
     if constexpr(std::is_same_v<T, OutT>)
     {
-        P out;
-        ar_fusion_epilogue_rms_norm<P, A, P, T, PACK_SIZE>(
-            out, in, weight, eps, hidden_dim, block_size);
+        // Plain (non-quant) path: T == OutT (bf16/fp16). Compute the normed
+        // output in fp32, write the bf16 mirror to `output`, and -- when
+        // requested -- also write the unrounded fp32 mirror to `fp32_output`.
+        // The fp32 mirror lets downstream consumers (e.g. the MoE router gate)
+        // skip a separate hidden_states.float() cast.
+        using FA = opus::vector_t<opus::fp32_t, PACK_SIZE>;
+        FA out_f32;
+        ar_fusion_epilogue_rms_norm<P, A, FA, opus::fp32_t, PACK_SIZE>(
+            out_f32, in, weight, eps, hidden_dim, block_size);
         if(active)
+        {
+            P out;
+#pragma unroll
+            for(int i = 0; i < PACK_SIZE; ++i)
+                out[i] = downcast_s<T>(out_f32[i]);
             *reinterpret_cast<P*>(output + idx) = out;
+            if(fp32_output != nullptr)
+                *reinterpret_cast<FA*>(fp32_output + idx) = out_f32;
+        }
     }
     else
     {
@@ -1760,7 +1789,8 @@ __global__ void __launch_bounds__(1024, 1)
                                    int input_hidden_dim,
                                    int hidden_dim,
                                    int out_hidden_dim,
-                                   float eps)
+                                   float eps,
+                                   float* __restrict__ fp32_output = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
@@ -1846,7 +1876,8 @@ __global__ void __launch_bounds__(1024, 1)
         padded_block_size,
         output,
         scale_out,
-        active);
+        active,
+        fp32_output);
     if(active_tail)
     {
         OP zero_pack{};
@@ -2208,7 +2239,8 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                              int hidden_dim,
                                              int out_hidden_dim,
                                              float eps,
-                                             hipStream_t stream)
+                                             hipStream_t stream,
+                                             float* fp32_output = nullptr)
 {
     constexpr int PACK_SIZE  = 16 / sizeof(T);
     constexpr int WARP_SIZE  = 32;
@@ -2236,7 +2268,8 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                                     input_hidden_dim,
                                                     hidden_dim,
                                                     out_hidden_dim,
-                                                    eps);
+                                                    eps,
+                                                    fp32_output);
 }
 
 template <typename T, int ngpus, int WARP_SIZE>
@@ -2445,7 +2478,8 @@ __global__ void __launch_bounds__(1024, 1)
                                    float* __restrict__ scale_out,
                                    int size,
                                    int hidden_dim,
-                                   float eps)
+                                   float eps,
+                                   float* __restrict__ fp32_output = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
@@ -2523,7 +2557,8 @@ __global__ void __launch_bounds__(1024, 1)
             acc[v] = upcast_s(vec[v]);
         }
         ar_fusion_epilogue<P, A, T, OutT, pack_size>(
-            acc, weight_p, hidden_dim, eps, idx, tidx, block_size, output, scale_out);
+            acc, weight_p, hidden_dim, eps, idx, tidx, block_size, output, scale_out,
+            /*active=*/true, fp32_output);
     }
 }
 
@@ -3542,7 +3577,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    int input_hidden_dim,
                                    int n,
                                    int out_n,
-                                   bool use_1stage)
+                                   bool use_1stage,
+                                   float* fp32_output = nullptr)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -3590,7 +3626,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                                              n,                    \
                                                              out_n,                \
                                                              eps,                  \
-                                                             stream);              \
+                                                             stream,               \
+                                                             fp32_output);         \
         return;                                                                    \
     }
 
@@ -3634,16 +3671,17 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);              \
         setGrid(naive_grid_size, kernel_ptr);                                          \
         template_kernel<<<grid, block, 0, stream>>>(                                   \
-            sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, out_n); \
+            sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, out_n,  \
+            fp32_output);                                                              \
     } while(0)
 
-#define launch_fused_allreduce_rmsnorm(template_kernel)                         \
-    do                                                                          \
-    {                                                                           \
-        auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);       \
-        setGrid(naive_grid_size, kernel_ptr);                                   \
-        template_kernel<<<grid, block, 0, stream>>>(                            \
-            sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
+#define launch_fused_allreduce_rmsnorm(template_kernel)                                      \
+    do                                                                                       \
+    {                                                                                        \
+        auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);                    \
+        setGrid(naive_grid_size, kernel_ptr);                                                \
+        template_kernel<<<grid, block, 0, stream>>>(                                         \
+            sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, fp32_output); \
     } while(0)
 
     // n_packs = number of vectorized elements per row

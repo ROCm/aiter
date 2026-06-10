@@ -458,7 +458,8 @@ namespace py = pybind11;
           py::arg("eps"),                                                                      \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
-          py::arg("use_1stage"));                                                              \
+          py::arg("use_1stage"),                                                               \
+          py::arg("fp32_out_ptr") = static_cast<int64_t>(0));                                  \
     m.def("fused_allreduce_rmsnorm_pad",                                                       \
           &aiter::fused_allreduce_rmsnorm_pad,                                                 \
           py::arg("_fa"),                                                                      \
