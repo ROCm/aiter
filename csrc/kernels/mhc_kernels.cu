@@ -1789,7 +1789,8 @@ namespace aiter {
         float hc_sinkhorn_eps = 1e-6,
         float norm_eps = 1e-6,
         float hc_post_mult_value = 1.0,
-        int sinkhorn_repeat = 20
+        int sinkhorn_repeat = 20,
+        int use_nt = -1
     )
     {
         int m = residual.size(0);
@@ -1803,7 +1804,12 @@ namespace aiter {
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
-        
+        bool residual_nt = false;
+        bool layer_nt = false;
+        resolve_big_fuse_cache_policies(use_nt, m, cu_num, residual_nt, layer_nt);
+        (void)residual_nt;
+        (void)layer_nt;
+
         MHC_PRE_BIG_FUSE_RM_KERNEL_DISPATCH(m);
     }
 

@@ -39,7 +39,8 @@ void mhc_pre_big_fuse_rmsnorm(torch::Tensor& post_mix,        // (m, hc_mult)
                               float hc_sinkhorn_eps    = 1e-6,
                               float norm_eps           = 1e-6,
                               float hc_post_mult_value = 1.0,
-                              int sinkhorn_repeat      = 20);
+                              int sinkhorn_repeat      = 20,
+                              int use_nt               = -1);
 void mhc_post(torch::Tensor& out,            // (m, hc_mult, hidden_size)
               torch::Tensor& x,              // (m, hidden_size)
               torch::Tensor& residual,       // (m, hc_mult, hidden_size)
