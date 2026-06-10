@@ -23,6 +23,7 @@ from aiter.ops.mha import (
     flash_attn_i8fp8_pertensor_func,
     flash_attn_i8fp8_sparse_pertensor_func,
     flash_attn_mxfp4_sparse_pertensor_func,
+    flash_attn_fp8_sparse_pertensor_func,
 )
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
@@ -73,6 +74,7 @@ KernelName = Literal[
     "aiter_bf16",
     "aiter_asm_sparse",
     "aiter_asm_sparse_mxfp4",
+    "aiter_asm_sparse_fp8",
 ]
 
 ALL_KERNELS: List[str] = [
@@ -91,6 +93,7 @@ FP8_CHECK_KERNELS = {
     "aiter_i8fp8",
     "aiter_asm_sparse",
     "aiter_asm_sparse_mxfp4",
+    "aiter_asm_sparse_fp8",
 }
 
 # -----------------------------------------------------------------------------
@@ -184,6 +187,79 @@ def make_asm_sparse_runner(
         return flash_attn_i8fp8_sparse_pertensor_func(
             q_int8,
             k_int8,
+            v_fp8,
+            q_descale,
+            k_descale,
+            v_descale,
+            kv_block_indices,
+            lut_start,
+            lut_count,
+            softmax_scale=softmax_scale,
+        )
+
+    return _run
+
+
+def make_asm_sparse_fp8_runner(
+    args: argparse.Namespace,
+    q_bshd: torch.Tensor,
+    k_bshd: torch.Tensor,
+    v_bshd: torch.Tensor,
+    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> Any:
+    """Runner factory for the hand-written ASM block-sparse all-fp8 Sage kernel.
+
+    Mirrors ``make_asm_sparse_runner`` but quantizes Q/K/V to fp8 (E4M3)
+    per-tensor (the same ``fp8_quantize`` the dense ``aiter_fp8`` backend
+    uses), and dispatches through
+    ``flash_attn_fp8_sparse_pertensor_func`` ->
+    ``aiter.ops.mha.fmha_v3_fwd_fp8_sparse`` ->
+    ``aiter::torch_itfs::fmha_v3_fwd_fp8_sparse`` ->
+    ``aiter::fmha_fwd_v3_fp8_sparse`` -> .co launch
+    (fwd_hd128_fp8_sparse.co, kernel symbol
+    _ZN5aiter32fmha_fwd_hd128_fp8_sparse_gfx950E).
+
+    Returns a 0-arg closure compatible with triton.testing.do_bench.
+    """
+    if block_lut is None:
+        raise ValueError(
+            "aiter_asm_sparse_fp8 requires --block-sparsity or "
+            "--block-mask-file; the kernel has no dense traversal path."
+        )
+    if args.causal:
+        raise NotImplementedError(
+            "aiter_asm_sparse_fp8 does not support causal masking yet."
+        )
+    if args.layout != "bshd":
+        raise ValueError("aiter_asm_sparse_fp8 expects --layout=bshd inputs.")
+    if (
+        q_bshd.shape[-1] != ASM_SPARSE_HEAD_DIM
+        or v_bshd.shape[-1] != ASM_SPARSE_HEAD_DIM
+    ):
+        raise ValueError(
+            f"aiter_asm_sparse_fp8 is hard-coded to hd={ASM_SPARSE_HEAD_DIM} "
+            f"(got Qd={q_bshd.shape[-1]}, Vd={v_bshd.shape[-1]})."
+        )
+
+    # Per-tensor fp8 quantization for Q/K/V (same contract as dense aiter_fp8).
+    q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = fp8_quantize(
+        q_bshd, k_bshd, v_bshd
+    )
+    q_descale = q_descale.reshape(1).to(torch.float32).contiguous()
+    k_descale = k_descale.reshape(1).to(torch.float32).contiguous()
+    v_descale = v_descale.reshape(1).to(torch.float32).contiguous()
+
+    kv_block_indices, lut_start, lut_count = block_lut
+    kv_block_indices = kv_block_indices.to(torch.int32).contiguous()
+    lut_start = lut_start.to(torch.int32).contiguous()
+    lut_count = lut_count.to(torch.int32).contiguous()
+
+    softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
+
+    def _run() -> torch.Tensor:
+        return flash_attn_fp8_sparse_pertensor_func(
+            q_fp8,
+            k_fp8,
             v_fp8,
             q_descale,
             k_descale,
@@ -539,7 +615,11 @@ def load_block_mask_from_json(
 def kernel_block_sizes(kernel: KernelName) -> Tuple[int, int]:
     if kernel == "sage_mxfp4":
         cfg = get_sage_fwd_configs_mxfp4()
-    elif kernel in ("aiter_asm_sparse", "aiter_asm_sparse_mxfp4"):
+    elif kernel in (
+        "aiter_asm_sparse",
+        "aiter_asm_sparse_mxfp4",
+        "aiter_asm_sparse_fp8",
+    ):
         return ASM_SPARSE_BLOCK_M, ASM_SPARSE_BLOCK_N
     else:
         cfg = get_sage_fwd_configs()
@@ -1041,6 +1121,9 @@ def make_kernel_runner(
             args, q_bshd, k_bshd, v_bshd, block_lut
         )
 
+    if args.kernel == "aiter_asm_sparse_fp8":
+        return make_asm_sparse_fp8_runner(args, q_bshd, k_bshd, v_bshd, block_lut)
+
     raise ValueError(f"Unsupported kernel: {args.kernel}")
 
 
@@ -1178,6 +1261,7 @@ def benchmark_single_case(
     _return_none_if_dense = args.kernel not in (
         "aiter_asm_sparse",
         "aiter_asm_sparse_mxfp4",
+        "aiter_asm_sparse_fp8",
     )
     block_lut = (
         block_attn_mask_to_ragged_lut(
@@ -1213,6 +1297,7 @@ def benchmark_single_case(
         "sage_mxfp4",
         "aiter_asm_sparse",
         "aiter_asm_sparse_mxfp4",
+        "aiter_asm_sparse_fp8",
     ):
         # Per-element size in BYTES for the GB/s memory-bw estimate. mxfp4
         # is 4 bits/elem = 0.5 B, but element_size in PyTorch is integer.
@@ -1234,6 +1319,7 @@ def benchmark_single_case(
             "aiter_i8fp8",
             "aiter_asm_sparse",
             "aiter_asm_sparse_mxfp4",
+            "aiter_asm_sparse_fp8",
         )
         else v.element_size()
     )
@@ -1439,7 +1525,11 @@ def validate_args(args: argparse.Namespace) -> None:
     ):
         logger.warning("MXFP4-specific flags are ignored unless --kernel=sage_mxfp4")
 
-    if args.kernel in ("aiter_asm_sparse", "aiter_asm_sparse_mxfp4"):
+    if args.kernel in (
+        "aiter_asm_sparse",
+        "aiter_asm_sparse_mxfp4",
+        "aiter_asm_sparse_fp8",
+    ):
         if args.block_sparsity is None and not args.block_mask_file:
             raise ValueError(
                 f"--kernel={args.kernel} requires --block-sparsity or "
@@ -1641,6 +1731,7 @@ def run_block_sparse_repetitions(
     _return_none_if_dense = args.kernel not in (
         "aiter_asm_sparse",
         "aiter_asm_sparse_mxfp4",
+        "aiter_asm_sparse_fp8",
     )
     warmup_mask = (
         torch.rand(shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device)
@@ -1796,13 +1887,15 @@ def parse_args() -> argparse.Namespace:
             "aiter_bf16",
             "aiter_asm_sparse",
             "aiter_asm_sparse_mxfp4",
+            "aiter_asm_sparse_fp8",
             "all",
         ],
         help=(
             "Kernel implementation to benchmark. Use 'all' to compare all "
-            "non-sparse backends. 'aiter_asm_sparse' (i8fp8) and "
-            "'aiter_asm_sparse_mxfp4' are the hand-written PyISA kernels "
-            "and REQUIRE --block-sparsity (or --block-mask-file)."
+            "non-sparse backends. 'aiter_asm_sparse' (i8fp8), "
+            "'aiter_asm_sparse_mxfp4', and 'aiter_asm_sparse_fp8' are the "
+            "hand-written PyISA kernels and REQUIRE --block-sparsity "
+            "(or --block-mask-file)."
         ),
     )
 

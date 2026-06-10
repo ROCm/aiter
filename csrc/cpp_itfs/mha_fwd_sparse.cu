@@ -31,6 +31,13 @@ static constexpr const char* kSparseMxfp4KernelName =
     "_ZN5aiter35fmha_fwd_hd128_mxfp4_sparse_gfx950E";
 static constexpr const char* kSparseMxfp4CoName =
     "fmha_v3_fwd/fwd_hd128_mxfp4_sparse.co";
+// fp8-quantized sibling (E4M3 Q/K/V). Same 704-byte kernarg layout and
+// same in_bpe=1 byte stride as the i8fp8 path, so init_sparse_v3_args is
+// reused unchanged; only the kernel symbol + .co name differ.
+static constexpr const char* kSparseFp8KernelName =
+    "_ZN5aiter32fmha_fwd_hd128_fp8_sparse_gfx950E";
+static constexpr const char* kSparseFp8CoName =
+    "fmha_v3_fwd/fwd_hd128_fp8_sparse.co";
 
 // Pack the 704-byte blob. The first 656 bytes mirror init_fmha_fwd_v3_args
 // (see mha_fwd.cu); the trailing 48 bytes hold the 3 LUT pointers (each 16
@@ -196,6 +203,65 @@ float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_conf
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
         kSparseMxfp4KernelName,
         [&]() { return AiterAsmKernel(kSparseMxfp4KernelName, kSparseMxfp4CoName); });
+
+    fmha_fwd_v3_sparse_args args{};
+    size_t arg_size = sizeof(args);
+    init_sparse_v3_args(args, a);
+
+    const int num_q_blocks = (a.seqlen_q + kSparseTileQ - 1) / kSparseTileQ;
+    const int gdx = num_q_blocks;
+    const int gdy = a.nhead_q;
+    const int gdz = a.batch;
+    const int bdx = kSparseBdx;
+
+    return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+        void* args_ptr     = &args;
+        size_t* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz,
+                                 bdx, 1, 1, s_.stream_id_});
+    });
+}
+
+// Block-sparse fp8 fmha sibling (E4M3 Q/K and fp8 V, per-tensor fp32
+// descales -- same descale contract as the i8fp8 path). Shares the
+// identical 704-byte kernarg blob and in_bpe=1 byte stride as the i8fp8
+// path, so init_sparse_v3_args is reused unchanged. The only on-device
+// difference is the kernel symbol + .co name.
+float fmha_fwd_v3_fp8_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
+{
+    if(!a.use_asm_v3)
+        return -1;
+
+    const std::string arch_id = get_gpu_arch();
+    if(arch_id != "gfx950")
+    {
+        AITER_LOG_WARNING("fmha_fwd_v3_fp8_sparse: only gfx950 is supported "
+                          "(detected arch: " << arch_id << ")");
+        return -1;
+    }
+    if(a.data_type != "fp8bf16")
+    {
+        AITER_LOG_WARNING("fmha_fwd_v3_fp8_sparse: only data_type=fp8bf16 is "
+                          "supported (got " << a.data_type << ")");
+        return -1;
+    }
+    if(a.is_group_mode || a.mask_type != 0 || a.has_lse || a.p_drop > 0.f ||
+       a.bias_type != 0)
+    {
+        AITER_LOG_WARNING("fmha_fwd_v3_fp8_sparse: unsupported feature combination "
+                          "(group/mask/lse/dropout/bias must all be off)");
+        return -1;
+    }
+
+    if(a.v3_api_check)
+    {
+        return 1;
+    }
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
+        kSparseFp8KernelName,
+        [&]() { return AiterAsmKernel(kSparseFp8KernelName, kSparseFp8CoName); });
 
     fmha_fwd_v3_sparse_args args{};
     size_t arg_size = sizeof(args);

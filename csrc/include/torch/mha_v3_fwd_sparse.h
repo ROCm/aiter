@@ -28,6 +28,25 @@ fmha_v3_fwd_sparse(at::Tensor& q,                  // [b, sq, hq, d], int8
                    float softmax_scale,
                    std::optional<at::Tensor> out_ = std::nullopt); // [b, sq, hq, d_v], bf16
 
+// Block-sparse fp8 sibling. Q/K/V are all fp8 (E4M3); descales are
+// per-tensor (or [b, hk]) fp32. Same LUT triple and bf16 output as the
+// i8fp8 variant -- the only contract difference is Q/K dtype (fp8 vs int8).
+//
+// Kernel: _ZN5aiter32fmha_fwd_hd128_fp8_sparse_gfx950E from
+// aiter/hsa/gfx950/fmha_v3_fwd/fwd_hd128_fp8_sparse.co.
+std::vector<at::Tensor>
+fmha_v3_fwd_fp8_sparse(at::Tensor& q,                  // [b, sq, hq, d], fp8
+                       const at::Tensor& k,            // [b, sk, hk, d], fp8
+                       const at::Tensor& v,            // [b, sk, hk, d_v], fp8
+                       const at::Tensor& q_descale,    // [1] or [b, hk], fp32
+                       const at::Tensor& k_descale,    // [1] or [b, hk], fp32
+                       const at::Tensor& v_descale,    // [1] or [b, hk], fp32
+                       const at::Tensor& kv_block_indices, // int32, ragged LUT data
+                       const at::Tensor& lut_start,        // int32 [b*hq*num_q_blocks]
+                       const at::Tensor& lut_count,        // int32 [b*hq*num_q_blocks]
+                       float softmax_scale,
+                       std::optional<at::Tensor> out_ = std::nullopt); // bf16
+
 // Block-sparse mxfp4 sibling. Q/K are fp4-packed bytes (logical hd=128
 // stored as byte[hd/2]); V is fp8; Q/K scales are E8M0 per-block
 // uint8/int8 bytes; V descale is fp32 per output channel. Same LUT

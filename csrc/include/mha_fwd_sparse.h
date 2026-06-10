@@ -53,4 +53,11 @@ float fmha_fwd_v3_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
 // validate shapes (see asm_mha_fwd_sparse.cu::fmha_v3_fwd_mxfp4_sparse).
 float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
 
+// Sparse fp8 sibling. Same kernarg layout, different .co
+// (fwd_hd128_fp8_sparse.co) generated from
+// /workspace/mi350_fmha_hd128_fp8_sparse.py. Q/K/V are all fp8 (E4M3)
+// and the descales are per-tensor fp32, so the dispatcher reuses the
+// i8fp8 init_sparse_v3_args path verbatim (in_bpe=1 for fp8).
+float fmha_fwd_v3_fp8_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
+
 } // namespace aiter
