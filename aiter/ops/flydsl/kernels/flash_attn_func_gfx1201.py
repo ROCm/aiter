@@ -115,8 +115,12 @@ def build_flash_attn_func_module_primary(
     BLOCK_M = block_m if block_m is not None else 128
     BLOCK_N = block_n if block_n is not None else 32
 
-    assert BLOCK_N % K_SUB_N == 0, f"BLOCK_N ({BLOCK_N}) must be a multiple of K_SUB_N ({K_SUB_N})"
-    assert BLOCK_M % ROWS_PER_WAVE == 0, f"BLOCK_M ({BLOCK_M}) must be a multiple of {ROWS_PER_WAVE}"
+    assert (
+        BLOCK_N % K_SUB_N == 0
+    ), f"BLOCK_N ({BLOCK_N}) must be a multiple of K_SUB_N ({K_SUB_N})"
+    assert (
+        BLOCK_M % ROWS_PER_WAVE == 0
+    ), f"BLOCK_M ({BLOCK_M}) must be a multiple of {ROWS_PER_WAVE}"
 
     N_SUB_TILES = BLOCK_N // K_SUB_N
     NUM_S_ACCS = N_SUB_TILES * 2
@@ -235,7 +239,9 @@ def build_flash_attn_func_module_primary(
             if const_expr(dtype_str == "bf16"):
                 a_i16 = Vec(a_v8).bitcast(fx.Int16)
                 b_i16 = Vec(b_v8).bitcast(fx.Int16)
-                return rocdl.wmma_f32_16x16x16_bf16(v8f32_type, _raw(a_i16), _raw(b_i16), c_v8).result
+                return rocdl.wmma_f32_16x16x16_bf16(
+                    v8f32_type, _raw(a_i16), _raw(b_i16), c_v8
+                ).result
             return rocdl.wmma_f32_16x16x16_f16(v8f32_type, a_v8, b_v8, c_v8).result
 
         seq_len_v = fx.Index(seq_len)
@@ -274,11 +280,15 @@ def build_flash_attn_func_module_primary(
             return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
         def _load_global_half_vec(ptr, base_idx, vec_type):
-            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(base_idx), elem_type=elem_type)
+            gep = buffer_ops.get_element_ptr(
+                ptr, fx.Int64(base_idx), elem_type=elem_type
+            )
             return _pointer_load(vec_type, gep)
 
         def _store_global_half(ptr, base_idx, val):
-            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(base_idx), elem_type=elem_type)
+            gep = buffer_ops.get_element_ptr(
+                ptr, fx.Int64(base_idx), elem_type=elem_type
+            )
             _pointer_store(val, gep)
 
         def load_global_f16xN(base_ptr, base_idx):
@@ -301,7 +311,9 @@ def build_flash_attn_func_module_primary(
             _cmask = fx.Int32(0xFFFF0000)
             pairs = []
             for j in range_constexpr(4):
-                pairs.append(_pack_bf16_pair(f32_vals[j * 2], f32_vals[j * 2 + 1], _c16, _cmask))
+                pairs.append(
+                    _pack_bf16_pair(f32_vals[j * 2], f32_vals[j * 2 + 1], _c16, _cmask)
+                )
             return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
 
         def k_buf_base(buf_id):
@@ -389,7 +401,9 @@ def build_flash_attn_func_module_primary(
 
         _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
-            kv_upper = fx.Index(ArithValue(_q_end < seq_len_v).select(_q_end, seq_len_v))
+            kv_upper = fx.Index(
+                ArithValue(_q_end < seq_len_v).select(_q_end, seq_len_v)
+            )
         else:
             kv_upper = seq_len_v
 
@@ -404,11 +418,16 @@ def build_flash_attn_func_module_primary(
             init_args.append(_v_vecs_init[batch])
 
         loop_results = init_args
-        for kv_block_start, inner_iter_args in range(0, kv_upper, BLOCK_N_OUT, init=init_args):
+        for kv_block_start, inner_iter_args in range(
+            0, kv_upper, BLOCK_N_OUT, init=init_args
+        ):
             m_running = inner_iter_args[0]
             l_running = inner_iter_args[1]
             o_accs = [inner_iter_args[2 + i] for i in range_constexpr(D_CHUNKS)]
-            _v_vecs_prefetch = [inner_iter_args[2 + D_CHUNKS + b] for b in range_constexpr(NUM_BATCHES_KV)]
+            _v_vecs_prefetch = [
+                inner_iter_args[2 + D_CHUNKS + b]
+                for b in range_constexpr(NUM_BATCHES_KV)
+            ]
 
             coop_load_k(kv_block_start, 0)
             gpu.barrier()
@@ -433,8 +452,12 @@ def build_flash_attn_func_module_primary(
 
                     acc_idx_a = st_idx * 2
                     acc_idx_b = st_idx * 2 + 1
-                    s_accs[acc_idx_a] = wmma_acc(k_pack_a, q_b_packs[ks], s_accs[acc_idx_a])
-                    s_accs[acc_idx_b] = wmma_acc(k_pack_b, q_b_packs[ks], s_accs[acc_idx_b])
+                    s_accs[acc_idx_a] = wmma_acc(
+                        k_pack_a, q_b_packs[ks], s_accs[acc_idx_a]
+                    )
+                    s_accs[acc_idx_b] = wmma_acc(
+                        k_pack_b, q_b_packs[ks], s_accs[acc_idx_b]
+                    )
 
             # ==== Online softmax ====
             s_raw = []
@@ -577,7 +600,9 @@ def build_flash_attn_func_module_primary(
                         elem_list = []
                         for j in range_constexpr(8):
                             elem_list.append(fx.Float32(p_slice[j]).to(elem_dtype))
-                        p_packs_st.append(Vec.from_elements(elem_list, elem_dtype).ir_value())
+                        p_packs_st.append(
+                            Vec.from_elements(elem_list, elem_dtype).ir_value()
+                        )
                 p_packs_all.append(p_packs_st)
 
             # ==== GEMM2: O += V^T @ P (software pipelined, row-major V) ====
@@ -588,7 +613,11 @@ def build_flash_attn_func_module_primary(
                 d_pos = fx.Index(dc_val * D_CHUNK) + lane16
                 v_elems = []
                 for k_sub in range_constexpr(8):
-                    kv_row = fx.Index(st_kv_base_val + pks_val * PV_K_STEP) + klane * WMMA_LANE_K + fx.Index(k_sub)
+                    kv_row = (
+                        fx.Index(st_kv_base_val + pks_val * PV_K_STEP)
+                        + klane * WMMA_LANE_K
+                        + fx.Index(k_sub)
+                    )
                     v_lds_idx = v_base + kv_row * V_STRIDE + d_pos
                     # Kept as raw memref.load: scalar element load with no
                     # direct Vec equivalent — Vec is for SIMD vectors.
@@ -613,10 +642,14 @@ def build_flash_attn_func_module_primary(
                     next_v_packs = []
                     if const_expr(has_next):
                         for st_idx in range_constexpr(N_SUB_TILES):
-                            next_v_packs.append(_load_v_rowmajor(st_idx * K_SUB_N, next_pks, next_dc))
+                            next_v_packs.append(
+                                _load_v_rowmajor(st_idx * K_SUB_N, next_pks, next_dc)
+                            )
 
                     for st_idx in range_constexpr(N_SUB_TILES):
-                        o_accs[dc] = wmma_acc(cur_v_packs[st_idx], p_packs_all[st_idx][pks], o_accs[dc])
+                        o_accs[dc] = wmma_acc(
+                            cur_v_packs[st_idx], p_packs_all[st_idx][pks], o_accs[dc]
+                        )
 
                     if const_expr(has_next):
                         cur_v_packs = next_v_packs
@@ -675,7 +708,9 @@ def build_flash_attn_func_module_primary(
             if const_expr(_wpe >= 1):
                 for op in ctx.gpu_module_body.operations:
                     if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, _wpe)
+                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                            T.i32, _wpe
+                        )
         if const_expr(flat_work_group_size is not None):
             _fwgs = int(flat_work_group_size)
             if const_expr(_fwgs >= 1):
@@ -726,7 +761,11 @@ def build_flash_attn_func_module_primary(
         if hasattr(t, "data_ptr"):
             type_name = type(t).__name__
             module_name = type(t).__module__
-            ptr = 0 if type_name == "FakeTensor" or "fake_tensor" in module_name else t.data_ptr()
+            ptr = (
+                0
+                if type_name == "FakeTensor" or "fake_tensor" in module_name
+                else t.data_ptr()
+            )
             return flyc.from_c_void_p(fx.Uint8, ptr)
         return t
 
