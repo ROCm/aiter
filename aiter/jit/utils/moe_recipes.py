@@ -44,7 +44,7 @@ def _build_moe_variant(
         parts.append("splitk")
 
     flags = ""
-    if preshuffle_mode:
+    if preshuffle_mode and b_dtype == "fp4x2":
         flags += " --preshuffle"
     if is_splitk:
         flags += " --issplitk"
@@ -81,20 +81,15 @@ def _normalize_activation(activation: str) -> str:
     return _normalize_enum_str(activation)
 
 
-def _infer_preshuffle_modes(
-    b_dtype: str, quant_type: str, activation: str = ""
-) -> List[bool]:
+def _infer_preshuffle_modes(b_dtype: str, quant_type: str) -> List[bool]:
     """Infer preshuffle modes based on runtime behavior.
 
     - fp4x2: may or may not be pre-shuffled -> both off and on
-    - swiglustep + no-quant (b16/f16): gfx950 uses preshuffle_off -> both modes
     - no-quant (b16/f16): always pre-shuffled at runtime -> preshuffle_on only
     - other quantized types: always shuffled -> preshuffle_on only
     """
     if b_dtype == "fp4x2":
         return [False, True]
-    if activation == "swiglustep" and quant_type == "no":
-        return [True, False]
     return [True]
 
 
@@ -161,7 +156,7 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> List[Dict]:
         if quant_type == "per_1x32" and a_dtype == "b16" and b_dtype == "torch.int4":
             continue
 
-        for preshuffle in _infer_preshuffle_modes(b_dtype, quant_type, activation):
+        for preshuffle in _infer_preshuffle_modes(b_dtype, quant_type):
             for splitk in [False, True] if need_splitk else [False]:
                 key = (
                     a_dtype,
