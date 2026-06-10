@@ -677,14 +677,6 @@ def _get_compiled_swiglu(inter_dim: int):
     return build_swiglu_and_mul_module(inter_dim)
 
 
-@functools.cache
-def _get_compiled_silu(inter_dim: int):
-    """Compile and cache the fused silu_and_mul kernel (interleaved input)."""
-    from aiter.ops.flydsl.kernels.silu_and_mul import build_silu_and_mul_module
-
-    return build_silu_and_mul_module(inter_dim)
-
-
 # Public API
 
 

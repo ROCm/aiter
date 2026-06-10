@@ -2472,18 +2472,40 @@ def cktile_moe_stage1(
                 )
             elif activation == ActivationType.Silu:
                 from aiter.ops.flydsl.moe_kernels import (
-                    _get_compiled_silu,
+                    _get_compiled_silu_fused,
+                    _ptr_view_safe,
                     _run_compiled,
                 )
 
-                _silu_fn = _get_compiled_silu(inter_dim)
-                num_rows = valid_out.view(-1, inter_dim * 2).shape[0]
+                _silu_fn = _get_compiled_silu_fused(
+                    inter_dim,
+                    topk,
+                    quant_mode="none",
+                    gui_layout=True,
+                    act="silu",
+                )
+                num_sorted_rows = sorted_token_ids.shape[0]
+                empty_scale = torch.empty(
+                    0, dtype=torch.uint8, device=out.device
+                )
+                empty_i32 = torch.empty(
+                    0, dtype=torch.int32, device=out.device
+                )
+                empty_f32 = torch.empty(
+                    0, dtype=torch.float32, device=out.device
+                )
                 _run_compiled(
                     _silu_fn,
                     (
-                        valid_out.view(-1, inter_dim * 2),
-                        out.view(-1, inter_dim),
-                        num_rows,
+                        _ptr_view_safe(valid_out.view(-1, inter_dim * 2)),
+                        _ptr_view_safe(out.view(-1, inter_dim)),
+                        _ptr_view_safe(empty_scale),
+                        _ptr_view_safe(sorted_token_ids),
+                        _ptr_view_safe(num_valid_ids),
+                        _ptr_view_safe(empty_i32),
+                        _ptr_view_safe(empty_f32),
+                        token_num,
+                        num_sorted_rows,
                         torch.cuda.current_stream(),
                     ),
                 )
