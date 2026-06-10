@@ -1244,7 +1244,9 @@ def _mxfp4_moe_run(
                 NE=NE, TOPK=topk, D_HIDDEN=D_HIDDEN, MB=BM)
             return out
 
-        if mxfp4out and _mx_shape_ok:
+        # Lossy before-sum 4-bit quant (ok for gsm8k, degrades other evals): opt-in.
+        if (mxfp4out and _mx_shape_ok
+                and os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"):
             flat_out_q = torch.empty(
                 (max_sorted, D_HIDDEN // 2), dtype=torch.uint8, device=device)
             flat_out_scale = torch.empty(
