@@ -1,55 +1,3781 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 FlyDSL Project Contributors
+
 """FP8/FP8 + per-1x128 FP32 blockscale MoE GEMM stage1/stage2 (FlyDSL port).
 
-Thin **adapter** over the upstream FlyDSL implementation in
-``_blockscale_moe_gemm_2stage_upstream.py``. The upstream file is a direct
-port (import-rewritten copy) of ``FlyDSL/kernels/moe_blockscale_2stage.py``
-on the ROCm/FlyDSL repo (introduced in PR #164, FP8-enabled in PR #252,
-MI355-tuned in PR #306).
+UPSTREAM
+--------
+Vendored from FlyDSL upstream:
+    repo:   https://github.com/ROCm/FlyDSL
+    file:   kernels/moe_blockscale_2stage.py
+    basis:  PRs #164 (initial), #252 (FP8), #306 (MI355 tuning)
 
-This adapter exposes the wider aiter dispatcher signature expected by
-``aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_stage{1,2}`` and maps
-it down to the narrower upstream signature.
+The upstream kernel definitions (``compile_moe_blockscale_gemm1`` /
+``compile_moe_blockscale_gemm2`` and their helpers) are reproduced
+near-verbatim in this file so they ship with aiter without an external
+FlyDSL build dependency at runtime. To re-sync with upstream, diff against
+``ROCm/FlyDSL:kernels/moe_blockscale_2stage.py`` and re-apply the
+aiter-side patches below.
 
-CK feature surface coverage in this adapter (matched against
-``GridwiseMoeGemmBlockScale``):
+AITER-SIDE ADDITIONS (on top of upstream)
+-----------------------------------------
+* Split-K plumbing (``k_batch > 1`` along the K dim) for stage1.
+* Fused FP8 stage1 epilog (silu+mul + per-1x128 e4m3fnuz quant + tiled
+  e8m0 scale write inside the GEMM epilog, no separate
+  ``silu_and_mul_fq`` launch).
+* ``gui_layout`` per-16 interleave for stage1 ``tmp_out`` to match the
+  downstream ``silu_and_mul_fq`` consumer in the split-K path.
+* The ``compile_flydsl_moe_stage{1,2}`` adapter functions and the
+  Tier A/B/C aiter dispatcher signature (originally housed in a separate
+  ``_blockscale_moe_gemm_2stage_upstream.py`` companion file; merged into
+  this file 2026-06 to make the upstream vendor surface and the aiter
+  adapter discoverable in one place).
 
-  Tier A  (supported, forwarded to upstream):
-    - out_dtype in {"bf16", "f16"/"fp16"}
-    - scale_block_k (default 128, configurable)
-    - waves_per_eu (default 2 on gfx950)
-    - accumulate (stage2, atomic add vs reduce wrapper)
-    - scale_block_m=1, scale_block_n=128 (CK production defaults)
-
-  Tier B  (validated; required to be the default for DSR1 / TP=8 prefill):
-    - act in {"silu", "gelu"}  (gelu uses exact erf, CK parity)
-    - enable_bias is False     (no bias path in upstream blockscale yet)
-    - model_dim_pad == 0       (clean shapes only)
-    - inter_dim_pad == 0
-    - swiglu_limit == 0.0      (no SiLU clipping yet)
-    - sort_block_m: forwarded as a no-op (upstream encodes its own tile_m)
-
-  Tier C  (raises NotImplementedError until upstream grows the knob):
-    - act not in {"silu", "gelu"}
-    - enable_bias=True
-    - persist_m > 1             (no persistent kernel)
-    - use_async_copy=False      (upstream always uses async/buffer copy)
-    - b_nt != default            (non-temporal B load — TODO)
-    - xcd_swizzle != 0           (XCD remap — TODO)
-    - any non-clean shape paddings
-
-Future commits in this PR will move ``xcd_swizzle`` and ``b_nt`` from
-Tier C to Tier B with small upstream extensions.
+Per-block scaling: ScaleBlockM=1, ScaleBlockN=128, ScaleBlockK=128.
+FP8 a8w8, g1u1 (gate+up with SiLU or GeLU).
 """
-
-from __future__ import annotations
 
 import functools
 import logging
+import os
+from contextlib import contextmanager
 
-from ._blockscale_moe_gemm_2stage_upstream import (
-    compile_moe_blockscale_gemm1 as _upstream_compile_gemm1,
-    compile_moe_blockscale_gemm2 as _upstream_compile_gemm2,
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import math as math_dialect
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import (
+    arith,
+    buffer_ops,
+    const_expr,
+    gpu,
+    range_constexpr,
+    rocdl,
+    vector,
 )
+from flydsl.expr.arith import ArithValue
+from flydsl.expr.typing import T
+from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
+from .mfma_preshuffle_pipeline import (
+    buffer_copy_gmem16_dwordx4,
+    crd2idx,
+    lds_store_4b_xor16,
+    lds_store_8b_xor16,
+    lds_store_16b_xor16,
+    load_b_pack_k32,
+    make_preshuffle_b_layout,
+    swizzle_xor16,
+    tile_chunk_coord_i32,
+)
+
+
+@contextmanager
+def _if_then(if_op):
+    """Compat helper for SCF IfOp then-region across old/new Python APIs."""
+    with ir.InsertionPoint(if_op.then_block):
+        try:
+            yield if_op.then_block
+        finally:
+            blk = if_op.then_block
+            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
+                scf.YieldOp([])
+
+
+@contextmanager
+def _if_else(if_op):
+    """Compat helper for SCF IfOp else-region across old/new Python APIs."""
+    if getattr(if_op, "else_block", None) is None:
+        raise RuntimeError("IfOp has no else block")
+    with ir.InsertionPoint(if_op.else_block):
+        try:
+            yield if_op.else_block
+        finally:
+            blk = if_op.else_block
+            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
+                scf.YieldOp([])
+
+
+@functools.lru_cache(maxsize=1024)
+def compile_moe_blockscale_gemm1(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    doweight_stage1: bool,
+    scale_block_k: int = 128,
+    out_dtype: str = "f16",
+    use_cshuffle_epilog: bool | None = None,
+    waves_per_eu: int | None = None,
+    act: str = "silu",
+    k_batch: int = 1,
+):
+    """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
+
+    in_dtype:
+      - "fp8": X/W are fp8
+      - "fp16": X/W are fp16
+      - "int8": X/W are int8 (X is [tokens, K])
+      - "int8smooth": X/W are int8, but X is pre-expanded to [tokens*topk, K] with per-(token,slot)
+        quant scales (used to emulate MoE smoothquant behavior where each (token,slot)->expert route can
+        have a distinct input scaling before quantization).
+      - "int4": W4A8 path: X is int8, W is packed int4 (2 values per byte) unpacked to int8 in-kernel
+    """
+    if act not in ("silu", "gelu"):
+        raise ValueError(f"act must be 'silu' or 'gelu', got {act!r}")
+
+    # ── split-K (k_batch) plumbing ───────────────────────────────────────────
+    # When k_batch>1, the K dim of each (M,N) tile is partitioned across
+    # k_batch CTAs along blockIdx.z. Each CTA computes one slice's contribution
+    # to gate/up and atomic-adds it (unactivated, no sorted_weight) into
+    # `tmp_out` in the gui_layout per-16 interleave that the downstream
+    # `silu_and_mul_fq` kernel expects.
+    k_batch = int(k_batch)
+    if k_batch < 1:
+        raise ValueError(f"k_batch must be >= 1, got {k_batch}")
+    if k_batch > 1:
+        if model_dim % k_batch != 0:
+            raise ValueError(f"k_batch={k_batch} does not divide model_dim={model_dim}")
+        k_per_split = model_dim // k_batch
+        if k_per_split % scale_block_k != 0:
+            raise ValueError(
+                f"k_per_split={k_per_split} not divisible by "
+                f"scale_block_k={scale_block_k}"
+            )
+        if k_per_split % tile_k != 0:
+            raise ValueError(
+                f"k_per_split={k_per_split} not divisible by tile_k={tile_k}"
+            )
+        if (k_per_split // tile_k) < 2 or ((k_per_split // tile_k) % 2) != 0:
+            raise ValueError(
+                f"k_per_split={k_per_split} / tile_k={tile_k} = "
+                f"{k_per_split // tile_k} must be even and >= 2 (K-loop "
+                "unrolls in pairs of tile_k tiles)"
+            )
+    else:
+        k_per_split = int(model_dim)
+    if k_batch > 1 and bool(doweight_stage1):
+        # The plan defers sorted_weight to silu_and_mul_fq under split-K, but
+        # the current aiter dispatcher's _gui_sk path does not forward
+        # sorted_weights to the post-activation kernel. Until that wiring
+        # lands, refuse rather than silently dropping the weight multiply.
+        raise NotImplementedError(
+            "blockscale stage1: doweight_stage1=True with k_batch>1 is not "
+            "supported yet (sorted_weight must be applied by "
+            "silu_and_mul_fq, which is not wired in the current dispatcher)."
+        )
+    # Compile-time per-CTA K-loop constants.
+    _total_tiles_per_split = k_per_split // int(tile_k)
+    _pair_iters_per_split = max((_total_tiles_per_split - 2) // 2, 0)
+    _c_k_main_per_split = _pair_iters_per_split * int(tile_k) * 2
+
+    gpu_arch = get_hip_arch()
+    _is_gfx950 = str(gpu_arch).startswith("gfx95")
+    allocator = SmemAllocator(None, arch=gpu_arch)
+    _state = {}
+
+    in_dtype = "fp8"  # blockscale is FP8-only
+    is_f16 = in_dtype == "fp16"
+    elem_bytes = 2 if is_f16 else 1
+    if out_dtype not in ("f16", "bf16", "fp8"):
+        raise ValueError(
+            f"out_dtype must be 'f16', 'bf16', or 'fp8', got {out_dtype!r}"
+        )
+    # fp8 output = fused silu_and_mul + e4m3fnuz quant + tiled e8m0 scale write
+    # inside the GEMM epilogue (no separate silu_and_mul_fq launch).
+    _out_is_fp8 = out_dtype == "fp8"
+    if _out_is_fp8 and k_batch > 1:
+        raise NotImplementedError(
+            "blockscale stage1: out_dtype='fp8' with k_batch>1 is not "
+            "supported (atomic-add fp8 quant is non-trivial; use k_batch=1 "
+            "or fall back to out_dtype='bf16'+silu_and_mul_fq for split-K)."
+        )
+
+    # NOTE: don't materialize MLIR types outside an active MLIR Context.
+    def out_mlir():
+        if out_dtype == "f16":
+            ty = T.f16
+        elif out_dtype == "bf16":
+            ty = T.bf16
+        else:  # fp8
+            ty = T.f8
+        return ty() if callable(ty) else ty
+
+    tile_k_bytes = int(tile_k) * int(elem_bytes)
+    # K64-byte micro-step: always 64 bytes per `ku`. For fp16 this is 32 elements.
+    if (tile_k_bytes % 64) != 0:
+        raise ValueError(
+            f"tile_k_bytes must be divisible by 64, got tile_k_bytes={tile_k_bytes} "
+            f"(tile_k={tile_k}, elem_bytes={elem_bytes})"
+        )
+    is_int4 = in_dtype == "int4"
+    # INT4 here means W4A8: X is int8, W is packed int4 and unpacked to int8 in-kernel.
+    is_int8 = (in_dtype == "int8") or is_int4
+    x_is_token_slot = in_dtype == "int8smooth"
+    # "int8smooth" still uses int8 MFMA, but X/scale_x are provided per (token,slot).
+    is_int8 = is_int8 or x_is_token_slot
+
+    # Blockscale compile-time constants (K=model_dim for stage1)
+    if model_dim % scale_block_k != 0:
+        raise ValueError(
+            f"model_dim ({model_dim}) must be divisible by scale_block_k ({scale_block_k})"
+        )
+    if (2 * inter_dim) % 128 != 0:
+        raise ValueError(
+            f"2*inter_dim ({2 * inter_dim}) must be divisible by 128 (ScaleBlockN)"
+        )
+    sb_per_tile_s1 = tile_k // scale_block_k  # scale blocks per tile (in K dim)
+    ku_per_sb_s1 = scale_block_k // 64  # K64-steps per scale block = 2
+    nblk_k_w1 = model_dim // scale_block_k  # K-blocks in W1 (=scale_k)
+    nblk_n_w1 = (2 * inter_dim) // 128  # N-blocks in W1 (ScaleBlockN=128)
+    # scale_w: [experts, nblk_n_w1, nblk_k_w1] f32 (per-block scale)
+    sw_nbytes = experts * nblk_n_w1 * nblk_k_w1 * 4
+
+    mfma_i32_k32 = None
+    if is_int8:
+        mfma_i32_k32 = getattr(rocdl, "mfma_i32_16x16x32i8", None) or getattr(
+            rocdl, "mfma_i32_16x16x32_i8", None
+        )
+        if mfma_i32_k32 is None:
+            raise AttributeError(
+                "INT8 K32 MFMA op not found: expected `rocdl.mfma_i32_16x16x32i8` (or `rocdl.mfma_i32_16x16x32_i8`)."
+            )
+
+    ir.ShapedType.get_dynamic_size()
+    # W is packed int4 for W4A8: 2 values per byte.
+    w_nbytes = (
+        (experts * (2 * inter_dim) * model_dim) // 2
+        if is_int4
+        else (experts * (2 * inter_dim) * model_dim * elem_bytes)
+    )
+
+    total_threads = 256
+    bytes_x_per_tile = int(tile_m) * int(tile_k) * int(elem_bytes)
+    if bytes_x_per_tile % total_threads != 0:
+        raise ValueError(
+            "tile_m*tile_k*elem_bytes must be divisible by "
+            f"{total_threads}: tile_m={tile_m}, tile_k={tile_k}, elem_bytes={elem_bytes}"
+        )
+    bytes_per_thread_x = bytes_x_per_tile // total_threads
+    # Keep MoE stage1 X gmem->LDS pipeline consistent with the optimized GEMM kernel:
+    # split into <=16B pieces and use `fly.copy(load-only)` for buffer_load_dwordx4.
+    # (Compute the split lens inside the kernel so the code matches GEMM structure.)
+
+    # LDS128 mode (same idea as test_preshuffle_gemm.py):
+    # - LDS stride == tile_k (no extra padding) + XOR16 swizzle
+    # - Use ds_{read,write}_b128 (16B) and extract 8B halves for MFMA steps
+    _ck_lds128 = os.environ.get("FLYDSL_CK_LDS128", "1") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+    pad_k = 0 if _ck_lds128 else 8
+    lds_stride = tile_k + pad_k
+    if use_cshuffle_epilog is None:
+        use_cshuffle_epilog = os.environ.get("FLYDSL_MOE_STAGE1_CSHUFFLE", "1") in (
+            "1",
+            "true",
+            "True",
+            "YES",
+            "yes",
+        )
+    use_cshuffle_epilog = bool(use_cshuffle_epilog)
+    # Split-K must bypass the CShuffle LDS epilogue: the atomic-add store goes
+    # to a 2*inter_dim-wide tmp_out in gui_layout per-16 interleave, which the
+    # current CShuffle reorganization doesn't produce. Force the direct-store
+    # path; correctness over a small throughput loss in the first iteration.
+    if k_batch > 1 and use_cshuffle_epilog:
+        use_cshuffle_epilog = False
+    # fp8 output uses direct epilog (CShuffle f16/bf16 LDS aliasing doesn't
+    # match the per-32-element quant block layout we need).
+    if _out_is_fp8 and use_cshuffle_epilog:
+        use_cshuffle_epilog = False
+    # cshuffle epilog now supports both f16 and bf16 (out_mlir() handles the type swap).
+    _out_is_bf16 = out_dtype == "bf16"
+
+    # For fp8 output: quant blocks span 32 contiguous output cols. With
+    # direct-epilog ni-stride=16 cols, each pair (ni, ni+1) forms one quant
+    # block. Require num_acc_n to be even.
+    if _out_is_fp8:
+        _n_per_wave_fp8 = tile_n // 4
+        _num_acc_n_fp8 = _n_per_wave_fp8 // 16
+        if (_num_acc_n_fp8 % 2) != 0:
+            raise ValueError(
+                f"out_dtype='fp8' requires num_acc_n (={_num_acc_n_fp8}) "
+                f"to be even (tile_n={tile_n} -> n_per_wave={_n_per_wave_fp8})"
+            )
+        if (inter_dim % 32) != 0:
+            raise ValueError(
+                f"out_dtype='fp8' requires inter_dim ({inter_dim}) divisible by 32"
+            )
+
+    epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
+    # IMPORTANT: module name participates in FlyDSL's compile cache key.
+    # Keep an explicit ABI tag so signature changes can't accidentally reuse an old binary.
+    _wpe_tag = f"_wpe{waves_per_eu}" if waves_per_eu is not None else ""
+    _kb_tag = f"_kb{k_batch}" if k_batch > 1 else ""
+    module_name = (
+        f"mfma_moe1_bs_{in_dtype}_{out_dtype}_{epilog_tag}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_wpe_tag}{_kb_tag}"
+        f"_abi8"  # scf.for main loop (reduced ISA size)
+    ).replace("-", "_")
+
+    # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
+    _use_cshuffle_epilog = bool(use_cshuffle_epilog)
+    lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(elem_bytes)
+    lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+    lds_total_bytes = max(lds_x_bytes, lds_out_bytes)
+    lds_total_elems = lds_total_bytes if elem_bytes == 1 else (lds_total_bytes // 2)
+
+    lds_alloc_bytes = int(lds_total_elems) * int(elem_bytes)
+    lds_alloc_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_alloc_offset + lds_alloc_bytes
+
+    # Extra LDS scratch for fused-fp8 per-128 cross-wave amax reduction.
+    # tile_m rows × num_waves(=4) × f32 = 256B for tile_m=16.
+    _fp8_per128 = bool(_out_is_fp8) and (int(tile_n) == 128)
+    if _fp8_per128:
+        _lds_amax_bytes = int(tile_m) * 4 * 4
+        _lds_amax_offset = allocator._align(allocator.ptr, 16)
+        allocator.ptr = _lds_amax_offset + _lds_amax_bytes
+    else:
+        _lds_amax_offset = 0
+        _lds_amax_bytes = 0
+    if _out_is_fp8 and not _fp8_per128:
+        raise NotImplementedError(
+            f"fused fp8 epilog (per-1x128 f32 scale) currently requires tile_n=128; got tile_n={tile_n}"
+        )
+
+    @flyc.kernel(name=module_name)
+    def moe_blockscale_gemm1(
+        arg_out: fx.Tensor,
+        arg_x: fx.Tensor,
+        arg_w: fx.Tensor,
+        arg_scale_x: fx.Tensor,
+        arg_scale_w: fx.Tensor,
+        arg_sorted_token_ids: fx.Tensor,
+        arg_expert_ids: fx.Tensor,
+        arg_sorted_weights: fx.Tensor,
+        arg_max_token_ids: fx.Tensor,
+        arg_out_scale_sorted: fx.Tensor,
+        i32_tokens_in: fx.Int32,
+        i32_inter_in: fx.Int32,
+        i32_k_in: fx.Int32,
+        i32_size_expert_ids_in: fx.Int32,
+    ):
+        tokens_in = arith.index_cast(T.index, i32_tokens_in)
+        inter_in = arith.index_cast(T.index, i32_inter_in)
+        k_in = arith.index_cast(T.index, i32_k_in)
+        size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
+        tokens_i32_v = i32_tokens_in
+        k_i32_v = i32_k_in
+        x_elem = T.f16 if is_f16 else (T.i8 if is_int8 else T.f8)
+        # For int4, weights are stored as packed bytes (i8) and unpacked to i8 packs.
+        w_elem = T.f16 if is_f16 else (T.i8 if is_int8 else T.f8)
+        vec16_elems = 16 if elem_bytes == 1 else 8
+        vec8_elems = 8 if elem_bytes == 1 else 4
+        vec8_x = T.vec(vec8_elems, x_elem)
+        vec16_x = T.vec(vec16_elems, x_elem)
+
+        def silu(x):
+            # device fast path:
+            #   emu = exp(-x)  ~= exp2(log2e * (-x))  -> v_exp_f32
+            #   sig = rcp(1 + emu)                   -> v_rcp_f32
+            #   y = x * sig
+            #
+            # Using llvm.amdgcn intrinsics prevents lowering to the div_scale/div_fixup
+            # sequences that introduce extra compares/cndmasks.
+            t = x * (-1.4426950408889634)  # -log2(e)
+            emu = rocdl.exp2(T.f32, t)
+            den = 1.0 + emu
+            sig = rocdl.rcp(T.f32, den)
+            return x * sig
+
+        def gelu(x):
+            # CK parity: y = 0.5 * x * (1 + erf(x / sqrt(2))).
+            # rocdl exposes exp/exp2/rcp but no erf, so we use Abramowitz & Stegun
+            # 7.1.26 polynomial (max abs err ~1.5e-7) and a sign trick for erf.
+            #   z   = x * 1/sqrt(2)
+            #   a   = |z|
+            #   t   = 1 / (1 + 0.3275911 * a)            (rcp)
+            #   p   = ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
+            #   e   = exp(-z*z) = exp2(-z*z * log2(e))   (rocdl.exp2 fast path)
+            #   |erf(z)| = 1 - p * e
+            #   erf(z)   = copysign(|erf(z)|, z)
+            z = x * 0.70710678118654752440  # 1/sqrt(2)
+            a = math_dialect.absf(z)
+            den = 1.0 + 0.3275911 * a
+            t = rocdl.rcp(T.f32, den)
+            # Horner: ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
+            p = 1.061405429 * t + (-1.453152027)
+            p = p * t + 1.421413741
+            p = p * t + (-0.284496736)
+            p = p * t + 0.254829592
+            p = p * t
+            # exp(-z*z) = exp2(-z*z * log2e)
+            neg_z2_log2e = (z * z) * (-1.4426950408889634)
+            e = rocdl.exp2(T.f32, neg_z2_log2e)
+            erf_abs = 1.0 - p * e
+            erf_z = math_dialect.copysign(erf_abs, z)
+            return 0.5 * x * (1.0 + erf_z)
+
+        act_fn = gelu if act == "gelu" else silu
+
+        acc_init = (
+            arith.constant_vector(0, T.i32x4)
+            if is_int8
+            else arith.constant_vector(0.0, T.f32x4)
+        )
+
+        # Layouts
+        fx.make_layout((tokens_i32_v, k_i32_v), stride=(k_i32_v, 1))
+
+        # B preshuffle layout: match GEMM test helper exactly.
+        c_n_total = arith.index(experts * (2 * inter_dim))
+        kpack_bytes = 8 if is_int4 else 16
+        b_layout = make_preshuffle_b_layout(
+            arith,
+            c_n=c_n_total,
+            c_k=k_in,
+            kpack_bytes=kpack_bytes,
+            elem_bytes=elem_bytes,
+        )
+        layout_b = b_layout.layout_b
+        (k_in * arith.index(int(elem_bytes))) // fx.Index(64)
+
+        shape_lds = fx.make_shape(tile_m, tile_k)
+        stride_lds = fx.make_stride(lds_stride, 1)
+        layout_lds = fx.make_layout(shape_lds, stride_lds)
+
+        tx = gpu.thread_id("x")
+        # Align with Aiter launch mapping (NSwizzle==false):
+        # - blockIdx.x -> N dimension (tile along inter_dim)
+        # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
+        by = gpu.block_id("x")  # tile along inter_dim
+        bx = gpu.block_id("y")  # tile along sorted M
+        # split-K: each CTA's K-slice base. When k_batch==1 this is 0.
+        if const_expr(k_batch > 1):
+            bz = gpu.block_id("z")
+            k_offset_base = bz * fx.Index(k_per_split)
+        else:
+            k_offset_base = fx.Index(0)
+
+        # Block validity: compute as early as possible so invalid blocks skip all buffer-resource
+        # setup, LDS pointer math, and gmem prefetch work.
+        bx_m = bx * fx.Index(tile_m)
+        maxids_rsrc = buffer_ops.create_buffer_resource(
+            arg_max_token_ids, max_size=False, num_records_bytes=fx.Index(4)
+        )
+        max_token_id_i32 = buffer_ops.buffer_load(
+            maxids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+        )
+        bx_m_i32 = arith.index_cast(T.i32, bx_m)
+        blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, max_token_id_i32)
+        # Common constants/atoms (hoisted): keep IR small like GEMM.
+        # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
+        k_blocks16 = arith.index(tile_k_bytes // 16)
+        layout_tx_wave_lane = fx.make_layout((4, 64), stride=(64, 1))
+        layout_lane16 = fx.make_layout((4, 16), stride=(16, 1))
+
+        # Everything below is gated by `blk_valid` to avoid doing buffer-resource setup and
+        # gmem work for padding blocks.
+        _if_blk = scf.IfOp(blk_valid)
+        with _if_then(_if_blk):
+            base_ptr = allocator.get_base()
+            lds_x_ptr = SmemPtr(
+                base_ptr,
+                lds_alloc_offset,
+                (T.f16 if is_f16 else (T.i8 if is_int8 else T.f8)),
+                shape=(lds_total_elems,),
+            )
+            lds_x = lds_x_ptr.get()
+            # Alias LDS bytes as fp16/bf16 for optional CShuffle epilogue.
+            lds_out = (
+                SmemPtr(
+                    base_ptr,
+                    lds_x_ptr.byte_offset,
+                    T.bf16 if _out_is_bf16 else T.f16,
+                    shape=(tile_m * tile_n,),
+                ).get()
+                if _use_cshuffle_epilog
+                else None
+            )
+            # Per-128 amax scratch (fused fp8 epilog only). Separate region
+            # from lds_x, allocated after the GEMM LDS so it does not collide.
+            lds_amax = (
+                SmemPtr(
+                    base_ptr,
+                    _lds_amax_offset,
+                    T.f32,
+                    shape=(int(tile_m) * 4,),
+                ).get()
+                if _fp8_per128
+                else None
+            )
+
+            # Buffer resources: for dynamic memrefs, provide `num_records_bytes` explicitly so
+            # hardware OOB behavior is stable (otherwise it falls back to a large max size).
+            c_topk = fx.Index(topk)
+
+            # X: [tokens, k] bytes = tokens*k*elem_bytes
+            x_rows = tokens_in * (c_topk if x_is_token_slot else fx.Index(1))
+            x_nbytes_idx = x_rows * k_in * arith.index(int(elem_bytes))
+            x_rsrc = buffer_ops.create_buffer_resource(
+                arg_x,
+                max_size=False,
+                num_records_bytes=arith.index_cast(T.i64, x_nbytes_idx),
+            )
+
+            w_rsrc = buffer_ops.create_buffer_resource(
+                arg_w, max_size=False, num_records_bytes=w_nbytes
+            )
+
+            # OUT: [tokens, topk, inter] f16/bf16/fp8 -> bytes = tokens*topk*inter*out_elem_bytes
+            # Split-K: arg_out is tmp_out of shape (tokens, topk, 2*inter_dim)
+            # in gui_layout per-16 interleave. Double the per-row width so the
+            # buffer-resource OOB bound covers the full tmp_out span.
+            out_elem_bytes = 1 if _out_is_fp8 else 2
+            _out_row_mult = fx.Index(2 if k_batch > 1 else 1)
+            out_nbytes_idx = (
+                tokens_in * c_topk * inter_in * _out_row_mult * fx.Index(out_elem_bytes)
+            )
+            out_rsrc = buffer_ops.create_buffer_resource(
+                arg_out,
+                max_size=False,
+                num_records_bytes=arith.index_cast(T.i64, out_nbytes_idx),
+            )
+
+            # OUT_SCALE (Phase B-v2): per-1x128 f32 blockscale in per-row
+            # layout, shape (n_blocks_k, tokens*topk). This matches what the
+            # downstream fp8/fp8 stage2 kernel consumes natively (the same
+            # format `per_group_quant_hip(..., transpose_scale=True)` emits).
+            out_scale_rsrc = -1
+            if const_expr(_out_is_fp8):
+                _n_blocks_k = inter_dim // 128
+                out_scale_nbytes_idx = (
+                    arith.index(_n_blocks_k) * tokens_in * fx.Index(topk) * fx.Index(4)
+                )
+                out_scale_rsrc = buffer_ops.create_buffer_resource(
+                    arg_out_scale_sorted,
+                    max_size=False,
+                    num_records_bytes=arith.index_cast(T.i64, out_scale_nbytes_idx),
+                )
+
+            # fp16 path ignores scales completely (implicit scale=1.0).
+            x_load_bytes = 16
+
+            sx_rsrc = -1
+            sw_rsrc = -1
+            if const_expr(not is_f16):
+                # scale_x: [nblk_k_w1, tokens] f32 transposed -> total = nblk_k_w1 * tokens
+                sx_nbytes_idx = arith.index(nblk_k_w1) * tokens_in * fx.Index(4)
+                sx_rsrc = buffer_ops.create_buffer_resource(
+                    arg_scale_x,
+                    max_size=False,
+                    num_records_bytes=arith.index_cast(T.i64, sx_nbytes_idx),
+                )
+                sw_rsrc = buffer_ops.create_buffer_resource(
+                    arg_scale_w, max_size=False, num_records_bytes=sw_nbytes
+                )
+
+            sorted_nbytes_idx = size_expert_ids_in * fx.Index(tile_m) * fx.Index(4)
+            sorted_rsrc = buffer_ops.create_buffer_resource(
+                arg_sorted_token_ids,
+                max_size=False,
+                num_records_bytes=sorted_nbytes_idx,
+            )
+            sorted_w_rsrc = buffer_ops.create_buffer_resource(
+                arg_sorted_weights, max_size=False, num_records_bytes=sorted_nbytes_idx
+            )
+
+            # expert ids: [blocks] i32 -> bytes = size_expert_ids_in*4
+            expert_rsrc = buffer_ops.create_buffer_resource(
+                arg_expert_ids,
+                max_size=False,
+                num_records_bytes=arith.index_cast(
+                    T.i64, size_expert_ids_in * fx.Index(4)
+                ),
+            )
+
+            # Expert id for this M tile (keep address math in `index`)
+            expert_i32 = buffer_ops.buffer_load(
+                expert_rsrc, bx, vec_width=1, dtype=T.i32
+            )
+            expert_idx = arith.index_cast(T.index, expert_i32)
+            inter2_idx = arith.index(2 * inter_dim)
+            expert_off_idx = expert_idx * inter2_idx  # index
+
+            # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
+            # Prefer 16B buffer-load (dwordx4). If the per-thread byte count isn't divisible by
+            # 16, fall back to 8B (dwordx2) or 4B (dword) loads. For fp16 we require 16B.
+            x_load_bytes = 16
+            if const_expr(is_f16):
+                if const_expr(bytes_per_thread_x % 16 != 0):
+                    raise ValueError(
+                        f"[fp16] bytes_per_thread_x ({bytes_per_thread_x}) must be divisible by 16"
+                    )
+                x_load_bytes = 16
+            else:
+                if const_expr(bytes_per_thread_x % 16 == 0):
+                    x_load_bytes = 16
+                elif const_expr(bytes_per_thread_x % 8 == 0):
+                    x_load_bytes = 8
+                elif const_expr(bytes_per_thread_x % 4 == 0):
+                    x_load_bytes = 4
+                else:
+                    raise ValueError(
+                        f"bytes_per_thread_x ({bytes_per_thread_x}) must be divisible by 4 to use the dword-indexed load mapping."
+                    )
+            num_x_loads = bytes_per_thread_x // x_load_bytes
+            chunk_i32 = x_load_bytes // 4  # dwords per chunk (1/2/4)
+
+            c_k_div4 = (k_in * arith.index(int(elem_bytes))) // fx.Index(4)
+            c_k_div4_i32 = arith.index_cast(T.i32, c_k_div4)
+            fx.make_layout((tokens_i32_v, c_k_div4_i32), stride=(c_k_div4_i32, 1))
+            tile_k_dwords = (int(tile_k) * int(elem_bytes)) // 4
+            layout_x_tile_div4 = fx.make_layout(
+                (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
+            )
+            c_chunk_i32 = fx.Index(chunk_i32)
+            tx_i32_base = tx * c_chunk_i32
+            mask24 = fx.Int32(0xFFFFFF)
+            # Keep i32 constants available for epilogue index math.
+            tokens_i32 = arith.index_cast(T.i32, tokens_in)
+            topk_i32 = fx.Int32(topk)
+
+            def x_tile_chunk_coord_i32(i: int):
+                return tile_chunk_coord_i32(
+                    arith,
+                    tx_i32_base=tx_i32_base,
+                    i=i,
+                    total_threads=total_threads,
+                    layout_tile_div4=layout_x_tile_div4,
+                    chunk_i32=chunk_i32,
+                )
+
+            # decode token once (per thread's M-slice) and build a base row offset.
+            x_row_base_div4 = []
+            x_col_local_i32 = []
+            x_row_local = []
+            for i in range_constexpr(num_x_loads):
+                row_local, col_local_i32 = x_tile_chunk_coord_i32(i)
+                x_row_local.append(row_local)
+                x_col_local_i32.append(col_local_i32)
+
+                sorted_row_i = bx_m + row_local
+                # NOTE: rows beyond `num_valid_ids` can contain garbage (within the allocated
+                # buffer). That's OK as long as we never use an out-of-range token id to index X.
+                fused_i = buffer_ops.buffer_load(
+                    sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
+                )
+                t_raw = fused_i & mask24
+                # NOTE: aiter moe_sorting uses sentinel token_id == tokens for padding.
+                # Do NOT rely on buffer OOB semantics for X loads; explicitly mask to a safe row.
+                t_valid_i32 = arith.cmpi(arith.CmpIPredicate.ult, t_raw, tokens_i32)
+                if const_expr(x_is_token_slot):
+                    s_raw = fused_i >> 24
+                    # X is indexed by token-slot in **slot-major** order:
+                    #   row_ts = slot * tokens + token
+                    # This matches CK's moe_smoothquant output layout.
+                    row_ts_i32 = s_raw * tokens_i32 + t_raw
+                    row_ts_idx = arith.index_cast(T.index, row_ts_i32)
+                    # Apply bounds check to token-slot index
+                    row_ts_safe = t_valid_i32.select(row_ts_idx, fx.Index(0))
+                    x_row_base_div4.append(row_ts_safe * c_k_div4)
+                else:
+                    t_idx = arith.index_cast(T.index, t_raw)
+                    t_safe = t_valid_i32.select(t_idx, fx.Index(0))
+                    x_row_base_div4.append(t_safe * c_k_div4)
+
+            T.vec(1, T.i32)
+            T.vec(2, T.i32)
+            vec4_x = T.vec(4, x_elem)
+
+            def load_x(idx_i32, x_load_bytes_v):
+                """Load `x_load_bytes` bytes from X (gmem) into regs.
+
+                For 16B, keep the fast dwordx4 path. For 8B/4B, use byte offsets.
+                """
+                if const_expr(x_load_bytes_v == 16):
+                    idx_elem = idx_i32 if elem_bytes == 1 else (idx_i32 * fx.Index(2))
+                    return buffer_copy_gmem16_dwordx4(
+                        buffer_ops,
+                        vector,
+                        elem_type=x_elem,
+                        idx_i32=idx_elem,
+                        rsrc=x_rsrc,
+                        vec_elems=vec16_elems,
+                        elem_bytes=elem_bytes,
+                    )
+                if const_expr(x_load_bytes_v == 8):
+                    return buffer_ops.buffer_load(
+                        x_rsrc, idx_i32, vec_width=2, dtype=T.i32
+                    )
+                return buffer_ops.buffer_load(x_rsrc, idx_i32, vec_width=1, dtype=T.i32)
+
+            def load_x_tile(base_k, x_load_bytes_v):
+                """Prefetch the per-thread X tile portion (gmem -> regs) for a given K base (in elements)."""
+                base_k_div4 = (base_k * arith.index(int(elem_bytes))) // fx.Index(4)
+                parts = []
+                for i in range_constexpr(num_x_loads):
+                    idx_i32 = x_row_base_div4[i] + base_k_div4 + x_col_local_i32[i]
+                    x_vec = load_x(idx_i32, x_load_bytes_v)
+                    if const_expr(x_load_bytes_v == 16):
+                        parts.append(vector.bitcast(T.i32x4, x_vec))
+                    elif const_expr(x_load_bytes_v == 8):
+                        parts.append(x_vec)
+                    else:
+                        parts.append(x_vec)
+                return parts
+
+            # tx -> wave/lane (GEMM-style decomposition).
+            coord_wl = fx.idx2crd(tx, layout_tx_wave_lane)
+            wave_id = fx.get(coord_wl, 0)
+            lane_id = fx.get(coord_wl, 1)
+            coord_l16 = fx.idx2crd(lane_id, layout_lane16)
+            lane_div_16 = fx.get(coord_l16, 0)
+            lane_mod_16 = fx.get(coord_l16, 1)
+
+            # Match GEMM naming/pattern: row in LDS is lane_mod_16, and col base is lane_div_16*16.
+            row_a_lds = lane_mod_16
+            a_kpack_elems = 16 // elem_bytes
+            col_offset_base = lane_div_16 * arith.index(int(a_kpack_elems))
+            col_offset_base_bytes = (
+                col_offset_base
+                if elem_bytes == 1
+                else (col_offset_base * arith.index(int(elem_bytes)))
+            )
+
+            # Dynamic N tiling within block (same as existing kernels)
+            by_n = by * fx.Index(tile_n)
+            num_waves = 4
+            n_per_wave = tile_n // num_waves
+            num_acc_n = n_per_wave // 16
+            c_n_per_wave = fx.Index(n_per_wave)
+            wave_mod_4 = wave_id % fx.Index(4)
+            n_tile_base = wave_mod_4 * c_n_per_wave
+
+            # Precompute n_blk/n_intra for gate and up rows (GEMM-style: idx2crd/get)
+            n_intra_gate = []
+            n_blk_gate = []
+            n_intra_up = []
+            n_blk_up = []
+            col_g_list = []
+            inter_idx = fx.Index(inter_dim)
+            # layout for (row -> (blk,intra)) where intra is 0..15
+            c_n0 = c_n_total // fx.Index(16)
+            c_n0_i32 = arith.index_cast(T.i32, c_n0)
+            layout_n_blk_intra = fx.make_layout((c_n0_i32, 16), stride=(16, 1))
+            for ni in range_constexpr(num_acc_n):
+                offset = arith.index(ni * 16)
+                col_g = by_n + n_tile_base
+                col_g = col_g + offset
+                col_g = col_g + lane_mod_16
+                col_g_list.append(col_g)
+
+                row_gate = expert_off_idx + col_g
+                row_up = row_gate + inter_idx
+
+                coord_gate = fx.idx2crd(row_gate, layout_n_blk_intra)
+                n_blk_gate.append(fx.get(coord_gate, 0))
+                n_intra_gate.append(fx.get(coord_gate, 1))
+
+                coord_up = fx.idx2crd(row_up, layout_n_blk_intra)
+                n_blk_up.append(fx.get(coord_up, 0))
+                n_intra_up.append(fx.get(coord_up, 1))
+
+            m_repeat = tile_m // 16
+            k_unroll = tile_k_bytes // 64  # K64-byte micro-step (2x MFMA)
+
+            # --- B Load Logic (K64) - shared layout with preshuffle GEMM ---
+            def load_b_pack(base_k, ki_step, ni, blk_list, intra_list):
+                return load_b_pack_k32(
+                    buffer_ops,
+                    arith,
+                    vector,
+                    arg_b=arg_w,
+                    b_rsrc=w_rsrc,
+                    layout_b=layout_b,
+                    base_k=base_k,
+                    ki_step=ki_step,
+                    n_blk=blk_list[ni],
+                    n_intra=intra_list[ni],
+                    lane_div_16=lane_div_16,  # 0..3
+                    elem_type=w_elem,
+                    kpack_bytes=kpack_bytes,
+                    elem_bytes=elem_bytes,
+                    unpack_int4=is_int4,
+                )
+
+            def load_b_tile(base_k, blk_list, intra_list):
+                """Prefetch the entire per-thread B tile (gmem -> regs) for a given K base.
+
+                Returns a list of length `k_unroll`, where each entry is a tuple:
+                  (packs_half0[ni], packs_half1[ni])  for the K64 micro-step.
+                """
+                b_tile = []
+                for ku in range_constexpr(k_unroll):
+                    packs0 = []
+                    packs1 = []
+                    for ni in range_constexpr(num_acc_n):
+                        ki0 = (ku * 2) + 0
+                        ki1 = (ku * 2) + 1
+                        b0 = load_b_pack(base_k, ki0, ni, blk_list, intra_list)
+                        b1 = load_b_pack(base_k, ki1, ni, blk_list, intra_list)
+                        packs0.append(b0)
+                        packs1.append(b1)
+                    b_tile.append((packs0, packs1))
+                return b_tile
+
+            acc_gate = [arith.constant_vector(0.0, T.f32x4)] * (num_acc_n * m_repeat)
+            acc_up = [arith.constant_vector(0.0, T.f32x4)] * (num_acc_n * m_repeat)
+
+            # ---- Pipeline helpers: store X tile to LDS with ping-pong base ----
+            def store_x_tile_to_lds(vec_x_in_parts, lds_base, x_load_bytes_v):
+                for i in range_constexpr(num_x_loads):
+                    row_local = x_row_local[i]
+                    col_local_i32 = x_col_local_i32[i]
+                    if const_expr(x_load_bytes_v == 16):
+                        lds_store_16b_xor16(
+                            arith,
+                            vector,
+                            lds_memref=lds_x,
+                            vec16_ty=vec16_x,
+                            layout_lds=layout_lds,
+                            row_local=row_local,
+                            col_local_i32=col_local_i32,
+                            tx_c4=fx.Index(4),
+                            k_blocks16=k_blocks16,
+                            lds_base=lds_base,
+                            vec_part_i32x4=vec_x_in_parts[i],
+                            elem_bytes=elem_bytes,
+                        )
+                    elif const_expr(x_load_bytes_v == 8):
+                        lds_store_8b_xor16(
+                            arith,
+                            vector,
+                            lds_memref=lds_x,
+                            vec8_ty=vec8_x,
+                            layout_lds=layout_lds,
+                            row_local=row_local,
+                            col_local_i32=col_local_i32,
+                            tx_c4=fx.Index(4),
+                            k_blocks16=k_blocks16,
+                            lds_base=lds_base,
+                            vec_part_i32x2=vec_x_in_parts[i],
+                        )
+                    else:
+                        lds_store_4b_xor16(
+                            arith,
+                            vector,
+                            lds_memref=lds_x,
+                            vec4_ty=vec4_x,
+                            layout_lds=layout_lds,
+                            row_local=row_local,
+                            col_local_i32=col_local_i32,
+                            tx_c4=fx.Index(4),
+                            k_blocks16=k_blocks16,
+                            lds_base=lds_base,
+                            vec_part_i32x1=vec_x_in_parts[i],
+                        )
+
+            # --- A LDS load helper for K64 (load 16B once, extract 2x i64 halves) ---
+            def lds_load_packs_k64(curr_row_a_lds, col_base_bytes, lds_base):
+                col_base_swz_bytes = swizzle_xor16(
+                    curr_row_a_lds, col_base_bytes, k_blocks16
+                )
+                col_base_swz = (
+                    col_base_swz_bytes
+                    if elem_bytes == 1
+                    else (col_base_swz_bytes // arith.index(int(elem_bytes)))
+                )
+                idx_a16 = crd2idx((curr_row_a_lds, col_base_swz), layout_lds)
+                idx_a16 = idx_a16 + lds_base
+                loaded_a16 = vector.load_op(vec16_x, lds_x, [idx_a16])
+                a_i64x2 = vector.bitcast(T.i64x2, loaded_a16)
+                a0 = vector.extract(a_i64x2, static_position=[0], dynamic_position=[])
+                a1 = vector.extract(a_i64x2, static_position=[1], dynamic_position=[])
+                return a0, a1
+
+            # --- Blockscale pre-decode and helpers ---
+            c_scale_block_k = fx.Index(scale_block_k)
+            c_128 = fx.Index(128)
+            c_nblk_k_w1 = fx.Index(nblk_k_w1)
+            row_off_base = lane_div_16 * fx.Index(4)
+
+            # Pre-decode sorted token IDs as i32 (constant across all K-tiles).
+            # OOB buffer loads return 0, so no validity masking needed for scale values.
+            _pre_t_safe_i32 = []
+            for _mi in range_constexpr(m_repeat):
+                _mi_safe = []
+                for _ii in range_constexpr(4):
+                    _row_in_tile = arith.index(_mi * 16) + row_off_base + fx.Index(_ii)
+                    _sorted_row = bx_m + _row_in_tile
+                    _fused_pre = buffer_ops.buffer_load(
+                        sorted_rsrc, _sorted_row, vec_width=1, dtype=T.i32
+                    )
+                    _t_id_pre = _fused_pre & mask24
+                    _t_valid_pre = arith.cmpi(
+                        arith.CmpIPredicate.ult, _t_id_pre, tokens_i32
+                    )
+                    _t_safe_pre = _t_valid_pre.select(_t_id_pre, fx.Int32(0))
+                    _mi_safe.append(_t_safe_pre)
+                _pre_t_safe_i32.append(_mi_safe)
+
+            # Pre-compute N-block indices for scale_w (constant per CTA)
+            _pre_n_block_gate = []
+            _pre_n_block_up = []
+            for _ni in range_constexpr(num_acc_n):
+                _col_base_ni_pre = by_n + n_tile_base + arith.index(_ni * 16)
+                _pre_n_block_gate.append((expert_off_idx + _col_base_ni_pre) // c_128)
+                _pre_n_block_up.append(
+                    (expert_off_idx + inter_idx + _col_base_ni_pre) // c_128
+                )
+
+            def load_scales_s1(k_base):
+                all_combined = []
+                for sb in range_constexpr(sb_per_tile_s1):
+                    kb = k_base // c_scale_block_k + fx.Index(sb)
+                    sa_base_offset = kb * tokens_in
+
+                    s_a_vecs = []
+                    sa_base_i32 = arith.index_cast(T.i32, sa_base_offset)
+                    for mi in range_constexpr(m_repeat):
+                        s_a_row = []
+                        for ii in range_constexpr(4):
+                            t_safe_i32 = _pre_t_safe_i32[mi][ii]
+                            sa_idx_i32 = sa_base_i32 + t_safe_i32
+                            sa_idx = arith.index_cast(T.index, sa_idx_i32)
+                            s_a_val = buffer_ops.buffer_load(
+                                sx_rsrc, sa_idx, vec_width=1, dtype=T.f32
+                            )
+                            s_a_row.append(s_a_val)
+                        s_a_vecs.append(s_a_row)
+
+                    _sw_shared_n = n_per_wave <= 128
+                    s_w_gate_vals = []
+                    s_w_up_vals = []
+                    s_w_gate = fx.Float32(1.0)
+                    s_w_up = fx.Float32(1.0)
+                    for ni in range_constexpr(num_acc_n):
+                        if const_expr(ni == 0 or not _sw_shared_n):
+                            sw_gate_idx = _pre_n_block_gate[ni] * c_nblk_k_w1 + kb
+                            s_w_gate = buffer_ops.buffer_load(
+                                sw_rsrc, sw_gate_idx, vec_width=1, dtype=T.f32
+                            )
+                            sw_up_idx = _pre_n_block_up[ni] * c_nblk_k_w1 + kb
+                            s_w_up = buffer_ops.buffer_load(
+                                sw_rsrc, sw_up_idx, vec_width=1, dtype=T.f32
+                            )
+                        s_w_gate_vals.append(s_w_gate)
+                        s_w_up_vals.append(s_w_up)
+
+                    s_a_vec4_list = []
+                    for mi in range_constexpr(m_repeat):
+                        s_a_vec4_list.append(
+                            vector.from_elements(T.f32x4, s_a_vecs[mi])
+                        )
+                    all_combined.append((s_a_vec4_list, s_w_gate_vals, s_w_up_vals))
+                return all_combined
+
+            def compute_tile_bs_s1(
+                acc_gate_in,
+                acc_up_in,
+                b_gate_tile_in,
+                b_up_tile_in,
+                lds_base,
+                pre_scales,
+                *,
+                a0_prefetch=None,
+            ):
+                current_gate = list(acc_gate_in)
+                current_up = list(acc_up_in)
+                mfma_res_ty = T.f32x4
+
+                if const_expr(_is_gfx950):
+
+                    def _pack128(x0, x1, x2, x3):
+                        v4 = vector.from_elements(T.vec(4, T.i64), [x0, x1, x2, x3])
+                        return vector.bitcast(T.vec(8, T.i32), v4)
+
+                    for sb in range_constexpr(sb_per_tile_s1):
+                        s_a_vec4_list, s_w_gate_vals, s_w_up_vals = pre_scales[sb]
+                        ku0 = sb * ku_per_sb_s1
+                        ku1 = ku0 + 1
+                        bg0_p0, bg0_p1 = b_gate_tile_in[ku0]
+                        bg1_p0, bg1_p1 = b_gate_tile_in[ku1]
+                        bu0_p0, bu0_p1 = b_up_tile_in[ku0]
+                        bu1_p0, bu1_p1 = b_up_tile_in[ku1]
+                        col0 = col_offset_base_bytes + arith.index(ku0 * 64)
+                        col1 = col_offset_base_bytes + arith.index(ku1 * 64)
+                        for mi in range_constexpr(m_repeat):
+                            curr_row = row_a_lds + arith.index(mi * 16)
+                            a0 = arith.constant(0, type=T.i64)
+                            a1 = arith.constant(0, type=T.i64)
+                            if const_expr(
+                                a0_prefetch is not None and sb == 0 and mi == 0
+                            ):
+                                a0, a1 = a0_prefetch
+                            else:
+                                a0, a1 = lds_load_packs_k64(curr_row, col0, lds_base)
+                            a2, a3 = lds_load_packs_k64(curr_row, col1, lds_base)
+                            a128 = _pack128(a0, a1, a2, a3)
+                            s_a_v4 = s_a_vec4_list[mi]
+                            pending_gate_up = None
+                            for ni in range_constexpr(num_acc_n):
+                                acc_idx = mi * num_acc_n + ni
+                                bg128 = _pack128(
+                                    bg0_p0[ni], bg0_p1[ni], bg1_p0[ni], bg1_p1[ni]
+                                )
+                                bu128 = _pack128(
+                                    bu0_p0[ni], bu0_p1[ni], bu1_p0[ni], bu1_p1[ni]
+                                )
+                                blk_g = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                                    mfma_res_ty,
+                                    [
+                                        a128,
+                                        bg128,
+                                        acc_init,
+                                        0,
+                                        0,
+                                        0,
+                                        0x7F7F7F7F,
+                                        0,
+                                        0x7F7F7F7F,
+                                    ],
+                                )
+                                blk_u = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                                    mfma_res_ty,
+                                    [
+                                        a128,
+                                        bu128,
+                                        acc_init,
+                                        0,
+                                        0,
+                                        0,
+                                        0x7F7F7F7F,
+                                        0,
+                                        0x7F7F7F7F,
+                                    ],
+                                )
+                                rocdl.sched_barrier(0)
+                                if const_expr(pending_gate_up is not None):
+                                    prev_acc_idx, prev_blk_g, prev_blk_u, prev_ni = (
+                                        pending_gate_up
+                                    )
+                                    s_wg_bc = vector.broadcast(
+                                        T.f32x4, s_w_gate_vals[prev_ni]
+                                    )
+                                    s_wu_bc = vector.broadcast(
+                                        T.f32x4, s_w_up_vals[prev_ni]
+                                    )
+                                    scale_g = ArithValue(s_a_v4) * ArithValue(s_wg_bc)
+                                    scale_u = ArithValue(s_a_v4) * ArithValue(s_wu_bc)
+                                    current_gate[prev_acc_idx] = math_dialect.fma(
+                                        prev_blk_g, scale_g, current_gate[prev_acc_idx]
+                                    )
+                                    current_up[prev_acc_idx] = math_dialect.fma(
+                                        prev_blk_u, scale_u, current_up[prev_acc_idx]
+                                    )
+                                pending_gate_up = (acc_idx, blk_g, blk_u, ni)
+                            if const_expr(pending_gate_up is not None):
+                                prev_acc_idx, prev_blk_g, prev_blk_u, prev_ni = (
+                                    pending_gate_up
+                                )
+                                s_wg_bc = vector.broadcast(
+                                    T.f32x4, s_w_gate_vals[prev_ni]
+                                )
+                                s_wu_bc = vector.broadcast(
+                                    T.f32x4, s_w_up_vals[prev_ni]
+                                )
+                                scale_g = ArithValue(s_a_v4) * ArithValue(s_wg_bc)
+                                scale_u = ArithValue(s_a_v4) * ArithValue(s_wu_bc)
+                                current_gate[prev_acc_idx] = math_dialect.fma(
+                                    prev_blk_g, scale_g, current_gate[prev_acc_idx]
+                                )
+                                current_up[prev_acc_idx] = math_dialect.fma(
+                                    prev_blk_u, scale_u, current_up[prev_acc_idx]
+                                )
+                else:
+                    mfma_fn = (
+                        mfma_i32_k32
+                        if const_expr(is_int8)
+                        else (
+                            rocdl.mfma_f32_16x16x16f16
+                            if is_f16
+                            else rocdl.mfma_f32_16x16x32_fp8_fp8
+                        )
+                    )
+
+                    def _i64_to_v4f16(x_i64):
+                        v1 = vector.from_elements(T.vec(1, T.i64), [x_i64])
+                        return vector.bitcast(T.f16x4, v1)
+
+                    def mfma_k64(acc_in, a0, a1, b0, b1):
+                        if const_expr(is_f16):
+                            a0v = _i64_to_v4f16(a0)
+                            a1v = _i64_to_v4f16(a1)
+                            b0v = _i64_to_v4f16(b0)
+                            b1v = _i64_to_v4f16(b1)
+                            acc_mid = mfma_fn(mfma_res_ty, [a0v, b0v, acc_in, 0, 0, 0])
+                            return mfma_fn(mfma_res_ty, [a1v, b1v, acc_mid, 0, 0, 0])
+                        acc_mid = mfma_fn(mfma_res_ty, [a0, b0, acc_in, 0, 0, 0])
+                        return mfma_fn(mfma_res_ty, [a1, b1, acc_mid, 0, 0, 0])
+
+                    for sb in range_constexpr(sb_per_tile_s1):
+                        s_a_vec4_list, s_w_gate_vals, s_w_up_vals = pre_scales[sb]
+                        for mi in range_constexpr(m_repeat):
+                            s_a_v4 = s_a_vec4_list[mi]
+                            for ni in range_constexpr(num_acc_n):
+                                acc_idx = mi * num_acc_n + ni
+                                blk_g = acc_init
+                                blk_u = acc_init
+                                for ku_local in range_constexpr(ku_per_sb_s1):
+                                    ku = sb * ku_per_sb_s1 + ku_local
+                                    b_gate_packs0, b_gate_packs1 = b_gate_tile_in[ku]
+                                    b_up_packs0, b_up_packs1 = b_up_tile_in[ku]
+                                    ki64 = arith.index(ku * 64)
+                                    col_base = col_offset_base_bytes + ki64
+                                    a0 = arith.constant(-1, type=T.i64)
+                                    a1 = arith.constant(-1, type=T.i64)
+                                    if const_expr(
+                                        (a0_prefetch is not None)
+                                        and (sb == 0)
+                                        and (ku_local == 0)
+                                        and (mi == 0)
+                                    ):
+                                        a0, a1 = a0_prefetch
+                                    else:
+                                        a0, a1 = lds_load_packs_k64(
+                                            row_a_lds + arith.index(mi * 16),
+                                            col_base,
+                                            lds_base,
+                                        )
+                                    blk_g = mfma_k64(
+                                        blk_g,
+                                        a0,
+                                        a1,
+                                        b_gate_packs0[ni],
+                                        b_gate_packs1[ni],
+                                    )
+                                    blk_u = mfma_k64(
+                                        blk_u, a0, a1, b_up_packs0[ni], b_up_packs1[ni]
+                                    )
+                                s_wg_bc = vector.broadcast(T.f32x4, s_w_gate_vals[ni])
+                                s_wu_bc = vector.broadcast(T.f32x4, s_w_up_vals[ni])
+                                scale_g = ArithValue(s_a_v4) * ArithValue(s_wg_bc)
+                                scale_u = ArithValue(s_a_v4) * ArithValue(s_wu_bc)
+                                current_gate[acc_idx] = math_dialect.fma(
+                                    blk_g, scale_g, current_gate[acc_idx]
+                                )
+                                current_up[acc_idx] = math_dialect.fma(
+                                    blk_u, scale_u, current_up[acc_idx]
+                                )
+                return current_gate, current_up
+
+            def compute_tile(
+                acc_gate_in,
+                acc_up_in,
+                b_gate_tile_in,
+                b_up_tile_in,
+                lds_base,
+                *,
+                prefetch_epilogue: bool = False,
+                a0_prefetch=None,
+            ):
+                gate_list = list(acc_gate_in)
+                up_list = list(acc_up_in)
+                mfma_res_ty = T.i32x4 if is_int8 else T.f32x4
+                mfma_fn = (
+                    mfma_i32_k32
+                    if const_expr(is_int8)
+                    else (
+                        rocdl.mfma_f32_16x16x16f16
+                        if is_f16
+                        else rocdl.mfma_f32_16x16x32_fp8_fp8
+                    )
+                )
+
+                # Optional: prefetch epilogue scales while we are about to run the last MFMA tile,
+                # matching the preshuffle GEMM pattern of overlapping scale loads with MFMA.
+                epilogue_pf = None
+                if const_expr(prefetch_epilogue):
+                    expert_off_pf = expert_off_idx
+                    sw_gate_pf = []
+                    sw_up_pf = []
+                    for ni in range_constexpr(num_acc_n):
+                        col_g = col_g_list[ni]
+                        row_gate_idx = expert_off_pf + col_g
+                        row_up_idx = row_gate_idx + inter_idx
+                        sw_gate_pf.append(
+                            fx.Float32(1.0)
+                            if const_expr(is_f16)
+                            else buffer_ops.buffer_load(
+                                sw_rsrc, row_gate_idx, vec_width=1, dtype=T.f32
+                            )
+                        )
+                        sw_up_pf.append(
+                            fx.Float32(1.0)
+                            if const_expr(is_f16)
+                            else buffer_ops.buffer_load(
+                                sw_rsrc, row_up_idx, vec_width=1, dtype=T.f32
+                            )
+                        )
+                    epilogue_pf = (sw_gate_pf, sw_up_pf)
+
+                def _i64_to_v4f16(x_i64):
+                    v1 = vector.from_elements(T.vec(1, T.i64), [x_i64])
+                    return vector.bitcast(T.f16x4, v1)
+
+                def mfma_k64(acc_in, a0, a1, b0, b1):
+                    if const_expr(is_f16):
+                        a0v = _i64_to_v4f16(a0)
+                        a1v = _i64_to_v4f16(a1)
+                        b0v = _i64_to_v4f16(b0)
+                        b1v = _i64_to_v4f16(b1)
+                        acc_mid = mfma_fn(mfma_res_ty, [a0v, b0v, acc_in, 0, 0, 0])
+                        return mfma_fn(mfma_res_ty, [a1v, b1v, acc_mid, 0, 0, 0])
+                    acc_mid = mfma_fn(mfma_res_ty, [a0, b0, acc_in, 0, 0, 0])
+                    return mfma_fn(mfma_res_ty, [a1, b1, acc_mid, 0, 0, 0])
+
+                for ku in range_constexpr(k_unroll):
+                    b_gate_packs0, b_gate_packs1 = b_gate_tile_in[ku]
+                    b_up_packs0, b_up_packs1 = b_up_tile_in[ku]
+                    ki64 = arith.index(ku * 64)
+                    col_base = col_offset_base_bytes + ki64
+
+                    for mi in range_constexpr(m_repeat):
+                        mi_val = arith.index(mi * 16)
+                        curr_row_a_lds = row_a_lds + mi_val
+
+                        a0 = arith.constant(-1, type=T.i64)
+                        a1 = arith.constant(-1, type=T.i64)
+                        if const_expr(
+                            (a0_prefetch is not None) and (ku == 0) and (mi == 0)
+                        ):
+                            a0, a1 = a0_prefetch
+                        else:
+                            a0, a1 = lds_load_packs_k64(
+                                curr_row_a_lds, col_base, lds_base
+                            )
+
+                        for ni in range_constexpr(num_acc_n):
+                            acc_idx = mi * num_acc_n + ni
+                            gate_list[acc_idx] = mfma_k64(
+                                gate_list[acc_idx],
+                                a0,
+                                a1,
+                                b_gate_packs0[ni],
+                                b_gate_packs1[ni],
+                            )
+                            up_list[acc_idx] = mfma_k64(
+                                up_list[acc_idx],
+                                a0,
+                                a1,
+                                b_up_packs0[ni],
+                                b_up_packs1[ni],
+                            )
+                return gate_list, up_list, epilogue_pf
+
+            # ── scf.for loop helpers (acc-only loop state, CK-style) ──────
+            n_accs_half = m_repeat * num_acc_n
+
+            # ---------------- 2-stage pipeline (ping-pong LDS + B tile prefetch) ----------------
+            lds_tile_elems = arith.index(tile_m * lds_stride)
+            lds_base_cur = fx.Index(0)
+            lds_base_nxt = lds_tile_elems
+
+            rocdl.sched_barrier(0)
+
+            def hot_loop_scheduler():
+                mfma_per_ku = m_repeat * num_acc_n * 2 * 2
+                total_mfma = k_unroll * mfma_per_ku
+                rocdl.sched_group_barrier(rocdl.mask_dsrd, ku_per_sb_s1 * m_repeat, 0)
+                rocdl.sched_group_barrier(rocdl.mask_mfma, total_mfma, 1)
+                rocdl.sched_group_barrier(rocdl.mask_vmem_rd, num_x_loads, 2)
+                rocdl.sched_group_barrier(rocdl.mask_dswr, num_x_loads, 3)
+                rocdl.sched_barrier(0)
+
+            def do_one_stage(
+                acc_gate_in, acc_up_in, k_compute, k_next, lds_compute, lds_store
+            ):
+                """One pipeline stage: load next tile data, compute current tile, store X to LDS."""
+                scale_fn = load_scales_s1
+                pre_scales = scale_fn(k_compute)
+                x_regs_next = load_x_tile(k_next, x_load_bytes)
+                b_gate_cur = load_b_tile(k_compute, n_blk_gate, n_intra_gate)
+                b_up_cur = load_b_tile(k_compute, n_blk_up, n_intra_up)
+
+                ag, au = compute_tile_bs_s1(
+                    acc_gate_in,
+                    acc_up_in,
+                    b_gate_cur,
+                    b_up_cur,
+                    lds_compute,
+                    pre_scales,
+                )
+                store_x_tile_to_lds(x_regs_next, lds_store, x_load_bytes)
+                hot_loop_scheduler()
+                gpu.barrier()
+                return ag, au
+
+            # Prologue: prefetch tile0 X into LDS, sync.
+            # Split-K: tile0 of this CTA's slice starts at k_offset_base.
+            k0 = k_offset_base
+            x_regs0 = load_x_tile(k0, x_load_bytes)
+            store_x_tile_to_lds(x_regs0, lds_base_cur, x_load_bytes)
+            gpu.barrier()
+
+            lds_base_pong = lds_base_cur
+            lds_base_ping = lds_base_nxt
+
+            c2_tile_k = arith.index(tile_k * 2)
+            c_tile_k = arith.index(tile_k)
+            # Per-CTA K-loop bounds (compile-time): k_per_split = model_dim
+            # when k_batch==1, otherwise model_dim/k_batch. Compile-time
+            # constants computed above as _c_k_main_per_split.
+            c_k_main = int(_c_k_main_per_split)
+            # Main K loop iterates over absolute K positions in
+            #   [k_offset_base, k_offset_base + c_k_main),
+            # leaving the last 2 tiles of this slice for the tail.
+            k_main_lo = k_offset_base
+            k_main_hi = k_offset_base + arith.index(c_k_main)
+
+            init_state = list(acc_gate) + list(acc_up)
+
+            for k_iv, inner in range(k_main_lo, k_main_hi, tile_k * 2, init=init_state):
+                n = n_accs_half
+                acc_gate_in = list(inner[:n])
+                acc_up_in = list(inner[n : 2 * n])
+
+                next_k1 = k_iv + c_tile_k
+
+                acc_gate_s0, acc_up_s0 = do_one_stage(
+                    acc_gate_in, acc_up_in, k_iv, next_k1, lds_base_pong, lds_base_ping
+                )
+
+                next_k2 = k_iv + c2_tile_k
+
+                acc_gate_s1, acc_up_s1 = do_one_stage(
+                    acc_gate_s0,
+                    acc_up_s0,
+                    next_k1,
+                    next_k2,
+                    lds_base_ping,
+                    lds_base_pong,
+                )
+
+                results = yield list(acc_gate_s1) + list(acc_up_s1)
+
+            n = n_accs_half
+            acc_gate = list(results[:n])
+            acc_up = list(results[n : 2 * n])
+
+            # Tail: use fresh scale decode (no dependency on prologue _pre_t_safe_idx).
+            # Split-K: tail tiles are at the end of this CTA's K-slice, not
+            # the end of the full K. k_slice_end = k_offset_base + k_per_split.
+            if const_expr(k_batch > 1):
+                k_slice_end = k_offset_base + arith.index(k_per_split)
+            else:
+                k_slice_end = k_in
+            k_tail0 = k_slice_end - c2_tile_k
+            k_tail1 = k_slice_end - c_tile_k
+
+            acc_gate, acc_up = do_one_stage(
+                acc_gate, acc_up, k_tail0, k_tail1, lds_base_pong, lds_base_ping
+            )
+
+            pre_scales_tail1 = load_scales_s1(k_tail1)
+            b_gate_last = load_b_tile(k_tail1, n_blk_gate, n_intra_gate)
+            b_up_last = load_b_tile(k_tail1, n_blk_up, n_intra_up)
+            acc_gate, acc_up = compute_tile_bs_s1(
+                acc_gate,
+                acc_up,
+                b_gate_last,
+                b_up_last,
+                lds_base_ping,
+                pre_scales_tail1,
+            )
+
+            # Store epilogue to out[t, slot, inter]
+            tokens_i32_v = tokens_i32
+            topk_i32_v = topk_i32
+            inter_i32_v = fx.Int32(inter_dim)
+            mask24_i32 = fx.Int32(0xFFFFFF)
+
+            # Blockscale: dequant already done in compute_tile_bs_s1, no sw/sx needed here.
+
+            # Epilogue hoists to keep IR + Python build time small:
+            col_i32_list = []
+            for ni in range_constexpr(num_acc_n):
+                col_i32_list.append(arith.index_cast(T.i32, col_g_list[ni]))
+
+            lane_div_16 * fx.Index(4)
+            inter_i32_local = inter_i32_v
+
+            if const_expr(use_cshuffle_epilog):
+                if const_expr(lds_out is None):
+                    raise RuntimeError(
+                        "CShuffle epilogue enabled but lds_out is not allocated/aliased."
+                    )
+
+                def write_row_to_lds(
+                    *,
+                    mi: int,
+                    ii: int,
+                    row_in_tile,
+                    row,
+                    row_base_lds,
+                    col_base_local,
+                    num_acc_n: int,
+                    lds_out,
+                ):
+                    # Blockscale: dequant already done in compute_tile_bs_s1.
+                    # Just apply silu + optional sorted weight.
+                    if const_expr(doweight_stage1):
+                        tw = buffer_ops.buffer_load(
+                            sorted_w_rsrc, row, vec_width=1, dtype=T.f32
+                        )
+
+                    for ni in range_constexpr(num_acc_n):
+                        col_local = col_base_local + (ni * 16)
+
+                        acc_idx = mi * num_acc_n + ni
+                        vg = vector.extract(
+                            acc_gate[acc_idx], static_position=[ii], dynamic_position=[]
+                        )
+                        vu = vector.extract(
+                            acc_up[acc_idx], static_position=[ii], dynamic_position=[]
+                        )
+
+                        y = act_fn(vg) * vu
+                        if const_expr(doweight_stage1):
+                            y = y * tw
+                        _out_ty = out_mlir()
+                        y16 = arith.trunc_f(_out_ty, y)
+
+                        lds_idx = row_base_lds + col_local
+                        v1 = vector.from_elements(T.vec(1, _out_ty), [y16])
+                        vector.store(v1, lds_out, [lds_idx], alignment=2)
+
+                def precompute_row(*, row_local, row):
+                    fused2 = buffer_ops.buffer_load(
+                        sorted_rsrc, row, vec_width=1, dtype=T.i32
+                    )
+                    t2 = fused2 & mask24_i32
+                    s2 = fused2 >> 24
+                    return (t2 * topk_i32_v + s2) * inter_i32_local
+
+                def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
+                    # Guard against sentinel token ids (t == tokens) produced by aiter moe_sorting padding.
+                    # OOB buffer stores are not guaranteed to be safe on all paths, so predicate explicitly.
+                    fused2 = buffer_ops.buffer_load(
+                        sorted_rsrc, row, vec_width=1, dtype=T.i32
+                    )
+                    t2 = fused2 & mask24_i32
+                    t_valid = arith.cmpi(arith.CmpIPredicate.ult, t2, tokens_i32_v)
+                    _if_valid = scf.IfOp(t_valid)
+                    with _if_then(_if_valid):
+                        idx0 = row_ctx
+                        col_i32 = arith.index_cast(T.i32, col_g0)
+                        idx_out = idx0 + col_i32
+                        # Vectorized fp16 store (EVec=4).
+                        buffer_ops.buffer_store(frag, out_rsrc, idx_out)
+
+                mfma_epilog(
+                    use_cshuffle=True,
+                    arith=arith,
+                    vector=vector,
+                    gpu=gpu,
+                    scf=scf,
+                    range_constexpr=range_constexpr,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    e_vec=4,
+                    m_repeat=m_repeat,
+                    num_acc_n=num_acc_n,
+                    tx=tx,
+                    lane_div_16=lane_div_16,
+                    lane_mod_16=lane_mod_16,
+                    bx_m=bx_m,
+                    by_n=by_n,
+                    n_tile_base=n_tile_base,
+                    lds_out=lds_out,
+                    frag_elem_type=(T.bf16 if _out_is_bf16 else T.f16),
+                    write_row_to_lds=write_row_to_lds,
+                    precompute_row=precompute_row,
+                    store_pair=store_pair,
+                )
+                return
+
+            # ── split-K atomic store helper (k_batch > 1) ──────────────────
+            # AMD lacks a scalar fp16/bf16 buffer atomic; on gfx950 packed
+            # half2 atomic-add (`buffer_atomic_pk_add_f16/bf16`) is the only
+            # 16-bit atomic. To emit a per-element atomic from a single
+            # scalar value we round the element index down to the nearest
+            # even position and pack the scalar into the matching half of a
+            # half2 vector, leaving the other half as 0.0 (no-op under add).
+            #   - even element idx -> packed = (val, 0.0)
+            #   - odd  element idx -> packed = (0.0, val)
+            # Both addresses are 4-byte aligned, so the same packed atomic
+            # works for any element position.
+            if const_expr(k_batch > 1):
+                # Half2 scalar-via-packed atomic emit. Defined once and
+                # used by the per-row body below.
+                _out_ty_local = T.bf16 if _out_is_bf16 else T.f16
+                _out_vec2_ty = T.vec(2, _out_ty_local)
+                _c_two_i32 = fx.Int32(2)
+                _c_one_i32 = fx.Int32(1)
+                _c_even_mask_i32 = fx.Int32(0xFFFFFFFE)
+                _zero_half = arith.constant(0.0, type=_out_ty_local)
+
+                def _atomic_add_scalar_via_pk(idx_elem_i32, val_half):
+                    """Emit a scalar f16/bf16 atomic-add by packing into a
+                    half2 with the unused lane zeroed.
+
+                    idx_elem_i32: element index into `arg_out` (tmp_out) in
+                                  fp16/bf16 units.
+                    val_half:     the scalar f16/bf16 value to add.
+                    """
+                    idx_even = idx_elem_i32 & _c_even_mask_i32
+                    is_odd_i32 = idx_elem_i32 & _c_one_i32
+                    is_odd_i1 = arith.cmpi(
+                        arith.CmpIPredicate.ne, is_odd_i32, fx.Int32(0)
+                    )
+                    elem0 = arith.select(is_odd_i1, _zero_half, val_half)
+                    elem1 = arith.select(is_odd_i1, val_half, _zero_half)
+                    packed = vector.from_elements(_out_vec2_ty, [elem0, elem1])
+                    byte_off = idx_even * _c_two_i32
+                    rocdl.raw_ptr_buffer_atomic_fadd(
+                        packed,
+                        out_rsrc,
+                        byte_off,
+                        fx.Int32(0),
+                        fx.Int32(0),
+                    )
+
+                # Compile-time column base for gui_layout per-16 interleave.
+                #   In inter_dim coords (no split):
+                #     col_g_inter = by_n + n_tile_base + ni*16 + lane_mod_16
+                #   In 2*inter_dim coords (gui_layout, per-16 interleave):
+                #     gate_col = 2*(by_n + n_tile_base + ni*16) + lane_mod_16
+                #     up_col   = gate_col + 16
+                # Row stride in tmp_out: (t*topk + s) * (2*inter_dim).
+                _two_inter_i32 = fx.Int32(2 * inter_dim)
+                _c16_i32 = fx.Int32(16)
+                lane_mod_16_i32 = arith.index_cast(T.i32, lane_mod_16)
+
+                # Precompute per-ni gate_col / up_col in i32.
+                _gate_col_i32_list = []
+                _up_col_i32_list = []
+                for ni in range_constexpr(num_acc_n):
+                    # block_base_inter = by_n + n_tile_base + ni*16 (no lane).
+                    blk_base_inter_idx = by_n + n_tile_base + arith.index(ni * 16)
+                    blk_base_inter_i32 = arith.index_cast(T.i32, blk_base_inter_idx)
+                    gate_col_i32 = (blk_base_inter_i32 * _c_two_i32) + lane_mod_16_i32
+                    up_col_i32 = gate_col_i32 + _c16_i32
+                    _gate_col_i32_list.append(gate_col_i32)
+                    _up_col_i32_list.append(up_col_i32)
+
+            def _stage1_store_row(*, mi: int, ii: int, row_in_tile, row):
+                # Blockscale: dequant already done in compute_tile_bs_s1.
+                fused2 = buffer_ops.buffer_load(
+                    sorted_rsrc, row, vec_width=1, dtype=T.i32
+                )
+                t2 = fused2 & mask24_i32
+                s2 = fused2 >> 24
+                t_valid = arith.cmpi(arith.CmpIPredicate.ult, t2, tokens_i32_v)
+
+                if const_expr(k_batch > 1):
+                    # Split-K: write **unactivated** gate and up partials to
+                    # tmp_out (shape (tokens, topk, 2*inter_dim), gui_layout
+                    # per-16 interleave) via half2-packed scalar atomic add.
+                    # The downstream silu_and_mul_fq kernel applies silu(g)*u
+                    # and (optionally) quant. No sorted_weight is applied here
+                    # (deferred; doweight_stage1=True is rejected at compile
+                    # time for k_batch>1).
+                    row_base_i32 = (t2 * topk_i32_v + s2) * _two_inter_i32
+
+                    _if_valid = scf.IfOp(t_valid)
+                    with _if_then(_if_valid):
+                        for ni in range_constexpr(num_acc_n):
+                            acc_idx = mi * num_acc_n + ni
+                            vg_f32 = vector.extract(
+                                acc_gate[acc_idx],
+                                static_position=[ii],
+                                dynamic_position=[],
+                            )
+                            vu_f32 = vector.extract(
+                                acc_up[acc_idx],
+                                static_position=[ii],
+                                dynamic_position=[],
+                            )
+                            vg = arith.trunc_f(out_mlir(), vg_f32)
+                            vu = arith.trunc_f(out_mlir(), vu_f32)
+                            gate_idx_i32 = row_base_i32 + _gate_col_i32_list[ni]
+                            up_idx_i32 = row_base_i32 + _up_col_i32_list[ni]
+                            _atomic_add_scalar_via_pk(gate_idx_i32, vg)
+                            _atomic_add_scalar_via_pk(up_idx_i32, vu)
+                    return
+
+                # out linear index base. For bf16/f16: element-indexed -> (t*topk+s)*inter_dim.
+                # For fp8: byte-indexed -> (t*topk+s)*inter_dim (each element is 1 byte).
+                idx0 = (t2 * topk_i32_v + s2) * inter_i32_local
+
+                # Sorted weight aligned with `row` (matches aiter moe_sorting output).
+                if const_expr(doweight_stage1):
+                    tw = buffer_ops.buffer_load(
+                        sorted_w_rsrc, row, vec_width=1, dtype=T.f32
+                    )
+
+                if const_expr(_out_is_fp8):
+                    # ── Phase B-v2: fused fp8 emit (tile_n=128) ──────────────
+                    # Each wave owns 32 N-cols (n_per_wave = tile_n/4 = 32);
+                    # 4 waves combine via LDS to form one per-1x128 amax.
+                    # Output:
+                    #   * fp8 bytes -> token-major out[(t*topk+s)*inter + col]
+                    #   * f32 scale -> per-row [n_blocks_k, tokens*topk] flat,
+                    #     written as scale[by * tokens*topk + t*topk + s].
+                    #
+                    # Two-pass with one block-wide barrier:
+                    #   1) compute act(g)*u; intra-wave amax via shuffle_xor;
+                    #      lane_mod_16==0 publishes per-wave amax to LDS
+                    #      slot [row_in_tile*4 + wave_mod_4].
+                    #   2) barrier; all threads read 4 slots → per-128 amax;
+                    #      apply quant_scale = FMAX/amax + clamp ±FMAX →
+                    #      cvt_pk_fp8 → buffer_store fp8 bytes.
+                    #      Lane (wave_mod_4==0, lane_mod_16==0) writes f32
+                    #      (amax/FMAX) to per-row scale buffer.
+                    #   FMAX = 240 on gfx942 (fp8 e4m3 fnuz), 448 on gfx950+
+                    #   (fp8 e4m3 fn) — matches finfo<fp8_t>::max() used by
+                    #   per_group_quant_hip on each arch.
+                    _fp8_fmax_val = 448.0 if _is_gfx950 else 240.0
+                    _fp8_max_v = arith.constant(_fp8_fmax_val, type=T.f32)
+                    _fp8_min_v = arith.constant(-_fp8_fmax_val, type=T.f32)
+                    _fp8_inv240 = arith.constant(1.0 / _fp8_fmax_val, type=T.f32)
+                    _c_240_f32 = arith.constant(_fp8_fmax_val, type=T.f32)
+                    _c_tiny_f32 = arith.constant(1e-10, type=T.f32)
+                    _c0_i32 = arith.constant(0, type=T.i32)
+                    _c8_i32 = arith.constant(8, type=T.i32)
+                    _c64_i32 = arith.constant(64, type=T.i32)
+                    _shuffle_dists = (1, 2, 4, 8)
+                    lane_mod_16_i32_local = arith.index_cast(T.i32, lane_mod_16)
+                    wave_mod_4_i32 = arith.index_cast(T.i32, wave_mod_4)
+                    _vec1_f32 = T.vec(1, T.f32)
+                    _c4_idx = fx.Index(4)
+                    _c1_idx = fx.Index(1)
+                    _c2_idx = fx.Index(2)
+                    _c3_idx = fx.Index(3)
+
+                    # Restricted to tile_n=128: exactly one (ni0,ni1) pair per
+                    # wave (num_acc_n == 2). The outer compile-time guard
+                    # rejects other tile_n at module-build time.
+                    ni0 = 0
+                    ni1 = 1
+                    acc_idx0 = mi * num_acc_n + ni0
+                    acc_idx1 = mi * num_acc_n + ni1
+                    vg0 = vector.extract(
+                        acc_gate[acc_idx0], static_position=[ii], dynamic_position=[]
+                    )
+                    vu0 = vector.extract(
+                        acc_up[acc_idx0], static_position=[ii], dynamic_position=[]
+                    )
+                    vg1 = vector.extract(
+                        acc_gate[acc_idx1], static_position=[ii], dynamic_position=[]
+                    )
+                    vu1 = vector.extract(
+                        acc_up[acc_idx1], static_position=[ii], dynamic_position=[]
+                    )
+                    a0 = act_fn(vg0) * vu0
+                    a1 = act_fn(vg1) * vu1
+                    if const_expr(doweight_stage1):
+                        a0 = a0 * tw
+                        a1 = a1 * tw
+
+                    # Pass 1: per-wave amax of these 32 cols.
+                    abs0 = math_dialect.absf(a0)
+                    abs1 = math_dialect.absf(a1)
+                    local_max = arith.maximumf(abs0, abs1)
+                    for _d in _shuffle_dists:
+                        _off = arith.constant(_d, type=T.i32)
+                        peer = local_max.shuffle_xor(_off, _c64_i32)
+                        local_max = arith.maximumf(local_max, peer)
+
+                    # Publish per-wave amax to LDS. Guard with t_valid: pad
+                    # rows skip the write (and skip the read in pass 2).
+                    lane_eq_0 = arith.cmpi(
+                        arith.CmpIPredicate.eq, lane_mod_16_i32_local, _c0_i32
+                    )
+                    pub_cond = arith.andi(lane_eq_0, t_valid)
+                    _if_pub = scf.IfOp(pub_cond)
+                    with _if_then(_if_pub):
+                        lds_off = row_in_tile * _c4_idx + wave_mod_4
+                        v1 = vector.from_elements(_vec1_f32, [local_max])
+                        vector.store(v1, lds_amax, [lds_off], alignment=4)
+
+                    # Block-wide barrier (must be unconditional).
+                    gpu.barrier()
+
+                    # Pass 2: cross-wave amax, scale, quant, store.
+                    _if_valid = scf.IfOp(t_valid)
+                    with _if_then(_if_valid):
+                        row_base_idx = row_in_tile * _c4_idx
+                        m0_v = vector.load_op(_vec1_f32, lds_amax, [row_base_idx])
+                        m1_v = vector.load_op(
+                            _vec1_f32, lds_amax, [row_base_idx + _c1_idx]
+                        )
+                        m2_v = vector.load_op(
+                            _vec1_f32, lds_amax, [row_base_idx + _c2_idx]
+                        )
+                        m3_v = vector.load_op(
+                            _vec1_f32, lds_amax, [row_base_idx + _c3_idx]
+                        )
+                        m0 = vector.extract(
+                            m0_v, static_position=[0], dynamic_position=[]
+                        )
+                        m1 = vector.extract(
+                            m1_v, static_position=[0], dynamic_position=[]
+                        )
+                        m2 = vector.extract(
+                            m2_v, static_position=[0], dynamic_position=[]
+                        )
+                        m3 = vector.extract(
+                            m3_v, static_position=[0], dynamic_position=[]
+                        )
+                        per128_amax = arith.maximumf(
+                            arith.maximumf(m0, m1), arith.maximumf(m2, m3)
+                        )
+                        amax_safe = arith.maximumf(per128_amax, _c_tiny_f32)
+                        # quant_scale = 240 / amax (multiplier on activations).
+                        quant_scale = _c_240_f32 * rocdl.rcp(T.f32, amax_safe)
+                        # scale_f32 = amax / 240 (per-row scale to stage2).
+                        scale_f32 = amax_safe * _fp8_inv240
+
+                        s0 = a0 * quant_scale
+                        s0 = arith.minimumf(s0, _fp8_max_v)
+                        s0 = arith.maximumf(s0, _fp8_min_v)
+                        s1 = a1 * quant_scale
+                        s1 = arith.minimumf(s1, _fp8_max_v)
+                        s1 = arith.maximumf(s1, _fp8_min_v)
+                        packed_i32 = rocdl.cvt_pk_fp8_f32(T.i32, s0, s1, _c0_i32, 0)
+                        byte0 = arith.TruncIOp(T.i8, packed_i32)
+                        byte1 = arith.TruncIOp(T.i8, packed_i32 >> _c8_i32)
+                        col0_i32 = col_i32_list[ni0]
+                        col1_i32 = col_i32_list[ni1]
+                        buffer_ops.buffer_store(
+                            byte0,
+                            out_rsrc,
+                            idx0 + col0_i32,
+                            offset_is_bytes=True,
+                        )
+                        buffer_ops.buffer_store(
+                            byte1,
+                            out_rsrc,
+                            idx0 + col1_i32,
+                            offset_is_bytes=True,
+                        )
+
+                        # Designated writer for the per-row f32 scale: exactly
+                        # one thread per (row, per-128-block). For tile_n=128
+                        # each CTA owns one block in N, indexed by `by`.
+                        wave_eq_0 = arith.cmpi(
+                            arith.CmpIPredicate.eq, wave_mod_4_i32, _c0_i32
+                        )
+                        is_writer = arith.andi(wave_eq_0, lane_eq_0)
+                        _if_w = scf.IfOp(is_writer)
+                        with _if_then(_if_w):
+                            by_i32 = arith.index_cast(T.i32, by)
+                            scale_off_elems = by_i32 * (tokens_i32_v * topk_i32_v) + (
+                                t2 * topk_i32_v + s2
+                            )
+                            scale_byte_off = scale_off_elems * fx.Int32(4)
+                            buffer_ops.buffer_store(
+                                scale_f32,
+                                out_scale_rsrc,
+                                scale_byte_off,
+                                offset_is_bytes=True,
+                            )
+                    return
+
+                _if_valid = scf.IfOp(t_valid)
+                with _if_then(_if_valid):
+                    for ni in range_constexpr(num_acc_n):
+                        col_i32 = col_i32_list[ni]
+
+                        acc_idx = mi * num_acc_n + ni
+                        vg = vector.extract(
+                            acc_gate[acc_idx], static_position=[ii], dynamic_position=[]
+                        )
+                        vu = vector.extract(
+                            acc_up[acc_idx], static_position=[ii], dynamic_position=[]
+                        )
+
+                        y = act_fn(vg) * vu
+                        if const_expr(doweight_stage1):
+                            y = y * tw
+                        y = arith.trunc_f(out_mlir(), y)
+                        idx_out0 = idx0 + col_i32
+                        buffer_ops.buffer_store(y, out_rsrc, idx_out0)
+
+            mfma_epilog(
+                use_cshuffle=False,
+                arith=arith,
+                range_constexpr=range_constexpr,
+                m_repeat=m_repeat,
+                lane_div_16=lane_div_16,
+                bx_m=bx_m,
+                body_row=_stage1_store_row,
+            )
+
+    # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
+    @flyc.jit
+    def launch_moe_blockscale_gemm1(
+        arg_out: fx.Tensor,
+        arg_x: fx.Tensor,
+        arg_w: fx.Tensor,
+        arg_scale_x: fx.Tensor,
+        arg_scale_w: fx.Tensor,
+        arg_sorted_token_ids: fx.Tensor,
+        arg_expert_ids: fx.Tensor,
+        arg_sorted_weights: fx.Tensor,
+        arg_max_token_ids: fx.Tensor,
+        arg_out_scale_sorted: fx.Tensor,
+        i32_tokens_in: fx.Int32,
+        i32_inter_in: fx.Int32,
+        i32_k_in: fx.Int32,
+        i32_size_expert_ids_in: fx.Int32,
+        stream: fx.Stream,
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+
+        inter_in = arith.index_cast(T.index, i32_inter_in)
+        size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
+        gx = inter_in // fx.Index(tile_n)
+        gy = size_expert_ids_in
+
+        moe_blockscale_gemm1(
+            arg_out,
+            arg_x,
+            arg_w,
+            arg_scale_x,
+            arg_scale_w,
+            arg_sorted_token_ids,
+            arg_expert_ids,
+            arg_sorted_weights,
+            arg_max_token_ids,
+            arg_out_scale_sorted,
+            i32_tokens_in,
+            i32_inter_in,
+            i32_k_in,
+            i32_size_expert_ids_in,
+            value_attrs={"rocdl.waves_per_eu": waves_per_eu},
+        ).launch(grid=(gx, gy, k_batch), block=(256, 1, 1), stream=stream)
+
+    return launch_moe_blockscale_gemm1
+
+
+@functools.lru_cache(maxsize=1024)
+def compile_moe_blockscale_gemm2(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    doweight_stage2: bool,
+    scale_block_k: int = 128,
+    out_dtype: str = "f16",
+    use_cshuffle_epilog: bool | None = None,
+    # Optional experiment: write per-(token,slot) output (no atomics) into an output shaped
+    # [tokens*topk, model_dim] (or [tokens, topk, model_dim] flattened), then reduce over topk outside.
+    # This can reduce atomic contention for small tokens at the cost of extra bandwidth / reduction.
+    accumulate: bool = True,
+    waves_per_eu: int | None = None,
+):
+    """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
+
+    in_dtype:
+      - "fp8": A2/W are fp8
+      - "fp16": A2/W are fp16
+      - "int8": A2/W are int8
+      - "int4": W4A8 path: A2 is int8, W is packed int4 unpacked to int8 in-kernel
+
+    Stage2 output supports:
+      - out_dtype="f16": fp16 half2 atomics (fast, can overflow to +/-inf for bf16 workloads)
+      - out_dtype="f32": fp32 scalar atomics (slower, but avoids fp16 atomic overflow)
+
+    `use_cshuffle_epilog` controls whether we use the LDS CShuffle epilogue before
+    global atomics (recommended for performance).
+    """
+    gpu_arch = get_hip_arch()
+    _is_gfx950 = str(gpu_arch).startswith("gfx95")
+    allocator = SmemAllocator(None, arch=gpu_arch)
+    _state = {}
+
+    in_dtype = "fp8"  # blockscale is FP8-only
+    is_f16 = in_dtype == "fp16"
+    elem_bytes = 2 if is_f16 else 1
+    out_s = str(out_dtype).strip().lower()
+    if out_s not in ("f16", "fp16", "half", "bf16", "bfloat16", "f32", "fp32", "float"):
+        raise ValueError(
+            f"out_dtype must be 'f16', 'bf16', or 'f32', got {out_dtype!r}"
+        )
+    out_is_f32 = out_s in ("f32", "fp32", "float")
+    out_is_bf16 = out_s in ("bf16", "bfloat16")
+    if (not bool(accumulate)) and out_is_f32:
+        raise ValueError(
+            "compile_moe_blockscale_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16'}"
+        )
+    is_int4 = in_dtype == "int4"
+    # INT4 here means W4A8: A2 is int8, W is packed int4 and unpacked to int8 in-kernel.
+    is_int8 = (in_dtype in ("int8", "int8smooth")) or is_int4
+
+    # Blockscale compile-time constants (K=inter_dim for stage2)
+    if inter_dim % scale_block_k != 0:
+        raise ValueError(
+            f"inter_dim ({inter_dim}) must be divisible by scale_block_k ({scale_block_k})"
+        )
+    if model_dim % 128 != 0:
+        raise ValueError(
+            f"model_dim ({model_dim}) must be divisible by 128 (ScaleBlockN)"
+        )
+    sb_per_tile_s2 = tile_k // scale_block_k  # scale blocks per tile (in K dim)
+    ku_per_sb_s2 = scale_block_k // 64  # K64-steps per scale block = 2
+    nblk_k_w2 = inter_dim // scale_block_k  # K-blocks in W2 (=scale_k)
+    nblk_n_w2 = model_dim // 128  # N-blocks in W2 (ScaleBlockN=128)
+    # scale_w: [experts, nblk_n_w2, nblk_k_w2] f32 (per-block scale)
+    sw_nbytes = experts * nblk_n_w2 * nblk_k_w2 * 4
+
+    mfma_i32_k32 = None
+    if is_int8:
+        mfma_i32_k32 = getattr(rocdl, "mfma_i32_16x16x32i8", None) or getattr(
+            rocdl, "mfma_i32_16x16x32_i8", None
+        )
+        if mfma_i32_k32 is None:
+            raise AttributeError(
+                "INT8 K32 MFMA op not found: expected `rocdl.mfma_i32_16x16x32i8` (or `rocdl.mfma_i32_16x16x32_i8`)."
+            )
+
+    ir.ShapedType.get_dynamic_size()
+    # W is packed int4 for W4A8: 2 values per byte.
+    w_nbytes = (
+        (experts * model_dim * inter_dim) // 2
+        if is_int4
+        else (experts * model_dim * inter_dim * elem_bytes)
+    )
+
+    total_threads = 256
+    tile_k_bytes = int(tile_k) * int(elem_bytes)
+    if (tile_k_bytes % 64) != 0:
+        raise ValueError(
+            f"tile_k_bytes must be divisible by 64, got tile_k_bytes={tile_k_bytes} "
+            f"(tile_k={tile_k}, elem_bytes={elem_bytes})"
+        )
+    bytes_x_per_tile = int(tile_m) * int(tile_k) * int(elem_bytes)
+    if bytes_x_per_tile % total_threads != 0:
+        raise ValueError(
+            "tile_m*tile_k*elem_bytes must be divisible by "
+            f"{total_threads}: tile_m={tile_m}, tile_k={tile_k}, elem_bytes={elem_bytes}"
+        )
+    bytes_per_thread_x = bytes_x_per_tile // total_threads
+
+    _ck_lds128 = os.environ.get("FLYDSL_CK_LDS128", "1") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+    pad_k = 0 if _ck_lds128 else 8
+    lds_stride = tile_k + pad_k
+    # gfx950+ has buffer_atomic_pk_add_bf16 → bf16 can use buffer atomics (same as f16).
+    # gfx942 only has global_atomic_pk_add_bf16 → must use global atomics with raw pointer.
+    _has_buffer_atomic_bf16 = str(gpu_arch).startswith(("gfx95", "gfx12"))
+    _needs_global_atomic_bf16 = out_is_bf16 and not _has_buffer_atomic_bf16
+    if out_is_bf16:
+        if not (
+            gpu_arch.startswith("gfx942")
+            or gpu_arch.startswith("gfx950")
+            or gpu_arch.startswith("gfx12")
+        ):
+            raise ValueError(
+                f"out_dtype='bf16' requires bf16 global atomics (gfx942/gfx950/gfx12), got arch={gpu_arch!r}"
+            )
+
+    if out_is_f32:
+        # Match origin/dev_a16w4: f32 output uses scalar atomics and does NOT use the CShuffle epilogue.
+        _use_cshuffle_epilog = (
+            False if use_cshuffle_epilog is None else bool(use_cshuffle_epilog)
+        )
+        if _use_cshuffle_epilog:
+            raise ValueError(
+                "out_dtype='f32' does not support CShuffle epilogue (set use_cshuffle_epilog=False)."
+            )
+    else:
+        if use_cshuffle_epilog is None:
+            _use_cshuffle_epilog = os.environ.get(
+                "FLYDSL_MOE_STAGE2_CSHUFFLE", "1"
+            ) in (
+                "1",
+                "true",
+                "True",
+                "YES",
+                "yes",
+            )
+        else:
+            _use_cshuffle_epilog = bool(use_cshuffle_epilog)
+        if not _use_cshuffle_epilog:
+            raise ValueError(
+                "stage2 f16 output currently requires CShuffle epilogue (FLYDSL_MOE_STAGE2_CSHUFFLE=1)."
+            )
+
+    # NOTE: Keep this as a callable so we don't require an MLIR Context at Python-time.
+    def out_elem():
+        ty = T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
+        return ty() if callable(ty) else ty
+
+    epilog_tag = "cshuffle"
+    # IMPORTANT: include tiling in the module name to avoid accidentally reusing a compiled
+    # binary for a different (tile_m, tile_n, tile_k) configuration.
+    # See stage1 note: include ABI tag to prevent binary reuse across signature changes.
+    # IMPORTANT: module name participates in FlyDSL's compile cache key.
+    # Dynamic-shape variant: safe to reuse across (tokens/sorted_size/size_expert_ids) at runtime.
+    # Keep a distinct ABI tag so the compile cache never mixes with historical signatures.
+    _wpe_tag2 = f"_wpe{waves_per_eu}" if waves_per_eu is not None else ""
+    module_name = (
+        f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_wpe_tag2}"
+        f"_abi6"  # scale prefetch before VMEM tile loads
+    ).replace("-", "_")
+
+    # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
+    lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(elem_bytes)
+    lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+    lds_total_bytes = max(lds_x_bytes, lds_out_bytes)
+    lds_total_elems = lds_total_bytes if elem_bytes == 1 else (lds_total_bytes // 2)
+
+    lds_alloc_bytes = int(lds_total_elems) * int(elem_bytes)
+    lds_alloc_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_alloc_offset + lds_alloc_bytes
+
+    _cshuffle_nlane = 32
+    if bool(accumulate):
+        _e_vec = 2
+    else:
+        _e_vec = 8 if int(tile_n) % (_cshuffle_nlane * 8) == 0 else 2
+        _cshuffle_stride = _cshuffle_nlane * _e_vec
+        if int(tile_n) % _cshuffle_stride != 0:
+            raise ValueError(
+                f"tile_n={tile_n} must be divisible by {_cshuffle_stride} when accumulate=False"
+            )
+
+    if True:
+
+        @flyc.kernel(name=module_name)
+        def moe_blockscale_gemm2(
+            arg_out: fx.Tensor,
+            arg_x: fx.Tensor,
+            arg_w: fx.Tensor,
+            arg_scale_x: fx.Tensor,
+            arg_scale_w: fx.Tensor,
+            arg_sorted_token_ids: fx.Tensor,
+            arg_expert_ids: fx.Tensor,
+            arg_sorted_weights: fx.Tensor,
+            arg_num_valid_ids: fx.Tensor,
+            i32_tokens_in: fx.Int32,
+            i32_n_in: fx.Int32,
+            i32_k_in: fx.Int32,
+            i32_size_expert_ids_in: fx.Int32,
+        ):
+            tokens_in = arith.index_cast(T.index, i32_tokens_in)
+            n_in = arith.index_cast(T.index, i32_n_in)
+            k_in = arith.index_cast(T.index, i32_k_in)
+            size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
+            k_i32_v = i32_k_in
+            x_elem = T.f16 if is_f16 else (T.i8 if is_int8 else T.f8)
+            # For int4, weights are stored as packed bytes (i8) and unpacked to i8 packs.
+            w_elem = T.f16 if is_f16 else (T.i8 if is_int8 else T.f8)
+            vec16_elems = 16 if elem_bytes == 1 else 8
+            vec8_elems = 8 if elem_bytes == 1 else 4
+            vec8_x = T.vec(vec8_elems, x_elem)
+            vec16_x = T.vec(vec16_elems, x_elem)
+
+            acc_init = (
+                arith.constant_vector(0, T.i32x4)
+                if is_int8
+                else arith.constant_vector(0.0, T.f32x4)
+            )
+
+            # A2 layout (flatten token-slot -> M).
+            topk_idx = fx.Index(topk)
+            m_in = tokens_in * topk_idx
+            m_i32_v = arith.index_cast(T.i32, m_in)
+            fx.make_layout((m_i32_v, k_i32_v), stride=(k_i32_v, 1))
+
+            # B preshuffle layout: [experts*model_dim, inter_dim]
+            c_n_total = arith.index(experts * model_dim)
+            kpack_bytes = 8 if is_int4 else 16
+            b_layout = make_preshuffle_b_layout(
+                arith,
+                c_n=c_n_total,
+                c_k=k_in,
+                kpack_bytes=kpack_bytes,
+                elem_bytes=elem_bytes,
+            )
+            layout_b = b_layout.layout_b
+            (k_in * arith.index(int(elem_bytes))) // fx.Index(64)
+
+            shape_lds = fx.make_shape(tile_m, tile_k)
+            stride_lds = fx.make_stride(lds_stride, 1)
+            layout_lds = fx.make_layout(shape_lds, stride_lds)
+
+            tx = gpu.thread_id("x")
+            # Align with Aiter launch mapping:
+            # - blockIdx.x -> N dimension (tile along model_dim)
+            # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
+            by = gpu.block_id("x")  # tile along model_dim
+            bx = gpu.block_id("y")  # tile along sorted M
+
+            # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
+            k_blocks16 = arith.index(tile_k_bytes // 16)
+            layout_tx_wave_lane = fx.make_layout((4, 64), stride=(64, 1))
+            layout_lane16 = fx.make_layout((4, 16), stride=(16, 1))
+            fx.make_layout((tile_m, tile_k), stride=(tile_k, 1))
+
+            base_ptr = allocator.get_base()
+            lds_x_ptr = SmemPtr(
+                base_ptr,
+                lds_alloc_offset,
+                (T.f16 if is_f16 else (T.i8 if is_int8 else T.f8)),
+                shape=(lds_total_elems,),
+            )
+            lds_x = lds_x_ptr.get()
+            # Alias the same underlying LDS bytes as f16/bf16 for epilogue shuffle.
+            lds_out = (
+                SmemPtr(
+                    base_ptr,
+                    lds_x_ptr.byte_offset,
+                    (T.bf16 if out_is_bf16 else T.f16),
+                    shape=(tile_m * tile_n,),
+                ).get()
+                if _use_cshuffle_epilog
+                else None
+            )
+
+            # Buffer resources.
+            # For dynamic memrefs, `max_size=False` cannot infer the logical size from the memref *type*,
+            # so we should pass `num_records_bytes` explicitly for stable hardware OOB behavior.
+            c_topk = fx.Index(topk)
+
+            # X(A2): [tokens*topk, inter_dim] bytes = tokens*topk*k*elem_bytes
+            x_nbytes_idx = (tokens_in * c_topk) * k_in * arith.index(int(elem_bytes))
+            x_rsrc = buffer_ops.create_buffer_resource(
+                arg_x,
+                max_size=False,
+                num_records_bytes=arith.index_cast(T.i64, x_nbytes_idx),
+            )
+
+            w_rsrc = buffer_ops.create_buffer_resource(
+                arg_w, max_size=False, num_records_bytes=w_nbytes
+            )
+
+            # OUT: [tokens, model_dim] -> clamp to descriptor max (i32 bytes) to avoid overflow on huge tokens.
+            out_elem_bytes = 4 if out_is_f32 else 2
+            out_nbytes_idx = tokens_in * n_in * fx.Index(out_elem_bytes)
+            if const_expr(not bool(accumulate)):
+                out_nbytes_idx = (
+                    tokens_in * fx.Index(topk) * n_in * fx.Index(out_elem_bytes)
+                )
+            out_rsrc = buffer_ops.create_buffer_resource(
+                arg_out,
+                max_size=False,
+                num_records_bytes=arith.index_cast(T.i64, out_nbytes_idx),
+            )
+            # fp16 path ignores scales completely (implicit scale=1.0).
+            sx_rsrc = -1
+            sw_rsrc = -1
+            if const_expr(not is_f16):
+                # scale_x (A2 scale): [nblk_k_w2, tokens*topk] f32 transposed -> total = nblk_k_w2 * tokens * topk
+                sx_nbytes_idx = (
+                    arith.index(nblk_k_w2) * (tokens_in * c_topk) * fx.Index(4)
+                )
+                sx_rsrc = buffer_ops.create_buffer_resource(
+                    arg_scale_x,
+                    max_size=False,
+                    num_records_bytes=arith.index_cast(T.i64, sx_nbytes_idx),
+                )
+                # scale_w: [experts, nblk_n_w2, nblk_k_w2] f32 (per-block scale)
+                sw_rsrc = buffer_ops.create_buffer_resource(
+                    arg_scale_w, max_size=False, num_records_bytes=sw_nbytes
+                )
+
+            # sorted_token_ids / sorted_weights: [blocks*tile_m] (CK-style padded length)
+            sorted_nbytes_idx = size_expert_ids_in * fx.Index(tile_m) * fx.Index(4)
+            sorted_nbytes_i64 = arith.index_cast(T.i64, sorted_nbytes_idx)
+            sorted_rsrc = buffer_ops.create_buffer_resource(
+                arg_sorted_token_ids,
+                max_size=False,
+                num_records_bytes=sorted_nbytes_i64,
+            )
+            sorted_w_rsrc = buffer_ops.create_buffer_resource(
+                arg_sorted_weights, max_size=False, num_records_bytes=sorted_nbytes_i64
+            )
+
+            # expert ids: [blocks] i32 -> bytes = size_expert_ids_in*4
+            eid_nbytes_idx = size_expert_ids_in * fx.Index(4)
+            expert_rsrc = buffer_ops.create_buffer_resource(
+                arg_expert_ids,
+                max_size=False,
+                num_records_bytes=arith.index_cast(T.i64, eid_nbytes_idx),
+            )
+            bx_m = bx * fx.Index(tile_m)
+
+            # Early-exit guard (as in 2ce65fb): some routing paths can produce extra/garbage
+            # expert blocks beyond `num_valid_ids`. Skip those blocks entirely to avoid OOB.
+            numids_rsrc = buffer_ops.create_buffer_resource(
+                arg_num_valid_ids, max_size=False, num_records_bytes=fx.Index(4)
+            )
+            num_valid_i32 = buffer_ops.buffer_load(
+                numids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+            )
+            bx_m_i32 = arith.index_cast(T.i32, bx_m)
+            blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, num_valid_i32)
+
+            def _moe_gemm2_then_body():
+                # Expert id for this M tile.
+                expert_i32 = buffer_ops.buffer_load(
+                    expert_rsrc, bx, vec_width=1, dtype=T.i32
+                )
+                expert_idx = arith.index_cast(T.index, expert_i32)
+                n_idx = fx.Index(model_dim)
+                expert_off_idx = expert_idx * n_idx  # index
+
+                # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
+                # Prefer 16B buffer-load (dwordx4). If the per-thread byte count isn't divisible by
+                # 16, fall back to 8B (dwordx2) or 4B (dword) loads. For fp16 we require 16B.
+                x_load_bytes = 0
+                if const_expr(is_f16):
+                    if const_expr(bytes_per_thread_x % 16 != 0):
+                        raise ValueError(
+                            f"[fp16] bytes_per_thread_x ({bytes_per_thread_x}) must be divisible by 16"
+                        )
+                    x_load_bytes = 16
+                else:
+                    if const_expr(bytes_per_thread_x % 16 == 0):
+                        x_load_bytes = 16
+                    elif const_expr(bytes_per_thread_x % 8 == 0):
+                        x_load_bytes = 8
+                    elif const_expr(bytes_per_thread_x % 4 == 0):
+                        x_load_bytes = 4
+                    else:
+                        raise ValueError(
+                            f"bytes_per_thread_x ({bytes_per_thread_x}) must be divisible by 4 to use the dword-indexed load mapping."
+                        )
+                num_x_loads = bytes_per_thread_x // x_load_bytes
+                chunk_i32 = x_load_bytes // 4  # dwords per chunk (1/2/4)
+
+                c_k_div4 = (k_in * arith.index(int(elem_bytes))) // fx.Index(4)
+                c_k_div4_i32 = arith.index_cast(T.i32, c_k_div4)
+                fx.make_layout((m_i32_v, c_k_div4_i32), stride=(c_k_div4_i32, 1))
+                tile_k_dwords = (int(tile_k) * int(elem_bytes)) // 4
+                layout_x_tile_div4 = fx.make_layout(
+                    (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
+                )
+                c_chunk_i32 = fx.Index(chunk_i32)
+                tx_i32_base = tx * c_chunk_i32
+
+                topk_i32 = fx.Int32(topk)
+                mask24 = fx.Int32(0xFFFFFF)
+                # Sentinel clamp uses `tokens` as the upper bound: t_valid = (t < tokens).
+                tokens_i32 = arith.index_cast(T.i32, tokens_in)
+
+                def x_tile_chunk_coord_i32(i: int):
+                    return tile_chunk_coord_i32(
+                        arith,
+                        tx_i32_base=tx_i32_base,
+                        i=i,
+                        total_threads=total_threads,
+                        layout_tile_div4=layout_x_tile_div4,
+                        chunk_i32=chunk_i32,
+                    )
+
+                T.vec(1, T.i32)
+                T.vec(2, T.i32)
+                vec4_x = T.vec(4, x_elem)
+
+                def load_x(idx_i32, x_load_bytes_v):
+                    if const_expr(x_load_bytes_v == 16):
+                        idx_elem = (
+                            idx_i32 if elem_bytes == 1 else (idx_i32 * fx.Index(2))
+                        )
+                        return buffer_copy_gmem16_dwordx4(
+                            buffer_ops,
+                            vector,
+                            elem_type=x_elem,
+                            idx_i32=idx_elem,
+                            rsrc=x_rsrc,
+                            vec_elems=vec16_elems,
+                            elem_bytes=elem_bytes,
+                        )
+                    if const_expr(x_load_bytes_v == 8):
+                        return buffer_ops.buffer_load(
+                            x_rsrc, idx_i32, vec_width=2, dtype=T.i32
+                        )
+                    return buffer_ops.buffer_load(
+                        x_rsrc, idx_i32, vec_width=1, dtype=T.i32
+                    )
+
+                # decode routed token once (per thread's M-slice) and build a base offset.
+                x_row_base_div4 = []
+                x_col_local_i32 = []
+                x_row_local = []
+                for i in range_constexpr(num_x_loads):
+                    row_local, col_local_i32 = x_tile_chunk_coord_i32(i)
+                    x_row_local.append(row_local)
+                    x_col_local_i32.append(col_local_i32)
+
+                    sorted_row_i = bx_m + row_local
+                    fused_i = buffer_ops.buffer_load(
+                        sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
+                    )
+                    t_i32 = fused_i & mask24
+                    s_i32 = fused_i >> 24
+                    # aiter moe_sorting uses sentinel token_id == tokens for padding.
+                    # Do NOT rely on buffer OOB semantics for A2/scale loads; explicitly mask.
+                    t_valid = arith.cmpi(arith.CmpIPredicate.ult, t_i32, tokens_i32)
+                    s_valid = arith.cmpi(arith.CmpIPredicate.ult, s_i32, topk_i32)
+                    ts_valid = t_valid & s_valid
+                    t_safe = ts_valid.select(t_i32, fx.Int32(0))
+                    s_safe = ts_valid.select(s_i32, fx.Int32(0))
+                    row_ts_i32 = t_safe * topk_i32 + s_safe
+                    row_ts_idx = arith.index_cast(T.index, row_ts_i32)
+                    # Base row offset in dword units: row_ts_idx * (k_in/4)
+                    x_row_base_div4.append(row_ts_idx * c_k_div4)
+
+                def load_x_tile(base_k, x_load_bytes_v):
+                    base_k_div4 = (base_k * arith.index(int(elem_bytes))) // fx.Index(4)
+                    parts = []
+                    for i in range_constexpr(num_x_loads):
+                        idx_i32 = x_row_base_div4[i] + base_k_div4 + x_col_local_i32[i]
+                        x_vec = load_x(idx_i32, x_load_bytes_v)
+                        if const_expr(x_load_bytes_v == 16):
+                            parts.append(vector.bitcast(T.i32x4, x_vec))
+                        elif const_expr(x_load_bytes_v == 8):
+                            parts.append(x_vec)
+                        else:
+                            parts.append(x_vec)
+                    return parts
+
+                # tx -> wave/lane (GEMM-style decomposition).
+                coord_wl = fx.idx2crd(tx, layout_tx_wave_lane)
+                wave_id = fx.get(coord_wl, 0)
+                lane_id = fx.get(coord_wl, 1)
+                coord_l16 = fx.idx2crd(lane_id, layout_lane16)
+                lane_div_16 = fx.get(coord_l16, 0)
+                lane_mod_16 = fx.get(coord_l16, 1)
+
+                row_a_lds = lane_mod_16
+                a_kpack_elems = 16 // elem_bytes
+                col_offset_base = lane_div_16 * arith.index(int(a_kpack_elems))
+                col_offset_base_bytes = (
+                    col_offset_base
+                    if elem_bytes == 1
+                    else (col_offset_base * arith.index(int(elem_bytes)))
+                )
+
+                # Dynamic N tiling within block.
+                by_n = by * fx.Index(tile_n)
+                num_waves = 4
+                n_per_wave = tile_n // num_waves
+                num_acc_n = n_per_wave // 16
+                c_n_per_wave = fx.Index(n_per_wave)
+                wave_mod_4 = wave_id % fx.Index(4)
+                n_tile_base = wave_mod_4 * c_n_per_wave
+
+                # Precompute (n_blk, n_intra) for B, and col indices for output.
+                n_intra_list = []
+                n_blk_list = []
+                col_g_list = []
+                c_n0 = c_n_total // fx.Index(16)
+                c_n0_i32 = arith.index_cast(T.i32, c_n0)
+                layout_n_blk_intra = fx.make_layout((c_n0_i32, 16), stride=(16, 1))
+                for ni in range_constexpr(num_acc_n):
+                    offset = arith.index(ni * 16)
+                    col_g = by_n + n_tile_base + offset + lane_mod_16
+                    col_g_list.append(col_g)
+
+                    row_w = expert_off_idx + col_g
+                    coord_w = fx.idx2crd(row_w, layout_n_blk_intra)
+                    n_blk_list.append(fx.get(coord_w, 0))
+                    n_intra_list.append(fx.get(coord_w, 1))
+
+                m_repeat = tile_m // 16
+                k_unroll = tile_k_bytes // 64  # K64-byte micro-step (2x MFMA)
+
+                # --- B Load Logic (K64) ---
+                def load_b_pack(base_k, ki_step, ni):
+                    return load_b_pack_k32(
+                        buffer_ops,
+                        arith,
+                        vector,
+                        arg_b=arg_w,
+                        b_rsrc=w_rsrc,
+                        layout_b=layout_b,
+                        base_k=base_k,
+                        ki_step=ki_step,
+                        n_blk=n_blk_list[ni],
+                        n_intra=n_intra_list[ni],
+                        lane_div_16=lane_div_16,  # 0..3
+                        elem_type=w_elem,
+                        kpack_bytes=kpack_bytes,
+                        elem_bytes=elem_bytes,
+                        unpack_int4=is_int4,
+                    )
+
+                def load_b_tile(base_k):
+                    """Prefetch the entire per-thread B tile (gmem -> regs) for a given K base.
+
+                    Returns a list of length `k_unroll`, where each entry is a tuple:
+                      (packs_half0[ni], packs_half1[ni])  for the K64 micro-step.
+                    """
+                    b_tile = []
+                    for ku in range_constexpr(k_unroll):
+                        packs0 = []
+                        packs1 = []
+                        for ni in range_constexpr(num_acc_n):
+                            ki0 = (ku * 2) + 0
+                            ki1 = (ku * 2) + 1
+                            b0 = load_b_pack(base_k, ki0, ni)
+                            b1 = load_b_pack(base_k, ki1, ni)
+                            packs0.append(b0)
+                            packs1.append(b1)
+                        b_tile.append((packs0, packs1))
+                    return b_tile
+
+                # ---- Pipeline helpers: store X tile to LDS with ping-pong base ----
+                def store_x_tile_to_lds(vec_x_in_parts, lds_base, x_load_bytes_v):
+                    for i in range_constexpr(num_x_loads):
+                        row_local = x_row_local[i]
+                        col_local_i32 = x_col_local_i32[i]
+                        if const_expr(x_load_bytes_v == 16):
+                            lds_store_16b_xor16(
+                                arith,
+                                vector,
+                                lds_memref=lds_x,
+                                vec16_ty=vec16_x,
+                                layout_lds=layout_lds,
+                                row_local=row_local,
+                                col_local_i32=col_local_i32,
+                                tx_c4=fx.Index(4),
+                                k_blocks16=k_blocks16,
+                                lds_base=lds_base,
+                                vec_part_i32x4=vec_x_in_parts[i],
+                                elem_bytes=elem_bytes,
+                            )
+                        elif const_expr(x_load_bytes_v == 8):
+                            lds_store_8b_xor16(
+                                arith,
+                                vector,
+                                lds_memref=lds_x,
+                                vec8_ty=vec8_x,
+                                layout_lds=layout_lds,
+                                row_local=row_local,
+                                col_local_i32=col_local_i32,
+                                tx_c4=fx.Index(4),
+                                k_blocks16=k_blocks16,
+                                lds_base=lds_base,
+                                vec_part_i32x2=vec_x_in_parts[i],
+                            )
+                        else:
+                            lds_store_4b_xor16(
+                                arith,
+                                vector,
+                                lds_memref=lds_x,
+                                vec4_ty=vec4_x,
+                                layout_lds=layout_lds,
+                                row_local=row_local,
+                                col_local_i32=col_local_i32,
+                                tx_c4=fx.Index(4),
+                                k_blocks16=k_blocks16,
+                                lds_base=lds_base,
+                                vec_part_i32x1=vec_x_in_parts[i],
+                            )
+
+                # --- A LDS load helper for K64 (load 16B once, extract 2x i64 halves) ---
+                def lds_load_packs_k64(curr_row_a_lds, col_base_bytes, lds_base):
+                    col_base_swz_bytes = swizzle_xor16(
+                        curr_row_a_lds, col_base_bytes, k_blocks16
+                    )
+                    col_base_swz = (
+                        col_base_swz_bytes
+                        if elem_bytes == 1
+                        else (col_base_swz_bytes // arith.index(int(elem_bytes)))
+                    )
+                    idx_a16 = crd2idx((curr_row_a_lds, col_base_swz), layout_lds)
+                    idx_a16 = idx_a16 + lds_base
+                    loaded_a16 = vector.load_op(vec16_x, lds_x, [idx_a16])
+                    a_i64x2 = vector.bitcast(T.i64x2, loaded_a16)
+                    a0 = vector.extract(
+                        a_i64x2, static_position=[0], dynamic_position=[]
+                    )
+                    a1 = vector.extract(
+                        a_i64x2, static_position=[1], dynamic_position=[]
+                    )
+                    return a0, a1
+
+                # --- Blockscale pre-decode and helpers (stage2) ---
+                c_scale_block_k_s2 = fx.Index(scale_block_k)
+                c_128_s2 = fx.Index(128)
+                c_nblk_k_w2 = fx.Index(nblk_k_w2)
+                row_off_base_s2 = lane_div_16 * fx.Index(4)
+                fx.Index(model_dim)
+
+                # Pre-decode sorted token IDs for stage2 (constant across all K-tiles).
+                # OOB buffer loads return 0, so no validity masking needed for scale values.
+                _pre_ts_safe_i32_s2 = []
+                for _mi in range_constexpr(m_repeat):
+                    _mi_safe = []
+                    for _ii in range_constexpr(4):
+                        _row_in_tile = (
+                            arith.index(_mi * 16) + row_off_base_s2 + fx.Index(_ii)
+                        )
+                        _sorted_row = bx_m + _row_in_tile
+                        _fused_pre = buffer_ops.buffer_load(
+                            sorted_rsrc, _sorted_row, vec_width=1, dtype=T.i32
+                        )
+                        _t_id_pre = _fused_pre & mask24
+                        _s_id_pre = _fused_pre >> 24
+                        _t_valid_pre = arith.cmpi(
+                            arith.CmpIPredicate.ult, _t_id_pre, tokens_i32
+                        )
+                        _s_valid_pre = arith.cmpi(
+                            arith.CmpIPredicate.ult, _s_id_pre, topk_i32
+                        )
+                        _ts_valid_pre = _t_valid_pre & _s_valid_pre
+                        _t_safe_pre = _ts_valid_pre.select(_t_id_pre, fx.Int32(0))
+                        _s_safe_pre = _ts_valid_pre.select(_s_id_pre, fx.Int32(0))
+                        _ts_i32_pre = _t_safe_pre * topk_i32 + _s_safe_pre
+                        _mi_safe.append(_ts_i32_pre)
+                    _pre_ts_safe_i32_s2.append(_mi_safe)
+
+                # Pre-compute N-block indices for scale_w (constant per CTA)
+                _pre_n_block_s2 = []
+                for _ni in range_constexpr(num_acc_n):
+                    _col_base_ni_pre = by_n + n_tile_base + arith.index(_ni * 16)
+                    _pre_n_block_s2.append(
+                        (expert_off_idx + _col_base_ni_pre) // c_128_s2
+                    )
+
+                m_in_s2 = tokens_in * fx.Index(topk)
+
+                def load_scales_s2(k_base):
+                    all_combined = []
+                    for sb in range_constexpr(sb_per_tile_s2):
+                        kb = k_base // c_scale_block_k_s2 + fx.Index(sb)
+                        sa_base_offset = kb * m_in_s2
+
+                        s_a_vecs = []
+                        sa_base_i32 = arith.index_cast(T.i32, sa_base_offset)
+                        for mi in range_constexpr(m_repeat):
+                            s_a_row = []
+                            for ii in range_constexpr(4):
+                                ts_safe_i32 = _pre_ts_safe_i32_s2[mi][ii]
+                                sa_idx_i32 = sa_base_i32 + ts_safe_i32
+                                sa_idx = arith.index_cast(T.index, sa_idx_i32)
+                                s_a_val = buffer_ops.buffer_load(
+                                    sx_rsrc, sa_idx, vec_width=1, dtype=T.f32
+                                )
+                                s_a_row.append(s_a_val)
+                            s_a_vecs.append(s_a_row)
+
+                        _sw_shared_n_s2 = n_per_wave <= 128
+                        s_w_vals = []
+                        s_w = arith.constant(1.0, type=T.f32)
+                        for ni in range_constexpr(num_acc_n):
+                            if const_expr(ni == 0 or not _sw_shared_n_s2):
+                                sw_idx = _pre_n_block_s2[ni] * c_nblk_k_w2 + kb
+                                s_w = buffer_ops.buffer_load(
+                                    sw_rsrc, sw_idx, vec_width=1, dtype=T.f32
+                                )
+                            s_w_vals.append(s_w)
+
+                        s_a_vec4_list = []
+                        for mi in range_constexpr(m_repeat):
+                            s_a_vec4_list.append(
+                                vector.from_elements(T.f32x4, s_a_vecs[mi])
+                            )
+                        all_combined.append((s_a_vec4_list, s_w_vals))
+                    return all_combined
+
+                def compute_tile_bs_s2(
+                    acc_in, b_tile_in, lds_base, pre_scales, *, a0_prefetch=None
+                ):
+                    current_acc = list(acc_in)
+                    mfma_res_ty = T.f32x4
+
+                    if const_expr(_is_gfx950):
+
+                        def _pack128(x0, x1, x2, x3):
+                            v4 = vector.from_elements(T.vec(4, T.i64), [x0, x1, x2, x3])
+                            return vector.bitcast(T.vec(8, T.i32), v4)
+
+                        for sb in range_constexpr(sb_per_tile_s2):
+                            s_a_vec4_list, s_w_vals = pre_scales[sb]
+                            ku0 = sb * ku_per_sb_s2
+                            ku1 = ku0 + 1
+                            b0_p0, b0_p1 = b_tile_in[ku0]
+                            b1_p0, b1_p1 = b_tile_in[ku1]
+                            col0 = col_offset_base_bytes + arith.index(ku0 * 64)
+                            col1 = col_offset_base_bytes + arith.index(ku1 * 64)
+                            for mi in range_constexpr(m_repeat):
+                                curr_row = row_a_lds + arith.index(mi * 16)
+                                a0 = arith.constant(0, type=T.i64)
+                                a1 = arith.constant(0, type=T.i64)
+                                if const_expr(
+                                    a0_prefetch is not None and sb == 0 and mi == 0
+                                ):
+                                    a0, a1 = a0_prefetch
+                                else:
+                                    a0, a1 = lds_load_packs_k64(
+                                        curr_row, col0, lds_base
+                                    )
+                                a2, a3 = lds_load_packs_k64(curr_row, col1, lds_base)
+                                a128 = _pack128(a0, a1, a2, a3)
+                                s_a_v4 = s_a_vec4_list[mi]
+                                pending_acc = None
+                                for ni in range_constexpr(num_acc_n):
+                                    acc_idx = mi * num_acc_n + ni
+                                    b128 = _pack128(
+                                        b0_p0[ni], b0_p1[ni], b1_p0[ni], b1_p1[ni]
+                                    )
+                                    blk = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                                        mfma_res_ty,
+                                        [
+                                            a128,
+                                            b128,
+                                            acc_init,
+                                            0,
+                                            0,
+                                            0,
+                                            0x7F7F7F7F,
+                                            0,
+                                            0x7F7F7F7F,
+                                        ],
+                                    )
+                                    rocdl.sched_barrier(0)
+                                    if const_expr(pending_acc is not None):
+                                        prev_acc_idx, prev_blk, prev_ni = pending_acc
+                                        s_w_bc = vector.broadcast(
+                                            T.f32x4, s_w_vals[prev_ni]
+                                        )
+                                        scale = ArithValue(s_a_v4) * ArithValue(s_w_bc)
+                                        current_acc[prev_acc_idx] = math_dialect.fma(
+                                            prev_blk, scale, current_acc[prev_acc_idx]
+                                        )
+                                    pending_acc = (acc_idx, blk, ni)
+                                if const_expr(pending_acc is not None):
+                                    prev_acc_idx, prev_blk, prev_ni = pending_acc
+                                    s_w_bc = vector.broadcast(
+                                        T.f32x4, s_w_vals[prev_ni]
+                                    )
+                                    scale = ArithValue(s_a_v4) * ArithValue(s_w_bc)
+                                    current_acc[prev_acc_idx] = math_dialect.fma(
+                                        prev_blk, scale, current_acc[prev_acc_idx]
+                                    )
+                    else:
+                        mfma_fn = (
+                            mfma_i32_k32
+                            if const_expr(is_int8)
+                            else (
+                                rocdl.mfma_f32_16x16x16f16
+                                if is_f16
+                                else rocdl.mfma_f32_16x16x32_fp8_fp8
+                            )
+                        )
+
+                        def _i64_to_v4f16(x_i64):
+                            v1 = vector.from_elements(T.vec(1, T.i64), [x_i64])
+                            return vector.bitcast(T.f16x4, v1)
+
+                        def mfma_k64(acc0, a0, a1, b0, b1):
+                            if const_expr(is_f16):
+                                a0v = _i64_to_v4f16(a0)
+                                a1v = _i64_to_v4f16(a1)
+                                b0v = _i64_to_v4f16(b0)
+                                b1v = _i64_to_v4f16(b1)
+                                acc1 = mfma_fn(mfma_res_ty, [a0v, b0v, acc0, 0, 0, 0])
+                                return mfma_fn(mfma_res_ty, [a1v, b1v, acc1, 0, 0, 0])
+                            acc1 = mfma_fn(mfma_res_ty, [a0, b0, acc0, 0, 0, 0])
+                            return mfma_fn(mfma_res_ty, [a1, b1, acc1, 0, 0, 0])
+
+                        for sb in range_constexpr(sb_per_tile_s2):
+                            s_a_vec4_list, s_w_vals = pre_scales[sb]
+                            for mi in range_constexpr(m_repeat):
+                                for ni in range_constexpr(num_acc_n):
+                                    acc_idx = mi * num_acc_n + ni
+                                    blk = acc_init
+                                    for ku_local in range_constexpr(ku_per_sb_s2):
+                                        ku = sb * ku_per_sb_s2 + ku_local
+                                        b_packs0, b_packs1 = b_tile_in[ku]
+                                        ki64 = arith.index(ku * 64)
+                                        col_base = col_offset_base_bytes + ki64
+                                        a0 = arith.constant(-1, type=T.i64)
+                                        a1 = arith.constant(-1, type=T.i64)
+                                        if const_expr(
+                                            (a0_prefetch is not None)
+                                            and (sb == 0)
+                                            and (ku_local == 0)
+                                            and (mi == 0)
+                                        ):
+                                            a0, a1 = a0_prefetch
+                                        else:
+                                            a0, a1 = lds_load_packs_k64(
+                                                row_a_lds + arith.index(mi * 16),
+                                                col_base,
+                                                lds_base,
+                                            )
+                                        blk = mfma_k64(
+                                            blk, a0, a1, b_packs0[ni], b_packs1[ni]
+                                        )
+                                    s_w_bc = vector.broadcast(T.f32x4, s_w_vals[ni])
+                                    scale = ArithValue(s_a_vec4_list[mi]) * ArithValue(
+                                        s_w_bc
+                                    )
+                                    current_acc[acc_idx] = math_dialect.fma(
+                                        blk, scale, current_acc[acc_idx]
+                                    )
+                    return current_acc
+
+                def compute_tile(
+                    acc_in,
+                    b_tile_in,
+                    lds_base,
+                    *,
+                    prefetch_epilogue: bool = False,
+                    a0_prefetch=None,
+                ):
+                    acc_list = list(acc_in)
+                    mfma_res_ty = T.i32x4 if is_int8 else T.f32x4
+                    mfma_fn = (
+                        mfma_i32_k32
+                        if is_int8
+                        else (
+                            rocdl.mfma_f32_16x16x16f16
+                            if is_f16
+                            else rocdl.mfma_f32_16x16x32_fp8_fp8
+                        )
+                    )
+
+                    epilogue_pf = None
+                    if const_expr(prefetch_epilogue):
+                        expert_off_pf = expert_off_idx
+                        sw_pf = []
+                        for ni in range_constexpr(num_acc_n):
+                            col_g = col_g_list[ni]
+                            row_w_idx = expert_off_pf + col_g
+                            sw_pf.append(
+                                fx.Float32(1.0)
+                                if is_f16
+                                else buffer_ops.buffer_load(
+                                    sw_rsrc, row_w_idx, vec_width=1, dtype=T.f32
+                                )
+                            )
+                        # Also prefetch per-row routed/topk weights (sorted_weights) when enabled.
+                        tw_pf = None
+                        if const_expr(doweight_stage2):
+                            tw_pf = []
+                            lane_div_16_mul4_pf = lane_div_16 * fx.Index(4)
+                            ii_idx_list_pf = [fx.Index(ii) for ii in range(4)]
+                            for mi in range_constexpr(m_repeat):
+                                mi_base_pf = arith.index(mi * 16)
+                                for ii in range_constexpr(4):
+                                    row_off_pf = (
+                                        lane_div_16_mul4_pf + ii_idx_list_pf[ii]
+                                    )
+                                    row_in_tile_pf = mi_base_pf + row_off_pf
+                                    sorted_row_pf = bx_m + row_in_tile_pf
+                                    tw_pf.append(
+                                        buffer_ops.buffer_load(
+                                            sorted_w_rsrc,
+                                            sorted_row_pf,
+                                            vec_width=1,
+                                            dtype=T.f32,
+                                        )
+                                    )
+                        epilogue_pf = (sw_pf, tw_pf)
+
+                    def _i64_to_v4f16(x_i64):
+                        v1 = vector.from_elements(T.vec(1, T.i64), [x_i64])
+                        return vector.bitcast(T.f16x4, v1)
+
+                    def mfma_k64(acc0, a0, a1, b0, b1):
+                        if const_expr(is_f16):
+                            a0v = _i64_to_v4f16(a0)
+                            a1v = _i64_to_v4f16(a1)
+                            b0v = _i64_to_v4f16(b0)
+                            b1v = _i64_to_v4f16(b1)
+                            acc1 = mfma_fn(mfma_res_ty, [a0v, b0v, acc0, 0, 0, 0])
+                            return mfma_fn(mfma_res_ty, [a1v, b1v, acc1, 0, 0, 0])
+                        acc1 = mfma_fn(mfma_res_ty, [a0, b0, acc0, 0, 0, 0])
+                        return mfma_fn(mfma_res_ty, [a1, b1, acc1, 0, 0, 0])
+
+                    for ku in range_constexpr(k_unroll):
+                        b_packs0, b_packs1 = b_tile_in[ku]
+                        ki64 = arith.index(ku * 64)
+                        col_base = col_offset_base_bytes + ki64
+
+                        for mi in range_constexpr(m_repeat):
+                            mi_val = arith.index(mi * 16)
+                            curr_row_a_lds = row_a_lds + mi_val
+
+                            a0 = arith.constant(-1, type=T.i64)
+                            a1 = arith.constant(-1, type=T.i64)
+                            if const_expr(
+                                (a0_prefetch is not None) and (ku == 0) and (mi == 0)
+                            ):
+                                a0, a1 = a0_prefetch
+                            else:
+                                a0, a1 = lds_load_packs_k64(
+                                    curr_row_a_lds, col_base, lds_base
+                                )
+
+                            for ni in range_constexpr(num_acc_n):
+                                acc_idx = mi * num_acc_n + ni
+                                acc_list[acc_idx] = mfma_k64(
+                                    acc_list[acc_idx],
+                                    a0,
+                                    a1,
+                                    b_packs0[ni],
+                                    b_packs1[ni],
+                                )
+                    return acc_list, epilogue_pf
+
+                # ---------------- 2-stage pipeline (ping-pong LDS + B tile prefetch) ----------------
+                lds_tile_elems = arith.index(tile_m * lds_stride)
+                lds_base_cur = fx.Index(0)
+                lds_base_nxt = lds_tile_elems
+
+                rocdl.sched_barrier(0)
+
+                # def hot_loop_scheduler():
+                #     mfma_group = num_acc_n
+                #     # K64 micro-step: 2x K32 MFMA per accumulator update.
+                #     mfma_total = (k_unroll * 2) * m_repeat * mfma_group
+                #     mfma_per_iter = 2 * mfma_group
+                #     sche_iters = 0 if mfma_per_iter == 0 else (mfma_total // mfma_per_iter)
+                #     rocdl.sched_dsrd(2)
+                #     rocdl.sched_mfma(1)
+                #     rocdl.sched_mfma(1)
+                #     if num_acc_n < 4:
+                #         rocdl.sched_dsrd(1)
+                #         rocdl.sched_mfma(1)
+                #         rocdl.sched_dsrd(1)
+                #         rocdl.sched_mfma(1)
+                #         rocdl.sched_vmem(1)
+                #         rocdl.sched_mfma(1)
+                #         rocdl.sched_vmem(1)
+                #         rocdl.sched_mfma(2)
+                #         rocdl.sched_dsrd(1)
+                #         rocdl.sched_mfma(2)
+                #         rocdl.sched_vmem(1)
+
+                #     dswr_tail = num_x_loads
+                #     if dswr_tail > sche_iters:
+                #         dswr_tail = sche_iters
+                #     dswr_start = sche_iters - dswr_tail
+                #     for sche_i in range_constexpr(sche_iters):
+                #         rocdl.sched_mfma(mfma_group // 2)
+                #         rocdl.sched_dsrd(1)
+                #         rocdl.sched_mfma(mfma_group // 2)
+                #         rocdl.sched_vmem(1)
+                #         rocdl.sched_mfma(mfma_group)
+                #         if sche_i >= dswr_start - 1:
+                #             rocdl.sched_dswr(1)
+                #     rocdl.sched_barrier(0)
+
+                def hot_loop_scheduler():
+                    mfma_per_ku = m_repeat * num_acc_n * 2  # m * n_acc * 2(k32)
+                    total_mfma = k_unroll * mfma_per_ku
+                    rocdl.sched_group_barrier(
+                        rocdl.mask_dsrd, ku_per_sb_s2 * m_repeat, 0
+                    )
+                    rocdl.sched_group_barrier(rocdl.mask_mfma, total_mfma, 1)
+                    rocdl.sched_group_barrier(rocdl.mask_vmem_rd, num_x_loads, 2)
+                    rocdl.sched_group_barrier(rocdl.mask_dswr, num_x_loads, 3)
+                    rocdl.sched_barrier(0)
+
+                # Prologue.
+                k0 = fx.Index(0)
+                x_regs0 = load_x_tile(k0, x_load_bytes)
+                b_cur = load_b_tile(k0)
+                store_x_tile_to_lds(x_regs0, lds_base_cur, x_load_bytes)
+                gpu.barrier()
+
+                acc = [arith.constant_vector(0.0, T.f32x4)] * (num_acc_n * m_repeat)
+                lds_base_pong = lds_base_cur
+                lds_base_ping = lds_base_nxt
+
+                # Cross-tile A0 LDS prefetch (default-on): prefetch the first A-pack (K64) for the
+                # tile we are about to compute from LDS, to overlap with upcoming VMEM.
+                a0_prefetch_pong = lds_load_packs_k64(
+                    row_a_lds, col_offset_base_bytes, lds_base_pong
+                )
+
+                # Main loop: process K tiles in 2-tile ping-pong steps.
+                #
+                # IMPORTANT: for odd number of K tiles, leave **1** tail tile; for even, leave **2**.
+                # Otherwise the 2-tile tail below would double-count the last tile when num_tiles is odd
+                # (e.g. inter_dim=192, tile_k=64 -> 3 tiles).
+                num_k_tiles_py = int(inter_dim) // int(tile_k)
+                odd_k_tiles = (num_k_tiles_py % 2) == 1
+                tail_tiles = 1 if odd_k_tiles else 2
+                k_main2_py = (num_k_tiles_py - tail_tiles) * int(tile_k)
+                if const_expr(k_main2_py < 0):
+                    k_main2_py = 0
+
+                c2_tile_k = arith.index(tile_k * 2)
+                pair_iters = k_main2_py // (int(tile_k) * 2)
+                for pair_i in range_constexpr(pair_iters):
+                    k_iv = arith.index(pair_i * (tile_k * 2))
+                    # Issue scale loads FIRST so their latency hides behind heavy tile VMEM.
+                    pre_scales_pong = load_scales_s2(k_iv)
+                    next_k1 = k_iv + tile_k
+                    x_regs_ping = load_x_tile(next_k1, x_load_bytes)
+                    b_ping = load_b_tile(next_k1)
+
+                    acc = compute_tile_bs_s2(
+                        acc,
+                        b_cur,
+                        lds_base_pong,
+                        pre_scales_pong,
+                        a0_prefetch=a0_prefetch_pong,
+                    )
+                    a0_prefetch_pong = None
+                    store_x_tile_to_lds(x_regs_ping, lds_base_ping, x_load_bytes)
+                    hot_loop_scheduler()
+                    gpu.barrier()
+
+                    # Cross-tile prefetch for the ping tile we are about to compute.
+                    a0_prefetch_ping = lds_load_packs_k64(
+                        row_a_lds, col_offset_base_bytes, lds_base_ping
+                    )
+
+                    # Issue scale loads FIRST so their latency hides behind heavy tile VMEM.
+                    pre_scales_ping = load_scales_s2(next_k1)
+                    next_k2 = k_iv + c2_tile_k
+                    x_regs_pong = load_x_tile(next_k2, x_load_bytes)
+                    b_next = load_b_tile(next_k2)
+
+                    acc = compute_tile_bs_s2(
+                        acc,
+                        b_ping,
+                        lds_base_ping,
+                        pre_scales_ping,
+                        a0_prefetch=a0_prefetch_ping,
+                    )
+                    a0_prefetch_ping = None
+                    store_x_tile_to_lds(x_regs_pong, lds_base_pong, x_load_bytes)
+                    hot_loop_scheduler()
+                    gpu.barrier()
+
+                    # Cross-tile prefetch for the next pong tile.
+                    a0_prefetch_pong = lds_load_packs_k64(
+                        row_a_lds, col_offset_base_bytes, lds_base_pong
+                    )
+
+                    b_cur = b_next
+
+                if const_expr(odd_k_tiles):
+                    # Tail: single remaining tile (already in `b_cur` / `lds_base_pong`).
+                    k_last = arith.index((num_k_tiles_py - 1) * int(tile_k))
+                    pre_scales_last = load_scales_s2(k_last)
+                    acc = compute_tile_bs_s2(
+                        acc,
+                        b_cur,
+                        lds_base_pong,
+                        pre_scales_last,
+                        a0_prefetch=a0_prefetch_pong,
+                    )
+                else:
+                    # Tail: 2 remaining tiles.
+                    k_tail0 = k_in - c2_tile_k
+                    k_tail1 = k_in - tile_k
+                    # Issue scale loads FIRST so their latency hides behind heavy tile VMEM.
+                    pre_scales_tail0 = load_scales_s2(k_tail0)
+                    x_regs_ping = load_x_tile(k_tail1, x_load_bytes)
+                    b_ping = load_b_tile(k_tail1)
+
+                    acc = compute_tile_bs_s2(
+                        acc,
+                        b_cur,
+                        lds_base_pong,
+                        pre_scales_tail0,
+                        a0_prefetch=a0_prefetch_pong,
+                    )
+                    a0_prefetch_pong = None
+                    store_x_tile_to_lds(x_regs_ping, lds_base_ping, x_load_bytes)
+                    hot_loop_scheduler()
+                    gpu.barrier()
+
+                    # Epilogue tile (blockscale already dequantized).
+                    a0_prefetch_ping = lds_load_packs_k64(
+                        row_a_lds, col_offset_base_bytes, lds_base_ping
+                    )
+                    pre_scales_tail1 = load_scales_s2(k_tail1)
+                    acc = compute_tile_bs_s2(
+                        acc,
+                        b_ping,
+                        lds_base_ping,
+                        pre_scales_tail1,
+                        a0_prefetch=a0_prefetch_ping,
+                    )
+
+                # ---------------- Epilogue: LDS CShuffle + atomic half2 (x2) ----------------
+                # Reuse the shared helper so GEMM / MoE kernels share the exact same CShuffle skeleton.
+                mask24_i32 = fx.Int32(0xFFFFFF)
+                model_i32 = fx.Int32(model_dim)
+                topk_i32_v = topk_i32
+
+                zero_i32 = fx.Int32(0)
+                c2_i32 = fx.Int32(2)  # 2B element size for f16/bf16
+                mask_even_i32 = fx.Int32(
+                    0xFFFFFFFE
+                )  # align element index to even for half2 atomics
+
+                e_vec = _e_vec
+
+                def atomic_add_f16x2(val_f16x2, byte_off_i32):
+                    rocdl.raw_ptr_buffer_atomic_fadd(
+                        val_f16x2,
+                        out_rsrc,
+                        byte_off_i32,
+                        zero_i32,
+                        zero_i32,
+                    )
+
+                # Blockscale: dequant already done in compute_tile_bs_s2, no sw/sx needed here.
+
+                if const_expr(out_is_f32):
+                    # origin/dev_a16w4: f32 output uses scalar f32 atomics and skips CShuffle/LDS.
+                    c4_i32 = fx.Int32(4)
+
+                    def atomic_add_f32(val_f32, byte_off_i32):
+                        rocdl.raw_ptr_buffer_atomic_fadd(
+                            val_f32,
+                            out_rsrc,
+                            byte_off_i32,
+                            zero_i32,
+                            zero_i32,
+                        )
+
+                    def _stage2_row_atomic(*, mi: int, ii: int, row_in_tile, row):
+                        # Blockscale: dequant already done in compute_tile_bs_s2.
+                        fused2 = buffer_ops.buffer_load(
+                            sorted_rsrc, row, vec_width=1, dtype=T.i32
+                        )
+                        t2 = fused2 & mask24_i32
+                        fused2 >> 24
+
+                        if const_expr(doweight_stage2):
+                            tw = buffer_ops.buffer_load(
+                                sorted_w_rsrc, row, vec_width=1, dtype=T.f32
+                            )
+
+                        idx0 = t2 * model_i32  # i32 element index base
+
+                        for ni in range_constexpr(num_acc_n):
+                            col_g = col_g_list[ni]
+                            acc_idx = mi * num_acc_n + ni
+                            v = vector.extract(
+                                acc[acc_idx], static_position=[ii], dynamic_position=[]
+                            )
+                            if const_expr(doweight_stage2):
+                                v = v * tw
+                            col_i32 = arith.index_cast(T.i32, col_g)
+                            idx_elem = idx0 + col_i32
+                            byte_off = idx_elem * c4_i32
+                            atomic_add_f32(v, byte_off)
+
+                    default_epilog(
+                        arith=arith,
+                        range_constexpr=range_constexpr,
+                        m_repeat=m_repeat,
+                        lane_div_16=lane_div_16,
+                        bx_m=bx_m,
+                        body_row=_stage2_row_atomic,
+                    )
+                else:
+                    if const_expr(lds_out is None):
+                        raise RuntimeError(
+                            "FLYDSL_MOE_STAGE2_CSHUFFLE=1 but lds_out is not allocated/aliased."
+                        )
+
+                    # For bf16 global atomics (gfx942 only), precompute the output base address.
+                    # gfx950+ has buffer_atomic_pk_add_bf16, so bf16 uses buffer atomics there.
+                    out_base_idx = None
+                    if const_expr(_needs_global_atomic_bf16):
+                        out_base_idx = buffer_ops.extract_base_index(arg_out)
+
+                    def write_row_to_lds(
+                        *,
+                        mi: int,
+                        ii: int,
+                        row_in_tile,
+                        row,
+                        row_base_lds,
+                        col_base_local,
+                        num_acc_n: int,
+                        lds_out,
+                    ):
+                        # Blockscale: dequant already done in compute_tile_bs_s2.
+                        tw = arith.constant(1.0, type=T.f32)
+                        if const_expr(doweight_stage2):
+                            tw = buffer_ops.buffer_load(
+                                sorted_w_rsrc, row, vec_width=1, dtype=T.f32
+                            )
+
+                        for ni in range_constexpr(num_acc_n):
+                            col_local = col_base_local + (ni * 16)
+                            acc_idx = mi * num_acc_n + ni
+                            v = vector.extract(
+                                acc[acc_idx], static_position=[ii], dynamic_position=[]
+                            )
+                            if const_expr(doweight_stage2):
+                                v = v * tw
+                            v_out = arith.trunc_f(out_elem(), v)
+
+                            lds_idx = row_base_lds + col_local
+                            vec1_out = T.vec(1, out_elem())
+                            v1 = vector.from_elements(vec1_out, [v_out])
+                            vector.store(v1, lds_out, [lds_idx], alignment=2)
+
+                    def precompute_row(*, row_local, row):
+                        # Precompute row context for cshuffle stores.
+                        # Return (fused_i32, row_valid_i1) so the epilogue can skip the entire row
+                        # for invalid tail rows (CK-style), avoiding per-store branching.
+                        fused2 = buffer_ops.buffer_load(
+                            sorted_rsrc, row, vec_width=1, dtype=T.i32
+                        )
+                        row_i32 = arith.index_cast(T.i32, row)
+                        row_valid0 = arith.cmpi(
+                            arith.CmpIPredicate.ult, row_i32, num_valid_i32
+                        )
+                        t = fused2 & mask24_i32
+                        s = fused2 >> 24
+                        t_ok = arith.cmpi(arith.CmpIPredicate.ult, t, tokens_i32)
+                        s_ok = arith.cmpi(arith.CmpIPredicate.ult, s, topk_i32_v)
+                        row_valid = row_valid0 & t_ok & s_ok
+                        return (fused2, row_valid)
+
+                    def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
+                        fused = row_ctx
+                        t = fused & mask24_i32
+                        s = fused >> 24
+                        idx0 = t * model_i32
+                        if const_expr(not bool(accumulate)):
+                            ts = t * topk_i32_v + s
+                            idx0 = ts * model_i32
+                        col_i32 = arith.index_cast(T.i32, col_g0)
+                        idx_elem = idx0 + col_i32
+                        idx_elem_even = idx_elem & mask_even_i32
+                        if const_expr(_needs_global_atomic_bf16):
+                            # gfx942: no buffer_atomic_pk_add_bf16, use global atomicrmw fadd
+                            if const_expr(bool(accumulate)):
+                                byte_off = idx_elem_even * c2_i32
+                                byte_off_idx = arith.index_cast(T.index, byte_off)
+                                ptr_addr_idx = out_base_idx + byte_off_idx
+                                out_ptr = buffer_ops.create_llvm_ptr(
+                                    ptr_addr_idx, address_space=1
+                                )
+                                out_ptr_v = (
+                                    out_ptr._value
+                                    if hasattr(out_ptr, "_value")
+                                    else out_ptr
+                                )
+                                frag_v = (
+                                    frag._value if hasattr(frag, "_value") else frag
+                                )
+                                llvm.AtomicRMWOp(
+                                    llvm.AtomicBinOp.fadd,
+                                    out_ptr_v,
+                                    frag_v,
+                                    llvm.AtomicOrdering.monotonic,
+                                    syncscope="agent",
+                                    alignment=4,
+                                )
+                            else:
+                                buffer_ops.buffer_store(frag, out_rsrc, idx_elem_even)
+                        else:
+                            # f16, or bf16 on gfx950+ (has buffer_atomic_pk_add_bf16)
+                            byte_off = idx_elem_even * c2_i32
+                            if const_expr(bool(accumulate)):
+                                atomic_add_f16x2(frag, byte_off)
+                            else:
+                                buffer_ops.buffer_store(frag, out_rsrc, idx_elem_even)
+
+                    c_shuffle_epilog(
+                        arith=arith,
+                        vector=vector,
+                        gpu=gpu,
+                        scf=scf,
+                        range_constexpr=range_constexpr,
+                        tile_m=tile_m,
+                        tile_n=tile_n,
+                        e_vec=e_vec,
+                        m_repeat=m_repeat,
+                        num_acc_n=num_acc_n,
+                        tx=tx,
+                        lane_div_16=lane_div_16,
+                        lane_mod_16=lane_mod_16,
+                        bx_m=bx_m,
+                        by_n=by_n,
+                        n_tile_base=n_tile_base,
+                        lds_out=lds_out,
+                        frag_elem_type=(T.bf16 if out_is_bf16 else T.f16),
+                        write_row_to_lds=write_row_to_lds,
+                        precompute_row=precompute_row,
+                        store_pair=store_pair,
+                    )
+
+            _if_blk = scf.IfOp(blk_valid)
+            with _if_then(_if_blk):
+                _moe_gemm2_then_body()
+
+    # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
+    @flyc.jit
+    def launch_moe_blockscale_gemm2(
+        arg_out: fx.Tensor,
+        arg_x: fx.Tensor,
+        arg_w: fx.Tensor,
+        arg_scale_x: fx.Tensor,
+        arg_scale_w: fx.Tensor,
+        arg_sorted_token_ids: fx.Tensor,
+        arg_expert_ids: fx.Tensor,
+        arg_sorted_weights: fx.Tensor,
+        arg_num_valid_ids: fx.Tensor,
+        i32_tokens_in: fx.Int32,
+        i32_n_in: fx.Int32,
+        i32_k_in: fx.Int32,
+        i32_size_expert_ids_in: fx.Int32,
+        stream: fx.Stream,
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+
+        n_in = arith.index_cast(T.index, i32_n_in)
+        size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
+        gx = n_in // fx.Index(tile_n)
+        gy = size_expert_ids_in
+
+        moe_blockscale_gemm2(
+            arg_out,
+            arg_x,
+            arg_w,
+            arg_scale_x,
+            arg_scale_w,
+            arg_sorted_token_ids,
+            arg_expert_ids,
+            arg_sorted_weights,
+            arg_num_valid_ids,
+            i32_tokens_in,
+            i32_n_in,
+            i32_k_in,
+            i32_size_expert_ids_in,
+            value_attrs={"rocdl.waves_per_eu": waves_per_eu},
+        ).launch(grid=(gx, gy, 1), block=(256, 1, 1), stream=stream)
+
+    return launch_moe_blockscale_gemm2
+
+
+# MoE Reduction Kernel (reduce sum over topk dimension)
+@functools.lru_cache(maxsize=1024)
+def compile_moe_reduction(
+    *,
+    topk: int,
+    model_dim: int,
+    dtype_str: str = "f16",
+    use_mask: bool = False,
+):
+    """Compile a reduction kernel that sums over the topk dimension.
+
+    Input:  X [tokens, topk, model_dim]
+            valid_mask [tokens, topk] (optional, if use_mask=True)
+    Output: Y [tokens, model_dim]
+
+    This kernel performs: Y[t, d] = sum(X[t, :, d]) for all t, d.
+    When use_mask=True, only sums slots where valid_mask[t,k]=1.
+    Used in conjunction with compile_moe_blockscale_gemm2(accumulate=False) to avoid atomic contention.
+    """
+    get_hip_arch()
+    ir.ShapedType.get_dynamic_size()
+
+    # Kernel Config
+    BLOCK_SIZE = 256
+    VEC_WIDTH = 8
+
+    masked = "masked" if use_mask else ""
+
+    module_name = f"bs_moe_reduce_topk{topk}_{dtype_str}{masked}"
+
+    if dtype_str == "f32":
+        elem_type_tag = "f32"
+    elif dtype_str == "f16":
+        elem_type_tag = "f16"
+    elif dtype_str == "bf16":
+        elem_type_tag = "bf16"
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype_str}")
+    compute_type = lambda: T.f32  # noqa: E731
+    i8_type = lambda: T.i8  # noqa: E731
+
+    def elem_type():
+        ty = (
+            T.f32
+            if elem_type_tag == "f32"
+            else (T.f16 if elem_type_tag == "f16" else T.bf16)
+        )
+        return ty() if callable(ty) else ty
+
+    if True:
+
+        @flyc.kernel(name=module_name)
+        def moe_reduction_kernel(
+            X: fx.Tensor,
+            Y: fx.Tensor,
+            valid_mask: fx.Tensor,
+            i32_m_tokens: fx.Int32,
+        ):
+            m_tokens = fx.Index(i32_m_tokens)
+            c_topk = fx.Index(topk)
+            c_model_dim = fx.Index(model_dim)
+            mask_nbytes_idx = m_tokens * c_topk
+            elem_bits = 32 if dtype_str == "f32" else 16
+            copy_vec_width = 128 // elem_bits  # 8 for f16/bf16, 4 for f32
+            n_sub = VEC_WIDTH // copy_vec_width  # 1 for f16/bf16, 2 for f32
+            # Buffer-backed tensors via layout API (all dtypes)
+            X_buf = fx.rocdl.make_buffer_tensor(X)
+            Y_buf = fx.rocdl.make_buffer_tensor(Y)
+            # Scalar buffer resources for tail path and mask
+            x_rsrc = buffer_ops.create_buffer_resource(X, max_size=True)
+            y_rsrc = buffer_ops.create_buffer_resource(Y, max_size=True)
+            mask_rsrc = buffer_ops.create_buffer_resource(
+                valid_mask, max_size=False, num_records_bytes=mask_nbytes_idx
+            )
+
+            token_idx = gpu.block_id("x")
+            tile_idx = gpu.block_id("y")
+            tid = gpu.thread_id("x")
+
+            # Guard: token in range (Index is unsigned → auto ult)
+            tok_ok = token_idx < m_tokens
+            _if_tok = scf.IfOp(tok_ok)
+            with _if_then(_if_tok):
+                tile_cols = BLOCK_SIZE * VEC_WIDTH
+                c_tile_cols = fx.Index(tile_cols)
+                c_vecw = fx.Index(VEC_WIDTH)
+
+                col_base = tile_idx * c_tile_cols + tid * c_vecw
+
+                # Guard: any work in bounds (Index < → ult)
+                col_ok = col_base < c_model_dim
+                _if_col = scf.IfOp(col_ok)
+                with _if_then(_if_col):
+                    # Fast path: full vector in-bounds (Index <= → ule)
+                    end_ok = col_base + c_vecw <= c_model_dim
+                    _if_full = scf.IfOp(end_ok, has_else=True)
+                    with _if_then(_if_full):
+                        # ── Vector path via layout API (all dtypes) ──
+                        # fx.copy auto-iterates when atom width < VEC_WIDTH
+                        # (e.g. f32: BufferCopy128b handles 4, fx.copy issues 2 calls for 8)
+                        copy_atom = fx.make_copy_atom(
+                            fx.rocdl.BufferCopy128b(), elem_bits
+                        )
+                        vec_type_c = T.vec(copy_vec_width, compute_type())
+                        vec_type_e = T.vec(copy_vec_width, elem_type())
+
+                        acc_vecs = [
+                            vector.broadcast(vec_type_c, fx.Float32(0.0).ir_value())
+                            for _ in range(n_sub)
+                        ]
+                        elem_dtype = fx.Numeric.from_ir_type(elem_type())
+
+                        tok_i32 = fx.Int32(token_idx)
+                        tile_i32 = fx.Int32(tile_idx)
+                        tid_i32 = fx.Int32(tid)
+
+                        for k in range_constexpr(topk):
+                            # X[token, k, :] → tile → thread's VEC_WIDTH slice
+                            x_row = X_buf[tok_i32, fx.Int32(k), None]
+                            x_tiled = fx.logical_divide(
+                                x_row, fx.make_layout(tile_cols, 1)
+                            )
+                            x_div = fx.logical_divide(
+                                x_tiled[None, tile_i32], fx.make_layout(VEC_WIDTH, 1)
+                            )
+                            x_thread = x_div[None, tid_i32]
+
+                            if const_expr(use_mask):
+                                m_idx_i32 = fx.Int32(token_idx * c_topk + fx.Index(k))
+                                mv = buffer_ops.buffer_load(
+                                    mask_rsrc, m_idx_i32, vec_width=1, dtype=i8_type()
+                                )
+                                mv_ok = mv != fx.Int8(0)
+
+                            if const_expr(n_sub > 1):
+                                x_inner = fx.logical_divide(
+                                    x_thread, fx.make_layout(copy_vec_width, 1)
+                                )
+                            for si in range_constexpr(n_sub):
+                                src = (
+                                    x_inner[None, fx.Int32(si)]
+                                    if n_sub > 1
+                                    else x_thread
+                                )
+                                r = fx.make_rmem_tensor(copy_vec_width, elem_dtype)
+                                fx.copy_atom_call(copy_atom, src, r)
+                                vec_e = fx.memref_load_vec(r)
+
+                                if const_expr(use_mask):
+                                    zero_e = vector.broadcast(
+                                        vec_type_e,
+                                        arith.constant(0.0, type=elem_type()),
+                                    )
+                                    vec_e = mv_ok.select(vec_e, zero_e)
+
+                                if const_expr(elem_bits < 32):
+                                    vec_c = vec_e.extf(vec_type_c)
+                                else:
+                                    vec_c = vec_e
+                                acc_vecs[si] = acc_vecs[si] + vec_c
+
+                        # ── Store results ──
+                        if const_expr(n_sub > 1):
+                            y_row = Y_buf[tok_i32, None]
+                            y_tiled = fx.logical_divide(
+                                y_row, fx.make_layout(tile_cols, 1)
+                            )
+                            y_div = fx.logical_divide(
+                                y_tiled[None, tile_i32], fx.make_layout(VEC_WIDTH, 1)
+                            )
+                            y_inner = fx.logical_divide(
+                                y_div[None, tid_i32], fx.make_layout(copy_vec_width, 1)
+                            )
+
+                        for si in range_constexpr(n_sub):
+                            out_vec = acc_vecs[si]
+                            if const_expr(elem_bits < 32):
+                                out_vec = out_vec.truncf(vec_type_e)
+
+                            if const_expr(n_sub > 1):
+                                dst = y_inner[None, fx.Int32(si)]
+                            else:
+                                y_row = Y_buf[tok_i32, None]
+                                y_tiled = fx.logical_divide(
+                                    y_row, fx.make_layout(tile_cols, 1)
+                                )
+                                y_div = fx.logical_divide(
+                                    y_tiled[None, tile_i32],
+                                    fx.make_layout(VEC_WIDTH, 1),
+                                )
+                                dst = y_div[None, tid_i32]
+
+                            r_out = fx.make_rmem_tensor(copy_vec_width, elem_dtype)
+                            fx.memref_store_vec(out_vec, r_out)
+                            fx.copy_atom_call(copy_atom, r_out, dst)
+
+                    with _if_else(_if_full):
+                        for lane in range_constexpr(VEC_WIDTH):
+                            col = col_base + fx.Index(lane)
+                            lane_ok = col < c_model_dim
+                            _if_lane = scf.IfOp(lane_ok)
+                            with _if_then(_if_lane):
+                                a = arith.constant(0.0, type=compute_type())
+                                token_base = token_idx * c_topk
+                                for k in range_constexpr(topk):
+                                    k_idx = fx.Index(k)
+                                    x_idx_i32 = fx.Int32(
+                                        (token_base + k_idx) * c_model_dim + col
+                                    )
+                                    if const_expr(use_mask):
+                                        m_idx_i32 = fx.Int32(token_base + k_idx)
+                                        mv = buffer_ops.buffer_load(
+                                            mask_rsrc,
+                                            m_idx_i32,
+                                            vec_width=1,
+                                            dtype=i8_type(),
+                                        )
+                                        v = (mv != fx.Int8(0)).select(
+                                            buffer_ops.buffer_load(
+                                                x_rsrc,
+                                                x_idx_i32,
+                                                vec_width=1,
+                                                dtype=elem_type(),
+                                            ),
+                                            arith.constant(0.0, type=elem_type()),
+                                        )
+                                    else:
+                                        v = buffer_ops.buffer_load(
+                                            x_rsrc,
+                                            x_idx_i32,
+                                            vec_width=1,
+                                            dtype=elem_type(),
+                                        )
+                                    if const_expr(dtype_str in ("f16", "bf16")):
+                                        v = v.extf(compute_type())
+                                    a = a + v
+
+                                out = a
+                                if const_expr(dtype_str in ("f16", "bf16")):
+                                    out = out.truncf(elem_type())
+                                y_idx_i32 = fx.Int32(token_idx * c_model_dim + col)
+                                buffer_ops.buffer_store(out, y_rsrc, y_idx_i32)
+
+    # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
+    tile_size = BLOCK_SIZE * VEC_WIDTH
+    gy_static = (model_dim + tile_size - 1) // tile_size
+
+    @flyc.jit
+    def launch_moe_reduction(
+        X: fx.Tensor,
+        Y: fx.Tensor,
+        valid_mask: fx.Tensor,
+        i32_m_tokens: fx.Int32,
+        stream: fx.Stream,
+    ):
+        gx = fx.Index(i32_m_tokens)
+        moe_reduction_kernel(X, Y, valid_mask, i32_m_tokens).launch(
+            grid=(gx, gy_static, 1),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return launch_moe_reduction
+
+
+# MoE GEMM2 Execution Modes
+class MoeGemm2Mode:
+    """Execution mode for MoE GEMM2."""
+
+    ATOMIC = "atomic"  # Use atomic accumulation (default)
+    REDUCE = "reduce"  # Use non-atomic write + reduce kernel
+
+
+class _MoeGemm2ReduceWrapper:
+    """Wrapper combining GEMM2 (no atomics) with reduction kernel.
+
+    This wrapper handles the intermediate buffer allocation and orchestrates
+    the two-phase computation:
+    1. GEMM2 outputs to [tokens*topk, model_dim] without atomics
+    2. Reduce sums over topk to produce [tokens, model_dim]
+    """
+
+    def __init__(
+        self,
+        gemm2_exe,
+        reduce_exe,
+        topk: int,
+        model_dim: int,
+        out_dtype_str: str = "f16",
+        use_mask: bool = False,
+    ):
+        self._gemm2_exe = gemm2_exe
+        self._reduce_exe = reduce_exe
+        self._topk = topk
+        self._model_dim = model_dim
+        self._out_dtype_str = out_dtype_str
+        self._use_mask = use_mask
+
+    def _get_torch_dtype(self):
+        """Convert dtype string to torch dtype."""
+        import torch
+
+        dtype_map = {
+            "f16": torch.float16,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "f32": torch.float32,
+        }
+        return dtype_map.get(self._out_dtype_str, torch.float16)
+
+    def __call__(
+        self,
+        arg_out,
+        arg_x,
+        arg_w,
+        arg_scale_x,
+        arg_scale_w,
+        arg_sorted_token_ids,
+        arg_expert_ids,
+        arg_sorted_weights,
+        arg_num_valid_ids,
+        tokens_in,
+        n_in,
+        k_in,
+        size_expert_ids_in,
+        valid_mask=None,
+        stream=None,
+    ):
+        """Execute GEMM2 + reduce.
+
+        Args match moe_gemm2 kernel signature (see compile_moe_blockscale_gemm2).
+        """
+        import torch
+
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        intermediate = torch.empty(
+            tokens_in * self._topk,
+            self._model_dim,
+            device=arg_out.device,
+            dtype=self._get_torch_dtype(),
+        )
+        if not self._use_mask:
+            intermediate.zero_()
+        # Phase 1: GEMM2 (no atomics) -> [tokens*topk, model_dim]
+        self._gemm2_exe(
+            intermediate.view(-1),
+            arg_x,
+            arg_w,
+            arg_scale_x,
+            arg_scale_w,
+            arg_sorted_token_ids,
+            arg_expert_ids,
+            arg_sorted_weights,
+            arg_num_valid_ids,
+            tokens_in,
+            n_in,
+            k_in,
+            size_expert_ids_in,
+            stream,
+        )
+        # Phase 2: Reduce over topk -> [tokens, model_dim]
+        X = intermediate.view(tokens_in, self._topk, self._model_dim)
+        Y = arg_out.view(tokens_in, self._model_dim)
+        if not self._use_mask:
+            if valid_mask is not None:
+                logging.warning(
+                    "valid_mask provided but use_mask=False; ignoring valid_mask"
+                )
+            valid_mask = torch.empty(
+                (0, self._topk), device=arg_out.device, dtype=torch.uint8
+            )
+        self._reduce_exe(X, Y, valid_mask, tokens_in, stream)
+
+    @property
+    def mode(self) -> str:
+        """Return the execution mode."""
+        return MoeGemm2Mode.REDUCE
+
+
+def compile_moe_blockscale_gemm2_ex(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    doweight_stage2: bool,
+    in_dtype: str = "fp8",
+    out_dtype: str = "f16",
+    use_cshuffle_epilog: bool | None = None,
+    # Extended parameters for mode control
+    mode: str = MoeGemm2Mode.ATOMIC,
+    valid_mask=None,
+):
+    """Compile MoE GEMM2 kernel with optional reduction.
+
+    This is the extended interface that supports explicit mode control.
+
+    Args:
+        mode: Execution mode selection:
+            - "atomic": Use atomic accumulation (original behavior)
+            - "reduce": Use non-atomic write + reduce kernel
+
+    Returns:
+        Compiled executable (either wrapped or raw depending on mode).
+    """
+    # Compile based on mode
+    if mode == MoeGemm2Mode.REDUCE:
+        # Determine if we need masked reduction
+        use_mask = valid_mask is not None
+
+        # Compile GEMM2 with accumulate=False
+        gemm2_exe = compile_moe_blockscale_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype=in_dtype,
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=use_cshuffle_epilog,
+            accumulate=False,
+        )
+        # Compile reduction kernel with masking support
+        out_s = str(out_dtype).strip().lower()
+        if out_s in ("f16", "fp16", "half"):
+            dtype_str = "f16"
+        elif out_s in ("bf16", "bfloat16"):
+            dtype_str = "bf16"
+        else:
+            dtype_str = "f32"
+        reduce_exe = compile_moe_reduction(
+            topk=topk,
+            model_dim=model_dim,
+            dtype_str=dtype_str,
+            use_mask=use_mask,
+        )
+        return _MoeGemm2ReduceWrapper(
+            gemm2_exe=gemm2_exe,
+            reduce_exe=reduce_exe,
+            topk=topk,
+            model_dim=model_dim,
+            out_dtype_str=dtype_str,
+            use_mask=use_mask,
+        )
+    else:
+        # Compile GEMM2 with accumulate=True (atomic mode)
+        return compile_moe_blockscale_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype=in_dtype,
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=use_cshuffle_epilog,
+            accumulate=True,
+        )
+
+
+# Adapter aliases (the adapter code below references these names).
+_upstream_compile_gemm1 = compile_moe_blockscale_gemm1
+_upstream_compile_gemm2 = compile_moe_blockscale_gemm2
+
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +3885,10 @@ def _validate_scale_blocks(
 
 
 def _splitk_kslice_is_valid(
-    k_batch: int, model_dim: int, tile_k: int, scale_block_k: int = SCALE_BLOCK_K_DEFAULT
+    k_batch: int,
+    model_dim: int,
+    tile_k: int,
+    scale_block_k: int = SCALE_BLOCK_K_DEFAULT,
 ) -> bool:
     """Cheap predicate version of ``_validate_split_k`` (no exceptions).
 

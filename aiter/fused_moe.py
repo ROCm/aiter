@@ -1897,9 +1897,11 @@ def fused_moe_2stages(
         a2 = a2_v
     else:
         a2_quant_func = quant_func
-        if quant_type == QuantType.per_1x128 and getattr(
-            metadata.stage1, "func", metadata.stage1
-        ) is _flydsl_stage1_wrapper:
+        if (
+            quant_type == QuantType.per_1x128
+            and getattr(metadata.stage1, "func", metadata.stage1)
+            is _flydsl_stage1_wrapper
+        ):
             a2_quant_func = functools.partial(a2_quant_func, transpose_scale=True)
         a2, a2_scale = a2_quant_func(
             a2,
