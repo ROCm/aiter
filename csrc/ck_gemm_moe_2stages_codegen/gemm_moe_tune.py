@@ -3332,12 +3332,28 @@ class FmoeTuner(TunerCommon):
                     err_ratio = 1.0
                 else:
                     err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
-                    if err_ratio <= allowed_err_ratio:
+                    # Element-wise err_ratio (atol/rtol) is overly strict for lossy
+                    # fp4/fp8 MoE: even a correct kernel differs on most elements
+                    # vs the higher-precision reference. op_tests/test_moe_2stage.py
+                    # judges these paths by cosine similarity (logits_diff) instead,
+                    # so accept a shape if either metric passes. A genuinely wrong
+                    # (uncorrelated) kernel still has large logits_diff and fails.
+                    _x = out.to(dtypes.fp32)
+                    _y = ref.to(dtypes.fp32)
+                    _den = (_x * _x + _y * _y).sum()
+                    logits_diff = (
+                        float(1.0 - (2.0 * (_x * _y).sum() / _den).item())
+                        if _den.item() != 0
+                        else 0.0
+                    )
+                    cos_tol = float(os.environ.get("AITER_RUN_CONFIG_COS_TOL", "0.01"))
+                    if err_ratio <= allowed_err_ratio or logits_diff <= cos_tol:
                         status = "ok"
                     else:
                         status = (
                             f"mismatch:err_ratio={err_ratio:.6g}"
-                            f"(>{allowed_err_ratio_desc})"
+                            f"(>{allowed_err_ratio_desc}),"
+                            f"logits_diff={logits_diff:.6g}(>{cos_tol})"
                         )
                 results.append(
                     {
