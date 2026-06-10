@@ -15,6 +15,8 @@ from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
@@ -29,18 +31,46 @@ def _is_gluon_available():
         return False
 
 
-def gemm_a16w16(
-    x,
-    w,
+def gemm_a16w16_fake_tensor(
+    x: torch.Tensor,
+    w: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    dtype: Optional[float] = torch.bfloat16,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    config: Optional[str] = None,
     activation: Optional[str] = None,
     skip_reduce: Optional[bool] = False,
     kernel_type: str = "bandwidth_bound",
     backend: Optional[str] = None,
-):
+) -> torch.Tensor:
+    M, K = x.shape
+    N, _ = w.shape
+    # [triton only] split-K with skip_reduce returns the unreduced partials.
+    if skip_reduce:
+        cfg = deserialize_str(config) if config else _get_triton_config(M, N, K)[0]
+        num_ksplit = cfg.get("NUM_KSPLIT", 1)
+        if num_ksplit > 1:
+            return torch.empty(
+                (num_ksplit, M, N), dtype=torch.float32, device=x.device
+            )
+    if y is not None:
+        return y
+    return torch.empty((M, N), dtype=dtype, device=x.device)
+
+
+@torch_compile_guard(gen_fake=gemm_a16w16_fake_tensor)
+def gemm_a16w16_(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
+    activation: Optional[str] = None,
+    skip_reduce: Optional[bool] = False,
+    kernel_type: str = "bandwidth_bound",
+    backend: Optional[str] = None,
+) -> torch.Tensor:
     """
     Computes 16 bit matrix multiplication Y = X @ W^T
 
@@ -53,7 +83,7 @@ def gemm_a16w16(
         bias (Optional[torch.Tensor]): Bias vector with shape (N,).
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
-        config (Optional[dict]): Kernel tuning parameters.
+        config (Optional[str]): Serialized kernel tuning parameters.
         activation (Optional[str]): Activation function ("gelu", "gelu_tanh", "silu",
             "silu_exp2", "relu").
         skip_reduce (Optional[bool]): [triton only] Skip reduction of split-K partial
@@ -64,6 +94,8 @@ def gemm_a16w16(
     Returns:
         torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
     """
+    config = deserialize_str(config) if config is not None else None
+
     if backend is None:
         backend = "gluon" if _is_gluon_available() else "triton"
     backend = backend.lower()
@@ -301,3 +333,42 @@ def gemm_a16w16(
         )
 
     return y
+
+
+def gemm_a16w16(
+    x,
+    w,
+    bias: Optional[torch.Tensor] = None,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+    activation: Optional[str] = None,
+    skip_reduce: Optional[bool] = False,
+    kernel_type: str = "bandwidth_bound",
+    backend: Optional[str] = None,
+):
+    """
+    Computes 16 bit matrix multiplication Y = X @ W^T
+
+    Uses the gluon backend automatically on supported architectures (gfx1250)
+    and the triton backend everywhere else. Pass ``backend`` to force a choice.
+    See ``gemm_a16w16_`` for the full argument description; ``config`` is a dict
+    here and is serialized before dispatch so the op is torch.compile-traceable.
+    """
+    # dtype must be a torch.dtype at the custom-op boundary (callers sometimes
+    # pass a placeholder when a preallocated y already fixes the output dtype).
+    if not isinstance(dtype, torch.dtype):
+        dtype = torch.bfloat16
+    config_hashable = serialize_dict(config) if config else None
+    return gemm_a16w16_(
+        x,
+        w,
+        bias,
+        dtype,
+        y,
+        config_hashable,
+        activation,
+        skip_reduce,
+        kernel_type,
+        backend,
+    )
