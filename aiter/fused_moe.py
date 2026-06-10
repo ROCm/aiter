@@ -2471,13 +2471,22 @@ def cktile_moe_stage1(
                     ),
                 )
             elif activation == ActivationType.Silu:
-                NLane = 16
-                N0 = inter_dim // NLane
-                flat = valid_out.view(-1, N0, 2, NLane)
-                deinterleaved = (
-                    flat.permute(0, 2, 1, 3).contiguous().view(-1, inter_dim * 2)
+                from aiter.ops.flydsl.moe_kernels import (
+                    _get_compiled_silu,
+                    _run_compiled,
                 )
-                aiter.silu_and_mul(out, deinterleaved)
+
+                _silu_fn = _get_compiled_silu(inter_dim)
+                num_rows = valid_out.view(-1, inter_dim * 2).shape[0]
+                _run_compiled(
+                    _silu_fn,
+                    (
+                        valid_out.view(-1, inter_dim * 2),
+                        out.view(-1, inter_dim),
+                        num_rows,
+                        torch.cuda.current_stream(),
+                    ),
+                )
             else:
                 NLane = 16
                 N0 = inter_dim // NLane
