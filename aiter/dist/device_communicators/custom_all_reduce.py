@@ -976,12 +976,14 @@ class CustomAllreduce:
         out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
         if transpose_scale:
             # Column-major scale: the kernel writes scale[group_id * M + tidx],
-            # i.e. it treats the buffer as (num_groups, M) row-major. Expose it
-            # to the consumer as a logical (M, num_groups) tensor via transpose
-            # (NOT view -- view would keep row-major stride and scatter the
-            # values). transpose(0, 1) yields the column-major stride (1, M)
-            # the preshuffle GEMM expects. Requires a 2D (M, K) input; the
-            # per-group fused path is always 2D in practice.
+            # i.e. it fills a (num_groups, M) row-major buffer. Expose it to the
+            # consumer as a logical (M, num_groups) tensor via transpose -> stride
+            # (1, M), the layout gemm_a8w8_blockscale_preshuffle consumes. This
+            # also matches the layout inductor re-strides the op output to (the
+            # op has no needs_fixed_stride_order tag on torch>=2.8), so the
+            # torch.compile fake (which declares the same (1, M) stride) agrees
+            # with the runtime tensor. Requires a 2D (M, K) input; the per-group
+            # fused path is always 2D in practice.
             assert inp.dim() == 2, (
                 "transpose_scale per-group quant requires a 2D (M, K) input, "
                 f"got shape {tuple(inp.shape)}"

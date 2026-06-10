@@ -125,14 +125,22 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     emit_bf16: bool = False,
     transpose_scale: bool = False,
 ):
-    return tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+    # Route through GroupCoordinator.fused_allreduce_rmsnorm_quant_per_group,
+    # which (for the non-emit_bf16 case) dispatches the torch.library-registered
+    # op ``fused_allreduce_rmsnorm_quant_per_group_``. Going through the generic
+    # ``fused_allreduce_rmsnorm_quant`` instead would reach the raw pybind chain
+    # directly, which Dynamo cannot trace -> graph break / compile failure under
+    # torch.compile, silently disabling the fusion.
+    _assert_no_custom_group(
+        "tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group"
+    )
+    return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
         input_,
         residual_inp_,
         weight_,
         eps,
-        prefill_support,
-        quant_type="per_group",
         group_size=group_size,
+        prefill_support=prefill_support,
         emit_bf16=emit_bf16,
         transpose_scale=transpose_scale,
     )

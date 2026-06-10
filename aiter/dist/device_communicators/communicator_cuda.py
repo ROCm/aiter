@@ -461,32 +461,46 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 if self._ar_1stage_override is not None
                 else (total_bytes <= 128 * 1024)
             )
-            try:
-                result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
-                    input_,
-                    res_inp_,
-                    weight_,
-                    eps,
-                    group_size,
-                    use_1stage,
-                    emit_bf16=emit_bf16,
-                    transpose_scale=transpose_scale,
-                )
+            result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                group_size,
+                use_1stage,
+                emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale,
+            )
+            if result is not None:
                 if emit_bf16:
                     out, res_out, scale_out, bf16_out = result
                 else:
                     out, res_out, scale_out = result
                 fused_ok = True
-            except Exception:
-                pass
         if not fused_ok:
             out_, res_out = self.fused_allreduce_rmsnorm(
                 input_, res_inp_, weight_, eps, prefill_support
             )
             hip_quant = get_hip_quant(QuantType.per_1x128)
-            out, scale_out = hip_quant(
-                out_, quant_dtype=fp8, transpose_scale=transpose_scale
-            )
+            # The fused path and the registered op's fake return the per-group
+            # scale in column-major (1, M) layout (stride (1, M)) when
+            # transpose_scale=True. per_group_quant_hip cannot produce that
+            # stride directly (with transpose_scale=True it returns a contiguous
+            # (M, num_groups) buffer with SHUFFLED bytes -- a different physical
+            # arrangement). So compute the plain row-major scale and, when
+            # transpose_scale is requested, copy its values into a genuinely
+            # column-major (1, M)-strided tensor so the runtime stride/values
+            # match the fake (otherwise torch.compile's assert_size_stride fails
+            # or the GEMM reads the wrong layout).
+            out, scale_row = hip_quant(out_, quant_dtype=fp8, transpose_scale=False)
+            if transpose_scale:
+                M, num_groups = scale_row.shape
+                scale_out = torch.empty(
+                    (num_groups, M), dtype=scale_row.dtype, device=scale_row.device
+                ).transpose(0, 1)
+                scale_out.copy_(scale_row)
+            else:
+                scale_out = scale_row
             if emit_bf16:
                 bf16_out = out_
         assert out is not None

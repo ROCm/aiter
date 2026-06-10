@@ -263,22 +263,24 @@ def fused_ar_rmsnorm_per_group_quant(
         out_fp8, scale_out, res_out = result
         bf16_out = None
 
-    # The returned scale always carries the logical (M, num_groups) shape.
-    # With transpose_scale=True it must be backed by column-major storage,
-    # i.e. (num_groups, M) row-major viewed as (M, num_groups): stride (1, M).
-    # Verifying both the layout AND that the dequant below still matches the
-    # reference proves the kernel wrote each group's scale to the correct
-    # transposed slot (not just that the buffer happens to be transposed).
+    # The returned scale carries the logical (M, num_groups) shape for both
+    # layouts; only the storage stride differs:
+    #   transpose_scale=False -> row-major,    stride (num_groups, 1)
+    #   transpose_scale=True  -> column-major, stride (1, M) -- storage
+    #       (num_groups, M) viewed transposed; this is what
+    #       gemm_a8w8_blockscale_preshuffle consumes (and what inductor
+    #       re-strides the fused op output to). In both cases reading
+    #       scale[t, g] yields the correct per-(token, group) scale, so the
+    #       dequant below is layout-agnostic.
     M_local, num_groups_local = scale_out.shape
     if transpose_scale:
         assert scale_out.stride() == (1, M_local), (
-            f"transpose_scale: expected column-major scale stride "
-            f"(1, {M_local}), got {scale_out.stride()} for shape "
-            f"{tuple(scale_out.shape)}"
+            f"transpose_scale: expected column-major stride (1, {M_local}), "
+            f"got {scale_out.stride()} for shape {tuple(scale_out.shape)}"
         )
     else:
         assert scale_out.stride() == (num_groups_local, 1), (
-            f"row-major scale expected stride ({num_groups_local}, 1), "
+            f"row-major: expected stride ({num_groups_local}, 1), "
             f"got {scale_out.stride()} for shape {tuple(scale_out.shape)}"
         )
 
@@ -372,11 +374,11 @@ def test_fused_ar_rmsnorm_per_group_quant(
             ss == expected_scale_shape
         ), f"Scale shape mismatch: got {ss}, expected {expected_scale_shape}"
 
-    # The fused kernel's scale layout must match what the downstream GEMM
-    # expects: column-major (stride (1, M)) when transpose_scale=True, else
-    # row-major (stride (num_groups, 1)). Combined with the value-level
-    # checkAllclose below, this guarantees each group's scale landed in the
-    # correct transposed slot.
+    # The fused kernel's scale layout must match what the downstream GEMM (and
+    # inductor's re-layout of the op output) expects: column-major stride (1, M)
+    # when transpose_scale=True, else row-major stride (num_groups, 1). Combined
+    # with the value-level checkAllclose below, this guarantees each group's
+    # scale landed in the correct slot.
     num_groups = K // group_size
     expected_stride = (1, M) if transpose_scale else (num_groups, 1)
     for st in scale_strides:
