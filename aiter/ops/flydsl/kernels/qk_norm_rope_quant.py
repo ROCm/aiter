@@ -70,7 +70,7 @@ from flydsl.expr.vector import ReductionOp
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl._mlir.dialects import llvm, rocdl
 
-from .tensor_shim import GTensor, _to_raw
+from .tensor_shim import GTensor, _to_raw, _run_compiled
 
 # JIT-free MX-format mode/dtype int mirrors. ``aiter.utility.mx_types``'s
 # pybind11 ``MxScaleRoundMode`` / ``MxDtype`` lazy-load on first attribute
@@ -164,9 +164,7 @@ def _store_bf16_vec_g(vals_list, g_out, row_off_elems, idx, vec):
     raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
     f32v = vector.from_elements(vec_t, raw)
     bf16v = f32v.truncf(T.vec(vec, T.bf16))
-    my_off = ArithValue(row_off_elems) + ArithValue(idx) * arith.constant(
-        vec, type=T.i32
-    )
+    my_off = ArithValue(row_off_elems) + ArithValue(idx) * arith.constant(vec, type=T.i32)
     g_out.store(my_off, bf16v, vec_size=vec)
 
 
@@ -247,9 +245,7 @@ def _build_kernel(
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
 
-    assert (
-        D % BLOCK_THREADS == 0
-    ), f"D={D} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
+    assert D % BLOCK_THREADS == 0, f"D={D} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
     assert NOPE % VEC == 0, f"NOPE={NOPE} must be divisible by VEC={VEC}"
     assert RD % 2 == 0, "rope_head_dim must be even (GPT-J pair layout)"
     assert RD % VEC == 0, f"RD={RD} must be divisible by VEC={VEC}"
@@ -269,20 +265,12 @@ def _build_kernel(
     # --- quant-group layout ------------------------------------------------
     # group_size must divide D evenly AND be a multiple of VEC (so a single
     # thread's VEC-wide slice never crosses a group boundary).
-    assert (
-        group_size > 0 and D % group_size == 0
-    ), f"group_size {group_size} must divide head_dim {D}"
-    assert (
-        group_size % VEC == 0
-    ), f"group_size {group_size} must be a multiple of VEC {VEC}"
+    assert group_size > 0 and D % group_size == 0, f"group_size {group_size} must divide head_dim {D}"
+    assert group_size % VEC == 0, f"group_size {group_size} must be a multiple of VEC {VEC}"
     TPG = group_size // VEC  # threads per group
     NG = D // group_size  # number of groups per row
-    assert (
-        TPG > 0 and (TPG & (TPG - 1)) == 0
-    ), f"TPG {TPG} must be a power of 2 (for butterfly reduce)"
-    assert (
-        scale_dtype in SCALE_DTYPE_OPTIONS
-    ), f"scale_dtype {scale_dtype!r} must be one of {SCALE_DTYPE_OPTIONS}"
+    assert TPG > 0 and (TPG & (TPG - 1)) == 0, f"TPG {TPG} must be a power of 2 (for butterfly reduce)"
+    assert scale_dtype in SCALE_DTYPE_OPTIONS, f"scale_dtype {scale_dtype!r} must be one of {SCALE_DTYPE_OPTIONS}"
 
     log2_block = int(math.log2(BLOCK_THREADS))
     log2_tpg = int(math.log2(TPG))
@@ -334,9 +322,7 @@ def _build_kernel(
         full_lay = fx.make_layout(VEC, 1)
         rope_lay = fx.make_layout(PAIRS_PER_THREAD, 1)
 
-        def load_vec(
-            div_tensor, idx, *, layout=full_lay, atom=full_atom, dt=elem_dtype
-        ):
+        def load_vec(div_tensor, idx, *, layout=full_lay, atom=full_atom, dt=elem_dtype):
             r = fx.make_rmem_tensor(layout, dt)
             fx.copy_atom_call(atom, fx.slice(div_tensor, (None, idx)), r)
             return fx.memref_load_vec(r)
@@ -351,9 +337,7 @@ def _build_kernel(
             addr_i64 = arith.index_cast(T.i64, addr)
             if num_records_bytes is None:
                 return buffer_ops.create_buffer_resource_from_addr(addr_i64)
-            return buffer_ops.create_buffer_resource_from_addr(
-                addr_i64, num_records_bytes=num_records_bytes
-            )
+            return buffer_ops.create_buffer_resource_from_addr(addr_i64, num_records_bytes=num_records_bytes)
 
         # --- shared: load position (i64 -> i32) ---
         pos_rsrc = _ptr_buffer_resource(positions)
@@ -417,9 +401,7 @@ def _build_kernel(
                     peer_sq = _to_raw(ArithValue(w_sq).shuffle_xor(off, BLOCK_THREADS))
                     w_sq = arith.AddFOp(w_sq, peer_sq, fastmath=fm_fast).result
                     if const_expr(sh_exp >= amax_start_step):
-                        peer_am = _to_raw(
-                            ArithValue(w_am).shuffle_xor(off, BLOCK_THREADS)
-                        )
+                        peer_am = _to_raw(ArithValue(w_am).shuffle_xor(off, BLOCK_THREADS))
                         w_am = arith.maximumf(w_am, peer_am)
                 sq_block = w_sq
                 am_group = w_am  # per-group after partial butterfly
@@ -441,16 +423,12 @@ def _build_kernel(
                     c_sqrt2 = arith.constant(_SQRT2, type=f32)
                     amax_post = am_safe * rstd * c_sqrt2
 
-                    e8m0_biased = emit_mx_e8m0_scale(
-                        amax_post, mode=_DEFAULT_MODE, dtype=_fp8_mx_dtype
-                    )
+                    e8m0_biased = emit_mx_e8m0_scale(amax_post, mode=_DEFAULT_MODE, dtype=_fp8_mx_dtype)
                     # quant_scale = 2^(127 - e8m0_biased) for x_norm. We apply
                     # to x_in directly, so absorb the per-row rstd: factor =
                     # rstd * quant_scale.
                     quant_exp = arith.constant(254, type=T.i32) - e8m0_biased
-                    quant_scale = (quant_exp << arith.constant(23, type=T.i32)).bitcast(
-                        T.f32
-                    )
+                    quant_scale = (quant_exp << arith.constant(23, type=T.i32)).bitcast(T.f32)
                     factor = rstd * quant_scale
                 else:
                     # FP32 scale with the rstd-cancellation trick.
@@ -458,14 +436,10 @@ def _build_kernel(
                     # factor   = FP8_MAX / (amax * SQRT2)        (applied to x_in)
                     # The rstd factor cancels algebraically: store(out) =
                     # x_in * factor -> dequant: x_norm = scale * out = x_in * rstd.
-                    rcp_am = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [am_safe], [], []
-                    )
+                    rcp_am = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [am_safe], [], [])
                     _fc = _fp8_const()
                     factor = arith.constant(_fc["max_over_sqrt2"], type=f32) * rcp_am
-                    scale_val = (
-                        am_safe * rstd * arith.constant(_fc["inv_max_sqrt2"], type=f32)
-                    )
+                    scale_val = am_safe * rstd * arith.constant(_fc["inv_max_sqrt2"], type=f32)
 
                 # Group-leader lanes (one per quant group) write the scale.
                 # Predicate: tid & (TPG-1) == 0. For TPG=64 (per-row) this is
@@ -549,9 +523,7 @@ def _build_kernel(
         # the input is index-typed. Doing the math in index avoids large
         # H*D configs (e.g. H=128 D=512 -> 128 KB/token, max offset 8.6 GiB
         # at bid_t=65534) silently producing garbage if we feed i64.
-        q_tok_off_bytes = arith.MulIOp(
-            bid_t_idx, arith.constant(H * D * 2, type=T.index)
-        ).result
+        q_tok_off_bytes = arith.MulIOp(bid_t_idx, arith.constant(H * D * 2, type=T.index)).result
 
         if bid_x < fx.Int32(H):
             # ---------- Q path ----------
@@ -565,9 +537,9 @@ def _build_kernel(
                 shape=(H, D),
                 static_bytes_offset_i64=q_tok_off_bytes,
             )
-            q_my_off = ArithValue(head_idx) * arith.constant(D, type=i32) + ArithValue(
-                tid
-            ) * arith.constant(VEC, type=i32)
+            q_my_off = ArithValue(head_idx) * arith.constant(D, type=i32) + ArithValue(tid) * arith.constant(
+                VEC, type=i32
+            )
             raw_x_vec = q_in_tok.load(q_my_off, vec_size=VEC)
             # Round-trip through rmem so the rest of emit_body (.to/.reduce)
             # sees a Fly-wrapped vec instead of a raw MLIR vec.
@@ -590,9 +562,7 @@ def _build_kernel(
             row_off_q_elems = ArithValue(head_idx) * arith.constant(D, type=i32)
             if const_expr(quant):
                 # Per-token shifted base for q_out (fp8 = 1 byte/elem).
-                q_tok_off_fp8 = arith.MulIOp(
-                    bid_t_idx, arith.constant(H * D, type=T.index)
-                ).result
+                q_tok_off_fp8 = arith.MulIOp(bid_t_idx, arith.constant(H * D, type=T.index)).result
                 qo_g_tmp = GTensor(
                     q_out,
                     dtype=T.i8,
@@ -605,9 +575,9 @@ def _build_kernel(
                 qs_rsrc = _ptr_buffer_resource(q_scale)
                 # q_scale layout (T, H, NG) flat: bid_t * H*NG + head_idx * NG.
                 # Per-lane adds group_idx inside emit_body.
-                scale_base_off_q = ArithValue(bid_t) * arith.constant(
-                    H * NG, type=i32
-                ) + ArithValue(head_idx) * arith.constant(NG, type=i32)
+                scale_base_off_q = ArithValue(bid_t) * arith.constant(H * NG, type=i32) + ArithValue(
+                    head_idx
+                ) * arith.constant(NG, type=i32)
                 emit_body(
                     weighted=q_weighted,
                     x_f32_vec=x_f32,
@@ -646,14 +616,12 @@ def _build_kernel(
             # round-trip through an rmem tensor to get a Fly-wrapped vec that
             # the rest of emit_body (.to/.reduce/[i]) expects.
             kv_rsrc = _ptr_buffer_resource(kv_in)
-            kv_off_elems = ArithValue(bid_t) * ArithValue(
-                kv_in_row_stride
-            ) + ArithValue(tid) * arith.constant(VEC, type=i32)
+            kv_off_elems = ArithValue(bid_t) * ArithValue(kv_in_row_stride) + ArithValue(tid) * arith.constant(
+                VEC, type=i32
+            )
             kv_off_dw = kv_off_elems >> arith.constant(1, type=i32)
             vec_bf16xV = T.vec(VEC, T.bf16)
-            x_raw = buffer_ops.buffer_load(
-                kv_rsrc, kv_off_dw, vec_width=VEC // 2, dtype=i32
-            )
+            x_raw = buffer_ops.buffer_load(kv_rsrc, kv_off_dw, vec_width=VEC // 2, dtype=i32)
             x_vec_bf16_raw = vector.bitcast(vec_bf16xV, x_raw)
             kv_rmem = fx.make_rmem_tensor(full_lay, elem_dtype)
             fx.memref_store_vec(x_vec_bf16_raw, kv_rmem)
@@ -667,9 +635,7 @@ def _build_kernel(
 
             if const_expr(quant):
                 # Per-token shifted base for kv_out (fp8 = 1 byte/elem).
-                kv_tok_off_fp8 = arith.MulIOp(
-                    bid_t_idx, arith.constant(D, type=T.index)
-                ).result
+                kv_tok_off_fp8 = arith.MulIOp(bid_t_idx, arith.constant(D, type=T.index)).result
                 kvo_g_tmp = GTensor(
                     kv_out,
                     dtype=T.i8,
@@ -694,9 +660,7 @@ def _build_kernel(
                 )
             else:
                 # Per-token shifted base for kv_out (bf16 = 2 bytes/elem).
-                kv_tok_off_bf16 = arith.MulIOp(
-                    bid_t_idx, arith.constant(D * 2, type=T.index)
-                ).result
+                kv_tok_off_bf16 = arith.MulIOp(bid_t_idx, arith.constant(D * 2, type=T.index)).result
                 kvo_g = GTensor(
                     kv_out,
                     dtype=T.bf16,
@@ -929,9 +893,7 @@ def flydsl_qk_norm_rope_quant(
         q_view = q.view(T_tok, H, D)
     else:
         if q.dim() != 3 or q.shape != (T_tok, H, D):
-            raise ValueError(
-                f"q shape {tuple(q.shape)} != (T, H, D)=({T_tok}, {H}, {D})"
-            )
+            raise ValueError(f"q shape {tuple(q.shape)} != (T, H, D)=({T_tok}, {H}, {D})")
         q_view = q
         # The kernel linearly indexes q_in as if it were dense [T,H,D] with
         # the (H,D) inner block contiguous. Strided views (e.g. a slice of a
@@ -946,9 +908,7 @@ def flydsl_qk_norm_rope_quant(
     # Normalize cos/sin to 2D [max_pos, RD/2]. Accept any shape whose last
     # dim is RD/2 (DeepSeek-V4 stores [max_pos, 1, 1, RD/2]).
     if cos_cache.shape[-1] != RD // 2:
-        raise ValueError(
-            f"cos_cache last dim {cos_cache.shape[-1]} != RD/2 ({RD // 2})"
-        )
+        raise ValueError(f"cos_cache last dim {cos_cache.shape[-1]} != RD/2 ({RD // 2})")
     if sin_cache.shape != cos_cache.shape:
         raise ValueError("cos/sin shape mismatch")
     if not (cos_cache.is_contiguous() and sin_cache.is_contiguous()):
@@ -967,13 +927,9 @@ def flydsl_qk_norm_rope_quant(
     scale_torch_dtype = _TORCH_DTYPE_FOR_SCALE[scale_dtype]
     if quant:
         if q_scale is None:
-            q_scale = torch.empty(
-                (T_tok, H, NG), dtype=scale_torch_dtype, device=q.device
-            )
+            q_scale = torch.empty((T_tok, H, NG), dtype=scale_torch_dtype, device=q.device)
         if kv_scale is None:
-            kv_scale = torch.empty(
-                (T_tok, NG), dtype=scale_torch_dtype, device=kv.device
-            )
+            kv_scale = torch.empty((T_tok, NG), dtype=scale_torch_dtype, device=kv.device)
         q_scale_arg, kv_scale_arg = q_scale, kv_scale
     else:
         q_scale_arg = q.new_empty(1, dtype=scale_torch_dtype)
@@ -1040,11 +996,6 @@ def flydsl_qk_norm_rope_quant(
             n,
             _stream_arg(),
         )
-        cf = getattr(launcher, "_cf", None)
-        if cf is not None:
-            cf(*args)
-        else:
-            cf = flyc.compile(launcher, *args)
-            launcher._cf = cf
+        _run_compiled(launcher, *args)
 
     return q_out, kv_out, (q_scale if quant else None), (kv_scale if quant else None)

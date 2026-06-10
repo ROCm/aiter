@@ -59,7 +59,7 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from .tensor_shim import STensor, _to_raw
+from .tensor_shim import STensor, _to_raw, _run_compiled
 
 # Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
 # (the multi-wave LDS kernel references CompilationContext, STensor,
@@ -127,21 +127,15 @@ def _build_compress_forward_kernel(
     sub-loop reading kv_in + score_in. Phase 2 in_row is clamped to ≥ 0
     so wasted reads in pure-Phase-1 iters stay in-bounds.
     """
-    assert (
-        head_dim % slice_size == 0
-    ), f"head_dim={head_dim} must be divisible by slice_size={slice_size}"
-    assert (
-        slice_size % 64 == 0
-    ), f"slice_size={slice_size} must be a multiple of 64 (wave width)"
+    assert head_dim % slice_size == 0, f"head_dim={head_dim} must be divisible by slice_size={slice_size}"
+    assert slice_size % 64 == 0, f"slice_size={slice_size} must be a multiple of 64 (wave width)"
     assert slice_size // 64 in (
         1,
         2,
         4,
         8,
     ), f"VEC={slice_size // 64} must be 1, 2, 4, or 8"
-    assert (
-        ratio % k_split_num_waves == 0
-    ), f"K={ratio} must divide evenly across {k_split_num_waves} waves"
+    assert ratio % k_split_num_waves == 0, f"K={ratio} must divide evenly across {k_split_num_waves} waves"
     assert state_size >= ratio, f"state_size={state_size} must be >= K={ratio}"
     D = head_dim
     K = ratio
@@ -174,9 +168,7 @@ def _build_compress_forward_kernel(
     lds_w_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_off + LDS_W_BYTES
 
-    _kname = (
-        f"hca_compress_forward_D{D}_R{ratio}_NW{NW}_SL{SLICE_SZ}_S{state_size}_flydsl"
-    )
+    _kname = f"hca_compress_forward_D{D}_R{ratio}_NW{NW}_SL{SLICE_SZ}_S{state_size}_flydsl"
     fm_fast = arith.FastMathFlags.fast
 
     @flyc.kernel(name=_kname, known_block_size=[BLOCK_TH, 1, 1])
@@ -219,9 +211,7 @@ def _build_compress_forward_kernel(
         c_state_size = arith.constant(state_size, type=i32)
 
         def fexp_f32(x):
-            return llvm.call_intrinsic(
-                f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
-            )
+            return llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], [])
 
         # Per-thread wave / lane (block-local).
         wid = arith.divsi(_to_raw(tid), c_64)  # ∈ [0, NW)
@@ -244,19 +234,13 @@ def _build_compress_forward_kernel(
             slice_base_i32 = ArithValue(sid) * c_SLICE
             col_off_base = slice_base_i32 + ArithValue(lid) * c_VEC
 
-            slot_map_rsrc = buffer_ops.create_buffer_resource(
-                state_slot_mapping, max_size=True
-            )
-            slot = buffer_ops.buffer_load(
-                slot_map_rsrc, batch_id, vec_width=1, dtype=i32
-            )
+            slot_map_rsrc = buffer_ops.create_buffer_resource(state_slot_mapping, max_size=True)
+            slot = buffer_ops.buffer_load(slot_map_rsrc, batch_id, vec_width=1, dtype=i32)
 
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
             score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
             kv_state_rsrc = buffer_ops.create_buffer_resource(kv_state, max_size=True)
-            score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state, max_size=True
-            )
+            score_state_rsrc = buffer_ops.create_buffer_resource(score_state, max_size=True)
             ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
 
             def _load_bf16_vec_to_f32(rsrc, base_off_elems_i32):
@@ -279,9 +263,7 @@ def _build_compress_forward_kernel(
                     lo16 = arith.andi(lo_or_hi, arith.constant(0xFFFF, type=i32))
                     lo16_v = vector.from_elements(T.vec(1, T.i32), [lo16])
                     bf16_pair = vector.bitcast(T.vec(2, T.bf16), lo16_v)
-                    bf16_v = vector.extract(
-                        bf16_pair, static_position=[0], dynamic_position=[]
-                    )
+                    bf16_v = vector.extract(bf16_pair, static_position=[0], dynamic_position=[])
                     return [arith.extf(f32, bf16_v)]
                 else:
                     # base must be VEC-aligned (caller guarantees by
@@ -291,43 +273,30 @@ def _build_compress_forward_kernel(
                     if const_expr(dwords == 1):
                         # buffer_load(vec_width=1) returns scalar i32; wrap
                         # into vec<1xi32> before bitcast to vec<2xbf16>.
-                        raw_s = buffer_ops.buffer_load(
-                            rsrc, off_dw, vec_width=1, dtype=i32
-                        )
+                        raw_s = buffer_ops.buffer_load(rsrc, off_dw, vec_width=1, dtype=i32)
                         raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
                     else:
-                        raw = buffer_ops.buffer_load(
-                            rsrc, off_dw, vec_width=dwords, dtype=i32
-                        )
+                        raw = buffer_ops.buffer_load(rsrc, off_dw, vec_width=dwords, dtype=i32)
                     vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
                     out = []
                     for i in range_constexpr(VEC):
-                        bf16_v = vector.extract(
-                            vec_bf16, static_position=[i], dynamic_position=[]
-                        )
+                        bf16_v = vector.extract(vec_bf16, static_position=[i], dynamic_position=[])
                         out.append(arith.extf(f32, bf16_v))
                     return out
 
             def _load_f32_vec(rsrc, base_off_elems_i32):
                 """Load VEC f32 starting at base → list of VEC f32 values."""
                 if const_expr(VEC <= 4):
-                    raw = buffer_ops.buffer_load(
-                        rsrc, base_off_elems_i32, vec_width=VEC, dtype=f32
-                    )
+                    raw = buffer_ops.buffer_load(rsrc, base_off_elems_i32, vec_width=VEC, dtype=f32)
                     if const_expr(VEC == 1):
                         # vec_width=1 returns scalar, not 1-vec.
                         return [raw]
-                    return [
-                        vector.extract(raw, static_position=[i], dynamic_position=[])
-                        for i in range(VEC)
-                    ]
+                    return [vector.extract(raw, static_position=[i], dynamic_position=[]) for i in range(VEC)]
                 else:
                     # VEC == 8: AMD HW max is dwordx4 → 2 loads.
                     assert VEC == 8
                     half = VEC // 2
-                    r0 = buffer_ops.buffer_load(
-                        rsrc, base_off_elems_i32, vec_width=half, dtype=f32
-                    )
+                    r0 = buffer_ops.buffer_load(rsrc, base_off_elems_i32, vec_width=half, dtype=f32)
                     r1 = buffer_ops.buffer_load(
                         rsrc,
                         ArithValue(base_off_elems_i32) + arith.constant(half, type=i32),
@@ -336,13 +305,9 @@ def _build_compress_forward_kernel(
                     )
                     out = []
                     for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r0, static_position=[i], dynamic_position=[])
-                        )
+                        out.append(vector.extract(r0, static_position=[i], dynamic_position=[]))
                     for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r1, static_position=[i], dynamic_position=[])
-                        )
+                        out.append(vector.extract(r1, static_position=[i], dynamic_position=[]))
                     return out
 
             def _issue_phase2_loads(k_i32):
@@ -352,12 +317,8 @@ def _build_compress_forward_kernel(
                 tmp = arith.subi(c_K_m1, k_i32)
                 in_row_raw = arith.subi(_to_raw(ragged_id), tmp)
                 in_row = arith.maxsi(in_row_raw, c_zero_i32)
-                base_in_off = (
-                    ArithValue(in_row) * ArithValue(kv_in_row_stride) + col_off_base
-                )
-                base_sc_off = (
-                    ArithValue(in_row) * ArithValue(score_in_row_stride) + col_off_base
-                )
+                base_in_off = ArithValue(in_row) * ArithValue(kv_in_row_stride) + col_off_base
+                base_sc_off = ArithValue(in_row) * ArithValue(score_in_row_stride) + col_off_base
                 base_ape_off = ArithValue(ape_row) * c_DIM_FULL + col_off_base
                 kv = _load_bf16_vec_to_f32(kv_in_rsrc, base_in_off)
                 sc = _load_bf16_vec_to_f32(score_in_rsrc, base_sc_off)
@@ -386,14 +347,10 @@ def _build_compress_forward_kernel(
                 )
                 kv_list = _load_f32_vec(kv_state_rsrc, base_kv_off)
                 sc_list = _load_f32_vec(score_state_rsrc, base_sc_off)
-                sc_padded = [
-                    arith.select(is_pad, c_neg_inf, sc_list[i]) for i in range(VEC)
-                ]
+                sc_padded = [arith.select(is_pad, c_neg_inf, sc_list[i]) for i in range(VEC)]
                 return kv_list, sc_padded
 
-            def _softmax_step_padded(
-                m_old_list, kv_old_list, w_old_list, score_k_list, kv_k_list
-            ):
+            def _softmax_step_padded(m_old_list, kv_old_list, w_old_list, score_k_list, kv_k_list):
                 """Padding-aware vector softmax step over VEC lanes. When
                 score_k == -inf, w_k is forced to 0 (avoids NaN when m_old
                 is also -inf). Safe in both Phase 1 (padding can occur) and
@@ -456,17 +413,13 @@ def _build_compress_forward_kernel(
             # Sub-loop 1: Phase 1 sub-range [k_start, split). Reads state
             # cache; padded softmax (score can be -inf).
             phase1_local = init_state
-            for k_static, state in range(
-                _to_raw(k_start_i32), _to_raw(split_i32), 1, init=init_state
-            ):
+            for k_static, state in range(_to_raw(k_start_i32), _to_raw(split_i32), 1, init=init_state):
                 m_lane = list(state[0:VEC])
                 kv_lane = list(state[VEC : 2 * VEC])
                 w_lane = list(state[2 * VEC : 3 * VEC])
                 k_i32 = arith.index_cast(i32, _to_raw(k_static))
                 kv_v, sc_v = _issue_phase1_loads(k_i32)
-                new_m, new_kv, new_w = _softmax_step_padded(
-                    m_lane, kv_lane, w_lane, sc_v, kv_v
-                )
+                new_m, new_kv, new_w = _softmax_step_padded(m_lane, kv_lane, w_lane, sc_v, kv_v)
                 phase1_local = yield list(new_m) + list(new_kv) + list(new_w)
 
             # Sub-loop 2: Phase 2 sub-range [split, k_end). Reads input;
@@ -474,21 +427,14 @@ def _build_compress_forward_kernel(
             # since Phase 2 scores are always finite — compiler elides).
             # Carry Phase 1's accumulator through as init.
             final = phase1_local
-            for k_static, state in range(
-                _to_raw(split_i32), _to_raw(k_end_i32), 1, init=phase1_local
-            ):
+            for k_static, state in range(_to_raw(split_i32), _to_raw(k_end_i32), 1, init=phase1_local):
                 m_lane = list(state[0:VEC])
                 kv_lane = list(state[VEC : 2 * VEC])
                 w_lane = list(state[2 * VEC : 3 * VEC])
                 k_i32 = arith.index_cast(i32, _to_raw(k_static))
                 p2_kv, p2_sc, p2_ape = _issue_phase2_loads(k_i32)
-                p2_score = [
-                    arith.AddFOp(p2_sc[i], p2_ape[i], fastmath=fm_fast).result
-                    for i in range(VEC)
-                ]
-                new_m, new_kv, new_w = _softmax_step_padded(
-                    m_lane, kv_lane, w_lane, p2_score, p2_kv
-                )
+                p2_score = [arith.AddFOp(p2_sc[i], p2_ape[i], fastmath=fm_fast).result for i in range(VEC)]
+                new_m, new_kv, new_w = _softmax_step_padded(m_lane, kv_lane, w_lane, p2_score, p2_kv)
                 final = yield list(new_m) + list(new_kv) + list(new_w)
 
             m_local = list(final[0:VEC])
@@ -563,21 +509,12 @@ def _build_compress_forward_kernel(
                             arith.MulFOp(w_w, scale_w, fastmath=fm_fast).result,
                             fastmath=fm_fast,
                         ).result
-                    rcp_w = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [w_sum], [], []
-                    )
-                    comp_list.append(
-                        arith.MulFOp(kv_sum, rcp_w, fastmath=fm_fast).result
-                    )
+                    rcp_w = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [w_sum], [], [])
+                    comp_list.append(arith.MulFOp(kv_sum, rcp_w, fastmath=fm_fast).result)
 
                 # ── Vectorized write of VEC f32 comp values ──
-                out_rsrc = buffer_ops.create_buffer_resource(
-                    kv_compressed, max_size=True
-                )
-                out_off = (
-                    ArithValue(pid) * ArithValue(kv_compressed_row_stride)
-                    + col_off_base
-                )
+                out_rsrc = buffer_ops.create_buffer_resource(kv_compressed, max_size=True)
+                out_off = ArithValue(pid) * ArithValue(kv_compressed_row_stride) + col_off_base
                 if const_expr(VEC == 1):
                     buffer_ops.buffer_store(comp_list[0], out_rsrc, out_off)
                 elif const_expr(VEC <= 4):
@@ -737,36 +674,23 @@ def _build_norm_rope_scatter_kernel(
 
             # ── Load kv_compressed[pid, tid*VEC : tid*VEC + VEC] ──
             kvc_rsrc = buffer_ops.create_buffer_resource(kv_compressed, max_size=True)
-            base_off = (
-                ArithValue(pid) * ArithValue(kv_compressed_row_stride) + tid_x_vec
-            )
+            base_off = ArithValue(pid) * ArithValue(kv_compressed_row_stride) + tid_x_vec
             # VEC ∈ {2, 4, 8}: VEC <= 4 → single dwordx{VEC}; VEC=8 → 2× dwordx4.
             if const_expr(VEC <= 4):
-                raw = buffer_ops.buffer_load(
-                    kvc_rsrc, base_off, vec_width=VEC, dtype=f32
-                )
-                comp_lane = [
-                    vector.extract(raw, static_position=[i], dynamic_position=[])
-                    for i in range(VEC)
-                ]
+                raw = buffer_ops.buffer_load(kvc_rsrc, base_off, vec_width=VEC, dtype=f32)
+                comp_lane = [vector.extract(raw, static_position=[i], dynamic_position=[]) for i in range(VEC)]
             else:
                 assert VEC == 8
                 half = 4
-                r0 = buffer_ops.buffer_load(
-                    kvc_rsrc, base_off, vec_width=half, dtype=f32
-                )
+                r0 = buffer_ops.buffer_load(kvc_rsrc, base_off, vec_width=half, dtype=f32)
                 r1 = buffer_ops.buffer_load(
                     kvc_rsrc,
                     ArithValue(base_off) + arith.constant(half, type=i32),
                     vec_width=half,
                     dtype=f32,
                 )
-                comp_lane = [
-                    vector.extract(r0, static_position=[i], dynamic_position=[])
-                    for i in range(half)
-                ] + [
-                    vector.extract(r1, static_position=[i], dynamic_position=[])
-                    for i in range(half)
+                comp_lane = [vector.extract(r0, static_position=[i], dynamic_position=[]) for i in range(half)] + [
+                    vector.extract(r1, static_position=[i], dynamic_position=[]) for i in range(half)
                 ]
 
             # ── RMSNorm (wave reduce-add of squares / D + eps; rsqrt) ──
@@ -779,9 +703,7 @@ def _build_norm_rope_scatter_kernel(
                 ).result
             sq_full = wave_reduce_add(sq_local)
             var = arith.MulFOp(sq_full, c_inv_D, fastmath=fm_fast).result
-            rrms = fmath.rsqrt(
-                arith.AddFOp(var, c_eps, fastmath=fm_fast).result, fastmath=fm_fast
-            )
+            rrms = fmath.rsqrt(arith.AddFOp(var, c_eps, fastmath=fm_fast).result, fastmath=fm_fast)
 
             # rms_weight load
             rmsw_rsrc = buffer_ops.create_buffer_resource(rms_weight, max_size=True)
@@ -789,47 +711,30 @@ def _build_norm_rope_scatter_kernel(
                 dwords = (VEC + 1) // 2
                 off_dw = ArithValue(tid_x_vec) >> c_one_i32
                 if const_expr(dwords == 1):
-                    raw_s = buffer_ops.buffer_load(
-                        rmsw_rsrc, off_dw, vec_width=1, dtype=i32
-                    )
+                    raw_s = buffer_ops.buffer_load(rmsw_rsrc, off_dw, vec_width=1, dtype=i32)
                     raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
                 else:
-                    raw = buffer_ops.buffer_load(
-                        rmsw_rsrc, off_dw, vec_width=dwords, dtype=i32
-                    )
+                    raw = buffer_ops.buffer_load(rmsw_rsrc, off_dw, vec_width=dwords, dtype=i32)
                 vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
                 rmsw_lane = []
                 for i in range_constexpr(VEC):
-                    bf16_v = vector.extract(
-                        vec_bf16, static_position=[i], dynamic_position=[]
-                    )
+                    bf16_v = vector.extract(vec_bf16, static_position=[i], dynamic_position=[])
                     rmsw_lane.append(arith.extf(f32, bf16_v))
             else:
                 if const_expr(VEC <= 4):
-                    raw = buffer_ops.buffer_load(
-                        rmsw_rsrc, tid_x_vec, vec_width=VEC, dtype=f32
-                    )
-                    rmsw_lane = [
-                        vector.extract(raw, static_position=[i], dynamic_position=[])
-                        for i in range(VEC)
-                    ]
+                    raw = buffer_ops.buffer_load(rmsw_rsrc, tid_x_vec, vec_width=VEC, dtype=f32)
+                    rmsw_lane = [vector.extract(raw, static_position=[i], dynamic_position=[]) for i in range(VEC)]
                 else:
                     half = 4
-                    r0 = buffer_ops.buffer_load(
-                        rmsw_rsrc, tid_x_vec, vec_width=half, dtype=f32
-                    )
+                    r0 = buffer_ops.buffer_load(rmsw_rsrc, tid_x_vec, vec_width=half, dtype=f32)
                     r1 = buffer_ops.buffer_load(
                         rmsw_rsrc,
                         ArithValue(tid_x_vec) + arith.constant(half, type=i32),
                         vec_width=half,
                         dtype=f32,
                     )
-                    rmsw_lane = [
-                        vector.extract(r0, static_position=[i], dynamic_position=[])
-                        for i in range(half)
-                    ] + [
-                        vector.extract(r1, static_position=[i], dynamic_position=[])
-                        for i in range(half)
+                    rmsw_lane = [vector.extract(r0, static_position=[i], dynamic_position=[]) for i in range(half)] + [
+                        vector.extract(r1, static_position=[i], dynamic_position=[]) for i in range(half)
                     ]
 
             normed_lane = [
@@ -858,12 +763,8 @@ def _build_norm_rope_scatter_kernel(
             cs_lo = ArithValue(rope_rel) * arith.constant(PAIRS_PER_THREAD, type=i32)
 
             if const_expr(PAIRS_PER_THREAD == 1):
-                cos_b = buffer_ops.buffer_load(
-                    cos_rsrc, cos_row_base + cs_lo, vec_width=1, dtype=T.bf16
-                )
-                sin_b = buffer_ops.buffer_load(
-                    sin_rsrc, cos_row_base + cs_lo, vec_width=1, dtype=T.bf16
-                )
+                cos_b = buffer_ops.buffer_load(cos_rsrc, cos_row_base + cs_lo, vec_width=1, dtype=T.bf16)
+                sin_b = buffer_ops.buffer_load(sin_rsrc, cos_row_base + cs_lo, vec_width=1, dtype=T.bf16)
                 cos_vals = [arith.extf(f32, cos_b)]
                 sin_vals = [arith.extf(f32, sin_b)]
             else:
@@ -882,18 +783,14 @@ def _build_norm_rope_scatter_kernel(
                 cos_vals = [
                     arith.extf(
                         f32,
-                        vector.extract(
-                            cos_vec, static_position=[i], dynamic_position=[]
-                        ),
+                        vector.extract(cos_vec, static_position=[i], dynamic_position=[]),
                     )
                     for i in range(PAIRS_PER_THREAD)
                 ]
                 sin_vals = [
                     arith.extf(
                         f32,
-                        vector.extract(
-                            sin_vec, static_position=[i], dynamic_position=[]
-                        ),
+                        vector.extract(sin_vec, static_position=[i], dynamic_position=[]),
                     )
                     for i in range(PAIRS_PER_THREAD)
                 ]
@@ -916,22 +813,15 @@ def _build_norm_rope_scatter_kernel(
                 rotated_lane[2 * k] = new_e
                 rotated_lane[2 * k + 1] = new_o
 
-            out_lane = [
-                arith.select(is_rope_t, rotated_lane[i], normed_lane[i])
-                for i in range_constexpr(VEC)
-            ]
+            out_lane = [arith.select(is_rope_t, rotated_lane[i], normed_lane[i]) for i in range_constexpr(VEC)]
 
             # ── Paged BF16 scatter ──
             ci = arith.divsi(_to_raw(position), c_ratio)
             block_in_seq = arith.divsi(ci, c_k_per_block)
             slot_in_block = arith.remui(ci, c_k_per_block)
             bt_rsrc = buffer_ops.create_buffer_resource(block_table, max_size=True)
-            bt_off = ArithValue(batch_id) * ArithValue(
-                block_table_seq_stride
-            ) + ArithValue(block_in_seq)
-            physical_block = buffer_ops.buffer_load(
-                bt_rsrc, bt_off, vec_width=1, dtype=i32
-            )
+            bt_off = ArithValue(batch_id) * ArithValue(block_table_seq_stride) + ArithValue(block_in_seq)
+            physical_block = buffer_ops.buffer_load(bt_rsrc, bt_off, vec_width=1, dtype=i32)
 
             cache_off = (
                 ArithValue(physical_block) * ArithValue(kv_cache_block_stride)
@@ -946,9 +836,7 @@ def _build_norm_rope_scatter_kernel(
             dwords = (VEC + 1) // 2
             bf16_as_i32 = vector.bitcast(T.vec(dwords, T.i32), bf16_vec)
             if const_expr(dwords == 1):
-                scalar_i32 = vector.extract(
-                    bf16_as_i32, static_position=[0], dynamic_position=[]
-                )
+                scalar_i32 = vector.extract(bf16_as_i32, static_position=[0], dynamic_position=[])
                 buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
             else:
                 buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
@@ -1125,32 +1013,24 @@ def flydsl_hca_compress_attn(
     if score_in.shape != kv_in.shape:
         raise ValueError(f"score_in shape {tuple(score_in.shape)} != kv_in")
     if kv_in.dtype != torch.bfloat16 or score_in.dtype != torch.bfloat16:
-        raise TypeError(
-            f"kv_in/score_in must be bf16; got {kv_in.dtype}/{score_in.dtype}"
-        )
+        raise TypeError(f"kv_in/score_in must be bf16; got {kv_in.dtype}/{score_in.dtype}")
     if kv_in.stride(-1) != 1 or score_in.stride(-1) != 1:
         raise ValueError("kv_in/score_in inner stride must be 1")
     if kv_in.stride(0) % 2 != 0 or score_in.stride(0) % 2 != 0:
-        raise ValueError(
-            "kv_in/score_in row strides (bf16 elem) must be even for dword bitcast"
-        )
+        raise ValueError("kv_in/score_in row strides (bf16 elem) must be even for dword bitcast")
 
     plan_capacity = plan_gpu.shape[0]
     if plan_capacity == 0:
         return
 
     if ape.shape != (ratio, head_dim) or ape.dtype != torch.float32:
-        raise ValueError(
-            f"ape shape {tuple(ape.shape)} dtype {ape.dtype} != ({ratio}, {head_dim}) f32"
-        )
+        raise ValueError(f"ape shape {tuple(ape.shape)} dtype {ape.dtype} != ({ratio}, {head_dim}) f32")
     if not ape.is_contiguous():
         raise ValueError("ape must be contiguous")
 
     # State cache validation.
     if kv_state.dim() != 3 or kv_state.shape[2] != head_dim:
-        raise ValueError(
-            f"kv_state shape {tuple(kv_state.shape)} != [*, *, {head_dim}]"
-        )
+        raise ValueError(f"kv_state shape {tuple(kv_state.shape)} != [*, *, {head_dim}]")
     state_size = kv_state.shape[1]
     if state_size < ratio:
         raise ValueError(f"state_size={state_size} must be >= K={ratio}")
@@ -1180,8 +1060,7 @@ def flydsl_hca_compress_attn(
     else:
         if kv_compressed_scratch.shape != (plan_capacity, head_dim):
             raise ValueError(
-                f"kv_compressed_scratch shape {tuple(kv_compressed_scratch.shape)}"
-                f" != ({plan_capacity}, {head_dim})"
+                f"kv_compressed_scratch shape {tuple(kv_compressed_scratch.shape)}" f" != ({plan_capacity}, {head_dim})"
             )
         if kv_compressed_scratch.dtype != torch.float32:
             raise TypeError("kv_compressed_scratch must be fp32")
@@ -1222,12 +1101,7 @@ def flydsl_hca_compress_attn(
         int(plan_capacity),
         stream_obj,
     )
-    cf = getattr(compress_fn, "_cf", None)
-    if cf is not None:
-        cf(*compress_args)
-    else:
-        cf = flyc.compile(compress_fn, *compress_args)
-        compress_fn._cf = cf
+    _run_compiled(compress_fn, *compress_args)
 
     rms_weight_is_bf16 = rms_weight.dtype == torch.bfloat16
     norm_fn = compile_hca_norm_rope_scatter(
@@ -1253,9 +1127,4 @@ def flydsl_hca_compress_attn(
         int(plan_capacity),
         stream_obj,
     )
-    cf = getattr(norm_fn, "_cf", None)
-    if cf is not None:
-        cf(*norm_args)
-    else:
-        cf = flyc.compile(norm_fn, *norm_args)
-        norm_fn._cf = cf
+    _run_compiled(norm_fn, *norm_args)

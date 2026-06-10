@@ -67,9 +67,7 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
     return None
 
 
-def get_flydsl_stage1_kernels(
-    a_dtype: str, b_dtype: str, out_dtype: str
-) -> Dict[str, Dict]:
+def get_flydsl_stage1_kernels(a_dtype: str, b_dtype: str, out_dtype: str) -> Dict[str, Dict]:
     """Return {kernelName: params} for all supported stage1 configs."""
     kernels = {}
     is_fp4_a = a_dtype == "fp4"
@@ -94,14 +92,10 @@ def get_flydsl_stage1_kernels(
                 for wpe in waves_per_eus:
                     for kb in k_batches if wpe == 3 and tm == 32 and is_fp4_a else [1]:
                         for bnt in b_nts:
-                            gate_onlys = (
-                                [False, True] if kb > 1 and is_fp4_a else [False]
-                            )
+                            gate_onlys = [False, True] if kb > 1 and is_fp4_a else [False]
                             for go in gate_onlys:
                                 for xcd in xcd_swizzles:
-                                    name = flydsl_kernel_name(
-                                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
-                                    )
+                                    name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
                                     if wpe != 1:
                                         name += f"_w{wpe}"
                                     if kb != 1:
@@ -129,20 +123,14 @@ def get_flydsl_stage1_kernels(
                                         "gate_mode": (
                                             "mock_gate_only"
                                             if go
-                                            else (
-                                                "interleave"
-                                                if a_dtype == "fp8"
-                                                else "separated"
-                                            )
+                                            else ("interleave" if a_dtype == "fp8" else "separated")
                                         ),
                                         "xcd_swizzle": xcd,
                                     }
     return kernels
 
 
-def get_flydsl_stage2_kernels(
-    a_dtype: str, b_dtype: str, out_dtype: str
-) -> Dict[str, Dict]:
+def get_flydsl_stage2_kernels(a_dtype: str, b_dtype: str, out_dtype: str) -> Dict[str, Dict]:
     """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
@@ -164,9 +152,7 @@ def get_flydsl_stage2_kernels(
                 for mode in modes:
                     for bnt in b_nts:
                         for xcd in xcd_swizzles:
-                            base_name = flydsl_kernel_name(
-                                2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
-                            )
+                            base_name = flydsl_kernel_name(2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode)
                             if bnt != 0:
                                 base_name += f"_bnt{bnt}"
                             if xcd > 0:
@@ -206,9 +192,7 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
         for tn in tile_ns:
             for tk in tile_ks:
                 for kb in k_batches:
-                    name = flydsl_kernel_name(
-                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
-                    )
+                    name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
                     if kb != 1:
                         name += f"_kb{kb}"
                     kernels[name] = {
@@ -241,9 +225,7 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
         for tn in tile_ns:
             for tk in tile_ks:
                 for mode in modes:
-                    base_name = flydsl_kernel_name(
-                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
-                    )
+                    base_name = flydsl_kernel_name(2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode)
                     base_params = {
                         "stage": 2,
                         "a_dtype": a_dtype,
@@ -361,9 +343,7 @@ def compile_flydsl_moe_stage1(
             k_batch=k_batch,
         )
     else:
-        raise ValueError(
-            f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
-        )
+        raise ValueError(f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}")
 
 
 def compile_flydsl_moe_stage2(
@@ -432,9 +412,7 @@ def compile_flydsl_moe_stage2(
             scale_is_bf16=True,
         )
     else:
-        raise ValueError(
-            f"Unsupported stage2 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
-        )
+        raise ValueError(f"Unsupported stage2 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}")
 
 
 # Private helpers
@@ -445,11 +423,7 @@ _DLPACK_SAFE = (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
 
 def _view_safe(t: torch.Tensor) -> torch.Tensor:
     """View as uint8 if dtype is not dlpack-safe, otherwise return as-is."""
-    return (
-        t.view(torch.uint8)
-        if t is not None and t.numel() > 0 and t.dtype not in _DLPACK_SAFE
-        else t
-    )
+    return t.view(torch.uint8) if t is not None and t.numel() > 0 and t.dtype not in _DLPACK_SAFE else t
 
 
 def _ptr_view_safe(t: torch.Tensor):
@@ -562,11 +536,7 @@ def _s2_args_fp4(
     bias=None,
     stream=None,
 ):
-    _bias = (
-        bias.view(-1)
-        if bias is not None
-        else torch.empty(0, device=dev, dtype=torch.float32)
-    )
+    _bias = bias.view(-1) if bias is not None else torch.empty(0, device=dev, dtype=torch.float32)
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
@@ -770,56 +740,35 @@ def flydsl_moe_stage1(
 
     if out is None:
         if _need_fp4 or (_gui_sk_fused and _need_fp4):
-            out = torch.empty(
-                (token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
-            )
+            out = torch.empty((token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=dev)
         elif _need_fp8 or (_gui_sk_fused and _need_fp8):
-            out = torch.empty(
-                (token_num, topk, inter_dim), dtype=dtypes.fp8, device=dev
-            )
+            out = torch.empty((token_num, topk, inter_dim), dtype=dtypes.fp8, device=dev)
         else:
-            out = torch.empty(
-                (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
-            )
+            out = torch.empty((token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev)
 
     if _is_splitk:
         torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
-        tmp_out = torch.zeros(
-            (token_num, topk, inter_dim * 2), dtype=torch_tmp_out_dtype, device=dev
-        )
+        tmp_out = torch.zeros((token_num, topk, inter_dim * 2), dtype=torch_tmp_out_dtype, device=dev)
     else:
         tmp_out = None
 
-    flat_a_scale = (
-        a1_scale.view(-1) if a1_scale is not None else torch.empty(0, device=dev)
-    )
-    flat_w_scale = (
-        w1_scale.view(-1) if w1_scale is not None else torch.empty(0, device=dev)
-    )
-    sw = (
-        sorted_weights
-        if sorted_weights is not None
-        else torch.empty(0, device=dev, dtype=torch.float32)
-    )
+    flat_a_scale = a1_scale.view(-1) if a1_scale is not None else torch.empty(0, device=dev)
+    flat_w_scale = w1_scale.view(-1) if w1_scale is not None else torch.empty(0, device=dev)
+    sw = sorted_weights if sorted_weights is not None else torch.empty(0, device=dev, dtype=torch.float32)
 
     _need_quant = _fuse_any_quant or _splitk_fp4 or _gui_sk_fused
     _need_sort = _need_quant
 
     _sort_block_m = tile_m
     _all_blks = sorted_expert_ids.shape[0]
-    _dense_blks = (
-        min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])
-        // _sort_block_m
-    )
+    _dense_blks = min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0]) // _sort_block_m
     _grid_y = min(_dense_blks, _all_blks)
 
     _persist_m = persist_m if persist_m > 0 else 1
 
     # Allocate sorted-scale buffer with padding for tiled layout
     scale_cols = inter_dim // 32
-    sorted_size = max(
-        sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * _sort_block_m
-    )
+    sorted_size = max(sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * _sort_block_m)
     padded_rows = (sorted_size + 255) // 256 * 256
     padded_cols = (scale_cols + 7) // 8 * 8
     out_scale_sorted_flat = (
@@ -857,11 +806,7 @@ def flydsl_moe_stage1(
             _k_in,
             _grid_y,
             dev,
-            bias=(
-                kernel_bias.view(-1)
-                if kernel_bias is not None
-                else torch.empty(0, device=dev)
-            ),
+            bias=(kernel_bias.view(-1) if kernel_bias is not None else torch.empty(0, device=dev)),
         )
     else:
         args = _s1_args_std(
@@ -914,11 +859,7 @@ def flydsl_moe_stage1(
         raise ValueError("topk_ids are required for split-K FlyDSL stage1 bias")
     # sorted_token_ids only gives (token_id, slot_id). Bias is stored per expert,
     # so the post-activation kernel needs topk_ids[token_id * topk + slot_id].
-    topk_ids_arg = (
-        topk_ids.to(torch.int32).contiguous().view(-1)
-        if use_splitk_bias
-        else sorted_token_ids.view(-1)
-    )
+    topk_ids_arg = topk_ids.to(torch.int32).contiguous().view(-1) if use_splitk_bias else sorted_token_ids.view(-1)
     bias_arg = (
         bias.contiguous().view(-1)
         if use_splitk_bias
@@ -1021,17 +962,13 @@ def flydsl_moe_stage1(
             swiglu_and_mul(post_out, post_input)
         else:
             if bias is not None:
-                post_input = post_input + bias[topk_ids.to(torch.long)].view(
-                    -1, inter_dim * 2
-                )
+                post_input = post_input + bias[topk_ids.to(torch.long)].view(-1, inter_dim * 2)
             silu_and_mul(post_out, post_input)
 
     if _fuse_any_quant and _need_sort:
         from aiter.utility.dtypes import fp8_e8m0
 
-        out_scale_sorted = out_scale_sorted_flat.view(fp8_e8m0).view(
-            padded_rows, padded_cols
-        )
+        out_scale_sorted = out_scale_sorted_flat.view(fp8_e8m0).view(padded_rows, padded_cols)
         return out, out_scale_sorted
 
     return out
@@ -1102,17 +1039,11 @@ def flydsl_moe_stage2(
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
     if out is None:
         alloc_fn = torch.zeros if accumulate else torch.empty
-        out = alloc_fn(
-            (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
-        )
+        out = alloc_fn((token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device)
 
     dev = inter_states.device
-    flat_a_scale = (
-        a2_scale.view(-1) if a2_scale is not None else torch.empty(0, device=dev)
-    )
-    flat_w_scale = (
-        w2_scale.view(-1) if w2_scale is not None else torch.empty(0, device=dev)
-    )
+    flat_a_scale = a2_scale.view(-1) if a2_scale is not None else torch.empty(0, device=dev)
+    flat_w_scale = w2_scale.view(-1) if w2_scale is not None else torch.empty(0, device=dev)
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -1210,9 +1141,7 @@ def flydsl_moe_stage2(
     if not accumulate:
         use_mask = expert_mask is not None
         if use_mask and topk_ids is None:
-            raise ValueError(
-                "topk_ids is required when expert_mask is provided for reduce mode"
-            )
+            raise ValueError("topk_ids is required when expert_mask is provided for reduce mode")
         # Map torch dtype -> compile_moe_reduction dtype_str
         if out.dtype == torch.float16:
             _reduce_dtype_str = "f16"
@@ -1243,21 +1172,22 @@ def flydsl_moe_stage2(
                 em = torch.empty(0, device=out.device, dtype=torch.int32)
                 tk = torch.empty(0, device=out.device, dtype=torch.int32)
             stream = torch.cuda.current_stream()
-            reduce_exe(
-                _ptr_view_safe(X),
-                _ptr_view_safe(out),
-                _ptr_view_safe(em),
-                _ptr_view_safe(tk),
-                token_num,
-                stream,
+            _run_compiled(
+                reduce_exe,
+                (
+                    _ptr_view_safe(X),
+                    _ptr_view_safe(out),
+                    _ptr_view_safe(em),
+                    _ptr_view_safe(tk),
+                    token_num,
+                    stream,
+                ),
             )
         else:
             # Unsupported dtype for the masked kernel — fall back to torch.sum.
             # This drops the EP mask, so only valid for non-EP runs.
             if use_mask:
-                raise NotImplementedError(
-                    f"Masked moe reduction not supported for dtype {out.dtype}"
-                )
+                raise NotImplementedError(f"Masked moe reduction not supported for dtype {out.dtype}")
             torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
 
     return out

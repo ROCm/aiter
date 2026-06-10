@@ -24,6 +24,7 @@ import torch
 import triton
 
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
+from .kernels.tensor_shim import _run_compiled
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_chunk_offsets,
     prepare_num_chunks,
@@ -67,9 +68,7 @@ def _select_bv_for_grid(*, H: int, V: int, N: int, target_ctas: int) -> int:
     return legal[-1]
 
 
-def _target_bv_for_shape(
-    *, H: int, Hg: int, T_flat: int, N: int, is_varlen: bool
-) -> int | None:
+def _target_bv_for_shape(*, H: int, Hg: int, T_flat: int, N: int, is_varlen: bool) -> int | None:
     """Return the calibrated BV regime before legality/grid adjustment."""
     if is_varlen and H == 32 and Hg == 16:
         if N == 2 and 11000 <= T_flat < 15000:
@@ -177,12 +176,8 @@ def _heuristic_bv(
         V (rare: V<16 or V not divisible by 16), falls back to the
         largest legal candidate, then finally to ``_DEFAULT_BV``.
     """
-    target_bv = _target_bv_for_shape(
-        H=H, Hg=Hg, T_flat=T_flat, N=N, is_varlen=is_varlen
-    )
-    target_ctas = (
-        _grid_ctas(H=H, V=V, N=N, BV=target_bv) if target_bv is not None else 256
-    )
+    target_bv = _target_bv_for_shape(H=H, Hg=Hg, T_flat=T_flat, N=N, is_varlen=is_varlen)
+    target_ctas = _grid_ctas(H=H, V=V, N=N, BV=target_bv) if target_bv is not None else 256
     return _select_bv_for_grid(H=H, V=V, N=N, target_ctas=target_ctas)
 
 
@@ -264,7 +259,8 @@ def _launch_kernel(
 ):
     grid_v = triton.cdiv(V, BV)
     grid_nh = N * H
-    args = (
+    _run_compiled(
+        launch_fn,
         k,
         u,
         w,
@@ -283,14 +279,6 @@ def _launch_kernel(
         grid_nh,
         stream,
     )
-    cf = getattr(launch_fn, "_cf", None)
-    if cf is not None:
-        cf(*args)
-        return
-    import flydsl.compiler as flyc
-
-    cf = flyc.compile(launch_fn, *args)
-    launch_fn._cf = cf
 
 
 def chunk_gated_delta_rule_fwd_h_flydsl(
@@ -378,9 +366,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     else:
         resolved_state_dtype = torch.float32
     if resolved_state_dtype not in (torch.float32, torch.bfloat16):
-        raise ValueError(
-            f"SSM state dtype must be float32 or bfloat16, got {resolved_state_dtype}."
-        )
+        raise ValueError(f"SSM state dtype must be float32 or bfloat16, got {resolved_state_dtype}.")
     state_bf16 = resolved_state_dtype == torch.bfloat16
 
     B, T, Hg, K = k.shape
@@ -402,26 +388,18 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         # per-forward D2H. (Passing a freshly-rebased tensor instead would key
         # the offset/num-chunk caches on an unstable identity and re-fire the
         # .tolist()/int() syncs every call.)
-        chunk_offsets = prepare_chunk_offsets(
-            cu_seqlens, BT, num_decodes, num_decode_tokens
-        )
+        chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT, num_decodes, num_decode_tokens)
         NT = prepare_num_chunks(cu_seqlens, BT, num_decodes, num_decode_tokens)
         # Rebased kernel-facing cu_seqlens (matches the pre-sliced prefill
         # data). N is the prefill sequence count (len() is a shape read, no
         # sync).
-        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
-            cu_seqlens, num_decodes, num_decode_tokens
-        )
+        kernel_cu_seqlens = prepare_rebased_cu_seqlens(cu_seqlens, num_decodes, num_decode_tokens)
         N = len(kernel_cu_seqlens) - 1
 
     assert K <= 256
 
     h = k.new_empty(B, NT, H, V, K)
-    final_state = (
-        k.new_empty(N, H, V, K, dtype=resolved_state_dtype)
-        if output_final_state
-        else None
-    )
+    final_state = k.new_empty(N, H, V, K, dtype=resolved_state_dtype) if output_final_state else None
     v_new_buf = k.new_empty(B, H, T_flat, V, dtype=u.dtype)
     v_new = v_new_buf if save_new_value else None
 
@@ -436,13 +414,9 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
             f"or [H, T_flat]); got strides={g.stride()}, shape={tuple(g.shape)}."
         )
         assert g.shape[-1] == T_flat, (
-            f"FlyDSL K5: ``g.shape[-1]`` must equal T_flat={T_flat}, "
-            f"got g.shape={tuple(g.shape)}."
+            f"FlyDSL K5: ``g.shape[-1]`` must equal T_flat={T_flat}, " f"got g.shape={tuple(g.shape)}."
         )
-        assert g.shape[-2] == H, (
-            f"FlyDSL K5: ``g.shape[-2]`` must equal H={H}, "
-            f"got g.shape={tuple(g.shape)}."
-        )
+        assert g.shape[-2] == H, f"FlyDSL K5: ``g.shape[-2]`` must equal H={H}, " f"got g.shape={tuple(g.shape)}."
     g_arg = g if g is not None else dummy
 
     # Mirror the Triton VK wrapper: when ``use_exp2=True`` the K5 kernel
@@ -462,16 +436,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # int32. `.to(torch.int32)` is a device-to-device cast (no host sync); the
     # resulting fresh objects are consumed only by the kernel launch, so their
     # identity does not matter for the @tensor_cache helpers above.
-    cu_arg = (
-        kernel_cu_seqlens.to(torch.int32)
-        if kernel_cu_seqlens is not None
-        else dummy.to(torch.int32)
-    )
-    co_arg = (
-        chunk_offsets.to(torch.int32)
-        if chunk_offsets is not None
-        else dummy.to(torch.int32)
-    )
+    cu_arg = kernel_cu_seqlens.to(torch.int32) if kernel_cu_seqlens is not None else dummy.to(torch.int32)
+    co_arg = chunk_offsets.to(torch.int32) if chunk_offsets is not None else dummy.to(torch.int32)
     stream = torch.cuda.current_stream()
 
     use_g = g is not None
