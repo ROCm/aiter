@@ -7,6 +7,7 @@ from aiter.test_common import (
     benchmark,
     run_perftest,
 )
+import gc
 import torch
 import aiter
 from aiter import dtypes
@@ -990,15 +991,28 @@ if not args.hc_head:
         for hidden_size in args.hidden_size:
             for m in args.m:
                 for hc_mult in [4]:
-                    ret = test_mhc_post_pre(
-                        m=m,
-                        hidden_size=hidden_size,
-                        hc_mult=hc_mult,
-                        fuse_rmsnorm=args.fuse_rmsnorm,
-                    )
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    try:
+                        ret = test_mhc_post_pre(
+                            m=m,
+                            hidden_size=hidden_size,
+                            hc_mult=hc_mult,
+                            fuse_rmsnorm=args.fuse_rmsnorm,
+                        )
+                    except torch.OutOfMemoryError as e:
+                        aiter.logger.warning(
+                            "OOM mhc_post_pre M=%s hidden_size=%s: %s",
+                            m,
+                            hidden_size,
+                            e,
+                        )
+                        continue
                     if ret.get("skipped"):
                         continue
                     df.append(ret)
+                    torch.cuda.empty_cache()
+                    gc.collect()
     if df:
         df = pd.DataFrame(df)
         df_md = df.to_markdown(index=False)
