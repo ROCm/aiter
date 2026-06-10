@@ -11,9 +11,17 @@
 # HSTU (B,D,K,N) bench naming -> GEMM dims: reduction K = bench D, output N =
 # bench K (here Kout), grid M-envelope = bench N (max_seq_len, here Mi cap).
 #
+# Two sequence-length regimes (--regime):
+#   uniform : M_i == Mi for every group (controlled baseline; zero tail waste).
+#   skew    : M_i = Mi * U(0,1)**4 with ~20% empty groups + one full and one
+#             near-full group (the real HSTU deployment distribution). The FlyDSL
+#             dispatch routes skew via uniform_seqlen=False (remap off, persistent
+#             kernel for the small-weight/large-B cell).
+#
 # Run inside the devcontainer (torch/triton/flydsl in the container venv):
 #   PYTHONPATH=/home/anguyenh/aiter:/home/anguyenh/generative-recommenders:$PYTHONPATH \
 #     python op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py --metric time -test
+#     python op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py --regime both -test
 #
 # This uses triton.testing.do_bench (CUDA-event timing, many reps, L2-flushed).
 # At the production headline shapes (kernel 0.3-7 ms) do_bench tracks the
@@ -54,20 +62,38 @@ def default_benchmark_configs():
     ]
 
 
-def _make_inputs(B, D, Kout, Mi, device="cuda"):
-    """Uniform per-group rows = Mi. Returns the tensors both kernels need."""
+def _make_seq_offsets(B, Mi, regime, seed, device):
+    """Per-group prefix-sum offsets. uniform: every group == Mi. skew: Mi*U**4
+    with ~20% empty groups + one full and one near-full group (deployment dist)."""
+    if regime == "uniform":
+        return torch.arange(0, (B + 1) * Mi, Mi, dtype=torch.int32, device=device)
+    g = torch.Generator().manual_seed(seed)
+    u = torch.rand(B, generator=g)
+    t = (Mi * (u**4)).floor().to(torch.int64)
+    t[: max(1, B // 5)] = 0          # ~20% empty groups
+    t[-1] = Mi                       # one full-envelope group
+    if B > 1:
+        t[-2] = int(0.9 * Mi)        # one near-full group
+    so = torch.zeros(B + 1, dtype=torch.int32)
+    for i in range(B):
+        so[i + 1] = so[i] + int(t[i])
+    return so.to(device)
+
+
+def _make_inputs(B, D, Kout, Mi, regime="uniform", seed=1234, device="cuda"):
+    """Returns the tensors both kernels need for the given regime."""
     torch.manual_seed(0)
     N, K = Kout, D  # GEMM: output N = Kout, reduction K = D
-    seq_offsets = torch.arange(0, (B + 1) * Mi, Mi, dtype=torch.int32, device=device)
-    L = B * Mi
+    seq_offsets = _make_seq_offsets(B, Mi, regime, seed, device)
+    L = int(seq_offsets[-1].item())
 
-    jagged = torch.randn(L, K, dtype=torch.bfloat16, device=device)
+    jagged = torch.randn(max(L, 1), K, dtype=torch.bfloat16, device=device)
     dense = torch.randn(B, K, N, dtype=torch.bfloat16, device=device)  # (B, K, N)
     bias = torch.randn(B, N, dtype=torch.bfloat16, device=device)
     return jagged, dense, bias, seq_offsets, L, N, K
 
 
-def _flydsl_fn(jagged, dense, bias, seq_offsets, B, Mi, N, K):
+def _flydsl_fn(jagged, dense, bias, seq_offsets, B, Mi, N, K, regime="uniform"):
     # FlyDSL wants Dense as a tall (B*N, K) matrix, bias flat, padded output.
     dense_tall = dense.transpose(1, 2).reshape(B * N, K).contiguous()  # (B*N, K)
     bias_flat = bias.reshape(B * N).contiguous()
@@ -76,13 +102,14 @@ def _flydsl_fn(jagged, dense, bias, seq_offsets, B, Mi, N, K):
     tA = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
     tC = flyc.from_dlpack(out).mark_layout_dynamic(leading_dim=1, divisibility=8)
 
-    # Route through the production dispatch layer (picks gen vs persistent per
-    # regime). These configs are uniform, so the gate keeps them on the gen
-    # kernel; the import path is now the production entry point either way.
+    # Route through the production dispatch layer (picks gen vs persistent and
+    # remap on/off per regime via uniform_seqlen).
+    uniform = regime == "uniform"
+
     def fn():
         jagged_dense_bmm_dispatched(
             tC, tA, dense_tall, bias_flat, seq_offsets, B, Mi,
-            stream=torch.cuda.current_stream(), uniform_seqlen=True,
+            stream=torch.cuda.current_stream(), uniform_seqlen=uniform,
         )
 
     return fn, out, L
@@ -110,23 +137,12 @@ def _torch_reference(jagged, dense, bias, seq_offsets, N):
     return out
 
 
-def run_benchmark(custom, args):
-    providers = []
-    if not args.triton_only:
-        providers.append("flydsl")
-    if _HAS_TRITON and not args.flydsl_only:
-        providers.append("triton")
-    if not providers:
-        print("No providers selected / available.")
-        return
-
+def _run_one_regime(custom, args, regime, providers, unit):
     if custom:
         x_vals = [(args.b, args.d, args.kout)]
     else:
         x_vals = default_benchmark_configs()
     x_vals = [(*v, args.mi) for v in x_vals]
-
-    unit = {"time": "ms", "throughput": "TFLOPS", "bandwidth": "GB/s"}[args.metric]
 
     config = triton.testing.Benchmark(
         x_names=["B", "D", "KOUT", "MI"],
@@ -136,16 +152,18 @@ def run_benchmark(custom, args):
         line_names=providers,
         styles=[("blue", "-"), ("red", "-")][: len(providers)],
         ylabel=unit,
-        plot_name=f"bench_jagged_dense_bmm_{args.metric}",
-        args={},
+        plot_name=f"bench_jagged_dense_bmm_{regime}_{args.metric}",
+        args={"regime": regime},
     )
 
     @triton.testing.perf_report([config])
-    def bench_fn(B, D, KOUT, MI, provider):
-        jagged, dense, bias, seq_offsets, L, N, K = _make_inputs(B, D, KOUT, MI)
+    def bench_fn(B, D, KOUT, MI, provider, regime):
+        jagged, dense, bias, seq_offsets, L, N, K = _make_inputs(
+            B, D, KOUT, MI, regime=regime, seed=args.seed
+        )
 
         if provider == "flydsl":
-            fn, out, _ = _flydsl_fn(jagged, dense, bias, seq_offsets, B, MI, N, K)
+            fn, out, _ = _flydsl_fn(jagged, dense, bias, seq_offsets, B, MI, N, K, regime)
             out_view = out[:L]
         else:
             fn = _triton_fn(jagged, dense, bias, seq_offsets, MI)
@@ -163,13 +181,15 @@ def run_benchmark(custom, args):
             cos = torch.nn.functional.cosine_similarity(
                 ref.float().flatten(), got.float().flatten(), dim=0
             ).item()
-            tag = f"(B={B}, D={D}, Kout={KOUT}, Mi={MI})"
+            tag = f"({regime:7s} B={B}, D={D}, Kout={KOUT}, Mi={MI})"
             print(f"  {'PASS' if cos > 0.999 else 'FAIL'} [{provider:6s}] {tag}  cos={cos:.4f}")
 
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
-        # FLOPs: per group (M_b x D) . (D x N) -> 2*M_b*D*N; sum M_b = L. Bias add
-        # negligible. Bytes: A (L*D) + Dense (B*D*N) + bias (B*N) + Out (L*N), bf16.
+        # FLOPs/bytes use the ACTUAL packed length L (sum of M_i), so skew and
+        # uniform are each scored on the work they truly do. FLOPs: per group
+        # (M_b x D) . (D x N) -> 2*M_b*D*N; sum M_b = L. Bias add negligible.
+        # Bytes: A (L*D) + Dense (B*D*N) + bias (B*N) + Out (L*N), bf16.
         flops = 2.0 * L * D * N
         mem = (L * D + B * D * N + B * N + L * N) * 2
 
@@ -181,7 +201,24 @@ def run_benchmark(custom, args):
             return mem / ms * 1e-6
         raise ValueError(f"Unknown metric: {args.metric}")
 
+    print(f"\n=== regime={regime}  (metric={args.metric} [{unit}]) ===")
     bench_fn.run(save_path="." if args.o else None, print_data=True)
+
+
+def run_benchmark(custom, args):
+    providers = []
+    if not args.triton_only:
+        providers.append("flydsl")
+    if _HAS_TRITON and not args.flydsl_only:
+        providers.append("triton")
+    if not providers:
+        print("No providers selected / available.")
+        return
+
+    unit = {"time": "ms", "throughput": "TFLOPS", "bandwidth": "GB/s"}[args.metric]
+    regimes = ["uniform", "skew"] if args.regime == "both" else [args.regime]
+    for regime in regimes:
+        _run_one_regime(custom, args, regime, providers, unit)
 
 
 def parse_args(argv=None):
@@ -190,10 +227,13 @@ def parse_args(argv=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--metric", choices=["time", "throughput", "bandwidth"], default="time")
+    p.add_argument("--regime", choices=["uniform", "skew", "both"], default="uniform",
+                   help="sequence-length distribution (uniform baseline / skewed deployment / both)")
+    p.add_argument("--seed", type=int, default=1234, help="skew RNG seed")
     p.add_argument("-b", type=int, default=0, help="B groups (custom shape)")
     p.add_argument("-d", type=int, default=0, help="D = reduction K (custom shape)")
     p.add_argument("-kout", type=int, default=0, help="Kout = output N (custom shape)")
-    p.add_argument("-mi", type=int, default=7680, help="uniform per-group rows (max_seq_len)")
+    p.add_argument("-mi", type=int, default=7680, help="max_seq_len (per-group rows in uniform; envelope in skew)")
     p.add_argument("--warmup", type=int, default=25, help="do_bench warmup ms")
     p.add_argument("--rep", type=int, default=100, help="do_bench rep ms")
     p.add_argument("-test", action="store_true", help="correctness check vs torch eager")

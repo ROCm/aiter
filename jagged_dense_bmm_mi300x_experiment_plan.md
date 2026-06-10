@@ -119,7 +119,7 @@ docker exec -e PYTHONPATH=/home/anguyenh/aiter:/home/anguyenh/generative-recomme
 # both regimes (uniform + skew), end-to-end through the dispatch
 docker exec -e PYTHONPATH=/home/anguyenh/aiter:/home/anguyenh/generative-recommenders \
   -w /home/anguyenh/aiter anguyenh-dev \
-  python3 op_tests/flydsl_tests/bench_jdbba_vs_triton.py --regime both -test
+  python3 op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py --regime both -test
 ```
 
 Capture: per-shape per-regime FlyDSL ms, Triton ms, ratio, and cos. This is the
@@ -188,8 +188,7 @@ redirects the search toward levers #2–#5/#10.
 | `aiter/ops/flydsl/kernels/jagged_dense_bmm_gen.py` | generalized production kernel (per-shape factory; remap + atom + tiling knobs) |
 | `aiter/ops/flydsl/kernels/jagged_dense_bmm_persist_dev.py` | persistent on-device problem-visitor kernel (skew candidate) |
 | `aiter/ops/flydsl/jagged_dense_bmm_dispatch_v2.py` | production dispatch (regime gate + per-shape config) |
-| `op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py` | canonical perf bench (flydsl vs triton, headline shapes) |
-| `op_tests/flydsl_tests/bench_jdbba_vs_triton.py` | both-regime cross-check bench |
+| `op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py` | canonical perf bench (flydsl vs triton, headline shapes, `--regime uniform/skew/both`) |
 | `op_tests/flydsl_tests/test_jdbba_dispatch_v2.py` | dispatch correctness test |
 | `jagged_dense_bmm_broadcast_add_dev_journal.md` | methodology / running log |
 | `jagged_dense_bmm_broadcast_add_flydsl_plan.md` | original FlyDSL port plan |

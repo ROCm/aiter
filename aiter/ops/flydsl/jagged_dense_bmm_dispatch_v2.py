@@ -313,7 +313,7 @@ def jagged_dense_bmm_dispatched(
     # the static grid's per-group max_seq_len M-envelope early-exit waste dominates,
     # and persist's occupied-tile-only traversal recovers it. For the D512 shapes
     # the static remap-off path is faster than persist (1.13-1.20x), so they fall
-    # through. (Measured 2026-06-09, op_tests/flydsl_tests/bench_jdbba_vs_triton.py.)
+    # through. (Measured 2026-06-09, bench_jagged_dense_bmm_perf.py --regime both.)
     total_out = n_groups * output_n * max_seq_len
     use_persist = (
         (not uniform_seqlen)
