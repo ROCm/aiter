@@ -44,6 +44,9 @@ OPUS_D fp32x2_t pk_mul_f32(fp32x2_t a, fp32x2_t b)
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 {
+#if defined(__gfx11__)
+    return fp8x2_t{};
+#else
     fp32x2_t tmp = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
 #if defined(__gfx942__)
     constexpr float hi = 240.0f, lo = -240.0f;
@@ -58,6 +61,7 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
                  : "=v"(w), "+v"(a), "+v"(b)
                  : "v"(lo), "v"(hi));
     return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
+#endif
 }
 
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
@@ -73,6 +77,9 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x4(const S& s, float inverted_scale)
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
 {
+#if defined(__gfx11__)
+    return bf8x2_t{};
+#else
     fp32x2_t tmp       = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
     constexpr float hi = 57344.0f, lo = -57344.0f;
     float a = tmp[0], b = tmp[1];
@@ -83,6 +90,7 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
                  : "=v"(w), "+v"(a), "+v"(b)
                  : "v"(lo), "v"(hi));
     return __builtin_bit_cast(bf8x2_t, static_cast<int16_t>(w));
+#endif
 }
 
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
