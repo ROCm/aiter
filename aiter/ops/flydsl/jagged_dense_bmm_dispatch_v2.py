@@ -98,6 +98,8 @@ _SCHEMA_DEFAULTS = {
     # --- live knobs (forwarded to jagged_dense_bmm today) ---
     "xcd_c": None,  # None -> kernel picks weight-size-dependent default
     "xcd_w": None,  # None -> kernel default (8 for uniform_seqlen)
+    "skew_xcd_c": None,  # None -> remap off under skew; set to force a skew chunk
+    "skew_xcd_w": None,  # window for the skew remap (paired with skew_xcd_c)
     "use_mfma_k32": None,  # None -> auto (True on gfx950)
     "block_k": None,  # None -> shape-derived (128 if reduction_K<=256 else 64)
     # --- reserved / forward-compatible (ignored on apply today) ---
@@ -181,6 +183,11 @@ def _coerce(v, kind):
     if kind is bool:
         return bool(v)
     return int(v)
+
+
+def _opt_int(v):
+    """None-preserving int cast for optional skew-path knobs."""
+    return None if v is None else int(v)
 
 
 def _normalize_cfg(cfg: dict) -> dict:
@@ -380,8 +387,8 @@ def jagged_dense_bmm_dispatched(
         n_groups,
         max_seq_len,
         stream=stream,
-        xcd_c=cfg["xcd_c"] if uniform_seqlen else None,
-        xcd_w=cfg["xcd_w"] if uniform_seqlen else None,
+        xcd_c=cfg["xcd_c"] if uniform_seqlen else _opt_int(cfg.get("skew_xcd_c")),
+        xcd_w=cfg["xcd_w"] if uniform_seqlen else _opt_int(cfg.get("skew_xcd_w")),
         use_mfma_k32=cfg["use_mfma_k32"],
         uniform_seqlen=uniform_seqlen,
         block_m=cfg.get("tile_m") if uniform_seqlen else None,
