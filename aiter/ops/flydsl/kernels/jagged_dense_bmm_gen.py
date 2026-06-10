@@ -143,7 +143,7 @@ def make_bounded_buffer_tensor(tensor, num_records_bytes):
 
 
 @functools.lru_cache(maxsize=None)
-def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES, N_GROUPS, XCD_C, XCD_W, USE_MFMA_K32, WAVES_PER_EU=0):
+def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES, N_GROUPS, XCD_C, XCD_W, USE_MFMA_K32, WAVES_PER_EU=0, B_STAGES=3):
     """Build (and memoize) a launch wrapper specialized to this (N, K, tiling).
     N (output) and K (reduction) are baked in as closure constants. BM_TILES
     (= ceil(max_seq_len/BLOCK_M)) and N_GROUPS are also baked in so the chiplet
@@ -259,7 +259,7 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
             copy_frag_A = fx.make_fragment_like(thr_sA[None, None, None, 0])
 
             mma_frag_A = thr_mma.make_fragment_A(sA[None, None, 0])
-            mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=3)
+            mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=B_STAGES)
             mma_frag_C = thr_mma.make_fragment_C(gC)
 
             mma_frag_A_retile = thr_copy_s2r_A.retile(mma_frag_A)
@@ -268,14 +268,20 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
             gA_k_stride = fx.get_scalar(gA_k.stride[2])
             gB_k_stride = fx.get_scalar(gB_k.stride[2])
 
-            # B is register-double/triple-buffered with a DEEPER prefetch than A.
-            # A (LDS) stays 1-ahead/2-deep on a_read_stage^1. B uses 3 register
-            # slots and prefetches 2 tiles ahead: while consuming logical tile i
-            # from b_read_stage, it loads tile i+2 into b_write_stage = (i+2)%3.
+            # B is register-buffered with a DEEPER prefetch than A. A (LDS) stays
+            # 1-ahead/2-deep on a_read_stage^1. B uses B_STAGES register slots and
+            # prefetches B_STAGES-1 tiles ahead: while consuming logical tile i from
+            # b_read_stage, it loads tile i+(B_STAGES-1) into b_write_stage. With
+            # B_STAGES=2 this collapses to B being 1-ahead, in lockstep with A (the
+            # pre-prefetch behavior); B_STAGES=3 is the gfx942 2-ahead win. gfx950's
+            # 256x256 tile is VGPR-capped at occ=1.0, so the extra B slot spills
+            # there -> B_STAGES=2 on gfx950.
+            B_PREFETCH = B_STAGES - 1
+
             def run_pipeline_stage(a_read_stage, b_read_stage, a_next_k, b_next_k,
                                    read_next_a=True, read_next_b=True):
                 a_write_stage = a_read_stage ^ 1
-                b_write_stage = (b_read_stage + 2) % 3
+                b_write_stage = (b_read_stage + B_PREFETCH) % B_STAGES
                 if fx.const_expr(read_next_a):
                     a_next_k = fx.Int32(a_next_k)
                     fx.copy(
@@ -320,35 +326,39 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
                 fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, a_write_stage])
                 fx.gpu.barrier()
 
-            # Prologue: load K-tile 0 (A LDS slot 0, B reg slot 0) and prefetch
-            # K-tile 1 into B reg slot 1 (B is 2-ahead, so slot 1 must be primed).
+            # Prologue: load K-tile 0 (A LDS slot 0, B reg slot 0) and prime the
+            # remaining B prefetch slots 1 .. B_PREFETCH (B is B_PREFETCH-ahead, so
+            # those slots must hold tiles 1 .. B_PREFETCH before the loop). With
+            # B_STAGES=2 (B_PREFETCH=1) no extra priming runs -- B is 1-ahead in
+            # lockstep with A, the original behavior.
+            n_tiles = K // BLOCK_K
             fx.copy(buffer_copy_128b, thr_gA_k[None, None, None, 0], copy_frag_A)
             fx.copy(buffer_copy_128b, thr_gB_k[None, None, None, 0], mma_frag_B_retile[None, None, None, 0])
             mma_frag_C.fill(0)
             fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
-            if fx.const_expr(K // BLOCK_K >= 2):
-                fx.copy(
-                    buffer_copy_128b,
-                    thr_gB_k[None, None, None, 0],
-                    mma_frag_B_retile[None, None, None, 1],
-                    soffset=fx.Int32(1) * gB_k_stride,
-                )
+            for prime in fx.range_constexpr(1, B_PREFETCH + 1):
+                if fx.const_expr(prime < n_tiles):
+                    fx.copy(
+                        buffer_copy_128b,
+                        thr_gB_k[None, None, None, 0],
+                        mma_frag_B_retile[None, None, None, prime % B_STAGES],
+                        soffset=fx.Int32(prime) * gB_k_stride,
+                    )
             fx.gpu.barrier()
 
-            # Main K-loop. A toggles 0/1 (mod 2); B rotates 0/1/2 (mod 3).
-            # At logical tile i: read B slot i%3, prefetch tile i+2 -> (i+2)%3.
-            n_tiles = K // BLOCK_K
+            # Main K-loop. A toggles 0/1 (mod 2); B rotates over B_STAGES slots.
+            # At logical tile i: read B slot i%B_STAGES, prefetch tile i+B_PREFETCH.
             for i in range(0, n_tiles - 1):
                 a_rs = i % 2
-                b_rs = i % 3
-                # A prefetch: tile i+1 (1-ahead). B prefetch: tile i+2 (2-ahead),
-                # only while i+2 is a valid tile.
-                b_has_next = (i + 2) < n_tiles
+                b_rs = i % B_STAGES
+                # A prefetch: tile i+1 (1-ahead). B prefetch: tile i+B_PREFETCH,
+                # only while that tile is valid.
+                b_has_next = (i + B_PREFETCH) < n_tiles
                 run_pipeline_stage(
                     a_read_stage=a_rs,
                     b_read_stage=b_rs,
                     a_next_k=i + 1,
-                    b_next_k=i + 2,
+                    b_next_k=i + B_PREFETCH,
                     read_next_a=True,
                     read_next_b=b_has_next,
                 )
@@ -356,7 +366,7 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
             last = n_tiles - 1
             run_pipeline_stage(
                 a_read_stage=last % 2,
-                b_read_stage=last % 3,
+                b_read_stage=last % B_STAGES,
                 a_next_k=None,
                 b_next_k=None,
                 read_next_a=False,
@@ -550,7 +560,14 @@ def jagged_dense_bmm(
     bmn = BLOCK_M if block_m is None else block_m
     bnn = BLOCK_N if block_n is None else block_n
     bm = (max_seq_len + bmn - 1) // bmn
+    # B-fragment register-prefetch depth (arch-dependent). gfx942 (MI300X) uses a
+    # 3-slot, 2-ahead B pipeline to hide global-load latency on its short K-loop
+    # (+5-8% all shapes). gfx950 (MI355X) uses its tuned 256x256 tile on the large-D
+    # shape, which is VGPR-capped at occupancy 1.0; the extra B register slot spills
+    # there and nearly doubles runtime (11.3 vs 5.9ms on B1024_D512), so gfx950 keeps
+    # the 2-slot, 1-ahead B pipeline.
+    b_stages = 2 if _use_mfma_k32() else 3
     launch = _build_launcher(
-        N, K, bmn, bnn, block_k, STAGES_A, THREADS, bm, n_groups, xcd_c, xcd_w, use_mfma_k32, waves_per_eu
+        N, K, bmn, bnn, block_k, STAGES_A, THREADS, bm, n_groups, xcd_c, xcd_w, use_mfma_k32, waves_per_eu, b_stages
     )
     return launch(C, A, B, BIAS, SEQ_OFFSETS, n_groups, max_seq_len, stream=stream)
