@@ -11,8 +11,7 @@ _GLUON_REPR_KEYS = [
     "BLOCK_N",
     "BLOCK_K",
     "NUM_BUFFERS",
-    "PHYSICAL_MK",
-    "PHYSICAL_KN",
+    "LAYOUT",
     "USE_ACTIVATION",
     "ADD_BIAS",
 ]
@@ -30,10 +29,9 @@ def create_shared_layouts(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    PHYSICAL_MK: gl.constexpr,
-    PHYSICAL_KN: gl.constexpr,
+    LAYOUT: gl.constexpr,
 ):
-    if PHYSICAL_MK:
+    if LAYOUT[0] == "T":
         SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
         )
@@ -42,7 +40,7 @@ def create_shared_layouts(
             [[BLOCK_M, 8]], [BLOCK_K, BLOCK_M], [1, 0]
         )
 
-    if PHYSICAL_KN:
+    if LAYOUT[1] == "T":
         SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
         )
@@ -87,8 +85,7 @@ def _gemm_a16w16_basic_kernel(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    PHYSICAL_MK: gl.constexpr,
-    PHYSICAL_KN: gl.constexpr,
+    LAYOUT: gl.constexpr,
     SHARED_LAYOUT_A: gl.constexpr,
     SHARED_LAYOUT_B: gl.constexpr,
     WMMA_LAYOUT: gl.constexpr,
@@ -108,7 +105,7 @@ def _gemm_a16w16_basic_kernel(
     a_base = a_ptr + pid_m * BLOCK_M * stride_am
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn
 
-    if PHYSICAL_MK:
+    if LAYOUT[0] == "T":
         a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=a_base,
             shape=(M - pid_m * BLOCK_M, K),
@@ -125,7 +122,7 @@ def _gemm_a16w16_basic_kernel(
             layout=SHARED_LAYOUT_A,
         )
 
-    if PHYSICAL_KN:
+    if LAYOUT[1] == "T":
         b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=b_base,
             shape=(K, N - pid_n * BLOCK_N),
@@ -142,7 +139,7 @@ def _gemm_a16w16_basic_kernel(
             layout=SHARED_LAYOUT_B,
         )
 
-    if PHYSICAL_MK:
+    if LAYOUT[0] == "T":
         a_buffer = gl.allocate_shared_memory(
             a_ptr.type.element_ty,
             shape=[NUM_BUFFERS, BLOCK_M, BLOCK_K],
@@ -155,7 +152,7 @@ def _gemm_a16w16_basic_kernel(
             layout=SHARED_LAYOUT_A,
         )
 
-    if PHYSICAL_KN:
+    if LAYOUT[1] == "T":
         b_buffer = gl.allocate_shared_memory(
             b_ptr.type.element_ty,
             shape=[NUM_BUFFERS, BLOCK_K, BLOCK_N],
@@ -183,7 +180,7 @@ def _gemm_a16w16_basic_kernel(
         )
 
         # Walk the descriptors forward one K tile.
-        if PHYSICAL_MK:
+        if LAYOUT[0] == "T":
             a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 a_desc, add_offsets=[0, BLOCK_K]
             )
@@ -192,7 +189,7 @@ def _gemm_a16w16_basic_kernel(
                 a_desc, add_offsets=[BLOCK_K, 0]
             )
 
-        if PHYSICAL_KN:
+        if LAYOUT[1] == "T":
             b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 b_desc, add_offsets=[BLOCK_K, 0]
             )
@@ -217,7 +214,7 @@ def _gemm_a16w16_basic_kernel(
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
         # Walk the descriptors forward one K tile.
-        if PHYSICAL_MK:
+        if LAYOUT[0] == "T":
             a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 a_desc, add_offsets=[0, BLOCK_K]
             )
@@ -226,7 +223,7 @@ def _gemm_a16w16_basic_kernel(
                 a_desc, add_offsets=[BLOCK_K, 0]
             )
 
-        if PHYSICAL_KN:
+        if LAYOUT[1] == "T":
             b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 b_desc, add_offsets=[BLOCK_K, 0]
             )
@@ -237,7 +234,7 @@ def _gemm_a16w16_basic_kernel(
 
         load_idx += 1
 
-        if PHYSICAL_MK:
+        if LAYOUT[0] == "T":
             cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
             )
@@ -247,7 +244,7 @@ def _gemm_a16w16_basic_kernel(
                 OPERAND_LAYOUT_A,
             )
 
-        if PHYSICAL_KN:
+        if LAYOUT[1] == "T":
             cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
             )
@@ -265,7 +262,7 @@ def _gemm_a16w16_basic_kernel(
     for i in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
 
-        if PHYSICAL_MK:
+        if LAYOUT[0] == "T":
             cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
             )
@@ -275,7 +272,7 @@ def _gemm_a16w16_basic_kernel(
                 OPERAND_LAYOUT_A,
             )
 
-        if PHYSICAL_KN:
+        if LAYOUT[1] == "T":
             cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
             )
@@ -336,8 +333,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    PHYSICAL_MK: gl.constexpr,
-    PHYSICAL_KN: gl.constexpr,
+    LAYOUT: gl.constexpr,
     SHARED_LAYOUT_A: gl.constexpr,
     SHARED_LAYOUT_B: gl.constexpr,
     WMMA_LAYOUT: gl.constexpr,
@@ -369,7 +365,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
     a_base = a_ptr + pid_m * BLOCK_M * stride_am
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn
 
-    if PHYSICAL_MK:
+    if LAYOUT[0] == "T":
         a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=a_base,
             shape=(M - pid_m * BLOCK_M, K),
@@ -386,7 +382,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
             layout=SHARED_LAYOUT_A,
         )
 
-    if PHYSICAL_KN:
+    if LAYOUT[1] == "T":
         b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=b_base,
             shape=(K, N - pid_n * BLOCK_N),
@@ -403,7 +399,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
             layout=SHARED_LAYOUT_B,
         )
 
-    if PHYSICAL_MK:
+    if LAYOUT[0] == "T":
         a_buffer = gl.allocate_shared_memory(
             a_ptr.type.element_ty,
             shape=[NUM_BUFFERS, BLOCK_M, BLOCK_K],
@@ -416,7 +412,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
             layout=SHARED_LAYOUT_A,
         )
 
-    if PHYSICAL_KN:
+    if LAYOUT[1] == "T":
         b_buffer = gl.allocate_shared_memory(
             b_ptr.type.element_ty,
             shape=[NUM_BUFFERS, BLOCK_K, BLOCK_N],
@@ -444,7 +440,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
         )
 
         # Walk the descriptors forward one K tile.
-        if PHYSICAL_MK:
+        if LAYOUT[0] == "T":
             a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 a_desc, add_offsets=[0, BLOCK_K]
             )
@@ -453,7 +449,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
                 a_desc, add_offsets=[BLOCK_K, 0]
             )
 
-        if PHYSICAL_KN:
+        if LAYOUT[1] == "T":
             b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 b_desc, add_offsets=[BLOCK_K, 0]
             )
@@ -471,7 +467,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
     # (NUM_BUFFERS-2)*2 lets exactly one tile (tile 0) complete.
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
-    if PHYSICAL_MK:
+    if LAYOUT[0] == "T":
         cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
             a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
         )
@@ -481,7 +477,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
             OPERAND_LAYOUT_A,
         )
 
-    if PHYSICAL_KN:
+    if LAYOUT[1] == "T":
         cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
             b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
         )
@@ -508,7 +504,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
     )
 
     # Walk the descriptors forward one K tile.
-    if PHYSICAL_MK:
+    if LAYOUT[0] == "T":
         a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             a_desc, add_offsets=[0, BLOCK_K]
         )
@@ -517,7 +513,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
             a_desc, add_offsets=[BLOCK_K, 0]
         )
 
-    if PHYSICAL_KN:
+    if LAYOUT[1] == "T":
         b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             b_desc, add_offsets=[BLOCK_K, 0]
         )
@@ -536,7 +532,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
     # Pre-load the NEXT tile's operands into registers *before* the WMMA
     # below.  The hardware can run LDS reads and the matrix unit in
     # parallel, hiding the ds_read latency inside the WMMA execution.
-    if PHYSICAL_MK:
+    if LAYOUT[0] == "T":
         next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
             a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
         )
@@ -546,7 +542,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
             OPERAND_LAYOUT_A,
         )
 
-    if PHYSICAL_KN:
+    if LAYOUT[1] == "T":
         next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
             b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
         )
@@ -577,7 +573,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
         )
 
         # Walk the descriptors forward one K tile.
-        if PHYSICAL_MK:
+        if LAYOUT[0] == "T":
             a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 a_desc, add_offsets=[0, BLOCK_K]
             )
@@ -586,7 +582,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
                 a_desc, add_offsets=[BLOCK_K, 0]
             )
 
-        if PHYSICAL_KN:
+        if LAYOUT[1] == "T":
             b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 b_desc, add_offsets=[BLOCK_K, 0]
             )
@@ -605,7 +601,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
         # Pre-load the NEXT tile's operands into registers *before* the WMMA
         # below.  The hardware can run LDS reads and the matrix unit in
         # parallel, hiding the ds_read latency inside the WMMA execution.
-        if PHYSICAL_MK:
+        if LAYOUT[0] == "T":
             next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
             )
@@ -615,7 +611,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
                 OPERAND_LAYOUT_A,
             )
 
-        if PHYSICAL_KN:
+        if LAYOUT[1] == "T":
             next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
             )
@@ -634,7 +630,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
     for i in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
 
-        if PHYSICAL_MK:
+        if LAYOUT[0] == "T":
             next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
             )
@@ -644,7 +640,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
                 OPERAND_LAYOUT_A,
             )
 
-        if PHYSICAL_KN:
+        if LAYOUT[1] == "T":
             next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
             )

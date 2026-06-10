@@ -153,19 +153,22 @@ def gemm_a16w16(
 
         w = w.T
 
+        # Operand layout in BLAS TT/TN/NT/NN form: 'T' (row-major, trailing dim
+        # contiguous) or 'N' (column-major, leading dim contiguous). First char
+        # is x (A), second is w (B, after the internal transpose above).
         if x.stride(1) == 1:
-            physical_mk = True
+            layout = "T"
         elif x.stride(0) == 1:
-            physical_mk = False
+            layout = "N"
         else:
             raise ValueError(
                 f"x must be contiguous in at least one dimension, got strides {x.stride()}"
             )
 
         if w.stride(1) == 1:
-            physical_kn = True
+            layout += "T"
         elif w.stride(0) == 1:
-            physical_kn = False
+            layout += "N"
         else:
             raise ValueError(
                 f"w must be contiguous in at least one dimension, got strides {w.stride()}"
@@ -175,9 +178,7 @@ def gemm_a16w16(
             y = torch.empty((M, N), dtype=dtype, device=x.device)
 
         wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
-        shared_a, shared_b = create_shared_layouts(
-            BLOCK_M, BLOCK_N, BLOCK_K, physical_mk, physical_kn
-        )
+        shared_a, shared_b = create_shared_layouts(BLOCK_M, BLOCK_N, BLOCK_K, layout)
 
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 
@@ -199,8 +200,7 @@ def gemm_a16w16(
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
             NUM_BUFFERS=NUM_BUFFERS,
-            PHYSICAL_MK=physical_mk,
-            PHYSICAL_KN=physical_kn,
+            LAYOUT=layout,
             SHARED_LAYOUT_A=shared_a,
             SHARED_LAYOUT_B=shared_b,
             WMMA_LAYOUT=wmma_layout,
