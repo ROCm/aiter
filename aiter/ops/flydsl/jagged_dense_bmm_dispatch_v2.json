@@ -3,8 +3,45 @@
   "by_arch": {
     "gfx942": {
       "gfx": "gfx942",
-      "source": "baseline (gfx942 MI300X): empty winners -> D-bucketed heuristic with use_mfma_k32=false (gfx942 has no 16x16x32 bf16 atom; forcing it core-dumps with 'Cannot select intrinsic llvm.amdgcn.mfma.f32.16x16x32.bf16'). xcd_c/xcd_w left null so the kernel's own shape-derived defaults apply. Reproducible baseline BEFORE any per-shape gfx942 tuning. Bench: op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py --regime both --metric time -test.",
-      "winners": {},
+      "source": "tier-A XCD-remap autotune (gfx942 MI300X, 2026-06-10): tune_jdbba_xcd.py, triton.testing.do_bench cold-L2 ms, Mi=7680, UNIFORM regime only (skew forces remap off in the dispatch); swept xcd_c in [1,8,16,32,60,120,240] x xcd_w in [4,8,16], use_mfma_k32=false (gfx942 has no 16x16x32 bf16 atom -- forcing it core-dumps); correctness cos>0.999 vs torch eager (all =1.0000); 3x-repeat confirmed each winner beats the kernel auto-default by 0.9-2.6%. Fallback stays empty-winners -> D-bucketed heuristic with use_mfma_k32=false, xcd_c/xcd_w null (kernel shape-derived defaults). Bench: op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py --regime both --metric time -test.",
+      "winners": {
+        "B120D256K256N7680": {
+          "use_mfma_k32": false,
+          "xcd_c": 32,
+          "xcd_w": 16,
+          "cos": 1.0,
+          "ms": 0.5748,
+          "auto_ms": 0.5896,
+          "speedup": 1.026
+        },
+        "B120D512K512N7680": {
+          "use_mfma_k32": false,
+          "xcd_c": 32,
+          "xcd_w": 8,
+          "cos": 1.0,
+          "ms": 1.4664,
+          "auto_ms": 1.4839,
+          "speedup": 1.012
+        },
+        "B1024D256K256N7680": {
+          "use_mfma_k32": false,
+          "xcd_c": 32,
+          "xcd_w": 16,
+          "cos": 1.0,
+          "ms": 4.7373,
+          "auto_ms": 4.8367,
+          "speedup": 1.021
+        },
+        "B1024D512K512N7680": {
+          "use_mfma_k32": false,
+          "xcd_c": 240,
+          "xcd_w": 8,
+          "cos": 1.0,
+          "ms": 12.2677,
+          "auto_ms": 12.3749,
+          "speedup": 1.009
+        }
+      },
       "fallback": {
         "by_d_bucket": {
           "d_le_256": {

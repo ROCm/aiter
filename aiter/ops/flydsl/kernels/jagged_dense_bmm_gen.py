@@ -259,7 +259,7 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
             copy_frag_A = fx.make_fragment_like(thr_sA[None, None, None, 0])
 
             mma_frag_A = thr_mma.make_fragment_A(sA[None, None, 0])
-            mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=2)
+            mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=3)
             mma_frag_C = thr_mma.make_fragment_C(gC)
 
             mma_frag_A_retile = thr_copy_s2r_A.retile(mma_frag_A)
@@ -268,27 +268,35 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
             gA_k_stride = fx.get_scalar(gA_k.stride[2])
             gB_k_stride = fx.get_scalar(gB_k.stride[2])
 
-            def run_pipeline_stage(read_stage, next_k, read_next=True):
-                write_stage = read_stage ^ 1
-                if fx.const_expr(read_next):
-                    next_k = fx.Int32(next_k)
+            # B is register-double/triple-buffered with a DEEPER prefetch than A.
+            # A (LDS) stays 1-ahead/2-deep on a_read_stage^1. B uses 3 register
+            # slots and prefetches 2 tiles ahead: while consuming logical tile i
+            # from b_read_stage, it loads tile i+2 into b_write_stage = (i+2)%3.
+            def run_pipeline_stage(a_read_stage, b_read_stage, a_next_k, b_next_k,
+                                   read_next_a=True, read_next_b=True):
+                a_write_stage = a_read_stage ^ 1
+                b_write_stage = (b_read_stage + 2) % 3
+                if fx.const_expr(read_next_a):
+                    a_next_k = fx.Int32(a_next_k)
                     fx.copy(
                         buffer_copy_128b,
                         thr_gA_k[None, None, None, 0],
                         copy_frag_A,
-                        soffset=next_k * gA_k_stride,
+                        soffset=a_next_k * gA_k_stride,
                     )
+                if fx.const_expr(read_next_b):
+                    b_next_k = fx.Int32(b_next_k)
                     fx.copy(
                         buffer_copy_128b,
                         thr_gB_k[None, None, None, 0],
-                        mma_frag_B_retile[None, None, None, write_stage],
-                        soffset=next_k * gB_k_stride,
+                        mma_frag_B_retile[None, None, None, b_write_stage],
+                        soffset=b_next_k * gB_k_stride,
                     )
 
                 for block_k_iter in fx.range_constexpr(BLOCK_K // 32):
                     fx.copy(
                         uni_copy_128b,
-                        thr_sA_s2r[None, None, block_k_iter, read_stage],
+                        thr_sA_s2r[None, None, block_k_iter, a_read_stage],
                         mma_frag_A_retile[None, None, block_k_iter],
                     )
                     # K=32 atom: one atom spans tile_K_perm=32, so the fragment K
@@ -296,10 +304,10 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
                     # atoms per 32-wide perm group -> hierarchical (None, iter).
                     if fx.const_expr(USE_MFMA_K32):
                         frag_A_k = mma_frag_A[None, None, block_k_iter]
-                        frag_B_k = mma_frag_B[None, None, block_k_iter, read_stage]
+                        frag_B_k = mma_frag_B[None, None, block_k_iter, b_read_stage]
                     else:
                         frag_A_k = mma_frag_A[None, None, (None, block_k_iter)]
-                        frag_B_k = mma_frag_B[None, None, (None, block_k_iter), read_stage]
+                        frag_B_k = mma_frag_B[None, None, (None, block_k_iter), b_read_stage]
                     fx.gemm(
                         tiled_mma,
                         mma_frag_C,
@@ -309,22 +317,51 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
                         traversal_order=fx.GemmTraversalOrder.KNM,
                     )
 
-                fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, write_stage])
+                fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, a_write_stage])
                 fx.gpu.barrier()
 
-            # Prologue: load K-tile 0 into the read buffer.
+            # Prologue: load K-tile 0 (A LDS slot 0, B reg slot 0) and prefetch
+            # K-tile 1 into B reg slot 1 (B is 2-ahead, so slot 1 must be primed).
             fx.copy(buffer_copy_128b, thr_gA_k[None, None, None, 0], copy_frag_A)
             fx.copy(buffer_copy_128b, thr_gB_k[None, None, None, 0], mma_frag_B_retile[None, None, None, 0])
             mma_frag_C.fill(0)
             fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
+            if fx.const_expr(K // BLOCK_K >= 2):
+                fx.copy(
+                    buffer_copy_128b,
+                    thr_gB_k[None, None, None, 0],
+                    mma_frag_B_retile[None, None, None, 1],
+                    soffset=fx.Int32(1) * gB_k_stride,
+                )
             fx.gpu.barrier()
 
-            # Main K-loop (double-buffered over K // BLOCK_K tiles). K>=128 here.
-            for k_iter in range(0, K // BLOCK_K - 2, 2):
-                run_pipeline_stage(read_stage=0, next_k=k_iter + 1)
-                run_pipeline_stage(read_stage=1, next_k=k_iter + 2)
-            run_pipeline_stage(read_stage=0, next_k=K // BLOCK_K - 1)
-            run_pipeline_stage(read_stage=1, next_k=None, read_next=False)
+            # Main K-loop. A toggles 0/1 (mod 2); B rotates 0/1/2 (mod 3).
+            # At logical tile i: read B slot i%3, prefetch tile i+2 -> (i+2)%3.
+            n_tiles = K // BLOCK_K
+            for i in range(0, n_tiles - 1):
+                a_rs = i % 2
+                b_rs = i % 3
+                # A prefetch: tile i+1 (1-ahead). B prefetch: tile i+2 (2-ahead),
+                # only while i+2 is a valid tile.
+                b_has_next = (i + 2) < n_tiles
+                run_pipeline_stage(
+                    a_read_stage=a_rs,
+                    b_read_stage=b_rs,
+                    a_next_k=i + 1,
+                    b_next_k=i + 2,
+                    read_next_a=True,
+                    read_next_b=b_has_next,
+                )
+            # Final tile (i = n_tiles-1): no prefetch.
+            last = n_tiles - 1
+            run_pipeline_stage(
+                a_read_stage=last % 2,
+                b_read_stage=last % 3,
+                a_next_k=None,
+                b_next_k=None,
+                read_next_a=False,
+                read_next_b=False,
+            )
 
             # --- Epilogue: fp32 accumulators -> bf16, broadcast bias, masked store ---
             # O4 LDS C-shuffle: the MFMA accumulator layout is M-major per lane
@@ -481,11 +518,18 @@ def jagged_dense_bmm(
     CDNA4 16x16x32 bf16 atom; defaults to auto-detect (on gfx950, off gfx942)."""
     N = B.shape[0] // n_groups
     K = B.shape[1]
-    # Shape-dependent BLOCK_K: for small reduction K (<=256) a 2-iter K-loop with
-    # BLOCK_K=128 has fewer barriers and wins (~4% on K=256 shapes); for larger K
-    # the deeper BLOCK_K=64 pipeline keeps occupancy and is faster. (BLOCK_K=256
-    # is unsafe: the 2-stage double-buffer epilogue mis-accumulates a single tile.)
-    block_k = 128 if K <= 256 else BLOCK_K
+    # Shape-/arch-dependent BLOCK_K. On gfx942 (MI300X) BLOCK_K=64 for ALL reduction
+    # K: the smaller A double-buffer (BLOCK_M*BLOCK_K*STAGES_A*2 = 32KB at K<=256, vs
+    # 64KB for BLOCK_K=128) leaves headroom under gfx942's 64KB LDS ceiling, doubling
+    # occupancy: +11-19% on the D256 shapes (uniform B120 1.11x, B1024 1.14x; skew
+    # B120 1.19x), cos=1.0. On gfx950 (MI355X, 160KB LDS) the opposite holds: the
+    # larger LDS hides the occupancy cost, so BLOCK_K=128 for K<=256 wins ~4% (fewer
+    # K-loop barriers). (BLOCK_K=256 remains unsafe on both: the 2-stage double-buffer
+    # epilogue mis-accumulates a single tile.)
+    if _use_mfma_k32():
+        block_k = 128 if K <= 256 else BLOCK_K
+    else:
+        block_k = BLOCK_K
     # XCD remap defaults (see docstring). Remap ON only for uniform seqlens, where
     # every M-tile is occupied so chiplets stay balanced and the Dense[b] L2-reuse
     # win lands. Under SKEW the remap clusters a group's M-tiles onto one XCD and

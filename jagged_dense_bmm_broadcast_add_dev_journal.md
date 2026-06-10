@@ -185,3 +185,77 @@ Still genuinely open: which avenue ships to production (FlyDSL→CKTile recommen
   reuses ccache and does not fix it). Run env is the `jdbba-flydsl` container, aiter at
   `/workspaces/meta/aiter`. Next: re-tune per-shape gfx942 winners (BLOCK_K, tiles, XCD remap, warps)
   via the `/jdbba-autoresearch` loop.
+- **2026-06-10 (loop session)** — Ran the autoresearch loop on gfx942. **Bound check:** achieved
+  HBM BW is only 25-32% of MI300X peak (~5.3 TB/s) → kernel is **overhead/latency-bound**, not
+  HBM-bound, so amortization + occupancy levers have the headroom, not bandwidth tricks.
+  Levers tried (cold-L2 do_bench, both regimes, cos=1.0 gate):
+  - **#6 XCD remap (tier-A live-knob sweep, `tune_jdbba_xcd.py`)** → KEPT. Swept xcd_c×xcd_w;
+    per-shape winners beat the kernel auto-default by 0.9-2.6% (uniform only; skew has remap off).
+    Promoted to `by_arch.gfx942.winners`. Marginal size confirms the kernel is *not* L2/chiplet-bound.
+  - **BLOCK_K=64 for all K (was 128 for K≤256)** → KEPT, the session's big win. The K≤256→BLOCK_K=128
+    special case made A-staging LDS = 64KB, saturating gfx942's 64KB ceiling and halving occupancy.
+    BLOCK_K=64 → 32KB → doubles occupancy: **+11-19% on D256** (uniform B120 1.11×, B1024 1.14×;
+    skew B120 1.19×), cos=1.0. The old "128 wins ~4%" note was a **gfx950** result (bigger LDS hides
+    the occupancy cost). **This is the central gfx942 lesson: occupancy is the binding constraint.**
+  - **Tier-B grow-levers — all DISCARDED** (fan-out, 4 isolated worktrees): BLOCK_M=256 (crashes D256
+    at 128KB LDS, D512 −39% occupancy-killed at the 64KB ceiling), BLOCK_N=256 (cos=1.0 but −8-15%
+    uniform / up to −7.7× skew, 64KB C-tile collapses occupancy), STAGES_A=3 (crashes D256 on old
+    BLOCK_K=128; **re-tested clean on the new BLOCK_K=64 baseline → still −24-29%**, deeper pipeline
+    costs occupancy with no latency to hide on the 4-8-step K-loop), waves_per_eu={2,3,4} (parity at
+    best; wpe=3 spills 2.5× on B1024_D256). Every LDS-*growing* change loses; the only tile/pipeline
+    win was *shrinking* LDS (BLOCK_K=64). gfx942's 64KB LDS (2.5× smaller than gfx950) is the wall.
+  - **Standing vs Triton (uniform, post-levers):** D256 now ~1.28-1.29×, D512 ~1.28-1.31×. Skew
+    1.13-1.21×. The 2× target needs a *structural* amortization lever (#12 B-stationary multi-M-tile:
+    load Dense[b] once, run several M-tiles to keep the pipeline warm) — the remaining big idea, since
+    every knob-level lever is now exhausted or occupancy-capped.
+- **2026-06-10 (loop session, batch 2 + profiling + structural)** — Continued the loop.
+  - **Profiled B1024_D512 (rocprofv3 PMC):** OccupancyPercent=**23.5%**, MeanOccupancyPerActiveCU=1.93
+    waves, VALUBusy=17%, MFMA low, MemUnitStalled=**4%**, LDSBankConflict=2.3%. Verdict: the kernel
+    is **occupancy-limited with all execution units idle** — overhead/latency-bound, occupancy capped
+    by VGPR pressure (the C accumulator is BLOCK_M·BLOCK_N/THREADS = 64 fp32/thread). Device p10
+    (12.06ms) ≈ do_bench (12.24ms) → host launch overhead is negligible.
+  - **Skew regime gates re-derived for gfx942 (KEPT, +20%):** the persist-vs-static and skew-remap
+    gates were gfx950 decisions. Re-measured (`_regime_gates.py`, do_bench): the **persistent kernel
+    LOSES on every gfx942 skew shape** (B1024_D256: persist 1.045 > static-off 0.904 > remap-ON 0.857).
+    Gated persist to gfx95x only; routed B1024_D256 skew → static remap-ON (xcd_c=32). **B1024_D256
+    skew 1.051→0.873 (+20%), now 1.17× faster than Triton (was a tie).** Dispatch test passes.
+  - **Batch-2 fan-out (4 LDS-neutral levers) — all DISCARDED:** warp (2,2,1) (compile-fails — C-shuffle
+    epilogue hardcodes the (1,4,1) all-N split), warp (4,1,1) (cos=1.0 but −46-70%, all-M serializes
+    N-MFMA + kills store coalescing), A-staging global→reg (cos=1.0 but −50-78%: freeing 32KB LDS
+    doesn't help because per-thread A fragments then blow VGPR — VGPR is the real wall, the LDS A
+    buffer was load-balancing register pressure), THREADS=512 w/ (1,8,1) (cos=1.0 but +1-5% slower).
+  - **#12 B-stationary multi-M-tile (structural) — DISCARDED:** grid-shrink + inner unrolled M-tile loop,
+    correct everywhere (cos=1.0 both regimes incl. skew empty/partial), but −1-7% uniform / marginal
+    skew. The reframe it gave: **on uniform every M-tile is already occupied, so fewer/bigger blocks
+    LOWER pipeline fill instead of amortizing it — the kernel wants MORE concurrent blocks, not fewer.**
+    Only over-subscribed large-B skew showed a small win (B1024_D256 +6% @P=4), not worth a regime default.
+  - **BLOCK_N=64 (more blocks + less VGPR) — DISCARDED:** halves C-accumulator VGPR (64→32 fp32/thr)
+    AND doubles N-blocks, both the directions profiling + #12 pointed to, but −7-15% uniform: 2× more
+    N-blocks each pay a full LDS C-shuffle epilogue, and that fixed cost multiplies with block count.
+  - **Standing:** the C-shuffle epilogue fixed cost is the floor — it can't be amortized by *fewer*
+    blocks (#12: fill drops) nor by *more smaller* blocks (BLOCK_N=64: epilogue multiplies). The
+    genuine remaining structural idea is a **cheaper epilogue** (direct register→global store at small
+    N, skipping the LDS C-shuffle) so the per-block fixed cost itself shrinks — the next lever to try.
+- **2026-06-10 (loop session, batch 3 — the B-prefetch BREAKTHROUGH).** Profiling said latency-bound,
+  units idle → the win was hiding global-load latency, NOT amortizing fixed cost.
+  - **B-fragment prefetch decoupled to 2-ahead / 3-stage (KEPT, +5-8% ALL 8 shapes).** B (dense weight)
+    is register-staged (not LDS), so deepening its prefetch costs VGPR, not LDS — sidestepping the 64KB
+    wall entirely. A stays LDS 1-ahead/2-deep (mod 2); B now uses 3 register slots and prefetches 2
+    K-tiles ahead (read slot i%3, prefetch tile i+2→(i+2)%3). The crux: naive `stages=3` alone is a
+    no-op (the `^1` toggle never touches slot 2 → wasted VGPR, ~2% slower); the win needs the explicit
+    mod-3 rotation + 2-ahead prefetch + slot-1 prologue prime. Measured do_bench cold-L2, cos=1.0, stable
+    2 runs: uniform 0.509→0.473 / 1.468→1.352 / 4.236→4.042 / 12.24→11.33; skew similar. **This is the
+    latency-hiding the profile predicted.** B_STAGES=4 is within noise of 3 (D512 8 K-tiles: both ~11.15);
+    B_STAGES=5 regresses (VGPR pressure overtakes). B_STAGES=3 is the committed peak.
+  - **Batch-3 fan-out (4 occupancy/VGPR levers), 3 DISCARDED + the B-prefetch win:** A global→LDS direct
+    (blocked — gfx942 buffer_load→LDS is DWORD-only, the 32b atom breaks the 128b LDS swizzle the MFMA
+    s2r needs → cos 0.01), STAGES_A=1 (null — the 32KB epilogue C-tile is the binding LDS term, shrinking
+    the 16KB A buffer frees nothing), waves_per_eu=2 re-tested on the new baseline (flat/regress).
+  - **Also discarded:** epilogue barrier-removal (one barrier provably redundant, cos=1.0 ×3 skew runs,
+    but flat — the epilogue cost is the HBM C round-trip, not barrier latency; a direct coalesced store
+    is impossible because the MFMA fragment is M-major per lane), BLOCK_K=32 (compile-fail — the (4,4,2)
+    K-permute fragment layout assumes BLOCK_K=64).
+  - **Final standing vs Triton:** uniform D256 ~1.35×, D512 **~1.40-1.42×**; skew up to 1.32×. The
+    C-shuffle epilogue HBM round-trip is now the floor — not amortizable by fewer blocks (#12 lowers fill)
+    nor more smaller blocks (BLOCK_N=64 multiplies epilogues), and no direct coalesced store exists. 2×
+    would require a fundamentally cheaper epilogue or a different output data layout.
