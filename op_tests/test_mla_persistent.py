@@ -467,9 +467,6 @@ def torch_mla_extend_round_robin(
     if is_fp8_kvc:
         kvc_cache = kvc_cache.to(torch.float)
 
-    W = cp_world_size
-    r = cp_rank
-
     qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
     kvc = torch.index_select(kvc_cache, 0, kv_indices)
     kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
@@ -1942,7 +1939,6 @@ def test_mla_cp(
     qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     qo_indptr[1:] = torch.cumsum(seq_lens_qo, dim=0)
     total_q = int(qo_indptr[-1].item())
-    max_seqlen_qo = qlen
 
     kv_buffer = torch.randn(
         (num_page, page_size, 1, qk_head_dim), dtype=torch.bfloat16
