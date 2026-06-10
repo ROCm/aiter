@@ -236,3 +236,26 @@ Still genuinely open: which avenue ships to production (FlyDSL→CKTile recommen
     blocks (#12: fill drops) nor by *more smaller* blocks (BLOCK_N=64: epilogue multiplies). The
     genuine remaining structural idea is a **cheaper epilogue** (direct register→global store at small
     N, skipping the LDS C-shuffle) so the per-block fixed cost itself shrinks — the next lever to try.
+- **2026-06-10 (loop session, batch 3 — the B-prefetch BREAKTHROUGH).** Profiling said latency-bound,
+  units idle → the win was hiding global-load latency, NOT amortizing fixed cost.
+  - **B-fragment prefetch decoupled to 2-ahead / 3-stage (KEPT, +5-8% ALL 8 shapes).** B (dense weight)
+    is register-staged (not LDS), so deepening its prefetch costs VGPR, not LDS — sidestepping the 64KB
+    wall entirely. A stays LDS 1-ahead/2-deep (mod 2); B now uses 3 register slots and prefetches 2
+    K-tiles ahead (read slot i%3, prefetch tile i+2→(i+2)%3). The crux: naive `stages=3` alone is a
+    no-op (the `^1` toggle never touches slot 2 → wasted VGPR, ~2% slower); the win needs the explicit
+    mod-3 rotation + 2-ahead prefetch + slot-1 prologue prime. Measured do_bench cold-L2, cos=1.0, stable
+    2 runs: uniform 0.509→0.473 / 1.468→1.352 / 4.236→4.042 / 12.24→11.33; skew similar. **This is the
+    latency-hiding the profile predicted.** B_STAGES=4 is within noise of 3 (D512 8 K-tiles: both ~11.15);
+    B_STAGES=5 regresses (VGPR pressure overtakes). B_STAGES=3 is the committed peak.
+  - **Batch-3 fan-out (4 occupancy/VGPR levers), 3 DISCARDED + the B-prefetch win:** A global→LDS direct
+    (blocked — gfx942 buffer_load→LDS is DWORD-only, the 32b atom breaks the 128b LDS swizzle the MFMA
+    s2r needs → cos 0.01), STAGES_A=1 (null — the 32KB epilogue C-tile is the binding LDS term, shrinking
+    the 16KB A buffer frees nothing), waves_per_eu=2 re-tested on the new baseline (flat/regress).
+  - **Also discarded:** epilogue barrier-removal (one barrier provably redundant, cos=1.0 ×3 skew runs,
+    but flat — the epilogue cost is the HBM C round-trip, not barrier latency; a direct coalesced store
+    is impossible because the MFMA fragment is M-major per lane), BLOCK_K=32 (compile-fail — the (4,4,2)
+    K-permute fragment layout assumes BLOCK_K=64).
+  - **Final standing vs Triton:** uniform D256 ~1.35×, D512 **~1.40-1.42×**; skew up to 1.32×. The
+    C-shuffle epilogue HBM round-trip is now the floor — not amortizable by fewer blocks (#12 lowers fill)
+    nor more smaller blocks (BLOCK_N=64 multiplies epilogues), and no direct coalesced store exists. 2×
+    would require a fundamentally cheaper epilogue or a different output data layout.
