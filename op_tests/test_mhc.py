@@ -954,57 +954,56 @@ _mode_group.add_argument(
     help="Fuse RMSNorm into mhc_pre / mhc_post_pre HIP paths (mutually exclusive with --hc_head).",
 )
 
-if __name__ == "__main__":
-    args = parser.parse_args()
+args = parser.parse_args()
+
+df = []
+for dtype in args.dtype:
+    for hidden_size in args.hidden_size:
+        for m in args.m:
+            for hc_mult in [4]:
+                ret = test_mhc_pre(
+                    m=m,
+                    hidden_size=hidden_size,
+                    hc_mult=hc_mult,
+                    test_hc_head=args.hc_head,
+                    fuse_rmsnorm=args.fuse_rmsnorm,
+                )
+                df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
+
+if not args.hc_head:
+    df = []
+    for dtype in args.dtype:
+        for hidden_size in args.hidden_size:
+            for m in args.m:
+                for hc_mult in [4]:
+                    ret = test_mhc_post(
+                        m=m, hidden_size=hidden_size, hc_mult=hc_mult
+                    )
+                    df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
 
     df = []
     for dtype in args.dtype:
         for hidden_size in args.hidden_size:
             for m in args.m:
                 for hc_mult in [4]:
-                    ret = test_mhc_pre(
+                    ret = test_mhc_post_pre(
                         m=m,
                         hidden_size=hidden_size,
                         hc_mult=hc_mult,
-                        test_hc_head=args.hc_head,
                         fuse_rmsnorm=args.fuse_rmsnorm,
                     )
+                    if ret.get("skipped"):
+                        continue
                     df.append(ret)
-    df = pd.DataFrame(df)
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
-
-    if not args.hc_head:
-        df = []
-        for dtype in args.dtype:
-            for hidden_size in args.hidden_size:
-                for m in args.m:
-                    for hc_mult in [4]:
-                        ret = test_mhc_post(
-                            m=m, hidden_size=hidden_size, hc_mult=hc_mult
-                        )
-                        df.append(ret)
+    if df:
         df = pd.DataFrame(df)
         df_md = df.to_markdown(index=False)
-        aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
-
-        df = []
-        for dtype in args.dtype:
-            for hidden_size in args.hidden_size:
-                for m in args.m:
-                    for hc_mult in [4]:
-                        ret = test_mhc_post_pre(
-                            m=m,
-                            hidden_size=hidden_size,
-                            hc_mult=hc_mult,
-                            fuse_rmsnorm=args.fuse_rmsnorm,
-                        )
-                        if ret.get("skipped"):
-                            continue
-                        df.append(ret)
-        if df:
-            df = pd.DataFrame(df)
-            df_md = df.to_markdown(index=False)
-            aiter.logger.info("mhc_post_pre summary (markdown):\n%s", df_md)
-        else:
-            aiter.logger.info("mhc_post_pre: all cases skipped")
+        aiter.logger.info("mhc_post_pre summary (markdown):\n%s", df_md)
+    else:
+        aiter.logger.info("mhc_post_pre: all cases skipped")

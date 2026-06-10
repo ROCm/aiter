@@ -163,30 +163,29 @@ parser.add_argument(
     help="Fuse RMSNorm in large-M path",
 )
 
-if __name__ == "__main__":
-    args = parser.parse_args()
-    rows = []
-    for m in args.m:
-        for hidden_size in args.hidden_size:
-            torch.cuda.empty_cache()
-            gc.collect()
-            try:
-                ret = test_mhc_large_m_post_pre(
-                    m=m,
-                    hidden_size=hidden_size,
-                    fuse_rmsnorm=args.fuse_rmsnorm,
-                )
-            except torch.OutOfMemoryError as e:
-                aiter.logger.warning("OOM m=%s hidden_size=%s: %s", m, hidden_size, e)
-                continue
-            if ret.get("skipped"):
-                continue
-            rows.append(ret)
-            torch.cuda.empty_cache()
-            gc.collect()
+args = parser.parse_args()
+rows = []
+for m in args.m:
+    for hidden_size in args.hidden_size:
+        torch.cuda.empty_cache()
+        gc.collect()
+        try:
+            ret = test_mhc_large_m_post_pre(
+                m=m,
+                hidden_size=hidden_size,
+                fuse_rmsnorm=args.fuse_rmsnorm,
+            )
+        except torch.OutOfMemoryError as e:
+            aiter.logger.warning("OOM m=%s hidden_size=%s: %s", m, hidden_size, e)
+            continue
+        if ret.get("skipped"):
+            continue
+        rows.append(ret)
+        torch.cuda.empty_cache()
+        gc.collect()
 
-    if rows:
-        df = pd.DataFrame(rows)
-        aiter.logger.info("mhc_large_m summary:\n%s", df.to_markdown(index=False))
-    else:
-        aiter.logger.info("mhc_large_m: all cases skipped")
+if rows:
+    df = pd.DataFrame(rows)
+    aiter.logger.info("mhc_large_m summary:\n%s", df.to_markdown(index=False))
+else:
+    aiter.logger.info("mhc_large_m: all cases skipped")
