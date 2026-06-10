@@ -563,7 +563,6 @@ def _gemm_a16w16_compute_bound_kernel(
         # *previous* iteration so no ds_read stall before the matrix op.
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
-
         # Issue TDM for the tile that is (NUM_BUFFERS-1) steps ahead
         gl.amd.gfx1250.tdm.async_load(
             a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
@@ -694,9 +693,7 @@ def _gemm_a16w16_compute_bound_kernel(
         block_shape=(BLOCK_M, BLOCK_N),
         layout=SHARED_LAYOUT_C,
     )
-    gl.amd.gfx1250.tdm.async_store(
-        c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_buffer
-    )
+    gl.amd.gfx1250.tdm.async_store(c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_buffer)
     gl.amd.gfx1250.tdm.async_wait(0)
 
 

@@ -50,9 +50,7 @@ def gemm_a16w16_fake_tensor(
         cfg = deserialize_str(config) if config else _get_triton_config(M, N, K)[0]
         num_ksplit = cfg.get("NUM_KSPLIT", 1)
         if num_ksplit > 1:
-            return torch.empty(
-                (num_ksplit, M, N), dtype=torch.float32, device=x.device
-            )
+            return torch.empty((num_ksplit, M, N), dtype=torch.float32, device=x.device)
     if y is not None:
         return y
     return torch.empty((M, N), dtype=dtype, device=x.device)

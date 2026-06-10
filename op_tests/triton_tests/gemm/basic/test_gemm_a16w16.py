@@ -186,7 +186,9 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_typ
 
     torch_out = F.linear(x, w, bias=None)
 
-    triton_out = gemm_a16w16(x, w, None, out_dtype, y, backend=backend, kernel_type=kernel_type)
+    triton_out = gemm_a16w16(
+        x, w, None, out_dtype, y, backend=backend, kernel_type=kernel_type
+    )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
