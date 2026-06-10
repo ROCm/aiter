@@ -34,7 +34,8 @@ void reshape_and_cache_flash(torch::Tensor& key,
                              torch::Tensor& slot_mapping,
                              const std::string& kv_cache_dtype,
                              torch::Tensor& k_scale,
-                             torch::Tensor& v_scale);
+                             torch::Tensor& v_scale,
+                             int kv_layout = -1);
 
 void reshape_and_cache_with_pertoken_quant(torch::Tensor& key,
                                            torch::Tensor& value,

@@ -251,12 +251,13 @@ template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
 __global__ void reshape_and_cache_flash_kernel(
     const scalar_t* __restrict__ key,         // [num_tokens, num_heads, head_size]
     const scalar_t* __restrict__ value,       // [num_tokens, num_heads, head_size]
-    cache_t* __restrict__ key_cache,          // [num_blocks, block_size, num_heads,
-                                              // head_size]
-    cache_t* __restrict__ value_cache,        // [num_blocks, block_size, num_heads,
-                                              // head_size]
+    cache_t* __restrict__ key_cache,          // packed:      [num_blocks, block_size, num_heads, head_size]
+                                              // heads-first: [num_blocks, num_heads, block_size, head_size]
+    cache_t* __restrict__ value_cache,        // same as key_cache (must share strides)
     const int64_t* __restrict__ slot_mapping, // [num_tokens]
     const int block_stride,
+    const int cache_page_stride,
+    const int cache_head_stride,
     const int key_stride,
     const int value_stride,
     const int num_heads,
@@ -283,9 +284,10 @@ __global__ void reshape_and_cache_flash_kernel(
         const int64_t src_value_idx     = token_idx * value_stride + i;
         const int head_idx              = i / head_size;
         const int head_offset           = i % head_size;
-        const int64_t tgt_key_value_idx = block_idx * block_stride +
-                                          block_offset * num_heads * head_size +
-                                          head_idx * head_size + head_offset;
+        const int64_t tgt_key_value_idx = static_cast<int64_t>(block_idx) * block_stride +
+                                          static_cast<int64_t>(block_offset) * cache_page_stride +
+                                          static_cast<int64_t>(head_idx) * cache_head_stride +
+                                          head_offset;
         scalar_t tgt_key   = key[src_key_idx];
         scalar_t tgt_value = value[src_value_idx];
         if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
@@ -2673,6 +2675,8 @@ void reshape_and_cache(
                                      reinterpret_cast<CACHE_T*>(value_cache.data_ptr()), \
                                      slot_mapping.data_ptr<int64_t>(),                   \
                                      block_stride,                                       \
+                                     cache_page_stride,                                  \
+                                     cache_head_stride,                                  \
                                      key_stride,                                         \
                                      value_stride,                                       \
                                      num_heads,                                          \
@@ -2691,17 +2695,56 @@ void reshape_and_cache_flash(
     torch::Tensor& slot_mapping, // [num_tokens]
     const std::string& kv_cache_dtype,
     torch::Tensor& k_scale,
-    torch::Tensor& v_scale)
+    torch::Tensor& v_scale,
+    int kv_layout)
 {
     int num_tokens = key.size(0);
     int num_heads  = key.size(1);
     int head_size  = key.size(2);
-    int block_size = key_cache.size(1);
 
     int key_stride   = key.stride(0);
     int value_stride = value.stride(0);
     int block_stride = key_cache.stride(0);
     TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
+    TORCH_CHECK(kv_layout == -1 || kv_layout == 1 || kv_layout == 3,
+                "reshape_and_cache_flash only supports kv_layout -1/1 (linear [N,B,H,D]) "
+                "or 3 (linear_heads_first [N,H,B,D]), got ",
+                kv_layout);
+
+    const bool heads_first = kv_layout == 3;
+    int block_size;
+    int cache_page_stride;
+    int cache_head_stride;
+    if(heads_first)
+    {
+        TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4,
+                    "linear_heads_first cache must be 4D [num_blocks, num_heads, block_size, "
+                    "head_size]");
+        TORCH_CHECK(key_cache.size(1) == num_heads && value_cache.size(1) == num_heads,
+                    "linear_heads_first cache num_heads must match key/value num_heads");
+        TORCH_CHECK(key_cache.size(3) == head_size && value_cache.size(3) == head_size,
+                    "linear_heads_first cache head_size must match key/value head_size");
+        block_size        = key_cache.size(2);
+        cache_page_stride = key_cache.stride(2);
+        cache_head_stride = key_cache.stride(1);
+    }
+    else
+    {
+        TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4,
+                    "linear cache must be 4D [num_blocks, block_size, num_heads, head_size]");
+        TORCH_CHECK(key_cache.size(2) == num_heads && value_cache.size(2) == num_heads,
+                    "linear cache num_heads must match key/value num_heads");
+        TORCH_CHECK(key_cache.size(3) == head_size && value_cache.size(3) == head_size,
+                    "linear cache head_size must match key/value head_size");
+        block_size        = key_cache.size(1);
+        cache_page_stride = key_cache.stride(1);
+        cache_head_stride = key_cache.stride(2);
+    }
+    TORCH_CHECK(key_cache.stride(3) == 1 && value_cache.stride(3) == 1,
+                "reshape_and_cache_flash requires cache head_dim to be contiguous");
+    TORCH_CHECK(key_cache.stride(1) == value_cache.stride(1) &&
+                    key_cache.stride(2) == value_cache.stride(2),
+                "key_cache and value_cache must share page/head strides");
 
     dim3 grid(num_tokens);
     dim3 block(std::min(num_heads * head_size, 512));

@@ -210,6 +210,62 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
 
         stride_v = 1;
     }
+    else if(kv_memory_layout ==
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT)
+    {
+        // Cross-layer 5D KV cache, per-layer non-contiguous view.
+        // K/V layout: [NumBlocks, NumHeads, PageSize, HeadDim]
+        // The per-head and per-block strides encode the cross-layer factor, so
+        // packed LINEAR_LAYOUT invariants do not apply here. Only require
+        // innermost contiguity and 16B alignment of multi-stride dimensions.
+        TORCH_CHECK(k.dim() == 4,
+                    "Cross-layer linear-heads-first K must be 4D [NumBlocks, NumHeads, "
+                    "PageSize, HeadDim]");
+        TORCH_CHECK(v.dim() == 4,
+                    "Cross-layer linear-heads-first V must be 4D [NumBlocks, NumHeads, "
+                    "PageSize, HeadDim]");
+
+        stride_k = k.stride(2);
+        stride_v = v.stride(2);
+
+        const int64_t k_stride_batch = k.stride(0);
+        const int64_t k_stride_head  = k.stride(1);
+        const int64_t k_stride_page  = k.stride(2);
+        const int64_t k_stride_dim   = k.stride(3);
+
+        TORCH_CHECK(k_stride_dim == 1,
+                    "K last dim must be contiguous in LINEAR_HEADS_FIRST_LAYOUT");
+        TORCH_CHECK(k_stride_page == static_cast<int64_t>(d),
+                    "K page (PageSize) stride must equal head_size in "
+                    "LINEAR_HEADS_FIRST_LAYOUT");
+        TORCH_CHECK(k_stride_head % k_vector_size == 0,
+                    "K head stride (nhead_stride_k) must be a multiple of ",
+                    k_vector_size,
+                    " in LINEAR_HEADS_FIRST_LAYOUT; required for 16B vectorized loads");
+        TORCH_CHECK(k_stride_batch % k_vector_size == 0,
+                    "K batch stride (batch_stride_k) must be a multiple of ",
+                    k_vector_size,
+                    " in LINEAR_HEADS_FIRST_LAYOUT; required for 16B vectorized loads");
+
+        const int64_t v_stride_batch = v.stride(0);
+        const int64_t v_stride_head  = v.stride(1);
+        const int64_t v_stride_page  = v.stride(2);
+        const int64_t v_stride_dim   = v.stride(3);
+
+        TORCH_CHECK(v_stride_dim == 1,
+                    "V last dim must be contiguous in LINEAR_HEADS_FIRST_LAYOUT");
+        TORCH_CHECK(v_stride_page == static_cast<int64_t>(d_v),
+                    "V page (PageSize) stride must equal head_size in "
+                    "LINEAR_HEADS_FIRST_LAYOUT");
+        TORCH_CHECK(v_stride_head % k_vector_size == 0,
+                    "V head stride (nhead_stride_v) must be a multiple of ",
+                    k_vector_size,
+                    " in LINEAR_HEADS_FIRST_LAYOUT; required for 16B vectorized loads");
+        TORCH_CHECK(v_stride_batch % k_vector_size == 0,
+                    "V batch stride (batch_stride_v) must be a multiple of ",
+                    k_vector_size,
+                    " in LINEAR_HEADS_FIRST_LAYOUT; required for 16B vectorized loads");
+    }
     else
     {
         if(k.dim() == 4)
@@ -311,10 +367,14 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
         kv_memory_layout == ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT;
     const bool is_vec_k_col_v_layout =
         kv_memory_layout == ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VEC_K_COL_V_LAYOUT;
-    // Vectorized / VEC_K_COL_V: K head dim at index 1. Linear: head dim at index 2 (4D) or 1 (3D).
+    const bool is_heads_first_layout =
+        kv_memory_layout ==
+        ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT;
+    // Vectorized / VEC_K_COL_V / LINEAR_HEADS_FIRST: K head dim at index 1.
+    // Linear: head dim at index 2 (4D) or 1 (3D).
     ck_tile::index_t nhead_stride_k;
     ck_tile::index_t nhead_stride_v;
-    if(is_vectorized_layout || is_vec_k_col_v_layout)
+    if(is_vectorized_layout || is_vec_k_col_v_layout || is_heads_first_layout)
     {
         nhead_stride_k = k.stride(1);
         nhead_stride_v = v.stride(1);
@@ -588,7 +648,8 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                   std::optional<at::Generator> gen_,
                   // PER_TOKEN_HEAD optional per-q-head P scale (see header).
                   std::optional<const at::Tensor> p_scale,
-                  std::optional<const at::Tensor> p_scale_inv
+                  std::optional<const at::Tensor> p_scale_inv,
+                  int kv_layout
                 )
 {
     auto q_dtype = q.scalar_type();
@@ -690,7 +751,37 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     int head_size_v     = 0;
     int num_blocks      = 0;
 
-    if(k.dim() == 5 && v.dim() == 5)
+    const bool detect_auto               = kv_layout < 0;
+    const bool detect_vectorized         = kv_layout == 0;
+    const bool detect_linear             = kv_layout == 1;
+    const bool detect_vec_k_col_v        = kv_layout == 2;
+    const bool detect_linear_heads_first = kv_layout == 3;
+
+    TORCH_CHECK(detect_auto || detect_vectorized || detect_linear || detect_vec_k_col_v ||
+                    detect_linear_heads_first,
+                "kv_layout must be -1 (auto), 0 (vectorized), 1 (linear), 2 "
+                "(vec_k_col_v), or 3 (linear_heads_first), got ",
+                kv_layout);
+
+    if(detect_linear_heads_first)
+    {
+        kv_memory_layout =
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT;
+        TORCH_CHECK(k.dim() == 4,
+                    "LINEAR_HEADS_FIRST_LAYOUT requires 4D K [NumBlocks, NumHeads, "
+                    "PageSize, HeadDim], got dim ",
+                    k.dim());
+        TORCH_CHECK(v.dim() == 4,
+                    "LINEAR_HEADS_FIRST_LAYOUT requires 4D V [NumBlocks, NumHeads, "
+                    "PageSize, HeadDim], got dim ",
+                    v.dim());
+
+        num_blocks      = k.size(0);
+        num_heads_k     = k.size(1);
+        page_block_size = k.size(2);
+        head_size_v     = v.size(3);
+    }
+    else if((detect_auto || detect_vectorized) && k.dim() == 5 && v.dim() == 5)
     {
         kv_memory_layout = ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT;
 
@@ -705,7 +796,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
         head_size_v = v.size(3);
         num_blocks  = k.size(0);
     }
-    else if(k.dim() == 5 && v.dim() == 4)
+    else if((detect_auto || detect_vec_k_col_v) && k.dim() == 5 && v.dim() == 4)
     {
         // Decode-aligned VEC_K_COL_V_LAYOUT: K is 5D vectorized (same as VECTORIZED_LAYOUT)
         // and V is 4D ColumnMajor [NumBlocks, NumHeads, HeadDim, PageSize] — produced by
@@ -731,7 +822,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
         head_size_v = v.size(2);
         num_blocks  = k.size(0);
     }
-    else if(k.dim() == 4)
+    else if((detect_auto || detect_linear) && k.dim() == 4)
     {
         kv_memory_layout = ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT;
         TORCH_CHECK(v.dim() == 4,
@@ -743,7 +834,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
         head_size_v     = v.size(3);
         num_blocks      = k.size(0);
     }
-    else if(k.dim() == 3)
+    else if((detect_auto || detect_linear) && k.dim() == 3)
     {
         kv_memory_layout = ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT;
         TORCH_CHECK(v.dim() == 3, "V tensor must be 3D [NumBlocks, NumHeads, HeadDim]");
@@ -757,8 +848,9 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     else
     {
         TORCH_CHECK(false,
-                    "K tensor must be 5D (vectorized), 4D (linear), or 3D (linear, page_size=1) "
-                    "for batch prefill");
+                    "K/V tensors must match kv_layout: 5D/5D vectorized, 5D/4D vec_k_col_v, "
+                    "4D [N,B,H,D] linear, 4D [N,H,B,D] linear_heads_first, or 3D "
+                    "linear page_size=1 for batch prefill");
     }
 
 
@@ -851,6 +943,13 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                     page_block_size,
                     k_vector_size);
         CHECK_SHAPE(v, num_blocks, num_heads_k, head_size_v, page_block_size);
+    }
+    else if(kv_memory_layout ==
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT)
+    {
+        // K/V: [NumBlocks, NumHeads, PageSize, HeadDim] (cross-layer 5D view)
+        CHECK_SHAPE(k, num_blocks, num_heads_k, page_block_size, head_size_q);
+        CHECK_SHAPE(v, num_blocks, num_heads_k, page_block_size, head_size_v);
     }
     else
     {
