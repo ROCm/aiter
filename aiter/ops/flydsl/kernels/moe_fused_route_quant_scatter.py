@@ -96,15 +96,16 @@ LANES_PER_MX_BLOCK = 32 // ELEMS_PER_LANE  # 16 lanes cover one 32-element MX bl
 # portable path as gfx942 (matches ``silu_and_mul_fq``).
 _NATIVE_SCALED_CVT_ARCHS = ("gfx950",)
 
-# gfx1250 has no ``v_cvt_scalef32_pk_fp4_f32`` (the 2-element pk form, gfx950-only)
-# but it *does* have the 8-element ``v_cvt_scalef32_pk8_fp4_bf16``: 8 bf16 ->
-# i32 (8 fp4 nibbles), dividing by the e8m0 exponent carried in the f32 scale.
-# We emit it via inline asm so it does not depend on the MLIR rocdl op lowering.
-_PK8_FP4_BF16_ARCHS = ("gfx1250",)
+# gfx1250 has no 2-element ``v_cvt_scalef32_pk_{fp4,fp8}_f32`` (gfx950-only) but it
+# *does* have the 8-element ``v_cvt_scalef32_pk8_{fp4,fp8}_bf16``: 8 bf16 -> packed
+# fp4 (i32, 8 nibbles) / fp8 (v2i32, 8 e4m3 bytes), dividing by the e8m0 exponent
+# carried in the f32 scale. We emit them via inline asm so they do not depend on
+# the MLIR rocdl op lowering.
+_PK8_BF16_ARCHS = ("gfx1250",)
 
 
-def _arch_has_pk8_fp4(arch: str) -> bool:
-    return arch.startswith(_PK8_FP4_BF16_ARCHS)
+def _arch_has_pk8(arch: str) -> bool:
+    return arch.startswith(_PK8_BF16_ARCHS)
 
 
 def _cvt_scalef32_pk8_fp4_bf16(src_v8bf16, scale_f32, *, i32_ty):
@@ -118,6 +119,21 @@ def _cvt_scalef32_pk8_fp4_bf16(src_v8bf16, scale_f32, *, i32_ty):
         i32_ty,
         [_raw(src_v8bf16), _raw(scale_f32)],
         "v_cvt_scalef32_pk8_fp4_bf16 $0, $1, $2",
+        "=v,v,v",
+        has_side_effects=False,
+    )
+
+
+def _cvt_scalef32_pk8_fp8_bf16(src_v8bf16, scale_f32, *, v2i32_ty):
+    """Native gfx1250 scaled 8x bf16 -> packed fp8 e4m3 (v2i32, 8 bytes).
+
+    Same scale contract as the fp4 form; the HW divides each input by the f32
+    scale's exponent and RNE-packs 8 fp8 e4m3 bytes into a 2xi32 vector.
+    """
+    return llvm.inline_asm(
+        v2i32_ty,
+        [_raw(src_v8bf16), _raw(scale_f32)],
+        "v_cvt_scalef32_pk8_fp8_bf16 $0, $1, $2",
         "=v,v,v",
         has_side_effects=False,
     )
@@ -152,10 +168,11 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
     is_fp8 = quant_mode == "fp8"
     arch = str(get_rocm_arch())
     use_native = _arch_has_native_scaled_cvt(arch)
-    # gfx1250 fp4: native 8-wide pk8 convert -> 8 elems/lane (4 lanes per 32-elem
-    # MX block) instead of the 2 elems/lane (16 lanes) the SW/pk2 paths use.
-    use_pk8_fp4 = (not is_fp8) and _arch_has_pk8_fp4(arch)
-    elems_per_lane = 8 if use_pk8_fp4 else ELEMS_PER_LANE
+    # gfx1250: native 8-wide pk8 convert for both fp4 and fp8 -> 8 elems/lane
+    # (4 lanes per 32-elem MX block) instead of the 2 elems/lane (16 lanes) the
+    # SW/pk2 paths use.
+    use_pk8 = _arch_has_pk8(arch)
+    elems_per_lane = 8 if use_pk8 else ELEMS_PER_LANE
     lanes_per_mx_block = 32 // elems_per_lane
 
     if is_fp8:
@@ -194,12 +211,12 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
         amax_shuffle_dists.append(dist)
         dist *= 2
 
-    native_tag = "pk8" if use_pk8_fp4 else ("nat" if use_native else "sw")
+    native_tag = "pk8" if use_pk8 else ("nat" if use_native else "sw")
     return SimpleNamespace(
         is_fp8=is_fp8,
         arch=arch,
         use_native=use_native,
-        use_pk8_fp4=use_pk8_fp4,
+        use_pk8=use_pk8,
         elems_per_lane=elems_per_lane,
         lanes_per_mx_block=lanes_per_mx_block,
         mx_dtype=mx_dtype,
@@ -243,8 +260,8 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
         )
         _if_block = scf.IfOp(block_in_range)
         with ir.InsertionPoint(_if_block.then_block):
-            if const_expr(c.use_pk8_fp4):
-                # gfx1250 native fp4: 8 contiguous bf16 cols this lane.
+            if const_expr(c.use_pk8):
+                # gfx1250 native pk8: 8 contiguous bf16 cols this lane.
                 # col_base = mx_block*32 + lane_in_block*8.
                 col_base = (
                     mx_block * arith.constant(32, type=i32)
@@ -279,11 +296,16 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                     block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype
                 )
                 # scale 2^(e8m0-127); the HW divides each input by its exponent
-                # and RNE-packs 8 fp4 nibbles into one i32.
+                # and RNE-packs the 8 outputs (fp4: i32 / fp8: v2i32).
                 block_scale_f32 = (ArithValue(e8m0_scale) << c.c23_i32).bitcast(f32)
-                payload_val = _cvt_scalef32_pk8_fp4_bf16(
-                    bf16x8, block_scale_f32, i32_ty=i32
-                )  # i32 = 4 fp4x2 bytes
+                if const_expr(c.is_fp8):
+                    payload_val = _cvt_scalef32_pk8_fp8_bf16(
+                        bf16x8, block_scale_f32, v2i32_ty=T.vec(2, i32)
+                    )  # v2i32 = 8 fp8 e4m3 bytes
+                else:
+                    payload_val = _cvt_scalef32_pk8_fp4_bf16(
+                        bf16x8, block_scale_f32, i32_ty=i32
+                    )  # i32 = 4 fp4x2 bytes
             else:
                 # two contiguous bf16 columns: col_base = mx_block*32 + lane_in_block*2
                 col_base = (
@@ -424,7 +446,7 @@ def build_moe_fused_route_quant_scatter_module(
     L = _quant_layout(model_dim, quant_mode, wmma_rep)
     is_fp8 = L.is_fp8
     use_native = L.use_native
-    use_pk8_fp4 = L.use_pk8_fp4
+    use_pk8 = L.use_pk8
     elems_per_lane = L.elems_per_lane
     lanes_per_mx_block = L.lanes_per_mx_block
     mx_dtype = L.mx_dtype
@@ -574,7 +596,7 @@ def build_moe_fused_route_quant_scatter_module(
                 amax_shuffle_dists=amax_shuffle_dists,
                 is_fp8=is_fp8,
                 use_native=use_native,
-                use_pk8_fp4=use_pk8_fp4,
+                use_pk8=use_pk8,
                 mx_dtype=mx_dtype,
                 c0_i32=c0_i32,
                 c1_i32=c1_i32,
@@ -677,7 +699,7 @@ def build_moe_fused_quant_preshuffle_module(
     # would hash to the same key and silently share one binary.
     is_fp8 = L.is_fp8
     use_native = L.use_native
-    use_pk8_fp4 = L.use_pk8_fp4
+    use_pk8 = L.use_pk8
     elems_per_lane = L.elems_per_lane
     lanes_per_mx_block = L.lanes_per_mx_block
     mx_dtype = L.mx_dtype
@@ -781,7 +803,7 @@ def build_moe_fused_quant_preshuffle_module(
                 amax_shuffle_dists=amax_shuffle_dists,
                 is_fp8=is_fp8,
                 use_native=use_native,
-                use_pk8_fp4=use_pk8_fp4,
+                use_pk8=use_pk8,
                 mx_dtype=mx_dtype,
                 c0_i32=c0_i32,
                 c1_i32=c1_i32,
