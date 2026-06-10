@@ -88,6 +88,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     quant_type: Any = "per_token",
     group_size: int = 128,
     emit_bf16: bool = False,
+    transpose_scale: bool = False,
 ):
     """Fused tensor-parallel all-reduce + RMSNorm + quantization.
 
@@ -95,6 +96,10 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     ``"per_token"`` for existing FP8 per-token quantization,
     ``"per_group"`` / ``"per_1x128"`` for FP8 per-group quantization, and
     ``"mxfp4"`` / ``"per_1x32"`` for MXFP4 quantization.
+
+    ``transpose_scale`` (per-group only) writes the per-group scale in
+    column-major layout ``(num_groups, M)`` viewed as ``(M, num_groups)``,
+    matching what ``gemm_a8w8_blockscale_preshuffle`` expects.
     """
     _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm_quant")
     return get_tp_group().fused_allreduce_rmsnorm_quant(
@@ -106,6 +111,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         quant_type=quant_type,
         group_size=group_size,
         emit_bf16=emit_bf16,
+        transpose_scale=transpose_scale,
     )
 
 
@@ -117,6 +123,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     group_size: int = 128,
     prefill_support: bool = False,
     emit_bf16: bool = False,
+    transpose_scale: bool = False,
 ):
     return tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         input_,
@@ -127,6 +134,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
         quant_type="per_group",
         group_size=group_size,
         emit_bf16=emit_bf16,
+        transpose_scale=transpose_scale,
     )
 
 

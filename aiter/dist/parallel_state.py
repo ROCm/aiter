@@ -499,6 +499,7 @@ class GroupCoordinator:
         quant_type: Any = "per_token",
         group_size: int = 128,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         if quant_type == "per_token" and group_size == 128 and not emit_bf16:
             return fused_allreduce_rmsnorm_quant_(
@@ -520,6 +521,7 @@ class GroupCoordinator:
             quant_type=quant_type,
             group_size=group_size,
             emit_bf16=emit_bf16,
+            transpose_scale=transpose_scale,
         )
 
     def fused_allreduce_rmsnorm_quant_per_group(
@@ -531,6 +533,7 @@ class GroupCoordinator:
         group_size: int = 128,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         return self.fused_allreduce_rmsnorm_quant(
             input_,
@@ -541,6 +544,7 @@ class GroupCoordinator:
             quant_type="per_group",
             group_size=group_size,
             emit_bf16=emit_bf16,
+            transpose_scale=transpose_scale,
         )
 
     def fused_qknorm_allreduce(

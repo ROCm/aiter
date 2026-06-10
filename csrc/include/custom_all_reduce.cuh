@@ -1660,7 +1660,15 @@ __device__ __forceinline__ void ar_fusion_epilogue(A& in,
 // Per-group FP8 quantization epilogue.
 // group_size is in elements (e.g. 128). Each group of group_size/PACK_SIZE
 // consecutive threads computes its own abs-max and scale independently.
-// scale_out layout: (M, hidden_dim / group_size), row-major.
+// scale_out layout:
+//   transpose_scale == false: (M, hidden_dim / group_size), row-major
+//                             scale_out[tidx * num_groups + group_id]
+//   transpose_scale == true : (hidden_dim / group_size, M) column-major,
+//                             i.e. (num_groups, M) stored row-major then viewed
+//                             as (M, num_groups) by the consumer; needs the
+//                             total token count `m` to stride between groups:
+//                             scale_out[group_id * m + tidx]
+// The column-major layout matches what gemm_a8w8_blockscale_preshuffle expects.
 template <typename P, typename A, typename T, typename OutT, int PACK_SIZE>
 __device__ __forceinline__ void ar_fusion_epilogue_per_group(
     A& in,
@@ -1673,8 +1681,10 @@ __device__ __forceinline__ void ar_fusion_epilogue_per_group(
     int group_size,
     OutT* __restrict__ output,
     float* __restrict__ scale_out,
-    bool active = true,
-    T* __restrict__ bf16_output = nullptr)
+    bool active            = true,
+    T* __restrict__ bf16_output = nullptr,
+    int m                  = 0,
+    bool transpose_scale   = false)
 {
     static_assert(!std::is_same_v<T, OutT>, "per-group quant requires FP8 output");
     float FP8_UPBOUND = opus::cast<opus::fp32_t>(opus::numeric_limits<opus::fp8_t>::max());
@@ -1731,7 +1741,8 @@ __device__ __forceinline__ void ar_fusion_epilogue_per_group(
 
     // Write per-group scale: one float per group per token
     if(lane_in_group == 0 && active)
-        scale_out[tidx * num_groups + group_id] = scale;
+        scale_out[transpose_scale ? (group_id * m + tidx)
+                                  : (tidx * num_groups + group_id)] = scale;
 }
 
 template <typename T, typename OutT, int ngpus>
@@ -1860,13 +1871,15 @@ __global__ void __launch_bounds__(1024, 1)
                                              int hidden_dim,
                                              int group_size,
                                              float eps,
-                                             T* __restrict__ bf16_output = nullptr)
+                                             T* __restrict__ bf16_output = nullptr,
+                                             bool transpose_scale = false)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
     bool active             = (int)threadIdx.x < block_size;
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int m                   = size / hidden_dim;
     int tidx                = blockIdx.x;
     int access_id_in_token  = threadIdx.x * pack_size;
     int idx                 = tidx * hidden_dim + access_id_in_token;
@@ -1918,7 +1931,7 @@ __global__ void __launch_bounds__(1024, 1)
     int padded_block_size = (int)blockDim.x;
     ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size>(
         acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
-        group_size, output, scale_out, active, bf16_output);
+        group_size, output, scale_out, active, bf16_output, m, transpose_scale);
 }
 
 template <typename T, typename OutT, int NGPUS>
@@ -1926,7 +1939,8 @@ void allreduce_fusion_kernel_1stage_per_group_launcher(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
     T* residual_inp, T* residual_out, OutT* output, T* weight,
     float* scale_out, int size, int hidden_dim, int group_size,
-    float eps, hipStream_t stream, T* bf16_output = nullptr)
+    float eps, hipStream_t stream, T* bf16_output = nullptr,
+    bool transpose_scale = false)
 {
     auto pack_size  = 16 / sizeof(T);
     int block_size  = hidden_dim / pack_size;
@@ -1939,7 +1953,7 @@ void allreduce_fusion_kernel_1stage_per_group_launcher(
                                      residual_inp, residual_out,
                                      output, weight, scale_out,
                                      size, hidden_dim, group_size, eps,
-                                     bf16_output);
+                                     bf16_output, transpose_scale);
 }
 
 template <typename T, int ngpus>
@@ -2566,11 +2580,13 @@ __global__ void __launch_bounds__(1024, 1)
                                              int hidden_dim,
                                              int group_size,
                                              float eps,
-                                             T* __restrict__ bf16_output = nullptr)
+                                             T* __restrict__ bf16_output = nullptr,
+                                             bool transpose_scale = false)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
     int tnum_gpu            = block_size / ngpus;
+    int m                   = size / hidden_dim;
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
     extern __shared__ char smem_buf[];
@@ -2634,7 +2650,8 @@ __global__ void __launch_bounds__(1024, 1)
             acc[v] = upcast_s(vec[v]);
         ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size>(
             acc, weight_p, hidden_dim, eps, idx, tidx, block_size,
-            group_size, output, scale_out, /*active=*/true, bf16_output);
+            group_size, output, scale_out, /*active=*/true, bf16_output,
+            m, transpose_scale);
     }
 }
 
@@ -2643,7 +2660,8 @@ void allreduce_fusion_kernel_2stage_per_group_launcher(
     RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
     T* residual_inp, T* residual_out, OutT* output, T* weight,
     float* scale_out, int size, int hidden_dim, int group_size,
-    float eps, hipStream_t stream, T* bf16_output = nullptr)
+    float eps, hipStream_t stream, T* bf16_output = nullptr,
+    bool transpose_scale = false)
 {
     constexpr int PACK_SIZE = 16 / sizeof(T);
     int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
@@ -2656,7 +2674,7 @@ void allreduce_fusion_kernel_2stage_per_group_launcher(
         <<<numBlocks, threadsPerBlock, smem_size, stream>>>(
             _dp, sg, self_sg, rank,
             residual_inp, residual_out, output, weight, scale_out,
-            size, hidden_dim, group_size, eps, bf16_output);
+            size, hidden_dim, group_size, eps, bf16_output, transpose_scale);
 }
 
 template <typename T, typename OutT>
@@ -2715,10 +2733,12 @@ __global__ void __launch_bounds__(1024, 1)
                                                     int hidden_dim,
                                                     int group_size,
                                                     float eps,
-                                                    T* __restrict__ bf16_output = nullptr)
+                                                    T* __restrict__ bf16_output = nullptr,
+                                                    bool transpose_scale = false)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
+    int m                   = size / hidden_dim;
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
     P* tmps                 = get_tmp_buf<P>(sg.signals[rank]);
@@ -2739,7 +2759,8 @@ __global__ void __launch_bounds__(1024, 1)
             acc[v] = upcast_s(vec[v]);
         ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size>(
             acc, weight_p, hidden_dim, eps, idx, tidx, block_size,
-            group_size, output, scale_out, /*active=*/true, bf16_output);
+            group_size, output, scale_out, /*active=*/true, bf16_output,
+            m, transpose_scale);
     }
 }
 
@@ -2758,7 +2779,8 @@ void allreduce_fusion_kernel_split_per_group_launcher(RankData* _dp,
                                                       int group_size,
                                                       float eps,
                                                       hipStream_t stream,
-                                                      T* bf16_output = nullptr)
+                                                      T* bf16_output = nullptr,
+                                                      bool transpose_scale = false)
 {
     // step 1: reduce-scatter + allgather cross device store (same as per-token)
     dim3 block(512);
@@ -2791,7 +2813,7 @@ void allreduce_fusion_kernel_split_per_group_launcher(RankData* _dp,
     local_device_load_rmsnorm_quant_per_group_naive<T, OutT>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(
             sg, rank, residual_inp, residual_out, output, weight, scale_out,
-            size, hidden_dim, group_size, eps, bf16_output);
+            size, hidden_dim, group_size, eps, bf16_output, transpose_scale);
 }
 
 template <typename T, typename OutT, int NGPUS>
@@ -3893,7 +3915,8 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
                                                 int n,
                                                 int group_size,
                                                 bool use_1stage,
-                                                T* bf16_output = nullptr)
+                                                T* bf16_output = nullptr,
+                                                bool transpose_scale = false)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -3970,7 +3993,7 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
         allreduce_fusion_kernel_1stage_per_group_launcher<T, QT, NGPUS>(                   \
             ptrs, sg_, self_sg_, rank_,                                                     \
             residual_inp, residual_out, output, weight, scale_out,                          \
-            size, n, group_size, eps, stream, bf16_output);                                 \
+            size, n, group_size, eps, stream, bf16_output, transpose_scale);               \
         return;                                                                             \
     }                                                                                      \
     else if(n_constrain && (size * sizeof(T) <= 512 * 1024))                               \
@@ -3978,7 +4001,7 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
         allreduce_fusion_kernel_2stage_per_group_launcher<T, QT, NGPUS>(                   \
             ptrs, sg_, self_sg_, rank_,                                                     \
             residual_inp, residual_out, output, weight, scale_out,                          \
-            size, n, group_size, eps, stream, bf16_output);                                 \
+            size, n, group_size, eps, stream, bf16_output, transpose_scale);               \
         return;                                                                             \
     }                                                                                      \
     else if(n_constrain)                                                                   \
@@ -3986,7 +4009,7 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
         allreduce_fusion_kernel_split_per_group_launcher<T, QT, NGPUS>(                    \
             ptrs, sg_, self_sg_, rank_,                                                     \
             residual_inp, residual_out, output, weight, scale_out,                          \
-            size, n, group_size, eps, stream, bf16_output);                                 \
+            size, n, group_size, eps, stream, bf16_output, transpose_scale);               \
         return;                                                                             \
     }                                                                                      \
     else                                                                                   \

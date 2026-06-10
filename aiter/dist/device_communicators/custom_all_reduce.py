@@ -136,9 +136,7 @@ def _validate_mxfp4_hidden_dim(n: int, element_size: int) -> None:
             f"(bf16/fp16: 2), got element_size={element_size}"
         )
     if n <= 0:
-        raise ValueError(
-            f"MXFP4 fused quant requires hidden_dim n > 0, got n={n}"
-        )
+        raise ValueError(f"MXFP4 fused quant requires hidden_dim n > 0, got n={n}")
     pack_size = 16 // element_size
     if n % 32 != 0:
         raise ValueError(f"MXFP4 fused quant requires n divisible by 32, got n={n}")
@@ -762,7 +760,9 @@ class CustomAllreduce:
         if not post_per_token_quant:
             if out is None:
                 out_dim = out_hidden_dim or inp.shape[-1]
-                out = torch.empty(inp.shape[:-1] + (out_dim,), dtype=inp.dtype, device=inp.device)
+                out = torch.empty(
+                    inp.shape[:-1] + (out_dim,), dtype=inp.dtype, device=inp.device
+                )
             assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
             if inp.shape[-1] == valid_dim and out.shape[-1] == inp.shape[-1]:
                 ops.fused_allreduce_rmsnorm(
@@ -962,6 +962,7 @@ class CustomAllreduce:
         registered: bool = False,
         use_1stage: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         K = inp.shape[-1]
         # Fail fast on bad ``group_size`` at the Python boundary. Mirrors
@@ -973,9 +974,26 @@ class CustomAllreduce:
         res_out = torch.empty_like(inp)
         num_groups = K // group_size
         out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
-        scale_out = torch.empty(
-            inp.shape[:-1] + (num_groups,), dtype=torch.float32, device=inp.device
-        )
+        if transpose_scale:
+            # Column-major scale: the kernel writes scale[group_id * M + tidx],
+            # i.e. it treats the buffer as (num_groups, M) row-major. Expose it
+            # to the consumer as a logical (M, num_groups) tensor via transpose
+            # (NOT view -- view would keep row-major stride and scatter the
+            # values). transpose(0, 1) yields the column-major stride (1, M)
+            # the preshuffle GEMM expects. Requires a 2D (M, K) input; the
+            # per-group fused path is always 2D in practice.
+            assert inp.dim() == 2, (
+                "transpose_scale per-group quant requires a 2D (M, K) input, "
+                f"got shape {tuple(inp.shape)}"
+            )
+            M = inp.shape[0]
+            scale_out = torch.empty(
+                (num_groups, M), dtype=torch.float32, device=inp.device
+            ).transpose(0, 1)
+        else:
+            scale_out = torch.empty(
+                inp.shape[:-1] + (num_groups,), dtype=torch.float32, device=inp.device
+            )
         # Optional bf16/fp16 mirror of the pre-quantization normed output.
         # Requested by GDN-style layers that also need an unquantized view
         # (e.g. Qwen3.5 in_proj_ba). Zero-overhead when not requested
@@ -1001,6 +1019,7 @@ class CustomAllreduce:
             reg_bytes,
             use_1stage,
             bf16_ptr,
+            transpose_scale,
         )
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
@@ -1154,6 +1173,7 @@ class CustomAllreduce:
         group_size: int = 128,
         use_1stage: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -1168,16 +1188,23 @@ class CustomAllreduce:
                     registered=True,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
+                    transpose_scale=transpose_scale,
                 )
             else:
                 K = input.shape[-1]
                 num_groups = K // group_size
                 dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
-                dummy_scale = torch.zeros(
-                    input.shape[:-1] + (num_groups,),
-                    dtype=torch.float32,
-                    device=input.device,
-                )
+                if transpose_scale:
+                    M = input.shape[0]
+                    dummy_scale = torch.zeros(
+                        (num_groups, M), dtype=torch.float32, device=input.device
+                    ).transpose(0, 1)
+                else:
+                    dummy_scale = torch.zeros(
+                        input.shape[:-1] + (num_groups,),
+                        dtype=torch.float32,
+                        device=input.device,
+                    )
                 if emit_bf16:
                     return (
                         dummy_out,
@@ -1196,6 +1223,7 @@ class CustomAllreduce:
                 registered=False,
                 use_1stage=use_1stage,
                 emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale,
             )
 
     def custom_fused_ar_rms_mxfp4_quant(
@@ -1226,7 +1254,9 @@ class CustomAllreduce:
                     input.shape[:-1] + (K // 2,), dtype=torch.uint8, device=input.device
                 )
                 dummy_scale = torch.zeros(
-                    input.shape[:-1] + (K // 32,), dtype=torch.uint8, device=input.device
+                    input.shape[:-1] + (K // 32,),
+                    dtype=torch.uint8,
+                    device=input.device,
                 )
                 if emit_bf16:
                     return (
