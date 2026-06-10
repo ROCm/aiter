@@ -153,11 +153,47 @@ def write_install_mode():
         f.write(mode)
 
 
+CK_PATCHES = [
+    os.path.join(this_dir, "patches", "composable_kernel_oai_swiglu.patch"),
+]
+
+
+def _apply_ck_patches(ck_dir):
+    """Apply local CK patches needed by AITER without modifying the submodule baseline."""
+    if AITER_TRITON_ONLY or not ENABLE_CK:
+        return
+
+    for patch in CK_PATCHES:
+        if not os.path.exists(patch):
+            raise FileNotFoundError(f"Required CK patch not found: {patch}")
+
+        check_cmd = ["git", "-C", ck_dir, "apply", "--check", patch]
+        reverse_check_cmd = ["git", "-C", ck_dir, "apply", "--reverse", "--check", patch]
+        apply_cmd = ["git", "-C", ck_dir, "apply", patch]
+
+        if subprocess.run(check_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            print(f"[aiter] Applying CK patch: {os.path.basename(patch)}")
+            subprocess.check_call(apply_cmd)
+        elif (
+            subprocess.run(
+                reverse_check_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            ).returncode
+            == 0
+        ):
+            print(f"[aiter] CK patch already applied: {os.path.basename(patch)}")
+        else:
+            raise RuntimeError(
+                f"Unable to apply CK patch {patch}. Please reset/update {ck_dir} "
+                "or refresh the patch for the current Composable Kernel revision."
+            )
+
+
 def prepare_packaging():
     """Copy source directories and create package metadata for non-editable installs."""
     if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
         shutil.rmtree("aiter_meta")
     if ENABLE_CK:
+        _apply_ck_patches(os.path.join(this_dir, "3rdparty", "composable_kernel"))
         shutil.copytree("3rdparty", "aiter_meta/3rdparty")
     else:
         os.makedirs("aiter_meta/3rdparty", exist_ok=True)
@@ -225,6 +261,7 @@ if not _is_metadata_only() and not AITER_TRITON_ONLY:
             '"git clone --recursive https://github.com/ROCm/aiter.git" or '
             '"git submodule sync ; git submodule update --init --recursive"'
         )
+        _apply_ck_patches(ck_dir)
 
 
 def _load_modules_from_config():

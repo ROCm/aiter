@@ -15,6 +15,23 @@ using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 
 // API for user aiter.ck_moe_stage1(...)
 
+int to_ck_activation_op(int activation)
+{
+    // aiter ActivationType: Silu=0, Gelu=1, Swiglu=2.
+    // CK Activation: gelu_and_mul=0, silu_and_mul=1, swiglustep_and_mul=2.
+    switch (activation)
+    {
+    case 0:
+        return 1;
+    case 1:
+        return 0;
+    case 2:
+        return 2;
+    default:
+        TORCH_CHECK(false, "Unsupported MoE activation: ", activation);
+    }
+}
+
 template <int stage = 1>
 MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant_type, bool mul_routed_weight, bool is_shuffled)
 {
@@ -108,7 +125,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         K *= 2;
     }
 
-    activation = !activation;
+    activation = to_ck_activation_op(activation);
 
     auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
@@ -172,7 +189,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
         K *= 2;
     }
 
-    activation = !activation;
+    activation = to_ck_activation_op(activation);
     auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
     kernel(at::hip::getCurrentHIPStream(),

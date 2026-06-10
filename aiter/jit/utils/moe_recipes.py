@@ -148,9 +148,6 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> List[Dict]:
         mul_weight_stage = _get_mul_weight_stage(row)
         need_splitk = _should_include_splitk(row, quant_type)
 
-        if activation == "swiglu":
-            continue
-
         # A16W4 per_1x32 (bf16 activation, int4 weight) is owned by FlyDSL,
         # not CK 2stages. CK has no matching instance — skip prebuild.
         if quant_type == "per_1x32" and a_dtype == "b16" and b_dtype == "torch.int4":

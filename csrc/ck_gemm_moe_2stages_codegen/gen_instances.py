@@ -5,6 +5,12 @@ import argparse
 import itertools
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
 
+ACT_OPS = {
+    "gelu": 0,
+    "silu": 1,
+    "swiglu": 2,
+}
+
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages_common{quanttype}.cuh"
@@ -61,7 +67,24 @@ MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarTy
 heuristic_dispatch_end = """
     TORCH_CHECK(
         false,
-        "Unsupported kernel config for moe heuristic dispatch");
+        "Unsupported kernel config for moe heuristic dispatch: block_m=",
+        block_m,
+        ", inter_dim=",
+        inter_dim,
+        ", x_dtype=",
+        x_dtype,
+        ", w_dtype=",
+        w_dtype,
+        ", y_dtype=",
+        y_dtype,
+        ", act_op=",
+        act_op,
+        ", quant=",
+        quant,
+        ", mul_routed_weight_stage=",
+        mul_routed_weight_stage,
+        ", is_shuffled=",
+        is_shuffled);
 }}
 
 """
@@ -925,11 +948,7 @@ class ck_moe_2stage_gemm_codegen:
                             CDEElementOp=kernel.CDEElementOp,
                             Nswizzle=str(self.nswizzle).lower(),
                             Quant=self.quant_type,
-                            ActOP=(
-                                int(self.activation == "silu")
-                                if kernel.stage == 1
-                                else 0
-                            ),
+                            ActOP=ACT_OPS[self.activation] if kernel.stage == 1 else 0,
                             Stage=kernel.stage,
                             BlockSize=kernel.BLOCK_SIZE,
                             MPerBlock=kernel.MPerBlock,
@@ -958,7 +977,7 @@ class ck_moe_2stage_gemm_codegen:
                     CDEElementOp=kernel.CDEElementOp,
                     Nswizzle=str(self.nswizzle).lower(),
                     Quant=self.quant_type,
-                    ActOP=int(self.activation == "silu") if kernel.stage == 1 else 0,
+                    ActOP=ACT_OPS[self.activation] if kernel.stage == 1 else 0,
                     Stage=kernel.stage,
                     BlockSize=kernel.BLOCK_SIZE,
                     MPerBlock=kernel.MPerBlock,
@@ -989,7 +1008,7 @@ class ck_moe_2stage_gemm_codegen:
                 CDEElementOp=kernel_list[0].CDEElementOp,
                 Nswizzle=str(self.nswizzle).lower(),
                 Quant=self.quant_type,
-                ActOP=str(int(self.activation == "silu")),
+                ActOP=str(ACT_OPS[self.activation]),
                 MulRoutedWeight=str(self.mul_routed_weight_stage == 1).lower(),
                 Preshuffle=str(self.preshuffle).lower(),
             )
@@ -1071,7 +1090,7 @@ if __name__ == "__main__":
         default="silu",
         required=False,
         type=str,
-        choices=["silu", "gelu"],
+        choices=["silu", "gelu", "swiglu"],
         help="select activation",
     )
 
@@ -1125,7 +1144,7 @@ if __name__ == "__main__":
         # quanted moe
         b_quant_dtypes = ["f8", "i8", "i4", "fp4x2"]
         c_dtypes = ["f16", "b16"]
-        acts = ["silu", "gelu"]
+        acts = ["silu", "gelu", "swiglu"]
         routed_weight_l = [1, 2]
         general_quant_l = ["per_tensor", "per_token"]
         preshuffle_mode_l = [True, False]
