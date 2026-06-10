@@ -20,6 +20,7 @@ from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, roc
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+
 from . import dpp_utils
 
 # -- compile-time constants (BM-independent; BM-derived ones live in _bm_constants) --
@@ -186,18 +187,6 @@ def _gep3(base_ptr, byte_off_i32):
     """getelementptr i8, base_ptr, byte_off_i32  (ptr<3>)."""
     return buffer_ops.get_element_ptr(
         base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
-    )
-
-
-def _s_barrier_bare():
-    """Bare ``s_barrier`` (no surrounding memory fence), matching HIP's K-loop
-    ``__builtin_amdgcn_s_barrier()`` cross-wave fence after the vmcnt wait."""
-    llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string="s_barrier",
-        constraints="",
-        has_side_effects=True,
     )
 
 
