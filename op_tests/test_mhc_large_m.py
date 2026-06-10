@@ -30,7 +30,9 @@ torch.set_default_device("cuda")
 
 
 @benchmark()
-def test_mhc_large_m_post_pre(m: int, hidden_size: int, hc_mult: int = 4, fuse_rmsnorm: bool = False):
+def test_mhc_large_m_post_pre(
+    m: int, hidden_size: int, hc_mult: int = 4, fuse_rmsnorm: bool = False
+):
     if m <= 1024:
         aiter.logger.info("skip large_m: m=%s <= 1024", m)
         return {"skipped": True}
@@ -119,8 +121,12 @@ def test_mhc_large_m_post_pre(m: int, hidden_size: int, hc_mult: int = 4, fuse_r
         **hip_kwargs,
     )
 
-    hip_large_m_err = checkAllclose(layer_input_ref, layer_input_large_m, msg="large_m/layer_input")
-    hip_dispatch_err = checkAllclose(layer_input_ref, layer_input_dispatch, msg="dispatch/layer_input")
+    hip_large_m_err = checkAllclose(
+        layer_input_ref, layer_input_large_m, msg="large_m/layer_input"
+    )
+    hip_dispatch_err = checkAllclose(
+        layer_input_ref, layer_input_dispatch, msg="dispatch/layer_input"
+    )
 
     return {
         "m": m,

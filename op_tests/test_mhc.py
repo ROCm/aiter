@@ -980,7 +980,9 @@ if __name__ == "__main__":
             for hidden_size in args.hidden_size:
                 for m in args.m:
                     for hc_mult in [4]:
-                        ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
+                        ret = test_mhc_post(
+                            m=m, hidden_size=hidden_size, hc_mult=hc_mult
+                        )
                         df.append(ret)
         df = pd.DataFrame(df)
         df_md = df.to_markdown(index=False)
