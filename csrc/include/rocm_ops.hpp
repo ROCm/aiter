@@ -270,7 +270,17 @@ namespace py = pybind11;
           "                        Tensor! value_cache,"                            \
           "                        Tensor slot_mapping,"                            \
           "                        str kv_cache_dtype,"                             \
-          "                        float k_scale, float v_scale) -> ()");           \
+          "                        float k_scale, float v_scale,"                   \
+          "                        int kv_layout=-1) -> ()",                        \
+          py::arg("key"),                                                           \
+          py::arg("value"),                                                         \
+          py::arg("key_cache"),                                                     \
+          py::arg("value_cache"),                                                   \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("kv_cache_dtype"),                                                \
+          py::arg("k_scale"),                                                       \
+          py::arg("v_scale"),                                                       \
+          py::arg("kv_layout") = -1);                                               \
     m.def("reshape_and_cache_with_pertoken_quant",                                  \
           &aiter::reshape_and_cache_with_pertoken_quant,                            \
           "reshape_and_cache_with_pertoken_quant",                                  \
@@ -1133,7 +1143,8 @@ namespace py = pybind11;
           py::arg("sink_ptr")             = std::nullopt, \
           py::arg("gen")                  = std::nullopt, \
           py::arg("p_scale")              = std::nullopt, \
-          py::arg("p_scale_inv")          = std::nullopt);
+          py::arg("p_scale_inv")          = std::nullopt, \
+          py::arg("kv_layout")            = -1);
 
 #define MOE_OP_PYBIND                                                          \
     m.def("topk_softmax",                                                      \

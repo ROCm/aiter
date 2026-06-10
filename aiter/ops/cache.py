@@ -9,6 +9,15 @@ from ..jit.core import compile_ops
 MD_NAME = "module_cache"
 
 
+# KV cache memory layout selectors for reshape_and_cache_flash. Must stay in
+# sync with ck_tile::BlockAttentionKVCacheMemoryLayoutEnum and aiter/ops/mha.py.
+KV_LAYOUT_AUTO = -1
+KV_LAYOUT_VECTORIZED = 0
+KV_LAYOUT_LINEAR = 1
+KV_LAYOUT_VEC_K_COL_V = 2
+KV_LAYOUT_LINEAR_HEADS_FIRST = 3
+
+
 @compile_ops("module_cache")
 def swap_blocks(src: Tensor, dst: Tensor, block_mapping: Tensor) -> None: ...
 
@@ -43,7 +52,76 @@ def reshape_and_cache_flash(
     kv_cache_dtype: str,
     k_scale: Tensor,
     v_scale: Tensor,
+    kv_layout: int = -1,
 ) -> None: ...
+
+
+def reshape_and_cache_flash_func(
+    key: Tensor,
+    value: Tensor,
+    key_cache: Optional[Tensor] = None,
+    value_cache: Optional[Tensor] = None,
+    slot_mapping: Optional[Tensor] = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: Optional[Tensor] = None,
+    v_scale: Optional[Tensor] = None,
+    kv_cache: Optional[Tensor] = None,
+    kv_layout: int = KV_LAYOUT_AUTO,
+) -> None:
+    """High-level wrapper around `reshape_and_cache_flash`.
+
+    Supports either legacy packed caches `[NumBlocks, PageSize, NumKVHeads,
+    HeadDim]` via `key_cache`/`value_cache`, or a cross-layer per-layer
+    `kv_cache` view `[2, NumBlocks, NumKVHeads, PageSize, HeadDim]`.
+    """
+    if kv_cache is not None:
+        if key_cache is not None or value_cache is not None:
+            raise ValueError(
+                "reshape_and_cache_flash_func: pass either kv_cache "
+                "(5D [2, N, H, B, D]) or separate key_cache/value_cache, not both"
+            )
+        if kv_cache.dim() != 5:
+            raise ValueError(
+                "kv_cache must be 5D [2, NumBlocks, NumKVHeads, PageSize, HeadDim], "
+                f"got dim {kv_cache.dim()}"
+            )
+        if kv_cache.size(0) != 2:
+            raise ValueError(
+                "kv_cache outer dim must be 2 (K, V), got " f"{kv_cache.size(0)}"
+            )
+        if kv_layout == KV_LAYOUT_AUTO:
+            kv_layout = KV_LAYOUT_LINEAR_HEADS_FIRST
+        elif kv_layout != KV_LAYOUT_LINEAR_HEADS_FIRST:
+            raise ValueError(
+                "kv_cache implies kv_layout=KV_LAYOUT_LINEAR_HEADS_FIRST, got "
+                f"kv_layout={kv_layout}"
+            )
+        key_cache = kv_cache[0]
+        value_cache = kv_cache[1]
+
+    if key_cache is None or value_cache is None:
+        raise ValueError(
+            "reshape_and_cache_flash_func: must pass key_cache/value_cache or kv_cache"
+        )
+    if slot_mapping is None:
+        raise ValueError("reshape_and_cache_flash_func: slot_mapping is required")
+
+    if k_scale is None:
+        k_scale = torch.tensor([1.0], dtype=torch.float32, device=key.device)
+    if v_scale is None:
+        v_scale = torch.tensor([1.0], dtype=torch.float32, device=key.device)
+
+    reshape_and_cache_flash(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        kv_layout,
+    )
 
 
 @compile_ops("module_cache")

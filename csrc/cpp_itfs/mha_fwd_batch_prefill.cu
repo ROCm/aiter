@@ -57,6 +57,17 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     // no runtime trait field for it.
     // The wrapper sets args.is_v_rowmajor=false only for the decode-aligned
     // VEC_K_COL_V_LAYOUT path; all other paths keep V as RowMajor.
+    // LINEAR_HEADS_FIRST_LAYOUT (cross-layer 5D KV cache) shares the same
+    // address arithmetic as LINEAR_LAYOUT once the wrapper has extracted the
+    // non-contiguous [N,H,B,D] strides. Collapse the enum here to reuse the
+    // existing generated CK Tile linear kernel instances.
+    auto dispatch_kv_memory_layout = args.kv_memory_layout;
+    if(dispatch_kv_memory_layout ==
+       ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT)
+    {
+        dispatch_kv_memory_layout =
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT;
+    }
     auto traits      = get_mha_batch_prefill_traits(head_size_q,
                                                head_size_v,
                                                q_dtype_str,
@@ -67,7 +78,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                                has_lse,
                                                has_dropout,
                                                qscale_type,
-                                               args.kv_memory_layout,
+                                               dispatch_kv_memory_layout,
                                                args.kv_lookup_table,
                                                args.page_block_size,
                                                /*skip_min_seqlen_q=*/false,

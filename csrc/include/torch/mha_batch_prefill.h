@@ -48,7 +48,8 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                   // explicit-multiply implementations but unused internally;
                   // the kernel folds log2(p_scale) into the exp2 row-max shift.
                   std::optional<const at::Tensor> p_scale = std::nullopt,
-                  std::optional<const at::Tensor> p_scale_inv = std::nullopt);
+                  std::optional<const at::Tensor> p_scale_inv = std::nullopt,
+                  int kv_layout = -1);
 
 } // namespace torch_itfs
 } // namespace aiter
