@@ -1038,7 +1038,7 @@ def flydsl_qk_norm_rope_quant(
             _ptr_arg(kv_scale_arg[start:end] if quant else kv_scale_arg),
             kv.stride(0),
             n,
-            stream=_stream_arg(),
+            _stream_arg(),
         )
         cf = getattr(launcher, "_cf", None)
         if cf is not None:
