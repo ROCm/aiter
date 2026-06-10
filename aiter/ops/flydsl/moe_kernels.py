@@ -6,7 +6,6 @@
 import functools
 import os
 import re
-
 from typing import Dict, Optional
 
 import torch
@@ -1056,13 +1055,14 @@ def flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     bias: Optional[torch.Tensor] = None,
+    return_per_slot: bool = False,
     expert_mask: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
     a: (token_num, topk, inter_dim), w1: (E, model_dim, inter_dim) pre-shuffled.
-    Returns (token_num, model_dim).
+    Returns (token_num, model_dim) by default.
     bias: optional (E, model_dim) f32 bias added after GEMM.
 
     sort_block_m: block_size used by moe_sorting / stage1. When 0 (default),
@@ -1070,6 +1070,10 @@ def flydsl_moe_stage2(
         from sorting/stage1.
     persist: if True, use persistent round-robin mode (grid_y=cu_num);
         if False, use legacy persist_m mode; if None, auto-select.
+
+    return_per_slot: when True, return the raw per-(token, slot) output as a
+        contiguous (token_num, topk, model_dim) tensor without applying the
+        topk reduction.
 
     expert_mask, topk_ids: when both are provided and mode="reduce", the
         post-GEMM reduction fuses the EP validity gather
@@ -1087,17 +1091,27 @@ def flydsl_moe_stage2(
     if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
         mode = "reduce"
 
-    accumulate = mode != "reduce"
+    accumulate = mode != "reduce" and not return_per_slot
 
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
+
     if out is None:
-        alloc_fn = torch.zeros if accumulate else torch.empty
-        out = alloc_fn(
-            (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
-        )
+        if return_per_slot:
+            out = torch.empty(
+                (token_num, topk, model_dim),
+                dtype=torch_out_dtype,
+                device=inter_states.device,
+            )
+        else:
+            alloc_fn = torch.zeros if accumulate else torch.empty
+            out = alloc_fn(
+                (token_num, model_dim),
+                dtype=torch_out_dtype,
+                device=inter_states.device,
+            )
 
     dev = inter_states.device
     flat_a_scale = (
@@ -1136,11 +1150,14 @@ def flydsl_moe_stage2(
 
     target = out
     if not accumulate:
-        target = torch.empty(
-            (token_num * topk * model_dim,),
-            device=out.device,
-            dtype=out.dtype,
-        )
+        if return_per_slot:
+            target = out.view(-1)
+        else:
+            target = torch.empty(
+                (token_num * topk * model_dim,),
+                device=out.device,
+                dtype=out.dtype,
+            )
 
     if is_fp4:
         args = _s2_args_fp4(
@@ -1200,7 +1217,7 @@ def flydsl_moe_stage2(
     )
     _run_compiled(exe, args)
 
-    if not accumulate:
+    if not accumulate and not return_per_slot:
         use_mask = expert_mask is not None
         if use_mask and topk_ids is None:
             raise ValueError(
