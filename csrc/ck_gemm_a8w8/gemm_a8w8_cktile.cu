@@ -51,7 +51,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
 
   static const auto lookup = []
   {
-    return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(ABDataType, DDataType, EDataType)};
+    return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(ABDataType, DDataType, EDataType, true)};
   }();
 
   const int cu_num           = get_device_cu_num();
