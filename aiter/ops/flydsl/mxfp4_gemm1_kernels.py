@@ -21,30 +21,39 @@ _SUPPORTED = {
 
 
 @functools.cache
-def _get_compiled_mxfp4_gemm1_port(BM, use_nt, inline_quant, D_HIDDEN):
+def _get_compiled_mxfp4_gemm1_port(
+    BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk
+):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
-    return compile_gemm1_a4w4_port(BM, use_nt, inline_quant, D_HIDDEN=D_HIDDEN)
+    return compile_gemm1_a4w4_port(
+        BM,
+        use_nt,
+        inline_quant,
+        D_HIDDEN=D_HIDDEN,
+        D_INTER=D_INTER,
+        NE=NE,
+        TOPK=topk,
+    )
 
 
 def _assert_supported(*, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, inline_quant):
-    from .kernels import mxfp4_gemm1 as port
-
-    # K (= D_HIDDEN, the contraction dim) is parametrized; only the OUTPUT side
-    # (NE, INTER, TOPK) is still fixed. K must be a multiple of BK(256).
-    if (NE, D_INTER, topk) != (port.NE, port.INTER, port.TOPK):
-        raise NotImplementedError(
-            f"flydsl mxfp4 gemm1 ??? Kimi ? NE/INTER/TOPK "
-            f"(NE={port.NE}, INTER={port.INTER}, TOPK={port.TOPK}),"
-            f"?? (NE={NE}, INTER={D_INTER}, TOPK={topk})"
-        )
+    # K (= D_HIDDEN, contraction), INTER (= D_INTER, output) and NE/TOPK are all
+    # parametrized now. Only the real divisibility / variant constraints remain:
+    #   * K must be a multiple of BK (256)
+    #   * 2*D_INTER (= N_OUT) must be a multiple of BN (256), i.e. D_INTER % 128 == 0
     if D_HIDDEN % 256 != 0:
         raise NotImplementedError(
-            f"flydsl mxfp4 gemm1 ?? D_HIDDEN (K) ? 256 ???,?? H={D_HIDDEN}"
+            f"flydsl mxfp4 gemm1 requires D_HIDDEN (K) % 256 == 0, got H={D_HIDDEN}"
+        )
+    if (2 * D_INTER) % 256 != 0:
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm1 requires 2*D_INTER (N_OUT) % 256 == 0 "
+            f"(i.e. D_INTER % 128 == 0), got D_INTER={D_INTER}"
         )
     if (BM, use_nt, inline_quant) not in _SUPPORTED:
         raise NotImplementedError(
-            f"flydsl mxfp4 gemm1 ????? (variant) "
+            f"flydsl mxfp4 gemm1 unsupported variant "
             f"(BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
         )
 
@@ -86,8 +95,10 @@ def flydsl_mxfp4_gemm1(
     )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
-    launch = _get_compiled_mxfp4_gemm1_port(BM, use_nt, inline_quant, D_HIDDEN)
-    grid = gemm1_grid(n_tokens, BM)
+    launch = _get_compiled_mxfp4_gemm1_port(
+        BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk
+    )
+    grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER)
     launch(
         a_quant,
         a_scale_sorted_shuffled,

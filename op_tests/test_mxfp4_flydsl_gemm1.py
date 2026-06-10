@@ -13,15 +13,42 @@ def test_port_module_imports_and_constants():
     assert port.N_OUT == 1024
 
 
-def test_guard_rejects_bad_ne_inter_topk():
-    """OUTPUT ??? (NE/INTER/TOPK) ???,? Kimi ??? fail-loud?"""
+def test_guard_accepts_non_kimi_ne_inter_topk():
+    """OUTPUT side (NE/INTER/TOPK) is now parametrized: non-KIMI but
+    divisibility-legal shapes (e.g. minimax NE=256/INTER=768/TOPK=8) are accepted."""
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
-    with pytest.raises(NotImplementedError, match="Kimi"):
+    # minimax: NE=256, H=3072, INTER=768, TOPK=8 (2*768=1536 % 256 == 0).
+    _assert_supported(
+        NE=256,
+        D_HIDDEN=3072,
+        D_INTER=768,
+        topk=8,
+        BM=32,
+        use_nt=True,
+        inline_quant=False,
+    )
+    # arbitrary NE / TOPK are fine as long as divisibility holds.
+    _assert_supported(
+        NE=257,
+        D_HIDDEN=7168,
+        D_INTER=512,
+        topk=5,
+        BM=32,
+        use_nt=True,
+        inline_quant=False,
+    )
+
+
+def test_guard_rejects_bad_inter():
+    """2*D_INTER (= N_OUT) must be a multiple of 256 (i.e. D_INTER % 128 == 0)."""
+    from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
+
+    with pytest.raises(NotImplementedError, match="N_OUT|D_INTER"):
         _assert_supported(
-            NE=257,
+            NE=385,
             D_HIDDEN=7168,
-            D_INTER=512,
+            D_INTER=500,  # 2*500=1000, not a multiple of 256
             topk=9,
             BM=32,
             use_nt=True,
@@ -65,7 +92,7 @@ def test_guard_rejects_bad_variant():
     """?????????? fail-loud?"""
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
-    with pytest.raises(NotImplementedError, match="??|variant"):
+    with pytest.raises(NotImplementedError, match="variant"):
         _assert_supported(
             NE=385,
             D_HIDDEN=7168,
@@ -207,6 +234,82 @@ def test_flydsl_gemm1_parametrized_k_compiles(H):
         assert callable(launch)
 
 
+@_GFX950
+@pytest.mark.parametrize(
+    "NE,H,INTER,TOPK",
+    [
+        (385, 7168, 512, 9),  # KIMI (sanity: still compiles all 4 variants)
+        (256, 3072, 768, 8),  # minimax: non-KIMI NE/INTER/TOPK + parametrized K
+    ],
+)
+def test_flydsl_gemm1_parametrized_shape_compiles(NE, H, INTER, TOPK):
+    """INTER/NE/TOPK-parametrization: every supported variant must COMPILE for a
+    non-KIMI OUTPUT shape (minimax NE=256/H=3072/INTER=768/TOPK=8)."""
+    from aiter.ops.flydsl.kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
+
+    assert (2 * INTER) % 256 == 0 and H % 256 == 0
+    for BM, nt, iq in [
+        (32, True, False),
+        (32, False, False),
+        (128, False, False),
+        (16, True, True),
+    ]:
+        launch = compile_gemm1_a4w4_port(
+            BM=BM,
+            use_nt=nt,
+            inline_quant=iq,
+            D_HIDDEN=H,
+            D_INTER=INTER,
+            NE=NE,
+            TOPK=TOPK,
+        )
+        assert callable(launch)
+
+
+def _torch_threestage_sort(topk_ids, topk_weight, M, NE, TOPK, BM, max_sorted):
+    """Torch replica of moe_3stage_sort.cuh (stable expert-grouped sort, each
+    expert region padded up to a multiple of BM). The HIP threestage sort is
+    hard-templated to KIMI (NE=385/TOPK=9) only, so non-KIMI shapes need this to
+    build the gemm1 inputs. Validated against the HIP sort at the KIMI shape (same
+    sti/sei/cumsum/m_indices). Returns (sti, sei, cumsum, mind)."""
+    device = topk_ids.device
+    flat_e = topk_ids.reshape(-1)  # (M*TOPK,) expert per (token,topk) pair, row-major
+    counts = torch.bincount(flat_e, minlength=NE)  # tokens per expert
+    padded = ((counts + BM - 1) // BM) * BM
+    starts = torch.zeros(NE + 1, dtype=torch.int64, device=device)
+    starts[1:] = torch.cumsum(padded, 0)
+    total = int(starts[NE].item())
+    assert total <= max_sorted, f"total {total} > max_sorted {max_sorted}"
+
+    sti = torch.full((max_sorted,), M & 0x00FFFFFF, dtype=torch.int32, device=device)
+    mind = torch.full((max_sorted,), M & 0x00FFFFFF, dtype=torch.int32, device=device)
+    cumsum = torch.tensor([total], dtype=torch.int32, device=device)
+    sei = torch.zeros(max_sorted // BM, dtype=torch.int32, device=device)
+
+    # sorted_expert_ids per BM-block (mirror sort_cumsum: blocks in [start/BM, end/BM)).
+    for e in range(NE):
+        b0 = int(starts[e].item()) // BM
+        b1 = int(starts[e + 1].item()) // BM
+        sei[b0:b1] = e
+
+    # stable placement: iterate pairs in linear order, append into each expert's run.
+    fill = starts[:NE].clone()  # next write position per expert
+    flat_e_c = flat_e.cpu().tolist()
+    fill_c = fill.cpu().tolist()
+    sti_c = sti.cpu()
+    mind_c = mind.cpu()
+    for i, eid in enumerate(flat_e_c):
+        sp = fill_c[eid]
+        fill_c[eid] = sp + 1
+        token_id = i // TOPK
+        topk_id = i % TOPK
+        sti_c[sp] = (token_id & 0x00FFFFFF) | ((topk_id & 0xFF) << 24)
+        mind_c[sp] = token_id & 0x00FFFFFF
+    sti = sti_c.to(device)
+    mind = mind_c.to(device)
+    return sti, sei, cumsum, mind
+
+
 def _torch_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=256):
     """Reconstruct a_scale_sorted_shuffled exactly as moe_sort_scales.cuh does, in
     torch (the HIP kernel is H-locked to 7168). Validated bit-for-bit at H=7168:
@@ -254,17 +357,25 @@ def _torch_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=25
 
 
 @_GFX950
-@pytest.mark.parametrize("H", [7168, 3072, 4096])
-def test_flydsl_gemm1_parametrized_k_numeric(H):
-    """Standalone numeric check of the K-parametrized gemm1 (BM32 non-inline).
+@pytest.mark.parametrize(
+    "NE,H,INTER,TOPK",
+    [
+        (385, 7168, 512, 9),  # KIMI (known-good; ~0.88 fp4-output-quant ceiling)
+        (385, 3072, 512, 9),  # parametrized K only
+        (385, 4096, 512, 9),  # parametrized K only
+        (256, 3072, 768, 8),  # minimax: parametrized INTER/NE/TOPK + K
+    ],
+)
+def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK):
+    """Standalone numeric check of the parametrized gemm1 (BM32 non-inline).
 
-    Uses the (H-independent) threestage sort + torch per_1x32 A-quant + a torch
+    Uses the (shape-independent) threestage sort + torch per_1x32 A-quant + a torch
     reconstruction of a_scale_sorted_shuffled (the HIP quant/sort_scales kernels are
     H-locked). Compares each sorted output row (dequantized fp4) against a torch
     silu_mul reference on the SAME dequantized A/w1. The ~0.88 mean-row-cosine
-    ceiling is the per-row fp4 OUTPUT-quant error, not a kernel defect: H=7168
-    (the known-good KIMI shape) scores the same, so a comparable score at new H
-    validates the contraction over the parametrized K."""
+    ceiling is the per-row fp4 OUTPUT-quant error, not a kernel defect: KIMI
+    (the known-good shape) scores the same, so a comparable score at a new
+    (NE,H,INTER,TOPK) validates the parametrized N/contraction handling."""
     import aiter
     from aiter import QuantType, dtypes
     from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
@@ -273,7 +384,6 @@ def test_flydsl_gemm1_parametrized_k_numeric(H):
     import torch.nn.functional as Fnn
 
     device = torch.device("cuda")
-    NE, INTER, TOPK = 385, 512, 9
     BM, M, seed = 32, 256, 2
     D_INTER, topk = INTER, TOPK
     tq = aiter.get_torch_quant(QuantType.per_1x32)
@@ -309,35 +419,43 @@ def test_flydsl_gemm1_parametrized_k_numeric(H):
 
     active = min(NE, M * topk)
     max_sorted = ((M * topk + active * (BM - 1) + BM - 1) // BM) * BM
-    eb = lambda: torch.empty((0,), device=device, dtype=dtypes.bf16)
-    sti = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
-    sei = torch.empty((max_sorted // BM,), device=device, dtype=dtypes.i32)
-    cumsum = torch.empty((1,), device=device, dtype=dtypes.i32)
-    rev = torch.empty((M * topk,), device=device, dtype=dtypes.i32)
-    swt = torch.empty((max_sorted,), device=device, dtype=dtypes.fp32)
-    mm = torch.empty((NE,), device=device, dtype=dtypes.i32)
-    mind = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
-    aiter.mxfp4_moe_sort(
-        topk_ids=topk_ids,
-        topk_weight=topk_weight,
-        sorted_token_ids=sti,
-        sorted_expert_ids=sei,
-        cumsum_tensor=cumsum,
-        reverse_sorted=rev,
-        sorted_weights=swt,
-        masked_m=mm,
-        m_indices=mind,
-        bf16_zero_out=eb(),
-        bf16_zero_workspace=eb(),
-        M_logical=M,
-        NE=NE,
-        TOPK=topk,
-        D_HIDDEN=H,
-        D_INTER=D_INTER,
-        MB=BM,
-        prologue=1,
-    )
-    torch.cuda.synchronize()
+    # The HIP threestage sort is hard-templated to KIMI (NE=385/TOPK=9). For other
+    # shapes use the torch replica (validated vs HIP at the KIMI shape: identical
+    # sti/sei/cumsum/m_indices). Both produce the exact layout gemm1 consumes.
+    if (NE, topk) == (385, 9):
+        eb = lambda: torch.empty((0,), device=device, dtype=dtypes.bf16)
+        sti = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
+        sei = torch.empty((max_sorted // BM,), device=device, dtype=dtypes.i32)
+        cumsum = torch.empty((1,), device=device, dtype=dtypes.i32)
+        rev = torch.empty((M * topk,), device=device, dtype=dtypes.i32)
+        swt = torch.empty((max_sorted,), device=device, dtype=dtypes.fp32)
+        mm = torch.empty((NE,), device=device, dtype=dtypes.i32)
+        mind = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
+        aiter.mxfp4_moe_sort(
+            topk_ids=topk_ids,
+            topk_weight=topk_weight,
+            sorted_token_ids=sti,
+            sorted_expert_ids=sei,
+            cumsum_tensor=cumsum,
+            reverse_sorted=rev,
+            sorted_weights=swt,
+            masked_m=mm,
+            m_indices=mind,
+            bf16_zero_out=eb(),
+            bf16_zero_workspace=eb(),
+            M_logical=M,
+            NE=NE,
+            TOPK=topk,
+            D_HIDDEN=H,
+            D_INTER=D_INTER,
+            MB=BM,
+            prologue=1,
+        )
+        torch.cuda.synchronize()
+    else:
+        sti, sei, cumsum, mind = _torch_threestage_sort(
+            topk_ids, topk_weight, M, NE, topk, BM, max_sorted
+        )
     n = int(cumsum[0].item())
 
     aq, asc = tq(hidden, quant_dtype=dtypes.fp4x2)
@@ -347,7 +465,8 @@ def test_flydsl_gemm1_parametrized_k_numeric(H):
 
     isq = torch.zeros((max_sorted, D_INTER // 2), device=device, dtype=torch.uint8)
     isc = D_INTER // 32
-    isr = (((max_sorted * (1024 // 64) * 4) + isc - 1) // isc + 31) // 32 * 32
+    N_OUT = 2 * INTER
+    isr = (((max_sorted * (N_OUT // 64) * 4) + isc - 1) // isc + 31) // 32 * 32
     iss = torch.zeros((isr, isc), device=device, dtype=torch.uint8)
     flydsl_mxfp4_gemm1(
         a_quant=aq,
@@ -394,5 +513,12 @@ def test_flydsl_gemm1_parametrized_k_numeric(H):
         ).item()
         cnt += 1
     mean_cos = cossum / cnt
-    # 0.85 floor: the fp4 output-quant ceiling (~0.88) holds for H=7168 too.
-    assert mean_cos > 0.85, f"H={H} mean_row_cos={mean_cos:.4f} (cnt={cnt})"
+    print(
+        f"[gemm1 numeric] NE={NE} H={H} INTER={INTER} TOPK={TOPK} "
+        f"mean_row_cos={mean_cos:.4f} (cnt={cnt})"
+    )
+    # 0.85 floor: the fp4 output-quant ceiling (~0.88) holds for KIMI too.
+    assert mean_cos > 0.85, (
+        f"NE={NE} H={H} INTER={INTER} TOPK={TOPK} "
+        f"mean_row_cos={mean_cos:.4f} (cnt={cnt})"
+    )

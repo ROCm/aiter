@@ -24,24 +24,67 @@ from . import dpp_utils
 
 # -- compile-time constants (BM-independent; BM-derived ones live in _bm_constants) --
 MAX_M = 655360
-NE = 385
+NE = 385  # experts (DEFAULT / KIMI; per-shape value comes from the compile arg NE.
+#           Threaded through the body so non-KIMI expert counts work; these module
+#           globals are the KIMI defaults so existing importers keep working.)
 K = 7168  # gemm1 contraction = hidden_size (DEFAULT / KIMI; per-shape value comes
 #           from the compile arg D_HIDDEN. All K-derived sizes are computed from the
 #           arg via the *_for() helpers below; these module globals are the KIMI
 #           defaults so existing importers (and the test) keep working unchanged.)
-INTER = 512  # per-shard MLP intermediate (OUTPUT side; kept fixed for now)
+INTER = 512  # per-shard MLP intermediate (OUTPUT side; DEFAULT / KIMI; per-shape
+#              value comes from the compile arg D_INTER. All INTER-derived sizes
+#              are computed from the arg via the *_for() helpers below.)
 N_OUT = 2 * INTER  # 1024
-TOPK = 9
+TOPK = 9  # DEFAULT / KIMI; per-shape value comes from the compile arg TOPK (only
+#           used host-side in gemm1_grid for the launch bound).
 
 BN = 256
 BK = 256
 KH_TILE = BK // 2  # 128 packed bytes per K-tile (BK-derived, K-independent)
 kStages = 2
-NUM_N_BLOCKS = N_OUT // 256  # 4 (OUTPUT side; INTER/N_OUT-derived, K-independent)
 
 # B-scale layout (OUTPUT side + K-independent strides)
-kBS_c_n1 = N_OUT // 16 // 2  # 32 (N_OUT-derived)
 kBS_stride_k0_dw = 64
+
+
+# -- INTER-derived sizes (parametrized over the OUTPUT/intermediate dim INTER) --
+# 2*INTER (=N_OUT) MUST be a multiple of BN (256), i.e. INTER % 128 == 0. The
+# *_for() helpers mirror gemm2's pattern so the KIMI default (INTER=512) path is
+# byte-for-byte identical to the old globals.
+def n_out_for(inter):
+    return 2 * inter  # KIMI: 1024
+
+
+def num_n_blocks_for(inter):
+    return n_out_for(inter) // 256  # KIMI: 4 (OUTPUT side; INTER/N_OUT-derived)
+
+
+def kbs_c_n1_for(inter):
+    return n_out_for(inter) // 16 // 2  # KIMI: 32 (N_OUT-derived)
+
+
+# gemm2-A-scale chunk stride (dwords) the epilog writes with; equals gemm2's
+# kAS_per_chunk_dw for K(=gemm2 contraction)=INTER: ((INTER//32)//4//2)*64.
+def out_as_per_chunk_dw_for(inter):
+    return ((inter // 32) // 4 // 2) * 64  # KIMI: 128
+
+
+# gemm2-A packed-fp4 bytes per row (= K_G2_HALF), and the per-N-block silu_mul
+# intermediate width (= BN//2, BN-derived so INTER-independent).
+def k_g2_half_for(inter):
+    return inter // 2  # KIMI: 256
+
+
+BN_INT = BN // 2  # 128 (per-N-block intermediate width; BN-derived, INTER-indep)
+
+
+# -- OUTPUT-side defaults (back-compat module globals = the *_for() helpers). --
+N_OUT = n_out_for(INTER)  # 1024
+NUM_N_BLOCKS = num_n_blocks_for(INTER)  # 4
+kBS_c_n1 = kbs_c_n1_for(INTER)  # 32
+OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(INTER)  # 128
+K_G2_HALF = k_g2_half_for(INTER)  # 256
+N_INTER = INTER  # 512 (documentation alias for the intermediate dim)
 
 
 # -- K-derived sizes (parametrized over the contraction dim K = D_HIDDEN) ------
@@ -81,20 +124,21 @@ def kbs_stride_n0_dw_for(k):
     return kbs_c_k1_for(k) * 64  # KIMI: 1792
 
 
-def kbs_per_expert_dw_for(k):
-    return kBS_c_n1 * kbs_stride_n0_dw_for(k)  # KIMI: 57344
+def kbs_per_expert_dw_for(k, inter=INTER):
+    # depends on BOTH INTER (via kBS_c_n1) AND K (via kBS_stride_n0_dw).
+    return kbs_c_n1_for(inter) * kbs_stride_n0_dw_for(k)  # KIMI: 57344
 
 
-def bq_bytes_for(k):
-    return NE * N_OUT * k_half_for(k)  # KIMI: 1412956160
+def bq_bytes_for(k, inter=INTER, ne=NE):
+    return ne * n_out_for(inter) * k_half_for(k)  # KIMI: 1412956160
 
 
 def ascale_bytes_for(k, max_m=MAX_M):
     return (max_m // 32) * kas_per_chunk_dw_for(k) * 4  # KIMI: 146800640
 
 
-def bscale_bytes_for(k):
-    return NE * kbs_per_expert_dw_for(k) * 4  # KIMI: 88309760
+def bscale_bytes_for(k, inter=INTER, ne=NE):
+    return ne * kbs_per_expert_dw_for(k, inter) * 4  # KIMI: 88309760
 
 
 # KIMI defaults (back-compat module globals; equal to the *_for(K) helpers).
@@ -109,12 +153,8 @@ kBS_per_expert_dw = kbs_per_expert_dw_for(K)  # 57344
 BQ_BYTES = bq_bytes_for(K)  # 1412956160
 ASCALE_BYTES = ascale_bytes_for(K)  # 146800640
 BSCALE_BYTES = bscale_bytes_for(K)  # 88309760
-
-# epilog output-scale layout (gemm2 A-scale): N_INTER=512, K_G2_HALF=256, BN_INT=128
-N_INTER = 512
-K_G2_HALF = 256
-BN_INT = 128
-OUT_AS_PER_CHUNK_DW = 128
+# (N_INTER/K_G2_HALF/BN_INT/OUT_AS_PER_CHUNK_DW are the INTER-derived globals
+#  defined above; the gemm2-A-scale epilog layout lives with the OUTPUT-side block.)
 
 LOG2E = 1.4426950408889634
 
@@ -265,18 +305,19 @@ def _inline_e8m0(amax_u16_i32):
     return fx.Int32(arith.select(lt, _raw(bm2), _raw(fx.Int32(254))))
 
 
-def gemm1_grid(n_tokens, BM=32):
+def gemm1_grid(n_tokens, BM=32, NE=NE, TOPK=TOPK, INTER=INTER):
     """Host-side grid size, mirroring gemm1_a4w4.cuh launch (:611-619).
 
     BM==128 uses the full-NE bound; else the active-experts bound. (BM=32 path
-    is unchanged from Phase 1.)
+    is unchanged from Phase 1.) NE/TOPK/INTER default to the KIMI module globals.
     """
+    num_n_blocks = num_n_blocks_for(INTER)
     if BM == 128:
         max_m_blocks = (n_tokens * TOPK + NE * (BM - 1) + BM - 1) // BM
     else:
         active = min(n_tokens * TOPK, NE)
         max_m_blocks = (n_tokens * TOPK + active * (BM - 1) + BM - 1) // BM
-    return max_m_blocks * NUM_N_BLOCKS
+    return max_m_blocks * num_n_blocks
 
 
 def _gemm1_body(
@@ -312,9 +353,13 @@ def _gemm1_body(
     BQ_BYTES=BQ_BYTES,
     ASCALE_BYTES=ASCALE_BYTES,
     BSCALE_BYTES=BSCALE_BYTES,
+    N_OUT=N_OUT,
+    NUM_N_BLOCKS=NUM_N_BLOCKS,
+    OUT_AS_PER_CHUNK_DW=OUT_AS_PER_CHUNK_DW,
+    K_G2_HALF=K_G2_HALF,
 ):
-    # All K-derived sizes arrive as params (KIMI defaults bound from the module
-    # globals above so the default call path is unchanged).
+    # All K- and INTER/NE-derived sizes arrive as params (KIMI defaults bound from
+    # the module globals above so the default call path is unchanged).
     b_aux = 2 if use_nt else 0  # NT: B_q loads carry aux=2 (non-temporal hint)
     M_REPS = BM // 16
 
@@ -918,7 +963,15 @@ def _bm_constants(BM, K_TILES_TOTAL=K_TILES_TOTAL):
     return kAStages, kSubBlocks, kMChunks, lds_bytes
 
 
-def compile_gemm1_a4w4_port(BM=32, use_nt=True, inline_quant=False, D_HIDDEN=K):
+def compile_gemm1_a4w4_port(
+    BM=32,
+    use_nt=True,
+    inline_quant=False,
+    D_HIDDEN=K,
+    D_INTER=INTER,
+    NE=NE,
+    TOPK=TOPK,
+):
     # Supported Phase 2 combos.
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),
@@ -933,22 +986,37 @@ def compile_gemm1_a4w4_port(BM=32, use_nt=True, inline_quant=False, D_HIDDEN=K):
     # K = contraction dim = hidden_size. Parametrized; defaults to KIMI's 7168.
     _K = D_HIDDEN
     assert _K % BK == 0, f"D_HIDDEN (K) must be a multiple of {BK}, got {_K}"
+    # INTER = OUTPUT/intermediate dim. Parametrized; defaults to KIMI's 512.
+    # 2*INTER (=N_OUT) must be a multiple of BN(256), i.e. INTER % 128 == 0.
+    _INTER = D_INTER
+    _N_OUT = n_out_for(_INTER)
+    assert (
+        _N_OUT % BN == 0
+    ), f"2*D_INTER (N_OUT) must be a multiple of {BN}, got {_N_OUT}"
+    # NE (experts) and TOPK are parametrized; TOPK is host-side only (grid bound).
+    _NE = NE
     # Derive ALL K-dependent compile constants from the arg (KIMI default -> old values).
     _K_HALF = k_half_for(_K)
     _K_TILES_TOTAL = k_tiles_total_for(_K)
     _kUnroll = kunroll_for(_K)
     _kAS_per_chunk_dw = kas_per_chunk_dw_for(_K)
     _kBS_stride_n0_dw = kbs_stride_n0_dw_for(_K)
-    _kBS_per_expert_dw = kbs_per_expert_dw_for(_K)
-    _BQ_BYTES = bq_bytes_for(_K)
+    # INTER/NE-dependent compile constants (kBS_per_expert_dw / BQ / BSCALE depend
+    # on INTER and NE too; the OUTPUT-side block is purely INTER-derived).
+    _kBS_per_expert_dw = kbs_per_expert_dw_for(_K, _INTER)
+    _BQ_BYTES = bq_bytes_for(_K, _INTER, _NE)
     _ASCALE_BYTES = ascale_bytes_for(_K)
-    _BSCALE_BYTES = bscale_bytes_for(_K)
+    _BSCALE_BYTES = bscale_bytes_for(_K, _INTER, _NE)
+    _NUM_N_BLOCKS = num_n_blocks_for(_INTER)
+    _OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(_INTER)
+    _K_G2_HALF = k_g2_half_for(_INTER)
 
     kAStages, kSubBlocks, kMChunks, lds_bytes = _bm_constants(BM, _K_TILES_TOTAL)
 
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
-    # Tag with H so different K specializations get distinct kernel/smem symbols.
-    name_suffix = f"h{_K}_bm{BM}_{variant_tag}"
+    # Tag with H/INTER/NE so different shape specializations get distinct
+    # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
+    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}"
 
     allocator = SmemAllocator(
         None, arch="gfx950", global_sym_name=f"gemm1port_smem_{name_suffix}"
@@ -981,7 +1049,7 @@ def compile_gemm1_a4w4_port(BM=32, use_nt=True, inline_quant=False, D_HIDDEN=K):
         # bound: total_m_blocks = cumsum[0]//BM ; bound = total_m_blocks*NUM_N_BLOCKS
         cumsum0 = llvm.load(T.i32, _global_ptr1(arg_cumsum, fx.Int32(0)))
         total_m_blocks = cumsum0 // fx.Int32(BM)
-        bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
+        bound = total_m_blocks * fx.Int32(_NUM_N_BLOCKS)
         in_range = arith.cmpi(arith.CmpIPredicate.slt, bx_i32, bound)
         if_op = scf.IfOp(in_range, [], has_else=False)
         with ir.InsertionPoint(if_op.then_block):
@@ -1017,6 +1085,10 @@ def compile_gemm1_a4w4_port(BM=32, use_nt=True, inline_quant=False, D_HIDDEN=K):
                 BQ_BYTES=_BQ_BYTES,
                 ASCALE_BYTES=_ASCALE_BYTES,
                 BSCALE_BYTES=_BSCALE_BYTES,
+                N_OUT=_N_OUT,
+                NUM_N_BLOCKS=_NUM_N_BLOCKS,
+                OUT_AS_PER_CHUNK_DW=_OUT_AS_PER_CHUNK_DW,
+                K_G2_HALF=_K_G2_HALF,
             )
             scf.YieldOp([])
 
