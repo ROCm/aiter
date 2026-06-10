@@ -64,18 +64,19 @@
         },
         "B1024D512K512N7680": {
           "b_to_lds": false,
-          "cos": 0.999999,
+          "cos": 1.0,
           "default_p10_us": 5946.79,
           "m_warps": 4,
           "n_warps": 1,
           "p10_us": 5910.23,
           "stages": 2,
-          "tile_m": 128,
-          "tile_n": 128,
+          "tile_m": 256,
+          "tile_n": 256,
           "use_mfma_k32": true,
           "waves_per_eu": 0,
           "xcd_c": 120,
-          "xcd_w": 8
+          "xcd_w": 8,
+          "source": "tile-fold (gfx950 MI355X, 2026-06-10): do_bench cold-L2 uniform, 256x256 tile + xcd_c=120 -> 5.82ms vs 5.98ms at 128x128 (-2.7%), cos=1.0. 256x256 needs 128KB epilogue LDS (fits CDNA4 160KB, not CDNA3 64KB). tune_jdbba_tiles.py. Skew unchanged (remap-off 128x128)."
         },
         "B120D256K256N7680": {
           "b_to_lds": false,

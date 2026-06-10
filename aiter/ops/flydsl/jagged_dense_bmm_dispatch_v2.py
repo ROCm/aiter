@@ -384,4 +384,6 @@ def jagged_dense_bmm_dispatched(
         xcd_w=cfg["xcd_w"] if uniform_seqlen else None,
         use_mfma_k32=cfg["use_mfma_k32"],
         uniform_seqlen=uniform_seqlen,
+        block_m=cfg.get("tile_m") if uniform_seqlen else None,
+        block_n=cfg.get("tile_n") if uniform_seqlen else None,
     )

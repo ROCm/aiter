@@ -446,6 +446,8 @@ def jagged_dense_bmm(
     xcd_w: int | None = None,
     use_mfma_k32: bool | None = None,
     uniform_seqlen: bool = True,
+    block_m: int | None = None,
+    block_n: int | None = None,
 ):
     """Public entry. Derives N (output) and K (reduction) from the tall dense B
     matrix shape (B_groups * N, K), then dispatches to the per-shape kernel.
@@ -493,8 +495,10 @@ def jagged_dense_bmm(
         xcd_w = 1 if xcd_c == 1 else XCD_W
     if use_mfma_k32 is None:
         use_mfma_k32 = _use_mfma_k32()
-    bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
+    bmn = BLOCK_M if block_m is None else block_m
+    bnn = BLOCK_N if block_n is None else block_n
+    bm = (max_seq_len + bmn - 1) // bmn
     launch = _build_launcher(
-        N, K, BLOCK_M, BLOCK_N, block_k, STAGES_A, THREADS, bm, n_groups, xcd_c, xcd_w, use_mfma_k32
+        N, K, bmn, bnn, block_k, STAGES_A, THREADS, bm, n_groups, xcd_c, xcd_w, use_mfma_k32
     )
     return launch(C, A, B, BIAS, SEQ_OFFSETS, n_groups, max_seq_len, stream=stream)
