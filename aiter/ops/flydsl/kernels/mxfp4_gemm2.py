@@ -31,14 +31,13 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 MAX_M = 655360
 NE = 385
 K = 512  # gemm2 contraction = inter_dim
-N_OUT = 7168  # gemm2 output dim = model_dim
+N_OUT = 7168  # default gemm2 output dim = model_dim (per-shape value comes from the compile arg)
 TOPK = 9
 
 BN = 256
 BK = 256
 K_HALF = K // 2  # 256 packed-fp4 bytes along K
 KH_TILE = BK // 2  # 128 packed bytes per K-tile
-NUM_N_BLOCKS = N_OUT // 256  # 28
 K_TILES_TOTAL = K // BK  # 2
 kStages = 2
 NUM_CU = 256  # persistent-grid workgroup count (matches gemm2_a4w4.cuh NUM_CU).
@@ -53,8 +52,6 @@ _NONATOMIC_KLOOP_VMCNT = 16
 kBS_c_k1 = (K // 32) // 4 // 2  # 2
 kBS_stride_k0_dw = 64
 kBS_stride_n0_dw = kBS_c_k1 * 64  # 128
-kBS_c_n1 = N_OUT // 16 // 2  # 224
-kBS_per_expert_dw = kBS_c_n1 * kBS_stride_n0_dw  # 28672
 kAS_c_k1 = (K // 32) // 4 // 2  # 2
 kAS_per_chunk_dw = kAS_c_k1 * 64  # 128
 
@@ -66,7 +63,7 @@ def num_n_blocks_for(n_out):
 
 
 def kbs_per_expert_dw_for(n_out):
-    return (n_out // 16 // 2) * kBS_stride_n0_dw  # kBS_c_n1 * kBS_stride_n0_dw
+    return (n_out // 16 // 2) * kBS_stride_n0_dw
 
 
 def aq_bytes_for(max_m):
@@ -98,12 +95,6 @@ def ascale_bytes(BM, max_m=MAX_M):
     0.05 @ M=32768) while smaller M that stayed under the bound looked fine."""
     chunk_div = 16 if BM == 16 else 32
     return (max_m // chunk_div) * kAS_per_chunk_dw * 4
-
-
-# Back-compat KIMI defaults (NE=385, N_OUT=7168, MAX_M=655360).
-AQ_BYTES = aq_bytes_for(MAX_M)  # 167772160
-BQ_BYTES = bq_bytes_for(NE, N_OUT)  # 706478080
-BSCALE_BYTES = bscale_bytes_for(NE, N_OUT)  # 44154880
 
 
 def saq_slot_bytes(BM):
@@ -337,7 +328,7 @@ def compile_gemm2_a4w4_port(
                 epilog,
             )
 
-        # total_m_blocks = cumsum[0] / BM ; bound = total_m_blocks * NUM_N_BLOCKS
+        # total_m_blocks = cumsum[0] / BM ; bound = total_m_blocks * _num_n_blocks
         if const_expr(_persistent):
             # Persistent grid (BM128 non-atomic): NUM_CU workgroups grid-stride over
             # tiles. Peel tile 0 (keeps its sched_barrier so the A->LDS issue is
