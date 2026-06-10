@@ -163,6 +163,28 @@ def tensor_model_parallel_fused_qknorm_allreduce(
     )
 
 
+def tensor_model_parallel_fused_qknorm_allreduce_rope(
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+):
+    return get_tp_group().fused_qknorm_allreduce_rope(
+        qkv_in,
+        q_w,
+        k_w,
+        cos_sin_cache,
+        position_ids,
+        head_dim,
+        rotary_dim,
+        eps,
+    )
+
+
 def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
     _assert_no_custom_group("tensor_model_parallel_custom_all_gather")
     return get_tp_group().custom_all_gather(input_)

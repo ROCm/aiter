@@ -525,6 +525,22 @@ namespace py = pybind11;
           py::arg("eps"),                                                                       \
           py::arg("reg_ptr"),                                                                   \
           py::arg("reg_bytes"));                                                                \
+    m.def("fused_qknorm_allreduce_rope",                                                        \
+          &aiter::fused_qknorm_allreduce_rope,                                                  \
+          py::arg("_fa"),                                                                       \
+          py::arg("qkv_in"),                                                                    \
+          py::arg("q_w"),                                                                       \
+          py::arg("k_w"),                                                                       \
+          py::arg("q_out"),                                                                     \
+          py::arg("k_out"),                                                                     \
+          py::arg("v_out"),                                                                     \
+          py::arg("cos_sin_cache"),                                                             \
+          py::arg("position_ids"),                                                              \
+          py::arg("head_dim"),                                                                  \
+          py::arg("rotary_dim"),                                                                \
+          py::arg("eps"),                                                                       \
+          py::arg("reg_ptr"),                                                                   \
+          py::arg("reg_bytes"));                                                                \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
     m.def("register_input_buffer",                                                             \

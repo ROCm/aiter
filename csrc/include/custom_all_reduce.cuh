@@ -2227,42 +2227,42 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
 
 template <typename T, int PACK_SIZE>
 __device__ __forceinline__ typename opus::vector_t<T, PACK_SIZE>
-apply_neox_rope_pack(
+apply_neox_rope_pack_shuffle(
     typename opus::vector_t<T, PACK_SIZE> x,
-    const T* __restrict__ peer_base,
     const T* __restrict__ cos_sin_cache,
     const int64_t* __restrict__ position_ids,
     int token_id,
     int access_id_in_head,
-    int head_dim,
     int rotary_dim)
 {
     using P = typename opus::vector_t<T, PACK_SIZE>;
-    if (access_id_in_head >= rotary_dim) {
-        return x;
-    }
     const int embed_dim = rotary_dim / 2;
+    if(access_id_in_head >= rotary_dim)
+        return x;
+
     const int64_t pos_id = position_ids[token_id];
-    const T* cache_ptr = cos_sin_cache + pos_id * (int64_t)rotary_dim;
-    const T* cos_ptr = cache_ptr;
-    const T* sin_ptr = cache_ptr + embed_dim;
+    const T* cache_ptr   = cos_sin_cache + pos_id * (int64_t)rotary_dim;
+    const T* cos_ptr     = cache_ptr;
+    const T* sin_ptr     = cache_ptr + embed_dim;
+    const int partner_delta = embed_dim / PACK_SIZE;
     P y;
+
 #pragma unroll
-    for (int i = 0; i < PACK_SIZE; ++i) {
+    for(int i = 0; i < PACK_SIZE; ++i)
+    {
         const int dim = access_id_in_head + i;
-        if (dim < rotary_dim) {
-            const int peer_dim = (dim < embed_dim) ? dim + embed_dim : dim - embed_dim;
-            const float peer = static_cast<float>(peer_base[peer_dim]);
+        if(dim < rotary_dim)
+        {
             const float self = static_cast<float>(x[i]);
+            const float peer = shfl_xor<float>(self, partner_delta);
             const int half_dim = dim % embed_dim;
             const float c = static_cast<float>(cos_ptr[half_dim]);
             const float s = static_cast<float>(sin_ptr[half_dim]);
-            // vLLM NEOX: [x0, x1] -> [x0*cos - x1*sin, x1*cos + x0*sin]
-            const float rotated = (dim < embed_dim)
-                ? (self * c - peer * s)
-                : (self * c + peer * s);
-            y[i] = downcast_s<T>(rotated);
-        } else {
+            y[i] = dim < embed_dim ? downcast_s<T>(self * c - peer * s)
+                                   : downcast_s<T>(self * c + peer * s);
+        }
+        else
+        {
             y[i] = x[i];
         }
     }
@@ -2406,38 +2406,33 @@ __global__ void __launch_bounds__(1024, 1)
                 vec[v] = downcast_s<T>(acc[v] * denom * weight_p[v]);
             if constexpr (FUSE_ROPE) {
                 const int access_id_in_head = access_id_in_token % head_dim;
-                vec = apply_neox_rope_pack<T, pack_size>(
+                vec = apply_neox_rope_pack_shuffle<T, pack_size>(
                     vec,
-                    q_out + tidx * hidden_dim_q + (access_id_in_token / head_dim) * head_dim,
                     cos_sin_cache,
                     position_ids,
                     tidx,
                     access_id_in_head,
-                    head_dim,
                     rotary_dim);
             }
             *reinterpret_cast<P*>(&q_out[tidx * hidden_dim_q + access_id_in_token]) = vec;
         } else if (is_qk) {
-            P weight_p = *reinterpret_cast<P*>(&k_w[access_id_in_token - hidden_dim_q]);
+            const int k_access = access_id_in_token - hidden_dim_q;
+            P weight_p = *reinterpret_cast<P*>(&k_w[k_access]);
             float denom = rsqrtf(smem[1] / ngpus + eps);
 #pragma unroll
             for(int v = 0; v < pack_size; ++v)
                 vec[v] = downcast_s<T>(acc[v] * denom * weight_p[v]);
             if constexpr (FUSE_ROPE) {
-                const int k_access = access_id_in_token - hidden_dim_q;
                 const int access_id_in_head = k_access % head_dim;
-                vec = apply_neox_rope_pack<T, pack_size>(
+                vec = apply_neox_rope_pack_shuffle<T, pack_size>(
                     vec,
-                    k_out + tidx * hidden_dim_k + (k_access / head_dim) * head_dim,
                     cos_sin_cache,
                     position_ids,
                     tidx,
                     access_id_in_head,
-                    head_dim,
                     rotary_dim);
             }
-            *reinterpret_cast<P*>(&k_out[tidx * hidden_dim_k +
-                                         access_id_in_token - hidden_dim_q]) = vec;
+            *reinterpret_cast<P*>(&k_out[tidx * hidden_dim_k + k_access]) = vec;
         }
         __syncthreads();
     }
@@ -2474,6 +2469,19 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
     if (!valid)
         throw std::runtime_error(
             "Invalid qk hidden dim layout for qknorm_allreduce_fusion_kernel_2stage kernel");
+    if constexpr(FUSE_ROPE)
+    {
+        if(cos_sin_cache == nullptr || position_ids == nullptr)
+            throw std::runtime_error("qknorm_allreduce rope fusion requires cos_sin_cache and position_ids");
+        if(head_dim <= 0 || rotary_dim <= 0 || rotary_dim > head_dim || rotary_dim % 2 != 0)
+            throw std::runtime_error("Invalid head_dim/rotary_dim for qknorm_allreduce rope fusion");
+        if(hidden_dim_q % head_dim != 0 || hidden_dim_k % head_dim != 0)
+            throw std::runtime_error("q/k hidden dims must be multiples of head_dim for rope fusion");
+        if(rotary_dim % (2 * PACK_SIZE) != 0)
+            throw std::runtime_error("rotary_dim/2 must be divisible by PACK_SIZE for rope shuffle fusion");
+        if(head_dim / PACK_SIZE > WARP_SIZE)
+            throw std::runtime_error("rope shuffle fusion requires one head to fit within one warp");
+    }
     dim3 threadsPerBlock(BLOCK_SIZE);
     int grid_blocks = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(grid_blocks);

@@ -835,4 +835,88 @@ void fused_qknorm_allreduce(fptr_t _fa,
 #undef DISPATCH_AR_FUSION
 }
 
+void fused_qknorm_allreduce_rope(fptr_t _fa,
+                                 const aiter_tensor_t& qkv_in,
+                                 const aiter_tensor_t& q_w,
+                                 const aiter_tensor_t& k_w,
+                                 const aiter_tensor_t& q_out,
+                                 const aiter_tensor_t& k_out,
+                                 const aiter_tensor_t& v_out,
+                                 const aiter_tensor_t& cos_sin_cache,
+                                 const aiter_tensor_t& position_ids,
+                                 int64_t head_dim,
+                                 int64_t rotary_dim,
+                                 double eps,
+                                 int64_t reg_ptr,
+                                 int64_t reg_bytes)
+{
+    HipDeviceGuard device_guard(qkv_in.device_id);
+    hipStream_t stream   = aiter::getCurrentHIPStream();
+    auto dtype           = qkv_in.dtype();
+    int64_t hidden_dim_q = q_w.numel();
+    int64_t hidden_dim_k = k_w.numel();
+    int64_t token_num    = qkv_in.size(0);
+    int64_t hidden_dim_v = qkv_in.size(1) - (hidden_dim_q + hidden_dim_k);
+    auto fa              = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int64_t data_bytes   = qkv_in.numel() * qkv_in.element_size();
+    void* inp_ptr        = qkv_in.data_ptr();
+
+    if(qkv_in.dtype() != cos_sin_cache.dtype())
+        throw std::runtime_error("fused_qknorm_allreduce_rope requires cos_sin_cache dtype to match qkv_in dtype");
+    if(position_ids.dtype() != AITER_DTYPE_i64)
+        throw std::runtime_error("fused_qknorm_allreduce_rope requires int64 position_ids");
+    if(cos_sin_cache.dim() != 2 || cos_sin_cache.size(1) < rotary_dim)
+        throw std::runtime_error("fused_qknorm_allreduce_rope expects cos_sin_cache shape [max_pos, rotary_dim]");
+
+    if(reg_ptr != 0)
+    {
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, qkv_in.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        inp_ptr = (void*)reg_ptr;
+    }
+
+#define DISPATCH_AR_ROPE_FUSION(DTYPE)                                                      \
+    {                                                                                        \
+        fa->dispatchFusedQKNormAllReduce<DTYPE, true>(stream,                                \
+                                                reinterpret_cast<DTYPE*>(inp_ptr),           \
+                                                reinterpret_cast<DTYPE*>(q_w.data_ptr()),    \
+                                                reinterpret_cast<DTYPE*>(k_w.data_ptr()),    \
+                                                reinterpret_cast<DTYPE*>(q_out.data_ptr()),  \
+                                                reinterpret_cast<DTYPE*>(k_out.data_ptr()),  \
+                                                reinterpret_cast<DTYPE*>(v_out.data_ptr()),  \
+                                                token_num,                                   \
+                                                hidden_dim_q,                                \
+                                                hidden_dim_k,                                \
+                                                hidden_dim_v,                                \
+                                                eps,                                         \
+                                                reinterpret_cast<DTYPE*>(cos_sin_cache.data_ptr()), \
+                                                reinterpret_cast<int64_t*>(position_ids.data_ptr()), \
+                                                head_dim,                                    \
+                                                rotary_dim);                                 \
+    }
+
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp32: {
+        DISPATCH_AR_ROPE_FUSION(opus::fp32_t)
+        break;
+    }
+    case AITER_DTYPE_fp16: {
+        DISPATCH_AR_ROPE_FUSION(opus::fp16_t)
+        break;
+    }
+#if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16: {
+        DISPATCH_AR_ROPE_FUSION(opus::bf16_t)
+        break;
+    }
+#endif
+    default:
+        throw std::runtime_error("custom allreduce rope only supports float32, float16 and bfloat16");
+    }
+#undef DISPATCH_AR_ROPE_FUSION
+}
+
 } // namespace aiter
