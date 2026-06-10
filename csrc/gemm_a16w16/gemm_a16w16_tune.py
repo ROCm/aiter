@@ -652,6 +652,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
             return []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
         cu_num = get_cu_num()
+        rtol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
+        atol = rtol
         cand_kids = _opus_candidate_kids_for_shape(M, N, K, has_bias, cu_num)
         tasks = []
         for kid in sorted(cand_kids):
@@ -684,8 +686,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
                         ),
                         {},
                         None,
-                        2e-2,
-                        1.0,
+                        rtol,
+                        atol,
                         None,
                         None,
                         ("out_asm",),
