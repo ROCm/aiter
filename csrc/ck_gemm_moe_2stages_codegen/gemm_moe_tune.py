@@ -269,7 +269,50 @@ class FmoeTuner(TunerCommon):
             return {}
         df = pd.read_csv(file)
         kernel_dict = df.groupby(key)["knl_name"].apply(list).to_dict()
-        return kernel_dict
+        return self._filter_excluded_kernels(kernel_dict, file)
+
+    @staticmethod
+    def _filter_excluded_kernels(kernel_dict, file=""):
+        """Drop asm kernel candidates whose name matches the regex in
+        ``AITER_FMOE_TUNE_EXCLUDE_KERNEL_RE`` (default ``_pf2``).
+
+        The default excludes the prefetch-depth-2 (``_pf2``) asm stage1 g1u1
+        kernels, which carry a prefetch-pipeline synchronization race that
+        intermittently corrupts the stage1 output (NaN / large-magnitude rows;
+        see FMOE_ASM_STAGE1_PF2_BUG.md). The matching ``_pf3`` variants are
+        race-free, and every tile_m bucket has a non-``_pf2`` alternative.
+
+        Exclusion is coverage-aware: a candidate is only dropped when its group
+        retains at least one surviving candidate, so no bucket is ever orphaned.
+        Set ``AITER_FMOE_TUNE_EXCLUDE_KERNEL_RE=""`` to disable filtering.
+        """
+        pattern = os.environ.get("AITER_FMOE_TUNE_EXCLUDE_KERNEL_RE", "_pf2")
+        if not pattern:
+            return kernel_dict
+        import re
+
+        rx = re.compile(pattern)
+        fname = os.path.basename(file)
+        filtered = {}
+        for k, names in kernel_dict.items():
+            kept = [n for n in names if not rx.search(str(n))]
+            dropped = [n for n in names if rx.search(str(n))]
+            if dropped and not kept:
+                # Dropping would orphan this bucket -> keep originals and warn.
+                print(
+                    f"[fmoe_tune] WARNING: keeping kernels matching {pattern!r} for "
+                    f"group {k} in {fname}: no alternative candidate available "
+                    f"({names})"
+                )
+                filtered[k] = names
+            else:
+                if dropped:
+                    print(
+                        f"[fmoe_tune] excluding {len(dropped)} kernel(s) matching "
+                        f"{pattern!r} for group {k} in {fname}: {dropped}"
+                    )
+                filtered[k] = kept
+        return filtered
 
     @staticmethod
     def ck_moe_stage1_fwd_out(
