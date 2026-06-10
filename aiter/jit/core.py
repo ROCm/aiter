@@ -27,6 +27,7 @@ from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
+ATOM_DISABLE_KERNARG_PRELOAD = int(os.environ.get("ATOM_DISABLE_KERNARG_PRELOAD", "0")) != 0
 
 
 def is_experimental_enabled() -> bool:
@@ -777,7 +778,6 @@ def build_module(
             "-D__HIP_PLATFORM_AMD__=1",
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
-            "-mllvm --amdgpu-kernarg-preload-count=16",
             # "-v --save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",
@@ -788,6 +788,8 @@ def build_module(
             "-fgpu-flush-denormals-to-zero",
             f"-DDLLVM_MAIN_REVISION={check_LLVM_MAIN_REVISION()}",
         ]
+        if not ATOM_DISABLE_KERNARG_PRELOAD:
+            flags_hip += ["-mllvm --amdgpu-kernarg-preload-count=16"]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
