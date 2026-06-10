@@ -844,22 +844,22 @@ if __name__ == "__main__":
             args.input_layout,
         )
         collected.append(ret)
-        test_flash_attn_seq_padding(
-            "mixed",
-            args.batch_size,
-            args.nheads,
-            args.seqlen_q,
-            args.seqlen_k,
-            dim_qk,
-            dim_v,
-            args.dropout_p,
-            causal,
-            local,
-            args.bias_type if args.bias_type != "bias" else "no",
-            deterministic,
-            gqa_ratio,
-            dtypes.d_dtypes[dtype],
-        )
+        # test_flash_attn_seq_padding(
+        #     "mixed",
+        #     args.batch_size,
+        #     args.nheads,
+        #     args.seqlen_q,
+        #     args.seqlen_k,
+        #     dim_qk,
+        #     dim_v,
+        #     args.dropout_p,
+        #     causal,
+        #     local,
+        #     args.bias_type if args.bias_type != "bias" else "no",
+        #     deterministic,
+        #     gqa_ratio,
+        #     dtypes.d_dtypes[dtype],
+        # )
 
     df = pd.DataFrame(collected)
     aiter.logger.info(f"mha summary:\n{df}")

@@ -15,6 +15,7 @@ This test can be run in two ways:
 
 import argparse
 import itertools
+import os
 import sys
 
 import pandas as pd
@@ -33,6 +34,124 @@ from aiter.utility.dtypes import str2Dtype, str2tuple
 # - softplus/softmax use set-based ID matching (id_errors/max_weight_err)
 #   because torch references intentionally use `topk(..., sorted=False)` to
 #   mirror routing behavior where top-K order is not semantically required.
+#
+# Tie-aware selection: the fused kernel scores experts with hardware-approximate
+# math (exp2f/log2f, ~1e-6 ULP), while the torch reference uses exact libm. When
+# two experts straddle the top-K cutoff with biased selection scores closer than
+# this noise, which one wins is a genuine tie and the choice is semantically
+# irrelevant (the swapped experts carry near-identical weights). We must NOT flag
+# such boundary ties as errors, otherwise tiny token counts (e.g. 64) make a
+# single harmless flip exceed the 1% threshold. `_count_routing_mismatches`
+# excuses a token iff every kernel-only expert sits within `tol` below the cutoff
+# and every reference-only expert sits within `tol` above it.
+
+# Tolerance for boundary ties: ~1e-4 is ~100x the kernel's score-approximation
+# noise (~1e-6 on O(1) scores), so genuine routing bugs (gaps >> 1e-4) are still
+# caught while harmless tie flips are excused.
+_TIE_TOL = 1e-4
+
+
+def _selection_scores(
+    gating_output: torch.Tensor, bias: torch.Tensor, score_func: str
+) -> torch.Tensor:
+    """Reference biased selection scores [num_tokens, num_experts] in fp32.
+
+    These mirror exactly what the torch reference (and the kernel) sort by to
+    pick the top-K: sqrt(softplus(x))+bias for softplus, softmax(x)+bias for
+    softmax (bias is added AFTER softmax normalization, matching the kernel).
+    """
+    g = gating_output.float()
+    if score_func == "softplus":
+        scores = torch.nn.functional.softplus(g).sqrt()
+    elif score_func == "softmax":
+        scores = torch.softmax(g, dim=-1)
+    else:
+        raise ValueError(f"unsupported score_func: {score_func}")
+    if bias is not None and bias.numel() > 0:
+        scores = scores + bias.float()
+    return scores
+
+
+def _count_routing_mismatches(
+    i_fused: torch.Tensor,
+    i_torch: torch.Tensor,
+    sel_scores: torch.Tensor,
+    topk: int,
+    tol: float = _TIE_TOL,
+    *,
+    bias: torch.Tensor = None,
+    label: str = "",
+) -> int:
+    """Number of tokens whose selected expert set differs from the reference in
+    a way NOT explained by a near-tie at the top-K selection boundary.
+
+    A token is excused when every kernel-only expert has a selection score within
+    `tol` below the reference cutoff and every reference-only expert is within
+    `tol` above it (i.e. all disagreements sit on the cutoff and are ties).
+
+    Set env TOPK_TIE_DEBUG=1 to print, for every disagreeing token, the boundary
+    experts with their unbiased score f(x), bias, biased selection score f(x)+bias
+    and the gap to the cutoff -- evidence that disagreements are genuine ties
+    created by the bias bringing two experts' biased scores nearly equal.
+    """
+    debug = os.environ.get("TOPK_TIE_DEBUG", "0") != "0"
+    # Copy small tensors to CPU once to avoid per-token CUDA syncs.
+    i_fused_cpu = i_fused.cpu()
+    i_torch_cpu = i_torch.cpu()
+    sel_cpu = sel_scores.cpu()
+    sorted_sel, _ = sel_cpu.sort(dim=-1, descending=True)
+    cutoff = sorted_sel[:, topk - 1]  # k-th largest selection score per token
+    has_bias = bias is not None and bias.numel() > 0
+    bias_cpu = bias.cpu() if has_bias else None
+    mism = 0
+    for t in range(i_fused_cpu.shape[0]):
+        fused_row = i_fused_cpu[t].tolist()
+        torch_row = i_torch_cpu[t].tolist()
+        kset = set(fused_row)
+        rset = set(torch_row)
+        # Duplicate expert IDs collapse in set(); treat as real mismatch.
+        if kset == rset and len(kset) == topk:
+            continue
+        thr = cutoff[t].item()
+        extra = kset - rset  # kernel picked, ref didn't -> must be >= thr - tol
+        missing = rset - kset  # ref picked, kernel didn't -> must be <= thr + tol
+        excused = (
+            len(kset) == topk
+            and len(rset) == topk
+            and all(sel_cpu[t, e].item() >= thr - tol for e in extra)
+            and all(sel_cpu[t, e].item() <= thr + tol for e in missing)
+        )
+        if not excused:
+            mism += 1
+
+        if debug:
+
+            def _fmt(e):
+                sel = sel_cpu[t, e].item()
+                b = float(bias_cpu[e]) if has_bias else 0.0
+                return (
+                    f"      expert {e:4d}: f(x)={sel - b:+.7f}  bias={b:+.7f}  "
+                    f"f(x)+bias={sel:+.7f}  gap_to_cutoff={sel - thr:+.2e}"
+                )
+
+            tag = "TIE (excused)" if excused else "REAL MISMATCH"
+            print(
+                f"[TIE_DEBUG]{(' ' + label) if label else ''} token {t}: {tag}  "
+                f"cutoff(k={topk})={thr:+.7f}"
+            )
+            print("    kernel-only (picked by fused, not ref):")
+            for e in sorted(extra):
+                print(_fmt(e))
+            print("    ref-only (picked by torch, not fused):")
+            for e in sorted(missing):
+                print(_fmt(e))
+            for ek in sorted(extra):
+                for er in sorted(missing):
+                    d = abs(sel_cpu[t, ek].item() - sel_cpu[t, er].item())
+                    print(
+                        f"    |f(x)+bias gap| between kernel#{ek} and ref#{er} = {d:.2e}"
+                    )
+    return mism
 
 
 @perftest(num_iters=10, num_warmup=1)
@@ -149,15 +268,8 @@ def benchmark_topk_sigmoid(
     topk: int = 4,
     dtype: torch.dtype = torch.float16,
 ):
-    # generate data - each row has only unique values
-    gating_output = (
-        torch.arange(-1, 1, 2.0 / num_experts)
-        .repeat((num_tokens, 1))
-        .to(dtype=dtype, device="cuda")
-    )
-    permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
-    gating_output = torch.gather(gating_output, dim=-1, index=permutation)
-    assert gating_output.is_contiguous()
+    torch.random.manual_seed(0)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
     # run benchmarks
     (scores_torch, indices_torch), avg_torch = run_torch(gating_output.clone(), topk)
     (scores_fused, indices_fused), avg_fused = run_fused(gating_output.clone(), topk)
@@ -201,6 +313,45 @@ def benchmark_topk_sigmoid(
     return result
 
 
+def _max_weight_error(w_fused, i_fused, w_torch, i_torch):
+    """Max absolute weight error across tokens for matched expert ids."""
+    max_err = 0.0
+    for t in range(w_fused.shape[0]):
+        for k in range(w_fused.shape[1]):
+            kid = i_fused[t, k].item()
+            ref_k = (i_torch[t] == kid).nonzero(as_tuple=True)[0]
+            if len(ref_k) > 0:
+                max_err = max(
+                    max_err,
+                    abs(w_fused[t, k].item() - w_torch[t, ref_k[0]].item()),
+                )
+    return max_err
+
+
+def _assert_weights_close(w_fused, i_fused, w_torch, i_torch):
+    """Assert matched expert weights are close; skip tie-swapped experts."""
+    for t in range(w_fused.shape[0]):
+        for k in range(w_fused.shape[1]):
+            kid = i_fused[t, k].item()
+            ref_k = (i_torch[t] == kid).nonzero(as_tuple=True)[0]
+            if len(ref_k) == 0:
+                continue
+            torch.testing.assert_close(
+                w_fused[t, k], w_torch[t, ref_k[0]], atol=1e-5, rtol=1e-4
+            )
+
+
+def _make_gating(num_experts, num_tokens, dtype):
+    """Shuffled uniform gating output -- each row has unique values."""
+    gating_output = (
+        torch.arange(-1, 1, 2.0 / num_experts)
+        .repeat((num_tokens, 1))
+        .to(dtype=dtype, device="cuda")
+    )
+    permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
+    return torch.gather(gating_output, dim=-1, index=permutation).contiguous()
+
+
 def benchmark_topk_softplus(
     num_experts: int = 256,
     num_tokens: int = 1024,
@@ -209,13 +360,8 @@ def benchmark_topk_softplus(
     renormalize: bool = True,
     route_scale: float = 2.5,
 ):
-    gating_output = (
-        torch.arange(-1, 1, 2.0 / num_experts)
-        .repeat((num_tokens, 1))
-        .to(dtype=dtype, device="cuda")
-    )
-    permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
-    gating_output = torch.gather(gating_output, dim=-1, index=permutation)
+    torch.random.manual_seed(1)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
     bias = torch.randn(num_experts, dtype=dtype, device="cuda") * 0.1
 
     (w_torch, i_torch), avg_torch = run_torch_softplus(
@@ -225,22 +371,18 @@ def benchmark_topk_softplus(
         gating_output.clone(), bias, topk, renormalize, route_scale
     )
 
-    # compare by matching expert ids per token
-    id_match = 0
-    max_w_err = 0.0
-    for t in range(num_tokens):
-        kern_set = set(i_fused[t].tolist())
-        ref_set = set(i_torch[t].tolist())
-        if kern_set == ref_set:
-            id_match += 1
-            for k in range(topk):
-                kid = i_fused[t, k].item()
-                ref_k = (i_torch[t] == kid).nonzero(as_tuple=True)[0]
-                if len(ref_k) > 0:
-                    err = abs(w_fused[t, k].item() - w_torch[t, ref_k[0]].item())
-                    max_w_err = max(max_w_err, err)
-
-    id_err = 1.0 - id_match / num_tokens
+    sel = _selection_scores(gating_output, bias, "softplus")
+    id_err = (
+        _count_routing_mismatches(
+            i_fused,
+            i_torch,
+            sel,
+            topk,
+            bias=bias,
+            label=f"softplus E={num_experts} T={num_tokens} k={topk} {dtype}",
+        )
+        / num_tokens
+    )
 
     result = {
         "num_experts": num_experts,
@@ -251,15 +393,13 @@ def benchmark_topk_softplus(
         "fused_us": avg_fused,
         "uplift": avg_torch / avg_fused,
         "id_errors": id_err,
-        "max_weight_err": max_w_err,
+        "max_weight_err": _max_weight_error(w_fused, i_fused, w_torch, i_torch),
     }
-
     if id_err > 0.01:
         print(
             f"\n[ERROR] softplus: num_experts={num_experts}, num_tokens={num_tokens}, "
             f"topk={topk}, dtype={str(dtype).split('.')[-1]}, id_err={id_err:.4f}"
         )
-
     return result
 
 
@@ -271,13 +411,8 @@ def benchmark_topk_softmax(
     route_scale: float = 1.0,
     use_bias: bool = True,
 ):
-    gating_output = (
-        torch.arange(-1, 1, 2.0 / num_experts)
-        .repeat((num_tokens, 1))
-        .to(dtype=dtype, device="cuda")
-    )
-    permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
-    gating_output = torch.gather(gating_output, dim=-1, index=permutation)
+    torch.random.manual_seed(2)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
     bias = (
         torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
         if use_bias
@@ -291,21 +426,18 @@ def benchmark_topk_softmax(
         gating_output.clone(), bias, topk, route_scale
     )
 
-    id_match = 0
-    max_w_err = 0.0
-    for t in range(num_tokens):
-        kern_set = set(i_fused[t].tolist())
-        ref_set = set(i_torch[t].tolist())
-        if kern_set == ref_set:
-            id_match += 1
-            for k in range(topk):
-                kid = i_fused[t, k].item()
-                ref_k = (i_torch[t] == kid).nonzero(as_tuple=True)[0]
-                if len(ref_k) > 0:
-                    err = abs(w_fused[t, k].item() - w_torch[t, ref_k[0]].item())
-                    max_w_err = max(max_w_err, err)
-
-    id_err = 1.0 - id_match / num_tokens
+    sel = _selection_scores(gating_output, bias, "softmax")
+    id_err = (
+        _count_routing_mismatches(
+            i_fused,
+            i_torch,
+            sel,
+            topk,
+            bias=bias,
+            label=f"softmax E={num_experts} T={num_tokens} k={topk} {dtype}",
+        )
+        / num_tokens
+    )
 
     result = {
         "num_experts": num_experts,
@@ -316,15 +448,13 @@ def benchmark_topk_softmax(
         "fused_us": avg_fused,
         "uplift": avg_torch / avg_fused,
         "id_errors": id_err,
-        "max_weight_err": max_w_err,
+        "max_weight_err": _max_weight_error(w_fused, i_fused, w_torch, i_torch),
     }
-
     if id_err > 0.01:
         print(
             f"\n[ERROR] softmax: num_experts={num_experts}, num_tokens={num_tokens}, "
             f"topk={topk}, dtype={str(dtype).split('.')[-1]}, id_err={id_err:.4f}"
         )
-
     return result
 
 
@@ -344,13 +474,7 @@ def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype, bias_dt
     torch.random.manual_seed(0)
     route_scale = 2.5
 
-    gating_output = (
-        torch.arange(-1, 1, 2.0 / num_experts)
-        .repeat((num_tokens, 1))
-        .to(dtype=dtype, device="cuda")
-    )
-    permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
-    gating_output = torch.gather(gating_output, dim=-1, index=permutation)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
     bias = (torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1).to(
         bias_dtype
     )
@@ -362,24 +486,21 @@ def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype, bias_dt
         gating_output.clone(), bias, topk, True, route_scale
     )
 
-    # compare ids per token (order may differ)
-    for t in range(num_tokens):
-        kern_set = set(i_fused[t].tolist())
-        ref_set = set(i_torch[t].tolist())
-        assert kern_set == ref_set, (
-            f"Token {t} (gating={dtype},bias={bias_dtype},E={num_experts},topk={topk}): "
-            f"ID mismatch kernel={sorted(kern_set)} ref={sorted(ref_set)}"
-        )
+    sel = _selection_scores(gating_output, bias, "softplus")
+    n_mism = _count_routing_mismatches(
+        i_fused,
+        i_torch,
+        sel,
+        topk,
+        bias=bias,
+        label=f"softplus gating={dtype} bias={bias_dtype} E={num_experts} k={topk}",
+    )
+    assert n_mism == 0, (
+        f"gating={dtype},bias={bias_dtype},E={num_experts},topk={topk}: "
+        f"{n_mism}/{num_tokens} tokens have non-tie ID mismatches"
+    )
 
-    # compare weights (match by expert id)
-    for t in range(num_tokens):
-        for k in range(topk):
-            kid = i_fused[t, k].item()
-            ref_k = (i_torch[t] == kid).nonzero(as_tuple=True)[0]
-            assert len(ref_k) > 0
-            torch.testing.assert_close(
-                w_fused[t, k], w_torch[t, ref_k[0]], atol=1e-5, rtol=1e-4
-            )
+    _assert_weights_close(w_fused, i_fused, w_torch, i_torch)
 
 
 # Pytest-parametrized test functions -- topk_sigmoid
@@ -390,16 +511,7 @@ def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype, bias_dt
 def test_topk_sigmoid_correctness(num_experts, num_tokens, topk, dtype):
     """Pytest test for correctness of topk_sigmoid operation."""
     torch.random.manual_seed(0)
-
-    # generate data - each row has only unique values
-    gating_output = (
-        torch.arange(-1, 1, 2.0 / num_experts)
-        .repeat((num_tokens, 1))
-        .to(dtype=dtype, device="cuda")
-    )
-    permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
-    gating_output = torch.gather(gating_output, dim=-1, index=permutation)
-    assert gating_output.is_contiguous()
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
 
     # run both implementations
     (scores_torch, indices_torch), _ = run_torch(gating_output.clone(), topk)
@@ -424,13 +536,7 @@ def test_topk_softmax_correctness(num_experts, num_tokens, topk, dtype):
     torch.random.manual_seed(0)
     route_scale = 1.0
 
-    gating_output = (
-        torch.arange(-1, 1, 2.0 / num_experts)
-        .repeat((num_tokens, 1))
-        .to(dtype=dtype, device="cuda")
-    )
-    permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
-    gating_output = torch.gather(gating_output, dim=-1, index=permutation)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
     bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
 
     (w_torch, i_torch), _ = run_torch_softmax(
@@ -440,23 +546,21 @@ def test_topk_softmax_correctness(num_experts, num_tokens, topk, dtype):
         gating_output.clone(), bias, topk, route_scale
     )
 
-    # compare ids per token (order may differ)
-    for t in range(num_tokens):
-        kern_set = set(i_fused[t].tolist())
-        ref_set = set(i_torch[t].tolist())
-        assert (
-            kern_set == ref_set
-        ), f"Token {t}: ID mismatch kernel={sorted(kern_set)} ref={sorted(ref_set)}"
+    sel = _selection_scores(gating_output, bias, "softmax")
+    n_mism = _count_routing_mismatches(
+        i_fused,
+        i_torch,
+        sel,
+        topk,
+        bias=bias,
+        label=f"softmax E={num_experts} k={topk} dtype={dtype}",
+    )
+    assert n_mism == 0, (
+        f"E={num_experts},topk={topk},dtype={dtype}: "
+        f"{n_mism}/{num_tokens} tokens have non-tie ID mismatches"
+    )
 
-    # compare weights (match by expert id)
-    for t in range(num_tokens):
-        for k in range(topk):
-            kid = i_fused[t, k].item()
-            ref_k = (i_torch[t] == kid).nonzero(as_tuple=True)[0]
-            assert len(ref_k) > 0
-            torch.testing.assert_close(
-                w_fused[t, k], w_torch[t, ref_k[0]], atol=1e-5, rtol=1e-4
-            )
+    _assert_weights_close(w_fused, i_fused, w_torch, i_torch)
 
 
 if __name__ == "__main__":

@@ -145,7 +145,7 @@ def _batched_gemm_bf16_kernel(
             a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-        accumulator += tl.dot(a, b)
+        accumulator = tl.dot(a, b, acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -179,4 +179,5 @@ def _get_config(
     K: int,
 ):
 
+    # BF16 uses the shared 16-bit activation / 16-bit weight batched GEMM config.
     return get_gemm_config("BATCHED_GEMM-A16W16", M, N, K)
