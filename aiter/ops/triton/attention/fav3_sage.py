@@ -51,6 +51,29 @@ def get_sage_fwd_configs():
         }
 
 
+def build_tile_schedule(
+    lut_count: torch.Tensor,
+    descending: bool = True,
+) -> torch.Tensor:
+    """Order the block-sparse q-block tiles by their KV-block work for load balance.
+
+    The block-sparse kernel launches one program per
+    ``(batch, head, q_block)`` segment, and each program loops over
+    ``lut_count[seg]`` KV blocks (``seg = b*(H*Q) + h*Q + q_block``). When the
+    per-segment counts are very uneven (e.g. some heads near-dense, others
+    sparse) a naive launch leaves heavy tiles running in the tail while light
+    tiles have long finished.
+
+    Returns an int32 permutation of segment indices sorted by ``lut_count``
+    (descending by default = longest-processing-time-first). Used internally by
+    :func:`fav3_sage_func` when ``sparge_load_balancing=True``: the persistent
+    atomic work queue hands these out heaviest-first, shrinking the makespan
+    tail.
+    """
+    order = torch.argsort(lut_count.to(torch.int64), descending=descending, stable=True)
+    return order.to(torch.int32).contiguous()
+
+
 class _FAv3SageWrapperFunc(torch.autograd.Function):
     """
     Sage Attention v1 wrapper that maintains high-precision inputs/outputs.
@@ -342,6 +365,7 @@ def fav3_sage_func(
     lut_count: Optional[torch.Tensor] = None,
     use_block_sparse: bool = False,
     freeze_softmax_max_count: int = -1,
+    sparge_load_balancing: bool = False,
 ):
     """
     SageAttention v1.
@@ -482,9 +506,41 @@ def fav3_sage_func(
         lut_start = torch.zeros(1, dtype=torch.int32, device=q.device)
         lut_count = torch.zeros(1, dtype=torch.int32, device=q.device)
 
+    if sparge_load_balancing and not use_block_sparse:
+        raise ValueError(
+            "sparge_load_balancing=True is only supported on the block-sparse "
+            "path (use_block_sparse=True)."
+        )
+
+    # Sparge load balancing: sort the (batch, head, q_block) tiles by descending
+    # KV-block count (longest-processing-time first) and run them through a
+    # persistent kernel whose resident programs share a global atomic work queue.
+    # This evens out the makespan when per-q-block KV-block counts are very
+    # uneven (e.g. some heads near-dense, others sparse).
+    use_tile_schedule = bool(sparge_load_balancing)
+    tile_schedule = None
+    tile_counter = None
+    n_tiles = 0
+    if use_tile_schedule:
+        tile_schedule = build_tile_schedule(lut_count)
+        n_tiles = tile_schedule.numel()
+        # Atomic work-queue counter; must start at zero on every launch.
+        tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+        # One resident workgroup per CU saturates this register-heavy kernel
+        # (occupancy ~1); surplus programs just find the queue drained and exit.
+        num_cus = torch.cuda.get_device_properties(q.device).multi_processor_count
+        num_programs = min(n_tiles, num_cus)
+
     # --- 7. Kernel Launch ---
-    def grid(META):
-        return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
+    if use_tile_schedule:
+
+        def grid(META):
+            return (num_programs,)
+
+    else:
+
+        def grid(META):
+            return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
 
     sage_fwd[grid](
         q,
@@ -568,6 +624,10 @@ def fav3_sage_func(
         USE_SEQUSED=False,
         USE_BLOCK_SPARSE=use_block_sparse,
         FREEZE_SOFTMAX_MAX_COUNT=freeze_softmax_max_count,
+        TILE_SCHEDULE=tile_schedule,
+        TILE_COUNTER=tile_counter,
+        NUM_TILES=n_tiles,
+        USE_TILE_SCHEDULE=use_tile_schedule,
         **config,
     )
 

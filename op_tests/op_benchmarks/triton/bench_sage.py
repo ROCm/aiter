@@ -578,6 +578,7 @@ def make_kernel_runner(
         )
 
         kv_idx, lut_s, lut_c, sparse = _unpack_block_lut(block_lut)
+        sparge_load_balancing = sparse and getattr(args, "sparge_load_balancing", False)
         return lambda: fav3_sage_func(
             q_int8,
             k_int8,
@@ -595,6 +596,7 @@ def make_kernel_runner(
             lut_count=lut_c,
             use_block_sparse=sparse,
             freeze_softmax_max_count=freeze_softmax_max_count,
+            sparge_load_balancing=sparge_load_balancing,
         )
 
     if args.kernel == "sage_mxfp4":
@@ -1363,6 +1365,16 @@ def parse_args() -> argparse.Namespace:
         "--sparge selection is meaningless. Takes precedence over --sparge.",
     )
 
+    parser.add_argument(
+        "--sparge-load-balancing",
+        action="store_true",
+        help="Load-balance the block-sparse launch: sort the (batch, head, "
+        "q_block) tiles by descending KV-block count (longest-processing-time "
+        "first) and run them through a persistent kernel whose resident "
+        "programs share a global atomic work queue, so heavy tiles never strand "
+        "idle CUs in the tail. Only affects the block-sparse "
+        "sage_fp8/sage_fp8_vfa path.",
+    )
     parser.add_argument(
         "--n-sample",
         type=int,

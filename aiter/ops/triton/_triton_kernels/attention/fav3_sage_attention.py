@@ -1255,6 +1255,188 @@ def sage_fwd(
     cu_seqlens_q,
     cu_seqlens_k,
     seqused_q,
+    seqused_k,
+    kv_block_indices,
+    lut_start,
+    lut_count,
+    num_q_blocks,
+    dropout_p,
+    philox_seed,
+    philox_offset_base,
+    RETURN_LSE: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
+    MAX_SEQLENS_Q: tl.constexpr,
+    MAX_SEQLENS_K: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    USE_SLIDING_WINDOW: tl.constexpr,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL_QK: tl.constexpr,
+    BLOCK_DMODEL_V: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PRE_LOAD_V: tl.constexpr,
+    USE_BIAS: tl.constexpr,
+    ENABLE_DROPOUT: tl.constexpr,
+    RETURN_SCORES: tl.constexpr,
+    USE_ALIBI: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    USE_SEQUSED: tl.constexpr,
+    USE_BLOCK_SPARSE: tl.constexpr,
+    FREEZE_SOFTMAX_MAX_COUNT: tl.constexpr = -1,
+    TILE_SCHEDULE=None,
+    TILE_COUNTER=None,
+    NUM_TILES=0,
+    USE_TILE_SCHEDULE: tl.constexpr = False,
+):
+    """Dispatch (batch, head, q_block) attention tiles to ``_sage_attn_one_tile``.
+
+    Two launch modes, selected by ``USE_TILE_SCHEDULE``:
+
+    * default (``False``): the classic dense launch -- a 3D grid
+      ``(num_q_blocks, HQ, batch)`` where each program owns one tile, decoded
+      straight from the program id.
+    * sparge load balancing (``True``): a persistent pool of resident programs
+      sharing a global atomic work queue. Each program repeatedly grabs the
+      next-heaviest unprocessed tile via ``tl.atomic_add(TILE_COUNTER, 1)`` over
+      the work-sorted ``TILE_SCHEDULE`` until the queue is drained. This is
+      dynamic longest-processing-time scheduling: a program that finishes a
+      light tile immediately pulls the next one, so the heavy tiles never
+      strand idle CUs in the tail. Pairs with the block-sparse path where
+      per-q-block KV-block counts are very uneven across heads.
+
+    ``TILE_SCHEDULE`` packs each segment as
+    ``seg = off_z*(HQ*num_q_blocks) + off_h_q*num_q_blocks + start_m`` (the same
+    layout as ``lut_idx`` in the tile body). ``TILE_COUNTER`` is a single int32
+    cell, zeroed by the host before each launch.
+    """
+    if USE_TILE_SCHEDULE:
+        tile = tl.atomic_add(TILE_COUNTER, 1)
+        while tile < NUM_TILES:
+            seg = tl.load(TILE_SCHEDULE + tile).to(tl.int64)
+            start_m = seg % num_q_blocks
+            seg_hz = seg // num_q_blocks
+            off_h_q = seg_hz % HQ
+            off_z = seg_hz // HQ
+            _sage_attn_one_tile(
+                start_m, off_h_q, off_z,
+                Q, K, V, bias, Q_Descale, K_Descale, V_Descale,
+                stride_qsz, stride_qsh, stride_qsblk,
+                stride_ksz, stride_ksh, stride_ksblk,
+                stride_vsz, stride_vsh, LSE, Out, SD_MASK, ALIBI_SLOPES,
+                stride_qz, stride_qh, stride_qm, stride_qk,
+                stride_kz, stride_kh, stride_kn, stride_kk,
+                stride_vz, stride_vh, stride_vk, stride_vn,
+                stride_oz, stride_oh, stride_om, stride_on,
+                stride_bz, stride_bh, stride_bm, stride_bn,
+                stride_az, stride_ah,
+                stride_sz, stride_sh, stride_sm, stride_sn,
+                stride_lse_z, stride_lse_h, stride_lse_m,
+                cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
+                kv_block_indices, lut_start, lut_count, num_q_blocks,
+                dropout_p, philox_seed, philox_offset_base,
+                RETURN_LSE, HQ, HK,
+                ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V,
+                MAX_SEQLENS_Q, MAX_SEQLENS_K, IS_VARLEN, IS_CAUSAL,
+                USE_SLIDING_WINDOW, WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT,
+                BLOCK_M, BLOCK_DMODEL_QK, BLOCK_DMODEL_V, BLOCK_N,
+                PRE_LOAD_V, USE_BIAS, ENABLE_DROPOUT, RETURN_SCORES,
+                USE_ALIBI, USE_EXP2, USE_SEQUSED, USE_BLOCK_SPARSE,
+                FREEZE_SOFTMAX_MAX_COUNT,
+            )
+            tile = tl.atomic_add(TILE_COUNTER, 1)
+    else:
+        start_m = tl.program_id(0).to(tl.int64)
+        off_h_q = tl.program_id(1).to(tl.int64)
+        off_z = tl.program_id(2).to(tl.int64)
+        _sage_attn_one_tile(
+            start_m, off_h_q, off_z,
+            Q, K, V, bias, Q_Descale, K_Descale, V_Descale,
+            stride_qsz, stride_qsh, stride_qsblk,
+            stride_ksz, stride_ksh, stride_ksblk,
+            stride_vsz, stride_vsh, LSE, Out, SD_MASK, ALIBI_SLOPES,
+            stride_qz, stride_qh, stride_qm, stride_qk,
+            stride_kz, stride_kh, stride_kn, stride_kk,
+            stride_vz, stride_vh, stride_vk, stride_vn,
+            stride_oz, stride_oh, stride_om, stride_on,
+            stride_bz, stride_bh, stride_bm, stride_bn,
+            stride_az, stride_ah,
+            stride_sz, stride_sh, stride_sm, stride_sn,
+            stride_lse_z, stride_lse_h, stride_lse_m,
+            cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
+            kv_block_indices, lut_start, lut_count, num_q_blocks,
+            dropout_p, philox_seed, philox_offset_base,
+            RETURN_LSE, HQ, HK,
+            ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V,
+            MAX_SEQLENS_Q, MAX_SEQLENS_K, IS_VARLEN, IS_CAUSAL,
+            USE_SLIDING_WINDOW, WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT,
+            BLOCK_M, BLOCK_DMODEL_QK, BLOCK_DMODEL_V, BLOCK_N,
+            PRE_LOAD_V, USE_BIAS, ENABLE_DROPOUT, RETURN_SCORES,
+            USE_ALIBI, USE_EXP2, USE_SEQUSED, USE_BLOCK_SPARSE,
+            FREEZE_SOFTMAX_MAX_COUNT,
+        )
+
+
+@triton.jit
+def _sage_attn_one_tile(
+    start_m,
+    off_h_q,
+    off_z,
+    Q,
+    K,
+    V,
+    bias,
+    Q_Descale,
+    K_Descale,
+    V_Descale,
+    stride_qsz,
+    stride_qsh,
+    stride_qsblk,
+    stride_ksz,
+    stride_ksh,
+    stride_ksblk,
+    stride_vsz,
+    stride_vsh,
+    LSE,
+    Out,
+    SD_MASK,
+    ALIBI_SLOPES,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vk,
+    stride_vn,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_on,
+    stride_bz,
+    stride_bh,
+    stride_bm,
+    stride_bn,
+    stride_az,
+    stride_ah,
+    stride_sz,
+    stride_sh,
+    stride_sm,
+    stride_sn,
+    stride_lse_z,
+    stride_lse_h,
+    stride_lse_m,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqused_q,
     seqused_k,  # Add seqused parameters
     kv_block_indices,
     lut_start,
@@ -1292,10 +1474,10 @@ def sage_fwd(
     # set params
     ACCUMULATOR_TYPE = tl.float32  # for q*k product
 
-    # compute offsets
-    start_m = tl.program_id(0).to(tl.int64)
-    off_h_q = tl.program_id(1).to(tl.int64)
-    off_z = tl.program_id(2).to(tl.int64)
+    # ``start_m`` (q-block index), ``off_h_q`` (q-head) and ``off_z`` (batch)
+    # are supplied by the ``sage_fwd`` dispatcher -- either straight from the
+    # 3D program id, or decoded from a packed tile-schedule segment for the
+    # load-balanced / persistent launch.
     # If MQA / GQA, set the K and V head offsets appropriately.
     GROUP_SIZE: tl.constexpr = HQ // HK
     if GROUP_SIZE != 1:
