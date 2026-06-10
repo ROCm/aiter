@@ -2125,9 +2125,9 @@ def _unified_attention_gluon_kernel_3d(
     )
     q_shared.store(Q_load)
     Q = q_shared.load(layout=cfg.Q_DOT_LAYOUT)
-    if QUERY_DTYPE != "nvfp4":
-        Q = Q.to(gl.float32) * qk_factor
-        Q = Q.to(query_ptr.type.element_ty)
+    # if QUERY_DTYPE != "nvfp4":
+    #     Q = Q.to(gl.float32) * qk_factor
+    #     Q = Q.to(query_ptr.type.element_ty)
 
     if QUERY_DTYPE == "nvfp4":
         # A4W4
@@ -2156,8 +2156,8 @@ def _unified_attention_gluon_kernel_3d(
         q_scales = q_scales_shared.load(layout=cfg.Q_SCALES_DOT_LAYOUT).to(
             e4m3_dtype, bitcast=True
         )
-        q_scales = q_scales.to(gl.float32) * qk_factor
-        q_scales = q_scales.to(e4m3_dtype)
+        # q_scales = q_scales.to(gl.float32) * qk_factor
+        # q_scales = q_scales.to(e4m3_dtype)
     elif KV_CACHE_DTYPE == "nvfp4":
         # A8W4
         q_scales = gl.full(
@@ -2315,7 +2315,7 @@ def _unified_attention_gluon_kernel_3d(
         pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=next_buffer_id)
 
         S = pgm.compute_qk(k, q_scales, k_scales)
-        # S = S * qk_factor
+        S = S * qk_factor
 
         S = pgm.apply_softcap(S)
         if need_addtional_mask:
@@ -2369,7 +2369,7 @@ def _unified_attention_gluon_kernel_3d(
         k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=buffer_id)
         k_scales = None
     S = pgm.compute_qk(k, q_scales, k_scales)
-    # S = S * qk_factor
+    S = S * qk_factor
 
     S = pgm.apply_softcap(S)
     seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
