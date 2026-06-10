@@ -668,9 +668,9 @@ namespace aiter {
 
             for(int i = 0; i < sinkhorn_repeat - 1; i++) {
                 row_sum = reduce_in_4threads(comb_mix_v, sum_f);
-                comb_mix_v = comb_mix_v * __builtin_amdgcn_rcpf(row_sum) + hc_sinkhorn_eps;
+                comb_mix_v = comb_mix_v * __builtin_amdgcn_rcpf(row_sum + hc_sinkhorn_eps);
                 col_sum = reduce_cross_4threads(comb_mix_v, sum_f);
-                comb_mix_v = comb_mix_v * __builtin_amdgcn_rcpf(col_sum) + hc_sinkhorn_eps;
+                comb_mix_v = comb_mix_v * __builtin_amdgcn_rcpf(col_sum + hc_sinkhorn_eps);
             }
 
             if (lane_id / hc_mult2 < m_oob) {
@@ -1506,9 +1506,9 @@ namespace aiter {
 
             for(int i = 0; i < sinkhorn_repeat - 1; i++) {
                 row_sum = reduce_in_4threads(comb_mix_v, sum_f);
-                comb_mix_v = comb_mix_v * __builtin_amdgcn_rcpf(row_sum) + hc_sinkhorn_eps;
+                comb_mix_v = comb_mix_v * __builtin_amdgcn_rcpf(row_sum + hc_sinkhorn_eps);
                 col_sum = reduce_cross_4threads(comb_mix_v, sum_f);
-                comb_mix_v = comb_mix_v * __builtin_amdgcn_rcpf(col_sum) + hc_sinkhorn_eps;
+                comb_mix_v = comb_mix_v * __builtin_amdgcn_rcpf(col_sum + hc_sinkhorn_eps);
             }
 
             if (lane_id / hc_mult2 < m_oob) {
@@ -1589,7 +1589,7 @@ namespace aiter {
             MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL((64 + 64 * 2), 4, 2, 1280, 256, 128, true); \
         } \
     } else { \
-        TORCH_CHECK(false, "hidden_size only supports 7168 and 4096"); \
+        TORCH_CHECK(false, "hidden_size only supports 7168, 4096, 2560 and 1280"); \
     }
 
     void mhc_pre_big_fuse_rmsnorm(
