@@ -1,0 +1,455 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Fused MoE route-map + MX quant + scatter-copy + scale-preshuffle (FlyDSL).
+
+The grouped a8w4/fp4 MoE stage1 input prep is normally four kernels (see
+``grouped_moe_gfx1250.py``):
+
+    1. build_route_maps          route i -> grouped row (atomic argsort)
+    2. per_1x32 MX quant         hidden(T, model_dim) -> payload + e8m0 scale
+    3. scatter_copy_token        payload[token] -> grouped_payload[row]
+    4. scatter_preshuffle_scale  scale[token]   -> grouped_scale[row] (WMMA layout)
+
+This kernel fuses all four into one *warp-per-route* pass. Each warp owns one
+route ``i = token*topk + k``:
+
+    lane 0   : expert = topk_ids[i]; slot = atomicAdd(counter[expert], 1)
+               grouped_row = expert*max_m + slot; topids_to_rows[i] = grouped_row
+    broadcast slot (hence grouped_row) to the whole warp via readlane
+    all lanes: quantize token's activation row directly into
+               grouped_payload[grouped_row] (fp4 e2m1 or fp8 e4m3) and write the
+               e8m0 block scales into grouped_scale in the preshuffled WMMA layout
+               for grouped_row -- no per-token intermediates, no rows_to_tokens.
+
+The quant math (per-1x32 E8M0 block scale + f32->e2m1) is shared with
+``silu_and_mul_fq.py`` via ``quant_utils``. ``counter`` must be zero-initialised
+before launch; after the run ``counter[expert] == masked_m[expert]``.
+
+Layout / intra-warp mapping
+---------------------------
+``model_dim`` is processed in 32-element MX blocks. Each lane quantizes
+``ELEMS_PER_LANE`` (=2) contiguous bf16 columns, so a block spans
+``LANES_PER_MX_BLOCK`` (=16) lanes and a wavefront (32 on gfx1250 / 64 on gfx9xx)
+covers ``wave_size // 16`` blocks at once. The per-block amax reduction is a
+butterfly ``shuffle_xor`` over the block's 16 lanes; the lead lane of each block
+(lane_in_block == 0) writes the single e8m0 scale byte.
+
+Scale preshuffle (per grouped row, mirrors
+``moe_scatter_copy_preshuffle_scale.py``): for a grouped row at within-expert
+position ``slot`` in expert ``e`` and MX block ``mx_block`` (with
+``scale_dword = mx_block // 4`` and ``byte_in_dword = mx_block % 4``)::
+
+    scale_tile  = slot // (wmma_rep*16)
+    wmma_row    = (slot % (wmma_rep*16)) // 16
+    row_lane16  = slot % 16
+    out_row     = scale_tile*16 + row_lane16
+    dst_dword   = e*(max_m*scale_dwords_per_row)
+                  + out_row*(scale_dwords_per_row*wmma_rep)
+                  + scale_dword*wmma_rep + wmma_row
+    dst_byte    = dst_dword*4 + byte_in_dword
+
+Each warp writes only its own (valid) row; padding rows are never touched, which
+matches the existing scatter-copy contract (the masked GEMM, bounded by
+``masked_m``, never reads padding payload or scale).
+
+Grid  : (ceil(numel / warps_per_block), 1, 1)   numel = token_num*topk
+Block : (BLOCK_THREADS, 1, 1)
+"""
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import arith, range_constexpr, const_expr, rocdl, vector
+from flydsl.expr.typing import T, Int32
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.compiler.kernel_function import CompilationContext
+
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, scf
+from flydsl.expr import buffer_ops
+from flydsl.runtime.device import get_rocm_arch
+
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
+from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
+
+from aiter.utility.mx_types import (
+    MxDtypeInt as _MxDtype,
+    MX_DEFAULT_ROUND_MODE as _ROUND_MODE,
+)
+
+BLOCK_THREADS = 256
+ELEMS_PER_LANE = 2  # bf16 columns each lane quantizes -> 1 fp4 byte / 2 fp8 bytes
+LANES_PER_MX_BLOCK = 32 // ELEMS_PER_LANE  # 16 lanes cover one 32-element MX block
+
+# Architectures with native scaled-pack f32->fp4/fp8 conversion
+# (``v_cvt_scalef32_pk_{fp4,fp8}_f32``). On these the per-block pack folds the
+# scale division in (one HW instruction, exact RNE); elsewhere we fall back to
+# the portable path (SW e2m1 emitter for fp4 / ``v_cvt_pk_fp8_f32`` for fp8,
+# both legal on gfx942).
+_NATIVE_SCALED_CVT_ARCHS = ("gfx950", "gfx1250")
+
+
+def _raw(value):
+    """Unwrap a DSL Numeric to a raw ir.Value (rocdl ops need raw operands)."""
+    return value.ir_value() if hasattr(value, "ir_value") else value
+
+
+def _arch_has_native_scaled_cvt(arch: str) -> bool:
+    return arch.startswith(_NATIVE_SCALED_CVT_ARCHS)
+
+
+def build_moe_fused_route_quant_scatter_module(
+    model_dim: int,
+    topk: int,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+):
+    """Return a JIT launcher for the fused route+quant+scatter+preshuffle kernel.
+
+    Parameters
+    ----------
+    model_dim : int    activation feature dim (must be a multiple of 32).
+    topk : int         routes per token (token = route // topk).
+    wmma_rep : int     ``warp_tile_m // 16`` (scale preshuffle tile geometry).
+    quant_mode : str   ``"fp4"`` (MXFP4 e2m1, payload model_dim//2) or ``"fp8"``
+                       (MXFP8 e4m3, payload model_dim).
+
+    The payload conversion path (native ``v_cvt_scalef32_pk_{fp4,fp8}_f32`` vs the
+    portable path) is chosen here from the current arch -- gfx950/gfx1250 use the
+    native scaled-convert instruction, everything else (incl. gfx942) uses the
+    portable path. ``topk_ids`` is int32 (the router's only output dtype).
+
+    Launcher signature::
+
+        (topk_ids, counter, topids_to_rows, hidden, grouped_payload, grouped_scale,
+         numel, max_m, grid_blocks, stream=...)
+
+      topk_ids        : (numel,)               int32  flattened expert ids
+      counter         : (E,)                   int32  per-expert counter, init 0
+                        (== masked_m[expert] after the run)
+      topids_to_rows  : (numel,)               int32  out: route -> grouped row
+      hidden          : (token_num*model_dim,) bf16   flat activations
+      grouped_payload : (E*max_m*payload_bytes_per_row,) uint8  out: MX payload
+                        (payload_bytes_per_row = model_dim//2 fp4 / model_dim fp8)
+      grouped_scale   : (E*(max_m//wmma_rep)*(model_dim//32)*wmma_rep,) uint8
+                        out: preshuffled e8m0 scale
+    """
+    if quant_mode not in ("fp4", "fp8"):
+        raise NotImplementedError(
+            f"moe_fused_route_quant_scatter: quant_mode={quant_mode!r} "
+            "unsupported (expected 'fp4' or 'fp8')."
+        )
+    assert model_dim % 32 == 0, f"model_dim ({model_dim}) must be a multiple of 32"
+    assert wmma_rep >= 1, "wmma_rep must be >= 1"
+
+    is_fp8 = quant_mode == "fp8"
+    arch = str(get_rocm_arch())
+    use_native = _arch_has_native_scaled_cvt(arch)
+
+    # MX target dtype for the E8M0 block-scale formula. fp8 uses the HW FP8
+    # variant: e4m3fnuz on gfx942, OCP e4m3fn on gfx950+ (matches silu_and_mul_fq).
+    if is_fp8:
+        mx_dtype = _MxDtype.FP8_E4M3_FNUZ if arch.startswith("gfx942") else _MxDtype.FP8_E4M3
+        # payload geometry: 1 fp8 byte/elem -> 32 bytes/MX-block, 2 bytes/lane.
+        payload_bytes_per_row = model_dim
+        payload_bytes_per_block = 32
+        payload_bytes_per_lane = ELEMS_PER_LANE
+    else:
+        mx_dtype = _MxDtype.FP4_E2M1
+        # packed fp4: 2 nibbles/byte -> 16 bytes/MX-block, 1 byte/lane.
+        payload_bytes_per_row = model_dim // 2
+        payload_bytes_per_block = 16
+        payload_bytes_per_lane = ELEMS_PER_LANE // 2
+
+    wave_size = get_warp_size()
+    assert BLOCK_THREADS % wave_size == 0
+    warps_per_block = BLOCK_THREADS // wave_size
+    mx_blocks_per_wave_iter = wave_size // LANES_PER_MX_BLOCK
+
+    mx_blocks_per_row = model_dim // 32  # also == scale_bytes_per_row (1 e8m0/block)
+    scale_bytes_per_row = mx_blocks_per_row
+    assert (
+        scale_bytes_per_row % 4 == 0
+    ), "model_dim//32 must be a multiple of 4 (dword-packed scale)"
+    scale_dwords_per_row = scale_bytes_per_row // 4
+    rows_per_tile = wmma_rep * 16
+    dst_scale_dwords_per_row = scale_dwords_per_row * wmma_rep
+
+    block_iters = (
+        mx_blocks_per_row + mx_blocks_per_wave_iter - 1
+    ) // mx_blocks_per_wave_iter
+
+    # Butterfly reduction distances within one 16-lane MX block.
+    amax_shuffle_dists = []
+    dist = 1
+    while dist < LANES_PER_MX_BLOCK:
+        amax_shuffle_dists.append(dist)
+        dist *= 2
+
+    native_tag = "nat" if use_native else "sw"
+    module_name = (
+        f"moe_fused_route_quant_scatter_md{model_dim}_tk{topk}_r{wmma_rep}"
+        f"_{quant_mode}_{native_tag}"
+    )
+
+    @flyc.kernel(name=module_name)
+    def fused_kernel(
+        topk_ids: fx.Tensor,  # (numel,) int32
+        counter: fx.Tensor,  # (E,) int32, init 0
+        topids_to_rows: fx.Tensor,  # (numel,) int32 out
+        hidden: fx.Tensor,  # (token_num*model_dim,) bf16
+        grouped_payload: fx.Tensor,  # (E*max_m*payload_bytes_per_row,) uint8 out
+        grouped_scale: fx.Tensor,  # preshuffled e8m0 out
+        numel: Int32,
+        max_m: Int32,
+    ):
+        i32 = T.i32
+        f32 = T.f32
+
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c4_i32 = arith.constant(4, type=i32)
+        c16_i32 = arith.constant(16, type=i32)
+        c23_i32 = arith.constant(23, type=i32)
+        c254_i32 = arith.constant(254, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+
+        c_wave = arith.constant(wave_size, type=i32)
+        c_topk = arith.constant(topk, type=i32)
+        c_model_dim = arith.constant(model_dim, type=i32)
+        c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
+        c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
+        c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
+        c_scale_dwords_per_row = arith.constant(scale_dwords_per_row, type=i32)
+        c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
+        c_wmma_rep = arith.constant(wmma_rep, type=i32)
+        c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
+        c_lanes_per_block = arith.constant(LANES_PER_MX_BLOCK, type=i32)
+        c_elems_per_lane = arith.constant(ELEMS_PER_LANE, type=i32)
+
+        tid = ArithValue(fx.thread_idx.x)
+        bid = ArithValue(fx.block_idx.x)
+
+        warp_in_block = tid // c_wave
+        lane = tid - warp_in_block * c_wave  # tid % wave_size
+        route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
+
+        route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
+        _if_route = scf.IfOp(route_in_range)
+        with ir.InsertionPoint(_if_route.then_block):
+            topk_ids_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
+            # expert id for this route (uniform across the warp)
+            expert = ArithValue(
+                buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
+            )
+
+            # --- lane 0 claims the within-expert slot via atomicAdd, then
+            #     broadcasts it to the whole warp. Follows the readlane idiom in
+            #     FlyDSL/kernels/dispatch_combine_intranode_kernel.py:218-225:
+            #     init to 0, reassign on lane 0, readlane(...). ---
+            slot_on_lane0 = arith.constant(0, type=i32)
+            if lane == 0:
+                counter_base = buffer_ops.extract_base_index(counter, address_space=1)
+                expert_idx = arith.index_cast(T.index, expert)
+                counter_addr = (
+                    fx.Index(counter_base) + fx.Index(expert_idx) * fx.Index(4)
+                )
+                counter_ptr = buffer_ops.create_llvm_ptr(counter_addr, address_space=1)
+                counter_ptr = (
+                    counter_ptr._value
+                    if hasattr(counter_ptr, "_value")
+                    else counter_ptr
+                )
+                slot_on_lane0 = ArithValue(
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.add,
+                        counter_ptr,
+                        arith.constant(1, type=i32),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    ).result
+                )
+            # readlane needs raw ir.Value operands in this FlyDSL build (the
+            # /workspace/FlyDSL example's auto-unwrap + T.i32() are a newer API).
+            slot = ArithValue(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
+
+            grouped_row = slot + expert * ArithValue(max_m)
+            token = arith.divui(route, c_topk)
+
+            # topids_to_rows[route] = grouped_row (lane 0 only; warp-uniform value)
+            if lane == 0:
+                topids_to_rows_rsrc = buffer_ops.create_buffer_resource(
+                    topids_to_rows, max_size=True
+                )
+                buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route)
+
+            # --- per-row scale-preshuffle geometry (uniform; row position == slot) ---
+            scale_tile = arith.divui(slot, c_rows_per_tile)
+            row_in_tile = slot - scale_tile * c_rows_per_tile
+            wmma_row = arith.divui(row_in_tile, c16_i32)
+            row_lane16 = row_in_tile - wmma_row * c16_i32
+            out_row = scale_tile * c16_i32 + row_lane16
+            # dst dword base for (expert, out_row); scale_dword*wmma_rep added per block
+            scale_row_dword_base = (
+                expert * (ArithValue(max_m) * c_scale_dwords_per_row)
+                + out_row * c_dst_scale_dwords_per_row
+                + wmma_row
+            )
+
+            payload_row_byte_base = grouped_row * c_payload_bytes_per_row
+            hidden_elem_base = token * c_model_dim  # bf16 element base for this token
+
+            hidden_rsrc = buffer_ops.create_buffer_resource(hidden, max_size=True)
+            payload_rsrc = buffer_ops.create_buffer_resource(
+                grouped_payload, max_size=True
+            )
+            scale_rsrc = buffer_ops.create_buffer_resource(grouped_scale, max_size=True)
+
+            # this lane's position inside its 16-lane MX block group
+            block_in_wave = arith.divui(lane, c_lanes_per_block)
+            lane_in_block = lane - block_in_wave * c_lanes_per_block
+            is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
+
+            for it in range_constexpr(block_iters):
+                # MX block (along K) this lane works on this iteration.
+                mx_block = arith.constant(it * mx_blocks_per_wave_iter, type=i32) + block_in_wave
+                block_in_range = arith.cmpi(
+                    CmpIPredicate.ult, mx_block, arith.constant(mx_blocks_per_row, type=i32)
+                )
+                _if_block = scf.IfOp(block_in_range)
+                with ir.InsertionPoint(_if_block.then_block):
+                    # two contiguous bf16 columns: col_base = mx_block*32 + lane_in_block*2
+                    col_base = (
+                        mx_block * arith.constant(32, type=i32)
+                        + lane_in_block * c_elems_per_lane
+                    )
+                    hidden_dword = (hidden_elem_base + col_base) >> c1_i32  # 2 bf16/dword
+
+                    dword_raw = buffer_ops.buffer_load(
+                        hidden_rsrc, hidden_dword, vec_width=1, dtype=i32
+                    )
+                    vec1_i32_ty = T.vec(1, i32)
+                    vec2_bf16_ty = T.vec(ELEMS_PER_LANE, T.bf16)
+                    vec2_f32_ty = T.vec(ELEMS_PER_LANE, f32)
+                    bf16_pair = vector.bitcast(
+                        vec2_bf16_ty, vector.from_elements(vec1_i32_ty, [dword_raw])
+                    )
+                    f32_pair = bf16_pair.extf(vec2_f32_ty)
+                    x0 = vector.extract(f32_pair, static_position=[0], dynamic_position=[])
+                    x1 = vector.extract(f32_pair, static_position=[1], dynamic_position=[])
+
+                    # per-block amax: max over this lane's 2 elems, then a butterfly
+                    # shuffle_xor across the block's 16 lanes.
+                    abs0 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x0], [], [])
+                    abs1 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x1], [], [])
+                    block_amax = arith.maximumf(c0_f32, arith.maximumf(abs0, abs1))
+                    for dist in amax_shuffle_dists:
+                        peer_amax = block_amax.shuffle_xor(
+                            arith.constant(dist, type=i32), c_wave
+                        )
+                        block_amax = arith.maximumf(block_amax, peer_amax)
+
+                    e8m0_scale = emit_mx_e8m0_scale(
+                        block_amax, mode=_ROUND_MODE, dtype=mx_dtype
+                    )
+
+                    # Forward block scale 2^(e8m0-127) = bitcast(e8m0<<23); the native
+                    # scalef32 ops divide by its *exponent part*. The portable path
+                    # multiplies by the reciprocal 2^(127-e8m0) then converts.
+                    if const_expr(is_fp8):
+                        if const_expr(use_native):
+                            block_scale_f32 = (
+                                ArithValue(e8m0_scale) << c23_i32
+                            ).bitcast(f32)
+                            packed = rocdl.cvt_scalef32_pk_fp8_f32(
+                                i32, _raw(c0_i32), _raw(x0), _raw(x1),
+                                _raw(block_scale_f32), 0,
+                            )
+                        else:
+                            recip_scale = (
+                                (c254_i32 - e8m0_scale) << c23_i32
+                            ).bitcast(f32)
+                            scaled0 = ArithValue(x0) * recip_scale
+                            scaled1 = ArithValue(x1) * recip_scale
+                            # v_cvt_pk_fp8_f32: 2 f32 -> 2 fp8 bytes in word 0.
+                            packed = rocdl.cvt_pk_fp8_f32(i32, scaled0, scaled1, c0_i32, 0)
+                        payload_val = arith.trunci(T.i16, ArithValue(packed))  # 2 fp8 B
+                    else:
+                        if const_expr(use_native):
+                            block_scale_f32 = (
+                                ArithValue(e8m0_scale) << c23_i32
+                            ).bitcast(f32)
+                            packed = rocdl.cvt_scalef32_pk_fp4_f32(
+                                i32, _raw(c0_i32), _raw(x0), _raw(x1),
+                                _raw(block_scale_f32), 0,
+                            )
+                            payload_val = arith.trunci(T.i8, ArithValue(packed))
+                        else:
+                            recip_scale = (
+                                (c254_i32 - e8m0_scale) << c23_i32
+                            ).bitcast(f32)
+                            nib0 = emit_f32_to_e2m1(ArithValue(x0) * recip_scale)
+                            nib1 = emit_f32_to_e2m1(ArithValue(x1) * recip_scale)
+                            packed_byte = ArithValue(nib0) | (ArithValue(nib1) << c4_i32)
+                            payload_val = arith.trunci(T.i8, packed_byte)  # 1 fp4x2 B
+
+                    # payload byte offset within grouped_payload. offset_is_bytes=True
+                    # so the i8 (fp4) / i16 (fp8) store does not rescale this already-
+                    # byte offset by the data element size.
+                    payload_byte_off = (
+                        payload_row_byte_base
+                        + mx_block * c_payload_bytes_per_block
+                        + lane_in_block * c_payload_bytes_per_lane
+                    )
+                    buffer_ops.buffer_store(
+                        payload_val, payload_rsrc, payload_byte_off, offset_is_bytes=True
+                    )
+
+                    # one e8m0 byte per block, written by the block's lead lane.
+                    _if_lead = scf.IfOp(is_block_lead)
+                    with ir.InsertionPoint(_if_lead.then_block):
+                        scale_dword = arith.divui(mx_block, c4_i32)
+                        byte_in_dword = mx_block - scale_dword * c4_i32
+                        dst_scale_dword = scale_row_dword_base + scale_dword * c_wmma_rep
+                        dst_scale_byte = dst_scale_dword * c4_i32 + byte_in_dword
+                        e8m0_byte = arith.trunci(T.i8, e8m0_scale)
+                        buffer_ops.buffer_store(e8m0_byte, scale_rsrc, dst_scale_byte)
+                        scf.YieldOp([])
+                    scf.YieldOp([])
+            scf.YieldOp([])
+
+    @flyc.jit
+    def launch_fused(
+        topk_ids: fx.Tensor,
+        counter: fx.Tensor,
+        topids_to_rows: fx.Tensor,
+        hidden: fx.Tensor,
+        grouped_payload: fx.Tensor,
+        grouped_scale: fx.Tensor,
+        numel: fx.Int32,
+        max_m: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            pass
+
+        grid_x = arith.index_cast(T.index, grid_blocks)
+        fused_kernel(
+            topk_ids,
+            counter,
+            topids_to_rows,
+            hidden,
+            grouped_payload,
+            grouped_scale,
+            numel,
+            max_m,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch_fused
