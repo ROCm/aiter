@@ -32,7 +32,6 @@ MAX_M = 655360
 NE = 385
 K = 512  # gemm2 contraction = inter_dim
 N_OUT = 7168  # default gemm2 output dim = model_dim (per-shape value comes from the compile arg)
-TOPK = 9
 
 BN = 256
 BK = 256

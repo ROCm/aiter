@@ -57,15 +57,10 @@ def _assert_supported(*, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, atomic, mxfp4o
 
     # gemm2 ?? K=512 (contraction = inter_dim);prebuilt HIP ??? H=7168?
     # NE?{257,385}?TOPK=9?????????? HIP ??,fail-loud?
-    if (
-        D_INTER != port.K
-        or D_HIDDEN != port.N_OUT
-        or topk != port.TOPK
-        or NE not in (257, 385)
-    ):
+    if D_INTER != port.K or D_HIDDEN != port.N_OUT or NE not in (257, 385):
         raise NotImplementedError(
             f"flydsl mxfp4 gemm2 ??? Kimi/DSR ?? "
-            f"(NE?(257,385), H={port.N_OUT}, INTER={port.K}, TOPK={port.TOPK}),"
+            f"(NE?(257,385), H={port.N_OUT}, INTER={port.K}),"
             f"?? (NE={NE}, H={D_HIDDEN}, INTER={D_INTER}, TOPK={topk})"
         )
     epilog = _epilog_of(atomic, mxfp4out)

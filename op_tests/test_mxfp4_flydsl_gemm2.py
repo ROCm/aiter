@@ -9,7 +9,7 @@ def test_port_module_imports_and_constants():
 
     assert callable(port.compile_gemm2_a4w4_port)
     # gemm2 ?? K=512 (contraction = inter_dim),N_OUT = model_dim = 7168?
-    assert (port.NE, port.K, port.N_OUT, port.TOPK) == (385, 512, 7168, 9)
+    assert (port.NE, port.K, port.N_OUT) == (385, 512, 7168)
 
 
 def test_guard_rejects_bad_shape():
@@ -33,7 +33,7 @@ def test_guard_rejects_bad_variant():
     """?????????? fail-loud(atomic ??? BM16/32/64)?"""
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _assert_supported
 
-    with pytest.raises(NotImplementedError, match="??|variant"):
+    with pytest.raises(NotImplementedError, match="variant"):
         _assert_supported(
             NE=385,
             D_HIDDEN=7168,
