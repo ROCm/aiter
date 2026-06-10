@@ -83,7 +83,10 @@ def gather_kv_b_proj(
                 assert scale_k_granularity == 128
                 assert scale_n_granularity == 128
 
-    ChunkK = 16 if k_buffer.dtype in [torch.float16, torch.bfloat16] else 32
+    if is_fp4_weight:
+        ChunkK = 64
+    else:
+        ChunkK = 16 if k_buffer.dtype in [torch.float16, torch.bfloat16] else 32
 
     assert total_kv_k == total_kv_v
     assert tp_k_head_num_k == tp_k_head_num_v
@@ -98,6 +101,7 @@ def gather_kv_b_proj(
         # paths may pass a preallocated kv_indices buffer that is much larger
         # than the valid range described by kv_indptr/k_prefix.
         max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
+        fp4_scale_k_granularity = 32 if weight_preshuffle else 128
         fp4_grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
         _triton_gather_kv_b_proj[fp4_grid](
             batch_size,
@@ -121,6 +125,7 @@ def gather_kv_b_proj(
             PaddedV=padded_v,
             ScaleCols=scale_k if not no_scale and not per_row_scale else 1,
             IS_FP4=True,
+            Fp4ScaleKGranularity=fp4_scale_k_granularity,
             WEIGHT_PRESHUFFLE=weight_preshuffle,
             num_stages=3,
         )

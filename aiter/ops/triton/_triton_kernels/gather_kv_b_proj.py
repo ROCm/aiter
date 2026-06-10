@@ -80,6 +80,7 @@ def _triton_gather_kv_b_proj_fp4_impl(
     PaddedK: tl.constexpr,
     PaddedV: tl.constexpr,
     ScaleCols: tl.constexpr,
+    Fp4ScaleKGranularity: tl.constexpr = 32,
     WEIGHT_PRESHUFFLE: tl.constexpr = False,
 ):
     """FP4/per-1x32 gather + kv_b_proj expansion for raw MXFP4 weights."""
@@ -89,7 +90,8 @@ def _triton_gather_kv_b_proj_fp4_impl(
     )
     stride_v_prefix = tl.full([], TpNumHeads * VHeadDim, dtype=tl.int64)
 
-    ScaleKGranularity: tl.constexpr = 32
+    ScaleKGranularity: tl.constexpr = Fp4ScaleKGranularity
+    ScaleGroupsPerSegment: tl.constexpr = ScaleKGranularity // 32
     PackedScaleKGranularity: tl.constexpr = ScaleKGranularity // 2
     PackedKV_CDim: tl.constexpr = KV_CDim // 2
     KBlocksPerChunkK: tl.constexpr = ChunkK // KBlockSize
@@ -109,6 +111,8 @@ def _triton_gather_kv_b_proj_fp4_impl(
     context_end = tl.load(kv_prefix_sum_context_lens + pid_batch + 1)
 
     total_kv_block = kv_block_end - kv_block_start
+    if chunk_id >= (total_kv_block + KBlocksPerChunkK - 1) // KBlocksPerChunkK:
+        return
 
     k_type = k_buffer.dtype.element_ty
     if k_type == tl.bfloat16:
@@ -122,6 +126,7 @@ def _triton_gather_kv_b_proj_fp4_impl(
     mask_v = offs_n_v < VHeadDim
     offs_k = tl.arange(0, ScaleKGranularity)
     offs_k_packed = tl.arange(0, PackedScaleKGranularity)
+    offs_scale_g = tl.arange(0, ScaleGroupsPerSegment)
 
     head_row_base = pid_head * (QkNopeHeadDim + VHeadDim)
     k_abs_rows = head_row_base + offs_n_k
@@ -196,7 +201,7 @@ def _triton_gather_kv_b_proj_fp4_impl(
         if WEIGHT_PRESHUFFLE:
             # Inverse of fp4_utils.e8m0_shuffle / shuffle_scale.
             k_scale_n = k_abs_rows[:, None]
-            k_scale_g = seg
+            k_scale_g = seg * ScaleGroupsPerSegment + offs_scale_g[None, :]
             k_scale_a = k_scale_n // 32
             k_scale_b = (k_scale_n % 32) // 16
             k_scale_c = k_scale_n % 16
@@ -213,7 +218,7 @@ def _triton_gather_kv_b_proj_fp4_impl(
             ) * 2 + k_scale_b
 
             v_scale_n = v_abs_rows[:, None]
-            v_scale_g = seg
+            v_scale_g = seg * ScaleGroupsPerSegment + offs_scale_g[None, :]
             v_scale_a = v_scale_n // 32
             v_scale_b = (v_scale_n % 32) // 16
             v_scale_c = v_scale_n % 16
@@ -229,8 +234,16 @@ def _triton_gather_kv_b_proj_fp4_impl(
                 + v_scale_e
             ) * 2 + v_scale_b
         else:
-            k_scale_offset = k_abs_rows[:, None] * ScaleCols + seg
-            v_scale_offset = v_abs_rows[:, None] * ScaleCols + seg
+            k_scale_offset = (
+                k_abs_rows[:, None] * ScaleCols
+                + seg * ScaleGroupsPerSegment
+                + offs_scale_g[None, :]
+            )
+            v_scale_offset = (
+                v_abs_rows[:, None] * ScaleCols
+                + seg * ScaleGroupsPerSegment
+                + offs_scale_g[None, :]
+            )
 
         k_weight_scale = tl.load(
             kv_proj_scale + k_scale_offset,
@@ -364,7 +377,6 @@ def _triton_gather_kv_b_proj_impl(
     context_end = tl.load(kv_prefix_sum_context_lens + pid_batch + 1)
 
     total_kv_block = kv_block_end - kv_block_start
-    total_kv_chunk = (total_kv_block + KBlocksPerChunkK - 1) // KBlocksPerChunkK
 
     # ===---------------------------------------------------
     # Pipeline Start
@@ -523,7 +535,7 @@ def _triton_gather_kv_b_proj_impl(
             other=0.0,
         ).to(tl.float32)
 
-    for chunk_id in range(total_kv_chunk):
+    for chunk_id in range((total_kv_block + KBlocksPerChunkK - 1) // KBlocksPerChunkK):
         block_lane_valid = (
             chunk_id * KBlocksPerChunkK + tl.arange(0, ChunkK) // KBlockSize
             < total_kv_block
@@ -680,6 +692,7 @@ def _triton_gather_kv_b_proj(
     PaddedV: tl.constexpr,
     ScaleCols: tl.constexpr = 1,
     IS_FP4: tl.constexpr = False,
+    Fp4ScaleKGranularity: tl.constexpr = 32,
     WEIGHT_PRESHUFFLE: tl.constexpr = False,
     PER_ROW_SCALE: tl.constexpr = False,
     NO_SCALE: tl.constexpr = False,
@@ -706,6 +719,7 @@ def _triton_gather_kv_b_proj(
             PaddedK,
             PaddedV,
             ScaleCols,
+            Fp4ScaleKGranularity,
             WEIGHT_PRESHUFFLE,
         )
     else:
