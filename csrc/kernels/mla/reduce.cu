@@ -15,8 +15,9 @@ struct MlaReduceKernelV1Traits
 {
     static constexpr int32_t kSizeDV     = kSizeDV_;   // hidden dimension size of value/output
     static constexpr int32_t kNumHeadQ   = kNumHeadQ_; // head count of q
+    static constexpr int32_t kWaveSize   = opus::get_warp_size(); // 32 on gfx1250, 64 on gfx9xx
     static constexpr int32_t kNumWarps   = 2;
-    static constexpr int32_t kNumThreads = kNumWarps * opus::get_warp_size();
+    static constexpr int32_t kNumThreads = kNumWarps * kWaveSize;
     static constexpr int32_t kOccupancy  = 8;
     static constexpr int32_t kNumThreadGroupPerBh = kNumThreadGroupPerBh_;
     static constexpr int32_t kMassiveThreshold = 4; // use massive pipeline if #splits >= this value
@@ -118,10 +119,15 @@ __device__ T integer_divide_ceil_power2(T x, T y, T y_log2)
     return (x + y - 1) >> y_log2;
 }
 
+// Bucketed by #splits relative to the wave size:
+//   kUpToWaveSizeSplits   : #splits <= kWaveSize       (1 LSE per lane in warp 0)
+//   kUpTo4xWaveSizeSplits : #splits <= 4 * kWaveSize    (4 LSEs per lane, VGPR)
+//   kUpToLdsLimit         : the remainder spills to LDS
+// On gfx9xx (wave64) the boundaries are 64 / 256, matching the original design.
 enum class MlaReduceProblemSize : uint8_t
 {
-    kUpTo64Splits,
-    kUpTo256Splits,
+    kUpToWaveSizeSplits,
+    kUpTo4xWaveSizeSplits,
     kUpToLdsLimit
 };
 
@@ -136,11 +142,11 @@ class LocalLse
 
     __device__ T& operator[](int32_t idx)
     {
-        if constexpr(kProblemSize == MlaReduceProblemSize::kUpTo64Splits)
+        if constexpr(kProblemSize == MlaReduceProblemSize::kUpToWaveSizeSplits)
         {
             return value_;
         }
-        else if constexpr(kProblemSize == MlaReduceProblemSize::kUpTo256Splits)
+        else if constexpr(kProblemSize == MlaReduceProblemSize::kUpTo4xWaveSizeSplits)
         {
             return value_[idx];
         }
@@ -159,11 +165,11 @@ class LocalLse
 
     __device__ T operator[](int32_t idx) const
     {
-        if constexpr(kProblemSize == MlaReduceProblemSize::kUpTo64Splits)
+        if constexpr(kProblemSize == MlaReduceProblemSize::kUpToWaveSizeSplits)
         {
             return value_;
         }
-        else if constexpr(kProblemSize == MlaReduceProblemSize::kUpTo256Splits)
+        else if constexpr(kProblemSize == MlaReduceProblemSize::kUpTo4xWaveSizeSplits)
         {
             return value_[idx];
         }
@@ -186,13 +192,14 @@ class LocalLse
     int32_t idx_in_group_;
 
     using DataType =
-        std::conditional_t<kProblemSize == MlaReduceProblemSize::kUpTo64Splits, T, T[4]>;
+        std::conditional_t<kProblemSize == MlaReduceProblemSize::kUpToWaveSizeSplits, T, T[4]>;
     alignas(16) DataType value_;
 };
 
 template <typename Traits, MlaReduceProblemSize kProblemSize, typename LocalLse,
           typename gmem_partial_lse_t, typename gmem_final_lse_t>
 __device__ void reduce_lse_massive(const MlaReduceKernelV1Params& params,
+                                   const int32_t warp_idx,
                                    const int32_t seq_idx,
                                    const int32_t reduce_tile_start,
                                    const int32_t reduce_tile_end,
@@ -207,7 +214,7 @@ __device__ void reduce_lse_massive(const MlaReduceKernelV1Params& params,
 {
     using lse_t = typename gmem_final_lse_t::scalar_type;
 
-    if(threadIdx.x / opus::get_warp_size() == 0)
+    if(warp_idx == 0)
     {
         const int32_t lane_idx = opus::lane_id();
 
@@ -230,7 +237,7 @@ __device__ void reduce_lse_massive(const MlaReduceKernelV1Params& params,
             return lse;
         };
 
-        if constexpr(kProblemSize == MlaReduceProblemSize::kUpTo64Splits)
+        if constexpr(kProblemSize == MlaReduceProblemSize::kUpToWaveSizeSplits)
         {
             const float new_lse = cal_lse(0);
             local_lse[0]        = new_lse;
@@ -254,7 +261,7 @@ __device__ void reduce_lse_massive(const MlaReduceKernelV1Params& params,
         // Get sum of LSE
         float sum_lse = 0.f;
 
-        if constexpr(kProblemSize == MlaReduceProblemSize::kUpTo64Splits)
+        if constexpr(kProblemSize == MlaReduceProblemSize::kUpToWaveSizeSplits)
         {
             sum_lse = expf(local_lse[0] - max_lse);
         }
@@ -286,7 +293,7 @@ __device__ void reduce_lse_massive(const MlaReduceKernelV1Params& params,
 
         // Write LSE to LDS
         int32_t split_idx = lane_idx;
-        if constexpr(kProblemSize == MlaReduceProblemSize::kUpTo64Splits)
+        if constexpr(kProblemSize == MlaReduceProblemSize::kUpToWaveSizeSplits)
         {
             p_lds_lse_scale[split_idx] = expf(local_lse[0] - global_lse);
         }
@@ -415,6 +422,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
 
 template <typename Traits, MlaReduceProblemSize kProblemSize, typename lse_t, typename out_t>
 __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params,
+                                           const int32_t warp_idx,
                                            const int32_t head_idx,
                                            const int32_t block_idx,
                                            const int32_t tile_idx,
@@ -475,21 +483,21 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
     const int32_t final_out_byte_offset_base =
         head_idx * params.stride_h_o * int32_t(sizeof(out_t));
 
-    static_assert((opus::get_warp_size() & (opus::get_warp_size() - 1)) == 0);
+    static_assert((Traits::kWaveSize & (Traits::kWaveSize - 1)) == 0);
     const int32_t num_lse_per_thr = [&]() {
-        if constexpr(kProblemSize == MlaReduceProblemSize::kUpTo64Splits)
+        if constexpr(kProblemSize == MlaReduceProblemSize::kUpToWaveSizeSplits)
         {
-            return 64 / opus::get_warp_size();
+            return 1; // <= kWaveSize splits: 1 LSE per lane
         }
-        else if constexpr(kProblemSize == MlaReduceProblemSize::kUpTo256Splits)
+        else if constexpr(kProblemSize == MlaReduceProblemSize::kUpTo4xWaveSizeSplits)
         {
-            return 256 / opus::get_warp_size();
+            return 4; // <= 4 * kWaveSize splits: 4 LSEs per lane
         }
         else
         {
             return integer_divide_ceil_power2(params.max_splits,
-                                              static_cast<int32_t>(opus::get_warp_size()),
-                                              __builtin_ctz(opus::get_warp_size()));
+                                              static_cast<int32_t>(Traits::kWaveSize),
+                                              __builtin_ctz(Traits::kWaveSize));
         }
     }();
 
@@ -505,6 +513,7 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
             + local_seqlen_idx * Traits::kNumHeadQ * Traits::kSizeDV * int32_t(sizeof(float));
 
         reduce_lse_massive<Traits, kProblemSize>(params,
+                                                 warp_idx,
                                                  seq_idx,
                                                  reduce_tile_start,
                                                  reduce_tile_end,
@@ -672,6 +681,9 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
 {
     extern __shared__ int32_t p_lds[];
 
+    const int32_t warp_idx =
+        __builtin_amdgcn_readfirstlane(threadIdx.x / Traits::kWaveSize);
+
     const int32_t last_reduce_tile =
         __builtin_amdgcn_readfirstlane(params.p_reduce_indptr[params.num_reduce_tile]);
     const int32_t tot_work =
@@ -698,12 +710,13 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
 
         if(num_splits >= Traits::kMassiveThreshold)
         {
-            if(num_splits <= 64)
+            if(num_splits <= Traits::kWaveSize)
             {
                 mla_reduce_v1_impl_massive<Traits,
-                                           MlaReduceProblemSize::kUpTo64Splits,
+                                           MlaReduceProblemSize::kUpToWaveSizeSplits,
                                            lse_t,
                                            out_t>(params,
+                                                  warp_idx,
                                                   head_idx,
                                                   block_idx,
                                                   tile_idx,
@@ -711,12 +724,13 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                                   reduce_tile_end,
                                                   p_lds);
             }
-            else if(num_splits <= 256)
+            else if(num_splits <= 4 * Traits::kWaveSize)
             {
                 mla_reduce_v1_impl_massive<Traits,
-                                           MlaReduceProblemSize::kUpTo256Splits,
+                                           MlaReduceProblemSize::kUpTo4xWaveSizeSplits,
                                            lse_t,
                                            out_t>(params,
+                                                  warp_idx,
                                                   head_idx,
                                                   block_idx,
                                                   tile_idx,
@@ -730,6 +744,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                            MlaReduceProblemSize::kUpToLdsLimit,
                                            lse_t,
                                            out_t>(params,
+                                                  warp_idx,
                                                   head_idx,
                                                   block_idx,
                                                   tile_idx,
@@ -787,22 +802,25 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
 
     const int32_t num_splits = reduce_tile_end - reduce_tile_start;
 
+    const int32_t warp_idx =
+        __builtin_amdgcn_readfirstlane(threadIdx.x / Traits::kWaveSize);
+
     if(num_splits >= Traits::kMassiveThreshold)
     {
-        if(num_splits <= 64)
+        if(num_splits <= Traits::kWaveSize)
         {
-            mla_reduce_v1_impl_massive<Traits, MlaReduceProblemSize::kUpTo64Splits, lse_t, out_t>(
-                params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
+            mla_reduce_v1_impl_massive<Traits, MlaReduceProblemSize::kUpToWaveSizeSplits, lse_t, out_t>(
+                params, warp_idx, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
         }
-        else if(num_splits <= 256)
+        else if(num_splits <= 4 * Traits::kWaveSize)
         {
-            mla_reduce_v1_impl_massive<Traits, MlaReduceProblemSize::kUpTo256Splits, lse_t, out_t>(
-                params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
+            mla_reduce_v1_impl_massive<Traits, MlaReduceProblemSize::kUpTo4xWaveSizeSplits, lse_t, out_t>(
+                params, warp_idx, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
         }
         else
         {
             mla_reduce_v1_impl_massive<Traits, MlaReduceProblemSize::kUpToLdsLimit, lse_t, out_t>(
-                params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
+                params, warp_idx, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
         }
     }
     // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata
@@ -928,10 +946,11 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
 
     // 1. Reduce partial map of each split;
     // 2. LSE of each split for rescale output;
-    // 3. Stack for the 1st warp to calculate LSE. The top 256 splits are stored in vgpr.
+    // 3. Stack for the 1st warp to calculate LSE. The top 4*kWaveSize splits
+    //    (4 LSEs per lane) are kept in vgpr; the remainder spills to LDS.
     const int32_t lds_size = params.max_splits * sizeof(int32_t) +
                              params.max_splits * sizeof(float) +
-                             max(0, params.max_splits - 256) * sizeof(float);
+                             max(0, params.max_splits - 4 * Traits::kWaveSize) * sizeof(float);
     if(lds_size <= dev_prop.maxSharedMemoryPerMultiProcessor)
     {
         if(lds_size > (dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy))
