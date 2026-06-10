@@ -30,7 +30,7 @@ template <typename ABDataType, typename DDataType, typename EDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
     // TODO: implement heuristics
-    return a8w8_cktile_128x128x128_1x4x1_16x16x32_intrawave_0x1x0_1<ABDataType, DDataType, EDataType>;
+    return a8w8_cktile_128x128x128_1x4x1_16x16x32_intrawave_0x1x0_1<ABDataType, DDataType, EDataType, true>;
 }
 
 // Helper function to return the next largest power of 2

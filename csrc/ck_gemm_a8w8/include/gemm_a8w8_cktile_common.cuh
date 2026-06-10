@@ -38,9 +38,22 @@ using D1Layout = ck_tile::tensor_layout::gemm::ColumnMajor;
 using D2Layout = ck_tile::tensor_layout::gemm::RowMajor;
 using ELayout  = ck_tile::tensor_layout::gemm::RowMajor;
 
-using CDEElementWise = ck_tile::element_wise::PassThrough;
+struct MultiplyMultiplyAdd
+{
+    static constexpr const char* name = "MultiplyMultiplyAdd";
 
-using HostArgs = ck_tile::GemmMultiABDHostArgs<1, 1, 2>;
+    template <typename E, typename C, typename D0, typename D1, typename D2>
+    inline __host__ __device__ auto operator()(E& e, const C& c, const D0& d0, const D1& d1, const D2& d2) const -> void
+    {
+        float const result =
+            ck_tile::type_convert<float>(c) * 
+            ck_tile::type_convert<float>(d0) *
+            ck_tile::type_convert<float>(d1) +
+            ck_tile::type_convert<float>(d2);
+
+        e = ck_tile::type_convert<E>(result);
+    }
+};
 
 template <ck_tile::index_t M_Tile,
           ck_tile::index_t N_Tile,
@@ -107,13 +120,34 @@ using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             BlockPerCu,
                                             AQRowMajor>;
 
+template <typename DDataType, bool HasBias>
+struct EpilogueTraits;
+
+template <typename DDataType>
+struct EpilogueTraits<DDataType, true>
+{
+    using ElementwiseOp = MultiplyMultiplyAdd;
+    using DLayouts      = ck_tile::tuple<D0Layout, D1Layout, D2Layout>;
+    using DDataTypes    = ck_tile::tuple<DDataType, DDataType, DDataType>;
+};
+
+template <typename DDataType>
+struct EpilogueTraits<DDataType, false>
+{
+    using ElementwiseOp = ck_tile::element_wise::MultiDMultiply;
+    using DLayouts      = ck_tile::tuple<D0Layout, D1Layout>;
+    using DDataTypes    = ck_tile::tuple<DDataType, DDataType>;
+};
+
 template <typename ABDataType,
           typename DDataType,
           typename EDataType, 
           typename GemmConfig,
+          typename HostArguments,
+          bool HasBias,
           bool PreshuffleB,
           bool UseDoubleSmemBuffer = PreshuffleB>
-void TileGemmComputeImpl(const HostArgs& args)
+void TileGemmComputeImpl(const HostArguments& args)
 {
     using ComputeDataType = ABDataType;
     using AccDataType = std::conditional_t<std::is_same_v<ABDataType, TILE_I8>, TILE_I32, TILE_FP32>;
@@ -153,18 +187,16 @@ void TileGemmComputeImpl(const HostArgs& args)
 
     using GemmPipeline = ck_tile::GemmPipelineAGmemBGmemCRegV1<PipelineProblem>;
 
-    // TODO: add optional bias
-    using element_op = ck_tile::element_wise::MultiDMultiply;
-
+    using EpTraits = EpilogueTraits<DDataType, HasBias>;
     using GemmEpilogue = ck_tile::CShuffleEpilogue<
         ck_tile::CShuffleEpilogueProblem<ck_tile::tuple<ABDataType>,
                                         ck_tile::tuple<ABDataType>,
-                                        ck_tile::tuple<DDataType, DDataType>,
+                                        typename EpTraits::DDataTypes,
                                         AccDataType,
                                         EDataType,
-                                        ck_tile::tuple<D0Layout, D1Layout>,
+                                        typename EpTraits::DLayouts,
                                         ELayout,
-                                        element_op,
+                                        typename EpTraits::ElementwiseOp,
                                         TilePartitioner::MPerBlock,
                                         TilePartitioner::NPerBlock,
                                         GemmConfig::M_Warp_v,
@@ -190,7 +222,7 @@ void TileGemmComputeImpl(const HostArgs& args)
         ck_tile::make_kernel<GemmConfig::BlockPerCu_v>(Kernel{}, grids, blocks, 0, kargs));
 }
 
-template <typename ABDataType, typename DDataType, typename EDataType, typename GemmInstance>
+template <typename ABDataType, typename DDataType, typename EDataType, bool HasBias, typename GemmInstance>
 __forceinline__ torch::Tensor gemm_a8w8_cktile_impl(torch::Tensor& XQ,
                                                     torch::Tensor& WQ,
                                                     torch::Tensor& x_scale,
@@ -241,35 +273,57 @@ __forceinline__ torch::Tensor gemm_a8w8_cktile_impl(torch::Tensor& XQ,
     std::array<int, 1> strideBs({K});
     int strideE = N;
 
-    HostArgs args(
-        std::array<const void*, 1>{XQ.data_ptr()},
-        std::array<const void*, 1>{WQ.data_ptr()},
-        std::array<const void*, 2>{w_scale.data_ptr(), x_scale.data_ptr()},
-        Y.data_ptr(),
-        k_batch,
-        M,
-        N,
-        K,
-        strideAs,
-        strideBs,
-        std::array<int, 2>({0, 0}),
-        strideE);
+    auto runWithBias = [&]() {
+        using HostArguments = ck_tile::GemmMultiABDHostArgs<1, 1, 3>;
 
-    // TODO: add Multiply-Multiply-Add operator for bias case
-    TileGemmComputeImpl<ABDataType, DDataType, EDataType, GemmInstance, false>(args);
+        HostArguments args(
+            std::array<const void*, 1>{XQ.data_ptr()},
+            std::array<const void*, 1>{WQ.data_ptr()},
+            std::array<const void*, 3>{w_scale.data_ptr(), x_scale.data_ptr(), bias.value().data_ptr()},
+            Y.data_ptr(),
+            k_batch,
+            M,
+            N,
+            K,
+            strideAs,
+            strideBs,
+            std::array<int, 3>({0, 0, 0}),
+            strideE);
 
-    // if constexpr(has_bias)
-    // {
-    //     auto cde_element_op = ck_tile::element_wise::MultiDMultiplyAdd<EDataType, AccDataType, DDataType, DDataType>{};
+        TileGemmComputeImpl<ABDataType, DDataType, EDataType, GemmInstance, HostArguments, true, false>(args);
+    };
 
-    //     TileGemmComputeImpl<ABDataType, DDataType, EDataType, GemmInstance, false>(args);
-    // }
-    // else
-    // {
-    //     auto cde_element_op = ck_tile::element_wise::MultiDMultiply<EDataType, AccDataType, DDataType, DDataType>{};
+    auto runWithoutBias = [&]() {
+        using HostArguments = ck_tile::GemmMultiABDHostArgs<1, 1, 2>;
 
-    //     TileGemmComputeImpl<ABDataType, DDataType, EDataType, GemmInstance, false>(args);
-    // }
+        HostArguments args(
+            std::array<const void*, 1>{XQ.data_ptr()},
+            std::array<const void*, 1>{WQ.data_ptr()},
+            std::array<const void*, 2>{w_scale.data_ptr(), x_scale.data_ptr()},
+            Y.data_ptr(),
+            k_batch,
+            M,
+            N,
+            K,
+            strideAs,
+            strideBs,
+            std::array<int, 2>({0, 0}),
+            strideE);
+
+        TileGemmComputeImpl<ABDataType, DDataType, EDataType, GemmInstance, HostArguments, false, false>(args);
+    };
+
+    if constexpr(HasBias) {
+        if (bias != std::nullopt) {
+            runWithBias();
+        }
+        else {
+            runWithoutBias();
+        }
+    }
+    else {
+        runWithoutBias();
+    }
 
     return Y;
 }
