@@ -627,6 +627,32 @@ aiter.logger.info("moeTopkSoftmax_biased_grouped_topk summary (markdown):\n%s", 
 
 df = []
 for token in args.token:
+    # Kimi-K2.5 shapes
+    topk = 8
+    group = 1
+    topk_group = 1
+    expert = 384
+    dtype = dtypes.bf16
+    need_renorm = True
+    ret = test_biased_grouped_topk(
+        token,
+        expert,
+        group,
+        topk,
+        topk_group,
+        need_renorm,
+        dtype,
+        scale_factor=2.827,
+    )
+    df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info(
+    "moeTopkSoftmax_biased_grouped_topk_kimi_k25 summary (markdown):\n%s", df_md
+)
+
+df = []
+for token in args.token:
     for scoring_func in ["softmax", "sigmoid"]:
         # DeepSeek-R1
         topk = 8
