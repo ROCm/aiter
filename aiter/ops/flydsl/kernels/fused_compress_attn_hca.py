@@ -1203,7 +1203,7 @@ def flydsl_hca_compress_attn(
         k_split_num_waves=k_split_num_waves,
         slice_size=slice_size,
     )
-    compress_fn(
+    compress_args = (
         kv_in,
         int(kv_in.stride(0)),
         score_in,
@@ -1220,8 +1220,14 @@ def flydsl_hca_compress_attn(
         kv_compressed,
         int(kv_compressed.stride(0)),
         int(plan_capacity),
-        stream=stream_obj,
+        stream_obj,
     )
+    cf = getattr(compress_fn, "_cf", None)
+    if cf is not None:
+        cf(*compress_args)
+    else:
+        cf = flyc.compile(compress_fn, *compress_args)
+        compress_fn._cf = cf
 
     rms_weight_is_bf16 = rms_weight.dtype == torch.bfloat16
     norm_fn = compile_hca_norm_rope_scatter(
@@ -1232,7 +1238,7 @@ def flydsl_hca_compress_attn(
         rms_weight_is_bf16=rms_weight_is_bf16,
         rms_eps=rms_eps,
     )
-    norm_fn(
+    norm_args = (
         kv_compressed,
         int(kv_compressed.stride(0)),
         plan_gpu,
@@ -1245,5 +1251,11 @@ def flydsl_hca_compress_attn(
         block_tables,
         int(block_tables.stride(0)),
         int(plan_capacity),
-        stream=stream_obj,
+        stream_obj,
     )
+    cf = getattr(norm_fn, "_cf", None)
+    if cf is not None:
+        cf(*norm_args)
+    else:
+        cf = flyc.compile(norm_fn, *norm_args)
+        norm_fn._cf = cf

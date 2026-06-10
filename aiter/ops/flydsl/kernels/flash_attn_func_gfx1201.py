@@ -779,12 +779,18 @@ def build_flash_attn_func_module_primary(
 
     def _launch(*args, **kwargs):
         args, kwargs = _wrap_qkvo(args, kwargs)
+        stream = kwargs.pop("stream", fx.Stream(None))
+        all_args = args + (stream,)
+        cf = getattr(launch_flash_attn_func, "_cf", None)
+        if cf is not None:
+            return cf(*all_args)
         with CompilationContext.compile_hints(_fmha_compile_hints):
-            return launch_flash_attn_func(*args, **kwargs)
+            cf = flyc.compile(launch_flash_attn_func, *all_args)
+            launch_flash_attn_func._cf = cf
 
     def _compile(Q, K, V, O, batch_size, seq_len, stream=None):  # noqa: E741
         with CompilationContext.compile_hints(_fmha_compile_hints):
-            return flyc.compile(
+            cf = flyc.compile(
                 launch_flash_attn_func,
                 _ptr_arg(Q),
                 _ptr_arg(K),
@@ -794,6 +800,8 @@ def build_flash_attn_func_module_primary(
                 seq_len,
                 fx.Stream(stream),
             )
+            launch_flash_attn_func._cf = cf
+            return cf
 
     _launch.compile = _compile
     return _launch

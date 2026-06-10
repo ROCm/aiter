@@ -264,7 +264,7 @@ def _launch_kernel(
 ):
     grid_v = triton.cdiv(V, BV)
     grid_nh = N * H
-    launch_fn(
+    args = (
         k,
         u,
         w,
@@ -283,6 +283,14 @@ def _launch_kernel(
         grid_nh,
         stream,
     )
+    cf = getattr(launch_fn, "_cf", None)
+    if cf is not None:
+        cf(*args)
+        return
+    import flydsl.compiler as flyc
+
+    cf = flyc.compile(launch_fn, *args)
+    launch_fn._cf = cf
 
 
 def chunk_gated_delta_rule_fwd_h_flydsl(
