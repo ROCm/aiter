@@ -2074,7 +2074,8 @@ namespace py = pybind11;
           py::arg("hc_pre_eps")         = 1e-6, \
           py::arg("hc_sinkhorn_eps")    = 1e-6, \
           py::arg("hc_post_mult_value") = 1.0,  \
-          py::arg("sinkhorn_repeat")    = 20);   \
+          py::arg("sinkhorn_repeat")    = 20,  \
+          py::arg("use_nt")             = -1);   \
     m.def("mhc_pre_big_fuse_rmsnorm",            \
           &aiter::mhc_pre_big_fuse_rmsnorm,      \
           "mhc_pre_big_fuse_rmsnorm",            \
@@ -2100,7 +2101,8 @@ namespace py = pybind11;
           py::arg("x"),                         \
           py::arg("residual"),                  \
           py::arg("post_layer_mix"),            \
-          py::arg("comb_res_mix"));             \
+          py::arg("comb_res_mix"),              \
+          py::arg("store_nt")       = -1);      \
     m.def("mhc_post_pre_large_m",               \
           &aiter::mhc_post_pre_large_m,         \
           "mhc_post_pre_large_m",               \

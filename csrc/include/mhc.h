@@ -23,7 +23,8 @@ void mhc_pre_big_fuse(torch::Tensor& post_mix,        // (m, hc_mult)
                       float hc_pre_eps         = 1e-6,
                       float hc_sinkhorn_eps    = 1e-6,
                       float hc_post_mult_value = 1.0,
-                      int sinkhorn_repeat      = 20);
+                      int sinkhorn_repeat      = 20,
+                      int use_nt               = -1);
 void mhc_pre_big_fuse_rmsnorm(torch::Tensor& post_mix,        // (m, hc_mult)
                               torch::Tensor& comb_mix,        // (m, hc_mult * hc_mult)
                               torch::Tensor& out,             // (m, hidden_size)
@@ -43,8 +44,8 @@ void mhc_post(torch::Tensor& out,            // (m, hc_mult, hidden_size)
               torch::Tensor& x,              // (m, hidden_size)
               torch::Tensor& residual,       // (m, hc_mult, hidden_size)
               torch::Tensor& post_layer_mix, // (m, hc_mult)
-              torch::Tensor& comb_res_mix    // (m, hc_mult, hc_mult)
-);
+              torch::Tensor& comb_res_mix,   // (m, hc_mult, hc_mult)
+              int store_nt                   = -1);
 void mhc_fused_post_pre_gemm_sqrsum(
     torch::Tensor& gemm_out_mul,    // (split_k * hc_mult, m, hc_mult3)
     torch::Tensor& gemm_out_sqrsum, // (split_k * hc_mult, m)

@@ -38,6 +38,7 @@ def mhc_pre_big_fuse(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
+    use_nt: int = -1,
 ) -> None: ...
 
 
@@ -337,6 +338,7 @@ def mhc_post(
     residual: Tensor,
     post_layer_mix: Tensor,
     comb_res_mix: Tensor,
+    store_nt: int = -1,
 ) -> None: ...
 
 
