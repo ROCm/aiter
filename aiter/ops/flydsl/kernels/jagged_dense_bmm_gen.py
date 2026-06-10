@@ -471,11 +471,14 @@ def jagged_dense_bmm(
     CDNA4 16x16x32 bf16 atom; defaults to auto-detect (on gfx950, off gfx942)."""
     N = B.shape[0] // n_groups
     K = B.shape[1]
-    # Shape-dependent BLOCK_K: for small reduction K (<=256) a 2-iter K-loop with
-    # BLOCK_K=128 has fewer barriers and wins (~4% on K=256 shapes); for larger K
-    # the deeper BLOCK_K=64 pipeline keeps occupancy and is faster. (BLOCK_K=256
-    # is unsafe: the 2-stage double-buffer epilogue mis-accumulates a single tile.)
-    block_k = 128 if K <= 256 else BLOCK_K
+    # BLOCK_K=64 for ALL reduction K on gfx942. The smaller A double-buffer
+    # (BLOCK_M*BLOCK_K*STAGES_A*2 = 32KB at K<=256, vs 64KB for BLOCK_K=128)
+    # leaves headroom under gfx942's 64KB LDS ceiling, doubling occupancy: +11-19%
+    # on the D256 shapes (uniform B120 1.11x, B1024 1.14x; skew B120 1.19x), cos=1.0.
+    # (The old "BLOCK_K=128 wins ~4% on K<=256" was a gfx950 result; gfx950's larger
+    # LDS hides the occupancy cost that dominates on gfx942's smaller LDS. BLOCK_K=256
+    # remains unsafe: the 2-stage double-buffer epilogue mis-accumulates a single tile.)
+    block_k = BLOCK_K
     # XCD remap defaults (see docstring). Remap ON only for uniform seqlens, where
     # every M-tile is occupied so chiplets stay balanced and the Dense[b] L2-reuse
     # win lands. Under SKEW the remap clusters a group's M-tiles onto one XCD and
