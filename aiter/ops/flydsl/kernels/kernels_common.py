@@ -20,9 +20,19 @@ def get_warp_size(arch=None):
     """Return the wavefront/warp size for the given GPU architecture.
 
     CDNA (gfx9xx) uses wave64, RDNA (gfx10xx/gfx11xx/gfx12xx) uses wave32.
+
+    NOTE: we do not defer the gfx12 case to ``flydsl.runtime.device.is_rdna_arch``:
+    that helper only matches ``gfx120*`` and so misclassifies gfx1250 (which is
+    wave32, RDNA-family) as CDNA, yielding wave64. Building a kernel for wave64
+    while gfx1250 dispatches wave32 corrupts every >1-warp-per-block kernel
+    (the phantom upper lanes silently drop their work). Classify all gfx10/11/12
+    as wave32 directly here so the kernel body matches the wave32 dispatch.
     """
     if arch is None:
         arch = get_rocm_arch()
+    arch_l = (arch or "").lower()
+    if arch_l.startswith(("gfx10", "gfx11", "gfx12")):
+        return 32
     return 32 if is_rdna_arch(arch) else 64
 
 

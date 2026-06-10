@@ -561,8 +561,10 @@ def _sanity_check(
     experts: int = 4,
     tokens: int = 8,
     topk: int = 2,
-    model_dim: int = 256,
-    inter_dim: int = 256,
+    # >= 512 so the real gfx1250 grouped GEMM sees >= 2 K-tiles (tile_k=256);
+    # smaller dims raise "2-stage buffering requires num_k_tiles >= 2".
+    model_dim: int = 512,
+    inter_dim: int = 512,
     layout: str = "gguu",
     activation: ActivationType = ActivationType.Swiglu,
     swiglu_limit: float = 7.0,

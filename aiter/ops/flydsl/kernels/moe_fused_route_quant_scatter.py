@@ -85,8 +85,40 @@ LANES_PER_MX_BLOCK = 32 // ELEMS_PER_LANE  # 16 lanes cover one 32-element MX bl
 # (``v_cvt_scalef32_pk_{fp4,fp8}_f32``). On these the per-block pack folds the
 # scale division in (one HW instruction, exact RNE); elsewhere we fall back to
 # the portable path (SW e2m1 emitter for fp4 / ``v_cvt_pk_fp8_f32`` for fp8,
-# both legal on gfx942).
-_NATIVE_SCALED_CVT_ARCHS = ("gfx950", "gfx1250")
+# both legal on gfx942 and gfx1250).
+#
+# NOTE: gfx1250 does *not* have these instructions -- the gfx950 (CDNA4)
+# ``v_cvt_scalef32_pk_{fp4,fp8}_f32`` intrinsics have no valid gfx1250 encoding,
+# so selecting them on gfx1250 makes the AMDGPU backend abort with an MC
+# "Invalid opcode!" assertion at compile time. gfx1250 therefore uses the same
+# portable path as gfx942 (matches ``silu_and_mul_fq``).
+_NATIVE_SCALED_CVT_ARCHS = ("gfx950",)
+
+# gfx1250 has no ``v_cvt_scalef32_pk_fp4_f32`` (the 2-element pk form, gfx950-only)
+# but it *does* have the 8-element ``v_cvt_scalef32_pk8_fp4_bf16``: 8 bf16 ->
+# i32 (8 fp4 nibbles), dividing by the e8m0 exponent carried in the f32 scale.
+# We emit it via inline asm so it does not depend on the MLIR rocdl op lowering.
+_PK8_FP4_BF16_ARCHS = ("gfx1250",)
+
+
+def _arch_has_pk8_fp4(arch: str) -> bool:
+    return arch.startswith(_PK8_FP4_BF16_ARCHS)
+
+
+def _cvt_scalef32_pk8_fp4_bf16(src_v8bf16, scale_f32, *, i32_ty):
+    """Native gfx1250 scaled 8x bf16 -> packed fp4 (i32, 8 nibbles).
+
+    ``src_v8bf16`` is a ``vector<8xbf16>`` ir.Value, ``scale_f32`` an f32 whose
+    exponent is the e8m0 block scale (value 2^(e8m0-127)); the HW divides each
+    input by it and round-to-nearest-even packs the 8 fp4 nibbles into i32.
+    """
+    return llvm.inline_asm(
+        i32_ty,
+        [_raw(src_v8bf16), _raw(scale_f32)],
+        "v_cvt_scalef32_pk8_fp4_bf16 $0, $1, $2",
+        "=v,v,v",
+        has_side_effects=False,
+    )
 
 
 def _raw(value):
@@ -145,6 +177,12 @@ def build_moe_fused_route_quant_scatter_module(
     is_fp8 = quant_mode == "fp8"
     arch = str(get_rocm_arch())
     use_native = _arch_has_native_scaled_cvt(arch)
+    # gfx1250 fp4: use the native 8-wide pk8 convert. It consumes 8 contiguous
+    # bf16 per lane, so this path runs at 8 elems/lane (4 lanes per 32-elem MX
+    # block) instead of the 2 elems/lane (16 lanes) the SW/pk2 paths use.
+    use_pk8_fp4 = (not is_fp8) and _arch_has_pk8_fp4(arch)
+    elems_per_lane = 8 if use_pk8_fp4 else ELEMS_PER_LANE
+    lanes_per_mx_block = 32 // elems_per_lane
 
     # MX target dtype for the E8M0 block-scale formula. fp8 uses the HW FP8
     # variant: e4m3fnuz on gfx942, OCP e4m3fn on gfx950+ (matches silu_and_mul_fq).
@@ -153,18 +191,19 @@ def build_moe_fused_route_quant_scatter_module(
         # payload geometry: 1 fp8 byte/elem -> 32 bytes/MX-block, 2 bytes/lane.
         payload_bytes_per_row = model_dim
         payload_bytes_per_block = 32
-        payload_bytes_per_lane = ELEMS_PER_LANE
+        payload_bytes_per_lane = elems_per_lane
     else:
         mx_dtype = _MxDtype.FP4_E2M1
-        # packed fp4: 2 nibbles/byte -> 16 bytes/MX-block, 1 byte/lane.
+        # packed fp4: 2 nibbles/byte -> 16 bytes/MX-block. SW/pk2: 1 byte/lane
+        # (2 elems); pk8: 4 bytes/lane (8 elems).
         payload_bytes_per_row = model_dim // 2
         payload_bytes_per_block = 16
-        payload_bytes_per_lane = ELEMS_PER_LANE // 2
+        payload_bytes_per_lane = elems_per_lane // 2
 
     wave_size = get_warp_size()
     assert BLOCK_THREADS % wave_size == 0
     warps_per_block = BLOCK_THREADS // wave_size
-    mx_blocks_per_wave_iter = wave_size // LANES_PER_MX_BLOCK
+    mx_blocks_per_wave_iter = wave_size // lanes_per_mx_block
 
     mx_blocks_per_row = model_dim // 32  # also == scale_bytes_per_row (1 e8m0/block)
     scale_bytes_per_row = mx_blocks_per_row
@@ -179,14 +218,15 @@ def build_moe_fused_route_quant_scatter_module(
         mx_blocks_per_row + mx_blocks_per_wave_iter - 1
     ) // mx_blocks_per_wave_iter
 
-    # Butterfly reduction distances within one 16-lane MX block.
+    # Butterfly reduction distances within one MX block (16 lanes for the 2-elem
+    # paths, 4 lanes for pk8).
     amax_shuffle_dists = []
     dist = 1
-    while dist < LANES_PER_MX_BLOCK:
+    while dist < lanes_per_mx_block:
         amax_shuffle_dists.append(dist)
         dist *= 2
 
-    native_tag = "nat" if use_native else "sw"
+    native_tag = "pk8" if use_pk8_fp4 else ("nat" if use_native else "sw")
     module_name = (
         f"moe_fused_route_quant_scatter_md{model_dim}_tk{topk}_r{wmma_rep}"
         f"_{quant_mode}_{native_tag}"
@@ -224,8 +264,8 @@ def build_moe_fused_route_quant_scatter_module(
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
-        c_lanes_per_block = arith.constant(LANES_PER_MX_BLOCK, type=i32)
-        c_elems_per_lane = arith.constant(ELEMS_PER_LANE, type=i32)
+        c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
+        c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
 
         tid = ArithValue(fx.thread_idx.x)
         bid = ArithValue(fx.block_idx.x)
@@ -319,80 +359,126 @@ def build_moe_fused_route_quant_scatter_module(
                 )
                 _if_block = scf.IfOp(block_in_range)
                 with ir.InsertionPoint(_if_block.then_block):
-                    # two contiguous bf16 columns: col_base = mx_block*32 + lane_in_block*2
-                    col_base = (
-                        mx_block * arith.constant(32, type=i32)
-                        + lane_in_block * c_elems_per_lane
-                    )
-                    hidden_dword = (hidden_elem_base + col_base) >> c1_i32  # 2 bf16/dword
-
-                    dword_raw = buffer_ops.buffer_load(
-                        hidden_rsrc, hidden_dword, vec_width=1, dtype=i32
-                    )
-                    vec1_i32_ty = T.vec(1, i32)
-                    vec2_bf16_ty = T.vec(ELEMS_PER_LANE, T.bf16)
-                    vec2_f32_ty = T.vec(ELEMS_PER_LANE, f32)
-                    bf16_pair = vector.bitcast(
-                        vec2_bf16_ty, vector.from_elements(vec1_i32_ty, [dword_raw])
-                    )
-                    f32_pair = bf16_pair.extf(vec2_f32_ty)
-                    x0 = vector.extract(f32_pair, static_position=[0], dynamic_position=[])
-                    x1 = vector.extract(f32_pair, static_position=[1], dynamic_position=[])
-
-                    # per-block amax: max over this lane's 2 elems, then a butterfly
-                    # shuffle_xor across the block's 16 lanes.
-                    abs0 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x0], [], [])
-                    abs1 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x1], [], [])
-                    block_amax = arith.maximumf(c0_f32, arith.maximumf(abs0, abs1))
-                    for dist in amax_shuffle_dists:
-                        peer_amax = block_amax.shuffle_xor(
-                            arith.constant(dist, type=i32), c_wave
+                    if const_expr(use_pk8_fp4):
+                        # gfx1250 native fp4: 8 contiguous bf16 cols this lane.
+                        # col_base = mx_block*32 + lane_in_block*8.
+                        col_base = (
+                            mx_block * arith.constant(32, type=i32)
+                            + lane_in_block * c_elems_per_lane
                         )
-                        block_amax = arith.maximumf(block_amax, peer_amax)
+                        # 2 bf16/dword -> 4 dwords; one aligned dwordx4 = 8 bf16.
+                        hidden_dword = (hidden_elem_base + col_base) >> c1_i32
+                        dwords4 = buffer_ops.buffer_load(
+                            hidden_rsrc, hidden_dword, vec_width=4, dtype=i32
+                        )
+                        vec8_bf16_ty = T.vec(8, T.bf16)
+                        vec8_f32_ty = T.vec(8, f32)
+                        bf16x8 = vector.bitcast(vec8_bf16_ty, dwords4)
+                        f32x8 = bf16x8.extf(vec8_f32_ty)
 
-                    e8m0_scale = emit_mx_e8m0_scale(
-                        block_amax, mode=_ROUND_MODE, dtype=mx_dtype
-                    )
-
-                    # Forward block scale 2^(e8m0-127) = bitcast(e8m0<<23); the native
-                    # scalef32 ops divide by its *exponent part*. The portable path
-                    # multiplies by the reciprocal 2^(127-e8m0) then converts.
-                    if const_expr(is_fp8):
-                        if const_expr(use_native):
-                            block_scale_f32 = (
-                                ArithValue(e8m0_scale) << c23_i32
-                            ).bitcast(f32)
-                            packed = rocdl.cvt_scalef32_pk_fp8_f32(
-                                i32, _raw(c0_i32), _raw(x0), _raw(x1),
-                                _raw(block_scale_f32), 0,
+                        # per-block amax over this lane's 8 elems, then a butterfly
+                        # shuffle_xor across the block's 4 lanes.
+                        block_amax = c0_f32
+                        for j in range_constexpr(8):
+                            xj = vector.extract(
+                                f32x8, static_position=[j], dynamic_position=[]
                             )
-                        else:
-                            recip_scale = (
-                                (c254_i32 - e8m0_scale) << c23_i32
-                            ).bitcast(f32)
-                            scaled0 = ArithValue(x0) * recip_scale
-                            scaled1 = ArithValue(x1) * recip_scale
-                            # v_cvt_pk_fp8_f32: 2 f32 -> 2 fp8 bytes in word 0.
-                            packed = rocdl.cvt_pk_fp8_f32(i32, scaled0, scaled1, c0_i32, 0)
-                        payload_val = arith.trunci(T.i16, ArithValue(packed))  # 2 fp8 B
+                            absj = llvm.call_intrinsic(
+                                f32, "llvm.fabs.f32", [xj], [], []
+                            )
+                            block_amax = arith.maximumf(block_amax, absj)
+                        for dist in amax_shuffle_dists:
+                            peer_amax = block_amax.shuffle_xor(
+                                arith.constant(dist, type=i32), c_wave
+                            )
+                            block_amax = arith.maximumf(block_amax, peer_amax)
+
+                        e8m0_scale = emit_mx_e8m0_scale(
+                            block_amax, mode=_ROUND_MODE, dtype=mx_dtype
+                        )
+                        # scale 2^(e8m0-127); the HW divides each input by its
+                        # exponent and RNE-packs 8 fp4 nibbles into one i32.
+                        block_scale_f32 = (
+                            ArithValue(e8m0_scale) << c23_i32
+                        ).bitcast(f32)
+                        payload_val = _cvt_scalef32_pk8_fp4_bf16(
+                            bf16x8, block_scale_f32, i32_ty=i32
+                        )  # i32 = 4 fp4x2 bytes
                     else:
-                        if const_expr(use_native):
-                            block_scale_f32 = (
-                                ArithValue(e8m0_scale) << c23_i32
-                            ).bitcast(f32)
-                            packed = rocdl.cvt_scalef32_pk_fp4_f32(
-                                i32, _raw(c0_i32), _raw(x0), _raw(x1),
-                                _raw(block_scale_f32), 0,
+                        # two contiguous bf16 columns: col_base = mx_block*32 + lane_in_block*2
+                        col_base = (
+                            mx_block * arith.constant(32, type=i32)
+                            + lane_in_block * c_elems_per_lane
+                        )
+                        hidden_dword = (hidden_elem_base + col_base) >> c1_i32  # 2 bf16/dword
+
+                        dword_raw = buffer_ops.buffer_load(
+                            hidden_rsrc, hidden_dword, vec_width=1, dtype=i32
+                        )
+                        vec1_i32_ty = T.vec(1, i32)
+                        vec2_bf16_ty = T.vec(ELEMS_PER_LANE, T.bf16)
+                        vec2_f32_ty = T.vec(ELEMS_PER_LANE, f32)
+                        bf16_pair = vector.bitcast(
+                            vec2_bf16_ty, vector.from_elements(vec1_i32_ty, [dword_raw])
+                        )
+                        f32_pair = bf16_pair.extf(vec2_f32_ty)
+                        x0 = vector.extract(f32_pair, static_position=[0], dynamic_position=[])
+                        x1 = vector.extract(f32_pair, static_position=[1], dynamic_position=[])
+
+                        # per-block amax: max over this lane's 2 elems, then a butterfly
+                        # shuffle_xor across the block's 16 lanes.
+                        abs0 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x0], [], [])
+                        abs1 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x1], [], [])
+                        block_amax = arith.maximumf(c0_f32, arith.maximumf(abs0, abs1))
+                        for dist in amax_shuffle_dists:
+                            peer_amax = block_amax.shuffle_xor(
+                                arith.constant(dist, type=i32), c_wave
                             )
-                            payload_val = arith.trunci(T.i8, ArithValue(packed))
+                            block_amax = arith.maximumf(block_amax, peer_amax)
+
+                        e8m0_scale = emit_mx_e8m0_scale(
+                            block_amax, mode=_ROUND_MODE, dtype=mx_dtype
+                        )
+
+                        # Forward block scale 2^(e8m0-127) = bitcast(e8m0<<23); the native
+                        # scalef32 ops divide by its *exponent part*. The portable path
+                        # multiplies by the reciprocal 2^(127-e8m0) then converts.
+                        if const_expr(is_fp8):
+                            if const_expr(use_native):
+                                block_scale_f32 = (
+                                    ArithValue(e8m0_scale) << c23_i32
+                                ).bitcast(f32)
+                                packed = rocdl.cvt_scalef32_pk_fp8_f32(
+                                    i32, _raw(c0_i32), _raw(x0), _raw(x1),
+                                    _raw(block_scale_f32), 0,
+                                )
+                            else:
+                                recip_scale = (
+                                    (c254_i32 - e8m0_scale) << c23_i32
+                                ).bitcast(f32)
+                                scaled0 = ArithValue(x0) * recip_scale
+                                scaled1 = ArithValue(x1) * recip_scale
+                                # v_cvt_pk_fp8_f32: 2 f32 -> 2 fp8 bytes in word 0.
+                                packed = rocdl.cvt_pk_fp8_f32(i32, scaled0, scaled1, c0_i32, 0)
+                            payload_val = arith.trunci(T.i16, ArithValue(packed))  # 2 fp8 B
                         else:
-                            recip_scale = (
-                                (c254_i32 - e8m0_scale) << c23_i32
-                            ).bitcast(f32)
-                            nib0 = emit_f32_to_e2m1(ArithValue(x0) * recip_scale)
-                            nib1 = emit_f32_to_e2m1(ArithValue(x1) * recip_scale)
-                            packed_byte = ArithValue(nib0) | (ArithValue(nib1) << c4_i32)
-                            payload_val = arith.trunci(T.i8, packed_byte)  # 1 fp4x2 B
+                            if const_expr(use_native):
+                                block_scale_f32 = (
+                                    ArithValue(e8m0_scale) << c23_i32
+                                ).bitcast(f32)
+                                packed = rocdl.cvt_scalef32_pk_fp4_f32(
+                                    i32, _raw(c0_i32), _raw(x0), _raw(x1),
+                                    _raw(block_scale_f32), 0,
+                                )
+                                payload_val = arith.trunci(T.i8, ArithValue(packed))
+                            else:
+                                recip_scale = (
+                                    (c254_i32 - e8m0_scale) << c23_i32
+                                ).bitcast(f32)
+                                nib0 = emit_f32_to_e2m1(ArithValue(x0) * recip_scale)
+                                nib1 = emit_f32_to_e2m1(ArithValue(x1) * recip_scale)
+                                packed_byte = ArithValue(nib0) | (ArithValue(nib1) << c4_i32)
+                                payload_val = arith.trunci(T.i8, packed_byte)  # 1 fp4x2 B
 
                     # payload byte offset within grouped_payload. offset_is_bytes=True
                     # so the i8 (fp4) / i16 (fp8) store does not rescale this already-
