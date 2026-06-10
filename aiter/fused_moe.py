@@ -543,14 +543,9 @@ def fused_moe_(
             )
         )
         # Different block_m can legitimately produce different padded valid-id
-        # counts, so do not enforce equality across the two sorting passes.
-        if int(num_valid_ids1[0].item()) != int(num_valid_ids2[0].item()):
-            pass
-            # logger.warning(
-            #     f"[fused_moe] dual-sorting valid-id counts differ with "
-            #     f"block_m(stage1)={block_size_M1}, block_m2(stage2)={block_size_M2}: "
-            #     f"{int(num_valid_ids1[0].item())} vs {int(num_valid_ids2[0].item())}"
-            # )
+        # counts across the two sorting passes; this is expected and not
+        # enforced. (No .item() comparison here: reading num_valid_ids on the
+        # host would force a device->host sync and break CPU/GPU overlap.)
 
     if metadata.run_1stage:
         return metadata.stage1(
