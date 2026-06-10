@@ -416,9 +416,10 @@ def _mhc_fused_post_pre_large_m_hybrid(
 
     selected_splitk, selected_tile_k = get_mhc_pre_splitk(m, hc_hidden_size)
     next_residual = torch.empty_like(residual_in)
-    gemm_out = torch.empty(
-        selected_splitk, m, hc_mult3, dtype=dtypes.fp32, device=device
+    gemm_out_pad = torch.empty(
+        selected_splitk, m, (hc_mult3 + 31) // 32 * 32, dtype=dtypes.fp32, device=device
     )
+    gemm_out = gemm_out_pad[:, :, :hc_mult3]
     gemm_out_sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
     post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
     comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
