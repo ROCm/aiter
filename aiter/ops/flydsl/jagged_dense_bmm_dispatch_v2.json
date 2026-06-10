@@ -108,6 +108,46 @@
           "waves_per_eu": 0,
           "xcd_c": 120,
           "xcd_w": 8
+        },
+        "B120D256K256N16384": {
+          "cos": 1.0,
+          "tile_m": 128,
+          "tile_n": 128,
+          "use_mfma_k32": true,
+          "waves_per_eu": 1,
+          "xcd_c": 32,
+          "xcd_w": 8,
+          "source": "Mi=16384 deployment sweep (gfx950, 2026-06-10, do_bench cold-L2 uniform): 128x128 wpe=1 -> 0.561ms vs 0.565 heuristic. _mi16k_winners.py. cos=1.0."
+        },
+        "B120D512K512N16384": {
+          "cos": 1.0,
+          "tile_m": 128,
+          "tile_n": 128,
+          "use_mfma_k32": true,
+          "waves_per_eu": 1,
+          "xcd_c": 120,
+          "xcd_w": 8,
+          "source": "Mi=16384 deployment sweep (gfx950, 2026-06-10): 128x128 wpe=1 -> 1.506ms. _mi16k_winners.py. cos=1.0."
+        },
+        "B1024D256K256N16384": {
+          "cos": 1.0,
+          "tile_m": 128,
+          "tile_n": 128,
+          "use_mfma_k32": true,
+          "waves_per_eu": 1,
+          "xcd_c": 32,
+          "xcd_w": 8,
+          "source": "Mi=16384 deployment sweep (gfx950, 2026-06-10): 128x128 wpe=1 -> 4.429ms vs 4.445 heuristic. _mi16k_winners.py. cos=1.0."
+        },
+        "B1024D512K512N16384": {
+          "cos": 1.0,
+          "tile_m": 256,
+          "tile_n": 256,
+          "use_mfma_k32": true,
+          "waves_per_eu": 0,
+          "xcd_c": 120,
+          "xcd_w": 8,
+          "source": "Mi=16384 deployment sweep (gfx950, 2026-06-10): 256x256 -> 12.44ms vs 12.85 at 128x128 (-3.2%). 256x256 needs 128KB LDS (CDNA4 only). _mi16k_winners.py. cos=1.0."
         }
       },
       "fallback": {
