@@ -992,7 +992,7 @@ def flydsl_qk_norm_rope_quant(
     for start in range(0, T_tok, MAX_GRID_Y):
         n = min(MAX_GRID_Y, T_tok - start)
         end = start + n
-        launcher(
+        args = (
             _ptr_arg(q_view[start:end]),
             _ptr_arg(kv[start:end]),
             q_weight_static,
@@ -1006,7 +1006,13 @@ def flydsl_qk_norm_rope_quant(
             _ptr_arg(kv_scale_arg[start:end] if quant else kv_scale_arg),
             kv.stride(0),
             n,
-            stream=fx_stream,
+            fx_stream,
         )
+        cf = getattr(launcher, "_cf", None)
+        if cf is not None:
+            cf(*args)
+        else:
+            cf = flyc.compile(launcher, *args)
+            launcher._cf = cf
 
     return q_out, kv_out, (q_scale if quant else None), (kv_scale if quant else None)

@@ -1422,7 +1422,7 @@ def flydsl_fused_compress_attn(
         stream = torch.cuda.current_stream()
     fx_stream = Stream(stream)
 
-    launcher(
+    args = (
         kv_in,
         kv_in.stride(0),
         score_in,
@@ -1447,5 +1447,11 @@ def flydsl_fused_compress_attn(
         bt_arg,
         bt_seq_stride,
         plan_capacity,
-        stream=fx_stream,
+        fx_stream,
     )
+    cf = getattr(launcher, "_cf", None)
+    if cf is not None:
+        cf(*args)
+    else:
+        cf = flyc.compile(launcher, *args)
+        launcher._cf = cf
