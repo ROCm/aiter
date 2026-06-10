@@ -171,11 +171,11 @@ void opus_gemm(
 
 // opus_gemm_a16w16_tune() — id-based tune entry.
 
-// splitk kids: gfx950 [200,300) + nooob [1200,1300); gfx942 [50200, 50400).
+// splitk kids: gfx950 [200,300) + nooob [1200,1300); gfx942 [10200, 10300).
 static constexpr int OPUS_SPLITK_KID_MIN = 200;
 static constexpr int OPUS_SPLITK_KID_MAX = 300;
-static constexpr int OPUS_GFX942_KID_OFFSET = 50000;
-static constexpr int OPUS_GFX942_SPLITK_KID_MAX = 400;
+static constexpr int OPUS_GFX942_KID_OFFSET = 10000;
+static constexpr int OPUS_GFX942_SPLITK_KID_MAX = 300;
 // SB a16w16 kids: gfx950 [4,10) + mirrors at +1000/.../+7000.
 static constexpr int OPUS_A16W16_SB_KID_MIN = 4;
 static constexpr int OPUS_A16W16_SB_KID_MAX = 10;
