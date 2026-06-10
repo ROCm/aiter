@@ -185,3 +185,26 @@ Still genuinely open: which avenue ships to production (FlyDSL→CKTile recommen
   reuses ccache and does not fix it). Run env is the `jdbba-flydsl` container, aiter at
   `/workspaces/meta/aiter`. Next: re-tune per-shape gfx942 winners (BLOCK_K, tiles, XCD remap, warps)
   via the `/jdbba-autoresearch` loop.
+- **2026-06-10 (loop session)** — Ran the autoresearch loop on gfx942. **Bound check:** achieved
+  HBM BW is only 25-32% of MI300X peak (~5.3 TB/s) → kernel is **overhead/latency-bound**, not
+  HBM-bound, so amortization + occupancy levers have the headroom, not bandwidth tricks.
+  Levers tried (cold-L2 do_bench, both regimes, cos=1.0 gate):
+  - **#6 XCD remap (tier-A live-knob sweep, `tune_jdbba_xcd.py`)** → KEPT. Swept xcd_c×xcd_w;
+    per-shape winners beat the kernel auto-default by 0.9-2.6% (uniform only; skew has remap off).
+    Promoted to `by_arch.gfx942.winners`. Marginal size confirms the kernel is *not* L2/chiplet-bound.
+  - **BLOCK_K=64 for all K (was 128 for K≤256)** → KEPT, the session's big win. The K≤256→BLOCK_K=128
+    special case made A-staging LDS = 64KB, saturating gfx942's 64KB ceiling and halving occupancy.
+    BLOCK_K=64 → 32KB → doubles occupancy: **+11-19% on D256** (uniform B120 1.11×, B1024 1.14×;
+    skew B120 1.19×), cos=1.0. The old "128 wins ~4%" note was a **gfx950** result (bigger LDS hides
+    the occupancy cost). **This is the central gfx942 lesson: occupancy is the binding constraint.**
+  - **Tier-B grow-levers — all DISCARDED** (fan-out, 4 isolated worktrees): BLOCK_M=256 (crashes D256
+    at 128KB LDS, D512 −39% occupancy-killed at the 64KB ceiling), BLOCK_N=256 (cos=1.0 but −8-15%
+    uniform / up to −7.7× skew, 64KB C-tile collapses occupancy), STAGES_A=3 (crashes D256 on old
+    BLOCK_K=128; **re-tested clean on the new BLOCK_K=64 baseline → still −24-29%**, deeper pipeline
+    costs occupancy with no latency to hide on the 4-8-step K-loop), waves_per_eu={2,3,4} (parity at
+    best; wpe=3 spills 2.5× on B1024_D256). Every LDS-*growing* change loses; the only tile/pipeline
+    win was *shrinking* LDS (BLOCK_K=64). gfx942's 64KB LDS (2.5× smaller than gfx950) is the wall.
+  - **Standing vs Triton (uniform, post-levers):** D256 now ~1.28-1.29×, D512 ~1.28-1.31×. Skew
+    1.13-1.21×. The 2× target needs a *structural* amortization lever (#12 B-stationary multi-M-tile:
+    load Dense[b] once, run several M-tiles to keep the pipeline warm) — the remaining big idea, since
+    every knob-level lever is now exhausted or occupancy-capped.
