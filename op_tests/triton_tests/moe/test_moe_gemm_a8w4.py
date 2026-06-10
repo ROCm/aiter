@@ -187,6 +187,9 @@ class Case:
             Case(4, 1024, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
             Case(1024, 3072, 512, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
             Case(4096, 3072, 3072, "float8_e4m3fn", 128, 4),
+            # compare-consistent: mxfp8 act + mxfp4 weight + scale swizzle, full
+            # MoE shape (matches test_flydsl_grouped_gemm_gfx1250_compare gluon path).
+            Case(4096, 3072, 3072, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
             Case(16, 1024, 1024, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
             Case(4096, 1024, 1024, "mxfloat8_e4m3fn", 128, 4),
             Case(16, 256, 256, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
@@ -238,8 +241,19 @@ def test_op(
         #     pytest.skip("Mxfloat activations are not supported yet on gfx1250.")
         if apply_swiglu and has_y_gammas:
             pytest.skip("Swiglu and gammas are not supported together on gfx1250.")
-        # temporary
-        if m > 1024 or n > 1024 or k > 1024 or n_expts_tot > 32:
+        # temporary: the FFM size guard is too coarse for the compare-consistent
+        # case, which is intentionally a full MoE shape. Allowlist that exact
+        # shape (mxfp8 act + swizzle) so it runs; everything else still skips.
+        _is_compare_shape = (m, n, k, n_expts_tot, n_expts_act) == (
+            4096,
+            3072,
+            3072,
+            128,
+            4,
+        ) and act_dtype_str == "mxfloat8_e4m3fn" and hbm_swizzling
+        if not _is_compare_shape and (
+            m > 1024 or n > 1024 or k > 1024 or n_expts_tot > 32
+        ):
             pytest.skip("Test will take too long time on FFM")
 
     if hbm_swizzling:
