@@ -3035,10 +3035,11 @@ def compile_mixed_moe_gemm2(
     _async_tag = "_async" if use_async_copy else ""
     _cumul_tag = f"_cumul{int(cu_num_mul)}" if int(cu_num_mul) != 1 else ""
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    _acc_tag = "" if accumulate else "_acc0"
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_vscale_fix3_fp4opt_v1{_pm_tag}{_sbm_tag}{_wpe_tag}{_async_tag}{_cumul_tag}{_xcd_tag}"
+        f"_vscale_fix3_fp4opt_v1{_pm_tag}{_sbm_tag}{_wpe_tag}{_async_tag}{_cumul_tag}{_xcd_tag}{_acc_tag}"
     ).replace("-", "_")
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Reuse a single allocation for both:

@@ -78,8 +78,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 1,
     CDNA_VERSION: gl.constexpr = 3,
-    IS_GFX1250: gl.constexpr = False,
+    ARCH: gl.constexpr = "gfx942",
 ):
+    IS_GFX1250: gl.constexpr = ARCH == "gfx1250"
     pid = tl.program_id(0)
     num_block_q_head = tl.cdiv(heads_num, ChunkQ)
 
@@ -365,8 +366,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 16,
     CDNA_VERSION: gl.constexpr = 3,
-    IS_GFX1250: gl.constexpr = False,
+    ARCH: gl.constexpr = "gfx942",
 ):
+    IS_GFX1250: gl.constexpr = ARCH == "gfx1250"
     # ===---------------------------------------------------
     # Gluon Layout
     # ===---------------------------------------------------
@@ -1345,7 +1347,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 16,
     CDNA_VERSION: gl.constexpr = 3,
-    IS_GFX1250: gl.constexpr = False,
+    ARCH: gl.constexpr = "gfx942",
 ):
     # ===---------------------------------------------------
     # Gluon Layout

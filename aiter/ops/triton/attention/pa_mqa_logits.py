@@ -310,7 +310,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["KVBlockSize"] = "constexpr"
     fn_signature["HiddenDim"] = "constexpr"
     fn_signature["CDNA_VERSION"] = "constexpr"
-    fn_signature["IS_GFX1250"] = "constexpr"
+    fn_signature["ARCH"] = "constexpr"
 
     effective_wave_per_eu = 1 if is_gfx1250 and not Preshuffle else WavePerEU
     options = {
@@ -355,7 +355,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             "KVBlockSize": KVBlockSize,
             "HiddenDim": HiddenDim,
             "CDNA_VERSION": cdna_version,
-            "IS_GFX1250": is_gfx1250,
+            "ARCH": gfx_version,
         },
         attrs={
             (2,): [["tt.divisibility", 16]],  # heads_num
@@ -533,6 +533,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 KVBlockSize,
                 hidden_dim,
                 cdna_version,
+                get_gfx(),
             )
         else:  #  load AOT compiled gluon kernel
             assert triton_version < Version(
