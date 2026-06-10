@@ -919,4 +919,120 @@ void fused_qknorm_allreduce_rope(fptr_t _fa,
 #undef DISPATCH_AR_ROPE_FUSION
 }
 
+void fused_qknorm_allreduce_rope_cache_quant(fptr_t _fa,
+                                             const aiter_tensor_t& qkv_in,
+                                             const aiter_tensor_t& q_w,
+                                             const aiter_tensor_t& k_w,
+                                             const aiter_tensor_t& q_out,
+                                             const aiter_tensor_t& k_out,
+                                             const aiter_tensor_t& v_out,
+                                             const aiter_tensor_t& cos_sin_cache,
+                                             const aiter_tensor_t& position_ids,
+                                             const aiter_tensor_t& k_cache,
+                                             const aiter_tensor_t& v_cache,
+                                             const aiter_tensor_t& k_scale,
+                                             const aiter_tensor_t& v_scale,
+                                             const aiter_tensor_t& slot_mapping,
+                                             int64_t head_dim,
+                                             int64_t rotary_dim,
+                                             double eps,
+                                             int64_t reg_ptr,
+                                             int64_t reg_bytes)
+{
+    HipDeviceGuard device_guard(qkv_in.device_id);
+    hipStream_t stream   = aiter::getCurrentHIPStream();
+    auto dtype           = qkv_in.dtype();
+    int64_t hidden_dim_q = q_w.numel();
+    int64_t hidden_dim_k = k_w.numel();
+    int64_t token_num    = qkv_in.size(0);
+    int64_t hidden_dim_v = qkv_in.size(1) - (hidden_dim_q + hidden_dim_k);
+    auto fa              = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int64_t data_bytes   = qkv_in.numel() * qkv_in.element_size();
+    void* inp_ptr        = qkv_in.data_ptr();
+
+    if(qkv_in.dtype() != cos_sin_cache.dtype())
+        throw std::runtime_error(
+            "fused_qknorm_allreduce_rope_cache_quant requires cos_sin_cache dtype to match qkv_in dtype");
+    if(position_ids.dtype() != AITER_DTYPE_i64 || slot_mapping.dtype() != AITER_DTYPE_i64)
+        throw std::runtime_error(
+            "fused_qknorm_allreduce_rope_cache_quant requires int64 position_ids and slot_mapping");
+    if(k_cache.dtype() != AITER_DTYPE_fp8 || v_cache.dtype() != AITER_DTYPE_fp8)
+        throw std::runtime_error("fused_qknorm_allreduce_rope_cache_quant only supports fp8 KV cache");
+    if(k_scale.dtype() != AITER_DTYPE_fp32 || v_scale.dtype() != AITER_DTYPE_fp32)
+        throw std::runtime_error("fused_qknorm_allreduce_rope_cache_quant requires fp32 KV scales");
+    if(cos_sin_cache.dim() != 2 || cos_sin_cache.size(1) < rotary_dim)
+        throw std::runtime_error(
+            "fused_qknorm_allreduce_rope_cache_quant expects cos_sin_cache shape [max_pos, rotary_dim]");
+    if(k_cache.dim() != 5 || v_cache.dim() != 5)
+        throw std::runtime_error(
+            "fused_qknorm_allreduce_rope_cache_quant expects 5D shuffle KV cache tensors");
+
+    const int64_t page_size = k_cache.size(3);
+    const int64_t x_layout  = k_cache.size(4);
+    if(v_cache.size(2) * v_cache.size(4) != page_size || v_cache.size(3) != head_dim ||
+       v_cache.size(4) != x_layout)
+        throw std::runtime_error("fused_qknorm_allreduce_rope_cache_quant V cache layout mismatch");
+    if(k_cache.size(1) != hidden_dim_k / head_dim || v_cache.size(1) != hidden_dim_v / head_dim)
+        throw std::runtime_error("fused_qknorm_allreduce_rope_cache_quant KV cache head count mismatch");
+
+    if(reg_ptr != 0)
+    {
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, qkv_in.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        inp_ptr = (void*)reg_ptr;
+    }
+
+#define DISPATCH_AR_ROPE_CACHE_FUSION(DTYPE)                                                \
+    {                                                                                        \
+        fa->dispatchFusedQKNormAllReduce<DTYPE, true, true>(                                 \
+            stream,                                                                          \
+            reinterpret_cast<DTYPE*>(inp_ptr),                                               \
+            reinterpret_cast<DTYPE*>(q_w.data_ptr()),                                        \
+            reinterpret_cast<DTYPE*>(k_w.data_ptr()),                                        \
+            reinterpret_cast<DTYPE*>(q_out.data_ptr()),                                      \
+            reinterpret_cast<DTYPE*>(k_out.data_ptr()),                                      \
+            reinterpret_cast<DTYPE*>(v_out.data_ptr()),                                      \
+            token_num,                                                                        \
+            hidden_dim_q,                                                                     \
+            hidden_dim_k,                                                                     \
+            hidden_dim_v,                                                                     \
+            eps,                                                                              \
+            reinterpret_cast<DTYPE*>(cos_sin_cache.data_ptr()),                              \
+            reinterpret_cast<int64_t*>(position_ids.data_ptr()),                             \
+            head_dim,                                                                         \
+            rotary_dim,                                                                       \
+            reinterpret_cast<opus::fp8_t*>(k_cache.data_ptr()),                              \
+            reinterpret_cast<opus::fp8_t*>(v_cache.data_ptr()),                              \
+            reinterpret_cast<float*>(k_scale.data_ptr()),                                     \
+            reinterpret_cast<float*>(v_scale.data_ptr()),                                     \
+            reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                             \
+            page_size,                                                                        \
+            x_layout);                                                                        \
+    }
+
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp32: {
+        DISPATCH_AR_ROPE_CACHE_FUSION(opus::fp32_t)
+        break;
+    }
+    case AITER_DTYPE_fp16: {
+        DISPATCH_AR_ROPE_CACHE_FUSION(opus::fp16_t)
+        break;
+    }
+#if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16: {
+        DISPATCH_AR_ROPE_CACHE_FUSION(opus::bf16_t)
+        break;
+    }
+#endif
+    default:
+        throw std::runtime_error(
+            "custom allreduce rope cache only supports float32, float16 and bfloat16 activations");
+    }
+#undef DISPATCH_AR_ROPE_CACHE_FUSION
+}
+
 } // namespace aiter

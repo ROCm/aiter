@@ -530,6 +530,42 @@ class CudaCommunicator(DeviceCommunicatorBase):
         assert v_out is not None
         return q_out, k_out, v_out
 
+    def fused_qknorm_allreduce_rope_cache_quant(
+        self,
+        qkv_in,
+        q_w,
+        k_w,
+        cos_sin_cache,
+        position_ids,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        slot_mapping,
+        head_dim,
+        rotary_dim,
+        eps,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_out, k_out, v_out = self.ca_comm.custom_fused_qknorm_ar_rope_cache_quant(
+            qkv_in,
+            q_w,
+            k_w,
+            cos_sin_cache,
+            position_ids,
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
+            slot_mapping,
+            head_dim,
+            rotary_dim,
+            eps,
+        )
+        assert q_out is not None
+        assert k_out is not None
+        assert v_out is not None
+        return q_out, k_out, v_out
+
     def fused_allreduce_rmsnorm_mxfp4_quant(
         self,
         input_,
