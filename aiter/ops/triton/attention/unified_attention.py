@@ -137,34 +137,25 @@ def select_3d_config(
     num_segments = 0
     attn_stages = 2
     if IS_DEVICE_ARCH_GFX12:
+        attn_warps = 1
+        TILE_SIZE = block_size
         if shuffled_kv_cache and head_size < 128:
-            TILE_SIZE = block_size
             if kv_cache_dtype == torch.bfloat16:
                 if block_size <= 64:
-                    attn_warps = 1
                     waves_per_eu = 2
                 else:
-                    attn_warps = 1
                     waves_per_eu = 1
-                    attn_stages = 1
             elif kv_cache_dtype == e4m3_dtype:
                 if block_size <= 128:
-                    attn_warps = 1
                     waves_per_eu = 2
                 else:
-                    attn_warps = 1
                     waves_per_eu = 1
-                    attn_stages = 1
             else:
                 assert block_size == 128, "FP4 KV cache only supports block_size 128"
-                attn_warps = 1
                 waves_per_eu = 2
         else:
-            # GFX12 fallback for un-tunned shapes
-            TILE_SIZE = block_size
-            attn_warps = 1
+            # GFX12 fallback
             waves_per_eu = 1
-            attn_stages = 1
 
         occ = waves_per_eu * 4 // attn_warps
         MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
@@ -181,12 +172,6 @@ def select_3d_config(
         #     )
         #     attn_warps = max(attn_warps, 1)
         #     attn_warps = min(attn_warps, 4)
-
-        if (
-            2 * attn_stages * TILE_SIZE * head_size * kv_cache_dtype.itemsize * occ
-            >= 327680
-        ):
-            waves_per_eu = 0
     else:
         occ = waves_per_eu * 4 // attn_warps
         target_num_prgms = target_num_prgms * occ
