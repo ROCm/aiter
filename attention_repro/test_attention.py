@@ -6,7 +6,7 @@ from typing import Optional
 import pytest
 import torch
 
-from unified_attention_2d_merged import (
+from  ua_2d_gfx1250_pr import (
     unified_attention as gluon_unified_attention_2d,
 )
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -287,7 +287,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "head_size",
     [
-        64,
+        64, 128,
     ],
 )
 @pytest.mark.parametrize(
@@ -305,7 +305,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "dtype",
     [
-        torch.bfloat16,
+        e4m3_dtype,
     ],
 )
 @pytest.mark.parametrize(
@@ -318,16 +318,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "q_dtype",
     [
-        torch.bfloat16,
-    ],
-)
-@torch.inference_mode()
-@pytest.mark.parametrize(
-    "use_tdm, num_kv_blocks",
-    [
-        # (False, 1),
-        (True, 1),
-        # (True, 4),
+        e4m3_dtype,
     ],
 )
 @pytest.mark.parametrize(
@@ -345,7 +336,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "loop_variant",
     [
-        0, 3,
+        0,1,2
     ],
 )
 @torch.inference_mode()
@@ -359,8 +350,6 @@ def test_gluon_unified_attn_2d_noncausal(
     soft_cap: Optional[float],
     num_blocks: int,
     q_dtype: Optional[torch.dtype],
-    use_tdm: bool,
-    num_kv_blocks: int,
     shuffled_kv_cache: bool,
     check_ref: bool,
     loop_variant: int,
@@ -373,10 +362,6 @@ def test_gluon_unified_attn_2d_noncausal(
         "gfx1250",
     ):
         pytest.skip(f"{DEVICE_ARCH} is not supported")
-    if DEVICE_ARCH not in ("gfx1250",) and use_tdm == True:
-        pytest.skip(f"{DEVICE_ARCH} does not have TDM")
-    if num_kv_blocks > 1 and DEVICE_ARCH not in ("gfx1250",):
-        pytest.skip(f"{DEVICE_ARCH} does not have TDM gather")
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
     # if shuffled_kv_cache and (not use_tdm or num_kv_blocks != 1):
@@ -390,11 +375,6 @@ def test_gluon_unified_attn_2d_noncausal(
     num_query_heads = num_heads[0]
     num_kv_heads = num_heads[1]
     assert num_query_heads % num_kv_heads == 0
-    num_buffers = 3
-    if loop_variant == 0:
-        num_buffers = 2
-    # NOTE: for now, skip paged access
-    remove_indirect_access=False
 
     (
         query,
@@ -425,7 +405,6 @@ def test_gluon_unified_attn_2d_noncausal(
         q_dtype=q_dtype,
         kv_dtype=dtype,
         shuffled_kv_cache=shuffled_kv_cache,
-        remove_indirect_access=remove_indirect_access, 
     )
     output_cuda = output.cuda()
     gluon_unified_attention_2d(
@@ -447,13 +426,8 @@ def test_gluon_unified_attn_2d_noncausal(
         v_descale=v_descale.cuda() if v_descale is not None else None,
         output_scale=output_scale.cuda() if output_scale is not None else None,
         sinks=sinks.cuda() if sinks is not None else None,
-        new_kv_layout=num_kv_blocks > 1,
-        num_kv_blocks=num_kv_blocks,
-        use_tdm=use_tdm,
         shuffled_kv_cache=shuffled_kv_cache,
-        #remove_indirect_access=remove_indirect_access,
-        #loop_variant=loop_variant,
-        #num_buffers=num_buffers,
+        loop_variant=loop_variant,
     )
     ref_output = ref_paged_attn(
         query=query,

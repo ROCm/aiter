@@ -2713,10 +2713,10 @@ def kernel_unified_attention_2d(
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
     query_start_len_ptr,  # [num_seqs+1]
-    query_stride_0,
-    query_stride_1,
-    output_stride_0,
-    output_stride_1,
+    query_stride_0: gl.int32,
+    query_stride_1: gl.constexpr,
+    output_stride_0: gl.int32,
+    output_stride_1: gl.constexpr,
     k_descale_ptr,
     v_descale_ptr,
     q_descale_ptr,
@@ -2982,7 +2982,7 @@ def kernel_unified_attention_2d(
         cur_batch_query_len,
         output_stride_0,
         output_stride_1,
-        USE_TDM=False,
+        USE_TDM=True,
     )
 
 def unified_attention(
