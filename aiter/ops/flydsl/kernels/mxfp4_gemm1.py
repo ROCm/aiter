@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 """FlyDSL port of aiter ``gemm1_a4w4`` (MXFP4 MoE up/gate-proj, gfx950).
 
 A 1:1 port of HIP ``gemm1_a4w4.cuh`` + ``mxfp4_epilogs.hpp``, bit-exact vs
@@ -22,38 +22,93 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from . import dpp_utils
 
-# ── compile-time constants (BM-independent; BM-derived ones live in _bm_constants) ──
+# -- compile-time constants (BM-independent; BM-derived ones live in _bm_constants) --
 MAX_M = 655360
 NE = 385
-K = 7168  # gemm1 contraction = hidden_size
-INTER = 512  # per-shard MLP intermediate
+K = 7168  # gemm1 contraction = hidden_size (DEFAULT / KIMI; per-shape value comes
+#           from the compile arg D_HIDDEN. All K-derived sizes are computed from the
+#           arg via the *_for() helpers below; these module globals are the KIMI
+#           defaults so existing importers (and the test) keep working unchanged.)
+INTER = 512  # per-shard MLP intermediate (OUTPUT side; kept fixed for now)
 N_OUT = 2 * INTER  # 1024
 TOPK = 9
 
 BN = 256
 BK = 256
-K_HALF = K // 2  # 3584 packed-fp4 bytes along K
-KH_TILE = BK // 2  # 128 packed bytes per K-tile
-K_TILES_TOTAL = K // BK  # 28
+KH_TILE = BK // 2  # 128 packed bytes per K-tile (BK-derived, K-independent)
 kStages = 2
-kUnroll = 26
-NUM_N_BLOCKS = N_OUT // 256  # 4
+NUM_N_BLOCKS = N_OUT // 256  # 4 (OUTPUT side; INTER/N_OUT-derived, K-independent)
 
-# input A-scale layout
-kAS_c_k1 = (K // 32) // 4 // 2  # 28
-kAS_per_chunk_dw = 1 * kAS_c_k1 * 64  # 1792
-
-# B-scale layout
-kBS_c_n1 = N_OUT // 16 // 2  # 32
-kBS_c_k1 = (K // 32) // 4 // 2  # 28
+# B-scale layout (OUTPUT side + K-independent strides)
+kBS_c_n1 = N_OUT // 16 // 2  # 32 (N_OUT-derived)
 kBS_stride_k0_dw = 64
-kBS_stride_n0_dw = kBS_c_k1 * 64  # 1792
-kBS_per_expert_dw = kBS_c_n1 * kBS_stride_n0_dw  # 57344
 
-# buffer-rsrc byte sizes
-BQ_BYTES = NE * N_OUT * K_HALF  # 1412956160
-ASCALE_BYTES = (MAX_M // 32) * kAS_per_chunk_dw * 4  # 146800640
-BSCALE_BYTES = NE * kBS_per_expert_dw * 4  # 88309760
+
+# -- K-derived sizes (parametrized over the contraction dim K = D_HIDDEN) ------
+# K MUST be a multiple of BK (256). The *_for() helpers mirror gemm2's pattern so
+# the KIMI default (K=7168) path is byte-for-byte identical to the old globals.
+def k_half_for(k):
+    return k // 2  # packed-fp4 bytes along K (KIMI: 3584)
+
+
+def k_tiles_total_for(k):
+    return k // BK  # KIMI: 28
+
+
+def kunroll_for(k):
+    # main-loop trip count. The K-loop is: prologue issues kStages tiles, the main
+    # loop processes tiles [0, kUnroll) while issuing tiles [kStages, kStages+kUnroll),
+    # and the drain processes the final kStages tiles. Full, gap-free coverage of all
+    # K_TILES_TOTAL tiles therefore requires EXACTLY kUnroll = K_TILES_TOTAL - kStages
+    # (KIMI: 28-2 = 26, matching the old hand-tuned value). This is the correct rule
+    # for arbitrary K (e.g. K=3072 -> K_TILES_TOTAL=12 -> kUnroll=10), not just a tune.
+    return k_tiles_total_for(k) - kStages
+
+
+def kas_c_k1_for(k):
+    return (k // 32) // 4 // 2  # KIMI: 28
+
+
+def kas_per_chunk_dw_for(k):
+    return 1 * kas_c_k1_for(k) * 64  # KIMI: 1792
+
+
+def kbs_c_k1_for(k):
+    return (k // 32) // 4 // 2  # KIMI: 28
+
+
+def kbs_stride_n0_dw_for(k):
+    return kbs_c_k1_for(k) * 64  # KIMI: 1792
+
+
+def kbs_per_expert_dw_for(k):
+    return kBS_c_n1 * kbs_stride_n0_dw_for(k)  # KIMI: 57344
+
+
+def bq_bytes_for(k):
+    return NE * N_OUT * k_half_for(k)  # KIMI: 1412956160
+
+
+def ascale_bytes_for(k, max_m=MAX_M):
+    return (max_m // 32) * kas_per_chunk_dw_for(k) * 4  # KIMI: 146800640
+
+
+def bscale_bytes_for(k):
+    return NE * kbs_per_expert_dw_for(k) * 4  # KIMI: 88309760
+
+
+# KIMI defaults (back-compat module globals; equal to the *_for(K) helpers).
+K_HALF = k_half_for(K)  # 3584
+K_TILES_TOTAL = k_tiles_total_for(K)  # 28
+kUnroll = kunroll_for(K)  # 26
+kAS_c_k1 = kas_c_k1_for(K)  # 28
+kAS_per_chunk_dw = kas_per_chunk_dw_for(K)  # 1792
+kBS_c_k1 = kbs_c_k1_for(K)  # 28
+kBS_stride_n0_dw = kbs_stride_n0_dw_for(K)  # 1792
+kBS_per_expert_dw = kbs_per_expert_dw_for(K)  # 57344
+BQ_BYTES = bq_bytes_for(K)  # 1412956160
+ASCALE_BYTES = ascale_bytes_for(K)  # 146800640
+BSCALE_BYTES = bscale_bytes_for(K)  # 88309760
 
 # epilog output-scale layout (gemm2 A-scale): N_INTER=512, K_G2_HALF=256, BN_INT=128
 N_INTER = 512
@@ -89,13 +144,21 @@ def _lds_base_ptr3(lds_view):
 
 def _gep3(base_ptr, byte_off_i32):
     """getelementptr i8, base_ptr, byte_off_i32  (ptr<3>)."""
-    return buffer_ops.get_element_ptr(base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8)
+    return buffer_ops.get_element_ptr(
+        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
+    )
 
 
 def _s_barrier_bare():
     """Bare ``s_barrier`` (no surrounding memory fence), matching HIP's K-loop
     ``__builtin_amdgcn_s_barrier()`` cross-wave fence after the vmcnt wait."""
-    llvm.inline_asm(res=None, operands_=[], asm_string="s_barrier", constraints="", has_side_effects=True)
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="s_barrier",
+        constraints="",
+        has_side_effects=True,
+    )
 
 
 def _global_base_ptr1(arg):
@@ -106,7 +169,9 @@ def _global_base_ptr1(arg):
 
 def _gep1(base_ptr, byte_off_i32):
     """getelementptr i8, base_ptr, byte_off_i32  (ptr<1>)."""
-    return buffer_ops.get_element_ptr(base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8)
+    return buffer_ops.get_element_ptr(
+        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
+    )
 
 
 def _global_ptr1(arg, byte_off_i32):
@@ -118,7 +183,7 @@ def _lds_swizzle_mask(row):
     return (row & fx.Int32(14)) << fx.Int32(3)
 
 
-# ── epilog math helpers (HIP mxfp4_epilogs.hpp 87-122 + mxfp4_gemm_common.hpp) ─
+# -- epilog math helpers (HIP mxfp4_epilogs.hpp 87-122 + mxfp4_gemm_common.hpp) -
 def _silu_mul(g, u):
     """silu(g)*u, matching HIP silu_mul_fast (mxfp4_gemm_common.hpp:62-65):
     e = __expf(-g) = exp2(-g*log2e); sig = rcpf(1+e); return g*sig*u."""
@@ -148,9 +213,9 @@ def _e8m0_from_amax(amax_f32):
     return e8m0, qscale
 
 
-# ── inline-quant helpers (HIP mxfp4_gemm_common.hpp:76-94) ───────────────────
+# -- inline-quant helpers (HIP mxfp4_gemm_common.hpp:76-94) -------------------
 def _pkmax_u16(a_i32, b_i32):
-    """v_pk_max_u16 a, b — pairwise u16 max of two packed-u16 dwords.
+    """v_pk_max_u16 a, b -- pairwise u16 max of two packed-u16 dwords.
     No FlyDSL builtin; mirror HIP inline_quant_pkmax_u16 via inline asm."""
     out = llvm.inline_asm(
         res=T.i32,
@@ -187,7 +252,9 @@ def _inline_e8m0(amax_u16_i32):
       bexp    = ((f32bits + 0x200000) >> 23) & 0xFF
       e8m0    = min(254, max(0, bexp - 2))
     Returns e8m0 as i32 (0..254)."""
-    f32bits = (fx.Int32(_raw(amax_u16_i32)) & fx.Int32(0xFFFF)) << fx.Int32(16)  # u16 << 16
+    f32bits = (fx.Int32(_raw(amax_u16_i32)) & fx.Int32(0xFFFF)) << fx.Int32(
+        16
+    )  # u16 << 16
     bexp = (f32bits + fx.Int32(0x200000)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
     # max(0, bexp - 2)
     bm2 = bexp - fx.Int32(2)
@@ -235,14 +302,28 @@ def _gemm1_body(
     kSubBlocks,
     kMChunks,
     inline_quant=False,
+    K=K,
+    K_HALF=K_HALF,
+    K_TILES_TOTAL=K_TILES_TOTAL,
+    kUnroll=kUnroll,
+    kAS_per_chunk_dw=kAS_per_chunk_dw,
+    kBS_stride_n0_dw=kBS_stride_n0_dw,
+    kBS_per_expert_dw=kBS_per_expert_dw,
+    BQ_BYTES=BQ_BYTES,
+    ASCALE_BYTES=ASCALE_BYTES,
+    BSCALE_BYTES=BSCALE_BYTES,
 ):
+    # All K-derived sizes arrive as params (KIMI defaults bound from the module
+    # globals above so the default call path is unchanged).
     b_aux = 2 if use_nt else 0  # NT: B_q loads carry aux=2 (non-temporal hint)
     M_REPS = BM // 16
 
     # block -> (m_block_idx, n_block_idx) ; e = sorted_expert_ids[m_block_idx]
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    e = rocdl.readfirstlane(T.i32, llvm.load(T.i32, _global_ptr1(arg_eids, m_block_idx * fx.Int32(4))))
+    e = rocdl.readfirstlane(
+        T.i32, llvm.load(T.i32, _global_ptr1(arg_eids, m_block_idx * fx.Int32(4)))
+    )
     m_row = m_block_idx * fx.Int32(BM)
 
     lane_div_16 = lane // fx.Int32(16)
@@ -250,7 +331,7 @@ def _gemm1_body(
     lane_div_8 = lane // fx.Int32(8)
     lane_mod_8 = lane % fx.Int32(8)
 
-    # ── buffer resources (exact num_bytes) ──────────────────────────────────
+    # -- buffer resources (exact num_bytes) ----------------------------------
     # A_q rsrc must be sized to the LOGICAL a_quant extent (n_tokens*K_HALF), NOT
     # max_size: padding rows carry m_indices == M (out of range), and the kernel
     # relies on hardware buffer-bounds returning 0 for those OOB row loads so
@@ -265,7 +346,9 @@ def _gemm1_body(
     ascale_rsrc = buffer_ops.create_buffer_resource(
         arg_ascale, max_size=False, num_records_bytes=fx.Index(ASCALE_BYTES)
     )
-    bq_rsrc = buffer_ops.create_buffer_resource(arg_bq, max_size=False, num_records_bytes=fx.Index(BQ_BYTES))
+    bq_rsrc = buffer_ops.create_buffer_resource(
+        arg_bq, max_size=False, num_records_bytes=fx.Index(BQ_BYTES)
+    )
     bscale_rsrc = buffer_ops.create_buffer_resource(
         arg_bscale, max_size=False, num_records_bytes=fx.Index(BSCALE_BYTES)
     )
@@ -278,15 +361,20 @@ def _gemm1_body(
             arg_hidden, max_size=False, num_records_bytes=hidden_num
         )
 
-    # ── LDS views (s_aq / s_asc, union-overlapping lds_acc) ──────────────────
+    # -- LDS views (s_aq / s_asc, union-overlapping lds_acc) ------------------
     lds_base = allocator.get_base()
     s_aq = SmemPtr(lds_base, lds_off, T.i8, shape=(kAStages * BM * KH_TILE,))  # 12288
     s_asc = SmemPtr(
-        lds_base, lds_off + kAStages * BM * KH_TILE, T.i8, shape=(kSubBlocks * K_TILES_TOTAL * 256,)
+        lds_base,
+        lds_off + kAStages * BM * KH_TILE,
+        T.i8,
+        shape=(kSubBlocks * K_TILES_TOTAL * 256,),
     )
-    lds_acc = SmemPtr(lds_base, lds_off, T.f32, shape=(BM * BN,))  # union overlap with s_aq/s_asc
+    lds_acc = SmemPtr(
+        lds_base, lds_off, T.f32, shape=(BM * BN,)
+    )  # union overlap with s_aq/s_asc
 
-    # ── cached A rows ─────────────────────────────────────────────────────────
+    # -- cached A rows ---------------------------------------------------------
     # Non-inline (HIP run_one 385-399): cached_actual_row per kSubBlocks, row_off=lane/8.
     # NB: for BM16 non-inline HIP guards on wave<2, but BM16 is inline-only here.
     # Inline (HIP run_one 402-409, kCachedInline=1 for BM16): cached_row_inline[s] =
@@ -302,9 +390,11 @@ def _gemm1_body(
     else:
         for sub in range_constexpr(kSubBlocks):
             idx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
-            cached_actual_row.append(llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4))))
+            cached_actual_row.append(
+                llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
+            )
 
-    # ── b_load_s_base[j] (HIP 412-416), readfirstlane'd uniform per wave ──────
+    # -- b_load_s_base[j] (HIP 412-416), readfirstlane'd uniform per wave ------
     b_load_s_base = []
     for j in range_constexpr(4):
         v = (
@@ -315,29 +405,34 @@ def _gemm1_body(
         ) * fx.Int32(K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
-    # ── b_scale_s_base / _hi (HIP 418-429) ───────────────────────────────────
+    # -- b_scale_s_base / _hi (HIP 418-429) -----------------------------------
     mni_base = n_block_idx * fx.Int32(BN // 16 // 2) + wave * fx.Int32(BN // 64 // 2)
     b_scale_s_base, b_scale_s_base_hi = [], []
     for mw in range_constexpr(2):
         base = (
-            e * fx.Int32(kBS_per_expert_dw) + (mni_base + fx.Int32(mw)) * fx.Int32(kBS_stride_n0_dw)
+            e * fx.Int32(kBS_per_expert_dw)
+            + (mni_base + fx.Int32(mw)) * fx.Int32(kBS_stride_n0_dw)
         ) * fx.Int32(4)
         base = rocdl.readfirstlane(T.i32, base)
         b_scale_s_base.append(base)
         b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
 
-    # ── register buffers (accumulators + per-stage B / B-scale) ───────────────
+    # -- register buffers (accumulators + per-stage B / B-scale) ---------------
     accm = [[None] * 4 for _ in range(kMChunks)]  # kMChunks = BM//16
     b = [[[None, None] for _ in range(4)] for _ in range(kStages)]  # kStages=2
     b_scale_v = [[None, None] for _ in range(kStages)]
 
-    # ── A-side data movement helpers (HIP 121-195) ───────────────────────────
+    # -- A-side data movement helpers (HIP 121-195) ---------------------------
     def issue_a_load_lds(slot, kt):
         for sub in range_constexpr(kSubBlocks):
             lds_row = wave * fx.Int32(BM // 4) + fx.Int32(sub * 8)
             mask = _lds_swizzle_mask(lds_row + lane_div_8)  # ROW_BYTES=BK/2=128
-            voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + cached_actual_row[sub] * fx.Int32(K_HALF)
-            base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(s_aq.get()))
+            voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + cached_actual_row[
+                sub
+            ] * fx.Int32(K_HALF)
+            base_i32 = fx.Int32(
+                memref_dialect.extract_aligned_pointer_as_index(s_aq.get())
+            )
             off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
             rocdl.raw_ptr_buffer_load_lds(
                 aq_rsrc,
@@ -357,7 +452,11 @@ def _gemm1_body(
             lds_col = (lane_div_16 * fx.Int32(16) + fx.Int32(k * 64)) ^ mask
             for i in range_constexpr(kMChunks):
                 lds_row = lane_mod_16 + fx.Int32(i * 16)
-                off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE) + lds_col
+                off = (
+                    fx.Int32(slot * (BM * KH_TILE))
+                    + lds_row * fx.Int32(KH_TILE)
+                    + lds_col
+                )
                 a[i][k] = llvm.load(T.vec(4, T.i32), _gep3(base_ptr, off))
         return a
 
@@ -365,9 +464,13 @@ def _gemm1_body(
         chunk_base = m_row // fx.Int32(32)
         v16 = (wave * fx.Int32(64) + lane) * fx.Int32(16)
         v4 = (wave * fx.Int32(64) + lane) * fx.Int32(4)
-        asc_base = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(s_asc.get()))
+        asc_base = fx.Int32(
+            memref_dialect.extract_aligned_pointer_as_index(s_asc.get())
+        )
         for sub in range_constexpr(kSubBlocks):
-            s_chunk = rocdl.readfirstlane(T.i32, (chunk_base + fx.Int32(sub)) * fx.Int32(kAS_per_chunk_dw * 4))
+            s_chunk = rocdl.readfirstlane(
+                T.i32, (chunk_base + fx.Int32(sub)) * fx.Int32(kAS_per_chunk_dw * 4)
+            )
             lds_sub = fx.Int32(sub * kAS_per_chunk_dw * 4)
             rocdl.raw_ptr_buffer_load_lds(
                 ascale_rsrc,
@@ -383,7 +486,9 @@ def _gemm1_body(
                 s_off = rocdl.readfirstlane(T.i32, s_chunk + fx.Int32(byte_off))
                 rocdl.raw_ptr_buffer_load_lds(
                     ascale_rsrc,
-                    _lds_ptr3(asc_base, lds_sub + fx.Int32(byte_off) + wave * fx.Int32(256)),
+                    _lds_ptr3(
+                        asc_base, lds_sub + fx.Int32(byte_off) + wave * fx.Int32(256)
+                    ),
                     fx.Int32(4),
                     v4,
                     s_off,
@@ -404,7 +509,7 @@ def _gemm1_body(
             out.append(llvm.load(T.i32, _gep3(base_ptr, lds_dw * fx.Int32(4))))
         return out  # a_scale_aiter[sub]
 
-    # ── inline-quant A path helpers (HIP 197-310) ────────────────────────────
+    # -- inline-quant A path helpers (HIP 197-310) ----------------------------
     # Used only on the BM16 inline-quant path. SUB is always 0 for BM16.
     # Common per-lane indices (HIP :241-246).
     lib = lane & fx.Int32(3)  # lane & 3
@@ -412,8 +517,12 @@ def _gemm1_body(
     r_in_chunk = wave * fx.Int32(4) + lane_div_16  # wave*4 + lane/16
 
     def inline_quant_load_kt(B128_IDX, kt, row_token):
-        """Load 8 bf16 (4×i32) from hidden_rsrc (HIP :197-207)."""
-        v_voff = row_token * fx.Int32(K * 2) + lane_shr2_and3 * fx.Int32(64) + lib * fx.Int32(16)
+        """Load 8 bf16 (4xi32) from hidden_rsrc (HIP :197-207)."""
+        v_voff = (
+            row_token * fx.Int32(K * 2)
+            + lane_shr2_and3 * fx.Int32(64)
+            + lib * fx.Int32(16)
+        )
         s_soff = rocdl.readfirstlane(T.i32, fx.Int32(kt * (BK * 2) + B128_IDX * 256))
         frag = buffer_ops.buffer_load(
             hidden_rsrc,
@@ -439,13 +548,17 @@ def _gemm1_body(
         local_amax = _umax_i32(lo, hi)  # u16 amax in low 16 bits
         amax_u32 = _inline_dpp_quad_amax(local_amax)
         e8m0 = _inline_e8m0(amax_u32)
-        qs = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))  # uint_as_float(e8m0<<23)
+        qs = fx.Float32(
+            _raw(e8m0 << fx.Int32(23)).bitcast(T.f32)
+        )  # uint_as_float(e8m0<<23)
         # pack 8 bf16 -> 4 fp4 bytes (1 u32) via cvt_scalef32_pk_fp4_bf16.
         # src is vector<2xbf16>: build from each i32 dword via a vector bitcast.
         pk = _raw(fx.Int32(0))
         qs_raw = _raw(qs)
         for j in range_constexpr(4):
-            src_bf16x2 = _raw(Vec.from_elements([h_dw[j]], fx.Int32).bitcast(fx.BFloat16))
+            src_bf16x2 = _raw(
+                Vec.from_elements([h_dw[j]], fx.Int32).bitcast(fx.BFloat16)
+            )
             pk = rocdl.cvt_scalef32_pk_fp4_bf16(T.i32, pk, src_bf16x2, qs_raw, j)
         pk = fx.Int32(pk)
         # write pk -> s_Aq[slot][r][((kb_in_kt*16)^mask_r)+b_off] (HIP :247-248).
@@ -454,7 +567,12 @@ def _gemm1_body(
         mask_r = _lds_swizzle_mask(r)
         b_off = lib * fx.Int32(4)
         aq_base = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(s_aq.get()))
-        off = fx.Int32(slot * (BM * KH_TILE)) + r * fx.Int32(KH_TILE) + ((kb_in_kt * fx.Int32(16)) ^ mask_r) + b_off
+        off = (
+            fx.Int32(slot * (BM * KH_TILE))
+            + r * fx.Int32(KH_TILE)
+            + ((kb_in_kt * fx.Int32(16)) ^ mask_r)
+            + b_off
+        )
         llvm.StoreOp(_raw(pk), _lds_ptr3(aq_base, off))
         # packed-scale path: fold e8m0 into the accumulated dword (BM16 only path).
         pack_byte = B128_IDX * 2 + SUB
@@ -470,13 +588,19 @@ def _gemm1_body(
     def inline_quant_pack_write(kt, scale_accum):
         """Write packed scale dword to s_Ascale (HIP :261-266)."""
         lane_tgt = lane_shr2_and3 * fx.Int32(16) + r_in_chunk
-        asc_base = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(s_asc.get()))
+        asc_base = fx.Int32(
+            memref_dialect.extract_aligned_pointer_as_index(s_asc.get())
+        )
         off = fx.Int32(kt * 256) + lane_tgt * fx.Int32(4)
         llvm.StoreOp(_raw(scale_accum[0]), _lds_ptr3(asc_base, off))
 
-    # ── B-side data movement helpers (HIP 312-332) ───────────────────────────
+    # -- B-side data movement helpers (HIP 312-332) ---------------------------
     def issue_b_load_j(b_slot, K_C, j):
-        v = (lane_div_16 * fx.Int32(256)) + (lane_mod_16 * fx.Int32(16)) + fx.Int32(K_C * 2048)
+        v = (
+            (lane_div_16 * fx.Int32(256))
+            + (lane_mod_16 * fx.Int32(16))
+            + fx.Int32(K_C * 2048)
+        )
         for half in range_constexpr(2):
             frag = buffer_ops.buffer_load(
                 bq_rsrc,
@@ -491,7 +615,9 @@ def _gemm1_body(
     def issue_b_scale_load(bs_slot, K_C):
         v = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
         K_C_HI = K_C // 16
-        imm = (K_C - K_C_HI * 16) * (kBS_stride_k0_dw * 4)  # Python int (K_C is constexpr)
+        imm = (K_C - K_C_HI * 16) * (
+            kBS_stride_k0_dw * 4
+        )  # Python int (K_C is constexpr)
         for mw in range_constexpr(2):
             s_off = b_scale_s_base[mw] if K_C_HI == 0 else b_scale_s_base_hi[mw]
             bs_slot[mw] = buffer_ops.buffer_load(
@@ -502,7 +628,7 @@ def _gemm1_body(
                 soffset_bytes=s_off,
             )
 
-    # ── MFMA cluster (HIP 334-375, BM!=16 non-AGPR else branch) ──────────────
+    # -- MFMA cluster (HIP 334-375, BM!=16 non-AGPR else branch) --------------
     # Generalized over kSubBlocks (BM32 -> 1 sub, BM128 -> 4 subs).
     # HIP uses an AGPR init form for BM128's zero-init mfmas (kUseAGPR=BM==128) to
     # relieve register pressure; the rest stay VGPR. FlyDSL emits plain
@@ -566,8 +692,8 @@ def _gemm1_body(
         issue_a_scale_load()
     for K_C in range_constexpr(kStages):
         if const_expr(inline_quant):
-            # HIP :447-455 (BM16 inline branch): 2× inline_quant_kt<B128,0> (packed scale)
-            # interleaved with 4× issue_b_load_j, then inline_quant_pack_write.
+            # HIP :447-455 (BM16 inline branch): 2x inline_quant_kt<B128,0> (packed scale)
+            # interleaved with 4x issue_b_load_j, then inline_quant_pack_write.
             scale_accum = [fx.Int32(0)]
             inline_quant_kt(0, 0, K_C, K_C, cached_row_inline[0], scale_accum)
             issue_b_load_j(b[K_C], K_C, 0)
@@ -606,7 +732,9 @@ def _gemm1_body(
             if const_expr(BM != 128):
                 rocdl.sched_barrier(0)
                 rocdl.s_setprio(1)
-            mfma_cluster(b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J, init=(OFFSET == 0))
+            mfma_cluster(
+                b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J, init=(OFFSET == 0)
+            )
             if const_expr(BM != 128):
                 rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
@@ -627,16 +755,20 @@ def _gemm1_body(
         a_cur = issue_a_ds_read(kt % kAStages)
         asc_cur = issue_a_scale_ds_read(kt)
         for J in range_constexpr(4):
-            mfma_cluster(b[kt % kStages], a_cur, asc_cur, b_scale_v[kt % kStages], J, init=False)
+            mfma_cluster(
+                b[kt % kStages], a_cur, asc_cur, b_scale_v[kt % kStages], J, init=False
+            )
 
     gpu.barrier()
     s_aq._view_cache = None
     s_asc._view_cache = None
     lds_acc._view_cache = None
 
-    # ── epilog: cshuffle -> SwiGLU -> fp4 + e8m0 requant (HIP apply_cshuffle_quant_epilog 39-122) ──
+    # -- epilog: cshuffle -> SwiGLU -> fp4 + e8m0 requant (HIP apply_cshuffle_quant_epilog 39-122) --
     # NOTE: the e8m0 scale is computed here and stored to arg_ascaleout in the kk==0 block below.
-    wave_n = wave  # NUM_N_BLOCKS path: wave_n == wave (HIP run_one passes wave as wave_n)
+    wave_n = (
+        wave  # NUM_N_BLOCKS path: wave_n == wave (HIP run_one passes wave as wave_n)
+    )
     lds_acc_base = _lds_base_ptr3(lds_acc.get())
 
     # cshuffle store (epilog 39-53): scalar f32 stores of accm into lds_acc.
@@ -709,7 +841,11 @@ def _gemm1_body(
         packed = fx.Int32(packed_i32)
 
         # nontemporal store to inter_sorted_quant (epilog 118-121).
-        byte_pos = n_block_idx * fx.Int32(BN_INT // 2) + wave_grp * fx.Int32(16) + kk * fx.Int32(4)
+        byte_pos = (
+            n_block_idx * fx.Int32(BN_INT // 2)
+            + wave_grp * fx.Int32(16)
+            + kk * fx.Int32(4)
+        )
         out_row = m_row + row_local
         store_off = out_row * fx.Int32(K_G2_HALF) + byte_pos
         llvm.StoreOp(
@@ -719,7 +855,7 @@ def _gemm1_body(
             nontemporal=True,
         )
 
-    # ── e8m0 scale store (epilog 124-144, BM != 16 branch; over kSubBlocks) ───
+    # -- e8m0 scale store (epilog 124-144, BM != 16 branch; over kSubBlocks) ---
     # Only lane-group kk==0 writes. Per sub: pack scales_per_mr[2*sub], [2*sub+1]
     # into a u16 and store at byte offset dword_off*4 + ikxdl*2 of a_scale_out,
     # using the OUTPUT-scale chunk stride OUT_AS_PER_CHUNK_DW(=128).
@@ -751,7 +887,9 @@ def _gemm1_body(
                     + wave_grp * fx.Int32(16)
                     + m_lane
                 )
-                pair_i32 = scales_per_mr[sub * 2 + 0] | (scales_per_mr[sub * 2 + 1] << fx.Int32(8))
+                pair_i32 = scales_per_mr[sub * 2 + 0] | (
+                    scales_per_mr[sub * 2 + 1] << fx.Int32(8)
+                )
                 pair_i16 = arith.TruncIOp(T.i16, _raw(pair_i32)).result
                 addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
                 llvm.StoreOp(
@@ -762,8 +900,12 @@ def _gemm1_body(
         scf.YieldOp([])
 
 
-def _bm_constants(BM):
-    """BM-derived compile-time constants (mirror gemm1_a4w4.cuh:49-72)."""
+def _bm_constants(BM, K_TILES_TOTAL=K_TILES_TOTAL):
+    """BM-derived compile-time constants (mirror gemm1_a4w4.cuh:49-72).
+
+    s_Ascale (and thus the LDS union) depends on K via K_TILES_TOTAL, so K is a
+    param (KIMI default keeps the old sizes: BM32->32768, BM128->131072, BM16->16384).
+    """
     kAStages = 2 if BM == 128 else 3
     kSubBlocks = 1 if BM < 32 else BM // 32  # HIP :61
     kMChunks = BM // 16  # HIP :62
@@ -776,7 +918,7 @@ def _bm_constants(BM):
     return kAStages, kSubBlocks, kMChunks, lds_bytes
 
 
-def compile_gemm1_a4w4_port(BM=32, use_nt=True, inline_quant=False):
+def compile_gemm1_a4w4_port(BM=32, use_nt=True, inline_quant=False, D_HIDDEN=K):
     # Supported Phase 2 combos.
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),
@@ -784,16 +926,37 @@ def compile_gemm1_a4w4_port(BM=32, use_nt=True, inline_quant=False):
         (128, False, False),
         (16, True, True),
     }:
-        raise AssertionError(f"unsupported gemm1 variant (BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})")
+        raise AssertionError(
+            f"unsupported gemm1 variant (BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
+        )
 
-    kAStages, kSubBlocks, kMChunks, lds_bytes = _bm_constants(BM)
+    # K = contraction dim = hidden_size. Parametrized; defaults to KIMI's 7168.
+    _K = D_HIDDEN
+    assert _K % BK == 0, f"D_HIDDEN (K) must be a multiple of {BK}, got {_K}"
+    # Derive ALL K-dependent compile constants from the arg (KIMI default -> old values).
+    _K_HALF = k_half_for(_K)
+    _K_TILES_TOTAL = k_tiles_total_for(_K)
+    _kUnroll = kunroll_for(_K)
+    _kAS_per_chunk_dw = kas_per_chunk_dw_for(_K)
+    _kBS_stride_n0_dw = kbs_stride_n0_dw_for(_K)
+    _kBS_per_expert_dw = kbs_per_expert_dw_for(_K)
+    _BQ_BYTES = bq_bytes_for(_K)
+    _ASCALE_BYTES = ascale_bytes_for(_K)
+    _BSCALE_BYTES = bscale_bytes_for(_K)
+
+    kAStages, kSubBlocks, kMChunks, lds_bytes = _bm_constants(BM, _K_TILES_TOTAL)
 
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
-    name_suffix = f"bm{BM}_{variant_tag}"
+    # Tag with H so different K specializations get distinct kernel/smem symbols.
+    name_suffix = f"h{_K}_bm{BM}_{variant_tag}"
 
-    allocator = SmemAllocator(None, arch="gfx950", global_sym_name=f"gemm1port_smem_{name_suffix}")
+    allocator = SmemAllocator(
+        None, arch="gfx950", global_sym_name=f"gemm1port_smem_{name_suffix}"
+    )
     lds_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_off + lds_bytes  # lds_bytes from _bm_constants: BM32->32768, BM128->131072, BM16->16384
+    allocator.ptr = (
+        lds_off + lds_bytes
+    )  # lds_bytes from _bm_constants (KIMI: BM32->32768, BM128->131072, BM16->16384)
 
     @flyc.kernel(name=f"gemm1_a4w4_port_{name_suffix}", known_block_size=[256, 1, 1])
     def gemm1_kernel(
@@ -844,6 +1007,16 @@ def compile_gemm1_a4w4_port(BM=32, use_nt=True, inline_quant=False):
                 kSubBlocks=kSubBlocks,
                 kMChunks=kMChunks,
                 inline_quant=inline_quant,
+                K=_K,
+                K_HALF=_K_HALF,
+                K_TILES_TOTAL=_K_TILES_TOTAL,
+                kUnroll=_kUnroll,
+                kAS_per_chunk_dw=_kAS_per_chunk_dw,
+                kBS_stride_n0_dw=_kBS_stride_n0_dw,
+                kBS_per_expert_dw=_kBS_per_expert_dw,
+                BQ_BYTES=_BQ_BYTES,
+                ASCALE_BYTES=_ASCALE_BYTES,
+                BSCALE_BYTES=_BSCALE_BYTES,
             )
             scf.YieldOp([])
 
