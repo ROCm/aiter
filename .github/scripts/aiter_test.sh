@@ -26,6 +26,7 @@ else
 fi
 
 skip_tests=(
+    "op_tests/test_pa_decode_bf16_asm.py" # MI400-only for now.
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
