@@ -23,7 +23,10 @@ Run:  AITER_USE_SYSTEM_TRITON=1 python op_tests/test_moe_fused_route_quant_scatt
 import pytest
 import torch
 
-from aiter.ops.flydsl.moe_kernels import flydsl_moe_fused_route_quant_scatter
+from aiter.ops.flydsl.moe_kernels import (
+    flydsl_moe_fused_route_quant_scatter,
+    flydsl_moe_fused_quant_preshuffle,
+)
 from aiter.ops.flydsl.grouped_moe_gfx1250 import _grouped_a8w4_preshuffle_e8m0_scale
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.utility import dtypes, fp4_utils
@@ -204,6 +207,60 @@ def test_fused_route_quant_scatter(
     )
 
 
+# ---------------------------------------------------------------------------
+# Stage2 fused (grouped) quant + scale-preshuffle. Input is already grouped
+# row-major (E, max_m, feat_dim); the kernel quantizes all rows and writes the
+# preshuffled scale -- no routing. Compared against the same per-token MX quant
+# reference + the torch preshuffle.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("scale_k_per_tile", [4, 8])
+@pytest.mark.parametrize("quant_mode", ["fp4", "fp8"])
+@pytest.mark.parametrize("max_m", [64, 128])
+@pytest.mark.parametrize("E", [4, 8])
+@pytest.mark.parametrize("feat_dim", [256, 512])
+def test_fused_quant_preshuffle(scale_k_per_tile, quant_mode, max_m, E, feat_dim):
+    if not torch.cuda.is_available():
+        pytest.skip("needs GPU")
+    if (feat_dim // 32) % scale_k_per_tile != 0:
+        pytest.skip("feat_dim//32 must be divisible by scale_k_per_tile")
+    torch.manual_seed(0)
+    dev = "cuda"
+    wmma_rep = 4
+    if max_m % (wmma_rep * 16) != 0:
+        pytest.skip("max_m must be a multiple of wmma_rep*16")
+
+    grouped_in = torch.randn(E, max_m, feat_dim, dtype=torch.bfloat16, device=dev)
+
+    payload, scale_pre = flydsl_moe_fused_quant_preshuffle(
+        grouped_in, E, max_m, wmma_rep=wmma_rep, quant_mode=quant_mode
+    )
+
+    Pb = feat_dim if quant_mode == "fp8" else feat_dim // 2
+    Ws = feat_dim // 32
+
+    # Reference: per-row MX quant (matches the kernel contract) + torch preshuffle.
+    ref_pay_u8, ref_scale_u8 = _ref_token_quant(
+        grouped_in.reshape(E * max_m, feat_dim), quant_mode
+    )
+    ref_payload = ref_pay_u8.view(E, max_m, Pb)
+    ref_scale_pre = _grouped_a8w4_preshuffle_e8m0_scale(
+        ref_scale_u8.view(E, max_m, Ws),
+        warp_tile=wmma_rep * 16,
+        scale_k_per_tile=scale_k_per_tile,
+    ).reshape(E, max_m // wmma_rep, Ws * wmma_rep)
+
+    # All rows are quantized (no padding concept for the grouped stage2 input).
+    pay_match = (payload == ref_payload).float().mean().item()
+    assert pay_match > 0.99, f"payload match {pay_match:.4f} too low"
+    sc_match = (scale_pre == ref_scale_pre).float().mean().item()
+    assert sc_match > 0.99, f"scale match {sc_match:.4f} too low"
+
+    print(
+        f"OK fused_quant_preshuffle {quant_mode} skpt={scale_k_per_tile} "
+        f"E={E} max_m={max_m} fd={feat_dim} payload={pay_match:.4f} scale={sc_match:.4f}"
+    )
+
+
 if __name__ == "__main__":
     for skpt in (4, 8):
         for qm in ("fp4", "fp8"):
@@ -216,4 +273,12 @@ if __name__ == "__main__":
                             if (md // 32) % skpt != 0:
                                 continue
                             test_fused_route_quant_scatter(skpt, qm, tn, tk, E, md)
+    for skpt in (4, 8):
+        for qm in ("fp4", "fp8"):
+            for E in (4, 8):
+                for mm in (64, 128):
+                    for fd in (256, 512):
+                        if (fd // 32) % skpt != 0:
+                            continue
+                        test_fused_quant_preshuffle(skpt, qm, mm, E, fd)
     print("all cases passed")

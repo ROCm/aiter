@@ -720,54 +720,52 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             if n:
                 grouped_a2[e, :n].mul_(route_weights[e, :n].view(-1, 1))
 
-    if data_format == "fp4":
-        # a2 fp4 quant: same NAIVE gating as a1 -- torch reference on NAIVE=1,
-        # HIP MXFP4 quant on the fast path.
-        if _use_naive:
-            from aiter.ops.quant import per_1x32_f4_quant as _a2_f4_quant
-        else:
-            from aiter.ops.quant import per_1x32_f4_quant_hip as _a2_f4_quant
-
-        _grouped_dbg("start a2 fp4 quant")
-        a2_quant, a2_scale_token = _a2_f4_quant(
-            grouped_a2.view(E * max_m, inter_dim),
-            quant_dtype=dtypes.fp4x2,
-            shuffle=False,
-        )
-        _grouped_dbg("a2 fp4 quant done")
-        grouped_a2_payload = (
-            a2_quant.view(torch.uint8).contiguous().view(E, max_m, inter_dim // 2)
-        )
-        a2_scale_raw = (
-            a2_scale_token.view(torch.uint8)
-            .contiguous()
-            .view(E, max_m, inter_dim // 32)
-        )
-        if not _capturing:
-            torch.cuda.synchronize()
-        _grouped_dbg("[crash-probe] after a2 fp4 quant sync OK")
-    else:
-        # a8w4 stage2 input also needs per-block-32 MXFP8 scale; SiLU outputs
-        # can exceed unit-scale fp8 and direct casts may encode NaNs.
-        grouped_a2_payload, a2_scale_raw = _quantize_mxfp8_payload(
-            grouped_a2, inter_dim
-        )
     if _use_naive:
+        # Deterministic torch fallback: per-row MX quant + torch preshuffle.
+        if data_format == "fp4":
+            from aiter.ops.quant import per_1x32_f4_quant as _a2_f4_quant
+
+            _grouped_dbg("start a2 fp4 quant (naive)")
+            a2_quant, a2_scale_token = _a2_f4_quant(
+                grouped_a2.view(E * max_m, inter_dim),
+                quant_dtype=dtypes.fp4x2,
+                shuffle=False,
+            )
+            _grouped_dbg("a2 fp4 quant done")
+            grouped_a2_payload = (
+                a2_quant.view(torch.uint8).contiguous().view(E, max_m, inter_dim // 2)
+            )
+            a2_scale_raw = (
+                a2_scale_token.view(torch.uint8)
+                .contiguous()
+                .view(E, max_m, inter_dim // 32)
+            )
+        else:
+            # a8w4 stage2 input also needs per-block-32 MXFP8 scale; SiLU outputs
+            # can exceed unit-scale fp8 and direct casts may encode NaNs.
+            grouped_a2_payload, a2_scale_raw = _quantize_mxfp8_payload(
+                grouped_a2, inter_dim
+            )
         grouped_a2_scale = _grouped_a8w4_preshuffle_e8m0_scale(
             a2_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
         )
     else:
-        # a2_scale_raw is already grouped row-major (no route-gather), so use the
-        # in-kernel preshuffle (gather-less fused version, like stage1).
-        from aiter.ops.flydsl.moe_kernels import flydsl_moe_preshuffle_scale
+        # Fast path: one fused kernel does the grouped MX quant AND writes the
+        # preshuffled e8m0 scale (the stage2 analog of the fused stage1 input
+        # prep). grouped_a2 is already grouped row-major, so no route-gather.
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_fused_quant_preshuffle
 
-        grouped_a2_scale = flydsl_moe_preshuffle_scale(
-            a2_scale_raw,
+        _grouped_dbg("start a2 fused quant+preshuffle")
+        grouped_a2_payload, grouped_a2_scale = flydsl_moe_fused_quant_preshuffle(
+            grouped_a2,
             E,
             max_m,
             wmma_rep=warp_tile_m // 16,
-            scale_k_per_tile=tile_k // 32,
+            quant_mode=fused_quant_mode,
         )
+        if not _capturing:
+            torch.cuda.synchronize()
+        _grouped_dbg("[crash-probe] after a2 fused quant+preshuffle sync OK")
     _grouped_dbg("a2 scale layout done")
     grouped_out = torch.empty((E, max_m, model_dim), dtype=dtype, device=device)
     stage2_compiler = (
