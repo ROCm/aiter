@@ -38,7 +38,7 @@ def gemm_a16w16(
     config: Optional[dict] = None,
     activation: Optional[str] = None,
     skip_reduce: Optional[bool] = False,
-    kernel_type: str = "basic",
+    kernel_type: str = "bandwidth_bound",
     backend: Optional[str] = None,
 ):
     """
@@ -58,7 +58,7 @@ def gemm_a16w16(
             "silu_exp2", "relu").
         skip_reduce (Optional[bool]): [triton only] Skip reduction of split-K partial
             results. Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
-        kernel_type (str): [gluon only] Kernel variant ("basic", "lds_pipeline").
+        kernel_type (str): [gluon only] Kernel variant ("bandwidth_bound", "compute_bound").
         backend (Optional[str]): "triton", "gluon", or None (auto-detect).
 
     Returns:
@@ -128,26 +128,27 @@ def gemm_a16w16(
         # exceeds that count the pipeline loop counts go negative, so cap the
         # depth at the real tile count. Variants differ in reach and in the
         # minimum depth they require:
-        #   basic : reaches num_k_tiles -> cap = num_k_tiles
-        #   lds_pipeline : preloads one tile ahead (needs num_k_tiles >= NB + 1)
-        #                  -> cap = num_k_tiles - 1
+        #   bandwidth_bound : reaches num_k_tiles -> cap = num_k_tiles
+        #   compute_bound : preloads one tile ahead (needs num_k_tiles >= NB + 1)
+        #                   -> cap = num_k_tiles - 1
         num_k_tiles = triton.cdiv(K, BLOCK_K)
-        _MIN_BUFFERS = {"basic": 1, "lds_pipeline": 2}
-        _DEPTH_SLACK = {"lds_pipeline": 1}
+        _MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
+        _DEPTH_SLACK = {"compute_bound": 1}
 
-        # Fall back to the basic kernel when the requested variant cannot satisfy
-        # its minimum pipeline depth for this K. The basic kernel has no such floor
-        # (min depth 1) and is valid for every K, so we downgrade rather than error.
+        # Fall back to the bandwidth_bound kernel when the requested variant cannot
+        # satisfy its minimum pipeline depth for this K. The bandwidth_bound kernel
+        # has no such floor (min depth 1) and is valid for every K, so we downgrade
+        # rather than error.
         depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
         if depth_cap < _MIN_BUFFERS[kernel_type]:
             needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
             _LOGGER.info(
                 f"GEMM_A16W16 [gluon/gfx1250]: kernel_type='{kernel_type}' needs "
                 f"num_k_tiles>={needed} but num_k_tiles={num_k_tiles} "
-                f"(K={K}, BLOCK_K={BLOCK_K}); falling back to kernel_type='basic'."
+                f"(K={K}, BLOCK_K={BLOCK_K}); falling back to kernel_type='bandwidth_bound'."
             )
-            kernel_type = "basic"
-            depth_cap = num_k_tiles  # basic: depth slack 0, min depth 1
+            kernel_type = "bandwidth_bound"
+            depth_cap = num_k_tiles  # bandwidth_bound: depth slack 0, min depth 1
 
         NUM_BUFFERS = min(NUM_BUFFERS, depth_cap)
 

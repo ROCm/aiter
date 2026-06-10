@@ -108,7 +108,7 @@ def get_x_vals():
     return x_vals
 
 
-def run_gemm(x, w, bias, out_dtype, y, backend, activation=None, kernel_type="basic"):
+def run_gemm(x, w, bias, out_dtype, y, backend, activation=None, kernel_type="bandwidth_bound"):
     """Unified GEMM runner dispatching via the backend parameter."""
     if isinstance(out_dtype, tuple):
         dtype_arg = out_dtype
@@ -132,11 +132,11 @@ def run_gemm(x, w, bias, out_dtype, y, backend, activation=None, kernel_type="ba
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
-@pytest.mark.parametrize("kernel_type", ["basic", "lds_pipeline"])
+@pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
 def test_gemm_a16_w16_activation(
     M: int, N: int, K: int, dtype, output, activation, backend, kernel_type
 ):
-    if backend == "triton" and kernel_type != "basic":
+    if backend == "triton" and kernel_type != "bandwidth_bound":
         pytest.skip("kernel_type only applies to gluon backend")
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
@@ -169,9 +169,9 @@ def test_gemm_a16_w16_activation(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
-@pytest.mark.parametrize("kernel_type", ["basic", "lds_pipeline"])
+@pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
 def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output, backend, kernel_type):
-    if backend == "triton" and kernel_type != "basic":
+    if backend == "triton" and kernel_type != "bandwidth_bound":
         pytest.skip("kernel_type only applies to gluon backend")
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
@@ -195,9 +195,9 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output, backend, kernel_typ
 @pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
-@pytest.mark.parametrize("kernel_type", ["basic", "lds_pipeline"])
+@pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
 def test_gemm_a16_w16_layout(M: int, N: int, K: int, dtype, layout, output, backend, kernel_type):
-    if backend == "triton" and kernel_type != "basic":
+    if backend == "triton" and kernel_type != "bandwidth_bound":
         pytest.skip("kernel_type only applies to gluon backend")
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")

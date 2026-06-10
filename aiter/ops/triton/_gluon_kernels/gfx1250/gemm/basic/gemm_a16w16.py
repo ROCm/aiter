@@ -16,12 +16,12 @@ _GLUON_REPR_KEYS = [
     "ADD_BIAS",
 ]
 
-_gemm_a16w16_basic_repr = make_kernel_repr(
-    "_gemm_a16w16_gfx1250_basic_kernel", _GLUON_REPR_KEYS
+_gemm_a16w16_bandwidth_bound_repr = make_kernel_repr(
+    "_gemm_a16w16_gfx1250_bandwidth_bound_kernel", _GLUON_REPR_KEYS
 )
 
-_gemm_a16w16_lds_pipeline_repr = make_kernel_repr(
-    "_gemm_a16w16_gfx1250_lds_pipeline_kernel", _GLUON_REPR_KEYS
+_gemm_a16w16_compute_bound_repr = make_kernel_repr(
+    "_gemm_a16w16_gfx1250_compute_bound_kernel", _GLUON_REPR_KEYS
 )
 
 
@@ -66,8 +66,8 @@ def create_wmma_layouts(num_warps):
     return (wmma_layout, operand_a, operand_b)
 
 
-@gluon.jit(repr=_gemm_a16w16_basic_repr)
-def _gemm_a16w16_basic_kernel(
+@gluon.jit(repr=_gemm_a16w16_bandwidth_bound_repr)
+def _gemm_a16w16_bandwidth_bound_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -314,8 +314,8 @@ def _gemm_a16w16_basic_kernel(
     )
 
 
-@gluon.jit(repr=_gemm_a16w16_lds_pipeline_repr)
-def _gemm_a16w16_lds_pipeline_kernel(
+@gluon.jit(repr=_gemm_a16w16_compute_bound_repr)
+def _gemm_a16w16_compute_bound_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -347,13 +347,13 @@ def _gemm_a16w16_lds_pipeline_kernel(
 
     Manually places load_shared_relaxed for tile i+1 *before* the wmma for
     tile i so the hardware LDS unit and matrix unit can run in parallel.
-    LLVM fails to schedule this reordering on its own in the basic kernel.
+    LLVM fails to schedule this reordering on its own in the bandwidth_bound kernel.
 
     Requires NUM_BUFFERS >= 2.  With NUM_BUFFERS == 2 the TDM must complete
     fully before each ds_read batch (async_wait(0)), but the ds_read/wmma
     overlap is still preserved.  NUM_BUFFERS >= 3 is recommended.
     """
-    gl.static_assert(NUM_BUFFERS >= 2, "lds_pipeline kernel requires NUM_BUFFERS >= 2")
+    gl.static_assert(NUM_BUFFERS >= 2, "compute_bound kernel requires NUM_BUFFERS >= 2")
 
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_M)
@@ -701,6 +701,6 @@ def _gemm_a16w16_lds_pipeline_kernel(
 
 
 _KERNEL_MAP = {
-    "basic": _gemm_a16w16_basic_kernel,
-    "lds_pipeline": _gemm_a16w16_lds_pipeline_kernel,
+    "bandwidth_bound": _gemm_a16w16_bandwidth_bound_kernel,
+    "compute_bound": _gemm_a16w16_compute_bound_kernel,
 }
