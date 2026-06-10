@@ -89,7 +89,9 @@ def get_gemm_afp4wfp4_preshuffle_layouts_cga(
     # Tile the num_ctas CTAs of the cluster into a [cta_m, cta_n] grid with
     # cta_m * cta_n == num_ctas. num_ctas == 1 -> [1, 1], which make_cga_layout
     # returns as an empty layout (byte-identical to the single-CTA path).
-    if num_ctas == 4:
+    if num_ctas == 2:
+        ctas_per_cga = [2, 1]
+    elif num_ctas == 4:
         ctas_per_cga = [2, 2]
     elif num_ctas == 8:
         ctas_per_cga = [2, 4]
@@ -274,7 +276,7 @@ _gemm_mxfp4_preshuffle_gfx1250_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=_gemm_mxfp4_preshuffle_gfx1250_repr, loop_carried_load_percent=0)
+@gluon.jit(repr=_gemm_mxfp4_preshuffle_gfx1250_repr)
 def gemm_mxfp4_preshuffle_gfx1250(
     a_fp4_ptr,
     b_preshuf_ptr,
@@ -444,8 +446,6 @@ def gemm_mxfp4_preshuffle_gfx1250(
     if num_ctas > 1:
         gl.amd.gfx1250.cluster.arrive()
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
-    if num_ctas > 1:
-        gl.amd.gfx1250.cluster.wait()
 
     slot_c = compute_idx % NUM_BUFFERS
     cur_A = smem_A.index(slot_c).load(layout=dot_a_layout)
@@ -458,6 +458,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
     cur_BS = depreshuffle_scales(smem_BS.index(slot_c), BLOCK_SIZE_N, K_GROUPS).load(
         layout=b_scale_layout
     )
+    # if num_ctas > 1:
+    #     gl.amd.gfx1250.cluster.wait()
 
     # --- 3. Main loop: WMMA(cur) → TDM(future) → wait → pre-load(next) ---
     main_iters = k_tiles - (NUM_BUFFERS)
@@ -485,8 +487,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
         if num_ctas > 1:
             gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.wait()
+
         load_idx += 1
 
         # Pre-load next tile from LDS into registers
@@ -505,6 +506,9 @@ def gemm_mxfp4_preshuffle_gfx1250(
         ).load(layout=b_scale_layout)
         compute_idx += 1
 
+        # if num_ctas > 1:
+        #     gl.amd.gfx1250.cluster.wait()
+
     # --- 4. Epilogue: drain remaining tiles (no new TDM loads) ---
     for i in gl.static_range(NUM_BUFFERS - 1):
         acc = gl.amd.gfx1250.wmma_scaled(
@@ -514,8 +518,6 @@ def gemm_mxfp4_preshuffle_gfx1250(
         if num_ctas > 1:
             gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 4)
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.wait()
 
         next_slot = (compute_idx + 1) % NUM_BUFFERS
         cur_A = smem_A.index(next_slot).load(layout=dot_a_layout)
@@ -531,6 +533,9 @@ def gemm_mxfp4_preshuffle_gfx1250(
             smem_BS.index(next_slot), BLOCK_SIZE_N, K_GROUPS
         ).load(layout=b_scale_layout)
         compute_idx += 1
+
+        # if num_ctas > 1:
+        #     gl.amd.gfx1250.cluster.wait()
 
     # --- 5. Final WMMA ---
     acc = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc)
