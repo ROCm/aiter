@@ -262,6 +262,7 @@ def ref_masked_attention(
     q_scale=None,
     kv_scale=None,
     causal_diagonal=None,
+    attn_mask=None,
 ):
     if is_fp8_q and q_scale is not None:
         scale *= q_scale
@@ -269,7 +270,14 @@ def ref_masked_attention(
         scale *= kv_scale
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
 
-    if is_causal:
+    if attn_mask is not None:
+        # Explicit boolean visibility mask [s_q, s_k] (True == keep). Used by the
+        # round-robin CP reference where the causal relation is on GLOBAL token
+        # positions and therefore cannot be expressed as a single diagonal.
+        attn_bias = torch.zeros_like(attn_weights)  # [h, q, k]
+        attn_bias.masked_fill_(attn_mask[None].logical_not(), float("-inf"))
+        attn_weights = attn_weights + attn_bias
+    elif is_causal:
         s_q = query.shape[0]
         s_k = key.shape[0]
         diagonal = causal_diagonal if causal_diagonal is not None else s_k - s_q
@@ -291,6 +299,17 @@ def ref_masked_attention(
     out = out / l.transpose(0, 1).unsqueeze(-1)
     if is_fp8_kvc and kv_scale is not None:
         out *= kv_scale
+
+    if attn_mask is not None:
+        # Query rows with no visible key (whole row masked) produce NaN above;
+        # define them as out=0, lse=-inf (an empty CP shard for that token).
+        invalid = attn_mask.any(dim=-1).logical_not()  # [s_q]
+        if bool(invalid.any()):
+            out = out.clone()
+            out[invalid] = 0.0
+            lse = lse.clone()
+            lse[:, invalid] = float("-inf")
+
     return out.to(dtype), lse
 
 
@@ -406,6 +425,117 @@ def torch_mla_extend(
     # Each lse is (nheads, seq_q_i); concatenate query positions along dim=1, then (total_q, nheads).
     lse = torch.concat(lses, dim=1).transpose(0, 1)
     return o, lse
+
+
+def torch_mla_extend_round_robin(
+    q,  # [total_q, nheads, headdim_q]
+    kvc_cache,  # [num_page, page_size, nhead_kv, qk_head_dim]
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    page_size,
+    sm_scale,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    dtype,
+    cp_world_size,
+    cp_rank,
+    q_scale=None,
+    kv_scale=None,
+):
+    """Round-robin (interleave) context-parallel reference for ONE rank.
+
+    Built on top of the existing paged reference machinery (same KV gather as
+    `torch_mla_extend`), so it is multi-batch and page-table aware.
+
+    For each request the full token-level KV is reconstructed from the paged
+    cache via `kv_indices`. The local shard of rank `cp_rank` is then EXTRACTED
+    by global position: `shard_pos = [p for p in range(real_kv) if p % W == r]`
+    (this is the page-table-aware analogue of slicing kv_indices by shard_pos).
+    The causal mask is computed on GLOBAL positions: query token `i` (global pos
+    `real_kv - s_q + i`) attends to local token `j` iff `shard_pos[j] <= q_pos`.
+
+    Returns (out[total_q, nheads, kv_lora_rank], lse[total_q, nheads]); empty
+    shards / fully-masked query rows yield out=0, lse=-inf.
+    """
+    dev = kvc_cache.device
+    is_fp8_q = q.dtype == dtypes.fp8
+    is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
+    if is_fp8_q:
+        q = q.to(torch.float)
+    if is_fp8_kvc:
+        kvc_cache = kvc_cache.to(torch.float)
+
+    W = cp_world_size
+    r = cp_rank
+
+    qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
+    kvc = torch.index_select(kvc_cache, 0, kv_indices)
+    kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
+    bs = qo_indptr.shape[0] - 1
+
+    os = []
+    lses = []
+    for i in range(bs):
+        cur_num_page = kvs[i].shape[0]
+        real_kv_seq_len = (cur_num_page - 1) * page_size + kv_last_page_lens.tolist()[i]
+        # token-level KV for this request: [real_kv, nhead_kv, qk_head_dim]
+        token_kv = kvs[i].flatten(0, 1)[:real_kv_seq_len]
+        q_i = qs[i]
+        s_q, nheads, _ = q_i.shape
+
+        # round-robin shard: global positions owned by this rank
+        all_pos = torch.arange(real_kv_seq_len, device=dev)
+        shard_pos = all_pos[all_pos % cp_world_size == cp_rank]
+        s_k = int(shard_pos.numel())
+
+        if s_k == 0:
+            # empty local shard -> out=0, lse=-inf (matches kernel/merge contract)
+            os.append(torch.zeros(s_q, nheads, kv_lora_rank, dtype=dtype, device=dev))
+            lses.append(torch.full((nheads, s_q), float("-inf"), device=dev))
+            continue
+
+        local_kv = token_kv[shard_pos]  # [s_k, nhead_kv, qk_head_dim]
+        k = local_kv
+        v, _ = torch.split(local_kv, [kv_lora_rank, qk_rope_head_dim], dim=-1)
+
+        # GLOBAL-position causal mask [s_q, s_k]
+        q_global = (real_kv_seq_len - s_q) + torch.arange(s_q, device=dev)
+        attn_mask = shard_pos[None, :] <= q_global[:, None]
+
+        o, lse = ref_masked_attention(
+            q_i,
+            k,
+            v,
+            sm_scale,
+            dtype,
+            is_fp8_q=is_fp8_q,
+            is_fp8_kvc=is_fp8_kvc,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            attn_mask=attn_mask,
+        )
+        os.append(o)
+        lses.append(lse)
+
+    o = torch.concat(os)
+    lse = torch.concat(lses, dim=1).transpose(0, 1)
+    return o, lse
+
+
+def merge_cp_ranks(cp_outs, cp_lses, out_dtype=torch.bfloat16):
+    """Online-softmax merge of per-rank CP partials.
+
+    cp_outs[r]: [total_q, nheads, dv] (fp32-friendly)
+    cp_lses[r]: [total_q, nheads]
+    -> merged out [total_q, nheads, dv] (out_dtype), merged lse [total_q, nheads].
+    """
+    LS = torch.stack([lse.float() for lse in cp_lses], 0)  # [W, total_q, nheads]
+    glse = torch.logsumexp(LS, 0)  # [total_q, nheads]
+    w = torch.exp(LS - glse).nan_to_num_(0.0)  # [W, total_q, nheads]
+    out = sum(w[r][..., None] * cp_outs[r].float() for r in range(len(cp_outs)))
+    return out.to(out_dtype), glse
 
 
 def torch_mla_extend_split_kv(
@@ -1616,6 +1746,349 @@ def test_mla(
     return ret
 
 
+def aiter_cp_rank_decode(
+    q,  # [total_q, nhead, qk_head_dim]
+    kv_buffer,  # [num_page, page_size, nhead_kv, qk_head_dim] ORIGINAL paged KV (global)
+    qo_indptr,  # [batch+1] int32
+    kv_indptr_r,  # [batch+1] int32  per-rank LOCAL page indptr (metadata tiling + kernel split)
+    kv_indices_r,  # [num_local_page] int32  physical pages of THIS rank's local KV
+    g_kv_indptr,  # [batch+1] int32  GLOBAL page indptr (kernel global-pos causal; next step)
+    kv_last_page_lens,  # [batch] int32
+    batch_size,
+    max_seqlen_q,
+    nhead,
+    nhead_kv,
+    kv_lora_rank,
+    qk_head_dim,
+    v_head_dim,
+    sm_scale,
+    dtype,
+    kvtype,
+    max_split_per_batch,
+    is_causal,
+    cp_world_size,
+    cp_rank,
+):
+    """Scaffold: run aiter persistent MLA decode for ONE CP rank.
+
+    Unlike the previous version (which physically repacked the rank's tokens into
+    a contiguous buffer), this keeps the ORIGINAL global ``kv_buffer`` and selects
+    this rank's KV via ``kv_indices_r``. Metadata tiling/splitting is driven by
+    the per-rank LOCAL ``kv_indptr_r``. ``g_kv_indptr`` together with
+    ``(cp_world_size, cp_rank)`` carry the information the kernel will need to map
+    a local index ``j`` back to its global position ``g(j) = j * W + r`` for the
+    correct round-robin causal mask.
+
+    NOTE: wiring ``g_kv_indptr`` / ``cp_world_size`` / ``cp_rank`` into
+    ``mla_decode_fwd`` and the asm kernel is the NEXT step. For now the data flow
+    (original buffer + per-rank ``kv_indices_r`` / ``kv_indptr_r``) is set up so
+    the scaffold is correct; the applied causal mask is still the kernel's
+    default (local-contiguous) one until that change lands.
+    """
+    dev = q.device
+    total_q = q.shape[0]
+
+    o = torch.zeros(total_q, nhead, v_head_dim, dtype=torch.bfloat16, device=dev)
+
+    info = aiter.get_mla_metadata_info_v1(
+        batch_size,
+        max_seqlen_q,
+        nhead,
+        dtype,
+        kvtype,
+        is_sparse=False,
+        fast_mode=True,
+        num_kv_splits=max_split_per_batch,
+        intra_batch_mode=False,
+    )
+
+    def _alloc(sz, ty):
+        return torch.empty(sz, dtype=ty, device=dev)
+
+    work_meta_data = _alloc(*info[0])
+    work_indptr = _alloc(*info[1])
+    work_info_set = _alloc(*info[2])
+    reduce_indptr = _alloc(*info[3])
+    reduce_final_map = _alloc(*info[4])
+    reduce_partial_map = _alloc(*info[5])
+
+    # per-rank LOCAL kv_indptr_r drives the work tiling / kv-split
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr_r,
+        kv_last_page_lens,
+        nhead // nhead_kv,
+        nhead_kv,
+        False,
+        work_meta_data,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        page_size=1,
+        kv_granularity=16,
+        max_seqlen_qo=max_seqlen_q,
+        uni_seqlen_qo=max_seqlen_q,
+        fast_mode=True,
+        max_split_per_batch=max_split_per_batch,
+        intra_batch_mode=False,
+        dtype_q=dtype,
+        dtype_kv=kvtype,
+    )
+
+    # round-robin CP: pass the GLOBAL kv_indptr + (cp_world_size, cp_rank) so the
+    # kernel maps local kv idx j -> global pos g(j)=j*W+r for the causal mask.
+    _, final_lse = aiter.mla.mla_decode_fwd(
+        q,
+        kv_buffer,
+        o,
+        qo_indptr,
+        kv_indptr_r,
+        kv_indices_r,
+        kv_last_page_lens,
+        max_seqlen_q=max_seqlen_q,
+        page_size=1,
+        nhead_kv=nhead_kv,
+        sm_scale=sm_scale,
+        num_kv_splits=max_split_per_batch,
+        work_meta_data=work_meta_data,
+        work_indptr=work_indptr,
+        work_info_set=work_info_set,
+        reduce_indptr=reduce_indptr,
+        reduce_final_map=reduce_final_map,
+        reduce_partial_map=reduce_partial_map,
+        intra_batch_mode=False,
+        return_lse=True,
+        g_kv_indptr=g_kv_indptr,
+        cp_world_size=cp_world_size,
+        cp_rank=cp_rank,
+    )
+    lse = final_lse.float() if final_lse is not None else None
+    return o.float(), lse
+
+
+@benchmark()
+def test_mla_cp(
+    ctx_lens,
+    batch_size,
+    nhead,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    v_head_dim,
+    dtype,
+    kvtype,
+    page_size,
+    varlen,
+    decode_qlen,
+    cp_world_size,
+    max_split_per_batch,
+):
+    """Round-robin (interleave) context-parallel MLA decode test.
+
+    Reuses the existing paged reference (`torch_mla_extend`) for the full-KV
+    causal golden, and the new page/batch-aware `torch_mla_extend_round_robin`
+    for the per-rank CP reference. KV is round-robin sharded across
+    `cp_world_size` ranks (global pos p -> rank p % W); the per-rank local KV is
+    EXTRACTED by `shard_pos` from the paged cache. We then:
+      1. merge the per-rank CP references (cp_outs/cp_lses) and assert it matches
+         the golden (out_ref/lse_ref)  -> validates the CP reference itself;
+      2. run aiter.mla_decode_fwd per rank, merge, and compare to the golden
+         (and per-rank vs the CP reference) -> validates the kernel.
+    """
+    ret = {}
+    W = cp_world_size
+    dev = "cuda"
+    out_dtype = torch.bfloat16
+    nhead_kv = 1
+    qlen = decode_qlen
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    sm_scale = 1.0 / (qk_head_dim**0.5)
+    is_causal = qlen > 1
+    # round-robin interleave is token-granular: global pos p == page index, so the
+    # per-rank kv_indices_r extraction below requires page_size == 1.
+    page_size = 1
+
+    # ---- build paged KV / Q (mirrors test_mla decode setup) ---------------- #
+    kv_block_nums = torch.empty(batch_size, dtype=torch.int)
+    seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    if varlen:
+        for i in range(batch_size):
+            seq_lens_kv[i] = max(int(random.uniform(W, ctx_lens)), W)
+            kv_block_nums[i] = (seq_lens_kv[i] + page_size - 1) // page_size
+            kv_last_page_lens[i] = (
+                page_size
+                if seq_lens_kv[i] % page_size == 0
+                else seq_lens_kv[i] % page_size
+            )
+    else:
+        seq_lens_kv.fill_(ctx_lens)
+        kv_block_nums.fill_((ctx_lens + page_size - 1) // page_size)
+        kv_last_page_lens.fill_(
+            page_size if ctx_lens % page_size == 0 else ctx_lens % page_size
+        )
+
+    assert (
+        int(seq_lens_kv.min().item()) >= W
+    ), f"every request kv_len must be >= cp_world_size({W})"
+
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    kv_indptr[1:] = torch.cumsum(kv_block_nums, dim=0)
+    num_page = int(kv_indptr[-1].item())
+    kv_indices = torch.randperm(num_page, dtype=torch.int)
+
+    seq_lens_qo = torch.full((batch_size,), qlen, dtype=torch.int)
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    qo_indptr[1:] = torch.cumsum(seq_lens_qo, dim=0)
+    total_q = int(qo_indptr[-1].item())
+    max_seqlen_qo = qlen
+
+    kv_buffer = torch.randn(
+        (num_page, page_size, 1, qk_head_dim), dtype=torch.bfloat16
+    ).to(kvtype)
+    q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16).to(dtype)
+
+    # ---- full-KV causal golden via the EXISTING reference ------------------ #
+    out_ref, lse_ref = torch_mla_extend(
+        q,
+        kv_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        sm_scale,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype=out_dtype,
+        is_causal=True,
+    )
+
+    # ---- per-rank round-robin CP reference + merge ------------------------- #
+    cp_outs, cp_lses = [], []
+    for r in range(W):
+        o_r, l_r = torch_mla_extend_round_robin(
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            page_size,
+            sm_scale,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype=out_dtype,
+            cp_world_size=W,
+            cp_rank=r,
+        )
+        cp_outs.append(o_r)
+        cp_lses.append(l_r)
+
+    cp_merged_out, cp_merged_lse = merge_cp_ranks(cp_outs, cp_lses, out_dtype)
+
+    err_ref = checkAllclose(
+        out_ref,
+        cp_merged_out,
+        msg=f"mla_cp_round_robin W={W} qlen={qlen} [golden vs cp_ref_merge out]:......",
+    )
+    checkAllclose(
+        lse_ref,
+        cp_merged_lse,
+        msg=f"mla_cp_round_robin W={W} qlen={qlen} [golden vs cp_ref_merge lse]:......",
+    )
+
+    # ---- aiter kernel per rank: keep ORIGINAL kv_buffer, extract by shard_pos -#
+    # page_size==1 so the GLOBAL page indptr == token indptr. For each rank build:
+    #   kv_indices_r : physical pages of positions p with (p % W == r), taken from
+    #                  the ORIGINAL kv_indices -> selects this rank's KV in-place;
+    #   kv_indptr_r  : per-request local page counts (drives metadata tiling);
+    #   g_kv_indptr  : the original GLOBAL page indptr (for the kernel, next step).
+    g_kv_indptr = kv_indptr.to(dev).to(torch.int32)
+    kv_indices_dev = kv_indices.to(dev).to(torch.int32)
+    qo_indptr_dev = qo_indptr.to(dev).to(torch.int32)
+    kv_buffer_dev = kv_buffer.to(dev)
+
+    aiter_outs, aiter_lses, rank_us = [], [], []
+    for r in range(W):
+        idx_r_list, local_lens = [], []
+        for b in range(batch_size):
+            real_kv = int(seq_lens_kv[b].item())
+            start = int(kv_indptr[b].item())
+            pos = torch.arange(real_kv, device=dev)
+            pos = pos[pos % W == r]  # this rank's GLOBAL positions in request b
+            idx_r_list.append(kv_indices_dev[start + pos])  # -> physical pages
+            local_lens.append(int(pos.numel()))
+        kv_indices_r = (
+            torch.cat(idx_r_list).to(torch.int32)
+            if sum(local_lens) > 0
+            else torch.zeros(1, dtype=torch.int32, device=dev)
+        )
+        kv_indptr_r = torch.zeros(batch_size + 1, dtype=torch.int32, device=dev)
+        kv_indptr_r[1:] = torch.cumsum(
+            torch.tensor(local_lens, dtype=torch.int32, device=dev), dim=0
+        )
+        kv_last_page_lens_r = torch.ones(batch_size, dtype=torch.int32, device=dev)
+
+        (o_a, l_a), us = run_perftest(
+            aiter_cp_rank_decode,
+            q,
+            kv_buffer_dev,
+            qo_indptr_dev,
+            kv_indptr_r,
+            kv_indices_r,
+            g_kv_indptr,
+            kv_last_page_lens_r,
+            batch_size,
+            qlen,
+            nhead,
+            nhead_kv,
+            kv_lora_rank,
+            qk_head_dim,
+            v_head_dim,
+            sm_scale,
+            dtype,
+            kvtype,
+            max_split_per_batch,
+            is_causal,
+            W,
+            r,
+        )
+        rank_us.append(us)
+
+        o_san = torch.where(torch.isnan(o_a), torch.zeros_like(o_a), o_a)
+        rank_err = (o_san - cp_outs[r].float()).abs().max().item()
+        aiter.logger.info(
+            "  [cp rank%d/%d] local_len=%s has_NaN=%s max|aiter-cp_ref|=%.3e",
+            r,
+            W,
+            local_lens,
+            bool(torch.isnan(o_a).any()),
+            rank_err,
+        )
+        if l_a is None:
+            l_san = torch.full((total_q, nhead), -1e30, dtype=torch.float32, device=dev)
+        else:
+            l_san = torch.where(
+                torch.isnan(l_a) | torch.isinf(l_a), torch.full_like(l_a, -1e30), l_a
+            )
+        aiter_outs.append(o_san)
+        aiter_lses.append(l_san)
+
+    aiter_merged_out, _ = merge_cp_ranks(aiter_outs, aiter_lses, out_dtype)
+    err = checkAllclose(
+        out_ref,
+        aiter_merged_out,
+        msg=f"mla_cp_round_robin W={W} qlen={qlen} [golden vs aiter_merge out]:......",
+    )
+
+    ret["cp:err_ref"] = err_ref
+    ret["cp:err_aiter"] = err
+    ret["cp:world_size"] = W
+    ret["cp:rank_us"] = sum(rank_us) / max(len(rank_us), 1)
+    return ret
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1758,35 +2231,110 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
+parser.add_argument(
+    "-cp",
+    "--cp_round_robin",
+    action="store_true",
+    help="""run round-robin context-parallel (interleave KV sharding) MLA decode
+    test instead of the standard test. KV is sharded across --cp_world_size
+    ranks (global pos p -> rank p %% W); per-rank local KV is extracted by
+    shard_pos, partials are merged via online softmax and compared to the
+    full-KV causal golden.
+    --cp # True""",
+)
+parser.add_argument(
+    "-cpw",
+    "--cp_world_size",
+    type=int,
+    default=4,
+    help="""cp world size (number of round-robin ranks). Used with --cp.
+    e.g.: -cpw 4""",
+)
 
 args = parser.parse_args()
-for nhead, decode_qlen in args.nhead:
-    df = []
-    for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
-        args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
-    ):
-        if check_support(dtype, kvtype, nhead):
-            ret = test_mla(
+if args.cp_round_robin:
+    for nhead, decode_qlen in args.nhead:
+        df = []
+        for (
+            dtype,
+            kvtype,
+            ctx_len,
+            batch_size,
+            max_split_per_batch,
+        ) in itertools.product(
+            args.dtype,
+            args.kv_dtype,
+            args.ctxLen,
+            args.batchSize,
+            args.max_split_per_batch,
+        ):
+            if dtype != dtypes.bf16 or kvtype != dtypes.bf16:
+                # CP round-robin path validated for bf16/bf16 only for now.
+                continue
+            if not check_support(dtype, kvtype, nhead):
+                continue
+            if ctx_len < args.cp_world_size:
+                continue
+            ret = test_mla_cp(
                 ctx_len,
                 batch_size,
                 nhead,
                 args.kv_lora_rank,
-                args.qk_nope_head_dim,
                 args.qk_rope_head_dim,
                 args.v_head_dim,
                 dtype,
                 kvtype,
-                args.block_size,
+                page_size=args.block_size,
                 varlen=args.varlen,
                 decode_qlen=decode_qlen,
+                cp_world_size=args.cp_world_size,
                 max_split_per_batch=max_split_per_batch,
-                non_persistent_mode=args.non_persistent_mode,
-                paged_layout=args.paged_layout,
-                scale_dim=args.scale_dim,
-                return_lse=args.return_lse,
             )
             df.append(ret)
-    df = pd.DataFrame(df)
-    # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)
+        if df:
+            df = pd.DataFrame(df)
+            df_md = df.to_markdown(index=False)
+            aiter.logger.info(
+                "mla_persistent CP round-robin summary (markdown):\n%s", df_md
+            )
+else:
+    for nhead, decode_qlen in args.nhead:
+        df = []
+        for (
+            dtype,
+            kvtype,
+            ctx_len,
+            batch_size,
+            max_split_per_batch,
+        ) in itertools.product(
+            args.dtype,
+            args.kv_dtype,
+            args.ctxLen,
+            args.batchSize,
+            args.max_split_per_batch,
+        ):
+            if check_support(dtype, kvtype, nhead):
+                ret = test_mla(
+                    ctx_len,
+                    batch_size,
+                    nhead,
+                    args.kv_lora_rank,
+                    args.qk_nope_head_dim,
+                    args.qk_rope_head_dim,
+                    args.v_head_dim,
+                    dtype,
+                    kvtype,
+                    args.block_size,
+                    varlen=args.varlen,
+                    decode_qlen=decode_qlen,
+                    max_split_per_batch=max_split_per_batch,
+                    non_persistent_mode=args.non_persistent_mode,
+                    paged_layout=args.paged_layout,
+                    scale_dim=args.scale_dim,
+                    return_lse=args.return_lse,
+                )
+                df.append(ret)
+        df = pd.DataFrame(df)
+        # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)

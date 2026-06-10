@@ -49,6 +49,16 @@ struct __attribute__((packed)) KernelArgs
     p3 _p23;
     void* ptr_LSEP;
     p2 _p24;
+    // round-robin context-parallel (CP) extension:
+    //   ptr_GKVTP        : GLOBAL kv_indptr [batch+1] (per-request global KV length)
+    //   s_cp_world_size  : number of CP ranks (W); 1 == disabled
+    //   s_cp_rank        : this rank id (r); local kv idx j -> global pos j*W + r
+    void* ptr_GKVTP;       // 0x140
+    p2 _p25;
+    unsigned int s_cp_world_size;  // 0x150
+    p3 _p26;
+    unsigned int s_cp_rank;        // 0x160
+    p3 _p27;
 };
 
 std::string get_heuristic_kernel_mla(std::string q_type,
@@ -116,6 +126,9 @@ void mla_decode_stage1_asm_fwd(
     aiter_tensor_t* lse,                  //   [batch_size, num_heads] (nullable)
     aiter_tensor_t* q_scale,              //   [1] (nullable)
     aiter_tensor_t* kv_scale,             //   [1] (nullable)
+    aiter_tensor_t* g_kv_indptr,          //   [batch_size+1] GLOBAL kv_indptr for round-robin CP (nullable)
+    int cp_world_size,                    //   round-robin CP world size (1 == disabled)
+    int cp_rank,                          //   round-robin CP rank id
     hipStream_t stream)
 {    
     int batch           = qo_indptr->size(0) - 1;
@@ -154,6 +167,11 @@ void mla_decode_stage1_asm_fwd(
     {
         args.ptr_LSEP = lse->data_ptr();
     }
+
+    // round-robin context-parallel inputs (no-op when cp_world_size <= 1)
+    args.ptr_GKVTP       = (g_kv_indptr != nullptr) ? g_kv_indptr->data_ptr() : nullptr;
+    args.s_cp_world_size = (cp_world_size > 0) ? (unsigned int)cp_world_size : 1u;
+    args.s_cp_rank       = (cp_rank >= 0) ? (unsigned int)cp_rank : 0u;
 
     if (persistent)
     {
