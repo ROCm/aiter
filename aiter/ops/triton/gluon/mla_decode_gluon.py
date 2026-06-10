@@ -117,6 +117,33 @@ def _mla_decode_gluon(
         batch_page_start = gl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
 
+    # split-KV: each program covers [split_kv_start, split_kv_end).
+    # OLD: ceil-based per_split. The LAST split could be empty (num_iter=0),
+    # which breaks the unconditional epilogue-2 consume. Kept here as commented
+    # reference; remove in cleanup.
+    # kv_len_per_split = gl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+    # split_kv_start = kv_len_per_split * split_kv_id
+    # split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+    #
+    # NEW: floor per_split with the last split absorbing the remainder
+    # (remainder = seq mod NUM_KV_SPLITS, in [0, NUM_KV_SPLITS)). Combined with
+    # the wrapper bound min_kv_seq_len >= NUM_KV_SPLITS this guarantees every
+    # split is non-empty (split_len >= floor >= 1, hence num_iter >= 1); bh64
+    # additionally bounds min_kv_seq_len so num_iter >= 3 for its gl.assume.
+    # Trade-off: at seqs just above the wrapper minimum the last CU does up to
+    # ~(floor + NUM_KV_SPLITS - 1)/floor more work than the others.
+    kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = split_kv_start + kv_len_per_split
+    if split_kv_id == NUM_KV_SPLITS - 1:
+        split_kv_end = cur_batch_seq_len
+    num_iter = gl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
+    start_n = split_kv_start
+
+    # early return with empty kv slice to save compute
+    if split_kv_start >= split_kv_end:
+        return
+
     ######### layout setting begin #########
     # Q-side layouts + mfma_layout: switch by BLOCK_H.
     # bh64 has BLOCK_H=64; bh16bn128 and bh16bn64 share BLOCK_H=16 (identical Q layouts + mfma orientation).
@@ -324,33 +351,6 @@ def _mla_decode_gluon(
     e_max = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf")
     e_sum = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout))
     acc = gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=gl.float32, layout=mfma_layout)
-
-    # split-KV: each program covers [split_kv_start, split_kv_end).
-    # OLD: ceil-based per_split. The LAST split could be empty (num_iter=0),
-    # which breaks the unconditional epilogue-2 consume. Kept here as commented
-    # reference; remove in cleanup.
-    # kv_len_per_split = gl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
-    # split_kv_start = kv_len_per_split * split_kv_id
-    # split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-    #
-    # NEW: floor per_split with the last split absorbing the remainder
-    # (remainder = seq mod NUM_KV_SPLITS, in [0, NUM_KV_SPLITS)). When the caller's
-    # min_kv_seq_len is a true lower bound on cur_batch_seq_len, NUM_KV_SPLITS <=
-    # min_kv_seq_len <= cur_batch_seq_len so every split is non-empty (split_len >=
-    # floor >= 1, hence num_iter >= 1); bh64 additionally bounds min_kv_seq_len so
-    # num_iter >= 3 for its gl.assume. 
-    # When NUM_KV_SPLITS > cur_batch_seq_len, the leading splits become empty 
-    # (floor==0, num_iter==0); the store epilogue emits neutral acc=0/lse=-inf
-    # for those so the stage-2 reduce ignores them.
-    # Trade-off: at seqs just above the wrapper minimum the last CU does up to
-    # ~(floor + NUM_KV_SPLITS - 1)/floor more work than the others.
-    kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
-    split_kv_start = kv_len_per_split * split_kv_id
-    split_kv_end = split_kv_start + kv_len_per_split
-    if split_kv_id == NUM_KV_SPLITS - 1:
-        split_kv_end = cur_batch_seq_len
-    num_iter = gl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
-    start_n = split_kv_start
 
     # Fold KV dequant scale into the QK temperature. For fp8 KV the real
     # logits are (Q @ K_fp8^T) * kv_scale * sm_scale; softmax is shift- but
@@ -626,9 +626,6 @@ def _mla_decode_gluon(
     acc *= kv_scale
     rcp = 1.0 / e_sum
     stored_value = (acc * rcp[:, None]).to(dtype)
-
-    if num_iter == 0:
-        stored_value = gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=dtype, layout=mfma_layout)
     if NHEAD < BLOCK_H:
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
     else:
@@ -649,11 +646,8 @@ def _mla_decode_gluon(
     elif NUM_KV_SPLITS > 1:
         # per-split lse for stage-2 reduce.
         offs_mid_lse = cur_batch * stride_mid_lse_b + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_s
-        if num_iter == 0:
-            lse = gl.full([BLOCK_H], float("-inf"), dtype=gl.float32, layout=blocked_lse)
-        else:
-            lse = e_max + gl.log(e_sum)
-            lse = gl.convert_layout(lse, blocked_lse)
+        lse = e_max + gl.log(e_sum)
+        lse = gl.convert_layout(lse, blocked_lse)
         if NHEAD < BLOCK_H:
             gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=(cur_head_lse < NHEAD))
         else:
@@ -668,6 +662,7 @@ def _mla_softmax_reducev_kernel(
     Mid_lse,
     O,  # noqa: E741
     Final_lse,
+    B_seq_len,  # same seq_info as the decode kernel to derive empty kv splits
     stride_l_b,
     stride_l_h,
     stride_l_s,
@@ -681,9 +676,21 @@ def _mla_softmax_reducev_kernel(
     NUM_KV_SPLITS: tl.constexpr,
     HEAD_DIM_CKV: tl.constexpr,
     HAS_FINAL_LSE: tl.constexpr,
+    USE_2D_VIEW: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
+
+    # Recompute this batch's seq len exactly as the decode kernel did, so we can
+    # rederive which splits are empty. Stage-1 early-returns on empty splits
+    # (num_iter == 0) and writes nothing, so their logits_buf / mid_lse slots hold
+    # raw, uninitialised memory - they cannot be loaded or reduced.
+    if USE_2D_VIEW:
+        cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+    else:
+        batch_page_start = tl.load(B_seq_len + cur_batch)
+        cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - batch_page_start
+    kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
 
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
     offs_l = cur_batch * stride_l_b + cur_head * stride_l_h + offs_d_ckv
@@ -693,13 +700,24 @@ def _mla_softmax_reducev_kernel(
     e_max = -float("inf")
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
 
-    # Splits may be empty when NUM_KV_SPLITS exceeds the seq len.
-    # Stage-1 marks those with lse=-inf; the tl.where guards give them zero weight. 
-    # Both guards are required: split 0 can be the empty one, so e_max starts at 
-    # -inf and an unguarded exp(-inf - (-inf)) = exp(nan) would poison the merge. 
     for split_kv_id in range(0, NUM_KV_SPLITS):
-        logits = tl.load(Logits + offs_l + split_kv_id * stride_l_s)
-        logits_1 = tl.load(Mid_lse + offs_ml + split_kv_id * stride_ml_s)
+        # Same [start, end) this split covered in stage-1; empty if start >= end.
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end = split_kv_start + kv_len_per_split
+        if split_kv_id == NUM_KV_SPLITS - 1:
+            split_kv_end = cur_batch_seq_len
+        is_valid = split_kv_start < split_kv_end
+
+        # Masked loads skip the empty slots entirely (no raw-data read): logits ->
+        # 0.0 and lse -> -inf. The lse==-inf guards then give it zero weight.
+        logits = tl.load(
+            Logits + offs_l + split_kv_id * stride_l_s, mask=is_valid, other=0.0
+        )
+        logits_1 = tl.load(
+            Mid_lse + offs_ml + split_kv_id * stride_ml_s,
+            mask=is_valid,
+            other=-float("inf"),
+        )
 
         n_e_max = tl.maximum(logits_1, e_max)
         old_scale = tl.where(e_max == -float("inf"), 0.0, tl.exp(e_max - n_e_max))
@@ -939,6 +957,7 @@ def mla_decode_gluon(
         mid_lse,
         o,
         final_lse,
+        seq_info,
         logits_buf.stride(0),
         logits_buf.stride(1),
         logits_buf.stride(2),
@@ -952,6 +971,7 @@ def mla_decode_gluon(
         NUM_KV_SPLITS=NUM_KV_SPLITS,
         HEAD_DIM_CKV=head_dim_ckv,
         HAS_FINAL_LSE=return_lse,
+        USE_2D_VIEW=use_2d_view,
         num_warps=8,
     )
 
