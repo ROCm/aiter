@@ -3105,6 +3105,19 @@ class FmoeTuner(TunerCommon):
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
+            # fused_moe overrides the activation quant dtype at runtime for
+            # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
+            # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
+            # The config's nominal q_dtype_a (e.g. a8w4=fp8) is ignored, so the
+            # kernel actually runs a4w4. Mirror that here so the reference and the
+            # kernel weight layout match (else outputs are uncorrelated).
+            # Source of truth: aiter/fused_moe.py q_dtype_a selection.
+            eff_q_dtype_a = q_dtype_a
+            if q_type == QuantType.per_1x32 and q_dtype_w != dtypes.i4x2:
+                if act_type == ActivationType.Swiglu:
+                    eff_q_dtype_a = dtypes.bf16 if token < 256 else dtypes.fp4x2
+                else:
+                    eff_q_dtype_a = dtypes.fp4x2
             shape_str = (
                 f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
                 f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
@@ -3202,13 +3215,25 @@ class FmoeTuner(TunerCommon):
                     )
                 elif (
                     q_type == QuantType.per_1x32
-                    and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+                    and eff_q_dtype_a in [dtypes.bf16, dtypes.fp16]
                     and q_dtype_w == dtypes.fp4x2
                 ):
+                    # a16w4 (bf16 activation): a16w4 weight layout
                     w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
                     w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
                     w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
                     w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
+                elif (
+                    q_type == QuantType.per_1x32
+                    and eff_q_dtype_a == dtypes.fp4x2
+                    and q_dtype_w == dtypes.fp4x2
+                ):
+                    # a4w4 (fp4 activation, what Silu+SEPARATED actually runs):
+                    # regular (16,16) weight shuffle + e8m0 scale shuffle.
+                    w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, layout=(16, 16))
+                    w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, layout=(16, 16))
+                    w1_scale_fmoe = fp4_utils.e8m0_shuffle(w1_scale)
+                    w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
                 elif q_dtype_w != dtypes.fp4x2:
                     w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, (16, 16))
                     w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, (16, 16))
@@ -3250,18 +3275,19 @@ class FmoeTuner(TunerCommon):
                     a1_scale = None
                 elif (
                     q_type == QuantType.per_1x32
-                    and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+                    and eff_q_dtype_a in [dtypes.bf16, dtypes.fp16]
                     and q_dtype_w == dtypes.fp4x2
                 ):
-                    # a16w4 & a8w4: the torch reference runs the activation in
-                    # bf16 (no quant); matches op_tests/test_moe_2stage.py. fp8
-                    # must be included here, else it falls through to the fp4-only
-                    # per_1x32 quantizer and asserts.
+                    # a16w4 (bf16 activation): reference runs activation in bf16.
                     a1_qt = hidden.to(dtype)
                     a1_scale = None
                 else:
+                    # Use the *effective* activation dtype (what fused_moe runs),
+                    # not the config's nominal q_dtype_a. For Silu+SEPARATED fp4
+                    # weights this is fp4x2 (a4w4), so the reference quantizes the
+                    # activation to fp4 to match the kernel.
                     torch_quant = aiter.get_torch_quant(q_type)
-                    a1_qt, a1_scale = torch_quant(hidden, quant_dtype=q_dtype_a)
+                    a1_qt, a1_scale = torch_quant(hidden, quant_dtype=eff_q_dtype_a)
 
                 out, us = run_perftest(
                     fused_moe,
