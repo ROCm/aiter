@@ -453,7 +453,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         # Static upper bound: each token routes at most one row per expert, so no
         # expert can receive more than token_num rows. CUDAGraph buckets have
         # static token_num/topk; per-expert count <= token_num*topk.
-        raw_max_m = token_num
+        if (not use_actual_max_m) and cfg_row is not None:
+            raw_max_m = _as_int(cfg_row.get("max_m"), token_num)
+        else:
+            raw_max_m = token_num
     max_m = max(
         warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
     )
