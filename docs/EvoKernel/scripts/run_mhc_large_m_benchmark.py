@@ -128,7 +128,7 @@ def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False):
     hip_fused_err = checkAllclose(refs[2], fused_out[2], msg="fused/layer_input")
     ret = {
         "m": m, "hidden_size": hidden_size, "hc_mult": hc_mult,
-        "fuse_msnorm": fuse_rmsnorm,
+        "fuse_rmsnorm": fuse_rmsnorm,
         "unfused_us": unfused_us, "hip_unfused_err": hip_unfused_err,
         "fused_us": fused_us, "hip_fused_err": hip_fused_err,
     }
