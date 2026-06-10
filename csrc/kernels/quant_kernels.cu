@@ -62,10 +62,18 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     int32_t scaleN_pad       = (use_e8m0_scale && shuffle_scale)
                                    ? (((scaleN + 7) / 8) * 8)
                                    : scaleN;
-    // V-60: SRD-bounded input buffer — hardware OOB clamp for excess lanes
+    // V-60: SRD-bounded input buffer — hardware OOB clamp for excess lanes.
+    // Bound by the physical row stride so the e8m0/MXFP4 launch (which passes a
+    // real ori_row_stride) keeps the last-row elements of a non-contiguous /
+    // padded input in-bounds instead of getting them clamped to 0. Max valid
+    // element offset = (ori_rows-1)*ori_row_stride + scaleN*group_size - 1.
+    // Byte-identical for per_1x128 (ori_row_stride == scaleN*group_size);
+    // over-launched rows (x>=ori_rows) still exceed this bound and are clamped.
     auto input_buf = opus::make_gmem<DTYPE_I>(
         input,
-        static_cast<unsigned int>(ori_rows * scaleN * group_size * sizeof(DTYPE_I)));
+        static_cast<unsigned int>(
+            ((ori_rows - 1) * ori_row_stride + scaleN * group_size)
+            * sizeof(DTYPE_I)));
     int64_t x                = groupId / scaleN_pad;
     int32_t y                = static_cast<int32_t>(groupId % scaleN_pad);
     if constexpr(use_e8m0_scale)
