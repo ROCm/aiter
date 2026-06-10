@@ -1,30 +1,7 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-
-"""
-Unified benchmark for A16W16 GEMM (triton + gluon backends).
-
-Backend selection (similar to pytest -k for tests):
-    python bench_gemm_a16w16.py                           # auto-detect (gluon on gfx1250, triton elsewhere)
-    python bench_gemm_a16w16.py --backend triton          # triton only
-    python bench_gemm_a16w16.py --backend gluon           # gluon only (asserts gfx1250)
-
-Other options:
-    python bench_gemm_a16w16.py --shape 128 256 512       # single shape
-    python bench_gemm_a16w16.py --metric time             # latency
-    python bench_gemm_a16w16.py --activation silu         # fused activation
-    python bench_gemm_a16w16.py --layout TT               # transposed layout
-    python bench_gemm_a16w16.py -o                        # save CSV
-"""
-
-import sys
 import torch
 import triton
 import math
-from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
-    gemm_a16w16,
-    _is_gluon_available,
-)
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16, _is_gluon_available
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
@@ -53,10 +30,9 @@ def bench_gemm_fn(
     backend: str,
     atomic: bool = False,
     activation: Optional[str] = None,
-    warmup: int = 25,
-    rep: int = 100,
     **kwargs,
 ):
+    # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
     x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
         M, N, K, c_dtype, layout=layout, output=True, bias=True
@@ -64,13 +40,14 @@ def bench_gemm_fn(
     # flops
     flops = 2.0 * M * N * K
     if activation is not None:
-        flops += M * N
+        flops += M * N  # elementwise ops on the GEMM output
     # memory transfer
     mem_read = (M * K) * x.element_size() + (N * K) * w.element_size()
     mem_write = (M * N) * x.element_size()
     mem = mem_read + mem_write
 
     if atomic:
+        # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
         assert backend != "gluon", "Atomic kernel is triton-only"
         assert (
             activation is None
@@ -78,24 +55,19 @@ def bench_gemm_fn(
         y = y.to(torch.float32).zero_()
         ms = triton.testing.do_bench(
             lambda: gemm_a16w16_atomic(x, w, torch.float32, y),
-            warmup=warmup,
-            rep=rep,
+            warmup=25,
+            rep=100,  # noqa: E731
         )
     else:
         ms = triton.testing.do_bench(
             lambda: gemm_a16w16(
-                x,
-                w,
-                bias,
-                c_dtype,
-                y,
-                activation=activation,
-                backend=backend,
+                x, w, bias, c_dtype, y, activation=activation, backend=backend
             ),
-            warmup=warmup,
-            rep=rep,
+            warmup=25,
+            rep=100,  # noqa: E731
         )
 
+    # Return exactly one scalar depending on which metric is active
     if metric == "time":
         return ms
     elif metric == "throughput":
@@ -138,6 +110,7 @@ def run_model_benchmark(args, backend):
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
+        # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
         return bench_gemm_fn(
             M,
@@ -148,8 +121,6 @@ def run_model_benchmark(args, backend):
             backend,
             atomic=args.atomic,
             activation=args.activation,
-            warmup=args.warmup,
-            rep=args.rep,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -165,17 +136,7 @@ def run_shape_benchmark(args, backend):
     def bench_gemm_a16w16(M, N, K, metric, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(
-            M,
-            N,
-            K,
-            metric,
-            args.layout,
-            backend,
-            atomic=args.atomic,
-            warmup=args.warmup,
-            rep=args.rep,
-        )
+        return bench_gemm_fn(M, N, K, metric, args.layout, backend, atomic=args.atomic)
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
@@ -210,7 +171,7 @@ def run_benchmark(args, defaults):
         run_shape_benchmark(args, backend)
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="A16W16 GEMM")
     parser = add_argparse_ff(parser)
     parser.add_argument(
@@ -232,30 +193,18 @@ def parse_args():
         default=None,
         help="Backend to use. Default: auto-detect (gluon on gfx1250, triton elsewhere).",
     )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=25,
-        help="do_bench warmup budget in ms (default: 25). Use ~1 on simulators.",
-    )
-    parser.add_argument(
-        "--rep",
-        type=int,
-        default=100,
-        help="do_bench repetition budget in ms (default: 100). Use ~1 on simulators.",
-    )
-    return get_ff_args(parser)
+    return get_ff_args(parser, args=args)
 
 
-def main():
-    args, defaults = parse_args()
-    if args.print_vgpr:
+def main(args: list[str] | None = None) -> None:
+    parsed_args, defaults = parse_args(args=args)
+    if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(parsed_args, defaults)  # noqa: E731
         print_vgpr(fun, get_caller_name_no_ext())
-        return 0
-    run_benchmark(args, defaults)
+        return
+    run_benchmark(parsed_args, defaults)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
