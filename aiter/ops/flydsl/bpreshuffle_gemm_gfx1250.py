@@ -3,12 +3,15 @@
 
 """gfx1250 (WMMA) backend for the FlyDSL a8w8 bpreshuffle GEMM.
 
-aiter.gemm_a8w8_bpreshuffle routes here when its tuned kernelName starts with
-``flydsl_bpreshuffle_wmma_`` (gfx1250 has no MFMA preshuffle kernel). Runs the
-vendored gemm_fp8fp4_gfx1250 WMMA kernel in ptpc scale mode: C = (A*sa) @ (B*sb)^T
-with fp32 per-token sa[M] / per-channel sb[N] applied in the epilogue. N/K are not
-padded (must divide the tile); M is padded to tile_m when ragged, since the kernel
-reads a full tile_m rows per workgroup (M=1 would otherwise read past A/sa -> NaN).
+aiter.gemm_a8w8_bpreshuffle's FlyDSL path runs here on gfx1250 (no MFMA preshuffle
+kernel); the tuned kernelName (prefix ``flydsl_bpreshuffle_wmma_``) encodes the tile
+config. Computes C = (A*sa) @ (B*sb)^T via the vendored gemm_fp8fp4_gfx1250 WMMA
+kernel, fp32 per-token sa[M] / per-channel sb[N] applied in the epilogue.
+
+N/K must divide the tile; M may be ragged (no host padding) — the kernel clips
+loads/stores to the runtime M via hardware OOB, predicating split-k's atomic add
+per-lane on row < M. A/C may be strided (lda/ldc passed at runtime, no copy) when
+the inner dim is unit-stride; B is preshuffled into its own contiguous buffer.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ _fx = None
 _WMMA_K = 128
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
+_MAX_SPLIT_K = 4
 
 
 def _lazy_import():
@@ -52,10 +56,6 @@ def _as_1d_fp32(scale: Tensor, length: int, name: str) -> Tensor:
     if flat.dtype != torch.float32:
         flat = flat.to(torch.float32)
     return flat.contiguous()
-
-
-def _to_uint8(t: Tensor) -> Tensor:
-    return t.contiguous().view(torch.uint8).view(-1)
 
 
 def run_preshuffle_gemm_a8_gfx1250(
@@ -113,33 +113,36 @@ def run_preshuffle_gemm_a8_gfx1250(
     cluster_m = max(1, int(cluster_m))
     cluster_n = max(1, int(cluster_n))
 
-    accumulate_fp32 = split_k > 1
-    kernel_out_dtype = "f32" if accumulate_fp32 else out_dtype
+    if split_k > _MAX_SPLIT_K:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] split_k={split_k} exceeds the bf16/f16 atomic-add "
+            f"precision cap of {_MAX_SPLIT_K}"
+        )
 
-    # Pipeline depth needs >= 1 K tile per buffer (per split-k chunk).
-    num_k_tiles = (K // split_k) // tile_k
-    nb = max(2, min(int(num_buffers), num_k_tiles))
+    # Validate (tuned names always pass); fail loudly rather than silently clamp.
+    nb = int(num_buffers)
     if nb not in _SUPPORTED_NUM_BUFFERS:
-        nb = max(b for b in _SUPPORTED_NUM_BUFFERS if b <= nb)
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] num_buffers must be one of {_SUPPORTED_NUM_BUFFERS}, "
+            f"got {nb}"
+        )
+    if K % (split_k * tile_k) != 0:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] K={K} must be divisible by split_k*tile_k="
+            f"{split_k}*{tile_k}={split_k * tile_k}"
+        )
+    # Each split-k chunk must hold >= num_buffers K-tiles to fill the pipeline.
+    num_k_tiles = (K // split_k) // tile_k
+    if num_k_tiles < nb:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] {nb}-buffer pipeline needs >= {nb} K-tiles per "
+            f"split-k chunk, got {num_k_tiles} (K={K}, split_k={split_k}, tile_k={tile_k})"
+        )
 
     sa = _as_1d_fp32(x_scale, M, "x_scale")
     sb = _as_1d_fp32(w_scale, N, "w_scale")
 
-    # M padded to tile_m when ragged (kernel reads a full tile_m rows/wg).
-    padded_m = ((M + tile_m - 1) // tile_m) * tile_m
-    if padded_m == M:
-        a_dev = XQ.contiguous()
-        sa_dev = sa
-    else:
-        a_dev = torch.zeros((padded_m, K), dtype=XQ.dtype, device=XQ.device)
-        a_dev[:M] = XQ
-        sa_dev = torch.ones((padded_m,), dtype=torch.float32, device=sa.device)
-        sa_dev[:M] = sa
-
-    b_dev = WQ.contiguous()
-
     exe = _compile_ptpc_gemm(
-        M=padded_m,
         N=N,
         K=K,
         data_format="fp8",
@@ -152,40 +155,37 @@ def run_preshuffle_gemm_a8_gfx1250(
         waves_per_eu=(None if waves_per_eu <= 0 else waves_per_eu),
         cluster_m=cluster_m,
         cluster_n=cluster_n,
-        out_dtype=kernel_out_dtype,
+        out_dtype=out_dtype,
         split_k=split_k,
     )
 
-    if accumulate_fp32:
-        # fp32 atomic-accumulation scratch (zeroed; narrowed into Out below).
-        out_buf = torch.zeros((padded_m, N), dtype=torch.float32, device=Out.device)
-    elif padded_m == M:
-        out_buf = Out.contiguous()
-    else:
-        out_buf = torch.empty((padded_m, N), dtype=Out.dtype, device=Out.device)
+    lda = XQ.stride(0)
+    ldc = Out.stride(0)
+    if split_k > 1:
+        Out.zero_()  # split-k atomic-accumulates into Out
 
-    stream = _fx.Stream(torch.cuda.current_stream(device=a_dev.device))
+    stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
     _run_compiled(
         exe,
-        out_buf.view(-1),
-        _to_uint8(a_dev),
-        _to_uint8(b_dev),
-        sa_dev.contiguous().view(-1),
-        sb.contiguous().view(-1),
-        padded_m,
+        Out,
+        XQ.view(torch.uint8),
+        WQ.view(torch.uint8),
+        sa.view(-1),
+        sb.view(-1),
+        M,
         N,
+        lda,
+        ldc,
         stream,
     )
-
-    if out_buf.data_ptr() != Out.data_ptr():
-        Out.copy_(out_buf[:M])
     return Out
 
 
-# flydsl_bpreshuffle_wmma_t{tm}x{tn}x{tk}_nb{nb}_sk{sk}_cm{cm}_cn{cn}
+# flydsl_bpreshuffle_wmma_t{tm}x{tn}x{tk}_mw{mw}_nw{nw}_nb{nb}_sk{sk}_cm{cm}_cn{cn}
 _KERNEL_NAME_RE = re.compile(
     r"^flydsl_bpreshuffle_wmma_"
     r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
+    r"mw(?P<m_warp>\d+)_nw(?P<n_warp>\d+)_"
     r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_"
     r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)$"
 )
@@ -200,10 +200,13 @@ def wmma_kernel_name(
     split_k: int,
     cluster_m: int,
     cluster_n: int,
+    m_warp: int,
+    n_warp: int,
 ) -> str:
     return (
         f"flydsl_bpreshuffle_wmma_t{tile_m}x{tile_n}x{tile_k}_"
-        f"nb{num_buffers}_sk{split_k}_cm{cluster_m}_cn{cluster_n}"
+        f"mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk{split_k}_"
+        f"cm{cluster_m}_cn{cluster_n}"
     )
 
 
@@ -238,4 +241,6 @@ def run_gemm_a8w8_bpreshuffle_gfx1250(
         split_k=cfg["split_k"],
         cluster_m=cfg["cluster_m"],
         cluster_n=cfg["cluster_n"],
+        m_warp=cfg["m_warp"],
+        n_warp=cfg["n_warp"],
     )

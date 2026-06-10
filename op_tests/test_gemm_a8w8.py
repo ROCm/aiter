@@ -356,9 +356,18 @@ def calculate_total_valid_points(cu_count, aligned_k):
 def test_normal_gemm_a8w8_pertoken_quant(
     l_dtype, l_quantDtype, l_mnk, pad_a=128, skip_ck=False
 ):
+    is_gfx1250 = get_gfx() == "gfx1250"
+    if is_gfx1250 and not skip_ck:
+        aiter.logger.warning("gfx1250 has no CK a8w8 path; forcing skip_ck=True.")
+        skip_ck = True
     df = []
     for dtype in l_dtype:
         for quantDtype in l_quantDtype:
+            if is_gfx1250 and quantDtype == dtypes.i8:
+                aiter.logger.warning(
+                    "gfx1250 a8w8 only supports fp8 pertoken quant; skipping i8 shapes."
+                )
+                continue
             for m, n, k in l_mnk:
                 ret = test_gemm(
                     dtype, m, n, k, quantDtype, pad_a=pad_a, skip_ck=skip_ck
@@ -617,7 +626,8 @@ if not args.no_legacy:
     df = test_normal_gemm_a8w8_pertoken_quant(
         args.dtype, args.quantDtype, args.mnk, args.pad_a
     )
-    test_skinny_gemm_a8w8_pertoken_quant()
+    if get_gfx() != "gfx1250":
+        test_skinny_gemm_a8w8_pertoken_quant()
 
     if args.output and df is not None:
         os.makedirs(args.output, exist_ok=True)
