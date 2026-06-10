@@ -39,6 +39,18 @@ def is_gluon_supported():
     return _is_gluon_available()
 
 
+def _skip_if_gluon_unaligned_k(backend, M, N, K):
+    """The gluon a16w16 kernels require K to be a multiple of BLOCK_K (no host
+    K-padding). Triton handles any K, so only skip the gluon backend."""
+    if backend != "gluon":
+        return
+    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+    cfg, _ = get_gemm_config("GEMM-A16W16", M, N, K)
+    if K % cfg["BLOCK_K"] != 0:
+        pytest.skip(f"gluon a16w16 requires K % BLOCK_K == 0 (K={K}, BLOCK_K={cfg['BLOCK_K']})")
+
+
 def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=False):
     torch.manual_seed(0)
     if isinstance(dtype, str):
@@ -128,6 +140,7 @@ def test_gemm_a16_w16_activation(
         pytest.skip("kernel_type only applies to gluon backend")
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
+    _skip_if_gluon_unaligned_k(backend, M, N, K)
 
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
         M,
@@ -162,6 +175,7 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output, backend, kernel_typ
         pytest.skip("kernel_type only applies to gluon backend")
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
+    _skip_if_gluon_unaligned_k(backend, M, N, K)
 
     torch.cuda.empty_cache()
 
@@ -187,6 +201,7 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, dtype, layout, output, back
         pytest.skip("kernel_type only applies to gluon backend")
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
+    _skip_if_gluon_unaligned_k(backend, M, N, K)
 
     torch.cuda.empty_cache()
 

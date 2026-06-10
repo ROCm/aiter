@@ -111,23 +111,23 @@ def gemm_a16w16(
         NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
         num_warps = config["num_warps"]
 
-        # Pad K to be divisible by block k so tdm loads never read out of bounds
-        K_padded = triton.cdiv(K, BLOCK_K) * BLOCK_K
-        if K_padded != K:
-            pad_size = K_padded - K
-            x = torch.nn.functional.pad(x, (0, pad_size))
-            w = torch.nn.functional.pad(w, (0, pad_size))
-            K = K_padded
+        # The kernels walk K with update_tensor_descriptor(add_offsets=...),
+        # which advances the load position without shrinking the descriptor's
+        # OOB bound, so a partial last K-tile would read past the end of K.
+        # Require K to be a multiple of BLOCK_K rather than padding here. (M and
+        # N may be unaligned: their descriptor bounds + store mask zero-fill the
+        # partial tiles.)
+        assert (
+            K % BLOCK_K == 0
+        ), f"K ({K}) must be a multiple of BLOCK_K ({BLOCK_K}) for the gluon a16w16 GEMM"
 
         # Clamp the software-pipeline depth to the number of K-tiles.
         #
         # The prologue/epilogue walk a fixed number of K-tiles determined by
         # NUM_BUFFERS, independent of how many real tiles exist. If NUM_BUFFERS
-        # exceeds that count the descriptor base advances past the end of K while
-        # its bound stays stale (add_offsets never shrinks it), so TDM OOB
-        # zero-fill cannot fire and the WMMA consumes garbage. Cap the depth at the
-        # real tile count. Variants differ in reach and in the minimum depth they
-        # require:
+        # exceeds that count the pipeline loop counts go negative, so cap the
+        # depth at the real tile count. Variants differ in reach and in the
+        # minimum depth they require:
         #   basic : reaches num_k_tiles -> cap = num_k_tiles
         #   lds_pipeline : preloads one tile ahead (needs num_k_tiles >= NB + 1)
         #                  -> cap = num_k_tiles - 1
