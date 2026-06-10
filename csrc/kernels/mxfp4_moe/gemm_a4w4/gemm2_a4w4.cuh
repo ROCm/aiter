@@ -118,7 +118,7 @@ kernel(
     const buffer_rsrc_t B_q_rsrc =
         make_buffer_rsrc(B_q,
             (uint32_t)((long long)NUM_EXPERTS * N_OUT * K_HALF * sizeof(__hip_fp4x2_storage_t)));
-    constexpr int kAS_bound_div = kAtomic ? BM_GRID : 32;
+    constexpr int kAS_bound_div = (BM == 16) ? BM_GRID : 32;
     const buffer_rsrc_t A_scale_rsrc =
         make_buffer_rsrc(A_scale,
             (uint32_t)((long long)(max_sorted / kAS_bound_div) * kAS_per_chunk_dw * 4));
