@@ -413,8 +413,8 @@ def mhc_fused_post_pre(
     folded layer input, and the new residual stream for the following layer's post.
 
     ``force_fused``: when True, always use the fused HIP kernel. When False (default),
-    only m<=64 uses the fused kernel; larger m falls back to the unfused
-    ``mhc_post`` + ``mhc_pre`` path (faster on this chip at large m).
+    use the fused path only for smaller ``m`` (threshold depends on the detected GPU arch);
+    larger ``m`` falls back to the unfused ``mhc_post`` + ``mhc_pre`` path.
     """
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
@@ -423,7 +423,7 @@ def mhc_fused_post_pre(
     fused_m_upper_bound = {
         "gfx950": 1024,
         "gfx942": 128,
-    }[arch]
+    }.get(arch, 1024)
 
     if not force_fused and m >= fused_m_upper_bound:
         next_residual = torch.empty_like(residual_in)
