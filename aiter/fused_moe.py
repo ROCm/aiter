@@ -906,6 +906,7 @@ def _flydsl_stage1_wrapper(
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
+        block_scale=parsed.get("block_scale", False),
     )
 
 
@@ -959,6 +960,7 @@ def _flydsl_stage2_wrapper(
         model_dim_pad=model_dim_pad,
         bias=bias2,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
+        block_scale=parsed.get("block_scale", False),
     )
 
 
