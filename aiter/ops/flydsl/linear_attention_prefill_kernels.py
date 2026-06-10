@@ -26,7 +26,11 @@ from pathlib import Path
 
 import torch
 import triton
+from packaging.version import Version
 
+import flydsl
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 from flydsl.runtime.device import get_rocm_arch
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 from ..triton._triton_kernels.gated_delta_rule.utils import (
@@ -34,6 +38,36 @@ from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
+
+
+# The K5 kernel passes every tensor slot as ``fx.Pointer`` (raw data pointer).
+# The kernel body wraps each one as ``GTensor(..., shape=(-1,))`` and never
+# reads the FlyDSL memref shape/stride, so the pointer ABI produces identical
+# device code while skipping the per-launch DLPack export + layout-buffer
+# packing that the default layout-dynamic ``fx.Tensor`` memref incurs under
+# flydsl >=0.2.0. ``fx.Pointer`` host wrapping (``flyc.from_c_void_p`` +
+# ``PointerAdaptor`` fast dispatch) only exists from 0.2.0, so this op alone
+# requires 0.2.0 (the rest of aiter.ops.flydsl only needs >=0.1.8).
+_K5_MIN_FLYDSL_VERSION = Version("0.2.0")
+_installed_flydsl_version = Version(
+    getattr(flydsl, "__version__", "0").split("+")[0]
+)
+if _installed_flydsl_version < _K5_MIN_FLYDSL_VERSION:
+    raise ImportError(
+        "FlyDSL K5 linear-attention prefill requires `flydsl` "
+        f">=`{_K5_MIN_FLYDSL_VERSION}` (for the fx.Pointer argument ABI), "
+        f"but got `{getattr(flydsl, '__version__', 'unknown')}`."
+    )
+
+
+def _as_ptr(t: torch.Tensor):
+    """Wrap a torch tensor as a flydsl ``Pointer`` argument (raw data ptr).
+
+    Uses ``fx.Uint8`` element type: the K5 kernel re-types every slot inside
+    the body via ``GTensor(ptr, dtype=...)``, so the host-side element type is
+    irrelevant to codegen and only needs to be a valid 1-byte unit.
+    """
+    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
 # log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
 # place of exp(g) (matches the Triton VK / HIP K5 convention).
@@ -820,18 +854,29 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         k.new_empty(fs_shape, dtype=fs_dtype) if fs_shape is not None else None
     )
 
+    # The 11 tensor slots, wrapped as raw fx.Pointer args. Keep the torch
+    # tensors referenced as locals (``k``/``u``/``h``/... above) so the storage
+    # stays alive across the (synchronous) launch -- ``from_c_void_p`` only
+    # captures the data pointer, not a reference to the tensor.
+    tensor_args = tuple(
+        _as_ptr(t)
+        for t in (
+            k,
+            u,
+            w,
+            v_new_buf,
+            g if g is not None else dummy,
+            gk if gk is not None else dummy,
+            h,
+            initial_state if initial_state is not None else dummy,
+            final_state if final_state is not None else dummy,
+            cu_arg,
+            co_arg,
+        )
+    )
+
     launch_fn(
-        k,
-        u,
-        w,
-        v_new_buf,
-        g if g is not None else dummy,
-        gk if gk is not None else dummy,
-        h,
-        initial_state if initial_state is not None else dummy,
-        final_state if final_state is not None else dummy,
-        cu_arg,
-        co_arg,
+        *tensor_args,
         T,
         T_flat,
         N,

@@ -109,6 +109,15 @@ def compile_chunk_gated_delta_h(
     assert BV % 16 == 0
     NUM_K_BLOCKS = K // 64
 
+    # Tensor slots use the ``fx.Pointer`` ABI (raw data pointer). The kernel
+    # body wraps every slot as ``GTensor(..., shape=(-1,))`` and never reads
+    # the FlyDSL-injected memref shape/stride, so passing a bare pointer
+    # produces identical device code while skipping the per-launch DLPack
+    # export + layout-buffer packing that the default layout-dynamic
+    # ``fx.Tensor`` memref incurs under flydsl >=0.2.0. The host side wraps
+    # each tensor with ``flyc.from_c_void_p`` (see ``_as_ptr`` in the host
+    # wrapper module), which requires flydsl >=0.2.0.
+
     _fast_exp = _make_fast_exp(G_IS_LOG2_SCALED)
 
     WARP_SIZE = 64
@@ -229,17 +238,17 @@ def compile_chunk_gated_delta_h(
 
     @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_vk")
     def gdn_h_kernel(
-        k_tensor: fx.Tensor,
-        v_tensor: fx.Tensor,
-        w_tensor: fx.Tensor,
-        v_new_tensor: fx.Tensor,
-        g_tensor: fx.Tensor,
-        gk_tensor: fx.Tensor,
-        h_tensor: fx.Tensor,
-        h0_tensor: fx.Tensor,
-        ht_tensor: fx.Tensor,
-        cu_seqlens_tensor: fx.Tensor,
-        chunk_offsets_tensor: fx.Tensor,
+        k_tensor: fx.Pointer,
+        v_tensor: fx.Pointer,
+        w_tensor: fx.Pointer,
+        v_new_tensor: fx.Pointer,
+        g_tensor: fx.Pointer,
+        gk_tensor: fx.Pointer,
+        h_tensor: fx.Pointer,
+        h0_tensor: fx.Pointer,
+        ht_tensor: fx.Pointer,
+        cu_seqlens_tensor: fx.Pointer,
+        chunk_offsets_tensor: fx.Pointer,
         T_val: fx.Int32,
         T_flat: fx.Int32,
         N_val: fx.Int32,
@@ -991,17 +1000,17 @@ def compile_chunk_gated_delta_h(
     # -- Host launcher ------------------------------------------------------
     @flyc.jit
     def launch_gdn_h(
-        k_tensor: fx.Tensor,
-        v_tensor: fx.Tensor,
-        w_tensor: fx.Tensor,
-        v_new_tensor: fx.Tensor,
-        g_tensor: fx.Tensor,
-        gk_tensor: fx.Tensor,
-        h_tensor: fx.Tensor,
-        h0_tensor: fx.Tensor,
-        ht_tensor: fx.Tensor,
-        cu_seqlens_tensor: fx.Tensor,
-        chunk_offsets_tensor: fx.Tensor,
+        k_tensor: fx.Pointer,
+        v_tensor: fx.Pointer,
+        w_tensor: fx.Pointer,
+        v_new_tensor: fx.Pointer,
+        g_tensor: fx.Pointer,
+        gk_tensor: fx.Pointer,
+        h_tensor: fx.Pointer,
+        h0_tensor: fx.Pointer,
+        ht_tensor: fx.Pointer,
+        cu_seqlens_tensor: fx.Pointer,
+        chunk_offsets_tensor: fx.Pointer,
         T_val: fx.Int32,
         T_flat: fx.Int32,
         N_val: fx.Int32,
