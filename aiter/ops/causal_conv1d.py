@@ -7,7 +7,7 @@ from ..jit.core import compile_ops
 MD_NAME = "module_causal_conv1d_update"
 
 
-@compile_ops("module_causal_conv1d_update")
+@compile_ops("module_causal_conv1d_update", develop=True)
 def causal_conv1d_update(
     x: Tensor,
     conv_state: Tensor,
