@@ -170,3 +170,18 @@ Still genuinely open: which avenue ships to production (FlyDSL→CKTile recommen
 
 - **2026-06-05** — Journal created. Reviewed Slack threads + Sami's design doc. Status: design
   phase complete, no implementation yet. Next: FlyDSL prototype forking generic `hgemm`.
+- **2026-06-10** — Established the **official gfx942 (MI300X) baseline** and made the dispatch
+  JSON **arch-keyed**. The shipped `jagged_dense_bmm_dispatch_v2.json` was gfx950-only and forced
+  `use_mfma_k32=true`; on gfx942 that core-dumps (`Cannot select intrinsic
+  llvm.amdgcn.mfma.f32.16x16x32.bf16` — no 16x16x32 bf16 atom on CDNA3). Restructured the JSON to
+  `arch-keyed-v1` (`by_arch.gfx942` / `by_arch.gfx950`); the loader now auto-selects the section
+  matching `flydsl.runtime.device.get_rocm_arch()` (overridable via `FLYDSL_JAGGED_DENSE_BMM_ARCH`),
+  and still accepts a flat legacy JSON via the `..._DISPATCH_V2_JSON` env override. The committed
+  `by_arch.gfx942` section is the baseline: empty `winners` → D-bucketed heuristic with
+  `use_mfma_k32=false`, `xcd_c/xcd_w` null. Out-of-box bench passes correctness with no core-dump;
+  the 2× target is the remaining gap vs Triton (record measured numbers in a results table, not
+  here). Also hit a stale-build blocker: `import aiter` failing on
+  `MxScaleRoundMode` needs a full `module_aiter_core` rebuild (`rm -rf` the build dir; `AITER_REBUILD=1`
+  reuses ccache and does not fix it). Run env is the `jdbba-flydsl` container, aiter at
+  `/workspaces/meta/aiter`. Next: re-tune per-shape gfx942 winners (BLOCK_K, tiles, XCD remap, warps)
+  via the `/jdbba-autoresearch` loop.

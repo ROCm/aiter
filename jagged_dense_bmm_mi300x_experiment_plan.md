@@ -103,27 +103,37 @@ Consequences to verify, not assume:
 
 ---
 
-## 4. Baseline to establish first (before any lever)
+## 4. Baseline (established — the official gfx942 reference)
 
-Bring up the current production kernel on gfx942 and record the reference table.
+The current production kernel was brought up on gfx942 and the reference table
+recorded. Run env: the **`jdbba-flydsl`** docker container, with the host `~/aiter`
+checkout bind-mounted at **`/workspaces/meta/aiter`** (genrec already on the
+container PYTHONPATH).
 
 ```bash
-# inside the devcontainer; confirm arch first
-docker exec anguyenh-dev bash -c 'rocminfo | grep -m1 gfx'   # expect gfx942
+# confirm arch first
+docker exec jdbba-flydsl bash -c 'rocminfo | grep -m1 gfx'   # expect gfx942
 
-# headline uniform benchmark, flydsl vs triton, with correctness
-docker exec -e PYTHONPATH=/home/anguyenh/aiter:/home/anguyenh/generative-recommenders \
-  -w /home/anguyenh/aiter anguyenh-dev \
-  python3 op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py --metric time -test
-
-# both regimes (uniform + skew), end-to-end through the dispatch
-docker exec -e PYTHONPATH=/home/anguyenh/aiter:/home/anguyenh/generative-recommenders \
-  -w /home/anguyenh/aiter anguyenh-dev \
-  python3 op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py --regime both -test
+# both regimes (uniform + skew), flydsl vs triton, with correctness, out-of-box.
+# The dispatch JSON is arch-keyed (arch-keyed-v1): the loader auto-selects the
+# gfx942 section, so NO env override is needed and it will NOT core-dump on the
+# gfx950 use_mfma_k32=true atom.
+docker exec -e PYTHONPATH=/workspaces/meta/aiter \
+  -w /workspaces/meta/aiter jdbba-flydsl \
+  python3 op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py --regime both --metric time -test
 ```
 
-Capture: per-shape per-regime FlyDSL ms, Triton ms, ratio, and cos. This is the
-gfx942 starting point. Do **not** compare it to any gfx950 number.
+> If `import aiter` fails with `cannot import name 'MxScaleRoundMode'`, the
+> prebuilt core module is stale — wipe the build dir and reimport:
+> `docker exec -w /workspaces/meta/aiter jdbba-flydsl bash -c 'rm -rf aiter/jit/build/module_aiter_core aiter/jit/module_aiter_core.so && python3 -c "import aiter"'`
+> (a plain `AITER_REBUILD=1` reuses the ccache and does NOT fix it).
+
+Capture per-shape per-regime FlyDSL ms, Triton ms, ratio, and cos. This is the
+gfx942 starting point — do **not** compare it to any gfx950 number. The baseline
+comes from the committed `by_arch.gfx942` section (empty winners → D-bucketed
+heuristic, `use_mfma_k32=false`), which is the reproducible pre-tuning
+configuration; record the measured numbers in your own results table (§8), not
+here.
 
 Also establish a **bound analysis for gfx942**: compute the HBM-traffic floor
 (A read-once + C write-once + B re-reads) at MI300X's HBM bandwidth, and the
@@ -187,7 +197,8 @@ redirects the search toward levers #2–#5/#10.
 | `aiter/ops/flydsl/kernels/jagged_dense_bmm.py` | N=K=128 prototype (validated reference) |
 | `aiter/ops/flydsl/kernels/jagged_dense_bmm_gen.py` | generalized production kernel (per-shape factory; remap + atom + tiling knobs) |
 | `aiter/ops/flydsl/kernels/jagged_dense_bmm_persist_dev.py` | persistent on-device problem-visitor kernel (skew candidate) |
-| `aiter/ops/flydsl/jagged_dense_bmm_dispatch_v2.py` | production dispatch (regime gate + per-shape config) |
+| `aiter/ops/flydsl/jagged_dense_bmm_dispatch_v2.py` | production dispatch (arch-keyed JSON loader, regime gate + per-shape config) |
+| `aiter/ops/flydsl/jagged_dense_bmm_dispatch_v2.json` | arch-keyed winners table (`by_arch.gfx942` = official baseline / `by_arch.gfx950`); loader auto-selects by detected arch |
 | `op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py` | canonical perf bench (flydsl vs triton, headline shapes, `--regime uniform/skew/both`) |
 | `op_tests/flydsl_tests/test_jdbba_dispatch_v2.py` | dispatch correctness test |
 | `jagged_dense_bmm_broadcast_add_dev_journal.md` | methodology / running log |

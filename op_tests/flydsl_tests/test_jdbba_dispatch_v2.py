@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""End-to-end test of the jagged_dense_bmm_dispatch_v2 layer (gfx950).
+"""End-to-end test of the jagged_dense_bmm_dispatch_v2 layer (arch-aware).
+
+The dispatch JSON is arch-keyed (arch-keyed-v1); the loader selects the section
+matching the detected arch. This test uses the loaded (arch-selected) table, so it
+works on gfx942 (baseline: empty winners -> heuristic) and gfx950 (4 winners).
 
 Verifies:
   1. The public v2 wrapper runs on each headline shape with cos>0.999 vs eager.
-  2. For an in-table shape, resolve_config picks the JSON table winner.
+  2. For an in-table shape (if the arch has winners), resolve_config picks the
+     JSON table winner; for an arch with empty winners the heuristic is used.
   3. An OFF-table shape exercises the D-bucketed heuristic fallback (cos>0.999).
 
 Run (inside container, GPU 7):
@@ -15,15 +20,13 @@ Run (inside container, GPU 7):
 
 from __future__ import annotations
 
-import json
 import sys
-from pathlib import Path
 
 import torch
 
 import flydsl.compiler as flyc
 from aiter.ops.flydsl.jagged_dense_bmm_dispatch_v2 import (
-    _dispatch_json_paths,
+    _load_dispatch_table,
     jagged_dense_bmm_dispatched,
     resolve_config,
     shape_id,
@@ -63,9 +66,10 @@ def _cos(d):
 
 
 def main() -> int:
-    table = json.loads(_dispatch_json_paths()[0].read_text())
+    # Use the loaded (arch-selected) table so this works on whatever arch we run.
+    table = _load_dispatch_table()
     winners = table.get("winners") or {}
-    assert table.get("gfx") == "gfx950", "JSON must be tagged gfx950"
+    print(f"dispatch table: gfx={table.get('gfx')} winners={len(winners)}")
 
     st = torch.cuda.current_stream()
     ok = True

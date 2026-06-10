@@ -11,9 +11,18 @@ the sibling branch ever merges.
 
 Design (mirrors the sibling):
 
-    JSON  : {gfx, source, fallback, winners}
-            winners maps a per-shape id -> a config dict.
-    py    : _shape_id(...), _load_dispatch_table() (cached),
+    JSON  : arch-keyed-v1 schema:
+              {schema, by_arch: {<arch>: {gfx, source, fallback, winners}}}
+            The loader picks the section matching the detected ROCm arch
+            (flydsl.runtime.device.get_rocm_arch, overridable via
+            FLYDSL_JAGGED_DENSE_BMM_ARCH). winners maps a per-shape id -> a
+            config dict. gfx942 (MI300X) and gfx950 (MI355X) have SEPARATE
+            sections because gfx942 has no 16x16x32 bf16 atom -- the gfx950
+            winners force use_mfma_k32=true, which core-dumps on gfx942. A flat
+            (legacy, non-by_arch) JSON is still accepted as-is, so an env-var
+            override file (FLYDSL_JAGGED_DENSE_BMM_DISPATCH_V2_JSON) may use
+            either schema.
+    py    : _shape_id(...), _load_dispatch_table() (cached, arch-selected),
             _resolve_dispatch(...) = explicit-override > exact-match > heuristic,
             config normalize/validate, and a public wrapper that resolves the
             config then calls jagged_dense_bmm() with the chosen knobs.
@@ -110,17 +119,51 @@ def _dispatch_json_paths() -> tuple[Path, ...]:
     return (Path(__file__).resolve().parent / "jagged_dense_bmm_dispatch_v2.json",)
 
 
+def _detect_arch() -> Optional[str]:
+    """Detected ROCm arch (e.g. ``gfx942``), or None if unavailable. Overridable
+    via ``FLYDSL_JAGGED_DENSE_BMM_ARCH`` for testing a non-native table."""
+    env = os.environ.get("FLYDSL_JAGGED_DENSE_BMM_ARCH")
+    if env:
+        return env
+    try:
+        from flydsl.runtime.device import get_rocm_arch
+
+        return get_rocm_arch()
+    except Exception:
+        return None
+
+
+def _select_arch_section(data: dict, arch: Optional[str]) -> dict:
+    """Pick the per-arch sub-table from an ``arch-keyed-v1`` JSON. Falls back to
+    an exact ``gfx`` match, else the lone section if only one exists, else an
+    empty table. A flat (legacy, non-arch-keyed) JSON is returned as-is."""
+    by_arch = data.get("by_arch")
+    if not isinstance(by_arch, dict):
+        return data  # legacy flat schema (e.g. an env-var override file)
+    if arch and arch in by_arch:
+        return by_arch[arch]
+    if arch:
+        for sect in by_arch.values():
+            if sect.get("gfx") == arch:
+                return sect
+    if len(by_arch) == 1:
+        return next(iter(by_arch.values()))
+    return {}
+
+
 def _load_dispatch_table() -> dict:
     global _DISPATCH_TABLE
     if _DISPATCH_TABLE is not None:
         return _DISPATCH_TABLE
+    arch = _detect_arch()
     for path in _dispatch_json_paths():
         if path.is_file():
             data = json.loads(path.read_text())
+            section = _select_arch_section(data, arch)
             _DISPATCH_TABLE = {
-                "gfx": data.get("gfx"),
-                "winners": dict(data.get("winners") or {}),
-                "fallback": dict(data.get("fallback") or {}),
+                "gfx": section.get("gfx"),
+                "winners": dict(section.get("winners") or {}),
+                "fallback": dict(section.get("fallback") or {}),
             }
             return _DISPATCH_TABLE
     _DISPATCH_TABLE = {"gfx": None, "winners": {}, "fallback": {}}
