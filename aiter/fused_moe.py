@@ -2485,15 +2485,9 @@ def cktile_moe_stage1(
                     act="silu",
                 )
                 num_sorted_rows = sorted_token_ids.shape[0]
-                empty_scale = torch.empty(
-                    0, dtype=torch.uint8, device=out.device
-                )
-                empty_i32 = torch.empty(
-                    0, dtype=torch.int32, device=out.device
-                )
-                empty_f32 = torch.empty(
-                    0, dtype=torch.float32, device=out.device
-                )
+                empty_scale = torch.empty(0, dtype=torch.uint8, device=out.device)
+                empty_i32 = torch.empty(0, dtype=torch.int32, device=out.device)
+                empty_f32 = torch.empty(0, dtype=torch.float32, device=out.device)
                 _run_compiled(
                     _silu_fn,
                     (
