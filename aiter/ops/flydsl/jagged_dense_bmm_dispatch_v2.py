@@ -343,29 +343,49 @@ def jagged_dense_bmm_dispatched(
     if stream is None:
         stream = fx.Stream(None)
 
-    # --- Skew gate: pick the kernel variant ---
+    # --- Skew gate: pick the kernel variant (ARCH-DEPENDENT) ---
     # Under SKEW the right default is the STATIC kernel with the XCD remap turned
     # OFF (round-robin), which spreads the surviving tiles evenly across all 8 XCDs
-    # (the gen kernel does this automatically for uniform_seqlen=False). That beats
-    # both remap-on AND the persistent scheduler on every skew shape EXCEPT one.
+    # (the gen kernel does this automatically for uniform_seqlen=False).
     #
-    # The lone exception is the small-weight / large-B cell (output_n<=256 AND
-    # n_groups>=1024, e.g. B1024_D256): there the persistent problem-visitor variant
-    # (on-device CUM prefix, no host sync) wins ~1.13x over static remap-off and
-    # essentially ties Triton, because with a small Dense[b] weight and many groups
-    # the static grid's per-group max_seq_len M-envelope early-exit waste dominates,
-    # and persist's occupied-tile-only traversal recovers it. For the D512 shapes
-    # the static remap-off path is faster than persist (1.13-1.20x), so they fall
-    # through. (Measured 2026-06-09, bench_jagged_dense_bmm_perf.py --regime both.)
+    # The persistent problem-visitor variant (on-device CUM prefix, no host sync)
+    # was a win ONLY on gfx950 for the small-weight/large-B cell (output_n<=256 AND
+    # n_groups>=1024, e.g. B1024_D256): there it beat static remap-off ~1.13x.
+    # On gfx942 (MI300X) that does NOT hold -- re-measured 2026-06-10
+    # (op_tests/flydsl_tests/_regime_gates.py, do_bench cold-L2): for B1024_D256
+    # skew, persist=1.045ms LOSES to static remap-off=0.904ms (1.16x) and to static
+    # remap-ON=0.857ms (1.22x). Persist loses on every gfx942 skew shape, so it is
+    # gated to gfx95x only. (gfx942 routing of B1024_D256 skew -> remap-ON is set
+    # via _SKEW_REMAP_ON below.)
+    arch = _detect_arch()
+    is_gfx95x = bool(arch) and arch.lower().startswith("gfx95")
     total_out = n_groups * output_n * max_seq_len
     use_persist = (
-        (not uniform_seqlen)
+        is_gfx95x
+        and (not uniform_seqlen)
         and output_n <= 256
         and n_groups >= 1024
         and total_out >= (256 * 256 * 4096)
     )
     if use_persist:
         return jagged_dense_bmm_persist(C, A, B, BIAS, SEQ_OFFSETS, n_groups, max_seq_len, stream=stream)
+
+    # Skew + gfx942: the small-weight/large-B cell (B1024_D256) prefers the XCD
+    # remap ON even under skew (0.857 vs 0.904 remap-off, 1.05x), because with many
+    # groups the L2 reuse outweighs the chiplet imbalance there. Every other skew
+    # shape prefers remap-off (D512: remap-on is 1.2-1.6x SLOWER). Re-measured
+    # 2026-06-10 on gfx942.
+    skew_remap_on = (
+        (not uniform_seqlen)
+        and (not is_gfx95x)
+        and output_n <= 256
+        and n_groups >= 1024
+    )
+    if skew_remap_on:
+        return jagged_dense_bmm(
+            C, A, B, BIAS, SEQ_OFFSETS, n_groups, max_seq_len, stream=stream,
+            xcd_c=32, xcd_w=8, use_mfma_k32=cfg["use_mfma_k32"], uniform_seqlen=False,
+        )
 
     # block_k is shape-derived inside the kernel; it has no public-entry arg, so
     # a forced block_k from the table cannot be applied without editing the
