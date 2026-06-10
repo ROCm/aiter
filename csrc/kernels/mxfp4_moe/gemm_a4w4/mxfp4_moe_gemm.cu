@@ -158,12 +158,9 @@ void mxfp4_moe_gemm2_a4w4_mxfp4out_kernel(
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(inter_sorted_quant));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    // MUST match gen_instances.py's MAX_M (drives the A_q/A_scale buffer bound;
-    // too-small clips large-prefill tail rows to 0 → wrong output).
-    constexpr int MAX_M = 655360;
 
 #define LAUNCH_G2_MXFP4(NE_, K_, N_)                                                              \
-    aiter::mxfp4_moe::gemm2::launch_nonatomic_mxfp4<MAX_M, NE_, K_, N_>(                          \
+    aiter::mxfp4_moe::gemm2::launch_nonatomic_mxfp4<NE_, K_, N_>(                                 \
         stream,                                                                                  \
         inter_sorted_quant.data_ptr(), inter_sorted_shuffled_scale.data_ptr(),                   \
         w3_shuffled_quant.data_ptr(), w3_shuffled_scale.data_ptr(),                              \

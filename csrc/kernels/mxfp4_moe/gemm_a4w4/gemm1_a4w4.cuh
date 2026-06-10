@@ -19,7 +19,7 @@ namespace aiter::mxfp4_moe::gemm1 {
 
 using namespace aiter::mxfp4_moe::gemm_common;
 
-template <int MAX_M, int NUM_EXPERTS, int K, int N_OUT, int BM,
+template <int NUM_EXPERTS, int K, int N_OUT, int BM,
           bool kUseNT = false,
           bool kInlineQuant = false,
           int kXcdSwizzle = 0>
@@ -34,6 +34,7 @@ kernel(
     const int*                   __restrict__ cumsum_tensor,
     const int*                   __restrict__ m_indices,
     int                                       n_tokens,
+    int                                       max_sorted,
     uint8_t*                     __restrict__ A_q_out,
     uint8_t*                     __restrict__ A_scale_out,
     const __hip_bfloat16*        __restrict__ hidden_states)
@@ -85,7 +86,7 @@ kernel(
             (uint32_t)(NUM_EXPERTS * N_OUT * K_HALF * sizeof(__hip_fp4x2_storage_t)));
     const buffer_rsrc_t A_scale_rsrc =
         make_buffer_rsrc(A_scale,
-            (uint32_t)((long long)(MAX_M / 32) * kAS_per_chunk_dw * 4));
+            (uint32_t)((long long)(max_sorted / 32) * kAS_per_chunk_dw * 4));
     const buffer_rsrc_t B_ps_scale_rsrc =
         make_buffer_rsrc(B_ps_scale, (uint32_t)(NUM_EXPERTS * kBS_per_expert_dw * 4));
     // rsrc base non-null, size=0 ⇒ OOB loads trap.
@@ -592,7 +593,7 @@ kernel(
     run_one(m_block_idx, n_block_idx, e);
 }
 
-template <int MAX_M, int NUM_EXPERTS, int K, int N_OUT, int BM,
+template <int NUM_EXPERTS, int K, int N_OUT, int BM,
           bool kUseNT = false, bool kInlineQuant = false,
           int kXcdSwizzle = 0>
 inline void launch(
@@ -608,23 +609,26 @@ inline void launch(
     constexpr int num_n_blocks = N_OUT / 256;
     constexpr int BM_GRID = BM;
     int grid;
+    int max_sorted;
     if constexpr (BM == 128) {
         const int max_m_blocks =
             (n_tokens * TOPK + NUM_EXPERTS * (BM - 1) + BM - 1) / BM;
         grid = max_m_blocks * num_n_blocks;
+        max_sorted = max_m_blocks * BM;
     } else {
         const int active_experts = (n_tokens * TOPK < NUM_EXPERTS) ? (n_tokens * TOPK) : NUM_EXPERTS;
         const int max_m_blocks =
             (n_tokens * TOPK + active_experts * (BM_GRID - 1) + BM_GRID - 1) / BM_GRID;
         grid = max_m_blocks * num_n_blocks;
+        max_sorted = max_m_blocks * BM;
     }
-    kernel<MAX_M, NUM_EXPERTS, K, N_OUT, BM, kUseNT, kInlineQuant, kXcdSwizzle>
+    kernel<NUM_EXPERTS, K, N_OUT, BM, kUseNT, kInlineQuant, kXcdSwizzle>
         <<<grid, 256, 0, stream>>>(
             reinterpret_cast<const __hip_fp4x2_storage_t*>(A_q),
             reinterpret_cast<const __amd_scale_t*>(A_scale),
             reinterpret_cast<const __hip_fp4x2_storage_t*>(B_q),
             reinterpret_cast<const __amd_scale_t*>(B_scale),
-            sorted_expert_ids, cumsum_tensor, m_indices, n_tokens,
+            sorted_expert_ids, cumsum_tensor, m_indices, n_tokens, max_sorted,
             reinterpret_cast<uint8_t*>(A_q_out),
             reinterpret_cast<uint8_t*>(A_scale_out),
             reinterpret_cast<const __hip_bfloat16*>(hidden_states));
