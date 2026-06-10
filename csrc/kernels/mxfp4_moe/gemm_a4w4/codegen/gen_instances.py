@@ -16,11 +16,11 @@
 import argparse
 from pathlib import Path
 
-# ── Supported shape tuples ─────────────────────────────────────────────────
+# -- Supported shape tuples -------------------------------------------------
 # (NE, D_HIDDEN, D_INTER, TOPK)
 SHAPES = [
-    (385,  7168,      512,      9),  # Kimi-K2.5 TP=4
-    (257,  7168,      512,      9),  # DSR
+    (385, 7168, 512, 9),  # Kimi-K2.5 TP=4
+    (257, 7168, 512, 9),  # DSR
 ]
 
 # XCD-swizzle group sizes to enumerate for BM=128 paths (large-M targets).
@@ -34,7 +34,7 @@ BM128_XCD_SWIZZLES = [0, 1, 2, 4, 8]
 BM32_XCD_SWIZZLES = [0, 1, 2]
 BM16_XCD_SWIZZLES = [0, 1, 2]
 
-# ── Instance file template ─────────────────────────────────────────────────
+# -- Instance file template -------------------------------------------------
 INSTANCE_HEADER = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
@@ -88,7 +88,7 @@ G2_NONATOMIC_PARAMS = """    const void*    A_q,
 G1_INC = '#include "gemm_a4w4/gemm1_a4w4.cuh"'
 G2_INC = '#include "gemm_a4w4/gemm2_a4w4.cuh"'
 
-# ── Lookup header templates ────────────────────────────────────────────────
+# -- Lookup header templates ------------------------------------------------
 LOOKUP_HEADER_HEAD = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
@@ -102,7 +102,7 @@ LOOKUP_HEADER_HEAD = """// SPDX-License-Identifier: MIT
 """
 
 
-# ── Instance record ────────────────────────────────────────────────────────
+# -- Instance record --------------------------------------------------------
 class Instance:
     """One codegen'd template instance.
 
@@ -172,7 +172,7 @@ def _g2_nonatomic_body(ne, h, e, *, xcd_swizzle=0):
     )
 
 
-# ── Codegen ────────────────────────────────────────────────────────────────
+# -- Codegen ----------------------------------------------------------------
 class mxfp4_moe_gemm_codegen:
     def __init__(self, working_path):
         self.working_path = Path(working_path)
@@ -193,7 +193,7 @@ class mxfp4_moe_gemm_codegen:
                         _g1_body(ne, h, e, 32, use_nt=use_nt, xcd_swizzle=xcd),
                     )
 
-            # BM=128 cshuffle — enumerate XCD-swizzle variants. XCD=0 keeps the
+            # BM=128 cshuffle -- enumerate XCD-swizzle variants. XCD=0 keeps the
             # legacy kernel-name (no _XCD suffix); positive XCD gets a suffix so
             # the dispatcher can pick among them.
             for xcd in BM128_XCD_SWIZZLES:
@@ -217,14 +217,21 @@ class mxfp4_moe_gemm_codegen:
                         "Gemm1CshuffleFn",
                         G1_INC,
                         G1_CSHUFFLE_PARAMS,
-                        _g1_body(ne, h, e, 16, use_nt=use_nt, inline_quant=True,
-                                 xcd_swizzle=xcd),
+                        _g1_body(
+                            ne,
+                            h,
+                            e,
+                            16,
+                            use_nt=use_nt,
+                            inline_quant=True,
+                            xcd_swizzle=xcd,
+                        ),
                     )
 
     def enumerate_g2_instances(self):
         for ne, h, e, topk in SHAPES:
             prefix_topk = f"mxfp4_moe_g2_a4w4_NE{ne}_H{h}_E{e}_TOPK{topk}"
-            prefix_nt   = f"mxfp4_moe_g2_a4w4_NE{ne}_H{h}_E{e}"
+            prefix_nt = f"mxfp4_moe_g2_a4w4_NE{ne}_H{h}_E{e}"
 
             # Each atomic variant comes in a cached (default) and a non-temporal
             # (_NT) B-load flavor. NT is a dispatch-level choice (the CSV kernelName2
@@ -232,18 +239,19 @@ class mxfp4_moe_gemm_codegen:
             # nonatomic BM=128 path stays cached (cross-CTA L1 reuse dominates).
             for use_nt, nt_suffix in [(False, ""), (True, "_NT")]:
                 for bm in (16, 32, 64):
-                    for xcd in BM32_XCD_SWIZZLES:   # {0,1,2}; reuse the small-tier set
+                    for xcd in BM32_XCD_SWIZZLES:  # {0,1,2}; reuse the small-tier set
                         xsuf = "" if xcd == 0 else f"_XCD{xcd}"
                         yield Instance(
                             f"{prefix_topk}_BM{bm}_ATOMIC{nt_suffix}{xsuf}",
                             "Gemm2AtomicFn",
                             G2_INC,
                             G2_ATOMIC_PARAMS,
-                            _g2_atomic_body(ne, h, e, topk, bm, use_nt=use_nt,
-                                            xcd_swizzle=xcd),
+                            _g2_atomic_body(
+                                ne, h, e, topk, bm, use_nt=use_nt, xcd_swizzle=xcd
+                            ),
                         )
 
-            # BM=128 nonatomic — enumerate XCD-swizzle variants (large-M target).
+            # BM=128 nonatomic -- enumerate XCD-swizzle variants (large-M target).
             for xcd in BM128_XCD_SWIZZLES:
                 suffix = "" if xcd == 0 else f"_XCD{xcd}"
                 yield Instance(
@@ -278,19 +286,21 @@ class mxfp4_moe_gemm_codegen:
             out.append(self._decl_extern_c(inst) + "\n")
 
         g1_cshuffle = [i.name for i in g1_list if i.fn_type == "Gemm1CshuffleFn"]
-        g2_atomic   = [i.name for i in g2_list if i.fn_type == "Gemm2AtomicFn"]
-        g2_nonatom  = [i.name for i in g2_list if i.fn_type == "Gemm2NonatomicFn"]
+        g2_atomic = [i.name for i in g2_list if i.fn_type == "Gemm2AtomicFn"]
+        g2_nonatom = [i.name for i in g2_list if i.fn_type == "Gemm2NonatomicFn"]
 
-        self._emit_map(out, "GENERATE_G1_CSHUFFLE_LOOKUP_TABLE",  g1_cshuffle)
-        self._emit_map(out, "GENERATE_G2_ATOMIC_LOOKUP_TABLE",    g2_atomic)
+        self._emit_map(out, "GENERATE_G1_CSHUFFLE_LOOKUP_TABLE", g1_cshuffle)
+        self._emit_map(out, "GENERATE_G2_ATOMIC_LOOKUP_TABLE", g2_atomic)
         self._emit_map(out, "GENERATE_G2_NONATOMIC_LOOKUP_TABLE", g2_nonatom)
 
         (self.working_path / "mxfp4_moe_gemm_lookup.h").write_text("".join(out))
 
     @staticmethod
     def _decl_extern_c(inst):
-        return (f'extern "C" void {inst.name}(\n'
-                f'    hipStream_t stream,\n{inst.params});')
+        return (
+            f'extern "C" void {inst.name}(\n'
+            f"    hipStream_t stream,\n{inst.params});"
+        )
 
     @staticmethod
     def _emit_map(out, macro, names):
@@ -307,16 +317,387 @@ class mxfp4_moe_gemm_codegen:
         g2 = list(self.enumerate_g2_instances())
         self.gen_instances(g1 + g2)
         self.gen_lookup(g1, g2)
-        print(f"mxfp4_moe codegen: {len(g1)} g1 + {len(g2)} g2 = "
-              f"{len(g1) + len(g2)} instances under {self.working_path}/instances/")
+        print(
+            f"mxfp4_moe codegen: {len(g1)} g1 + {len(g2)} g2 = "
+            f"{len(g1) + len(g2)} instances under {self.working_path}/instances/"
+        )
+
+
+# -- aux codegen (sort / quant / sort_scales / scatter_reduce) ---------------
+AUX_INSTANCE_HEADER = """// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// AUTO-GENERATED by gen_instances.py. Do not edit.
+
+#ifdef __HIP_NO_HALF_CONVERSIONS__
+#undef __HIP_NO_HALF_CONVERSIONS__
+#endif
+#ifdef __HIP_NO_HALF_OPERATORS__
+#undef __HIP_NO_HALF_OPERATORS__
+#endif
+
+#include <hip/hip_runtime.h>
+#include <cstdint>
+#include <hip/amd_detail/amd_hip_bf16.h>
+
+{kernel_include}
+#include "aux/codegen/mxfp4_moe_aux_dispatch.h"
+
+using namespace aiter::mxfp4_moe::aux_dispatch;
+
+extern "C" void {fn_name}(
+    hipStream_t stream,
+{params})
+{{
+{body}
+}}
+"""
+
+AUX_INC_SORT_QUANT = '#include "aux/moe_sort_quant.cuh"'
+AUX_INC_3STAGE = '#include "aux/moe_3stage_sort.cuh"'
+AUX_INC_SORT_SCALES = '#include "aux/moe_sort_scales.cuh"'
+AUX_INC_SCATTER = '#include "aux/moe_scatter_reduce.cuh"'
+
+AUX_SORT_QUANT_PARAMS = """    int            M,
+    const void*    a_input,
+    const int32_t* topk_ids,
+    const float*   topk_weight,
+    int32_t*       sorted_token_ids,
+    int32_t*       sorted_expert_ids,
+    int32_t*       cumsum,
+    int32_t*       reverse_sorted,
+    float*         sorted_weights,
+    void*          a_quant,
+    void*          a_scale,
+    int32_t*       masked_m,
+    int32_t*       m_indices,
+    void*          bf16_zero_ptr"""
+
+AUX_3STAGE_PARAMS = """    int            M,
+    const int32_t* topk_ids,
+    const float*   topk_weight,
+    int32_t*       sorted_token_ids,
+    int32_t*       sorted_expert_ids,
+    int32_t*       cumsum,
+    int32_t*       reverse_sorted,
+    float*         sorted_weights,
+    int32_t*       masked_m,
+    int32_t*       m_indices,
+    int32_t*       block_offsets,
+    int32_t*       real_counts"""
+
+AUX_SORT_ONLY_ZI_PARAMS = """    int            M,
+    const int32_t* topk_ids,
+    const float*   topk_weight,
+    int32_t*       sorted_token_ids,
+    int32_t*       sorted_expert_ids,
+    int32_t*       cumsum,
+    int32_t*       reverse_sorted,
+    float*         sorted_weights,
+    int32_t*       masked_m,
+    int32_t*       m_indices,
+    void*          bf16_zero_ptr,
+    void*          bf16_zero_ws_ptr,
+    long long      workspace_bytes"""
+
+AUX_SORT_ONLY_PARAMS = """    int            M,
+    const int32_t* topk_ids,
+    const float*   topk_weight,
+    int32_t*       sorted_token_ids,
+    int32_t*       sorted_expert_ids,
+    int32_t*       cumsum,
+    int32_t*       reverse_sorted,
+    float*         sorted_weights,
+    int32_t*       masked_m,
+    int32_t*       m_indices"""
+
+AUX_QUANT_PARAMS = """    int            M,
+    const void*    a_input,
+    void*          a_quant,
+    void*          a_scale,
+    void*          bf16_zero_ptr"""
+
+AUX_SORT_SCALES_PARAMS = """    int            M,
+    int            max_sorted,
+    void*          a_scale,
+    const int32_t* sorted_token_ids,
+    const int32_t* cumsum,
+    void*          a_scale_sorted_shuffled"""
+
+AUX_SCATTER_PARAMS = """    int            M,
+    const void*    flat_out,
+    const int32_t* reverse_sorted,
+    const float*   sorted_weights,
+    void*          out"""
+
+AUX_SCATTER_Q_PARAMS = """    int            M,
+    const void*    flat_out_q,
+    const void*    flat_out_scale,
+    const int32_t* reverse_sorted,
+    const float*   sorted_weights,
+    void*          out"""
+
+
+def _aux_sort_quant_body(ne, topk, mb, h):
+    return (
+        f"    aiter::mxfp4_moe::moe_sort_quant::launch<\n"
+        f"        {ne}, {topk}, {mb}, {h}, kNCtasSort, kThreadsSort>(\n"
+        f"            stream, M,\n"
+        f"            reinterpret_cast<const __hip_bfloat16*>(a_input),\n"
+        f"            topk_ids, topk_weight, sorted_token_ids, sorted_expert_ids,\n"
+        f"            cumsum, reverse_sorted, sorted_weights,\n"
+        f"            reinterpret_cast<uint8_t*>(a_quant),\n"
+        f"            reinterpret_cast<uint8_t*>(a_scale),\n"
+        f"            masked_m, m_indices,\n"
+        f"            reinterpret_cast<__hip_bfloat16*>(bf16_zero_ptr));"
+    )
+
+
+def _aux_3stage_body(ne, topk, mb):
+    return (
+        f"    aiter::mxfp4_moe::moe_3stage_sort::launch<\n"
+        f"        {ne}, {topk}, {mb}, kSplitSortCtas, kThreadsSort>(\n"
+        f"            stream, M,\n"
+        f"            topk_ids, topk_weight, sorted_token_ids, sorted_expert_ids,\n"
+        f"            cumsum, reverse_sorted, sorted_weights,\n"
+        f"            masked_m, m_indices, block_offsets, real_counts);"
+    )
+
+
+def _aux_sort_only_zi_body(ne, topk, mb, h):
+    return (
+        f"    aiter::mxfp4_moe::moe_sort_quant::launch_sort_only_with_zero_init<\n"
+        f"        {ne}, {topk}, {mb}, {h}, kInlineQuantZeroInitCtas, kThreadsSort>(\n"
+        f"            stream, M,\n"
+        f"            topk_ids, topk_weight, sorted_token_ids, sorted_expert_ids,\n"
+        f"            cumsum, reverse_sorted, sorted_weights,\n"
+        f"            masked_m, m_indices,\n"
+        f"            reinterpret_cast<__hip_bfloat16*>(bf16_zero_ptr),\n"
+        f"            bf16_zero_ws_ptr, workspace_bytes);"
+    )
+
+
+def _aux_sort_only_body(ne, topk, mb, h):
+    return (
+        f"    aiter::mxfp4_moe::moe_sort_quant::launch_sort_only<\n"
+        f"        {ne}, {topk}, {mb}, {h}, kThreadsSort>(\n"
+        f"            stream, M,\n"
+        f"            topk_ids, topk_weight, sorted_token_ids, sorted_expert_ids,\n"
+        f"            cumsum, reverse_sorted, sorted_weights,\n"
+        f"            masked_m, m_indices);"
+    )
+
+
+def _aux_quant_body(ne, topk, mb, h):
+    return (
+        f"    aiter::mxfp4_moe::moe_sort_quant::launch_quant<\n"
+        f"        {ne}, {topk}, {mb}, {h}, kNCtasSort, kThreadsSort>(\n"
+        f"            stream, M,\n"
+        f"            reinterpret_cast<const __hip_bfloat16*>(a_input),\n"
+        f"            reinterpret_cast<uint8_t*>(a_quant),\n"
+        f"            reinterpret_cast<uint8_t*>(a_scale),\n"
+        f"            reinterpret_cast<__hip_bfloat16*>(bf16_zero_ptr));"
+    )
+
+
+def _aux_sort_scales_body(bm, ne, e, h):
+    return (
+        f"    aiter::mxfp4_moe::moe_sort_scales::launch<\n"
+        f"        {bm}, {ne}, {e}, {h}, kBK, kNCtasScales, kThreadsScales>(\n"
+        f"            stream, M, max_sorted,\n"
+        f"            reinterpret_cast<uint8_t*>(a_scale),\n"
+        f"            sorted_token_ids, cumsum,\n"
+        f"            reinterpret_cast<uint8_t*>(a_scale_sorted_shuffled));"
+    )
+
+
+def _aux_scatter_body(h, topk, nt):
+    return (
+        f"    aiter::mxfp4_moe::moe_scatter_reduce::launch<\n"
+        f"        {h}, {topk}, kThreadsScatterReduce, kColsPerThread, {str(nt).lower()}>(\n"
+        f"            stream, M,\n"
+        f"            reinterpret_cast<const __hip_bfloat16*>(flat_out),\n"
+        f"            reverse_sorted, sorted_weights,\n"
+        f"            reinterpret_cast<__hip_bfloat16*>(out));"
+    )
+
+
+def _aux_scatter_q_body(h, topk, nt):
+    return (
+        f"    aiter::mxfp4_moe::moe_scatter_reduce::launch_mxfp4<\n"
+        f"        {h}, {topk}, kThreadsScatterReduceQ, kColsPerThreadQ, {str(nt).lower()}>(\n"
+        f"            stream, M,\n"
+        f"            reinterpret_cast<const uint8_t*>(flat_out_q),\n"
+        f"            reinterpret_cast<const uint8_t*>(flat_out_scale),\n"
+        f"            reverse_sorted, sorted_weights,\n"
+        f"            reinterpret_cast<__hip_bfloat16*>(out));"
+    )
+
+
+class mxfp4_moe_aux_codegen:
+    def __init__(self, working_path):
+        self.working_path = Path(working_path)
+
+    def enumerate_instances(self):
+        # sort_quant: MB=32 only
+        for ne, h, e, topk in SHAPES:
+            for mb in (32,):
+                yield Instance(
+                    f"aux_sort_quant_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
+                    "SortQuantFn",
+                    AUX_INC_SORT_QUANT,
+                    AUX_SORT_QUANT_PARAMS,
+                    _aux_sort_quant_body(ne, topk, mb, h),
+                )
+
+        # sort (threestage): MB in {32, 128}
+        for ne, h, e, topk in SHAPES:
+            for mb in (32, 128):
+                yield Instance(
+                    f"aux_sort3s_NE{ne}_TOPK{topk}_MB{mb}",
+                    "Sort3StageFn",
+                    AUX_INC_3STAGE,
+                    AUX_3STAGE_PARAMS,
+                    _aux_3stage_body(ne, topk, mb),
+                )
+
+        # sort (inline_quant + zero_init): MB=16
+        for ne, h, e, topk in SHAPES:
+            for mb in (16,):
+                yield Instance(
+                    f"aux_sortzi_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
+                    "SortOnlyZiFn",
+                    AUX_INC_SORT_QUANT,
+                    AUX_SORT_ONLY_ZI_PARAMS,
+                    _aux_sort_only_zi_body(ne, topk, mb, h),
+                )
+
+        # sort (inline_quant): MB=16
+        for ne, h, e, topk in SHAPES:
+            for mb in (16,):
+                yield Instance(
+                    f"aux_sortonly_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
+                    "SortOnlyFn",
+                    AUX_INC_SORT_QUANT,
+                    AUX_SORT_ONLY_PARAMS,
+                    _aux_sort_only_body(ne, topk, mb, h),
+                )
+
+        # quant: MB in {32, 128}
+        for ne, h, e, topk in SHAPES:
+            for mb in (32, 128):
+                yield Instance(
+                    f"aux_quant_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
+                    "QuantFn",
+                    AUX_INC_SORT_QUANT,
+                    AUX_QUANT_PARAMS,
+                    _aux_quant_body(ne, topk, mb, h),
+                )
+
+        # sort_scales: BM in {32, 128} (MB=16 callers clamp to BM=32)
+        for ne, h, e, topk in SHAPES:
+            for bm in (32, 128):
+                yield Instance(
+                    f"aux_sortscales_BM{bm}_NE{ne}_E{e}_H{h}",
+                    "SortScalesFn",
+                    AUX_INC_SORT_SCALES,
+                    AUX_SORT_SCALES_PARAMS,
+                    _aux_sort_scales_body(bm, ne, e, h),
+                )
+
+        # scatter_reduce / scatter_reduce_q: keyed by (D_HIDDEN, TOPK, NT) only,
+        # so dedup across shapes that share an (h, topk).
+        for h, topk in sorted({(h, topk) for _ne, h, _e, topk in SHAPES}):
+            for nt in (False, True):
+                yield Instance(
+                    f"aux_scatter_H{h}_TOPK{topk}_NT{1 if nt else 0}",
+                    "ScatterReduceFn",
+                    AUX_INC_SCATTER,
+                    AUX_SCATTER_PARAMS,
+                    _aux_scatter_body(h, topk, nt),
+                )
+                yield Instance(
+                    f"aux_scatterq_H{h}_TOPK{topk}_NT{1 if nt else 0}",
+                    "ScatterReduceQFn",
+                    AUX_INC_SCATTER,
+                    AUX_SCATTER_Q_PARAMS,
+                    _aux_scatter_q_body(h, topk, nt),
+                )
+
+    def gen_instances(self, instances):
+        inst_dir = self.working_path / "instances"
+        inst_dir.mkdir(exist_ok=True)
+        for inst in instances:
+            text = AUX_INSTANCE_HEADER.format(
+                kernel_include=inst.include,
+                fn_name=inst.name,
+                params=inst.params,
+                body=inst.body,
+            )
+            (inst_dir / f"{inst.name}.cu").write_text(text)
+
+    # fn_type -> lookup-table macro name (one table per aux entry).
+    _MACRO = {
+        "SortQuantFn": "GENERATE_AUX_SORT_QUANT_LOOKUP_TABLE",
+        "Sort3StageFn": "GENERATE_AUX_SORT3STAGE_LOOKUP_TABLE",
+        "SortOnlyZiFn": "GENERATE_AUX_SORT_ONLY_ZI_LOOKUP_TABLE",
+        "SortOnlyFn": "GENERATE_AUX_SORT_ONLY_LOOKUP_TABLE",
+        "QuantFn": "GENERATE_AUX_QUANT_LOOKUP_TABLE",
+        "SortScalesFn": "GENERATE_AUX_SORT_SCALES_LOOKUP_TABLE",
+        "ScatterReduceFn": "GENERATE_AUX_SCATTER_REDUCE_LOOKUP_TABLE",
+        "ScatterReduceQFn": "GENERATE_AUX_SCATTER_REDUCE_Q_LOOKUP_TABLE",
+    }
+
+    def gen_lookup(self, instances):
+        out = ["""// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// AUTO-GENERATED by gen_instances.py.
+
+#pragma once
+
+#include "mxfp4_moe_aux_dispatch.h"
+
+// Forward declarations of every codegen'd aux instance.
+"""]
+        for inst in instances:
+            out.append(mxfp4_moe_gemm_codegen._decl_extern_c(inst) + "\n")
+
+        for fn_type, macro in self._MACRO.items():
+            names = [i.name for i in instances if i.fn_type == fn_type]
+            mxfp4_moe_gemm_codegen._emit_map(out, macro, names)
+
+        (self.working_path / "mxfp4_moe_aux_lookup.h").write_text("".join(out))
+
+    def run(self):
+        self.working_path.mkdir(parents=True, exist_ok=True)
+        insts = list(self.enumerate_instances())
+        self.gen_instances(insts)
+        self.gen_lookup(insts)
+        print(
+            f"mxfp4_moe aux codegen: {len(insts)} instances under "
+            f"{self.working_path}/instances/"
+        )
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--working_path", required=True,
-                    help="output directory (gets instances/ subdir + lookup.h)")
+    ap.add_argument(
+        "--working_path",
+        required=True,
+        help="output directory (gets instances/ subdir + lookup.h)",
+    )
+    ap.add_argument(
+        "--target",
+        choices=["gemm", "aux"],
+        default="gemm",
+        help="which instance set to generate (shared SHAPES list)",
+    )
     args = ap.parse_args()
-    mxfp4_moe_gemm_codegen(args.working_path).run()
+    if args.target == "gemm":
+        mxfp4_moe_gemm_codegen(args.working_path).run()
+    else:
+        mxfp4_moe_aux_codegen(args.working_path).run()
 
 
 if __name__ == "__main__":
