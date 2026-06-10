@@ -27,6 +27,17 @@ def _skip_if_gluon_unaligned_k(backend, M, N, K):
         )
 
 
+def _skip_if_triton_on_gfx1250(backend):
+    """gfx1250 only ships gluon-format a16w16 configs, so the triton backend has
+    no usable config there; skip the triton backend on gfx1250."""
+    if backend != "triton":
+        return
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if "gfx1250" in (get_arch() or ""):
+        pytest.skip("triton backend has no gfx1250 a16w16 config (gluon-only arch)")
+
+
 def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=False):
     torch.manual_seed(0)
     if isinstance(dtype, str):
@@ -79,6 +90,7 @@ def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
         pytest.skip("kernel_type only applies to the gluon backend")
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
+    _skip_if_triton_on_gfx1250(backend)
     _skip_if_gluon_unaligned_k(backend, M, N, K)
 
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
@@ -121,6 +133,7 @@ def test_gemm_a16_w16_activation(
         pytest.skip("kernel_type only applies to the gluon backend")
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
+    _skip_if_triton_on_gfx1250(backend)
     _skip_if_gluon_unaligned_k(backend, M, N, K)
 
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
@@ -162,6 +175,7 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_typ
         pytest.skip("kernel_type only applies to the gluon backend")
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
+    _skip_if_triton_on_gfx1250(backend)
     _skip_if_gluon_unaligned_k(backend, M, N, K)
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
