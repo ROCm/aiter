@@ -2093,7 +2093,8 @@ namespace py = pybind11;
           py::arg("hc_sinkhorn_eps")    = 1e-6,  \
           py::arg("norm_eps")           = 1e-6,  \
           py::arg("hc_post_mult_value") = 1.0,   \
-          py::arg("sinkhorn_repeat")    = 20);   \
+          py::arg("sinkhorn_repeat")    = 20,   \
+          py::arg("use_nt")           = -1);    \
     m.def("mhc_post",                           \
           &aiter::mhc_post,                     \
           "mhc_post",                           \
