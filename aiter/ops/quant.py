@@ -644,9 +644,11 @@ def get_torch_act(aType):
         ActivationType.Gelu: F.gelu,
         ActivationType.SwigluStep: _swiglustep_single,
     }
-    if aType not in tmp:
-        raise NotImplementedError(f"Unsupported activation type: {aType!r}")
-    return tmp[aType]
+    # Lazy lookup (matches main): return the NotImplementedError class for
+    # unlisted activations instead of raising. The MoE torch-reference path
+    # calls get_torch_act(activation) for Swiglu *before* its dedicated branch,
+    # so raising here breaks Swiglu op tests.
+    return tmp.get(aType, NotImplementedError)
 
 
 def moe_smooth_per_token_scaled_quant(
