@@ -795,7 +795,7 @@ void fused_qknorm_allreduce(fptr_t _fa,
 
 #define DISPATCH_AR_FUSION(DTYPE)                                                           \
     {                                                                                       \
-        fa->dispatchFusedQKNormAllReduce<DTYPE>(stream,                                     \
+        fa->dispatchFusedQKNormAllReduce<DTYPE, false>(stream,                              \
                                                 reinterpret_cast<DTYPE*>(inp_ptr),          \
                                                 reinterpret_cast<DTYPE*>(q_w.data_ptr()),   \
                                                 reinterpret_cast<DTYPE*>(k_w.data_ptr()),   \
@@ -806,7 +806,11 @@ void fused_qknorm_allreduce(fptr_t _fa,
                                                 hidden_dim_q,                               \
                                                 hidden_dim_k,                               \
                                                 hidden_dim_v,                               \
-                                                eps);                                       \
+                                                eps,                                        \
+                                                nullptr,                                    \
+                                                nullptr,                                    \
+                                                0,                                          \
+                                                0);                                         \
     }
 
     switch(dtype)

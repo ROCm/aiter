@@ -2242,8 +2242,8 @@ apply_neox_rope_pack(
         return x;
     }
     const int embed_dim = rotary_dim / 2;
-    const int pos_id = position_ids[token_id];
-    const T* cache_ptr = cos_sin_cache + pos_id * rotary_dim;
+    const int64_t pos_id = position_ids[token_id];
+    const T* cache_ptr = cos_sin_cache + pos_id * (int64_t)rotary_dim;
     const T* cos_ptr = cache_ptr;
     const T* sin_ptr = cache_ptr + embed_dim;
     P y;
@@ -2269,7 +2269,7 @@ apply_neox_rope_pack(
     return y;
 }
 
-template <typename T, int ngpus, int WARP_SIZE, bool USE_ROPE_CACHE = false>
+template <typename T, int ngpus, int WARP_SIZE, bool FUSE_ROPE>
 __global__ void __launch_bounds__(1024, 1)
     qknorm_allreduce_fusion_kernel_2stage(RankData* _dp,
                                           RankSignals sg,
@@ -2286,10 +2286,10 @@ __global__ void __launch_bounds__(1024, 1)
                                           int hidden_dim_k,
                                           int hidden_dim_v,
                                           float eps,
-                                          const T* __restrict__ cos_sin_cache = nullptr,
-                                          const int64_t* __restrict__ position_ids = nullptr,
-                                          int head_dim = 0,
-                                          int rotary_dim = 0)
+                                          const T* __restrict__ cos_sin_cache,
+                                          const int64_t* __restrict__ position_ids,
+                                          int head_dim,
+                                          int rotary_dim)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int hidden_dim_qk       = hidden_dim_q + hidden_dim_k;
@@ -2404,7 +2404,7 @@ __global__ void __launch_bounds__(1024, 1)
 #pragma unroll
             for(int v = 0; v < pack_size; ++v)
                 vec[v] = downcast_s<T>(acc[v] * denom * weight_p[v]);
-            if constexpr (USE_ROPE_CACHE) {
+            if constexpr (FUSE_ROPE) {
                 const int access_id_in_head = access_id_in_token % head_dim;
                 vec = apply_neox_rope_pack<T, pack_size>(
                     vec,
@@ -2423,7 +2423,7 @@ __global__ void __launch_bounds__(1024, 1)
 #pragma unroll
             for(int v = 0; v < pack_size; ++v)
                 vec[v] = downcast_s<T>(acc[v] * denom * weight_p[v]);
-            if constexpr (USE_ROPE_CACHE) {
+            if constexpr (FUSE_ROPE) {
                 const int k_access = access_id_in_token - hidden_dim_q;
                 const int access_id_in_head = k_access % head_dim;
                 vec = apply_neox_rope_pack<T, pack_size>(
@@ -2443,7 +2443,7 @@ __global__ void __launch_bounds__(1024, 1)
     }
 }
 
-template <typename T, int NGPUS>
+template <typename T, int NGPUS, bool FUSE_ROPE>
 void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                              RankSignals sg,
                                              Signal* self_sg,
@@ -2459,6 +2459,10 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                              int hidden_dim_k,
                                              int hidden_dim_v,
                                              float eps,
+                                             const T* cos_sin_cache,
+                                             const int64_t* position_ids,
+                                             int head_dim,
+                                             int rotary_dim,
                                              hipStream_t stream)
 {
     constexpr int PACK_SIZE      = 16 / sizeof(T);
@@ -2473,7 +2477,7 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
     dim3 threadsPerBlock(BLOCK_SIZE);
     int grid_blocks = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(grid_blocks);
-    qknorm_allreduce_fusion_kernel_2stage<T, NGPUS, WARP_SIZE>
+    qknorm_allreduce_fusion_kernel_2stage<T, NGPUS, WARP_SIZE, FUSE_ROPE>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
                                                     sg,
                                                     self_sg,
@@ -2488,7 +2492,11 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                                     hidden_dim_q,
                                                     hidden_dim_k,
                                                     hidden_dim_v,
-                                                    eps);
+                                                    eps,
+                                                    cos_sin_cache,
+                                                    position_ids,
+                                                    head_dim,
+                                                    rotary_dim);
 }
 
 template <typename T, typename OutT, int ngpus>
@@ -4159,7 +4167,7 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
 #undef DISPATCH_AR_FUSION_MXFP4_KERNEL
 }
 
-template <typename T>
+template <typename T, bool FUSE_ROPE>
 void dispatchFusedQKNormAllReduce(hipStream_t stream,
                                   T* qkv_in,
                                   T* q_w,
@@ -4171,7 +4179,11 @@ void dispatchFusedQKNormAllReduce(hipStream_t stream,
                                   int hidden_dim_q,
                                   int hidden_dim_k,
                                   int hidden_dim_v,
-                                  float eps)
+                                  float eps,
+                                  T* cos_sin_cache,
+                                  int64_t* position_ids,
+                                  int head_dim,
+                                  int rotary_dim)
 {
     auto d = 16 / sizeof(T);
     if(hidden_dim_q % d != 0 || hidden_dim_k % d != 0 || hidden_dim_v % d != 0)
@@ -4182,25 +4194,29 @@ void dispatchFusedQKNormAllReduce(hipStream_t stream,
     }
     RankData* ptrs = get_buffer_RD(stream, qkv_in);
 
-#define DISPATCH_QKNORM_AR_FUSION_KERNEL(NGPUS)                                \
-    {                                                                          \
-        qknorm_allreduce_fusion_kernel_2stage_launcher<T, NGPUS>(ptrs,         \
-                                                                 sg_,          \
-                                                                 self_sg_,     \
-                                                                 rank_,        \
-                                                                 qkv_in,       \
-                                                                 q_w,          \
-                                                                 k_w,          \
-                                                                 q_out,        \
-                                                                 k_out,        \
-                                                                 v_out,        \
-                                                                 token_num,    \
-                                                                 hidden_dim_q, \
-                                                                 hidden_dim_k, \
-                                                                 hidden_dim_v, \
-                                                                 eps,          \
-                                                                 stream);      \
-        return;                                                                \
+#define DISPATCH_QKNORM_AR_FUSION_KERNEL(NGPUS)                                   \
+    {                                                                             \
+        qknorm_allreduce_fusion_kernel_2stage_launcher<T, NGPUS, FUSE_ROPE>(ptrs, \
+                                                                 sg_,             \
+                                                                 self_sg_,        \
+                                                                 rank_,           \
+                                                                 qkv_in,          \
+                                                                 q_w,             \
+                                                                 k_w,             \
+                                                                 q_out,           \
+                                                                 k_out,           \
+                                                                 v_out,           \
+                                                                 token_num,       \
+                                                                 hidden_dim_q,    \
+                                                                 hidden_dim_k,    \
+                                                                 hidden_dim_v,    \
+                                                                 eps,             \
+                                                                 cos_sin_cache,   \
+                                                                 position_ids,    \
+                                                                 head_dim,        \
+                                                                 rotary_dim,      \
+                                                                 stream);         \
+        return;                                                                   \
     }
 
     switch(world_size_)
