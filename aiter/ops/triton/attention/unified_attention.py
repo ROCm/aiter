@@ -1,5 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import os
+import warnings
 import triton
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -32,6 +34,81 @@ DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
+
+
+# Expert-only deployment overrides for the non-gfx12 Triton UA path.
+# Unset or malformed values are ignored so default heuristics are preserved.
+def _env_int(name, *, min_value=None, max_value=None):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        warnings.warn(f"Ignoring {name}: expected integer, got {value!r}")
+        return None
+    if min_value is not None and parsed < min_value:
+        warnings.warn(f"Ignoring {name}: expected >= {min_value}, got {parsed}")
+        return None
+    if max_value is not None and parsed > max_value:
+        warnings.warn(f"Ignoring {name}: expected <= {max_value}, got {parsed}")
+        return None
+    return parsed
+
+
+def _env_power_of_2_int(name, *, min_value=1, max_value=None):
+    value = _env_int(name, min_value=min_value, max_value=max_value)
+    if value is not None and value & (value - 1):
+        warnings.warn(f"Ignoring {name}: expected power of two, got {value}")
+        return None
+    return value
+
+
+def _env_kernel_override():
+    value = os.environ.get("AITER_UA_KERNEL", "auto").strip().lower()
+    if value == "":
+        return "auto"
+    if value not in ("auto", "2d", "3d"):
+        warnings.warn(
+            f"Ignoring AITER_UA_KERNEL: expected auto, 2d, or 3d, got {value!r}"
+        )
+        return "auto"
+    return value
+
+
+_UA_KERNEL_OVERRIDE = _env_kernel_override()
+_UA_TARGET_CU_MULTIPLIER = _env_int("AITER_UA_TARGET_CU_MULTIPLIER", min_value=1)
+
+_UA_2D_OVERRIDES = {
+    "TILE_SIZE": _env_power_of_2_int("AITER_UA_2D_TILE_SIZE"),
+    "num_warps": _env_power_of_2_int("AITER_UA_2D_NUM_WARPS", max_value=32),
+    "num_stages": _env_int("AITER_UA_2D_NUM_STAGES", min_value=1),
+    "waves_per_eu": _env_int("AITER_UA_2D_WAVES_PER_EU", min_value=0),
+}
+
+_UA_3D_ATTN_OVERRIDES = {
+    "TILE_SIZE": _env_power_of_2_int("AITER_UA_3D_TILE_SIZE"),
+    "NUM_SEGMENTS_PER_SEQ": _env_power_of_2_int(
+        "AITER_UA_3D_NUM_SEGMENTS", max_value=128
+    ),
+    "num_warps": _env_power_of_2_int("AITER_UA_3D_NUM_WARPS", max_value=32),
+    "num_stages": _env_int("AITER_UA_3D_NUM_STAGES", min_value=1),
+    "waves_per_eu": _env_int("AITER_UA_3D_WAVES_PER_EU", min_value=0),
+}
+
+
+def _apply_env_overrides(config, overrides):
+    for key, value in overrides.items():
+        if value is not None:
+            config[key] = value
+    return config
+
+
+def _validate_tile_override(name, tile_size, block_size, shuffled_kv_cache):
+    if tile_size is None:
+        return
+    if shuffled_kv_cache and tile_size != block_size:
+        raise ValueError(f"{name} must equal block_size when shuffled_kv_cache=True")
 
 
 def is_2d_gluon_available(
@@ -104,7 +181,7 @@ def select_2d_config(
     elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
         TILE_SIZE = max(32, TILE_SIZE)
 
-    return {
+    config = {
         "BLOCK_M": BLOCK_M,
         "BLOCK_Q": BLOCK_Q,
         "TILE_SIZE": TILE_SIZE,
@@ -112,6 +189,15 @@ def select_2d_config(
         "num_stages": num_stages_2d,
         "waves_per_eu": waves_per_eu,
     }
+    if not IS_DEVICE_ARCH_GFX12:
+        _validate_tile_override(
+            "AITER_UA_2D_TILE_SIZE",
+            _UA_2D_OVERRIDES["TILE_SIZE"],
+            block_size,
+            shuffled_kv_cache,
+        )
+        _apply_env_overrides(config, _UA_2D_OVERRIDES)
+    return config
 
 
 def select_3d_config(
@@ -233,6 +319,22 @@ def select_3d_config(
         "num_stages": 1,
     }
 
+    if not IS_DEVICE_ARCH_GFX12:
+        _validate_tile_override(
+            "AITER_UA_3D_TILE_SIZE",
+            _UA_3D_ATTN_OVERRIDES["TILE_SIZE"],
+            block_size,
+            shuffled_kv_cache,
+        )
+        _apply_env_overrides(attn_config, _UA_3D_ATTN_OVERRIDES)
+        reduce_config["TILE_SIZE"] = attn_config["TILE_SIZE"]
+        reduce_config["NUM_SEGMENTS_PER_SEQ"] = attn_config["NUM_SEGMENTS_PER_SEQ"]
+        max_segments = min(128, math.ceil(max_seqlen_k / attn_config["TILE_SIZE"]))
+        min_segments = min(8, max_segments)
+        reduce_config["num_warps"] = (
+            1 if attn_config["NUM_SEGMENTS_PER_SEQ"] == min_segments else 2
+        )
+
     return attn_config, reduce_config
 
 
@@ -349,7 +451,7 @@ def unified_attention(
         target_num_prgms = 256
     else:
         cu_count = get_num_sms()
-        target_num_prgms = cu_count * 4
+        target_num_prgms = cu_count * (_UA_TARGET_CU_MULTIPLIER or 4)
     ALL_DECODE = max_seqlen_q == 1
     if ALL_DECODE:
         total_num_q_blocks = num_seqs
@@ -358,7 +460,7 @@ def unified_attention(
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = int(max_seqlen_q) == 1
     # if batch contains a prefill
-    if use_2d_kernel(
+    use_2d = use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
@@ -366,7 +468,13 @@ def unified_attention(
         max_seqlen_k,
         target_num_prgms,
         num_2d_prgms,
-    ):
+    )
+    if not IS_DEVICE_ARCH_GFX12 and _UA_KERNEL_OVERRIDE == "2d":
+        use_2d = True
+    elif not IS_DEVICE_ARCH_GFX12 and _UA_KERNEL_OVERRIDE == "3d":
+        use_2d = False
+
+    if use_2d:
 
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
         # sinks / output_scale / shuffled_kv_cache)
