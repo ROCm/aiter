@@ -39,7 +39,6 @@ from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_rebased_cu_seqlens,
 )
 
-
 # The K5 kernel passes every tensor slot as ``fx.Pointer`` (raw data pointer).
 # The kernel body wraps each one as ``GTensor(..., shape=(-1,))`` and never
 # reads the FlyDSL memref shape/stride, so the pointer ABI produces identical
@@ -49,9 +48,7 @@ from ..triton._triton_kernels.gated_delta_rule.utils import (
 # ``PointerAdaptor`` fast dispatch) only exists from 0.2.0, so this op alone
 # requires 0.2.0 (the rest of aiter.ops.flydsl only needs >=0.1.8).
 _K5_MIN_FLYDSL_VERSION = Version("0.2.0")
-_installed_flydsl_version = Version(
-    getattr(flydsl, "__version__", "0").split("+")[0]
-)
+_installed_flydsl_version = Version(getattr(flydsl, "__version__", "0").split("+")[0])
 if _installed_flydsl_version < _K5_MIN_FLYDSL_VERSION:
     raise ImportError(
         "FlyDSL K5 linear-attention prefill requires `flydsl` "
@@ -68,6 +65,7 @@ def _as_ptr(t: torch.Tensor):
     irrelevant to codegen and only needs to be a valid 1-byte unit.
     """
     return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+
 
 # log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
 # place of exp(g) (matches the Triton VK / HIP K5 convention).
