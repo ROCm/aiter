@@ -149,4 +149,9 @@ def str2ActivationType(s):
         "swiglu": ActivationType.Swiglu,
         "swiglustep": ActivationType.SwigluStep,
     }
-    return mapping[s.lower()]
+    key = s.lower()
+    if key not in mapping:
+        raise argparse.ArgumentTypeError(
+            f"invalid activation type {s!r}; choose from {sorted(mapping)}"
+        )
+    return mapping[key]
