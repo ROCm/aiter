@@ -38,6 +38,7 @@ def mhc_pre_big_fuse(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
+    use_nt: int = -1,
 ) -> None: ...
 
 
@@ -63,6 +64,9 @@ def mhc_pre_big_fuse_rmsnorm(
 
 @functools.lru_cache(maxsize=1024)
 def get_mhc_pre_splitk(m: int, hc_hidden_size: int) -> tuple[int, int]:
+    if get_gfx_runtime() == "gfx950" and m >= 8192 and hc_hidden_size % (8 * 64) == 0:
+        return 8, 64
+
     prefetch_stages = 2
     tile_m = 16 * 4
     num_cu = get_cu_num()
@@ -337,7 +341,136 @@ def mhc_post(
     residual: Tensor,
     post_layer_mix: Tensor,
     comb_res_mix: Tensor,
+    store_nt: int = -1,
 ) -> None: ...
+
+
+@compile_ops("module_mhc")
+def mhc_post_pre_hybrid(
+    residual_out: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    layer_input: Tensor,
+    gemm_out_mul: Tensor,
+    gemm_out_sqrsum: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+    fn: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    tile_k: int,
+    post_store_nt: int,
+    norm_weight: Optional[Tensor] = None,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    norm_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+) -> None: ...
+
+
+def _mhc_big_fuse_nt(m: int) -> int:
+    return 2 if m == 8 * get_cu_num() else -1
+
+
+def _mhc_fused_post_pre_large_m_hybrid(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: Optional[torch.Tensor],
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    m = residual_in.size(0)
+    hc_mult = residual_in.size(1)
+    hidden_size = residual_in.size(2)
+    hc_mult3 = fn.size(0)
+    hc_hidden_size = hc_mult * hidden_size
+    device = residual_in.device
+
+    if post_layer_mix.ndim == 3:
+        post_layer_mix = post_layer_mix.squeeze(-1)
+    if not post_layer_mix.is_contiguous():
+        post_layer_mix = post_layer_mix.contiguous()
+    if not comb_res_mix.is_contiguous():
+        comb_res_mix = comb_res_mix.contiguous()
+    if not residual_in.is_contiguous():
+        residual_in = residual_in.contiguous()
+    if not layer_input.is_contiguous():
+        layer_input = layer_input.contiguous()
+    if not fn.is_contiguous():
+        fn = fn.contiguous()
+    if norm_weight is not None and not norm_weight.is_contiguous():
+        norm_weight = norm_weight.contiguous()
+
+    selected_splitk, selected_tile_k = get_mhc_pre_splitk(m, hc_hidden_size)
+    next_residual = torch.empty_like(residual_in)
+    gemm_out = torch.empty(
+        selected_splitk, m, hc_mult3, dtype=dtypes.fp32, device=device
+    )
+    gemm_out_sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
+    layer_input_out = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
+
+    post_store_nt = 0 if m > 8 * get_cu_num() else -1
+    mhc_post(
+        next_residual,
+        layer_input,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        post_store_nt,
+    )
+    mhc_pre_gemm_sqrsum(gemm_out, gemm_out_sqrsum, next_residual, fn, selected_tile_k)
+    big_fuse_nt = _mhc_big_fuse_nt(m)
+    if norm_weight is not None:
+        mhc_pre_big_fuse_rmsnorm(
+            post_mix,
+            comb_mix,
+            layer_input_out,
+            gemm_out,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            next_residual,
+            norm_weight,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            norm_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+    else:
+        mhc_pre_big_fuse(
+            post_mix,
+            comb_mix,
+            layer_input_out,
+            gemm_out,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            next_residual,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            big_fuse_nt,
+        )
+    return post_mix, comb_mix, layer_input_out, next_residual
 
 
 @compile_ops("module_mhc")
@@ -448,6 +581,24 @@ def mhc_fused_post_pre(
             norm_eps,
         )
         return post_mix, comb_mix, layer_input_out, next_residual
+
+    if force_fused and arch == "gfx950" and m >= fused_m_upper_bound:
+        return _mhc_fused_post_pre_large_m_hybrid(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
 
     assert layer_input.shape == (
         m,
