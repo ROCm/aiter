@@ -208,3 +208,31 @@ Still genuinely open: which avenue ships to production (FlyDSL→CKTile recommen
     1.13-1.21×. The 2× target needs a *structural* amortization lever (#12 B-stationary multi-M-tile:
     load Dense[b] once, run several M-tiles to keep the pipeline warm) — the remaining big idea, since
     every knob-level lever is now exhausted or occupancy-capped.
+- **2026-06-10 (loop session, batch 2 + profiling + structural)** — Continued the loop.
+  - **Profiled B1024_D512 (rocprofv3 PMC):** OccupancyPercent=**23.5%**, MeanOccupancyPerActiveCU=1.93
+    waves, VALUBusy=17%, MFMA low, MemUnitStalled=**4%**, LDSBankConflict=2.3%. Verdict: the kernel
+    is **occupancy-limited with all execution units idle** — overhead/latency-bound, occupancy capped
+    by VGPR pressure (the C accumulator is BLOCK_M·BLOCK_N/THREADS = 64 fp32/thread). Device p10
+    (12.06ms) ≈ do_bench (12.24ms) → host launch overhead is negligible.
+  - **Skew regime gates re-derived for gfx942 (KEPT, +20%):** the persist-vs-static and skew-remap
+    gates were gfx950 decisions. Re-measured (`_regime_gates.py`, do_bench): the **persistent kernel
+    LOSES on every gfx942 skew shape** (B1024_D256: persist 1.045 > static-off 0.904 > remap-ON 0.857).
+    Gated persist to gfx95x only; routed B1024_D256 skew → static remap-ON (xcd_c=32). **B1024_D256
+    skew 1.051→0.873 (+20%), now 1.17× faster than Triton (was a tie).** Dispatch test passes.
+  - **Batch-2 fan-out (4 LDS-neutral levers) — all DISCARDED:** warp (2,2,1) (compile-fails — C-shuffle
+    epilogue hardcodes the (1,4,1) all-N split), warp (4,1,1) (cos=1.0 but −46-70%, all-M serializes
+    N-MFMA + kills store coalescing), A-staging global→reg (cos=1.0 but −50-78%: freeing 32KB LDS
+    doesn't help because per-thread A fragments then blow VGPR — VGPR is the real wall, the LDS A
+    buffer was load-balancing register pressure), THREADS=512 w/ (1,8,1) (cos=1.0 but +1-5% slower).
+  - **#12 B-stationary multi-M-tile (structural) — DISCARDED:** grid-shrink + inner unrolled M-tile loop,
+    correct everywhere (cos=1.0 both regimes incl. skew empty/partial), but −1-7% uniform / marginal
+    skew. The reframe it gave: **on uniform every M-tile is already occupied, so fewer/bigger blocks
+    LOWER pipeline fill instead of amortizing it — the kernel wants MORE concurrent blocks, not fewer.**
+    Only over-subscribed large-B skew showed a small win (B1024_D256 +6% @P=4), not worth a regime default.
+  - **BLOCK_N=64 (more blocks + less VGPR) — DISCARDED:** halves C-accumulator VGPR (64→32 fp32/thr)
+    AND doubles N-blocks, both the directions profiling + #12 pointed to, but −7-15% uniform: 2× more
+    N-blocks each pay a full LDS C-shuffle epilogue, and that fixed cost multiplies with block count.
+  - **Standing:** the C-shuffle epilogue fixed cost is the floor — it can't be amortized by *fewer*
+    blocks (#12: fill drops) nor by *more smaller* blocks (BLOCK_N=64: epilogue multiplies). The
+    genuine remaining structural idea is a **cheaper epilogue** (direct register→global store at small
+    N, skipping the LDS C-shuffle) so the per-block fixed cost itself shrinks — the next lever to try.
