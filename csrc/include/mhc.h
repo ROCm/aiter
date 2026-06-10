@@ -23,8 +23,7 @@ void mhc_pre_big_fuse(torch::Tensor& post_mix,        // (m, hc_mult)
                       float hc_pre_eps         = 1e-6,
                       float hc_sinkhorn_eps    = 1e-6,
                       float hc_post_mult_value = 1.0,
-                      int sinkhorn_repeat      = 20,
-                      int use_nt               = -1);
+                      int sinkhorn_repeat      = 20);
 void mhc_pre_big_fuse_rmsnorm(torch::Tensor& post_mix,        // (m, hc_mult)
                               torch::Tensor& comb_mix,        // (m, hc_mult * hc_mult)
                               torch::Tensor& out,             // (m, hidden_size)
@@ -58,27 +57,4 @@ void mhc_fused_post_pre_gemm_sqrsum(
     int tile_m                       = 16,
     int tile_n                       = 32,
     int tile_k                       = 32);
-// gfx950 large-M path (M > 1024): additive kernels, PR #3623 kernels unchanged.
-void mhc_post_pre_large_m(torch::Tensor& residual_out,
-                          torch::Tensor& post_mix,
-                          torch::Tensor& comb_mix,
-                          torch::Tensor& layer_input,
-                          torch::Tensor& gemm_out_mul,
-                          torch::Tensor& gemm_out_sqrsum,
-                          torch::Tensor& x,
-                          torch::Tensor& residual,
-                          torch::Tensor& post_layer_mix,
-                          torch::Tensor& comb_res_mix,
-                          torch::Tensor& fn,
-                          torch::Tensor& hc_scale,
-                          torch::Tensor& hc_base,
-                          int tile_k,
-                          int post_store_nt,
-                          c10::optional<torch::Tensor> norm_weight,
-                          float rms_eps            = 1e-6,
-                          float hc_pre_eps         = 1e-6,
-                          float hc_sinkhorn_eps    = 1e-6,
-                          float norm_eps           = 1e-6,
-                          float hc_post_mult_value = 1.0,
-                          int sinkhorn_repeat      = 20);
 } // namespace aiter

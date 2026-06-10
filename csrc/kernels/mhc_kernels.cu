@@ -383,47 +383,7 @@ namespace aiter {
         // return res;
     }
 
-    static inline bool resolve_gemm_out_store_nt(int m, int cu_num)
-    {
-        (void)m;
-        (void)cu_num;
-        return false;
-    }
-
-    static inline bool resolve_medium_m(int m, int cu_num)
-    {
-        return m == 2 * cu_num || m == 4 * cu_num;
-    }
-
-    static inline bool resolve_gemm_out_load_nt(int m, int cu_num)
-    {
-        if (resolve_medium_m(m, cu_num)) {
-            return false;
-        }
-        return resolve_gemm_out_store_nt(m, cu_num);
-    }
-
-    static inline void resolve_big_fuse_cache_policies(
-        int use_nt, int m, int cu_num, bool& residual_nt, bool& layer_nt)
-    {
-        if (use_nt == 2) {
-            layer_nt = (m >= 4 * cu_num);
-            residual_nt = (m > 8 * cu_num);
-        } else if (use_nt < 0) {
-            residual_nt = layer_nt = (m >= 8 * cu_num);
-        } else {
-            residual_nt = layer_nt = (use_nt != 0);
-        }
-    }
-
-    template <typename DTYPE_I,
-              int block_size,
-              int hc_mult,
-              int num_rows,
-              int residual_block,
-              bool gemm_load_nt,
-              bool residual_nt,
-              bool layer_nt>
+    template <typename DTYPE_I, int block_size, int hc_mult, int num_rows, int residual_block, bool use_nt>
     __global__ __launch_bounds__(block_size,2)
     void mhc_pre_big_fuse_kernel(
         float* post_mix,
@@ -447,9 +407,7 @@ namespace aiter {
         int sub_hidden_size
     )
     {
-        static constexpr int gemm_cache_policy = gemm_load_nt ? GROUP_NT : RT;
-        static constexpr int res_cache_policy = residual_nt ? GROUP_NT : RT;
-        static constexpr int layer_cache_policy = layer_nt ? GROUP_NT : RT;
+        static constexpr int cache_policy = use_nt ? GROUP_NT : RT;
         using opus::operator""_I;
         static constexpr int warp_size = opus::get_warp_size();
         constexpr int warp_num = block_size / warp_size;
@@ -506,12 +464,10 @@ namespace aiter {
         for(int j = 0; j < num_rows; j++) { v_sq[j] = 0.0f; }
         const bool has_sq0 = threadIdx.x < n_splits;
         if(has_sq0) {
-            v_sq = load<num_rows>(buffer_gemm_out_sqrsum, threadIdx.x * m, 0,
-                                  opus::number<gemm_cache_policy>{});
+            v_sq = load<num_rows>(buffer_gemm_out_sqrsum, threadIdx.x * m);
         }
         for(int split_idx = threadIdx.x + block_size; split_idx < n_splits; split_idx += block_size) {
-            rms_load_t vt = load<num_rows>(buffer_gemm_out_sqrsum, split_idx * m, 0,
-                                           opus::number<gemm_cache_policy>{});
+            rms_load_t vt = load<num_rows>(buffer_gemm_out_sqrsum, split_idx * m);
             #pragma unroll
             for(int j = 0; j < num_rows; j++) { rms_acc[j] += vt[j]; }
         }
@@ -533,8 +489,7 @@ namespace aiter {
                     for(int u = 0; u < gemm_split_unroll; u++) {
                         const int s = split_base + u * reduce_splits_per_round;
                         v_tmp[u] = load<4>(buffer_gemm_out_mul,
-                                           s * m * gemm_out_mul_stride + row_off, 0,
-                                           opus::number<gemm_cache_policy>{});
+                                           s * m * gemm_out_mul_stride + row_off);
                     }
                     __builtin_amdgcn_sched_barrier(0);
                     #pragma unroll
@@ -641,7 +596,7 @@ namespace aiter {
             auto load_res_loop = [&](int i) {
                 res_vec_t v_res;
                 if (i < out_loop) {
-                    v_res = load_vector_nbytes<DTYPE_I, res_vec_size, res_load_bytes, res_cache_policy, false>(
+                    v_res = load_vector_nbytes<DTYPE_I, res_vec_size, res_load_bytes, cache_policy, false>(
                         buffer_res,
                         res_row_id * residual_stride + res_hc_id * residual_hc_stride +
                         i * residual_block + K_swizzled);
@@ -659,7 +614,7 @@ namespace aiter {
                 if(threadIdx.x % hc_mult != 0) {
                     out_offset = -1;
                 }
-                store_vector_nbytes<DTYPE_I, DTYPE_I, res_vec_size, res_load_bytes, layer_cache_policy, false>(buffer_layer_input, v_res, out_offset, 0);
+                store_vector_nbytes<DTYPE_I, DTYPE_I, res_vec_size, res_load_bytes, cache_policy, false>(buffer_layer_input, v_res, out_offset, 0);
             };
 
             res_vec_t v_res0 = load_res_loop(0);
@@ -724,7 +679,7 @@ namespace aiter {
         }
     }
 
-#define MHC_PRE_BIG_FUSE_KERNEL_IMPL_(block_size, hc_mult, num_rows, residual_block, gemm_nt, res_nt, layer_nt) \
+#define MHC_PRE_BIG_FUSE_KERNEL_IMPL_(block_size, hc_mult, num_rows, residual_block, use_nt) \
     TORCH_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
     TORCH_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
     int m_blocks = (m + num_rows - 1) / num_rows; \
@@ -740,7 +695,7 @@ namespace aiter {
     dim3 block(block_size); \
     AITER_DISPATCH_FLOATING16_TYPES(layer_input.scalar_type(), "mhc_pre_big_fuse", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
-        mhc_pre_big_fuse_kernel<DTYPE_I, block_size, hc_mult, num_rows, residual_block, gemm_nt, res_nt, layer_nt><<<grid, block, 0, stream>>>( \
+        mhc_pre_big_fuse_kernel<DTYPE_I, block_size, hc_mult, num_rows, residual_block, use_nt><<<grid, block, 0, stream>>>( \
             reinterpret_cast<float*>(post_mix.data_ptr()), \
             reinterpret_cast<float*>(comb_mix.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(layer_input.data_ptr()), \
@@ -763,58 +718,19 @@ namespace aiter {
         ); \
     });
 
-#define MHC_PRE_BIG_FUSE_KERNEL_IMPL_LEGACY(block_size, hc_mult, num_rows, residual_block, use_nt) \
-    MHC_PRE_BIG_FUSE_KERNEL_IMPL_(block_size, hc_mult, num_rows, residual_block, use_nt, use_nt, use_nt)
-
 #define MHC_PRE_BIG_FUSE_KERNEL_IMPL(block_size, hc_mult, num_rows, residual_block) \
     if (m >= 8 * cu_num) { \
-        MHC_PRE_BIG_FUSE_KERNEL_IMPL_LEGACY(block_size, hc_mult, num_rows, residual_block, true); \
+        MHC_PRE_BIG_FUSE_KERNEL_IMPL_(block_size, hc_mult, num_rows, residual_block, true); \
     } else { \
-        MHC_PRE_BIG_FUSE_KERNEL_IMPL_LEGACY(block_size, hc_mult, num_rows, residual_block, false); \
+        MHC_PRE_BIG_FUSE_KERNEL_IMPL_(block_size, hc_mult, num_rows, residual_block, false); \
     }
 
-#define MHC_PRE_BIG_FUSE_KERNEL_DISPATCH_CFG(block_size, hc_mult, num_rows, residual_block, gemm_nt, res_nt, layer_nt) \
-    do { \
-        if (res_nt) { \
-            if (layer_nt) { \
-                MHC_PRE_BIG_FUSE_KERNEL_IMPL_(block_size, hc_mult, num_rows, residual_block, gemm_nt, true, true); \
-            } else { \
-                MHC_PRE_BIG_FUSE_KERNEL_IMPL_(block_size, hc_mult, num_rows, residual_block, gemm_nt, true, false); \
-            } \
-        } else { \
-            if (layer_nt) { \
-                MHC_PRE_BIG_FUSE_KERNEL_IMPL_(block_size, hc_mult, num_rows, residual_block, gemm_nt, false, true); \
-            } else { \
-                MHC_PRE_BIG_FUSE_KERNEL_IMPL_(block_size, hc_mult, num_rows, residual_block, gemm_nt, false, false); \
-            } \
-        } \
-    } while (0)
-
-#define MHC_PRE_BIG_FUSE_KERNEL_DISPATCH_(m, res_nt, layer_nt, gemm_nt_val) \
-    do { \
-        if (gemm_nt_val) { \
-            if (m <= cu_num * 12 || get_gpu_arch() != "gfx942") { \
-                MHC_PRE_BIG_FUSE_KERNEL_DISPATCH_CFG((64 + 64 * 4), 4, 2, 256, true, res_nt, layer_nt); \
-            } else { \
-                MHC_PRE_BIG_FUSE_KERNEL_DISPATCH_CFG((64 + 64 * 2), 4, 2, 128, true, res_nt, layer_nt); \
-            } \
-        } else { \
-            if (m <= cu_num * 12 || get_gpu_arch() != "gfx942") { \
-                MHC_PRE_BIG_FUSE_KERNEL_DISPATCH_CFG((64 + 64 * 4), 4, 2, 256, false, res_nt, layer_nt); \
-            } else { \
-                MHC_PRE_BIG_FUSE_KERNEL_DISPATCH_CFG((64 + 64 * 2), 4, 2, 128, false, res_nt, layer_nt); \
-            } \
-        } \
-    } while (0)
-
 #define MHC_PRE_BIG_FUSE_KERNEL_DISPATCH(m) \
-    do { \
-        if (m >= 8 * cu_num) { \
-            MHC_PRE_BIG_FUSE_KERNEL_DISPATCH_(m, true, true, true); \
-        } else { \
-            MHC_PRE_BIG_FUSE_KERNEL_DISPATCH_(m, false, false, false); \
-        } \
-    } while (0)
+    if (m <= cu_num * 12 || get_gpu_arch() != "gfx942") { \
+        MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 4), 4, 2, 256); \
+    } else { \
+        MHC_PRE_BIG_FUSE_KERNEL_IMPL((64 + 64 * 2), 4, 2, 128); \
+    }
 
     void mhc_pre_big_fuse(
         torch::Tensor& post_mix, // (m, hc_mult)
@@ -829,8 +745,8 @@ namespace aiter {
         float hc_pre_eps = 1e-6,
         float hc_sinkhorn_eps = 1e-6,
         float hc_post_mult_value = 1.0,
-        int sinkhorn_repeat = 20,
-        int use_nt = -1)
+        int sinkhorn_repeat = 20
+    )
     {
         int m = residual.size(0);
         int residual_stride = residual.stride(0);
@@ -843,15 +759,8 @@ namespace aiter {
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(layer_input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
-        if (use_nt == -1) {
-            MHC_PRE_BIG_FUSE_KERNEL_DISPATCH(m);
-        } else {
-            bool residual_nt = false;
-            bool layer_nt = false;
-            resolve_big_fuse_cache_policies(use_nt, m, cu_num, residual_nt, layer_nt);
-            const bool gemm_nt = resolve_gemm_out_load_nt(m, cu_num);
-            MHC_PRE_BIG_FUSE_KERNEL_DISPATCH_(m, residual_nt, layer_nt, gemm_nt);
-        }
+
+        MHC_PRE_BIG_FUSE_KERNEL_DISPATCH(m);
     }
 
     template <typename DTYPE_I, int block_size, int hc_mult, int residual_block, bool store_nt>
@@ -2182,71 +2091,5 @@ namespace aiter {
         MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
     }
 
-
-
-    void mhc_post_pre_large_m(
-        torch::Tensor& residual_out,
-        torch::Tensor& post_mix,
-        torch::Tensor& comb_mix,
-        torch::Tensor& layer_input,
-        torch::Tensor& gemm_out_mul,
-        torch::Tensor& gemm_out_sqrsum,
-        torch::Tensor& x,
-        torch::Tensor& residual,
-        torch::Tensor& post_layer_mix,
-        torch::Tensor& comb_res_mix,
-        torch::Tensor& fn,
-        torch::Tensor& hc_scale,
-        torch::Tensor& hc_base,
-        int tile_k,
-        int post_store_nt,
-        c10::optional<torch::Tensor> norm_weight,
-        float rms_eps,
-        float hc_pre_eps,
-        float hc_sinkhorn_eps,
-        float norm_eps,
-        float hc_post_mult_value,
-        int sinkhorn_repeat)
-    {
-        const int m_rows = residual_out.size(0);
-        const int cu_num = get_num_cu_func();
-        const int big_fuse_nt = (m_rows == 8 * cu_num) ? 2 : -1;
-        mhc_post(residual_out, x, residual, post_layer_mix, comb_res_mix, post_store_nt);
-        mhc_pre_gemm_sqrsum(gemm_out_mul, gemm_out_sqrsum, residual_out, fn, tile_k);
-        if (norm_weight.has_value()) {
-            mhc_pre_big_fuse_rmsnorm(
-                post_mix,
-                comb_mix,
-                layer_input,
-                gemm_out_mul,
-                gemm_out_sqrsum,
-                hc_scale,
-                hc_base,
-                residual_out,
-                norm_weight.value(),
-                rms_eps,
-                hc_pre_eps,
-                hc_sinkhorn_eps,
-                norm_eps,
-                hc_post_mult_value,
-                sinkhorn_repeat);
-        } else {
-            mhc_pre_big_fuse(
-                post_mix,
-                comb_mix,
-                layer_input,
-                gemm_out_mul,
-                gemm_out_sqrsum,
-                hc_scale,
-                hc_base,
-                residual_out,
-                rms_eps,
-                hc_pre_eps,
-                hc_sinkhorn_eps,
-                hc_post_mult_value,
-                sinkhorn_repeat,
-                big_fuse_nt);
-        }
-    }
 
 } // namespace aiter

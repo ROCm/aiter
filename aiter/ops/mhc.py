@@ -38,7 +38,6 @@ def mhc_pre_big_fuse(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
-    use_nt: int = -1,
 ) -> None: ...
 
 
@@ -270,6 +269,7 @@ def mhc_pre(
     sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
+    large_m_splitk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -279,7 +279,10 @@ def mhc_pre(
         hc_mult3 == hc_mult and sinkhorn_repeat == 0
     )
     hc_hidden_size = hc_mult * hidden_size
-    selected_splitk, selected_tile_k = get_mhc_pre_splitk(m, hc_hidden_size)
+    if large_m_splitk:
+        selected_splitk, selected_tile_k = get_mhc_pre_splitk_large_m(m, hc_hidden_size)
+    else:
+        selected_splitk, selected_tile_k = get_mhc_pre_splitk(m, hc_hidden_size)
     device = residual.device
     out_pad = torch.empty(
         selected_splitk, m, (hc_mult3 + 31) // 32 * 32, dtype=dtypes.fp32, device=device
@@ -339,33 +342,6 @@ def mhc_post(
     post_layer_mix: Tensor,
     comb_res_mix: Tensor,
     store_nt: int = -1,
-) -> None: ...
-
-
-@compile_ops("module_mhc")
-def mhc_post_pre_large_m(
-    residual_out: Tensor,
-    post_mix: Tensor,
-    comb_mix: Tensor,
-    layer_input: Tensor,
-    gemm_out_mul: Tensor,
-    gemm_out_sqrsum: Tensor,
-    x: Tensor,
-    residual: Tensor,
-    post_layer_mix: Tensor,
-    comb_res_mix: Tensor,
-    fn: Tensor,
-    hc_scale: Tensor,
-    hc_base: Tensor,
-    tile_k: int,
-    post_store_nt: int,
-    norm_weight: Optional[Tensor] = None,
-    rms_eps: float = 1e-6,
-    hc_pre_eps: float = 1e-6,
-    hc_sinkhorn_eps: float = 1e-6,
-    norm_eps: float = 1e-6,
-    hc_post_mult_value: float = 1.0,
-    sinkhorn_repeat: int = 20,
 ) -> None: ...
 
 
@@ -437,13 +413,8 @@ def mhc_fused_post_pre_large_m(
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """gfx950 large-M post+pre (M > 1024): additive ``mhc_post_pre_large_m`` HIP kernel."""
+    """gfx950 large-M post+pre (M > 1024): upstream ``mhc_post`` + ``mhc_pre``."""
     m = residual_in.size(0)
-    hc_mult = residual_in.size(1)
-    hidden_size = residual_in.size(2)
-    hc_mult3 = fn.size(0)
-    hc_hidden_size = hc_mult * hidden_size
-    device = residual_in.device
 
     if post_layer_mix.ndim == 3:
         post_layer_mix = post_layer_mix.contiguous()
@@ -460,41 +431,29 @@ def mhc_fused_post_pre_large_m(
     if norm_weight is not None and not norm_weight.is_contiguous():
         norm_weight = norm_weight.contiguous()
 
-    selected_splitk, selected_tile_k = get_mhc_pre_splitk_large_m(m, hc_hidden_size)
     next_residual = torch.empty_like(residual_in)
-    gemm_out_pad = torch.empty(
-        selected_splitk, m, (hc_mult3 + 31) // 32 * 32, dtype=dtypes.fp32, device=device
-    )
-    gemm_out = gemm_out_pad[:, :, :hc_mult3]
-    gemm_out_sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
-    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
-    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
-    layer_input_out = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
-
     post_store_nt = 0 if m > 8 * get_cu_num() else -1
-    mhc_post_pre_large_m(
+    mhc_post(
         next_residual,
-        post_mix,
-        comb_mix,
-        layer_input_out,
-        gemm_out,
-        gemm_out_sqrsum,
         layer_input,
         residual_in,
         post_layer_mix,
         comb_res_mix,
+        post_store_nt,
+    )
+    post_mix, comb_mix, layer_input_out = mhc_pre(
+        next_residual,
         fn,
         hc_scale,
         hc_base,
-        selected_tile_k,
-        post_store_nt,
-        norm_weight,
         rms_eps,
         hc_pre_eps,
         hc_sinkhorn_eps,
-        norm_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        norm_weight,
+        norm_eps,
+        large_m_splitk=True,
     )
     return post_mix, comb_mix, layer_input_out, next_residual
 

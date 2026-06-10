@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """gfx950 large-M (M > 1024) mhc_post_pre kernel test.
 
-Exercises the additive ``mhc_fused_post_pre_large_m`` / ``mhc_post_pre_large_m`` path
+Exercises the gfx950 large-M ``mhc_fused_post_pre_large_m`` path
 without modifying PR #3623 kernels used at M <= 1024.
 """
 
