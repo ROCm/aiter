@@ -869,12 +869,16 @@ class AttentionProgram:
             ]
         )
 
-        seq_mask = seq_offset < (self.context_len_q_pos_qk + 1)
         if self.cfg.SLIDING_WINDOW > 0:
-            seq_mask = seq_mask & (
-                (self.context_len_q_pos_qk - seq_offset) < self.cfg.SLIDING_WINDOW
-            )
-        full_mask = seq_mask
+            # Band q_pos - SLIDING_WINDOW < seq_offset <= q_pos collapses to one
+            # unsigned compare: 0 <= (q_pos - seq_offset) < SLIDING_WINDOW. A
+            # negative distance (non-causal) wraps to a huge uint, so the causal
+            # upper bound is enforced for free.
+            full_mask = (self.context_len_q_pos_qk - seq_offset).to(
+                gl.uint32
+            ) < self.cfg.SLIDING_WINDOW
+        else:
+            full_mask = seq_offset < (self.context_len_q_pos_qk + 1)
         S = gl.where(full_mask, S, float("-inf"))
         return S
 
@@ -1139,11 +1143,13 @@ class AttentionProgram:
                 0, self.cfg.TILE_SIZE // 2, layout=gl.SliceLayout(0, self.cfg.qk_layout)
             )[None, :]
         )
-        seq_mask = seq_offset < (self.context_len_q_pos_qk + 1)
         if self.cfg.SLIDING_WINDOW > 0:
-            seq_mask = seq_mask & (
-                (self.context_len_q_pos_qk - seq_offset) < self.cfg.SLIDING_WINDOW
-            )
+            # Same band-as-unsigned-compare trick as apply_mask_qk.
+            seq_mask = (self.context_len_q_pos_qk - seq_offset).to(
+                gl.uint32
+            ) < self.cfg.SLIDING_WINDOW
+        else:
+            seq_mask = seq_offset < (self.context_len_q_pos_qk + 1)
         S = gl.where(seq_mask, S, float("-inf"))
         return S
 
@@ -2243,71 +2249,61 @@ def unified_attention(
         # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
         # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
         num_blocks, NUM_KV_HEADS, _, BLOCK_SIZE, K_WIDTH = k.shape
-        TILE_SIZE = 128
-        num_kv_blocks = TILE_SIZE // BLOCK_SIZE
     else:
         BLOCK_SIZE = k.shape[1]
         NUM_KV_HEADS = k.shape[2]
-        TILE_SIZE = BLOCK_SIZE
-        num_kv_blocks = 1
-    assert (
-        num_kv_blocks & (num_kv_blocks - 1) == 0
-    ), "num_kv_blocks must be a power of 2"
 
     SLIDING_WINDOW = 1 + window_size[0]
     ALL_DECODE = max_seqlen_q == 1
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
-    # Stash the values routed from collect_data_lds.sh before the inline
-    # auto-selection below overwrites the same-named locals. A pinned (non-None)
-    # value wins over the inline selection; None keeps the auto-selected default.
-    _pinned_num_warps = num_warps
-    _pinned_waves_per_eu = waves_per_eu
-    _pinned_tile_size = tile_size
-    # ---- inline config selection (overridden by collect_data_lds.sh when pinned) ----
-    num_warps = 4
-    waves_per_eu = 1
-    if SLIDING_WINDOW > 0:
-        _loop_variant = 0
-    if shuffled_kv_cache or TILE_SIZE > 32:
-        _loop_variant = 2
-    else:
-        _loop_variant = 0
+    # ---- Tunable selection --------------------------------------------------
+    # Auto-select every knob for the current regime, then let any caller-pinned
+    # value (routed from collect_data_lds.sh / run_kernel.py) override it. A
+    # None argument keeps the auto-selected value.
     if ALL_DECODE:
-        _loop_variant = 0
-        BLOCK_M = (
+        # Decode; sliding window shares the same config.
+        auto_loop_variant = 0
+        auto_block_m = (
             16
             if NUM_QUERIES_PER_KV <= 16
             else triton.next_power_of_2(NUM_QUERIES_PER_KV)
         )
-        if Q_FP8 and KV_FP8:
-            num_warps = 1
-            waves_per_eu = 2
-            TILE_SIZE = 128
-            target_wg_per_simd = 2
+        auto_num_warps = 1
+        auto_waves_per_eu = 2
+        auto_tile_size = 128 if (Q_FP8 and KV_FP8) else 64
+    elif SLIDING_WINDOW > 0:
+        # Prefill, sliding window.
+        auto_loop_variant = 0
+        auto_block_m = 64
+        auto_num_warps = 2
+        auto_waves_per_eu = 4
+        auto_tile_size = 128 if (Q_FP8 and KV_FP8) else 64
+    else:
+        # Prefill, full attention.
+        auto_loop_variant = 2
+        auto_block_m = 128
+        auto_num_warps = 4
+        auto_waves_per_eu = 2
+        auto_tile_size = 64
 
-        else:
-            num_warps = 1
-            waves_per_eu = 2
-            TILE_SIZE = 64
-            target_wg_per_simd = 1
-    
-    BLOCK_M = 128 if block_m == None else block_m
-    if loop_variant is None:
-        loop_variant = _loop_variant
-    # ---- routed from collect_data_lds.sh: pinned values override the above ----
-    if _pinned_num_warps is not None:
-        num_warps = _pinned_num_warps
-    if _pinned_waves_per_eu is not None:
-        waves_per_eu = _pinned_waves_per_eu
-    if _pinned_tile_size is not None:
-        TILE_SIZE = _pinned_tile_size
-        num_kv_blocks = TILE_SIZE // BLOCK_SIZE if shuffled_kv_cache else 1
-        assert (
-            num_kv_blocks & (num_kv_blocks - 1) == 0
-        ), "num_kv_blocks must be a power of 2"
+    num_warps = auto_num_warps if num_warps is None else num_warps
+    waves_per_eu = auto_waves_per_eu if waves_per_eu is None else waves_per_eu
+    BLOCK_M = auto_block_m if block_m is None else block_m
+    loop_variant = auto_loop_variant if loop_variant is None else loop_variant
+    TILE_SIZE = auto_tile_size if tile_size is None else tile_size
+
+    # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page.
+    if not shuffled_kv_cache:
+        TILE_SIZE = BLOCK_SIZE
+
+    num_kv_blocks = TILE_SIZE // BLOCK_SIZE if shuffled_kv_cache else 1
+    assert TILE_SIZE < 256, "TILE_SIZE must be less than 256"
     assert (
         TILE_SIZE >= BLOCK_SIZE
     ), f"TILE_SIZE={TILE_SIZE} must be multiple of PAGE_SIZE={BLOCK_SIZE}"
+    assert (
+        num_kv_blocks & (num_kv_blocks - 1) == 0
+    ), "num_kv_blocks must be a power of 2"
 
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
     # Upper bound on masked tiles. +1 because the causal diagonal isnt

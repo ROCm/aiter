@@ -1,7 +1,13 @@
 
 export PRINT_IRS=1
-for wpeu in 1; do
-for lenn in 1024; do
+# best prefill fp8 sliding win: BLOCK_M=64 num_warps=4, wpeu=4, loop=0 block_size=tile_size=128
+# best prefill bf16 sliding win: BLOCK_M=64 num_warps=4, wpeu=4, loop=0 block_size=tile_size=128
+
+# best prefill fp8, BLOCK_M=128, num_warps=4, wpeu=2, loop=2 block_size=tile_size=128
+# best prefill bf16, BLOCK_M=128, num_warps=4, wpeu=2, loop=2 block_size=tile_size=64
+
+for wpeu in 2; do
+for lenn in 4096; do
     seq_q_l=$lenn
     seq_kv_l=$lenn
 
@@ -9,9 +15,9 @@ for lenn in 1024; do
     num_heads_k=1
     bs=1
     window_size=0
-    block_size=128
-    tile_size=128
-    head_size=128
+    block_size=64
+    tile_size=64
+    head_size=64
     waves_per_eu=$wpeu
     num_warps=4
     BLOCK_M=128
@@ -52,7 +58,10 @@ for lenn in 1024; do
     source $TRITON_GFX1250_MODEL_PATH/am_env.sh
 
     rm -r ~/.triton/cache/
-    folder_name="6_13_${triton}_lp${loop_variant}_buf${num_buffer}_pg$((1 - remove_indirect))_cau${causal}_shfl${SHUFFLED_KV_CACHE}_qf8${Q_FP8}_kvf8${KV_FP8}_bm${BLOCK_M}_nw${NUM_WARPS}_weu${WAVES_PER_EU}_sq${seq_q_l}_sk${seq_kv_l}_nh${num_heads_q}_nk${num_heads_k}_bs${bs}_ws${window_size}_blk${block_size}_hs${head_size}_sp${num_splits}"
+    base="lp${loop_variant}_buf${num_buffer}_pg$((1 - remove_indirect))_cau${causal}_shfl${SHUFFLED_KV_CACHE}_qf8_${Q_FP8}_kvf8_${KV_FP8}_bm${BLOCK_M}_nw${NUM_WARPS}_weu${WAVES_PER_EU}_sq${seq_q_l}_sk${seq_kv_l}_nh${num_heads_q}_nk${num_heads_k}_bs${bs}_ws${window_size}_blk${block_size}_ts${tile_size}_hs${head_size}_sp${num_splits}"
+    folder_name="6_14_${triton}_${base}"
+    #ATT_trace_fold="att_${triton}_${base}"
+    ATT_trace_fold="ATT_trace"
     mkdir -p $folder_name
     cd $folder_name
     pip show triton > triton_version.txt
@@ -106,17 +115,24 @@ for lenn in 1024; do
     $TRITON_GFX1250_MODEL_PATH/tools/roccap/bin/roccap play -r "${GPUVM_BASE}-${GPUVM_SIZE}" ./${LARGEST_CAP}
     echo "After replay"
     echo "--------------------------------"
-    mkdir -p ATT_trace
+    mkdir -p ${ATT_trace_fold}
     $TRITON_GFX1250_MODEL_PATH/tools/roccap/bin/roccap extract --sp3 0- ${LARGEST_CAP} # whichever .cap file you used earlier for itrace
     $TRITON_GFX1250_MODEL_PATH/ffm-lite/sp3disasm ./roc-dump* ATT_trace.sp3
-    $TRITON_GFX1250_MODEL_PATH/tools/rcv/amtool ATT_trace *.mon ATT_trace.sp3
-
-    grep -A1 "WGP00" ./xcc0se0sa0_itrace_emu.mon > ./wgp0.txt
-    python3 ../gen_perfetto.py ./wgp0.txt ./${folder_name}.json
+    $TRITON_GFX1250_MODEL_PATH/tools/rcv/amtool ${ATT_trace_fold} *.mon ATT_trace.sp3
 
     python3 ../collect_results.py --draw_log ./draw.log --causal $causal --q_fp8 $q_fp8 --kv_fp8 $kv_fp8 --window_size $window_size --head_size $head_size --block_size $block_size --num_heads_q $num_heads_q --num_heads_k $num_heads_k --bs $bs --seq_q_l $seq_q_l --seq_kv_l $seq_kv_l > roofline.txt
+    # cleanup
+    rm *.mon
+    rm perf_counters.csv
+    rm perf_counters_absolute.txt 
+    rm perf_counters_miperf.csv
+    rm perf_counters_miperf_absolute.txt
+    rm gclog_params.json
+    rm runtime_params.conf
+    rm gclog_params.json
+    rm *.cap
 
-    #rm *.mon
     cd ../
+
 done
 done
