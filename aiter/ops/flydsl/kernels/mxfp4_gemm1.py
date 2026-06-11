@@ -81,7 +81,6 @@ BN_INT = BN // 2  # 128 (per-N-block intermediate width; BN-derived, INTER-indep
 # -- OUTPUT-side defaults (back-compat module globals = the *_for() helpers). --
 N_OUT = n_out_for(INTER)  # 1024
 NUM_N_BLOCKS = num_n_blocks_for(INTER)  # 4
-kBS_c_n1 = kbs_c_n1_for(INTER)  # 32
 OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(INTER)  # 128
 K_G2_HALF = k_g2_half_for(INTER)  # 256
 
@@ -124,7 +123,7 @@ def kbs_stride_n0_dw_for(k):
 
 
 def kbs_per_expert_dw_for(k, inter=INTER):
-    # depends on BOTH INTER (via kBS_c_n1) AND K (via kBS_stride_n0_dw).
+    # depends on BOTH INTER (via kbs_c_n1_for) AND K (via kbs_stride_n0_dw_for).
     return kbs_c_n1_for(inter) * kbs_stride_n0_dw_for(k)  # KIMI: 57344
 
 
@@ -144,9 +143,7 @@ def bscale_bytes_for(k, inter=INTER, ne=NE):
 K_HALF = k_half_for(K)  # 3584
 K_TILES_TOTAL = k_tiles_total_for(K)  # 28
 kUnroll = kunroll_for(K)  # 26
-kAS_c_k1 = kas_c_k1_for(K)  # 28
 kAS_per_chunk_dw = kas_per_chunk_dw_for(K)  # 1792
-kBS_c_k1 = kbs_c_k1_for(K)  # 28
 kBS_stride_n0_dw = kbs_stride_n0_dw_for(K)  # 1792
 kBS_per_expert_dw = kbs_per_expert_dw_for(K)  # 57344
 BQ_BYTES = bq_bytes_for(K)  # 1412956160
