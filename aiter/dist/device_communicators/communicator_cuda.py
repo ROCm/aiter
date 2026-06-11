@@ -241,6 +241,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
         prefill_support: bool = False,
         x_pad_to_multiple: int = 0,
+        emit_fp32: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from aiter.dist.device_communicators.custom_all_reduce import (
             can_pack_2d_last_dim_slice,
@@ -286,14 +287,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and can_use_custom_ar
             and ca_comm.should_custom_ar(input_, prefill_support)
         ):
-            out, res_out = ca_comm.custom_fused_ar_rms(
+            result = ca_comm.custom_fused_ar_rms(
                 input_,
                 res_inp_,
                 weight_,
                 eps,
                 use_1stage,
                 out_hidden_dim=out_n,
+                emit_fp32=emit_fp32,
             )
+            if emit_fp32:
+                out, res_out, fp32_out = result
+                assert out is not None and res_out is not None and fp32_out is not None
+                return out, res_out, fp32_out
+            out, res_out = result
             assert out is not None
             assert res_out is not None
             return out, res_out
@@ -316,6 +323,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             assert out is not None
             assert res_out is not None
+            if emit_fp32:
+                return out, res_out, out.float()
             return out, res_out
 
         input_for_ar = input_ if input_is_weak_contiguous else input_.contiguous()
@@ -347,6 +356,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             out = out_2d.reshape(input_.shape[:-1] + (out_2d.shape[-1],))
             residual_out = residual_out_2d.reshape(res_inp_.shape)
+            if emit_fp32:
+                return out, residual_out, out.float()
             return out, residual_out
 
         # call split kernel
@@ -363,6 +374,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             eps,
             0,
         )
+        if emit_fp32:
+            return out, residual_out, out.float()
         return out, residual_out
 
     def fused_allreduce_rmsnorm_quant(
@@ -375,6 +388,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         quant_type="per_token",
         group_size=128,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         quant_type = _normalize_fused_ar_rms_quant_type(quant_type)
         if quant_type == "per_group":
@@ -386,6 +400,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 group_size=group_size,
                 prefill_support=prefill_support,
                 emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale,
             )
         if quant_type == "mxfp4":
             return self.fused_allreduce_rmsnorm_mxfp4_quant(
@@ -432,6 +447,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         group_size=128,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         """Fused AR+RMSNorm+per-group FP8 quant, optionally also emitting the
         pre-quantization bf16/fp16 normed output.
@@ -458,29 +474,46 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 if self._ar_1stage_override is not None
                 else (total_bytes <= 128 * 1024)
             )
-            try:
-                result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
-                    input_,
-                    res_inp_,
-                    weight_,
-                    eps,
-                    group_size,
-                    use_1stage,
-                    emit_bf16=emit_bf16,
-                )
+            result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                group_size,
+                use_1stage,
+                emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale,
+            )
+            if result is not None:
                 if emit_bf16:
                     out, res_out, scale_out, bf16_out = result
                 else:
                     out, res_out, scale_out = result
                 fused_ok = True
-            except Exception:
-                pass
         if not fused_ok:
             out_, res_out = self.fused_allreduce_rmsnorm(
                 input_, res_inp_, weight_, eps, prefill_support
             )
             hip_quant = get_hip_quant(QuantType.per_1x128)
-            out, scale_out = hip_quant(out_, quant_dtype=fp8)
+            # The fused path and the registered op's fake return the per-group
+            # scale in column-major (1, M) layout (stride (1, M)) when
+            # transpose_scale=True. per_group_quant_hip cannot produce that
+            # stride directly (with transpose_scale=True it returns a contiguous
+            # (M, num_groups) buffer with SHUFFLED bytes -- a different physical
+            # arrangement). So compute the plain row-major scale and, when
+            # transpose_scale is requested, copy its values into a genuinely
+            # column-major (1, M)-strided tensor so the runtime stride/values
+            # match the fake (otherwise torch.compile's assert_size_stride fails
+            # or the GEMM reads the wrong layout).
+            out, scale_row = hip_quant(out_, quant_dtype=fp8, transpose_scale=False)
+            if transpose_scale:
+                M, num_groups = scale_row.shape
+                scale_out = torch.empty(
+                    (num_groups, M), dtype=scale_row.dtype, device=scale_row.device
+                ).transpose(0, 1)
+                scale_out.copy_(scale_row)
+            else:
+                scale_out = scale_row
             if emit_bf16:
                 bf16_out = out_
         assert out is not None

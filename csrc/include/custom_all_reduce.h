@@ -62,7 +62,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              double eps,
                              int64_t reg_ptr,
                              int64_t reg_bytes,
-                             bool use_1stage);
+                             bool use_1stage,
+                             int64_t fp32_out_ptr = 0);
 void fused_allreduce_rmsnorm_pad(fptr_t _fa,
                                  const aiter_tensor_t& inp,
                                  const aiter_tensor_t& res_inp,
@@ -96,7 +97,8 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t reg_ptr,
                                              int64_t reg_bytes,
                                              bool use_1stage,
-                                             int64_t bf16_out_ptr = 0);
+                                             int64_t bf16_out_ptr = 0,
+                                             bool transpose_scale = false);
 void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          const aiter_tensor_t& inp,
                                          const aiter_tensor_t& res_inp,

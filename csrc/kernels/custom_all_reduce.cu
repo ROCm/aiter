@@ -194,7 +194,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      void* scale_out, void* w,
                                      AiterDtype dtype, float eps,
                                      int m, int input_n, int n, int out_n,
-                                     bool use_1stage)
+                                     bool use_1stage,
+                                     void* fp32_out = nullptr)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -215,7 +216,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
             input_n,                                             \
             n,                                                   \
             out_n,                                               \
-            use_1stage);                                         \
+            use_1stage,                                          \
+            reinterpret_cast<float*>(fp32_out));                 \
     }                                                            \
     else                                                         \
     {                                                            \
@@ -497,7 +499,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& w,
                              double eps,
                              int64_t reg_ptr, int64_t reg_bytes,
-                             bool use_1stage)
+                             bool use_1stage,
+                             int64_t fp32_out_ptr)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -518,20 +521,28 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
             "fused allreduce rmsnorm requires residual input/output width == weight width");
     }
 
+    // fp32_out_ptr is an opaque float* (0 = not requested). When non-zero the
+    // plain (non-quant) fused kernel ALSO writes the unrounded fp32 normed
+    // output, letting downstream consumers (e.g. the MoE router gate) skip a
+    // separate hidden_states.float() cast.
+    void* fp32_out = reinterpret_cast<void*>(fp32_out_ptr);
+
     if(reg_ptr != 0)
     {
         _copy_input_to_registered_buffer(inp, m, input_n, stream, reg_ptr, reg_bytes);
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage);
+                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage,
+                                 fp32_out);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage);
+                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage,
+                                 fp32_out);
     }
 }
 
@@ -631,7 +642,8 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t group_size,
                                              int64_t reg_ptr, int64_t reg_bytes,
                                              bool use_1stage,
-                                             int64_t bf16_out_ptr)
+                                             int64_t bf16_out_ptr,
+                                             bool transpose_scale)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -669,7 +681,7 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
             reinterpret_cast<float*>(scale_out.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
             (float)eps, m, n, (int)group_size, use_1stage,
-            reinterpret_cast<opus::bf16_t*>(bf16_out));
+            reinterpret_cast<opus::bf16_t*>(bf16_out), transpose_scale);
         break;
     }
 #endif
@@ -683,7 +695,7 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
             reinterpret_cast<float*>(scale_out.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(w.data_ptr()),
             (float)eps, m, n, (int)group_size, use_1stage,
-            reinterpret_cast<opus::fp16_t*>(bf16_out));
+            reinterpret_cast<opus::fp16_t*>(bf16_out), transpose_scale);
         break;
     }
     default:
