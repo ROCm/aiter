@@ -2736,7 +2736,7 @@ void allreduce_fusion_kernel_2stage_per_group_launcher(
     dim3 numBlocks(token_num);
     size_t smem_size = BLOCK_SIZE * sizeof(typename opus::vector_t<T, PACK_SIZE>);
     auto launch = [&](auto ts_tag) {
-        constexpr w = decltype(ts_tag)::value;
+        constexpr bool TRANSPOSE_SCALE = decltype(ts_tag)::value;
         allreduce_fusion_kernel_2stage_per_group<T, OutT, NGPUS, TRANSPOSE_SCALE>
             <<<numBlocks, threadsPerBlock, smem_size, stream>>>(
                 _dp, sg, self_sg, rank,
