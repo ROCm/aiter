@@ -317,4 +317,276 @@ void gated_rmsnorm_fp8_group_quant(
     }
 }
 
+/**
+ * Fused Gated RMSNorm + FP8 PER-TOKEN Quantization Kernel
+ *
+ * Same gated RMSNorm math as the group variant (per-head RMSNorm over
+ * head_dim=128, then SiLU gating), but the FP8 quantization scale is computed
+ * ONCE PER TOKEN across the full flattened row [num_heads * head_dim], matching
+ * the per-token-activation + per-output-channel-weight a8w8 scheme. This means
+ * the downstream GEMM (per-channel weight scale x per-token act scale) is
+ * unchanged; only the activation production is fused.
+ *
+ * Layout:
+ * - One block per token. The block must cover ALL heads of the token so the
+ *   per-token amax can be reduced across heads (one quantization group = whole row).
+ * - Each warp holds groups_per_warp heads; block_size is chosen by the launcher so
+ *   groups_per_block >= num_heads (single pass, gated values kept in registers).
+ *
+ * Constraints:
+ * - ONLY supports head_dim=128 (RMSNorm group) and num_heads <= 128.
+ * - AMD GPU: warp_size=64.
+ */
+template <typename DTYPE_I, typename DTYPE_O, int GROUP_SIZE = 128, int THREAD_DATA_SIZE = 16>
+__global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
+    DTYPE_O* __restrict__ out,           // [num_tokens, num_heads * head_dim]
+    float* __restrict__ scale,           // [num_tokens]
+    DTYPE_I const* __restrict__ x,       // [num_tokens, num_heads, head_dim]
+    DTYPE_I const* __restrict__ z,       // [num_tokens, num_heads, head_dim]
+    DTYPE_I const* __restrict__ weight,  // [head_dim] - RMSNorm weight
+    double epsilon,
+    int num_tokens,
+    int num_heads,
+    int head_dim,
+    int64_t x_token_stride,
+    int64_t x_head_stride,
+    int64_t z_token_stride,
+    int64_t z_head_stride)
+{
+    static_assert(GROUP_SIZE == 128, "Only GROUP_SIZE=128 is supported");
+    static_assert(THREAD_DATA_SIZE >= 2 && THREAD_DATA_SIZE <= 32, "THREAD_DATA_SIZE must be 2-32");
+
+    constexpr int WARP_SIZE = 64;
+    constexpr int threads_per_group = GROUP_SIZE / THREAD_DATA_SIZE;  // threads cooperating on one head
+    constexpr int groups_per_warp = WARP_SIZE / threads_per_group;    // heads per warp
+    constexpr int MAX_WARPS = 16;                                     // num_heads <= 128 -> <= 16 warps
+
+    const int token_id = blockIdx.x;
+    if (token_id >= num_tokens) {
+        return;  // uniform across the block, safe before any __syncthreads
+    }
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+    const int num_warps = blockDim.x / WARP_SIZE;
+
+    const int thread_group_id = lane_id / threads_per_group;
+    const int thread_in_group = lane_id % threads_per_group;
+    const int head_id = warp_id * groups_per_warp + thread_group_id;
+
+    const bool valid = head_id < num_heads;
+    const int elem_id = thread_in_group * THREAD_DATA_SIZE;
+
+    // Gated RMSNorm values for this thread's slice (kept in registers for the
+    // second, quantization pass). Initialized so idle threads are harmless.
+    float gated_vals[THREAD_DATA_SIZE];
+    #pragma unroll
+    for (int i = 0; i < THREAD_DATA_SIZE; i++) {
+        gated_vals[i] = 0.0f;
+    }
+
+    float local_max = -INFINITY;
+
+    if (valid) {
+        const int64_t x_offset = static_cast<int64_t>(token_id) * x_token_stride
+                               + static_cast<int64_t>(head_id) * x_head_stride;
+        const int64_t z_offset = static_cast<int64_t>(token_id) * z_token_stride
+                               + static_cast<int64_t>(head_id) * z_head_stride;
+        const DTYPE_I* x_ptr = x + x_offset;
+        const DTYPE_I* z_ptr = z + z_offset;
+
+        float x_vals[THREAD_DATA_SIZE];
+        float z_vals[THREAD_DATA_SIZE];
+        float weight_vals[THREAD_DATA_SIZE];
+
+        #pragma unroll
+        for (int i = 0; i < THREAD_DATA_SIZE; i++) {
+            x_vals[i] = opus::cast<float>(x_ptr[elem_id + i]);
+            z_vals[i] = opus::cast<float>(z_ptr[elem_id + i]);
+            weight_vals[i] = opus::cast<float>(weight[elem_id + i]);
+        }
+
+        // Per-head RMSNorm: sum of squares reduced within the head's group only.
+        float sum_sq = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < THREAD_DATA_SIZE; i++) {
+            sum_sq += x_vals[i] * x_vals[i];
+        }
+        #pragma unroll
+        for (int mask = threads_per_group / 2; mask > 0; mask >>= 1) {
+            sum_sq += __shfl_xor(sum_sq, mask);
+        }
+
+        constexpr float inv_head_dim = 1.0f / static_cast<float>(GROUP_SIZE);
+        float variance = sum_sq * inv_head_dim;
+        float inv_std = rsqrtf(variance + static_cast<float>(epsilon));
+
+        // norm(x) * silu(z), and track this thread's local amax.
+        #pragma unroll
+        for (int i = 0; i < THREAD_DATA_SIZE; i++) {
+            float normed = x_vals[i] * weight_vals[i] * inv_std;
+            float sigmoid_z = 1.0f / (1.0f + expf(-z_vals[i]));
+            float silu_z = z_vals[i] * sigmoid_z;
+            gated_vals[i] = normed * silu_z;
+            local_max = fmaxf(local_max, fabsf(gated_vals[i]));
+        }
+    }
+
+    // Token-wide amax: reduce across the FULL warp (all heads in the warp)...
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        local_max = fmaxf(local_max, __shfl_xor(local_max, mask));
+    }
+    // ...then across warps via shared memory.
+    __shared__ float s_warp_max[MAX_WARPS];
+    if (lane_id == 0) {
+        s_warp_max[warp_id] = local_max;
+    }
+    __syncthreads();
+
+    float block_max = -INFINITY;
+    if (tid == 0) {
+        for (int w = 0; w < num_warps; w++) {
+            block_max = fmaxf(block_max, s_warp_max[w]);
+        }
+        s_warp_max[0] = block_max;
+    }
+    __syncthreads();
+    block_max = s_warp_max[0];
+
+    constexpr float FP8_MAX = static_cast<float>(opus::finfo<DTYPE_O>::max());
+    float quant_scale = (block_max > 1e-10f) ? (block_max / FP8_MAX) : 1e-10f;
+    float quant_scale_inv = 1.0f / quant_scale;
+
+    if (valid) {
+        const int out_base = token_id * (num_heads * head_dim) + head_id * head_dim;
+        using DTYPE_O_STORE = typename opus::vector_traits<DTYPE_O>::dtype;
+        DTYPE_O_STORE* out_ptr = reinterpret_cast<DTYPE_O_STORE*>(out + out_base);
+
+        #pragma unroll
+        for (int i = 0; i < THREAD_DATA_SIZE; i++) {
+            float clamped = fminf(fmaxf(gated_vals[i] * quant_scale_inv, -FP8_MAX), FP8_MAX);
+            out_ptr[elem_id + i] = opus::cast<DTYPE_O>(clamped);
+        }
+    }
+
+    // One scale per token.
+    if (tid == 0) {
+        scale[token_id] = quant_scale;
+    }
+}
+
+template <typename DTYPE_I, typename DTYPE_O, int THREAD_DATA_SIZE>
+void gated_rmsnorm_fp8_per_token_quant_launcher_impl(
+    torch::Tensor& out,
+    torch::Tensor& scale,
+    torch::Tensor const& x,
+    torch::Tensor const& z,
+    torch::Tensor const& weight,
+    double epsilon,
+    int num_tokens,
+    int num_heads,
+    int head_dim)
+{
+    constexpr int GROUP_SIZE = 128;
+    constexpr int WARP_SIZE = 64;
+    constexpr int threads_per_group = GROUP_SIZE / THREAD_DATA_SIZE;
+    constexpr int groups_per_warp = WARP_SIZE / threads_per_group;
+
+    // One block per token; size the block so it covers ALL heads in a single pass.
+    int num_warps = (num_heads + groups_per_warp - 1) / groups_per_warp;
+    if (num_warps < 1) {
+        num_warps = 1;
+    }
+    dim3 grid(num_tokens);
+    dim3 block(num_warps * WARP_SIZE);
+
+    hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+
+    const int64_t x_token_stride = x.stride(0);
+    const int64_t x_head_stride  = x.stride(1);
+    const int64_t z_token_stride = z.stride(0);
+    const int64_t z_head_stride  = z.stride(1);
+
+    gated_rmsnorm_fp8_per_token_quant_kernel<DTYPE_I, DTYPE_O, GROUP_SIZE, THREAD_DATA_SIZE>
+        <<<grid, block, 0, stream>>>(
+            reinterpret_cast<DTYPE_O*>(out.data_ptr()),
+            reinterpret_cast<float*>(scale.data_ptr()),
+            reinterpret_cast<DTYPE_I const*>(x.data_ptr()),
+            reinterpret_cast<DTYPE_I const*>(z.data_ptr()),
+            reinterpret_cast<DTYPE_I const*>(weight.data_ptr()),
+            epsilon,
+            num_tokens,
+            num_heads,
+            head_dim,
+            x_token_stride,
+            x_head_stride,
+            z_token_stride,
+            z_head_stride
+        );
+}
+
+template <typename DTYPE_I, typename DTYPE_O>
+void gated_rmsnorm_fp8_per_token_quant_launcher(
+    torch::Tensor& out,           // [num_tokens, num_heads * head_dim]
+    torch::Tensor& scale,          // [num_tokens]
+    torch::Tensor const& x,        // [num_tokens, num_heads, head_dim]
+    torch::Tensor const& z,        // [num_tokens, num_heads, head_dim]
+    torch::Tensor const& weight,   // [head_dim]
+    double epsilon)
+{
+    TORCH_CHECK(x.dim() == 3, "Input x must be 3D: [num_tokens, num_heads, head_dim]");
+    TORCH_CHECK(z.dim() == 3, "Input z must be 3D: [num_tokens, num_heads, head_dim]");
+    const int num_tokens = x.size(0);
+    const int num_heads = x.size(1);
+    const int head_dim = x.size(2);
+
+    TORCH_CHECK(z.size(0) == num_tokens && z.size(1) == num_heads && z.size(2) == head_dim,
+                "Gating tensor z must have same shape as x");
+    TORCH_CHECK(head_dim == 128, "ONLY head_dim=128 is supported, got ", head_dim);
+    TORCH_CHECK(num_heads <= 128, "ONLY num_heads <= 128 is supported (block must cover all heads), got ", num_heads);
+    TORCH_CHECK(weight.size(0) == head_dim, "Weight size must match head_dim");
+    TORCH_CHECK(scale.numel() == num_tokens, "scale must have num_tokens elements, got ", scale.numel());
+
+    // head_dim must be unit-stride for vectorized loads; token/head may be strided slices.
+    TORCH_CHECK(x.stride(2) == 1, "x.stride(2) must be 1 (head_dim contiguous), got ", x.stride(2));
+    TORCH_CHECK(z.stride(2) == 1, "z.stride(2) must be 1 (head_dim contiguous), got ", z.stride(2));
+
+    constexpr int thread_data_size = 16;
+    gated_rmsnorm_fp8_per_token_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size>(
+        out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
+}
+
+/**
+ * Python interface: fused gated RMSNorm + FP8 per-token quantization.
+ */
+void gated_rmsnorm_fp8_per_token_quant(
+    torch::Tensor& out,           // [num_tokens, num_heads * head_dim] (FP8)
+    torch::Tensor& scale,          // [num_tokens] (fp32)
+    torch::Tensor const& x,        // [num_tokens, num_heads, head_dim]
+    torch::Tensor const& z,        // [num_tokens, num_heads, head_dim]
+    torch::Tensor const& weight,   // [head_dim]
+    double epsilon)
+{
+    TORCH_CHECK(x.is_cuda(), "Input x must be on CUDA device");
+    TORCH_CHECK(z.is_cuda(), "Input z must be on CUDA device");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be on CUDA device");
+    TORCH_CHECK(out.is_cuda(), "Output must be on CUDA device");
+    TORCH_CHECK(scale.is_cuda(), "Scale must be on CUDA device");
+
+    if (x.scalar_type() == at::ScalarType::BFloat16 &&
+        (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz || out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
+        gated_rmsnorm_fp8_per_token_quant_launcher<opus::bf16_t, opus::fp8_t>(
+            out, scale, x, z, weight, epsilon);
+    } else if (x.scalar_type() == at::ScalarType::Half &&
+               (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz || out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
+        gated_rmsnorm_fp8_per_token_quant_launcher<opus::fp16_t, opus::fp8_t>(
+            out, scale, x, z, weight, epsilon);
+    } else {
+        TORCH_CHECK(false, "Unsupported dtype combination. Input: ", x.scalar_type(),
+                    ", Output: ", out.scalar_type());
+    }
+}
+
 } // namespace aiter

@@ -41,4 +41,32 @@ void gated_rmsnorm_fp8_group_quant(
     bool transpose_scale = false);
 
 
+/**
+ * Fused Gated RMSNorm + FP8 Per-Token Quantization
+ *
+ * Same gated RMSNorm math as the group variant, but the FP8 scale is computed
+ * once per token over the full flattened row [num_heads * head_dim] (per-token
+ * activation quant). Pairs with a per-output-channel weight scale a8w8 GEMM with
+ * no GEMM change.
+ *
+ * Constraints:
+ * - ONLY supports head_dim=128 and num_heads <= 128.
+ *
+ * Args:
+ *   out: Output quantized tensor [num_tokens, num_heads * head_dim] (FP8)
+ *   scale: Per-token quantization scales [num_tokens] (fp32)
+ *   x: Input tensor to normalize [num_tokens, num_heads, head_dim] (bf16/fp16)
+ *   z: Gating tensor [num_tokens, num_heads, head_dim] (bf16/fp16)
+ *   weight: RMSNorm weight [head_dim] (bf16/fp16)
+ *   epsilon: Small value for numerical stability
+ */
+void gated_rmsnorm_fp8_per_token_quant(
+    torch::Tensor& out,           // [num_tokens, num_heads * head_dim]
+    torch::Tensor& scale,          // [num_tokens]
+    torch::Tensor const& x,        // [num_tokens, num_heads, head_dim] - input to normalize
+    torch::Tensor const& z,        // [num_tokens, num_heads, head_dim] - gating tensor
+    torch::Tensor const& weight,   // [head_dim] - RMSNorm weight
+    double epsilon);
+
+
 } // namespace aiter
