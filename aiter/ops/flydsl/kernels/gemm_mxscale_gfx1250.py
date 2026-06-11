@@ -2966,7 +2966,7 @@ def compile_mxscale_gemm(
                         take_group, cur_start, found_start
                     )
                     next_start = (
-                        (actual_end + c_tile_m_minus_1_i32) / c_tile_m_i32
+                        (actual_end + c_tile_m_minus_1_i32) // c_tile_m_i32
                     ) * c_tile_m_i32
                     scf.YieldOp(
                         [next_found, next_group, next_start, next_found_start]
@@ -2977,7 +2977,7 @@ def compile_mxscale_gemm(
                     group_start_i32 = e_loop.results[3]
                     batch_idx = arith.index_cast(T.index, batch_i32)
                     local_row_i32 = layout_row_i32 - group_start_i32
-                    bx_local = arith.index_cast(T.index, local_row_i32 / c_tile_m_i32)
+                    bx_local = arith.index_cast(T.index, local_row_i32 // c_tile_m_i32)
                     group_if = scf.IfOp(group_active, results_=[], has_else=False)
                     with ir.InsertionPoint(group_if.then_block):
                         valid_m_i32 = buffer_ops.buffer_load(
