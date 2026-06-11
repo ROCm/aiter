@@ -1867,12 +1867,14 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
 //     nope: block_idx*block_stride + block_offset*KV_LORA + d
 //     rope: block_idx*block_stride + PAGE_SIZE*KV_LORA + block_offset*PE_DIM + d
 //
-// Launch: grid = T*H, block = KV_LORA threads. One block per (token, head)
+// Launch: grid = T*H, block = KV_LORA/VEC threads. One block per (token, head)
 // handles that head's q; when head_idx==0 the same block also handles the
-// token's k (kv=1). The first PE_DIM threads additionally process the pe seg.
+// token's k (kv=1). The nope segment is written with VEC-wide vectorized
+// loads/stores (128-bit for 16-bit inputs); the pe segment is RoPE'd per
+// element (PE_DIM threads).
 // ============================================================================
 template <typename scalar_t, typename cache_t, int KV_LORA, int PE_DIM,
-          int PAGE_SIZE, bool IS_NEOX>
+          int PAGE_SIZE, bool IS_NEOX, int VEC>
 __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     const scalar_t* __restrict__ q_nope,    // [T, H, KV_LORA]
     const scalar_t* __restrict__ q_pe,      // [T, H, PE_DIM]
@@ -1896,22 +1898,24 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     const int64_t sin_stride0,
     const int64_t block_stride)
 {
-    constexpr int HALF = PE_DIM / 2;
+    constexpr int HALF    = PE_DIM / 2;
+    constexpr int NUM_VEC = KV_LORA / VEC; // nope vectors per row
+    using in_vec_t  = opus::vector_t<scalar_t, VEC>;
+    using out_vec_t = opus::vector_t<cache_t, VEC>;
 
     const int64_t token_idx = blockIdx.x / num_heads;
     const int     head_idx  = blockIdx.x % num_heads;
-    const int     d         = threadIdx.x; // 0 .. KV_LORA-1
 
     const int64_t slot_idx = slot_mapping[token_idx];
     if(slot_idx < 0)
         return; // uniform across the block (same token)
 
-    const int64_t pos      = positions[token_idx];
+    const int64_t pos       = positions[token_idx];
     const scalar_t* cos_ptr = cos_cache + pos * cos_stride0;
     const scalar_t* sin_ptr = sin_cache + pos * sin_stride0;
 
-    // ---- helper: RoPE on the pe segment for a single thread d (< PE_DIM) ----
-    auto rope_pe = [&](const scalar_t* pe_ptr) -> float {
+    // ---- helper: RoPE on the pe segment for output element d (< PE_DIM) ----
+    auto rope_pe = [&](const scalar_t* pe_ptr, int d) -> float {
         int pair_dim, cos_idx;
         if constexpr(IS_NEOX)
         {
@@ -1941,15 +1945,22 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         cache_t* q_out_row =
             q_out + token_idx * q_out_stride_0 + head_idx * q_out_stride_1;
 
-        // nope: direct static quant.
-        const float x = static_cast<float>(q_nope_row[d]);
-        q_out_row[d]  = opus::cast<cache_t>(x * inv_qscale);
-
-        if(d < PE_DIM)
+        // nope: vectorized static quant.
+        auto in_buf  = opus::make_gmem<scalar_t>(q_nope_row, KV_LORA * sizeof(scalar_t));
+        auto out_buf = opus::make_gmem<cache_t>(q_out_row, KV_LORA * sizeof(cache_t));
+        for(int v = threadIdx.x; v < NUM_VEC; v += blockDim.x)
         {
-            const scalar_t* q_pe_row =
-                q_pe + token_idx * q_pe_stride_0 + head_idx * q_pe_stride_1;
-            const float roped = rope_pe(q_pe_row);
+            in_vec_t  vin  = in_buf.template load<VEC>(v * VEC);
+            out_vec_t vout = aiter::scaled_cast<cache_t>(vin, inv_qscale);
+            out_buf.template store<VEC, out_vec_t>(vout, v * VEC);
+        }
+
+        // pe: RoPE then static quant (per element).
+        const scalar_t* q_pe_row =
+            q_pe + token_idx * q_pe_stride_0 + head_idx * q_pe_stride_1;
+        for(int d = threadIdx.x; d < PE_DIM; d += blockDim.x)
+        {
+            const float roped = rope_pe(q_pe_row, d);
             q_out_row[KV_LORA + d] = opus::cast<cache_t>(roped * inv_qscale);
         }
     }
@@ -1964,15 +1975,22 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         const int64_t rope_base    =
             block_idx * block_stride + (int64_t)PAGE_SIZE * KV_LORA + block_offset * PE_DIM;
 
-        // nope: direct static quant.
+        // nope: vectorized static quant.
         const scalar_t* kv_c_row = kv_c + token_idx * kv_c_stride;
-        const float x = static_cast<float>(kv_c_row[d]);
-        kv_cache[nope_base + d] = opus::cast<cache_t>(x * inv_kscale);
-
-        if(d < PE_DIM)
+        auto in_buf  = opus::make_gmem<scalar_t>(kv_c_row, KV_LORA * sizeof(scalar_t));
+        auto out_buf = opus::make_gmem<cache_t>(kv_cache + nope_base, KV_LORA * sizeof(cache_t));
+        for(int v = threadIdx.x; v < NUM_VEC; v += blockDim.x)
         {
-            const scalar_t* k_pe_row = k_pe + token_idx * k_pe_stride;
-            const float roped = rope_pe(k_pe_row);
+            in_vec_t  vin  = in_buf.template load<VEC>(v * VEC);
+            out_vec_t vout = aiter::scaled_cast<cache_t>(vin, inv_kscale);
+            out_buf.template store<VEC, out_vec_t>(vout, v * VEC);
+        }
+
+        // pe: RoPE then static quant (per element).
+        const scalar_t* k_pe_row = k_pe + token_idx * k_pe_stride;
+        for(int d = threadIdx.x; d < PE_DIM; d += blockDim.x)
+        {
+            const float roped = rope_pe(k_pe_row, d);
             kv_cache[rope_base + d] = opus::cast<cache_t>(roped * inv_kscale);
         }
     }
@@ -4190,12 +4208,16 @@ void fused_qk_rope_concat_and_cache_mla_seg(
     HipDeviceGuard device_guard(kv_c.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
+    // 16-bit inputs (fp16/bf16) use 128-bit vectorized loads/stores (VEC=8).
+    constexpr int VEC = 8;
+    static_assert(KV_LORA % VEC == 0, "KV_LORA must be divisible by VEC");
+
     dim3 grid((unsigned)(num_tokens * num_heads));
-    dim3 block(KV_LORA);
+    dim3 block(KV_LORA / VEC);
 
 #define LAUNCH_MLA_NORM_ROPE(SCALAR_T, NEOX)                                              \
     aiter::fused_qk_rope_concat_and_cache_mla_seg_kernel<SCALAR_T, opus::fp8_t, KV_LORA,  \
-                                                         PE_DIM, PAGE_SIZE, NEOX>         \
+                                                         PE_DIM, PAGE_SIZE, NEOX, VEC>    \
         <<<grid, block, 0, stream>>>(                                                     \
             reinterpret_cast<SCALAR_T*>(q_nope.data_ptr()),                               \
             reinterpret_cast<SCALAR_T*>(q_pe.data_ptr()),                                 \
