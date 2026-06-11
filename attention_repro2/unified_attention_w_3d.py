@@ -900,7 +900,7 @@ class AttentionProgram:
 
     @gluon.jit
     def apply_mask_qk(self, S, j):
-        if self.cfg.SLIDING_WINDOW > 0 or self.cfg.ALL_DECODE:
+        if self.cfg.SLIDING_WINDOW > 0:
             return self.apply_mask_qk_orig(S, j)
         else:
             return self.apply_mask_qk_vgpr(S, j)     
@@ -1198,7 +1198,7 @@ class AttentionProgram:
 
     @gluon.jit
     def apply_mask_qk_subtile(self, S, j, sub_idx):
-        if self.cfg.SLIDING_WINDOW > 0 or self.cfg.ALL_DECODE:
+        if self.cfg.SLIDING_WINDOW > 0:
             return self.apply_mask_qk_subtile_orig(S, j, sub_idx)
         else:
             return self.apply_mask_qk_subtile_vgpr(S, j, sub_idx)     
@@ -2345,30 +2345,25 @@ def unified_attention(
     SLIDING_WINDOW = 1 + window_size[0]
     ALL_DECODE = max_seqlen_q == 1
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
-    # ---- Tunable selection --------------------------------------------------
-    # Auto-select every knob for the current regime, then let any caller-pinned
-    # value (routed from collect_data_lds.sh / run_kernel.py) override it. A
-    # None argument keeps the auto-selected value.
     if ALL_DECODE:
-        # Decode; sliding window shares the same config.
-        auto_loop_variant = 0
+        auto_loop_variant = 0 if SLIDING_WINDOW > 0 else 2
         auto_block_m = (
             16
             if NUM_QUERIES_PER_KV <= 16
             else triton.next_power_of_2(NUM_QUERIES_PER_KV)
         )
         auto_num_warps = 1
-        auto_waves_per_eu = 2
+        auto_waves_per_eu = 1
         auto_tile_size = 128 if (Q_FP8 and KV_FP8) else 64
     elif SLIDING_WINDOW > 0:
-        # Prefill, sliding window.
+        # Prefill, sliding window
         auto_loop_variant = 0
         auto_block_m = 64
-        auto_num_warps = 2
+        auto_num_warps = 4
         auto_waves_per_eu = 4
         auto_tile_size = 128 if (Q_FP8 and KV_FP8) else 64
     else:
-        # Prefill, full attention.
+        # Prefill, full attention
         auto_loop_variant = 2
         auto_block_m = 128
         auto_num_warps = 4
@@ -2381,7 +2376,7 @@ def unified_attention(
     loop_variant = auto_loop_variant if loop_variant is None else loop_variant
     TILE_SIZE = auto_tile_size if tile_size is None else tile_size
 
-    # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page.
+    # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page
     if not shuffled_kv_cache:
         TILE_SIZE = BLOCK_SIZE
     # tile size cannot be bigger than block size
@@ -2390,7 +2385,7 @@ def unified_attention(
             
 
     num_kv_blocks = TILE_SIZE // BLOCK_SIZE if shuffled_kv_cache else 1
-    assert TILE_SIZE < 256 and TILE_SIZE > 32, "TILE_SIZE must be in [32, 256]"
+    assert TILE_SIZE < 512 and TILE_SIZE > 32, "TILE_SIZE must be in [32, 256]"
     assert (
         TILE_SIZE >= BLOCK_SIZE
     ), f"TILE_SIZE={TILE_SIZE} must be multiple of PAGE_SIZE={BLOCK_SIZE}"
@@ -2399,19 +2394,12 @@ def unified_attention(
     ), "num_kv_blocks must be a power of 2"
 
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
-    # Upper bound on masked tiles. +1 because the causal diagonal isnt
-    # tile-aligned, the query_span-wide band sits at an arbitrary key offset
-    # and can spill into one extra tile
+    # Upper bound on masked tiles
     query_span = (BLOCK_M - 1) // NUM_QUERIES_PER_KV + 1
     max_mask_tiles = (query_span + TILE_SIZE - 1) // TILE_SIZE + 1
     # other variants do at most 2 masking at the end of loop
     if max_mask_tiles > 2:
         loop_variant = 0
-    # Split-KV only supports the plain double-buffered loop: variants 1/2 over-read
-    # past [tile_start, tile_end) (max(3, tile_end) + fixed 3-tile epilogue), which
-    # is harmless for a full sequence but would double-count a neighbor split's keys.
-    # if num_splits > 1:
-    #     loop_variant = 0
     if not ALL_DECODE:
         total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
     else:
@@ -2425,8 +2413,7 @@ def unified_attention(
     USE_LOAD_BUFFER_OP = ARCH_NAME != "gfx1250" and kv_size <= MAX_INT32
     USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
 
-    # Split-KV partial buffers. Pre-filled with neutral values so empty splits
-    # (and unwritten rows) are ignored by the reduction. 2d grid when num_splits==1.
+    # Split-KV partial buffers
     if num_splits > 1:
         num_tokens = q.shape[0]
         partial_m = torch.full(
