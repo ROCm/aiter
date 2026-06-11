@@ -532,14 +532,15 @@ class GroupCoordinator:
         prefill_support: bool = False,
         emit_bf16: bool = False,
     ):
-        return self.fused_allreduce_rmsnorm_quant(
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
             input_,
             residual_inp_,
             weight_,
             eps,
+            group_size,
             prefill_support,
-            quant_type="per_group",
-            group_size=group_size,
             emit_bf16=emit_bf16,
         )
 
@@ -550,32 +551,9 @@ class GroupCoordinator:
         k_w: torch.Tensor,
         eps: float,
     ):
-        return fused_qknorm_allreduce_(
-            qkv_in,
-            q_w,
-            k_w,
-            eps,
-            group_name=self.unique_name,
-        )
-
-    def fused_allreduce_rmsnorm_mxfp4_quant(
-        self,
-        input_: torch.Tensor,
-        residual_inp_: torch.Tensor,
-        weight_: torch.Tensor,
-        eps: float,
-        prefill_support: bool = False,
-        emit_bf16: bool = False,
-    ):
-        return self.fused_allreduce_rmsnorm_quant(
-            input_,
-            residual_inp_,
-            weight_,
-            eps,
-            prefill_support,
-            quant_type="mxfp4",
-            emit_bf16=emit_bf16,
-        )
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_qknorm_allreduce(qkv_in, q_w, k_w, eps)
 
     def _fused_allreduce_rmsnorm_out_place(
         self,
@@ -659,14 +637,25 @@ class GroupCoordinator:
         # return outplace_reduce_scatter(input_, group_name=self.unique_name, dim=dim)
         world_size = self.world_size
         assert world_size > 1, "error! world_size = 1"
+        ndim = input_.dim()
         assert (
-            input_.numel() % world_size == 0
-        ), "input shape error, input.numel() % world_size should equals to 0"
-        if input_.shape[0] % world_size == 0:
-            out_dim0 = input_.shape[0] // world_size
-            out_shape = (out_dim0,) + input_.shape[1:]
-        else:
-            out_shape = (input_.numel() // world_size,)
+            -ndim <= dim < ndim
+        ), f"Invalid dim ({dim}) for input tensor with shape {tuple(input_.shape)}"
+        if dim < 0:
+            dim += ndim
+        assert input_.shape[dim] % world_size == 0, (
+            f"input shape error, input.shape[{dim}]={input_.shape[dim]} "
+            f"is not divisible by world_size={world_size}"
+        )
+        # Output keeps the same rank/strides as input, only the scattered
+        # dim shrinks by world_size. Allocation is contiguous; the custom
+        # kernel writes elements in linear order into this layout, so no
+        # post-kernel reshape/copy is needed.
+        out_shape = (
+            input_.shape[:dim]
+            + (input_.shape[dim] // world_size,)
+            + input_.shape[dim + 1 :]
+        )
 
         output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
         if use_custom:
@@ -674,9 +663,20 @@ class GroupCoordinator:
                 input_, output_, group_name=self.unique_name, dim=dim
             )
         else:
-            torch.distributed.reduce_scatter_tensor(
-                output_, input_, group=self.device_group
-            )
+            if dim != 0:
+                input_ = input_.movedim(dim, 0).contiguous()
+                tmp_out_shape = (input_.shape[0] // world_size,) + input_.shape[1:]
+                tmp_output = torch.empty(
+                    tmp_out_shape, dtype=input_.dtype, device=input_.device
+                )
+                torch.distributed.reduce_scatter_tensor(
+                    tmp_output, input_, group=self.device_group
+                )
+                output_ = tmp_output.movedim(0, dim).contiguous()
+            else:
+                torch.distributed.reduce_scatter_tensor(
+                    output_, input_, group=self.device_group
+                )
         return output_
 
     def all_gather(
