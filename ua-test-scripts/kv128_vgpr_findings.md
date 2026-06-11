@@ -46,14 +46,17 @@ CK-UA registers that scale with kBlockN:
 ## What moves the needle (and what doesn't)
 
 - **E2 (share one fp32 `sp_compute` across both slots, keep a 2-slot fp8 `p`
-  ping-pong)**: 173 -> 126 spills. This is the single biggest clean cut and
-  confirms the duplicated fp32 score tile is the largest *single* contributor.
-  The deferred-PV pipeline only needs one live fp32 score (QK writes it, the
-  immediately-following softmax drains it to fp8 P; only the fp8 P needs the
-  2-slot ping-pong). Mathematically/bit identical (forces in-place delta).
-  NOTE: at kv64 E2 is a slight regression (214 -> 220) because the union
-  already let `p` alias `sp_compute`; splitting them costs storage when the
-  score tile is small. So E2 is a kv128-only lever, not a free production win.
+  ping-pong)**: cut kv128 spills 173 -> 126 and identified the duplicated fp32
+  score tile as the largest single contributor — **BUT it is NOT correctness-
+  preserving.** A full build with E2 on FAILS prefill_fp8 accuracy (0.6% of
+  elements wrong, max abs delta 2.7) while decode PASSES. The hypothesis "the
+  deferred-PV pipeline only ever keeps one live fp32 score" is wrong: in
+  steady-state prefill the next tile's QK writes its score while the current
+  tile's softmax is still reading the OTHER slot's score, so **both fp32 score
+  buffers are live concurrently**. The score double-buffer is therefore load-
+  bearing for correctness, not just latency, and cannot be removed — only made
+  smaller (sub-tiling). E2 is left default-OFF as a measured dead end.
+  (At kv64 it was also a slight VGPR regression, 214 -> 220.)
 - **E3 (union k_tile/v_tile, ASM-style)**: 0 effect. The compiler already
   overlaps their live ranges, so unioning is redundant; separating them for the
   K-read/PV overlap costs nothing in VGPR. Keep them separate.
@@ -80,8 +83,11 @@ plus the grown KV addressing state — there is no single clean cut left.
 CK-UA cannot hold a 128-wide **compute** tile under the 256-VGPR ceiling: the
 working set at kv64 is 214 and doubling the compute width overflows by ~40-60
 live VGPRs spread across many structures. ASM fits kv128 because it
-single-buffers the score (CK double-buffers for the deferred-PV pipeline; E2
-recovers most of that) and hand-packs its register file.
+single-buffers the score and hand-packs its register file. CK CANNOT
+single-buffer the score: E2 proved the deferred-PV ping-pong needs both fp32
+score buffers live in steady-state prefill (it fails accuracy otherwise). So
+the score double-buffer is irreducible at a given tile width — the only way to
+shrink it is to shrink the tile (sub-tiling kBlockN to 64).
 
 The robust unlock is to **decouple the K/V LDS/DRAM load granularity (128) from
 the compute width (64)**: keep the proven kv64 compute footprint (214 VGPR, 0
