@@ -164,13 +164,15 @@ def compile_chunk_gated_delta_h(
     # -- LDS layout: w and k store all K-blocks to reduce barriers --
     LDS_W_STRIDE = K
     LDS_W_ELEMS_PER_STAGE = BT * LDS_W_STRIDE
-    # OPT-DBW: ping/pong double-buffer for lds_w. Stage 0 is at byte offset
-    # 0, stage 1 at byte offset LDS_W_ELEMS_PER_STAGE * 2. ds_write(w[t+1])
-    # can be issued at the end of chunk t (after GEMM2) while chunk t still
-    # reads the (previously written) lds_w[t%2]. This decouples
-    # ds_write_b128(w) from the chunk-internal vmcnt(8) critical path that
-    # hotspot #2 in the ATT trace identified (2.32 M cycles / 9.7% stall).
-    LDS_W_STAGES = 2
+    # NOTE: a ping/pong double-buffer for lds_w was originally reserved here
+    # (2 stages), but the read offset (GEMM1) and write offset
+    # (w_prefetch_lds_all) never select a stage via i_t%2 -- both always use
+    # stage 0. W is written at the top of each chunk and read by GEMM1 in the
+    # SAME chunk (separated by a barrier), so there is no t / t+1 overlap to
+    # double-buffer. The second stage was therefore allocated but never
+    # accessed -- pure dead LDS. Use a single stage to reclaim those bytes
+    # (16 KB at BT=64,K=128); behaviour is identical.
+    LDS_W_STAGES = 1
     LDS_W_ELEMS = LDS_W_ELEMS_PER_STAGE * LDS_W_STAGES
     LDS_W_BYTES = LDS_W_ELEMS * 2
 
@@ -1017,14 +1019,14 @@ def compile_chunk_gated_delta_h(
                     for nr in range_constexpr(N_REPEAT):
                         vn_frags[nr] = vn_frags[nr] * gate_vec
 
-                # Wrap raw ArithValue in fx.Float32 so fx.full's broadcast
-                # accepts it (filled() requires a Numeric or Python scalar).
-                exp_g_last_vec = fx.full(4, fx.Float32(exp_g_last), fx.Float32)
+                # Scalar broadcast multiply (no explicit f32x4 temp) to keep
+                # VGPR pressure down -- helps reach the 3 waves/SIMD threshold.
+                exp_g_last_s = fx.Float32(exp_g_last)
 
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     for nr in range_constexpr(N_REPEAT):
                         acc_idx = kb * N_REPEAT + nr
-                        h_accs_in[acc_idx] = h_accs_in[acc_idx] * exp_g_last_vec
+                        h_accs_in[acc_idx] = h_accs_in[acc_idx] * exp_g_last_s
 
             # Per-K decay: h[v, k] *= exp(gk_last[k]) at chunk end.
             # Each lane's v4f32 spans 4 different K positions (one per elem_i),
