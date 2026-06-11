@@ -46,17 +46,15 @@ CK-UA registers that scale with kBlockN:
 ## What moves the needle (and what doesn't)
 
 - **E2 (share one fp32 `sp_compute` across both slots, keep a 2-slot fp8 `p`
-  ping-pong)**: cut kv128 spills 173 -> 126 and identified the duplicated fp32
-  score tile as the largest single contributor — **BUT it is NOT correctness-
-  preserving.** A full build with E2 on FAILS prefill_fp8 accuracy (0.6% of
-  elements wrong, max abs delta 2.7) while decode PASSES. The hypothesis "the
-  deferred-PV pipeline only ever keeps one live fp32 score" is wrong: in
-  steady-state prefill the next tile's QK writes its score while the current
-  tile's softmax is still reading the OTHER slot's score, so **both fp32 score
-  buffers are live concurrently**. The score double-buffer is therefore load-
-  bearing for correctness, not just latency, and cannot be removed — only made
-  smaller (sub-tiling). E2 is left default-OFF as a measured dead end.
-  (At kv64 it was also a slight VGPR regression, 214 -> 220.)
+  ping-pong)**: cut kv128 spills 173 -> 126 — the single biggest lever — and is
+  **correctness-equivalent to baseline** (a full E2 build reproduces the
+  baseline prefill_fp8 output byte-for-byte; same max-abs-delta and identical
+  mismatch-element count). It is simply **insufficient**: 126 spills remain.
+  At kv64 it is a slight VGPR regression (214 -> 220) since the union already
+  let `p` alias `sp_compute`. Left default-OFF as a measured dead end.
+
+  (Process note: an intermediate write-up here claimed E2 *broke* accuracy. That
+  was a misattribution — see the pre-existing-failure note below. E2 is correct.)
 - **E3 (union k_tile/v_tile, ASM-style)**: 0 effect. The compiler already
   overlaps their live ranges, so unioning is redundant; separating them for the
   K-read/PV overlap costs nothing in VGPR. Keep them separate.
@@ -83,11 +81,27 @@ plus the grown KV addressing state — there is no single clean cut left.
 CK-UA cannot hold a 128-wide **compute** tile under the 256-VGPR ceiling: the
 working set at kv64 is 214 and doubling the compute width overflows by ~40-60
 live VGPRs spread across many structures. ASM fits kv128 because it
-single-buffers the score and hand-packs its register file. CK CANNOT
-single-buffer the score: E2 proved the deferred-PV ping-pong needs both fp32
-score buffers live in steady-state prefill (it fails accuracy otherwise). So
-the score double-buffer is irreducible at a given tile width — the only way to
-shrink it is to shrink the tile (sub-tiling kBlockN to 64).
+single-buffers the score and hand-packs its register file. The biggest single
+CK lever (E2, sharing the fp32 score) only recovers ~47 of the needed spills
+and the residual is diffuse, so no combination of register tricks fits kv128 at
+128-wide compute. The only path that fits is shrinking the score/operand tiles
+themselves: keep the proven kv64 compute footprint (214 VGPR, 0 spill) and
+widen ONLY the K/V LDS/DRAM load + block barrier to 128 keys (decouple load
+width from compute width), or equivalently sub-tile kBlockN into 2x64 inside
+the per-tile phases.
+
+## IMPORTANT: pre-existing prefill_fp8 accuracy failure on this branch
+
+While validating, a CLEAN build of the base branch (jukorhon/fa4-k-preread @
+9aa380e6c "wide 32x32x64 FP8 MMA") FAILS the prefill_fp8 correctness check at
+the loose fp8 tolerance (atol=rtol=0.15), independent of any kv128/VGPR work:
+  - rebuild_and_test matrix `prefill_fp8` (b2 sq8192 h12,2 blk64):
+    max abs delta 2.73, 0.6% of elements (140700 / 25,165,824) over tolerance.
+  - regression fixtures also report fp8 "not all close" (e.g. 2.2% of elements).
+This reproduces byte-for-byte with and without the E2 toggle, so it is NOT
+caused by the kv128 experiments. It looks like a real accuracy regression in the
+wide-MMA fp8 path (the cvt-only P relayout / 32x32x64 MMA) that predates this
+work and should be triaged separately. bf16 and fp8 decode paths PASS.
 
 The robust unlock is to **decouple the K/V LDS/DRAM load granularity (128) from
 the compute width (64)**: keep the proven kv64 compute footprint (214 VGPR, 0
