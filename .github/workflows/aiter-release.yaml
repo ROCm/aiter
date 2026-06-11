@@ -575,6 +575,7 @@ jobs:
     steps:
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
+        timeout-minutes: 30
         with:
           pattern: aiter-whl-packages-py*
           path: all-wheels
