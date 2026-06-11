@@ -3,13 +3,41 @@
 import torch
 from typing import Tuple
 import aiter
+import aiter.fused_moe as fm
 from aiter.test_common import checkAllclose, run_perftest, benchmark
 from aiter.fused_moe import moe_sorting, fused_topk
+from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter import dtypes
 import argparse
 import pandas as pd
 
 BLOCK_SIZE_M = 32
+
+
+def set_moe_sorting_backend(backend: str) -> None:
+    """Force which moe_sorting backend `moe_sorting()` dispatches to.
+
+    The backend is selected by module-level flags in aiter.fused_moe that are
+    read at call time, so flipping them here is sufficient for this
+    single-process test. 
+    """
+    if backend == "flydsl":
+        if not is_flydsl_available():
+            raise RuntimeError(
+                "backend=flydsl requested but FlyDSL is not available in this build"
+            )
+        fm._USE_CK_MOE_SORTING = False
+        fm._USE_OPUS_MOE_SORTING = False
+    elif backend == "opus":
+        fm._USE_CK_MOE_SORTING = False
+        fm._USE_OPUS_MOE_SORTING = True
+    elif backend == "ck":
+        fm._USE_CK_MOE_SORTING = True
+        fm._USE_OPUS_MOE_SORTING = False
+    elif backend == "auto":
+        pass  # leave module defaults as imported
+    else:
+        raise ValueError(f"unknown backend: {backend}")
 
 
 def moe_sorting_native(
@@ -81,7 +109,9 @@ def test_moe_sorting(
     has_expert_mask=False,
     padding_token=False,
     dispatch_policy=0,
+    backend="auto",
 ):
+    set_moe_sorting_backend(backend)
     dim = (token, model_dim, inter_dim)
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
     score = torch.rand((token, E), device="cuda", dtype=dtype)
@@ -146,9 +176,13 @@ def test_moe_sorting(
     )
 
     print(
-        f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a / avg_b - 1:<5.1%}"
+        f"[perf] backend={backend}, {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, kernel avg: {avg_b:<8.2f} us, uplift: {avg_a / avg_b - 1:<5.1%}"
     )
-    checkAllclose(
+    # checkAllclose only logs; it returns the mismatch fraction (0 == all close)
+    # and never raises. Collect the fractions and assert so a regression in any
+    # backend actually fails the process / CI rather than passing silently.
+    errs = {}
+    errs["num_tokens_post_padded"] = checkAllclose(
         num_tokens_post_padded_a,
         num_tokens_post_padded_b,
         atol=0,
@@ -156,22 +190,29 @@ def test_moe_sorting(
     )
     mask = sorted_ids_a != (topk << 24 | topk_ids.shape[0])
     num_tokens_post_pad = num_tokens_post_padded_a[0].item()
-    checkAllclose(
+    errs["sorted_ids"] = checkAllclose(
         sorted_ids_a[:num_tokens_post_pad],
         sorted_ids_b[:num_tokens_post_pad],
         msg="sorted_ids",
     )
-    checkAllclose(
+    errs["sorted_weights"] = checkAllclose(
         sorted_weights_a[mask],
         sorted_weights_b[mask],
         msg="sorted_weights",
     )
 
     expert_mask = sorted_expert_ids_a != -1
-    checkAllclose(
+    errs["sorted_expert_ids"] = checkAllclose(
         sorted_expert_ids_a[expert_mask],
         sorted_expert_ids_b[expert_mask],
         msg="sorted_expert_ids",
+    )
+    bad = {k: v for k, v in errs.items() if v}
+    assert not bad, (
+        f"moe_sorting backend={backend} mismatch vs CPU reference at "
+        f"token={token}, E={E}, topk={topk}, has_expert_mask={has_expert_mask}, "
+        f"padding_token={padding_token}, dispatch_policy={dispatch_policy}: "
+        f"mismatch fractions {bad}"
     )
     return {"us": avg_b}
 
@@ -261,31 +302,68 @@ parser.add_argument(
     e.g.: -em f    # false
           -em t    # true""",
 )
+parser.add_argument(
+    "-b",
+    "--backend",
+    type=str,
+    nargs="*",
+    choices=["auto", "flydsl", "opus", "ck"],
+    default=None,
+    help="""moe_sorting backend(s) to validate against the CPU reference.
+    Each is checked independently so coverage is explicit per backend and does
+    not depend on which backend the build happens to default to.
+    Default: validate FlyDSL when it is available in the build (skipped
+    otherwise), so the FlyDSL path is always exercised when present.
+    e.g.: -b flydsl opus    # validate both
+          -b auto           # whatever the build defaults to""",
+)
 
 args = parser.parse_args()
 
-for padding_token in args.padding:
-    for expert_mask in args.expert_mask:
-        for dispatch_policy in args.dispatch_policy:
-            df = []
-            print(
-                f"test test_moe_sorting, expert mask:{bool(expert_mask)}, padding_token:{padding_token}, dispatch_policy={dispatch_policy}"
-            )
-            for dtype in args.dtype:
-                for m in args.m:
-                    for E, top in zip(args.expert, args.topk):
-                        ret = test_moe_sorting(
-                            dtype,
-                            m,
-                            args.model_dim,
-                            args.inter_dim,
-                            E,
-                            top,
-                            has_expert_mask=expert_mask,
-                            padding_token=padding_token,
-                            dispatch_policy=dispatch_policy,
-                        )
-                        df.append(ret)
-            df = pd.DataFrame(df)
-            df_md = df.to_markdown(index=False)
-            aiter.logger.info("moe_sorting summary (markdown):\n%s", df_md)
+if args.backend is None:
+    backends = ["flydsl"] if is_flydsl_available() else ["auto"]
+    if not is_flydsl_available():
+        print("FlyDSL not available in this build; validating default backend (auto)")
+else:
+    backends = args.backend
+
+for backend in backends:
+    if backend == "flydsl" and not is_flydsl_available():
+        print("skipping backend=flydsl: not available in this build")
+        continue
+    for padding_token in args.padding:
+        for expert_mask in args.expert_mask:
+            for dispatch_policy in args.dispatch_policy:
+                # dispatch_policy is not plumbed into the FlyDSL kernel; its
+                # guard falls back to opus/ck for dp != 0, so skip the redundant
+                # (and mislabeled) FlyDSL run there.
+                if backend == "flydsl" and dispatch_policy != 0:
+                    continue
+                df = []
+                print(
+                    f"test test_moe_sorting, backend:{backend}, "
+                    f"expert mask:{bool(expert_mask)}, "
+                    f"padding_token:{padding_token}, "
+                    f"dispatch_policy={dispatch_policy}"
+                )
+                for dtype in args.dtype:
+                    for m in args.m:
+                        for E, top in zip(args.expert, args.topk):
+                            ret = test_moe_sorting(
+                                dtype,
+                                m,
+                                args.model_dim,
+                                args.inter_dim,
+                                E,
+                                top,
+                                has_expert_mask=expert_mask,
+                                padding_token=padding_token,
+                                dispatch_policy=dispatch_policy,
+                                backend=backend,
+                            )
+                            df.append(ret)
+                df = pd.DataFrame(df)
+                df_md = df.to_markdown(index=False)
+                aiter.logger.info(
+                    "moe_sorting summary (backend=%s, markdown):\n%s", backend, df_md
+                )
