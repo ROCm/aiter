@@ -30,7 +30,7 @@ BK=256 kernel.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -418,9 +418,7 @@ def compile_gemm2_a4w4_port(
             cumsum0 = llvm.load(T.i32, _global_ptr1(arg_cumsum, fx.Int32(0)))
             total_m_blocks = cumsum0 // fx.Int32(BM)
             bound = total_m_blocks * fx.Int32(_num_n_blocks)
-            ub = arith.index_cast(T.index, _raw(bound))
-            step = arith.index_cast(T.index, _raw(gpu.grid_dim.x))
-            grid_nb = arith.index_cast(T.i32, _raw(gpu.grid_dim.x))
+            grid_nb = fx.Int32(gpu.grid_dim.x)
 
             # XCD-grouped interleave (mirrors xcd_remap.hpp swizzle=-1): remap the
             # raw persistent index -> wgid so consecutive indices spread across the
@@ -438,29 +436,25 @@ def compile_gemm2_a4w4_port(
                     + pid // fx.Int32(_NXCD)
                 )
 
-            peel_if = scf.IfOp(
-                arith.cmpi(arith.CmpIPredicate.slt, bx_i32, bound), [], has_else=False
-            )
-            with ir.InsertionPoint(peel_if.then_block):
+            if bx_i32 < bound:
                 tile = _xcd(bx_i32)
                 _issue_all_a_loads((tile // fx.Int32(_num_n_blocks)) * fx.Int32(BM))
                 rocdl.sched_barrier(0)
                 _run_tile(tile)
-                scf.YieldOp([])
 
             saq._view_cache = None
-            start2 = arith.index_cast(T.index, _raw(bx_i32 + grid_nb))
-            for_op = scf.ForOp(start2, ub, step)
-            with ir.InsertionPoint(for_op.body):
-                wu = arith.index_cast(T.i32, for_op.induction_variable)
+            for iv in range(bx_i32 + grid_nb, bound, gpu.grid_dim.x):
+                wu = fx.Int32(iv)
                 # iter-boundary fence: prev tile's LDS reads must finish before
                 # this tile overwrites the s_Aq slots (persistent-grid reuse race).
                 rocdl.barrier()
-                saq._view_cache = None
+                # setattr (not `saq._view_cache = None`): an `=` assignment would make
+                # the AST for-rewriter treat saq (a SmemPtr, active before the loop) as
+                # a loop-carried iter_arg, which only MLIR values can be.
+                setattr(saq, "_view_cache", None)
                 tile = _xcd(wu)
                 _issue_all_a_loads((tile // fx.Int32(_num_n_blocks)) * fx.Int32(BM))
                 _run_tile(tile)
-                scf.YieldOp([])
         else:
             # One-shot grid (atomic): issue A->LDS BEFORE the cumsum load so the
             # A->LDS HBM latency overlaps the cumsum load + bound check (A->LDS
@@ -468,13 +462,8 @@ def compile_gemm2_a4w4_port(
             # (BM16: waves 0,1), so gate on wave < n_load_waves.
             m_row0 = (bx_i32 // fx.Int32(_num_n_blocks)) * fx.Int32(BM)
             if const_expr(_n_load_waves < 4):  # BM16: only waves 0,1 hold A rows
-                a_pred = arith.cmpi(
-                    arith.CmpIPredicate.slt, wave, fx.Int32(_n_load_waves)
-                )
-                a_if = scf.IfOp(a_pred, [], has_else=False)
-                with ir.InsertionPoint(a_if.then_block):
+                if wave < fx.Int32(_n_load_waves):
                     _issue_all_a_loads(m_row0)
-                    scf.YieldOp([])
             else:
                 _issue_all_a_loads(m_row0)
             rocdl.sched_barrier(0)
@@ -483,11 +472,8 @@ def compile_gemm2_a4w4_port(
             total_m_blocks = cumsum0 // fx.Int32(BM)
             bound = total_m_blocks * fx.Int32(_num_n_blocks)
 
-            in_range = arith.cmpi(arith.CmpIPredicate.slt, bx_i32, bound)
-            if_op = scf.IfOp(in_range, [], has_else=False)
-            with ir.InsertionPoint(if_op.then_block):
+            if bx_i32 < bound:
                 _run_tile(bx_i32)
-                scf.YieldOp([])
 
     @flyc.jit
     def launch_gemm2(
@@ -518,9 +504,7 @@ def compile_gemm2_a4w4_port(
             # amortizes the prologue + pipelines tiles for large launches. Persist
             # only past ~4*NUM_CU tiles, where tiles/wg is high enough to pay off.
             tw = i32_max_m_blocks * fx.Int32(_num_n_blocks)
-            persist = arith.cmpi(
-                arith.CmpIPredicate.sgt, _raw(tw), _raw(fx.Int32(NUM_CU * 4))
-            )
+            persist = _raw(tw > fx.Int32(NUM_CU * 4))
             grid_i32 = arith.select(persist, _raw(fx.Int32(NUM_CU)), _raw(tw))
             grid_x = arith.index_cast(T.index, grid_i32)
         else:
@@ -544,6 +528,7 @@ def compile_gemm2_a4w4_port(
     return launch_gemm2
 
 
+@flyc.jit
 def _gemm2_body(
     allocator,
     lds_off,
@@ -940,6 +925,7 @@ def _flat_bf16_epilog(accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, kMC
                 llvm.StoreOp(_raw(bf), _gep1(out_base, elem * fx.Int64(2)))
 
 
+@flyc.jit
 def _flat_mxfp4_epilog(
     accm,
     out_q_base,
@@ -1031,13 +1017,11 @@ def _flat_mxfp4_epilog(
             llvm.StoreOp(packed, _gep1(out_q_base, q_byte), nontemporal=True)
             blk = n_block_idx * fx.Int32(NBLK) + group
             s_byte = fx.Int64(out_row) * fx.Int64(N_OUT // 32) + fx.Int64(blk)
-            pred = arith.cmpi(arith.CmpIPredicate.eq, _raw(kk), _raw(fx.Int32(0)))
-            if_op = scf.IfOp(pred, [], has_else=False)
-            with ir.InsertionPoint(if_op.then_block):
+            if kk == fx.Int32(0):
                 llvm.StoreOp(arith.trunci(T.i8, e8), _gep1(out_scale_base, s_byte))
-                scf.YieldOp([])
 
 
+@flyc.jit
 def _atomic_bf16_epilog(
     lds_acc,
     accm,
@@ -1103,9 +1087,7 @@ def _atomic_bf16_epilog(
     for mr in range_constexpr(M_REPS):
         row_in_block = fx.Int32(mr * 8) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
-        valid = arith.cmpi(arith.CmpIPredicate.slt, token_id, i32_M)
-        if_op = scf.IfOp(valid, [], has_else=False)
-        with ir.InsertionPoint(if_op.then_block):
+        if token_id < i32_M:
             row_base_addr = (
                 token_id * fx.Int32(N_OUT) + n_block_idx * fx.Int32(BN) + col_start
             )
@@ -1130,4 +1112,3 @@ def _atomic_bf16_epilog(
                     syncscope="agent",
                     alignment=4,
                 )
-            scf.YieldOp([])
