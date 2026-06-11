@@ -85,6 +85,7 @@ def compile_mxscale_gemm(
     epilogue_bias: bool = False,
     kernel_tag: str = "gemm",
     n_valid: int | None = None,
+    k_valid: int | None = None,
 ):
     """Compile an MXFP4 or MXFP8 GEMM kernel with TDM async copy.
 
@@ -263,6 +264,19 @@ def compile_mxscale_gemm(
             f"{num_buffers}-stage buffering requires num_k_tiles >= {num_buffers}, "
             f"got {num_k_tiles}"
         )
+
+    # K-pad tail tile skip: when k_valid is provided and smaller than K,
+    # trailing K tiles entirely in the padded region [k_valid, K) are skipped.
+    # The caller must ensure the padded region is zeroed in global memory.
+    k_valid_eff = K if k_valid is None else int(k_valid)
+    if not (0 < k_valid_eff <= K):
+        raise ValueError(f"k_valid must be in (0, {K}], got {k_valid!r}")
+    k_pad = k_valid_eff < K
+    if k_pad:
+        k_grid_tiles = (k_valid_eff + tile_k - 1) // tile_k
+        k_grid_tiles = min(k_grid_tiles, num_k_tiles)
+        if k_grid_tiles >= num_buffers:
+            num_k_tiles = k_grid_tiles
 
     gpu_arch = str(get_hip_arch())
     assert gpu_arch.startswith("gfx1250"), f"Expected gfx1250, got {gpu_arch}"
@@ -2926,6 +2940,7 @@ def compile_mxscale_gemm(
         N,
         K,
         n_valid_eff,
+        k_valid_eff,
         tile_m,
         tile_n,
         tile_k,
