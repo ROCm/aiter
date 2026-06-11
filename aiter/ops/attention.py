@@ -835,24 +835,24 @@ def get_ps_metadata_info_v1(
     cus_per_cluster = cu_num // num_clusters
 
     max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
-    # When max_kvlen is not provided, fall back to max_qlen (causal-only sizing
-    # where KV length per q-tile is bounded by q length). Noncausal callers
-    # (e.g. chunked-context prefill) must pass the true max KV length per
-    # sequence so per-q-tile KV splits are accounted for.
+    # Causal case: set max_kvlen to None. Then it falls back to max_qlen, since
+    #   the context is always <= the max query len.
+    # Non-causal case: set max_kvlen to the true KV length
     effective_max_kvlen = max_kvlen if max_kvlen is not None else max_qlen
     max_kv_split_per_qtile = max(1, math.ceil(effective_max_kvlen / kvlen_granularity))
 
     qo_tile_cnt = batch_size * max_qo_split_per_batch
-    # Per-cluster work entries are bounded by total_units (sum over q-tiles of
-    # their KV-split count) plus one trailing slot per cluster per q-tile from
-    # the scheduler's allocate_work tail. total_units <= qo_tile_cnt *
-    # max_kv_split_per_qtile, so per-cluster work count <= qo_tile_cnt *
-    # (max_kv_split_per_qtile + cus_per_cluster). max_works covers all heads.
-    per_cluster_work = qo_tile_cnt * (max_kv_split_per_qtile + cus_per_cluster)
-    max_works = num_head_k * per_cluster_work
-    # Each work_info entry contributes at most one partial slot. max_partials
-    # bounds the per-head reduce_partial_map.
-    max_partials = per_cluster_work
+    # Explanation:
+    # Number of work entries = # tiles closed (query tiles) + # partial tiles
+    #  where # partial tiles is at most one per TG = cus_per_cluster
+    # So the work each cluster is doing is the sum of
+    #  1. (# q tiles) * (# of kv splits per q tile)   <- "closed tiles"
+    #  2. (# q tiles) * (# of CUs per cluster)        <- "partial tiles, 1 per TG"
+    work_entries_per_cluster = qo_tile_cnt * (max_kv_split_per_qtile + cus_per_cluster)
+    # max_works covers all heads
+    max_works = num_head_k * work_entries_per_cluster
+    # per head
+    max_partials = work_entries_per_cluster
 
     return (
         (2, torch.uint64),  # work_metadata_ptrs
