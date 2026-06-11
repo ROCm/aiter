@@ -536,6 +536,272 @@ def test_fused_rope_concat_and_cache_mla(
     return ret
 
 
+# ============================================================================
+# DeepSeek V3.1 MLA seg: fused QK RoPE(pe) + static per-tensor fp8 quant +
+# segmented paged KV cache write (no RMSNorm; q/k are already post-projection).
+#   q: nope quantized directly; pe RoPE'd then quantized -> q_out fp8
+#   k: nope quantized directly; pe RoPE'd then quantized -> kv_cache fp8
+# kv_cache is flat per block: [page_size x kv_lora (nope)][page_size x pe (rope)]
+# q_out head_dim is padded (tail left untouched).
+# ============================================================================
+SEG_PAGE_SIZE = 64
+
+
+def _seg_rope_ref(pe, cos, sin, pos, is_neox):
+    """pe: [N, pe_dim] (N = T or T*H). cos/sin: [max_pos, pe_dim//2]. pos: [N]."""
+    half = pe.shape[-1] // 2
+    c = cos[pos].float()
+    s = sin[pos].float()
+    out = torch.empty_like(pe, dtype=torch.float32)
+    pe = pe.float()
+    if is_neox:
+        lo, hi = pe[:, :half], pe[:, half:]
+        out[:, :half] = lo * c - hi * s
+        out[:, half:] = hi * c + lo * s
+    else:
+        even, odd = pe[:, 0::2], pe[:, 1::2]
+        out[:, 0::2] = even * c - odd * s
+        out[:, 1::2] = odd * c + even * s
+    return out
+
+
+def _seg_ref(
+    q_nope,
+    q_pe,
+    kv_c,
+    k_pe,
+    cos,
+    sin,
+    pos,
+    slot_mapping,
+    q_scale,
+    k_scale,
+    num_blocks,
+    page_size,
+    is_neox,
+):
+    T, H, kv_lora = q_nope.shape
+    pe_dim = q_pe.shape[-1]
+    fp8 = dtypes.fp8
+    q_inv = 1.0 / q_scale.item()
+    k_inv = 1.0 / k_scale.item()
+
+    # ---- q_out [T, H, kv_lora + pe_dim] ----
+    q_nope_q = (q_nope.float() * q_inv).to(fp8)
+    qpe_pos = pos.view(T, 1).expand(T, H).reshape(-1)
+    q_pe_roped = _seg_rope_ref(q_pe.reshape(-1, pe_dim), cos, sin, qpe_pos, is_neox)
+    q_pe_q = (q_pe_roped * q_inv).to(fp8).view(T, H, pe_dim)
+    q_out_ref = torch.cat([q_nope_q, q_pe_q], dim=-1)
+
+    # ---- k: nope quant (no norm); pe RoPE + quant ----
+    k_nope_q = (kv_c.float() * k_inv).to(fp8)
+    k_pe_roped = _seg_rope_ref(k_pe, cos, sin, pos, is_neox)
+    k_pe_q = (k_pe_roped * k_inv).to(fp8)
+
+    # ---- segmented kv_cache [num_blocks, page_size*(kv_lora + pe_dim)] ----
+    block_stride = page_size * kv_lora + page_size * pe_dim
+    kv_cache_ref = torch.zeros(num_blocks, block_stride, dtype=fp8)
+    blk = (slot_mapping // page_size).long()
+    off = (slot_mapping % page_size).long()
+    for i in range(T):
+        if slot_mapping[i].item() < 0:
+            continue
+        b, o = blk[i].item(), off[i].item()
+        nbase = o * kv_lora
+        rbase = page_size * kv_lora + o * pe_dim
+        kv_cache_ref[b, nbase : nbase + kv_lora] = k_nope_q[i]
+        kv_cache_ref[b, rbase : rbase + pe_dim] = k_pe_q[i]
+    return q_out_ref, kv_cache_ref
+
+
+@benchmark()
+def test_fused_qk_rope_concat_cache_mla_seg(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    num_tokens: int,
+    num_heads: int,
+    device: str,
+    is_neox: bool,
+    q_out_dim: int = 768,
+):
+    ret = {}
+    torch.set_default_device(device)
+    page_size = SEG_PAGE_SIZE
+    fp8 = dtypes.fp8
+
+    num_blocks = (num_tokens + page_size - 1) // page_size + 1
+    total_slots = num_blocks * page_size
+    slot_mapping = torch.tensor(
+        random.sample(range(total_slots), num_tokens),
+        dtype=torch.int64,
+        device=device,
+    )
+
+    q_nope = (
+        torch.randn(
+            num_tokens, num_heads, kv_lora_rank, dtype=dtypes.bf16, device=device
+        )
+        * 0.1
+    )
+    q_pe = (
+        torch.randn(
+            num_tokens, num_heads, qk_rope_head_dim, dtype=dtypes.bf16, device=device
+        )
+        * 0.1
+    )
+    kv_c = torch.randn(num_tokens, kv_lora_rank, dtype=dtypes.bf16, device=device) * 0.1
+    k_pe = (
+        torch.randn(num_tokens, qk_rope_head_dim, dtype=dtypes.bf16, device=device)
+        * 0.1
+    )
+
+    max_pos = max(num_tokens, 64)
+    cos_cache, sin_cache = compute_cache(max_pos, qk_rope_head_dim // 2, dtypes.bf16)
+    cos_cache = cos_cache.to(device)
+    sin_cache = sin_cache.to(device)
+    pos = torch.randint(0, max_pos, (num_tokens,), dtype=torch.int64, device=device)
+
+    q_scale = torch.tensor(0.05, dtype=torch.float32, device=device)
+    k_scale = torch.tensor(0.05, dtype=torch.float32, device=device)
+
+    block_stride = page_size * kv_lora_rank + page_size * qk_rope_head_dim
+    kv_cache = torch.zeros(num_blocks, block_stride, dtype=fp8, device=device)
+    q_out = torch.zeros(num_tokens, num_heads, q_out_dim, dtype=fp8, device=device)
+
+    q_out_ref, kv_cache_ref = _seg_ref(
+        q_nope,
+        q_pe,
+        kv_c,
+        k_pe,
+        cos_cache,
+        sin_cache,
+        pos,
+        slot_mapping,
+        q_scale,
+        k_scale,
+        num_blocks,
+        page_size,
+        is_neox,
+    )
+
+    _, avg_us = run_perftest(
+        aiter.fused_qk_rope_concat_and_cache_mla_seg,
+        q_nope,
+        q_pe,
+        kv_c,
+        k_pe,
+        kv_cache,
+        q_out,
+        slot_mapping,
+        k_scale,
+        q_scale,
+        pos,
+        cos_cache,
+        sin_cache,
+        is_neox,
+    )
+
+    # dequant compare
+    q_got = q_out[:, :, : kv_lora_rank + qk_rope_head_dim].float() * q_scale.item()
+    q_exp = q_out_ref.float() * q_scale.item()
+    kv_got = kv_cache.float() * k_scale.item()
+    kv_exp = kv_cache_ref.float() * k_scale.item()
+    err_q = checkAllclose(q_exp, q_got, rtol=0.05, atol=0.05, msg="seg q_out")
+    err_kv = checkAllclose(kv_exp, kv_got, rtol=0.05, atol=0.05, msg="seg kv_cache")
+
+    ret["fused_qk_seg_us"] = avg_us
+    ret["hip_q_err"] = err_q
+    ret["hip_kv_err"] = err_kv
+    return ret
+
+
+def _concat_seg_ref(
+    kv_c, k_pe, slot_mapping, scale, num_blocks, page_size, kv_cache_dtype
+):
+    """Reference for concat_and_cache_mla_seg (no rope): nope/pe quant + seg layout."""
+    T, kv_lora = kv_c.shape
+    pe_dim = k_pe.shape[-1]
+    out_dtype = dtypes.fp8 if kv_cache_dtype == "fp8" else kv_c.dtype
+    block_stride = page_size * kv_lora + page_size * pe_dim
+    ref = torch.zeros(num_blocks, block_stride, dtype=out_dtype)
+    if kv_cache_dtype == "fp8":
+        inv = 1.0 / scale.item()
+        kv_q = (kv_c.float() * inv).to(out_dtype)
+        pe_q = (k_pe.float() * inv).to(out_dtype)
+    else:
+        kv_q, pe_q = kv_c, k_pe
+    blk = (slot_mapping // page_size).long()
+    off = (slot_mapping % page_size).long()
+    for i in range(T):
+        if slot_mapping[i].item() < 0:
+            continue
+        b, o = blk[i].item(), off[i].item()
+        nbase = o * kv_lora
+        rbase = page_size * kv_lora + o * pe_dim
+        ref[b, nbase : nbase + kv_lora] = kv_q[i]
+        ref[b, rbase : rbase + pe_dim] = pe_q[i]
+    return ref
+
+
+@benchmark()
+def test_concat_and_cache_mla_seg(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    num_tokens: int,
+    device: str,
+    kv_cache_dtype: str,
+):
+    ret = {}
+    torch.set_default_device(device)
+    page_size = SEG_PAGE_SIZE
+
+    num_blocks = (num_tokens + page_size - 1) // page_size + 1
+    total_slots = num_blocks * page_size
+    slot_mapping = torch.tensor(
+        random.sample(range(total_slots), num_tokens),
+        dtype=torch.int64,
+        device=device,
+    )
+
+    kv_c = torch.randn(num_tokens, kv_lora_rank, dtype=dtypes.bf16, device=device) * 0.1
+    k_pe = (
+        torch.randn(num_tokens, qk_rope_head_dim, dtype=dtypes.bf16, device=device)
+        * 0.1
+    )
+    scale = torch.tensor(0.05, dtype=torch.float32, device=device)
+    cache_dtype = dtypes.fp8 if kv_cache_dtype == "fp8" else dtypes.bf16
+
+    block_stride = page_size * kv_lora_rank + page_size * qk_rope_head_dim
+    kv_cache = torch.zeros(num_blocks, block_stride, dtype=cache_dtype, device=device)
+
+    kv_cache_ref = _concat_seg_ref(
+        kv_c, k_pe, slot_mapping, scale, num_blocks, page_size, kv_cache_dtype
+    )
+
+    _, avg_us = run_perftest(
+        aiter.concat_and_cache_mla_seg,
+        kv_c,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        scale,
+    )
+
+    if kv_cache_dtype == "fp8":
+        kv_got = kv_cache.float() * scale.item()
+        kv_exp = kv_cache_ref.float() * scale.item()
+        err_kv = checkAllclose(
+            kv_exp, kv_got, rtol=0.05, atol=0.05, msg="concat seg kv"
+        )
+    else:
+        err_kv = checkAllclose(kv_cache, kv_cache_ref, msg="concat seg kv")
+
+    ret["concat_seg_us"] = avg_us
+    ret["hip_kv_err"] = err_kv
+    return ret
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -645,10 +911,12 @@ parser.add_argument(
     "-c",
     "--case",
     type=str,
-    choices=["normal", "fused_qk"],
+    choices=["normal", "fused_qk", "seg", "concat_seg"],
     nargs="*",
-    default=["normal", "fused_qk"],
-    help="""tests concat and cache or fused_qk.
+    default=["normal", "fused_qk", "seg", "concat_seg"],
+    help="""tests concat and cache, fused_qk, seg (DeepSeek V3.1 MLA fused
+    qk-rope segmented fp8 paged cache), or concat_seg (concat-only segmented
+    paged cache, no rope).
     e.g.: -c normal""",
 )
 
@@ -706,3 +974,41 @@ if "fused_qk" in args.case:
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("fused_rope_concat_and_cache_mla summary (markdown):\n%s", df_md)
+
+
+if "seg" in args.case:
+    df = []
+    for num_token in args.token:
+        for num_heads in args.head:
+            for is_neox in args.is_neox:
+                ret = test_fused_qk_rope_concat_cache_mla_seg(
+                    args.kv_lora_rank,
+                    args.qk_rope_head_dim,
+                    num_token,
+                    num_heads,
+                    args.device,
+                    is_neox,
+                )
+                df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info(
+        "fused_qk_rope_concat_and_cache_mla_seg summary (markdown):\n%s", df_md
+    )
+
+
+if "concat_seg" in args.case:
+    df = []
+    for num_token in args.token:
+        for kv_cache_dtype in args.kv_dtype:
+            ret = test_concat_and_cache_mla_seg(
+                args.kv_lora_rank,
+                args.qk_rope_head_dim,
+                num_token,
+                args.device,
+                kv_cache_dtype,
+            )
+            df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("concat_and_cache_mla_seg summary (markdown):\n%s", df_md)
