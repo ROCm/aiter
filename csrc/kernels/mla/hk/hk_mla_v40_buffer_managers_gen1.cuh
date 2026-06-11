@@ -159,7 +159,7 @@ class QManager8to16bitsV1
                   "QManager8to16bitsV1: RoPE chunk currently assumed to be one full chunk.");
 
     // Per-row record byte stride for the packed fp8 NoPE + scale + pad input.
-    static constexpr uint32_t kPackedNopeStride = T::kQkPackedNopeQElems * sizeof(q_nope_t); // 576
+    static constexpr uint32_t kPackedNopeStride = T::kQkPackedNopeQElems * sizeof(q_nope_t); // 512
     static constexpr uint32_t kRopeStride       = T::kQkRopeHeadDim * sizeof(q_rope_t);      // 128
     static constexpr uint32_t kScaleBaseOff     = 448u; // E8M0 scales start at byte 448 of record.
 

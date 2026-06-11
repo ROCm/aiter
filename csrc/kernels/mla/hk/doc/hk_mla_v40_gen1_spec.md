@@ -67,15 +67,18 @@ with the V4 MLA dimensions:
 | $D_{\mathrm{RoPE}}$ | RoPE tail head dim, bf16 elements | 64 |
 | $D_{\mathrm{QK}}$ | $= D_{\mathrm{NoPE}} + D_{\mathrm{RoPE}}$ | 512 |
 | $D_V$ | output / value head dim | 512 (= $D_{\mathrm{QK}}$) |
-| $B_{\mathrm{rec}}$ | packed NoPE-record bytes / token (incl. dup E8M0 + pad) | 576 |
+| $B_{\mathrm{rec}}$ | packed NoPE-record bytes / token (incl. dup E8M0 + pad) | 512 |
 | $H$ | query heads sharing one KV head | varies (see 2.3) |
 | $\mathrm{mtp}$ | multi-token-prediction tokens / step | varies (see 2.3) |
 | $N_{kv}$ | KV context length for this batch element | varies |
 
-The 576-byte packed record per token is $448$ fp8 NoPE values
-+ $16$ duplicated E8M0 scale bytes + $112$ pad — see `kQkPackedNopeBytes`
-in `hk_mla_utils.cuh`. The "576" is a *byte budget on disk*, not an
-element count.
+The 512-byte packed record per token is $448$ fp8 NoPE values
++ $14$ duplicated E8M0 scale bytes + $50$ pad — see `kQkPackedNopeBytes`
+in `hk_mla_utils.cuh`. The "512" is a *byte budget on disk*, not an
+element count. The $14$ scale bytes are one E8M0 per $32$-element sub-tile
+($448/32 = 14$), duplicated in pairs because the actual quant tile is
+$64$ elements ($\mathrm{scales}[2i] = \mathrm{scales}[2i+1]$); the kernel
+never reads the trailing $50$ pad bytes (contents undefined).
 
 PV consumes the *full* $D_{\mathrm{QK}}$ slice (NoPE-in-bf16 + RoPE-in-bf16
 after softmax cvt), so $D_V = D_{\mathrm{QK}} = 512$. This differs from
@@ -566,8 +569,8 @@ the prologue, before the main loop.
 | `kP1StagingBytesPerWarp` | per-warp staging slot, one buffer | $16 \cdot 64 \cdot 1 = 1024$ B |
 | `kP1NumStagingBuffers` | double-buffer slots | 2 |
 | `kP1StagingBytesPerWarpTotal` | per-warp staging, both buffers | 2048 B |
-| `kPackedNopeStride` | source bytes per token | 576 |
-| `kScaleBaseOff` | first E8M0 scale byte in the 576-byte record | 448 |
+| `kPackedNopeStride` | source bytes per token | 512 |
+| `kScaleBaseOff` | first E8M0 scale byte in the 512-byte record | 448 |
 
 Each warp covers 16 rows of $Q$ (`kTileM = 16`). Each chunk covers 64 cols.
 So one Phase-1 iteration moves a $16 \times 64$ fp8 tile = 1024 B per warp,
@@ -601,7 +604,7 @@ Step 2).
 **Per-lane vmem offset (NoPE bytes):**
 
 $$
-\mathit{vOff}(\ell) = (\ell \gg 2) \cdot 576 + (\ell  \mathbin{\mathrm{and}}  3 \oplus (S \ll 1)) \cdot 16
+\mathit{vOff}(\ell) = (\ell \gg 2) \cdot 512 + (\ell  \mathbin{\mathrm{and}}  3 \oplus (S \ll 1)) \cdot 16
 $$
 
 with $S = (\ell \gg 4)   \mathbin{\mathrm{and}}   1$. The bare expression
@@ -633,10 +636,10 @@ occupies bytes $[r\cdot 64,\, r\cdot 64 + 64)$.
 
 Each row $r \in [0,16)$ has its own scale dword (dup'd to 2 bytes for
 alignment). For chunk $c$, the scale byte lives at byte $448 + 2c$ of the
-576-byte record:
+512-byte record:
 
 $$
-\mathit{vOffScale}(\ell) = (\ell  \mathbin{\mathrm{and}}  15) \cdot 576, \qquad \mathit{iOff} = 448 + 2c
+\mathit{vOffScale}(\ell) = (\ell  \mathbin{\mathrm{and}}  15) \cdot 512, \qquad \mathit{iOff} = 448 + 2c
 $$
 
 Note: `scale_row = lane & 15` (**not** `lane >> 2`). Step 2's consumer
@@ -912,7 +915,7 @@ Split into two halves for double-buffering across chunks:
 **Per-lane vmem offset (NoPE):**
 
 $$
-\mathit{vOffNope}(\ell) = (\ell \gg 2) \cdot 576 + (\ell  \mathbin{\mathrm{and}}  3) \cdot 16, \quad \mathit{iOff} = 256 + 64 c
+\mathit{vOffNope}(\ell) = (\ell \gg 2) \cdot 512 + (\ell  \mathbin{\mathrm{and}}  3) \cdot 16, \quad \mathit{iOff} = 256 + 64 c
 $$
 
 with chunk $c \in \{0,1,2\}$. The vmem side is **straight** (no
@@ -922,7 +925,7 @@ mirroring KvManager.
 **Per-lane vmem offset (scale):**
 
 $$
-\mathit{vOffScale}(\ell) = (\ell \gg 2) \cdot 576 + ((\ell  \mathbin{\mathrm{and}}  3) \gg 1), \quad \mathit{iOff} = 448 + c \cdot 2
+\mathit{vOffScale}(\ell) = (\ell \gg 2) \cdot 512 + ((\ell  \mathbin{\mathrm{and}}  3) \gg 1), \quad \mathit{iOff} = 448 + c \cdot 2
 $$
 
 The `(\ell  \mathbin{\mathrm{and}}  3) \gg 1` gives 0 for col_group 0/1 and 1 for col_group
@@ -1018,7 +1021,7 @@ D-axis (Ch. 8) so QK accumulation is correct.
 ## Chapter 8 — KvManager double-buffered pipeline
 
 KV is the dominant bandwidth consumer (one new 32-row tile per iter,
-$32 \cdot 576$ B fp8 + $32 \cdot 128$ B bf16 RoPE = ~22 KiB / iter)
+$32 \cdot 512$ B fp8 + $32 \cdot 128$ B bf16 RoPE = ~20 KiB / iter)
 and the only inter-iteration LDS resident. The KvManager hides VMEM
 latency via a **double-buffer pong** scheme: while iter $i$'s compute
 reads from the *current* pong, iter $i+1$'s cvt+store fills the
@@ -1127,10 +1130,10 @@ Address split:
 
 | Field | Per-lane / wave-uniform / immediate | Expression |
 |---|---|---|
-| `v_offset` (per-lane) | NoPE fp8 | $\mathit{rowKvLd} \cdot 576 + \mathit{colGroupSwz} \cdot 16$ |
+| `v_offset` (per-lane) | NoPE fp8 | $\mathit{rowKvLd} \cdot 512 + \mathit{colGroupSwz} \cdot 16$ |
 | `s_offset` (wave-uniform) | NoPE fp8 | $c_{tileInHalf} \cdot 64$ |
 | `i_offset` (immediate) | NoPE fp8 | $\text{kTileIdx} \cdot 256$ |
-| `v_offset` (per-lane) | scale | $\mathit{rowKvLd} \cdot 576$ |
+| `v_offset` (per-lane) | scale | $\mathit{rowKvLd} \cdot 512$ |
 | `s_offset` (wave-uniform) | scale | $c_{tileInHalf} \cdot 2$ |
 | `i_offset` (immediate) | scale | $448 + \text{kTileIdx} \cdot 8$ |
 
@@ -1360,7 +1363,45 @@ $\log_2 e \approx 1.4426950408889634$ (the `log2e` constant) so
 
 On the **first iter** ($\mathrm{kIsFirstIter} = \mathrm{true}$):
 $\alpha = 1$, $m^{\mathrm{old}}$ is treated as $-\infty$ via
-`new_row_max = local_max`, and `oaccu`'s rescale is skipped.
+`new_row_max = local_max`, and `oaccu`'s rescale is skipped (PV's mfma
+initializes `oaccu` fresh with a 3-arg, non-accumulating form).
+
+### 9.1.1 Deferred rescale (skip when the max barely moves)
+
+Rescaling `oaccu` by $\alpha$ is a full-width pass over the 128-vgpr
+`oaccu` tile every tile. But $\alpha = \exp_2((m^{\mathrm{old}} -
+m^{\mathrm{new}}) \log_2 e)$ is **exactly 1** when $m^{\mathrm{new}} =
+m^{\mathrm{old}}$, and *negligibly* below 1 when the max rises only
+slightly. The softmax result $\mathrm{oaccu}/\ell$ is invariant to the
+common reference $m$ as long as that reference is (a) shared by numerator
+and denominator and (b) large enough that $\exp_2(S - m)$ does not
+overflow fp32. So $m$ may be kept **stale** for as many tiles as the
+overflow budget allows, deferring the rescale.
+
+The kernel exploits this with a compile-time threshold
+`T::kRescaleThreshold` (in `HkMlaV40DecodeFwdTraits`, logit units):
+
+- Per lane, `local_max - row_max > kRescaleThreshold` decides whether
+  *this lane's* rows need a rescale.
+- The decision is promoted to a **wave-uniform** flag via
+  `__builtin_amdgcn_ballot_w64(...) != 0`. `oaccu` is rescaled per wave
+  (one $\alpha$ branch for the whole wave), but each lane owns different
+  rows — so the rescale is only safe to skip when **every** active lane
+  is under threshold.
+- When the flag is false: keep `row_max` stale, set $\alpha = 1$, and
+  skip the `oaccu` + `row_sum_e` rescale entirely. $P^{(i)} =
+  \exp_2(S^{(i)} - m^{\mathrm{stale}})$ accumulates against the existing
+  reference, staying consistent with the un-rescaled `oaccu`/$\ell$.
+- When true: do the real rescale and advance $m^{\mathrm{new}} =
+  \max(m^{\mathrm{old}}, m^{\mathrm{loc}})$, restoring headroom.
+
+The default `kRescaleThreshold = 8.0` defers until the max would move by
+more than $e^8 \approx 2981\times$ — far under the $e^{88}$ fp32 overflow
+wall, so the fp32 accumulator's extra dynamic range stays well within
+mantissa precision. The skip path is selected by a separate `kDoRescale`
+instantiation of the PV gemm (§10), which omits all the interleaved
+rescale multiplies. Setting the threshold $< 0$ disables the
+optimization (every tile rescales).
 
 ### 9.2 Where $m$ and $\ell$ live
 
@@ -1574,6 +1615,27 @@ The kernel emits these via two `if constexpr` branches: the special
 case (init form on first iter, plain accum on last) emits only the
 2 mfmas + 1 mid-`s_waitcnt`; the canonical case adds the 4 interleaved
 `mul_pair`s.
+
+### 10.4.1 `kDoRescale` — the two PV gemm instantiations
+
+The whole PV gemm (prologue `pk_mul_pair` + the per-iter loop) is a lambda
+templated on `bool kDoRescale`. The kernel picks the instantiation per tile
+from the wave-uniform deferred-rescale decision (§9.1.1):
+
+- `kIsFirstIter` → `kDoRescale = false` (oaccu init, nothing to rescale).
+- else if `do_rescale` (the ballot fired) → `kDoRescale = true` — the full
+  path with all the interleaved `pk_mul_pair`/`mul_pair`s above.
+- else → `kDoRescale = false` — the max was kept stale, so $\alpha = 1$ and
+  **every** rescale multiply is dropped, leaving a clean PV gemm (4 ds_read
+  + 2 mfma + 2 s_waitcnt per iter, no VALU rescale).
+
+Because the rescale multiplies are already hidden under ds_read / mfma
+latency (§10.5), dropping them does not shorten a serial dependency chain —
+the win is the reclaimed VALU/issue slots, which matters only at long
+context where the running max plateaus and the skip path is taken on most
+tiles. At short context the max keeps climbing within a wave, so
+`do_rescale` is almost always true and the full path runs (no regression
+beyond the one ballot).
 
 ### 10.5 Why this pattern hides everything
 

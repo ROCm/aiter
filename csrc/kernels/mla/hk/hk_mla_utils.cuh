@@ -171,6 +171,24 @@ struct HkMlaV40DecodeFwdTraits
     static_assert(kTileM == 16, "kTileM must be 16 (kBlockM / kNumWarps).");
     static constexpr int32_t kRoundMode = 1;
 
+    // Online-softmax oaccu rescale skip threshold, in natural-log (logit)
+    // units (same units as the scaled scores, before the *log2e in exp2).
+    // Per K-tile, when every active lane's new running max exceeds the prior
+    // max by <= this, the running max is kept stale and the per-tile oaccu +
+    // row_sum_e rescale (factor exp(old-new) ~ 1) is skipped wave-wide.
+    //   8.0 (default) -> defer until the max would move by > e^8 (~2981x)
+    //     dynamic range, then force one rescale. Well under the e^88 fp32
+    //     overflow wall, so accumulation error stays below our atol (measured
+    //     bit-exact vs silver). Worth ~3% only at long ctx, where the running
+    //     max plateaus so the skip path is taken on most tiles; at short ctx
+    //     the max keeps climbing within a wave so it ~always rescales (no gain,
+    //     no cost beyond the ballot).
+    //   0.0 -> skip only on an exact wave-wide max tie. Bit-exact but inert
+    //     (rarely fires).
+    //   < 0 -> disables the optimization (the <= test never fires; every tile
+    //     rescales as before).
+    static constexpr float kRescaleThreshold = 8.0f;
+
     // base types
     using q_nope_t  = q_nope_t_;
     using q_rope_t  = q_rope_t_;

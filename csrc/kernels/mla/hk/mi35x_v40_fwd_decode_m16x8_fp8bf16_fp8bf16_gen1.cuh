@@ -775,6 +775,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
             const uint32_t col_0_idx = lane_idx >> 4;
             comp_t local_max{};
             comp_t rescale = 1.0f;
+            // Wave-uniform: does the running max move enough this tile to
+            // require rescaling the prior oaccu / row_sum_e? Decided by ballot
+            // so the whole wave agrees (oaccu rescale is a per-wave op, but
+            // each lane owns different rows). Stays false on kIsFirstIter (no
+            // prior oaccu) and whenever every active lane's new max is within
+            // T::kRescaleThreshold of the stale max -- in which case row_max is
+            // kept stale and the rescale multiplies (all == 1) are skipped.
+            bool do_rescale = false;
             if constexpr(kSkipCompute == false)
             {
                 const uint32_t kv_tile_start_u = static_cast<uint32_t>(kv_tile_start);
@@ -802,15 +810,35 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                                                                  reduce_range,
                                                                  stop_stride>(local_max);
                 }
-                const comp_t new_row_max = kIsFirstIter ? local_max : opus::max(local_max, row_max);
-                rescale =
-                    kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((row_max - new_row_max) * log2e);
-                row_max = new_row_max;
+                if constexpr(kIsFirstIter)
+                {
+                    row_max = local_max;
+                    rescale = 1.0f;
+                }
+                else
+                {
+                    // Lane-private: would this lane's rows need a rescale?
+                    const bool lane_needs =
+                        (local_max - row_max) > static_cast<comp_t>(T::kRescaleThreshold);
+                    // Promote to a wave-uniform decision: rescale iff ANY active
+                    // lane needs it (ballot != 0). When no lane needs it, keep
+                    // row_max stale so exp(p_comp - row_max) accumulates into the
+                    // existing oaccu reference (rescale stays 1.0, mults skipped).
+                    do_rescale = (__builtin_amdgcn_ballot_w64(lane_needs) != 0ull);
+                    if(do_rescale)
+                    {
+                        const comp_t new_row_max = opus::max(local_max, row_max);
+                        rescale  = __builtin_amdgcn_exp2f((row_max - new_row_max) * log2e);
+                        row_max  = new_row_max;
+                    }
+                }
 
                 __builtin_amdgcn_s_setprio(1);
 
                 // exp + sum + warp_reduce(add) -> row_sum_e. Updates p_comp in
-                // place to hold exp(p_comp - new_row_max).
+                // place to hold exp(p_comp - row_max). rescale==1.0 when the
+                // running max was kept stale, so the prior row_sum_e carries
+                // forward unscaled.
                 softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
 
                 // ---- fp32->bf16 pack (p_comp -> p_mfma overlay) ----
@@ -824,60 +852,58 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                 pack_2f32_to_bf16_pair_pinned<k_p_mfma_begin + 3, k_p_comp_begin + 6>();
             }
 
-            auto pk_mul_pair = [&](float r, auto base_c) {
-                constexpr uint32_t base = decltype(base_c)::value;
-                const float2 r2         = {r, r};
-                asm volatile("v_pk_mul_f32 v[%0:%1], %2, v[%0:%1]"
-                             :
-                             : "n"(base), "n"(base + 1), "v"(r2));
-            };
-            auto mul_pair = [&](float r, auto base_c) {
-                constexpr uint32_t base = decltype(base_c)::value;
-                asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base), "v"(r));
-                asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base + 1), "v"(r));
-            };
-
-            // Rescale oaccu (128 fp32 = 32 sub-tiles x 4 vgprs = 16 PV iters
-            // x 2 sub-tiles/iter). V32 PV scaler workaround:
-            //   - vgprs [+0,+1] via 1x v_pk_mul_f32 (prologue only -- v_pk
-            //     after mfma trips the hazard)
-            //   - vgprs [+2,+3] via 2x v_mul_f32; iter 0's 2 sub-tiles done
-            //     in prologue, iters 1..N-1 interleaved between the 2 mfmas
-            //     of iter i-1.
+            // ---- oaccu rescale + PV GEMM ----
             //
-            // Prologue: scale only iter 0's 2 sub-tiles (both halves) via
-            // pk_mul_pair = 4 pk_mul_pair total. The remaining 30 sub-tiles
-            // (iters 1..15) are scaled in-loop by iter i in [0..14]:
-            //   - 2 mul_pair for +0/+1 after the 4 ds_loads (hide under
-            //     ds_read latency)
-            //   - 2 mul_pair for +2/+3 between mfma_a and mfma_b (existing
-            //     pattern)
-            // Both halves of next iter's 2 sub-tiles get scaled per slot.
-            if constexpr((kSkipCompute == false) && (kIsFirstIter == false))
-            {
-                opus::static_for<2>([&](auto s) {
-                    pk_mul_pair(rescale, opus::number<k_o_begin + s.value * 4u + 0u>{});
-                    pk_mul_pair(rescale, opus::number<k_o_begin + s.value * 4u + 2u>{});
-                });
-            }
-
-            __builtin_amdgcn_s_setprio(0);
-
-            // ---- PV GEMM ----
+            // Templated on kDoRescale so the online-softmax oaccu rescale can
+            // be elided entirely when the running max did not move this tile
+            // (do_rescale==false). kDoRescale==false leaves a clean PV gemm
+            // with no v_mul_f32/v_pk_mul_f32 interleaved; kDoRescale==true is
+            // the full path. kDoRescale is only ever instantiated true when
+            // kIsFirstIter==false (the first iter inits oaccu fresh, never
+            // rescales), so kDoRescale implies !kIsFirstIter.
             //
-            // O = P @ V, computed as oaccu^T = V^T @ P^T via
+            // PV GEMM: O = P @ V, computed as oaccu^T = V^T @ P^T via
             // mma_ABt(oaccu, kv, p_mfma). For V4.0 kBlockN=32, each iter
             // covers 32 V-cols (= 2 mfma A-tiles = both base tiles of kv) and
             // writes 2 oaccu base tiles. With kVoHeadDim=512 we run 16 iters.
-            //
             // Per iter: 4 ds_read_b64_tr_b16 to fill kv (8 vgprs = 2 A-tiles),
             // wait lgkmcnt(0), 2 mfmas (3-arg init when kIsFirstIter, else
-            // 4-arg accum).
+            // 4-arg accum). Single-buffered (pv_v_aux unused in Gen.1).
             //
-            // Single-buffered (pv_v_aux unused in Gen.1 -- deferred).
+            // Rescale schedule (kDoRescale only), V32 PV scaler workaround:
+            //   - vgprs [+0,+1] via 1x v_pk_mul_f32 (prologue only -- v_pk
+            //     after mfma trips the hazard)
+            //   - vgprs [+2,+3] via 2x v_mul_f32, iters 1..N-1 interleaved
+            //     between the 2 mfmas of iter i-1.
+            // Prologue scales iter 0's 2 sub-tiles (both halves) via
+            // pk_mul_pair; the remaining 30 sub-tiles (iters 1..15) are scaled
+            // in-loop by iter i in [0..14]: 2 mul_pair for +0/+1 hidden under
+            // ds_read latency, 2 mul_pair for +2/+3 between the 2 mfmas.
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / T::kBlockN; // 16
-            if constexpr(kSkipCompute == false)
-            {
+            auto pv_gemm = [&]<bool kDoRescale>() {
+                auto pk_mul_pair = [&](float r, auto base_c) {
+                    constexpr uint32_t base = decltype(base_c)::value;
+                    const float2 r2         = {r, r};
+                    asm volatile("v_pk_mul_f32 v[%0:%1], %2, v[%0:%1]"
+                                 :
+                                 : "n"(base), "n"(base + 1), "v"(r2));
+                };
+                auto mul_pair = [&](float r, auto base_c) {
+                    constexpr uint32_t base = decltype(base_c)::value;
+                    asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base), "v"(r));
+                    asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base + 1), "v"(r));
+                };
+
+                if constexpr(kDoRescale)
+                {
+                    opus::static_for<2>([&](auto s) {
+                        pk_mul_pair(rescale, opus::number<k_o_begin + s.value * 4u + 0u>{});
+                        pk_mul_pair(rescale, opus::number<k_o_begin + s.value * 4u + 2u>{});
+                    });
+                }
+
+                __builtin_amdgcn_s_setprio(0);
+
                 opus::static_for<num_pv_iter>([&](auto i) {
                     constexpr uint32_t iter            = i.value;
                     constexpr bool has_next            = (iter + 1) < num_pv_iter;
@@ -897,11 +923,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                         .template load_transposed_v_to_gpr<16u, kColOffset + 16u, k_kv_begin + 6>(
                             p_lds_kv_curr);
 
-                    // Scale next iter's BOTH sub-tiles +0/+1 (moved from
-                    // prologue) -- 2 mul_pair = 4 v_mul_f32 hidden under
-                    // ds_read latency.
-                    // Skipped on kIsFirstIter and on the last iter (no next).
-                    if constexpr((kIsFirstIter == false) && has_next)
+                    // Scale next iter's BOTH sub-tiles +0/+1 -- 2 mul_pair =
+                    // 4 v_mul_f32 hidden under ds_read latency. Last iter has
+                    // no next.
+                    if constexpr(kDoRescale && has_next)
                     {
                         mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 0>{});
                         mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 0>{});
@@ -944,15 +969,46 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                     }
                     else
                     {
-                        // Interleave next iter's +2/+3 rescale (2 mul_pair =
-                        // 4 v_mul_f32) into the 2 mfmas, 1 mul_pair per slot.
+                        // 4-arg accumulate. When kDoRescale, interleave next
+                        // iter's +2/+3 rescale (2 mul_pair) into the 2 mfmas,
+                        // 1 mul_pair per slot.
                         hk::mma_ABt(oaccu_a, kv_top, p_mfma, oaccu_a);
-                        mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 2>{});
+                        if constexpr(kDoRescale)
+                        {
+                            mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 2>{});
+                        }
                         __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(0, -1));
                         hk::mma_ABt(oaccu_b, kv_bot, p_mfma, oaccu_b);
-                        mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 2>{});
+                        if constexpr(kDoRescale)
+                        {
+                            mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 2>{});
+                        }
                     }
                 });
+            };
+
+            if constexpr(kSkipCompute == false)
+            {
+                if constexpr(kIsFirstIter)
+                {
+                    // First compute iter inits oaccu fresh -- never rescales.
+                    pv_gemm.template operator()<false>();
+                }
+                else if(do_rescale)
+                {
+                    pv_gemm.template operator()<true>();
+                }
+                else
+                {
+                    pv_gemm.template operator()<false>();
+                }
+            }
+            else
+            {
+                // Skip-compute iter: no QK/softmax/PV ran, but match the prior
+                // code's unconditional priority reset (setprio(1) is only
+                // issued on the compute path).
+                __builtin_amdgcn_s_setprio(0);
             }
 
             // ---- Epilogue ----
