@@ -391,6 +391,131 @@ def pa_ps_fwd_asm(
     return output
 
 
+# ---------------------------------------------------------------------------
+# pa_decode_bf16_asm (gfx1250) — persistent / split-KV paged-attention decode.
+#
+# Wraps the SP3 kernel PA_DECODE_D64_1TG_4W_PS (head_dim=64, page_size=256,
+# gqa=8).  FP8 Q **and** FP8 paged KV cache, bf16 output, **per-tensor** scalar
+# dequant scales for Q/K/V (distinct from the per-token/per-block scale tensors
+# used by pa_ps_fwd_asm).  GPT-OSS style attention sink (per-Q-head fp32 logits
+# in the kernel's pre-scale raw-logit domain) is always read by the kernel.
+#
+# Memory-allocation policy: all GPU tensors are allocated on the Python side;
+# the C++ entry point performs only pointer + stride bookkeeping and the kernel
+# launch (no torch dependency).  The public wrapper `pa_decode_bf16_asm` below
+# handles output/scale/sink allocation and folds the attention softmax scale
+# into key_scale (matching the reference host file sched2/pa_ps.cpp).
+# ---------------------------------------------------------------------------
+@compile_ops(
+    "module_pa_decode_bf16_asm",
+    fc_name="pa_decode_bf16_asm",
+    ffi_type="ctypes",
+)
+def _pa_decode_bf16_asm(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    out: torch.Tensor,
+    qo_indptr: Optional[torch.Tensor],
+    kv_indptr: torch.Tensor,
+    work_indptr: Optional[torch.Tensor],
+    work_info: Optional[torch.Tensor],
+    split_o: Optional[torch.Tensor],
+    split_lse: Optional[torch.Tensor],
+    sink: torch.Tensor,
+    gqa: int,
+    mtp: int,
+    kernelName: Optional[str],
+) -> None: ...
+
+
+def pa_decode_bf16_asm(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    softmax_scale: float,
+    kv_indptr: torch.Tensor,
+    gqa: int = 8,
+    mtp: int = 0,
+    query_scale: float = 1.0,
+    key_scale: float = 1.0,
+    value_scale: float = 1.0,
+    qo_indptr: Optional[torch.Tensor] = None,
+    work_indptr: Optional[torch.Tensor] = None,
+    work_info: Optional[torch.Tensor] = None,
+    split_o: Optional[torch.Tensor] = None,
+    split_lse: Optional[torch.Tensor] = None,
+    sink: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    kernelName: Optional[str] = None,
+) -> torch.Tensor:
+    """Public wrapper for the gfx1250 PA decode kernel.
+
+    Contract details:
+      * `Q`/`K`/`V` are FP8; `out` is bf16 with Q's logical shape.
+      * `query_scale`/`key_scale`/`value_scale` are the per-tensor FP8 dequant
+        scales; the attention `softmax_scale` (typically 1/sqrt(head_dim)) is
+        folded into `key_scale` before launch (the kernel forms
+        scl_log2e = query_scale * key_scale * log2e).
+      * `sink` (optional) holds per-Q-head fp32 logits in the kernel's
+        pre-scale raw-logit domain, shape [kv_head_num * gqa].  The kernel
+        always reads this slot, so when `sink` is None a -inf buffer is
+        allocated, making the sink a numerical no-op.
+    """
+    device = Q.device
+    kv_head_num = K.shape[1]
+    q_head_num = kv_head_num * gqa
+
+    if out is None:
+        out = torch.empty(Q.shape, dtype=torch.bfloat16, device=device)
+
+    q_scale = torch.tensor([query_scale], dtype=torch.float32, device=device)
+    # Fold the attention softmax scale into key_scale (matches pa_ps.cpp).
+    k_scale = torch.tensor(
+        [key_scale * softmax_scale], dtype=torch.float32, device=device
+    )
+    v_scale = torch.tensor([value_scale], dtype=torch.float32, device=device)
+
+    if sink is None:
+        # The kernel is compiled sink-enabled (always reads + merges the sink
+        # slot), so default to a FINITE large-negative buffer (numerical no-op:
+        # exp2((sink-max)*scl) underflows to 0) rather than -inf, which can
+        # produce inf/NaN in the in-kernel sink merge.
+        sink = torch.full((q_head_num,), -1.0e30, dtype=torch.float32, device=device)
+    else:
+        sink = sink.to(torch.float32).contiguous()
+
+    _pa_decode_bf16_asm(
+        Q,
+        K,
+        V,
+        kv_indices,
+        context_lens,
+        q_scale,
+        k_scale,
+        v_scale,
+        out,
+        qo_indptr,
+        kv_indptr,
+        work_indptr,
+        work_info,
+        split_o,
+        split_lse,
+        sink,
+        gqa,
+        mtp,
+        kernelName,
+    )
+    return out
+
+
 def pa_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -937,18 +1062,6 @@ def get_mla_metadata_info_v1(
     if is_hk_m16x4:
         cu_num *= 2
 
-    use_qseqlen_fold = (
-        get_gfx() == "gfx950"
-        and q_dtype == dtypes.fp8
-        and kv_dtype == dtypes.fp8
-        and num_head_qo > 16
-        and not (num_head_qo == 32 and max_seqlen_qo == 2)
-        and (
-            (max_seqlen_qo * (num_head_qo // 16) == 4)
-            or (num_head_qo == 64 and max_seqlen_qo == 2)
-        )
-    )
-
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
     max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 16))
     if (
@@ -969,19 +1082,14 @@ def get_mla_metadata_info_v1(
         )
         or (
             get_gfx() == "gfx950"
-            and num_head_qo == 128
             and kv_dtype == dtypes.fp8
             and q_dtype == dtypes.fp8
-            and effective_seqlen_qo != 4
+            and (
+                (num_head_qo == 32 and effective_seqlen_qo == 4)
+                or (num_head_qo == 64)
+                or (num_head_qo == 128)
+            )
         )
-        or (
-            get_gfx() == "gfx950"
-            and num_head_qo == 64
-            and q_dtype == dtypes.fp8
-            and kv_dtype == dtypes.fp8
-            and effective_seqlen_qo == 1
-        )
-        or use_qseqlen_fold
     ):
         max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
     elif (
