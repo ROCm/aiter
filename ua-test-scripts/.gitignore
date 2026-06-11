@@ -8,3 +8,6 @@ rocprof_analysis/
 *.log
 # standalone driver build artifacts (compiled exe + per-TU objects)
 standalone/build/
+
+# VGPR probe artifacts (large generated .s)
+ua-test-scripts/vgpr_probe/
