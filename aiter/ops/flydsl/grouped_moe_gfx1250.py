@@ -449,6 +449,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if not (is_grouped_a4w4 or is_grouped_a8w4):
         return None
     data_format = "fp4" if is_grouped_a4w4 else "a8w4"
+    # a8w4 weights are fp4 (4-bit) packed into uint8, so w1.dtype shows up as
+    # torch.uint8 upstream. Normalize back to fp4x2 so the CSV lookup key matches
+    # the tuned config (which records q_dtype_w as torch.float4_e2m1fn_x2).
+    q_dtype_w_key = (
+        dtypes.fp4x2
+        if (q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8)
+        else q_dtype_w
+    )
     _grouped_dbg(f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
         return None
@@ -506,7 +514,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         activation=activation,
         dtype=dtype,
         q_dtype_a=q_dtype_a,
-        q_dtype_w=q_dtype_w,
+        q_dtype_w=q_dtype_w_key,
         quant_type=quant_type,
         gate_mode=gate_mode,
     )
@@ -534,6 +542,18 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
         grouped_contiguous_m = True
+    # Auto-switch to the DeepGEMM-style contiguous M scheduler once the batch is
+    # large enough: the dense M-tile layout amortizes better than persistent-M at
+    # high token counts. Threshold is overridable via env (default 512).
+    _contig_token_threshold = _as_int(
+        os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"), 512
+    )
+    if token_num > _contig_token_threshold:
+        grouped_contiguous_m = True
+        _grouped_dbg(
+            f"token_num={token_num} > {_contig_token_threshold}; "
+            "auto-enable contiguous M scheduler"
+        )
     if grouped_contiguous_m:
         grouped_persistent_m = False
         _grouped_dbg("DeepGEMM contiguous M scheduler enabled; persistent-M off")
