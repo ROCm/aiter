@@ -98,6 +98,80 @@ def _fused_qk_rmsnorm_kernel(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="minimax_qk_norm_rope_tp1",
+    develop=True,
+)
+def _minimax_qk_norm_rope_tp1_kernel(
+    qkv: Tensor,
+    q_weight: Tensor,
+    k_weight: Tensor,
+    cos_sin_cache: Tensor,
+    positions: Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    is_neox_style: bool,
+    q_out: Tensor,
+    k_out: Tensor,
+    v_out: Tensor,
+) -> None: ...
+
+
+def minimax_qk_norm_rope_tp1(
+    qkv: Tensor,
+    q_weight: Tensor,
+    k_weight: Tensor,
+    cos_sin_cache: Tensor,
+    positions: Tensor,
+    *,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    is_neox_style: bool,
+    q_out: Optional[Tensor] = None,
+    k_out: Optional[Tensor] = None,
+    v_out: Optional[Tensor] = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """MiniMax TP1 qkv split with full-vector q/k RMSNorm and RoPE.
+
+    Unlike the generic qk-norm RoPE kernels, MiniMax normalizes Q across
+    num_heads_q * head_dim and K across num_heads_k * head_dim.
+    """
+    num_tokens = qkv.size(0)
+    q_size = num_heads_q * head_dim
+    kv_size = num_heads_k * head_dim
+    if q_out is None:
+        q_out = torch.empty((num_tokens, q_size), dtype=qkv.dtype, device=qkv.device)
+    if k_out is None:
+        k_out = torch.empty((num_tokens, kv_size), dtype=qkv.dtype, device=qkv.device)
+    if v_out is None:
+        v_out = torch.empty((num_tokens, kv_size), dtype=qkv.dtype, device=qkv.device)
+
+    _minimax_qk_norm_rope_tp1_kernel(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        num_heads_q,
+        num_heads_k,
+        head_dim,
+        rotary_dim,
+        eps,
+        is_neox_style,
+        q_out,
+        k_out,
+        v_out,
+    )
+    return q_out, k_out, v_out
+
+
 _FUSED_QK_FALLBACK_M = 16384
 
 
