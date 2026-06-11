@@ -498,6 +498,35 @@ def compile_mxscale_gemm(
             return arith.index(n_grid_tiles)
         return (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
 
+    # Static K-pad (compile-time): k_valid is the *valid* (unpadded) extent along
+    # the K (contraction) dim.  When it is smaller than K, the trailing
+    # [k_valid:K) region is the padded tail.  Rather than require the caller to
+    # zero that region in global memory, we shrink each load descriptor's K
+    # (inner-dim) extent to the per-tile valid-remaining count and let the TDM
+    # hardware OOB-fill the padded slots with 0.  Because WMMA always contracts
+    # the full tile_k, a zero-filled A/B fragment contributes exactly 0, so the
+    # result is unchanged (0 * scale = 0, independent of the scale value).  The
+    # K-tile loop count is NOT reduced -- fully-padded trailing tiles still run
+    # their WMMA, but on zero operands.  k_valid must be a multiple of SCALE_BLOCK
+    # so the boundary never splits a 32-element scale block.  Baked into cache_tag
+    # so the aligned/no-pad case (k_valid == K) emits ZERO extra instructions --
+    # the OOB machinery below is entirely const_expr-gated.
+    k_valid_eff = K if k_valid is None else int(k_valid)
+    if not (0 < k_valid_eff <= K):
+        raise ValueError(f"k_valid must be in (0, {K}], got {k_valid!r}")
+    if k_valid_eff % SCALE_BLOCK != 0:
+        raise ValueError(
+            f"k_valid must be a multiple of {SCALE_BLOCK}, got {k_valid_eff}"
+        )
+    k_pad = k_valid_eff < K
+    if k_pad and wave_specialized_tdm:
+        # K-pad rebuilds full per-tile descriptors at each load site; the
+        # wave-specialized loader path (one tensor per wave, shared advancing
+        # descriptor) would need its own per-wave rebuild.  Not implemented yet.
+        raise NotImplementedError(
+            "k_valid (K-pad) is not supported with wave_specialized_tdm"
+        )
+
     if use_fp4_bank_friendly_schedule:
         _bank_half_wm = wmma_m_rep // 2
         _bank_half_wn = wmma_n_rep // 2
@@ -642,6 +671,26 @@ def compile_mxscale_gemm(
                 bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
             zero_i32 = arith.constant(0, type=T.i32)
 
+            def _k_valid_inner(k_base, div, mul, tile_inner):
+                """Per-tile valid extent along K (inner descriptor dim), in this
+                tensor's inner units, for TDM-load OOB zero-fill.  Returns an i32
+                ``min(tile_inner, max(0, k_valid_eff - k_base) / div * mul)``
+                when K-pad is active, else None.  The min-clamp ensures fully-
+                valid tiles keep their original tile extent and only the boundary
+                tile is narrowed."""
+                if const_expr(not k_pad):
+                    return None
+                rem_k = arith.subi(
+                    arith.constant(k_valid_eff, type=T.i32),
+                    arith.index_cast(T.i32, k_base),
+                )
+                rem_k = arith.maxsi(rem_k, zero_i32)
+                if const_expr(div > 1):
+                    rem_k = arith.divui(rem_k, arith.constant(div, type=T.i32))
+                if const_expr(mul > 1):
+                    rem_k = arith.muli(rem_k, arith.constant(mul, type=T.i32))
+                return arith.minsi(rem_k, arith.constant(tile_inner, type=T.i32))
+
             def make_desc_a(memref, k_base):
                 k_packed_off = k_base / arith.index(PACK_FACTOR_A)
                 return tdm_ops.make_tensor_descriptor_2d(
@@ -657,6 +706,7 @@ def compile_mxscale_gemm(
                     num_warps=tdm_desc_num_warps,
                     workgroup_mask=a_mcast_mask,
                     atomic_barrier_enable=atomic_barrier_enable,
+                    valid_inner=_k_valid_inner(k_base, PACK_FACTOR_A, 1, packed_tile_k_a),
                 )
 
             def make_desc_b(memref, k_base, n_offset=0):
@@ -678,6 +728,7 @@ def compile_mxscale_gemm(
                     num_warps=tdm_desc_num_warps,
                     workgroup_mask=b_mcast_mask,
                     atomic_barrier_enable=atomic_barrier_enable,
+                    valid_inner=_k_valid_inner(k_base, PACK_FACTOR_B, 16, packed_tile_k_b * 16),
                 )
 
             def make_desc_as(memref, k_base):
@@ -700,6 +751,7 @@ def compile_mxscale_gemm(
                     num_warps=tdm_desc_num_warps,
                     workgroup_mask=a_mcast_mask,
                     atomic_barrier_enable=atomic_barrier_enable,
+                    valid_inner=None,
                 )
 
             def make_desc_bs(memref, k_base, n_offset=0):
@@ -724,6 +776,7 @@ def compile_mxscale_gemm(
                     num_warps=tdm_desc_num_warps,
                     workgroup_mask=b_mcast_mask,
                     atomic_barrier_enable=atomic_barrier_enable,
+                    valid_inner=None,
                 )
 
             if const_expr(wave_specialized_tdm):
@@ -2170,6 +2223,27 @@ def compile_mxscale_gemm(
                     hi_inc = arith.addi(hi, arith.constant(1, type=T.i32))
                     return new_lo, arith.select(wrapped, hi_inc, hi)
 
+            def _issue_loads_for_tile(stage_lds_idx, k_base):
+                """K-pad load path (non-WS): rebuild full descriptors for one
+                K-tile from its absolute ``k_base`` so each load carries the
+                correct OOB ``valid_inner`` (padded tail zero-filled), then
+                issue.  Used instead of the shared advancing descriptor whenever
+                ``k_pad`` is active."""
+                issue_tdm_loads(
+                    make_desc_a(stages_a_mem[stage_lds_idx], k_base),
+                    make_desc_b(stages_b_mem[stage_lds_idx], k_base),
+                    make_desc_as(stages_as_mem[stage_lds_idx], k_base),
+                    make_desc_bs(stages_bs_mem[stage_lds_idx], k_base),
+                    wave_specialized=wave_specialized_tdm,
+                )
+                if const_expr(stage1_dual_b):
+                    tdm_ops.tensor_load_2d(
+                        make_desc_b(stages_b_up_mem[stage_lds_idx], k_base, N)
+                    )
+                    tdm_ops.tensor_load_2d(
+                        make_desc_bs(stages_bs_up_mem[stage_lds_idx], k_base, N)
+                    )
+
             # Prologue
             if const_expr(wave_specialized_tdm):
                 for i in range_constexpr(pre_loaded):
@@ -2186,6 +2260,11 @@ def compile_mxscale_gemm(
                     active_addr_lo = arith.addi(active_addr_lo, active_adv_i32)
             else:
                 for i in range_constexpr(pre_loaded):
+                    if const_expr(k_pad):
+                        _issue_loads_for_tile(
+                            i, split_k_base + arith.index(i * tile_k)
+                        )
+                        continue
                     dg0_a = vector.from_elements(
                         T.vec(4, T.i32),
                         [pred_const, stages_a_lds_addr[i], addr_lo_a, addr_hi_a],
@@ -2419,6 +2498,13 @@ def compile_mxscale_gemm(
                                     + arith.index(buf_idx * tile_k)
                                 ),
                             ):
+                                if const_expr(k_pad):
+                                    # Rebuild per-tile descriptors so the padded
+                                    # K tail is OOB zero-filled; the shared
+                                    # advancing descriptor can't vary tdim0.
+                                    _issue_loads_for_tile(_ls, _k_off)
+                                    _l2_prefetch(_k_off)
+                                    return
                                 dg0_a = vector.from_elements(
                                     T.vec(4, T.i32),
                                     [
@@ -2923,7 +3009,7 @@ def compile_mxscale_gemm(
     # Bump this when changing generated IR in ways not otherwise reflected in
     # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
     # reusing a previously compiled kernel after source-only descriptor fixes.
-    tdm_store_descriptor_version = 32
+    tdm_store_descriptor_version = 33
 
     # M/N are compile-time constants used throughout the generated IR
     # (B_TOTAL_N, C_N, grid dimensions, output/bias strides, scale descriptor
@@ -2931,9 +3017,9 @@ def compile_mxscale_gemm(
     # compiled for a small inter_dim can be incorrectly reused for a larger
     # grouped MoE shape (e.g. DS TP1 I=2048), causing OOB accesses.
     #
-    # n_valid_eff is the static N-pad extent and MUST be in the key: kernels
-    # compiled for the aligned (no-pad) shape generate different IR (no OOB
-    # machinery) than the padded variant of the same M/N/K.
+    # n_valid_eff / k_valid_eff are the static N-/K-pad extents and MUST be in
+    # the key: kernels compiled for the aligned (no-pad) shape generate
+    # different IR (no OOB machinery) than the padded variant of the same M/N/K.
     cache_tag = (
         data_format,
         M,
