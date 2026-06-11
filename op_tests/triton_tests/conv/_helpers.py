@@ -249,7 +249,6 @@ def run_all_methods(
                 padding,
                 dilation,
                 activation=activation,
-                out_dtype=suite.dtype,
             )
             rtol, atol = _get_tolerances(
                 m, entry, suite, y_ref, N, C, H, W_in, K_out, R, S, stride, dilation
@@ -271,7 +270,6 @@ def run_all_methods(
             padding,
             dilation,
             activation=activation,
-            out_dtype=suite.dtype,
         )
         if _is_3x3_conv(R, S):
             nhwc_method = _select_3x3_method(N, C, H, W_in, K_out, stride, dilation)

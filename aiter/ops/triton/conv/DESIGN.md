@@ -155,7 +155,7 @@ The headline is **`conv2d`**:
 
 ```python
 def conv2d(x, w_oihw, bias=None, stride=(1,1), padding=(0,0), dilation=(1,1),
-           activation="none", out_dtype=None, layout="nchw"):
+           activation="none", layout="nchw"):
 ```
 
 | Argument | Meaning |
@@ -165,7 +165,6 @@ def conv2d(x, w_oihw, bias=None, stride=(1,1), padding=(0,0), dilation=(1,1),
 | `bias` | Optional 1-D bias of length `K_out`, cast to fp32 once at entry. |
 | `stride`, `padding`, `dilation` | Standard `Conv2d` semantics; tuples of ints. |
 | `activation` | `"none" / "relu" / "relu6" / "gelu"` — fused into the kernel epilogue. |
-| `out_dtype` | `None` (default — match input dtype, mirrors `nn.Conv2d`) or one of `torch.float16` / `torch.bfloat16` to override. The fp32 accumulator is downcast at store. |
 | `layout` | `"nchw"` or `"nhwc"` (case-insensitive — passed through `.lower()`). Selects which top-level routing function runs. |
 
 The semi-public method-specific functions (`conv2d_nchw_cblocked`,
@@ -174,9 +173,10 @@ tile size used by the prepack caches. It is intentionally not surfaced on the
 public `conv2d` — every shipped config in `configs/conv/` assumes 64, so the
 parameter has no good user story.
 
-Both `x.dtype` and (when explicitly passed) `out_dtype` are validated at
-entry: anything other than `torch.float16` / `torch.bfloat16` raises
-`ValueError`. `w_oihw.dtype` is trusted to the kernel.
+`x.dtype` is validated at entry: anything other than `torch.float16` /
+`torch.bfloat16` raises `ValueError`. The output always matches the input
+dtype (mirrors `nn.Conv2d`); the fp32 accumulator is downcast at store.
+`w_oihw.dtype` is trusted to the kernel.
 
 Everything else (`conv2d_nchw`, `conv2d_1x1`, `conv2d_winograd_f4x3_cblocked`,
 …) is **semi-public**: not in `__all__` but importable by name. The benchmark

@@ -85,11 +85,11 @@ def _winograd_f4x3_input_transform_kernel(
     pad_h: tl.constexpr,
     pad_w: tl.constexpr,
     BLOCK_C: tl.constexpr,
-    LAYOUT: tl.constexpr = 0,
+    LAYOUT: tl.constexpr = "nchw",
 ):
     INPUT_DTYPE: tl.constexpr = X.type.element_ty
     # X layout: LAYOUT=0 NCHW, LAYOUT=1 NHWC
-    if LAYOUT == 0:
+    if LAYOUT == "nchw":
         stride_x_w: tl.constexpr = 1
         stride_x_h: tl.constexpr = W_in
         stride_x_c: tl.constexpr = H * W_in
@@ -844,14 +844,14 @@ def _winograd_f4x3_output_transform_kernel(
     BLOCK_K: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     ACTIVATION: tl.constexpr,
-    LAYOUT: tl.constexpr = 0,
+    LAYOUT: tl.constexpr = "nchw",
 ):
     # M layout: [36, T, K_out] contiguous
     stride_m_k: tl.constexpr = 1
     stride_m_tile: tl.constexpr = K_out
     stride_m_alpha: tl.constexpr = T * K_out
     # Y layout: LAYOUT=0 NCHW, LAYOUT=1 NHWC
-    if LAYOUT == 0:
+    if LAYOUT == "nchw":
         stride_y_q: tl.constexpr = 1
         stride_y_p: tl.constexpr = Q
         stride_y_k: tl.constexpr = P * Q
@@ -1119,7 +1119,7 @@ def _winograd_f4x3_fused_gemm_output_kernel(
     BLOCK_C: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     ACTIVATION: tl.constexpr,
-    LAYOUT: tl.constexpr = 0,
+    LAYOUT: tl.constexpr = "nchw",
 ):
     """Fused GEMM + output transform for Winograd F(4x4,3x3).
     Processes 6 alphas per column (6 columns = 36 total) sequentially,
@@ -1133,7 +1133,7 @@ def _winograd_f4x3_fused_gemm_output_kernel(
     stride_u_k: tl.constexpr = C_pad
     stride_u_alpha: tl.constexpr = K_out * C_pad
     # Y layout: LAYOUT=0 NCHW, LAYOUT=1 NHWC
-    if LAYOUT == 0:
+    if LAYOUT == "nchw":
         stride_y_q: tl.constexpr = 1
         stride_y_p: tl.constexpr = Q
         stride_y_k: tl.constexpr = P * Q

@@ -43,7 +43,6 @@ def conv2d(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype: Optional[torch.dtype] = None,
     layout="nchw",
 ):
     """Forward 2-D conv on AMD ROCm via Triton. Drop-in for the forward of
@@ -55,7 +54,7 @@ def conv2d(
     Inputs must be fp16 or bf16. ``layout="nhwc"`` runs an NHWC-native kernel
     with no internal layout conversion.
 
-    ``out_dtype=None`` (default) returns output in the input dtype, matching
+    Output dtype always matches the input dtype, matching
     ``torch.nn.Conv2d`` semantics.
 
     Notes
@@ -67,12 +66,6 @@ def conv2d(
     """
     if x.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"conv2d only supports fp16 and bf16 inputs, got {x.dtype}")
-    if out_dtype is None:
-        out_dtype = x.dtype
-    elif out_dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(
-            f"out_dtype must be torch.float16 or torch.bfloat16, got {out_dtype}"
-        )
     layout = layout.lower()
     if layout not in ("nchw", "nhwc"):
         raise ValueError(f"layout must be 'nchw' or 'nhwc', got '{layout}'")
@@ -80,18 +73,14 @@ def conv2d(
     _LOGGER.info(
         f"CONV2D: x={tuple(x.shape)} w={tuple(w_oihw.shape)} stride={stride} "
         f"padding={padding} dilation={dilation} layout={layout} "
-        f"dtype={x.dtype} out_dtype={out_dtype} bias={'yes' if bias is not None else 'no'} "
+        f"dtype={x.dtype} bias={'yes' if bias is not None else 'no'} "
         f"act={activation}"
     )
 
     if layout == "nhwc":
-        return conv2d_nhwc(
-            x, w_oihw, bias, stride, padding, dilation, activation, out_dtype
-        )
+        return conv2d_nhwc(x, w_oihw, bias, stride, padding, dilation, activation)
     else:
-        return conv2d_nchw(
-            x, w_oihw, bias, stride, padding, dilation, activation, out_dtype
-        )
+        return conv2d_nchw(x, w_oihw, bias, stride, padding, dilation, activation)
 
 
 def conv2d_winograd_f4x3(
@@ -102,14 +91,11 @@ def conv2d_winograd_f4x3(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
     layout="nchw",
 ):
     """NCHW/NHWC conv2d using Winograd F(4x4,3x3). Raises ValueError for non-eligible convs."""
     assert x.is_cuda and w_oihw.is_cuda
-    if out_dtype is None:
-        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -124,11 +110,11 @@ def conv2d_winograd_f4x3(
         )
 
     if layout == "nhwc":
-        y = torch.empty((N, K_out, P, Q), device=x.device, dtype=out_dtype).to(
+        y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype).to(
             memory_format=torch.channels_last
         )
     else:
-        y = torch.empty((N, K_out, P, Q), device=x.device, dtype=out_dtype)
+        y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
     U, (_, C_pad) = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
     _launch_winograd_f4x3(
@@ -159,14 +145,11 @@ def conv2d_winograd_f4x3_cblocked(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
 ):
     """NCHW conv2d using Winograd F(4x4,3x3) with NCHWc input layout for coalesced loads.
     Raises ValueError for non-eligible convs."""
     assert x.is_cuda and w_oihw.is_cuda
-    if out_dtype is None:
-        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -180,7 +163,7 @@ def conv2d_winograd_f4x3_cblocked(
             f"got {R}x{S} stride={stride} dilation={dilation} C={C}"
         )
 
-    y = torch.empty((N, K_out, P, Q), device=x.device, dtype=out_dtype)
+    y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
     U, (_, C_pad) = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
     x_blocked, C_pad_blocked = get_or_make_input_pack_cblocked(x, block_k)
@@ -213,14 +196,11 @@ def conv2d_winograd_f4x3_fused(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
 ):
     """NCHW conv2d using Winograd F(4x4,3x3) with fused GEMM+output transform.
     Raises ValueError for non-eligible convs."""
     assert x.is_cuda and w_oihw.is_cuda
-    if out_dtype is None:
-        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -234,7 +214,7 @@ def conv2d_winograd_f4x3_fused(
             f"got {R}x{S} stride={stride} dilation={dilation} C={C}"
         )
 
-    y = torch.empty((N, K_out, P, Q), device=x.device, dtype=out_dtype)
+    y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
     U, (_, C_pad) = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
     _launch_winograd_f4x3_fused(
@@ -264,14 +244,11 @@ def conv2d_1x1(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
     layout="nchw",
 ):
     """NCHW/NHWC conv2d for 1x1 kernels. Raises ValueError for non-1x1."""
     assert x.is_cuda and w_oihw.is_cuda
-    if out_dtype is None:
-        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -280,11 +257,11 @@ def conv2d_1x1(
     P, Q = _out_hw(H, W_in, R, S, stride, padding, dilation)
 
     if layout == "nhwc":
-        y = torch.empty((N, K_out, P, Q), device=x.device, dtype=out_dtype).to(
+        y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype).to(
             memory_format=torch.channels_last
         )
     else:
-        y = torch.empty((N, K_out, P, Q), device=x.device, dtype=out_dtype)
+        y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
     _launch_1x1(
         x,
@@ -314,25 +291,22 @@ def conv2d_general(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
     layout="nchw",
 ):
     """NCHW/NHWC conv2d using general kernel with prepacked weights (5x5, 7x7, etc.)."""
     assert x.is_cuda and w_oihw.is_cuda
-    if out_dtype is None:
-        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
     P, Q = _out_hw(H, W_in, R, S, stride, padding, dilation)
 
     if layout == "nhwc":
-        y = torch.empty((N, K_out, P, Q), device=x.device, dtype=out_dtype).to(
+        y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype).to(
             memory_format=torch.channels_last
         )
     else:
-        y = torch.empty((N, K_out, P, Q), device=x.device, dtype=out_dtype)
+        y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
     w_k, (_, K_pad) = get_or_make_weight_pack(w_oihw.contiguous(), block_k)
     _launch_general(
@@ -368,13 +342,10 @@ def conv2d_nhwc_3x3(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
 ):
     """NHWC conv2d for 3x3 kernels. Raises ValueError for non-3x3."""
     assert x.is_cuda and w_oihw.is_cuda
-    if out_dtype is None:
-        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -382,7 +353,7 @@ def conv2d_nhwc_3x3(
         raise ValueError(f"conv2d_nhwc_3x3 requires 3x3 kernel, got {R}x{S}")
     P, Q = _out_hw(H, W_in, R, S, stride, padding, dilation)
 
-    y = torch.empty((N, K_out, P, Q), device=x.device, dtype=out_dtype).to(
+    y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype).to(
         memory_format=torch.channels_last
     )
     bias_fp32 = bias.float().contiguous() if bias is not None else None
@@ -416,13 +387,10 @@ def conv2d_nchw(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
 ):
     """Hybrid NCHW conv2d: routes to specialized 1x1, 3x3, or general kernel."""
     assert x.is_cuda and w_oihw.is_cuda
-    if out_dtype is None:
-        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -438,7 +406,6 @@ def conv2d_nchw(
             padding,
             dilation,
             activation,
-            out_dtype,
             block_k,
             layout="nchw",
         )
@@ -454,7 +421,6 @@ def conv2d_nchw(
                 padding,
                 dilation,
                 activation,
-                out_dtype,
                 block_k,
             )
         elif method == "winograd_f4x3":
@@ -467,7 +433,6 @@ def conv2d_nchw(
                 padding,
                 dilation,
                 activation,
-                out_dtype,
                 block_k,
             )
         else:
@@ -480,7 +445,6 @@ def conv2d_nchw(
                 padding,
                 dilation,
                 activation,
-                out_dtype,
                 block_k,
             )
     else:
@@ -493,7 +457,6 @@ def conv2d_nchw(
             padding,
             dilation,
             activation,
-            out_dtype,
             block_k,
             layout="nchw",
         )
@@ -507,7 +470,6 @@ def conv2d_nhwc(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
 ):
     """Conv2d with NHWC (channels-last) input and output.
@@ -517,8 +479,6 @@ def conv2d_nhwc(
     in logical NCHW shape with channels_last strides.
     """
     assert x.is_cuda and w_oihw.is_cuda
-    if out_dtype is None:
-        out_dtype = x.dtype
     x = x.to(memory_format=torch.channels_last)
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
@@ -535,7 +495,6 @@ def conv2d_nhwc(
             padding,
             dilation,
             activation,
-            out_dtype,
             block_k,
             layout="nhwc",
         )
@@ -551,7 +510,6 @@ def conv2d_nhwc(
                 padding,
                 dilation,
                 activation,
-                out_dtype,
                 block_k,
                 layout="nhwc",
             )
@@ -565,7 +523,6 @@ def conv2d_nhwc(
                 padding,
                 dilation,
                 activation,
-                out_dtype,
                 block_k,
             )
     else:
@@ -578,7 +535,6 @@ def conv2d_nhwc(
             padding,
             dilation,
             activation,
-            out_dtype,
             block_k,
             layout="nhwc",
         )
@@ -592,14 +548,11 @@ def conv2d_nchw_cblocked(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
 ):
     """NCHW conv2d with channel-blocked input packing for 3x3 kernels.
     Raises ValueError for non-3x3."""
     assert x.is_cuda and w_oihw.is_cuda
-    if out_dtype is None:
-        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -608,7 +561,7 @@ def conv2d_nchw_cblocked(
     if not _is_3x3_conv(R, S):
         raise ValueError(f"conv2d_nchw_cblocked requires 3x3 kernel, got {R}x{S}")
 
-    y = torch.empty((N, K_out, P, Q), device=x.device, dtype=out_dtype)
+    y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
     w_3x3, (_, C_pad) = get_or_make_weight_pack_3x3(w_oihw.contiguous(), block_k)
     Cb = block_k  # packing block size matches weight padding block
