@@ -700,24 +700,10 @@ def _mla_softmax_reducev_kernel(
     e_max = -float("inf")
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
 
-    for split_kv_id in range(0, NUM_KV_SPLITS):
-        # Same [start, end) this split covered in stage-1; empty if start >= end.
-        split_kv_start = kv_len_per_split * split_kv_id
-        split_kv_end = split_kv_start + kv_len_per_split
-        if split_kv_id == NUM_KV_SPLITS - 1:
-            split_kv_end = cur_batch_seq_len
-        is_valid = split_kv_start < split_kv_end
-
-        # Masked loads skip the empty slots entirely (no raw-data read): logits ->
-        # 0.0 and lse -> -inf. The lse==-inf guards then give it zero weight.
-        logits = tl.load(
-            Logits + offs_l + split_kv_id * stride_l_s, mask=is_valid, other=0.0
-        )
-        logits_1 = tl.load(
-            Mid_lse + offs_ml + split_kv_id * stride_ml_s,
-            mask=is_valid,
-            other=-float("inf"),
-        )
+    LOOP_START = NUM_KV_SPLITS - 1 if kv_len_per_split == 0 else 0
+    for split_kv_id in range(LOOP_START, NUM_KV_SPLITS):
+        logits = tl.load(Logits + offs_l + split_kv_id * stride_l_s)
+        logits_1 = tl.load(Mid_lse + offs_ml + split_kv_id * stride_ml_s)
 
         n_e_max = tl.maximum(logits_1, e_max)
         old_scale = tl.where(e_max == -float("inf"), 0.0, tl.exp(e_max - n_e_max))
@@ -728,9 +714,10 @@ def _mla_softmax_reducev_kernel(
         e_sum = e_sum * old_scale + exp_logic
         e_max = n_e_max
 
+    out = acc / e_sum if e_sum > 0.0 else tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
     tl.store(
         O + cur_batch * stride_o_b + cur_head * stride_o_h + offs_d_ckv,
-        acc / e_sum,
+        out,
     )
     if HAS_FINAL_LSE:
         tl.store(
