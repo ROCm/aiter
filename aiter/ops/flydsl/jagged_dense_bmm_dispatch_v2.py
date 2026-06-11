@@ -102,6 +102,7 @@ _SCHEMA_DEFAULTS = {
     "skew_xcd_w": None,  # window for the skew remap (paired with skew_xcd_c)
     "use_mfma_k32": None,  # None -> auto (True on gfx950)
     "block_k": None,  # None -> shape-derived (128 if reduction_K<=256 else 64)
+    "threads": None,  # None -> kernel default (256); 512 halves accum AGPR/thread
     # --- reserved / forward-compatible (ignored on apply today) ---
     "tile_m": 128,  # == BLOCK_M module constant
     "tile_n": 128,  # == BLOCK_N module constant
@@ -414,4 +415,5 @@ def jagged_dense_bmm_dispatched(
         block_m=cfg.get("tile_m") if uniform_seqlen else None,
         block_n=cfg.get("tile_n") if uniform_seqlen else None,
         waves_per_eu=int(cfg.get("waves_per_eu") or 0) if uniform_seqlen else 0,
+        threads=_opt_int(cfg.get("threads")) if uniform_seqlen else None,
     )

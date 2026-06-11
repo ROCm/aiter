@@ -9,10 +9,12 @@
           "use_mfma_k32": false,
           "xcd_c": 32,
           "xcd_w": 16,
+          "threads": 512,
           "cos": 1.0,
-          "ms": 0.5748,
-          "auto_ms": 0.5896,
-          "speedup": 1.026
+          "ms": 0.4874,
+          "auto_ms": 0.5634,
+          "speedup": 1.156,
+          "source": "threads=512 (gfx942, 2026-06-11): 8-warp (1,8,1) layout halves the fp32 C-accumulator AGPR/thread (64->32 fp32 -> 128->64 AGPR), raising occupancy on the AGPR-bound D256 short-K-loop. do_bench cold-L2 uniform 0.487 vs 0.563 (-13.5%) atop the xcd_c=32/w=16 winner, cos=1.0. Loses on D512 (already MFMA-bound) and all skew -> D256-uniform only."
         },
         "B120D512K512N7680": {
           "use_mfma_k32": false,
@@ -27,10 +29,12 @@
           "use_mfma_k32": false,
           "xcd_c": 32,
           "xcd_w": 16,
+          "threads": 512,
           "cos": 1.0,
-          "ms": 4.7373,
-          "auto_ms": 4.8367,
-          "speedup": 1.021
+          "ms": 4.1808,
+          "auto_ms": 4.4491,
+          "speedup": 1.060,
+          "source": "threads=512 (gfx942, 2026-06-11): 8-warp (1,8,1) layout halves the fp32 C-accumulator AGPR/thread, raising occupancy on the AGPR-bound D256 short-K-loop. do_bench cold-L2 uniform 4.181 vs 4.449 (-6.0%) atop xcd_c=32/w=16, cos=1.0. D256-uniform only (D512 and skew regress)."
         },
         "B1024D512K512N7680": {
           "use_mfma_k32": false,

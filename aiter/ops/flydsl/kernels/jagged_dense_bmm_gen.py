@@ -158,7 +158,7 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
     C_FRAG_LEN = BLOCK_M * BLOCK_N // THREADS
     smem_bytes = BLOCK_M * BLOCK_K * STAGES_A * 2  # bf16 A double-buffer staging
 
-    @flyc.kernel
+    @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def jdbba_kernel(
         C: fx.Tensor,  # out    (L, N)   bf16
         A: fx.Tensor,  # jagged (L, K)   bf16
@@ -447,7 +447,7 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
         else:
             tiled_mma = fx.make_tiled_mma(
                 fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
-                fx.make_layout((1, 4, 1), (0, 1, 0)),
+                fx.make_layout((1, THREADS // 64, 1), (0, 1, 0)),
                 fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
             )
         val_per_thr = 8  # 16B / bf16
@@ -503,6 +503,7 @@ def jagged_dense_bmm(
     block_m: int | None = None,
     block_n: int | None = None,
     waves_per_eu: int = 0,
+    threads: int | None = None,
 ):
     """Public entry. Derives N (output) and K (reduction) from the tall dense B
     matrix shape (B_groups * N, K), then dispatches to the per-shape kernel.
@@ -567,7 +568,8 @@ def jagged_dense_bmm(
     # there and nearly doubles runtime (11.3 vs 5.9ms on B1024_D512), so gfx950 keeps
     # the 2-slot, 1-ahead B pipeline.
     b_stages = 2 if _use_mfma_k32() else 3
+    nthreads = THREADS if threads is None else threads
     launch = _build_launcher(
-        N, K, bmn, bnn, block_k, STAGES_A, THREADS, bm, n_groups, xcd_c, xcd_w, use_mfma_k32, waves_per_eu, b_stages
+        N, K, bmn, bnn, block_k, STAGES_A, nthreads, bm, n_groups, xcd_c, xcd_w, use_mfma_k32, waves_per_eu, b_stages
     )
     return launch(C, A, B, BIAS, SEQ_OFFSETS, n_groups, max_seq_len, stream=stream)
