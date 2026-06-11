@@ -352,6 +352,14 @@ namespace py = pybind11;
           py::arg("slot_mapping"),                                                  \
           py::arg("kv_cache_dtype"),                                                \
           py::arg("scale"));                                                        \
+    m.def("concat_and_cache_mla_seg",                                               \
+          &aiter::concat_and_cache_mla_seg,                                         \
+          py::arg("kv_c"),                                                          \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("kv_cache_dtype"),                                                \
+          py::arg("scale"));                                                        \
     m.def("indexer_k_quant_and_cache",                                              \
           &aiter::indexer_k_quant_and_cache,                                        \
           py::arg("k"),                                                             \
@@ -403,7 +411,23 @@ namespace py = pybind11;
           py::arg("cos_cache"),                                                     \
           py::arg("sin_cache"),                                                     \
           py::arg("is_neox"),                                                       \
-          py::arg("is_nope_first"));
+          py::arg("is_nope_first"));                                                \
+    m.def("fused_qk_rope_concat_and_cache_mla_seg",                                 \
+          &aiter::fused_qk_rope_concat_and_cache_mla_seg,                           \
+          py::arg("q_nope"),                                                        \
+          py::arg("q_pe"),                                                          \
+          py::arg("kv_c"),                                                          \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("q_out"),                                                         \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("k_scale"),                                                       \
+          py::arg("q_scale"),                                                       \
+          py::arg("positions"),                                                     \
+          py::arg("cos_cache"),                                                     \
+          py::arg("sin_cache"),                                                     \
+          py::arg("is_neox"),                                                       \
+          py::arg("is_nope_first") = true);
 
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
