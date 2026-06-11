@@ -944,13 +944,21 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
     HIP_CALL(hipGetDevice(&dev));
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
 
+    // Host/device wave-size split: Traits::kWaveSize (== opus::get_warp_size())
+    // resolves to 64 in the host compiler pass regardless of the target arch,
+    // but the device kernel is compiled with the real wave size (32 on wave32
+    // GPUs). Launch parameters must match the *device* kernel, so derive the
+    // block dim and LDS spill boundary from the runtime warpSize instead.
+    const int32_t wave_size  = dev_prop.warpSize;
+    const int32_t block_dim  = Traits::kNumWarps * wave_size;
+
     // 1. Reduce partial map of each split;
     // 2. LSE of each split for rescale output;
-    // 3. Stack for the 1st warp to calculate LSE. The top 4*kWaveSize splits
+    // 3. Stack for the 1st warp to calculate LSE. The top 4*wave_size splits
     //    (4 LSEs per lane) are kept in vgpr; the remainder spills to LDS.
     const int32_t lds_size = params.max_splits * sizeof(int32_t) +
                              params.max_splits * sizeof(float) +
-                             max(0, params.max_splits - 4 * Traits::kWaveSize) * sizeof(float);
+                             max(0, params.max_splits - 4 * wave_size) * sizeof(float);
     if(lds_size <= dev_prop.maxSharedMemoryPerMultiProcessor)
     {
         if(lds_size > (dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy))
@@ -966,13 +974,13 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
             const dim3 grid =
                 dim3(Traits::kNumHeadQ, Traits::kNumThreadGroupPerBh, params.num_reduce_tile);
             kn_mla_reduce_v1<Traits, lse_t, out_t>
-                <<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
+                <<<grid, block_dim, lds_size, stream>>>(params);
         }
         else
         {
             const dim3 grid = dim3(ps_grid_size);
             kn_mla_reduce_v1_ps<Traits, lse_t, out_t>
-                <<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
+                <<<grid, block_dim, lds_size, stream>>>(params);
         }
     }
     else
