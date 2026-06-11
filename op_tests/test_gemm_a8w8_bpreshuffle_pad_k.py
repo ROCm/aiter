@@ -43,9 +43,7 @@ def test_gemm_a8w8_bpreshuffle_pads_activation_to_weight_k(monkeypatch):
     monkeypatch.setattr(gemm_mod, "get_GEMM_config_with_quant_type", fake_config)
     monkeypatch.setattr(gemm_mod, "gemm_a8w8_bpreshuffle_ck", fake_ck)
 
-    out = gemm_mod.gemm_a8w8_bpreshuffle(
-        xq, wq, x_scale, w_scale, dtype=torch.bfloat16
-    )
+    out = gemm_mod.gemm_a8w8_bpreshuffle(xq, wq, x_scale, w_scale, dtype=torch.bfloat16)
 
     assert out.shape == (2, 16)
     assert out.dtype == torch.bfloat16
@@ -60,6 +58,4 @@ def test_gemm_a8w8_bpreshuffle_rejects_short_weight_k():
     w_scale = torch.ones((16, 1), device="cuda", dtype=torch.float32)
 
     with pytest.raises(RuntimeError, match="WQ K >= XQ K"):
-        gemm_mod.gemm_a8w8_bpreshuffle(
-            xq, wq, x_scale, w_scale, dtype=torch.bfloat16
-        )
+        gemm_mod.gemm_a8w8_bpreshuffle(xq, wq, x_scale, w_scale, dtype=torch.bfloat16)

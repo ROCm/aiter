@@ -640,8 +640,7 @@ def gemm_a8w8_bpreshuffle(
         k = XQ.shape[-1]
     elif w_k < k:
         raise RuntimeError(
-            f"gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K={w_k}, "
-            f"XQ K={k}"
+            f"gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K={w_k}, " f"XQ K={k}"
         )
 
     # if (
