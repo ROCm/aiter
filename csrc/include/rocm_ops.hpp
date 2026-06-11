@@ -1572,7 +1572,8 @@ namespace py = pybind11;
           py::arg("residual_out"),                                                                 \
           py::arg("weight"),                                                                       \
           py::arg("epsilon"),                                                                      \
-          py::arg("use_model_sensitive_rmsnorm") = 0);                                             \
+          py::arg("use_model_sensitive_rmsnorm") = 0,                                              \
+          py::arg("weight_bias")                  = 0.0);                                          \
     m.def("rmsnorm2d_fwd_with_smoothquant",                                                        \
           &rmsnorm2d_with_smoothquant,                                                             \
           py::arg("out"),                                                                          \
@@ -2019,7 +2020,8 @@ namespace py = pybind11;
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
           py::arg("group_size")    = 0,      \
-          py::arg("shuffle_scale") = false); \
+          py::arg("shuffle_scale") = false,  \
+          py::arg("weight_bias")   = 0.0);   \
     m.def("add_rmsnorm",                     \
           &aiter::add_rmsnorm,               \
           py::arg("out"),                    \
@@ -2027,7 +2029,8 @@ namespace py = pybind11;
           py::arg("residual_in"),            \
           py::arg("residual_out"),           \
           py::arg("weight"),                 \
-          py::arg("epsilon"));               \
+          py::arg("epsilon"),                \
+          py::arg("weight_bias") = 0.0);     \
     m.def("rmsnorm_quant",                   \
           &aiter::rmsnorm_quant,             \
           py::arg("out"),                    \

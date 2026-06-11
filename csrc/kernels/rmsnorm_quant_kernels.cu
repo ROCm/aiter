@@ -12,6 +12,19 @@
 
 namespace aiter {
 
+template <typename T>
+__device__ __forceinline__ T rmsnorm_store_cast(float x)
+{
+    if constexpr(std::is_same_v<T, opus::bf16_t>)
+    {
+        return opus::fp32_to_bf16<0>(x);
+    }
+    else
+    {
+        return opus::cast<T>(x);
+    }
+}
+
 template <typename DTYPE_I, typename DTYPE_O, int BlockSize, int thread_data_size, bool ADD_RESIDUAL=true, bool FUSE_QUANT=true, bool interleave = false, int num_row = 1>
 __global__ void add_rmsnorm_quant_kernel(
     DTYPE_O* out,
@@ -21,6 +34,7 @@ __global__ void add_rmsnorm_quant_kernel(
     DTYPE_I* residual_in,
     DTYPE_I* weight,
     double epsilon,
+    double weight_bias,
     int m,
     int n,
     int input_stride,
@@ -92,9 +106,11 @@ __global__ void add_rmsnorm_quant_kernel(
                 auto& thread_data_residual_in = thread_data_ix2[1];
                 DTYPE_I* residual_out_ptr = residual_out + idx * static_cast<int64_t>(residual_out_stride);
                 auto buffer_residual_out = opus::make_gmem<DTYPE_I>(residual_out_ptr, oob_i * sizeof(DTYPE_I));
+                vec_i residual_store;
                 for(int i = 0; i < thread_data_size; i++)
                 {
                     thread_data_float[i] = static_cast<float>(thread_data_i[i]) + static_cast<float>(thread_data_residual_in[i]);
+                    residual_store[i] = rmsnorm_store_cast<DTYPE_I>(thread_data_float[i]);
                 }
 
                 if constexpr(use_prefetch)
@@ -104,7 +120,7 @@ __global__ void add_rmsnorm_quant_kernel(
                     thread_data_i = load_vector_nbytes<DTYPE_I, thread_data_size, load_chunk_bytes, load_aux, interleave, interleave_size>(buffer_input, row_offset);
                 }
 
-                store_vector<DTYPE_I, float, thread_data_size, load_aux, interleave, interleave_size, num_load_inst, DTYPE_I>(buffer_residual_out, thread_data_float, row_offset);
+                store_vector<DTYPE_I, DTYPE_I, thread_data_size, load_aux, interleave, interleave_size, num_load_inst, DTYPE_I>(buffer_residual_out, residual_store, row_offset);
                 
                 if constexpr(use_prefetch)
                 {
@@ -160,8 +176,10 @@ __global__ void add_rmsnorm_quant_kernel(
             for(int i = 0; i < thread_data_size / 2; i++)
             {
                 vec2_f& thread_data_weight_float2 = rcp;
-                thread_data_weight_float2[0] = static_cast<float>(thread_data_weight[2 * i]);
-                thread_data_weight_float2[1] = static_cast<float>(thread_data_weight[2 * i + 1]);
+                thread_data_weight_float2[0] =
+                    static_cast<float>(thread_data_weight[2 * i]) + static_cast<float>(weight_bias);
+                thread_data_weight_float2[1] =
+                    static_cast<float>(thread_data_weight[2 * i + 1]) + static_cast<float>(weight_bias);
                 // if constexpr(std::is_same_v<DTYPE_I, opus::bf16_t>)
                 // {
                 //     asm volatile(
@@ -278,7 +296,20 @@ __global__ void add_rmsnorm_quant_kernel(
             }
             else
             {
-                store_vector<DTYPE_O_STORE, float, thread_data_size, RT, interleave, interleave_size, num_load_inst, DTYPE_O>(buffer_out, thread_data_float, row_offset);
+                if constexpr(std::is_same_v<DTYPE_O_STORE, opus::bf16_t> ||
+                             std::is_same_v<DTYPE_O_STORE, opus::fp16_t>)
+                {
+                    vec_o output_store;
+                    for(int i = 0; i < vec_size_o; i++)
+                    {
+                        output_store[i] = rmsnorm_store_cast<DTYPE_O_STORE>(thread_data_float[i]);
+                    }
+                    store_vector<DTYPE_O_STORE, DTYPE_O_STORE, vec_size_o, RT, interleave, interleave_size, num_load_inst, DTYPE_O>(buffer_out, output_store, row_offset);
+                }
+                else
+                {
+                    store_vector<DTYPE_O_STORE, float, thread_data_size, RT, interleave, interleave_size, num_load_inst, DTYPE_O>(buffer_out, thread_data_float, row_offset);
+                }
             }
         };
         #pragma nounroll
@@ -310,7 +341,7 @@ __global__ void add_rmsnorm_quant_kernel(
                                                                                                      reinterpret_cast<DTYPE_I*>(input.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(residual_in.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(weight.data_ptr()), \
-                                                                                                     epsilon, m, n, input_stride, residual_in_stride, residual_out_stride, out_stride, group_size, shuffle_scale); \
+                                                                                                     epsilon, weight_bias, m, n, input_stride, residual_in_stride, residual_out_stride, out_stride, group_size, shuffle_scale); \
                                                                                                      });
 
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT) \
@@ -362,7 +393,8 @@ __global__ void add_rmsnorm_quant_kernel(
         torch::Tensor& weight,
         double epsilon,
         int group_size = 0,
-        bool shuffle_scale = false
+        bool shuffle_scale = false,
+        double weight_bias = 0.0
     )
     {
         int n = input.size(1);
@@ -433,6 +465,7 @@ __global__ void add_rmsnorm_quant_kernel(
         int residual_out_stride = residual_out.stride(0);
         int input_stride = input.stride(0);
         int out_stride = out.stride(0);
+        double weight_bias = 0.0;
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -483,7 +516,8 @@ __global__ void add_rmsnorm_quant_kernel(
         torch::Tensor& residual_in,
         torch::Tensor& residual_out,
         torch::Tensor& weight,
-        double epsilon
+        double epsilon,
+        double weight_bias = 0.0
     )
     {
         torch::Tensor scale = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
@@ -551,6 +585,7 @@ __global__ void add_rmsnorm_quant_kernel(
         int out_stride = out.stride(0);
         int group_size = 0;
         bool shuffle_scale = false;
+        double weight_bias = 0.0;
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();

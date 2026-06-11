@@ -81,6 +81,7 @@ def rmsnorm2d_fwd_with_add(
     weight: Tensor,
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
+    weight_bias: float = 0.0,
 ) -> None:
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         rmsnorm2d_fwd_with_add_ck(
@@ -91,9 +92,10 @@ def rmsnorm2d_fwd_with_add(
             weight,
             epsilon,
             use_model_sensitive_rmsnorm,
+            weight_bias,
         )
     else:
-        add_rmsnorm(out, input, residual_in, residual_out, weight, epsilon)
+        add_rmsnorm(out, input, residual_in, residual_out, weight, epsilon, weight_bias)
 
 
 @compile_ops("module_rmsnorm")
@@ -202,6 +204,7 @@ def rmsnorm2d_fwd_with_add_ck(
     weight: Tensor,
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
+    weight_bias: float = 0.0,
 ) -> None: ...
 
 
@@ -240,6 +243,7 @@ def add_rmsnorm_quant(
     epsilon: float,
     group_size: int = 0,
     shuffle_scale: bool = False,
+    weight_bias: float = 0.0,
 ) -> None: ...
 
 
@@ -251,6 +255,7 @@ def add_rmsnorm(
     residual_out: Tensor,
     weight: Tensor,
     epsilon: float,
+    weight_bias: float = 0.0,
 ) -> None: ...
 
 

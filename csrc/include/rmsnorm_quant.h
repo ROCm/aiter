@@ -14,14 +14,16 @@ void add_rmsnorm_quant(torch::Tensor& out,
                        torch::Tensor& weight,
                        double epsilon,
                        int group_size     = 0,
-                       bool shuffle_scale = false);
+                       bool shuffle_scale = false,
+                       double weight_bias = 0.0);
 
 void add_rmsnorm(torch::Tensor& out,
                  torch::Tensor& input,
                  torch::Tensor& residual_in,
                  torch::Tensor& residual_out,
                  torch::Tensor& weight,
-                 double epsilon);
+                 double epsilon,
+                 double weight_bias = 0.0);
 
 void rmsnorm_quant(torch::Tensor& out,
                    torch::Tensor& input,

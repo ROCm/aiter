@@ -48,6 +48,7 @@ void rmsnorm2d(
                    nullptr, // p_invRms
                    nullptr, // p_y_unquant
                    static_cast<float>(epsilon),
+                   0.0f,
                    m,
                    n,
                    stride,
@@ -76,7 +77,8 @@ void rmsnorm2d_with_add(
     torch::Tensor& residual_out, // [m ,n]
     torch::Tensor& weight,       // [1 ,n]
     double epsilon,
-    int use_model_sensitive_rmsnorm = 0) // 0: Use default RMSNorm; 1: Use T5-like implementation
+    int use_model_sensitive_rmsnorm = 0, // 0: Use default RMSNorm; 1: Use T5-like implementation
+    double weight_bias = 0.0)
 {
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
@@ -112,6 +114,7 @@ void rmsnorm2d_with_add(
                    nullptr,                 // p_invRms
                    nullptr,                 // p_y_unquant
                    static_cast<float>(epsilon),
+                   static_cast<float>(weight_bias),
                    m,
                    n,
                    stride,
@@ -167,6 +170,7 @@ void rmsnorm2d_with_smoothquant(
                    nullptr,           // p_invRms
                    nullptr,           // p_y_unquant
                    static_cast<float>(epsilon),
+                   0.0f,
                    m,
                    n,
                    stride,
@@ -226,6 +230,7 @@ void rmsnorm2d_with_add_smoothquant(
                    out_before_quant.has_value() ? out_before_quant.value().data_ptr()
                                                 : nullptr, // p_y_unquant
                    static_cast<float>(epsilon),
+                   0.0f,
                    m,
                    n,
                    stride,
@@ -279,6 +284,7 @@ void rmsnorm2d_with_dynamicquant(
                    nullptr,           // p_invRms
                    nullptr,           // p_y_unquant
                    static_cast<float>(epsilon),
+                   0.0f,
                    m,
                    n,
                    stride,
@@ -334,6 +340,7 @@ void rmsnorm2d_with_add_dynamicquant(
                    nullptr,                 // p_invRms
                    nullptr,                 // p_y_unquant
                    static_cast<float>(epsilon),
+                   0.0f,
                    m,
                    n,
                    stride,

@@ -328,7 +328,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # the fallback path only needs the valid hidden region for RMSNorm.
             ar_out = ar_out[..., :n].contiguous()
 
-        effective_weight = weight_ if weight_bias == 0.0 else weight_ + weight_bias
         if use_general_path or x_pad_to_multiple > 0 or input_n != n:
             # The custom fused AR+RMS kernel still falls back here for strided rows
             # or when custom all-reduce is unavailable for padded outputs.
@@ -342,6 +341,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
             ar_out_2d = ar_out.reshape(-1, ar_out.shape[-1])
             res_inp_2d = res_inp_.reshape(-1, res_inp_.shape[-1])
+            effective_weight = weight_ if weight_bias == 0.0 else weight_ + weight_bias
             out_2d, residual_out_2d = fused_add_rmsnorm_pad(
                 ar_out_2d,
                 effective_weight,
@@ -363,9 +363,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             ar_out,
             res_inp_,
             residual_out,
-            effective_weight,
+            weight_,
             eps,
             0,
+            weight_bias=weight_bias,
         )
         return out, residual_out
 

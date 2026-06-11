@@ -38,7 +38,8 @@ void rmsnorm2d_with_add(
     torch::Tensor& residual_out, // [m ,n]
     torch::Tensor& weight,       // [1 ,n]
     double epsilon,
-    int use_model_sensitive_rmsnorm); // 0: Use default RMSNorm; 1: Use T5-like implementation
+    int use_model_sensitive_rmsnorm, // 0: Use default RMSNorm; 1: Use T5-like implementation
+    double weight_bias = 0.0);
 
 void rmsnorm2d_with_smoothquant(
     torch::Tensor& out,    // [m ,n]
