@@ -327,6 +327,7 @@ def _mla_decode_fwd_kernel(
     segm_max_ptr,  # [total_num_tokens, num_query_heads, num_segments]
     segm_expsum_ptr,  # [total_num_tokens, num_query_heads, num_segments]
     query_ptr,  # [total_num_tokens, num_query_heads, head_size]
+    query_scales_ptr,  # nvfp4 query scales (unused for non-shuffled bf16/fp8)
     kv_buffer_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
@@ -338,6 +339,8 @@ def _mla_decode_fwd_kernel(
     block_tables_stride: tl.int64,  # int
     query_stride_0: tl.int64,  # int
     query_stride_1: tl.int64,  # int, should be equal to head_size
+    query_scales_stride_0: tl.int64,  # int
+    query_scales_stride_1: tl.int64,  # int
     KV_LORA_RANK: tl.constexpr,  # int
     QK_ROPE_HEAD_DIM: tl.constexpr,  # int
     stride_kv_buffer_0: tl.int64,  # int
