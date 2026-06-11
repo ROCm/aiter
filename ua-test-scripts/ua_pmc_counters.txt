@@ -1,0 +1,15 @@
+# rocprofv3 counter-collection input for the UA prefill kernel.
+# Each `pmc:` line is ONE hardware pass (<=8 SQ counters/pass on gfx9).
+# Reduced/derived into bottleneck metrics by analyze_ua_counters.py.
+
+# Pass 1 — activity + instruction mix
+pmc: GRBM_GUI_ACTIVE GRBM_COUNT SQ_WAVES SQ_BUSY_CYCLES SQ_INSTS_VALU SQ_INSTS_MFMA SQ_INSTS_VMEM SQ_INSTS_LDS
+
+# Pass 2 — busy / VALU+MFMA occupancy / stalls
+pmc: SQ_VALU_MFMA_BUSY_CYCLES SQ_ACTIVE_INST_VALU SQ_WAIT_INST_LDS SQ_WAIT_ANY SQ_BUSY_CU_CYCLES SQ_INSTS_SMEM
+
+# Pass 3 — LDS bank conflicts
+pmc: SQ_LDS_BANK_CONFLICT SQ_LDS_IDX_ACTIVE
+
+# Pass 4 — L2 (TCC) hit/miss + DRAM read traffic & backpressure
+pmc: TCC_HIT_sum TCC_MISS_sum TCC_EA0_RDREQ_sum TCC_EA0_RDREQ_DRAM_sum TCC_EA0_RDREQ_DRAM_CREDIT_STALL_sum TCC_BUSY_sum

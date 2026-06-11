@@ -1225,6 +1225,60 @@ def run_sage(
     return out
 
 
+# ----------------------------------------------------------------------------
+# ASM FP8 FMHA (hand-tuned gfx950 assembly) throughput baseline — opt-in via
+# `--contiguous --asmfp8`. flash_attn_fp8_pertensor_func dispatches the v3 ASM
+# launcher (fmha_v3_fwd), which loads
+# hsa/gfx950/fmha_v3_fwd/fwd_hd128_fp8.co — the hand-tuned dense prefill kernel
+# (the ASM-optimised counterpart of SageAttention). Q/K/V are per-tensor FP8
+# E4M3, output BF16. Takes the same dense [b, s, h, d] input as the Sage leg
+# (built from the contiguous gather) and quantises here, so the comparison
+# runs on identical logical values. Dense-only: same single-shape / non-SWA /
+# non-top-left guards as Sage.
+# ----------------------------------------------------------------------------
+@perftest()
+def run_asmfp8(
+    out,
+    q_bshd,
+    k_bshd,
+    v_bshd,
+    *,
+    scale,
+    causal,
+):
+    from aiter.ops.mha import flash_attn_fp8_pertensor_func
+
+    fp8_dtype = _pick_fp8_dtype()
+    fp8_max = float(torch.finfo(fp8_dtype).max)
+
+    def _q(t):
+        amax = t.detach().abs().amax().clamp(min=1e-9)
+        descale = amax / fp8_max
+        qt = (t / descale).clamp_(-fp8_max, fp8_max).to(fp8_dtype)
+        # The ASM launcher expects per-tensor descales as 1-element fp32
+        # tensors (folded into _s_scale_log2e for Q/K, into 1/L for V).
+        return qt, descale.reshape(1).to(dtypes.fp32)
+
+    q_fp8, q_ds = _q(q_bshd)
+    k_fp8, k_ds = _q(k_bshd)
+    v_fp8, v_ds = _q(v_bshd)
+
+    res = flash_attn_fp8_pertensor_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_descale=q_ds,
+        k_descale=k_ds,
+        v_descale=v_ds,
+        causal=causal,
+        softmax_scale=scale,
+    )
+    if isinstance(res, (tuple, list)):
+        res = res[0]
+    out.copy_(res.reshape(out.shape).to(out.dtype))
+    return out
+
+
 def _ck_dispatch_supported(cfg: CaseConfig) -> Optional[str]:
     """Return None if the kernel can run this config, else a skip reason."""
     if cfg.head_size not in (64, 128):
@@ -1260,6 +1314,7 @@ def test_unified_attention_ck(
     device: str = "cuda",
     run_triton_backend: bool = True,
     run_sage_backend: bool = False,
+    run_asmfp8_backend: bool = False,
     contiguous: bool = False,
     skip_reference: bool = False,
     allow_splitkv: bool = True,
@@ -1306,7 +1361,7 @@ def test_unified_attention_ck(
     # The same packed bf16 K/V doubles as the dense input for the optional
     # SageAttention leg, so build it whenever either is requested.
     packed = None
-    if contiguous or run_sage_backend:
+    if contiguous or run_sage_backend or run_asmfp8_backend:
         packed = _build_contiguous_kv(
             t["key_cache"], t["value_cache"], t["k_fp8"], t["v_fp8"],
             t["block_tables"], t["kv_lens_list"], device,
@@ -1427,6 +1482,45 @@ def test_unified_attention_ck(
                 aiter.logger.info(f"sagev1 run failed for {cfg}: {e}")
                 out_sage = None
 
+    # ASM FP8 FMHA (hand-tuned gfx950 assembly) throughput baseline — opt-in
+    # via `--asmfp8` (requires `--contiguous`). Same dense constraints as the
+    # Sage leg (uniform single-shape, non-SWA, non-top-left). Fed the same
+    # logical K/V as bf16 reshaped to dense [b, s, h, d]; run_asmfp8 quantises
+    # to per-tensor FP8 and dispatches the v3 ASM launcher (fwd_hd128_fp8.co).
+    time_asmfp8 = None
+    out_asmfp8 = None
+    asmfp8_skipped_reason = None
+    if run_asmfp8_backend:
+        uniform = (len(set(t["query_lens"])) == 1
+                   and len(set(t["kv_lens_list"])) == 1)
+        if not contiguous:
+            asmfp8_skipped_reason = "asmfp8 requires --contiguous"
+        elif window_size_left >= 0 or window_size_right > 0:
+            asmfp8_skipped_reason = "asmfp8 (dense) has no SWA"
+        elif mask_type == 1:
+            asmfp8_skipped_reason = "asmfp8 has no top-left causal"
+        elif not uniform:
+            asmfp8_skipped_reason = "asmfp8 requires uniform single-shape seq lens"
+        else:
+            try:
+                b = len(t["query_lens"])
+                sq = t["query_lens"][0]
+                sk = t["kv_lens_list"][0]
+                hq, hk = num_heads
+                pk_bf16, pv_bf16 = packed[0], packed[1]
+                q_bshd = t["query"].view(b, sq, hq, head_size).to(dtypes.bf16)
+                k_bshd = pk_bf16.view(b, sk, hk, head_size).to(dtypes.bf16)
+                v_bshd = pv_bf16.view(b, sk, hk, head_size).to(dtypes.bf16)
+                out_asmfp8_buf = torch.empty_like(out_ck)
+                out_asmfp8, time_asmfp8 = run_asmfp8(
+                    out_asmfp8_buf, q_bshd, k_bshd, v_bshd,
+                    scale=t["scale"], causal=(mask_type != 0),
+                )
+            except Exception as e:
+                asmfp8_skipped_reason = str(e).splitlines()[0][:160]
+                aiter.logger.info(f"asmfp8 run failed for {cfg}: {e}")
+                out_asmfp8 = None
+
     # Reference (torch). The reference always consumes the high-precision
     # source tensors — quantisation noise shows up in the kernels' outputs
     # but never in the reference, which is the convention the upstream
@@ -1435,7 +1529,7 @@ def test_unified_attention_ck(
     # bidirectional case as well as causal.
     atol = 1.5e-1 if cfg.q_dtype == "fp8" else 1.5e-2
     rtol = 1.5e-1 if cfg.q_dtype == "fp8" else 1e-2
-    ck_passed = triton_passed = sage_passed = None
+    ck_passed = triton_passed = sage_passed = asmfp8_passed = None
     if not skip_reference:
         ref = ref_paged_attn(
             t["query"], t["key_cache"], t["value_cache"],
@@ -1463,10 +1557,20 @@ def test_unified_attention_ck(
                 ref, out_sage, atol=1.5e-1, rtol=1.5e-1,
                 msg=f"Sage   vs ref     | {cfg} | {time_sage:>8.2f} us",
             ) == 0
+        if out_asmfp8 is not None:
+            # Same FP8 quantisation error class as Sage; loose FP8 tolerance,
+            # reported informationally (not gated in CI).
+            asmfp8_passed = checkAllclose(
+                ref, out_asmfp8, atol=1.5e-1, rtol=1.5e-1,
+                msg=f"ASMfp8 vs ref     | {cfg} | {time_asmfp8:>8.2f} us",
+            ) == 0
 
     speedup = (time_triton / time_ck) if (time_triton is not None) else None
     # >1 means CK-UA is faster than SageAttention-v1.
     sage_speedup = (time_sage / time_ck) if (time_sage is not None) else None
+    # >1 means CK-UA is faster than the ASM FP8 kernel (<1 means the ASM
+    # kernel wins — the expected case at large prefill shapes).
+    asmfp8_speedup = (time_asmfp8 / time_ck) if (time_asmfp8 is not None) else None
     # num_splits surfaces what the transparent split-KV wrapper picked
     # for this shape. Single-shape mode tags the report with it so any
     # perf surprise can be attributed to the combine-kernel path vs the
@@ -1484,11 +1588,16 @@ def test_unified_attention_ck(
         "ck_vs_tri":   round(speedup, 2) if speedup is not None else None,
         # >1 means CK-UA is faster than SageAttention-v1.
         "ck_vs_sage":  round(sage_speedup, 2) if sage_speedup is not None else None,
+        "asmfp8_us":   round(time_asmfp8, 2) if time_asmfp8 is not None else None,
+        # >1 means CK-UA is faster than the ASM FP8 kernel.
+        "ck_vs_asmfp8": round(asmfp8_speedup, 2) if asmfp8_speedup is not None else None,
         "ck_pass":     ck_passed,
         "triton_pass": triton_passed,
         "sage_pass":   sage_passed,
+        "asmfp8_pass": asmfp8_passed,
         "triton_skip": triton_skipped_reason,
         "sage_skip":   sage_skipped_reason,
+        "asmfp8_skip": asmfp8_skipped_reason,
         "num_splits":  num_splits,
         "status":      "ok",
     }
@@ -1631,6 +1740,15 @@ def main():
                              "internal Int8 Q/K + FP8 V quantisation). Without "
                              "--sagev1 the comparison is just the Triton UA "
                              "kernel.")
+    parser.add_argument("--asmfp8", action="store_true",
+                        help="Add a hand-tuned ASM FP8 FMHA leg "
+                             "(flash_attn_fp8_pertensor_func -> v3 launcher -> "
+                             "hsa/gfx950/fmha_v3_fwd/fwd_hd128_fp8.co). Same "
+                             "constraints as --sagev1: requires --contiguous "
+                             "and a uniform single-shape, non-SWA, non-top-left "
+                             "config (dense bshd, per-tensor FP8 E4M3 Q/K/V, "
+                             "BF16 out). This is the SOTA perf target for the "
+                             "CK-UA prefill at hd128.")
     parser.add_argument("--no-reference", action="store_true",
                         help="Skip the torch reference (perf-only run).")
     parser.add_argument("--no-splitkv", action="store_true",
@@ -1775,6 +1893,9 @@ def main():
     run_sage = bool(args.sagev1)
     if run_sage and not contiguous:
         parser.error("--sagev1 requires --contiguous")
+    run_asmfp8 = bool(args.asmfp8)
+    if run_asmfp8 and not contiguous:
+        parser.error("--asmfp8 requires --contiguous")
 
     # Pool sizing. Single-shape (bench) mode auto-sizes the physical KV pool
     # to a realistic, oversubscribed value (see `_auto_num_blocks`) so a
@@ -1889,6 +2010,7 @@ def main():
                 seed=args.seed,
                 run_triton_backend=run_triton,
                 run_sage_backend=run_sage,
+                run_asmfp8_backend=run_asmfp8,
                 contiguous=contiguous,
                 skip_reference=args.no_reference,
                 allow_splitkv=not args.no_splitkv,
@@ -1918,6 +2040,7 @@ def main():
                                             seed=args.seed,
                                             run_triton_backend=run_triton,
                                             run_sage_backend=run_sage,
+                                            run_asmfp8_backend=run_asmfp8,
                                             contiguous=contiguous,
                                             skip_reference=args.no_reference,
                                             allow_splitkv=not args.no_splitkv,
@@ -1954,6 +2077,7 @@ def main():
                     seed=args.seed,
                     run_triton_backend=run_triton,
                     run_sage_backend=run_sage,
+                    run_asmfp8_backend=run_asmfp8,
                     contiguous=contiguous,
                     skip_reference=args.no_reference,
                     allow_splitkv=not args.no_splitkv,
@@ -1981,8 +2105,8 @@ def main():
         # the ones that are constant across rows to keep the table
         # readable.
         for noise_col in ("seed", "device", "run_triton_backend",
-                           "run_sage_backend", "contiguous",
-                           "skip_reference", "allow_splitkv"):
+                           "run_sage_backend", "run_asmfp8_backend",
+                           "contiguous", "skip_reference", "allow_splitkv"):
             if noise_col in df.columns:
                 df = df.drop(columns=[noise_col])
         aiter.logger.info(
@@ -2097,6 +2221,12 @@ def _print_single_shape_report(
     sage_skip = row.get("sage_skip")
     if sage_skip:
         print(f"  Sage:           SKIPPED ({sage_skip})")
+    asmfp8_p = row.get("asmfp8_pass")
+    if asmfp8_p is not None:
+        print(f"  ASMfp8 vs ref:  {'PASS' if asmfp8_p else 'FAIL'} (FP8, informational)")
+    asmfp8_skip = row.get("asmfp8_skip")
+    if asmfp8_skip:
+        print(f"  ASMfp8:         SKIPPED ({asmfp8_skip})")
 
     print("-" * 80)
     print("Timing (median of @perftest iters):")
@@ -2124,6 +2254,14 @@ def _print_single_shape_report(
         print(f"  Sage time      = {ms:8.4f} ms")
         print(f"  Sage Bandwidth = {bw:8.2f} GB/s")
         print(f"  Sage TFLOPs    = {tflops:8.2f}")
+    asmfp8_us = row.get("asmfp8_us")
+    if asmfp8_us is not None:
+        ms = asmfp8_us / 1e3
+        tflops = (flops / 1e12) / (ms / 1e3)
+        bw = mem_gb / (ms / 1e3)
+        print(f"  ASMfp8 time    = {ms:8.4f} ms")
+        print(f"  ASMfp8 Bandwidth={bw:8.2f} GB/s")
+        print(f"  ASMfp8 TFLOPs  = {tflops:8.2f}")
     if ck_us is not None and tr_us is not None:
         speedup = tr_us / ck_us
         winner = "CK-UA" if speedup >= 1.0 else "Triton"
@@ -2132,6 +2270,10 @@ def _print_single_shape_report(
         speedup = sage_us / ck_us
         winner = "CK-UA" if speedup >= 1.0 else "Sage"
         print(f"  UA vs Sage     = {speedup:.3f}x ({winner} wins)")
+    if ck_us is not None and asmfp8_us is not None:
+        speedup = asmfp8_us / ck_us
+        winner = "CK-UA" if speedup >= 1.0 else "ASMfp8"
+        print(f"  UA vs ASMfp8   = {speedup:.3f}x ({winner} wins)")
     print("=" * 80)
 
 
