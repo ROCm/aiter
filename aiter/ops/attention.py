@@ -1493,8 +1493,8 @@ def decode_update_mla_metadata_v1(
     )
 
 
-@compile_ops("module_hk_mla_v32_fwd", develop=True)
-def hk_mla_v32_decode_fwd(
+@compile_ops("module_hk_mla_v32_fwd_mi3xx", fc_name="hk_mla_v32_decode_fwd", develop=True)
+def hk_mla_v32_decode_fwd_mi3xx(
     # [num_seqs, num_heads, head_size]
     query: torch.Tensor,
     # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
@@ -1519,14 +1519,53 @@ def hk_mla_v32_decode_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_hk_mla_v40_fwd", develop=True)
-def hk_mla_v40_decode_fwd(
-    # [total_q, num_heads, V4_DIM_QK_PACKED=576]  FP8
-    #   per-token bytes: NOPE 448 + dup-E8M0 16 + zero pad 112
+def hk_mla_v32_decode_fwd(
+    query: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    split_output: torch.Tensor,
+    split_lse: torch.Tensor,
+    final_output: torch.Tensor,
+) -> None:
+    """Arch-dispatching entry point for the HK V3.2 MLA decode kernel."""
+    arch_id = get_gfx()
+    if arch_id in ("gfx942", "gfx950"):
+        hk_mla_v32_decode_fwd_mi3xx(
+            query,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            work_indptr,
+            work_info_set,
+            max_seqlen_q,
+            softmax_scale,
+            split_output,
+            split_lse,
+            final_output,
+        )
+    else:
+        raise NotImplementedError(
+            f"hk_mla_v32_decode_fwd has no implementation for arch {arch_id}"
+        )
+
+
+@compile_ops("module_hk_mla_v40_fwd_mi3xx", fc_name="hk_mla_v40_decode_fwd", develop=True)
+def hk_mla_v40_decode_fwd_mi3xx(
+    # [total_q, num_heads, V4_DIM_QK_PACKED=512]  FP8
+    #   per-token bytes: NOPE 448 + dup-E8M0 14 + pad 50
     query: torch.Tensor,
     # [total_q, num_heads, V4_DIM_ROPE=64]        BF16
     query_rope: torch.Tensor,
-    # [num_page, page_size, num_kv_heads=1, 576]  FP8 (same packing as Q)
+    # [num_page, page_size, num_kv_heads=1, 512]  FP8 (same packing as Q)
     kv_buffer: torch.Tensor,
     # [num_page, page_size, num_kv_heads=1, 64]   BF16
     kv_buffer_rope: torch.Tensor,
@@ -1542,3 +1581,46 @@ def hk_mla_v40_decode_fwd(
     final_output: torch.Tensor,
     attn_sink: Optional[torch.Tensor] = None,
 ) -> None: ...
+
+
+def hk_mla_v40_decode_fwd(
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    kv_buffer_rope: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    split_output: torch.Tensor,
+    split_lse: torch.Tensor,
+    final_output: torch.Tensor,
+    attn_sink: Optional[torch.Tensor] = None,
+) -> None:
+    """Arch-dispatching entry point for the HK V4.0 MLA decode kernel."""
+    arch_id = get_gfx()
+    if arch_id in ("gfx942", "gfx950"):
+        hk_mla_v40_decode_fwd_mi3xx(
+            query,
+            query_rope,
+            kv_buffer,
+            kv_buffer_rope,
+            qo_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            work_indptr,
+            work_info_set,
+            max_seqlen_q,
+            softmax_scale,
+            split_output,
+            split_lse,
+            final_output,
+            attn_sink,
+        )
+    else:
+        raise NotImplementedError(
+            f"hk_mla_v40_decode_fwd has no implementation for arch {arch_id}"
+        )
