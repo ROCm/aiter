@@ -455,9 +455,7 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
     {
         p_lds_reduce_partial_map[i] = params.p_reduce_partial_map[reduce_tile_start + i];
     }
-    __builtin_amdgcn_s_waitcnt(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+    __syncthreads();
 
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
     const int32_t reduce_partial_map_1 = p_lds_reduce_partial_map[1];
@@ -539,8 +537,7 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
                                                  g_final_lse,
                                                  final_lse_head_byte_offset);
 
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
+        __syncthreads();
 
         reduce_output_massive<Traits>(params,
                                       seq_idx,
@@ -575,9 +572,7 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
     {
         p_lds_reduce_partial_map[i] = params.p_reduce_partial_map[reduce_tile_start + i];
     }
-    __builtin_amdgcn_s_waitcnt(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+    __syncthreads();
 
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
     const int32_t reduce_partial_map_1 = p_lds_reduce_partial_map[1];
@@ -790,7 +785,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
             work_idx += gridDim.x;
             while(work_idx < tot_work)
             {
-                __builtin_amdgcn_s_barrier();
+                __syncthreads();
                 continue_flag = main_loop(work_idx);
                 if(continue_flag == false)
                 {
