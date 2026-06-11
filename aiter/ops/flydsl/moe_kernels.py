@@ -1106,7 +1106,7 @@ def flydsl_moe_stage1(
         # such slot. Pass the real buffer when fused; a 1-byte placeholder
         # when blockscale but not fused (slot still required); None otherwise
         # so _s1_args_std omits the slot entirely.
-        _is_blockscale_s1 = a_dtype == "fp8" and b_dtype == "fp8" and not _is_splitk
+        _is_blockscale_s1 = a_dtype == "fp8" and b_dtype == "fp8"
         if _fused_fp8_in_gemm:
             _s1_scale_arg = out_scale_sorted_flat.view(-1)
         elif _is_blockscale_s1:
