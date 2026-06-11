@@ -166,15 +166,6 @@ def tiling(BM):
     return n_load_waves, rows_per_wave, rows_per_wave // 8
 
 
-# Back-compat module constants (BM32 defaults; the test imports BM/ASCALE_BYTES).
-BM = 32
-kMChunks = kmchunks(BM)
-SAQ_SLOT_BYTES = saq_slot_bytes(BM)
-LDS_ACC_FLOATS = BM * BN
-LDS_BYTES = lds_bytes(BM)
-ASCALE_BYTES = ascale_bytes(BM)
-
-
 _PTR3 = "!llvm.ptr<3>"
 
 
