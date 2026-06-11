@@ -2297,15 +2297,15 @@ def unified_attention(
     output_scale=None,
     shuffled_kv_cache=False,
     loop_variant=None,
-    num_splits=1,
     # Config knobs routed from collect_data_lds.sh (None => inline auto-selection).
+    num_splits=None,
     num_warps=None,
     tile_size=None,
     waves_per_eu=None,
     remove_indirect_access = False,
     block_m=None,
     num_buffers=None,
-    reduce=False,
+    reduce=True,
 ):
     """
     Internal wrapper for the gfx1250 gluon kernel.
@@ -2346,7 +2346,7 @@ def unified_attention(
     ALL_DECODE = max_seqlen_q == 1
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
     if ALL_DECODE:
-        auto_loop_variant = 0 if SLIDING_WINDOW > 0 else 2
+        auto_loop_variant = 0
         auto_block_m = (
             16
             if NUM_QUERIES_PER_KV <= 16
@@ -2355,6 +2355,14 @@ def unified_attention(
         auto_num_warps = 1
         auto_waves_per_eu = 1
         auto_tile_size = 128 if (Q_FP8 and KV_FP8) else 64
+        target_num_prgs = 256
+        auto_num_splits = target_num_prgs // (NUM_SEQS * NUM_KV_HEADS)
+        auto_num_splits = max(1, auto_num_splits)
+        auto_num_splits = 2
+        # we shouldnt split further than this
+        # min_kv_per_split = 1024
+        # auto_num_splits = min(auto_num_splits, max_seqlen_k // min_kv_per_split)
+        # auto_num_splits = max(1, auto_num_splits) 
     elif SLIDING_WINDOW > 0:
         # Prefill, sliding window
         auto_loop_variant = 0
@@ -2362,6 +2370,7 @@ def unified_attention(
         auto_num_warps = 4
         auto_waves_per_eu = 4
         auto_tile_size = 128 if (Q_FP8 and KV_FP8) else 64
+        auto_num_splits = 1
     else:
         # Prefill, full attention
         auto_loop_variant = 2
@@ -2369,13 +2378,14 @@ def unified_attention(
         auto_num_warps = 4
         auto_waves_per_eu = 2
         auto_tile_size =  128 if (Q_FP8 and KV_FP8) else 64
+        auto_num_splits = 1
 
     num_warps = auto_num_warps if num_warps is None else num_warps
     waves_per_eu = auto_waves_per_eu if waves_per_eu is None else waves_per_eu
     BLOCK_M = auto_block_m if block_m is None else block_m
     loop_variant = auto_loop_variant if loop_variant is None else loop_variant
     TILE_SIZE = auto_tile_size if tile_size is None else tile_size
-
+    num_splits = auto_num_splits if num_splits is None else num_splits
     # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page
     if not shuffled_kv_cache:
         TILE_SIZE = BLOCK_SIZE
