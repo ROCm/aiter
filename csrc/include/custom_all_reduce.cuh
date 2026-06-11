@@ -2237,13 +2237,23 @@ apply_neox_rope_pack_shuffle(
 {
     using P = typename opus::vector_t<T, PACK_SIZE>;
     const int embed_dim = rotary_dim / 2;
-    if(access_id_in_head >= rotary_dim)
-        return x;
-
     const int64_t pos_id = position_ids[token_id];
     const T* cache_ptr   = cos_sin_cache + pos_id * (int64_t)rotary_dim;
-    const T* cos_ptr     = cache_ptr;
-    const T* sin_ptr     = cache_ptr + embed_dim;
+    T* cos_ptr     = const_cast<T*>(cache_ptr);
+    T* sin_ptr     = const_cast<T*>(cache_ptr + embed_dim);
+
+    P cos_vec;
+    P sin_vec;
+    if (access_id_in_head < rotary_dim) {
+        if (access_id_in_head < embed_dim) {
+            cos_vec = *reinterpret_cast<P*>(&cos_ptr[access_id_in_head]);
+            sin_vec = *reinterpret_cast<P*>(&sin_ptr[access_id_in_head]);
+        } else {
+            cos_vec = *reinterpret_cast<P*>(&cos_ptr[access_id_in_head - embed_dim]);
+            sin_vec = *reinterpret_cast<P*>(&sin_ptr[access_id_in_head - embed_dim]);
+        }
+    }
+
     const int partner_delta = embed_dim / PACK_SIZE;
     P y;
 
@@ -2254,12 +2264,12 @@ apply_neox_rope_pack_shuffle(
         if(dim < rotary_dim)
         {
             const float self = static_cast<float>(x[i]);
-            const float peer = shfl_xor<float>(self, partner_delta);
-            const int half_dim = dim % embed_dim;
-            const float c = static_cast<float>(cos_ptr[half_dim]);
-            const float s = static_cast<float>(sin_ptr[half_dim]);
-            y[i] = dim < embed_dim ? downcast_s<T>(self * c - peer * s)
-                                   : downcast_s<T>(self * c + peer * s);
+            const float peer_xor = __shfl_xor(self, partner_delta, 64);
+            const float peer_up = __shfl_up(self, partner_delta, 64);
+            const float c = static_cast<float>(cos_vec[i]);
+            const float s = static_cast<float>(sin_vec[i]);
+            y[i] = dim < embed_dim ? downcast_s<T>(self * c - peer_xor * s)
+                                   : downcast_s<T>(self * c + peer_up * s);
         }
         else
         {
