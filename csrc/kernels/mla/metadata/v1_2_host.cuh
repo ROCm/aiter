@@ -178,7 +178,7 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                         // This TG can process all of this qo_tile's remaining_blocks to the causal
                         // boundary.
 			// Always emit a partial slot (partial_o_loc) so the mla_reduce_v1 runs and
-		        // populates the final LSE. We must do this even when the number of splits is 1.	
+			// populates the final LSE. We must do this even when the number of splits is 1.	
                         const int32_t partial_o_loc = qlen_granularity * partial_tile_idx++;
                         const int32_t kv_end =
                             std::min(kv_start + consuming_blocks,
