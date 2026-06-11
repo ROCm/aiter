@@ -35,7 +35,6 @@ K = 7168  # gemm1 contraction = hidden_size (DEFAULT / KIMI; per-shape value com
 INTER = 512  # per-shard MLP intermediate (OUTPUT side; DEFAULT / KIMI; per-shape
 #              value comes from the compile arg D_INTER. All INTER-derived sizes
 #              are computed from the arg via the *_for() helpers below.)
-N_OUT = 2 * INTER  # 1024
 TOPK = 9  # DEFAULT / KIMI; per-shape value comes from the compile arg TOPK (only
 #           used host-side in gemm1_grid for the launch bound).
 
