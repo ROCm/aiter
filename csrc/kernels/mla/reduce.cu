@@ -113,6 +113,18 @@ struct MlaReduceKernelV1Params
                                // reduce_partial_map[1] - reduce_partial_map[0].
 };
 
+// Launch-time configuration derived from the runtime device properties (kept
+// separate from MlaReduceKernelV1Params, which only carries problem inputs).
+struct MlaReduceKernelV1Configs
+{
+    // Capacity (in #splits) of the p_lds_lse_scale / p_lds_local_lse LDS
+    // regions. The massive LSE path writes a fixed span per bucket
+    // (num_lse_per_thr * wave_size), which can exceed max_splits, so these
+    // regions are sized to that span instead of max_splits. See
+    // dispatch_mla_reduce_v1 for the exact formula.
+    int32_t lds_scale_cap;
+};
+
 template <typename T>
 __device__ T integer_divide_ceil_power2(T x, T y, T y_log2)
 {
@@ -422,6 +434,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
 
 template <typename Traits, MlaReduceProblemSize kProblemSize, typename lse_t, typename out_t>
 __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params,
+                                           const int32_t lds_scale_cap,
                                            const int32_t warp_idx,
                                            const int32_t head_idx,
                                            const int32_t block_idx,
@@ -432,7 +445,7 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
 {
     int32_t* p_lds_reduce_partial_map = p_lds;
     float* p_lds_lse_scale            = reinterpret_cast<float*>(p_lds + params.max_splits);
-    float* p_lds_local_lse            = p_lds_lse_scale + params.max_splits;
+    float* p_lds_local_lse            = p_lds_lse_scale + lds_scale_cap;
     LocalLse<float, kProblemSize> local_lse(
         p_lds_local_lse, opus::get_warp_size(), opus::lane_id());
 
@@ -677,7 +690,8 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
 
 template <typename Traits, typename lse_t, typename out_t>
 __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
-    void kn_mla_reduce_v1_ps(const MlaReduceKernelV1Params params)
+    void kn_mla_reduce_v1_ps(const MlaReduceKernelV1Params params,
+                             const MlaReduceKernelV1Configs configs)
 {
     extern __shared__ int32_t p_lds[];
 
@@ -716,6 +730,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                            MlaReduceProblemSize::kUpToWaveSizeSplits,
                                            lse_t,
                                            out_t>(params,
+                                                  configs.lds_scale_cap,
                                                   warp_idx,
                                                   head_idx,
                                                   block_idx,
@@ -730,6 +745,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                            MlaReduceProblemSize::kUpTo4xWaveSizeSplits,
                                            lse_t,
                                            out_t>(params,
+                                                  configs.lds_scale_cap,
                                                   warp_idx,
                                                   head_idx,
                                                   block_idx,
@@ -744,6 +760,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                            MlaReduceProblemSize::kUpToLdsLimit,
                                            lse_t,
                                            out_t>(params,
+                                                  configs.lds_scale_cap,
                                                   warp_idx,
                                                   head_idx,
                                                   block_idx,
@@ -787,7 +804,8 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
 
 template <typename Traits, typename lse_t, typename out_t>
 __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
-    void kn_mla_reduce_v1(const MlaReduceKernelV1Params params)
+    void kn_mla_reduce_v1(const MlaReduceKernelV1Params params,
+                          const MlaReduceKernelV1Configs configs)
 {
     extern __shared__ int32_t p_lds[];
 
@@ -810,17 +828,17 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
         if(num_splits <= Traits::kWaveSize)
         {
             mla_reduce_v1_impl_massive<Traits, MlaReduceProblemSize::kUpToWaveSizeSplits, lse_t, out_t>(
-                params, warp_idx, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
+                params, configs.lds_scale_cap, warp_idx, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
         }
         else if(num_splits <= 4 * Traits::kWaveSize)
         {
             mla_reduce_v1_impl_massive<Traits, MlaReduceProblemSize::kUpTo4xWaveSizeSplits, lse_t, out_t>(
-                params, warp_idx, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
+                params, configs.lds_scale_cap, warp_idx, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
         }
         else
         {
             mla_reduce_v1_impl_massive<Traits, MlaReduceProblemSize::kUpToLdsLimit, lse_t, out_t>(
-                params, warp_idx, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
+                params, configs.lds_scale_cap, warp_idx, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
         }
     }
     // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata
@@ -952,13 +970,29 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
     const int32_t wave_size  = dev_prop.warpSize;
     const int32_t block_dim  = Traits::kNumWarps * wave_size;
 
-    // 1. Reduce partial map of each split;
-    // 2. LSE of each split for rescale output;
+    // lds_scale_cap = LDS span (in #splits) written by the massive LSE path,
+    // which is num_lse_per_thr * wave_size per bucket and can exceed max_splits:
+    //   <= wave_size splits      -> 1 LSE/lane -> span = wave_size
+    //   <= 4*wave_size splits    -> 4 LSE/lane -> span = 4*wave_size
+    //   >  4*wave_size splits    -> ceil(max_splits/wave_size) LSE/lane
+    //                               -> span = round_up(max_splits, wave_size)
+    const int32_t round_up_splits =
+        ((params.max_splits + wave_size - 1) / wave_size) * wave_size;
+
+    MlaReduceKernelV1Configs configs = {};
+    configs.lds_scale_cap =
+        (params.max_splits <= wave_size)
+            ? wave_size
+            : ((params.max_splits <= 4 * wave_size) ? 4 * wave_size : round_up_splits);
+
+    // 1. Reduce partial map of each split (max_splits entries);
+    // 2. LSE scale of each split for rescale output (lds_scale_cap entries);
     // 3. Stack for the 1st warp to calculate LSE. The top 4*wave_size splits
-    //    (4 LSEs per lane) are kept in vgpr; the remainder spills to LDS.
+    //    (4 LSEs per lane) are kept in vgpr; the remainder spills to LDS
+    //    (lds_scale_cap - 4*wave_size entries).
     const int32_t lds_size = params.max_splits * sizeof(int32_t) +
-                             params.max_splits * sizeof(float) +
-                             max(0, params.max_splits - 4 * wave_size) * sizeof(float);
+                             configs.lds_scale_cap * sizeof(float) +
+                             max(0, configs.lds_scale_cap - 4 * wave_size) * sizeof(float);
     if(lds_size <= dev_prop.maxSharedMemoryPerMultiProcessor)
     {
         if(lds_size > (dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy))
@@ -974,13 +1008,13 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
             const dim3 grid =
                 dim3(Traits::kNumHeadQ, Traits::kNumThreadGroupPerBh, params.num_reduce_tile);
             kn_mla_reduce_v1<Traits, lse_t, out_t>
-                <<<grid, block_dim, lds_size, stream>>>(params);
+                <<<grid, block_dim, lds_size, stream>>>(params, configs);
         }
         else
         {
             const dim3 grid = dim3(ps_grid_size);
             kn_mla_reduce_v1_ps<Traits, lse_t, out_t>
-                <<<grid, block_dim, lds_size, stream>>>(params);
+                <<<grid, block_dim, lds_size, stream>>>(params, configs);
         }
     }
     else

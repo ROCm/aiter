@@ -337,16 +337,16 @@ def main():
 
     # Cover both kernel paths:
     #   num_splits in [2,3]  -> simple impl
-    #   num_splits >= 4      -> massive impl (<=64 / <=256 buckets)
+    #   num_splits >= 4      -> massive impl (<=wave_size / <=4*wave_size buckets)
     big = min(cu_count, 256)  # largest single-tile split count we can safely run
     split_configs = [
         [2],  # simple, single tile
         [3, 2],  # simple, multi tile
         [4],  # massive, exactly threshold
-        [8, 5, 7],  # massive <=64, ragged
-        [33],  # massive <=64
-        [big],  # massive: <=256 bucket if cu_count>64, else <=64
-        [2, 4, 16, 64],  # mixed: simple + massive buckets
+        [8, 5, 7],  # massive, ragged tiles
+        [33],  # massive, single large tile
+        [big],  # massive, largest tile that fits LDS (CU-capped)
+        [2, 4, 16, 64],  # mixed: simple + massive tiles
     ] + [
         [6] * 40
     ]  # many tiles -> exercises persistent-grid path
