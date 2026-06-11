@@ -26,8 +26,6 @@ Math:
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
-
 
 # ── Codebook lookup ──────────────────────────────────────────────────────────
 

@@ -10,11 +10,8 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
     sage_fwd_mxfp4,
 )
-import math
-import torch.nn.functional as F
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     sage_quant_mxfp4,
-    sage_quant_lloymax,
     sage_quant_lloymax_packed,
 )
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_lloymax import (

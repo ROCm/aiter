@@ -228,9 +228,12 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if not args.dv: args.dv = args.d
-    if not args.sk: args.sk = args.sq
-    if not args.hk: args.hk = args.hq
+    if not args.dv:
+        args.dv = args.d
+    if not args.sk:
+        args.sk = args.sq
+    if not args.hk:
+        args.hk = args.hq
     run_benchmark(args)
 
 
