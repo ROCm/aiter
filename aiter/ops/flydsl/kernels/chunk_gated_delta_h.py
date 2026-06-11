@@ -68,6 +68,24 @@ def _mfma_bf16_16x16x32(a_bf16x8, b_bf16x8, acc_f32x4):
     )
 
 
+def _mfma_bf16_16x16x16(a_bf16x4, b_bf16x4, acc_f32x4):
+    """Single mfma_f32_16x16x16_bf16 instruction (gfx950 / CDNA bf16 1k form).
+
+    K-tile is 16 (half of the 16x16x32 variant), so A and B are bf16x4
+    (one ds_read_tr16_b64 worth) instead of bf16x8. Output C is f32x4,
+    identical layout to the 16x16x32 form.
+
+    The ``rocdl.mfma.f32.16x16x16bf16.1k`` op takes its A/B operands as
+    ``vector<4xi16>`` (bf16 bit-pattern as signless i16), so bitcast the
+    bf16x4 fragments before handing them over.
+    """
+    a_i16x4 = a_bf16x4.bitcast(fx.Int16)
+    b_i16x4 = b_bf16x4.bitcast(fx.Int16)
+    return rocdl.mfma_f32_16x16x16bf16_1k(
+        T.f32x4, [a_i16x4, b_i16x4, acc_f32x4, 0, 0, 0]
+    )
+
+
 # -- Compile the kernel ---------------------------------------------------
 
 
@@ -130,6 +148,19 @@ def compile_chunk_gated_delta_h(
 
     NUM_H_ACCS = NUM_K_BLOCKS * N_REPEAT
 
+    # OPT-VWARP (BV=64 only): flip the warp partition from "wid owns 16 BT rows,
+    # all V" to "wid owns one 16-wide V-tile, all BT rows + FULL K". Each warp's
+    # GEMM2 h_accs then already holds the complete K for its V-tile -- exactly
+    # the B operand GEMM1 needs -- so h is passed straight from registers into
+    # GEMM1, eliminating the h LDS round-trip (h_accs -> lds_h -> barrier ->
+    # ds_read_tr16). Requires BV==64 (4 warps*16=64 V) and the no-per-K-gate
+    # path (the gk gate vector is K-indexed and differs under this layout).
+    VWARP_LAYOUT = (
+        (BV == 64) and (NUM_WARPS == 4) and (K % 64 == 0) and (not USE_GK)
+    )
+    K_SUB_PER_BLOCK = 64 // WMMA_N  # 16-wide K sub-tiles per 64 block (=4)
+    BT_MTILES = BT // WMMA_N  # 16-row BT M-tiles a warp spans in GEMM1 (=4)
+
     # -- LDS layout: w and k store all K-blocks to reduce barriers --
     LDS_W_STRIDE = K
     LDS_W_ELEMS_PER_STAGE = BT * LDS_W_STRIDE
@@ -176,7 +207,13 @@ def compile_chunk_gated_delta_h(
     lds_vn_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_vn_offset + LDS_VN_BYTES
     lds_h_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_h_offset + LDS_H_BYTES
+    # OPT-VWARP: under the V-tile layout the h snapshot goes straight from
+    # registers to HBM, so lds_h is never read/written -- don't reserve its
+    # bytes (saves LDS_H_BYTES of group_segment). The offset is still defined
+    # (the STensor wrapper references it) but the allocator pointer is not
+    # advanced, so nothing else overlaps it because it's simply unused.
+    if not VWARP_LAYOUT:
+        allocator.ptr = lds_h_offset + LDS_H_BYTES
 
     # Cooperative load parameters
     LOAD_VEC_WIDTH = 8  # 8 bf16 = 16 bytes = buffer_load_dwordx4
@@ -210,7 +247,10 @@ def compile_chunk_gated_delta_h(
     OPT_W_ENABLED = N_REPEAT == 1
     NUM_INNER_SLOTS = NUM_K_BLOCKS * K_STEPS_PER_BLOCK * N_REPEAT
     NUM_GK_LOADS_CT = (NUM_K_BLOCKS * 4) if USE_GK else 0
-    NUM_G_LOADS_CT = (1 + 4) if USE_G else 0  # g_last + 4 g_row
+    # g_last + g_row. VWARP spans all BT M-tiles so it prefetches BT_MTILES*4
+    # g_row values instead of just 4.
+    _N_GROW = (BT_MTILES * 4) if VWARP_LAYOUT else 4
+    NUM_G_LOADS_CT = (1 + _N_GROW) if USE_G else 0
     NUM_U_LOADS_CT = N_REPEAT * 4
     NUM_EXTRA_LOADS_CT = NUM_GK_LOADS_CT + NUM_G_LOADS_CT + NUM_U_LOADS_CT
     if OPT_VC_ENABLED and NUM_INNER_SLOTS > 0 and NUM_EXTRA_LOADS_CT > 0:
@@ -323,6 +363,11 @@ def compile_chunk_gated_delta_h(
         def _lds_vec_read_w_bf16x8(elem_idx):
             return vector.load_op(v8bf16_type, lds_w_memref, [elem_idx])
 
+        v4bf16_w_type = T.vec(4, T.bf16)
+
+        def _lds_vec_read_w_bf16x4(elem_idx):
+            return vector.load_op(v4bf16_w_type, lds_w_memref, [elem_idx])
+
         def _lds_vec_read_k_bf16x8(elem_idx):
             return vector.load_op(v8bf16_type, lds_k_memref, [elem_idx])
 
@@ -414,18 +459,27 @@ def compile_chunk_gated_delta_h(
         # contiguous in memory -> a single vec_load(4) covers them.
         if const_expr(USE_INITIAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
-                for nr in range_constexpr(N_REPEAT):
-                    h0_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
-                    h0_row_base = (
-                        fx.Int32(kb * 64)
-                        + wid * fx.Int32(16)
-                        + lane_m_base * fx.Int32(4)
-                    )
+                for slot in range_constexpr(N_REPEAT):
+                    if const_expr(VWARP_LAYOUT):
+                        # wid -> V-tile; slot -> K sub-tile (full K per warp).
+                        h0_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
+                        h0_row_base = (
+                            fx.Int32(kb * 64)
+                            + fx.Int32(slot * 16)
+                            + lane_m_base * fx.Int32(4)
+                        )
+                    else:
+                        h0_col = i_v * fx.Int32(BV) + fx.Int32(slot * 16) + lane_n
+                        h0_row_base = (
+                            fx.Int32(kb * 64)
+                            + wid * fx.Int32(16)
+                            + lane_m_base * fx.Int32(4)
+                        )
                     h0_off_base = h0_base + h0_col * fx.Int32(K) + h0_row_base
                     loaded_vec = h0_.vec_load((fx.Index(h0_off_base),), 4)
                     if const_expr(STATE_DTYPE_BF16):
                         loaded_vec = loaded_vec.extf(T.f32x4)
-                    acc_idx = kb * N_REPEAT + nr
+                    acc_idx = kb * N_REPEAT + slot
                     h_accs[acc_idx] = h_accs[acc_idx] + loaded_vec
 
         # -- Software-pipelined main chunk loop --
@@ -469,43 +523,69 @@ def compile_chunk_gated_delta_h(
                     swz_col = _xor_swizzle(row, col)
                     w_prefetch_lds_all.append(row * fx.Int32(LDS_W_STRIDE) + swz_col)
 
-            # -- Store h snapshot to LDS --
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for nr in range_constexpr(N_REPEAT):
-                    acc_idx = kb * N_REPEAT + nr
-                    acc_val = h_accs_in[acc_idx]
-                    lds_h_col = fx.Int32(nr * 16) + lane_n
-
-                    for elem_i in range_constexpr(4):
-                        f32_val = acc_val[elem_i]
-                        bf16_val = f32_val.to(fx.BFloat16)
-
-                        lds_h_row = (
+            if const_expr(VWARP_LAYOUT):
+                # OPT-VWARP: each warp owns V-tile wid and the full K, so write
+                # the h snapshot straight to HBM from registers -- no lds_h
+                # scatter, no barrier, no cooperative transpose loop. h is
+                # [V,K] (K innermost); the 4 acc elems are 4 consecutive K, so
+                # one vec_store(4) covers them.
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for slot in range_constexpr(N_REPEAT):
+                        acc_idx = kb * N_REPEAT + slot
+                        acc_val = h_accs_in[acc_idx]
+                        h_v_global = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
+                        h_k_base = (
                             fx.Int32(kb * 64)
-                            + wid * fx.Int32(16)
+                            + fx.Int32(slot * 16)
                             + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
                         )
-                        # OPT-H: stride is LDS_H_STRIDE = BV + LDS_H_PAD
-                        lds_h_idx = lds_h_row * fx.Int32(LDS_H_STRIDE) + lds_h_col
-                        lds_h[fx.Index(lds_h_idx)] = bf16_val
+                        h_off_base = (
+                            h_base
+                            + i_t_i32 * stride_h
+                            + h_v_global * fx.Int32(K)
+                            + h_k_base
+                        )
+                        out_vec = acc_val.to(fx.BFloat16)
+                        h_.vec_store((fx.Index(h_off_base),), out_vec, 4)
+            else:
+                # -- Store h snapshot to LDS --
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for nr in range_constexpr(N_REPEAT):
+                        acc_idx = kb * N_REPEAT + nr
+                        acc_val = h_accs_in[acc_idx]
+                        lds_h_col = fx.Int32(nr * 16) + lane_n
 
-            gpu.barrier()
+                        for elem_i in range_constexpr(4):
+                            f32_val = acc_val[elem_i]
+                            bf16_val = f32_val.to(fx.BFloat16)
 
-            # OPT-H: LDS -> HBM transpose loop.
-            # Iteration count uses VK_TOTAL = K * BV (actual elements, NOT
-            # LDS_H_ELEMS which now includes padding). Reading uses the padded
-            # LDS_H_STRIDE so we hit the same layout as the writer above.
-            VK_TOTAL = K * BV
-            for vk_base in range_constexpr(0, VK_TOTAL, BLOCK_THREADS):
-                linear = fx.Int32(vk_base) + tid
-                k_idx = linear % fx.Int32(K)
-                v_loc = linear // fx.Int32(K)
-                lds_read_idx = k_idx * fx.Int32(LDS_H_STRIDE) + v_loc
-                bf16_tile = lds_h[fx.Index(lds_read_idx)]
-                v_global = i_v * fx.Int32(BV) + v_loc
-                h_off = h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k_idx
-                h_[fx.Index(h_off)] = bf16_tile
+                            lds_h_row = (
+                                fx.Int32(kb * 64)
+                                + wid * fx.Int32(16)
+                                + lane_m_base * fx.Int32(4)
+                                + fx.Int32(elem_i)
+                            )
+                            # OPT-H: stride is LDS_H_STRIDE = BV + LDS_H_PAD
+                            lds_h_idx = (
+                                lds_h_row * fx.Int32(LDS_H_STRIDE) + lds_h_col
+                            )
+                            lds_h[fx.Index(lds_h_idx)] = bf16_val
+
+                gpu.barrier()
+
+                # OPT-H: LDS -> HBM transpose loop.
+                VK_TOTAL = K * BV
+                for vk_base in range_constexpr(0, VK_TOTAL, BLOCK_THREADS):
+                    linear = fx.Int32(vk_base) + tid
+                    k_idx = linear % fx.Int32(K)
+                    v_loc = linear // fx.Int32(K)
+                    lds_read_idx = k_idx * fx.Int32(LDS_H_STRIDE) + v_loc
+                    bf16_tile = lds_h[fx.Index(lds_read_idx)]
+                    v_global = i_v * fx.Int32(BV) + v_loc
+                    h_off = (
+                        h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k_idx
+                    )
+                    h_[fx.Index(h_off)] = bf16_tile
 
             # -- Store prefetched w to LDS (data already in registers from previous iter/prologue) --
             for i_wp in range_constexpr(NUM_W_LOADS):
@@ -567,20 +647,38 @@ def compile_chunk_gated_delta_h(
             g_last_off = i_h * T_flat + (bos + last_idx_raw)
             g_row_off_list = []
             g_row_in_bounds = []
-            for elem_i in range_constexpr(4):
-                abs_row = (
-                    i_t_i32 * fx.Int32(BT)
-                    + wid * fx.Int32(16)
-                    + lane_m_base * fx.Int32(4)
-                    + fx.Int32(elem_i)
-                )
-                in_bounds = abs_row < T_local
-                safe_row = in_bounds.select(abs_row, fx.Int32(0))
-                g_row_off = i_h * T_flat + (bos + safe_row)
-                g_row_off_list.append(g_row_off)
-                g_row_in_bounds.append(in_bounds)
+            if const_expr(VWARP_LAYOUT):
+                # VWARP: each warp spans ALL BT rows (4 M-tiles), so prefetch
+                # 4*4=16 g rows ordered (m_bt outer, elem_i inner) to match the
+                # per-m_bt gate vectors built during gating.
+                for m_bt in range_constexpr(BT_MTILES):
+                    for elem_i in range_constexpr(4):
+                        abs_row = (
+                            i_t_i32 * fx.Int32(BT)
+                            + fx.Int32(m_bt * 16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(elem_i)
+                        )
+                        in_bounds = abs_row < T_local
+                        safe_row = in_bounds.select(abs_row, fx.Int32(0))
+                        g_row_off = i_h * T_flat + (bos + safe_row)
+                        g_row_off_list.append(g_row_off)
+                        g_row_in_bounds.append(in_bounds)
+            else:
+                for elem_i in range_constexpr(4):
+                    abs_row = (
+                        i_t_i32 * fx.Int32(BT)
+                        + wid * fx.Int32(16)
+                        + lane_m_base * fx.Int32(4)
+                        + fx.Int32(elem_i)
+                    )
+                    in_bounds = abs_row < T_local
+                    safe_row = in_bounds.select(abs_row, fx.Int32(0))
+                    g_row_off = i_h * T_flat + (bos + safe_row)
+                    g_row_off_list.append(g_row_off)
+                    g_row_in_bounds.append(in_bounds)
             g_last_prefetch_cell = [None]
-            g_row_prefetch = [None] * 4
+            g_row_prefetch = [None] * (BT_MTILES * 4 if VWARP_LAYOUT else 4)
 
             gk_chunk_base = (bos + last_idx_raw) * fx.Int32(H * K) + i_h * fx.Int32(K)
             gk_off_flat = []
@@ -596,24 +694,44 @@ def compile_chunk_gated_delta_h(
             gk_raw_prefetch = [None] * NUM_GK_LOADS_CT
 
             u_off_list = []
-            for nr in range_constexpr(N_REPEAT):
-                u_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
-                for elem_i in range_constexpr(4):
-                    u_bt_row_raw = (
-                        i_t_i32 * fx.Int32(BT)
-                        + wid * fx.Int32(16)
-                        + lane_m_base * fx.Int32(4)
-                        + fx.Int32(elem_i)
-                    )
-                    safe_u_row = (u_bt_row_raw < T_local).select(
-                        u_bt_row_raw, fx.Int32(0)
-                    )
-                    u_off = v_base + safe_u_row * stride_v + u_col
-                    u_off_list.append(u_off)
+            if const_expr(VWARP_LAYOUT):
+                # VWARP: warp owns V-tile wid, all BT rows. Prefetch u for the 4
+                # BT M-tiles (m_bt outer, elem_i inner) at fixed V-tile = wid.
+                u_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
+                for m_bt in range_constexpr(BT_MTILES):
+                    for elem_i in range_constexpr(4):
+                        u_bt_row_raw = (
+                            i_t_i32 * fx.Int32(BT)
+                            + fx.Int32(m_bt * 16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(elem_i)
+                        )
+                        safe_u_row = (u_bt_row_raw < T_local).select(
+                            u_bt_row_raw, fx.Int32(0)
+                        )
+                        u_off = v_base + safe_u_row * stride_v + u_col
+                        u_off_list.append(u_off)
+            else:
+                for nr in range_constexpr(N_REPEAT):
+                    u_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
+                    for elem_i in range_constexpr(4):
+                        u_bt_row_raw = (
+                            i_t_i32 * fx.Int32(BT)
+                            + wid * fx.Int32(16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(elem_i)
+                        )
+                        safe_u_row = (u_bt_row_raw < T_local).select(
+                            u_bt_row_raw, fx.Int32(0)
+                        )
+                        u_off = v_base + safe_u_row * stride_v + u_col
+                        u_off_list.append(u_off)
             u_prefetch = [None] * NUM_U_LOADS_CT
 
+            # bv_accs: default layout indexes by nr (V-tile); VWARP indexes by
+            # m_bt (BT M-tile), fixed V-tile = wid. Both are 4 accumulators.
             bv_accs = []
-            for _nr in range_constexpr(N_REPEAT):
+            for _i in range_constexpr(N_REPEAT):
                 bv_accs.append(fx.full(4, 0.0, fx.Float32))
 
             K_STEPS_PER_BLOCK = 64 // WMMA_K
@@ -674,7 +792,7 @@ def compile_chunk_gated_delta_h(
                     extra_load_emitters.append(_make_emit_gk(i))
             if const_expr(USE_G):
                 extra_load_emitters.append(_make_emit_g_last())
-                for i in range_constexpr(4):
+                for i in range_constexpr(BT_MTILES * 4 if VWARP_LAYOUT else 4):
                     extra_load_emitters.append(_make_emit_g_row(i))
             for i in range_constexpr(NUM_U_LOADS_CT):
                 extra_load_emitters.append(_make_emit_u(i))
@@ -695,54 +813,114 @@ def compile_chunk_gated_delta_h(
             for _eidx in PROLOGUE_EMITTER_CT:
                 extra_load_emitters[_eidx]()
 
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for ks in range_constexpr(K_STEPS_PER_BLOCK):
-                    # OPT-K: issue one k_prefetch vec_load per (kb, ks) slot to
-                    # spread the 4 buffer_load_dwordx4 across the MFMA chain
-                    # so HBM latency is hidden by the MFMA dependency chain.
-                    mfma_slot = kb * K_STEPS_PER_BLOCK + ks
-                    if mfma_slot < NUM_K_LOADS:
-                        k_prefetch[mfma_slot] = k_.vec_load(
-                            (fx.Index(k_prefetch_off[mfma_slot]),), LOAD_VEC_WIDTH
+            if const_expr(VWARP_LAYOUT):
+                # OPT-VWARP GEMM1: warp wid computes b_v for V-tile wid over ALL
+                # BT rows. b_v = w @ h^T. h (the B operand) comes straight from
+                # the h_accs registers (no lds_h round-trip): h_accs[kb*N+slot]
+                # is the 16(K)x16(V) tile for K sub-tile `slot` of block kb and
+                # this warp's V-tile -- exactly the 16x16x16 B operand after a
+                # bf16 cast (C and B share the same lane layout). A=w is read
+                # for the 4 BT M-tiles (full K), 4 warps read the same w rows.
+                # Issue k_prefetch (next chunk's K) here too, like the default.
+                for _mslot in range_constexpr(NUM_K_LOADS):
+                    k_prefetch[_mslot] = k_.vec_load(
+                        (fx.Index(k_prefetch_off[_mslot]),), LOAD_VEC_WIDTH
+                    )
+                for m_bt in range_constexpr(BT_MTILES):
+                    for kb in range_constexpr(NUM_K_BLOCKS):
+                        for slot in range_constexpr(K_SUB_PER_BLOCK):
+                            # A=w 16x16x16 native layout: m=BT row=m_bt*16+lane_n,
+                            # K = kb*64 + slot*16 + lane_m_base*4 + i (bf16x4),
+                            # matching the h_accs B operand's K lane layout
+                            # (lane_m_base*4), NOT the bf16x8 (lane_m_base*8)
+                            # split used by the LDS-h path. Apply the SAME XOR
+                            # swizzle as the write side; since it only flips
+                            # bits>=3 and the 4 elems stay within one 8-block,
+                            # the bf16x4 read maps to 4 consecutive swizzled
+                            # addresses.
+                            w_lds_row_idx = fx.Index(m_bt * 16) + lane_n_idx
+                            w_lds_col_idx = fx.Index(
+                                kb * 64 + slot * 16
+                            ) + lane_m_base_idx * fx.Index(4)
+                            w_lds_col_idx = _xor_swizzle_idx(
+                                w_lds_row_idx, w_lds_col_idx
+                            )
+                            w_lds_idx = (
+                                w_lds_row_idx * fx.Index(LDS_W_STRIDE)
+                                + w_lds_col_idx
+                            )
+                            a_frag = _lds_vec_read_w_bf16x4(w_lds_idx)
+
+                            b_frag = h_accs_in[kb * N_REPEAT + slot].to(
+                                fx.BFloat16
+                            )
+
+                            bv_accs[m_bt] = _mfma_bf16_16x16x16(
+                                a_frag, b_frag, bv_accs[m_bt]
+                            )
+            else:
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for ks in range_constexpr(K_STEPS_PER_BLOCK):
+                        # OPT-K: issue one k_prefetch vec_load per (kb, ks) slot
+                        # to spread the 4 buffer_load_dwordx4 across the MFMA
+                        # chain so HBM latency is hidden by the MFMA chain.
+                        mfma_slot = kb * K_STEPS_PER_BLOCK + ks
+                        if mfma_slot < NUM_K_LOADS:
+                            k_prefetch[mfma_slot] = k_.vec_load(
+                                (fx.Index(k_prefetch_off[mfma_slot]),),
+                                LOAD_VEC_WIDTH,
+                            )
+
+                        w_lds_row_idx = wid_idx * fx.Index(16) + lane_n_idx
+                        w_lds_col_idx = fx.Index(
+                            kb * 64 + ks * WMMA_K
+                        ) + lane_m_base_idx * fx.Index(8)
+                        # OPT-4: apply SAME XOR swizzle as the write side.
+                        w_lds_col_idx = _xor_swizzle_idx(
+                            w_lds_row_idx, w_lds_col_idx
                         )
-
-                    w_lds_row_idx = wid_idx * fx.Index(16) + lane_n_idx
-                    w_lds_col_idx = fx.Index(
-                        kb * 64 + ks * WMMA_K
-                    ) + lane_m_base_idx * fx.Index(8)
-                    # OPT-4: apply SAME XOR swizzle as the write side.
-                    w_lds_col_idx = _xor_swizzle_idx(w_lds_row_idx, w_lds_col_idx)
-                    w_lds_idx = w_lds_row_idx * fx.Index(LDS_W_STRIDE) + w_lds_col_idx
-                    a_frag = _lds_vec_read_w_bf16x8(w_lds_idx)
-
-                    global_ks = kb * K_STEPS_PER_BLOCK + ks
-
-                    for nr in range_constexpr(N_REPEAT):
-                        # OPT-VC: emit pre-assigned prefetches for this slot.
-                        # SLOT_ASSIGN_CT is the compile-time schedule list.
-                        slot_idx = (
-                            kb * (K_STEPS_PER_BLOCK * N_REPEAT) + ks * N_REPEAT + nr
+                        w_lds_idx = (
+                            w_lds_row_idx * fx.Index(LDS_W_STRIDE) + w_lds_col_idx
                         )
-                        for _eidx in SLOT_ASSIGN_CT[slot_idx]:
-                            extra_load_emitters[_eidx]()
+                        a_frag8 = _lds_vec_read_w_bf16x8(w_lds_idx)
+                        a_frag_lo = a_frag8.shuffle(a_frag8, [0, 1, 2, 3])
+                        a_frag_hi = a_frag8.shuffle(a_frag8, [4, 5, 6, 7])
 
-                        h_k_row = (
-                            fx.Int32(global_ks * WMMA_K)
-                            + lane_m_base * fx.Int32(8)
-                            + tr_k_group
-                        )
-                        h_v_col = fx.Int32(nr * 16) + tr_col_sub * fx.Int32(4)
-                        # OPT-H: stride is LDS_H_STRIDE = BV + LDS_H_PAD
-                        h_lds_elem = h_k_row * fx.Int32(LDS_H_STRIDE) + h_v_col
-                        h_lds_byte = h_lds_elem * fx.Int32(2) + fx.Int32(lds_h_offset)
+                        global_ks = kb * K_STEPS_PER_BLOCK + ks
 
-                        h_lo = _ds_read_tr_bf16x4(h_lds_byte)
-                        h_hi = _ds_read_tr_bf16x4(
-                            h_lds_byte + fx.Int32(4 * LDS_H_STRIDE * 2)
-                        )
-                        b_frag = h_lo.shuffle(h_hi, [0, 1, 2, 3, 4, 5, 6, 7])
+                        for nr in range_constexpr(N_REPEAT):
+                            slot_idx = (
+                                kb * (K_STEPS_PER_BLOCK * N_REPEAT)
+                                + ks * N_REPEAT
+                                + nr
+                            )
+                            for _eidx in SLOT_ASSIGN_CT[slot_idx]:
+                                extra_load_emitters[_eidx]()
 
-                        bv_accs[nr] = _mfma_bf16_16x16x32(a_frag, b_frag, bv_accs[nr])
+                            h_k_row = (
+                                fx.Int32(global_ks * WMMA_K)
+                                + lane_m_base * fx.Int32(8)
+                                + tr_k_group
+                            )
+                            h_v_col = fx.Int32(nr * 16) + tr_col_sub * fx.Int32(4)
+                            h_lds_elem = (
+                                h_k_row * fx.Int32(LDS_H_STRIDE) + h_v_col
+                            )
+                            h_lds_byte = h_lds_elem * fx.Int32(2) + fx.Int32(
+                                lds_h_offset
+                            )
+
+                            b_frag_lo = _ds_read_tr_bf16x4(h_lds_byte)
+                            b_frag_hi = _ds_read_tr_bf16x4(
+                                h_lds_byte + fx.Int32(4 * LDS_H_STRIDE * 2)
+                            )
+
+                            bv_accs[nr] = _mfma_bf16_16x16x16(
+                                a_frag_lo, b_frag_lo, bv_accs[nr]
+                            )
+                            bv_accs[nr] = _mfma_bf16_16x16x16(
+                                a_frag_hi, b_frag_hi, bv_accs[nr]
+                            )
 
             # OPT-VC: tail-emit any extras that did not fit (rare path).
             for _eidx in TAIL_EMITTER_CT:
@@ -758,16 +936,16 @@ def compile_chunk_gated_delta_h(
                         kb_elems.append(_fast_exp(gk_raw_prefetch[kb * 4 + elem_i]))
                     gk_last_prefetch.append(kb_elems)
 
-            # v_new = u - b_v (u values already prefetched)
+            # v_new = u - b_v (u values already prefetched). Default: indexed by
+            # nr (V-tile). VWARP: indexed by m_bt (BT M-tile), V fixed = wid.
             vn_frags = []
-            for nr in range_constexpr(N_REPEAT):
-                bv_val = bv_accs[nr]
+            for idx in range_constexpr(N_REPEAT):
+                bv_val = bv_accs[idx]
                 u_f32_elems = []
                 for elem_i in range_constexpr(4):
-                    # u_prefetch is a list of raw ir.Value from buffer_load;
-                    # wrap in fx.BFloat16 so we can use .to() instead of
-                    # the bare arith.extf wrapper.
-                    u_bf16 = fx.BFloat16(u_prefetch[nr * 4 + elem_i])
+                    # u_prefetch entries are ordered (idx outer, elem_i inner)
+                    # in both layouts, so the flat index is the same expression.
+                    u_bf16 = fx.BFloat16(u_prefetch[idx * 4 + elem_i])
                     u_f32_elems.append(u_bf16.to(fx.Float32))
                 u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
 
@@ -786,13 +964,19 @@ def compile_chunk_gated_delta_h(
                 def _emit_vn_store(off, value):
                     vn_[fx.Index(off)] = value
 
-                for nr in range_constexpr(N_REPEAT):
-                    vn_val = vn_frags[nr]
-                    vn_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
+                for idx in range_constexpr(N_REPEAT):
+                    vn_val = vn_frags[idx]
+                    if const_expr(VWARP_LAYOUT):
+                        # idx = m_bt (BT M-tile); V-tile fixed = wid.
+                        vn_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
+                        bt_tile_base = fx.Int32(idx * 16)
+                    else:
+                        vn_col = i_v * fx.Int32(BV) + fx.Int32(idx * 16) + lane_n
+                        bt_tile_base = wid * fx.Int32(16)
                     for elem_i in range_constexpr(4):
                         vn_bt_row = (
                             i_t_i32 * fx.Int32(BT)
-                            + wid * fx.Int32(16)
+                            + bt_tile_base
                             + lane_m_base * fx.Int32(4)
                             + fx.Int32(elem_i)
                         )
@@ -807,18 +991,31 @@ def compile_chunk_gated_delta_h(
                 g_last = g_last_prefetch_cell[0]
                 exp_g_last = _fast_exp(g_last)
 
-                # Build the 4-lane gate vector via a single from_elements
-                # instead of fx.full(0.0) + 4x vector.insert: less SSA chain,
-                # lets LLVM pack the 4 lanes directly as register-immediate.
-                gate_elems = []
-                for elem_i in range_constexpr(4):
-                    g_row, in_bounds = g_row_prefetch[elem_i]
-                    gate = _fast_exp(g_last - g_row)
-                    gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
-                gate_vec = vector.from_elements(T.f32x4, gate_elems)
+                if const_expr(VWARP_LAYOUT):
+                    # Gate is per-BT-row. Each vn_frags[m_bt] spans a distinct
+                    # BT M-tile, so build a per-m_bt gate vector from the 16
+                    # prefetched g rows (ordered m_bt outer, elem_i inner).
+                    for m_bt in range_constexpr(BT_MTILES):
+                        gate_elems = []
+                        for elem_i in range_constexpr(4):
+                            g_row, in_bounds = g_row_prefetch[m_bt * 4 + elem_i]
+                            gate = _fast_exp(g_last - g_row)
+                            gate_elems.append(
+                                in_bounds.select(gate, fx.Float32(0.0))
+                            )
+                        gate_vec = vector.from_elements(T.f32x4, gate_elems)
+                        vn_frags[m_bt] = vn_frags[m_bt] * gate_vec
+                else:
+                    # Build the 4-lane gate vector via a single from_elements.
+                    gate_elems = []
+                    for elem_i in range_constexpr(4):
+                        g_row, in_bounds = g_row_prefetch[elem_i]
+                        gate = _fast_exp(g_last - g_row)
+                        gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
+                    gate_vec = vector.from_elements(T.f32x4, gate_elems)
 
-                for nr in range_constexpr(N_REPEAT):
-                    vn_frags[nr] = vn_frags[nr] * gate_vec
+                    for nr in range_constexpr(N_REPEAT):
+                        vn_frags[nr] = vn_frags[nr] * gate_vec
 
                 # Wrap raw ArithValue in fx.Float32 so fx.full's broadcast
                 # accepts it (filled() requires a Numeric or Python scalar).
@@ -847,15 +1044,22 @@ def compile_chunk_gated_delta_h(
             # -- 4. State update: h += k^T @ v_new_gated --
             BT_STEPS = BT // WMMA_K
 
-            # Store gated v_new + all k K-blocks to LDS in one batch, single barrier
-            for nr in range_constexpr(N_REPEAT):
-                vn_val = vn_frags[nr]
-                lds_col = fx.Int32(nr * 16) + lane_n
+            # Store gated v_new + all k K-blocks to LDS in one batch, single
+            # barrier. lds_vn is global [BT, BV]; only the per-warp scatter
+            # pattern differs by layout. VWARP: m_bt -> BT rows, V-tile = wid.
+            for idx in range_constexpr(N_REPEAT):
+                vn_val = vn_frags[idx]
+                if const_expr(VWARP_LAYOUT):
+                    lds_col = wid * fx.Int32(16) + lane_n
+                    lds_bt_tile = fx.Int32(idx * 16)
+                else:
+                    lds_col = fx.Int32(idx * 16) + lane_n
+                    lds_bt_tile = wid * fx.Int32(16)
                 for elem_i in range_constexpr(4):
                     f32_v = vn_val[elem_i]
                     bf16_v = f32_v.to(fx.BFloat16)
                     lds_row = (
-                        wid * fx.Int32(16)
+                        lds_bt_tile
                         + lane_m_base * fx.Int32(4)
                         + fx.Int32(elem_i)
                     )
@@ -917,46 +1121,87 @@ def compile_chunk_gated_delta_h(
                                 LOAD_VEC_WIDTH,
                             )
 
-                    k_col_tr = wid * fx.Int32(16) + tr_col_sub * fx.Int32(4)
                     bt_row_tr = (
                         fx.Int32(bt_s * WMMA_K) + lane_m_base * fx.Int32(8) + tr_k_group
                     )
-                    k_lds_elem = (
-                        bt_row_tr * fx.Int32(LDS_K_STRIDE)
-                        + fx.Int32(kb * 64)
-                        + k_col_tr
-                    )
-                    k_lds_byte = k_lds_elem * fx.Int32(2) + fx.Int32(lds_k_offset)
 
-                    k_lo = _ds_read_tr_bf16x4(k_lds_byte)
-                    k_hi = _ds_read_tr_bf16x4(
-                        k_lds_byte + fx.Int32(4 * LDS_K_STRIDE * 2)
-                    )
-                    k_a_frag = k_lo.shuffle(k_hi, [0, 1, 2, 3, 4, 5, 6, 7])
-
-                    for nr in range_constexpr(N_REPEAT):
-                        vn_bt_row = (
-                            fx.Int32(bt_s * WMMA_K)
-                            + lane_m_base * fx.Int32(8)
-                            + tr_k_group
-                        )
-                        vn_v_col = fx.Int32(nr * 16) + tr_col_sub * fx.Int32(4)
-                        vn_lds_elem = vn_bt_row * fx.Int32(LDS_VN_STRIDE) + vn_v_col
+                    if const_expr(VWARP_LAYOUT):
+                        # VWARP: warp wid computes h for its V-tile over the
+                        # FULL K. vn (B) is this warp's V-tile only; read it
+                        # once. k (A) iterates the K sub-tiles (slot) -> full K.
+                        vn_v_col = wid * fx.Int32(16) + tr_col_sub * fx.Int32(4)
+                        vn_lds_elem = bt_row_tr * fx.Int32(LDS_VN_STRIDE) + vn_v_col
                         vn_lds_byte = vn_lds_elem * fx.Int32(2) + fx.Int32(
                             lds_vn_offset
                         )
-
-                        vn_lo = _ds_read_tr_bf16x4(vn_lds_byte)
-                        # OPT-D: stride is LDS_VN_STRIDE = BV + LDS_VN_PAD
-                        vn_hi = _ds_read_tr_bf16x4(
+                        vn_b_lo = _ds_read_tr_bf16x4(vn_lds_byte)
+                        vn_b_hi = _ds_read_tr_bf16x4(
                             vn_lds_byte + fx.Int32(4 * LDS_VN_STRIDE * 2)
                         )
-                        vn_b_frag = vn_lo.shuffle(vn_hi, [0, 1, 2, 3, 4, 5, 6, 7])
 
-                        acc_idx = kb * N_REPEAT + nr
-                        h_accs_in[acc_idx] = _mfma_bf16_16x16x32(
-                            k_a_frag, vn_b_frag, h_accs_in[acc_idx]
+                        for slot in range_constexpr(K_SUB_PER_BLOCK):
+                            k_col = fx.Int32(slot * 16) + tr_col_sub * fx.Int32(4)
+                            k_lds_elem = (
+                                bt_row_tr * fx.Int32(LDS_K_STRIDE)
+                                + fx.Int32(kb * 64)
+                                + k_col
+                            )
+                            k_lds_byte = k_lds_elem * fx.Int32(2) + fx.Int32(
+                                lds_k_offset
+                            )
+                            k_a_lo = _ds_read_tr_bf16x4(k_lds_byte)
+                            k_a_hi = _ds_read_tr_bf16x4(
+                                k_lds_byte + fx.Int32(4 * LDS_K_STRIDE * 2)
+                            )
+                            acc_idx = kb * N_REPEAT + slot
+                            h_accs_in[acc_idx] = _mfma_bf16_16x16x16(
+                                k_a_lo, vn_b_lo, h_accs_in[acc_idx]
+                            )
+                            h_accs_in[acc_idx] = _mfma_bf16_16x16x16(
+                                k_a_hi, vn_b_hi, h_accs_in[acc_idx]
+                            )
+                    else:
+                        k_col_tr = wid * fx.Int32(16) + tr_col_sub * fx.Int32(4)
+                        k_lds_elem = (
+                            bt_row_tr * fx.Int32(LDS_K_STRIDE)
+                            + fx.Int32(kb * 64)
+                            + k_col_tr
                         )
+                        k_lds_byte = k_lds_elem * fx.Int32(2) + fx.Int32(
+                            lds_k_offset
+                        )
+
+                        k_a_lo = _ds_read_tr_bf16x4(k_lds_byte)
+                        k_a_hi = _ds_read_tr_bf16x4(
+                            k_lds_byte + fx.Int32(4 * LDS_K_STRIDE * 2)
+                        )
+
+                        for nr in range_constexpr(N_REPEAT):
+                            vn_bt_row = (
+                                fx.Int32(bt_s * WMMA_K)
+                                + lane_m_base * fx.Int32(8)
+                                + tr_k_group
+                            )
+                            vn_v_col = fx.Int32(nr * 16) + tr_col_sub * fx.Int32(4)
+                            vn_lds_elem = (
+                                vn_bt_row * fx.Int32(LDS_VN_STRIDE) + vn_v_col
+                            )
+                            vn_lds_byte = vn_lds_elem * fx.Int32(2) + fx.Int32(
+                                lds_vn_offset
+                            )
+
+                            vn_b_lo = _ds_read_tr_bf16x4(vn_lds_byte)
+                            vn_b_hi = _ds_read_tr_bf16x4(
+                                vn_lds_byte + fx.Int32(4 * LDS_VN_STRIDE * 2)
+                            )
+
+                            acc_idx = kb * N_REPEAT + nr
+                            h_accs_in[acc_idx] = _mfma_bf16_16x16x16(
+                                k_a_lo, vn_b_lo, h_accs_in[acc_idx]
+                            )
+                            h_accs_in[acc_idx] = _mfma_bf16_16x16x16(
+                                k_a_hi, vn_b_hi, h_accs_in[acc_idx]
+                            )
 
             # OPT-W: emit any remaining w_next loads that didn't fit into the
             # GEMM2 main loop (only possible if NUM_K_BLOCKS*BT_STEPS <
@@ -980,16 +1225,24 @@ def compile_chunk_gated_delta_h(
         # directly (no extract + from_elements needed).
         if const_expr(STORE_FINAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
-                for nr in range_constexpr(N_REPEAT):
-                    acc_idx = kb * N_REPEAT + nr
+                for slot in range_constexpr(N_REPEAT):
+                    acc_idx = kb * N_REPEAT + slot
                     acc_val = h_accs_final[acc_idx]
 
-                    ht_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
-                    ht_row_base = (
-                        fx.Int32(kb * 64)
-                        + wid * fx.Int32(16)
-                        + lane_m_base * fx.Int32(4)
-                    )
+                    if const_expr(VWARP_LAYOUT):
+                        ht_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
+                        ht_row_base = (
+                            fx.Int32(kb * 64)
+                            + fx.Int32(slot * 16)
+                            + lane_m_base * fx.Int32(4)
+                        )
+                    else:
+                        ht_col = i_v * fx.Int32(BV) + fx.Int32(slot * 16) + lane_n
+                        ht_row_base = (
+                            fx.Int32(kb * 64)
+                            + wid * fx.Int32(16)
+                            + lane_m_base * fx.Int32(4)
+                        )
                     ht_off_base = ht_base + ht_col * fx.Int32(K) + ht_row_base
                     if const_expr(STATE_DTYPE_BF16):
                         out_vec = acc_val.truncf(T.vec(4, T.bf16))
