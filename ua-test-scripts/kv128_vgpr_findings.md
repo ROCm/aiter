@@ -99,9 +99,15 @@ the loose fp8 tolerance (atol=rtol=0.15), independent of any kv128/VGPR work:
     max abs delta 2.73, 0.6% of elements (140700 / 25,165,824) over tolerance.
   - regression fixtures also report fp8 "not all close" (e.g. 2.2% of elements).
 This reproduces byte-for-byte with and without the E2 toggle, so it is NOT
-caused by the kv128 experiments. It looks like a real accuracy regression in the
-wide-MMA fp8 path (the cvt-only P relayout / 32x32x64 MMA) that predates this
-work and should be triaged separately. bf16 and fp8 decode paths PASS.
+caused by the kv128 experiments. bf16 and fp8 decode paths PASS.
+
+**Bisected to the wide-MMA commit.** A clean build of the PARENT commit
+(a4d3ff34f "widen FP8 K/V async loads to dwordx4") PASSES the same prefill_fp8
+config; the child 9aa380e6c "wide 32x32x64 FP8 MMA with cvt-only P relayout"
+FAILS it. So the 32x32x64 FP8 MMA / cvt-only P relayout introduced a real
+prefill_fp8 accuracy regression. This needs separate triage (likely the P
+relayout mapping for the wide MMA), and means the "wide MMA closed the gap to
+~1.2x" result was measured on a numerically-incorrect prefill_fp8 kernel.
 
 The robust unlock is to **decouple the K/V LDS/DRAM load granularity (128) from
 the compute width (64)**: keep the proven kv64 compute footprint (214 VGPR, 0
