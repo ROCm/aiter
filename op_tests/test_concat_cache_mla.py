@@ -548,23 +548,21 @@ SEG_PAGE_SIZE = 64
 
 
 def _seg_rope_ref(pe, cos, sin, pos, is_neox):
-    """RoPE on the pe segment, reusing aiter.rope_cached_positions_fwd.
-
-    pe: [s, b, h, pe_dim] (sbhd). cos/sin: [max_pos, pe_dim//2]. pos: [s, b].
-    Since rotate_dim == pe_dim there is no nope copy region, so nope_first is
-    irrelevant. Returns the roped tensor in the same shape/dtype as ``pe``.
-    """
-    cos4 = cos.reshape(cos.shape[0], 1, 1, cos.shape[1])
-    sin4 = sin.reshape(sin.shape[0], 1, 1, sin.shape[1])
-    return aiter.rope_cached_positions_fwd(
-        pe,
-        cos4,
-        sin4,
-        pos,
-        0 if is_neox else 1,  # rotate_style: 0 NeoX, 1 GPT-J
-        True,  # reuse_freqs_front_part
-        True,  # nope_first (no-op here: rotate_dim == pe_dim)
-    )
+    """pe: [N, pe_dim] (N = T or T*H). cos/sin: [max_pos, pe_dim//2]. pos: [N]."""
+    half = pe.shape[-1] // 2
+    c = cos[pos].float()
+    s = sin[pos].float()
+    out = torch.empty_like(pe, dtype=torch.float32)
+    pe = pe.float()
+    if is_neox:
+        lo, hi = pe[:, :half], pe[:, half:]
+        out[:, :half] = lo * c - hi * s
+        out[:, half:] = hi * c + lo * s
+    else:
+        even, odd = pe[:, 0::2], pe[:, 1::2]
+        out[:, 0::2] = even * c - odd * s
+        out[:, 1::2] = odd * c + even * s
+    return out
 
 
 def _seg_ref(
@@ -588,20 +586,17 @@ def _seg_ref(
     q_inv = 1.0 / q_scale.item()
     k_inv = 1.0 / k_scale.item()
 
-    pos2 = pos.reshape(1, T)  # [s=1, b=T]
-
     # ---- q_out [T, H, kv_lora + pe_dim] ----
     q_nope_q = (q_nope.float() * q_inv).to(fp8)
-    # [s=1, b=T, h=H, d=pe_dim]; all heads of a token share its position.
-    q_pe_roped = _seg_rope_ref(q_pe.reshape(1, T, H, pe_dim), cos, sin, pos2, is_neox)
-    q_pe_q = (q_pe_roped.reshape(T, H, pe_dim).float() * q_inv).to(fp8)
+    qpe_pos = pos.view(T, 1).expand(T, H).reshape(-1)
+    q_pe_roped = _seg_rope_ref(q_pe.reshape(-1, pe_dim), cos, sin, qpe_pos, is_neox)
+    q_pe_q = (q_pe_roped * q_inv).to(fp8).view(T, H, pe_dim)
     q_out_ref = torch.cat([q_nope_q, q_pe_q], dim=-1)
 
     # ---- k: nope quant (no norm); pe RoPE + quant ----
     k_nope_q = (kv_c.float() * k_inv).to(fp8)
-    k_pe_roped = _seg_rope_ref(k_pe.reshape(1, T, 1, pe_dim), cos, sin, pos2, is_neox)
-    k_pe_roped = k_pe_roped.reshape(T, pe_dim)
-    k_pe_q = (k_pe_roped.float() * k_inv).to(fp8)
+    k_pe_roped = _seg_rope_ref(k_pe, cos, sin, pos, is_neox)
+    k_pe_q = (k_pe_roped * k_inv).to(fp8)
 
     # ---- segmented kv_cache [num_blocks, page_size*(kv_lora + pe_dim)] ----
     block_stride = page_size * kv_lora + page_size * pe_dim
