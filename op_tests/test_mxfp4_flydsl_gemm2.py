@@ -10,11 +10,11 @@ def test_port_module_imports_and_constants():
     assert callable(port.compile_gemm2_a4w4_port)
     # gemm2 ?? K=512 (contraction = inter_dim),N_OUT = model_dim = 7168?
     assert (port.NE, port.K, port.N_OUT) == (385, 512, 7168)
-    # KIMI-default K-derived globals == the *_for(512) helpers (byte-for-byte).
+    # KIMI-default K-derived sizes via the *_for(512) helpers (byte-for-byte).
     assert port.K_HALF == port.k_half_for(512) == 256
-    assert port.K_TILES_TOTAL == port.k_tiles_total_for(512) == 2
-    assert port.kAS_per_chunk_dw == port.kas_per_chunk_dw_for(512) == 128
-    assert port.kBS_stride_n0_dw == port.kbs_stride_n0_dw_for(512) == 128
+    assert port.k_tiles_total_for(512) == 2
+    assert port.kas_per_chunk_dw_for(512) == 128
+    assert port.kbs_stride_n0_dw_for(512) == 128
 
 
 def test_k_parametrized_helpers():

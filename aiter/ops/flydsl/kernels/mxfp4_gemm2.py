@@ -139,14 +139,10 @@ def ascale_bytes(BM, max_m=MAX_M, k=K):
     return (max_m // chunk_div) * kas_per_chunk_dw_for(k) * 4
 
 
-# KIMI defaults (back-compat module globals; equal to the *_for(K) helpers).
+# KIMI default kept as a module global (used as a param default below). All other
+# K-derived sizes are computed per-shape from the compile arg via the *_for(K)
+# helpers (local _K_* in compile_gemm2_a4w4_port), so they need no module globals.
 K_HALF = k_half_for(K)  # 256
-K_TILES_TOTAL = k_tiles_total_for(K)  # 2
-kUnroll = kunroll_for(K)  # 0
-kBS_c_k1 = kbs_c_k1_for(K)  # 2
-kBS_stride_n0_dw = kbs_stride_n0_dw_for(K)  # 128
-kAS_c_k1 = kas_c_k1_for(K)  # 2
-kAS_per_chunk_dw = kas_per_chunk_dw_for(K)  # 128
 
 
 def saq_slot_bytes(BM):
