@@ -42,21 +42,14 @@ import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import _mxfp4_moe_run
 
-# Self-check: we MUST be running the up-aiter checkout (the one with the runtime
-# max_sorted fix), not a pip-installed / sibling aiter. Import-shadowing otherwise
-# silently tests the wrong kernels.
-print("[selfcheck] aiter pkg:", aiter.__file__)
-
 torch.set_default_device("cuda")
 
 # ── Kimi-K2.5 TP=4 mxfp4_moe shape (the codegen'd NE=385 nonatomic instance) ──
-NE = 385          # 384 routed + 1 shared expert slot
+NE = 385
 D_HIDDEN = 7168
 D_INTER = 512
-TOPK = 9          # top_k(8) + 1 shared
+TOPK = 9
 
-# BM=128 nonatomic path — what large-M (incl. 128k) dispatches to, and the path
-# whose A_q/A_scale bound we changed.
 KN1 = f"mxfp4_moe_g1_a4w4_NE{NE}_H{D_HIDDEN}_E{D_INTER}_BM128"
 KN2 = f"mxfp4_moe_g2_a4w4_NE{NE}_H{D_HIDDEN}_E{D_INTER}_BM128_NONATOMIC"
 
@@ -66,9 +59,7 @@ def make_weights(seed=0):
     buffer-resource byte bounds (B_q: NE*N_OUT*K/2 ; B_scale: per-expert e8m0)."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     u8 = lambda *s: torch.randint(0, 256, s, dtype=torch.uint8, generator=g)
-    # e8m0 biased exponents in a TIGHT band around 127 (=2^0): 126..129 -> 2^-1..2^2.
-    # Keeps gemm outputs moderate so full vs chunked stays bit-exact (no overflow /
-    # catastrophic cancellation), making any mismatch a real size-dependent bug.
+
     e8 = lambda *s: torch.randint(126, 130, s, dtype=torch.uint8, generator=g)
     # gemm1: w12 = [E, 2*D_INTER, D_HIDDEN] mxfp4 (2 nibbles/byte) + e8m0 (1/32 along K)
     w1 = u8(NE, 2 * D_INTER, D_HIDDEN // 2)
@@ -142,13 +133,6 @@ def main():
         thr = args.atol + args.rtol * b.abs()
         return (diff > thr).any(dim=1), diff
 
-    # The kernel's nonatomic/scatter reduce is run-to-run NON-deterministic on rows
-    # with catastrophic cancellation (FP non-associativity). Measure that noise floor
-    # from repeated full re-runs (a single sample misses rows that only sometimes
-    # diverge), then only count an invariance break as REAL where the kernel was
-    # self-consistent (deterministic across ALL repeats) yet full != chunked — that is
-    # the signature of the old max_sorted clipping bug (which corrupts ~half the rows
-    # at 128k, deterministically every run, so it survives the noise mask).
     noise = torch.zeros(NT, dtype=torch.bool, device=full.device)
     dn_max = 0.0
     for _ in range(args.noise_reps):
@@ -159,12 +143,6 @@ def main():
     inv, di = bad_rows(full, chunked)
     real = inv & ~noise
 
-    # full and chunked use DIFFERENT token counts → DIFFERENT reduction orders, so a
-    # handful of catastrophic-cancellation rows legitimately differ between them (FP
-    # non-associativity) in a way the same-order noise probe can't fully capture. The
-    # max_sorted clipping bug, in contrast, corrupts ~HALF the rows (~NT/2) every run.
-    # So the discriminator is the COUNT, not any single row: tolerate a small fraction
-    # of cancellation rows; fail only on a bug-scale fraction.
     tol_rows = max(64, NT // 1000)  # 0.1% of rows; bug is ~50%, noise is <0.1‰
     n_real = int(real.sum())
     print(f"[determinism full vs full ] noise rows={int(noise.sum())}/{NT}  "
