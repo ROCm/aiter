@@ -431,6 +431,10 @@ namespace py = pybind11;
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("out"),                                                                      \
+          py::arg("m"),                                                                        \
+          py::arg("n"),                                                                        \
+          py::arg("k"),                                                                        \
+          py::arg("split_dim"),                                                                \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"));                                                               \
     m.def("all_gather_reg",                                                                    \
