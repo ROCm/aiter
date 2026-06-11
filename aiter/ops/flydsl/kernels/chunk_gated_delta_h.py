@@ -249,12 +249,15 @@ def compile_chunk_gated_delta_h(
     OPT_W_ENABLED = N_REPEAT == 1
     NUM_INNER_SLOTS = NUM_K_BLOCKS * K_STEPS_PER_BLOCK * N_REPEAT
     NUM_GK_LOADS_CT = (NUM_K_BLOCKS * 4) if USE_GK else 0
-    # g_last + g_row. VWARP spans all BT M-tiles so it prefetches BT_MTILES*4
-    # g_row values instead of just 4.
-    _N_GROW = (BT_MTILES * 4) if VWARP_LAYOUT else 4
-    NUM_G_LOADS_CT = (1 + _N_GROW) if USE_G else 0
+    # g_last + g_row. Default batches them through the emitter queue; VWARP
+    # loads g_last and g_row inline during gating (minimal live VGPR), so
+    # nothing goes through the queue for it.
+    NUM_G_LOADS_CT = 0 if VWARP_LAYOUT else (5 if USE_G else 0)
     NUM_U_LOADS_CT = N_REPEAT * 4
-    NUM_EXTRA_LOADS_CT = NUM_GK_LOADS_CT + NUM_G_LOADS_CT + NUM_U_LOADS_CT
+    # VWARP loads u inline (in v_new), so it contributes nothing to the prefetch
+    # emitter queue / PROLOGUE schedule.
+    _NUM_U_QUEUE_CT = 0 if VWARP_LAYOUT else NUM_U_LOADS_CT
+    NUM_EXTRA_LOADS_CT = NUM_GK_LOADS_CT + NUM_G_LOADS_CT + _NUM_U_QUEUE_CT
     if OPT_VC_ENABLED and NUM_INNER_SLOTS > 0 and NUM_EXTRA_LOADS_CT > 0:
         EXTRAS_PER_SLOT_CT = (
             NUM_EXTRA_LOADS_CT + NUM_INNER_SLOTS - 1
@@ -793,11 +796,17 @@ def compile_chunk_gated_delta_h(
                 for i in range_constexpr(NUM_GK_LOADS_CT):
                     extra_load_emitters.append(_make_emit_gk(i))
             if const_expr(USE_G):
-                extra_load_emitters.append(_make_emit_g_last())
-                for i in range_constexpr(BT_MTILES * 4 if VWARP_LAYOUT else 4):
-                    extra_load_emitters.append(_make_emit_g_row(i))
-            for i in range_constexpr(NUM_U_LOADS_CT):
-                extra_load_emitters.append(_make_emit_u(i))
+                if const_expr(not VWARP_LAYOUT):
+                    extra_load_emitters.append(_make_emit_g_last())
+                    for i in range_constexpr(4):
+                        extra_load_emitters.append(_make_emit_g_row(i))
+                # VWARP: g_last and g_row are loaded inline during gating to
+                # minimise live VGPR (toward the 3 waves/SIMD threshold).
+            if const_expr(not VWARP_LAYOUT):
+                for i in range_constexpr(NUM_U_LOADS_CT):
+                    extra_load_emitters.append(_make_emit_u(i))
+            # VWARP: u is loaded inline in the v_new compute to keep it off the
+            # live set across GEMM1 (toward the 3 waves/SIMD VGPR threshold).
 
             # OPT-VC: the prefetch slot-assignment schedule lives in the
             # outer compile_chunk_gated_delta_h scope as SLOT_ASSIGN_CT /
@@ -945,9 +954,15 @@ def compile_chunk_gated_delta_h(
                 bv_val = bv_accs[idx]
                 u_f32_elems = []
                 for elem_i in range_constexpr(4):
-                    # u_prefetch entries are ordered (idx outer, elem_i inner)
-                    # in both layouts, so the flat index is the same expression.
-                    u_bf16 = fx.BFloat16(u_prefetch[idx * 4 + elem_i])
+                    if const_expr(VWARP_LAYOUT):
+                        # Load u inline here (not prefetched) so it never lives
+                        # across GEMM1 -- saves VGPR toward the 3 waves target.
+                        u_raw = v_[fx.Index(u_off_list[idx * 4 + elem_i])]
+                    else:
+                        # u_prefetch entries are ordered (idx outer, elem_i
+                        # inner), so the flat index is the same expression.
+                        u_raw = u_prefetch[idx * 4 + elem_i]
+                    u_bf16 = fx.BFloat16(u_raw)
                     u_f32_elems.append(u_bf16.to(fx.Float32))
                 u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
 
@@ -990,17 +1005,24 @@ def compile_chunk_gated_delta_h(
 
             # -- 3. Gating -- g values prefetched before MFMA --
             if const_expr(USE_G):
-                g_last = g_last_prefetch_cell[0]
+                if const_expr(VWARP_LAYOUT):
+                    # Load g_last inline (not via the prefetch queue) so it does
+                    # not occupy a VGPR across GEMM1.
+                    g_last = g_[fx.Index(g_last_off)]
+                else:
+                    g_last = g_last_prefetch_cell[0]
                 exp_g_last = _fast_exp(g_last)
 
                 if const_expr(VWARP_LAYOUT):
-                    # Gate is per-BT-row. Each vn_frags[m_bt] spans a distinct
-                    # BT M-tile, so build a per-m_bt gate vector from the 16
-                    # prefetched g rows (ordered m_bt outer, elem_i inner).
+                    # Gate is per-BT-row. Load this m_bt's 4 g rows inline and
+                    # consume immediately so only 4 g values are live at once
+                    # (vs 16 prefetched up-front) -- cuts VGPR toward 3 waves.
                     for m_bt in range_constexpr(BT_MTILES):
                         gate_elems = []
                         for elem_i in range_constexpr(4):
-                            g_row, in_bounds = g_row_prefetch[m_bt * 4 + elem_i]
+                            _idx = m_bt * 4 + elem_i
+                            g_row = g_[fx.Index(g_row_off_list[_idx])]
+                            in_bounds = g_row_in_bounds[_idx]
                             gate = _fast_exp(g_last - g_row)
                             gate_elems.append(
                                 in_bounds.select(gate, fx.Float32(0.0))
