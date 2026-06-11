@@ -22,6 +22,7 @@ LSE merge runs on host in cpu_reduce (which matches aiter csrc/kernels/mla/reduc
 import argparse
 import itertools
 import random
+import sys
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -29,6 +30,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 torch.set_default_device("cuda")
@@ -655,6 +657,14 @@ parser.add_argument(
     kernel binary; with the current .co the kernel ignores it and this fails.""",
 )
 args = parser.parse_args()
+
+# pa_decode_bf16_asm is a gfx1250-only asm kernel (the .co binary ships only
+# under hsa/gfx1250/ and the csrc guard raises on other archs). On any other
+# GPU the kernel can't run, so skip cleanly instead of failing CI.
+_arch = get_gfx_runtime()
+if _arch != "gfx1250":
+    print(f"[skip] pa_decode_bf16_asm requires gfx1250, got {_arch}; skipping test.")
+    sys.exit(0)
 
 df = []
 for batch, kv_head_num, ctx_len, mtp in itertools.product(
