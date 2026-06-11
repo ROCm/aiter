@@ -17,6 +17,8 @@ def addressable_lds_bytes_for_gfx(gfx: str) -> int:
         return _FALLBACK_MAX_LDS_BYTES
     if g.startswith("gfx950"):
         return 163840
+    if g.startswith("gfx1250"):
+        return 327680
     if g.startswith("gfx7") or g.startswith("gfx8"):
         return 32768
     return 65536

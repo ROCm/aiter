@@ -629,35 +629,100 @@ class CustomAllreduce:
                 registered_input=False,
             )
 
+    # reduce_scatter split_dim enum — must match `aiter::ReduceScatterSplitDim`
+    # in csrc/include/custom_all_reduce.cuh.
+    _RS_SPLIT_FIRST = 0
+    _RS_SPLIT_LAST = 1
+    _RS_SPLIT_MID = 2
+
+    @staticmethod
+    def _compute_rs_args(shape, dim: int, numel: int):
+        """Collapse `shape` around the scatter dim into the canonical
+        (m, n, k, split_dim) the C++ dispatcher expects. `dim` must be
+        already normalized to [0, len(shape))."""
+        ndim = len(shape)
+        if dim == 0:
+            return 0, 0, numel, CustomAllreduce._RS_SPLIT_FIRST
+        if dim == ndim - 1:
+            n = 1
+            for s in shape[:-1]:
+                n *= s
+            return 0, n, shape[-1], CustomAllreduce._RS_SPLIT_LAST
+        m = 1
+        for s in shape[:dim]:
+            m *= s
+        k = 1
+        for s in shape[dim + 1 :]:
+            k *= s
+        return m, shape[dim], k, CustomAllreduce._RS_SPLIT_MID
+
+    def should_custom_rs(self, inp: torch.Tensor, dim: int) -> bool:
+        """Return True iff the custom reduce_scatter kernel can handle
+        (inp, dim). Mirrors the C++ dispatch's hard requirements:
+
+          - all the should_custom_ar gates (size cap, contiguous, etc.)
+          - inp.shape[dim_normalized] % world_size == 0
+          - for dim == 0 (first-dim split) the flattened input must be
+            vectorizable: numel % (world_size * pack_size) == 0; there is
+            no naive fallback for the first-dim kernel and the framework is
+            expected to route to an external lib in that case.
+            (last/mid-dim kernels have naive fallbacks built in.)
+        """
+        if not self.should_custom_ar(inp):
+            return False
+        ndim = inp.dim()
+        if dim < 0:
+            dim += ndim
+        if dim < 0 or dim >= ndim:
+            return False
+        if inp.shape[dim] % self.world_size != 0:
+            return False
+        if dim == 0:
+            pack_size = 16 // inp.element_size()
+            if inp.numel() % (self.world_size * pack_size) != 0:
+                return False
+        return True
+
     def reduce_scatter(
         self,
         inp: torch.Tensor,
         out: torch.Tensor,
+        dim: int = 0,
         *,
         registered: bool = False,
     ):
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        ndim = inp.dim()
+        if dim < 0:
+            dim += ndim
+        m, n, k, split_dim = self._compute_rs_args(tuple(inp.shape), dim, inp.numel())
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
         ops.reduce_scatter(
             self._ptr,
             inp,
             out,
+            m,
+            n,
+            k,
+            split_dim,
             reg,
             reg_bytes,
         )
 
     def custom_reduce_scatter(
-        self, input: torch.Tensor, output: torch.Tensor
+        self, input: torch.Tensor, output: torch.Tensor, dim: int = 0
     ) -> Optional[torch.Tensor]:
-        # when custom allreduce is disabled, this will be None
-        if self.disabled or not self.should_custom_ar(input):
+        # when custom allreduce is disabled or this shape/dim is unsupported,
+        # this will be None and the caller is expected to fall back to an
+        # external reduce_scatter implementation (NCCL / pynccl / torch.dist).
+        if self.disabled or not self.should_custom_rs(input, dim):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.reduce_scatter(input, output, registered=True)
+                return self.reduce_scatter(input, output, dim, registered=True)
         else:
-            return self.reduce_scatter(input, output, registered=False)
+            return self.reduce_scatter(input, output, dim, registered=False)
 
     def _allgather_out_shape(self, inp: torch.Tensor, dim: int):
         ndim = inp.dim()
