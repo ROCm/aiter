@@ -290,3 +290,40 @@ Still genuinely open: which avenue ships to production (FlyDSL→CKTile recommen
     the g2s/s2g copy partitions made m_warps-aware — a kernel-surface project, not a quick lever; deferred.
   - **Final standing vs Triton:** uniform D256 **~1.30-1.34×** (was 1.16-1.22×), D512 ~1.41-1.43×; skew
     up to 1.31×. The D256 shapes gained the most this batch.
+
+## 2026-06-11 (loop session, batch 5 — fresh PMC closes the AGPR axis)
+
+Resumed the autoresearch loop. Re-confirmed the baseline (do_bench cold-L2, all cos=1.0): uniform
+B120_D256 0.493 / B120_D512 1.357 / B1024_D256 4.239 / B1024_D512 11.363 ms; flydsl leads Triton
+1.29-1.44× uniform, 1.19-1.32× skew. This batch took the diagnosed-but-unattempted D512 lever and the
+remaining occupancy probes to a definitive verdict via fresh profiling. **Net: no new commit — the batch
+proves the kernel is at its gfx942 ceiling for these shapes and corrects two stale diagnoses.**
+
+- **D512 warp-split at threads=512 — REFUTED (the deferred batch-4 lever).** The batch-4 note hypothesized
+  D512 regresses at threads=512 because 8 N-warps cause MFMA issue-port contention, and a 4N×2M split
+  might recover it. Tested cleanly via a `JDBBA_NWARP_CAP` env knob capping n_warps (cap=4 → (2,4,1),
+  cap=2 → (4,2,1), default (1,8,1)). threads=512 regressed D512 ~24% in **all three** layouts
+  (B120 1.34→1.67, B1024 11.2→13.9, cos=1.0). The contention hypothesis is wrong — threads=512 hurts
+  D512's longer 8-tile K-loop regardless of warp arrangement; the warp-scheduling overhead dominates and
+  halved-AGPR occupancy doesn't pay on the longer loop. D512 wants threads=256. Probe hook reverted.
+- **Fresh D512 PMC corrects the stale VALU note.** rocprofv3 (B1024_D512, threads=256): **MfmaUtil 44%,
+  VALUBusy ~20%, MemUnitStalled 0.08%, LDSBankConflict 2.8%, VGPR=56, AGPR=128.** The batch-4
+  "VALUBusy 44%" was wrong — VALU is only ~20% and idle; **MFMA at 44% is the busy unit**. There is no
+  VALU lever to pull (and the inner-loop soffset multiplies are already constant-folded by the unrolled
+  K-loop anyway).
+- **D256@threads=512 PMC.** (B1024_D256): MfmaUtil 31%, VALUBusy 22%, MemUnitStalled 0.13%,
+  LDSBankConflict 3.9%, **VGPR=112, AGPR=0** — threads=512 pushed the entire accumulator into VGPR; the
+  occupancy win is fully banked.
+- **waves_per_eu re-tested at threads=512 — still INERT.** wpe∈{0..4} on both D256 shapes, all within
+  noise (B120 best wpe=0; B1024 wpe=1 0.5% = noise). Even at AGPR=64/0 the hint has no slack. Discarded.
+- **Memory-amortization lever class REFUTED by PMC.** Both shapes show MemUnitStalled ≈ 0.1% with all
+  non-MFMA units idle → there is NO memory stall to hide. So B-stationary multi-M-tile (#12), deeper
+  A-staging / STAGES_A (#5/#9), and async-copy changes cannot help — they amortize memory/fill latency
+  that the profile shows isn't there. The kernel is **MFMA-throughput + occupancy bound** on both shapes.
+- **Conclusion — the AGPR-occupancy axis is exhausted; the kernel is at its gfx942 ceiling.** The only
+  remaining ceiling-raisers are (a) the 32-K MFMA atom (gfx942 hardware lacks it → use_mfma_k32 must stay
+  False) or (b) lower C-accumulator register footprint without doubling the block grid — and threads=512
+  already did (b) for D256 (1024 lost, smaller tiles lose to 2× block-grid). No quick lever remains.
+  **Standing vs Triton unchanged from batch 4:** uniform D256 ~1.30-1.34× / D512 ~1.41-1.43×; skew up to
+  ~1.31×. The committed dispatch (threads=512 D256-uniform, per-shape XCD, B-prefetch 3-stage, BLOCK_K=64)
+  is the gfx942-optimal static config found by this loop.
