@@ -2315,9 +2315,8 @@ __device__ __forceinline__ void store_fp8_kv_cache_pack(
     const int64_t block_offset = slot_id % page_size;
     const float fp8_max =
         opus::cast<opus::fp32_t>(opus::numeric_limits<opus::fp8_t>::max());
-    const float safe_max  = fmaxf(local_max, 1.0e-8f);
-    const float scale_val = safe_max / fp8_max;
-    const float inv_scale = fp8_max / safe_max;
+    const float scale_val = fmaxf(local_max / fp8_max, 1.0e-12f);
+    const float inv_scale = 1.0f / scale_val;
 
     if(access_id_in_head == 0)
     {
@@ -2635,6 +2634,11 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
             throw std::runtime_error("Invalid cache page_size/x_layout/head_dim for qknorm cache fusion");
         if(head_dim % PACK_SIZE != 0)
             throw std::runtime_error("head_dim must be divisible by PACK_SIZE for qknorm cache fusion");
+        if(x_layout % PACK_SIZE != 0)
+            throw std::runtime_error("x_layout must be divisible by PACK_SIZE for qknorm cache fusion");
+        int const head_packs = head_dim / PACK_SIZE;
+        if((head_packs & (head_packs - 1)) != 0)
+            throw std::runtime_error("head_dim/PACK_SIZE must be a power of two for qknorm cache fusion");
     }
     dim3 threadsPerBlock(BLOCK_SIZE);
     int grid_blocks = std::min(token_num, kMaxBlocks);

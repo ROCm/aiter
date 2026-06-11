@@ -969,6 +969,8 @@ void fused_qknorm_allreduce_rope_cache_quant(fptr_t _fa,
 
     const int64_t page_size = k_cache.size(3);
     const int64_t x_layout  = k_cache.size(4);
+    if(k_cache.size(2) * k_cache.size(4) != head_dim)
+        throw std::runtime_error("fused_qknorm_allreduce_rope_cache_quant K cache layout mismatch");
     if(v_cache.size(2) * v_cache.size(4) != page_size || v_cache.size(3) != head_dim ||
        v_cache.size(4) != x_layout)
         throw std::runtime_error("fused_qknorm_allreduce_rope_cache_quant V cache layout mismatch");
