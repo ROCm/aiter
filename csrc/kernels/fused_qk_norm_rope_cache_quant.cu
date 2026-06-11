@@ -2813,6 +2813,12 @@ __global__ void minimax_qk_norm_rope_tp1_kernel(
     {
         x = *reinterpret_cast<pack_t const*>(q_ptr + pack_start);
     }
+    float acc[PackSize];
+#pragma unroll
+    for(int i = 0; i < PackSize; ++i)
+    {
+        acc[i] = static_cast<float>(x[i]);
+    }
 
     float q_square_sum = 0.0f;
     float k_square_sum = 0.0f;
@@ -2821,14 +2827,13 @@ __global__ void minimax_qk_norm_rope_tp1_kernel(
 #pragma unroll
         for(int i = 0; i < PackSize; ++i)
         {
-            float const val = static_cast<float>(x[i]);
             if(tid < q_packs)
             {
-                q_square_sum += val * val;
+                q_square_sum += acc[i] * acc[i];
             }
             else
             {
-                k_square_sum += val * val;
+                k_square_sum += acc[i] * acc[i];
             }
         }
     }
@@ -2845,8 +2850,7 @@ __global__ void minimax_qk_norm_rope_tp1_kernel(
 #pragma unroll
         for(int i = 0; i < PackSize; ++i)
         {
-            x[i] = static_cast<scalar_t>(static_cast<float>(x[i]) * q_rstd *
-                                         static_cast<float>(w[i]));
+            x[i] = static_cast<scalar_t>(acc[i] * q_rstd * static_cast<float>(w[i]));
         }
         int const access_id_in_head = pack_start % head_dim;
         x = is_neox ? minimax_apply_neox_rope_pack<scalar_t, PackSize>(
@@ -2864,8 +2868,7 @@ __global__ void minimax_qk_norm_rope_tp1_kernel(
 #pragma unroll
         for(int i = 0; i < PackSize; ++i)
         {
-            x[i] = static_cast<scalar_t>(static_cast<float>(x[i]) * k_rstd *
-                                         static_cast<float>(w[i]));
+            x[i] = static_cast<scalar_t>(acc[i] * k_rstd * static_cast<float>(w[i]));
         }
         int const access_id_in_head = k_start % head_dim;
         x = is_neox ? minimax_apply_neox_rope_pack<scalar_t, PackSize>(
