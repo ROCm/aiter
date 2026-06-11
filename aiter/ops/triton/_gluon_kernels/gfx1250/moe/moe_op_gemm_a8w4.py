@@ -363,10 +363,10 @@ def _moe_gemm_a8w4_decode(
         offs_xs_m = off_x_m + gl.arange(
             0, BLOCK_M, layout=gl.SliceLayout(1, X_SCALES_LOAD_LAYOUT)
         )
+        offs_xs_m = gl.max_contiguous(gl.multiple_of(offs_xs_m % M, BLOCK_M), BLOCK_M)
         offs_xs_k = gl.arange(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
         )
-        mask_xs_m = offs_xs_m < M
         if GatherIndx is None:
             XMxScale += start_m * stride_x_mx_m
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -440,8 +440,6 @@ def _moe_gemm_a8w4_decode(
             async_copy.global_to_shared(
                 x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 xs_ptrs_base + xs_k.to(index_type)[None, :],
-                mask=mask_xs_m[:, None],
-                other=0.0,
             )
             async_copy.commit_group()
         write_idx += 1
@@ -480,8 +478,6 @@ def _moe_gemm_a8w4_decode(
             async_copy.global_to_shared(
                 x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 xs_ptrs_base + xs_k.to(index_type)[None, :],
-                mask=mask_xs_m[:, None],
-                other=0.0,
             )
             async_copy.commit_group()
         write_idx += 1
@@ -920,7 +916,6 @@ def _moe_gemm_a8w4_prefill(
         offs_xs_k = gl.arange(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
         )
-        mask_xs_m = offs_xs_m < M
         if GatherIndx is None:
             XMxScale += start_m * stride_x_mx_m
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -994,8 +989,6 @@ def _moe_gemm_a8w4_prefill(
             async_copy.global_to_shared(
                 x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 xs_ptrs_base + xs_k.to(index_type)[None, :],
-                mask=mask_xs_m[:, None],
-                other=0.0,
             )
             async_copy.commit_group()
         write_idx += 1
