@@ -327,3 +327,35 @@ proves the kernel is at its gfx942 ceiling for these shapes and corrects two sta
   **Standing vs Triton unchanged from batch 4:** uniform D256 ~1.30-1.34× / D512 ~1.41-1.43×; skew up to
   ~1.31×. The committed dispatch (threads=512 D256-uniform, per-shape XCD, B-prefetch 3-stage, BLOCK_K=64)
   is the gfx942-optimal static config found by this loop.
+
+## 2026-06-11 (loop session, batch 6 — the bottleneck reclassified: MFMA-issue latency, not occupancy)
+
+Resumed the loop to attack the 2× gap directly. The decisive experiment reclassifies the bottleneck and
+explains why every occupancy lever (batches 4-5) has plateaued. **Net: no new commit — batch 6 proves the
+kernel is at its gfx942 ceiling on the current surface, and identifies the one path to 2× (a warp-
+specialized rewrite) as out of scope for an autoresearch lever.**
+
+- **Smoking gun:** threads=512 on D512 **does** double occupancy (MeanOccupancyPerActiveCU 1.92→3.82
+  waves/CU, OccupancyPercent 23%→46%, AGPR 128→0) — **yet MfmaUtil stays FLAT at ~44% and runtime
+  regresses** (B1024_D512 11.26→12.0). More waves changed nothing → MFMA is not idle for lack of waves;
+  it idles ~56% waiting on its INPUTS (A-staging LDS round-trip + per-K barrier in the dependency chain).
+  **The kernel is MFMA-issue/dependency-latency bound, not occupancy bound** — this supersedes the
+  batch 4-5 "AGPR-occupancy bound" framing (occupancy was a symptom). MfmaFlopsBF16 = 4.12e12 = exactly
+  2·L·K·N (zero wasted MFMA work), ~28% of bf16 MFMA peak.
+- **Refuted against the new diagnosis (all measured, cos=1.0):** smaller tiles on D512 (64×128/128×64/
+  64×64 all lose — occupancy gain irrelevant, block-grid overhead dominates); fatter tiles (256×* lose
+  on D256, 256×256 crashes the 64KB LDS ceiling); BLOCK_K=128 on D512 (13.96/13.11 vs 11.26 — fewer
+  barriers don't beat the longer K-tile); STAGES_A=3 on D512 (13.79/14.13 vs 11.26 — deeper A pipeline
+  doesn't recover the MFMA gap even though D512 ignores occupancy); B_STAGES=2/4 at threads=512 (3 still
+  optimal). All probe hooks (JDBBA_NWARP_CAP/BSTAGES/BLOCKK/STAGESA) reverted, tree clean.
+- **D256 @ threads=512 is now VGPR-capped** (3.83 waves/CU, VGPR=112, AGPR=0, MfmaUtil 31%) — the
+  threads=512 win is fully banked, no further headroom on the occupancy axis.
+- **The 2× verdict.** MFMA work is already minimal (zero waste), so raising the ~28% MFMA-peak
+  utilization requires either (a) the 32-K MFMA atom — **gfx942 hardware lacks it** (hard ceiling); or
+  (b) a **warp-specialized producer/consumer pipeline** (dedicated copy warps feed the MFMA warps via a
+  multi-buffer LDS queue so MFMA never stalls on the round-trip/barrier — the CUTLASS ping-pong surface).
+  (b) is a ground-up kernel rewrite (new warp-role partitioning, async LDS queue, cross-warp barriers),
+  not a one-lever autoresearch change — multi-day effort with real correctness risk. Within the current
+  surface (shared-memory A-staging, single-role warps, barrier-synced K-loop) the kernel is at its gfx942
+  ceiling: **uniform D256 ~1.30-1.34×, D512 ~1.41-1.43× vs Triton; skew up to ~1.31×.** The committed
+  config remains the gfx942-optimal static kernel this loop found.
