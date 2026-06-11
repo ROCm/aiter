@@ -250,8 +250,9 @@ class PagedAttention:
         fp8_out_scale=None,
         mtp: int = 1,
         output_dtype: torch.dtype = None,
-        p_scale: Optional[torch.Tensor] = None,
-        p_scale_inv: Optional[torch.Tensor] = None,
+        p_scale: Optional[torch.Tensor | float] = None,
+        p_scale_inv: Optional[torch.Tensor | float] = None,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Whether to use rocm custom paged attention or not
         num_query_tokens, num_heads, head_size = query.shape
@@ -268,7 +269,9 @@ class PagedAttention:
             and mtp in (1, 2)
         ):
             output_dtype = dtypes.bf16
-        output = torch.empty_like(query, dtype=output_dtype)
+        output = out if out is not None else torch.empty_like(
+            query, dtype=output_dtype
+        )
         cpa_fp8_out = False
         if fp8_out_scale is not None:
             output = torch.empty_like(output, dtype=dtypes.fp8)
@@ -283,8 +286,8 @@ class PagedAttention:
         # ---- FP8 GQA HIP fast path ----
         # Project-internal HIP kernel for the default FP8 GQA decode config:
         # Q/K/V fp8_e4m3fnuz, 8Q/1KV heads, head=128, block=16, mtp in
-        # {1,2}, Q/K per-token scale, V per-head scale, and P scale
-        # (default 256 when not explicitly provided).
+        # {1,2}, Q/K per-token scale, V per-head scale, and optional P
+        # scale (tensor per-head or scalar constant).
         # Disable via $AITER_DISABLE_PA_FP8_GQA=1.
         if _pa_fp8_gqa_eligible(
             query, key_cache, value_cache, output,

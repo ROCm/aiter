@@ -120,6 +120,8 @@ void pa_fp8_main_kernel_v2(
     const float* __restrict__                v_scale_ptr,
     const float* __restrict__                p_scale_ptr,     // [total_num_heads]
     const float* __restrict__                p_scale_inv_ptr, // [total_num_heads]
+    const float                              p_scale_value,   // scalar fallback when p_scale_ptr is null
+    const float                              p_scale_inv_value,
     const int* __restrict__                  block_tables,
     const int* __restrict__                  context_lens,
     const int                                max_num_blocks_per_seq,
@@ -268,8 +270,16 @@ void pa_fp8_main_kernel_v2(
     float p_scale_inv_lane = 1.f;
     if constexpr (HasPScale)
     {
-        p_scale_lane     = p_scale_ptr    [q_head_idx];
-        p_scale_inv_lane = p_scale_inv_ptr[q_head_idx];
+        if (p_scale_ptr != nullptr)
+        {
+            p_scale_lane     = p_scale_ptr    [q_head_idx];
+            p_scale_inv_lane = p_scale_inv_ptr[q_head_idx];
+        }
+        else
+        {
+            p_scale_lane     = p_scale_value;
+            p_scale_inv_lane = p_scale_inv_value;
+        }
     }
 
     // Wide Q load: 16 fp8 / lane per qkhe step, covering head_dim
