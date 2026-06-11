@@ -302,9 +302,7 @@ def compile_gemm2_a4w4_port(
     # epilog. This mirrors the prebuilt HIP gemm2 (256 persistent WGs); profiling
     # showed the old one-shot mxfp4out path ~8-9% slower than HIP at M>=16384.
     _persistent = epilog in ("nonatomic", "nonatomic_mxfp4")
-    kmchunks(BM)
     _slot_bytes = saq_slot_bytes(BM)
-    BM * BN
     # Number of LDS A-slots (s_Aq stages). The K_TILES_TOTAL==2 fast path preloads
     # all 2 tiles into 2 slots (double buffer). The streaming K_TILES_TOTAL>2 path
     # uses 3 slots (triple buffer) so the per-iteration read-slot (tile kt) and
