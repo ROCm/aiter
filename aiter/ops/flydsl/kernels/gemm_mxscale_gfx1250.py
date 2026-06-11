@@ -345,8 +345,18 @@ def compile_mxscale_gemm(
 
     pre_loaded = num_buffers - 1
     loop_iters = (num_k_tiles - pre_loaded) // num_buffers
+    # When K-pad has a partial boundary tile, ensure it is loaded by the tail
+    # (which rebuilds full descriptors with valid_inner) rather than the main
+    # loop (which uses a shared advancing descriptor without valid_inner).
+    # Shorten the main loop by one iteration so the boundary tile spills into
+    # the tail's extra loads.
+    _k_boundary_partial = k_pad and (k_valid_eff % tile_k != 0)
     _tail_start = loop_iters * num_buffers
     extra = num_k_tiles - _tail_start - pre_loaded
+    if _k_boundary_partial and extra == 0 and loop_iters > 0:
+        loop_iters -= 1
+        _tail_start = loop_iters * num_buffers
+        extra = num_k_tiles - _tail_start - pre_loaded
     _base_tail_plan = make_tail_plan(num_buffers, pre_loaded, extra)
 
     _last_compute_stage = _base_tail_plan[-1][1]
@@ -2223,27 +2233,6 @@ def compile_mxscale_gemm(
                     hi_inc = arith.addi(hi, arith.constant(1, type=T.i32))
                     return new_lo, arith.select(wrapped, hi_inc, hi)
 
-            def _issue_loads_for_tile(stage_lds_idx, k_base):
-                """K-pad load path (non-WS): rebuild full descriptors for one
-                K-tile from its absolute ``k_base`` so each load carries the
-                correct OOB ``valid_inner`` (padded tail zero-filled), then
-                issue.  Used instead of the shared advancing descriptor whenever
-                ``k_pad`` is active."""
-                issue_tdm_loads(
-                    make_desc_a(stages_a_mem[stage_lds_idx], k_base),
-                    make_desc_b(stages_b_mem[stage_lds_idx], k_base),
-                    make_desc_as(stages_as_mem[stage_lds_idx], k_base),
-                    make_desc_bs(stages_bs_mem[stage_lds_idx], k_base),
-                    wave_specialized=wave_specialized_tdm,
-                )
-                if const_expr(stage1_dual_b):
-                    tdm_ops.tensor_load_2d(
-                        make_desc_b(stages_b_up_mem[stage_lds_idx], k_base, N)
-                    )
-                    tdm_ops.tensor_load_2d(
-                        make_desc_bs(stages_bs_up_mem[stage_lds_idx], k_base, N)
-                    )
-
             # Prologue
             if const_expr(wave_specialized_tdm):
                 for i in range_constexpr(pre_loaded):
@@ -2260,11 +2249,6 @@ def compile_mxscale_gemm(
                     active_addr_lo = arith.addi(active_addr_lo, active_adv_i32)
             else:
                 for i in range_constexpr(pre_loaded):
-                    if const_expr(k_pad):
-                        _issue_loads_for_tile(
-                            i, split_k_base + arith.index(i * tile_k)
-                        )
-                        continue
                     dg0_a = vector.from_elements(
                         T.vec(4, T.i32),
                         [pred_const, stages_a_lds_addr[i], addr_lo_a, addr_hi_a],
@@ -2498,13 +2482,6 @@ def compile_mxscale_gemm(
                                     + arith.index(buf_idx * tile_k)
                                 ),
                             ):
-                                if const_expr(k_pad):
-                                    # Rebuild per-tile descriptors so the padded
-                                    # K tail is OOB zero-filled; the shared
-                                    # advancing descriptor can't vary tdim0.
-                                    _issue_loads_for_tile(_ls, _k_off)
-                                    _l2_prefetch(_k_off)
-                                    return
                                 dg0_a = vector.from_elements(
                                     T.vec(4, T.i32),
                                     [
