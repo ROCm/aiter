@@ -125,89 +125,82 @@ def select_3d_config(
     shuffled_kv_cache: bool = False,
     NUM_BLOCKS_GATHER_PER_TILE: int = 1,
 ):
+    # TODO: wait for Triton compiler to support ds_load_tr4 before we can include torch.uint8 kv_cache_dtype
+    # assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, torch.uint8, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8})"
+    assert kv_cache_dtype in (
+        torch.bfloat16,
+        e4m3_dtype,
+    ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
     reduce_num_warps = 2
     attn_warps = 2
     waves_per_eu = 2
     num_segments = 0
     attn_stages = 2
-    if shuffled_kv_cache:
-        if kv_cache_dtype == torch.bfloat16:
-            if num_2d_prgms >= 2048:
-                attn_warps = 1
-                waves_per_eu = 2
-                if IS_DEVICE_ARCH_GFX12:
-                    num_segments = 1
-            else:
-                attn_warps = 1
-                waves_per_eu = 2
-                num_segments = 8
-        elif kv_cache_dtype == e4m3_dtype:
-            if num_2d_prgms >= 2048:
-                attn_warps = 1
-                waves_per_eu = 2
-                if IS_DEVICE_ARCH_GFX12:
-                    num_segments = 1
-            else:
-                attn_warps = 1
-                waves_per_eu = 2
-                num_segments = 8
-        else:
-            assert (
-                block_size == 128
-            ), "Only block_size == 128 is supported for FP4 KV cache"
-            if num_2d_prgms >= 2048:
-                attn_warps = 1
-                waves_per_eu = 2
-                if IS_DEVICE_ARCH_GFX12:
-                    num_segments = 1
-            else:
-                attn_warps = 1
-                waves_per_eu = 2
-                num_segments = 8
-
-    TILE_SIZE = min(64, triton.next_power_of_2(block_size))
-
-    MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
-    MIN_SEGMENTS = min(8, MAX_SEGMENTS)
-    if num_segments == 0:
-        num_segments = math.ceil(target_num_prgms / num_2d_prgms)
-        num_segments = min(num_segments, MAX_SEGMENTS)
-        num_segments = triton.next_power_of_2(num_segments)
-        num_segments = min(num_segments, 128)
-        num_segments = max(num_segments, MIN_SEGMENTS)
-
-    if num_segments == MIN_SEGMENTS:
-        reduce_num_warps = 1
-
-    occ = waves_per_eu * 4 // attn_warps
-
-    # # this section increases the num_warps if the occ is too high
-    # total_num_wg = num_2d_prgms * num_segments
-    # if total_num_wg < occ * target_num_prgms:
-    #     # occ too high, increase attn_warps to relax occ
-    #     attn_warps = (waves_per_eu * 4) // max(
-    #         1, triton.next_power_of_2(total_num_wg // target_num_prgms)
-    #     )
-    #     attn_warps = max(attn_warps, 1)
-    #     attn_warps = min(attn_warps, 4)
-
-    if (
-        2 * attn_stages * TILE_SIZE * head_size * kv_cache_dtype.itemsize * occ
-        >= 327680
-    ):
-        waves_per_eu = 0
-
-    # fix TILE_SIZE to block_size if shuffled_kv_cache is True
-    if shuffled_kv_cache:
-        if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
-            assert (
-                block_size >= 32
-            ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+    if IS_DEVICE_ARCH_GFX12:
+        attn_warps = 1
         TILE_SIZE = block_size
-    elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
-        TILE_SIZE = max(32, TILE_SIZE)
+        if shuffled_kv_cache and head_size < 128:
+            if kv_cache_dtype == torch.bfloat16:
+                if block_size <= 64:
+                    waves_per_eu = 2
+                else:
+                    waves_per_eu = 1
+            elif kv_cache_dtype == e4m3_dtype:
+                if block_size <= 128:
+                    waves_per_eu = 2
+                else:
+                    waves_per_eu = 1
+            else:
+                assert block_size == 128, "FP4 KV cache only supports block_size 128"
+                waves_per_eu = 2
+        else:
+            # GFX12 fallback
+            waves_per_eu = 1
+
+        occ = waves_per_eu * 4 // attn_warps
+        MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
+        num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
+        num_segments = min(MAX_SEGMENTS, num_segments)
+        num_segments = triton.next_power_of_2(num_segments)
+
+        # # this section increases the num_warps if the occ is too high
+        # total_num_wg = num_2d_prgms * num_segments
+        # if total_num_wg < occ * target_num_prgms:
+        #     # occ too high, increase attn_warps to relax occ
+        #     attn_warps = (waves_per_eu * 4) // max(
+        #         1, triton.next_power_of_2(total_num_wg // target_num_prgms)
+        #     )
+        #     attn_warps = max(attn_warps, 1)
+        #     attn_warps = min(attn_warps, 4)
+    else:
+        occ = waves_per_eu * 4 // attn_warps
+        target_num_prgms = target_num_prgms * occ
+
+        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+
+        MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+        MIN_SEGMENTS = min(8, MAX_SEGMENTS)
+        if num_segments == 0:
+            num_segments = math.ceil(target_num_prgms / num_2d_prgms)
+            num_segments = min(num_segments, MAX_SEGMENTS)
+            num_segments = triton.next_power_of_2(num_segments)
+            num_segments = min(num_segments, 128)
+            num_segments = max(num_segments, MIN_SEGMENTS)
+
+        if num_segments == MIN_SEGMENTS:
+            reduce_num_warps = 1
+
+        if shuffled_kv_cache:
+            if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+                assert (
+                    block_size >= 32
+                ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+            TILE_SIZE = block_size
+        elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+            TILE_SIZE = max(32, TILE_SIZE)
 
     if NUM_BLOCKS_GATHER_PER_TILE > 1:
+        # force gather mode
         assert NUM_BLOCKS_GATHER_PER_TILE in [
             4,
             8,
@@ -216,6 +209,11 @@ def select_3d_config(
         waves_per_eu = 1
         num_segments = max(1, num_segments // NUM_BLOCKS_GATHER_PER_TILE)
         TILE_SIZE = block_size * NUM_BLOCKS_GATHER_PER_TILE
+    elif TILE_SIZE > block_size:
+        assert (
+            TILE_SIZE % block_size == 0
+        ), "TILE_SIZE needs to be divisible by block_size"
+        NUM_BLOCKS_GATHER_PER_TILE = TILE_SIZE // block_size
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
@@ -245,6 +243,10 @@ def use_2d_kernel(
     target_num_prgms,
     num_2d_prgms,
 ):
+    # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
+    if IS_DEVICE_ARCH_GFX12:
+        return (sliding_window > 0) or (not all_decode)
+
     return (
         (sliding_window > 0)
         or (max_seqlen_k <= 512)
@@ -345,11 +347,8 @@ def unified_attention(
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
-    if IS_DEVICE_ARCH_GFX12:
-        target_num_prgms = 256
-    else:
-        cu_count = get_num_sms()
-        target_num_prgms = cu_count * 4
+    cu_count = get_num_sms()
+    target_num_prgms = cu_count * 4
     ALL_DECODE = max_seqlen_q == 1
     if ALL_DECODE:
         total_num_q_blocks = num_seqs
@@ -511,7 +510,7 @@ def unified_attention(
             segm_max = out  # dummy ptr
             segm_expsum = out  # dummy ptr
 
-        if IS_DEVICE_ARCH_GFX12:
+        if IS_DEVICE_ARCH_GFX12 and shuffled_kv_cache:
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](

@@ -106,6 +106,7 @@ class AttentionConfig:
         self,
         HEAD_SIZE,
         BLOCK_SIZE,
+        TILE_SIZE,
         NUM_BLOCKS_GATHER_PER_TILE,
         NUM_SEGMENTS_PER_SEQ,
         BLOCK_M,
@@ -134,6 +135,7 @@ class AttentionConfig:
         # Constants
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
+        self.TILE_SIZE = gl.constexpr(TILE_SIZE)
         self.NUM_BLOCKS_GATHER_PER_TILE = gl.constexpr(NUM_BLOCKS_GATHER_PER_TILE)
         self.NUM_SEGMENTS_PER_SEQ = gl.constexpr(NUM_SEGMENTS_PER_SEQ)
         self.BLOCK_M = gl.constexpr(BLOCK_M)
@@ -149,7 +151,6 @@ class AttentionConfig:
         self.SCALE_K_WIDTH = gl.constexpr(SCALE_K_WIDTH)
         self.BLOCK_SCALES_SIZE = gl.constexpr(BLOCK_SCALES_SIZE)
         # Derived constants
-        self.TILE_SIZE = gl.constexpr(BLOCK_SIZE * NUM_BLOCKS_GATHER_PER_TILE)
         self.NUM_QUERIES_PER_KV = gl.constexpr(NUM_QUERY_HEADS // NUM_KV_HEADS)
         self.BLOCK_Q = gl.constexpr(BLOCK_Q)
         self.RCP_LN2 = gl.constexpr(1.4426950408889634)
@@ -1901,8 +1902,8 @@ def e2m1_packed_to_fp(
 unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
     "_unified_attention_gluon_kernel_3d",
     [
-        "num_query_heads",
-        "num_queries_per_kv",
+        "NUM_QUERY_HEADS",
+        "NUM_KV_HEADS",
         "BLOCK_SIZE",
         "TILE_SIZE",
         "HEAD_SIZE",
@@ -1993,6 +1994,7 @@ def _unified_attention_gluon_kernel_3d(
     cfg = AttentionConfig(
         HEAD_SIZE,
         BLOCK_SIZE,
+        TILE_SIZE,
         NUM_BLOCKS_GATHER_PER_TILE,
         NUM_SEGMENTS_PER_SEQ,
         BLOCK_M,
@@ -2123,9 +2125,9 @@ def _unified_attention_gluon_kernel_3d(
     )
     q_shared.store(Q_load)
     Q = q_shared.load(layout=cfg.Q_DOT_LAYOUT)
-    if QUERY_DTYPE != "nvfp4":
-        Q = Q.to(gl.float32) * qk_factor
-        Q = Q.to(query_ptr.type.element_ty)
+    # if QUERY_DTYPE != "nvfp4":
+    #     Q = Q.to(gl.float32) * qk_factor
+    #     Q = Q.to(query_ptr.type.element_ty)
 
     if QUERY_DTYPE == "nvfp4":
         # A4W4
@@ -2154,8 +2156,8 @@ def _unified_attention_gluon_kernel_3d(
         q_scales = q_scales_shared.load(layout=cfg.Q_SCALES_DOT_LAYOUT).to(
             e4m3_dtype, bitcast=True
         )
-        q_scales = q_scales.to(gl.float32) * qk_factor
-        q_scales = q_scales.to(e4m3_dtype)
+        # q_scales = q_scales.to(gl.float32) * qk_factor
+        # q_scales = q_scales.to(e4m3_dtype)
     elif KV_CACHE_DTYPE == "nvfp4":
         # A8W4
         q_scales = gl.full(
@@ -2313,7 +2315,7 @@ def _unified_attention_gluon_kernel_3d(
         pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=next_buffer_id)
 
         S = pgm.compute_qk(k, q_scales, k_scales)
-        # S = S * qk_factor
+        S = S * qk_factor
 
         S = pgm.apply_softcap(S)
         if need_addtional_mask:
@@ -2367,7 +2369,7 @@ def _unified_attention_gluon_kernel_3d(
         k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=buffer_id)
         k_scales = None
     S = pgm.compute_qk(k, q_scales, k_scales)
-    # S = S * qk_factor
+    S = S * qk_factor
 
     S = pgm.apply_softcap(S)
     seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
