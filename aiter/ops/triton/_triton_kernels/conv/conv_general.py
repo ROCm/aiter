@@ -61,12 +61,12 @@ def _conv2d_general_kernel(
     LAYOUT: tl.constexpr,
 ):
     """General conv kernel with precomputed bases.
-    LAYOUT: 0=NCHW, 1=NHWC
+    LAYOUT: "nchw" or "nhwc"
     """
     # WK is always [K_out, K_pad] contiguous
     stride_wk_kout: tl.constexpr = K_pad
     stride_wk_kred: tl.constexpr = 1
-    if LAYOUT == 0:
+    if LAYOUT == "nchw":
         # NCHW: X[N, C, H, W_in], Y[N, K_out, P, Q]
         stride_x_n: tl.constexpr = C * H * W_in
         stride_x_c: tl.constexpr = H * W_in

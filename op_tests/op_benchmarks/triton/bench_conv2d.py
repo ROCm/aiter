@@ -337,7 +337,6 @@ def bench_one_shape(
             padding,
             dilation,
             activation="none",
-            out_dtype=dtype,
         )
 
     def run_torch():

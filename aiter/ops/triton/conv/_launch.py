@@ -63,14 +63,6 @@ def _select_3x3_method(N, C, H, W, K_out, stride, dilation):
     return "cblocked"
 
 
-def _layout_to_int(layout):
-    """Convert layout string to kernel int: 0=NCHW, 1=NHWC."""
-    layout = layout.lower()
-    if layout not in ("nchw", "nhwc"):
-        raise ValueError(f"layout must be 'nchw' or 'nhwc', got '{layout}'")
-    return 0 if layout == "nchw" else 1
-
-
 def _launch_1x1(
     x,
     w_oihw,
@@ -98,7 +90,6 @@ def _launch_1x1(
     ph, pw = padding
 
     w = w_oihw.squeeze(-1).squeeze(-1).contiguous()  # [K_out, C]
-    layout = _layout_to_int(layout)
 
     def grid(meta):
         BM = meta["BLOCK_M"]
@@ -339,7 +330,6 @@ def _launch_general(
     sh, sw = stride
     ph, pw = padding
     dh, dw = dilation
-    layout = _layout_to_int(layout)
 
     def grid(meta):
         BM = meta["BLOCK_M"]
@@ -420,7 +410,6 @@ def _launch_winograd_f4x3_fused(
     tile_H = (P + 3) // 4
     tile_W = (Q + 3) // 4
     T = N * tile_H * tile_W
-    layout_int = _layout_to_int(layout)
 
     input_dtype = x.dtype
     V = torch.empty((36, T, C_pad), device=x.device, dtype=input_dtype)
@@ -460,7 +449,7 @@ def _launch_winograd_f4x3_fused(
         T,
         ph,
         pw,
-        LAYOUT=layout_int,
+        LAYOUT=layout,
         **input_config,
     )
 
@@ -485,7 +474,7 @@ def _launch_winograd_f4x3_fused(
         T,
         HAS_BIAS=1 if bias_fp32 is not None else 0,
         ACTIVATION=activation,
-        LAYOUT=layout_int,
+        LAYOUT=layout,
         **fused_config,
     )
 
@@ -514,7 +503,6 @@ def _launch_winograd_f4x3(
     tile_H = (P + 3) // 4
     tile_W = (Q + 3) // 4
     T = N * tile_H * tile_W
-    layout_int = _layout_to_int(layout)
 
     input_dtype = x.dtype
     V = torch.empty((36, T, C_pad), device=x.device, dtype=input_dtype)
@@ -556,7 +544,7 @@ def _launch_winograd_f4x3(
         T,
         ph,
         pw,
-        LAYOUT=layout_int,
+        LAYOUT=layout,
         **input_config,
     )
 
@@ -595,7 +583,7 @@ def _launch_winograd_f4x3(
         T,
         HAS_BIAS=1 if bias_fp32 is not None else 0,
         ACTIVATION=activation,
-        LAYOUT=layout_int,
+        LAYOUT=layout,
         **output_config,
     )
 

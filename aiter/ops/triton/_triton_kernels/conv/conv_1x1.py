@@ -61,12 +61,12 @@ def _conv2d_1x1_kernel(
     - No R*S loop (R=S=1)
     - Direct channel reduction
     - Simplified pointer arithmetic
-    LAYOUT: 0=NCHW, 1=NHWC
+    LAYOUT: "nchw" or "nhwc"
     """
     # W is always [K_out, C] contiguous
     stride_w_k: tl.constexpr = C
     stride_w_c: tl.constexpr = 1
-    if LAYOUT == 0:
+    if LAYOUT == "nchw":
         # NCHW: X[N, C, H, W_in], Y[N, K_out, P, Q]
         stride_x_n: tl.constexpr = C * H * W_in
         stride_x_c: tl.constexpr = H * W_in
