@@ -1657,12 +1657,53 @@ def compile_mxscale_gemm(
             def epilogue_stage1_act_stores(gate_accs, up_accs, addrs):
                 addr_idx = 0
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
-                    gate_sub8 = _get_acc_sub8(gate_accs, acc_idx, vec_base)
-                    up_sub8 = _get_acc_sub8(up_accs, acc_idx, vec_base)
-                    gate_sub8 = _add_bias_vec8(gate_sub8, wn)
-                    up_sub8 = _add_bias_vec8(up_sub8, wn, N)
-                    out_sub8 = _stage1_act_mul_vec8(gate_sub8, up_sub8)
-                    if const_expr(needs_grouped_row_masked_store):
+                    def _do_act_store(gate_accs, up_accs, addrs, addr_idx,
+                                     acc_idx, vec_base, m_off, wn):
+                        gate_sub8 = _get_acc_sub8(gate_accs, acc_idx, vec_base)
+                        up_sub8 = _get_acc_sub8(up_accs, acc_idx, vec_base)
+                        gate_sub8 = _add_bias_vec8(gate_sub8, wn)
+                        up_sub8 = _add_bias_vec8(up_sub8, wn, N)
+                        out_sub8 = _stage1_act_mul_vec8(gate_sub8, up_sub8)
+                        if const_expr(_bf16_out):
+                            store_acc_vec8_to_buffer(
+                                out_sub8,
+                                c_rsrc,
+                                addrs[addr_idx],
+                                out_elem=_out_elem_local,
+                                offset_is_bytes=True,
+                            )
+                        else:
+                            store_acc_vec8_to_buffer(
+                                out_sub8, c_rsrc, addrs[addr_idx : addr_idx + 2]
+                            )
+
+                    if const_expr(n_pad):
+                        col_base_i32 = arith.index_cast(
+                            T.i32, blk_n + warp_n_base + arith.index(wn * WMMA_N)
+                        )
+                        col_valid = arith.cmpi(
+                            arith.CmpIPredicate.slt,
+                            col_base_i32,
+                            arith.constant(n_valid_eff, type=T.i32),
+                        )
+                        if const_expr(needs_grouped_row_masked_store):
+                            row_local = blk_m + warp_m_base + arith.index(m_off) + lane16
+                            row_valid = arith.cmpi(
+                                arith.CmpIPredicate.slt,
+                                arith.index_cast(T.i32, row_local),
+                                valid_m_i32,
+                            )
+                            store_valid = arith.andi(
+                                arith.andi(tile_valid, row_valid), col_valid
+                            )
+                        else:
+                            store_valid = col_valid
+                        store_if = scf.IfOp(store_valid, results_=[], has_else=False)
+                        with ir.InsertionPoint(store_if.then_block):
+                            _do_act_store(gate_accs, up_accs, addrs, addr_idx,
+                                          acc_idx, vec_base, m_off, wn)
+                            scf.YieldOp([])
+                    elif const_expr(needs_grouped_row_masked_store):
                         row_local = blk_m + warp_m_base + arith.index(m_off) + lane16
                         row_valid = arith.cmpi(
                             arith.CmpIPredicate.slt,
@@ -1672,33 +1713,13 @@ def compile_mxscale_gemm(
                         store_valid = arith.andi(tile_valid, row_valid)
                         store_if = scf.IfOp(store_valid, results_=[], has_else=False)
                         with ir.InsertionPoint(store_if.then_block):
-                            if const_expr(_bf16_out):
-                                store_acc_vec8_to_buffer(
-                                    out_sub8,
-                                    c_rsrc,
-                                    addrs[addr_idx],
-                                    out_elem=_out_elem_local,
-                                    offset_is_bytes=True,
-                                )
-                            else:
-                                store_acc_vec8_to_buffer(
-                                    out_sub8, c_rsrc, addrs[addr_idx : addr_idx + 2]
-                                )
+                            _do_act_store(gate_accs, up_accs, addrs, addr_idx,
+                                          acc_idx, vec_base, m_off, wn)
                             scf.YieldOp([])
-                        addr_idx += 1 if _bf16_out else 2
                     else:
-                        if const_expr(_bf16_out):
-                            addr_idx += store_acc_vec8_to_buffer(
-                                out_sub8,
-                                c_rsrc,
-                                addrs[addr_idx],
-                                out_elem=_out_elem_local,
-                                offset_is_bytes=True,
-                            )
-                        else:
-                            addr_idx += store_acc_vec8_to_buffer(
-                                out_sub8, c_rsrc, addrs[addr_idx : addr_idx + 2]
-                            )
+                        _do_act_store(gate_accs, up_accs, addrs, addr_idx,
+                                      acc_idx, vec_base, m_off, wn)
+                    addr_idx += 1 if _bf16_out else 2
 
             def epilogue_stage1_act_interleaved_stores(final_accs):
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
