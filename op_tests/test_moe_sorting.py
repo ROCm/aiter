@@ -19,7 +19,7 @@ def set_moe_sorting_backend(backend: str) -> None:
 
     The backend is selected by module-level flags in aiter.fused_moe that are
     read at call time, so flipping them here is sufficient for this
-    single-process test. 
+    single-process test.
     """
     if backend == "flydsl":
         if not is_flydsl_available():
