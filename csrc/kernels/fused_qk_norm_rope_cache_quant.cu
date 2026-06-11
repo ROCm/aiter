@@ -2698,7 +2698,216 @@ __global__ void static_fp8_quant_perhead_kernel(mrope_utils::fp8e4m3fnuz* out,
     }
 }
 
+template <typename scalar_t, int BlockSize>
+__global__ void minimax_qk_norm_rope_tp1_kernel(
+    scalar_t const* __restrict__ qkv,
+    scalar_t const* __restrict__ q_weight,
+    scalar_t const* __restrict__ k_weight,
+    scalar_t const* __restrict__ cos_sin_cache,
+    int64_t const* __restrict__ position_ids,
+    int const num_heads_q,
+    int const num_heads_k,
+    int const head_dim,
+    int const rotary_dim,
+    float const eps,
+    bool const is_neox,
+    scalar_t* __restrict__ q_out,
+    scalar_t* __restrict__ k_out,
+    scalar_t* __restrict__ v_out)
+{
+    int const token_idx = blockIdx.x;
+    int const tid       = threadIdx.x;
+    int const q_size    = num_heads_q * head_dim;
+    int const kv_size   = num_heads_k * head_dim;
+    int64_t const qkv_row_stride = static_cast<int64_t>(q_size) + 2LL * kv_size;
+
+    scalar_t const* q_ptr = qkv + static_cast<int64_t>(token_idx) * qkv_row_stride;
+    scalar_t const* k_ptr = q_ptr + q_size;
+    scalar_t const* v_ptr = k_ptr + kv_size;
+
+    float q_square_sum = 0.0f;
+    for(int idx = tid; idx < q_size; idx += BlockSize)
+    {
+        float const x = static_cast<float>(q_ptr[idx]);
+        q_square_sum += x * x;
+    }
+    auto sum_op = [](float a, float b) { return a + b; };
+    q_square_sum = block_reduce<float, decltype(sum_op), BlockSize, true>(q_square_sum, sum_op);
+    float const q_rstd = rsqrtf(q_square_sum / static_cast<float>(q_size) + eps);
+
+    float k_square_sum = 0.0f;
+    for(int idx = tid; idx < kv_size; idx += BlockSize)
+    {
+        float const x = static_cast<float>(k_ptr[idx]);
+        k_square_sum += x * x;
+    }
+    k_square_sum = block_reduce<float, decltype(sum_op), BlockSize, true>(k_square_sum, sum_op);
+    float const k_rstd = rsqrtf(k_square_sum / static_cast<float>(kv_size) + eps);
+
+    int64_t const pos_id       = position_ids[token_idx];
+    int const rotary_half_dim  = rotary_dim / 2;
+    scalar_t const* cache_base = cos_sin_cache + pos_id * rotary_dim;
+    scalar_t const* cos_ptr    = cache_base;
+    scalar_t const* sin_ptr    = cache_base + rotary_half_dim;
+
+    for(int idx = tid; idx < q_size; idx += BlockSize)
+    {
+        int const dim = idx % head_dim;
+        float out     = static_cast<float>(q_ptr[idx]) * q_rstd * static_cast<float>(q_weight[idx]);
+        if(dim < rotary_dim)
+        {
+            int pair_dim;
+            int cos_idx;
+            float sign;
+            if(is_neox)
+            {
+                bool const first_half = dim < rotary_half_dim;
+                pair_dim             = first_half ? dim + rotary_half_dim : dim - rotary_half_dim;
+                cos_idx              = first_half ? dim : dim - rotary_half_dim;
+                sign                 = first_half ? -1.0f : 1.0f;
+            }
+            else
+            {
+                bool const even = (dim & 1) == 0;
+                pair_dim        = even ? dim + 1 : dim - 1;
+                cos_idx         = dim / 2;
+                sign            = even ? -1.0f : 1.0f;
+            }
+            int const pair_idx = idx - dim + pair_dim;
+            float const pair =
+                static_cast<float>(q_ptr[pair_idx]) * q_rstd * static_cast<float>(q_weight[pair_idx]);
+            out = out * static_cast<float>(cos_ptr[cos_idx]) +
+                  sign * pair * static_cast<float>(sin_ptr[cos_idx]);
+        }
+        q_out[static_cast<int64_t>(token_idx) * q_size + idx] = static_cast<scalar_t>(out);
+    }
+
+    for(int idx = tid; idx < kv_size; idx += BlockSize)
+    {
+        int const dim = idx % head_dim;
+        float out     = static_cast<float>(k_ptr[idx]) * k_rstd * static_cast<float>(k_weight[idx]);
+        if(dim < rotary_dim)
+        {
+            int pair_dim;
+            int cos_idx;
+            float sign;
+            if(is_neox)
+            {
+                bool const first_half = dim < rotary_half_dim;
+                pair_dim             = first_half ? dim + rotary_half_dim : dim - rotary_half_dim;
+                cos_idx              = first_half ? dim : dim - rotary_half_dim;
+                sign                 = first_half ? -1.0f : 1.0f;
+            }
+            else
+            {
+                bool const even = (dim & 1) == 0;
+                pair_dim        = even ? dim + 1 : dim - 1;
+                cos_idx         = dim / 2;
+                sign            = even ? -1.0f : 1.0f;
+            }
+            int const pair_idx = idx - dim + pair_dim;
+            float const pair =
+                static_cast<float>(k_ptr[pair_idx]) * k_rstd * static_cast<float>(k_weight[pair_idx]);
+            out = out * static_cast<float>(cos_ptr[cos_idx]) +
+                  sign * pair * static_cast<float>(sin_ptr[cos_idx]);
+        }
+        k_out[static_cast<int64_t>(token_idx) * kv_size + idx] = static_cast<scalar_t>(out);
+    }
+
+    for(int idx = tid; idx < kv_size; idx += BlockSize)
+    {
+        v_out[static_cast<int64_t>(token_idx) * kv_size + idx] = v_ptr[idx];
+    }
+}
+
 namespace aiter {
+
+void minimax_qk_norm_rope_tp1(aiter_tensor_t& qkv,
+                              aiter_tensor_t& q_weight,
+                              aiter_tensor_t& k_weight,
+                              aiter_tensor_t& cos_sin_cache,
+                              aiter_tensor_t& position_ids,
+                              int64_t num_heads_q,
+                              int64_t num_heads_k,
+                              int64_t head_dim,
+                              int64_t rotary_dim,
+                              double eps,
+                              bool is_neox,
+                              aiter_tensor_t& q_out,
+                              aiter_tensor_t& k_out,
+                              aiter_tensor_t& v_out)
+{
+    CHECK_INPUT(qkv);
+    CHECK_INPUT(q_weight);
+    CHECK_INPUT(k_weight);
+    CHECK_INPUT(cos_sin_cache);
+    CHECK_INPUT(position_ids);
+    CHECK_INPUT(q_out);
+    CHECK_INPUT(k_out);
+    CHECK_INPUT(v_out);
+    CHECK_TYPE(position_ids, AITER_DTYPE_i64);
+
+    AITER_CHECK(qkv.dim() == 2, "qkv must be 2D [num_tokens, q_size + 2 * kv_size]");
+    AITER_CHECK(q_weight.dim() == 1, "q_weight must be 1D [num_heads_q * head_dim]");
+    AITER_CHECK(k_weight.dim() == 1, "k_weight must be 1D [num_heads_k * head_dim]");
+    AITER_CHECK(cos_sin_cache.dim() == 2,
+                "cos_sin_cache must be 2D [max_position, rotary_dim]");
+    AITER_CHECK(position_ids.dim() == 1, "position_ids must be 1D [num_tokens]");
+    AITER_CHECK(q_out.dim() == 2 && k_out.dim() == 2 && v_out.dim() == 2,
+                "q_out, k_out and v_out must be 2D");
+    AITER_CHECK(num_heads_q > 0 && num_heads_k > 0 && head_dim > 0,
+                "num_heads_q, num_heads_k and head_dim must be positive");
+    AITER_CHECK(rotary_dim > 0 && rotary_dim <= head_dim && rotary_dim % 2 == 0,
+                "rotary_dim must be positive, even and <= head_dim");
+
+    int64_t const num_tokens = qkv.size(0);
+    int64_t const q_size     = num_heads_q * head_dim;
+    int64_t const kv_size    = num_heads_k * head_dim;
+    AITER_CHECK(qkv.size(1) == q_size + 2 * kv_size,
+                "qkv dim 1 must equal q_size + 2 * kv_size");
+    AITER_CHECK(q_weight.size(0) == q_size,
+                "q_weight size must equal num_heads_q * head_dim for MiniMax TP1");
+    AITER_CHECK(k_weight.size(0) == kv_size,
+                "k_weight size must equal num_heads_k * head_dim for MiniMax TP1");
+    AITER_CHECK(cos_sin_cache.size(1) == rotary_dim,
+                "cos_sin_cache dim 1 must equal rotary_dim");
+    AITER_CHECK(position_ids.size(0) == num_tokens,
+                "position_ids size must match qkv num_tokens");
+    AITER_CHECK(q_out.size(0) == num_tokens && q_out.size(1) == q_size,
+                "q_out must be [num_tokens, num_heads_q * head_dim]");
+    AITER_CHECK(k_out.size(0) == num_tokens && k_out.size(1) == kv_size,
+                "k_out must be [num_tokens, num_heads_k * head_dim]");
+    AITER_CHECK(v_out.size(0) == num_tokens && v_out.size(1) == kv_size,
+                "v_out must be [num_tokens, num_heads_k * head_dim]");
+    AITER_CHECK(qkv.dtype() == q_weight.dtype() && qkv.dtype() == k_weight.dtype() &&
+                    qkv.dtype() == cos_sin_cache.dtype() && qkv.dtype() == q_out.dtype() &&
+                    qkv.dtype() == k_out.dtype() && qkv.dtype() == v_out.dtype(),
+                "qkv, weights, cos_sin_cache and outputs must have the same dtype");
+
+    HipDeviceGuard device_guard(qkv.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    constexpr int block_size = 256;
+    dim3 grid(num_tokens);
+    dim3 block(block_size);
+
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(qkv.dtype(), "minimax_qk_norm_rope_tp1", [&] {
+        minimax_qk_norm_rope_tp1_kernel<scalar_t, block_size><<<grid, block, 0, stream>>>(
+            reinterpret_cast<scalar_t const*>(qkv.data_ptr()),
+            reinterpret_cast<scalar_t const*>(q_weight.data_ptr()),
+            reinterpret_cast<scalar_t const*>(k_weight.data_ptr()),
+            reinterpret_cast<scalar_t const*>(cos_sin_cache.data_ptr()),
+            reinterpret_cast<int64_t const*>(position_ids.data_ptr()),
+            static_cast<int>(num_heads_q),
+            static_cast<int>(num_heads_k),
+            static_cast<int>(head_dim),
+            static_cast<int>(rotary_dim),
+            static_cast<float>(eps),
+            is_neox,
+            reinterpret_cast<scalar_t*>(q_out.data_ptr()),
+            reinterpret_cast<scalar_t*>(k_out.data_ptr()),
+            reinterpret_cast<scalar_t*>(v_out.data_ptr()));
+    });
+}
 
 void fused_qk_norm_rope_cache_quant_shuffle(
     aiter_tensor_t& q,
