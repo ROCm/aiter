@@ -1199,7 +1199,6 @@ def run_benchmark_captured(
         q = inp["q"].to(device)
         k = inp["k"].to(device)
         v = inp["v"].to(device)
-
         return benchmark_single_case(
             args,
             q,
