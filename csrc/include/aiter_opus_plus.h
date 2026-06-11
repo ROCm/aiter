@@ -45,6 +45,7 @@ template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true
 OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 {
 #if defined(__gfx11__)
+    assert(false);
     return fp8x2_t{};
 #else
     fp32x2_t tmp = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
@@ -78,6 +79,7 @@ template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true
 OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
 {
 #if defined(__gfx11__)
+    assert(false);
     return bf8x2_t{};
 #else
     fp32x2_t tmp       = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
