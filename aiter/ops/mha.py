@@ -1594,6 +1594,8 @@ def _flash_attn_forward(
         # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
         ret = get_gfx() == "gfx1250"
         ret = ret and (q.dtype == dtypes.bf16)
+        # Only causal gfx1250 binaries are registered in fmha_fwd_bf16*.csv.
+        ret = ret and bool(causal)
         ret = ret and (hdim_q in (64, 128))
         ret = ret and (hdim_v == hdim_q)
         ret = ret and (nhead_q % nhead_k == 0)
@@ -2503,6 +2505,8 @@ def _flash_attn_varlen_forward(
         # logits (per-Q-head fp32) supported; sink-token (sink_size) not.
         ret = get_gfx() == "gfx1250"
         ret = ret and (q.dtype == dtypes.bf16)
+        # Only causal gfx1250 binaries are registered in fmha_fwd_bf16*.csv.
+        ret = ret and bool(causal)
         ret = ret and (hdim_q in (64, 128))
         ret = ret and (hdim_v == hdim_q)
         ret = ret and (nhead_q % nhead_k == 0)
@@ -3131,7 +3135,67 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
-    # FlyDSL path — returns result if supported, None otherwise
+    # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
+    def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
+        # Keep this public-router gate intentionally narrow so the PR3039
+        # prefill ASM path can be measured without changing decode or other
+        # FlyDSL/CK coverage.
+        if get_gfx() != "gfx1250" or q.dtype != dtypes.bf16:
+            return False
+        hdim_q = q.shape[-1]
+        hdim_v = v.shape[-1]
+        nhead_q = q.shape[-2]
+        nhead_k = k.shape[-2]
+        if hdim_q not in (64, 128) or hdim_v != hdim_q:
+            return False
+        if nhead_q % nhead_k != 0:
+            return False
+        if not causal or dropout_p != 0.0 or logits_soft_cap != 0.0:
+            return False
+        if window_size[0] != -1 or window_size[1] != -1:
+            return False
+        sink_size = window_size[2] if len(window_size) > 2 else 0
+        if sink_size != 0:
+            return False
+        if bias is not None or alibi_slopes is not None or block_table is not None:
+            return False
+        if cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None:
+            return False
+        if hdim_q == 64:
+            return sink_ptr is not None
+        return sink_ptr is None
+
+    if can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
+        return FlashAttnVarlenFunc.apply(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            min_seqlen_q,
+            dropout_p,
+            softmax_scale,
+            logits_soft_cap,
+            causal,
+            window_size,
+            bias,
+            alibi_slopes,
+            deterministic,
+            return_lse,
+            return_attn_probs,
+            block_table,
+            out,
+            torch.is_grad_enabled(),
+            cu_seqlens_q_padded,
+            cu_seqlens_k_padded,
+            True,
+            how_v3_bf16_cvt,
+            sink_ptr,
+        )
+
+    # FlyDSL path returns result if supported, None otherwise.
     from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
     _flydsl_result = flydsl_flash_attn_varlen_func(
