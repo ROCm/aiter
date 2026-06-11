@@ -359,3 +359,25 @@ specialized rewrite) as out of scope for an autoresearch lever.**
   surface (shared-memory A-staging, single-role warps, barrier-synced K-loop) the kernel is at its gfx942
   ceiling: **uniform D256 ~1.30-1.34×, D512 ~1.41-1.43× vs Triton; skew up to ~1.31×.** The committed
   config remains the gfx942-optimal static kernel this loop found.
+
+## 2026-06-11 (loop session, batch 6b — warp-specialization feasibility probe: NOT recommended)
+
+Per the user's "validate before rewriting" call, ran two cheap proxy probes to bound the prize a warp-
+specialized (CUTLASS ping-pong) rewrite could capture, before sinking multi-day effort into it.
+
+- **Barrier ablation (env-gated drop of the per-K `gpu.barrier()`):** B1024_D512 11.22→11.23 ms,
+  B1024_D256 4.17→4.15 ms = **0.0% change**, MfmaUtil flat at 44%, and **cos stayed 1.0**. The barrier is
+  ALREADY redundant — the compiler's waitcnt + the LDS A double-buffer RAW dependency serialize the stage
+  reuse for free. A warp-specialized pipeline whose main trick is removing that barrier buys nothing.
+- **Wait-cycle breakdown (B1024_D512):** SQ_WAVE_CYCLES 8.53e9; **SQ_WAIT_INST_ANY 4.61e9 = 54%** of
+  cycles the wave cannot issue (issue/dependency stall); SQ_WAIT_ANY 2.13e9 = 25%. SQ_INSTS_VALU 9.25e8 =
+  **1.84× SQ_INSTS_MFMA** (5.03e8). The MFMA idle is the in-warp s2r-LDS-read→MFMA dependency plus the
+  interleaved VALU (retile/address-gen) inside the MFMA warp's own chain — NOT cross-warp sync contention.
+- **Verdict:** both the occupancy axis (threads=512 → 2× waves) and the sync axis (barrier removal) leave
+  MfmaUtil pinned at 44%. The stall is intrinsic to the 16×16×16 MFMA issue cadence + the VALU interleave.
+  Warp specialization could offload the VALU/copy to producer warps, but VALU is only 20% busy and the
+  barrier is already free, so the recoverable headroom is small and far below 2×. **The honest 2× blocker
+  is the missing 32-K MFMA atom (gfx942 hardware lacks v_mfma_f32_16x16x32_bf16, which would halve MFMA
+  issue count).** Recommendation: do NOT invest in the warp-specialized rewrite for these shapes — the
+  ceiling is hardware, not the kernel surface. The committed config stands as gfx942-optimal: uniform
+  D256 ~1.30-1.34×, D512 ~1.41-1.43× vs Triton; skew up to ~1.31×.
