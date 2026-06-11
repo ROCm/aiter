@@ -167,13 +167,9 @@ def _flydsl_moe_sorting(
     block_size,
     expert_mask,
     num_local_tokens,
+    accumulate=True,
 ):
-    """FlyDSL sorting dispatch — called outside torch_compile_guard.
-
-    Only used on the accumulate / EP paths (see guard in moe_sorting): the
-    FlyDSL stage2 reduce mode (accumulate=False, no expert_mask) needs a (0,0)
-    placeholder moe_buf and falls back to the Opus/CK impl instead.
-    """
+    """FlyDSL sorting dispatch — called outside torch_compile_guard."""
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
 
     device = topk_ids.device
@@ -186,7 +182,15 @@ def _flydsl_moe_sorting(
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    # moe_buf shape mirrors _moe_sorting_impl: full [M, model_dim] when stage2
+    # accumulates (or EP w/ expert_mask), else a (0,0) placeholder for FlyDSL
+    # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
+    # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
+    # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
+    if (expert_mask is not None) or accumulate:
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    else:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
 
     flydsl_moe_sorting_fwd(
         topk_ids,
@@ -225,7 +229,6 @@ def moe_sorting(
         and not return_local_topk_ids
         and not flat
         and dispatch_policy == 0
-        and (expert_mask is not None or accumulate)
     ):
         return _flydsl_moe_sorting(
             topk_ids,
@@ -236,6 +239,7 @@ def moe_sorting(
             block_size,
             expert_mask,
             num_local_tokens,
+            accumulate=accumulate,
         )
     # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
     if flat:

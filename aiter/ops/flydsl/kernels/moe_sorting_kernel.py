@@ -1912,8 +1912,17 @@ def moe_sorting_flydsl(
     sub_tokens = _compute_sub_tokens(num_experts)
 
     device = topk_ids.device
-    moe_buf_i32 = moe_buf.view(torch.int32)
-    moe_buf_elems = moe_buf_i32.numel()
+    # An empty placeholder moe_buf (reduce-mode stage2: caller owns the
+    # [M, topk, model_dim] intermediate) carries no zeroing work. Hand the
+    # kernel a real 2-D 0-element int32 tensor: reinterpreting the (0,0) bf16
+    # buffer would fail the stride-divisibility check, and a 1-D empty tensor
+    # breaks the kernel arg's 2-D shape codec (pack_into expects 2 dims).
+    if moe_buf.numel() == 0:
+        moe_buf_i32 = torch.empty((0, 0), dtype=torch.int32, device=device)
+        moe_buf_elems = 0
+    else:
+        moe_buf_i32 = moe_buf.view(torch.int32)
+        moe_buf_elems = moe_buf_i32.numel()
 
     # EP: prepare mask tensor and flag.
     has_mask = expert_mask is not None
