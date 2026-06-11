@@ -14,7 +14,7 @@ gemm1 variants:
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -304,6 +304,7 @@ def gemm1_grid(n_tokens, BM=32, NE=NE, TOPK=TOPK, INTER=INTER):
     return max_m_blocks * num_n_blocks
 
 
+@flyc.jit
 def _gemm1_body(
     allocator,
     lds_off,
@@ -889,9 +890,12 @@ def _gemm1_body(
     # into a u16 and store at byte offset dword_off*4 + ikxdl*2 of a_scale_out,
     # using the OUTPUT-scale chunk stride OUT_AS_PER_CHUNK_DW(=128).
     ascaleout_base = _global_base_ptr1(arg_ascaleout)
-    kk_is_zero = arith.cmpi(arith.CmpIPredicate.eq, _raw(kk), _raw(fx.Int32(0)))
-    if_kk = scf.IfOp(kk_is_zero, [], has_else=False)
-    with ir.InsertionPoint(if_kk.then_block):
+    # Native Python `if` on the runtime kk==0 lane predicate. _gemm1_body is
+    # @flyc.jit, so its AST is rewritten: this lowers to the same
+    # scf.if(cmpi(eq), [], has_else=False) the manual scf.IfOp built. (When
+    # called inside the kernel trace, @flyc.jit just runs the rewritten body
+    # inline -- ir.Context.current is set, so no nested compilation.)
+    if kk == fx.Int32(0):
         ku = n_block_idx >> fx.Int32(1)
         ikxdl = n_block_idx & fx.Int32(1)
         if const_expr(BM == 16):
@@ -926,7 +930,6 @@ def _gemm1_body(
                     _gep1(ascaleout_base, addr),
                     alignment=2,
                 )
-        scf.YieldOp([])
 
 
 def _bm_constants(BM, K_TILES_TOTAL=K_TILES_TOTAL):
@@ -1034,9 +1037,11 @@ def compile_gemm1_a4w4_port(
         cumsum0 = llvm.load(T.i32, _global_ptr1(arg_cumsum, fx.Int32(0)))
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(_NUM_N_BLOCKS)
-        in_range = arith.cmpi(arith.CmpIPredicate.slt, bx_i32, bound)
-        if_op = scf.IfOp(in_range, [], has_else=False)
-        with ir.InsertionPoint(if_op.then_block):
+        # Native Python `if` + comparison: the @flyc.kernel AST rewriter lowers
+        # `fx.Int32 < fx.Int32` to arith.cmpi(slt) (Int32 is signed) and the
+        # guard to scf.if(cond, [], has_else=False) -- identical IR to the
+        # manual arith.cmpi/scf.IfOp/InsertionPoint/YieldOp.
+        if fx.Int32(bx_i32) < bound:
             _gemm1_body(
                 allocator,
                 lds_off,
@@ -1074,7 +1079,6 @@ def compile_gemm1_a4w4_port(
                 OUT_AS_PER_CHUNK_DW=_OUT_AS_PER_CHUNK_DW,
                 K_G2_HALF=_K_G2_HALF,
             )
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_gemm1(

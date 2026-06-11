@@ -135,7 +135,7 @@ def ascale_bytes(BM, max_m=MAX_M, k=K):
     high-id experts incl. the always-on shared expert -- so large-M MoE
     (BM128 nonatomic / mxfp4out) lost accuracy (e.g. KIMI cos 0.68 @ M=16384,
     0.05 @ M=32768) while smaller M that stayed under the bound looked fine."""
-    chunk_div = 16 if BM == 16 else 32
+    chunk_div = 16 if const_expr(BM == 16) else 32
     return (max_m // chunk_div) * kas_per_chunk_dw_for(k) * 4
 
 
@@ -154,7 +154,7 @@ def lds_bytes(BM):
 
 
 def kmchunks(BM):
-    return 1 if BM == 16 else BM // 16
+    return 1 if const_expr(BM == 16) else BM // 16
 
 
 def tiling(BM):
@@ -630,7 +630,7 @@ def _gemm2_body(
         b_scale_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     # a_scale_s_base[sub]: chunk_base = m_row / (16 if BM==16 else 32); sub in kSubBlocks
-    chunk_base = m_row // fx.Int32(16 if BM == 16 else 32)
+    chunk_base = m_row // fx.Int32(16 if const_expr(BM == 16) else 32)
     a_scale_s_base = [
         rocdl.readfirstlane(
             T.i32,
