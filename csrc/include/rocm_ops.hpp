@@ -418,7 +418,8 @@ namespace py = pybind11;
           py::arg("positions"),                                                     \
           py::arg("cos_cache"),                                                     \
           py::arg("sin_cache"),                                                     \
-          py::arg("is_neox"));
+          py::arg("is_neox"),                                                       \
+          py::arg("is_nope_first") = true);
 
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \

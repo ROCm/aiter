@@ -176,4 +176,5 @@ def fused_qk_rope_concat_and_cache_mla_seg(
     cos_cache: Tensor,  # [max_position, pe_dim//2=32]
     sin_cache: Tensor,  # [max_position, pe_dim//2=32]
     is_neox: bool,
+    is_nope_first: bool = True,
 ) -> None: ...

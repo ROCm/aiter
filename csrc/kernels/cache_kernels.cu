@@ -4169,8 +4169,11 @@ void fused_qk_rope_concat_and_cache_mla_seg(
     aiter_tensor_t& positions,    // [T]
     aiter_tensor_t& cos_cache,    // [max_pos, pe_dim/2]
     aiter_tensor_t& sin_cache,    // [max_pos, pe_dim/2]
-    bool is_neox)
+    bool is_neox,
+    bool is_nope_first)
 {
+    AITER_CHECK(is_nope_first, "is_nope_first=false is not supported yet");
+
     constexpr int KV_LORA   = 512;
     constexpr int PE_DIM    = 64;
     constexpr int PAGE_SIZE = 64;

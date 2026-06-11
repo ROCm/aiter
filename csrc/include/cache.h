@@ -140,6 +140,7 @@ void fused_qk_rope_concat_and_cache_mla_seg(
     aiter_tensor_t& positions, // [num_tokens]
     aiter_tensor_t& cos_cache, // [max_positions, pe_dim//2]
     aiter_tensor_t& sin_cache, // [max_positions, pe_dim//2]
-    bool is_neox);
+    bool is_neox,
+    bool is_nope_first = true);
 
 } // namespace aiter
