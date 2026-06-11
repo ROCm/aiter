@@ -788,22 +788,33 @@ def _make_qkv_perf(init: str, *, layout, sq, sk, batch, hq, hk, d, dtype, device
     raise ValueError(f"unknown perf init pattern: {init!r}")
 
 
+# (head_dim, seqlen) perf shapes; sq == sk.  batch=2, hq=64, hk=8 (D64) / 4 (D128).
+_PERF_SHAPES = [
+    (64, 1024),
+    (64, 4096),
+    (64, 8192),
+    (64, 16384),
+    (64, 32768),
+    (128, 1024),
+    (128, 2048),
+    (128, 4096),
+    (128, 8192),
+    (128, 16384),
+]
+
+
 @pytest.mark.parametrize("init", _PERF_INITS)
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("head_dim,seqlen", _PERF_SHAPES)
 # Only causal kernels are shipped (see test_fmha_fwd_with_sink_asm_correctness comment).
 @pytest.mark.parametrize("is_causal", [True])
-def test_fmha_fwd_with_sink_asm_perf(head_dim, is_causal, init):
+def test_fmha_fwd_with_sink_asm_perf(head_dim, seqlen, is_causal, init):
     device = "cuda"
     torch.manual_seed(0)
 
-    # Shapes aligned with run.sh perf_v?_d64 / perf_v?_d128:
-    #   D64  : batch=2 kv_head_num=8  gqa=8  -> hq=64, hk=8,  sq=sk=8192
-    #   D128 : batch=2 kv_head_num=4  gqa=16 -> hq=64, hk=4,  sq=sk=4096
-    # (D128 sq/sk is halved because per-head buffer doubles vs D64.)
-    if head_dim == 64:
-        sq, batch, hq, hk, sk = 8192, 2, 64, 8, 8192
-    else:  # head_dim == 128
-        sq, batch, hq, hk, sk = 4096, 2, 64, 4, 4096
+    # batch=1, hq=64; kv_head_num matches run.sh perf (D64 gqa=8, D128 gqa=16).
+    batch, hq = 1, 64
+    hk = 8 if head_dim == 64 else 4
+    sq = sk = seqlen
     q, k, v = _make_qkv_perf(
         init,
         layout=2,
@@ -836,8 +847,8 @@ def test_fmha_fwd_with_sink_asm_perf(head_dim, is_causal, init):
         flops /= 2.0
     tflops = flops / (us * 1e-6) / 1e12
     print(
-        f"[perf] d={head_dim} causal={is_causal} init={init}: "
-        f"{us:.1f}us, {tflops:.2f} TFLOPS"
+        f"[perf] d={head_dim} sq=sk={seqlen} b={batch} hq={hq} hk={hk} "
+        f"causal={is_causal} init={init}: {us:.1f}us, {tflops:.2f} TFLOPS"
     )
     # Sanity: catch silent-PASS when timing infrastructure breaks (e.g. profiler
     # / ROCTracer drops events → us=0, TFLOPS=inf).  Without these asserts the
@@ -866,6 +877,7 @@ def run_cli(
     head_dim: int,
     causal: bool = False,
     layout: int = 0,
+    init: str = "randn",
     do_ref: bool = False,
     do_perf: bool = False,
 ) -> int:
@@ -873,6 +885,9 @@ def run_cli(
 
     Returns 0 on success, 1 if --ref check fails.  Prints a one-line summary
     of kernel shape / time and (if requested) ref / perf metrics.
+
+    `init` selects q/k/v initialization: "randn" (random normal) or
+    "const0.25" (every element filled with 0.25).
     """
     device = "cuda"
     torch.manual_seed(0)
@@ -880,11 +895,12 @@ def run_cli(
 
     print(
         f"Shape: b={batch} hq={hq} hk={hk} sq={sq} sk={sk} d={head_dim} "
-        f"causal={causal} layout={layout}",
+        f"causal={causal} layout={layout} init={init}",
         flush=True,
     )
 
-    q, k, v = make_qkv_bshd(
+    q, k, v = _make_qkv_perf(
+        init,
         layout=layout,
         sq=sq,
         sk=sk,
@@ -1005,6 +1021,14 @@ parser.add_argument(
     "non-contiguous bshd view of the underlying memory)",
 )
 parser.add_argument(
+    "--init",
+    type=str,
+    choices=_PERF_INITS,
+    default="randn",
+    help="q/k/v initialization: 'randn' (random normal, default) or\n"
+    "'const0.25' (every element filled with the fixed value 0.25)",
+)
+parser.add_argument(
     "--ref",
     action="store_true",
     help="also run PyTorch reference and print max diff + nrms",
@@ -1028,6 +1052,7 @@ if __name__ == "__main__":
         head_dim=args.head_dim,
         causal=args.causal,
         layout=args.layout,
+        init=args.init,
         do_ref=args.ref,
         do_perf=args.perf,
     )
