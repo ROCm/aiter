@@ -116,7 +116,19 @@ static std::string get_heuristic_kernel_fmha_fwd_bf16(const std::string& dtype,
 
 // ---- main entry ------------------------------------------------------------
 
+// When compiled as part of libmha_fwd (FAV1250_ON=1 set via flags_extra_cc),
+// mha_fwd.cu owns the single AITER_CTYPES_ERROR_DEF instantiation (defines
+// g_aiter_last_error + aiter_get_last_error / aiter_clear_last_error /
+// aiter_ctypes_abi_version).  Use AITER_CTYPES_ERROR_DECL here to declare
+// g_aiter_last_error as extern so AITER_CTYPES_DEFINE_ENTRYPOINT_VOID can
+// reference it without redefining the C functions a second time.
+// When compiled standalone (module_fmha_fwd_with_sink_asm, FAV1250_ON unset),
+// this file owns the single definition as before.
+#ifdef FAV1250_ON
+AITER_CTYPES_ERROR_DECL;
+#else
 AITER_CTYPES_ERROR_DEF
+#endif
 
 // C ABI: every tensor is caller-allocated.  No GPU memory is allocated here;
 // no torch dependency.

@@ -1,3 +1,4 @@
+#if ENABLE_CK
 #include "mha_fwd.h"
 #include <string>
 
@@ -75,3 +76,4 @@ float mha_batch_prefill(mha_batch_prefill_args args,
 }
 
 } // namespace aiter
+#endif //ENABLE_CK

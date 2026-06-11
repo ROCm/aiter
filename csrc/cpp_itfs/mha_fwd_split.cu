@@ -1,3 +1,4 @@
+#if ENABLE_CK
 #include "mha_fwd.h"
 #include <string>
 
@@ -47,3 +48,4 @@ float mha_fwd_splitkv(mha_fwd_splitkv_args args,
 }
 
 } // namespace aiter
+#endif //ENABLE_CK
