@@ -95,7 +95,10 @@ def torch_mla_reduce_v1(
                     partial_qo_loc = tile_reduce_partial_map[split_idx].item()
                     buf_idx = partial_qo_loc + local_seq_idx
 
-                    if buf_idx < partial_lse.shape[0] and head_idx < partial_lse.shape[1]:
+                    if (
+                        buf_idx < partial_lse.shape[0]
+                        and head_idx < partial_lse.shape[1]
+                    ):
                         lse_val = partial_lse[buf_idx, head_idx].item()
                         if math.isnan(lse_val):
                             lse_val = float("-inf")
@@ -145,11 +148,11 @@ def torch_mla_reduce_v1(
 
 
 def build_reduce_problem(
-    splits_per_tile,   # list[int]: number of splits for each reduce tile
+    splits_per_tile,  # list[int]: number of splits for each reduce tile
     num_heads,
     head_dim,
     out_dtype,
-    qo_len=1,          # output rows produced per reduce tile
+    qo_len=1,  # output rows produced per reduce tile
     device="cuda",
 ):
     """Build a synthetic reduce problem.
@@ -158,13 +161,11 @@ def build_reduce_problem(
     `splits_per_tile[t]` partials. Every (tile, split, local_seq) triple gets a
     unique row in the partial buffer, filled with random data.
     """
-    num_tiles = len(splits_per_tile)
 
     # reduce_indptr: cumulative split counts.
     indptr = [0]
     for s in splits_per_tile:
         indptr.append(indptr[-1] + s)
-    total_splits = indptr[-1]
 
     # Assign every partial a unique base location in the partial buffer. The
     # kernel reads partial row = base + local_seq, so reserve qo_len rows per
@@ -200,9 +201,7 @@ def build_reduce_problem(
     final_output = torch.empty(
         num_out_rows, num_heads, head_dim, dtype=out_dtype, device=device
     )
-    final_lse = torch.empty(
-        num_out_rows, num_heads, dtype=torch.float32, device=device
-    )
+    final_lse = torch.empty(num_out_rows, num_heads, dtype=torch.float32, device=device)
 
     return dict(
         partial_output=partial_output,
@@ -341,14 +340,16 @@ def main():
     #   num_splits >= 4      -> massive impl (<=64 / <=256 buckets)
     big = min(cu_count, 256)  # largest single-tile split count we can safely run
     split_configs = [
-        [2],                 # simple, single tile
-        [3, 2],              # simple, multi tile
-        [4],                 # massive, exactly threshold
-        [8, 5, 7],           # massive <=64, ragged
-        [33],                # massive <=64
-        [big],               # massive: <=256 bucket if cu_count>64, else <=64
-        [2, 4, 16, 64],      # mixed: simple + massive buckets
-    ] + [[6] * 40]           # many tiles -> exercises persistent-grid path
+        [2],  # simple, single tile
+        [3, 2],  # simple, multi tile
+        [4],  # massive, exactly threshold
+        [8, 5, 7],  # massive <=64, ragged
+        [33],  # massive <=64
+        [big],  # massive: <=256 bucket if cu_count>64, else <=64
+        [2, 4, 16, 64],  # mixed: simple + massive buckets
+    ] + [
+        [6] * 40
+    ]  # many tiles -> exercises persistent-grid path
 
     # Drop any config whose per-tile split count exceeds the LDS capacity.
     dropped = [c for c in split_configs if max(c) > cu_count]
