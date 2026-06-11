@@ -6,6 +6,13 @@
 Initial A8W4 grouped support reuses the tuned gemm_mxscale_gfx1250
 compile_a8w4_gemm schedule per expert.  The wrapper keeps the grouped/masked
 calling convention while the underlying A8W4 GEMM owns TDM/WMMA_SCALE codegen.
+
+When ``grouped_contiguous_m=True`` (and ``grouped_persistent_m=False``), stage1/2
+use the contiguous M-tile 1D grid from ``gemm_mxscale_gfx1250``.  Tile
+``prefix``/``map`` are a **dense** expert×M-tile layout; per-tile (``m_block``,
+``n_block``) indices follow DeepGEMM ``scheduler.cuh``
+``get_swizzled_block_idx`` (``kIsMulticastOnA == false``), with ``kNum1DBlocksPerGroup``
+chosen like DeepGEMM's ``get_num_1d_blocks_per_group`` (candidates 8/16).
 """
 
 from __future__ import annotations
@@ -55,6 +62,7 @@ class _GroupedA8W4Config:
     use_scale_opsel: bool
     expert_sched_mode: bool
     grouped_persistent_m: bool = True
+    grouped_contiguous_m: bool = False
     persistent_workers: Optional[int] = None
     data_format: str = "a8w4"
     act: str = "silu"
@@ -94,6 +102,16 @@ def _validate_common(cfg: _GroupedA8W4Config) -> None:
         raise ValueError(
             "grouped_persistent_m currently requires cluster_m=cluster_n=1"
         )
+    if cfg.grouped_contiguous_m:
+        if cfg.grouped_persistent_m:
+            raise ValueError(
+                "grouped_contiguous_m (DeepGEMM-style scheduler) is incompatible "
+                "with grouped_persistent_m; set one of them to False"
+            )
+        if cfg.cluster_m != 1 or cfg.cluster_n != 1:
+            raise ValueError(
+                "grouped_contiguous_m currently requires cluster_m=cluster_n=1"
+            )
 
 
 def _to_int(value) -> int:
@@ -175,39 +193,6 @@ def _make_m_tile_map(
     m_tile_prefix: torch.Tensor | None = None,
 ) -> torch.Tensor:
     max_m_tiles = (cfg.max_m + cfg.tile_m - 1) // cfg.tile_m
-    if os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1":
-        valid_m = masked_m[: cfg.experts].to(dtype=torch.int32)
-        valid_m = valid_m.clamp(min=0, max=cfg.max_m)
-        valid_tiles = torch.div(
-            valid_m + (cfg.tile_m - 1),
-            cfg.tile_m,
-            rounding_mode="floor",
-        )
-        device = masked_m.device
-        tile_counts = valid_tiles.to(torch.long)
-        expert_ids = torch.repeat_interleave(
-            torch.arange(cfg.experts, device=device, dtype=torch.int32),
-            tile_counts,
-        )
-        prefix = torch.empty((cfg.experts + 1,), device=device, dtype=torch.int32)
-        prefix[0].zero_()
-        torch.cumsum(valid_tiles, dim=0, out=prefix[1:])
-        start_offsets = torch.repeat_interleave(
-            prefix[:-1].to(torch.long), tile_counts
-        ).to(torch.int32)
-        total_tiles = valid_tiles.sum()
-        global_idx = (
-            torch.cumsum(
-                torch.ones(total_tiles, device=device, dtype=torch.int32), dim=0
-            )
-            - 1
-        )
-        local_tiles = global_idx - start_offsets
-        packed = expert_ids * max_m_tiles + local_tiles
-        if not _is_stream_capturing() and packed.numel() == 0:
-            packed = torch.zeros(1, device=device, dtype=torch.int32)
-        return packed
-
     if m_tile_prefix is None:
         m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
     m_tile_map = torch.empty(
@@ -222,7 +207,6 @@ def _make_m_tile_map(
         stream=torch.cuda.current_stream(),
     )
     return m_tile_map
-
 
 def _check_rank(name: str, tensor: torch.Tensor, rank: int) -> None:
     if tensor.dim() != rank:
@@ -286,30 +270,40 @@ def _check_stage1_args(
     _check_rank("w", w, 3)
     _check_rank("scale_x", scale_x, 3)
     _check_rank("scale_w", scale_w, 3)
-    if tuple(y.shape) != (cfg.experts, cfg.max_m, cfg.inter_dim):
-        raise ValueError(
-            f"y shape must be {(cfg.experts, cfg.max_m, cfg.inter_dim)}, got {tuple(y.shape)}"
-        )
     pack_a, pack_b = _pack_factors(cfg)
-    if tuple(x.shape) != (cfg.experts, cfg.max_m, cfg.model_dim // pack_a):
-        raise ValueError(
-            f"x shape must be {(cfg.experts, cfg.max_m, cfg.model_dim // pack_a)}, got {tuple(x.shape)}"
-        )
+    if cfg.grouped_contiguous_m:
+        if y.shape[0] != 1 or y.shape[2] != cfg.inter_dim:
+            raise ValueError(f"y must be flat (1, m, {cfg.inter_dim}), got {tuple(y.shape)}")
+        if x.shape[0] != 1 or x.shape[1] != y.shape[1] or x.shape[2] != cfg.model_dim // pack_a:
+            raise ValueError(
+                f"x must be flat (1, {y.shape[1]}, {cfg.model_dim // pack_a}), got {tuple(x.shape)}"
+            )
+    else:
+        if tuple(y.shape) != (cfg.experts, cfg.max_m, cfg.inter_dim):
+            raise ValueError(
+                f"y shape must be {(cfg.experts, cfg.max_m, cfg.inter_dim)}, got {tuple(y.shape)}"
+            )
+        if tuple(x.shape) != (cfg.experts, cfg.max_m, cfg.model_dim // pack_a):
+            raise ValueError(
+                f"x shape must be {(cfg.experts, cfg.max_m, cfg.model_dim // pack_a)}, got {tuple(x.shape)}"
+            )
     if tuple(w.shape) != (cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // pack_b):
         raise ValueError(
             f"w shape must be {(cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // pack_b)}, got {tuple(w.shape)}"
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
     warp_tile_n = cfg.tile_n // cfg.n_warp
+    scale_x_rows = int(x.shape[1]) if cfg.grouped_contiguous_m else cfg.max_m
     scale_x_shape = _preshuffled_scale_shape(
-        cfg.max_m, cfg.model_dim, warp_tile_m, cfg.tile_k
+        scale_x_rows, cfg.model_dim, warp_tile_m, cfg.tile_k
     )
     scale_w_shape = _preshuffled_scale_shape(
         2 * cfg.inter_dim, cfg.model_dim, warp_tile_n, cfg.tile_k
     )
-    if tuple(scale_x.shape) != (cfg.experts, *scale_x_shape):
+    expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
+    if tuple(scale_x.shape) != expected_scale_x:
         raise ValueError(
-            f"scale_x shape must be {(cfg.experts, *scale_x_shape)}, got {tuple(scale_x.shape)}"
+            f"scale_x shape must be {expected_scale_x}, got {tuple(scale_x.shape)}"
         )
     if tuple(scale_w.shape) != (cfg.experts, *scale_w_shape):
         raise ValueError(
@@ -644,30 +638,40 @@ def _check_stage2_args(
     _check_rank("w", w, 3)
     _check_rank("scale_x", scale_x, 3)
     _check_rank("scale_w", scale_w, 3)
-    if tuple(y.shape) != (cfg.experts, cfg.max_m, cfg.model_dim):
-        raise ValueError(
-            f"y shape must be {(cfg.experts, cfg.max_m, cfg.model_dim)}, got {tuple(y.shape)}"
-        )
     pack_a, pack_b = _pack_factors(cfg)
-    if tuple(x.shape) != (cfg.experts, cfg.max_m, cfg.inter_dim // pack_a):
-        raise ValueError(
-            f"x shape must be {(cfg.experts, cfg.max_m, cfg.inter_dim // pack_a)}, got {tuple(x.shape)}"
-        )
+    if cfg.grouped_contiguous_m:
+        if y.shape[0] != 1 or y.shape[2] != cfg.model_dim:
+            raise ValueError(f"y must be flat (1, m, {cfg.model_dim}), got {tuple(y.shape)}")
+        if x.shape[0] != 1 or x.shape[1] != y.shape[1] or x.shape[2] != cfg.inter_dim // pack_a:
+            raise ValueError(
+                f"x must be flat (1, {y.shape[1]}, {cfg.inter_dim // pack_a}), got {tuple(x.shape)}"
+            )
+    else:
+        if tuple(y.shape) != (cfg.experts, cfg.max_m, cfg.model_dim):
+            raise ValueError(
+                f"y shape must be {(cfg.experts, cfg.max_m, cfg.model_dim)}, got {tuple(y.shape)}"
+            )
+        if tuple(x.shape) != (cfg.experts, cfg.max_m, cfg.inter_dim // pack_a):
+            raise ValueError(
+                f"x shape must be {(cfg.experts, cfg.max_m, cfg.inter_dim // pack_a)}, got {tuple(x.shape)}"
+            )
     if tuple(w.shape) != (cfg.experts, cfg.model_dim, cfg.inter_dim // pack_b):
         raise ValueError(
             f"w shape must be {(cfg.experts, cfg.model_dim, cfg.inter_dim // pack_b)}, got {tuple(w.shape)}"
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
     warp_tile_n = cfg.tile_n // cfg.n_warp
+    scale_x_rows = int(x.shape[1]) if cfg.grouped_contiguous_m else cfg.max_m
     scale_x_shape = _preshuffled_scale_shape(
-        cfg.max_m, cfg.inter_dim, warp_tile_m, cfg.tile_k
+        scale_x_rows, cfg.inter_dim, warp_tile_m, cfg.tile_k
     )
     scale_w_shape = _preshuffled_scale_shape(
         cfg.model_dim, cfg.inter_dim, warp_tile_n, cfg.tile_k
     )
-    if tuple(scale_x.shape) != (cfg.experts, *scale_x_shape):
+    expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
+    if tuple(scale_x.shape) != expected_scale_x:
         raise ValueError(
-            f"scale_x shape must be {(cfg.experts, *scale_x_shape)}, got {tuple(scale_x.shape)}"
+            f"scale_x shape must be {expected_scale_x}, got {tuple(scale_x.shape)}"
         )
     if tuple(scale_w.shape) != (cfg.experts, *scale_w_shape):
         raise ValueError(
@@ -689,6 +693,23 @@ def _compile_base_a8w4_gemm(
     stage1_weight_layout: str = "gguu",
     kernel_tag: str = "gemm",
 ):
+    split_k_chunk = K // int(cfg.split_k)
+    tile_k_i = int(cfg.tile_k)
+    if tile_k_i <= 0 or split_k_chunk % tile_k_i != 0:
+        raise ValueError(
+            f"grouped GEMM requires (K // split_k) divisible by tile_k; "
+            f"got K={K}, split_k={cfg.split_k}, tile_k={tile_k_i}, chunk={split_k_chunk}"
+        )
+    num_k_tiles = split_k_chunk // tile_k_i
+    eff_num_buffers = min(int(cfg.num_buffers), int(num_k_tiles))
+    if eff_num_buffers < 2:
+        raise ValueError(
+            "Grouped MXScale GEMM needs at least two K-dimension tiles "
+            f"((K // split_k) // tile_k >= 2). Got K={K}, split_k={cfg.split_k}, "
+            f"tile_k={tile_k_i} => num_k_tiles={num_k_tiles} but mxscale "
+            f"pipeline requires num_k_tiles >= 2. Increase K (e.g. model_dim), "
+            "use tile_k=128 if it divides K/split_k, or lower split_k."
+        )
     compiler = compile_mxfp4_gemm if cfg.data_format == "fp4" else compile_a8w4_gemm
     return compiler(
         M=cfg.max_m,
@@ -699,7 +720,7 @@ def _compile_base_a8w4_gemm(
         tile_k=cfg.tile_k,
         m_warp=cfg.m_warp,
         n_warp=cfg.n_warp,
-        num_buffers=cfg.num_buffers,
+        num_buffers=eff_num_buffers,
         waves_per_eu=cfg.waves_per_eu,
         out_dtype=cfg.out_dtype,
         use_tdm_store=cfg.use_tdm_store and cfg.split_k == 1 and stage1_act is None,
@@ -713,6 +734,7 @@ def _compile_base_a8w4_gemm(
         batch_count=cfg.experts,
         grouped_masked_m=True,
         grouped_persistent_m=cfg.grouped_persistent_m,
+        grouped_contiguous_m=cfg.grouped_contiguous_m,
         persistent_workers=cfg.persistent_workers,
         stage1_act=stage1_act,
         stage1_weight_layout=stage1_weight_layout,
@@ -745,6 +767,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     use_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     grouped_persistent_m: bool = True,
+    grouped_contiguous_m: bool = False,
     persistent_workers: int | None = None,
     act: str = "silu",
     stage1_weight_layout: str = "gguu",
@@ -772,6 +795,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         use_scale_opsel=bool(use_scale_opsel),
         expert_sched_mode=bool(expert_sched_mode),
         grouped_persistent_m=bool(grouped_persistent_m),
+        grouped_contiguous_m=bool(grouped_contiguous_m),
         persistent_workers=persistent_workers,
         data_format=str(data_format),
         act=str(act),
@@ -949,7 +973,14 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
-        else:
+        elif cfg.grouped_contiguous_m:
+            # DeepGEMM MGroupedContiguous-style 1D block scheduler (non-persistent).
+            _unused_m_tile_prefix = masked_m
+            grouped_layout = _m_tile_map
+            if grouped_layout is None:
+                grouped_layout = masked_m
+            contiguous_m = int(x.shape[1])
+            m_tile_total = (contiguous_m + int(cfg.tile_m) - 1) // int(cfg.tile_m)
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if use_fused_gemm:
@@ -963,6 +994,70 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         scale_w,
                         bias,
                         masked_m,
+                        _unused_m_tile_prefix,
+                        grouped_layout,
+                        m_tile_total,
+                        contiguous_m,
+                        fused_n,
+                        stream,
+                    )
+                else:
+                    _run_compiled(
+                        fused_gemm,
+                        y,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        masked_m,
+                        _unused_m_tile_prefix,
+                        grouped_layout,
+                        m_tile_total,
+                        contiguous_m,
+                        fused_n,
+                        stream,
+                    )
+            else:
+                _run_compiled(
+                    raw_base,
+                    tmp,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    masked_m,
+                    _unused_m_tile_prefix,
+                    grouped_layout,
+                    m_tile_total,
+                    contiguous_m,
+                    2 * cfg.inter_dim,
+                    stream,
+                )
+            if _gemm_events is not None:
+                _gemm_events[1].record(stream)
+        else:
+            # The base grouped kernel is compiled with grouped_masked_m=True, so
+            # even the dense non-persistent launcher keeps the masked signature.
+            # Prefix/map tensors are unused in this mode; pass harmless tensor
+            # placeholders to keep the FlyDSL signature aligned.
+            _unused_m_tile_prefix = masked_m
+            _unused_m_tile_map = masked_m
+            if _gemm_events is not None:
+                _gemm_events[0].record(stream)
+            if use_fused_gemm:
+                if bias is not None:
+                    _run_compiled(
+                        fused_gemm,
+                        y,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        bias,
+                        masked_m,
+                        _unused_m_tile_prefix,
+                        _unused_m_tile_map,
+                        cfg.max_m,
                         cfg.max_m,
                         fused_n,
                         stream,
@@ -976,6 +1071,9 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         scale_x,
                         scale_w,
                         masked_m,
+                        _unused_m_tile_prefix,
+                        _unused_m_tile_map,
+                        cfg.max_m,
                         cfg.max_m,
                         fused_n,
                         stream,
@@ -989,6 +1087,9 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     scale_x,
                     scale_w,
                     masked_m,
+                    _unused_m_tile_prefix,
+                    _unused_m_tile_map,
+                    cfg.max_m,
                     cfg.max_m,
                     2 * cfg.inter_dim,
                     stream,
@@ -1036,6 +1137,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     use_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     grouped_persistent_m: bool = True,
+    grouped_contiguous_m: bool = False,
     persistent_workers: int | None = None,
     data_format: str = "a8w4",
 ):
@@ -1061,6 +1163,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         use_scale_opsel=bool(use_scale_opsel),
         expert_sched_mode=bool(expert_sched_mode),
         grouped_persistent_m=bool(grouped_persistent_m),
+        grouped_contiguous_m=bool(grouped_contiguous_m),
         persistent_workers=persistent_workers,
         data_format=str(data_format),
     )
@@ -1154,7 +1257,13 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
-        else:
+        elif cfg.grouped_contiguous_m:
+            _unused_m_tile_prefix = masked_m
+            grouped_layout = _m_tile_map
+            if grouped_layout is None:
+                grouped_layout = masked_m
+            contiguous_m = int(x.shape[1])
+            m_tile_total = (contiguous_m + int(cfg.tile_m) - 1) // int(cfg.tile_m)
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if bias is not None:
@@ -1167,6 +1276,51 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     scale_w,
                     bias,
                     masked_m,
+                    _unused_m_tile_prefix,
+                    grouped_layout,
+                    m_tile_total,
+                    contiguous_m,
+                    cfg.model_dim,
+                    stream,
+                )
+            else:
+                _run_compiled(
+                    gemm,
+                    y,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    masked_m,
+                    _unused_m_tile_prefix,
+                    grouped_layout,
+                    m_tile_total,
+                    contiguous_m,
+                    cfg.model_dim,
+                    stream,
+                )
+            if _gemm_events is not None:
+                _gemm_events[1].record(stream)
+        else:
+            # See the stage1 dense fallback above: the compiled grouped kernel
+            # still exposes the masked launcher ABI in this mode.
+            _unused_m_tile_prefix = masked_m
+            _unused_m_tile_map = masked_m
+            if _gemm_events is not None:
+                _gemm_events[0].record(stream)
+            if bias is not None:
+                _run_compiled(
+                    gemm,
+                    y,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    bias,
+                    masked_m,
+                    _unused_m_tile_prefix,
+                    _unused_m_tile_map,
+                    cfg.max_m,
                     cfg.max_m,
                     cfg.model_dim,
                     stream,
@@ -1180,6 +1334,9 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     scale_x,
                     scale_w,
                     masked_m,
+                    _unused_m_tile_prefix,
+                    _unused_m_tile_map,
+                    cfg.max_m,
                     cfg.max_m,
                     cfg.model_dim,
                     stream,

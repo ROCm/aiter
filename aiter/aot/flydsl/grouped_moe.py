@@ -56,6 +56,7 @@ def parse_csv(csv_path: str):
                 "split_k2": int(row.get("split_k2") or 1),
                 "out_dtype": "bf16" if row.get("dtype") == "torch.bfloat16" else "f16",
                 "grouped_persistent_m": _as_bool(row.get("grouped_persistent_m"), True),
+                "grouped_contiguous_m": _as_bool(row.get("grouped_contiguous_m"), False),
                 "persistent_workers": _as_int(row.get("persistent_workers"), None),
                 "stage1_weight_layout": row.get("stage1_weight_layout") or "gguu",
                 "act": "swiglu" if "Swiglu" in row.get("act_type", "") else "silu",
@@ -68,6 +69,9 @@ def parse_csv(csv_path: str):
                 continue
             seen.add(key)
             jobs.append(job)
+    for job in jobs:
+        if job.get("grouped_contiguous_m"):
+            job["grouped_persistent_m"] = False
     return jobs
 
 
@@ -108,6 +112,7 @@ def compile_one_config(**job):
         out_dtype=job["out_dtype"],
         num_buffers=job["num_buffers"],
         grouped_persistent_m=job["grouped_persistent_m"],
+        grouped_contiguous_m=job.get("grouped_contiguous_m", False),
         persistent_workers=job["persistent_workers"],
     )
     masked_m = torch.full(
