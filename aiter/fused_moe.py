@@ -32,9 +32,9 @@ from aiter import (
 
 BLOCK_SIZE_M = 32
 
-# Default to Opus unless CK or FlyDSL sorting is explicitly requested.
+# Default to Opus unless Opus or FlyDSL sorting is explicitly requested.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
-_USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
+_USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
@@ -168,7 +168,12 @@ def _flydsl_moe_sorting(
     expert_mask,
     num_local_tokens,
 ):
-    """FlyDSL sorting dispatch — called outside torch_compile_guard."""
+    """FlyDSL sorting dispatch — called outside torch_compile_guard.
+
+    Only used on the accumulate / EP paths (see guard in moe_sorting): the
+    FlyDSL stage2 reduce mode (accumulate=False, no expert_mask) needs a (0,0)
+    placeholder moe_buf and falls back to the Opus/CK impl instead.
+    """
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
 
     device = topk_ids.device
@@ -214,10 +219,13 @@ def moe_sorting(
     flat=False,
 ):
     if (
-        _USE_FLYDSL_MOE_SORTING
+        not _USE_CK_MOE_SORTING
+        and not _USE_OPUS_MOE_SORTING
         and is_flydsl_available()
         and not return_local_topk_ids
         and not flat
+        and dispatch_policy == 0
+        and (expert_mask is not None or accumulate)
     ):
         return _flydsl_moe_sorting(
             topk_ids,
