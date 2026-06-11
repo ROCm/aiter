@@ -17,5 +17,6 @@ void mla_reduce_v1(const aiter_tensor_t& partial_output,
                    std::optional<aiter_tensor_t> reduce_final_map,
                    const aiter_tensor_t& reduce_partial_map,
                    const int32_t max_seqlen_q,
+                   const int32_t num_kv_splits,
                    aiter_tensor_t& final_output,
                    std::optional<aiter_tensor_t> final_lse = std::nullopt);

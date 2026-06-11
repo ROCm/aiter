@@ -1022,6 +1022,7 @@ void mla_reduce_v1(
     std::optional<aiter_tensor_t> reduce_final_map, // contiguous [#work, 2]
     const aiter_tensor_t& reduce_partial_map,       // contiguous [reduce_indptr[-1]]
     const int32_t max_seqlen_q,
+    const int32_t num_kv_splits,
     aiter_tensor_t& final_output,            //            [bs, h, dv]
     std::optional<aiter_tensor_t> final_lse) // contiguous [bs, h]
 {

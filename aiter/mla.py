@@ -672,6 +672,7 @@ def mla_v40_decode_fwd(
         reduce_final_map,
         reduce_partial_map,
         max_seqlen_q,
+        0,
         o,
         final_lse,
     )
