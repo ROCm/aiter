@@ -292,11 +292,11 @@ def compile_mxscale_gemm(
     _b_frag_loads_per_wn = 2 if is_a8w4 else 4
     # B-scale ds-load count for one full K-subtile (one `load_scale_b128`).
     #   interleaved: ceil(rep/4) packed b128 (rep e8m0 blocks contiguous).
-    #   lane32     : each row's 4 K-blocks span the b=0 and b=1 planes (64B apart),
-    #                so 2 ds_load_b32 per super-row -> 4 for the 2 super-rows/warp.
-    _b_scale_ds_loads_full = 4 if b_lane32 else (b_scale_load_rep + 3) // 4
-    # Per bank-half slice (one super-row): b=0 plane + b=1 plane.
-    _b_scale_ds_loads_half = 2 if b_lane32 else (b_scale_load_rep // 2 + 3) // 4
+    #   lane32     : V_WMMA_SCALE uses 2 e8m0/lane (op_sel half) = the half-warp's
+    #                own b-plane, so one ds_load_b32 per super-row -> 2 per warp.
+    _b_scale_ds_loads_full = 2 if b_lane32 else (b_scale_load_rep + 3) // 4
+    # Per bank-half slice (one super-row): a single dword.
+    _b_scale_ds_loads_half = 1 if b_lane32 else (b_scale_load_rep // 2 + 3) // 4
     _bs_ds_loads = (
         wmma_n_rep * _b_frag_loads_per_wn
         + _b_scale_ds_loads_full
@@ -934,52 +934,34 @@ def compile_mxscale_gemm(
             # cols, col = ks*128 + b*64 + lane16*4 + n2*2 + a (see
             # grouped_moe_gfx1250._grouped_b_scale_preshuffle_e8m0).
             #
-            # The WMMA scaleB operand needs ALL 4 K-blocks [k0,k1,k2,k3] of one
-            # weight row in a single i32 per lane (k = a*2+b).  In this layout the
-            # ``b`` bit has stride 64, so a row's 4 blocks live in two dwords:
-            #   b=0 plane @ off      -> bytes (n2,a) = k0 (a0), k2 (a1)
-            #   b=1 plane @ off+64   -> bytes (n2,a) = k1 (a0), k3 (a1)
-            # We read both planes and repack into [k0,k1,k2,k3].  The lane's row is
-            # selected by n2: fp4 fixes n2=lane_kgrp (kgrp0->even rows, kgrp1->odd),
-            # reproducing the interleaved layout's lane->row mapping; a8w4 emits one
-            # i32 per (super,n2).  (The half-warp K-interleave is for weight DATA,
-            # NOT the scale operand, so a single b-plane is insufficient.)
+            # V_WMMA_SCALE reads only 2 e8m0 (one op_sel-selected 16-bit half of
+            # the i32 scale VGPR) per call, and the ``b`` bit = the half-warp K
+            # split (kgrp0 holds K-blocks 0,2 = b0; kgrp1 holds 1,3 = b1), matching
+            # the weight load.  So each lane needs only its OWN b-plane: a single
+            # contiguous ds_load_b32 at lane16*4 yields [a0n0,a1n0,a0n1,a1n1] --
+            # the 2 K-blocks (a) for both even/odd N-rows (n2) -- exactly the
+            # scaleB operand; op_sel (scaleBType) selects the n2 half.  No gather.
             _B_LANE32_ROW_BYTES = scale_k_per_tile * 32
             _B_LANE32_KSTEP_BYTES = 128  # ks stride: b(2)*64
-            _B_LANE32_BPLANE_BYTES = 64  # b-bit stride (k1/k3 plane)
+            _B_LANE32_BPLANE_BYTES = 64  # b-bit (half-warp K-split) stride
 
             def _precompute_b_scale_lane32_base(lds_ptr, warp_n_base):
-                """Per-lane byte base: super-row 0, ks 0, b=0 plane."""
+                """Per-lane byte base: super-row 0, ks 0, this lane's b-plane."""
                 super_base = warp_n_base / arith.index(32)
-                base = super_base * arith.index(_B_LANE32_ROW_BYTES) + lane16 * arith.index(4)
+                base = (
+                    super_base * arith.index(_B_LANE32_ROW_BYTES)
+                    + lane_kgrp * arith.index(_B_LANE32_BPLANE_BYTES)
+                    + lane16 * arith.index(4)
+                )
                 return lds_ptr, [base]
 
-            def _b_lane32_assemble(b0w, b1w, sh0, sh1):
-                """Pack one row's 4 K-blocks into [k0,k1,k2,k3].
-
-                b0w/b1w = the b=0 / b=1 plane dwords; sh0/sh1 select the (a0,a1)
-                bytes for the chosen n2 (k0=a0b0, k1=a0b1, k2=a1b0, k3=a1b1).
-                """
-                mask = arith.constant(0xFF, type=T.i32)
-
-                def _byte(w, sh):
-                    return arith.andi(arith.shrui(w, sh), mask)
-
-                b0_a0 = _byte(b0w, sh0)  # k0
-                b1_a0 = _byte(b1w, sh0)  # k1
-                b0_a1 = _byte(b0w, sh1)  # k2
-                b1_a1 = _byte(b1w, sh1)  # k3
-                out = b0_a0
-                out = arith.ori(out, arith.shli(b1_a0, arith.constant(8, type=T.i32)))
-                out = arith.ori(out, arith.shli(b0_a1, arith.constant(16, type=T.i32)))
-                out = arith.ori(out, arith.shli(b1_a1, arith.constant(24, type=T.i32)))
-                return out
-
             def _load_b_scale_lane32(lds_buffer, scale_base, supers, super_start, ks):
-                """Return packed [k0,k1,k2,k3] i32 scale(s) per super-row.
+                """One ds_load_b32 per super-row from this lane's b-plane.
 
-                Output length ``supers*2``; fp4 uses index ``2*s`` (n2=lane_kgrp,
-                with a filler at ``2*s+1``), a8w4 uses both (n2=0 / n2=1).
+                Returns length ``supers*2``; index ``2*s`` (with a parity filler at
+                ``2*s+1``) holds super-row ``super_start+s``'s scale dword
+                [a0n0,a1n0,a0n1,a1n1] (2 K-blocks x 2 N-rows for this b-plane).
+                op_sel (scaleBType) picks the n2 half the WMMA call consumes.
                 """
                 results = []
                 for s in range_constexpr(supers):
@@ -987,23 +969,9 @@ def compile_mxscale_gemm(
                     off = scale_base + arith.index(
                         s_global * _B_LANE32_ROW_BYTES + ks * _B_LANE32_KSTEP_BYTES
                     )
-                    b0w = lds_load_b32_raw(lds_buffer, off)
-                    b1w = lds_load_b32_raw(
-                        lds_buffer, off + arith.index(_B_LANE32_BPLANE_BYTES)
-                    )
-                    if const_expr(is_fp4):
-                        # n2 = lane_kgrp -> byte shift kgrp*16 (a0), +8 (a1).
-                        kgrp_i32 = arith.index_cast(T.i32, lane_kgrp)
-                        sh0 = arith.muli(kgrp_i32, arith.constant(16, type=T.i32))
-                        sh1 = arith.addi(sh0, arith.constant(8, type=T.i32))
-                        val = _b_lane32_assemble(b0w, b1w, sh0, sh1)
-                        results.append(val)
-                        results.append(val)  # filler; emit uses index 2*s only
-                    else:
-                        for n2 in range_constexpr(2):
-                            sh0 = arith.constant(n2 * 16, type=T.i32)
-                            sh1 = arith.constant(n2 * 16 + 8, type=T.i32)
-                            results.append(_b_lane32_assemble(b0w, b1w, sh0, sh1))
+                    b32 = lds_load_b32_raw(lds_buffer, off)
+                    results.append(b32)
+                    results.append(b32)  # parity filler for the [2*s] indexing
                 return results
 
             def _load_b_and_scales(
@@ -1015,8 +983,8 @@ def compile_mxscale_gemm(
                     for wn in range_constexpr(wmma_n_rep)
                 ]
                 if const_expr(b_lane32):
-                    # 2 super-rows/warp; each i32 = one row's [k0,k1,k2,k3] gathered
-                    # from both b-planes. index 2*s = super-row s (b_scales[wn*2]).
+                    # One dword per super-row (2/warp) from this lane's b-plane;
+                    # WMMA op_sel picks the n2 half. index 2*s = super-row s.
                     b_scales_all = _load_b_scale_lane32(bs_buf, bs_bases[0], 2, 0, ks)
                 else:
                     b_scales_all = load_scale_b128(
@@ -1297,7 +1265,7 @@ def compile_mxscale_gemm(
                 def _load_b_half_bundle(wn_base, rep_start, ks):
                     b_frags = _load_b_half(wn_base, ks)
                     if const_expr(b_lane32):
-                        # rep_start in {0, 2} -> super-row rep_start//2 (n2=lane_kgrp).
+                        # rep_start in {0, 2} -> super-row rep_start//2 (b-plane=lane_kgrp).
                         b_scales = _load_b_scale_lane32(
                             bs_buf, bs_bases[0], 1, rep_start // 2, ks
                         )
