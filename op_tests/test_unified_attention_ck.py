@@ -1236,18 +1236,12 @@ def run_sage(
 # runs on identical logical values. Dense-only: same single-shape / non-SWA /
 # non-top-left guards as Sage.
 # ----------------------------------------------------------------------------
-@perftest()
-def run_asmfp8(
-    out,
-    q_bshd,
-    k_bshd,
-    v_bshd,
-    *,
-    scale,
-    causal,
-):
-    from aiter.ops.mha import flash_attn_fp8_pertensor_func
-
+def _quantize_asmfp8_inputs(q_bshd, k_bshd, v_bshd):
+    """Per-tensor FP8 quantisation of Q/K/V for the ASM launcher. Done ONCE
+    outside the @perftest-timed region (mirrors the CK leg, which consumes
+    pre-quantised q_fp8/k_fp8/v_fp8): otherwise every timed iter re-runs three
+    full-tensor amax+divide+cast passes and the ASM number is penalised by
+    quantisation overhead the CK kernel-only timing never pays."""
     fp8_dtype = _pick_fp8_dtype()
     fp8_max = float(torch.finfo(fp8_dtype).max)
 
@@ -1259,17 +1253,33 @@ def run_asmfp8(
         # tensors (folded into _s_scale_log2e for Q/K, into 1/L for V).
         return qt, descale.reshape(1).to(dtypes.fp32)
 
-    q_fp8, q_ds = _q(q_bshd)
-    k_fp8, k_ds = _q(k_bshd)
-    v_fp8, v_ds = _q(v_bshd)
+    return _q(q_bshd), _q(k_bshd), _q(v_bshd)
+
+
+@perftest()
+def run_asmfp8(
+    out,
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    *,
+    q_descale,
+    k_descale,
+    v_descale,
+    scale,
+    causal,
+):
+    # Kernel-only timed region: inputs are pre-quantised by
+    # _quantize_asmfp8_inputs() outside @perftest (see CK parity note there).
+    from aiter.ops.mha import flash_attn_fp8_pertensor_func
 
     res = flash_attn_fp8_pertensor_func(
         q_fp8,
         k_fp8,
         v_fp8,
-        q_descale=q_ds,
-        k_descale=k_ds,
-        v_descale=v_ds,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         causal=causal,
         softmax_scale=scale,
     )
@@ -1512,8 +1522,12 @@ def test_unified_attention_ck(
                 k_bshd = pk_bf16.view(b, sk, hk, head_size).to(dtypes.bf16)
                 v_bshd = pv_bf16.view(b, sk, hk, head_size).to(dtypes.bf16)
                 out_asmfp8_buf = torch.empty_like(out_ck)
+                # Quantise ONCE outside the timed region (CK parity).
+                (q_fp8_a, q_ds_a), (k_fp8_a, k_ds_a), (v_fp8_a, v_ds_a) = \
+                    _quantize_asmfp8_inputs(q_bshd, k_bshd, v_bshd)
                 out_asmfp8, time_asmfp8 = run_asmfp8(
-                    out_asmfp8_buf, q_bshd, k_bshd, v_bshd,
+                    out_asmfp8_buf, q_fp8_a, k_fp8_a, v_fp8_a,
+                    q_descale=q_ds_a, k_descale=k_ds_a, v_descale=v_ds_a,
                     scale=t["scale"], causal=(mask_type != 0),
                 )
             except Exception as e:
