@@ -703,7 +703,6 @@ def _compile_base_a8w4_gemm(
     stage1_weight_layout: str = "gguu",
     kernel_tag: str = "gemm",
     n_valid: int | None = None,
-    k_valid: int | None = None,
 ):
     compiler = compile_mxfp4_gemm if cfg.data_format == "fp4" else compile_a8w4_gemm
     return compiler(
@@ -711,7 +710,6 @@ def _compile_base_a8w4_gemm(
         N=N,
         K=K,
         n_valid=n_valid,
-        k_valid=k_valid,
         tile_m=cfg.tile_m,
         tile_n=cfg.tile_n,
         tile_k=cfg.tile_k,
@@ -800,12 +798,11 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     _validate_common(cfg)
     _validate_pad(hidden_pad, intermediate_pad, cfg)
     # NOTE on K-direction padding (hidden_pad here):
-    #   Stage1 contracts over model_dim (K).  K-pad is handled in-kernel via
-    #   TDM-load OOB: we pass k_valid = model_dim - hidden_pad so each load
-    #   descriptor clips its K extent to the valid region and the hardware
-    #   zero-fills the padded tail.  The padded K then contributes exactly 0 to
-    #   the contraction (0 * scale = 0) without the caller having to pre-zero
-    #   the activation/weight rows in [model_dim - hidden_pad, model_dim).
+    #   Stage1 contracts over model_dim (K).  This N-skip-only build does NOT
+    #   zero-fill the K-pad tail inside the kernel -- the caller is responsible
+    #   for ensuring the activation/weight rows in the padded K range are
+    #   already zero, so the contraction contribution is identically 0.  We
+    #   accept the parameter for API parity but do nothing with it on K side.
     # intermediate_pad lives in the N (output-column) direction for stage1.  We
     # clamp the N grid to skip trailing all-pad N-tiles:
     #   gguu fused (N = inter_dim):          trailing pad = intermediate_pad
@@ -821,10 +818,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     _stage1_n_valid_fused = None
     _stage1_n_valid_raw = (
         2 * cfg.inter_dim - int(intermediate_pad) if intermediate_pad else None
-    )
-    # K (contraction) = model_dim; hidden_pad is the trailing padded K extent.
-    _stage1_k_valid = (
-        cfg.model_dim - int(hidden_pad) if hidden_pad else None
     )
     if cfg.split_k == 1:
         fused_n = (
@@ -844,7 +837,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             stage1_weight_layout=cfg.stage1_weight_layout,
             kernel_tag="gemm1",
             n_valid=_stage1_n_valid_fused,
-            k_valid=_stage1_k_valid,
         )
         fused_base_bias = _compile_base_a8w4_gemm(
             K=cfg.model_dim,
@@ -855,7 +847,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             stage1_weight_layout=cfg.stage1_weight_layout,
             kernel_tag="gemm1_bias",
             n_valid=_stage1_n_valid_fused,
-            k_valid=_stage1_k_valid,
         )
     raw_base = _compile_base_a8w4_gemm(
         K=cfg.model_dim,
@@ -863,7 +854,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         cfg=cfg,
         kernel_tag="gemm1_raw",
         n_valid=_stage1_n_valid_raw,
-        k_valid=_stage1_k_valid,
     )
     finalize_act = _compile_stage1_finalize_act(
         experts=cfg.experts,
@@ -1129,29 +1119,24 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     _validate_common(cfg)
     _validate_pad(hidden_pad, intermediate_pad, cfg)
     # NOTE on K-direction padding (intermediate_pad here):
-    #   Stage2 contracts over inter_dim (K).  K-pad is handled in-kernel via
-    #   TDM-load OOB: we pass k_valid = inter_dim - intermediate_pad so stage2
-    #   clips its K read to the valid region and zero-fills the padded tail.
-    #   This makes stage2 robust to whatever stage1 wrote into the
-    #   intermediate_pad output columns (its boundary tile may leave garbage
-    #   there) -- those K columns are simply never read, so no upstream zeroing
-    #   of the stage1 output pad region is required for correctness.
+    #   Stage2 contracts over inter_dim (K).  This N-skip-only build does NOT
+    #   zero-fill the K-pad tail inside the kernel.  Stage1 writes garbage to
+    #   intermediate_pad output columns (its boundary tile), and stage2 reads
+    #   them.  In end-to-end MoE flows the upstream grouped wrapper / scale
+    #   shuffle must keep that region zero (or the workflow must guarantee
+    #   stage1 output is zero in pad cols), otherwise stage2 will miscompute.
+    #   We accept the parameter for API parity but do nothing with it on K side.
     # hidden_pad lives in the N (output-column) direction for stage2.  The
     # trailing all-pad N-tiles are skipped via grid clamp; the boundary tile
     # writes its pad cols as garbage but the consumer of the output (gather/
     # reduce) reads only the valid columns.
     _stage2_n_valid = (cfg.model_dim - int(hidden_pad)) if hidden_pad else None
-    # K (contraction) = inter_dim; intermediate_pad is the trailing padded K.
-    _stage2_k_valid = (
-        cfg.inter_dim - int(intermediate_pad) if intermediate_pad else None
-    )
     base = _compile_base_a8w4_gemm(
         K=cfg.inter_dim,
         N=cfg.model_dim,
         cfg=cfg,
         kernel_tag="gemm2",
         n_valid=_stage2_n_valid,
-        k_valid=_stage2_k_valid,
     )
     base_bias = _compile_base_a8w4_gemm(
         K=cfg.inter_dim,
@@ -1160,7 +1145,6 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         epilogue_bias=True,
         kernel_tag="gemm2_bias",
         n_valid=_stage2_n_valid,
-        k_valid=_stage2_k_valid,
     )
 
     def launch(
