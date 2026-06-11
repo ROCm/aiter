@@ -30,6 +30,29 @@ from aiter.ops.flydsl.moe_common import GateMode
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 _GROUPED_CONFIG_CACHE = {}
 _CONTIGUOUS_LAYOUT_CACHE = {}
+_WARNED_NAIVE_EPILOGUE = False
+# Cache the contiguous uint8 view of static MoE weights so a non-contiguous
+# weight is materialized at most once (not re-copied on every fused_moe call).
+_GROUPED_WEIGHT_CACHE = {}
+
+
+def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
+    """Return a contiguous uint8 view of a (static) MoE weight, cached by buffer.
+
+    Weights don't change across decode/bench steps, so this turns a potential
+    per-call ``.contiguous()`` D2D copy into a one-time cost. Keyed by
+    ``data_ptr`` (weights stay alive, so no buffer-reuse aliasing in practice);
+    the cache is bounded and cleared if it grows unexpectedly.
+    """
+    key = (w.data_ptr(), tuple(w.shape), tuple(w.stride()), str(w.dtype))
+    cached = _GROUPED_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out = (w if w.dtype == torch.uint8 else w.view(torch.uint8)).contiguous()
+    if len(_GROUPED_WEIGHT_CACHE) > 64:
+        _GROUPED_WEIGHT_CACHE.clear()
+    _GROUPED_WEIGHT_CACHE[key] = out
+    return out
 
 
 def _as_bool(value, default: bool) -> bool:
@@ -191,23 +214,21 @@ def _make_contiguous_psum_layout(
             )
         starts_t, psum_t, contiguous_m = cached
     else:
-        actual_ms = [
-            int(x)
-            for x in masked_m[:experts].detach().to("cpu", non_blocking=False).tolist()
-        ]
-        aligned_ms = [_align_up(m, tile_m) for m in actual_ms]
-        starts = []
-        cur = 0
-        for aligned_m in aligned_ms:
-            starts.append(cur)
-            cur += aligned_m
-        contiguous_m = max(int(tile_m), int(cur))
-        starts_t = torch.tensor(starts, device=device, dtype=torch.int32)
-        psum_t = torch.tensor(
-            [s + m for s, m in zip(starts, actual_ms)],
-            device=device,
-            dtype=torch.int32,
-        )
+        # Tile-aligned exclusive prefix sum over per-expert counts in one FlyDSL
+        # kernel (device-side starts/psum, no torch.cumsum / rocprim scan).
+        from aiter.ops.flydsl.moe_kernels import contiguous_psum
+
+        starts_t, psum_t, _ = contiguous_psum(masked_m, int(experts), int(tile_m))
+        # Use a HOST-STATIC upper bound for the contiguous-M dimension so buffer
+        # shapes and the GEMM grid are known without a per-call `.item()` host
+        # sync. The exact size is sum_e ceil(count_e / tile_m) * tile_m; since
+        # sum_e count_e == token_num * topk and each used expert adds < tile_m of
+        # padding, this is bounded by token_num*topk + experts*(tile_m-1). The
+        # GEMM skips padding tiles via the device-side ``psum_t`` ends, and the
+        # gather only reads ``topids_to_rows`` (real rows), so the extra padding
+        # rows are never read -- they only cost a slightly larger allocation.
+        ub = int(token_num) * int(topk) + int(experts) * (int(tile_m) - 1)
+        contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
         _CONTIGUOUS_LAYOUT_CACHE[cache_key] = (starts_t, psum_t, contiguous_m)
 
     old_flat = topids_to_rows.reshape(-1)
@@ -216,23 +237,16 @@ def _make_contiguous_psum_layout(
     new_flat = starts_t[expert.to(torch.long)] + slot
     remapped_topids = new_flat.to(torch.int32).view_as(topids_to_rows)
 
+    # Inverse map (new contiguous row -> source token) in ONE scatter, replacing
+    # the per-expert D2D slice-copy loop (up to E copies + 2 D2H syncs/call --
+    # the dominant Memcpy DtoD source in profiles). Every (token, topk) route is
+    # a valid assignment with slot < count[e], so all new rows are in range and
+    # padding rows stay -1.
     remapped_rows = torch.full(
         (int(contiguous_m),), -1, device=device, dtype=torch.int32
     )
-    if not capturing:
-        starts_cpu = starts_t.detach().cpu().tolist()
-        actual_cpu = (psum_t - starts_t).detach().cpu().tolist()
-        for e, (start, actual_m) in enumerate(zip(starts_cpu, actual_cpu)):
-            if int(actual_m) <= 0:
-                continue
-            old_start = int(e) * int(max_m)
-            remapped_rows[int(start) : int(start) + int(actual_m)] = rows_to_tokens[
-                old_start : old_start + int(actual_m)
-            ]
-    else:
-        # Capture reuses the static layout. Dynamic route rows are still remapped
-        # above for gather-reduce; padding rows are never read by the GEMM.
-        remapped_rows[: rows_to_tokens.numel()] = rows_to_tokens[: remapped_rows.numel()]
+    src_tokens = rows_to_tokens[old_flat.to(torch.long)]
+    remapped_rows[new_flat.to(torch.long)] = src_tokens
 
     return remapped_topids, remapped_rows, psum_t, int(contiguous_m)
 
@@ -527,6 +541,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # topk_ids is already an integer tensor; keep one flattened view for routing.
     flat_experts = topk_ids.reshape(-1)
     _capturing = _is_stream_capturing()
+    # The [crash-probe] stage1/stage2 device syncs are debug-only: they serialize
+    # the pipeline (no copy/compute overlap) and add a full device sync per call.
+    # Gate them behind AITER_GROUPED_DEBUG so production/bench runs skip them.
+    _grouped_sync_dbg = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    )
     # Expert-id range validation is a debug-only safety check: at decode sizes it
     # issues ~6 tiny launches/iter (lt+ge compare_scalar, two any() reductions)
     # plus a device->host sync from the `or` -- a real hotspot relative to the
@@ -760,8 +783,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
         _grouped_dbg("route gather done")
 
-    grouped_w1 = (w1 if w1.dtype == torch.uint8 else w1.view(torch.uint8)).contiguous()
-    grouped_w2 = (w2 if w2.dtype == torch.uint8 else w2.view(torch.uint8)).contiguous()
+    grouped_w1 = _grouped_weight_uint8(w1)
+    grouped_w2 = _grouped_weight_uint8(w2)
     _grouped_dbg("weight layout done")
     # Weight scales are already preshuffled per expert.
     _wmma_rep = warp_tile_n // 16
@@ -807,7 +830,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
     if _bias1_arg is not None and _bias1_arg.dtype != dtype:
         _bias1_arg = _bias1_arg.to(dtype)
-    if not _capturing:
+    if _grouped_sync_dbg and not _capturing:
         torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage1 tokens={token_num} max_m={max_m} E={E}")
     stage1(
@@ -826,7 +849,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_map=m_tile_map,
         bias=_bias1_arg,
     )
-    if not _capturing:
+    if _grouped_sync_dbg and not _capturing:
         torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage1 sync OK, unsort")
     _grouped_dbg("[crash-probe] after stage1 sync OK")
@@ -887,7 +910,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             .contiguous()
             .view(route_E, route_max_m, inter_dim // 32)
         )
-        if not _capturing:
+        if _grouped_sync_dbg and not _capturing:
             torch.cuda.synchronize()
         _grouped_dbg("[crash-probe] after a2 fp4 quant sync OK")
     else:
@@ -942,7 +965,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None
     if _bias2_arg is not None and _bias2_arg.dtype != dtype:
         _bias2_arg = _bias2_arg.to(dtype)
-    if not _capturing:
+    if _grouped_sync_dbg and not _capturing:
         torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage2 tokens={token_num} max_m={max_m} E={E}")
     stage2(
@@ -961,7 +984,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_map=m_tile_map,
         bias=_bias2_arg,
     )
-    if not _capturing:
+    if _grouped_sync_dbg and not _capturing:
         torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage2 sync OK")
     if os.environ.get("MOE_DUMP_INTER", "").strip().lower() not in (
@@ -1001,6 +1024,21 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("gather-reduce output done")
     else:
         _grouped_dbg("start scatter output")
+        # Naive fallback epilogue: a per-expert Python loop that issues E small
+        # D2D copies (and E `.item()` D2H syncs) per call -- the dominant Memcpy
+        # source in profiles. The fast path above (flydsl_moe_gather_reduce, one
+        # kernel) only triggers for non-naive + bf16/fp16. Warn once when we land
+        # here outside CUDAGraph capture so the slow path is easy to spot.
+        global _WARNED_NAIVE_EPILOGUE
+        if not _capturing and not _WARNED_NAIVE_EPILOGUE:
+            _WARNED_NAIVE_EPILOGUE = True
+            logger.warning(
+                "[grouped_a8w4] slow naive scatter epilogue: per-expert loop "
+                "(E=%d) issues E D2D copies + E D2H syncs per call. Use dtype "
+                "bf16/fp16 and unset AITER_GROUPED_GEMM_NAIVE to take the fused "
+                "flydsl_moe_gather_reduce path.",
+                E,
+            )
         # Naive fallback epilogue.
         if counts is None:
             counts = torch.bincount(flat_experts, minlength=E)
