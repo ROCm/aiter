@@ -23,6 +23,44 @@ PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
+# Large finite penalty used to build the attention mask as an *additive* bias.
+# Driving a masked QK score to -_MASK_BIG (rather than literal -inf) makes exp2()
+# underflow to 0 in softmax, but is computed without any boolean predicate.
+#   1e30 * (max masked distance ~ seq_len) stays well under the f32 max (3.4e38),
+#   and -1e30 * QK_scale is far below the exp2 underflow point (~-150), so a single
+#   masked column already vanishes. Kept positions get +0.0 and keep S exactly.
+_MASK_BIG = gl.constexpr(1.0e30)
+
+
+@gluon.jit
+def neg_inf_mask_bias(diff, SLIDING_WINDOW: gl.constexpr):
+    """Additive attention-mask bias: 0.0 on kept positions, ~-inf on masked ones.
+
+    ``diff`` is ``key_position_limit - seq_offset`` as f32 (positions are integers
+    well under 2**24, so f32 is exact):
+        causal (SLIDING_WINDOW == 0): keep ``diff >= 0``.
+        sliding window:               keep ``0 <= diff < SLIDING_WINDOW``.
+
+    Why not ``gl.where(mask, S, -inf)``: that lowers to a v_cmp -> v_cndmask pair
+    per masked register, and v_cmp writes its predicate to an SGPR. A masked tile
+    holds dozens of S registers, so dozens of predicates stay live at once and pin
+    the scalar register file. Any sign-bit/bitcast trick is also folded back into a
+    select by LLVM. Instead we take ``min(0, diff)`` -- 0 exactly on kept positions,
+    negative (how far out of range) on masked ones -- with native v_min_f32 (no
+    predicate, no SGPR) and scale by a big positive constant. Working in f32 means
+    the int->float convert lands on the broadcast row/col vectors at the call site
+    rather than per element, dropping a v_cvt_f32 from every masked S register.
+    """
+    if SLIDING_WINDOW > 0:
+        # Two-sided band: distance below the window (diff < 0) plus distance past
+        # it (diff >= SLIDING_WINDOW). Either being < 0 masks the position.
+        masked = gl.minimum(0.0, diff) + gl.minimum(0.0, (SLIDING_WINDOW - 1) - diff)
+    else:
+        # Causal: masked exactly when seq_offset > key limit, i.e. diff < 0.
+        masked = gl.minimum(0.0, diff)
+    return masked * _MASK_BIG
+
+
 @gluon.jit
 def elementwise_max_prop_nan(a, b):
     return gl.maximum(a, b, propagate_nan=_MAX_PROPAGATE_NAN_ALL)
@@ -862,6 +900,30 @@ class AttentionProgram:
 
     @gluon.jit
     def apply_mask_qk(self, S, j):
+        if self.cfg.SLIDING_WINDOW > 0 or self.cfg.ALL_DECODE:
+            return self.apply_mask_qk_orig(S, j)
+        else:
+            return self.apply_mask_qk_vgpr(S, j)     
+        return S
+
+    @gluon.jit
+    def apply_mask_qk_vgpr(self, S, j):
+        seq_offset = (
+            j * self.cfg.TILE_SIZE
+            + gl.arange(0, self.cfg.TILE_SIZE, layout=gl.SliceLayout(0, S.type.layout))[
+                None, :
+            ]
+        )
+
+        # Additive -inf bias instead of gl.where: keeps the mask in VGPRs and
+        # avoids the v_cmp/v_cndmask predicate SGPRs. See neg_inf_mask_bias.
+        # Convert the broadcast row/col vectors (not the 2D result) to f32.
+        diff = self.context_len_q_pos_qk.to(gl.float32) - seq_offset.to(gl.float32)
+        S = S + neg_inf_mask_bias(diff, self.cfg.SLIDING_WINDOW)
+        return S
+
+    @gluon.jit
+    def apply_mask_qk_orig(self, S, j):
         seq_offset = (
             j * self.cfg.TILE_SIZE
             + gl.arange(0, self.cfg.TILE_SIZE, layout=gl.SliceLayout(0, S.type.layout))[
@@ -1136,6 +1198,29 @@ class AttentionProgram:
 
     @gluon.jit
     def apply_mask_qk_subtile(self, S, j, sub_idx):
+        if self.cfg.SLIDING_WINDOW > 0 or self.cfg.ALL_DECODE:
+            return self.apply_mask_qk_subtile_orig(S, j, sub_idx)
+        else:
+            return self.apply_mask_qk_subtile_vgpr(S, j, sub_idx)     
+
+    @gluon.jit
+    def apply_mask_qk_subtile_vgpr(self, S, j, sub_idx):
+        seq_offset = (
+            j * self.cfg.TILE_SIZE
+            + sub_idx * (self.cfg.TILE_SIZE // 2)
+            + gl.arange(
+                0, self.cfg.TILE_SIZE // 2, layout=gl.SliceLayout(0, self.cfg.qk_layout)
+            )[None, :]
+        )
+        # Additive -inf bias instead of gl.where: keeps the mask in VGPRs and
+        # avoids the v_cmp/v_cndmask predicate SGPRs. See neg_inf_mask_bias.
+        # Convert the broadcast row/col vectors (not the 2D result) to f32.
+        diff = self.context_len_q_pos_qk.to(gl.float32) - seq_offset.to(gl.float32)
+        S = S + neg_inf_mask_bias(diff, self.cfg.SLIDING_WINDOW)
+        return S
+
+    @gluon.jit
+    def apply_mask_qk_subtile_orig(self, S, j, sub_idx):
         seq_offset = (
             j * self.cfg.TILE_SIZE
             + sub_idx * (self.cfg.TILE_SIZE // 2)
@@ -1909,20 +1994,24 @@ def _unified_attention_gluon_kernel_2d(
         block_table_stride,
     )
 
-    seq_idx = find_seq_idx(
-        query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
-    )
+    if not ALL_DECODE:
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
+        )
+        cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx)
+        q_block_start_idx = cur_batch_in_all_start_index // cfg.BLOCK_Q + seq_idx
+        q_block_local_idx = q_block_global_idx - q_block_start_idx
+        cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
+        cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
-    cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx)
-    q_block_start_idx = cur_batch_in_all_start_index // cfg.BLOCK_Q + seq_idx
-    q_block_local_idx = q_block_global_idx - q_block_start_idx
-
-    cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
-    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
-
-    # Not needed when num programs is computed precisely
-    if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
-        return
+        # Not needed when num programs is computed precisely
+        if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
+            return
+    else:
+        seq_idx = q_block_global_idx
+        q_block_local_idx: gl.int32 = 0
+        cur_batch_query_len: gl.int32 = 1
+        cur_batch_in_all_start_index: gl.int32 = q_block_global_idx
 
     offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
     offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.q_layout))
@@ -2284,7 +2373,7 @@ def unified_attention(
         auto_block_m = 128
         auto_num_warps = 4
         auto_waves_per_eu = 2
-        auto_tile_size = 64
+        auto_tile_size =  128 if (Q_FP8 and KV_FP8) else 64
 
     num_warps = auto_num_warps if num_warps is None else num_warps
     waves_per_eu = auto_waves_per_eu if waves_per_eu is None else waves_per_eu
@@ -2295,9 +2384,13 @@ def unified_attention(
     # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page.
     if not shuffled_kv_cache:
         TILE_SIZE = BLOCK_SIZE
+    # tile size cannot be bigger than block size
+    elif TILE_SIZE > BLOCK_SIZE:
+        TILE_SIZE = BLOCK_SIZE
+            
 
     num_kv_blocks = TILE_SIZE // BLOCK_SIZE if shuffled_kv_cache else 1
-    assert TILE_SIZE < 256, "TILE_SIZE must be less than 256"
+    assert TILE_SIZE < 256 and TILE_SIZE > 32, "TILE_SIZE must be in [32, 256]"
     assert (
         TILE_SIZE >= BLOCK_SIZE
     ), f"TILE_SIZE={TILE_SIZE} must be multiple of PAGE_SIZE={BLOCK_SIZE}"
@@ -2326,7 +2419,7 @@ def unified_attention(
     NUM_WARPS = num_warps
     if num_buffers == None:
         num_buffers = 2 if loop_variant == 0 else 3
-
+        num_buffers = 2 if ALL_DECODE else num_buffers
     kv_size = k.nelement() * k.element_size()
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = ARCH_NAME != "gfx1250" and kv_size <= MAX_INT32

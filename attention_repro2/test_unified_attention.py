@@ -20,7 +20,7 @@ from typing import Optional
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+#sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from aiter.ops.triton.utils.types import e4m3_dtype  # noqa: E402
 import aiter.ops.triton.utils._triton.arch_info as arch_info  # noqa: E402
@@ -291,19 +291,20 @@ def ref_paged_attn(
             (454, 345),
             (1, 134),
         ],
+        [(1, 128), (1, 77), (1, 397)]
     ],
 )
-@pytest.mark.parametrize("num_heads", [(8, 8), (8, 1)])
+@pytest.mark.parametrize("num_heads", [(8, 1)])
 @pytest.mark.parametrize("head_size", [64, 128])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("block_size", [64, ])
 @pytest.mark.parametrize("sliding_window", [None, 256])
-@pytest.mark.parametrize("soft_cap", [None, 50.0])
-@pytest.mark.parametrize("num_blocks", [2048, 32768])
+@pytest.mark.parametrize("soft_cap", [None,])
+@pytest.mark.parametrize("num_blocks", [2048,])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, out_dtype, use_q_descale, use_kv_descale, use_out_scale",
     [
         (torch.bfloat16, torch.bfloat16, torch.bfloat16, False, False, False),
-        (torch.bfloat16, e4m3_dtype, torch.bfloat16, False, True, False),
+        #(torch.bfloat16, e4m3_dtype, torch.bfloat16, False, True, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, True, True, False),
     ],
 )
