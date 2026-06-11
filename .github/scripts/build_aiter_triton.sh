@@ -34,42 +34,68 @@ git config --global --add safe.directory /workspace
 pip config set global.retries 15
 pip config set global.timeout 120
 retry_cmd 3 pip install -r .github/requirements/triton-test.txt
-.github/scripts/install_triton.sh
+
+# ###################################################################
+# # EXPERIMENT (bmazzott): force Triton to be COMPILED FROM SOURCE. #
+# # Throwaway hack -- do NOT merge. See notes below.                #
+# ###################################################################
+#
+# CI normally injects TRITON_WHEEL_DIR=/workspace/triton_wheels (populated with a
+# prebuilt wheel by the workflow). That short-circuits both install_triton.sh and
+# the old BUILD_TRITON block into installing the wheel. Nuke it so nothing can
+# grab a prebuilt wheel behind our back.
+unset TRITON_WHEEL_DIR
+export TRITON_WHEEL_DIR=""
+
+# .github/scripts/install_triton.sh
+
+echo
+echo "##################################################################"
+echo "## EXPERIMENT: BUILDING TRITON FROM SOURCE (THROWAWAY HACK)      ##"
+echo "##################################################################"
+pip uninstall -y triton triton-kernels pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
+
+# Pin triton to a known commit so the build is reproducible.
+# Commit from June 11th, 2026 - Advance version 3.7.0->3.8.0 (#10583)
+TRITON_COMMIT='5838701feb5ce8131137b541460058495b23b154'
+echo "[experiment] Target TRITON_COMMIT=${TRITON_COMMIT}"
+
+# Network in CI is flaky and a full clone of triton routinely times out
+# (curl 56 / "early EOF"). Do a shallow single-commit fetch and retry it.
+# Run inside a subshell so a failed attempt doesn't leave us cd'd into a
+# half-written dir; retry_cmd then re-runs the whole thing cleanly.
+fetch_triton() {
+    rm -rf triton
+    mkdir -p triton
+    (
+        cd triton
+        git init -q
+        git remote add origin https://github.com/triton-lang/triton
+        git fetch --depth 1 origin "$TRITON_COMMIT"
+        git checkout -q FETCH_HEAD
+    )
+}
+retry_cmd 5 fetch_triton
+
+cd triton
+echo "[experiment] triton checked out at HEAD=$(git rev-parse HEAD)"
+retry_cmd 3 pip install -r python/requirements.txt
+MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
+cd ..
+echo "[experiment] Finished building Triton from source."
+
+# Install aiter WITHOUT letting setup.py replace our freshly-built source Triton.
+# setup.py calls install_triton.sh unless AITER_USE_SYSTEM_TRITON=1 (and a triton
+# is already present), so set it now that the source build is installed.
+export AITER_USE_SYSTEM_TRITON=1
 pip uninstall -y aiter || true
 retry_cmd 3 pip install --no-build-isolation -e .
 
 echo
-echo "==== Verify triton installed by install_triton.sh ===="
+echo "==== Verify triton (should be the SOURCE build) ===="
 python .github/scripts/verify_triton_pin.py
-
-# Read BUILD_TRITON env var, default to 0. If 1, override the pinned triton wheel with a source build; if 0, use the pinned wheel from triton-test.txt.
-BUILD_TRITON=${BUILD_TRITON:-0}
-
-if [[ "$BUILD_TRITON" == "1" ]]; then
-    echo
-    echo "==== Install triton ===="
-    pip uninstall -y triton || true
-
-    TRITON_WHEEL_DIR=${TRITON_WHEEL_DIR:-}
-    if [[ -n "$TRITON_WHEEL_DIR" ]] && ls "$TRITON_WHEEL_DIR"/*.whl 1>/dev/null 2>&1; then
-        echo "Installing triton from pre-built wheel in $TRITON_WHEEL_DIR"
-        pip install "$TRITON_WHEEL_DIR"/*.whl
-    else
-        echo "Building triton from source..."
-        # Pin triton to a known-good commit to avoid CI breakage from
-        # upstream changes (e.g. AMD codegen regressions in triton-lang/triton).
-        TRITON_COMMIT=${TRITON_COMMIT:-756afc06}
-        git clone https://github.com/triton-lang/triton || true
-        cd triton
-        git checkout "$TRITON_COMMIT"
-        pip install -r python/requirements.txt
-        MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
-        cd ..
-    fi
-else
-    echo
-    echo "[SKIP] Triton source build skipped; using pinned wheel from triton-test.txt."
-fi
+echo "==== [experiment] Confirm Triton provenance ===="
+python -c "import triton, os; print('[experiment] triton', triton.__version__, 'imported from', os.path.dirname(triton.__file__))"
 
 echo
 echo "==== Show installed packages ===="
