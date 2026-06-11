@@ -738,16 +738,6 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                                   p_lds);
             }
         }
-        // NOTE: num_splits == 1 must also run through the simple reduce path.
-        // The prefill PS scheduler (v1_2_host.cuh) used to filter these out via
-        // a partial_o_loc == -1 sentinel and the prefill kernel wrote `out`
-        // directly without LSE. That dropped final_lse on the floor for tiles
-        // that a single TG could absorb, corrupting downstream chunked-context
-        // merges in vLLM. The scheduler now always emits a real partial slot,
-        // so reduce must process num_splits == 1 too. The math degenerates
-        // cleanly: the merge loop body runs zero times, sum_e_lse stays 1.0,
-        // max_lse stays at partial_lse[0], final_lse = log(1) + max_lse =
-        // max_lse, final_out = partial_out / 1.0 = partial_out.
         else
         {
             mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
@@ -813,10 +803,6 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                 params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
         }
     }
-    // num_splits == 1 must also run through the simple reduce path so that
-    // final_lse is written for tiles that a single TG can absorb. The math
-    // degenerates cleanly (sum_e_lse == 1.0, max_lse == partial_lse[0],
-    // final_lse = max_lse, final_out = partial_out).
     else
     {
         mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
