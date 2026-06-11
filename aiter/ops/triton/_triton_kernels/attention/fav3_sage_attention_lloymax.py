@@ -72,8 +72,6 @@ def _sage_fwd_no_mask_lloymax(
 ):
     offs_n = tl.arange(0, BLOCK_N)
     for start_n in range(block_min, block_max, BLOCK_N):
-        kv_offs_n = start_n + offs_n
-
         # Load K_packed (HALF_D, BLOCK_N) transposed layout
         k_ptrs = k_base_ptrs + start_n * stride_kn + offs_d_half[:, None] + offs_n[None, :] * stride_kn
         k_packed = tl.load(k_ptrs)                                           # (HALF_D, BLOCK_N) uint8

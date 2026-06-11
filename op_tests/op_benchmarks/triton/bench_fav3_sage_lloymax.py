@@ -143,10 +143,14 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
     o_sz = B * N_CTX_Q * HQ * DV * q.element_size()
     mem  = q_sz + k_sz + v_sz + o_sz
 
-    if "ms" in provider:               return ms
-    if "throughput_sparse" in provider: return sparse_flops / ms * 1e-9
-    if "TFLOPS" in provider:           return total_flops / ms * 1e-9
-    if "GB/s" in provider:             return mem / ms * 1e-6
+    if "ms" in provider:
+        return ms
+    if "throughput_sparse" in provider:
+        return sparse_flops / ms * 1e-9
+    if "TFLOPS" in provider:
+        return total_flops / ms * 1e-9
+    if "GB/s" in provider:
+        return mem / ms * 1e-6
     return ms
 
 
