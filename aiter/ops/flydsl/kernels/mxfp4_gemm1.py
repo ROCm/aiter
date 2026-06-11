@@ -84,7 +84,6 @@ NUM_N_BLOCKS = num_n_blocks_for(INTER)  # 4
 kBS_c_n1 = kbs_c_n1_for(INTER)  # 32
 OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(INTER)  # 128
 K_G2_HALF = k_g2_half_for(INTER)  # 256
-N_INTER = INTER  # 512 (documentation alias for the intermediate dim)
 
 
 # -- K-derived sizes (parametrized over the contraction dim K = D_HIDDEN) ------
@@ -153,7 +152,7 @@ kBS_per_expert_dw = kbs_per_expert_dw_for(K)  # 57344
 BQ_BYTES = bq_bytes_for(K)  # 1412956160
 ASCALE_BYTES = ascale_bytes_for(K)  # 146800640
 BSCALE_BYTES = bscale_bytes_for(K)  # 88309760
-# (N_INTER/K_G2_HALF/BN_INT/OUT_AS_PER_CHUNK_DW are the INTER-derived globals
+# (K_G2_HALF/BN_INT/OUT_AS_PER_CHUNK_DW are the INTER-derived globals
 #  defined above; the gemm2-A-scale epilog layout lives with the OUTPUT-side block.)
 
 LOG2E = 1.4426950408889634
