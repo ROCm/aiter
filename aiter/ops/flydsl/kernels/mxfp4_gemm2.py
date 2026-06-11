@@ -345,8 +345,8 @@ def compile_gemm2_a4w4_port(
     ):
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
-        tx_i32 = arith.index_cast(T.i32, tx)
-        bx_i32 = arith.index_cast(T.i32, bx)
+        tx_i32 = fx.Int32(tx)
+        bx_i32 = fx.Int32(bx)
 
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))  # wave == wave_n
@@ -883,7 +883,7 @@ def _gemm2_body(
         # flat per-sorted-row fp4 (packed q + e8m0 scale) write.
         out_q_base = _global_base_ptr1(arg_out)
         out_scale_base = _global_base_ptr1(arg_out_scale)
-        tid_i32 = arith.index_cast(T.i32, gpu.thread_id("x"))
+        tid_i32 = fx.Int32(gpu.thread_id("x"))
         _flat_mxfp4_epilog(
             accm,
             out_q_base,
@@ -1058,7 +1058,7 @@ def _atomic_bf16_epilog(
     lane_mod_16 = lane % fx.Int32(16)
     lds_base = _lds_base_ptr3(lds_acc.get())
 
-    tx_i32 = arith.index_cast(T.i32, gpu.thread_id("x"))
+    tx_i32 = fx.Int32(gpu.thread_id("x"))
     m_lane = tx_i32 // fx.Int32(32)
     n_lane = tx_i32 % fx.Int32(32)
     col_start = n_lane * fx.Int32(2)
