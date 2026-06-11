@@ -210,7 +210,6 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm -enable-noalias-to-md-conversion=1'"
         ],
-
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
     },
     "module_gemm_a8w8_blockscale_bpreshuffle": {
@@ -301,7 +300,9 @@
             "'-mllvm --amdgpu-mfma-vgpr-form'"
         ],
         "flags_extra_hip_per_source": {
-            "*.device.cu": ["-D__HIPCC_RTC__"]
+            "*.device.cu": [
+                "-D__HIPCC_RTC__"
+            ]
         },
         "md_name": "'module_deepgemm_opus'",
         "extra_ldflags": "None",
@@ -695,7 +696,6 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm -enable-noalias-to-md-conversion=1'"
         ],
-
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune'"
     },
     "module_gemm_a8w8_blockscale_bpreshuffle_tune": {
@@ -720,7 +720,6 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm -enable-noalias-to-md-conversion=1'"
         ],
-
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune'"
     },
     "module_gemm_a4w4_blockscale_tune": {
@@ -1091,6 +1090,36 @@
             "f'{AITER_META_DIR}/hsa/codegen.py -m pa_decode_bf16 --output_dir {{}}'"
         ]
     },
+    "module_fmha_fwd_with_sink_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_fwd_with_sink.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_fwd_bf16 --output_dir {{}}'"
+        ]
+    },
+    "module_fmha_fwd_with_sink_varlen_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_fwd_with_sink_varlen.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_fwd_bf16_varlen --output_dir {{}}'"
+        ]
+    },
     "module_fmha_v3_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
@@ -1432,7 +1461,10 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''",
-        "third_party": ["'HipKittens'", "'ComposableKernel'"],
+        "third_party": [
+            "'HipKittens'",
+            "'ComposableKernel'"
+        ],
         "is_experimental": "True"
     },
     "module_topk_plain": {
@@ -1489,8 +1521,7 @@
             "f'{AITER_CSRC_DIR}/pybind/fused_split_gdr_update_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/fused_split_gdr_update.cu'"
         ],
-        "flags_extra_cc": [
-        ],
+        "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'"
         ],
@@ -1504,8 +1535,7 @@
             "f'{AITER_CSRC_DIR}/pybind/chunk_gated_delta_rule_fwd_h_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/chunk_gated_delta_rule_fwd_h.cu'"
         ],
-        "flags_extra_cc": [
-        ],
+        "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'"
         ],
