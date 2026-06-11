@@ -32,7 +32,7 @@ from aiter import (
 
 BLOCK_SIZE_M = 32
 
-# Default to Opus unless Opus or FlyDSL sorting is explicitly requested.
+# Default to FlyDSL unless Opus or CK sorting is explicitly requested or FlyDSL fallback.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
