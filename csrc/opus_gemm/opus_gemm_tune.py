@@ -77,9 +77,28 @@ from opus_gemm_common import (
 OCCUPANCY_TILE_BM = 128
 OCCUPANCY_TILE_BN = 128
 
+BF16WS_EXACT_REDUCE_SHAPES = (
+    (64, 8),
+    (128, 4),
+    (256, 2),
+    (512, 1),
+    (1024, 4),
+    (1024, 2),
+    (1024, 1),
+    (2048, 1),
+)
+
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-int(a) // int(b))
+
+
+def _kid_uses_bf16_workspace(k_inst):
+    return getattr(k_inst, "splitk_workspace_dtype", "fp32_t") == "bf16_t"
+
+
+def _kid_rejects_outdtype(k_inst, out_dtype):
+    return _kid_uses_bf16_workspace(k_inst) and out_dtype is not dtypes.bf16
 
 
 def _flatmm_splitk_pfk(k) -> int:
@@ -215,16 +234,24 @@ def kid_rejects_shape(k_inst, M, N, K):
     B_K = k_inst.B_K
     loops = _ceil_div(K, B_K)
 
+    if _kid_uses_bf16_workspace(k_inst):
+        padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
+        if loops < 2 or K % B_K != 0 or padded_N != N:
+            return True
+        return not any(
+            N == n_exact and M % rows == 0
+            for n_exact, rows in BF16WS_EXACT_REDUCE_SHAPES
+        )
+
     if k_inst.kernel_tag in (
         "a16w16",
         "a16w16_kbuf1_large_tile",
         "a16w16_kbuf2v",
         "a16w16_kbuf2v_bk128",
-        "a16w16_kbuf3",
         "a16w16_kbuf1",
     ):
-        # Non-splitK a16w16 family all share the same (loops-2)%2==0 K-dbuf parity + mfma layout
-        # constraints as a16w16 (50000).
+        # Non-splitK a16w16 family all share the same K-dbuf parity +
+        # MFMA layout constraints as a16w16 (10000).
         if loops < 2 or (loops % 2 != 0):
             return True
         if N % 16 != 0:
@@ -324,9 +351,9 @@ def kid_rejects_bias(k_inst, bias):
       * gfx950 a16w16_flatmm_splitk (kid 200..299 + nooob mirror)
     Rejected:
       * persistent / flatmm-non-splitk (HAS_BIAS=false hardcoded in pipelines)
-      * gfx942 SB kid 50000 (HAS_BIAS path removed 2026-06-02; was dead code)
-      * gfx942 splitk family (kid 50200+): silently ignored bias
-      * gfx942 non-splitK siblings (50001/02/03/11): no bias path
+      * gfx942 SB kid 10000 (HAS_BIAS path removed 2026-06-02; was dead code)
+      * gfx942 splitk family (kid 10200+): silently ignored bias
+      * gfx942 non-splitK siblings (10002/03/11): no bias path
     """
     if not bias:
         return False
@@ -413,17 +440,13 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
     except Exception:
         pass  # unknown arch -> keep legacy multi-arch behaviour
 
-    # Step 6: drop known-bad kids permanently (silent garbage; see PLAN.md G2/G3).
+    # Step 6: drop known-bad kids permanently.
     cands = cands - _OPUS_PERMA_BAD_KIDS
     return cands
 
 
-# Kids we never want tuner to probe (correctness FAIL on multiple shape niches).
-# See plan PLAN.md G2: 50300 fused_reduce 49% splitK case FAIL on 1024x64x7168
-# (memory [[opus-50300-silent-garbage]]). Kept in source + heuristic-default
-# (so opus_gemm_a16w16_tune(id=50300) debug path still works) but excluded
-# from tune candidate search.
-_OPUS_PERMA_BAD_KIDS = frozenset({50300})
+# Kids we never want tuner to probe.
+_OPUS_PERMA_BAD_KIDS = frozenset()
 
 
 def _ensure_kids_compiled(candidate_kids):
@@ -1168,7 +1191,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             type=str,
             default=None,
             help="Comma-separated kid id(s) to restrict the sweep to "
-            "(e.g. --kid 50201 or --kid 50200,50201). Kids must still pass "
+            "(e.g. --kid 10201 or --kid 10200,10201). Kids must still pass "
             "the host-side shape / bias / outdtype filters; rejected kids "
             "are dropped with a log line. Compile sidecar is auto-expanded "
             "to cover the requested kids if needed.",
@@ -1521,7 +1544,6 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with the func/kwargs we provide here.
         bench_func = run_opus_gemm_bench
         perf_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
-        check_rtol, check_atol = 2e-2, 1.0
 
         logger.info(
             "OpusGemmA16W16Tuner: CUDA graph timing via cuda.Event "
@@ -1561,6 +1583,12 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             )
             in_dtype = _dtype_csv_str_to_torch(dtype_str)
             out_dtype = _dtype_csv_str_to_torch(outdtype_str)
+
+            # Gate opus candidates by the same tolerance the other a16w16
+            # solutions use (5e-2 for bf16, 1e-2 otherwise) instead of the
+            # looser hardcoded 2e-2/1.0.
+            check_rtol = 5e-2 if out_dtype == dtypes.bf16 else 1e-2
+            check_atol = check_rtol
 
             # Sanity check: a16w16-family kernels lock the input to bf16 today (the launcher TORCH_CHECKs
             # XQ.dtype()==BFloat16).
@@ -1603,15 +1631,10 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     dtypes.bf16: "bf16_t",
                     dtypes.fp32: "fp32_t",
                 }
-                _is_splitk_tag = k_inst.kernel_tag in (
-                    "a16w16_flatmm_splitk",
-                    "a16w16_kbuf3_sk",
-                    "a16w16_kbuf1_sk",
-                    "a16w16_fused_reduce",
-                    "a16w16_kbuf2v_sk",
-                    "a16w16_kbuf2v_bk128_sk",
-                )
+                _is_splitk_tag = kid in SPLITK_KIDS
                 _need = _OUT_TORCH_TO_CTYPE.get(out_dtype)
+                if _kid_rejects_outdtype(k_inst, out_dtype):
+                    continue
                 if (
                     not _is_splitk_tag
                     and _need is not None
@@ -1620,14 +1643,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     continue
 
                 # SplitK candidate set per shape+kid.
-                if k_inst.kernel_tag in (
-                    "a16w16_flatmm_splitk",
-                    "a16w16_kbuf3_sk",
-                    "a16w16_kbuf1_sk",
-                    "a16w16_fused_reduce",
-                    "a16w16_kbuf2v_sk",
-                    "a16w16_kbuf2v_bk128_sk",
-                ):
+                if kid in SPLITK_KIDS:
                     splitK_range = candidate_splitK(M, N, K, batch, cu_num, k_inst)
                 else:
                     splitK_range = [0]
