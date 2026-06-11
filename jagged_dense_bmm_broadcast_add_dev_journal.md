@@ -259,3 +259,34 @@ Still genuinely open: which avenue ships to production (FlyDSL→CKTile recommen
     C-shuffle epilogue HBM round-trip is now the floor — not amortizable by fewer blocks (#12 lowers fill)
     nor more smaller blocks (BLOCK_N=64 multiplies epilogues), and no direct coalesced store exists. 2×
     would require a fundamentally cheaper epilogue or a different output data layout.
+- **2026-06-11 (loop session, batch 4 — the AGPR-occupancy axis).** Premise reset: the prior "epilogue
+  HBM round-trip is the floor" conclusion went STALE after the B-prefetch win moved the bottleneck.
+  Attribution (env-gated `JDBBA_EPI_NOSTORE`/`JDBBA_EPI_NOEPI`, all 4 shapes) proved dropping the ENTIRE
+  epilogue changes runtime 0.0% — it is fully hidden behind MFMA. Fresh PMC: the kernel is now
+  **AGPR-occupancy bound** (128×128 fp32 C accum = 64 fp32/thread → 128 AGPR full → ~2 waves/CU). So this
+  batch attacks per-thread accumulator AGPR.
+  - **threads=512 (8-warp (1,8,1)) — KEPT, WIN on D256 uniform ONLY.** Doubling THREADS halves the
+    accumulator to 32 fp32/thread (64 AGPR) → higher occupancy. **B120_D256 −13.5% (0.563→0.487),
+    B1024_D256 −7.4% (4.45→4.12), cos=1.0.** Wins where the K-loop is SHORTEST (D256 = 4 K-tiles, most
+    occupancy-sensitive). LOSES D512 (+6-7%: its 8-tile steady-state K-loop suffers MFMA issue-port
+    contention from 8 warps) and ALL skew → gated to D256-uniform via the per-shape dispatch. `threads`
+    is now a per-call dispatch knob (default 256); the warp N-count derives THREADS//64, splitting across
+    M when n_warps would exceed BLOCK_N/16. Commits 3a62cc2 + 09ace8e.
+  - **KEY MECHANISM: relieve AGPR via MORE WARPS, not SMALLER TILES.** Both halve the accumulator, but
+    more warps KEEPS tile size (no extra block-grid → WIN) while smaller tiles DOUBLE the block-grid
+    (BLOCK_N=64 +20%, BLOCK_M=64 +1.6% — re-pay 2× pipeline fills/B-reloads → LOSE). The old "BLOCK_N=64
+    loses to 2× epilogues" reason was wrong (epilogue=0.0%); the verdict stands for a different reason
+    (2× pipeline fills). The kernel wants FATTER tiles + MORE warps.
+  - **threads=1024 — DISCARDED** (0.554 > 0.489 on B120_D256): past 512 occupancy is no longer the
+    bottleneck and extra warp-scheduling (the (2,8,1) M-split) dominates. 512 is the sweet spot.
+  - **XCD re-swept at threads=512** (tune_jdbba_xcd_t512.py, commit 866dc0f): B1024_D256 shifted
+    c=32/w=16→w=8 (occupancy doubling moved the L2 sweet spot, ~within run-to-run noise). B120_D256 stays
+    c=32/w=16. B_STAGES re-swept: 3 remains optimal (unchanged by warp count).
+  - **waves_per_eu — INERT** (wpe=1, wpe=2 on D512 both flat/noise): at AGPR=128 the compiler already
+    packs the max wave budget; the hint has no slack. Don't re-try.
+  - **D512 next lever (open):** PMC (B1024_D512) = MfmaUtil 8%, VALUBusy 44%, AGPR=128, occ ~2 waves/CU.
+    Also AGPR-bound, but threads=512 regresses it. Busiest unit is VALU (addr-gen/index math). A 4N×2M
+    warp split at threads=512 (to cut N-direction issue contention while keeping doubled occupancy) needs
+    the g2s/s2g copy partitions made m_warps-aware — a kernel-surface project, not a quick lever; deferred.
+  - **Final standing vs Triton:** uniform D256 **~1.30-1.34×** (was 1.16-1.22×), D512 ~1.41-1.43×; skew
+    up to 1.31×. The D256 shapes gained the most this batch.
