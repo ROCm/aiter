@@ -31,6 +31,7 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     get_lds_memref,
     issue_tdm_loads,
     lds_load_b128_raw,
+    lds_load_b32_raw,
     pipeline_fence,
     pipeline_fence_signal,
     pipeline_fence_wait,
@@ -84,6 +85,7 @@ def compile_mxscale_gemm(
     stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
     kernel_tag: str = "gemm",
+    b_scale_layout: str = "interleaved",
 ):
     """Compile an MXFP4 or MXFP8 GEMM kernel with TDM async copy.
 
@@ -106,6 +108,19 @@ def compile_mxscale_gemm(
 
     is_fp4 = data_format == "fp4"
     is_a8w4 = data_format == "a8w4"
+
+    # B (weight) scale memory layout:
+    #   "interleaved" -- legacy layout: rows N//wmma_rep, cols k_scale*wmma_rep,
+    #                    4 e8m0 blocks of a WMMA-K step contiguous per lane.
+    #   "lane32"      -- new grouped layout (see grouped_moe_gfx1250.
+    #                    _grouped_b_scale_preshuffle_e8m0): 32 N-rows fold into
+    #                    the columns (n2*16 lanes); the 4 e8m0 blocks of a
+    #                    WMMA-K step land at non-contiguous cols {x,x+1,x+64,x+65}.
+    if b_scale_layout not in ("interleaved", "lane32"):
+        raise ValueError(
+            f"b_scale_layout must be 'interleaved' or 'lane32', got {b_scale_layout!r}"
+        )
+    b_lane32 = b_scale_layout == "lane32"
 
     if out_dtype not in ("f32", "bf16", "f16"):
         raise ValueError(
@@ -275,9 +290,16 @@ def compile_mxscale_gemm(
     b_scale_load_rep = warp_tile_n // WMMA_M if is_fp4 else wmma_n_rep
 
     _b_frag_loads_per_wn = 2 if is_a8w4 else 4
+    # B-scale ds-load count for one full K-subtile (one `load_scale_b128`).
+    #   interleaved: ceil(rep/4) packed b128 (rep e8m0 blocks contiguous).
+    #   lane32     : the 4 WMMA-K blocks per lane are non-contiguous, so each of
+    #                the 2 covered super-rows needs a b0-plane + b1-plane b128 = 4.
+    _b_scale_ds_loads_full = 4 if b_lane32 else (b_scale_load_rep + 3) // 4
+    # Per bank-half slice (one super-row): b0-plane + b1-plane.
+    _b_scale_ds_loads_half = 2 if b_lane32 else (b_scale_load_rep // 2 + 3) // 4
     _bs_ds_loads = (
         wmma_n_rep * _b_frag_loads_per_wn
-        + (b_scale_load_rep + 3) // 4
+        + _b_scale_ds_loads_full
         + (wmma_m_rep + 3) // 4
     )
 
@@ -529,7 +551,13 @@ def compile_mxscale_gemm(
             batch_m_base = batch_idx * arith.index(M)
             batch_b_base = batch_idx * arith.index(B_TOTAL_N // 16)
             batch_as_base = batch_idx * arith.index(M // wmma_m_rep)
-            batch_bs_base = batch_idx * arith.index(B_TOTAL_N // b_scale_load_rep)
+            if const_expr(b_lane32):
+                # lane32: B-scale rows are N//32 super-rows per expert.
+                batch_bs_base = batch_idx * arith.index(B_TOTAL_N // 32)
+            else:
+                batch_bs_base = batch_idx * arith.index(
+                    B_TOTAL_N // b_scale_load_rep
+                )
             tile_valid = arith.constant(1, type=ir.IntegerType.get_signless(1))
             valid_m_i32 = i32_m.ir_value()
             if const_expr(grouped_masked_m):
@@ -655,6 +683,29 @@ def compile_mxscale_gemm(
 
             def make_desc_bs(memref, k_base, n_offset=0):
                 k_scale_off = k_base / arith.index(SCALE_BLOCK)
+                if const_expr(b_lane32):
+                    # lane32: gmem is (batch*(N//32), K_scale*32). Each tile is a
+                    # clean 2D region of (tile_n//32) super-rows x
+                    # (scale_k_per_tile*32) interleaved columns.
+                    outer_off = (blk_n + arith.index(n_offset)) / arith.index(32)
+                    inner_off = k_scale_off * arith.index(32)
+                    return tdm_ops.make_tensor_descriptor_2d(
+                        global_ptr=arg_b_scale,
+                        lds_memref=memref,
+                        global_offset=(batch_bs_base + outer_off, inner_off),
+                        tensor_shape=(
+                            batch_count * (B_TOTAL_N // 32),
+                            K_scale * 32,
+                        ),
+                        strides=(K_scale * 32, 1),
+                        tile_shape=(tile_n // 32, scale_k_per_tile * 32),
+                        elem_bytes=1,
+                        pad_interval=0,
+                        pad_amount=0,
+                        num_warps=tdm_desc_num_warps,
+                        workgroup_mask=b_mcast_mask,
+                        atomic_barrier_enable=atomic_barrier_enable,
+                    )
                 outer_off = (blk_n + arith.index(n_offset)) / arith.index(
                     b_scale_load_rep
                 )
@@ -878,6 +929,76 @@ def compile_mxscale_gemm(
                     results.append(vi)
                 return results
 
+            # -- lane32 B-scale read --------------------------------------
+            # LDS B-scale tile is (tile_n//32) super-rows x (scale_k_per_tile*32)
+            # cols, col = ks*128 + b*64 + lane16*4 + n2*2 + a (see
+            # grouped_moe_gfx1250._grouped_b_scale_preshuffle_e8m0).  One warp
+            # owns 2 super-rows (warp_tile_n=64); a physical lane (lane_kgrp,
+            # lane16) feeds WMMA N-row (super*32 + n2*16 + lane16) where
+            #   fp4 : n2 = lane_kgrp,  super = warp_super_base + wn   (b_scales[wn*2])
+            #   a8w4: super = warp_super_base + wn//2, n2 = wn%2      (b_scales[wn])
+            _B_LANE32_ROW_BYTES = scale_k_per_tile * 32
+            _B_LANE32_KSTEP_BYTES = 128  # ks stride: b(2)*lane(16)*n2(2)*a(2)/... = 2*64
+            _B_LANE32_BPLANE_BYTES = 64  # b-bit stride: lane16(16)*n2(2)*a(2) = 64
+
+            def _precompute_b_scale_lane32_base(lds_ptr, warp_n_base):
+                """Byte base for this lane's super-row 0 (ks=0, b-plane 0)."""
+                super_base = warp_n_base / arith.index(32)
+                base = super_base * arith.index(_B_LANE32_ROW_BYTES) + lane16 * arith.index(4)
+                return lds_ptr, [base]
+
+            def _b_lane32_assemble(b0w, b1w, sh0, sh1):
+                """Pack 4 e8m0 blocks [a0b0,a0b1,a1b0,a1b1] into one i32.
+
+                b0w/b1w are the b=0 / b=1 plane dwords for this lane; sh0/sh1 are
+                the bit shifts selecting the (a0,a1) bytes for the chosen n2.
+                """
+                mask = arith.constant(0xFF, type=T.i32)
+
+                def _byte(w, sh):
+                    return arith.andi(arith.shrui(w, sh), mask)
+
+                b0_a0 = _byte(b0w, sh0)
+                b1_a0 = _byte(b1w, sh0)
+                b0_a1 = _byte(b0w, sh1)
+                b1_a1 = _byte(b1w, sh1)
+                out = b0_a0
+                out = arith.ori(out, arith.shli(b1_a0, arith.constant(8, type=T.i32)))
+                out = arith.ori(out, arith.shli(b0_a1, arith.constant(16, type=T.i32)))
+                out = arith.ori(out, arith.shli(b1_a1, arith.constant(24, type=T.i32)))
+                return out
+
+            def _load_b_scale_lane32(lds_buffer, scale_base, supers, super_start, ks):
+                """Return i32 scale list for ``supers`` super-rows (one per 2 entries).
+
+                Output length is ``supers*2``; index ``2*s`` / ``2*s+1`` hold n2=0 /
+                n2=1 for super-row ``super_start+s``.  fp4 collapses to n2=lane_kgrp.
+                """
+                results = []
+                for s in range_constexpr(supers):
+                    s_global = super_start + s
+                    off = scale_base + arith.index(
+                        s_global * _B_LANE32_ROW_BYTES + ks * _B_LANE32_KSTEP_BYTES
+                    )
+                    b0w = lds_load_b32_raw(lds_buffer, off)
+                    b1w = lds_load_b32_raw(
+                        lds_buffer, off + arith.index(_B_LANE32_BPLANE_BYTES)
+                    )
+                    if const_expr(is_fp4):
+                        # n2 = lane_kgrp -> runtime byte shift kgrp*16 (a0), +8 (a1).
+                        kgrp_i32 = arith.index_cast(T.i32, lane_kgrp)
+                        sh0 = arith.muli(kgrp_i32, arith.constant(16, type=T.i32))
+                        sh1 = arith.addi(sh0, arith.constant(8, type=T.i32))
+                        val = _b_lane32_assemble(b0w, b1w, sh0, sh1)
+                        results.append(val)
+                        results.append(val)  # filler; emit uses index 2*s only
+                    else:
+                        for n2 in range_constexpr(2):
+                            sh0 = arith.constant(n2 * 16, type=T.i32)
+                            sh1 = arith.constant(n2 * 16 + 8, type=T.i32)
+                            results.append(_b_lane32_assemble(b0w, b1w, sh0, sh1))
+                return results
+
             def _load_b_and_scales(
                 b_buf, b_bases, bs_buf, bs_bases, as_buf, as_bases, ks
             ):
@@ -886,9 +1007,14 @@ def compile_mxscale_gemm(
                     load_b_frag(b_buf, b_bases, wn, ks)
                     for wn in range_constexpr(wmma_n_rep)
                 ]
-                b_scales_all = load_scale_b128(
-                    bs_buf, bs_bases[0], b_scale_load_rep, ks
-                )
+                if const_expr(b_lane32):
+                    # 2 super-rows per warp; list[2*s(+1)] = n2 entries (fp4 fixes
+                    # n2=lane_kgrp so only even indices are read by _emit_wmma).
+                    b_scales_all = _load_b_scale_lane32(bs_buf, bs_bases[0], 2, 0, ks)
+                else:
+                    b_scales_all = load_scale_b128(
+                        bs_buf, bs_bases[0], b_scale_load_rep, ks
+                    )
                 a_scales_all = load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
                 if const_expr(is_fp4):
                     # FP4 32x16: scaleAType=0 fixed (no op_sel on BScale)
@@ -1054,9 +1180,14 @@ def compile_mxscale_gemm(
                 as_buf, as_bases = _precompute_scale_lane_bases(
                     lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
                 )
-                bs_buf, bs_bases = _precompute_scale_lane_bases(
-                    lds_bs, warp_n_base, b_scale_load_rep, interleaved_scale_cols_b
-                )
+                if const_expr(b_lane32):
+                    bs_buf, bs_bases = _precompute_b_scale_lane32_base(
+                        lds_bs, warp_n_base
+                    )
+                else:
+                    bs_buf, bs_bases = _precompute_scale_lane_bases(
+                        lds_bs, warp_n_base, b_scale_load_rep, interleaved_scale_cols_b
+                    )
 
                 if const_expr(k_wmma_steps == 1):
                     b_frags, b_scales, a_scales = _load_b_and_scales(
@@ -1125,10 +1256,19 @@ def compile_mxscale_gemm(
                 as_buf, as_bases = _precompute_scale_lane_bases(
                     lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
                 )
-                bs_buf, bs_bases = _precompute_scale_lane_bases(
-                    lds_bs, warp_n_base, b_scale_load_rep, interleaved_scale_cols_b
+                if const_expr(b_lane32):
+                    bs_buf, bs_bases = _precompute_b_scale_lane32_base(
+                        lds_bs, warp_n_base
+                    )
+                else:
+                    bs_buf, bs_bases = _precompute_scale_lane_bases(
+                        lds_bs, warp_n_base, b_scale_load_rep, interleaved_scale_cols_b
+                    )
+                _b_half_scale_loads = (
+                    _b_scale_ds_loads_half
+                    if b_lane32
+                    else (_bank_half_b_scale_rep + 3) // 4
                 )
-                _b_half_scale_loads = (_bank_half_b_scale_rep + 3) // 4
 
                 def _fp4_get_a_scale_and_opsel(a_scales_all, wm_idx):
                     if const_expr(use_scale_opsel):
@@ -1149,14 +1289,20 @@ def compile_mxscale_gemm(
 
                 def _load_b_half_bundle(wn_base, rep_start, ks):
                     b_frags = _load_b_half(wn_base, ks)
-                    b_scales = load_scale_slice_b128(
-                        bs_buf,
-                        bs_bases[0],
-                        b_scale_load_rep,
-                        rep_start,
-                        _bank_half_b_scale_rep,
-                        ks,
-                    )
+                    if const_expr(b_lane32):
+                        # rep_start in {0, 2} -> super-row rep_start//2 (n2=lane_kgrp).
+                        b_scales = _load_b_scale_lane32(
+                            bs_buf, bs_bases[0], 1, rep_start // 2, ks
+                        )
+                    else:
+                        b_scales = load_scale_slice_b128(
+                            bs_buf,
+                            bs_bases[0],
+                            b_scale_load_rep,
+                            rep_start,
+                            _bank_half_b_scale_rep,
+                            ks,
+                        )
                     return b_frags, b_scales
 
                 def _emit_group_rows(
@@ -1296,12 +1442,16 @@ def compile_mxscale_gemm(
                 _half_wm = wmma_m_rep // 2
                 _half_wmma = _half_wm * wmma_n_rep
                 _b_loads_per_frag = 2 if is_a8w4 else 4
+                # b-scale + a-scale ds-read hint (lane32 b-scale = 4 dwords).
+                _scale_hint = (
+                    _b_scale_ds_loads_full + (wmma_m_rep + 3) // 4 if b_lane32 else 2
+                )
 
                 for _ks in range_constexpr(k_wmma_steps):
                     if const_expr(_ks == 0):
                         rocdl.sched_dsrd(
                             wmma_n_rep * _b_loads_per_frag
-                            + 2
+                            + _scale_hint
                             + _half_wm * DS_LOADS_PER_A_FRAG
                         )
                     else:
@@ -1310,14 +1460,18 @@ def compile_mxscale_gemm(
                     rocdl.sched_dsrd(_half_wm * DS_LOADS_PER_A_FRAG)
                     rocdl.sched_mfma(_half_wmma)
                     if const_expr(_ks < k_wmma_steps - 1):
-                        rocdl.sched_dsrd(wmma_n_rep * _b_loads_per_frag + 2)
+                        rocdl.sched_dsrd(wmma_n_rep * _b_loads_per_frag + _scale_hint)
                 rocdl.sched_barrier(0)
 
             def hot_loop_scheduler_fp4_bank_friendly():
                 _a_all_loads = wmma_m_rep * DS_LOADS_PER_A_FRAG
                 _a_scale_loads = (wmma_m_rep + 3) // 4
                 _b_half_loads = _bank_half_wn * 4
-                _b_half_scale_loads = (_bank_half_b_scale_rep + 3) // 4
+                _b_half_scale_loads = (
+                    _b_scale_ds_loads_half
+                    if b_lane32
+                    else (_bank_half_b_scale_rep + 3) // 4
+                )
                 _group_wmma = _bank_group_size
                 _right_half_loads = _b_half_loads + _b_half_scale_loads
 

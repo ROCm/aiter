@@ -278,6 +278,20 @@ def _preshuffled_scale_shape(
     return int(rows) // wmma_rep, k_scale * wmma_rep
 
 
+def _preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
+    """Weight (B) scale shape in the new layout: (rows//32, (k_dim//32)*32).
+
+    Matches ``grouped_moe_gfx1250._grouped_b_scale_preshuffle_e8m0``: 32 N-rows
+    fold into the column dim (2 * 16 lanes) and each k_scale column expands x32.
+    """
+    k_scale = int(k_dim) // 32
+    if k_scale % 4 != 0:
+        raise ValueError(f"B-scale k columns must be divisible by 4, got {k_scale}")
+    if int(rows) % 32 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 32, got {rows}")
+    return int(rows) // 32, k_scale * 32
+
+
 def _check_stage1_args(
     y, x, w, scale_x, scale_w, masked_m, cfg: _GroupedA8W4Config
 ) -> None:
@@ -300,13 +314,10 @@ def _check_stage1_args(
             f"w shape must be {(cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // pack_b)}, got {tuple(w.shape)}"
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
-    warp_tile_n = cfg.tile_n // cfg.n_warp
     scale_x_shape = _preshuffled_scale_shape(
         cfg.max_m, cfg.model_dim, warp_tile_m, cfg.tile_k
     )
-    scale_w_shape = _preshuffled_scale_shape(
-        2 * cfg.inter_dim, cfg.model_dim, warp_tile_n, cfg.tile_k
-    )
+    scale_w_shape = _preshuffled_b_scale_shape(2 * cfg.inter_dim, cfg.model_dim)
     if tuple(scale_x.shape) != (cfg.experts, *scale_x_shape):
         raise ValueError(
             f"scale_x shape must be {(cfg.experts, *scale_x_shape)}, got {tuple(scale_x.shape)}"
@@ -658,13 +669,10 @@ def _check_stage2_args(
             f"w shape must be {(cfg.experts, cfg.model_dim, cfg.inter_dim // pack_b)}, got {tuple(w.shape)}"
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
-    warp_tile_n = cfg.tile_n // cfg.n_warp
     scale_x_shape = _preshuffled_scale_shape(
         cfg.max_m, cfg.inter_dim, warp_tile_m, cfg.tile_k
     )
-    scale_w_shape = _preshuffled_scale_shape(
-        cfg.model_dim, cfg.inter_dim, warp_tile_n, cfg.tile_k
-    )
+    scale_w_shape = _preshuffled_b_scale_shape(cfg.model_dim, cfg.inter_dim)
     if tuple(scale_x.shape) != (cfg.experts, *scale_x_shape):
         raise ValueError(
             f"scale_x shape must be {(cfg.experts, *scale_x_shape)}, got {tuple(scale_x.shape)}"
@@ -718,6 +726,7 @@ def _compile_base_a8w4_gemm(
         stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
         kernel_tag=kernel_tag,
+        b_scale_layout="lane32",
     )
 
 

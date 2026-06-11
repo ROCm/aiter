@@ -189,6 +189,68 @@ def _grouped_a8w4_prepare_scale_batch(
     ).to(device=device)
 
 
+# ---------------------------------------------------------------------------
+# Weight (B) scale preshuffle -- NEW layout (gfx1250 grouped GEMM).
+#
+# Unlike the activation (A) scale above, the weight scale uses a lane-major
+# interleave fixed by the WMMA scale contract (16 N-lanes, 4 e8m0 blocks per
+# WMMA-K step), independent of warp_tile / tile_k:
+#
+#   view(E, N//32, 2, 16, k_scale//4, 2, 2)
+#     .permute(0, 1, 4, 6, 3, 2, 5)        # [E, remain_n, other_k, k2_a, n_lane, n2, k2_b]
+#     .reshape(E, N//32, k_scale*32)
+#
+# For a raw byte at (n, ks) (n in [0,N), ks in [0,k_scale)=[0,K//32)):
+#   n  = super_row*32 + n2*16 + lane     # n2 = (n//16)%2,  lane = n%16
+#   ks = other_k*4    + a*2  + b         # a  = (ks//2)%2,  b    = ks%2
+#   super_row = n // 32
+#   col = (((other_k*2 + b)*16 + lane)*2 + n2)*2 + a
+#
+# Note: the 4 e8m0 blocks of one WMMA-K step land at non-contiguous columns
+# {x, x+1, x+64, x+65} (the ``b`` bit has stride 64), so the consumer cannot
+# read a contiguous i32 per lane the way the old A/B layout allowed.
+# ---------------------------------------------------------------------------
+def _grouped_b_scale_preshuffle_e8m0(scale: torch.Tensor) -> torch.Tensor:
+    """Preshuffle a raw per-expert weight e8m0 scale into the new B layout."""
+    scale = scale.view(torch.uint8).contiguous()
+    E, N, k_scale = scale.shape
+    if N % 32 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 32, got {N}")
+    if k_scale % 4 != 0:
+        raise ValueError(f"B-scale k columns must be divisible by 4, got {k_scale}")
+    remain_n = N // 32
+    other_k = k_scale // 4
+    g = scale.view(E, remain_n, 2, 16, other_k, 2, 2)
+    g = g.permute(0, 1, 4, 6, 3, 2, 5).contiguous()
+    return g.reshape(E, remain_n, k_scale * 32)
+
+
+def _grouped_b_scale_prepare_batch(
+    scale: torch.Tensor,
+    *,
+    experts: int,
+    rows: int,
+    k_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Accept raw / flat-raw / already-preshuffled weight scale -> new B layout."""
+    scale_u8 = scale.view(torch.uint8).contiguous()
+    k_scale = k_dim // 32
+    raw_shape = (experts, rows, k_scale)
+    preshuffled_shape = (experts, rows // 32, k_scale * 32)
+    if tuple(scale_u8.shape) == preshuffled_shape:
+        return scale_u8.to(device=device)
+    if tuple(scale_u8.shape) == (experts * rows, k_scale):
+        scale_u8 = scale_u8.view(raw_shape)
+    elif tuple(scale_u8.shape) != raw_shape:
+        raise ValueError(
+            f"B-scale shape must be raw {raw_shape}, flat raw "
+            f"{(experts * rows, k_scale)} or preshuffled {preshuffled_shape}, "
+            f"got {tuple(scale_u8.shape)}"
+        )
+    return _grouped_b_scale_preshuffle_e8m0(scale_u8).to(device=device)
+
+
 def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
     """Torch fallback for route -> grouped-row maps."""
     import torch.nn.functional as F
@@ -622,14 +684,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     grouped_w1 = (w1 if w1.dtype == torch.uint8 else w1.view(torch.uint8)).contiguous()
     grouped_w2 = (w2 if w2.dtype == torch.uint8 else w2.view(torch.uint8)).contiguous()
     _grouped_dbg("weight layout done")
-    # Weight scales are already preshuffled per expert.
-    _wmma_rep = warp_tile_n // 16
+    # Weight scales are already preshuffled per expert (new B-scale layout:
+    # rows N -> N//32 super-rows, k_scale cols -> k_scale*32 interleaved cols).
     grouped_w1_scale = w1_scale.reshape(
-        E, (2 * inter_dim) // _wmma_rep, (model_dim // 32) * _wmma_rep
+        E, (2 * inter_dim) // 32, (model_dim // 32) * 32
     )
-    grouped_w2_scale = w2_scale.reshape(
-        E, model_dim // _wmma_rep, (inter_dim // 32) * _wmma_rep
-    )
+    grouped_w2_scale = w2_scale.reshape(E, model_dim // 32, (inter_dim // 32) * 32)
 
     # grouped_a1_scale is produced above: fused gather+preshuffle (fast path) or
     # scatter + _grouped_a8w4_preshuffle_e8m0_scale (naive path).

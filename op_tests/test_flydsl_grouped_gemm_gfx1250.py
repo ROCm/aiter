@@ -45,6 +45,7 @@ from aiter.fused_moe import (  # noqa: E402
 )
 from aiter.ops.flydsl.grouped_moe_gfx1250 import (  # noqa: E402
     _grouped_a8w4_prepare_scale_batch,
+    _grouped_b_scale_prepare_batch,
 )
 from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402
 from aiter.ops.quant import per_1x32_f4_quant  # noqa: E402
@@ -111,14 +112,18 @@ def _grouped_scale(
     n_warp: int = 4,
     tile_k: int = 256,
 ) -> torch.Tensor:
-    """Prepare grouped e8m0 scales for the test kernel."""
-    return _grouped_a8w4_prepare_scale_batch(
+    """Prepare grouped weight (B) e8m0 scales for the test kernel.
+
+    Uses the new B-scale layout (``_grouped_b_scale_prepare_batch``); tile_n /
+    n_warp / tile_k are kept for call-site compatibility but the new weight
+    layout is fixed by the WMMA scale contract and does not depend on them.
+    """
+    del tile_n, n_warp, tile_k  # unused: new B layout is WMMA-fixed
+    return _grouped_b_scale_prepare_batch(
         scale_raw.contiguous().cuda().view(dtypes.fp8_e8m0),
         experts=experts,
         rows=rows,
         k_dim=k_dim,
-        warp_tile=tile_n // n_warp,
-        tile_k=tile_k,
         device="cuda",
     )
 
