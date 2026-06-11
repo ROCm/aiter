@@ -342,6 +342,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if not (is_grouped_a4w4 or is_grouped_a8w4):
         return None
     data_format = "fp4" if is_grouped_a4w4 else "a8w4"
+    # a8w4 weights are fp4 (4-bit) packed into uint8, so w1.dtype shows up as
+    # torch.uint8 upstream. Normalize back to fp4x2 so the CSV lookup key matches
+    # the tuned config (which records q_dtype_w as torch.float4_e2m1fn_x2).
+    q_dtype_w_key = (
+        dtypes.fp4x2 if (q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8) else q_dtype_w
+    )
     _grouped_dbg(f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
         return None
@@ -398,7 +404,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         activation=activation,
         dtype=dtype,
         q_dtype_a=q_dtype_a,
-        q_dtype_w=q_dtype_w,
+        q_dtype_w=q_dtype_w_key,
         quant_type=quant_type,
         gate_mode=gate_mode,
     )
@@ -454,6 +460,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         # expert can receive more than token_num rows. CUDAGraph buckets have
         # static token_num/topk; per-expert count <= token_num*topk.
         raw_max_m = token_num
+        _grouped_dbg(f" csv_max_m={csv_max_m} raw_max_m={raw_max_m}")
     max_m = max(
         warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
     )
@@ -641,6 +648,35 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         if data_format == "fp4"
         else compile_moe_grouped_gemm1_a8w4_masked
     )
+    _grouped_dbg(
+        "kernel_mxscale_gemm1 tile config: "
+        + ", ".join(
+            f"{k}={v}"
+            for k, v in [
+                ("data_format", data_format),
+                ("model_dim", model_dim),
+                ("inter_dim", inter_dim),
+                ("experts", E),
+                ("max_m", max_m),
+                ("tile_m", tile_m),
+                ("tile_n", tile_n),
+                ("tile_k", tile_k),
+                ("m_warp", m_warp),
+                ("n_warp", n_warp),
+                ("warp_tile_m", warp_tile_m),
+                ("warp_tile_n", warp_tile_n),
+                ("out_dtype", out_dtype_str),
+                ("num_buffers", num_buffers),
+                ("split_k", split_k1),
+                ("expert_sched_mode", False),
+                ("grouped_persistent_m", effective_grouped_persistent_m),
+                ("persistent_workers", persistent_workers),
+                ("act", "swiglu" if activation == ActivationType.Swiglu else "silu"),
+                ("stage1_weight_layout", stage1_weight_layout),
+                ("cfg_row", cfg_row),
+            ]
+        )
+    )
     _grouped_dbg("start stage1 compile")
     stage1 = stage1_compiler(
         model_dim=model_dim,
@@ -772,6 +808,33 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         compile_moe_grouped_gemm2_mxfp4_masked
         if data_format == "fp4"
         else compile_moe_grouped_gemm2_a8w4_masked
+    )
+    _grouped_dbg(
+        "kernel_mxscale_gemm2 tile config: "
+        + ", ".join(
+            f"{k}={v}"
+            for k, v in [
+                ("data_format", data_format),
+                ("model_dim", model_dim),
+                ("inter_dim", inter_dim),
+                ("experts", E),
+                ("max_m", max_m),
+                ("tile_m", tile_m),
+                ("tile_n", tile_n),
+                ("tile_k", tile_k),
+                ("m_warp", m_warp),
+                ("n_warp", n_warp),
+                ("warp_tile_m", warp_tile_m),
+                ("warp_tile_n", warp_tile_n),
+                ("out_dtype", out_dtype_str),
+                ("num_buffers", num_buffers),
+                ("split_k", split_k2),
+                ("expert_sched_mode", False),
+                ("grouped_persistent_m", effective_grouped_persistent_m),
+                ("persistent_workers", persistent_workers),
+                ("cfg_row", cfg_row),
+            ]
+        )
     )
     _grouped_dbg("start stage2 compile")
     stage2 = stage2_compiler(
