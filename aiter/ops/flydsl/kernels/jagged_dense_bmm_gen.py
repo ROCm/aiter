@@ -445,9 +445,12 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
                 fx.make_tile(None, None, fx.make_layout((8, 4), (1, 8))),
             )
         else:
+            n_warps_total = THREADS // 64
+            n_warps = min(n_warps_total, BLOCK_N // 16)
+            m_warps = n_warps_total // n_warps
             tiled_mma = fx.make_tiled_mma(
                 fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
-                fx.make_layout((1, THREADS // 64, 1), (0, 1, 0)),
+                fx.make_layout((m_warps, n_warps, 1), (1, m_warps, 0)),
                 fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
             )
         val_per_thr = 8  # 16B / bf16

@@ -28,13 +28,13 @@
         "B1024D256K256N7680": {
           "use_mfma_k32": false,
           "xcd_c": 32,
-          "xcd_w": 16,
+          "xcd_w": 8,
           "threads": 512,
           "cos": 1.0,
-          "ms": 4.1808,
+          "ms": 4.1212,
           "auto_ms": 4.4491,
-          "speedup": 1.060,
-          "source": "threads=512 (gfx942, 2026-06-11): 8-warp (1,8,1) layout halves the fp32 C-accumulator AGPR/thread, raising occupancy on the AGPR-bound D256 short-K-loop. do_bench cold-L2 uniform 4.181 vs 4.449 (-6.0%) atop xcd_c=32/w=16, cos=1.0. D256-uniform only (D512 and skew regress)."
+          "speedup": 1.080,
+          "source": "threads=512 + XCD re-tune (gfx942, 2026-06-11): 8-warp (1,8,1) layout halves the fp32 C-accumulator AGPR/thread, raising occupancy on the AGPR-bound D256 short-K-loop. XCD re-swept at threads=512 (tune_jdbba_xcd_t512.py): c=32/w=8 now wins (4.121) vs the threads=256-era c=32/w=16 (4.181); occupancy doubling shifted the L2 sweet spot. do_bench cold-L2 uniform 4.121 vs 4.449 baseline (-7.4%), cos=1.0. D256-uniform only (D512 and skew regress)."
         },
         "B1024D512K512N7680": {
           "use_mfma_k32": false,
