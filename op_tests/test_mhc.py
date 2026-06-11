@@ -919,7 +919,9 @@ def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False, large_m=False
         if m < LARGE_M_MIN:
             aiter.logger.info("skip large_m_us: m=%s < %s", m, LARGE_M_MIN)
         elif get_gfx_runtime() != "gfx950":
-            aiter.logger.info("skip large_m_us: gfx=%s (gfx950 only)", get_gfx_runtime())
+            aiter.logger.info(
+                "skip large_m_us: gfx=%s (gfx950 only)", get_gfx_runtime()
+            )
         elif mhc_fused_post_pre_large_m is None:
             aiter.logger.info("skip large_m_us: mhc_fused_post_pre_large_m unavailable")
         else:
