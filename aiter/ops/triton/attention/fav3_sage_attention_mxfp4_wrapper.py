@@ -219,17 +219,21 @@ def fav3_sage_lloymax_wrapper(
       block_lut: (kv_block_indices, lut_start, lut_count) for Sparge sparse attention.
     """
     for tensor, name in zip([q, k, v], ["q", "k", "v"]):
-        assert tensor.dtype in [torch.float16, torch.bfloat16, torch.float32], (
-            f"Expected high-precision for {name}, got {tensor.dtype}"
-        )
+        assert tensor.dtype in [
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ], f"Expected high-precision for {name}, got {tensor.dtype}"
 
     FP8_TYPE = aiter.dtypes.fp8
-    FP8_MAX  = torch.finfo(FP8_TYPE).max
-    config   = get_sage_fwd_configs_mxfp4()
+    FP8_MAX = torch.finfo(FP8_TYPE).max
+    config = get_sage_fwd_configs_mxfp4()
 
     # Quantize Q/K with Lloyd-Max (packed uint8 + float16 norms)
     q_packed, q_norms, k_packed, k_norms, v_fp8, v_scale, _ = sage_quant_lloymax_packed(
-        q, k, v,
+        q,
+        k,
+        v,
         FP8_TYPE=FP8_TYPE,
         FP8_MAX=FP8_MAX,
         BLKQ=config["BLOCK_M"],
@@ -241,6 +245,7 @@ def fav3_sage_lloymax_wrapper(
 
     # Load codebook (cached by get_codebook)
     from aiter.ops.triton.attention.turboquant.codebook import get_codebook
+
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
     head_dim = map_dims(q.shape, bshd)[-1]
     codebook = get_codebook(head_dim, 4, device=q.device).float().contiguous()
@@ -252,9 +257,12 @@ def fav3_sage_lloymax_wrapper(
         kv_block_indices = lut_start = lut_count = None
 
     return fav3_sage_lloymax_func(
-        q_packed, q_norms,
-        k_packed, k_norms,
-        v_fp8, v_scale,
+        q_packed,
+        q_norms,
+        k_packed,
+        k_norms,
+        v_fp8,
+        v_scale,
         codebook,
         causal=causal,
         layout=layout,
@@ -296,17 +304,21 @@ def fav3_sage_lloymax_func(
     """
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
     batch, seqlen_q, nheads_q, head_dim_half = map_dims(q_packed.shape, bshd_map)
-    _, seqlen_k, nheads_k, head_dim_v        = map_dims(v.shape, bshd_map)
+    _, seqlen_k, nheads_k, head_dim_v = map_dims(v.shape, bshd_map)
 
     assert q_packed.dtype == torch.uint8, "q_packed must be uint8"
     assert k_packed.dtype == torch.uint8, "k_packed must be uint8"
-    assert nheads_q % nheads_k == 0,      "GQA ratio mismatch"
+    assert nheads_q % nheads_k == 0, "GQA ratio mismatch"
     assert layout in ("bshd", "bhsd")
     # q_norms shape: (B*H_q, S_q) contiguous; k_norms: (B*H_k, S_k) contiguous
-    assert q_norms.shape == (batch * nheads_q, seqlen_q), \
-        f"q_norms shape mismatch: {q_norms.shape} vs ({batch*nheads_q}, {seqlen_q})"
-    assert k_norms.shape == (batch * nheads_k, seqlen_k), \
-        f"k_norms shape mismatch: {k_norms.shape} vs ({batch*nheads_k}, {seqlen_k})"
+    assert q_norms.shape == (
+        batch * nheads_q,
+        seqlen_q,
+    ), f"q_norms shape mismatch: {q_norms.shape} vs ({batch*nheads_q}, {seqlen_q})"
+    assert k_norms.shape == (
+        batch * nheads_k,
+        seqlen_k,
+    ), f"k_norms shape mismatch: {k_norms.shape} vs ({batch*nheads_k}, {seqlen_k})"
 
     if config is None:
         config = get_sage_fwd_configs_mxfp4()
@@ -324,7 +336,7 @@ def fav3_sage_lloymax_func(
     stride_kz, stride_kn, stride_kh, _ = map_dims(k_packed.stride(), bshd_map)
     # V / V_descale / Out strides
     stride_vz, stride_vn, stride_vh, _ = map_dims(v.stride(), bshd_map)
-    stride_vsz, stride_vsh, _          = v_descale.stride()
+    stride_vsz, stride_vsh, _ = v_descale.stride()
     stride_oz, stride_om, stride_oh, _ = map_dims(out.stride(), bshd_map)
 
     USE_BIAS = bias is not None
@@ -336,9 +348,13 @@ def fav3_sage_lloymax_func(
 
     if use_block_sparse:
         if any(x is None for x in (kv_block_indices, lut_start, lut_count)):
-            raise ValueError("kv_block_indices, lut_start, lut_count required for block-sparse")
+            raise ValueError(
+                "kv_block_indices, lut_start, lut_count required for block-sparse"
+            )
     else:
-        kv_block_indices = lut_start = lut_count = torch.empty(0, device=q_packed.device)
+        kv_block_indices = lut_start = lut_count = torch.empty(
+            0, device=q_packed.device
+        )
 
     padded_dv = max(16, 1 << (head_dim_v - 1).bit_length())
     PADDED_HEAD_V = padded_dv != head_dim_v
@@ -346,35 +362,56 @@ def fav3_sage_lloymax_func(
     grid = (triton.cdiv(seqlen_q, BLOCK_M), nheads_q, batch)
 
     sage_fwd_lloymax[grid](
-        q_packed, q_norms,
-        k_packed, k_norms,
-        v, v_descale,
+        q_packed,
+        q_norms,
+        k_packed,
+        k_norms,
+        v,
+        v_descale,
         codebook,
         out,
         # Q packed strides
-        stride_qz, stride_qh, stride_qm,
+        stride_qz,
+        stride_qh,
+        stride_qm,
         # K packed strides
-        stride_kz, stride_kh, stride_kn,
+        stride_kz,
+        stride_kh,
+        stride_kn,
         # V strides
-        stride_vz, stride_vh, stride_vn,
+        stride_vz,
+        stride_vh,
+        stride_vn,
         # V_descale strides
-        stride_vsz, stride_vsh,
+        stride_vsz,
+        stride_vsh,
         # Out strides
-        stride_oz, stride_oh, stride_om,
+        stride_oz,
+        stride_oh,
+        stride_om,
         # Bias
-        bias, stride_bz, stride_bh, stride_bm, stride_bn,
+        bias,
+        stride_bz,
+        stride_bh,
+        stride_bm,
+        stride_bn,
         # LUT
-        kv_block_indices, lut_start, lut_count,
+        kv_block_indices,
+        lut_start,
+        lut_count,
         # Sequence
-        seqlen_q, seqlen_k,
+        seqlen_q,
+        seqlen_k,
         # GQA
-        HQ=nheads_q, HK=nheads_k,
+        HQ=nheads_q,
+        HK=nheads_k,
         # Head dims
         HALF_D=head_dim_half,
         BLOCK_DV=padded_dv,
         ACTUAL_DV=head_dim_v,
         # Tuning
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
         PRE_LOAD_V=config.get("PRE_LOAD_V", False),
         # Flags
         IS_CAUSAL=causal,

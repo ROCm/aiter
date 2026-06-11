@@ -730,14 +730,14 @@ def sage_quant_lloymax(
         orig_shape = xf.shape
 
         # Per-vector norm extraction (polar coordinates)
-        norms = xf.norm(dim=-1, keepdim=True).clamp(min=1e-8)   # (..., 1)
+        norms = xf.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # (..., 1)
 
         # Scale to match codebook distribution: unit sphere × sqrt(D)
-        x_scaled = (xf / norms) * sqrt_d                         # (..., D)
+        x_scaled = (xf / norms) * sqrt_d  # (..., D)
 
         # Nearest-centroid via bucket search — O(D log 16), no extra memory
         x_flat = x_scaled.reshape(-1)
-        idx = torch.bucketize(x_flat, boundaries)                 # (N*D,) in [0,15]
+        idx = torch.bucketize(x_flat, boundaries)  # (N*D,) in [0,15]
 
         # Dequantize: centroid / sqrt(D) × original norm
         recon_flat = codebook[idx] / sqrt_d
@@ -752,23 +752,40 @@ def sage_quant_lloymax(
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
     if layout == "bshd":
         stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0), v.stride(2), v.stride(1), v.stride(3),
+            v.stride(0),
+            v.stride(2),
+            v.stride(1),
+            v.stride(3),
         )
     else:
         stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
         )
 
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
     K_NUM_BLKS = (s_k + BLKK - 1) // BLKK
     v_task_count = b * h_k * K_NUM_BLKS
     sage_quant_v_kernel[(v_task_count,)](
-        v, v_fp8, v_scale,
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v,
-        v_scale.stride(0), v_scale.stride(1),
-        b, h_k, K_NUM_BLKS, s_k,
-        D=head_dim, BLK_K=BLKK,
-        num_stages=3, num_warps=8,
+        v,
+        v_fp8,
+        v_scale,
+        stride_bz_v,
+        stride_h_v,
+        stride_seq_v,
+        stride_d_v,
+        v_scale.stride(0),
+        v_scale.stride(1),
+        b,
+        h_k,
+        K_NUM_BLKS,
+        s_k,
+        D=head_dim,
+        BLK_K=BLKK,
+        num_stages=3,
+        num_warps=8,
     )
 
     return q_lm, k_lm, v_fp8, v_scale, delta_s
@@ -809,8 +826,8 @@ def sage_quant_lloymax_packed(
     codebook = get_codebook(head_dim, 4, device=q.device).float()
     boundaries = ((codebook[:-1] + codebook[1:]) / 2.0).contiguous()
     sqrt_d = math.sqrt(head_dim)
-    log2e = math.log(math.e) / math.log(2)   # log2(e) ≈ 1.4427
-    sm_scale = head_dim ** -0.5
+    log2e = math.log(math.e) / math.log(2)  # log2(e) ≈ 1.4427
+    sm_scale = head_dim**-0.5
 
     # Apply Hadamard rotation (existing kernel, reused)
     q_rot, k_rot, delta_s = rotation_smooth_qk(
@@ -829,19 +846,19 @@ def sage_quant_lloymax_packed(
         xf = x.float()
         norms = xf.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # (B, S, H, 1)
 
-        x_scaled = (xf / norms) * sqrt_d                        # (B, S, H, D)
+        x_scaled = (xf / norms) * sqrt_d  # (B, S, H, D)
 
         idx = torch.bucketize(x_scaled.reshape(-1).contiguous(), boundaries)
-        idx = idx.reshape(x_scaled.shape).to(torch.uint8)       # (B, S, H, D)
+        idx = idx.reshape(x_scaled.shape).to(torch.uint8)  # (B, S, H, D)
 
         lo = idx[..., 0::2]
         hi = idx[..., 1::2]
-        packed = (lo | (hi << 4)).contiguous()                   # (B, S, H, D//2) uint8
+        packed = (lo | (hi << 4)).contiguous()  # (B, S, H, D//2) uint8
 
         # Pre-scaled norms stored as (B*H, S) for stride-1 sequence access in kernel.
         # For Q: q_norm = ||Q_rot|| * sm_scale * log2(e) / sqrt(D)
         # For K: k_norm = ||K_rot|| / sqrt(D)
-        norms_bsh = norms.squeeze(-1)                             # (B, S, H)
+        norms_bsh = norms.squeeze(-1)  # (B, S, H)
         if is_query:
             norms_scaled = (norms_bsh * sm_scale * log2e / sqrt_d).to(torch.float16)
         else:
@@ -858,7 +875,10 @@ def sage_quant_lloymax_packed(
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
     if layout == "bshd":
         stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0), v.stride(2), v.stride(1), v.stride(3),
+            v.stride(0),
+            v.stride(2),
+            v.stride(1),
+            v.stride(3),
         )
     else:
         stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = v.stride()
@@ -866,11 +886,23 @@ def sage_quant_lloymax_packed(
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
     K_NUM_BLKS = (s_k + BLKK - 1) // BLKK
     sage_quant_v_kernel[(b * h_k * K_NUM_BLKS,)](
-        v, v_fp8, v_scale,
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v,
-        v_scale.stride(0), v_scale.stride(1),
-        b, h_k, K_NUM_BLKS, s_k,
-        D=head_dim, BLK_K=BLKK, num_stages=3, num_warps=8,
+        v,
+        v_fp8,
+        v_scale,
+        stride_bz_v,
+        stride_h_v,
+        stride_seq_v,
+        stride_d_v,
+        v_scale.stride(0),
+        v_scale.stride(1),
+        b,
+        h_k,
+        K_NUM_BLKS,
+        s_k,
+        D=head_dim,
+        BLK_K=BLKK,
+        num_stages=3,
+        num_warps=8,
     )
 
     return q_packed, q_norms, k_packed, k_norms, v_fp8, v_scale, delta_s
