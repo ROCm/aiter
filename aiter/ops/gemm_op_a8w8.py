@@ -129,7 +129,8 @@ def gemm_a8w8_bpreshuffle_flydsl(
     config: dict,
 ) -> Tensor:
     kernel_name = str(config.get("kernelName", ""))
-    if kernel_name.startswith("flydsl_bpreshuffle_wmma_"):
+    # gfx1250 runs the WMMA ptpc backend; other archs use the MFMA preshuffle path.
+    if get_gfx() == "gfx1250":
         from .flydsl.bpreshuffle_gemm_gfx1250 import run_gemm_a8w8_bpreshuffle_gfx1250
 
         return run_gemm_a8w8_bpreshuffle_gfx1250(
@@ -474,6 +475,8 @@ def get_GEMM_config_with_quant_type(
                 msg = f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}!"
                 if "libtype" in config:
                     msg += f" libtype is {config['libtype']}!"
+                if "kernelName" in config:
+                    msg += f" kernelName is {config['kernelName']} (kernelId {config.get('kernelId')})!"
                 logger.info(msg)
             break
     if config is None:
@@ -671,6 +674,26 @@ def gemm_a8w8_bpreshuffle(
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "flydsl" and is_flydsl_available():
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+
+    if get_gfx() == "gfx1250" and is_flydsl_available():
+        from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
+            kernel_fits_shape,
+            kernels_list,
+        )
+
+        fits = [ki for ki in kernels_list.values() if kernel_fits_shape(ki, m, n, k)]
+        if fits:
+            want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
+            ki = min(
+                fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k)
+            )
+            logger.warning(
+                f"[gfx1250] gemm_a8w8_bpreshuffle untuned M={m}, N={n}, K={k}; "
+                f"falling back to flydsl kernel '{ki.name}'."
+            )
+            return gemm_a8w8_bpreshuffle_flydsl(
+                XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
+            )
     try:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
     except RuntimeError as e:
