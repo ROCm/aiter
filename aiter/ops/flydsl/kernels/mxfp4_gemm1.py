@@ -959,6 +959,12 @@ def compile_gemm1_a4w4_port(
     NE=NE,
     TOPK=TOPK,
 ):
+    print(
+        f"[PORT-FLYDSL-GEMM1] compile_gemm1_a4w4_port ENTERED "
+        f"BM={BM} use_nt={use_nt} inline_quant={inline_quant} "
+        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE}",
+        flush=True,
+    )
     # Supported Phase 2 combos.
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),

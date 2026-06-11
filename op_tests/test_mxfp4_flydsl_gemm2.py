@@ -50,13 +50,13 @@ def test_guard_rejects_bad_shape():
 
 
 def test_guard_rejects_bad_hidden():
-    """D_HIDDEN(=model_dim/output) ? Kimi/DSR ???? fail-loud?"""
+    """D_HIDDEN (=N_OUT=model_dim) must be %256 (NE/H now parametrized, not KIMI-gated)."""
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _assert_supported
 
-    with pytest.raises(NotImplementedError, match="Kimi"):
+    with pytest.raises(NotImplementedError, match="256"):
         _assert_supported(
             NE=385,
-            D_HIDDEN=4096,
+            D_HIDDEN=7000,  # not a multiple of 256
             D_INTER=512,
             topk=9,
             BM=32,
@@ -64,6 +64,24 @@ def test_guard_rejects_bad_hidden():
             atomic=True,
             mxfp4out=False,
         )
+
+
+def test_guard_accepts_non_kimi_hidden_ne():
+    """gemm2 _assert now accepts non-KIMI N_OUT/NE (e.g. model_dim=3072, NE=256)
+    as long as the divisibility constraints hold -- pipeline gates (sort) are
+    enforced elsewhere."""
+    from aiter.ops.flydsl.mxfp4_gemm2_kernels import _assert_supported
+
+    _assert_supported(
+        NE=256,
+        D_HIDDEN=3072,
+        D_INTER=768,
+        topk=8,
+        BM=32,
+        use_nt=False,
+        atomic=True,
+        mxfp4out=False,
+    )
 
 
 def test_guard_accepts_new_inter():

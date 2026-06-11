@@ -274,6 +274,11 @@ def compile_gemm2_a4w4_port(
                            separate scatter_reduce sums topk afterwards
       "nonatomic_mxfp4" -> flat per-sorted-row fp4 (q + e8m0 scale) write (BM128)
     """
+    print(
+        f"[PORT-FLYDSL-GEMM2] compile_gemm2_a4w4_port ENTERED "
+        f"BM={BM} use_nt={use_nt} NE={NE} N_OUT={N_OUT} epilog={epilog} D_INTER={D_INTER}",
+        flush=True,
+    )
     _atomic = epilog == "atomic"
     # K = contraction dim = inter_dim. Parametrized; defaults to KIMI/DSR's 512.
     _K = D_INTER

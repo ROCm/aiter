@@ -66,11 +66,15 @@ def _assert_supported(*, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, atomic, mxfp4o
             f"384/192) is not supported by this BK={port.BK} kernel "
             f"(got D_INTER={D_INTER})"
         )
-    if D_HIDDEN != port.N_OUT or NE not in (257, 385):
+    # N_OUT (= D_HIDDEN = model_dim) and NE are compile-parametrized; gemm2's real
+    # constraint is N_OUT % BN(256) == 0 (the kernel tiles the output by BN=256).
+    # (Was KIMI/DSR-gated to NE in (257,385), H=7168 -- relaxed to match gemm1's
+    # _assert. Pipeline-level routing limits, e.g. mxfp4_moe_sort's NE/TOPK gating,
+    # are enforced by those components, not here.)
+    if D_HIDDEN % 256 != 0:
         raise NotImplementedError(
-            f"flydsl mxfp4 gemm2 ??? Kimi/DSR ?? "
-            f"(NE?(257,385), H={port.N_OUT}),"
-            f"?? (NE={NE}, H={D_HIDDEN}, INTER={D_INTER}, TOPK={topk})"
+            f"flydsl mxfp4 gemm2 requires D_HIDDEN (=N_OUT=model_dim) % 256 == 0, "
+            f"got H={D_HIDDEN}"
         )
     epilog = _epilog_of(atomic, mxfp4out)
     if (BM, use_nt, epilog) not in _SUPPORTED:
