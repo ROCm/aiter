@@ -5,6 +5,7 @@
 #include "aiter_dispatch.h"
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
+#include "mx_quant_utils.h"
 #include "dsv4_rotate_quant.h"
 #include "rocprim/rocprim.hpp"
 #include <hipcub/hipcub.hpp>
@@ -163,19 +164,7 @@ __global__ void hadamard_rotate_activation_fp4quant_inplace_kernel(DTYPE_I* __re
         int num_thread_per_group = group_size / vec_size;
         absMax                  = multithread_reduce(absMax, max_op, num_thread_per_group);
 
-        constexpr float inverted_DTYPE_MAX = 1.0f / fp4_max;
-        auto ceil_pow2 = [](float tmp) {
-            uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-            uint32_t exponent = (u32 >> 23) & 0b11111111;
-            if(exponent == 0b11111111)
-            {
-                return __builtin_bit_cast(float, exponent << 23);
-            }
-            if(u32 & 0x7FFFFF)
-                exponent += 1;
-            return __builtin_bit_cast(float, exponent << 23);
-        };
-        float scale = ceil_pow2(absMax * inverted_DTYPE_MAX);
+        float scale = aiter::fp4_f32_to_e8m0_scale(absMax);
 
         auto a_fp4       = scaled_cast<opus::fp4_t>(af, scale);
         halfxvec_t a_out = scaled_cast<DTYPE_I>(a_fp4, scale);
@@ -188,7 +177,7 @@ __global__ void hadamard_rotate_activation_fp4quant_inplace_kernel(DTYPE_I* __re
 }
 
 #define ROTATE_ACTIVATION_FP4QUANT_INPLACE_KERNEL_IMPL(dim, fp4quant, vec_size, name)                      \
-    const int32_t m_block = vec_size * WARP_SIZE / dim; \
+    int32_t m_block = vec_size * WARP_SIZE / dim; \
     dim3 const grid((m + m_block - 1) / m_block);                              \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name, \
                                             [&] {                                                \
@@ -215,7 +204,7 @@ void rotate_activation_fp4quant_inplace(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE;
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     if(dim == 128)
     {
@@ -231,7 +220,7 @@ void rotate_activation_fp4quant_inplace(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        ROTATE_ACTIVATION_FP4QUANT_INPLACE_KERNEL_IMPL(1024, true, 16, "rotate_activation_fp4quant_inplace");
+        ROTATE_ACTIVATION_FP4QUANT_INPLACE_KERNEL_IMPL(1024, true, 32, "rotate_activation_fp4quant_inplace");
     }
     else
     {
@@ -253,7 +242,7 @@ void rotate_activation(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE;
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     if(dim == 128)
     {
@@ -269,7 +258,7 @@ void rotate_activation(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        ROTATE_ACTIVATION_FP4QUANT_INPLACE_KERNEL_IMPL(1024, false, 16, "rotate_activation");
+        ROTATE_ACTIVATION_FP4QUANT_INPLACE_KERNEL_IMPL(1024, false, 32, "rotate_activation");
     }
     else
     {
@@ -398,19 +387,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_inplace_kernel(DTYPE_I*
         int num_thread_per_group = group_size / vec_size;
         absMax                  = multithread_reduce(absMax, max_op, num_thread_per_group);
 
-        constexpr float inverted_DTYPE_MAX = 1.0f / fp4_max;
-        auto ceil_pow2 = [](float tmp) {
-            uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-            uint32_t exponent = (u32 >> 23) & 0b11111111;
-            if(exponent == 0b11111111)
-            {
-                return __builtin_bit_cast(float, exponent << 23);
-            }
-            if(u32 & 0x7FFFFF)
-                exponent += 1;
-            return __builtin_bit_cast(float, exponent << 23);
-        };
-        float scale = ceil_pow2(absMax * inverted_DTYPE_MAX);
+        float scale = aiter::fp4_f32_to_e8m0_scale(absMax);
 
         auto a_fp4       = scaled_cast<opus::fp4_t>(af, scale);
         halfxvec_t a_out = scaled_cast<DTYPE_I>(a_fp4, scale);
@@ -425,7 +402,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_inplace_kernel(DTYPE_I*
 #define ROPE_ROTATE_ACTIVATION_FP4QUANT_INPLACE_KERNEL_IMPL(dim, fp4quant, vec_size, name)         \
     AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim"); \
     AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");              \
-    const int32_t m_block = vec_size * WARP_SIZE / dim;                                            \
+    int32_t m_block = vec_size * WARP_SIZE / dim;                                            \
     dim3 const grid((m + m_block - 1) / m_block);                                                   \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name,                                   \
                                             [&] {                                                  \
@@ -482,7 +459,7 @@ void rope_rotate_activation_fp4quant_inplace(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE;
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     if(dim == 128)
     {
@@ -501,7 +478,7 @@ void rope_rotate_activation_fp4quant_inplace(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        ROPE_ROTATE_ACTIVATION_FP4QUANT_INPLACE_KERNEL_IMPL(1024, true, 16,
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_INPLACE_KERNEL_IMPL(1024, true, 32,
             "rope_rotate_activation_fp4quant_inplace");
     }
     else
@@ -550,11 +527,8 @@ void rope_rotate_activation(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE;
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
-    constexpr int32_t vec_size = 16;
-    AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim");
-    AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");
 
     const int32_t group_size = 0;
     if(dim == 128)
@@ -574,7 +548,7 @@ void rope_rotate_activation(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        ROPE_ROTATE_ACTIVATION_FP4QUANT_INPLACE_KERNEL_IMPL(1024, false, 16,
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_INPLACE_KERNEL_IMPL(1024, false, 32,
             "rope_rotate_activation");
     }
     else

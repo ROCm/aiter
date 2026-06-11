@@ -98,7 +98,6 @@ jobs:
               pip uninstall -y aiter amd-aiter || true
               pip config set global.default-timeout 60
               pip config set global.retries 10
-              pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
               pip install -r requirements.txt
               pip install --upgrade pandas pyzmq einops numpy==1.26.2
               pip install --upgrade "pybind11>=3.0.1"
@@ -170,12 +169,14 @@ jobs:
 
       - name: Download Aiter wheel artifact
         uses: actions/download-artifact@v4
+        timeout-minutes: 30
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
 
       - name: Download Triton wheel artifact
         uses: actions/download-artifact@v4
+        timeout-minutes: 30
         continue-on-error: true
         with:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
@@ -244,7 +245,9 @@ jobs:
                 bash ./.github/scripts/install_triton.sh
                 pip show triton
                 pip uninstall -y aiter amd-aiter || true
-                pip install --no-deps \"\${wheels[0]}\"
+                pip config set global.default-timeout 60
+                pip config set global.retries 10
+                pip install \"\${wheels[0]}\"
                 pip show amd-aiter || pip show aiter
                 if [ -d \"/models/${{ matrix.model }}\" ]; then
                   model_path=\"/models/${{ matrix.model }}\"

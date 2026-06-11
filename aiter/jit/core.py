@@ -27,6 +27,9 @@ from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
+AITER_DISABLE_KERNARG_PRELOAD = (
+    int(os.environ.get("AITER_DISABLE_KERNARG_PRELOAD", "0")) != 0
+)
 
 
 def is_experimental_enabled() -> bool:
@@ -777,7 +780,6 @@ def build_module(
             "-D__HIP_PLATFORM_AMD__=1",
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
-            "-mllvm --amdgpu-kernarg-preload-count=16",
             # "-v --save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",
@@ -788,6 +790,8 @@ def build_module(
             "-fgpu-flush-denormals-to-zero",
             f"-DDLLVM_MAIN_REVISION={check_LLVM_MAIN_REVISION()}",
         ]
+        if not AITER_DISABLE_KERNARG_PRELOAD:
+            flags_hip += ["-mllvm --amdgpu-kernarg-preload-count=16"]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
@@ -829,6 +833,13 @@ def build_module(
             flags_hip.append(
                 f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
             )
+
+        # ASM kernel debug instrumentation (host prints + post-launch sync) in
+        # *.cu is compiled only when AITER_ASM_DEBUG=1, mirroring poc_kl's
+        # `compile-dbg` / -DASM_DEBUG. Default builds stay free of debug code.
+        if int(os.environ.get("AITER_ASM_DEBUG", "0")) != 0:
+            if not any("ASM_DEBUG" in f for f in flags_extra_hip):
+                flags_hip.append("-DASM_DEBUG")
 
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
@@ -995,10 +1006,7 @@ def _get_ck_exclude_modules():
         "module_mla_metadata",
         "module_mla_reduce",
         "module_moe_asm",
-        "module_pa",
         "module_pa_metadata",
-        "module_pa_ragged",
-        "module_pa_v1",
         "module_ps_metadata",
         "module_quant",
         "module_rmsnorm_quant",
