@@ -1645,16 +1645,6 @@ def _test_async_load_ioffset_one(mod, ios_bytes):
     """Validate that a non-zero compile-time i_os shifts BOTH ends of the
     async copy (source read AND LDS destination write), as documented in
     opus.hpp gmem::_async_load.
-
-    Kernel layout (BLOCK_SIZE=256 threads, single block):
-      thread tid issues async_load(smem + tid, v_os=tid, 0, number<ios_bytes>)
-        -> reads  src[tid + ios_elems]
-        -> writes smem[tid + ios_elems]
-      LDS is pre-seeded with the sentinel and the whole region copied to dst, so
-        dst[0 .. ios_elems)              == sentinel  (LDS dest was shifted)
-        dst[ios_elems .. 256+ios_elems)  == src[j]    (source was shifted)
-    A missing source shift makes the data region mismatch; a missing dest shift
-    clobbers the sentinel region. Either bug fails the test.
     """
     if _skip_if_missing_symbol(
         mod, "run_async_load_ioffset", f"async_load_ioffset(i_os={ios_bytes})"
