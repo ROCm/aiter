@@ -22,6 +22,7 @@ LSE merge runs on host in cpu_reduce (which matches aiter csrc/kernels/mla/reduc
 import argparse
 import itertools
 import random
+import sys
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -31,6 +32,11 @@ import aiter
 from aiter import dtypes
 from aiter.test_common import benchmark, checkAllclose, perftest
 
+current_gfx = aiter.get_gfx()
+if current_gfx != "gfx1250":
+    print(f"Skipping test_pa_decode_bf16_asm.py: requires gfx1250, got {current_gfx}")
+    sys.exit(0)
+
 torch.set_default_device("cuda")
 
 PA_HEAD_DIM = 64
@@ -38,7 +44,7 @@ PA_PAGE_SIZE = 256
 PA_GQA_RATIO = 8
 PA_TILE_Q = 32  # kernel TileQ; mtp must be < PA_TILE_Q / gqa (= 4)
 
-fp8 = torch.float8_e4m3fn
+fp8 = dtypes.fp8
 
 
 def ceil_div(a, b):
