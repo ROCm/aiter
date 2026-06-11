@@ -72,6 +72,12 @@ SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
 
 
 def _ptr_view_safe(t: torch.Tensor):
+    # Every kernel reached through this helper (splitk_hgemm, small_m_hgemm,
+    # preshuffle_gemm) declares `fx.Pointer` args and calls `fx.ptrtoint` on
+    # them, so they need a raw PointerAdaptor — from_dlpack returns a memref
+    # which fails ptrtoint ("expected PointerType, got memref"). FakeTensors
+    # (AOT trace) get a null pointer, which avoids CUDA-initialising the parent
+    # process before forking AOT workers.
     type_name = type(t).__name__
     module_name = type(t).__module__
     if type_name == "FakeTensor" or "fake_tensor" in module_name:

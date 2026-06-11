@@ -516,6 +516,18 @@ def _precompile_to_cache(
                     stream=0,
                 )
             else:
+                # Blockscale fp8/fp8 launcher has an arg_out_scale_sorted slot;
+                # other stage1 launchers don't. Pass a 1-byte placeholder for
+                # blockscale so the slot count matches, None otherwise so
+                # _s1_args_std omits it.
+                _is_blockscale_s1 = (
+                    a_dtype == "fp8" and b_dtype == "fp8" and not _is_splitk
+                )
+                _s1_scale_arg = (
+                    torch.empty(1, dtype=torch.uint8, device=dev)
+                    if _is_blockscale_s1
+                    else None
+                )
                 args = _s1_args_std(
                     _kernel_out.view(-1),
                     a.view(-1),
@@ -531,6 +543,7 @@ def _precompile_to_cache(
                     _k_in,
                     _grid_y,
                     stream=0,
+                    out_scale_sorted=_s1_scale_arg,
                 )
 
             exe = compile_flydsl_moe_stage1(

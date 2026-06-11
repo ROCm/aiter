@@ -113,6 +113,10 @@ def build_silu_and_mul_fq_module(
             else _D.FP4_E2M1
         )
     )
+    # FP8 saturation bound follows the HW FP8 variant, matching _mx_dtype:
+    # gfx942 e4m3fnuz -> 240, gfx950+ OCP e4m3fn -> 448. Mirrors the in-GEMM
+    # fused epilog (blockscale_moe_gemm_2stage.py) and finfo<fp8_t>::max().
+    _fp8_fmax_val = 240.0 if get_hip_arch() == "gfx942" else 448.0
 
     @flyc.kernel
     def silu_and_mul_fq_kernel(
@@ -398,9 +402,20 @@ def build_silu_and_mul_fq_module(
                             )
                             out_byte_off = out_row_byte_base + col0
 
+                            # Per CK pattern (vec_convert.h:46-59, aiter_opus_plus.h:34-56):
+                            # clamp scaled f32 to the arch FP8 max (±240 on
+                            # gfx942 e4m3fnuz, ±448 on gfx950+ OCP e4m3fn)
+                            # before cvt_pk_fp8_f32 — the intrinsic itself does
+                            # NOT saturate, so out-of-range inputs become fp8
+                            # NaN (0x80) and propagate through stage2.
+                            _fp8_max = arith.constant(_fp8_fmax_val, type=f32)
+                            _fp8_min = arith.constant(-_fp8_fmax_val, type=f32)
                             scaled_vals = []
                             for vi in range_constexpr(VEC):
-                                scaled_vals.append(act_vals[vi] * quant_scale)
+                                s = act_vals[vi] * quant_scale
+                                s = arith.minimumf(s, _fp8_max)
+                                s = arith.maximumf(s, _fp8_min)
+                                scaled_vals.append(s)
 
                             if const_expr(VEC <= 4):
                                 packed_i32 = c0_i32
