@@ -65,6 +65,11 @@ VERIFY_TOL_ALL_ONES = 0.01
 # Environment / arch guards
 # ---------------------------------------------------------------------------
 def _require_gfx1250() -> None:
+    # AITER_FORCE_GFX1250=1 forces the grouped path on other archs (e.g. gfx942)
+    # to exercise the tiny operators with the GEMM mocked (default; pass
+    # --real-gemm to call the real gfx1250 kernel instead).
+    if os.environ.get("AITER_FORCE_GFX1250", "0") in ("1", "true", "True", "yes"):
+        return
     try:
         from flydsl.runtime.device import get_rocm_arch
     except Exception as exc:
@@ -74,6 +79,16 @@ def _require_gfx1250() -> None:
         pytest.skip(f"requires gfx1250, got {arch!r}")
 
 
+def is_gfx1250() -> bool:
+    """True only on actual gfx1250 hardware. AITER_FORCE_GFX1250 does NOT count:
+    forcing the grouped path onto another arch (e.g. gfx942) still needs the GEMM
+    mocked, so real-gemm defaults on only when the real WMMA kernel can run."""
+    try:
+        from flydsl.runtime.device import get_rocm_arch
+
+        return "gfx1250" in get_rocm_arch().lower()
+    except Exception:
+        return False
 # ---------------------------------------------------------------------------
 # Weight / scale preshuffle helpers (mandatory for the grouped path)
 #
