@@ -123,4 +123,23 @@ void fused_qk_rope_concat_and_cache_mla(
     bool is_neox,
     bool is_nope_first);
 
+// DeepSeek V3.1 MLA: fused QK RoPE(pe) + static FP8 quant + segmented paged KV
+// cache write (no RMSNorm). kv_cache is flat [num_blocks, page_size*kv_lora +
+// page_size*pe] (nope seg then rope seg, each token-major). q_out
+// [T, H, >=kv_lora+pe], tail left untouched.
+void fused_qk_rope_concat_and_cache_mla_seg(
+    aiter_tensor_t& q_nope,       // [num_tokens, num_heads, kv_lora_rank]
+    aiter_tensor_t& q_pe,         // [num_tokens, num_heads, pe_dim]
+    aiter_tensor_t& kv_c,         // [num_tokens, kv_lora_rank]
+    aiter_tensor_t& k_pe,         // [num_tokens, pe_dim]
+    aiter_tensor_t& kv_cache,     // [num_blocks, page_size*(kv_lora_rank+pe_dim)] flat
+    aiter_tensor_t& q_out,        // [num_tokens, num_heads, q_out_dim]
+    aiter_tensor_t& slot_mapping, // [num_tokens]
+    aiter_tensor_t& k_scale,
+    aiter_tensor_t& q_scale,
+    aiter_tensor_t& positions, // [num_tokens]
+    aiter_tensor_t& cos_cache, // [max_positions, pe_dim//2]
+    aiter_tensor_t& sin_cache, // [max_positions, pe_dim//2]
+    bool is_neox);
+
 } // namespace aiter

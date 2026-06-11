@@ -159,3 +159,21 @@ def fused_qk_rope_concat_and_cache_mla(
     is_neox: bool,
     is_nope_first: bool,
 ) -> None: ...
+
+
+@compile_ops("module_cache", develop=True)
+def fused_qk_rope_concat_and_cache_mla_seg(
+    q_nope: Tensor,  # [num_tokens, num_heads, kv_lora_rank=512]
+    q_pe: Tensor,  # [num_tokens, num_heads, pe_dim=64]
+    kv_c: Tensor,  # [num_tokens, kv_lora_rank=512]
+    k_pe: Tensor,  # [num_tokens, pe_dim=64]
+    kv_cache: Tensor,  # [num_blocks, page_size*kv_lora + page_size*pe] flat fp8
+    q_out: Tensor,  # [num_tokens, num_heads, q_out_dim>=576] fp8 (tail untouched)
+    slot_mapping: Tensor,  # [num_tokens]
+    k_scale: Tensor,  # [1] fp32 static scale
+    q_scale: Tensor,  # [1] fp32 static scale
+    positions: Tensor,  # [num_tokens]
+    cos_cache: Tensor,  # [max_position, pe_dim//2=32]
+    sin_cache: Tensor,  # [max_position, pe_dim//2=32]
+    is_neox: bool,
+) -> None: ...

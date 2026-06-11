@@ -1847,6 +1847,137 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
   }
 
 }
+
+// ============================================================================
+// DeepSeek V3.1 MLA: fused QK RoPE(pe only) + static FP8 per-tensor quant +
+// segmented paged KV cache write. No RMSNorm (q/k are already post-projection).
+//
+// q: nope quantized directly, pe RoPE'd then quantized.
+// k: nope quantized directly, pe RoPE'd then quantized.
+//
+//   q_nope [T, H, KV_LORA]   q_pe [T, H, PE_DIM]
+//   kv_c   [T, KV_LORA]      k_pe [T, PE_DIM]      (num_kv_heads == 1)
+//   cos_cache / sin_cache [max_pos, PE_DIM/2]      (same dtype as input)
+//   q_scale / k_scale [1] fp32                     (static per-tensor)
+//
+//   q_out [T, H, Q_OUT_DIM] fp8  -> [0:KV_LORA]=quant nope,
+//                                   [KV_LORA:KV_LORA+PE_DIM]=quant rope,
+//                                   [KV_LORA+PE_DIM:Q_OUT_DIM] left untouched (pad).
+//   kv_cache flat per block:  [PAGE_SIZE*KV_LORA nope][PAGE_SIZE*PE_DIM rope] fp8
+//     nope: block_idx*block_stride + block_offset*KV_LORA + d
+//     rope: block_idx*block_stride + PAGE_SIZE*KV_LORA + block_offset*PE_DIM + d
+//
+// Launch: grid = T*H, block = KV_LORA threads. One block per (token, head)
+// handles that head's q; when head_idx==0 the same block also handles the
+// token's k (kv=1). The first PE_DIM threads additionally process the pe seg.
+// ============================================================================
+template <typename scalar_t, typename cache_t, int KV_LORA, int PE_DIM,
+          int PAGE_SIZE, bool IS_NEOX>
+__global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
+    const scalar_t* __restrict__ q_nope,    // [T, H, KV_LORA]
+    const scalar_t* __restrict__ q_pe,      // [T, H, PE_DIM]
+    const scalar_t* __restrict__ kv_c,      // [T, KV_LORA]
+    const scalar_t* __restrict__ k_pe,      // [T, PE_DIM]
+    cache_t* __restrict__ kv_cache,         // flat [num_blocks, block_stride]
+    cache_t* __restrict__ q_out,            // [T, H, Q_OUT_DIM]
+    const int64_t* __restrict__ slot_mapping,
+    const int64_t* __restrict__ positions,
+    const scalar_t* __restrict__ cos_cache, // [max_pos, PE_DIM/2]
+    const scalar_t* __restrict__ sin_cache, // [max_pos, PE_DIM/2]
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const int num_heads,
+    const int64_t q_nope_stride_0, const int64_t q_nope_stride_1,
+    const int64_t q_pe_stride_0,   const int64_t q_pe_stride_1,
+    const int64_t q_out_stride_0,  const int64_t q_out_stride_1,
+    const int64_t kv_c_stride,
+    const int64_t k_pe_stride,
+    const int64_t cos_stride0,
+    const int64_t sin_stride0,
+    const int64_t block_stride)
+{
+    constexpr int HALF = PE_DIM / 2;
+
+    const int64_t token_idx = blockIdx.x / num_heads;
+    const int     head_idx  = blockIdx.x % num_heads;
+    const int     d         = threadIdx.x; // 0 .. KV_LORA-1
+
+    const int64_t slot_idx = slot_mapping[token_idx];
+    if(slot_idx < 0)
+        return; // uniform across the block (same token)
+
+    const int64_t pos      = positions[token_idx];
+    const scalar_t* cos_ptr = cos_cache + pos * cos_stride0;
+    const scalar_t* sin_ptr = sin_cache + pos * sin_stride0;
+
+    // ---- helper: RoPE on the pe segment for a single thread d (< PE_DIM) ----
+    auto rope_pe = [&](const scalar_t* pe_ptr) -> float {
+        int pair_dim, cos_idx;
+        if constexpr(IS_NEOX)
+        {
+            pair_dim = d < HALF ? d + HALF : d - HALF;
+            cos_idx  = d < HALF ? d : d - HALF;
+        }
+        else
+        {
+            pair_dim = (d % 2 == 0) ? d + 1 : d - 1;
+            cos_idx  = d / 2;
+        }
+        const float xv   = static_cast<float>(pe_ptr[d]);
+        const float yv   = static_cast<float>(pe_ptr[pair_dim]);
+        const float cosv = static_cast<float>(cos_ptr[cos_idx]);
+        const float sinv = static_cast<float>(sin_ptr[cos_idx]);
+        if constexpr(IS_NEOX)
+            return d < HALF ? (xv * cosv - yv * sinv) : (yv * cosv + xv * sinv);
+        else
+            return (d % 2 == 0) ? (xv * cosv - yv * sinv) : (yv * cosv + xv * sinv);
+    };
+
+    // ================= Q (every block) =================
+    {
+        const float inv_qscale = 1.0f / (*q_scale);
+        const scalar_t* q_nope_row =
+            q_nope + token_idx * q_nope_stride_0 + head_idx * q_nope_stride_1;
+        cache_t* q_out_row =
+            q_out + token_idx * q_out_stride_0 + head_idx * q_out_stride_1;
+
+        // nope: direct static quant.
+        const float x = static_cast<float>(q_nope_row[d]);
+        q_out_row[d]  = opus::cast<cache_t>(x * inv_qscale);
+
+        if(d < PE_DIM)
+        {
+            const scalar_t* q_pe_row =
+                q_pe + token_idx * q_pe_stride_0 + head_idx * q_pe_stride_1;
+            const float roped = rope_pe(q_pe_row);
+            q_out_row[KV_LORA + d] = opus::cast<cache_t>(roped * inv_qscale);
+        }
+    }
+
+    // ================= K (only head 0, kv=1) =================
+    if(head_idx == 0)
+    {
+        const float inv_kscale = 1.0f / (*k_scale);
+        const int64_t block_idx    = slot_idx / PAGE_SIZE;
+        const int64_t block_offset = slot_idx % PAGE_SIZE;
+        const int64_t nope_base    = block_idx * block_stride + block_offset * KV_LORA;
+        const int64_t rope_base    =
+            block_idx * block_stride + (int64_t)PAGE_SIZE * KV_LORA + block_offset * PE_DIM;
+
+        // nope: direct static quant.
+        const scalar_t* kv_c_row = kv_c + token_idx * kv_c_stride;
+        const float x = static_cast<float>(kv_c_row[d]);
+        kv_cache[nope_base + d] = opus::cast<cache_t>(x * inv_kscale);
+
+        if(d < PE_DIM)
+        {
+            const scalar_t* k_pe_row = k_pe + token_idx * k_pe_stride;
+            const float roped = rope_pe(k_pe_row);
+            kv_cache[rope_base + d] = opus::cast<cache_t>(roped * inv_kscale);
+        }
+    }
+}
+
   template <typename scalar_t, typename cache_t, typename query_t, bool IS_NEOX, bool is_nope_first>
   inline __device__ void rotary_embedding_kernel(
       const int64_t *__restrict__ positions,      // [batch_size, seq_len] or
@@ -3996,11 +4127,109 @@ void fused_qk_rope_concat_and_cache_mla(
     }
   }
   else {
-    AITER_CHECK(false, 
-                "Unsupported tensor dimensions: kv_c.dim()=", kv_c.dim(), 
+    AITER_CHECK(false,
+                "Unsupported tensor dimensions: kv_c.dim()=", kv_c.dim(),
                 ", k_pe.dim()=", k_pe.dim(),
                 ". Expected either decode (dim=2) or prefill with GQA (dim=3).");
   }
+}
+
+// ============================================================================
+// DeepSeek V3.1 MLA: fused QK RoPE + static FP8 quant + segmented paged KV
+// cache write (no RMSNorm). See kernel comment for layout.
+// ============================================================================
+void fused_qk_rope_concat_and_cache_mla_seg(
+    aiter_tensor_t& q_nope,       // [T, H, kv_lora_rank]
+    aiter_tensor_t& q_pe,         // [T, H, pe_dim]
+    aiter_tensor_t& kv_c,         // [T, kv_lora_rank]
+    aiter_tensor_t& k_pe,         // [T, pe_dim]
+    aiter_tensor_t& kv_cache,     // [num_blocks, page_size*kv_lora + page_size*pe] flat
+    aiter_tensor_t& q_out,        // [T, H, q_out_dim] (>= kv_lora+pe; tail untouched)
+    aiter_tensor_t& slot_mapping, // [T]
+    aiter_tensor_t& k_scale,      // [1] fp32
+    aiter_tensor_t& q_scale,      // [1] fp32
+    aiter_tensor_t& positions,    // [T]
+    aiter_tensor_t& cos_cache,    // [max_pos, pe_dim/2]
+    aiter_tensor_t& sin_cache,    // [max_pos, pe_dim/2]
+    bool is_neox)
+{
+    constexpr int KV_LORA   = 512;
+    constexpr int PE_DIM    = 64;
+    constexpr int PAGE_SIZE = 64;
+
+    const int num_tokens = slot_mapping.size(0);
+    const int num_heads  = q_nope.size(1);
+
+    AITER_CHECK(kv_c.size(-1) == KV_LORA, "kv_c last dim must be ", KV_LORA);
+    AITER_CHECK(q_nope.size(-1) == KV_LORA, "q_nope last dim must be ", KV_LORA);
+    AITER_CHECK(q_pe.size(-1) == PE_DIM && k_pe.size(-1) == PE_DIM,
+                "q_pe/k_pe last dim must be ", PE_DIM);
+    AITER_CHECK(q_out.size(-1) >= KV_LORA + PE_DIM,
+                "q_out last dim must be >= ", KV_LORA + PE_DIM);
+    AITER_CHECK(cos_cache.size(-1) == PE_DIM / 2 && sin_cache.size(-1) == PE_DIM / 2,
+                "cos/sin cache last dim must be ", PE_DIM / 2);
+    AITER_CHECK(q_out.dtype() == AITER_DTYPE_fp8, "q_out must be fp8");
+    AITER_CHECK(kv_cache.dtype() == AITER_DTYPE_fp8, "kv_cache must be fp8");
+    AITER_CHECK(q_scale.dtype() == AITER_DTYPE_fp32 && k_scale.dtype() == AITER_DTYPE_fp32,
+                "q_scale/k_scale must be fp32");
+    AITER_CHECK(kv_c.stride(-1) == 1 && k_pe.stride(-1) == 1,
+                "kv_c/k_pe must be contiguous in last dim");
+
+    const int64_t q_nope_stride_0 = q_nope.stride(0);
+    const int64_t q_nope_stride_1 = q_nope.stride(1);
+    const int64_t q_pe_stride_0   = q_pe.stride(0);
+    const int64_t q_pe_stride_1   = q_pe.stride(1);
+    const int64_t q_out_stride_0  = q_out.stride(0);
+    const int64_t q_out_stride_1  = q_out.stride(1);
+    const int64_t kv_c_stride     = kv_c.stride(0);
+    const int64_t k_pe_stride     = k_pe.stride(0);
+    const int64_t cos_stride0     = cos_cache.stride(0);
+    const int64_t sin_stride0     = sin_cache.stride(0);
+    const int64_t block_stride    = kv_cache.stride(0);
+
+    HipDeviceGuard device_guard(kv_c.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    dim3 grid((unsigned)(num_tokens * num_heads));
+    dim3 block(KV_LORA);
+
+#define LAUNCH_MLA_NORM_ROPE(SCALAR_T, NEOX)                                              \
+    aiter::fused_qk_rope_concat_and_cache_mla_seg_kernel<SCALAR_T, opus::fp8_t, KV_LORA,  \
+                                                         PE_DIM, PAGE_SIZE, NEOX>         \
+        <<<grid, block, 0, stream>>>(                                                     \
+            reinterpret_cast<SCALAR_T*>(q_nope.data_ptr()),                               \
+            reinterpret_cast<SCALAR_T*>(q_pe.data_ptr()),                                 \
+            reinterpret_cast<SCALAR_T*>(kv_c.data_ptr()),                                 \
+            reinterpret_cast<SCALAR_T*>(k_pe.data_ptr()),                                 \
+            reinterpret_cast<opus::fp8_t*>(kv_cache.data_ptr()),                          \
+            reinterpret_cast<opus::fp8_t*>(q_out.data_ptr()),                             \
+            reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                          \
+            reinterpret_cast<int64_t*>(positions.data_ptr()),                             \
+            reinterpret_cast<SCALAR_T*>(cos_cache.data_ptr()),                            \
+            reinterpret_cast<SCALAR_T*>(sin_cache.data_ptr()),                            \
+            reinterpret_cast<float*>(q_scale.data_ptr()),                                 \
+            reinterpret_cast<float*>(k_scale.data_ptr()),                                 \
+            num_heads,                                                                    \
+            q_nope_stride_0, q_nope_stride_1,                                             \
+            q_pe_stride_0, q_pe_stride_1,                                                 \
+            q_out_stride_0, q_out_stride_1,                                               \
+            kv_c_stride, k_pe_stride,                                                     \
+            cos_stride0, sin_stride0,                                                     \
+            block_stride);
+
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        q_nope.dtype(), "fused_qk_rope_concat_and_cache_mla_seg", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
+            if(is_neox)
+            {
+                LAUNCH_MLA_NORM_ROPE(input_dtype, true);
+            }
+            else
+            {
+                LAUNCH_MLA_NORM_ROPE(input_dtype, false);
+            }
+        });
+#undef LAUNCH_MLA_NORM_ROPE
 }
 
 } // namespace aiter
