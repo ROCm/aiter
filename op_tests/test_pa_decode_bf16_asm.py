@@ -7,8 +7,8 @@ Ops layer:  aiter.pa_decode_bf16_asm  (wraps SP3 PA_DECODE_D64_1TG_4W_PS)
 Kernel properties (see the reference host file sched2/pa_ps.cpp):
   * head_dim=64, page_size=256, gqa=8.
   * FP8 Q **and** FP8 paged KV cache; bf16 output.
-  * per-tensor scalar dequant scales for Q/K/V (softmax scale folded into
-    key_scale by the wrapper).
+  * per-tensor scalar dequant scales for Q/K/V (softmax scale passed
+    separately as a by-value kernarg, no longer folded into key_scale).
   * persistent / split-KV; GPT-OSS style attention sink (no-op here).
 
 Style mirrors op_tests/test_pa_ps.py: a torch host reference is compared against

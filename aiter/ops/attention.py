@@ -403,8 +403,8 @@ def pa_ps_fwd_asm(
 # Memory-allocation policy: all GPU tensors are allocated on the Python side;
 # the C++ entry point performs only pointer + stride bookkeeping and the kernel
 # launch (no torch dependency).  The public wrapper `pa_decode_bf16_asm` below
-# handles output/scale/sink allocation and folds the attention softmax scale
-# into key_scale (matching the reference host file sched2/pa_ps.cpp).
+# handles output/scale/sink allocation and passes the attention softmax scale
+# as a separate by-value kernarg (matching the reference host file sched2/pa_ps.cpp).
 # ---------------------------------------------------------------------------
 @compile_ops(
     "module_pa_decode_bf16_asm",
@@ -417,6 +417,7 @@ def _pa_decode_bf16_asm(
     V: torch.Tensor,
     kv_indices: torch.Tensor,
     context_lens: torch.Tensor,
+    softmax_scale: float,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
@@ -462,8 +463,8 @@ def pa_decode_bf16_asm(
       * `Q`/`K`/`V` are FP8; `out` is bf16 with Q's logical shape.
       * `query_scale`/`key_scale`/`value_scale` are the per-tensor FP8 dequant
         scales; the attention `softmax_scale` (typically 1/sqrt(head_dim)) is
-        folded into `key_scale` before launch (the kernel forms
-        scl_log2e = query_scale * key_scale * log2e).
+        passed as a separate by-value kernarg (the kernel forms
+        scl_log2e = query_scale * key_scale * softmax_scale * log2e).
       * `sink` (optional) holds per-Q-head fp32 logits in the kernel's
         pre-scale raw-logit domain, shape [kv_head_num * gqa].  The kernel
         always reads this slot, so when `sink` is None a -inf buffer is
@@ -477,10 +478,9 @@ def pa_decode_bf16_asm(
         out = torch.empty(Q.shape, dtype=torch.bfloat16, device=device)
 
     q_scale = torch.tensor([query_scale], dtype=torch.float32, device=device)
-    # Fold the attention softmax scale into key_scale (matches pa_ps.cpp).
-    k_scale = torch.tensor(
-        [key_scale * softmax_scale], dtype=torch.float32, device=device
-    )
+    # softmax_scale is a separate by-value kernarg now (NOT folded into key_scale);
+    # the kernel forms scl_log2e = query_scale * key_scale * softmax_scale * log2e.
+    k_scale = torch.tensor([key_scale], dtype=torch.float32, device=device)
     v_scale = torch.tensor([value_scale], dtype=torch.float32, device=device)
 
     if sink is None:
@@ -498,6 +498,7 @@ def pa_decode_bf16_asm(
         V,
         kv_indices,
         context_lens,
+        softmax_scale,
         q_scale,
         k_scale,
         v_scale,
