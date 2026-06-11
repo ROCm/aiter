@@ -114,6 +114,9 @@ class RotaryEmbedding(nn.Module):
         self.sin_cache: torch.Tensor
         self.register_buffer("cos_cache", cos, persistent=False)
         self.register_buffer("sin_cache", sin, persistent=False)
+        cache = torch.cat((cos, sin), dim=-1)
+        self.cos_sin_cache: torch.Tensor
+        self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
