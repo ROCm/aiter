@@ -507,6 +507,46 @@ def test_pa_decode(
         num_cu,
         device,
     )
+
+    # --- PA_DECODE kernel-invariant validation (varlen page-fault guard) ---
+    # The SP3 kernel indexes kv_indices ABSOLUTELY by per-work kv_start..kv_end
+    # (clamped to kv_end-1) and reads K/V at the physical page it finds there.
+    # If any of these host-side invariants is violated, the GPU faults inside
+    # K_TDM_lookup_issue (the s_load_dword on kv_indices) or the K/V TDM load.
+    _nkv = kv_indices.numel()
+    _num_work = work_info.numel() // 8
+    assert int(kv_indptr[-1].item()) == _nkv, (
+        f"kv_indptr[-1]={int(kv_indptr[-1])} != kv_indices.numel()={_nkv}"
+    )
+    assert int(kv_indices.max().item()) < K.shape[0], (
+        f"max phys page {int(kv_indices.max())} >= K pages {K.shape[0]}"
+    )
+    assert int(work_indptr[-1].item()) == _num_work, (
+        f"work_indptr[-1]={int(work_indptr[-1])} != num_work={_num_work}"
+    )
+    for _b in range(batch):
+        _pages = (int(seq_lens_kv[_b].item()) + page_size - 1) // page_size
+        assert int(kv_indptr[_b + 1] - kv_indptr[_b]) == _pages, (
+            f"batch {_b}: kv_indptr stride "
+            f"{int(kv_indptr[_b + 1] - kv_indptr[_b])} != ceil(seq/page)={_pages}"
+        )
+    # Per-work kv_start/kv_end bounds = the exact values the faulting BT load uses.
+    _wi = work_info.view(_num_work, 8)
+    _ks, _ke = _wi[:, 4], _wi[:, 5]
+    assert int(_ks.min()) >= 0 and int(_ke.max()) <= _nkv, (
+        f"work kv_start/kv_end outside [0,{_nkv}]: "
+        f"ks_min={int(_ks.min())} ke_max={int(_ke.max())}"
+    )
+    assert int((_ke - _ks).min()) >= 1, (
+        f"a work has kv_end <= kv_start (min span {int((_ke - _ks).min())})"
+    )
+    print(
+        f"[pa_decode validate] num_cu={work_indptr.numel() - 1} "
+        f"num_work={_num_work} nkv={_nkv} K_pages={K.shape[0]} "
+        f"max_phys={int(kv_indices.max())} kv_end_max={int(_ke.max())}"
+    )
+    # --- end validation ---
+
     # -inf lse / 0 o so any split the kernel leaves unwritten is inert in reduce.
     split_o = torch.zeros(
         (split_rows, 1, q_head_num, head_dim), dtype=dtypes.fp32, device=device
