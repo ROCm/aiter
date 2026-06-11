@@ -463,6 +463,7 @@ def test_pa_decode(
     kv_indices = torch.cat(
         [block_tables[i, : int(actual_blocks[i].item())] for i in range(batch)]
     ).to(torch.int32)
+    kv_indices = torch.zeros(kv_indices.shape())
     qo_indptr = torch.arange(
         0, (batch + 1) * qlen_with_mtp, qlen_with_mtp, dtype=torch.int32, device=device
     )
@@ -564,6 +565,7 @@ def test_pa_decode(
     else:
         sink = torch.full((q_head_num,), -1.0e30, dtype=dtypes.fp32, device=device)
 
+    print("before run --------------------------------", kv_indices)
     out, us = run_pa_stage(
         Q,
         K,
@@ -585,6 +587,8 @@ def test_pa_decode(
         sink,
     )
     torch.cuda.synchronize()
+    print("after run --------------------------------", kv_indices)
+
     out = cpu_reduce(
         out,
         split_o,
