@@ -28,8 +28,6 @@ void generate_reduce_info(int32_t num_work,
     for(int32_t i = 0; i < num_work; ++i)
     {
         auto work = work_info[i];
-        if(work.partial_o_loc == -1)
-            continue;
         std::tie(q_head_start, q_head_end) = unpack_dword(work.q_head_range);
 
         auto final_loc   = std::vector<int32_t>({work.qo_start, work.qo_end});
