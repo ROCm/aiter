@@ -8,7 +8,7 @@
 #include "aiter_tensor.h"
 #include "aiter_stream.h"
 #include "aiter_dispatch.h"
-#include "fp4_quant_utils.h"
+#include "mx_quant_utils.h"
 #include <hip/hip_bf16.h>
 #include "rocprim/rocprim.hpp"
 #include <hipcub/hipcub.hpp>
@@ -92,7 +92,15 @@ __global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d
                 opus::fp32x2_t a    = {ax0, ax1};
                 opus::fp32x2_t b    = {y0, y1};
                 opus::fp32x2_t c;
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
                 asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
+#else
+                // RDNA archs lack `v_pk_mul_f32`; portable fallback.
+                c.x = a.x * b.x;
+                c.y = a.y * b.y;
+#endif
                 r[j]     = opus::cast<DTYPE_O>(c.x);
                 r[j + 1] = opus::cast<DTYPE_O>(c.y);
             }
@@ -261,7 +269,15 @@ __global__ void act_and_mul_bias_kernel(DTYPE_O* __restrict__ out,              
                 opus::fp32x2_t a = {ax0, ax1};
                 opus::fp32x2_t b = {y0, y1};
                 opus::fp32x2_t c;
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
                 asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
+#else
+                // RDNA archs lack `v_pk_mul_f32`; portable fallback.
+                c.x = a.x * b.x;
+                c.y = a.y * b.y;
+#endif
                 r[j]     = opus::cast<DTYPE_O>(c.x);
                 r[j + 1] = opus::cast<DTYPE_O>(c.y);
             }
@@ -430,10 +446,19 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
                 float2 scale_vals = {scale, scale};
                 float2 result;
 
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
                 asm volatile("v_pk_mul_f32 %0, %1, %2\n\t"
                              "v_pk_mul_f32 %0, %0, %3"
                              : "=v"(result)
                              : "v"(act_vals), "v"(y_vals), "v"(scale_vals));
+#else
+                // RDNA archs lack `v_pk_mul_f32`; portable fallback emits two
+                // pairs of `v_mul_f32`.
+                result.x = act_vals.x * y_vals.x * scale_vals.x;
+                result.y = act_vals.y * y_vals.y * scale_vals.y;
+#endif
 
                 r[j]     = opus::cast<DTYPE_O>(result.x);
                 r[j + 1] = opus::cast<DTYPE_O>(result.y);
@@ -496,8 +521,7 @@ __global__ void act_and_mul_quant_kernel(
     auto buffer_out = opus::make_gmem<DTYPE_O_STORE>(out_base, oob_o * sizeof(DTYPE_O_STORE));
 
     constexpr float inverted_DTYPE_MAX =
-        is_fp4 ? 0.25f
-               : (1.f / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        (1.f / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
     const int reduce_thread_size = group_size / VEC_SIZE_I;
     const int tid                = threadIdx.x;
@@ -540,7 +564,15 @@ __global__ void act_and_mul_quant_kernel(
             opus::fp32x2_t a      = {act_x0, act_x1};
             opus::fp32x2_t b      = {y0, y1};
             opus::fp32x2_t c;
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
             asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
+#else
+            // RDNA archs lack `v_pk_mul_f32`; portable fallback.
+            c.x = a.x * b.x;
+            c.y = a.y * b.y;
+#endif
             result_float[j]     = c.x;
             result_float[j + 1] = c.y;
         }
@@ -572,10 +604,9 @@ __global__ void act_and_mul_quant_kernel(
 
     float max_val = multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
 
-    if constexpr(is_fp4)
-        max_val = aiter::fp4_f32_to_e8m0_scale(max_val);
-
-    float quant_scale = max_val * inverted_DTYPE_MAX;
+    float quant_scale = is_fp4
+        ? aiter::fp4_f32_to_e8m0_scale(max_val)
+        : max_val * inverted_DTYPE_MAX;
 
     if(tid % reduce_thread_size == 0 && row_offset < d)
     {

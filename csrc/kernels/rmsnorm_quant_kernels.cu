@@ -5,7 +5,7 @@
 #include "py_itfs_common.h"
 #include "aiter_opus_plus.h"
 #include "dispatch_utils.h"
-#include "fp4_quant_utils.h"
+#include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
@@ -51,9 +51,7 @@ __global__ void add_rmsnorm_quant_kernel(
         static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
         static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
         constexpr float inverted_DTYPE_MAX =
-            std::is_same_v<DTYPE_O, opus::fp4_t>
-                ? 0.25
-                : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+            (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
         DTYPE_I* input_ptr = input + idx * static_cast<int64_t>(input_stride);
         DTYPE_O_STORE* out_ptr;
         const int oob_i = (n + ooba_i - 1) / ooba_i * ooba_i;
@@ -144,7 +142,18 @@ __global__ void add_rmsnorm_quant_kernel(
             vec2_f* thread_data_float2 = reinterpret_cast<vec2_f*>(&thread_data_float);
             for(int i = 0; i < thread_data_size / 2; i++)
             {
-                asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(rcp));
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
+                asm volatile("v_pk_mul_f32 %0, %1, %2"
+                             : "=v"(thread_data_float2[i])
+                             : "v"(thread_data_float2[i]), "v"(rcp));
+#else
+                // RDNA archs lack `v_pk_mul_f32`; fall back to portable
+                // element-wise multiplies (compiler emits two v_mul_f32).
+                thread_data_float2[i][0] *= rcp[0];
+                thread_data_float2[i][1] *= rcp[1];
+#endif
             }
             
             float* thread_data_weight2 = reinterpret_cast<float*>(&thread_data_weight);
@@ -171,7 +180,18 @@ __global__ void add_rmsnorm_quant_kernel(
                 //         : "v"(thread_data_weight2[i])
                 //     );
                 // }
-                asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(thread_data_weight_float2));
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
+                asm volatile("v_pk_mul_f32 %0, %1, %2"
+                             : "=v"(thread_data_float2[i])
+                             : "v"(thread_data_float2[i]),
+                               "v"(thread_data_weight_float2));
+#else
+                // RDNA archs lack `v_pk_mul_f32`; portable fallback.
+                thread_data_float2[i][0] *= thread_data_weight_float2[0];
+                thread_data_float2[i][1] *= thread_data_weight_float2[1];
+#endif
             }
 
             if constexpr(FUSE_QUANT)
@@ -209,11 +229,9 @@ __global__ void add_rmsnorm_quant_kernel(
                 {
                     int reduce_thread_size = group_size / thread_data_size;
                     float max= multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
-                    if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
-                    {
-                        max = aiter::fp4_f32_to_e8m0_scale(max);
-                    }
-                    quant_scale = max * inverted_DTYPE_MAX;
+                    quant_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
+                        ? aiter::fp4_f32_to_e8m0_scale(max)
+                        : max * inverted_DTYPE_MAX;
                     if(threadIdx.x % reduce_thread_size == 0 && (threadIdx.x * thread_data_size) < n)
                     {
                         int64_t x = idx;
