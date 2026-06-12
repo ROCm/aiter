@@ -411,10 +411,13 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    # Backend opt-in via shuffle_kind tag on w1: tells get_2stage_cfgs to
-    # prefer CSV rows tagged with this backend (e.g., "mxfp4_moe") over the
-    # default untagged rows. None / missing attribute → default CSV lookup.
-    shuffle_kind = getattr(w1, "shuffle_kind", None)
+    # Backend opt-in via the is_guinterleave tag on w1: a guinterleave-preshuffled
+    # weight selects the mxfp4 backend, telling get_2stage_cfgs to prefer the
+    # tagged CSV rows over the default untagged rows. Missing / False → default CSV
+    # lookup. NOTE: is_guinterleave is, in aiter, shared with the a16w4 (int4)
+    # shuffle; this dispatch treats any guinterleave weight as mxfp4, so callers
+    # must not tag a16w4 weights with is_guinterleave.
+    is_guinterleave = getattr(w1, "is_guinterleave", False)
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -433,7 +436,7 @@ def fused_moe_(
         intermediate_pad,
         isShuffled,
         gate_mode,
-        shuffle_kind=shuffle_kind,
+        is_guinterleave=is_guinterleave,
         is_ep=expert_mask is not None,
     )
 
@@ -455,12 +458,11 @@ def fused_moe_(
         not metadata.flat or get_gfx() == "gfx950"
     ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
 
-    _w1_kind = getattr(w1, "shuffle_kind", None)
     _csv_is_mxfp4 = metadata.pipeline is not None
-    if (_w1_kind == "mxfp4_moe") != _csv_is_mxfp4:
+    if is_guinterleave != _csv_is_mxfp4:
         raise TypeError(
             f"fused_moe: weight/CSV backend mismatch. "
-            f"w1.shuffle_kind={_w1_kind!r}, "
+            f"w1.is_guinterleave={is_guinterleave!r}, "
             f"csv_pipeline={metadata.pipeline!r}, "
             f"M={M}, model_dim={model_dim}, inter_dim={inter_dim}, "
             f"E={E}, topk={topk}, dtype={dtype}, "
@@ -790,8 +792,8 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 
 cfg_2stages = None
-# Per-tag tuned-cfg cache, indexed by `_tag` value (e.g., "mxfp4_moe").
-# Populated lazily when get_2stage_cfgs is called with shuffle_kind set.
+# Per-tag tuned-cfg cache, indexed by `_tag` value (e.g., "mxfp4_guinterleave").
+# Populated lazily when get_2stage_cfgs is called with is_guinterleave=True.
 cfg_2stages_tagged: dict = {}
 # fmt: off
 fused_moe_1stage_dict = {
@@ -1367,17 +1369,15 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
-    shuffle_kind=None,
+    is_guinterleave=False,
     is_ep=False,
 ):
     """
-    `shuffle_kind`: if set (e.g., "mxfp4_moe"), prefer CSV rows tagged with
-    this backend (`_tag == shuffle_kind`) over the default untagged rows;
-    fall back to untagged on miss. None → current behaviour (untagged only).
-    Used to let a model-specific backend (mxfp4_moe et al.) ship its own
-    tuned rows alongside the existing default tuning without dedup conflict.
+    `is_guinterleave`: when True, prefer CSV rows tagged "mxfp4_guinterleave"
+    (`_tag == "mxfp4_guinterleave"`) over the default untagged rows.
     """
     gate_mode = GateMode(gate_mode)
+    tag = "mxfp4_guinterleave" if is_guinterleave else None
     _INDEX_COLS = [
         "cu_num",
         "token",
@@ -1397,8 +1397,8 @@ def get_2stage_cfgs(
     def get_cfg_2stages(tune_file, tag=""):
         """Build (primary, fallback) lookup dicts for one `_tag` value.
         Default ``tag=""`` returns the untagged rows (legacy behaviour);
-        passing e.g. ``tag="mxfp4_moe"`` returns the rows the mxfp4_moe
-        backend ships."""
+        passing e.g. ``tag="mxfp4_guinterleave"`` returns the rows the mxfp4
+        guinterleave backend ships."""
         import pandas as pd
 
         df = pd.read_csv(tune_file)
@@ -1473,9 +1473,9 @@ def get_2stage_cfgs(
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
-    # Lazy-load per-tag tuned dicts (e.g., shuffle_kind="mxfp4_moe").
-    if shuffle_kind and shuffle_kind not in cfg_2stages_tagged:
-        cfg_2stages_tagged[shuffle_kind] = get_cfg_2stages(tune_file, tag=shuffle_kind)
+    # Lazy-load per-tag tuned dicts (e.g., tag="mxfp4_guinterleave").
+    if tag and tag not in cfg_2stages_tagged:
+        cfg_2stages_tagged[tag] = get_cfg_2stages(tune_file, tag=tag)
     cu_num = get_cu_num()
     # EP convention: callers append one always-masked fake-expert slot to
     # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
@@ -1554,11 +1554,9 @@ def get_2stage_cfgs(
         return result
 
     # Backend-tagged rows (if requested) win over the default untagged rows.
-    # E.g., w1.shuffle_kind="mxfp4_moe" makes us look up CSV rows tagged
-    # "mxfp4_moe" first; only on miss do we fall back to the untagged set.
     cfg = None
-    if shuffle_kind:
-        cfg = _lookup_cfg(cfg_2stages_tagged.get(shuffle_kind))
+    if tag:
+        cfg = _lookup_cfg(cfg_2stages_tagged.get(tag))
     if cfg is None:
         cfg = _lookup_cfg(cfg_2stages)
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
