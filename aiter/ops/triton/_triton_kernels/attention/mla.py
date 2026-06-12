@@ -646,7 +646,19 @@ def _mla_decode_fwd_kernel(
     tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
 
 
-@triton.jit
+_mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
+    "_mla_decode_fwd_reduce_kernel",
+    [
+        "num_query_heads",
+        "TILE_SIZE",
+        "KV_LORA_RANK",
+        "NUM_SEGMENTS_PER_SEQ",
+        "ALL_DECODE",
+    ],
+)
+
+
+@triton.jit(repr=_mla_decode_fwd_reduce_kernel_repr)
 def _mla_decode_fwd_reduce_kernel(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     segm_output_ptr,
@@ -661,6 +673,7 @@ def _mla_decode_fwd_reduce_kernel(
     output_stride_1: tl.int64,  # int, should be equal to head_size
     block_tables_stride: tl.int64,  # int
     num_tokens_per_seq: tl.int32,
+    total_num_tokens: tl.int32,
     TILE_SIZE: tl.constexpr,  # int
     KV_LORA_RANK: tl.constexpr,  # int
     query_start_len_ptr,  # [num_seqs+1]
@@ -673,10 +686,6 @@ def _mla_decode_fwd_reduce_kernel(
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
 
-    out_scale = None
-    if out_scale_ptr is not None:
-        out_scale = 1 / tl.load(out_scale_ptr)
-
     if ALL_DECODE:
         seq_idx = query_token_idx
     else:
@@ -684,6 +693,10 @@ def _mla_decode_fwd_reduce_kernel(
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
+
+    out_scale = None
+    if out_scale_ptr is not None:
+        out_scale = 1 / tl.load(out_scale_ptr)
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ

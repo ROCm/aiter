@@ -10,7 +10,9 @@ from aiter.ops.triton._triton_kernels.attention.mla import (
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_decode_fwd_kernel as triton_mla_decode_fwd_kernel,
 )
-from aiter.ops.triton._triton_kernels.attention.mla import _mla_decode_fwd_reduce_kernel
+from aiter.ops.triton._triton_kernels.attention.mla import (
+    _mla_decode_fwd_reduce_kernel as triton_mla_decode_fwd_reduce_kernel,
+)
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
@@ -22,10 +24,14 @@ try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
         _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
     )
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+        _mla_decode_fwd_reduce_kernel as gluon_mla_decode_fwd_reduce_kernel,
+    )
 except:  # noqa: E722
     gluon_mla_prefill_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel = None
+    gluon_mla_decode_fwd_reduce_kernel = None
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -63,22 +69,27 @@ def select_3d_config(
     kv_dtype,
     shuffled_kv_cache,
 ):
+    attn_num_warps = 2
     reduce_num_warps = 2
-    attn_warps = 2
-    waves_per_eu = 1
+    attn_waves_per_eu = 1
+    reduce_waves_per_eu = 2
     num_segments = 0
     TILE_SIZE = block_size
     if IS_DEVICE_ARCH_GFX12:
-        attn_warps = 2
-        waves_per_eu = 1
+        # If we cannot infer max_seqlen_k during graph capture
+        maybe_guess_max_seqlen_k = 128000 if max_seqlen_k == 0 else max_seqlen_k
+        attn_num_warps = 2
+        reduce_num_warps = 4
+        attn_waves_per_eu = 1
+        reduce_waves_per_eu = 1
         if shuffled_kv_cache:
             if kv_dtype == torch.uint8:
                 assert (
                     block_size == 128
                 ), "Only block_size == 128 is supported for FP4 KV cache"
 
-        occ = waves_per_eu * 4 // attn_warps
-        MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
+        occ = attn_waves_per_eu * 4 // attn_num_warps
+        MAX_SEGMENTS = max(1, math.ceil(maybe_guess_max_seqlen_k / TILE_SIZE))
         num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
         num_segments = min(MAX_SEGMENTS, num_segments)
         num_segments = triton.next_power_of_2(num_segments)
@@ -98,15 +109,15 @@ def select_3d_config(
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
-        "num_warps": attn_warps,
-        "waves_per_eu": waves_per_eu,
+        "num_warps": attn_num_warps,
+        "waves_per_eu": attn_waves_per_eu,
         "num_stages": 2 if DEVICE_ARCH in ("gfx1250", "gfx950") else 1,
     }
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": reduce_num_warps,
-        "waves_per_eu": 2,
+        "waves_per_eu": reduce_waves_per_eu,
         "num_stages": 1,
     }
     return attn_config, reduce_config
@@ -480,7 +491,15 @@ def mla_decode_fwd(
     elif skip_reduce:
         return segm_output, segm_max, segm_expsum
 
-    _mla_decode_fwd_reduce_kernel[(total_num_tokens, num_query_heads)](
+    # Temporarily disable gluon reduce kernel, optimize later
+    # if IS_DEVICE_ARCH_GFX12:
+    #     _reduce_kernel = gluon_mla_decode_fwd_reduce_kernel
+    # else:
+    #     _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
+
+    _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
+
+    _reduce_kernel[(total_num_tokens, num_query_heads)](
         output_ptr=out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
@@ -493,9 +512,11 @@ def mla_decode_fwd(
         output_stride_1=out.stride(1),
         block_tables_stride=block_tables.stride(0),
         num_tokens_per_seq=num_tokens_per_seq,
+        total_num_tokens=total_num_tokens,
         KV_LORA_RANK=kv_lora_rank,
         query_start_len_ptr=cu_seqlens_q,
         BLOCK_Q=BLOCK_Q,
+        ALL_DECODE=ALL_DECODE,
         **reduce_config,
     )
     return out
