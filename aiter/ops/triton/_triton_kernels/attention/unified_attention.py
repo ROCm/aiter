@@ -401,7 +401,7 @@ def kernel_unified_attention_2d(
                 + offs_d[None, :] * stride_v_cache_3
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
-            v_mask = dim_mask[None, :] & tile_mask[:, None]
+            v_mask = (offs_d < stride_v_cache_2)[None, :] & tile_mask[:, None]
 
             k_offset = (
                 physical_block_idx[None, :] * stride_k_cache_0
@@ -540,7 +540,9 @@ def kernel_unified_attention_2d(
     tl.store(
         output_ptr + output_offset,
         acc,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        mask=(offs_d < output_stride_1)[None, :]
+        & query_mask_0[:, None]
+        & query_mask_1[:, None],
     )
 
 
@@ -807,7 +809,7 @@ def kernel_unified_attention_3d(
                 + offs_d[None, :] * stride_v_cache_3
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
-            v_mask = dim_mask[None, :] & tile_mask[:, None]
+            v_mask = (offs_d < stride_v_cache_2)[None, :] & tile_mask[:, None]
 
             k_offset = (
                 physical_block_idx[None, :] * stride_k_cache_0
@@ -1061,5 +1063,7 @@ def reduce_segments(
         + tl.arange(0, HEAD_SIZE_PADDED)
     )
     tl.store(
-        output_ptr + output_offset, acc.to(output_ptr.type.element_ty), mask=dim_mask
+        output_ptr + output_offset,
+        acc.to(output_ptr.type.element_ty),
+        mask=tl.arange(0, HEAD_SIZE_PADDED) < output_stride_1,
     )
