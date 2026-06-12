@@ -1297,7 +1297,13 @@ def _mxfp4_moe_run(
     )
     BM_MIN = 64
     inter_scale_cols = D_INTER // 32
-    inter_scale_bytes = max_sorted * (1024 // BM_MIN) * 4
+    # The legacy term (1024//BM_MIN)*4 == 64 is D_INTER-independent and only happens
+    # to cover D_INTER<=2048 (it equals the per-row scale size D_INTER/32 exactly at
+    # D_INTER=2048, e.g. dsv3_a -> no slack; it is undersized for D_INTER>2048). Take
+    # the max with 2x the actual per-row scale so large-INTER shapes keep headroom
+    # (guards an OOB scale write); small-INTER shapes (Kimi/DSR/minimax/qwen) are
+    # unchanged since (1024//BM_MIN)*4 already dominates there.
+    inter_scale_bytes = max_sorted * max((1024 // BM_MIN) * 4, inter_scale_cols * 2)
     inter_scale_rows = (inter_scale_bytes + inter_scale_cols - 1) // inter_scale_cols
     inter_scale_rows = (inter_scale_rows + 31) // 32 * 32
     inter_sorted_shuffled_scale = torch.empty(
