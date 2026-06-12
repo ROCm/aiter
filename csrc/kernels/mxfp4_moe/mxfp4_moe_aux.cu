@@ -185,6 +185,16 @@ void mxfp4_moe_sort_kernel(
                 if (MB == 16) { LAUNCH_IQ_ZI(257, 9, 16, 7168); return; }
             }
         }
+        if (TOPK == 8 && D_HIDDEN == 7168) {  // dsv3_a / kimik2_a
+            if (NE == 32)  { if (MB == 16) { LAUNCH_IQ_ZI(32,  8, 16, 7168); return; } }
+            if (NE == 384) { if (MB == 16) { LAUNCH_IQ_ZI(384, 8, 16, 7168); return; } }
+        }
+        if (TOPK == 8 && D_HIDDEN == 3072) {  // minimax
+            if (NE == 256) { if (MB == 16) { LAUNCH_IQ_ZI(256, 8, 16, 3072); return; } }
+        }
+        if (TOPK == 10 && D_HIDDEN == 4096) {  // qwen3.5 397b
+            if (NE == 512) { if (MB == 16) { LAUNCH_IQ_ZI(512, 10, 16, 4096); return; } }
+        }
         TORCH_CHECK(false,
             "mxfp4_moe_sort (inline_quant+zero_init): unsupported (NE=", NE,
             " TOPK=", TOPK, " D_HIDDEN=", D_HIDDEN, " MB=", MB, ")");
@@ -207,6 +217,16 @@ void mxfp4_moe_sort_kernel(
             if (NE == 257) {
                 if (MB == 16) { LAUNCH_IQ(257, 9, 16, 7168); return; }
             }
+        }
+        if (TOPK == 8 && D_HIDDEN == 7168) {  // dsv3_a / kimik2_a
+            if (NE == 32)  { if (MB == 16) { LAUNCH_IQ(32,  8, 16, 7168); return; } }
+            if (NE == 384) { if (MB == 16) { LAUNCH_IQ(384, 8, 16, 7168); return; } }
+        }
+        if (TOPK == 8 && D_HIDDEN == 3072) {  // minimax
+            if (NE == 256) { if (MB == 16) { LAUNCH_IQ(256, 8, 16, 3072); return; } }
+        }
+        if (TOPK == 10 && D_HIDDEN == 4096) {  // qwen3.5 397b
+            if (NE == 512) { if (MB == 16) { LAUNCH_IQ(512, 10, 16, 4096); return; } }
         }
         TORCH_CHECK(false,
             "mxfp4_moe_sort (inline_quant): unsupported (NE=", NE,

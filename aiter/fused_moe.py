@@ -420,6 +420,26 @@ def fused_moe_(
 
     _w1_kind = getattr(w1, "shuffle_kind", None)
     _csv_is_mxfp4 = metadata.pipeline is not None
+    if _w1_kind == "mxfp4_moe" and not _csv_is_mxfp4:
+        # No tuned CSV pipeline for this mxfp4 shape (e.g. non-Kimi NE/TOPK that the
+        # threestage sort can't instantiate). Build a default inline_quant + atomic
+        # BM32 port pipeline: _mxfp4_moe_run falls back to the generic moe_sorting
+        # when the threestage sort can't handle (NE, TOPK), and inline_quant avoids
+        # the H-locked a-scale kernel.
+        _kn1 = f"mxfp4_moe_g1_a4w4_NE{E}_H{model_dim}_E{inter_dim}_BM16_INLINEQUANT"
+        _kn2 = (
+            f"mxfp4_moe_g2_a4w4_NE{E}_H{model_dim}_E{inter_dim}_TOPK{topk}_BM16_ATOMIC"
+        )
+        metadata = MOEMetadata(
+            stage1=None,
+            stage2=None,
+            block_m=16,
+            ksplit=1,
+            pipeline=functools.partial(
+                _mxfp4_moe_run, kernelName1=_kn1, kernelName2=_kn2
+            ),
+        )
+        _csv_is_mxfp4 = True
     if (_w1_kind == "mxfp4_moe") != _csv_is_mxfp4:
         raise TypeError(
             f"fused_moe: weight/CSV backend mismatch. "
@@ -1142,7 +1162,17 @@ def _mxfp4_moe_run(
     bf16_zero = atomic_output_buf if atomic else _empty_bf16(device)
 
     # -- Sort + (optional) quant ---------------------------------------
-    if prologue_name == "threestage":
+    # The sort uses the generic HIP moe_sorting for ALL shapes (runtime-parametrized
+    # for any NE/TOPK); its sorted_ids/sorted_expert_ids/sorted_weights/num_valid_ids
+    # map ~1:1 to the port's sorted_token_ids/sei/swt/cumsum (m_indices == sti). No
+    # specialized mxfp4_moe_sort, no fallback. The sole exception is the legacy
+    # non-inline Kimi/DSR path (BM32/128): a coupled HIP pipeline (threestage sort +
+    # mxfp4_moe_quant + sort_scales + reverse_sorted) moe_sorting can't replace, so
+    # it keeps mxfp4_moe_sort(prologue=1).
+    _threestage_ok = (
+        not inline_quant and NE in (257, 385) and topk == 9 and BM in (32, 128)
+    )
+    if _threestage_ok:
         aiter.mxfp4_moe_sort(
             topk_ids=topk_ids,
             topk_weight=topk_weight,
@@ -1173,7 +1203,17 @@ def _mxfp4_moe_run(
             D_HIDDEN=D_HIDDEN,
             MB=BM,
         )
-    else:  # inline_quant: no separate quant launch -- gemm1 does it
+    else:
+        # inline_quant: ALWAYS the specialized mxfp4_moe_sort (prologue=0) -- no
+        # generic moe_sorting, no fallback. gemm1 quantizes the activation itself;
+        # the sort fuses the bf16 atomic-output zero-init via bf16_zero_out. Add new
+        # (NE, TOPK, MB=16, D_HIDDEN) instantiations to the inline_quant blocks of
+        # csrc/kernels/mxfp4_moe/mxfp4_moe_aux.cu to support more shapes.
+        if not inline_quant:
+            raise NotImplementedError(
+                "flydsl mxfp4 port: non-inline (BM32/128) is Kimi/DSR threestage-only; "
+                f"got NE={NE} TOPK={topk} BM={BM} inline_quant=False"
+            )
         aiter.mxfp4_moe_sort(
             topk_ids=topk_ids,
             topk_weight=topk_weight,

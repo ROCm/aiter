@@ -305,7 +305,7 @@ def compile_gemm2_a4w4_port(
     # write-slot (tile kt+kStages, streamed in) never alias -- the read tile maps to
     # kt%3 and the streamed tile to (kt+2)%3, which differ for all kt. (gemm1 uses
     # the same kAStages=3 triple-buffer for its streaming non-128 path.)
-    _aStages = kStages if _K_TILES_TOTAL == kStages else 3
+    _aStages = kStages if _K_TILES_TOTAL <= kStages else 3
     # atomic / mxfp4 epilog reuses LDS for the cshuffle (BM*BN f32); nonatomic
     # bf16 writes direct, so only s_Aq (_aStages slots) is needed.
     _lds_bytes = (
@@ -806,16 +806,19 @@ def _gemm2_body(
             )
             _s_barrier_bare()
 
-    if const_expr(_K_TILES_TOTAL == kStages):
-        # -- KIMI/DSR fast path: K_TILES_TOTAL==2, fully unrolled, ALL tiles
-        #    preloaded by the kernel. Byte-for-byte identical to the original
-        #    K=512 port: load all B + scales upfront, then the unrolled 2-stage
-        #    K-loop (vmcnt 23 then 22) with no streaming A->LDS. -----------------
+    if const_expr(_K_TILES_TOTAL <= kStages):
+        # -- KIMI/DSR fast path: K_TILES_TOTAL <= 2 (D_INTER <= 512), fully
+        #    unrolled, ALL tiles preloaded by the kernel. Byte-for-byte identical
+        #    to the original K=512 port at K_TILES_TOTAL==2: load all B + scales
+        #    upfront, then the unrolled K-loop (vmcnt 23 then 22) with no streaming
+        #    A->LDS. K_TILES_TOTAL==1 (D_INTER==256) iterates the single tile here
+        #    (init=True on it) -- the streaming path's kUnroll = K_TILES-kStages
+        #    would be negative and skip the init mfma, leaving accm uninitialized. -
         a_scale_v = [load_a_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
         b_scale_v = [load_b_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
         b = [load_b_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
-        for S in range_constexpr(kStages):
-            kt = _K_TILES_TOTAL - kStages + S
+        for S in range_constexpr(_K_TILES_TOTAL):
+            kt = S
             slot = kt % kStages
             _kloop_fence(23 if S == 0 else 22)
             a = issue_a_ds_read(slot)
