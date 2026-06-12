@@ -1169,7 +1169,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     )
     _validate_common(cfg)
     base = _compile_base_a8w4_gemm(
-        K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, kernel_tag="gemm2"
+        K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, kernel_tag=f"gemm2_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_mode{grouped_contiguous_m}"
     )
     base_bias = _compile_base_a8w4_gemm(
         K=cfg.inter_dim,
