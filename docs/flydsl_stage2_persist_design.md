@@ -209,8 +209,24 @@ persist 写占比 90%→**86.9%**（X 载一次 + W2 在 WG 内复用 → read-D
 
 vs asm 核 3162us：差距从最初的 1.86× 收窄到 **1.24×**。
 
+### ✅ Step F（persist + atomic：端到端最优，已落地）
+关键再发现：之前比较是 gemm2-only。按**端到端**看，reduce 模式虽 gemm2 低（3936），但要额外的 `topk_sum` 规约 kernel（~673us）；atomic 模式直接原子累加到 `[tokens, model_dim]`、**无需 topk_sum**。persist（X 复用 + 跨 N 预取）让 atomic 的 gemm2 从 5416→**4401**，于是：
+
+| 模式（均 persist+pf, t32x256） | gemm2 | topk_sum | e2e | cos |
+|---|---|---|---|---|
+| reduce | 3936 | +673 | 9128 | 1.0 |
+| **atomic（落地）** | **4401** | **0** | **8909（-2.4%）** | 0.99999 |
+
+**atomic 端到端更优**（省掉独立规约 kernel），精度 cos 0.99999（与最初 atomic 基线一致，max_delta 0.0117 可接受）。tuned 配置改为 `t32x256_atomic_persist`。**e2e 8909 vs asm 1-stage 8602 = 1.036×**（已非常接近）。
+
+### rocprof-compute 分析（确认非 VALU 受限）
+persist+pf reduce SOL：VALU Util **52.9%**（最忙 pipe）、MFMA 26.1%、IPC **0.86**（低）、占用 92%、LDS 冲突 0.27。两次 VALU 削减实验印证非 VALU 受限：
+- fast-valid-block（削 583 条 cmp/cndmask）：3966（更差）。
+- v_pk dequant（640→320 muls）：3957（更差）。
+> VALU 虽是最忙 pipe，但 IPC 低 = 停顿主导、VALU 不在关键路径。reduce gemm2 的地板是写带宽（610 GB/s vs asm 760）。
+
 ### 实验记录（已穷尽的微调）
-- waves_per_eu / gating lds_tid / K-loop 全 B 前置：均无效或反伤，已回退。
+- waves_per_eu / gating lds_tid / K-loop 全 B 前置 / 预取移到 K-loop 前 / 更大 tile / v_pk dequant / fast-valid：均无效或反伤，已回退。
 
 ### 落地状态
 `hy3_fp8_pertensor_tuned_fmoe.csv` token=32768 行用 `..._reduce_persist_bnt0`，persist+pf 默认生效、无需 env。非 `_persist` kernel 名零影响。lint 通过、正确性 cos 1.0。env 旋钮：`FLYDSL_MOE_STAGE2_PERSIST`(默认按 kernel 名)、`FLYDSL_MOE_STAGE2_PERSIST_PF`(persist 下默认开)。
