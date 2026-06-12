@@ -2069,7 +2069,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
 
     // ================= Q (every block) =================
     {
-        const float inv_qscale = 1.0f / (*q_scale);
+        [[maybe_unused]] const float inv_qscale = 1.0f / (*q_scale);
         const scalar_t* q_nope_row =
             q_nope + token_idx * q_nope_stride_0 + head_idx * q_nope_stride_1;
         cache_t* q_out_row =
@@ -2080,10 +2080,17 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         auto out_buf = opus::make_gmem<cache_t>(q_out_row, KV_LORA * sizeof(cache_t));
         for(int v = threadIdx.x; v < NUM_VEC; v += blockDim.x)
         {
-            in_vec_t  vin  = in_buf.template load<VEC>(v * VEC);
-            // fp8/bf8 -> hardware scaled-cast (static quant); bf16/fp16 -> scaled passthrough
-            // via the generic scaled_cast fallback (fp32 mul + cast; lossless when scale==1).
-            out_vec_t vout = aiter::scaled_cast<cache_t>(vin, inv_qscale);
+            in_vec_t  vin = in_buf.template load<VEC>(v * VEC);
+            // fp8 output: static per-tensor quant; bf16/fp16: un-quantized passthrough (no scale).
+            out_vec_t vout;
+            if constexpr(std::is_same_v<cache_t, opus::fp8_t>)
+            {
+                vout = aiter::scaled_cast<cache_t>(vin, inv_qscale);
+            }
+            else
+            {
+                vout = vin;
+            }
             out_buf.template store<VEC, out_vec_t>(vout, v * VEC);
         }
 
@@ -2095,15 +2102,23 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
             int lo_idx, hi_idx;
             float lo_out, hi_out;
             rope_pe_pair(q_pe_row, j, lo_idx, hi_idx, lo_out, hi_out);
-            q_out_row[KV_LORA + lo_idx] = opus::cast<cache_t>(lo_out * inv_qscale);
-            q_out_row[KV_LORA + hi_idx] = opus::cast<cache_t>(hi_out * inv_qscale);
+            if constexpr(std::is_same_v<cache_t, opus::fp8_t>)
+            {
+                q_out_row[KV_LORA + lo_idx] = opus::cast<cache_t>(lo_out * inv_qscale);
+                q_out_row[KV_LORA + hi_idx] = opus::cast<cache_t>(hi_out * inv_qscale);
+            }
+            else
+            {
+                q_out_row[KV_LORA + lo_idx] = static_cast<cache_t>(lo_out);
+                q_out_row[KV_LORA + hi_idx] = static_cast<cache_t>(hi_out);
+            }
         }
     }
 
     // ================= K (only head 0, kv=1) =================
     if(head_idx == 0)
     {
-        const float inv_kscale = 1.0f / (*k_scale);
+        [[maybe_unused]] const float inv_kscale = 1.0f / (*k_scale);
         const int64_t block_idx    = slot_idx / PAGE_SIZE;
         const int64_t block_offset = slot_idx % PAGE_SIZE;
         const int64_t nope_base    = block_idx * block_stride + block_offset * KV_LORA;
@@ -2116,8 +2131,17 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         auto out_buf = opus::make_gmem<cache_t>(kv_cache + nope_base, KV_LORA * sizeof(cache_t));
         for(int v = threadIdx.x; v < NUM_VEC; v += blockDim.x)
         {
-            in_vec_t  vin  = in_buf.template load<VEC>(v * VEC);
-            out_vec_t vout = aiter::scaled_cast<cache_t>(vin, inv_kscale);
+            in_vec_t  vin = in_buf.template load<VEC>(v * VEC);
+            // fp8 output: static per-tensor quant; bf16/fp16: un-quantized passthrough (no scale).
+            out_vec_t vout;
+            if constexpr(std::is_same_v<cache_t, opus::fp8_t>)
+            {
+                vout = aiter::scaled_cast<cache_t>(vin, inv_kscale);
+            }
+            else
+            {
+                vout = vin;
+            }
             out_buf.template store<VEC, out_vec_t>(vout, v * VEC);
         }
 
@@ -2128,8 +2152,16 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
             int lo_idx, hi_idx;
             float lo_out, hi_out;
             rope_pe_pair(k_pe_row, j, lo_idx, hi_idx, lo_out, hi_out);
-            kv_cache[rope_base + lo_idx] = opus::cast<cache_t>(lo_out * inv_kscale);
-            kv_cache[rope_base + hi_idx] = opus::cast<cache_t>(hi_out * inv_kscale);
+            if constexpr(std::is_same_v<cache_t, opus::fp8_t>)
+            {
+                kv_cache[rope_base + lo_idx] = opus::cast<cache_t>(lo_out * inv_kscale);
+                kv_cache[rope_base + hi_idx] = opus::cast<cache_t>(hi_out * inv_kscale);
+            }
+            else
+            {
+                kv_cache[rope_base + lo_idx] = static_cast<cache_t>(lo_out);
+                kv_cache[rope_base + hi_idx] = static_cast<cache_t>(hi_out);
+            }
         }
     }
 }

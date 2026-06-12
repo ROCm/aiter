@@ -663,8 +663,11 @@ def test_fused_qk_rope_concat_cache_mla_seg(
     sin_cache = sin_cache.to(device)
     pos = torch.randint(0, max_pos, (num_tokens,), dtype=torch.int64, device=device)
 
-    q_scale = torch.tensor(1, dtype=torch.float32, device=device)
-    k_scale = torch.tensor(1, dtype=torch.float32, device=device)
+    # bf16/fp16 output is an un-quantized passthrough (the kernel ignores scale), so use
+    # scale=1 to keep the reference in lockstep; fp8 output exercises the quant scale.
+    sc = 0.05 if out_dtype == dtypes.fp8 else 1.0
+    q_scale = torch.tensor(sc, dtype=torch.float32, device=device)
+    k_scale = torch.tensor(sc, dtype=torch.float32, device=device)
 
     block_stride = page_size * kv_lora_rank + page_size * qk_rope_head_dim
     kv_cache = torch.zeros(num_blocks, block_stride, dtype=fp8, device=device)
