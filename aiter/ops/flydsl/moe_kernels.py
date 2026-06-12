@@ -681,11 +681,18 @@ def _s2_args_std(
 
 
 def _run_compiled(exe, args):
-    """Call the JitFunction with the given args.
-    JitFunction.__call__ handles compilation caching internally.
+    """First call: JIT-compile via flyc.compile (compiles + executes + returns CompiledFunction).
+    Subsequent calls: fast dispatch via the cached CompiledFunction.
     """
+    import flydsl.compiler as flyc
+
+    cf = getattr(exe, "_cf", None)
+    if cf is not None:
+        cf(*args)
+        return
     try:
-        exe(*args)
+        cf = flyc.compile(exe, *args)
+        exe._cf = cf
     except Exception:
         # JitFunction.__call__ leaks ir.Context on compilation failure,
         # causing all subsequent JitFunction calls to take a wrong code path
@@ -699,6 +706,84 @@ def _run_compiled(exe, args):
         except Exception:
             pass
         raise
+
+
+def _run_moe_reduction(
+    target,
+    out,
+    token_num,
+    topk,
+    model_dim,
+    expert_mask=None,
+    topk_ids=None,
+    stream=None,
+):
+    """Topk reduction epilogue for stage2 reduce mode.
+
+    Shared by the runtime stage2 path and the AOT precompile so both derive the
+    identical compile-time params (dtype_str / use_mask / num_experts) and thus
+    the identical JIT cache key. AOT must call this helper (not a hand-copied
+    variant) or the precompiled artifact will not match the runtime lookup.
+
+    ``stream`` defaults to the current CUDA stream; AOT passes ``stream=0`` since
+    it runs on CPU / FakeTensor under COMPILE_ONLY.
+    """
+    use_mask = expert_mask is not None
+    if use_mask and topk_ids is None:
+        raise ValueError(
+            "topk_ids is required when expert_mask is provided for reduce mode"
+        )
+    # Map torch dtype -> compile_moe_reduction dtype_str
+    if out.dtype == torch.float16:
+        _reduce_dtype_str = "f16"
+    elif out.dtype == torch.bfloat16:
+        _reduce_dtype_str = "bf16"
+    elif out.dtype == torch.float32:
+        _reduce_dtype_str = "f32"
+    else:
+        _reduce_dtype_str = None
+
+    if _reduce_dtype_str is None:
+        # Unsupported dtype for the masked kernel — fall back to torch.sum.
+        # This drops the EP mask, so only valid for non-EP runs.
+        if use_mask:
+            raise NotImplementedError(
+                f"Masked moe reduction not supported for dtype {out.dtype}"
+            )
+        torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+        return
+
+    from .kernels.moe_gemm_2stage import compile_moe_reduction
+
+    reduce_exe = compile_moe_reduction(
+        topk=topk,
+        model_dim=model_dim,
+        dtype_str=_reduce_dtype_str,
+        use_mask=use_mask,
+        # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
+        num_experts=int(expert_mask.numel()) if use_mask else 0,
+    )
+    X = target.view(token_num, topk, model_dim)
+    if use_mask:
+        em = expert_mask.to(torch.int32).contiguous()
+        tk = topk_ids.to(torch.int32).contiguous()
+    else:
+        # Placeholders; kernel ignores them when use_mask=False.
+        em = torch.empty(0, device=out.device, dtype=torch.int32)
+        tk = torch.empty(0, device=out.device, dtype=torch.int32)
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    _run_compiled(
+        reduce_exe,
+        (
+            _ptr_view_safe(X),
+            _ptr_view_safe(out),
+            _ptr_view_safe(em),
+            _ptr_view_safe(tk),
+            token_num,
+            stream,
+        ),
+    )
 
 
 @functools.cache
@@ -1287,56 +1372,8 @@ def flydsl_moe_stage2(
     _run_compiled(exe, args)
 
     if not accumulate and not return_per_slot:
-        use_mask = expert_mask is not None
-        if use_mask and topk_ids is None:
-            raise ValueError(
-                "topk_ids is required when expert_mask is provided for reduce mode"
-            )
-        # Map torch dtype -> compile_moe_reduction dtype_str
-        if out.dtype == torch.float16:
-            _reduce_dtype_str = "f16"
-        elif out.dtype == torch.bfloat16:
-            _reduce_dtype_str = "bf16"
-        elif out.dtype == torch.float32:
-            _reduce_dtype_str = "f32"
-        else:
-            _reduce_dtype_str = None
-
-        if _reduce_dtype_str is not None:
-            from .kernels.moe_gemm_2stage import compile_moe_reduction
-
-            reduce_exe = compile_moe_reduction(
-                topk=topk,
-                model_dim=model_dim,
-                dtype_str=_reduce_dtype_str,
-                use_mask=use_mask,
-                # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
-                num_experts=int(expert_mask.numel()) if use_mask else 0,
-            )
-            X = target.view(token_num, topk, model_dim)
-            if use_mask:
-                em = expert_mask.to(torch.int32).contiguous()
-                tk = topk_ids.to(torch.int32).contiguous()
-            else:
-                # Placeholders; kernel ignores them when use_mask=False.
-                em = torch.empty(0, device=out.device, dtype=torch.int32)
-                tk = torch.empty(0, device=out.device, dtype=torch.int32)
-            stream = torch.cuda.current_stream()
-            reduce_exe(
-                _ptr_view_safe(X),
-                _ptr_view_safe(out),
-                _ptr_view_safe(em),
-                _ptr_view_safe(tk),
-                token_num,
-                stream,
-            )
-        else:
-            # Unsupported dtype for the masked kernel — fall back to torch.sum.
-            # This drops the EP mask, so only valid for non-EP runs.
-            if use_mask:
-                raise NotImplementedError(
-                    f"Masked moe reduction not supported for dtype {out.dtype}"
-                )
-            torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+        _run_moe_reduction(
+            target, out, token_num, topk, model_dim, expert_mask, topk_ids
+        )
 
     return out
