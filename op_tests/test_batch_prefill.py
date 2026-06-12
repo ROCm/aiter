@@ -3120,7 +3120,7 @@ def run_batch_prefill_per_token_head(
         torch.manual_seed(seed)
 
     quant_dtype = dtypes.fp8
-    SUPPORTED_PAGE_SIZES = (64, 1024)
+    SUPPORTED_PAGE_SIZES = (16, 64, 1024)
     if page_size not in SUPPORTED_PAGE_SIZES:
         if skip_test_if(
             True,

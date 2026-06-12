@@ -89,7 +89,7 @@ _parser.add_argument(
 _args = _parser.parse_args()
 SEQS = tuple(_args.seqs)
 
-SHAPES = [(b, s, s, 8, 1, 128, True, 0.0) for s in SEQS for b in (2, 4, 6, 8)]
+SHAPES = [(b, s, s, 8, 1, 128, True, 0.0) for s in SEQS for b in (1, 2, 4, 6, 8)]
 
 
 def _fmt(r):
