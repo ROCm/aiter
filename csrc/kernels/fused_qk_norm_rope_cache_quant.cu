@@ -95,6 +95,17 @@ using mrope_utils::vec_t;
 // activations are all zero (e.g. CUDA graph warmup, invalid slots, or padding).
 static constexpr float kFp8KvQuantAbsmaxFloorF32 = 1e-8f;
 
+// HW-native fp8 e4m3 element dtype, selected by the compile target (same idiom as
+// quant_kernels.cu): gfx942 ships e4m3fnuz (max_pos=240), gfx950+ ships OCP e4m3fn
+// (max_pos=448). Used as the MX dtype tag for the e8m0 block-scale helpers. Keyed on the
+// arch macro rather than an ad-hoc finfo<>::max() threshold, matching opus::finfo<fp8_t>.
+static constexpr aiter::MxDtype kHwFp8E4m3Dtype =
+#if defined(__gfx942__)
+    aiter::MxDtype::FP8_E4M3_FNUZ;
+#else
+    aiter::MxDtype::FP8_E4M3;
+#endif
+
 template <typename Func, typename T>
 __inline__ __device__ T warpReduceSum(Func func, T val)
 {
@@ -3853,8 +3864,7 @@ namespace aiter {
         if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
           // E8M0 block scale via the shared MX helper, RoundUp mode (matches
           // V4-Pro / NV ROUND_UP / torchao RCEIL: dq_scale = ceil_pow2(amax / fp8_max)).
-          constexpr MxDtype kMxDt = (opus::finfo<cache_t>::max() <= 300.f)
-                                        ? MxDtype::FP8_E4M3_FNUZ : MxDtype::FP8_E4M3;
+          constexpr MxDtype kMxDt = kHwFp8E4m3Dtype;
           const E8m0BlockScale s =
               fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kMxDt>(thread_max);
           // v4 nm asm reader reads each tile scale TWICE consecutively
@@ -3957,12 +3967,15 @@ namespace aiter {
       constexpr int32_t head_size = HEAD_DIM;
       constexpr int32_t pe_dim = 64;
       constexpr int32_t nope_dim = head_size - pe_dim;
-      // Elements/lane to cover one head with a single wave = HEAD_DIM/WAVE
-      // (wave64: 8 for head=512; wave32: 16). WAVE is a plain int template param
-      // (set by host dispatch), so this is constexpr-safe (no WarpSizeValue host-pass trap).
+      // Elements/lane to cover one head with a single wave = HEAD_DIM/WARP_SIZE
+      // (wave64: 8 for head=512; wave32: 16). WARP_SIZE is the device-resolved wavefront
+      // size; safe in this __device__ constexpr (matches the shared K-wave body). The trailing
+      // WAVE template param is kept for API compatibility but is no longer consulted, so the
+      // Q path is wave-generic without an extra per-wave-size instantiation.
       // fp32 is a dead-code instantiation; cap at 4 (no 32-byte opus float vector).
+      constexpr int32_t kWave = WARP_SIZE;
       constexpr int32_t vec_size_i =
-          std::is_same_v<scalar_t, float> ? 4 : ((HEAD_DIM / 8 <= WAVE) ? 8 : 16);
+          std::is_same_v<scalar_t, float> ? 4 : ((HEAD_DIM / 8 <= kWave) ? 8 : 16);
       constexpr int32_t vec_size_o = vec_size_i;
       constexpr uint32_t nope_vec = nope_dim / vec_size_o;
       constexpr uint32_t vec_stride = 64;
@@ -4160,8 +4173,7 @@ namespace aiter {
             thread_max = fmaxf(thread_max, __shfl_xor(thread_max, offset, WARP_SIZE));
           }
           // E8M0 block scale via the shared MX helper, RoundUp mode (same as K).
-          constexpr MxDtype kQMxDt = (opus::finfo<query_t>::max() <= 300.f)
-                                         ? MxDtype::FP8_E4M3_FNUZ : MxDtype::FP8_E4M3;
+          constexpr MxDtype kQMxDt = kHwFp8E4m3Dtype;
           const E8m0BlockScale qs_scale =
               fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(thread_max);
           const float inv_scale = is_nope_thr ? (1.0f / qs_scale.dq_scale) : 0.0f;
@@ -4170,7 +4182,9 @@ namespace aiter {
           if (is_nope_thr) {
             // group-leader writes the e8m0 scale TWICE (s,s) at byte [nope_dim + 2*group_id).
             if (tid % Q_REDUCE == 0) {
-              const int group_id = (tid * vec_size_i) >> 6;  // 0..num_nope_groups-1
+              // group_id = (tid * vec_size_i) / Q_GROUP_SIZE = tid / Q_REDUCE; generic over
+              // Q_GROUP_SIZE (the compiler folds to a shift since Q_REDUCE is a power of 2).
+              const int group_id = tid / Q_REDUCE;  // 0..Q_NUM_GROUPS-1
               auto* qs = reinterpret_cast<uint8_t*>(q_out_head) + nope_dim;
               qs[group_id * 2]     = qs_scale.byte;
               qs[group_id * 2 + 1] = qs_scale.byte;
@@ -4302,12 +4316,15 @@ namespace aiter {
       constexpr int32_t head_size = HEAD_DIM;
       constexpr int32_t pe_dim = 64;
       constexpr int32_t nope_dim = head_size - pe_dim;
-      // Elements/lane to cover one head with a single wave = HEAD_DIM/WAVE
-      // (wave64: 8 for head=512; wave32: 16). WAVE is a plain int template param
-      // (set by host dispatch), so this is constexpr-safe (no WarpSizeValue host-pass trap).
+      // Elements/lane to cover one head with a single wave = HEAD_DIM/WARP_SIZE
+      // (wave64: 8 for head=512; wave32: 16). WARP_SIZE is the device-resolved wavefront
+      // size; safe in this __device__ constexpr (matches the shared K-wave body). The trailing
+      // WAVE template param is kept for API compatibility but is no longer consulted, so the
+      // Q path is wave-generic without an extra per-wave-size instantiation.
       // fp32 is a dead-code instantiation; cap at 4 (no 32-byte opus float vector).
+      constexpr int32_t kWave = WARP_SIZE;
       constexpr int32_t vec_size_i =
-          std::is_same_v<scalar_t, float> ? 4 : ((HEAD_DIM / 8 <= WAVE) ? 8 : 16);
+          std::is_same_v<scalar_t, float> ? 4 : ((HEAD_DIM / 8 <= kWave) ? 8 : 16);
       constexpr int32_t vec_size_o = vec_size_i;
       constexpr uint32_t nope_vec = nope_dim / vec_size_o;
       constexpr int32_t nope_offset = 0;            // V4 layout: nope-first
@@ -4383,12 +4400,13 @@ namespace aiter {
           const float amax_norm = amax_raw * rms_scale;  // == amax(|x_norm|) over the group
           float factor;
           if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
-            constexpr MxDtype kMxDt = (opus::finfo<cache_t>::max() <= 300.f)
-                                          ? MxDtype::FP8_E4M3_FNUZ : MxDtype::FP8_E4M3;
+            constexpr MxDtype kMxDt = kHwFp8E4m3Dtype;
             const E8m0BlockScale s =
                 fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kMxDt>(amax_norm);
             if (is_nope_thread && (tid % reduce_thread_size) == 0) {
-              const int group_id = (tid * vec_size_i) >> 6;
+              // K NoPE is always group=64 (GROUP_SIZE hardcoded above for the asm reader's
+              // 14-byte format); use the generic tid/reduce_thread_size to avoid a magic >>6.
+              const int group_id = tid / reduce_thread_size;
               auto* tmp = reinterpret_cast<uint8_t*>(ptr_o + nope_dim);
               tmp[group_id * 2]     = s.byte;
               tmp[group_id * 2 + 1] = s.byte;
@@ -4502,8 +4520,7 @@ namespace aiter {
 
       if constexpr (Q_QUANT) {
         const float amax_norm = amax_raw * q_rms_scale;  // == amax(|q_norm|) over the group
-        constexpr MxDtype kQMxDt = (opus::finfo<query_t>::max() <= 300.f)
-                                       ? MxDtype::FP8_E4M3_FNUZ : MxDtype::FP8_E4M3;
+        constexpr MxDtype kQMxDt = kHwFp8E4m3Dtype;
         const E8m0BlockScale qs_scale =
             fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(amax_norm);
         const float factor = q_rms_scale / qs_scale.dq_scale;  // x_in -> fp8 (rstd folded)
@@ -4511,7 +4528,9 @@ namespace aiter {
         query_t* q_out_head = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
         if (is_nope_thr) {
           if ((tid % Q_REDUCE) == 0) {
-            const int group_id = (tid * vec_size_i) >> 6;
+            // group_id = (tid * vec_size_i) / Q_GROUP_SIZE = tid / Q_REDUCE; generic over
+            // Q_GROUP_SIZE (folds to a shift since Q_REDUCE is a power of 2).
+            const int group_id = tid / Q_REDUCE;
             auto* qs = reinterpret_cast<uint8_t*>(q_out_head) + nope_dim;
             qs[group_id * 2]     = qs_scale.byte;
             qs[group_id * 2 + 1] = qs_scale.byte;
@@ -4739,10 +4758,15 @@ void fused_qk_norm_rope_group_quant(
   // rotated Q-PE goes to the separate q_rope_buff (bf16). The e8m0 scale is written
   // inline, so a separate q_scale tensor is no longer required.
   if (q_is_fp8) {
-    AITER_CHECK(quant_group_size == 32 || quant_group_size == 64 || quant_group_size == 128,
-                "quant_group_size must be one of {32, 64, 128}, got ", quant_group_size);
-    AITER_CHECK(head_dim % quant_group_size == 0,
-                "head_dim must be divisible by quant_group_size");
+    // group=128 is excluded: the NoPE region (head_dim - rot_dim) is the only part that is
+    // group-quantised, and for the V4 shape (512-64=448) 448 % 128 != 0. Only {32, 64} tile
+    // the 448-wide NoPE evenly.
+    AITER_CHECK(quant_group_size == 32 || quant_group_size == 64,
+                "quant_group_size must be one of {32, 64}, got ", quant_group_size);
+    // Validate the NoPE region (the quantised part), not the full head_dim: the trailing
+    // rot_dim is RoPE'd bf16 and never quantised.
+    AITER_CHECK((head_dim - rot_dim) % quant_group_size == 0,
+                "NoPE size (head_dim - rot_dim) must be divisible by quant_group_size");
     AITER_CHECK(q_rope_buff.has_value(),
                 "q_rope_buff (rotated Q-PE bf16 buffer) is required when Q is fp8");
   }
@@ -4792,7 +4816,7 @@ void fused_qk_norm_rope_group_quant(
   constexpr int64_t OPTIMIZED_ROT_DIM = 64;
   const bool use_optimized = (rot_dim == OPTIMIZED_ROT_DIM && head_dim <= 512);
 
-  aiter::MlaKernelParams mla_params;
+  aiter::MlaKernelParams mla_params{};  // zero-init: paged-cache fields are unused here
   mla_params.token_stride = token_stride;
   mla_params.kv_cache_stride_h = kv_cache_stride_h;
   mla_params.q_stride_0 = q_stride_0;
@@ -4824,6 +4848,9 @@ void fused_qk_norm_rope_group_quant(
 
   int num_CUs;
   hipDeviceGetAttribute(&num_CUs, hipDeviceAttributeMultiprocessorCount, kv.device_id);
+  // Device wavefront size (64 GFX9 / 32 else), queried at runtime for the block dim so the
+  // launch matches the in-kernel wave_id = threadIdx.x / WARP_SIZE decomposition on wave32 too.
+  const int warp_size = static_cast<int>(get_warp_size_func());
 
   // ---------------------------------------------------------------------------
   // Launch-config heuristic: pick Q heads-per-wave (HPW) from the prefill size.
@@ -4909,19 +4936,19 @@ void fused_qk_norm_rope_group_quant(
       // waves, so we keep the single-head block (no extra instantiations).
       constexpr int tokens_per_block_val = 1;  // == HEADS_PER_BLOCK for the FG kernel
       dim3 grid(static_cast<unsigned>(1 + num_heads), static_cast<unsigned>(num_tokens));
-      dim3 block(64);
+      dim3 block(static_cast<unsigned>(tokens_per_block_val * warp_size));
       DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(kv.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_FUSED_QK_NORM_ROPE_FINEGRAINED);
     } else if (use_decode_path) {
       constexpr int tokens_per_block_val = 1;
       dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val, 1 + num_q_waves);
-      dim3 block(tokens_per_block_val * 64);
+      dim3 block(tokens_per_block_val * warp_size);
       DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(kv.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE);
     } else {
       constexpr int tokens_per_block_val = 4;
       dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val, 1 + num_q_waves);
-      dim3 block(tokens_per_block_val * 64);
+      dim3 block(tokens_per_block_val * warp_size);
       DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(kv.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE);
     }

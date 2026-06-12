@@ -121,15 +121,19 @@ def _norm_rope_nope_fp8(x, weight, cos, sin, pos, eps, *, is_neox, group_size):
     return nope_fp8, scale_e8m0, pe_rotated.to(torch.bfloat16), full_rotated_bf16
 
 
-def _ref(q, kv, kw, cos, sin, pos, eps, *, is_neox, group_size):
+def _ref(q, kv, kw, cos, sin, pos, eps, *, is_neox, q_group_size, k_group_size):
     """V4 Q/K reference. Q is weightless (V4-Pro); K uses the RMSNorm weight kw.
     fp8 Q mirrors K (nope fp8 + pe bf16); the full bf16-rotated Q is the bf16-Q reference.
+
+    NOTE: only Q honours ``quant_group_size``; the kernel's K NoPE quant is always
+    1x64 (the v4 asm reader's 14-byte scale format is hardcoded), so the K reference
+    uses ``k_group_size`` (= 64) independently of the Q group size.
     """
     q_nope_fp8, q_scale, q_pe_bf16, q_full_bf16 = _norm_rope_nope_fp8(
-        q, None, cos, sin, pos, eps, is_neox=is_neox, group_size=group_size
+        q, None, cos, sin, pos, eps, is_neox=is_neox, group_size=q_group_size
     )
     k_nope_fp8, k_scale, k_pe_bf16, _ = _norm_rope_nope_fp8(
-        kv, kw, cos, sin, pos, eps, is_neox=is_neox, group_size=group_size
+        kv, kw, cos, sin, pos, eps, is_neox=is_neox, group_size=k_group_size
     )
     return q_nope_fp8, q_scale, q_pe_bf16, k_nope_fp8, k_scale, k_pe_bf16, q_full_bf16
 
@@ -141,15 +145,18 @@ def _ref(q, kv, kw, cos, sin, pos, eps, *, is_neox, group_size):
 
 @benchmark()
 def test_fused_qk_norm_rope_group_quant(
-    T, H, D, RD, *, is_neox, q_fp8, G, compare_flydsl=True
+    T, H, D, RD, *, is_neox, q_fp8, G, GK=64, compare_flydsl=True
 ):
     NK = 1  # DeepSeek V4 is MQA: exactly one KV head (kernel hardcodes this)
     torch.manual_seed(0)
     random.seed(0)
     nope = D - RD
     eps = 1e-6
-    n_groups = nope // G  # e8m0 scale groups over the NoPE part (7 for D=512, G=64)
-    entry = D  # k_nope_scale_buff is 512 B (head_dim): nope(448) + 14 dup e8m0 + pad
+    # Q honours the quant_group_size (G); K NoPE is always 1x64 in the kernel, so use a
+    # separate GK (=64) for the K reference / scale-readback layout.
+    n_groups_q = nope // G  # Q e8m0 scale groups (7 for D=512, G=64; 14 for G=32)
+    n_groups_k = nope // GK  # K e8m0 scale groups (always 7 for D=512)
+    entry = D  # k_nope_scale_buff is 512 B (head_dim): nope(448) + 2*n_groups dup e8m0 + pad
 
     cos, sin = _cos_sin(max(T, 64) + 4, RD, torch.bfloat16)
     pos = torch.randint(0, cos.shape[0] - 1, (T,), dtype=torch.int64, device=_DEV)
@@ -159,7 +166,18 @@ def test_fused_qk_norm_rope_group_quant(
 
     # Reference
     ref_q_nope, ref_q_scale, ref_q_pe, ref_k_nope, ref_k_scale, ref_k_pe, ref_q_bf16 = (
-        _ref(q, kv, kw, cos, sin, pos, eps, is_neox=is_neox, group_size=G)
+        _ref(
+            q,
+            kv,
+            kw,
+            cos,
+            sin,
+            pos,
+            eps,
+            is_neox=is_neox,
+            q_group_size=G,
+            k_group_size=GK,
+        )
     )
 
     # Kernel + perf (pre-allocate outputs so we time the kernel, not torch.empty)
@@ -201,19 +219,19 @@ def test_fused_qk_norm_rope_group_quant(
         assert q_rope_buff is not None, "fp8 Q must produce q_rope_buff"
         q_nope_got = q_nope_scale_buff[..., :nope]
         q_scale_pairs = (
-            q_nope_scale_buff.view(torch.uint8)[..., nope : nope + 2 * n_groups]
+            q_nope_scale_buff.view(torch.uint8)[..., nope : nope + 2 * n_groups_q]
             .contiguous()
-            .reshape(T, H, n_groups, 2)
+            .reshape(T, H, n_groups_q, 2)
         )
         got_scale_f32 = (q_scale_pairs[..., 0].to(torch.int32) << 23).view(
             torch.float32
         )
         ref_scale_f32 = (ref_q_scale.to(torch.int32) << 23).view(torch.float32)
         q_deq = q_nope_got.float() * got_scale_f32.unsqueeze(-1).expand(
-            T, H, n_groups, G
+            T, H, n_groups_q, G
         ).reshape(T, H, nope)
         ref_q_deq = ref_q_nope.float() * ref_scale_f32.unsqueeze(-1).expand(
-            T, H, n_groups, G
+            T, H, n_groups_q, G
         ).reshape(T, H, nope)
         err_q = checkAllclose(q_deq, ref_q_deq, atol=0.05, rtol=0.02, msg="Q-nope fp8")
         checkAllclose(
@@ -249,17 +267,17 @@ def test_fused_qk_norm_rope_group_quant(
     # each pair for dequant; verify BOTH halves equal the reference scale.
     k_nope_got = k_nope_scale_buff[..., :nope]
     k_scale_pairs = (
-        k_nope_scale_buff.view(torch.uint8)[..., nope : nope + 2 * n_groups]
+        k_nope_scale_buff.view(torch.uint8)[..., nope : nope + 2 * n_groups_k]
         .contiguous()
-        .reshape(T, NK, n_groups, 2)
+        .reshape(T, NK, n_groups_k, 2)
     )
     got_k_scale_f32 = (k_scale_pairs[..., 0].to(torch.int32) << 23).view(torch.float32)
     ref_k_scale_f32 = (ref_k_scale.to(torch.int32) << 23).view(torch.float32)
     k_deq = k_nope_got.float() * got_k_scale_f32.unsqueeze(-1).expand(
-        T, NK, n_groups, G
+        T, NK, n_groups_k, GK
     ).reshape(T, NK, nope)
     ref_k_deq = ref_k_nope.float() * ref_k_scale_f32.unsqueeze(-1).expand(
-        T, NK, n_groups, G
+        T, NK, n_groups_k, GK
     ).reshape(T, NK, nope)
     err_k = checkAllclose(k_deq, ref_k_deq, atol=0.05, rtol=0.02, msg="K-nope fp8")
     checkAllclose(
@@ -302,7 +320,7 @@ def test_fused_qk_norm_rope_group_quant(
                 head_dim=D,
                 rope_head_dim=RD,
                 quant=q_fp8,
-                quant_group_size=(64 if q_fp8 else None),
+                quant_group_size=(G if q_fp8 else None),
                 scale_dtype=("e8m0" if q_fp8 else "fp32"),
             )
         except Exception:
@@ -312,12 +330,12 @@ def test_fused_qk_norm_rope_group_quant(
     bytes_in = T * H * D * 2 + T * NK * D * 2 + D * 2
     if q_fp8:
         bytes_out = (
-            T * H * (nope + 2 * n_groups) + T * H * RD * 2
+            T * H * (nope + 2 * n_groups_q) + T * H * RD * 2
         )  # Q nope+scale + Q rope bf16
     else:
         bytes_out = T * H * D * 2  # Q bf16 full head
     bytes_out += (
-        T * NK * (nope + 2 * n_groups) + T * NK * RD * 2
+        T * NK * (nope + 2 * n_groups_k) + T * NK * RD * 2
     )  # K nope+scale + K rope bf16
     gbps = (bytes_in + bytes_out) / (us * 1e-6) / 1e9
     ratio = (us / fly_us) if fly_us == fly_us and fly_us > 0 else float("nan")
@@ -362,6 +380,14 @@ parser.add_argument(
 parser.add_argument("--D", type=int, default=512, help="head_dim (kernel MVP: 512)")
 parser.add_argument("--RD", type=int, default=64, help="rope_head_dim (RoPE tail size)")
 parser.add_argument(
+    "--G",
+    type=int,
+    nargs="*",
+    default=[32, 64],
+    choices=[32, 64],
+    help="Q quant_group_size sweep (K is always 64). e.g. --G 64",
+)
+parser.add_argument(
     "--neox", action="store_true", help="also sweep is_neox=True (default: GPT-J only)."
 )
 parser.add_argument(
@@ -373,7 +399,7 @@ neox_modes = [False, True] if args.neox else [False]
 
 rows = []
 q_fp8 = True
-for H, neox in itertools.product(args.H, neox_modes):
+for G, H, neox in itertools.product(args.G, args.H, neox_modes):
     for T in args.T:
         rows.append(
             test_fused_qk_norm_rope_group_quant(
@@ -383,7 +409,8 @@ for H, neox in itertools.product(args.H, neox_modes):
                 args.RD,
                 is_neox=neox,
                 q_fp8=q_fp8,
-                G=64,
+                G=G,
+                GK=64,
                 compare_flydsl=not args.no_flydsl,
             )
         )

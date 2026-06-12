@@ -332,10 +332,8 @@ def fused_qk_norm_rope_group_quant(
     num_tokens, num_heads, head_dim = q.shape
     num_kv_heads = kv.shape[1] if kv.dim() == 3 else 1
     rot_dim = cos_cache.shape[-1] * 2
-    assert (
-        head_dim % quant_group_size == 0
-    ), "head_dim must be divisible by quant_group_size"
-    # k_nope_scale_buff / fp8 q_nope_scale_buff entry = 512 B (head_dim): nope + 14 dup e8m0 scale + pad.
+    # k_nope_scale_buff / fp8 q_nope_scale_buff entry = 512 B (head_dim): nope + 2*(nope/G) dup
+    # e8m0 scale + pad (14 B for G=64, 28 B for G=32).
     k_entry_bytes = head_dim
 
     from .. import dtypes
@@ -343,6 +341,18 @@ def fused_qk_norm_rope_group_quant(
     q_is_fp8 = (
         q_nope_scale_buff.dtype if q_nope_scale_buff is not None else q_out_dtype
     ) == dtypes.fp8
+    if q_is_fp8:
+        # Only fp8 Q is group-quantised, and only over the NoPE region (head_dim - rot_dim);
+        # the trailing rot_dim is RoPE'd bf16 and never quantised. bf16 Q ignores group size.
+        assert quant_group_size in (
+            32,
+            64,
+        ), f"quant_group_size must be one of {{32, 64}}, got {quant_group_size}"
+        assert (
+            head_dim - rot_dim
+        ) % quant_group_size == 0, (
+            "NoPE size (head_dim - rot_dim) must be divisible by quant_group_size"
+        )
     if q_nope_scale_buff is None:
         # fp8: nope+scale (zeros for the pad); bf16: plain [.,H,512] rotated Q.
         q_nope_scale_buff = (
