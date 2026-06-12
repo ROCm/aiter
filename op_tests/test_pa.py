@@ -973,48 +973,49 @@ def test_paged_attention(
     }
 
 
-df = []
+if __name__ == "__main__":
+    df = []
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=dtypes.str2Dtype,
-    nargs="*",
-    default=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
-    help="""Data type.
-    e.g.: -d bf16""",
-)
-parser.add_argument(
-    "-n",
-    "--num_heads",
-    type=dtypes.str2tuple,
-    nargs="*",
-    default=[(4, 1), (8, 1), (32, 8)],
-    help="""Number of heads (num_query_heads, num_kv_heads)
-    e.g.: -n 4,1""",
-)
-parser.add_argument(
-    "-c",
-    "--ctx_len",
-    type=int,
-    nargs="*",
-    default=[7, 26, 57, 66, 109, 128, 257, 282, 4097],
-    help="""Context length.
-    e.g. -c 128""",
-)
-args = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
+        help="""Data type.
+        e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-n",
+        "--num_heads",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(4, 1), (8, 1), (32, 8)],
+        help="""Number of heads (num_query_heads, num_kv_heads)
+        e.g.: -n 4,1""",
+    )
+    parser.add_argument(
+        "-c",
+        "--ctx_len",
+        type=int,
+        nargs="*",
+        default=[7, 26, 57, 66, 109, 128, 257, 282, 4097],
+        help="""Context length.
+        e.g. -c 128""",
+    )
+    args = parser.parse_args()
 
-for num_heads in args.num_heads:
-    for ctx_len in args.ctx_len:
-        for dtype in args.dtype:
-            ret = test_paged_attention(
-                ctx_len, 128, num_heads, 128, False, 16, dtype, "auto", 0, "cuda:0"
-            )
-            df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("pa summary (markdown):\n%s", df_md)
+    for num_heads in args.num_heads:
+        for ctx_len in args.ctx_len:
+            for dtype in args.dtype:
+                ret = test_paged_attention(
+                    ctx_len, 128, num_heads, 128, False, 16, dtype, "auto", 0, "cuda:0"
+                )
+                df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("pa summary (markdown):\n%s", df_md)
