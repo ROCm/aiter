@@ -1211,6 +1211,7 @@ def get_mla_metadata_v1(
     intra_batch_mode: bool = False,
     dtype_q: Optional[torch.dtype] = None,
     dtype_kv: Optional[torch.dtype] = None,
+    is_cp_round_robin: bool = False,
 ) -> None:
     """
     Inputs:
