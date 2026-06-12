@@ -51,6 +51,10 @@ def get_x_vals():
     x_vals += [(v, 9216, 7168) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 7168, 4608) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
+    # Small-K shapes that exercise the gluon wind-down's num_k_iter guards
+    # (BLOCK_SIZE_K=128; K in {128,192,256,320} -> num_k_iter in {1,2,2,3}).
+    # K<BLOCK_SIZE_K isn't supported by the gluon wrapper (GROUP_K assert).
+    x_vals += [(512, 512, K) for K in (128, 192, 256, 320)]
     return x_vals
 
 
@@ -128,7 +132,7 @@ def generate_gemm_a8w8_blockscale_inputs(
 @pytest.mark.parametrize(
     "impl",
     [
-        # "gluon",
+        "gluon",
         "triton",
         "triton_shuffle",
     ],
@@ -150,20 +154,13 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
                 "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
             )
 
+    if impl != "gluon" and K < 512:
+        # Small-K shapes were added for the gluon wind-down's num_k_iter
+        # guards; the standard triton / preshuffle autotune configs fail to
+        # compile at these K values (BLOCK_SIZE_K mismatch).
+        pytest.skip("Small-K shapes exercise gluon-only paths.")
+
     dtype = str_to_torch_dtype[dtype]
-    x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
-        generate_gemm_a8w8_blockscale_inputs(
-            M,
-            N,
-            K,
-            block_shape_n,
-            block_shape_k,
-            dtype=dtype,
-            layout=layout,
-            output=output,
-            shuffle=("_shuffle" in impl),
-        )
-    )
     x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
         generate_gemm_a8w8_blockscale_inputs(
             M,
