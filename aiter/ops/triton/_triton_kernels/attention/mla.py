@@ -61,6 +61,7 @@ _mla_prefill_fwd_kernel_repr = make_kernel_repr(
         "QK_ROPE_HEAD_DIM",
         "BLOCK_Q",
         "BLOCK_M",
+        "NUM_HEAD_BLOCKS",
         "NUM_SEGMENTS_PER_SEQ",
         "num_warps",
         "num_stages",
@@ -99,6 +100,7 @@ def _mla_prefill_fwd_kernel(
     BLOCK_M: tl.constexpr,  # int
     num_warps: tl.constexpr,  # int
     num_stages: tl.constexpr,  # int
+    NUM_HEAD_BLOCKS: tl.constexpr = 1,  # int
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -109,13 +111,18 @@ def _mla_prefill_fwd_kernel(
     RCP_LN2 = 1.4426950408889634
     qk_scale = scale * RCP_LN2
 
+    # split the flat block index into a token-block part and a head-block part
+    token_q_block_global_idx = q_block_global_idx // NUM_HEAD_BLOCKS
+    head_block_idx = q_block_global_idx % NUM_HEAD_BLOCKS
+    head_offset = head_block_idx * BLOCK_M
+
     seq_idx = _find_seq_idx(
-        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+        query_start_len_ptr, token_q_block_global_idx, num_seqs, BLOCK_Q, True
     )
 
     q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
 
-    q_block_local_idx = q_block_global_idx - q_block_start_idx
+    q_block_local_idx = token_q_block_global_idx - q_block_start_idx
 
     cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
     cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
@@ -150,7 +157,9 @@ def _mla_prefill_fwd_kernel(
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
-    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset_1 = (
+        kv_head_idx * num_queries_per_kv + head_offset + offs_m % num_queries_per_kv
+    )
     query_offset = (
         query_offset_0[:, None] * query_stride_0
         + query_offset_1[:, None] * query_stride_1
@@ -310,6 +319,7 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "QK_ROPE_HEAD_DIM",
         "BLOCK_Q",
         "BLOCK_M",
+        "NUM_HEAD_BLOCKS",
         "NUM_SEGMENTS_PER_SEQ",
         "num_warps",
         "waves_per_eu",
@@ -356,6 +366,7 @@ def _mla_decode_fwd_kernel(
     num_warps: tl.constexpr,  # int
     waves_per_eu: tl.constexpr,  # int
     num_stages: tl.constexpr,  # int
+    NUM_HEAD_BLOCKS: tl.constexpr = 1,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     IS_Q_FP8: tl.constexpr = False,  # bool
@@ -368,15 +379,20 @@ def _mla_decode_fwd_kernel(
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
     qk_scale = scale * RCP_LN2
-    num_q_blocks_per_seq = cdiv_fn(num_tokens_per_seq, BLOCK_Q)
+    num_token_blocks_per_seq = cdiv_fn(num_tokens_per_seq, BLOCK_Q)
+    num_q_blocks_per_seq = num_token_blocks_per_seq * NUM_HEAD_BLOCKS
 
     if ALL_DECODE:
-        seq_idx = q_block_global_idx
+        seq_idx = q_block_global_idx // NUM_HEAD_BLOCKS
     else:
         seq_idx = q_block_global_idx // num_q_blocks_per_seq
 
     q_start_idx = tl.load(query_start_len_ptr + seq_idx)
     q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
+
+    token_q_block_local_idx = q_block_local_idx // NUM_HEAD_BLOCKS
+    head_block_idx = q_block_local_idx % NUM_HEAD_BLOCKS
+    head_offset = head_block_idx * BLOCK_M
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
@@ -420,10 +436,12 @@ def _mla_decode_fwd_kernel(
         K_WIDTH: tl.constexpr = 8
 
     num_queries_per_kv: tl.constexpr = num_query_heads // num_kv_heads
-    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    query_pos = token_q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
     query_offset_0 = q_start_idx + query_pos
-    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset_1 = (
+        kv_head_idx * num_queries_per_kv + head_offset + offs_m % num_queries_per_kv
+    )
     query_offset = (
         query_offset_0[:, None] * query_stride_0
         + query_offset_1[:, None] * query_stride_1
@@ -455,10 +473,10 @@ def _mla_decode_fwd_kernel(
     context_len = seq_len - num_tokens_per_seq
 
     # compute the length of the longest sequence prefix spanned by any
-    # query token in the current q_block (q_block_local_idx)
+    # query token in the current q_block (token_q_block_local_idx)
     max_seq_prefix_len = (
         context_len
-        + q_block_local_idx * BLOCK_Q
+        + token_q_block_local_idx * BLOCK_Q
         + (BLOCK_M - 1) // num_queries_per_kv
         + 1
     )
