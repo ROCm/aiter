@@ -102,7 +102,7 @@ def triton_fill_block_map_kernel(
     NK: tl.constexpr,
 ):
     b, h, q = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    B, H, Q = tl.num_programs(0), tl.num_programs(1), tl.num_programs(2)
+    H, Q = tl.num_programs(1), tl.num_programs(2)
     cur_num_to_select = tl.load(num_to_select + b * H * Q + h * Q + q)
     cur_sorted_idx_ptr = sorted_indices + b * H * Q * NK + h * Q * NK + q * NK
     cur_final_map_ptr = final_map + b * H * Q * NK + h * Q * NK + q * NK
@@ -116,7 +116,7 @@ def triton_fill_block_map_kernel(
 @triton.jit
 def triton_fill_causal_mask_kernel(mask, BqdivBk):
     q, k = tl.program_id(0), tl.program_id(1)
-    Q, K = tl.num_programs(0), tl.num_programs(1)
+    K = tl.num_programs(1)
     if k >= (q + 1) * BqdivBk:
         tl.store(mask + q * K + k, 0)
     else:
