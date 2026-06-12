@@ -772,124 +772,74 @@ def compile_mxscale_gemm(
             elem_ty_lds = T.f16
 
             def _precompute_a_lane_bases(lds_ptr):
-                """Precompute per-wm A fragment lane base addresses (byte offsets)."""
+                """Single lane-dependent A base; per-wm and per-ks offsets go into ds_load imm."""
                 row_base = (warp_m_base + lane16) * arith.index(lds_a_stride_bytes)
-                # K-dimension interleaving: kgrp0/kgrp1 read alternating 128-bit chunks
-                # All formats: kgrp offset = 16 bytes (one ds_load_b128 width)
                 k_half_off = lane_kgrp * arith.index(16)
-                bases = []
-                for wm in range_constexpr(wmma_m_rep):
-                    base = (
-                        row_base
-                        + arith.index(wm * WMMA_M * lds_a_stride_bytes)
-                        + k_half_off
-                    )
-                    bases.append(base)
-                return lds_ptr, bases
+                base = row_base + k_half_off
+                return lds_ptr, base
 
-            def load_a_frag(lds_buffer, a_lane_base, ks):
+            def load_a_frag(lds_buffer, a_lane_base, wm, ks):
                 """Load one A-fragment from LDS.
 
-                FP4: vec<8xi32> via 2 x ds_load_b128 (32 bytes per lane).
-                FP8/A8W4: vec<16xi32> via 4 x ds_load_b128 (64 bytes per lane).
-                  Interleaved K layout:
-                  kgrp0 reads bytes [0:15],[32:47],[64:79],[96:111] (stride=32)
-                  kgrp1 reads bytes [16:31],[48:63],[80:95],[112:127] (stride=32)
+                wm and ks are folded into ds_load immediates — no VALU offset arithmetic.
+                FP4: vec<8xi32> via 2 x ds_load_b128.
+                FP8/A8W4: vec<16xi32> via 4 x ds_load_b128.
                 """
-                k_byte_off = arith.index(ks * WMMA_K // PACK_FACTOR_A)
-                byte_off = a_lane_base + k_byte_off
-                v0 = lds_load_b128_raw(lds_buffer, byte_off)
+                imm = wm * WMMA_M * lds_a_stride_bytes + ks * (WMMA_K // PACK_FACTOR_A)
+                v0 = lds_load_b128_raw(lds_buffer, a_lane_base, imm)
                 if const_expr(is_fp4):
-                    # Interleaved stride=32: +0, +32
-                    v1 = lds_load_b128_raw(lds_buffer, byte_off + arith.index(32))
+                    v1 = lds_load_b128_raw(lds_buffer, a_lane_base, imm + 32)
                     return vector.shuffle(v0, v1, list(range(8)))
                 else:
-                    # Interleaved stride=32: +0, +32, +64, +96
-                    v1 = lds_load_b128_raw(lds_buffer, byte_off + arith.index(32))
-                    v2 = lds_load_b128_raw(lds_buffer, byte_off + arith.index(64))
-                    v3 = lds_load_b128_raw(lds_buffer, byte_off + arith.index(96))
+                    v1 = lds_load_b128_raw(lds_buffer, a_lane_base, imm + 32)
+                    v2 = lds_load_b128_raw(lds_buffer, a_lane_base, imm + 64)
+                    v3 = lds_load_b128_raw(lds_buffer, a_lane_base, imm + 96)
                     v01 = vector.shuffle(v0, v1, list(range(8)))
                     v23 = vector.shuffle(v2, v3, list(range(8)))
                     return vector.shuffle(v01, v23, list(range(16)))
 
+            _ngroup_stride = packed_tile_k_b * 16
+
             def _precompute_b_lane_bases(lds_ptr):
-                """Precompute per-wn B fragment lane base addresses (byte offsets).
-
-                FP4: 2 bases per wn (32-col WMMA = 2 N-groups of 16).
-                FP8: 1 base per wn (16-col WMMA = 1 N-group).
-                A8W4: 1 base per wn (16-col WMMA, FP4 packed weight).
-
-                K-dimension interleaving for FP8/A8W4:
-                  kgrp0 and kgrp1 read alternating 16x16 tiles (stride = 2 tiles).
-                  kgrp offset = 1 tile = 256 bytes.
-                """
-                _ngroup_stride = packed_tile_k_b * 16
+                """Single lane-dependent B base; per-wn and per-ks offsets go into ds_load imm."""
                 _n_group_base = arith.index(warp_tile_n // 16) * wave_n_idx
                 row_off = lane16 * arith.index(16)
-                # All formats: interleaved -- kgrp offset = 1 tile = 256 bytes
                 k_tile_off = lane_kgrp * arith.index(256)
-                bases = []
-                if const_expr(is_fp4):
-                    for wn_half in range_constexpr(wmma_n_rep * 2):
-                        ngroup_off = _n_group_base * arith.index(
-                            _ngroup_stride
-                        ) + arith.index(wn_half * _ngroup_stride)
-                        bases.append(ngroup_off + row_off + k_tile_off)
-                else:
-                    # FP8 and A8W4: 1 base per wn (16-col WMMA)
-                    for wn in range_constexpr(wmma_n_rep):
-                        ngroup_off = _n_group_base * arith.index(
-                            _ngroup_stride
-                        ) + arith.index(wn * _ngroup_stride)
-                        bases.append(ngroup_off + row_off + k_tile_off)
-                return lds_ptr, bases
+                base = _n_group_base * arith.index(_ngroup_stride) + row_off + k_tile_off
+                return lds_ptr, base
 
-            def load_b_frag(lds_buffer, b_lane_bases, wn, ks):
+            def load_b_frag(lds_buffer, b_lane_base, wn, ks):
                 """Load one B-fragment from preshuffled LDS.
 
-                FP4: 32x128 -> vec<16xi32> from 2 N-groups (bases[wn*2], bases[wn*2+1]).
-                FP8: 16x128 -> vec<16xi32> from 1 N-group (bases[wn]).
-                A8W4: 16x128 FP4 -> vec<8xi32> from 1 N-group (bases[wn]).
-
-                K-dimension interleaving (FP8/A8W4):
-                  Stride = 2 tiles = 512 bytes between loads.
-                  kgrp0 reads tiles 0,2,4,6; kgrp1 reads tiles 1,3,5,7.
+                wn and ks are folded into ds_load immediates — no VALU offset arithmetic.
+                FP4: 32x128 -> vec<16xi32> from 2 N-groups.
+                FP8: 16x128 -> vec<16xi32> from 1 N-group.
+                A8W4: 16x128 FP4 -> vec<8xi32> from 1 N-group.
                 """
                 if const_expr(is_fp4):
-                    # FP4: 2 N-groups per wn, 4 tiles per N-group
-                    # Interleaved stride=512 (2 tiles): kgrp0->tiles 0,2; kgrp1->tiles 1,3
-                    _num_tiles = (
-                        WMMA_K // PACK_FACTOR_B // 16
-                    )  # 4 tiles total per N-group
-                    k_subtile_off = arith.index(ks * _num_tiles * 256)
-                    base0 = b_lane_bases[wn * 2] + k_subtile_off
-                    v0 = lds_load_b128_raw(lds_buffer, base0)
-                    v1 = lds_load_b128_raw(lds_buffer, base0 + arith.index(512))
-                    base1 = b_lane_bases[wn * 2 + 1] + k_subtile_off
-                    v2 = lds_load_b128_raw(lds_buffer, base1)
-                    v3 = lds_load_b128_raw(lds_buffer, base1 + arith.index(512))
+                    _num_tiles = WMMA_K // PACK_FACTOR_B // 16
+                    imm0 = wn * 2 * _ngroup_stride + ks * _num_tiles * 256
+                    imm1 = (wn * 2 + 1) * _ngroup_stride + ks * _num_tiles * 256
+                    v0 = lds_load_b128_raw(lds_buffer, b_lane_base, imm0)
+                    v1 = lds_load_b128_raw(lds_buffer, b_lane_base, imm0 + 512)
+                    v2 = lds_load_b128_raw(lds_buffer, b_lane_base, imm1)
+                    v3 = lds_load_b128_raw(lds_buffer, b_lane_base, imm1 + 512)
                     v01 = vector.shuffle(v0, v1, list(range(8)))
                     v23 = vector.shuffle(v2, v3, list(range(8)))
                     return vector.shuffle(v01, v23, list(range(16)))
                 elif const_expr(is_a8w4):
-                    # A8W4: FP4 weight, 4 tiles per N-group
-                    # Interleaved stride=512: kgrp0->tiles 0,2; kgrp1->tiles 1,3
-                    _num_tiles = WMMA_K // PACK_FACTOR_B // 16  # 4 tiles total
-                    k_subtile_off = arith.index(ks * _num_tiles * 256)
-                    base0 = b_lane_bases[wn] + k_subtile_off
-                    v0 = lds_load_b128_raw(lds_buffer, base0)
-                    v1 = lds_load_b128_raw(lds_buffer, base0 + arith.index(512))
+                    _num_tiles = WMMA_K // PACK_FACTOR_B // 16
+                    imm = wn * _ngroup_stride + ks * _num_tiles * 256
+                    v0 = lds_load_b128_raw(lds_buffer, b_lane_base, imm)
+                    v1 = lds_load_b128_raw(lds_buffer, b_lane_base, imm + 512)
                     return vector.shuffle(v0, v1, list(range(8)))
                 else:
-                    # FP8: 8 tiles per N-group
-                    # Interleaved stride=512: kgrp0->tiles 0,2,4,6; kgrp1->tiles 1,3,5,7
-                    _num_tiles = WMMA_K // PACK_FACTOR_B // 16  # 8 tiles total
-                    k_subtile_off = arith.index(ks * _num_tiles * 256)
-                    base0 = b_lane_bases[wn] + k_subtile_off
-                    v0 = lds_load_b128_raw(lds_buffer, base0)
-                    v1 = lds_load_b128_raw(lds_buffer, base0 + arith.index(512))
-                    v2 = lds_load_b128_raw(lds_buffer, base0 + arith.index(1024))
-                    v3 = lds_load_b128_raw(lds_buffer, base0 + arith.index(1536))
+                    _num_tiles = WMMA_K // PACK_FACTOR_B // 16
+                    imm = wn * _ngroup_stride + ks * _num_tiles * 256
+                    v0 = lds_load_b128_raw(lds_buffer, b_lane_base, imm)
+                    v1 = lds_load_b128_raw(lds_buffer, b_lane_base, imm + 512)
+                    v2 = lds_load_b128_raw(lds_buffer, b_lane_base, imm + 1024)
+                    v3 = lds_load_b128_raw(lds_buffer, b_lane_base, imm + 1536)
                     v01 = vector.shuffle(v0, v1, list(range(8)))
                     v23 = vector.shuffle(v2, v3, list(range(8)))
                     return vector.shuffle(v01, v23, list(range(16)))
@@ -897,31 +847,26 @@ def compile_mxscale_gemm(
             def _precompute_scale_lane_bases(
                 lds_ptr, warp_base, reps, interleaved_cols
             ):
-                """Precompute scale lane bases (byte offsets)."""
+                """Single lane-dependent scale base; ks/rep offsets go into ds_load imm."""
                 warp_lds_row = warp_base / arith.index(reps) + lane16
                 base = warp_lds_row * arith.index(interleaved_cols)
                 if const_expr(is_fp4 or is_a8w4):
-                    # FP4/A8W4: always add lane_kgrp offset (no opsel on BScale)
                     base = base + lane_kgrp * arith.index(SCALES_PER_WMMA)
                 else:
-                    # FP8: conditional on opsel
                     if const_expr(use_scale_opsel):
                         base = base + lane_kgrp * arith.index(SCALES_PER_WMMA)
-                return lds_ptr, [base]
+                return lds_ptr, base
 
             def load_scale_b128(lds_buffer, scale_base, reps, ks=0):
-                """Load all wmma_rep scales via ds_load_b128(s) for K-subtile *ks*."""
+                """Load all wmma_rep scales via ds_load_b128(s) for K-subtile *ks*.
+
+                ks offset is a pure Python integer folded into ds_load imm — no VALU.
+                """
                 ks_byte_off = ks * reps * SCALES_PER_WMMA
-                eff_base = (
-                    scale_base
-                    if ks_byte_off == 0
-                    else scale_base + arith.index(ks_byte_off)
-                )
                 num_loads = (reps + 3) // 4
                 vecs = []
                 for ld in range_constexpr(num_loads):
-                    off = eff_base if ld == 0 else eff_base + arith.index(ld * 16)
-                    vecs.append(lds_load_b128_raw(lds_buffer, off))
+                    vecs.append(lds_load_b128_raw(lds_buffer, scale_base, ks_byte_off + ld * 16))
                 results = []
                 for i in range_constexpr(reps):
                     vi = vector.extract(
@@ -933,18 +878,15 @@ def compile_mxscale_gemm(
             def load_scale_slice_b128(
                 lds_buffer, scale_base, full_reps, rep_start, rep_count, ks=0
             ):
-                """Load a contiguous slice of packed scale VGPRs for one K-subtile."""
+                """Load a contiguous slice of packed scale VGPRs for one K-subtile.
+
+                All offsets are pure Python integers folded into ds_load imm — no VALU.
+                """
                 ks_byte_off = (ks * full_reps + rep_start) * SCALES_PER_WMMA
-                eff_base = (
-                    scale_base
-                    if ks_byte_off == 0
-                    else scale_base + arith.index(ks_byte_off)
-                )
                 num_loads = (rep_count + 3) // 4
                 vecs = []
                 for ld in range_constexpr(num_loads):
-                    off = eff_base if ld == 0 else eff_base + arith.index(ld * 16)
-                    vecs.append(lds_load_b128_raw(lds_buffer, off))
+                    vecs.append(lds_load_b128_raw(lds_buffer, scale_base, ks_byte_off + ld * 16))
                 results = []
                 for i in range_constexpr(rep_count):
                     vi = vector.extract(
@@ -954,17 +896,17 @@ def compile_mxscale_gemm(
                 return results
 
             def _load_b_and_scales(
-                b_buf, b_bases, bs_buf, bs_bases, as_buf, as_bases, ks
+                b_buf, b_base, bs_buf, bs_base, as_buf, as_base, ks
             ):
                 """Load B frags + all scales for one K-subtile."""
                 b_frags = [
-                    load_b_frag(b_buf, b_bases, wn, ks)
+                    load_b_frag(b_buf, b_base, wn, ks)
                     for wn in range_constexpr(wmma_n_rep)
                 ]
                 b_scales_all = load_scale_b128(
-                    bs_buf, bs_bases[0], b_scale_load_rep, ks
+                    bs_buf, bs_base, b_scale_load_rep, ks
                 )
-                a_scales_all = load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
+                a_scales_all = load_scale_b128(as_buf, as_base, wmma_m_rep, ks)
                 if const_expr(is_fp4):
                     # FP4 32x16: scaleAType=0 fixed (no op_sel on BScale)
                     b_scales = b_scales_all
@@ -1028,7 +970,7 @@ def compile_mxscale_gemm(
             def _a_streaming_compute(
                 accs,
                 a_buf,
-                a_bases,
+                a_base,
                 b_frags,
                 b_scales,
                 a_scales,
@@ -1067,7 +1009,7 @@ def compile_mxscale_gemm(
                             )
 
                 a_frags_front = [
-                    load_a_frag(a_buf, a_bases[wm], ks)
+                    load_a_frag(a_buf, a_base, wm, ks)
                     for wm in range_constexpr(_front_wm)
                 ]
 
@@ -1076,11 +1018,11 @@ def compile_mxscale_gemm(
                 )
 
                 if const_expr(_use_partial_drain):
-                    nb_buf, nb_bases, nbs_buf, nbs_bases, nas_buf, nas_bases, n_ks = (
+                    nb_buf, nb_base, nbs_buf, nbs_base, nas_buf, nas_base, n_ks = (
                         next_bs_info
                     )
                     next_result = _load_b_and_scales(
-                        nb_buf, nb_bases, nbs_buf, nbs_bases, nas_buf, nas_bases, n_ks
+                        nb_buf, nb_base, nbs_buf, nbs_base, nas_buf, nas_base, n_ks
                     )
                     rocdl.s_wait_dscnt(_bs_ds_loads)
                 else:
@@ -1094,7 +1036,7 @@ def compile_mxscale_gemm(
 
                 if const_expr(_back_wm > 0):
                     a_frags_back = [
-                        load_a_frag(a_buf, a_bases[_front_wm + h], ks)
+                        load_a_frag(a_buf, a_base, _front_wm + h, ks)
                         for h in range_constexpr(_back_wm)
                     ]
                     _back_drain = _bs_ds_loads if _use_partial_drain else 0
@@ -1104,11 +1046,11 @@ def compile_mxscale_gemm(
                 if const_expr(_use_partial_drain):
                     return accs, next_result
                 if const_expr(next_bs_info is not None):
-                    nb_buf, nb_bases, nbs_buf, nbs_bases, nas_buf, nas_bases, n_ks = (
+                    nb_buf, nb_base, nbs_buf, nbs_base, nas_buf, nas_base, n_ks = (
                         next_bs_info
                     )
                     next_result = _load_b_and_scales(
-                        nb_buf, nb_bases, nbs_buf, nbs_bases, nas_buf, nas_bases, n_ks
+                        nb_buf, nb_base, nbs_buf, nbs_base, nas_buf, nas_base, n_ks
                     )
                     return accs, next_result
                 return accs
@@ -1124,23 +1066,23 @@ def compile_mxscale_gemm(
                 mid_compute_callback=None,
             ):
                 current_accs = list(accs_in)
-                a_buf, a_bases = _precompute_a_lane_bases(lds_a)
-                b_buf, b_bases = _precompute_b_lane_bases(lds_b)
-                as_buf, as_bases = _precompute_scale_lane_bases(
+                a_buf, a_base = _precompute_a_lane_bases(lds_a)
+                b_buf, b_base = _precompute_b_lane_bases(lds_b)
+                as_buf, as_base = _precompute_scale_lane_bases(
                     lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
                 )
-                bs_buf, bs_bases = _precompute_scale_lane_bases(
+                bs_buf, bs_base = _precompute_scale_lane_bases(
                     lds_bs, warp_n_base, b_scale_load_rep, interleaved_scale_cols_b
                 )
 
                 if const_expr(k_wmma_steps == 1):
                     b_frags, b_scales, a_scales = _load_b_and_scales(
-                        b_buf, b_bases, bs_buf, bs_bases, as_buf, as_bases, 0
+                        b_buf, b_base, bs_buf, bs_base, as_buf, as_base, 0
                     )
                     current_accs = _a_streaming_compute(
                         current_accs,
                         a_buf,
-                        a_bases,
+                        a_base,
                         b_frags,
                         b_scales,
                         a_scales,
@@ -1150,25 +1092,25 @@ def compile_mxscale_gemm(
                     )
                 else:
                     prev_b, prev_bs, prev_as = _load_b_and_scales(
-                        b_buf, b_bases, bs_buf, bs_bases, as_buf, as_bases, 0
+                        b_buf, b_base, bs_buf, bs_base, as_buf, as_base, 0
                     )
                     for ks in range_constexpr(k_wmma_steps - 1):
                         _mid_cb = mid_compute_callback if ks == 0 else None
                         current_accs, (prev_b, prev_bs, prev_as) = _a_streaming_compute(
                             current_accs,
                             a_buf,
-                            a_bases,
+                            a_base,
                             prev_b,
                             prev_bs,
                             prev_as,
                             ks,
                             next_bs_info=(
                                 b_buf,
-                                b_bases,
+                                b_base,
                                 bs_buf,
-                                bs_bases,
+                                bs_base,
                                 as_buf,
-                                as_bases,
+                                as_base,
                                 ks + 1,
                             ),
                             mid_compute_callback=_mid_cb,
@@ -1176,7 +1118,7 @@ def compile_mxscale_gemm(
                     current_accs = _a_streaming_compute(
                         current_accs,
                         a_buf,
-                        a_bases,
+                        a_base,
                         prev_b,
                         prev_bs,
                         prev_as,
@@ -1195,12 +1137,12 @@ def compile_mxscale_gemm(
                 mid_compute_callback=None,
             ):
                 current_accs = list(accs_in)
-                a_buf, a_bases = _precompute_a_lane_bases(lds_a)
-                b_buf, b_bases = _precompute_b_lane_bases(lds_b)
-                as_buf, as_bases = _precompute_scale_lane_bases(
+                a_buf, a_base = _precompute_a_lane_bases(lds_a)
+                b_buf, b_base = _precompute_b_lane_bases(lds_b)
+                as_buf, as_base = _precompute_scale_lane_bases(
                     lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
                 )
-                bs_buf, bs_bases = _precompute_scale_lane_bases(
+                bs_buf, bs_base = _precompute_scale_lane_bases(
                     lds_bs, warp_n_base, b_scale_load_rep, interleaved_scale_cols_b
                 )
                 _b_half_scale_loads = (_bank_half_b_scale_rep + 3) // 4
@@ -1212,13 +1154,13 @@ def compile_mxscale_gemm(
 
                 def _load_a_group(wm_base, wm_count, ks):
                     return [
-                        load_a_frag(a_buf, a_bases[wm_base + wm_local], ks)
+                        load_a_frag(a_buf, a_base, wm_base + wm_local, ks)
                         for wm_local in range_constexpr(wm_count)
                     ]
 
                 def _load_b_half(wn_base, ks):
                     return [
-                        load_b_frag(b_buf, b_bases, wn_base + wn_local, ks)
+                        load_b_frag(b_buf, b_base, wn_base + wn_local, ks)
                         for wn_local in range_constexpr(_bank_half_wn)
                     ]
 
@@ -1226,7 +1168,7 @@ def compile_mxscale_gemm(
                     b_frags = _load_b_half(wn_base, ks)
                     b_scales = load_scale_slice_b128(
                         bs_buf,
-                        bs_bases[0],
+                        bs_base,
                         b_scale_load_rep,
                         rep_start,
                         _bank_half_b_scale_rep,
@@ -1294,7 +1236,7 @@ def compile_mxscale_gemm(
 
                 for ks in range_constexpr(k_wmma_steps):
                     is_last_ks = ks == k_wmma_steps - 1
-                    a_scales_all = load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
+                    a_scales_all = load_scale_b128(as_buf, as_base, wmma_m_rep, ks)
 
                     a_top_frags = _load_a_group(0, _bank_half_wm, ks)
                     a_bottom_frags = _load_a_group(_bank_half_wm, _bank_half_wm, ks)
