@@ -562,8 +562,8 @@ class mxfp4_moe_aux_codegen:
                     _aux_sort_quant_body(ne, topk, mb, h),
                 )
 
-        # sort (threestage): MB in {32, 128}
-        for ne, h, e, topk in SHAPES:
+        # sort (threestage): MB in {32, 128} -- incl. FlyDSL-port extra shapes
+        for ne, h, e, topk in SHAPES + AUX_EXTRA_SHAPES:
             for mb in (32, 128):
                 yield Instance(
                     f"aux_sort3s_NE{ne}_TOPK{topk}_MB{mb}",
@@ -595,8 +595,8 @@ class mxfp4_moe_aux_codegen:
                     _aux_sort_only_body(ne, topk, mb, h),
                 )
 
-        # quant: MB in {32, 128}
-        for ne, h, e, topk in SHAPES:
+        # quant: MB in {32, 128} -- incl. FlyDSL-port extra shapes
+        for ne, h, e, topk in SHAPES + AUX_EXTRA_SHAPES:
             for mb in (32, 128):
                 yield Instance(
                     f"aux_quant_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
@@ -606,8 +606,8 @@ class mxfp4_moe_aux_codegen:
                     _aux_quant_body(ne, topk, mb, h),
                 )
 
-        # sort_scales: BM in {32, 128} (MB=16 callers clamp to BM=32)
-        for ne, h, e, topk in SHAPES:
+        # sort_scales: BM in {32, 128} -- incl. FlyDSL-port extra shapes
+        for ne, h, e, topk in SHAPES + AUX_EXTRA_SHAPES:
             for bm in (32, 128):
                 yield Instance(
                     f"aux_sortscales_BM{bm}_NE{ne}_E{e}_H{h}",
@@ -619,7 +619,9 @@ class mxfp4_moe_aux_codegen:
 
         # scatter_reduce / scatter_reduce_q: keyed by (D_HIDDEN, TOPK, NT) only,
         # so dedup across shapes that share an (h, topk).
-        for h, topk in sorted({(h, topk) for _ne, h, _e, topk in SHAPES}):
+        for h, topk in sorted(
+            {(h, topk) for _ne, h, _e, topk in SHAPES + AUX_EXTRA_SHAPES}
+        ):
             for nt in (False, True):
                 yield Instance(
                     f"aux_scatter_H{h}_TOPK{topk}_NT{1 if nt else 0}",

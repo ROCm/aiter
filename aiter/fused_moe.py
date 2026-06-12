@@ -429,12 +429,23 @@ def fused_moe_(
         # Kimi/DSR SHAPES; every other shape stays on BM16 (its only built variant).
         # Thresholds are heuristic -- production tunes them per shape via the CSV.
         _g = f"mxfp4_moe_g{{n}}_a4w4_NE{E}_H{model_dim}_E{inter_dim}"
-        _noninline_ok = (NE, model_dim, inter_dim, topk) in {
+        # Shapes whose full BM128 non-inline aux (threestage sort + quant +
+        # sort_scales + scatter) is codegen'd (gen_instances SHAPES + AUX_EXTRA_SHAPES).
+        # Must match those lists exactly -- sort_scales is per (NE, E, H), so each
+        # INTER variant needs its own entry (e.g. MiniMax 1536 not yet covered).
+        _noninline_ok = (E, model_dim, inter_dim, topk) in {
             (385, 7168, 512, 9),  # Kimi-K2.5
             (257, 7168, 512, 9),  # DSR
+            (256, 3072, 768, 8),  # MiniMax (INTER 768)
+            (32, 7168, 2048, 8),  # dsv3 variant
+            (384, 7168, 512, 8),  # Kimi-K2
+            (512, 4096, 256, 10),  # Qwen3.5 397B
         }
         if not _noninline_ok or M <= 1024:
-            # decode / mid-M: BM16 inline_quant + atomic (latency-bound).
+            # decode / mid-M: BM16 inline_quant + atomic (latency-bound). (The BM16<->
+            # BM128 crossover near M=1024 is shape-dependent -- wide shapes prefer BM128
+            # earlier, narrow ones like Qwen INTER=256 prefer BM16 longer -- and main
+            # wins at 1024 either way; production tunes the threshold per shape via CSV.)
             _bm = 16
             _kn1 = _g.format(n=1) + "_BM16_INLINEQUANT"
             _kn2 = _g.format(n=2) + f"_TOPK{topk}_BM16_ATOMIC"
@@ -1184,7 +1195,17 @@ def _mxfp4_moe_run(
     # mxfp4_moe_quant + sort_scales + reverse_sorted) moe_sorting can't replace, so
     # it keeps mxfp4_moe_sort(prologue=1).
     _threestage_ok = (
-        not inline_quant and NE in (257, 385) and topk == 9 and BM in (32, 128)
+        not inline_quant
+        and BM in (32, 128)
+        and (NE, D_HIDDEN, D_INTER, topk)
+        in {
+            (385, 7168, 512, 9),  # Kimi-K2.5
+            (257, 7168, 512, 9),  # DSR
+            (256, 3072, 768, 8),  # MiniMax (INTER 768)
+            (32, 7168, 2048, 8),  # dsv3 variant
+            (384, 7168, 512, 8),  # Kimi-K2
+            (512, 4096, 256, 10),  # Qwen3.5 397B
+        }
     )
     if _threestage_ok:
         aiter.mxfp4_moe_sort(
