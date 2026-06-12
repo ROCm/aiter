@@ -33,7 +33,7 @@ from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
-from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+from aiter.ops.triton.attention.block_sparse import block_attn_mask_to_ragged_lut
 from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
 
 CAUSAL = False

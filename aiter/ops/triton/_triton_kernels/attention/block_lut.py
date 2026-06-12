@@ -2,17 +2,24 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-Triton kernel to build the block-sparse LUT (kv_block_indices) from a 4D block
-attention mask without using nonzero or argsort.
+Generic Triton kernels for block-sparse attention mask construction:
+
+  * :func:`block_attn_mask_to_lut_kernel` -- build the block-sparse LUT
+    (kv_block_indices) from a 4D block attention mask without nonzero/argsort.
+  * :func:`triton_fill_block_map_kernel` / :func:`triton_fill_causal_mask_kernel`
+    -- SpargeAttn-style block-sparse mask construction.
+
+Host wrappers live in ``aiter/ops/triton/attention/block_sparse.py``. The VFA
+``m_init`` estimator kernel lives in
+``aiter/ops/triton/_triton_kernels/attention/vfa.py``.
 """
 
-import torch
 import triton
 import triton.language as tl
 
 
 @triton.jit()
-def _block_attn_mask_to_lut_kernel(
+def block_attn_mask_to_lut_kernel(
     mask_ptr,
     lut_start_ptr,
     lut_count_ptr,
@@ -72,33 +79,45 @@ def _block_attn_mask_to_lut_kernel(
     # No return; kv_block_indices is written in place
 
 
-def block_attn_mask_to_lut_kernel(
-    block_attn_mask: torch.Tensor,
-    lut_start: torch.Tensor,
-    lut_count: torch.Tensor,
-    kv_block_indices: torch.Tensor,
-    BLOCK_KB: int = 128,
+# ----------------------------------------------------------------------------
+# SpargeAttn-style block-sparse mask construction kernels.
+#
+#   * ``triton_fill_block_map_kernel`` -- scatters the top-``num_to_select``
+#     ranked K blocks per query block into a dense (B, H, Q, K) bool map.
+#   * ``triton_fill_causal_mask_kernel`` -- materializes a block-level causal
+#     mask accounting for a (possibly non-unit) query/key block-size ratio.
+#
+# The per-block mean-pooling proxy kernel (``triton_bmm_pool_sim_simmean``) that
+# ranks candidate blocks lives in ``aiter/ops/triton/_triton_kernels/pool.py``
+# (host wrappers in ``aiter/ops/triton/pool.py``).
+#
+# Reference: "SpargeAttn: Accurate Sparse Attention Accelerating Any Model
+# Inference" (https://arxiv.org/abs/2502.18137).
+# ----------------------------------------------------------------------------
+@triton.jit
+def triton_fill_block_map_kernel(
+    final_map,
+    num_to_select,
+    sorted_indices,
+    NK: tl.constexpr,
 ):
-    """
-    Launch the LUT-fill kernel. Caller must ensure block_attn_mask is 4D
-    (batch, num_heads, num_q_blocks, num_kv_blocks) and kv_block_indices has
-    length lut_count.sum().
-    """
-    batch, num_heads, num_q_blocks, num_kv_blocks = block_attn_mask.shape
-    num_programs = batch * num_heads * num_q_blocks
+    b, h, q = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    B, H, Q = tl.num_programs(0), tl.num_programs(1), tl.num_programs(2)
+    cur_num_to_select = tl.load(num_to_select + b * H * Q + h * Q + q)
+    cur_sorted_idx_ptr = sorted_indices + b * H * Q * NK + h * Q * NK + q * NK
+    cur_final_map_ptr = final_map + b * H * Q * NK + h * Q * NK + q * NK
+    # Always select at least one block per query block.
+    cur_num_to_select = (cur_num_to_select + 1) if cur_num_to_select == 0 else cur_num_to_select
+    for i in range(cur_num_to_select):
+        cur_idx = tl.load(cur_sorted_idx_ptr + i)
+        tl.store(cur_final_map_ptr + cur_idx, 1)
 
-    grid = (num_programs,)
-    _block_attn_mask_to_lut_kernel[grid](
-        block_attn_mask,
-        lut_start,
-        lut_count,
-        kv_block_indices,
-        stride_mask_b=block_attn_mask.stride(0),
-        stride_mask_h=block_attn_mask.stride(1),
-        stride_mask_qb=block_attn_mask.stride(2),
-        stride_mask_kb=block_attn_mask.stride(3),
-        num_heads=num_heads,
-        num_q_blocks=num_q_blocks,
-        num_kv_blocks=num_kv_blocks,
-        BLOCK_KB=BLOCK_KB,
-    )
+
+@triton.jit
+def triton_fill_causal_mask_kernel(mask, BqdivBk):
+    q, k = tl.program_id(0), tl.program_id(1)
+    Q, K = tl.num_programs(0), tl.num_programs(1)
+    if k >= (q + 1) * BqdivBk:
+        tl.store(mask + q * K + k, 0)
+    else:
+        tl.store(mask + q * K + k, 1)

@@ -24,6 +24,7 @@ from aiter.ops.triton.attention.fav3_sage import (
     build_attention_lut,
     fav3_sage_func,
     fav3_sage_wrapper_func,
+    fav3_sage_vfa_wrapper_func,
     get_sage_fwd_configs,
 )
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
@@ -31,7 +32,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
-from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+from aiter.ops.triton.attention.block_sparse import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
     sage_quant,
@@ -76,6 +77,16 @@ ALL_KERNELS: List[str] = [
     "aiter_bf16",
 ]
 
+# Kernels that consume fp8/mxfp4 inputs (1-byte Q/K) rather than the raw dtype.
+QUANTIZED_KERNELS = ("sage_fp8", "sage_fp8_vfa", "sage_mxfp4", "fav3_fp8", "aiter_fp8")
+# Kernels whose V is also 1 byte.
+FP8_V_KERNELS = ("fav3_fp8", "aiter_fp8")
+SAGE_FP8_KERNELS = ("sage_fp8", "sage_fp8_vfa")
+
+
+def ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
 
 @dataclass
 class ShapeSpec:
@@ -86,6 +97,18 @@ class ShapeSpec:
     n_ctx_k: int
     d_head: int
     d_head_v: int
+
+
+def dense_flops(shape: ShapeSpec) -> float:
+    """Total dense attention FLOPs (QK^T + PV) for the given shape."""
+    return (
+        2.0
+        * shape.batch
+        * shape.hq
+        * shape.n_ctx_q
+        * shape.n_ctx_k
+        * (shape.d_head + shape.d_head_v)
+    )
 
 
 @dataclass
@@ -170,6 +193,17 @@ def _mask_array_to_tensor(
     raise ValueError(f"mask must be 2D or 3D, got {depth}D")
 
 
+def _mask_from_json_item(item: Dict[str, Any], device: torch.device) -> LoadedMask:
+    """Build a LoadedMask from a JSON object, validating any declared block counts."""
+    if "mask" not in item:
+        raise ValueError("Each mask entry must include key 'mask'")
+    m = _mask_array_to_tensor(item["mask"], device)
+    for key, inferred in (("num_q_blocks", m.num_q_blocks), ("num_kv_blocks", m.num_kv_blocks)):
+        if key in item and item[key] != inferred:
+            raise ValueError(f"{key} mismatch: inferred {inferred}, got {item[key]}")
+    return m
+
+
 def load_block_mask_from_json(
     path: Optional[str],
     device: torch.device,
@@ -186,36 +220,10 @@ def load_block_mask_from_json(
 
     if not data:
         return None
-
     if "masks" in data:
-        loaded = []
-        for item in data["masks"]:
-            if "mask" not in item:
-                raise ValueError("Each element in 'masks' must include key 'mask'")
-            m = _mask_array_to_tensor(item["mask"], device)
-            if "num_q_blocks" in item and item["num_q_blocks"] != m.num_q_blocks:
-                raise ValueError(
-                    f"num_q_blocks mismatch: inferred {m.num_q_blocks}, got {item['num_q_blocks']}"
-                )
-            if "num_kv_blocks" in item and item["num_kv_blocks"] != m.num_kv_blocks:
-                raise ValueError(
-                    f"num_kv_blocks mismatch: inferred {m.num_kv_blocks}, got {item['num_kv_blocks']}"
-                )
-            loaded.append(m)
-        return loaded
-
+        return [_mask_from_json_item(item, device) for item in data["masks"]]
     if "mask" in data:
-        m = _mask_array_to_tensor(data["mask"], device)
-        if "num_q_blocks" in data and data["num_q_blocks"] != m.num_q_blocks:
-            raise ValueError(
-                f"num_q_blocks mismatch: inferred {m.num_q_blocks}, got {data['num_q_blocks']}"
-            )
-        if "num_kv_blocks" in data and data["num_kv_blocks"] != m.num_kv_blocks:
-            raise ValueError(
-                f"num_kv_blocks mismatch: inferred {m.num_kv_blocks}, got {data['num_kv_blocks']}"
-            )
-        return m
-
+        return _mask_from_json_item(data, device)
     return None
 
 
@@ -227,24 +235,20 @@ def kernel_block_sizes(kernel: KernelName) -> Tuple[int, int]:
     return cfg["BLOCK_M"], cfg["BLOCK_N"]
 
 
-def effective_attn_mode(args: argparse.Namespace) -> Optional[str]:
-    """Resolve the build_attention_lut mode for this run.
+def use_vfa(args: argparse.Namespace) -> bool:
+    """Whether this run exercises the VFA running-max freeze (the sage_fp8_vfa kernel)."""
+    return args.kernel == "sage_fp8_vfa"
 
-    The mode is derived from the kernel name and ``--sparge``:
 
-    * ``sage_fp8_vfa`` + ``--sparge`` -> ``"both"`` (VFA running-max freeze on a
-      sparge-selected block LUT),
-    * ``sage_fp8_vfa`` (no ``--sparge``) -> ``"vfa"`` (freeze, dense LUT),
-    * any other kernel + ``--sparge`` -> ``"sparge"`` (block selection only).
+def builds_qk_lut(args: argparse.Namespace) -> bool:
+    """Whether this run builds a Q/K-derived block LUT via ``build_attention_lut``.
 
-    Returns ``None`` for the plain dense / mask-driven path.
+    True iff ``--sparge`` is set: plain SpargeAttn block selection, or (for
+    ``sage_fp8_vfa``) SpargeAttn selection plus the VFA running-max freeze. The
+    standalone dense-VFA build was removed, so VFA always rides on a sparge LUT
+    (or a static mask, handled separately in ``run_benchmark``).
     """
-    is_vfa = args.kernel == "sage_fp8_vfa"
-    if args.sparge:
-        return "both" if is_vfa else "sparge"
-    if is_vfa:
-        return "vfa"
-    return None
+    return bool(args.sparge)
 
 
 def _ragged_lut_to_block_mask(
@@ -270,16 +274,17 @@ def _ragged_lut_to_block_mask(
 
 def build_attn_mode_lut(
     args: argparse.Namespace,
-    mode: str,
     q_bhsd: torch.Tensor,
     k_bhsd: torch.Tensor,
     device: torch.device,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], int, torch.Tensor]:
-    """Build a VFA/Sparge ragged LUT (+ freeze count) from bhsd Q/K.
+    """Build a Sparge (+ optional VFA) ragged LUT (+ freeze count) from bhsd Q/K.
 
-    Returns ``(block_lut, freeze_softmax_max_count, block_attn_mask)``.  The mask
-    is reconstructed from the LUT so the ``--compare-to-ref`` block-sparse
-    reference path keeps working.
+    Plain ``--sparge`` builds a SpargeAttn-selected LUT; ``sage_fp8_vfa``
+    additionally front-loads the top-``n_sample`` blocks for the VFA running-max
+    freeze (``use_vfa``). Returns ``(block_lut, freeze_softmax_max_count,
+    block_attn_mask)``; the mask is reconstructed from the LUT so the
+    ``--compare-to-ref`` block-sparse reference path keeps working.
     """
     batch, hq, n_ctx_q, _ = q_bhsd.shape
     n_ctx_k = k_bhsd.shape[2]
@@ -293,7 +298,7 @@ def build_attn_mode_lut(
         k_bhsd,
         simthreshd1=simthreshd1,
         cdfthreshd=cdfthreshd,
-        mode=mode,
+        use_vfa=use_vfa(args),
         n_sample=args.n_sample,
         is_causal=False,
         block_m=block_m,
@@ -365,24 +370,14 @@ def sparse_flops_from_lut(
     num_sparse_pairs = lut_count.sum().item()
 
     block_m, block_n = kernel_block_sizes(kernel)
-    num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
-    num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
+    num_q_blocks = ceil_div(shape.n_ctx_q, block_m)
+    num_kv_blocks = ceil_div(shape.n_ctx_k, block_n)
     num_dense_pairs = shape.batch * shape.hq * num_q_blocks * num_kv_blocks
 
-    total_dense_flops = (
-        2.0
-        * shape.batch
-        * shape.hq
-        * shape.n_ctx_q
-        * shape.n_ctx_k
-        * (shape.d_head + shape.d_head_v)
-    )
-
+    total_dense_flops = dense_flops(shape)
     if num_dense_pairs == 0:
         return 0.0, total_dense_flops
-
-    sparse_flops = total_dense_flops * (num_sparse_pairs / num_dense_pairs)
-    return sparse_flops, total_dense_flops
+    return total_dense_flops * (num_sparse_pairs / num_dense_pairs), total_dense_flops
 
 
 def fp8_quantize(
@@ -394,24 +389,19 @@ def fp8_quantize(
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     quant_dtype = aiter.dtypes.fp8
-    q_quant, q_descale = aiter.per_tensor_quant(
-        q,
-        scale=torch.abs(q).max() if scale is None else scale,
-        quant_dtype=quant_dtype,
-        dtypeMax=torch.finfo(quant_dtype).max,
-    )
-    k_quant, k_descale = aiter.per_tensor_quant(
-        k,
-        scale=torch.abs(k).max() if scale is None else scale,
-        quant_dtype=quant_dtype,
-        dtypeMax=torch.finfo(quant_dtype).max,
-    )
-    v_quant, v_descale = aiter.per_tensor_quant(
-        v,
-        scale=torch.abs(v).max() if scale is None else scale,
-        quant_dtype=quant_dtype,
-        dtypeMax=torch.finfo(quant_dtype).max,
-    )
+    dtype_max = torch.finfo(quant_dtype).max
+
+    def _quant(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return aiter.per_tensor_quant(
+            x,
+            scale=torch.abs(x).max() if scale is None else scale,
+            quant_dtype=quant_dtype,
+            dtypeMax=dtype_max,
+        )
+
+    q_quant, q_descale = _quant(q)
+    k_quant, k_descale = _quant(k)
+    v_quant, v_descale = _quant(v)
     return q_quant, k_quant, v_quant, q_descale, k_descale, v_descale
 
 
@@ -545,9 +535,26 @@ def make_kernel_runner(
     head_dim = q_bshd.shape[-1]
     softmax_scale = head_dim**-0.5
 
-    # sage_fp8_vfa is now just sage_fp8 driven by a build_attention_lut LUT plus
-    # the matching freeze_softmax_max_count (see effective_attn_mode).
-    if args.kernel in ("sage_fp8", "sage_fp8_vfa"):
+    # sage_fp8_vfa without a block LUT (no --sparge / mask): dense VFA. The
+    # m_init running-max estimate is intrinsic to this path and depends on the
+    # quantized Q/K, so we always go through the full wrapper (quant + m_init +
+    # kernel), even in non-e2e mode.
+    if args.kernel == "sage_fp8_vfa" and block_lut is None:
+        return lambda: fav3_sage_vfa_wrapper_func(
+            q,
+            k,
+            v,
+            softmax_scale,
+            return_lse=False,
+            layout=args.layout,
+            n_sample_blocks=args.n_sample,
+            block_lut=None,
+        )
+
+    # sage_fp8 (and sage_fp8_vfa with a LUT) run the unified kernel driven by a
+    # build_attention_lut LUT plus the matching freeze_softmax_max_count
+    # (see build_attn_mode_lut / use_vfa).
+    if args.kernel in SAGE_FP8_KERNELS:
         if args.e2e:
             return lambda: fav3_sage_wrapper_func(
                 q,
@@ -793,12 +800,11 @@ def benchmark_single_case(
     explicit_block_attn_mask: Optional[torch.Tensor] = None,
 ) -> float:
     shape = infer_shape_spec(q, v, args.layout)
-    attn_mode = effective_attn_mode(args)
     freeze_softmax_max_count = -1
 
     # Block-mask precedence (highest first):
     #   1. an explicit list-mode mask, 2. a --block-mask-file mask,
-    #   3. a random --block-sparsity mask, 4. the Q/K-derived --sparge/vfa LUT.
+    #   3. a random --block-sparsity mask, 4. the Q/K-derived --sparge LUT.
     # A static mask (1-3) is used directly and wins over the --sparge build.
     file_mask = (
         explicit_block_attn_mask
@@ -825,16 +831,16 @@ def benchmark_single_case(
         # front-load the top-n blocks (no build_attention_lut). Keep the LUT in
         # ascending block order and just run the kernel with the n_sample freeze
         # count so the VFA running-max-freeze path is still exercised.
-        if args.kernel == "sage_fp8_vfa" and block_lut is not None:
+        if use_vfa(args) and block_lut is not None:
             freeze_softmax_max_count = args.n_sample
-    elif attn_mode is not None:
-        # VFA/Sparge: build the ragged LUT (+ freeze count) from the bhsd Q/K
-        # via build_attention_lut, replacing the mask-driven LUT path.
+    elif builds_qk_lut(args):
+        # Sparge (+ optional VFA): build the ragged LUT (+ freeze count) from the
+        # bhsd Q/K via build_attention_lut, replacing the mask-driven LUT path.
         q_bhsd, k_bhsd, _ = layout_preprocess(
             q, k, v, layout=args.layout, target_layout="bhsd"
         )
         block_lut, freeze_softmax_max_count, block_attn_mask = build_attn_mode_lut(
-            args, attn_mode, q_bhsd, k_bhsd, q.device
+            args, q_bhsd, k_bhsd, q.device
         )
     else:
         block_attn_mask = None
@@ -849,12 +855,9 @@ def benchmark_single_case(
     if args.compare_to_ref:
         current_primary = primary_output(fn())
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
-        # "vfa" keeps every K block (the LUT is dense), so the right reference is
-        # plain dense attention -- pass no mask so any --ref backend can be used.
-        ref_mask = None if attn_mode == "vfa" else block_attn_mask
-        ref_primary = make_reference_output(args, q, k, v, ref_mask)
+        ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
         compare_accuracy(current_primary, ref_primary)
-        if attn_mode == "vfa" or args.kernel == "sage_fp8_vfa":
+        if use_vfa(args):
             # VFA freezes the online-softmax running max after the first few
             # K-block iterations, so a handful of weights drift from the exact
             # reference.  Allow a higher pass-rate so the check passes by default.
@@ -875,30 +878,11 @@ def benchmark_single_case(
         else:
             check_attention_outputs(current_primary, ref_primary, fp8=False)
 
-    total_flops = (
-        2.0
-        * shape.batch
-        * shape.hq
-        * shape.n_ctx_q
-        * shape.n_ctx_k
-        * (shape.d_head + shape.d_head_v)
-    )
+    total_flops = dense_flops(shape)
 
-    if args.kernel in (
-        "fav3_fp8",
-        "aiter_fp8",
-        "sage_fp8",
-        "sage_fp8_vfa",
-        "sage_mxfp4",
-    ):
-        q_elem_size = 1
-        k_elem_size = 1
-    else:
-        q_elem_size = q.element_size()
-        k_elem_size = k.element_size()
-
-    v_elem_size = 1 if args.kernel in ("fav3_fp8", "aiter_fp8") else v.element_size()
-    mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
+    qk_elem_size = 1 if args.kernel in QUANTIZED_KERNELS else q.element_size()
+    v_elem_size = 1 if args.kernel in FP8_V_KERNELS else v.element_size()
+    mem = compute_memory_bytes(shape, qk_elem_size, qk_elem_size, v_elem_size)
 
     sparse_flops = None
     if block_lut is not None:
@@ -953,18 +937,22 @@ def make_styles(num_lines: int) -> List[Tuple[str, str]]:
     return [(palette[i % len(palette)], "-") for i in range(num_lines)]
 
 
+def has_sparse_metric(args: argparse.Namespace) -> bool:
+    """Whether this run produces a block-sparse LUT (and thus a sparse-throughput metric)."""
+    return (
+        args.block_mask_file is not None
+        or args.block_sparsity is not None
+        or builds_qk_lut(args)
+    )
+
+
 def create_single_shape_config(args: argparse.Namespace) -> List[Any]:
     hk = args.hk if args.hk else args.hq
     sk = args.sk if args.sk else args.sq
     d_head = args.d if args.d else 128
     d_head_v = args.dv if args.dv else d_head
 
-    include_sparse_metric = (
-        args.block_mask_file is not None
-        or args.block_sparsity is not None
-        or effective_attn_mode(args) is not None
-    )
-    lines = metric_lines(args, include_sparse_metric)
+    lines = metric_lines(args, has_sparse_metric(args))
 
     return [
         triton.testing.Benchmark(
@@ -991,12 +979,7 @@ def create_captured_config(
     args: argparse.Namespace,
     inputs: List[Dict[str, Any]],
 ) -> List[Any]:
-    include_sparse_metric = (
-        args.block_mask_file is not None
-        or args.block_sparsity is not None
-        or effective_attn_mode(args) is not None
-    )
-    lines = metric_lines(args, include_sparse_metric)
+    lines = metric_lines(args, has_sparse_metric(args))
 
     return [
         triton.testing.Benchmark(
@@ -1099,17 +1082,20 @@ def validate_args(args: argparse.Namespace) -> None:
             "--block-sparsity R to benchmark a random block-sparse mask."
         )
 
-    attn_mode = effective_attn_mode(args)
-    if attn_mode is not None:
+    # sage_fp8_vfa with a block LUT (--sparge or a static mask) rides the VFA
+    # running-max freeze on the LUT; without one it runs the dense VFA path
+    # (fav3_sage_vfa_wrapper_func, m_init estimate from compute_m_proxy_topn).
+
+    if builds_qk_lut(args):
         if args.causal:
             raise NotImplementedError(
                 "--sparge / sage_fp8_vfa does not support causal attention "
                 "(the block-sparse LUT path is non-causal)"
             )
         if args.block_mask_file:
-            # The file mask is used directly; only the plain 'sparge' mode accepts
-            # an external mask (vfa/both build a dense/front-loaded LUT from Q/K).
-            if attn_mode != "sparge":
+            # The file mask is used directly; only plain SpargeAttn accepts an
+            # external mask (VFA builds a front-loaded LUT from Q/K).
+            if use_vfa(args):
                 raise ValueError(
                     "--block-mask-file can only be combined with "
                     "--kernel=sage_fp8 --sparge, not the sage_fp8_vfa kernel"
@@ -1129,15 +1115,7 @@ def validate_args(args: argparse.Namespace) -> None:
         if args.load_captured:
             raise ValueError("--kernel=all does not support --load-captured")
 
-    _quantized_kernels = (
-        "sage_fp8",
-        "sage_fp8_vfa",
-        "sage_mxfp4",
-        "fav3_fp8",
-        "aiter_fp8",
-    )
-
-    if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
+    if args.e2e and args.kernel not in QUANTIZED_KERNELS and args.kernel != "all":
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
 
     if args.kernel not in ("sage_mxfp4", "all") and (
@@ -1168,10 +1146,6 @@ def run_benchmark_generated(
         q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
         k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
         v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
-
-        q.requires_grad = False
-        k.requires_grad = False
-        v.requires_grad = False
 
         q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
 
@@ -1240,10 +1214,6 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: List[LoadedMask]) -
         v = torch.randn(
             (loaded.batch, HK, n_ctx_k, D_HEAD_V), device=device, dtype=dtype
         )
-        q.requires_grad = False
-        k.requires_grad = False
-        v.requires_grad = False
-
         q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
         return benchmark_single_case(
             args,
@@ -1268,15 +1238,7 @@ def parse_args() -> argparse.Namespace:
         "--kernel",
         type=str,
         default="sage_fp8",
-        choices=[
-            "sage_fp8",
-            "sage_fp8_vfa",
-            "sage_mxfp4",
-            "fav3_fp8",
-            "aiter_fp8",
-            "aiter_bf16",
-            "all",
-        ],
+        choices=[*ALL_KERNELS, "all"],
         help="Kernel implementation to benchmark. Use 'all' to compare all backends.",
     )
 
@@ -1379,7 +1341,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="Number of top pooled-score K blocks front-loaded per q-block for "
-        "the sage_fp8_vfa kernel (vfa/both)",
+        "the sage_fp8_vfa kernel ('both' mode) / used as the static-mask freeze count",
     )
     parser.add_argument(
         "--simthreshd1",
@@ -1510,20 +1472,10 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     q = torch.randn((args.b, args.hq, args.sq, d_head), device=device, dtype=dtype)
     k = torch.randn((args.b, hk, sk, d_head), device=device, dtype=dtype)
     v = torch.randn((args.b, hk, sk, d_head_v), device=device, dtype=dtype)
-    q.requires_grad = False
-    k.requires_grad = False
-    v.requires_grad = False
     q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=args.layout)
 
     shape = infer_shape_spec(q, v, args.layout)
-    total_flops = (
-        2.0
-        * shape.batch
-        * shape.hq
-        * shape.n_ctx_q
-        * shape.n_ctx_k
-        * (shape.d_head + shape.d_head_v)
-    )
+    total_flops = dense_flops(shape)
 
     saved_kernel = args.kernel
     rows: List[Tuple[str, float, float]] = []
@@ -1535,11 +1487,10 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     for kernel_name in ALL_KERNELS:
         args.kernel = kernel_name
         try:
-            attn_mode = effective_attn_mode(args)
             block_lut, freeze = None, -1
-            if attn_mode is not None:
+            if builds_qk_lut(args):
                 block_lut, freeze, _ = build_attn_mode_lut(
-                    args, attn_mode, q_bhsd, k_bhsd, device
+                    args, q_bhsd, k_bhsd, device
                 )
             fn = make_kernel_runner(
                 args, q, k, v, block_lut=block_lut, freeze_softmax_max_count=freeze
