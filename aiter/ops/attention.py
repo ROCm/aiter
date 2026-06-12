@@ -417,6 +417,7 @@ def _pa_decode_bf16_asm(
     V: torch.Tensor,
     kv_indices: torch.Tensor,
     context_lens: torch.Tensor,
+    softmax_scale: float,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
@@ -462,8 +463,8 @@ def pa_decode_bf16_asm(
       * `Q`/`K`/`V` are FP8; `out` is bf16 with Q's logical shape.
       * `query_scale`/`key_scale`/`value_scale` are the per-tensor FP8 dequant
         scales; the attention `softmax_scale` (typically 1/sqrt(head_dim)) is
-        folded into `key_scale` before launch (the kernel forms
-        scl_log2e = query_scale * key_scale * log2e).
+        passed BY VALUE (kernarg 0x60) and the kernel forms
+        scl_log2e = query_scale * key_scale * softmax_scale * log2e.
       * `sink` (optional) holds per-Q-head fp32 logits in the kernel's
         pre-scale raw-logit domain, shape [kv_head_num * gqa].  The kernel
         always reads this slot, so when `sink` is None a -inf buffer is
@@ -487,8 +488,9 @@ def pa_decode_bf16_asm(
         )
 
     q_scale = _scale_tensor(query_scale)
-    # Fold the attention softmax scale into key_scale (matches pa_ps.cpp).
-    k_scale = _scale_tensor(key_scale, softmax_scale)
+    # softmax_scale is passed BY VALUE (kernarg 0x60); the kernel applies it, so
+    # do NOT pre-fold it into key_scale.
+    k_scale = _scale_tensor(key_scale)
     v_scale = _scale_tensor(value_scale)
 
     if sink is None:
@@ -506,6 +508,7 @@ def pa_decode_bf16_asm(
         V,
         kv_indices,
         context_lens,
+        softmax_scale,
         q_scale,
         k_scale,
         v_scale,
