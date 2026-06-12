@@ -969,6 +969,85 @@ def _flydsl_stage2_wrapper(
     )
 
 
+_proven_fp4_stage1_cache = {}
+
+
+def _get_proven_fp4_stage1(tune_file):
+    """FlyDSL stage1 kernels with a fused activation-quant (``_fp4``) epilogue
+    that ship in the merged tuned config. Membership here means the kernel's
+    codegen is AMD-validated/known-good, so it is safe to JIT-compile on demand.
+    """
+    if tune_file in _proven_fp4_stage1_cache:
+        return _proven_fp4_stage1_cache[tune_file]
+    result = set()
+    try:
+        import pandas as pd
+
+        if os.path.exists(tune_file):
+            df = pd.read_csv(tune_file)
+            if "kernelName1" in df.columns:
+                for kn in df["kernelName1"].dropna().astype(str):
+                    if kn.startswith("flydsl_moe1") and kn.endswith("_fp4"):
+                        result.add(kn)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            f"[fused_moe] could not collect fused-quant stage1 kernels: {e}"
+        )
+    _proven_fp4_stage1_cache[tune_file] = result
+    return result
+
+
+def _maybe_fuse_stage1_quant(kernelName1, q_dtype_a, tune_file, token=None):
+    """Opt-in upgrade of a FlyDSL stage1 kernel to its fused-quant sibling.
+
+    The fused stage1 kernel writes fp4 activations + sorted e8m0 scales directly
+    from the gate/up GEMM epilogue, which lets fused_moe skip the standalone
+    inter-stage activation-quant kernel (dynamic_mxfp4 quant + moe_sort).
+
+    Gated by ``AITER_FUSE_STAGE1_QUANT`` (default off) so default behavior is
+    unchanged. Only swaps to a kernel that ships in a tuned config, and falls
+    back silently to the original kernel when no proven fused sibling exists.
+
+    The fused epilogue (quant+sort+swizzle) carries a fixed per-launch cost that
+    is a larger fraction of a tiny GEMM, so at small token tiers it can run
+    slightly slower than the standalone split path. ``AITER_FUSE_STAGE1_MIN_TOKENS``
+    (default 0 = no gate, i.e. behavior unchanged) restricts the upgrade to
+    ``token >= threshold`` so the win is kept at large-M decode and the small-M
+    tail is left on the stock kernel. ``token`` is the padded per-local-expert
+    M tier (1,2,..,512,1024,2048,4096,..) used for the kernel-config lookup.
+    """
+    try:
+        _enabled = int(os.environ.get("AITER_FUSE_STAGE1_QUANT", "0"))
+    except ValueError:
+        _enabled = 0
+    if not _enabled:
+        return kernelName1
+    try:
+        _min_tokens = int(os.environ.get("AITER_FUSE_STAGE1_MIN_TOKENS", "0"))
+    except ValueError:
+        _min_tokens = 0
+    if _min_tokens > 0 and token is not None and token < _min_tokens:
+        return kernelName1
+    if q_dtype_a != dtypes.fp4x2:
+        return kernelName1
+    if not kernelName1.startswith("flydsl_moe1") or kernelName1.endswith("_fp4"):
+        return kernelName1
+    proven = _get_proven_fp4_stage1(tune_file)
+    if not proven:
+        return kernelName1
+    candidates = [f"{kernelName1}_fp4"]
+    if kernelName1.endswith("_bnt0"):
+        # The fused variants are not tuned with the b-non-temporal flag; drop it.
+        candidates.append(f"{kernelName1[: -len('_bnt0')]}_fp4")
+    for cand in candidates:
+        if cand in proven:
+            logger.info(
+                f"[fused_moe] AITER_FUSE_STAGE1_QUANT: {kernelName1} -> {cand}"
+            )
+            return cand
+    return kernelName1
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -1299,6 +1378,10 @@ def get_2stage_cfgs(
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
         )
+        if is_flydsl1:
+            kernelName1 = _maybe_fuse_stage1_quant(
+                kernelName1, q_dtype_a, tune_file, token=token
+            )
         _s1_fp4q = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
         if is_flydsl1:
             stage1_func = functools.partial(
