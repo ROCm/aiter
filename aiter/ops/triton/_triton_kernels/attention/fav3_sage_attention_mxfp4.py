@@ -3,8 +3,6 @@ import functools
 import torch
 import triton
 import triton.language as tl
-import aiter
-
 
 @triton.jit
 def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
