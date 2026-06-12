@@ -99,6 +99,9 @@ def _load_grouped_config_rows():
             continue
         with open(path, newline="") as f:
             rows.extend(csv.DictReader(f))
+    # Skip malformed rows (e.g. a stray blank trailing line); an all-empty row
+    # matches every lookup as a wildcard and would mask the real tuned config.
+    rows = [r for r in rows if _as_int(r.get("token"), None) is not None]
     _GROUPED_CONFIG_CACHE[cfg_path] = rows
     return rows
 
@@ -135,32 +138,37 @@ def _find_grouped_config(
     }
     rows = _load_grouped_config_rows()
 
-    def _matches(row, *, require_cu_num: bool):
+    def _matches(row, *, require_cu_num: bool, ignore_token: bool = False):
         for k, v in keys.items():
-            if k == "cu_num" and not require_cu_num:
+            if (k == "cu_num" and not require_cu_num) or (k == "token" and ignore_token):
                 continue
             if row.get(k) and str(row.get(k)).strip() != v:
                 return False
         return True
 
-    matches = [row for row in rows if _matches(row, require_cu_num=True)]
-    if not matches:
-        matches = [row for row in rows if _matches(row, require_cu_num=False)]
-    if not matches:
-        if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
-            "",
-            "0",
-            "false",
-            "False",
-        ):
-            print(
-                f"[grouped-gemm-debug] no grouped CSV config match for {keys}; "
-                f"loaded_rows={len(rows)}",
-                flush=True,
-            )
-        return None
-    matches.sort(key=lambda r: float(r.get("us") or 0.0))
-    return matches[0]
+    def _best(cands):
+        return min(cands, key=lambda r: float(r.get("us") or 0.0)) if cands else None
+
+    # require_cu_num=True prefers a config tuned for this GPU; False falls back to
+    # any GPU's config (mirrors the original two-tier lookup).
+    for require_cu_num in (True, False):
+        exact = _best([r for r in rows if _matches(r, require_cu_num=require_cu_num)])
+        if exact is not None:
+            return exact
+
+    # No exact token row: snap up to the nearest tuned token bucket so an arbitrary
+    # token_num reuses a tuned config (and its max_m upper bound) instead of
+    # recompiling per distinct M. Out-of-range token_num falls through to None.
+    for require_cu_num in (True, False):
+        cand = [
+            r for r in rows if _matches(r, require_cu_num=require_cu_num, ignore_token=True)
+        ]
+        tokens = sorted({int(r["token"]) for r in cand})
+        bucket = next((t for t in tokens if t >= token_num), None)
+        if bucket is not None:
+            return _best([r for r in cand if int(r["token"]) == bucket])
+
+    return None
 
 
 def _use_grouped_gemm_enabled() -> bool:
@@ -181,6 +189,17 @@ def _align_up(value: int, alignment: int) -> int:
     if alignment <= 0:
         raise ValueError(f"alignment must be > 0, got {alignment}")
     return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
+
+
+def _pow2_bucket_max_m(raw_max_m: int, warp_tile_m: int) -> int:
+    """Round max_m up to a power-of-two bucket, aligned to warp_tile_m.
+
+    max_m is baked into the compiled kernel, so bucketing caps the number of
+    compiled variants instead of one per distinct token count.
+    """
+    v = max(int(raw_max_m), int(warp_tile_m))
+    pow2 = 1 << (v - 1).bit_length()
+    return max(pow2, _align_up(pow2, int(warp_tile_m)))
 
 
 def _make_contiguous_psum_layout(
@@ -595,18 +614,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if use_actual_max_m:
         counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
         raw_max_m = int(counts.max().item()) if counts.numel() else 0
+        # Data-dependent count: bucket to a power of two so distinct batches reuse
+        # a small fixed set of kernels.
+        max_m = _pow2_bucket_max_m(raw_max_m, warp_tile_m)
+    elif cfg_row is not None:
+        # Tuned upper bound (exact or snapped bucket); align to warp_tile_m.
+        raw_max_m = _as_int(cfg_row.get("max_m"), token_num)
+        max_m = max(warp_tile_m, _align_up(raw_max_m, warp_tile_m))
     else:
-        # Static upper bound: each token routes at most one row per expert, so no
-        # expert can receive more than token_num rows. CUDAGraph buckets have
-        # static token_num/topk; per-expert count <= token_num*topk.
-        if (not use_actual_max_m) and cfg_row is not None:
-            raw_max_m = _as_int(cfg_row.get("max_m"), token_num)
-        else:
-            raw_max_m = token_num
-    max_m = max(
-        warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
-    )
-    _grouped_dbg(f"routing max_m={max_m} actual={use_actual_max_m}")
+        # No tuned row: per-expert rows <= token_num; bucket to a power of two.
+        max_m = _pow2_bucket_max_m(token_num, warp_tile_m)
 
     # Build route maps once. The fast path uses the FlyDSL atomic-scatter kernel;
     # the naive path keeps a deterministic torch fallback for tests/debug.
