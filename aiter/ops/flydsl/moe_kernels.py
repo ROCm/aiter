@@ -1029,6 +1029,7 @@ def compile_flydsl_moe_stage2(
     split_reduce: bool = False,
     n_per_wave: int = 32,
     k_batch: int = 1,
+    persist: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if direct:
@@ -1108,6 +1109,7 @@ def compile_flydsl_moe_stage2(
             b_nt=b_nt,
             n_per_wave=n_per_wave,
             k_batch=k_batch,
+            persist=persist,
         )
 
 
@@ -2075,6 +2077,7 @@ def flydsl_moe_stage2(
         mfma_variant=mfma_variant,
         n_per_wave=n_per_wave,
         k_batch=k_batch,
+        persist=bool(persist),
     )
     _run_compiled(exe, args)
 
