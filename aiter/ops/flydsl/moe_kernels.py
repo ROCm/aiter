@@ -1518,6 +1518,45 @@ def _get_compiled_route_maps():
     return build_moe_route_maps_module()
 
 
+@functools.cache
+def _get_compiled_contiguous_psum():
+    """Compile and cache the contiguous M-tile prefix-sum kernel."""
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_contiguous_psum_module,
+    )
+
+    return build_moe_contiguous_psum_module()
+
+
+def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
+    """Tile-aligned exclusive prefix sum over per-expert counts in one FlyDSL
+    kernel (no torch.cumsum / rocprim scan / D2D temp copy).
+
+    Returns ``(starts, psum, contiguous_m_t)``:
+      starts        : (E,) int32  exclusive prefix sum of ceil-aligned counts
+      psum          : (E,) int32  starts[e] + masked_m[e] (actual ends)
+      contiguous_m_t: (1,) int32  max(tile_m, sum(aligned)); read ``.item()``
+                      once on the host for the grouped-buffer shape.
+    """
+    device = masked_m.device
+    experts = int(experts)
+    masked_m_i32 = masked_m[:experts].to(torch.int32)
+    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
+    launch = _get_compiled_contiguous_psum()
+    launch(
+        masked_m_i32,
+        starts,
+        psum,
+        contiguous_m_t,
+        experts,
+        int(tile_m),
+        stream=torch.cuda.current_stream(),
+    )
+    return starts, psum, contiguous_m_t
+
+
 def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
     """Per-token route maps via a single atomic-scatter kernel (SGLang-style),
     no host-side argsort / nonzero / one-hot. Returns
