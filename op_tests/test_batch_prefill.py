@@ -2470,6 +2470,48 @@ def test_batch_prefill_per_token_head_pytest(
     )
 
 
+# Small-seqlen regression for the PER_TOKEN_HEAD q_descale coredump. When
+# qo_len <= kM0 (128), the query tile is mostly padding rows; before the fix the
+# kernel read q_descale_per_token for those padding rows (past the [total_q]
+# tensor) and faulted. Exercises the generated PER_TOKEN_HEAD path on the
+# layout-independent linear cache.
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("qo_len,kv_len", [(1, 1), (4, 4), (16, 16), (16, 64)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("page_size", [64, 1024])
+def test_batch_prefill_per_token_head_small_seqlen_pytest(
+    batch_size,
+    qo_len,
+    kv_len,
+    causal,
+    page_size,
+):
+    """Regression: PER_TOKEN_HEAD must not OOB-read q_descale on padding rows
+    when the query tile (kM0=128) is larger than the valid sequence length."""
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, 0.0),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return
+
+    run_batch_prefill_per_token_head(
+        kvcache_layout="linear",
+        table_layout="sglang",
+        batch_size=batch_size,
+        qo_len=qo_len,
+        kv_len=kv_len,
+        page_size=page_size,
+        num_qo_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        causal=causal,
+        logits_soft_cap=0.0,
+        dtype=torch.bfloat16,
+        contiguous_kv=True,
+        seed=42,
+    )
+
+
 def _make_cross_layer_5d_view(
     num_blocks: int,
     num_kv_heads: int,
@@ -3065,7 +3107,7 @@ def run_batch_prefill_per_token_head(
         torch.manual_seed(seed)
 
     quant_dtype = dtypes.fp8
-    SUPPORTED_PAGE_SIZES = (64, 1024)
+    SUPPORTED_PAGE_SIZES = (16, 64, 1024)
     if page_size not in SUPPORTED_PAGE_SIZES:
         if skip_test_if(
             True,

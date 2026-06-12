@@ -25,6 +25,8 @@ Environment variables:
                                 without changing magnitudes), "per_head_random"
                                 (uniform [0.25, 1.0] per q-head, fixed seed),
                                 or "none" (skip the p_scale fold)
+    BENCH_BATCHES=...           comma-separated batch/concurrency values
+                                (default: 1,2,4,6,8)
 """
 
 import argparse
@@ -55,6 +57,22 @@ if P_SCALE_MODE not in _VALID_P_SCALE:
     )
 
 
+def _parse_int_tuple_env(name, default):
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        values = tuple(int(x.strip()) for x in raw.split(",") if x.strip())
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a comma-separated integer list") from exc
+    if not values or any(x <= 0 for x in values):
+        raise SystemExit(f"{name} must contain positive integers")
+    return values
+
+
+BATCHES = _parse_int_tuple_env("BENCH_BATCHES", (1, 2, 4, 6, 8))
+
+
 def _build_p_scale(num_qo_heads):
     """Build a [num_qo_heads] fp32 cuda tensor for the given mode, or None."""
     if P_SCALE_MODE == "none":
@@ -71,7 +89,9 @@ def _build_p_scale(num_qo_heads):
         num_qo_heads, dtype=torch.float32, device="cuda", generator=g
     )
 
-DEFAULT_SEQS = (1024, 16384, 32768, 65536, 131072)
+# Small seqlens (<=16) exercise the kM0=128 query tile with mostly padding rows;
+# they reproduce the PER_TOKEN_HEAD small-seqlen q_descale out-of-bounds coredump.
+DEFAULT_SEQS = (4, 8, 16, 1024, 16384, 32768, 65536, 131072)
 _parser = argparse.ArgumentParser(
     description="Benchmark FP8 PER_TOKEN_HEAD batch_prefill kernel.",
     formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -87,7 +107,7 @@ _parser.add_argument(
 _args = _parser.parse_args()
 SEQS = tuple(_args.seqs)
 
-SHAPES = [(b, s, s, 8, 1, 128, True, 0.0) for s in SEQS for b in (2, 4, 6, 8)]
+SHAPES = [(b, s, s, 8, 1, 128, True, 0.0) for s in SEQS for b in BATCHES]
 
 
 def _fmt(r):
