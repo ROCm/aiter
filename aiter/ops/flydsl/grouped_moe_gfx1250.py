@@ -690,12 +690,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     grouped_w1 = (w1 if w1.dtype == torch.uint8 else w1.view(torch.uint8)).contiguous()
     grouped_w2 = (w2 if w2.dtype == torch.uint8 else w2.view(torch.uint8)).contiguous()
     _grouped_dbg("weight layout done")
-    # Weight scales are already preshuffled per expert (new B-scale layout:
-    # rows N -> N//32 super-rows, k_scale cols -> k_scale*32 interleaved cols).
+    # Weight scales are already preshuffled per expert (N4K8 B-scale layout:
+    # rows N -> N//64 super-rows, k_scale cols -> k_scale*64 folded cols; see
+    # _grouped_b_scale_preshuffle_e8m0).
     grouped_w1_scale = w1_scale.reshape(
-        E, (2 * inter_dim) // 32, (model_dim // 32) * 32
+        E, (2 * inter_dim) // 64, (model_dim // 32) * 64
     )
-    grouped_w2_scale = w2_scale.reshape(E, model_dim // 32, (inter_dim // 32) * 32)
+    grouped_w2_scale = w2_scale.reshape(E, model_dim // 64, (inter_dim // 32) * 64)
 
     # grouped_a1_scale is produced above: fused gather+preshuffle (fast path) or
     # scatter + _grouped_a8w4_preshuffle_e8m0_scale (naive path).
