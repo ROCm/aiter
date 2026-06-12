@@ -599,9 +599,16 @@ def make_kernel_runner(
         m_init = None
         if dense_vfa:
             m_init = compute_m_proxy_topn(
-                q, k, q_int8, k_int8, q_scale, k_scale,
-                BLKQ=cfg["BLOCK_M"], BLKK=cfg["BLOCK_N"],
-                layout=args.layout, n_blocks=args.n_sample,
+                q,
+                k,
+                q_int8,
+                k_int8,
+                q_scale,
+                k_scale,
+                BLKQ=cfg["BLOCK_M"],
+                BLKK=cfg["BLOCK_N"],
+                layout=args.layout,
+                n_blocks=args.n_sample,
             )
 
         kv_idx, lut_s, lut_c, sparse = _unpack_block_lut(block_lut)
