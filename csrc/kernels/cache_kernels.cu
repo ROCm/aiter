@@ -1136,6 +1136,121 @@ __global__ void concat_and_cache_mla_opt_kernel(
 
 }
 
+// ============================================================================
+// Segmented paged KV cache write (no RoPE): concat kv_c (nope) + k_pe into a
+// flat block layout that matches fused_qk_rope_concat_and_cache_mla_seg:
+//   block: [page_size x kv_lora (nope)][page_size x pe], token-major.
+//     nope: block_idx*block_stride + block_offset*kv_lora_rank + i
+//     pe:   block_idx*block_stride + page_size*kv_lora_rank + block_offset*pe_dim + i
+// ============================================================================
+template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
+__global__ void concat_and_cache_mla_seg_kernel(
+    const scalar_t* __restrict__ kv_c,        // [num_tokens, kv_lora_rank]
+    const scalar_t* __restrict__ k_pe,        // [num_tokens, pe_dim]
+    cache_t* __restrict__ kv_cache,           // [num_blocks, block_stride] flat
+    const int64_t* __restrict__ slot_mapping, // [num_tokens]
+    const int block_stride,                   //
+    const int kv_c_stride,                    //
+    const int k_pe_stride,                    //
+    const int kv_lora_rank,                   //
+    const int pe_dim,                         //
+    const int page_size,                      //
+    const float* scale                        //
+)
+{
+    const int64_t token_idx = blockIdx.x;
+    const int64_t slot_idx  = slot_mapping[token_idx];
+    // NOTE: slot_idx can be -1 if the token is padded
+    if(slot_idx < 0)
+    {
+        return;
+    }
+    const int64_t block_idx     = slot_idx / page_size;
+    const int64_t block_offset  = slot_idx % page_size;
+    const float inverted_kscale = 1.0f / *scale;
+    const int64_t nope_base     = block_idx * block_stride + block_offset * kv_lora_rank;
+    const int64_t pe_base =
+        block_idx * block_stride + (int64_t)page_size * kv_lora_rank + block_offset * pe_dim;
+
+    auto copy = [&](const scalar_t* __restrict__ src,
+                    int src_stride,
+                    int size,
+                    int64_t dst_base) {
+        for(int i = threadIdx.x; i < size; i += blockDim.x)
+        {
+            const scalar_t v = src[token_idx * src_stride + i];
+            if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+            {
+                kv_cache[dst_base + i] = v;
+            }
+            else
+            {
+                kv_cache[dst_base + i] =
+                    opus::cast<cache_t>(static_cast<float>(v) * inverted_kscale);
+            }
+        }
+    };
+    copy(kv_c, kv_c_stride, kv_lora_rank, nope_base);
+    copy(k_pe, k_pe_stride, pe_dim, pe_base);
+}
+
+// Vectorized variant (kv_lora_rank & pe_dim divisible by VEC): 128-bit
+// loads/stores for 16-bit inputs. Plain global vector access, portable.
+template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt, int VEC>
+__global__ void concat_and_cache_mla_seg_opt_kernel(
+    const scalar_t* __restrict__ kv_c,        // [num_tokens, kv_lora_rank]
+    const scalar_t* __restrict__ k_pe,        // [num_tokens, pe_dim]
+    cache_t* __restrict__ kv_cache,           // [num_blocks, block_stride] flat
+    const int64_t* __restrict__ slot_mapping, // [num_tokens]
+    const int block_stride,                   //
+    const int kv_c_stride,                    //
+    const int k_pe_stride,                    //
+    const int kv_lora_rank,                   //
+    const int pe_dim,                         //
+    const int page_size,                      //
+    const float* scale                        //
+)
+{
+    using in_vec_t  = opus::vector_t<scalar_t, VEC>;
+    using out_vec_t = opus::vector_t<cache_t, VEC>;
+
+    const int64_t token_idx = blockIdx.x;
+    const int64_t slot_idx  = slot_mapping[token_idx];
+    if(slot_idx < 0)
+    {
+        return;
+    }
+    const int64_t block_idx     = slot_idx / page_size;
+    const int64_t block_offset  = slot_idx % page_size;
+    const float inverted_kscale = 1.0f / *scale;
+    const int64_t nope_base     = block_idx * block_stride + block_offset * kv_lora_rank;
+    const int64_t pe_base =
+        block_idx * block_stride + (int64_t)page_size * kv_lora_rank + block_offset * pe_dim;
+
+    auto copy = [&](const scalar_t* __restrict__ src, int src_stride, int size, int64_t dst_base) {
+        const int num_vec        = size / VEC;
+        const in_vec_t* src_v    = reinterpret_cast<const in_vec_t*>(src + token_idx * src_stride);
+        out_vec_t*      dst_v    = reinterpret_cast<out_vec_t*>(kv_cache + dst_base);
+        for(int v = threadIdx.x; v < num_vec; v += blockDim.x)
+        {
+            const in_vec_t vin = src_v[v];
+            if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+            {
+                out_vec_t vout;
+                for(int j = 0; j < VEC; ++j)
+                    vout[j] = static_cast<cache_t>(vin[j]);
+                dst_v[v] = vout;
+            }
+            else
+            {
+                dst_v[v] = aiter::scaled_cast<cache_t>(vin, inverted_kscale);
+            }
+        }
+    };
+    copy(kv_c, kv_c_stride, kv_lora_rank, nope_base);
+    copy(k_pe, k_pe_stride, pe_dim, pe_base);
+}
+
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType kv_dt,
@@ -3276,6 +3391,34 @@ void reshape_and_cache_flash(
                                      block_size,                                      \
                                      reinterpret_cast<const float*>(scale.data_ptr()));
 
+#define CALL_CONCAT_AND_CACHE_MLA_SEG(KV_T, CACHE_T, KV_DTYPE)                        \
+    aiter::concat_and_cache_mla_seg_kernel<KV_T, CACHE_T, KV_DTYPE>                   \
+        <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(kv_c.data_ptr()),        \
+                                     reinterpret_cast<KV_T*>(k_pe.data_ptr()),        \
+                                     reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()), \
+                                     reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                \
+                                     block_stride,                                    \
+                                     kv_c_stride,                                     \
+                                     k_pe_stride,                                     \
+                                     kv_lora_rank,                                    \
+                                     pe_dim,                                          \
+                                     page_size,                                       \
+                                     reinterpret_cast<const float*>(scale.data_ptr()));
+
+#define CALL_CONCAT_AND_CACHE_MLA_SEG_OPT(KV_T, CACHE_T, KV_DTYPE)                    \
+    aiter::concat_and_cache_mla_seg_opt_kernel<KV_T, CACHE_T, KV_DTYPE, 8>            \
+        <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(kv_c.data_ptr()),        \
+                                     reinterpret_cast<KV_T*>(k_pe.data_ptr()),        \
+                                     reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()), \
+                                     reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                \
+                                     block_stride,                                    \
+                                     kv_c_stride,                                     \
+                                     k_pe_stride,                                     \
+                                     kv_lora_rank,                                    \
+                                     pe_dim,                                          \
+                                     page_size,                                       \
+                                     reinterpret_cast<const float*>(scale.data_ptr()));
+
 // Macro to dispatch the kernel based on the data type.
 #define CALL_INDEXER_K_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                                   \
     aiter::                                                                                       \
@@ -3720,6 +3863,49 @@ void concat_and_cache_mla(aiter_tensor_t& kv_c,         // [num_tokens, kv_lora_
         dim3 grid(num_tokens);
         dim3 block(std::min(kv_lora_rank, 512));
         DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(kv_c.dtype(), kv_cache_dtype, CALL_CONCAT_AND_CACHE_MLA);
+    }
+}
+
+// Same as concat_and_cache_mla but writes the segmented block layout used by
+// fused_qk_rope_concat_and_cache_mla_seg: kv_cache is flat
+// [num_blocks, page_size*(kv_lora_rank + pe_dim)], nope segment then pe segment.
+void concat_and_cache_mla_seg(aiter_tensor_t& kv_c,         // [num_tokens, kv_lora_rank]
+                              aiter_tensor_t& k_pe,         // [num_tokens, pe_dim]
+                              aiter_tensor_t& kv_cache,     // [num_blocks, page_size*(kv_lora+pe)]
+                              aiter_tensor_t& slot_mapping, // [num_tokens]
+                              const std::string& kv_cache_dtype,
+                              aiter_tensor_t& scale)
+{
+    int num_tokens   = slot_mapping.size(0);
+    int kv_lora_rank = kv_c.size(-1);
+    int pe_dim       = k_pe.size(-1);
+    int kv_c_stride  = kv_c.stride(0);
+    int k_pe_stride  = k_pe.stride(0);
+    int block_stride = kv_cache.stride(0);
+
+    const int entry = kv_lora_rank + pe_dim;
+    AITER_CHECK(block_stride % entry == 0,
+                "kv_cache block stride must be a multiple of kv_lora_rank + pe_dim");
+    int page_size = block_stride / entry;
+    AITER_CHECK(kv_c.stride(-1) == 1 && k_pe.stride(-1) == 1,
+                "kv_c/k_pe must be contiguous in last dim");
+
+    HipDeviceGuard device_guard(kv_c.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    if((pe_dim & 0x7) == 0 && (kv_lora_rank & 0x7) == 0)
+    {
+        dim3 grid(num_tokens);
+        dim3 block(std::min(kv_lora_rank / 8, 1024));
+        DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(
+            kv_c.dtype(), kv_cache_dtype, CALL_CONCAT_AND_CACHE_MLA_SEG_OPT);
+    }
+    else
+    {
+        dim3 grid(num_tokens);
+        dim3 block(std::min(kv_lora_rank, 512));
+        DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(
+            kv_c.dtype(), kv_cache_dtype, CALL_CONCAT_AND_CACHE_MLA_SEG);
     }
 }
 

@@ -71,6 +71,15 @@ void concat_and_cache_mla(aiter_tensor_t& kv_c,         // [num_tokens, kv_lora_
                           const std::string& kv_cache_dtype,
                           aiter_tensor_t& scale);
 
+// Segmented block layout (matches fused_qk_rope_concat_and_cache_mla_seg):
+// kv_cache flat [num_blocks, page_size*(kv_lora_rank + pe_dim)], nope seg then pe seg.
+void concat_and_cache_mla_seg(aiter_tensor_t& kv_c,          // [num_tokens, kv_lora_rank]
+                              aiter_tensor_t& k_pe,          // [num_tokens, pe_dim]
+                              aiter_tensor_t& kv_cache,      // [num_blocks, page_size*(kv_lora+pe)]
+                              aiter_tensor_t& slot_mapping,  // [num_tokens]
+                              const std::string& kv_cache_dtype,
+                              aiter_tensor_t& scale);
+
 
 void indexer_k_quant_and_cache(aiter_tensor_t& k,            // [num_tokens, head_dim]
                                aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]

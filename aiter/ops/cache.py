@@ -98,6 +98,17 @@ def concat_and_cache_mla(
 
 
 @compile_ops("module_cache", develop=True)
+def concat_and_cache_mla_seg(
+    kv_c: Tensor,  # [num_tokens, kv_lora_rank]
+    k_pe: Tensor,  # [num_tokens, pe_dim]
+    kv_cache: Tensor,  # [num_blocks, page_size*(kv_lora_rank + pe_dim)] flat (seg layout)
+    slot_mapping: Tensor,  # [num_tokens]
+    kv_cache_dtype: str,
+    scale: Tensor,  # [1] fp32 static scale
+) -> None: ...
+
+
+@compile_ops("module_cache", develop=True)
 def indexer_k_quant_and_cache(
     k: Tensor,
     kv_cache: Tensor,

@@ -352,6 +352,14 @@ namespace py = pybind11;
           py::arg("slot_mapping"),                                                  \
           py::arg("kv_cache_dtype"),                                                \
           py::arg("scale"));                                                        \
+    m.def("concat_and_cache_mla_seg",                                               \
+          &aiter::concat_and_cache_mla_seg,                                         \
+          py::arg("kv_c"),                                                          \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("kv_cache_dtype"),                                                \
+          py::arg("scale"));                                                        \
     m.def("indexer_k_quant_and_cache",                                              \
           &aiter::indexer_k_quant_and_cache,                                        \
           py::arg("k"),                                                             \
