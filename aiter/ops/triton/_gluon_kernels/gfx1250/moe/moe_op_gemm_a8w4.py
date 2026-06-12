@@ -394,6 +394,7 @@ def _moe_gemm_a8w4_decode(
             )
             xs_row = gl.load(GatherIndx + offs_xs_m) // N_EXPTS_ACT
         xs_ptrs_base = XMxScale + xs_row.to(index_type)[:, None] * stride_x_mx_m
+        xs_ptrs = xs_ptrs_base + offs_xs_k.to(index_type)[None, :]
 
     x_buffer = gl.allocate_shared_memory(
         x_desc.dtype, shape=[NUM_BUFFERS] + x_desc.block_shape, layout=x_desc.layout
@@ -458,12 +459,12 @@ def _moe_gemm_a8w4_decode(
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
             else:
-                xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
                 async_copy.global_to_shared(
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                    xs_ptrs_base + xs_k.to(index_type)[None, :],
+                    xs_ptrs,
                 )
                 async_copy.commit_group()
+                xs_ptrs += MX_SCALE_BLOCK_K
         write_idx += 1
 
     num_k_iter = tl.cdiv(K, BLOCK_K)
@@ -511,12 +512,12 @@ def _moe_gemm_a8w4_decode(
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
             else:
-                xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
                 async_copy.global_to_shared(
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                    xs_ptrs_base + xs_k.to(index_type)[None, :],
+                    xs_ptrs,
                 )
                 async_copy.commit_group()
+                xs_ptrs += MX_SCALE_BLOCK_K
         write_idx += 1
 
         gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS * NUM_TDM_OPS - 1)
@@ -979,6 +980,7 @@ def _moe_gemm_a8w4_prefill(
             )
             xs_row = gl.load(GatherIndx + offs_xs_m) // N_EXPTS_ACT
         xs_ptrs_base = XMxScale + xs_row.to(index_type)[:, None] * stride_x_mx_m
+        xs_ptrs = xs_ptrs_base + offs_xs_k.to(index_type)[None, :]
 
     x_buffer = gl.allocate_shared_memory(
         x_desc.dtype, shape=[NUM_BUFFERS] + x_desc.block_shape, layout=x_desc.layout
@@ -1043,12 +1045,12 @@ def _moe_gemm_a8w4_prefill(
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
             else:
-                xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
                 async_copy.global_to_shared(
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                    xs_ptrs_base + xs_k.to(index_type)[None, :],
+                    xs_ptrs,
                 )
                 async_copy.commit_group()
+                xs_ptrs += MX_SCALE_BLOCK_K
         write_idx += 1
 
     num_k_iter = tl.cdiv(K, BLOCK_K)
@@ -1136,12 +1138,12 @@ def _moe_gemm_a8w4_prefill(
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
             else:
-                xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
                 async_copy.global_to_shared(
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                    xs_ptrs_base + xs_k.to(index_type)[None, :],
+                    xs_ptrs,
                 )
                 async_copy.commit_group()
+                xs_ptrs += MX_SCALE_BLOCK_K
         write_idx += 1
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
