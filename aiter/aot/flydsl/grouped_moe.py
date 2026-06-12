@@ -63,49 +63,6 @@ def _as_int(value, default: int | None = None) -> int | None:
 
 
 def _scheduler_variants(row, base_job):
-    """Expand one parsed config into the M-scheduler variants the runtime can
-    pick at launch time.
-
-    The grouped masked GEMM launcher's pkl signature is determined by the
-    host-side launch parameters, which differ between the two M schedulers:
-    persistent-M passes ``m_tile_prefix/m_tile_map``, while the DeepGEMM-style
-    contiguous-M passes ``contiguous_psum``-derived layout + ``contiguous_m``
-    scalars. They therefore hash to *different* launchers, so each mode must be
-    AOT-compiled on its own or the missing one falls back to start-up JIT.
-
-    There are three distinct launcher signatures, picked by the runtime config
-    + batch size:
-      - persistent-M           : grouped_persistent_m=True  (small batches)
-      - contiguous-M (DeepGEMM) : grouped_contiguous_m=True  (large batches)
-      - dense non-persistent    : both False (the masked ``else`` launcher used
-                                  for small batches when persistent-M is off)
-
-    The runtime (``grouped_moe_gfx1250``) auto-switches to contiguous-M once
-    ``token_num`` exceeds ``AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD`` (default
-    512), so prefill batches hit the contiguous path regardless of the CSV's
-    small-batch mode. We therefore always emit the contiguous-M variant PLUS the
-    config's small-batch variant (persistent-M when ``grouped_persistent_m`` is
-    set, otherwise the dense non-persistent launcher), so both signatures the
-    runtime can reach are AOT-precompiled instead of JIT'd at start-up.
-
-    Explicit CSV columns still win:
-      - ``grouped_contiguous_m=1`` -> contiguous-M only (config forces it always)
-      - otherwise                  -> small-batch variant + contiguous-M
-
-    Defaults mirror the runtime (``grouped_moe_gfx1250``): when the CSV omits
-    ``grouped_persistent_m`` the runtime leaves it False (dense non-persistent
-    small-batch launcher), so the AOT default must match -- defaulting to True
-    here would precompile a persistent-M kernel the runtime never selects while
-    skipping the dense launcher it actually uses.
-
-    Each M-scheduler variant is further expanded over ``expert_sched_mode`` in
-    (False, True). ``expert_sched_mode=True`` injects the
-    ``amdgpu-expert-scheduling-mode`` llvm_options compile hint, which becomes
-    part of the FlyDSL launch cache key -- so True and False hash to *different*
-    launchers. The runtime currently passes ``expert_sched_mode=False`` at every
-    grouped GEMM call site, but it is a perf knob that can be flipped, so we
-    precompile both signatures rather than betting on one.
-    """
     want_persistent = _as_bool(row.get("grouped_persistent_m"), False)
     explicit_contiguous = _as_bool(row.get("grouped_contiguous_m"), False)
     if explicit_contiguous:
@@ -224,39 +181,8 @@ def compile_one_config(**job):
         grouped_persistent_m=job["grouped_persistent_m"],
         grouped_contiguous_m=contiguous,
         persistent_workers=job["persistent_workers"],
-        # expert_sched_mode feeds the launcher's FlyDSL cache key: True injects
-        # the ``amdgpu-expert-scheduling-mode`` llvm_options compile hint, so True
-        # and False hash to different launchers. The compiler default is True; the
-        # runtime currently passes False everywhere. _scheduler_variants enumerates
-        # both, so honor the per-job choice instead of defaulting -- a False-only
-        # AOT would miss the runtime's signature if the knob is ever flipped, and
-        # an unset (default-True) AOT misses the False signature the runtime uses
-        # today, leaving the kernel to fall back to start-up JIT.
         expert_sched_mode=job["expert_sched_mode"],
     )
-    # The contiguous-M (DeepGEMM-style) launcher validates a *flat* layout: the
-    # per-expert activations/scales collapse into a single leading dim of 1 with
-    # ``m`` contiguous rows (route_E=1, route_max_m=contiguous_m), whereas
-    # persistent-M keeps the (experts, max_m, ...) per-expert layout. Weights
-    # stay per-expert in both modes.
-    #
-    # contiguous_m mirrors the runtime upper-bound computed in
-    # ``_make_contiguous_psum_layout``:
-    #   ub = token_num * topk + experts * (tile_m - 1)
-    #   contiguous_m = max(tile_m, align_up(ub, tile_m))
-    # The activation/scale tensors use contiguous_m as their row dimension
-    # so the AOT dummy shapes match the runtime allocation exactly.
-    #
-    # Contiguous-M launch-signature fix: at runtime ``grouped_moe_gfx1250`` passes
-    # a DISTINCT psum-derived layout tensor as ``_m_tile_map`` (see
-    # ``_make_contiguous_psum_layout`` -> ``psum_t``, an (experts,) int32 tensor
-    # separate from ``masked_m``). Leaving ``_m_tile_map`` to default makes the
-    # launcher alias ``masked_m`` into that slot; the aliased vs distinct argument
-    # hash to DIFFERENT FlyDSL launch cache keys. Without an explicit distinct
-    # tensor the AOT compiles a contiguous launcher the runtime never calls and
-    # the real one falls back to start-up JIT. Only the tensor's rank/dtype feed
-    # the launch key, so a plain (experts,) int32 dummy reproduces the runtime
-    # ``psum_t`` signature regardless of contiguous_m.
     if contiguous:
         act_lead = 1
         ub = job["token_num"] * job["topk"] + job["experts"] * (job["tile_m"] - 1)
@@ -264,11 +190,6 @@ def compile_one_config(**job):
     else:
         act_lead = job["experts"]
         rows = job["max_m"]
-    # Dummy inputs are built under FakeTensorMode (mirroring aiter.aot.flydsl.moe):
-    # COMPILE_ONLY=1 compiles + persists the artifact without launching a kernel,
-    # so only tensor shape/dtype/strides feed the cache key -- fake tensors carry
-    # exactly that metadata while skipping real host allocation (the per-expert
-    # weight buffers would otherwise cost real GBs in every AOT worker process).
     with compile_only_env(), FakeTensorMode():
         masked_m = torch.full(
             (job["experts"],), job["max_m"], dtype=torch.int32, device=dev
