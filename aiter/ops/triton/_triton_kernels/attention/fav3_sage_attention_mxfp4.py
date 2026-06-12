@@ -6,9 +6,6 @@ import triton.language as tl
 import aiter
 
 
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
-
-
 @triton.jit
 def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
     """Calculate padding information for the last K block."""

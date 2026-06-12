@@ -734,15 +734,18 @@ def fav3_sage_vfa_wrapper_func(
 
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
     _, _, _, head_dim = map_dims(q.shape, bshd_map)
-    softmax_scale = softmax_scale or (head_dim ** -0.5)
+    softmax_scale = softmax_scale or (head_dim**-0.5)
 
     BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
     fp8_dtype = aiter.dtypes.fp8
     fp8_max = torch.finfo(fp8_dtype).max
 
     q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
-        q, k, v,
-        fp8_dtype, fp8_max,
+        q,
+        k,
+        v,
+        fp8_dtype,
+        fp8_max,
         sm_scale=softmax_scale,
         BLKQ=BLKQ,
         BLKK=BLKK,
@@ -756,14 +759,25 @@ def fav3_sage_vfa_wrapper_func(
         kv_block_indices = lut_start = lut_count = None
 
     m_init = compute_m_proxy_topn(
-        q, k, q_int8, k_int8, q_descale, k_descale,
-        BLKQ=BLKQ, BLKK=BLKK, layout=layout,
+        q,
+        k,
+        q_int8,
+        k_int8,
+        q_descale,
+        k_descale,
+        BLKQ=BLKQ,
+        BLKK=BLKK,
+        layout=layout,
         n_blocks=n_sample_blocks,
     )
 
     out, lse = fav3_sage_func(
-        q_int8, k_int8, v_fp8,
-        q_descale, k_descale, v_descale,
+        q_int8,
+        k_int8,
+        v_fp8,
+        q_descale,
+        k_descale,
+        v_descale,
         softmax_scale=softmax_scale,
         return_lse=return_lse,
         layout=layout,

@@ -62,7 +62,14 @@ def get_pool_sim_triton_simmean(
         sim_arg = sim_blocks
     grid = (B, H, nblock)
     triton_bmm_pool_sim_simmean[grid](
-        x, pool, sim_arg, simthreshd1, N=N, D=D, BS=block_size, SKIP_SIM=attention_scored_only
+        x,
+        pool,
+        sim_arg,
+        simthreshd1,
+        N=N,
+        D=D,
+        BS=block_size,
+        SKIP_SIM=attention_scored_only,
     )
     return pool, sim_blocks
 
@@ -131,4 +138,4 @@ def compute_pooled_scores(
         pooled_k = pooled_k.repeat_interleave(nheads_q // nheads_k, dim=1)
 
     head_dim = pooled_q.shape[-1]
-    return torch.matmul(pooled_q, pooled_k.transpose(-1, -2)) * (head_dim ** -0.5)
+    return torch.matmul(pooled_q, pooled_k.transpose(-1, -2)) * (head_dim**-0.5)

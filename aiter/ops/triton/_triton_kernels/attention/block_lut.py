@@ -107,7 +107,9 @@ def triton_fill_block_map_kernel(
     cur_sorted_idx_ptr = sorted_indices + b * H * Q * NK + h * Q * NK + q * NK
     cur_final_map_ptr = final_map + b * H * Q * NK + h * Q * NK + q * NK
     # Always select at least one block per query block.
-    cur_num_to_select = (cur_num_to_select + 1) if cur_num_to_select == 0 else cur_num_to_select
+    cur_num_to_select = (
+        (cur_num_to_select + 1) if cur_num_to_select == 0 else cur_num_to_select
+    )
     for i in range(cur_num_to_select):
         cur_idx = tl.load(cur_sorted_idx_ptr + i)
         tl.store(cur_final_map_ptr + cur_idx, 1)

@@ -193,8 +193,12 @@ def get_block_map_meansim(
     """
     nq = (q.shape[-2] + BLKQ - 1) // BLKQ
     nk = (k.shape[-2] + BLKK - 1) // BLKK
-    pooled_q, sim_q = get_pool_sim_triton_simmean(q, BLKQ, simthreshd1, attention_scored_only)
-    pooled_k, sim_k = get_pool_sim_triton_simmean(k, BLKK, simthreshd1, attention_scored_only)
+    pooled_q, sim_q = get_pool_sim_triton_simmean(
+        q, BLKQ, simthreshd1, attention_scored_only
+    )
+    pooled_k, sim_k = get_pool_sim_triton_simmean(
+        k, BLKK, simthreshd1, attention_scored_only
+    )
     pooled_score = pooled_q @ pooled_k.transpose(-1, -2) * q.shape[-1] ** -0.5
     if attention_scored_only:
         return None, pooled_score
@@ -579,16 +583,34 @@ def compute_m_proxy_topn(
 
     grid = (num_q_blocks, nheads_q, batch)
     _sage_vfa_m_blockidx_kernel[grid](
-        q_int8, k_int8,
-        q_descale, k_descale,
+        q_int8,
+        k_int8,
+        q_descale,
+        k_descale,
         block_idx,
         m_init,
-        stride_qz, stride_qh, stride_qm, stride_qd,
-        stride_kz, stride_kh, stride_kn, stride_kd,
-        stride_qsz, stride_qsh, stride_qsblk,
-        stride_ksz, stride_ksh, stride_ksblk,
-        stride_biz, stride_bih, stride_biqblk, stride_bis,
-        stride_mz, stride_mh, stride_mblk, stride_mr,
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kd,
+        stride_qsz,
+        stride_qsh,
+        stride_qsblk,
+        stride_ksz,
+        stride_ksh,
+        stride_ksblk,
+        stride_biz,
+        stride_bih,
+        stride_biqblk,
+        stride_bis,
+        stride_mz,
+        stride_mh,
+        stride_mblk,
+        stride_mr,
         SEQLEN_Q=seqlen_q,
         SEQLEN_K=seqlen_k,
         HQ=nheads_q,

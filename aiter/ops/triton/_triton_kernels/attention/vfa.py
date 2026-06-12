@@ -30,18 +30,34 @@ import triton.language as tl
 
 @triton.jit
 def _sage_vfa_m_blockidx_kernel(
-    Q,                  # int8 query tensor
-    K,                  # int8 key tensor
-    Q_Descale,          # fp32 [B, H_Q, num_q_blocks]
-    K_Descale,          # fp32 [B, H_K, num_k_blocks]
-    Block_Idx,          # int32 [B, H_Q, num_q_blocks, N_SAMPLES]
-    M_Init,             # fp32 [B, H_Q, num_q_blocks, BLOCK_M] output
-    stride_qz, stride_qh, stride_qm, stride_qd,
-    stride_kz, stride_kh, stride_kn, stride_kd,
-    stride_qsz, stride_qsh, stride_qsblk,
-    stride_ksz, stride_ksh, stride_ksblk,
-    stride_biz, stride_bih, stride_biqblk, stride_bis,
-    stride_mz, stride_mh, stride_mblk, stride_mr,
+    Q,  # int8 query tensor
+    K,  # int8 key tensor
+    Q_Descale,  # fp32 [B, H_Q, num_q_blocks]
+    K_Descale,  # fp32 [B, H_K, num_k_blocks]
+    Block_Idx,  # int32 [B, H_Q, num_q_blocks, N_SAMPLES]
+    M_Init,  # fp32 [B, H_Q, num_q_blocks, BLOCK_M] output
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_qsz,
+    stride_qsh,
+    stride_qsblk,
+    stride_ksz,
+    stride_ksh,
+    stride_ksblk,
+    stride_biz,
+    stride_bih,
+    stride_biqblk,
+    stride_bis,
+    stride_mz,
+    stride_mh,
+    stride_mblk,
+    stride_mr,
     SEQLEN_Q,
     SEQLEN_K,
     HQ: tl.constexpr,
@@ -89,10 +105,7 @@ def _sage_vfa_m_blockidx_kernel(
     k_descale_off = K_Descale + off_z * stride_ksz + off_h_k * stride_ksh
 
     bi_off = (
-        Block_Idx
-        + off_z * stride_biz
-        + off_h_q * stride_bih
-        + start_m * stride_biqblk
+        Block_Idx + off_z * stride_biz + off_h_q * stride_bih + start_m * stride_biqblk
     )
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)

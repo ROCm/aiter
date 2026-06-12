@@ -33,7 +33,9 @@ def triton_bmm_pool_sim_simmean(
 
     block_offset = b * H * N * D + h * N * D + nb * BS * D
     xmask = (nb * BS + tl.arange(0, BS)[:, None]) < N
-    x_ptrs = x_ptr + block_offset + tl.arange(0, BS)[:, None] * D + tl.arange(0, D)[None, :]
+    x_ptrs = (
+        x_ptr + block_offset + tl.arange(0, BS)[:, None] * D + tl.arange(0, D)[None, :]
+    )
     # Load the input block, xmask will return nan for out-of-bound elements
     x = tl.load(x_ptrs, mask=xmask)
     BS_ = BS if (N - nb * BS) >= BS else (N - nb * BS)

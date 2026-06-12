@@ -198,7 +198,10 @@ def _mask_from_json_item(item: Dict[str, Any], device: torch.device) -> LoadedMa
     if "mask" not in item:
         raise ValueError("Each mask entry must include key 'mask'")
     m = _mask_array_to_tensor(item["mask"], device)
-    for key, inferred in (("num_q_blocks", m.num_q_blocks), ("num_kv_blocks", m.num_kv_blocks)):
+    for key, inferred in (
+        ("num_q_blocks", m.num_q_blocks),
+        ("num_kv_blocks", m.num_kv_blocks),
+    ):
         if key in item and item[key] != inferred:
             raise ValueError(f"{key} mismatch: inferred {inferred}, got {item[key]}")
     return m
@@ -290,7 +293,9 @@ def build_attn_mode_lut(
     n_ctx_k = k_bhsd.shape[2]
     block_m, block_n = kernel_block_sizes(args.kernel)
 
-    simthreshd1 = torch.full((hq,), args.simthreshd1, device=device, dtype=torch.float32)
+    simthreshd1 = torch.full(
+        (hq,), args.simthreshd1, device=device, dtype=torch.float32
+    )
     cdfthreshd = torch.full((hq,), args.cdfthreshd, device=device, dtype=torch.float32)
 
     block_lut, freeze = build_attention_lut(
@@ -817,7 +822,9 @@ def benchmark_single_case(
         num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
         num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
         warmup_mask = (
-            torch.rand(shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device)
+            torch.rand(
+                shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device
+            )
             > args.block_sparsity
         ).to(torch.bool)
         file_mask = warmup_mask
@@ -847,7 +854,11 @@ def benchmark_single_case(
         block_lut = None
 
     fn = make_kernel_runner(
-        args, q, k, v, block_lut=block_lut,
+        args,
+        q,
+        k,
+        v,
+        block_lut=block_lut,
         freeze_softmax_max_count=freeze_softmax_max_count,
     )
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
@@ -922,9 +933,7 @@ def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> List[
         return result
 
     if args.metric == "sparseput" and not include_sparse_metric:
-        raise ValueError(
-            "sparse_throughput requires --sparge or --block-mask-file"
-        )
+        raise ValueError("sparse_throughput requires --sparge or --block-mask-file")
 
     if args.metric not in metric_map:
         raise ValueError(f"Unknown metric: {args.metric}")
@@ -1354,8 +1363,7 @@ def parse_args() -> argparse.Namespace:
         "--cdfthreshd",
         type=float,
         default=0.9,
-        help="Per-head cumulative-probability threshold for --sparge "
-        "selection",
+        help="Per-head cumulative-probability threshold for --sparge " "selection",
     )
 
     parser.add_argument(
@@ -1489,9 +1497,7 @@ def run_all_kernels(args: argparse.Namespace) -> None:
         try:
             block_lut, freeze = None, -1
             if builds_qk_lut(args):
-                block_lut, freeze, _ = build_attn_mode_lut(
-                    args, q_bhsd, k_bhsd, device
-                )
+                block_lut, freeze, _ = build_attn_mode_lut(args, q_bhsd, k_bhsd, device)
             fn = make_kernel_runner(
                 args, q, k, v, block_lut=block_lut, freeze_softmax_max_count=freeze
             )

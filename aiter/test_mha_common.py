@@ -505,7 +505,9 @@ def _attention_ref_block_sparse_tiled(
             )
             disallow = ~allow
             if block_attn_mask.dim() == 3:
-                scores.masked_fill_(rearrange(disallow, "b t s -> b 1 t s"), float("-inf"))
+                scores.masked_fill_(
+                    rearrange(disallow, "b t s -> b 1 t s"), float("-inf")
+                )
             else:
                 scores.masked_fill_(disallow, float("-inf"))
             if key_padding_mask is not None:
