@@ -160,11 +160,11 @@ def _moe_gemm_a8w4_decode(
     MX_PACK_DIVISOR: gl.constexpr = 32
 
     if GatherIndx is None:
-        NUM_TDM_OPS: gl.constexpr = 1 # async_loads fuse into 1 TDM op
+        NUM_TDM_OPS: gl.constexpr = 1  # async_loads fuse into 1 TDM op
     elif X_SCALE_TDM:
-        NUM_TDM_OPS: gl.constexpr = 5 # x + x_scales int16 TDM gathers
+        NUM_TDM_OPS: gl.constexpr = 5  # x + x_scales int16 TDM gathers
     else:
-        NUM_TDM_OPS: gl.constexpr = 3 # x_scales use async_copy
+        NUM_TDM_OPS: gl.constexpr = 3  # x_scales use async_copy
     w_type: gl.constexpr = W.dtype.element_ty
     gl.static_assert(w_type == gl.uint8, "mx_weight_ptr must be uint8 or fp8")
     gl.static_assert(
@@ -751,11 +751,11 @@ def _moe_gemm_a8w4_prefill(
     MX_PACK_DIVISOR: gl.constexpr = 32
 
     if GatherIndx is None:
-        NUM_TDM_OPS: gl.constexpr = 1 # async_loads fuse into 1 TDM op
+        NUM_TDM_OPS: gl.constexpr = 1  # async_loads fuse into 1 TDM op
     elif X_SCALE_TDM:
-        NUM_TDM_OPS: gl.constexpr = 5 # x + x_scales int16 TDM gathers
+        NUM_TDM_OPS: gl.constexpr = 5  # x + x_scales int16 TDM gathers
     else:
-        NUM_TDM_OPS: gl.constexpr = 3 # x_scales use async_copy
+        NUM_TDM_OPS: gl.constexpr = 3  # x_scales use async_copy
     w_type: gl.constexpr = W.dtype.element_ty
     gl.static_assert(w_type == gl.uint8, "mx_weight_ptr must be uint8 or fp8")
     gl.static_assert(
