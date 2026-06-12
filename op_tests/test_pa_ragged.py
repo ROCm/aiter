@@ -398,6 +398,122 @@ def run_aiter(
         return output
 
 
+def _run_paged_attention_ragged_nhd(
+    query,
+    key_cache,
+    value_cache,
+    kv_indptr,
+    kv_page_indices,
+    kv_last_page_lens,
+    max_seq_len,
+    kv_cache_dtype,
+):
+    partition_size = 256
+    num_seqs, num_heads, head_size = query.shape
+    block_size = key_cache.shape[1]
+    max_num_partitions = (max_seq_len + partition_size - 1) // partition_size
+    scale = 1.0 / (head_size**0.5)
+
+    output = torch.empty_like(query)
+    workspace_buffer = torch.empty(
+        (num_seqs * num_heads * max_num_partitions * head_size) * query.element_size()
+        + 2 * (num_seqs * num_heads * max_num_partitions) * FLOAT32_BYTES,
+        dtype=torch.uint8,
+        device=query.device,
+    )
+    k_scale = torch.tensor([1.0], dtype=dtypes.fp32, device=query.device)
+    v_scale = torch.tensor([1.0], dtype=dtypes.fp32, device=query.device)
+
+    torch.ops.aiter.paged_attention_ragged(
+        output,
+        workspace_buffer,
+        query,
+        key_cache,
+        value_cache,
+        scale,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        block_size,
+        max_num_partitions,
+        None,
+        kv_cache_dtype,
+        "NHD",
+        0.0,
+        k_scale,
+        v_scale,
+        None,
+        partition_size,
+    )
+    return output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_paged_attention_ragged_glm_gqa_fp8_kv_nhd():
+    """GLM-style GQA decode should consume FP8 KV cache directly.
+
+    GLM-4.5-Air TP=1 uses 96 query heads, 8 KV heads, head dimension 128, and
+    SGLang's non-MLA AITER backend passes page-size-1 NHD KV cache tensors.
+    """
+
+    torch.manual_seed(0)
+    device = "cuda"
+    num_seqs = 2
+    num_query_heads = 96
+    num_kv_heads = 8
+    head_size = 128
+    block_size = 1
+    seq_len = 128
+    num_blocks = num_seqs * seq_len
+
+    query = torch.randn(
+        (num_seqs, num_query_heads, head_size),
+        dtype=dtypes.bf16,
+        device=device,
+    )
+    key_bf16 = torch.randn(
+        (num_blocks, block_size, num_kv_heads, head_size),
+        dtype=dtypes.bf16,
+        device=device,
+    )
+    value_bf16 = torch.randn(
+        (num_blocks, block_size, num_kv_heads, head_size),
+        dtype=dtypes.bf16,
+        device=device,
+    )
+    key_fp8 = key_bf16.to(dtypes.fp8)
+    value_fp8 = value_bf16.to(dtypes.fp8)
+
+    kv_indptr = torch.arange(
+        0, (num_seqs + 1) * seq_len, seq_len, dtype=torch.int32, device=device
+    )
+    kv_page_indices = torch.arange(num_blocks, dtype=torch.int32, device=device)
+    kv_last_page_lens = torch.ones((num_seqs,), dtype=torch.int32, device=device)
+
+    expected = _run_paged_attention_ragged_nhd(
+        query,
+        key_fp8.to(dtypes.bf16),
+        value_fp8.to(dtypes.bf16),
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        seq_len,
+        "auto",
+    )
+    actual = _run_paged_attention_ragged_nhd(
+        query,
+        key_fp8,
+        value_fp8,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        seq_len,
+        "fp8_e4m3",
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+
+
 @perftest(num_iters=2)
 def run_aiter_naive(
     query,

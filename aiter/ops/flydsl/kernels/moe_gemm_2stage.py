@@ -61,6 +61,7 @@ from .mfma_preshuffle_pipeline import (
     crd2idx,
 )
 from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
+from .tensor_shim import _run_compiled
 
 
 @contextmanager
@@ -3972,7 +3973,8 @@ class _MoeGemm2ReduceWrapper:
             return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
         # Phase 1: GEMM2 (no atomics) -> [tokens*topk, model_dim]
-        self._gemm2_exe(
+        _run_compiled(
+            self._gemm2_exe,
             _ptr_arg(intermediate.view(-1)),
             _ptr_arg(arg_x),
             _ptr_arg(arg_w),
@@ -4002,8 +4004,14 @@ class _MoeGemm2ReduceWrapper:
             # Placeholders; kernel ignores them when use_mask=False (compile-time).
             em = torch.empty(0, device=arg_out.device, dtype=torch.int32)
             tk = torch.empty(0, device=arg_out.device, dtype=torch.int32)
-        self._reduce_exe(
-            _ptr_arg(X), _ptr_arg(Y), _ptr_arg(em), _ptr_arg(tk), tokens_in, stream
+        _run_compiled(
+            self._reduce_exe,
+            _ptr_arg(X),
+            _ptr_arg(Y),
+            _ptr_arg(em),
+            _ptr_arg(tk),
+            tokens_in,
+            stream,
         )
 
     @property

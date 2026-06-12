@@ -1,8 +1,8 @@
 {
     "any": {
-        "BLOCK_M": 32,
-        "BLOCK_N": 64,
-        "BLOCK_K": 64,
+        "BLOCK_M": 16,
+        "BLOCK_N": 32,
+        "BLOCK_K": 256,
         "NUM_BUFFERS": 5,
         "num_warps": 2
     }
