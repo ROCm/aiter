@@ -29,7 +29,7 @@ def triton_bmm_pool_sim_simmean(
     SKIP_SIM: tl.constexpr = False,
 ):
     b, h, nb = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    B, H, NB = tl.num_programs(0), tl.num_programs(1), tl.num_programs(2)
+    _, H, NB = tl.num_programs(0), tl.num_programs(1), tl.num_programs(2)
 
     block_offset = b * H * N * D + h * N * D + nb * BS * D
     xmask = (nb * BS + tl.arange(0, BS)[:, None]) < N

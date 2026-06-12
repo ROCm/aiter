@@ -32,7 +32,10 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
-from aiter.ops.triton.attention.block_sparse import block_attn_mask_to_ragged_lut
+from aiter.ops.triton.attention.block_sparse import (
+    block_attn_mask_to_ragged_lut,
+    compute_m_proxy_topn,
+)
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
     sage_quant,
@@ -540,11 +543,12 @@ def make_kernel_runner(
     head_dim = q_bshd.shape[-1]
     softmax_scale = head_dim**-0.5
 
-    # sage_fp8_vfa without a block LUT (no --sparge / mask): dense VFA. The
-    # m_init running-max estimate is intrinsic to this path and depends on the
-    # quantized Q/K, so we always go through the full wrapper (quant + m_init +
-    # kernel), even in non-e2e mode.
-    if args.kernel == "sage_fp8_vfa" and block_lut is None:
+    # sage_fp8_vfa without a block LUT (no --sparge / mask): dense VFA. In --e2e
+    # mode the full wrapper (quant + m_init + kernel) is timed; the non-e2e
+    # kernel-only path is handled inside the SAGE_FP8_KERNELS branch below
+    # (quant + m_init precomputed outside the timed loop, like plain sage_fp8).
+    dense_vfa = args.kernel == "sage_fp8_vfa" and block_lut is None
+    if dense_vfa and args.e2e:
         return lambda: fav3_sage_vfa_wrapper_func(
             q,
             k,
@@ -589,6 +593,17 @@ def make_kernel_runner(
             layout=args.layout,
         )
 
+        # Dense VFA, non-e2e: the m_init running-max estimate is preparation
+        # (like quantization), so precompute it outside the timed loop so the
+        # measurement isolates the VFA kernel speedup, matching plain sage_fp8.
+        m_init = None
+        if dense_vfa:
+            m_init = compute_m_proxy_topn(
+                q, k, q_int8, k_int8, q_scale, k_scale,
+                BLKQ=cfg["BLOCK_M"], BLKK=cfg["BLOCK_N"],
+                layout=args.layout, n_blocks=args.n_sample,
+            )
+
         kv_idx, lut_s, lut_c, sparse = _unpack_block_lut(block_lut)
         sparge_load_balancing = sparse and getattr(args, "sparge_load_balancing", False)
         return lambda: fav3_sage_func(
@@ -609,6 +624,7 @@ def make_kernel_runner(
             use_block_sparse=sparse,
             freeze_softmax_max_count=freeze_softmax_max_count,
             sparge_load_balancing=sparge_load_balancing,
+            m_init=m_init,
         )
 
     if args.kernel == "sage_mxfp4":
