@@ -213,7 +213,8 @@ def make_sched2_metadata(
 
 
 def cpu_reduce(
-    out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_partial_map, gqa
+    out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_partial_map, gqa,
+    sink=None, s_eff=1.0,
 ):
     """Host reduce (matches aiter csrc/kernels/mla/reduce.cu, natural log):
         global_lse = max_lse + log(sum exp(lse - max_lse))
@@ -227,6 +228,14 @@ def cpu_reduce(
     out_flat = out.view(batch * qlen, q_head_num, head_dim)
     so = split_o.reshape(split_o.shape[0], q_head_num, head_dim).float()
     sl = split_lse.reshape(split_lse.shape[0], q_head_num).float()
+
+    # SINK: the kernel defers the sink logit on the split-KV partial path
+    # (do_sink=0, to avoid double-counting across splits), so it must be merged
+    # ONCE here -- into the final denominator only (no value contribution),
+    # matching ref_pa_decode's appended sink logit. sink_log[head] = sink_raw*s_eff
+    # (natural-log domain). NOTE: the production GPU reduce (mla_reduce/pa_reduce_v1)
+    # has the same gap -- it also never adds the sink to split rows.
+    sink_log = (sink.float().reshape(-1) * s_eff) if sink is not None else None
 
     rip = reduce_indptr.to(torch.int64).tolist()
     rfm = reduce_final_map.to(torch.int64).reshape(-1, 2).tolist()
@@ -244,6 +253,11 @@ def cpu_reduce(
             m = lses.max(dim=0).values
             s = torch.exp(lses - m).sum(dim=0)
             global_lse = m + torch.log(s)
+            if sink_log is not None:
+                mm = torch.maximum(global_lse, sink_log)
+                global_lse = mm + torch.log(
+                    torch.exp(global_lse - mm) + torch.exp(sink_log - mm)
+                )
             scale = torch.exp(lses - global_lse)
             o = (so[locs] * scale.unsqueeze(-1)).sum(dim=0)
             out_flat[seq_id] = o.to(out_flat.dtype)
@@ -596,6 +610,8 @@ def test_pa_decode(
         reduce_final_map,
         reduce_partial_map,
         gqa,
+        sink=sink,
+        s_eff=query_scale * key_scale * softmax_scale,
     )
 
     ref = ref_pa_decode(
