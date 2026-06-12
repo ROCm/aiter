@@ -2038,27 +2038,33 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
     const scalar_t* cos_ptr = cos_cache + pos * cos_stride0;
     const scalar_t* sin_ptr = sin_cache + pos * sin_stride0;
 
-    // ---- helper: RoPE on the pe segment for output element d (< PE_DIM) ----
-    auto rope_pe = [&](const scalar_t* pe_ptr, int d) -> float {
-        int pair_dim, cos_idx;
+    // ---- helper: RoPE one (lo, hi) pair, indexed by pair j in [0, HALF). One thread owns
+    // the whole pair (vs one element each), so pe data and cos/sin are loaded once instead of
+    // twice -- mirrors the non-seg fuse_qk_rope_concat_and_cache_mla_kernel_opt. NEOX pairs
+    // (j, j+HALF); GPT-J pairs (2j, 2j+1); cos/sin shared, indexed by j.
+    // RoPE: lo' = lo*cos - hi*sin ; hi' = lo*sin + hi*cos. ----
+    auto rope_pe_pair = [&](const scalar_t* pe_ptr,
+                            int             j,
+                            int&            lo_idx,
+                            int&            hi_idx,
+                            float&          lo_out,
+                            float&          hi_out) {
         if constexpr(IS_NEOX)
         {
-            pair_dim = d < HALF ? d + HALF : d - HALF;
-            cos_idx  = d < HALF ? d : d - HALF;
+            lo_idx = j;
+            hi_idx = j + HALF;
         }
         else
         {
-            pair_dim = (d % 2 == 0) ? d + 1 : d - 1;
-            cos_idx  = d / 2;
+            lo_idx = 2 * j;
+            hi_idx = 2 * j + 1;
         }
-        const float xv   = static_cast<float>(pe_ptr[d]);
-        const float yv   = static_cast<float>(pe_ptr[pair_dim]);
-        const float cosv = static_cast<float>(cos_ptr[cos_idx]);
-        const float sinv = static_cast<float>(sin_ptr[cos_idx]);
-        if constexpr(IS_NEOX)
-            return d < HALF ? (xv * cosv - yv * sinv) : (yv * cosv + xv * sinv);
-        else
-            return (d % 2 == 0) ? (xv * cosv - yv * sinv) : (yv * cosv + xv * sinv);
+        const float lo   = static_cast<float>(pe_ptr[lo_idx]);
+        const float hi   = static_cast<float>(pe_ptr[hi_idx]);
+        const float cosv = static_cast<float>(cos_ptr[j]);
+        const float sinv = static_cast<float>(sin_ptr[j]);
+        lo_out = lo * cosv - hi * sinv;
+        hi_out = lo * sinv + hi * cosv;
     };
 
     // ================= Q (every block) =================
@@ -2075,17 +2081,22 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         for(int v = threadIdx.x; v < NUM_VEC; v += blockDim.x)
         {
             in_vec_t  vin  = in_buf.template load<VEC>(v * VEC);
+            // fp8/bf8 -> hardware scaled-cast (static quant); bf16/fp16 -> scaled passthrough
+            // via the generic scaled_cast fallback (fp32 mul + cast; lossless when scale==1).
             out_vec_t vout = aiter::scaled_cast<cache_t>(vin, inv_qscale);
             out_buf.template store<VEC, out_vec_t>(vout, v * VEC);
         }
 
-        // pe: RoPE then static quant (per element).
+        // pe: RoPE then static quant. One thread per (lo, hi) pair (HALF pairs).
         const scalar_t* q_pe_row =
             q_pe + token_idx * q_pe_stride_0 + head_idx * q_pe_stride_1;
-        for(int d = threadIdx.x; d < PE_DIM; d += blockDim.x)
+        for(int j = threadIdx.x; j < HALF; j += blockDim.x)
         {
-            const float roped = rope_pe(q_pe_row, d);
-            q_out_row[KV_LORA + d] = opus::cast<cache_t>(roped * inv_qscale);
+            int lo_idx, hi_idx;
+            float lo_out, hi_out;
+            rope_pe_pair(q_pe_row, j, lo_idx, hi_idx, lo_out, hi_out);
+            q_out_row[KV_LORA + lo_idx] = opus::cast<cache_t>(lo_out * inv_qscale);
+            q_out_row[KV_LORA + hi_idx] = opus::cast<cache_t>(hi_out * inv_qscale);
         }
     }
 
@@ -2110,12 +2121,15 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
             out_buf.template store<VEC, out_vec_t>(vout, v * VEC);
         }
 
-        // pe: RoPE then static quant (per element).
+        // pe: RoPE then static quant. One thread per (lo, hi) pair (HALF pairs).
         const scalar_t* k_pe_row = k_pe + token_idx * k_pe_stride;
-        for(int d = threadIdx.x; d < PE_DIM; d += blockDim.x)
+        for(int j = threadIdx.x; j < HALF; j += blockDim.x)
         {
-            const float roped = rope_pe(k_pe_row, d);
-            kv_cache[rope_base + d] = opus::cast<cache_t>(roped * inv_kscale);
+            int lo_idx, hi_idx;
+            float lo_out, hi_out;
+            rope_pe_pair(k_pe_row, j, lo_idx, hi_idx, lo_out, hi_out);
+            kv_cache[rope_base + lo_idx] = opus::cast<cache_t>(lo_out * inv_kscale);
+            kv_cache[rope_base + hi_idx] = opus::cast<cache_t>(hi_out * inv_kscale);
         }
     }
 }
@@ -4384,8 +4398,13 @@ void fused_qk_rope_concat_and_cache_mla_seg(
                 "q_out last dim must be >= ", KV_LORA + PE_DIM);
     AITER_CHECK(cos_cache.size(-1) == PE_DIM / 2 && sin_cache.size(-1) == PE_DIM / 2,
                 "cos/sin cache last dim must be ", PE_DIM / 2);
-    AITER_CHECK(q_out.dtype() == AITER_DTYPE_fp8, "q_out must be fp8");
-    AITER_CHECK(kv_cache.dtype() == AITER_DTYPE_fp8, "kv_cache must be fp8");
+    // Output may be fp8 (static per-tensor quant) or the same 16-bit dtype as the input
+    // (bf16/fp16 passthrough, no quant -- pass scale=1). q_out and kv_cache must agree.
+    AITER_CHECK(q_out.dtype() == kv_cache.dtype(),
+                "q_out and kv_cache must have the same dtype");
+    const bool out_is_fp8 = (q_out.dtype() == AITER_DTYPE_fp8);
+    AITER_CHECK(out_is_fp8 || q_out.dtype() == q_nope.dtype(),
+                "q_out/kv_cache must be fp8 or match the input (bf16/fp16) dtype");
     AITER_CHECK(q_scale.dtype() == AITER_DTYPE_fp32 && k_scale.dtype() == AITER_DTYPE_fp32,
                 "q_scale/k_scale must be fp32");
     AITER_CHECK(kv_c.stride(-1) == 1 && k_pe.stride(-1) == 1,
@@ -4413,16 +4432,16 @@ void fused_qk_rope_concat_and_cache_mla_seg(
     dim3 grid((unsigned)(num_tokens * num_heads));
     dim3 block(KV_LORA / VEC);
 
-#define LAUNCH_MLA_NORM_ROPE(SCALAR_T, NEOX)                                              \
-    aiter::fused_qk_rope_concat_and_cache_mla_seg_kernel<SCALAR_T, opus::fp8_t, KV_LORA,  \
+#define LAUNCH_MLA_NORM_ROPE(SCALAR_T, CACHE_T, NEOX)                                     \
+    aiter::fused_qk_rope_concat_and_cache_mla_seg_kernel<SCALAR_T, CACHE_T, KV_LORA,       \
                                                          PE_DIM, PAGE_SIZE, NEOX, VEC>    \
         <<<grid, block, 0, stream>>>(                                                     \
             reinterpret_cast<SCALAR_T*>(q_nope.data_ptr()),                               \
             reinterpret_cast<SCALAR_T*>(q_pe.data_ptr()),                                 \
             reinterpret_cast<SCALAR_T*>(kv_c.data_ptr()),                                 \
             reinterpret_cast<SCALAR_T*>(k_pe.data_ptr()),                                 \
-            reinterpret_cast<opus::fp8_t*>(kv_cache.data_ptr()),                          \
-            reinterpret_cast<opus::fp8_t*>(q_out.data_ptr()),                             \
+            reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                              \
+            reinterpret_cast<CACHE_T*>(q_out.data_ptr()),                                 \
             reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                          \
             reinterpret_cast<int64_t*>(positions.data_ptr()),                             \
             reinterpret_cast<SCALAR_T*>(cos_cache.data_ptr()),                            \
@@ -4437,18 +4456,25 @@ void fused_qk_rope_concat_and_cache_mla_seg(
             cos_stride0, sin_stride0,                                                     \
             block_stride);
 
+#define LAUNCH_MLA_NORM_ROPE_NEOX(SCALAR_T, CACHE_T)                                       \
+    do {                                                                                  \
+        if(is_neox) { LAUNCH_MLA_NORM_ROPE(SCALAR_T, CACHE_T, true); }                    \
+        else        { LAUNCH_MLA_NORM_ROPE(SCALAR_T, CACHE_T, false); }                   \
+    } while(0)
+
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
         q_nope.dtype(), "fused_qk_rope_concat_and_cache_mla_seg", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-            if(is_neox)
+            if(out_is_fp8)
             {
-                LAUNCH_MLA_NORM_ROPE(input_dtype, true);
+                LAUNCH_MLA_NORM_ROPE_NEOX(input_dtype, opus::fp8_t);
             }
             else
             {
-                LAUNCH_MLA_NORM_ROPE(input_dtype, false);
+                LAUNCH_MLA_NORM_ROPE_NEOX(input_dtype, input_dtype);
             }
         });
+#undef LAUNCH_MLA_NORM_ROPE_NEOX
 #undef LAUNCH_MLA_NORM_ROPE
 }
 

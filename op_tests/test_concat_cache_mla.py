@@ -579,10 +579,11 @@ def _seg_ref(
     num_blocks,
     page_size,
     is_neox,
+    out_dtype=dtypes.fp8,
 ):
     T, H, kv_lora = q_nope.shape
     pe_dim = q_pe.shape[-1]
-    fp8 = dtypes.fp8
+    fp8 = out_dtype  # output element dtype: fp8 (quant) or bf16/fp16 (passthrough)
     q_inv = 1.0 / q_scale.item()
     k_inv = 1.0 / k_scale.item()
 
@@ -623,11 +624,12 @@ def test_fused_qk_rope_concat_cache_mla_seg(
     device: str,
     is_neox: bool,
     q_out_dim: int = 768,
+    out_dtype=dtypes.fp8,
 ):
     ret = {}
     torch.set_default_device(device)
     page_size = SEG_PAGE_SIZE
-    fp8 = dtypes.fp8
+    fp8 = out_dtype
 
     num_blocks = (num_tokens + page_size - 1) // page_size + 1
     total_slots = num_blocks * page_size
@@ -661,8 +663,8 @@ def test_fused_qk_rope_concat_cache_mla_seg(
     sin_cache = sin_cache.to(device)
     pos = torch.randint(0, max_pos, (num_tokens,), dtype=torch.int64, device=device)
 
-    q_scale = torch.tensor(0.05, dtype=torch.float32, device=device)
-    k_scale = torch.tensor(0.05, dtype=torch.float32, device=device)
+    q_scale = torch.tensor(1, dtype=torch.float32, device=device)
+    k_scale = torch.tensor(1, dtype=torch.float32, device=device)
 
     block_stride = page_size * kv_lora_rank + page_size * qk_rope_head_dim
     kv_cache = torch.zeros(num_blocks, block_stride, dtype=fp8, device=device)
@@ -682,6 +684,7 @@ def test_fused_qk_rope_concat_cache_mla_seg(
         num_blocks,
         page_size,
         is_neox,
+        out_dtype,
     )
 
     _, avg_us = run_perftest(
@@ -864,7 +867,7 @@ parser.add_argument(
     "--token",
     type=int,
     nargs="*",
-    default=[4, 128, 256, 512, 1024, 2048],  # , 4096 , 8192, 16384,
+    default=[1, 4, 35, 128, 256, 512, 1024, 2048],  # , 4096 , 8192, 16384,
     help="""token nums.
     e.g.: -t 128""",
 )
@@ -978,18 +981,24 @@ if "fused_qk" in args.case:
 
 if "seg" in args.case:
     df = []
+    # "fp8" -> fp8 static-quant output; "auto" -> bf16 passthrough output (no quant).
+    seg_out_dtypes = [
+        (dtypes.fp8 if qd == "fp8" else dtypes.bf16) for qd in args.q_dtype
+    ]
     for num_token in args.token:
         for num_heads in args.head:
             for is_neox in args.is_neox:
-                ret = test_fused_qk_rope_concat_cache_mla_seg(
-                    args.kv_lora_rank,
-                    args.qk_rope_head_dim,
-                    num_token,
-                    num_heads,
-                    args.device,
-                    is_neox,
-                )
-                df.append(ret)
+                for od in seg_out_dtypes:
+                    ret = test_fused_qk_rope_concat_cache_mla_seg(
+                        args.kv_lora_rank,
+                        args.qk_rope_head_dim,
+                        num_token,
+                        num_heads,
+                        args.device,
+                        is_neox,
+                        out_dtype=od,
+                    )
+                    df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info(
