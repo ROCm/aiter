@@ -18,7 +18,7 @@ from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 
 from aiter import dtypes
 
-from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.core import compile_ops, is_experimental_enabled
 
 MD_NAME = "module_attention"
@@ -523,6 +523,7 @@ def pa_reduce_v1(
     reduce_final_map: Optional[torch.Tensor],
     reduce_partial_map: torch.Tensor,
     max_seqlen_q: int,
+    num_kv_splits: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
 ) -> None:
@@ -533,6 +534,7 @@ def pa_reduce_v1(
         reduce_final_map,
         reduce_partial_map,
         max_seqlen_q,
+        num_kv_splits,
         final_output,
         final_lse,
     )
@@ -603,6 +605,7 @@ def pa_persistent_fwd(
         reduce_final_map,
         reduce_partial_map,
         max_qlen,
+        0,
         output,
         final_lse,
     )
@@ -1020,6 +1023,52 @@ def mla_prefill_ps_asm_fwd(
 ) -> None: ...
 
 
+def get_mla_decode_fwd_occupancy(
+    num_head_qo: int,
+    max_seqlen_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> int:
+    """Occupancy of the HK MLA decode fwd kernel that will be dispatched for
+    these (num_head_qo, max_seqlen_qo, dtypes). The m16x4 kernel (gfx950 +
+    fp8/fp8, 64 q-tokens per tile, gated on AITER_ENABLE_EXPERIMENTAL) runs at
+    occupancy=2; all other kernels run at occupancy=1.
+
+    Used wherever code must agree with the metadata kernel's cluster count
+    (which is `multiProcessorCount * occupancy / num_heads_k`):
+      - get_mla_metadata_info_v1 (buffer sizing)
+      - mla_decode_fwd (per-tile num_kv_splits upper bound for the reduce)
+      - C++ metadata at csrc/kernels/mla/metadata/v1_2_device.cuh
+    """
+    is_hk_m16x4 = (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.fp8
+        and kv_dtype == dtypes.fp8
+        and (num_head_qo * max_seqlen_qo == 64)
+        and is_experimental_enabled()
+    )
+    return 2 if is_hk_m16x4 else 1
+
+
+def get_mla_decode_fwd_max_splits(
+    num_head_qo: int,
+    max_seqlen_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> int:
+    """Upper bound on per-tile num_splits produced by the metadata kernel for
+    the HK MLA decode fwd dispatch. Equals `cu_num * occupancy` (num_heads_k=1
+    is assumed, matching the only configuration the HK kernels support). This
+    is the value `mla_reduce_v1` needs for its LDS layout so
+    `p_lds_reduce_partial_map` is sized to fit every split the fwd kernel can
+    emit.
+    """
+    occupancy = get_mla_decode_fwd_occupancy(
+        num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
+    )
+    return get_cu_num() * occupancy
+
+
 def get_mla_metadata_info_v1(
     batch_size: int,
     max_seqlen_qo: int,
@@ -1030,6 +1079,7 @@ def get_mla_metadata_info_v1(
     fast_mode: bool = True,
     num_kv_splits: int = 32,
     intra_batch_mode: bool = False,
+    max_split_per_batch: int = -1,
 ):
     """
     Returns:
@@ -1042,25 +1092,9 @@ def get_mla_metadata_info_v1(
     """
 
     assert num_head_qo % 8 == 0
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
-
-    # HK MLA m16x4 (gfx950 + fp8/fp8 + 64 q-tokens per tile) runs at occupancy=2,
-    # so the kernel launches 2*num_cu workgroups. Buffer sizes (work_indptr,
-    # work_info_set) must scale to match -- the C++ metadata layer applies the
-    # same multiplier when it builds the cluster work map. The dispatch (in
-    # aiter/mla.py:use_hk) only routes to hk_mla_decode_fwd when
-    # AITER_ENABLE_EXPERIMENTAL is set, so the multiplier is gated identically.
-    is_hk_m16x4 = (
-        get_gfx() == "gfx950"
-        and q_dtype == dtypes.fp8
-        and kv_dtype == dtypes.fp8
-        and (num_head_qo * max_seqlen_qo == 64)
-        and is_experimental_enabled()
+    cu_num = get_mla_decode_fwd_max_splits(
+        num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
     )
-    if is_hk_m16x4:
-        cu_num *= 2
 
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
     max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 16))
@@ -1117,6 +1151,14 @@ def get_mla_metadata_info_v1(
     else:
         max_work = tile_cnt * cu_num
         max_split_tiles = tile_cnt * cu_num
+
+    # Metadata's global split cap is `min(cu_num, max_split_per_batch * batch_size)`
+    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). A single tile can in
+    # the worst case absorb the entire global budget, so reduce_partial_map must
+    # hold up to tile_cnt * per_tile_cap entries.
+    if max_split_per_batch > 0:
+        per_tile_cap = min(cu_num, max_split_per_batch * batch_size)
+        max_split_tiles = max(max_split_tiles, tile_cnt * per_tile_cap)
 
     if not intra_batch_mode:
         return (
@@ -1256,6 +1298,7 @@ def mla_reduce_v1(
     reduce_final_map: Optional[torch.Tensor],
     reduce_partial_map: torch.Tensor,
     max_seqlen_q: int,
+    num_kv_splits: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
 ) -> None: ...

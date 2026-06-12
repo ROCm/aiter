@@ -759,7 +759,7 @@ namespace aiter {
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(layer_input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
-        
+
         MHC_PRE_BIG_FUSE_KERNEL_DISPATCH(m);
     }
 
@@ -1066,24 +1066,33 @@ namespace aiter {
         MHC_POST_KERNEL_IMPL_(kernel_name, hidden_size, residual_block, false); \
     }
 
-#define MHC_POST_KERNEL_DISPATCH(hidden_size) \
+#define MHC_POST_KERNEL_DISPATCH_NT(hidden_size, store_nt_val) \
     if (arch_id != "gfx942" && hidden_size % 1024 == 0) { \
-        MHC_POST_KERNEL_IMPL(mhc_post_kernel, hidden_size, 1024); \   
+        MHC_POST_KERNEL_IMPL_(mhc_post_kernel, hidden_size, 1024, store_nt_val); \
     } else if (hidden_size % 512 == 0) { \
-        MHC_POST_KERNEL_IMPL(mhc_post_kernel, hidden_size, 512); \   
+        MHC_POST_KERNEL_IMPL_(mhc_post_kernel, hidden_size, 512, store_nt_val); \
     } else if (hidden_size % 256 == 0) { \
-        MHC_POST_KERNEL_IMPL(mhc_post_kernel_x2vgpr, hidden_size, 256); \
+        MHC_POST_KERNEL_IMPL_(mhc_post_kernel_x2vgpr, hidden_size, 256, store_nt_val); \
     } else { \
         AITER_CHECK(false, "hidden_size must be divisible by 256"); \
     }
-    
+
+#define MHC_POST_KERNEL_DISPATCH(hidden_size) \
+    do { \
+        if (m > 8 * cu_num) { \
+            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, true); \
+        } else { \
+            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, false); \
+        } \
+    } while (0)
+
     void mhc_post(
         torch::Tensor& out,
         torch::Tensor& x, // (m, hc_mult, h)
         torch::Tensor& residual, // (m, hc_mult, hidden_size)
         torch::Tensor& post_layer_mix, // (m, hc_mult)
-        torch::Tensor& comb_res_mix // (m, hc_mult, hc_mult)
-    )
+        torch::Tensor& comb_res_mix, // (m, hc_mult, hc_mult)
+        int store_nt = -1)
     {
         int m = residual.size(0);
         int hc_mult = residual.size(1);
@@ -1096,8 +1105,13 @@ namespace aiter {
         const hipStream_t stream = at::hip::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
         const std::string arch_id = get_gpu_arch();
-        
-        MHC_POST_KERNEL_DISPATCH(hidden_size);
+        if (store_nt < 0) {
+            MHC_POST_KERNEL_DISPATCH(hidden_size);
+        } else if (store_nt != 0) {
+            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, true);
+        } else {
+            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, false);
+        }
     }
 
 
@@ -2076,5 +2090,6 @@ namespace aiter {
 
         MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
     }
+
 
 } // namespace aiter
