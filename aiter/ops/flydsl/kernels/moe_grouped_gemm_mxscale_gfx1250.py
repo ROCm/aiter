@@ -323,7 +323,7 @@ def _apply_gate_up(gate: torch.Tensor, up: torch.Tensor, act: str) -> torch.Tens
     return torch.nn.functional.silu(gate) * up
 
 
-@functools.lru_cache(maxsize=64)
+@functools.lru_cache(maxsize=16384)
 def _compile_stage1_finalize_act(
     *,
     experts: int,
@@ -465,7 +465,7 @@ def _compile_stage1_finalize_act(
     return launch_stage1_finalize_act
 
 
-@functools.lru_cache(maxsize=64)
+@functools.lru_cache(maxsize=16384)
 def _compile_stage1_finalize_act_bias(
     *,
     experts: int,
@@ -743,7 +743,7 @@ def _compile_base_a8w4_gemm(
     )
 
 
-@functools.lru_cache(maxsize=128)
+@functools.lru_cache(maxsize=16384)
 def compile_moe_grouped_gemm1_a8w4_masked(
     *,
     model_dim: int,
@@ -1113,7 +1113,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     return launch
 
 
-@functools.lru_cache(maxsize=128)
+@functools.lru_cache(maxsize=16384)
 def compile_moe_grouped_gemm2_a8w4_masked(
     *,
     model_dim: int,
