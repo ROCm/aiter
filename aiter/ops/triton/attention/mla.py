@@ -319,27 +319,24 @@ def mla_decode_fwd(
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
     ), "qk_head_dim must be equal to kv_lora_rank + qk_rope_head_dim"
 
-    BLOCK_M = (
-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
-    )
+    MAX_BLOCK_M = 16
+    if num_queries_per_kv <= 16:
+        BLOCK_M = 16
+    else:
+        BLOCK_M = min(triton.next_power_of_2(num_queries_per_kv), MAX_BLOCK_M)
     BLOCK_Q = BLOCK_M // num_queries_per_kv
-    assert BLOCK_Q >= 1
-    # Ideally we would launch with kernel with:
-    # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
-    # However, it is slow to realize the query_lens on cpu.
-    # Instead we use upper-bound:
-    # \sum_i[ceil(query_len[i] / BLOCK_Q)]
-    #   <= \sum_i[floor(query_len[i] / BLOCK_Q) + 1]
-    #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
-    #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
-    #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
+    assert BLOCK_Q >= 1 or (num_queries_per_kv > BLOCK_M)
+    BLOCK_Q = max(BLOCK_Q, 1)
+    NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
     cu_count = get_num_sms()
     target_num_prgms = cu_count * 4
     ALL_DECODE = num_tokens_per_seq == 1
     if ALL_DECODE:
-        total_num_q_blocks = num_seqs
+        total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
     else:
-        total_num_q_blocks = ((num_tokens_per_seq + BLOCK_Q - 1) // BLOCK_Q) * num_seqs
+        total_num_q_blocks = (
+            ((num_tokens_per_seq + BLOCK_Q - 1) // BLOCK_Q) * num_seqs * NUM_HEAD_BLOCKS
+        )
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     # if batch contains a prefill
 
@@ -430,6 +427,7 @@ def mla_decode_fwd(
             QUERY_DTYPE=QUERY_DTYPE,
             KV_CACHE_DTYPE=KV_CACHE_DTYPE,
             BLOCK_SCALES_SIZE=BLOCK_SCALES_SIZE,
+            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
             **attn_config,
         )
     else:
