@@ -683,6 +683,12 @@ def _s2_args_std(
 def _run_compiled(exe, args):
     """Call the JitFunction with the given args.
     JitFunction.__call__ handles compilation caching internally.
+
+    Some kernels (e.g. the gfx1250 fp8/a8w4 stage1 path) wrap the compiled
+    JIT function in a host-side ``_Stage1GateUpPackedWrapper`` that repacks
+    the weight and weight-scale tensors before dispatch. Calling ``exe(*args)``
+    works for both ``@flyc.jit`` functions and such host-side wrappers since
+    both are callable.
     """
     try:
         exe(*args)
@@ -699,6 +705,204 @@ def _run_compiled(exe, args):
         except Exception:
             pass
         raise
+
+
+# ---------------------------------------------------------------------------
+# gfx1250 MXScale shape-alignment helpers
+#
+# The FlyDSL mxscale MoE kernels hard-require K (the GEMM contraction dim,
+# stage1: model_dim, stage2: inter_dim) be divisible by tile_k (itself a
+# multiple of WMMA_K=128), and tile_n to divide N (stage1: 2*inter_dim with
+# the stage1 wrapper also requiring inter_dim % tile_n == 0; stage2:
+# model_dim). Model shapes like GPT-OSS (2880) break both constraints with
+# default tile_n=128 / tile_k=128.
+#
+# The helpers below let the gfx1250 stage1/stage2 wrappers (a) pick the
+# largest legal tile_n that divides the required N dims, and (b) zero-pad
+# activations, weights and scales on the K dim to the next multiple of
+# tile_k. Zero padding is algebraically safe for mx-quantized GEMM (the
+# extra K-slice contributes 0·anything = 0), and is cheap relative to the
+# kernel cost (~2% for 2944 vs 2880).
+# ---------------------------------------------------------------------------
+
+_MXSCALE_FORMAT_PACK = {
+    # in_dtype: (pack_a, pack_b, weight_is_preshuffled)
+    "fp4": (2, 2, False),
+    "fp8": (1, 1, True),
+    "a8w4": (1, 2, True),
+}
+
+
+# Cache padded weight / scale tensors keyed on storage pointer so that
+# repeated fused_moe calls with the same W / W_scale don't re-pad +
+# re-memcpy ~100MB per invocation. This is the dominant cost for shapes
+# whose model_dim is not natively tile_k-aligned (e.g. GPT-OSS 2880 ->
+# padded to 2944).
+#
+# Key:   (data_ptr, numel, element_size, delta_bytes, pad_value, preshuffled)
+# Value: padded tensor (strong ref keeps the entry alive).
+# Policy: FIFO eviction bounded by _MXSCALE_PAD_CACHE_MAX_BYTES total VRAM
+# occupancy (default 512MB) to avoid OOM'ing on multi-GB weight tensors.
+# Disable via AITER_GFX1250_DISABLE_PAD_CACHE=1 if memory-constrained.
+_MXSCALE_PAD_CACHE: dict = {}
+_MXSCALE_PAD_CACHE_BYTES: int = 0
+_MXSCALE_PAD_CACHE_MAX_BYTES: int = int(
+    os.environ.get("AITER_GFX1250_PAD_CACHE_MAX_BYTES", str(512 * 1024 * 1024))
+)
+_MXSCALE_PAD_CACHE_ENABLED: bool = not bool(
+    int(os.environ.get("AITER_GFX1250_DISABLE_PAD_CACHE", "0"))
+)
+
+
+def _mxscale_pad_cache_key(t: torch.Tensor, delta: int, value: int, preshuffled: bool):
+    return (
+        int(t.data_ptr()),
+        int(t.numel()),
+        int(t.element_size()),
+        int(delta),
+        int(value),
+        bool(preshuffled),
+    )
+
+
+def _mxscale_pad_cache_get(key):
+    if not _MXSCALE_PAD_CACHE_ENABLED:
+        return None
+    return _MXSCALE_PAD_CACHE.get(key)
+
+
+def _mxscale_pad_cache_put(key, value):
+    global _MXSCALE_PAD_CACHE_BYTES
+    if not _MXSCALE_PAD_CACHE_ENABLED:
+        return
+    # nbytes of the padded tensor we would cache
+    nbytes = int(value.numel()) * int(value.element_size())
+    if nbytes > _MXSCALE_PAD_CACHE_MAX_BYTES:
+        # Too big to cache without blowing the budget; skip entirely.
+        return
+    # Evict oldest entries (FIFO) until the new one fits within the byte budget.
+    while (
+        _MXSCALE_PAD_CACHE_BYTES + nbytes
+    ) > _MXSCALE_PAD_CACHE_MAX_BYTES and _MXSCALE_PAD_CACHE:
+        oldest_key = next(iter(_MXSCALE_PAD_CACHE))
+        evicted = _MXSCALE_PAD_CACHE.pop(oldest_key)
+        _MXSCALE_PAD_CACHE_BYTES -= int(evicted.numel()) * int(evicted.element_size())
+    _MXSCALE_PAD_CACHE[key] = value
+    _MXSCALE_PAD_CACHE_BYTES += nbytes
+
+
+def _mxscale_align_up(x: int, align: int) -> int:
+    return ((int(x) + int(align) - 1) // int(align)) * int(align)
+
+
+def _mxscale_pick_tile_n(
+    default_tile_n: int, *required_divisors: int, in_dtype: str = "fp8", align: int = 16
+) -> int:
+    """Largest tile_n <= default_tile_n that divides every N dim in
+    ``required_divisors`` and is a multiple of ``align`` (bumped to 32 for
+    fp4, which uses WMMA_N_EFF=32).
+
+    Matches FlyDSL's own ``bench_resolve_tiles`` heuristic (largest multiple
+    of align that divides the N dim). The downstream launch-shape picker
+    (`_pick_fp16_single_launch_shape`) will adapt m_warp/n_warp to whatever
+    tile_n we pick, falling back to degenerate shapes such as n_warp=1 when
+    needed (e.g. tile_n=240 for GPT-OSS fp8).
+    """
+    if in_dtype == "fp4":
+        align = max(align, 32)
+    tn = int(default_tile_n)
+    while tn >= align:
+        if all((int(d) % tn) == 0 for d in required_divisors):
+            return tn
+        tn -= align
+    return align
+
+
+def _mxscale_zero_pad_last(
+    t: torch.Tensor, delta: int, value: int = 0, cache: bool = False
+) -> torch.Tensor:
+    """Append ``delta`` elements of ``value`` along the last dim (default 0).
+
+    ``torch.nn.functional.pad`` does not implement some 1-byte float dtypes
+    (e.g. Float8_e8m0fnu / Float8_e4m3fn / Float4_e2m1fn_x2); operate through
+    a uint8 view in that case, then restore the original dtype.
+
+    ``value`` is interpreted as the raw byte/element value (e.g. 0x7F for
+    E8M0 = 1.0, 0x00 for E8M0 = 2^-127 / fp8 zero).
+
+    When ``cache=True`` (typical for static weight/scale tensors), the result
+    is memoized by the input's storage pointer so repeated calls with the
+    same tensor avoid redoing the ~100MB memcpy.
+    """
+    if int(delta) <= 0:
+        return t
+    if cache:
+        key = _mxscale_pad_cache_key(t, int(delta), int(value), False)
+        cached = _mxscale_pad_cache_get(key)
+        if cached is not None:
+            return cached
+    if t.element_size() == 1 and t.dtype not in (torch.uint8, torch.int8):
+        orig_dtype = t.dtype
+        u8 = t.contiguous().view(torch.uint8)
+        padded = torch.nn.functional.pad(u8, (0, int(delta)), value=int(value))
+        padded = padded.view(orig_dtype)
+    else:
+        padded = torch.nn.functional.pad(t.contiguous(), (0, int(delta)), value=value)
+    if cache:
+        _mxscale_pad_cache_put(key, padded)
+    return padded
+
+
+def _mxscale_pad_weight_k(
+    w: torch.Tensor, delta_bytes: int, weight_is_preshuffled: bool, cache: bool = True
+) -> torch.Tensor:
+    """Zero-pad a weight tensor of shape ``(E, N, K/pack_b)`` on the K-byte
+    (last) dim.
+
+    When the caller has already preshuffled the weight
+    (fp8 / a8w4 path), a raw ``F.pad`` on the last dim would insert zero
+    bytes *inside* each 16-wide shuffled column group, not at the end of
+    the virtual K axis. Instead reshape into the underlying 16x16 tile grid
+    and append whole zero tiles, which preserves the invariant
+    ``preshuffle(pad(W)) == pad_shuffled(preshuffle(W))``.
+    """
+    if int(delta_bytes) <= 0:
+        return w
+    if not weight_is_preshuffled:
+        return _mxscale_zero_pad_last(w, int(delta_bytes), cache=cache)
+
+    if cache:
+        key = _mxscale_pad_cache_key(w, int(delta_bytes), 0, True)
+        cached = _mxscale_pad_cache_get(key)
+        if cached is not None:
+            return cached
+
+    if int(delta_bytes) % 16 != 0:
+        raise ValueError(
+            f"preshuffled K-pad delta must be a multiple of 16 bytes, got {delta_bytes}"
+        )
+    E, N, K_old = w.shape
+    if N % 16 != 0 or K_old % 16 != 0:
+        raise ValueError(
+            f"preshuffled weight must have N and K/pack_b divisible by 16, got N={N}, K={K_old}"
+        )
+
+    orig_dtype = w.dtype
+    w_u8 = w.contiguous()
+    if w.element_size() == 1 and w.dtype not in (torch.uint8, torch.int8):
+        w_u8 = w_u8.view(torch.uint8)
+
+    # Tile view: (E, N/16, K/16, 16, 16). Append delta_bytes/16 zero
+    # tile-columns along the K-tile dim (dim 2).
+    tile_view = w_u8.view(E, N // 16, K_old // 16, 16, 16)
+    delta_tiles = int(delta_bytes) // 16
+    padded = torch.nn.functional.pad(tile_view, (0, 0, 0, 0, 0, delta_tiles))
+    padded = padded.contiguous().view(E, N, K_old + int(delta_bytes))
+    if padded.dtype != orig_dtype:
+        padded = padded.view(orig_dtype)
+    if cache:
+        _mxscale_pad_cache_put(key, padded)
+    return padded
 
 
 @functools.cache
@@ -1339,4 +1543,337 @@ def flydsl_moe_stage2(
                 )
             torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
 
+    return out
+
+
+# ---------------------------------------------------------------------------
+# MoE gather-reduce (weighted) epilogue
+#
+# Final MoE step: combine the per-expert stage2 output ``grouped_out (E, max_m,
+# model_dim)`` into the flat per-token output, weighting each row by its route
+# weight and summing the ``topk`` contributions of every token::
+#
+#     moe_out[t] = sum_k  w(t,k) * grouped_out[expert(t,k), pos(t,k)]
+#
+# ``flydsl_moe_gather_reduce`` is the one-pass gather-reduce kernel: it builds a
+# per-token inverse index map (vectorized host prep) and launches a single
+# kernel that produces each output token's row in one pass. The scatter
+# reference it is validated against (the per-expert ``index_add_`` loop) lives
+# in ``op_tests/test_moe_gather_reduce.py``.
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _get_compiled_gather_reduce(model_dim: int, topk: int, out_dtype: str):
+    """Compile and cache the one-pass MoE gather-reduce kernel."""
+    from aiter.ops.flydsl.kernels.moe_gather_reduce import (
+        build_moe_gather_reduce_module,
+    )
+
+    return build_moe_gather_reduce_module(model_dim, topk, out_dtype)
+
+
+def build_topids_to_rows(
+    topk_ids: torch.Tensor,  # (token_num, topk) local expert ids in [0, E)
+    max_m: int,
+    E: int,
+) -> torch.Tensor:
+    """Per-token gather map: ``topids_to_rows[t,k] = topk_ids[t,k]*max_m + slot``, where
+    ``slot`` is token ``t``'s within-expert position in token-major route order
+    (matching how the route-gather fills each expert). Returns (token_num, topk)
+    int32.
+
+    Argsort-free: the within-expert ``slot`` is a one-hot cumsum (running count
+    per expert in route order). Build this once and share it with the
+    route-gather (scatter-copy) step instead of recomputing.
+    """
+    import torch.nn.functional as F
+
+    token_num, topk = topk_ids.shape
+    flat_e = topk_ids.reshape(-1).to(torch.long)
+    # slot[r] = (# earlier routes to the same expert) = running count - 1
+    slot = F.one_hot(flat_e, E).cumsum(0).gather(1, flat_e[:, None]).squeeze(1) - 1
+    return (flat_e * max_m + slot).view(token_num, topk).to(torch.int32)
+
+
+@functools.cache
+def _get_compiled_route_maps():
+    """Compile and cache the atomic route -> grouped-row map kernel."""
+    from aiter.ops.flydsl.kernels.moe_route_maps import build_moe_route_maps_module
+
+    return build_moe_route_maps_module()
+
+
+def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
+    """Per-token route maps via a single atomic-scatter kernel (SGLang-style),
+    no host-side argsort / nonzero / one-hot. Returns
+    ``(topids_to_rows, rows_to_tokens, masked_m)``:
+
+      topids_to_rows : (token_num, topk) int32  -- route -> grouped row
+                 = ``topk_ids[t,k]*max_m + slot`` (gather-reduce input)
+      rows_to_tokens  : (E*max_m,)        int32  -- grouped row -> source token
+                 (-1 for unused padding rows; scatter-copy input)
+      masked_m        : (E,)              int32  -- rows routed to each expert
+                 (== bincount(topk_ids), the per-expert GEMM mask)
+
+    The within-expert ``slot`` is claimed by ``atomicAdd(1)`` on a per-expert
+    counter initialized to 0; the kernel forms the grouped row in-place as
+    ``slot + e*max_m`` (one int mul-add per thread, hidden behind the atomic).
+    It writes both maps in one pass (topids_to_rows + its inverse
+    rows_to_tokens), and the final counter value is exactly ``counts[e]`` -- so
+    ``masked_m`` is the counter itself, no bincount and no host-side
+    ``arange``/``clone``/``sub`` to build or strip an offset. Order within an
+    expert is atomic-race order (nondeterministic) but self-consistent -- both
+    maps come from the same run, and the grouped GEMM is order-agnostic per
+    expert.
+    """
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    topk_ids_i32 = topk_ids.reshape(-1).to(torch.int32).contiguous()
+    # Per-expert counter starts at 0; the kernel applies the e*max_m offset, so
+    # after the run this buffer holds counts[e] directly == masked_m.
+    atomic_buffer = torch.zeros(E, dtype=torch.int32, device=device)
+    topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
+    rows_to_tokens = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
+    grid_blocks = (numel + 255) // 256
+    launch = _get_compiled_route_maps()
+    launch(
+        topk_ids_i32,
+        atomic_buffer,
+        topids_to_rows,
+        rows_to_tokens,
+        numel,
+        topk,
+        max_m,
+        grid_blocks,
+        stream=torch.cuda.current_stream(),
+    )
+    # atomic_buffer[e] == counts[e] now; it is masked_m, no further math.
+    masked_m = atomic_buffer
+    return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
+
+
+def flydsl_moe_gather_reduce(
+    grouped_out: torch.Tensor,  # (E, max_m, model_dim) bf16/f16
+    topids_to_rows: torch.Tensor,  # (token_num, topk) int32 grouped flat rows
+    gather_w: torch.Tensor,  # (token_num, topk) weight, bf16/f16 (== grouped_out dtype)
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """One-pass gather-reduce epilogue. Thin launcher over a *precomputed* gather
+    map: ``out[t] = sum_k gather_w[t,k] * grouped_out_flat[topids_to_rows[t,k]]``.
+
+    The caller builds ``topids_to_rows`` once (see ``build_topids_to_rows``,
+    argsort-free) and may share it with the route-gather step; this wrapper does
+    no host-side map building. ``grouped_out`` and ``gather_w`` must be bf16 or
+    f16 (the kernel extends the weight to f32 internally for accumulation)."""
+    E, max_m, model_dim = grouped_out.shape
+    token_num, topk = topids_to_rows.shape
+    device = grouped_out.device
+    if grouped_out.dtype == torch.bfloat16:
+        out_dtype = "bf16"
+    elif grouped_out.dtype == torch.float16:
+        out_dtype = "f16"
+    else:
+        raise ValueError(f"unsupported dtype {grouped_out.dtype}; need bf16/f16")
+
+    # Caller passes topids_to_rows int32 and gather_w bf16/f16 (both contiguous).
+    grouped_out_flat = grouped_out.contiguous().view(E * max_m, model_dim)
+    if out is None:
+        out = torch.empty(
+            (token_num, model_dim), dtype=grouped_out.dtype, device=device
+        )
+
+    launch = _get_compiled_gather_reduce(model_dim, topk, out_dtype)
+    launch(
+        grouped_out_flat,
+        topids_to_rows,
+        gather_w,
+        out,
+        token_num,
+        stream=torch.cuda.current_stream(),
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# MoE route-gather (scatter-copy) input layout
+#
+# Pre-stage1 step: copy each token's quantized payload (and per-token scale)
+# from the flat per-token layout into the grouped per-expert layout::
+#
+#     for e in range(E):
+#         toks = tokens routed to expert e        # n = counts[e]
+#         grouped[e, :n] = a_payload[toks]
+#
+# ``flydsl_moe_scatter_copy_token`` does the heavy row copies in one kernel pass
+# (one block per grouped row, gathered from its source token via a precomputed
+# dst->src map) and fills route_tokens/route_weights with cheap host ops. The
+# reference loop it is validated against lives in
+# ``op_tests/test_moe_scatter_copy_token.py``.
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _get_compiled_scatter_copy(row_bytes: int):
+    """Compile and cache the one-pass row scatter-copy kernel (per row width)."""
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
+        build_moe_scatter_copy_token_module,
+    )
+
+    return build_moe_scatter_copy_token_module(row_bytes)
+
+
+def flydsl_moe_scatter_copy_token(
+    a1_payload: torch.Tensor,  # (token_num, Wp) uint8
+    a1_scale_token_u8: Optional[torch.Tensor],  # (token_num, Ws) uint8 or None
+    rows_to_tokens: torch.Tensor,  # (E*max_m,) int32 grouped row -> token (-1 pad)
+    E: int,
+    max_m: int,
+    grouped_a1: Optional[torch.Tensor] = None,  # (E, max_m, Wp) uint8 out
+    a1_scale_raw: Optional[torch.Tensor] = None,  # (E, max_m, Ws) uint8 out
+):
+    """Copy each token's payload (and per-token scale) into the grouped layout,
+    driven by ``rows_to_tokens`` (grouped row -> source token, -1 for padding)
+    from ``build_route_maps``. Pure copy -- one kernel per tensor.
+
+    route_tokens/route_weights are NOT produced here: they are needed only by the
+    naive epilogue (built in that loop) and, for doweight_stage1, derived on
+    demand by the caller from topk_weight + topids_to_rows.
+
+    Output tensors may be passed in (the kernel writes only the mapped/valid
+    rows, leaving any pre-existing padding untouched -- e.g. an a1_scale_raw
+    pre-filled with 127). When omitted they are allocated zero-filled.
+
+    Returns (grouped_a1, a1_scale_raw)."""
+    device = a1_payload.device
+    Wp = a1_payload.shape[1]
+    num_dst = E * max_m
+
+    if grouped_a1 is None:
+        grouped_a1 = torch.zeros((E, max_m, Wp), dtype=torch.uint8, device=device)
+    launch_p = _get_compiled_scatter_copy(Wp)
+    launch_p(
+        a1_payload.contiguous().view(-1, Wp),
+        grouped_a1.view(num_dst, Wp),
+        rows_to_tokens,
+        num_dst,
+        stream=torch.cuda.current_stream(),
+    )
+
+    if a1_scale_token_u8 is not None:
+        Ws = a1_scale_token_u8.shape[1]
+        if a1_scale_raw is None:
+            a1_scale_raw = torch.zeros((E, max_m, Ws), dtype=torch.uint8, device=device)
+        launch_s = _get_compiled_scatter_copy(Ws)
+        launch_s(
+            a1_scale_token_u8.contiguous().view(-1, Ws),
+            a1_scale_raw.view(num_dst, Ws),
+            rows_to_tokens,
+            num_dst,
+            stream=torch.cuda.current_stream(),
+        )
+
+    return grouped_a1, a1_scale_raw
+
+
+@functools.cache
+def _get_compiled_scatter_preshuffle_scale(
+    row_bytes: int, wmma_rep: int, scale_k_per_tile: int, gather: bool = True
+):
+    """Compile and cache the WMMA-preshuffle scale kernel (with/without gather)."""
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_preshuffle_scale import (
+        build_moe_scatter_copy_preshuffle_scale_module,
+    )
+
+    return build_moe_scatter_copy_preshuffle_scale_module(
+        row_bytes, wmma_rep, scale_k_per_tile, gather=gather
+    )
+
+
+def flydsl_moe_scatter_preshuffle_scale(
+    a1_scale_token_u8: torch.Tensor,  # (token_num, Ws) uint8
+    rows_to_tokens: torch.Tensor,  # (E*max_m,) int32 grouped row -> token (-1 pad)
+    E: int,
+    max_m: int,
+    *,
+    wmma_rep: int,
+    scale_k_per_tile: int,
+    grouped_a1_scale: Optional[
+        torch.Tensor
+    ] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+):
+    """Route-gather each token's e8m0 scale row AND preshuffle it into the WMMA
+    layout in a single kernel pass -- fusing ``flydsl_moe_scatter_copy_token``'s
+    scale copy with ``_grouped_a8w4_preshuffle_e8m0_scale``.
+
+    ``max_m`` must be a multiple of ``wmma_rep*16`` (the grouped path pads it to
+    a multiple of ``warp_tile_m``). Padding rows (``rows_to_tokens == -1``) are
+    left untouched -- the masked GEMM never reads them, matching the previous
+    uninitialized ``a1_scale_raw`` behaviour. Returns ``grouped_a1_scale``."""
+    device = a1_scale_token_u8.device
+    Ws = a1_scale_token_u8.shape[1]
+    rows_per_tile = wmma_rep * 16
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    tiles_per_expert = max_m // rows_per_tile
+
+    if grouped_a1_scale is None:
+        grouped_a1_scale = torch.empty(
+            (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
+        )
+
+    launch = _get_compiled_scatter_preshuffle_scale(
+        Ws, wmma_rep, scale_k_per_tile, True
+    )
+    launch(
+        a1_scale_token_u8.contiguous().view(-1, Ws),
+        grouped_a1_scale.view(E * (max_m // wmma_rep), Ws * wmma_rep),
+        rows_to_tokens,
+        max_m,
+        E,
+        tiles_per_expert,
+        stream=torch.cuda.current_stream(),
+    )
+    return grouped_a1_scale
+
+
+def flydsl_moe_preshuffle_scale(
+    scale_grouped_u8: torch.Tensor,  # (E, max_m, Ws) or (E*max_m, Ws) uint8
+    E: int,
+    max_m: int,
+    *,
+    wmma_rep: int,
+    scale_k_per_tile: int,
+    out: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+):
+    """Preshuffle an already-grouped row-major e8m0 scale into the WMMA layout in
+    one kernel pass -- the in-kernel equivalent of the torch
+    ``_grouped_a8w4_preshuffle_e8m0_scale`` permute (used by stage2, where the
+    scale is already grouped so no route-gather is needed). Returns ``out``."""
+    device = scale_grouped_u8.device
+    Ws = scale_grouped_u8.shape[-1]
+    rows_per_tile = wmma_rep * 16
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    tiles_per_expert = max_m // rows_per_tile
+
+    if out is None:
+        out = torch.empty(
+            (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
+        )
+
+    launch = _get_compiled_scatter_preshuffle_scale(
+        Ws, wmma_rep, scale_k_per_tile, False
+    )
+    launch(
+        scale_grouped_u8.contiguous().view(E * max_m, Ws),
+        out.view(E * (max_m // wmma_rep), Ws * wmma_rep),
+        max_m,
+        E,
+        tiles_per_expert,
+        stream=torch.cuda.current_stream(),
+    )
     return out
