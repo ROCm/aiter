@@ -48,6 +48,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
 from .kernels_common import dtype_to_elem_type
+from .tensor_shim import _run_compiled
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl._mlir import ir
@@ -777,23 +778,24 @@ def build_flash_attn_func_module_primary(
                 kwargs[name] = _ptr_arg(kwargs[name])
         return tuple(args), kwargs
 
+    launch_flash_attn_func.compile_hints = dict(_fmha_compile_hints)
+
     def _launch(*args, **kwargs):
         args, kwargs = _wrap_qkvo(args, kwargs)
-        with CompilationContext.compile_hints(_fmha_compile_hints):
-            return launch_flash_attn_func(*args, **kwargs)
+        stream = kwargs.pop("stream", fx.Stream(None))
+        _run_compiled(launch_flash_attn_func, *args, stream)
 
     def _compile(Q, K, V, O, batch_size, seq_len, stream=None):  # noqa: E741
-        with CompilationContext.compile_hints(_fmha_compile_hints):
-            return flyc.compile(
-                launch_flash_attn_func,
-                _ptr_arg(Q),
-                _ptr_arg(K),
-                _ptr_arg(V),
-                _ptr_arg(O),
-                batch_size,
-                seq_len,
-                fx.Stream(stream),
-            )
+        return flyc.compile(
+            launch_flash_attn_func,
+            _ptr_arg(Q),
+            _ptr_arg(K),
+            _ptr_arg(V),
+            _ptr_arg(O),
+            batch_size,
+            seq_len,
+            fx.Stream(stream),
+        )
 
     _launch.compile = _compile
     return _launch
