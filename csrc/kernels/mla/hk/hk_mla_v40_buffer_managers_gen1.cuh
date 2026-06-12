@@ -305,7 +305,9 @@ class QManager8to16bitsV1
     // to ensure the staging bytes and scale dwords are valid before the cvt).
     template <uint32_t kChunkIdx, uint32_t kBufIdx, uint32_t GPR_NOPE_VGPR_START>
     __device__ __forceinline__ static void
-    p1_staging_to_vgpr_chunk(const uintptr_t p_lds_warp_staging, const uint32_t s_dw)
+    p1_staging_to_vgpr_chunk(const uintptr_t p_lds_warp_staging,
+                             const uint32_t s_dw,
+                             const float q_scale_log2)
     {
         static_assert(kChunkIdx < kP1NumChunks, "p1_staging_to_vgpr_chunk: bad kChunkIdx.");
         static_assert(kBufIdx < kP1NumStagingBuffers, "p1_staging_to_vgpr_chunk: bad kBufIdx.");
@@ -364,8 +366,12 @@ class QManager8to16bitsV1
 
         // V4 shares one E8M0 scale across the full 64-col chunk -> single
         // scale_f for both 32-col mfma A-tiles (iter0 cols [0,32), iter1
-        // cols [32,64)).
-        const float scale_f = hk_mla::e8m0_to_f32(s_dw);
+        // cols [32,64)). Fold the softmax temperature (sm_scale * log2e) into
+        // the cvt's fp32 scale operand here so the QK scores arrive already
+        // temperature-scaled and in log2 domain -- this removes the per-tile
+        // softmax_scale_p multiply and softmax_p1's log2e multiply. Single
+        // rounding (the cvt rounds once to bf16), no extra instructions.
+        const float scale_f = hk_mla::e8m0_to_f32(s_dw) * q_scale_log2;
 
         // Drain lgkmcnt: ds_read fp8 results must be ready before cvt builtin
         // consumes them. Pair with sched_barrier(0) -- the cvt is a pure-SSA
@@ -432,7 +438,8 @@ class QManager8to16bitsV1
     __device__ __forceinline__ static void p2_cvt_store_nope_chunk(const uintptr_t p_lds_q,
                                                                    const uint32_t warp_idx,
                                                                    const hk::u32x4& nope_dw,
-                                                                   const uint32_t scale_dw)
+                                                                   const uint32_t scale_dw,
+                                                                   const float q_scale_log2)
     {
         static_assert(kChunkIdx < kP2NumNopeChunks, "p2_cvt_store_nope_chunk: bad kChunkIdx.");
         constexpr uint32_t kColInLds    = kChunkIdx * kP2ChunkCols;  // 0,64,128
@@ -463,7 +470,10 @@ class QManager8to16bitsV1
         // only waits for its own source. This is strictly better than a
         // blanket vmcnt(0) (verified by ISA diff).
 
-        const float scale_f = hk_mla::e8m0_to_f32(scale_dw);
+        // Fold the softmax temperature (sm_scale * log2e) into the cvt scale
+        // (see p1_staging_to_vgpr_chunk) so Phase-2 NoPE Q lands pre-scaled
+        // in log2 domain too.
+        const float scale_f = hk_mla::e8m0_to_f32(scale_dw) * q_scale_log2;
 
         using bf16x2_v = __attribute__((__vector_size__(4))) short;
         hk::u32x4 lo_dw, hi_dw;
@@ -506,14 +516,31 @@ class QManager8to16bitsV1
         hkm::ds_write_b128(hi_dw, addr, kSubBlockBytes);
     }
 
-    // ---- Phase 2: RoPE bf16 chunk -> LDS (direct vmem -> LDS, no cvt) ----
+    // Scale one bf16x2 dword by an fp32 scalar: unpack each bf16 to fp32
+    // (bf16 = high 16 bits of fp32, so element k -> bits<<16), multiply, then
+    // repack with v_cvt_pk_bf16_f32 (element 0 -> low half, element 1 -> high).
+    // Used by the RoPE Q load to fold sm_scale*log2e into bf16 RoPE Q.
+    __device__ __forceinline__ static uint32_t scale_bf16_pair(uint32_t b, float s)
+    {
+        const float f0 = __builtin_bit_cast(float, (b & 0x0000ffffu) << 16) * s;
+        const float f1 = __builtin_bit_cast(float, (b & 0xffff0000u)) * s;
+        uint32_t out;
+        asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2" : "=v"(out) : "v"(f0), "v"(f1));
+        return out;
+    }
+
+    // ---- Phase 2: RoPE bf16 chunk -> LDS (load -> VGPR, scale, ds_write) ----
     // Lane mapping (matches the row-major-within-sub-block layout the QK
     // ds_read_b128 expects): lane T writes 16 B = 8 bf16 to row T/4, cols
-    // (T%4)*8..+8 of one 16x32 sub-block. Two buffer_load_lds_b128 instructions
-    // cover both 32-col halves of the 64-col RoPE region.
+    // (T%4)*8..+8 of one 16x32 sub-block. Two 16-B halves cover the 64-col
+    // RoPE region. Unlike NoPE (cvt-at-store from fp8), RoPE is already bf16,
+    // but we must fold the softmax temperature (sm_scale*log2e) in, so this
+    // can no longer be a direct vmem->LDS copy: load to VGPR, scale each bf16
+    // pair, then ds_write_b128 to the same swizzled LDS slots.
     __device__ __forceinline__ static void p2_load_rope_chunk(const q_rope_t* p_q_rope_warp,
                                                               const uintptr_t p_lds_q,
-                                                              const uint32_t warp_idx)
+                                                              const uint32_t warp_idx,
+                                                              const float q_scale_log2)
     {
         constexpr uint32_t kColTileLo = kLdsHalfNopeCols / kSubBlockCols; // 6
         constexpr uint32_t kColTileHi = kColTileLo + 1u;                  // 7
@@ -538,27 +565,34 @@ class QManager8to16bitsV1
         // which means (sb=0, q) <- data sub-tile 2q (cols 16q..+7) and
         //             (sb=1, q) <- data sub-tile 2q+1 (cols 16q+8..+15).
         // Both lo & hi share v_off base = row*kRopeStride + col_quad*32 B;
-        // hi adds +16 B. We still overlap that +16 with the LDS advance to
-        // kColTileHi by pre-subtracting 16 from p_dst_hi_adj and using
-        // i_off=16 on the 2nd load -- eliminates the second voffset VGPR.
+        // hi adds +16 B in the gmem source. With an explicit ds_write (vs the
+        // old buffer_load_lds) the LDS dst is addressed directly, so the +16
+        // is applied only to the gmem offset (s_os) and the two halves land at
+        // their natural swizzled LDS slots.
         const uint32_t v_off_lo = row_in_warp * kRopeStride + col_quad_swz * 32u;
 
         const uint32_t lds_off = lane_idx * 16u;
 
         const uintptr_t p_dst_lo = p_lds_q + sub_block_byte_offset(warp_idx, kColTileLo) + lds_off;
-        const uintptr_t p_dst_hi_adj =
-            p_lds_q + sub_block_byte_offset(warp_idx, kColTileHi) + lds_off - 16u;
+        const uintptr_t p_dst_hi = p_lds_q + sub_block_byte_offset(warp_idx, kColTileHi) + lds_off;
 
+        // Process each 16-B half independently (load -> scale -> ds_write)
+        // before touching the next, so only one u32x4 + its fp32 temps are live
+        // at a time -- keeps the compiler scratch footprint inside the
+        // amdgpu_num_vgpr(64) budget (this runs in load_q, outside the pinned
+        // hot loop, but its scratch still shares v0..v63). Byte-addressed gmem
+        // (uint8) so v_off_lo / the +16 stay in bytes; load<16> pulls 16 B.
         auto g_q_rope =
             opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_rope_warp));
-        __builtin_amdgcn_raw_ptr_buffer_load_lds(
-            g_q_rope.cached_rsrc,
-            (hk::as3_uint32_ptr)(p_dst_lo),
-            /*size=*/16, v_off_lo, /*s_off=*/0u, /*i_off=*/0, /*aux=*/0);
-        __builtin_amdgcn_raw_ptr_buffer_load_lds(
-            g_q_rope.cached_rsrc,
-            (hk::as3_uint32_ptr)(p_dst_hi_adj),
-            /*size=*/16, v_off_lo, /*s_off=*/0u, /*i_off=*/16, /*aux=*/0);
+        auto scale_and_store = [&](uint32_t s_os, uintptr_t p_dst) {
+            hk::u32x4 v =
+                __builtin_bit_cast(hk::u32x4, g_q_rope.template load<16>(v_off_lo, s_os));
+            opus::static_for<4>(
+                [&](auto i) { v[i.value] = scale_bf16_pair(v[i.value], q_scale_log2); });
+            hkm::ds_write_b128(v, static_cast<uint32_t>(p_dst), 0);
+        };
+        scale_and_store(0u, p_dst_lo);
+        scale_and_store(16u, p_dst_hi);
     }
 
     public:
@@ -596,7 +630,8 @@ class QManager8to16bitsV1
                                            const int32_t num_qheads,
                                            const int32_t warp_idx,
                                            const int32_t qo_start,
-                                           const uintptr_t p_lds_q)
+                                           const uintptr_t p_lds_q,
+                                           const float q_scale_log2)
     {
         // Per-warp base pointers in vmem (each warp owns kTileM=16 rows).
         // Q layout: [total_q, num_qheads, kQkPackedNopeQElems] (the
@@ -630,7 +665,7 @@ class QManager8to16bitsV1
         // Drain c0 (oldest 2 of 4 outstanding).
         __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/2));
         __builtin_amdgcn_sched_barrier(0);
-        p1_staging_to_vgpr_chunk<0, 0, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_0);
+        p1_staging_to_vgpr_chunk<0, 0, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_0, q_scale_log2);
         // c0 ds_read must be done before c2 overwrites buf 0.
         __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
         __builtin_amdgcn_sched_barrier(0);
@@ -638,7 +673,7 @@ class QManager8to16bitsV1
         // Drain c1 (oldest 2 of 4).
         __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/2));
         __builtin_amdgcn_sched_barrier(0);
-        p1_staging_to_vgpr_chunk<1, 1, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_1);
+        p1_staging_to_vgpr_chunk<1, 1, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_1, q_scale_log2);
         // c1 ds_read must be done before c3 overwrites buf 1.
         __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
         __builtin_amdgcn_sched_barrier(0);
@@ -646,11 +681,11 @@ class QManager8to16bitsV1
         // Drain c2.
         __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/2));
         __builtin_amdgcn_sched_barrier(0);
-        p1_staging_to_vgpr_chunk<2, 0, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_2);
+        p1_staging_to_vgpr_chunk<2, 0, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_2, q_scale_log2);
         // Drain c3.
         __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/0));
         __builtin_amdgcn_sched_barrier(0);
-        p1_staging_to_vgpr_chunk<3, 1, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_3);
+        p1_staging_to_vgpr_chunk<3, 1, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_3, q_scale_log2);
 
         // ---- Phase 2: LDS half (Q[:, 256:512]) ----
         // 3 NoPE chunks then 1 RoPE chunk. Phase 2 overwrites the staging
@@ -672,14 +707,14 @@ class QManager8to16bitsV1
 
         p2_vmem_to_vgpr_nope_chunk<0>(p_q_warp, nope_dw_0, scale_dw_0);
         p2_vmem_to_vgpr_nope_chunk<1>(p_q_warp, nope_dw_1, scale_dw_1);
-        p2_cvt_store_nope_chunk<0>(p_lds_q, warp_idx_u, nope_dw_0, scale_dw_0);
+        p2_cvt_store_nope_chunk<0>(p_lds_q, warp_idx_u, nope_dw_0, scale_dw_0, q_scale_log2);
         // chunk 1's vmem is already drained by the wait inside chunk 0's drain;
         // chunk 1's cvt_store wait is therefore a no-op.
-        p2_cvt_store_nope_chunk<1>(p_lds_q, warp_idx_u, nope_dw_1, scale_dw_1);
+        p2_cvt_store_nope_chunk<1>(p_lds_q, warp_idx_u, nope_dw_1, scale_dw_1, q_scale_log2);
 
         p2_vmem_to_vgpr_nope_chunk<2>(p_q_warp, nope_dw_2, scale_dw_2);
-        p2_load_rope_chunk(p_q_rope_warp, p_lds_q, warp_idx_u);
-        p2_cvt_store_nope_chunk<2>(p_lds_q, warp_idx_u, nope_dw_2, scale_dw_2);
+        p2_load_rope_chunk(p_q_rope_warp, p_lds_q, warp_idx_u, q_scale_log2);
+        p2_cvt_store_nope_chunk<2>(p_lds_q, warp_idx_u, nope_dw_2, scale_dw_2, q_scale_log2);
     }
 
     // QK A-tile load from the bf16 final Q LDS region. Loads one 16 x 32 bf16

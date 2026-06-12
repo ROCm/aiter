@@ -354,8 +354,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
         // Load Q: Q[:, 0:256] -> VGPR pinned at k_q_vgpr_begin (32 vgprs/lane).
         //         Q[:, 256:512] -> bf16 final LDS region inside p_lds_q.
         // Q rope/nope buffers are separate tensors in V4.0.
-        q_manager.template load_q<k_q_vgpr_begin>(
-            params.p_query, params.p_query_rope, num_qheads, warp_idx, qo_start, p_lds_q);
+        // Fold the softmax temperature AND the natural->log2 conversion into Q
+        // once here, so the per-KV-tile softmax drops both its sm_scale multiply
+        // (softmax_scale_p -> softmax_mask_p) and its log2e multiply
+        // (softmax_p1 -> softmax_p1_prescaled). Scores then arrive in log2 units.
+        const float q_scale_log2 = params.softmax_scale * static_cast<float>(log2e);
+        q_manager.template load_q<k_q_vgpr_begin>(params.p_query,
+                                                  params.p_query_rope,
+                                                  num_qheads,
+                                                  warp_idx,
+                                                  qo_start,
+                                                  p_lds_q,
+                                                  q_scale_log2);
         __builtin_amdgcn_sched_barrier(0);
 
         // Prologue: prefetch + cvt+store the first KV tile into the curr pong.
@@ -785,18 +795,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
             bool do_rescale = false;
             if constexpr(kSkipCompute == false)
             {
+                // Q was pre-scaled by sm_scale*log2e in load_q, so only mask
+                // OOB columns here (no per-tile multiply).
                 const uint32_t kv_tile_start_u = static_cast<uint32_t>(kv_tile_start);
                 if((kv_tile_start_u + T::kBlockN) > static_cast<uint32_t>(kv_end_eff))
                 {
-                    softmax_scale_p<true, k_p_comp_begin>(col_0_idx * 4u + kv_tile_start_u,
-                                                          static_cast<uint32_t>(kv_end_eff),
-                                                          params.softmax_scale);
+                    softmax_mask_p<true, k_p_comp_begin>(col_0_idx * 4u + kv_tile_start_u,
+                                                         static_cast<uint32_t>(kv_end_eff));
                 }
                 else
                 {
-                    softmax_scale_p<false, k_p_comp_begin>(col_0_idx * 4u + kv_tile_start_u,
-                                                           static_cast<uint32_t>(kv_end_eff),
-                                                           params.softmax_scale);
+                    softmax_mask_p<false, k_p_comp_begin>(col_0_idx * 4u + kv_tile_start_u,
+                                                          static_cast<uint32_t>(kv_end_eff));
                 }
 
                 // Row-wise max across 8 p_comp vgprs, then across the 4-lane
@@ -828,7 +838,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                     if(do_rescale)
                     {
                         const comp_t new_row_max = opus::max(local_max, row_max);
-                        rescale  = __builtin_amdgcn_exp2f((row_max - new_row_max) * log2e);
+                        // row_max is already in log2 units (Q pre-scaled), so no
+                        // * log2e here.
+                        rescale  = __builtin_amdgcn_exp2f(row_max - new_row_max);
                         row_max  = new_row_max;
                     }
                 }
@@ -839,7 +851,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                 // place to hold exp(p_comp - row_max). rescale==1.0 when the
                 // running max was kept stale, so the prior row_sum_e carries
                 // forward unscaled.
-                softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
+                softmax_p1_prescaled<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
 
                 // ---- fp32->bf16 pack (p_comp -> p_mfma overlay) ----
                 // 8 fp32 (v120..v127) -> 4 bf16x2 dwords (v120..v123 overlay).
@@ -1035,7 +1047,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                 // (-inf if p_attn_sink is null, so exp(...)=0 -> no-op).
                 if(kEpilogueType == PvGemmEpilogueType::OutputFinal || is_last_split)
                 {
-                    const float sink_term = __builtin_amdgcn_exp2f((attn_sink - row_max) * log2e);
+                    // row_max is in log2 units (Q pre-scaled), attn_sink is a raw
+                    // logit, so convert the sink to log2 units before the diff.
+                    const float sink_term =
+                        __builtin_amdgcn_exp2f(attn_sink * log2e - row_max);
                     row_sum_e += sink_term;
                 }
 
@@ -1081,7 +1096,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                         constexpr comp_t inv_log2e = 1.0f / log2e;
                         const uint32_t row_idx = lane_idx + warp_idx * kMfmaResultRows +
                                                  static_cast<uint32_t>(partial_qo_loc) * num_qheads;
-                        const comp_t lse = row_max + __builtin_amdgcn_logf(row_sum_e) * inv_log2e;
+                        // row_max is now in log2 units (Q pre-scaled).
+                        // __builtin_amdgcn_logf == v_log_f32 == LOG2 in HW.
+                        // lse_nat = row_max_nat + ln(sum)
+                        //         = row_max_log2*inv_log2e + log2(sum)*inv_log2e
+                        //         = (row_max + log2(sum)) * inv_log2e.
+                        const comp_t lse =
+                            (row_max + __builtin_amdgcn_logf(row_sum_e)) * inv_log2e;
                         params.p_split_lse[row_idx] = lse;
                     }
                 }
