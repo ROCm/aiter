@@ -319,6 +319,21 @@ def swizzle_scales_gfx1250(data):
     return data
 
 
+def swizzle_scales(data):
+    """Arch-agnostic scale swizzle for moe_gemm_a8w4.
+
+    Returns (swizzled_data, layout_string) where layout_string is the
+    SWIZZLE_MX_SCALE value the kernel expects, or None for unknown arches.
+    """
+    arch = get_arch()
+    if arch == "gfx1250":
+        return swizzle_scales_gfx1250(data), "GFX1250_SCALE"
+    elif arch == "gfx950":
+        return swizzle_scales_gfx950(data), "CDNA4_SCALE"
+    else:
+        return data, None
+
+
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
