@@ -797,7 +797,7 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
     // Prologue
     kv_page[2] = load_kv_page(0);
     async_load<T::VEC_KV>(g_kv, s_kv[0].ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv);
-    __builtin_amdgcn_s_waitcnt(0);
+    __syncthreads();
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 

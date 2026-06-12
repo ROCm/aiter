@@ -434,7 +434,7 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
     {
         p_lds_reduce_partial_map[i] = params.p_reduce_partial_map[reduce_tile_start + i];
     }
-    __builtin_amdgcn_s_waitcnt(0);
+    __syncthreads();
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
 
@@ -553,7 +553,7 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
     {
         p_lds_reduce_partial_map[i] = params.p_reduce_partial_map[reduce_tile_start + i];
     }
-    __builtin_amdgcn_s_waitcnt(0);
+    __syncthreads();
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
 
