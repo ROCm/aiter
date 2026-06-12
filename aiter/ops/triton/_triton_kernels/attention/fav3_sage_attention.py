@@ -1,4 +1,3 @@
-from op_tests.test_pa import USE_ALIBI
 import torch
 import triton
 import triton.language as tl
