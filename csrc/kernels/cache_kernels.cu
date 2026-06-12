@@ -1211,9 +1211,6 @@ __global__ void concat_and_cache_mla_seg_opt_kernel(
     const float* scale                        //
 )
 {
-    using in_vec_t  = opus::vector_t<scalar_t, VEC>;
-    using out_vec_t = opus::vector_t<cache_t, VEC>;
-
     const int64_t token_idx = blockIdx.x;
     const int64_t slot_idx  = slot_mapping[token_idx];
     if(slot_idx < 0)
@@ -1227,23 +1224,35 @@ __global__ void concat_and_cache_mla_seg_opt_kernel(
     const int64_t pe_base =
         block_idx * block_stride + (int64_t)page_size * kv_lora_rank + block_offset * pe_dim;
 
+    // Buffer load/store granularity is capped at 128-bit (b128). Use
+    // LVEC = 16 / sizeof(scalar_t) elements per buffer op (bf16 -> 8, fp32 -> 4)
+    // so the load always fits one b128 instruction regardless of input dtype.
+    constexpr int LVEC = 16 / sizeof(scalar_t);
+    using lin_t  = opus::vector_t<scalar_t, LVEC>;
+    using lout_t = opus::vector_t<cache_t, LVEC>;
+
     auto copy = [&](const scalar_t* __restrict__ src, int src_stride, int size, int64_t dst_base) {
-        const int num_vec        = size / VEC;
-        const in_vec_t* src_v    = reinterpret_cast<const in_vec_t*>(src + token_idx * src_stride);
-        out_vec_t*      dst_v    = reinterpret_cast<out_vec_t*>(kv_cache + dst_base);
-        for(int v = threadIdx.x; v < num_vec; v += blockDim.x)
+        const int num_chunk = size / LVEC;
+        // prefill: inputs are read once -> non-temporal (aux=3) buffer load to
+        // avoid polluting L1/L2 with data that won't be reused. Output store
+        // stays normal (the written cache is read by prefill attention later).
+        auto in_buf  = opus::make_gmem<scalar_t>(src + token_idx * src_stride,
+                                                 size * sizeof(scalar_t));
+        auto out_buf = opus::make_gmem<cache_t>(kv_cache + dst_base, size * sizeof(cache_t));
+        for(int v = threadIdx.x; v < num_chunk; v += blockDim.x)
         {
-            const in_vec_t vin = src_v[v];
+            const lin_t vin = in_buf.template load<LVEC, 3>(v * LVEC);
             if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
             {
-                out_vec_t vout;
-                for(int j = 0; j < VEC; ++j)
+                lout_t vout;
+                for(int j = 0; j < LVEC; ++j)
                     vout[j] = static_cast<cache_t>(vin[j]);
-                dst_v[v] = vout;
+                out_buf.template store<LVEC, lout_t>(vout, v * LVEC);
             }
             else
             {
-                dst_v[v] = aiter::scaled_cast<cache_t>(vin, inverted_kscale);
+                out_buf.template store<LVEC, lout_t>(
+                    aiter::scaled_cast<cache_t>(vin, inverted_kscale), v * LVEC);
             }
         }
     };
