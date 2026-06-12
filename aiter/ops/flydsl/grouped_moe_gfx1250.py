@@ -190,39 +190,45 @@ def _grouped_a8w4_prepare_scale_batch(
 
 
 # ---------------------------------------------------------------------------
-# Weight (B) scale preshuffle -- NEW layout (gfx1250 grouped GEMM).
+# Weight (B) scale preshuffle -- "N4K8" layout (gfx1250 grouped GEMM).
 #
-# Unlike the activation (A) scale above, the weight scale uses a lane-major
-# interleave fixed by the WMMA scale contract (16 N-lanes, 4 e8m0 blocks per
-# WMMA-K step), independent of warp_tile / tile_k:
+# The weight scale folds a 64-row x 256-K super-block (4 WMMA N-tiles x 8 e8m0
+# blocks = 2 WMMA-K steps) into one row so that each lane reads its complete
+# WMMA scaleB operand (the 4 e8m0 blocks = one WMMA-K=128 step) with a single
+# contiguous ds_load_b32, and op_sel selects the lane-half (see the WMMA scale
+# contract in ffm/FlyDSL/tests/kernels/test_wmma_scale_sample.py):
 #
-#   view(E, N//32, 2, 16, k_scale//4, 2, 2)
-#     .permute(0, 1, 4, 6, 3, 2, 5)        # [E, remain_n, other_k, k2_a, n_lane, n2, k2_b]
-#     .reshape(E, N//32, k_scale*32)
+#   view(E, N//64, 4, 16, k_scale//8, 2, 4)
+#     .permute(0, 1, 4, 2, 5, 3, 6)        # [E, remain_n, remain_b, p, q, lane, r]
+#     .reshape(E, N//64, k_scale*64)
 #
 # For a raw byte at (n, ks) (n in [0,N), ks in [0,k_scale)=[0,K//32)):
-#   n  = super_row*32 + n2*16 + lane     # n2 = (n//16)%2,  lane = n%16
-#   ks = other_k*4    + a*2  + b         # a  = (ks//2)%2,  b    = ks%2
-#   super_row = n // 32
-#   col = (((other_k*2 + b)*16 + lane)*2 + n2)*2 + a
+#   n  = super_row*64 + p*16 + lane      # p = (n//16)%4,  lane = n%16
+#   ks = remain_b*8   + q*4 + r          # q = (ks//4)%2,  r    = ks%4
+#   super_row = n // 64
+#   col = remain_b*512 + p*128 + q*64 + lane*4 + r
 #
-# Note: the 4 e8m0 blocks of one WMMA-K step land at non-contiguous columns
-# {x, x+1, x+64, x+65} (the ``b`` bit has stride 64), so the consumer cannot
-# read a contiguous i32 per lane the way the old A/B layout allowed.
+# The 4 e8m0 blocks (r=0..3) of one WMMA-K step land CONTIGUOUS (one i32);
+# p (N-tile) has stride 128, q (the 2nd WMMA-K step in the block) stride 64.
+# A full ``remain_b`` block is 512 contiguous cols = 8 e8m0 = 256 K = one k-tile
+# (tile_k=256), so the consumer descriptor loads it as one contiguous tile.
 # ---------------------------------------------------------------------------
 def _grouped_b_scale_preshuffle_e8m0(scale: torch.Tensor) -> torch.Tensor:
-    """Preshuffle a raw per-expert weight e8m0 scale into the new B layout."""
+    """Preshuffle a raw per-expert weight e8m0 scale into the N4K8 B layout."""
     scale = scale.view(torch.uint8).contiguous()
     E, N, k_scale = scale.shape
-    if N % 32 != 0:
-        raise ValueError(f"B-scale rows must be divisible by 32, got {N}")
-    if k_scale % 4 != 0:
-        raise ValueError(f"B-scale k columns must be divisible by 4, got {k_scale}")
-    remain_n = N // 32
-    other_k = k_scale // 4
-    g = scale.view(E, remain_n, 2, 16, other_k, 2, 2)
-    g = g.permute(0, 1, 4, 6, 3, 2, 5).contiguous()
-    return g.reshape(E, remain_n, k_scale * 32)
+    if N % 64 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 64, got {N}")
+    if k_scale % 8 != 0:
+        raise ValueError(
+            f"B-scale k columns (K//32) must be divisible by 8 (K%256==0), "
+            f"got {k_scale}"
+        )
+    remain_n = N // 64
+    remain_b = k_scale // 8
+    g = scale.view(E, remain_n, 4, 16, remain_b, 2, 4)
+    g = g.permute(0, 1, 4, 2, 5, 3, 6).contiguous()
+    return g.reshape(E, remain_n, k_scale * 64)
 
 
 def _grouped_b_scale_prepare_batch(
@@ -237,7 +243,7 @@ def _grouped_b_scale_prepare_batch(
     scale_u8 = scale.view(torch.uint8).contiguous()
     k_scale = k_dim // 32
     raw_shape = (experts, rows, k_scale)
-    preshuffled_shape = (experts, rows // 32, k_scale * 32)
+    preshuffled_shape = (experts, rows // 64, k_scale * 64)
     if tuple(scale_u8.shape) == preshuffled_shape:
         return scale_u8.to(device=device)
     if tuple(scale_u8.shape) == (experts * rows, k_scale):

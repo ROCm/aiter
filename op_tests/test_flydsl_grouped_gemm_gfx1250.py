@@ -250,6 +250,24 @@ def _full_scale(
     return torch.full((experts, rows, n_blocks), byte, dtype=torch.uint8)
 
 
+def _weight_scale(experts: int, rows: int, n_blocks: int, *, seed: int) -> torch.Tensor:
+    """Varied weight (B) e8m0 scale -- makes the test validate the B-scale layout.
+
+    A uniform weight scale makes the grouped GEMM output INSENSITIVE to the
+    B-scale preshuffle layout (any non-crashing layout passes), so it cannot
+    catch a wrong permutation/addressing.  Here we spread the e8m0 byte over
+    {126,127,128} = {0.5, 1.0, 2.0} pseudo-randomly per (expert, row, block):
+    a misplaced scale then shifts those products by 2x/4x -- far beyond
+    VERIFY_TOL -- while the small window keeps the dynamic range safe.  Both the
+    grouped path (preshuffled via ``_grouped_scale``) and the torch reference
+    (raw, per logical (n, ks)) consume the SAME tensor, so a correct layout
+    still matches and only a wrong layout fails.
+    """
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    r = torch.randint(0, 3, (experts, rows, n_blocks), generator=g, dtype=torch.int16)
+    return (r + (DEFAULT_SCALE_BYTE - 1)).to(torch.uint8)
+
+
 def _balanced_topk(
     tokens: int, topk: int, experts: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -323,8 +341,10 @@ def _run_grouped_via_fused_moe(
     else:
         w1_logical = _pattern_packed(experts, 2 * inter, K_pack, seed=seed + 17)
         w2_logical = _pattern_packed(experts, K, inter_pack, seed=seed + 47)
-        w1_scale_raw = _full_scale(experts, 2 * inter, K // SCALE_BLOCK)
-        w2_scale_raw = _full_scale(experts, K, inter // SCALE_BLOCK)
+        # Varied weight scales so the B-scale preshuffle layout is actually
+        # exercised (see _weight_scale).
+        w1_scale_raw = _weight_scale(experts, 2 * inter, K // SCALE_BLOCK, seed=seed + 201)
+        w2_scale_raw = _weight_scale(experts, K, inter // SCALE_BLOCK, seed=seed + 202)
         if use_bias:
             bg = torch.Generator(device="cpu").manual_seed(seed + 91)
             bias1 = (torch.randn((experts, 2 * inter), generator=bg) * 1e-3).float()
@@ -456,8 +476,10 @@ def _prepare_grouped_moe_case(
     else:
         w1_logical = _pattern_packed(experts, 2 * inter, K_pack, seed=seed + 17)
         w2_logical = _pattern_packed(experts, K, inter_pack, seed=seed + 47)
-        w1_scale_raw = _full_scale(experts, 2 * inter, K // SCALE_BLOCK)
-        w2_scale_raw = _full_scale(experts, K, inter // SCALE_BLOCK)
+        # Varied weight scales so the B-scale preshuffle layout is actually
+        # exercised (see _weight_scale).
+        w1_scale_raw = _weight_scale(experts, 2 * inter, K // SCALE_BLOCK, seed=seed + 201)
+        w2_scale_raw = _weight_scale(experts, K, inter // SCALE_BLOCK, seed=seed + 202)
         if use_bias:
             bg = torch.Generator(device="cpu").manual_seed(seed + 91)
             bias1 = (torch.randn((experts, 2 * inter), generator=bg) * 1e-3).to(
