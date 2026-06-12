@@ -88,10 +88,11 @@ def candidate_variants(shape, M):
     out = []
     for label, k1, k2 in B.flyg_variants(shape):
         bm = _parse_mxfp4_g1_kname(k1)["BM"]
-        if M <= 64 and bm == 128:
+        if M <= 64 and bm == 128:  # BM128 never wins at tiny M
             continue
-        if M >= 8192 and bm == 16:
-            continue
+        # Always keep BM16: it self-loses to BM128 at large M for codegen'd shapes,
+        # but is the only buildable variant for BM16-only shapes (flyg_variants can't
+        # tell which is which -- the unbuildable BM32/128 fail fast via try/except).
         out.append((label, k1, k2))
     return out
 
