@@ -217,7 +217,20 @@ vs asm 核 3162us：差距从最初的 1.86× 收窄到 **1.24×**。
 | reduce | 3936 | +673 | 9128 | 1.0 |
 | **atomic（落地）** | **4401** | **0** | **8909（-2.4%）** | 0.99999 |
 
-**atomic 端到端更优**（省掉独立规约 kernel），精度 cos 0.99999（与最初 atomic 基线一致，max_delta 0.0117 可接受）。tuned 配置改为 `t32x256_atomic_persist`。**e2e 8909 vs asm 1-stage 8602 = 1.036×**（已非常接近）。
+**atomic 端到端更优**（省掉独立规约 kernel），精度 cos 0.99999（与最初 atomic 基线一致，max_delta 0.0117 可接受）。
+
+### ✅ Step G（atomic tile 重扫：t32x128 最优，已落地）
+atomic 路径的 tile 最优与 reduce 不同。重扫 persist+atomic 的 tile：
+
+| tile (atomic persist) | gemm2 | e2e |
+|---|---|---|
+| t16x128 | 5493 | 10008 |
+| t32x64 | 4966 | 9472 |
+| t64x256 | 5304 | 9809 |
+| t32x256 | 4401 | 8907 |
+| **t32x128（落地）** | **4187** | **8694** |
+
+`tile_n=128` 是甜点（gx=32 个 N-tile，e_vec 较小、每 N-tile 累加器 VGPR 少、跨 N 预取粒度更细）；更大(256)或更小(64)都更差。tuned 配置改为 `t32x128_atomic_persist`。**e2e 8694 vs asm 1-stage 8602 = 1.011×（实质追平）**。
 
 ### rocprof-compute 分析（确认非 VALU 受限）
 persist+pf reduce SOL：VALU Util **52.9%**（最忙 pipe）、MFMA 26.1%、IPC **0.86**（低）、占用 92%、LDS 冲突 0.27。两次 VALU 削减实验印证非 VALU 受限：
