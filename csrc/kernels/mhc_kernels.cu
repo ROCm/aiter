@@ -23,9 +23,11 @@ namespace aiter {
     __device__ float cross_row_sum_4(float val, int lane_id) {
         int ival;
     
-        ival = __builtin_bit_cast(int, val);
-        val += __builtin_bit_cast(float,
-            __builtin_amdgcn_ds_bpermute((lane_id ^ 32) * 4, ival));
+        if constexpr (opus::get_warp_size() == 64) {
+            ival = __builtin_bit_cast(int, val);
+            val += __builtin_bit_cast(float,
+                __builtin_amdgcn_ds_bpermute((lane_id ^ 32) * 4, ival));
+        }
     
         ival = __builtin_bit_cast(int, val);
         val += __builtin_bit_cast(float,
@@ -34,13 +36,58 @@ namespace aiter {
         return val;
     }
 
-#if defined(__GFX9__)
+// Branch must match mma_pack_size (= warp_size == 64 ? 1 : 2): the MFMA path
+// consumes scalar lanes ((a)[0]/(b)[0], pack size 1, wave64), while gfx1250
+// uses native wave32 WMMA and other wave32 targets use the FMA fallback.
+// The host compile pass defines neither __GFX9__ nor __gfx1250__ but
+// get_warp_size() returns 64 there, so it must take the MFMA (scalar) branch
+// to stay type-consistent with mma_pack_size.
+#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
 #define MMA_F32_16X16X4(a, b, c) \
     __builtin_amdgcn_mfma_f32_16x16x4f32((a)[0], (b)[0], (c), 0, 0, 0)
-#else
+#elif defined(__gfx1250__)
 #define MMA_F32_16X16X4(a, b, c) \
     __builtin_amdgcn_wmma_f32_16x16x4_f32( \
         false, (a), false, (b), static_cast<short>(0), (c), false, false)
+#else
+    template <typename FP32Vec, typename AccVec>
+    __device__ __forceinline__ AccVec mma_f32_16x16x4_fma(
+        const FP32Vec& b,
+        const FP32Vec& a,
+        const AccVec& c
+    ) {
+        static constexpr int pack_elems = sizeof(FP32Vec) / sizeof(float);
+        static constexpr int acc_elems = sizeof(AccVec) / sizeof(float);
+        AccVec out = c;
+        int lane_id = opus::lane_id();
+        int n_base = (lane_id / 16) * acc_elems;
+        int own_group_base = lane_id & ~15;
+        int peer_group_base = own_group_base ^ 16;
+        #pragma unroll
+        for (int i = 0; i < acc_elems; i++) {
+            int n_col = n_base + i;
+            float acc = 0.0f;
+            #pragma unroll
+            for (int k_lane = 0; k_lane < pack_elems; k_lane++) {
+                float a_val = a[k_lane];
+                float raw_b = b[k_lane];
+                float peer_a = __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute(
+                    (lane_id ^ 16) * 4, __builtin_bit_cast(int, a_val)));
+                int b_src_lane = own_group_base + n_col;
+                float own_b = __builtin_bit_cast(float,
+                    __builtin_amdgcn_ds_bpermute(b_src_lane * 4, __builtin_bit_cast(int, raw_b)));
+                int peer_b_src_lane = peer_group_base + n_col;
+                float peer_b = __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute(
+                    peer_b_src_lane * 4, __builtin_bit_cast(int, raw_b)));
+                acc += a_val * own_b + peer_a * peer_b;
+            }
+            out[i] += acc;
+        }
+        return out;
+    }
+
+#define MMA_F32_16X16X4(a, b, c) \
+    mma_f32_16x16x4_fma((a), (b), (c))
 #endif
 
     template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k>
@@ -177,7 +224,7 @@ namespace aiter {
         for (int n = 0; n < repeat_n; n++) {
             opus::clear(v_cf[n]);
         }
-        opus::s_waitcnt_vmcnt(opus::number<2 * fn_lds_load_waitcnt + x_load_waitcnt>{});
+        s_wait_all_loadcnt(opus::number<x_load_waitcnt>{}, opus::number<2 * fn_lds_load_waitcnt>{});
         const int k_loop = hc_hidden_size / (split_k * tile_k);
 
         static constexpr int gemm_steps = tile_k / mfma_k * repeat_n;
@@ -221,6 +268,27 @@ namespace aiter {
                 }
             }
         };
+        auto lds_load_bf_window_w32 = [&](float* s_fn_rd_ptr, float (&dst)[8], int p_window_base) {
+            int kk_window_base = p_window_base / repeat_n;
+            #pragma unroll
+            for (int vec_id = 0; vec_id < bf_vecs_per_window; vec_id++) {
+                int n = vec_id / bf_vecs_per_n;
+                int kk_vec_base = kk_window_base + (vec_id % bf_vecs_per_n) * fn_vec_size;
+                int fn_row = n * mfma_n + lane_id % mfma_n;
+                int k_group = lane_id / mfma_m;
+                int K_wanted_base = k_group * x_vec_size +
+                                    (kk_vec_base / x_vec_size) * interleave_size * x_vec_size +
+                                    kk_vec_base % x_vec_size;
+                int K_lds_base = K_wanted_base ^ ((fn_row & 0xF) << fn_xor_shift);
+                fp32x4_t bf_vec = *(reinterpret_cast<fp32x4_t*>(
+                    s_fn_rd_ptr + fn_row * tile_k + K_lds_base));
+                #pragma unroll
+                for (int i = 0; i < fn_vec_size; i++) {
+                    int p_offset = (kk_vec_base + i) * repeat_n + n - p_window_base;
+                    dst[p_offset] = bf_vec[i];
+                }
+            }
+        };
 
 #define GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH)                                             \
         do {                                                                                      \
@@ -235,17 +303,21 @@ namespace aiter {
                 v_a[BUF] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I),             \
                                                 0, true, interleave_size>(                        \
                     g_a, ga_offset + ((k) + 2) * tile_k);                                         \
-                opus::s_waitcnt_vmcnt(opus::number<2 * x_load_waitcnt + fn_lds_load_waitcnt>{});  \
+                s_wait_all_loadcnt(opus::number<2 * x_load_waitcnt>{}, opus::number<fn_lds_load_waitcnt>{}); \
             } else {                                                                              \
-                opus::s_waitcnt_vmcnt(0_I);                                                       \
+                s_wait_all_loadcnt(0_I, 0_I);                                                     \
             }                                                                                     \
             __builtin_amdgcn_s_barrier();                                                         \
             float* s_fn_rd_ptr = s_fn + (LDS_SLOT) * tile_n * tile_k;                             \
             float v_bf[2][8];                                                                      \
-            lds_load_bf_window(s_fn_rd_ptr, v_bf[0], 0);                                           \
+            if constexpr (warp_size == 32) {                                                       \
+                lds_load_bf_window_w32(s_fn_rd_ptr, v_bf[0], 0);                                  \
+            } else {                                                                               \
+                lds_load_bf_window(s_fn_rd_ptr, v_bf[0], 0);                                      \
+            }                                                                                     \
             __builtin_amdgcn_sched_barrier(0);                                                     \
             _Pragma("unroll")                                                                     \
-            for (int p_base = 8; p_base < gemm_steps; p_base += 8) {                               \
+            for (int p_base = 8; p_base < (warp_size == 32 ? vec_tile * repeat_n : gemm_steps); p_base += 8) { \
                 int bf_rd_buf = (p_base / 8 - 1) & 0x1;                                           \
                 int bf_wr_buf = (p_base / 8) & 0x1;                                               \
                 _Pragma("unroll")                                                                 \
@@ -265,7 +337,11 @@ namespace aiter {
                         }                                                                          \
                         v_cf[n_old] = MMA_F32_16X16X4(b_pack, a_pack, v_cf[n_old]);                \
                         if (p_offset == 0 && n_delta == 0) {                                       \
-                            lds_load_bf_window(s_fn_rd_ptr, v_bf[bf_wr_buf], p_base);              \
+                            if constexpr (warp_size == 32) {                                       \
+                                lds_load_bf_window_w32(s_fn_rd_ptr, v_bf[bf_wr_buf], p_base);      \
+                            } else {                                                               \
+                                lds_load_bf_window(s_fn_rd_ptr, v_bf[bf_wr_buf], p_base);          \
+                            }                                                                      \
                         }                                                                          \
                         __builtin_amdgcn_sched_barrier(0);                                         \
                     }                                                                              \
@@ -275,12 +351,12 @@ namespace aiter {
                 __syncthreads();                                                                  \
                 lds_load_fn_tile((k) + 2);                                                        \
             }                                                                                     \
-            int bf_tail_buf = (gemm_steps / 8 - 1) & 0x1;                                          \
+            int bf_tail_buf = ((warp_size == 32 ? vec_tile * repeat_n : gemm_steps) / 8 - 1) & 0x1; \
             _Pragma("unroll")                                                                     \
             for (int p_offset = 0; p_offset < 8; p_offset += mma_pack_size * repeat_n) {           \
                 _Pragma("unroll")                                                                 \
                 for (int n_delta = 0; n_delta < repeat_n; n_delta++) {                             \
-                    int p_old = gemm_steps - 8 + p_offset + n_delta;                               \
+                    int p_old = (warp_size == 32 ? vec_tile * repeat_n : gemm_steps) - 8 + p_offset + n_delta; \
                     int kk_base = p_old / repeat_n;                                                \
                     int n_old = p_old % repeat_n;                                                  \
                     fp32xmma_t a_pack;                                                             \
@@ -870,7 +946,7 @@ namespace aiter {
 #define MHC_POST_LOOP_BODY(BUF, i, prefetch) \
     do { \
         if constexpr(prefetch) { \
-            opus::s_waitcnt_vmcnt(opus::number<x_load_waitcnt + residual_load_waitcnt>{}); \
+            s_wait_all_loadcnt(opus::number<x_load_waitcnt>{}, opus::number<residual_load_waitcnt>{}); \
             __builtin_amdgcn_s_barrier(); \
         } \
         DTYPE_I* s_residual_rd_ptr = s_residual + BUF * (hc_mult * residual_block); \
@@ -905,23 +981,23 @@ namespace aiter {
 
         if (loop - i == 3) {
             MHC_POST_LOOP_BODY(0, i, true);
-            opus::s_waitcnt_vmcnt(opus::number<x_load_waitcnt + residual_load_waitcnt>{});
+            s_wait_all_loadcnt(opus::number<x_load_waitcnt>{}, opus::number<residual_load_waitcnt>{});
             __builtin_amdgcn_s_barrier();
             MHC_POST_LOOP_BODY(1, i + 1, false);
-            opus::s_waitcnt_vmcnt(0_I);
+            s_wait_all_loadcnt(0_I, 0_I);
             __builtin_amdgcn_s_barrier();
             MHC_POST_LOOP_BODY(0, i + 2, false);
         }
         else if(loop - i == 2) {
-            opus::s_waitcnt_vmcnt(opus::number<x_load_waitcnt + residual_load_waitcnt>{});
+            s_wait_all_loadcnt(opus::number<x_load_waitcnt>{}, opus::number<residual_load_waitcnt>{});
             __builtin_amdgcn_s_barrier();
             MHC_POST_LOOP_BODY(0, i, false);
-            opus::s_waitcnt_vmcnt(0_I);
+            s_wait_all_loadcnt(0_I, 0_I);
             __builtin_amdgcn_s_barrier();
             MHC_POST_LOOP_BODY(1, i + 1, false);
         }
         else {
-            opus::s_waitcnt_vmcnt(0_I);
+            s_wait_all_loadcnt(0_I, 0_I);
             __builtin_amdgcn_s_barrier();
             MHC_POST_LOOP_BODY(0, i, false);
         }
@@ -1026,7 +1102,7 @@ namespace aiter {
                 for(int h = 0; h < hc_mult; h++) {
                     residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset + h * residual_block));
                 }
-                opus::s_waitcnt_lgkmcnt(opus::number<hc_mult>{});
+                s_wait_all_dscnt(opus::number<hc_mult>{});
                 for(int k = 0; k < ds_read_vec; k++) {
                     res[k] = static_cast<float>(x_vec[k]) * post_mix_v;
                 }
@@ -1046,17 +1122,17 @@ namespace aiter {
             lds_load_residual_tile(i + 1);
             __builtin_amdgcn_sched_barrier(0);
             if(threadIdx.x < x_async_load_threads) {
-                opus::s_waitcnt_vmcnt(opus::number<x_load_waitcnt + residual_load_waitcnt>{});
+                s_wait_all_loadcnt(opus::number<-1>{}, opus::number<x_load_waitcnt + residual_load_waitcnt>{});
             }
             else {
-                opus::s_waitcnt_vmcnt(opus::number<residual_load_waitcnt>{});
+                s_wait_all_loadcnt(opus::number<-1>{}, opus::number<residual_load_waitcnt>{});
             }
             __builtin_amdgcn_s_barrier();
             compute_store_tile(i);
             __builtin_amdgcn_s_barrier();
         }
         int i = loop - 1;
-        opus::s_waitcnt_vmcnt(0_I);
+        s_wait_all_loadcnt(opus::number<-1>{}, 0_I);
         __builtin_amdgcn_s_barrier();
         compute_store_tile(i);
     }
@@ -1839,7 +1915,7 @@ namespace aiter {
                     for(int h = 0; h < hc_mult; h++) {
                         residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset + h * tile_mk));
                     }
-                    opus::s_waitcnt_lgkmcnt(opus::number<0>{});
+                    s_wait_all_dscnt(opus::number<0>{});
                     for(int k = 0; k < ds_read_vec; k++) {
                         res[k] = static_cast<float>(x_vec[k]) * post_mix_v[b];
                     }
@@ -1874,17 +1950,17 @@ namespace aiter {
 
         auto wait_load_cnt = [&]() {
             if(threadIdx.x < x_async_load_threads) {
-                opus::s_waitcnt_vmcnt(opus::number<x_load_waitcnt + residual_load_waitcnt + fn_load_waitcnt*2>{});
+                s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<x_load_waitcnt + residual_load_waitcnt>{});
             }
             else {
-                opus::s_waitcnt_vmcnt(opus::number<residual_load_waitcnt + fn_load_waitcnt*2>{});
+                s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<residual_load_waitcnt>{});
             }
             __builtin_amdgcn_s_barrier();
             if(threadIdx.x < x_async_load_threads) {
-                opus::s_waitcnt_vmcnt(opus::number<x_load_waitcnt + residual_load_waitcnt + fn_load_waitcnt>{});
+                s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<x_load_waitcnt + residual_load_waitcnt>{});
             }
             else {
-                opus::s_waitcnt_vmcnt(opus::number<residual_load_waitcnt + fn_load_waitcnt>{});
+                s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<residual_load_waitcnt>{});
             }
         };
 
@@ -1916,17 +1992,17 @@ namespace aiter {
                 wait_load_cnt();
             }
             else {
-                opus::s_waitcnt_vmcnt(opus::number<0>{});
+                s_wait_all_loadcnt(0_I, 0_I);
                 __builtin_amdgcn_s_barrier();
             }
             compute_store_tile(i + 1, v_fn1);
             if (i + 2 < k_loop) {
-                opus::s_waitcnt_vmcnt(opus::number<0>{});
+                s_wait_all_loadcnt(0_I, 0_I);
                 __builtin_amdgcn_s_barrier();
                 compute_store_tile(i + 2, v_fn0);
             }
         } else if (i < k_loop) {
-            opus::s_waitcnt_vmcnt(opus::number<0>{});
+            s_wait_all_loadcnt(0_I, 0_I);
             __builtin_amdgcn_s_barrier();
             compute_store_tile(i, v_fn0);
         }
