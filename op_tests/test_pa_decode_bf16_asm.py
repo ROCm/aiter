@@ -463,7 +463,6 @@ def test_pa_decode(
     kv_indices = torch.cat(
         [block_tables[i, : int(actual_blocks[i].item())] for i in range(batch)]
     ).to(torch.int32)
-    kv_indices = torch.zeros(kv_indices.shape)
     qo_indptr = torch.arange(
         0, (batch + 1) * qlen_with_mtp, qlen_with_mtp, dtype=torch.int32, device=device
     )
