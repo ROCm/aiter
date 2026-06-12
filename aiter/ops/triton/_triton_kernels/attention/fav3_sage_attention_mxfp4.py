@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
     """Calculate padding information for the last K block."""
