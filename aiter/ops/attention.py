@@ -1146,7 +1146,8 @@ def get_mla_metadata_info_v1(
     if fast_mode:
         max_work = (batch_size + max_splits - 1) * max_qo_tiles_per_batch
         max_split_tiles = (
-            min(batch_size + max_splits - 1, (max_splits - 1) * 2) * max_qo_tiles_per_batch
+            min(batch_size + max_splits - 1, (max_splits - 1) * 2)
+            * max_qo_tiles_per_batch
         )
     else:
         max_work = tile_cnt * max_splits
@@ -1479,7 +1480,9 @@ def decode_update_mla_metadata_v1(
     )
 
 
-@compile_ops("module_hk_mla_v32_fwd_mi3xx", fc_name="hk_mla_v32_decode_fwd", develop=True)
+@compile_ops(
+    "module_hk_mla_v32_fwd_mi3xx", fc_name="hk_mla_v32_decode_fwd", develop=True
+)
 def hk_mla_v32_decode_fwd_mi3xx(
     # [num_seqs, num_heads, head_size]
     query: torch.Tensor,
@@ -1544,7 +1547,9 @@ def hk_mla_v32_decode_fwd(
         )
 
 
-@compile_ops("module_hk_mla_v40_fwd_mi3xx", fc_name="hk_mla_v40_decode_fwd", develop=True)
+@compile_ops(
+    "module_hk_mla_v40_fwd_mi3xx", fc_name="hk_mla_v40_decode_fwd", develop=True
+)
 def hk_mla_v40_decode_fwd_mi3xx(
     # [total_q, num_heads, V4_DIM_QK_PACKED=512]  FP8
     #   per-token bytes: NOPE 448 + dup-E8M0 14 + pad 50
