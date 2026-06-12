@@ -213,14 +213,18 @@ def make_sched2_metadata(
 
 
 def cpu_reduce(
-    out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_partial_map, gqa,
-    sink=None, s_eff=1.0,
+    out, split_o, split_lse, reduce_indptr, reduce_final_map, reduce_partial_map, gqa
 ):
     """Host reduce (matches aiter csrc/kernels/mla/reduce.cu, natural log):
         global_lse = max_lse + log(sum exp(lse - max_lse))
         out        = sum_p partial_o_p * exp(lse_p - global_lse)
     partial_lse layout [row, head]; partial_output [row, head, dv]; row = loc+local_seq.
     Only reduced rows are touched; direct-O rows (written by the kernel) are left alone.
+
+    SINK: NOT handled here. The kernel applies the per-row sink ONCE, on the owner
+    work item (the row's first KV chunk, s_KV_start==s_KV_batch_start), folding it
+    into that partial's stored LSE+O. So the partials already carry the sink and the
+    reduce must stay sink-free (matches the production sink-free mla_reduce).
     """
     batch, qlen, kv_head_num = out.shape[0], out.shape[1], out.shape[2]
     head_dim = out.shape[-1]
@@ -228,14 +232,6 @@ def cpu_reduce(
     out_flat = out.view(batch * qlen, q_head_num, head_dim)
     so = split_o.reshape(split_o.shape[0], q_head_num, head_dim).float()
     sl = split_lse.reshape(split_lse.shape[0], q_head_num).float()
-
-    # SINK: the kernel defers the sink logit on the split-KV partial path
-    # (do_sink=0, to avoid double-counting across splits), so it must be merged
-    # ONCE here -- into the final denominator only (no value contribution),
-    # matching ref_pa_decode's appended sink logit. sink_log[head] = sink_raw*s_eff
-    # (natural-log domain). NOTE: the production GPU reduce (mla_reduce/pa_reduce_v1)
-    # has the same gap -- it also never adds the sink to split rows.
-    sink_log = (sink.float().reshape(-1) * s_eff) if sink is not None else None
 
     rip = reduce_indptr.to(torch.int64).tolist()
     rfm = reduce_final_map.to(torch.int64).reshape(-1, 2).tolist()
@@ -253,11 +249,6 @@ def cpu_reduce(
             m = lses.max(dim=0).values
             s = torch.exp(lses - m).sum(dim=0)
             global_lse = m + torch.log(s)
-            if sink_log is not None:
-                mm = torch.maximum(global_lse, sink_log)
-                global_lse = mm + torch.log(
-                    torch.exp(global_lse - mm) + torch.exp(sink_log - mm)
-                )
             scale = torch.exp(lses - global_lse)
             o = (so[locs] * scale.unsqueeze(-1)).sum(dim=0)
             out_flat[seq_id] = o.to(out_flat.dtype)
@@ -529,15 +520,15 @@ def test_pa_decode(
     # K_TDM_lookup_issue (the s_load_dword on kv_indices) or the K/V TDM load.
     _nkv = kv_indices.numel()
     _num_work = work_info.numel() // 8
-    assert int(kv_indptr[-1].item()) == _nkv, (
-        f"kv_indptr[-1]={int(kv_indptr[-1])} != kv_indices.numel()={_nkv}"
-    )
-    assert int(kv_indices.max().item()) < K.shape[0], (
-        f"max phys page {int(kv_indices.max())} >= K pages {K.shape[0]}"
-    )
-    assert int(work_indptr[-1].item()) == _num_work, (
-        f"work_indptr[-1]={int(work_indptr[-1])} != num_work={_num_work}"
-    )
+    assert (
+        int(kv_indptr[-1].item()) == _nkv
+    ), f"kv_indptr[-1]={int(kv_indptr[-1])} != kv_indices.numel()={_nkv}"
+    assert (
+        int(kv_indices.max().item()) < K.shape[0]
+    ), f"max phys page {int(kv_indices.max())} >= K pages {K.shape[0]}"
+    assert (
+        int(work_indptr[-1].item()) == _num_work
+    ), f"work_indptr[-1]={int(work_indptr[-1])} != num_work={_num_work}"
     for _b in range(batch):
         _pages = (int(seq_lens_kv[_b].item()) + page_size - 1) // page_size
         assert int(kv_indptr[_b + 1] - kv_indptr[_b]) == _pages, (
@@ -551,9 +542,9 @@ def test_pa_decode(
         f"work kv_start/kv_end outside [0,{_nkv}]: "
         f"ks_min={int(_ks.min())} ke_max={int(_ke.max())}"
     )
-    assert int((_ke - _ks).min()) >= 1, (
-        f"a work has kv_end <= kv_start (min span {int((_ke - _ks).min())})"
-    )
+    assert (
+        int((_ke - _ks).min()) >= 1
+    ), f"a work has kv_end <= kv_start (min span {int((_ke - _ks).min())})"
     print(
         f"[pa_decode validate] num_cu={work_indptr.numel() - 1} "
         f"num_work={_num_work} nkv={_nkv} K_pages={K.shape[0]} "
@@ -610,8 +601,6 @@ def test_pa_decode(
         reduce_final_map,
         reduce_partial_map,
         gqa,
-        sink=sink,
-        s_eff=query_scale * key_scale * softmax_scale,
     )
 
     ref = ref_pa_decode(
