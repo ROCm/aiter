@@ -820,7 +820,15 @@ def _gemm2_body(
         for S in range_constexpr(_K_TILES_TOTAL):
             kt = S
             slot = kt % kStages
-            _kloop_fence(23 if S == 0 else 22)
+            # K_TILES_TOTAL==1 (D_INTER==256): the KIMI-tuned vmcnt(23) assumes two
+            # preloaded tiles' loads are still outstanding; with a single tile that
+            # count is already satisfied, so it under-waits and the A ds_read can
+            # race the buffer_load_lds under memory pressure (correct at tiny M,
+            # silent-wrong at M>=32). Wait for all loads (vmcnt 0) for the 1-tile case.
+            if const_expr(_K_TILES_TOTAL == 1):
+                _kloop_fence(0)
+            else:
+                _kloop_fence(23 if S == 0 else 22)
             a = issue_a_ds_read(slot)
             a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
             mfma_cluster(b[slot], a, a_scale_sub, b_scale_v[slot], init=(S == 0))
