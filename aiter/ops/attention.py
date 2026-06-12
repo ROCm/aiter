@@ -1092,22 +1092,8 @@ def get_mla_metadata_info_v1(
     """
 
     assert num_head_qo % 8 == 0
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
-
-    # HK MLA m16x4 (gfx950 + fp8/fp8 + 64 q-tokens per tile) runs at occupancy=2,
-    # so the kernel launches 2*num_cu workgroups. Buffer sizes (work_indptr,
-    # work_info_set) must scale to match -- the C++ metadata layer applies the
-    # same multiplier when it builds the cluster work map. The dispatch (in
-    # aiter/mla.py:use_hk) only routes to hk_mla_v32_decode_fwd when
-    # AITER_ENABLE_EXPERIMENTAL is set, so the multiplier is gated identically.
-    is_hk_m16x4 = (
-        get_gfx() == "gfx950"
-        and q_dtype == dtypes.fp8
-        and kv_dtype == dtypes.fp8
-        and (num_head_qo * max_seqlen_qo == 64)
-        and is_experimental_enabled()
+    max_splits = get_mla_decode_fwd_max_splits(
+        num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
     )
 
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
@@ -1158,26 +1144,26 @@ def get_mla_metadata_info_v1(
     tile_cnt = batch_size * max_qo_tiles_per_batch
 
     if fast_mode:
-        max_work = (batch_size + cu_num - 1) * max_qo_tiles_per_batch
+        max_work = (batch_size + max_splits - 1) * max_qo_tiles_per_batch
         max_split_tiles = (
-            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
+            min(batch_size + max_splits - 1, (max_splits - 1) * 2) * max_qo_tiles_per_batch
         )
     else:
-        max_work = tile_cnt * cu_num
-        max_split_tiles = tile_cnt * cu_num
+        max_work = tile_cnt * max_splits
+        max_split_tiles = tile_cnt * max_splits
 
     # Metadata's global split cap is `min(cu_num, max_split_per_batch * batch_size)`
     # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). A single tile can in
     # the worst case absorb the entire global budget, so reduce_partial_map must
     # hold up to tile_cnt * per_tile_cap entries.
     if max_split_per_batch > 0:
-        per_tile_cap = min(cu_num, max_split_per_batch * batch_size)
+        per_tile_cap = min(max_splits, max_split_per_batch * batch_size)
         max_split_tiles = max(max_split_tiles, tile_cnt * per_tile_cap)
 
     if not intra_batch_mode:
         return (
             ((2), torch.uint64),  # work_metadata_ptrs
-            ((cu_num + 1), torch.int32),  # work_indptr
+            ((max_splits + 1), torch.int32),  # work_indptr
             ((max_work, 8), torch.int32),  # work_info_set
             ((tile_cnt + 1), torch.int32),  # reduce_indptr
             ((tile_cnt, 2), torch.int32),  # reduce_final_map
@@ -1186,7 +1172,7 @@ def get_mla_metadata_info_v1(
     else:
         return (
             ((2), torch.uint64),  # work_metadata_ptrs
-            (cu_num + 1, torch.int32),  # work_indptr
+            (max_splits + 1, torch.int32),  # work_indptr
             ((tile_cnt * num_kv_splits, 8), torch.int32),  # work_info_set
             ((tile_cnt + 1), torch.int32),  # reduce_indptr
             ((tile_cnt, 2), torch.int32),  # reduce_final_map
