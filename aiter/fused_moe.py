@@ -421,19 +421,33 @@ def fused_moe_(
     _w1_kind = getattr(w1, "shuffle_kind", None)
     _csv_is_mxfp4 = metadata.pipeline is not None
     if _w1_kind == "mxfp4_moe" and not _csv_is_mxfp4:
-        # No tuned CSV pipeline for this mxfp4 shape (e.g. non-Kimi NE/TOPK that the
-        # threestage sort can't instantiate). Build a default inline_quant + atomic
-        # BM32 port pipeline: _mxfp4_moe_run falls back to the generic moe_sorting
-        # when the threestage sort can't handle (NE, TOPK), and inline_quant avoids
-        # the H-locked a-scale kernel.
-        _kn1 = f"mxfp4_moe_g1_a4w4_NE{E}_H{model_dim}_E{inter_dim}_BM16_INLINEQUANT"
-        _kn2 = (
-            f"mxfp4_moe_g2_a4w4_NE{E}_H{model_dim}_E{inter_dim}_TOPK{topk}_BM16_ATOMIC"
-        )
+        # No tuned CSV pipeline for this mxfp4 shape -> synthesize an M-adaptive port
+        # pipeline mirroring what the tuned CSV / the bench's per-M-best selection
+        # picks: BM16 inline_quant + atomic for decode (small M), BM32 atomic for mid
+        # M, BM128 nonatomic for prefill (large M). The BM32/BM128 paths are NON-inline
+        # (threestage sort + mxfp4_moe_quant + sort_scales), codegen'd only for the
+        # Kimi/DSR SHAPES; every other shape stays on BM16 (its only built variant).
+        # Thresholds are heuristic -- production tunes them per shape via the CSV.
+        _g = f"mxfp4_moe_g{{n}}_a4w4_NE{E}_H{model_dim}_E{inter_dim}"
+        _noninline_ok = (NE, model_dim, inter_dim, topk) in {
+            (385, 7168, 512, 9),  # Kimi-K2.5
+            (257, 7168, 512, 9),  # DSR
+        }
+        if not _noninline_ok or M <= 1024:
+            # decode / mid-M: BM16 inline_quant + atomic (latency-bound).
+            _bm = 16
+            _kn1 = _g.format(n=1) + "_BM16_INLINEQUANT"
+            _kn2 = _g.format(n=2) + f"_TOPK{topk}_BM16_ATOMIC"
+        else:
+            # prefill (large M): BM128 nonatomic (throughput-bound). (BM32 measured
+            # no better than BM16 here, so we skip straight to BM128.)
+            _bm = 128
+            _kn1 = _g.format(n=1) + "_BM128"
+            _kn2 = _g.format(n=2) + f"_TOPK{topk}_BM128_NONATOMIC"
         metadata = MOEMetadata(
             stage1=None,
             stage2=None,
-            block_m=16,
+            block_m=_bm,
             ksplit=1,
             pipeline=functools.partial(
                 _mxfp4_moe_run, kernelName1=_kn1, kernelName2=_kn2
@@ -1382,8 +1396,11 @@ def _mxfp4_moe_run(
             return out
 
         # Lossy before-sum 4-bit quant (ok for gsm8k, degrades other evals): opt-in.
-        if (mxfp4out and _mx_shape_ok
-                and os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"):
+        if (
+            mxfp4out
+            and _mx_shape_ok
+            and os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
+        ):
             flat_out_q = torch.empty(
                 (max_sorted, D_HIDDEN // 2), dtype=torch.uint8, device=device
             )
