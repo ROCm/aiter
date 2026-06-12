@@ -1,17 +1,10 @@
-"""Assert installed triton matches the pin in the given requirements file."""
+"""Assert installed triton meets the minimum version requirement (>=3.6.0)."""
 
-import re
 import sys
 from importlib.metadata import version
 
-req_path = sys.argv[1]
-with open(req_path) as f:
-    m = re.search(r"^triton==(\S+)", f.read(), re.M)
-if not m:
-    sys.exit(f"no triton pin found in {req_path}")
-expected = m.group(1)
-
-got = version("triton")
-if got != expected:
-    sys.exit(f"triton mismatch: expected {expected}, got {got}")
-print(f"triton {got}")
+v = version("triton")
+parts = tuple(int(p) for p in v.split("+")[0].split("-")[0].split(".") if p.isdigit())
+if parts < (3, 6, 0):
+    sys.exit(f"triton>=3.6.0 is required, found {v}")
+print(f"triton {v}")

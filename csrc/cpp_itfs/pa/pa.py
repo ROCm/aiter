@@ -53,6 +53,58 @@ def compile(
     )
 
 
+def validate_paged_attention_rocm_buffers(
+    tmp_out,
+    exp_sums,
+    max_logits,
+    block_tables,
+    context_lens,
+    block_size,
+    max_context_len,
+    partition_size,
+):
+    op_name = "paged_attention_rocm"
+    max_num_partitions = math.ceil(max_context_len / partition_size)
+    # Use the launch-time upper bound rather than reading context_lens data.
+    # context_lens may live on GPU, and scalar extraction would force a sync
+    # and introduce tensor-data-dependent Python in torch.compile paths.
+    min_blocks_per_seq = math.ceil(max_context_len / block_size)
+
+    def _check_partition_dim(name, tensor):
+        if tensor.dim() < 3:
+            raise ValueError(
+                f"{op_name}: {name} must have shape "
+                f"[..., max_num_partitions, head_size], got {tuple(tensor.shape)}"
+            )
+        if tensor.size(2) < max_num_partitions:
+            raise ValueError(
+                f"{op_name}: {name}.size(2)={tensor.size(2)} is too small for "
+                f"max_context_len={max_context_len} and partition_size={partition_size}; "
+                f"need at least {max_num_partitions} partition slots"
+            )
+
+    _check_partition_dim("tmp_out", tmp_out)
+    _check_partition_dim("exp_sums", exp_sums)
+    _check_partition_dim("max_logits", max_logits)
+
+    if block_tables.dim() != 2:
+        raise ValueError(
+            f"{op_name}: block_tables must be 2D "
+            f"[num_seqs, max_num_blocks_per_seq], got {tuple(block_tables.shape)}"
+        )
+    if block_tables.size(1) < min_blocks_per_seq:
+        raise ValueError(
+            f"{op_name}: block_tables.size(1)={block_tables.size(1)} is too small "
+            f"for max_context_len={max_context_len} and block_size={block_size}; "
+            f"need at least {min_blocks_per_seq} block-table entries per sequence"
+        )
+    if context_lens.size(0) != block_tables.size(0):
+        raise ValueError(
+            f"{op_name}: context_lens.size(0)={context_lens.size(0)} must match "
+            f"block_tables.size(0)={block_tables.size(0)}"
+        )
+
+
 def paged_attention_rocm(
     out,
     exp_sums,
@@ -79,6 +131,17 @@ def paged_attention_rocm(
     import torch
 
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
+
+    validate_paged_attention_rocm_buffers(
+        tmp_out,
+        exp_sums,
+        max_logits,
+        block_tables,
+        context_lens,
+        block_size,
+        max_context_len,
+        partition_size,
+    )
 
     dtype_map = {
         torch.bfloat16: "__hip_bfloat16",

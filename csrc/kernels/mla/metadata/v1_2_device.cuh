@@ -165,9 +165,12 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
 
                 auto fill_work_info = [&](const int32_t split_idx) {
                     const int32_t global_qo_tile_idx = tot_qo_tiles;
+                    const int32_t curr_batch_kv =
+                        Traits::kIsSparse ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
+                                          : curr_batch;
 
                     MlaWorkInfo work_info{};
-                    work_info.batch_idx = curr_batch;
+                    work_info.batch_idx = curr_batch_kv;
                     work_info.qo_start =
                         qo_state.get_begin(curr_batch) + curr_qo_tile_idx * qo_tile_size;
                     work_info.qo_end =
@@ -212,7 +215,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                             (curr_kv_end - work_info.kv_end == 0)
                                 ? 0
                                 : ((curr_kv_end - work_info.kv_end - 1) * page_size +
-                                   params.p_kv_last_page_lens[curr_batch]);
+                                   params.p_kv_last_page_lens[curr_batch_kv]);
                     }
                     // split related info
                     if(curr_n_split_idx > 0)
@@ -312,8 +315,12 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                         remain_payload - params.fixed_over_head_num_blocks;
 
                     auto fill_work_info = [&]() {
+                        const int32_t curr_batch_kv =
+                            Traits::kIsSparse
+                                ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
+                                : curr_batch;
                         MlaWorkInfo work_info{};
-                        work_info.batch_idx = curr_batch;
+                        work_info.batch_idx = curr_batch_kv;
                         work_info.qo_start =
                             qo_state.get_begin(curr_batch) + curr_qo_tile_idx * qo_tile_size;
                         work_info.qo_end = opus::min(work_info.qo_start + qo_tile_size,
@@ -359,7 +366,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                                 (curr_kv_end - work_info.kv_end == 0)
                                     ? 0
                                     : ((curr_kv_end - work_info.kv_end - 1) * page_size +
-                                       params.p_kv_last_page_lens[curr_batch]);
+                                       params.p_kv_last_page_lens[curr_batch_kv]);
                         }
                         work_info.partial_qo_loc = partial_idx;
                         if(!cur_tail_done)
@@ -503,33 +510,14 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         (num_heads == 16) ||
         ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
          (max_seqlen_qo == 2)) ||
-        ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
-         (max_seqlen_qo == 4)) ||
-        ((arch_id == "gfx950") && (num_heads == 64) && q_is_fp8 && kv_is_fp8 &&
-         (max_seqlen_qo == 1)) ||
         ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8)  ||
-        ((arch_id == "gfx950") && (num_heads == 128) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo != 4)) ||
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
+        ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
+         (((num_heads == 32) && (max_seqlen_qo == 4)) || (num_heads == 64) || (num_heads == 128))) ||
         hk_mtp_experimental;
 
 
-    const bool use_qseqlen_fold =
-        !natively_supported && (arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads > 16) &&
-        ((uni_seqlen_qo * (num_heads / 16) == 4) || ((num_heads == 64) && (uni_seqlen_qo == 2)));
-
-    if(use_qseqlen_fold && (num_heads == 64) && (uni_seqlen_qo == 2))
-    {
-        qk_seqlen_ratio = num_heads / 32;
-        num_heads       = 32;
-        uni_seqlen_qo *= qk_seqlen_ratio;
-    }
-    else if(use_qseqlen_fold && (uni_seqlen_qo * (num_heads / 16) == 4))
-    {
-        qk_seqlen_ratio = num_heads / 16;
-        num_heads       = 16;
-        uni_seqlen_qo *= qk_seqlen_ratio;
-    }
-    else if(!natively_supported && (num_heads % 16 == 0))
+    if(!natively_supported && (num_heads % 16 == 0))
     {
         qk_batch_ratio = num_heads / 16;
         num_heads      = 16;
@@ -538,12 +526,13 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
 
     TORCH_CHECK(
         (num_heads == 16) || (num_heads == 128) || ((num_heads == 32) && q_is_fp8 && kv_is_fp8) ||
-            ((num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
             ((arch_id == "gfx950") && (num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 &&
              kv_is_fp8) ||
             ((arch_id == "gfx942") && (num_heads == 8) && (max_seqlen_qo == 2) && !q_is_fp8 &&
              !kv_is_fp8) ||
             ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
+            ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
+             (((num_heads == 32) && (max_seqlen_qo == 4)) || (num_heads == 64) || (num_heads == 128))) ||
             hk_mtp_experimental,
         __func__,
         ": only supports #heads in [16, 64, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "

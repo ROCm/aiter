@@ -7,7 +7,7 @@ import torch
 from torch import Generator, Tensor
 
 from ..jit.core import CK_DIR, AITER_META_DIR, ENABLE_CK, compile_ops
-from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
@@ -218,6 +218,49 @@ def mha_fwd(
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+
+
+def gen_mha_fwd_native_splitkv_fake_tensors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: Optional[torch.Tensor],
+    softmax_scale: float,
+    causal: bool,
+    return_lse: bool,
+    num_splits: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch_size, seqlen_q, nhead_q, hdim = q.shape
+    o = (
+        torch.empty(
+            (batch_size, seqlen_q, nhead_q, hdim), dtype=q.dtype, device=q.device
+        )
+        if out is None
+        else out
+    )
+    if return_lse:
+        lse = torch.empty(
+            (batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+        )
+    else:
+        lse = torch.empty((0,), dtype=torch.float32, device=q.device)
+    return o, lse
+
+
+@compile_ops(
+    "module_mha_fwd_native_splitkv",
+    gen_fake=gen_mha_fwd_native_splitkv_fake_tensors,
+)
+def mha_fwd_native_splitkv(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Optional[Tensor],
+    softmax_scale: float,
+    causal: bool,
+    return_lse: bool,
+    num_splits: int,
+) -> Tuple[Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_fwd_fake_tensors(
@@ -1254,6 +1297,53 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _native_splitkv_heuristic(batch, nhead_q, seqlen_q, seqlen_k, num_cu):
+    # Pick split-KV group count G for the native D64 kernel; G == 0 falls back to
+    # the CK non-split-KV kernel. Tuned on 100 measured shapes
+    # (fmha_native scripts/splitkv_heuristic.py).
+    # nwg = workgroups (occupancy); skvt = KV tiles (reduction work to split).
+    # Tile sizes are the kernel block geometry: kM0=128 query, kN0=64 key.
+    SQ_TILE = 128
+    KV_TILE = 64
+
+    def snap(x):
+        # Largest split in {2,4,8,16} that is <= x (0 if none).
+        g = 0
+        for c in (2, 4, 8, 16):
+            if c <= x:
+                g = c
+        return g
+
+    sqt = (seqlen_q + SQ_TILE - 1) // SQ_TILE
+    skvt = (seqlen_k + KV_TILE - 1) // KV_TILE
+    nwg = batch * nhead_q * sqt
+
+    # Cap G so each split keeps enough KV tiles to amortize combine cost.
+    kvdiv = 10 if nwg < 24 else 28
+    kv_cap = snap(skvt / kvdiv)
+
+    # Regime A -- undersubscribed: split to fill the machine, capped by KV work.
+    if nwg < num_cu:
+        occ_cap = snap(3.5 * num_cu / nwg)
+        return min(occ_cap, kv_cap)
+
+    # Regime B -- saturated: batch >= 2 has ample independent work, split is loss.
+    if batch >= 2:
+        return 0
+
+    # batch == 1: a small split hides the long per-CU KV reduction, but only if
+    # KV is long enough relative to oversubscription.
+    over = nwg / num_cu
+    if skvt < 10 * over and over < 30:
+        return 0
+
+    # Modest split; fewer heads leave more headroom, extreme corner splits more.
+    g = 4 if nhead_q <= 8 else 2
+    if over >= 30:
+        g = max(g, snap(skvt / 160))
+    return min(g, kv_cap) if kv_cap > 0 else 0
+
+
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1276,6 +1366,7 @@ def _flash_attn_forward(
     cu_seqlens_kv: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    num_splits: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     batch_size, seqlen_q, nhead_q, hdim_q = q.shape
@@ -1310,7 +1401,9 @@ def _flash_attn_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
-        ret = alibi_slopes is None
+        # fmha v3 is hand-written gfx9 ASM; non-gfx9 must fall back to ck-tile.
+        ret = get_gfx() in ("gfx942", "gfx950")
+        ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (hdim_v == 128)
@@ -1324,6 +1417,35 @@ def _flash_attn_forward(
         if is_fmha_v3_fp8():
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
+        return ret
+
+    def can_impl_fmha_native():
+        # Native hand-written HIP D64 split-K forward. gfx942-only, dense bf16, no
+        # bias/alibi/swa/dropout/sink/fp8/varlen. See design doc.
+        ret = get_gfx() == "gfx942"
+        ret = ret and (
+            q.dtype == dtypes.bf16 and k.dtype == dtypes.bf16 and v.dtype == dtypes.bf16
+        )
+        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
+        ret = ret and (hdim_q == 64 and hdim_v == 64)
+        ret = ret and (seqlen_q > 0 and seqlen_k > 0)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (bias is None) and (alibi_slopes is None)
+        # Native has only two mask modes: full (causal=False) and full causal
+        # (causal=True). Require the exact no-window sentinel -- `not swa` is too
+        # loose because swa only tests >0, so a finite 0 window (e.g.
+        # window_size=(-1, 0), which is semantically causal) would slip through and
+        # be computed as unmasked. Any window/sink restriction falls back to CK/ASM.
+        ret = ret and (window_size_left == -1 and window_size_right == -1)
+        ret = ret and (sink_size == 0)
+        ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        ret = ret and (sink_ptr is None)
+        ret = ret and (nhead_q % nhead_k == 0)
+        if causal:
+            # sq>sk causal would NaN fully-masked rows in attention_ref but combine
+            # returns 0 -> divergence; let those fall back to ASM/CK. decode/square
+            # always satisfy sk>=sq.
+            ret = ret and (seqlen_k >= seqlen_q)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -1340,6 +1462,30 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_q", cu_seqlens_q)
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
+    assert num_splits >= 0, f"num_splits must be >= 0 (0=auto), got {num_splits}"
+    if can_impl_fmha_native():
+        ns = (
+            num_splits
+            if num_splits >= 1
+            else _native_splitkv_heuristic(
+                batch_size, nhead_q, seqlen_q, seqlen_k, get_cu_num()
+            )
+        )
+        if ns > 1:
+            assert (
+                ns <= (seqlen_k + 63) // 64
+            ), (  # ceil(seqlen_k/64); don't silently clamp
+                f"num_splits={ns} too large for seqlen_k={seqlen_k}"
+            )
+            out_, softmax_lse = mha_fwd_native_splitkv(
+                q, k, v, out, softmax_scale, causal, return_lse, ns
+            )
+            S_dmask = None
+            # grad path needs a real rng_state tensor (dropout=0 -> no-dropout path).
+            rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+            return out_, softmax_lse, S_dmask, rng_state
+        # ns <= 1 (0 = heuristic fallback, 1 = forced no-split) -> existing dispatch
+    # can_impl_fmha_native() False -> num_splits ignored, existing dispatch
     if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
         out_, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
@@ -1778,6 +1924,7 @@ class FlashAttnFunc(torch.autograd.Function):
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_kv: Optional[torch.Tensor] = None,
         sink_ptr: Optional[Tensor] = None,
+        num_splits: int = 0,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -1810,6 +1957,7 @@ class FlashAttnFunc(torch.autograd.Function):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
             sink_ptr=sink_ptr,  # fwd kernel still uses sink_ptr naming
+            num_splits=num_splits,
         )
         if is_grad:
             assert return_lse
@@ -1894,7 +2042,8 @@ class FlashAttnFunc(torch.autograd.Function):
         # 18 sink_ptr (fwd-only sink scores; not differentiable via autograd.
         #              bwd sink gradient d_sink is computed inside mha_bwd kernel,
         #              not returned here as a positional gradient.)
-        # Need to return exactly 18 gradient entries.
+        # 19 num_splits
+        # Need to return exactly 19 gradient entries.
         return (
             dq,  # q
             dk,  # k
@@ -1914,6 +2063,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # cu_seqlens_q
             None,  # cu_seqlens_kv
             None,  # sink_ptr (not differentiable; bwd uses sink/d_sink args separately)
+            None,  # num_splits
         )
 
 
@@ -1934,6 +2084,7 @@ def flash_attn_func(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    num_splits: int = 0,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1977,6 +2128,10 @@ def flash_attn_func(
            (they might not have the right scaling).
         cu_seqlens_q: (batch_size + 1,). The cumulative sequence lengths of the query sequences.
         cu_seqlens_kv: (batch_size + 1,). The cumulative sequence lengths of the key/value sequences.
+        num_splits: int. Number of key/value splits for the native split-K forward path.
+            0 (default) lets aiter decide via a heuristic; 1 disables split-K (uses the
+            standard CK/ASM dispatch); >=2 forces the native split-K kernel with that many
+            splits when that path is applicable, otherwise num_splits is ignored.
     Return:
         out: (batch_size, seqlen, nheads, headdim_v).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -2023,6 +2178,7 @@ def flash_attn_func(
         cu_seqlens_q,
         cu_seqlens_kv,
         sink_ptr,
+        num_splits,
     )
 
 
@@ -2096,7 +2252,10 @@ def _flash_attn_varlen_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
-        ret = alibi_slopes is None
+        # fmha v3 varlen is hand-written gfx9 ASM; non-gfx9 must fall back to
+        # ck-tile (mha_varlen_fwd, the else branch below).
+        ret = get_gfx() in ("gfx942", "gfx950")
+        ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (hdim_v == 128)
@@ -2689,6 +2848,33 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    # FlyDSL path — returns result if supported, None otherwise
+    from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
+
+    _flydsl_result = flydsl_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_lse=return_lse,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+        block_table=block_table,
+        out=out,
+        sink=sink_ptr,
+    )
+    if _flydsl_result is not None:
+        return _flydsl_result
+
     if not ENABLE_CK:
         from .triton.attention.mha import (
             flash_attn_varlen_func as flash_attn_varlen_func_triton,

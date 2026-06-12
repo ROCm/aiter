@@ -80,7 +80,7 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
-    err_ck = checkAllclose(a, b, msg="ck")
+    err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
     ret["ck us"] = avg_b
     ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
@@ -90,7 +90,7 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     weight_asm = shuffle_weight(weight, layout=(16, 16))
     c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
-    err_asm = checkAllclose(a, c, msg=f"{tag}")
+    err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
     ret[f"{tag} us"] = avg_c
     ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
     ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
@@ -150,7 +150,12 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
     gemm_a8w8_blockscale_ck(x, weight, x_scale, w_scale, Y_base, splitK=0)
     gemm_a8w8_blockscale_ck(x, weight, x_scale, w_scale, Y_split, splitK=splitK)
     ck_err = checkAllclose(
-        Y_base, Y_split, msg=f"ck splitK={splitK} vs splitK=0", rtol=1e-2, atol=1e-2
+        Y_base,
+        Y_split,
+        msg=f"ck splitK={splitK} vs splitK=0",
+        rtol=1e-2,
+        atol=1e-2,
+        catastrophic_check=True,
     )
 
     # CKTile path (no preshuffle): compare splitK=0 vs splitK>0
@@ -168,6 +173,7 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
         msg=f"cktile splitK={splitK} vs splitK=0",
         rtol=1e-2,
         atol=1e-2,
+        catastrophic_check=True,
     )
 
     print(

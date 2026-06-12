@@ -126,7 +126,7 @@ def _attention_inner(
         k = tl.load(k_ptrs, mask=mask_k_cols_local[:, None], other=0.0)
         qk_scale = SM_SCALE * RCP_LN2
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k)
+        qk = tl.dot(q, k, acc=qk)
         qk = qk * qk_scale
 
         if causal:
@@ -157,7 +157,7 @@ def _attention_inner(
         # Update accumulator
         acc = acc * alpha[:, None]
         v = tl.load(v_ptrs, mask=mask_k_cols_local[None, :], other=0.0)
-        acc += tl.dot(p.to(v.dtype), v)
+        acc = tl.dot(p.to(v.dtype), v, acc=acc)
 
         # Update stats
         l_ij = tl.sum(p, 1)

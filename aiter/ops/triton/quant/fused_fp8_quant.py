@@ -518,25 +518,48 @@ def fused_flatten_fp8_group_quant(
     x: torch.Tensor,
     group_size,
     dtype_quant=fp8_dtype,
+    transpose_scale: bool = False,
 ):
     """
     Flatten the last two dimension of x and perform FP8 per-token group quantization along the last dimension
 
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
+    - transpose_scale: If True, return scale with shape (M, cdiv(N1*N2, group_size))
+                       in column-major (transposed) memory layout, i.e. strides
+                       (1, M) instead of the default (num_bs_cols, 1). Element
+                       values at logical position [m, n] are unchanged; only the
+                       physical memory layout differs so downstream consumers
+                       (e.g. CK bpreshuffle GEMM) can skip an explicit
+                       .transpose(-1, -2).contiguous() before reading.
 
     Returns:
     - out: The output matrix with shape (M, N1 * N2).
     - out_block_scales: The output matrix with shape (M, cdiv((N1 * N2), group_size)).
+                        When transpose_scale=True, strides are (1, M)
+                        (column-major); otherwise (num_bs_cols, 1) (row-major).
     """
     M, N1, N2 = x.shape
 
     BLOCK_SIZE_N2 = max(triton.next_power_of_2(N2), group_size)
     N = N1 * N2
+    num_bs_cols = triton.cdiv(N, group_size)
     out = torch.empty((M, N), dtype=dtype_quant, device=x.device)
-    out_block_scales = torch.empty(
-        (M, triton.cdiv(N, group_size)), dtype=torch.float32, device=x.device
-    )
+
+    if transpose_scale:
+        # Physical buffer is (num_bs_cols, M) row-major; .T gives a
+        # (M, num_bs_cols) view with strides (1, M). The kernel writes
+        # at out_scales_ptr + m * stride_m + n * stride_n, so passing
+        # the natural strides of this view writes to the correct memory
+        # location regardless of layout — no special-case stride wiring
+        # or trailing .view() needed.
+        out_block_scales = torch.empty(
+            (num_bs_cols, M), dtype=torch.float32, device=x.device
+        ).T
+    else:
+        out_block_scales = torch.empty(
+            (M, num_bs_cols), dtype=torch.float32, device=x.device
+        )
 
     DTYPE_MAX = (
         torch.finfo(out.dtype).max
