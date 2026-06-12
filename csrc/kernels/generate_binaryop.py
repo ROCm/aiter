@@ -21,18 +21,16 @@ DATA_TYPE_MAP = {
     "int32": "int",
     "int64": "long long",
     "bool": "bool",
-    "float16": "torch::Half",
-    "bfloat16": "torch::BFloat16",
+    "float16": "_Float16",
+    "bfloat16": "hip_bfloat16",
 }
 
-TORCH_TYPE_MAP = {
-    "float32": "torch::kFloat32",
-    "float64": "torch::kFloat64",
-    "int32": "torch::kInt32",
-    "int64": "torch::kInt64",
-    "bool": "torch::kBool",
-    "float16": "torch::kHalf",
-    "bfloat16": "torch::kBFloat16",
+AITER_DTYPE_MAP = {
+    "float32": "AITER_DTYPE_fp32",
+    "int32": "AITER_DTYPE_i32",
+    "int64": "AITER_DTYPE_i64",
+    "float16": "AITER_DTYPE_fp16",
+    "bfloat16": "AITER_DTYPE_bf16",
 }
 
 OPERATOR_MAP = {
@@ -48,13 +46,15 @@ class BinaryOpCodegen:
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2023, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
-#include <torch/extension.h>
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include "binary_operator.cuh"
 
 template <typename Op, typename T0, typename T1>
-void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output)
+bool binary_op_impl(aiter_tensor_t &input, aiter_tensor_t &other, aiter_tensor_t &output)
 {
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+  HipDeviceGuard device_guard(input.device_id);
   int dim = input.dim();
 
   bool is_support = false;
@@ -91,7 +91,7 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
     // transpose case
     if (input.is_contiguous() != other.is_contiguous())
     {
-      auto tensor_not_conti = input.is_contiguous() ? other : input;
+      const aiter_tensor_t& tensor_not_conti = input.is_contiguous() ? other : input;
       order_flag = !input.is_contiguous() ? true : false;
       is_support = true;
       // avoid broadcast
@@ -217,12 +217,6 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
     }
   }
 
-  // hip does not support double
-  if (input.dtype() == torch::kDouble || other.dtype() == torch::kDouble)
-  {
-    is_support = false;
-  }
-
   if (is_support)
   {
     switch (pattern)
@@ -249,14 +243,13 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
         binary_operation_process<7, Op, T0, T1>(input, other, output, order_flag);
         break;
       default:
-        return ;
+        return false;
     }
-    return ;
+    return true;
   }
   else
   {
-  output = aiter::aten_compute<Op>(input, other);
-  return ;
+    return false;
   }
 }
 """
@@ -266,13 +259,13 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
 // Copyright (c) 2023, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "binary_op_api_common.hpp"
-void binary_op_dispatch(const std::string& op_type,
-                       torch::Tensor &input,
-                       torch::Tensor &other,
-                       torch::Tensor &output) {{
+bool binary_op_dispatch(const std::string& op_type,
+                       aiter_tensor_t &input,
+                       aiter_tensor_t &other,
+                       aiter_tensor_t &output) {{
     // Dispatch based on operator and input types
 {F_dispatch}
-    //AT_ERROR("Unsupported operator or dtype combination");
+    return false;
 }}
 """
 
@@ -281,8 +274,8 @@ void binary_op_dispatch(const std::string& op_type,
     }}
 """
 
-    API_PER_DTYPE = """        {F_if}(input.scalar_type() == {F_in0_type} && other.scalar_type() == {F_in1_type}) {{
-            binary_op_impl<{F_op_cpp}, {F_in0_cpp}, {F_in1_cpp}>(input, other, output);
+    API_PER_DTYPE = """        {F_if}(input.dtype() == {F_in0_type} && other.dtype() == {F_in1_type}) {{
+            return binary_op_impl<{F_op_cpp}, {F_in0_cpp}, {F_in1_cpp}>(input, other, output);
         }}
 """
 
@@ -321,7 +314,7 @@ void binary_op_dispatch(const std::string& op_type,
 
         @property
         def def_name(self) -> str:
-            return f"template void binary_op_impl<{self.trait_name}>(torch::Tensor&, torch::Tensor&, torch::Tensor&);"
+            return f"template bool binary_op_impl<{self.trait_name}>(aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&);"
 
     @dataclass
     class h_instance:
@@ -356,8 +349,8 @@ void binary_op_dispatch(const std::string& op_type,
                 in0, in1 = dtype_key.split(",")
                 dtype_str += self.API_PER_DTYPE.format(
                     F_if=get_if_str(i_dtype, len(dtype_blobs)),
-                    F_in0_type=TORCH_TYPE_MAP[in0],
-                    F_in1_type=TORCH_TYPE_MAP[in1],
+                    F_in0_type=AITER_DTYPE_MAP[in0],
+                    F_in1_type=AITER_DTYPE_MAP[in1],
                     F_op_cpp=OPERATOR_MAP[op_type],
                     F_in0_cpp=DATA_TYPE_MAP[in0],
                     F_in1_cpp=DATA_TYPE_MAP[in1],
