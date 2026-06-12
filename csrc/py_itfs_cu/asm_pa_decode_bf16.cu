@@ -163,6 +163,36 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 "pa_decode_bf16_asm: q/k/v scales must be fp32");
     AITER_CHECK(sink->dtype() == AITER_DTYPE_fp32, "pa_decode_bf16_asm: sink must be fp32");
 
+    // ---- index/metadata tensor validation ---------------------------------
+    // The kernel reads these as raw 4-byte indices via SMEM. A CPU tensor, a
+    // non-int32 dtype (torch arange/cumsum default to int64!), or a non-contiguous
+    // slice silently yields a host pointer / wrong strides -> GPU page fault (IMA)
+    // inside K_TDM_lookup, or garbage work distribution. Fail loudly here instead.
+    auto check_idx = [](const aiter_tensor_t* t, const char* name) {
+        if (t == nullptr) return;
+        AITER_CHECK(t->is_gpu(), "pa_decode_bf16_asm: ", name, " must be a CUDA tensor");
+        AITER_CHECK(t->is_contiguous(), "pa_decode_bf16_asm: ", name, " must be contiguous");
+        AITER_CHECK(t->dtype() == AITER_DTYPE_i32 || t->dtype() == AITER_DTYPE_u32,
+                    "pa_decode_bf16_asm: ", name, " must be int32/uint32");
+    };
+    // Persistent kernel: it is purely work-list driven and always dereferences
+    // work_indptr/work_info — there is no non-work path. Require them.
+    AITER_CHECK(work_indptr != nullptr && work_info != nullptr,
+                "pa_decode_bf16_asm: work_indptr/work_info are required (persistent kernel)");
+    check_idx(kv_indices, "kv_indices");
+    check_idx(context_lens, "context_lens");
+    check_idx(kv_indptr, "kv_indptr");
+    check_idx(qo_indptr, "qo_indptr");
+    check_idx(work_indptr, "work_indptr");
+    check_idx(work_info, "work_info");
+
+    // Q/K/V/out feed address math with strides derived from K; require contiguity.
+    AITER_CHECK(Q->is_gpu() && K->is_gpu() && V->is_gpu() && out->is_gpu(),
+                "pa_decode_bf16_asm: Q/K/V/out must be CUDA tensors");
+    AITER_CHECK(Q->is_contiguous() && K->is_contiguous() && V->is_contiguous() &&
+                    out->is_contiguous(),
+                "pa_decode_bf16_asm: Q/K/V/out must be contiguous");
+
     // ---- dimensions -------------------------------------------------------
     // head_dim comes from Q's innermost dim ([batch, mtp, kv_head, gqa, head_dim]).
     // Do NOT derive it from K/V: those use the tiled paged layout
@@ -187,6 +217,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // Paged K/V: K[num_pages, kv_heads, head_dim/16, page, 16] (contiguous).
     const int stride_KV_blk  = (int)K->stride(0) * elem_k;
     const int stride_KV_head = (int)K->stride(1) * elem_k;
+    // The kernel hard-aliases V's block/head strides to K's (V_blk_stride=K_blk_stride,
+    // V_head_stride=K_head_stride). Enforce that V actually shares K's page/head layout,
+    // otherwise V loads land at wrong addresses with no diagnostic.
+    AITER_CHECK(V->stride(0) == K->stride(0) && V->stride(1) == K->stride(1),
+                "pa_decode_bf16_asm: V must share K's [num_pages, kv_head, ...] strides "
+                "(the kernel aliases V's block/head strides to K's)");
 
     // ---- kernel args ------------------------------------------------------
     KernelArgs args;
