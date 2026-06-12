@@ -4384,6 +4384,9 @@ class GroupedFmoeTuner(FmoeTuner):
             cache = getattr(grouped_mod, "_GROUPED_CONFIG_CACHE", None)
             if cache is not None:
                 cache.clear()
+            finder = getattr(grouped_mod, "_find_grouped_config", None)
+            if finder is not None and hasattr(finder, "cache_clear"):
+                finder.cache_clear()
 
         config_path = self._write_candidate_config(candidate)
         old_config = os.environ.get("AITER_CONFIG_GROUPED_FMOE")

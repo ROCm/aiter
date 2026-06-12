@@ -17,6 +17,7 @@ DeepGEMM's ``scheduler.cuh``; optional override ``AITER_DEEPGEMM_NUM_1D_BLOCKS=8
 
 import os
 import csv
+import functools
 
 from typing import Optional
 
@@ -103,6 +104,25 @@ def _load_grouped_config_rows():
     return rows
 
 
+def _nextPow2(n):
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+_PADDED_M_TIERS = [32768, 131072]
+
+
+def _get_padded_M(M):
+    if M < _PADDED_M_TIERS[0]:
+        return _nextPow2(M)
+    for tier in reversed(_PADDED_M_TIERS):
+        if M >= tier:
+            return tier
+    return _PADDED_M_TIERS[0]
+
+
+@functools.lru_cache(maxsize=1024)
 def _find_grouped_config(
     *,
     token_num: int,
@@ -511,7 +531,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     grouped_contiguous_m = False
     persistent_workers = None
     cfg_row = _find_grouped_config(
-        token_num=token_num,
+        token_num=_get_padded_M(token_num),
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,

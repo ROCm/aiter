@@ -347,7 +347,8 @@ class AITER_CONFIG(object):
                 config_file = default_file
             else:
                 tuned_files = ":".join(str(p) for p in op_tuned_file_list)
-                tuned_files = default_file + ":" + tuned_files
+                if os.path.exists(default_file):
+                    tuned_files = default_file + ":" + tuned_files
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )
