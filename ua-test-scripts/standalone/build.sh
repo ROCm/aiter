@@ -49,7 +49,7 @@ mkdir -p "$OUT/obj"
 # Otherwise we no-op in <1s, so runners can call build.sh unconditionally.
 # ---------------------------------------------------------------------------
 EXE="$OUT/ua_trace"
-WANT_STAMP="$ARCH $DTYPE $D $MASK"
+WANT_STAMP="$ARCH $DTYPE $D $MASK ${XCFLAGS:-}"
 if [[ "${REBUILD:-0}" != "1" && -x "$EXE" && "$(cat "$OUT/.built" 2>/dev/null || true)" == "$WANT_STAMP" ]]; then
     newer="$(find "$CK/include/ck_tile" "$UADIR" -type f \
                   \( -name '*.hpp' -o -name '*.h' -o -name '*.cpp' \) -newer "$EXE" -print -quit 2>/dev/null || true)"
@@ -108,6 +108,13 @@ cat > "$OUT/flags.rsp" <<EOF
 -gline-tables-only
 EOF
 
+# Optional extra -D toggles (e.g. XCFLAGS="-DUA_FP8_WIDE_MMA=0") for A/B probes.
+# Newline-split into the response file so each token is its own arg. Folded into
+# the build stamp so toggling XCFLAGS forces a rebuild.
+if [[ -n "${XCFLAGS:-}" ]]; then
+    for tok in $XCFLAGS; do printf '%s\n' "$tok" >> "$OUT/flags.rsp"; done
+fi
+
 # Build the source list: driver + dispatcher + every instance.
 SRCS=( "$HERE/ua_trace_main.cpp" "$UADIR/unified_attention.cpp" )
 while IFS= read -r f; do SRCS+=( "$f" ); done < <(ls "$UADIR"/instances/*.cpp)
@@ -140,6 +147,6 @@ echo "[link] ua_trace ..."
 # Stamp which instance this exe was built for, so run.sh/check.sh can detect a
 # stale exe (every non-target instance is a stub -> wrong mask/dtype = "no
 # matching kernel" at runtime).
-echo "$ARCH $DTYPE $D $MASK" > "$OUT/.built"
+echo "$WANT_STAMP" > "$OUT/.built"
 echo "[ok] $OUT/ua_trace"
 ls -lah "$OUT/ua_trace" | awk '{print "     size:", $5}'

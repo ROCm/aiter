@@ -10,4 +10,10 @@ rocprof_analysis/
 standalone/build/
 
 # VGPR probe artifacts (large generated .s)
-ua-test-scripts/vgpr_probe/
+vgpr_probe/
+
+# single-instance ISA disassembly working dirs (fat.bin / instance.o / .s)
+isa_analysis*/
+
+# python caches
+__pycache__/
