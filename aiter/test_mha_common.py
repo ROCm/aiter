@@ -491,7 +491,7 @@ def _attention_ref_block_sparse_tiled(
         q_tile = q[:, q0:q1] * scale  # (b, tq, h, d)
 
         m = torch.full((b, h, tq), float("-inf"), device=device, dtype=torch.float32)
-        l = torch.zeros((b, h, tq), device=device, dtype=torch.float32)
+        l = torch.zeros((b, h, tq), device=device, dtype=torch.float32)  # noqa: E741
         acc = torch.zeros((b, h, tq, d), device=device, dtype=torch.float32)
 
         for k0 in range(0, seqlen_k, tile_k):
@@ -521,7 +521,7 @@ def _attention_ref_block_sparse_tiled(
             p = torch.exp(scores - m_safe.unsqueeze(-1))  # (b, h, tq, tk)
             correction = torch.exp(m - m_safe)  # (b, h, tq)
 
-            l = l * correction + p.sum(dim=-1)
+            l = l * correction + p.sum(dim=-1)  # noqa: E741
             acc = acc * correction.unsqueeze(-1) + torch.einsum(
                 "bhts,bshd->bhtd", p, v_tile
             )
