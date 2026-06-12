@@ -148,6 +148,7 @@ def _moe_gemm_a8w4_decode(
     NUM_BUFFERS: gl.constexpr,
     # One of ["GFX1250", None]
     SWIZZLE_MX_SCALE: gl.constexpr,
+    X_SCALE_TDM: gl.constexpr,
     PRESHUFFLED: gl.constexpr,
     MASK_K_LIMIT: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
@@ -157,7 +158,13 @@ def _moe_gemm_a8w4_decode(
 
     is_x_microscaled: gl.constexpr = XMxScale is not None
     MX_PACK_DIVISOR: gl.constexpr = 32
-    NUM_TDM_OPS: gl.constexpr = 3
+
+    if GatherIndx is None:
+        NUM_TDM_OPS: gl.constexpr = 1 # async_loads fuse into 1 TDM op
+    elif X_SCALE_TDM:
+        NUM_TDM_OPS: gl.constexpr = 5 # x + x_scales int16 TDM gathers
+    else:
+        NUM_TDM_OPS: gl.constexpr = 3 # x_scales use async_copy
     w_type: gl.constexpr = W.dtype.element_ty
     gl.static_assert(w_type == gl.uint8, "mx_weight_ptr must be uint8 or fp8")
     gl.static_assert(
@@ -436,12 +443,27 @@ def _moe_gemm_a8w4_decode(
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
-            xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
-            async_copy.global_to_shared(
-                x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                xs_ptrs_base + xs_k.to(index_type)[None, :],
-            )
-            async_copy.commit_group()
+            if X_SCALE_TDM:
+                if GatherIndx is None:
+                    gl.amd.gfx1250.tdm.async_load(
+                        x_scales_desc,
+                        [off_x_m, write_idx * MX_SCALE_BLOCK_K],
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    )
+                else:
+                    gl.amd.gfx1250.tdm.async_gather(
+                        x_scales_desc,
+                        offs_x_m,
+                        write_idx * MX_SCALE_BLOCK_K,
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    )
+            else:
+                xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
+                async_copy.global_to_shared(
+                    x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    xs_ptrs_base + xs_k.to(index_type)[None, :],
+                )
+                async_copy.commit_group()
         write_idx += 1
 
     num_k_iter = tl.cdiv(K, BLOCK_K)
@@ -474,12 +496,27 @@ def _moe_gemm_a8w4_decode(
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
-            xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
-            async_copy.global_to_shared(
-                x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                xs_ptrs_base + xs_k.to(index_type)[None, :],
-            )
-            async_copy.commit_group()
+            if X_SCALE_TDM:
+                if GatherIndx is None:
+                    gl.amd.gfx1250.tdm.async_load(
+                        x_scales_desc,
+                        [off_x_m, write_idx * MX_SCALE_BLOCK_K],
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    )
+                else:
+                    gl.amd.gfx1250.tdm.async_gather(
+                        x_scales_desc,
+                        offs_x_m,
+                        write_idx * MX_SCALE_BLOCK_K,
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    )
+            else:
+                xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
+                async_copy.global_to_shared(
+                    x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    xs_ptrs_base + xs_k.to(index_type)[None, :],
+                )
+                async_copy.commit_group()
         write_idx += 1
 
         gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS * NUM_TDM_OPS - 1)
@@ -491,7 +528,7 @@ def _moe_gemm_a8w4_decode(
         cur_w = w_buffer_slice.permute((1, 0)).load(layout=DOT_LAYOUT_W)
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
-        if is_x_microscaled:
+        if is_x_microscaled and not X_SCALE_TDM:
             async_copy.wait_group(NUM_BUFFERS - 1)
         cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
@@ -561,7 +598,7 @@ def _moe_gemm_a8w4_decode(
         gl.amd.gfx1250.tdm.async_wait(
             (NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS + TDM_BIAS_WAIT
         )
-        if is_x_microscaled:
+        if is_x_microscaled and not X_SCALE_TDM:
             async_copy.wait_group(NUM_BUFFERS - 2 - k_ep)
 
         cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
@@ -702,7 +739,7 @@ def _moe_gemm_a8w4_prefill(
     NUM_BUFFERS: gl.constexpr,
     # One of ["GFX1250", None]
     SWIZZLE_MX_SCALE: gl.constexpr,
-    EVEN_K: gl.constexpr,
+    X_SCALE_TDM: gl.constexpr,
     PRESHUFFLED: gl.constexpr,
     MASK_K_LIMIT: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
@@ -712,7 +749,13 @@ def _moe_gemm_a8w4_prefill(
 
     is_x_microscaled: gl.constexpr = XMxScale is not None
     MX_PACK_DIVISOR: gl.constexpr = 32
-    NUM_TDM_OPS: gl.constexpr = 3
+
+    if GatherIndx is None:
+        NUM_TDM_OPS: gl.constexpr = 1 # async_loads fuse into 1 TDM op
+    elif X_SCALE_TDM:
+        NUM_TDM_OPS: gl.constexpr = 5 # x + x_scales int16 TDM gathers
+    else:
+        NUM_TDM_OPS: gl.constexpr = 3 # x_scales use async_copy
     w_type: gl.constexpr = W.dtype.element_ty
     gl.static_assert(w_type == gl.uint8, "mx_weight_ptr must be uint8 or fp8")
     gl.static_assert(
@@ -985,20 +1028,35 @@ def _moe_gemm_a8w4_prefill(
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
-            xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
-            async_copy.global_to_shared(
-                x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                xs_ptrs_base + xs_k.to(index_type)[None, :],
-            )
-            async_copy.commit_group()
+            if X_SCALE_TDM:
+                if GatherIndx is None:
+                    gl.amd.gfx1250.tdm.async_load(
+                        x_scales_desc,
+                        [off_x_m, write_idx * MX_SCALE_BLOCK_K],
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    )
+                else:
+                    gl.amd.gfx1250.tdm.async_gather(
+                        x_scales_desc,
+                        offs_x_m,
+                        write_idx * MX_SCALE_BLOCK_K,
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    )
+            else:
+                xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
+                async_copy.global_to_shared(
+                    x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    xs_ptrs_base + xs_k.to(index_type)[None, :],
+                )
+                async_copy.commit_group()
         write_idx += 1
 
     num_k_iter = tl.cdiv(K, BLOCK_K)
 
-    # After TDM prologue there are NUM_BUFFERS*3 ops in-flight; waiting for
-    # (NUM_BUFFERS-1)*3 lets exactly one tile (tile 0) complete.
+    # After TDM prologue there are NUM_BUFFERS*NUM_TDM_OPS ops in-flight; waiting
+    # for (NUM_BUFFERS-1)*NUM_TDM_OPS lets exactly one tile (tile 0) complete.
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
-    if is_x_microscaled:
+    if is_x_microscaled and not X_SCALE_TDM:
         async_copy.wait_group(NUM_BUFFERS - 1)
 
     # Register pre-load prologue: wait for tile 0 then read it into cur_x/cur_w/cur_w_scales.
@@ -1063,16 +1121,31 @@ def _moe_gemm_a8w4_prefill(
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
-            xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
-            async_copy.global_to_shared(
-                x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                xs_ptrs_base + xs_k.to(index_type)[None, :],
-            )
-            async_copy.commit_group()
+            if X_SCALE_TDM:
+                if GatherIndx is None:
+                    gl.amd.gfx1250.tdm.async_load(
+                        x_scales_desc,
+                        [off_x_m, write_idx * MX_SCALE_BLOCK_K],
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    )
+                else:
+                    gl.amd.gfx1250.tdm.async_gather(
+                        x_scales_desc,
+                        offs_x_m,
+                        write_idx * MX_SCALE_BLOCK_K,
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    )
+            else:
+                xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
+                async_copy.global_to_shared(
+                    x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    xs_ptrs_base + xs_k.to(index_type)[None, :],
+                )
+                async_copy.commit_group()
         write_idx += 1
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
-        if is_x_microscaled:
+        if is_x_microscaled and not X_SCALE_TDM:
             async_copy.wait_group(NUM_BUFFERS - 1)
 
         next_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
@@ -1142,7 +1215,7 @@ def _moe_gemm_a8w4_prefill(
         gl.amd.gfx1250.tdm.async_wait(
             (NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS + TDM_BIAS_WAIT
         )
-        if is_x_microscaled:
+        if is_x_microscaled and not X_SCALE_TDM:
             async_copy.wait_group(NUM_BUFFERS - 2 - k_ep)
 
         next_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
