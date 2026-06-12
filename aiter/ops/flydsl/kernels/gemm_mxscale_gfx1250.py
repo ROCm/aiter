@@ -75,6 +75,7 @@ def compile_mxscale_gemm(
     wave_specialized_tdm: bool = False,
     split_k: int = 1,
     use_scale_opsel: bool = False,
+    weight_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     atomic_barrier_enable: bool = False,
     batch_count: int = 1,
@@ -124,11 +125,16 @@ def compile_mxscale_gemm(
             f"b_scale_layout must be 'interleaved' or 'n4k8', got {b_scale_layout!r}"
         )
     b_n4k8 = b_scale_layout == "n4k8"
-    if b_n4k8 and use_scale_opsel:
-        # The n4k8 read path encodes the N-tile in the lane address + op_sel=0
-        # (a8w4: lanes 0-15) / lane_kgrp (fp4: 32 lanes); it is derived for the
-        # grouped config which always runs use_scale_opsel=False.
-        raise ValueError("b_scale_layout='n4k8' requires use_scale_opsel=False")
+    # Weight (B) scale op_sel == the WMMA *A operand* (scaleAType).  It is enabled
+    # by the dedicated ``weight_scale_opsel`` flag (grouped env WEIGHT_SCALE_OP_SEL)
+    # or by ``use_scale_opsel`` (which also drives the activation/B-operand op_sel,
+    # kept for the standalone GEMM).  The activation (A) scale op_sel stays on
+    # ``use_scale_opsel`` alone.
+    b_opsel_on = use_scale_opsel or weight_scale_opsel
+    # n4k8 supports both weight-op_sel states (producer/gmem layout is identical):
+    #   off -> a8w4 reads op_sel=0 (one dword per N-tile, lanes 0-15);
+    #   on  -> a8w4 reads one dword per N-tile PAIR with lane_kgrp, op_sel
+    #          (scaleAType) picks the half -- same form as the fp4 read.
 
     if out_dtype not in ("f32", "bf16", "f16"):
         raise ValueError(
@@ -314,8 +320,12 @@ def compile_mxscale_gemm(
     # B-scale ds-load count for one full K-subtile (one B-scale load call).
     #   interleaved: ceil(rep/4) packed b128 (rep e8m0 blocks contiguous).
     #   n4k8       : each lane reads its complete scaleB i32 with one ds_load_b32;
-    #                a8w4 (ROW_MAJOR) loads one dword per N-tile -> wmma_n_rep.
-    _b_scale_ds_loads_full = wmma_n_rep if b_n4k8 else (b_scale_load_rep + 3) // 4
+    #                a8w4 (ROW_MAJOR) loads one dword per N-tile (op_sel off) or
+    #                one per N-tile pair (op_sel on) -> wmma_n_rep or wmma_n_rep//2.
+    if b_n4k8:
+        _b_scale_ds_loads_full = wmma_n_rep // 2 if b_opsel_on else wmma_n_rep
+    else:
+        _b_scale_ds_loads_full = (b_scale_load_rep + 3) // 4
     # Per bank-half slice (fp4 COL_BAND): one ds_load_b32 per fp4-wn half.
     _b_scale_ds_loads_half = (
         wmma_n_rep // 2 if b_n4k8 else (b_scale_load_rep // 2 + 3) // 4
@@ -962,11 +972,14 @@ def compile_mxscale_gemm(
             #
             # The 4 e8m0 of one WMMA-K step (r=0..3) are contiguous, so each lane
             # reads its complete scaleB i32 with ONE ds_load_b32.  p = the WMMA
-            # N-tile, q = ks (the 2nd WMMA-K step within the 256-K block):
-            #   a8w4 (16x16, op_sel=0): only lanes 0-15 supply scale, p = wn,
-            #       off = wn*128 + ks*64,  no lane_kgrp.
-            #   fp4  (32x16): all 32 lanes supply scale, p = 2*fpwn + lane_kgrp,
-            #       off = fpwn*256 + ks*64,  lane_kgrp folded into the base.
+            # N-tile, q = ks (the 2nd WMMA-K step within the 256-K block).
+            # Two read forms (the gmem layout is identical for both):
+            #   "per-tile"  (a8w4, op_sel off): only lanes 0-15 supply scale,
+            #       p = wn, off = wn*128 + ks*64, no lane_kgrp.
+            #   "per-pair"  (fp4 always; a8w4 when op_sel on): one dword serves a
+            #       N-tile pair, p = 2*idx + lane_kgrp, off = idx*256 + ks*64,
+            #       lane_kgrp folded into the base; op_sel/lane-half picks the tile.
+            _b_n4k8_pair = is_fp4 or b_opsel_on
             _B_N4K8_ROW_BYTES = scale_k_per_tile * 64  # LDS super-row stride
             _B_N4K8_BLOCK_BYTES = 512  # one remain_b block (8 e8m0 = 2 WMMA-K steps)
             _B_N4K8_QSTEP_BYTES = 64  # q (2nd WMMA-K step in the block) stride
@@ -979,30 +992,33 @@ def compile_mxscale_gemm(
                 return (ks // 2) * _B_N4K8_BLOCK_BYTES + (ks % 2) * _B_N4K8_QSTEP_BYTES
 
             def _precompute_b_scale_n4k8_base(lds_ptr, warp_n_base):
-                """Per-lane byte base for this warp's super-row, ks 0, wn 0."""
+                """Per-lane byte base for this warp's super-row, ks 0, tile/pair 0."""
                 super_local = warp_n_base / arith.index(64)
                 base = (
                     super_local * arith.index(_B_N4K8_ROW_BYTES)
                     + lane16 * arith.index(4)
                 )
-                if const_expr(is_fp4):
-                    # fp4: p = 2*fpwn + lane_kgrp -> lane_kgrp adds one N-tile.
+                if const_expr(_b_n4k8_pair):
+                    # per-pair: p = 2*idx + lane_kgrp -> lane_kgrp adds one N-tile.
                     base = base + lane_kgrp * arith.index(_B_N4K8_PTILE_BYTES)
                 return lds_ptr, [base]
 
             def _load_b_scale_n4k8(lds_buffer, scale_base, ks, wn_start, wn_count):
-                """One ds_load_b32 per N-tile; returns the full scaleB i32 each.
+                """One ds_load_b32 per unit; returns the full scaleB i32 each.
 
-                a8w4: result[i] = dword for N-tile (wn_start+i) (op_sel=0).
-                fp4 : result[2*i] = dword for fp4-wn (wn_start+i), filler at 2*i+1
-                      (the consumer indexes b_scales[wn_local*2]); lane_kgrp (in
-                      the base) selects the 2nd N-tile of the 32-row fp4 op.
+                per-tile (a8w4 op_sel off): result[i] = dword for N-tile
+                    (wn_start+i); stride 128.
+                per-pair (fp4, or a8w4 op_sel on): result[2*i] = dword for pair
+                    (wn_start+i) with filler at 2*i+1, so the consumer's
+                    b_scales[idx*2] (fp4) / b_scales_all[::2] (op_sel) indexes the
+                    reals; stride 256; lane_kgrp (in the base) + op_sel/lane-half
+                    selects the N-tile within the pair.
                 """
                 q_off = _n4k8_kstep_off(ks)
                 results = []
                 for i in range_constexpr(wn_count):
                     wn = wn_start + i
-                    if const_expr(is_fp4):
+                    if const_expr(_b_n4k8_pair):
                         off = scale_base + arith.index(wn * 256 + q_off)
                         b32 = lds_load_b32_raw(lds_buffer, off)
                         results.append(b32)
@@ -1023,31 +1039,31 @@ def compile_mxscale_gemm(
                     for wn in range_constexpr(wmma_n_rep)
                 ]
                 if const_expr(b_n4k8):
-                    # One ds_load_b32 per N-tile = the full scaleB i32 (4 K-blocks).
-                    # a8w4 (op_sel=0): result[wn] = N-tile wn's dword.
+                    # One ds_load_b32 per unit = the full scaleB i32 (4 K-blocks).
+                    # op_sel off: wmma_n_rep dwords, result[wn] = N-tile wn.
+                    # op_sel on : wmma_n_rep//2 pair dwords (even-indexed), the
+                    #             [::2] below selects them, indexed by wn//2.
+                    _n_units = wmma_n_rep // 2 if b_opsel_on else wmma_n_rep
                     b_scales_all = _load_b_scale_n4k8(
-                        bs_buf, bs_bases[0], ks, 0, wmma_n_rep
+                        bs_buf, bs_bases[0], ks, 0, _n_units
                     )
                 else:
                     b_scales_all = load_scale_b128(
                         bs_buf, bs_bases[0], b_scale_load_rep, ks
                     )
                 a_scales_all = load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
+                # Weight (B) scale op_sel is independent of the activation (A)
+                # scale op_sel.  fp4 never op_sels the weight scale (scaleAType=0).
                 if const_expr(is_fp4):
-                    # FP4 32x16: scaleAType=0 fixed (no op_sel on BScale)
                     b_scales = b_scales_all
-                    if const_expr(use_scale_opsel):
-                        a_scales = a_scales_all[::2]
-                    else:
-                        a_scales = a_scales_all
+                elif const_expr(b_opsel_on):
+                    b_scales = b_scales_all[::2]
                 else:
-                    # FP8/A8W4 16x16: both scales support op_sel
-                    if const_expr(use_scale_opsel):
-                        b_scales = b_scales_all[::2]
-                        a_scales = a_scales_all[::2]
-                    else:
-                        b_scales = b_scales_all
-                        a_scales = a_scales_all
+                    b_scales = b_scales_all
+                if const_expr(use_scale_opsel):
+                    a_scales = a_scales_all[::2]
+                else:
+                    a_scales = a_scales_all
                 return b_frags, b_scales, a_scales
 
             def _emit_wmma(accs, wm, wn, a_frag, b_frags, a_scales, b_scales):
@@ -1073,8 +1089,10 @@ def compile_mxscale_gemm(
                         scaleBType=a_opsel,
                     )
                 else:
-                    # 16x16x128 WMMA: A8W4 (fmtA=FP4) or FP8 (fmtA=FP8)
-                    if const_expr(use_scale_opsel):
+                    # 16x16x128 WMMA: A8W4 (fmtA=FP4) or FP8 (fmtA=FP8).
+                    # Weight scale = scaleAType (the WMMA A operand), op_sel from
+                    # the dedicated weight-scale flag.
+                    if const_expr(b_opsel_on):
                         b_scale_idx = wn // 2
                         b_opsel = wn % 2
                     else:
@@ -3055,6 +3073,7 @@ def compile_mxscale_gemm(
         wave_specialized_tdm,
         split_k,
         use_scale_opsel,
+        weight_scale_opsel,
         expert_sched_mode,
         atomic_barrier_enable,
         batch_count,

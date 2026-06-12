@@ -59,6 +59,9 @@ class _GroupedA8W4Config:
     data_format: str = "a8w4"
     act: str = "silu"
     stage1_weight_layout: str = "gguu"
+    # op_sel on the WMMA A operand = the weight (B) scale (scaleAType) only;
+    # independent of use_scale_opsel (which drives the activation/B operand).
+    weight_scale_opsel: bool = False
 
 
 def _validate_common(cfg: _GroupedA8W4Config) -> None:
@@ -721,6 +724,7 @@ def _compile_base_a8w4_gemm(
         cluster_m=cfg.cluster_m,
         cluster_n=cfg.cluster_n,
         use_scale_opsel=cfg.use_scale_opsel,
+        weight_scale_opsel=cfg.weight_scale_opsel,
         expert_sched_mode=cfg.expert_sched_mode,
         batch_count=cfg.experts,
         grouped_masked_m=True,
@@ -756,6 +760,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     cluster_m: int = 1,
     cluster_n: int = 1,
     use_scale_opsel: bool = False,
+    weight_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     grouped_persistent_m: bool = True,
     persistent_workers: int | None = None,
@@ -783,6 +788,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         cluster_m=int(cluster_m),
         cluster_n=int(cluster_n),
         use_scale_opsel=bool(use_scale_opsel),
+        weight_scale_opsel=bool(weight_scale_opsel),
         expert_sched_mode=bool(expert_sched_mode),
         grouped_persistent_m=bool(grouped_persistent_m),
         persistent_workers=persistent_workers,
@@ -1047,6 +1053,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     cluster_m: int = 1,
     cluster_n: int = 1,
     use_scale_opsel: bool = False,
+    weight_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     grouped_persistent_m: bool = True,
     persistent_workers: int | None = None,
@@ -1072,6 +1079,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         cluster_m=int(cluster_m),
         cluster_n=int(cluster_n),
         use_scale_opsel=bool(use_scale_opsel),
+        weight_scale_opsel=bool(weight_scale_opsel),
         expert_sched_mode=bool(expert_sched_mode),
         grouped_persistent_m=bool(grouped_persistent_m),
         persistent_workers=persistent_workers,

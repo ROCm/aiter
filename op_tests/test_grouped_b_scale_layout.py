@@ -186,5 +186,52 @@ def test_consumer_read_fp4(E, N, k_scale):
                                 assert got == want, (got, want)
 
 
+@pytest.mark.parametrize("E,N,k_scale", _SHAPES)
+def test_consumer_read_a8w4_opsel(E, N, k_scale):
+    """a8w4 with use_scale_opsel=True reads one dword per N-tile PAIR.
+
+    p = 2*idx + lane_kgrp (op_sel picks the lane-half); off = idx*256 + ks*64 +
+    lane_kgrp*128 -- identical addressing to the fp4 path, just driven by
+    WEIGHT_SCALE_OP_SEL instead of the format.
+    """
+    raw = torch.arange(E * N * k_scale, dtype=torch.int64).reshape(E, N, k_scale)
+    out = (
+        raw.reshape(E, N // 64, 4, 16, k_scale // 8, 2, 4)
+        .permute(0, 1, 4, 2, 5, 3, 6)
+        .contiguous()
+        .reshape(E, N // 64, k_scale * 64)
+    )
+
+    def decode(v, e):
+        local = int(v) - e * N * k_scale
+        return (local // k_scale, local % k_scale)
+
+    wmma_n_rep = 4
+    n_pairs = wmma_n_rep // 2  # = 2 dwords loaded per step (op_sel halves it)
+    for e in range(E):
+        for super_local in range(N // 64):
+            for rb in range(k_scale // 8):
+                for idx in range(n_pairs):
+                    for ks in range(2):
+                        s = rb * 2 + ks
+                        for lane_kgrp in range(2):
+                            p = 2 * idx + lane_kgrp
+                            for lane16 in range(16):
+                                col = (
+                                    rb * 512
+                                    + idx * 256
+                                    + ks * 64
+                                    + lane_kgrp * 128
+                                    + lane16 * 4
+                                )
+                                got = [
+                                    decode(v, e)
+                                    for v in out[e, super_local, col : col + 4]
+                                ]
+                                n = super_local * 64 + p * 16 + lane16
+                                want = [(n, s * 4 + r) for r in range(4)]
+                                assert got == want, (got, want)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([os.path.abspath(__file__), "-q"]))
