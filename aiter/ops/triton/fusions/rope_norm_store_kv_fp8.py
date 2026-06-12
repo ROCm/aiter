@@ -45,10 +45,11 @@ def _precompute_positions_slots(
     kvcache_indices: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     device = q_index.device
-    positions = torch.empty(num_rows, dtype=torch.int32, device=device)
-    slot_indices = torch.empty(num_rows, dtype=torch.int64, device=device)
-    req_ids = torch.empty(num_rows, dtype=torch.int32, device=device)
-    local_idx = torch.empty(num_rows, dtype=torch.int32, device=device)
+    positions = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    # -1 sentinel marks rows the helper didn't touch (padded requests).
+    slot_indices = torch.full((num_rows,), -1, dtype=torch.int64, device=device)
+    req_ids = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    local_idx = torch.zeros(num_rows, dtype=torch.int32, device=device)
 
     BLOCK_R = 32
     _rope_norm_store_kv_fp8_compute_pos_slot_kernel[(num_req,)](
@@ -250,8 +251,8 @@ def rope_norm_store_kv_fp8(
     else:
         q_scale_out = None
 
-    # split_k_flag: unused on AMD path; avoid unnecessary initialization.
-    split_k_flag = torch.empty(
+    # split_k_flag: zeroed [num_req, num_kv_heads] int32
+    split_k_flag = torch.zeros(
         (num_req, num_kv_heads), dtype=torch.int32, device=qkv.device,
     )
 

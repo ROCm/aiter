@@ -227,8 +227,6 @@ void launch_main_v2_impl(
     const at::Tensor& v_scale_t,
     const at::Tensor& p_scale_t,
     const at::Tensor& p_scale_inv_t,
-    double p_scale_value,
-    double p_scale_inv_value,
     at::Tensor&       exp_sums,
     at::Tensor&       max_logits,
     at::Tensor&       tmp_out,
@@ -250,13 +248,7 @@ void launch_main_v2_impl(
     const bool query_is_bf16 = is_bf16(query);
     TORCH_CHECK(query_is_fp8 || query_is_bf16,
         "v2 query must be float8_e4m3fnuz or bfloat16; got ", query.dtype());
-    const bool has_pscale_tensor = has_pscale_tensors(p_scale_t, p_scale_inv_t);
-    const bool has_pscale_scalar = (p_scale_value > 0.0 || p_scale_inv_value > 0.0);
-    TORCH_CHECK(!has_pscale_scalar || (p_scale_value > 0.0 && p_scale_inv_value > 0.0),
-        "scalar p_scale and p_scale_inv must either both be positive or both be zero");
-    TORCH_CHECK(!(has_pscale_tensor && has_pscale_scalar),
-        "p_scale/p_scale_inv must be provided as either tensors or scalar values, not both");
-    const bool has_pscale = has_pscale_tensor || has_pscale_scalar;
+    const bool has_pscale = has_pscale_tensors(p_scale_t, p_scale_inv_t);
 
     const auto stream = at::hip::getCurrentHIPStream();
     const int q_stride        = query.stride(0);
@@ -307,8 +299,6 @@ void launch_main_v2_impl(
                 v_scale_t.data_ptr<float>(),
                 p_scale_ptr,
                 p_scale_inv_ptr,
-                static_cast<float>(p_scale_value),
-                static_cast<float>(p_scale_inv_value),
                 block_tables.data_ptr<int>(),
                 context_lens.data_ptr<int>(),
                 max_num_blocks_per_seq,
@@ -457,8 +447,6 @@ void pa_fp8_decode_v2(
     const at::Tensor& v_scale,
     const at::Tensor& p_scale,
     const at::Tensor& p_scale_inv,
-    double p_scale_value,
-    double p_scale_inv_value,
     int64_t num_seqs, int64_t num_kv_heads, int64_t num_q_heads,
     int64_t head_size, int64_t block_size, int64_t mtp,
     int64_t num_fat_partitions,
@@ -483,7 +471,6 @@ void pa_fp8_decode_v2(
         launch_main_v2_impl<__hip_bfloat16>(
             query, k_cache, v_cache, block_tables, context_lens,
             q_scale, k_scale, v_scale, p_scale, p_scale_inv,
-            p_scale_value, p_scale_inv_value,
             exp_sums, max_logits, tmp_out,
             (int)num_seqs, (int)num_kv_heads, (int)num_q_heads,
             (int)head_size, (int)block_size, (int)mtp,
@@ -504,7 +491,6 @@ void pa_fp8_decode_v2(
         launch_main_v2_impl<_Float16>(
             query, k_cache, v_cache, block_tables, context_lens,
             q_scale, k_scale, v_scale, p_scale, p_scale_inv,
-            p_scale_value, p_scale_inv_value,
             exp_sums, max_logits, tmp_out,
             (int)num_seqs, (int)num_kv_heads, (int)num_q_heads,
             (int)head_size, (int)block_size, (int)mtp,
@@ -568,8 +554,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           pybind11::arg("v_scale"),
           pybind11::arg("p_scale"),
           pybind11::arg("p_scale_inv"),
-          pybind11::arg("p_scale_value"),
-          pybind11::arg("p_scale_inv_value"),
           pybind11::arg("num_seqs"),
           pybind11::arg("num_kv_heads"),
           pybind11::arg("num_q_heads"),

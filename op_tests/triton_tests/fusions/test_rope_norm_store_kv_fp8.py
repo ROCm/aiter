@@ -381,6 +381,7 @@ def test_fp8_prefill(seqlens, qh, kvh, qk_d, v_d, bs, qk_norm_policy, quant_poli
 
     assert split_k_flag.shape == (inp["num_seqlen_per_req"].shape[0], kvh)
     assert split_k_flag.dtype == torch.int32
+    assert torch.all(split_k_flag == 0)
 
     _dequant_compare(
         {"k_scale": inp["k_scale"]}, inp, quant_policy, qk_norm_policy, True,
