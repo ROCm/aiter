@@ -51,6 +51,8 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         R: torch.Tensor = None,
         BLOCK_R: int = 128,
         block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        return_lse: bool = False,
+        smooth_k: bool = True,
     ):
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         bhsd_map = [0, 2, 1, 3] if layout == "bshd" else [0, 1, 2, 3]
@@ -64,15 +66,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         FP8_MAX = torch.finfo(FP8_TYPE).max
 
         assert hadamard_rotation, "hadamard_rotation=False not supported at the moment"
-        (
-            q_quantized,
-            q_descale,
-            k_quantized,
-            k_descale,
-            v_quantized,
-            v_descale,
-            delta_s,
-        ) = sage_quant_mxfp4(
+        sq_result = sage_quant_mxfp4(
             q,
             k,
             v,
@@ -84,7 +78,31 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             R=R,
             BLOCK_R=BLOCK_R,
             q_smoothing=q_smooth,
+            smooth_k=smooth_k,
+            return_lse=return_lse,
         )
+        if return_lse:
+            (
+                q_quantized,
+                q_descale,
+                k_quantized,
+                k_descale,
+                v_quantized,
+                v_descale,
+                delta_s,
+                sage_lse_delta,
+            ) = sq_result
+        else:
+            (
+                q_quantized,
+                q_descale,
+                k_quantized,
+                k_descale,
+                v_quantized,
+                v_descale,
+                delta_s,
+            ) = sq_result
+            sage_lse_delta = None
         # TODO: fused quant has perf downgrade
         # fused_sage_quant_mxfp4(
         #     q,
@@ -120,7 +138,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             kv_block_indices = lut_start = lut_count = None
             use_block_sparse = False
 
-        out = fav3_sage_mxfp4_func(
+        result = fav3_sage_mxfp4_func(
             q=q_quantized,
             k=k_quantized,
             v=v_quantized,
@@ -135,15 +153,26 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             lut_start=lut_start,
             lut_count=lut_count,
             use_block_sparse=use_block_sparse,
+            return_lse=return_lse,
         )
 
-        return out
+        if return_lse:
+            out, softmax_lse = result
+            # Recover the un-smoothed LSE. The kernel computed the LSE against
+            # (K - k_mean); adding delta = sm_scale * Q . k_mean^T shifts it
+            # back so it is consistent with a kernel call on un-smoothed K
+            # (required for correct ring-attention merging).
+            if sage_lse_delta is not None:
+                softmax_lse = softmax_lse + sage_lse_delta.to(softmax_lse.dtype)
+            return out, softmax_lse
+
+        return result
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
         # Backward remains unimplemented
         assert False, "backward not implemented"
-        return (None,) * 10
+        return (None,) * 12
 
 
 def fav3_sage_mxfp4_wrapper(
@@ -158,8 +187,19 @@ def fav3_sage_mxfp4_wrapper(
     R: torch.Tensor = None,
     BLOCK_R: int = 128,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    return_lse: bool = False,
+    smooth_k: bool = True,
 ):
-    """High-precision entry point for MXFP4 SageAttention."""
+    """High-precision entry point for MXFP4 SageAttention.
+
+    Args (additions):
+        return_lse: if True, also return softmax_lse of shape (B, H_q, S_q),
+            fp32, in natural log units. The wrapper internally adds the
+            K-smoothing compensation so the returned LSE is consistent with
+            FA-style ring-attention merging.
+        smooth_k: whether to apply SageAttention-style K smoothing (default
+            True). When False, no LSE compensation is needed.
+    """
     for tensor, name in zip([q, k, v], ["q", "k", "v"]):
         assert tensor.dtype in [
             torch.float16,
@@ -179,6 +219,8 @@ def fav3_sage_mxfp4_wrapper(
         R,
         BLOCK_R,
         block_lut,
+        return_lse,
+        smooth_k,
     )
 
 
@@ -197,6 +239,7 @@ def fav3_sage_mxfp4_func(
     lut_start: Optional[torch.Tensor] = None,
     lut_count: Optional[torch.Tensor] = None,
     use_block_sparse: bool = False,
+    return_lse: bool = False,
 ):
     """Direct MXFP4 kernel execution with unused parameters removed."""
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -221,6 +264,11 @@ def fav3_sage_mxfp4_func(
         dtype=torch.bfloat16,
         device=q.device,
     )
+    softmax_lse = (
+        torch.empty((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+        if return_lse
+        else None
+    )
 
     # Tensor Strides
     stride_qb, stride_qm, stride_qh, _ = map_dims(q.stride(), bshd_map)
@@ -240,6 +288,11 @@ def fav3_sage_mxfp4_func(
     stride_qsz, stride_qsm, stride_qsh, _ = map_dims(q_descale.stride(), bshd_map)
     stride_ksz, stride_ksn, stride_ksh, _ = map_dims(k_descale.stride(), bshd_map)
     stride_vsz, stride_vsh, _ = v_descale.stride()
+
+    # LSE strides (always (B, H_q, S_q) regardless of input layout)
+    stride_lse_z, stride_lse_h, stride_lse_m = (
+        softmax_lse.stride() if return_lse else (0, 0, 0)
+    )
 
     # Kernel padding logic
     padded_d_qk = max(16, 1 << (head_size_qk - 1).bit_length())
@@ -283,6 +336,7 @@ def fav3_sage_mxfp4_func(
         stride_vsz=stride_vsz,
         stride_vsh=stride_vsh,
         Out=out,
+        LSE=softmax_lse,
         stride_qz=stride_qb,
         stride_qh=stride_qh,
         stride_qm=stride_qm,
@@ -299,6 +353,9 @@ def fav3_sage_mxfp4_func(
         stride_bh=stride_bh,
         stride_bm=stride_bm,
         stride_bn=stride_bn,  # Bias strides
+        stride_lse_z=stride_lse_z,
+        stride_lse_h=stride_lse_h,
+        stride_lse_m=stride_lse_m,
         cu_seqlens_q=None,
         cu_seqlens_k=None,
         kv_block_indices=kv_block_indices,
@@ -318,7 +375,10 @@ def fav3_sage_mxfp4_func(
         BLOCK_DMODEL_V=padded_d_v,
         USE_BIAS=USE_BIAS,
         USE_BLOCK_SPARSE=use_block_sparse,
+        RETURN_LSE=return_lse,
         **config,
     )
 
+    if return_lse:
+        return out, softmax_lse
     return out
