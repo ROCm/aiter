@@ -503,6 +503,12 @@ def compile_mxscale_gemm(
     )
     needs_grouped_row_masked_store = grouped_masked_m and (M % tile_m != 0)
     kernel_tag_mode = str(kernel_tag).replace("-", "_")
+    # Kernel symbol carries the data format + tile shape so profiles/dumps can
+    # tell configs apart (e.g. stage1 vs stage2, different tile_m/n/k).
+    module_name = (
+        f"kernel_mxscale_{kernel_tag_mode}_{data_format}"
+        f"_t{tile_m}x{tile_n}x{tile_k}"
+    ).replace("-", "_")
 
     if use_fp4_bank_friendly_schedule:
         _bank_half_wm = wmma_m_rep // 2
@@ -524,7 +530,7 @@ def compile_mxscale_gemm(
                 _bank_group_to_row_major.append(_wm * wmma_n_rep + _wn)
 
     @flyc.kernel(
-        name=f"kernel_mxscale_{kernel_tag_mode}", known_block_size=[block_threads, 1, 1]
+        name=module_name, known_block_size=[block_threads, 1, 1]
     )
     def kernel_mxscale_gemm(
         arg_c: fx.Tensor,
