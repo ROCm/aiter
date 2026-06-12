@@ -815,7 +815,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             cfg=cfg,
             stage1_act=cfg.act,
             stage1_weight_layout=cfg.stage1_weight_layout,
-            kernel_tag="gemm1",
+            kernel_tag=f"gemm1_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}",
         )
         fused_base_bias = _compile_base_a8w4_gemm(
             K=cfg.model_dim,
@@ -824,10 +824,10 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             stage1_act=cfg.act,
             epilogue_bias=True,
             stage1_weight_layout=cfg.stage1_weight_layout,
-            kernel_tag="gemm1_bias",
+            kernel_tag=f"gemm1_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}",
         )
     raw_base = _compile_base_a8w4_gemm(
-        K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg, kernel_tag="gemm1_raw"
+        K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg, kernel_tag=f"gemm1_raw_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}"
     )
     finalize_act = _compile_stage1_finalize_act(
         experts=cfg.experts,
@@ -1176,7 +1176,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         N=cfg.model_dim,
         cfg=cfg,
         epilogue_bias=True,
-        kernel_tag="gemm2_bias",
+        kernel_tag=f"gemm2_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_mode{grouped_contiguous_m}",
     )
 
     def launch(
