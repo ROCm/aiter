@@ -5,6 +5,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
     compute_alibi_block,
 )
 
+
 @triton.jit
 def _sage_fwd_no_mask(
     acc,
