@@ -188,7 +188,6 @@ def _use_grouped_gemm_enabled() -> bool:
     return os.environ.get("AITER_USE_GROUPED_GEMM", "1") in _TRUTHY_ENV
 
 
-
 def _align_up(value: int, alignment: int) -> int:
     if alignment <= 0:
         raise ValueError(f"alignment must be > 0, got {alignment}")
@@ -451,8 +450,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     try:
         from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (
-            _GroupedA8W4Config,
-            _make_m_tile_prefix_map,
             compile_moe_grouped_gemm1_a8w4_masked,
             compile_moe_grouped_gemm2_a8w4_masked,
             compile_moe_grouped_gemm1_mxfp4_masked,
@@ -461,8 +458,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     except Exception as vendored_exc:
         try:
             from kernels.moe_grouped_gemm_mxscale_gfx1250 import (
-                _GroupedA8W4Config,
-                _make_m_tile_prefix_map,
                 compile_moe_grouped_gemm1_a8w4_masked,
                 compile_moe_grouped_gemm2_a8w4_masked,
                 compile_moe_grouped_gemm1_mxfp4_masked,
