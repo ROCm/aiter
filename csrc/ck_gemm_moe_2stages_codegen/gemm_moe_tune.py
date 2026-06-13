@@ -39,7 +39,7 @@ from aiter.int4_utils import (
 from aiter.ops.quant import per_1x32_i4_quant
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
 import torch.nn.functional as F
 from einops import rearrange
 from aiter.utility.base_tuner import TunerCommon
@@ -1712,6 +1712,7 @@ class FmoeTuner(TunerCommon):
     def calculate(self, results, bpes=(1, 1, 2)):
         key, stage, kernelName, block_m, us, err = results
         (
+            gfx,
             cu_num,
             token,
             model_dim,
@@ -1822,6 +1823,7 @@ class FmoeTuner(TunerCommon):
         task_1stage = []
         info = key
         (
+            gfx,
             cu_num,
             token,
             model_dim,
@@ -2074,6 +2076,7 @@ class FmoeTuner(TunerCommon):
         info = key
         tasks = []
         (
+            gfx,
             cu_num,
             token,
             model_dim,
@@ -2185,6 +2188,7 @@ class FmoeTuner(TunerCommon):
         info = key
         tasks_ck = []
         (
+            gfx,
             cu_num,
             token,
             model_dim,
@@ -2416,6 +2420,7 @@ class FmoeTuner(TunerCommon):
         """A8W4 (fp8 activation + fp4 weight + per_1x32) uses cktile path."""
         tasks_ck = []
         (
+            gfx,
             cu_num,
             token,
             model_dim,
@@ -2575,6 +2580,7 @@ class FmoeTuner(TunerCommon):
         if not is_flydsl_available():
             return tasks_flydsl
         (
+            gfx,
             cu_num,
             token,
             model_dim,
@@ -2840,6 +2846,7 @@ class FmoeTuner(TunerCommon):
         if not is_flydsl_available():
             return tasks_flydsl
         (
+            gfx,
             cu_num,
             token,
             model_dim,
@@ -3364,6 +3371,7 @@ class FmoeTuner(TunerCommon):
         in_data = []
         for line in untunedf[keys].values:
             (
+                gfx,
                 cu_num,
                 token,
                 model_dim,
@@ -3392,6 +3400,7 @@ class FmoeTuner(TunerCommon):
                 continue
             act_type = eval(act_type)
             info = (
+                gfx,
                 cu_num,
                 token,
                 model_dim,
@@ -3473,7 +3482,12 @@ class FmoeTuner(TunerCommon):
 
         for col in self.columns:
             if col not in old_tunedf.columns:
-                old_tunedf[col] = 0
+                # Migrate legacy tuned files lacking a gfx column: infer from
+                # cu_num so old rows stay matchable instead of collapsing to 0.
+                if col == "gfx" and "cu_num" in old_tunedf.columns:
+                    old_tunedf[col] = old_tunedf["cu_num"].map(gfx_from_cu_num)
+                else:
+                    old_tunedf[col] = 0
 
         new_fallbacks = getattr(self, "_flydsl_fallbacks", [])
         new_fb_keys = set()
@@ -3524,6 +3538,12 @@ class FmoeTuner(TunerCommon):
         resultdf = resultdf.astype(str).drop_duplicates(
             subset=self.keys + ["_tag"], keep="last"
         )
+        # Canonical column order (self.columns, so gfx stays the first column);
+        # any extra columns such as _tag are kept at the end. Without this an
+        # incremental tune of a legacy file would append gfx at the back.
+        ordered_cols = [c for c in self.columns if c in resultdf.columns]
+        ordered_cols += [c for c in resultdf.columns if c not in ordered_cols]
+        resultdf = resultdf[ordered_cols]
         resultdf.to_csv(file, index=False)
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
@@ -3541,6 +3561,7 @@ class FmoeTuner(TunerCommon):
         for key, rets in grouped_results:
             us_qs_cache = {}
             (
+                gfx,
                 cu_num,
                 token,
                 model_dim,
@@ -3572,6 +3593,7 @@ class FmoeTuner(TunerCommon):
                 profileDF.append(
                     [
                         stage,
+                        gfx,
                         cu_num,
                         token,
                         model_dim,
@@ -3694,6 +3716,7 @@ class FmoeTuner(TunerCommon):
                 stage1_profileDF,
                 stage2_profileDF,
                 on=[
+                    "gfx",
                     "cu_num",
                     "token",
                     "model_dim",
@@ -3722,6 +3745,7 @@ class FmoeTuner(TunerCommon):
                 ret = []
                 ret.append(
                     [
+                        gfx,
                         cu_num,
                         token,
                         model_dim,
@@ -4212,7 +4236,16 @@ class FmoeTuner(TunerCommon):
                 )
             else:
                 self.tunedf = None
+            self.untunedf["gfx"] = get_gfx_runtime()
             self.untunedf["cu_num"] = self.get_cu_num()
+            # Migrate a legacy tuned file that predates the gfx column so the
+            # untuned-vs-tuned dedup below (which now includes gfx) doesn't fail.
+            if (
+                self.tunedf is not None
+                and "gfx" not in self.tunedf.columns
+                and "cu_num" in self.tunedf.columns
+            ):
+                self.tunedf["gfx"] = self.tunedf["cu_num"].map(gfx_from_cu_num)
             if args.last:
                 self.untunedf = self.untunedf.iloc[-1:]
 
@@ -4226,6 +4259,7 @@ class FmoeTuner(TunerCommon):
 
 if __name__ == "__main__":
     key = [
+        "gfx",
         "cu_num",
         "token",
         "model_dim",
