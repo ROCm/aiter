@@ -212,3 +212,61 @@ fraction of the naive kv128 promise — weigh against the numeric levers
   documented dead-end.
 
 Probe with: `XCFLAGS="-DUA_PREFILL_D128_BLOCKSIZE=128 -DUA_FA4_SHARED_SPCOMPUTE=1" ua-test-scripts/measure_vgpr.sh`
+
+---
+
+# Softmax-phase latency investigation (canonical fp8 prefill, b1 sq=sk=75600 hq=hk=5 d128 non-causal)
+
+Current production config (committed): kv128 tile + cooperative K/V load + single-sp +
+wide 32x32x64 MMA + packed shift + packed alu1 rescale. Standalone kernel-only median
+**1782 TF/s** (== ~1774 TF/s on the contiguous prod path; the python paged path is
+~1483 TF/s — paging addressing overhead, separate axis). The wide-MMA fp8 accuracy
+regression flagged below is **FIXED** (CK f947db93f "fix wide-MMA FP8 P relayout":
+the cvt-only P relayout was missing the QK-C->PV-A transpose); full regression matrix
++ standalone check now PASS, and the python harness reports CK-vs-ref PASS.
+
+## What landed (committed, CK 29e0f75e1)
+- **Packed score shift** (`UA_FA4_PACKED_SHIFT`): 64 scalar `v_fma_f32` -> 32
+  `v_pk_fma_f32` (addend `-scale_s*max` is per-thread uniform). +4.5%, bit-identical.
+- **Packed alu1 o_acc rescale** (`UA_FA4_PACKED_ALU1_RESCALE`): 6 `v_mul_f32` ->
+  3 `v_pk_mul_f32`. +4%, bit-identical. Net **+8%** over the prior 1649 baseline.
+
+## Softmax COMPUTE is already hidden — it is not the wall-time gate at this shape
+Per-warp-group ATT phase breakdown (busy+stall, sq=8192 trace, repeated per tile):
+
+| phase | exec | stall | %wave |
+|---|--:|--:|--:|
+| softmax | 72747 | 39628 | **33.8%** |
+| barrier | 1161 | **52720** | 16.2% |
+| memwait | 6426 | **41508** | 14.4% |
+| matrix | 7041 | 28732 | 10.8% |
+| lds | 18760 | 12300 | 9.4% |
+
+softmax has the largest *exec*, but matrix is only 10.8% (the user's "matrix is hidden
+under softmax" is correct) — and the largest *stalls* are barrier (52720) + memwait
+(41508) = the ping-pong rendezvous waiting on K/V DRAM latency. softmax exec overlaps
+the peer warp-group's matrix/load, so cutting softmax *instruction count* mostly
+converts to more barrier stall rather than less wall time. This matches the kv128
+memory-latency-bound conclusion above.
+
+Evidence (all at the real sq=75600 shape, kernel-only median, 3+ runs each):
+- **exp2 Schraudolph approx** (`UA_FA4_EXP2_APPROX=1`, replaces 64 quarter-rate
+  `v_exp_f32` with full-rate `v_cvt_u32_f32`): **-11%** (1782 -> 1587). The cvt/finish
+  path adds ALU on the critical chain and the exp throughput it removes was hidden.
+  Hard loser; default OFF.
+- **Split rowmax ahead of PV gemm** (`UA_FA4_SPLIT_ROWMAX=1`): emit `fmha_alu0_rowmax`
+  before `gemm_1(PV)` and `fmha_alu0_shift` after, so the MFMA cluster hides the
+  reduce->shift-addend chain. **Neutral** (1782 either way), bit-identical. The post-RA
+  scheduler already groups instructions per the core-loop `sched_group_barrier` hints,
+  so source-level reorder does not move the emitted schedule. Kept as a default-OFF
+  structural hook (`fmha_alu0` is split into rowmax/shift lambdas; the combined call
+  is byte-for-byte the original). Moving the rowmax earlier in the *schedule* would
+  require editing the `sched_group_barrier` hints, not the call order.
+
+## Recommended next lever
+softmax compute is saturated against the overlap; the real headroom is the
+barrier+memwait stall (~30% of the wave), i.e. **memory-latency hiding** — deeper K/V
+prefetch / more in-flight loads / higher occupancy — consistent with the kv128
+"memory-latency-bound, not softmax-bound" finding above. The numeric softmax shortcut
+(rowmax-freeze / conditional rescale, already on via `CONDITIONAL_RESCALE=1`) is the
+only softmax-side lever that removes critical-path *dependency* rather than hidden exec.
