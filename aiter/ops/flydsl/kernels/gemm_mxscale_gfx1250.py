@@ -1462,9 +1462,7 @@ def compile_mxscale_gemm(
                 addrs = []
                 _bf16_out = out_dtype in ("bf16", "f16")
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
-                    row = (
-                        flat_m_base + warp_m_base + arith.index(m_off) + lane16
-                    )
+                    row = flat_m_base + warp_m_base + arith.index(m_off) + lane16
                     col_base = (
                         blk_n
                         + warp_n_base
@@ -2908,25 +2906,23 @@ def compile_mxscale_gemm(
                 num_blocks_in_group = arith.select(
                     use_full_group, k_num_1d, remaining_primary
                 )
-                in_m = in_group_idx - (
-                    in_group_idx / num_blocks_in_group
-                ) * num_blocks_in_group
+                in_m = (
+                    in_group_idx
+                    - (in_group_idx / num_blocks_in_group) * num_blocks_in_group
+                )
                 flat_m_tile = first_block_idx + in_m
                 by_contig = in_group_idx / num_blocks_in_group
 
                 m_tile_active = arith.cmpi(
                     arith.CmpIPredicate.slt, flat_m_tile, primary_num_blocks
                 )
-                n_tile_active = arith.cmpi(
-                    arith.CmpIPredicate.slt, by_contig, n_tiles
-                )
+                n_tile_active = arith.cmpi(arith.CmpIPredicate.slt, by_contig, n_tiles)
                 tile_active = arith.andi(m_tile_active, n_tile_active)
                 tile_if = scf.IfOp(tile_active, results_=[], has_else=False)
                 with ir.InsertionPoint(tile_if.then_block):
                     layout_row = flat_m_tile * arith.index(tile_m)
                     layout_row_i32 = arith.index_cast(T.i32, layout_row)
                     c0_i32 = arith.constant(0, type=T.i32)
-                    c1_i32 = arith.constant(1, type=T.i32)
                     c_tile_m_i32 = arith.constant(tile_m, type=T.i32)
                     c_tile_m_minus_1_i32 = arith.constant(tile_m - 1, type=T.i32)
                     c_false = arith.constant(0, type=ir.IntegerType.get_signless(1))
@@ -2956,21 +2952,15 @@ def compile_mxscale_gemm(
                         arith.CmpIPredicate.slt, layout_row_i32, actual_end
                     )
                     row_in_group = arith.andi(row_ge_start, row_lt_end)
-                    not_found = arith.cmpi(
-                        arith.CmpIPredicate.eq, found, c_false
-                    )
+                    not_found = arith.cmpi(arith.CmpIPredicate.eq, found, c_false)
                     take_group = arith.andi(not_found, row_in_group)
                     next_found = arith.ori(found, take_group)
                     next_group = arith.select(take_group, e_i32, found_group)
-                    next_found_start = arith.select(
-                        take_group, cur_start, found_start
-                    )
+                    next_found_start = arith.select(take_group, cur_start, found_start)
                     next_start = (
                         (actual_end + c_tile_m_minus_1_i32) // c_tile_m_i32
                     ) * c_tile_m_i32
-                    scf.YieldOp(
-                        [next_found, next_group, next_start, next_found_start]
-                    )
+                    scf.YieldOp([next_found, next_group, next_start, next_found_start])
                     e_ip.__exit__(None, None, None)
                     group_active = e_loop.results[0]
                     batch_i32 = e_loop.results[1]

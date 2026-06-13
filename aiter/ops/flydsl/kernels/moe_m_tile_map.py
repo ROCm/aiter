@@ -24,7 +24,6 @@ from flydsl.expr import arith, buffer_ops
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import T, Int32
 
-
 BLOCK_THREADS = 256
 
 
@@ -130,10 +129,9 @@ def build_moe_m_tile_map_module():
             max_tiles_idx = arith.index_cast(T.index, max_m_tiles)
             c0 = arith.constant(0, index=True)
             c1 = arith.constant(1, index=True)
-            trips = (
-                max_tiles_idx
-                + arith.index(BLOCK_THREADS - 1)
-            ) / arith.index(BLOCK_THREADS)
+            trips = (max_tiles_idx + arith.index(BLOCK_THREADS - 1)) / arith.index(
+                BLOCK_THREADS
+            )
 
             loop = scf.ForOp(c0, trips, c1)
             loop_ip = ir.InsertionPoint(loop.body)
@@ -143,7 +141,9 @@ def build_moe_m_tile_map_module():
             tile_ok = arith.cmpi(CmpIPredicate.ult, local_tile, tiles)
             if_tile = scf.IfOp(tile_ok)
             with ir.InsertionPoint(if_tile.then_block):
-                buffer_ops.buffer_store(e_base + local_tile, map_rsrc, prefix + local_tile)
+                buffer_ops.buffer_store(
+                    e_base + local_tile, map_rsrc, prefix + local_tile
+                )
                 scf.YieldOp([])
             scf.YieldOp([])
             loop_ip.__exit__(None, None, None)

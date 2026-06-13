@@ -667,9 +667,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # Persistent-M uses compact prefix/map from per-expert masked_m counts.
     # Contiguous (DeepGEMM-style) uses a dense expert×M-tile layout instead.
     effective_grouped_contiguous_m = bool(grouped_contiguous_m)
-    effective_grouped_persistent_m = (
-        bool(grouped_persistent_m) and not _capturing
-    )
+    effective_grouped_persistent_m = bool(grouped_persistent_m) and not _capturing
     if not _use_naive and (
         effective_grouped_persistent_m or effective_grouped_contiguous_m
     ):
@@ -845,7 +843,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # scatter + _grouped_a8w4_preshuffle_e8m0_scale (naive path).
     _grouped_dbg("scale layout done")
 
-    grouped_a2 = torch.empty((route_E, route_max_m, inter_dim), dtype=dtype, device=device)
+    grouped_a2 = torch.empty(
+        (route_E, route_max_m, inter_dim), dtype=dtype, device=device
+    )
     stage1_compiler = (
         compile_moe_grouped_gemm1_mxfp4_masked
         if data_format == "fp4"
@@ -982,7 +982,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             scale_k_per_tile=tile_k // 32,
         )
     _grouped_dbg("a2 scale layout done")
-    grouped_out = torch.empty((route_E, route_max_m, model_dim), dtype=dtype, device=device)
+    grouped_out = torch.empty(
+        (route_E, route_max_m, model_dim), dtype=dtype, device=device
+    )
     stage2_compiler = (
         compile_moe_grouped_gemm2_mxfp4_masked
         if data_format == "fp4"

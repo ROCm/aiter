@@ -18,7 +18,6 @@ chosen like DeepGEMM's ``get_num_1d_blocks_per_group`` (candidates 8/16).
 from __future__ import annotations
 
 import functools
-import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -208,6 +207,7 @@ def _make_m_tile_map(
     )
     return m_tile_map
 
+
 def _check_rank(name: str, tensor: torch.Tensor, rank: int) -> None:
     if tensor.dim() != rank:
         raise ValueError(f"{name} must be rank-{rank}, got shape={tuple(tensor.shape)}")
@@ -273,8 +273,14 @@ def _check_stage1_args(
     pack_a, pack_b = _pack_factors(cfg)
     if cfg.grouped_contiguous_m:
         if y.shape[0] != 1 or y.shape[2] != cfg.inter_dim:
-            raise ValueError(f"y must be flat (1, m, {cfg.inter_dim}), got {tuple(y.shape)}")
-        if x.shape[0] != 1 or x.shape[1] != y.shape[1] or x.shape[2] != cfg.model_dim // pack_a:
+            raise ValueError(
+                f"y must be flat (1, m, {cfg.inter_dim}), got {tuple(y.shape)}"
+            )
+        if (
+            x.shape[0] != 1
+            or x.shape[1] != y.shape[1]
+            or x.shape[2] != cfg.model_dim // pack_a
+        ):
             raise ValueError(
                 f"x must be flat (1, {y.shape[1]}, {cfg.model_dim // pack_a}), got {tuple(x.shape)}"
             )
@@ -641,8 +647,14 @@ def _check_stage2_args(
     pack_a, pack_b = _pack_factors(cfg)
     if cfg.grouped_contiguous_m:
         if y.shape[0] != 1 or y.shape[2] != cfg.model_dim:
-            raise ValueError(f"y must be flat (1, m, {cfg.model_dim}), got {tuple(y.shape)}")
-        if x.shape[0] != 1 or x.shape[1] != y.shape[1] or x.shape[2] != cfg.inter_dim // pack_a:
+            raise ValueError(
+                f"y must be flat (1, m, {cfg.model_dim}), got {tuple(y.shape)}"
+            )
+        if (
+            x.shape[0] != 1
+            or x.shape[1] != y.shape[1]
+            or x.shape[2] != cfg.inter_dim // pack_a
+        ):
             raise ValueError(
                 f"x must be flat (1, {y.shape[1]}, {cfg.inter_dim // pack_a}), got {tuple(x.shape)}"
             )
@@ -852,7 +864,10 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     def _get_raw_base():
         if "raw_base" not in _lazy:
             _lazy["raw_base"] = _compile_base_a8w4_gemm(
-                K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg, kernel_tag=f"gemm1_raw_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}"
+                K=cfg.model_dim,
+                N=2 * cfg.inter_dim,
+                cfg=cfg,
+                kernel_tag=f"gemm1_raw_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}",
             )
         return _lazy["raw_base"]
 
@@ -1208,7 +1223,10 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     def _get_base():
         if "base" not in _lazy2:
             _lazy2["base"] = _compile_base_a8w4_gemm(
-                K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, kernel_tag=f"gemm2_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_mode{grouped_contiguous_m}"
+                K=cfg.inter_dim,
+                N=cfg.model_dim,
+                cfg=cfg,
+                kernel_tag=f"gemm2_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_mode{grouped_contiguous_m}",
             )
         return _lazy2["base"]
 
