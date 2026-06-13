@@ -1,0 +1,1 @@
+gfx,cu_num,num_query_heads,num_kv_heads,head_size,block_size,q_dtype,kv_dtype,sliding_window,has_sinks,phase,ctx_bucket,bs_bucket,kernel,TILE_SIZE,NUM_SEGMENTS,BLOCK_M,num_warps,num_stages,waves_per_eu,us,errRatio,_tag

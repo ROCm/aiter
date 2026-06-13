@@ -107,6 +107,11 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
+AITER_CONFIG_UA = os.getenv(
+    "AITER_CONFIG_UA",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_ua.csv",
+)
+
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
@@ -164,6 +169,10 @@ class AITER_CONFIG(object):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
         )
+
+    @property
+    def AITER_CONFIG_UA_FILE(self):
+        return self.get_config_file("AITER_CONFIG_UA", AITER_CONFIG_UA, "tuned_ua")
 
     @property
     def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE(self):

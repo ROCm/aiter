@@ -1,0 +1,16 @@
+num_query_heads,num_kv_heads,head_size,block_size,q_dtype,kv_dtype,sliding_window,has_sinks,phase,ctx_bucket,bs_bucket
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,1,decode,2048,64
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,1,decode,8192,64
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,1,decode,32768,64
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,1,decode,65536,64
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,1,decode,131072,64
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,1,decode,2048,256
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,1,decode,8192,256
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,1,decode,32768,256
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,1,decode,131072,256
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,1,decode,131072,2147483647
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,128,1,decode,8192,64
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,1,prefill,8192,16
+64,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,1,prefill,131072,16
+48,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,0,decode,8192,64
+48,8,64,64,torch.bfloat16,torch.float8_e4m3fn,0,0,decode,131072,64

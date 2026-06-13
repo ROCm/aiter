@@ -27,11 +27,31 @@ except:  # noqa: E722
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+from aiter.ops.triton.utils import ua_config as _ua_config
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
+
+
+def _apply_2d_override(config, override, num_queries_per_kv, allow_block_m):
+    """Overlay a tuned 2D launch config (from the per-model table) in place."""
+    # BLOCK_M is only meaningful for large prefill; gating it on the heuristic's
+    # own max_seqlen_q>=256 condition avoids forcing a wide tile on a small
+    # (e.g. chunked-prefill) query that the prefill row was not tuned for.
+    if allow_block_m and override.get("BLOCK_M"):
+        block_m = override["BLOCK_M"]
+        block_q = block_m // num_queries_per_kv
+        if block_q >= 1:
+            config["BLOCK_M"] = block_m
+            config["BLOCK_Q"] = block_q
+    for field in ("TILE_SIZE", "num_warps", "num_stages"):
+        if override.get(field):
+            config[field] = override[field]
+    if override.get("waves_per_eu") is not None:
+        config["waves_per_eu"] = override["waves_per_eu"]
+    return config
 
 
 def is_2d_gluon_available(
@@ -62,6 +82,7 @@ def select_2d_config(
     q_dtype,
     kv_cache_dtype,
     shuffled_kv_cache,
+    ua_override=None,
 ):
     arch = get_arch()
 
@@ -104,7 +125,7 @@ def select_2d_config(
     elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
         TILE_SIZE = max(32, TILE_SIZE)
 
-    return {
+    config = {
         "BLOCK_M": BLOCK_M,
         "BLOCK_Q": BLOCK_Q,
         "TILE_SIZE": TILE_SIZE,
@@ -112,6 +133,13 @@ def select_2d_config(
         "num_stages": num_stages_2d,
         "waves_per_eu": waves_per_eu,
     }
+    if ua_override is not None and ua_override.get("kernel") == "2d":
+        _apply_2d_override(
+            config, ua_override, num_queries_per_kv, allow_block_m=max_seqlen_q >= 256
+        )
+        if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+            config["TILE_SIZE"] = max(32, config["TILE_SIZE"])
+    return config
 
 
 def select_3d_config(
@@ -124,6 +152,7 @@ def select_3d_config(
     kv_cache_dtype: torch.dtype,
     shuffled_kv_cache: bool = False,
     NUM_BLOCKS_GATHER_PER_TILE: int = 1,
+    ua_override=None,
 ):
     # TODO: wait for Triton compiler to support ds_load_tr4 before we can include torch.uint8 kv_cache_dtype
     # assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, torch.uint8, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8})"
@@ -214,6 +243,30 @@ def select_3d_config(
             TILE_SIZE % block_size == 0
         ), "TILE_SIZE needs to be divisible by block_size"
         NUM_BLOCKS_GATHER_PER_TILE = TILE_SIZE // block_size
+
+    # Overlay a tuned 3D config; clamp segments to the live seqlen so a
+    # long-context config cannot over-segment a short one.
+    if (
+        ua_override is not None
+        and ua_override.get("kernel") == "3d"
+        and NUM_BLOCKS_GATHER_PER_TILE == 1
+    ):
+        if ua_override.get("TILE_SIZE"):
+            TILE_SIZE = ua_override["TILE_SIZE"]
+            if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+                TILE_SIZE = max(32, TILE_SIZE)
+        if ua_override.get("num_warps"):
+            attn_warps = ua_override["num_warps"]
+        if ua_override.get("num_stages"):
+            attn_stages = ua_override["num_stages"]
+        if ua_override.get("waves_per_eu") is not None:
+            waves_per_eu = ua_override["waves_per_eu"]
+        if ua_override.get("NUM_SEGMENTS"):
+            num_segments = ua_override["NUM_SEGMENTS"]
+        max_seg = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+        min_seg = min(8, max_seg)
+        num_segments = max(min(num_segments, max_seg), min_seg)
+        reduce_num_warps = 1 if num_segments == min_seg else 2
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
@@ -356,16 +409,49 @@ def unified_attention(
         total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = int(max_seqlen_q) == 1
-    # if batch contains a prefill
-    if use_2d_kernel(
-        head_size,
-        SLIDING_WINDOW,
-        ALL_DECODE,
-        max_seqlen_q,
-        max_seqlen_k,
-        target_num_prgms,
-        num_2d_prgms,
+
+    # Per-model tuned config (non-gfx12, non-shuffled, bf16/fp8 only; nvfp4
+    # doubles head_size above so it would key inconsistently). None keeps the
+    # heuristics and is threaded into select_*_config.
+    ua_override = None
+    if (
+        not IS_DEVICE_ARCH_GFX12
+        and not shuffled_kv_cache
+        and q_dtype != torch.uint8
+        and kv_cache_dtype != torch.uint8
     ):
+        ua_override = _ua_config.get_ua_config(
+            gfx=DEVICE_ARCH,
+            cu_num=cu_count,
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            block_size=block_size,
+            q_dtype=q_dtype,
+            kv_dtype=kv_cache_dtype,
+            sliding_window=SLIDING_WINDOW,
+            has_sinks=sinks is not None,
+            phase="decode" if ALL_DECODE else "prefill",
+            max_seqlen_k=max_seqlen_k,
+            num_seqs=num_seqs,
+        )
+
+    # Hard constraints the table cannot override: SWA / short context stay 2D.
+    force_2d = (SLIDING_WINDOW > 0) or (max_seqlen_k <= 512)
+    if ua_override is not None and not force_2d:
+        use_2d = ua_override["kernel"] == "2d"
+    else:
+        use_2d = use_2d_kernel(
+            head_size,
+            SLIDING_WINDOW,
+            ALL_DECODE,
+            max_seqlen_q,
+            max_seqlen_k,
+            target_num_prgms,
+            num_2d_prgms,
+        )
+    # if batch contains a prefill
+    if use_2d:
 
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
         # sinks / output_scale / shuffled_kv_cache)
@@ -407,6 +493,7 @@ def unified_attention(
                 q_dtype,
                 kv_cache_dtype,
                 shuffled_kv_cache,
+                ua_override=ua_override,
             )
             assert config["BLOCK_Q"] >= 1
             if ALL_DECODE:
@@ -480,6 +567,7 @@ def unified_attention(
             kv_cache_dtype,
             shuffled_kv_cache,
             NUM_BLOCKS_GATHER_PER_TILE,
+            ua_override=ua_override,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         if NUM_SEGMENTS > 1:
