@@ -4,9 +4,38 @@
 import torch
 import torch.nn.functional as F
 import pytest
-from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16, _is_gluon_available
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
+
+
+def is_gluon_supported():
+    """gluon a16w16 kernels are only available on supported archs (gfx1250)."""
+    return _is_gluon_available()
+
+
+def _skip_if_gluon_unaligned_k(backend, M, N, K):
+    """The gluon a16w16 kernels require K to be a multiple of BLOCK_K (no host
+    K-padding); triton handles any K, so only skip the gluon backend."""
+    if backend != "gluon":
+        return
+    cfg, _ = get_gemm_config("GEMM-A16W16", M, N, K)
+    if K % cfg["BLOCK_K"] != 0:
+        pytest.skip(
+            f"gluon a16w16 requires K % BLOCK_K == 0 (K={K}, BLOCK_K={cfg['BLOCK_K']})"
+        )
+
+
+def _skip_if_triton_on_gfx1250(backend):
+    """gfx1250 only ships gluon-format a16w16 configs, so the triton backend has
+    no usable config there; skip the triton backend on gfx1250."""
+    if backend != "triton":
+        return
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if "gfx1250" in (get_arch() or ""):
+        pytest.skip("triton backend has no gfx1250 a16w16 config (gluon-only arch)")
 
 
 def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=False):
@@ -54,7 +83,16 @@ def get_x_vals():
 
 # Test plain BF16 GEMMs - the most common types.
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-def test_gemm_a16_w16(M: int, N: int, K: int):
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
+def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
+    if backend == "triton" and kernel_type != "bandwidth_bound":
+        pytest.skip("kernel_type only applies to the gluon backend")
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    _skip_if_triton_on_gfx1250(backend)
+    _skip_if_gluon_unaligned_k(backend, M, N, K)
+
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
         M,
         N,
@@ -65,10 +103,7 @@ def test_gemm_a16_w16(M: int, N: int, K: int):
 
     torch_out = F.linear(x, w, bias=None)
 
-    triton_out = gemm_a16w16(
-        x,
-        w,
-    )
+    triton_out = gemm_a16w16(x, w, backend=backend, kernel_type=kernel_type)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
@@ -89,7 +124,18 @@ def get_fewer_x_vals():
 @pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activation):
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
+def test_gemm_a16_w16_activation(
+    M: int, N: int, K: int, dtype, output, activation, backend, kernel_type
+):
+    if backend == "triton" and kernel_type != "bandwidth_bound":
+        pytest.skip("kernel_type only applies to the gluon backend")
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    _skip_if_triton_on_gfx1250(backend)
+    _skip_if_gluon_unaligned_k(backend, M, N, K)
+
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
         M,
         N,
@@ -113,6 +159,8 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
         out_dtype,
         y,
         activation=activation,
+        backend=backend,
+        kernel_type=kernel_type,
     )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
@@ -120,7 +168,16 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
-def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout):
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
+def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_type):
+    if backend == "triton" and kernel_type != "bandwidth_bound":
+        pytest.skip("kernel_type only applies to the gluon backend")
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    _skip_if_triton_on_gfx1250(backend)
+    _skip_if_gluon_unaligned_k(backend, M, N, K)
+
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
@@ -129,7 +186,9 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout):
 
     torch_out = F.linear(x, w, bias=None)
 
-    triton_out = gemm_a16w16(x, w, None, out_dtype, y)
+    triton_out = gemm_a16w16(
+        x, w, None, out_dtype, y, backend=backend, kernel_type=kernel_type
+    )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
