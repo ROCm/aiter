@@ -30,6 +30,15 @@
 
 namespace aiter {
 
+// Selects which input dim is the scatter dim for reduce_scatter.
+// Python framework collapses the tensor to one of these canonical shapes:
+//   kFirst : input flattened to (k,)             ; only `k` used (= numel)
+//   kLast  : input reshaped  to (n, k)           ; `m=0`, n/k used
+//   kMid   : input reshaped  to (m, n, k)        ; all three used
+// In all cases `n` (or `k` for kFirst) is the INPUT dim length; output's
+// corresponding dim = input_dim / ngpus.
+enum class ReduceScatterSplitDim : int { kFirst = 0, kLast = 1, kMid = 2 };
+
 constexpr int kMaxBlocks = 80;
 // note: we don't want to use atomics for signals because peer atomics are no
 // supported on PCIe links
@@ -764,16 +773,22 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
     }
 }
 
-/*
- * reduce_scatter, at first dim
- * range = size / (pack_size * ngpu)
- * for case:
- *  input:(ngpus * n) -> output:(n)
- *  input:(ngpus * m, n, ...) -> output(m, n, ...)
- * cond: size % (pack_size * ngpus) == 0
- * */
+// ========== reduce_scatter kernel start ==========
+//
+// reduce_scatter has 3 categories depending on where the scatter dim sits in
+// the input tensor. Any higher-rank tensor can be collapsed into one of these
+// shapes by flattening the dims before / after the scatter dim:
+//   - scatter dim is the first  dim: input(ngpus*m, n[, ...])      -> output(m, n[, ...])
+//   - scatter dim is the last   dim: input(m, ngpus*n)             -> output(m, n)
+//   - scatter dim is a middle   dim: input(m, ngpus*n, k)          -> output(m, n, k)
+// Each non-first-dim case has a vectorized kernel (pack 16B per thread) and a
+// naive fallback for shapes that cannot be vectorized along the inner dim.
+//
+// reduce_scatter, scatter on first dim.
+// Note: `range` is the per-rank packed element count, i.e. total_elems / (ngpus * pack_size).
+// cond: total_elems % (ngpus * pack_size) == 0
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) reduce_scatter_first_dim(
+__global__ void __launch_bounds__(512, 1) reduce_scatter_split_first_dim(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int range)
 {
     int tid                 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -798,6 +813,148 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_first_dim(
             packed_reduce<P, ngpus, A>(ptrs, load_index);
     }
 }
+
+// reduce_scatter, scatter on last dim — naive (non-vectorized) fallback.
+// Use when the last dim cannot be vectorized along pack_size
+// (e.g. n % (ngpus * pack_size) != 0). Slower than the vectorized version.
+// Params: `n` is the input's last-dim length; output's last dim = n / ngpus.
+// cond: n % ngpus == 0
+// shape: input (m, n) -> output (m, n / ngpus)
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim_naive(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int m, int n
+)
+{
+  int size = m * n / ngpus;
+  int splited_n = n / ngpus;
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const T* ptrs[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; ++i)
+  {
+    int target = (rank + i) % ngpus;
+    ptrs[i] = (const T*)_dp->ptrs[target];
+  }
+  start_sync<ngpus>(sg, self_sg, rank);
+  for (int i = index; i < size; i += blockDim.x * gridDim.x)
+  {
+    int index_x = i % splited_n;
+    int index_y = i / splited_n;
+    int load_index = index_y * n + rank * splited_n + index_x;
+    opus::fp32_t rslt_reg = 0.0f;
+#pragma unroll
+    for (int j = 0; j < ngpus; ++j)
+    {
+      rslt_reg += upcast_s(ptrs[j][load_index]);
+    }
+    result[i] = downcast_s<T>(rslt_reg);
+  }
+}
+
+// reduce_scatter, scatter on last dim — vectorized (16B / thread).
+// Params: `n` is the input's last-dim length; output's last dim = n / ngpus.
+// cond: n % (ngpus * pack_size) == 0
+// shape: input (m, n) -> output (m, n / ngpus)
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int m, int n
+)
+{
+  constexpr int pack_size = 16 / sizeof(T);
+  using P = typename opus::vector_t<T, pack_size>;
+  using A = typename opus::vector_t<opus::fp32_t, pack_size>;
+  int size = m * n / (ngpus * pack_size);
+  int splited_n = n / (ngpus * pack_size);
+  int packed_dim_n = n / pack_size;
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const P* ptrs[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; ++i)
+  {
+    int target = (rank + i) % ngpus;
+    ptrs[i] = (const P*)_dp->ptrs[target];
+  }
+  start_sync<ngpus>(sg, self_sg, rank);
+  for (int i = index; i < size; i += blockDim.x * gridDim.x)
+  {
+    int index_x = i % splited_n;
+    int index_y = i / splited_n;
+    int load_index = index_y * packed_dim_n + rank * splited_n + index_x;
+    *(reinterpret_cast<P*>(result) + i) = packed_reduce<P, ngpus, A>(ptrs, load_index);
+  }
+}
+
+// reduce_scatter, scatter on middle dim — naive (non-vectorized) fallback.
+// Use when the inner dim `k` cannot be vectorized (k % pack_size != 0).
+// Params: `n` is the input's middle-dim length; output's middle dim = n / ngpus.
+// cond: n % ngpus == 0
+// shape: input (m, n, k) -> output (m, n / ngpus, k)
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim_naive(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int m, int n, int k
+)
+{
+  int size = m * n * k / ngpus;
+  int splited_n = n / ngpus;
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const T* ptrs[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; ++i)
+  {
+    int target = (rank + i) % ngpus;
+    ptrs[i] = (const T*)_dp->ptrs[target];
+  }
+  start_sync<ngpus>(sg, self_sg, rank);
+  for (int i = index; i < size; i += blockDim.x * gridDim.x)
+  {
+    int index_m = i / (splited_n * k);
+    int index_n = (i % (splited_n * k)) / k;
+    int index_k = (i % (splited_n * k)) % k;
+    int load_index = index_m * (n * k) + (rank * splited_n + index_n) * k + index_k;
+    opus::fp32_t rslt_reg = 0.0f;
+#pragma unroll
+    for (int j = 0; j < ngpus; ++j)
+    {
+      rslt_reg += upcast_s(ptrs[j][load_index]);
+    }
+    result[i] = downcast_s<T>(rslt_reg);
+  }
+}
+
+// reduce_scatter, scatter on middle dim — vectorized (16B / thread along k).
+// Params: `n` is the input's middle-dim length; output's middle dim = n / ngpus.
+// cond: n % ngpus == 0 && k % pack_size == 0
+// shape: input (m, n, k) -> output (m, n / ngpus, k)
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int m, int n, int k
+)
+{
+  constexpr int pack_size = 16 / sizeof(T);
+  using P = typename opus::vector_t<T, pack_size>;
+  using A = typename opus::vector_t<opus::fp32_t, pack_size>;
+  int size = m * n * k / (pack_size * ngpus);
+  int splited_n = n / ngpus;
+  int packed_dim_k = k / pack_size;
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const P* ptrs[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; ++i)
+  {
+    int target = (rank + i) % ngpus;
+    ptrs[i] = (const P*)_dp->ptrs[target];
+  }
+  start_sync<ngpus>(sg, self_sg, rank);
+  for (int i = index; i < size; i += blockDim.x * gridDim.x)
+  {
+    int index_m = i / (splited_n * packed_dim_k);
+    int index_n = (i % (splited_n * packed_dim_k)) / packed_dim_k;
+    int index_k = (i % (splited_n * packed_dim_k)) % packed_dim_k;
+    int load_index = index_m * (n * packed_dim_k) + (rank * splited_n + index_n) * packed_dim_k + index_k;
+    *(reinterpret_cast<P*>(result) + i) = packed_reduce<P, ngpus, A>(ptrs, load_index);
+  }
+}
+// ========== reduce_scatter kernel end ==========
 
 // fp8 quant all-reduce code start
 template <typename T>
@@ -3400,30 +3557,102 @@ class CustomAllreduce
 #undef KL
 }
 
+// reduce_scatter dispatch. Python wrapper is responsible for:
+//   - normalizing dim < 0
+//   - rejecting shapes where n (or k, for kFirst) % ngpus != 0
+//   - falling back to an external library when scatter is on the first dim
+//     AND the flattened size cannot be vectorized (numel % (ngpus*pack) != 0)
+//
+// For kLast / kMid, this dispatcher auto-falls-back to the naive kernel when
+// the inner dim cannot be vectorized; both kernels live in this file.
 template <typename T>
-void dispatchReduceScatter(hipStream_t stream, T* input, T* output, int size)
+void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
+                           int m, int n, int k,
+                           ReduceScatterSplitDim split_dim)
 {
-    RankData* ptrs = get_buffer_RD(stream, input);
-    auto d         = 16 / sizeof(T);
-    int range      = size / (world_size_ * d);
-    dim3 block(512);
-    int block_num = (range + 511) / 512;
-    dim3 grid(std::min(16, block_num));
-    switch(world_size_)
+    RankData* ptrs          = get_buffer_RD(stream, input);
+    constexpr int pack_size = 16 / sizeof(T);
+    constexpr int kGridCap  = 80;  // bounded by signal slots (see kMaxBlocks)
+
+    switch(split_dim)
     {
-    case 8:
-        reduce_scatter_first_dim<T, 8>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+    case ReduceScatterSplitDim::kFirst: {
+        // Python guarantees k % (ngpus * pack_size) == 0 here.
+        int range = k / (world_size_ * pack_size);
+        dim3 block(512);
+        dim3 grid(std::min(kGridCap, (range + 511) / 512));
+        switch(world_size_)
+        {
+        case 8:
+            reduce_scatter_split_first_dim<T, 8>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+            break;
+        case 4:
+            reduce_scatter_split_first_dim<T, 4>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+            break;
+        case 2:
+            reduce_scatter_split_first_dim<T, 2>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+            break;
+        default: printf("reduce_scatter world_size error!\n");
+        }
         break;
-    case 4:
-        reduce_scatter_first_dim<T, 4>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+    }
+    case ReduceScatterSplitDim::kLast: {
+        // Framework passes (n_f, k_f); kernel signature is (m, n) where
+        // kernel.m = n_f, kernel.n = k_f. n % ngpus is guaranteed by Python.
+        bool vec  = (k % (world_size_ * pack_size) == 0);
+        int size  = vec ? (n * k) / (world_size_ * pack_size)
+                        : (n * k) / world_size_;
+        dim3 block(256);
+        dim3 grid(std::min(kGridCap, (size + 255) / 256));
+#define LAUNCH_LAST(NG)                                                                       \
+    do {                                                                                      \
+        if(vec)                                                                               \
+            reduce_scatter_split_lastdim<T, NG>                                               \
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, n, k);       \
+        else                                                                                  \
+            reduce_scatter_split_lastdim_naive<T, NG>                                         \
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, n, k);       \
+    } while(0)
+        switch(world_size_)
+        {
+        case 8: LAUNCH_LAST(8); break;
+        case 4: LAUNCH_LAST(4); break;
+        case 2: LAUNCH_LAST(2); break;
+        default: printf("reduce_scatter world_size error!\n");
+        }
+#undef LAUNCH_LAST
         break;
-    case 2:
-        reduce_scatter_first_dim<T, 2>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+    }
+    case ReduceScatterSplitDim::kMid: {
+        // n is the input's middle-dim length; n % ngpus is guaranteed by Python.
+        bool vec  = (k % pack_size == 0);
+        int size  = vec ? (m * n * k) / (world_size_ * pack_size)
+                        : (m * n * k) / world_size_;
+        dim3 block(256);
+        dim3 grid(std::min(kGridCap, (size + 255) / 256));
+#define LAUNCH_MID(NG)                                                                        \
+    do {                                                                                      \
+        if(vec)                                                                               \
+            reduce_scatter_split_middim<T, NG>                                                \
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, n, k);    \
+        else                                                                                  \
+            reduce_scatter_split_middim_naive<T, NG>                                          \
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, m, n, k);    \
+    } while(0)
+        switch(world_size_)
+        {
+        case 8: LAUNCH_MID(8); break;
+        case 4: LAUNCH_MID(4); break;
+        case 2: LAUNCH_MID(2); break;
+        default: printf("reduce_scatter world_size error!\n");
+        }
+#undef LAUNCH_MID
         break;
-    default: printf("reduce_scatter world_size error!\n");
+    }
+    default: printf("reduce_scatter split_dim error!\n");
     }
 }
 
