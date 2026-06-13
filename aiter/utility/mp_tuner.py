@@ -282,10 +282,10 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
         return rets
 
     except Exception as e:
-        print(f"Critical error in work_group: {e}")
-        # import traceback
+        import traceback
 
-        # traceback.print_exc()
+        print(f"Critical error in work_group: {e!r}")
+        traceback.print_exc()
         # Return dummy failed results for all tasks in the group
         if isinstance(tasks, list):
             return [
