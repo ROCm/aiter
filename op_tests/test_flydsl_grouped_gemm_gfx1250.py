@@ -651,6 +651,34 @@ def _bench(args: argparse.Namespace) -> None:
         def _thunk():
             return _invoke_grouped_fused_moe(fused_case)
 
+        # AITER_GROUPED_PROFILE=1: torch profiler trace for hunting stray copies.
+        if os.environ.get("AITER_GROUPED_PROFILE", "0") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        ):
+            from torch.profiler import ProfilerActivity, profile
+
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                with_stack=True,
+            ) as prof:
+                for _ in range(5):
+                    _invoke_grouped_fused_moe(fused_case)
+                torch.cuda.synchronize()
+            print(
+                prof.key_averages(group_by_stack_n=10).table(
+                    sort_by="self_cuda_time_total", row_limit=30
+                ),
+                flush=True,
+            )
+            trace_path = os.environ.get(
+                "AITER_GROUPED_PROFILE_TRACE", "/tmp/grouped_trace.json"
+            )
+            prof.export_chrome_trace(trace_path)
+            print(f"[bench] chrome trace -> {trace_path}", flush=True)
+
         # run_perftest returns (data, avg_us); the timing is the second value.
         _, us = run_perftest(_thunk, num_warmup=args.warmup, num_iters=args.iters)
         print(

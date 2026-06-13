@@ -4,10 +4,16 @@
 
 This module owns the FlyDSL grouped-GEMM path so the generic ``fused_moe``
 dispatcher does not carry gfx1250-specific implementation details.
+
+Optional **DeepGEMM-style contiguous M-tile** scheduler: set environment
+``AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1`` or CSV column ``grouped_contiguous_m=1``.
+Block swizzle matches ``deep_gemm::Scheduler::get_swizzled_block_idx`` in
+DeepGEMM's ``scheduler.cuh``; optional override ``AITER_DEEPGEMM_NUM_1D_BLOCKS=8|16``.
 """
 
 import os
 import csv
+import functools
 
 from typing import Optional
 
@@ -20,6 +26,29 @@ from aiter.ops.flydsl.moe_common import GateMode
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 _GROUPED_CONFIG_CACHE = {}
+_WARNED_NAIVE_EPILOGUE = False
+# Cache the contiguous uint8 view of static MoE weights so a non-contiguous
+# weight is materialized at most once (not re-copied on every fused_moe call).
+_GROUPED_WEIGHT_CACHE = {}
+
+
+def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
+    """Return a contiguous uint8 view of a (static) MoE weight, cached by buffer.
+
+    Weights don't change across decode/bench steps, so this turns a potential
+    per-call ``.contiguous()`` D2D copy into a one-time cost. Keyed by
+    ``data_ptr`` (weights stay alive, so no buffer-reuse aliasing in practice);
+    the cache is bounded and cleared if it grows unexpectedly.
+    """
+    key = (w.data_ptr(), tuple(w.shape), tuple(w.stride()), str(w.dtype))
+    cached = _GROUPED_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out = (w if w.dtype == torch.uint8 else w.view(torch.uint8)).contiguous()
+    if len(_GROUPED_WEIGHT_CACHE) > 64:
+        _GROUPED_WEIGHT_CACHE.clear()
+    _GROUPED_WEIGHT_CACHE[key] = out
+    return out
 
 
 def _as_bool(value, default: bool) -> bool:
@@ -70,6 +99,25 @@ def _load_grouped_config_rows():
     return rows
 
 
+def _nextPow2(n):
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+_PADDED_M_TIERS = [32768, 131072]
+
+
+def _get_padded_M(M):
+    if M < _PADDED_M_TIERS[0]:
+        return _nextPow2(M)
+    for tier in reversed(_PADDED_M_TIERS):
+        if M >= tier:
+            return tier
+    return _PADDED_M_TIERS[0]
+
+
+@functools.lru_cache(maxsize=1024)
 def _find_grouped_config(
     *,
     token_num: int,
@@ -140,13 +188,50 @@ def _use_grouped_gemm_enabled() -> bool:
     return os.environ.get("AITER_USE_GROUPED_GEMM", "1") in _TRUTHY_ENV
 
 
-def _is_stream_capturing() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    try:
-        return torch.cuda.is_current_stream_capturing()
-    except RuntimeError:
-        return False
+
+def _align_up(value: int, alignment: int) -> int:
+    if alignment <= 0:
+        raise ValueError(f"alignment must be > 0, got {alignment}")
+    return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
+
+
+def _make_contiguous_psum_layout(
+    *,
+    masked_m: torch.Tensor,
+    rows_to_tokens: torch.Tensor,
+    topids_to_rows: torch.Tensor,
+    experts: int,
+    max_m: int,
+    tile_m: int,
+    token_num: int,
+    topk: int,
+):
+    """Build DeepGEMM-style psum layout: grouped_layout[e] = actual_end.
+
+    contiguous_m is a static upper bound (no .item() sync), so this is safe
+    during CUDAGraph capture. Padding rows are never read by GEMM/gather.
+    """
+    device = masked_m.device
+    from aiter.ops.flydsl.moe_kernels import contiguous_psum
+
+    starts_t, psum_t, _ = contiguous_psum(masked_m, int(experts), int(tile_m))
+    ub = int(token_num) * int(topk) + int(experts) * (int(tile_m) - 1)
+    contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
+
+    old_flat = topids_to_rows.reshape(-1)
+    expert = torch.div(old_flat, int(max_m), rounding_mode="floor")
+    slot = old_flat - expert * int(max_m)
+    new_flat = starts_t[expert.to(torch.long)] + slot
+    remapped_topids = new_flat.to(torch.int32).view_as(topids_to_rows)
+
+    # Inverse map (contiguous row -> source token) via one scatter.
+    remapped_rows = torch.full(
+        (int(contiguous_m),), -1, device=device, dtype=torch.int32
+    )
+    src_tokens = rows_to_tokens[old_flat.to(torch.long)]
+    remapped_rows[new_flat.to(torch.long)] = src_tokens
+
+    return remapped_topids, remapped_rows, psum_t, int(contiguous_m)
 
 
 def _grouped_a8w4_preshuffle_e8m0_scale(
@@ -347,6 +432,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if not (is_grouped_a4w4 or is_grouped_a8w4):
         return None
     data_format = "fp4" if is_grouped_a4w4 else "a8w4"
+    # Normalize uint8-viewed fp4 weights back to fp4x2 for CSV key matching.
+    q_dtype_w_key = (
+        dtypes.fp4x2
+        if (q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8)
+        else q_dtype_w
+    )
     _grouped_dbg(f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
         return None
@@ -392,10 +483,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     num_buffers = 2
     split_k1 = 1
     split_k2 = 1
-    grouped_persistent_m = False
-    persistent_workers = None
+    grouped_contiguous_m = False
     cfg_row = _find_grouped_config(
-        token_num=token_num,
+        token_num=_get_padded_M(token_num),
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,
@@ -403,7 +493,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         activation=activation,
         dtype=dtype,
         q_dtype_a=q_dtype_a,
-        q_dtype_w=q_dtype_w,
+        q_dtype_w=q_dtype_w_key,
         quant_type=quant_type,
         gate_mode=gate_mode,
     )
@@ -413,10 +503,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
         split_k1 = _as_int(cfg_row.get("split_k1"), split_k1)
         split_k2 = _as_int(cfg_row.get("split_k2"), split_k2)
-        grouped_persistent_m = _as_bool(
-            cfg_row.get("grouped_persistent_m"), grouped_persistent_m
+        grouped_contiguous_m = _as_bool(
+            cfg_row.get("grouped_contiguous_m"), grouped_contiguous_m
         )
-        persistent_workers = _as_int(cfg_row.get("persistent_workers"), None)
         stage1_weight_layout = (
             cfg_row.get("stage1_weight_layout") or stage1_weight_layout
         )
@@ -426,9 +515,30 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
 
+    if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
+        grouped_contiguous_m = True
+    # Switch to DeepGEMM-style contiguous-M at large batches (env-overridable).
+    _contig_token_threshold = _as_int(
+        os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"), 512
+    )
+    if token_num > _contig_token_threshold:
+        grouped_contiguous_m = True
+        _grouped_dbg(
+            f"token_num={token_num} > {_contig_token_threshold}; "
+            "auto-enable contiguous M scheduler"
+        )
+    if grouped_contiguous_m:
+        _grouped_dbg("DeepGEMM contiguous M scheduler enabled")
+
     # topk_ids is already an integer tensor; keep one flattened view for routing.
     flat_experts = topk_ids.reshape(-1)
-    _capturing = _is_stream_capturing()
+    # [crash-probe] syncs are debug-only; gated by AITER_GROUPED_DEBUG.
+    _grouped_sync_dbg = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    )
     # Expert-id range validation is a debug-only safety check: at decode sizes it
     # issues ~6 tiny launches/iter (lt+ge compare_scalar, two any() reductions)
     # plus a device->host sync from the `or` -- a real hotspot relative to the
@@ -436,33 +546,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # (topk_ids is already produced in-range by the router); set the env to 1 to
     # re-enable the check when diagnosing bad route ids. Skip entirely during
     # CUDAGraph capture (dynamic control flow / sync).
-    if not _capturing and os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
-        "",
-        "0",
-        "false",
-        "False",
-    ):
+    if _grouped_sync_dbg:
         if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
             raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
-    # Default max_m comes directly from token_num. Exact per-call max_m requires
-    # a device->host sync (`counts.max().item()`), so keep it behind an opt-in
-    # switch for benchmarking/tuning.
     counts = None
-    use_actual_max_m = (not _capturing) and os.environ.get(
-        "AITER_GROUPED_USE_ACTUAL_MAX_M", "0"
-    ) in _TRUTHY_ENV
-    if use_actual_max_m:
-        counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
-        raw_max_m = int(counts.max().item()) if counts.numel() else 0
-    else:
-        # Static upper bound: each token routes at most one row per expert, so no
-        # expert can receive more than token_num rows. CUDAGraph buckets have
-        # static token_num/topk; per-expert count <= token_num*topk.
-        raw_max_m = token_num
+    raw_max_m = _as_int(cfg_row.get("max_m"), token_num) if cfg_row else token_num
+    _grouped_dbg(f"routing cfg_row={cfg_row} raw_max_m={raw_max_m}")
     max_m = max(
         warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
     )
-    _grouped_dbg(f"routing max_m={max_m} actual={use_actual_max_m}")
+    _grouped_dbg(f"routing max_m={max_m}")
 
     # Build route maps once. The fast path uses the FlyDSL atomic-scatter kernel;
     # the naive path keeps a deterministic torch fallback for tests/debug.
@@ -492,38 +585,24 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
     m_tile_prefix = None
     m_tile_map = None
-    # Persistent-M needs m_tile_prefix/m_tile_map. Skip both when disabled by
-    # CSV/config, and force flat-grid launch during HIP CUDAGraph capture.
-    effective_grouped_persistent_m = bool(grouped_persistent_m) and not _capturing
-    if not _use_naive and effective_grouped_persistent_m:
-        _m_tile_cfg = _GroupedA8W4Config(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=E,
-            max_m=max_m,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            m_warp=m_warp,
-            n_warp=n_warp,
-            num_buffers=num_buffers,
-            waves_per_eu=None,
-            out_dtype=out_dtype_str,
-            use_tdm_store=True,
-            inst_prefetch=False,
-            wave_specialized_tdm=False,
-            split_k=1,
-            cluster_m=1,
-            cluster_n=1,
-            use_scale_opsel=False,
-            expert_sched_mode=False,
-            grouped_persistent_m=effective_grouped_persistent_m,
-            persistent_workers=persistent_workers,
-            data_format=data_format,
-            act="swiglu" if activation == ActivationType.Swiglu else "silu",
-            stage1_weight_layout=stage1_weight_layout,
+    route_E = E
+    route_max_m = max_m
+    effective_grouped_contiguous_m = bool(grouped_contiguous_m)
+    if not _use_naive and effective_grouped_contiguous_m:
+        topids_to_rows, rows_to_tokens, m_tile_map, contiguous_m = (
+            _make_contiguous_psum_layout(
+                masked_m=masked_m,
+                rows_to_tokens=rows_to_tokens,
+                topids_to_rows=topids_to_rows,
+                experts=E,
+                max_m=max_m,
+                tile_m=tile_m,
+                token_num=token_num,
+                topk=topk,
+            )
         )
-        m_tile_prefix, m_tile_map = _make_m_tile_prefix_map(masked_m, _m_tile_cfg)
+        route_E = 1
+        route_max_m = int(contiguous_m)
 
     def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
         from aiter.ops.triton.quant import dynamic_mxfp8_quant
@@ -554,12 +633,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         a1_payload = a1_quant.view(torch.uint8).contiguous()
         a1_scale_token_u8 = a1_scale_token.view(torch.uint8).contiguous()
         grouped_a1 = torch.empty(
-            (E, max_m, model_dim // 2), dtype=torch.uint8, device=device
+            (route_E, route_max_m, model_dim // 2), dtype=torch.uint8, device=device
         )
         # Only the naive path needs the row-major scale buffer; the fast path
         # gathers + preshuffles the scale in one fused kernel (no a1_scale_raw).
         a1_scale_raw = (
-            torch.empty((E, max_m, model_dim // 32), dtype=torch.uint8, device=device)
+            torch.empty(
+                (route_E, route_max_m, model_dim // 32),
+                dtype=torch.uint8,
+                device=device,
+            )
             if _use_naive
             else None
         )
@@ -569,12 +652,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             hidden_states, model_dim
         )
         grouped_a1 = torch.empty(
-            (E, max_m, model_dim), dtype=torch.uint8, device=device
+            (route_E, route_max_m, model_dim), dtype=torch.uint8, device=device
         )
         # Padding rows decode with scale=1.0. Only the naive path needs the
         # row-major scale buffer; the fast path fuses gather + preshuffle.
         a1_scale_raw = (
-            torch.empty((E, max_m, model_dim // 32), dtype=torch.uint8, device=device)
+            torch.empty(
+                (route_E, route_max_m, model_dim // 32),
+                dtype=torch.uint8,
+                device=device,
+            )
             if _use_naive
             else None
         )
@@ -594,15 +681,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             a1_payload,
             None,
             rows_to_tokens,
-            E,
-            max_m,
+            route_E,
+            route_max_m,
             grouped_a1=grouped_a1,
         )
         grouped_a1_scale = flydsl_moe_scatter_preshuffle_scale(
             a1_scale_token_u8,
             rows_to_tokens,
-            E,
-            max_m,
+            route_E,
+            route_max_m,
             wmma_rep=warp_tile_m // 16,
             scale_k_per_tile=tile_k // 32,
         )
@@ -626,8 +713,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
         _grouped_dbg("route gather done")
 
-    grouped_w1 = (w1 if w1.dtype == torch.uint8 else w1.view(torch.uint8)).contiguous()
-    grouped_w2 = (w2 if w2.dtype == torch.uint8 else w2.view(torch.uint8)).contiguous()
+    grouped_w1 = _grouped_weight_uint8(w1)
+    grouped_w2 = _grouped_weight_uint8(w2)
     _grouped_dbg("weight layout done")
     # Weight scales are already preshuffled per expert.
     _wmma_rep = warp_tile_n // 16
@@ -638,11 +725,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         E, model_dim // _wmma_rep, (inter_dim // 32) * _wmma_rep
     )
 
-    # grouped_a1_scale is produced above: fused gather+preshuffle (fast path) or
-    # scatter + _grouped_a8w4_preshuffle_e8m0_scale (naive path).
+    # grouped_a1_scale already produced above (fast or naive path).
     _grouped_dbg("scale layout done")
 
-    grouped_a2 = torch.empty((E, max_m, inter_dim), dtype=dtype, device=device)
+    grouped_a2 = torch.empty(
+        (route_E, route_max_m, inter_dim), dtype=dtype, device=device
+    )
     stage1_compiler = (
         compile_moe_grouped_gemm1_mxfp4_masked
         if data_format == "fp4"
@@ -663,8 +751,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         num_buffers=num_buffers,
         split_k=split_k1,
         expert_sched_mode=False,
-        grouped_persistent_m=effective_grouped_persistent_m,
-        persistent_workers=persistent_workers,
+        grouped_persistent_m=False,
+        grouped_contiguous_m=effective_grouped_contiguous_m,
+        persistent_workers=None,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
     )
@@ -672,7 +761,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
     if _bias1_arg is not None and _bias1_arg.dtype != dtype:
         _bias1_arg = _bias1_arg.to(dtype)
-    if not _capturing:
+    if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage1 tokens={token_num} max_m={max_m} E={E}")
     stage1(
@@ -691,7 +780,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_map=m_tile_map,
         bias=_bias1_arg,
     )
-    if not _capturing:
+    if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage1 sync OK, unsort")
     _grouped_dbg("[crash-probe] after stage1 sync OK")
@@ -737,20 +826,22 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
         _grouped_dbg("start a2 fp4 quant")
         a2_quant, a2_scale_token = _a2_f4_quant(
-            grouped_a2.view(E * max_m, inter_dim),
+            grouped_a2.view(route_E * route_max_m, inter_dim),
             quant_dtype=dtypes.fp4x2,
             shuffle=False,
         )
         _grouped_dbg("a2 fp4 quant done")
         grouped_a2_payload = (
-            a2_quant.view(torch.uint8).contiguous().view(E, max_m, inter_dim // 2)
+            a2_quant.view(torch.uint8)
+            .contiguous()
+            .view(route_E, route_max_m, inter_dim // 2)
         )
         a2_scale_raw = (
             a2_scale_token.view(torch.uint8)
             .contiguous()
-            .view(E, max_m, inter_dim // 32)
+            .view(route_E, route_max_m, inter_dim // 32)
         )
-        if not _capturing:
+        if _grouped_sync_dbg:
             torch.cuda.synchronize()
         _grouped_dbg("[crash-probe] after a2 fp4 quant sync OK")
     else:
@@ -770,13 +861,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
         grouped_a2_scale = flydsl_moe_preshuffle_scale(
             a2_scale_raw,
-            E,
-            max_m,
+            route_E,
+            route_max_m,
             wmma_rep=warp_tile_m // 16,
             scale_k_per_tile=tile_k // 32,
         )
     _grouped_dbg("a2 scale layout done")
-    grouped_out = torch.empty((E, max_m, model_dim), dtype=dtype, device=device)
+    grouped_out = torch.empty(
+        (route_E, route_max_m, model_dim), dtype=dtype, device=device
+    )
     stage2_compiler = (
         compile_moe_grouped_gemm2_mxfp4_masked
         if data_format == "fp4"
@@ -797,14 +890,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         num_buffers=num_buffers,
         split_k=split_k2,
         expert_sched_mode=False,
-        grouped_persistent_m=effective_grouped_persistent_m,
-        persistent_workers=persistent_workers,
+        grouped_persistent_m=False,
+        grouped_contiguous_m=effective_grouped_contiguous_m,
+        persistent_workers=None,
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None
     if _bias2_arg is not None and _bias2_arg.dtype != dtype:
         _bias2_arg = _bias2_arg.to(dtype)
-    if not _capturing:
+    if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage2 tokens={token_num} max_m={max_m} E={E}")
     stage2(
@@ -823,7 +917,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_map=m_tile_map,
         bias=_bias2_arg,
     )
-    if not _capturing:
+    if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage2 sync OK")
     if os.environ.get("MOE_DUMP_INTER", "").strip().lower() not in (
@@ -863,6 +957,17 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("gather-reduce output done")
     else:
         _grouped_dbg("start scatter output")
+        # Naive fallback: per-expert D2D loop (slow). Warn once outside capture.
+        global _WARNED_NAIVE_EPILOGUE
+        if not _WARNED_NAIVE_EPILOGUE:
+            _WARNED_NAIVE_EPILOGUE = True
+            logger.warning(
+                "[grouped_a8w4] slow naive scatter epilogue: per-expert loop "
+                "(E=%d) issues E D2D copies + E D2H syncs per call. Use dtype "
+                "bf16/fp16 and unset AITER_GROUPED_GEMM_NAIVE to take the fused "
+                "flydsl_moe_gather_reduce path.",
+                E,
+            )
         # Naive fallback epilogue.
         if counts is None:
             counts = torch.bincount(flat_experts, minlength=E)
