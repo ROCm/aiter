@@ -16,7 +16,7 @@
 #include "opus_gemm_asm_mma16x16x16.cuh"
 #include "opus_gemm_helpers_a16w16.cuh"
 
-// Build a 10201-style traits view with B_K=64 from a B_K=128 trait T.
+// Build a "fake" 50211-style traits with B_K=64 from a B_K=128 trait T.
 template<typename T>
 struct bk64_traits_view {
     static constexpr int BLOCK_SIZE = T::BLOCK_SIZE;
@@ -111,7 +111,7 @@ void gemm_a16w16_kbuf2v_bk128_kernel(Kargs kargs) {
 
     auto g_c = [&]() {
         if constexpr (IS_SPLITK) {
-            return make_gmem(reinterpret_cast<D_C*>(kargs.ws_handle->ptr)
+            return make_gmem(reinterpret_cast<D_C*>(kargs.ptr_workspace)
                              + (size_t)split_id  * kargs.batch * kargs.stride_ws_batch
                              + (size_t)batch_id  * kargs.stride_ws_batch
                              + (size_t)row       * kargs.stride_ws
@@ -267,7 +267,6 @@ void gemm_a16w16_kbuf2v_bk128_kernel(Kargs kargs) {
         v_b[1][ST] = load<TS::VEC_B>(s_b[2 + ST], u_rb);
     };
 
-    #pragma unroll 4
     for (; tile < outer_end; tile += 2) {
         sub_iter(opus::number<0>{}, tile);
         sub_iter(opus::number<1>{}, tile);

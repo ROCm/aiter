@@ -17,7 +17,6 @@ from op_tests.triton_tests.quant.test_quant_mxfp4 import (
 )
 from aiter.ops.triton.utils.types import e4m3_dtype
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.test_common import checkAllclose
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -441,8 +440,6 @@ def test_triton_unified_attn_3d(
                 f"Skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size/1024} kB > 320 kB"
             )
 
-    # TODO: Uncomment after pytorch adds support for manual_seed
-    torch.manual_seed(0)
     query_lens = [x[0] for x in seq_lens]
 
     (
@@ -525,18 +522,9 @@ def test_triton_unified_attn_3d(
     atol, rtol = 1.5e-2, 1e-2
     if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
         atol, rtol = 1.5e-1, 1.5e-1
-    tol_err_ratio = 0.01
-    assert (
-        checkAllclose(
-            output.to(torch.bfloat16),
-            ref_output.to(torch.bfloat16),
-            atol=atol,
-            rtol=rtol,
-            tol_err_ratio=tol_err_ratio,
-            msg="unified_attn_3d output",
-        )
-        <= tol_err_ratio
-    )
+    torch.testing.assert_close(
+        output.to(torch.bfloat16), ref_output.to(torch.bfloat16), atol=atol, rtol=rtol
+    ), f"{torch.max(torch.abs(output.to(torch.bfloat16) - ref_output.to(torch.bfloat16)))}"
 
 
 @pytest.mark.parametrize(
@@ -644,31 +632,36 @@ def test_triton_unified_attn(
         use_q_descale=use_q_descale,
         use_kv_descale=use_kv_descale,
         use_out_scale=use_out_scale,
-        device="cuda",
+        device="cpu",
     )
 
+    def to_cuda(t):
+        return t.to("cuda") if t is not None else None
+
+    output = to_cuda(output)
     unified_attention(
-        q=query,
-        k=key_cache,
-        v=value_cache,
+        q=to_cuda(query),
+        k=to_cuda(key_cache),
+        v=to_cuda(value_cache),
         out=output,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=kv_lens,
+        cu_seqlens_q=to_cuda(cu_query_lens),
+        seqused_k=to_cuda(kv_lens),
         max_seqlen_q=max_query_len,
         max_seqlen_k=max_kv_len,
         softmax_scale=scale,
         causal=True,
         window_size=window_size,
-        block_table=block_tables,
+        block_table=to_cuda(block_tables),
         softcap=soft_cap if soft_cap is not None else 0,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        sinks=sinks,
-        output_scale=output_scale,
+        q_descale=to_cuda(q_descale),
+        k_descale=to_cuda(k_descale),
+        v_descale=to_cuda(v_descale),
+        sinks=to_cuda(sinks),
+        output_scale=to_cuda(output_scale),
         shuffled_kv_cache=shuffled_kv_cache,
     )
 
+    # The reference runs on CPU using the unshuffled KV
     ref_output = ref_paged_attn(
         query=query,
         key_cache=key_cache_orig,
@@ -691,7 +684,7 @@ def test_triton_unified_attn(
     is_fp8 = kv_dtype.itemsize == 1 or q_dtype.itemsize == 1
     if is_fp8:
         atol, rtol = 1.5e-1, 1.5e-1
-    output = output.to(torch.float32)
+    output = output.to(torch.float32).cpu()
     ref_output = ref_output.to(torch.float32)
     if is_fp8 and use_gluon_2d and (use_kv_descale or use_q_descale):
         # For fp8 allow up to 1% of elements to fall outside tolerance.

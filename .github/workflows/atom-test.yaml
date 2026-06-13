@@ -99,7 +99,6 @@ jobs:
 
           runner_overrides = {
               "atom-mi355-8gpu.predownload": "linux-aiter-mi35x-8",
-              "linux-atom-do-mi350x-8": "linux-aiter-do-mi350x-8",
               "linux-atom-mi35x-4": "linux-aiter-mi35x-4",
               "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
           }
@@ -202,7 +201,6 @@ jobs:
     name: ${{ matrix.job_name }}
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix:
         include: ${{ fromJson(needs.load-atom-models.outputs.models_json) }}
     runs-on: ${{ matrix.runner }}

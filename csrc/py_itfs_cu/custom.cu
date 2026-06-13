@@ -14,9 +14,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "aiter_tensor.h"
-#include "aiter_stream.h"
-#include "custom.h"
+#include <torch/all.h>
+#include <c10/core/ScalarType.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <hip/hip_runtime.h>
+#include "py_itfs_common.h"
 
 namespace aiter {
 
@@ -26,12 +29,12 @@ namespace aiter {
 // void LLGemm_Silu(void* in_a, void* in_b, void* out_c, const int M, const int
 // K,
 //                  hipStream_t stream, const int rows_per_block);
-// void LLMM_Silu(aiter_tensor_t& in_a, aiter_tensor_t& in_b, aiter_tensor_t& out_c,
+// void LLMM_Silu(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c,
 //                const int64_t rows_per_block) {
 //   auto M = in_a.size(0);
 //   auto K = in_a.size(1);
 //   LLGemm_Silu(in_a.data_ptr(), in_b.data_ptr(), out_c.data_ptr(), M, K,
-//               aiter::getCurrentHIPStream(), rows_per_block);
+//               at::hip::getCurrentHIPStream(), rows_per_block);
 // }
 
 void LLGemm1(void* in_a,
@@ -41,9 +44,9 @@ void LLGemm1(void* in_a,
              const int K,
              hipStream_t stream,
              const int rows_per_block          = 4,
-             const AiterDtype scalar_type      = AITER_DTYPE_fp16);
+             const c10::ScalarType scalar_type = c10::ScalarType::Half);
 // template <typename T>
-void LLMM1(aiter_tensor_t& in_a, aiter_tensor_t& in_b, aiter_tensor_t& out_c, const int64_t rows_per_block)
+void LLMM1(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c, const int64_t rows_per_block)
 {
     auto M = in_a.size(0);
     auto K = in_a.size(1);
@@ -55,20 +58,20 @@ void LLMM1(aiter_tensor_t& in_a, aiter_tensor_t& in_b, aiter_tensor_t& out_c, co
     //                           std::to_string(in_b.numel()));
 
     // out_c.resize_({N});
-    AITER_CHECK(N == 1, "Row number of activation tensor must be 1.");
-    AITER_CHECK(in_a.dtype() == in_b.dtype());
-    AITER_CHECK(in_b.dtype() == AITER_DTYPE_fp16 || in_b.dtype() == AITER_DTYPE_bf16);
+    TORCH_CHECK(N == 1, "Row number of activation tensor must be 1.");
+    TORCH_CHECK(in_a.dtype() == in_b.dtype());
+    TORCH_CHECK(in_b.dtype() == torch::kFloat16 || in_b.dtype() == torch::kBFloat16);
 
     // call the kernel function...
-    HipDeviceGuard device_guard(in_a.device_id);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(in_a));
     LLGemm1(in_a.data_ptr(),
             in_b.data_ptr(),
             out_c.data_ptr(),
             M,
             K,
-            aiter::getCurrentHIPStream(),
+            at::hip::getCurrentHIPStream(),
             rows_per_block,
-            in_b.dtype());
+            in_b.scalar_type());
 }
 
 void wvSplitK_(void* in_a,
@@ -79,30 +82,30 @@ void wvSplitK_(void* in_a,
                const int N,
                hipStream_t stream,
                const int CuCount                 = 1,
-               const AiterDtype scalar_type      = AITER_DTYPE_fp16);
-void wvSpltK(aiter_tensor_t& in_a,
-             aiter_tensor_t& in_b,
-             aiter_tensor_t& out_c,
+               const c10::ScalarType scalar_type = c10::ScalarType::Half);
+void wvSpltK(at::Tensor& in_a,
+             at::Tensor& in_b,
+             at::Tensor& out_c,
              const int64_t N_in,
              const int64_t CuCount)
 {
     auto M = in_a.size(0);
     auto K = in_a.size(1);
     int N  = N_in;
-    AITER_CHECK(in_a.dtype() == in_b.dtype());
-    AITER_CHECK(K % 8 == 0, "k % 8 == 0");
-    AITER_CHECK(in_a.dtype() == AITER_DTYPE_fp16 || in_a.dtype() == AITER_DTYPE_bf16);
+    TORCH_CHECK(in_a.dtype() == in_b.dtype());
+    TORCH_CHECK(K % 8 == 0, "k % 8 == 0");
+    TORCH_CHECK(in_a.dtype() == torch::kFloat16 || in_a.dtype() == torch::kBFloat16);
 
-    HipDeviceGuard device_guard(in_a.device_id);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(in_a));
     wvSplitK_(in_a.data_ptr(),
               in_b.data_ptr(),
               out_c.data_ptr(),
               M,
               K,
               N,
-              aiter::getCurrentHIPStream(),
+              at::hip::getCurrentHIPStream(),
               CuCount,
-              in_b.dtype());
+              in_b.scalar_type());
 }
 
 void wv_splitk_small_fp16_bf16(void* in_a,
@@ -113,30 +116,30 @@ void wv_splitk_small_fp16_bf16(void* in_a,
                                const int N,
                                hipStream_t stream,
                                const int CuCount                 = 1,
-                               const AiterDtype scalar_type      = AITER_DTYPE_fp16);
-void wv_splitk_small_fp16_bf16_wrapper(aiter_tensor_t& in_a,
-                                       aiter_tensor_t& in_b,
-                                       aiter_tensor_t& out_c,
+                               const c10::ScalarType scalar_type = c10::ScalarType::Half);
+void wv_splitk_small_fp16_bf16_wrapper(at::Tensor& in_a,
+                                       at::Tensor& in_b,
+                                       at::Tensor& out_c,
                                        const int64_t N_in,
                                        const int64_t CuCount)
 {
     auto M = in_a.size(0);
     auto K = in_a.size(1);
     int N  = N_in;
-    AITER_CHECK(in_a.dtype() == in_b.dtype());
-    AITER_CHECK(K % 8 == 0, "k % 8 == 0");
-    AITER_CHECK(in_a.dtype() == AITER_DTYPE_fp16 || in_a.dtype() == AITER_DTYPE_bf16);
+    TORCH_CHECK(in_a.dtype() == in_b.dtype());
+    TORCH_CHECK(K % 8 == 0, "k % 8 == 0");
+    TORCH_CHECK(in_a.dtype() == torch::kFloat16 || in_a.dtype() == torch::kBFloat16);
 
-    HipDeviceGuard device_guard(in_a.device_id);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(in_a));
     wv_splitk_small_fp16_bf16(in_a.data_ptr(),
                               in_b.data_ptr(),
                               out_c.data_ptr(),
                               M,
                               K,
                               N,
-                              aiter::getCurrentHIPStream(),
+                              at::hip::getCurrentHIPStream(),
                               CuCount,
-                              in_b.dtype());
+                              in_b.scalar_type());
 }
 
 void wvSplitKQ_(void* in_a,
@@ -150,26 +153,26 @@ void wvSplitKQ_(void* in_a,
                 const int N,
                 hipStream_t stream,
                 const int CuCount                   = 1,
-                const AiterDtype a_scalar_type       = AITER_DTYPE_fp8,
-                const AiterDtype c_scalar_type       = AITER_DTYPE_fp16);
-void wvSplitKQ(aiter_tensor_t& in_a,
-               aiter_tensor_t& in_b,
-               aiter_tensor_t& out_c,
-               aiter_tensor_t& scale_a,
-               aiter_tensor_t& scale_b,
+                const c10::ScalarType a_scalar_type = c10::ScalarType::Float8_e4m3fnuz,
+                const c10::ScalarType c_scalar_type = c10::ScalarType::Half);
+void wvSplitKQ(at::Tensor& in_a,
+               at::Tensor& in_b,
+               at::Tensor& out_c,
+               at::Tensor& scale_a,
+               at::Tensor& scale_b,
                const int64_t CuCount)
 {
     auto M  = in_a.size(0);
     auto K  = in_a.size(1);
     auto N  = in_b.size(0);
     auto Kp = in_a.stride(0);
-    AITER_CHECK(K % 16 == 0, "k % 16 == 0");
-    AITER_CHECK(in_a.dtype() == in_b.dtype() && in_a.dtype() == AITER_DTYPE_fp8);
-    AITER_CHECK(out_c.dtype() == AITER_DTYPE_fp16 || out_c.dtype() == AITER_DTYPE_bf16);
-    auto scale_a_ptr = reinterpret_cast<float*>(scale_a.data_ptr());
-    auto scale_b_ptr = reinterpret_cast<float*>(scale_b.data_ptr());
+    TORCH_CHECK(K % 16 == 0, "k % 16 == 0");
+    TORCH_CHECK(in_a.dtype() == in_b.dtype() && in_a.dtype() == torch_fp8);
+    TORCH_CHECK(out_c.dtype() == torch::kFloat16 || out_c.dtype() == torch::kBFloat16);
+    auto scale_a_ptr = scale_a.data_ptr<float>();
+    auto scale_b_ptr = scale_b.data_ptr<float>();
 
-    HipDeviceGuard device_guard(in_a.device_id);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(in_a));
     wvSplitKQ_(in_a.data_ptr(),
                in_b.data_ptr(),
                out_c.data_ptr(),
@@ -179,10 +182,10 @@ void wvSplitKQ(aiter_tensor_t& in_a,
                K,
                Kp,
                N,
-               aiter::getCurrentHIPStream(),
+               at::hip::getCurrentHIPStream(),
                CuCount,
-               in_a.dtype(),
-               out_c.dtype());
+               in_a.scalar_type(),
+               out_c.scalar_type());
 }
 
 void LLGemmZZ(void* in_a,
@@ -193,21 +196,21 @@ void LLGemmZZ(void* in_a,
               hipStream_t stream,
               const int solidx);
 
-void LLZZ(aiter_tensor_t& in_a, aiter_tensor_t& in_b, aiter_tensor_t& out_c, const int64_t solidx = 0)
+void LLZZ(at::Tensor in_a, at::Tensor in_b, at::Tensor out_c, const int64_t solidx = 0)
 {
     auto M = in_a.size(0);
     auto K = in_a.size(1);
-    HipDeviceGuard device_guard(in_a.device_id);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(in_a));
     LLGemmZZ(in_a.data_ptr(),
              in_b.data_ptr(),
              out_c.data_ptr(),
              M,
              K,
-             aiter::getCurrentHIPStream(),
+             at::hip::getCurrentHIPStream(),
              solidx);
 }
 // instantiate the CPP template for T=float:
-// template void AddGPU<float>(aiter_tensor_t in_a, aiter_tensor_t in_b, aiter_tensor_t
+// template void AddGPU<float>(at::Tensor in_a, at::Tensor in_b, at::Tensor
 // out_c);
 
 void MMGPUKernel(float* in_a,
@@ -221,24 +224,21 @@ void MMGPUKernel(float* in_a,
                  int numCColumns,
                  hipStream_t stream);
 
-void MMCustomGPU(aiter_tensor_t& in_a, aiter_tensor_t& in_b, aiter_tensor_t& out_c)
+void MMCustomGPU(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c)
 {
-    auto numARows    = in_a.size(0);
-    auto numAColumns = in_a.size(1);
-    auto numBRows    = in_b.size(0);
-    auto numBColumns = in_b.size(1);
-    auto numCRows    = out_c.size(0);
-    auto numCColumns = out_c.size(1);
-    HipDeviceGuard device_guard(in_a.device_id);
-    MMGPUKernel(reinterpret_cast<float*>(in_a.data_ptr()),
-                reinterpret_cast<float*>(in_b.data_ptr()),
-                reinterpret_cast<float*>(out_c.data_ptr()),
-                numARows,
-                numAColumns,
-                numBRows,
-                numBColumns,
-                numCRows,
-                numCColumns,
-                aiter::getCurrentHIPStream());
+    auto matA_sizes{in_a.sizes()};
+    auto matB_sizes{in_b.sizes()};
+    auto matO_sizes{out_c.sizes()};
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(in_a));
+    MMGPUKernel(in_a.data_ptr<float>(),
+                in_b.data_ptr<float>(),
+                out_c.data_ptr<float>(),
+                matA_sizes[0],
+                matA_sizes[1],
+                matB_sizes[0],
+                matB_sizes[1],
+                matO_sizes[0],
+                matO_sizes[1],
+                at::hip::getCurrentHIPStream());
 }
 } // namespace aiter

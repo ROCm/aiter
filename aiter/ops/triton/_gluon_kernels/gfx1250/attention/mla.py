@@ -2446,21 +2446,17 @@ def _mla_decode_fwd_kernel_non_pipelined(
     segm_max_ptr,  # [total_num_tokens, num_query_heads, num_segments]
     segm_expsum_ptr,  # [total_num_tokens, num_query_heads, num_segments]
     query_ptr,  # [total_num_tokens, num_query_heads, head_size]
-    query_scales_ptr,  # nvfp4 query scales (unused for non-shuffled bf16/fp8)
     kv_buffer_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
     SCALE: gl.constexpr,  # float32
     q_scale_ptr,  # float32
     kv_scale_ptr,  # float32
-    out_scale_ptr,  # float32 (only set when NUM_SEGMENTS_PER_SEQ == 1)
     num_query_heads: gl.constexpr,  # int
     num_kv_heads: gl.constexpr,  # int
     block_tables_stride: gl.int64,  # int
     query_stride_0: gl.int64,  # int
     query_stride_1: gl.int64,  # int, should be equal to head_size
-    query_scales_stride_0: gl.int64,  # int
-    query_scales_stride_1: gl.int64,  # int
     KV_LORA_RANK: gl.constexpr,  # int
     QK_ROPE_HEAD_DIM: gl.constexpr,  # int
     stride_kv_buffer_0: gl.int64,  # int
@@ -2479,21 +2475,10 @@ def _mla_decode_fwd_kernel_non_pipelined(
     num_stages: gl.constexpr,  # int
     SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
     ALL_DECODE: gl.constexpr = False,  # bool
-    K_WIDTH: gl.constexpr = 0,  # int
-    SCALE_K_WIDTH_LORA: gl.constexpr = 16,  # int
-    SCALE_K_WIDTH_ROPE: gl.constexpr = 16,  # int
-    QUERY_DTYPE: gl.constexpr = "bf16",  # str: "bf16" | "fp8"
-    KV_CACHE_DTYPE: gl.constexpr = "bf16",  # str: "bf16" | "fp8"
-    BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
+    IS_Q_FP8: gl.constexpr = False,  # bool
+    IS_KV_FP8: gl.constexpr = False,  # bool
 ):
     assert not SHUFFLED_KV_CACHE
-    # Non-shuffled KV cache only supports bf16/fp8 query: nvfp4 query requires a
-    # shuffled cache (handled by the pipelined kernel). query_scales_ptr is
-    # accepted so the launch signature matches the pipelined kernel, but it is
-    # only consumed for nvfp4, which never reaches this path.
-    assert QUERY_DTYPE == "bf16" or QUERY_DTYPE == "fp8"
-    IS_Q_FP8: gl.constexpr = QUERY_DTYPE == "fp8"
-    IS_KV_FP8: gl.constexpr = KV_CACHE_DTYPE == "fp8"
     cfg = MLAConfig(
         KV_LORA_RANK,
         QK_ROPE_HEAD_DIM,
@@ -2511,13 +2496,8 @@ def _mla_decode_fwd_kernel_non_pipelined(
         False,
         False,
         SHUFFLED_KV_CACHE,
-        QUERY_DTYPE,
-        KV_CACHE_DTYPE,
-        ALL_DECODE,
-        K_WIDTH,
-        SCALE_K_WIDTH_LORA,
-        SCALE_K_WIDTH_ROPE,
-        BLOCK_SCALES_SIZE,
+        IS_Q_FP8,
+        IS_KV_FP8,
     )
     q_block_global_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)

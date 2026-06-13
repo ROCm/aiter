@@ -1,7 +1,7 @@
 import torch
 import triton
 import math
-from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16, _is_gluon_available
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
@@ -27,7 +27,6 @@ def bench_gemm_fn(
     K: int,
     metric: str,
     layout: str,
-    backend: str,
     atomic: bool = False,
     activation: Optional[str] = None,
     **kwargs,
@@ -48,7 +47,6 @@ def bench_gemm_fn(
 
     if atomic:
         # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
-        assert backend != "gluon", "Atomic kernel is triton-only"
         assert (
             activation is None
         ), "Atomic kernel does not currently support fused activation"
@@ -60,9 +58,7 @@ def bench_gemm_fn(
         )
     else:
         ms = triton.testing.do_bench(
-            lambda: gemm_a16w16(
-                x, w, bias, c_dtype, y, activation=activation, backend=backend
-            ),
+            lambda: gemm_a16w16(x, w, bias, c_dtype, y, activation=activation),
             warmup=25,
             rep=100,  # noqa: E731
         )
@@ -80,7 +76,7 @@ def bench_gemm_fn(
         raise ValueError("Unknown metric: " + metric)
 
 
-def run_model_benchmark(args, backend):
+def run_model_benchmark(args):
     """
     Runs benchmark given a --model argument.
     """
@@ -113,20 +109,13 @@ def run_model_benchmark(args, backend):
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
         return bench_gemm_fn(
-            M,
-            N,
-            K,
-            metric,
-            args.layout,
-            backend,
-            atomic=args.atomic,
-            activation=args.activation,
+            M, N, K, metric, args.layout, atomic=args.atomic, activation=args.activation
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
 
-def run_shape_benchmark(args, backend):
+def run_shape_benchmark(args):
     """
     Runs a benchmark with given tensor shapes.
     """
@@ -136,7 +125,7 @@ def run_shape_benchmark(args, backend):
     def bench_gemm_a16w16(M, N, K, metric, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, backend, atomic=args.atomic)
+        return bench_gemm_fn(M, N, K, metric, args.layout, atomic=args.atomic)
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
@@ -145,10 +134,6 @@ def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
-
-    backend = args.backend or ("gluon" if _is_gluon_available() else "triton")
-    print(f"Using backend: {backend}")
-
     if args.model:
         unsupported_args = []
         for arg in unsupported_args:
@@ -156,7 +141,7 @@ def run_benchmark(args, defaults):
                 raise Exception(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
-        run_model_benchmark(args, backend)
+        run_model_benchmark(args)
     else:
         unsupported_args = [
             "fc1",
@@ -168,7 +153,7 @@ def run_benchmark(args, defaults):
                 raise Exception(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
-        run_shape_benchmark(args, backend)
+        run_shape_benchmark(args)
 
 
 def parse_args(args: list[str] | None = None):
@@ -185,13 +170,6 @@ def parse_args(args: list[str] | None = None):
         type=str,
         default=None,
         help="Activation function to apply to the output. One of ('gelu', 'gelu_tanh', 'silu', 'silu_exp2', 'relu').",
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["triton", "gluon"],
-        default=None,
-        help="Backend to use. Default: auto-detect (gluon on gfx1250, triton elsewhere).",
     )
     return get_ff_args(parser, args=args)
 

@@ -64,7 +64,6 @@ def get_GEMM_A16W16_config_():
         gemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
         gemm_dict = gemm_dict.set_index(
             [
-                "gfx",
                 "cu_num",
                 "M",
                 "N",
@@ -118,12 +117,11 @@ def get_GEMM_A16W16_config(
     cu_num = get_cu_num()
     padded_M = M
     config = None
-    gfx = get_gfx()
+
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         config = cfg.get(
             (
-                gfx,
                 cu_num,
                 padded_M,
                 N,
@@ -163,7 +161,12 @@ def get_GEMM_A16W16_config(
 
     if config is None:
         default_config = {}
-        if bpreshuffle:
+        gfx = get_gfx()
+        # gfx12: no ASM/skinny/hipblaslt kernels, use torch
+        if gfx.startswith("gfx12"):
+            default_config["libtype"] = "torch"
+            default_config["solidx"] = 0
+        elif bpreshuffle:
             default_config["bpreshuffle"] = True
             if gfx == "gfx942":
                 default_config["libtype"] = "hipblaslt"
@@ -285,8 +288,12 @@ def gemm_a16w16(
         scaleAB=scale_a is not None or scale_b is not None,
         bpreshuffle=bpreshuffle,
     )
+    gfx = get_gfx()
+    _no_asm = gfx.startswith("gfx12")
     libtype = config["libtype"]
-    solution_idx = config["solidx"]
+    if _no_asm and libtype in ("asm", "skinny", "hipblaslt"):
+        libtype = "torch"
+    solution_idx = config["solidx"] if libtype == config.get("libtype") else 0
     solfunc = solMap[libtype]
     out = solfunc(
         inp_view,

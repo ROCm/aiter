@@ -663,15 +663,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         world_size = self.world_size
         ca_comm = self.ca_comm
-        # Custom kernel supports scatter on first/last/mid dims; gate via
-        # should_custom_rs which also rejects first-dim-non-vectorizable
-        # shapes (no naive fallback exists for that case, see C++ dispatch).
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_rs(input_, dim)
+            and ca_comm.should_custom_ar(input_)
         ):
-            ca_comm.custom_reduce_scatter(input_, output_, dim)
+            ca_comm.custom_reduce_scatter(input_, output_)
         else:
             pynccl_comm = self.pynccl_comm
             assert pynccl_comm is not None
