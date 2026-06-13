@@ -1692,6 +1692,62 @@ OPUS_D __amdgpu_buffer_rsrc_t make_buffer_rsrc(const void* ptr, unsigned int siz
 OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR unsigned int* p, index_t size, index_t vos, index_t sos, index_t ios, index_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
 #pragma clang diagnostic pop
 #endif
+
+// ── buffer atomic feature guards ───────────────────────────────────────────────
+// per BuiltinsAMDGPU.td / IntrinsicsAMDGPU.td:
+//   fadd.f32     : atomic-fadd-rtn-insts                 (gfx908+, incl. gfx942/gfx950/gfx1250)
+//   fadd.v2f16   : atomic-buffer-global-pk-add-f16-insts (gfx942/gfx950/gfx1250)
+//   fadd.v2bf16  : raw_buffer_atomic_fadd<v2bf16>        (gfx90a/gfx942/gfx950/gfx12+; gated to gfx950/gfx1250 per request)
+//   fmin/fmax.f32: atomic-fmin-fmax-global-f32           (gfx950/gfx1250)
+#if defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1200__) || defined(__gfx1201__)
+#define OPUS_HAS_BUFFER_ATOMIC_FADD_F32 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_FADD_F32 0
+#endif
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__)
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 0
+#endif
+#if defined(__gfx950__) || defined(__gfx1250__)
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16 0
+#endif
+#if defined(__gfx950__) || defined(__gfx1250__)
+#define OPUS_HAS_BUFFER_ATOMIC_FMINMAX_F32 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_FMINMAX_F32 0
+#endif
+
+// v2bf16 buffer atomic-add has NO clang builtin (only global/flat/ds, never raw_(ptr_)buffer); bind the LLVM IR int_amdgcn_raw_buffer_atomic_fadd (".v2bf16" suffix = <2 x bfloat>) via __asm. rsrc is the i32x4 form (memcpy'd; __amdgpu_buffer_rsrc_t non-copyable).
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundefined-inline"
+OPUS_D bf16x2_t llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(bf16x2_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.v2bf16");
+#pragma clang diagnostic pop
+#endif
+
+// buffer atomic cmpswap has NO clang builtin — only the LLVM IR int_amdgcn_raw_buffer_atomic_cmpswap (".i32" = 32-bit), bound via __asm. Used to emulate packed fadd on archs without native pk_add (read-modify-CAS loop on the 32-bit word). Returns the old in-memory value (i32).
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundefined-inline"
+OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_cmpswap_i32(i32_t src, i32_t cmp, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.cmpswap.i32");
+#pragma clang diagnostic pop
+
+// raw buffer atomic add i32 via the LLVM IR intrinsic (__asm, like cmpswap/v2bf16) not the raw_ptr builtin, so aux fully controls the returning-bit + scope. Returns pre-op value; rsrc is the i32x4 form.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundefined-inline"
+OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_add_i32(i32_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.add.i32");
+#pragma clang diagnostic pop
+
+#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+enum class atomic_scope : uint8_t { cu=0, se=1, dev=2, sys=3 };   // VMEM cache scope[4:3] for atomics
+// RMW-atomic cpol (NOT make_cpol's load hints): TH[0]=returning (1=>returns pre-op value, tracked by LOADcnt; 0=>non-ret, STOREcnt), TH[1]=NT, TH[2]=cascade (defer scope of non-ret atomics; keep 0 for gates), scope[4:3]=cu/se/dev/sys (cross-cluster needs >=dev).
+OPUS_H_D constexpr int make_atomic_cpol(atomic_scope sc = atomic_scope::dev, bool returning = true, bool nt = false, bool cascade = false) { return (returning ? 1 : 0) | (nt ? (1 << 1) : 0) | (cascade ? (1 << 2) : 0) | ((int(sc) & 0x3) << 3); }
+static_assert(make_atomic_cpol(atomic_scope::dev, true, true, false) == 19, "atomic cpol layout drift");
+static_assert(make_atomic_cpol(atomic_scope::sys, false, false, false) == 24, "atomic cpol layout drift");
+#endif
+
 template<typename T_>
 struct gmem {
     using T = remove_cvref_t<T_>;
@@ -1774,6 +1830,67 @@ struct gmem {
         else if constexpr (sizeof(vector_type<vec>) == 16) { __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux); }
     }
 
+    // CAS-loop fallback: emulate a packed fp16/bf16 atomic-add on the 32-bit word at (vo,s_os) when the arch lacks native pk_add -- read the word, add in fp32, write back via cmpswap, retry until the compare succeeds. add_pk is the increment as an fp32x2 (lo,hi lanes).
+    template<typename Pk>
+    OPUS_D Pk _atomic_pk_add_cas(const Pk& add_pk, int vo, int s_os, index_t aux) {
+        i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));
+        i32_t old = __builtin_bit_cast(i32_t, _load<1>(vo, s_os, number<0>{}));   // seed with a normal read of the word
+        i32_t assumed;
+        do {
+            assumed = old;
+            Pk cur = __builtin_bit_cast(Pk, assumed);
+            Pk nxt;
+            if constexpr (std::is_same_v<scalar_type, bf16_t>) {
+                nxt[0] = fp32_to_bf16(bf16_to_fp32(cur[0]) + bf16_to_fp32(add_pk[0]));
+                nxt[1] = fp32_to_bf16(bf16_to_fp32(cur[1]) + bf16_to_fp32(add_pk[1]));
+            } else { // fp16
+                nxt[0] = fp32_to_fp16(fp16_to_fp32(cur[0]) + fp16_to_fp32(add_pk[0]));
+                nxt[1] = fp32_to_fp16(fp16_to_fp32(cur[1]) + fp16_to_fp32(add_pk[1]));
+            }
+            old = llvm_amdgcn_raw_buffer_atomic_cmpswap_i32(__builtin_bit_cast(i32_t, nxt), assumed, rsrc_, vo, s_os, aux);
+        } while (old != assumed);
+        return __builtin_bit_cast(Pk, old);
+    }
+
+    // buffer atomic add. v_os/ioffset in BYTES (ioffset compile-time -> folded into the immediate offset: field, v_os stays in a VGPR). Returns the old value. Dispatch on (scalar_type,total): f32x1/f16x2/bf16x2/i32x1/u32x1; packed types fall back to a cmpswap loop on archs lacking native pk_add.
+    template<index_t vec = 1, index_t ioffset = 0, typename V, index_t aux = 0>   // os in unit of byte
+    OPUS_D auto _atomic_add(const V& x, int v_os, int s_os = 0, number<ioffset> = {}, number<aux> = {}) {
+        using type = vector_type<vec>;
+        constexpr index_t total = vec * vector_size;
+        const int vo = v_os + ioffset;
+        static_assert((std::is_same_v<scalar_type, fp32_t> && total == 1) ||
+                      (std::is_same_v<scalar_type, fp16_t> && total == 2) ||
+                      (std::is_same_v<scalar_type, bf16_t> && total == 2) ||
+                      ((std::is_same_v<scalar_type, i32_t> || std::is_same_v<scalar_type, u32_t>) && total == 1),
+                      "unsupported atomic_add (scalar_type, vec) combination");
+#if defined(__HIP_DEVICE_COMPILE__)
+        if constexpr (std::is_same_v<scalar_type, fp32_t> && total == 1) {
+            static_assert(OPUS_HAS_BUFFER_ATOMIC_FADD_F32, "buffer_atomic_add f32 not supported on this arch");
+#if OPUS_HAS_BUFFER_ATOMIC_FADD_F32
+            return __builtin_bit_cast(type, __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_f32(__builtin_bit_cast(fp32_t, x), cached_rsrc, vo, s_os, aux));
+#endif
+        } else if constexpr (std::is_same_v<scalar_type, fp16_t> && total == 2) {
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16
+            return __builtin_bit_cast(type, __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_v2f16(__builtin_bit_cast(fp16x2_t, x), cached_rsrc, vo, s_os, aux));
+#else
+            return __builtin_bit_cast(type, _atomic_pk_add_cas(__builtin_bit_cast(fp16x2_t, x), vo, s_os, aux));
+#endif
+        } else if constexpr (std::is_same_v<scalar_type, bf16_t> && total == 2) {
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(__builtin_bit_cast(bf16x2_t, x), rsrc_, vo, s_os, aux));
+#else
+            return __builtin_bit_cast(type, _atomic_pk_add_cas(__builtin_bit_cast(bf16x2_t, x), vo, s_os, aux));
+#endif
+        } else /* i32/u32 */ {
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_add_i32(__builtin_bit_cast(i32_t, x), rsrc_, vo, s_os, aux));
+        }
+#else
+        (void)vo; (void)s_os; return type{};   // host: never codegen'd, body present only to satisfy parsing
+#endif
+    }
+
     template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
     OPUS_D auto load(int v_os, int s_os = 0, number<aux> = {}) { return _load<vec>(v_os * sizeof(T), s_os * sizeof(T), number<aux>{}); }
 
@@ -1788,6 +1905,35 @@ struct gmem {
         } else {
             static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check" );
             _store<vec>(x, v_os * sizeof(T), s_os * sizeof(T), number<aux>{});
+        }
+    }
+
+    // atomic add. v_os / s_os in unit of T; ioffset is a compile-time element offset folded into the
+    // instruction immediate offset: field (also in unit of T). Returns the old value. x must match vec*vector_size.
+    template<index_t vec = 1, index_t ioffset = 0, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>
+    OPUS_D auto atomic_add(const V& x, int v_os, int s_os = 0, number<ioffset> = {}, number<aux> = {}) {
+        static_assert(std::is_same_v<typename vector_traits<V>::dtype, scalar_type>, "scalar type must match for atomic_add");
+        static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check");
+        return _atomic_add<vec, ioffset * static_cast<index_t>(sizeof(T))>(x, v_os * sizeof(T), s_os * sizeof(T), number<ioffset * static_cast<index_t>(sizeof(T))>{}, number<aux>{});
+    }
+
+    // bulk atomic add over a tile layout. value is array/vector of partials, one vec per issue.
+    template<index_t vec = 1, typename V, typename Layout, index_t aux = 0, std::enable_if_t<((is_array_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
+    OPUS_D void atomic_add(const V& x, const Layout& u, int s_os = 0, number<aux> = {})
+    {
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
+#if OPUS_TILE_CONTAINER == 0
+        auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
+                         else if constexpr (is_vector_v<V>) return x; }();
+#elif OPUS_TILE_CONTAINER == 1
+        auto a_ = to_array(x);
+#endif
+        for (index_t i = 0; i < r_elem.value; i++) {
+            vector_type<vec> v_;
+            for (index_t j = 0; j < vec * vector_size; j++) v_[j] = a_[i * vec * vector_size + j];
+            atomic_add<vec>(v_, offsets[i], s_os, number<0>{}, number<aux>{});   // offsets are in element units
         }
     }
 
@@ -1985,18 +2131,21 @@ struct smem {
     {
         using LT = layout_load_traits<Layout, vec>;
         constexpr auto r_elem = LT::r_elem;
-        auto offsets = layout_to_offsets<vec>(u);
+        constexpr bool is_static_layout = is_static_tuple_v<typename Layout::Shape> && is_static_tuple_v<typename Layout::Stride>;
+        [[maybe_unused]] auto offsets = layout_to_offsets<vec>(u);
+        // static Shape+Stride => per-issue byte offset is compile-time: compute the runtime per-lane base ONCE and fold the constant into the ds offset: immediate (else materialize offsets[i] as a base VGPR per issue).
+        auto issue = [&](auto i) {
+            if constexpr (is_static_layout) { constexpr int off = layout_imm_offsets_v<Layout, vec>[i.value] * (int)sizeof(T);
+                if constexpr (off >= 0 && off <= 0xffff) return _load<vec>(static_cast<const typename layout_shift_traits<remove_cvref_t<Layout>>::base&>(u)(make_repeated_tuple(number<0>{}, number<size<decltype(LT::issue_space_vec)>()>{})) * (int)sizeof(T) + off); }
+            return load<vec>(offsets[i.value]); };
 
 #if OPUS_TILE_CONTAINER == 0
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
-        for (index_t i = 0; i < r_elem.value; i++) {
-            auto tmp = load<vec>(offsets[i]);
-            for (index_t j = 0; j < vec * vector_size; j++) r[i * vec * vector_size + j] = tmp[j];
-        }
+        static_for<r_elem.value>([&](auto i){ auto tmp = issue(i); for (index_t j = 0; j < vec * vector_size; j++) r[i.value * vec * vector_size + j] = tmp[j]; });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         array<vector_type<vec>, r_elem.value> r;
-        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i]);
+        static_for<r_elem.value>([&](auto i){ r[i.value] = issue(i); });
         return r;
 #endif
     }
