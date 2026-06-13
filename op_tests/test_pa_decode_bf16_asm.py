@@ -283,10 +283,13 @@ def ref_pa_decode(
     token (`ctx - mtp + 1 + i`), but the GPU follows the no-`+1` border above.
     For mtp=0 this is the full context (no-op).
 
-    sink (optional): per-Q-head fp32 logits in the kernel's PRE-SCALE raw domain,
-    shape [kv_head_num*gqa].  It adds one virtual logit `s_eff*sink_raw` (s_eff =
-    query_scale*key_scale*softmax_scale) to each row's softmax denominator; the
-    sink has no value, so it only shrinks the real-token weights.
+    sink (optional): per-Q-head fp32 logits in the SCALED-logit domain (Triton /
+    GPT-OSS convention), shape [kv_head_num*gqa].  It adds one virtual logit
+    `sink_raw` directly to each row's softmax denominator (compared against the
+    scaled logits (q.k)*s_eff); the sink has no value, so it only shrinks the
+    real-token weights.  NOTE: the ASM kernel divides the passed sink by s_eff
+    internally (it then re-multiplies by scl_log2e=s_eff*log2e), so callers pass
+    the scaled-domain sink directly -- no *s_eff here.
     """
     num_pages, kv_head_num = K.shape[0], K.shape[1]
     head_dim = Q.shape[-1]
@@ -295,9 +298,7 @@ def ref_pa_decode(
     mtp = qlen - 1
     device = Q.device
     s_eff = query_scale * key_scale * softmax_scale
-    sink_hg = (
-        (sink.float().view(kv_head_num, gqa) * s_eff) if sink is not None else None
-    )
+    sink_hg = sink.float().view(kv_head_num, gqa) if sink is not None else None
 
     # K[p,h,d//16,tok,d%16] -> K_tm[p,h,tok,d];  V[p,h,tok//16,d,tok%16] -> V_tm[p,h,tok,d]
     K_tm = (

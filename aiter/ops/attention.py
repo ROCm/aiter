@@ -398,7 +398,8 @@ def pa_ps_fwd_asm(
 # gqa=8).  FP8 Q **and** FP8 paged KV cache, bf16 output, **per-tensor** scalar
 # dequant scales for Q/K/V (distinct from the per-token/per-block scale tensors
 # used by pa_ps_fwd_asm).  GPT-OSS style attention sink (per-Q-head fp32 logits
-# in the kernel's pre-scale raw-logit domain) is always read by the kernel.
+# in the SCALED-logit domain, exp(sink); kernel divides by s_eff internally) is
+# always read by the kernel.
 #
 # Memory-allocation policy: all GPU tensors are allocated on the Python side;
 # the C++ entry point performs only pointer + stride bookkeeping and the kernel
@@ -465,10 +466,11 @@ def pa_decode_bf16_asm(
         scales; the attention `softmax_scale` (typically 1/sqrt(head_dim)) is
         passed BY VALUE (kernarg 0x60) and the kernel forms
         scl_log2e = query_scale * key_scale * softmax_scale * log2e.
-      * `sink` (optional) holds per-Q-head fp32 logits in the kernel's
-        pre-scale raw-logit domain, shape [kv_head_num * gqa].  The kernel
-        always reads this slot, so when `sink` is None a -inf buffer is
-        allocated, making the sink a numerical no-op.
+      * `sink` (optional) holds per-Q-head fp32 logits in the SCALED-logit
+        domain (exp(sink), Triton/GPT-OSS convention; the kernel divides by
+        s_eff internally), shape [kv_head_num * gqa].  The kernel always reads
+        this slot, so when `sink` is None a -inf buffer is allocated, making the
+        sink a numerical no-op.
     """
     device = Q.device
     kv_head_num = K.shape[1]

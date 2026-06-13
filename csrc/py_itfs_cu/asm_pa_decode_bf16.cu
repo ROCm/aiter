@@ -15,8 +15,9 @@
 //     the caller (the kernel forms scl_log2e = query_scale*key_scale*log2e).
 //   * Single thread-group per work item, 4 waves of 32 lanes → bdx = 128
 //     (wave32), launched persistently with grid.x = CU count.
-//   * GPT-OSS style attention sink: per-Q-head fp32 sink logits in the kernel's
-//     pre-scale raw-logit domain (sink slot is always read by this kernel).
+//   * GPT-OSS style attention sink: per-Q-head fp32 sink logits in the SCALED-
+//     logit domain (compared directly to (q.k)*softmax_scale, i.e. exp(sink); the
+//     kernel divides by s_eff internally). Sink slot is always read by this kernel.
 //
 // Memory-allocation policy: every tensor is caller-allocated.  This entry point
 // does only pointer + stride bookkeeping and kernel launch — no GPU memory
@@ -58,7 +59,7 @@ struct KernelArgs
     void* ptr_WorkInfo;   p2 _p19;   // 0x130  WorkInfo
     void* ptr_SplitO;     p2 _p20;   // 0x140  SplitO
     void* ptr_SplitLSE;   p2 _p21;   // 0x150  SplitLSE
-    void* ptr_Sink;       p2 _p22;   // 0x160  SinkBuffer (pre-scale raw logits)
+    void* ptr_Sink;       p2 _p22;   // 0x160  SinkBuffer (scaled-domain logits, exp(sink))
 };
 #pragma pack(pop)
 static_assert(sizeof(KernelArgs) == 0x170,
@@ -114,7 +115,7 @@ AITER_CTYPES_ERROR_DEF
 // softmax_scale : attention scale (e.g. 1/sqrt(head_dim)), passed BY VALUE at
 //           kernarg 0x60.  The kernel folds query_scale*key_scale*softmax_scale
 //           *log2(e) into scl_log2e (caller does NOT pre-fold it).
-// sink    : fp32 [kv_head*gqa] per-Q-head sink logits (pre-scale domain); the
+// sink    : fp32 [kv_head*gqa] per-Q-head sink logits (scaled-logit domain); the
 //           kernel always reads this slot, so it must be non-null.
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     pa_decode_bf16_asm,
