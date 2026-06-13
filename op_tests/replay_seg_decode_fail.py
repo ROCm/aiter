@@ -131,19 +131,27 @@ def main(path):
         k_full = torch.cat([k_nope, k_pe], dim=-1)  # [seq, 576]
         # query for this batch (decode_qlen=1 assumed)
         qi = q_f32[i].cpu() * q_scale  # [nhead, 576]
-        scores = (qi @ k_full.T) * sm_scale  # [nhead, seq]
-        scores = scores - scores.max(dim=-1, keepdim=True).values
-        w = torch.softmax(scores, dim=-1)
-        ref = w @ k_nope  # [nhead, kv_lora] (MLA value = nope part)
         oi = o[i].to(torch.float32).cpu()[:, :kv_lora]
-        cos = torch.nn.functional.cosine_similarity(
-            ref.reshape(-1), oi.reshape(-1), dim=0
-        ).item()
-        print(
-            f"\n[fp32 ref] batch={i} seq_len={seq_len} n_pages={n_pages} last={last} "
-            f"ref finite={torch.isfinite(ref).all().item()} ref absmax={ref.abs().max().item():.3f} "
-            f"cos(asm,ref)={cos:.4f}"
-        )
+        qk = qi @ k_full.T  # [nhead, seq] raw scores (pre-scale)
+        # Sweep candidate softmax scales to see which one the asm actually used.
+        # If the asm matched ref only for 1/sqrt(qk_head_dim) (and NOT for the
+        # passed sm_scale), the kernel is ignoring the sm_scale argument.
+        cand = {
+            "passed_sm_scale": sm_scale,
+            "1/sqrt(576)": 1.0 / ((kv_lora + pe_dim) ** 0.5),
+            "1/sqrt(512)": 1.0 / (kv_lora**0.5),
+            "1/sqrt(192)": 1.0 / (192**0.5),
+        }
+        print(f"\n[fp32 ref] batch={i} seq_len={seq_len} n_pages={n_pages} last={last}")
+        for name, sc in cand.items():
+            scores = qk * sc
+            scores = scores - scores.max(dim=-1, keepdim=True).values
+            w = torch.softmax(scores, dim=-1)
+            ref = w @ k_nope  # [nhead, kv_lora] (MLA value = nope part)
+            cos = torch.nn.functional.cosine_similarity(
+                ref.reshape(-1), oi.reshape(-1), dim=0
+            ).item()
+            print(f"    scale={name:>16s} ({sc:.6f})  cos(asm,ref)={cos:.4f}")
 
 
 if __name__ == "__main__":
