@@ -5,8 +5,6 @@ data with E8M0 block scales via V_WMMA_SCALE instructions.
 Select precision with ``data_format="fp4"|"fp8"|"a8w4"``.
 """
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
@@ -50,37 +48,6 @@ WAVE_SIZE = 32
 SCALE_BLOCK = 32
 SCALES_PER_WMMA = WMMA_K // SCALE_BLOCK  # 4
 
-
-def _deepgemm_num_1d_blocks_per_group(
-    *,
-    block_m: int,
-    block_n: int,
-    k_is_multicast_on_a: bool = False,
-) -> int:
-    """Mirror DeepGEMM ``get_num_1d_blocks_per_group`` (candidates 8 and 16).
-
-    Source: ``deep_gemm/include/deep_gemm/common/scheduler.cuh`` in
-    https://github.com/deepseek-ai/DeepGEMM — minimizes
-    ``candidate * BLOCK_M + ceil_div(num_sms, candidate) * BLOCK_N`` when
-    ``kIsMulticastOnA == false`` (M-primary swizzle grouping).
-    """
-    try:
-        from aiter.jit.utils.chip_info import get_cu_num
-
-        num_sms = max(1, int(get_cu_num()))
-    except Exception:
-        num_sms = 128
-    best, min_usage = 8, 2**31
-    for cand in (8, 16):
-        if k_is_multicast_on_a:
-            usage = cand * block_n + (num_sms + cand - 1) // cand * block_m
-        else:
-            usage = cand * block_m + (num_sms + cand - 1) // cand * block_n
-        if usage < min_usage:
-            min_usage, best = usage, cand
-    return int(best)
-
-
 LDS_PAD_A_BYTES = 16
 LDS_PAD_D_BYTES = 16
 
@@ -112,8 +79,6 @@ def compile_mxscale_gemm(
     batch_count: int = 1,
     grouped_masked_m: bool = False,
     grouped_persistent_m: bool = False,
-    grouped_contiguous_m: bool = False,
-    grouped_contiguous_num_1d_blocks: int | None = None,
     persistent_workers: int | None = None,
     stage1_act: str | None = None,
     stage1_weight_layout: str = "gguu",
@@ -158,29 +123,6 @@ def compile_mxscale_gemm(
         raise ValueError("grouped_masked_m requires batch_count > 1")
     if grouped_persistent_m and not grouped_masked_m:
         raise ValueError("grouped_persistent_m requires grouped_masked_m=True")
-    if grouped_contiguous_m and not grouped_masked_m:
-        raise ValueError("grouped_contiguous_m requires grouped_masked_m=True")
-    if grouped_contiguous_m and grouped_persistent_m:
-        raise ValueError("grouped_contiguous_m is only for non-persistent grouped GEMM")
-    _env_1d = os.environ.get("AITER_DEEPGEMM_NUM_1D_BLOCKS", "").strip()
-    if grouped_contiguous_m:
-        if grouped_contiguous_num_1d_blocks is not None:
-            _k_contiguous_1d = int(grouped_contiguous_num_1d_blocks)
-        elif _env_1d in ("8", "16"):
-            _k_contiguous_1d = int(_env_1d)
-        else:
-            _k_contiguous_1d = _deepgemm_num_1d_blocks_per_group(
-                block_m=int(tile_m),
-                block_n=int(tile_n),
-                k_is_multicast_on_a=False,
-            )
-        if _k_contiguous_1d not in (8, 16):
-            raise ValueError(
-                "grouped_contiguous_num_1d_blocks / AITER_DEEPGEMM_NUM_1D_BLOCKS "
-                "must be 8 or 16 (DeepGEMM scheduler.cuh candidates)"
-            )
-    else:
-        _k_contiguous_1d = 8
     stage1_act_mode = None if stage1_act in (None, "", "none") else str(stage1_act)
     stage1_weight_layout_mode = str(stage1_weight_layout)
     if stage1_weight_layout_mode not in ("gguu", "gugu"):
@@ -539,7 +481,6 @@ def compile_mxscale_gemm(
         arg_masked_m: fx.Tensor,
         arg_m_tile_prefix: fx.Tensor,
         arg_m_tile_map: fx.Tensor,
-        i32_m_tile_bound: fx.Int32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
     ):
@@ -581,7 +522,6 @@ def compile_mxscale_gemm(
             bz,
             tile_valid_override=None,
             valid_m_override=None,
-            flat_m_base_override=None,
         ):
             blk_m = bx_local * arith.index(tile_m)
             blk_n = by_local * arith.index(tile_n)
@@ -590,9 +530,6 @@ def compile_mxscale_gemm(
             batch_b_base = batch_idx * arith.index(B_TOTAL_N // 16)
             batch_as_base = batch_idx * arith.index(M // wmma_m_rep)
             batch_bs_base = batch_idx * arith.index(B_TOTAL_N // b_scale_load_rep)
-            flat_m_base = batch_m_base + blk_m
-            if flat_m_base_override is not None:
-                flat_m_base = flat_m_base_override
             tile_valid = arith.constant(1, type=ir.IntegerType.get_signless(1))
             valid_m_i32 = i32_m.ir_value()
             if const_expr(grouped_masked_m):
@@ -646,9 +583,7 @@ def compile_mxscale_gemm(
 
             m_idx = arith.index_cast(T.index, i32_m.ir_value())
             n_stride = arith.index(C_N)
-            if const_expr(grouped_contiguous_m):
-                c_rows = m_idx
-            elif const_expr(batch_count > 1):
+            if const_expr(batch_count > 1):
                 c_rows = arith.index(batch_count * M)
             else:
                 c_rows = m_idx
@@ -663,11 +598,8 @@ def compile_mxscale_gemm(
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_a,
                     lds_memref=memref,
-                    global_offset=(flat_m_base, k_packed_off),
-                    tensor_shape=(
-                        c_rows if const_expr(grouped_contiguous_m) else batch_count * M,
-                        K_packed_a,
-                    ),
+                    global_offset=(batch_m_base + blk_m, k_packed_off),
+                    tensor_shape=(batch_count * M, K_packed_a),
                     strides=(K_packed_a, 1),
                     tile_shape=(tile_m, packed_tile_k_a),
                     elem_bytes=1,
@@ -703,19 +635,12 @@ def compile_mxscale_gemm(
                 k_scale_off = k_base / arith.index(SCALE_BLOCK)
                 outer_off = blk_m / arith.index(wmma_m_rep)
                 inner_off = k_scale_off * arith.index(wmma_m_rep)
-                a_scale_row_base = batch_as_base + outer_off
-                if flat_m_base_override is not None:
-                    a_scale_row_base = flat_m_base / arith.index(wmma_m_rep)
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_a_scale,
                     lds_memref=memref,
-                    global_offset=(a_scale_row_base, inner_off),
+                    global_offset=(batch_as_base + outer_off, inner_off),
                     tensor_shape=(
-                        (
-                            c_rows / arith.index(wmma_m_rep)
-                            if const_expr(grouped_contiguous_m)
-                            else batch_count * (M // wmma_m_rep)
-                        ),
+                        batch_count * (M // wmma_m_rep),
                         K_scale * wmma_m_rep,
                     ),
                     strides=(wmma_m_rep * K_scale, 1),
@@ -1462,7 +1387,9 @@ def compile_mxscale_gemm(
                 addrs = []
                 _bf16_out = out_dtype in ("bf16", "f16")
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
-                    row = flat_m_base + warp_m_base + arith.index(m_off) + lane16
+                    row = (
+                        batch_m_base + blk_m + warp_m_base + arith.index(m_off) + lane16
+                    )
                     col_base = (
                         blk_n
                         + warp_n_base
@@ -1666,7 +1593,7 @@ def compile_mxscale_gemm(
                     raw_sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
                     raw_sub8 = _add_bias_vec8(raw_sub8, wn)
                     row_local = blk_m + warp_m_base + arith.index(m_off) + lane16
-                    row = flat_m_base + warp_m_base + arith.index(m_off) + lane16
+                    row = batch_m_base + row_local
                     raw_col_base = (
                         blk_n
                         + warp_n_base
@@ -1826,7 +1753,7 @@ def compile_mxscale_gemm(
                 pf_k_packed_b = pf_k / arith.index(PACK_FACTOR_B)
                 tdm_ops.l2_prefetch_tile(
                     arg_a,
-                    (flat_m_base, pf_k_packed_a),
+                    (batch_m_base + blk_m, pf_k_packed_a),
                     (tile_m, packed_tile_k_a),
                     (K_packed_a, 1),
                     elem_bytes=1,
@@ -1974,7 +1901,7 @@ def compile_mxscale_gemm(
                     global_ptr=arg_c,
                     lds_memref=d_lds_base_ptr,
                     global_offset=(
-                        flat_m_base + warp_m_off_sgpr,
+                        batch_m_base + blk_m + warp_m_off_sgpr,
                         blk_n + warp_n_off_sgpr,
                     ),
                     tensor_shape=(batch_count * M, N),
@@ -2872,173 +2799,57 @@ def compile_mxscale_gemm(
             scf.YieldOp([cur_active])
             _for_ip.__exit__(None, None, None)
         else:
-            if const_expr(grouped_contiguous_m):
-                masked_m_rsrc = buffer_ops.create_buffer_resource(
-                    arg_masked_m, max_size=True
-                )
-                layout_rsrc = buffer_ops.create_buffer_resource(
-                    arg_m_tile_map, max_size=True
-                )
-                flat_pid = arith.index_cast(T.index, _raw(gpu.block_idx.x))
+            if const_expr(batch_count > 1):
+                flat_bx = arith.index_cast(T.index, _raw(gpu.block_idx.x))
+                batch_idx = flat_bx / m_tiles_per_batch
+                bx_local = flat_bx - batch_idx * m_tiles_per_batch
                 bz = (
                     arith.index_cast(T.index, _raw(gpu.block_idx.z))
                     if split_k > 1
                     else arith.index(0)
                 )
-                m_tile_bound = arith.index_cast(T.index, i32_m_tile_bound.ir_value())
-                idx_n = arith.index_cast(T.index, i32_n.ir_value())
-                n_tiles = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
-
-                # Port of ``deep_gemm::Scheduler::get_swizzled_block_idx`` for
-                # ``GemmType::MGroupedContiguous`` with ``kIsMulticastOnA == false``.
-                # https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/include/deep_gemm/common/scheduler.cuh
-                k_num_1d = arith.index(int(_k_contiguous_1d))
-                primary_num_blocks = m_tile_bound
-                secondary_num_blocks = n_tiles
-                num_blocks_per_group = secondary_num_blocks * k_num_1d
-                group_idx = flat_pid / num_blocks_per_group
-                first_block_idx = group_idx * k_num_1d
-                in_group_idx = flat_pid - group_idx * num_blocks_per_group
-                remaining_primary = primary_num_blocks - first_block_idx
-                use_full_group = arith.cmpi(
-                    arith.CmpIPredicate.slt, k_num_1d, remaining_primary
+            else:
+                batch_idx = arith.index(0)
+                bx_local = bx
+                bz = (
+                    arith.index_cast(T.index, _raw(gpu.block_idx.z))
+                    if split_k > 1
+                    else arith.index(0)
                 )
-                num_blocks_in_group = arith.select(
-                    use_full_group, k_num_1d, remaining_primary
+            if const_expr(grouped_masked_m):
+                masked_m_rsrc = buffer_ops.create_buffer_resource(
+                    arg_masked_m, max_size=True
                 )
-                in_m = (
-                    in_group_idx
-                    - (in_group_idx / num_blocks_in_group) * num_blocks_in_group
+                valid_m_i32 = buffer_ops.buffer_load(
+                    masked_m_rsrc,
+                    arith.index_cast(T.i32, batch_idx),
+                    vec_width=1,
+                    dtype=T.i32,
                 )
-                flat_m_tile = first_block_idx + in_m
-                by_contig = in_group_idx / num_blocks_in_group
-
-                m_tile_active = arith.cmpi(
-                    arith.CmpIPredicate.slt, flat_m_tile, primary_num_blocks
+                blk_m = bx_local * arith.index(tile_m)
+                tile_active = arith.cmpi(
+                    arith.CmpIPredicate.slt,
+                    arith.index_cast(T.i32, blk_m),
+                    valid_m_i32,
                 )
-                n_tile_active = arith.cmpi(arith.CmpIPredicate.slt, by_contig, n_tiles)
-                tile_active = arith.andi(m_tile_active, n_tile_active)
                 tile_if = scf.IfOp(tile_active, results_=[], has_else=False)
                 with ir.InsertionPoint(tile_if.then_block):
-                    layout_row = flat_m_tile * arith.index(tile_m)
-                    layout_row_i32 = arith.index_cast(T.i32, layout_row)
-                    c0_i32 = arith.constant(0, type=T.i32)
-                    c_tile_m_i32 = arith.constant(tile_m, type=T.i32)
-                    c_tile_m_minus_1_i32 = arith.constant(tile_m - 1, type=T.i32)
-                    c_false = arith.constant(0, type=ir.IntegerType.get_signless(1))
-                    c0_idx = arith.index(0)
-                    c1_idx = arith.index(1)
-                    e_loop = scf.ForOp(
-                        c0_idx,
-                        arith.index(batch_count),
-                        c1_idx,
-                        [c_false, c0_i32, c0_i32, c0_i32],
+                    _emit_tile(
+                        batch_idx,
+                        bx_local,
+                        by,
+                        bz,
+                        tile_valid_override=tile_active,
+                        valid_m_override=valid_m_i32,
                     )
-                    e_ip = ir.InsertionPoint(e_loop.body)
-                    e_ip.__enter__()
-                    e = e_loop.induction_variable
-                    found = e_loop.inner_iter_args[0]
-                    found_group = e_loop.inner_iter_args[1]
-                    cur_start = e_loop.inner_iter_args[2]
-                    found_start = e_loop.inner_iter_args[3]
-                    e_i32 = arith.index_cast(T.i32, e)
-                    actual_end = buffer_ops.buffer_load(
-                        layout_rsrc, e, vec_width=1, dtype=T.i32
-                    )
-                    row_ge_start = arith.cmpi(
-                        arith.CmpIPredicate.sge, layout_row_i32, cur_start
-                    )
-                    row_lt_end = arith.cmpi(
-                        arith.CmpIPredicate.slt, layout_row_i32, actual_end
-                    )
-                    row_in_group = arith.andi(row_ge_start, row_lt_end)
-                    not_found = arith.cmpi(arith.CmpIPredicate.eq, found, c_false)
-                    take_group = arith.andi(not_found, row_in_group)
-                    next_found = arith.ori(found, take_group)
-                    next_group = arith.select(take_group, e_i32, found_group)
-                    next_found_start = arith.select(take_group, cur_start, found_start)
-                    next_start = (
-                        (actual_end + c_tile_m_minus_1_i32) // c_tile_m_i32
-                    ) * c_tile_m_i32
-                    scf.YieldOp([next_found, next_group, next_start, next_found_start])
-                    e_ip.__exit__(None, None, None)
-                    group_active = e_loop.results[0]
-                    batch_i32 = e_loop.results[1]
-                    group_start_i32 = e_loop.results[3]
-                    batch_idx = arith.index_cast(T.index, batch_i32)
-                    local_row_i32 = layout_row_i32 - group_start_i32
-                    bx_local = arith.index_cast(T.index, local_row_i32 // c_tile_m_i32)
-                    group_if = scf.IfOp(group_active, results_=[], has_else=False)
-                    with ir.InsertionPoint(group_if.then_block):
-                        valid_m_i32 = buffer_ops.buffer_load(
-                            masked_m_rsrc,
-                            batch_i32,
-                            vec_width=1,
-                            dtype=T.i32,
-                        )
-                        _emit_tile(
-                            batch_idx,
-                            bx_local,
-                            by_contig,
-                            bz,
-                            tile_valid_override=tile_active,
-                            valid_m_override=valid_m_i32,
-                            flat_m_base_override=layout_row,
-                        )
-                        scf.YieldOp([])
                     scf.YieldOp([])
             else:
-                if const_expr(batch_count > 1):
-                    flat_bx = arith.index_cast(T.index, _raw(gpu.block_idx.x))
-                    batch_idx = flat_bx / m_tiles_per_batch
-                    bx_local = flat_bx - batch_idx * m_tiles_per_batch
-                    bz = (
-                        arith.index_cast(T.index, _raw(gpu.block_idx.z))
-                        if split_k > 1
-                        else arith.index(0)
-                    )
-                else:
-                    batch_idx = arith.index(0)
-                    bx_local = bx
-                    bz = (
-                        arith.index_cast(T.index, _raw(gpu.block_idx.z))
-                        if split_k > 1
-                        else arith.index(0)
-                    )
-                if const_expr(grouped_masked_m):
-                    masked_m_rsrc = buffer_ops.create_buffer_resource(
-                        arg_masked_m, max_size=True
-                    )
-                    valid_m_i32 = buffer_ops.buffer_load(
-                        masked_m_rsrc,
-                        arith.index_cast(T.i32, batch_idx),
-                        vec_width=1,
-                        dtype=T.i32,
-                    )
-                    blk_m = bx_local * arith.index(tile_m)
-                    tile_active = arith.cmpi(
-                        arith.CmpIPredicate.slt,
-                        arith.index_cast(T.i32, blk_m),
-                        valid_m_i32,
-                    )
-                    tile_if = scf.IfOp(tile_active, results_=[], has_else=False)
-                    with ir.InsertionPoint(tile_if.then_block):
-                        _emit_tile(
-                            batch_idx,
-                            bx_local,
-                            by,
-                            bz,
-                            tile_valid_override=tile_active,
-                            valid_m_override=valid_m_i32,
-                        )
-                        scf.YieldOp([])
-                else:
-                    _emit_tile(batch_idx, bx_local, by, bz)
+                _emit_tile(batch_idx, bx_local, by, bz)
 
     # Bump this when changing generated IR in ways not otherwise reflected in
     # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
     # reusing a previously compiled kernel after source-only descriptor fixes.
-    tdm_store_descriptor_version = 31
+    tdm_store_descriptor_version = 30
 
     # M/N are compile-time constants used throughout the generated IR
     # (B_TOTAL_N, C_N, grid dimensions, output/bias strides, scale descriptor
@@ -3072,8 +2883,6 @@ def compile_mxscale_gemm(
         batch_count,
         grouped_masked_m,
         grouped_persistent_m,
-        grouped_contiguous_m,
-        _k_contiguous_1d,
         _persistent_workers,
         stage1_act_mode,
         stage1_weight_layout_mode,
@@ -3118,7 +2927,6 @@ def compile_mxscale_gemm(
             arg_c,
             arg_c,
             i32_m,
-            i32_m,
             i32_n,
         )
         for op in ctx.gpu_module_body.operations:
@@ -3151,9 +2959,6 @@ def compile_mxscale_gemm(
         arg_a_scale: fx.Tensor,
         arg_b_scale: fx.Tensor,
         arg_masked_m: fx.Tensor,
-        arg_m_tile_prefix: fx.Tensor,
-        arg_m_tile_map: fx.Tensor,
-        i32_m_tile_bound: fx.Int32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
@@ -3166,15 +2971,10 @@ def compile_mxscale_gemm(
 
         idx_m = arith.index_cast(T.index, i32_m.ir_value())
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        if const_expr(grouped_contiguous_m):
-            n_tiles = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
-            gx = arith.index_cast(T.index, i32_m_tile_bound.ir_value()) * n_tiles
-            gy = arith.index(1)
-        else:
-            gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
-            if const_expr(batch_count > 1):
-                gx = gx * batch_count
-            gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
+        if const_expr(batch_count > 1):
+            gx = gx * batch_count
+        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
@@ -3185,9 +2985,8 @@ def compile_mxscale_gemm(
             arg_b_scale,
             arg_c,
             arg_masked_m,
-            arg_m_tile_prefix,
-            arg_m_tile_map,
-            i32_m_tile_bound,
+            arg_masked_m,
+            arg_masked_m,
             i32_m,
             i32_n,
         )
@@ -3249,7 +3048,6 @@ def compile_mxscale_gemm(
             arg_m_tile_prefix,
             arg_m_tile_map,
             i32_m,
-            i32_m,
             i32_n,
         )
         for op in ctx.gpu_module_body.operations:
@@ -3305,7 +3103,6 @@ def compile_mxscale_gemm(
             arg_c,
             arg_c,
             i32_m,
-            i32_m,
             i32_n,
         )
         for op in ctx.gpu_module_body.operations:
@@ -3339,9 +3136,6 @@ def compile_mxscale_gemm(
         arg_b_scale: fx.Tensor,
         arg_bias: fx.Tensor,
         arg_masked_m: fx.Tensor,
-        arg_m_tile_prefix: fx.Tensor,
-        arg_m_tile_map: fx.Tensor,
-        i32_m_tile_bound: fx.Int32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
@@ -3354,15 +3148,10 @@ def compile_mxscale_gemm(
 
         idx_m = arith.index_cast(T.index, i32_m.ir_value())
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        if const_expr(grouped_contiguous_m):
-            n_tiles = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
-            gx = arith.index_cast(T.index, i32_m_tile_bound.ir_value()) * n_tiles
-            gy = arith.index(1)
-        else:
-            gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
-            if const_expr(batch_count > 1):
-                gx = gx * batch_count
-            gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
+        if const_expr(batch_count > 1):
+            gx = gx * batch_count
+        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
@@ -3373,9 +3162,8 @@ def compile_mxscale_gemm(
             arg_b_scale,
             arg_bias,
             arg_masked_m,
-            arg_m_tile_prefix,
-            arg_m_tile_map,
-            i32_m_tile_bound,
+            arg_masked_m,
+            arg_masked_m,
             i32_m,
             i32_n,
         )
@@ -3437,7 +3225,6 @@ def compile_mxscale_gemm(
             arg_masked_m,
             arg_m_tile_prefix,
             arg_m_tile_map,
-            i32_m,
             i32_m,
             i32_n,
         )

@@ -216,7 +216,6 @@ def run_aiter_mla_reduce(
         reduce_final_map,
         reduce_partial_map,
         tile_q,
-        0,
         output,
         final_lse,
     )

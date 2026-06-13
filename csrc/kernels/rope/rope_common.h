@@ -8001,26 +8001,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             }
             else
             {
-                // block_size == 0 => non-paged cache (flat [num_slots, num_heads_k, HEAD_SIZE]):
-                // index directly by slot. Otherwise the cache is paged and K/V are interleaved
-                // per block, so index with the cache's real per-block stride (k_block_stride):
-                // offset = block_id*block_stride + block_offset*slot_size + head*HEAD_SIZE + elem
-                const int64_t slot_size = static_cast<int64_t>(num_heads_k) * HEAD_SIZE;
-                int64_t offset;
-                if(block_size == 0)
-                {
-                    offset = slot_id * slot_size + head_id_k * HEAD_SIZE + access_id_in_head;
-                }
-                else
-                {
-                    const int block_id         = static_cast<int>(slot_id / block_size);
-                    const int block_offset     = static_cast<int>(slot_id % block_size);
-                    const int64_t block_stride = (k_block_stride != 0)
-                                                     ? k_block_stride
-                                                     : static_cast<int64_t>(block_size) * slot_size;
-                    offset = block_id * block_stride + block_offset * slot_size +
-                             head_id_k * HEAD_SIZE + access_id_in_head;
-                }
+                const int64_t offset =
+                    (slot_id * num_heads_k + head_id_k) * HEAD_SIZE + access_id_in_head;
                 out_kv_vec.store(k_cache + offset);
             }
             if(k_out != nullptr)
@@ -8055,24 +8037,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
         }
         else
         {
-            // Same scheme as the K path above, for the V cache.
-            // block_size == 0 => non-paged cache, index directly by slot.
-            const int64_t slot_size = static_cast<int64_t>(num_heads_v) * HEAD_SIZE;
-            int64_t offset;
-            if(block_size == 0)
-            {
-                offset = slot_id * slot_size + head_id_v * HEAD_SIZE + access_id_in_head;
-            }
-            else
-            {
-                const int block_id         = static_cast<int>(slot_id / block_size);
-                const int block_offset     = static_cast<int>(slot_id % block_size);
-                const int64_t block_stride = (v_block_stride != 0)
-                                                 ? v_block_stride
-                                                 : static_cast<int64_t>(block_size) * slot_size;
-                offset                     = block_id * block_stride + block_offset * slot_size +
-                         head_id_v * HEAD_SIZE + access_id_in_head;
-            }
+            const int64_t offset =
+                (slot_id * num_heads_v + head_id_v) * HEAD_SIZE + access_id_in_head;
             out_kv_vec.store(v_cache + offset);
         }
         if(v_out != nullptr)

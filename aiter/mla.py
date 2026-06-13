@@ -13,7 +13,6 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.core import is_experimental_enabled
-from aiter.ops.attention import get_mla_decode_fwd_max_splits
 
 
 @triton.jit
@@ -330,9 +329,7 @@ def mla_decode_fwd(
         )
     else:
         if num_kv_splits is None:
-            num_kv_splits = get_mla_decode_fwd_max_splits(
-                ori_nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
-            )
+            num_kv_splits = get_cu_num()
         if (
             nhead == 16
             or (
@@ -499,7 +496,6 @@ def mla_decode_fwd(
             reduce_final_map,
             reduce_partial_map,
             max_seqlen_q,
-            num_kv_splits,
             o,
             final_lse,
         )
@@ -655,7 +651,6 @@ def mla_prefill_ps_fwd(
         reduce_final_map,
         reduce_partial_map,
         tile_q,
-        0,
         output,
         final_lse,
     )

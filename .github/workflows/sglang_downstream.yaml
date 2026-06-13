@@ -65,7 +65,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix: ${{ fromJSON(needs.select-sglang-tests.outputs.matrix) }}
 
     env:

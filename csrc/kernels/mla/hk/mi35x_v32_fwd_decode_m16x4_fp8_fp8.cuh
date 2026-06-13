@@ -966,26 +966,24 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                     if constexpr(kEpilogueType == PvGemmEpilogueType::OutputFinal)
                     {
-                        o_manager.template output_to_vram<oaccu_base, col_off, true>(
-                            params.final_output.raw_ptr, warp_idx, qo_start, qo_end, p_lds_o, num_qheads);
-                        o_manager.template output_to_vram<oaccu_base + 8, col_off + T::kBlockK, true>(
-                            params.final_output.raw_ptr, warp_idx, qo_start, qo_end, p_lds_o, num_qheads);
+                        o_manager.template output_to_vram<oaccu_base, col_off>(
+                            params.final_output.raw_ptr, warp_idx, qo_start, p_lds_o, num_qheads);
+                        o_manager.template output_to_vram<oaccu_base + 8, col_off + T::kBlockK>(
+                            params.final_output.raw_ptr, warp_idx, qo_start, p_lds_o, num_qheads);
                     }
                     else
                     {
-                        split_o_manager.template output_to_vram<oaccu_base, col_off, false>(
+                        split_o_manager.template output_to_vram<oaccu_base, col_off>(
                             params.split_output.raw_ptr,
                             warp_idx,
                             partial_qo_loc,
-                            0,
                             p_lds_o,
                             num_qheads);
                         split_o_manager
-                            .template output_to_vram<oaccu_base + 8, col_off + T::kBlockK, false>(
+                            .template output_to_vram<oaccu_base + 8, col_off + T::kBlockK>(
                                 params.split_output.raw_ptr,
                                 warp_idx,
                                 partial_qo_loc,
-                                0,
                                 p_lds_o,
                                 num_qheads);
                     }

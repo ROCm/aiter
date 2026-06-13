@@ -24,7 +24,6 @@ import torch
 import triton
 
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
-from .kernels.tensor_shim import _run_compiled
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_chunk_offsets,
     prepare_num_chunks,
@@ -265,8 +264,7 @@ def _launch_kernel(
 ):
     grid_v = triton.cdiv(V, BV)
     grid_nh = N * H
-    _run_compiled(
-        launch_fn,
+    launch_fn(
         k,
         u,
         w,
