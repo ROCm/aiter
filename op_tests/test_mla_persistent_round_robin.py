@@ -731,7 +731,8 @@ parser.add_argument(
     "-cpw",
     "--cp_world_size",
     type=int,
-    default=4,
+    nargs="*",
+    default=[2, 3, 4, 7, 8],
     help="""cp world size (number of round-robin ranks).
     e.g.: -cpw 4""",
 )
@@ -753,19 +754,21 @@ for nhead, decode_qlen in args.nhead:
         ctx_len,
         batch_size,
         max_split_per_batch,
+        cp_world_size,
     ) in itertools.product(
         args.dtype,
         args.kv_dtype,
         args.ctxLen,
         args.batchSize,
         args.max_split_per_batch,
+        args.cp_world_size,
     ):
         if dtype != dtypes.bf16 or kvtype != dtypes.bf16:
             # CP round-robin path validated for bf16/bf16 only for now.
             continue
         if not check_support(dtype, kvtype, nhead):
             continue
-        if ctx_len < args.cp_world_size:
+        if ctx_len < cp_world_size:
             continue
         ret = test_mla_cp(
             ctx_len,
@@ -779,7 +782,7 @@ for nhead, decode_qlen in args.nhead:
             page_size=args.block_size,
             varlen=args.varlen,
             decode_qlen=decode_qlen,
-            cp_world_size=args.cp_world_size,
+            cp_world_size=cp_world_size,
             max_split_per_batch=max_split_per_batch,
             return_lse=args.return_lse,
         )
