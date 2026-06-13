@@ -67,27 +67,21 @@ def select_3d_config(
     attn_warps = 2
     waves_per_eu = 1
     num_segments = 0
-    if shuffled_kv_cache:
-        if IS_DEVICE_ARCH_GFX12:
-            if kv_dtype == torch.bfloat16:
-                if num_2d_prgms >= 512:
-                    num_segments = 1
-                else:
-                    num_segments = 2
-            else:
-                if num_2d_prgms >= 512:
-                    num_segments = 1
-                else:
-                    num_segments = 2
+    TILE_SIZE = block_size
+    if IS_DEVICE_ARCH_GFX12:
+        attn_warps = 2
+        waves_per_eu = 1
+        if shuffled_kv_cache:
             if kv_dtype == torch.uint8:
                 assert (
                     block_size == 128
                 ), "Only block_size == 128 is supported for FP4 KV cache"
-        else:
-            attn_warps = 2
-            waves_per_eu = 1
 
-    TILE_SIZE = block_size
+        occ = waves_per_eu * 4 // attn_warps
+        MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
+        num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
+        num_segments = min(MAX_SEGMENTS, num_segments)
+        num_segments = triton.next_power_of_2(num_segments)
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     if num_segments == 0:
@@ -339,11 +333,8 @@ def mla_decode_fwd(
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
-    if IS_DEVICE_ARCH_GFX12:
-        target_num_prgms = 256
-    else:
-        cu_count = get_num_sms()
-        target_num_prgms = cu_count * 4
+    cu_count = get_num_sms()
+    target_num_prgms = cu_count * 4
     ALL_DECODE = num_tokens_per_seq == 1
     if ALL_DECODE:
         total_num_q_blocks = num_seqs
@@ -447,6 +438,7 @@ def mla_decode_fwd(
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
             query_ptr=q,
+            query_scales_ptr=q_scales,
             kv_buffer_ptr=kv_buffer,
             block_tables_ptr=block_tables,
             seq_lens_ptr=seqused_k,
@@ -458,6 +450,8 @@ def mla_decode_fwd(
             block_tables_stride=block_tables.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
+            query_scales_stride_0=q_scales.stride(0) if q_scales is not None else 0,
+            query_scales_stride_1=q_scales.stride(1) if q_scales is not None else 0,
             KV_LORA_RANK=kv_lora_rank,
             QK_ROPE_HEAD_DIM=qk_rope_head_dim,
             stride_kv_buffer_0=kv_buffer.stride(0),
