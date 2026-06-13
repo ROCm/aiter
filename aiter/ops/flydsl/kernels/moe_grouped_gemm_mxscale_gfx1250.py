@@ -802,49 +802,83 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         stage1_weight_layout=str(stage1_weight_layout),
     )
     _validate_common(cfg)
-    fused_base = None
-    fused_base_bias = None
     fused_n = cfg.inter_dim
     if cfg.split_k == 1:
         fused_n = (
             2 * cfg.inter_dim if cfg.stage1_weight_layout == "gugu" else cfg.inter_dim
         )
-        fused_base = _compile_base_a8w4_gemm(
-            K=cfg.model_dim,
-            N=fused_n,
-            cfg=cfg,
-            stage1_act=cfg.act,
-            stage1_weight_layout=cfg.stage1_weight_layout,
-            kernel_tag=f"gemm1_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}",
-        )
-        fused_base_bias = _compile_base_a8w4_gemm(
-            K=cfg.model_dim,
-            N=fused_n,
-            cfg=cfg,
-            stage1_act=cfg.act,
-            epilogue_bias=True,
-            stage1_weight_layout=cfg.stage1_weight_layout,
-            kernel_tag=f"gemm1_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}",
-        )
-    raw_base = _compile_base_a8w4_gemm(
-        K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg, kernel_tag=f"gemm1_raw_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}"
-    )
-    finalize_act = _compile_stage1_finalize_act(
-        experts=cfg.experts,
-        max_m=cfg.max_m,
-        inter_dim=cfg.inter_dim,
-        out_dtype=cfg.out_dtype,
-        act=cfg.act,
-        stage1_weight_layout=cfg.stage1_weight_layout,
-    )
-    finalize_act_bias = _compile_stage1_finalize_act_bias(
-        experts=cfg.experts,
-        max_m=cfg.max_m,
-        inter_dim=cfg.inter_dim,
-        out_dtype=cfg.out_dtype,
-        act=cfg.act,
-        stage1_weight_layout=cfg.stage1_weight_layout,
-    )
+
+    # Lazy compilation: only compile each variant on first use.  The previous
+    # eager approach compiled all 5 variants (fused_base, fused_base_bias,
+    # raw_base, finalize_act, finalize_act_bias) upfront, but at runtime only
+    # 1-2 of them are actually called.  Each compile_mxscale_gemm() call costs
+    # ~0.3s of Python-level closure setup, so deferring saves ~0.9s on first
+    # call and avoids polluting the FlyDSL cache with unused entries.
+    _lazy = {}
+
+    def _get_fused_base():
+        if "fused_base" not in _lazy:
+            _lazy["fused_base"] = (
+                _compile_base_a8w4_gemm(
+                    K=cfg.model_dim,
+                    N=fused_n,
+                    cfg=cfg,
+                    stage1_act=cfg.act,
+                    stage1_weight_layout=cfg.stage1_weight_layout,
+                    kernel_tag=f"gemm1_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}",
+                )
+                if cfg.split_k == 1
+                else None
+            )
+        return _lazy["fused_base"]
+
+    def _get_fused_base_bias():
+        if "fused_base_bias" not in _lazy:
+            _lazy["fused_base_bias"] = (
+                _compile_base_a8w4_gemm(
+                    K=cfg.model_dim,
+                    N=fused_n,
+                    cfg=cfg,
+                    stage1_act=cfg.act,
+                    epilogue_bias=True,
+                    stage1_weight_layout=cfg.stage1_weight_layout,
+                    kernel_tag=f"gemm1_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}",
+                )
+                if cfg.split_k == 1
+                else None
+            )
+        return _lazy["fused_base_bias"]
+
+    def _get_raw_base():
+        if "raw_base" not in _lazy:
+            _lazy["raw_base"] = _compile_base_a8w4_gemm(
+                K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg, kernel_tag=f"gemm1_raw_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}"
+            )
+        return _lazy["raw_base"]
+
+    def _get_finalize_act():
+        if "finalize_act" not in _lazy:
+            _lazy["finalize_act"] = _compile_stage1_finalize_act(
+                experts=cfg.experts,
+                max_m=cfg.max_m,
+                inter_dim=cfg.inter_dim,
+                out_dtype=cfg.out_dtype,
+                act=cfg.act,
+                stage1_weight_layout=cfg.stage1_weight_layout,
+            )
+        return _lazy["finalize_act"]
+
+    def _get_finalize_act_bias():
+        if "finalize_act_bias" not in _lazy:
+            _lazy["finalize_act_bias"] = _compile_stage1_finalize_act_bias(
+                experts=cfg.experts,
+                max_m=cfg.max_m,
+                inter_dim=cfg.inter_dim,
+                out_dtype=cfg.out_dtype,
+                act=cfg.act,
+                stage1_weight_layout=cfg.stage1_weight_layout,
+            )
+        return _lazy["finalize_act_bias"]
 
     def launch(
         y,
@@ -895,7 +929,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         _check_bias_args("bias", bias, (cfg.experts, 2 * cfg.inter_dim), y)
         if stream is None:
             stream = torch.cuda.current_stream()
-        fused_gemm = fused_base_bias if bias is not None else fused_base
+        fused_gemm = _get_fused_base_bias() if bias is not None else _get_fused_base()
         use_fused_gemm = (
             fused_gemm is not None
             and _tmp is None
@@ -958,7 +992,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     )
             else:
                 _run_compiled(
-                    raw_base,
+                    _get_raw_base(),
                     tmp,
                     x,
                     w,
@@ -1019,7 +1053,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     )
             else:
                 _run_compiled(
-                    raw_base,
+                    _get_raw_base(),
                     tmp,
                     x,
                     w,
@@ -1080,7 +1114,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     )
             else:
                 _run_compiled(
-                    raw_base,
+                    _get_raw_base(),
                     tmp,
                     x,
                     w,
@@ -1105,9 +1139,9 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         if _skip_epilogue:
             return tmp
         if bias is not None:
-            _run_compiled(finalize_act_bias, y, tmp, bias, masked_m, stream)
+            _run_compiled(_get_finalize_act_bias(), y, tmp, bias, masked_m, stream)
         else:
-            _run_compiled(finalize_act, y, tmp, masked_m, stream)
+            _run_compiled(_get_finalize_act(), y, tmp, masked_m, stream)
         return y
 
     return launch
@@ -1168,16 +1202,26 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         data_format=str(data_format),
     )
     _validate_common(cfg)
-    base = _compile_base_a8w4_gemm(
-        K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, kernel_tag=f"gemm2_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_mode{grouped_contiguous_m}"
-    )
-    base_bias = _compile_base_a8w4_gemm(
-        K=cfg.inter_dim,
-        N=cfg.model_dim,
-        cfg=cfg,
-        epilogue_bias=True,
-        kernel_tag=f"gemm2_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_mode{grouped_contiguous_m}",
-    )
+
+    _lazy2 = {}
+
+    def _get_base():
+        if "base" not in _lazy2:
+            _lazy2["base"] = _compile_base_a8w4_gemm(
+                K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg, kernel_tag=f"gemm2_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_mode{grouped_contiguous_m}"
+            )
+        return _lazy2["base"]
+
+    def _get_base_bias():
+        if "base_bias" not in _lazy2:
+            _lazy2["base_bias"] = _compile_base_a8w4_gemm(
+                K=cfg.inter_dim,
+                N=cfg.model_dim,
+                cfg=cfg,
+                epilogue_bias=True,
+                kernel_tag=f"gemm2_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_mode{grouped_contiguous_m}",
+            )
+        return _lazy2["base_bias"]
 
     def launch(
         y,
@@ -1214,7 +1258,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             stream = torch.cuda.current_stream()
         if cfg.split_k > 1:
             y.zero_()
-        gemm = base_bias if bias is not None else base
+        gemm = _get_base_bias() if bias is not None else _get_base()
         if cfg.grouped_persistent_m:
             m_tile_prefix = _m_tile_prefix
             if m_tile_prefix is None:
