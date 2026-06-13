@@ -284,9 +284,14 @@ void pa_fp8_main_kernel_v3(
         float qk_max  = -FLT_MAX;
         float exp_sum = 0.f;
         {
-            const int valid_upper = context_len;
+            // MTP causal mask: see pa_fp8_main_kernel_v2.cuh for rationale.
+            // token `q_token_for_lane` attends to
+            //   context_len - (kMtp - 1 - q_token_for_lane) KV tokens.
+            const int valid_upper =
+                context_len - (kMtp - 1 - q_token_for_lane);
+            const int valid_upper_min = context_len - (kMtp - 1);
             const bool interior_partition =
-                (partition_start_token_idx + kTParSize) <= valid_upper;
+                (partition_start_token_idx + kTParSize) <= valid_upper_min;
 
             if (!interior_partition)
             {

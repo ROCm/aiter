@@ -618,9 +618,24 @@ void pa_fp8_main_kernel_v2(
         float qk_max  = -FLT_MAX;
         float exp_sum = 0.f;
         {
-            const int valid_upper = context_len;
+            // MTP causal mask: query token `q_token_for_lane` (0..kMtp-1) is the
+            // (kMtp-1-q_token_for_lane)-th token BEFORE the sequence end, so it
+            // must NOT attend to the speculative tokens that follow it within
+            // the same mtp group.  Its causal KV length is therefore
+            //   context_len - (kMtp - 1 - q_token_for_lane).
+            // (kMtp==1 collapses to context_len.)  Without this every mtp token
+            // shared `context_len`, letting token0 attend to token1's KV slot —
+            // a future-token leak that corrupts decode output under MTP.
+            const int valid_upper =
+                context_len - (kMtp - 1 - q_token_for_lane);
+            // `interior_partition` gates whether the (per-lane) mask loop runs
+            // at all.  Different lanes now have different `valid_upper`, so the
+            // gate must use the SMALLEST causal length in the group
+            // (= context_len - (kMtp - 1), token0's) — otherwise a lane that
+            // still needs masking could be skipped.
+            const int valid_upper_min = context_len - (kMtp - 1);
             const bool interior_partition =
-                (partition_start_token_idx + kTParSize) <= valid_upper;
+                (partition_start_token_idx + kTParSize) <= valid_upper_min;
 
             if (!interior_partition)
             {

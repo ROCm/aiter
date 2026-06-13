@@ -362,9 +362,17 @@ void pa_fp8_main_kernel_v0(
     float qk_max  = -FLT_MAX;
     float exp_sum = 0.f;
     {
-        const int valid_upper = context_len;
+        // MTP causal mask: query token `q_token_for_lane` (0..kMtp-1) must not
+        // attend to speculative tokens that follow it within the same mtp group.
+        // Its causal KV length is context_len - (kMtp - 1 - q_token_for_lane).
+        // (kMtp==1 collapses to context_len.)  See pa_fp8_main_kernel_v2.cuh for
+        // the full rationale (future-token leak corrupts MTP decode output).
+        const int valid_upper = context_len - (kMtp - 1 - q_token_for_lane);
+        // Gate uses the smallest causal length in the group so no masking lane
+        // is skipped (lanes now have differing valid_upper).
+        const int valid_upper_min = context_len - (kMtp - 1);
         const bool interior_partition =
-            (partition_start_token_idx + kTParSize) <= valid_upper;
+            (partition_start_token_idx + kTParSize) <= valid_upper_min;
 
         // Unified path (see v1 for the same trick): pre-mask out-of-range
         // d_out values to -FLT_MAX in the boundary case so a single set of
@@ -1106,9 +1114,14 @@ void pa_fp8_main_kernel_v1(
         float qk_max  = -FLT_MAX;
         float exp_sum = 0.f;
         {
-            const int valid_upper = context_len;
+            // MTP causal mask: see pa_fp8_main_kernel_v2.cuh for rationale.
+            // token `q_token_for_lane` attends to
+            //   context_len - (kMtp - 1 - q_token_for_lane) KV tokens.
+            const int valid_upper =
+                context_len - (kMtp - 1 - q_token_for_lane);
+            const int valid_upper_min = context_len - (kMtp - 1);
             const bool interior_partition =
-                (partition_start_token_idx + kTParSize) <= valid_upper;
+                (partition_start_token_idx + kTParSize) <= valid_upper_min;
 
             // Boundary tiles: pre-mask out-of-range elements to -FLT_MAX so
             // the downstream max-reduce and exp loop can be a single unified
