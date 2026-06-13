@@ -24,6 +24,83 @@ ceiling on gfx950; anything above spills to scratch.
 | kv128 nopage | 256 | 156 | 128 KB | 288 B |
 | kv128 nopage + E2 | 256 | 113 | 128 KB | 240 B |
 | kv64 + E2 | 220 | 0 | 64 KB | 0 |
+| **kv64 + single-`sp` (E4)** | **182** | **0** | 64 KB | 0 |
+| **kv128 + single-`sp` (E4)** | 256 | **4** | 128 KB | 20 B |
+
+### UPDATE (2026-06-12): single-buffering the `sp` union DOES fit kv128
+
+The "no register trick fits kv128" conclusion below was **wrong** — it was based
+only on E2 (share `sp_compute`, keep a 2-slot fp8 `p`), which left 126 spills.
+Collapsing the **whole `sp` union to a single slot** (E4: `UA_FA4_SINGLE_SP`,
+score *and* P single-buffered) drops kv128 spills **173 → 4** (essentially fits).
+Attribution: the `sp` score/P double-buffer is the *entire* kv128 register
+blocker; `sp_delta` is a red herring (single-buffering it alone = 0 effect, the
+compiler already reclaims it). E2 only got to 126 because it kept `p`
+double-buffered in a separate array; the true union collapse is far more
+effective.
+
+**Correctness:** the single-`sp` build is fully correct as-is. The deferred-PV
+`PV(pi)` read and `QK(1-pi)` write now alias the same VGPRs, which is a register
+WAR hazard the compiler *must* resolve — it simply serializes PV→QK (the sp
+tiles are pure VGPR, no LDS/barrier involvement). Full regression + matrix
+(incl. prefill_fp8) PASS with `-DUA_FA4_SINGLE_SP=1 -DUA_PREFILL_D128_BLOCKSIZE=128`.
+
+### But kv128 is a PERF dead-end anyway (measured, not register-bound)
+
+Same shape `b1 hq=hk=5 sq=sk=75600 d128 non-causal`, kernel-only `@perftest`
+median, same session:
+
+| config | KV tile | sp | VGPR/spill | LDS | TFLOPs | vs base |
+|---|---|---|---|---|---|---|
+| baseline | 64 | double | 214/0 | 64 KB | 1632 | — |
+| single-`sp` | 64 | single | 182/0 | 64 KB | 1647 | +0.9% (noise) |
+| single-`sp` | 128 | single | 256/4 | 128 KB | 1433 | **−12%** |
+
+Two conclusions:
+1. **The deferred-PV double buffer earns nothing.** Single-buffering `sp` is
+   perf-neutral at kv64 (1632→1647, within noise) while freeing **32 VGPR**.
+   The PV‖QK MFMA overlap it exists to enable is not measurable (one MFMA
+   pipe/SIMD serializes PV+QK regardless). The 32 VGPR are free to reclaim at kv64.
+2. **kv128 fits but runs ~12% slower — it is MEMORY-LATENCY-bound, not
+   occupancy- or softmax-bound.** Occupancy is *identical* between kv64 and
+   kv128: both run **1 workgroup/CU = 2 waves/SIMD** (8 waves/WG over 4 SIMDs).
+   kv64 at 208 VGPR already can't fit a 2nd WG (4 waves×208 = 832 > 512-VGPR/SIMD
+   budget), and kv128 at 256 VGPR sits at exactly 512/512 — still 1 WG/CU. The
+   earlier "LDS halves occupancy" claim here was WRONG (occupancy was already
+   VGPR-capped at 1 WG).
+
+   The ATT overlay (single SIMD, sq=75600, 4 iters; `runs/att_kv64sp` vs
+   `runs/att_kv128sp`) shows the regression is entirely in the **memory** phases.
+   Per-tile cycles go 1360 (kv64) → 3095 (kv128) = 2.28× for 2× the keys
+   (~14%/key). WG1 busy-cycle ratios kv128/kv64:
+
+   | phase | kv64 | kv128 | ratio |
+   |---|--:|--:|--:|
+   | memwait | 836 | 4244 | **5.1×** |
+   | load | 60 | 660 | **11×** |
+   | matrix | 476 | 1028 | 2.16× (≈ per-key neutral) |
+   | lds | 400 | 924 | 2.31× |
+   | softmax | 1044 | 1648 | 1.58× (**amortizes**) |
+   | other | 1024 | 1544 | 1.51× |
+   | barrier | 888 | 1108 | 1.25× |
+
+   softmax/other/barrier all grow **sub-2×** (they amortize), matrix/lds grow
+   ~2× (neutral/key); only `memwait`/`load` blow up super-linearly. Pure
+   memory-wait per tile goes 15% → **34%** of the tile. Same total DRAM bytes,
+   same occupancy, but each tile's K/V load is 2× larger and the fixed 2-wave/SIMD
+   parallelism can't hide the longer latency, so it is exposed as stall.
+   MATRIX‖SOFTMAX overlap also drops 10% → 7%.
+
+   This also reconciles the old "kv128 ~10× slower" number: that was
+   **spill-driven** (173 spills thrashing scratch). Single-`sp` removes the
+   spills, leaving a 12% *memory-latency* loss.
+
+**Corollary for the load-decoupling path (below):** widening only the K/V load to
+128 keys gives the *same* doubled per-tile memory latency at the same occupancy,
+so it would hit the same memwait wall unless it also raises in-flight load
+parallelism (more buffering / higher occupancy). The kernel is already
+memory-latency-exposed at kv64 (memwait+load+barrier is a large share of every
+tile). The real lever is **latency hiding / occupancy**, not the KV tile width.
 
 ## Per-wave register maps (both kernels split M the same: 8 warps x 32 rows)
 

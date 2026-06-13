@@ -72,6 +72,7 @@ CFLAGS=(
   -mllvm -enable-post-misched=0
   -fno-gpu-rdc
   -g
+  ${XCFLAGS:-}
 )
 
 echo "[1/4] compiling $INSTANCE ($ARCH) with line tables ..."
