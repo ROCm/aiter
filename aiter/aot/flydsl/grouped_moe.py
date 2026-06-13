@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import sys
 import time
 
@@ -87,8 +86,7 @@ def parse_csv(csv_path: str):
         for row in csv.DictReader(f):
             if not row:
                 continue
-            # Skip blank/incomplete rows (e.g. a trailing whitespace line),
-            # where required columns come back empty or None.
+            # Skip blank/incomplete CSV rows.
             if any(
                 row.get(col) is None or str(row.get(col)).strip() == ""
                 for col in ("model_dim", "inter_dim", "expert", "token")
@@ -194,52 +192,48 @@ def compile_one_config(**job):
         masked_m = torch.full(
             (job["experts"],), job["max_m"], dtype=torch.int32, device=dev
         )
-        # Distinct (experts,) int32 layout tensor mirroring the runtime
-        # contiguous_psum ``psum_t`` output. Passed as ``_m_tile_map`` only for
-        # the contiguous-M variant (None otherwise) -- see the note above.
+        # Contiguous-M layout tensor (mirrors runtime psum_t); None otherwise.
         contiguous_layout = (
             torch.empty((job["experts"],), dtype=torch.int32, device=dev)
             if contiguous
             else None
         )
         y1 = torch.empty((act_lead, rows, job["inter_dim"]), dtype=dtype)
-        x1 = torch.empty(
-            (act_lead, rows, job["model_dim"] // pack), dtype=torch.uint8
-        )
+        x1 = torch.empty((act_lead, rows, job["model_dim"] // pack), dtype=torch.uint8)
         w1 = torch.empty(
             (job["experts"], 2 * job["inter_dim"], job["model_dim"] // 2),
             dtype=torch.uint8,
         )
         sx1 = torch.empty(
-            (act_lead, *_preshuffled_scale_shape(
-                rows, job["model_dim"], warp_tile_m
-            )),
+            (act_lead, *_preshuffled_scale_shape(rows, job["model_dim"], warp_tile_m)),
             dtype=torch.uint8,
         )
         sw1 = torch.empty(
-            (job["experts"], *_preshuffled_scale_shape(
-                2 * job["inter_dim"], job["model_dim"], warp_tile_n
-            )),
+            (
+                job["experts"],
+                *_preshuffled_scale_shape(
+                    2 * job["inter_dim"], job["model_dim"], warp_tile_n
+                ),
+            ),
             dtype=torch.uint8,
         )
         y2 = torch.empty((act_lead, rows, job["model_dim"]), dtype=dtype)
-        x2 = torch.empty(
-            (act_lead, rows, job["inter_dim"] // pack), dtype=torch.uint8
-        )
+        x2 = torch.empty((act_lead, rows, job["inter_dim"] // pack), dtype=torch.uint8)
         w2 = torch.empty(
             (job["experts"], job["model_dim"], job["inter_dim"] // 2),
             dtype=torch.uint8,
         )
         sx2 = torch.empty(
-            (act_lead, *_preshuffled_scale_shape(
-                rows, job["inter_dim"], warp_tile_m
-            )),
+            (act_lead, *_preshuffled_scale_shape(rows, job["inter_dim"], warp_tile_m)),
             dtype=torch.uint8,
         )
         sw2 = torch.empty(
-            (job["experts"], *_preshuffled_scale_shape(
-                job["model_dim"], job["inter_dim"], warp_tile_n
-            )),
+            (
+                job["experts"],
+                *_preshuffled_scale_shape(
+                    job["model_dim"], job["inter_dim"], warp_tile_n
+                ),
+            ),
             dtype=torch.uint8,
         )
         exe1 = compiler1(

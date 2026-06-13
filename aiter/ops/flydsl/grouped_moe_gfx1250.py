@@ -5,13 +5,9 @@
 This module owns the FlyDSL grouped-GEMM path so the generic ``fused_moe``
 dispatcher does not carry gfx1250-specific implementation details.
 
-Optional **DeepGEMM-style contiguous M-tile** scheduler for the grouped GEMM
-(non-persistent): set environment ``AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1`` or add
-CSV column ``grouped_contiguous_m=1`` (mutually exclusive with
-``grouped_persistent_m``).  Contiguous mode uses a **dense** M-tile
-prefix/map (fixed expert-major order); it does **not** use the compact
-``masked_m``-derived tile packing used by persistent-M.  Block swizzle matches
-``deep_gemm::Scheduler::get_swizzled_block_idx`` (``kIsMulticastOnA == false``) in
+Optional **DeepGEMM-style contiguous M-tile** scheduler: set environment
+``AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1`` or CSV column ``grouped_contiguous_m=1``.
+Block swizzle matches ``deep_gemm::Scheduler::get_swizzled_block_idx`` in
 DeepGEMM's ``scheduler.cuh``; optional override ``AITER_DEEPGEMM_NUM_1D_BLOCKS=8|16``.
 """
 
@@ -30,7 +26,6 @@ from aiter.ops.flydsl.moe_common import GateMode
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 _GROUPED_CONFIG_CACHE = {}
-_CONTIGUOUS_LAYOUT_CACHE = {}
 _WARNED_NAIVE_EPILOGUE = False
 # Cache the contiguous uint8 view of static MoE weights so a non-contiguous
 # weight is materialized at most once (not re-copied on every fused_moe call).
@@ -193,14 +188,6 @@ def _use_grouped_gemm_enabled() -> bool:
     return os.environ.get("AITER_USE_GROUPED_GEMM", "1") in _TRUTHY_ENV
 
 
-def _is_stream_capturing() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    try:
-        return torch.cuda.is_current_stream_capturing()
-    except RuntimeError:
-        return False
-
 
 def _align_up(value: int, alignment: int) -> int:
     if alignment <= 0:
@@ -218,43 +205,18 @@ def _make_contiguous_psum_layout(
     tile_m: int,
     token_num: int,
     topk: int,
-    capturing: bool,
 ):
-    """Build DeepGEMM-style psum layout: grouped_layout[e] = actual_end."""
-    device = masked_m.device
-    cache_key = (
-        int(device.index or 0),
-        int(experts),
-        int(max_m),
-        int(tile_m),
-        int(token_num),
-        int(topk),
-    )
-    if capturing:
-        cached = _CONTIGUOUS_LAYOUT_CACHE.get(cache_key)
-        if cached is None:
-            raise RuntimeError(
-                "contiguous grouped GEMM capture requires a warmup call to "
-                "precompute static grouped_layout"
-            )
-        starts_t, psum_t, contiguous_m = cached
-    else:
-        # Tile-aligned exclusive prefix sum over per-expert counts in one FlyDSL
-        # kernel (device-side starts/psum, no torch.cumsum / rocprim scan).
-        from aiter.ops.flydsl.moe_kernels import contiguous_psum
+    """Build DeepGEMM-style psum layout: grouped_layout[e] = actual_end.
 
-        starts_t, psum_t, _ = contiguous_psum(masked_m, int(experts), int(tile_m))
-        # Use a HOST-STATIC upper bound for the contiguous-M dimension so buffer
-        # shapes and the GEMM grid are known without a per-call `.item()` host
-        # sync. The exact size is sum_e ceil(count_e / tile_m) * tile_m; since
-        # sum_e count_e == token_num * topk and each used expert adds < tile_m of
-        # padding, this is bounded by token_num*topk + experts*(tile_m-1). The
-        # GEMM skips padding tiles via the device-side ``psum_t`` ends, and the
-        # gather only reads ``topids_to_rows`` (real rows), so the extra padding
-        # rows are never read -- they only cost a slightly larger allocation.
-        ub = int(token_num) * int(topk) + int(experts) * (int(tile_m) - 1)
-        contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
-        _CONTIGUOUS_LAYOUT_CACHE[cache_key] = (starts_t, psum_t, contiguous_m)
+    contiguous_m is a static upper bound (no .item() sync), so this is safe
+    during CUDAGraph capture. Padding rows are never read by GEMM/gather.
+    """
+    device = masked_m.device
+    from aiter.ops.flydsl.moe_kernels import contiguous_psum
+
+    starts_t, psum_t, _ = contiguous_psum(masked_m, int(experts), int(tile_m))
+    ub = int(token_num) * int(topk) + int(experts) * (int(tile_m) - 1)
+    contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
 
     old_flat = topids_to_rows.reshape(-1)
     expert = torch.div(old_flat, int(max_m), rounding_mode="floor")
@@ -262,11 +224,7 @@ def _make_contiguous_psum_layout(
     new_flat = starts_t[expert.to(torch.long)] + slot
     remapped_topids = new_flat.to(torch.int32).view_as(topids_to_rows)
 
-    # Inverse map (new contiguous row -> source token) in ONE scatter, replacing
-    # the per-expert D2D slice-copy loop (up to E copies + 2 D2H syncs/call --
-    # the dominant Memcpy DtoD source in profiles). Every (token, topk) route is
-    # a valid assignment with slot < count[e], so all new rows are in range and
-    # padding rows stay -1.
+    # Inverse map (contiguous row -> source token) via one scatter.
     remapped_rows = torch.full(
         (int(contiguous_m),), -1, device=device, dtype=torch.int32
     )
@@ -474,9 +432,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if not (is_grouped_a4w4 or is_grouped_a8w4):
         return None
     data_format = "fp4" if is_grouped_a4w4 else "a8w4"
-    # a8w4 weights are fp4 (4-bit) packed into uint8, so w1.dtype shows up as
-    # torch.uint8 upstream. Normalize back to fp4x2 so the CSV lookup key matches
-    # the tuned config (which records q_dtype_w as torch.float4_e2m1fn_x2).
+    # Normalize uint8-viewed fp4 weights back to fp4x2 for CSV key matching.
     q_dtype_w_key = (
         dtypes.fp4x2
         if (q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8)
@@ -527,9 +483,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     num_buffers = 2
     split_k1 = 1
     split_k2 = 1
-    grouped_persistent_m = False
     grouped_contiguous_m = False
-    persistent_workers = None
     cfg_row = _find_grouped_config(
         token_num=_get_padded_M(token_num),
         model_dim=model_dim,
@@ -549,13 +503,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
         split_k1 = _as_int(cfg_row.get("split_k1"), split_k1)
         split_k2 = _as_int(cfg_row.get("split_k2"), split_k2)
-        grouped_persistent_m = _as_bool(
-            cfg_row.get("grouped_persistent_m"), grouped_persistent_m
-        )
         grouped_contiguous_m = _as_bool(
             cfg_row.get("grouped_contiguous_m"), grouped_contiguous_m
         )
-        persistent_workers = _as_int(cfg_row.get("persistent_workers"), None)
         stage1_weight_layout = (
             cfg_row.get("stage1_weight_layout") or stage1_weight_layout
         )
@@ -567,9 +517,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
         grouped_contiguous_m = True
-    # Auto-switch to the DeepGEMM-style contiguous M scheduler once the batch is
-    # large enough: the dense M-tile layout amortizes better than persistent-M at
-    # high token counts. Threshold is overridable via env (default 512).
+    # Switch to DeepGEMM-style contiguous-M at large batches (env-overridable).
     _contig_token_threshold = _as_int(
         os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"), 512
     )
@@ -580,15 +528,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             "auto-enable contiguous M scheduler"
         )
     if grouped_contiguous_m:
-        grouped_persistent_m = False
-        _grouped_dbg("DeepGEMM contiguous M scheduler enabled; persistent-M off")
+        _grouped_dbg("DeepGEMM contiguous M scheduler enabled")
 
     # topk_ids is already an integer tensor; keep one flattened view for routing.
     flat_experts = topk_ids.reshape(-1)
-    _capturing = _is_stream_capturing()
-    # The [crash-probe] stage1/stage2 device syncs are debug-only: they serialize
-    # the pipeline (no copy/compute overlap) and add a full device sync per call.
-    # Gate them behind AITER_GROUPED_DEBUG so production/bench runs skip them.
+    # [crash-probe] syncs are debug-only; gated by AITER_GROUPED_DEBUG.
     _grouped_sync_dbg = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
         "",
         "0",
@@ -602,37 +546,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # (topk_ids is already produced in-range by the router); set the env to 1 to
     # re-enable the check when diagnosing bad route ids. Skip entirely during
     # CUDAGraph capture (dynamic control flow / sync).
-    if not _capturing and os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
-        "",
-        "0",
-        "false",
-        "False",
-    ):
+    if _grouped_sync_dbg:
         if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
             raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
-    # Default max_m comes directly from token_num. Exact per-call max_m requires
-    # a device->host sync (`counts.max().item()`), so keep it behind an opt-in
-    # switch for benchmarking/tuning.
     counts = None
-    use_actual_max_m = (not _capturing) and os.environ.get(
-        "AITER_GROUPED_USE_ACTUAL_MAX_M", "0"
-    ) in _TRUTHY_ENV
-    if use_actual_max_m:
-        counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
-        raw_max_m = int(counts.max().item()) if counts.numel() else 0
-    else:
-        # Static upper bound: each token routes at most one row per expert, so no
-        # expert can receive more than token_num rows. CUDAGraph buckets have
-        # static token_num/topk; per-expert count <= token_num*topk.
-        if (not use_actual_max_m) and cfg_row is not None:
-            raw_max_m = _as_int(cfg_row.get("max_m"), token_num)
-        else:
-            raw_max_m = token_num
+    raw_max_m = _as_int(cfg_row.get("max_m"), token_num) if cfg_row else token_num
     _grouped_dbg(f"routing cfg_row={cfg_row} raw_max_m={raw_max_m}")
     max_m = max(
         warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
     )
-    _grouped_dbg(f"routing max_m={max_m} actual={use_actual_max_m}")
+    _grouped_dbg(f"routing max_m={max_m}")
 
     # Build route maps once. The fast path uses the FlyDSL atomic-scatter kernel;
     # the naive path keeps a deterministic torch fallback for tests/debug.
@@ -664,59 +587,22 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     m_tile_map = None
     route_E = E
     route_max_m = max_m
-    # Persistent-M uses compact prefix/map from per-expert masked_m counts.
-    # Contiguous (DeepGEMM-style) uses a dense expert×M-tile layout instead.
     effective_grouped_contiguous_m = bool(grouped_contiguous_m)
-    effective_grouped_persistent_m = bool(grouped_persistent_m) and not _capturing
-    if not _use_naive and (
-        effective_grouped_persistent_m or effective_grouped_contiguous_m
-    ):
-        _m_tile_cfg = _GroupedA8W4Config(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=E,
-            max_m=max_m,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            m_warp=m_warp,
-            n_warp=n_warp,
-            num_buffers=num_buffers,
-            waves_per_eu=None,
-            out_dtype=out_dtype_str,
-            use_tdm_store=True,
-            inst_prefetch=False,
-            wave_specialized_tdm=False,
-            split_k=1,
-            cluster_m=1,
-            cluster_n=1,
-            use_scale_opsel=False,
-            expert_sched_mode=False,
-            grouped_persistent_m=effective_grouped_persistent_m,
-            grouped_contiguous_m=effective_grouped_contiguous_m,
-            persistent_workers=persistent_workers,
-            data_format=data_format,
-            act="swiglu" if activation == ActivationType.Swiglu else "silu",
-            stage1_weight_layout=stage1_weight_layout,
-        )
-        if effective_grouped_persistent_m:
-            m_tile_prefix, m_tile_map = _make_m_tile_prefix_map(masked_m, _m_tile_cfg)
-        elif effective_grouped_contiguous_m:
-            topids_to_rows, rows_to_tokens, m_tile_map, contiguous_m = (
-                _make_contiguous_psum_layout(
-                    masked_m=masked_m,
-                    rows_to_tokens=rows_to_tokens,
-                    topids_to_rows=topids_to_rows,
-                    experts=E,
-                    max_m=max_m,
-                    tile_m=tile_m,
-                    token_num=token_num,
-                    topk=topk,
-                    capturing=_capturing,
-                )
+    if not _use_naive and effective_grouped_contiguous_m:
+        topids_to_rows, rows_to_tokens, m_tile_map, contiguous_m = (
+            _make_contiguous_psum_layout(
+                masked_m=masked_m,
+                rows_to_tokens=rows_to_tokens,
+                topids_to_rows=topids_to_rows,
+                experts=E,
+                max_m=max_m,
+                tile_m=tile_m,
+                token_num=token_num,
+                topk=topk,
             )
-            route_E = 1
-            route_max_m = int(contiguous_m)
+        )
+        route_E = 1
+        route_max_m = int(contiguous_m)
 
     def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
         from aiter.ops.triton.quant import dynamic_mxfp8_quant
@@ -839,8 +725,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         E, model_dim // _wmma_rep, (inter_dim // 32) * _wmma_rep
     )
 
-    # grouped_a1_scale is produced above: fused gather+preshuffle (fast path) or
-    # scatter + _grouped_a8w4_preshuffle_e8m0_scale (naive path).
+    # grouped_a1_scale already produced above (fast or naive path).
     _grouped_dbg("scale layout done")
 
     grouped_a2 = torch.empty(
@@ -866,9 +751,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         num_buffers=num_buffers,
         split_k=split_k1,
         expert_sched_mode=False,
-        grouped_persistent_m=effective_grouped_persistent_m,
+        grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
-        persistent_workers=persistent_workers,
+        persistent_workers=None,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
     )
@@ -876,7 +761,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
     if _bias1_arg is not None and _bias1_arg.dtype != dtype:
         _bias1_arg = _bias1_arg.to(dtype)
-    if _grouped_sync_dbg and not _capturing:
+    if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage1 tokens={token_num} max_m={max_m} E={E}")
     stage1(
@@ -895,7 +780,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_map=m_tile_map,
         bias=_bias1_arg,
     )
-    if _grouped_sync_dbg and not _capturing:
+    if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage1 sync OK, unsort")
     _grouped_dbg("[crash-probe] after stage1 sync OK")
@@ -956,7 +841,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             .contiguous()
             .view(route_E, route_max_m, inter_dim // 32)
         )
-        if _grouped_sync_dbg and not _capturing:
+        if _grouped_sync_dbg:
             torch.cuda.synchronize()
         _grouped_dbg("[crash-probe] after a2 fp4 quant sync OK")
     else:
@@ -1005,15 +890,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         num_buffers=num_buffers,
         split_k=split_k2,
         expert_sched_mode=False,
-        grouped_persistent_m=effective_grouped_persistent_m,
+        grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
-        persistent_workers=persistent_workers,
+        persistent_workers=None,
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None
     if _bias2_arg is not None and _bias2_arg.dtype != dtype:
         _bias2_arg = _bias2_arg.to(dtype)
-    if _grouped_sync_dbg and not _capturing:
+    if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage2 tokens={token_num} max_m={max_m} E={E}")
     stage2(
@@ -1032,7 +917,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_map=m_tile_map,
         bias=_bias2_arg,
     )
-    if _grouped_sync_dbg and not _capturing:
+    if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage2 sync OK")
     if os.environ.get("MOE_DUMP_INTER", "").strip().lower() not in (
@@ -1072,13 +957,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("gather-reduce output done")
     else:
         _grouped_dbg("start scatter output")
-        # Naive fallback epilogue: a per-expert Python loop that issues E small
-        # D2D copies (and E `.item()` D2H syncs) per call -- the dominant Memcpy
-        # source in profiles. The fast path above (flydsl_moe_gather_reduce, one
-        # kernel) only triggers for non-naive + bf16/fp16. Warn once when we land
-        # here outside CUDAGraph capture so the slow path is easy to spot.
+        # Naive fallback: per-expert D2D loop (slow). Warn once outside capture.
         global _WARNED_NAIVE_EPILOGUE
-        if not _capturing and not _WARNED_NAIVE_EPILOGUE:
+        if not _WARNED_NAIVE_EPILOGUE:
             _WARNED_NAIVE_EPILOGUE = True
             logger.warning(
                 "[grouped_a8w4] slow naive scatter epilogue: per-expert loop "

@@ -651,10 +651,7 @@ def _bench(args: argparse.Namespace) -> None:
         def _thunk():
             return _invoke_grouped_fused_moe(fused_case)
 
-        # AITER_GROUPED_PROFILE=1: stack-attributed torch profiler pass so each
-        # GPU op (incl. "Memcpy DtoD") can be traced back to the exact Python
-        # line that issued it. Helps hunt down stray copies. Writes a Chrome
-        # trace to AITER_GROUPED_PROFILE_TRACE (default /tmp/grouped_trace.json).
+        # AITER_GROUPED_PROFILE=1: torch profiler trace for hunting stray copies.
         if os.environ.get("AITER_GROUPED_PROFILE", "0") not in (
             "",
             "0",

@@ -820,12 +820,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             2 * cfg.inter_dim if cfg.stage1_weight_layout == "gugu" else cfg.inter_dim
         )
 
-    # Lazy compilation: only compile each variant on first use.  The previous
-    # eager approach compiled all 5 variants (fused_base, fused_base_bias,
-    # raw_base, finalize_act, finalize_act_bias) upfront, but at runtime only
-    # 1-2 of them are actually called.  Each compile_mxscale_gemm() call costs
-    # ~0.3s of Python-level closure setup, so deferring saves ~0.9s on first
-    # call and avoids polluting the FlyDSL cache with unused entries.
+    # Lazy compilation: only build each variant on first use (~0.9s saved).
     _lazy = {}
 
     def _get_fused_base():
@@ -1085,10 +1080,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
         else:
-            # The base grouped kernel is compiled with grouped_masked_m=True, so
-            # even the dense non-persistent launcher keeps the masked signature.
-            # Prefix/map tensors are unused in this mode; pass harmless tensor
-            # placeholders to keep the FlyDSL signature aligned.
+            # Dense mode: prefix/map unused, pass placeholders for ABI compat.
             _unused_m_tile_prefix = masked_m
             _unused_m_tile_map = masked_m
             if _gemm_events is not None:
@@ -1364,8 +1356,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
         else:
-            # See the stage1 dense fallback above: the compiled grouped kernel
-            # still exposes the masked launcher ABI in this mode.
+            # Dense mode: prefix/map unused, pass placeholders for ABI compat.
             _unused_m_tile_prefix = masked_m
             _unused_m_tile_map = masked_m
             if _gemm_events is not None:
