@@ -140,6 +140,7 @@ def _find_grouped_config(
     from aiter.jit.utils.chip_info import get_cu_num
 
     keys = {
+        "gfx": str(get_gfx()),
         "cu_num": str(get_cu_num()),
         "token": str(int(token_num)),
         "model_dim": str(int(model_dim)),
@@ -155,6 +156,10 @@ def _find_grouped_config(
     }
     rows = _load_grouped_config_rows()
 
+    # Hardware is locked by (gfx, cu_num): gfx (architecture) is always a hard
+    # constraint, while cu_num can be relaxed as a fallback. Columns missing from
+    # the CSV (e.g. older configs without a 'gfx' column) are skipped, so this
+    # stays backward compatible with pre-gfx tuned files.
     def _matches(row, *, require_cu_num: bool):
         for k, v in keys.items():
             if k == "cu_num" and not require_cu_num:
