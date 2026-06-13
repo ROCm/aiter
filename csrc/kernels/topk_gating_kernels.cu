@@ -125,6 +125,25 @@ __device__ __forceinline__ void sort_network_desc(float* vals, float* orig, int*
         _CAS_DESC(vals, orig, idxs, 3, 4);
         _CAS_DESC(vals, orig, idxs, 2, 3);
     }
+    else if constexpr(N == 8)
+    {   // 19-comparator Batcher odd-even merge sort (optimal for N=8)
+        // Used by opt2 kernel with 256 experts (EPT = 256/32 = 8)
+        _CAS_DESC(vals, orig, idxs, 0, 1); _CAS_DESC(vals, orig, idxs, 2, 3);
+        _CAS_DESC(vals, orig, idxs, 4, 5); _CAS_DESC(vals, orig, idxs, 6, 7);
+
+        _CAS_DESC(vals, orig, idxs, 0, 2); _CAS_DESC(vals, orig, idxs, 1, 3);
+        _CAS_DESC(vals, orig, idxs, 4, 6); _CAS_DESC(vals, orig, idxs, 5, 7);
+
+        _CAS_DESC(vals, orig, idxs, 1, 2); _CAS_DESC(vals, orig, idxs, 5, 6);
+
+        _CAS_DESC(vals, orig, idxs, 0, 4); _CAS_DESC(vals, orig, idxs, 1, 5);
+        _CAS_DESC(vals, orig, idxs, 2, 6); _CAS_DESC(vals, orig, idxs, 3, 7);
+
+        _CAS_DESC(vals, orig, idxs, 2, 4); _CAS_DESC(vals, orig, idxs, 3, 5);
+
+        _CAS_DESC(vals, orig, idxs, 1, 2); _CAS_DESC(vals, orig, idxs, 3, 4);
+        _CAS_DESC(vals, orig, idxs, 5, 6);
+    }
     else
     {   // generic unrolled bubble sort fallback
 #pragma unroll
@@ -236,6 +255,305 @@ __global__ void topk_softplus_kernel_opt(
     {
         topk_weights[token_idx * stride_tk + threadIdx.x] = topk_value * sum;
         topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_indice;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sub-warp argmax: reduce (val, orig, idx) within THREADS_PER_ROW lanes.
+//
+// Uses shfl_xor with offset < THREADS_PER_ROW, which stays within the group:
+//   group-0 lanes [0, TPR)  XOR offset < TPR  → stays in [0, TPR)
+//   group-1 lanes [TPR, 2*TPR) XOR offset < TPR → stays in [TPR, 2*TPR)
+//
+// After return, all lanes in the same group hold identical (val, orig, idx)
+// = the group winner.  val = biased max; orig = unbiased weight of winner;
+// idx = expert index of winner (used to advance the K-merge cursor).
+// ---------------------------------------------------------------------------
+
+template <int THREADS_PER_ROW>
+__device__ __forceinline__ void subwarpArgmax(float& val, float& orig, int& idx)
+{
+#pragma unroll
+    for(int offset = THREADS_PER_ROW >> 1; offset >= 1; offset >>= 1)
+    {
+        float v2 = __shfl_xor(val,  offset);
+        float o2 = __shfl_xor(orig, offset);
+        int   i2 = __shfl_xor(idx,  offset);
+        if(v2 > val) { val = v2; orig = o2; idx = i2; }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prefill-optimised register-only kernel — templatized TOKENS_PER_WARP
+//
+// One 64-lane wavefront handles TPW tokens simultaneously.
+// Lanes are split into TPW sub-groups of THREADS_PER_ROW = 64/TPW lanes.
+// Each lane covers EPT = NUM_EXPERTS / THREADS_PER_ROW experts for its token.
+//
+// Compared to the decode kernel (TPW=1):
+//   - Trades per-token thread count for multi-token throughput
+//   - K-merge reduce uses sub-warp subwarpArgmax (fewer shfl rounds)
+//   - TPW tokens execute concurrently in the same wavefront → TPW× throughput
+//
+// Constraint: topk ≤ THREADS_PER_ROW.  Violated → use TPW=1 kernel.
+// Not used for softmax (needs full-row sum before selection).
+// ---------------------------------------------------------------------------
+
+template <typename DTYPE_I, typename DTYPE_B, int NUM_EXPERTS,
+          bool need_renorm, int SCORE_FUNC = SCORE_SQRTSOFTPLUS, int TPW = 2>
+__global__ void topk_softplus_kernel_opt_n(
+    const DTYPE_I* __restrict__ gating_output,
+    const DTYPE_B* __restrict__ correction_bias,
+    float* __restrict__ topk_weights,
+    int* __restrict__ topk_ids,
+    const size_t stride_tk,
+    const int topk,
+    const int num_tokens,
+    const float routed_scaling_factor)
+{
+    static constexpr int TOKENS_PER_WARP = TPW;
+    static constexpr int THREADS_PER_ROW = WARP_SIZE / TOKENS_PER_WARP;
+    static constexpr int EPT             = NUM_EXPERTS / THREADS_PER_ROW;
+    static_assert(NUM_EXPERTS % THREADS_PER_ROW == 0);
+    static_assert((THREADS_PER_ROW & (THREADS_PER_ROW - 1)) == 0,
+                  "THREADS_PER_ROW must be power of 2");
+
+    const int lane          = static_cast<int>(threadIdx.x);
+    const int token_in_warp = lane / THREADS_PER_ROW;
+    const int lane_in_group = lane % THREADS_PER_ROW;
+    const int token_idx     = blockIdx.x * TOKENS_PER_WARP + token_in_warp;
+
+    // Guard: trailing tokens of the last block may be out of bounds.
+    // Load from token 0 (harmless) and skip the write.
+    const bool valid      = token_idx < num_tokens;
+    auto const* input_ptr = gating_output + (valid ? token_idx : 0) * NUM_EXPERTS;
+
+    float vals[EPT], orig[EPT];
+    int   idxs[EPT];
+
+#pragma unroll
+    for(int i = 0; i < EPT; i++)
+    {
+        int   e     = lane_in_group + i * THREADS_PER_ROW;
+        float score = compute_score<SCORE_FUNC>(static_cast<float>(input_ptr[e]));
+        orig[i]     = score;
+        vals[i]     = score;
+        idxs[i]     = e;
+        if(correction_bias != nullptr)
+            vals[i] += static_cast<float>(correction_bias[e]);
+    }
+
+    sort_network_desc<EPT>(vals, orig, idxs);
+
+    int   cursor      = 0;
+    float sum         = 0.0f;
+    int   topk_indice = 0;
+    float topk_value  = 0.0f;
+
+    for(int k = 0; k < topk; ++k)
+    {
+        float my_val  = (cursor < EPT) ? vals[cursor] : -INFINITY;
+        float my_orig = (cursor < EPT) ? orig[cursor] : 0.0f;
+        int   my_idx  = (cursor < EPT) ? idxs[cursor] : 0;
+
+        // Sub-warp reduce within group; returns winner broadcast to all
+        // lanes in the group.  Each group operates independently.
+        subwarpArgmax<THREADS_PER_ROW>(my_val, my_orig, my_idx);
+
+        // Advance cursor for the lane that originally held the winning expert.
+        bool i_won = (cursor < EPT && idxs[cursor] == my_idx);
+        if(i_won) cursor++;
+
+        if(lane_in_group == k)
+        {
+            topk_indice = my_idx;
+            topk_value  = my_orig;  // unbiased score, broadcast from winner
+        }
+        if constexpr(need_renorm) sum += my_orig;
+    }
+
+    if constexpr(need_renorm)
+        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+    else
+        sum = routed_scaling_factor;
+
+    if(lane_in_group < topk && valid)
+    {
+        topk_weights[token_idx * stride_tk + lane_in_group] = topk_value * sum;
+        topk_ids[token_idx * stride_tk + lane_in_group]     = topk_indice;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prefill kernel: templatized TOKENS_PER_WARP + vectorized global load
+//
+// Register-only scan+invalidate kernel (vLLM-style).
+// Each thread loads a consecutive block of VPT experts via vector LDG.
+// Top-k selection via per-thread linear scan + subwarpArgmax + invalidate.
+// No sorting network, no shared memory.
+//
+// VPT = NUM_EXPERTS / THREADS_PER_ROW.  Effective when VPT ≤ 16.
+//   E=64  TPW=16: VPT=4,  TPR=4   (16 tokens/warp)
+//   E=64  TPW=8:  VPT=8,  TPR=8   (8 tokens/warp)
+//   E=128 TPW=8:  VPT=16, TPR=8   (8 tokens/warp)
+//   E=128 TPW=4:  VPT=8,  TPR=16  (4 tokens/warp)
+//   E=256 TPW=4:  VPT=16, TPR=16  (4 tokens/warp)
+//   E=256 TPW=2:  VPT=8,  TPR=32  (2 tokens/warp)
+//
+// Constraint: topk ≤ THREADS_PER_ROW, NUM_EXPERTS % THREADS_PER_ROW == 0.
+// Not used for softmax (needs full-row sum before selection).
+// ---------------------------------------------------------------------------
+
+template <typename DTYPE_I, typename DTYPE_B, int NUM_EXPERTS,
+          bool need_renorm, int SCORE_FUNC = SCORE_SQRTSOFTPLUS, int TPW = 2>
+__global__ __launch_bounds__(64)
+void topk_softplus_kernel_prefill(
+    const DTYPE_I* __restrict__ gating_output,
+    const DTYPE_B* __restrict__ correction_bias,
+    float* __restrict__ topk_weights,
+    int* __restrict__ topk_ids,
+    const size_t stride_tk,
+    const int topk,
+    const int num_tokens,
+    const float routed_scaling_factor)
+{
+    static constexpr int TOKENS_PER_WARP = TPW;
+    static constexpr int THREADS_PER_ROW = WARP_SIZE / TOKENS_PER_WARP;
+    static constexpr int VPT             = NUM_EXPERTS / THREADS_PER_ROW;
+    static_assert(NUM_EXPERTS % THREADS_PER_ROW == 0);
+    static_assert((THREADS_PER_ROW & (THREADS_PER_ROW - 1)) == 0,
+                  "THREADS_PER_ROW must be power of 2");
+
+    // Vector load sizing: largest power-of-2 factor of VPT, capped at 16 bytes.
+    // n & -n gives the lowest set bit = largest power-of-2 dividing n.
+    //   VPT=2  → 2; VPT=4 → 4; VPT=8 → 8; VPT=12 → 4
+    static constexpr int VPT_POW2      = VPT & (-VPT);
+    static constexpr int MAX_ELTS      = 16 / static_cast<int>(sizeof(DTYPE_I));
+    static constexpr int ELTS_PER_LDG  = VPT_POW2 < MAX_ELTS ? VPT_POW2 : MAX_ELTS;
+    static constexpr int LDG_PER_THREAD = VPT / ELTS_PER_LDG;
+    static_assert(VPT % ELTS_PER_LDG == 0);
+
+    using cktype_i   = typename hip2opus<DTYPE_I>::type;
+    using AccessType = opus::vector_t<cktype_i, ELTS_PER_LDG>;
+
+    const int lane          = static_cast<int>(threadIdx.x);
+    const int token_in_warp = lane / THREADS_PER_ROW;
+    const int lane_in_group = lane % THREADS_PER_ROW;
+    const int token_idx     = blockIdx.x * TOKENS_PER_WARP + token_in_warp;
+
+    const bool valid = token_idx < num_tokens;
+    // Each thread points directly to its VPT consecutive experts.
+    // Threads 0..31 (token A): experts [0, VPT), [VPT, 2*VPT), ...
+    // Threads 32..63 (token B): same layout for their own token.
+    const DTYPE_I* input_ptr = gating_output
+                             + (valid ? token_idx : 0) * NUM_EXPERTS
+                             + lane_in_group * VPT;
+
+    float row_chunk[VPT];  // biased selection scores
+    float row_orig[VPT];   // unbiased weights
+
+    // Vectorized load: LDG_PER_THREAD instructions cover all VPT experts.
+#pragma unroll
+    for(int ldg = 0; ldg < LDG_PER_THREAD; ++ldg)
+    {
+        AccessType vec = reinterpret_cast<const AccessType*>(input_ptr)[ldg];
+#pragma unroll
+        for(int j = 0; j < ELTS_PER_LDG; ++j)
+        {
+            int elt             = ldg * ELTS_PER_LDG + j;
+            float score         = compute_score<SCORE_FUNC>(static_cast<float>(vec[j]));
+            row_orig[elt]       = score;
+            row_chunk[elt]      = score;
+            if(correction_bias != nullptr) {
+                int global_e    = lane_in_group * VPT + elt;
+                row_chunk[elt] += static_cast<float>(correction_bias[global_e]);
+            }
+        }
+    }
+
+    // Softmax: register-only normalize (max → exp → sum → scale),
+    // then add bias for topk selection.  row_orig[] holds unbiased softmax weights.
+    if constexpr(SCORE_FUNC == SCORE_SOFTMAX)
+    {
+        float local_max = row_chunk[0];
+#pragma unroll
+        for(int i = 1; i < VPT; i++)
+            local_max = fmaxf(local_max, row_chunk[i]);
+#pragma unroll
+        for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
+            local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+
+        float local_sum = 0.0f;
+#pragma unroll
+        for(int i = 0; i < VPT; i++)
+        {
+            row_chunk[i] = exp2f((row_chunk[i] - local_max) * 1.4426950408889634f);
+            local_sum += row_chunk[i];
+        }
+#pragma unroll
+        for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
+            local_sum += __shfl_xor(local_sum, off);
+
+        float inv_sum = __builtin_amdgcn_rcpf(local_sum);
+#pragma unroll
+        for(int i = 0; i < VPT; i++)
+        {
+            row_chunk[i] *= inv_sum;
+            row_orig[i]   = row_chunk[i];
+            if(correction_bias != nullptr)
+                row_chunk[i] += static_cast<float>(correction_bias[lane_in_group * VPT + i]);
+        }
+    }
+
+    // K-way merge:
+    //   1. Thread-local linear scan finds its best remaining candidate.
+    //   2. subwarpArgmax selects the group winner.
+    //   3. Winner clears its expert from row_chunk to prevent re-selection.
+    float sum         = 0.0f;
+    int   topk_indice = 0;
+    float topk_value  = 0.0f;
+
+    for(int k = 0; k < topk; ++k)
+    {
+        float local_val  = row_chunk[0];
+        float local_orig = row_orig[0];
+        int   local_idx  = lane_in_group * VPT;
+#pragma unroll
+        for(int i = 1; i < VPT; ++i)
+        {
+            if(row_chunk[i] > local_val)
+            {
+                local_val  = row_chunk[i];
+                local_orig = row_orig[i];
+                local_idx  = lane_in_group * VPT + i;
+            }
+        }
+
+        float best_val  = local_val;
+        float best_orig = local_orig;
+        int   best_idx  = local_idx;
+        subwarpArgmax<THREADS_PER_ROW>(best_val, best_orig, best_idx);
+
+        if(lane_in_group == k)
+        {
+            topk_indice = best_idx;
+            topk_value  = best_orig;
+        }
+        if constexpr(need_renorm) sum += best_orig;
+
+        if(lane_in_group == best_idx / VPT)
+            row_chunk[best_idx % VPT] = -INFINITY;
+    }
+
+    if constexpr(need_renorm)
+        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+    else
+        sum = routed_scaling_factor;
+
+    if(lane_in_group < topk && valid)
+    {
+        topk_weights[token_idx * stride_tk + lane_in_group] = topk_value * sum;
+        topk_ids[token_idx * stride_tk + lane_in_group]     = topk_indice;
     }
 }
 
@@ -366,6 +684,182 @@ __global__ void topk_softplus_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Prefill smem kernel — templatized ROWS_PER_WARP (multi-token per wavefront)
+//
+// One 64-lane wavefront handles RPW tokens simultaneously.
+// Lanes are split into RPW sub-groups of THREADS_PER_ROW = 64/RPW lanes each.
+// Sub-group g owns token (blockIdx.x * RPW + g) and smem slice
+//   scores_all + g * num_experts.
+//
+// Each sub-group reads / writes only its own smem slice.  LDS is coherent
+// within a wavefront so no __syncthreads() is needed between K-merge rounds.
+//
+// Reduces: shfl_xor(offset < THREADS_PER_ROW) naturally stays within the
+// aligned sub-group for any power-of-2 THREADS_PER_ROW.
+//
+// Constraint: topk ≤ THREADS_PER_ROW (each lane stores one topk slot).
+// Falls back to the single-token smem kernel when topk > THREADS_PER_ROW
+// or tokens < threshold.
+// ---------------------------------------------------------------------------
+
+template <typename DTYPE_I, typename DTYPE_B, typename f32vec, bool need_renorm,
+          int SCORE_FUNC = SCORE_SQRTSOFTPLUS, int RPW = 2>
+__global__ void topk_softplus_kernel_smem_n(
+    const DTYPE_I* __restrict__ gating_output,
+    const DTYPE_B* __restrict__ correction_bias,
+    float* __restrict__ topk_weights,
+    int* __restrict__ topk_ids,
+    const size_t stride_tk,
+    const int num_experts,
+    const int topk,
+    const int num_tokens,
+    const float routed_scaling_factor)
+{
+    static constexpr int ROWS_PER_WARP   = RPW;
+    static constexpr int THREADS_PER_ROW = WARP_SIZE / ROWS_PER_WARP;
+    static_assert((THREADS_PER_ROW & (THREADS_PER_ROW - 1)) == 0,
+                  "THREADS_PER_ROW must be power of 2");
+    static_assert(ROWS_PER_WARP >= 1 && ROWS_PER_WARP <= WARP_SIZE,
+                  "ROWS_PER_WARP out of range");
+
+    extern __shared__ char shared_mem[];
+    float* scores_all = reinterpret_cast<float*>(shared_mem);
+
+    const int warp_row    = static_cast<int>(threadIdx.x) / THREADS_PER_ROW;  // 0..RPW-1
+    const int lane_in_row = static_cast<int>(threadIdx.x) % THREADS_PER_ROW;
+    const int token_idx   = blockIdx.x * ROWS_PER_WARP + warp_row;
+
+    // Each token's scores sit in its own smem slice (no cross-group aliasing).
+    float* scores = scores_all + warp_row * num_experts;
+
+    using cktype_i                = typename hip2opus<DTYPE_I>::type;
+    f32vec* scores_vec            = reinterpret_cast<f32vec*>(scores);
+    static constexpr int vec_size = opus::vector_traits<f32vec>::size();
+    using vec_i                   = opus::vector_t<cktype_i, vec_size>;
+    const int num_experts_vec     = num_experts / vec_size;
+
+    // Guard: trailing tokens of the last block may be out of range.
+    const bool valid      = token_idx < num_tokens;
+    auto const* input_ptr = gating_output + (valid ? token_idx : 0) * num_experts;
+
+    // -----------------------------------------------------------------------
+    // Step 1: load + score (stride = THREADS_PER_ROW within the group)
+    // -----------------------------------------------------------------------
+    for(int e = lane_in_row; e < num_experts_vec; e += THREADS_PER_ROW)
+    {
+        vec_i tmp = reinterpret_cast<vec_i const*>(input_ptr)[e];
+        f32vec gating;
+#pragma unroll
+        for(int i = 0; i < vec_size; i++)
+        {
+            gating[i] = compute_score<SCORE_FUNC>(static_cast<float>(tmp[i]));
+            if constexpr(SCORE_FUNC != SCORE_SOFTMAX)
+            {
+                if(correction_bias != nullptr)
+                    gating[i] += static_cast<float>(correction_bias[e * vec_size + i]);
+            }
+        }
+        scores_vec[e] = gating;
+    }
+    for(int e = num_experts_vec * vec_size + lane_in_row; e < num_experts; e += THREADS_PER_ROW)
+    {
+        scores[e] = compute_score<SCORE_FUNC>(static_cast<float>(input_ptr[e]));
+        if constexpr(SCORE_FUNC != SCORE_SOFTMAX)
+        {
+            if(correction_bias != nullptr)
+                scores[e] += static_cast<float>(correction_bias[e]);
+        }
+    }
+    __syncthreads();  // both groups must finish writing before K-merge reads
+
+    // -----------------------------------------------------------------------
+    // Step 2: softmax (if needed) — sub-warp reduce per group
+    // -----------------------------------------------------------------------
+    if constexpr(SCORE_FUNC == SCORE_SOFTMAX)
+    {
+        float local_max = -INFINITY;
+        for(int e = lane_in_row; e < num_experts; e += THREADS_PER_ROW)
+            local_max = fmaxf(local_max, scores[e]);
+#pragma unroll
+        for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
+            local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+
+        float local_sum = 0.0f;
+        for(int e = lane_in_row; e < num_experts; e += THREADS_PER_ROW)
+        {
+            scores[e] = exp2f((scores[e] - local_max) * 1.4426950408889634f);
+            local_sum += scores[e];
+        }
+#pragma unroll
+        for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
+            local_sum += __shfl_xor(local_sum, off);
+
+        float inv_sum = __builtin_amdgcn_rcpf(local_sum);
+        for(int e = lane_in_row; e < num_experts; e += THREADS_PER_ROW)
+        {
+            scores[e] *= inv_sum;
+            if(correction_bias != nullptr)
+                scores[e] += static_cast<float>(correction_bias[e]);
+        }
+        __syncthreads();
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 3: K-merge — sub-warp argmax, clears winner in smem
+    // -----------------------------------------------------------------------
+    float sum         = 0.0f;
+    int   topk_indice = 0;
+    float topk_value  = 0.0f;
+
+    for(int k = 0; k < topk; ++k)
+    {
+        float max_val = -INFINITY;
+        int   max_idx = lane_in_row;  // fallback (never written)
+        for(int e = lane_in_row; e < num_experts_vec; e += THREADS_PER_ROW)
+        {
+            f32vec tmp = scores_vec[e];
+#pragma unroll
+            for(int i = 0; i < vec_size; i++)
+            {
+                if(tmp[i] > max_val) { max_val = tmp[i]; max_idx = e * vec_size + i; }
+            }
+        }
+        // sub-warp argmax (shfl_xor stays within the aligned group)
+#pragma unroll
+        for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
+        {
+            float v2 = __shfl_xor(max_val, off);
+            int   i2 = __shfl_xor(max_idx, off);
+            if(v2 > max_val) { max_val = v2; max_idx = i2; }
+        }
+
+        if(correction_bias != nullptr)
+            max_val -= static_cast<float>(correction_bias[max_idx]);
+
+        // Clear winner — visible to all lanes in this group (LDS coherent in wavefront)
+        scores[max_idx] = -INFINITY;
+
+        if(lane_in_row == k)
+        {
+            topk_indice = max_idx;
+            topk_value  = max_val;
+        }
+        if constexpr(need_renorm) sum += max_val;
+    }
+
+    if constexpr(need_renorm)
+        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+    else
+        sum = routed_scaling_factor;
+
+    if(lane_in_row < topk && valid)
+    {
+        topk_weights[token_idx * stride_tk + lane_in_row] = topk_value * sum;
+        topk_ids[token_idx * stride_tk + lane_in_row]     = topk_indice;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Launch macros
 // ---------------------------------------------------------------------------
 
@@ -382,6 +876,36 @@ __global__ void topk_softplus_kernel(
     hipLaunchKernelGGL(                                                                          \
         (aiter::topk_softplus_kernel_opt<scalar_t, bias_scalar_t, NE, RENORM, SF>),              \
         dim3(grid), dim3(block), 0, stream,                                                      \
+        reinterpret_cast<const scalar_t*>(gating_output.data_ptr()),                              \
+        has_bias ? reinterpret_cast<const bias_scalar_t*>(correction_bias.data_ptr()) : nullptr,  \
+        topk_weights.data_ptr<float>(), topk_indices.data_ptr<int>(),                            \
+        stride_tk, topk, num_tokens, routed_scaling_factor);
+
+// opt_n: register-only prefill kernel with TOKENS_PER_WARP=TPW.
+#define LAUNCH_TOPK_KERNEL_OPT_N(NE, RENORM, SF, TPW)                                           \
+    hipLaunchKernelGGL(                                                                          \
+        (aiter::topk_softplus_kernel_opt_n<scalar_t, bias_scalar_t, NE, RENORM, SF, TPW>),       \
+        dim3((num_tokens + (TPW) - 1) / (TPW)), dim3(block), 0, stream,                         \
+        reinterpret_cast<const scalar_t*>(gating_output.data_ptr()),                              \
+        has_bias ? reinterpret_cast<const bias_scalar_t*>(correction_bias.data_ptr()) : nullptr,  \
+        topk_weights.data_ptr<float>(), topk_indices.data_ptr<int>(),                            \
+        stride_tk, topk, num_tokens, routed_scaling_factor);
+
+// smem_n: ROWS_PER_WARP=RPW shared-memory kernel; smem = RPW * num_experts floats.
+#define LAUNCH_TOPK_KERNEL_SMEM_N(VEC_F, RENORM, SF, RPW)                                       \
+    hipLaunchKernelGGL(                                                                          \
+        (aiter::topk_softplus_kernel_smem_n<scalar_t, bias_scalar_t, VEC_F, RENORM, SF, RPW>),   \
+        dim3((num_tokens + (RPW) - 1) / (RPW)), dim3(block), (RPW) * shared_mem_size, stream,   \
+        reinterpret_cast<const scalar_t*>(gating_output.data_ptr()),                              \
+        has_bias ? reinterpret_cast<const bias_scalar_t*>(correction_bias.data_ptr()) : nullptr,  \
+        topk_weights.data_ptr<float>(), topk_indices.data_ptr<int>(),                            \
+        stride_tk, num_experts, topk, num_tokens, routed_scaling_factor);
+
+// prefill: vectorized-load scan+invalidate kernel, templatized TPW.
+#define LAUNCH_TOPK_KERNEL_PREFILL_N(NE, RENORM, SF, TPW)                                       \
+    hipLaunchKernelGGL(                                                                          \
+        (aiter::topk_softplus_kernel_prefill<scalar_t, bias_scalar_t, NE, RENORM, SF, TPW>),     \
+        dim3((num_tokens + (TPW) - 1) / (TPW)), dim3(block), 0, stream,                         \
         reinterpret_cast<const scalar_t*>(gating_output.data_ptr()),                              \
         has_bias ? reinterpret_cast<const bias_scalar_t*>(correction_bias.data_ptr()) : nullptr,  \
         topk_weights.data_ptr<float>(), topk_indices.data_ptr<int>(),                            \
@@ -459,6 +983,29 @@ void topk_softplus(torch::Tensor& topk_weights,
         // Register-only opt kernel (NOT supported for softmax: needs global reduce).
         if constexpr(SF != SCORE_SOFTMAX)
         {
+            // opt_n: prefill path — multi-token sort+merge kernel.
+            // Only used where benchmarked breakeven shows net gain:
+            //   E=64  TPW=8: breakeven ~T=2048, 1.5-1.9x at T=8192+
+            //   E=128 TPW=4: breakeven ~T=4096, 1.2-1.3x at T=8192+
+            //   E=256 TPW=2: never breaks even (sort EPT=8 cost > 2x throughput gain)
+            //   E=384: TPW=1 only (EPT=12 bubble sort too expensive)
+#define _DISPATCH_OPT_N_KERNEL(NE, TPW)                                          \
+    if(num_experts == NE) {                                                       \
+        if(need_renorm) { LAUNCH_TOPK_KERNEL_OPT_N(NE, true,  SF, TPW) }        \
+        else            { LAUNCH_TOPK_KERNEL_OPT_N(NE, false, SF, TPW) }        \
+        return;                                                                   \
+    }
+            if(topk <= 8 && num_experts == 64 && num_tokens >= 4096)
+            {
+                _DISPATCH_OPT_N_KERNEL(64, 8)
+            }
+            if(topk <= 16 && num_experts == 128 && num_tokens >= 4096)
+            {
+                _DISPATCH_OPT_N_KERNEL(128, 4)
+            }
+#undef _DISPATCH_OPT_N_KERNEL
+
+            // opt1 (TOKENS_PER_WARP=1): decode path, or topk > 32, or few tokens.
 #define _DISPATCH_REG_KERNEL(NE)                                          \
     if(num_experts == NE) {                                                \
         if(need_renorm) { LAUNCH_TOPK_KERNEL_OPT(NE, true,  SF) }         \
@@ -472,8 +1019,105 @@ void topk_softplus(torch::Tensor& topk_weights,
 #undef _DISPATCH_REG_KERNEL
         }
 
+        // prefill_n: register-only scan+invalidate (vLLM-style).
+        // Supports all score functions including softmax (register-only normalize).
+        // VPT = E / TPR.  Effective when VPT ≤ 16.
+        // Thresholds:
+        //   sigmoid/softplus: T≥4096 (compute_score is heavier per element)
+        //   softmax: T≥1 (all T — register-only softmax beats smem for any token count)
+        {
+            const int prefill_n_threshold = (sf_code == SCORE_SOFTMAX) ? 1 : 4096;
+#define _DISPATCH_PREFILL_N_KERNEL(NE, TPW)                                      \
+    if(num_experts == NE) {                                                       \
+        if(need_renorm) { LAUNCH_TOPK_KERNEL_PREFILL_N(NE, true,  SF, TPW) }    \
+        else            { LAUNCH_TOPK_KERNEL_PREFILL_N(NE, false, SF, TPW) }    \
+        return;                                                                   \
+    }
+            if(num_tokens >= prefill_n_threshold)
+            {
+                // For softmax at small T, use TPW=1 (decode).
+                // For large T, use higher TPW for multi-token throughput.
+                int best_tpw = 1;
+                if(num_tokens >= 1024)
+                {
+                    if(topk <= 8)
+                        best_tpw = (num_experts <= 64) ? 8 : (num_experts <= 128) ? 8 : 4;
+                    else if(topk <= 16)
+                        best_tpw = 4;
+                }
+                // Compile-time dispatch of TPW (must be static for template).
+                // TPW=1 covers decode + small T for all score functions.
+                if(best_tpw >= 8 && topk <= 8)
+                {
+                    _DISPATCH_PREFILL_N_KERNEL(64,  8)
+                    _DISPATCH_PREFILL_N_KERNEL(128, 8)
+                }
+                if(best_tpw >= 4)
+                {
+                    if(topk <= 8)
+                    {
+                        _DISPATCH_PREFILL_N_KERNEL(256, 4)
+                    }
+                    if(topk <= 16)
+                    {
+                        _DISPATCH_PREFILL_N_KERNEL(64,  4)
+                        _DISPATCH_PREFILL_N_KERNEL(128, 4)
+                        _DISPATCH_PREFILL_N_KERNEL(256, 4)
+                    }
+                }
+                // TPW=1 fallback for known expert counts
+                _DISPATCH_PREFILL_N_KERNEL(64,  1)
+                _DISPATCH_PREFILL_N_KERNEL(128, 1)
+                _DISPATCH_PREFILL_N_KERNEL(256, 1)
+                _DISPATCH_PREFILL_N_KERNEL(384, 1)
+            }
+#undef _DISPATCH_PREFILL_N_KERNEL
+        }
+
         // Shared-memory fallback kernel
         const size_t shared_mem_size = num_experts * sizeof(float);
+
+        // smem_n (ROWS_PER_WARP=N): prefill path for smem kernel.
+        // Each block handles N tokens using N separate smem slices.
+        // Benchmarked breakeven points (softmax K=8 bf16):
+        //   E≤64  RPW=8: breakeven ~T=1024, 1.3-3.1x at T=2048+
+        //   E≤128 RPW=4: breakeven ~T=1024, 1.2-2.1x at T=2048+
+        //   E≤256 RPW=2: breakeven ~T=4096, 1.1x at T=8192+
+#define _DISPATCH_SMEM_N_KERNEL(VEC_LANES, RPW)                               \
+    {                                                                         \
+        using VT = opus::vector_t<float, VEC_LANES>;                          \
+        if(need_renorm) { LAUNCH_TOPK_KERNEL_SMEM_N(VT, true,  SF, RPW) }    \
+        else            { LAUNCH_TOPK_KERNEL_SMEM_N(VT, false, SF, RPW) }    \
+        return;                                                               \
+    }
+#define _DISPATCH_SMEM_N_VEC(RPW)                                             \
+    switch(num_experts % 4)                                                   \
+    {                                                                         \
+    case 0:  _DISPATCH_SMEM_N_KERNEL(4, RPW) break;                           \
+    case 2:  _DISPATCH_SMEM_N_KERNEL(2, RPW) break;                           \
+    default: _DISPATCH_SMEM_N_KERNEL(1, RPW) break;                           \
+    }
+        // Dispatch order: most aggressive RPW first, with guards.
+        // RPW is effective only when experts_per_thread (= E / THREADS_PER_ROW)
+        // stays small. Benchmarked limits:
+        //   RPW=8 (TPR=8):  E≤64  → 8 experts/thread, OK
+        //   RPW=4 (TPR=16): E≤128 → 8 experts/thread, OK
+        //   RPW=2 (TPR=32): E≤256 → 8 experts/thread, OK
+        if(topk <= 8 && num_experts <= 64 && num_tokens >= 1024)
+        {
+            _DISPATCH_SMEM_N_VEC(8)
+        }
+        if(topk <= 16 && num_experts <= 128 && num_tokens >= 1024)
+        {
+            _DISPATCH_SMEM_N_VEC(4)
+        }
+        if(topk <= 32 && num_experts <= 256 && num_tokens >= 4096)
+        {
+            _DISPATCH_SMEM_N_VEC(2)
+        }
+#undef _DISPATCH_SMEM_N_VEC
+#undef _DISPATCH_SMEM_N_KERNEL
+
 #define _DISPATCH_SMEM_KERNEL(VEC_LANES)                                  \
     {                                                                      \
         using VT = opus::vector_t<float, VEC_LANES>;                       \

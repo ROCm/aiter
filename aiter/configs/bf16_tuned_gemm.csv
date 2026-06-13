@@ -1,1 +1,11 @@
 gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,kernelName,err_ratio,tflops,bw
+gfx942,80,64,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,5,16,9.698,_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE,0.0,17.3,341.26
+gfx942,80,80,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,3,10,10.4375,_ZN5aiter39bf16gemm_fp32bf16_tn_48x64_splitk_cleanE,0.0,20.09,333.57
+gfx942,80,128,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,5,10,11.8023,_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE,0.0,28.43,338.72
+gfx942,80,150,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,7,10,13.4694,_ZN5aiter39bf16gemm_fp32bf16_tn_80x64_splitk_cleanE,0.0,29.19,314.36
+gfx942,80,192,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,3,5,14.6866,_ZN5aiter39bf16gemm_fp32bf16_tn_48x64_splitk_cleanE,0.0,34.27,319.05
+gfx942,80,220,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,5,5,15.2899,_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE,0.0,37.72,326.16
+gfx942,80,256,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,5,5,16.4967,_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE,0.0,40.68,325.76
+gfx942,80,384,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,8,5,21.7751,_ZN5aiter39bf16gemm_fp32bf16_tn_96x64_splitk_cleanE,0.0,46.23,310.0
+gfx942,80,448,256,5120,False,torch.bfloat16,torch.float32,False,False,opus,50202,0,31.5141,opus_gemm_gfx942_splitk_legacy_256x128x64x64_2x2_16x16x16_0x0x0,0.0,37.27,236.03
+gfx942,80,512,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,5,2,29.6218,_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE,0.0,45.31,274.34
