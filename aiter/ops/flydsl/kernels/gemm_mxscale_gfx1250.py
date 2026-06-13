@@ -2182,8 +2182,13 @@ def compile_mxscale_gemm(
             adv_a_i32 = arith.constant(tile_k // PACK_FACTOR_A, type=T.i32)
             adv_b_i32 = arith.constant(packed_tile_k_b * 16, type=T.i32)
             adv_as_i32 = arith.constant(tile_k // SCALE_BLOCK * wmma_m_rep, type=T.i32)
+            # Per-k-tile gmem advance of the B-scale descriptor in the
+            # steady-state loop must match make_desc_bs's per-tile column stride.
+            # n4k8: inner_off = k_scale_off*64 -> stride (tile_k//32)*64.
+            # interleaved: inner_off = k_scale_off*b_scale_load_rep -> *b_scale_load_rep.
             adv_bs_i32 = arith.constant(
-                tile_k // SCALE_BLOCK * b_scale_load_rep, type=T.i32
+                tile_k // SCALE_BLOCK * (64 if b_n4k8 else b_scale_load_rep),
+                type=T.i32,
             )
 
             if const_expr(grouped_masked_m):
