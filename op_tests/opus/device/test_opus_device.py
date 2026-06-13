@@ -183,6 +183,13 @@ class OpusDeviceLib:
         fn.argtypes = [_VP, _VP, _VP, _I]
         fn(self._ptr(A), self._ptr(B), self._ptr(Result), int(A.numel()))
 
+    # -- opus_gmem_gfx1100 (verifies opus.hpp parses + opus utils work on gfx1100) --
+    def run_opus_gmem_gfx1100(self, A, B, Result):
+        fn = self._lib.run_opus_gmem_gfx1100
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I]
+        fn(self._ptr(A), self._ptr(B), self._ptr(Result), int(A.numel()))
+
     # -- wmma_gfx1201 (8 wave32 16x16x16 variants via __builtin_amdgcn_wmma_*_w32_gfx12) --
     def _run_wmma_gfx1201(self, suffix, A, B, C):
         fn = getattr(self._lib, f"run_wmma_gfx1201_{suffix}")
@@ -384,6 +391,7 @@ _MFMA_ARCHS_GFX942_GFX950 = {"gfx942", "gfx950"}  # 32x32x16, 16x16x32
 _MFMA_ALL = _MFMA_ARCHS_GFX942 | _MFMA_ARCHS_GFX942_GFX950  # all archs with MFMA
 _WMMA_ARCHS_GFX1250 = {"gfx1250"}  # WMMA 16x16x32 (wave32)
 _TR_LOAD_ARCHS_GFX950 = {"gfx950"}  # smem tr_load
+_SKIP_FP8_GFX11 = {"gfx1100"}
 
 
 # FP8/BF8 torch dtypes differ by architecture:
@@ -1271,6 +1279,7 @@ def test_vector_add(mod):
 # on other archs the launcher runs an empty kernel, so we skip the correctness
 # check to avoid a misleading failure.
 _OPUS_PARSE_GFX1201_ARCHS = {"gfx1201", "gfx1200"}
+_OPUS_PARSE_GFX1100_ARCHS = {"gfx1100"}
 
 
 def test_opus_gmem_gfx1201(mod):
@@ -1598,6 +1607,46 @@ def test_wmma_gfx1201_tiled_f32_bf16(mod):
         torch.float32,
     )
 
+
+# ---------------------------------------------------------------------------
+# gfx1100 (RDNA3, Navi 31) tests
+# ---------------------------------------------------------------------------
+
+
+def test_opus_gmem_gfx1100(mod):
+    """Verify opus.hpp parses + opus utilities (make_gmem / .load/.store /
+    cast) work on gfx1100. Mirrors the load → cast<float> → store pattern
+    in sample_kernels.cu. Skips on other archs (kernel body is gfx1100-only)."""
+    arch = _get_gpu_arch()
+    if arch not in _OPUS_PARSE_GFX1100_ARCHS:
+        print(f"  SKIP: opus_gmem_gfx1100 (arch={arch}, gfx1100-only test)")
+        return 0
+
+    n = 1310720
+    device = torch.device("cuda")
+    dtype = torch.float32
+
+    torch.manual_seed(42)
+    A = torch.randn(n, device=device, dtype=dtype)
+    B = torch.randn(n, device=device, dtype=dtype)
+    Result = torch.empty(n, device=device, dtype=dtype)
+
+    mod.run_opus_gmem_gfx1100(A, B, Result)
+
+    Ref = A + B
+
+    atol, rtol = 1e-5, 1e-5
+    ok = torch.allclose(Result, Ref, atol=atol, rtol=rtol)
+    max_diff = (Result - Ref).abs().max().item()
+    if not ok:
+        diff_count = (Result - Ref).abs().gt(atol + rtol * Ref.abs()).sum().item()
+        print(
+            f"  FAIL: opus_gmem_gfx1100 max_diff={max_diff:.6e}, "
+            f"{diff_count} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: opus_gmem_gfx1100 (arch={arch}, n={n}), max_diff={max_diff:.6e}")
+    return 0
 
 def test_async_load(mod):
     """Test async_load: copy data through LDS and verify integrity."""
@@ -2394,6 +2443,9 @@ def test_numeric_limits(mod):
     ]
 
     for name, offset, size, is_float, dtype, has_inf in type_table:
+        if name in ("fp8", "bf8") and arch in _SKIP_FP8_GFX11:
+            print(f"  SKIP: numeric_limits<{name}> (fp8/bf8 not supported on {arch})")
+            continue
         if is_float:
             ref = ref_float(dtype, size, has_inf)
         else:
@@ -2454,6 +2506,7 @@ def test_finfo(mod):
             "tiny": fi.tiny,
         }
 
+    arch = _get_gpu_arch()
     fp8_dtype = _get_fp8_dtype()
     bf8_dtype = _get_bf8_dtype()
 
@@ -2479,6 +2532,9 @@ def test_finfo(mod):
     ]
 
     for name, offset, dtype, expected_bits, manual_ref in type_table:
+        if name in ("fp8", "bf8") and arch in _SKIP_FP8_GFX11:
+            print(f"  SKIP: finfo<{name}> (fp8/bf8 not supported on {arch})")
+            continue
         if dtype is not None:
             ref = ref_from_torch_finfo(dtype)
             ref["bits"] = expected_bits
@@ -2638,6 +2694,7 @@ def main():
     failures += test_wmma_gfx1201_w64_bf16_bf16(mod)
     failures += test_wmma_gfx1201_tiled_f32_f16(mod)
     failures += test_wmma_gfx1201_tiled_f32_bf16(mod)
+    failures += test_opus_gmem_gfx1100(mod)
     failures += test_async_load(mod)
     failures += test_tr_load_f16(mod)
     failures += test_dtype_convert_fp32_bf16(mod)

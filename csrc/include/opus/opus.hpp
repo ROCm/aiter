@@ -1104,7 +1104,7 @@ OPUS_D constexpr unsigned short fp32_to_bf16_rtn_raw(float f)
     else if(bits & 0xffff) { bits |= 0x10000; /* Preserve signaling NaN */ }
     return static_cast<unsigned short>(bits >> 16);
 }
-#if (defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)) && __clang_major__ >= 20
+#if (defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__) || defined (__GFX11__)) && __clang_major__ >= 20
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx1250/gfx12 has instruction conversion, leave 'rm' here for compatiblity
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) { return static_cast<bf16_t>(x); }
 #else
@@ -1124,14 +1124,22 @@ OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
 // constexpr functions containing GPU builtins (__builtin_amdgcn_cvt_*) that can never be compile-time evaluated.
 // Template constexpr (packed variants, OPUS_CAST_DEFINE) survives because the check is deferred to instantiation.
 // TODO: we may remove constexpr from cast in the future
+#if __has_builtin(__builtin_amdgcn_cvt_pk_fp8_f32)
 OPUS_D auto fp32_to_fp8(const fp32_t& x) {
     int w; w = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, w, /*sel=lo*/0);
     return __builtin_bit_cast(fp8_t, static_cast<signed char>(w));
 }
+#else
+OPUS_D auto fp32_to_fp8(const fp32_t& /*x*/) { return fp8_t{}; }
+#endif
+#if __has_builtin(__builtin_amdgcn_cvt_f32_fp8)
 OPUS_D auto fp8_to_fp32(const fp8_t& x) {
     int w = static_cast<int>(__builtin_bit_cast(unsigned char, x));
     return __builtin_amdgcn_cvt_f32_fp8(w, /*byte=*/0);
 }
+#else
+OPUS_D auto fp8_to_fp32(const fp8_t& /*x*/) { return fp32_t{}; }
+#endif
 OPUS_D constexpr auto fp32_to_fp32(const fp32_t& x) { return x; }
 OPUS_D constexpr auto fp32_to_i8(const fp32_t& x) { return static_cast<i8_t>(x); }
 OPUS_D constexpr auto i8_to_fp32(const i8_t& x) { return static_cast<fp32_t>(x); }
@@ -1222,6 +1230,7 @@ template<> struct finfo<e8m0_t> {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wuninitialized"
 #pragma clang diagnostic ignored "-Wc++20-extensions"
+#if __has_builtin(__builtin_amdgcn_cvt_pk_fp8_f32)
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp8_packed_x2(const S& s, number<sel> = {}) {
     int w ; w = __builtin_amdgcn_cvt_pk_fp8_f32(s[0], s[1], w, sel);
@@ -1243,6 +1252,17 @@ OPUS_D constexpr decltype(auto) fp8_to_fp32_packed_x4(const S& s) {
     auto x = __builtin_amdgcn_cvt_pk_f32_fp8(bitwise, 0); auto y = __builtin_amdgcn_cvt_pk_f32_fp8(bitwise, 1);
     return fp32x4_t{x[0], x[1], y[0], y[1]};
 }
+#else
+// TODO implement emulated fp8 casts for gfx1100
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp8_packed_x2(const S& /*s*/, number<sel> = {}) { return fp8x2_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp8_packed_x4(const S& /*s*/) { return fp8x4_t{}; }
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp8x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp8_to_fp32_packed_x2(const S& /*s*/, number<sel> = {}) { return fp32x2_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp8x4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp8_to_fp32_packed_x4(const S& /*s*/) { return fp32x4_t{}; }
+#endif
 
 namespace impl {
 template<typename S, index_t... Xs>     OPUS_D constexpr decltype(auto) fold_as_tuple_of_vec(const S& s, seq<Xs...>) {
@@ -1627,8 +1647,7 @@ OPUS_D constexpr auto buffer_default_config() {
     return 0x00020000;
 #elif defined(__gfx103__)
     return 0x31014000;
-// gfx1200/gfx1201 (Navi 44/48) listed explicitly — __gfx11__/__gfx12__ are typos (clang predefines only uppercase __GFX11__/__GFX12__), so without this gfx1200/gfx1201 fall into the 0xffffffff sentinel and make_gmem<> stores silently drop.
-#elif defined(__gfx11__) || defined(__gfx12__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)
+#elif defined(__GFX11__) || defined(__gfx1201__) || defined(__gfx1200__)
     return 0x31004000;
 #else
     return 0xffffffff;
