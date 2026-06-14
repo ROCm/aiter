@@ -188,7 +188,6 @@ def _use_grouped_gemm_enabled() -> bool:
     return os.environ.get("AITER_USE_GROUPED_GEMM", "1") in _TRUTHY_ENV
 
 
-
 def _align_up(value: int, alignment: int) -> int:
     if alignment <= 0:
         raise ValueError(f"alignment must be > 0, got {alignment}")
@@ -450,8 +449,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     try:
         from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (
-            _GroupedA8W4Config,
-            _make_m_tile_prefix_map,
             compile_moe_grouped_gemm1_a8w4_masked,
             compile_moe_grouped_gemm2_a8w4_masked,
             compile_moe_grouped_gemm1_mxfp4_masked,
@@ -460,8 +457,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     except Exception as vendored_exc:
         try:
             from kernels.moe_grouped_gemm_mxscale_gfx1250 import (
-                _GroupedA8W4Config,
-                _make_m_tile_prefix_map,
                 compile_moe_grouped_gemm1_a8w4_masked,
                 compile_moe_grouped_gemm2_a8w4_masked,
                 compile_moe_grouped_gemm1_mxfp4_masked,
@@ -666,7 +661,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     # Route-gather into the grouped per-expert layout.
     if not _use_naive:
-
         _grouped_dbg("start route gather (scatter-copy kernel)")
         # Payload route-gather only; the e8m0 scale is route-gathered AND
         # preshuffled into the WMMA layout in one fused pass below (no
@@ -786,8 +780,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             _routed_experts = topk_ids[0].to(torch.long)
             _a2_tt = grouped_a2[_routed_experts, 0].view(token_num, topk, inter_dim)
             print(
-                f"[dump] grouped_a2 (num_token, topk, inter_dim)="
-                f"{tuple(_a2_tt.shape)}",
+                f"[dump] grouped_a2 (num_token, topk, inter_dim)={tuple(_a2_tt.shape)}",
                 flush=True,
             )
             for _k in range(topk):
@@ -937,7 +930,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     # Fast epilogue gathers/reduces grouped rows back to token order.
     if (not _use_naive) and dtype in (dtypes.bf16, dtypes.fp16):
-
         _grouped_dbg("start gather-reduce output")
         # Reuse the route map; the kernel accumulates in f32.
         gather_w = (
@@ -1270,9 +1262,9 @@ def flydsl_moe_scatter_preshuffle_scale(
     device = a1_scale_token_u8.device
     Ws = a1_scale_token_u8.shape[1]
     rows_per_tile = wmma_rep * 16
-    assert (
-        max_m % rows_per_tile == 0
-    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
     tiles_per_expert = max_m // rows_per_tile
 
     if grouped_a1_scale is None:
@@ -1311,9 +1303,9 @@ def flydsl_moe_preshuffle_scale(
     device = scale_grouped_u8.device
     Ws = scale_grouped_u8.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert (
-        max_m % rows_per_tile == 0
-    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
     tiles_per_expert = max_m // rows_per_tile
 
     if out is None:
