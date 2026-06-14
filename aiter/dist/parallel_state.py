@@ -1283,20 +1283,16 @@ def graph_capture():
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    if _CUSTOM:
-        from contextlib import ExitStack
+    from contextlib import ExitStack
 
-        with ExitStack() as stack:
-            context = stack.enter_context(get_tp_group().graph_capture())
-            stack.enter_context(get_pp_group().graph_capture(context))
-            for group in _CUSTOM.values():
+    with ExitStack() as stack:
+        context = stack.enter_context(get_tp_group().graph_capture())
+        for group in (get_pp_group(), get_dp_group(), get_ep_group()):
+            if group is not None and group.device_communicator is not None:
                 stack.enter_context(group.graph_capture(context))
-            yield context
-    else:
-        with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
-            context
-        ):
-            yield context
+        for group in _CUSTOM.values():
+            stack.enter_context(group.graph_capture(context))
+        yield context
 
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
