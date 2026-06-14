@@ -151,10 +151,13 @@ def replay_one(path, dev="cuda"):
     o2c = o2[..., :kv_lora]
     f1 = torch.isfinite(o1c).all().item()
     f2 = torch.isfinite(o2c).all().item()
+    kvi = b["kv_indptr"].to(torch.int64)
+    max_pages = int((kvi[1:] - kvi[:-1]).max().item())
     res = {
         "name": os.path.basename(path),
         "layer": b["layer_num"],
         "bs": b["kv_indptr"].numel() - 1,
+        "pages": max_pages,
         "kv_indptr": b["kv_indptr"].tolist(),
         "finite1": f1,
         "finite2": f2,
@@ -176,7 +179,7 @@ def main(arg):
         return
     print(f"Found {len(paths)} dump(s)\n")
     header = (
-        f"{'name':42s} {'bs':>3s} {'fin1':>4s} {'fin2':>4s} "
+        f"{'name':42s} {'bs':>3s} {'pg':>4s} {'fin1':>4s} {'fin2':>4s} "
         f"{'cos1_ref':>10s} {'cos2_ref':>10s} {'cos2_1':>10s} {'relerr2_1':>10s}"
     )
     print(header)
@@ -187,7 +190,7 @@ def main(arg):
         if r is None:
             continue
         print(
-            f"{r['name']:42s} {r['bs']:>3d} {str(r['finite1']):>4s} {str(r['finite2']):>4s} "
+            f"{r['name']:42s} {r['bs']:>3d} {r['pages']:>4d} {str(r['finite1']):>4s} {str(r['finite2']):>4s} "
             f"{r['cos1_ref']:>10.6f} {r['cos2_ref']:>10.6f} {r['cos2_1']:>10.6f} {r['relerr2_1']:>10.4f}"
         )
         worst.append(r)
