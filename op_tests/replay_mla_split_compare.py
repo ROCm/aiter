@@ -59,7 +59,10 @@ def _max_rel(a, b):
     return (a - b).abs().max().item() / (b.abs().max().item() + 1e-9)
 
 
-def _run_split(b, dev, num_kv_splits):
+def _run_split(b, dev, num_kv_splits, force=True):
+    """Run mla_decode_fwd. If force=True, pass an explicit uniform
+    num_kv_splits_indptr so we bypass get_meta_param's fp8 clamp and actually
+    exercise the requested split count (otherwise short ctx collapses to 1)."""
     q = b["q"].to(dev)
     seg_kv = b["kv_compact"].to(dev).contiguous()
     o = torch.zeros_like(b["o_server"]).to(dev)
@@ -69,6 +72,13 @@ def _run_split(b, dev, num_kv_splits):
     kv_last = b["kv_last_page_lens"].to(dev).to(torch.int32)
     q_scale_t = b["q_scale"].to(dev) if b["q_scale"] is not None else None
     kv_scale_t = b["kv_scale"].to(dev) if b["kv_scale"] is not None else None
+    bs = kv_indptr.numel() - 1
+    indptr = None
+    if force:
+        indptr = (
+            torch.arange(0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int32)
+            .to(dev)
+        )
     aiter.mla.mla_decode_fwd(
         q,
         seg_kv,
@@ -82,6 +92,7 @@ def _run_split(b, dev, num_kv_splits):
         nhead_kv=1,
         sm_scale=b["sm_scale"],
         num_kv_splits=num_kv_splits,
+        num_kv_splits_indptr=indptr,
         q_scale=q_scale_t,
         kv_scale=kv_scale_t,
     )
@@ -185,13 +196,31 @@ def main(arg):
 
         c1 = [r["cos1_ref"] for r in worst if r["cos1_ref"] == r["cos1_ref"]]
         c2 = [r["cos2_ref"] for r in worst if r["cos2_ref"] == r["cos2_ref"]]
-        print("\n=== summary ===")
+        c21 = [r["cos2_1"] for r in worst if r["cos2_1"] == r["cos2_1"]]
+        re21 = [r["relerr2_1"] for r in worst if r["relerr2_1"] == r["relerr2_1"]]
+        print("\n=== summary (forced 1-split vs forced 2-split) ===")
+        if c21:
+            print(
+                f"cos(forced_split2, forced_split1): mean = {statistics.mean(c21):.6f}  "
+                f"min = {min(c21):.6f}"
+            )
+        if re21:
+            print(
+                f"max-rel-err(forced_split2 vs split1): mean = {statistics.mean(re21):.6f}  "
+                f"max = {max(re21):.6f}"
+            )
         if c1:
+            print(f"\n(ref is a rough fp32 baseline, may be misaligned)")
             print(f"mean cos(split1, fp32_ref) = {statistics.mean(c1):.6f}  min = {min(c1):.6f}")
         if c2:
             print(f"mean cos(split2, fp32_ref) = {statistics.mean(c2):.6f}  min = {min(c2):.6f}")
         n_nonfinite2 = sum(1 for r in worst if not r["finite2"])
         print(f"non-finite split2 outputs: {n_nonfinite2}/{len(worst)}")
+
+        topn = sorted(worst, key=lambda r: -(r["relerr2_1"] if r["relerr2_1"] == r["relerr2_1"] else -1))[:10]
+        print("\n=== worst 10 by max-rel-err(split2 vs split1) ===")
+        for r in topn:
+            print(f"  {r['name']:42s} cos2_1={r['cos2_1']:.6f}  relerr2_1={r['relerr2_1']:.4f}")
 
 
 if __name__ == "__main__":
