@@ -193,18 +193,6 @@ def _use_grouped_gemm_enabled() -> bool:
     return os.environ.get("AITER_USE_GROUPED_GEMM", "1") in _TRUTHY_ENV
 
 
-def _weight_scale_opsel_enabled() -> bool:
-    """WEIGHT_SCALE_OP_SEL toggles op_sel on the weight (B) scale only.
-
-    This is the WMMA *A operand* scale (scaleAType).  Default off.  When on, a8w4
-    reads the weight scale as one dword per N-tile pair with op_sel selecting the
-    lane-half (halving the weight-scale ds-loads); off keeps the per-N-tile
-    op_sel=0 read.  The activation (A) scale is unaffected.  Both are supported by
-    the N4K8 layout (producer unchanged).
-    """
-    return os.environ.get("WEIGHT_SCALE_OP_SEL", "0") in _TRUTHY_ENV
-
-
 def _is_stream_capturing() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -644,7 +632,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     tile_k = 256
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
-    weight_scale_opsel = _weight_scale_opsel_enabled()
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
         grouped_contiguous_m = True
@@ -774,7 +761,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             cluster_m=1,
             cluster_n=1,
             use_scale_opsel=False,
-            weight_scale_opsel=weight_scale_opsel,
             expert_sched_mode=False,
             grouped_persistent_m=effective_grouped_persistent_m,
             grouped_contiguous_m=effective_grouped_contiguous_m,
@@ -952,7 +938,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         persistent_workers=persistent_workers,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
-        weight_scale_opsel=weight_scale_opsel,
     )
     _grouped_dbg("stage1 compile done; start launch")
     _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
@@ -1088,7 +1073,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_persistent_m=effective_grouped_persistent_m,
         grouped_contiguous_m=effective_grouped_contiguous_m,
         persistent_workers=persistent_workers,
-        weight_scale_opsel=weight_scale_opsel,
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None

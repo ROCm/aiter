@@ -108,7 +108,6 @@ def compile_mxscale_gemm(
     wave_specialized_tdm: bool = False,
     split_k: int = 1,
     use_scale_opsel: bool = False,
-    weight_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     atomic_barrier_enable: bool = False,
     batch_count: int = 1,
@@ -160,12 +159,15 @@ def compile_mxscale_gemm(
             f"b_scale_layout must be 'interleaved' or 'n4k8', got {b_scale_layout!r}"
         )
     b_n4k8 = b_scale_layout == "n4k8"
-    # Weight (B) scale op_sel == the WMMA *A operand* (scaleAType).  It is enabled
-    # by the dedicated ``weight_scale_opsel`` flag (grouped env WEIGHT_SCALE_OP_SEL)
-    # or by ``use_scale_opsel`` (which also drives the activation/B-operand op_sel,
-    # kept for the standalone GEMM).  The activation (A) scale op_sel stays on
-    # ``use_scale_opsel`` alone.
-    b_opsel_on = use_scale_opsel or weight_scale_opsel
+    # a8w4 N4K8 weight-scale is ALWAYS K-pairing: one ds_load_b32 per N-tile holds
+    # both WMMA-K=128 steps' scales (lanes 0-15 = K-step0, lanes 16-31 = K-step1);
+    # the WMMA op_sel (matrix_a_scale ROW0/ROW1) selects the K-step, and both
+    # K-steps accumulate into the same accumulator.  fp4 keeps its own n4k8 read.
+    b_kpair = b_n4k8 and is_a8w4
+    # ``use_scale_opsel`` drives the activation (A-operand) op_sel for the
+    # standalone GEMM (and the fp4 weight-scale read).  a8w4 no longer has a
+    # weight-scale op_sel toggle: K-pairing fixes op_sel to the K-step.
+    b_opsel_on = use_scale_opsel
     # n4k8 supports both weight-op_sel states (producer/gmem layout is identical):
     #   off -> a8w4 reads op_sel=0 (one dword per N-tile, lanes 0-15);
     #   on  -> a8w4 reads one dword per N-tile PAIR with lane_kgrp, op_sel
@@ -380,7 +382,11 @@ def compile_mxscale_gemm(
     #   n4k8       : each lane reads its complete scaleB i32 with one ds_load_b32;
     #                a8w4 (ROW_MAJOR) loads one dword per N-tile (op_sel off) or
     #                one per N-tile pair (op_sel on) -> wmma_n_rep or wmma_n_rep//2.
-    if b_n4k8:
+    if b_kpair:
+        # a8w4 K-pairing: one ds_load_b32 per N-tile (covers both K-steps via
+        # op_sel), loaded ONCE per tile -> wmma_n_rep dwords.
+        _b_scale_ds_loads_full = wmma_n_rep
+    elif b_n4k8:
         _b_scale_ds_loads_full = wmma_n_rep // 2 if b_opsel_on else wmma_n_rep
     else:
         _b_scale_ds_loads_full = (b_scale_load_rep + 3) // 4
@@ -388,9 +394,11 @@ def compile_mxscale_gemm(
     _b_scale_ds_loads_half = (
         wmma_n_rep // 2 if b_n4k8 else (b_scale_load_rep // 2 + 3) // 4
     )
+    # Partial-drain wait for the NEXT k-subtile's loads.  a8w4 K-pairing loads the
+    # b-scale once per tile (not per ks), so it is NOT part of the per-ks drain.
     _bs_ds_loads = (
         wmma_n_rep * _b_frag_loads_per_wn
-        + _b_scale_ds_loads_full
+        + (0 if b_kpair else _b_scale_ds_loads_full)
         + (wmma_m_rep + 3) // 4
     )
 
@@ -1079,10 +1087,26 @@ def compile_mxscale_gemm(
                     super_local * arith.index(_B_N4K8_ROW_BYTES)
                     + lane16 * arith.index(4)
                 )
-                if const_expr(_b_n4k8_pair):
-                    # per-pair: p = 2*idx + lane_kgrp -> lane_kgrp adds one N-tile.
+                if const_expr(b_kpair):
+                    # a8w4 K-pairing: lane_kgrp -> q (the WMMA-K step), stride 64.
+                    # lanes 0-15 read K-step0, lanes 16-31 read K-step1; one
+                    # ds_load_b32 per N-tile holds both, op_sel selects the step.
+                    base = base + lane_kgrp * arith.index(_B_N4K8_QSTEP_BYTES)
+                elif const_expr(_b_n4k8_pair):
+                    # fp4 per-pair: p = 2*idx + lane_kgrp -> lane_kgrp adds one N-tile.
                     base = base + lane_kgrp * arith.index(_B_N4K8_PTILE_BYTES)
                 return lds_ptr, [base]
+
+            def _load_b_scale_n4k8_kpair(lds_buffer, scale_base):
+                """a8w4 K-pairing b-scale read: one ds_load_b32 per N-tile, holding
+                BOTH WMMA-K steps (lane_kgrp/op_sel selects the step).  ks-INDEPENDENT
+                -> loaded once per tile.  Returns wmma_n_rep dwords indexed by wn.
+                """
+                results = []
+                for wn in range_constexpr(wmma_n_rep):
+                    off = scale_base + arith.index(wn * _B_N4K8_PTILE_BYTES)
+                    results.append(lds_load_b32_raw(lds_buffer, off))
+                return results
 
             def _load_b_scale_n4k8(lds_buffer, scale_base, ks, wn_start, wn_count):
                 """One ds_load_b32 per unit; returns the full scaleB i32 each.
@@ -1111,6 +1135,11 @@ def compile_mxscale_gemm(
                         results.append(lds_load_b32_raw(lds_buffer, off))
                 return results
 
+            # a8w4 K-pairing loads the b-scale ONCE per tile; compute_tile fills
+            # this holder and _load_b_and_scales reuses it for every ks (no per-ks
+            # ds_load).  Sequential compute_tile calls reset it for their buffer.
+            _b_scales_kpair_holder = [None]
+
             def _load_b_and_scales(
                 b_buf, b_bases, bs_buf, bs_bases, as_buf, as_bases, ks
             ):
@@ -1119,35 +1148,36 @@ def compile_mxscale_gemm(
                     load_b_frag(b_buf, b_bases, wn, ks)
                     for wn in range_constexpr(wmma_n_rep)
                 ]
-                if const_expr(b_n4k8):
-                    # One ds_load_b32 per unit = the full scaleB i32 (4 K-blocks).
-                    # op_sel off: wmma_n_rep dwords, result[wn] = N-tile wn.
-                    # op_sel on : wmma_n_rep//2 pair dwords (even-indexed), the
-                    #             [::2] below selects them, indexed by wn//2.
-                    _n_units = wmma_n_rep // 2 if b_opsel_on else wmma_n_rep
-                    b_scales_all = _load_b_scale_n4k8(
-                        bs_buf, bs_bases[0], ks, 0, _n_units
-                    )
+                if const_expr(b_kpair):
+                    # K-pairing: b-scale already loaded once for this tile; reuse
+                    # the closure value (ks-independent), no ds_load here.
+                    b_scales = _b_scales_kpair_holder[0]
                 else:
-                    b_scales_all = load_scale_b128(
-                        bs_buf, bs_bases[0], b_scale_load_rep, ks
-                    )
+                    if const_expr(b_n4k8):
+                        # fp4 n4k8: one ds_load_b32 per unit = the full scaleB i32.
+                        _n_units = wmma_n_rep // 2 if b_opsel_on else wmma_n_rep
+                        b_scales_all = _load_b_scale_n4k8(
+                            bs_buf, bs_bases[0], ks, 0, _n_units
+                        )
+                    else:
+                        b_scales_all = load_scale_b128(
+                            bs_buf, bs_bases[0], b_scale_load_rep, ks
+                        )
+                    # fp4 never op_sels the weight scale (scaleAType=0).
+                    if const_expr(is_fp4):
+                        b_scales = b_scales_all
+                    elif const_expr(b_opsel_on):
+                        b_scales = b_scales_all[::2]
+                    else:
+                        b_scales = b_scales_all
                 a_scales_all = load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
-                # Weight (B) scale op_sel is independent of the activation (A)
-                # scale op_sel.  fp4 never op_sels the weight scale (scaleAType=0).
-                if const_expr(is_fp4):
-                    b_scales = b_scales_all
-                elif const_expr(b_opsel_on):
-                    b_scales = b_scales_all[::2]
-                else:
-                    b_scales = b_scales_all
                 if const_expr(use_scale_opsel):
                     a_scales = a_scales_all[::2]
                 else:
                     a_scales = a_scales_all
                 return b_frags, b_scales, a_scales
 
-            def _emit_wmma(accs, wm, wn, a_frag, b_frags, a_scales, b_scales):
+            def _emit_wmma(accs, wm, wn, ks, a_frag, b_frags, a_scales, b_scales):
                 """Emit one WMMA instruction (format-specific)."""
                 idx = wm * wmma_n_rep + wn
                 if const_expr(use_scale_opsel):
@@ -1171,9 +1201,14 @@ def compile_mxscale_gemm(
                     )
                 else:
                     # 16x16x128 WMMA: A8W4 (fmtA=FP4) or FP8 (fmtA=FP8).
-                    # Weight scale = scaleAType (the WMMA A operand), op_sel from
-                    # the dedicated weight-scale flag.
-                    if const_expr(b_opsel_on):
+                    # Weight scale = scaleAType (the WMMA A operand).
+                    if const_expr(b_kpair):
+                        # a8w4 K-pairing: one dword per N-tile holds both K-steps;
+                        # op_sel = the K-step (ks=0 -> ROW0, ks=1 -> ROW1).  Both
+                        # K-steps accumulate into the same acc (idx is ks-free).
+                        b_scale_idx = wn
+                        b_opsel = ks
+                    elif const_expr(b_opsel_on):
                         b_scale_idx = wn // 2
                         b_opsel = wn % 2
                     else:
@@ -1227,6 +1262,7 @@ def compile_mxscale_gemm(
                                 accs,
                                 wm,
                                 wn,
+                                ks,
                                 a_frags[frag_i],
                                 b_frags,
                                 a_scales,
@@ -1303,6 +1339,13 @@ def compile_mxscale_gemm(
                 else:
                     bs_buf, bs_bases = _precompute_scale_lane_bases(
                         lds_bs, warp_n_base, b_scale_load_rep, interleaved_scale_cols_b
+                    )
+
+                if const_expr(b_kpair):
+                    # a8w4 K-pairing: load this tile's b-scale ONCE (covers both
+                    # K-steps per N-tile via op_sel); _load_b_and_scales reuses it.
+                    _b_scales_kpair_holder[0] = _load_b_scale_n4k8_kpair(
+                        bs_buf, bs_bases[0]
                     )
 
                 if const_expr(k_wmma_steps == 1):
@@ -1564,16 +1607,26 @@ def compile_mxscale_gemm(
                 _half_wm = wmma_m_rep // 2
                 _half_wmma = _half_wm * wmma_n_rep
                 _b_loads_per_frag = 2 if is_a8w4 else 4
-                # b-scale + a-scale ds-read hint (n4k8 b-scale = wmma_n_rep dwords).
-                _scale_hint = (
-                    _b_scale_ds_loads_full + (wmma_m_rep + 3) // 4 if b_n4k8 else 2
-                )
+                _a_scale_hint = (wmma_m_rep + 3) // 4
+                # Per-ks scale-prefetch hint = (per-ks b-scale) + a-scale.
+                # K-pairing loads the b-scale ONCE before the ks loop, so its per-ks
+                # hint drops the b-scale and that one-time load is added to ks==0.
+                if const_expr(b_kpair):
+                    _scale_hint = _a_scale_hint
+                    _once_bscale = _b_scale_ds_loads_full
+                elif const_expr(b_n4k8):
+                    _scale_hint = _b_scale_ds_loads_full + _a_scale_hint
+                    _once_bscale = 0
+                else:
+                    _scale_hint = 2
+                    _once_bscale = 0
 
                 for _ks in range_constexpr(k_wmma_steps):
                     if const_expr(_ks == 0):
                         rocdl.sched_dsrd(
                             wmma_n_rep * _b_loads_per_frag
                             + _scale_hint
+                            + _once_bscale
                             + _half_wm * DS_LOADS_PER_A_FRAG
                         )
                     else:
@@ -3283,7 +3336,6 @@ def compile_mxscale_gemm(
         wave_specialized_tdm,
         split_k,
         use_scale_opsel,
-        weight_scale_opsel,
         expert_sched_mode,
         atomic_barrier_enable,
         batch_count,
