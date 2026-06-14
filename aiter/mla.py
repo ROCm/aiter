@@ -263,6 +263,16 @@ def mla_decode_fwd(
         attn_lse = torch.empty(
             (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
         )
+        # Empty-split safety net for kernels (e.g. qh128) that do not write a
+        # sentinel for per-(batch,split) slots they leave empty. stage1 may
+        # populate fewer splits than `num_kv_splits_indptr` advertises for short
+        # sequences, leaving these fp32 `torch.empty` buffers uninitialized; the
+        # stage2 reduce then reads garbage -> NaN. Pre-seed unwritten slots as a
+        # neutral empty split: data=0 and lse=-1e20 so exp(lse-lse_max)=0 and the
+        # split contributes nothing (and 0*0 avoids 0*garbage NaNs).
+        if num_kv_splits > 1:
+            logits.fill_(0.0)
+            attn_lse.fill_(-1.0e20)
         final_lse = (
             torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
             if return_lse
