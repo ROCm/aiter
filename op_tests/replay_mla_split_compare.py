@@ -137,8 +137,25 @@ def _fp32_ref(b, dev):
     return torch.stack(outs, dim=0)  # [B, nhead, kv_lora]
 
 
+def _normalize(b):
+    """Accept both dump schemas:
+      * dump_decode_mla:   kv_compact / kv_indices / o_server / kv_layout='seg'
+      * _dump_seg_decode_failure: seg_kv_compact / kv_indices_remapped / o (no kv_layout)
+    Both are the seg layout; map the latter onto the former's key names in place."""
+    if "kv_compact" not in b and "seg_kv_compact" in b:
+        b["kv_compact"] = b["seg_kv_compact"]
+    if "kv_indices" not in b and "kv_indices_remapped" in b:
+        b["kv_indices"] = b["kv_indices_remapped"]
+    if "o_server" not in b and "o" in b:
+        b["o_server"] = b["o"]
+    # seg_decode dump always stores last_page_lens; both schemas already have
+    # kv_indptr / qo_indptr / q / page_size / sm_scale / kv_lora_rank.
+    b.setdefault("kv_layout", "seg")
+    return b
+
+
 def replay_one(path, dev="cuda"):
-    b = torch.load(path, map_location="cpu")
+    b = _normalize(torch.load(path, map_location="cpu"))
     if b.get("kv_layout") != "seg":
         print(f"[skip] {os.path.basename(path)}: kv_layout={b.get('kv_layout')} (need 'seg')")
         return None
@@ -171,7 +188,10 @@ def replay_one(path, dev="cuda"):
 
 def main(arg):
     if os.path.isdir(arg):
-        paths = sorted(glob.glob(os.path.join(arg, "mla_decode_*.pt")))
+        paths = sorted(
+            glob.glob(os.path.join(arg, "mla_decode_*.pt"))
+            + glob.glob(os.path.join(arg, "seg_decode_*.pt"))
+        )
     else:
         paths = [arg]
     if not paths:
