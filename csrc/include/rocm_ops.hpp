@@ -432,6 +432,10 @@ namespace py = pybind11;
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("out"),                                                                      \
+          py::arg("m"),                                                                        \
+          py::arg("n"),                                                                        \
+          py::arg("k"),                                                                        \
+          py::arg("split_dim"),                                                                \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"));                                                               \
     m.def("all_gather_reg",                                                                    \
@@ -1986,6 +1990,7 @@ namespace py = pybind11;
           py::arg("reduce_final_map"),   \
           py::arg("reduce_partial_map"), \
           py::arg("max_seqlen_q"),       \
+          py::arg("num_kv_splits"),      \
           py::arg("final_output"),       \
           py::arg("final_lse") = std::nullopt);
 
@@ -2101,7 +2106,22 @@ namespace py = pybind11;
           py::arg("x"),                         \
           py::arg("residual"),                  \
           py::arg("post_layer_mix"),            \
-          py::arg("comb_res_mix"));
+          py::arg("comb_res_mix"),              \
+          py::arg("store_nt")       = -1);      \
+    m.def("mhc_fused_post_pre_gemm_sqrsum",     \
+          &aiter::mhc_fused_post_pre_gemm_sqrsum, \
+          "mhc_fused_post_pre_gemm_sqrsum",     \
+          py::arg("gemm_out_mul"),              \
+          py::arg("gemm_out_sqrsum"),           \
+          py::arg("next_residual"),             \
+          py::arg("layer_input"),               \
+          py::arg("residual_in"),               \
+          py::arg("post_layer_mix"),            \
+          py::arg("comb_res_mix"),              \
+          py::arg("fn"),                        \
+          py::arg("tile_m") = 16,               \
+          py::arg("tile_n") = 32,               \
+          py::arg("tile_k") = 32);
 #define CAUSAL_CONV1D_UPDATE_PYBIND                                            \
     m.def("causal_conv1d_update",                                              \
           &aiter::causal_conv1d_update,                                        \
@@ -2112,8 +2132,8 @@ namespace py = pybind11;
           py::arg("bias"),                                                     \
           py::arg("out"),                                                      \
           py::arg("use_silu"),                                                 \
-          py::arg("cache_seqlens")      = torch::Tensor(),                     \
-          py::arg("conv_state_indices") = torch::Tensor(),                     \
+          py::arg("cache_seqlens"),                                             \
+          py::arg("conv_state_indices"),                                       \
           py::arg("pad_slot_id")        = -1);
 
 #define CHUNK_GDR_FWD_H_PYBIND                                              \
@@ -2137,6 +2157,19 @@ namespace py = pybind11;
           py::arg("save_new_value"),                                        \
           py::arg("use_exp2"),                                              \
           py::arg("g_head_major") = false);
+
+#define MHA_FWD_NATIVE_SPLITKV_PYBIND                                          \
+    m.def("mha_fwd_native_splitkv",                                            \
+          &aiter::mha_fwd_native_splitkv,                                      \
+          "Native HIP D64 BF16 split-K FMHA forward (producer + combine).",    \
+          py::arg("q"),                                                        \
+          py::arg("k"),                                                        \
+          py::arg("v"),                                                        \
+          py::arg("out"),                                                      \
+          py::arg("softmax_scale"),                                            \
+          py::arg("causal"),                                                   \
+          py::arg("return_lse"),                                               \
+          py::arg("num_splits"));
 
 #define FUSED_SPLIT_GDR_UPDATE_PYBIND                                 \
     m.def("fused_split_gdr_update",                                   \
