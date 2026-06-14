@@ -445,7 +445,7 @@ def gemm_afp4wfp4_preshuffle(
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
-    use_gluon = arch_info.get_arch() == "gfx1250"
+    use_gluon = False
 
     M, K_bytes = x_fp4.shape
     n16, _ = w_preshuf.shape
@@ -467,6 +467,12 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_M"] >= 32
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
+    config.setdefault("NUM_KSPLIT", 1)
+    config.setdefault("GROUP_SIZE_M", 4)
+    config.setdefault("num_stages", 2)
+    config.setdefault("waves_per_eu", 1)
+    config.setdefault("matrix_instr_nonkdim", 16)
+    config.setdefault("cache_modifier", None)
     if use_gluon:
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
@@ -521,6 +527,8 @@ def gemm_afp4wfp4_preshuffle(
             **layouts,
         )
         return y
+
+    config.pop("NUM_BUFFERS", None)
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(

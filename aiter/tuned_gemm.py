@@ -551,6 +551,8 @@ def triton_gemm(
     bpreshuffle: Optional[bool] = False,
     config: Optional[dict] = None,
 ):
+    if get_gfx().startswith("gfx12"):
+        return torch_gemm(inp, weights, solidx, bias, otype, scale_a, scale_b, scale_c, bpreshuffle, config)
     from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 
     assert (
