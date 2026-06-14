@@ -67,6 +67,9 @@ class _GroupedA8W4Config:
     data_format: str = "a8w4"
     act: str = "silu"
     stage1_weight_layout: str = "gguu"
+    # op_sel on the WMMA A operand = the weight (B) scale (scaleAType) only;
+    # independent of use_scale_opsel (which drives the activation/B operand).
+    weight_scale_opsel: bool = False
 
 
 def _validate_common(cfg: _GroupedA8W4Config) -> None:
@@ -262,6 +265,24 @@ def _preshuffled_scale_shape(
     return int(rows) // wmma_rep, k_scale * wmma_rep
 
 
+def _preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
+    """Weight (B) scale shape in the N4K8 layout: (rows//64, (k_dim//32)*64).
+
+    Matches ``grouped_moe_gfx1250._grouped_b_scale_preshuffle_e8m0``: a 64-row x
+    256-K super-block (4 N-tiles x 8 e8m0) folds into the column dim, so 64 N-rows
+    collapse to one row and each k_scale column expands x64.
+    """
+    k_scale = int(k_dim) // 32
+    if k_scale % 8 != 0:
+        raise ValueError(
+            f"B-scale k columns (K//32) must be divisible by 8 (K%256==0), "
+            f"got {k_scale}"
+        )
+    if int(rows) % 64 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 64, got {rows}")
+    return int(rows) // 64, k_scale * 64
+
+
 def _check_stage1_args(
     y, x, w, scale_x, scale_w, masked_m, cfg: _GroupedA8W4Config
 ) -> None:
@@ -297,9 +318,7 @@ def _check_stage1_args(
     scale_x_shape = _preshuffled_scale_shape(
         scale_x_rows, cfg.model_dim, warp_tile_m, cfg.tile_k
     )
-    scale_w_shape = _preshuffled_scale_shape(
-        2 * cfg.inter_dim, cfg.model_dim, warp_tile_n, cfg.tile_k
-    )
+    scale_w_shape = _preshuffled_b_scale_shape(2 * cfg.inter_dim, cfg.model_dim)
     expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
     if tuple(scale_x.shape) != expected_scale_x:
         raise ValueError(
@@ -665,9 +684,7 @@ def _check_stage2_args(
     scale_x_shape = _preshuffled_scale_shape(
         scale_x_rows, cfg.inter_dim, warp_tile_m, cfg.tile_k
     )
-    scale_w_shape = _preshuffled_scale_shape(
-        cfg.model_dim, cfg.inter_dim, warp_tile_n, cfg.tile_k
-    )
+    scale_w_shape = _preshuffled_b_scale_shape(cfg.model_dim, cfg.inter_dim)
     expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
     if tuple(scale_x.shape) != expected_scale_x:
         raise ValueError(
@@ -730,6 +747,7 @@ def _compile_base_a8w4_gemm(
         cluster_m=cfg.cluster_m,
         cluster_n=cfg.cluster_n,
         use_scale_opsel=cfg.use_scale_opsel,
+        weight_scale_opsel=cfg.weight_scale_opsel,
         expert_sched_mode=cfg.expert_sched_mode,
         batch_count=cfg.experts,
         grouped_masked_m=True,
@@ -740,6 +758,7 @@ def _compile_base_a8w4_gemm(
         stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
         kernel_tag=kernel_tag,
+        b_scale_layout="n4k8",
     )
 
 
@@ -765,6 +784,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     cluster_m: int = 1,
     cluster_n: int = 1,
     use_scale_opsel: bool = False,
+    weight_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     grouped_persistent_m: bool = True,
     grouped_contiguous_m: bool = False,
@@ -793,6 +813,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         cluster_m=int(cluster_m),
         cluster_n=int(cluster_n),
         use_scale_opsel=bool(use_scale_opsel),
+        weight_scale_opsel=bool(weight_scale_opsel),
         expert_sched_mode=bool(expert_sched_mode),
         grouped_persistent_m=bool(grouped_persistent_m),
         grouped_contiguous_m=bool(grouped_contiguous_m),
@@ -1169,6 +1190,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     cluster_m: int = 1,
     cluster_n: int = 1,
     use_scale_opsel: bool = False,
+    weight_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     grouped_persistent_m: bool = True,
     grouped_contiguous_m: bool = False,
@@ -1195,6 +1217,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         cluster_m=int(cluster_m),
         cluster_n=int(cluster_n),
         use_scale_opsel=bool(use_scale_opsel),
+        weight_scale_opsel=bool(weight_scale_opsel),
         expert_sched_mode=bool(expert_sched_mode),
         grouped_persistent_m=bool(grouped_persistent_m),
         grouped_contiguous_m=bool(grouped_contiguous_m),

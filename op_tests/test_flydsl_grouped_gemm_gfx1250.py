@@ -45,6 +45,7 @@ from aiter.fused_moe import (  # noqa: E402
 )
 from aiter.ops.flydsl.grouped_moe_gfx1250 import (  # noqa: E402
     _grouped_a8w4_prepare_scale_batch,
+    _grouped_b_scale_prepare_batch,
 )
 from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402
 from aiter.ops.quant import per_1x32_f4_quant  # noqa: E402
@@ -115,14 +116,18 @@ def _grouped_scale(
     n_warp: int = 4,
     tile_k: int = 256,
 ) -> torch.Tensor:
-    """Prepare grouped e8m0 scales for the test kernel."""
-    return _grouped_a8w4_prepare_scale_batch(
+    """Prepare grouped weight (B) e8m0 scales for the test kernel.
+
+    Uses the new B-scale layout (``_grouped_b_scale_prepare_batch``); tile_n /
+    n_warp / tile_k are kept for call-site compatibility but the new weight
+    layout is fixed by the WMMA scale contract and does not depend on them.
+    """
+    del tile_n, n_warp, tile_k  # unused: new B layout is WMMA-fixed
+    return _grouped_b_scale_prepare_batch(
         scale_raw.contiguous().cuda().view(dtypes.fp8_e8m0),
         experts=experts,
         rows=rows,
         k_dim=k_dim,
-        warp_tile=tile_n // n_warp,
-        tile_k=tile_k,
         device="cuda",
     )
 
@@ -250,11 +255,6 @@ def _full_scale(
 
 
 def _weight_scale(experts: int, rows: int, n_blocks: int, *, seed: int) -> torch.Tensor:
-    """Varied weight (B) e8m0 scale {126,127,128} = {0.5,1.0,2.0} (exact pow2).
-
-    DIAGNOSTIC: exercise wjx's (lane32) B-scale layout with non-uniform scales,
-    same generator as the N4K8 branch's _weight_scale.
-    """
     g = torch.Generator(device="cpu").manual_seed(seed)
     r = torch.randint(0, 3, (experts, rows, n_blocks), generator=g, dtype=torch.int16)
     return (r + (DEFAULT_SCALE_BYTE - 1)).to(torch.uint8)
@@ -333,8 +333,6 @@ def _run_grouped_via_fused_moe(
     else:
         w1_logical = _pattern_packed(experts, 2 * inter, K_pack, seed=seed + 17)
         w2_logical = _pattern_packed(experts, K, inter_pack, seed=seed + 47)
-        # DIAGNOSTIC: varied weight scales (was _full_scale) to exercise the
-        # lane32 B-scale layout on wjx.
         w1_scale_raw = _weight_scale(experts, 2 * inter, K // SCALE_BLOCK, seed=seed + 201)
         w2_scale_raw = _weight_scale(experts, K, inter // SCALE_BLOCK, seed=seed + 202)
         if use_bias:
@@ -468,8 +466,10 @@ def _prepare_grouped_moe_case(
     else:
         w1_logical = _pattern_packed(experts, 2 * inter, K_pack, seed=seed + 17)
         w2_logical = _pattern_packed(experts, K, inter_pack, seed=seed + 47)
-        w1_scale_raw = _full_scale(experts, 2 * inter, K // SCALE_BLOCK)
-        w2_scale_raw = _full_scale(experts, K, inter // SCALE_BLOCK)
+        # Varied weight scales so the B-scale preshuffle layout is actually
+        # exercised (see _weight_scale).
+        w1_scale_raw = _weight_scale(experts, 2 * inter, K // SCALE_BLOCK, seed=seed + 201)
+        w2_scale_raw = _weight_scale(experts, K, inter // SCALE_BLOCK, seed=seed + 202)
         if use_bias:
             bg = torch.Generator(device="cpu").manual_seed(seed + 91)
             bias1 = (torch.randn((experts, 2 * inter), generator=bg) * 1e-3).to(
