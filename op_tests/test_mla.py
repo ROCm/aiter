@@ -182,9 +182,9 @@ _MI400_VARIANT_BY_KEY = {(v.nhead, v.decode_qlen): v for v in _MI400_KERNEL_VARI
 
 # mi400 driver sweep dims (applied as arg overrides when --mi400 is active).
 _MI400_NHEAD = [(v.nhead, v.decode_qlen) for v in _MI400_KERNEL_VARIANTS]
-_MI400_CTX_LENS = [1024 + 1, 1536 + 3, 8192 + 17, 8704 + 19, 16384]
-_MI400_BATCH_SIZES = [64, 256]
-_MI400_SPLIT_PER_BATCH = [1, 2, 4]
+_MI400_CTX_LENS = [1,2,3,4,5,6,7,11,13,17, 1024 + 1, 1536 + 3, 8192 + 17, 8704 + 19, 16384]
+_MI400_BATCH_SIZES = [1, 64, 256]
+_MI400_SPLIT_PER_BATCH = [1, 2]
 
 # Exact poc_kl parity sweep: when --poc_kl on, the mi400 driver tests ONLY the
 # cases defined in poc_kl/mi400/mla/run.sh (one tuple per run.sh test), instead
