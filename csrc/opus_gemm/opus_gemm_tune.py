@@ -151,7 +151,13 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     """
     B_K = k_inst.B_K
     total_iters = _ceil_div(K, B_K)
-    pfk = _flatmm_splitk_pfk(k_inst)
+    # gfx1250 cluster/TDM split-K triple-buffers but tolerates any k_steps>=1
+    # (the launcher clamps split_k so no split is empty); pfk=1. gfx950 flatmm
+    # split-K needs prefetch_k_iter iters per split.
+    if k_inst.kernel_tag == "a16w16_cluster_tdm_splitk_ws":
+        pfk = 1
+    else:
+        pfk = _flatmm_splitk_pfk(k_inst)
 
     candidates = {0}
 
@@ -292,6 +298,23 @@ def kid_rejects_shape(k_inst, M, N, K):
             return True
         return False
 
+    if k_inst.kernel_tag == "a16w16_cluster_tdm_splitk_ws":
+        # gfx1250 WMMA kernel: ragged M/N ARE supported -- the main kernel
+        # TDM-clamps OOB global reads to the real (M, N) extents (tensor_dim1 =
+        # m - tile_row / n - tile_col), padded partials land in the padded fp32
+        # workspace, and the reduce kernel only touches m in [0, M) / n in
+        # [0, N). So M=49 runs as a padded M=64 tile. Ragged K is handled via
+        # the TDM k_extent clamp. K must be even (a16w16 family). Workspace
+        # store BR is 32-bit (per-slice cap).
+        if K % 2 != 0:
+            return True
+        padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
+        padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
+        UINT32_MAX_BYTES = (1 << 32) - 1
+        if 1 * padded_M * padded_N * 4 > UINT32_MAX_BYTES:  # batch=1 in tune path
+            return True
+        return False
+
     # kbuf2v_sk and quad_mfma32 splitK families require loops_per_split
     # (both full and last) even AND >=2.
     if k_inst.kernel_tag in EVEN_LOOP_SPLITK_TAGS:
@@ -364,6 +387,9 @@ def kid_rejects_bias(k_inst, bias):
       * gfx942 non-splitK siblings (10002/03/11): no bias path
     """
     if not bias:
+        return False
+    # gfx1250 cluster_tdm_splitk_ws folds bias in the reduce kernel (bias-aware).
+    if k_inst.kernel_tag == "a16w16_cluster_tdm_splitk_ws":
         return False
     if k_inst.kernel_tag not in ("a16w16", "a16w16_flatmm_splitk"):
         return True

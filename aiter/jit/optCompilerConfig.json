@@ -313,7 +313,10 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-mllvm --amdgpu-mfma-vgpr-form'"
+            "'-mllvm --amdgpu-mfma-vgpr-form'",
+            "(('-DOPUS_TCOPY_BUILTIN_HAS_SG_EXTRA=1' if os.environ.get('OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA', '1') == '1' else '') if 'gfx1250' in os.environ.get('GPU_ARCHS', '') else '')",
+            "('-mllvm -amdgpu-expert-scheduling-mode' if ('gfx1250' in os.environ.get('GPU_ARCHS', '') and os.environ.get('OPUS_NO_EXPERT_SCHED', '0') != '1') else '')",
+            "('-mllvm -enable-post-misched=1' if 'gfx1250' in os.environ.get('GPU_ARCHS', '') else '')"
         ],
         "flags_extra_hip_per_source": {
             "*.device.cu": ["-D__HIPCC_RTC__"]

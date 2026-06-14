@@ -67,6 +67,10 @@ class OpusGemmInstance:
     # SplitK workspace storage dtype; splitK launchers still use fp32 tune dispatch.
     splitk_workspace_dtype: str = "fp32_t"
 
+    # gfx1250 cluster/TDM split-K consumer tiling: "tileN" (split N) or
+    # "tileM" (split M). Only consumed by the a16w16_cluster_tdm_splitk_ws tag.
+    ctdm_layout: str = "tileN"
+
     @property
     def name(self) -> str:
         parts = [
@@ -90,6 +94,14 @@ class OpusGemmInstance:
             parts.insert(tag_at, "persistent")
         elif self.kernel_tag == "a16w16_mono_tile":
             parts.insert(tag_at, "mono_tile")
+        elif self.kernel_tag == "a16w16_cluster_tdm_splitk_ws":
+            # gfx1250 fp32-workspace split-K with a separate reduce kernel.
+            # Name it opus_gemm_gfx1250_splitk_* (note the "splitk_" segment) so
+            # the reduce-TU arch detection in gen_instances.py -- which keys on
+            # "opus_gemm_<arch>_splitk_" -- buckets it like the gfx942 splitk kids.
+            # The T_M x T_N segment (1x2 for tileN, 2x1 for tileM) keeps the name
+            # unique between the two consumer-tiling layouts.
+            parts.insert(tag_at, "splitk_cluster_tdm_ws")
         elif self.name_tag:
             parts.insert(tag_at, self.name_tag)
         elif self.kernel_tag in _GFX942_KERNEL_NAME_TAGS:
@@ -691,6 +703,80 @@ gfx942_splitk_kernels_list = {
 
 gfx942_kernels_list = {**gfx942_nosplit_kernels_list, **gfx942_splitk_kernels_list}
 
+# -- gfx1250 kernel lists ----------------------------------------------------
+# Kid offset: gfx1250 kids live in the 20000+ range, disjoint from gfx950
+# (<10000) and gfx942 (50000+). Today only the cluster/TDM split-K (atomic
+# fp32 reduction) pipeline is wired (打通阶段：fp32 output, no bias).
+GFX1250_KID_OFFSET = 20000
+
+
+def _a16w16_cluster_tdm_splitk_ws_gfx1250(bm, bn, bk, layout):
+    """Factory for the gfx1250 a16w16 cluster/TDM split-K (workspace + reduce) kid.
+
+    Locked geometry from the kernel base
+    (demon_gcn/wmma_opus_rdna4/gemm_a16w16_cluster_tdm_splitk_reduce_4wave.cc):
+    BLOCK_SIZE=128 (4 waves x 32 = 2 producer + 2 consumer), MFMA 16x16x32,
+    NO-CLUSTER (one WG per B_M x B_N tile). The main kernel WMMA-accumulates in
+    fp32 and PLAIN-stores each split's partial into an fp32 workspace; a separate
+    reduce kernel sums the split slices, folds bias, and casts to the Y dtype.
+    output_dtypes = ["fp32_t"] (only the fp32-workspace main kernel is
+    instantiated; Y bf16/fp32 is a runtime decision in the reduce kernel).
+
+    layout: "tileN" (consumers split N; B_N>=32) -> T_M=1, T_N=2;
+            "tileM" (consumers split M; B_M>=32) -> T_M=2, T_N=1.
+    """
+    vec = 16 // 2  # bf16 -> VEC_A = VEC_B = 8
+    t_m, t_n = (2, 1) if layout == "tileM" else (1, 2)
+    return OpusGemmInstance(
+        128,            # BLOCK_SIZE (4 waves x 32 lanes)
+        bm, bn, bk,
+        t_m, t_n,       # T_M, T_N (encodes the consumer tiling layout)
+        16, 16, 32,     # MFMA 16x16x32
+        vec, vec, 8,    # VEC_A, VEC_B, VEC_C
+        0, 0, 0,        # GROUP (unused)
+        "a16w16_cluster_tdm_splitk_ws",
+        ["fp32_t"],
+        arch_prefix="gfx1250",
+        ctdm_layout=layout,
+    )
+
+
+# Initial tile set seeded from the feasible no-cluster sweep
+# (demon_gcn/wmma_opus_rdna4/instances_full_nocluster_feasible.csv), curated to
+# the gfx1250 untuned shapes (small M / large N / large K).
+#
+# SCOPE (on-hardware validated, see op_tests/test_opus_gfx1250_ws.py -- 156/156):
+# both the small-M tileN tiles and the fully generalized M/N tiles are wired:
+#   * tileN: B_M==16, B_N>=32 (kExpN = B_N/32; N-wave-split + register-expand).
+#   * tileM: B_M>=32 (kExpM = B_M/32) with any B_N (kExpN = B_N/16).
+# Two earlier generalization bugs have been FIXED (2026-06):
+#   (a) kExpM>1 && kExpN>1 -> NaN at the software-pipeline tail (per-split
+#       k_steps%3==2): the sched_group_barrier DS/WMMA counts were hard-coded
+#       for the kExpM==kExpN==1 base; now scaled by the register expansion in
+#       the traits header (kSchedDsCount / kSchedWmmaCount).
+#   (b) tileN with kExpN>1 (B_N>32, kTileN=2) -> wrong values: the B-read
+#       N-decomposition order (make_layout_rb_ctdm) disagreed with the C-store
+#       order; B now mirrors A (kExpN outer, kTileN=wave_n inner).
+gfx1250_kernels_list = {
+    # -- tileN family (B_M=16, kExpN = B_N/32) -- small M --
+    20000: _a16w16_cluster_tdm_splitk_ws_gfx1250( 16, 32, 128, "tileN"),
+    20001: _a16w16_cluster_tdm_splitk_ws_gfx1250( 16, 32, 256, "tileN"),
+    20002: _a16w16_cluster_tdm_splitk_ws_gfx1250( 16, 32, 512, "tileN"),
+    # -- tileM family (B_M=32, kExpM=1; any B_N) -- generalizes M --
+    20010: _a16w16_cluster_tdm_splitk_ws_gfx1250( 32,  32, 128, "tileM"),
+    20011: _a16w16_cluster_tdm_splitk_ws_gfx1250( 32,  64, 128, "tileM"),
+    20012: _a16w16_cluster_tdm_splitk_ws_gfx1250( 32, 128, 128, "tileM"),
+    20013: _a16w16_cluster_tdm_splitk_ws_gfx1250( 32, 256, 128, "tileM"),
+    20014: _a16w16_cluster_tdm_splitk_ws_gfx1250( 32,  64, 256, "tileM"),
+    20015: _a16w16_cluster_tdm_splitk_ws_gfx1250( 32, 128, 256, "tileM"),
+    # NOTE: 32x256x256 omitted -- LDS (~445KB) exceeds the 320KB gfx1250 budget.
+    # -- generalized tiles (kExpM>1 / tileN kExpN>1) -- validated post-fix --
+    20020: _a16w16_cluster_tdm_splitk_ws_gfx1250( 64,  16, 128, "tileM"),  # kExpM=2, kExpN=1
+    20021: _a16w16_cluster_tdm_splitk_ws_gfx1250( 64,  64, 128, "tileM"),  # kExpM=2, kExpN=4
+    20022: _a16w16_cluster_tdm_splitk_ws_gfx1250( 16,  64, 128, "tileN"),  # kExpM=1, kExpN=2
+    20023: _a16w16_cluster_tdm_splitk_ws_gfx1250( 16, 128, 128, "tileN"),  # kExpM=1, kExpN=4
+}
+
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
     **a8w8_scale_kernels_list,
@@ -713,6 +799,7 @@ kernels_list = {
     **a16w16_persistent_kernels_list_4g_safe_nooob,
     **a16w16_mono_tile_kernels_list_4g_safe,
     **gfx942_kernels_list,
+    **gfx1250_kernels_list,
 }
 
 default_kernels_dict = {
@@ -730,6 +817,7 @@ SPLITK_KIDS = (
     frozenset(a16w16_flatmm_splitk_kernels_list.keys())
     | frozenset(a16w16_flatmm_splitk_kernels_list_nooob.keys())
     | frozenset(gfx942_splitk_kernels_list.keys())
+    | frozenset(gfx1250_kernels_list.keys())
 )
 
 # Non-splitk a16w16-family kids: split-barrier 4..9 + cpol/nooob mirrors, persistent 300..315 +
@@ -821,11 +909,21 @@ HEURISTIC_DEFAULT_KIDS_GFX942 = frozenset(
     }
 )
 
-HEURISTIC_DEFAULT_KIDS = HEURISTIC_DEFAULT_KIDS_GFX950 | HEURISTIC_DEFAULT_KIDS_GFX942
+# gfx1250 has no shape-heuristic dispatch yet (tune-id entry only). This set
+# is used purely to keep the kid in the subset-compile set S so the tune-id
+# path can always reach it.
+HEURISTIC_DEFAULT_KIDS_GFX1250 = frozenset(gfx1250_kernels_list.keys())
+
+HEURISTIC_DEFAULT_KIDS = (
+    HEURISTIC_DEFAULT_KIDS_GFX950
+    | HEURISTIC_DEFAULT_KIDS_GFX942
+    | HEURISTIC_DEFAULT_KIDS_GFX1250
+)
 
 HEURISTIC_DEFAULT_KIDS_BY_ARCH = {
     "gfx950": HEURISTIC_DEFAULT_KIDS_GFX950,
     "gfx942": HEURISTIC_DEFAULT_KIDS_GFX942,
+    "gfx1250": HEURISTIC_DEFAULT_KIDS_GFX1250,
 }
 
 

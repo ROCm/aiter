@@ -22,6 +22,7 @@ from codegen.common import (
 # and ARCH_MAP_REGISTRY at import time.
 from codegen import gen_instances_gfx950 as _gfx950  # noqa: F401
 from codegen import gen_instances_gfx942 as _gfx942  # noqa: F401
+from codegen import gen_instances_gfx1250 as _gfx1250  # noqa: F401
 from opus_gemm_common import (
     HEURISTIC_DEFAULT_KIDS,
     OpusGemmInstance,
@@ -44,16 +45,19 @@ from opus_gemm_common import (
 PIPELINE_HEADER_MAP = {
     **get_arch_map("gfx950", "pipeline_header"),
     **get_arch_map("gfx942", "pipeline_header"),
+    **get_arch_map("gfx1250", "pipeline_header"),
 }
 
 TRAITS_HEADER_MAP = {
     **get_arch_map("gfx950", "traits_header"),
     **get_arch_map("gfx942", "traits_header"),
+    **get_arch_map("gfx1250", "traits_header"),
 }
 
 KERNEL_FUNC_MAP = {
     **get_arch_map("gfx950", "kernel_func"),
     **get_arch_map("gfx942", "kernel_func"),
+    **get_arch_map("gfx1250", "kernel_func"),
 }
 
 SPLITK_REDUCE_EXTRA_MAP = {
@@ -75,6 +79,16 @@ SPLITK_REDUCE_ABI_MAP = {
         "ws_arg": "const opus_splitk_ws_handle* ws_handle",
         "ws_type": "const opus_splitk_ws_handle*",
         "baseline_has_oob": (True,),
+    },
+    "gfx1250": {
+        # gfx1250 cluster/TDM split-K: fp32 workspace + separate reduce kernel.
+        # Distinct kernel NAME (splitk_reduce_kernel_gfx1250) but the same
+        # ws_handle ABI as gfx950, so it never collides in a multi-arch build.
+        "forward_decl_include": '#include "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh"\n',
+        "kernel": "splitk_reduce_kernel_gfx1250",
+        "ws_arg": "const opus_splitk_ws_handle* ws_handle",
+        "ws_type": "const opus_splitk_ws_handle*",
+        "baseline_has_oob": (True, False),
     },
 }
 
@@ -133,17 +147,20 @@ NOSCALE_TAGS = A16W16_TUNE_TAGS | {"a8w8"}
 # the actual workspace dtype and the reduce launcher writes the requested Y.
 SPLITK_TAGS = {
     "a16w16_flatmm_splitk",
+    "a16w16_cluster_tdm_splitk_ws",
     *_SPLITK,
 }
 
 TRAITS_NAME_MAP = {
     **get_arch_map("gfx950", "traits_name"),
     **get_arch_map("gfx942", "traits_name"),
+    **get_arch_map("gfx1250", "traits_name"),
 }
 
 KARGS_NAME_MAP = {
     **get_arch_map("gfx950", "kargs_name"),
     **get_arch_map("gfx942", "kargs_name"),
+    **get_arch_map("gfx1250", "kargs_name"),
 }
 
 
@@ -1058,7 +1075,9 @@ if __name__ == "__main__":
     # tables: a single-arch build (GPU_ARCHS=gfx950) must not link gfx942
     # launcher symbols and vice versa.
     archs_for_header = (
-        sorted(target_arches) if target_arches is not None else ["gfx942", "gfx950"]
+        sorted(target_arches)
+        if target_arches is not None
+        else ["gfx942", "gfx950", "gfx1250"]
     )
     with open(os.path.join(args.working_path, "opus_build_archs.h"), "w") as f:
         f.write(
