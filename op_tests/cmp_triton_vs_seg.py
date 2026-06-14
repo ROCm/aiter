@@ -80,8 +80,33 @@ def main(triton_path, seg_path):
     try:
         qt = dt["q"].float()
         qs = ds["q"].float()
+        print(f"\nq shapes: triton {tuple(qt.shape)} {dt['q'].dtype}  seg {tuple(qs.shape)} {ds['q'].dtype}")
         if qt.shape == qs.shape:
-            print(f"cos(seg_q, triton_q) = {cosq(qs, qt):.4f}   (<<1 => fused_seg q_out wrong)")
+            kv_lora = 512
+            print(f"cos(seg_q, triton_q)        = {cosq(qs, qt):.4f}   (<<1 => fused_seg q_out wrong)")
+            # split into nope (first 512, NO rope) and pe (last 64, roped)
+            print(f"cos(seg_q[nope], triton_q[nope]) = {cosq(qs[..., :kv_lora], qt[..., :kv_lora]):.4f}   (nope has no rope; <<1 => quant/layout issue)")
+            print(f"cos(seg_q[pe],   triton_q[pe])   = {cosq(qs[..., kv_lora:], qt[..., kv_lora:]):.4f}   (<<1 => rope issue in fused_seg)")
+            # per-head cosine over first few heads (detect head scramble)
+            qsf, qtf = qs.reshape(-1, qs.shape[-1]), qt.reshape(-1, qt.shape[-1])
+            ph = [round(cosq(qsf[h], qtf[h]), 3) for h in range(min(6, qsf.shape[0]))]
+            print(f"per-head cos(seg,triton) heads[0:6] = {ph}")
+            # absmax sanity
+            print(f"absmax: triton_q={qt.abs().max():.2f} seg_q={qs.abs().max():.2f}")
+            # --- neox<->gptj layout reconciliation on the pe(64) segment ---
+            sp = qs[..., kv_lora:].reshape(-1, 64)   # seg pe
+            tp = qt[..., kv_lora:].reshape(-1, 64)    # triton pe
+            half = 32
+            idx_g2n = torch.empty(64, dtype=torch.long)   # gptj-order -> neox-order
+            idx_g2n[:half] = torch.arange(0, 64, 2)
+            idx_g2n[half:] = torch.arange(1, 64, 2)
+            idx_n2g = torch.empty(64, dtype=torch.long)   # neox-order -> gptj-order
+            idx_n2g[0::2] = torch.arange(0, half)
+            idx_n2g[1::2] = torch.arange(half, 64)
+            print(f"cos(seg_pe, triton_pe[g2n])    = {cosq(sp, tp[:, idx_g2n]):.4f}  (seg=neox, triton=gptj?)")
+            print(f"cos(seg_pe, triton_pe[n2g])    = {cosq(sp, tp[:, idx_n2g]):.4f}  (seg=gptj, triton=neox?)")
+            print(f"cos(seg_pe[firsthalf], triton_pe[firsthalf]) = {cosq(sp[:, :half], tp[:, :half]):.4f}")
+            print(f"cos(seg_pe[2ndhalf],  triton_pe[2ndhalf])  = {cosq(sp[:, half:], tp[:, half:]):.4f}")
         else:
             print(f"q shapes differ: triton {tuple(qt.shape)} vs seg {tuple(qs.shape)}")
     except Exception as e:

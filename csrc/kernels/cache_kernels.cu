@@ -2046,10 +2046,15 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         const float yv   = static_cast<float>(pe_ptr[pair_dim]);
         const float cosv = static_cast<float>(cos_ptr[cos_idx]);
         const float sinv = static_cast<float>(sin_ptr[cos_idx]);
+        // Standard RoPE pair transform (a,b) -> (a*cos - b*sin, b*cos + a*sin).
+        // xv is always the current element pe[d]; yv is its pair pe[pair_dim].
+        // For the "first" element of a pair (d<HALF / even d) output is
+        // xv*cos - yv*sin; for the "second" element output is xv*cos + yv*sin
+        // (i.e. b*cos + a*sin). The cos/sin operands must NOT be swapped here.
         if constexpr(IS_NEOX)
-            return d < HALF ? (xv * cosv - yv * sinv) : (yv * cosv + xv * sinv);
+            return d < HALF ? (xv * cosv - yv * sinv) : (xv * cosv + yv * sinv);
         else
-            return (d % 2 == 0) ? (xv * cosv - yv * sinv) : (yv * cosv + xv * sinv);
+            return (d % 2 == 0) ? (xv * cosv - yv * sinv) : (xv * cosv + yv * sinv);
     };
 
     // ================= Q (every block) =================
