@@ -2131,21 +2131,18 @@ struct smem {
     {
         using LT = layout_load_traits<Layout, vec>;
         constexpr auto r_elem = LT::r_elem;
-        constexpr bool is_static_layout = is_static_tuple_v<typename Layout::Shape> && is_static_tuple_v<typename Layout::Stride>;
-        [[maybe_unused]] auto offsets = layout_to_offsets<vec>(u);
-        // static Shape+Stride => per-issue byte offset is compile-time: compute the runtime per-lane base ONCE and fold the constant into the ds offset: immediate (else materialize offsets[i] as a base VGPR per issue).
-        auto issue = [&](auto i) {
-            if constexpr (is_static_layout) { constexpr int off = layout_imm_offsets_v<Layout, vec>[i.value] * (int)sizeof(T);
-                if constexpr (off >= 0 && off <= 0xffff) return _load<vec>(static_cast<const typename layout_shift_traits<remove_cvref_t<Layout>>::base&>(u)(make_repeated_tuple(number<0>{}, number<size<decltype(LT::issue_space_vec)>()>{})) * (int)sizeof(T) + off); }
-            return load<vec>(offsets[i.value]); };
+        auto offsets = layout_to_offsets<vec>(u);
 
 #if OPUS_TILE_CONTAINER == 0
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
-        static_for<r_elem.value>([&](auto i){ auto tmp = issue(i); for (index_t j = 0; j < vec * vector_size; j++) r[i.value * vec * vector_size + j] = tmp[j]; });
+        for (index_t i = 0; i < r_elem.value; i++) {
+            auto tmp = load<vec>(offsets[i]);
+            for (index_t j = 0; j < vec * vector_size; j++) r[i * vec * vector_size + j] = tmp[j];
+        }
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         array<vector_type<vec>, r_elem.value> r;
-        static_for<r_elem.value>([&](auto i){ r[i.value] = issue(i); });
+        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i]);
         return r;
 #endif
     }
