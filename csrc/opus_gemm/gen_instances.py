@@ -63,6 +63,7 @@ KERNEL_FUNC_MAP = {
 SPLITK_REDUCE_EXTRA_MAP = {
     "gfx950": get_arch_map("gfx950", "splitk_reduce_extra"),
     "gfx942": get_arch_map("gfx942", "splitk_reduce_extra"),
+    "gfx1250": get_arch_map("gfx1250", "splitk_reduce_extra"),
 }
 
 SPLITK_REDUCE_ABI_MAP = {

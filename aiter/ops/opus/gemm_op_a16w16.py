@@ -364,16 +364,19 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
     else:
         Y = torch.empty(batch, M, N, dtype=dtype, device=A.device)
 
-    # Bias validation. dtype must match Y dtype (match_d_out convention).
-    # Bias is per-output-feature [N] (F.linear convention). Shape protocol:
+    # Bias validation. Bias may be fp32 OR match the output dtype: the gfx1250
+    # splitk main kernel always writes an fp32 workspace and the reduce kernel
+    # folds bias in fp32 before the final cast to Y, so an fp32 bias is exact
+    # and free regardless of Y dtype (the common accuracy-friendly case for a
+    # bf16 output). Bias is per-output-feature [N] (F.linear convention):
     #   * [N]          -> stride_bias_batch = 0 (broadcast across batch)
     #   * [batch, N]   -> stride_bias_batch = N
-    # Matches the C++-side BIAS_HOST_VALIDATE in gen_instances.py.
+    # Matches the C++-side gfx1250 bias validation in gen_instances_gfx1250.py.
     if bias is not None:
-        if bias.dtype != dtype:
+        if bias.dtype not in (dtype, torch.float32):
             raise ValueError(
-                f"gemm_a16w16_opus: bias dtype must match output dtype "
-                f"(got bias.dtype={bias.dtype}, dtype={dtype})"
+                f"gemm_a16w16_opus: bias dtype must be fp32 or match output "
+                f"dtype (got bias.dtype={bias.dtype}, dtype={dtype})"
             )
         if not bias.is_contiguous():
             raise ValueError(

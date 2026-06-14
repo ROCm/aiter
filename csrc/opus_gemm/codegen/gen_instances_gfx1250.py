@@ -41,11 +41,34 @@ KARGS_NAME_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "opus_gemm_cluster_tdm_ws_kargs_gfx1250",
 }
 
+
+def splitk_reduce_extra_device_instantiations():
+    # gfx1250 only: fp32 bias with a bf16 output (D_OUT=__bf16, D_BIAS=float).
+    # The main kernel always writes an fp32 workspace, so an fp32 bias folds
+    # exactly in the reduce before the cast to bf16. The baseline instantiations
+    # cover the matched-dtype cases; this adds the bf16-out + fp32-bias mix that
+    # other arches never request. Same kernel NAME/ABI -> no extra forward decl.
+    return (
+        "// fp32-bias + bf16-out (gfx1250 f32 bias support)\n"
+        "template __global__ void splitk_reduce_kernel_gfx1250<16, 64, __bf16, true,  float,  true>(\n"
+        "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int, int,\n"
+        "    const float*,  int);\n"
+        "template __global__ void splitk_reduce_kernel_gfx1250<16, 64, __bf16, true,  float,  false>(\n"
+        "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int, int,\n"
+        "    const float*,  int);\n"
+    )
+
+
+SPLITK_REDUCE_EXTRA_MAP = {
+    "device_instantiations": splitk_reduce_extra_device_instantiations,
+}
+
 register_arch_map("gfx1250", "pipeline_header", PIPELINE_HEADER_MAP)
 register_arch_map("gfx1250", "traits_header", TRAITS_HEADER_MAP)
 register_arch_map("gfx1250", "kernel_func", KERNEL_FUNC_MAP)
 register_arch_map("gfx1250", "traits_name", TRAITS_NAME_MAP)
 register_arch_map("gfx1250", "kargs_name", KARGS_NAME_MAP)
+register_arch_map("gfx1250", "splitk_reduce_extra", SPLITK_REDUCE_EXTRA_MAP)
 
 # tileN = consumers split N (B_N>=32); tileM = consumers split M (B_M>=32).
 _LAYOUT_INT = {"tileN": 0, "tileM": 1}
@@ -78,6 +101,44 @@ def gen_cluster_tdm_splitk_ws_instance(
     layout_int = _LAYOUT_INT[getattr(k, "ctdm_layout", "tileN")]
     has_oob_str = "true" if k.has_oob else "false"
     enable_bias_str = "true" if getattr(k, "enable_bias", False) else "false"
+
+    # gfx1250-specific bias validation (does NOT use the shared BIAS_HOST_VALIDATE,
+    # which forces bias.dtype == Y.dtype). The main kernel always writes an fp32
+    # workspace and the reduce kernel folds bias in fp32 before the final cast to
+    # Y, so an fp32 bias is exact for ANY Y dtype (bf16 or fp32). We therefore
+    # accept bias.dtype in {{fp32, Y.dtype}} and record bias_is_fp32_ so the reduce
+    # launch below can pick the matching D_BIAS template. (Double C++ braces are
+    # intentional -- this string is inserted verbatim into the f-string template.)
+    gfx1250_bias_validate = """
+    const void* ptr_bias_ = nullptr;
+    int stride_bias_batch_ = 0;
+    bool bias_is_fp32_ = false;
+    if (bias.has_value()) {{
+        const auto& bt = bias.value();
+        AITER_CHECK(bt.is_contiguous(),
+            "bias must be contiguous (got non-contiguous tensor)");
+        AITER_CHECK(bt.dtype() == AITER_DTYPE_fp32 || bt.dtype() == Y.dtype(),
+            "bias dtype must be fp32 or match Y dtype (got bias=",
+            AiterDtype_to_str(bt.dtype()),
+            " Y=", AiterDtype_to_str(Y.dtype()), ")");
+        bias_is_fp32_ = (bt.dtype() == AITER_DTYPE_fp32);
+        if (bt.dim() == 1) {{
+            AITER_CHECK(bt.size(0) == N,
+                "bias 1D length must equal N (got bias.size(0)=", bt.size(0),
+                " N=", N, ")");
+            stride_bias_batch_ = 0;
+        }} else if (bt.dim() == 2) {{
+            AITER_CHECK(bt.size(0) == batch && bt.size(1) == N,
+                "bias 2D shape must equal [batch, N] (got [", bt.size(0), ", ",
+                bt.size(1), "] vs batch=", batch, " N=", N, ")");
+            stride_bias_batch_ = N;
+        }} else {{
+            AITER_CHECK(false, "bias must be 1D [N] or 2D [batch, N]; got dim=",
+                bt.dim());
+        }}
+        ptr_bias_ = bt.data_ptr();
+    }}
+"""
 
     traits_aliases = f"""
 template <typename D_C>
@@ -151,7 +212,7 @@ void
         "K=", K, " must be even (a16w16 family rejects odd K)");
     AITER_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
         "M, N, K, batch must be >= 1");
-{BIAS_HOST_VALIDATE}
+{gfx1250_bias_validate}
     using Traits = {k.name}_Traits<D_C>;
 
     int split_k = (splitK <= 1) ? 1 : splitK;
@@ -200,7 +261,7 @@ void
     const size_t b_batch_bytes = (size_t)N * (size_t)K * sizeof({db});
     const size_t c_elem_bytes  = (Y.dtype() == AITER_DTYPE_bf16) ? sizeof(bf16_t) : sizeof(fp32_t);
     const size_t c_batch_bytes = (size_t)M * (size_t)N * c_elem_bytes;
-    const size_t bias_elem_bytes = c_elem_bytes;   // bias dtype matches Y dtype
+    const size_t bias_elem_bytes = bias_is_fp32_ ? sizeof(fp32_t) : c_elem_bytes;
 
     dim3 grid_main(num_tiles_m, num_tiles_n, split_k);
     dim3 block_main({k.BLOCK_SIZE});
@@ -239,7 +300,14 @@ void
 
         if (Y.dtype() == AITER_DTYPE_bf16) {{{{
             __bf16* y_ptr = reinterpret_cast<__bf16*>(kargs.ptr_c);
-            if (bias_bb) {{{{
+            if (bias_bb && bias_is_fp32_) {{{{
+                // fp32 bias + bf16 output: fold the exact fp32 bias in the
+                // reduce (D_BIAS=float), then cast the fp32 sum to bf16.
+                splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, {has_oob_str}>
+                    <<<grid_reduce, block_reduce, 0, stream>>>(
+                        ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                        reinterpret_cast<const float*>(bias_bb), 0);
+            }}}} else if (bias_bb) {{{{
                 splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}>
                     <<<grid_reduce, block_reduce, 0, stream>>>(
                         ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
