@@ -535,12 +535,12 @@ void
     kargs.ptr_bias      = ptr_bias_;
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
     kargs.split_k = split_k;
-    kargs.stride_a        = K;
-    kargs.stride_b        = K;
+    kargs.stride_a        = XQ.stride(1);
+    kargs.stride_b        = WQ.stride(1);
     kargs.stride_ws       = padded_N;
     kargs.stride_c        = N;
-    kargs.stride_a_batch  = M * K;
-    kargs.stride_b_batch  = N * K;
+    kargs.stride_a_batch  = XQ.stride(0);
+    kargs.stride_b_batch  = WQ.stride(0);
     kargs.stride_ws_batch = padded_M * padded_N;
     kargs.stride_c_batch  = M * N;
     kargs.stride_bias_batch = stride_bias_batch_;
@@ -637,11 +637,11 @@ void
     kargs.n = N;
     kargs.k = K;
     kargs.batch = batch;
-    kargs.stride_a = K;
-    kargs.stride_b = K;
+    kargs.stride_a = XQ.stride(1);
+    kargs.stride_b = WQ.stride(1);
     kargs.stride_c = N;
-    kargs.stride_a_batch = M * K;
-    kargs.stride_b_batch = N * K;
+    kargs.stride_a_batch = XQ.stride(0);
+    kargs.stride_b_batch = WQ.stride(0);
     kargs.stride_c_batch = M * N;
 {bias_kargs_block}
     int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};

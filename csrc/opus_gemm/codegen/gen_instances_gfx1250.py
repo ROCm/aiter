@@ -257,8 +257,8 @@ void
         ws_handle_->bytes = grow_bytes;
     }}}}
 
-    const size_t a_batch_bytes = (size_t)M * (size_t)K * sizeof({da});
-    const size_t b_batch_bytes = (size_t)N * (size_t)K * sizeof({db});
+    const size_t a_batch_bytes = (size_t)XQ.stride(0) * sizeof({da});
+    const size_t b_batch_bytes = (size_t)WQ.stride(0) * sizeof({db});
     const size_t c_elem_bytes  = (Y.dtype() == AITER_DTYPE_bf16) ? sizeof(bf16_t) : sizeof(fp32_t);
     const size_t c_batch_bytes = (size_t)M * (size_t)N * c_elem_bytes;
     const size_t bias_elem_bytes = bias_is_fp32_ ? sizeof(fp32_t) : c_elem_bytes;
@@ -280,12 +280,12 @@ void
         kargs.ptr_c     = reinterpret_cast<char*>(Y.data_ptr()) + (size_t)bb * c_batch_bytes;
         kargs.ptr_bias  = ptr_bias_;
         kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = 1; kargs.split_k = split_k;
-        kargs.stride_a        = K;
-        kargs.stride_b        = K;
+        kargs.stride_a        = XQ.stride(1);
+        kargs.stride_b        = WQ.stride(1);
         kargs.stride_ws       = padded_N;
         kargs.stride_c        = N;
-        kargs.stride_a_batch  = M * K;
-        kargs.stride_b_batch  = N * K;
+        kargs.stride_a_batch  = XQ.stride(0);
+        kargs.stride_b_batch  = WQ.stride(0);
         kargs.stride_ws_batch = padded_M * padded_N;
         kargs.stride_c_batch  = M * N;
         kargs.stride_bias_batch = stride_bias_batch_;

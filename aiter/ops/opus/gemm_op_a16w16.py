@@ -128,24 +128,39 @@ def _check_a16w16_tune_layout(XQ: torch.Tensor, WQ: torch.Tensor, Y: torch.Tenso
             f"Y.shape={tuple(Y.shape)}, expected ({batch}, {M}, {N}))"
         )
 
-    # Strides must match the launcher's hardcoded assumptions.
-    expected = {
-        "XQ": (XQ, (M * K, K, 1)),
-        "WQ": (WQ, (N * K, K, 1)),
-        "Y": (Y, (M * N, N, 1)),
-    }
-    for name, (t, want) in expected.items():
-        got = tuple(t.stride())
-        if got != want:
+    # XQ / WQ: the K (innermost / contraction) dimension may be padded -- the
+    # launcher passes the tensor's real leading stride as kargs.stride_a/stride_b
+    # and the kernels use it as the lda for BOTH addressing and the gmem buffer
+    # bound, so a row pitch > K (e.g. a 2880-wide tensor stored at lda 3072) is
+    # served correctly. We only require:
+    #   * innermost stride == 1   (the kernel layout hardcodes the K stride to 1)
+    #   * row pitch (stride[1]) >= K
+    #   * batch stride == rows * row pitch (or batch == 1) -- rejects broadcast
+    #     (stride 0) and transposed / overlapping views.
+    for name, t, rows in (("XQ", XQ, M), ("WQ", WQ, N)):
+        s0, s1, s2 = t.stride()
+        k_inner = t.shape[2]
+        ok = s2 == 1 and s1 >= k_inner and (batch == 1 or s0 == rows * s1)
+        if not ok:
             raise NotImplementedError(
-                f"opus_gemm_a16w16_tune: {name} must have contiguous "
-                f"strides {want} (got {name}.stride()={got}, "
-                f"{name}.shape={tuple(t.shape)}). The launcher hardcodes "
-                f"stride_*_batch and stride_* values; any broadcast / "
-                f"transpose / slice produces wrong results or a memory "
-                f"access fault. Materialize with `{name} = {name}."
-                f"contiguous()` before calling."
+                f"opus_gemm_a16w16_tune: {name} must be K-contiguous with an "
+                f"optional padded leading dim -- need stride[2]==1, "
+                f"stride[1]>={k_inner}, and stride[0]==size(1)*stride[1] (or "
+                f"batch==1). Got {name}.stride()={tuple(t.stride())}, "
+                f"{name}.shape={tuple(t.shape)}. Broadcast / transpose / "
+                f"non-K-contiguous slices are not supported; materialize with "
+                f"`{name} = {name}.contiguous()` before calling."
             )
+    # Y is the output: the launcher hardcodes stride_c == N and
+    # stride_c_batch == M*N, so it must be fully contiguous.
+    y_want = (M * N, N, 1)
+    if tuple(Y.stride()) != y_want:
+        raise NotImplementedError(
+            f"opus_gemm_a16w16_tune: Y must have contiguous strides {y_want} "
+            f"(got Y.stride()={tuple(Y.stride())}, Y.shape={tuple(Y.shape)}). "
+            f"The launcher hardcodes stride_c == N and stride_c_batch == M*N; "
+            f"materialize with `Y = Y.contiguous()` before calling."
+        )
 
 
 def opus_gemm_a16w16_tune(

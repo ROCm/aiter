@@ -69,12 +69,12 @@ struct opus_gemm_cluster_tdm_ws_kargs_gfx1250 {
     int k;
     int batch;                               // = 1 per launch (host loops batch)
     int split_k;                             // runtime split factor (KBatch)
-    int stride_a;                            // = K
-    int stride_b;                            // = K
+    int stride_a;                            // A row pitch (typically = K; > K if row-padded)
+    int stride_b;                            // B row pitch (typically = K; > K if row-padded)
     int stride_ws;                           // = padded_N
     int stride_c;                            // = N
-    int stride_a_batch;                      // = M * K
-    int stride_b_batch;                      // = N * K
+    int stride_a_batch;                      // A batch pitch (= M * stride_a)
+    int stride_b_batch;                      // B batch pitch (= N * stride_b)
     int stride_ws_batch;                     // = padded_M * padded_N (one split slice)
     int stride_c_batch;                      // = M * N
     int stride_bias_batch;                   // 0 (broadcast [N]) or N ([batch, N])
