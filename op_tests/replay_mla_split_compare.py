@@ -177,21 +177,29 @@ def replay_one(path, dev="cuda"):
     nan_diag = ""
     if not f2:
         qoi = b["qo_indptr"].to(torch.int64)
+        klp = b["kv_last_page_lens"].to(torch.int64)
+        page_size = int(b["page_size"])
         bs = qoi.numel() - 1
         row_finite = torch.isfinite(o2c.reshape(o2c.shape[0], -1)).all(dim=1).cpu()
-        nan_pages, ok_pages = [], []
+        nan_tok, ok_tok, nan_last, ok_last = [], [], [], []
         for i in range(bs):
             r0, r1 = int(qoi[i]), int(qoi[i + 1])
-            pg = int(per_batch_pages[i].item()) if i < per_batch_pages.numel() else -1
+            pg = int(per_batch_pages[i].item()) if i < per_batch_pages.numel() else 0
+            last = int(klp[i].item()) if i < klp.numel() else 0
+            tok = (pg - 1) * page_size + last if pg > 0 else 0
             rows_ok = bool(row_finite[r0:r1].all()) if r1 > r0 else True
-            (ok_pages if rows_ok else nan_pages).append(pg)
-        n_nan_b = len(nan_pages)
+            if rows_ok:
+                ok_tok.append(tok); ok_last.append(last)
+            else:
+                nan_tok.append(tok); nan_last.append(last)
+
+        def _fmt(xs):
+            return f"{min(xs)}..{max(xs)}" if xs else "-"
+
         nan_diag = (
-            f"nan_batches={n_nan_b}/{bs} "
-            f"nan_pages[min/max]={min(nan_pages) if nan_pages else '-'}/"
-            f"{max(nan_pages) if nan_pages else '-'} "
-            f"ok_pages[min/max]={min(ok_pages) if ok_pages else '-'}/"
-            f"{max(ok_pages) if ok_pages else '-'}"
+            f"nan_batches={len(nan_tok)}/{bs} "
+            f"nan_tok={_fmt(nan_tok)} nan_last={sorted(set(nan_last))} | "
+            f"ok_tok={_fmt(ok_tok)} ok_last={sorted(set(ok_last))}"
         )
     res = {
         "name": os.path.basename(path),
