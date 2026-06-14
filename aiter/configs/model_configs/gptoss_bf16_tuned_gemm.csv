@@ -93,9 +93,9 @@ gfx1250,256,2,128,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0
 gfx1250,256,4,128,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,8,128,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,16,128,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
-gfx1250,256,32,128,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
+gfx1250,256,32,128,2880,True,torch.bfloat16,torch.bfloat16,False,False,opus,20012,0,0.0,opus_gemm_gfx1250_splitk_cluster_tdm_ws_128x32x128x128_2x1_16x16x32_0x0x0,0.0,0.0,0.0
 gfx1250,256,48,128,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
-gfx1250,256,64,128,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
+gfx1250,256,64,128,2880,True,torch.bfloat16,torch.bfloat16,False,False,opus,20012,0,0.0,opus_gemm_gfx1250_splitk_cluster_tdm_ws_128x32x128x128_2x1_16x16x32_0x0x0,0.0,0.0,0.0
 gfx1250,256,128,128,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,256,128,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,512,128,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
@@ -109,9 +109,9 @@ gfx1250,256,2,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,
 gfx1250,256,4,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,8,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,16,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
-gfx1250,256,32,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
+gfx1250,256,32,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,opus,20011,0,0.0,opus_gemm_gfx1250_splitk_cluster_tdm_ws_128x32x64x128_2x1_16x16x32_0x0x0,0.0,0.0,0.0
 gfx1250,256,48,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
-gfx1250,256,64,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
+gfx1250,256,64,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,opus,20011,0,0.0,opus_gemm_gfx1250_splitk_cluster_tdm_ws_128x32x64x128_2x1_16x16x32_0x0x0,0.0,0.0,0.0
 gfx1250,256,128,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,256,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,512,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
@@ -125,9 +125,9 @@ gfx1250,256,2,5120,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,
 gfx1250,256,4,5120,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,8,5120,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,16,5120,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
-gfx1250,256,32,5120,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
+gfx1250,256,32,5120,2880,True,torch.bfloat16,torch.bfloat16,False,False,opus,20013,0,0.0,opus_gemm_gfx1250_splitk_cluster_tdm_ws_128x32x256x128_2x1_16x16x32_0x0x0,0.0,0.0,0.0
 gfx1250,256,48,5120,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
-gfx1250,256,64,5120,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
+gfx1250,256,64,5120,2880,True,torch.bfloat16,torch.bfloat16,False,False,opus,20013,0,0.0,opus_gemm_gfx1250_splitk_cluster_tdm_ws_128x32x256x128_2x1_16x16x32_0x0x0,0.0,0.0,0.0
 gfx1250,256,128,5120,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,256,5120,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,512,5120,2880,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
