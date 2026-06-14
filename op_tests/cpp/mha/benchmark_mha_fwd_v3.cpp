@@ -1,212 +1,124 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// CK-excluded benchmark host for the fmha_fwd_with_sink_asm ASM path.
-// Pair with libmha_fwd_asm.so built via `compile.py --api=fwd_v3` (ck_exclude=True),
-// which defines ENABLE_CK=0 and links both csrc/cpp_itfs/mha_fwd.cu and
-// csrc/py_itfs_cu/asm_fmha_fwd_with_sink.cu into libmha_fwd_asm.so.  The latter
-// provides the `fmha_fwd_with_sink_asm` C-ABI entry point used here.
-// A distinct library name (libmha_fwd_asm vs libmha_fwd) prevents the JIT blob
-// directory from being contaminated by CK-generated blobs from a prior full-CK
-// build, which would cause compile errors on gfx1250 where CK fails.
+// Unified benchmark/correctness host for the gfx1250 ASM FWD sink path.
 //
-// Supported features (matches kernel capabilities in hsa/gfx1250/fmha_fwd_bf16/):
-//   - arch: gfx1250 only
-//   - prec: bf16 only (kernel does not accept fp16)
-//   - head_dim: 64 or 128
-//   - mask: causal only (mask=1; only causal kernels are shipped in the CSV)
-//   - layout: bshd ([b, s, h, d]) shape; kernel reads strides directly so the
-//             underlying memory layout can differ (this host uses contiguous bshd)
-//   - sink (D64 only): per-head fp32 logit in AITER post-scale domain required
-//             for D64 (ENABLE_SINK=1 kernels).  D128 kernels (ENABLE_SINK=0)
-//             ignore sink contents; a zero-filled buffer is still passed.
+// Two calling modes selected at run time via -via= (default: mha_fwd):
 //
-// Not supported: fp16, group/varlen mode, bias, dropout, sliding-window (non-causal).
+//   direct   -- calls fmha_fwd_with_sink_asm() directly (bypasses mha_fwd wrapper).
+//               The host pre-initialises O=0 and LSE=-inf before each call because
+//               the kernel is a streaming accumulator that does not self-initialise.
+//   mha_fwd  -- calls aiter::mha_fwd() (same dispatch path as TE's ck_fused_attn_fwd).
+//               No host-side initialisation required: fmha_fwd_gfx1250_batched
+//               handles O=0 / LSE=-inf initialisation internally.
 //
-// GPU tensor management:
-//   Uses plain hipMalloc/hipFree (DeviceMem) with manually-filled aiter_tensor_t
-//   descriptors.  AiterTensor from aiter_tensor.h is intentionally NOT used:
-//   that RAII class depends on PyTorch's HIP runtime being pre-initialized,
-//   which is not guaranteed in a standalone C++ host.  An explicit hipInit(0)
-//   at program start ensures a stable HIP context before any hipMalloc calls.
+// Both modes share the same CPU reference, validation thresholds, and shape args.
+//
+// Prerequisites:
+//   python3 compile.py --api=fwd_v3 && bash build_mha.sh fwd_v3
 
-#include "aiter_enum.h" // AiterDtype enum + AiterDtype_element_size()
+#include "aiter_tensor.h"  // aiter_tensor_t, AITER_DTYPE_*
+#include "mha_fwd.h"       // aiter::mha_fwd, mha_fwd_args
+#include "ck_tile_shim.h"  // ck_tile::stream_config
 
 #include <hip/hip_bf16.h>
-#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
-#include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
-#include <optional>
 #include <random>
-#include <sstream>
 #include <string>
 #include <tuple>
-#include <utility>
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// aiter_tensor_t: POD descriptor for a GPU tensor.
-// Copied from csrc/include/aiter_tensor.h to avoid pulling in aiter_hip_common.h
-// (which transitively includes ck_tile_shim.h and other headers that are not
-// needed in a standalone C++ host).
+// Direct-mode kernel (csrc/py_itfs_cu/asm_fmha_fwd_with_sink.cu → libmha_fwd_asm.so)
 // ---------------------------------------------------------------------------
-
-struct aiter_tensor_t
-{
-    void*       ptr;        // device data pointer
-    std::size_t numel_;     // total number of elements
-    int         ndim;       // number of dimensions (up to 8)
-    int64_t     shape[8];   // size of each dimension
-    int64_t     strides[8]; // stride of each dimension (in elements)
-    AiterDtype  dtype_;     // data type
-    int         device_id;  // GPU device index
-
-    // accessors matching the torch::Tensor API expected by the .cu dispatcher
-    int64_t     size(int i)      const { return (i < 0) ? shape[ndim + i]   : shape[i]; }
-    int64_t     stride(int i)    const { return (i < 0) ? strides[ndim + i] : strides[i]; }
-    void*       data_ptr()       const { return ptr; }
-    std::size_t numel()          const { return numel_; }
-    int         dim()            const { return ndim; }
-    AiterDtype  dtype()          const { return dtype_; }
-    std::size_t element_size()   const { return AiterDtype_element_size(dtype_); }
-};
-
-// ---------------------------------------------------------------------------
-// C-ABI declaration for the ASM FWD with sink entry point.
-// Defined in csrc/py_itfs_cu/asm_fmha_fwd_with_sink.cu, linked via libmha_fwd_asm.so.
-// Returns 0 on success, -1 on error (error string in TLS via aiter_get_last_error).
-// ---------------------------------------------------------------------------
-extern "C" int fmha_fwd_with_sink_asm(aiter_tensor_t* q,
-                                       aiter_tensor_t* k,
-                                       aiter_tensor_t* v,
-                                       aiter_tensor_t* out,
-                                       aiter_tensor_t* lse,
-                                       aiter_tensor_t* sink,
-                                       float           softmax_scale,
-                                       int             is_causal,
-                                       int             return_lse,
-                                       hipStream_t     stream);
-
-// TLS error accessors (AITER_CTYPES_ERROR_DEF in asm_fmha_fwd_with_sink.cu).
+extern "C" int         fmha_fwd_with_sink_asm(aiter_tensor_t* q,
+                                               aiter_tensor_t* k,
+                                               aiter_tensor_t* v,
+                                               aiter_tensor_t* out,
+                                               aiter_tensor_t* lse,
+                                               aiter_tensor_t* sink,
+                                               float           softmax_scale,
+                                               int             is_causal,
+                                               int             return_lse,
+                                               hipStream_t     stream);
 extern "C" const char* aiter_get_last_error();
 extern "C" void        aiter_clear_last_error();
 
 // ---------------------------------------------------------------------------
-// HIP error check helper
+// HIP error helper
 // ---------------------------------------------------------------------------
-
 #ifndef HIP_CHECK
-#define HIP_CHECK(expr)                                                      \
-    do                                                                       \
-    {                                                                        \
-        hipError_t _e = (expr);                                              \
-        if(_e != hipSuccess)                                                 \
-        {                                                                    \
-            std::cerr << "HIP error: " << hipGetErrorString(_e) << " at "   \
-                      << __FILE__ << ":" << __LINE__ << " (" #expr ")"      \
-                      << std::endl;                                          \
-            std::abort();                                                    \
-        }                                                                    \
+#define HIP_CHECK(expr)                                                        \
+    do {                                                                       \
+        hipError_t _e = (expr);                                                \
+        if(_e != hipSuccess) {                                                 \
+            std::cerr << "HIP error: " << hipGetErrorString(_e) << " at "     \
+                      << __FILE__ << ":" << __LINE__ << " (" #expr ")\n";     \
+            std::abort();                                                      \
+        }                                                                      \
     } while(0)
 #endif
 
 // ---------------------------------------------------------------------------
-// DeviceMem: simple RAII wrapper for hipMalloc / hipFree.
-// Avoids any dependency on PyTorch or the aiter JIT infrastructure.
+// DeviceMem: RAII hipMalloc wrapper
 // ---------------------------------------------------------------------------
-
 class DeviceMem
 {
-  public:
+public:
     DeviceMem() = default;
-    explicit DeviceMem(std::size_t bytes) { Realloc(bytes); }
-    ~DeviceMem()
-    {
-        if(buf_)
-            (void)hipFree(buf_);
-    }
+    explicit DeviceMem(std::size_t bytes) { realloc(bytes); }
+    ~DeviceMem() { if(buf_) (void)hipFree(buf_); }
     DeviceMem(const DeviceMem&)            = delete;
     DeviceMem& operator=(const DeviceMem&) = delete;
 
-    void Realloc(std::size_t bytes)
+    void realloc(std::size_t bytes)
     {
-        if(buf_)
-        {
-            HIP_CHECK(hipFree(buf_));
-            buf_ = nullptr;
-        }
+        if(buf_) { HIP_CHECK(hipFree(buf_)); buf_ = nullptr; }
         size_ = bytes;
-        if(bytes > 0)
-            HIP_CHECK(hipMalloc(&buf_, bytes));
+        if(bytes > 0) HIP_CHECK(hipMalloc(&buf_, bytes));
     }
-
-    void ToDevice(const void* src) const
+    void to_device(const void* src)
     {
         if(src && buf_ && size_)
             HIP_CHECK(hipMemcpy(buf_, src, size_, hipMemcpyHostToDevice));
     }
-
-    void FromDevice(void* dst) const
+    void from_device(void* dst) const
     {
         if(dst && buf_ && size_)
             HIP_CHECK(hipMemcpy(dst, buf_, size_, hipMemcpyDeviceToHost));
     }
+    void set_zero() { if(buf_ && size_) HIP_CHECK(hipMemset(buf_, 0, size_)); }
 
-    void SetZero()
-    {
-        if(buf_ && size_)
-            HIP_CHECK(hipMemset(buf_, 0, size_));
-    }
+    void*       ptr()  const { return buf_; }
+    std::size_t size() const { return size_; }
 
-    void*       GetDeviceBuffer() const { return buf_; }
-    std::size_t GetBufferSize()   const { return size_; }
-
-  private:
+private:
     void*       buf_  = nullptr;
     std::size_t size_ = 0;
 };
 
 // ---------------------------------------------------------------------------
-// make_tensor_desc: build a contiguous row-major aiter_tensor_t descriptor.
-// Strides are in elements (not bytes); the dispatcher multiplies by element_size.
+// make_tensor_desc: contiguous row-major aiter_tensor_t; strides in elements
 // ---------------------------------------------------------------------------
-
 template <typename... Dims>
-inline aiter_tensor_t make_tensor_desc(void*      ptr,
-                                        AiterDtype dtype,
-                                        int        device_id,
-                                        Dims...    dims)
+inline aiter_tensor_t make_tensor_desc(void* ptr, AiterDtype dtype, int dev, Dims... dims)
 {
-    static_assert(sizeof...(dims) <= 8,
-                  "aiter_tensor_t supports at most 8 dimensions");
+    static_assert(sizeof...(dims) <= 8, "aiter_tensor_t supports at most 8 dimensions");
     aiter_tensor_t t{};
-    t.ptr       = ptr;
-    t.dtype_    = dtype;
-    t.device_id = device_id;
-    t.ndim      = static_cast<int>(sizeof...(dims));
-
-    const int64_t dim_arr[] = {static_cast<int64_t>(dims)...};
+    t.ptr = ptr; t.dtype_ = dtype; t.device_id = dev;
+    t.ndim = (int)sizeof...(dims);
+    const int64_t da[] = {(int64_t)dims...};
     t.numel_ = 1;
-    for(int i = 0; i < t.ndim; ++i)
-    {
-        t.shape[i] = dim_arr[i];
-        t.numel_ *= static_cast<std::size_t>(dim_arr[i]);
-    }
-
-    // Row-major contiguous strides in elements (matches PyTorch convention).
-    if(t.ndim > 0)
-    {
+    for(int i = 0; i < t.ndim; ++i) { t.shape[i] = da[i]; t.numel_ *= (std::size_t)da[i]; }
+    if(t.ndim > 0) {
         t.strides[t.ndim - 1] = 1;
         for(int i = t.ndim - 2; i >= 0; --i)
             t.strides[i] = t.strides[i + 1] * t.shape[i + 1];
@@ -215,674 +127,476 @@ inline aiter_tensor_t make_tensor_desc(void*      ptr,
 }
 
 // ---------------------------------------------------------------------------
-// Dtype <-> float conversions
+// HostTensor<T>: flat row-major CPU storage
 // ---------------------------------------------------------------------------
-
-template <typename T>
-inline float to_float(T x);
-template <>
-inline float to_float<float>(float x) { return x; }
-template <>
-inline float to_float<__half>(__half x) { return __half2float(x); }
-template <>
-inline float to_float<__hip_bfloat16>(__hip_bfloat16 x) { return static_cast<float>(x); }
-
-template <typename T>
-inline T from_float(float x);
-template <>
-inline float from_float<float>(float x) { return x; }
-template <>
-inline __half from_float<__half>(float x) { return __float2half_rn(x); }
-template <>
-inline __hip_bfloat16 from_float<__hip_bfloat16>(float x)
-{
-    return static_cast<__hip_bfloat16>(x);
-}
-
-// ---------------------------------------------------------------------------
-// HostTensor<T>: flat row-major storage indexed by variadic indices
-// ---------------------------------------------------------------------------
-
 using index_t = int32_t;
 
 template <typename T>
 class HostTensor
 {
-  public:
-    HostTensor() = default;
-
+public:
     explicit HostTensor(std::vector<index_t> shape) : shape_(std::move(shape))
     {
         strides_.assign(shape_.size(), 1);
-        for(int i = static_cast<int>(shape_.size()) - 2; i >= 0; --i)
+        for(int i = (int)shape_.size() - 2; i >= 0; --i)
             strides_[i] = strides_[i + 1] * shape_[i + 1];
         data_.assign(numel(), T{});
     }
+    HostTensor(std::initializer_list<index_t> s)
+        : HostTensor(std::vector<index_t>(s.begin(), s.end())) {}
 
-    template <std::size_t N>
-    explicit HostTensor(std::array<index_t, N> shape)
-        : HostTensor(std::vector<index_t>(shape.begin(), shape.end()))
-    {
-    }
-
-    HostTensor(std::initializer_list<index_t> shape)
-        : HostTensor(std::vector<index_t>(shape.begin(), shape.end()))
-    {
-    }
-
-    const std::vector<index_t>& shape() const { return shape_; }
-
-    std::size_t numel() const
-    {
-        std::size_t n = 1;
-        for(auto s : shape_)
-            n *= static_cast<std::size_t>(s);
-        return n;
-    }
-
+    std::size_t numel() const { std::size_t n=1; for(auto s:shape_) n*=(std::size_t)s; return n; }
     std::size_t bytes() const { return numel() * sizeof(T); }
-
-    T*       data() { return data_.data(); }
+    T*       data()       { return data_.data(); }
     const T* data() const { return data_.data(); }
 
-    template <typename... Idxs>
-    std::size_t offset(Idxs... idxs) const
+    template <typename... Idx>
+    T& operator()(Idx... idx)
     {
-        const index_t ii[] = {static_cast<index_t>(idxs)...};
-        std::size_t   off  = 0;
-        for(std::size_t i = 0; i < sizeof...(idxs); ++i)
-            off += static_cast<std::size_t>(ii[i]) *
-                   static_cast<std::size_t>(strides_[i]);
-        return off;
+        const index_t ii[] = {(index_t)idx...};
+        std::size_t off = 0;
+        for(std::size_t i = 0; i < sizeof...(idx); ++i)
+            off += (std::size_t)ii[i] * (std::size_t)strides_[i];
+        return data_[off];
+    }
+    template <typename... Idx>
+    const T& operator()(Idx... idx) const
+    {
+        const index_t ii[] = {(index_t)idx...};
+        std::size_t off = 0;
+        for(std::size_t i = 0; i < sizeof...(idx); ++i)
+            off += (std::size_t)ii[i] * (std::size_t)strides_[i];
+        return data_[off];
     }
 
-    template <typename... Idxs>
-    T& operator()(Idxs... idxs) { return data_[offset(idxs...)]; }
-    template <typename... Idxs>
-    const T& operator()(Idxs... idxs) const { return data_[offset(idxs...)]; }
-
-  private:
-    std::vector<index_t> shape_;
-    std::vector<index_t> strides_;
+private:
+    std::vector<index_t> shape_, strides_;
     std::vector<T>       data_;
 };
 
 // ---------------------------------------------------------------------------
+// Type helpers (BF16 only — the only precision the gfx1250 sink kernel accepts)
+// ---------------------------------------------------------------------------
+template <typename T> float to_float(T x);
+template <> float to_float<float>(float x)                    { return x; }
+template <> float to_float<__hip_bfloat16>(__hip_bfloat16 x) { return (float)x; }
+
+template <typename T> T from_float(float x);
+template <> float          from_float<float>(float x)          { return x; }
+template <> __hip_bfloat16 from_float<__hip_bfloat16>(float x) { return (__hip_bfloat16)x; }
+
+// ---------------------------------------------------------------------------
 // Fill helpers
 // ---------------------------------------------------------------------------
-
-template <typename T, typename Engine>
-void fill_uniform_int(HostTensor<T>& t, float lo, float hi, Engine& eng)
-{
-    std::uniform_int_distribution<int> dist(static_cast<int>(lo), static_cast<int>(hi));
-    for(std::size_t i = 0; i < t.numel(); ++i)
-        t.data()[i] = from_float<T>(static_cast<float>(dist(eng)));
-}
-
-template <typename T, typename Engine>
-void fill_uniform(HostTensor<T>& t, float lo, float hi, Engine& eng)
-{
-    std::uniform_real_distribution<float> dist(lo, hi);
-    for(std::size_t i = 0; i < t.numel(); ++i)
-        t.data()[i] = from_float<T>(dist(eng));
-}
-
 template <typename T>
-void fill_trig(HostTensor<T>& t)
+void fill_uniform(HostTensor<T>& t, float lo, float hi, std::mt19937& eng)
 {
+    std::uniform_real_distribution<float> d(lo, hi);
     for(std::size_t i = 0; i < t.numel(); ++i)
-    {
-        float x    = static_cast<float>(i);
-        t.data()[i] = from_float<T>(0.5f * std::sin(x) + 0.5f * std::cos(0.5f * x));
-    }
+        t.data()[i] = from_float<T>(d(eng));
 }
 
 template <typename T>
 void fill_constant(HostTensor<T>& t, float v)
 {
-    const T tv = from_float<T>(v);
     for(std::size_t i = 0; i < t.numel(); ++i)
-        t.data()[i] = tv;
+        t.data()[i] = from_float<T>(v);
 }
 
 // ---------------------------------------------------------------------------
-// check_err: element-wise comparison with a bad-fraction budget.
-// Pass criterion: (#fails / N) <= bad_fraction  (default 0.5%).
+// check_err: element-wise comparison; pass if bad fraction <= bad_fraction
 // ---------------------------------------------------------------------------
-
-template <typename T, typename Ref>
-bool check_err(const HostTensor<T>&   out,
-               const HostTensor<Ref>& ref,
-               const std::string&     msg,
-               double                 rtol,
-               double                 atol,
-               double                 bad_fraction = 5e-3)
+template <typename T, typename R>
+bool check_err(const HostTensor<T>& out, const HostTensor<R>& ref,
+               const std::string& msg, double rtol, double atol,
+               double bad_fraction = 5e-3)
 {
-    if(out.numel() != ref.numel())
-    {
-        std::cerr << msg << " size mismatch " << out.numel() << " vs " << ref.numel()
-                  << std::endl;
-        return false;
-    }
-    std::size_t bad_cnt = 0;
-    double      max_abs = 0.0;
-    double      sq_err  = 0.0;
-    double      sq_ref  = 0.0;
+    std::size_t bad = 0;
+    double max_abs = 0, sq_err = 0, sq_ref = 0;
     for(std::size_t i = 0; i < out.numel(); ++i)
     {
-        double a = static_cast<double>(to_float<T>(out.data()[i]));
-        double b = static_cast<double>(to_float<Ref>(ref.data()[i]));
+        double a = (double)to_float<T>(out.data()[i]);
+        double b = (double)to_float<R>(ref.data()[i]);
         double d = std::fabs(a - b);
         if(d > max_abs) max_abs = d;
-        sq_err += d * d;
-        sq_ref += b * b;
-        if(d > atol + rtol * std::fabs(b))
-            ++bad_cnt;
+        sq_err += d * d; sq_ref += b * b;
+        if(d > atol + rtol * std::fabs(b)) ++bad;
     }
-    const double frac = static_cast<double>(bad_cnt) / static_cast<double>(out.numel());
-    const double nrms = std::sqrt(sq_err / (sq_ref + 1e-30));
-    const bool   pass = frac <= bad_fraction;
+    bool pass = (double)bad / (double)out.numel() <= bad_fraction;
     if(!pass)
-    {
-        std::cerr << msg << " bad=" << bad_cnt << "/" << out.numel() << " ("
-                  << (frac * 100.0) << "%) max_abs=" << max_abs << " nrms=" << nrms
-                  << std::endl;
-    }
+        std::cerr << msg << " bad=" << bad << "/" << out.numel()
+                  << " (" << (100.0 * bad / out.numel()) << "%)"
+                  << " max_abs=" << max_abs
+                  << " nrms=" << std::sqrt(sq_err / (sq_ref + 1e-30)) << "\n";
     return pass;
 }
 
 // ---------------------------------------------------------------------------
-// Tiny ArgParser
+// ArgParser
 // ---------------------------------------------------------------------------
-
 class ArgParser
 {
-  public:
+public:
     void insert(const std::string& key, const std::string& def, const std::string& help)
     {
-        if(map_.count(key) == 0)
-            map_[key] = def;
+        if(!map_.count(key)) map_[key] = def;
         order_.push_back({key, def, help});
     }
-
     bool parse(int argc, char** argv)
     {
         for(int i = 1; i < argc; ++i)
         {
             std::string s = argv[i];
-            if(s == "--help" || s == "-h" || s == "-?")
-            {
-                print_help(argv[0]);
-                return false;
-            }
-            if(s.rfind("-", 0) != 0)
-            {
-                std::cerr << "unknown arg: " << s << std::endl;
-                return false;
-            }
+            if(s == "--help" || s == "-h" || s == "-?") { print_help(argv[0]); return false; }
             auto eq = s.find('=');
-            if(eq == std::string::npos)
-            {
-                std::cerr << "expected -k=v, got: " << s << std::endl;
-                return false;
-            }
-            std::string key = s.substr(1, eq - 1);
-            std::string val = s.substr(eq + 1);
-            if(map_.count(key) == 0)
-            {
-                std::cerr << "unknown option: " << key << std::endl;
-                return false;
-            }
-            map_[key] = val;
+            if(eq == std::string::npos || s.rfind("-", 0) != 0)
+                { std::cerr << "expected -k=v, got: " << s << "\n"; return false; }
+            std::string k = s.substr(1, eq - 1), v = s.substr(eq + 1);
+            if(!map_.count(k)) { std::cerr << "unknown option: " << k << "\n"; return false; }
+            map_[k] = v;
         }
         return true;
     }
+    std::string get_str  (const std::string& k) const { return map_.at(k); }
+    int         get_int  (const std::string& k) const { return std::stoi(map_.at(k)); }
+    float       get_float(const std::string& k) const { return std::stof(map_.at(k)); }
+    bool        get_bool (const std::string& k) const { return get_int(k) != 0; }
 
-    std::string get_str(const std::string& k)   const { return get(k); }
-    int         get_int(const std::string& k)   const { return std::stoi(get(k)); }
-    float       get_float(const std::string& k) const { return std::stof(get(k)); }
-    bool        get_bool(const std::string& k)  const { return get_int(k) != 0; }
-
-  private:
-    std::string get(const std::string& k) const
-    {
-        auto it = map_.find(k);
-        if(it == map_.end())
-        {
-            std::cerr << "missing key " << k << std::endl;
-            std::abort();
-        }
-        return it->second;
-    }
-
+private:
     void print_help(const char* prog) const
     {
-        std::cout << "Usage: " << prog << " [-key=val ...]" << std::endl;
+        std::cout << "Usage: " << prog << " [-key=val ...]\n";
         for(const auto& e : order_)
-        {
             std::cout << "  -" << std::get<0>(e) << " (=" << std::get<1>(e) << ") "
-                      << std::get<2>(e) << std::endl;
-        }
+                      << std::get<2>(e) << "\n";
     }
-
-    std::map<std::string, std::string>                              map_;
-    std::vector<std::tuple<std::string, std::string, std::string>>  order_;
+    std::map<std::string, std::string>                             map_;
+    std::vector<std::tuple<std::string, std::string, std::string>> order_;
 };
 
 // ---------------------------------------------------------------------------
-// CLI definition
-// ---------------------------------------------------------------------------
-
-std::tuple<bool, ArgParser> create_args(int argc, char** argv)
-{
-    ArgParser p;
-    p.insert("v",      "1",     "1: run CPU validation, 0: perf only");
-    p.insert("b",      "2",     "batch size");
-    p.insert("h",      "64",    "num q heads");
-    p.insert("h_k",    "-1",    "num k/v heads (-1 = same as h)");
-    p.insert("s",      "4096",  "seqlen_q");
-    p.insert("s_k",    "-1",    "seqlen_k (-1 = same as s)");
-    p.insert("d",      "128",   "head dim; 64 or 128 only (kernel constraint)");
-    p.insert("scale",  "0",     "softmax scale (0 = 1/sqrt(d))");
-    p.insert("causal", "1",     "causal mask; only causal kernels are shipped");
-    p.insert("sink",   "1.0",
-             "per-head sink logit in AITER post-scale domain. "
-             "D64 kernels require a valid sink tensor (ENABLE_SINK=1); "
-             "D128 kernels always receive a zero buffer (kernel ignores contents). "
-             "Set to 0.0 for an all-zero D64 sink (valid but no sink effect).");
-    p.insert("init",   "1",     "init: 0=randint, 1=rand, 2=trig, 3=const(0.25)");
-    p.insert("seed",   "11939", "random seed");
-    p.insert("warmup", "10",    "warmup iterations");
-    p.insert("repeat", "10",    "timed iterations");
-    p.insert("timer",  "gpu",   "gpu / cpu (HIP events always used for timing)");
-    p.insert("kname",  "0",     "reserved (no effect in ASM path)");
-    bool ok = p.parse(argc, argv);
-    return {ok, std::move(p)};
-}
-
-// ---------------------------------------------------------------------------
-// CPU forward-attention reference
+// CPU reference (shared by both modes)
 //
-// Matches _ref_attn() in op_tests/test_fmha_fwd_with_sink_asm.py.
-// Works in the SCALED-LOGIT domain (scale = 1/sqrt(d) applied first).
+// Bottom-right causal attention with optional sink token:
+//   scores[b,h,m,n] = scale * (Q[b,m,h,:] @ K[b,n,hk,:]^T)
+//   mask: n > m + (sk - sq) → -inf   (bottom-right; reduces to top-left when sq==sk)
+//   max_total = max(max(scores), sink_val)     [if has_sink]
+//   denom = sum exp(scores - max_total) + exp(sink_val - max_total)  [if has_sink]
+//   O[b,m,h,:] = sum_n softmax_n * V[b,n,hk,:]
+//   LSE[b,h,m]  = max_total + log(denom)
 //
-//   scores[b,h,m,n] = scale * sum_d Q[b,m,h,d] * K[b,n,hk,d]
-//   causal (bottom-right): scores = -inf if n > m + (sk - sq)
-//   max_total = max(scores[visible])
-//   if has_sink: max_total = max(max_total, sink_user[h])
-//                sink_user is already in scaled domain — no sqrt(d) needed
-//   denom = sum_n exp(scores - max_total) + (has_sink ? exp(sink_user - max_total) : 0)
-//   P[b,h,m,n] = exp(scores - max_total) / denom
-//   O[b,m,h,v] = sum_n P[b,h,m,n] * V[b,n,hk,v]
-//   LSE[b,h,m]  = max_total + log(denom)   (no extra * scale)
-//
-// All tensors stored bshd: HostTensor shape [b,s,h,d] or [b,h,s].
-// Accumulation in fp32.  GQA: Q head h uses K/V head (h / (nhead / nhead_k)).
+// sink_val is in the AITER post-scale domain (scale already applied).
+// TE uses sink_val = -1e30 → exp(-1e30) ≈ 0 → no sink contribution.
 // ---------------------------------------------------------------------------
-
 template <typename BF16, typename F32>
 void cpu_fwd_ref(
-    const HostTensor<BF16>& q_host,    // [batch, sq, nhead,   hdim]
-    const HostTensor<BF16>& k_host,    // [batch, sk, nhead_k, hdim]
-    const HostTensor<BF16>& v_host,    // [batch, sk, nhead_k, hdim]
-    const HostTensor<F32>&  sink_host, // [nhead]  post-scale domain
-    HostTensor<BF16>&       o_ref,     // [batch, sq, nhead,   hdim]  output
-    HostTensor<F32>&        lse_ref,   // [batch, nhead, sq]           output
-    int   batch,
-    int   nhead,
-    int   nhead_k,
-    int   seqlen_q,
-    int   seqlen_k,
-    int   hdim,
-    float scale,
-    bool  is_causal,
-    bool  has_sink)
+    const HostTensor<BF16>& q,
+    const HostTensor<BF16>& k,
+    const HostTensor<BF16>& v,
+    HostTensor<BF16>&       o,
+    HostTensor<F32>&        lse,
+    int batch, int nhead, int nhead_k, int sq, int sk, int hdim,
+    float scale, bool is_causal, bool has_sink, float sink_val)
 {
     const int ratio         = nhead / nhead_k;
-    // Bottom-right causal: mask n if n > m + (sk - sq).
-    // When sq == sk, this reduces to standard top-left (n > m).
-    const int causal_offset = seqlen_k - seqlen_q;
+    const int causal_offset = sk - sq; // bottom-right causal
 
     for(int b = 0; b < batch; ++b)
+    for(int h = 0; h < nhead; ++h)
     {
-        for(int h = 0; h < nhead; ++h)
+        const int   hk          = h / ratio;
+        const float sink_scaled = has_sink ? sink_val : 0.f;
+
+        for(int m = 0; m < sq; ++m)
         {
-            const int   hk           = h / ratio;
-            // sink_user is in the scaled-logit domain (same as scores = Q@K^T * scale).
-            // Passed verbatim — no sqrt(d) conversion.
-            const float sink_scaled  = has_sink ? to_float<F32>(sink_host(h)) : 0.f;
-
-            for(int m = 0; m < seqlen_q; ++m)
+            std::vector<float> scores(sk);
+            for(int n = 0; n < sk; ++n)
             {
-                // Step 1: scores = (Q[b,m,h,:] @ K[b,:,hk,:]^T) * scale
-                std::vector<float> scores(seqlen_k);
-                for(int n = 0; n < seqlen_k; ++n)
-                {
-                    if(is_causal && n > m + causal_offset)
-                    {
-                        scores[n] = -std::numeric_limits<float>::infinity();
-                        continue;
-                    }
-                    float acc = 0.f;
-                    for(int d = 0; d < hdim; ++d)
-                        acc += to_float<BF16>(q_host(b, m, h,  d)) *
-                               to_float<BF16>(k_host(b, n, hk, d));
-                    scores[n] = acc * scale;  // scale applied here
-                }
-
-                // Step 2: max_total (with optional sink in scaled domain)
-                float max_total = scores[0];
-                for(int n = 1; n < seqlen_k; ++n)
-                    if(scores[n] > max_total) max_total = scores[n];
-                if(has_sink && sink_scaled > max_total)
-                    max_total = sink_scaled;
-
-                // Step 3: unnormalized softmax + denom
-                float denom = 0.f;
-                for(int n = 0; n < seqlen_k; ++n)
-                {
-                    float v = std::isfinite(scores[n])
-                                  ? std::exp(scores[n] - max_total)
-                                  : 0.f;
-                    scores[n] = v;
-                    denom += v;
-                }
-                if(has_sink)
-                    denom += std::exp(sink_scaled - max_total);
-                if(denom == 0.f) denom = 1.f; // guard fully-masked rows
-
-                // Step 4: O = P @ V
-                for(int dv = 0; dv < hdim; ++dv)
-                {
-                    float acc = 0.f;
-                    for(int n = 0; n < seqlen_k; ++n)
-                        acc += (scores[n] / denom) * to_float<BF16>(v_host(b, n, hk, dv));
-                    o_ref(b, m, h, dv) = from_float<BF16>(acc);
-                }
-
-                // Step 5: LSE = max_total + log(denom)  (no extra * scale)
-                lse_ref(b, h, m) = from_float<F32>(max_total + std::log(denom));
+                if(is_causal && n > m + causal_offset)
+                    { scores[n] = -std::numeric_limits<float>::infinity(); continue; }
+                float acc = 0.f;
+                for(int d = 0; d < hdim; ++d)
+                    acc += to_float<BF16>(q(b,m,h,d)) * to_float<BF16>(k(b,n,hk,d));
+                scores[n] = acc * scale;
             }
+
+            float max_total = scores[0];
+            for(int n = 1; n < sk; ++n)
+                if(scores[n] > max_total) max_total = scores[n];
+            if(has_sink && sink_scaled > max_total) max_total = sink_scaled;
+
+            float denom = 0.f;
+            for(int n = 0; n < sk; ++n)
+            {
+                float w = std::isfinite(scores[n]) ? std::exp(scores[n] - max_total) : 0.f;
+                scores[n] = w; denom += w;
+            }
+            if(has_sink) denom += std::exp(sink_scaled - max_total);
+            if(denom == 0.f) denom = 1.f;
+
+            for(int dv = 0; dv < hdim; ++dv)
+            {
+                float acc = 0.f;
+                for(int n = 0; n < sk; ++n)
+                    acc += (scores[n] / denom) * to_float<BF16>(v(b,n,hk,dv));
+                o(b,m,h,dv) = from_float<BF16>(acc);
+            }
+            lse(b,h,m) = from_float<F32>(max_total + std::log(denom));
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// run_bench: orchestrate one benchmark run
+// run_bench
 // ---------------------------------------------------------------------------
-
 bool run_bench(const ArgParser& arg)
 {
     using BF16 = __hip_bfloat16;
     using F32  = float;
 
-    const bool do_validation = arg.get_bool("v");
-    const int  batch         = arg.get_int("b");
-    int        nhead         = arg.get_int("h");
-    int        nhead_k       = arg.get_int("h_k");
+    const bool via_direct = (arg.get_str("via") == "direct");
+    const bool do_val     = arg.get_bool("v");
+    const int  batch      = arg.get_int("b");
+    int        nhead      = arg.get_int("h");
+    int        nhead_k    = arg.get_int("h_k");
     if(nhead_k < 0) nhead_k = nhead;
-    if(nhead % nhead_k != 0)
-    {
-        std::cerr << "nhead=" << nhead << " must be a multiple of nhead_k=" << nhead_k << std::endl;
-        return false;
-    }
-    int seqlen_q = arg.get_int("s");
-    int seqlen_k = arg.get_int("s_k");
-    if(seqlen_k < 0) seqlen_k = seqlen_q;
+    int sq = arg.get_int("s");
+    int sk = arg.get_int("s_k");
+    if(sk < 0) sk = sq;
+
     const int hdim = arg.get_int("d");
     if(hdim != 64 && hdim != 128)
-    {
-        std::cerr << "head_dim must be 64 or 128, got " << hdim << std::endl;
-        return false;
-    }
+        { std::cerr << "head_dim must be 64 or 128\n"; return false; }
+    if(nhead % nhead_k != 0)
+        { std::cerr << "nhead must be a multiple of nhead_k\n"; return false; }
 
     float scale = arg.get_float("scale");
-    if(scale == 0.f)
-        scale = 1.f / std::sqrt(static_cast<float>(hdim));
+    if(scale == 0.f) scale = 1.f / std::sqrt((float)hdim);
 
     const bool  is_causal = arg.get_bool("causal");
     const float sink_val  = arg.get_float("sink");
+    // D64 kernels have ENABLE_SINK=1 and require a valid sink tensor.
+    // D128 kernels have ENABLE_SINK=0 and ignore the sink buffer.
+    const bool  has_sink  = (hdim == 64);
 
-    // D64 kernels: ENABLE_SINK=1, must receive a valid (non-null) sink tensor.
-    // D128 kernels: ENABLE_SINK=0, sink contents ignored; zero buffer is fine.
-    const bool has_sink = (hdim == 64);
+    // ---- Host tensors ----
+    HostTensor<BF16> q_h({batch, sq, nhead,   hdim});
+    HostTensor<BF16> k_h({batch, sk, nhead_k, hdim});
+    HostTensor<BF16> v_h({batch, sk, nhead_k, hdim});
+    HostTensor<F32>  sink_h({nhead});
 
-    const int init_method = arg.get_int("init");
-    const int seed_val    = arg.get_int("seed");
-    const int warmup      = arg.get_int("warmup");
-    const int repeat      = arg.get_int("repeat");
+    std::mt19937 eng((unsigned)arg.get_int("seed"));
+    fill_uniform(q_h, -1.f, 1.f, eng);
+    fill_uniform(k_h, -1.f, 1.f, eng);
+    fill_uniform(v_h, -1.f, 1.f, eng);
+    fill_constant(sink_h, has_sink ? sink_val : 0.f);
 
-    // ---- Host tensors (contiguous bshd: [b, s, h, d]) ----
-    HostTensor<BF16> q_host({batch, seqlen_q, nhead,   hdim});
-    HostTensor<BF16> k_host({batch, seqlen_k, nhead_k, hdim});
-    HostTensor<BF16> v_host({batch, seqlen_k, nhead_k, hdim});
-    HostTensor<F32>  sink_host({nhead}); // AITER post-scale domain
-
-    std::mt19937 eng(static_cast<unsigned>(seed_val));
-    if(init_method == 0)
-    {
-        fill_uniform_int(q_host, -2.f, 2.f, eng);
-        fill_uniform_int(k_host, -2.f, 2.f, eng);
-        fill_uniform_int(v_host, -2.f, 2.f, eng);
-    }
-    else if(init_method == 1)
-    {
-        fill_uniform(q_host, -1.f, 1.f, eng);
-        fill_uniform(k_host, -1.f, 1.f, eng);
-        fill_uniform(v_host, -1.f, 1.f, eng);
-    }
-    else if(init_method == 2)
-    {
-        fill_trig(q_host);
-        fill_trig(k_host);
-        fill_trig(v_host);
-    }
-    else
-    {
-        fill_constant(q_host, 0.25f);
-        fill_constant(k_host, 0.25f);
-        fill_constant(v_host, 0.25f);
-    }
-    fill_constant(sink_host, has_sink ? sink_val : 0.f);
-
-    // ---- GPU buffers (plain hipMalloc via DeviceMem) ----
-    const std::size_t q_bytes    = q_host.bytes();
-    const std::size_t k_bytes    = k_host.bytes();
-    const std::size_t v_bytes    = v_host.bytes();
-    const std::size_t out_bytes  = q_bytes;  // same shape as q
-    const std::size_t lse_bytes  = (std::size_t)batch * nhead * seqlen_q * sizeof(F32);
+    // ---- GPU buffers ----
+    const std::size_t lse_elems  = (std::size_t)batch * nhead * sq;
+    const std::size_t lse_bytes  = lse_elems * sizeof(F32);
     const std::size_t sink_bytes = (std::size_t)nhead * sizeof(F32);
 
-    DeviceMem q_buf(q_bytes);
-    DeviceMem k_buf(k_bytes);
-    DeviceMem v_buf(v_bytes);
-    DeviceMem out_buf(out_bytes);
-    DeviceMem lse_buf(lse_bytes);
-    DeviceMem sink_buf(sink_bytes);
+    DeviceMem q_buf(q_h.bytes()), k_buf(k_h.bytes()), v_buf(v_h.bytes());
+    DeviceMem o_buf(q_h.bytes()), lse_buf(lse_bytes),  sink_buf(sink_bytes);
 
-    q_buf.ToDevice(q_host.data());
-    k_buf.ToDevice(k_host.data());
-    v_buf.ToDevice(v_host.data());
-    // Zero-initialise output and LSE before the kernel call.  The ASM kernel
-    // may read the current O/LSE as an initial value when accumulating across
-    // KV-tiles (analogous to how PyTorch's torch.empty returns zero-filled
-    // GPU memory on ROCm).  Without this, hipMalloc garbage corrupts the
-    // accumulation and produces wrong results for multi-tile K sequences.
-    out_buf.SetZero();
-    {
-        // lse_buf must start at -inf (log-sum-exp identity: exp(-inf)=0 contributes
-        // nothing), NOT 0 (exp(0)=1 would inflate every denominator by +1).
-        const float neg_inf = -std::numeric_limits<float>::infinity();
-        std::vector<float> neg_inf_buf(lse_bytes / sizeof(float), neg_inf);
-        HIP_CHECK(hipMemcpy(lse_buf.GetDeviceBuffer(), neg_inf_buf.data(),
-                            lse_bytes, hipMemcpyHostToDevice));
-    }
-    if(has_sink)
-        sink_buf.ToDevice(sink_host.data());
-    else
-        sink_buf.SetZero();
+    q_buf.to_device(q_h.data());
+    k_buf.to_device(k_h.data());
+    v_buf.to_device(v_h.data());
+    if(has_sink) sink_buf.to_device(sink_h.data());
 
-    // ---- Tensor descriptors (contiguous bshd, strides in elements) ----
+    hipStream_t stream = nullptr;
+
     int device_id = 0;
     HIP_CHECK(hipGetDevice(&device_id));
 
-    // q/k/v/out shape: [batch, seq, head, hdim]  bshd contiguous
-    aiter_tensor_t q_desc = make_tensor_desc(
-        q_buf.GetDeviceBuffer(), AITER_DTYPE_bf16, device_id,
-        batch, seqlen_q, nhead, hdim);
-    aiter_tensor_t k_desc = make_tensor_desc(
-        k_buf.GetDeviceBuffer(), AITER_DTYPE_bf16, device_id,
-        batch, seqlen_k, nhead_k, hdim);
-    aiter_tensor_t v_desc = make_tensor_desc(
-        v_buf.GetDeviceBuffer(), AITER_DTYPE_bf16, device_id,
-        batch, seqlen_k, nhead_k, hdim);
-    aiter_tensor_t out_desc = make_tensor_desc(
-        out_buf.GetDeviceBuffer(), AITER_DTYPE_bf16, device_id,
-        batch, seqlen_q, nhead, hdim);
-    // lse shape required by kernel ABI: [batch, q_head_num, q_seq_len] fp32
-    aiter_tensor_t lse_desc = make_tensor_desc(
-        lse_buf.GetDeviceBuffer(), AITER_DTYPE_fp32, device_id,
-        batch, nhead, seqlen_q);
-    // sink shape: [q_head_num] fp32
-    aiter_tensor_t sink_desc = make_tensor_desc(
-        sink_buf.GetDeviceBuffer(), AITER_DTYPE_fp32, device_id,
-        nhead);
-
-    hipStream_t stream = nullptr; // default (null) stream
-
-    auto run_kernel = [&]() {
-        aiter_clear_last_error();
-        int ret = fmha_fwd_with_sink_asm(
-            &q_desc, &k_desc, &v_desc,
-            &out_desc, &lse_desc, &sink_desc,
-            scale, is_causal ? 1 : 0, 1 /*return_lse*/, stream);
-        if(ret != 0)
+    // ---- Accumulator reset ----
+    // direct:  kernel reads running O/LSE as initial state; caller must initialise.
+    //          LSE=-inf is the log-sum-exp identity: exp(-inf)=0 contributes nothing.
+    //          0xFF800000 = IEEE 754 -inf for float32.
+    // mha_fwd: fmha_fwd_gfx1250_batched initialises internally; nothing to do here.
+    auto reset_accumulators = [&]() {
+        if(via_direct)
         {
-            const char* err = aiter_get_last_error();
-            std::cerr << "fmha_fwd_with_sink_asm failed: "
-                      << (err ? err : "(no error message)") << std::endl;
-            std::abort();
+            o_buf.set_zero();
+            (void)hipMemsetD32(reinterpret_cast<hipDeviceptr_t>(lse_buf.ptr()),
+                               0xFF800000u, lse_elems);
         }
     };
 
-    // ---- FLOPs / bandwidth estimate ----
-    // FWD: 2 GEMMs (Q@K^T + P@V), each 2*sq*sk*hdim MACs per head.
-    std::size_t flop =
-        4ULL * (std::size_t)batch * (std::size_t)nhead *
-               (std::size_t)seqlen_q * (std::size_t)seqlen_k * (std::size_t)hdim;
-    if(is_causal) flop /= 2;
+    // ---- Strides for mha_fwd mode (in elements, bshd contiguous) ----
+    const int stride_q    = nhead   * hdim;
+    const int stride_k    = nhead_k * hdim;
+    const int stride_v    = nhead_k * hdim;
+    const int bstride_q   = sq * stride_q;
+    const int bstride_k   = sk * stride_k;
+    const int bstride_v   = sk * stride_v;
+    const int bstride_lse = nhead * sq;
+    const int mask_type   = is_causal ? 1 : 0;
 
-    // Bytes: Q + O + LSE per q-head; K + V per kv-head.
-    std::size_t num_byte =
-        (std::size_t)batch *
-        ((std::size_t)nhead   * ((std::size_t)seqlen_q * hdim * sizeof(BF16)   // Q
-                                + (std::size_t)seqlen_q * hdim * sizeof(BF16)  // O
-                                + (std::size_t)seqlen_q        * sizeof(F32))  // LSE
-        + (std::size_t)nhead_k * ((std::size_t)seqlen_k * hdim * sizeof(BF16)  // K
-                                 + (std::size_t)seqlen_k * hdim * sizeof(BF16))); // V
-
-    // ---- Print benchmark header ----
-    std::string sink_str =
-        has_sink ? (", sink=" + std::to_string(sink_val)) : ", sink=none(D128)";
-    std::cout << "[bf16|bshd|causal=" << is_causal << "]"
-              << " b:" << batch << ", h:" << nhead << "/" << nhead_k
-              << ", s:" << seqlen_q << "/" << seqlen_k << ", d:" << hdim
-              << ", scale:" << scale << sink_str << std::flush;
-
-    // ---- Warmup (re-init buffers each call so merge state doesn't accumulate) ----
-    for(int i = 0; i < warmup; ++i)
+    auto run_kernel = [&]()
     {
-        out_buf.SetZero();
-        lse_buf.SetZero();
-        run_kernel();
-    }
+        if(via_direct)
+        {
+            auto q_d    = make_tensor_desc(q_buf.ptr(),    AITER_DTYPE_bf16, device_id,
+                                           batch, sq, nhead,   hdim);
+            auto k_d    = make_tensor_desc(k_buf.ptr(),    AITER_DTYPE_bf16, device_id,
+                                           batch, sk, nhead_k, hdim);
+            auto v_d    = make_tensor_desc(v_buf.ptr(),    AITER_DTYPE_bf16, device_id,
+                                           batch, sk, nhead_k, hdim);
+            auto o_d    = make_tensor_desc(o_buf.ptr(),    AITER_DTYPE_bf16, device_id,
+                                           batch, sq, nhead,   hdim);
+            auto lse_d  = make_tensor_desc(lse_buf.ptr(),  AITER_DTYPE_fp32, device_id,
+                                           batch, nhead, sq);
+            auto sink_d = make_tensor_desc(sink_buf.ptr(), AITER_DTYPE_fp32, device_id,
+                                           nhead);
+            aiter_clear_last_error();
+            int ret = fmha_fwd_with_sink_asm(&q_d, &k_d, &v_d, &o_d, &lse_d, &sink_d,
+                                              scale, is_causal ? 1 : 0, 1, stream);
+            if(ret != 0)
+            {
+                const char* err = aiter_get_last_error();
+                std::cerr << "fmha_fwd_with_sink_asm failed: "
+                          << (err ? err : "(no error message)") << "\n";
+                std::abort();
+            }
+        }
+        else
+        {
+            ck_tile::stream_config sc{stream};
+            aiter::mha_fwd_args a{};
+            a.use_asm_v3 = true; a.v3_api_check = false; a.how_v3_bf16_cvt = 0;
+            a.data_type = "bf16"; a.is_group_mode = false;
+            a.bias_type = 0; a.has_lse = true; a.qscale_type = 0; a.has_sink = false;
+
+            a.q_ptr = q_buf.ptr(); a.k_ptr = k_buf.ptr(); a.v_ptr = v_buf.ptr();
+            a.bias_ptr = nullptr; a.q_descale_ptr = nullptr; a.k_descale_ptr = nullptr;
+            a.v_descale_ptr = nullptr; a.rand_val_ptr = nullptr;
+            a.lse_ptr = lse_buf.ptr(); a.o_ptr = o_buf.ptr();
+            a.sink_ptr = has_sink ? sink_buf.ptr() : nullptr;
+
+            a.seqstart_q_ptr = nullptr; a.seqstart_k_ptr = nullptr;
+            a.seqlen_q_ptr = nullptr; a.seqlen_k_ptr = nullptr;
+            a.cu_seqlen_q_ptr = nullptr; a.cu_seqlen_k_ptr = nullptr;
+            a.block_scale_seqstart_q_ptr = nullptr; a.block_scale_seqstart_k_ptr = nullptr;
+
+            a.seqlen_q = sq; a.seqlen_k = sk; a.batch = batch; a.max_seqlen_q = sq;
+            a.hdim_q = hdim; a.hdim_v = hdim; a.nhead_q = nhead; a.nhead_k = nhead_k;
+            a.scale_s = scale; a.logits_soft_cap = 0.f;
+
+            a.stride_q = stride_q; a.stride_k = stride_k; a.stride_v = stride_v;
+            a.stride_bias = 0; a.stride_randval = 0; a.stride_o = stride_q;
+            a.nhead_stride_q = hdim; a.nhead_stride_k = hdim; a.nhead_stride_v = hdim;
+            a.nhead_stride_bias = 0; a.nhead_stride_randval = 0;
+            a.nhead_stride_lse = sq; a.nhead_stride_o = hdim;
+            a.nhead_stride_q_descale = 0; a.nhead_stride_k_descale = 0;
+            a.nhead_stride_v_descale = 0;
+            a.batch_stride_q = bstride_q; a.batch_stride_k = bstride_k;
+            a.batch_stride_v = bstride_v; a.batch_stride_bias = 0;
+            a.batch_stride_randval = 0; a.batch_stride_lse = bstride_lse;
+            a.batch_stride_o = bstride_q;
+            a.batch_stride_q_descale = 0; a.batch_stride_k_descale = 0;
+            a.batch_stride_v_descale = 0;
+
+            a.window_size_left = -1; a.window_size_right = 0; a.sink_size = 0;
+            a.mask_type = mask_type; a.min_seqlen_q = 0;
+            a.p_drop = 0.f; a.s_randval = false;
+            a.drop_seed_offset = std::pair<uint64_t, uint64_t>{0, 0};
+            a.block_scale_size_q = 0; a.block_scale_size_kv = 0;
+
+            aiter::mha_fwd(a, sc);
+        }
+    };
+
+    // ---- FLOPs estimate (2 GEMMs, each sq*sk*hdim MACs per head) ----
+    const std::size_t flop =
+        4ULL * (std::size_t)batch * nhead * sq * sk * hdim / (is_causal ? 2 : 1);
+
+    std::cout << "[bf16|bshd|causal=" << is_causal << "|via=" << arg.get_str("via") << "]"
+              << " b=" << batch << " h=" << nhead << "/" << nhead_k
+              << " s=" << sq << "/" << sk << " d=" << hdim << " scale=" << scale
+              << (has_sink ? (" sink=" + std::to_string(sink_val)) : " sink=none(D128)")
+              << std::flush;
+
+    // ---- Warmup ----
+    for(int i = 0; i < arg.get_int("warmup"); ++i)
+        { reset_accumulators(); run_kernel(); }
     HIP_CHECK(hipStreamSynchronize(stream));
 
-    // ---- Timed run (re-init each iter to match single-call semantics) ----
-    hipEvent_t ev_start, ev_stop;
-    HIP_CHECK(hipEventCreate(&ev_start));
-    HIP_CHECK(hipEventCreate(&ev_stop));
-    HIP_CHECK(hipEventRecord(ev_start, stream));
-    for(int i = 0; i < repeat; ++i)
-    {
-        out_buf.SetZero();
-        lse_buf.SetZero();
-        run_kernel();
-    }
-    HIP_CHECK(hipEventRecord(ev_stop, stream));
-    HIP_CHECK(hipEventSynchronize(ev_stop));
-    float elapsed_ms = 0.f;
-    HIP_CHECK(hipEventElapsedTime(&elapsed_ms, ev_start, ev_stop));
-    HIP_CHECK(hipEventDestroy(ev_start));
-    HIP_CHECK(hipEventDestroy(ev_stop));
-
-    const float ave_time   = elapsed_ms / static_cast<float>(repeat);
-    const float tflops     = static_cast<float>(flop) / 1.E9f / ave_time;
-    const float gb_per_sec = static_cast<float>(num_byte) / 1.E6f / ave_time;
-
+    // ---- Timed runs ----
+    hipEvent_t ev0, ev1;
+    HIP_CHECK(hipEventCreate(&ev0)); HIP_CHECK(hipEventCreate(&ev1));
+    HIP_CHECK(hipEventRecord(ev0, stream));
+    for(int i = 0; i < arg.get_int("repeat"); ++i)
+        { reset_accumulators(); run_kernel(); }
+    HIP_CHECK(hipEventRecord(ev1, stream));
+    HIP_CHECK(hipEventSynchronize(ev1));
+    float ms = 0.f; HIP_CHECK(hipEventElapsedTime(&ms, ev0, ev1));
+    HIP_CHECK(hipEventDestroy(ev0)); HIP_CHECK(hipEventDestroy(ev1));
+    const float ave_ms = ms / (float)arg.get_int("repeat");
     std::cout << std::fixed
-              << ", " << std::setprecision(3) << ave_time   << " ms"
-              << ", " << std::setprecision(2) << tflops     << " TFlops"
-              << ", " << std::setprecision(2) << gb_per_sec << " GB/s";
+              << ", " << std::setprecision(3) << ave_ms << " ms"
+              << ", " << std::setprecision(2) << (float)flop / 1e9f / ave_ms << " TFlops";
 
-    if(!do_validation)
-    {
-        std::cout << std::endl;
-        return true;
-    }
+    if(!do_val) { std::cout << "\n"; return true; }
 
-    // ---- Validation run: single call from -inf/0 initial state ----
-    // lse_buf = -inf (log-sum-exp identity), out_buf = 0, then exactly ONE kernel call.
-    // This prevents multiple-call accumulation from corrupting the LSE comparison.
-    {
-        out_buf.SetZero();
-        const float neg_inf = -std::numeric_limits<float>::infinity();
-        std::vector<float> ni(lse_bytes / sizeof(float), neg_inf);
-        HIP_CHECK(hipMemcpy(lse_buf.GetDeviceBuffer(), ni.data(),
-                            lse_bytes, hipMemcpyHostToDevice));
-        run_kernel();
-        HIP_CHECK(hipStreamSynchronize(stream));
-    }
+    // ---- Validation: single call from a clean initial state ----
+    reset_accumulators();
+    run_kernel();
+    HIP_CHECK(hipStreamSynchronize(stream));
 
     // ---- CPU reference ----
-    HostTensor<BF16> o_ref  ({batch, seqlen_q, nhead, hdim});
-    HostTensor<F32>  lse_ref({batch, nhead,    seqlen_q});
-    cpu_fwd_ref<BF16, F32>(
-        q_host, k_host, v_host, sink_host, o_ref, lse_ref,
-        batch, nhead, nhead_k, seqlen_q, seqlen_k, hdim,
-        scale, is_causal, has_sink);
+    HostTensor<BF16> o_ref  ({batch, sq, nhead, hdim});
+    HostTensor<F32>  lse_ref({batch, nhead, sq});
+    cpu_fwd_ref<BF16, F32>(q_h, k_h, v_h, o_ref, lse_ref,
+                            batch, nhead, nhead_k, sq, sk, hdim,
+                            scale, is_causal, has_sink, sink_val);
 
-    // ---- Copy kernel outputs to host ----
-    HostTensor<BF16> out_got({batch, seqlen_q, nhead, hdim});
-    HostTensor<F32>  lse_got({batch, nhead,    seqlen_q});
-    out_buf.FromDevice(out_got.data());
-    lse_buf.FromDevice(lse_got.data());
+    HostTensor<BF16> o_got  ({batch, sq, nhead, hdim});
+    HostTensor<F32>  lse_got({batch, nhead, sq});
+    o_buf.from_device(o_got.data());
+    lse_buf.from_device(lse_got.data());
 
-    // ---- Validate (rtol=atol=1e-2, matching Python test thresholds) ----
-    const double rtol = 1e-2;
-    const double atol = 1e-2;
-    bool ok_out = check_err<BF16, BF16>(out_got, o_ref,   "[out]", rtol, atol);
-    bool ok_lse = check_err<F32,  F32> (lse_got, lse_ref, "[lse]", rtol, atol);
-    const bool pass = ok_out && ok_lse;
-
-    std::cout << ", valid:" << (pass ? "y" : "n") << std::endl;
+    bool pass = check_err<BF16,BF16>(o_got,   o_ref,   "[out]", 1e-2, 1e-2)
+             && check_err<F32, F32> (lse_got, lse_ref, "[lse]", 1e-2, 1e-2);
+    std::cout << ", valid:" << (pass ? "y" : "n") << "\n";
     return pass;
 }
 
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
-
 int main(int argc, char** argv)
 {
-    // Force explicit HIP context creation before any hipMalloc calls.
-    // Without this, the implicit context created inside hipMalloc can be
-    // unreliable in a standalone C++ host (no PyTorch runtime pre-init),
-    // causing later hipMalloc / hipMemcpy calls to fail with illegal-access.
+    // Force HIP context creation before any hipMalloc (no PyTorch pre-init here).
     HIP_CHECK(hipInit(0));
 
-    auto [ok, arg] = create_args(argc, argv);
-    if(!ok)
+    ArgParser p;
+    p.insert("via",    "mha_fwd",
+             "calling mode: direct (fmha_fwd_with_sink_asm) or mha_fwd (aiter::mha_fwd)");
+    p.insert("v",      "1",     "1: CPU validation, 0: perf only");
+    p.insert("b",      "2",     "batch size");
+    p.insert("h",      "8",     "num q heads");
+    p.insert("h_k",    "-1",    "num k/v heads (-1 = same as h)");
+    p.insert("s",      "1024",  "seqlen_q");
+    p.insert("s_k",    "-1",    "seqlen_k (-1 = same as s)");
+    p.insert("d",      "64",    "head dim (64 or 128 only)");
+    p.insert("scale",  "0",     "softmax scale (0 = 1/sqrt(d))");
+    p.insert("causal", "1",     "1: causal mask, 0: no mask");
+    p.insert("sink",   "-1e30", "per-head sink logit (AITER post-scale domain); "
+                                "D64: -1e30 → exp(-1e30)≈0 (no effect); "
+                                "D128: ignored (kernel has ENABLE_SINK=0)");
+    p.insert("seed",   "11939", "random seed");
+    p.insert("warmup", "2",     "warmup iterations");
+    p.insert("repeat", "3",     "timed iterations");
+
+    if(!p.parse(argc, argv)) return -1;
+
+    const std::string via = p.get_str("via");
+    if(via != "direct" && via != "mha_fwd")
+    {
+        std::cerr << "unknown -via=" << via << "; expected 'direct' or 'mha_fwd'\n";
         return -1;
-    return run_bench(arg) ? 0 : -2;
+    }
+
+    return run_bench(p) ? 0 : -2;
 }

@@ -5,7 +5,8 @@ this is an example how to benchmark aiter mha fwd/bwd kernel through c++ API: `a
 ## build and run
 We provide a simple script `build_mha.sh` to build the device library as well as a simple executable:
 ```
-# this will build fwd_v3(asm) only
+# this will build fwd_v3(asm) only that calls mha_fwd or direct fmha_fwd_with_sink_asm gfx1250 API
+# API is selected runtime the -via= flag (defaulting to 'mha_fwd' respectively).
 bash build_mha.sh fwd_v3
 
 # this will build bwd_v3(asm) only

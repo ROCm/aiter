@@ -30,14 +30,16 @@ echo "######## linking mha fwd"
 fi
 
 if [ x"$FMA_API" = x"fwd_v3" ] ; then
-echo "######## linking mha fwd_v3 (ASM FWD with sink, CK-excluded)"
+echo "######## linking mha fwd_v3 (gfx1250, -via=direct|mha_fwd)"
 
-# fwd_v3 produces libmha_fwd_asm.so with ENABLE_CK=0 (asm-only path +
-# fmha_fwd_with_sink_asm dispatcher for gfx1250).  A separate library name
-# (libmha_fwd_asm vs libmha_fwd) is used so the JIT blob directory never
-# collides with the full CK build of libmha_fwd.
+# Build target compiles benchmark_mha_fwd_v3.cpp into fwd_v3.exe.
+# The -via= runtime flag (default: mha_fwd) selects the kernel call path:
+#   -via=mha_fwd  calls aiter::mha_fwd (same path as pre-gfx1250)
+#   -via=direct   calls fmha_fwd_with_sink_asm directly  (smoke_test_fwd_sink.sh)
+# libmha_fwd_asm is CK-excluded (ENABLE_CK=0) to avoid JIT blob collisions
+# with any full-CK libmha_fwd build.
 # rpath:
-#   $ORIGIN      -> find libmha_fwd_asm.so next to the exe without LD_LIBRARY_PATH
+#   $ORIGIN       -> find libmha_fwd_asm.so next to the exe without LD_LIBRARY_PATH
 #   /opt/rocm/lib -> libamdhip64.so.7 lives here
 
 hipcc  -I$TOP_DIR/csrc/include \
@@ -47,7 +49,8 @@ hipcc  -I$TOP_DIR/csrc/include \
                      --offload-arch=native \
                      -L $SCRIPT_DIR -lmha_fwd_asm \
                      -Wl,-rpath,'$ORIGIN':/opt/rocm/lib \
-                     $SCRIPT_DIR/benchmark_mha_fwd_v3.cpp -o fwd.exe
+                     $SCRIPT_DIR/benchmark_mha_fwd_v3.cpp \
+                     -o fwd_v3.exe
 fi
 
 if [ x"$FMA_API" = x"bwd" ] || [ x"$FMA_API" = x"" ] ; then

@@ -505,6 +505,21 @@ static float fmha_fwd_gfx1250_batched(const mha_fwd_args& a,
     // mask_type: 0=no mask, 1=top-left causal, 2=bottom-right causal
     const int is_causal = (a.mask_type == 1 || a.mask_type == 2) ? 1 : 0;
 
+    // fmha_fwd_with_sink_asm is a streaming accumulator kernel: it reads O and
+    // LSE as running state from a previous chunk and updates them in-place.
+    // When called for a single full-sequence pass the caller must pre-initialize:
+    //   LSE = -inf  (identity for log-sum-exp: exp(-inf) contributes 0)
+    //   O   = 0     (initial accumulator value)
+    {
+        size_t lse_elems = static_cast<size_t>(a.batch) * a.nhead_q * a.seqlen_q;
+        // -inf in IEEE 754 float32 = 0xFF800000; hipMemsetD32 fills 32-bit words.
+        (void)hipMemsetD32(reinterpret_cast<hipDeviceptr_t>(a.lse_ptr),
+                           0xFF800000u, lse_elems);
+        size_t o_elems = static_cast<size_t>(a.batch) * a.seqlen_q *
+                         a.nhead_q * a.hdim_v;
+        (void)hipMemsetAsync(a.o_ptr, 0, o_elems * 2u, s.stream_id_); // bf16: 2 B
+    }
+
     aiter_clear_last_error();
     int ret = fmha_fwd_with_sink_asm(
         &q_t, &k_t, &v_t, &o_t, &lse_t, sink_t,

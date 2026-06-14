@@ -39,7 +39,7 @@ def cmdGenFunc_mha_fwd(ck_exclude: bool):
         ]
     blob_gen_cmd.extend(FWD_CODEGEN_CMD)
     flag_use_v3 = (
-        "-DFAV3_ON=1 -DENABLE_CK=0" if ck_exclude else "-DFAV3_ON=1 -DFAV2_ON=1"
+        "-DFAV3_ON=1 -DFAV1250_ON=1 -DENABLE_CK=0" if ck_exclude else "-DFAV3_ON=1 -DFAV2_ON=1"
     )
     # Use a separate library name for the CK-excluded (gfx1250 / ASM-only) path
     # so its JIT blob directory never collides with the full CK build of libmha_fwd.
