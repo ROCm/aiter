@@ -1262,9 +1262,9 @@ def flydsl_moe_scatter_preshuffle_scale(
     device = a1_scale_token_u8.device
     Ws = a1_scale_token_u8.shape[1]
     rows_per_tile = wmma_rep * 16
-    assert max_m % rows_per_tile == 0, (
-        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
-    )
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
     tiles_per_expert = max_m // rows_per_tile
 
     if grouped_a1_scale is None:
@@ -1303,9 +1303,9 @@ def flydsl_moe_preshuffle_scale(
     device = scale_grouped_u8.device
     Ws = scale_grouped_u8.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert max_m % rows_per_tile == 0, (
-        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
-    )
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
     tiles_per_expert = max_m // rows_per_tile
 
     if out is None:
