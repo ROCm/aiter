@@ -1727,7 +1727,7 @@ namespace aiter {
                 for(int i = 0; i < x_load_waitcnt; i++) {
                     int s_offset = i * s_offset_i + threadIdx.x * x_async_load_vec;
                     async_load<x_async_load_vec>(g_x, s_x_wr_ptr + s_offset,
-                        offset_base + rows_per_load * i * x_stride, 0, opus::number<GROUP_NT>{});
+                        offset_base + rows_per_load * i * x_stride, 0, opus::number<0>{}, opus::number<GROUP_NT>{});
                 }
             }
         };
