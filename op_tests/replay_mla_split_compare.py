@@ -169,7 +169,30 @@ def replay_one(path, dev="cuda"):
     f1 = torch.isfinite(o1c).all().item()
     f2 = torch.isfinite(o2c).all().item()
     kvi = b["kv_indptr"].to(torch.int64)
-    max_pages = int((kvi[1:] - kvi[:-1]).max().item())
+    per_batch_pages = (kvi[1:] - kvi[:-1])
+    max_pages = int(per_batch_pages.max().item())
+    # Per-row (per-token) finiteness of forced split=2, mapped back to its batch
+    # so we can correlate NaN rows with that batch's KV length (pages). If NaNs
+    # cluster on SHORT batches, the empty per-batch split is the culprit.
+    nan_diag = ""
+    if not f2:
+        qoi = b["qo_indptr"].to(torch.int64)
+        bs = qoi.numel() - 1
+        row_finite = torch.isfinite(o2c.reshape(o2c.shape[0], -1)).all(dim=1).cpu()
+        nan_pages, ok_pages = [], []
+        for i in range(bs):
+            r0, r1 = int(qoi[i]), int(qoi[i + 1])
+            pg = int(per_batch_pages[i].item()) if i < per_batch_pages.numel() else -1
+            rows_ok = bool(row_finite[r0:r1].all()) if r1 > r0 else True
+            (ok_pages if rows_ok else nan_pages).append(pg)
+        n_nan_b = len(nan_pages)
+        nan_diag = (
+            f"nan_batches={n_nan_b}/{bs} "
+            f"nan_pages[min/max]={min(nan_pages) if nan_pages else '-'}/"
+            f"{max(nan_pages) if nan_pages else '-'} "
+            f"ok_pages[min/max]={min(ok_pages) if ok_pages else '-'}/"
+            f"{max(ok_pages) if ok_pages else '-'}"
+        )
     res = {
         "name": os.path.basename(path),
         "layer": b["layer_num"],
@@ -178,6 +201,7 @@ def replay_one(path, dev="cuda"):
         "kv_indptr": b["kv_indptr"].tolist(),
         "finite1": f1,
         "finite2": f2,
+        "nan_diag": nan_diag,
         "cos1_ref": _cos(o1c, ref) if f1 else float("nan"),
         "cos2_ref": _cos(o2c, ref) if f2 else float("nan"),
         "cos2_1": _cos(o2c, o1c) if (f1 and f2) else float("nan"),
@@ -205,6 +229,7 @@ def main(arg):
     print(header)
     print("-" * len(header))
     worst = []
+    diag_printed = 0
     for p in paths:
         r = replay_one(p)
         if r is None:
@@ -213,6 +238,9 @@ def main(arg):
             f"{r['name']:42s} {r['bs']:>3d} {r['pages']:>4d} {str(r['finite1']):>4s} {str(r['finite2']):>4s} "
             f"{r['cos1_ref']:>10.6f} {r['cos2_ref']:>10.6f} {r['cos2_1']:>10.6f} {r['relerr2_1']:>10.4f}"
         )
+        if r.get("nan_diag") and diag_printed < 5:
+            print(f"    -> {r['nan_diag']}")
+            diag_printed += 1
         worst.append(r)
     if worst:
         import statistics
