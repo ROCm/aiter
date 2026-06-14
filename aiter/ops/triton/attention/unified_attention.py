@@ -35,17 +35,8 @@ WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
 
-def _apply_2d_override(config, override, num_queries_per_kv, allow_block_m):
+def _apply_2d_override(config, override):
     """Overlay a tuned 2D launch config (from the per-model table) in place."""
-    # BLOCK_M is only meaningful for large prefill; gating it on the heuristic's
-    # own max_seqlen_q>=256 condition avoids forcing a wide tile on a small
-    # (e.g. chunked-prefill) query that the prefill row was not tuned for.
-    if allow_block_m and override.get("BLOCK_M"):
-        block_m = override["BLOCK_M"]
-        block_q = block_m // num_queries_per_kv
-        if block_q >= 1:
-            config["BLOCK_M"] = block_m
-            config["BLOCK_Q"] = block_q
     for field in ("TILE_SIZE", "num_warps", "num_stages"):
         if override.get(field):
             config[field] = override[field]
@@ -134,9 +125,7 @@ def select_2d_config(
         "waves_per_eu": waves_per_eu,
     }
     if ua_override is not None and ua_override.get("kernel") == "2d":
-        _apply_2d_override(
-            config, ua_override, num_queries_per_kv, allow_block_m=max_seqlen_q >= 256
-        )
+        _apply_2d_override(config, ua_override)
         if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
             config["TILE_SIZE"] = max(32, config["TILE_SIZE"])
     return config
@@ -410,12 +399,14 @@ def unified_attention(
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = int(max_seqlen_q) == 1
 
-    # Per-model tuned config (non-gfx12, non-shuffled, bf16/fp8 only; nvfp4
-    # doubles head_size above so it would key inconsistently). None keeps the
-    # heuristics and is threaded into select_*_config.
+    # Per-model tuned config. Decode only (prefill/mixed batches keep the
+    # heuristic), non-gfx12, non-shuffled, bf16/fp8 (nvfp4 doubles head_size
+    # above so it would key inconsistently). None keeps the heuristics and is
+    # threaded into select_*_config.
     ua_override = None
     if (
-        not IS_DEVICE_ARCH_GFX12
+        ALL_DECODE
+        and not IS_DEVICE_ARCH_GFX12
         and not shuffled_kv_cache
         and q_dtype != torch.uint8
         and kv_cache_dtype != torch.uint8
@@ -431,7 +422,7 @@ def unified_attention(
             kv_dtype=kv_cache_dtype,
             sliding_window=SLIDING_WINDOW,
             has_sinks=sinks is not None,
-            phase="decode" if ALL_DECODE else "prefill",
+            phase="decode",
             max_seqlen_k=max_seqlen_k,
             num_seqs=num_seqs,
         )

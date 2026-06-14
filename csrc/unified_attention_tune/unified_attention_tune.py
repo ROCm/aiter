@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Per-model tuner for the Triton unified-attention 2D / 3D kernels.
+"""Per-model decode tuner for the Triton unified-attention 2D / 3D kernels.
 
 Reads an untuned shape table (``aiter/configs/untuned_ua.csv`` by default),
-sweeps 2D and 3D launch configs for each (phase, context-bucket, batch-bucket)
+sweeps 2D and 3D launch configs for each (context-bucket, exact-batch) decode
 operating point, and writes the winning config to a tuned table
 (``aiter/configs/tuned_ua.csv``) in the schema consumed at runtime by
 ``aiter/ops/triton/utils/ua_config.py``.
 
 A row is only written when the best swept config beats the built-in heuristic by
-at least ``--min_improvement_pct`` (default 3%); otherwise the heuristic is left
-in place for that bucket (so the table never makes a shape slower than default).
+at least ``--min_improvement_pct`` (default 3%) at the sampled point; otherwise
+the heuristic is left in place.
 
 Usage (inside the container with vLLM + AITER installed):
 
@@ -69,6 +69,7 @@ def parse_dtype(s):
         "torch.float16": torch.float16,
         "torch.float8_e4m3fn": aiter.dtypes.fp8,
         "torch.float8_e4m3fnuz": aiter.dtypes.fp8,
+        "fp8_e4m3": aiter.dtypes.fp8,  # ua_config's normalized fp8 token
         "fp8": aiter.dtypes.fp8,
         "bf16": torch.bfloat16,
         "fp16": torch.float16,
@@ -80,18 +81,7 @@ def parse_dtype(s):
 
 def sample_ctx(ctx_bucket):
     """Representative context length for a bucket (its upper edge, capped)."""
-    return 196608 if int(ctx_bucket) >= _INT_MAX else int(ctx_bucket)
-
-
-def sample_bs(bs_bucket, phase, ctx):
-    bs = 512 if int(bs_bucket) >= _INT_MAX else int(bs_bucket)
-    # Prefill batches are far more memory-hungry; cap concurrent prefills.
-    if phase == "prefill":
-        bs = min(bs, 8)
-    # Bound KV-cache memory when tuning very long contexts.
-    if ctx >= 65536:
-        bs = min(bs, 32)
-    return max(1, bs)
+    return 131072 if int(ctx_bucket) >= _INT_MAX else int(ctx_bucket)
 
 
 def bench_fn(fn, warmup, iters, trim_pct=5):
@@ -111,9 +101,8 @@ def bench_fn(fn, warmup, iters, trim_pct=5):
     return sum(trimmed) / len(trimmed)
 
 
-def make_inputs(spec, phase, ctx_len, bs, has_sinks, dev="cuda:0"):
-    """Build unified_attention inputs for a decode (max_seqlen_q=1) or a
-    same-length prefill batch."""
+def make_inputs(spec, ctx_len, bs, has_sinks, dev="cuda:0"):
+    """Build decode (max_seqlen_q=1) unified_attention inputs."""
     nqh, nkvh, hs, block = (
         spec["num_query_heads"],
         spec["num_kv_heads"],
@@ -122,8 +111,6 @@ def make_inputs(spec, phase, ctx_len, bs, has_sinks, dev="cuda:0"):
     )
     kv_dtype = spec["kv_dtype"]
     q_dtype = spec["q_dtype"]
-    q_len = 1 if phase == "decode" else ctx_len
-    total_q = bs * q_len
     bps = (ctx_len + block - 1) // block
     num_blocks = max(4096, bs * (bps + 1) + 64)
 
@@ -131,12 +118,12 @@ def make_inputs(spec, phase, ctx_len, bs, has_sinks, dev="cuda:0"):
     vf = torch.randn(num_blocks, block, nkvh, hs, device=dev, dtype=torch.bfloat16)
     if kv_dtype != torch.bfloat16:
         kf, vf = kf.to(kv_dtype), vf.to(kv_dtype)
-    q = torch.randn(total_q, nqh, hs, device=dev, dtype=torch.bfloat16)
+    q = torch.randn(bs, nqh, hs, device=dev, dtype=torch.bfloat16)
     if q_dtype != torch.bfloat16:
         q = q.to(q_dtype)
     out = torch.empty_like(q, dtype=torch.bfloat16)
     sl = torch.full((bs,), ctx_len, dtype=torch.int32, device=dev)
-    cu = torch.arange(0, (bs + 1) * q_len, q_len, dtype=torch.int32, device=dev)
+    cu = torch.arange(0, bs + 1, dtype=torch.int32, device=dev)
     bt = torch.arange(bs * bps, device=dev, dtype=torch.int32).reshape(bs, bps)
     bt = torch.cat([bt, torch.zeros(bs, 16, device=dev, dtype=torch.int32)], dim=1)
     ks = torch.tensor([1.0], dtype=torch.float32, device=dev).unsqueeze(0)
@@ -144,7 +131,7 @@ def make_inputs(spec, phase, ctx_len, bs, has_sinks, dev="cuda:0"):
     sinks = torch.randn(nqh, dtype=torch.float32, device=dev) if has_sinks else None
     return dict(
         q=q, k=kf, v=vf, out=out, cu=cu, sl=sl, bt=bt, ks=ks, vs=vs,
-        sinks=sinks, q_len=q_len, hs=hs,
+        sinks=sinks, q_len=1, hs=hs,
     )
 
 
@@ -216,9 +203,8 @@ def tune_row(row, sweep_2d, sweep_3d, warmup, iters, dev):
     }
     sliding_window = int(float(row["sliding_window"]))
     has_sinks = int(float(row["has_sinks"])) != 0
-    phase = str(row["phase"]).strip().lower()
     ctx = sample_ctx(row["ctx_bucket"])
-    bs = sample_bs(row["bs_bucket"], phase, ctx)
+    bs = int(row["bs"])
     forced_2d = sliding_window > 0 or ctx <= 512
 
     # fp8 q+kv requires TILE_SIZE >= 32 (matches select_*_config); never sweep
@@ -228,12 +214,9 @@ def tune_row(row, sweep_2d, sweep_3d, warmup, iters, dev):
     max_tile = max(64, spec["block_size"])
 
     nqpkv = spec["num_query_heads"] // spec["num_kv_heads"]
-    default_block_m = 16 if nqpkv <= 16 else triton.next_power_of_2(nqpkv)
-    # Large prefill uses a wide query tile; record it so runtime reproduces it.
-    block_m = 128 if (phase == "prefill" and ctx >= 256) else default_block_m
-    record_block_m = block_m if block_m != default_block_m else 0
+    block_m = 16 if nqpkv <= 16 else triton.next_power_of_2(nqpkv)
 
-    inp = make_inputs(spec, phase, ctx, bs, has_sinks, dev)
+    inp = make_inputs(spec, ctx, bs, has_sinks, dev)
 
     # Baseline: built-in heuristic (table disabled).
     _restore_dispatch()
@@ -255,15 +238,15 @@ def tune_row(row, sweep_2d, sweep_3d, warmup, iters, dev):
         except Exception:
             t = float("inf")
         candidates.append(
-            ("2d", {"TILE_SIZE": tile, "NUM_SEGMENTS": 0, "BLOCK_M": record_block_m,
+            ("2d", {"TILE_SIZE": tile, "NUM_SEGMENTS": 0, "BLOCK_M": 0,
                     "num_warps": warps, "num_stages": stages, "waves_per_eu": wpe}, t)
         )
     _restore_dispatch()
 
-    # 3D sweep (decode only; prefill uses the 2D kernel and would OOM the
-    # split-K segment buffers). Segments are clamped to the runtime range so the
-    # measured and recorded NUM_SEGMENTS are exactly what the runtime applies.
-    if not forced_2d and phase == "decode":
+    # 3D sweep, skipped only when the dispatch forces 2D (SWA / ctx<=512).
+    # Segments are clamped to the runtime range so the measured and recorded
+    # NUM_SEGMENTS are exactly what the runtime applies.
+    if not forced_2d:
         ua_module.use_2d_kernel = lambda *a, **k: False
         seen = set()
         for seg, stages, warps, wpe, tile in itertools.product(
@@ -365,10 +348,9 @@ def main():
             continue
         keep = cfg is not None and sp >= 1.0 + args.min_improvement_pct / 100.0
         print(
-            f"[{i}/{len(rows)}] {row['phase']} ctx<={row['ctx_bucket']} "
-            f"bs<={row['bs_bucket']}: best={kernel} {cfg} "
-            f"{t*1000:.1f}us vs default {base*1000:.1f}us ({sp:.2f}x) "
-            f"{'KEEP' if keep else 'skip'}"
+            f"[{i}/{len(rows)}] ctx<={row['ctx_bucket']} bs={row['bs']}: "
+            f"best={kernel} {cfg} {t*1000:.1f}us vs default {base*1000:.1f}us "
+            f"({sp:.2f}x) {'KEEP' if keep else 'skip'}"
         )
         if not keep:
             continue
@@ -381,7 +363,7 @@ def main():
             "sliding_window": int(float(row["sliding_window"])),
             "has_sinks": int(float(row["has_sinks"])),
             "phase": row["phase"], "ctx_bucket": row["ctx_bucket"],
-            "bs_bucket": row["bs_bucket"], "kernel": kernel,
+            "bs": row["bs"], "kernel": kernel,
             "TILE_SIZE": cfg["TILE_SIZE"], "NUM_SEGMENTS": cfg["NUM_SEGMENTS"],
             "BLOCK_M": cfg["BLOCK_M"], "num_warps": cfg["num_warps"],
             "num_stages": cfg["num_stages"], "waves_per_eu": cfg["waves_per_eu"],

@@ -2,18 +2,22 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Per-model launch-config table for the Triton unified-attention kernels.
 
-The attention analogue of the FMOE/GEMM tuned-config tables under
-``aiter/configs/``. A row maps an attention-shape signature plus an operating
-point (phase, coarse context-length bucket, coarse batch bucket) to a kernel
-choice (2d/3d) and its launch meta-params. Lookup runs per call; a miss keeps
-the built-in heuristics in ``unified_attention.py``.
+Decode-only: a row maps an attention-shape signature plus an operating point
+(a coarse context-length bucket and the exact batch size) to a kernel choice
+(2d/3d) and its launch meta-params. Lookup runs per call; a miss — and any
+prefill/mixed call — keeps the built-in heuristics in ``unified_attention.py``.
 
-Buckets are coarse to bound the number of distinct Triton compilations. On a
-miss for the exact bucket the lookup falls *down* to a shorter-context bucket
-first (a config tuned for a shorter context degrades gracefully on a longer
-one; the reverse can be worse than the heuristic), then down the batch bucket,
-and up only as a last resort. ``NUM_SEGMENTS`` is clamped to the valid range for
-the live sequence length by the caller.
+Batch is matched **exactly**: vLLM quantizes decode ``num_seqs`` to a fixed set
+of CUDA-graph capture sizes, so a batch that wasn't tuned cleanly defers to the
+heuristic (which picks the kernel correctly per batch) rather than reusing a
+neighbor's config across the 2D/3D occupancy boundary. Context is continuous,
+so it is bucketed; on a miss the context bucket falls *down* to a
+shorter-context config (which degrades gracefully on a longer context; the
+reverse can be worse than the heuristic) and up only as a last resort.
+``NUM_SEGMENTS`` is clamped to the live sequence length by the caller.
+
+Context buckets are coarse so the set of distinct launch configs stays small:
+each config JITs once and is then reused.
 """
 import logging
 import math
@@ -33,8 +37,6 @@ _INT_MAX = 2**31 - 1
 # dispatch boundary (max_seqlen_k <= 512 always uses 2D), so a bucket never
 # straddles the 2D/3D split.
 CTX_BUCKETS = (512, 2048, 8192, 32768, 65536, 131072, _INT_MAX)
-# Batch (num_seqs) bucket upper bounds.
-BS_BUCKETS = (4, 16, 64, 256, _INT_MAX)
 
 KEY_COLS = (
     "gfx",
@@ -49,7 +51,7 @@ KEY_COLS = (
     "has_sinks",
     "phase",
     "ctx_bucket",
-    "bs_bucket",
+    "bs",
 )
 RESULT_COLS = (
     "kernel",
@@ -196,7 +198,7 @@ def _load_table(path):
         try:
             key = _shape_key(*(raw[c] for c in KEY_COLS[:-2])) + (
                 int(raw["ctx_bucket"]),
-                int(raw["bs_bucket"]),
+                int(raw["bs"]),
             )
         except (TypeError, ValueError, KeyError):
             continue
@@ -225,9 +227,9 @@ def _untuned_dump_path():
     return _DUMP_UNTUNED
 
 
-def _dump_untuned(fixed, ctx_b, bs_b):
-    """Append this shape/bucket to the untuned CSV once per process (best effort)."""
-    row = fixed[2:] + (ctx_b, bs_b)  # drop gfx, cu_num -> tuner re-derives them
+def _dump_untuned(fixed, ctx_b, bs):
+    """Append this shape/point to the untuned CSV once per process (best effort)."""
+    row = fixed[2:] + (ctx_b, bs)  # drop gfx, cu_num -> tuner re-derives them
     if row in _dumped:
         return
     _dumped.add(row)
@@ -259,10 +261,9 @@ def get_ua_config(
     num_seqs,
 ):
     """Tuned UA config for this shape/operating-point, or ``None`` for default."""
-    # AITER_BYPASS_TUNE_CONFIG forces the heuristics (same switch as FMOE/GEMM):
-    # behave as if no table exists, but still allow shape capture.
-    # Fast path: no tuned table and not capturing (the common case) costs one
-    # cached lookup. With capture on we still need the key to record the miss.
+    # AITER_BYPASS_TUNE_CONFIG (shared FMOE/GEMM switch) forces heuristics by
+    # treating the table as empty; capture still runs. No table + no capture is
+    # the common case and exits here after one cached lookup.
     table = {} if _bypass_active() else _load_table(_resolve_config_path())
     if not table and not _DUMP_UNTUNED:
         if _LOG_TUNED_CONFIG:
@@ -283,41 +284,40 @@ def get_ua_config(
         phase,
     )
     ctx_b = bucket_value(int(max_seqlen_k), CTX_BUCKETS)
-    bs_b = bucket_value(int(num_seqs), BS_BUCKETS)
+    bs = int(num_seqs)
 
-    # Context is the dominant axis (it decides 2D vs 3D and the kernel regime),
-    # so match the context bucket first, then the batch bucket.
+    # Exact batch match (quantized axis); context bucket falls down then up.
     for ctx in _bucket_order(ctx_b, CTX_BUCKETS):
-        for bs in _bucket_order(bs_b, BS_BUCKETS):
-            row = table.get(fixed + (ctx, bs))
-            if row is not None:
-                if _LOG_TUNED_CONFIG:
-                    _log_once(
-                        ("hit",) + fixed + (ctx_b, bs_b),
-                        logging.INFO,
-                        "unified_attention: %s config for %s ctx<=%d bs<=%d",
-                        row["kernel"],
-                        fixed,
-                        ctx,
-                        bs,
-                    )
-                return row
+        row = table.get(fixed + (ctx, bs))
+        if row is not None:
+            if _LOG_TUNED_CONFIG:
+                _log_once(
+                    ("hit",) + fixed + (ctx_b, bs),
+                    logging.INFO,
+                    "unified_attention: %s config for %s ctx<=%d bs=%d",
+                    row["kernel"],
+                    fixed,
+                    ctx,
+                    bs,
+                )
+            return row
 
+    # An untuned batch deferring to the heuristic is expected (only specific
+    # capture sizes are tuned), so this is informational, not a warning.
     if _DUMP_UNTUNED:
-        _dump_untuned(fixed, ctx_b, bs_b)
-    if table:
-        # Table has tuning, but not for this shape/bucket: a real, actionable gap.
-        _log_once(
-            ("miss",) + fixed + (ctx_b, bs_b),
-            logging.WARNING,
-            "unified_attention: no tuned config for %s ctx<=%d bs<=%d; "
-            "using default heuristic",
-            fixed,
-            ctx_b,
-            bs_b,
-        )
-    elif _LOG_TUNED_CONFIG:
-        _log_once(("no_table",), logging.INFO, "unified_attention: no tuned UA table")
+        _dump_untuned(fixed, ctx_b, bs)
+    if _LOG_TUNED_CONFIG:
+        if table:
+            _log_once(
+                ("miss",) + fixed + (ctx_b, bs),
+                logging.INFO,
+                "unified_attention: no tuned config for %s ctx<=%d bs=%d; using heuristic",
+                fixed,
+                ctx_b,
+                bs,
+            )
+        else:
+            _log_once(("no_table",), logging.INFO, "unified_attention: no tuned UA table")
     return None
 
 
