@@ -531,7 +531,9 @@ def test_pa_decode(
         qlen_granularity=qlen_with_mtp,
         kvlen_granularity=page_size,
         block_size=page_size,
-        is_causal=False,
+        # Match the kernel (compile-time CAUSAL=1) and ATOM. No-op for mtp=0;
+        # required to validate the causal path under --mtp > 0.
+        is_causal=True,
     )
     split_rows = max(1, int(reduce_partial_map.numel()) * qlen_with_mtp)
     # -inf lse / 0 o so any split the kernel leaves unwritten is inert in reduce.
