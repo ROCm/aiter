@@ -1,7 +1,0 @@
-#ifdef OPUS_FUSED_HOST_TU
-#include "{{ traits_header }}"
-template<typename Traits{{ fwd_decl_kargs_tpl }}>
-__global__ void {{ kernel_func }}({{ fwd_decl_kargs_fnarg }} kargs);
-#else
-#include "{{ pipeline_header }}"
-#endif

@@ -1,22 +1,6 @@
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#pragma once
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-#include "aiter_tensor.h"
-#include "aiter_stream.h"
-#include <optional>
-#endif
+{% extends "_base_impl.cuh.j2" %}
+{%- block launcher %}
 // See _gen_noscale_instance for the rationale of the host/device pass split.
-#ifdef OPUS_FUSED_HOST_TU
-#include "{{ traits_header }}"
-template<typename Traits>
-__global__ void {{ kernel_func }}({{ kargs_name }} kargs);
-#else
-#include "{{ pipeline_header }}"
-#endif
-{{ traits_aliases }}
-
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template <typename D_C>
 void
 {{ kid_name }}(
@@ -35,7 +19,7 @@ void
         "bias is not supported on a16w16_mono_tile kid; use a16w16 "
         "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
 
-    {{ kargs_name }} kargs{{{}}};
+    {{ kargs_name }} kargs{};
     kargs.ptr_a = XQ.data_ptr();
     kargs.ptr_b = WQ.data_ptr();
     kargs.ptr_c = Y.data_ptr();
@@ -59,4 +43,4 @@ void
     {{ kernel_func }}<{{ kid_name }}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
 
 }
-#endif // launcher only on regular host pass
+{%- endblock %}

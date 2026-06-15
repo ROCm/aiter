@@ -133,29 +133,6 @@ def _kargs_template_vars(kernel_tag, kargs_name):
     return "", "", kargs_name
 
 
-# INSTANCE_IMPL building blocks. Host pass needs torch/optional; RTC/device passes skip them.
-def instance_impl_preamble(extra_host_includes=""):
-    return _render("_preamble.cuh.j2", extra_host_includes=extra_host_includes)
-
-
-# Fused host TU sees only traits header + fwd decl; avoids layout-helper ODR clash.
-def instance_impl_host_tu_split(
-    traits_header,
-    pipeline_header,
-    fwd_decl_kargs_tpl,
-    kernel_func,
-    fwd_decl_kargs_fnarg,
-):
-    return _render(
-        "_host_tu_split.cuh.j2",
-        traits_header=traits_header,
-        pipeline_header=pipeline_header,
-        fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
-        kernel_func=kernel_func,
-        fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
-    )
-
-
 # Launcher signature tails after Y.
 A16W16_TUNE_HOST_EXTRA = ",\n    std::optional<aiter_tensor_t>,\n    int"
 A8W8_SCALE_HOST_EXTRA = (
@@ -310,8 +287,6 @@ class opus_gemm_codegen:
             traits_name=traits_name,
             kargs_name=kargs_name,
             kargs_template_vars=_kargs_template_vars,
-            instance_impl_preamble=instance_impl_preamble,
-            instance_impl_host_tu_split=instance_impl_host_tu_split,
             record_one_instantiation=_record_one_instantiation,
             make_host_decl=_make_host_decl,
             make_device_decl=_make_device_decl,

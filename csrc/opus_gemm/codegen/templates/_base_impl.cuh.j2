@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "aiter_tensor.h"
+#include "aiter_stream.h"{% block extra_host_includes %}{% endblock %}
+#include <optional>
+#endif
+{%- block device_tu_split %}
+#ifdef OPUS_FUSED_HOST_TU
+#include "{{ traits_header }}"
+template<typename Traits{{ fwd_decl_kargs_tpl }}>
+__global__ void {{ kernel_func }}({{ fwd_decl_kargs_fnarg }} kargs);
+#else
+#include "{{ pipeline_header }}"
+#endif
+{%- endblock %}
+{% block traits_aliases %}{{ traits_aliases }}{% endblock %}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+{%- block launcher %}
+{%- endblock %}
+#endif // launcher only on regular host pass

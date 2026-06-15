@@ -1,14 +1,13 @@
-{{ preamble }}
-{{ host_tu_split }}
-
+{% extends "_base_impl.cuh.j2" %}
+{% block traits_aliases %}
 template <typename D_C>
 using {{ kid_name }}_Traits = {{ traits_name }}<{{ BLOCK_SIZE }},
     opus::seq<{{ B_M }}, {{ B_N }}, {{ B_K }}>,
     opus::tuple<{{ da }}, {{ db }}, D_C, fp32_t, fp32_t>,
     opus::seq<{{ VEC_A }}, {{ VEC_B }}, {{ VEC_C }}>,
     opus::seq<{{ GROUP_M }}, {{ GROUP_N }}, {{ GROUP_K }}>>;
-
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+{% endblock %}
+{%- block launcher %}
 template <typename D_C>
 void
 {{ kid_name }}(
@@ -63,4 +62,4 @@ void
     {{ kernel_func }}<{{ kid_name }}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
 
 }
-#endif // launcher only on regular host pass
+{%- endblock %}

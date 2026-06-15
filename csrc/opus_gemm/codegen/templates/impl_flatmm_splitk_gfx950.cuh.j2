@@ -1,7 +1,5 @@
-{{ preamble }}
-{{ host_tu_split }}
-{{ traits_aliases }}
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+{% extends "_base_impl.cuh.j2" %}
+{%- block launcher %}
 template <typename D_C>
 void
 {{ kid_name }}(
@@ -29,7 +27,7 @@ void
     AITER_CHECK(K % 2 == 0,
         "K=", K, " must be even (a16w16 family rejects odd K due to a "
         "latent K-tail accumulation bug; pass an even K)");
-{{ bias_validate_block }}
+{% include "_bias_validate.cuh.j2" %}
     using Traits = {{ kid_name }}_Traits<D_C>;
 
     int split_k = (splitK <= 1) ? 1 : splitK;
@@ -92,7 +90,7 @@ void
         ws_handle_->bytes = grow_bytes;
     }
 
-    {{ kargs_name }} kargs{{{}}};
+    {{ kargs_name }} kargs{};
     kargs.ptr_a         = XQ.data_ptr();
     kargs.ptr_b         = WQ.data_ptr();
     kargs.ws_handle     = ws_handle_;
@@ -157,4 +155,4 @@ void
     }
 
 }
-#endif // launcher only on regular host pass
+{%- endblock %}

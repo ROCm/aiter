@@ -560,8 +560,6 @@ def gen_persistent_instance(
     traits_name,
     kargs_name,
     kargs_template_vars,
-    instance_impl_preamble,
-    instance_impl_host_tu_split,
     record_one_instantiation,
     A16W16_TUNE_HOST_EXTRA,
     **_unused,
@@ -618,18 +616,12 @@ def gen_persistent_instance(
     dim3 block({k.BLOCK_SIZE});
 """
 
-    preamble = instance_impl_preamble("\n#include <algorithm>")
-    host_tu_split = instance_impl_host_tu_split(
-        traits_header,
-        pipeline_header,
-        fwd_decl_kargs_tpl,
-        kernel_func,
-        fwd_decl_kargs_fnarg,
-    )
     INSTANCE_IMPL = _render(
         "impl_persistent_gfx950.cuh.j2",
-        preamble=preamble,
-        host_tu_split=host_tu_split,
+        traits_header=traits_header,
+        pipeline_header=pipeline_header,
+        fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
+        fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
         kid_name=k.name,
         traits_name=traits_name,
         BLOCK_SIZE=k.BLOCK_SIZE,
@@ -661,8 +653,6 @@ def gen_scale_instance(
     traits_name,
     kargs_name,
     kargs_template_vars,
-    instance_impl_preamble,
-    instance_impl_host_tu_split,
     record_one_instantiation,
     A8W8_SCALE_HOST_EXTRA,
     **_unused,
@@ -671,18 +661,12 @@ def gen_scale_instance(
     kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
-    preamble = instance_impl_preamble()
-    host_tu_split = instance_impl_host_tu_split(
-        traits_header,
-        pipeline_header,
-        fwd_decl_kargs_tpl,
-        kernel_func,
-        fwd_decl_kargs_fnarg,
-    )
     INSTANCE_IMPL = _render(
         "impl_scale_gfx950.cuh.j2",
-        preamble=preamble,
-        host_tu_split=host_tu_split,
+        traits_header=traits_header,
+        pipeline_header=pipeline_header,
+        fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
+        fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
         kid_name=k.name,
         traits_name=traits_name,
         BLOCK_SIZE=k.BLOCK_SIZE,
@@ -708,8 +692,6 @@ def gen_noscale_instance_gfx950(
     traits_name,
     kargs_name,
     kargs_template_vars,
-    instance_impl_preamble,
-    instance_impl_host_tu_split,
     BIAS_HOST_VALIDATE,
     A16W16_TUNE_TAGS,
     **_unused,
@@ -811,14 +793,6 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     auto stream = aiter::getCurrentHIPStream();
     {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);"""
 
-    preamble = instance_impl_preamble()
-    host_tu_split = instance_impl_host_tu_split(
-        traits_header,
-        pipeline_header,
-        fwd_decl_kargs_tpl,
-        kernel_func,
-        fwd_decl_kargs_fnarg,
-    )
     template_name = (
         "impl_noscale_a16w16_gfx950.cuh.j2"
         if is_a16w16_split_barrier
@@ -826,8 +800,11 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     )
     INSTANCE_IMPL = _render(
         template_name,
-        preamble=preamble,
-        host_tu_split=host_tu_split,
+        traits_header=traits_header,
+        pipeline_header=pipeline_header,
+        fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
+        fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
+        kernel_func=kernel_func,
         traits_aliases=traits_aliases,
         kid_name=k.name,
         kargs_name=kargs_name,
@@ -918,6 +895,8 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         "impl_mono_tile_gfx950.cuh.j2",
         traits_header=traits_header,
         pipeline_header=pipeline_header,
+        fwd_decl_kargs_tpl="",
+        fwd_decl_kargs_fnarg=kargs_name,
         kernel_func=kernel_func,
         kargs_name=kargs_name,
         kid_name=k.name,
@@ -961,8 +940,6 @@ def gen_flatmm_instance(
     traits_name,
     kargs_name,
     kargs_template_vars,
-    instance_impl_preamble,
-    instance_impl_host_tu_split,
     record_one_instantiation,
     A16W16_TUNE_HOST_EXTRA,
     **_unused,
@@ -996,18 +973,12 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     {has_bias_str}>;
 """
 
-    preamble = instance_impl_preamble()
-    host_tu_split = instance_impl_host_tu_split(
-        traits_header,
-        pipeline_header,
-        fwd_decl_kargs_tpl,
-        kernel_func,
-        fwd_decl_kargs_fnarg,
-    )
     INSTANCE_IMPL = _render(
         "impl_flatmm_gfx950.cuh.j2",
-        preamble=preamble,
-        host_tu_split=host_tu_split,
+        traits_header=traits_header,
+        pipeline_header=pipeline_header,
+        fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
+        fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
         traits_aliases=traits_aliases,
         kid_name=k.name,
         kargs_name=kargs_name,
@@ -1031,11 +1002,8 @@ def gen_flatmm_splitk_instance(
     traits_name,
     kargs_name,
     kargs_template_vars,
-    instance_impl_preamble,
-    instance_impl_host_tu_split,
     record_one_instantiation,
     A16W16_TUNE_HOST_EXTRA,
-    BIAS_HOST_VALIDATE,
     **_unused,
 ):
     """gfx950 a16w16_flatmm_splitk launcher emit (uses ws_handle + reduce kernel call)."""
@@ -1055,22 +1023,15 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     {has_oob_str}>;
 """
 
-    preamble = instance_impl_preamble()
-    host_tu_split = instance_impl_host_tu_split(
-        traits_header,
-        pipeline_header,
-        fwd_decl_kargs_tpl,
-        kernel_func,
-        fwd_decl_kargs_fnarg,
-    )
     INSTANCE_IMPL = _render(
         "impl_flatmm_splitk_gfx950.cuh.j2",
-        preamble=preamble,
-        host_tu_split=host_tu_split,
+        traits_header=traits_header,
+        pipeline_header=pipeline_header,
+        fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
+        fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
         traits_aliases=traits_aliases,
         kid_name=k.name,
         kargs_name=kargs_name,
-        bias_validate_block=BIAS_HOST_VALIDATE,
         B_K=k.B_K, B_M=k.B_M, B_N=k.B_N,
         BLOCK_SIZE=k.BLOCK_SIZE,
         kernel_func=kernel_func,

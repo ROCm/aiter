@@ -81,7 +81,6 @@ def gen_splitk_gfx942_instance(
     kargs_name,
     fused,
     kargs_template_vars,
-    BIAS_HOST_VALIDATE,
     SPLITK_REDUCE_FAST_ARCHES,
     V3_NVEC_ROWS,
     V2_SUPPORTED_SPLITKS,
@@ -291,7 +290,6 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         kid_name=k.name,
         kargs_name=kargs_name,
         err_label=err_label,
-        bias_validate_block=BIAS_HOST_VALIDATE,
         B_K=k.B_K, B_M=k.B_M, B_N=k.B_N,
         BLOCK_SIZE=k.BLOCK_SIZE,
         target_wg_expr=target_wg_expr,
@@ -352,8 +350,6 @@ def gen_a16w16_nosplit_gfx942_instance(
     traits_name,
     kargs_name,
     kargs_template_vars,
-    instance_impl_preamble,
-    instance_impl_host_tu_split,
     record_one_instantiation,
     A16W16_TUNE_HOST_EXTRA,
     A16W16_TUNE_TAGS,
@@ -407,18 +403,13 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     auto stream = aiter::getCurrentHIPStream();
     {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);"""
 
-    preamble = instance_impl_preamble()
-    host_tu_split = instance_impl_host_tu_split(
-        traits_header,
-        pipeline_header,
-        fwd_decl_kargs_tpl,
-        kernel_func,
-        fwd_decl_kargs_fnarg,
-    )
     INSTANCE_IMPL = _render(
         "impl_nosplit_gfx942.cuh.j2",
-        preamble=preamble,
-        host_tu_split=host_tu_split,
+        traits_header=traits_header,
+        pipeline_header=pipeline_header,
+        fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
+        fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
+        kernel_func=kernel_func,
         traits_aliases=traits_aliases,
         kid_name=k.name,
         kargs_name=kargs_name,
