@@ -23,16 +23,19 @@ SHAPES = [
     (257, 7168, 512, 9),  # DSR
 ]
 
-# FlyDSL-port-only shapes. These run the BM16 inline_quant sort (mxfp4_moe_sort
-# prologue=0) feeding the FlyDSL gemm1/gemm2 -- NOT the HIP gemm -- so they are
-# enumerated for the AUX (sort) codegen only, never the gemm codegen (which would
-# emit HIP gemm instances that needn't / may not compile for these shapes). One
-# tuple per unique (NE, TOPK, H) sort key (D_INTER does not affect the sort).
+# FlyDSL-port-only shapes -- enumerated for the AUX (sort/quant/sort_scales/scatter)
+# codegen only, never the HIP gemm codegen. Listed per (NE, H, E, TOPK): sort_scales
+# is per-E so EVERY INTER variant needs its own entry; the E-independent aux
+# (sort/3stage/quant) is de-duplicated in enumerate_instances so shapes that share an
+# (NE, TOPK, H) sort key don't emit duplicate instances.
 AUX_EXTRA_SHAPES = [
-    (256, 3072, 768, 8),  # MiniMax (H=3072, TOPK=8) -- covers INTER 768 & 1536
-    (32, 7168, 2048, 8),  # dsv3 variant (NE=32, TOPK=8)
-    (384, 7168, 512, 8),  # Kimi-K2 (NE=384, TOPK=8)
-    (512, 4096, 256, 10),  # Qwen3.5 397B (NE=512, TOPK=10, H=4096)
+    (256, 3072, 1536, 8),  # MiniMax (INTER 1536)
+    (256, 3072, 768, 8),  # MiniMax (INTER 768)
+    (32, 7168, 2048, 8),  # dsv3 variant (NE=32)
+    (257, 7168, 256, 9),  # dsv3_c (INTER 256, shares sort key with DSR)
+    (384, 7168, 512, 8),  # Kimi-K2 (NE=384)
+    (385, 7168, 256, 9),  # kimik2_b (INTER 256, shares sort key with Kimi-K2.5)
+    (512, 4096, 256, 10),  # Qwen3.5 397B (NE=512, TOPK=10)
 ]
 
 # XCD-swizzle group sizes to enumerate for BM=128 paths (large-M targets).
@@ -551,6 +554,21 @@ class mxfp4_moe_aux_codegen:
         self.working_path = Path(working_path)
 
     def enumerate_instances(self):
+        all_shapes = SHAPES + AUX_EXTRA_SHAPES
+        # E-independent aux (sort / 3stage / quant) must de-dup: AUX_EXTRA shapes that
+        # differ only in INTER share an (NE, TOPK, H) sort key (or (NE, TOPK) for the
+        # H-independent 3stage), which would otherwise emit duplicate instance names.
+        sort_shapes, _seen = [], set()  # unique (NE, TOPK, H)
+        for ne, h, e, topk in all_shapes:
+            if (ne, topk, h) not in _seen:
+                _seen.add((ne, topk, h))
+                sort_shapes.append((ne, h, e, topk))
+        s3_shapes, _seen3 = [], set()  # unique (NE, TOPK)
+        for ne, h, e, topk in all_shapes:
+            if (ne, topk) not in _seen3:
+                _seen3.add((ne, topk))
+                s3_shapes.append((ne, h, e, topk))
+
         # sort_quant: MB=32 only
         for ne, h, e, topk in SHAPES:
             for mb in (32,):
@@ -562,8 +580,8 @@ class mxfp4_moe_aux_codegen:
                     _aux_sort_quant_body(ne, topk, mb, h),
                 )
 
-        # sort (threestage): MB in {32, 128} -- incl. FlyDSL-port extra shapes
-        for ne, h, e, topk in SHAPES + AUX_EXTRA_SHAPES:
+        # sort (threestage): MB in {32, 128} -- de-duped by (NE, TOPK)
+        for ne, h, e, topk in s3_shapes:
             for mb in (32, 128):
                 yield Instance(
                     f"aux_sort3s_NE{ne}_TOPK{topk}_MB{mb}",
@@ -573,8 +591,8 @@ class mxfp4_moe_aux_codegen:
                     _aux_3stage_body(ne, topk, mb),
                 )
 
-        # sort (inline_quant + zero_init): MB=16 -- incl. FlyDSL-port extra shapes
-        for ne, h, e, topk in SHAPES + AUX_EXTRA_SHAPES:
+        # sort (inline_quant + zero_init): MB=16 -- de-duped by (NE, TOPK, H)
+        for ne, h, e, topk in sort_shapes:
             for mb in (16,):
                 yield Instance(
                     f"aux_sortzi_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
@@ -584,8 +602,8 @@ class mxfp4_moe_aux_codegen:
                     _aux_sort_only_zi_body(ne, topk, mb, h),
                 )
 
-        # sort (inline_quant): MB=16 -- incl. FlyDSL-port extra shapes
-        for ne, h, e, topk in SHAPES + AUX_EXTRA_SHAPES:
+        # sort (inline_quant): MB=16 -- de-duped by (NE, TOPK, H)
+        for ne, h, e, topk in sort_shapes:
             for mb in (16,):
                 yield Instance(
                     f"aux_sortonly_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
@@ -595,8 +613,8 @@ class mxfp4_moe_aux_codegen:
                     _aux_sort_only_body(ne, topk, mb, h),
                 )
 
-        # quant: MB in {32, 128} -- incl. FlyDSL-port extra shapes
-        for ne, h, e, topk in SHAPES + AUX_EXTRA_SHAPES:
+        # quant: MB in {32, 128} -- de-duped by (NE, TOPK, H)
+        for ne, h, e, topk in sort_shapes:
             for mb in (32, 128):
                 yield Instance(
                     f"aux_quant_NE{ne}_TOPK{topk}_MB{mb}_H{h}",

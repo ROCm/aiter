@@ -432,15 +432,8 @@ def fused_moe_(
         # Shapes whose full BM128 non-inline aux (threestage sort + quant +
         # sort_scales + scatter) is codegen'd (gen_instances SHAPES + AUX_EXTRA_SHAPES).
         # Must match those lists exactly -- sort_scales is per (NE, E, H), so each
-        # INTER variant needs its own entry (e.g. MiniMax 1536 not yet covered).
-        _noninline_ok = (E, model_dim, inter_dim, topk) in {
-            (385, 7168, 512, 9),  # Kimi-K2.5
-            (257, 7168, 512, 9),  # DSR
-            (256, 3072, 768, 8),  # MiniMax (INTER 768)
-            (32, 7168, 2048, 8),  # dsv3 variant
-            (384, 7168, 512, 8),  # Kimi-K2
-            (512, 4096, 256, 10),  # Qwen3.5 397B
-        }
+        # INTER variant needs its own entry.
+        _noninline_ok = (E, model_dim, inter_dim, topk) in _MXFP4_BM128_SHAPES
         if not _noninline_ok or M <= 1024:
             # decode / mid-M: BM16 inline_quant + atomic (latency-bound). (The BM16<->
             # BM128 crossover near M=1024 is shape-dependent -- wide shapes prefer BM128
@@ -1015,6 +1008,26 @@ def _flydsl_stage2_wrapper(
 # identifies one template instance (NE / D_HIDDEN / D_INTER / BM / variant).
 # The "E{n}" tag inside the name encodes D_INTER (per-shard inter_dim) --
 # the single-letter "E" is kept for brevity and does NOT mean expert count.
+# (NE, model_dim/H, inter_dim/E, topk) shapes whose full BM128 non-inline aux
+# (threestage sort + quant + sort_scales + scatter) is codegen'd in
+# gen_instances.py (SHAPES + AUX_EXTRA_SHAPES). These get the M-adaptive BM128
+# prefill path; any other mxfp4_moe shape stays BM16 inline_quant. Keep in sync
+# with gen_instances.py.
+_MXFP4_BM128_SHAPES = frozenset(
+    {
+        (385, 7168, 512, 9),  # Kimi-K2.5
+        (257, 7168, 512, 9),  # DSR (dsv3_b)
+        (256, 3072, 1536, 8),  # MiniMax (INTER 1536)
+        (256, 3072, 768, 8),  # MiniMax (INTER 768)
+        (32, 7168, 2048, 8),  # dsv3_a (NE=32)
+        (257, 7168, 256, 9),  # dsv3_c (INTER 256)
+        (384, 7168, 512, 8),  # Kimi-K2 (kimik2_a)
+        (385, 7168, 256, 9),  # kimik2_b (INTER 256)
+        (512, 4096, 256, 10),  # Qwen3.5 397B
+    }
+)
+
+
 _MXFP4_G1_KNAME_RE = re.compile(
     r"^mxfp4_moe_g1_a4w4_NE(?P<ne>\d+)_H(?P<h>\d+)_E(?P<d_inter>\d+)"
     r"_BM(?P<bm>\d+)"
@@ -1197,15 +1210,7 @@ def _mxfp4_moe_run(
     _threestage_ok = (
         not inline_quant
         and BM in (32, 128)
-        and (NE, D_HIDDEN, D_INTER, topk)
-        in {
-            (385, 7168, 512, 9),  # Kimi-K2.5
-            (257, 7168, 512, 9),  # DSR
-            (256, 3072, 768, 8),  # MiniMax (INTER 768)
-            (32, 7168, 2048, 8),  # dsv3 variant
-            (384, 7168, 512, 8),  # Kimi-K2
-            (512, 4096, 256, 10),  # Qwen3.5 397B
-        }
+        and (NE, D_HIDDEN, D_INTER, topk) in _MXFP4_BM128_SHAPES
     )
     if _threestage_ok:
         aiter.mxfp4_moe_sort(
