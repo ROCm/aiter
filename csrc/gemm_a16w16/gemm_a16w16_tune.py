@@ -271,7 +271,9 @@ def run_skinny_gemm_a16w16(input, weight, bias=None, otype=dtypes.bf16):
     return native_skinny_gemm(input, weight, 2, bias=bias, otype=otype)
 
 
-def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=None):
+def run_flydsl_gemm_bf16(
+    input, weight, out, bias=None, otype=dtypes.bf16, config=None
+):
     if flydsl_hgemm is None:
         raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
     if config is None:
@@ -287,6 +289,7 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
     out = flydsl_hgemm(
         input,
         weight,
+        out=out,
         bias=fused_bias,
         kernel_family=config.get("kernel_family"),
         tile_m=config["tile_m"],
@@ -751,7 +754,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     generate_data,
                     (M, N, K, indtype, outdtype, scaleAB, is_shuffle, 0, has_bias),
                     run_flydsl_gemm_bf16,
-                    (["inp", weight_key, "bias"], outdtype, config),
+                    (["inp", weight_key, "out_asm", "bias"], outdtype, config),
                     dict(run_kwargs),
                     get_gemm_ref,
                     (
@@ -763,6 +766,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     None,
                     rtol,
                     atol,
+                    None,
+                    None,
+                    ("out_asm",),
                 )
             )
         logger.info(f"FlyDSL candidate count for M={M}, N={N}, K={K}: {len(tasks)}")
