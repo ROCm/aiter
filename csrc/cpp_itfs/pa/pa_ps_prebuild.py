@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Ahead-of-time prebuild for the cpp_itfs ``pa_ps`` paged-attention reduce kernel.
+"""Ahead-of-time prebuild for the cpp_itfs ``pa_ps`` paged-attention *reduce* kernel.
+
+Scope note: this prebuilds ONLY the pa_ps partition-combine/softmax-rescale step
+(the C++ ``pa_decode_ps_reduce_hip_kernel`` in pa_ps.cuh). It does NOT prebuild the
+paged-attention *decode* / main-attention compute -- that runs through the separate
+gluon/triton path (aiter/ops/triton/gluon/pa_decode_gluon.py) and is unaffected
+here. "pa_ps" == the reduce kernel, not the whole decode kernel.
 
 ``pa_ps`` is a cpp_itfs template op: each (head_size, query_group_size,
 context_partition_num, dtypes, use_sinks) combination is rendered from a jinja
@@ -33,6 +39,15 @@ Coverage / caveats (a prebuilt variant is hit only on an EXACT signature match):
     is set (e.g. to a persistent volume), BUILD_DIR becomes <root>/build, which
     has no prebuilt artifacts -> one JIT recompile into that volume. So setting
     AITER_ROOT_DIR *disables* the wheel prebuild (counterintuitive but expected).
+  * Arch binding (same contract PREBUILD_KERNELS already imposes on module_*):
+    compile_lib bakes the target arch into the .so via --offload-arch= (from
+    GPU_ARCHS), but the folder name (md5 of the op signature) does NOT include the
+    arch, and at runtime not_built() only checks file existence -- never arch match.
+    So a .so prebuilt for e.g. gfx942 is loaded as-is on a gfx950 box without
+    recompiling. Pure JIT avoids this because GPU_ARCHS defaults to the running
+    GPU's native arch; a shipped .so is never re-validated. Safe ONLY when the
+    wheel's GPU_ARCHS covers the deployment arch (or is a multi-arch fat binary) --
+    keep this in mind for cross-arch wheel deployments.
 
 Packaging: these .so are written under {BUILD_DIR}/pa_ps_<hash>/lib.so, i.e.
 aiter/jit/build/..., which MANIFEST.in prunes. MANIFEST.in must re-include
