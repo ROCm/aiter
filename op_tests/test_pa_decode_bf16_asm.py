@@ -600,6 +600,270 @@ def test_pa_decode(
     }
 
 
+# ---------------------------------------------------------------------------
+# V-mask NaN-vs-zero bit-match test
+# ---------------------------------------------------------------------------
+# When kv_seq_len is not a multiple of page_size, the last KV page holds
+# uninitialized V for tokens [seq_len, page_end).  The score border mask drives
+# P=0 there, but a stale fp8-NaN V byte makes the PV WMMA compute 0*NaN = NaN
+# (then spread by the reduce).  The kernel's V-mask (apply_V_mask in
+# PA_DECODE_D64_1TG_4W_PS.sp3...) zeros those V bytes before the PV WMMA.  This
+# test fills that padding region two ways — all-NaN vs all-zero — and requires
+# the kernel outputs to be BIT-IDENTICAL: if the mask is correct the NaN can
+# never reach the math, so both runs must produce the same bytes.
+
+
+def _build_pa_inputs(
+    batch, kv_head_num, ctx_len, mtp, scales, varlen, context_lens, device="cuda", seed=0
+):
+    """Construct one PA-decode test case (mirrors test_pa_decode's input setup) and
+    return all kernel inputs + split-KV metadata in a dict, so several kernel runs
+    can share byte-identical inputs (used by the V-mask bit-match test)."""
+    gqa = PA_GQA_RATIO
+    head_dim = PA_HEAD_DIM
+    page_size = PA_PAGE_SIZE
+    assert mtp < PA_TILE_Q // gqa, f"kernel requires mtp < {PA_TILE_Q // gqa}, got {mtp}"
+    qlen_with_mtp = mtp + 1
+    q_head_num = kv_head_num * gqa
+    torch.manual_seed(seed)
+    random.seed(seed)
+
+    if scales is None:
+        query_scale = round(random.uniform(0.5, 2.0), 4)
+        key_scale = round(random.uniform(0.5, 2.0), 4)
+        value_scale = round(random.uniform(0.5, 2.0), 4)
+    else:
+        query_scale, key_scale, value_scale = scales
+    softmax_scale = 1.0 / (head_dim**0.5)
+
+    if context_lens is not None:
+        seq_lens_kv = torch.tensor(context_lens, dtype=torch.int32, device=device)
+        batch = seq_lens_kv.numel()
+    elif varlen:
+        seq_lens_kv = torch.empty(batch, dtype=torch.int32, device=device)
+        for i in range(batch):
+            seq_lens_kv[i] = max(int(random.uniform(1, ctx_len)), 1)
+    else:
+        seq_lens_kv = torch.full((batch,), ctx_len, dtype=torch.int32, device=device)
+
+    max_blocks_per_seq = ceil_div(int(seq_lens_kv.max().item()), page_size)
+    max_blocks = max_blocks_per_seq * batch
+    block_tables = (
+        torch.randperm(max_blocks, device=device)
+        .to(torch.int32)
+        .reshape(batch, max_blocks_per_seq)
+    )
+    actual_blocks = ceil_div(seq_lens_kv, page_size)
+    kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=device)
+    kv_indptr[1:] = torch.cumsum(actual_blocks, dim=0)
+    kv_indices = torch.cat(
+        [block_tables[i, : int(actual_blocks[i].item())] for i in range(batch)]
+    ).to(torch.int32)
+    qo_indptr = torch.arange(
+        0, (batch + 1) * qlen_with_mtp, qlen_with_mtp, dtype=torch.int32, device=device
+    )
+
+    num_phys_pages = max_blocks
+    Q = (
+        0.5
+        * torch.randn(batch, qlen_with_mtp, kv_head_num, gqa, head_dim, device=device)
+    ).to(fp8)
+    K = (
+        0.5
+        * torch.randn(
+            num_phys_pages, kv_head_num, head_dim // 16, page_size, 16, device=device
+        )
+    ).to(fp8)
+    V = (
+        0.5
+        * torch.randn(
+            num_phys_pages, kv_head_num, page_size // 16, head_dim, 16, device=device
+        )
+    ).to(fp8)
+
+    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+    (
+        work_indptr,
+        work_info,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        split_rows,
+    ) = make_sched2_metadata(
+        batch,
+        kv_head_num,
+        gqa,
+        qo_indptr,
+        kv_indptr,
+        seq_lens_kv,
+        page_size,
+        qlen_with_mtp,
+        num_cu,
+        device,
+    )
+    sink = torch.full((q_head_num,), -1.0e30, dtype=dtypes.fp32, device=device)
+
+    return dict(
+        batch=batch,
+        gqa=gqa,
+        mtp=mtp,
+        page_size=page_size,
+        head_dim=head_dim,
+        q_head_num=q_head_num,
+        Q=Q,
+        K=K,
+        V=V,
+        kv_indices=kv_indices,
+        seq_lens_kv=seq_lens_kv,
+        softmax_scale=softmax_scale,
+        kv_indptr=kv_indptr,
+        qo_indptr=qo_indptr,
+        query_scale=query_scale,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        work_indptr=work_indptr,
+        work_info=work_info,
+        reduce_indptr=reduce_indptr,
+        reduce_final_map=reduce_final_map,
+        reduce_partial_map=reduce_partial_map,
+        split_rows=split_rows,
+        sink=sink,
+    )
+
+
+def fill_v_padding(V, value, kv_indices, kv_indptr, seq_lens_kv, page_size):
+    """Return a clone of V with each sequence's last-page padding tokens (token
+    index >= seq_len) set to `value`.  V is the paged cache [page, kv_head,
+    token//16, head_dim, token%16].  These positions hold uninitialized data in a
+    real KV cache; the kernel's V-mask must zero them.  Returns (V_filled, n_pad)
+    where n_pad is the total number of (page,token) padding slots filled."""
+    V = V.clone()
+    n_pad = 0
+    for b in range(seq_lens_kv.numel()):
+        seq = int(seq_lens_kv[b].item())
+        lo, hi = int(kv_indptr[b].item()), int(kv_indptr[b + 1].item())
+        nb = hi - lo
+        if nb == 0:
+            continue
+        last_page = int(kv_indices[hi - 1].item())
+        valid_in_last = seq - (nb - 1) * page_size
+        for t in range(valid_in_last, page_size):  # empty range when last page is full
+            V[last_page, :, t // 16, :, t % 16] = value
+            n_pad += 1
+    return V, n_pad
+
+
+def _run_pa_pipeline(inp, V):
+    """Run the PA stage + host LSE reduce for a given V tensor; return final bf16 out.
+    Calls the op directly (not the perftest wrapper) for a single deterministic run,
+    and allocates fresh split scratch since the kernel writes into it."""
+    split_o = torch.zeros(
+        (inp["split_rows"], 1, inp["q_head_num"], inp["head_dim"]),
+        dtype=dtypes.fp32,
+        device="cuda",
+    )
+    split_lse = torch.full(
+        (inp["split_rows"], 1, inp["q_head_num"], 1),
+        float("-inf"),
+        dtype=dtypes.fp32,
+        device="cuda",
+    )
+    out = aiter.pa_decode_bf16_asm(
+        inp["Q"],
+        inp["K"],
+        V,
+        inp["kv_indices"],
+        inp["seq_lens_kv"],
+        inp["softmax_scale"],
+        inp["kv_indptr"],
+        gqa=inp["gqa"],
+        mtp=inp["mtp"],
+        query_scale=inp["query_scale"],
+        key_scale=inp["key_scale"],
+        value_scale=inp["value_scale"],
+        qo_indptr=inp["qo_indptr"],
+        work_indptr=inp["work_indptr"],
+        work_info=inp["work_info"],
+        split_o=split_o,
+        split_lse=split_lse,
+        sink=inp["sink"],
+    )
+    torch.cuda.synchronize()
+    out = cpu_reduce(
+        out,
+        split_o,
+        split_lse,
+        inp["reduce_indptr"],
+        inp["reduce_final_map"],
+        inp["reduce_partial_map"],
+        inp["gqa"],
+    )
+    return out
+
+
+def _bits(t):
+    """Reinterpret a bf16 tensor as int16 for exact bitwise comparison (NaN-safe:
+    torch.equal on floats treats NaN != NaN, which would mask a real bit match)."""
+    return t.contiguous().view(torch.int16)
+
+
+def test_pa_decode_vmask(
+    batch: int,
+    kv_head_num: int,
+    ctx_len: int,
+    mtp: int = 0,
+    scales: Optional[Tuple[float, float, float]] = None,
+    varlen: bool = False,
+    context_lens: Optional[list] = None,
+) -> dict:
+    """V-mask correctness: filling the last-page padding region with NaN vs 0 must
+    yield BIT-IDENTICAL kernel output.  A mismatch (or any NaN in the output) means
+    stale padding V leaked into the PV WMMA — i.e. the kernel's V-mask is missing or
+    wrong for this shape."""
+    inp = _build_pa_inputs(batch, kv_head_num, ctx_len, mtp, scales, varlen, context_lens)
+    ps = inp["page_size"]
+
+    V_nan, n_pad = fill_v_padding(
+        inp["V"], float("nan"), inp["kv_indices"], inp["kv_indptr"], inp["seq_lens_kv"], ps
+    )
+    V_zero, _ = fill_v_padding(
+        inp["V"], 0.0, inp["kv_indices"], inp["kv_indptr"], inp["seq_lens_kv"], ps
+    )
+
+    out_nan = _run_pa_pipeline(inp, V_nan)
+    out_zero = _run_pa_pipeline(inp, V_zero)
+
+    nan_count = int(torch.isnan(out_nan.float()).sum().item())
+    mismatch = int((_bits(out_nan) != _bits(out_zero)).sum().item())
+    bitmatch = mismatch == 0
+    status = "PASS" if bitmatch else "FAIL"
+    aiter.logger.info(
+        "[V-mask %s] batch=%d kvh=%d ctx=%s mtp=%d varlen=%s | pad_slots=%d "
+        "nan_in_out=%d mismatched_elems=%d",
+        status,
+        inp["batch"],
+        kv_head_num,
+        context_lens if context_lens is not None else ctx_len,
+        mtp,
+        varlen,
+        n_pad,
+        nan_count,
+        mismatch,
+    )
+
+    return {
+        "batch": inp["batch"],
+        "kvh": kv_head_num,
+        "max_kv": int(inp["seq_lens_kv"].max().item()),
+        "mtp": mtp,
+        "varlen": varlen,
+        "pad_slots": n_pad,
+        "nan_in_out": nan_count,
+        "mismatch": mismatch,
+        "bitmatch": bitmatch,
+    }
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of pa_decode_bf16_asm test",
@@ -670,6 +934,15 @@ parser.add_argument(
     tensor dumped from a production run). batch = number of values given; overrides
     -b/-c/--varlen. e.g. --context_lens 462 549 670 520 ...""",
 )
+parser.add_argument(
+    "--vmask",
+    action="store_true",
+    help="""Run the V-mask NaN-vs-zero bit-match test instead of the accuracy test:
+    fill each sequence's last-page padding (token >= seq_len) with NaN vs with 0 and
+    require BIT-IDENTICAL kernel output. Catches stale/garbage V leaking into the PV
+    WMMA. Exits non-zero if any config mismatches. Use ctx_len values that are NOT a
+    multiple of 256 so a padding region exists, e.g. -c 7 100 260 777 4097.""",
+)
 args = parser.parse_args()
 
 # An explicit context_lens vector defines a single shape: batch = its length, the
@@ -678,22 +951,55 @@ args = parser.parse_args()
 batch_sizes = [len(args.context_lens)] if args.context_lens else args.batch_size
 ctx_lens = [max(args.context_lens)] if args.context_lens else args.ctx_len
 
-df = []
-for batch, kv_head_num, ctx_len, mtp in itertools.product(
-    batch_sizes, args.kv_head_num, ctx_lens, args.mtp
-):
-    ret = test_pa_decode(
-        batch,
-        kv_head_num,
-        ctx_len,
-        mtp,
-        tuple(args.scales) if args.scales is not None else None,
-        args.varlen,
-        args.sink,
-        args.context_lens,
-    )
-    df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("pa_decode_bf16_asm summary (markdown):\n%s", df_md)
-df.to_csv("pa_decode_bf16_asm.csv")
+if args.vmask:
+    # V-mask bit-match sweep: NaN-padded V vs zero-padded V must match bit-for-bit.
+    import sys
+
+    df = []
+    for batch, kv_head_num, ctx_len, mtp in itertools.product(
+        batch_sizes, args.kv_head_num, ctx_lens, args.mtp
+    ):
+        ret = test_pa_decode_vmask(
+            batch,
+            kv_head_num,
+            ctx_len,
+            mtp,
+            tuple(args.scales) if args.scales is not None else None,
+            args.varlen,
+            args.context_lens,
+        )
+        df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("pa_decode_bf16_asm V-mask summary (markdown):\n%s", df_md)
+    df.to_csv("pa_decode_bf16_asm_vmask.csv")
+    n_fail = int((~df["bitmatch"]).sum())
+    if n_fail:
+        aiter.logger.error(
+            "V-mask test FAILED: %d/%d configs did not bit-match (NaN leaked "
+            "into PV) — kernel V-mask is missing/incorrect for those shapes.",
+            n_fail,
+            len(df),
+        )
+        sys.exit(1)
+    aiter.logger.info("V-mask test PASSED: all %d configs bit-match.", len(df))
+else:
+    df = []
+    for batch, kv_head_num, ctx_len, mtp in itertools.product(
+        batch_sizes, args.kv_head_num, ctx_lens, args.mtp
+    ):
+        ret = test_pa_decode(
+            batch,
+            kv_head_num,
+            ctx_len,
+            mtp,
+            tuple(args.scales) if args.scales is not None else None,
+            args.varlen,
+            args.sink,
+            args.context_lens,
+        )
+        df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("pa_decode_bf16_asm summary (markdown):\n%s", df_md)
+    df.to_csv("pa_decode_bf16_asm.csv")
