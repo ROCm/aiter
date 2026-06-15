@@ -827,7 +827,8 @@ def _bwd_dq_inner_split(
             dp = tl.dot(do, vT)
 
         if ENABLE_DROPOUT:
-            dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
+            scaled_mask = dropout_mask.to(dp.dtype) * dropout_scale
+            dp = dp * scaled_mask
 
         # ds
         delta_i = Di[:, None]
@@ -842,7 +843,7 @@ def _bwd_dq_inner_split(
             ds_transposed = tl.trans(ds).to(kT.type.element_ty)
             dq += tl.trans(tl.dot(kT, ds_transposed)) * descale_k
         else:
-            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
+            dq = tl.dot(ds.to(kT.type.element_ty), tl.trans(kT), acc=dq)
 
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
@@ -967,10 +968,11 @@ def _bwd_dkdv_inner_split(
 
         # dV
         if ENABLE_DROPOUT:
-            pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            scaled_mask = dropout_mask.to(pT.dtype) * dropout_scale
+            pT_dropout = pT * scaled_mask
+            dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
         else:
-            dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
         # Load delta
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
@@ -982,7 +984,8 @@ def _bwd_dkdv_inner_split(
             dpT = tl.dot(v, tl.trans(do))
 
         if ENABLE_DROPOUT:
-            dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
+            scaled_mask = dropout_mask.to(dpT.dtype) * dropout_scale
+            dpT = dpT * scaled_mask
 
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
@@ -995,7 +998,7 @@ def _bwd_dkdv_inner_split(
             dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
 
         # increment pointers
         curr_m += step_m
@@ -1149,10 +1152,11 @@ def _bwd_dkdvdq_inner_atomic(
 
         # dV
         if ENABLE_DROPOUT:
-            pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            scaled_mask = dropout_mask.to(pT.dtype) * dropout_scale
+            pT_dropout = pT * scaled_mask
+            dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
         else:
-            dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
         # Load delta
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
@@ -1164,7 +1168,8 @@ def _bwd_dkdvdq_inner_atomic(
             dpT = tl.dot(v, tl.trans(do))
 
         if ENABLE_DROPOUT:
-            dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
+            scaled_mask = dropout_mask.to(dpT.dtype) * dropout_scale
+            dpT = dpT * scaled_mask
 
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
@@ -1177,7 +1182,7 @@ def _bwd_dkdvdq_inner_atomic(
             dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
 
         # We can compute the dq_partial here and do a atomic add to the correct memory location
         # NOTE: Possible problems with the atomic add: contention, is inside a loop which has achieved bad perf before
@@ -2920,10 +2925,11 @@ def _bwd_dkdv_inner(
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
         # Compute dV.
         if ENABLE_DROPOUT:
-            pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            scaled_mask = dropout_mask.to(pT.dtype) * dropout_scale
+            pT_dropout = pT * scaled_mask
+            dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
         else:
-            dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
         if DEBUG_TRITON_DETAIL:
             if start_n == 256:
@@ -2936,7 +2942,8 @@ def _bwd_dkdv_inner(
         else:
             dpT = tl.dot(v, tl.trans(do))
         if ENABLE_DROPOUT:
-            dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
+            scaled_mask = dropout_mask.to(dpT.dtype) * dropout_scale
+            dpT = dpT * scaled_mask
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
         if IS_FP8:
@@ -2946,7 +2953,7 @@ def _bwd_dkdv_inner(
             dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
@@ -3098,7 +3105,8 @@ def _bwd_dq_inner(
         else:
             dp = tl.dot(do, vT)
         if ENABLE_DROPOUT:
-            dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
+            scaled_mask = dropout_mask.to(dp.dtype) * dropout_scale
+            dp = dp * scaled_mask
         delta_i = Di[:, None]
         ds = p * (dp - delta_i)
         # Compute dQ.
@@ -3110,7 +3118,7 @@ def _bwd_dq_inner(
             ds_transposed = tl.trans(ds).to(kT.type.element_ty)
             dq += tl.trans(tl.dot(kT, ds_transposed)) * descale_k
         else:
-            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
+            dq = tl.dot(ds.to(kT.type.element_ty), tl.trans(kT), acc=dq)
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
