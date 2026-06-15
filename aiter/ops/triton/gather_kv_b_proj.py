@@ -20,6 +20,7 @@ def gather_kv_b_proj(
     k_prefix: torch.Tensor,  # [total_kv, tp_k_head_num, qk_nope_head_dim + kv_pe_dim]
     v_prefix: torch.Tensor,  # [total_kv, tp_k_head_num, v_head_dim]
     weight_preshuffle: bool = False,
+    shuffled_kv_cache: bool = False,
 ):
     num_block, block_size, hidden_dim = k_buffer.shape
     batch_size = kv_indptr.shape[0] - 1
@@ -83,7 +84,22 @@ def gather_kv_b_proj(
                 assert scale_k_granularity == 128
                 assert scale_n_granularity == 128
 
-    if is_fp4_weight:
+    if shuffled_kv_cache:
+        # FP4 *kv_buffer* is not supported; the kv buffer must be bf16/fp8. The
+        # weight may still be MXFP4 (handled by the FP4 weight path below).
+        assert k_buffer.dtype in (
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ), f"shuffled_kv_cache gather expects a bf16/fp8 kv buffer, got {k_buffer.dtype}"
+        assert block_size % 16 == 0, (
+            f"shuffled_kv_cache gather requires block_size % 16 == 0 (16-token "
+            f"shuffle groups), got block_size={block_size}"
+        )
+        # The shuffle keeps each token's data within its own block, so a chunk
+        # must span exactly one block (KBlocksPerChunkK == 1).
+        ChunkK = block_size
+    elif is_fp4_weight:
         ChunkK = 64
     else:
         ChunkK = 16 if k_buffer.dtype in [torch.float16, torch.bfloat16] else 32
@@ -127,6 +143,7 @@ def gather_kv_b_proj(
             IS_FP4=True,
             Fp4ScaleKGranularity=fp4_scale_k_granularity,
             WEIGHT_PRESHUFFLE=weight_preshuffle,
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
             num_stages=3,
         )
         return
@@ -155,5 +172,6 @@ def gather_kv_b_proj(
         WEIGHT_PRESHUFFLE=weight_preshuffle,
         PER_ROW_SCALE=per_row_scale,
         NO_SCALE=no_scale,
+        SHUFFLED_KV_CACHE=shuffled_kv_cache,
         num_stages=3,
     )
