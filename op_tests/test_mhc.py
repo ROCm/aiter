@@ -10,9 +10,18 @@ from aiter.test_common import (
 import torch
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime
 import argparse
 import pandas as pd
 from typing import Optional
+
+try:
+    from aiter.ops.mhc import mhc_fused_post_pre_large_m
+except ImportError:
+    mhc_fused_post_pre_large_m = None
+
+# gfx950 large-M path (mhc_fused_post_pre_large_m) applies when M > 1024.
+LARGE_M_MIN = 1025
 
 try:
     from aiter.ops.triton.fusions.mhc import mhc_post_pre as triton_mhc_post_pre
@@ -745,7 +754,7 @@ def mhc_post_pre_unfused_hip(
 
 
 @benchmark()
-def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False):
+def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False, large_m=False):
     """Fused mhc_post + mhc_pre: HIP ``mhc_fused_post_pre`` vs ref / unfused HIP / Triton."""
     if hidden_size < 512:
         aiter.logger.info(
@@ -906,6 +915,32 @@ def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False):
     elif not _HAS_TRITON_MHC_POST_PRE:
         aiter.logger.info("skip Triton mhc_post_pre: import unavailable")
 
+    if large_m:
+        if m < LARGE_M_MIN:
+            aiter.logger.info("skip large_m_us: m=%s < %s", m, LARGE_M_MIN)
+        elif get_gfx_runtime() != "gfx950":
+            aiter.logger.info(
+                "skip large_m_us: gfx=%s (gfx950 only)", get_gfx_runtime()
+            )
+        elif mhc_fused_post_pre_large_m is None:
+            aiter.logger.info("skip large_m_us: mhc_fused_post_pre_large_m unavailable")
+        else:
+            (_, _, layer_input_large_m, _), large_m_us = run_perftest(
+                mhc_fused_post_pre_large_m,
+                layer_input,
+                residual_in,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                **hip_kwargs,
+            )
+            ret["large_m_us"] = large_m_us
+            ret["hip_large_m_err"] = checkAllclose(
+                layer_input_ref, layer_input_large_m, msg="large_m/layer_input"
+            )
+
     return ret
 
 
@@ -953,6 +988,12 @@ _mode_group.add_argument(
     action="store_true",
     help="Fuse RMSNorm into mhc_pre / mhc_post_pre HIP paths (mutually exclusive with --hc_head).",
 )
+parser.add_argument(
+    "--largeM",
+    action="store_true",
+    help="In mhc_post_pre summary, add large_m_us / hip_large_m_err columns "
+    "(gfx950, M>1024, mhc_fused_post_pre_large_m).",
+)
 
 args = parser.parse_args()
 
@@ -995,6 +1036,7 @@ if not args.hc_head:
                         hidden_size=hidden_size,
                         hc_mult=hc_mult,
                         fuse_rmsnorm=args.fuse_rmsnorm,
+                        large_m=args.largeM,
                     )
                     if ret.get("skipped"):
                         continue
