@@ -1380,6 +1380,10 @@ def _mxfp4_moe_run(
         # the codegen'd Kimi/DSR nonatomic shapes (NE?{257,385}, H=7168, E=512) have
         # the gemm2-mxfp4out + scatter_reduce_q kernels.
         mxfp4out = p2.get("mxfp4out", False)
+        # mxfp4-out (lossy fp4 intermediate) is validated only for the codegen'd
+        # Kimi/DSR shapes. It does NOT transfer to non-Kimi INTER=256: at mid-M it
+        # loses to the tuned BM32, and at large M the non-Kimi scatter_reduce_q path
+        # is broken (cos=0, max_sorted-dependent). Keep it Kimi/DSR-only.
         _mx_shape_ok = (
             BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
         )

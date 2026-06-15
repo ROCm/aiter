@@ -74,7 +74,8 @@ def g2_kernel_name(shape, bm, variant):
 
 
 def _mxfp4out_ok(shape):
-    # ? codegen'd KIMI/DSR ??? gemm2-mxfp4out + scatter_reduce_q kernel?
+    # mxfp4-out is validated only for the codegen'd Kimi/DSR shapes; it does not
+    # transfer to non-Kimi INTER=256 (loses to tuned BM32 at mid-M, broken at large M).
     return shape.NE in (257, 385) and shape.H == 7168 and shape.INTER == 512
 
 
