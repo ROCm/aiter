@@ -13,6 +13,9 @@ Examples:
     BENCH_KV_LAYOUT=linear python op_tests/bench_per_token_head.py 16384
     BENCH_P_SCALE=none python op_tests/bench_per_token_head.py 16384
 
+    # Compare CK vs ASM (ASM requires vec_k_col_v layout and page_size=16):
+    BENCH_PAGE_SIZE=16 python op_tests/bench_per_token_head.py 1024 16384 32768
+
 Environment variables:
     BENCH_VERIFY=0|1            verify outputs vs FP32 reference (default 0)
     BENCH_PAGE_SIZE=N           paged-KV page size (default 1024)
@@ -25,6 +28,8 @@ Environment variables:
                                 without changing magnitudes), "per_head_random"
                                 (uniform [0.25, 1.0] per q-head, fixed seed),
                                 or "none" (skip the p_scale fold)
+    BENCH_ASM=0|1               show ASM kernel column (default: 1 when
+                                kv_layout=vec_k_col_v and page_size=16, else 0)
 """
 
 import argparse
@@ -53,6 +58,10 @@ if P_SCALE_MODE not in _VALID_P_SCALE:
     raise SystemExit(
         f"BENCH_P_SCALE={P_SCALE_MODE!r} is not one of {_VALID_P_SCALE}"
     )
+
+# ASM column: only meaningful on gfx942 with vec_k_col_v layout and page_size=16.
+_ASM_CAPABLE = KV_LAYOUT == "vec_k_col_v" and PAGE_SIZE == 16
+BENCH_ASM = bool(int(os.environ.get("BENCH_ASM", "1" if _ASM_CAPABLE else "0")))
 
 
 def _build_p_scale(num_qo_heads):
@@ -121,7 +130,7 @@ def _call_kernel(fn, **kwargs):
     return bench
 
 
-def _run_one(shape):
+def _run_one(shape, asm: bool = False):
     b, qo, kv, nhq, nhk, hd, c, sc = shape
     common = dict(
         kvcache_layout=KV_LAYOUT,
@@ -140,16 +149,28 @@ def _run_one(shape):
         seed=42,
         p_scale=_build_p_scale(nhq),
     )
-    pth = _call_kernel(run_batch_prefill_per_token_head, **common)
-    return pth
+    prev = os.environ.get("AITER_FMHA_PREFILL_ASM")
+    os.environ["AITER_FMHA_PREFILL_ASM"] = "1" if asm else "0"
+    try:
+        result = _call_kernel(run_batch_prefill_per_token_head, **common)
+    finally:
+        if prev is None:
+            os.environ.pop("AITER_FMHA_PREFILL_ASM", None)
+        else:
+            os.environ["AITER_FMHA_PREFILL_ASM"] = prev
+    return result
 
 
-def _format_row(shape, pth):
+def _format_row(shape, pth, asm=None):
     b = shape[0]
-    return f"{b:>5} | {_fmt(pth):>27} {_verify_str(pth)}"
+    ck_col = f"{_fmt(pth):>27} {_verify_str(pth)}"
+    if asm is None:
+        return f"{b:>5} | {ck_col}"
+    asm_col = f"{_fmt(asm):>27} {_verify_str(asm)}"
+    return f"{b:>5} | {ck_col} | {asm_col}"
 
 
-def _run_silent(shape):
+def _run_silent(shape, asm: bool = False):
     """Run one shape with FD-level stdout/stderr suppression."""
     import tempfile
 
@@ -162,7 +183,7 @@ def _run_silent(shape):
     os.dup2(capture.fileno(), 2)
     ok = True
     try:
-        return _run_one(shape)
+        return _run_one(shape, asm=asm)
     except BaseException:
         ok = False
         raise
@@ -180,7 +201,8 @@ def _run_silent(shape):
 
 
 print("Warming up kernels (one-time JIT setup, may take a moment)...", flush=True)
-_pth0 = _run_silent(SHAPES[0])
+_pth0_ck = _run_silent(SHAPES[0], asm=False)
+_pth0_asm = _run_silent(SHAPES[0], asm=True) if BENCH_ASM else None
 
 _nhq, _nhk, _hd, _causal, _sc = SHAPES[0][3:8]
 for _s in SHAPES:
@@ -195,17 +217,20 @@ print(
     f"causal={_causal}, soft_cap={_sc}, page_size={PAGE_SIZE}, "
     f"kv_layout={KV_LAYOUT}, p_scale={P_SCALE_MODE}"
 )
-_HEADER = f"{'batch':>5} | {'PER_TOKEN_HEAD':>27} {'vrf':>4}"
+if BENCH_ASM:
+    _HEADER = f"{'batch':>5} | {'CK (PER_TOKEN_HEAD)':>27} {'vrf':>4} | {'ASM (gfx942 fp8)':>27} {'vrf':>4}"
+else:
+    _HEADER = f"{'batch':>5} | {'PER_TOKEN_HEAD':>27} {'vrf':>4}"
 print(_HEADER)
 print("-" * len(_HEADER))
 
 failures = []
 
 
-def _record_failures(shape, pth):
+def _record_failures(shape, pth, label):
     b, _qo, kv, *_ = shape
     if pth.get("verify") == "fail":
-        failures.append((b, kv, "PER_TOKEN_HEAD", pth.get("error", "")))
+        failures.append((b, kv, label, pth.get("error", "")))
 
 
 _groups = {}
@@ -217,12 +242,16 @@ for _seq, _shapes in _groups.items():
     print(f"seq={_seq}")
     for shape in _shapes:
         if shape == SHAPES[0] and not _warmup_done:
-            pth = _pth0
+            pth_ck = _pth0_ck
+            pth_asm = _pth0_asm
             _warmup_done = True
         else:
-            pth = _run_one(shape)
-        print(_format_row(shape, pth), flush=True)
-        _record_failures(shape, pth)
+            pth_ck = _run_one(shape, asm=False)
+            pth_asm = _run_one(shape, asm=True) if BENCH_ASM else None
+        print(_format_row(shape, pth_ck, pth_asm), flush=True)
+        _record_failures(shape, pth_ck, "CK")
+        if pth_asm is not None:
+            _record_failures(shape, pth_asm, "ASM")
 
 if VERIFY:
     if failures:
