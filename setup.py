@@ -412,14 +412,31 @@ if PREBUILD_KERNELS != 0:
         # throughput on a freshly built container. Compile it AOT into the packaged
         # jit dir so it ships in the wheel and needs zero runtime config. Only hipcc
         # is invoked (no GPU), same as the CK builds above.
+        # NOTE: these .so land in {get_user_jit_dir()}/build/pa_ps_<hash>/lib.so.
+        # MANIFEST.in prunes aiter/jit/build, so that file must re-include
+        # aiter/jit/build/pa_ps_*/lib.so or the wheel ships without them (the
+        # build/ tree is not a package and package_data globs are non-recursive,
+        # so nothing else re-adds nested .so). Runtime hits them only when
+        # AITER_ROOT_DIR is unset (then BUILD_DIR == this same packaged dir).
         if this_dir not in sys.path:
             sys.path.insert(0, this_dir)
         try:
             from csrc.cpp_itfs.pa.pa_ps_prebuild import prebuild_pa_ps
 
-            prebuild_pa_ps()
+            _pa_ps_built = prebuild_pa_ps()
         except Exception as e:  # noqa: BLE001 - never fail the whole wheel on prebuild
-            print(f"[aiter] pa_ps prebuild skipped: {e}")
+            _pa_ps_built = 0
+            print(f"[aiter] pa_ps prebuild raised: {e}")
+        # Make a no-op prebuild loud: the wheel still builds, but ships WITHOUT the
+        # prebuilt pa_ps kernels, so cold-start JIT returns silently (gpt-oss-120b
+        # first-run ~24k vs ~31k tok/s). Don't fail the build (triton-only / no-hipcc
+        # envs legitimately produce nothing), just make it impossible to miss.
+        if not _pa_ps_built:
+            print("=" * 72)
+            print("[aiter] WARNING: pa_ps AOT prebuild produced 0 kernels.")
+            print("[aiter] The wheel will NOT carry prebuilt pa_ps; first-inference")
+            print("[aiter] hipcc JIT (cold-start slowdown) is back. Check hipcc/GPU_ARCHS.")
+            print("=" * 72)
 
         # Retune GEMM shapes on the live GPU after the main build phase.
         if PRETUNE_MODULES:

@@ -19,6 +19,24 @@ Variants are derived from, and md5-verified against, the set gpt-oss-120b
 actually triggers (head_size=64, query_group_size=8, bf16, attention sinks,
 context_partition_num growing with context length). To add another model, append
 a recipe dict below.
+
+Coverage / caveats (a prebuilt variant is hit only on an EXACT signature match):
+  * Scope is gpt-oss-120b only. Other head_size / query_group_size, or
+    use_sinks=False decode paths, are not covered and still JIT on first use.
+  * All three runtime dtypes must be bf16: out_dtype (output), logits_dtype
+    (the temporary per-partition output), and sink_dtype (sinks). A model whose
+    sinks are fp32, say, hashes to a different folder and falls back to JIT.
+  * context_partition_num {1..8} is complete *because* the gluon decode path caps
+    it at 8 (get_recommended_splits); if that cap is raised, widen the recipe.
+  * Zero-config payoff requires AITER_ROOT_DIR to be UNSET at runtime. Unset ->
+    BUILD_DIR == the packaged jit dir, so these .so are found. If AITER_ROOT_DIR
+    is set (e.g. to a persistent volume), BUILD_DIR becomes <root>/build, which
+    has no prebuilt artifacts -> one JIT recompile into that volume. So setting
+    AITER_ROOT_DIR *disables* the wheel prebuild (counterintuitive but expected).
+
+Packaging: these .so are written under {BUILD_DIR}/pa_ps_<hash>/lib.so, i.e.
+aiter/jit/build/..., which MANIFEST.in prunes. MANIFEST.in must re-include
+aiter/jit/build/pa_ps_*/lib.so or the wheel ships without them.
 """
 
 import os
