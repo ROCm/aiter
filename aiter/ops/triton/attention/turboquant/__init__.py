@@ -18,7 +18,7 @@ Phase 1 exports (core quantization infrastructure, no Triton kernels):
 
   Codebook utilities:
     get_codebook
-    pregenerate_all_codebooks
+    pregenerate_codebooks
 
   Rotation/projection utilities:
     get_rotation_matrix
@@ -31,7 +31,7 @@ Phase 1 exports (core quantization infrastructure, no Triton kernels):
     compression_ratio
 """
 
-from .codebook import get_codebook, pregenerate_all_codebooks
+from .codebook import get_codebook, pregenerate_codebooks
 from .rotation import (
     get_rotation_matrix,
     get_qjl_matrix,
@@ -58,7 +58,7 @@ __all__ = [
     "CompressedValues",
     # Codebook
     "get_codebook",
-    "pregenerate_all_codebooks",
+    "pregenerate_codebooks",
     # Rotation
     "get_rotation_matrix",
     "get_qjl_matrix",

@@ -5,7 +5,10 @@
 Lloyd-Max optimal codebook generation for TurboQuant.
 
 After a random orthogonal rotation Π, each coordinate of a unit-norm
-vector follows a Beta(d/2, d/2) distribution (after scaling by √d).
+vector follows the distribution (Lemma 1 of the paper):
+    f(x) = Γ(d/2) / (√π · Γ((d-1)/2)) · (1 - x²)^((d-3)/2)  for x ∈ [-1, 1]
+which is Beta((d-1)/2, (d-1)/2) on [0,1].
+Codebook centroids are stored in [-1, 1] space — no sqrt(d) scaling (matches paper).
 Lloyd-Max iteration finds the MSE-optimal scalar quantizer for this
 distribution, giving us the codebooks used by TurboQuantMSE.
 
@@ -22,25 +25,12 @@ from typing import Optional
 import torch
 import numpy as np
 
-# Directory where pre-generated codebooks are stored
-_CONFIGS_DIR = Path(__file__).parent / "configs"
+# Codebook cache directory — user home cache, always writable.
+_CONFIGS_DIR = Path.home() / ".cache" / "turboquant"
 
 # Supported configurations
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
 SUPPORTED_BITS = (2, 3, 4)
-
-
-def _beta_pdf(x: np.ndarray, alpha: float, beta: float) -> np.ndarray:
-    """Beta distribution PDF (unnormalized for sampling purposes)."""
-    from scipy.special import betaln
-
-    log_norm = betaln(alpha, beta)
-    log_pdf = (
-        (alpha - 1) * np.log(np.clip(x, 1e-300, None))
-        + (beta - 1) * np.log(np.clip(1 - x, 1e-300, None))
-        - log_norm
-    )
-    return np.exp(log_pdf)
 
 
 def _sample_beta_coords(
@@ -66,8 +56,9 @@ def _sample_beta_coords(
     z = rng.standard_normal((n_samples, head_dim)).astype(np.float64)
     norms = np.linalg.norm(z, axis=1, keepdims=True)
     z /= norms
-    # Return the first-coordinate marginal, scaled by sqrt(d) for unit variance
-    return z[:, 0] * math.sqrt(head_dim)
+    # Return the first-coordinate marginal in [-1, 1] — matching the paper's
+    # Beta((d-1)/2, (d-1)/2) distribution directly, no sqrt(d) scaling.
+    return z[:, 0]
 
 
 def _lloyd_max_iteration(
@@ -124,7 +115,7 @@ def generate_lloyd_max_codebook(
     Generate a Lloyd-Max optimal codebook for the given (head_dim, bits).
 
     The codebook contains 2^bits reconstruction centroids optimized for
-    MSE under the Beta(d/2, d/2) coordinate distribution that arises
+    MSE under the Beta((d-1)/2, (d-1)/2) coordinate distribution that arises
     after the random orthogonal rotation Π.
 
     Args:
@@ -152,7 +143,7 @@ def generate_lloyd_max_codebook(
 
 
 def get_codebook_path(head_dim: int, bits: int) -> Path:
-    """Return the path for a pre-generated codebook file."""
+    """Return the codebook file path under _CONFIGS_DIR."""
     return _CONFIGS_DIR / f"codebook_d{head_dim}_b{bits}.pt"
 
 
@@ -165,8 +156,8 @@ def get_codebook(
     """
     Load or generate a Lloyd-Max codebook for (head_dim, bits).
 
-    Loads from a pre-generated .pt file if available; otherwise generates
-    the codebook via Lloyd-Max iteration and saves it to disk.
+    Loads from _CONFIGS_DIR if the file exists; otherwise runs Lloyd-Max
+    and saves to _CONFIGS_DIR (user home cache — always writable).
 
     Args:
         head_dim:         Transformer head dimension.
@@ -183,7 +174,7 @@ def get_codebook(
         codebook = torch.load(path, map_location="cpu", weights_only=True)
     else:
         codebook = generate_lloyd_max_codebook(head_dim, bits)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
         torch.save(codebook, path)
 
     if device is not None:
@@ -192,20 +183,30 @@ def get_codebook(
     return codebook
 
 
-def pregenerate_all_codebooks(verbose: bool = True) -> None:
+def pregenerate_codebooks(
+    head_dims: tuple = SUPPORTED_HEAD_DIMS,
+    bits_list: tuple = SUPPORTED_BITS,
+    verbose: bool = True,
+) -> None:
     """
-    Pre-generate and save all codebooks for standard (head_dim, bits) configs.
+    Pre-generate and save codebooks for the given (head_dim, bits) configs.
 
-    Call this once at repo setup time or in a build step.
-    Generates 9 codebooks: head_dim ∈ {64,128,256} × bits ∈ {2,3,4}.
+    Args:
+        head_dims: Tuple of head dimensions to generate codebooks for.
+                   Defaults to SUPPORTED_HEAD_DIMS = (64, 128, 256).
+        bits_list: Tuple of bit-widths to generate codebooks for.
+                   Defaults to SUPPORTED_BITS = (2, 3, 4).
+        verbose:   Print progress.
     """
     _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
-    for head_dim in SUPPORTED_HEAD_DIMS:
-        for bits in SUPPORTED_BITS:
+    for head_dim in head_dims:
+        for bits in bits_list:
             path = get_codebook_path(head_dim, bits)
             if path.exists():
                 if verbose:
-                    print(f"  [skip] codebook_d{head_dim}_b{bits}.pt already exists")
+                    print(
+                        f"  [skip] codebook_d{head_dim}_b{bits}.pt already exists at {path}"
+                    )
                 continue
             if verbose:
                 print(
@@ -217,9 +218,10 @@ def pregenerate_all_codebooks(verbose: bool = True) -> None:
                 print(
                     f" done  ({cb.shape[0]} levels, range [{cb[0]:.4f}, {cb[-1]:.4f}])"
                 )
+                print(f"         saved to {path}")
 
 
 if __name__ == "__main__":
     print("Generating TurboQuant codebooks...")
-    pregenerate_all_codebooks(verbose=True)
+    pregenerate_codebooks(verbose=True)
     print("All codebooks generated.")

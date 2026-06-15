@@ -25,9 +25,9 @@ TurboQuantProd — Algorithm 2 from the paper.
 
   score(q, compressed):
       MSE score  = q_rot · centroid_lookup(indices)   (where q_rot = Π @ q)
-      QJL correction = res_norm * (q_sketch · signs) / d
-                                  (where q_sketch = S @ q)
-      total = (MSE score + QJL correction) * norm
+      QJL correction = sqrt(π/2)/d * res_norm * (q_sketch · signs)
+                                  (where q_sketch = S @ q, S ~ N(0,1))
+      total = MSE score + QJL correction
 
 ValueQuantizer — simple group-wise quantization for V tensors.
   Values are not dot-product scored, so the rotation trick is not needed.
@@ -165,15 +165,11 @@ class TurboQuantMSE(nn.Module):
         # Normalize to unit sphere, then rotate.
         # Rotation preserves norms, so we rotate unit vectors.
         x_unit = x.float() / norms.unsqueeze(-1).clamp(min=1e-8)
-        x_rot = x_unit @ self.Pi.T  # (..., d) — unit-norm in rotated space
+        # Rotate: coordinates follow Beta((d-1)/2,(d-1)/2) in [-1,1] (paper Lemma 1)
+        x_rot = x_unit @ self.Pi.T  # (..., d)
 
-        # Scale by sqrt(d) to match the codebook distribution.
-        # Codebook was generated for coordinates scaled to N(0,1);
-        # raw rotated coordinates of unit-norm vectors are N(0, 1/d).
-        x_rot_scaled = x_rot * math.sqrt(d)  # (..., d) — now O(1), matches codebook
-
-        # Quantize: for each coordinate find the nearest centroid index
-        dists = (x_rot_scaled.unsqueeze(-1) - self.codebook).abs()  # (..., d, 2^b)
+        # Quantize: find nearest codebook centroid per coordinate (codebook in [-1,1])
+        dists = (x_rot.unsqueeze(-1) - self.codebook).abs()  # (..., d, 2^b)
         indices = dists.argmin(dim=-1).to(torch.uint8)  # (..., d)  values in [0, 2^b)
 
         # Bit-pack indices
@@ -205,11 +201,8 @@ class TurboQuantMSE(nn.Module):
             compressed.mse_indices, compressed.bits, d
         )  # (..., d)  int64
 
-        # Lookup centroids (on the sqrt(d) scale used during compression)
-        x_rot_scaled_hat = self.codebook[indices]  # (..., d)
-
-        # Unscale: divide by sqrt(d) to recover unit-sphere coordinates
-        x_rot_hat = x_rot_scaled_hat / math.sqrt(d)  # (..., d)
+        # Lookup centroids — codebook in [-1,1], matching rotated coordinates
+        x_rot_hat = self.codebook[indices]  # (..., d)
 
         # Rotate back: we stored x_rot = x_unit @ Πᵀ, so x_unit = x_rot @ Π
         x_unit_hat = x_rot_hat @ compressed.Pi  # (..., d) — approximately unit-norm
@@ -238,10 +231,10 @@ class TurboQuantProd(TurboQuantMSE):
     to be unbiased in expectation (Theorem 2 in the paper).
 
     The QJL correction estimates <q, r> via:
-        res_norm * ((S @ q) · sign(S @ r)) / d
-    where S is a Gaussian matrix.  Note the query projection (S @ q) is
-    kept continuous — only the key-side residual is binarized.  This gives
-    a lower-variance estimator than binarizing both sides.
+        sqrt(π/2)/d * res_norm * (S @ q) · sign(S @ r)
+    where S ~ N(0,1).  The query projection (S @ q) is kept continuous —
+    only the key-side residual is binarized, giving lower variance than
+    binarizing both sides.
 
     Usage::
         quantizer = TurboQuantProd(head_dim=128, bits=3, device=device)
@@ -256,7 +249,12 @@ class TurboQuantProd(TurboQuantMSE):
         device: Optional[torch.device] = None,
         seed: int = 1234,
     ) -> None:
-        super().__init__(head_dim, bits, device=device, seed=seed)
+        if bits < 3:
+            raise ValueError(
+                f"TurboQuantProd requires bits >= 3 (MSE uses bits-1, QJL uses 1); got {bits}"
+            )
+        # Stage 1: MSE quantizer at (bits-1) — leaves 1 bit budget for QJL (Algorithm 2)
+        super().__init__(head_dim, bits - 1, device=device, seed=seed)
 
         dev = device or torch.device("cpu")
         S = get_qjl_matrix(head_dim, dev, seed=seed + 1)
@@ -304,6 +302,33 @@ class TurboQuantProd(TurboQuantMSE):
         )
 
     # ------------------------------------------------------------------
+    def decompress(self, compressed: CompressedKeysProd) -> torch.Tensor:  # type: ignore[override]
+        """
+        Reconstruct key vectors including the QJL residual correction.
+
+        Returns a better approximation than the inherited TurboQuantMSE.decompress,
+        which would silently drop the QJL term.
+
+        Formula (Algorithm 2, DeQuant):
+            x̃ = x̃_mse + sqrt(π/2)/d * ||r|| * S^T @ sign(S @ r)
+        """
+        d = self.head_dim
+
+        # Stage 1: MSE reconstruction (uses bits-1 codebook)
+        x_mse = super().decompress(compressed)  # (..., d)
+
+        # Stage 2: QJL residual correction
+        signs = _unpack_signs(compressed.qjl_signs, d)  # (..., d)  bool
+        signs_float = signs.float() * 2 - 1  # {-1, +1}
+
+        # S^T @ sign(S @ r) = sign(S @ r) @ S  (for row vectors)
+        x_qjl = signs_float @ self.S  # (..., d)
+        scale = math.sqrt(math.pi / 2) / d * compressed.res_norms.float()
+        x_qjl = x_qjl * scale.unsqueeze(-1)
+
+        return x_mse + x_qjl
+
+    # ------------------------------------------------------------------
     def inner_product_score(
         self,
         q: torch.Tensor,
@@ -323,20 +348,19 @@ class TurboQuantProd(TurboQuantMSE):
         d = self.head_dim
 
         # --- MSE score ---
-        # <q, k_hat> = k_norm / sqrt(d) * (q @ Πᵀ) · codebook[idx]
-        # because k_hat = (codebook[idx] / sqrt(d)) @ Π * k_norm
+        # <q, k_hat> = k_norm * (q @ Πᵀ) · codebook[idx]
+        # because k_hat = codebook[idx] @ Π * k_norm  (codebook in [-1,1])
         q_rot = q.float() @ self.Pi.T  # (..._q, d)
         k_indices = unpack_indices(
             compressed.mse_indices, compressed.bits, d
         )  # (..._k, d)
-        k_rot_hat = self.codebook[k_indices]  # (..._k, d) — codebook (sqrt(d)) scale
-        # Divide by sqrt(d) to account for the coordinate scaling applied at compress time
-        mse_score = (q_rot.unsqueeze(-2) * k_rot_hat).sum(dim=-1) / math.sqrt(d)
+        k_rot_hat = self.codebook[k_indices]  # (..._k, d) — codebook in [-1,1]
+        mse_score = (q_rot.unsqueeze(-2) * k_rot_hat).sum(dim=-1)
         mse_score = mse_score * compressed.norms.float()
 
         # --- QJL correction for <q, r> ---
-        # Estimator: ||r|| * (S @ q) · sign(S @ r) / d
-        # q_sketch stays continuous (NOT binarized) — lower variance than sign(Sq)·sign(Sr)
+        # Estimator: sqrt(π/2)/d * ||r|| * (S @ q) · sign(S @ r)
+        # (Theorem 2, paper). q_sketch stays continuous — lower variance than sign(Sq)·sign(Sr).
         q_sketch = q.float() @ self.S.T  # (..._q, d)  continuous
 
         k_signs = _unpack_signs(compressed.qjl_signs, d)  # (..._k, d)  bool
@@ -345,7 +369,7 @@ class TurboQuantProd(TurboQuantMSE):
         # (S @ q) · sign(S @ r)
         qjl_dot = (q_sketch.unsqueeze(-2) * k_signs_float).sum(dim=-1)
 
-        correction = compressed.res_norms.float() * qjl_dot / d
+        correction = compressed.res_norms.float() * qjl_dot * math.sqrt(math.pi / 2) / d
 
         return mse_score + correction
 

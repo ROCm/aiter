@@ -156,15 +156,15 @@ class TestRotationMatrices:
         assert not torch.allclose(Pi1, Pi2), "Different seeds produced identical Π"
 
     @pytest.mark.parametrize("head_dim", [64, 128])
-    def test_s_is_not_orthogonal(self, head_dim):
-        """S should be Gaussian, NOT orthogonal (Sᵀ S ≠ I in general)."""
+    def test_s_is_gaussian_n01(self, head_dim):
+        """S must have i.i.d. N(0,1) entries per paper Definition 1."""
         clear_cache()
         S = get_qjl_matrix(head_dim, DEVICE)
-        # For a d×d Gaussian matrix scaled by 1/d, Sᵀ S ≈ I/d * d = I but with variance
-        # The key check is that it is NOT exactly orthogonal
-        # We just verify S exists and has the right shape
         assert S.shape == (head_dim, head_dim), f"S shape wrong: {S.shape}"
         assert S.dtype == torch.float32
+        # For N(0,1): mean ≈ 0, std ≈ 1
+        assert abs(S.mean().item()) < 0.1, f"S mean not ≈ 0: {S.mean().item():.4f}"
+        assert abs(S.std().item() - 1.0) < 0.1, f"S std not ≈ 1: {S.std().item():.4f}"
 
     def test_caching(self):
         """get_rotation_matrix must return the same object on second call."""
@@ -228,6 +228,13 @@ class TestCodebook:
         """Codebook must be float32."""
         cb = get_codebook(128, bits, device=DEVICE)
         assert cb.dtype == torch.float32
+
+    @pytest.mark.parametrize("head_dim,bits", [(64, 2), (128, 3), (128, 4)])
+    def test_codebook_in_unit_range(self, head_dim, bits):
+        """Centroids must lie in [-1, 1] — paper-consistent, no sqrt(d) scaling."""
+        cb = get_codebook(head_dim, bits, device=DEVICE)
+        assert cb.min().item() >= -1.0, f"Centroid below -1: {cb.min().item():.4f}"
+        assert cb.max().item() <= 1.0, f"Centroid above +1: {cb.max().item():.4f}"
 
 
 # ---------------------------------------------------------------------------
@@ -353,37 +360,71 @@ class TestTurboQuantProd:
         bias = (est_scores - true_scores).mean().item()
         assert abs(bias) < 0.02, f"Mean bias too large: {bias:.4f}"
 
-    def test_prod_better_than_mse_for_ip(self):
+    def test_prod_lower_bias_than_mse(self):
         """
-        TurboQuantProd should have lower mean IP error than TurboQuantMSE
-        (especially at low bits where residual correction matters most).
+        TurboQuantProd is an unbiased inner-product estimator; TurboQuantMSE is biased.
+        The correct comparison is BIAS (mean signed error), not absolute error.
+        TurboQuantProd has variance from the QJL term, so its absolute error per
+        instance may be larger — but its signed error averages to zero.
+
+        TurboQuantProd(bits=3): MSE at bits-1=2 internally + 1-bit QJL correction.
+        Compared against TurboQuantMSE at 2 bits (same underlying MSE bits).
         """
         clear_cache()
         torch.manual_seed(0)
-        d, bits = 128, 2
-        n = 512
+        d, n = 128, 1024
 
-        mse = TurboQuantMSE(d, bits, device=DEVICE, seed=5)
-        prod = TurboQuantProd(d, bits, device=DEVICE, seed=5)
+        mse = TurboQuantMSE(d, bits=2, device=DEVICE, seed=5)
+        prod = TurboQuantProd(d, bits=3, device=DEVICE, seed=5)
 
         q = _rand_unit_vecs(1, d, seed=100)
         k = _rand_unit_vecs(n, d, seed=101)
         true_ip = (q @ k.T).squeeze(0)
 
-        # MSE score: compute manually via decompress + dot
         k_hat_mse = mse.decompress(mse.compress(k))
         mse_scores = (q @ k_hat_mse.T).squeeze(0)
+        mse_bias = (mse_scores - true_ip).mean().item()  # systematic underestimate
 
-        # Prod score
         prod_scores = prod.inner_product_score(q, prod.compress(k)).squeeze(0)
+        prod_bias = (prod_scores - true_ip).mean().item()  # should be ≈ 0
 
-        mse_err = (mse_scores - true_ip).abs().mean().item()
-        prod_err = (prod_scores - true_ip).abs().mean().item()
+        assert abs(prod_bias) < abs(
+            mse_bias
+        ), f"Prod bias ({prod_bias:.4f}) not smaller than MSE bias ({mse_bias:.4f})"
+        assert abs(prod_bias) < 0.02, f"Prod estimator too biased: {prod_bias:.4f}"
 
-        # Prod should be at least as good; allow small slack due to randomness
+    def test_bits_less_than_3_raises(self):
+        """TurboQuantProd requires bits >= 3 (MSE at bits-1 + 1 QJL bit)."""
+        with pytest.raises(ValueError, match="bits >= 3"):
+            TurboQuantProd(128, bits=2, device=DEVICE)
+
+    def test_decompress_includes_qjl_correction(self):
+        """TurboQuantProd.decompress must apply QJL correction, not just MSE."""
+        clear_cache()
+        torch.manual_seed(0)
+        d = 128
+        prod = TurboQuantProd(d, bits=3, device=DEVICE)
+        mse_only = TurboQuantMSE(d, bits=2, device=DEVICE)  # same MSE bits
+
+        x = _rand_unit_vecs(64, d, seed=5)
+        compressed_prod = prod.compress(x)
+        x_hat_prod = prod.decompress(compressed_prod)
+
+        # MSE-only reconstruction (using the same b-1 codebook)
+        compressed_mse = mse_only.compress(x)
+        x_hat_mse = mse_only.decompress(compressed_mse)
+
+        # Prod decompress should differ from MSE-only (QJL adds correction)
+        assert not torch.allclose(
+            x_hat_prod, x_hat_mse, atol=1e-4
+        ), "TurboQuantProd.decompress did not apply QJL correction"
+
+        # And prod should have equal or better cosine similarity than MSE-only
+        cos_prod = F.cosine_similarity(x, x_hat_prod, dim=-1).mean().item()
+        cos_mse = F.cosine_similarity(x, x_hat_mse, dim=-1).mean().item()
         assert (
-            prod_err <= mse_err * 1.05
-        ), f"Prod (err={prod_err:.4f}) worse than MSE (err={mse_err:.4f})"
+            cos_prod >= cos_mse - 0.05
+        ), f"Prod decompress worse than MSE: prod={cos_prod:.4f} mse={cos_mse:.4f}"
 
 
 # ---------------------------------------------------------------------------

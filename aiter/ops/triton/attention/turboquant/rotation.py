@@ -13,7 +13,7 @@ Two matrices are used:
              independent, making per-coordinate Lloyd-Max optimal.
 
   S        — Gaussian random projection matrix for QJL.
-             Each entry drawn i.i.d. from N(0, 1/d).
+             Each entry drawn i.i.d. from N(0, 1) (Definition 1 of paper).
              Used by TurboQuantProd: project the quantization residual
              to obtain a 1-bit sketch that corrects inner-product bias.
              Intentionally NOT orthogonalized (paper uses Gaussian S).
@@ -81,12 +81,12 @@ def get_qjl_matrix(
     Return (or create) the cached Gaussian QJL projection matrix S.
 
     S is a (head_dim × head_dim) matrix with entries drawn i.i.d. from
-    N(0, 1/head_dim).  It is intentionally NOT orthogonalized — the paper's
-    QJL construction uses a plain Gaussian S.
+    N(0, 1) — matching Definition 1 of the paper exactly.
+    It is intentionally NOT orthogonalized.
 
     In TurboQuantProd:
       - The residual r = x - x̂  is projected to get sketch = sign(S @ r)
-      - At query time: inner-product correction = ||r|| * <sign(S r), sign(S q)> / d
+      - At query time: inner-product correction = sqrt(π/2)/d * ||r|| * (S @ q) · sign(S @ r)
 
     Args:
         head_dim: Transformer head dimension d.
@@ -101,9 +101,8 @@ def get_qjl_matrix(
     if key not in _S_CACHE:
         gen = torch.Generator()
         gen.manual_seed(seed)
-        # i.i.d. N(0, 1/d) entries — plain Gaussian, not orthogonalized
+        # i.i.d. N(0, 1) entries — plain Gaussian, not orthogonalized (per paper Definition 1)
         S = torch.randn(head_dim, head_dim, generator=gen, dtype=torch.float64)
-        S = S / math.sqrt(head_dim)
         _S_CACHE[key] = S.to(dtype=dtype, device=device)
     return _S_CACHE[key]
 
@@ -112,9 +111,3 @@ def clear_cache() -> None:
     """Clear all cached rotation and QJL matrices (useful for testing)."""
     _PI_CACHE.clear()
     _S_CACHE.clear()
-
-
-# ---------------------------------------------------------------------------
-# math import at module level (used in get_qjl_matrix)
-# ---------------------------------------------------------------------------
-import math  # noqa: E402  (moved here to keep top-of-file imports clean)
