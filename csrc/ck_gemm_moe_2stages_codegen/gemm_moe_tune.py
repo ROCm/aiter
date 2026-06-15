@@ -27,7 +27,7 @@ from aiter.ops.shuffle import (
     shuffle_scale_a16w4,
     shuffle_weight_a16w4,
 )
-from aiter.utility.mp_tuner import mp_tuner
+from aiter.utility.mp_tuner import mp_tuner, GenTaskMeta
 from aiter.int4_utils import (
     rearrange_4bit_elements,
     convert_int8_to_uint32_int4,
@@ -808,6 +808,11 @@ class FmoeTuner(TunerCommon):
 
         score = torch.randn((token, expert), dtype=dtype)
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
+        # Number of distinct experts actually hit by the routing. Only these
+        # experts' weights are loaded from HBM, so bandwidth/MBU should use this
+        # instead of the total `expert` count (which over-estimates for small
+        # token counts). Carried through to calculate() via the result channel.
+        n_active = int(topk_ids.unique().numel())
         if q_type == QuantType.per_1x128:
             a1_qt, a1_scale = aiter.pertoken_quant(
                 input.view(token, -1, 128), quant_dtype=q_dtype_a
@@ -874,6 +879,7 @@ class FmoeTuner(TunerCommon):
             a1_scale,
             w1_scale,
             w2_scale,
+            n_active,
         )
 
     @staticmethod
@@ -910,6 +916,7 @@ class FmoeTuner(TunerCommon):
             a1_scale,
             w1_scale,
             w2_scale,
+            n_active,
         ) = FmoeTuner.generate_data(
             token,
             model_dim,
@@ -954,6 +961,7 @@ class FmoeTuner(TunerCommon):
             w1_qt,
             w2_qt,
             a1_scale,
+            GenTaskMeta(n_active=n_active),
         )
 
     @staticmethod
@@ -1001,6 +1009,7 @@ class FmoeTuner(TunerCommon):
             a1_scale,
             w1_scale,
             w2_scale,
+            n_active,
         ) = FmoeTuner.generate_data(
             token,
             model_dim,
@@ -1093,6 +1102,7 @@ class FmoeTuner(TunerCommon):
                 w2_qt_shffle_flydsl,  # 17
                 w1_scale_flydsl,  # 18
                 w2_scale_flydsl,  # 19
+                GenTaskMeta(n_active=n_active),  # 20
             )
         elif stage == 2:
             ref1 = FmoeTuner.run_torch_moe_stage1(
@@ -1169,6 +1179,7 @@ class FmoeTuner(TunerCommon):
                 w2_qt_shffle_flydsl,  # 17
                 w1_scale_flydsl,  # 18
                 w2_scale_flydsl,  # 19
+                GenTaskMeta(n_active=n_active),  # 20
             )
 
     @staticmethod
@@ -1204,6 +1215,7 @@ class FmoeTuner(TunerCommon):
             a1_scale,
             w1_scale,
             w2_scale,
+            n_active,
         ) = FmoeTuner.generate_data(
             token,
             model_dim,
@@ -1263,6 +1275,7 @@ class FmoeTuner(TunerCommon):
             fc1_smooth_scale,  # 16
             fc2_smooth_scale,  # 17
             a1_scale_t,
+            GenTaskMeta(n_active=n_active),
         )
 
     @staticmethod
@@ -1661,7 +1674,7 @@ class FmoeTuner(TunerCommon):
 
         return (out * topk_weight.view(B, -1, 1)).sum(dim=1).to(dtype)
 
-    def calculate(self, results, bpes=(1, 1, 2)):
+    def calculate(self, results, bpes=(1, 1, 2), n_active=None):
         key, stage, kernelName, block_m, us, err = results
         if len(key) == 13:
             (
@@ -1703,6 +1716,15 @@ class FmoeTuner(TunerCommon):
             raise ValueError(f"Unsupported key length in calculate(): {len(key)}")
         if us == self.INVALID_TIME or us == self.INF_TIME:
             return 0, 0
+        # Only the experts actually hit by the routing are loaded from HBM,
+        # which can be far fewer than the total `expert` count for small token
+        # counts. `n_active` (distinct experts in topk_ids, computed in
+        # generate_data and carried via the result channel) is used for the
+        # weight traffic so bw/MBU is not over-estimated. Fall back to `expert`
+        # when it is unavailable (e.g. failed task or merged-row recompute).
+        if n_active is None:
+            n_active = expert
+        n_active = min(int(expert), max(1, int(n_active)))
         flop = 0
         data_bytes = 0
         stage = ""
@@ -1720,7 +1742,7 @@ class FmoeTuner(TunerCommon):
             data_bytes = (
                 m * k * self.get_bpe(q_dtype_a)
                 + m * n * self.get_bpe(dtype)
-                + k * n * self.get_bpe(q_dtype_w) * expert
+                + k * n * self.get_bpe(q_dtype_w) * n_active
             )
         elif stage == "stage2":
             ## gemm2
@@ -1734,7 +1756,7 @@ class FmoeTuner(TunerCommon):
             data_bytes = (
                 m * k * self.get_bpe(q_dtype_a) * topk
                 + m * n * self.get_bpe(dtype)
-                + k * n * self.get_bpe(q_dtype_w) * expert
+                + k * n * self.get_bpe(q_dtype_w) * n_active
             )
         else:
             if use_g1u1:
@@ -1747,8 +1769,8 @@ class FmoeTuner(TunerCommon):
             )
             data_bytes = (
                 token * model_dim * self.get_bpe(q_dtype_a)
-                + n * model_dim * self.get_bpe(q_dtype_w) * expert
-                + inter_dim * model_dim * self.get_bpe(q_dtype_w) * expert
+                + n * model_dim * self.get_bpe(q_dtype_w) * n_active
+                + inter_dim * model_dim * self.get_bpe(q_dtype_w) * n_active
                 + token * model_dim * self.get_bpe(dtype)
             )  # Rough Estimate
         tflops = round(flop / (us * 1000000), 2)
@@ -2863,9 +2885,26 @@ class FmoeTuner(TunerCommon):
             ) = self._unpack_info_with_stage2(key)
             import re
 
+            # n_active (distinct experts hit by the routing) is the same for all
+            # tasks of this key (deterministic synthetic data), so pick it once
+            # from any task that carried it back via GenTaskMeta.
+            key_n_active = None
+            for _rinfo, _us, _err in rets:
+                if len(_rinfo) > 3 and isinstance(_rinfo[3], GenTaskMeta):
+                    _na = _rinfo[3].get("n_active")
+                    if _na is not None:
+                        key_n_active = int(_na)
+                        break
+            # value written to the `active_expert` output column: distinct experts
+            # actually hit by the routing; fall back to total experts if unknown.
+            active_expert_val = int(key_n_active) if key_n_active is not None else int(expert)
+
             profileDF = []
-            for (stage, kernelName, block_m), us, err in rets:
-                tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))
+            for _rinfo, us, err in rets:
+                stage, kernelName, block_m = _rinfo[0], _rinfo[1], _rinfo[2]
+                tflops, bw = self.calculate(
+                    (key, stage, kernelName, block_m, us, err), n_active=key_n_active
+                )
                 row_ksplit = 0
                 sk_match = re.search(r"_sk(\d+)$", str(kernelName))
                 if sk_match:
@@ -3063,6 +3102,7 @@ class FmoeTuner(TunerCommon):
                         0,
                         -1,
                         -1,
+                        active_expert_val,
                     ]
                 )
                 failedf = pd.DataFrame(ret, columns=self.columns)
@@ -3133,13 +3173,15 @@ class FmoeTuner(TunerCommon):
                         row["block_m"],
                         row["us"],
                         row["err1"],
-                    )
+                    ),
+                    n_active=key_n_active,
                 ),
                 axis=1,
                 result_type="expand",
             )
             profileDF["tflops"] = results[0]
             profileDF["bw"] = results[1]
+            profileDF["active_expert"] = active_expert_val
             profileDF.drop(["tflops1", "tflops2", "bw1", "bw2"], axis=1, inplace=True)
             profileDF["err1"] = profileDF["err1"].apply(lambda x: f"{x:.1%}")
             profileDF["err2"] = profileDF["err2"].apply(lambda x: f"{x:.1%}")
@@ -3218,6 +3260,7 @@ class FmoeTuner(TunerCommon):
                     non_flydsl_df["tflops"] = 0
                     non_flydsl_df["bw"] = 0
                     fb = non_flydsl_df.loc[non_flydsl_df["us"].idxmin()].copy()
+                    fb["active_expert"] = active_expert_val
                     fb["act_type"] = str(fb["act_type"])
                     fb["q_type"] = str(fb["q_type"])
                     fb["dtype"] = str(fb["dtype"])
@@ -3304,6 +3347,7 @@ if __name__ == "__main__":
         "run_1stage",
         "tflops",
         "bw",
+        "active_expert",
     ]
     tuner = FmoeTuner("fmoeTuner", key, resultList, "fmoe tuner")
     args = tuner.parse_args()

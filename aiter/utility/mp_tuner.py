@@ -10,6 +10,22 @@ from aiter import dtypes
 from aiter import logger
 
 
+class GenTaskMeta(dict):
+    """Optional per-task metadata produced by a ``gen_data`` function.
+
+    A ``gen_data`` callable may append a single ``GenTaskMeta`` instance as the
+    *last* element of the data it returns. ``work_group`` detects it and appends
+    it to each task's ``info`` so the metadata flows back to the caller together
+    with ``(info, latency, error_ratio)``.
+
+    This is backward compatible: positional argument selection from the
+    generated data uses explicit indices, so a trailing metadata element is
+    ignored, and only this exact type triggers the propagation.
+    """
+
+    pass
+
+
 def worker(
     gpu_id,
     info,
@@ -147,6 +163,15 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
         if not input_data and gen_data is not None
         else input_data
     )
+    # Optional metadata the gen_data func appended as the last data element.
+    # It is propagated back attached to each task's info (see GenTaskMeta).
+    gen_meta = (
+        data[-1]
+        if isinstance(data, (list, tuple))
+        and len(data) > 0
+        and isinstance(data[-1], GenTaskMeta)
+        else None
+    )
 
     assert ref_func is not None or ref is not None or fast_mode != 0
     # ref=None & ref_func=None & fast_mode=1: fast tune, not compare results, do not postprocess,return all results
@@ -233,6 +258,13 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
 
             # Run worker with explicit GPU ID
             ret = worker(*work_args)
+            if (
+                gen_meta is not None
+                and isinstance(ret, tuple)
+                and len(ret) >= 1
+                and isinstance(ret[0], tuple)
+            ):
+                ret = ((*ret[0], gen_meta), *ret[1:])
             rets.append(ret)
         return rets
 
