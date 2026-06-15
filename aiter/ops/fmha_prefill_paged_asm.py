@@ -51,14 +51,20 @@ def fmha_prefill_paged_asm_launch(
     num_pages = k.shape[0]
     page_size = 16   # kPageSize fixed in constants.py
 
-    # Byte strides in K/V pool (vec_k_col_v layout, fp8 = 1 byte)
+    # V arrives from the test harness in column-major layout [pages, nhead_k, hd, page_size].
+    # The kernel expects row-major V [pages, page_size, nhead_k, hd], so permute it.
+    # Use contiguous() to get a fresh allocation with the correct memory layout.
+    if v.dim() == 4 and v.shape[1] == nhead_k and v.shape[2] == 128 and v.shape[3] == page_size:
+        v = v.permute(0, 3, 1, 2).contiguous()  # [pages, nhead_k, hd, page_size] → [pages, page_size, nhead_k, hd]
+
+    # Byte strides in K/V pool (fp8 = 1 byte)
     # K: [pages, nhead_k, 8, page_size, 16]  → head stride = 8*page_size*16 bytes
     k_head_stride_bytes = (128 // 16) * page_size * 16 * 1   # = 128 * page_size
     # K: page stride = nhead_k * k_head_stride_bytes
     k_page_stride_bytes = nhead_k * k_head_stride_bytes
-    # V: [pages, nhead_k, 128, page_size]    → head stride = 128*page_size bytes
-    v_head_stride_bytes = 128 * page_size * 1
-    v_page_stride_bytes = nhead_k * v_head_stride_bytes
+    # V: [pages, page_size, nhead_k, hd] row-major
+    v_head_stride_bytes = 128 * 1                        # bytes per kv-head within a token row (= hd)
+    v_page_stride_bytes = page_size * nhead_k * 128 * 1  # bytes per page
 
     # Output: [total_q, nhead_q, 128] bf16 = 2 bytes per element
     if out is None:
