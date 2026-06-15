@@ -56,8 +56,9 @@ echo "##################################################################"
 pip uninstall -y triton triton-kernels pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
 
 # Pin triton to a known commit so the build is reproducible.
-# Commit from June 11th, 2026 - Advance version 3.7.0->3.8.0 (#10583)
-TRITON_COMMIT='5838701feb5ce8131137b541460058495b23b154'
+# Commit from June 15th, 2026 - [llvm-build] Fix LLVM build for make dev-install-llvm (#10616)
+# |_ it's another LLVM version bump
+TRITON_COMMIT='0f2b0d6cd86fa75c38764bf9037dab229344bd2f'
 echo "[experiment] Target TRITON_COMMIT=${TRITON_COMMIT}"
 
 # Network in CI is flaky and a full clone of triton routinely times out
