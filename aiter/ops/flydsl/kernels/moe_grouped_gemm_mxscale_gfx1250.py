@@ -263,21 +263,21 @@ def _preshuffled_scale_shape(
 
 
 def _preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
-    """Weight (B) scale shape in the N4K8 layout: (rows//64, (k_dim//32)*64).
+    """Weight (B) scale shape in the n32k4 layout: (rows//32, (k_dim//32)*32).
 
-    Matches ``grouped_moe_gfx1250._grouped_b_scale_preshuffle_e8m0``: a 64-row x
-    256-K super-block (4 N-tiles x 8 e8m0) folds into the column dim, so 64 N-rows
-    collapse to one row and each k_scale column expands x64.
+    Matches ``grouped_moe_gfx1250._grouped_b_scale_preshuffle_e8m0``: a 32-row
+    super-block folds into the column dim (col = remain_k*128 + row32*4 + r), so
+    32 N-rows collapse to one row and each k_scale column expands x32.
     """
     k_scale = int(k_dim) // 32
-    if k_scale % 8 != 0:
+    if k_scale % 4 != 0:
         raise ValueError(
-            f"B-scale k columns (K//32) must be divisible by 8 (K%256==0), "
+            f"B-scale k columns (K//32) must be divisible by 4 (K%128==0), "
             f"got {k_scale}"
         )
-    if int(rows) % 64 != 0:
-        raise ValueError(f"B-scale rows must be divisible by 64, got {rows}")
-    return int(rows) // 64, k_scale * 64
+    if int(rows) % 32 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 32, got {rows}")
+    return int(rows) // 32, k_scale * 32
 
 
 def _check_stage1_args(

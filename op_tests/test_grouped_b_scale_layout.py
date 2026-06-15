@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
-"""Local (gfx942-friendly) correctness gate for the N4K8 weight (B) scale layout.
+"""Local (gfx942-friendly) correctness gate for the n32k4 weight (B) scale layout.
 
-The real grouped GEMM test (``test_flydsl_grouped_gemm_gfx1250.py``) sets every
-weight scale to e8m0 byte 127 (= 1.0), so its numerics are INSENSITIVE to the
-B-scale layout -- any non-crashing layout passes.  This test instead proves the
-layout math with *distinct* per-byte values, in pure torch (no kernel, no GPU):
+The real grouped GEMM test (``test_flydsl_grouped_gemm_gfx1250.py``) varies the
+weight scale only mildly, so its numerics are weakly sensitive to the B-scale
+layout.  This test instead proves the layout math with *distinct* per-byte
+values, in pure torch (no kernel, no GPU):
 
   1. producer ``_grouped_b_scale_preshuffle_e8m0`` == the closed-form ``col`` map
-     (and is a bijection / lossless roundtrip), output shape (E, N//64, k_scale*64).
-  2. the consumer per-lane ds_load_b32 addressing (a8w4 ROW_MAJOR and fp4
-     COL_BAND) reads exactly the 4 e8m0 of the intended (N-row, WMMA-K step).
+     (and is a bijection / lossless roundtrip), output shape (E, N//32, k_scale*32).
+  2. the consumer per-lane ds_load_b32 addressing (a8w4 16x16x128 and fp4
+     32x16x128) reads exactly the 4 e8m0 of the intended (N-row, WMMA-K step).
   3. ``test_bscale_numeric_reconstruction`` (RANDOM init): the strong gate -- it
      models the *full verified WMMA scale contract* (each lane = one i32 = the 4
      e8m0 of a 128-K step, byte r -> K-block r; op_sel = lane-half select, proven
-     by ``test_wmma_scale_sample.py``) for BOTH op_sel states, at the real failing
-     dims (model_dim=inter_dim=3072), and asserts the effective scale the GEMM
-     applies to every (N-row, K-block) equals the logical scale byte-for-byte.
+     by ``test_wmma_scale_sample.py``) for BOTH op_sel states and asserts the
+     effective scale the GEMM applies to every (N-row, K-block) equals the
+     logical scale byte-for-byte.
+
+n32k4 layout: raw (E, N, K//32) e8m0 -> view(E, N//32, 32, K//128, 4).
+permute(0,1,3,2,4) -> (E, N//32, (K//32)*32).  Within a 32-row super-row,
+``col = remain_k*128 + row32*4 + r`` where remain_k = WMMA-K=128 step, row32
+(== lane) is the row in the super-row, and r (0-3) is the K-block in the step.
 
 Run: ``AITER_USE_SYSTEM_TRITON=1 python -m pytest -q op_tests/test_grouped_b_scale_layout.py``
 """
@@ -36,23 +41,22 @@ except Exception as exc:  # pragma: no cover - import guard
     pytest.skip(f"cannot import grouped_moe_gfx1250: {exc}", allow_module_level=True)
 
 
-# Real dims exercised by the grouped MoE test (model_dim=inter_dim=512 default):
-#   stage1: rows = 2*inter, k_dim = K (model_dim)
-#   stage2: rows = K,        k_dim = inter
-# plus a couple of multi-block shapes.  Constraints: N%64==0, (k_dim//32)%8==0.
+# (E, N, k_scale) with k_scale = K//32.  Producer needs N%32==0 and k_scale%4==0;
+# the reconstruction (grouped config tile_n=256 -> warp owns 64 rows = 2 super-
+# rows, tile_k=256 -> scale_k_per_tile=8) additionally needs N%64==0, k_scale%8==0.
 _SHAPES = [
-    (1, 1024, 512),   # stage1, E=1
-    (2, 512, 512),    # stage2, E=2
-    (3, 128, 256),    # smallest legal (N=128 -> 2 super-rows, k_scale=8 -> 1 block)
-    (2, 256, 512),    # 4 super-rows x 2 remain_b blocks
+    (1, 1024, 16),   # stage1-ish: N=1024 (32 super-rows), k_scale=16 (2 k-tiles)
+    (2, 512, 16),    # stage2-ish, E=2
+    (3, 128, 8),     # smallest: N=128 (4 super-rows), k_scale=8 (1 k-tile)
+    (2, 256, 16),    # 8 super-rows x 2 k-tiles
 ]
 
 
 def _ref_col(n, ks):
-    """Closed-form N4K8 (row, col) for raw byte (n, ks)."""
-    super_row, p, lane = n // 64, (n // 16) % 4, n % 16
-    remain_b, q, r = ks // 8, (ks // 4) % 2, ks % 4
-    return super_row, remain_b * 512 + p * 128 + q * 64 + lane * 4 + r
+    """Closed-form n32k4 (super_row, col) for raw byte (n, ks=e8m0 index)."""
+    super_row, row32 = n // 32, n % 32
+    remain_k, r = ks // 4, ks % 4
+    return super_row, remain_k * 128 + row32 * 4 + r
 
 
 @pytest.mark.parametrize("E,N,k_scale", _SHAPES)
@@ -61,11 +65,11 @@ def test_producer_matches_closed_form_and_roundtrips(E, N, k_scale):
     raw = torch.randint(0, 256, (E, N, k_scale), dtype=torch.uint8, generator=g)
     out = _grouped_b_scale_preshuffle_e8m0(raw)
 
-    assert tuple(out.shape) == (E, N // 64, k_scale * 64)
+    assert tuple(out.shape) == (E, N // 32, k_scale * 32)
 
     # Bijection / closed-form check: every (n, ks) lands at the predicted (row,col)
     # with no collisions (full coverage of the output).
-    seen = torch.zeros((E, N // 64, k_scale * 64), dtype=torch.bool)
+    seen = torch.zeros((E, N // 32, k_scale * 32), dtype=torch.bool)
     for e in range(E):
         for n in range(N):
             for ks in range(k_scale):
@@ -85,7 +89,7 @@ def test_prepare_batch_accepts_raw_and_preshuffled(E, N, k_scale):
     pre = _grouped_b_scale_prepare_batch(
         raw, experts=E, rows=N, k_dim=k_dim, device="cpu"
     )
-    assert tuple(pre.shape) == (E, N // 64, k_scale * 64)
+    assert tuple(pre.shape) == (E, N // 32, k_scale * 32)
     # idempotent: feeding the preshuffled tensor back returns it unchanged.
     pre2 = _grouped_b_scale_prepare_batch(
         pre, experts=E, rows=N, k_dim=k_dim, device="cpu"
@@ -99,110 +103,80 @@ def test_prepare_batch_accepts_raw_and_preshuffled(E, N, k_scale):
 
 
 def test_producer_rejects_bad_dims():
-    with pytest.raises(ValueError):
-        _grouped_b_scale_preshuffle_e8m0(torch.zeros((1, 32, 8), dtype=torch.uint8))
-    with pytest.raises(ValueError):  # k_scale=4 not divisible by 8
-        _grouped_b_scale_preshuffle_e8m0(torch.zeros((1, 64, 4), dtype=torch.uint8))
-
-
-# --- consumer per-lane ds_load_b32 addressing (must invert the producer) -----
-# LDS holds one remain_b block as (tile_n//64) rows x 512 bytes:
-#   LDS[super_local][col] = out[expert, super0 + super_local, rb*512 + col]
-# scale_k_per_tile = tile_k//32 = 8  ->  ROW/ block = 512 cols.
-
-def _consumer_dword_a8w4(out, e, super_local, wn, ks, lane16, rb):
-    """a8w4 (16x16, op_sel=0, p=wn): off = wn*128 + ks*64 + lane16*4."""
-    col = rb * 512 + wn * 128 + ks * 64 + lane16 * 4
-    return out[e, super_local, col : col + 4]
-
-
-def _consumer_dword_fp4(out, e, super_local, fpwn, ks, lane_kgrp, lane16, rb):
-    """fp4 (32x16): p = 2*fpwn + lane_kgrp; off = fpwn*256 + ks*64 + lane_kgrp*128."""
-    col = rb * 512 + fpwn * 256 + ks * 64 + lane_kgrp * 128 + lane16 * 4
-    return out[e, super_local, col : col + 4]
+    with pytest.raises(ValueError):  # N=16 not divisible by 32
+        _grouped_b_scale_preshuffle_e8m0(torch.zeros((1, 16, 8), dtype=torch.uint8))
+    with pytest.raises(ValueError):  # k_scale=2 not divisible by 4 (K%128!=0)
+        _grouped_b_scale_preshuffle_e8m0(torch.zeros((1, 64, 2), dtype=torch.uint8))
 
 
 # ---------------------------------------------------------------------------
-# Numerical end-to-end reconstruction (RANDOM init) -- the real correctness gate.
+# Consumer per-lane ds_load_b32 addressing (must invert the producer).
 #
-# The addressing tests above use an arange carrier and only prove producer<->
-# consumer-address identity.  This test instead models the FULL verified WMMA
-# scale contract (proved on gfx1250 by ``test_wmma_scale_sample.py``):
-#
-#   * each lane supplies a full i32 scaleA VGPR = the 4 e8m0 bytes (r=0..3) of
-#     one WMMA-K=128 step, byte r -> K-block r (the sample's 32+8+2+0.5=42.5);
-#   * ``scaleAType`` (op_sel) selects the LANE-HALF that supplies the scale
-#     (op_sel=0 -> lanes 0-15, op_sel=1 -> lanes 16-31) -- NOT a byte-half of the
-#     i32 (the rocdl docstring's "lo/hi 16-bit half" wording is misleading; the
-#     sample's opsel0/opsel1 cases zero the unused half-wave and prove lane-half).
-#
-# We feed RANDOM e8m0 bytes through the producer, then replay the EXACT consumer
-# offsets from ``gemm_mxscale_gfx1250.py`` (transcribed below) plus that op_sel
-# lane-half selection, and rebuild the effective scale the GEMM would apply to
-# every (N-row, K-block).  A correct layout reconstructs the logical scale
-# byte-for-byte; any wrong stride / op_sel mapping shows up as a mismatch.
-#
-# Grouped config (locked): tile_n=256, n_warp=4 -> warp_tile_n=64, WMMA_N=16 ->
-# wmma_n_rep=4 (one warp owns one 64-row super-row, p=wn); tile_k=256 ->
-# scale_k_per_tile=8 (one remain_b block per k-tile) and k_wmma_steps=2 (ks=0,1).
+# Grouped config (locked): tile_n=256, n_warp=4 -> warp_tile_n=64; tile_k=256 ->
+# scale_k_per_tile=8, k_wmma_steps=2.  A 64-row warp owns 2 n32k4 super-rows.
+# LDS per super-row width = scale_k_per_tile*32 = 256 bytes (one k-tile).  The
+# kernel's flat byte offset (gemm_mxscale_gfx1250) is
+#   super_local*256 + (wn//2)*256 + (wn%2)*64 + ks*128 + lane16*4   (op_sel off)
+# which, on the gmem ``pre`` (E, N//32, k_scale*32), maps to super-row
+# (sr_base + wn//2) and column (t*256 + (wn%2)*64 + ks*128 + lane16*4).
 # ---------------------------------------------------------------------------
 _WMMA_N_REP = 4          # warp_tile_n // WMMA_N = 64 // 16
+_FP4_WMMA_N_REP = 2      # warp_tile_n // 32 = 64 // 32
 _SCALE_K_PER_TILE = 8    # tile_k // 32 = 256 // 32
 _K_WMMA_STEPS = 2        # tile_k // 128 = 256 // 128
-_PTILE_BYTES = 128       # p (WMMA N-tile) stride, _B_N4K8_PTILE_BYTES
-_BLOCK_BYTES = 512       # one remain_b block (8 e8m0 = 2 WMMA-K steps)
-_QSTEP_BYTES = 64        # q (2nd WMMA-K step) stride, _B_N4K8_QSTEP_BYTES
-
-
-def _n4k8_kstep_off(ks):  # mirrors gemm_mxscale_gfx1250._n4k8_kstep_off
-    return (ks // 2) * _BLOCK_BYTES + (ks % 2) * _QSTEP_BYTES
+_ROW_BYTES = _SCALE_K_PER_TILE * 32  # LDS per-super-row width (one k-tile) = 256
+_REMAIN_K_BYTES = 128    # one WMMA-K=128 step (= BLOCK_N*R = 32*4)
+_HALF_BYTES = 64         # one 16-row half (= SUBBLOCK_N*R = 16*4)
 
 
 def _reconstruct_b_scale(pre, E, N, k_scale, *, op_sel):
-    """Replay the kernel's per-lane scaleA reads -> effective scale per (n, ks).
+    """Replay the kernel's per-lane scaleB reads -> effective scale per (n, ks).
 
     Returns a (E, N, k_scale) uint8 tensor: the e8m0 byte the WMMA actually
     applies to weight-row ``n`` / K-block ``ks``.  Equals the logical raw scale
     iff the producer layout + consumer read + op_sel mapping are all correct.
+
+    op_sel off (per-tile) and op_sel on (per-pair) enumerate the SAME (super-row,
+    16-row half) pairs, so they reconstruct identically -- running both documents
+    that invariance and guards either driving path.
     """
     recon = torch.full((E, N, k_scale), 255, dtype=torch.uint8)  # 255 = "unwritten"
-    n_super = N // 64
+    n_super = N // 32
     n_ktiles = k_scale // _SCALE_K_PER_TILE
     for e in range(E):
-        for sr in range(n_super):
-            for t in range(n_ktiles):              # k-tile -> gmem col [t*512, +512)
-                for ks in range(_K_WMMA_STEPS):    # WMMA-K step within the k-tile
-                    q_off = _n4k8_kstep_off(ks)
+        for sr_base in range(0, n_super, 2):       # warp base super-row (64 rows)
+            for t in range(n_ktiles):              # k-tile -> col [t*256, +256)
+                for ks in range(_K_WMMA_STEPS):    # WMMA-K=128 step within k-tile
                     kblock0 = t * _SCALE_K_PER_TILE + ks * 4  # 4 consecutive K-blocks
-                    for wn in range(_WMMA_N_REP):  # one 16x16 WMMA per N-tile
-                        if op_sel:
-                            lane_kgrp = wn % 2     # op_sel picks the lane-half...
-                            idx = wn // 2          # ...and b_scale_idx = wn//2
-                            base_lane = lane_kgrp * _PTILE_BYTES + idx * 256
-                        else:
-                            base_lane = wn * _PTILE_BYTES  # per-tile: p = wn
-                        for lane16 in range(16):   # lane -> weight N-row in the tile
-                            col = t * (k_scale * 64 // n_ktiles)  # = t*512
-                            col += lane16 * 4 + base_lane + q_off
-                            n = sr * 64 + wn * 16 + lane16
+                    if op_sel:
+                        units = [
+                            (idx, kgrp)
+                            for idx in range(_WMMA_N_REP // 2)
+                            for kgrp in range(2)
+                        ]
+                    else:
+                        units = [(wn // 2, wn % 2) for wn in range(_WMMA_N_REP)]
+                    for sub_sr, half in units:     # super-row offset, 16-row half
+                        sr = sr_base + sub_sr
+                        if sr >= n_super:
+                            continue
+                        for lane16 in range(16):   # lane -> weight N-row in the half
+                            row32 = half * 16 + lane16
+                            col = t * _ROW_BYTES + ks * _REMAIN_K_BYTES + row32 * 4
+                            n = sr * 32 + row32
                             for r in range(4):     # i32 byte r -> K-block r
                                 recon[e, n, kblock0 + r] = pre[e, sr, col + r]
     return recon
 
 
-# Real shapes from the failing CLI run (model_dim=inter_dim=3072): stage1 has
-# N=2*inter=6144, k_scale=K//32=96 (12 k-tiles); stage2 N=3072, k_scale=96.
-_NUMERIC_SHAPES = _SHAPES + [(1, 6144, 96), (2, 3072, 96)]
-
-
 @pytest.mark.parametrize("op_sel", [False, True], ids=["opsel_off", "opsel_on"])
-@pytest.mark.parametrize("E,N,k_scale", _NUMERIC_SHAPES)
+@pytest.mark.parametrize("E,N,k_scale", _SHAPES)
 def test_bscale_numeric_reconstruction(E, N, k_scale, op_sel):
     """RANDOM e8m0 -> producer -> simulated WMMA scale read == logical scale."""
     g = torch.Generator().manual_seed(20240613 + N * 131 + k_scale * 7 + int(op_sel))
     raw = torch.randint(0, 255, (E, N, k_scale), dtype=torch.uint8, generator=g)
     pre = _grouped_b_scale_preshuffle_e8m0(raw)
-    assert tuple(pre.shape) == (E, N // 64, k_scale * 64)
+    assert tuple(pre.shape) == (E, N // 32, k_scale * 32)
 
     recon = _reconstruct_b_scale(pre, E, N, k_scale, op_sel=op_sel)
     assert (recon != 255).all(), "some (n, ks) never written -> read does not cover the tile"
@@ -215,149 +189,97 @@ def test_bscale_numeric_reconstruction(E, N, k_scale, op_sel):
 
 @pytest.mark.parametrize("E,N,k_scale", _SHAPES)
 def test_consumer_read_a8w4(E, N, k_scale):
+    """a8w4 16x16x128 (op_sel off): lane16 -> row in the 16-row half wn%2."""
     raw = torch.arange(E * N * k_scale, dtype=torch.int64).reshape(E, N, k_scale)
-    # reuse the producer permute on an int64 carrier so we can decode (n, ks).
     out = (
-        raw.reshape(E, N // 64, 4, 16, k_scale // 8, 2, 4)
-        .permute(0, 1, 4, 2, 5, 3, 6)
+        raw.reshape(E, N // 32, 32, k_scale // 4, 4)
+        .permute(0, 1, 3, 2, 4)
         .contiguous()
-        .reshape(E, N // 64, k_scale * 64)
+        .reshape(E, N // 32, k_scale * 32)
     )
 
     def decode(v, e):
         local = int(v) - e * N * k_scale  # carrier is a global arange
         return (local // k_scale, local % k_scale)
 
-    wmma_n_rep = 4  # warp_tile_n//16
+    n_super = N // 32
+    n_ktiles = k_scale // _SCALE_K_PER_TILE
     for e in range(E):
-        for super_local in range(N // 64):
-            for rb in range(k_scale // 8):
-                for wn in range(wmma_n_rep):
-                    for ks in range(2):  # k_wmma_steps (tile_k=256 -> 2)
-                        s = rb * 2 + ks
+        for sr_base in range(0, n_super, 2):
+            for t in range(n_ktiles):
+                for ks in range(_K_WMMA_STEPS):
+                    for wn in range(_WMMA_N_REP):
+                        sr = sr_base + wn // 2
+                        if sr >= n_super:
+                            continue
                         for lane16 in range(16):
-                            got = [
-                                decode(v, e)
-                                for v in _consumer_dword_a8w4(
-                                    out, e, super_local, wn, ks, lane16, rb
-                                )
-                            ]
-                            n = super_local * 64 + wn * 16 + lane16
-                            want = [(n, s * 4 + r) for r in range(4)]
-                            assert got == want, (got, want, e, super_local, wn, ks, lane16)
+                            row32 = (wn % 2) * 16 + lane16
+                            col = t * _ROW_BYTES + ks * _REMAIN_K_BYTES + row32 * 4
+                            got = [decode(v, e) for v in out[e, sr, col : col + 4]]
+                            n = sr * 32 + row32
+                            kblock0 = t * _SCALE_K_PER_TILE + ks * 4
+                            want = [(n, kblock0 + r) for r in range(4)]
+                            assert got == want, (got, want, e, sr, wn, ks, lane16)
 
 
 @pytest.mark.parametrize("E,N,k_scale", _SHAPES)
 def test_consumer_read_fp4(E, N, k_scale):
+    """fp4 32x16x128: one dword per lane covers all 32 rows (lane == row32)."""
     raw = torch.arange(E * N * k_scale, dtype=torch.int64).reshape(E, N, k_scale)
     out = (
-        raw.reshape(E, N // 64, 4, 16, k_scale // 8, 2, 4)
-        .permute(0, 1, 4, 2, 5, 3, 6)
+        raw.reshape(E, N // 32, 32, k_scale // 4, 4)
+        .permute(0, 1, 3, 2, 4)
         .contiguous()
-        .reshape(E, N // 64, k_scale * 64)
-    )
-
-    def decode(v, e):
-        local = int(v) - e * N * k_scale  # carrier is a global arange
-        return (local // k_scale, local % k_scale)
-
-    fp4_wmma_n_rep = 2  # warp_tile_n//32
-    for e in range(E):
-        for super_local in range(N // 64):
-            for rb in range(k_scale // 8):
-                for fpwn in range(fp4_wmma_n_rep):
-                    for ks in range(2):
-                        s = rb * 2 + ks
-                        for lane_kgrp in range(2):
-                            p = 2 * fpwn + lane_kgrp
-                            for lane16 in range(16):
-                                got = [
-                                    decode(v, e)
-                                    for v in _consumer_dword_fp4(
-                                        out, e, super_local, fpwn, ks,
-                                        lane_kgrp, lane16, rb,
-                                    )
-                                ]
-                                n = super_local * 64 + p * 16 + lane16
-                                want = [(n, s * 4 + r) for r in range(4)]
-                                assert got == want, (got, want)
-
-
-@pytest.mark.parametrize("E,N,k_scale", _SHAPES)
-def test_consumer_read_a8w4_opsel(E, N, k_scale):
-    """a8w4 with use_scale_opsel=True reads one dword per N-tile PAIR.
-
-    p = 2*idx + lane_kgrp (op_sel picks the lane-half); off = idx*256 + ks*64 +
-    lane_kgrp*128 -- identical addressing to the fp4 path, just driven by
-    WEIGHT_SCALE_OP_SEL instead of the format.
-    """
-    raw = torch.arange(E * N * k_scale, dtype=torch.int64).reshape(E, N, k_scale)
-    out = (
-        raw.reshape(E, N // 64, 4, 16, k_scale // 8, 2, 4)
-        .permute(0, 1, 4, 2, 5, 3, 6)
-        .contiguous()
-        .reshape(E, N // 64, k_scale * 64)
+        .reshape(E, N // 32, k_scale * 32)
     )
 
     def decode(v, e):
         local = int(v) - e * N * k_scale
         return (local // k_scale, local % k_scale)
 
-    wmma_n_rep = 4
-    n_pairs = wmma_n_rep // 2  # = 2 dwords loaded per step (op_sel halves it)
+    n_super = N // 32
+    n_ktiles = k_scale // _SCALE_K_PER_TILE
     for e in range(E):
-        for super_local in range(N // 64):
-            for rb in range(k_scale // 8):
-                for idx in range(n_pairs):
-                    for ks in range(2):
-                        s = rb * 2 + ks
-                        for lane_kgrp in range(2):
-                            p = 2 * idx + lane_kgrp
+        for sr_base in range(0, n_super, 2):
+            for t in range(n_ktiles):
+                for ks in range(_K_WMMA_STEPS):
+                    for fpwn in range(_FP4_WMMA_N_REP):   # each fp4-tile = 1 super-row
+                        sr = sr_base + fpwn
+                        if sr >= n_super:
+                            continue
+                        for lane_kgrp in range(2):        # full 32-row read
                             for lane16 in range(16):
+                                row32 = lane_kgrp * 16 + lane16
                                 col = (
-                                    rb * 512
-                                    + idx * 256
-                                    + ks * 64
-                                    + lane_kgrp * 128
-                                    + lane16 * 4
+                                    t * _ROW_BYTES
+                                    + ks * _REMAIN_K_BYTES
+                                    + row32 * 4
                                 )
-                                got = [
-                                    decode(v, e)
-                                    for v in out[e, super_local, col : col + 4]
-                                ]
-                                n = super_local * 64 + p * 16 + lane16
-                                want = [(n, s * 4 + r) for r in range(4)]
+                                got = [decode(v, e) for v in out[e, sr, col : col + 4]]
+                                n = sr * 32 + row32
+                                kblock0 = t * _SCALE_K_PER_TILE + ks * 4
+                                want = [(n, kblock0 + r) for r in range(4)]
                                 assert got == want, (got, want)
 
 
 # ---------------------------------------------------------------------------
-# Static guard: steady-state B-scale gmem advance must match the N4K8 layout.
+# Static guard: steady-state B-scale gmem advance must match the n32k4 layout.
 #
 # The multi-buffer pipeline advances the B-scale descriptor by a constant byte
 # stride per k-tile (gemm_mxscale_gfx1250.py ``adv_bs_i32``).  It MUST equal the
-# per-k-tile column delta of the n4k8 descriptor (``make_desc_bs`` n4k8 branch:
-# ``inner_off = k_scale_off*64`` -> stride ``(tile_k//32)*64``), i.e. one full
-# ``remain_b`` super-block of 512 cols per k-tile -- the same 512 the consumer/
-# producer use (``rb*512``).  The original bug used the *interleaved* stride
-# ``(tile_k//32)*b_scale_load_rep`` (=32), so k-tiles >= the prologue depth read
-# the wrong scale columns once the steady-state loop engaged (>=3 k-tiles).  The
-# numeric reconstruction test can't see this (it models explicit per-tile
-# descriptors, not the advancing one).
+# per-k-tile column delta of the n32k4 descriptor (``make_desc_bs``:
+# ``inner_off = k_scale_off*32`` -> stride ``(tile_k//32)*32``), i.e. one k-tile's
+# worth of columns (= scale_k_per_tile*32 = _ROW_BYTES).
 # ---------------------------------------------------------------------------
-def test_n4k8_steady_state_advance_matches_layout():
+def test_n32k4_steady_state_advance_matches_layout():
     SCALE_BLOCK = 32
     tile_k = 256            # grouped config (locked)
-    b_scale_load_rep = 4    # a8w4: wmma_n_rep = warp_tile_n//16 = 64//16; fp4: warp_tile_n//16
-    N4K8_SUPERBLOCK_COLS = 512  # one remain_b block = 8 e8m0 * 64 ; == _B_N4K8_BLOCK_BYTES
+    scale_k_per_tile = tile_k // SCALE_BLOCK  # = 8
 
-    n4k8_advance = tile_k // SCALE_BLOCK * 64
-    interleaved_advance = tile_k // SCALE_BLOCK * b_scale_load_rep
+    adv = tile_k // SCALE_BLOCK * 32          # kernel adv_bs_i32
+    per_ktile_cols = scale_k_per_tile * 32    # make_desc_bs per-k-tile column width
 
-    # advance == n4k8 per-k-tile column delta (one remain_b super-block)
-    assert n4k8_advance == N4K8_SUPERBLOCK_COLS, (n4k8_advance, N4K8_SUPERBLOCK_COLS)
-    # and it is NOT the (wrong) interleaved stride that caused the bug
-    assert n4k8_advance != interleaved_advance, (n4k8_advance, interleaved_advance)
-    assert interleaved_advance == 32  # documents the old (broken) value
+    assert adv == per_ktile_cols == _ROW_BYTES == 256, (adv, per_ktile_cols)
 
 
 if __name__ == "__main__":
