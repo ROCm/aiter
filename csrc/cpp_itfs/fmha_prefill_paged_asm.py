@@ -30,7 +30,8 @@ def compile(func_name: str = None):
         return compile_template_op(
             src_template,
             MD_NAME,
-            ["../utils.h", "../../include"],
+            [f"{AITER_CORE_DIR}/csrc/cpp_itfs/utils.h",
+             f"{AITER_CORE_DIR}/csrc/include"],
             [],
             bin_size=bin_size,
             bin_data=bin_data,
