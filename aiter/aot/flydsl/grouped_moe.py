@@ -62,20 +62,20 @@ def _as_int(value, default: int | None = None) -> int | None:
 
 
 def _scheduler_variants(row, base_job):
-    want_persistent = _as_bool(row.get("grouped_persistent_m"), False)
+    # Production dispatch (grouped_moe_gfx1250._maybe_grouped_gfx1250_a8w4_moe)
+    # hardcodes grouped_persistent_m=False and expert_sched_mode=False; the only
+    # runtime axis is dense vs DeepGEMM contiguous-M (auto-enabled for large token
+    # counts). Mirror exactly that set so AOT never compiles GEMM variants the
+    # runtime cannot launch.
     explicit_contiguous = _as_bool(row.get("grouped_contiguous_m"), False)
-    if explicit_contiguous:
-        modes = [(False, True)]
-    else:
-        modes = [(want_persistent, False), (False, True)]
+    contiguous_modes = [True] if explicit_contiguous else [False, True]
     variants = []
-    for persistent, contiguous in modes:
-        for expert_sched in (False, True):
-            variant = dict(base_job)
-            variant["grouped_persistent_m"] = persistent
-            variant["grouped_contiguous_m"] = contiguous
-            variant["expert_sched_mode"] = expert_sched
-            variants.append(variant)
+    for contiguous in contiguous_modes:
+        variant = dict(base_job)
+        variant["grouped_persistent_m"] = False
+        variant["grouped_contiguous_m"] = contiguous
+        variant["expert_sched_mode"] = False
+        variants.append(variant)
     return variants
 
 
@@ -256,6 +256,26 @@ def compile_one_config(**job):
             stream=0,
             _m_tile_map=contiguous_layout,
         )
+        # Bias-epilogue variant: runtime calls stage1(..., bias=...) when the model
+        # carries per-expert bias (e.g. gpt-oss), which triggers a distinct compiled
+        # kernel (gemm1_bias_* / finalize_act_bias). Precompile it alongside the
+        # bias-free kernel so neither path JITs at first inference.
+        bias1 = torch.empty((job["experts"], 2 * job["inter_dim"]), dtype=dtype)
+        exe1(
+            y1,
+            x1,
+            w1,
+            sx1,
+            sw1,
+            masked_m,
+            job["max_m"],
+            job["inter_dim"],
+            job["model_dim"],
+            job["experts"],
+            stream=0,
+            _m_tile_map=contiguous_layout,
+            bias=bias1,
+        )
         exe2 = compiler2(split_k=job["split_k2"], **common)
         exe2(
             y2,
@@ -270,6 +290,23 @@ def compile_one_config(**job):
             job["experts"],
             stream=0,
             _m_tile_map=contiguous_layout,
+        )
+        # Bias-epilogue variant for stage2 (gemm2_bias_*); see stage1 note above.
+        bias2 = torch.empty((job["experts"], job["model_dim"]), dtype=dtype)
+        exe2(
+            y2,
+            x2,
+            w2,
+            sx2,
+            sw2,
+            masked_m,
+            job["max_m"],
+            job["model_dim"],
+            job["inter_dim"],
+            job["experts"],
+            stream=0,
+            _m_tile_map=contiguous_layout,
+            bias=bias2,
         )
     return {**job, "compile_time": time.time() - t0}
 
