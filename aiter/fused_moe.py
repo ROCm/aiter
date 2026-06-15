@@ -1891,6 +1891,29 @@ def get_2stage_cfgs(
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
+    # mxfp4_moe port rows are logged as "1stage" but drive a fused _mxfp4_moe_run
+    # pipeline (sort+gemm1+gemm2+scatter), NOT fused_moe_1stage. Build that pipeline
+    # from the CSV kernelName HERE, before the run_1stage early-return below --
+    # otherwise the run_1stage path returns pipeline=None and fused_moe falls back to
+    # the M-adaptive synthesis (BM128 nonatomic), silently discarding the tuned
+    # cshuffle/BM64 kernelName the CSV selected.
+    if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
+        try:
+            _bm = _parse_mxfp4_g1_kname(kernelName1)["BM"]
+        except ValueError:
+            _bm = int(block_m) if block_m is not None else BLOCK_SIZE_M
+        return MOEMetadata(
+            stage1=None,
+            stage2=None,
+            block_m=_bm,
+            ksplit=int(ksplit),
+            pipeline=functools.partial(
+                _mxfp4_moe_run,
+                kernelName1=kernelName1,
+                kernelName2=kernelName2,
+            ),
+        )
+
     if run_1stage:
         # never hard code block_m for 1-stage since it can be tuned by kernel itself, and we have different heuristics for different quant types
         # # TODO: enable this approach for other quant types and archs
@@ -1911,25 +1934,6 @@ def get_2stage_cfgs(
             run_1stage,
             flat=cfg_flat,
         )
-    is_mxfp4_1 = _is_mxfp4_kname(kernelName1)
-    is_mxfp4_2 = _is_mxfp4_kname(kernelName2)
-    if is_mxfp4_1 or is_mxfp4_2:
-        try:
-            _bm = _parse_mxfp4_g1_kname(kernelName1)["BM"]
-        except ValueError:
-            _bm = int(block_m) if block_m is not None else BLOCK_SIZE_M
-        return MOEMetadata(
-            stage1=None,
-            stage2=None,
-            block_m=_bm,
-            ksplit=int(ksplit),
-            pipeline=functools.partial(
-                _mxfp4_moe_run,
-                kernelName1=kernelName1,
-                kernelName2=kernelName2,
-            ),
-        )
-
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     is_cktile2 = bool(kernelName2) and kernelName2.startswith("cktile_")
