@@ -290,9 +290,6 @@ def _mhc_fused_split_kernel(
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
 
-    # int64: rm is the row/token index; rm * stride_xm (= hc_mult*dim) overflows
-    # int32 when num_tokens * stride_xm >= 2**31 (e.g. dim=4096,hc=4 -> >=131072
-    # tokens), causing OOB memory access on long-sequence prefill.
     rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     rn = tl.arange(0, N_TOTAL_POW2)
 
@@ -471,9 +468,6 @@ def _mhc_reduce_apply_kernel(
     pid_m = tl.program_id(0)
     pid_c = tl.program_id(1)
 
-    # int64: rm is the row/token index; rm * stride_xm (= hc_mult*dim) overflows
-    # int32 when num_tokens * stride_xm >= 2**31 (e.g. dim=4096,hc=4 -> >=131072
-    # tokens), causing OOB memory access on long-sequence prefill.
     rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     rc = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     rn_pre = tl.arange(0, N_POW2)
@@ -695,9 +689,6 @@ def _mhc_post_kernel(
     """
     pid_m = tl.program_id(0)
 
-    # int64: rm is the row/token index; rm * stride_xm (= hc_mult*dim) overflows
-    # int32 when num_tokens * stride_xm >= 2**31 (e.g. dim=4096,hc=4 -> >=131072
-    # tokens), causing OOB memory access on long-sequence prefill.
     rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     i_n = tl.arange(0, n)
 
@@ -853,9 +844,6 @@ def _mhc_post_pre_split_kernel(
     pid_m = tl.program_id(0)
     pid_c = tl.program_id(1)
 
-    # int64: rm is the row/token index; rm * stride_xm (= hc_mult*dim) overflows
-    # int32 when num_tokens * stride_xm >= 2**31 (e.g. dim=4096,hc=4 -> >=131072
-    # tokens), causing OOB memory access on long-sequence prefill.
     rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     rc = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     rn = tl.arange(0, N_TOTAL_POW2)
@@ -989,7 +977,7 @@ def _mhc_post_pre_reduce_apply_res_block(
     hc_sinkhorn_eps: tl.constexpr,
 ):
     """Compute h_res = rsigma * alpha_res * acc_res + bias_res, optionally run
-    Sinkhorn-Knopp, and store to ``h_res_ptr`` (flattened (M, n2)).
+    Sinkhorn-Knopp, and store to ``h_res_ptr`` (flattened (M, n?)).
 
     Called from the dedicated res-stream CTA in
     ``_mhc_post_pre_reduce_apply_kernel``.
@@ -1152,9 +1140,6 @@ def _mhc_post_pre_reduce_apply_kernel(
         pid_m = pid // NUM_C_BLOCKS
         pid_c = pid % NUM_C_BLOCKS
         rc = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-        # int64: m_offs is the row/token index, passed as rm into
-        # _mhc_apply_pre_mix_tile where rm * stride_xm (= hc_mult*dim) overflows
-        # int32 at >=131072 tokens (dim=4096,hc=4) -> OOB on long prefill.
         m_offs = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
         m_mask = m_offs < M
         acc_sq = tl.load(
