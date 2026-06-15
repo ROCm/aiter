@@ -105,7 +105,6 @@ else:
     from .ops.moe_op import *  # noqa: F403,E402
     from .ops.moe_sorting import *  # noqa: F403,E402
     from .ops.moe_sorting_opus import *  # noqa: F403,E402
-    from .ops.mxfp4_moe import *  # noqa: F403,E402
     from .ops.pa_sparse_prefill_opus import *  # noqa: F403,E402
     from .ops.pos_encoding import *  # noqa: F403,E402
     from .ops.cache import *  # noqa: F403,E402
