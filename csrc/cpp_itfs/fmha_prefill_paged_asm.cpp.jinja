@@ -47,8 +47,8 @@ struct __attribute__((packed)) KernelArgs
     void    *ptr_q_descale; uint64_t _p32;   // 0x200  q_descale_per_token [total_q, nhead_q] fp32
     void    *ptr_k_descale; uint64_t _p33;   // 0x210  k_descale_per_token [pages, page_size, nhead_k] fp32
     void    *ptr_v_descale; uint64_t _p34;   // 0x220  v_descale_per_head  [nhead_k] fp32
-    int32_t  s_descale_q_Bs;  int32_t _p35[3];// 0x230  q_descale batch byte stride
-    int32_t  s_descale_q_Hs;  int32_t _p36[3];// 0x240  q_descale head byte stride (= 4)
+    int32_t  s_descale_q_Bs;  int32_t _p35[3];// 0x230  q_descale batch byte stride (= max_seqlen_q*4)
+    int32_t  s_descale_q_Hs;  int32_t _p36[3];// 0x240  q_descale head byte stride (= total_q*4)
     int32_t  s_kscale_page_stride;  int32_t _p37[3]; // 0x250 k_descale page stride (elements; kernel <<2)
     int32_t  s_kscale_token_stride; int32_t _p38[3]; // 0x260 k_descale token stride (elements; kernel <<2)
     int32_t  s_vscale_Bs;  int32_t _p39[3]; // 0x270  v_descale batch byte stride (0: no batch dim)
@@ -80,7 +80,7 @@ void {{func_name}}(
     int   page_size,            // must be 16
     void* kv_page_indices,      // [num_pages_used] int32
     void* kv_indptr,            // [batch+1] int32
-    void* q_descale_per_token,  // [total_q, nhead_q] fp32
+    void* q_descale_per_token,  // [nhead_q, total_q] fp32  (head-major)
     void* k_descale_per_token,  // [num_pages, page_size, nhead_k] fp32
     void* v_descale_per_head,   // [nhead_k] fp32
     void* p_scale,              // [nhead_q] fp32, nullable
@@ -89,6 +89,7 @@ void {{func_name}}(
     int   k_head_stride_bytes,  // bytes per kv-head in K pool
     int   v_head_stride_bytes,  // bytes per kv-head in V pool
     int   o_head_stride_bytes,  // bytes per q-head in output
+    int   total_q,              // total tokens across all batch entries
     int   sched_groups,         // G = clamp(num_cu / nhead_q, 1, num_tiles)
     void* stream);
 }
@@ -118,6 +119,7 @@ void {{func_name}}(
     int   k_head_stride_bytes,
     int   v_head_stride_bytes,
     int   o_head_stride_bytes,
+    int   total_q,
     int   sched_groups,
     void* stream)
 {
@@ -180,9 +182,11 @@ void {{func_name}}(
     args.ptr_q_descale  = q_descale_per_token;
     args.ptr_k_descale  = k_descale_per_token;
     args.ptr_v_descale  = v_descale_per_head;
-    // Q descale: [total_q, nhead_q] fp32; batch stride = max_seqlen_q * nhead_q * 4
-    args.s_descale_q_Bs = max_seqlen_q * nhead_q * 4;
-    args.s_descale_q_Hs = 4;   // bytes per head (stride between heads for one token)
+    // Q descale: [nhead_q, total_q] fp32 (head-major, transposed by Python caller)
+    // head stride = total_q * 4; within a head, tokens are contiguous (stride 4 per token)
+    // batch stride = max_seqlen_q * 4 (advance within a head's row by one batch entry)
+    args.s_descale_q_Bs = max_seqlen_q * 4;
+    args.s_descale_q_Hs = total_q * 4;   // bytes per head (= total_q elements)
     // K descale strides: [pages, page_size, nhead_k] fp32 — passed as elements, kernel <<2
     args.s_kscale_page_stride  = page_size * nhead_k;
     args.s_kscale_token_stride = nhead_k;

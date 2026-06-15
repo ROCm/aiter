@@ -78,6 +78,10 @@ def fmha_prefill_paged_asm_launch(
     num_cu = props.multi_processor_count
     sched_groups = _sched_groups(num_cu, nhead_q, max_seqlen_q)
 
+    # Kernel expects q_descale in [nhead_q, total_q] layout (head-major).
+    # Incoming q_descale_per_token is [total_q, nhead_q] (token-major) — transpose it.
+    q_descale_hm = q_descale_per_token.t().contiguous()  # [nhead_q, total_q]
+
     _get_impl()(
         *torch_to_c_types(
             out,
@@ -95,7 +99,7 @@ def fmha_prefill_paged_asm_launch(
             page_size,
             kv_page_indices,
             kv_indptr,
-            q_descale_per_token,
+            q_descale_hm,
             k_descale_per_token,
             v_descale_per_head,
             p_scale,
@@ -104,6 +108,7 @@ def fmha_prefill_paged_asm_launch(
             k_head_stride_bytes,
             v_head_stride_bytes,
             o_head_stride_bytes,
+            total_q,
             sched_groups,
             torch.cuda.current_stream(q.device),
         )
