@@ -340,16 +340,6 @@ class opus_gemm_codegen:
             splitk reduce kernel handles the cast / passthrough at
             launch time based on the actual Y dtype.
         """
-        # Sorted flat-array layout (was: {(M,N,K), kernel<CTYPE>} initializer list for std::unordered_map).
-        HEADER = _render("opus_gemm_lookup.h.j2")
-
-        ENTRY_MATCH_CTYPE = """\
-    {{ {{{M}, {N}, {K}}}, &{kernel_name}<CTYPE> }},  \\
-"""
-        ENTRY_FORCE_FP32 = """\
-    {{ {{{M}, {N}, {K}}}, &{kernel_name}<fp32_t> }}, \\
-"""
-
         # Map ctype short name -> CSV outdtype string emitted by the
         # tuner's result_to_df.
         ctype_to_outdtype = {
@@ -357,10 +347,9 @@ class opus_gemm_codegen:
             "fp32_t": "torch.float32",
         }
 
-        def _emit_map(f, macro_name: str, ctype: str):
+        def _emit_map(ctype: str):
             # No body line break between `\` and the first entry; macro continuation requires every line
             # that participates in the definition ...
-            f.write(f"#define {macro_name}(CTYPE) \\\n")
             target_outdtype = ctype_to_outdtype.get(ctype)
             # Collect all (M, N, K, kernel_name, is_splitk) rows for this
             # CTYPE first, so we can sort lex on (M, N, K) before emitting.
@@ -379,24 +368,19 @@ class opus_gemm_codegen:
                 is_splitk = k.kernel_tag in SPLITK_TAGS
                 if not is_splitk and ctype not in k.output_dtypes:
                     continue
-                rows.append((int(mnk[0]), int(mnk[1]), int(mnk[2]), k.name, is_splitk))
+                rows.append({"id": (int(mnk[0]), int(mnk[1]), int(mnk[2])), "kernel_name": k.name, "ctype": "fp32_t" if is_splitk else "CTYPE"})
 
-            rows.sort(key=lambda r: (r[0], r[1], r[2]))
-            n = len(rows)
-            for i, (M, N, K, name, is_splitk) in enumerate(rows):
-                entry = ENTRY_FORCE_FP32 if is_splitk else ENTRY_MATCH_CTYPE
-                line = entry.format(M=M, N=N, K=K, kernel_name=name)
-                if i == n - 1:
-                    # Last entry: drop the trailing `\` so the macro
-                    # ends cleanly. Strip the line's continuation.
-                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
-                f.write(line)
-            f.write("\n")
+            rows.sort(key=lambda r: r["id"])
+            return rows
 
         with open(os.path.join(self.working_path, "opus_gemm_lookup.h"), "w") as f:
-            f.write(HEADER)
-            _emit_map(f, "GENERATE_OPUS_LOOKUP_TABLE_BF16", "bf16_t")
-            _emit_map(f, "GENERATE_OPUS_LOOKUP_TABLE_FP32", "fp32_t")
+            # Sorted flat-array layout (was: {(M,N,K), kernel<CTYPE>} initializer list for std::unordered_map).
+            contents = _render("opus_gemm_lookup.h.j2", macros=[
+                {"name": "GENERATE_OPUS_LOOKUP_TABLE_BF16",
+                 "rows": _emit_map("bf16_t")},
+                {"name": "GENERATE_OPUS_LOOKUP_TABLE_FP32",
+                 "rows": _emit_map("fp32_t")}])
+            f.write(contents)
 
     def gen_a16w16_tune_lookup(self, kernels_dict):
         """Emit opus_gemm_a16w16_tune_lookup.h with int-ID-to-kernel maps for tuning.
@@ -418,37 +402,29 @@ class opus_gemm_codegen:
         Emit two macros side by side, gated on each kid's output_dtypes set.
         """
         # Same flat-array design as gen_lookup_dict, keyed on int kid instead of (M,N,K).
-        HEADER = _render("opus_gemm_a16w16_tune_lookup.h.j2")
-        ENTRY = """\
-    {{ {kid}, &{kernel_name}<CTYPE> }},  \\
-"""
 
-        def _emit_map(f, macro_name, ctype):
-            f.write(f"#define {macro_name}(CTYPE) \\\n")
+        def _emit_map(ctype):
             rows = []
             for kid, k in kernels_dict.items():
                 if not (isinstance(kid, int) and k.kernel_tag in A16W16_TUNE_TAGS):
                     continue
                 if ctype not in k.output_dtypes:
                     continue
-                rows.append((kid, k.name))
-            rows.sort(key=lambda r: r[0])
-            n = len(rows)
-            for i, (kid, name) in enumerate(rows):
-                line = ENTRY.format(kid=kid, kernel_name=name)
-                if i == n - 1:
-                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
-                f.write(line)
-            f.write("\n")
+                rows.append({"id": (kid,), "kernel_name": k.name, "ctype": ctype})
+            rows.sort(key=lambda r: r["id"])
+            return rows
 
         with open(
             os.path.join(self.working_path, "opus_gemm_a16w16_tune_lookup.h"), "w"
         ) as f:
-            f.write(HEADER)
             # Use explicit per-CTYPE macro names; the dispatcher in opus_gemm.cu calls the right one from
             # each opus_a16w16_tune_dispatch<CDat...
-            _emit_map(f, "GENERATE_A16W16_TUNE_LOOKUP_BF16", "bf16_t")
-            _emit_map(f, "GENERATE_A16W16_TUNE_LOOKUP_FP32", "fp32_t")
+            contents = _render("opus_gemm_lookup.h.j2", macros=[
+                {"name": "GENERATE_A16W16_TUNE_LOOKUP_BF16",
+                 "rows": _emit_map("bf16_t")},
+                {"name": "GENERATE_A16W16_TUNE_LOOKUP_FP32",
+                 "rows": _emit_map("fp32_t")}])
+            f.write(contents)
 
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.

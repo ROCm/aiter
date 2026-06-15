@@ -8,3 +8,11 @@
 // output_dtypes doesn't include CTYPE are omitted from that CTYPE's table
 // (splitk kids only live in the fp32 table). See
 // opus_gemm_arch_gfx950.cuh for the dispatch wrapper.
+
+{% for macro in macros -%}
+#define {{macro.name}}(CTYPE) \
+{%- for entry in macro.rows %}
+    { { {{entry.id | join(', ') }} }, &{{entry.kernel_name}}<{{entry.ctype}}> },{{ ' \\' if not loop.last else '' }}
+{%- endfor %}
+
+{% endfor %}

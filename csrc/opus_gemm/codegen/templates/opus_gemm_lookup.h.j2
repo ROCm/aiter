@@ -14,3 +14,11 @@
 //
 // Lookup is std::lower_bound on the lex-ordered (M, N, K) key. See
 // opus_gemm_arch_gfx950.cuh for the dispatch wrapper.
+
+{% for macro in macros -%}
+#define {{macro.name}}(CTYPE) \
+{%- for entry in macro.rows %}
+    { { {{entry.id | join(', ') }} }, &{{entry.kernel_name}}<{{entry.ctype}}> },{{ ' \\' if not loop.last else '' }}
+{%- endfor %}
+
+{% endfor %}
