@@ -359,6 +359,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     SCALE_K_WIDTH_ROPE: gl.constexpr = 4,
     OUTPUT_Q_NOPE_ZEROS_AND_Q_PE: gl.constexpr = False,
     HAVE_K_SCALE: gl.constexpr = False,
+    UPCAST_OPERAND: gl.constexpr = False,
 ):
     # 1-warp (wave32) blocked layouts matching the Triton-generated ttgir.
     L_NOPE: gl.constexpr = gl.BlockedLayout(
@@ -382,6 +383,13 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     d_nope_offs = gl.arange(0, BLOCK_D_nope, layout=L_NOPE).to(gl.int64)
     d_pe_offs = gl.arange(0, BLOCK_D_pe, layout=L_PE).to(gl.int64)
 
+    # When q_out has the same dtype as q_nope/q_pe we can stage the passthrough
+    # q_nope straight from its load buffer (no cast). When it differs we need
+    # separate q_out-dtype staging buffers and an explicit cast on store.
+    Q_OUT_MATCHES: gl.constexpr = (
+        q_out_ptr.dtype.element_ty == q_nope_ptr.dtype.element_ty
+    )
+
     # Shared staging buffers (static allocation; only a subset is used per pid).
     qn_smem = gl.allocate_shared_memory(q_nope_ptr.dtype.element_ty, [BLOCK_D_nope], SH)
     qpe_smem = gl.allocate_shared_memory(q_pe_ptr.dtype.element_ty, [BLOCK_D_pe], SH)
@@ -389,10 +397,21 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     kpe_smem = gl.allocate_shared_memory(k_pe_ptr.dtype.element_ty, [BLOCK_D_pe], SH)
     cos_smem = gl.allocate_shared_memory(cos_ptr.dtype.element_ty, [FREQ_W], SH)
     sin_smem = gl.allocate_shared_memory(sin_ptr.dtype.element_ty, [FREQ_W], SH)
+    if not Q_OUT_MATCHES:
+        # q_out-dtype staging buffers for the cast path.
+        qn_smem_out = gl.allocate_shared_memory(
+            q_out_ptr.dtype.element_ty, [BLOCK_D_nope], SH
+        )
+        qpe_smem_out = gl.allocate_shared_memory(
+            q_out_ptr.dtype.element_ty, [BLOCK_D_pe], SH
+        )
 
     if pid < B * QH:
-        pid_b = pid // QH
-        pid_hq = pid % QH
+        # pid_b = pid // QH
+        # pid_hq = pid % QH
+        # This is a new optimization that prioritized heavy workload WGs first
+        pid_hq = pid // B
+        pid_b = pid % B
 
         # Issue ``pos`` first — it's used immediately by the cos/sin TDM
         # descriptors. pid_slot / k_scale are only consumed later in the
@@ -436,8 +455,12 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         )
         _issue_tdm_load_1d(q_pe_desc, 0, qpe_smem)
 
-        pid_hk = pid_hq // QH_PER_KH
-        is_kv = pid_hq % QH_PER_KH == 0
+        # pid_hk = pid_hq // QH_PER_KH
+        # is_kv = pid_hq % QH_PER_KH == 0
+        # This is a new optimization that prioritized heavy workload WGs first
+        pid_hk = pid_hq
+        is_kv = pid_hk < KH
+
         q_out_base = pid_b * q_out_stride_b + pid_hq * q_out_stride_h
 
         if is_kv:
@@ -464,15 +487,14 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         sin = _freq_from_shared(
             sin_smem, REUSE_FREQS_FRONT_PART, IS_NEOX, BLOCK_D_pe, L_PE, L_FREQ
         )
-        # q_nope is a pure passthrough (no rope, no scale) and the host
-        # asserts q_out.dtype == q_nope.dtype, so the data already in qn_smem
-        # (from the async_load) is bit-identical. Skip the LDS round-trip and
-        # TDM-store directly from qn_smem to q_out.
+        if UPCAST_OPERAND:
+            cos = cos.to(gl.float32)
+            sin = sin.to(gl.float32)
+
         q_pe_in = qpe_smem.load(L_PE)
         q_pe = _rope_pe(
             q_pe_in, cos, sin, d_pe_offs, IS_NEOX, BLOCK_D_pe, BLOCK_D_HALF_pe
         )
-        qpe_smem.store(q_pe.to(q_out_ptr.dtype.element_ty))
 
         q_out_nope_desc = _make_tdm_desc_1d(
             q_out_ptr + q_out_base,
@@ -486,8 +508,20 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             BLOCK_D_pe,
             SH,
         )
-        gl.amd.gfx1250.tdm.async_store(q_out_nope_desc, [0], qn_smem)
-        gl.amd.gfx1250.tdm.async_store(q_out_pe_desc, [0], qpe_smem)
+        if Q_OUT_MATCHES:
+            # Same dtype: qn_smem already holds the bit-identical q_nope from the
+            # async_load, so TDM-store directly (skip the LDS round-trip).
+            qpe_smem.store(q_pe.to(q_out_ptr.dtype.element_ty))
+            gl.amd.gfx1250.tdm.async_store(q_out_nope_desc, [0], qn_smem)
+            gl.amd.gfx1250.tdm.async_store(q_out_pe_desc, [0], qpe_smem)
+        else:
+            # Differing dtype: load q_nope to registers, cast to the q_out dtype
+            # and stage into the q_out-dtype buffers before the TDM-store.
+            q_nope = qn_smem.load(L_NOPE)
+            qn_smem_out.store(q_nope.to(q_out_ptr.dtype.element_ty))
+            qpe_smem_out.store(q_pe.to(q_out_ptr.dtype.element_ty))
+            gl.amd.gfx1250.tdm.async_store(q_out_nope_desc, [0], qn_smem_out)
+            gl.amd.gfx1250.tdm.async_store(q_out_pe_desc, [0], qpe_smem_out)
 
         if is_kv:
             if pid_slot >= 0:

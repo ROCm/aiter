@@ -274,6 +274,13 @@ class OpusDeviceLib:
         fn.argtypes = [_VP, _VP, _I]
         fn(self._ptr(Src), self._ptr(Dst), int(Src.numel()))
 
+    # -- async_load with compile-time immediate offset (i_os) --
+    def run_async_load_ioffset(self, Src, Dst, ios_bytes):
+        fn = self._lib.run_async_load_ioffset
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _I]
+        fn(self._ptr(Src), self._ptr(Dst), int(ios_bytes))
+
     # -- tr_load_f16 --
     def run_tr_load_f16(self, Src, Dst):
         fn = self._lib.run_tr_load_f16
@@ -1267,7 +1274,7 @@ def test_vector_add(mod):
 
 
 # Archs where the opus.hpp gfx12 (Navi 44/48 RDNA4) path is active. The kernel
-# body in test_opus_gmem_gfx1201.cu is gated by __gfx1201__ / __gfx1200__ —
+# body in test_opus_gmem_gfx1201.cu is gated by __gfx1201__ / __gfx1200__ --
 # on other archs the launcher runs an empty kernel, so we skip the correctness
 # check to avoid a misleading failure.
 _OPUS_PARSE_GFX1201_ARCHS = {"gfx1201", "gfx1200"}
@@ -1275,7 +1282,7 @@ _OPUS_PARSE_GFX1201_ARCHS = {"gfx1201", "gfx1200"}
 
 def test_opus_gmem_gfx1201(mod):
     """Verify opus.hpp parses + opus utilities (make_gmem / .load/.store /
-    cast) work on gfx1201. Mirrors the load → cast<float> → store pattern
+    cast) work on gfx1201. Mirrors the load -> cast<float> -> store pattern
     in sample_kernels.cu. Skips on other archs (kernel body is gfx1201-only)."""
     arch = _get_gpu_arch()
     if arch not in _OPUS_PARSE_GFX1201_ARCHS:
@@ -1311,7 +1318,7 @@ def test_opus_gmem_gfx1201(mod):
 
 # WMMA tests for gfx1200/gfx1201 (Navi 44/48, RDNA4). Both archs share the
 # same gfx12 wmma-128b ISA so the kernel bodies in test_wmma_gfx1201.cu are
-# gated by __gfx1201__ / __gfx1200__ — on other archs the launcher runs an
+# gated by __gfx1201__ / __gfx1200__ -- on other archs the launcher runs an
 # empty kernel so we skip the correctness check.
 _WMMA_GFX1201_ARCHS = {"gfx1201", "gfx1200"}
 
@@ -1627,6 +1634,68 @@ def test_async_load(mod):
         return 1
     print(f"  PASS: async_load (n={n}), bit-exact copy")
     return 0
+
+
+# Sentinel that the i_os kernel pre-fills into LDS; must match
+# ASYNC_LOAD_IOS_SENTINEL in test_async_load.cu.
+_ASYNC_LOAD_IOS_SENTINEL = -123456.0
+
+
+def _test_async_load_ioffset_one(mod, ios_bytes):
+    """Validate that a non-zero compile-time i_os shifts BOTH ends of the
+    async copy (source read AND LDS destination write), as documented in
+    opus.hpp gmem::_async_load.
+    """
+    if _skip_if_missing_symbol(
+        mod, "run_async_load_ioffset", f"async_load_ioffset(i_os={ios_bytes})"
+    ):
+        return 0
+
+    BLOCK_SIZE = 256
+    ios_elems = ios_bytes // 4  # float32
+    lds_size = BLOCK_SIZE + ios_elems
+    device = torch.device("cuda")
+
+    torch.manual_seed(99 + ios_bytes)
+    Src = torch.randn(lds_size, device=device, dtype=torch.float32)
+    Dst = torch.full((lds_size,), 7777.0, device=device, dtype=torch.float32)
+
+    mod.run_async_load_ioffset(Src, Dst, ios_bytes)
+
+    ref = Src.clone()
+    ref[:ios_elems] = _ASYNC_LOAD_IOS_SENTINEL
+
+    ok = torch.equal(Dst, ref)
+    if not ok:
+        # Diagnose which end failed for a clearer message.
+        sentinel_ok = torch.equal(
+            Dst[:ios_elems],
+            torch.full((ios_elems,), _ASYNC_LOAD_IOS_SENTINEL, device=device),
+        )
+        data_ok = torch.equal(Dst[ios_elems:], Src[ios_elems:])
+        reason = []
+        if not sentinel_ok:
+            reason.append("LDS dest not shifted (sentinel region clobbered)")
+        if not data_ok:
+            reason.append("source not shifted (data region mismatch)")
+        max_diff = (Dst - ref).abs().max().item()
+        print(
+            f"  FAIL: async_load_ioffset(i_os={ios_bytes}) max_diff={max_diff:.4e}; "
+            f"{'; '.join(reason) or 'unexpected mismatch'}"
+        )
+        return 1
+    print(f"  PASS: async_load_ioffset(i_os={ios_bytes}), both ends shifted")
+    return 0
+
+
+def test_async_load_ioffset(mod):
+    """i_os boundary values: 32 bytes (small) and 4092 bytes (= 1023 floats,
+    the dword-aligned max within the CDNA 12-bit OFFSET range [0,4095], valid
+    on every arch's per-arch static_assert)."""
+    rc = 0
+    rc += _test_async_load_ioffset_one(mod, 32)
+    rc += _test_async_load_ioffset_one(mod, 4092)
+    return rc
 
 
 def test_tr_load_f16(mod):
@@ -2150,7 +2219,7 @@ def test_predicated_copy_2d(mod):
     """Test 2D predicated load_if/store_if with multi-index predicate (i_row, i_col).
 
     Catches bugs where _if methods pass flat index instead of multi-index to predicates.
-    Uses a 2D layout with row/col boundary checking — the predicate receives (i_row, i_col)
+    Uses a 2D layout with row/col boundary checking -- the predicate receives (i_row, i_col)
     and uses them to check bounds, which would fail if given a single flat index.
     """
     if _skip_if_missing_symbol(mod, "run_predicated_copy_2d", "predicated_copy_2d"):
@@ -2639,6 +2708,7 @@ def main():
     failures += test_wmma_gfx1201_tiled_f32_f16(mod)
     failures += test_wmma_gfx1201_tiled_f32_bf16(mod)
     failures += test_async_load(mod)
+    failures += test_async_load_ioffset(mod)
     failures += test_tr_load_f16(mod)
     failures += test_dtype_convert_fp32_bf16(mod)
     failures += test_dtype_convert_fp32_fp16(mod)
