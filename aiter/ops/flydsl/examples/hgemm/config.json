@@ -9,6 +9,7 @@
     "cases[].m": "rows of a / output (a is [m, k])",
     "cases[].n": "rows of b / output cols (b is [n, k]); n % tile_n must be 0",
     "cases[].k": "shared contraction dim; (k / split_k) % tile_k must be 0",
+    "cases[].source": "AITER config CSV the (m, n, k) shape was taken from",
     "cases[].<tiling>": "optional per-case overrides: tile_m, tile_n, tile_k, split_k, block_m_warps, block_n_warps, b_to_lds"
   },
   "op": "hgemm",
@@ -24,41 +25,40 @@
   },
   "cases": [
     {
-      "name": "square_m256_n256_k512_default",
+      "name": "untuned_m64_n256_k5120",
+      "m": 64,
+      "n": 256,
+      "k": 5120,
+      "source": "aiter/configs/bf16_untuned_gemm.csv"
+    },
+    {
+      "name": "untuned_m256_n256_k5120",
       "m": 256,
       "n": 256,
-      "k": 512
+      "k": 5120,
+      "source": "aiter/configs/bf16_untuned_gemm.csv"
     },
     {
-      "name": "square_m1024_n1024_k1024_default",
-      "m": 1024,
-      "n": 1024,
-      "k": 1024
+      "name": "untuned_m512_n256_k5120",
+      "m": 512,
+      "n": 256,
+      "k": 5120,
+      "source": "aiter/configs/bf16_untuned_gemm.csv"
     },
     {
-      "name": "splitk8_tile32_m104_n384_k7168",
-      "m": 104,
-      "n": 384,
-      "k": 7168,
-      "tile_m": 32,
-      "tile_n": 64,
-      "tile_k": 128,
-      "split_k": 8,
-      "block_m_warps": 1,
-      "block_n_warps": 4
+      "name": "dsv3_m128_n3072_k1536",
+      "m": 128,
+      "n": 3072,
+      "k": 1536,
+      "source": "aiter/configs/model_configs/dsv3_bf16_untuned_gemm.csv"
     },
     {
-      "name": "splitk16_tile32_m1_n2112_k7168_warp2x2_blds",
-      "m": 1,
+      "name": "dsv3_m64_n2112_k7168_tn64",
+      "m": 64,
       "n": 2112,
       "k": 7168,
-      "tile_m": 32,
       "tile_n": 64,
-      "tile_k": 64,
-      "split_k": 16,
-      "block_m_warps": 2,
-      "block_n_warps": 2,
-      "b_to_lds": true
+      "source": "aiter/configs/model_configs/dsv3_bf16_untuned_gemm.csv"
     }
   ]
 }

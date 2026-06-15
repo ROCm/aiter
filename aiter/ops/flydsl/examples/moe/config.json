@@ -1,0 +1,57 @@
+{
+  "_schema": {
+    "op": "string identifier of the op (matches the folder name)",
+    "description": "human-readable summary of the math",
+    "dtype": "reference / output dtype shared by all cases: bf16 | f16",
+    "default_params": "params shared by all cases; per-case keys override these",
+    "default_params.activation": "gate activation: silu | gelu",
+    "default_params.a_dtype": "FlyDSL activation quant dtype (fp4 = mxfp4 float4_e2m1fn_x2)",
+    "default_params.b_dtype": "FlyDSL weight quant dtype (fp4 = mxfp4 float4_e2m1fn_x2)",
+    "default_params.quant_type": "quantization scheme used to build kernel inputs (per_1x32, e8m0 block scales)",
+    "default_params.block_m": "MoE sorting block size; also stage1/stage2 tile_m",
+    "default_params.tile_n": "stage1/stage2 GEMM tile along N",
+    "default_params.tile_k": "stage1/stage2 GEMM tile along K",
+    "default_params.mode": "stage2 reduction mode: atomic | reduce",
+    "cases": "list of shape entries; each must define name, tokens, model_dim, inter_dim, experts, topk",
+    "cases[].name": "unique label for the case",
+    "cases[].tokens": "number of input tokens (rows of hidden_states)",
+    "cases[].model_dim": "model/hidden dim D; must be divisible by tile_k",
+    "cases[].inter_dim": "intermediate dim I; 2*I must be divisible by tile_n",
+    "cases[].experts": "number of experts E (>= topk)",
+    "cases[].topk": "experts selected per token",
+    "cases[].source": "AITER config CSV (and model) the row was taken from"
+  },
+  "op": "moe",
+  "description": "fused MoE: route topk experts, gate/up GEMM (w1) + silu-gated activation, down GEMM (w2), weighted combine across topk",
+  "dtype": "bf16",
+  "default_params": {
+    "activation": "silu",
+    "a_dtype": "fp4",
+    "b_dtype": "fp4",
+    "quant_type": "per_1x32",
+    "block_m": 32,
+    "tile_n": 256,
+    "tile_k": 256,
+    "mode": "atomic"
+  },
+  "cases": [
+    {
+      "name": "dsv3_t16_e257_k9",
+      "tokens": 16,
+      "model_dim": 7168,
+      "inter_dim": 256,
+      "experts": 257,
+      "topk": 9,
+      "source": "aiter/configs/model_configs/dsv3_fp4_untuned_fmoe.csv (DeepSeek-V3)"
+    },
+    {
+      "name": "kimik2_t32_e384_k8",
+      "tokens": 32,
+      "model_dim": 7168,
+      "inter_dim": 256,
+      "experts": 384,
+      "topk": 8,
+      "source": "aiter/configs/model_configs/kimik2_fp4_untuned_fmoe.csv (Kimi-K2)"
+    }
+  ]
+}
