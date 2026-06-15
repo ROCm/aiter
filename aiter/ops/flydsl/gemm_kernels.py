@@ -670,27 +670,6 @@ def get_flydsl_splitk_hgemm_kernels(
             )
             if config is None:
                 continue
-            if m is not None and n is not None and k is not None:
-                try:
-                    _validate_hgemm_tiling(
-                        m,
-                        n,
-                        k,
-                        dtype=dtype,
-                        tile_m=config["tile_m"],
-                        tile_n=config["tile_n"],
-                        tile_k=config["tile_k"],
-                        pack_n=1,
-                        split_k=config["split_k"],
-                        stages=config["stages"],
-                        block_m_warps=config["block_m_warps"],
-                        block_n_warps=config["block_n_warps"],
-                        block_k_warps=config["block_k_warps"],
-                        b_to_lds=config["b_to_lds"],
-                        use_ht=config["use_ht"],
-                    )
-                except ValueError:
-                    continue
             config["dtype"] = dtype
             config["out_dtype"] = out_dtype
             config["target_gfx"] = get_gfx()
