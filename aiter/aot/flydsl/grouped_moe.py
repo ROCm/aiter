@@ -12,7 +12,12 @@ import csv
 import sys
 import time
 
-from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
+from aiter.aot.flydsl.common import (
+    collect_aot_jobs,
+    compile_only_env,
+    job_identity,
+    override_env,
+)
 from aiter.jit.core import AITER_CONFIGS
 
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE]
@@ -126,6 +131,7 @@ def parse_csv(csv_path: str):
                 "data_format": (
                     "fp4" if "float4" in row.get("q_dtype_a", "") else "a8w4"
                 ),
+                "gfx": row.get("gfx", ""),
             }
             for job in _scheduler_variants(row, base_job):
                 key = job_identity(job)
@@ -134,6 +140,9 @@ def parse_csv(csv_path: str):
                 seen.add(key)
                 jobs.append(job)
     return jobs
+
+
+GROUPED_MOE_AOT_ARCH_DEFAULT = "gfx1250"
 
 
 def compile_one_config(**job):
@@ -146,6 +155,8 @@ def compile_one_config(**job):
         compile_moe_grouped_gemm2_a8w4_masked,
         compile_moe_grouped_gemm2_mxfp4_masked,
     )
+
+    aot_arch = job.pop("gfx", "") or GROUPED_MOE_AOT_ARCH_DEFAULT
 
     t0 = time.time()
     dev = torch.device("cpu")
@@ -188,7 +199,9 @@ def compile_one_config(**job):
     else:
         act_lead = job["experts"]
         rows = job["max_m"]
-    with compile_only_env(), FakeTensorMode():
+    with compile_only_env(), override_env(
+        "FLYDSL_GPU_ARCH", aot_arch
+    ), FakeTensorMode():
         masked_m = torch.full(
             (job["experts"],), job["max_m"], dtype=torch.int32, device=dev
         )
@@ -308,7 +321,7 @@ def compile_one_config(**job):
             _m_tile_map=contiguous_layout,
             bias=bias2,
         )
-    return {**job, "compile_time": time.time() - t0}
+    return {**job, "compile_time": time.time() - t0, "compile_arch": aot_arch}
 
 
 def main(argv=None):
