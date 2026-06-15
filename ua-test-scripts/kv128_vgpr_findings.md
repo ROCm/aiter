@@ -218,18 +218,31 @@ Probe with: `XCFLAGS="-DUA_PREFILL_D128_BLOCKSIZE=128 -DUA_FA4_SHARED_SPCOMPUTE=
 # Softmax-phase latency investigation (canonical fp8 prefill, b1 sq=sk=75600 hq=hk=5 d128 non-causal)
 
 Current production config (committed): kv128 tile + cooperative K/V load + single-sp +
-wide 32x32x64 MMA + packed shift + packed alu1 rescale. Standalone kernel-only median
-**1782 TF/s** (== ~1774 TF/s on the contiguous prod path; the python paged path is
-~1483 TF/s — paging addressing overhead, separate axis). The wide-MMA fp8 accuracy
-regression flagged below is **FIXED** (CK f947db93f "fix wide-MMA FP8 P relayout":
-the cvt-only P relayout was missing the QK-C->PV-A transpose); full regression matrix
-+ standalone check now PASS, and the python harness reports CK-vs-ref PASS.
+wide 32x32x64 MMA + conditional-rescale, **scalar softmax** (packs reverted). Standalone
+kernel-only median **~1877 TF/s on GPU2** (~1782 on the slower-clocked GPU0). The
+wide-MMA fp8 accuracy regression flagged below is **FIXED** (CK f947db93f "fix wide-MMA
+FP8 P relayout": the cvt-only P relayout was missing the QK-C->PV-A transpose); full
+regression matrix + standalone check now PASS, and the python harness reports
+CK-vs-ref PASS.
 
-## What landed (committed, CK 29e0f75e1)
+## What was tried and REVERTED (CK a49a273a7) -- packs are a regression, not a win
 - **Packed score shift** (`UA_FA4_PACKED_SHIFT`): 64 scalar `v_fma_f32` -> 32
-  `v_pk_fma_f32` (addend `-scale_s*max` is per-thread uniform). +4.5%, bit-identical.
+  `v_pk_fma_f32` (addend `-scale_s*max` is per-thread uniform), bit-identical.
 - **Packed alu1 o_acc rescale** (`UA_FA4_PACKED_ALU1_RESCALE`): 6 `v_mul_f32` ->
-  3 `v_pk_mul_f32`. +4%, bit-identical. Net **+8%** over the prior 1649 baseline.
+  3 `v_pk_mul_f32`, bit-identical.
+- **fmha_alu0 rowmax/shift split** (`UA_FA4_SPLIT_ROWMAX`): hoist rowmax ahead of PV.
+
+**Verdict: net ~3% REGRESSION**, reverted to default OFF. Same-session, same-harness,
+GPU2, 3-run median: scalar softmax **~1877 TF/s** vs packed shift+alu1 **~1825 TF/s**.
+The softmax shift/rescale are hidden under the ping-pong overlap (see phase table
+below), so collapsing their FMAs/muls does not shorten the critical path -- it only
+perturbs the scheduler and loses.
+
+**Measurement caveat that bit us:** the "+8%" that originally motivated the packs was
+a confounded **GPU0** reading. On this shared 8-GPU MI355 box GPU0 sustains a lower
+boost clock than GPU2; the *same kernel* reads ~1782 on GPU0 vs ~1827-1877 on GPU2.
+Always A/B on the same GPU (GPU2, the check.sh default) and treat cross-GPU /
+cross-session absolute TF/s as non-comparable.
 
 ## Softmax COMPUTE is already hidden — it is not the wall-time gate at this shape
 Per-warp-group ATT phase breakdown (busy+stall, sq=8192 trace, repeated per tile):
