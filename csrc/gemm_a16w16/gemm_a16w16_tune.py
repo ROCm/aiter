@@ -279,6 +279,8 @@ def run_flydsl_gemm_bf16(
     if config is None:
         raise ValueError("flydsl tuning requires a kernel config")
     stages = config.get("stages", config.get("stage", 2))
+    kernel_name = config.get("kernel_name", config.get("kernelName", ""))
+    use_ht = config.get("use_ht", False) or "_use_htTrue" in kernel_name
     fused_bias = None
     if (
         bias is not None
@@ -309,7 +311,7 @@ def run_flydsl_gemm_bf16(
         b_preshuffle=config.get("b_preshuffle", False),
         auto_shuffle_b=False,
         c_to_lds=config.get("c_to_lds", False),
-        use_ht=config.get("use_ht", False),
+        use_ht=use_ht,
     )
     if bias is not None and fused_bias is None:
         out = out.to(bias.dtype) + bias
@@ -723,6 +725,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
         min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
         tasks = []
         for solidx, kernel_name, config in flydsl_catalog:
+            config = dict(config)
+            config["use_ht"] = config.get("use_ht", False) or "_use_htTrue" in kernel_name
+            config["kernel_name"] = kernel_name
             if config.get("b_preshuffle", False) != is_shuffle:
                 continue
             if config["tile_m"] > max(M, min_tile_m):
