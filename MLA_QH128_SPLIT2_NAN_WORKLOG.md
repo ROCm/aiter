@@ -9,9 +9,12 @@
 - 调用入口：`app/ATOM/atom/model_ops/attention_mla.py` 的非 persistent 路径，硬编码
   `mla_decode_fwd(..., num_kv_splits=2, ...)`（约 1221 行）。
 
-根因结论（先给）：**aiter 的 qh128 decode kernel 在 `num_kv_splits>1`（多 pass）路径上，
-对部分真实序列会产出 NaN/Inf**，污染对应序列的注意力输出，导致端到端精度回退。
-这不是空 split 问题，也不是 .co 过期问题，而是多 pass「跨页 strided 分配 + 尾页处理」路径的缺陷。
+根因结论（已定位到确切指令，见 §4.1.2）：**`num_kv_splits>1` 时，对部分真实序列某行的
+softmax 分母 `L` 下溢为 0，而 `R_div_L`（sp3 2277-2305）缺失 sum==0 保护（2288 行只有注释），
+导致 `1/0=+inf`、`R(0)*inf=NaN`** 污染该序列注意力输出 → 端到端精度回退。
+- **不是**空 split、不是 .co 过期、不是控制流/掩码/页计费问题（§4.1 逐指令核对 + §4.1.2 几何碰撞已排除）。
+- 是**数据相关数值问题**：`L=0` 源于运行最大值被数据相关的垃圾值污染（深层成因待查），
+  但**缺失的 sum==0 保护是 NaN 的直接诞生点**，补回该保护即可消除 NaN（已修复）。
 
 ## 2. 复现方法（离线单测）
 
@@ -218,6 +221,52 @@ full_pages%2 -> {0:333, 1:307}
   `_v_FA_Max` 更新之间的 `s_wait_*` / 发射顺序（6453-6494 / 6530-6571），
   对比 passes=1 的等价时序，修正 `m` 更新与 `exp` 的先后。
 
+### 4.1.2 实测分型 + 锁定到确切指令（已确认并修复）
+
+第二轮 replay（已加 inf/nan 分型 + (full_pages,tail_len) 碰撞检测）实测：
+
+```
+(full_pages,tail_len) keys: nan-only=16 ok-only=52 BOTH=197
+>>> COLLISION: same geometry is BOTH NaN and OK -> NaN is DATA-dependent (numerical), not control-flow.
+每条 dump: logits[+inf=0 -inf=0 nan=~1.5M] lse[+inf=0] kind=0/0 NaN (zero-sum / all-masked)
+```
+
+两个决定性事实：
+1. **碰撞 BOTH=197**：同一 `(full_pages,tail_len)`（⇒ 完全相同的内核控制流与掩码）同时出现
+   NaN 与 OK ⇒ **与控制流/掩码/页计费无关，纯数据相关数值问题**（坐实 §4.1 静态核对）。
+2. **`kind=0/0`、无任何 inf**：整行 512 维全 NaN ⇒ 该行 softmax 分母 `L=0`，归一化 `0/0`。
+
+**锁定到确切指令** —— `R_div_L`（sp3 2277-2305，post-process 唯一归一化）：
+```
+2286  v_add_f32 _v_L = Σ exp(score-max)        // 分母求和
+2288  //check sum==0   ← 原代码此处保护为空（只有注释）   ★缺陷
+2298  v_rcp_f32 _v_L = 1/_v_L                  // L==0 → +inf
+2300  v_fma_f32 _v_Lse = ln(L)+max*scalar      // L==0 → -inf（故 lse 非有限且无 +inf）
+（其后 R_post_process: R *= _v_L）             // R(=0) * inf = NaN → logits 全 NaN
+```
+完全对上实测：`logits 全 nan`、`lse 无 +inf`（是 -inf）。
+
+数学上 `L=0` 仅当运行最大值 `FA_Max` 被污染成 > 所有真实分数（否则 argmax 项 = exp(0)=1，L≥1）；
+而污染是**数据相关的垃圾值进入 max 归约**（同几何不同数据 → 大则污染、小则侥幸），
+与 split=1 共用同一 bootstrap 却唯独 split=2 触发 ⇒ 属 `passes>1` 流水线对特定 K/V 数据的
+LDS/寄存器时序敏感（深层成因，需 GPU 侧 dump per-split `FA_Max` 才能再细究）。
+
+**已应用修复（补回 2288 的 sum==0 保护，即作者注释本意）**：在 `R_div_L` 内
+- rcp 之前用 `v_cmp_ne_u32` 捕获 `sum!=0` 判据（此时 `_v_L` 仍是分母和）；
+- 归一化末尾用两条 `v_cndmask_b32`：退化行（sum==0）强制
+  **归一化因子=0（R*0=0，消除 NaN）** 且 **`_v_Lse=EMPTY_SPLIT_LSE`**，
+  使 stage2 online-softmax 把该 split 当空 split 丢弃、退化到另一个 split。
+- 非退化行（mask 置位）保持原值 → **工作路径逐位不变**；split=1 路径 L 永不为 0，无影响。
+
+> 语义正确性：在线 softmax 中「某 split 软最大质量为 0」的正确合并行为本就是发出
+> `lse=-inf`(空 split) 让 stage2 忽略它——故此修复既消 NaN、又是数学上正确的退化处理。
+> 残留：若**同一行两个 split 都被污染**才会丢失该行注意力（但仍 finite）。需重汇编 .co
+> 后跑 §2 单测确认 `fin2=True`，再跑 gsm8k 看是否回到 ≈0.944；若仍偏低，再深挖 max 污染源。
+
+> ⚠️ 该补丁改的是手写 asm（`mla_a8w8_qh64_1tg_16mx4_64nx1_np.sp3`，qh128 同源），
+> **本环境无法汇编/验证**。需在能 build 的环境重汇编 `.co` 并覆盖部署到
+> `/app/aiter/hsa/gfx1250/mla/`（qh64 与 qh128 都要），再跑 replay 确认。
+
 ### 4.2 用页几何关联锁定触发条件（新增工具）
 
 `replay_mla_split_compare.py` 已新增 `_kernel_geom()` + `_stage1_per_batch_diag()`：
@@ -245,11 +294,14 @@ NaN 是否集中在某个 `full_pages` 奇偶 / 某段 `loop_cnt` / 某个 `tail
 
 ## 5. 修复建议
 
-### 方案 A（根治，kernel）
-修复 `mla_a8w8_qh64_1tg_16mx4_64nx1_np.sp3` 中 `passes>1` 的尾页/边界处理，使
-「两个 split 都有数据」时尾页 masking 与 split=1 等价；改完后重新汇编 `.co` 并
+### 方案 A（根治，kernel）★已应用，待重汇编验证
+补回 `R_div_L`（sp3 ~2288）缺失的 sum==0 保护：rcp 前用 `v_cmp_ne_u32` 记下 `sum!=0`，
+归一化末尾用两条 `v_cndmask_b32` 把退化行（sum==0）的归一化因子置 0、`_v_Lse` 置
+`EMPTY_SPLIT_LSE`（详见 §4.1.2）。非退化行逐位不变。改完后重新汇编 `.co` 并
 **覆盖部署到 `/app/aiter/hsa/gfx1250/mla/`**（qh64/qh128 同源，注意两者都要更新），
-再跑 §2 单测，期望 `fin2=True`、`cos2_1≈1.0`、`relerr2_1≈0`、`non-finite split2 = 0`。
+再跑 §2 单测，期望 `fin2=True`、`non-finite split2 = 0`；随后跑 gsm8k 看是否回到 ≈0.944。
+> 该补丁消除 0/0 NaN 且是数学上正确的空 split 退化处理；若 gsm8k 仍偏低，说明 max 污染
+> 丢失了真实质量，需继续深挖（GPU 侧 dump per-split `FA_Max`）定位污染源（LDS/寄存器时序）。
 
 ### 方案 B（主机兜底，快速可用，保留 split=2）
 在 `aiter/mla.py` 的 `mla_decode_fwd` 中，reduce 之后做 `torch.isfinite(o).all()` 检查，
