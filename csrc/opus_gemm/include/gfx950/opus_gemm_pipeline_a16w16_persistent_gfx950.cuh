@@ -266,19 +266,19 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
         // shifter and B/A prefetch are byte-identical). The outer-iter
         // vmcnt(0)+s_barrier at the loop tail resets the wave phase,
         // so every iter re-establishes the shifter.
-        async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, 0), opus::number<T::CACHECTL_B>{});
-        async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, 0), opus::number<T::CACHECTL_A>{});
-        async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0), opus::number<T::CACHECTL_B>{});
-        async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, 0), opus::number<T::CACHECTL_A>{});
+        async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, 0), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
+        async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, 0), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
+        async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
+        async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, 0), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
 
         if (wave_id_m == 1) __builtin_amdgcn_s_barrier();
 
         s_waitcnt_vmcnt(number<T::a_buffer_load_insts + T::b_buffer_load_insts>{});
         __builtin_amdgcn_s_barrier();
 
-        async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, 1), opus::number<T::CACHECTL_B>{});
-        async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, 1), opus::number<T::CACHECTL_A>{});
-        async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, 1), opus::number<T::CACHECTL_B>{});
+        async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, 1), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
+        async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, 1), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
+        async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, 1), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
 
         s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
         __builtin_amdgcn_s_barrier();
@@ -299,7 +299,7 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
         for(int tile = 0; tile < loops - 2; tile += 2) {
             // First tile
             v_a = load<T::VEC_A>(s_a[tic][0], u_ra);
-            async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 1), opus::number<T::CACHECTL_A>{});
+            async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 1), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
             s_waitcnt_lgkmcnt(number<T::a_ds_read_insts>{});
             __builtin_amdgcn_s_barrier();
 
@@ -311,7 +311,7 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
             __builtin_amdgcn_sched_barrier(0);
 
             v_b[1] = load<T::VEC_B>(s_b[tic][1], u_rb);
-            async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, tile + 2), opus::number<T::CACHECTL_B>{});
+            async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, tile + 2), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
             __builtin_amdgcn_s_barrier();
 
             s_waitcnt_lgkmcnt(0_I);
@@ -321,7 +321,7 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
             __builtin_amdgcn_s_barrier();
 
             v_a = load<T::VEC_A>(s_a[tic][1], u_ra);
-            async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, tile + 2), opus::number<T::CACHECTL_A>{});
+            async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, tile + 2), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
             __builtin_amdgcn_s_barrier();
 
             s_waitcnt_lgkmcnt(0_I);
@@ -352,7 +352,7 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
             // mmas -- silent intermittent corruption only the tighter
             // tile-3 vmcnt budget exposes (tiles 0/1/2 have larger
             // budgets that absorb the race without manifesting).
-            async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, tile + 2), opus::number<T::CACHECTL_B>{});
+            async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, tile + 2), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
             s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
             __builtin_amdgcn_s_barrier();
             v_b[0] = load<T::VEC_B>(s_b[toc][0], u_rb);
@@ -364,7 +364,7 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
 
             // Second tile
             v_a = load<T::VEC_A>(s_a[toc][0], u_ra);
-            async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, tile + 2), opus::number<T::CACHECTL_A>{});
+            async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, tile + 2), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
             s_waitcnt_lgkmcnt(number<T::a_ds_read_insts>{});
             __builtin_amdgcn_s_barrier();
 
@@ -376,7 +376,7 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
             __builtin_amdgcn_sched_barrier(0);
 
             v_b[1] = load<T::VEC_B>(s_b[toc][1], u_rb);
-            async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, tile + 3), opus::number<T::CACHECTL_B>{});
+            async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, tile + 3), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
             __builtin_amdgcn_s_barrier();
 
             s_waitcnt_lgkmcnt(0_I);
@@ -386,7 +386,7 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
             __builtin_amdgcn_s_barrier();
 
             v_a = load<T::VEC_A>(s_a[toc][1], u_ra);
-            async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, tile + 3), opus::number<T::CACHECTL_A>{});
+            async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, tile + 3), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
             __builtin_amdgcn_s_barrier();
 
             s_waitcnt_lgkmcnt(0_I);
@@ -403,7 +403,7 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
             // mirror issue: the next loop iter's prologue rewrites
             // s_b[tic][0], so reading it before the vmcnt-bound barrier
             // can return stale data on tile-3 (tighter vmcnt budget).
-            async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 3), opus::number<T::CACHECTL_B>{});
+            async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 3), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
             s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
             __builtin_amdgcn_s_barrier();
             v_b[0] = load<T::VEC_B>(s_b[tic][0], u_rb);
@@ -423,7 +423,7 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
             int tile = loops - 2;
 
             v_a = load<T::VEC_A>(s_a[tic][0], u_ra);
-            async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 1), opus::number<T::CACHECTL_A>{});
+            async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 1), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
             __builtin_amdgcn_s_barrier();
             s_waitcnt_lgkmcnt(0_I);
 
