@@ -711,8 +711,6 @@ def get_flydsl_splitk_hgemm_kernels(
                 config["c_to_lds"],
                 use_ht=config["use_ht"],
             )
-            if "_use_htTrue" in name:
-                config["use_ht"] = True
             kernels[name] = config
     # NOTE: Keep the old small_m registry generation here for now, but leave it
     # disabled so shape-aware FlyDSL catalog/tuning only enumerates generic HGEMM.

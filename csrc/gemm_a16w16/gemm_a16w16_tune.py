@@ -271,16 +271,12 @@ def run_skinny_gemm_a16w16(input, weight, bias=None, otype=dtypes.bf16):
     return native_skinny_gemm(input, weight, 2, bias=bias, otype=otype)
 
 
-def run_flydsl_gemm_bf16(
-    input, weight, out, bias=None, otype=dtypes.bf16, config=None, kernel_name=""
-):
+def run_flydsl_gemm_bf16(input, weight, out, bias=None, otype=dtypes.bf16, config=None):
     if flydsl_hgemm is None:
         raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
     if config is None:
         raise ValueError("flydsl tuning requires a kernel config")
     stages = config.get("stages", config.get("stage", 2))
-    kernel_name = kernel_name or config.get("kernel_name", config.get("kernelName", ""))
-    use_ht = config.get("use_ht", False) or "_use_htTrue" in kernel_name
     fused_bias = None
     if (
         bias is not None
@@ -311,7 +307,7 @@ def run_flydsl_gemm_bf16(
         b_preshuffle=config.get("b_preshuffle", False),
         auto_shuffle_b=False,
         c_to_lds=config.get("c_to_lds", False),
-        use_ht=use_ht,
+        use_ht=config.get("use_ht", False),
     )
     if bias is not None and fused_bias is None:
         out = out.to(bias.dtype) + bias
@@ -725,9 +721,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
         min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
         tasks = []
         for solidx, kernel_name, config in flydsl_catalog:
-            config = dict(config)
-            config["use_ht"] = config.get("use_ht", False) or "_use_htTrue" in kernel_name
-            config["kernel_name"] = kernel_name
             if config.get("b_preshuffle", False) != is_shuffle:
                 continue
             if config["tile_m"] > max(M, min_tile_m):
@@ -743,7 +736,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 counters = ((M + config["tile_m"] - 1) // config["tile_m"]) * (
                     N // config["tile_n"]
                 )
-                if counters > 128:
+                if counters > 256:
                     continue
             info = (
                 info_keys,
@@ -759,7 +752,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     generate_data,
                     (M, N, K, indtype, outdtype, scaleAB, is_shuffle, 0, has_bias),
                     run_flydsl_gemm_bf16,
-                    (["inp", weight_key, "out_asm", "bias"], outdtype, config, kernel_name),
+                    (["inp", weight_key, "out_asm", "bias"], outdtype, config),
                     dict(run_kwargs),
                     get_gemm_ref,
                     (
