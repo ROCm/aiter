@@ -270,6 +270,7 @@ def routing(logits, n_expts_act, sm_first=False):
     m = num_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
     if get_arch() == "gfx1250":
+        # TODO: remove (just using it for testing)
         # GFX1250 block_m
         if m == 32:
             block_m = 32

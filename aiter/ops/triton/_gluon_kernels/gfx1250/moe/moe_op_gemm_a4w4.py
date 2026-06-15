@@ -182,7 +182,22 @@ def _moe_gemm_a4w4_gfx1250(
     NUM_BUFFERS: gl.constexpr,
     UPCAST_INDICES: gl.constexpr,
     L2_PREFETCH_DISTANCE: gl.constexpr,
+    # layouts
+    WMMA_LAYOUT: gl.constexpr,
+    DOT_LAYOUT_X: gl.constexpr,
+    DOT_LAYOUT_W: gl.constexpr,
+    DOT_LAYOUT_X_SCALES: gl.constexpr,
+    DOT_LAYOUT_W_SCALES: gl.constexpr,
+    GATHER_IDX_LAYOUT: gl.constexpr,
+    BLOCKED_LAYOUT_X_SCALES: gl.constexpr,
+    SHARED_LAYOUT_X: gl.constexpr,
+    SHARED_LAYOUT_W: gl.constexpr,
+    SHARED_LAYOUT_X_SCALES: gl.constexpr,
+    SHARED_LAYOUT_W_SCALES: gl.constexpr,
+    SHARED_LAYOUT_Y: gl.constexpr,
+    # metaparameters
     num_warps: gl.constexpr,
+    num_ctas: gl.constexpr,
 ):
     gl.assume(stride_y_k >= 0)
     gl.assume(stride_y_m >= 0)
@@ -274,73 +289,13 @@ def _moe_gemm_a4w4_gfx1250(
         BLOCK_K // MX_PACK_DIVISOR
     )  # 32 elements share 1 scale element
 
-    # wmma layouts
-    if PACKED_BLOCK_M_X == 16:
-        WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
-            3,
-            transposed=True,
-            warp_bases=[[0, 1], [0, 2]],
-            reg_bases=[],
-            instr_shape=[16, 16, 128],
-        )
-        WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(
-            3,
-            transposed=True,
-            warp_bases=[[0, 1], [0, 2]],
-            reg_bases=[],
-            instr_shape=[16, 16, 64],
-        )
-    else:
-        WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
-            3,
-            transposed=True,
-            warp_bases=[[0, 1], [1, 0]],
-            reg_bases=[],
-            instr_shape=[16, 16, 128],
-        )
-        WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(
-            3,
-            transposed=True,
-            warp_bases=[[0, 1], [1, 0]],
-            reg_bases=[],
-            instr_shape=[16, 16, 64],
-        )
-    DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=WMMA_LAYOUT_PACKED, k_width=16
-    )
-    DOT_LAYOUT_W: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=WMMA_LAYOUT_PACKED, k_width=16
-    )
-    DOT_LAYOUT_X_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
-        DOT_LAYOUT_X, [PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K]
-    )
-    DOT_LAYOUT_W_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
-        DOT_LAYOUT_W, [PACKED_BLOCK_N_W, MX_SCALE_BLOCK_K]
-    )
-    BLOCKED_LAYOUT_X_SCALES: gl.constexpr = gl.BlockedLayout(
-        [1, MX_SCALE_BLOCK_K], [32, 1], [num_warps, 1], [1, 0]
-    )
-
     # A pointers
     offs_x_m = PACKED_BLOCK_M_X * block_id
     if GatherIndx is None:
         X += start_m * stride_x_m
     else:
-        gl.static_assert(
-            GatherIndx.dtype.element_ty == gl.uint16
-            or GatherIndx.dtype.element_ty == gl.int32,
-            "GatherIndex must be uint16 or int32",
-        )
-        if GatherIndx.dtype.element_ty == gl.uint16:
-            IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
-                0, gl.BlockedLayout([1, 16], [32, 1], [1, num_warps], [0, 1])
-            )
-        else:
-            IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
-                0, gl.BlockedLayout([1, 8], [32, 1], [1, num_warps], [0, 1])
-            )
         offs_x_m = PACKED_BLOCK_M_X * block_id + gl.arange(
-            0, PACKED_BLOCK_M_X, layout=IDX_LAYOUT
+            0, PACKED_BLOCK_M_X, layout=GATHER_IDX_LAYOUT
         )
         GatherIndx += start_m
         offs_x_m = gl.amd.gfx1250.buffer_load(GatherIndx, offs_x_m) // N_EXPTS_ACT
@@ -386,42 +341,6 @@ def _moe_gemm_a4w4_gfx1250(
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
     offs_w_n_scale = pid_n * SCALE_BLOCK_N
-
-    # shared layouts
-    if PACKED_BLOCK_K_X <= 256:
-        SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[256, 16]], [PACKED_BLOCK_M_X, PACKED_BLOCK_K_X], [1, 0]
-        )
-    else:
-        SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[PACKED_BLOCK_K_X, 16]], [PACKED_BLOCK_M_X, PACKED_BLOCK_K_X], [1, 0]
-        )
-    if PRESHUFFLE_WEIGHTS:
-        SHARED_LAYOUT_W: gl.constexpr = gl.SwizzledSharedLayout(
-            vec=1, per_phase=1, max_phase=1, order=[1, 0]
-        )
-    elif PACKED_BLOCK_K_W <= 256:
-        SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[256, 16]], [PACKED_BLOCK_N_W, PACKED_BLOCK_K_W], [1, 0]
-        )
-    else:
-        SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[PACKED_BLOCK_K_W, 16]], [PACKED_BLOCK_N_W, PACKED_BLOCK_K_W], [1, 0]
-        )
-    SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 16]], [PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K], [1, 0]
-    )
-    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
-        SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.SwizzledSharedLayout(
-            vec=1, per_phase=1, max_phase=1, order=[1, 0]
-        )
-    else:
-        SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[256, 16]], [SCALE_BLOCK_N, PACKED_MX_BLOCK], [1, 0]
-        )
-    SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[OUT_BLOCK_N, 8]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
-    )
 
     if GatherIndx is None:
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -563,7 +482,11 @@ def _moe_gemm_a4w4_gfx1250(
         load_idx += 1
 
     # preload tile 0 from LDS into registers
+    if num_ctas > 1:
+        gl.amd.gfx1250.cluster.arrive()
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
+    if num_ctas > 1:
+        gl.amd.gfx1250.cluster.wait()
     gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 1)
     cur_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
     if PRESHUFFLE_WEIGHTS:
@@ -606,10 +529,15 @@ def _moe_gemm_a4w4_gfx1250(
     # main loop: perform wmma and fill LDS with next tile
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     for _ in range(num_k_iter - NUM_BUFFERS):
-        # issue wmma
+        # issue wmma; bracket with the cluster barrier so the cluster sync
+        # overlaps the matmul instead of stacking on top of the async_wait stall
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.arrive()
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
         )
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.wait()
 
         # fill next tile to LDS
         idx_x = load_idx * PACKED_BLOCK_K_X
@@ -742,10 +670,15 @@ def _moe_gemm_a4w4_gfx1250(
 
     # epilogue: drain remaining tiles
     for k_ep in gl.static_range(NUM_BUFFERS - 1):
-        # issue wmma
+        # issue wmma; bracket with the cluster barrier so the cluster sync
+        # overlaps the matmul instead of stacking on top of the async_wait stall
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.arrive()
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
         )
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.wait()
 
         # wait for next tile to be filled
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - k_ep) * NUM_LOADS_IN_BATCH)
