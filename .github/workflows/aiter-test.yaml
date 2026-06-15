@@ -206,10 +206,12 @@ jobs:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py${{ matrix.python_version }}
           path: dist/*.whl
           compression-level: 0
-          retention-days: 14
+          retention-days: 3
 
   upload_s3_manifest:
-    if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
+    if: >-
+      (github.ref == 'refs/heads/main' && github.event_name != 'schedule') ||
+      (github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork)
     needs: [build_aiter_wheels]
     name: Upload wheels and manifest to S3
     runs-on: ubuntu-latest
@@ -218,19 +220,27 @@ jobs:
       contents: read
     steps:
       - name: Download all wheel artifacts
+        id: download_wheels
         uses: actions/download-artifact@v4
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         with:
           pattern: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py*
           path: all-wheels
           merge-multiple: true
 
       - name: Configure AWS credentials
+        id: configure_s3
+        if: steps.download_wheels.outcome == 'success'
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: us-east-1
           role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-nightlies
 
       - name: Install AWS CLI
+        id: install_aws_cli
+        if: steps.download_wheels.outcome == 'success' && steps.configure_s3.outcome == 'success'
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: |
           if ! command -v aws &> /dev/null; then
             curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
@@ -240,10 +250,89 @@ jobs:
           fi
 
       - name: Upload wheels and versioned manifest to S3
+        if: steps.download_wheels.outcome == 'success' && steps.configure_s3.outcome == 'success' && steps.install_aws_cli.outcome == 'success'
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: |
           set -euo pipefail
-          S3_STAGING="s3://framework-whls-nightlies/whl-staging/gfx942-gfx950"
-          S3_PUBLIC="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950"
+          S3_BUCKET="framework-whls-nightlies"
+          S3_KEY_PREFIX="whl-staging/gfx942-gfx950"
+          S3_STAGING="s3://${S3_BUCKET}/${S3_KEY_PREFIX}"
+          S3_PUBLIC="https://rocm.frameworks-nightlies.amd.com/${S3_KEY_PREFIX}"
+          EXPIRES_AT=$(date -u -d '+3 days' '+%Y-%m-%dT%H:%M:%SZ')
+
+          cat > pr-wheel-tags.json <<'JSON'
+          {
+            "TagSet": [
+              {"Key": "ci", "Value": "pr"},
+              {"Key": "repo", "Value": "aiter"},
+              {"Key": "ttl", "Value": "3d"}
+            ]
+          }
+          JSON
+
+          tag_object() {
+            local key="$1"
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              if ! aws s3api put-object-tagging \
+                --bucket "${S3_BUCKET}" \
+                --key "${key}" \
+                --tagging file://pr-wheel-tags.json; then
+                echo "::warning::Failed to tag s3://${S3_BUCKET}/${key}; object still has Expires metadata"
+              fi
+            fi
+          }
+
+          python_tag_to_version() {
+            python3 - "$1" <<'PY'
+          import sys
+
+          tag = sys.argv[1]
+          if not tag.startswith("cp3") or len(tag) < 4:
+              raise SystemExit(f"Unexpected Python wheel tag: {tag}")
+          print(f"py{tag[2]}.{tag[3:]}")
+          PY
+          }
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "=== Uploading PR wheels to S3 ==="
+            for WHL in all-wheels/amd_aiter*.whl; do
+              WHL_NAME=$(basename "${WHL}")
+              PY_TAG=$(echo "${WHL_NAME}" | sed -n 's/.*-\(cp3[0-9][0-9]\)-.*/\1/p')
+              PY_VERSION=$(python_tag_to_version "${PY_TAG}")
+              S3_KEY="${S3_KEY_PREFIX}/pr/${{ github.event.pull_request.number }}/${{ github.run_id }}/${{ github.run_attempt }}/${PY_VERSION}/${WHL_NAME}"
+              S3_PREFIX="${S3_STAGING}/pr/${{ github.event.pull_request.number }}/${{ github.run_id }}/${{ github.run_attempt }}/${PY_VERSION}"
+              S3_PUBLIC_PREFIX="${S3_PUBLIC}/pr/${{ github.event.pull_request.number }}/${{ github.run_id }}/${{ github.run_attempt }}/${PY_VERSION}"
+
+              echo "Uploading ${WHL_NAME} to ${S3_PREFIX}/${WHL_NAME}"
+              aws s3 cp "${WHL}" "${S3_PREFIX}/${WHL_NAME}" --expires "${EXPIRES_AT}"
+              tag_object "${S3_KEY}"
+
+              python3 - <<PY
+          import json
+
+          manifest = {
+              "commit": "${{ github.event.pull_request.head.sha }}",
+              "expires_at": "${EXPIRES_AT}",
+              "python_version": "${PY_VERSION}",
+              "wheel_name": "${WHL_NAME}",
+              "wheel_url": "${S3_PUBLIC_PREFIX}/${WHL_NAME}",
+          }
+          with open("aiter-wheel-${PY_VERSION}.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          print(json.dumps(manifest, indent=2))
+          PY
+
+              MANIFEST_KEY="${S3_KEY_PREFIX}/pr/${{ github.event.pull_request.number }}/${{ github.run_id }}/${{ github.run_attempt }}/${PY_VERSION}/latest.json"
+              aws s3 cp "aiter-wheel-${PY_VERSION}.json" "${S3_PREFIX}/latest.json" \
+                --content-type "application/json" \
+                --expires "${EXPIRES_AT}"
+              tag_object "${MANIFEST_KEY}"
+            done
+
+            echo "Uploaded PR S3 wheels"
+            exit 0
+          fi
 
           echo "=== Uploading all wheels to S3 ==="
           for WHL in all-wheels/amd_aiter*.whl; do
@@ -337,10 +426,14 @@ jobs:
 
   standard:
     if: >-
+      always() &&
       (!github.event.pull_request || github.event.pull_request.draft == false) &&
-      github.event.action != 'labeled'
+      github.event.action != 'labeled' &&
+      needs.build_aiter_wheels.result == 'success' &&
+      needs.split_aiter_tests.result == 'success' &&
+      needs.prepare_triton_wheel.result == 'success'
     name: Standard Tests (1 GPU)
-    needs: [build_aiter_wheels, split_aiter_tests, prepare_triton_wheel]
+    needs: [build_aiter_wheels, upload_s3_manifest, split_aiter_tests, prepare_triton_wheel]
     strategy:
       fail-fast: false
       matrix:
@@ -433,10 +526,41 @@ jobs:
           echo "AITER_TEST=$(cat aiter_shard_${{ matrix.shard_idx }}.list)" >> $GITHUB_ENV
           echo "$AITER_TEST"
 
+      - name: Download Aiter wheel from S3
+        id: download_aiter_wheel_s3
+        if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          mkdir -p aiter_wheels
+          MANIFEST_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/pr/${{ github.event.pull_request.number }}/${{ github.run_id }}/${{ github.run_attempt }}/py3.12/latest.json"
+
+          echo "Downloading Aiter wheel manifest from ${MANIFEST_URL}"
+          curl -fL --retry 10 --retry-delay 10 --connect-timeout 30 --max-time 300 \
+            "${MANIFEST_URL}" -o aiter-wheel.json
+
+          WHEEL_URL=$(python3 - <<'PY'
+          import json
+
+          with open("aiter-wheel.json", encoding="utf-8") as f:
+              manifest = json.load(f)
+          print(manifest["wheel_url"])
+          PY
+          )
+
+          echo "Downloading Aiter wheel from ${WHEEL_URL}"
+          WHEEL_PATH="aiter_wheels/$(basename "${WHEEL_URL}")"
+          curl -fL --retry 10 --retry-delay 10 --connect-timeout 30 --max-time 300 \
+            "${WHEEL_URL}" -o "${WHEEL_PATH}.tmp"
+          mv "${WHEEL_PATH}.tmp" "${WHEEL_PATH}"
+          ls -lh aiter_wheels
+
       - name: Download Aiter wheel artifact
+        if: ${{ steps.download_aiter_wheel_s3.outcome != 'success' }}
         id: download_aiter_wheel
         uses: actions/download-artifact@v4
-        timeout-minutes: 5
+        timeout-minutes: 30
         continue-on-error: true
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
@@ -445,7 +569,7 @@ jobs:
       - name: Retry Download Aiter wheel artifact
         if: steps.download_aiter_wheel.outcome == 'failure'
         uses: actions/download-artifact@v4
-        timeout-minutes: 5
+        timeout-minutes: 30
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
           path: aiter_wheels
