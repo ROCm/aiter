@@ -828,6 +828,11 @@ def compile_moe_gemm1(
                 k_unroll = tile_k_bytes // 64  # K64-byte micro-step (2x MFMA)
                 _num_b_loads_gate = k_unroll * 2 * num_acc_n
                 _num_b_loads = _num_b_loads_gate * (2 if use_g1u1 else 1)
+                # NOTE: the async-copy barriers below use vmcnt=0 (full drain).
+                # The async global->LDS DMA for X is slower than the B VGPR loads,
+                # so a partial vmcnt count lets MFMA read the X tile from LDS
+                # before the DMA lands (read-before-write race). Full drain has
+                # negligible measured e2e cost and fixes the corruption.
 
                 # --- B Load Logic (K64) - shared layout with preshuffle GEMM ---
                 def _load_b_gep_vec_i32(*, n_blk, k0, k1, n_intra, load_bytes):
@@ -1376,7 +1381,7 @@ def compile_moe_gemm1(
                     b_up_cur = load_b_tile(k0, n_blk_up, n_intra_up) if use_g1u1 else []
                     store_x_tile_to_lds(x_regs0, lds_base_cur)
                 if use_async_copy:
-                    _barrier(vmcnt=_num_b_loads, lgkmcnt=0)
+                    _barrier(vmcnt=0, lgkmcnt=0)
                 else:
                     _barrier(lgkmcnt=0)
 
@@ -1430,7 +1435,7 @@ def compile_moe_gemm1(
                         store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
                     if use_async_copy:
-                        _barrier(vmcnt=_num_b_loads, lgkmcnt=0)
+                        _barrier(vmcnt=0, lgkmcnt=0)
                     else:
                         _barrier(lgkmcnt=0)
 
@@ -1468,7 +1473,7 @@ def compile_moe_gemm1(
                         store_x_tile_to_lds(x_regs_pong, lds_base_pong)
                     hot_loop_scheduler()
                     if use_async_copy:
-                        _barrier(vmcnt=_num_b_loads, lgkmcnt=0)
+                        _barrier(vmcnt=0, lgkmcnt=0)
                     else:
                         _barrier(lgkmcnt=0)
 
@@ -1523,7 +1528,7 @@ def compile_moe_gemm1(
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                 hot_loop_scheduler()
                 if use_async_copy:
-                    _barrier(vmcnt=_num_b_loads, lgkmcnt=0)
+                    _barrier(vmcnt=0, lgkmcnt=0)
                 else:
                     _barrier(lgkmcnt=0)
 
@@ -2508,6 +2513,8 @@ def compile_moe_gemm2(
                 m_repeat = tile_m // 16
                 k_unroll = tile_k_bytes // 64  # K64-byte micro-step (2x MFMA)
                 _num_b_loads2 = k_unroll * 2 * num_acc_n
+                # NOTE: the async-copy barriers below use vmcnt=0 (full drain) for
+                # the same X DMA read-before-write reason as stage1.
 
                 # --- B Load Logic (K64) ---
                 def _load_b_gep_vec_i32(*, n_blk, k0, k1, n_intra, load_bytes):
@@ -3082,7 +3089,7 @@ def compile_moe_gemm2(
                     b_cur = load_b_tile(k0)
                     store_x_tile_to_lds(x_regs0, lds_base_cur)
                 if use_async_copy:
-                    _barrier(vmcnt=_num_b_loads2, lgkmcnt=0)
+                    _barrier(vmcnt=0, lgkmcnt=0)
                 else:
                     _barrier(lgkmcnt=0)
 
@@ -3135,7 +3142,7 @@ def compile_moe_gemm2(
                         store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
                     if use_async_copy:
-                        _barrier(vmcnt=_num_b_loads2, lgkmcnt=0)
+                        _barrier(vmcnt=0, lgkmcnt=0)
                     else:
                         _barrier(lgkmcnt=0)
 
@@ -3167,7 +3174,7 @@ def compile_moe_gemm2(
                         store_x_tile_to_lds(x_regs_pong, lds_base_pong)
                     hot_loop_scheduler()
                     if use_async_copy:
-                        _barrier(vmcnt=_num_b_loads2, lgkmcnt=0)
+                        _barrier(vmcnt=0, lgkmcnt=0)
                     else:
                         _barrier(lgkmcnt=0)
 
@@ -3213,7 +3220,7 @@ def compile_moe_gemm2(
                         store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
                     if use_async_copy:
-                        _barrier(vmcnt=_num_b_loads2, lgkmcnt=0)
+                        _barrier(vmcnt=0, lgkmcnt=0)
                     else:
                         _barrier(lgkmcnt=0)
 
