@@ -51,7 +51,7 @@ jobs:
             # Validated MI350X gfx950 TP8: c=64 output 3284.7 tok/s. Floor =
             # 2400 (~27% margin) absorbs JIT/run-to-run variance.
             floor_c64: "2400"
-    runs-on: linux-aiter-do-mi350x-8
+    runs-on: linux-aiter-mi35x-8
     timeout-minutes: 180
     env:
       MODEL_PATH: "amd/Kimi-K2.5-MXFP4"
