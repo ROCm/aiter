@@ -49,6 +49,11 @@
                 "N": 16384
             }
         ],
+	    "fused_rms_mxfp4_quant": [
+            {
+                "N": 16384
+            }
+        ],
 	    "rope": [
             {
                 "num_heads": 128,
@@ -122,6 +127,11 @@
             }
         ],
 	    "rmsnorm": [
+            {
+                "N": 8192
+            }
+        ],
+	    "fused_rms_mxfp4_quant": [
             {
                 "N": 8192
             }
@@ -203,6 +213,11 @@
                 "N": 4096
             }
         ],
+	    "fused_rms_mxfp4_quant": [
+            {
+                "N": 4096
+            }
+        ],
 	    "rope": [
             {
                 "num_heads": 32,
@@ -257,6 +272,11 @@
             }
         ],
 	    "rmsnorm": [
+            {
+                "N": 2880
+            }
+        ],
+	    "fused_rms_mxfp4_quant": [
             {
                 "N": 2880
             }
@@ -452,6 +472,17 @@
                 "N": 512
             }
         ],
+	    "fused_rms_mxfp4_quant": [
+            {
+                "N": 7168
+            },
+            {
+                "N": 1536
+            },
+            {
+                "N": 512
+            }
+        ],
 	    "rope": [
             {
                 "num_heads": 128,
@@ -542,6 +573,11 @@
                 "N": 5120
             }
         ],
+	    "fused_rms_mxfp4_quant": [
+            {
+                "N": 5120
+            }
+        ],
 	    "rope": [
             {
                 "num_heads": 40,
@@ -606,6 +642,14 @@
             }
         ],
 	    "rmsnorm": [
+            {
+                "N": 4096
+            },
+            {
+                "N": 128
+            }
+        ],
+	    "fused_rms_mxfp4_quant": [
             {
                 "N": 4096
             },
