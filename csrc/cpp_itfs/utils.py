@@ -51,8 +51,38 @@ AITER_REBUILD = int(os.environ.get("AITER_REBUILD", 0))
 
 HOME_PATH = os.environ.get("HOME")
 AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
+
+
+def _resolve_build_dir():
+    """Where cpp_itfs template ops (pa_ps, ...) are compiled to and loaded from.
+
+    1. AITER_ROOT_DIR explicitly set  -> <AITER_ROOT_DIR>/build  (e.g. a persisted
+       JIT cache on a mounted volume; preserves the existing override behaviour).
+    2. Otherwise piggyback on the module-JIT dir (get_user_jit_dir()/build). This is
+       the same dir the module_* kernels build into, so prebuilt cpp_itfs .so (a) ship
+       inside the wheel via package_data and (b) are found at runtime with ZERO config
+       on a fresh container -- no more lazy hipcc JIT during the first inferences.
+       Tried via both import paths: aiter.jit.core (runtime) and jit.core (the path
+       setup.py puts on sys.path at build time).
+    3. Fall back to ~/.aiter/build if aiter's jit core cannot be imported.
+    """
+    root = os.environ.get("AITER_ROOT_DIR")
+    if root:
+        return os.path.abspath(os.path.join(root, "build"))
+    import importlib
+
+    for mod_name in ("aiter.jit.core", "jit.core"):
+        try:
+            get_user_jit_dir = importlib.import_module(mod_name).get_user_jit_dir
+            return os.path.abspath(os.path.join(get_user_jit_dir(), "build"))
+        except Exception:
+            continue
+    return os.path.abspath(os.path.join(f"{HOME_PATH}/.aiter", "build"))
+
+
+# Kept for backward compat: external code may read utils.AITER_ROOT_DIR.
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
-BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
+BUILD_DIR = _resolve_build_dir()
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))

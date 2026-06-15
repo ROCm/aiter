@@ -4,3 +4,10 @@ graft aiter_meta
 # exclude cache and compiled files .pyc / .pyo / .pyd / .pyd 
 global-exclude *.py[cod]
 prune aiter/jit/build
+# Re-include the AOT-prebuilt cpp_itfs pa_ps reduce kernels (~175K total). These are
+# compiled by setup.py's prebuild_pa_ps() into aiter/jit/build/pa_ps_<hash>/lib.so,
+# which is exactly where the cpp_itfs runtime (BUILD_DIR) looks for them. Without this
+# they get pruned out of the wheel and pa_ps falls back to slow first-inference hipcc
+# JIT (gpt-oss-120b cold-start ~24k vs ~31k tok/s). module_* kernels avoid the prune
+# because they install to aiter/jit/ root, not build/.
+recursive-include aiter/jit/build pa_ps_*/lib.so

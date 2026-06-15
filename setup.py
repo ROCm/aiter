@@ -407,6 +407,20 @@ if PREBUILD_KERNELS != 0:
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
 
+        # --- cpp_itfs template-op prebuild (pa_ps) ---
+        # pa_ps is JIT-compiled lazily at first inference, which stalls cold-start
+        # throughput on a freshly built container. Compile it AOT into the packaged
+        # jit dir so it ships in the wheel and needs zero runtime config. Only hipcc
+        # is invoked (no GPU), same as the CK builds above.
+        if this_dir not in sys.path:
+            sys.path.insert(0, this_dir)
+        try:
+            from csrc.cpp_itfs.pa.pa_ps_prebuild import prebuild_pa_ps
+
+            prebuild_pa_ps()
+        except Exception as e:  # noqa: BLE001 - never fail the whole wheel on prebuild
+            print(f"[aiter] pa_ps prebuild skipped: {e}")
+
         # Retune GEMM shapes on the live GPU after the main build phase.
         if PRETUNE_MODULES:
             from aiter.utility.pretune import run_pretune_modules  # noqa: E402
