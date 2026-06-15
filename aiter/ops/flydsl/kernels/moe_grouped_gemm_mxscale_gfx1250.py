@@ -262,6 +262,24 @@ def _preshuffled_scale_shape(
     return int(rows) // wmma_rep, k_scale * wmma_rep
 
 
+def _preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
+    """Weight (B) scale shape in the N4K8 layout: (rows//64, (k_dim//32)*64).
+
+    Matches ``grouped_moe_gfx1250._grouped_b_scale_preshuffle_e8m0``: a 64-row x
+    256-K super-block (4 N-tiles x 8 e8m0) folds into the column dim, so 64 N-rows
+    collapse to one row and each k_scale column expands x64.
+    """
+    k_scale = int(k_dim) // 32
+    if k_scale % 8 != 0:
+        raise ValueError(
+            f"B-scale k columns (K//32) must be divisible by 8 (K%256==0), "
+            f"got {k_scale}"
+        )
+    if int(rows) % 64 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 64, got {rows}")
+    return int(rows) // 64, k_scale * 64
+
+
 def _check_stage1_args(
     y, x, w, scale_x, scale_w, masked_m, cfg: _GroupedA8W4Config
 ) -> None:
@@ -303,9 +321,7 @@ def _check_stage1_args(
     scale_x_shape = _preshuffled_scale_shape(
         scale_x_rows, cfg.model_dim, warp_tile_m, cfg.tile_k
     )
-    scale_w_shape = _preshuffled_scale_shape(
-        2 * cfg.inter_dim, cfg.model_dim, warp_tile_n, cfg.tile_k
-    )
+    scale_w_shape = _preshuffled_b_scale_shape(2 * cfg.inter_dim, cfg.model_dim)
     expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
     if tuple(scale_x.shape) != expected_scale_x:
         raise ValueError(
@@ -677,9 +693,7 @@ def _check_stage2_args(
     scale_x_shape = _preshuffled_scale_shape(
         scale_x_rows, cfg.inter_dim, warp_tile_m, cfg.tile_k
     )
-    scale_w_shape = _preshuffled_scale_shape(
-        cfg.model_dim, cfg.inter_dim, warp_tile_n, cfg.tile_k
-    )
+    scale_w_shape = _preshuffled_b_scale_shape(cfg.model_dim, cfg.inter_dim)
     expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
     if tuple(scale_x.shape) != expected_scale_x:
         raise ValueError(

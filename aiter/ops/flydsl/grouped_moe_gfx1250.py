@@ -277,6 +277,74 @@ def _grouped_a8w4_prepare_scale_batch(
     ).to(device=device)
 
 
+# ---------------------------------------------------------------------------
+# Weight (B) scale preshuffle -- "N4K8" layout (gfx1250 grouped GEMM).
+#
+# The weight scale folds a 64-row x 256-K super-block (4 WMMA N-tiles x 8 e8m0
+# blocks = 2 WMMA-K steps) into one row so that each lane reads its complete
+# WMMA scaleB operand (the 4 e8m0 blocks = one WMMA-K=128 step) with a single
+# contiguous ds_load_b32, and op_sel selects the lane-half (see the WMMA scale
+# contract in ffm/FlyDSL/tests/kernels/test_wmma_scale_sample.py):
+#
+#   view(E, N//64, 4, 16, k_scale//8, 2, 4)
+#     .permute(0, 1, 4, 2, 5, 3, 6)        # [E, remain_n, remain_b, p, q, lane, r]
+#     .reshape(E, N//64, k_scale*64)
+#
+# For a raw byte at (n, ks) (n in [0,N), ks in [0,k_scale)=[0,K//32)):
+#   n  = super_row*64 + p*16 + lane      # p = (n//16)%4,  lane = n%16
+#   ks = remain_b*8   + q*4 + r          # q = (ks//4)%2,  r    = ks%4
+#   super_row = n // 64
+#   col = remain_b*512 + p*128 + q*64 + lane*4 + r
+#
+# The 4 e8m0 blocks (r=0..3) of one WMMA-K step land CONTIGUOUS (one i32);
+# p (N-tile) has stride 128, q (the 2nd WMMA-K step in the block) stride 64.
+# A full ``remain_b`` block is 512 contiguous cols = 8 e8m0 = 256 K = one k-tile
+# (tile_k=256), so the consumer descriptor loads it as one contiguous tile.
+# ---------------------------------------------------------------------------
+def _grouped_b_scale_preshuffle_e8m0(scale: torch.Tensor) -> torch.Tensor:
+    """Preshuffle a raw per-expert weight e8m0 scale into the N4K8 B layout."""
+    scale = scale.view(torch.uint8).contiguous()
+    E, N, k_scale = scale.shape
+    if N % 64 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 64, got {N}")
+    if k_scale % 8 != 0:
+        raise ValueError(
+            f"B-scale k columns (K//32) must be divisible by 8 (K%256==0), "
+            f"got {k_scale}"
+        )
+    remain_n = N // 64
+    remain_b = k_scale // 8
+    g = scale.view(E, remain_n, 4, 16, remain_b, 2, 4)
+    g = g.permute(0, 1, 4, 2, 5, 3, 6).contiguous()
+    return g.reshape(E, remain_n, k_scale * 64)
+
+
+def _grouped_b_scale_prepare_batch(
+    scale: torch.Tensor,
+    *,
+    experts: int,
+    rows: int,
+    k_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Accept raw / flat-raw / already-preshuffled weight scale -> new B layout."""
+    scale_u8 = scale.view(torch.uint8).contiguous()
+    k_scale = k_dim // 32
+    raw_shape = (experts, rows, k_scale)
+    preshuffled_shape = (experts, rows // 64, k_scale * 64)
+    if tuple(scale_u8.shape) == preshuffled_shape:
+        return scale_u8.to(device=device)
+    if tuple(scale_u8.shape) == (experts * rows, k_scale):
+        scale_u8 = scale_u8.view(raw_shape)
+    elif tuple(scale_u8.shape) != raw_shape:
+        raise ValueError(
+            f"B-scale shape must be raw {raw_shape}, flat raw "
+            f"{(experts * rows, k_scale)} or preshuffled {preshuffled_shape}, "
+            f"got {tuple(scale_u8.shape)}"
+        )
+    return _grouped_b_scale_preshuffle_e8m0(scale_u8).to(device=device)
+
+
 def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
     """Torch fallback for route -> grouped-row maps."""
     import torch.nn.functional as F
@@ -704,14 +772,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     grouped_w1 = _grouped_weight_uint8(w1)
     grouped_w2 = _grouped_weight_uint8(w2)
     _grouped_dbg("weight layout done")
-    # Weight scales are already preshuffled per expert.
-    _wmma_rep = warp_tile_n // 16
+    # Weight scales are already preshuffled per expert (N4K8 B-scale layout:
+    # rows N -> N//64 super-rows, k_scale cols -> k_scale*64 folded cols; see
+    # _grouped_b_scale_preshuffle_e8m0).
     grouped_w1_scale = w1_scale.reshape(
-        E, (2 * inter_dim) // _wmma_rep, (model_dim // 32) * _wmma_rep
+        E, (2 * inter_dim) // 64, (model_dim // 32) * 64
     )
-    grouped_w2_scale = w2_scale.reshape(
-        E, model_dim // _wmma_rep, (inter_dim // 32) * _wmma_rep
-    )
+    grouped_w2_scale = w2_scale.reshape(E, model_dim // 64, (inter_dim // 32) * 64)
 
     # grouped_a1_scale already produced above (fast or naive path).
     _grouped_dbg("scale layout done")
