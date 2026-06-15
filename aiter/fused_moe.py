@@ -990,9 +990,7 @@ def _get_proven_fp4_stage1(tune_file):
                     if kn.startswith("flydsl_moe1") and kn.endswith("_fp4"):
                         result.add(kn)
     except Exception as e:  # pragma: no cover - defensive
-        logger.warning(
-            f"[fused_moe] could not collect fused-quant stage1 kernels: {e}"
-        )
+        logger.warning(f"[fused_moe] could not collect fused-quant stage1 kernels: {e}")
     _proven_fp4_stage1_cache[tune_file] = result
     return result
 
@@ -1041,9 +1039,7 @@ def _maybe_fuse_stage1_quant(kernelName1, q_dtype_a, tune_file, token=None):
         candidates.append(f"{kernelName1[: -len('_bnt0')]}_fp4")
     for cand in candidates:
         if cand in proven:
-            logger.info(
-                f"[fused_moe] AITER_FUSE_STAGE1_QUANT: {kernelName1} -> {cand}"
-            )
+            logger.info(f"[fused_moe] AITER_FUSE_STAGE1_QUANT: {kernelName1} -> {cand}")
             return cand
     return kernelName1
 
