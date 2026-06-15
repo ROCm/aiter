@@ -206,13 +206,6 @@ def fused_qk_rope_cat_and_cache_mla(
         assert (
             b == b_q_out and qh == qh_q_out and d_nope + d_pe == d_q_out
         ), "q_out shape mismatch"
-        # The gluon kernel reuses qn_smem/qpe_smem (sized in q_nope dtype) to
-        # stage the q_out async_store. That requires the q_out dtype to match
-        # the input q_nope/q_pe dtype.
-        assert q_out.dtype == q_nope.dtype == q_pe.dtype, (
-            f"q_out dtype ({q_out.dtype}) must match q_nope dtype ({q_nope.dtype})"
-            f" and q_pe dtype ({q_pe.dtype})"
-        )
 
     if decode_q_pe_out is None:
         decode_q_pe_out = torch.empty(

@@ -1989,6 +1989,7 @@ namespace py = pybind11;
           py::arg("reduce_final_map"),   \
           py::arg("reduce_partial_map"), \
           py::arg("max_seqlen_q"),       \
+          py::arg("num_kv_splits"),      \
           py::arg("final_output"),       \
           py::arg("final_lse") = std::nullopt);
 
@@ -2104,7 +2105,8 @@ namespace py = pybind11;
           py::arg("x"),                         \
           py::arg("residual"),                  \
           py::arg("post_layer_mix"),            \
-          py::arg("comb_res_mix"));             \
+          py::arg("comb_res_mix"),              \
+          py::arg("store_nt")       = -1);      \
     m.def("mhc_fused_post_pre_gemm_sqrsum",     \
           &aiter::mhc_fused_post_pre_gemm_sqrsum, \
           "mhc_fused_post_pre_gemm_sqrsum",     \
