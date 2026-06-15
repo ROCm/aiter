@@ -3699,6 +3699,10 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(sin_cache.dtype() == q.dtype(), "sin_cache dtype must match q dtype");
     AITER_CHECK(norm_weight.size(0) == head_dim, "norm_weight size must match head_dim");
     AITER_CHECK(norm_bias.size(0) == head_dim, "norm_bias size must match head_dim");
+    AITER_CHECK(norm_weight.dim() == 1, "norm_weight must be 1D");
+    AITER_CHECK(norm_bias.dim() == 1, "norm_bias must be 1D");
+    AITER_CHECK(norm_weight.is_contiguous(), "norm_weight must be contiguous");
+    AITER_CHECK(norm_bias.is_contiguous(), "norm_bias must be contiguous");
     if(preshuffle)
     {
         AITER_CHECK(cache_block_size % 16 == 0,
