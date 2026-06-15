@@ -311,6 +311,7 @@ def rope_norm_store_kv_fp8(
         eps=1e-5,
         num_rows=num_rows,
         total_num_kv_cache_tokens=num_blocks * block_size,
+        max_pos=cos_sin.shape[0],
         fp8_max=fp8_max,
         stride_qkv_t=qkv.stride(0),
         stride_qkv_d=qkv.stride(1),
@@ -341,6 +342,12 @@ def rope_norm_store_kv_fp8(
         stride_qs_0=qs_strides[0],
         stride_qs_1=qs_strides[1],
         stride_qs_2=qs_strides[2],
+        num_req=num_req,
+        qs_local_dim=(
+            q_scale_out.shape[2]
+            if (q_scale_out is not None and q_scale_out.dim() == 3)
+            else 0
+        ),
         NUM_Q_HEADS=num_q_heads,
         NUM_KV_HEADS=num_kv_heads,
         QK_HEAD_DIM=qk_head_dim,

@@ -82,6 +82,7 @@ def _rope_norm_store_kv_fp8_kernel(
     eps,
     num_rows,
     total_num_kv_cache_tokens: tl.int64,
+    max_pos,                 # cos_sin table length (rows); guards OOB rope index
     fp8_max,
     # qkv strides
     stride_qkv_t, stride_qkv_d,
@@ -101,6 +102,10 @@ def _rope_norm_store_kv_fp8_kernel(
     stride_ks_b, stride_ks_r, stride_ks_h, stride_ks_l,
     # q_scale_out strides (dynamic-Q path)
     stride_qs_0, stride_qs_1, stride_qs_2,
+    # q_scale_out bounds (prefill dynamic-Q path); guard OOB store from
+    # uninitialized req_ids/local_idx on padded rows no request covers.
+    num_req,
+    qs_local_dim,
     # constexprs
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
@@ -149,12 +154,21 @@ def _rope_norm_store_kv_fp8_kernel(
     block_row = (safe_slots % BLOCK_SIZE).to(tl.int32)
 
     # ===== cos/sin (NeoX: cos/sin[d] = table[d % half]) =====
+    # positions may be uninitialized garbage for padded rows that no request
+    # covers (callers pass uninitialized buffers via torch.empty). Guard the
+    # cos/sin table index so an out-of-range position can never read OOB:
+    # clamp the offset and drop the row from the load mask (cos=1/sin=0 => no-op
+    # rope). Real rows always satisfy 0 <= position < max_pos, so this is a
+    # no-op for them.
+    pos_in_range = (positions >= 0) & (positions < max_pos)
+    safe_positions = tl.where(pos_in_range, positions, 0)
+    cos_sin_mask = t_mask[:, None] & pos_in_range[:, None]
     d = tl.arange(0, QK_HEAD_DIM)
     d_mod = d % QK_HEAD_DIM_HALF
-    cos_offs = positions[:, None] * stride_cos_t + d_mod[None, :] * stride_cos_d
+    cos_offs = safe_positions[:, None] * stride_cos_t + d_mod[None, :] * stride_cos_d
     sin_offs = cos_offs + QK_HEAD_DIM_HALF * stride_cos_d
-    cos_full = tl.load(cos_sin_ptr + cos_offs, mask=t_mask[:, None], other=1.0)
-    sin_full = tl.load(cos_sin_ptr + sin_offs, mask=t_mask[:, None], other=0.0)
+    cos_full = tl.load(cos_sin_ptr + cos_offs, mask=cos_sin_mask, other=1.0)
+    sin_full = tl.load(cos_sin_ptr + sin_offs, mask=cos_sin_mask, other=0.0)
     qk_rotated_mask = (d < QK_HEAD_DIM_HALF)[None, :]
 
     # Load Hadamard once if needed
@@ -198,12 +212,24 @@ def _rope_norm_store_kv_fp8_kernel(
         if IS_PREFILL:
             req_ids = tl.load(req_ids_ptr + t_offs, mask=t_mask, other=0).to(tl.int32)
             local_idx = tl.load(local_idx_ptr + t_offs, mask=t_mask, other=0).to(tl.int32)
-            qs_offs = (
-                req_ids * stride_qs_0
-                + hq * stride_qs_1
-                + local_idx * stride_qs_2
+            # req_ids/local_idx may be uninitialized garbage for padded rows that
+            # no request covers (callers pass uninitialized buffers). valid_row
+            # only bounds `slots`, not these indices, so bound them explicitly to
+            # keep the q_scale_out store in range. Clamp the offset too, so even a
+            # masked-off lane never forms an OOB address.
+            qs_valid = (
+                valid_row
+                & (req_ids >= 0) & (req_ids < num_req)
+                & (local_idx >= 0) & (local_idx < qs_local_dim)
             )
-            tl.store(q_scale_out_ptr + qs_offs, q_scale, mask=valid_row)
+            safe_req_ids = tl.where(qs_valid, req_ids, 0)
+            safe_local_idx = tl.where(qs_valid, local_idx, 0)
+            qs_offs = (
+                safe_req_ids * stride_qs_0
+                + hq * stride_qs_1
+                + safe_local_idx * stride_qs_2
+            )
+            tl.store(q_scale_out_ptr + qs_offs, q_scale, mask=qs_valid)
         else:
             qs_offs = t_offs * stride_qs_0 + hq * stride_qs_1
             tl.store(q_scale_out_ptr + qs_offs, q_scale, mask=t_mask)
