@@ -1040,7 +1040,7 @@ _MXFP4_G2_KNAME_RE = re.compile(
     r"^mxfp4_moe_g2_a4w4_NE(?P<ne>\d+)_H(?P<h>\d+)_E(?P<d_inter>\d+)"
     r"(?:_TOPK(?P<topk>\d+))?"
     r"_BM(?P<bm>\d+)"
-    r"(?:_SK(?P<sk>\d+)|_(?P<variant>ATOMIC|NONATOMIC)(?:_(?P<nt>NT))?(?:_(?P<mxfp4out>MXFP4OUT))?)?"
+    r"(?:_SK(?P<sk>\d+)|_(?P<variant>ATOMIC|NONATOMIC)(?:_(?P<nt>NT))?(?:_(?P<mxfp4out>MXFP4OUT))?(?:_(?P<cshuffle>CSHUFFLE))?)?"
     r"(?:_XCD(?P<xcd>\d+))?$"
 )
 
@@ -1088,6 +1088,7 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
         # _MXFP4OUT (nonatomic only): gemm2 stages flat_out as packed fp4+e8m0 and
         # scatter_reduce reads it back as mxfp4 (the mxfp4-intermediate path).
         "mxfp4out": m.group("mxfp4out") == "MXFP4OUT",
+        "cshuffle": m.group("cshuffle") == "CSHUFFLE",
     }
 
 
@@ -1142,6 +1143,7 @@ def _mxfp4_moe_run(
     BM = p1["BM"]
     inline_quant = p1["inline_quant"]
     atomic = p2["atomic"]
+    cshuffle = p2.get("cshuffle", False)
     prologue_name = "inline_quant" if inline_quant else "threestage"
 
     # FlyDSL gemm1/gemm2 opt-in tag(???? w1/w2.view ???,view ?????????)?
@@ -1526,6 +1528,7 @@ def _mxfp4_moe_run(
             use_nt=p2["use_nt"],
             atomic=atomic,
             mxfp4out=False,
+            cshuffle=cshuffle,
             NE=NE,
             D_HIDDEN=D_HIDDEN,
             D_INTER=D_INTER,

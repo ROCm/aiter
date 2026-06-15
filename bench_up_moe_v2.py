@@ -101,8 +101,9 @@ def flyg_variants(shape):
                     g2_kernel_name(shape, 32, g2v),
                 )
             )
-    # BM128: g1 '' x g2 {NONATOMIC (+MXFP4OUT if shape ok)}
-    g2vs = ["NONATOMIC"]
+    # BM128: g1 '' x g2 {NONATOMIC, NONATOMIC_CSHUFFLE (+MXFP4OUT if shape ok)}.
+    # CSHUFFLE = coalesced flat_out write (2-pass cshuffle); fly's mfma_moe2 recipe.
+    g2vs = ["NONATOMIC", "NONATOMIC_CSHUFFLE"]
     if _mxfp4out_ok(shape):
         g2vs.append("NONATOMIC_MXFP4OUT")
     for g2v in g2vs:

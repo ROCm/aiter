@@ -307,9 +307,11 @@ def compile_gemm2_a4w4_port(
     # the same kAStages=3 triple-buffer for its streaming non-128 path.)
     _aStages = kStages if _K_TILES_TOTAL <= kStages else 3
     # atomic / mxfp4 epilog reuses LDS for the cshuffle (BM*BN f32); nonatomic
-    # bf16 writes direct, so only s_Aq (_aStages slots) is needed.
+    # bf16 writes direct, so only s_Aq (_aStages slots) is needed. nonatomic_cshuffle
+    # cshuffles in 64-row passes -> only min(BM,64)*BN f32 (BM128 -> 64KB not 128KB).
+    _acc_rows = min(BM, 64) if epilog == "nonatomic_cshuffle" else BM
     _lds_bytes = (
-        max(lds_bytes(BM), _aStages * _slot_bytes)
+        max(lds_bytes(_acc_rows), _aStages * _slot_bytes)
         if epilog != "nonatomic"
         else _aStages * _slot_bytes
     )
@@ -322,6 +324,7 @@ def compile_gemm2_a4w4_port(
         "atomic": "atomic",
         "nonatomic": "nonatomic",
         "nonatomic_mxfp4": "nonatomic_mxfp4",
+        "nonatomic_cshuffle": "nonatomic_cshuffle",
     }[epilog]
     # Tag with the inter (K) so specializations with different contraction dims get
     # distinct kernel/smem symbols (KIMI i512 keeps the original numeric layout).
@@ -564,7 +567,7 @@ def _gemm2_body(
     _aStages = aStages
     _kMChunks = kmchunks(BM)
     _slot_bytes = saq_slot_bytes(BM)
-    _lds_acc_floats = BM * BN
+    _lds_acc_floats = (min(BM, 64) if epilog == "nonatomic_cshuffle" else BM) * BN
     # K-derived sizes (parametrized over the contraction dim K = inter_dim = D_INTER).
     _K = D_INTER
     _K_HALF = k_half_for(_K)
@@ -880,6 +883,14 @@ def _gemm2_body(
         _flat_bf16_epilog(
             accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, _kMChunks
         )
+    elif epilog == "nonatomic_cshuffle":
+        # cshuffle -> coalesced flat per-sorted-row bf16 write (BM<=64); scatter
+        # follows (fly's mfma_moe2_cshuffle recipe). One-shot grid (no _persistent)
+        # to avoid the lds_acc reuse race.
+        lds_acc._view_cache = None
+        _cshuffle_flat_bf16_epilog(
+            lds_acc, accm, arg_out, m_row, n_block_idx, wave, lane, BM, N_OUT
+        )
     elif epilog == "nonatomic_mxfp4":
         # flat per-sorted-row fp4 (packed q + e8m0 scale) write.
         out_q_base = _global_base_ptr1(arg_out)
@@ -941,6 +952,63 @@ def _flat_bf16_epilog(accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, kMC
                 )  # i64 element index
                 bf = Vec.from_elements([vec[v]], fx.Float32).to(fx.BFloat16)
                 llvm.StoreOp(_raw(bf), _gep1(out_base, elem * fx.Int64(2)))
+
+
+def _cshuffle_flat_bf16_epilog(
+    lds_acc, accm, arg_out, m_row, n_block_idx, wave, lane, BM, N_OUT
+):
+    """Nonatomic flat epilog WITH cshuffle: cshuffle accm -> lds_acc (the SAME reorg
+    the atomic epilog does) so the flat_out write is a COALESCED <2xbf16> store, then
+    write per-sorted-row to flat_out[(m_row+row)*N_OUT + n] (no weight/atomic; a
+    scatter_reduce sums the TOPK rows). Mirrors fly's mfma_moe2 cshuffle gemm2
+    (coalesced) vs the port's direct uncoalesced nonatomic write. For BM>64 the
+    cshuffle is done in ceil(BM/64) PASSES of 64 rows so lds_acc fits 64KB (BM128's
+    full 128*BN*4=128KB would not); each pass reuses the same 64-row scratch."""
+    _RPP = min(BM, 64)  # rows per cshuffle pass (lds_acc holds _RPP*BN f32)
+    _PASSES = BM // _RPP
+    _iC = _RPP // 16  # accm i-chunks per pass
+    _REPS = _RPP // 8
+    lane_div_16 = lane // fx.Int32(16)
+    lane_mod_16 = lane % fx.Int32(16)
+    lds_base = _lds_base_ptr3(lds_acc.get())
+    tx_i32 = fx.Int32(gpu.thread_id("x"))
+    m_lane = tx_i32 // fx.Int32(32)
+    n_lane = tx_i32 % fx.Int32(32)
+    col_start = n_lane * fx.Int32(2)
+    out_base = _global_base_ptr1(arg_out)
+
+    for p in range_constexpr(_PASSES):
+        rocdl.barrier()  # pre-store fence (prev pass readback / K-loop s_Aq reads done)
+        for ii in range_constexpr(_iC):
+            i = p * _iC + ii
+            row_base = fx.Int32(ii * 16) + lane_div_16 * fx.Int32(4)  # LOCAL row
+            for J in range_constexpr(4):
+                col = wave * fx.Int32(64) + fx.Int32(J * 16) + lane_mod_16
+                vec = Vec(accm[i][J])
+                for v in range_constexpr(4):
+                    idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
+                    llvm.StoreOp(_raw(vec[v]), _gep3(lds_base, idx * fx.Int32(4)))
+        # drain the LDS cshuffle stores (s_barrier alone does NOT) before readback.
+        llvm.inline_asm(
+            res=None,
+            operands_=[],
+            asm_string="s_waitcnt lgkmcnt(0)",
+            constraints="",
+            has_side_effects=True,
+        )
+        rocdl.barrier()
+        for mr in range_constexpr(_REPS):
+            row_local = fx.Int32(mr * 8) + m_lane
+            sorted_row = m_row + fx.Int32(p * _RPP) + row_local
+            for s in range_constexpr(4):
+                idx0 = row_local * fx.Int32(BN) + col_start + fx.Int32(s * 64)
+                v2 = Vec(
+                    llvm.load(T.vec(2, T.f32), _gep3(lds_base, idx0 * fx.Int32(4)))
+                )
+                pk = Vec.from_elements([v2[0], v2[1]], fx.Float32).to(fx.BFloat16)
+                n_col = n_block_idx * fx.Int32(BN) + col_start + fx.Int32(s * 64)
+                elem = fx.Int64(sorted_row) * fx.Int64(N_OUT) + fx.Int64(n_col)
+                llvm.StoreOp(_raw(pk), _gep1(out_base, elem * fx.Int64(2)))
 
 
 @flyc.jit

@@ -29,12 +29,18 @@ _SUPPORTED = {
     (128, False, "nonatomic"),
     # nonatomic mxfp4-out (fp4 q + e8m0 scale flat)
     (128, False, "nonatomic_mxfp4"),
+    # nonatomic bf16 WITH cshuffle (coalesced flat write, BM<=64) -- fly recipe
+    (32, False, "nonatomic_cshuffle"),
+    (64, False, "nonatomic_cshuffle"),
+    (128, False, "nonatomic_cshuffle"),  # 2-pass cshuffle (64-row scratch)
 }
 
 
-def _epilog_of(atomic, mxfp4out):
+def _epilog_of(atomic, mxfp4out, cshuffle=False):
     if mxfp4out:
         return "nonatomic_mxfp4"
+    if cshuffle:
+        return "nonatomic_cshuffle"
     return "atomic" if atomic else "nonatomic"
 
 
@@ -52,7 +58,9 @@ def _dummy_out_scale(device_index):
     return torch.empty(1, dtype=torch.uint8, device=torch.device("cuda", device_index))
 
 
-def _assert_supported(*, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, atomic, mxfp4out):
+def _assert_supported(
+    *, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, atomic, mxfp4out, cshuffle=False
+):
     from .kernels import mxfp4_gemm2 as port
 
     # gemm2 contraction K = inter_dim = D_INTER. The kernel (BK=256) supports any
@@ -76,7 +84,7 @@ def _assert_supported(*, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, atomic, mxfp4o
             f"flydsl mxfp4 gemm2 requires D_HIDDEN (=N_OUT=model_dim) % 256 == 0, "
             f"got H={D_HIDDEN}"
         )
-    epilog = _epilog_of(atomic, mxfp4out)
+    epilog = _epilog_of(atomic, mxfp4out, cshuffle)
     if (BM, use_nt, epilog) not in _SUPPORTED:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm2 ????? (variant) "
@@ -106,6 +114,7 @@ def flydsl_mxfp4_gemm2(
     D_INTER,
     topk,
     flat_out_scale=None,
+    cshuffle=False,
 ):
     """?? FlyDSL ??? gemm2,?? flat_out(mxfp4out ???? flat_out_scale)?
 
@@ -121,8 +130,9 @@ def flydsl_mxfp4_gemm2(
         use_nt=use_nt,
         atomic=atomic,
         mxfp4out=mxfp4out,
+        cshuffle=cshuffle,
     )
-    epilog = _epilog_of(atomic, mxfp4out)
+    epilog = _epilog_of(atomic, mxfp4out, cshuffle)
     launch = _get_compiled_mxfp4_gemm2_port(BM, use_nt, NE, D_HIDDEN, epilog, D_INTER)
 
     # grid ?? = max_m_blocks(kernel ???? cumsum ???????)?
