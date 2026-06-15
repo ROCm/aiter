@@ -547,6 +547,7 @@ def _normalize_registry_config(
         _validate_hgemm_tiling(
             1,
             config["tile_n"],
+            config["tile_k"] * config["split_k"],
             dtype=dtype,
             tile_m=config["tile_m"],
             tile_n=config["tile_n"],
