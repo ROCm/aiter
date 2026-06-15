@@ -163,11 +163,7 @@ def get_GEMM_A16W16_config(
 
     if config is None:
         default_config = {}
-        # gfx12: no ASM/skinny/hipblaslt kernels, use torch
-        if gfx.startswith("gfx12"):
-            default_config["libtype"] = "torch"
-            default_config["solidx"] = 0
-        elif bpreshuffle:
+        if bpreshuffle:
             default_config["bpreshuffle"] = True
             if gfx == "gfx942":
                 default_config["libtype"] = "hipblaslt"
@@ -289,12 +285,8 @@ def gemm_a16w16(
         scaleAB=scale_a is not None or scale_b is not None,
         bpreshuffle=bpreshuffle,
     )
-    gfx = get_gfx()
-    _no_asm = gfx.startswith("gfx12")
     libtype = config["libtype"]
-    if _no_asm and libtype in ("asm", "skinny", "hipblaslt"):
-        libtype = "torch"
-    solution_idx = config["solidx"] if libtype == config.get("libtype") else 0
+    solution_idx = config["solidx"]
     solfunc = solMap[libtype]
     out = solfunc(
         inp_view,

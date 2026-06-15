@@ -111,6 +111,13 @@ EXACT_N_ROWBLOCK_REDUCE_CONFIGS = (
 
 def splitk_reduce_extra_forward_decls():
     return (
+        "template<int VEC_, int BLOCK_, typename D_OUT,\n"
+        "         bool HAS_BIAS_, typename D_BIAS_, bool HAS_OOB_>\n"
+        "__global__ void splitk_reduce_kernel_bf16ws_fallback(\n"
+        "    const opus_splitk_ws_handle* ws_handle, D_OUT* c_out,\n"
+        "    int split_k, int M, int N, int batch,\n"
+        "    int padded_M, int padded_N,\n"
+        "    const D_BIAS_* bias, int stride_bias_batch);\n"
         "template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_,\n"
         "         typename D_WS, typename D_OUT, bool HAS_BIAS_, typename D_BIAS_>\n"
         "__global__ void splitk_reduce_kernel_exact_n_rowblock(\n"
@@ -123,6 +130,15 @@ def splitk_reduce_extra_forward_decls():
 
 def splitk_reduce_extra_device_instantiations():
     contents = "// Exact-N row-block reduce instantiations (BLOCK=N_VEC*ROWS)\n"
+    for out_type in ("__bf16", "float"):
+        contents += (
+            f"template __global__ void splitk_reduce_kernel_bf16ws_fallback<16, 64, {out_type}, true,  {out_type}, true>(\n"
+            f"    const opus_splitk_ws_handle*, {out_type}*, int, int, int, int, int, int,\n"
+            f"    const {out_type}*, int);\n"
+            f"template __global__ void splitk_reduce_kernel_bf16ws_fallback<16, 64, {out_type}, false, {out_type}, true>(\n"
+            f"    const opus_splitk_ws_handle*, {out_type}*, int, int, int, int, int, int,\n"
+            f"    const {out_type}*, int);\n"
+        )
     for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS:
         for sk in SPLITK_REDUCE_SUPPORTED_SPLITKS:
             for ws_type in ("float", "__bf16"):
@@ -240,8 +256,13 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
             if hasbias
             else f"\n{indent}            nullptr, 0);"
         )
+        reduce_kernel = (
+            "splitk_reduce_kernel_bf16ws_fallback"
+            if bf16ws
+            else "splitk_reduce_kernel_fallback"
+        )
         return (
-            f"{indent}splitk_reduce_kernel_fallback<REDUCE_VEC, REDUCE_BS, {dtype}, {hb}, {dtype}, true>\n"
+            f"{indent}{reduce_kernel}<REDUCE_VEC, REDUCE_BS, {dtype}, {hb}, {dtype}, true>\n"
             f"{indent}    <<<grid_reduce, block_reduce, 0, stream>>>(\n"
             f"{indent}        ws_handle_,\n"
             f"{indent}        reinterpret_cast<{dtype}*>(Y.data_ptr()),\n"
@@ -254,25 +275,37 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     fp32_t = _baseline_call("float", True, "            ")
     fp32_f = _baseline_call("float", False, "            ")
     bf16_y_check = ""
-    bf16ws_reduce_check = ""
+    bf16ws_fallback_decl = ""
+    bf16ws_host_redirect = ""
     if bf16ws:
-        n_conditions = " || ".join(
+        fp32ws_name = k.name.replace("_bf16ws", "")
+        exact_reduce_shape_conditions = " ||\n        ".join(
             f"(N == {vec * nvec} && (M % {rows} == 0))"
             for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS
         )
-        sk_conditions = " || ".join(
-            f"split_k == {sk}" for sk in SPLITK_REDUCE_SUPPORTED_SPLITKS
-        )
+        bf16ws_fallback_decl = f"""
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void {fp32ws_name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int splitK);
+#endif
+"""
+        bf16ws_host_redirect = f"""
+    const bool bf16ws_exact_reduce_shape =
+        {exact_reduce_shape_conditions};
+    if (!bf16ws_exact_reduce_shape) {{
+        {fp32ws_name}<D_C>(XQ, WQ, Y, bias, splitK);
+        return;
+    }}
+"""
         bf16_y_check = (
             "    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,\n"
             f'    "{err_label} bf16 workspace currently supports only bf16 Y");\n'
         )
-        bf16ws_reduce_check = f"""
-    AITER_CHECK(padded_N == N && ({n_conditions}),
-    "{err_label} bf16 workspace requires an exact-N row-block reduce shape");
-    AITER_CHECK({sk_conditions},
-    "{err_label} bf16 workspace requires an instantiated split_k");
-"""
     reduce_launch = f"""
     constexpr int REDUCE_VEC = 16;
     constexpr int REDUCE_BS  = 64;
@@ -314,6 +347,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 #else
 #include "{pipeline_header}"
 #endif
+{bf16ws_fallback_decl}
 {traits_aliases}
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template <typename D_C>
@@ -333,6 +367,7 @@ void
     int N = WQ.size(1);
     int K = XQ.size(2);
 
+{bf16ws_host_redirect}
 {bf16_y_check}
     AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
             || Y.dtype() == AITER_DTYPE_fp32,
@@ -418,7 +453,6 @@ void
     int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
     int padded_M    = num_tiles_m * {k.B_M};
     int padded_N    = num_tiles_n * {k.B_N};
-{bf16ws_reduce_check}
 
     auto stream = aiter::getCurrentHIPStream();
     hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;

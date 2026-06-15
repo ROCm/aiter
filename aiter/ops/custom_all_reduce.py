@@ -39,6 +39,10 @@ def reduce_scatter(
     _fa: int,
     inp: torch.Tensor,
     out: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+    split_dim: int,
     reg_ptr: int,
     reg_bytes: int,
 ) -> None: ...

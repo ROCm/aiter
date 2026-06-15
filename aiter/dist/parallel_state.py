@@ -644,14 +644,15 @@ class GroupCoordinator:
         prefill_support: bool = False,
         emit_bf16: bool = False,
     ):
-        return self.fused_allreduce_rmsnorm_quant(
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
             input_,
             residual_inp_,
             weight_,
             eps,
+            group_size,
             prefill_support,
-            quant_type="per_group",
-            group_size=group_size,
             emit_bf16=emit_bf16,
         )
 
@@ -885,14 +886,25 @@ class GroupCoordinator:
         # return outplace_reduce_scatter(input_, group_name=self.unique_name, dim=dim)
         world_size = self.world_size
         assert world_size > 1, "error! world_size = 1"
+        ndim = input_.dim()
         assert (
-            input_.numel() % world_size == 0
-        ), "input shape error, input.numel() % world_size should equals to 0"
-        if input_.shape[0] % world_size == 0:
-            out_dim0 = input_.shape[0] // world_size
-            out_shape = (out_dim0,) + input_.shape[1:]
-        else:
-            out_shape = (input_.numel() // world_size,)
+            -ndim <= dim < ndim
+        ), f"Invalid dim ({dim}) for input tensor with shape {tuple(input_.shape)}"
+        if dim < 0:
+            dim += ndim
+        assert input_.shape[dim] % world_size == 0, (
+            f"input shape error, input.shape[{dim}]={input_.shape[dim]} "
+            f"is not divisible by world_size={world_size}"
+        )
+        # Output keeps the same rank/strides as input, only the scattered
+        # dim shrinks by world_size. Allocation is contiguous; the custom
+        # kernel writes elements in linear order into this layout, so no
+        # post-kernel reshape/copy is needed.
+        out_shape = (
+            input_.shape[:dim]
+            + (input_.shape[dim] // world_size,)
+            + input_.shape[dim + 1 :]
+        )
 
         output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
         if use_custom:
@@ -900,9 +912,20 @@ class GroupCoordinator:
                 input_, output_, group_name=self.unique_name, dim=dim
             )
         else:
-            torch.distributed.reduce_scatter_tensor(
-                output_, input_, group=self.device_group
-            )
+            if dim != 0:
+                input_ = input_.movedim(dim, 0).contiguous()
+                tmp_out_shape = (input_.shape[0] // world_size,) + input_.shape[1:]
+                tmp_output = torch.empty(
+                    tmp_out_shape, dtype=input_.dtype, device=input_.device
+                )
+                torch.distributed.reduce_scatter_tensor(
+                    tmp_output, input_, group=self.device_group
+                )
+                output_ = tmp_output.movedim(0, dim).contiguous()
+            else:
+                torch.distributed.reduce_scatter_tensor(
+                    output_, input_, group=self.device_group
+                )
         return output_
 
     def all_gather(
@@ -1509,20 +1532,16 @@ def graph_capture():
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    if _CUSTOM:
-        from contextlib import ExitStack
+    from contextlib import ExitStack
 
-        with ExitStack() as stack:
-            context = stack.enter_context(get_tp_group().graph_capture())
-            stack.enter_context(get_pp_group().graph_capture(context))
-            for group in _CUSTOM.values():
+    with ExitStack() as stack:
+        context = stack.enter_context(get_tp_group().graph_capture())
+        for group in (get_pp_group(), get_dp_group(), get_ep_group()):
+            if group is not None and group.device_communicator is not None:
                 stack.enter_context(group.graph_capture(context))
-            yield context
-    else:
-        with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
-            context
-        ):
-            yield context
+        for group in _CUSTOM.values():
+            stack.enter_context(group.graph_capture(context))
+        yield context
 
 
 _ENABLE_CUSTOM_ALL_REDUCE = True

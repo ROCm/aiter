@@ -118,7 +118,9 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
 }
 
 static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
-                            int64_t size, AiterDtype dtype)
+                            int m, int n, int k,
+                            aiter::ReduceScatterSplitDim split_dim,
+                            AiterDtype dtype)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -128,14 +130,14 @@ static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
         fa->dispatchReduceScatter<opus::fp32_t>(stream,
                                      reinterpret_cast<opus::fp32_t*>(inp),
                                      reinterpret_cast<opus::fp32_t*>(out),
-                                     size);
+                                     m, n, k, split_dim);
         break;
     }
     case AITER_DTYPE_fp16: {
         fa->dispatchReduceScatter<opus::fp16_t>(stream,
                                     reinterpret_cast<opus::fp16_t*>(inp),
                                     reinterpret_cast<opus::fp16_t*>(out),
-                                    size);
+                                    m, n, k, split_dim);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
@@ -143,7 +145,7 @@ static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
         fa->dispatchReduceScatter<opus::bf16_t>(stream,
                                               reinterpret_cast<opus::bf16_t*>(inp),
                                               reinterpret_cast<opus::bf16_t*>(out),
-                                              size);
+                                              m, n, k, split_dim);
         break;
     }
 #endif
@@ -436,13 +438,15 @@ void all_reduce(fptr_t _fa,
 void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
+                    int64_t m, int64_t n, int64_t k,
+                    int64_t split_dim,
                     int64_t reg_ptr, int64_t reg_bytes)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
-    auto dtype     = inp.dtype();
-    int64_t inp_numel  = inp.numel();
-    int64_t data_bytes = inp_numel * inp.element_size();
+    auto dtype         = inp.dtype();
+    int64_t data_bytes = inp.numel() * inp.element_size();
+    auto sd            = static_cast<aiter::ReduceScatterSplitDim>(split_dim);
 
     if(reg_ptr != 0)
     {
@@ -450,11 +454,15 @@ void reduce_scatter(fptr_t _fa,
             throw std::runtime_error("registered buffer is too small to contain the input");
         HIP_CALL(hipMemcpyAsync((void*)reg_ptr, inp.data_ptr(), data_bytes,
                                 hipMemcpyDeviceToDevice, stream));
-        _reduce_scatter(_fa, (void*)reg_ptr, out.data_ptr(), inp_numel, dtype);
+        _reduce_scatter(_fa, (void*)reg_ptr, out.data_ptr(),
+                        static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+                        sd, dtype);
     }
     else
     {
-        _reduce_scatter(_fa, inp.data_ptr(), out.data_ptr(), inp_numel, dtype);
+        _reduce_scatter(_fa, inp.data_ptr(), out.data_ptr(),
+                        static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+                        sd, dtype);
     }
 }
 
