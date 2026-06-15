@@ -1149,6 +1149,23 @@ class CustomAllreduce:
                 torch.empty_like(residual_in),
             )
 
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                registered = True
+            else:
+                m = inp.size(0)
+                hidden_size = inp.size(-1)
+                hc_mult = residual_in.size(1)
+                device = inp.device
+                return (
+                    torch.empty(m, hc_mult, 1, dtype=torch.float32, device=device),
+                    torch.empty(
+                        m, hc_mult, hc_mult, dtype=torch.float32, device=device
+                    ),
+                    torch.empty(m, hidden_size, dtype=inp.dtype, device=device),
+                    torch.empty_like(residual_in),
+                )
+
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
         return launch_fused_allreduce_mhc_fused_post_pre_rmsnorm(
