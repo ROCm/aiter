@@ -4481,8 +4481,8 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
         vec_pairs >>= 1;
 
     // Fall back to smaller VP if not enough waves to saturate the GPU.
-    const int32_t gpu_capacity  = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
-    constexpr int32_t warp_size = 64;
+    const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
+    const int32_t warp_size    = static_cast<int32_t>(get_warp_size_func());
     while(vec_pairs > 1)
     {
         const int32_t total_waves = total_sb * (size_half_r / vec_pairs) / warp_size;

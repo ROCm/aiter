@@ -128,6 +128,34 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
     return cos_diff if cos_diff >= COS_DIFF_THRESHOLD else 0.0
 
 
+# Positional order of the dict returned by ``FmoeTuner.generate_data_1stage``.
+# The asm 1-stage tasks select/reorder their kernel inputs by integer index
+# (``_data_idx``); work_group looks tensors up by *name* in that dict, so the
+# integer indices must be translated to names through this list. Keep it in
+# sync with the return dict of ``generate_data_1stage``.
+_GEN_DATA_1STAGE_KEYS = [
+    "input",  # 0
+    "a1_qt",  # 1
+    "w1_qt_shffle",  # 2
+    "w2_qt_shffle",  # 3
+    "sorted_ids",  # 4
+    "sorted_weights",  # 5
+    "sorted_expert_ids",  # 6
+    "num_valid_ids",  # 7
+    "moe_buf",  # 8
+    "a1_scale",  # 9
+    "w1_scale",  # 10
+    "w2_scale",  # 11
+    "w1_qt",  # 12
+    "w2_qt",  # 13
+    "topk_weights",  # 14
+    "topk_ids",  # 15
+    "fc1_smooth_scale",  # 16
+    "fc2_smooth_scale",  # 17
+    "a1_scale_t",  # 18
+]
+
+
 class FmoeTuner(TunerCommon):
     ARG_DEFAULTS = {
         **TunerCommon.ARG_DEFAULTS,
@@ -1886,6 +1914,7 @@ class FmoeTuner(TunerCommon):
                     _data_idx = [0, 1, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
                 else:
                     _data_idx = [0, 1, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
+                _data_names = [_GEN_DATA_1STAGE_KEYS[i] for i in _data_idx]
                 task_1stage.append(
                     (
                         (info, "asm_1stage", el, tile_m, flat_flag),
@@ -1906,21 +1935,7 @@ class FmoeTuner(TunerCommon):
                         ),
                         fmoe_func,
                         (
-                            _data_idx,
-                            [
-                                "input",
-                                "a1_qt",
-                                "w1_qt_shffle",
-                                "w2_qt_shffle",
-                                "sorted_ids",
-                                "sorted_weights",
-                                "sorted_expert_ids",
-                                "num_valid_ids",
-                                "a1_scale_t",
-                                "w1_scale",
-                                "w2_scale",
-                                "fc2_smooth_scale",
-                            ],
+                            _data_names,
                             q_type,
                             use_g1u1,
                             act_type,
@@ -2003,6 +2018,7 @@ class FmoeTuner(TunerCommon):
                         _data_idx = [0, 0, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
                     else:
                         _data_idx = [0, 0, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
+                    _data_names = [_GEN_DATA_1STAGE_KEYS[i] for i in _data_idx]
                     task_1stage.append(
                         (
                             (info, "asm_1stage_xbf16", el, tile_m, flat_flag),
@@ -2023,21 +2039,7 @@ class FmoeTuner(TunerCommon):
                             ),
                             fmoe_func,
                             (
-                                _data_idx,
-                                [
-                                    "input",
-                                    "input",
-                                    "w1_qt_shffle",
-                                    "w2_qt_shffle",
-                                    "sorted_ids",
-                                    "sorted_weights",
-                                    "sorted_expert_ids",
-                                    "num_valid_ids",
-                                    "a1_scale_t",
-                                    "w1_scale",
-                                    "w2_scale",
-                                    "fc2_smooth_scale",
-                                ],
+                                _data_names,
                                 q_type,
                                 use_g1u1,
                                 act_type,
