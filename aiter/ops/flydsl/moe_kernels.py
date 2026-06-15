@@ -188,7 +188,53 @@ def get_flydsl_stage2_kernels(
                                 **base_params,
                                 "persist": True,
                             }
+    _register_production_variants_stage2(kernels, a_dtype, b_dtype, out_dtype)
     return kernels
+
+
+def _register_production_variants_stage2(
+    kernels: Dict[str, Dict], a_dtype: str, b_dtype: str, out_dtype: str
+) -> None:
+    """Append hand-tuned stage2 variants to ``kernels`` in-place.
+
+    Pulled out of the 6-deep tile/mode/bnt/xcd cartesian product in
+    ``get_flydsl_stage2_kernels`` so we don't pay a ``base_name == "..."``
+    string special-case on every iteration. Each entry pins a specific
+    shape (tile/mode/dtype) and applies a hand-tuned override dict.
+    """
+    # (a, b, out, tile_m, tile_n, tile_k, mode, suffix, overrides)
+    PRODUCTION_VARIANTS = (
+        # EP4 DeepSeek prefill on MI355X (M=49152, model_dim=7168, inter_dim=2048):
+        #   use_async_copy=True  -- async X DMA in prologue overlaps with B/scale VMEM
+        #   cu_num_mul=3         -- persistent grid 3x CU count fills in-flight
+        #                           slack from small per-WG M tile counts;
+        #                           cu_num_mul=4 regresses ~2.4% on the same shape
+        #   waves_per_eu=4       -- best on EP4 prefill at cu_num_mul=3;
+        #                           wpe=5/6 underperform here
+        (
+            "fp4",
+            "fp4",
+            "bf16",
+            64,
+            128,
+            256,
+            "atomic",
+            "_persist_async_w4_cumul3",
+            {
+                "persist": True,
+                "use_async_copy": True,
+                "waves_per_eu": 4,
+                "cu_num_mul": 3,
+            },
+        ),
+    )
+    for pa, pb, pout, ptm, ptn, ptk, pmode, psuffix, povr in PRODUCTION_VARIANTS:
+        if (pa, pb, pout) != (a_dtype, b_dtype, out_dtype):
+            continue
+        _base = flydsl_kernel_name(2, pa, pb, pout, ptm, ptn, ptk, pmode)
+        if _base not in kernels:
+            continue
+        kernels[_base + psuffix] = {**kernels[_base], **povr}
 
 
 def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
@@ -380,6 +426,9 @@ def compile_flydsl_moe_stage2(
     accumulate: bool = True,
     persist_m: int = 1,
     sort_block_m: int = 0,
+    waves_per_eu: Optional[int] = None,
+    use_async_copy: bool = False,
+    cu_num_mul: int = 1,
     b_nt: int = 0,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
@@ -405,10 +454,18 @@ def compile_flydsl_moe_stage2(
             accumulate=accumulate,
             persist_m=persist_m,
             sort_block_m=sort_block_m,
+            waves_per_eu=waves_per_eu,
+            use_async_copy=use_async_copy,
+            cu_num_mul=cu_num_mul,
+            # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
+            # from the kernel-name parser. They are accepted as ignored
+            # kwargs on the fp4xfp4 path so callers parsing the
+            # `_bnt{N}` / `_xcd{N}` registry suffixes don't need
+            # per-dtype special cases.
             b_nt=b_nt,
+            xcd_swizzle=xcd_swizzle,
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
-            xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
@@ -624,11 +681,18 @@ def _s2_args_std(
 
 
 def _run_compiled(exe, args):
-    """Call the JitFunction with the given args.
-    JitFunction.__call__ handles compilation caching internally.
+    """First call: JIT-compile via flyc.compile (compiles + executes + returns CompiledFunction).
+    Subsequent calls: fast dispatch via the cached CompiledFunction.
     """
+    import flydsl.compiler as flyc
+
+    cf = getattr(exe, "_cf", None)
+    if cf is not None:
+        cf(*args)
+        return
     try:
-        exe(*args)
+        cf = flyc.compile(exe, *args)
+        exe._cf = cf
     except Exception:
         # JitFunction.__call__ leaks ir.Context on compilation failure,
         # causing all subsequent JitFunction calls to take a wrong code path
@@ -642,6 +706,84 @@ def _run_compiled(exe, args):
         except Exception:
             pass
         raise
+
+
+def _run_moe_reduction(
+    target,
+    out,
+    token_num,
+    topk,
+    model_dim,
+    expert_mask=None,
+    topk_ids=None,
+    stream=None,
+):
+    """Topk reduction epilogue for stage2 reduce mode.
+
+    Shared by the runtime stage2 path and the AOT precompile so both derive the
+    identical compile-time params (dtype_str / use_mask / num_experts) and thus
+    the identical JIT cache key. AOT must call this helper (not a hand-copied
+    variant) or the precompiled artifact will not match the runtime lookup.
+
+    ``stream`` defaults to the current CUDA stream; AOT passes ``stream=0`` since
+    it runs on CPU / FakeTensor under COMPILE_ONLY.
+    """
+    use_mask = expert_mask is not None
+    if use_mask and topk_ids is None:
+        raise ValueError(
+            "topk_ids is required when expert_mask is provided for reduce mode"
+        )
+    # Map torch dtype -> compile_moe_reduction dtype_str
+    if out.dtype == torch.float16:
+        _reduce_dtype_str = "f16"
+    elif out.dtype == torch.bfloat16:
+        _reduce_dtype_str = "bf16"
+    elif out.dtype == torch.float32:
+        _reduce_dtype_str = "f32"
+    else:
+        _reduce_dtype_str = None
+
+    if _reduce_dtype_str is None:
+        # Unsupported dtype for the masked kernel — fall back to torch.sum.
+        # This drops the EP mask, so only valid for non-EP runs.
+        if use_mask:
+            raise NotImplementedError(
+                f"Masked moe reduction not supported for dtype {out.dtype}"
+            )
+        torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+        return
+
+    from .kernels.moe_gemm_2stage import compile_moe_reduction
+
+    reduce_exe = compile_moe_reduction(
+        topk=topk,
+        model_dim=model_dim,
+        dtype_str=_reduce_dtype_str,
+        use_mask=use_mask,
+        # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
+        num_experts=int(expert_mask.numel()) if use_mask else 0,
+    )
+    X = target.view(token_num, topk, model_dim)
+    if use_mask:
+        em = expert_mask.to(torch.int32).contiguous()
+        tk = topk_ids.to(torch.int32).contiguous()
+    else:
+        # Placeholders; kernel ignores them when use_mask=False.
+        em = torch.empty(0, device=out.device, dtype=torch.int32)
+        tk = torch.empty(0, device=out.device, dtype=torch.int32)
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    _run_compiled(
+        reduce_exe,
+        (
+            _ptr_view_safe(X),
+            _ptr_view_safe(out),
+            _ptr_view_safe(em),
+            _ptr_view_safe(tk),
+            token_num,
+            stream,
+        ),
+    )
 
 
 @functools.cache
@@ -1050,6 +1192,9 @@ def flydsl_moe_stage2(
     sorted_weights: Optional[torch.Tensor] = None,
     sort_block_m: int = 0,
     persist: Optional[bool] = None,
+    waves_per_eu: Optional[int] = None,
+    use_async_copy: bool = False,
+    cu_num_mul: int = 1,
     b_nt: int = 0,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
@@ -1112,6 +1257,12 @@ def flydsl_moe_stage2(
                 dtype=torch_out_dtype,
                 device=inter_states.device,
             )
+    # NOTE: when ``accumulate=True`` (atomic mode), the caller is responsible
+    # for ensuring ``out`` is zero-initialized. In the standard ``fused_moe``
+    # dispatch path this is handled by ``moe_sorting_*_fwd`` which already
+    # zeros ``moe_buf`` via ``moe_buf_set_zero_kernel_2d``, so an extra
+    # ``out.fill_(0)`` here would be a redundant ~``token_num * model_dim``
+    # HBM write (~130us per call at MI355X HBM bw on EP4 prefill shape).
 
     dev = inter_states.device
     flat_a_scale = (
@@ -1209,6 +1360,9 @@ def flydsl_moe_stage2(
         accumulate=accumulate,
         persist_m=_persist_m,
         sort_block_m=sort_block_m,
+        waves_per_eu=waves_per_eu,
+        use_async_copy=use_async_copy,
+        cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
@@ -1218,56 +1372,8 @@ def flydsl_moe_stage2(
     _run_compiled(exe, args)
 
     if not accumulate and not return_per_slot:
-        use_mask = expert_mask is not None
-        if use_mask and topk_ids is None:
-            raise ValueError(
-                "topk_ids is required when expert_mask is provided for reduce mode"
-            )
-        # Map torch dtype -> compile_moe_reduction dtype_str
-        if out.dtype == torch.float16:
-            _reduce_dtype_str = "f16"
-        elif out.dtype == torch.bfloat16:
-            _reduce_dtype_str = "bf16"
-        elif out.dtype == torch.float32:
-            _reduce_dtype_str = "f32"
-        else:
-            _reduce_dtype_str = None
-
-        if _reduce_dtype_str is not None:
-            from .kernels.moe_gemm_2stage import compile_moe_reduction
-
-            reduce_exe = compile_moe_reduction(
-                topk=topk,
-                model_dim=model_dim,
-                dtype_str=_reduce_dtype_str,
-                use_mask=use_mask,
-                # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
-                num_experts=int(expert_mask.numel()) if use_mask else 0,
-            )
-            X = target.view(token_num, topk, model_dim)
-            if use_mask:
-                em = expert_mask.to(torch.int32).contiguous()
-                tk = topk_ids.to(torch.int32).contiguous()
-            else:
-                # Placeholders; kernel ignores them when use_mask=False.
-                em = torch.empty(0, device=out.device, dtype=torch.int32)
-                tk = torch.empty(0, device=out.device, dtype=torch.int32)
-            stream = torch.cuda.current_stream()
-            reduce_exe(
-                _ptr_view_safe(X),
-                _ptr_view_safe(out),
-                _ptr_view_safe(em),
-                _ptr_view_safe(tk),
-                token_num,
-                stream,
-            )
-        else:
-            # Unsupported dtype for the masked kernel — fall back to torch.sum.
-            # This drops the EP mask, so only valid for non-EP runs.
-            if use_mask:
-                raise NotImplementedError(
-                    f"Masked moe reduction not supported for dtype {out.dtype}"
-                )
-            torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+        _run_moe_reduction(
+            target, out, token_num, topk, model_dim, expert_mask, topk_ids
+        )
 
     return out
