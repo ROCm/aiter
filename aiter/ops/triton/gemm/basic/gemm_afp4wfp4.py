@@ -564,6 +564,7 @@ def gemm_afp4wfp4_preshuffle(
         ),
     )
 
+    config.pop("NUM_BUFFERS", None)
     _triton_gemm_afp4wfp4_preshuffle_kernel[grid](
         x_fp4,
         w_preshuf,
