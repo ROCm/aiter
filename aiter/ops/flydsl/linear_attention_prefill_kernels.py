@@ -34,6 +34,7 @@ import flydsl.expr as fx
 from flydsl.runtime.device import get_rocm_arch
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 from .kernels.chunk_gated_delta_h_kv import compile_chunk_gated_delta_h_kv
+from .kernels.chunk_gated_delta_h_vk import compile_chunk_gated_delta_h_vk
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_chunk_offsets,
     prepare_num_chunks,
@@ -685,6 +686,46 @@ def _get_or_compile_kv(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_vk(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+):
+    """Compile (and cache) the VK-layout K5 kernel (separate implementation,
+    forked from the KV variant: VWARP 16x16x16 + 3-wave). Same compile-time
+    config surface as the baseline / KV paths; distinct cache namespace."""
+    return compile_chunk_gated_delta_h_vk(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
 def _resolve_state_dtype(initial_state, state_dtype):
     """Mirror the legacy state-dtype resolution. Cheap; runs every call."""
     if initial_state is not None:
@@ -722,13 +763,17 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
     _use_kv: bool = False,
+    _use_vk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
 
     ``_use_kv=True`` selects the separate KV-layout implementation (VWARP
-    16x16x16 + 3-wave + coalesced KV h-store). It is only active when the
-    chosen BV is 64 (the VWARP gate); otherwise it falls back to the baseline
-    kernel. The public h layout stays VK (a transposed view is returned).
+    16x16x16 + 3-wave + coalesced KV h-store). ``_use_vk=True`` selects the
+    separate VK-layout implementation (forked from the KV variant; same VWARP
+    16x16x16 + 3-wave kernel, distinct cache namespace). Both are only active
+    when the chosen BV is 64 (the VWARP gate); otherwise they fall back to the
+    baseline kernel. ``_use_kv`` and ``_use_vk`` are mutually exclusive. The
+    public h layout stays VK (a transposed view is returned).
 
     Signature is API-compatible with
     ``aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h.chunk_gated_delta_rule_fwd_h_opt_vk``:
@@ -834,10 +879,24 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         BT=BT,
     )
 
-    # OPT-KV: pick the separate KV-layout kernel only when BV==64 (its VWARP
-    # gate); otherwise the baseline kernel handles all configs.
+    if _use_kv and _use_vk:
+        raise ValueError(
+            "FlyDSL K5: ``_use_kv`` and ``_use_vk`` are mutually exclusive; "
+            "pass at most one."
+        )
+
+    # OPT-KV / OPT-VK: pick the separate VWARP kernel only when BV==64 (the
+    # VWARP gate); otherwise the baseline kernel handles all configs. The KV
+    # fork stores h in [..., K, V] (coalesced) and returns a transposed VK
+    # view; the VK fork writes the public VK layout ([..., V, K]) directly.
     _kv_active = bool(_use_kv) and (BV == 64)
-    _compile_fn = _get_or_compile_kv if _kv_active else _get_or_compile
+    _vk_active = bool(_use_vk) and (BV == 64)
+    if _kv_active:
+        _compile_fn = _get_or_compile_kv
+    elif _vk_active:
+        _compile_fn = _get_or_compile_vk
+    else:
+        _compile_fn = _get_or_compile
     launch_fn = _compile_fn(
         K,
         V,
@@ -871,9 +930,12 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     grid_v = triton.cdiv(V, BV)
     grid_nh = N * H
 
-    # OPT-KV: when the KV impl is active (BV==64), h is stored [B, NT, H, K, V]
-    # (coalesced stores) and a transposed VK view is returned so the public
-    # layout stays VK. ``_kv_active`` was set at the compile-fn selection above.
+    # h hidden-state layout:
+    #   * baseline & VK fork  -> [B, NT, H, V, K] (true VK, K innermost).
+    #   * KV fork (BV==64)    -> [B, NT, H, K, V] (coalesced KV stores); a
+    #     transposed VK view is returned below so the public layout stays VK.
+    # ``_kv_active`` was set at the compile-fn selection above; the VK fork
+    # (``_vk_active``) writes the public VK layout directly, no view needed.
     h_shape = (B, NT, H, K, V) if _kv_active else (B, NT, H, V, K)
     vn_shape = (B, H, T_flat, V)
     vn_dtype = u.dtype
@@ -937,8 +999,9 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         stream,
     )
 
-    # OPT-KV: the KV kernel wrote h as [B, NT, H, K, V]; return a transposed
-    # VIEW so the public layout stays VK (zero-copy stride swap).
+    # OPT-KV: the KV fork wrote h as [B, NT, H, K, V]; return a transposed
+    # VIEW so the public layout stays VK (zero-copy stride swap). The VK fork
+    # writes the public VK layout ([..., V, K]) directly, so no view is needed.
     if _kv_active:
         h = h.transpose(-2, -1)
 
@@ -981,4 +1044,44 @@ def chunk_gated_delta_rule_fwd_h_flydsl_kv(
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
         _use_kv=True,
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_vk(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Separate VK-layout K5 implementation (forked from the KV variant;
+    VWARP 16x16x16 + 3-wave). API-identical to
+    ``chunk_gated_delta_rule_fwd_h_flydsl``; the VK kernel is used only when
+    the chosen BV is 64, else it falls back to the baseline. The returned h is
+    the usual VK layout (transposed view)."""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _use_vk=True,
     )

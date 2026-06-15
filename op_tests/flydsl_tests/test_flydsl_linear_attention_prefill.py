@@ -7,7 +7,7 @@ Usage:
     rm -rf ~/.triton/cache
     export GATED_DELTA_RULE_TRITON_AUTOTUNE=1
     FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 pytest -sv op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -s
-    FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 python -m pytest op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-16k-aws" -v -s
+    FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 python -m pytest op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-32k-aws" -v -s
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
         chunk_gated_delta_rule_fwd_h_flydsl,
         chunk_gated_delta_rule_fwd_h_flydsl_kv,
+        chunk_gated_delta_rule_fwd_h_flydsl_vk,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_h_opt_vk,
@@ -780,6 +781,47 @@ class TestCorrectness:
         )
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_flydsl_vk(self, args: PrefillArgs):
+        """Separate VK-layout FlyDSL K5 impl (forked from the KV variant;
+        VWARP 16x16x16 + 3-wave). Same VK public outputs as the baseline
+        flydsl path; only the BV==64 configs exercise the VK kernel, others
+        fall back."""
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_vk(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl_vk",
+        )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_correctness_triton_vk(self, args: PrefillArgs):
         """Triton VK K5 (h: [V, K]) -- same input/output layout as FlyDSL."""
         if args.ssm_state_dtype != torch.float32:
@@ -1036,6 +1078,17 @@ def _run_perf_comparison(args: PrefillArgs):
             cu_seqlens=cu,
         )
 
+    def flydsl_vk_launch():
+        chunk_gated_delta_rule_fwd_h_flydsl_vk(
+            k=k,
+            w=w_c,
+            u=u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
     def triton_vk_launch():
         chunk_gated_delta_rule_fwd_h_opt_vk(
             k=k,
@@ -1092,12 +1145,14 @@ def _run_perf_comparison(args: PrefillArgs):
     # kernel time, not the autotune sweep.
     flydsl_launch()
     flydsl_kv_launch()
+    flydsl_vk_launch()
     if _HAS_VLLM_K5:
         vllm_launch()
     torch.cuda.synchronize()
 
     us_fly = _bench_fn(flydsl_launch)
     us_fly_kv = _bench_fn(flydsl_kv_launch)
+    us_fly_vk = _bench_fn(flydsl_vk_launch)
     us_triton_vk = _bench_fn(triton_vk_launch)
     us_triton_origin_opt = _bench_fn(triton_origin_opt_launch)
     us_vllm = _bench_fn(vllm_launch) if _HAS_VLLM_K5 else float("nan")
@@ -1120,6 +1175,7 @@ def _run_perf_comparison(args: PrefillArgs):
             "final_st": args.output_final_state,
             "FlyDSL_vk(us)": us_fly,
             "FlyDSL_kv(us)": us_fly_kv,
+            "FlyDSL_vkfork(us)": us_fly_vk,
             "Triton_vk(us)": us_triton_vk,
             "Triton_origin_opt(us)": us_triton_origin_opt,
             "vLLM_vk(us)": us_vllm,
@@ -1153,6 +1209,7 @@ def _print_perf_table():
         ("fs", "final_st", 3),
         ("FlyDSL", "FlyDSL_vk(us)", 8),
         ("FlyDSL_kv", "FlyDSL_kv(us)", 9),
+        ("FlyDSL_vkf", "FlyDSL_vkfork(us)", 10),
         ("Tri_vk", "Triton_vk(us)", 8),
         ("Tri_orig_opt", "Triton_origin_opt(us)", 12),
         ("vLLM", "vLLM_vk(us)", 8),
