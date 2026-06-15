@@ -65,6 +65,26 @@ def _resolve_build_dir():
        Tried via both import paths: aiter.jit.core (runtime) and jit.core (the path
        setup.py puts on sys.path at build time).
     3. Fall back to ~/.aiter/build if aiter's jit core cannot be imported.
+
+    SCOPE / SIDE EFFECTS -- read before changing:
+      * This runs UNCONDITIONALLY at import time of this module. It is not gated by
+        PREBUILD_KERNELS / AITER_TRITON_ONLY / whether pa_ps is used, and BUILD_DIR
+        backs EVERY cpp_itfs template op (pa, pa_ps, mla, moe, sampling, ...), not
+        just pa_ps.
+      * Default move: with AITER_ROOT_DIR unset, the default cache dir changes from
+        the old ~/.aiter/build to get_user_jit_dir()/build. Any pre-upgrade cache
+        under ~/.aiter/build is thus orphaned -> the first run after upgrade triggers
+        a one-time JIT recompile into the new location for whatever cpp_itfs op gets
+        used (again, not only pa_ps).
+      * Import-time cost: case 2 imports aiter.jit.core, whose module body may
+        os.makedirs(bd_dir) and copytree the jit dir into ~/.aiter/jit if
+        site-packages isn't writable -- heavier than the old plain string join. There
+        is no circular import (aiter.jit.core does not import this module), and case 3
+        degrades gracefully to ~/.aiter/build if that import fails.
+      * Counterintuitive: setting AITER_ROOT_DIR (case 1) points BUILD_DIR at
+        <root>/build, which has NO wheel-prebuilt artifacts -> the prebuild benefit is
+        lost and the op JIT-recompiles there. compile_template_op logs a one-time
+        warning when it hits this so the loss isn't silent.
     """
     root = os.environ.get("AITER_ROOT_DIR")
     if root:
@@ -306,6 +326,38 @@ def not_built(folder):
     return not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so")
 
 
+# Folders we've already warned about, so the bypass notice fires at most once each.
+_prebuild_bypass_warned = set()
+
+
+def _warn_if_prebuild_bypassed(folder):
+    """Loudly note when AITER_ROOT_DIR redirected BUILD_DIR past a shipped prebuild.
+
+    Setting AITER_ROOT_DIR points BUILD_DIR at <root>/build, which has no
+    wheel-prebuilt .so, so the op JIT-recompiles even though the wheel shipped one.
+    That loss is otherwise silent. We only reach here on the (rare) compile path and
+    only when AITER_ROOT_DIR is set, so the extra import/stat is cheap; aiter.jit.core
+    is already loaded by the time any op compiles at runtime.
+    """
+    if not os.environ.get("AITER_ROOT_DIR") or folder in _prebuild_bypass_warned:
+        return
+    _prebuild_bypass_warned.add(folder)
+    try:
+        import importlib
+
+        jit_dir = importlib.import_module("aiter.jit.core").get_user_jit_dir()
+        packaged = os.path.join(jit_dir, "build", folder, "lib.so")
+        if os.path.exists(packaged):
+            logger.warning(
+                f"AITER_ROOT_DIR is set, so BUILD_DIR={BUILD_DIR}; a wheel-prebuilt "
+                f"kernel exists at {packaged} but is being ignored -- JIT-recompiling "
+                f"into {BUILD_DIR}/{folder}. Unset AITER_ROOT_DIR to use the shipped "
+                f"prebuild and skip this compile."
+            )
+    except Exception:
+        pass
+
+
 def compile_template_op(
     src_template,
     md_name,
@@ -323,6 +375,7 @@ def compile_template_op(
         folder = func_name
 
     if not_built(folder):
+        _warn_if_prebuild_bypassed(folder)
         if includes is None:
             includes = []
         if sources is None:
