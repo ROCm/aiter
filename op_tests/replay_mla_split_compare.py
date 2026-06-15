@@ -164,6 +164,83 @@ def _stage1_partials(b, dev, num_kv_splits):
         return None, None
 
 
+def _kernel_geom(b):
+    """Reconstruct the per-batch page geometry exactly as the asm kernel sees it
+    (SUB_KV = page_size pages, strided over `passes` splits), so NaN batches can
+    be correlated with full_pages / tail / tail_owner / per-split loop_cnt.
+
+    Mirrors sp3:
+      full_pages = n_pages - (tail_len>0 ? 1 : 0)         (sp3 6280-6288)
+      tail_len   = last_page_len   (0 if the last page is exactly full)
+      tail_owner = full_pages % passes                     (sp3 6303-6313)
+      loop_cnt(z)= 0 if full_pages<=z else (full_pages-1-z)//passes + 1  (sp3 6294-6301)
+    """
+    page_size = int(b["page_size"])
+    passes = 2
+    kvi = b["kv_indptr"].to(torch.int64)
+    klp = b["kv_last_page_lens"].to(torch.int64)
+    bs = kvi.numel() - 1
+    rows = []
+    for i in range(bs):
+        n_pages = int((kvi[i + 1] - kvi[i]).item())
+        last = int(klp[i].item()) if i < klp.numel() else 0
+        tail_len = last if (0 < last < page_size) else 0
+        full_pages = n_pages - (1 if tail_len > 0 else 0)
+        tail_owner = (full_pages % passes) if full_pages > 0 else -1
+        loop = [
+            (0 if full_pages <= z else (full_pages - 1 - z) // passes + 1)
+            for z in range(passes)
+        ]
+        rows.append(
+            {
+                "i": i,
+                "n_pages": n_pages,
+                "last": last,
+                "tail_len": tail_len,
+                "full_pages": full_pages,
+                "tail_owner": tail_owner,
+                "loop0": loop[0],
+                "loop1": loop[1],
+            }
+        )
+    return rows
+
+
+def _stage1_per_batch_diag(b, logits, attn_lse):
+    """Per-(batch) finiteness of stage1 partials, correlated with kernel page
+    geometry. Returns (nan_rows, ok_rows, summary_str)."""
+    qoi = b["qo_indptr"].to(torch.int64)
+    bs = qoi.numel() - 1
+    geom = _kernel_geom(b)
+    lg_fin = torch.isfinite(logits).reshape(logits.shape[0], -1)
+    lse_fin = torch.isfinite(attn_lse).reshape(attn_lse.shape[0], -1)
+    nan_rows, ok_rows = [], []
+    for i in range(bs):
+        r0, r1 = int(qoi[i]), int(qoi[i + 1])
+        if r1 <= r0:
+            continue
+        fin = bool(lg_fin[r0:r1].all()) and bool(lse_fin[r0:r1].all())
+        (ok_rows if fin else nan_rows).append(geom[i])
+
+    def _set(rows, key):
+        return sorted(set(r[key] for r in rows))
+
+    summary = ""
+    if nan_rows:
+        summary = (
+            f"NaN batches={len(nan_rows)}/{bs} | "
+            f"full_pages(nan)={_set(nan_rows,'full_pages')} "
+            f"tail_len(nan)={_set(nan_rows,'tail_len')} "
+            f"tail_owner(nan)={_set(nan_rows,'tail_owner')} "
+            f"loop0(nan)={_set(nan_rows,'loop0')} loop1(nan)={_set(nan_rows,'loop1')}\n"
+            f"      OK : full_pages={_set(ok_rows,'full_pages')} "
+            f"tail_len={_set(ok_rows,'tail_len')} "
+            f"tail_owner={_set(ok_rows,'tail_owner')} "
+            f"loop0={_set(ok_rows,'loop0')} loop1={_set(ok_rows,'loop1')}"
+        )
+    return nan_rows, ok_rows, summary
+
+
 def _fp32_ref(b, dev):
     """fp32 ground-truth MLA decode attention (decode_qlen=1)."""
     page_size = b["page_size"]
@@ -242,6 +319,8 @@ def replay_one(path, dev="cuda"):
     # asm stage1 kernel produced it (stage2 / seg-layout-of-stage2 exonerated).
     s1_logits_fin = s1_lse_fin = None
     s1_split_diag = ""
+    s1_geom_diag = ""
+    s1_nan_geom = []
     lg2, lse2 = _stage1_partials(b, dev, 2)
     if lg2 is not None:
         s1_logits_fin = bool(torch.isfinite(lg2).all().item())
@@ -257,6 +336,8 @@ def replay_one(path, dev="cuda"):
                 f"lse_bad_splits={bad_lse_splits} "
                 f"(=> asm stage1 wrote NaN; stage2 exonerated)"
             )
+            # correlate NaN batches with kernel page geometry
+            s1_nan_geom, _ok, s1_geom_diag = _stage1_per_batch_diag(b, lg2, lse2)
     # Per-row (per-token) finiteness of forced split=2, mapped back to its batch
     # so we can correlate NaN rows with that batch's KV length (pages). If NaNs
     # cluster on SHORT batches, the empty per-batch split is the culprit.
@@ -298,6 +379,8 @@ def replay_one(path, dev="cuda"):
         "stage1_logits_finite": s1_logits_fin,
         "stage1_lse_finite": s1_lse_fin,
         "stage1_diag": s1_split_diag,
+        "stage1_geom_diag": s1_geom_diag,
+        "stage1_nan_geom": s1_nan_geom,
         "nan_diag": nan_diag,
         "cos1_ref": _cos(o1c, ref) if f1 else float("nan"),
         "cos2_ref": _cos(o2c, ref) if f2 else float("nan"),
@@ -337,6 +420,8 @@ def main(arg):
         )
         if r.get("stage1_diag"):
             print(f"    -> {r['stage1_diag']}")
+        if r.get("stage1_geom_diag") and diag_printed < 5:
+            print(f"    -> {r['stage1_geom_diag']}")
         if r.get("nan_diag") and diag_printed < 5:
             print(f"    -> {r['nan_diag']}")
             diag_printed += 1
@@ -393,6 +478,29 @@ def main(arg):
                     f"{out_nan_s1_nan} already had NaN in stage1 partials "
                     f"(=> asm stage1 root cause; stage2 reduce exonerated)."
                 )
+
+        # Cross-dump geometry correlation: pool every NaN batch's page geometry
+        # to find the discriminating feature (the asm trigger condition).
+        all_nan_geom = []
+        for r in worst:
+            all_nan_geom.extend(r.get("stage1_nan_geom") or [])
+        if all_nan_geom:
+            def _dist(key):
+                from collections import Counter
+                c = Counter(g[key] for g in all_nan_geom)
+                return ", ".join(f"{k}:{v}" for k, v in sorted(c.items()))
+
+            print("\n=== stage1 NaN batch geometry (pooled over all dumps) ===")
+            print(f"  total NaN batches: {len(all_nan_geom)}")
+            print(f"  full_pages -> count : {_dist('full_pages')}")
+            print(f"  tail_len   -> count : {_dist('tail_len')}")
+            print(f"  tail_owner -> count : {_dist('tail_owner')}")
+            print(f"  loop0      -> count : {_dist('loop0')}")
+            print(f"  loop1      -> count : {_dist('loop1')}")
+            fp_par = {}
+            for g in all_nan_geom:
+                fp_par[g["full_pages"] % 2] = fp_par.get(g["full_pages"] % 2, 0) + 1
+            print(f"  full_pages%2 -> count : {dict(sorted(fp_par.items()))}")
 
         topn = sorted(worst, key=lambda r: -(r["relerr2_1"] if r["relerr2_1"] == r["relerr2_1"] else -1))[:10]
         print("\n=== worst 10 by max-rel-err(split2 vs split1) ===")

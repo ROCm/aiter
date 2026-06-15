@@ -71,6 +71,25 @@ fin2=False（split=2 全部出现 NaN），non-finite split2 outputs: 40/40
 - **非单调**：更长的序列(872 tok)反而 NaN，更短的(715 tok)反而 OK
   → 排除「第二个 split 为空」的经典空 split 解释，指向尾页/边界处理。
 
+#### 2.3.1 stage1-partial 探针实测结果（已确认）
+
+40/40 dump 全部命中，且决定性地把根因锁死在 stage1：
+
+```
+non-finite split2 outputs: 40/40
+stage1-partial probe: 40/40 dumps have NaN in stage1 (logits|attn_lse) BEFORE stage2.
+  of 40 dumps with non-finite split2 OUTPUT, 40 already had NaN in stage1 partials
+  (=> asm stage1 root cause; stage2 reduce exonerated).
+每条 dump: stage1 NaN: logits_bad_splits=[0, 1] lse_bad_splits=[0, 1]
+```
+
+两条强结论：
+1. **NaN 在 stage2 之前就已存在于 partial 缓冲** → stage2 reduce / seg 布局被彻底排除（见 §3.5）。
+2. **`logits_bad_splits=[0,1]`：两个 split 都 NaN**，不是只有尾页归属的那一个 split。
+   这推翻了「尾页只归属单个 split 才出错」的窄假设：passes=2 的 strided 多 pass 路径把
+   **split 0 和 split 1 双双污染**。结合 §2.3「只有 16/64 条序列出错」，
+   说明触发条件与**每条序列自身的页数/尾页奇偶**相关，但一旦触发，两个 pass 的 partial 都坏。
+
 ## 3. 关键事实核对
 
 ### 3.1 不是部署了旧 .co
@@ -141,9 +160,55 @@ asm stage1 多 pass 路径。
 - split=1（passes=1）尾页处理正确（`fin1=True`）；
 - passes=2 的 strided + 尾页路径对部分序列（与尾页长度 / 尾页归属奇偶相关）产出 NaN。
 
-> 待确认项：NaN 是否集中在「尾页归属到非 0 号 split」或某些 `tail_len`。
-> 可在 replay 中对每条 NaN/OK 序列额外打印 `full_pages、tail_len、tail_owner=full_pages%passes`
-> 做相关性分析，以精确锁定 sp3 中尾页 masking 的具体指令段。
+### 4.1 静态逐指令核对（已排除项 + 剩余可疑面）
+
+为定位到具体指令，对 sp3 中所有用到 `_s_passes`/`_s_tg_idz` 的多 pass 专有代码逐条核对。
+**以下均已确认与 split=1 全局语义一致、计算正确**，可从嫌疑中排除：
+
+| 区段 | 行号 | 作用 | 核对结论 |
+|---|---|---|---|
+| qh128 z 维解包 | 6221-6224 | `tg_idx=z&1`(qh64 组), `tg_idz=z>>1`(真 split) | 正确，passes 用解包后的 split 数 |
+| 页计费 | 6280-6288 | `full_pages=n_pages-(tail?1:0)`，`total_ps=full_pages*64+tail_len` | 正确（total_ps=全局 seqlen） |
+| 空 split 早退 | 6290-6292 | `tg_idz*64>=total_ps` 才退 | 长序列(>64)两 split 都不早退，无关 |
+| 每 split loop_cnt | 6294-6301 | `(full_pages-1-tg_idz)/passes+1` | 正确（strided 满页计数） |
+| tail_owner | 6303-6316 | `full_pages%passes` 拥有尾页 | 正确 |
+| LTD 双缓冲偏移 | 6318-6323 | `off=tg_idz*4`，`inc=passes*4` | 正确（strided 取页索引） |
+| LTD 步进 | 2403-2405 | 每页 `off+=passes*4` | 正确 |
+| LTD→CKV 地址 | 1241-1249 | `CKV+=(KPAGE)*LTD[idx]` | 正确 |
+| 掩码边界(主循环) | 6133-6141 | `kv_top_eidx=total_ps`，`mask_idx=(tg_idz+1)*64`，`inc=passes*64` | 正确（全局行索引） |
+| 掩码边界(尾循环) | 5632-5638 | `mask_idx=((loop_cnt-1)*passes+tg_idz+1)*64` | 正确 |
+| R/LSE 写出偏移 | 5947-5966 / 5970-5992 | split 维偏移 `tg_idz` | 正确（且若写错位会留下哨兵=finite，与实测 NaN 矛盾，故排除寻址错位） |
+
+**关键推论**：既然每个 split 的页集合、掩码边界、取页地址都全局正确，则
+「某行被全部掩成 NEG_INF → softmax 分母 0 → 0/0=NaN」这一解释**不成立**
+（正确掩码下两 split 各有多页有效）。因此 NaN 只能来自：
+**多 pass 流水线 overlap 路径里，对特定页数序列的 K/V 数据通路或累加器/LDS slot 的破坏**
+（计算出 inf→exp 溢出→NaN），而非标量页计费/掩码。
+
+### 4.2 用页几何关联锁定触发条件（新增工具）
+
+`replay_mla_split_compare.py` 已新增 `_kernel_geom()` + `_stage1_per_batch_diag()`：
+对每个 NaN/OK batch 还原内核视角的 `full_pages / tail_len / tail_owner / loop0 / loop1`，
+并在汇总里**池化所有 dump 的 NaN batch** 打印各特征的分布，用来回答：
+NaN 是否集中在某个 `full_pages` 奇偶 / 某段 `loop_cnt` / 某个 `tail_owner`。
+
+> 下一步（需在 ff_mla 跑）：看 `=== stage1 NaN batch geometry (pooled) ===` 的分布。
+> - 若 NaN 全部 `full_pages%2==X` 或集中在某 `loop0/loop1` 值 → 锁定到流水线对应 `loop_cnt`
+>   分支（`final_loop_0/1` 的 `last_loop[parity]`，sp3 5640-5790；或 core_loop 的尾页 drain）。
+> - 若与 `tail_owner` 强相关 → 锁定尾页 drain 的 K/V slot（`GEMMV_tail_drain_*` / `GEMMK_tail_drain`）。
+> 这能把范围从「整个多 pass 路径」收敛到具体的流水线分支与 drain 宏，再对那几条
+> `s_wait_*` / slot 递增/`VGPR_init` 指令做修复。
+
+> **§2.3.1 实测修正**：探针显示触发序列的 `logits_bad_splits=[0,1]`——**两个 split 的 partial 都坏**，
+> 不是只有「尾页归属的那个 split」。因此 bug 不是单纯的尾页 masking 漏写，而更像是
+> **passes=2 时 strided 页遍历/累加器（或共享的尾页边界寄存器）被破坏，污染了同一 work-group
+> 内两个 pass 的累加**。下一步应在 sp3 中重点审查：
+> - `int_div_ss(.., div1, passes)`（行 6300）后 strided 页步进 `LTD_buf_inc=passes*4`（行 6318–6319）
+>   是否在 passes>1 时把累加器初始化 / 边界寄存器算错；
+> - `total_ps`、`tail_len`、`tail_owner=full_pages%passes`（行 6286–6316）的计算在 passes=2 下
+>   是否对**两个 split 都**产生越界/未初始化访问。
+> 可在 replay 中对每条 NaN/OK 序列额外打印 `full_pages、tail_len、tail_owner` 做相关性分析，
+> 锁定触发的页数/尾页特征。
 
 ## 5. 修复建议
 
