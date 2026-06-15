@@ -1112,6 +1112,68 @@ class CustomAllreduce:
         )
         return q_out, k_out, v_out
 
+    def custom_fused_ar_mhc_fused_post_pre_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_in: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: torch.Tensor,
+        *,
+        rms_eps: float = 1e-6,
+        hc_pre_eps: float = 1e-6,
+        hc_sinkhorn_eps: float = 1e-6,
+        hc_post_mult_value: float = 1.0,
+        sinkhorn_repeat: int = 20,
+        norm_eps: float = 1e-6,
+        use_new: bool = True,
+        open_fp8_quant: bool = False,
+        registered: bool = False,
+    ):
+        from aiter.ops.custom_all_reduce import (
+            launch_fused_allreduce_mhc_fused_post_pre_rmsnorm,
+        )
+
+        if self.disabled:
+            m = inp.size(0)
+            hidden_size = inp.size(-1)
+            hc_mult = residual_in.size(1)
+            device = inp.device
+            return (
+                torch.empty(m, hc_mult, 1, dtype=torch.float32, device=device),
+                torch.empty(m, hc_mult, hc_mult, dtype=torch.float32, device=device),
+                torch.empty(m, hidden_size, dtype=inp.dtype, device=device),
+                torch.empty_like(residual_in),
+            )
+
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        return launch_fused_allreduce_mhc_fused_post_pre_rmsnorm(
+            self._ptr,
+            inp,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+            norm_eps=norm_eps,
+            use_new=use_new,
+            open_fp8_quant=open_fp8_quant,
+            reg_ptr=reg,
+            reg_bytes=reg_bytes,
+            force_fused=True,
+        )
+
     def custom_fused_qknorm_ar(
         self,
         qkv_in: torch.Tensor,

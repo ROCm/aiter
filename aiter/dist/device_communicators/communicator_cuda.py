@@ -504,6 +504,100 @@ class CudaCommunicator(DeviceCommunicatorBase):
         assert v_out is not None
         return q_out, k_out, v_out
 
+    def fused_allreduce_mhc_fused_post_pre_rmsnorm(
+        self,
+        input_,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight,
+        *,
+        rms_eps: float = 1e-6,
+        hc_pre_eps: float = 1e-6,
+        hc_sinkhorn_eps: float = 1e-6,
+        hc_post_mult_value: float = 1.0,
+        sinkhorn_repeat: int = 20,
+        norm_eps: float = 1e-6,
+        force_fused: bool = True,
+        use_new: bool = True,
+        open_fp8_quant: bool = False,
+        prefill_support: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_, prefill_support)
+        ):
+            return ca_comm.custom_fused_ar_mhc_fused_post_pre_rmsnorm(
+                input_,
+                residual_in,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                norm_weight,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_repeat=sinkhorn_repeat,
+                norm_eps=norm_eps,
+                use_new=use_new,
+                open_fp8_quant=open_fp8_quant,
+            )
+
+        reduced = self.all_reduce(
+            input_, use_new, open_fp8_quant, prefill_support=prefill_support
+        )
+        from aiter.ops.mhc import mhc_fused_post_pre, mhc_fused_post_pre_large_m
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        m = reduced.size(0)
+        if (
+            force_fused
+            and get_gfx_runtime() == "gfx950"
+            and m > 1024
+        ):
+            return mhc_fused_post_pre_large_m(
+                reduced,
+                residual_in,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                norm_weight,
+                norm_eps,
+            )
+
+        return mhc_fused_post_pre(
+            reduced,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+            force_fused,
+        )
+
     def fused_allreduce_rmsnorm_mxfp4_quant(
         self,
         input_,

@@ -163,6 +163,60 @@ def tensor_model_parallel_fused_qknorm_allreduce(
     )
 
 
+def tensor_model_parallel_fused_allreduce_mhc_fused_post_pre_rmsnorm(
+    input_: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    *,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_eps: float = 1e-6,
+    force_fused: bool = True,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    prefill_support: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Tensor-parallel native AllReduce + MHC post/pre + RMSNorm.
+
+    Uses the custom-allreduce + MHC fused module when custom AR is available.
+    The native entry launches custom allreduce and the existing MHC fused
+    post/pre + RMSNorm kernels on one HIP stream without a Python-level
+    ``all_reduce`` -> ``mhc_fused_post_pre`` split. Falls back to the composed
+    path when custom AR is disabled or unsupported for the shape.
+    """
+    _assert_no_custom_group(
+        "tensor_model_parallel_fused_allreduce_mhc_fused_post_pre_rmsnorm"
+    )
+    return get_tp_group().fused_allreduce_mhc_fused_post_pre_rmsnorm(
+        input_,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        norm_eps=norm_eps,
+        force_fused=force_fused,
+        use_new=use_new,
+        open_fp8_quant=open_fp8_quant,
+        prefill_support=prefill_support,
+    )
+
+
 def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
     _assert_no_custom_group("tensor_model_parallel_custom_all_gather")
     return get_tp_group().custom_all_gather(input_)

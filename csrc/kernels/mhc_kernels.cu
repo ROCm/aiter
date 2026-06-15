@@ -10,6 +10,10 @@
 #include "rocprim/rocprim.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
+#ifdef AITER_FUSED_AR_MHC_MODULE
+#include "custom_all_reduce.h"
+#include "custom_all_reduce.cuh"
+#endif
 
 
 namespace aiter {
@@ -1088,7 +1092,7 @@ namespace aiter {
 
     void mhc_post(
         torch::Tensor& out,
-        torch::Tensor& x, // (m, hc_mult, h)
+        torch::Tensor& x, // (m, hidden_size)
         torch::Tensor& residual, // (m, hc_mult, hidden_size)
         torch::Tensor& post_layer_mix, // (m, hc_mult)
         torch::Tensor& comb_res_mix, // (m, hc_mult, hc_mult)
@@ -1116,8 +1120,7 @@ namespace aiter {
 
 
     template <typename DTYPE_I, int block_size, int hc_mult, int num_rows, int hidden_size, int residual_block, int norm_block, bool use_nt>
-    __global__ __launch_bounds__(block_size,2)
-    void mhc_pre_big_fuse_rmsnorm_kernel(
+    __device__ void mhc_pre_big_fuse_rmsnorm_impl(
         float* post_mix,
         float* comb_mix,
         DTYPE_I* out,
@@ -1136,8 +1139,9 @@ namespace aiter {
         float norm_eps,
         float hc_post_mult_value,
         int sinkhorn_repeat,
-        int n_splits
-    )
+        int n_splits,
+        int bf_block_idx,
+        char* s_work)
     {
         static constexpr int cache_policy = use_nt ? GROUP_NT : RT;
         using opus::operator""_I;
@@ -1157,7 +1161,6 @@ namespace aiter {
         static_assert(num_rows * hc_mult * residual_block % pre_thread_num == 0 && pre_thread_num > 0, 
             "num_rows * hc_mult * residual_block must be divisible by pre_thread_num");
         __shared__ float s_hc_mult3[num_rows * hc_mult3];
-        extern __shared__ char s_work[];
         DTYPE_I* s_layer_input = reinterpret_cast<DTYPE_I*>(s_work);
         float* s_pre_rms_partial = reinterpret_cast<float*>(s_work);
         float* s_hc_mult3_partial = reinterpret_cast<float*>(s_work) + num_rows * warp_num_pow2;
@@ -1165,7 +1168,7 @@ namespace aiter {
         using fp32x4_t = opus::vector_t<float, 4>;
         using floatx8_t = opus::vector_t<float, 8>;
         using halfx8_t = opus::vector_t<DTYPE_I, 8>;
-        const int m_idx = num_rows * blockIdx.x;
+        const int m_idx = num_rows * bf_block_idx;
         const int lane_id = threadIdx.x % warp_size;
         int warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x / warp_size);
         const int m_oob = m < m_idx + num_rows ? (m - m_idx) : num_rows;
@@ -1531,6 +1534,54 @@ namespace aiter {
         }
     }
 
+    template <typename DTYPE_I, int block_size, int hc_mult, int num_rows, int hidden_size, int residual_block, int norm_block, bool use_nt>
+    __global__ __launch_bounds__(block_size, 2)
+    void mhc_pre_big_fuse_rmsnorm_kernel(
+        float* post_mix,
+        float* comb_mix,
+        DTYPE_I* out,
+        float* gemm_out_mul,
+        float* gemm_out_sqrsum,
+        float* hc_scale,
+        float* hc_base,
+        DTYPE_I* residual,
+        DTYPE_I* norm_weight,
+        int m,
+        int gemm_out_mul_stride,
+        int residual_stride,
+        float rms_eps,
+        float hc_pre_eps,
+        float hc_sinkhorn_eps,
+        float norm_eps,
+        float hc_post_mult_value,
+        int sinkhorn_repeat,
+        int n_splits)
+    {
+        extern __shared__ char s_work[];
+        mhc_pre_big_fuse_rmsnorm_impl<DTYPE_I, block_size, hc_mult, num_rows, hidden_size, residual_block, norm_block, use_nt>(
+            post_mix,
+            comb_mix,
+            out,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            residual,
+            norm_weight,
+            m,
+            gemm_out_mul_stride,
+            residual_stride,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            norm_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            blockIdx.x,
+            s_work);
+    }
+
 #define MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(block_size, hc_mult, num_rows, hidden_size, residual_block, norm_block, use_nt) \
     TORCH_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
     TORCH_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
@@ -1640,8 +1691,7 @@ namespace aiter {
     }
 
     template <typename DTYPE_I, int block_size, int hc_mult, int tile_m, int tile_n, int tile_k, bool store_nt>
-    __global__ __launch_bounds__(block_size, 1)
-    void mhc_fused_post_pre_gemm_sqrsum_kernel(
+    __device__ void mhc_fused_post_pre_gemm_sqrsum_impl(
         float* out,
         float* sqrsum,
         DTYPE_I* next_residual,
@@ -1969,6 +2019,39 @@ namespace aiter {
         }
     }
 
+    template <typename DTYPE_I, int block_size, int hc_mult, int tile_m, int tile_n, int tile_k, bool store_nt>
+    __global__ __launch_bounds__(block_size, 1)
+    void mhc_fused_post_pre_gemm_sqrsum_kernel(
+        float* out,
+        float* sqrsum,
+        DTYPE_I* next_residual,
+        DTYPE_I* x,
+        DTYPE_I* residual,
+        float* fn,
+        float* post_layer_mix,
+        float* comb_res_mix,
+        int m,
+        int hidden_size,
+        int x_stride,
+        int out_stride,
+        int split_k = 1)
+    {
+        mhc_fused_post_pre_gemm_sqrsum_impl<DTYPE_I, block_size, hc_mult, tile_m, tile_n, tile_k, store_nt>(
+            out,
+            sqrsum,
+            next_residual,
+            x,
+            residual,
+            fn,
+            post_layer_mix,
+            comb_res_mix,
+            m,
+            hidden_size,
+            x_stride,
+            out_stride,
+            split_k);
+    }
+
 #define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(block_size, tile_m, tile_n, tile_k, store_nt) \
     AITER_DISPATCH_FLOATING16_TYPES(layer_input.scalar_type(), "mhc_fused_post_pre_gemm_sqrsum", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
@@ -2091,5 +2174,617 @@ namespace aiter {
         MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
     }
 
+#ifdef AITER_FUSED_AR_MHC_MODULE
+    // -------------------------------------------------------------------------
+    // AR reduce-scatter + MHC fused post/pre GEMM + big_fuse RMSNorm in ONE kernel.
+    // Phase 1: custom AR RS writes reduced activations into IPC tmps (no layer_input).
+    // Phase 2: mhc_fused_post_pre_gemm_sqrsum_impl reads x directly from tmps.
+    // Phase 3: mhc_pre_big_fuse_rmsnorm_impl on bf blocks after GEMM grid sync.
+    // sync_flags[0]=rs_done, sync_flags[1]=gemm_done, sync_flags[2]=gemm_count
+    // -------------------------------------------------------------------------
+
+    template <typename T, int NGPUS, typename DTYPE_I>
+    __global__ void __launch_bounds__(512, 1) fused_ar_mhc_rs_kernel(
+        RankData* _dp,
+        RankSignals sg,
+        Signal* self_sg,
+        int rank,
+        int rs_grid_x,
+        int m,
+        int hidden_dim,
+        int input_hidden_dim)
+    {
+        constexpr int pack_size = 16 / sizeof(T);
+        constexpr int tnum_gpu  = THREAD_NUM / NGPUS;
+        using P                 = typename opus::vector_t<T, pack_size>;
+        using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+
+        if(blockIdx.y != 0 || blockIdx.z != 0 || blockIdx.x >= rs_grid_x)
+        {
+            return;
+        }
+
+        __shared__ T tmp_smem[tnum_gpu * NGPUS * pack_size];
+        int warp_id = threadIdx.x / tnum_gpu;
+        int lane_id = threadIdx.x % tnum_gpu;
+        int tid     = blockIdx.x * tnum_gpu + lane_id;
+        int valid_pack_count = hidden_dim / pack_size;
+        int input_pack_count = input_hidden_dim / pack_size;
+        const P* ptrs[NGPUS];
+        P* tmps[NGPUS];
+#pragma unroll
+        for(int i = 0; i < NGPUS; ++i)
+        {
+            ptrs[i] = (const P*)_dp->ptrs[i];
+            tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+        }
+        start_sync<NGPUS>(sg, self_sg, rank);
+
+        int part = m * valid_pack_count / NGPUS;
+        for(int idx = tid; idx < part; idx += rs_grid_x * tnum_gpu)
+        {
+            int flat_idx  = rank * part + idx;
+            int row       = flat_idx / valid_pack_count;
+            int col       = flat_idx % valid_pack_count;
+            int input_idx = row * input_pack_count + col;
+            P input_reg   = ptrs[warp_id][input_idx];
+            *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
+            __syncthreads();
+            if(warp_id == 0)
+            {
+                A add_reg{};
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    add_reg[i] = upcast_s(tmp_smem[pack_size * threadIdx.x + i]);
+                }
+#pragma unroll
+                for(int i = 1; i < NGPUS; ++i)
+                {
+#pragma unroll
+                    for(int j = 0; j < pack_size; ++j)
+                    {
+                        add_reg[j] +=
+                            upcast_s(tmp_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
+                    }
+                }
+                P add_rslt;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    add_rslt[i] = downcast_s<T>(add_reg[i]);
+                }
+                *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
+            }
+            __syncthreads();
+            P rslt                           = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
+            tmps[warp_id][rank * part + idx] = rslt;
+        }
+        end_sync<NGPUS, false>(sg, self_sg, rank);
+    }
+
+    template <typename T,
+              int NGPUS,
+              typename DTYPE_I,
+              int gemm_block_size,
+              int hc_mult,
+              int tile_m,
+              int tile_n,
+              int tile_k,
+              bool store_nt,
+              int bf_block_size,
+              int bf_num_rows,
+              int bf_hidden,
+              int bf_res_block,
+              int bf_norm_block,
+              bool bf_use_nt>
+    __global__ void __launch_bounds__(512, 2)
+    fused_ar_mhc_full_unified_kernel(
+        RankData* _dp,
+        RankSignals sg,
+        Signal* self_sg,
+        int rank,
+        int rs_grid_x,
+        int mb,
+        int m_blocks_bf,
+        unsigned gemm_blocks_total,
+        int* sync_flags,
+        float* gemm_out,
+        float* sqrsum,
+        DTYPE_I* next_residual,
+        DTYPE_I* residual,
+        float* fn,
+        float* post_layer_mix,
+        float* comb_res_mix,
+        float* post_mix,
+        float* comb_mix,
+        DTYPE_I* layer_input_out,
+        float* hc_scale,
+        float* hc_base,
+        DTYPE_I* norm_weight,
+        int m,
+        int hidden_dim,
+        int input_hidden_dim,
+        int out_stride,
+        int residual_stride,
+        int split_k,
+        float rms_eps,
+        float hc_pre_eps,
+        float hc_sinkhorn_eps,
+        float norm_eps,
+        float hc_post_mult_value,
+        int sinkhorn_repeat)
+    {
+        constexpr int pack_size = 16 / sizeof(T);
+        constexpr int tnum_gpu  = THREAD_NUM / NGPUS;
+        using P                   = typename opus::vector_t<T, pack_size>;
+        using A                   = typename opus::vector_t<opus::fp32_t, pack_size>;
+
+        const bool rs_block =
+            (blockIdx.y == 0 && blockIdx.z == 0 && blockIdx.x < rs_grid_x);
+
+        if(rs_block)
+        {
+            __shared__ T tmp_smem[tnum_gpu * NGPUS * pack_size];
+            int warp_id = threadIdx.x / tnum_gpu;
+            int lane_id = threadIdx.x % tnum_gpu;
+            int tid     = blockIdx.x * tnum_gpu + lane_id;
+            int valid_pack_count  = hidden_dim / pack_size;
+            int input_pack_count  = input_hidden_dim / pack_size;
+            const P* ptrs[NGPUS];
+            P* tmps[NGPUS];
+#pragma unroll
+            for(int i = 0; i < NGPUS; ++i)
+            {
+                ptrs[i] = (const P*)_dp->ptrs[i];
+                tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+            }
+            start_sync<NGPUS>(sg, self_sg, rank);
+
+            int part = m * valid_pack_count / NGPUS;
+            for(int idx = tid; idx < part; idx += rs_grid_x * tnum_gpu)
+            {
+                int flat_idx  = rank * part + idx;
+                int row       = flat_idx / valid_pack_count;
+                int col       = flat_idx % valid_pack_count;
+                int input_idx = row * input_pack_count + col;
+                P input_reg   = ptrs[warp_id][input_idx];
+                *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
+                __syncthreads();
+                if(warp_id == 0)
+                {
+                    A add_reg{};
+#pragma unroll
+                    for(int i = 0; i < pack_size; ++i)
+                    {
+                        add_reg[i] = upcast_s(tmp_smem[pack_size * threadIdx.x + i]);
+                    }
+#pragma unroll
+                    for(int i = 1; i < NGPUS; ++i)
+                    {
+#pragma unroll
+                        for(int j = 0; j < pack_size; ++j)
+                        {
+                            add_reg[j] +=
+                                upcast_s(tmp_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
+                        }
+                    }
+                    P add_rslt;
+#pragma unroll
+                    for(int i = 0; i < pack_size; ++i)
+                    {
+                        add_rslt[i] = downcast_s<T>(add_reg[i]);
+                    }
+                    *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
+                }
+                __syncthreads();
+                P rslt                           = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
+                tmps[warp_id][rank * part + idx] = rslt;
+            }
+            end_sync<NGPUS, false>(sg, self_sg, rank);
+            __syncthreads();
+            if(threadIdx.x == 0)
+            {
+                atomicExch(reinterpret_cast<unsigned*>(&sync_flags[0]), 1u);
+            }
+        }
+
+        if(!rs_block)
+        {
+            while(atomicAdd(reinterpret_cast<unsigned*>(&sync_flags[0]), 0u) == 0u)
+            {
+            }
+        }
+        __threadfence_system();
+
+        const int mb_local = (m + tile_m - 1) / tile_m;
+        if(blockIdx.x < mb_local && threadIdx.x < gemm_block_size)
+        {
+            DTYPE_I* x_tmps = reinterpret_cast<DTYPE_I*>(get_tmp_buf<T>(self_sg));
+            mhc_fused_post_pre_gemm_sqrsum_impl<DTYPE_I,
+                                                gemm_block_size,
+                                                hc_mult,
+                                                tile_m,
+                                                tile_n,
+                                                tile_k,
+                                                store_nt>(gemm_out,
+                                                          sqrsum,
+                                                          next_residual,
+                                                          x_tmps,
+                                                          residual,
+                                                          fn,
+                                                          post_layer_mix,
+                                                          comb_res_mix,
+                                                          m,
+                                                          hidden_dim,
+                                                          hidden_dim,
+                                                          out_stride,
+                                                          split_k);
+        }
+
+        if(blockIdx.x < mb_local && threadIdx.x == 0)
+        {
+            unsigned* gemm_count = reinterpret_cast<unsigned*>(&sync_flags[2]);
+            if(atomicAdd(gemm_count, 1u) + 1u == gemm_blocks_total)
+            {
+                atomicExch(reinterpret_cast<unsigned*>(&sync_flags[1]), 1u);
+            }
+        }
+
+        const int bf_x = static_cast<int>(blockIdx.x) - mb;
+        const bool bf_block =
+            (blockIdx.y == 0 && blockIdx.z == 0 && bf_x >= 0 && bf_x < m_blocks_bf);
+        const bool gemm_block = (blockIdx.x < mb_local);
+        if(gemm_block || bf_block)
+        {
+            while(atomicAdd(reinterpret_cast<unsigned*>(&sync_flags[1]), 0u) == 0u)
+            {
+            }
+            __threadfence_system();
+        }
+
+        if(bf_block && threadIdx.x < bf_block_size)
+        {
+            extern __shared__ char s_bf_work[];
+            mhc_pre_big_fuse_rmsnorm_impl<DTYPE_I,
+                                          bf_block_size,
+                                          hc_mult,
+                                          bf_num_rows,
+                                          bf_hidden,
+                                          bf_res_block,
+                                          bf_norm_block,
+                                          bf_use_nt>(post_mix,
+                                                     comb_mix,
+                                                     layer_input_out,
+                                                     gemm_out,
+                                                     sqrsum,
+                                                     hc_scale,
+                                                     hc_base,
+                                                     next_residual,
+                                                     norm_weight,
+                                                     m,
+                                                     out_stride,
+                                                     residual_stride,
+                                                     rms_eps,
+                                                     hc_pre_eps,
+                                                     hc_sinkhorn_eps,
+                                                     norm_eps,
+                                                     hc_post_mult_value,
+                                                     sinkhorn_repeat,
+                                                     split_k,
+                                                     bf_x,
+                                                     s_bf_work);
+        }
+    }
+
+    // Keep legacy alias for tooling; full path uses fused_ar_mhc_full_unified_kernel.
+    template <typename T,
+              int NGPUS,
+              typename DTYPE_I,
+              int block_size,
+              int hc_mult,
+              int tile_m,
+              int tile_n,
+              int tile_k,
+              bool store_nt>
+    __global__ void __launch_bounds__(256, 1) fused_ar_mhc_gemm_sqrsum_unified_kernel(
+        RankData* _dp,
+        RankSignals sg,
+        Signal* self_sg,
+        int rank,
+        float* gemm_out,
+        float* sqrsum,
+        DTYPE_I* next_residual,
+        DTYPE_I* residual,
+        float* fn,
+        float* post_layer_mix,
+        float* comb_res_mix,
+        int m,
+        int hidden_dim,
+        int out_stride,
+        int split_k)
+    {
+        const int mb = (m + tile_m - 1) / tile_m;
+        if(blockIdx.x < mb && threadIdx.x < block_size)
+        {
+            DTYPE_I* x_tmps = reinterpret_cast<DTYPE_I*>(get_tmp_buf<T>(self_sg));
+            mhc_fused_post_pre_gemm_sqrsum_impl<DTYPE_I,
+                                                block_size,
+                                                hc_mult,
+                                                tile_m,
+                                                tile_n,
+                                                tile_k,
+                                                store_nt>(gemm_out,
+                                                          sqrsum,
+                                                          next_residual,
+                                                          x_tmps,
+                                                          residual,
+                                                          fn,
+                                                          post_layer_mix,
+                                                          comb_res_mix,
+                                                          m,
+                                                          hidden_dim,
+                                                          hidden_dim,
+                                                          out_stride,
+                                                          split_k);
+        }
+    }
+
+#define FUSED_AR_MHC_FULL_UNIFIED_KERNEL_IMPL_(gemm_block_size, tile_m, tile_n, tile_k, store_nt, bf_block_size, bf_num_rows, bf_hidden, bf_res_block, bf_norm_block, bf_use_nt, ngpus) \
+    AITER_DISPATCH_FLOATING16_TYPES(inp.scalar_type(), "fused_ar_mhc_full_unified", [&] { \
+        using DTYPE_I = typename t2opus<scalar_t>::type; \
+        using T       = DTYPE_I; \
+        int mb        = (m + tile_m - 1) / tile_m; \
+        int n_blocks  = (hc_mult3 + tile_n - 1) / tile_n; \
+        int m_blocks_bf = (m + bf_num_rows - 1) / bf_num_rows; \
+        dim3 grid(std::max(rs_grid_x, mb), n_blocks, split_k); \
+        dim3 block(gemm_block_size); \
+        unsigned gemm_blocks_total = static_cast<unsigned>(mb * n_blocks * split_k); \
+        size_t layer_input_smem = static_cast<size_t>(bf_num_rows) * static_cast<size_t>(bf_hidden) * sizeof(DTYPE_I); \
+        constexpr int hc_mult3_local = 4 * 4 + 2 * 4; \
+        constexpr int hc_mult3_threads = bf_num_rows * hc_mult3_local / 4; \
+        constexpr int reduce_splits_per_round = bf_block_size / hc_mult3_threads; \
+        size_t hc_partial_smem = static_cast<size_t>(reduce_splits_per_round) * static_cast<size_t>(bf_num_rows) * static_cast<size_t>(hc_mult3_local) * sizeof(float); \
+        size_t smem_bytes = layer_input_smem > hc_partial_smem ? layer_input_smem : hc_partial_smem; \
+        fused_ar_mhc_full_unified_kernel<T, ngpus, DTYPE_I, gemm_block_size, 4, tile_m, tile_n, tile_k, store_nt, bf_block_size, bf_num_rows, bf_hidden, bf_res_block, bf_norm_block, bf_use_nt> \
+            <<<grid, block, smem_bytes, stream>>>(ptrs, \
+                                                  fa->sg_, \
+                                                  fa->self_sg_, \
+                                                  fa->rank_, \
+                                                  rs_grid_x, \
+                                                  mb, \
+                                                  m_blocks_bf, \
+                                                  gemm_blocks_total, \
+                                                  sync_flags_ptr, \
+                                                  reinterpret_cast<float*>(gemm_out_mul.data_ptr()), \
+                                                  reinterpret_cast<float*>(gemm_out_sqrsum.data_ptr()), \
+                                                  reinterpret_cast<DTYPE_I*>(next_residual.data_ptr()), \
+                                                  reinterpret_cast<DTYPE_I*>(residual_in.data_ptr()), \
+                                                  reinterpret_cast<float*>(fn.data_ptr()), \
+                                                  reinterpret_cast<float*>(post_layer_mix.data_ptr()), \
+                                                  reinterpret_cast<float*>(comb_res_mix.data_ptr()), \
+                                                  reinterpret_cast<float*>(post_mix.data_ptr()), \
+                                                  reinterpret_cast<float*>(comb_mix.data_ptr()), \
+                                                  reinterpret_cast<DTYPE_I*>(layer_input_out.data_ptr()), \
+                                                  reinterpret_cast<float*>(hc_scale.data_ptr()), \
+                                                  reinterpret_cast<float*>(hc_base.data_ptr()), \
+                                                  reinterpret_cast<DTYPE_I*>(norm_weight.data_ptr()), \
+                                                  m, \
+                                                  hidden_size, \
+                                                  input_hidden_dim, \
+                                                  out_stride, \
+                                                  residual_stride, \
+                                                  split_k, \
+                                                  rms_eps, \
+                                                  hc_pre_eps, \
+                                                  hc_sinkhorn_eps, \
+                                                  norm_eps, \
+                                                  hc_post_mult_value, \
+                                                  sinkhorn_repeat); \
+    });
+
+#define FUSED_AR_MHC_FULL_UNIFIED_KERNEL_IMPL(gemm_block_size, tile_m, tile_n, tile_k, bf_block_size, bf_num_rows, bf_hidden, bf_res_block, bf_norm_block, bf_use_nt, ngpus) \
+    if(m >= 8 * cu_num) { \
+        FUSED_AR_MHC_FULL_UNIFIED_KERNEL_IMPL_(gemm_block_size, tile_m, tile_n, tile_k, true, bf_block_size, bf_num_rows, bf_hidden, bf_res_block, bf_norm_block, bf_use_nt, ngpus); \
+    } else { \
+        FUSED_AR_MHC_FULL_UNIFIED_KERNEL_IMPL_(gemm_block_size, tile_m, tile_n, tile_k, false, bf_block_size, bf_num_rows, bf_hidden, bf_res_block, bf_norm_block, bf_use_nt, ngpus); \
+    }
+
+#define FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(TM, TN, TK, bf_block_size, bf_num_rows, bf_hidden, bf_res_block, bf_norm_block, bf_use_nt, ngpus) \
+    if(tile_m == TM && tile_n == TN && tile_k == TK) { \
+        FUSED_AR_MHC_FULL_UNIFIED_KERNEL_IMPL(256, TM, TN, TK, bf_block_size, bf_num_rows, bf_hidden, bf_res_block, bf_norm_block, bf_use_nt, ngpus); \
+    } else
+
+#define FUSED_AR_MHC_FULL_UNIFIED_DISPATCH_4096(ngpus) \
+    if(m < 4 * cu_num) { \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(16, 16, 32, (64 + 64 * 4), 1, 4096, 1024, 1024, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(16, 32, 32, (64 + 64 * 4), 1, 4096, 1024, 1024, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(32, 16, 32, (64 + 64 * 4), 1, 4096, 1024, 1024, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(32, 32, 32, (64 + 64 * 4), 1, 4096, 1024, 1024, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(64, 16, 32, (64 + 64 * 4), 1, 4096, 1024, 1024, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(64, 32, 32, (64 + 64 * 4), 1, 4096, 1024, 1024, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(16, 16, 64, (64 + 64 * 4), 1, 4096, 1024, 1024, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(16, 32, 64, (64 + 64 * 4), 1, 4096, 1024, 1024, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(32, 16, 64, (64 + 64 * 4), 1, 4096, 1024, 1024, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(32, 32, 64, (64 + 64 * 4), 1, 4096, 1024, 1024, false, ngpus) \
+        { TORCH_CHECK(false, "fused AR+MHC full: unsupported tile config"); } \
+    } else if(m <= 8 * cu_num) { \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(16, 16, 32, (64 + 64 * 4), 2, 4096, 512, 512, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(16, 32, 32, (64 + 64 * 4), 2, 4096, 512, 512, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(32, 16, 32, (64 + 64 * 4), 2, 4096, 512, 512, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(32, 32, 32, (64 + 64 * 4), 2, 4096, 512, 512, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(64, 16, 32, (64 + 64 * 4), 2, 4096, 512, 512, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(64, 32, 32, (64 + 64 * 4), 2, 4096, 512, 512, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(16, 16, 64, (64 + 64 * 4), 2, 4096, 512, 512, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(16, 32, 64, (64 + 64 * 4), 2, 4096, 512, 512, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(32, 16, 64, (64 + 64 * 4), 2, 4096, 512, 512, false, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(32, 32, 64, (64 + 64 * 4), 2, 4096, 512, 512, false, ngpus) \
+        { TORCH_CHECK(false, "fused AR+MHC full: unsupported tile config"); } \
+    } else { \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(16, 16, 32, (64 + 64 * 4), 2, 4096, 512, 512, true, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(16, 32, 32, (64 + 64 * 4), 2, 4096, 512, 512, true, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(32, 16, 32, (64 + 64 * 4), 2, 4096, 512, 512, true, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(32, 32, 32, (64 + 64 * 4), 2, 4096, 512, 512, true, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(64, 16, 32, (64 + 64 * 4), 2, 4096, 512, 512, true, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(64, 32, 32, (64 + 64 * 4), 2, 4096, 512, 512, true, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(16, 16, 64, (64 + 64 * 4), 2, 4096, 512, 512, true, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(16, 32, 64, (64 + 64 * 4), 2, 4096, 512, 512, true, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(32, 16, 64, (64 + 64 * 4), 2, 4096, 512, 512, true, ngpus) \
+        FUSED_AR_MHC_FULL_UNIFIED_TILE_BF_CASE(32, 32, 64, (64 + 64 * 4), 2, 4096, 512, 512, true, ngpus) \
+        { TORCH_CHECK(false, "fused AR+MHC full: unsupported tile config"); } \
+    }
+
+#define FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_IMPL_(block_size, tile_m, tile_n, tile_k, store_nt, ngpus) \
+    AITER_DISPATCH_FLOATING16_TYPES(inp.scalar_type(), "fused_ar_mhc_gemm_sqrsum_unified", [&] { \
+        using DTYPE_I = typename t2opus<scalar_t>::type; \
+        using T       = DTYPE_I; \
+        int mb        = (m + tile_m - 1) / tile_m; \
+        int n_blocks  = (hc_mult3 + tile_n - 1) / tile_n; \
+        dim3 rs_grid(rs_grid_x, 1, 1); \
+        dim3 rs_block(THREAD_NUM); \
+        fused_ar_mhc_rs_kernel<T, ngpus, DTYPE_I><<<rs_grid, rs_block, 0, stream>>>(ptrs, \
+                                                                                    fa->sg_, \
+                                                                                    fa->self_sg_, \
+                                                                                    fa->rank_, \
+                                                                                    rs_grid_x, \
+                                                                                    m, \
+                                                                                    hidden_size, \
+                                                                                    input_hidden_dim); \
+        dim3 grid(mb, n_blocks, split_k); \
+        dim3 block(block_size); \
+        fused_ar_mhc_gemm_sqrsum_unified_kernel<T, ngpus, DTYPE_I, block_size, 4, tile_m, tile_n, tile_k, store_nt> \
+            <<<grid, block, 0, stream>>>(ptrs, \
+                                         fa->sg_, \
+                                         fa->self_sg_, \
+                                         fa->rank_, \
+                                         reinterpret_cast<float*>(gemm_out_mul.data_ptr()), \
+                                         reinterpret_cast<float*>(gemm_out_sqrsum.data_ptr()), \
+                                         reinterpret_cast<DTYPE_I*>(next_residual.data_ptr()), \
+                                         reinterpret_cast<DTYPE_I*>(residual_in.data_ptr()), \
+                                         reinterpret_cast<float*>(fn.data_ptr()), \
+                                         reinterpret_cast<float*>(post_layer_mix.data_ptr()), \
+                                         reinterpret_cast<float*>(comb_res_mix.data_ptr()), \
+                                         m, \
+                                         hidden_size, \
+                                         out_stride, \
+                                         split_k); \
+    });
+
+#define FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_IMPL(block_size, tile_m, tile_n, tile_k, ngpus) \
+    if(m >= 8 * cu_num) { \
+        FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_IMPL_(block_size, tile_m, tile_n, tile_k, true, ngpus); \
+    } else { \
+        FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_IMPL_(block_size, tile_m, tile_n, tile_k, false, ngpus); \
+    }
+
+#define FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_CASE(TM, TN, TK, ngpus) \
+    if(tile_m == TM && tile_n == TN && tile_k == TK) { \
+        FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_IMPL(256, TM, TN, TK, ngpus); \
+    } else
+
+#define FUSED_AR_MHC_GEMM_UNIFIED_DISPATCH(ngpus) \
+    FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_CASE(16, 16, 32, ngpus) \
+    FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_CASE(16, 32, 32, ngpus) \
+    FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_CASE(32, 16, 32, ngpus) \
+    FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_CASE(32, 32, 32, ngpus) \
+    FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_CASE(64, 16, 32, ngpus) \
+    FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_CASE(64, 32, 32, ngpus) \
+    FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_CASE(16, 16, 64, ngpus) \
+    FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_CASE(16, 32, 64, ngpus) \
+    FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_CASE(32, 16, 64, ngpus) \
+    FUSED_AR_MHC_GEMM_UNIFIED_KERNEL_CASE(32, 32, 64, ngpus) \
+    { \
+        TORCH_CHECK(false, "fused AR+MHC GEMM: unsupported tile config"); \
+    }
+
+    void launch_fused_ar_mhc_gemm_sqrsum_unified(
+        fptr_t _fa,
+        torch::Tensor& inp,
+        torch::Tensor& gemm_out_mul,
+        torch::Tensor& gemm_out_sqrsum,
+        torch::Tensor& next_residual,
+        torch::Tensor& residual_in,
+        torch::Tensor& post_layer_mix,
+        torch::Tensor& comb_res_mix,
+        torch::Tensor& fn,
+        torch::Tensor& post_mix,
+        torch::Tensor& comb_mix,
+        torch::Tensor& layer_input_out,
+        torch::Tensor& hc_scale,
+        torch::Tensor& hc_base,
+        torch::Tensor& norm_weight,
+        float rms_eps,
+        float hc_pre_eps,
+        float hc_sinkhorn_eps,
+        float norm_eps,
+        float hc_post_mult_value,
+        int sinkhorn_repeat,
+        int tile_m,
+        int tile_n,
+        int tile_k,
+        int64_t reg_ptr)
+    {
+        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+        auto fa                  = reinterpret_cast<CustomAllreduce*>(_fa);
+        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        void* ar_inp             = inp.data_ptr();
+        if(reg_ptr != 0)
+            ar_inp = reinterpret_cast<void*>(reg_ptr);
+        RankData* ptrs = fa->get_buffer_RD(stream, ar_inp);
+
+        int m                 = inp.size(0);
+        int input_hidden_dim  = inp.size(-1);
+        int hidden_size       = input_hidden_dim;
+        int hc_mult3          = fn.size(0);
+        int split_k           = gemm_out_sqrsum.size(0);
+        int out_stride        = gemm_out_mul.stride(1);
+        int residual_stride   = next_residual.stride(1);
+        const int cu_num      = get_num_cu_func();
+
+        TORCH_CHECK(inp.scalar_type() == residual_in.scalar_type(),
+                    "inp/residual dtype mismatch");
+        TORCH_CHECK(hidden_size % 256 == 0,
+                    "fused AR+MHC GEMM requires hidden_size % 256 == 0");
+        TORCH_CHECK(input_hidden_dim == hidden_size,
+                    "fused AR+MHC GEMM requires full hidden shard in inp");
+        TORCH_CHECK(hidden_size % (tile_k * split_k) == 0,
+                    "hidden_size must be divisible by tile_k * split_k");
+
+        int size      = m * hidden_size;
+        int block_num = ((size / fa->world_size_) + THREAD_NUM - 1) / THREAD_NUM;
+        int rs_grid_x = std::min(block_num, kMaxBlocks);
+
+        switch(fa->world_size_)
+        {
+        case 2:
+            FUSED_AR_MHC_GEMM_UNIFIED_DISPATCH(2);
+            break;
+        case 4:
+            FUSED_AR_MHC_GEMM_UNIFIED_DISPATCH(4);
+            break;
+        case 8:
+            FUSED_AR_MHC_GEMM_UNIFIED_DISPATCH(8);
+            break;
+        default:
+            throw std::runtime_error("fused AR+MHC GEMM: unsupported world_size");
+        }
+
+        mhc_pre_big_fuse_rmsnorm(post_mix,
+                                 comb_mix,
+                                 layer_input_out,
+                                 gemm_out_mul,
+                                 gemm_out_sqrsum,
+                                 hc_scale,
+                                 hc_base,
+                                 next_residual,
+                                 norm_weight,
+                                 rms_eps,
+                                 hc_pre_eps,
+                                 hc_sinkhorn_eps,
+                                 norm_eps,
+                                 hc_post_mult_value,
+                                 sinkhorn_repeat);
+    }
+#endif // AITER_FUSED_AR_MHC_MODULE
 
 } // namespace aiter

@@ -16,8 +16,9 @@ import pandas as pd
 from typing import Optional
 
 try:
-    from aiter.ops.mhc import mhc_fused_post_pre_large_m
+    from aiter.ops.mhc import get_mhc_pre_splitk_large_m, mhc_fused_post_pre_large_m
 except ImportError:
+    get_mhc_pre_splitk_large_m = None
     mhc_fused_post_pre_large_m = None
 
 # gfx950 large-M path (mhc_fused_post_pre_large_m) applies when M > 1024.
@@ -925,6 +926,10 @@ def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False, large_m=False
         elif mhc_fused_post_pre_large_m is None:
             aiter.logger.info("skip large_m_us: mhc_fused_post_pre_large_m unavailable")
         else:
+            if get_mhc_pre_splitk_large_m is not None:
+                splitk, tile_k = get_mhc_pre_splitk_large_m(m, hc_hidden_size)
+                ret["large_m_splitk"] = splitk
+                ret["large_m_tile_k"] = tile_k
             (_, _, layer_input_large_m, _), large_m_us = run_perftest(
                 mhc_fused_post_pre_large_m,
                 layer_input,

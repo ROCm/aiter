@@ -555,6 +555,51 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_qknorm_allreduce(qkv_in, q_w, k_w, eps)
 
+    def fused_allreduce_mhc_fused_post_pre_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_in: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: torch.Tensor,
+        *,
+        rms_eps: float = 1e-6,
+        hc_pre_eps: float = 1e-6,
+        hc_sinkhorn_eps: float = 1e-6,
+        hc_post_mult_value: float = 1.0,
+        sinkhorn_repeat: int = 20,
+        norm_eps: float = 1e-6,
+        force_fused: bool = True,
+        use_new: bool = True,
+        open_fp8_quant: bool = False,
+        prefill_support: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_mhc_fused_post_pre_rmsnorm(
+            input_,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+            norm_eps=norm_eps,
+            force_fused=force_fused,
+            use_new=use_new,
+            open_fp8_quant=open_fp8_quant,
+            prefill_support=prefill_support,
+        )
+
     def _fused_allreduce_rmsnorm_out_place(
         self,
         input_: torch.Tensor,

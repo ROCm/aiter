@@ -346,7 +346,10 @@ def mhc_post(
 
 
 def get_mhc_pre_splitk_large_m(m: int, hc_hidden_size: int) -> tuple[int, int]:
-    """Split-K policy for gfx950 large-M post_pre kernel (M > 1024)."""
+    """Split-K policy for gfx950 large-M post_pre kernel (M > 1024).
+
+    PR #3651 single-card tuning only. TP-specific overrides live in fused_ar_mhc.py.
+    """
     if get_gfx_runtime() == "gfx950" and m >= 8192 and hc_hidden_size % (8 * 64) == 0:
         return 8, 64
     return get_mhc_pre_splitk(m, hc_hidden_size)
@@ -413,7 +416,7 @@ def mhc_fused_post_pre_large_m(
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """gfx950 large-M post+pre (M > 1024): upstream ``mhc_post`` + ``mhc_pre``."""
+    """gfx950 large-M post+pre (M > 1024): separate mhc_post + mhc_pre with large split-K."""
     m = residual_in.size(0)
 
     if post_layer_mix.ndim == 3:

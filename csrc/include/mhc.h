@@ -4,6 +4,7 @@
 #pragma once
 
 #include <torch/extension.h>
+#include "custom_all_reduce.h"
 
 namespace aiter {
 void mhc_pre_gemm_sqrsum(torch::Tensor& out,    // (split_k, m, hc_mult3) / (m, hc_mult3)
@@ -45,6 +46,32 @@ void mhc_post(torch::Tensor& out,            // (m, hc_mult, hidden_size)
               torch::Tensor& post_layer_mix, // (m, hc_mult)
               torch::Tensor& comb_res_mix,   // (m, hc_mult, hc_mult)
               int store_nt                   = -1);
+void launch_fused_ar_mhc_gemm_sqrsum_unified(
+    fptr_t _fa,
+    torch::Tensor& inp,
+    torch::Tensor& gemm_out_mul,
+    torch::Tensor& gemm_out_sqrsum,
+    torch::Tensor& next_residual,
+    torch::Tensor& residual_in,
+    torch::Tensor& post_layer_mix,
+    torch::Tensor& comb_res_mix,
+    torch::Tensor& fn,
+    torch::Tensor& post_mix,
+    torch::Tensor& comb_mix,
+    torch::Tensor& layer_input_out,
+    torch::Tensor& hc_scale,
+    torch::Tensor& hc_base,
+    torch::Tensor& norm_weight,
+    float rms_eps,
+    float hc_pre_eps,
+    float hc_sinkhorn_eps,
+    float norm_eps,
+    float hc_post_mult_value,
+    int sinkhorn_repeat,
+    int tile_m,
+    int tile_n,
+    int tile_k,
+    int64_t reg_ptr = 0);
 void mhc_fused_post_pre_gemm_sqrsum(
     torch::Tensor& gemm_out_mul,    // (split_k * hc_mult, m, hc_mult3)
     torch::Tensor& gemm_out_sqrsum, // (split_k * hc_mult, m)
