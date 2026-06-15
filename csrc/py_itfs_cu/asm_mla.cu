@@ -395,7 +395,7 @@ void mla_decode_stage1_asm_fwd(
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;
-    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio > 16) && (gqa_ratio * max_seqlen_q != 32)){
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio >= 16) && (gqa_ratio * max_seqlen_q != 32)){
         config_max_seqlen_q = 1;
         config_gqa_ratio = 64;
         args.s_MQA = gqa_ratio;
@@ -408,8 +408,7 @@ void mla_decode_stage1_asm_fwd(
         args.s_MQA = gqa_ratio;
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;
-    // round-robin context-parallel: route to the dedicated `cprr` kernel only when
-    // a valid g_kv_indptr is supplied; otherwise use the plain (non-CP) kernel.
+
     int cprr_flag = (g_kv_indptr != nullptr && g_kv_indptr->data_ptr() != nullptr) ? 1 : 0;
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag, cprr_flag);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");

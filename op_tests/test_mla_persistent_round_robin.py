@@ -37,6 +37,20 @@ def check_support(dtype, kv_dtype, nhead):
     return True
 
 
+def cal_diff(
+    x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
+) -> None:
+    x, y = x.double(), y.double()
+    # RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    amax_diff = (x - y).abs().max().item()
+    thr = 3e-2 if use_fp8 else 1e-5
+    flag = "  <<< OVER" if cos_diff >= thr else ""
+    print(
+        f"[cal_diff] {name}: cos_diff={cos_diff:.3e}, amax_diff={amax_diff:.3e}, thr={thr:.0e}{flag}"
+    )
+
+
 def ref_masked_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -516,9 +530,6 @@ def test_mla_cp(
         kv_indptr_r = rank_kv_indptr_r[r]
         kv_indices_r = rank_kv_indices_r[r]
         kv_last_page_lens_r = rank_kv_last_r[r]
-        print(f"kv_indptr_r: {kv_indptr_r}")
-        print(f"kv_indices_r: {kv_indices_r}")
-        print(f"kv_last_page_lens_r: {kv_last_page_lens_r}")
         # per-rank round-robin CP reference (consumes the same per-rank indices)
         o_r, l_r = torch_mla_extend_round_robin(
             q,
@@ -611,7 +622,7 @@ def test_mla_cp(
             aiter_merged_lse,
             msg=f"mla_cp_round_robin W={W} qlen={qlen} [golden vs aiter_merge lse]:......",
         )
-
+    cal_diff(out_ref, aiter_merged_out, "out", False)
     ret["cp:err_ref"] = err_ref
     ret["cp:err_aiter"] = err
     ret["cp:world_size"] = W
