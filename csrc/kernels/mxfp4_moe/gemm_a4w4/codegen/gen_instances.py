@@ -580,9 +580,9 @@ class mxfp4_moe_aux_codegen:
                     _aux_sort_quant_body(ne, topk, mb, h),
                 )
 
-        # sort (threestage): MB in {32, 128} -- de-duped by (NE, TOPK)
+        # sort (threestage): MB in {32, 64, 128} -- de-duped by (NE, TOPK)
         for ne, h, e, topk in s3_shapes:
-            for mb in (32, 128):
+            for mb in (32, 64, 128):
                 yield Instance(
                     f"aux_sort3s_NE{ne}_TOPK{topk}_MB{mb}",
                     "Sort3StageFn",
@@ -613,9 +613,9 @@ class mxfp4_moe_aux_codegen:
                     _aux_sort_only_body(ne, topk, mb, h),
                 )
 
-        # quant: MB in {32, 128} -- de-duped by (NE, TOPK, H)
+        # quant: MB in {32, 64, 128} -- de-duped by (NE, TOPK, H)
         for ne, h, e, topk in sort_shapes:
-            for mb in (32, 128):
+            for mb in (32, 64, 128):
                 yield Instance(
                     f"aux_quant_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
                     "QuantFn",
@@ -624,9 +624,9 @@ class mxfp4_moe_aux_codegen:
                     _aux_quant_body(ne, topk, mb, h),
                 )
 
-        # sort_scales: BM in {32, 128} -- incl. FlyDSL-port extra shapes
+        # sort_scales: BM in {32, 64, 128} -- incl. FlyDSL-port extra shapes
         for ne, h, e, topk in SHAPES + AUX_EXTRA_SHAPES:
-            for bm in (32, 128):
+            for bm in (32, 64, 128):
                 yield Instance(
                     f"aux_sortscales_BM{bm}_NE{ne}_E{e}_H{h}",
                     "SortScalesFn",

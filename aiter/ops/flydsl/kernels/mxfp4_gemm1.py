@@ -969,6 +969,7 @@ def compile_gemm1_a4w4_port(
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),
         (32, False, False),
+        (64, False, False),
         (128, False, False),
         (16, True, True),
     }:

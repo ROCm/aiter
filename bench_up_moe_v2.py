@@ -114,6 +114,15 @@ def flyg_variants(shape):
                 g2_kernel_name(shape, 128, g2v),
             )
         )
+    # BM64 cshuffle -- the mid-prefill (M~2048) sweet spot: bigger tile than BM32
+    # atomic + coalesced flat write, smaller than BM128 (more tiles at moderate M).
+    out.append(
+        (
+            "BM64+NONATOMIC_CSHUFFLE",
+            g1_kernel_name(shape, 64, ""),
+            g2_kernel_name(shape, 64, "NONATOMIC_CSHUFFLE"),
+        )
+    )
     return out
 
 

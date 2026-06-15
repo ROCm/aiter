@@ -1211,7 +1211,7 @@ def _mxfp4_moe_run(
     # it keeps mxfp4_moe_sort(prologue=1).
     _threestage_ok = (
         not inline_quant
-        and BM in (32, 128)
+        and BM in (32, 64, 128)
         and (NE, D_HIDDEN, D_INTER, topk) in _MXFP4_BM128_SHAPES
     )
     if _threestage_ok:

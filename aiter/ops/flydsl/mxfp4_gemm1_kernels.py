@@ -15,6 +15,7 @@ import torch
 _SUPPORTED = {
     (32, True, False),
     (32, False, False),
+    (64, False, False),
     (128, False, False),
     (16, True, True),
 }
