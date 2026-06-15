@@ -160,17 +160,28 @@ def fail_on_aot_cache_miss(
         def wrapper(*args, **kwargs):
             orig_run_compiled = getattr(run_compiled_module, run_compiled_name)
 
-            def run_compiled_tracked(exe, compile_args):
+            def run_compiled_tracked(exe, *compile_args):
                 if exe not in jit_fns_seen:
                     jit_fns_seen.append(exe)
+                # Support both _run_compiled calling conventions:
+                #   - variadic:     _run_compiled(exe, *args)  (tensor_shim et al.)
+                #   - single-tuple: _run_compiled(exe, args)   (moe_kernels et al.)
+                # Forwarding *compile_args is transparent for both, so only the
+                # signature bind below needs to peel a lone (tuple/list) arg back
+                # into the kernel's real positional arguments.
+                bind_args = compile_args
+                if len(compile_args) == 1 and isinstance(
+                    compile_args[0], (tuple, list)
+                ):
+                    bind_args = tuple(compile_args[0])
                 try:
                     exe._ensure_sig()
-                    bound = exe._sig.bind(*compile_args)
+                    bound = exe._sig.bind(*bind_args)
                     bound.apply_defaults()
                     last_cache_key[id(exe)] = exe._build_full_cache_key(bound.arguments)
                 except Exception:
                     pass
-                return orig_run_compiled(exe, compile_args)
+                return orig_run_compiled(exe, *compile_args)
 
             setattr(run_compiled_module, run_compiled_name, run_compiled_tracked)
             try:
@@ -227,8 +238,7 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     elif kind is OpKind.GEMM:
         from .gemm import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.GROUPED_MOE:
-        # from .grouped_moe import DEFAULT_CSVS, parse_csv
-        return []
+        from .grouped_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
     else:
@@ -245,9 +255,7 @@ def _compile_one(kind: OpKind, job: dict[str, Any]) -> tuple[OpKind, dict[str, A
     elif kind is OpKind.GEMM:
         from .gemm import compile_one_config
     elif kind is OpKind.GROUPED_MOE:
-        # grouped_moe AOT not wired up yet; return trivial result so no
-        # job is ever actually compiled (no jobs are collected either).
-        return kind, {}
+        from .grouped_moe import compile_one_config
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import compile_one_config
     else:

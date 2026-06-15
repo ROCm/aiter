@@ -29,37 +29,6 @@ def _align_up(value: int, alignment: int) -> int:
     return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
 
 
-def _preshuffled_scale_shape(
-    rows: int, k_dim: int, warp_tile: int, tile_k: int = _TILE_K
-) -> tuple[int, int]:
-    """Mirror moe_grouped_gemm_mxscale_gfx1250._preshuffled_scale_shape.
-
-    The grouped GEMM launchers validate an exact preshuffled E8M0 scale layout
-    (see tests.kernels.test_gemm_mxscale_gfx1250.preshuffle_e8m0_scale), so the
-    AOT dummy tensors must use the same shape, not the plain (rows, k//32) one.
-    """
-    k_scale = int(k_dim) // 32
-    scale_k_per_tile = int(tile_k) // 32
-    if k_scale % scale_k_per_tile != 0:
-        raise ValueError(
-            f"K scale columns must be divisible by tile_k/32, got {k_scale} and {scale_k_per_tile}"
-        )
-    wmma_rep = int(warp_tile) // 16
-    if wmma_rep < 1:
-        raise ValueError(f"warp_tile must be >= 16, got {warp_tile}")
-    if int(rows) % wmma_rep != 0:
-        raise ValueError(
-            f"scale rows must be divisible by wmma_rep={wmma_rep}, got {rows}"
-        )
-    return int(rows) // wmma_rep, k_scale * wmma_rep
-
-
-def _as_bool(value, default: bool = False) -> bool:
-    if value is None or str(value).strip() == "":
-        return default
-    return str(value).strip().lower() in ("1", "true", "yes")
-
-
 def _as_int(value, default: int | None = None) -> int | None:
     if value is None or str(value).strip() == "":
         return default
@@ -72,10 +41,8 @@ def _scheduler_variants(row, base_job):
     # runtime axis is dense vs DeepGEMM contiguous-M (auto-enabled for large token
     # counts). Mirror exactly that set so AOT never compiles GEMM variants the
     # runtime cannot launch.
-    explicit_contiguous = _as_bool(row.get("grouped_contiguous_m"), False)
-    contiguous_modes = [True] if explicit_contiguous else [False, True]
     variants = []
-    for contiguous in contiguous_modes:
+    for contiguous in [False, True]:
         variant = dict(base_job)
         variant["grouped_persistent_m"] = False
         variant["grouped_contiguous_m"] = contiguous
@@ -154,6 +121,7 @@ def compile_one_config(**job):
         compile_moe_grouped_gemm1_mxfp4_masked,
         compile_moe_grouped_gemm2_a8w4_masked,
         compile_moe_grouped_gemm2_mxfp4_masked,
+        preshuffled_scale_shape,
     )
 
     aot_arch = job.pop("gfx", "") or GROUPED_MOE_AOT_ARCH_DEFAULT
@@ -218,14 +186,17 @@ def compile_one_config(**job):
             dtype=torch.uint8,
         )
         sx1 = torch.empty(
-            (act_lead, *_preshuffled_scale_shape(rows, job["model_dim"], warp_tile_m)),
+            (
+                act_lead,
+                *preshuffled_scale_shape(rows, job["model_dim"], warp_tile_m, _TILE_K),
+            ),
             dtype=torch.uint8,
         )
         sw1 = torch.empty(
             (
                 job["experts"],
-                *_preshuffled_scale_shape(
-                    2 * job["inter_dim"], job["model_dim"], warp_tile_n
+                *preshuffled_scale_shape(
+                    2 * job["inter_dim"], job["model_dim"], warp_tile_n, _TILE_K
                 ),
             ),
             dtype=torch.uint8,
@@ -237,14 +208,17 @@ def compile_one_config(**job):
             dtype=torch.uint8,
         )
         sx2 = torch.empty(
-            (act_lead, *_preshuffled_scale_shape(rows, job["inter_dim"], warp_tile_m)),
+            (
+                act_lead,
+                *preshuffled_scale_shape(rows, job["inter_dim"], warp_tile_m, _TILE_K),
+            ),
             dtype=torch.uint8,
         )
         sw2 = torch.empty(
             (
                 job["experts"],
-                *_preshuffled_scale_shape(
-                    job["model_dim"], job["inter_dim"], warp_tile_n
+                *preshuffled_scale_shape(
+                    job["model_dim"], job["inter_dim"], warp_tile_n, _TILE_K
                 ),
             ),
             dtype=torch.uint8,

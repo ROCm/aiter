@@ -38,6 +38,7 @@ for _dep in reversed(_LOCAL_DEPS):
         sys.path.insert(0, _dep)
 
 from aiter import ActivationType, QuantType  # noqa: E402
+from aiter.aot.flydsl.common import fail_on_aot_cache_miss  # noqa: E402
 from aiter.fused_moe import (  # noqa: E402
     fused_moe,
     torch_moe_stage1,
@@ -46,6 +47,7 @@ from aiter.fused_moe import (  # noqa: E402
 from aiter.ops.flydsl.grouped_moe_gfx1250 import (  # noqa: E402
     _grouped_a8w4_prepare_scale_batch,
 )
+import aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 as _grouped_gk  # noqa: E402
 from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402
 from aiter.ops.quant import per_1x32_f4_quant  # noqa: E402
 from aiter.ops.shuffle import shuffle_weight  # noqa: E402
@@ -546,6 +548,17 @@ def _invoke_grouped_fused_moe(fused_case):
     )
 
 
+# ---------------------------------------------------------------------------
+# AOT cache-coverage guards
+# ---------------------------------------------------------------------------
+_run_grouped_via_fused_moe_with_aot_cache_check = fail_on_aot_cache_miss(_grouped_gk)(
+    _run_grouped_via_fused_moe
+)
+_invoke_grouped_fused_moe_with_aot_cache_check = fail_on_aot_cache_miss(_grouped_gk)(
+    _invoke_grouped_fused_moe
+)
+
+
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     diff = (actual.float() - expected.float()).norm()
     base = expected.float().norm().clamp(min=1e-12)
@@ -569,6 +582,7 @@ def _sanity_check(
     use_bias: bool = True,
     tol: float = VERIFY_TOL_A4W4,
     all_ones: bool = False,
+    check_aot_cache: bool = True,
 ) -> None:
     """Tiny shape; compare grouped FlyDSL vs PyTorch fp32 ref.
 
@@ -577,9 +591,18 @@ def _sanity_check(
     quantised path naturally diverge at this scale, but the grouped path
     should stay close when it uses the same MXFP4 quantization contract as
     the reference.
+
+    ``check_aot_cache=True`` additionally fails if the grouped GEMM JIT'd at
+    runtime instead of loading the AOT-precompiled artifact (see
+    ``aiter/aot/flydsl/grouped_moe.py``).
     """
     _require_gfx1250()
-    out, ref = _run_grouped_via_fused_moe(
+    run_grouped = (
+        _run_grouped_via_fused_moe_with_aot_cache_check
+        if check_aot_cache
+        else _run_grouped_via_fused_moe
+    )
+    out, ref = run_grouped(
         experts=experts,
         tokens=tokens,
         topk=topk,
@@ -645,7 +668,15 @@ def _bench(args: argparse.Namespace) -> None:
             swiglu_limit=args.swiglu_limit,
             use_bias=not args.no_bias,
         )
-        _invoke_grouped_fused_moe(fused_case)  # warmup / JIT
+        # Warmup / JIT. With --check-aot-cache, route the first invocation
+        # through the AOT-tracking wrapper so a runtime compile (cache miss)
+        # raises instead of silently masking missing precompiled coverage.
+        warmup_invoke = (
+            _invoke_grouped_fused_moe
+            if getattr(args, "no_check_aot_cache", False)
+            else _invoke_grouped_fused_moe_with_aot_cache_check
+        )
+        warmup_invoke(fused_case)
         torch.cuda.synchronize()
 
         def _thunk():
@@ -775,6 +806,14 @@ def main() -> None:
         "scale=127 (=2^0), bias=0. Expect rel_l2 < 0.01 since both "
         "grouped and ref see the exact same dequantised values.",
     )
+    parser.add_argument(
+        "--no-check-aot-cache",
+        action="store_true",
+        help="disable the default AOT cache-miss check. By default the test "
+        "fails if the grouped GEMM JIT-compiles at runtime instead of "
+        "loading the AOT-precompiled artifact. Pass this flag to allow "
+        "runtime JIT compilation.",
+    )
     args = parser.parse_args()
     if not args.real_gemm:
         _mock_grouped_gemm()
@@ -807,6 +846,7 @@ def main() -> None:
             swiglu_limit=args.swiglu_limit,
             use_bias=not args.no_bias,
             all_ones=args.all_ones,
+            check_aot_cache=not args.no_check_aot_cache,
         )
         return
     _bench(args)
