@@ -229,6 +229,7 @@ def _compile_hgemm_to_cache(
     target_gfx: str,
     kernel_family: str = "hgemm",
     has_bias: bool = False,
+    use_ht: bool = False,
     **kwargs,
 ):
     del kwargs, out_dtype
@@ -276,6 +277,7 @@ def _compile_hgemm_to_cache(
         b_preshuffle=b_preshuffle,
         c_to_lds=c_to_lds,
         has_bias=has_bias,
+        use_ht=use_ht,
     )
     # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
     # optional bias and split-K sync tensors.

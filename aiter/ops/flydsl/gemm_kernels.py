@@ -56,6 +56,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"b_to_lds(?P<b_to_lds>True|False)_"
     r"b_preshuffle(?P<b_preshuffle>True|False)_"
     r"c_to_lds(?P<c_to_lds>True|False)"
+    r"(?:_use_ht(?P<use_ht>True|False))?"
     r"(?P<small_m_suffix>"
     r"(?:_small_m)"
     r"(?:_nr(?P<n_tile_repeat>\d+))?"
@@ -98,8 +99,10 @@ KERNEL_CONFIG_VARIANTS = [
         "block_n_warps": wn,
         "block_k_warps": wk,
         "b_to_lds": True,
+        "use_ht": use_ht,
     }
     for wm, wn, wk in HGEMM_WARP_SHAPE_OPTIONS
+    for use_ht in (False, True)
 ]
 
 _SPLITK_HGEMM_KERNELS: Dict[str, Dict] = {}
@@ -145,6 +148,7 @@ def flydsl_kernel_name(
     persistent_n_tiles: int = 1,
     waves_per_eu: int = 0,
     b_to_lds_unroll: int = 0,
+    use_ht: bool = False,
 ) -> str:
     async_copy, c_to_lds = _normalize_supported_kernel_metadata(
         async_copy=async_copy,
@@ -156,8 +160,15 @@ def flydsl_kernel_name(
         )
     if kernel_family == KERNEL_FAMILY_HGEMM and b_preshuffle:
         raise ValueError("Current generic kernel only supports `b_preshuffle=False`")
+    if kernel_family == KERNEL_FAMILY_HGEMM and use_ht:
+        if stages != 2 or block_k_warp != 1 or not b_to_lds:
+            raise ValueError(
+                "HT HGEMM requires stages=2, block_k_warp=1, and b_to_lds=True"
+            )
     if kernel_family == KERNEL_FAMILY_SMALL_M and b_preshuffle:
         raise ValueError("small-M kernel only supports `b_preshuffle=False`")
+    if kernel_family == KERNEL_FAMILY_SMALL_M and use_ht:
+        raise ValueError("small-M kernel does not support `use_ht=True`")
     name = (
         f"flydsl_gemm{stages}_a{dtype}_w{dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
     )
@@ -166,6 +177,8 @@ def flydsl_kernel_name(
         f"_async_copy{async_copy}_b_to_lds{b_to_lds}_b_preshuffle{b_preshuffle}"
         f"_c_to_lds{c_to_lds}"
     )
+    if use_ht:
+        name += "_use_htTrue"
     if kernel_family == KERNEL_FAMILY_SMALL_M:
         name += "_small_m"
         if n_tile_repeat > 1:
@@ -322,8 +335,13 @@ def selection_filter(m, n, k, kwargs):
     BLOCK_N_WARPS = kwargs["BLOCK_N_WARPS"]
     BLOCK_K_WARPS = kwargs["BLOCK_K_WARPS"]
     B_TO_LDS = kwargs.get("B_TO_LDS", True)
+    USE_HT = kwargs.get("USE_HT", False)
     GPU_ARCH = get_rocm_arch()
     DTYPE_BYTES = 2
+
+    if USE_HT:
+        if not (STAGES == 2 and BLOCK_K_WARPS == 1 and B_TO_LDS):
+            return False
 
     def get_stage_smem_use(stages_):
         SMEM_USE = stages_ * TILE_M * TILE_K * DTYPE_BYTES
@@ -368,6 +386,7 @@ def _validate_hgemm_tiling(
     block_n_warps: int,
     block_k_warps: int,
     b_to_lds: bool,
+    use_ht: bool,
 ) -> None:
     config = {
         "TILE_M": tile_m,
@@ -379,6 +398,7 @@ def _validate_hgemm_tiling(
         "BLOCK_N_WARPS": block_n_warps,
         "BLOCK_K_WARPS": block_k_warps,
         "B_TO_LDS": b_to_lds,
+        "USE_HT": use_ht,
     }
     if not selection_filter(m, n, k, config):
         raise ValueError(
@@ -504,6 +524,7 @@ def _normalize_registry_config(
     block_n_warps: int,
     block_k_warps: int,
     b_to_lds: bool,
+    use_ht: bool = False,
 ) -> Optional[Dict]:
     config = {
         "kernel_family": KERNEL_FAMILY_HGEMM,
@@ -519,13 +540,13 @@ def _normalize_registry_config(
         "b_to_lds": bool(b_to_lds),
         "b_preshuffle": False,
         "c_to_lds": FIXED_C_TO_LDS,
+        "use_ht": bool(use_ht),
     }
 
     try:
         _validate_hgemm_tiling(
             1,
             config["tile_n"],
-            config["tile_k"] * config["split_k"],
             dtype=dtype,
             tile_m=config["tile_m"],
             tile_n=config["tile_n"],
@@ -537,6 +558,7 @@ def _normalize_registry_config(
             block_n_warps=config["block_n_warps"],
             block_k_warps=config["block_k_warps"],
             b_to_lds=config["b_to_lds"],
+            use_ht=config["use_ht"],
         )
     except ValueError:
         return None
@@ -558,6 +580,8 @@ def _parse_hgemm_kernel_params(name: str) -> Optional[Dict]:
     )
     block_k_warps = m.group("block_k_warps")
     block_k_warps = int(block_k_warps) if block_k_warps else 1
+    use_ht = m.group("use_ht")
+    use_ht = use_ht == "True" if use_ht else False
     config: Dict[str, object] = {
         "kernel_family": kernel_family,
         "stages": int(m.group("stages")),
@@ -572,6 +596,7 @@ def _parse_hgemm_kernel_params(name: str) -> Optional[Dict]:
         "b_to_lds": m.group("b_to_lds") == "True",
         "b_preshuffle": m.group("b_preshuffle") == "True",
         "c_to_lds": m.group("c_to_lds") == "True",
+        "use_ht": use_ht,
         "dtype": m.group("a_dtype"),
         "out_dtype": m.group("out_dtype"),
         "target_gfx": m.group("target_gfx"),
@@ -634,6 +659,7 @@ def get_flydsl_splitk_hgemm_kernels(
                 block_n_warps=variant["block_n_warps"],
                 block_k_warps=variant["block_k_warps"],
                 b_to_lds=variant["b_to_lds"],
+                use_ht=variant["use_ht"],
             )
             if config is None:
                 continue
@@ -655,6 +681,7 @@ def get_flydsl_splitk_hgemm_kernels(
                 config["b_to_lds"],
                 config["b_preshuffle"],
                 config["c_to_lds"],
+                use_ht=config["use_ht"],
             )
             kernels[name] = config
     # NOTE: Keep the old small_m registry generation here for now, but leave it
@@ -758,6 +785,7 @@ def _compile_flydsl_hgemm(
     c_to_lds: bool = False,
     kernel_family: str = KERNEL_FAMILY_HGEMM,
     has_bias: bool = False,
+    use_ht: bool = False,
 ):
     if dtype not in {"f16", "bf16"}:
         raise ValueError(f"`dtype` must be 'f16' or 'bf16', got {dtype!r}")
@@ -784,6 +812,7 @@ def _compile_flydsl_hgemm(
             block_n_warps=block_n_warps,
             block_k_warps=block_k_warps,
             b_to_lds=b_to_lds,
+            use_ht=use_ht,
         )
     elif kernel_family == KERNEL_FAMILY_SMALL_M:
         if dtype != "bf16":
@@ -826,6 +855,7 @@ def _compile_flydsl_hgemm(
         b_preshuffle=b_preshuffle,
         c_to_lds=c_to_lds,
         has_bias=has_bias,
+        use_ht=use_ht,
     )
 
     def launcher(
@@ -890,6 +920,7 @@ def flydsl_hgemm(
     c_to_lds: bool = False,
     kernel_family: Optional[str] = None,
     stream: Optional[torch.cuda.Stream] = None,
+    use_ht: bool = False,
 ) -> torch.Tensor:
     """Run FlyDSL HGEMM."""
 
@@ -944,6 +975,7 @@ def flydsl_hgemm(
         c_to_lds=c_to_lds,
         kernel_family=resolved_kernel_family,
         has_bias=bias is not None,
+        use_ht=use_ht,
     )
 
     launcher(out, a, b, bias=bias, stream=launch_stream)

@@ -186,8 +186,10 @@ def run_splitk_precision_case(
         split_k=case["split_k"],
         block_m_warps=case.get("block_m_warps", 1),
         block_n_warps=case.get("block_n_warps", 4),
+        block_k_warps=case.get("block_k_warps", 1),
         b_to_lds=case.get("b_to_lds", False),
         b_preshuffle=case["b_preshuffle"],
+        use_ht=case.get("use_ht", False),
     )
     torch.cuda.synchronize()
 

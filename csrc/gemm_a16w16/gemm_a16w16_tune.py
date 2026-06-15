@@ -306,6 +306,7 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         b_preshuffle=config.get("b_preshuffle", False),
         auto_shuffle_b=False,
         c_to_lds=config.get("c_to_lds", False),
+        use_ht=config.get("use_ht", False),
     )
     if bias is not None and fused_bias is None:
         out = out.to(bias.dtype) + bias

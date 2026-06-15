@@ -33,6 +33,7 @@ def compile_flydsl_hgemm_kernel(
     b_preshuffle: bool = False,
     c_to_lds: bool = False,
     has_bias: bool = False,
+    use_ht: bool = False,
 ):
     """Build one FlyDSL HGEMM-family kernel from a unified config surface."""
 
@@ -57,9 +58,12 @@ def compile_flydsl_hgemm_kernel(
             BLOCK_K_WARPS=block_k_warps,
             B_TO_LDS=b_to_lds,
             HAS_BIAS=has_bias,
+            USE_HT=use_ht,
         )
 
     if kernel_family == KERNEL_FAMILY_SMALL_M:
+        if use_ht:
+            raise ValueError("small-M FlyDSL HGEMM does not support `use_ht=True`")
         return compile_small_m_hgemm_kernel(
             dtype,
             n,
