@@ -4,6 +4,7 @@ import triton
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
 import math
+import os
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_prefill_fwd_kernel as triton_mla_prefill_fwd_kernel,
 )
@@ -349,13 +350,36 @@ def mla_decode_fwd(
     cu_count = get_num_sms()
     target_num_prgms = cu_count * 4
     ALL_DECODE = num_tokens_per_seq == 1
+    # Multi-CTA "multicast" of the shared KV: when a sequence's query heads span
+    # multiple head-blocks (NUM_HEAD_BLOCKS > 1), those head-block CTAs all read
+    # the identical KV.  Cluster them (num_ctas == NUM_HEAD_BLOCKS) so the KV is
+    # loaded once and broadcast across the cluster instead of re-fetched per CTA.
+    # Only wired up for the gfx1250 shuffled-KV pipelined decode + ALL_DECODE.
+    MULTICAST_HEADS = (
+        IS_DEVICE_ARCH_GFX12
+        and shuffled_kv_cache
+        and ALL_DECODE
+        and NUM_HEAD_BLOCKS > 1
+        and (NUM_HEAD_BLOCKS & (NUM_HEAD_BLOCKS - 1)) == 0  # power of two
+        and os.environ.get("MLA_MULTICAST", "1")
+        == "1"  # set MLA_MULTICAST=0 for baseline
+    )
     if ALL_DECODE:
-        total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
+        if MULTICAST_HEADS:
+            # one CLUSTER (of NUM_HEAD_BLOCKS CTAs) per sequence
+            total_num_q_blocks = num_seqs
+        else:
+            total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
     else:
         total_num_q_blocks = (
             ((num_tokens_per_seq + BLOCK_Q - 1) // BLOCK_Q) * num_seqs * NUM_HEAD_BLOCKS
         )
-    num_2d_prgms = total_num_q_blocks * num_kv_heads
+    # num_2d_prgms must reflect the physical program count for the segment
+    # heuristic; clustering reduces grid dim 0 but not the number of CTAs.
+    physical_q_blocks = (
+        total_num_q_blocks * NUM_HEAD_BLOCKS if MULTICAST_HEADS else total_num_q_blocks
+    )
+    num_2d_prgms = physical_q_blocks * num_kv_heads
     # if batch contains a prefill
 
     attn_config, reduce_config = select_3d_config(
@@ -403,6 +427,10 @@ def mla_decode_fwd(
         else:
             impl = gluon_mla_decode_fwd_kernel_non_pipelined
 
+        extra_launch_kwargs = {}
+        if MULTICAST_HEADS:
+            extra_launch_kwargs["num_ctas"] = NUM_HEAD_BLOCKS
+
         impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
@@ -446,6 +474,8 @@ def mla_decode_fwd(
             KV_CACHE_DTYPE=KV_CACHE_DTYPE,
             BLOCK_SCALES_SIZE=BLOCK_SCALES_SIZE,
             NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
+            MULTICAST_HEADS=MULTICAST_HEADS,
+            **extra_launch_kwargs,
             **attn_config,
         )
     else:

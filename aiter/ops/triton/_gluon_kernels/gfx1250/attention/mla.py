@@ -26,6 +26,8 @@ class MLAConfig:
     BLOCK_M: gl.constexpr
     NUM_QUERY_HEADS: gl.constexpr
     NUM_KV_HEADS: gl.constexpr
+    NUM_HEAD_BLOCKS: gl.constexpr
+    MULTICAST_HEADS: gl.constexpr
 
     # Derived constants
     TILE_SIZE: gl.constexpr
@@ -109,7 +111,33 @@ class MLAConfig:
         SCALE_K_WIDTH_LORA,
         SCALE_K_WIDTH_ROPE,
         BLOCK_SCALES_SIZE,
+        NUM_HEAD_BLOCKS=1,
+        MULTICAST_HEADS=False,
     ):
+        # --- Multi-CTA "multicast" of the shared KV across head-block CTAs ---
+        # When MULTICAST_HEADS is set we cluster the NUM_HEAD_BLOCKS head-block
+        # CTAs of one sequence into a CGA (num_ctas == NUM_HEAD_BLOCKS).  The
+        # head-block dimension is folded into the logical M dimension and a CGA
+        # split assigns each head-block to a CTA; the shared KV is CGA-broadcast
+        # so it is loaded once and shared across the cluster.
+        #   CGA_M_SPLIT: split M (heads) across the cluster's CTAs.
+        #   CGA_BCAST  : same address on every CTA (multicast) for shared KV.
+        # The Dot operand layout derives K/V broadcast automatically from a
+        # M-split parent WMMA layout (operand_index==1 zeroes the dim-0 basis),
+        # so only the parent WMMA / Q / shared-KV layouts need an explicit cga.
+        # All distributed/Q-shared tensors use the LOGICAL (cluster-wide) M; the
+        # CGA M split tiles it across the cluster's CTAs (BLOCK_M per CTA).  The
+        # shared KV is CGA-broadcast (every CTA holds the full tile).
+        if MULTICAST_HEADS:
+            _nhb_bits = int(math.log2(NUM_HEAD_BLOCKS))
+            CGA_M_SPLIT = [[1 << i, 0] for i in range(_nhb_bits)]
+            CGA_BCAST = [[0, 0] for _ in range(_nhb_bits)]
+            BLOCK_M = BLOCK_M * NUM_HEAD_BLOCKS  # logical (cluster-wide) M
+        else:
+            CGA_M_SPLIT = []
+            CGA_BCAST = []
+        self.NUM_HEAD_BLOCKS = gl.constexpr(NUM_HEAD_BLOCKS)
+        self.MULTICAST_HEADS = gl.constexpr(MULTICAST_HEADS)
         # Constants
         self.KV_LORA_RANK = gl.constexpr(KV_LORA_RANK)
         self.QK_ROPE_HEAD_DIM = gl.constexpr(QK_ROPE_HEAD_DIM)
@@ -215,6 +243,7 @@ class MLAConfig:
                 warp_bases=warp_bases_qk,
                 reg_bases=[],
                 instr_shape=[16, 16, instr_width_qk],
+                cga_layout=CGA_M_SPLIT,
             )
         )
 
@@ -225,6 +254,7 @@ class MLAConfig:
                 warp_bases=warp_bases_pv,
                 reg_bases=[],
                 instr_shape=[16, 16, instr_width_pv],
+                cga_layout=CGA_M_SPLIT,
             )
         )
 
@@ -238,6 +268,7 @@ class MLAConfig:
                     warp_bases=warp_bases_qk_unpacked,
                     reg_bases=reg_bases,
                     instr_shape=[16, 16, 128],
+                    cga_layout=CGA_M_SPLIT,
                 )
             )
         else:
@@ -376,11 +407,14 @@ class MLAConfig:
             KV_LORA_RANK_LOAD = KV_LORA_RANK // 2
             QK_ROPE_HEAD_DIM_LOAD = QK_ROPE_HEAD_DIM // 2
 
+        # Q shared uses the logical (cluster-wide) M with a CGA M split, so each
+        # CTA physically holds its own BLOCK_M head rows.
         self.Q_LORA_SHARED_LAYOUT = gl.constexpr(
             gl.PaddedSharedLayout.with_identity_for(
                 interval_padding_pairs=[[KV_LORA_RANK_LOAD, 8]],
                 shape=[BLOCK_M, KV_LORA_RANK_LOAD],
                 order=[1, 0],
+                cga_layout=CGA_M_SPLIT,
             )
         )
         self.Q_ROPE_SHARED_LAYOUT = gl.constexpr(
@@ -388,6 +422,7 @@ class MLAConfig:
                 interval_padding_pairs=[[QK_ROPE_HEAD_DIM_LOAD, 8]],
                 shape=[BLOCK_M, QK_ROPE_HEAD_DIM_LOAD],
                 order=[1, 0],
+                cga_layout=CGA_M_SPLIT,
             )
         )
         if self.QUERY_DTYPE == "nvfp4":
@@ -412,10 +447,22 @@ class MLAConfig:
         self.GATHER_BLOCKED_LAYOUT = gl.constexpr(None)
         if self.SHUFFLED_KV_CACHE:
             self.KV_LORA_SHARED_LAYOUT = gl.constexpr(
-                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+                gl.SwizzledSharedLayout(
+                    vec=1,
+                    per_phase=1,
+                    max_phase=1,
+                    order=[1, 0],
+                    cga_layout=CGA_BCAST,
+                )
             )
             self.K_ROPE_SHARED_LAYOUT = gl.constexpr(
-                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+                gl.SwizzledSharedLayout(
+                    vec=1,
+                    per_phase=1,
+                    max_phase=1,
+                    order=[1, 0],
+                    cga_layout=CGA_BCAST,
+                )
             )
         else:
             self.KV_LORA_SHARED_LAYOUT = gl.constexpr(
@@ -450,6 +497,7 @@ class MLAConfig:
                 ],
                 warps_per_cta=[NUM_WARPS, 1],
                 order=[1, 0],
+                cga_layout=CGA_M_SPLIT,
             )
         )
         threads_per_warp_fastest_dim1 = max(
@@ -464,6 +512,7 @@ class MLAConfig:
                 ],
                 warps_per_cta=[NUM_WARPS, 1],
                 order=[1, 0],
+                cga_layout=CGA_M_SPLIT,
             )
         )
 
@@ -801,6 +850,19 @@ class MLAProgram:
             return (buffer_id + 1) % self.cfg.NUM_STAGES
 
     @gluon.jit
+    def cluster_align_wait(self, wait_count):
+        # cluster_alignment: when the shared KV is multicast across the cluster's
+        # head-block CTAs, bracket the TDM wait with a cluster barrier so all CTAs
+        # stay within one iteration of each other and their identical (broadcast)
+        # KV loads are serviced together by L2 instead of drifting apart.
+        # Mirrors the gfx1250 GEMM issue_wmma pattern (arrive -> wait -> wait).
+        if self.cfg.MULTICAST_HEADS:
+            gl.amd.gfx1250.cluster.arrive()  # cluster_alignment
+        gl.amd.gfx1250.tdm.async_wait(wait_count)
+        if self.cfg.MULTICAST_HEADS:
+            gl.amd.gfx1250.cluster.wait()  # cluster_alignment
+
+    @gluon.jit
     def allocate_accumulator(
         self,
     ):
@@ -1004,12 +1066,12 @@ class MLAProgram:
 
     @gluon.jit
     def tdm_shared_load_kv_lora(self, wait_count, buffer_id):
-        gl.amd.gfx1250.tdm.async_wait(wait_count)
+        self.cluster_align_wait(wait_count)  # cluster_alignment
         return self.lds_unshuffle_kv_lora(buffer_id).load(layout=self.cfg.K_DOT_LAYOUT)
 
     @gluon.jit
     def tdm_shared_load_kv_lora_trans(self, wait_count, buffer_id):
-        gl.amd.gfx1250.tdm.async_wait(wait_count)
+        self.cluster_align_wait(wait_count)  # cluster_alignment
         return self.lds_unshuffle_kv_lora_trans(buffer_id).load(
             layout=self.cfg.V_DOT_LAYOUT
         )
@@ -1027,7 +1089,7 @@ class MLAProgram:
 
     @gluon.jit
     def tdm_shared_load_k_rope(self, wait_count, buffer_id):
-        gl.amd.gfx1250.tdm.async_wait(wait_count)
+        self.cluster_align_wait(wait_count)  # cluster_alignment
         return self.lds_unshuffle_k_rope(buffer_id).load(layout=self.cfg.K_DOT_LAYOUT)
 
     @gluon.jit
@@ -1533,6 +1595,7 @@ def _mla_decode_fwd_kernel(
     WARP_SIZE: gl.constexpr,  # int
     num_warps: gl.constexpr,  # int
     num_stages: gl.constexpr,  # int
+    num_ctas: gl.constexpr,
     SHUFFLED_KV_CACHE: gl.constexpr = True,  # bool
     ALL_DECODE: gl.constexpr = False,  # bool
     K_WIDTH: gl.constexpr = 0,  # int
@@ -1542,6 +1605,7 @@ def _mla_decode_fwd_kernel(
     KV_CACHE_DTYPE: gl.constexpr = "bf16",  # bool
     BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
     NUM_HEAD_BLOCKS: gl.constexpr = 1,  # int
+    MULTICAST_HEADS: gl.constexpr = False,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -1572,6 +1636,17 @@ def _mla_decode_fwd_kernel(
         SCALE_K_WIDTH_LORA,
         SCALE_K_WIDTH_ROPE,
         BLOCK_SCALES_SIZE,
+        NUM_HEAD_BLOCKS,
+        MULTICAST_HEADS,
+    )
+
+    # Logical (cluster-wide) M.  When multicasting the shared KV across the
+    # NUM_HEAD_BLOCKS head-block CTAs of a sequence, the head-block dimension is
+    # folded into M and split across the cluster's CTAs by the CGA layout, so
+    # every M-shaped tensor is allocated at BLOCK_M_CLUSTER and each CTA owns a
+    # BLOCK_M slice.  head_offset disappears (it is implicit in the M split).
+    BLOCK_M_CLUSTER: gl.constexpr = (
+        BLOCK_M * NUM_HEAD_BLOCKS if MULTICAST_HEADS else BLOCK_M
     )
 
     # Workgroup offsets
@@ -1582,17 +1657,27 @@ def _mla_decode_fwd_kernel(
     num_token_blocks_per_seq = cdiv_fn(num_tokens_per_seq, BLOCK_Q)
     num_q_blocks_per_seq = num_token_blocks_per_seq * NUM_HEAD_BLOCKS
 
-    if cfg.ALL_DECODE:
+    if MULTICAST_HEADS:
+        # One CLUSTER per sequence (ALL_DECODE); the cluster's CTAs cover all
+        # head-blocks via the CGA M split, so there is no per-CTA head index.
+        seq_idx = q_block_global_idx
+        q_block_local_idx = 0
+    elif cfg.ALL_DECODE:
         seq_idx = q_block_global_idx // NUM_HEAD_BLOCKS
+        q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
     else:
         seq_idx = q_block_global_idx // num_q_blocks_per_seq
-    q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
+        q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
 
     q_start_idx = gl.load(query_start_len_ptr + seq_idx)
 
-    token_q_block_local_idx = q_block_local_idx // NUM_HEAD_BLOCKS
-    head_block_idx = q_block_local_idx % NUM_HEAD_BLOCKS
-    head_offset = head_block_idx * BLOCK_M
+    if MULTICAST_HEADS:
+        token_q_block_local_idx = 0
+        head_offset = 0
+    else:
+        token_q_block_local_idx = q_block_local_idx // NUM_HEAD_BLOCKS
+        head_block_idx = q_block_local_idx % NUM_HEAD_BLOCKS
+        head_offset = head_block_idx * BLOCK_M
 
     # sequence len for this particular sequence
     seq_len = gl.load(seq_lens_ptr + seq_idx)
@@ -1633,26 +1718,28 @@ def _mla_decode_fwd_kernel(
         KV_LORA_RANK_LOAD: gl.constexpr = KV_LORA_RANK
         QK_ROPE_HEAD_DIM_LOAD: gl.constexpr = QK_ROPE_HEAD_DIM
 
+    # Q shared uses the logical (cluster-wide) M; the CGA M split gives each CTA
+    # its own BLOCK_M head rows physically.
     q_lora_shared = gl.allocate_shared_memory(
         query_ptr.type.element_ty,
-        shape=[BLOCK_M, KV_LORA_RANK_LOAD],
+        shape=[BLOCK_M_CLUSTER, KV_LORA_RANK_LOAD],
         layout=cfg.Q_LORA_SHARED_LAYOUT,
     )
     q_rope_shared = gl.allocate_shared_memory(
         query_ptr.type.element_ty,
-        shape=[BLOCK_M, QK_ROPE_HEAD_DIM_LOAD],
+        shape=[BLOCK_M_CLUSTER, QK_ROPE_HEAD_DIM_LOAD],
         layout=cfg.Q_ROPE_SHARED_LAYOUT,
     )
 
     # load Q
     offs_q_m_lora = gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, cfg.Q_LORA_LOAD_LAYOUT)
+        0, BLOCK_M_CLUSTER, layout=gl.SliceLayout(1, cfg.Q_LORA_LOAD_LAYOUT)
     )
     offs_q_d_lora = gl.arange(
         0, KV_LORA_RANK_LOAD, layout=gl.SliceLayout(0, cfg.Q_LORA_LOAD_LAYOUT)
     )
     offs_q_m_rope = gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, cfg.Q_ROPE_LOAD_LAYOUT)
+        0, BLOCK_M_CLUSTER, layout=gl.SliceLayout(1, cfg.Q_ROPE_LOAD_LAYOUT)
     )
     offs_q_d_rope = gl.arange(
         0, QK_ROPE_HEAD_DIM_LOAD, layout=gl.SliceLayout(0, cfg.Q_ROPE_LOAD_LAYOUT)
@@ -1782,7 +1869,7 @@ def _mla_decode_fwd_kernel(
         q_rope_scales = None
 
     offs_q_m_qk = gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, cfg.QK_WMMA_UNPACKED_LAYOUT)
+        0, BLOCK_M_CLUSTER, layout=gl.SliceLayout(1, cfg.QK_WMMA_UNPACKED_LAYOUT)
     )
     query_pos_qk = (
         token_q_block_local_idx * BLOCK_Q + offs_q_m_qk // cfg.NUM_QUERIES_PER_KV
@@ -1814,7 +1901,7 @@ def _mla_decode_fwd_kernel(
     max_seq_prefix_len = (
         context_len
         + token_q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // cfg.NUM_QUERIES_PER_KV
+        + (BLOCK_M_CLUSTER - 1) // cfg.NUM_QUERIES_PER_KV
         + 1
     )
     max_seq_prefix_len = gl.minimum(max_seq_prefix_len, seq_len)
@@ -1877,7 +1964,9 @@ def _mla_decode_fwd_kernel(
         )
 
         S = gl.zeros(
-            [BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_UNPACKED_LAYOUT
+            [BLOCK_M_CLUSTER, TILE_SIZE],
+            dtype=tl.float32,
+            layout=cfg.QK_WMMA_UNPACKED_LAYOUT,
         )
 
         if KV_CACHE_DTYPE == "nvfp4":
@@ -1940,7 +2029,9 @@ def _mla_decode_fwd_kernel(
         buffer_id = next_buffer_id
 
     S = gl.zeros(
-        [BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_UNPACKED_LAYOUT
+        [BLOCK_M_CLUSTER, TILE_SIZE],
+        dtype=tl.float32,
+        layout=cfg.QK_WMMA_UNPACKED_LAYOUT,
     )
     if KV_CACHE_DTYPE == "nvfp4":
         kv_lora = pgm.tdm_shared_load_kv_lora(3, buffer_id)

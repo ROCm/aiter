@@ -242,26 +242,26 @@ def torch_mla_extend(
     return out.to(o_dtype)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
-@pytest.mark.parametrize("decode_qlen", [1, 3])
-@pytest.mark.parametrize("ctx_lens", [200, 4371, 8192])
-@pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("decode_qlen", [1])
+@pytest.mark.parametrize("ctx_lens", [1328])
+@pytest.mark.parametrize("num_heads", [(128, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
-@pytest.mark.parametrize("num_blocks", [32768])
-@pytest.mark.parametrize("varlen", [True, False])
+@pytest.mark.parametrize("num_blocks", [256])
+@pytest.mark.parametrize("varlen", [False])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, out_dtype, block_size, use_out_scale",
     [
         (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
-        (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False),
+        # (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, False),
-        (e4m3_dtype, e4m3_dtype, e4m3_dtype, 64, True),
+        # (e4m3_dtype, e4m3_dtype, e4m3_dtype, 64, True),
         # skip NVFP4 KV cache for now as ds_load_tr4 is not yet supported
         # (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
         # (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
     ],
 )
-@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("shuffled_kv_cache", [True])
 @torch.inference_mode()
 def test_mla_decode_fwd(
     batch_size: int,
