@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -2933,6 +2934,7 @@ def _mha_batch_prefill(
 
     if (
         GPU_ARCH == "gfx942"
+        and os.environ.get("AITER_FMHA_PREFILL_ASM", "1") != "0"
         and q.dtype == torch.float8_e4m3fnuz
         and q_descale_per_token is not None
         and v_descale_per_head is not None
