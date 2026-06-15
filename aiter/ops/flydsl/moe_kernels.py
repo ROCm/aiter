@@ -1352,6 +1352,48 @@ def _get_compiled_silu_fq(inter_dim: int, topk: int):
     return build_silu_and_mul_fq_module(inter_dim, topk)
 
 
+_GATING_DTYPE_TO_STR = {
+    torch.float32: "f32",
+    torch.float16: "f16",
+    torch.bfloat16: "bf16",
+}
+
+
+@functools.cache
+def _get_compiled_grouped_topk(
+    num_experts: int,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    need_renorm: bool,
+    is_softmax: bool,
+    dtype_str: str,
+    routed_scaling_factor: float,
+    is_biased: bool = False,
+):
+    """Compile and cache the grouped-topk gating kernel for one configuration."""
+    from aiter.ops.flydsl.kernels.grouped_topk import build_grouped_topk_module
+
+    return build_grouped_topk_module(
+        num_experts=num_experts,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        topk=topk,
+        need_renorm=need_renorm,
+        is_softmax=is_softmax,
+        dtype_str=dtype_str,
+        routed_scaling_factor=routed_scaling_factor,
+        is_biased=is_biased,
+    )
+
+
+@functools.cache
+def _placeholder_bias(num_experts: int, dtype: torch.dtype, device: torch.device):
+    """A tiny (unused) bias tensor for the non-biased kernel build, which still
+    carries a ``bias`` argument in its signature."""
+    return torch.zeros(num_experts, dtype=dtype, device=device)
+
+
 # Public API
 
 
@@ -2365,3 +2407,112 @@ def flydsl_moe_stage1_direct(
     )
     _run_compiled(exe, args)
     return out
+
+
+def flydsl_grouped_topk(
+    gating_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    need_renorm: bool,
+    is_softmax: bool = True,
+    routed_scaling_factor: float = 1.0,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Grouped (group-limited) top-k expert routing, implemented in FlyDSL.
+
+    Single parameterized implementation that covers both the non-biased and the
+    biased routing variants in one kernel. The variant is selected at runtime by
+    whether ``correction_bias`` is provided:
+
+      gating_output   : (num_tokens, num_experts) f32/f16/bf16
+      correction_bias : None | (num_experts,)     same dtype as gating
+      topk_weights    : (num_tokens, topk)        f32 (row stride may exceed topk)
+      topk_ids        : (num_tokens, topk)        i32 (row stride may exceed topk)
+
+    Non-biased (``correction_bias is None``): scores with softmax
+    (``is_softmax=True``) or per-expert sigmoid, reduces each of
+    ``num_expert_group`` groups to its max, keeps the ``topk_group`` best groups,
+    then selects the global ``topk`` experts.
+
+    Biased (``correction_bias`` given): scoring is per-expert sigmoid and
+    ``is_softmax`` is ignored; the *selection* score is ``sigmoid(gate) + bias``;
+    a group's score is the sum of its top-2 selection scores; and the stored
+    weight is the **de-biased** ``sigmoid(gate)`` value.
+
+    In both cases the selected weights are multiplied by
+    ``routed_scaling_factor`` and, when ``need_renorm`` is set, normalized to
+    sum to ``routed_scaling_factor``. Results are written in-place into
+    ``topk_weights`` / ``topk_ids`` and also returned.
+    """
+    assert gating_output.dim() == 2, "gating_output must be 2D [num_tokens, num_experts]"
+    num_tokens, num_experts = gating_output.shape
+    topk = topk_ids.shape[1]
+    is_biased = correction_bias is not None
+
+    if gating_output.dtype not in _GATING_DTYPE_TO_STR:
+        raise ValueError(
+            f"flydsl_grouped_topk: unsupported gating dtype {gating_output.dtype}"
+        )
+    dtype_str = _GATING_DTYPE_TO_STR[gating_output.dtype]
+    gating_output = gating_output.contiguous()
+
+    if is_biased:
+        # The kernel reads bias with the same element type as the gating tensor.
+        bias = correction_bias.to(gating_output.dtype).contiguous()
+    else:
+        bias = _placeholder_bias(
+            int(num_experts), gating_output.dtype, gating_output.device
+        )
+
+    exe = _get_compiled_grouped_topk(
+        num_experts=int(num_experts),
+        num_expert_group=int(num_expert_group),
+        topk_group=int(topk_group),
+        topk=int(topk),
+        need_renorm=bool(need_renorm),
+        # The biased path always scores with sigmoid.
+        is_softmax=False if is_biased else bool(is_softmax),
+        dtype_str=dtype_str,
+        routed_scaling_factor=float(routed_scaling_factor),
+        is_biased=is_biased,
+    )
+    args = (
+        gating_output,
+        bias,
+        topk_weights,
+        topk_ids,
+        int(topk_weights.stride(0)),
+        int(topk_ids.stride(0)),
+        int(num_tokens),
+        torch.cuda.current_stream(),
+    )
+    _run_compiled(exe, args)
+    return topk_weights, topk_ids
+
+
+def flydsl_biased_grouped_topk(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    need_renorm: bool,
+    routed_scaling_factor: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Biased routing entry point. Thin adapter over the single
+    ``flydsl_grouped_topk`` implementation, passing ``correction_bias`` to
+    select the biased variant."""
+    return flydsl_grouped_topk(
+        gating_output,
+        topk_weights,
+        topk_ids,
+        num_expert_group,
+        topk_group,
+        need_renorm,
+        is_softmax=False,
+        routed_scaling_factor=routed_scaling_factor,
+        correction_bias=correction_bias,
+    )
