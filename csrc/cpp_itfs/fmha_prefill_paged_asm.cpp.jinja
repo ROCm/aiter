@@ -4,7 +4,7 @@
 #include <cmath>
 #include <stdint.h>
 
-// KernelArgs: 656 bytes = 41 slots × 16 bytes
+// KernelArgs: 736 bytes = 46 slots × 16 bytes
 // ptr fields: 8-byte pointer + 8-byte pad
 // i32 fields: 4-byte value  + 12-byte pad
 // See kernels/pyisa/gfx942/fmha_prefill/f8_fmha_prefill_gfx942_hd128_qkptph_vph_paged_vkcolv_ps/init.py
@@ -59,7 +59,7 @@ struct __attribute__((packed)) KernelArgs
     int32_t  s_sched_groups; int32_t _p44[3];// 0x2C0  G = clamp(num_cu / nhead_q, 1, num_tiles)
     int32_t  s_kscale_head_stride; int32_t _p45[3]; // 0x2D0 k_descale head stride (elements=1; kernel folds kv_head)
 };
-static_assert(sizeof(KernelArgs) == 656, "KernelArgs size mismatch — check init.py offsets");
+static_assert(sizeof(KernelArgs) == 736, "KernelArgs size mismatch — check init.py offsets");
 
 unsigned char hsaco[{{bin_size}}] = { {{bin_data}} };
 
@@ -188,9 +188,9 @@ void {{func_name}}(
     impl.launch_kernel({
         &args,
         &arg_size,
-        (uint32_t)sched_groups,  // gdx: bin index [0, G)
-        (uint32_t)nhead_q,       // gdy: Q-head index
-        (uint32_t)batch,         // gdz: batch index
+        static_cast<int>(sched_groups),  // gdx: bin index [0, G)
+        static_cast<int>(nhead_q),       // gdy: Q-head index
+        static_cast<int>(batch),         // gdz: batch index
         512,                     // bdx: 8 waves × 64 threads
         1,                       // bdy
         1,                       // bdz
