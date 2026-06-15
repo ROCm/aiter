@@ -973,6 +973,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
 
 # --- Functions moved from moe_kernels.py for grouped gemm ---
+@functools.cache
 def _get_compiled_gather_reduce(model_dim: int, topk: int, out_dtype: str):
     """Compile and cache the one-pass MoE gather-reduce kernel."""
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
