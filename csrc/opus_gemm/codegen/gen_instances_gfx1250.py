@@ -257,12 +257,6 @@ void
         ws_handle_->bytes = grow_bytes;
     }}}}
 
-    const size_t a_batch_bytes = (size_t)XQ.stride(0) * sizeof({da});
-    const size_t b_batch_bytes = (size_t)WQ.stride(0) * sizeof({db});
-    const size_t c_elem_bytes  = (Y.dtype() == AITER_DTYPE_bf16) ? sizeof(bf16_t) : sizeof(fp32_t);
-    const size_t c_batch_bytes = (size_t)M * (size_t)N * c_elem_bytes;
-    const size_t bias_elem_bytes = bias_is_fp32_ ? sizeof(fp32_t) : c_elem_bytes;
-
     dim3 grid_main(num_tiles_m, num_tiles_n, split_k);
     dim3 block_main({k.BLOCK_SIZE});
 
@@ -271,64 +265,60 @@ void
     dim3 grid_reduce((N + REDUCE_VEC * REDUCE_BS - 1) / (REDUCE_VEC * REDUCE_BS), M, 1);
     dim3 block_reduce(REDUCE_BS);
 
-    for (int bb = 0; bb < batch; ++bb)
-    {{{{
-        {kargs_name} kargs{{{{}}}};
-        kargs.ptr_a     = reinterpret_cast<const char*>(XQ.data_ptr()) + (size_t)bb * a_batch_bytes;
-        kargs.ptr_b     = reinterpret_cast<const char*>(WQ.data_ptr()) + (size_t)bb * b_batch_bytes;
-        kargs.ws_handle = ws_handle_;
-        kargs.ptr_c     = reinterpret_cast<char*>(Y.data_ptr()) + (size_t)bb * c_batch_bytes;
-        kargs.ptr_bias  = ptr_bias_;
-        kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = 1; kargs.split_k = split_k;
-        kargs.stride_a        = XQ.stride(1);
-        kargs.stride_b        = WQ.stride(1);
-        kargs.stride_ws       = padded_N;
-        kargs.stride_c        = N;
-        kargs.stride_a_batch  = XQ.stride(0);
-        kargs.stride_b_batch  = WQ.stride(0);
-        kargs.stride_ws_batch = padded_M * padded_N;
-        kargs.stride_c_batch  = M * N;
-        kargs.stride_bias_batch = stride_bias_batch_;
+    // gfx1250 cluster_tdm_splitk_ws is batch==1 only (the Python layout guard
+    // and the 3D grid both assume a single batch). A single main + reduce
+    // launch handles the whole gemm -- no host batch loop, no per-batch
+    // pointer / bias offsets. The kernels still take stride_*_batch but with
+    // batch==1 every batch term collapses (b==0, split_stride==stride_ws_batch).
+    {kargs_name} kargs{{{{}}}};
+    kargs.ptr_a     = XQ.data_ptr();
+    kargs.ptr_b     = WQ.data_ptr();
+    kargs.ws_handle = ws_handle_;
+    kargs.ptr_c     = Y.data_ptr();
+    kargs.ptr_bias  = ptr_bias_;
+    kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = 1; kargs.split_k = split_k;
+    kargs.stride_a        = XQ.stride(1);
+    kargs.stride_b        = WQ.stride(1);
+    kargs.stride_ws       = padded_N;
+    kargs.stride_c        = N;
+    kargs.stride_a_batch  = XQ.stride(0);
+    kargs.stride_b_batch  = WQ.stride(0);
+    kargs.stride_ws_batch = padded_M * padded_N;
+    kargs.stride_c_batch  = M * N;
+    kargs.stride_bias_batch = stride_bias_batch_;
 
-        {kernel_func}<Traits><<<grid_main, block_main, 0, stream>>>(kargs);
+    {kernel_func}<Traits><<<grid_main, block_main, 0, stream>>>(kargs);
 
-        // Per-batch bias base (reduce is called with batch=1 -> b==0 inside).
-        const void* bias_bb = ptr_bias_
-            ? (reinterpret_cast<const char*>(ptr_bias_)
-               + (size_t)bb * (size_t)stride_bias_batch_ * bias_elem_bytes)
-            : nullptr;
-
-        if (Y.dtype() == AITER_DTYPE_bf16) {{{{
-            __bf16* y_ptr = reinterpret_cast<__bf16*>(kargs.ptr_c);
-            if (bias_bb && bias_is_fp32_) {{{{
-                // fp32 bias + bf16 output: fold the exact fp32 bias in the
-                // reduce (D_BIAS=float), then cast the fp32 sum to bf16.
-                splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, {has_oob_str}>
-                    <<<grid_reduce, block_reduce, 0, stream>>>(
-                        ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
-                        reinterpret_cast<const float*>(bias_bb), 0);
-            }}}} else if (bias_bb) {{{{
-                splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}>
-                    <<<grid_reduce, block_reduce, 0, stream>>>(
-                        ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
-                        reinterpret_cast<const __bf16*>(bias_bb), 0);
-            }}}} else {{{{
-                splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}>
-                    <<<grid_reduce, block_reduce, 0, stream>>>(
-                        ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
-            }}}}
+    if (Y.dtype() == AITER_DTYPE_bf16) {{{{
+        __bf16* y_ptr = reinterpret_cast<__bf16*>(Y.data_ptr());
+        if (ptr_bias_ && bias_is_fp32_) {{{{
+            // fp32 bias + bf16 output: fold the exact fp32 bias in the
+            // reduce (D_BIAS=float), then cast the fp32 sum to bf16.
+            splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                    reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
+        }}}} else if (ptr_bias_) {{{{
+            splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                    reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_);
         }}}} else {{{{
-            float* y_ptr = reinterpret_cast<float*>(kargs.ptr_c);
-            if (bias_bb) {{{{
-                splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}>
-                    <<<grid_reduce, block_reduce, 0, stream>>>(
-                        ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
-                        reinterpret_cast<const float*>(bias_bb), 0);
-            }}}} else {{{{
-                splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}>
-                    <<<grid_reduce, block_reduce, 0, stream>>>(
-                        ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
-            }}}}
+            splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
+        }}}}
+    }}}} else {{{{
+        float* y_ptr = reinterpret_cast<float*>(Y.data_ptr());
+        if (ptr_bias_) {{{{
+            splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                    reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
+        }}}} else {{{{
+            splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
         }}}}
     }}}}
 }}}}
