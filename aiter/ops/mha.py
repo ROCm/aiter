@@ -2369,6 +2369,27 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    # FlyDSL batch path — returns result if supported, None otherwise.
+    from .flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+
+    _flydsl_result = flydsl_flash_attn_batch_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_lse=return_lse,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+        sink=sink_ptr,
+    )
+    if _flydsl_result is not None:
+        return _flydsl_result
+
     if not ENABLE_CK:
         from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
 
