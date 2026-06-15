@@ -13,13 +13,13 @@ from aiter.ops.triton._triton_kernels.attention.mla import (
 from aiter.ops.triton._triton_kernels.attention.mla import _mla_decode_fwd_reduce_kernel
 
 try:
-    from aiter.ops.triton.gluon.mla import (
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
         _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
     )
-    from aiter.ops.triton.gluon.mla import (
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
         _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
     )
-    from aiter.ops.triton.gluon.mla import (
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
         _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
     )
 except:  # noqa: E722
@@ -32,10 +32,6 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
-if IS_DEVICE_ARCH_GFX12:
-    assert gluon_mla_prefill_fwd_kernel_non_pipelined is not None
-    assert gluon_mla_decode_fwd_kernel_non_pipelined is not None
-    assert gluon_mla_decode_fwd_kernel is not None
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 
@@ -71,23 +67,21 @@ def select_3d_config(
     attn_warps = 2
     waves_per_eu = 1
     num_segments = 0
-    if shuffled_kv_cache:
-        if IS_DEVICE_ARCH_GFX12:
-            if kv_dtype == torch.bfloat16:
-                if num_2d_prgms >= 64:
-                    num_segments = 1
-                else:
-                    num_segments = 2
-            else:
-                if num_2d_prgms >= 64:
-                    num_segments = 1
-                else:
-                    num_segments = 2
-        else:
-            attn_warps = 2
-            waves_per_eu = 1
-
     TILE_SIZE = block_size
+    if IS_DEVICE_ARCH_GFX12:
+        attn_warps = 2
+        waves_per_eu = 1
+        if shuffled_kv_cache:
+            if kv_dtype == torch.uint8:
+                assert (
+                    block_size == 128
+                ), "Only block_size == 128 is supported for FP4 KV cache"
+
+        occ = waves_per_eu * 4 // attn_warps
+        MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
+        num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
+        num_segments = min(MAX_SEGMENTS, num_segments)
+        num_segments = triton.next_power_of_2(num_segments)
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     if num_segments == 0:
@@ -132,8 +126,8 @@ def mla_prefill_fwd(
     causal: bool,
     q_descale,
     kv_descale,
-    out_scale,
-    shuffled_kv_cache: bool,
+    out_scale=None,
+    shuffled_kv_cache: bool = False,
 ):
     assert causal, "Only causal attention is supported"
     assert (
@@ -146,6 +140,9 @@ def mla_prefill_fwd(
     num_queries_per_kv = num_query_heads // num_kv_heads
     q_dtype = q.dtype
     kv_buffer_dtype = kv_buffer.dtype
+    K_WIDTH = 16 if kv_buffer_dtype == e4m3_dtype else 8
+    QUERY_DTYPE = "fp8" if q_dtype == e4m3_dtype else "bf16"
+    KV_CACHE_DTYPE = "fp8" if kv_buffer_dtype == e4m3_dtype else "bf16"
 
     assert (
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
@@ -205,8 +202,9 @@ def mla_prefill_fwd(
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
             WARP_SIZE=WARP_SIZE,
-            IS_Q_FP8=(q_dtype == e4m3_dtype),
-            IS_KV_FP8=(kv_buffer_dtype == e4m3_dtype),
+            QUERY_DTYPE=QUERY_DTYPE,
+            KV_CACHE_DTYPE=KV_CACHE_DTYPE,
+            K_WIDTH=K_WIDTH,
             **attn_config,
         )
     else:
@@ -256,21 +254,66 @@ def mla_decode_fwd(
     causal: bool,
     q_descale,
     kv_descale,
-    out_scale,
-    shuffled_kv_cache: bool,
+    q_scales=None,
+    out_scale=None,
+    shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
 ):
     assert causal, "Only causal attention is supported"
+    q_dtype = q.dtype
+    kv_buffer_dtype = kv_buffer.dtype
     total_num_tokens, num_query_heads, qk_head_dim = q.shape
+
+    BLOCK_SCALES_SIZE = 16
+    if q_dtype == torch.uint8:
+        # A4W4
+        assert q_scales is not None and q_scales.dtype == e4m3_dtype
+        qk_head_dim = qk_head_dim * 2
+        QUERY_DTYPE = "nvfp4"
+    elif q_dtype == e4m3_dtype:
+        QUERY_DTYPE = "fp8"
+    else:
+        QUERY_DTYPE = "bf16"
+
+    if kv_buffer_dtype == torch.uint8:
+        # A8W4 A4W4
+        assert IS_DEVICE_ARCH_GFX12, "FP4 KV cache is only supported on GFX12"
+        KV_CACHE_DTYPE = "nvfp4"
+    elif kv_buffer_dtype == e4m3_dtype:
+        KV_CACHE_DTYPE = "fp8"
+    else:
+        KV_CACHE_DTYPE = "bf16"
+
+    SCALE_K_WIDTH_LORA = 0
+    SCALE_K_WIDTH_ROPE = 0
     if shuffled_kv_cache:
-        num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
+        SCALE_K_WIDTH_LORA = 4
+        SCALE_K_WIDTH_ROPE = 4
+        if kv_buffer_dtype == torch.uint8:
+            num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
+            K_WIDTH = 16
+            SCALE_K_LORA = kv_lora_rank // 16
+            SCALE_K_ROPE = qk_rope_head_dim // 16
+            SCALE_K_WIDTH_LORA = (
+                min(16, triton.next_power_of_2(SCALE_K_LORA))
+                if SCALE_K_LORA >= 4
+                else SCALE_K_LORA
+            )
+            SCALE_K_WIDTH_ROPE = (
+                min(16, triton.next_power_of_2(SCALE_K_ROPE))
+                if SCALE_K_ROPE >= 4
+                else SCALE_K_ROPE
+            )
+        else:
+            num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
+            K_WIDTH = 16 if kv_buffer_dtype == e4m3_dtype else 8
     else:
         num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
+        K_WIDTH = 16 if kv_buffer_dtype == e4m3_dtype else 8
+
     num_seqs = len(seqused_k)
     num_tokens_per_seq = total_num_tokens // num_seqs
     num_queries_per_kv = num_query_heads // num_kv_heads
-    q_dtype = q.dtype
-    kv_buffer_dtype = kv_buffer.dtype
 
     assert (
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
@@ -290,11 +333,8 @@ def mla_decode_fwd(
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
-    if IS_DEVICE_ARCH_GFX12:
-        target_num_prgms = 256
-    else:
-        cu_count = get_num_sms()
-        target_num_prgms = cu_count * 4
+    cu_count = get_num_sms()
+    target_num_prgms = cu_count * 4
     ALL_DECODE = num_tokens_per_seq == 1
     if ALL_DECODE:
         total_num_q_blocks = num_seqs
@@ -314,28 +354,33 @@ def mla_decode_fwd(
     )
 
     NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
-    segm_output = torch.empty(
-        total_num_tokens,
-        num_query_heads,
-        NUM_SEGMENTS,
-        triton.next_power_of_2(kv_lora_rank),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    segm_max = torch.empty(
-        total_num_tokens,
-        num_query_heads,
-        NUM_SEGMENTS,
-        dtype=torch.float32,
-        device=q.device,
-    )
-    segm_expsum = torch.empty(
-        total_num_tokens,
-        num_query_heads,
-        NUM_SEGMENTS,
-        dtype=torch.float32,
-        device=q.device,
-    )
+    if NUM_SEGMENTS > 1:
+        segm_output = torch.empty(
+            total_num_tokens,
+            num_query_heads,
+            NUM_SEGMENTS,
+            triton.next_power_of_2(kv_lora_rank),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        segm_max = torch.empty(
+            total_num_tokens,
+            num_query_heads,
+            NUM_SEGMENTS,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        segm_expsum = torch.empty(
+            total_num_tokens,
+            num_query_heads,
+            NUM_SEGMENTS,
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        segm_output = out
+        segm_max = out  # dummy ptr
+        segm_expsum = out  # dummy ptr
 
     if IS_DEVICE_ARCH_GFX12:
         if shuffled_kv_cache:
@@ -348,24 +393,28 @@ def mla_decode_fwd(
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
             query_ptr=q,
+            query_scales_ptr=q_scales,
             kv_buffer_ptr=kv_buffer,
             block_tables_ptr=block_tables,
             seq_lens_ptr=seqused_k,
             SCALE=softmax_scale,
             q_scale_ptr=q_descale,
             kv_scale_ptr=kv_descale,
+            out_scale_ptr=(
+                out_scale if (out_scale is not None and NUM_SEGMENTS == 1) else None
+            ),
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,
             block_tables_stride=block_tables.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
+            query_scales_stride_0=q_scales.stride(0) if q_scales is not None else 0,
+            query_scales_stride_1=q_scales.stride(1) if q_scales is not None else 0,
             KV_LORA_RANK=kv_lora_rank,
             QK_ROPE_HEAD_DIM=qk_rope_head_dim,
             stride_kv_buffer_0=kv_buffer.stride(0),
             stride_kv_buffer_1=kv_buffer.stride(1),
-            stride_kv_buffer_2=kv_buffer.stride(
-                2
-            ),  # * (16 if shuffled_kv_cache else 1),
+            stride_kv_buffer_2=kv_buffer.stride(2),
             stride_kv_buffer_3=kv_buffer.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_tokens_per_seq=num_tokens_per_seq,
@@ -374,8 +423,13 @@ def mla_decode_fwd(
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
-            IS_Q_FP8=(q_dtype == e4m3_dtype),
-            IS_KV_FP8=(kv_buffer_dtype == e4m3_dtype),
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
+            K_WIDTH=K_WIDTH,
+            SCALE_K_WIDTH_LORA=SCALE_K_WIDTH_LORA,
+            SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
+            QUERY_DTYPE=QUERY_DTYPE,
+            KV_CACHE_DTYPE=KV_CACHE_DTYPE,
+            BLOCK_SCALES_SIZE=BLOCK_SCALES_SIZE,
             **attn_config,
         )
     else:
@@ -384,6 +438,7 @@ def mla_decode_fwd(
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
             query_ptr=q,
+            query_scales_ptr=q_scales,
             kv_buffer_ptr=kv_buffer,
             block_tables_ptr=block_tables,
             seq_lens_ptr=seqused_k,
@@ -395,11 +450,13 @@ def mla_decode_fwd(
             block_tables_stride=block_tables.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
+            query_scales_stride_0=q_scales.stride(0) if q_scales is not None else 0,
+            query_scales_stride_1=q_scales.stride(1) if q_scales is not None else 0,
             KV_LORA_RANK=kv_lora_rank,
             QK_ROPE_HEAD_DIM=qk_rope_head_dim,
             stride_kv_buffer_0=kv_buffer.stride(0),
             stride_kv_buffer_1=kv_buffer.stride(1),
-            stride_kv_buffer_2=kv_buffer.stride(2) * (16 if shuffled_kv_cache else 1),
+            stride_kv_buffer_2=kv_buffer.stride(2),
             stride_kv_buffer_3=kv_buffer.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_tokens_per_seq=num_tokens_per_seq,
@@ -411,8 +468,12 @@ def mla_decode_fwd(
             IS_KV_FP8=(kv_buffer_dtype == e4m3_dtype),
             **attn_config,
         )
-    if skip_reduce:
+
+    if NUM_SEGMENTS == 1:
+        return segm_output
+    elif skip_reduce:
         return segm_output, segm_max, segm_expsum
+
     _mla_decode_fwd_reduce_kernel[(total_num_tokens, num_query_heads)](
         output_ptr=out,
         segm_output_ptr=segm_output,

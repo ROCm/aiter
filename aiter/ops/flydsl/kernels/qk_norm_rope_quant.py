@@ -4,15 +4,15 @@
 """Fused per-token RMSNorm + GPT-J RoPE + optional FP8 quant (FlyDSL).
 
 Q + KV combined into a single kernel launch (grid Y = num_tokens, grid X =
-num_q_heads + 1: bid_x ∈ [0, H) handle Q heads, bid_x == H handles KV).
+num_q_heads + 1: bid_x ? [0, H) handle Q heads, bid_x == H handles KV).
 
 Hard-coded MVP shape: D=512, RD=64, BLOCK_THREADS=64. Each block uses one
-wave (64 threads × 8 bf16 = 512 elems = D), so reductions are wave-local
+wave (64 threads x 8 bf16 = 512 elems = D), so reductions are wave-local
 (shuffle_xor, no LDS, no barrier).
 
 Layout per block:
-  - thread t ∈ [0, ROPE_THREAD_LO) owns NOPE elements [t*8, t*8+8)
-  - thread t ∈ [ROPE_THREAD_LO, 64) owns ROPE elements [t*8, t*8+8) which
+  - thread t ? [0, ROPE_THREAD_LO) owns NOPE elements [t*8, t*8+8)
+  - thread t ? [ROPE_THREAD_LO, 64) owns ROPE elements [t*8, t*8+8) which
     form ``PAIRS_PER_THREAD`` GPT-J pairs (2k, 2k+1)
 
 GPT-J RoPE with REUSE_FREQS_FRONT_PART=True: cos/sin shape (..., RD/2),
@@ -57,7 +57,7 @@ import torch
 # into ``module_aiter_core``. That JIT module is not yet built when
 # setup.py's AOT-compile pass walks the package, so importing dtypes at
 # module load time crashes setup with ``KeyError: 'module_aiter_core'``.
-# Defer the import until the first runtime call instead — sibling modules
+# Defer the import until the first runtime call instead -- sibling modules
 # (moe_kernels._get_dtypes, gemm_kernels._get_dtypes) use the same pattern.
 
 import flydsl.compiler as flyc
@@ -67,9 +67,43 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate
 from flydsl.expr.typing import T, Int32, Stream
 from flydsl.expr.vector import ReductionOp
+from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl._mlir.dialects import llvm, rocdl
 
-from .tensor_shim import GTensor, _to_raw
+from .tensor_shim import GTensor, _to_raw, _run_compiled
+
+# JIT-free MX-format mode/dtype int mirrors. ``aiter.utility.mx_types``'s
+# pybind11 ``MxScaleRoundMode`` / ``MxDtype`` lazy-load on first attribute
+# access; we only pull the int classes here so module import stays JIT-free
+# (mirrors the FlyDSL AOT-friendly pattern in ``quant_utils``).
+from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
+from aiter.utility.mx_types import (
+    MxDtypeInt as _D,
+    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
+)
+
+_STATIC_ADAPTOR_CACHE = {}
+_STATIC_ADAPTOR_CACHE_MAX = 64
+
+
+def _cached_from_dlpack(t: torch.Tensor):
+    key = (
+        int(t.data_ptr()),
+        str(t.device),
+        str(t.dtype),
+        tuple(t.shape),
+        tuple(t.stride()),
+        int(t.storage_offset()),
+    )
+    cached = _STATIC_ADAPTOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_STATIC_ADAPTOR_CACHE) >= _STATIC_ADAPTOR_CACHE_MAX:
+        _STATIC_ADAPTOR_CACHE.clear()
+    adaptor = flyc.from_dlpack(t)
+    _STATIC_ADAPTOR_CACHE[key] = adaptor
+    return adaptor
+
 
 # --- shape constants (V4-Pro MVP) -------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64
@@ -84,7 +118,7 @@ def _fp8_const():
 
     ``aiter.utility.dtypes.fp8`` selects e4m3fnuz on gfx942 MI300 and
     e4m3fn on gfx950 MI355 / gfx1250. ``cvt_pk_fp8_f32`` emits bytes in
-    the per-gfx native format, so FP8_MAX must track that — hardcoding
+    the per-gfx native format, so FP8_MAX must track that -- hardcoding
     e4m3fnuz's 240 on gfx950 would (a) clip outputs to a stricter range
     than needed and (b) leave the stored dequant scale inconsistent with
     downstream consumers reading the tensor as ``aiter.dtypes.fp8``.
@@ -102,19 +136,14 @@ def _fp8_const():
     }
 
 
-# --- supported quant-group sizes (1 × group_size block-scales) --------------
-# group_size == head_dim → per-row scale (single scale per token-head).
+# --- supported quant-group sizes (1 x group_size block-scales) --------------
+# group_size == head_dim -> per-row scale (single scale per token-head).
 GROUP_SIZE_OPTIONS = (32, 64, 128)
 
 # --- scale-dtype constants --------------------------------------------------
 SCALE_DTYPE_FP32 = "fp32"
 SCALE_DTYPE_E8M0 = "e8m0"
 SCALE_DTYPE_OPTIONS = (SCALE_DTYPE_FP32, SCALE_DTYPE_E8M0)
-
-# E8M0 encoding (matches the convention in silu_and_mul_fq / mixed_moe_gemm).
-# For e4m3fnuz (FP8_MAX = 240 ≈ 2^7.9): headroom = 7 keeps factor * amax_safe
-# ≤ 2^7 = 128 < FP8_MAX with sufficient SQRT2 margin.
-_E8M0_HEADROOM = 7
 
 _TORCH_DTYPE_FOR_SCALE = {
     SCALE_DTYPE_FP32: torch.float32,
@@ -144,11 +173,11 @@ def _store_bf16_vec_g(vals_list, g_out, row_off_elems, idx, vec):
 def _store_fp8_packed(vals_list, out_rsrc, row_base_bytes, idx, vec):
     """Pack VEC fp32 -> VEC fp8 (e4m3fnuz) via cvt_pk_fp8_f32 and store.
 
-    Emits one ``buffer_store_dwordx2`` per thread (VEC=8 → 2 dwords = 8 bytes).
+    Emits one ``buffer_store_dwordx2`` per thread (VEC=8 -> 2 dwords = 8 bytes).
 
     Workaround for the e4m3fnuz NaN encoding 0x80: cvt_pk_fp8_f32 returns
     0x80 (NaN) for inputs that round to negative zero, which propagates
-    through downstream attention as NaN. Clamp v ∈ (-2^-8, 0) to +0 first.
+    through downstream attention as NaN. Clamp v ? (-2^-8, 0) to +0 first.
     """
     f32 = T.f32
     i32 = T.i32
@@ -227,13 +256,13 @@ def _build_kernel(
     # Current MVP is hard-wired to VEC=8 (= D=512 with BLOCK_THREADS=64):
     # - ``BufferCopy128b`` atom expects 16 bytes / thread
     # - rope ``BufferCopy(64)`` atom expects 8 bytes / thread (= 4 bf16 pairs)
-    # - ``_store_fp8_packed`` is hand-rolled for VEC=8 → 2 dwords
+    # - ``_store_fp8_packed`` is hand-rolled for VEC=8 -> 2 dwords
     # Supporting other D values needs the atom widths + fp8 packing pattern
     # generalised. Reject other VECs with a clear message rather than dump
     # core inside LLVM lowering.
     assert VEC == 8, (
         f"VEC={VEC} unsupported (D={D}); only D=512 / VEC=8 is implemented. "
-        "Atom widths and fp8 packing assume VEC=8 — generalising requires "
+        "Atom widths and fp8 packing assume VEC=8 -- generalising requires "
         "a wider refactor."
     )
 
@@ -258,15 +287,20 @@ def _build_kernel(
     log2_block = int(math.log2(BLOCK_THREADS))
     log2_tpg = int(math.log2(TPG))
     # In the butterfly loop, sumsq shuffles at offsets [BLOCK/2, ..., 1].
-    # amax must NOT cross groups → only shuffles at offsets < TPG → only at
+    # amax must NOT cross groups -> only shuffles at offsets < TPG -> only at
     # the last log2(TPG) loop iterations (sh_exp >= amax_start_step).
     amax_start_step = log2_block - log2_tpg
 
     elem_dtype = fx.BFloat16
     is_e8m0 = scale_dtype == SCALE_DTYPE_E8M0
 
+    # The HW FP8 element dtype follows the arch (matches ``_fp8_const``):
+    # gfx942 ships e4m3fnuz (max_pos=240), gfx950+ ships OCP e4m3fn (max_pos=448).
+    # ``emit_mx_e8m0_scale`` uses this to pick the right ``max_pos`` reciprocal.
+    _fp8_mx_dtype = _D.FP8_E4M3_FNUZ if get_hip_arch() == "gfx942" else _D.FP8_E4M3
+
     # Kernel name: only include flags that affect the compiled binary.
-    # Default (not quant, not q_weighted) → "qk_norm_rope_H16_D512_RD64_flydsl"
+    # Default (not quant, not q_weighted) -> "qk_norm_rope_H16_D512_RD64_flydsl"
     _name_parts = ["qk_norm_rope", f"H{H}", f"D{D}", f"RD{RD}"]
     if q_weighted:
         _name_parts.append("qw")
@@ -398,30 +432,17 @@ def _build_kernel(
                 am_safe = arith.maximumf(am_group, arith.constant(1e-12, type=f32))
 
                 if const_expr(is_e8m0):
-                    # silu_and_mul_fq-style e8m0 encoding. amax_post incorporates
-                    # rstd (per-row) and SQRT2 (post-RoPE upper bound) so the
-                    # forward factor applied to x_norm (= x_in * rstd) bounds
-                    # the result by 2^_E8M0_HEADROOM ≤ FP8_MAX.
+                    # MX E8M0 RoundUp scale. ``amax_post`` folds rstd (per-row)
+                    # and SQRT2 (post-RoPE upper bound) so the forward factor
+                    # applied to x_norm bounds the result by ``max_pos`` of the
+                    # target FP8 dtype (e4m3fn 448 on gfx950+, e4m3fnuz 240 on
+                    # gfx942). The same NV ROUND_UP / torchao RCEIL formula is
+                    # used by silu_and_mul_fq and mixed_moe_gemm_2stage.
                     c_sqrt2 = arith.constant(_SQRT2, type=f32)
                     amax_post = am_safe * rstd * c_sqrt2
 
-                    amax_i32 = amax_post.bitcast(T.i32)
-                    bits_up = (
-                        amax_i32 + arith.constant(0x400000, type=T.i32)
-                    ) & arith.constant(0xFF800000, type=T.i32)
-                    exp_field = bits_up >> arith.constant(23, type=T.i32)
-                    # Subtract HEADROOM only. The IEEE bias (+127) is absorbed
-                    # by ``quant_exp = 254 - e8m0_biased`` below (254 = 127+127).
-                    # The stored byte is the IEEE biased-exp of the dequant
-                    # scale (MX e8m0 convention: byte b → scale 2^(b-127)).
-                    e8m0_biased_signed = exp_field - arith.constant(
-                        _E8M0_HEADROOM, type=T.i32
-                    )
-                    e8m0_biased = arith.maxsi(
-                        e8m0_biased_signed, arith.constant(0, type=T.i32)
-                    )
-                    e8m0_biased = arith.minsi(
-                        e8m0_biased, arith.constant(255, type=T.i32)
+                    e8m0_biased = emit_mx_e8m0_scale(
+                        amax_post, mode=_DEFAULT_MODE, dtype=_fp8_mx_dtype
                     )
                     # quant_scale = 2^(127 - e8m0_biased) for x_norm. We apply
                     # to x_in directly, so absorb the per-row rstd: factor =
@@ -436,7 +457,7 @@ def _build_kernel(
                     # scale_val = amax * rstd * SQRT2 / FP8_MAX  (stored)
                     # factor   = FP8_MAX / (amax * SQRT2)        (applied to x_in)
                     # The rstd factor cancels algebraically: store(out) =
-                    # x_in * factor → dequant: x_norm = scale * out = x_in * rstd.
+                    # x_in * factor -> dequant: x_norm = scale * out = x_in * rstd.
                     rcp_am = llvm.call_intrinsic(
                         f32, "llvm.amdgcn.rcp.f32", [am_safe], [], []
                     )
@@ -452,7 +473,7 @@ def _build_kernel(
                 # Per-lane scale_off = scale_base_off + (tid / TPG).
                 # NOTE: tried buffer_ops.buffer_store(mask=...) for
                 # predication but the mask path sets offset to 0x7FFFFFFF on
-                # masked-off lanes → OOB GPU fault on gfx950. Stay with scf.if.
+                # masked-off lanes -> OOB GPU fault on gfx950. Stay with scf.if.
                 group_idx = tid >> fx.Int32(log2_tpg)
                 lane_in_group = tid & fx.Int32(TPG - 1)
                 if lane_in_group == 0:
@@ -526,7 +547,7 @@ def _build_kernel(
         # width, 64-bit on AMD). GTensor.get_llvm_ptr does
         # arith.index_cast(i64, ...) on this value, which is only valid when
         # the input is index-typed. Doing the math in index avoids large
-        # H*D configs (e.g. H=128 D=512 → 128 KB/token, max offset 8.6 GiB
+        # H*D configs (e.g. H=128 D=512 -> 128 KB/token, max offset 8.6 GiB
         # at bid_t=65534) silently producing garbage if we feed i64.
         q_tok_off_bytes = arith.MulIOp(
             bid_t_idx, arith.constant(H * D * 2, type=T.index)
@@ -536,7 +557,7 @@ def _build_kernel(
             # ---------- Q path ----------
             head_idx = bid_x
             # Q in: per-token shifted base via GTensor. Each thread reads VEC
-            # bf16 at (head_idx, tid*VEC) — element offset is bounded by H*D
+            # bf16 at (head_idx, tid*VEC) -- element offset is bounded by H*D
             # = 64K (fits i32 with huge headroom).
             q_in_tok = GTensor(
                 q_in,
@@ -619,7 +640,7 @@ def _build_kernel(
         else:
             # ---------- KV path ----------
             # KV is often a strided slice of a wider tensor (V4: kv = split of
-            # qkv_a → row stride = q_lora + head_dim). fx.slice/logical_divide
+            # qkv_a -> row stride = q_lora + head_dim). fx.slice/logical_divide
             # do not pull stride from torch.Tensor metadata, so use raw
             # buffer_ops with the explicit kv_in_row_stride argument, then
             # round-trip through an rmem tensor to get a Fly-wrapped vec that
@@ -837,7 +858,7 @@ def flydsl_qk_norm_rope_quant(
         quant: if True, write fp8 in the per-GFX native encoding selected by
             ``aiter.dtypes.fp8`` (typically ``e4m3fnuz`` on gfx942 and
             ``e4m3fn`` on gfx950); else bf16.
-        quant_group_size: width of the 1×G scale block. Defaults to
+        quant_group_size: width of the 1xG scale block. Defaults to
             ``head_dim`` (per-row scale). Any value that divides ``head_dim``
             is accepted by the wrapper; the underlying kernel currently
             requires ``G`` to be a multiple of ``head_dim // BLOCK_THREADS``
@@ -853,7 +874,7 @@ def flydsl_qk_norm_rope_quant(
         stream: torch CUDA stream to launch on. Defaults to the current
             stream. **Must NOT be left at ``fx.Stream(None)`` default in
             caller code unless you accept the default-stream pitfall under
-            CUDA-graph capture** (NULL stream → empty captured graph).
+            CUDA-graph capture** (NULL stream -> empty captured graph).
 
     Returns:
         (q_out, kv_out, q_scale_or_None, kv_scale_or_None)
@@ -970,15 +991,24 @@ def flydsl_qk_norm_rope_quant(
 
     if stream is None:
         stream = torch.cuda.current_stream()
-    fx_stream = Stream(stream)
+
+    def _has_direct_state():
+        return getattr(launcher, "_direct_call_state", None) is not None
 
     def _ptr_arg(t):
+        if _has_direct_state():
+            return int(t.data_ptr())
         return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
-    q_weight_static = flyc.from_dlpack(q_weight_arg)
-    kv_weight_static = flyc.from_dlpack(kv_weight)
-    cos_static = flyc.from_dlpack(cos_2d)
-    sin_static = flyc.from_dlpack(sin_2d)
+    def _stream_arg():
+        if _has_direct_state():
+            return stream
+        return Stream(stream)
+
+    q_weight_static = _cached_from_dlpack(q_weight_arg)
+    kv_weight_static = _cached_from_dlpack(kv_weight)
+    cos_static = _cached_from_dlpack(cos_2d)
+    sin_static = _cached_from_dlpack(sin_2d)
 
     # HW grid Y is a 16-bit field on AMD HIP → cap 65535 blocks/launch. The
     # kernel uses per-token GTensor base-shift so each chunk's resource span
@@ -989,12 +1019,12 @@ def flydsl_qk_norm_rope_quant(
     # num_tokens, causing OOB memory faults at tail blocks). Wrapping the
     # full kernel body in a positive ``if bid_t < num_tokens:`` works but
     # requires indenting ~400 lines. The Python-loop chunk is the pragmatic
-    # solution — overhead is one launch per 65k tokens.
+    # solution -- overhead is one launch per 65k tokens.
     MAX_GRID_Y = 65535
     for start in range(0, T_tok, MAX_GRID_Y):
         n = min(MAX_GRID_Y, T_tok - start)
         end = start + n
-        launcher(
+        args = (
             _ptr_arg(q_view[start:end]),
             _ptr_arg(kv[start:end]),
             q_weight_static,
@@ -1008,7 +1038,8 @@ def flydsl_qk_norm_rope_quant(
             _ptr_arg(kv_scale_arg[start:end] if quant else kv_scale_arg),
             kv.stride(0),
             n,
-            stream=fx_stream,
+            _stream_arg(),
         )
+        _run_compiled(launcher, *args)
 
     return q_out, kv_out, (q_scale if quant else None), (kv_scale if quant else None)

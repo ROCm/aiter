@@ -91,7 +91,51 @@ def get_hip_version():
         output = subprocess.check_output([hipconfig, "--version"], text=True)
         return output
     except Exception:
-        raise RuntimeError("ROCm version file not found")
+        pass
+    # The fallbacks below previously hard-coded /opt/rocm, so they never
+    # helped users whose ROCm lives elsewhere.  Resolve the ROCm root the
+    # same way the rest of this module does (ROCM_HOME / ROCM_PATH env, then
+    # `which hipcc`, then /opt/rocm).  NOTE: the module-level ROCM_HOME global
+    # is assigned *after* this function is first called (see bottom of file),
+    # so we must call _find_rocm_home() directly here rather than referencing
+    # the global.  /opt/rocm is kept as a last-resort candidate so behavior on
+    # default installs is unchanged.
+    rocm_roots = []
+    discovered = _find_rocm_home()
+    if discovered:
+        rocm_roots.append(discovered)
+    if "/opt/rocm" not in rocm_roots:
+        rocm_roots.append("/opt/rocm")
+
+    # Fallback: try <rocm_root>/bin/hipconfig for each candidate root.
+    for root in rocm_roots:
+        rocm_hipconfig = os.path.join(root, "bin", "hipconfig")
+        if os.path.isfile(rocm_hipconfig):
+            try:
+                output = subprocess.check_output(
+                    [rocm_hipconfig, "--version"], text=True
+                )
+                return output
+            except Exception:
+                pass
+    # Fallback: read HIP version from a header / info file under each root.
+    for root in rocm_roots:
+        for ver_rel in ["include/hip/hip_version.h", ".info/version"]:
+            ver_path = os.path.join(root, ver_rel)
+            if os.path.isfile(ver_path):
+                with open(ver_path) as f:
+                    content = f.read()
+                if "HIP_VERSION_MAJOR" in content:
+                    import re
+
+                    major = re.search(r"HIP_VERSION_MAJOR\s+(\d+)", content)
+                    minor = re.search(r"HIP_VERSION_MINOR\s+(\d+)", content)
+                    patch = re.search(r"HIP_VERSION_PATCH\s+(\d+)", content)
+                    if major and minor and patch:
+                        return f"{major.group(1)}.{minor.group(1)}.{patch.group(1)}"
+                else:
+                    return content.strip()
+    raise RuntimeError("ROCm version file not found")
 
 
 def _find_rocm_home() -> Optional[str]:
