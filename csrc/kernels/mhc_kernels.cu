@@ -946,7 +946,7 @@ namespace aiter {
                 int offset = k * residual_block;
                 for(int i = 0; i < x_load_waitcnt; i++) {
                     int offset_in_block = i * x_async_load_threads * x_async_load_vec + threadIdx.x * x_async_load_vec;
-                    async_load<x_async_load_vec>(g_x, s_x_wr_ptr + offset_in_block, offset + offset_in_block, 0, opus::number<GROUP_NT>{});
+                    async_load<x_async_load_vec>(g_x, s_x_wr_ptr + offset_in_block, offset + offset_in_block, 0, opus::number<0>{}, opus::number<GROUP_NT>{});
                 }
             }
         };
@@ -962,7 +962,7 @@ namespace aiter {
             int offset = warp_id * hidden_size + k * residual_block;
             for(int i = 0; i < residual_load_waitcnt; i++) {
                 int offset_in_block = i * warp_size * r_async_load_vec + lane_id * r_async_load_vec;
-                async_load<r_async_load_vec>(g_residual, s_residual_wr_ptr + warp_id * residual_block + offset_in_block, offset + offset_in_block, 0, opus::number<GROUP_NT>{});
+                async_load<r_async_load_vec>(g_residual, s_residual_wr_ptr + warp_id * residual_block + offset_in_block, offset + offset_in_block, 0, opus::number<0>{}, opus::number<GROUP_NT>{});
             }
         };
         float post_mix_v = post_layer_mix[idx * hc_mult + warp_id];
@@ -1727,7 +1727,7 @@ namespace aiter {
                 for(int i = 0; i < x_load_waitcnt; i++) {
                     int s_offset = i * s_offset_i + threadIdx.x * x_async_load_vec;
                     async_load<x_async_load_vec>(g_x, s_x_wr_ptr + s_offset,
-                        offset_base + rows_per_load * i * x_stride, 0, opus::number<GROUP_NT>{});
+                        offset_base + rows_per_load * i * x_stride, 0, opus::number<0>{}, opus::number<GROUP_NT>{});
                 }
             }
         };
@@ -1747,7 +1747,7 @@ namespace aiter {
             static constexpr int s_offset_i = warp_size * r_async_load_vec;
             int s_offset = warp_id * tile_mk + lane_id * r_async_load_vec;
             for(int i = 0; i < residual_load_waitcnt; i++) {
-                async_load<r_async_load_vec>(g_res, s_residual_wr_ptr + s_offset, offset_base + rows_per_load * hc_hidden_size * i, 0, opus::number<GROUP_NT>{});
+                async_load<r_async_load_vec>(g_res, s_residual_wr_ptr + s_offset, offset_base + rows_per_load * hc_hidden_size * i, 0, opus::number<0>{}, opus::number<GROUP_NT>{});
                 s_offset += s_offset_i;
             }
         };
