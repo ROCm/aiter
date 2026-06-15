@@ -80,11 +80,10 @@ def _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False):
 
 
 def run_varlen_test(
-    cu_q_list, cu_k_list, H=1, causal=False, return_lse=False, warmup=1, repeat=5
+    cu_q_list, cu_k_list, H=1, causal=False, return_lse=False, warmup=1, repeat=5,
+    random_value=True,
 ):
     device = torch.device("cuda")
-    torch.manual_seed(42)
-
     cu_q, cu_k = cu_q_list, cu_k_list
     B = len(cu_q) - 1
     total_q, total_k = cu_q[-1], cu_k[-1]
@@ -92,9 +91,15 @@ def run_varlen_test(
     max_sq = max(cu_q[i + 1] - cu_q[i] for i in range(B))
     max_sk = max(cu_k[i + 1] - cu_k[i] for i in range(B))
 
-    q = torch.randn(total_q, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
-    k = torch.randn(total_k, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
-    v = torch.randn(total_k, H, HEAD_DIM_V, dtype=torch.bfloat16, device=device)
+    if random_value:
+        torch.manual_seed(42)
+        q = torch.randn(total_q, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
+        k = torch.randn(total_k, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
+        v = torch.randn(total_k, H, HEAD_DIM_V, dtype=torch.bfloat16, device=device)
+    else:
+        q = torch.full((total_q, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device)
+        k = torch.full((total_k, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device)
+        v = torch.full((total_k, H, HEAD_DIM_V), 0.25, dtype=torch.bfloat16, device=device)
 
     scale = 1.0 / math.sqrt(HEAD_DIM_QK)
 
@@ -297,6 +302,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Also time Triton for each case and print speedup.",
     )
+    parser.add_argument(
+        "--random-value",
+        type=str,
+        default="true",
+        help="Use random input data (default true). Set false to use fixed 0.25.\n"
+        "e.g.: --random-value false",
+    )
     args = parser.parse_args()
 
     for d_qk_v in args.d_qk_v:
@@ -426,6 +438,7 @@ if __name__ == "__main__":
                 return_lse=return_lse,
                 warmup=args.warmup,
                 repeat=args.repeat,
+                random_value=_parse_bool(args.random_value),
             )
             if args.cmp_triton:
                 device = torch.device("cuda")
