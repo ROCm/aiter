@@ -740,12 +740,6 @@ def get_moe_a8w4_prefill_layouts(
     else:
         ctas_per_cga = [1, num_ctas]
 
-    # TODO: double check this
-    if apply_swiglu:
-        assert ctas_per_cga[1] == 1, (
-            "APPLY_SWIGLU is incompatible with N-axis (cta_n > 1) multicast "
-            "sharding; use an M-only CGA split (e.g. ctas_per_cga = [num_ctas, 1])."
-        )
     cga_layout_c = make_cga_layout(ctas_per_cga, ctas_per_cga, [0, 1])
 
     if num_warps == 2:
