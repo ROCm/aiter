@@ -107,6 +107,8 @@ def get_moe_a4w4_layouts_gfx1250(
         W_BLOCK_N = PACKED_BLOCK_N_W // W_PRESHUFFLE_FACTOR
     else:
         W_PRESHUFFLE_FACTOR = 1
+        W_BLOCK_K = PACKED_BLOCK_K_W
+        W_BLOCK_N = PACKED_BLOCK_N_W
 
     # scale preshuffling
     MX_SCALE_BLOCK_K = BLOCK_K // 32
@@ -203,11 +205,8 @@ def get_moe_a4w4_layouts_gfx1250(
 
     GATHER_IDX_LAYOUT = None
     if GatherIndx is not None:
-        assert (
-            GatherIndx.dtype.element_ty == gl.uint16
-            or GatherIndx.dtype.element_ty == gl.int32
-        )
-        gather_idx_bitwidth = 16 if GatherIndx.dtype.element_ty == gl.uint16 else 32
+        assert GatherIndx.dtype == torch.uint16 or GatherIndx.dtype == torch.int32
+        gather_idx_bitwidth = 16 if GatherIndx.dtype == torch.uint16 else 32
         GATHER_IDX_LAYOUT = gl.SliceLayout(
             0,
             gl.BlockedLayout(

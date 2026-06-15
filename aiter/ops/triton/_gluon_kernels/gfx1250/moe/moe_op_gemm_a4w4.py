@@ -322,8 +322,9 @@ def _moe_gemm_a4w4_gfx1250(
             )
         ) % M
     else:
-        offs_x_m_scales = gl.convert_layout(
-            offs_x_m, gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES)
+        offs_x_m_scales = (
+            gl.convert_layout(offs_x_m, gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES))
+            % num_tokens
         )
     offs_x_k_scales = gl.arange(
         0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, BLOCKED_LAYOUT_X_SCALES)
@@ -442,9 +443,9 @@ def _moe_gemm_a4w4_gfx1250(
         idx_w = load_idx * W_BLOCK_K
         idx_x_scales = load_idx * MX_SCALE_BLOCK_K
         idx_w_scales = load_idx * PACKED_MX_BLOCK
-        x_scales_mask = (
-            offs_x_m_scales[:, None] < (M if GatherIndx is None else num_tokens)
-        ) & ((offs_x_k_scales[None, :] + idx_x_scales) < gl.cdiv(K, MX_PACK_DIVISOR))
+        x_scales_mask = (offs_x_k_scales[None, :] + idx_x_scales) < gl.cdiv(
+            K, MX_PACK_DIVISOR
+        )
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
@@ -544,9 +545,9 @@ def _moe_gemm_a4w4_gfx1250(
         idx_w = load_idx * W_BLOCK_K
         idx_x_scales = load_idx * MX_SCALE_BLOCK_K
         idx_w_scales = load_idx * PACKED_MX_BLOCK
-        x_scales_mask = (
-            offs_x_m_scales[:, None] < (M if GatherIndx is None else num_tokens)
-        ) & ((offs_x_k_scales[None, :] + idx_x_scales) < gl.cdiv(K, MX_PACK_DIVISOR))
+        x_scales_mask = (offs_x_k_scales[None, :] + idx_x_scales) < gl.cdiv(
+            K, MX_PACK_DIVISOR
+        )
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
