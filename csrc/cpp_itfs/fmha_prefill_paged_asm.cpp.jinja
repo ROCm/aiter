@@ -1,0 +1,199 @@
+#include <hip/hip_runtime.h>
+#include "aiter_hip_common.h"
+#include <cstring>
+#include <cmath>
+#include <stdint.h>
+
+// KernelArgs: 656 bytes = 41 slots × 16 bytes
+// ptr fields: 8-byte pointer + 8-byte pad
+// i32 fields: 4-byte value  + 12-byte pad
+// See kernels/pyisa/gfx942/fmha_prefill/f8_fmha_prefill_gfx942_hd128_qkptph_vph_paged_vkcolv_ps/init.py
+struct __attribute__((packed)) KernelArgs
+{
+    void    *ptr_o;         uint64_t _p0;    // 0x000  output [total_q, nhead_q, 128]
+    void    *ptr_q;         uint64_t _p1;    // 0x010  Q      [total_q, nhead_q, 128]
+    void    *ptr_k;         uint64_t _p2;    // 0x020  K paged pool
+    void    *ptr_v;         uint64_t _p3;    // 0x030  V paged pool
+    void    *ptr_lse;       uint64_t _p4;    // 0x040  LSE output [nhead_q, total_q]
+    int32_t  scalar;        int32_t  _p5[3]; // 0x050  softmax_scale as IEEE-754 bits
+    int32_t  s_seq_len;     int32_t  _p6[3]; // 0x060  max_seqlen_q
+    int32_t  s_Seqs;        int32_t  _p7[3]; // 0x070  batch size
+    int32_t  s_Ts;          int32_t  _p8[3]; // 0x080  max_seqlen_k
+    int32_t  s_Hs;          int32_t  _p9[3]; // 0x090  nhead_q
+    int32_t  s_Bs;          int32_t _p10[3]; // 0x0A0  nhead_k
+    int32_t  s_gqa;         int32_t _p11[3]; // 0x0B0  gqa ratio (nhead_q / nhead_k)
+    int32_t  s_k_Seqs;      int32_t _p12[3]; // 0x0C0  unused (0)
+    int32_t  s_k_Hs;        int32_t _p13[3]; // 0x0D0  K head byte stride in pool
+    int32_t  s_k_Bs;        int32_t _p14[3]; // 0x0E0  unused (0)
+    int32_t  s_opt;         int32_t _p15[3]; // 0x0F0  flags (0)
+    int32_t  s_lse;         int32_t _p16[3]; // 0x100  unused (0)
+    int32_t  s_kv_seq_len;  int32_t _p17[3]; // 0x110  max_seqlen_k (same as s_Ts)
+    int32_t  s_qk_head_dim; int32_t _p18[3]; // 0x120  128
+    int32_t  s_v_head_dim;  int32_t _p19[3]; // 0x130  128
+    int32_t  s_q_head_num;  int32_t _p20[3]; // 0x140  nhead_q
+    int32_t  s_v_Seqs;      int32_t _p21[3]; // 0x150  num_pages in K/V pool
+    int32_t  s_v_Hs;        int32_t _p22[3]; // 0x160  V head byte stride in pool
+    int32_t  s_v_Bs;        int32_t _p23[3]; // 0x170  page_size (= 16)
+    int32_t  s_o_Seqs;      int32_t _p24[3]; // 0x180  batch size
+    int32_t  s_o_Hs;        int32_t _p25[3]; // 0x190  output head byte stride
+    int32_t  s_o_Bs;        int32_t _p26[3]; // 0x1A0  hdim_v = 128
+    // Slots 0x1B0–0x1F0: field names in init.py are misleading; kernel reads
+    // different data here (documented in kernel.py Phase 1 comments).
+    void    *ptr_LTD;       uint64_t _p27;   // 0x1B0  kv_page_indices ptr  (LTD — flat page table)
+    void    *ptr_LTP;       uint64_t _p28;   // 0x1C0  kv_indptr ptr        (LTP — page range/seq)
+    int32_t  s_log2_plen;   int32_t _p29[3]; // 0x1D0  log2(page_size) = 4
+    int32_t  s_K_page_stride; int32_t _p30[3];// 0x1E0  K page stride (bytes); kernel reads lo dword
+    int32_t  s_V_page_stride; int32_t _p31[3];// 0x1F0  V page stride (bytes); kernel reads lo dword
+    void    *ptr_q_descale; uint64_t _p32;   // 0x200  q_descale_per_token [total_q, nhead_q] fp32
+    void    *ptr_k_descale; uint64_t _p33;   // 0x210  k_descale_per_token [pages, page_size, nhead_k] fp32
+    void    *ptr_v_descale; uint64_t _p34;   // 0x220  v_descale_per_head  [nhead_k] fp32
+    int32_t  s_descale_q_Bs;  int32_t _p35[3];// 0x230  q_descale batch byte stride (0 for varlen)
+    int32_t  s_descale_q_Hs;  int32_t _p36[3];// 0x240  q_descale head byte stride (= 4)
+    int32_t  s_kscale_page_stride;  int32_t _p37[3]; // 0x250 k_descale page stride (elements; kernel <<2)
+    int32_t  s_kscale_token_stride; int32_t _p38[3]; // 0x260 k_descale token stride (elements; kernel <<2)
+    int32_t  s_vscale_Bs;  int32_t _p39[3]; // 0x270  v_descale batch byte stride (0: no batch dim)
+    int32_t  s_vscale_Hs;  int32_t _p40[3]; // 0x280  v_descale head byte stride (= 4)
+    void    *ptr_p_scale;  uint64_t _p41;   // 0x290  p_scale [nhead_q] fp32 (nullable)
+    int32_t  s_p_scale_Bs; int32_t _p42[3]; // 0x2A0  p_scale batch byte stride (= nhead_q * 4)
+    int32_t  s_p_scale_Hs; int32_t _p43[3]; // 0x2B0  p_scale head byte stride (= 4)
+    int32_t  s_sched_groups; int32_t _p44[3];// 0x2C0  G = clamp(num_cu / nhead_q, 1, num_tiles)
+    int32_t  s_kscale_head_stride; int32_t _p45[3]; // 0x2D0 k_descale head stride (elements=1; kernel folds kv_head)
+};
+static_assert(sizeof(KernelArgs) == 656, "KernelArgs size mismatch — check init.py offsets");
+
+unsigned char hsaco[{{bin_size}}] = { {{bin_data}} };
+
+extern "C" {
+void {{func_name}}(
+    void* ptr_o,                // output  [total_q, nhead_q, 128]
+    void* ptr_q,                // Q       [total_q, nhead_q, 128] fp8
+    void* ptr_k,                // K paged pool (vec_k_col_v layout) fp8
+    void* ptr_v,                // V paged pool (vec_k_col_v layout) fp8
+    void* ptr_lse,              // LSE output [nhead_q, total_q] fp32
+    float softmax_scale,
+    int   max_seqlen_q,
+    int   batch,
+    int   max_seqlen_k,
+    int   nhead_q,
+    int   nhead_k,
+    int   num_pages,
+    int   page_size,            // must be 16
+    void* kv_page_indices,      // [num_pages_used] int32
+    void* kv_indptr,            // [batch+1] int32
+    void* q_descale_per_token,  // [total_q, nhead_q] fp32
+    void* k_descale_per_token,  // [num_pages, page_size, nhead_k] fp32
+    void* v_descale_per_head,   // [nhead_k] fp32
+    void* p_scale,              // [nhead_q] fp32, nullable
+    int   k_page_stride_bytes,  // bytes per K page in pool
+    int   v_page_stride_bytes,  // bytes per V page in pool
+    int   k_head_stride_bytes,  // bytes per kv-head in K pool
+    int   v_head_stride_bytes,  // bytes per kv-head in V pool
+    int   o_head_stride_bytes,  // bytes per q-head in output
+    int   sched_groups,         // G = clamp(num_cu / nhead_q, 1, num_tiles)
+    void* stream);
+}
+
+void {{func_name}}(
+    void* ptr_o,
+    void* ptr_q,
+    void* ptr_k,
+    void* ptr_v,
+    void* ptr_lse,
+    float softmax_scale,
+    int   max_seqlen_q,
+    int   batch,
+    int   max_seqlen_k,
+    int   nhead_q,
+    int   nhead_k,
+    int   num_pages,
+    int   page_size,
+    void* kv_page_indices,
+    void* kv_indptr,
+    void* q_descale_per_token,
+    void* k_descale_per_token,
+    void* v_descale_per_head,
+    void* p_scale,
+    int   k_page_stride_bytes,
+    int   v_page_stride_bytes,
+    int   k_head_stride_bytes,
+    int   v_head_stride_bytes,
+    int   o_head_stride_bytes,
+    int   sched_groups,
+    void* stream)
+{
+    static AiterAsmKernelFast impl("{{kernel_name}}", hsaco);
+
+    KernelArgs args;
+    memset(&args, 0, sizeof(args));
+
+    // softmax_scale passed as raw IEEE-754 bits (kernel reads with s_load_dword)
+    int32_t scale_bits;
+    memcpy(&scale_bits, &softmax_scale, sizeof(scale_bits));
+
+    args.ptr_o          = ptr_o;
+    args.ptr_q          = ptr_q;
+    args.ptr_k          = ptr_k;
+    args.ptr_v          = ptr_v;
+    args.ptr_lse        = ptr_lse;
+    args.scalar         = scale_bits;
+    args.s_seq_len      = max_seqlen_q;
+    args.s_Seqs         = batch;
+    args.s_Ts           = max_seqlen_k;
+    args.s_Hs           = nhead_q;
+    args.s_Bs           = nhead_k;
+    args.s_gqa          = nhead_q / nhead_k;
+    args.s_k_Seqs       = 0;
+    args.s_k_Hs         = k_head_stride_bytes;
+    args.s_k_Bs         = 0;
+    args.s_opt          = 0;
+    args.s_lse          = 0;
+    args.s_kv_seq_len   = max_seqlen_k;
+    args.s_qk_head_dim  = 128;
+    args.s_v_head_dim   = 128;
+    args.s_q_head_num   = nhead_q;
+    args.s_v_Seqs       = num_pages;
+    args.s_v_Hs         = v_head_stride_bytes;
+    args.s_v_Bs         = page_size;
+    args.s_o_Seqs       = batch;
+    args.s_o_Hs         = o_head_stride_bytes;
+    args.s_o_Bs         = 128;
+    // Reused slots — see kernel.py Phase 1 comments
+    args.ptr_LTD        = kv_page_indices;
+    args.ptr_LTP        = kv_indptr;
+    args.s_log2_plen    = (int32_t)log2f((float)page_size);
+    args.s_K_page_stride = k_page_stride_bytes;
+    args.s_V_page_stride = v_page_stride_bytes;
+    // Descale pointers
+    args.ptr_q_descale  = q_descale_per_token;
+    args.ptr_k_descale  = k_descale_per_token;
+    args.ptr_v_descale  = v_descale_per_head;
+    // Q descale strides: [total_q, nhead_q] fp32, varlen (no per-batch stride)
+    args.s_descale_q_Bs = 0;
+    args.s_descale_q_Hs = 4;   // bytes per head
+    // K descale strides: [pages, page_size, nhead_k] fp32 — passed as elements, kernel <<2
+    args.s_kscale_page_stride  = page_size * nhead_k;
+    args.s_kscale_token_stride = nhead_k;
+    args.s_kscale_head_stride  = 1;
+    // V descale strides: [nhead_k] fp32 — no batch dim
+    args.s_vscale_Bs    = 0;
+    args.s_vscale_Hs    = 4;   // bytes per kv-head
+    // P scale (optional)
+    args.ptr_p_scale    = p_scale;
+    args.s_p_scale_Bs   = nhead_q * 4;
+    args.s_p_scale_Hs   = 4;
+    // Persistent snake scheduler
+    args.s_sched_groups = sched_groups;
+
+    size_t arg_size = sizeof(args);
+    impl.launch_kernel({
+        &args,
+        &arg_size,
+        (uint32_t)sched_groups,  // gdx: bin index [0, G)
+        (uint32_t)nhead_q,       // gdy: Q-head index
+        (uint32_t)batch,         // gdz: batch index
+        512,                     // bdx: 8 waves × 64 threads
+        1,                       // bdy
+        1,                       // bdz
+        reinterpret_cast<hipStream_t>(stream)
+    });
+}

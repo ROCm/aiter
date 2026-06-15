@@ -8,6 +8,7 @@ from torch import Generator, Tensor
 
 from ..jit.core import CK_DIR, AITER_META_DIR, ENABLE_CK, compile_ops
 from ..jit.utils.chip_info import get_gfx
+from csrc.cpp_itfs.utils import GPU_ARCH
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
@@ -2929,6 +2930,24 @@ def _mha_batch_prefill(
     p_scale: Optional[torch.Tensor] = None,
     p_scale_inv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    if (
+        GPU_ARCH == "gfx942"
+        and q.dtype == torch.float8_e4m3fnuz
+        and q_descale_per_token is not None
+        and v_descale_per_head is not None
+        and kv_page_indices is not None
+        and causal
+    ):
+        from aiter.ops.fmha_prefill_paged_asm import fmha_prefill_paged_asm_launch
+        return fmha_prefill_paged_asm_launch(
+            q, k, v,
+            cu_seqlens_q, kv_indptr, kv_page_indices, kv_last_page_lens,
+            max_seqlen_q, max_seqlen_k, softmax_scale, causal,
+            q_descale_per_token, k_descale_per_token, v_descale_per_head,
+            p_scale, p_scale_inv,
+            out,
+        )
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_batch_prefill(
