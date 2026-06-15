@@ -70,7 +70,8 @@ std::string get_heuristic_kernel_mla(std::string q_type,
                                      int qseqlen,
                                      std::string arch_id,
                                      CFG* cfgs,
-                                     int lse = 0)
+                                     int lse = 0,
+                                     int cprr = 0)
 {
     for(const auto& el : *cfgs)
     {
@@ -86,6 +87,10 @@ std::string get_heuristic_kernel_mla(std::string q_type,
             continue;
         if (cfg.lse != lse)
             continue;
+        // round-robin context-parallel: select the dedicated `cprr` kernel when
+        // g_kv_indptr is provided (cprr==1), and the plain kernel otherwise.
+        if (cfg.cprr != cprr)
+            continue;
         return el.first;
     }
     
@@ -99,7 +104,8 @@ std::string get_heuristic_kernel_mla(std::string q_type,
                 " prefill:", prefill,
                 " causal:", causal,
                 " qseqlen:", qseqlen,
-                " lse:", lse);
+                " lse:", lse,
+                " cprr:", cprr);
     return "";
 }
 
@@ -402,7 +408,10 @@ void mla_decode_stage1_asm_fwd(
         args.s_MQA = gqa_ratio;
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;
-    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag);
+    // round-robin context-parallel: route to the dedicated `cprr` kernel only when
+    // a valid g_kv_indptr is supplied; otherwise use the plain (non-CP) kernel.
+    int cprr_flag = (g_kv_indptr != nullptr && g_kv_indptr->data_ptr() != nullptr) ? 1 : 0;
+    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag, cprr_flag);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
     AiterAsmKernel* impl_ptr = nullptr;
