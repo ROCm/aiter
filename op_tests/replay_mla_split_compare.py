@@ -332,22 +332,31 @@ def replay_one(path, dev="cuda"):
             lse_fin_per_split = torch.isfinite(lse2).all(dim=3).all(dim=2).all(dim=0).cpu()
             bad_logit_splits = (~lg_fin_per_split).nonzero().reshape(-1).tolist()
             bad_lse_splits = (~lse_fin_per_split).nonzero().reshape(-1).tolist()
-            # classify: +inf in logits => exp(big +score) overflow (running-max
-            # m is stale/wrong); pure NaN w/o inf => 0/0 (all-masked / zero-sum).
+            # classify the partials. The LSE distinguishes the two mechanisms:
+            #   lse all -inf  => L (softmax denom) underflowed to EXACTLY 0
+            #                    => R*(1/0)=0*inf=NaN  (a ==0 guard fixes it)
+            #   lse has NaN   => L became NaN (e.g. a garbage lane = +inf gives
+            #                    exp(inf-inf)=NaN in the sum AND R)  => a ==0
+            #                    guard MISSES it; need a non-finite guard + R reset
             n_posinf = int((lg2 == float("inf")).sum().item())
             n_neginf = int((lg2 == float("-inf")).sum().item())
             n_nan = int(torch.isnan(lg2).sum().item())
             lse_posinf = int((lse2 == float("inf")).sum().item())
-            kind = (
-                "OVERFLOW(+inf -> bad running-max)"
-                if (n_posinf or lse_posinf)
-                else "0/0 NaN (zero-sum / all-masked)"
-            )
+            lse_neginf = int((lse2 == float("-inf")).sum().item())
+            lse_nan = int(torch.isnan(lse2).sum().item())
+            if lse_nan > 0:
+                kind = "L==NaN (lse has NaN -> +inf lane: exp(inf-inf); R also NaN)"
+            elif lse_neginf > 0 and n_posinf == 0:
+                kind = "L==0 exactly (lse=-inf -> 0/0; ==0 guard applies)"
+            elif n_posinf or lse_posinf:
+                kind = "OVERFLOW(+inf -> bad running-max)"
+            else:
+                kind = "other"
             s1_split_diag = (
                 f"stage1 NaN: logits_bad_splits={bad_logit_splits} "
                 f"lse_bad_splits={bad_lse_splits} "
                 f"logits[+inf={n_posinf} -inf={n_neginf} nan={n_nan}] "
-                f"lse[+inf={lse_posinf}] kind={kind} "
+                f"lse[+inf={lse_posinf} -inf={lse_neginf} nan={lse_nan}] kind={kind} "
                 f"(=> asm stage1 wrote NaN; stage2 exonerated)"
             )
             # correlate NaN batches with kernel page geometry
