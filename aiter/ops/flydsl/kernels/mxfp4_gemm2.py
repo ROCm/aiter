@@ -920,7 +920,9 @@ def _flat_bf16_epilog(accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, kMC
     """Nonatomic flat epilog (BM128): write each computed sorted-row element
     directly to flat_out[(m_row+row)*N_OUT + gn] as bf16 -- no LDS cshuffle, no
     atomic, no sorted_weights (a later scatter_reduce sums the TOPK rows per
-    token). i64 element index (rows can exceed the i32 byte range)."""
+    token). i64 element index (rows can exceed the i32 byte range). Writes all BM
+    rows unconditionally: a per-row padding skip was tried and lost (the scf.if
+    breaks store coalescing, costing more than the ~37% saved padding writes)."""
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
     for i in range_constexpr(kMChunks):
