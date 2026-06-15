@@ -830,6 +830,11 @@ def build_module(
                 f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
             )
 
+        if int(os.environ.get("AITER_DEBUG_LINEINFO", "0")):
+            # line-table-only DWARF: source:line mapping in the HSACO for ATT
+            # traces, without -g's full debug bloat / codegen regressions.
+            flags_hip += ["-gline-tables-only"]
+            flags_cc += ["-gline-tables-only"]
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
