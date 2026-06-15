@@ -113,10 +113,8 @@ void pa_fp8_main_kernel_v3(
     __shared__ _T8x8 shared_logits[kNWarps * kTLoop * kSlotsPerWarpT];
     __shared__ float shared_qk[kNWarps * 16 * 2];
 
-    const __amdgpu_buffer_rsrc_t k_rsrc =
-        pa_make_buffer_rsrc(k_cache + wg_start_kv_head_idx * kv_head_stride);
-    const __amdgpu_buffer_rsrc_t v_rsrc =
-        pa_make_buffer_rsrc(v_cache + wg_start_kv_head_idx * kv_head_stride);
+    const int64_t kv_head_base_offset =
+        static_cast<int64_t>(wg_start_kv_head_idx) * kv_head_stride;
 
     const int q_token_for_lane = (kMtp == 1) ? 0 : (lane16id >> 3);
     const int head_for_lane    = lane16id & (kGqaRatio - 1);
@@ -212,10 +210,13 @@ void pa_fp8_main_kernel_v3(
         #pragma unroll
         for (int t = 0; t < kTLoop; t++)
         {
-            const unsigned int kblock_number = (unsigned int)kphys_num[t];
+            const int64_t kblock_number = static_cast<int64_t>(kphys_num[t]);
+            const __amdgpu_buffer_rsrc_t k_block_rsrc =
+                pa_make_buffer_rsrc(
+                    k_cache + kv_head_base_offset
+                    + kblock_number * static_cast<int64_t>(kv_block_stride));
             const unsigned int k_base_voffset =
-                  kblock_number * (unsigned int)kv_block_stride
-                + (unsigned int)kphys_off[t] * kElems16B_fp8
+                  (unsigned int)kphys_off[t] * kElems16B_fp8
                 + k_chunk_row_off;
             #pragma unroll
             for (int qkhe = 0; qkhe < v2::kWideQkheLoop; qkhe++)
@@ -223,7 +224,7 @@ void pa_fp8_main_kernel_v3(
                 const unsigned int voff =
                       k_base_voffset
                     + (unsigned int)qkhe * (unsigned int)v2::kBytesPerWideQkhe;
-                const pa_u32x4 v = pa_buffer_load_b128(k_rsrc, voff);
+                const pa_u32x4 v = pa_buffer_load_b128(k_block_rsrc, voff);
                 Klocal[t][qkhe].lo = pa_u32x4_low_long(v);
                 Klocal[t][qkhe].hi = pa_u32x4_high_long(v);
             }
@@ -247,12 +248,17 @@ void pa_fp8_main_kernel_v3(
             auto load_v_slice_wide = [&](int v_group) __attribute__((always_inline))
             {
                 const unsigned int v_phys_g = v_phys[v_group];
+                const __amdgpu_buffer_rsrc_t v_block_rsrc =
+                    pa_make_buffer_rsrc(
+                        v_cache + kv_head_base_offset
+                        + static_cast<int64_t>(v_phys_g)
+                              * static_cast<int64_t>(kv_block_stride));
                 const unsigned int v_base_voffset =
-                      v_phys_g * (unsigned int)kv_block_stride
-                    + (unsigned int)(warpid * 16 + lane16id) * kBlockSize;
-                V_wide[v_group][0] = pa_buffer_load_b128_nt(v_rsrc, v_base_voffset);
+                    (unsigned int)(warpid * 16 + lane16id) * kBlockSize;
+                V_wide[v_group][0] = pa_buffer_load_b128_nt(
+                    v_block_rsrc, v_base_voffset);
                 V_wide[v_group][1] = pa_buffer_load_b128_nt(
-                    v_rsrc, v_base_voffset + kVBytesPerVhe);
+                    v_block_rsrc, v_base_voffset + kVBytesPerVhe);
             };
 
             // V loads interleaved with QK MFMA on the prefetched Klocal.

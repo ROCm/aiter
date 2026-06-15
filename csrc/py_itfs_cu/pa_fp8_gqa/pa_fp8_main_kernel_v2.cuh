@@ -243,10 +243,8 @@ void pa_fp8_main_kernel_v2(
     constexpr int kBlocksPerKbi = kTParSize / kBlockSize;
     __shared__ int bt_lds[2][kBlocksPerKbi];
 
-    const __amdgpu_buffer_rsrc_t k_rsrc =
-        pa_make_buffer_rsrc(k_cache + wg_start_kv_head_idx * kv_head_stride);
-    const __amdgpu_buffer_rsrc_t v_rsrc =
-        pa_make_buffer_rsrc(v_cache + wg_start_kv_head_idx * kv_head_stride);
+    const int64_t kv_head_base_offset =
+        static_cast<int64_t>(wg_start_kv_head_idx) * kv_head_stride;
 
     const int q_token_for_lane = (kMtp == 1) ? 0 : (lane16id >> 3);
     const int head_for_lane    = lane16id & (kGqaRatio - 1);
@@ -384,10 +382,13 @@ void pa_fp8_main_kernel_v2(
         #pragma unroll
         for (int t = 0; t < kTLoop; t++)
         {
-            const unsigned int kblock_number = (unsigned int)kphys_local[t];
+            const int64_t kblock_number = static_cast<int64_t>(kphys_local[t]);
+            const __amdgpu_buffer_rsrc_t k_block_rsrc =
+                pa_make_buffer_rsrc(
+                    k_cache + kv_head_base_offset
+                    + kblock_number * static_cast<int64_t>(kv_block_stride));
             const unsigned int k_base_voffset =
-                kblock_number * (unsigned int)kv_block_stride
-                + (unsigned int)kphys_off_local[t] * kElems16B_fp8
+                (unsigned int)kphys_off_local[t] * kElems16B_fp8
                 + k_chunk_row_off;
             #pragma unroll
             for (int qkhe = 0; qkhe < v2::kWideQkheLoop; qkhe++)
@@ -395,7 +396,7 @@ void pa_fp8_main_kernel_v2(
                 const unsigned int voff =
                     k_base_voffset
                     + (unsigned int)qkhe * (unsigned int)v2::kBytesPerWideQkhe;
-                const pa_u32x4 v = pa_buffer_load_b128(k_rsrc, voff);
+                const pa_u32x4 v = pa_buffer_load_b128(k_block_rsrc, voff);
                 Klocal_carried[t][qkhe].lo = pa_u32x4_low_long(v);
                 Klocal_carried[t][qkhe].hi = pa_u32x4_high_long(v);
             }
@@ -579,16 +580,21 @@ void pa_fp8_main_kernel_v2(
             auto load_v_slice_wide = [&](int v_group) __attribute__((always_inline))
             {
                 const unsigned int v_phys = v_phys_block_wide[v_group];
+                const __amdgpu_buffer_rsrc_t v_block_rsrc =
+                    pa_make_buffer_rsrc(
+                        v_cache + kv_head_base_offset
+                        + static_cast<int64_t>(v_phys)
+                              * static_cast<int64_t>(kv_block_stride));
                 const unsigned int v_base_voffset =
-                    v_phys * (unsigned int)kv_block_stride
-                    + (unsigned int)(warpid * 16 + lane16id) * kBlockSize;
+                    (unsigned int)(warpid * 16 + lane16id) * kBlockSize;
                 // Non-temporal (L2-bypass) V loads.  Each V byte is read
                 // exactly once per workgroup (paged-attention has no
                 // intra-WG V reuse), so caching V in L2 would only thrash
                 // K cache lines.  Matches gluon's `global_load nt` policy.
-                V_wide[v_group][0] = pa_buffer_load_b128_nt(v_rsrc, v_base_voffset);
+                V_wide[v_group][0] = pa_buffer_load_b128_nt(
+                    v_block_rsrc, v_base_voffset);
                 V_wide[v_group][1] = pa_buffer_load_b128_nt(
-                    v_rsrc, v_base_voffset + kVBytesPerVhe);
+                    v_block_rsrc, v_base_voffset + kVBytesPerVhe);
             };
 
             #pragma unroll
