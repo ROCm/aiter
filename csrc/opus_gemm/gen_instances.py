@@ -347,18 +347,32 @@ class opus_gemm_codegen:
                 is_splitk = k.kernel_tag in SPLITK_TAGS
                 if not is_splitk and ctype not in k.output_dtypes:
                     continue
-                rows.append({"id": (int(mnk[0]), int(mnk[1]), int(mnk[2])), "kernel_name": k.name, "ctype": "fp32_t" if is_splitk else "CTYPE"})
+                rows.append(
+                    {
+                        "id": (int(mnk[0]), int(mnk[1]), int(mnk[2])),
+                        "kernel_name": k.name,
+                        "ctype": "fp32_t" if is_splitk else "CTYPE",
+                    }
+                )
 
             rows.sort(key=lambda r: r["id"])
             return rows
 
         with open(os.path.join(self.working_path, "opus_gemm_lookup.h"), "w") as f:
             # Sorted flat-array layout (was: {(M,N,K), kernel<CTYPE>} initializer list for std::unordered_map).
-            contents = _render("opus_gemm_lookup.h.j2", macros=[
-                {"name": "GENERATE_OPUS_LOOKUP_TABLE_BF16",
-                 "rows": _emit_map("bf16_t")},
-                {"name": "GENERATE_OPUS_LOOKUP_TABLE_FP32",
-                 "rows": _emit_map("fp32_t")}])
+            contents = _render(
+                "opus_gemm_lookup.h.j2",
+                macros=[
+                    {
+                        "name": "GENERATE_OPUS_LOOKUP_TABLE_BF16",
+                        "rows": _emit_map("bf16_t"),
+                    },
+                    {
+                        "name": "GENERATE_OPUS_LOOKUP_TABLE_FP32",
+                        "rows": _emit_map("fp32_t"),
+                    },
+                ],
+            )
             f.write(contents)
 
     def gen_a16w16_tune_lookup(self, kernels_dict):
@@ -398,11 +412,19 @@ class opus_gemm_codegen:
         ) as f:
             # Use explicit per-CTYPE macro names; the dispatcher in opus_gemm.cu calls the right one from
             # each opus_a16w16_tune_dispatch<CDat...
-            contents = _render("opus_gemm_lookup.h.j2", macros=[
-                {"name": "GENERATE_A16W16_TUNE_LOOKUP_BF16",
-                 "rows": _emit_map("bf16_t")},
-                {"name": "GENERATE_A16W16_TUNE_LOOKUP_FP32",
-                 "rows": _emit_map("fp32_t")}])
+            contents = _render(
+                "opus_gemm_lookup.h.j2",
+                macros=[
+                    {
+                        "name": "GENERATE_A16W16_TUNE_LOOKUP_BF16",
+                        "rows": _emit_map("bf16_t"),
+                    },
+                    {
+                        "name": "GENERATE_A16W16_TUNE_LOOKUP_FP32",
+                        "rows": _emit_map("fp32_t"),
+                    },
+                ],
+            )
             f.write(contents)
 
     def gen_manifest_head(self, kernels_dict):
@@ -410,9 +432,13 @@ class opus_gemm_codegen:
         decls = []
         for mnk, k in kernels_dict.items():
             if k.kernel_tag in A16W16_TUNE_TAGS:
-                decls.append(_render("_manifest_noscale_4arg.cuh.j2", kernel_name=k.name))
+                decls.append(
+                    _render("_manifest_noscale_4arg.cuh.j2", kernel_name=k.name)
+                )
             elif k.kernel_tag in NOSCALE_TAGS:
-                decls.append(_render("_manifest_noscale_3arg.cuh.j2", kernel_name=k.name))
+                decls.append(
+                    _render("_manifest_noscale_3arg.cuh.j2", kernel_name=k.name)
+                )
             else:
                 decls.append(_render("_manifest_scale.cuh.j2", kernel_name=k.name))
         with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
@@ -566,8 +592,16 @@ class opus_gemm_codegen:
                 arch=reduce_arch,
                 reduce_header=reduce_header,
                 ws_ptr_type=ws_ptr_type,
-                v2_splitks=list(V2_SUPPORTED_SPLITKS) if reduce_arch in SPLITK_REDUCE_FAST_ARCHES else [],
-                v3_nvec_rows=list(V3_NVEC_ROWS) if reduce_arch in SPLITK_REDUCE_FAST_ARCHES else [],
+                v2_splitks=(
+                    list(V2_SUPPORTED_SPLITKS)
+                    if reduce_arch in SPLITK_REDUCE_FAST_ARCHES
+                    else []
+                ),
+                v3_nvec_rows=(
+                    list(V3_NVEC_ROWS)
+                    if reduce_arch in SPLITK_REDUCE_FAST_ARCHES
+                    else []
+                ),
             )
             Path(
                 os.path.join(
