@@ -39,6 +39,7 @@ try:
         from aiter.ops.flydsl.gemm_kernels import (
             flydsl_hgemm,
             get_flydsl_splitk_hgemm_kernels,
+            SPLIT_K_SEMAPHORE_MAX_LEN,
         )
     else:
         raise ImportError("flydsl package is not installed")
@@ -736,7 +737,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 counters = ((M + config["tile_m"] - 1) // config["tile_m"]) * (
                     N // config["tile_n"]
                 )
-                if counters > 256:
+                if counters > SPLIT_K_SEMAPHORE_MAX_LEN:
                     continue
             info = (
                 info_keys,
