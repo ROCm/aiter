@@ -6,6 +6,7 @@
 # ------------------------------------------------------------------------------
 
 # Python standard library
+from typing import Literal
 import warnings
 
 # PyTorch
@@ -13,7 +14,7 @@ import torch
 from torch import Tensor
 
 # Triton
-import triton
+from triton import cdiv
 
 # AITER: GMM utility functions
 from aiter.ops.triton.utils.gmm_common import (
@@ -41,21 +42,83 @@ from aiter.ops.triton._triton_kernels.gmm import (
 # GMM PyTorch wrapper.
 # ------------------------------------------------------------------------------
 
+_NUM_XCDS: int = 8
+_TILE_COUNTER_STRIDE: int = 64
 
-# Per-(device, stream) cache for the work stealing tile counter. A single `int32`
-# scratch buffer is reused across launches to avoid an allocator round-trip plus
-# 4-byte host to device copy on every call.
+# Per-(device, stream) cache for the work stealing tile counter.
+# Layout: [xcd_{0}_slot, ..., xcd{_NUM_XCDS-1}_slot, global_slot]
+# It's one slot per XCD plus a global slot at the last position.
+# Each slot _TILE_COUNTER_STRIDE int32 elements wide (256 B = 1 MI355X L2 line)
+# to avoid false-sharing across XCDs.
+# A single scratch buffer is reused across launches to avoid an allocator
+# round-trip on every call.
 _GMM_TILE_COUNTER_CACHE: dict[tuple[torch.device, int], Tensor] = {}
 
 
-def _get_gmm_tile_counter(device: torch.device, grid_dim: int) -> Tensor:
+# Get work stealing tile counter.
+def _get_gmm_tile_counter(device: torch.device) -> Tensor:
     stream = torch.cuda.current_stream(device=device).cuda_stream
     tile_counter = _GMM_TILE_COUNTER_CACHE.get((device, stream))
     if tile_counter is None:
-        tile_counter = torch.empty(1, dtype=torch.int32, device=device)
+        tile_counter = torch.zeros(
+            (_NUM_XCDS + 1) * _TILE_COUNTER_STRIDE, dtype=torch.int32, device=device
+        )
         _GMM_TILE_COUNTER_CACHE[(device, stream)] = tile_counter
-    tile_counter.fill_(grid_dim)
+    else:
+        tile_counter.zero_()
     return tile_counter
+
+
+# Compute total number of GMM tiles. Transfer `group_sizes` tensor to host.
+def _gmm_total_tiles(
+    group_sizes: torch.Tensor | list[int],
+    N: int,
+    block_size_m: int,
+    block_size_n: int,
+) -> int:
+    group_sizes_list: list[int] = (
+        group_sizes.cpu().tolist()
+        if isinstance(group_sizes, torch.Tensor)
+        else group_sizes
+    )
+    all_m_tiles = (cdiv(group_size, block_size_m) for group_size in group_sizes_list)
+    n_tiles = cdiv(N, block_size_n)
+    num_tiles = sum(m_tiles * n_tiles for m_tiles in all_m_tiles)
+    return num_tiles
+
+
+# Compute number of GMM tiles per XCD. It's used with work stealing kernel.
+def _gmm_tiles_per_xcd(
+    group_sizes: torch.Tensor,
+    M: int,
+    N: int,
+    block_size_m: int,
+    block_size_n: int,
+    mode: Literal["global", "per_xcd"] = "global",
+    num_tiles: int | None = None,
+) -> int:
+    assert mode in (
+        "global",
+        "per_xcd",
+    ), f"GMM tiles per XCD work stealing mode must be in {{'global', 'per_xcd'}} (got '{mode}')."
+    assert (num_tiles is None) or (num_tiles > 0), "GMM must contain at least one tile."
+
+    if mode == "global":
+        return 0
+
+    assert mode == "per_xcd"
+    if num_tiles is None:
+        G = group_sizes.shape[0]
+        num_tiles_estimate = G * cdiv(M // G, block_size_m) * cdiv(N, block_size_n)
+        # If we have too few tiles then moving `group_sizes` to host and calculating the exact
+        # number isn't worthwhile.
+        num_tiles = (
+            num_tiles_estimate
+            if num_tiles_estimate < 1.5e5
+            else _gmm_total_tiles(group_sizes, N, block_size_m, block_size_n)
+        )
+    tiles_per_xcd = cdiv(num_tiles, _NUM_XCDS)
+    return tiles_per_xcd
 
 
 def _gmm_grid(
@@ -64,40 +127,46 @@ def _gmm_grid(
     block_size_n: int,
     group_sizes: Tensor,
     grid_dim: int,
+    # Minimum number of programs to launch. Per-XCD work stealing requires at
+    # least one program per XCD (i.e. `min_programs == _NUM_XCDS`). Otherwise,
+    # the per-XCD regions of the absent XCDs are never claimed and their output
+    # tiles are left untouched.
+    min_programs: int = 0,
     # Expensive assertions launch GPU kernels on `group_sizes` and dominate the
     # host-side launch cost. Only enable them in development.
     enable_expensive_assertions: bool = False,
-) -> tuple[int]:
-    assert N > 0, f"Number of output columns N must be positive (got N = {N})."
-    assert is_power_of_2(
-        block_size_m
-    ), f"M-dimension tile size BLOCK_SIZE_M must be a power of 2 (got {block_size_m})."
-    assert is_power_of_2(
-        block_size_n
-    ), f"N-dimension tile size BLOCK_SIZE_N must be a power of 2 (got {block_size_n})."
+) -> tuple[int, int | None]:
     assert (
-        grid_dim > 0
-    ), f"Grid dimension (number of programs) must be positive (got {grid_dim})."
-    num_n_tiles = triton.cdiv(N, block_size_n)
+        min_programs >= 0
+    ), f"Minimum number of programs must be non-negative (got {min_programs})."
 
-    # Cheap-path default. The kernel handle the case where grid_dim exceeds the
-    # total tile count: extra programs just exit without doing any work.
-    num_programs = grid_dim
+    num_tiles: int | None
+    num_programs: int
 
     if enable_expensive_assertions:
-        assert torch.all(group_sizes >= 0).item(), (
+        group_sizes_list: list[int] = group_sizes.cpu().tolist()
+        assert all(group_size >= 0 for group_size in group_sizes_list), (
             "All GMM group sizes must be non-negative, but at least one element "
             "of group_sizes is negative."
         )
-        num_m_tiles = (group_sizes + block_size_m - 1) // block_size_m
-        num_tiles = torch.sum(num_m_tiles * num_n_tiles).item()
+        num_tiles = _gmm_total_tiles(group_sizes_list, N, block_size_m, block_size_n)
         assert num_tiles > 0, (
             "GMM has no tiles to launch: group_sizes must contain at least one "
             f"non-empty group (computed {num_tiles} total tiles)."
         )
-        num_programs = int(min(grid_dim, num_tiles))
+        num_programs = min(grid_dim, num_tiles)
+    else:
+        # Cheap-path default. The kernel handle the case where grid_dim exceeds the
+        # total tile count: extra programs just exit without doing any work.
+        num_tiles = None
+        num_programs = grid_dim
 
-    return (num_programs,)
+    # Floor must be applied after the `min(grid_dim, num_tiles)` clamp above, so
+    # the clamp can't drop the program count below the per-XCD minimum. Extra
+    # programs (when this exceeds the tile count) just exit without doing work.
+    num_programs = max(num_programs, min_programs)
+
+    return num_programs, num_tiles
 
 
 def gmm(
@@ -108,6 +177,7 @@ def gmm(
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
     work_stealing: bool = False,
+    work_stealing_mode: Literal["global", "per_xcd"] | None = None,
     config: dict[str, int] | None = None,
     grid_dim: int | None = None,
 ) -> Tensor:
@@ -159,6 +229,13 @@ def gmm(
     work_stealing : bool, defaults to False
         Enable work stealing, i.e. dynamic load-balancing where CUs with no assigned tiles "steal"
         the next available tile to be computed.
+    work_stealing_mode : Literal["global", "per_xcd"] or None, optional
+        Work stealing behavior with respect to atomic synchronization. In "global" mode, all work
+        groups fetch the next tile from a shared atomic counter. In "per_xcd" mode, we have XCDs + 1
+        atomic counters: the work groups start fetching from a per-XCD shared counter and then
+        proceed to the global counter to drain the remaining tiles.
+        This argument only makes sense when `work_stealing` is True. If `work_stealing` is True and
+        `work_stealing_mode` is None, fall-back to "global" behavior.
     config : dict[str, int] or None, optional
         Optional dictionary with kernel metaparameters. If absent, config will be queried from
         internal tuning database.
@@ -251,28 +328,54 @@ def gmm(
         config = dict(config)
         config["GRID_DIM"] = grid_dim
 
-    grid = _gmm_grid(
+    resolved_ws_mode: str = (
+        "global" if work_stealing_mode is None else work_stealing_mode
+    )
+
+    num_programs, num_tiles = _gmm_grid(
         N,
         config["BLOCK_SIZE_M"],
         config["BLOCK_SIZE_N"],
         group_sizes,
         config["GRID_DIM"],
+        # per_xcd partitions tiles by XCD residue class, so every XCD needs at
+        # least one claiming program; global drains a single counter and needs no floor.
+        min_programs=(
+            _NUM_XCDS if work_stealing and resolved_ws_mode == "per_xcd" else 0
+        ),
     )
 
-    tile_counter: Tensor | None = (
-        _get_gmm_tile_counter(lhs.device, config["GRID_DIM"]) if work_stealing else None
-    )
+    tile_counter: Tensor | None
+    tiles_per_xcd: int | None
+    if work_stealing:
+        tile_counter = _get_gmm_tile_counter(lhs.device)
+        tiles_per_xcd = _gmm_tiles_per_xcd(
+            group_sizes,
+            M,
+            N,
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            mode=resolved_ws_mode,
+            num_tiles=num_tiles,
+        )
+    else:
+        tile_counter, tiles_per_xcd = None, None
 
     # fmt: off
-    gmm_kernel[grid](
+    gmm_kernel[(num_programs,)](
         # Tensor pointers:
-        lhs, rhs, group_sizes, out, bias, tile_counter,
+        lhs, rhs, group_sizes, out, bias,
+        # Work stealing parameters:
+        tile_counter, tiles_per_xcd,
         # Tensor shapes:
         M, K, N, G,
         # Meta-parameters:
         TRANS_RHS=trans_rhs,
         USE_BIAS=use_bias,
+        # Work stealing meta-parameters:
         WORK_STEALING=work_stealing,
+        NUM_XCDS=_NUM_XCDS,
+        TILE_COUNTER_STRIDE=_TILE_COUNTER_STRIDE,
         **config,
     )
     # fmt: on
@@ -304,8 +407,8 @@ def _ptgmm_grid(
     assert (
         grid_dim > 0
     ), f"Grid dimension (number of programs) must be positive (got {grid_dim})."
-    num_k_tiles = triton.cdiv(K, block_size_k)
-    num_n_tiles = triton.cdiv(N, block_size_n)
+    num_k_tiles = cdiv(K, block_size_k)
+    num_n_tiles = cdiv(N, block_size_n)
     num_tiles = G * num_k_tiles * num_n_tiles
     num_programs = min(grid_dim, num_tiles)
     return (num_programs,)
@@ -520,8 +623,8 @@ def _nptgmm_grid(
     assert is_power_of_2(
         block_size_n
     ), f"N-dimension tile size BLOCK_SIZE_N must be a power of 2 (got {block_size_n})."
-    num_k_tiles = triton.cdiv(K, block_size_k)
-    num_n_tiles = triton.cdiv(N, block_size_n)
+    num_k_tiles = cdiv(K, block_size_k)
+    num_n_tiles = cdiv(N, block_size_n)
     num_tiles_per_mm = num_k_tiles * num_n_tiles
     return (G, num_tiles_per_mm)
 
