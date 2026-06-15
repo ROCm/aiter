@@ -34,5 +34,11 @@ __global__ void splitk_reduce_kernel_v3(
 {% for name in impl_includes -%}
 #include "impl/{{ name }}.cuh"
 {% endfor -%}
-{{ host_body -}}
+{% for inst in host_instantiations -%}
+template void
+{{inst.kid_name}}<{{inst.dtype}}>(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y{{inst.host_extra_params}});
+{% endfor -%}
 #endif // host pass only

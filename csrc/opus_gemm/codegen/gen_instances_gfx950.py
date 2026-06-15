@@ -823,38 +823,35 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     else:
         inst_extra_param = ""
 
-    if is_a16w16_split_barrier:
-
-        def _device_decl(dtype):
-            return (
-                f"template __global__ void {kernel_func}<\n"
-                f"    {k.name}_TraitsNoBias<{dtype}>>({kargs_name});\n"
-                f"template __global__ void {kernel_func}<\n"
-                f"    {k.name}_TraitsBias<{dtype}>>({kargs_name});\n"
-            )
-
-    else:
-
-        def _device_decl(dtype):
-            return (
-                f"template __global__ void {kernel_func}<\n"
-                f"    {k.name}_Traits<{dtype}>{kargs_explicit_param}>({kargs_name});\n"
-            )
-
     for CDtype in k.output_dtypes:
-        host_decl = (
-            f"template void\n"
-            f"{k.name}<{CDtype}>(\n"
-            f"    aiter_tensor_t &XQ,\n"
-            f"    aiter_tensor_t &WQ,\n"
-            f"    aiter_tensor_t &Y{inst_extra_param});\n"
-        )
         cg._host_instantiations.append(
-            {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
+            {"kid_name": k.name, "dtype": CDtype, "host_extra_params": inst_extra_param}
         )
-        cg._device_instantiations.append(
-            {"kid_name": k.name, "dtype": CDtype, "device_decl": _device_decl(CDtype)}
-        )
+        if is_a16w16_split_barrier:
+            # split-barrier: NoBias + Bias trait variants share the same kid/dtype TU.
+            cg._device_instantiations.append(
+                {
+                    "kid_name": k.name,
+                    "dtype": CDtype,
+                    "kernel_func": kernel_func,
+                    "kargs_name": kargs_name,
+                    "kargs_explicit_param": "",
+                    "traits_name_override": f"{k.name}_TraitsNoBias",
+                    "extra_device_decls": [
+                        {"traits_name_override": f"{k.name}_TraitsBias"},
+                    ],
+                }
+            )
+        else:
+            cg._device_instantiations.append(
+                {
+                    "kid_name": k.name,
+                    "dtype": CDtype,
+                    "kernel_func": kernel_func,
+                    "kargs_name": kargs_name,
+                    "kargs_explicit_param": kargs_explicit_param,
+                }
+            )
 
 
 def gen_mono_tile_instance(
@@ -908,24 +905,21 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
     for CDtype in k.output_dtypes:
-        host_decl = (
-            f"template void\n"
-            f"{k.name}<{CDtype}>(\n"
-            f"    aiter_tensor_t &XQ,\n"
-            f"    aiter_tensor_t &WQ,\n"
-            f"    aiter_tensor_t &Y,\n"
-            f"    std::optional<aiter_tensor_t>,\n"
-            f"    int);\n"
-        )
-        device_decl = (
-            f"template __global__ void {kernel_func}<\n"
-            f"    {k.name}_Traits<{CDtype}>>({kargs_name});\n"
-        )
         cg._host_instantiations.append(
-            {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
+            {
+                "kid_name": k.name,
+                "dtype": CDtype,
+                "host_extra_params": ",\n    std::optional<aiter_tensor_t>,\n    int",
+            }
         )
         cg._device_instantiations.append(
-            {"kid_name": k.name, "dtype": CDtype, "device_decl": device_decl}
+            {
+                "kid_name": k.name,
+                "dtype": CDtype,
+                "kernel_func": kernel_func,
+                "kargs_name": kargs_name,
+                "kargs_explicit_param": "",
+            }
         )
 
 

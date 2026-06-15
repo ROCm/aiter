@@ -141,44 +141,25 @@ A8W8_SCALE_HOST_EXTRA = (
 )
 
 
-def _make_host_decl(kid_name, dtype, host_extra_params):
-    return (
-        f"template void\n"
-        f"{kid_name}<{dtype}>(\n"
-        f"    aiter_tensor_t &XQ,\n"
-        f"    aiter_tensor_t &WQ,\n"
-        f"    aiter_tensor_t &Y{host_extra_params});\n"
-    )
-
-
-def _make_device_decl(
-    kid_name, dtype, kernel_func, kargs_name, kargs_explicit_param=""
-):
-    return (
-        f"template __global__ void {kernel_func}<\n"
-        f"    {kid_name}_Traits<{dtype}>{kargs_explicit_param}>({kargs_name});\n"
-    )
-
-
 def _record_one_instantiation(
     self_obj, k, kernel_func, kargs_name, host_extra, kargs_explicit_param=""
 ):
-    """Record (host_decl, device_decl) for every (kid, dtype) in k.output_dtypes."""
+    """Record host/device instantiation rows for every (kid, dtype) in k.output_dtypes."""
     for CDtype in k.output_dtypes:
         self_obj._host_instantiations.append(
             {
                 "kid_name": k.name,
                 "dtype": CDtype,
-                "host_decl": _make_host_decl(k.name, CDtype, host_extra),
+                "host_extra_params": host_extra,
             }
         )
         self_obj._device_instantiations.append(
             {
                 "kid_name": k.name,
                 "dtype": CDtype,
-                "device_decl": _make_device_decl(
-                    k.name, CDtype, kernel_func, kargs_name, kargs_explicit_param
-                ),
+                "kernel_func": kernel_func,
+                "kargs_name": kargs_name,
+                "kargs_explicit_param": kargs_explicit_param,
             }
         )
 
@@ -288,8 +269,6 @@ class opus_gemm_codegen:
             kargs_name=kargs_name,
             kargs_template_vars=_kargs_template_vars,
             record_one_instantiation=_record_one_instantiation,
-            make_host_decl=_make_host_decl,
-            make_device_decl=_make_device_decl,
             A16W16_TUNE_HOST_EXTRA=A16W16_TUNE_HOST_EXTRA,
             A8W8_SCALE_HOST_EXTRA=A8W8_SCALE_HOST_EXTRA,
             A16W16_TUNE_TAGS=A16W16_TUNE_TAGS,
@@ -473,7 +452,6 @@ class opus_gemm_codegen:
 
         for arch, rows in host_by_arch.items():
             impl_includes = sorted({row["kid_name"] for row in rows})
-            host_body = "".join(row["host_decl"] for row in rows)
             # gfx950 splitk launcher passes ws_handle*; gfx942 passes raw float*.
             if arch == "gfx950":
                 fwd_ws_decl = '#include "gfx950/opus_gemm_traits_a16w16_gfx950.cuh"\n'
@@ -490,7 +468,7 @@ class opus_gemm_codegen:
                 ws_ptr_type=ws_ptr_type,
                 ws_arg_name=ws_arg_name,
                 impl_includes=impl_includes,
-                host_body=host_body,
+                host_instantiations=rows,
             )
             Path(
                 os.path.join(self.instances_path, f"all_instances_host_{arch}.cu")
@@ -519,7 +497,12 @@ class opus_gemm_codegen:
             contents = _render(
                 "device_tu.cu.j2",
                 kid_name=name,
-                device_decl=row["device_decl"],
+                dtype=dtype,
+                kernel_func=row["kernel_func"],
+                kargs_name=row["kargs_name"],
+                kargs_explicit_param=row["kargs_explicit_param"],
+                traits_name_override=row.get("traits_name_override"),
+                extra_device_decls=row.get("extra_device_decls", []),
             )
             Path(
                 os.path.join(self.instances_path, f"{name}_C{dtype}.device.cu")
@@ -578,35 +561,13 @@ class opus_gemm_codegen:
                 if reduce_arch == "gfx950"
                 else "const float*"
             )
-            fast_parts = []
-            if reduce_arch in SPLITK_REDUCE_FAST_ARCHES:
-                fast_parts.append("// V2 (split_k static-unroll, no OOB) instantiations -- gfx942 only\n")
-                for sk in V2_SUPPORTED_SPLITKS:
-                    fast_parts.append(
-                        f"template __global__ void splitk_reduce_kernel_v2<{sk}, 8, 8, __bf16, true,  __bf16>(\n"
-                        "    const float*, __bf16*, int, int, int, int, int,\n"
-                        "    const __bf16*, int);\n"
-                        f"template __global__ void splitk_reduce_kernel_v2<{sk}, 8, 8, __bf16, false, __bf16>(\n"
-                        "    const float*, __bf16*, int, int, int, int, int,\n"
-                        "    const __bf16*, int);\n"
-                    )
-                fast_parts.append("// V3 (multi-row per wg, BLOCK=64=1 wave) instantiations\n")
-                for nvec, rows in V3_NVEC_ROWS:
-                    for sk in V2_SUPPORTED_SPLITKS:
-                        fast_parts.append(
-                            f"template __global__ void splitk_reduce_kernel_v3<{sk}, {nvec}, {rows}, 8, __bf16, true,  __bf16>(\n"
-                            "    const float*, __bf16*, int, int, int, int, int,\n"
-                            "    const __bf16*, int);\n"
-                            f"template __global__ void splitk_reduce_kernel_v3<{sk}, {nvec}, {rows}, 8, __bf16, false, __bf16>(\n"
-                            "    const float*, __bf16*, int, int, int, int, int,\n"
-                            "    const __bf16*, int);\n"
-                        )
             contents = _render(
                 "splitk_reduce.device.cu.j2",
                 arch=reduce_arch,
                 reduce_header=reduce_header,
                 ws_ptr_type=ws_ptr_type,
-                fast_reduce_instantiations="".join(fast_parts),
+                v2_splitks=list(V2_SUPPORTED_SPLITKS) if reduce_arch in SPLITK_REDUCE_FAST_ARCHES else [],
+                v3_nvec_rows=list(V3_NVEC_ROWS) if reduce_arch in SPLITK_REDUCE_FAST_ARCHES else [],
             )
             Path(
                 os.path.join(

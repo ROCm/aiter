@@ -85,8 +85,6 @@ def gen_splitk_gfx942_instance(
     V3_NVEC_ROWS,
     V2_SUPPORTED_SPLITKS,
     A16W16_TUNE_HOST_EXTRA,
-    make_host_decl,
-    make_device_decl,
     record_one_instantiation,
     **_unused,
 ):
@@ -311,21 +309,22 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
                 {
                     "kid_name": k.name,
                     "dtype": CDtype,
-                    "host_decl": make_host_decl(k.name, CDtype, A16W16_TUNE_HOST_EXTRA),
+                    "host_extra_params": A16W16_TUNE_HOST_EXTRA,
                 }
             )
+            # fused kernel has a second D_OUT template param for in-kernel Y-dtype dispatch.
             cg._device_instantiations.append(
                 {
                     "kid_name": k.name,
                     "dtype": CDtype,
-                    "device_decl": (
-                        make_device_decl(
-                            k.name, CDtype, kernel_func, kargs_name, ", __bf16"
-                        )
-                        + make_device_decl(
-                            k.name, CDtype, kernel_func, kargs_name, ", float"
-                        )
-                    ),
+                    "kernel_func": kernel_func,
+                    "kargs_name": kargs_name,
+                    "kargs_explicit_param": ", __bf16",
+                    "extra_device_decls": [
+                        {
+                            "kargs_explicit_param": ", float",
+                        }
+                    ],
                 }
             )
     else:
@@ -428,22 +427,17 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         else ""
     )
     for CDtype in k.output_dtypes:
-        host_decl = (
-            f"template void\n"
-            f"{k.name}<{CDtype}>(\n"
-            f"    aiter_tensor_t &XQ,\n"
-            f"    aiter_tensor_t &WQ,\n"
-            f"    aiter_tensor_t &Y{inst_extra_param});\n"
-        )
-        device_decl = (
-            f"template __global__ void {kernel_func}<\n"
-            f"    {k.name}_Traits<{CDtype}>{kargs_explicit_param}>({kargs_name});\n"
-        )
         cg._host_instantiations.append(
-            {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
+            {"kid_name": k.name, "dtype": CDtype, "host_extra_params": inst_extra_param}
         )
         cg._device_instantiations.append(
-            {"kid_name": k.name, "dtype": CDtype, "device_decl": device_decl}
+            {
+                "kid_name": k.name,
+                "dtype": CDtype,
+                "kernel_func": kernel_func,
+                "kargs_name": kargs_name,
+                "kargs_explicit_param": kargs_explicit_param,
+            }
         )
 
 

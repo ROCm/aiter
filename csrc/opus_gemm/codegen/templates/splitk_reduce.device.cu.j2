@@ -29,4 +29,25 @@ template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float,  fal
 template __global__ void splitk_reduce_kernel<16, 64, float,  false, float,  false>(
     {{ ws_ptr_type }}, float*,  int, int, int, int, int, int,
     const float*,  int);
-{{ fast_reduce_instantiations -}}
+{% if v2_splitks %}
+// V2 (split_k static-unroll, no OOB) instantiations -- gfx942 only
+{% for sk in v2_splitks -%}
+template __global__ void splitk_reduce_kernel_v2<{{sk}}, 8, 8, __bf16, true,  __bf16>(
+    const float*, __bf16*, int, int, int, int, int,
+    const __bf16*, int);
+template __global__ void splitk_reduce_kernel_v2<{{sk}}, 8, 8, __bf16, false, __bf16>(
+    const float*, __bf16*, int, int, int, int, int,
+    const __bf16*, int);
+{% endfor -%}
+// V3 (multi-row per wg, BLOCK=64=1 wave) instantiations
+{% for nvec, rows_per_block in v3_nvec_rows -%}
+{% for sk in v2_splitks -%}
+template __global__ void splitk_reduce_kernel_v3<{{sk}}, {{nvec}}, {{rows_per_block}}, 8, __bf16, true,  __bf16>(
+    const float*, __bf16*, int, int, int, int, int,
+    const __bf16*, int);
+template __global__ void splitk_reduce_kernel_v3<{{sk}}, {{nvec}}, {{rows_per_block}}, 8, __bf16, false, __bf16>(
+    const float*, __bf16*, int, int, int, int, int,
+    const __bf16*, int);
+{% endfor -%}
+{% endfor -%}
+{% endif -%}

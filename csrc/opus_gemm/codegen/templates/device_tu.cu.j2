@@ -7,5 +7,13 @@
 // Compiled with -D__HIPCC_RTC__ (per-source flag in
 // optCompilerConfig.json) so the host pass takes the
 // minimal branch -- no torch, no full HIP runtime.
+{% set primary_traits = traits_name_override if traits_name_override else (kid_name + '_Traits') -%}
 #include "impl/{{ kid_name }}.cuh"
-{{ device_decl -}}
+template __global__ void {{kernel_func}}<
+    {{primary_traits}}<{{dtype}}>{{kargs_explicit_param}}>({{kargs_name}});
+{% for extra in extra_device_decls -%}
+{% set extra_traits = extra.traits_name_override if extra.traits_name_override is defined else primary_traits -%}
+{% set extra_kep = extra.kargs_explicit_param if extra.kargs_explicit_param is defined else kargs_explicit_param -%}
+template __global__ void {{kernel_func}}<
+    {{extra_traits}}<{{dtype}}>{{extra_kep}}>({{kargs_name}});
+{% endfor -%}
