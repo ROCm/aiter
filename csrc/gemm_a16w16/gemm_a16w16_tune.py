@@ -272,14 +272,14 @@ def run_skinny_gemm_a16w16(input, weight, bias=None, otype=dtypes.bf16):
 
 
 def run_flydsl_gemm_bf16(
-    input, weight, out, bias=None, otype=dtypes.bf16, config=None
+    input, weight, out, bias=None, otype=dtypes.bf16, config=None, kernel_name=""
 ):
     if flydsl_hgemm is None:
         raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
     if config is None:
         raise ValueError("flydsl tuning requires a kernel config")
     stages = config.get("stages", config.get("stage", 2))
-    kernel_name = config.get("kernel_name", config.get("kernelName", ""))
+    kernel_name = kernel_name or config.get("kernel_name", config.get("kernelName", ""))
     use_ht = config.get("use_ht", False) or "_use_htTrue" in kernel_name
     fused_bias = None
     if (
@@ -759,7 +759,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     generate_data,
                     (M, N, K, indtype, outdtype, scaleAB, is_shuffle, 0, has_bias),
                     run_flydsl_gemm_bf16,
-                    (["inp", weight_key, "out_asm", "bias"], outdtype, config),
+                    (["inp", weight_key, "out_asm", "bias"], outdtype, config, kernel_name),
                     dict(run_kwargs),
                     get_gemm_ref,
                     (
