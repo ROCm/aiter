@@ -115,7 +115,7 @@ def gather_kv_b_proj(
     num_stages = 3
     # To avoid out of LDS limit for gfx942
     if arch_info.get_arch() in ("gfx942",) and ChunkK > 64:
-        num_stages = 2
+        num_stages = 1
 
     grid = (batch_size * tp_k_head_num_k,)
     if is_fp4_weight:
