@@ -136,8 +136,7 @@ def get_GEMM_A16W16_config(
         )
         if config is not None:
             if config["libtype"] == "flydsl":
-                # if is_flydsl_available():
-                if False:
+                if is_flydsl_available():
                     flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
                         config["kernelName"]
                     )

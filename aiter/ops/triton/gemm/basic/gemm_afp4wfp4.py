@@ -445,7 +445,7 @@ def gemm_afp4wfp4_preshuffle(
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
-    use_gluon = False
+    use_gluon = arch_info.get_arch() == "gfx1250"
 
     M, K_bytes = x_fp4.shape
     n16, _ = w_preshuf.shape
@@ -456,9 +456,6 @@ def gemm_afp4wfp4_preshuffle(
 
     if config is None:
         config, _ = _get_config(M, N, K_cfg, True)
-
-    if "NUM_KSPLIT" not in config:
-        config["NUM_KSPLIT"] = 1
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if M < 32:
