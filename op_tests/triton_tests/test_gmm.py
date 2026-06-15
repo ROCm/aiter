@@ -76,7 +76,10 @@ TRANS_RHS_STR: set[str] = {f"trhs{b}" for b in {"F", "T"}}
 
 
 def trans_from_str(trans_str: str, tensor_str: str) -> bool:
-    assert tensor_str in {"lhs", "rhs"}, f"Invalid tensor string ({tensor_str})."
+    assert tensor_str in {
+        "lhs",
+        "rhs",
+    }, f"Tensor name must be 'lhs' or 'rhs' (got '{tensor_str}')."
     return trans_str.replace(f"t{tensor_str}", "") == "T"
 
 
@@ -387,7 +390,10 @@ def test_tgmm(
     G: int,
     trans_lhs_str: str,
 ):
-    assert persistent_str in {"p", "np"}
+    assert persistent_str in {
+        "p",
+        "np",
+    }, f"Persistence selector must be 'p' or 'np' (got '{persistent_str}')."
     persistent: bool = persistent_str == "p"
 
     in_dtype = out_dtype = DTYPE
@@ -577,7 +583,10 @@ def test_tgmm_alt_trans_lhs_int64_group_sizes_grid_dim_override(
     alt_trans: bool,
     grid_dim: int | None,
 ):
-    assert persistent_str in {"p", "np"}
+    assert persistent_str in {
+        "p",
+        "np",
+    }, f"Persistence selector must be 'p' or 'np' (got '{persistent_str}')."
     persistent: bool = persistent_str == "p"
     has_grid_dim: bool = grid_dim is not None
 

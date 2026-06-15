@@ -25,9 +25,10 @@ SUPPORTED_DTYPES_STR: set[str] = {"fp16", "bf16"}
 def dtype_from_str(dtype_str: str) -> torch.dtype:
     dtype_str = dtype_str.strip().lower()
     dtype_str = dtype_str[1:] if dtype_str[0] in {"i", "o"} else dtype_str
-    assert (
-        dtype_str in SUPPORTED_DTYPES_STR
-    ), "String data type isn't in set of supported string data types."
+    assert dtype_str in SUPPORTED_DTYPES_STR, (
+        f"Unsupported data type string '{dtype_str}'. "
+        f"Supported values are {SUPPORTED_DTYPES_STR}."
+    )
     return {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
 
 
@@ -39,17 +40,19 @@ SUPPORTED_DTYPES: set[torch.dtype] = {
 
 # Convert PyTorch data type to string data type.
 def str_from_dtype(dtype: torch.dtype) -> str:
-    assert (
-        dtype in SUPPORTED_DTYPES
-    ), "PyTorch data type isn't in set of supported PyTorch data types."
+    assert dtype in SUPPORTED_DTYPES, (
+        f"Unsupported PyTorch data type {dtype}. "
+        f"Supported data types are {SUPPORTED_DTYPES}."
+    )
     return {torch.float16: "fp16", torch.bfloat16: "bf16"}[dtype]
 
 
 # Default data type, as string.
 DTYPE_STR: str = "bf16"
-assert (
-    DTYPE_STR in SUPPORTED_DTYPES_STR
-), "Default string data type isn't in set of supported string data types."
+assert DTYPE_STR in SUPPORTED_DTYPES_STR, (
+    f"Default data type '{DTYPE_STR}' must be one of the supported data types "
+    f"{SUPPORTED_DTYPES_STR}."
+)
 
 
 # Default data type, as PyTorch type.
@@ -66,9 +69,10 @@ SUPPORTED_GROUP_SIZES_DTYPES_STR: set[str] = {"int32", "int64"}
 # Convert string data type to PyTorch data type.
 def group_sizes_dtype_from_str(dtype_str: str) -> torch.dtype:
     dtype_str = dtype_str.strip().lower()
-    assert (
-        dtype_str in SUPPORTED_GROUP_SIZES_DTYPES_STR
-    ), "String data type isn't in set of supported string data types."
+    assert dtype_str in SUPPORTED_GROUP_SIZES_DTYPES_STR, (
+        f"Unsupported group sizes data type string '{dtype_str}'. "
+        f"Supported values are {SUPPORTED_GROUP_SIZES_DTYPES_STR}."
+    )
     return {"int32": torch.int32, "int64": torch.int64}[dtype_str]
 
 
@@ -81,17 +85,19 @@ SUPPORTED_GROUP_SIZES_DTYPES: set[torch.dtype] = {
 
 # Convert PyTorch data type to string data type.
 def str_from_group_sizes_dtype(dtype: torch.dtype) -> str:
-    assert (
-        dtype in SUPPORTED_GROUP_SIZES_DTYPES
-    ), "PyTorch data type isn't in set of supported PyTorch data types."
+    assert dtype in SUPPORTED_GROUP_SIZES_DTYPES, (
+        f"Unsupported group sizes PyTorch data type {dtype}. "
+        f"Supported data types are {SUPPORTED_GROUP_SIZES_DTYPES}."
+    )
     return {torch.int32: "int32", torch.int64: "int64"}[dtype]
 
 
 # Default data type, as string.
 GROUP_SIZES_DTYPE_STR: str = "int32"
-assert (
-    GROUP_SIZES_DTYPE_STR in SUPPORTED_GROUP_SIZES_DTYPES_STR
-), "Default string data type isn't in set of supported string data types."
+assert GROUP_SIZES_DTYPE_STR in SUPPORTED_GROUP_SIZES_DTYPES_STR, (
+    f"Default group sizes data type '{GROUP_SIZES_DTYPE_STR}' must be one of the "
+    f"supported group sizes data types {SUPPORTED_GROUP_SIZES_DTYPES_STR}."
+)
 
 
 # Default data type, as PyTorch type.
@@ -508,10 +514,12 @@ def get_gmm_shape(
     ), f"G dimension of rhs and group_sizes don't match (rhs = {rhs_g}, group_sizes = {group_sizes_g})."
     G = rhs_g
 
-    assert M > 0, f"M must be positive, it's {M}."
-    assert K > 0, f"K must be positive, it's {K}."
-    assert N > 0, f"N must be positive, it's {N}"
-    assert G > 0, f"G must be positive, it's {G}"
+    assert M > 0, f"Number of lhs rows M must be positive (got M = {M})."
+    assert (
+        K > 0
+    ), f"Shared dimension K (lhs columns / rhs rows) must be positive (got K = {K})."
+    assert N > 0, f"Number of rhs columns N must be positive (got N = {N})."
+    assert G > 0, f"Number of groups G must be positive (got G = {G})."
 
     return M, K, N, G
 
@@ -558,7 +566,6 @@ def get_gmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool, 
     assert (
         lhs_m == out_m
     ), f"M dimension of lhs and out don't match (lhs = {lhs_m}, out = {out_m})."
-    M = lhs_m
     K = lhs_k
     N = out_n
 
@@ -577,13 +584,10 @@ def get_gmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool, 
         f"(G, N, K) = ({G}, {N}, {K})."
     )
 
-    assert M > 0, f"M must be positive, it's {M}."
-    assert K > 0, f"K must be positive, it's {K}."
-    assert N > 0, f"N must be positive, it's {N}"
-    assert G > 0, f"G must be positive, it's {G}"
-
     is_lhs_row_major = lhs.stride() == (K, 1)
-    assert is_lhs_row_major, "lhs must be row-major."
+    assert (
+        is_lhs_row_major
+    ), f"lhs must be row-major with stride (K, 1) = ({K}, 1), got {lhs.stride()}."
 
     rhs_stride = rhs.stride()
     is_rhs_not_transposed = is_kn_shape and rhs_stride == (K * N, N, 1)
@@ -613,7 +617,9 @@ def get_gmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool, 
         )
     )
     is_out_row_major = out.stride() == (N, 1)
-    assert is_out_row_major, "out must be row-major."
+    assert (
+        is_out_row_major
+    ), f"out must be row-major with stride (N, 1) = ({N}, 1), got {out.stride()}."
 
     is_rhs_transposed = is_rhs_transposed_layout_1 or is_rhs_transposed_layout_2
     # Get rhs leading dimension according to transposition configuration. Both
@@ -806,10 +812,12 @@ def get_tgmm_shape(
             f" (expected (K, M) or (M, K))."
         )
 
-    assert M > 0, f"M must be positive, it's {M}."
-    assert K > 0, f"K must be positive, it's {K}."
-    assert N > 0, f"N must be positive, it's {N}"
-    assert G > 0, f"G must be positive, it's {G}"
+    assert (
+        M > 0
+    ), f"Contraction dimension M (lhs columns / rhs rows) must be positive (got M = {M})."
+    assert K > 0, f"Number of output rows K must be positive (got K = {K})."
+    assert N > 0, f"Number of output columns N must be positive (got N = {N})."
+    assert G > 0, f"Number of groups G must be positive (got G = {G})."
 
     return M, K, N, G
 
@@ -937,11 +945,6 @@ def get_tgmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool,
         f"(M, K) = ({M}, {K})."
     )
 
-    assert M > 0, f"M must be positive, it's {M}."
-    assert K > 0, f"K must be positive, it's {K}."
-    assert N > 0, f"N must be positive, it's {N}"
-    assert G > 0, f"G must be positive, it's {G}"
-
     lhs_stride = lhs.stride()
     is_lhs_not_transposed = is_km_shape and lhs_stride == (M, 1)
     is_lhs_transposed_layout_1 = is_km_shape and lhs_stride == (1, K)
@@ -969,9 +972,14 @@ def get_tgmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool,
     )
 
     is_rhs_row_major = rhs.stride() == (N, 1)
-    assert is_rhs_row_major, "rhs must be row-major."
+    assert (
+        is_rhs_row_major
+    ), f"rhs must be row-major with stride (N, 1) = ({N}, 1), got {rhs.stride()}."
     is_out_row_major = out.stride() == (K * N, N, 1)
-    assert is_out_row_major, "out must be row-major."
+    assert is_out_row_major, (
+        f"out must be row-major with stride (K*N, N, 1) = ({K * N}, {N}, 1), "
+        f"got {out.stride()}."
+    )
 
     is_lhs_transposed = is_lhs_transposed_layout_1 or is_lhs_transposed_layout_2
     # Get lhs leading dimension according to transposition configuration. Both

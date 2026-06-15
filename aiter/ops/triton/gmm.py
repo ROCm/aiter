@@ -68,34 +68,35 @@ def _gmm_grid(
     # host-side launch cost. Only enable them in development.
     enable_expensive_assertions: bool = False,
 ) -> tuple[int]:
-    assert N > 0, f"N must be positive, it's {N}."
+    assert N > 0, f"Number of output columns N must be positive (got N = {N})."
     assert is_power_of_2(
         block_size_m
-    ), f"M-dimension tile size must be a power of 2 (it's {block_size_m})."
+    ), f"M-dimension tile size BLOCK_SIZE_M must be a power of 2 (got {block_size_m})."
     assert is_power_of_2(
         block_size_n
-    ), f"N-dimension tile size must be a power of 2 (it's {block_size_n})."
-    assert grid_dim > 0, f"Grid dimension must be positive (it's {grid_dim})."
+    ), f"N-dimension tile size BLOCK_SIZE_N must be a power of 2 (got {block_size_n})."
+    assert (
+        grid_dim > 0
+    ), f"Grid dimension (number of programs) must be positive (got {grid_dim})."
     num_n_tiles = triton.cdiv(N, block_size_n)
-    assert num_n_tiles > 0, f"num_n_tiles must be positive, it's {num_n_tiles}."
 
     # Cheap-path default. The kernel handle the case where grid_dim exceeds the
     # total tile count: extra programs just exit without doing any work.
     num_programs = grid_dim
 
     if enable_expensive_assertions:
-        assert torch.all(
-            group_sizes >= 0
-        ).item(), "All group_sizes must be non-negative."
+        assert torch.all(group_sizes >= 0).item(), (
+            "All GMM group sizes must be non-negative, but at least one element "
+            "of group_sizes is negative."
+        )
         num_m_tiles = (group_sizes + block_size_m - 1) // block_size_m
-        assert torch.all(
-            num_m_tiles >= 0
-        ).item(), "All num_m_tiles must be non-negative."
         num_tiles = torch.sum(num_m_tiles * num_n_tiles).item()
-        assert num_tiles > 0, f"num_tiles must be positive, it's {num_tiles}."
+        assert num_tiles > 0, (
+            "GMM has no tiles to launch: group_sizes must contain at least one "
+            f"non-empty group (computed {num_tiles} total tiles)."
+        )
         num_programs = int(min(grid_dim, num_tiles))
 
-    assert num_programs > 0, f"num_programs must be positive, it's {num_programs}."
     return (num_programs,)
 
 
@@ -230,12 +231,16 @@ def gmm(
             "GROUP_SIZE",
             "GRID_DIM",
         }
-    ), "Invalid GMM kernel config."
+    ), (
+        "Invalid GMM kernel config: each of BLOCK_SIZE_M, BLOCK_SIZE_K, "
+        "BLOCK_SIZE_N, GROUP_SIZE and GRID_DIM must be present, with BLOCK_SIZE_* "
+        f"being powers of 2 and the rest positive integers. Got: {config}."
+    )
 
     # Override grid dimension, if optional argument is provided.
     assert (grid_dim is None) or (
         grid_dim > 0
-    ), f"Invalid grid dimension {grid_dim}. It must be None or a positive integer."
+    ), f"grid_dim must be None or a positive integer (got {grid_dim})."
     if grid_dim is not None and grid_dim != config["GRID_DIM"]:
         warnings.warn(
             f"Overriding GMM grid dim with {grid_dim} (it was {config['GRID_DIM']})."
@@ -287,24 +292,22 @@ def _ptgmm_grid(
     block_size_n: int,
     grid_dim: int,
 ) -> tuple[int]:
-    assert K > 0, f"K must be positive, it's {K}."
-    assert N > 0, f"N must be positive, it's {N}."
-    assert G > 0, f"G must be positive, it's {G}."
+    assert K > 0, f"Number of output rows K must be positive (got K = {K})."
+    assert N > 0, f"Number of output columns N must be positive (got N = {N})."
+    assert G > 0, f"Number of groups G must be positive (got G = {G})."
     assert is_power_of_2(
         block_size_k
-    ), f"K-dimension tile size must be a power of 2 (it's {block_size_k})."
+    ), f"K-dimension tile size BLOCK_SIZE_K must be a power of 2 (got {block_size_k})."
     assert is_power_of_2(
         block_size_n
-    ), f"N-dimension tile size must be a power of 2 (it's {block_size_n})."
-    assert grid_dim > 0, f"Grid dimension must be positive (it's {grid_dim})."
+    ), f"N-dimension tile size BLOCK_SIZE_N must be a power of 2 (got {block_size_n})."
+    assert (
+        grid_dim > 0
+    ), f"Grid dimension (number of programs) must be positive (got {grid_dim})."
     num_k_tiles = triton.cdiv(K, block_size_k)
-    assert num_k_tiles > 0, f"num_k_tiles must be positive, it's {num_k_tiles}."
     num_n_tiles = triton.cdiv(N, block_size_n)
-    assert num_n_tiles > 0, f"num_n_tiles must be positive, it's {num_n_tiles}."
     num_tiles = G * num_k_tiles * num_n_tiles
-    assert num_tiles > 0, f"num_tiles must be positive, it's {num_tiles}."
     num_programs = min(grid_dim, num_tiles)
-    assert num_programs > 0, f"num_programs must be positive, it's {num_programs}."
     return (num_programs,)
 
 
@@ -440,12 +443,16 @@ def ptgmm(
             "GROUP_SIZE",
             "GRID_DIM",
         }
-    ), "Invalid PTGMM kernel config."
+    ), (
+        "Invalid PTGMM kernel config: each of BLOCK_SIZE_M, BLOCK_SIZE_K, "
+        "BLOCK_SIZE_N, GROUP_SIZE and GRID_DIM must be present, with BLOCK_SIZE_* "
+        f"being powers of 2 and the rest positive integers. Got: {config}."
+    )
 
     # Override grid dimension, if optional argument is provided.
     assert (grid_dim is None) or (
         grid_dim > 0
-    ), f"Invalid grid dimension {grid_dim}. It must be None or a positive integer."
+    ), f"grid_dim must be None or a positive integer (got {grid_dim})."
     if grid_dim is not None and grid_dim != config["GRID_DIM"]:
         warnings.warn(
             f"Overriding PTGMM grid dim with {grid_dim} (it was {config['GRID_DIM']})."
@@ -504,23 +511,18 @@ def _nptgmm_grid(
     block_size_k: int,
     block_size_n: int,
 ) -> tuple[int, int]:
-    assert K > 0, f"K must be positive, it's {K}."
-    assert N > 0, f"N must be positive, it's {N}."
-    assert G > 0, f"G must be positive, it's {G}."
+    assert K > 0, f"Number of output rows K must be positive (got K = {K})."
+    assert N > 0, f"Number of output columns N must be positive (got N = {N})."
+    assert G > 0, f"Number of groups G must be positive (got G = {G})."
     assert is_power_of_2(
         block_size_k
-    ), f"K-dimension tile size must be a power of 2 (it's {block_size_k})."
+    ), f"K-dimension tile size BLOCK_SIZE_K must be a power of 2 (got {block_size_k})."
     assert is_power_of_2(
         block_size_n
-    ), f"N-dimension tile size must be a power of 2 (it's {block_size_n})."
+    ), f"N-dimension tile size BLOCK_SIZE_N must be a power of 2 (got {block_size_n})."
     num_k_tiles = triton.cdiv(K, block_size_k)
-    assert num_k_tiles > 0, f"num_k_tiles must be positive, it's {num_k_tiles}."
     num_n_tiles = triton.cdiv(N, block_size_n)
-    assert num_n_tiles > 0, f"num_n_tiles must be positive, it's {num_n_tiles}."
     num_tiles_per_mm = num_k_tiles * num_n_tiles
-    assert (
-        num_tiles_per_mm > 0
-    ), f"num_tiles_per_mm must be positive, it's {num_tiles_per_mm}."
     return (G, num_tiles_per_mm)
 
 
@@ -661,7 +663,11 @@ def nptgmm(
             "BLOCK_SIZE_N",
             "GROUP_SIZE",
         }
-    ), "Invalid NPTGMM kernel config."
+    ), (
+        "Invalid NPTGMM kernel config: each of BLOCK_SIZE_M, BLOCK_SIZE_K, "
+        "BLOCK_SIZE_N and GROUP_SIZE must be present, with BLOCK_SIZE_* being "
+        f"powers of 2 and GROUP_SIZE a positive integer. Got: {config}."
+    )
 
     grid = _nptgmm_grid(
         K,

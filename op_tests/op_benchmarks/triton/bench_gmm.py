@@ -51,7 +51,9 @@ from aiter.ops.triton.gmm import (
 GMM_TYPES: set[str] = {"gmm", "ptgmm", "nptgmm"}
 
 DEFAULT_GMM: str = "gmm"
-assert DEFAULT_GMM in GMM_TYPES, "Default GMM type isn't in set of GMM variants."
+assert (
+    DEFAULT_GMM in GMM_TYPES
+), f"Default GMM type '{DEFAULT_GMM}' must be one of the GMM variants {GMM_TYPES}."
 
 
 # Real shapes, used by real models.
@@ -75,20 +77,23 @@ METRICS: set[str] = {"time", "throughput", "bandwidth"}
 DEFAULT_METRIC: str = "throughput"
 assert (
     DEFAULT_METRIC in METRICS
-), "Default benchmark metric isn't in set of supported metrics."
+), f"Default benchmark metric '{DEFAULT_METRIC}' must be one of {METRICS}."
 
 METRIC_UNITS: dict[str, str] = {
     "time": "ms",
     "throughput": "tflops",
     "bandwidth": "gbps",
 }
-assert (
-    METRIC_UNITS.keys() == METRICS
-), "Mismatch between available benchmark metrics and respective units."
+assert METRIC_UNITS.keys() == METRICS, (
+    "Every benchmark metric must have exactly one unit: METRIC_UNITS keys "
+    f"{set(METRIC_UNITS.keys())} don't match the set of metrics {METRICS}."
+)
 
 
 def select_triton_kernel(gmm_type: str):
-    assert gmm_type in GMM_TYPES, "Invalid GMM type."
+    assert (
+        gmm_type in GMM_TYPES
+    ), f"Unknown GMM type '{gmm_type}'. Choose one of {GMM_TYPES}."
     if gmm_type == "gmm":
         desc, gen_tensors, kernel_wrapper = (
             "GMM",
@@ -132,8 +137,12 @@ def benchmark_gmm(
     work_stealing: bool = False,
     output: bool = False,
 ) -> None:
-    assert gmm_type in GMM_TYPES, "Invalid GMM type."
-    assert metric in METRICS, "Invalid benchmark metric."
+    assert (
+        gmm_type in GMM_TYPES
+    ), f"Unknown GMM type '{gmm_type}'. Choose one of {GMM_TYPES}."
+    assert (
+        metric in METRICS
+    ), f"Unknown benchmark metric '{metric}'. Choose one of {METRICS}."
 
     desc, gen_tensors, kernel_wrapper = select_triton_kernel(gmm_type)
 

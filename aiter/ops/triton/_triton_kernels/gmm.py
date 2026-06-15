@@ -32,13 +32,13 @@ def get_config(
         "gmm",
         "ptgmm",
         "nptgmm",
-    }, f"'{gmm_type}' is an invalid GMM variant."
+    }, f"'{gmm_type}' is an invalid GMM variant. It should be in {{'gmm', 'ptgmm', 'nptgmm'}}."
     if not hasattr(get_config, "_config_dict"):
         dev = arch_info.get_arch()
         config_filename = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GMM.json"
         assert os.path.exists(config_filename) and os.path.isfile(
             config_filename
-        ), f"'{config_filename}' isn't an existent file."
+        ), f"Required kernel config file '{config_filename}' doesn't exist."
         with open(config_filename, "r") as config_file:
             get_config._config_dict = json.load(config_file)
             assert all(
@@ -50,7 +50,11 @@ def get_config(
     assert (
         "default" in get_config._config_dict[gmm_type]
     ), "Default configuration is absent."
-    key = "accumulate" if accumulate else "default"
+    key = (
+        "accumulate"
+        if accumulate and "accumulate" in get_config._config_dict[gmm_type]
+        else "default"
+    )
     return get_config._config_dict[gmm_type][key]
 
 
@@ -116,7 +120,10 @@ def _resolve_gmm_tile(
     cumsum_tile = tl.where(g_mask, tl.cumsum(num_tiles, dtype=INT_TYPE), 0)
     cumsum_m = tl.where(g_mask, tl.cumsum(group_sizes, dtype=INT_TYPE), 0)
     g = tl.sum((cumsum_tile <= tile) & g_mask, dtype=INT_TYPE)
-    tl.device_assert(g < G, "g >= G")
+    tl.device_assert(
+        g < G,
+        "Group index g exceeds number of groups G (g >= G). g should be in [0, G).",
+    )
     prev_mask = g_range < g
     prev_cumsum_m = tl.max(tl.where(prev_mask, cumsum_m, 0))
     prev_cumsum_tile = tl.max(tl.where(prev_mask, cumsum_tile, 0))
@@ -124,7 +131,10 @@ def _resolve_gmm_tile(
     m = g_cumsum_m - prev_cumsum_m
     num_m_tiles_out = tl.cdiv(m, BLOCK_SIZE_M)
     tile_in_mm = tile - prev_cumsum_tile
-    tl.device_assert(tile_in_mm >= 0, "tile_in_mm < 0")
+    tl.device_assert(
+        tile_in_mm >= 0,
+        "Local matrix multiplication tile coordinate can't be negative. It should be in [0, tiles_in_mm).",
+    )
     #      g, m, num_m_tiles,     last_m,        tile_in_mm
     return g, m, num_m_tiles_out, prev_cumsum_m, tile_in_mm
 
@@ -263,7 +273,7 @@ def _gmm(
         # Get m dimension of current MM problem.
         m = tl.load(group_sizes_ptr + g)
         # m can be zero if group is empty.
-        tl.device_assert(m >= 0, "m < 0")
+        tl.device_assert(m >= 0, "GMM group size can't be negative (m < 0).")
 
         num_m_tiles = tl.cdiv(m, BLOCK_SIZE_M)
         num_tiles = num_m_tiles * num_n_tiles
@@ -272,7 +282,10 @@ def _gmm(
         while tile >= last_mm_tile and tile < last_mm_tile + num_tiles:
             # Figure out tile coordinates in current MM problem.
             tile_in_mm = tile - last_mm_tile
-            tl.device_assert(tile_in_mm >= 0, "tile_in_mm < 0")
+            tl.device_assert(
+                tile_in_mm >= 0,
+                "GMM local matrix multiplication tile ID can't be negative (tile_in_mm < 0).",
+            )
 
             _process_gmm_tile(
                 # Tensor pointers:
@@ -302,18 +315,17 @@ def _gmm(
 
             # Go to the next tile by advancing number of programs.
             tile += GRID_DIM
-            tl.device_assert(tile > 0, "tile <= 0 (at update)")
 
         # Get ready to go to the next MM problem.
-
         last_mm_tile += num_tiles
-        # last_mm_tile can be zero if group 0 is skipped
-        tl.device_assert(last_mm_tile >= 0, "last_mm_tile < 0 (at update)")
-
         last_m += m
-        # last_m can be zero if group 0 is skipped
-        tl.device_assert(last_m >= 0, "last_m < 0 (at update)")
-        tl.device_assert(last_m <= M, "last_m > M (at update)")
+        # Cumulative rows consumed so far must never exceed the total number of
+        # rows M. A violation means group_sizes sums to more than M.
+        tl.device_assert(
+            last_m <= M,
+            "GMM group sizes sum to more rows than the M dimension of lhs "
+            "(sum(group_sizes) > M).",
+        )
 
 
 @triton.jit
@@ -349,7 +361,11 @@ def _work_stealing_gmm(
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         INT_TYPE=INT_TYPE,
     )
-    tl.device_assert(total_tiles > 0, "total_tiles <= 0")
+    tl.device_assert(
+        total_tiles > 0,
+        "Work stealing GMM has no tiles to process (total_tiles <= 0). "
+        "group_sizes must contain at least one non-empty group.",
+    )
 
     tile = tl.program_id(0).to(INT_TYPE)
 
@@ -448,7 +464,6 @@ def gmm_kernel(
     INT_TYPE: tl.constexpr = group_sizes_ptr.type.element_ty
 
     num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N).to(INT_TYPE)
-    tl.device_assert(num_n_tiles > 0, "num_n_tiles <= 0")
 
     if WORK_STEALING:
         _work_stealing_gmm(
@@ -552,17 +567,11 @@ def tgmm_persistent_kernel(
     zero = tl.cast(0, int_type)
 
     num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K).to(int_type)
-    tl.device_assert(num_k_tiles > 0, "num_k_tiles <= 0")
-
     num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N).to(int_type)
-    tl.device_assert(num_n_tiles > 0, "num_n_tiles <= 0")
-
     num_tiles = num_k_tiles * num_n_tiles
-    tl.device_assert(num_tiles > 0, "num_tiles <= 0")
 
     # Current tile. Each program computes multiple tiles of each group.
     tile = tl.program_id(0).to(int_type)
-    tl.device_assert(tile >= 0, "tile < 0 (at initialization)")
 
     # Tile limit of last MM problem (inclusive).
     last_mm_tile = zero
@@ -577,23 +586,19 @@ def tgmm_persistent_kernel(
     for g in range(G):
         # Get m dimension of current MM problem.
         m = tl.load(group_sizes_ptr + g)
-        # m can be zero if group is empty
-        tl.device_assert(m >= 0, "m < 0")
+        # m can be zero if group is empty.
+        tl.device_assert(m >= 0, "TGMM group size can't be negative (m < 0).")
 
         # Loop through tiles of current MM problem.
         while tile >= last_mm_tile and tile < last_mm_tile + num_tiles:
             # Figure out tile coordinates in current MM problem.
             tile_in_mm = tile - last_mm_tile
-            tl.device_assert(tile_in_mm >= 0, "tile_in_mm < 0")
 
             tile_k, tile_n = _remap_xcd_tile_grid(
                 tile_in_mm, num_k_tiles, num_n_tiles, GROUP_SIZE=GROUP_SIZE
             )
 
             # Do regular MM:
-
-            tl.device_assert(tile_k * BLOCK_SIZE_K >= 0, "tile_k * BLOCK_SIZE_K < 0")
-            tl.device_assert(tile_n * BLOCK_SIZE_N >= 0, "tile_n * BLOCK_SIZE_N < 0")
 
             offs_lhs_k = (
                 tile_k.to(tl.int64) * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
@@ -691,18 +696,17 @@ def tgmm_persistent_kernel(
 
             # Go to the next tile by advancing number of programs.
             tile += GRID_DIM
-            tl.device_assert(tile > 0, "tile <= 0 (at update)")
 
         # Get ready to go to the next MM problem.
-
         last_mm_tile += num_tiles
-        # last_mm_tile can be zero if group 0 is skipped
-        tl.device_assert(last_mm_tile >= 0, "last_mm_tile < 0 (at update)")
-
         last_m += m
-        # last_m can be zero if group 0 is skipped
-        tl.device_assert(last_m >= 0, "last_m < 0 (at update)")
-        tl.device_assert(last_m <= M, "last_m > M (at update)")
+        # Cumulative columns consumed so far must never exceed the contraction
+        # dimension M. A violation means group_sizes sums to more than M.
+        tl.device_assert(
+            last_m <= M,
+            "TGMM group sizes sum to more columns than the M dimension "
+            "(sum(group_sizes) > M).",
+        )
 
 
 # Regular non-persistent TGMM kernel.
@@ -754,13 +758,17 @@ def tgmm_non_persistent_kernel(
 
     # Get group ID from grid.
     g = tl.program_id(0)
-    tl.device_assert(g >= 0, "g < 0")
-    tl.device_assert(g < G, "g >= G")
+    # Guards the group_sizes load below against an out-of-range group index.
+    tl.device_assert(
+        g < G,
+        "TGMM group index exceeds the number of groups G (g >= G). "
+        "g should be in [0, G).",
+    )
 
     # Get m dimension of current MM group.
     m = tl.load(group_sizes_ptr + g)
     # m can be zero if group is empty.
-    tl.device_assert(m >= 0, "m < 0")
+    tl.device_assert(m >= 0, "TGMM group size can't be negative (m < 0).")
 
     # Skip empty groups.
     if m == 0:
@@ -773,21 +781,14 @@ def tgmm_non_persistent_kernel(
     start_m = tl.sum(group_sizes)
 
     num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-    tl.device_assert(num_k_tiles > 0, "num_k_tiles <= 0")
-
     num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
-    tl.device_assert(num_n_tiles > 0, "num_n_tiles <= 0")
 
     # Get MM tile from grid.
     tile_in_mm = tl.program_id(1)
-    tl.device_assert(tile_in_mm >= 0, "tile_in_mm < 0")
 
     tile_k, tile_n = _remap_xcd_tile_grid(
         tile_in_mm, num_k_tiles, num_n_tiles, GROUP_SIZE=GROUP_SIZE
     )
-
-    tl.device_assert(tile_k * BLOCK_SIZE_K >= 0, "tile_k * BLOCK_SIZE_K < 0")
-    tl.device_assert(tile_n * BLOCK_SIZE_N >= 0, "tile_n * BLOCK_SIZE_N < 0")
 
     offs_lhs_k = (tile_k.to(tl.int64) * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)) % K
     offs_rhs_n = (tile_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
