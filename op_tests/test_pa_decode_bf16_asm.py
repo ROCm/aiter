@@ -15,8 +15,9 @@ Style mirrors op_tests/test_pa_ps.py: a torch host reference is compared against
 the kernel via aiter.test_common.checkAllclose (no pytest), driven by argparse
 over a config grid.  Supports arbitrary kv_len (multi-page) via split-KV.
 
-The gfx1250 split-KV reduce kernel is WIP, so the PA stage runs on GPU and the
-LSE merge runs on host in cpu_reduce (which matches aiter csrc/kernels/mla/reduce.cu).
+Both stages run on GPU: the PA decode kernel produces direct-O + split partials,
+then the split-KV LSE merge runs via aiter.pa_reduce_v1 (the same mla_reduce GPU op
+ATOM uses).  cpu_reduce is kept as a host reference/fallback but is no longer used.
 """
 
 import argparse
@@ -283,10 +284,13 @@ def ref_pa_decode(
     token (`ctx - mtp + 1 + i`), but the GPU follows the no-`+1` border above.
     For mtp=0 this is the full context (no-op).
 
-    sink (optional): per-Q-head fp32 logits in the kernel's PRE-SCALE raw domain,
-    shape [kv_head_num*gqa].  It adds one virtual logit `s_eff*sink_raw` (s_eff =
-    query_scale*key_scale*softmax_scale) to each row's softmax denominator; the
-    sink has no value, so it only shrinks the real-token weights.
+    sink (optional): per-Q-head fp32 logits in the SCALED-logit domain (Triton /
+    GPT-OSS convention), shape [kv_head_num*gqa].  It adds one virtual logit
+    `sink_raw` directly to each row's softmax denominator (compared against the
+    scaled logits (q.k)*s_eff); the sink has no value, so it only shrinks the
+    real-token weights.  NOTE: the ASM kernel divides the passed sink by s_eff
+    internally (it then re-multiplies by scl_log2e=s_eff*log2e), so callers pass
+    the scaled-domain sink directly -- no *s_eff here.
     """
     num_pages, kv_head_num = K.shape[0], K.shape[1]
     head_dim = Q.shape[-1]
@@ -295,9 +299,7 @@ def ref_pa_decode(
     mtp = qlen - 1
     device = Q.device
     s_eff = query_scale * key_scale * softmax_scale
-    sink_hg = (
-        (sink.float().view(kv_head_num, gqa) * s_eff) if sink is not None else None
-    )
+    sink_hg = sink.float().view(kv_head_num, gqa) if sink is not None else None
 
     # K[p,h,d//16,tok,d%16] -> K_tm[p,h,tok,d];  V[p,h,tok//16,d,tok%16] -> V_tm[p,h,tok,d]
     K_tm = (
@@ -486,27 +488,54 @@ def test_pa_decode(
         )
     ).to(fp8)
 
-    # ---- sched2-convention split-KV metadata + scratch (host reduce; gfx1250 reduce WIP) ----
-    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+    # ---- split-KV metadata via aiter's production generator (same as ATOM) ----
+    # Uses aiter.get_ps_metadata_v1 (the clustered C++ scheduler) instead of the
+    # Python make_sched2_metadata, so the work/reduce maps are byte-identical to
+    # what ATOM feeds aiter.pa_reduce_v1 (no clustering/format drift). Buffers are
+    # over-allocated to max sizes; the generator fills the actual entries and
+    # work_indptr[-1] is the true work count.
     (
+        work_meta_data_spec,
+        work_indptr_spec,
+        work_info_spec,
+        reduce_indptr_spec,
+        reduce_final_map_spec,
+        reduce_partial_map_spec,
+    ) = aiter.get_ps_metadata_info_v1(
+        batch, kv_head_num, qlen_with_mtp, qlen_granularity=qlen_with_mtp
+    )
+
+    def _empty_spec(spec):
+        shape, dtype = spec
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    work_meta_data = _empty_spec(work_meta_data_spec)
+    work_indptr = _empty_spec(work_indptr_spec)
+    work_info = _empty_spec(work_info_spec)
+    reduce_indptr = _empty_spec(reduce_indptr_spec)
+    reduce_final_map = _empty_spec(reduce_final_map_spec)
+    reduce_partial_map = _empty_spec(reduce_partial_map_spec)
+    aiter.get_ps_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        seq_lens_kv,
+        gqa,
+        kv_head_num,
+        work_meta_data,
         work_indptr,
         work_info,
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        split_rows,
-    ) = make_sched2_metadata(
-        batch,
-        kv_head_num,
-        gqa,
-        qo_indptr,
-        kv_indptr,
-        seq_lens_kv,
-        page_size,
-        qlen_with_mtp,
-        num_cu,
-        device,
+        qhead_granularity=gqa,
+        qlen_granularity=qlen_with_mtp,
+        kvlen_granularity=page_size,
+        block_size=page_size,
+        # Match the kernel (compile-time CAUSAL=1) and ATOM. No-op for mtp=0;
+        # required to validate the causal path under --mtp > 0.
+        is_causal=True,
     )
+    split_rows = max(1, int(reduce_partial_map.numel()) * qlen_with_mtp)
     # -inf lse / 0 o so any split the kernel leaves unwritten is inert in reduce.
     split_o = torch.zeros(
         (split_rows, 1, q_head_num, head_dim), dtype=dtypes.fp32, device=device
@@ -545,14 +574,23 @@ def test_pa_decode(
         sink,
     )
     torch.cuda.synchronize()
-    out = cpu_reduce(
-        out,
+    # Merge split-KV partials with the GPU reduce (same op ATOM uses), instead of
+    # the host cpu_reduce. The kernel wrote direct-O rows into `out` and split
+    # partials into split_o/split_lse; pa_reduce_v1 reduces the partials into the
+    # reduced rows of `out` in place (direct-O rows untouched). Reduce is sink-free
+    # (the kernel owns the sink). Empty reduce maps (no splits) => no-op.
+    final_lse = torch.empty(
+        (batch * qlen_with_mtp, q_head_num), dtype=dtypes.fp32, device=device
+    )
+    aiter.pa_reduce_v1(
         split_o,
         split_lse,
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        gqa,
+        qlen_with_mtp,
+        out.view(batch * qlen_with_mtp, q_head_num, head_dim),
+        final_lse,
     )
 
     ref = ref_pa_decode(
