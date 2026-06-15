@@ -40,7 +40,7 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import _mxfp4_moe_run
+from aiter.fused_moe import mxfp4_moe_run
 
 torch.set_default_device("cuda")
 
@@ -82,8 +82,8 @@ def make_routing(num_tokens, seed=1):
 
 def run(hidden, topk_ids, topk_weight, w):
     w1, w2, w1s, w2s = w
-    return _mxfp4_moe_run(
-        hidden, w1, w2, topk_ids, topk_weight, TOPK,
+    return mxfp4_moe_run(
+        hidden, w1, w2, TOPK, topk_ids, topk_weight,
         kernelName1=KN1, kernelName2=KN2,
         w1_scale=w1s, w2_scale=w2s,
         quant_type=QuantType.per_1x32,

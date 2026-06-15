@@ -67,6 +67,11 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
 
 
+def _moe_prepare_mxfp4_passthrough(topk_ids, topk_weights):
+    # mxfp4_moe_run reads only topk_ids/weights; alias topk_ids into unused slots.
+    return topk_ids, topk_weights, topk_ids, topk_ids, topk_ids
+
+
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -401,23 +406,16 @@ def fused_moe_(
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
     elif quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
-            q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
-        elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
-            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
-                q_dtype_a = dtypes.bf16
-            else:
-                q_dtype_a = dtypes.fp8
+        if activation == ActivationType.Swiglu:
+            if gate_mode == GateMode.SEPARATED:
+                q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
+            elif gate_mode == GateMode.INTERLEAVE:
+                if get_gfx() != "gfx950" or M < bf16_fp8_bound:
+                    q_dtype_a = dtypes.bf16
+                else:
+                    q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
-
-    # Backend opt-in via the is_guinterleave tag on w1: a guinterleave-preshuffled
-    # weight selects the mxfp4 backend, telling get_2stage_cfgs to prefer the
-    # tagged CSV rows over the default untagged rows. Missing / False → default CSV
-    # lookup. NOTE: is_guinterleave is, in aiter, shared with the a16w4 (int4)
-    # shuffle; this dispatch treats any guinterleave weight as mxfp4, so callers
-    # must not tag a16w4 weights with is_guinterleave.
-    is_guinterleave = getattr(w1, "is_guinterleave", False)
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -436,7 +434,6 @@ def fused_moe_(
         intermediate_pad,
         isShuffled,
         gate_mode,
-        is_guinterleave=is_guinterleave,
         is_ep=expert_mask is not None,
     )
 
@@ -457,57 +454,24 @@ def fused_moe_(
     assert (
         not metadata.flat or get_gfx() == "gfx950"
     ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
-
-    _csv_is_mxfp4 = metadata.pipeline is not None
-    if is_guinterleave != _csv_is_mxfp4:
-        raise TypeError(
-            f"fused_moe: weight/CSV backend mismatch. "
-            f"w1.is_guinterleave={is_guinterleave!r}, "
-            f"csv_pipeline={metadata.pipeline!r}, "
-            f"M={M}, model_dim={model_dim}, inter_dim={inter_dim}, "
-            f"E={E}, topk={topk}, dtype={dtype}, "
-            f"q_dtype_a={q_dtype_a}, q_dtype_w={q_dtype_w}, "
-            f"quant_type={quant_type}, isShuffled={isShuffled}"
-        )
-
-    if metadata.pipeline is not None:
-        return metadata.pipeline(
-            hidden_states,
-            w1,
-            w2,
+    if metadata.mxfp4_hip:
+        # mxfp4 HIP 1stage routes on-device; skip host sort, shuttle raw topk.
+        sorting_ret = _moe_prepare_mxfp4_passthrough(topk_ids, topk_weight)
+    else:
+        sorting_ret = moe_sorting(
             topk_ids,
             topk_weight,
-            topk,
-            block_size_M=block_size_M,
-            q_dtype_a=q_dtype_a,
-            q_dtype_w=q_dtype_w,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-            num_local_tokens=num_local_tokens,
-            M=M,
-            device=topk_ids.device,
-            doweight_stage1=doweight_stage1,
-            activation=activation,
-            quant_type=quant_type,
-            expert_mask=expert_mask,
+            global_E,
+            model_dim,
+            dtype,
+            block_size_M,
+            expert_mask,
+            num_local_tokens,
+            moe_sorting_dispatch_policy,
+            return_local_topk_ids=need_local_topk_ids,
+            accumulate=not is_flydsl_stage2_reduce(metadata.stage2),
+            flat=metadata.flat,
         )
-
-    sorting_ret = moe_sorting(
-        topk_ids,
-        topk_weight,
-        global_E,
-        model_dim,
-        dtype,
-        block_size_M,
-        expert_mask,
-        num_local_tokens,
-        moe_sorting_dispatch_policy,
-        return_local_topk_ids=need_local_topk_ids,
-        accumulate=not is_flydsl_stage2_reduce(metadata.stage2),
-        flat=metadata.flat,
-    )
     if need_local_topk_ids:
         (
             sorted_ids,
@@ -792,9 +756,6 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 
 cfg_2stages = None
-# Per-tag tuned-cfg cache, indexed by `_tag` value (e.g., "mxfp4_guinterleave").
-# Populated lazily when get_2stage_cfgs is called with is_guinterleave=True.
-cfg_2stages_tagged: dict = {}
 # fmt: off
 fused_moe_1stage_dict = {
     "gfx942":
@@ -858,7 +819,7 @@ class MOEMetadata:
     fuse_quant: str = ""
     stage2_has_bias: bool = False
     flat: bool = False
-    pipeline: Optional[Callable] = None
+    mxfp4_hip: bool = False
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -1088,31 +1049,38 @@ def _empty_u8(device):
     return torch.empty((0,), dtype=torch.uint8, device=device)
 
 
-def _mxfp4_moe_run(
+def mxfp4_moe_run(
     hidden_states,
     w1,            # [E, 2*d_inter, d_hidden] packed MXFP4 (uint8 or float4_e2m1fn_x2)
     w2,            # [E, d_hidden, d_inter]   packed MXFP4
-    topk_ids,
-    topk_weight,
     topk,
+    # stage1 slot: raw topk arrives via sorted_ids/sorted_weights; the rest of
+    # the sorted_*/moe_buf/isG1U1/block_size_M slots are unused.
+    sorted_ids,
+    sorted_weights,
+    sorted_expert_ids=None,
+    num_valid_ids=None,
+    moe_buf=None,
+    isG1U1=None,
+    block_size_M=None,
     *,
     kernelName1: str = "",
     kernelName2: str = "",
+    activation=ActivationType.Silu,
+    quant_type=QuantType.per_1x32,
+    q_dtype_a=None,
+    q_dtype_w=None,
     w1_scale=None,
     w2_scale=None,
     a1_scale=None,
     a2_scale=None,
-    block_size_M=None,
     num_local_tokens=None,
     M=None,
     device=None,
     doweight_stage1=False,
-    activation=ActivationType.Silu,
-    quant_type=QuantType.per_1x32,
-    expert_mask=None,
-    q_dtype_a=None,
-    q_dtype_w=None,
 ):
+    topk_ids = sorted_ids
+    topk_weight = sorted_weights
     # ── Parse kernel names + read shapes ──────────────────────────────
     p1 = _parse_mxfp4_g1_kname(kernelName1)
     p2 = _parse_mxfp4_g2_kname(kernelName2)
@@ -1135,9 +1103,6 @@ def _mxfp4_moe_run(
     D_INTER  = w1.shape[1] // 2
     M, _ = hidden_states.shape
     device   = hidden_states.device
-
-    if expert_mask is not None:
-        raise NotImplementedError("mxfp4_moe: expert_mask (EP) not supported yet")
 
     # ── max_sorted: tight upper bound on cumsum (sum over experts of
     #     round_up(count_e, BM)). Drives all sort buffer sizes ─────────────
@@ -1369,15 +1334,9 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
-    is_guinterleave=False,
     is_ep=False,
 ):
-    """
-    `is_guinterleave`: when True, prefer CSV rows tagged "mxfp4_guinterleave"
-    (`_tag == "mxfp4_guinterleave"`) over the default untagged rows.
-    """
     gate_mode = GateMode(gate_mode)
-    tag = "mxfp4_guinterleave" if is_guinterleave else None
     _INDEX_COLS = [
         "cu_num",
         "token",
@@ -1392,21 +1351,30 @@ def get_2stage_cfgs(
         "q_type",
         "use_g1u1",
         "doweight_stage1",
+        # INTERLEAVE rows (mxfp4) vs everything else: only this split is keyed.
+        "gate_mode",
     ]
 
-    def get_cfg_2stages(tune_file, tag=""):
-        """Build (primary, fallback) lookup dicts for one `_tag` value.
-        Default ``tag=""`` returns the untagged rows (legacy behaviour);
-        passing e.g. ``tag="mxfp4_guinterleave"`` returns the rows the mxfp4
-        guinterleave backend ships."""
+    def _norm_gate_mode_col(df):
+        # CSV carries gate_mode only for INTERLEAVE (mxfp4) rows; collapse anything
+        # else (missing column, merge-fill, other modes) to "separated".
+        if "gate_mode" in df.columns:
+            df["gate_mode"] = df["gate_mode"].where(
+                df["gate_mode"] == "interleave", "separated"
+            )
+        else:
+            df["gate_mode"] = "separated"
+        return df
+
+    def get_cfg_2stages(tune_file):
+        """Build (primary, fallback) lookup dicts. Excludes flydsl_fallback rows
+        (loaded separately); mxfp4 rows are kept and disambiguated by gate_mode."""
         import pandas as pd
 
         df = pd.read_csv(tune_file)
+        df = _norm_gate_mode_col(df)
         if "_tag" in df.columns:
-            df = df[df["_tag"].fillna("") == tag]
-        elif tag != "":
-            # CSV has no `_tag` column → no tagged rows exist.
-            return ({}, {})
+            df = df[df["_tag"].fillna("") != "flydsl_fallback"]
 
         # Primary dict: keep original act_type for exact-match lookup.
         df_primary = df.copy()
@@ -1449,6 +1417,7 @@ def get_2stage_cfgs(
         if "_tag" not in df.columns:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
+        df = _norm_gate_mode_col(df)
         if "act_type" in df.columns:
             df["act_type"] = _ACT_TYPE_DISABLED_KEY
         fb_df = df[df["_tag"] == "flydsl_fallback"]
@@ -1466,21 +1435,19 @@ def get_2stage_cfgs(
         _flydsl_fallback_cache[tune_file] = result
         return result
 
-    global cfg_2stages, cfg_2stages_tagged
+    global cfg_2stages
     config_path = os.path.dirname(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
     tune_file = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
-    # Lazy-load per-tag tuned dicts (e.g., tag="mxfp4_guinterleave").
-    if tag and tag not in cfg_2stages_tagged:
-        cfg_2stages_tagged[tag] = get_cfg_2stages(tune_file, tag=tag)
     cu_num = get_cu_num()
     # EP convention: callers append one always-masked fake-expert slot to
     # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
     # on routed_topk; strip the fake slot before building the lookup key.
     topk -= int(is_ep)
+    key_gate_mode = "interleave" if gate_mode == GateMode.INTERLEAVE else "separated"
     keys = (
         cu_num,
         token,
@@ -1495,6 +1462,7 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
+        key_gate_mode,
     )
     keys_disabled = (
         cu_num,
@@ -1510,6 +1478,7 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
+        key_gate_mode,
     )
 
     def MainFunc():
@@ -1553,12 +1522,7 @@ def get_2stage_cfgs(
                     break
         return result
 
-    # Backend-tagged rows (if requested) win over the default untagged rows.
-    cfg = None
-    if tag:
-        cfg = _lookup_cfg(cfg_2stages_tagged.get(tag))
-    if cfg is None:
-        cfg = _lookup_cfg(cfg_2stages)
+    cfg = _lookup_cfg(cfg_2stages)
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_name = re.sub(r"[^\w.\-]", "_", str(keys))
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{lock_name}")
@@ -1703,15 +1667,18 @@ def get_2stage_cfgs(
         except ValueError:
             _bm = int(block_m) if block_m is not None else BLOCK_SIZE_M
         return MOEMetadata(
-            stage1=None,
-            stage2=None,
-            block_m=_bm,
-            ksplit=int(ksplit),
-            pipeline=functools.partial(
-                _mxfp4_moe_run,
+            functools.partial(
+                mxfp4_moe_run,
                 kernelName1=kernelName1,
                 kernelName2=kernelName2,
+                activation=activation,
+                quant_type=q_type,
             ),
+            None,
+            _bm,
+            int(ksplit),
+            run_1stage=True,
+            mxfp4_hip=True,
         )
 
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
