@@ -321,6 +321,7 @@ def replay_one(path, dev="cuda"):
     s1_split_diag = ""
     s1_geom_diag = ""
     s1_nan_geom = []
+    s1_ok_geom = []
     lg2, lse2 = _stage1_partials(b, dev, 2)
     if lg2 is not None:
         s1_logits_fin = bool(torch.isfinite(lg2).all().item())
@@ -331,13 +332,28 @@ def replay_one(path, dev="cuda"):
             lse_fin_per_split = torch.isfinite(lse2).all(dim=3).all(dim=2).all(dim=0).cpu()
             bad_logit_splits = (~lg_fin_per_split).nonzero().reshape(-1).tolist()
             bad_lse_splits = (~lse_fin_per_split).nonzero().reshape(-1).tolist()
+            # classify: +inf in logits => exp(big +score) overflow (running-max
+            # m is stale/wrong); pure NaN w/o inf => 0/0 (all-masked / zero-sum).
+            n_posinf = int((lg2 == float("inf")).sum().item())
+            n_neginf = int((lg2 == float("-inf")).sum().item())
+            n_nan = int(torch.isnan(lg2).sum().item())
+            lse_posinf = int((lse2 == float("inf")).sum().item())
+            kind = (
+                "OVERFLOW(+inf -> bad running-max)"
+                if (n_posinf or lse_posinf)
+                else "0/0 NaN (zero-sum / all-masked)"
+            )
             s1_split_diag = (
                 f"stage1 NaN: logits_bad_splits={bad_logit_splits} "
                 f"lse_bad_splits={bad_lse_splits} "
+                f"logits[+inf={n_posinf} -inf={n_neginf} nan={n_nan}] "
+                f"lse[+inf={lse_posinf}] kind={kind} "
                 f"(=> asm stage1 wrote NaN; stage2 exonerated)"
             )
             # correlate NaN batches with kernel page geometry
-            s1_nan_geom, _ok, s1_geom_diag = _stage1_per_batch_diag(b, lg2, lse2)
+            s1_nan_geom, s1_ok_geom, s1_geom_diag = _stage1_per_batch_diag(
+                b, lg2, lse2
+            )
     # Per-row (per-token) finiteness of forced split=2, mapped back to its batch
     # so we can correlate NaN rows with that batch's KV length (pages). If NaNs
     # cluster on SHORT batches, the empty per-batch split is the culprit.
@@ -381,6 +397,7 @@ def replay_one(path, dev="cuda"):
         "stage1_diag": s1_split_diag,
         "stage1_geom_diag": s1_geom_diag,
         "stage1_nan_geom": s1_nan_geom,
+        "stage1_ok_geom": s1_ok_geom,
         "nan_diag": nan_diag,
         "cos1_ref": _cos(o1c, ref) if f1 else float("nan"),
         "cos2_ref": _cos(o2c, ref) if f2 else float("nan"),
@@ -501,6 +518,33 @@ def main(arg):
             for g in all_nan_geom:
                 fp_par[g["full_pages"] % 2] = fp_par.get(g["full_pages"] % 2, 0) + 1
             print(f"  full_pages%2 -> count : {dict(sorted(fp_par.items()))}")
+
+            # DECISIVE: does the SAME (full_pages, tail_len) geometry appear in
+            # BOTH NaN and OK batches? Geometry fully determines kernel control
+            # flow, so a collision => NaN is DATA-dependent (numerical overflow
+            # in the multi-pass softmax/accumulator), NOT a control-flow/masking
+            # bug. No collision => geometry alone triggers it (control-flow bug).
+            all_ok_geom = []
+            for r in worst:
+                all_ok_geom.extend(r.get("stage1_ok_geom") or [])
+            nan_keys = set((g["full_pages"], g["tail_len"]) for g in all_nan_geom)
+            ok_keys = set((g["full_pages"], g["tail_len"]) for g in all_ok_geom)
+            collide = sorted(nan_keys & ok_keys)
+            print(
+                f"\n  (full_pages,tail_len) keys: nan-only={len(nan_keys - ok_keys)} "
+                f"ok-only={len(ok_keys - nan_keys)} BOTH={len(collide)}"
+            )
+            if collide:
+                print(
+                    "  >>> COLLISION: same geometry is BOTH NaN and OK -> NaN is "
+                    "DATA-dependent (numerical), not control-flow."
+                )
+                print(f"      sample colliding (full_pages,tail_len): {collide[:12]}")
+            else:
+                print(
+                    "  >>> NO collision: geometry alone determines NaN -> "
+                    "control-flow/masking bug."
+                )
 
         topn = sorted(worst, key=lambda r: -(r["relerr2_1"] if r["relerr2_1"] == r["relerr2_1"] else -1))[:10]
         print("\n=== worst 10 by max-rel-err(split2 vs split1) ===")

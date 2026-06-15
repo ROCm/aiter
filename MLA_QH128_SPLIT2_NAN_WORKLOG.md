@@ -185,6 +185,39 @@ asm stage1 多 pass 路径。
 **多 pass 流水线 overlap 路径里，对特定页数序列的 K/V 数据通路或累加器/LDS slot 的破坏**
 （计算出 inf→exp 溢出→NaN），而非标量页计费/掩码。
 
+### 4.1.1 几何关联实测：NaN 是**数据相关数值问题**，不是控制流（已确认）
+
+pooled 关联结果（40 dump、640 个 NaN batch）：
+
+```
+full_pages -> 10:5, 11:228, 12:312, 13:79, 14:16
+tail_len   -> 铺满 0..63（每值 8~14）
+tail_owner -> 0:333, 1:307
+loop0      -> 5:5, 6:540, 7:95     loop1 -> 5:233, 6:391, 7:16
+full_pages%2 -> {0:333, 1:307}
+```
+
+**关键判读**：NaN 与 OK 的几何特征**大面积重叠**——`full_pages∈{11,12,13,14}`、
+`tail_owner∈{0,1}`、`tail_len` 全段、`full_pages%2` 两种奇偶都同时出现在 NaN 与 OK。
+由于 `(full_pages, tail_len)` 完全决定内核控制流，**同一几何同时为 NaN 和 OK** ⇒
+**NaN 与控制流/掩码/页计费无关，是数据相关的数值问题**（同样的指令路径，K/Q/V 数值不同，
+一条溢出、一条正常）。这与 §4.1 静态核对「标量页/掩码/寻址全对」完全吻合。
+
+进一步约束：
+- `softmax_init()`（sp3 6399，置 `_v_FA_Max=NEG_INF`）与 `causal_init()`（6400）在
+  **wave/loop_cnt 分支之前的公共入口**，两 split 都执行 → 「行最大值未初始化」被排除。
+- split=1 与 split=2 共用同一套 bootstrap + `core_loop`，仅 `passes`（页步进）不同；
+  split=1 全程 finite ⇒ bug **只在 `passes>1` 的数值行为**里。
+
+**最可能机理**：在线 softmax 的**运行最大值 `m` 在 passes>1 的流水线 bootstrap 里出现
+时序错位**（exp 用到尚未并入当前 strided 页最大值的「陈旧 `m`」），对「新页分数显著大于
+陈旧 `m`」的序列 `exp(score-m)` 溢出成 `+inf` → `inf` 传播成 `NaN`；分数偏小的序列恰好不溢出。
+- 已加 inf/nan 分型探针：若 `logits[+inf]>0` ⇒ 坐实溢出（运行最大值失效）；
+  若纯 `nan` 无 inf ⇒ 0/0（零和/全掩）。**先看这一行再决定改哪段指令**。
+- 若确为溢出：定位 sp3 `core_loop` / `bootstrap_wave_0/1` 内 `mla_softmax` 与 `GEMMK`、
+  `_v_FA_Max` 更新之间的 `s_wait_*` / 发射顺序（6453-6494 / 6530-6571），
+  对比 passes=1 的等价时序，修正 `m` 更新与 `exp` 的先后。
+
 ### 4.2 用页几何关联锁定触发条件（新增工具）
 
 `replay_mla_split_compare.py` 已新增 `_kernel_geom()` + `_stage1_per_batch_diag()`：
