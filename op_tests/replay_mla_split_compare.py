@@ -99,6 +99,71 @@ def _run_split(b, dev, num_kv_splits, force=True):
     return o
 
 
+def _stage1_partials(b, dev, num_kv_splits):
+    """Run ONLY stage1 (asm) and return per-split (logits, attn_lse) so we can
+    check whether NaN already exists in the partials BEFORE the triton stage2
+    reduce. Mirrors the host-side buffer allocation in mla.mla_decode_fwd.
+
+    The buffers are pre-seeded with a finite *empty-split* sentinel
+    (data=0, lse=-1e20); any non-finite value afterwards was WRITTEN by stage1,
+    which decisively places the NaN in the asm kernel (not in stage2 / not an
+    uninitialized read). Returns (logits, attn_lse) or (None, None) on failure.
+    """
+    try:
+        q = b["q"].to(dev)
+        seg_kv = b["kv_compact"].to(dev).contiguous()
+        o = torch.zeros_like(b["o_server"]).to(dev)
+        qo_indptr = b["qo_indptr"].to(dev).to(torch.int32)
+        kv_indptr = b["kv_indptr"].to(dev).to(torch.int32)
+        kv_indices = b["kv_indices"].to(dev).to(torch.int32)
+        kv_last = b["kv_last_page_lens"].to(dev).to(torch.int32)
+        q_scale_t = b["q_scale"].to(dev) if b["q_scale"] is not None else None
+        kv_scale_t = b["kv_scale"].to(dev) if b["kv_scale"] is not None else None
+        bs = kv_indptr.numel() - 1
+        indptr = torch.arange(
+            0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int32
+        ).to(dev)
+        total_s, nhead, v_head_dim = o.shape
+        logits = torch.empty(
+            (total_s, num_kv_splits, nhead, v_head_dim),
+            dtype=torch.float32,
+            device=dev,
+        )
+        attn_lse = torch.empty(
+            (total_s, num_kv_splits, nhead, 1), dtype=torch.float32, device=dev
+        )
+        # finite empty-split sentinel: any NaN/Inf left after stage1 was written
+        # by the asm kernel itself.
+        logits.fill_(0.0)
+        attn_lse.fill_(-1.0e20)
+        aiter.mla_decode_stage1_asm_fwd(
+            q,
+            seg_kv,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last,
+            indptr,
+            None,
+            None,
+            None,
+            b["max_q_len"],
+            b["page_size"],
+            1,  # nhead_kv
+            b["sm_scale"],
+            logits,
+            attn_lse,
+            o,
+            None,  # final_lse
+            q_scale_t,
+            kv_scale_t,
+        )
+        return logits, attn_lse
+    except Exception as e:  # noqa: BLE001 - diagnostic, never fatal
+        print(f"    [stage1-probe] failed: {type(e).__name__}: {e}")
+        return None, None
+
+
 def _fp32_ref(b, dev):
     """fp32 ground-truth MLA decode attention (decode_qlen=1)."""
     page_size = b["page_size"]
@@ -171,6 +236,27 @@ def replay_one(path, dev="cuda"):
     kvi = b["kv_indptr"].to(torch.int64)
     per_batch_pages = (kvi[1:] - kvi[:-1])
     max_pages = int(per_batch_pages.max().item())
+
+    # --- Probe stage1 partials for split=2 BEFORE the stage2 reduce. ---
+    # Decisive attribution: if NaN already exists in (logits|attn_lse) here, the
+    # asm stage1 kernel produced it (stage2 / seg-layout-of-stage2 exonerated).
+    s1_logits_fin = s1_lse_fin = None
+    s1_split_diag = ""
+    lg2, lse2 = _stage1_partials(b, dev, 2)
+    if lg2 is not None:
+        s1_logits_fin = bool(torch.isfinite(lg2).all().item())
+        s1_lse_fin = bool(torch.isfinite(lse2).all().item())
+        if not (s1_logits_fin and s1_lse_fin):
+            # which split index carries the NaN? reduce over (s, head, dv).
+            lg_fin_per_split = torch.isfinite(lg2).all(dim=3).all(dim=2).all(dim=0).cpu()
+            lse_fin_per_split = torch.isfinite(lse2).all(dim=3).all(dim=2).all(dim=0).cpu()
+            bad_logit_splits = (~lg_fin_per_split).nonzero().reshape(-1).tolist()
+            bad_lse_splits = (~lse_fin_per_split).nonzero().reshape(-1).tolist()
+            s1_split_diag = (
+                f"stage1 NaN: logits_bad_splits={bad_logit_splits} "
+                f"lse_bad_splits={bad_lse_splits} "
+                f"(=> asm stage1 wrote NaN; stage2 exonerated)"
+            )
     # Per-row (per-token) finiteness of forced split=2, mapped back to its batch
     # so we can correlate NaN rows with that batch's KV length (pages). If NaNs
     # cluster on SHORT batches, the empty per-batch split is the culprit.
@@ -209,6 +295,9 @@ def replay_one(path, dev="cuda"):
         "kv_indptr": b["kv_indptr"].tolist(),
         "finite1": f1,
         "finite2": f2,
+        "stage1_logits_finite": s1_logits_fin,
+        "stage1_lse_finite": s1_lse_fin,
+        "stage1_diag": s1_split_diag,
         "nan_diag": nan_diag,
         "cos1_ref": _cos(o1c, ref) if f1 else float("nan"),
         "cos2_ref": _cos(o2c, ref) if f2 else float("nan"),
@@ -246,6 +335,8 @@ def main(arg):
             f"{r['name']:42s} {r['bs']:>3d} {r['pages']:>4d} {str(r['finite1']):>4s} {str(r['finite2']):>4s} "
             f"{r['cos1_ref']:>10.6f} {r['cos2_ref']:>10.6f} {r['cos2_1']:>10.6f} {r['relerr2_1']:>10.4f}"
         )
+        if r.get("stage1_diag"):
+            print(f"    -> {r['stage1_diag']}")
         if r.get("nan_diag") and diag_printed < 5:
             print(f"    -> {r['nan_diag']}")
             diag_printed += 1
@@ -275,6 +366,33 @@ def main(arg):
             print(f"mean cos(split2, fp32_ref) = {statistics.mean(c2):.6f}  min = {min(c2):.6f}")
         n_nonfinite2 = sum(1 for r in worst if not r["finite2"])
         print(f"non-finite split2 outputs: {n_nonfinite2}/{len(worst)}")
+
+        # Stage1-partial attribution summary: of the dumps whose split=2 OUTPUT
+        # is non-finite, how many already had NaN in the stage1 PARTIALS?
+        probed = [r for r in worst if r.get("stage1_logits_finite") is not None]
+        if probed:
+            s1_nan = sum(
+                1
+                for r in probed
+                if not (r["stage1_logits_finite"] and r["stage1_lse_finite"])
+            )
+            print(
+                f"stage1-partial probe: {s1_nan}/{len(probed)} dumps have NaN in "
+                f"stage1 (logits|attn_lse) BEFORE stage2."
+            )
+            out_nan_s1_nan = sum(
+                1
+                for r in probed
+                if (not r["finite2"])
+                and not (r["stage1_logits_finite"] and r["stage1_lse_finite"])
+            )
+            out_nan = sum(1 for r in probed if not r["finite2"])
+            if out_nan:
+                print(
+                    f"  of {out_nan} dumps with non-finite split2 OUTPUT, "
+                    f"{out_nan_s1_nan} already had NaN in stage1 partials "
+                    f"(=> asm stage1 root cause; stage2 reduce exonerated)."
+                )
 
         topn = sorted(worst, key=lambda r: -(r["relerr2_1"] if r["relerr2_1"] == r["relerr2_1"] else -1))[:10]
         print("\n=== worst 10 by max-rel-err(split2 vs split1) ===")

@@ -39,6 +39,21 @@ dump 默认输出目录 `~/mla_decode_dump`（可用 `MLA_DUMP_DIR` 覆盖）。
 cd /app/aiter && python op_tests/replay_mla_split_compare.py ~/mla_decode_dump
 ```
 
+#### 2.2.1 stage1-partial NaN 探针（新增）
+
+为把 NaN **决定性地**归因到 stage1（asm）还是 stage2（triton reduce），脚本新增
+`_stage1_partials()`：对每个 dump 在 `num_kv_splits=2` 下**只跑 stage1**
+（`aiter.mla_decode_stage1_asm_fwd`，参数顺序与 `mla.py` 完全一致），返回每个 split 的
+`logits`/`attn_lse` partial 缓冲。缓冲先用「空 split 安全哨兵」预置（`logits=0`、
+`attn_lse=-1e20`），因此 stage1 跑完后**任何非有限值都只可能是 stage1 主动写入的**
+（既排除未初始化读取，也排除 stage2）。
+
+输出新增：
+- 每条 dump 若 stage1 partial 含 NaN，打印 `logits_bad_splits` / `lse_bad_splits`（哪个 split 槽出错）；
+- 汇总行 `stage1-partial probe: N/M dumps have NaN in stage1 ... BEFORE stage2`，
+  以及「输出为 NaN 的 dump 中有多少在 stage1 partial 已是 NaN」。
+- 预期：**stage1 partial 已 NaN ⇒ stage2 reduce 与 seg 布局被排除，根因坐实在 asm stage1 多 pass 路径**。
+
 ### 2.3 观测到的结果
 
 ```
@@ -89,6 +104,25 @@ fp32 中间量是设计如此（多 split 累加需 fp32），**无格式/类型
 结果**完全不变**（仍 40/40 NaN，nan 序列/数值逐字节一致）。
 → 说明 stage1 **主动往第 2 个 split 槽写入了 NaN**（不是读未初始化内存），主机 buffer 兜底会被覆盖。
 （注：该 C-a 改动目前仍保留在 `app/aiter/aiter/mla.py`，验证纯 kernel 修复时建议先回退它。）
+
+### 3.5 stage2 reduce 与 ATOM 接口排查（确认无关）
+
+复核了 reduce（stage2）以及 ATOM 主机侧接口，二者**不是根因，无需为 seg 布局改动**：
+
+- **stage2 kernel 对 seg 布局无感**（`aiter/mla.py` 行 333–359，`_fwd_kernel_stage2_asm`）：
+  它只消费 stage1 产出的 `logits`/`attn_lse`（标准 `[total_s, n_splits, nhead, v_head_dim]`
+  / `[..., 1]` 布局）做 online-softmax 合并，**完全不直接读 seg KV cache**。
+  入参里只有 `kv_indptr`/`kv_last_page_lens`/`num_kv_splits_indptr` 与 `page_size`、
+  `KV_INDPTR_IS_PAGE_LEVEL=page_size>1`，没有任何 nope/pe 段偏移逻辑——
+  seg 与非 seg 在 stage2 看来是同一份中间张量。
+- **stage1-partial 探针（§2.2.1）已证实**：split=2 输出的 NaN 在 **stage2 之前**就存在于
+  partial 缓冲里，stage2 只是把已是 NaN 的 partial 合并下去 → **stage2 不产生、也无法修复 NaN**。
+- **ATOM 接口结构正确**：`attention_mla.py` 用 `_seg_kv_cache_view` 正确 reshape seg KV，
+  以正确 `page_size`/`kv_indices` 调用 `mla_decode_fwd`；`num_kv_splits=2` + `indptr=None`
+  时由 `get_meta_param` 在运行时按序列长度/批大小 clamp，接口语义无误。
+
+结论：**stage2 与 ATOM 接口均无需为 seg 布局或 split=2 做改动**；唯一需修复的是 §4 的
+asm stage1 多 pass 路径。
 
 ## 4. sp3 问题定位（`mla_a8w8_qh64_1tg_16mx4_64nx1_np.sp3`）
 
@@ -142,4 +176,5 @@ split=1 既正确、精度又更高（0.944）。
 - 部署 .co：`app/aiter/hsa/gfx1250/mla/mla_a8w8_qh128_1tg_16mx4_64nx1_np.co`
 - 空 split 修复说明：`poc_kl/mi400/mla/shaders/empty_split_worklog.md`
 - 复现脚本：`app/aiter/op_tests/replay_mla_split_compare.py`
+  （含 `_stage1_partials` stage1-partial NaN 探针，见 §2.2.1）
 - dump 工具：`app/ATOM/atom/utils/mla_decode_dump.py`（新增 `ATOM_MLA_DUMP_MIN_PAGES`）
