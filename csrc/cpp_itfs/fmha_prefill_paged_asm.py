@@ -34,6 +34,7 @@ def compile(func_name: str = None):
         # kernel CK is not needed, so redirect CK_DIR to a guaranteed-empty dir.
         _orig_ck_dir = _utils_mod.CK_DIR
         with tempfile.TemporaryDirectory() as _tmp:
+            os.makedirs(os.path.join(_tmp, "include"), exist_ok=True)
             _utils_mod.CK_DIR = _tmp
             try:
                 result = compile_template_op(
