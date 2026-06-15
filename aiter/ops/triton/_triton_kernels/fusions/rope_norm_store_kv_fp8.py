@@ -28,8 +28,8 @@ def _rope_norm_store_kv_fp8_compute_pos_slot_kernel(
     row index for each output row (needed by the FP8 kernel to address the
     [num_req, num_q_heads, max_seqlens_pad128] q_scale_out tensor in prefill).
 
-    Skips writes for padding requests (seq_len == 0); callers must pre-fill
-    slot_indices with -1 to mark untouched rows as invalid.
+    Writes sentinel defaults for padding requests (seq_len == 0), so callers
+    can pass uninitialized output buffers.
     """
     req = tl.program_id(0)
     start = tl.load(q_index_ptr + req).to(tl.int32)
@@ -37,26 +37,26 @@ def _rope_norm_store_kv_fp8_compute_pos_slot_kernel(
     seq_len = tl.load(num_seqlen_per_req_ptr + req).to(tl.int32)
     num_rows_req = end - start
 
-    if (seq_len > 0) & (num_rows_req > 0):
-        pos_offset = seq_len - end
-        num_chunks = tl.cdiv(num_rows_req, BLOCK_R)
-        for chunk in tl.range(0, num_chunks):
-            row_local = chunk * BLOCK_R + tl.arange(0, BLOCK_R)
-            mask = row_local < num_rows_req
-            row = start + row_local
-            token_pos = row + pos_offset
-            block_idx = token_pos // BLOCK_SIZE
-            block_row = token_pos % BLOCK_SIZE
-            phys_block = tl.load(
-                kvcache_indices_ptr + req * stride_kvi_r + block_idx * stride_kvi_b,
-                mask=mask, other=0,
-            ).to(tl.int64)
-            slot = phys_block * BLOCK_SIZE + block_row.to(tl.int64)
-            tl.store(positions_ptr + row, token_pos, mask=mask)
-            tl.store(slot_indices_ptr + row, slot, mask=mask)
-            req_vec = tl.full([BLOCK_R], req, tl.int32)
-            tl.store(req_ids_ptr + row, req_vec, mask=mask)
-            tl.store(local_idx_ptr + row, row_local, mask=mask)
+    valid_req = seq_len > 0
+    pos_offset = seq_len - end
+    num_chunks = tl.cdiv(num_rows_req, BLOCK_R)
+    for chunk in tl.range(0, num_chunks):
+        row_local = chunk * BLOCK_R + tl.arange(0, BLOCK_R)
+        mask = row_local < num_rows_req
+        row = start + row_local
+        token_pos = row + pos_offset
+        block_idx = token_pos // BLOCK_SIZE
+        block_row = token_pos % BLOCK_SIZE
+        phys_block = tl.load(
+            kvcache_indices_ptr + req * stride_kvi_r + block_idx * stride_kvi_b,
+            mask=mask & valid_req, other=0,
+        ).to(tl.int64)
+        slot = phys_block * BLOCK_SIZE + block_row.to(tl.int64)
+        tl.store(positions_ptr + row, tl.where(valid_req, token_pos, 0), mask=mask)
+        tl.store(slot_indices_ptr + row, tl.where(valid_req, slot, -1), mask=mask)
+        req_vec = tl.full([BLOCK_R], req, tl.int32)
+        tl.store(req_ids_ptr + row, tl.where(valid_req, req_vec, 0), mask=mask)
+        tl.store(local_idx_ptr + row, tl.where(valid_req, row_local, 0), mask=mask)
 
 
 @triton.jit

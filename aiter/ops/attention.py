@@ -516,6 +516,8 @@ def _pa_fp8_decode_v2(
     v_scale: torch.Tensor,
     p_scale: torch.Tensor,
     p_scale_inv: torch.Tensor,
+    p_scale_value: float,
+    p_scale_inv_value: float,
     num_seqs: int,
     num_kv_heads: int,
     num_q_heads: int,
@@ -529,11 +531,11 @@ def _pa_fp8_decode_v2(
 
 
 def _pa_fp8_p_scale_tensors(
-    p_scale: Optional[torch.Tensor],
-    p_scale_inv: Optional[torch.Tensor],
+    p_scale: Optional[torch.Tensor | float],
+    p_scale_inv: Optional[torch.Tensor | float],
     device: torch.device,
     num_q_heads: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
     # p_scale is OPT-IN.  On gfx942 the in-kernel P fp8 pack is e4m3fnuz
     # (max magnitude 240), so the documented p_scale=256 default (an e4m3fn /
     # gfx950 value) overflows and produces NaNs for max-probability rows.  When
@@ -542,15 +544,28 @@ def _pa_fp8_p_scale_tensors(
     # Page_Attetion_GQA_fp8 default (p_scale off unless explicitly requested).
     if p_scale is None and p_scale_inv is None:
         empty = torch.empty(0, dtype=torch.float32, device=device)
-        return empty, empty
+        return empty, empty, 0.0, 0.0
     if p_scale is None or p_scale_inv is None:
         raise ValueError("p_scale and p_scale_inv must either both be set or both be None")
+    if not isinstance(p_scale, torch.Tensor) or not isinstance(p_scale_inv, torch.Tensor):
+        if isinstance(p_scale, torch.Tensor) or isinstance(p_scale_inv, torch.Tensor):
+            raise ValueError(
+                "p_scale and p_scale_inv must both be tensors or both be scalar values"
+            )
+        empty = torch.empty(0, dtype=torch.float32, device=device)
+        p_scale_value = float(p_scale)
+        p_scale_inv_value = float(p_scale_inv)
+        if p_scale_value <= 0.0 or p_scale_inv_value <= 0.0:
+            raise ValueError("scalar p_scale and p_scale_inv must be positive")
+        return empty, empty, p_scale_value, p_scale_inv_value
     if p_scale.numel() == 1 and p_scale_inv.numel() == 1:
         return (
             p_scale.to(device=device, dtype=torch.float32).reshape(1).expand(num_q_heads).contiguous(),
             p_scale_inv.to(device=device, dtype=torch.float32).reshape(1).expand(num_q_heads).contiguous(),
+            0.0,
+            0.0,
         )
-    return p_scale, p_scale_inv
+    return p_scale, p_scale_inv, 0.0, 0.0
 
 
 def _pa_fp8_v2_splits(num_seqs: int, num_kv_heads: int, mtp: int) -> int:
@@ -605,8 +620,8 @@ def pa_fp8_gqa_decode(
     q_scale: Optional[torch.Tensor] = None,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
-    p_scale: Optional[torch.Tensor] = None,
-    p_scale_inv: Optional[torch.Tensor] = None,
+    p_scale: Optional[torch.Tensor | float] = None,
+    p_scale_inv: Optional[torch.Tensor | float] = None,
 ) -> None:
     """Project-internal HIP FP8 GQA decode path."""
     num_query_tokens, num_q_heads, head_size = query.shape
@@ -627,7 +642,7 @@ def pa_fp8_gqa_decode(
     if q_scale is None:
         q_scale = torch.empty(0, dtype=torch.float32, device=query.device)
 
-    p_scale, p_scale_inv = _pa_fp8_p_scale_tensors(
+    p_scale, p_scale_inv, p_scale_value, p_scale_inv_value = _pa_fp8_p_scale_tensors(
         p_scale, p_scale_inv, query.device, num_q_heads)
 
     # nf (= grid.y) is BS-ONLY (fly-aligned): a pure function of (bs, mtp, hw),
@@ -669,6 +684,8 @@ def pa_fp8_gqa_decode(
         v_scale,
         p_scale,
         p_scale_inv,
+        p_scale_value,
+        p_scale_inv_value,
         num_seqs,
         num_kv_heads,
         num_q_heads,
