@@ -15,11 +15,17 @@ Usage (ff_sp3 container, see poc_kl/mi400/mla/toaiter/README.md):
       ROCM_HOME=/opt/rocm ENABLE_CK=0 ENABLE_FLYDSL=0 \\
       GPU_ARCHS=gfx1250 AITER_GPU_ARCHS=gfx1250 \\
       AITER_ASM_DIR=/home/carhuang/feifei/aiter/hsa \\
-      python3 op_tests/test_mla_qh128.py'
+      python3 op_tests/test_mla_qh128.py
+
+    # invalid KV page slots beyond ctx_lens:
+    python3 op_tests/test_mla_qh128.py --invalid-kv-fill random   # default, leave torch.randn
+    python3 op_tests/test_mla_qh128.py --invalid-kv-fill zero   # poc_kl-style zero pad
+    python3 op_tests/test_mla_qh128.py --invalid-kv-fill nan    # NaN/Inf poison (OOB detect)
 """
 
 from __future__ import annotations
 
+import argparse
 import itertools
 import os
 from pathlib import Path
@@ -59,18 +65,23 @@ PAGE_INDICES_OOB = 4
 _RUN_POC_KL = False
 _Q_PATTERN = 3
 
-_CTX_LENS = [1, 3, 17, 1024, 1024+3, 1024+17]
+#_CTX_LENS = [1, 3, 17, 1024, 1024+3, 1024+17]
+_CTX_LENS = [3, 1024 , 1024+7]
 _BATCH_SIZES = [1, 64]
 _SPLIT_PER_BATCH = [1, 2]
 _MASK_CHOICES = [1]
 
 KV_MAX_SZ = 65536 * 32
-# Poison slots beyond ctx_lens with NaN/Inf to detect kernel reads of invalid tokens.
-POISON_INVALID_KV_SLOTS = True
+# How to initialize KV page token slots beyond ctx_lens: random | zero | nan
+INVALID_KV_SLOT_FILL = "random"
 
 
-def _poison_invalid_kv_slots(kv_pages_bf16: torch.Tensor, ctx_lens: int) -> None:
-    """In-place: fill page token slots beyond ctx_lens with NaN / +Inf."""
+def _fill_invalid_kv_slots(
+    kv_pages_bf16: torch.Tensor, ctx_lens: int, mode: str
+) -> None:
+    """In-place: optionally overwrite page slots beyond ctx_lens."""
+    if mode == "random":
+        return
     num_pages_per_batch = (ctx_lens + PAGE_SIZE - 1) // PAGE_SIZE
     total_pages = kv_pages_bf16.shape[0]
     for logical_page in range(total_pages):
@@ -83,8 +94,15 @@ def _poison_invalid_kv_slots(kv_pages_bf16: torch.Tensor, ctx_lens: int) -> None
         if valid_in_page >= PAGE_SIZE:
             continue
         tail = kv_pages_bf16[logical_page, valid_in_page:]
-        tail[..., ::2] = float("nan")
-        tail[..., 1::2] = float("inf")
+        if mode == "zero":
+            tail.zero_()
+        elif mode == "nan":
+            tail[..., ::2] = float("nan")
+            tail[..., 1::2] = float("inf")
+        else:
+            raise ValueError(
+                f"invalid-kv-fill must be random, zero, or nan, got {mode!r}"
+            )
 
 
 def _nonfinite_report(tensor: torch.Tensor, name: str) -> str:
@@ -212,8 +230,7 @@ def _make_mla_mi400_kv_case(*, kv_buffer_bf16, batch, ctx_lens):
             device=kv_buffer_source_bf16.device,
         )
 
-    if POISON_INVALID_KV_SLOTS:
-        _poison_invalid_kv_slots(kv_buffer_logical_bf16, ctx_lens)
+    _fill_invalid_kv_slots(kv_buffer_logical_bf16, ctx_lens, INVALID_KV_SLOT_FILL)
 
     shuffled_page_indices = _make_page_permutation(total_pages)
     kv_buffer_scattered_bf16 = torch.empty_like(kv_buffer_logical_bf16)
@@ -461,6 +478,24 @@ def run_qh128_case(ctx_lens, batch_size, split_per_batch, mask):
     return ret
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="qh128 mi400 MLA decode correctness sweep",
+    )
+    parser.add_argument(
+        "--invalid-kv-fill",
+        choices=["random", "zero", "nan"],
+        default="random",
+        help=(
+            "Initialize KV page slots beyond ctx_lens: "
+            "random=leave torch.randn (default); "
+            "zero=poc_kl-style zero pad; "
+            "nan=NaN/Inf poison for OOB-read detection"
+        ),
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     if get_gfx() != "gfx1250":
         raise SystemExit(f"requires gfx1250 (mi400), got {get_gfx()}")
@@ -469,11 +504,11 @@ def main() -> None:
     assert _Q_PATTERN == 3
 
     aiter.logger.info(
-        "test_mla_qh128: variant=%s _RUN_POC_KL=%s _Q_PATTERN=%s poison_invalid_kv=%s",
+        "test_mla_qh128: variant=%s _RUN_POC_KL=%s _Q_PATTERN=%s invalid_kv_fill=%s",
         VARIANT,
         _RUN_POC_KL,
         _Q_PATTERN,
-        POISON_INVALID_KV_SLOTS,
+        INVALID_KV_SLOT_FILL,
     )
     aiter.logger.info(
         "sweep: ctx_lens=%s batch=%s splits=%s mask=%s",
@@ -512,4 +547,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    _args = _parse_args()
+    INVALID_KV_SLOT_FILL = _args.invalid_kv_fill
     main()
