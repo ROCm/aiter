@@ -754,7 +754,6 @@ def _compile_base_a8w4_gemm(
         stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
         kernel_tag=kernel_tag,
-        b_scale_layout="n4k8",
     )
 
 
