@@ -82,9 +82,7 @@ class TestFuseStage1Quant(unittest.TestCase):
         kn = "flydsl_moe1_afp4_wfp4_bf16_t64x128x256_w2"
         f = self._csv([kn + "_fp4"])
         with mock.patch.dict(os.environ, {"AITER_FUSE_STAGE1_QUANT": "1"}):
-            self.assertEqual(
-                _maybe_fuse_stage1_quant(kn, dtypes.fp4x2, f), kn + "_fp4"
-            )
+            self.assertEqual(_maybe_fuse_stage1_quant(kn, dtypes.fp4x2, f), kn + "_fp4")
 
     def test_flag_on_drops_bnt0_suffix(self):
         base = "flydsl_moe1_afp4_wfp4_bf16_t64x128x256_w2"
