@@ -35,6 +35,12 @@ from flydsl.runtime.device import get_rocm_arch
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 from .kernels.chunk_gated_delta_h_kv import compile_chunk_gated_delta_h_kv
 from .kernels.chunk_gated_delta_h_vk import compile_chunk_gated_delta_h_vk
+from .kernels.chunk_gated_delta_h_vk_naive import (
+    compile_chunk_gated_delta_h_vk_naive,
+)
+from .kernels.chunk_gated_delta_h_kv_naive import (
+    compile_chunk_gated_delta_h_kv_naive,
+)
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_chunk_offsets,
     prepare_num_chunks,
@@ -726,6 +732,87 @@ def _get_or_compile_vk(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_vk_naive(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+):
+    """Compile (and cache) the NAIVE (un-pipelined) VK-fork K5 kernel. Same
+    VWARP layout + coalesced h-store as the optimized VK fork, but with all
+    prefetch / software-pipeline scheduling removed -- for trace baselining."""
+    return compile_chunk_gated_delta_h_vk_naive(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_kv_naive(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+):
+    """Compile (and cache) the NAIVE (un-pipelined) KV-fork K5 kernel. Same
+    VWARP layout + coalesced KV h-store (h in [..., K, V], host returns a
+    transposed VK view) as the optimized KV fork, but with all prefetch /
+    software-pipeline scheduling removed -- for trace baselining."""
+    return compile_chunk_gated_delta_h_kv_naive(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
 def _resolve_state_dtype(initial_state, state_dtype):
     """Mirror the legacy state-dtype resolution. Cheap; runs every call."""
     if initial_state is not None:
@@ -764,6 +851,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     num_decode_tokens: int = 0,
     _use_kv: bool = False,
     _use_vk: bool = False,
+    _use_vk_naive: bool = False,
+    _use_kv_naive: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
 
@@ -879,22 +968,37 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         BT=BT,
     )
 
-    if _use_kv and _use_vk:
+    if (
+        int(bool(_use_kv))
+        + int(bool(_use_vk))
+        + int(bool(_use_vk_naive))
+        + int(bool(_use_kv_naive))
+    ) > 1:
         raise ValueError(
-            "FlyDSL K5: ``_use_kv`` and ``_use_vk`` are mutually exclusive; "
-            "pass at most one."
+            "FlyDSL K5: ``_use_kv`` / ``_use_vk`` / ``_use_vk_naive`` / "
+            "``_use_kv_naive`` are mutually exclusive; pass at most one."
         )
 
     # OPT-KV / OPT-VK: pick the separate VWARP kernel only when BV==64 (the
     # VWARP gate); otherwise the baseline kernel handles all configs. The KV
-    # fork stores h in [..., K, V] (coalesced) and returns a transposed VK
-    # view; the VK fork writes the public VK layout ([..., V, K]) directly.
-    _kv_active = bool(_use_kv) and (BV == 64)
+    # forks store h in [..., K, V] (coalesced) and return a transposed VK
+    # view; the VK forks write the public VK layout ([..., V, K]) directly.
+    # The *_naive variants are the un-pipelined forks (same VWARP layout +
+    # same h-store, all prefetch/pipeline scheduling removed).
+    _kv_opt_active = bool(_use_kv) and (BV == 64)
+    _kv_naive_active = bool(_use_kv_naive) and (BV == 64)
     _vk_active = bool(_use_vk) and (BV == 64)
-    if _kv_active:
+    _vk_naive_active = bool(_use_vk_naive) and (BV == 64)
+    # KV-class forks (h stored [..., K, V] -> host transposes to VK).
+    _kv_active = _kv_opt_active or _kv_naive_active
+    if _kv_opt_active:
         _compile_fn = _get_or_compile_kv
+    elif _kv_naive_active:
+        _compile_fn = _get_or_compile_kv_naive
     elif _vk_active:
         _compile_fn = _get_or_compile_vk
+    elif _vk_naive_active:
+        _compile_fn = _get_or_compile_vk_naive
     else:
         _compile_fn = _get_or_compile
     launch_fn = _compile_fn(
@@ -1084,4 +1188,85 @@ def chunk_gated_delta_rule_fwd_h_flydsl_vk(
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
         _use_vk=True,
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_vk_naive(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """NAIVE (un-pipelined) VK-fork K5 implementation. Same VWARP layout +
+    coalesced VK h-store as ``chunk_gated_delta_rule_fwd_h_flydsl_vk``, but with
+    all prefetch / software-pipeline scheduling removed -- used to baseline the
+    raw bottleneck structure in a trace before re-designing the pipeline. Used
+    only when the chosen BV is 64, else it falls back to the baseline."""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _use_vk_naive=True,
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_kv_naive(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """NAIVE (un-pipelined) KV-fork K5 implementation. Same VWARP layout +
+    coalesced KV h-store (h in [..., K, V], host returns a transposed VK view)
+    as ``chunk_gated_delta_rule_fwd_h_flydsl_kv``, but with all prefetch /
+    software-pipeline scheduling removed -- used to baseline the raw bottleneck
+    structure in a trace before re-designing the pipeline. Used only when the
+    chosen BV is 64, else it falls back to the baseline."""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _use_kv_naive=True,
     )
