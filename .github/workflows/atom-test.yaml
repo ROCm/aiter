@@ -99,7 +99,7 @@ jobs:
 
           runner_overrides = {
               "atom-mi355-8gpu.predownload": "linux-aiter-mi35x-8",
-              "linux-atom-do-mi350x-8": "linux-aiter-do-mi350x-8",
+              "linux-atom-do-mi350x-8": "linux-aiter-mi35x-8",
               "linux-atom-mi35x-4": "linux-aiter-mi35x-4",
               "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
           }

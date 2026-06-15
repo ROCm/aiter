@@ -408,7 +408,7 @@ template <typename T, std::enable_if_t<is_tuple_v<T> && !(is_tuple_v<tuple_eleme
 OPUS_H_D constexpr auto flatten_tuple(const T& t) { return t; }  // already flat
 template <typename T, std::enable_if_t<!is_tuple_v<T>, bool> = true>
 OPUS_H_D constexpr auto flatten_tuple(const T& t) { return flatten_tuple_general(t, make_index_seq<size<T>()>{}); }  // non-tuple (e.g. seq)
-namespace impl { // direct flatten for 1-level nested tuples — bypasses concat_tuple + explode_tuple
+namespace impl { // direct flatten for 1-level nested tuples -- bypasses concat_tuple + explode_tuple
 template<typename T, index_t... Gs> constexpr auto group_sizes(seq<Gs...>) { return seq<size<tuple_element_t<Gs, T>>()...>{}; }
 template<typename T, index_t... Gs> constexpr index_t group_total(seq<Gs...>) { return (size<tuple_element_t<Gs, T>>() + ...); }
 template<index_t J, index_t... Gs, index_t... Ns> constexpr index_t flat_group(seq<Gs...>, seq<Ns...>) { index_t acc = 0, r = 0; ((void)(acc += Ns, (acc <= J ? (void)(r = Gs + 1) : (void)0)), ...); return r; }
@@ -499,7 +499,7 @@ template <std::size_t I, typename... Ts> struct tuple_element<I, const opus::tup
 } // namespace std
 
 namespace opus {
-// fwd-decl mma adaptors — needed so make_tiled_mma() parses on archs (gfx12) where full defs are gated out.
+// fwd-decl mma adaptors -- needed so make_tiled_mma() parses on archs (gfx12) where full defs are gated out.
 struct mfma_adaptor; struct mfma_adaptor_swap_ab; struct wmma_adaptor; struct wmma_adaptor_swap_ab;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -700,11 +700,11 @@ template<typename Layout, index_t vec = 1> struct layout_load_traits {
     static constexpr auto issue_space = layout_to_issue_space<Layout>();
     static constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{}); static constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
 };
-// Runtime flat index → multi-index tuple (all index_t) — avoids per-iteration template instantiation
+// Runtime flat index -> multi-index tuple (all index_t) -- avoids per-iteration template instantiation
 template<index_t... Is, index_t... Ns> OPUS_H_D constexpr auto flat_to_coords(index_t flat, seq<Is...>, tuple<number<Ns>...>) {
     constexpr index_t strides[] = {impl::ford_stride<Is>(make_index_seq<sizeof...(Ns)>{}, seq<Ns...>{})...}, dims[] = {Ns...};
     return opus::make_tuple(static_cast<index_t>((flat / strides[Is]) % dims[Is])...); }
-// Pre-compute offsets via runtime loop — 1 coord_to_linear instantiation per layout instead of N
+// Pre-compute offsets via runtime loop -- 1 coord_to_linear instantiation per layout instead of N
 template<index_t vec, typename Layout> OPUS_H_D constexpr auto layout_to_offsets(const Layout& u) {
     using LT = layout_load_traits<Layout, vec>; constexpr auto issue_space_vec = LT::issue_space_vec;
     constexpr index_t num_issues = LT::r_elem.value, ndim = size<remove_cvref_t<decltype(issue_space_vec)>>();
@@ -1532,7 +1532,7 @@ OPUS_H_D constexpr index_t get_smem_size()
 
 // ---- Device intrinsic wrappers ----
 // Replace HIP runtime macros (threadIdx.x, __syncthreads, __all, etc.) so kernels compile
-// with just #include <opus/opus.hpp> — no <hip/hip_runtime.h> needed.
+// with just #include <opus/opus.hpp> -- no <hip/hip_runtime.h> needed.
 OPUS_D index_t thread_id_x() { return __builtin_amdgcn_workitem_id_x(); }
 OPUS_D index_t thread_id_y() { return __builtin_amdgcn_workitem_id_y(); }
 OPUS_D index_t thread_id_z() { return __builtin_amdgcn_workitem_id_z(); }
@@ -1627,7 +1627,7 @@ OPUS_D constexpr auto buffer_default_config() {
     return 0x00020000;
 #elif defined(__gfx103__)
     return 0x31014000;
-// gfx1200/gfx1201 (Navi 44/48) listed explicitly — __gfx11__/__gfx12__ are typos (clang predefines only uppercase __GFX11__/__GFX12__), so without this gfx1200/gfx1201 fall into the 0xffffffff sentinel and make_gmem<> stores silently drop.
+// gfx1200/gfx1201 (Navi 44/48) listed explicitly -- __gfx11__/__gfx12__ are typos (clang predefines only uppercase __GFX11__/__GFX12__), so without this gfx1200/gfx1201 fall into the 0xffffffff sentinel and make_gmem<> stores silently drop.
 #elif defined(__gfx11__) || defined(__gfx12__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)
     return 0x31004000;
 #else
@@ -1667,46 +1667,50 @@ struct gmem {
         else if constexpr (sizeof(type) == 16) { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os, s_os, aux)); }
     }
 
-    template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
-    OPUS_D void _async_load(OPUS_LDS_ADDR void* dst, int v_os, int s_os = 0, number<aux> = {}) {
+    // Async copy global -> LDS. Offsets are in bytes.
+    // IMPORTANT - i_os shifts BOTH ends of the copy, not just the source.
+    template<index_t vec = 1, index_t i_os = 0, index_t aux = 0>
+    OPUS_D void _async_load(OPUS_LDS_ADDR void* dst, int v_os, int s_os = 0, number<i_os> = {}, number<aux> = {}) {
         using type = vector_type<vec>;
 #if defined(__gfx1250__)
-        // gfx1250: global_load_async_to_lds (global addressing, not buffer rsrc)
+        static_assert(i_os >= 0 && i_os <= (1 << 23) - 1, "_async_load: i_os exceeds gfx1250 VGLOBAL IOFFSET range [0, 2^23 - 1]");
         #define GPTR_(T, p) ((__attribute__((address_space(1))) T*)(p))
         #define LPTR_(T, p) ((OPUS_LDS_ADDR T*)(p))
         {
             auto* src = raw_ptr + v_os + s_os;
-            if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), 0, 0); }
-            else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), 0, 0);
-                                                     __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src + 1), LPTR_(char, (char*)dst + 1), 0, 0); }
-            else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_global_load_async_to_lds_b32 (GPTR_(int, src), LPTR_(int, dst), 0, 0); }
-            else if constexpr (sizeof(type) == 8)  { __builtin_amdgcn_global_load_async_to_lds_b64 (GPTR_(i32x2_t, src), LPTR_(i32x2_t, dst), 0, 0); }
-            else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_global_load_async_to_lds_b128(GPTR_(i32x4_t, src), LPTR_(i32x4_t, dst), 0, 0); }
+            if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), i_os, 0); }
+            else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), i_os, 0);
+                                                     __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src + 1), LPTR_(char, (char*)dst + 1), i_os, 0); }
+            else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_global_load_async_to_lds_b32 (GPTR_(int, src), LPTR_(int, dst), i_os, 0); }
+            else if constexpr (sizeof(type) == 8)  { __builtin_amdgcn_global_load_async_to_lds_b64 (GPTR_(i32x2_t, src), LPTR_(i32x2_t, dst), i_os, 0); }
+            else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_global_load_async_to_lds_b128(GPTR_(i32x4_t, src), LPTR_(i32x4_t, dst), i_os, 0); }
         }
         #undef GPTR_
         #undef LPTR_
 #elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__)   // CDNA: buffer-load lands directly in LDS (vmem-to-lds-load-insts).
+        static_assert(i_os >= 0 && i_os <= (1 << 12) - 1, "_async_load: i_os exceeds CDNA MUBUF OFFSET range [0, 2^12 - 1]");
 #if __clang_major__ >= 20    // clang 20+ raw_ptr builtin (rocm 7.0+)
-        if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  4, v_os, s_os, 0, aux); }
+        if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  4, v_os, s_os, i_os, aux); }
 #if  defined(__gfx950__)
-        else if constexpr (sizeof(type) == 12) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 12, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 16, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 12) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 12, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 16, v_os, s_os, i_os, aux); }
 #endif
 #else
         i32x4_t cached_rsrc_;
         __builtin_memcpy(&cached_rsrc_, &cached_rsrc, sizeof(i32x4_t));   // builtin memcpy, __builtin_bit_cast() can not use here due to __amdgpu_buffer_rsrc_t is non copyable
-        if      constexpr (sizeof(type) == 1)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  1, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 2)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  2, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 4)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  4, v_os, s_os, 0, aux); }
+        if      constexpr (sizeof(type) == 1)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  1, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 2)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  2, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 4)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  4, v_os, s_os, i_os, aux); }
 #if  defined(__gfx950__)
-        else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 12, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 16, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 12, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 16, v_os, s_os, i_os, aux); }
 #endif
 #endif
 #else
-        auto val = _load<vec, aux>(v_os, s_os, number<aux>{});  // No buffer->LDS hardware: synchronous load->VGPR->LDS fallback.
+        auto val = _load<vec, aux>(v_os + i_os, s_os, number<aux>{});
+        dst = reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<__UINTPTR_TYPE__>(dst) + i_os);
         *reinterpret_cast<OPUS_LDS_ADDR type*>(dst) = val;
 #endif
     }
@@ -1724,8 +1728,8 @@ struct gmem {
     template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
     OPUS_D auto load(int v_os, int s_os = 0, number<aux> = {}) { return _load<vec>(v_os * sizeof(T), s_os * sizeof(T), number<aux>{}); }
 
-    template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
-    OPUS_D void async_load(void* dst, int v_os, int s_os = 0, number<aux> = {}) { _async_load<vec>(reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<__UINTPTR_TYPE__>(dst)), v_os * sizeof(T), s_os * sizeof(T), number<aux>{}); }
+    template<index_t vec = 1, index_t i_os = 0, index_t aux = 0>   // os in unit of T and cast to vector with vec; i_os = compile-time immediate byte offset (see _async_load notes; applies to both src and dst)
+    OPUS_D void async_load(void* dst, int v_os, int s_os = 0, number<i_os> = {}, number<aux> = {}) { _async_load<vec>(reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<__UINTPTR_TYPE__>(dst)), v_os * sizeof(T), s_os * sizeof(T), number<i_os>{}, number<aux>{}); }
 
     template<index_t vec = 1, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>   // os in unit of T and cast to vector with vec
     OPUS_D void store(const V& x, int v_os, int s_os = 0, number<aux> = {}) {
@@ -1781,15 +1785,15 @@ struct gmem {
         }
     }
 
-    template<index_t vec = 1, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
-    OPUS_D void async_load(void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
+    template<index_t vec = 1, typename LayoutG, typename LayoutS, index_t i_os = 0, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
+    OPUS_D void async_load(void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<i_os> = {}, number<aux> = {}) {
         using LT = layout_load_traits<LayoutG, vec>;
         constexpr auto r_elem = LT::r_elem;
         auto gmem_offsets = layout_to_offsets<vec>(u_gmem);
         auto smem_offsets = layout_to_offsets<vec>(u_smem);
         auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_base));
         for (index_t i = 0; i < r_elem.value; i++) {
-            async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[i])), gmem_offsets[i], s_os, number<aux>{});
+            async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[i])), gmem_offsets[i], s_os, number<i_os>{}, number<aux>{});
         }
     }
 
@@ -1843,8 +1847,8 @@ struct gmem {
         });
     }
 
-    template<index_t vec = 1, typename Predicate, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
-    OPUS_D void async_load_if(const Predicate& pred, void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
+    template<index_t vec = 1, typename Predicate, typename LayoutG, typename LayoutS, index_t i_os = 0, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
+    OPUS_D void async_load_if(const Predicate& pred, void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<i_os> = {}, number<aux> = {}) {
         using LT = layout_load_traits<LayoutG, vec>;
         constexpr auto issue_space_vec = LT::issue_space_vec;
         auto gmem_offsets = layout_to_offsets<vec>(u_gmem);
@@ -1855,7 +1859,7 @@ struct gmem {
         static_ford(issue_space_vec, [&](auto... ids) {
             constexpr index_t idx = u_r(ids...);
             if (pred(ids...)) {
-                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[idx])), gmem_offsets[idx], s_os, number<aux>{});
+                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[idx])), gmem_offsets[idx], s_os, number<i_os>{}, number<aux>{});
             } else {
                 using type = vector_type<vec>;
                 type z = {0};
@@ -2323,7 +2327,7 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
 #endif // __GFX9__ (mfma)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// wmma (RDNA4 / wave32) — gfx1250 uses wmma-256b builtins (16x16x{4,32,64,128}); gfx1200/gfx1201 (Navi 44/48) use wmma-128b _w32_gfx12 builtins (16x16x16). Dispatch macros for the two arg-list shapes differ — gfx12 set is DISPATCH_WMMA_GFX12_*.
+// wmma (RDNA4 / wave32) -- gfx1250 uses wmma-256b builtins (16x16x{4,32,64,128}); gfx1200/gfx1201 (Navi 44/48) use wmma-128b _w32_gfx12 builtins (16x16x16). Dispatch macros for the two arg-list shapes differ -- gfx12 set is DISPATCH_WMMA_GFX12_*.
 #if defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
 // f16/bf16/f32 builtins: (neg_a, A, neg_b, B, matrix_fmts, C, clamp, neg_c)
 #define DISPATCH_WMMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
@@ -2347,7 +2351,7 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
                  __builtin_bit_cast(vector_t<i32_t, i32_b>, b), \
                  static_cast<short>(0), c, false, false); }
 
-// gfx12 builtins: 3-arg (A, B, C) — no matrix_fmts/neg_c. ws_ selects _w32/_w64 (same {wm,wn,wk} triple).
+// gfx12 builtins: 3-arg (A, B, C) -- no matrix_fmts/neg_c. ws_ selects _w32/_w64 (same {wm,wn,wk} triple).
 #define DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) \
     (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_ && warp_size == ws_)
 #define DISPATCH_WMMA_GFX12_F32_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_) \
@@ -2357,7 +2361,7 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
     constexpr index_t i32_a = elem_a * static_cast<index_t>(sizeof(dtype_a)) / static_cast<index_t>(sizeof(i32_t)); \
     constexpr index_t i32_b = elem_b * static_cast<index_t>(sizeof(dtype_b)) / static_cast<index_t>(sizeof(i32_t)); \
     return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), __builtin_bit_cast(vector_t<i32_t, i32_b>, b), c); }
-#define DISPATCH_WMMA_GFX12_F32_STEP_K_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_k_, inst_) /* chain N×inst for wider K */ \
+#define DISPATCH_WMMA_GFX12_F32_STEP_K_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_k_, inst_) /* chain Nxinst for wider K */ \
     DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { \
     constexpr index_t steps = wk_ / inst_k_, e_a = elem_a / steps, e_b = elem_b / steps; \
     auto tmp = inst_(slice(a, number<0>{}, number<e_a>{}), slice(b, number<0>{}, number<e_b>{}), c); \
@@ -2430,7 +2434,7 @@ struct wmma {
 #if defined(__gfx1201__) || defined(__gfx1200__)
         // _w32/_w64 builtins gated by wavefrontsize target feature; OPUS_GFX120X_IS_WAVE32 selects the active wave mode.
 #  if OPUS_GFX120X_IS_WAVE32
-        // gfx12 wave32 16x16x16: f16/bf16/fp8/bf8 → f32 + same-type acc. iu8/iu4 deferred.
+        // gfx12 wave32 16x16x16: f16/bf16/fp8/bf8 -> f32 + same-type acc. iu8/iu4 deferred.
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp16_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12)
@@ -2439,7 +2443,7 @@ struct wmma {
         else if constexpr DISPATCH_WMMA_GFX12_8BIT_(fp8_t , bf8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_fp8_bf8_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t , fp8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf8_fp8_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t , bf8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12)
-        // gfx12 wave32 16x16x32 synthetic: 2× stacked 16x16x16 along K.
+        // gfx12 wave32 16x16x32 synthetic: 2x stacked 16x16x16 along K.
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp32_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, fp32_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp16_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12)
@@ -2451,7 +2455,7 @@ struct wmma {
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, fp32_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp16_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f16_16x16x16_f16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, bf16_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w64_gfx12)
-        // gfx12 wave64 16x16x32 synthetic: 2× stacked _w64 16x16x16 (8 elem/lane = 1 b128 load).
+        // gfx12 wave64 16x16x32 synthetic: 2x stacked _w64 16x16x16 (8 elem/lane = 1 b128 load).
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp32_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, fp32_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp16_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w64_gfx12)
@@ -2566,7 +2570,7 @@ using wmma_f32_16x16x16_fp8_fp8 = wmma<fp8_t , fp8_t , fp32_t, 16, 16, 16>;
 using wmma_f32_16x16x16_fp8_bf8 = wmma<fp8_t , bf8_t , fp32_t, 16, 16, 16>;
 using wmma_f32_16x16x16_bf8_fp8 = wmma<bf8_t , fp8_t , fp32_t, 16, 16, 16>;
 using wmma_f32_16x16x16_bf8_bf8 = wmma<bf8_t , bf8_t , fp32_t, 16, 16, 16>;
-// gfx12 wave32 16x16x32 synthetic (2× 16x16x16).
+// gfx12 wave32 16x16x32 synthetic (2x 16x16x16).
 using wmma_f32_16x16x32_f16_w32   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32, 32>;
 using wmma_f32_16x16x32_bf16_w32  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 32, 32>;
 using wmma_f16_16x16x32_f16_w32   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 32, 32>;
@@ -2576,7 +2580,7 @@ using wmma_f32_16x16x16_f16_w64   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 16, 64>
 using wmma_f32_16x16x16_bf16_w64  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 16, 64>;
 using wmma_f16_16x16x16_f16_w64   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 16, 64>;
 using wmma_bf16_16x16x16_bf16_w64 = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 16, 64>;
-// gfx12 wave64 16x16x32 synthetic (2× 16x16x16_w64).
+// gfx12 wave64 16x16x32 synthetic (2x 16x16x16_w64).
 using wmma_f32_16x16x32_f16_w64   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32, 64>;
 using wmma_f32_16x16x32_bf16_w64  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 32, 64>;
 using wmma_f16_16x16x32_f16_w64   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 32, 64>;
@@ -2946,7 +2950,7 @@ struct tiled_mma_adaptor : public MMA_ {
     static constexpr index_t tile_c_len = EXPAND_M * EXPAND_N * mma_c_len;
 
     // input a/b/c is array of ext type e.g. "fp16x2_t a[2];", pass "a" to this function
-    // #pragma unroll required: constexpr trip counts but clang's heuristic gives up on large tiles → runtime indices into vtype_a/b/c → N-way s_cselect_b64 chain on GFX9 → SGPR-spill-to-VGPR-lane blow-up.
+    // #pragma unroll required: constexpr trip counts but clang's heuristic gives up on large tiles -> runtime indices into vtype_a/b/c -> N-way s_cselect_b64 chain on GFX9 -> SGPR-spill-to-VGPR-lane blow-up.
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
                     std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
