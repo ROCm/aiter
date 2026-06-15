@@ -1783,7 +1783,10 @@ def _flash_attn_forward(
 
     def is_fmha_v3_fp8():
         ret = get_gfx() in ("gfx942", "gfx950")
-        ret = ret and (hdim_q == 128)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and get_gfx() == "gfx950")
+        )
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
@@ -1804,8 +1807,11 @@ def _flash_attn_forward(
         ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_v == 128)
-        ret = ret and (hdim_q == 128 or hdim_q == 192)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 192 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and is_fmha_v3_fp8())
+        )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
@@ -2796,7 +2802,10 @@ def _flash_attn_varlen_forward(
 
     def is_fmha_v3_fp8():
         ret = get_gfx() in ("gfx942", "gfx950")
-        ret = ret and (hdim_q == 128)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and get_gfx() == "gfx950")
+        )
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
@@ -2818,8 +2827,11 @@ def _flash_attn_varlen_forward(
         ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_v == 128)
-        ret = ret and (hdim_q == 128 or hdim_q == 192)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 192 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and is_fmha_v3_fp8())
+        )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
