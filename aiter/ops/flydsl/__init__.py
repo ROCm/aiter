@@ -42,6 +42,8 @@ if is_flydsl_available():
         flydsl_moe_stage1_direct,
         flydsl_moe_stage2,
         flydsl_moe_stage2_direct,
+        flydsl_grouped_topk,
+        flydsl_biased_grouped_topk,
     )
 
     from .gemm_kernels import flydsl_hgemm
@@ -52,5 +54,7 @@ if is_flydsl_available():
         "flydsl_moe_stage1_direct",
         "flydsl_moe_stage2",
         "flydsl_moe_stage2_direct",
+        "flydsl_grouped_topk",
+        "flydsl_biased_grouped_topk",
         "flydsl_hgemm",
     ]
