@@ -59,10 +59,6 @@ DEFAULT_SCALE_BYTE = 127  # e8m0 byte for 2^0 = 1.0
 VERIFY_TOL_A4W4 = 0.02
 VERIFY_TOL_A8W4 = 0.02
 VERIFY_TOL_ALL_ONES = 0.01
-# Production MoE accuracy gate (matches op_tests/test_moe_2stage.py calc_diff):
-# logits_diff = ||x-y||^2 / (||x||^2 + ||y||^2).  rel_l2 is kept as an
-# informational print only; logits_diff < 0.01 is the actual pass/fail gate.
-LOGITS_DIFF_TOL = 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -249,17 +245,6 @@ def _full_scale(
     return torch.full((experts, rows, n_blocks), byte, dtype=torch.uint8)
 
 
-def _weight_scale(experts: int, rows: int, n_blocks: int, *, seed: int) -> torch.Tensor:
-    """Varied weight (B) e8m0 scale {126,127,128} = {0.5,1.0,2.0} (exact pow2).
-
-    DIAGNOSTIC: exercise wjx's (lane32) B-scale layout with non-uniform scales,
-    same generator as the N4K8 branch's _weight_scale.
-    """
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    r = torch.randint(0, 3, (experts, rows, n_blocks), generator=g, dtype=torch.int16)
-    return (r + (DEFAULT_SCALE_BYTE - 1)).to(torch.uint8)
-
-
 def _balanced_topk(
     tokens: int, topk: int, experts: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -333,10 +318,8 @@ def _run_grouped_via_fused_moe(
     else:
         w1_logical = _pattern_packed(experts, 2 * inter, K_pack, seed=seed + 17)
         w2_logical = _pattern_packed(experts, K, inter_pack, seed=seed + 47)
-        # DIAGNOSTIC: varied weight scales (was _full_scale) to exercise the
-        # lane32 B-scale layout on wjx.
-        w1_scale_raw = _weight_scale(experts, 2 * inter, K // SCALE_BLOCK, seed=seed + 201)
-        w2_scale_raw = _weight_scale(experts, K, inter // SCALE_BLOCK, seed=seed + 202)
+        w1_scale_raw = _full_scale(experts, 2 * inter, K // SCALE_BLOCK)
+        w2_scale_raw = _full_scale(experts, K, inter // SCALE_BLOCK)
         if use_bias:
             bg = torch.Generator(device="cpu").manual_seed(seed + 91)
             bias1 = (torch.randn((experts, 2 * inter), generator=bg) * 1e-3).float()
@@ -569,21 +552,6 @@ def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float(diff / base)
 
 
-def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
-    """MoE accuracy metric from op_tests/test_moe_2stage.py (calc_diff):
-
-        1 - 2*<x,y>/(||x||^2 + ||y||^2)  ==  ||x-y||^2 / (||x||^2 + ||y||^2)
-
-    A magnitude-weighted cosine-style diff. Relation to rel_l2: when the two
-    norms match, logits_diff ~= rel_l2**2 / 2.  Production strict gate: < 0.01.
-    """
-    x = actual.double()
-    y = expected.double()
-    denom = (x * x + y * y).sum()
-    sim = 2 * (x * y).sum() / denom
-    return float(1 - sim)
-
-
 # ---------------------------------------------------------------------------
 # Pytest correctness suite
 # ---------------------------------------------------------------------------
@@ -626,22 +594,14 @@ def _sanity_check(
         all_ones=all_ones,
     )
     rel = _rel_l2(out, ref)
-    ld = _logits_diff(out, ref)
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
     tag = f"{data_format} {layout} {act}{' all_ones' if all_ones else ''}"
     print(
-        f"[sanity {tag}] logits_diff = {ld:.4e} (gate<{LOGITS_DIFF_TOL}) "
-        f"rel_l2 = {rel:.4e} (info, was tol={tol}) "
+        f"[sanity {tag}] rel_l2 grouped vs ref = {rel:.4e} "
         f"(grouped_norm={float(out.float().norm()):.4e} ref_norm={float(ref.float().norm()):.4e})",
         flush=True,
     )
-    # Production-consistent gate (op_tests/test_moe_2stage.py): logits_diff < 0.01.
-    # rel_l2 is over-sensitive to the noisy fp32 reference (rel_l2 ~= sqrt(2*ld)),
-    # so it is printed for reference only and no longer gates pass/fail.
-    assert ld < LOGITS_DIFF_TOL, (
-        f"grouped {tag} vs ref logits_diff={ld:.4e} > {LOGITS_DIFF_TOL} "
-        f"(rel_l2={rel:.4f}, informational)"
-    )
+    assert rel < tol, f"grouped {tag} vs ref rel_l2={rel:.4f} > tol={tol}"
 
 
 @pytest.mark.parametrize("layout", ["gguu", "gugu"])
