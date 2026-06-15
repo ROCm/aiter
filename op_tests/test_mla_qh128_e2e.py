@@ -554,6 +554,50 @@ def _normalize_dump(b):
     return b
 
 
+def _print_dump_params(b, path):
+    """Print all parameters carried by a dump (ctx_len, batch_size, split, dims,
+    scales, page geometry) so a single-dump repro is fully described."""
+    page_size = int(b["page_size"])
+    kvi = b["kv_indptr"].to(torch.int64).cpu()
+    klp = b["kv_last_page_lens"].to(torch.int64).cpu()
+    bs = int(kvi.numel() - 1)
+    o = b["o_server"]
+    total_s, nhead, v_head_dim = o.shape
+    q = b["q"]
+    n_pages = (kvi[1:] - kvi[:-1])
+    ctx = (n_pages - 1).clamp_min(0) * page_size + klp[:bs]
+    ctx_list = ctx.tolist()
+    uniq_ctx = sorted(set(ctx_list))
+
+    def _scal(x):
+        if x is None:
+            return None
+        return x.flatten()[0].item() if hasattr(x, "flatten") else x
+
+    lines = [
+        f"=== dump params: {os.path.basename(path)} ===",
+        f"  batch_size      = {bs}",
+        f"  total_s (rows)  = {int(total_s)}   (qo rows; decode_qlen per batch)",
+        f"  nhead           = {int(nhead)}",
+        f"  v_head_dim      = {int(v_head_dim)}",
+        f"  kv_lora_rank    = {b.get('kv_lora_rank')}",
+        f"  qk_rope_head_dim= {b.get('qk_rope_head_dim')}",
+        f"  q.shape/dtype   = {tuple(q.shape)} / {q.dtype}",
+        f"  kv.shape/dtype  = {tuple(b['kv_compact'].shape)} / {b['kv_compact'].dtype}",
+        f"  page_size       = {page_size}",
+        f"  max_q_len       = {b.get('max_q_len')}",
+        f"  sm_scale        = {b.get('sm_scale')}",
+        f"  q_scale         = {_scal(b.get('q_scale'))}",
+        f"  kv_scale        = {_scal(b.get('kv_scale'))}",
+        f"  layer_num       = {b.get('layer_num')}",
+        f"  n_pages/batch   = min={int(n_pages.min())} max={int(n_pages.max())}",
+        f"  ctx_len/batch   = min={min(ctx_list)} max={max(ctx_list)} "
+        f"uniq={uniq_ctx if len(uniq_ctx) <= 16 else str(uniq_ctx[:16]) + '...'}",
+        f"  splits tested   = {DUMP_SPLITS}",
+    ]
+    aiter.logger.info("\n".join(lines))
+
+
 def run_dump_case(path, num_kv_splits):
     """STAGE1-ONLY replay of a real ATOM dump. Feeds the dumped (already
     seg-packed) q / kv directly to the stage1 ASM kernel and checks the raw
@@ -628,7 +672,7 @@ def run_dump_case(path, num_kv_splits):
     return ret
 
 
-def run_dumps() -> bool:
+def run_dumps(all_dumps: bool = False) -> bool:
     paths = sorted(
         glob.glob(os.path.join(DUMP_DIR, "mla_decode_*.pt"))
         + glob.glob(os.path.join(DUMP_DIR, "seg_decode_*.pt"))
@@ -636,15 +680,19 @@ def run_dumps() -> bool:
     if not paths:
         aiter.logger.info("no dumps under %s", DUMP_DIR)
         return False
+    if not all_dumps:
+        paths = paths[:1]  # default: only the first dump
     aiter.logger.info(
-        "replaying %d dump(s) from %s, stage1-only, splits=%s",
+        "replaying %d dump(s) from %s, stage1-only, splits=%s (mode=%s)",
         len(paths),
         DUMP_DIR,
         DUMP_SPLITS,
+        "all" if all_dumps else "first",
     )
     rows: list[dict] = []
     failures: list[tuple] = []
     for p in paths:
+        _print_dump_params(_normalize_dump(torch.load(p, map_location="cpu")), p)
         for nks in DUMP_SPLITS:
             r = run_dump_case(p, nks)
             rows.append(r)
@@ -741,19 +789,25 @@ def main() -> None:
             "both: dumps then synth. Default: synth." % DUMP_DIR
         ),
     )
+    parser.add_argument(
+        "--dumps",
+        choices=["first", "all"],
+        default=os.environ.get("MLA_QH128_DUMPS", "first"),
+        help="first: only the first dump file (default); all: every dump file.",
+    )
     args = parser.parse_args()
 
     if get_gfx() != "gfx1250":
         raise SystemExit(f"requires gfx1250 (mi400), got {get_gfx()}")
 
-    aiter.logger.info("mode=%s", args.mode)
+    aiter.logger.info("mode=%s dumps=%s", args.mode, args.dumps)
     if args.mode in ("dump", "both"):
         if not os.path.isdir(DUMP_DIR):
             raise SystemExit(
                 f"--mode {args.mode} needs dumps but {DUMP_DIR} is not a directory "
                 f"(set MLA_DECODE_DUMP_DIR)."
             )
-        ran = run_dumps()
+        ran = run_dumps(all_dumps=(args.dumps == "all"))
         if args.mode == "dump":
             if not ran:
                 raise SystemExit(f"no dumps found under {DUMP_DIR}")
