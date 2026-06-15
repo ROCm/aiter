@@ -255,19 +255,19 @@ def _estimate_hgemm_lds_bytes(
     tile_n: int,
     tile_k: int,
     stages: int,
+    block_k_warps: int,
     b_to_lds: bool,
 ) -> int:
     if dtype not in {"f16", "bf16"}:
         raise ValueError(f"`dtype` must be 'f16' or 'bf16', got {dtype!r}")
 
     dtype_bytes = 2
-    a_lds_bytes = max(
-        stages * tile_m * tile_k * dtype_bytes,
-        tile_m * tile_n * dtype_bytes,
-    )
-    if not b_to_lds:
-        return a_lds_bytes
-    return _align_up(a_lds_bytes, 16) + stages * tile_n * tile_k * dtype_bytes
+    ab_lds_bytes = stages * tile_m * tile_k * dtype_bytes
+    if b_to_lds:
+        ab_lds_bytes = _align_up(ab_lds_bytes, 16)
+        ab_lds_bytes += stages * tile_n * tile_k * dtype_bytes
+    c_lds_bytes = block_k_warps * tile_m * tile_n * dtype_bytes
+    return max(ab_lds_bytes, c_lds_bytes)
 
 
 def _validate_hgemm_inputs(
@@ -502,6 +502,7 @@ def _validate_hgemm_tiling(
         tile_n=tile_n,
         tile_k=tile_k,
         stages=stages,
+        block_k_warps=block_k_warps,
         b_to_lds=b_to_lds,
     )
     lds_limit = get_shared_memory_per_block(fallback_gfx=get_gfx())
