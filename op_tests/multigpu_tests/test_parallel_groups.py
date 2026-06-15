@@ -166,8 +166,7 @@ def _ref_groups_5d(world, dp, pp, pcp, tp):
     return {
         "tp": [x.tolist() for x in all_ranks.view(-1, tp).unbind(0)],
         "pcp": [
-            x.tolist()
-            for x in all_ranks.transpose(3, 4).reshape(-1, pcp).unbind(0)
+            x.tolist() for x in all_ranks.transpose(3, 4).reshape(-1, pcp).unbind(0)
         ],
         "dp": [x.tolist() for x in all_ranks.transpose(1, 4).reshape(-1, dp).unbind(0)],
         "ep": [
@@ -187,8 +186,7 @@ def _ref_groups_4d_old(world, dp, pp, tp):
         "pp": [x.tolist() for x in all_ranks.transpose(2, 3).reshape(-1, pp).unbind(0)],
         "dp": [x.tolist() for x in all_ranks.transpose(1, 3).reshape(-1, dp).unbind(0)],
         "ep": [
-            x.tolist()
-            for x in all_ranks.transpose(1, 2).reshape(-1, dp * tp).unbind(0)
+            x.tolist() for x in all_ranks.transpose(1, 2).reshape(-1, dp * tp).unbind(0)
         ],
     }
 
@@ -214,9 +212,7 @@ def test_parallel_groups(
     min_world_size = tp_size * pp_size * dp_size * pcp_size
     if world_size is None:
         world_size = min_world_size
-    assert (
-        world_size >= min_world_size and world_size % min_world_size == 0
-    ), (
+    assert world_size >= min_world_size and world_size % min_world_size == 0, (
         f"world_size ({world_size}) must be a multiple of tp*pp*dp*pcp "
         f"({min_world_size})"
     )
@@ -290,12 +286,12 @@ def test_parallel_groups(
         # PCP / TP / DP membership must match the 5D reference layout
         exp_pcp = _find_group(ref5d["pcp"], rank)
         exp_tp = _find_group(ref5d["tp"], rank)
-        assert sorted(info["pcp_ranks"]) == exp_pcp, (
-            f"Rank {rank}: PCP ranks {sorted(info['pcp_ranks'])} != expected {exp_pcp}"
-        )
-        assert sorted(info["tp_ranks"]) == exp_tp, (
-            f"Rank {rank}: TP ranks {sorted(info['tp_ranks'])} != expected {exp_tp}"
-        )
+        assert (
+            sorted(info["pcp_ranks"]) == exp_pcp
+        ), f"Rank {rank}: PCP ranks {sorted(info['pcp_ranks'])} != expected {exp_pcp}"
+        assert (
+            sorted(info["tp_ranks"]) == exp_tp
+        ), f"Rank {rank}: TP ranks {sorted(info['tp_ranks'])} != expected {exp_tp}"
         # accessor rank == this rank's index inside its PCP group
         assert info["pcp_rank_accessor"] == exp_pcp.index(rank), (
             f"Rank {rank}: pcp_rank_accessor={info['pcp_rank_accessor']} "
