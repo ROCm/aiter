@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated per-arch host TU ({{ arch }}). See gen_instances.py:_emit_fused_host_tu.
+#ifndef __HIP_DEVICE_COMPILE__
+#define OPUS_FUSED_HOST_TU 1
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include <optional>
+// Forward declaration only. Specialisations live in per-arch device TUs.
+{{ fwd_ws_decl -}}
+template<int VEC_, int BLOCK_, typename D_OUT,
+         bool HAS_BIAS_, typename D_BIAS_,
+         bool HAS_OOB_>
+__global__ void splitk_reduce_kernel(
+    {{ ws_ptr_type }} {{ ws_arg_name }}, D_OUT* c_out,
+    int split_k, int M, int N, int batch,
+    int padded_M, int padded_N,
+    const D_BIAS_* bias, int stride_bias_batch);
+template<int SPLIT_K, int VEC_, int BLOCK_, typename D_OUT,
+         bool HAS_BIAS_, typename D_BIAS_>
+__global__ void splitk_reduce_kernel_v2(
+    const float* workspace, D_OUT* c_out,
+    int M, int N, int batch,
+    int padded_M, int padded_N,
+    const D_BIAS_* bias, int stride_bias_batch);
+template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_,
+         typename D_OUT, bool HAS_BIAS_, typename D_BIAS_>
+__global__ void splitk_reduce_kernel_v3(
+    const float* workspace, D_OUT* c_out,
+    int M, int N, int batch,
+    int padded_M, int padded_N,
+    const D_BIAS_* bias, int stride_bias_batch);
+{% for name in impl_includes -%}
+#include "impl/{{ name }}.cuh"
+{% endfor -%}
+{{ host_body -}}
+#endif // host pass only

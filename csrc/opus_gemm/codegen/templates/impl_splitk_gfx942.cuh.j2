@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include <optional>
+#endif
+#ifdef OPUS_FUSED_HOST_TU
+#include "{{ traits_header }}"
+{{ kernel_fwd_decl }}
+#else
+#include "{{ pipeline_header }}"
+#endif
+{{ traits_aliases }}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{{ kid_name }}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int splitK)
+{
+    static_assert(std::is_same<D_C, fp32_t>::value,
+    "{{ err_label }} main kernel uses fp32 workspace; D_C template param must be fp32_t");
+
+    int batch = XQ.size(0);
+    int M = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
+            || Y.dtype() == AITER_DTYPE_fp32,
+    "{{ err_label }} requires Y dtype bf16 or fp32");
+    AITER_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
+    "M, N, K, batch must be >= 1");
+    AITER_CHECK(K % 2 == 0,
+    "K=", K, " must be even (a16w16 family rejects odd K due to a "
+    "latent K-tail accumulation bug; pass an even K)");
+    // The gfx942 a16w16 splitk pipeline does not yet implement mask_va_tail
+    // (the per-lane K-tail zeroing that gfx950's flatmm_splitk uses). When
+    // K is not a multiple of B_K the last K-tile's buffer_load wraps past
+    // the row into the next M-row's data, corrupting the accumulator
+    // (observed max|err|~44 on bf16). Reject K%B_K!=0 until the
+    // mask_va_tail port lands; callers must pad K to a multiple of B_K.
+    AITER_CHECK(K % {{ B_K }} == 0,
+    "K=", K, " must be a multiple of B_K={{ B_K }} for {{ err_label }} "
+    "(K-tail masking not yet implemented on gfx942 splitk)");
+{{ bias_validate_block }}
+    using Traits = {{ kid_name }}_Traits<D_C>;
+
+    // splitK semantics for gfx942 splitk launchers:
+    //   splitK >  1 -> caller-pinned (tuner / explicit override). Used verbatim
+    //                  (subject to the iters-per-split auto-clamp below).
+    //   splitK <= 0 -> caller wants the launcher to auto-pick. Production
+    //                  dispatcher (opus_gemm.cu) takes this path so the call
+    //                  site stays gfx950-style (`fn(..., 0)`) without
+    //                  arch-aware splitK plumbing leaking up.
+    //   splitK == 1 -> caller explicitly requested no K-split. Honored.
+    int split_k;
+    if (splitK > 0) {
+    split_k = splitK;
+    } else {
+    // Auto-pick: target ~1 WG per CU. cu_num cached thread_local so we
+    // do not pay hipGetDeviceProperties on every launch.
+    static thread_local int cu_cached = -1;
+    if (cu_cached < 0) {
+        int dev = 0;
+        hipDeviceProp_t prop{};
+        if (hipGetDevice(&dev) == hipSuccess &&
+            hipGetDeviceProperties(&prop, dev) == hipSuccess) {
+            cu_cached = prop.multiProcessorCount;
+        }
+        if (cu_cached <= 0) cu_cached = 64;  // safe gfx942 lower bound
+    }
+    int tiles_mn = ((M + {{ B_M }} - 1) / {{ B_M }})
+                 * ((N + {{ B_N }} - 1) / {{ B_N }}) * batch;
+    if (tiles_mn <= 0) tiles_mn = 1;
+    // P1 variant wants 2 wg/CU co-residency for TLP -> aim for 2x cu_num grid.
+    int target_wg_dbuf2 = {{ target_wg_expr }};
+    split_k = (target_wg_dbuf2 + tiles_mn - 1) / tiles_mn;
+    if (split_k < 1)  split_k = 1;
+    if (split_k > 16) split_k = 16;  // matches tuner enumeration ceiling
+    }
+
+    // Host-side auto-clamp: split-barrier pipeline requires at least 2
+    // K-tile iterations per split (one in LDS + one prefetched). Applies to
+    // both caller-pinned and auto-picked split_k. P1 (depth=2 K-dbuf) additionally
+    // requires loops even per split.
+    int total_iters = (K + {{ B_K }} - 1) / {{ B_K }};
+    constexpr int min_iters_per_split = 2;
+    constexpr bool require_even_loops_dbuf2 = {{ require_even_loops_str }};
+    while (split_k > 1) {
+    int iters_full = (total_iters + split_k - 1) / split_k;
+    int last_loops = total_iters - (split_k - 1) * iters_full;
+    bool parity_ok = !require_even_loops_dbuf2
+                   || (iters_full % 2 == 0 && last_loops % 2 == 0);
+    if (iters_full >= min_iters_per_split && last_loops >= min_iters_per_split && parity_ok) break;
+    split_k--;
+    }
+    AITER_CHECK(total_iters >= min_iters_per_split,
+    "K=", K, " too small for {{ err_label }} B_K={{ B_K }}: need K >= ",
+    {{ B_K }} * min_iters_per_split);
+    if (require_even_loops_dbuf2) {
+    int iters_full = (total_iters + split_k - 1) / split_k;
+    int last_loops = total_iters - (split_k - 1) * iters_full;
+    AITER_CHECK(iters_full % 2 == 0 && last_loops % 2 == 0,
+        "{{ err_label }} needs even loops per split; K=", K,
+        " split_k=", split_k, " gives loops=(", iters_full, ",", last_loops, ")");
+    }
+
+    int num_tiles_m = (M + {{ B_M }} - 1) / {{ B_M }};
+    int num_tiles_n = (N + {{ B_N }} - 1) / {{ B_N }};
+    int padded_M    = num_tiles_m * {{ B_M }};
+    int padded_N    = num_tiles_n * {{ B_N }};
+
+    auto stream = aiter::getCurrentHIPStream();
+    size_t ws_bytes = (size_t)split_k * (size_t)batch
+                * (size_t)padded_M * (size_t)padded_N * sizeof(float);{{ ws_alloc_extra }}
+    static thread_local void*  ws_cached_ptr   = nullptr;
+    static thread_local size_t ws_cached_bytes = 0;
+    if (ws_cached_ptr == nullptr || {{ ws_size_var }} > ws_cached_bytes)
+    {
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
+    AITER_CHECK(capture_status == hipStreamCaptureStatusNone,
+        "{{ err_label }} workspace cache miss inside HIP graph capture is not "
+        "supported. Run the launcher once eagerly with the same shape "
+        "before capturing the graph.");
+
+    if (ws_cached_ptr != nullptr)
+    {
+        HIP_CALL(hipDeviceSynchronize());
+        HIP_CALL(hipFree(ws_cached_ptr));
+    }
+    const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
+    size_t grow_bytes = (({{ ws_size_var }} + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
+    HIP_CALL(hipMalloc(&ws_cached_ptr, grow_bytes));
+    ws_cached_bytes = grow_bytes;
+    }
+    void* ptr_workspace_ = ws_cached_ptr;{{ flags_block }}
+
+    {{ kargs_name }} kargs{};
+    kargs.ptr_a         = XQ.data_ptr();
+    kargs.ptr_b         = WQ.data_ptr();
+    kargs.ptr_workspace = ptr_workspace_;
+    kargs.ptr_c         = Y.data_ptr();
+    kargs.ptr_bias      = ptr_bias_;
+{{ kargs_flags_assign }}    kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
+    kargs.split_k = split_k;
+    kargs.stride_a        = K;
+    kargs.stride_b        = K;
+    kargs.stride_ws       = padded_N;
+    kargs.stride_c        = N;
+    kargs.stride_a_batch  = M * K;
+    kargs.stride_b_batch  = N * K;
+    kargs.stride_ws_batch = padded_M * padded_N;
+    kargs.stride_c_batch  = M * N;
+    kargs.stride_bias_batch = stride_bias_batch_;
+{{ cooperative_assign }}
+    dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
+    dim3 block_main({{ BLOCK_SIZE }});
+
+{{ kernel_launch_body }}{{ reduce_launch }}
+}
+#endif // launcher only on regular host pass

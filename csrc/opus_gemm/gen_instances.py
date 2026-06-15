@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 import torch
+from codegen.template_env import render as _render
 from codegen.common import (
     _A16W16_TAGS,
     _GFX942_A16W16_TAGS,
@@ -133,32 +134,11 @@ def _kargs_template_vars(kernel_tag, kargs_name):
 
 
 # INSTANCE_IMPL building blocks. Host pass needs torch/optional; RTC/device passes skip them.
-_INSTANCE_IMPL_PREAMBLE_TEMPLATE = """// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#pragma once
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-#include "aiter_tensor.h"
-#include "aiter_stream.h"{extra_host_includes}
-#include <optional>
-#endif"""
-
-
 def instance_impl_preamble(extra_host_includes=""):
-    return _INSTANCE_IMPL_PREAMBLE_TEMPLATE.format(
-        extra_host_includes=extra_host_includes
-    )
+    return _render("_preamble.cuh.j2", extra_host_includes=extra_host_includes)
 
 
 # Fused host TU sees only traits header + fwd decl; avoids layout-helper ODR clash.
-_INSTANCE_IMPL_HOST_TU_SPLIT_TEMPLATE = """#ifdef OPUS_FUSED_HOST_TU
-#include "{traits_header}"
-template<typename Traits{fwd_decl_kargs_tpl}>
-__global__ void {kernel_func}({fwd_decl_kargs_fnarg} kargs);
-#else
-#include "{pipeline_header}"
-#endif"""
-
-
 def instance_impl_host_tu_split(
     traits_header,
     pipeline_header,
@@ -166,7 +146,8 @@ def instance_impl_host_tu_split(
     kernel_func,
     fwd_decl_kargs_fnarg,
 ):
-    return _INSTANCE_IMPL_HOST_TU_SPLIT_TEMPLATE.format(
+    return _render(
+        "_host_tu_split.cuh.j2",
         traits_header=traits_header,
         pipeline_header=pipeline_header,
         fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
@@ -349,34 +330,7 @@ class opus_gemm_codegen:
 
     # Shared host-side bias validation + kargs population. Consumed by gfx950
     # noscale + gfx950 flatmm_splitk + gfx942 splitk emit modules.
-    BIAS_HOST_VALIDATE = """
-    const void* ptr_bias_ = nullptr;
-    int stride_bias_batch_ = 0;
-    if (bias.has_value()) {{
-        const auto& bt = bias.value();
-        AITER_CHECK(bt.is_contiguous(),
-            "bias must be contiguous (got non-contiguous tensor)");
-        AITER_CHECK(bt.dtype() == Y.dtype(),
-            "bias dtype must match Y dtype (got bias=",
-            AiterDtype_to_str(bt.dtype()),
-            " Y=", AiterDtype_to_str(Y.dtype()), ")");
-        if (bt.dim() == 1) {{
-            AITER_CHECK(bt.size(0) == N,
-                "bias 1D length must equal N (got bias.size(0)=", bt.size(0),
-                " N=", N, ")");
-            stride_bias_batch_ = 0;
-        }} else if (bt.dim() == 2) {{
-            AITER_CHECK(bt.size(0) == batch && bt.size(1) == N,
-                "bias 2D shape must equal [batch, N] (got [", bt.size(0), ", ",
-                bt.size(1), "] vs batch=", batch, " N=", N, ")");
-            stride_bias_batch_ = N;
-        }} else {{
-            AITER_CHECK(false, "bias must be 1D [N] or 2D [batch, N]; got dim=",
-                bt.dim());
-        }}
-        ptr_bias_ = bt.data_ptr();
-    }}
-"""
+    BIAS_HOST_VALIDATE = _render("_bias_validate.cuh.j2")
 
     def gen_lookup_dict(self, kernels_dict):
         """Emit opus_gemm_lookup.h with two (M,N,K)->kernel macros.
@@ -412,23 +366,7 @@ class opus_gemm_codegen:
             launch time based on the actual Y dtype.
         """
         # Sorted flat-array layout (was: {(M,N,K), kernel<CTYPE>} initializer list for std::unordered_map).
-        HEADER = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-//
-// Auto-generated. Do not edit. See gen_instances.py:gen_lookup_dict.
-//
-// Per-CTYPE sorted flat arrays for (M,N,K)->kernel runtime dispatch.
-// Same (M,N,K) can resolve to different kernels in the BF16 vs FP32
-// tables because get_tune_dict keys winners on (M, N, K, outdtype_str)
-// and gen_lookup_dict buckets the rows into per-CTYPE macros below.
-// splitk kids appear in either table with their main-kernel template
-// forced to <fp32_t> (the reduce kernel handles the final Y cast at
-// launch time).
-//
-// Lookup is std::lower_bound on the lex-ordered (M, N, K) key. See
-// opus_gemm_arch_gfx950.cuh for the dispatch wrapper.
-"""
+        HEADER = _render("opus_gemm_lookup.h.j2")
 
         ENTRY_MATCH_CTYPE = """\
     {{ {{{M}, {N}, {K}}}, &{kernel_name}<CTYPE> }},  \\
@@ -505,17 +443,7 @@ class opus_gemm_codegen:
         Emit two macros side by side, gated on each kid's output_dtypes set.
         """
         # Same flat-array design as gen_lookup_dict, keyed on int kid instead of (M,N,K).
-        HEADER = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-//
-// Auto-generated. Do not edit. See gen_instances.py:gen_a16w16_tune_lookup.
-//
-// Per-CTYPE sorted flat arrays for kid->kernel tune dispatch. Kids whose
-// output_dtypes doesn't include CTYPE are omitted from that CTYPE's table
-// (splitk kids only live in the fp32 table). See
-// opus_gemm_arch_gfx950.cuh for the dispatch wrapper.
-"""
+        HEADER = _render("opus_gemm_a16w16_tune_lookup.h.j2")
         ENTRY = """\
     {{ {kid}, &{kernel_name}<CTYPE> }},  \\
 """
@@ -549,53 +477,16 @@ class opus_gemm_codegen:
 
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
-        MANIFEST_HEAD = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_tensor.h"
-#include <cstdlib>
-#include <optional>
-"""
-        MANIFEST_SCALE = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> x_scale,
-    std::optional<aiter_tensor_t> w_scale);
-"""
-        # a8w8 noscale (3 args, no splitK): stays compatible with
-        # opus_gemm_lookup.h where a8w8 kids live.
-        MANIFEST_NOSCALE_3ARG = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y);
-"""
-        # a16w16 family (5 args with optional bias + splitK): shared signature for tune lookup.
-        MANIFEST_NOSCALE_4ARG = """
-template <typename D_C>
-void
-{kernel_name}(
-    aiter_tensor_t &XQ,
-    aiter_tensor_t &WQ,
-    aiter_tensor_t &Y,
-    std::optional<aiter_tensor_t> bias,
-    int splitK);
-"""
+        decls = []
+        for mnk, k in kernels_dict.items():
+            if k.kernel_tag in A16W16_TUNE_TAGS:
+                decls.append(_render("_manifest_noscale_4arg.cuh.j2", kernel_name=k.name))
+            elif k.kernel_tag in NOSCALE_TAGS:
+                decls.append(_render("_manifest_noscale_3arg.cuh.j2", kernel_name=k.name))
+            else:
+                decls.append(_render("_manifest_scale.cuh.j2", kernel_name=k.name))
         with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
-            f.write(MANIFEST_HEAD)
-            for mnk, k in kernels_dict.items():
-                if k.kernel_tag in A16W16_TUNE_TAGS:
-                    f.write(MANIFEST_NOSCALE_4ARG.format(kernel_name=k.name))
-                elif k.kernel_tag in NOSCALE_TAGS:
-                    f.write(MANIFEST_NOSCALE_3ARG.format(kernel_name=k.name))
-                else:
-                    f.write(MANIFEST_SCALE.format(kernel_name=k.name))
+            f.write(_render("opus_gemm_manifest.h.j2", kernel_decls="".join(decls)))
 
     # -- Per-pass TU emission -- Replaces the old "one .cpp per (kid, dtype)" scheme.
 
@@ -634,51 +525,21 @@ void
             host_body = "".join(row["host_decl"] for row in rows)
             # gfx950 splitk launcher passes ws_handle*; gfx942 passes raw float*.
             if arch == "gfx950":
-                _fwd_ws_decl = '#include "gfx950/opus_gemm_traits_a16w16_gfx950.cuh"\n'
-                _fwd_ws_arg = "const opus_splitk_ws_handle* ws_handle"
+                fwd_ws_decl = '#include "gfx950/opus_gemm_traits_a16w16_gfx950.cuh"\n'
+                ws_ptr_type = "const opus_splitk_ws_handle*"
+                ws_arg_name = "ws_handle"
             else:
-                _fwd_ws_decl = ""
-                _fwd_ws_arg = "const float* workspace"
-            forward_decls = (
-                "// Forward declaration only. Specialisations live in per-arch device TUs.\n"
-                f"{_fwd_ws_decl}"
-                "template<int VEC_, int BLOCK_, typename D_OUT,\n"
-                "         bool HAS_BIAS_, typename D_BIAS_,\n"
-                "         bool HAS_OOB_>\n"
-                "__global__ void splitk_reduce_kernel(\n"
-                f"    {_fwd_ws_arg}, D_OUT* c_out,\n"
-                "    int split_k, int M, int N, int batch,\n"
-                "    int padded_M, int padded_N,\n"
-                "    const D_BIAS_* bias, int stride_bias_batch);\n"
-                "template<int SPLIT_K, int VEC_, int BLOCK_, typename D_OUT,\n"
-                "         bool HAS_BIAS_, typename D_BIAS_>\n"
-                "__global__ void splitk_reduce_kernel_v2(\n"
-                "    const float* workspace, D_OUT* c_out,\n"
-                "    int M, int N, int batch,\n"
-                "    int padded_M, int padded_N,\n"
-                "    const D_BIAS_* bias, int stride_bias_batch);\n"
-                "template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_,\n"
-                "         typename D_OUT, bool HAS_BIAS_, typename D_BIAS_>\n"
-                "__global__ void splitk_reduce_kernel_v3(\n"
-                "    const float* workspace, D_OUT* c_out,\n"
-                "    int M, int N, int batch,\n"
-                "    int padded_M, int padded_N,\n"
-                "    const D_BIAS_* bias, int stride_bias_batch);\n"
-            )
-            contents = (
-                "// SPDX-License-Identifier: MIT\n"
-                "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
-                "//\n"
-                f"// Auto-generated per-arch host TU ({arch}). See gen_instances.py:_emit_fused_host_tu.\n"
-                "#ifndef __HIP_DEVICE_COMPILE__\n"
-                "#define OPUS_FUSED_HOST_TU 1\n"
-                '#include "aiter_tensor.h"\n'
-                '#include "aiter_stream.h"\n'
-                "#include <optional>\n"
-                + forward_decls
-                + "".join(f'#include "impl/{name}.cuh"\n' for name in impl_includes)
-                + host_body
-                + "#endif // host pass only\n"
+                fwd_ws_decl = ""
+                ws_ptr_type = "const float*"
+                ws_arg_name = "workspace"
+            contents = _render(
+                "all_instances_host.cu.j2",
+                arch=arch,
+                fwd_ws_decl=fwd_ws_decl,
+                ws_ptr_type=ws_ptr_type,
+                ws_arg_name=ws_arg_name,
+                impl_includes=impl_includes,
+                host_body=host_body,
             )
             Path(
                 os.path.join(self.instances_path, f"all_instances_host_{arch}.cu")
@@ -704,17 +565,10 @@ void
             dtype = row["dtype"]
             # Include the kid's .cuh -- it transitively pulls in the full pipeline header (because
             # OPUS_FUSED_HOST_TU is NOT defined here) an...
-            contents = (
-                "// SPDX-License-Identifier: MIT\n"
-                "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
-                "//\n"
-                "// Auto-generated. Do not edit. See gen_instances.py:_emit_device_tus.\n"
-                "//\n"
-                "// Device-only translation unit for one (kid, dtype) pair.\n"
-                "// Compiled with -D__HIPCC_RTC__ (per-source flag in\n"
-                "// optCompilerConfig.json) so the host pass takes the\n"
-                "// minimal branch -- no torch, no full HIP runtime.\n"
-                f'#include "impl/{name}.cuh"\n' + row["device_decl"]
+            contents = _render(
+                "device_tu.cu.j2",
+                kid_name=name,
+                device_decl=row["device_decl"],
             )
             Path(
                 os.path.join(self.instances_path, f"{name}_C{dtype}.device.cu")
@@ -773,43 +627,11 @@ void
                 if reduce_arch == "gfx950"
                 else "const float*"
             )
-            contents = (
-                "// SPDX-License-Identifier: MIT\n"
-                "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
-                "//\n"
-                f"// Auto-generated per-arch reduce TU ({reduce_arch}). See gen_instances.py:_emit_splitk_reduce_tu.\n"
-                f'#include "{reduce_header}"\n'
-                "// HAS_OOB=true variants\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16, true>(\n"
-                f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-                f"    const __bf16*, int);\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16, true>(\n"
-                f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-                f"    const __bf16*, int);\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float,  true>(\n"
-                f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-                f"    const float*,  int);\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, float,  false, float,  true>(\n"
-                f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-                f"    const float*,  int);\n"
-                "// HAS_OOB=false variants\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16, false>(\n"
-                f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-                f"    const __bf16*, int);\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16, false>(\n"
-                f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-                f"    const __bf16*, int);\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float,  false>(\n"
-                f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-                f"    const float*,  int);\n"
-                f"template __global__ void splitk_reduce_kernel<16, 64, float,  false, float,  false>(\n"
-                f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-                f"    const float*,  int);\n"
-            )
+            fast_parts = []
             if reduce_arch in SPLITK_REDUCE_FAST_ARCHES:
-                contents += "// V2 (split_k static-unroll, no OOB) instantiations -- gfx942 only\n"
+                fast_parts.append("// V2 (split_k static-unroll, no OOB) instantiations -- gfx942 only\n")
                 for sk in V2_SUPPORTED_SPLITKS:
-                    contents += (
+                    fast_parts.append(
                         f"template __global__ void splitk_reduce_kernel_v2<{sk}, 8, 8, __bf16, true,  __bf16>(\n"
                         "    const float*, __bf16*, int, int, int, int, int,\n"
                         "    const __bf16*, int);\n"
@@ -817,10 +639,10 @@ void
                         "    const float*, __bf16*, int, int, int, int, int,\n"
                         "    const __bf16*, int);\n"
                     )
-                contents += "// V3 (multi-row per wg, BLOCK=64=1 wave) instantiations\n"
+                fast_parts.append("// V3 (multi-row per wg, BLOCK=64=1 wave) instantiations\n")
                 for nvec, rows in V3_NVEC_ROWS:
                     for sk in V2_SUPPORTED_SPLITKS:
-                        contents += (
+                        fast_parts.append(
                             f"template __global__ void splitk_reduce_kernel_v3<{sk}, {nvec}, {rows}, 8, __bf16, true,  __bf16>(\n"
                             "    const float*, __bf16*, int, int, int, int, int,\n"
                             "    const __bf16*, int);\n"
@@ -828,6 +650,13 @@ void
                             "    const float*, __bf16*, int, int, int, int, int,\n"
                             "    const __bf16*, int);\n"
                         )
+            contents = _render(
+                "splitk_reduce.device.cu.j2",
+                arch=reduce_arch,
+                reduce_header=reduce_header,
+                ws_ptr_type=ws_ptr_type,
+                fast_reduce_instantiations="".join(fast_parts),
+            )
             Path(
                 os.path.join(
                     self.instances_path, f"splitk_reduce_{reduce_arch}.device.cu"
@@ -1100,13 +929,7 @@ if __name__ == "__main__":
         sorted(target_arches) if target_arches is not None else ["gfx942", "gfx950"]
     )
     with open(os.path.join(args.working_path, "opus_build_archs.h"), "w") as f:
-        f.write(
-            "// SPDX-License-Identifier: MIT\n"
-            "// Auto-generated. See gen_instances.py.\n"
-            "#pragma once\n"
-        )
-        for a in archs_for_header:
-            f.write(f"#define OPUS_BUILD_HAS_{a.upper()} 1\n")
+        f.write(_render("opus_build_archs.h.j2", archs=archs_for_header))
 
     # a8w8 (kid 1, 2) referenced unconditionally by dispatcher; symbols must exist on every arch.
     S |= set(a8w8_scale_kernels_list.keys())

@@ -1,0 +1,16 @@
+#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated. Do not edit. See gen_instances.py:gen_lookup_dict.
+//
+// Per-CTYPE sorted flat arrays for (M,N,K)->kernel runtime dispatch.
+// Same (M,N,K) can resolve to different kernels in the BF16 vs FP32
+// tables because get_tune_dict keys winners on (M, N, K, outdtype_str)
+// and gen_lookup_dict buckets the rows into per-CTYPE macros below.
+// splitk kids appear in either table with their main-kernel template
+// forced to <fp32_t> (the reduce kernel handles the final Y cast at
+// launch time).
+//
+// Lookup is std::lower_bound on the lex-ordered (M, N, K) key. See
+// opus_gemm_arch_gfx950.cuh for the dispatch wrapper.

@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated per-arch reduce TU ({{ arch }}). See gen_instances.py:_emit_splitk_reduce_tu.
+#include "{{ reduce_header }}"
+// HAS_OOB=true variants
+template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16, true>(
+    {{ ws_ptr_type }}, __bf16*, int, int, int, int, int, int,
+    const __bf16*, int);
+template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16, true>(
+    {{ ws_ptr_type }}, __bf16*, int, int, int, int, int, int,
+    const __bf16*, int);
+template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float,  true>(
+    {{ ws_ptr_type }}, float*,  int, int, int, int, int, int,
+    const float*,  int);
+template __global__ void splitk_reduce_kernel<16, 64, float,  false, float,  true>(
+    {{ ws_ptr_type }}, float*,  int, int, int, int, int, int,
+    const float*,  int);
+// HAS_OOB=false variants
+template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16, false>(
+    {{ ws_ptr_type }}, __bf16*, int, int, int, int, int, int,
+    const __bf16*, int);
+template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16, false>(
+    {{ ws_ptr_type }}, __bf16*, int, int, int, int, int, int,
+    const __bf16*, int);
+template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float,  false>(
+    {{ ws_ptr_type }}, float*,  int, int, int, int, int, int,
+    const float*,  int);
+template __global__ void splitk_reduce_kernel<16, 64, float,  false, float,  false>(
+    {{ ws_ptr_type }}, float*,  int, int, int, int, int, int,
+    const float*,  int);
+{{ fast_reduce_instantiations -}}

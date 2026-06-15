@@ -1,0 +1,10 @@
+#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated. Do not edit. See gen_instances.py:gen_a16w16_tune_lookup.
+//
+// Per-CTYPE sorted flat arrays for kid->kernel tune dispatch. Kids whose
+// output_dtypes doesn't include CTYPE are omitted from that CTYPE's table
+// (splitk kids only live in the fp32 table). See
+// opus_gemm_arch_gfx950.cuh for the dispatch wrapper.

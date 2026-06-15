@@ -1,0 +1,53 @@
+{{ preamble }}
+{{ host_tu_split }}
+
+template <typename D_C>
+using {{ kid_name }}_Traits = {{ traits_name }}<{{ BLOCK_SIZE }},
+    opus::seq<{{ B_M }}, {{ B_N }}, {{ B_K }}>,
+    opus::tuple<{{ da }}, {{ db }}, D_C, fp32_t>,
+    opus::seq<{{ VEC_A }}, {{ VEC_B }}, {{ VEC_C }}>,
+    opus::seq<{{ T_M }}, {{ T_N }}, 1>,
+    opus::seq<{{ W_M }}, {{ W_N }}, {{ W_K }}>,
+    {{ has_oob_str }},
+    {{ cachectl_a }},
+    {{ cachectl_b }}>;
+
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{{ kid_name }}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int /*splitK*/)   // persistent ignores splitK; shares tune-lookup slot signature
+{
+    int batch = XQ.size(0);
+    int M = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+{{ k_check }}
+    AITER_CHECK(!bias.has_value(),
+        "bias is not supported on a16w16_persistent kid; use a16w16 "
+        "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
+
+    {{ kargs_name }} kargs{{{}}};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.m = M;
+    kargs.n = N;
+    kargs.k = K;
+    kargs.batch = batch;
+    kargs.stride_a = K;
+    kargs.stride_b = K;
+    kargs.stride_c = N;
+    kargs.stride_a_batch = M * K;
+    kargs.stride_b_batch = N * K;
+    kargs.stride_c_batch = M * N;
+{{ grid_setup }}
+    auto stream = aiter::getCurrentHIPStream();
+    {{ kernel_func }}<{{ kid_name }}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
+
+}
+#endif // launcher only on regular host pass

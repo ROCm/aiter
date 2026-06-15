@@ -1,0 +1,9 @@
+
+template <typename D_C>
+void
+{{ kernel_name }}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> x_scale,
+    std::optional<aiter_tensor_t> w_scale);

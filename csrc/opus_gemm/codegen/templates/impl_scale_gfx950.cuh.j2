@@ -1,0 +1,66 @@
+{{ preamble }}
+{{ host_tu_split }}
+
+template <typename D_C>
+using {{ kid_name }}_Traits = {{ traits_name }}<{{ BLOCK_SIZE }},
+    opus::seq<{{ B_M }}, {{ B_N }}, {{ B_K }}>,
+    opus::tuple<{{ da }}, {{ db }}, D_C, fp32_t, fp32_t>,
+    opus::seq<{{ VEC_A }}, {{ VEC_B }}, {{ VEC_C }}>,
+    opus::seq<{{ GROUP_M }}, {{ GROUP_N }}, {{ GROUP_K }}>>;
+
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{{ kid_name }}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> x_scale,
+    std::optional<aiter_tensor_t> w_scale)
+{
+    int batch = XQ.size(0);
+    int M = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+
+    using Traits = {{ kid_name }}_Traits<D_C>;
+
+    int GROUP_M = {{ GROUP_M }};
+    int GROUP_N = {{ GROUP_N }};
+    int GROUP_K = {{ GROUP_K }};
+    int num_groups_m = M / GROUP_M;
+    int num_groups_n = N / GROUP_N;
+    int num_groups_k = K / GROUP_K;
+
+    {{ kargs_name }} kargs{};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.m = M;
+    kargs.n = N;
+    kargs.k = K;
+    kargs.batch = batch;
+    kargs.stride_a = K;
+    kargs.stride_b = K;
+    kargs.stride_c = N;
+    kargs.stride_a_batch = M * K;
+    kargs.stride_b_batch = N * K;
+    kargs.stride_c_batch = M * N;
+
+    kargs.ptr_sfa = x_scale.value().data_ptr();
+    kargs.ptr_sfb = w_scale.value().data_ptr();
+    kargs.stride_sfa = num_groups_k;
+    kargs.stride_sfb = num_groups_k;
+    kargs.stride_sfa_batch = num_groups_m * num_groups_k;
+    kargs.stride_sfb_batch = num_groups_n * num_groups_k;
+
+    int num_tiles_m = (M + {{ B_M }} - 1) / {{ B_M }};
+    int num_tiles_n = (N + {{ B_N }} - 1) / {{ B_N }};
+    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
+    dim3 block({{ BLOCK_SIZE }});
+
+    auto stream = aiter::getCurrentHIPStream();
+    {{ kernel_func }}<{{ kid_name }}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
+
+}
+#endif // launcher only on regular host pass
