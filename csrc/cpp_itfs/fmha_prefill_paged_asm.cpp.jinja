@@ -17,26 +17,26 @@ struct __attribute__((packed)) KernelArgs
     void    *ptr_lse;       uint64_t _p4;    // 0x040  LSE output [nhead_q, total_q]
     int32_t  scalar;        int32_t  _p5[3]; // 0x050  softmax_scale as IEEE-754 bits
     int32_t  s_seq_len;     int32_t  _p6[3]; // 0x060  max_seqlen_q
-    int32_t  s_Seqs;        int32_t  _p7[3]; // 0x070  batch size
-    int32_t  s_Ts;          int32_t  _p8[3]; // 0x080  max_seqlen_k
-    int32_t  s_Hs;          int32_t  _p9[3]; // 0x090  nhead_q
-    int32_t  s_Bs;          int32_t _p10[3]; // 0x0A0  nhead_k
+    int32_t  s_Seqs;        int32_t  _p7[3]; // 0x070  Q token stride in bytes (nhead_q*128)
+    int32_t  s_Ts;          int32_t  _p8[3]; // 0x080  Q tile stride in bytes (256*nhead_q*128)
+    int32_t  s_Hs;          int32_t  _p9[3]; // 0x090  Q head stride in bytes (128)
+    int32_t  s_Bs;          int32_t _p10[3]; // 0x0A0  Q batch stride in bytes (seqlen_q*nhead_q*128)
     int32_t  s_gqa;         int32_t _p11[3]; // 0x0B0  gqa ratio (nhead_q / nhead_k)
-    int32_t  s_k_Seqs;      int32_t _p12[3]; // 0x0C0  unused (0)
-    int32_t  s_k_Hs;        int32_t _p13[3]; // 0x0D0  K head byte stride in pool
-    int32_t  s_k_Bs;        int32_t _p14[3]; // 0x0E0  unused (0)
-    int32_t  s_opt;         int32_t _p15[3]; // 0x0F0  flags (0)
-    int32_t  s_lse;         int32_t _p16[3]; // 0x100  unused (0)
-    int32_t  s_kv_seq_len;  int32_t _p17[3]; // 0x110  max_seqlen_k (same as s_Ts)
+    int32_t  s_k_Seqs;      int32_t _p12[3]; // 0x0C0  K vec-col stride in bytes (16 for vkcolv)
+    int32_t  s_k_Hs;        int32_t _p13[3]; // 0x0D0  K head stride in bytes
+    int32_t  s_k_Bs;        int32_t _p14[3]; // 0x0E0  K batch stride (0: paged)
+    int32_t  s_opt;         int32_t _p15[3]; // 0x0F0  flags (not read by PS kernel)
+    int32_t  s_lse;         int32_t _p16[3]; // 0x100  1 if LSE requested (0)
+    int32_t  s_kv_seq_len;  int32_t _p17[3]; // 0x110  max_seqlen_k
     int32_t  s_qk_head_dim; int32_t _p18[3]; // 0x120  128
     int32_t  s_v_head_dim;  int32_t _p19[3]; // 0x130  128
     int32_t  s_q_head_num;  int32_t _p20[3]; // 0x140  nhead_q
-    int32_t  s_v_Seqs;      int32_t _p21[3]; // 0x150  num_pages in K/V pool
-    int32_t  s_v_Hs;        int32_t _p22[3]; // 0x160  V head byte stride in pool
-    int32_t  s_v_Bs;        int32_t _p23[3]; // 0x170  page_size (= 16)
-    int32_t  s_o_Seqs;      int32_t _p24[3]; // 0x180  batch size
-    int32_t  s_o_Hs;        int32_t _p25[3]; // 0x190  output head byte stride
-    int32_t  s_o_Bs;        int32_t _p26[3]; // 0x1A0  hdim_v = 128
+    int32_t  s_v_Seqs;      int32_t _p21[3]; // 0x150  V token stride in bytes (nhead_k*128)
+    int32_t  s_v_Hs;        int32_t _p22[3]; // 0x160  V head stride in bytes
+    int32_t  s_v_Bs;        int32_t _p23[3]; // 0x170  V batch stride (0: paged)
+    int32_t  s_o_Seqs;      int32_t _p24[3]; // 0x180  O token stride in bytes (nhead_q*128*2)
+    int32_t  s_o_Hs;        int32_t _p25[3]; // 0x190  O head stride in bytes (128*2)
+    int32_t  s_o_Bs;        int32_t _p26[3]; // 0x1A0  O batch stride in bytes (seqlen_q*nhead_q*128*2)
     // Slots 0x1B0–0x1F0: field names in init.py are misleading; kernel reads
     // different data here (documented in kernel.py Phase 1 comments).
     void    *ptr_LTD;       uint64_t _p27;   // 0x1B0  kv_page_indices ptr  (LTD — flat page table)
@@ -47,7 +47,7 @@ struct __attribute__((packed)) KernelArgs
     void    *ptr_q_descale; uint64_t _p32;   // 0x200  q_descale_per_token [total_q, nhead_q] fp32
     void    *ptr_k_descale; uint64_t _p33;   // 0x210  k_descale_per_token [pages, page_size, nhead_k] fp32
     void    *ptr_v_descale; uint64_t _p34;   // 0x220  v_descale_per_head  [nhead_k] fp32
-    int32_t  s_descale_q_Bs;  int32_t _p35[3];// 0x230  q_descale batch byte stride (0 for varlen)
+    int32_t  s_descale_q_Bs;  int32_t _p35[3];// 0x230  q_descale batch byte stride
     int32_t  s_descale_q_Hs;  int32_t _p36[3];// 0x240  q_descale head byte stride (= 4)
     int32_t  s_kscale_page_stride;  int32_t _p37[3]; // 0x250 k_descale page stride (elements; kernel <<2)
     int32_t  s_kscale_token_stride; int32_t _p38[3]; // 0x260 k_descale token stride (elements; kernel <<2)
@@ -130,6 +130,19 @@ void {{func_name}}(
     int32_t scale_bits;
     memcpy(&scale_bits, &softmax_scale, sizeof(scale_bits));
 
+    // Q layout: [total_q, nhead_q, 128] fp8 (1 byte)
+    const int q_token_stride = nhead_q * 128;          // bytes per Q token
+    const int q_head_stride  = 128;                    // bytes per Q head
+    const int q_batch_stride = max_seqlen_q * q_token_stride; // bytes per batch entry
+
+    // V layout (paged pool): [pages, page_size, nhead_k, 128] fp8
+    // Token stride within a page = nhead_k * 128
+    const int v_token_stride = nhead_k * 128;
+
+    // O layout: [total_q, nhead_q, 128] bf16 (2 bytes)
+    const int o_token_stride = nhead_q * 128 * 2;
+    const int o_batch_stride = max_seqlen_q * o_token_stride;
+
     args.ptr_o          = ptr_o;
     args.ptr_q          = ptr_q;
     args.ptr_k          = ptr_k;
@@ -137,26 +150,26 @@ void {{func_name}}(
     args.ptr_lse        = ptr_lse;
     args.scalar         = scale_bits;
     args.s_seq_len      = max_seqlen_q;
-    args.s_Seqs         = batch;
-    args.s_Ts           = max_seqlen_k;
-    args.s_Hs           = nhead_q;
-    args.s_Bs           = nhead_k;
+    args.s_Seqs         = q_token_stride;    // Q token stride in bytes
+    args.s_Ts           = 256 * q_token_stride; // Q tile stride (kTileQ=256) in bytes
+    args.s_Hs           = q_head_stride;     // Q head stride in bytes
+    args.s_Bs           = q_batch_stride;    // Q batch stride in bytes
     args.s_gqa          = nhead_q / nhead_k;
-    args.s_k_Seqs       = 0;
-    args.s_k_Hs         = k_head_stride_bytes;
-    args.s_k_Bs         = 0;
+    args.s_k_Seqs       = 16;               // K vec-col stride: 16 fp8 elements (kVecX)
+    args.s_k_Hs         = k_head_stride_bytes; // K head stride in bytes
+    args.s_k_Bs         = 0;               // K/V not batch-strided (paged)
     args.s_opt          = 0;
     args.s_lse          = 0;
     args.s_kv_seq_len   = max_seqlen_k;
     args.s_qk_head_dim  = 128;
     args.s_v_head_dim   = 128;
     args.s_q_head_num   = nhead_q;
-    args.s_v_Seqs       = num_pages;
-    args.s_v_Hs         = v_head_stride_bytes;
-    args.s_v_Bs         = page_size;
-    args.s_o_Seqs       = batch;
-    args.s_o_Hs         = o_head_stride_bytes;
-    args.s_o_Bs         = 128;
+    args.s_v_Seqs       = v_token_stride;   // V token stride in bytes (within a page)
+    args.s_v_Hs         = v_head_stride_bytes; // V head stride in bytes
+    args.s_v_Bs         = 0;               // V not batch-strided (paged)
+    args.s_o_Seqs       = o_token_stride;   // O token stride in bytes
+    args.s_o_Hs         = o_head_stride_bytes; // O head stride in bytes
+    args.s_o_Bs         = o_batch_stride;   // O batch stride in bytes
     // Reused slots — see kernel.py Phase 1 comments
     args.ptr_LTD        = kv_page_indices;
     args.ptr_LTP        = kv_indptr;
@@ -167,14 +180,14 @@ void {{func_name}}(
     args.ptr_q_descale  = q_descale_per_token;
     args.ptr_k_descale  = k_descale_per_token;
     args.ptr_v_descale  = v_descale_per_head;
-    // Q descale strides: [total_q, nhead_q] fp32, varlen (no per-batch stride)
-    args.s_descale_q_Bs = 0;
-    args.s_descale_q_Hs = 4;   // bytes per head
+    // Q descale: [total_q, nhead_q] fp32; batch stride = max_seqlen_q * nhead_q * 4
+    args.s_descale_q_Bs = max_seqlen_q * nhead_q * 4;
+    args.s_descale_q_Hs = 4;   // bytes per head (stride between heads for one token)
     // K descale strides: [pages, page_size, nhead_k] fp32 — passed as elements, kernel <<2
     args.s_kscale_page_stride  = page_size * nhead_k;
     args.s_kscale_token_stride = nhead_k;
     args.s_kscale_head_stride  = 1;
-    // V descale strides: [nhead_k] fp32 — no batch dim
+    // V descale: [nhead_k] fp32 — no batch dim
     args.s_vscale_Bs    = 0;
     args.s_vscale_Hs    = 4;   // bytes per kv-head
     // P scale (optional)
