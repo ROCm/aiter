@@ -3,7 +3,8 @@
 Accurate path (trace built with -gline-tables-only): every ISA line carries a
 ``file:line``. We classify with this precedence:
 
-  1. control opcodes      s_barrier -> BARRIER, s_waitcnt -> MEMWAIT
+  1. control opcodes      s_barrier -> BARRIER, s_waitcnt vmcnt -> VMWAIT
+                           (DRAM/VMEM), s_waitcnt lgkmcnt -> LGKMWAIT (LDS/sLDS)
   2. unambiguous compute   v_mfma -> MATRIX, v_exp/v_rcp/... -> SOFTMAX
   3. source file           warp_gemm*->MATRIX, hip_math/math/masking->SOFTMAX,
                            buffer_addressing->LOAD, magic_div/coordinate/kernel->ADDR
@@ -28,7 +29,9 @@ LOAD = "load"        # global memory (K/V/Q DRAM) loads
 LDS = "lds"          # ds_read/ds_write (incl. the hoisted V transpose reads)
 ADDR = "addr"        # address calc / offset refresh / kernel setup
 BARRIER = "barrier"
-MEMWAIT = "memwait"  # s_waitcnt
+VMWAIT = "vmwait"      # s_waitcnt vmcnt/vscnt -- waiting on DRAM/VMEM (K/V/Q loads)
+LGKMWAIT = "lgkmwait"  # s_waitcnt lgkmcnt     -- waiting on LDS / scalar-mem roundtrip
+MEMWAIT = "memwait"    # s_waitcnt with both counters (ambiguous) or counterless
 OTHER = "other"
 
 PHASE_COLORS = {
@@ -38,10 +41,12 @@ PHASE_COLORS = {
     LDS:      "#17becf",   # cyan    -- ds_read/write
     ADDR:     "#9467bd",   # purple  -- addressing
     BARRIER:  "#d62728",   # red
-    MEMWAIT:  "#7f7f7f",   # gray
+    LGKMWAIT: "#bcbd22",   # olive   -- LDS-wait (lgkmcnt) -- the real wait floor
+    VMWAIT:   "#7f7f7f",   # gray    -- DRAM-wait (vmcnt)
+    MEMWAIT:  "#c7c7c7",   # light gray -- ambiguous combined wait
     OTHER:    "#dddddd",
 }
-PHASE_ORDER = [MATRIX, SOFTMAX, LDS, LOAD, ADDR, BARRIER, MEMWAIT, OTHER]
+PHASE_ORDER = [MATRIX, SOFTMAX, LDS, LOAD, ADDR, BARRIER, LGKMWAIT, VMWAIT, MEMWAIT, OTHER]
 
 # ---- mnemonic rules -----------------------------------------------------
 _MFMA = re.compile(r"^v_mfma|^v_smfmac")
@@ -56,7 +61,18 @@ def _mnemonic_phase(c: CodeLine) -> str | None:
         return None
     if m.startswith("s_barrier"):
         return BARRIER
-    if m.startswith("s_waitcnt"):
+    if m.startswith("s_wait"):
+        # Split the wait by which counter(s) it targets so we can tell DRAM
+        # latency (vmcnt/vscnt) apart from LDS / scalar-mem roundtrip (lgkmcnt).
+        # gfx9: "s_waitcnt vmcnt(0)" / "lgkmcnt(0)" / both; gfx12: loadcnt/
+        # storecnt (VMEM) and dscnt/kmcnt (LDS/scalar).
+        isa = c.isa
+        has_vm = any(t in isa for t in ("vmcnt", "vscnt", "loadcnt", "storecnt"))
+        has_lds = any(t in isa for t in ("lgkmcnt", "dscnt", "kmcnt"))
+        if has_vm and not has_lds:
+            return VMWAIT
+        if has_lds and not has_vm:
+            return LGKMWAIT
         return MEMWAIT
     if _MFMA.match(m):
         return MATRIX
