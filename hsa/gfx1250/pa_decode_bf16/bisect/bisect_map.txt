@@ -26,3 +26,9 @@
 26  KEEP ONLY {04 K_LDS_load}       md5=5fdd1f50   [PASS => single K_LDS_load barrier fixes it]
 27  KEEP ONLY {09 qk-inline-V}      md5=753c232f   [PASS => single qk-inline-V barrier fixes it]
 28  KEEP ONLY {10 pv-inline-K}      md5=edb1ff51   [PASS => single pv-inline-K barrier fixes it]
+
+---- MINIMAL-SYNC (single site, only one of wait_idle/wgp_barrier) ----
+30  site02 K_TDM: wgp_barrier ONLY (no s_wait_idle)   md5=2b4cf09d
+31  site03 V_TDM: wgp_barrier ONLY (no s_wait_idle)   md5=bf3a2569
+32  site02 K_TDM: s_wait_idle ONLY (no wgp_barrier)   md5=5c6e635d
+33  site03 V_TDM: s_wait_idle ONLY (no wgp_barrier)   md5=50740434
