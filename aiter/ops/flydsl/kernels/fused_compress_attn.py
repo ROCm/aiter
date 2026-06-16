@@ -70,7 +70,7 @@ from flydsl.expr.typing import T, Int32, Stream
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl, scf
 
-from .tensor_shim import _to_raw
+from .tensor_shim import _to_raw, _run_compiled
 
 # --- shape constants --------------------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64; D must be a multiple
@@ -1422,7 +1422,7 @@ def flydsl_fused_compress_attn(
         stream = torch.cuda.current_stream()
     fx_stream = Stream(stream)
 
-    launcher(
+    args = (
         kv_in,
         kv_in.stride(0),
         score_in,
@@ -1447,5 +1447,6 @@ def flydsl_fused_compress_attn(
         bt_arg,
         bt_seq_stride,
         plan_capacity,
-        stream=fx_stream,
+        fx_stream,
     )
+    _run_compiled(launcher, *args)
