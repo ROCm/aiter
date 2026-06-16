@@ -75,9 +75,15 @@ def test_fmoe(
     strict_accuracy=True,
     check_aot_cache=True,
     swiglu_limit=0.0,
+    ep=1,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
+
+    if ep < 1:
+            raise ValueError(f"ep must be >= 1, got {ep}")
+        global_E = E * ep
+
     torch_quant = aiter.get_torch_quant(qType)
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
@@ -98,17 +104,49 @@ def test_fmoe(
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if AITER_MOE_EXPERT_BALANCE:
-        score = torch.zeros((token, E), dtype=dtype)
+        score = torch.zeros((token, global_E), dtype=dtype)
         start_col = 0
         end_col = topk
         for token_id in range(token):
             score[token_id, start_col:end_col] = 1.0
-            start_col = end_col % E
+            start_col = end_col % global_E
             end_col = start_col + topk
     else:
-        score = torch.randn((token, E), dtype=dtype)
+        score = torch.randn((token, global_E), dtype=dtype)
 
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    expert_mask = None
+    num_local_tokens = None
+    if ep > 1:
+        padded_token = token
+        local_hit = topk_ids < E
+        token_mask = local_hit.any(dim=1)
+        if not token_mask.any():
+            logging.warning(
+                "skip EP case: no tokens routed to rank0 local experts "
+                "(%s global tokens, %s global experts, %s local experts)",
+                token,
+                global_E,
+                E,
+            )
+            return
+        local_input = input[token_mask]
+        local_topk_weights = topk_weights[token_mask]
+        local_topk_ids = topk_ids[token_mask]
+        local_token = local_input.shape[0]
+        num_local_tokens = torch.tensor(
+            [local_token], dtype=topk_ids.dtype, device=input.device
+        )
+
+        expert_mask = torch.zeros((global_E,), dtype=dtypes.i32)
+        expert_mask[:E] = 1
+
+        input = torch.zeros((padded_token, model_dim), dtype=input.dtype)
+        input[:local_token] = local_input
+        topk_weights = torch.zeros((padded_token, topk), dtype=topk_weights.dtype)
+        topk_weights[:local_token] = local_topk_weights
+        topk_ids = torch.zeros((padded_token, topk), dtype=topk_ids.dtype)
+        topk_ids[:local_token] = local_topk_ids
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -352,6 +390,8 @@ def test_fmoe(
         w2_qt_aiter,
         topk_weights,
         topk_ids,
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
         w1_scale=w1_scale_aiter,
         w2_scale=w2_scale_aiter,
         quant_type=qType,
@@ -366,6 +406,10 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
+    if num_local_tokens is not None:
+        valid_token = num_local_tokens.item()
+        out2_ref = out2_ref[:valid_token]
+        out2_ck = out2_ck[:valid_token]
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
     # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
     # producing NaN in the fused_moe output. checkAllclose's err/logits_diff can be
@@ -515,8 +559,17 @@ parser.add_argument(
     "--expert",
     type=int,
     default=257,
-    help="""Number of experts.
+    help="""Number of local experts.
     e.g.: -e 8""",
+)
+
+parser.add_argument(
+    "--ep",
+    type=int,
+    default=1,
+    help="""Expert parallel size. With EP > 1, routing is generated over
+    expert * ep global experts while this script simulates rank0.
+    e.g.: --ep 8""",
 )
 
 parser.add_argument(
@@ -753,6 +806,7 @@ def _iter_legacy_cases():
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
             check_aot_cache=False,
+            ep=args.ep,
             **over,
         )
 
