@@ -1,0 +1,101 @@
+name: Comms Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    branches: [main]
+    paths:
+      - "aiter/ops/triton/comms/**"
+      - "op_tests/comms_tests/**"
+      - ".github/workflows/comms-test.yaml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+  comms-test:
+    name: Comms Tests (${{ matrix.label }})
+    needs: check-signal
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: linux-aiter-mi35x-8
+            label: MI35X
+          - runner: aiter-8gpu-runner
+            label: MI325
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build comms image
+        run: |
+          set -ex
+          TRITON_COMMIT="6898a3288c28d50d1f4e1f91aa5867ca0d1f3c3b"
+          IRIS_COMMIT="04ad32409251c7a7b55a39c8bae4629154e89c2c"
+          docker build --network=host -t aiter_comms_test:ci - <<EOF
+          FROM rocm/pytorch:latest
+          RUN pip config set global.default-timeout 60 && pip config set global.retries 10
+          RUN pip install pytest pyzmq einops
+          RUN pip install pybind11 cmake ninja \
+              && git clone https://github.com/triton-lang/triton.git /app/triton \
+              && cd /app/triton \
+              && git checkout ${TRITON_COMMIT} \
+              && pip install -e . --no-build-isolation
+          RUN pip install "iris @ git+https://github.com/micmelesse/iris.git@${IRIS_COMMIT}"
+          EOF
+
+      - name: Run container
+        run: |
+          set -ex
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run -dt \
+            --device=/dev/kfd $DEVICE_FLAG \
+            --shm-size=16G \
+            --network=host \
+            --ipc=host \
+            --group-add $(getent group render | cut -d: -f3) \
+            --group-add $(getent group video | cut -d: -f3) \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            --name comms_test \
+            aiter_comms_test:ci
+
+      - name: Install aiter
+        run: |
+          set -ex
+          docker exec -w /workspace comms_test \
+            pip install --no-build-isolation -e .
+
+      - name: Run comms tests
+        timeout-minutes: 30
+        run: |
+          set -ex
+          for file in op_tests/comms_tests/test_*.py; do
+            echo "========================================"
+            echo "Running: $file"
+            echo "========================================"
+            docker exec -w /workspace comms_test python3 "$file"
+          done
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f comms_test || true
