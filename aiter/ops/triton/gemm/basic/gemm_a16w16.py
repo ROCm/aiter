@@ -129,9 +129,10 @@ def gemm_a16w16_(
         ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
         assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
 
-        M, _ = x.shape
-        K = x.stride(0)
+        M, K = x.shape
         N, _ = w.shape
+
+        K_stride = x.stride(0)
 
         if config is None:
             config, _ = get_gemm_config("GEMM-A16W16", M, N, K)
@@ -149,8 +150,8 @@ def gemm_a16w16_(
         # N may be unaligned: their descriptor bounds + store mask zero-fill the
         # partial tiles.)
         assert (
-            K % BLOCK_K == 0
-        ), f"K ({K}) must be a multiple of BLOCK_K ({BLOCK_K}) for the gluon a16w16 GEMM"
+            K_stride % BLOCK_K == 0
+        ), f"K_stride ({K_stride}) must be a multiple of BLOCK_K ({BLOCK_K}) for the gluon a16w16 GEMM"
 
         # Clamp the software-pipeline depth to the number of K-tiles.
         #
