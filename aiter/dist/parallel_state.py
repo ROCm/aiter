@@ -130,8 +130,14 @@ def fused_allreduce_rmsnorm_fake(
     w: torch.Tensor,
     eps: float,
     group_name: str,
+    prefill_support: bool = False,
+    x_pad_to_multiple: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(res_inp), torch.empty_like(inp)
+    n = w.shape[-1]
+    if x_pad_to_multiple > 0:
+        n = ((n + x_pad_to_multiple - 1) // x_pad_to_multiple) * x_pad_to_multiple
+    out = torch.empty(inp.shape[:-1] + (n,), dtype=inp.dtype, device=inp.device)
+    return out, torch.empty_like(res_inp)
 
 
 @torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
@@ -142,13 +148,19 @@ def fused_allreduce_rmsnorm_(
     eps: float,
     group_name: str,
     prefill_support: bool = False,
+    x_pad_to_multiple: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._fused_allreduce_rmsnorm_out_place(
-        inp, res_inp, w, eps, prefill_support
+        inp,
+        res_inp,
+        w,
+        eps,
+        prefill_support,
+        x_pad_to_multiple=x_pad_to_multiple,
     )
 
 
@@ -158,6 +170,7 @@ def fused_allreduce_rmsnorm_quant_fake(
     w: torch.Tensor,
     eps: float,
     group_name: str,
+    prefill_support: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(res_inp),
@@ -464,6 +477,7 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
         prefill_support: bool = False,
+        x_pad_to_multiple: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return fused_allreduce_rmsnorm_(
             input_,
@@ -472,6 +486,7 @@ class GroupCoordinator:
             eps,
             group_name=self.unique_name,
             prefill_support=prefill_support,
+            x_pad_to_multiple=x_pad_to_multiple,
         )
 
     def fused_allreduce_rmsnorm_quant(
@@ -481,14 +496,30 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
         prefill_support: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return fused_allreduce_rmsnorm_quant_(
+        quant_type: Any = "per_token",
+        group_size: int = 128,
+        emit_bf16: bool = False,
+    ):
+        if quant_type == "per_token" and group_size == 128 and not emit_bf16:
+            return fused_allreduce_rmsnorm_quant_(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                group_name=self.unique_name,
+                prefill_support=prefill_support,
+            )
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant(
             input_,
             residual_inp_,
             weight_,
             eps,
-            group_name=self.unique_name,
-            prefill_support=prefill_support,
+            prefill_support,
+            quant_type=quant_type,
+            group_size=group_size,
+            emit_bf16=emit_bf16,
         )
 
     def fused_allreduce_rmsnorm_quant_per_group(
@@ -531,6 +562,7 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
         prefill_support: bool = False,
+        x_pad_to_multiple: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -540,6 +572,7 @@ class GroupCoordinator:
             weight_,
             eps,
             prefill_support,
+            x_pad_to_multiple=x_pad_to_multiple,
         )
 
     def _fused_allreduce_rmsnorm_quant_out_place(
@@ -604,14 +637,25 @@ class GroupCoordinator:
         # return outplace_reduce_scatter(input_, group_name=self.unique_name, dim=dim)
         world_size = self.world_size
         assert world_size > 1, "error! world_size = 1"
+        ndim = input_.dim()
         assert (
-            input_.numel() % world_size == 0
-        ), "input shape error, input.numel() % world_size should equals to 0"
-        if input_.shape[0] % world_size == 0:
-            out_dim0 = input_.shape[0] // world_size
-            out_shape = (out_dim0,) + input_.shape[1:]
-        else:
-            out_shape = (input_.numel() // world_size,)
+            -ndim <= dim < ndim
+        ), f"Invalid dim ({dim}) for input tensor with shape {tuple(input_.shape)}"
+        if dim < 0:
+            dim += ndim
+        assert input_.shape[dim] % world_size == 0, (
+            f"input shape error, input.shape[{dim}]={input_.shape[dim]} "
+            f"is not divisible by world_size={world_size}"
+        )
+        # Output keeps the same rank/strides as input, only the scattered
+        # dim shrinks by world_size. Allocation is contiguous; the custom
+        # kernel writes elements in linear order into this layout, so no
+        # post-kernel reshape/copy is needed.
+        out_shape = (
+            input_.shape[:dim]
+            + (input_.shape[dim] // world_size,)
+            + input_.shape[dim + 1 :]
+        )
 
         output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
         if use_custom:
@@ -619,9 +663,20 @@ class GroupCoordinator:
                 input_, output_, group_name=self.unique_name, dim=dim
             )
         else:
-            torch.distributed.reduce_scatter_tensor(
-                output_, input_, group=self.device_group
-            )
+            if dim != 0:
+                input_ = input_.movedim(dim, 0).contiguous()
+                tmp_out_shape = (input_.shape[0] // world_size,) + input_.shape[1:]
+                tmp_output = torch.empty(
+                    tmp_out_shape, dtype=input_.dtype, device=input_.device
+                )
+                torch.distributed.reduce_scatter_tensor(
+                    tmp_output, input_, group=self.device_group
+                )
+                output_ = tmp_output.movedim(0, dim).contiguous()
+            else:
+                torch.distributed.reduce_scatter_tensor(
+                    output_, input_, group=self.device_group
+                )
         return output_
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
@@ -1241,22 +1296,18 @@ def graph_capture():
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    if _CUSTOM or (_DCP is not None and _DCP.world_size > 1):
-        from contextlib import ExitStack
+    from contextlib import ExitStack
 
-        with ExitStack() as stack:
-            context = stack.enter_context(get_tp_group().graph_capture())
-            stack.enter_context(get_pp_group().graph_capture(context))
+    with ExitStack() as stack:
+        context = stack.enter_context(get_tp_group().graph_capture())
+        for group in (get_pp_group(), get_dp_group(), get_ep_group()):
+            if group is not None and group.device_communicator is not None:
+                stack.enter_context(group.graph_capture(context))
             if _DCP is not None and _DCP.world_size > 1:
                 stack.enter_context(_DCP.graph_capture(context))
-            for group in _CUSTOM.values():
-                stack.enter_context(group.graph_capture(context))
-            yield context
-    else:
-        with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
-            context
-        ):
-            yield context
+        for group in _CUSTOM.values():
+            stack.enter_context(group.graph_capture(context))
+        yield context
 
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
