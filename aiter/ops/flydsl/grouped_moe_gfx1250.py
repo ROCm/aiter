@@ -277,6 +277,73 @@ def _grouped_a8w4_prepare_scale_batch(
     ).to(device=device)
 
 
+# ---------------------------------------------------------------------------
+# Weight (B) scale preshuffle -- "N4K8" layout (gfx1250 grouped GEMM).
+#
+# The weight scale folds a 64-row x 256-K super-block (4 WMMA N-tiles x 8 e8m0
+# blocks = 2 WMMA-K steps) into one row so that each lane reads its complete
+# WMMA scaleB operand (the 4 e8m0 blocks = one WMMA-K=128 step) with a single
+# contiguous ds_load_b32; lane = row, op_sel selects the lane-half (see the WMMA
+# scale contract in FlyDSL/tests/kernels/test_wmma_scale_sample.py):
+#
+#   weight_scale_n32k4:
+#   view(E, N//32, 32, k_scale//4, 4)
+#     .permute(0, 1, 3, 2, 4)              # [E, remain_n, remain_k, row32, r]
+#     .reshape(E, N//32, k_scale*32)
+#
+# For a raw byte at (n, ks) (n in [0,N), ks in [0,k_scale)=[0,K//32)):
+#   n  = remain_n*32 + row32              # row32 = n % 32
+#   ks = remain_k*4  + r                  # remain_k = ks // 4 (the WMMA-K step), r = ks % 4
+#   super_row = n // 32
+#   col = remain_k*128 + row32*4 + r
+#
+# The 4 e8m0 blocks (r=0..3) of one WMMA-K step land CONTIGUOUS (one i32);
+# row32 (lane = row) has stride 4, remain_k (WMMA-K step) has stride 128.
+# ---------------------------------------------------------------------------
+def _grouped_b_scale_preshuffle_e8m0(scale: torch.Tensor) -> torch.Tensor:
+    """Preshuffle a raw per-expert weight e8m0 scale into the n32k4 B layout."""
+    scale = scale.view(torch.uint8).contiguous()
+    E, N, k_scale = scale.shape
+    if N % 32 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 32, got {N}")
+    if k_scale % 4 != 0:
+        raise ValueError(
+            f"B-scale k columns (K//32) must be divisible by 4 (K%128==0), "
+            f"got {k_scale}"
+        )
+    remain_n = N // 32
+    remain_k = k_scale // 4
+    g = scale.view(E, remain_n, 32, remain_k, 4)
+    g = g.permute(0, 1, 3, 2, 4).contiguous()
+    return g.reshape(E, remain_n, k_scale * 32)
+
+
+def _grouped_b_scale_prepare_batch(
+    scale: torch.Tensor,
+    *,
+    experts: int,
+    rows: int,
+    k_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Accept raw / flat-raw / already-preshuffled weight scale -> new B layout."""
+    scale_u8 = scale.view(torch.uint8).contiguous()
+    k_scale = k_dim // 32
+    raw_shape = (experts, rows, k_scale)
+    preshuffled_shape = (experts, rows // 32, k_scale * 32)
+    if tuple(scale_u8.shape) == preshuffled_shape:
+        return scale_u8.to(device=device)
+    if tuple(scale_u8.shape) == (experts * rows, k_scale):
+        scale_u8 = scale_u8.view(raw_shape)
+    elif tuple(scale_u8.shape) != raw_shape:
+        raise ValueError(
+            f"B-scale shape must be raw {raw_shape}, flat raw "
+            f"{(experts * rows, k_scale)} or preshuffled {preshuffled_shape}, "
+            f"got {tuple(scale_u8.shape)}"
+        )
+    return _grouped_b_scale_preshuffle_e8m0(scale_u8).to(device=device)
+
+
 def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
     """Torch fallback for route -> grouped-row maps."""
     import torch.nn.functional as F
@@ -704,14 +771,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     grouped_w1 = _grouped_weight_uint8(w1)
     grouped_w2 = _grouped_weight_uint8(w2)
     _grouped_dbg("weight layout done")
-    # Weight scales are already preshuffled per expert.
-    _wmma_rep = warp_tile_n // 16
+    # Weight scales are already preshuffled per expert (n32k4 B-scale layout:
+    # rows N -> N//32 super-rows, k_scale cols -> k_scale*32 folded cols; see
+    # _grouped_b_scale_preshuffle_e8m0).
     grouped_w1_scale = w1_scale.reshape(
-        E, (2 * inter_dim) // _wmma_rep, (model_dim // 32) * _wmma_rep
+        E, (2 * inter_dim) // 32, (model_dim // 32) * 32
     )
-    grouped_w2_scale = w2_scale.reshape(
-        E, model_dim // _wmma_rep, (inter_dim // 32) * _wmma_rep
-    )
+    grouped_w2_scale = w2_scale.reshape(E, model_dim // 32, (inter_dim // 32) * 32)
 
     # grouped_a1_scale already produced above (fast or naive path).
     _grouped_dbg("scale layout done")
