@@ -329,6 +329,11 @@ def _moe_gemm_a4w4_gfx1250(
     offs_x_k_scales = gl.arange(
         0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, BLOCKED_LAYOUT_X_SCALES)
     )
+    x_scales_ptrs = (
+        XMxScale
+        + offs_x_m_scales[:, None] * stride_x_mx_m
+        + offs_x_k_scales[None, :] * stride_x_mx_k
+    )
 
     # B scale pointers
     WMxScale += expt_id * stride_w_mx_e
@@ -471,23 +476,16 @@ def _moe_gemm_a4w4_gfx1250(
         )
         gl.amd.gfx1250.async_copy.global_to_shared(
             x_scales_buffer.index(load_idx % NUM_BUFFERS),
-            (
-                XMxScale
-                + offs_x_m_scales[:, None] * stride_x_mx_m
-                + (offs_x_k_scales[None, :] + idx_x_scales) * stride_x_mx_k
-            ),
+            x_scales_ptrs,
             mask=x_scales_mask,
         )
         gl.amd.gfx1250.async_copy.commit_group()
+        x_scales_ptrs += MX_SCALE_BLOCK_K * stride_x_mx_k
 
         load_idx += 1
 
     # preload tile 0 from LDS into registers
-    if num_ctas > 1:
-        gl.amd.gfx1250.cluster.arrive()
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
-    if num_ctas > 1:
-        gl.amd.gfx1250.cluster.wait()
     gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 1)
     cur_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
     if PRESHUFFLE_WEIGHTS:
@@ -530,8 +528,6 @@ def _moe_gemm_a4w4_gfx1250(
     # main loop: perform wmma and fill LDS with next tile
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     for _ in range(num_k_iter - NUM_BUFFERS):
-        # issue wmma; bracket with the cluster barrier so the cluster sync
-        # overlaps the matmul instead of stacking on top of the async_wait stall
         if num_ctas > 1:
             gl.amd.gfx1250.cluster.arrive()
         acc = gl.amd.gfx1250.wmma_scaled(
@@ -573,14 +569,11 @@ def _moe_gemm_a4w4_gfx1250(
         )
         gl.amd.gfx1250.async_copy.global_to_shared(
             x_scales_buffer.index(load_idx % NUM_BUFFERS),
-            (
-                XMxScale
-                + offs_x_m_scales[:, None] * stride_x_mx_m
-                + (offs_x_k_scales[None, :] + idx_x_scales) * stride_x_mx_k
-            ),
+            x_scales_ptrs,
             mask=x_scales_mask,
         )
         gl.amd.gfx1250.async_copy.commit_group()
+        x_scales_ptrs += MX_SCALE_BLOCK_K * stride_x_mx_k
         load_idx += 1
 
         # prefetch L2_PREFETCH_DISTANCE iters ahead of the load we just issued.
@@ -671,8 +664,6 @@ def _moe_gemm_a4w4_gfx1250(
 
     # epilogue: drain remaining tiles
     for k_ep in gl.static_range(NUM_BUFFERS - 1):
-        # issue wmma; bracket with the cluster barrier so the cluster sync
-        # overlaps the matmul instead of stacking on top of the async_wait stall
         if num_ctas > 1:
             gl.amd.gfx1250.cluster.arrive()
         acc = gl.amd.gfx1250.wmma_scaled(
