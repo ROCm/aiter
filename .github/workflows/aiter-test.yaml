@@ -199,6 +199,23 @@ jobs:
               print(f"Prebuild validation passed: {len(kernels)} kernels compiled")
           PY
 
+      - name: Prepare Aiter wheel cache
+        if: ${{ matrix.build_enabled }}
+        run: |
+          set -euo pipefail
+          rm -rf aiter_wheels
+          mkdir -p aiter_wheels
+          cp dist/*.whl aiter_wheels/
+          ls -lh aiter_wheels
+
+      - name: Save Aiter wheel cache
+        if: ${{ matrix.build_enabled }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: aiter_wheels
+          key: ${{ runner.os }}-aiter-wheel-${{ github.run_id }}-py${{ matrix.python_version }}
+
       - name: Upload wheel as artifact
         if: ${{ matrix.build_enabled }}
         uses: actions/upload-artifact@v4
@@ -433,19 +450,30 @@ jobs:
           echo "AITER_TEST=$(cat aiter_shard_${{ matrix.shard_idx }}.list)" >> $GITHUB_ENV
           echo "$AITER_TEST"
 
+      - name: Restore Aiter wheel cache
+        id: restore_aiter_wheel
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: aiter_wheels
+          key: ${{ runner.os }}-aiter-wheel-${{ github.run_id }}-py3.12
+
       - name: Download Aiter wheel artifact
+        if: steps.restore_aiter_wheel.outputs.cache-hit != 'true'
         id: download_aiter_wheel
         uses: actions/download-artifact@v4
-        timeout-minutes: 5
+        timeout-minutes: 30
         continue-on-error: true
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
           path: aiter_wheels
 
       - name: Retry Download Aiter wheel artifact
-        if: steps.download_aiter_wheel.outcome == 'failure'
+        if: steps.restore_aiter_wheel.outputs.cache-hit != 'true' && steps.download_aiter_wheel.outcome == 'failure'
         uses: actions/download-artifact@v4
-        timeout-minutes: 5
+        timeout-minutes: 30
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
           path: aiter_wheels
@@ -701,7 +729,28 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+      - name: Restore Aiter wheel cache
+        id: restore_aiter_wheel
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: aiter_wheels
+          key: ${{ runner.os }}-aiter-wheel-${{ github.run_id }}-py3.12
+
       - name: Download Aiter wheel artifact
+        if: steps.restore_aiter_wheel.outputs.cache-hit != 'true'
+        id: download_aiter_wheel
+        uses: actions/download-artifact@v4
+        timeout-minutes: 30
+        continue-on-error: true
+        with:
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
+          path: aiter_wheels
+
+      - name: Retry Download Aiter wheel artifact
+        if: steps.restore_aiter_wheel.outputs.cache-hit != 'true' && steps.download_aiter_wheel.outcome == 'failure'
         uses: actions/download-artifact@v4
         timeout-minutes: 30
         with:

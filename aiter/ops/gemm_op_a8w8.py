@@ -6,6 +6,7 @@ from typing import Optional
 
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from aiter import logger
 from torch import Tensor
 from torch.library import Library
@@ -633,6 +634,14 @@ def gemm_a8w8_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
+    w_k = WQ.shape[-1]
+    if w_k > k:
+        XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
+        k = XQ.shape[-1]
+    elif w_k < k:
+        raise RuntimeError(
+            f"gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K={w_k}, " f"XQ K={k}"
+        )
 
     # if (
     #     ck_config is None

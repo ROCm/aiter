@@ -15,7 +15,12 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
 from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import (
+    get_cu_num,
+    get_gfx,
+    get_gfx_runtime,
+    gfx_from_cu_num,
+)
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.flydsl.moe_common import GateMode
@@ -410,6 +415,44 @@ def fused_moe_(
                 q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
+
+    if get_gfx() == "gfx1250":
+        if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
+            q_dtype_a = dtypes.fp8
+        else:
+            q_dtype_a = dtypes.fp4x2
+
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        _maybe_grouped_gfx1250_a8w4_moe,
+    )
+
+    grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        E=E,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        dtype=dtype,
+        activation=activation,
+        quant_type=quant_type,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        isG1U1=isG1U1,
+        doweight_stage1=doweight_stage1,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        expert_mask=expert_mask,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        gate_mode=gate_mode,
+    )
+    if grouped_a8w4_out is not None:
+        return grouped_a8w4_out
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -990,7 +1033,12 @@ def get_2stage_cfgs(
     is_ep=False,
 ):
     gate_mode = GateMode(gate_mode)
+    # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
+    # (e.g. gfx950 vs gfx1250, both report 256 CU) don't collide. Legacy CSVs
+    # without a `gfx` column are backfilled from cu_num at load time via
+    # ``_ensure_gfx_column`` (see gfx_from_cu_num).
     _INDEX_COLS = [
+        "gfx",
         "cu_num",
         "token",
         "model_dim",
@@ -1006,10 +1054,25 @@ def get_2stage_cfgs(
         "doweight_stage1",
     ]
 
+    def _ensure_gfx_column(df):
+        """Guarantee a usable `gfx` column, migrating legacy cu_num-only CSVs."""
+        if "gfx" not in df.columns:
+            df = df.copy()
+            df["gfx"] = df["cu_num"].map(gfx_from_cu_num)
+            return df
+        # Backfill placeholder/missing gfx (e.g. 0 filled when merging a config
+        # that lacks the column against ones that have it).
+        bad = df["gfx"].isna() | df["gfx"].astype(str).isin(["0", "", "nan", "None"])
+        if bad.any():
+            df = df.copy()
+            df.loc[bad, "gfx"] = df.loc[bad, "cu_num"].map(gfx_from_cu_num)
+        return df
+
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
         df = pd.read_csv(tune_file)
+        df = _ensure_gfx_column(df)
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
 
@@ -1051,6 +1114,7 @@ def get_2stage_cfgs(
             _flydsl_fallback_cache[tune_file] = {}
             return {}
         df = pd.read_csv(tune_file)
+        df = _ensure_gfx_column(df)
         if "_tag" not in df.columns:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
@@ -1079,11 +1143,13 @@ def get_2stage_cfgs(
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
+    gfx = get_gfx_runtime()
     # EP convention: callers append one always-masked fake-expert slot to
     # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
     # on routed_topk; strip the fake slot before building the lookup key.
     topk -= int(is_ep)
     keys = (
+        gfx,
         cu_num,
         token,
         model_dim,
@@ -1099,6 +1165,7 @@ def get_2stage_cfgs(
         doweight_stage1,
     )
     keys_disabled = (
+        gfx,
         cu_num,
         token,
         model_dim,
@@ -1146,8 +1213,11 @@ def get_2stage_cfgs(
         if result is None and token > _PADDED_M_TIERS[0]:
             tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
             for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
-                keys_fb = (keys[0], fallback_tier) + keys[2:]
-                keys_fb_disabled = (keys_disabled[0], fallback_tier) + keys_disabled[2:]
+                # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
+                keys_fb = keys[:2] + (fallback_tier,) + keys[3:]
+                keys_fb_disabled = (
+                    keys_disabled[:2] + (fallback_tier,) + keys_disabled[3:]
+                )
                 result = primary.get(keys_fb, None)
                 if result is None:
                     result = fallback.get(keys_fb_disabled, None)
