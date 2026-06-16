@@ -2421,8 +2421,8 @@ apply_neox_rope_pack_shuffle(
         if(dim < rotary_dim)
         {
             const float self = static_cast<float>(x[i]);
-            const float peer_xor = __shfl_xor(self, partner_delta, 64);
-            const float peer_up = __shfl_up(self, partner_delta, 64);
+            const float peer_xor = __shfl_xor(self, partner_delta, 32);
+            const float peer_up = __shfl_up(self, partner_delta, 32);
             const float c = static_cast<float>(cos_vec[i]);
             const float s = static_cast<float>(sin_vec[i]);
             y[i] = dim < embed_dim ? downcast_s<T>(self * c - peer_xor * s)
