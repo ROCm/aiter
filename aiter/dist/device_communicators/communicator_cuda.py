@@ -463,10 +463,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         fused_ok = False
         out = res_out = scale_out = bf16_out = None
         ca_comm = self.ca_comm
+        input_is_packable_slice = can_pack_2d_last_dim_slice(input_)
+        can_use_custom_ar_input = ca_comm is not None and (
+            ca_comm.should_custom_ar(input_, prefill_support)
+            or (
+                input_is_packable_slice
+                and ca_comm.should_custom_ar_bytes(input_, prefill_support)
+            )
+        )
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
+            and can_use_custom_ar_input
             and K % group_size == 0
             and K <= 16384
             and total_bytes < 8 * 1024 * 8192
@@ -486,6 +494,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 group_size,
                 use_1stage,
                 emit_bf16=emit_bf16,
+                prefill_support=prefill_support,
             )
             if result is None:
                 raise RuntimeError(
