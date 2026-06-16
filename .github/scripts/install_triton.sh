@@ -64,7 +64,7 @@ TRITON_INDEX_URL="https://pypi.amd.com/triton/release_tmp/rocm-7.0.0/simple/"
 ROCM_VERSION=$(dpkg -l rocm-core 2>/dev/null | awk '/^ii/{print $3}' || true)
 if [[ -n "$ROCM_VERSION" ]]; then
     ROCM_MAJOR_MINOR=$(echo "$ROCM_VERSION" | cut -d. -f1,2)
-    TRITON_INDEX_URL="https://pypi.amd.com/triton/release_/rocm-${ROCM_MAJOR_MINOR}.0/simple/"
+    TRITON_INDEX_URL="https://pypi.amd.com/triton/release_tmp/rocm-${ROCM_MAJOR_MINOR}.0/simple/"
 fi
 
 TRITON_WHEEL_DIR=${TRITON_WHEEL_DIR:-}
