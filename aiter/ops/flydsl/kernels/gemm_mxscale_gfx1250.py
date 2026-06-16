@@ -53,15 +53,13 @@ SCALES_PER_WMMA = WMMA_K // SCALE_BLOCK  # 4
 
 # n32k4 weight (B) scale layout (see grouped_moe_gfx1250._grouped_b_scale_
 # preshuffle_e8m0): a 32-row super-row folds the column as
-# col = remain_k*BS_N32K4_KSTEP_BYTES + row32*BS_N32K4_R + r, where remain_k is
-# the WMMA-K=128 step, row32 (==lane) the row, r (0-3) the K-block.  The 4 e8m0
+# col = remain_k*BS_N32K4_KSTEP_BYTES + row32*SCALES_PER_WMMA + r, where remain_k
+# is the WMMA-K=128 step, row32 (==lane) the row, r (0-3) the K-block.  The 4 e8m0
 # of one WMMA-K step are contiguous (one i32 = one lane's ds_load_b32 scaleB).
 BS_N32K4_BLOCK_N = 32  # N rows per super-row
 BS_N32K4_SUBBLOCK_N = WMMA_N  # 16, N rows per WMMA N-tile (= one op_sel half)
-BS_N32K4_R = SCALES_PER_WMMA  # 4, e8m0 per WMMA-K step = bytes per lane dword
-BS_N32K4_KSTEP_BYTES = BS_N32K4_BLOCK_N * BS_N32K4_R  # 128, WMMA-K step col stride
-BS_N32K4_HALF_BYTES = BS_N32K4_SUBBLOCK_N * BS_N32K4_R  # 64, 16-row half stride
-BS_N32K4_TILES_PER_SROW = BS_N32K4_BLOCK_N // BS_N32K4_SUBBLOCK_N  # 2
+BS_N32K4_KSTEP_BYTES = BS_N32K4_BLOCK_N * SCALES_PER_WMMA  # 128, WMMA-K step col stride
+BS_N32K4_HALF_BYTES = BS_N32K4_SUBBLOCK_N * SCALES_PER_WMMA  # 64, 16-row half stride
 
 
 def _deepgemm_num_1d_blocks_per_group(
@@ -979,55 +977,31 @@ def compile_mxscale_gemm(
             is_full_n32k4 = is_fp4 or b_opsel_on  # warp covers a full 32-row super-row
             _bs_row_bytes = scale_k_per_tile * BS_N32K4_BLOCK_N  # LDS super-row width
 
-            def _n32k4_kstep_off(ks):
-                return ks * BS_N32K4_KSTEP_BYTES
-
-            def _bs_n32k4_tile_byte_off(idx):
-                # per-tile: cross-super-row step + the 16-row half within it.
-                return (idx // BS_N32K4_TILES_PER_SROW) * _bs_row_bytes + (
-                    idx % BS_N32K4_TILES_PER_SROW
-                ) * BS_N32K4_HALF_BYTES
-
-            def _bs_n32k4_pair_byte_off(idx):
-                return idx * _bs_row_bytes  # one pair == one super-row
-
             def _precompute_b_scale_n32k4_base(lds_ptr, warp_n_base):
                 """Per-lane byte base at this warp's first super-row, ks 0, tile 0."""
                 super_local = warp_n_base / arith.index(BS_N32K4_BLOCK_N)
                 base = super_local * arith.index(_bs_row_bytes) + lane16 * arith.index(
-                    BS_N32K4_R  # each lane owns one dword (row32 == lane)
+                    SCALES_PER_WMMA  # each lane owns one dword (row32 == lane)
                 )
                 if const_expr(is_full_n32k4):
                     # lane_kgrp picks the 16-row half; op_sel selects the N-tile.
                     base = base + lane_kgrp * arith.index(BS_N32K4_HALF_BYTES)
                 elif const_expr(warp_tile_n < BS_N32K4_BLOCK_N):
-                    # warp_tile_n==16: warp owns one 16-row half; super_local dropped
-                    # it, so add (warp_n_base % 32) -> 0 or 64 bytes back.
-                    row_in_srow = warp_n_base - super_local * arith.index(
-                        BS_N32K4_BLOCK_N
-                    )
-                    base = base + row_in_srow * arith.index(BS_N32K4_R)
+                    # warp_tile_n==16: two warps share a super-row — even wave_n_idx
+                    # = low half, odd = high half (mirrors per-pair's lane_kgrp).
+                    warp_half = wave_n_idx % arith.index(2)
+                    base = base + warp_half * arith.index(BS_N32K4_HALF_BYTES)
                 return lds_ptr, [base]
 
             def _load_b_scale_n32k4(lds_buffer, scale_base, ks, wn_start, wn_count):
-                """One ds_load_b32 per unit -> full scaleB i32.  per-pair duplicates
-                each dword as [b32, filler] so consumers can index b_scales[i*2]."""
-                q_off = _n32k4_kstep_off(ks)
+                # per-pair: wn picks the super-row; per-tile: wn is always 0 (single
+                # N-tile) so this reduces to k_off, with the base holding the half.
+                k_off = ks * BS_N32K4_KSTEP_BYTES
                 results = []
                 for i in range_constexpr(wn_count):
                     wn = wn_start + i
-                    if const_expr(is_full_n32k4):
-                        off = scale_base + arith.index(
-                            _bs_n32k4_pair_byte_off(wn) + q_off
-                        )
-                        b32 = lds_load_b32_raw(lds_buffer, off)
-                        results.append(b32)
-                        results.append(b32)  # filler for the [2*i] indexing
-                    else:
-                        off = scale_base + arith.index(
-                            _bs_n32k4_tile_byte_off(wn) + q_off
-                        )
-                        results.append(lds_load_b32_raw(lds_buffer, off))
+                    off = scale_base + arith.index(wn * _bs_row_bytes + k_off)
+                    results.append(lds_load_b32_raw(lds_buffer, off))
                 return results
 
             def _load_b_and_scales(
@@ -1038,18 +1012,8 @@ def compile_mxscale_gemm(
                     load_b_frag(b_buf, b_bases, wn, ks)
                     for wn in range_constexpr(wmma_n_rep)
                 ]
-                # n32k4: one ds_load_b32 per unit = full scaleB i32.  op_sel off ->
-                # one dword per N-tile; op_sel on -> one per N-tile PAIR.
                 _n_units = wmma_n_rep // 2 if b_opsel_on else wmma_n_rep
-                b_scales_all = _load_b_scale_n32k4(bs_buf, bs_bases[0], ks, 0, _n_units)
-                if const_expr(is_fp4):
-                    # fp4 never op_sels the weight scale (scaleAType=0); the emit
-                    # indexes b_scales[wn*2] into the [b32, filler] pairs.
-                    b_scales = b_scales_all
-                elif const_expr(b_opsel_on):
-                    b_scales = b_scales_all[::2]
-                else:
-                    b_scales = b_scales_all
+                b_scales = _load_b_scale_n32k4(bs_buf, bs_bases[0], ks, 0, _n_units)
                 a_scales_all = load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
                 if const_expr(use_scale_opsel):
                     a_scales = a_scales_all[::2]
@@ -1074,16 +1038,13 @@ def compile_mxscale_gemm(
                         b_frags[wn],
                         a_frag,
                         accs[idx],
-                        b_scales[wn * 2],
+                        b_scales[wn],
                         a_scales[a_scale_idx],
                         scaleAType=0,
                         scaleBType=a_opsel,
                     )
                 else:
                     # 16x16x128 WMMA: A8W4 (fmtA=FP4) or FP8 (fmtA=FP8).
-                    # Weight scale = scaleAType (the WMMA A operand).  op_sel on ->
-                    # one i32 per N-tile PAIR (op_sel picks the 16-row half);
-                    # op_sel off -> one i32 per N-tile.
                     if const_expr(b_opsel_on):
                         b_scale_idx = wn // 2
                         b_opsel = wn % 2
@@ -1299,9 +1260,6 @@ def compile_mxscale_gemm(
 
                 def _load_b_half_bundle(wn_base, rep_start, ks):
                     b_frags = _load_b_half(wn_base, ks)
-                    # fp4: rep_start in {0, _bank_half_b_scale_rep} -> fp4-wn
-                    # rep_start//_bank_half_b_scale_rep; lane_kgrp picks the 2nd
-                    # N-tile of the 32-row op. result[wn_local*2] = real dword.
                     b_scales = _load_b_scale_n32k4(
                         bs_buf,
                         bs_bases[0],
@@ -1340,7 +1298,7 @@ def compile_mxscale_gemm(
                                 b_frags[wn_local],
                                 a_frag,
                                 current_accs[idx],
-                                b_scales[wn_local * 2],
+                                b_scales[wn_local],
                                 a_scale,
                                 scaleAType=0,
                                 scaleBType=a_opsel,
