@@ -49,6 +49,7 @@ def gemm_a8w8_ck(
     splitK: int = 0,
 ) -> torch.Tensor: ...
 
+
 @compile_ops(
     "module_gemm_a8w8_cktile",
     fc_name="gemm_a8w8_cktile",
