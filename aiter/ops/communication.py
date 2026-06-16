@@ -28,6 +28,7 @@ def init_dist_env(
     local_rank: int = -1,
     data_parallel_size: int = 1,
     data_parallel_rank: int = 0,
+    decode_context_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
 ):
     pipeline_model_parallel_size = 1
@@ -52,6 +53,7 @@ def init_dist_env(
     ensure_model_parallel_initialized(
         tensor_model_parallel_size,
         pipeline_model_parallel_size,
+        decode_context_model_parallel_size=decode_context_parallel_size,
         data_parallel_size=data_parallel_size,
         prefill_context_model_parallel_size=prefill_context_model_parallel_size,
     )
