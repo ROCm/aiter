@@ -582,11 +582,12 @@ def test_mla_cp(
 
         # per-rank comparison: aiter kernel vs CP reference (this rank's shard),
         # comparing the raw kernel outputs directly (no NaN sanitization).
+        local_lens_r = (kv_indptr_r[1:] - kv_indptr_r[:-1]).tolist()
         checkAllclose(
             o_r.float(),
             o_a,
             msg=f"mla_cp_round_robin W={W} qlen={qlen} rank{r} "
-            f"local_len={local_lens} has_NaN={bool(torch.isnan(o_a).any())} "
+            f"local_len={local_lens_r} has_NaN={bool(torch.isnan(o_a).any())} "
             f"[cp_ref vs aiter]:......",
         )
         if return_lse:
