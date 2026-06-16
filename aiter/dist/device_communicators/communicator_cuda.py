@@ -71,6 +71,25 @@ def _can_1stage_fused_ar_rms_quant(input_: torch.Tensor) -> bool:
     return _can_fused_ar_rms_quant(input_)
 
 
+def _can_1stage_fused_ar_rms(input_: torch.Tensor, out_hidden_dim: int = 0) -> bool:
+    hidden_dim = int(input_.shape[-1])
+    element_size = input_.element_size()
+    if hidden_dim <= 0:
+        return False
+    if input_.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if element_size <= 0 or 16 % element_size != 0:
+        return False
+    pack_size = 16 // element_size
+    out_hidden_dim = out_hidden_dim or hidden_dim
+    return (
+        hidden_dim % pack_size == 0
+        and out_hidden_dim % pack_size == 0
+        and hidden_dim // pack_size <= 1024
+        and out_hidden_dim // pack_size <= 1024
+    )
+
+
 class CudaCommunicator(DeviceCommunicatorBase):
     # AITER_AR_1STAGE=1 forces 1stage, =0 forces non-1stage, unset uses auto
     _ar_1stage_override = {"1": True, "0": False}.get(
@@ -295,7 +314,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         use_1stage = (
             self._ar_1stage_override
             if self._ar_1stage_override is not None
-            else (total_bytes <= 128 * 1024)
+            else _can_1stage_fused_ar_rms(input_, out_n)
         )
         if (
             not use_general_path
