@@ -45,9 +45,13 @@ def cal_diff(
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
     amax_diff = (x - y).abs().max().item()
     thr = 3e-2 if use_fp8 else 1e-5
-    flag = "  <<< OVER" if cos_diff >= thr else ""
+    flag = (
+        "  <<< over-thr (bf16 merge noise; checkAllclose is authoritative)"
+        if cos_diff >= thr
+        else ""
+    )
     print(
-        f"[cal_diff] {name}: cos_diff={cos_diff:.3e}, amax_diff={amax_diff:.3e}, thr={thr:.0e}{flag}"
+        f"[cal_diff] {name}: cos_diff={cos_diff:.3e} amax_diff={amax_diff:.3e} thr={thr:.0e}{flag}"
     )
 
 
