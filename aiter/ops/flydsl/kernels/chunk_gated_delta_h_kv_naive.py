@@ -133,19 +133,25 @@ def compile_chunk_gated_delta_h_kv_naive(
     BT_MTILES = BT // WMMA_N  # 16-row BT M-tiles a warp spans in GEMM1 (=4)
 
     # -- LDS layout (no lds_h: KV h-store goes reg -> HBM directly) --
-    LDS_W_STRIDE = K
+    # lds_w / lds_k row pads break LDS bank conflicts. K (=128 bf16 = 256 B) is
+    # a multiple of the 32-bank LDS period (128 B), so a plain row stride makes
+    # the GEMM ds reads (which stride across rows by the LDS stride) land on the
+    # same banks. Padding the row stride breaks that integer-multiple relation
+    # and offsets the banks WITHOUT any XOR swizzle, so a tile address stays
+    # "base + const" and NO extra address-chain / VGPR is introduced (a
+    # row-dependent swizzle, by contrast, makes the GEMM2 hi/lo k tiles use
+    # different column permutations -> two independent address chains -> +~20
+    # VGPR -> drops to 2 waves). The pads were chosen by a counter sweep
+    # (SQ_LDS_BANK_CONFLICT) on K128/BT64/BV64: lds_w pad=4 + lds_k pad=8 gives
+    # 67.6M conflict cycles vs 470M unpadded (-86%); they are coupled (lds_w's
+    # pad shifts lds_k's bank alignment), and conflict is non-monotonic in the
+    # pad value, so these are tuned for this shape. LDS cost is ~1.5 KB total.
+    LDS_W_PAD = 4
+    LDS_W_STRIDE = K + LDS_W_PAD
     LDS_W_ELEMS = BT * LDS_W_STRIDE
     LDS_W_BYTES = LDS_W_ELEMS * 2
 
-    # lds_k row pad: K (=128 bf16 = 256 B) is a multiple of the 32-bank LDS
-    # period (128 B), so a plain stride makes the GEMM2 ds_read_tr16 (which
-    # strides across rows by LDS_K_STRIDE) hit the same banks -> bank conflict.
-    # Padding the row stride breaks the integer-multiple relation and offsets
-    # the banks WITHOUT any XOR swizzle, so the hi tile address stays "lo +
-    # const" and no extra address-chain / VGPR is introduced (unlike a
-    # row-dependent swizzle). +4 mirrors lds_vn's pad; LDS cost is tiny
-    # (BT*4*2 = 512 B).
-    LDS_K_PAD = 4
+    LDS_K_PAD = 8
     LDS_K_STRIDE = K + LDS_K_PAD
     LDS_K_ELEMS = BT * LDS_K_STRIDE
     LDS_K_BYTES = LDS_K_ELEMS * 2
@@ -243,12 +249,6 @@ def compile_chunk_gated_delta_h_kv_naive(
         # -- Cooperative load decomposition --
         load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
         load_col_base = (tid % fx.Int32(THREADS_PER_ROW_64)) * fx.Int32(LOAD_VEC_WIDTH)
-
-        def _xor_swizzle(row, col):
-            return col ^ ((row & fx.Int32(0x7)) << fx.Int32(3))
-
-        def _xor_swizzle_idx(row, col):
-            return col ^ ((row & fx.Index(0x7)) << fx.Index(3))
 
         v8bf16_type = T.vec(8, T.bf16)
         lds_w_memref = lds_w_ptr.get()
@@ -402,8 +402,10 @@ def compile_chunk_gated_delta_h_kv_naive(
                     )
                     w_vec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
                     col = fx.Int32(kb * 64) + load_col_base
-                    swz_col = _xor_swizzle(row, col)
-                    w_lds_off = row * fx.Int32(LDS_W_STRIDE) + swz_col
+                    # Pad-based bank-conflict avoidance (no XOR swizzle): the
+                    # column is the plain logical column; the row pad in
+                    # LDS_W_STRIDE offsets the banks. GEMM1 read mirrors this.
+                    w_lds_off = row * fx.Int32(LDS_W_STRIDE) + col
                     lds_w.vec_store((fx.Index(w_lds_off),), w_vec, LOAD_VEC_WIDTH)
 
             # OPT-C(g): cooperatively stage this chunk's per-row g into lds_g.
@@ -457,9 +459,8 @@ def compile_chunk_gated_delta_h_kv_naive(
                         w_lds_col_idx = fx.Index(
                             kb * 64 + slot * 16
                         ) + lane_m_base_idx * fx.Index(4)
-                        w_lds_col_idx = _xor_swizzle_idx(
-                            w_lds_row_idx, w_lds_col_idx
-                        )
+                        # Plain logical column; bank conflicts are avoided by the
+                        # LDS_W_STRIDE row pad (matches the cooperative store).
                         w_lds_idx = (
                             w_lds_row_idx * fx.Index(LDS_W_STRIDE) + w_lds_col_idx
                         )
