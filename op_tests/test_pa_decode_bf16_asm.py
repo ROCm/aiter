@@ -838,64 +838,65 @@ def test_pa_decode_vmask(
         inp["V"], 0.0, inp["kv_indices"], inp["kv_indptr"], inp["seq_lens_kv"], ps
     )
 
-    # ---- DETERMINISM CONTROL: run the SAME (zero-V) input twice. ----
-    # Inputs are seed-fixed, so any byte difference between two zero-V runs is GPU
-    # nondeterminism (a race), NOT a V-padding effect.  If this fires, the NaN-vs-0
-    # mismatch below is measuring that race, not the V-mask — so the V-mask verdict
-    # is inconclusive until the race is fixed.
-    out_zero_raw, so_zero, sl_zero = _run_pa_kernel(inp, V_zero)
-    out_zero_raw2, so_zero2, sl_zero2 = _run_pa_kernel(inp, V_zero)
-    det_mismatch = int((_bits(out_zero_raw) != _bits(out_zero_raw2)).sum().item()) + int(
-        (_bits(so_zero) != _bits(so_zero2)).sum().item()
-    )
-    nondeterministic = det_mismatch > 0
+    # Run zero-V twice (determinism control) + NaN-V once.  Inputs are seed-fixed.
+    out_z1_raw, so_z1, sl_z1 = _run_pa_kernel(inp, V_zero)
+    out_z2_raw, so_z2, sl_z2 = _run_pa_kernel(inp, V_zero)
+    out_n_raw, so_n, sl_n = _run_pa_kernel(inp, V_nan)
 
-    # ---- kernel-side V-mask test (NaN-V vs zero-V) ----
-    out_nan_raw, so_nan, sl_nan = _run_pa_kernel(inp, V_nan)
+    # IMPORTANT: the raw `out` (direct-O tensor) is UNINITIALIZED for split rows —
+    # for a split work the kernel writes split_o, NOT out, and cpu_reduce fills out
+    # afterward.  So out_raw's split rows differ run-to-run (uninit GPU memory) and
+    # carry junk/NaN that is NOT a kernel race or a V leak.  We therefore judge ONLY
+    # the well-defined signals and report raw `out` diff separately as harmless:
+    #   * split_o            — kernel partials, zero-initialized -> deterministic if clean
+    #   * FINAL reduced out  — cpu_reduce overwrites the uninit split rows
+    def rd(o, so, sl):
+        return cpu_reduce(
+            o.clone(), so, sl, inp["reduce_indptr"],
+            inp["reduce_final_map"], inp["reduce_partial_map"], inp["gqa"],
+        )
 
-    kern_mismatch = int((_bits(out_nan_raw) != _bits(out_zero_raw)).sum().item()) + int(
-        (_bits(so_nan) != _bits(so_zero)).sum().item()
-    )
-    kern_nan = int(torch.isnan(out_nan_raw.float()).sum().item()) + int(
-        torch.isnan(so_nan.float()).sum().item()
-    )
-    # V-mask is only judged when the kernel is deterministic; otherwise the race
-    # dominates and the result is inconclusive.
-    kern_ok = (kern_mismatch == 0) and (kern_nan == 0) and not nondeterministic
+    final_z1 = rd(out_z1_raw, so_z1, sl_z1)
+    final_z2 = rd(out_z2_raw, so_z2, sl_z2)
+    final_n = rd(out_n_raw, so_n, sl_n)
 
-    # ---- final post-reduce output (informational; host cpu_reduce included) ----
-    out_nan = cpu_reduce(
-        out_nan_raw.clone(), so_nan, sl_nan, inp["reduce_indptr"],
-        inp["reduce_final_map"], inp["reduce_partial_map"], inp["gqa"],
-    )
-    out_zero = cpu_reduce(
-        out_zero_raw.clone(), so_zero, sl_zero, inp["reduce_indptr"],
-        inp["reduce_final_map"], inp["reduce_partial_map"], inp["gqa"],
-    )
-    final_mismatch = int((_bits(out_nan) != _bits(out_zero)).sum().item())
-    final_nan = int(torch.isnan(out_nan.float()).sum().item())
-    # A NaN that appears only after the (clean, matching) kernel side is host-reduce.
-    host_nan = final_nan if kern_ok else 0
+    # Determinism (two identical zero-V runs): well-defined outputs must match.
+    det_final = int((_bits(final_z1) != _bits(final_z2)).sum().item())
+    det_split_o = int((_bits(so_z1) != _bits(so_z2)).sum().item())
+    det_out_raw = int((_bits(out_z1_raw) != _bits(out_z2_raw)).sum().item())  # uninit, harmless
+    nondeterministic = (det_final > 0) or (det_split_o > 0)
 
-    status = "RACE" if nondeterministic else ("PASS" if kern_ok else "FAIL")
+    # V-mask (NaN-V vs zero-V): partials + final must match, no NaN reaching either.
+    vmask_split_nan = int(torch.isnan(so_n.float()).sum().item())
+    vmask_split_mismatch = int((_bits(so_n) != _bits(so_z1)).sum().item())
+    final_nan = int(torch.isnan(final_n.float()).sum().item())
+    final_mismatch = int((_bits(final_n) != _bits(final_z1)).sum().item())
+
+    vmask_ok = (
+        not nondeterministic
+        and vmask_split_nan == 0
+        and vmask_split_mismatch == 0
+        and final_nan == 0
+        and final_mismatch == 0
+    )
+    status = "RACE" if nondeterministic else ("PASS" if vmask_ok else "FAIL")
     aiter.logger.info(
-        "[V-mask %s] batch=%d kvh=%d ctx=%s mtp=%d varlen=%s | pad_slots=%d || "
-        "DET_CONTROL(zeroV x2): mismatch=%d %s || KERNEL(NaNvs0): nan=%d mismatch=%d "
-        "|| FINAL: nan=%d mismatch=%d (host_nan=%d)",
+        "[V-mask %s] b=%d kvh=%d ctx=%s mtp=%d | pad=%d || DET(zeroVx2): final=%d "
+        "split_o=%d (out_raw=%d uninit/harmless) || VMASK(NaNvs0): split_o[nan=%d "
+        "mismatch=%d] FINAL[nan=%d mismatch=%d]",
         status,
         inp["batch"],
         kv_head_num,
         context_lens if context_lens is not None else ctx_len,
         mtp,
-        varlen,
         n_pad,
-        det_mismatch,
-        "<-- NONDETERMINISTIC (GPU race; V-mask verdict inconclusive)" if nondeterministic else "",
-        kern_nan,
-        kern_mismatch,
+        det_final,
+        det_split_o,
+        det_out_raw,
+        vmask_split_nan,
+        vmask_split_mismatch,
         final_nan,
         final_mismatch,
-        host_nan,
     )
 
     return {
@@ -905,14 +906,15 @@ def test_pa_decode_vmask(
         "mtp": mtp,
         "varlen": varlen,
         "pad_slots": n_pad,
-        "det_mismatch": det_mismatch,
+        "det_final": det_final,
+        "det_split_o": det_split_o,
+        "det_out_raw_uninit": det_out_raw,
         "nondeterministic": nondeterministic,
-        "kern_nan": kern_nan,
-        "kern_mismatch": kern_mismatch,
+        "vmask_split_nan": vmask_split_nan,
+        "vmask_split_mismatch": vmask_split_mismatch,
         "final_nan": final_nan,
         "final_mismatch": final_mismatch,
-        "host_nan": host_nan,
-        "bitmatch": kern_ok,
+        "bitmatch": vmask_ok,
     }
 
 
@@ -1027,37 +1029,29 @@ if args.vmask:
     df.to_csv("pa_decode_bf16_asm_vmask.csv")
     n_race = int(df["nondeterministic"].sum())
     n_fail = int((~df["bitmatch"]).sum())
-    n_host_nan = int((df["host_nan"] > 0).sum())
     if n_race:
         aiter.logger.error(
-            "V-mask test INCONCLUSIVE: %d/%d configs are NONDETERMINISTIC — running "
-            "the SAME (zero-V) input twice gave different kernel bytes (det_mismatch>0). "
-            "That is a GPU RACE in the kernel, independent of V padding; the NaN-vs-0 "
-            "mismatch is measuring the race, not the V-mask. Fix the race first.",
+            "V-mask test INCONCLUSIVE: %d/%d configs NONDETERMINISTIC — two identical "
+            "zero-V runs differ in split_o or FINAL output (det_split_o/det_final>0). "
+            "That is a real GPU race (NOT the harmless uninit out_raw). Fix it first.",
             n_race,
             len(df),
         )
         sys.exit(2)
     if n_fail:
         aiter.logger.error(
-            "V-mask test FAILED: %d/%d configs — kernel output (out_raw/split_o) "
-            "diverged or held NaN, i.e. stale padding V leaked into the PV WMMA. "
-            "Kernel V-mask is missing/incorrect for those shapes.",
+            "V-mask test FAILED: %d/%d configs — NaN-V vs zero-V diverged or held NaN "
+            "in split_o/FINAL, i.e. stale padding V leaked into the PV WMMA.",
             n_fail,
             len(df),
         )
         sys.exit(1)
-    if n_host_nan:
-        aiter.logger.warning(
-            "V-mask test PASSED (all %d configs: kernel side bit-matches, no kernel "
-            "NaN), but %d config(s) show NaN AFTER cpu_reduce (host_nan>0). That is a "
-            "host-reduce artifact on fully-masked rows, NOT a V-mask bug — the fixed "
-            "cpu_reduce should zero those rows.",
-            len(df),
-            n_host_nan,
-        )
-    else:
-        aiter.logger.info("V-mask test PASSED: all %d configs bit-match.", len(df))
+    aiter.logger.info(
+        "V-mask test PASSED: all %d configs — kernel deterministic, split_o & FINAL "
+        "bit-match between NaN-V and zero-V, no NaN. (det_out_raw is uninitialized "
+        "direct-O scratch for split rows; cpu_reduce overwrites it — harmless.)",
+        len(df),
+    )
 else:
     df = []
     for batch, kv_head_num, ctx_len, mtp in itertools.product(
