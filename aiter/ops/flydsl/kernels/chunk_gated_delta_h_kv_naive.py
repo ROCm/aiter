@@ -137,7 +137,16 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_W_ELEMS = BT * LDS_W_STRIDE
     LDS_W_BYTES = LDS_W_ELEMS * 2
 
-    LDS_K_STRIDE = K
+    # lds_k row pad: K (=128 bf16 = 256 B) is a multiple of the 32-bank LDS
+    # period (128 B), so a plain stride makes the GEMM2 ds_read_tr16 (which
+    # strides across rows by LDS_K_STRIDE) hit the same banks -> bank conflict.
+    # Padding the row stride breaks the integer-multiple relation and offsets
+    # the banks WITHOUT any XOR swizzle, so the hi tile address stays "lo +
+    # const" and no extra address-chain / VGPR is introduced (unlike a
+    # row-dependent swizzle). +4 mirrors lds_vn's pad; LDS cost is tiny
+    # (BT*4*2 = 512 B).
+    LDS_K_PAD = 4
+    LDS_K_STRIDE = K + LDS_K_PAD
     LDS_K_ELEMS = BT * LDS_K_STRIDE
     LDS_K_BYTES = LDS_K_ELEMS * 2
 
