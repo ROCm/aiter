@@ -39,8 +39,6 @@ using BQLayout = ck_tile::tensor_layout::gemm::ColumnMajor;
 using ELayout  = ck_tile::tensor_layout::gemm::RowMajor;
 using DLayout  = ck_tile::tensor_layout::gemm::RowMajor;
 
-using HostArgs = ck_tile::QuantGemmHostArgs;
-
 template <ck_tile::index_t M_Tile,
           ck_tile::index_t N_Tile,
           ck_tile::index_t K_Tile,
@@ -106,23 +104,33 @@ using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             BlockPerCu,
                                             AQRowMajor>;
 
-template <typename DDataType, bool HasBias>
+template <typename EDataType, bool HasBias>
 struct EpilogueTraits;
 
-template <typename DDataType>
-struct EpilogueTraits<DDataType, true>
+template <typename EDataType>
+struct EpilogueTraits<EDataType, true>
 {
-    using ElementwiseOp = ck_tile::element_wise::MultiDAdd;
-    using DLayouts      = ck_tile::tuple<DLayout>;
-    using DDataTypes    = ck_tile::tuple<DDataType>;
+    using ElementwiseOp    = ck_tile::element_wise::MultiDAdd;
+    using DsLayout         = ck_tile::tuple<DLayout>;
+    using DsDataType       = ck_tile::tuple<EDataType>;
+    using CShuffleDataType = TILE_FP32;
 };
 
-template <typename DDataType>
-struct EpilogueTraits<DDataType, false>
+template <typename EDataType>
+struct EpilogueTraits<EDataType, false>
 {
-    using ElementwiseOp = ck_tile::element_wise::PassThrough;
-    using DLayouts      = ck_tile::tuple<>;
-    using DDataTypes    = ck_tile::tuple<>;
+    using ElementwiseOp    = ck_tile::element_wise::PassThrough;
+    using DsLayout         = ck_tile::tuple<>;
+    using DsDataType       = ck_tile::tuple<>;
+    using CShuffleDataType = EDataType;
+};
+
+// Needed only for passing AQDataType and BQDataType to QuantGemmKernel
+template <typename Problem, typename Policy = ck_tile::UniversalGemmPipelineAgBgCrPolicy>
+struct QuantGemmPipelineAgBgCrCompV3 : public ck_tile::GemmPipelineAgBgCrCompV3<Problem, Policy>
+{
+    using AQDataType = ck_tile::remove_cvref_t<typename Problem::AQDataType>;
+    using BQDataType = ck_tile::remove_cvref_t<typename Problem::BQDataType>;
 };
 
 template <typename ABDataType,
@@ -185,30 +193,33 @@ void TileGemmComputeImpl(const HostArguments& args)
         constexpr bool has_hot_loop_v = has_hot_loop_.value;
         constexpr auto tail_number_v  = tail_number_.value;
 
-        using PipelineProblem =
-            ck_tile::GemmRowColTensorQuantPipelineProblem<ABDataType,
-                                                          ABDataType,
-                                                          AccDataType,
-                                                          AccDataType,
-                                                          GemmShape,
-                                                          GemmTraits,
-                                                          TransposeC,
-                                                          ComputeDataType,
-                                                          GemmConfig::Scheduler_v,
-                                                          has_hot_loop_v,
-                                                          tail_number_v>;
+        using PipelineProblem = ck_tile::GemmQuantPipelineProblemBase<
+            ABDataType,
+            DDataType,
+            ABDataType,
+            DDataType,
+            AccDataType,
+            GemmShape,
+            GemmTraits,
+            ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 1>>, // no group size applicable
+            ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 1>>, // no group size applicable
+            TransposeC,
+            ComputeDataType,
+            GemmConfig::Scheduler_v,
+            has_hot_loop_v,
+            tail_number_v>;
 
-        using GemmPipeline = ck_tile::GemmPipelineAgBgCrCompV3<PipelineProblem>;
+        using GemmPipeline = QuantGemmPipelineAgBgCrCompV3<PipelineProblem>;
         static_assert(!GemmConfig::TiledMMAPermuteN_v,
                       "TiledMMAPermuteN=true requires PermuteNEpilogue, not CShuffleEpilogue");
-        using EpTraits = EpilogueTraits<DDataType, HasBias>;
+        using EpTraits     = EpilogueTraits<EDataType, HasBias>;
         using GemmEpilogue = ck_tile::CShuffleEpilogue<
             ck_tile::CShuffleEpilogueProblem<ABDataType,
                                              ABDataType,
-                                             typename EpTraits::DDataTypes,
+                                             typename EpTraits::DsDataType,
                                              AccDataType,
                                              EDataType,
-                                             typename EpTraits::DLayouts,
+                                             typename EpTraits::DsLayout,
                                              ELayout,
                                              typename EpTraits::ElementwiseOp,
                                              TilePartitioner::MPerBlock,
@@ -221,10 +232,17 @@ void TileGemmComputeImpl(const HostArguments& args)
                                              PipelineProblem::TransposeC,
                                              1,
                                              false,
-                                             1>>;
+                                             1,
+                                             1,
+                                             false,
+                                             void,
+                                             void,
+                                             false,
+                                             TILE_FP32,
+                                             typename EpTraits::CShuffleDataType>>;
 
         using Kernel =
-            ck_tile::QuantGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue, QuantMode>;
+            ck_tile::QuantGemmMultiDKernel<TilePartitioner, GemmPipeline, GemmEpilogue, QuantMode>;
 
         auto kargs = Kernel::MakeKernelArgs(args);
 
@@ -246,7 +264,11 @@ void TileGemmComputeImpl(const HostArguments& args)
     BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);
 }
 
-template <typename ABDataType, typename DDataType, typename EDataType, bool HasBias, typename GemmInstance>
+template <typename ABDataType,
+          typename DDataType,
+          typename EDataType,
+          bool HasBias,
+          typename GemmInstance>
 __forceinline__ torch::Tensor gemm_a8w8_cktile_impl(torch::Tensor& XQ,
                                                     torch::Tensor& WQ,
                                                     torch::Tensor& x_scale,
@@ -303,39 +325,80 @@ __forceinline__ torch::Tensor gemm_a8w8_cktile_impl(torch::Tensor& XQ,
     const int BQK = 1; // Column quantization: tensor shape [1, N]
 
     auto runWithBias = [&]() {
-        throw std::runtime_error("Wrong! Bias is supported! Skipping gemm!\n");
+        using HostArgs = ck_tile::QuantGemmMultiDHostArgs<1>;
+
+        HostArgs args(XQ.data_ptr(),
+                      WQ.data_ptr(),
+                      std::array<const void*, 1>{bias.value().data_ptr()},
+                      Y.data_ptr(),
+                      x_scale.data_ptr(),
+                      w_scale.data_ptr(),
+                      k_batch,
+                      M,
+                      N,
+                      K,
+                      AQK,
+                      BQK,
+                      stride_A,
+                      stride_B,
+                      std::array<ck_tile::index_t, 1>{0},
+                      stride_C,
+                      stride_AQ,
+                      stride_BQ);
+
+        TileGemmComputeImpl<ABDataType,
+                            DDataType,
+                            EDataType,
+                            GemmInstance,
+                            HostArgs,
+                            true,
+                            false,
+                            false>(args);
     };
 
     auto runWithoutBias = [&]() {
-        HostArgs args(XQ.data_ptr(),
-                    WQ.data_ptr(),
-                    Y.data_ptr(),
-                    x_scale.data_ptr(),
-                    w_scale.data_ptr(),
-                    k_batch,
-                    M,
-                    N,
-                    K,
-                    AQK,
-                    BQK,
-                    stride_A,
-                    stride_B,
-                    stride_C,
-                    stride_AQ,
-                    stride_BQ);
+        using HostArgs = ck_tile::QuantGemmHostArgs;
 
-        TileGemmComputeImpl<ABDataType, DDataType, EDataType, GemmInstance, HostArgs, false, false, false>(args);
+        HostArgs args(XQ.data_ptr(),
+                      WQ.data_ptr(),
+                      Y.data_ptr(),
+                      x_scale.data_ptr(),
+                      w_scale.data_ptr(),
+                      k_batch,
+                      M,
+                      N,
+                      K,
+                      AQK,
+                      BQK,
+                      stride_A,
+                      stride_B,
+                      stride_C,
+                      stride_AQ,
+                      stride_BQ);
+
+        TileGemmComputeImpl<ABDataType,
+                            DDataType,
+                            EDataType,
+                            GemmInstance,
+                            HostArgs,
+                            false,
+                            false,
+                            false>(args);
     };
 
-    if constexpr(HasBias) {
-        if (bias != std::nullopt) {
+    if constexpr(HasBias)
+    {
+        if(bias != std::nullopt)
+        {
             runWithBias();
         }
-        else {
+        else
+        {
             runWithoutBias();
         }
     }
-    else {
+    else
+    {
         runWithoutBias();
     }
 
