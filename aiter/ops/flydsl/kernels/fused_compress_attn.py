@@ -91,7 +91,14 @@ from .tensor_shim import STensor, _to_raw, _run_compiled
 # Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
 # (the K-split LDS path references these only inside @flyc.kernel / @flyc.jit
 # closures, which formatters may not see).
-_FORCE_BIND_LDS = (CompilationContext, STensor, SmemAllocator, SmemPtr, get_rocm_arch, gpu)
+_FORCE_BIND_LDS = (
+    CompilationContext,
+    STensor,
+    SmemAllocator,
+    SmemPtr,
+    get_rocm_arch,
+    gpu,
+)
 
 # --- shape constants --------------------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64; D must be a multiple
@@ -1413,7 +1420,9 @@ def _build_kernel_ksplit(
             def _col_off_for_k(k_i32):
                 if const_expr(not overlap):
                     return c_zero_i32
-                is_b = arith.cmpi(CmpIPredicate.sge, k_i32, arith.constant(ratio, type=i32))
+                is_b = arith.cmpi(
+                    CmpIPredicate.sge, k_i32, arith.constant(ratio, type=i32)
+                )
                 return arith.select(is_b, c_D, c_zero_i32)
 
             def _load_f32_vec(rsrc, off_elems_i32):
@@ -1595,15 +1604,18 @@ def _build_kernel_ksplit(
             lds_base = allocator.get_base()
             lds_m = STensor(
                 SmemPtr(lds_base, lds_m_off, T.f32, shape=(LDS_ELEMS,)),
-                dtype=T.f32, shape=(LDS_ELEMS,),
+                dtype=T.f32,
+                shape=(LDS_ELEMS,),
             )
             lds_kv = STensor(
                 SmemPtr(lds_base, lds_kv_off, T.f32, shape=(LDS_ELEMS,)),
-                dtype=T.f32, shape=(LDS_ELEMS,),
+                dtype=T.f32,
+                shape=(LDS_ELEMS,),
             )
             lds_w = STensor(
                 SmemPtr(lds_base, lds_w_off, T.f32, shape=(LDS_ELEMS,)),
-                dtype=T.f32, shape=(LDS_ELEMS,),
+                dtype=T.f32,
+                shape=(LDS_ELEMS,),
             )
             lds_thread_base = ArithValue(wid) * c_D + lid_x_vec
             for i in range_constexpr(VEC):
@@ -1725,12 +1737,16 @@ def _build_kernel_ksplit(
                     sin_vals = [arith.extf(f32, sin_b)]
                 else:
                     cos_vec = buffer_ops.buffer_load(
-                        cos_rsrc, cos_row_base + cs_lo,
-                        vec_width=PAIRS_PER_THREAD, dtype=T.bf16,
+                        cos_rsrc,
+                        cos_row_base + cs_lo,
+                        vec_width=PAIRS_PER_THREAD,
+                        dtype=T.bf16,
                     )
                     sin_vec = buffer_ops.buffer_load(
-                        sin_rsrc, cos_row_base + cs_lo,
-                        vec_width=PAIRS_PER_THREAD, dtype=T.bf16,
+                        sin_rsrc,
+                        cos_row_base + cs_lo,
+                        vec_width=PAIRS_PER_THREAD,
+                        dtype=T.bf16,
                     )
                     cos_vals = [
                         arith.extf(
@@ -1863,9 +1879,7 @@ def _build_kernel_ksplit(
                         v = arith.MulFOp(
                             out_lane[i], inv_scale, fastmath=fm_fast
                         ).result
-                        v = arith.minimumf(
-                            arith.maximumf(v, c_neg_fp8_max), c_fp8_max
-                        )
+                        v = arith.minimumf(arith.maximumf(v, c_neg_fp8_max), c_fp8_max)
                         is_tn = arith.andi(
                             arith.cmpf(CmpFPredicate.OLT, v, c_zero),
                             arith.cmpf(CmpFPredicate.OGT, v, c_neg_uf),
@@ -2342,12 +2356,10 @@ def flydsl_fused_compress_attn(
     # CSA Indexer (FP8) shapes the K-split kernel was tuned for; other shapes
     # fall through to the legacy single-wave kernel.
     _is_csa_main = (
-        head_dim == 512 and rope_head_dim == 64 and ratio == 4 and overlap
-        and not quant
+        head_dim == 512 and rope_head_dim == 64 and ratio == 4 and overlap and not quant
     )
     _is_csa_indexer = (
-        head_dim == 128 and rope_head_dim == 64 and ratio == 4 and overlap
-        and quant
+        head_dim == 128 and rope_head_dim == 64 and ratio == 4 and overlap and quant
     )
     if k_split_num_waves is None and has_bt and (_is_csa_main or _is_csa_indexer):
         nw_eff = csa_ksplit_num_waves(plan_capacity)
