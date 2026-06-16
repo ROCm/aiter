@@ -66,8 +66,11 @@ def get_mhc_pre_splitk(m: int, hc_hidden_size: int) -> tuple[int, int]:
     prefetch_stages = 2
     tile_m = 16 * 4
     num_cu = get_cu_num()
+    arch = get_gfx_runtime()
     tile_k_tg_dict = {
         128: 2 * num_cu,
+        64: 4 * num_cu,
+    } if arch.startswith("gfx9") else {
         64: 4 * num_cu,
     }
     selected_splitk = 1
