@@ -54,6 +54,14 @@ SHAPES = {
     "minimax_a": Shape(NE=256, H=3072, INTER=1536, TOPK=8),
     "minimax_b": Shape(NE=256, H=3072, INTER=768, TOPK=8),
     "qwen35_397b": Shape(NE=512, H=4096, INTER=256, TOPK=10),
+    # DeepSeek V4 geometry (production MoE is fp8fp4; here we exercise the a4w4 port
+    # kernels on the same NE/H/INTER/topk). Routed experts NE=384, topk=6, full
+    # inter=3072 sharded for TP2/4/6; EP8 keeps full inter with 48 experts/rank.
+    "dsv4_ep8": Shape(NE=48, H=7168, INTER=3072, TOPK=6),
+    "dsv4_tp2": Shape(NE=384, H=7168, INTER=1536, TOPK=6),
+    "dsv4_tp4": Shape(NE=384, H=7168, INTER=768, TOPK=6),
+    "dsv4_tp6": Shape(NE=384, H=7168, INTER=512, TOPK=6),
+    "dsv4_lite": Shape(NE=256, H=4096, INTER=256, TOPK=6),
 }
 
 

@@ -36,6 +36,13 @@ AUX_EXTRA_SHAPES = [
     (384, 7168, 512, 8),  # Kimi-K2 (NE=384)
     (385, 7168, 256, 9),  # kimik2_b (INTER 256, shares sort key with Kimi-K2.5)
     (512, 4096, 256, 10),  # Qwen3.5 397B (NE=512, TOPK=10)
+    # DeepSeek V4 (a4w4 port of the fp8fp4 geometry): routed NE=384 topk=6, full
+    # inter=3072 sharded TP2/4/6; EP8 keeps full inter at 48 experts/rank.
+    (48, 7168, 3072, 6),  # dsv4 EP8 (full INTER)
+    (384, 7168, 1536, 6),  # dsv4 TP2
+    (384, 7168, 768, 6),  # dsv4 TP4
+    (384, 7168, 512, 6),  # dsv4 TP6
+    (256, 4096, 256, 6),  # dsv4-lite (H=4096)
 ]
 
 # XCD-swizzle group sizes to enumerate for BM=128 paths (large-M targets).

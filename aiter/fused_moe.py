@@ -1024,6 +1024,11 @@ _MXFP4_BM128_SHAPES = frozenset(
         (384, 7168, 512, 8),  # Kimi-K2 (kimik2_a)
         (385, 7168, 256, 9),  # kimik2_b (INTER 256)
         (512, 4096, 256, 10),  # Qwen3.5 397B
+        (48, 7168, 3072, 6),  # dsv4 EP8 (full INTER)
+        (384, 7168, 1536, 6),  # dsv4 TP2
+        (384, 7168, 768, 6),  # dsv4 TP4
+        (384, 7168, 512, 6),  # dsv4 TP6
+        (256, 4096, 256, 6),  # dsv4-lite (H=4096)
     }
 )
 
@@ -1137,6 +1142,46 @@ def _mxfp4_moe_run(
     q_dtype_a=None,
     q_dtype_w=None,
 ):
+    # -- Large-M correctness guard ------------------------------------
+    # The flydsl port gemm scrambles its output above M ~70-82k (a per-token-index
+    # limit in the gemm, NOT the sort/scatter -- both BM16-atomic and BM128-cshuffle
+    # break identically; the legacy is unaffected). MoE is per-token independent, so
+    # processing M in <=_MXFP4_MAX_M chunks is exact (verified cos 0.987 at M=32768)
+    # and restores correctness for >65k-token batches with negligible overhead (the
+    # normal prefill path is already chunked <=16384, so this rarely triggers).
+    _MXFP4_MAX_M = 32768
+    if (
+        hidden_states.shape[0] > _MXFP4_MAX_M
+        and expert_mask is None
+        and num_local_tokens is None
+    ):
+        _chunks = []
+        for _i in range(0, hidden_states.shape[0], _MXFP4_MAX_M):
+            _sl = slice(_i, min(_i + _MXFP4_MAX_M, hidden_states.shape[0]))
+            _chunks.append(
+                _mxfp4_moe_run(
+                    hidden_states[_sl],
+                    w1,
+                    w2,
+                    topk_ids[_sl],
+                    topk_weight[_sl],
+                    topk,
+                    kernelName1=kernelName1,
+                    kernelName2=kernelName2,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    a1_scale=a1_scale,
+                    a2_scale=a2_scale,
+                    block_size_M=block_size_M,
+                    doweight_stage1=doweight_stage1,
+                    activation=activation,
+                    quant_type=quant_type,
+                    q_dtype_a=q_dtype_a,
+                    q_dtype_w=q_dtype_w,
+                )
+            )
+        return torch.cat(_chunks, 0)
+
     # -- Parse kernel names + read shapes ------------------------------
     p1 = _parse_mxfp4_g1_kname(kernelName1)
     p2 = _parse_mxfp4_g2_kname(kernelName2)
