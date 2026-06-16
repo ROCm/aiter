@@ -11,6 +11,10 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_reduce_rms_mxfp4_quant_kernel,
     _fused_dynamic_mxfp4_quant_moe_sort_kernel,
 )
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
+    _gluon_fused_rms_mxfp4_quant_kernel,
+)
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton._triton_kernels.activation import (
     _get_activation_from_str,
 )
@@ -30,6 +34,7 @@ def fused_rms_mxfp4_quant(
     shuffle: Optional[bool] = False,
     scale_shuffle_padding: Optional[bool] = False,
     output_unquantized_inp1=False,
+    inargs: str = "auto",
 ):
     """
     This op contains several steps:
@@ -104,8 +109,26 @@ def fused_rms_mxfp4_quant(
         x2_stride_m = x2.stride(0)
         out2_stride_m = out2.stride(0)
 
+    # auto: gfx1250 -> gluon TDM kernel; else triton. 'gluon'/'triton' force a path.
+    if inargs == "auto":
+        kernel = (
+            _gluon_fused_rms_mxfp4_quant_kernel
+            if get_arch() == "gfx1250"
+            else _fused_rms_mxfp4_quant_kernel
+        )
+    elif inargs == "gluon":
+        if get_arch() != "gfx1250":
+            raise RuntimeError("Gluon kernel only supported on gfx1250 hardware")
+        kernel = _gluon_fused_rms_mxfp4_quant_kernel
+    elif inargs == "triton":
+        kernel = _fused_rms_mxfp4_quant_kernel
+    else:
+        raise ValueError(
+            f"Invalid argument: {inargs}. Choose from auto, gluon, or triton"
+        )
+
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * (2 if (x2 is not None) else 1),)
-    _fused_rms_mxfp4_quant_kernel[grid](
+    kernel[grid](
         x1,
         x1_weight,
         x2,

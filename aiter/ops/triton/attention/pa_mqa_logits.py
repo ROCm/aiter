@@ -253,7 +253,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     VarCtxOpt: bool = False,
 ):
     gfx_version = get_gfx()
-    assert gfx_version == "gfx942" or gfx_version == "gfx950"
+    assert gfx_version in ("gfx942", "gfx950", "gfx1250")
     cdna_version = get_cdna_version()
     target = GPUTarget("hip", gfx_version, 64)
 

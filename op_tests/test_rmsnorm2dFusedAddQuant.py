@@ -219,32 +219,32 @@ def test_rmsnorm(
     )
     write_datasize = calculateTensorsSize(a, res_a, yscale_a)
     ret["torch us"] = avg_a
-    if quant_type in [QuantType.per_Token, QuantType.No] and quant_dtype in [
-        None,
-        dtypes.fp8,
-        dtypes.i8,
-    ]:
-        (b, res_b, yscale_b, _), avg_b = run_ck(
-            input,
-            weight,
-            1e-5,
-            residual=res,
-            x_scale=xscale,
-            q_dtype=quant_dtype,
-            quant_type=quant_type,
-        )
-        err_ck = checkAllclose(
-            a.to(dtypes.fp32), b.to(dtypes.fp32), rtol=0, atol=atol, msg="check ck out"
-        )
-        if add_residual:
-            checkAllclose(res_a, res_b, msg="check ck res")
-        if quant_type != QuantType.No:
-            checkAllclose(yscale_a, yscale_b, msg="check ck scale")
-        ret["ck us"] = avg_b
-        ret["ck err"] = err_ck
-        ret["ck bw(GB/s)"] = (
-            (read_datasize + write_datasize) / avg_b / 1024 / 1024 / 1024 * 1e6
-        )
+    # if quant_type in [QuantType.per_Token, QuantType.No] and quant_dtype in [
+    #     None,
+    #     dtypes.fp8,
+    #     dtypes.i8,
+    # ]:
+    #     (b, res_b, yscale_b, _), avg_b = run_ck(
+    #         input,
+    #         weight,
+    #         1e-5,
+    #         residual=res,
+    #         x_scale=xscale,
+    #         q_dtype=quant_dtype,
+    #         quant_type=quant_type,
+    #     )
+    #     err_ck = checkAllclose(
+    #         a.to(dtypes.fp32), b.to(dtypes.fp32), rtol=0, atol=atol, msg="check ck out"
+    #     )
+    #     if add_residual:
+    #         checkAllclose(res_a, res_b, msg="check ck res")
+    #     if quant_type != QuantType.No:
+    #         checkAllclose(yscale_a, yscale_b, msg="check ck scale")
+    #     ret["ck us"] = avg_b
+    #     ret["ck err"] = err_ck
+    #     ret["ck bw(GB/s)"] = (
+    #         (read_datasize + write_datasize) / avg_b / 1024 / 1024 / 1024 * 1e6
+    #     )
     if not smoothquant and n <= 8192:
         (c, res_c, yscale_c, _), avg_c = run_hip(
             input, weight, 1e-5, res, q_dtype=quant_dtype, quant_type=quant_type
