@@ -1040,6 +1040,11 @@ def test_mha_backward_varlen_fp8(
         (False, (-1, 32)),  # non-causal infinite-left window
     ],
 )
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32],
+    ids=["fp16", "fp32"],
+)
 def test_mha_v3_sliding_window_bwd(
     CAUSAL: bool,
     WINDOW_SIZE: tuple,
@@ -1048,7 +1053,7 @@ def test_mha_v3_sliding_window_bwd(
     NUM_Q_HEADS: int,
     NUM_K_HEADS: int,
     VARLEN: bool,
-    dtype=torch.float16,
+    dtype: torch.dtype,
 ):
     """Exercise the FA3 (interface_v3) backward path with sliding-window attention.
 
@@ -1059,6 +1064,10 @@ def test_mha_v3_sliding_window_bwd(
     """
     BATCH = 2
     HEAD_SZ = 64
+    # fp16 is limited by its ~1e-3 round-trip; fp32 is accumulated in fp32 end to
+    # end (observed max abs error < 4e-6 across these configs), so it gets a much
+    # tighter check.
+    atol, rtol = (1e-2, 1e-2) if dtype == torch.float16 else (1e-4, 1e-3)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -1146,7 +1155,7 @@ def test_mha_v3_sliding_window_bwd(
 
     if VARLEN:
         triton_out = output_pad_fn(triton_out)
-    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(triton_out, torch_out, atol=atol, rtol=rtol)
 
     do = torch.randn_like(torch_out)
     if VARLEN:
@@ -1166,22 +1175,22 @@ def test_mha_v3_sliding_window_bwd(
     torch.testing.assert_close(
         triton_dq,
         torch_dq,
-        atol=1e-2,
-        rtol=1e-2,
+        atol=atol,
+        rtol=rtol,
         msg=lambda m: f"FA3 sliding-window bwd dq mismatch\n\n{m}\n",
     )
     torch.testing.assert_close(
         triton_dk,
         torch_dk,
-        atol=1e-2,
-        rtol=1e-2,
+        atol=atol,
+        rtol=rtol,
         msg=lambda m: f"FA3 sliding-window bwd dk mismatch\n\n{m}\n",
     )
     torch.testing.assert_close(
         triton_dv,
         torch_dv,
-        atol=1e-2,
-        rtol=1e-2,
+        atol=atol,
+        rtol=rtol,
         msg=lambda m: f"FA3 sliding-window bwd dv mismatch\n\n{m}\n",
     )
 

@@ -2959,6 +2959,10 @@ def _bwd_dkdv_inner(
                 causal_mask = (offs_m[None, :] - delta_qk) >= offs_n[:, None]
                 mask = causal_mask & mask
             if USE_SLIDING_WINDOW:
+                # Per-element form of the band a query m attends:
+                #   m + (seqlen_k - seqlen_q) - L <= n <= m + (seqlen_k - seqlen_q) + R.
+                # _sliding_window_q_bounds() is the block-range inversion of this same
+                # inequality (it bounds m for a fixed K block); keep the two in sync.
                 causal_offset = seqlen_k - seqlen_q
                 if WINDOW_SIZE_LEFT < 0:
                     window_mask = offs_n[:, None] <= (
@@ -3161,6 +3165,10 @@ def _bwd_dq_inner(
                 causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
                 mask = causal_mask & mask
             if USE_SLIDING_WINDOW:
+                # Per-element form of the band a query m attends:
+                #   m + (seqlen_k - seqlen_q) - L <= n <= m + (seqlen_k - seqlen_q) + R.
+                # _sliding_window_k_bounds() is the block-range inversion of this same
+                # inequality (it bounds n for a fixed Q block); keep the two in sync.
                 causal_offset = seqlen_k - seqlen_q
                 if WINDOW_SIZE_LEFT < 0:
                     window_mask = offs_n[None, :] <= (
