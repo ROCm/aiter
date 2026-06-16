@@ -51,6 +51,7 @@ class MLAConfig:
     K_ROPE_SCALES_DOT_LAYOUT: gl.constexpr
     KV_LORA_DOT_PACKED_LAYOUT: gl.constexpr
     KV_LORA_SCALES_DOT_BROADCAST_LAYOUT: gl.constexpr
+    KV_LORA_SCALES_DOT_BROADCAST_LAYOUT_LOAD: gl.constexpr
 
     # Layout for loading Q
     Q_LORA_LOAD_LAYOUT: gl.constexpr
@@ -360,6 +361,36 @@ class MLAConfig:
                     ],
                 )
             )
+            # Same layout but with scale_chunk fast in registers and block_row
+            # bits in [4,8,16,64,1,2] order. Used at the LDS load so the 8 fp8
+            # inputs of v_cvt_scale_pk8_bf16_fp8 land packed in 2 consecutive
+            # regs without the v_lshl_or_b32 byte-glue chain. We convert_layout
+            # back to KV_LORA_SCALES_DOT_BROADCAST_LAYOUT after u8->bf16 cvt
+            # so the v*v_scales multiply layout is unchanged.
+            self.KV_LORA_SCALES_DOT_BROADCAST_LAYOUT_LOAD = gl.constexpr(
+                gl.DistributedLinearLayout(
+                    reg_bases=[
+                        [0, 2**v, 0]
+                        for v in range(log2_num_warps, log2_num_head_broadcast_chunk)
+                    ]
+                    + [
+                        [4, 0, 0],
+                        [8, 0, 0],
+                        [16, 0, 0],
+                        [64, 0, 0],
+                        [1, 0, 0],
+                        [2, 0, 0],
+                    ],
+                    lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [32, 0, 0]],
+                    warp_bases=[[0, 2**v, 0] for v in range(log2_num_warps)],
+                    block_bases=[],
+                    shape=[
+                        self.BLOCK_SIZE,
+                        (self.KV_LORA_RANK // self.HEAD_SIZE_SPLIT) // 16,
+                        16,
+                    ],
+                )
+            )
         else:
             self.Q_LORA_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.Q_ROPE_SCALES_DOT_LAYOUT = gl.constexpr(None)
@@ -367,6 +398,7 @@ class MLAConfig:
             self.K_ROPE_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.KV_LORA_DOT_PACKED_LAYOUT = gl.constexpr(None)
             self.KV_LORA_SCALES_DOT_BROADCAST_LAYOUT = gl.constexpr(None)
+            self.KV_LORA_SCALES_DOT_BROADCAST_LAYOUT_LOAD = gl.constexpr(None)
 
         assert NUM_BLOCKS_GATHER_PER_TILE == 1
 
@@ -1226,7 +1258,7 @@ class MLAProgram:
                         1,
                     )
                 )
-                .load(layout=self.cfg.KV_LORA_SCALES_DOT_BROADCAST_LAYOUT)
+                .load(layout=self.cfg.KV_LORA_SCALES_DOT_BROADCAST_LAYOUT_LOAD)
                 .to(scales_dtype, bitcast=True)
             )
 
@@ -1240,6 +1272,9 @@ class MLAProgram:
             )
 
             v_scales = v_scales.to(gl.bfloat16)
+            v_scales = gl.convert_layout(
+                v_scales, self.cfg.KV_LORA_SCALES_DOT_BROADCAST_LAYOUT
+            )
             v = v * v_scales
             v = v.reshape(
                 (self.cfg.BLOCK_SIZE, self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT)

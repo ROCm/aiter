@@ -69,6 +69,7 @@ class AttentionConfig:
     K_SCALES_DOT_LAYOUT: gl.constexpr
     V_DOT_PACKED_LAYOUT: gl.constexpr
     V_SCALES_DOT_BROADCAST_LAYOUT: gl.constexpr
+    V_SCALES_DOT_BROADCAST_LAYOUT_LOAD: gl.constexpr
 
     # Layout for loading Q
     Q_LOAD_LAYOUT: gl.constexpr
@@ -376,11 +377,43 @@ class AttentionConfig:
                     ],
                 )
             )
+            # Same layout as V_SCALES_DOT_BROADCAST_LAYOUT, but with scale_chunk
+            # (dim 1) as the fast-varying register axis. With LDS storing scales
+            # block_row-slow / scale_chunk-fast, this makes the 8 fp8 inputs
+            # consumed by one v_cvt_scale_pk8_bf16_fp8 land in two consecutive
+            # regs per lane directly from ds_load — no v_perm/v_lshl_or chain.
+            # We convert_layout back to V_SCALES_DOT_BROADCAST_LAYOUT after the
+            # u8->bf16 cvt so the v*v_scales multiply layout is unchanged.
+            self.V_SCALES_DOT_BROADCAST_LAYOUT_LOAD = gl.constexpr(
+                gl.DistributedLinearLayout(
+                    reg_bases=[
+                        [0, 2**v, 0]
+                        for v in range(log2_num_warps, log2_num_head_broadcast_chunk)
+                    ]
+                    + [
+                        [4, 0, 0],
+                        [8, 0, 0],
+                        [16, 0, 0],
+                        [64, 0, 0],
+                        [1, 0, 0],
+                        [2, 0, 0],
+                    ],
+                    lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [32, 0, 0]],
+                    warp_bases=[[0, 2**v, 0] for v in range(log2_num_warps)],
+                    block_bases=[],
+                    shape=[
+                        self.BLOCK_SIZE,
+                        (self.HEAD_SIZE // self.HEAD_SIZE_SPLIT) // 16,
+                        16,
+                    ],
+                )
+            )
         else:
             self.Q_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.K_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.V_DOT_PACKED_LAYOUT = gl.constexpr(None)
             self.V_SCALES_DOT_BROADCAST_LAYOUT = gl.constexpr(None)
+            self.V_SCALES_DOT_BROADCAST_LAYOUT_LOAD = gl.constexpr(None)
 
         assert (
             NUM_BLOCKS_GATHER_PER_TILE == 1
@@ -1270,7 +1303,7 @@ class AttentionProgram:
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
             return self.lds_unshuffle_v_scales(buffer_id).load(
-                layout=self.cfg.V_SCALES_DOT_BROADCAST_LAYOUT
+                layout=self.cfg.V_SCALES_DOT_BROADCAST_LAYOUT_LOAD
             )
 
     @gluon.jit
@@ -1498,6 +1531,9 @@ class AttentionProgram:
             v = gl.amd.gfx1250.scaled_upcast(v, v_scales_dummy, gl.bfloat16, axis=0)
             v = v.reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // 16, 16))
             v_scales = v_scales.to(gl.bfloat16)
+            v_scales = gl.convert_layout(
+                v_scales, self.cfg.V_SCALES_DOT_BROADCAST_LAYOUT
+            )
             v = v * v_scales
             v = v.reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE))
             v = v.to(gl.bfloat16)
@@ -1575,7 +1611,7 @@ class AttentionProgram:
                         1,
                     )
                 )
-                .load(layout=self.cfg.V_SCALES_DOT_BROADCAST_LAYOUT)
+                .load(layout=self.cfg.V_SCALES_DOT_BROADCAST_LAYOUT_LOAD)
                 .to(scales_dtype, bitcast=True)
             )
 
@@ -1589,6 +1625,9 @@ class AttentionProgram:
             )
 
             v_scales = v_scales.to(gl.bfloat16)
+            v_scales = gl.convert_layout(
+                v_scales, self.cfg.V_SCALES_DOT_BROADCAST_LAYOUT
+            )
             v = v * v_scales
             v = v.reshape(
                 (self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT)

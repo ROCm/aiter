@@ -130,7 +130,8 @@ def select_3d_config(
     assert kv_cache_dtype in (
         torch.bfloat16,
         e4m3_dtype,
-    ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
+        torch.uint8,
+    ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8})"
     reduce_num_warps = 2
     attn_warps = 2
     waves_per_eu = 2
