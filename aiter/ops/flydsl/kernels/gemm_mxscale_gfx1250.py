@@ -6,6 +6,7 @@ Select precision with ``data_format="fp4"|"fp8"|"a8w4"``.
 """
 
 import os
+from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -116,6 +117,7 @@ def compile_mxscale_gemm(
     grouped_contiguous_num_1d_blocks: int | None = None,
     persistent_workers: int | None = None,
     stage1_act: str | None = None,
+    swiglu_limit: Optional[float] = None,
     stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
     kernel_tag: str = "gemm",
@@ -1534,8 +1536,9 @@ def compile_mxscale_gemm(
             def _stage1_act_mul_scalar(g, u):
                 one = arith.constant(1.0, type=T.f32)
                 alpha = arith.constant(1.702, type=T.f32)
-                limit = arith.constant(7.0, type=T.f32)
-                neg_limit = arith.constant(-7.0, type=T.f32)
+                _lim = 7.0 if not swiglu_limit else float(swiglu_limit)
+                limit = arith.constant(_lim, type=T.f32)
+                neg_limit = arith.constant(-_lim, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
                 if const_expr(stage1_act_mode == "swiglu"):
                     g = arith.minimumf(g, limit)

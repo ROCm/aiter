@@ -1,0 +1,138 @@
+================================================================================
+ gfx1250 Grouped-MoE 性能调查 & 调优汇总
+ 日期: 2026-06-16
+ GPU: AMD gfx1250 (cu_num=256)
+ 测试命令基准: op_tests/test_flydsl_grouped_gemm_gfx1250.py --scenario bench
+              --data-format a8w4 --layout gguu --topk 8 --model-dim 7168
+              --inter-dim 2048 --act silu --no-bias
+ 模型差异: dsr1 = E(experts)=256, kimi = E=384, 其余完全相同
+================================================================================
+
+--------------------------------------------------------------------------------
+ 1. 最初的问题: dsr1 vs kimi 耗时差距过大
+--------------------------------------------------------------------------------
+原始 log (分支 gfx1250_moe_2mode_e2e_v1, token=1):
+    dsr1 (E=256): 93 us
+    kimi (E=384): 127 us
+
+根因 = 两个 run 选中了【不同的 kernel 配置】, 不是单纯专家数多:
+  _find_grouped_config() 用 expert 做精确匹配键查 tuned CSV。
+    - dsr1 (E=256): 命中 tuned 行 -> tile_m=16, split_k1=4, split_k2=2
+    - kimi (E=384): CSV 里【没有 E=384 的行】-> 回退到代码写死默认
+                    -> tile_m=64, split_k1=1, split_k2=1
+  profiler 佐证:
+    dsr1: gemm1_raw_16...16x256x256 + 独立 finalize, preshuffle _r1_
+    kimi: gemm1_64...64x256x256 (融合 act),               preshuffle _r4_
+
+--------------------------------------------------------------------------------
+ 2. "他们是怎么 tune 的"
+--------------------------------------------------------------------------------
+  - tuned_grouped_fmoe.csv 不是实测出来的: us/tflops/bw 三列在完全不同的
+    shape (E=128/3072 vs E=256/7168) 上一模一样, 是占位/排序用的 dummy 值。
+  - 所谓 "tuned" = 一张手写启发式查找表, 按
+    (cu_num, token, model_dim, inter_dim, expert, topk, ...) 索引,
+    每个 key 一行, 给 tile_m / split_k1 / split_k2 / n_warp。
+  - 仓库里【没有】自动 tuner 脚本。
+  - 重要: tile_k 在代码里写死 = 256 (grouped_moe_gfx1250.py), CSV 列被忽略;
+          tile_n = n_warp * 64 (CSV 的 tile_n 列也被忽略, 真正旋钮是 n_warp)。
+
+--------------------------------------------------------------------------------
+ 3. 关键发现: dsr1 的最优配置在 kimi 上是【最差】的, 不能照搬
+--------------------------------------------------------------------------------
+让 kimi(E=384) 套用 dsr1 的 gemm 配置, 实测 (back-to-back):
+                                 token=1     token=64
+    dsr1 native (E=256)          97 us       916 us
+    kimi 自己 tuned (E=384)      135 us      824 us
+    kimi 套用 dsr1-gemm (E=384)  271 us !!   1388 us !!   <- 反而慢 1.7~2x
+
+原因 (occupancy):
+  - token=1: dsr1 用 split_k1=4。专家少时 split-K 能填满 GPU; E=384 本身
+             block 就够多, split_k1=4 只剩 reduction 开销 -> 变慢。
+  - token=64: dsr1 用 tile_m=16。E=384 在 64 token 下 tile 是填满的,
+              小 tile 浪费 -> 变慢。
+结论: 最优 gemm 配置确实随专家数变化, 必须各自 tune。
+
+规律总结:
+  - token=1 (near-empty tile, decode): 小 tile_m=16 + split_k1=1 赢
+  - token=64 (512 routes 填满 tile):   大 tile_m=64 赢, tile_m=16 反而最差
+
+--------------------------------------------------------------------------------
+ 4. dsr1 / kimi 还能不能对上?
+--------------------------------------------------------------------------------
+  token=64: 已经对上 (kimi 甚至略快, 噪声内)。
+  token=1:  缩小很多但仍差 ~35% (dsr1 ~98 vs kimi ~133)。
+            这剩下的差距【不是 config 问题】, 是 E 大 1.5x 的固有开销:
+            masked grouped GEMM 对所有 E 个专家都发射 block(大多空的),
+            且所有 (E, max_m, dim) 缓冲操作 (quant/scatter/gather/preshuffle)
+            随 E 线性增长。384/256=1.5x, 实测 133/98≈1.35x, 对得上。
+            要彻底抹平 token=1 的差距, 只能上 DeepGEMM contiguous-M 调度
+            (route_E=1, grid 只随活跃专家数≈token*topk=8 走, 与 E 无关),
+            目前代码仅在 token_num>512 才自动开。
+
+--------------------------------------------------------------------------------
+ 5. tile_k=512 / tile_n=64 在 token=1 到底有没有用? -> 没用
+--------------------------------------------------------------------------------
+稳定 100-iter device time (token=1, E=384), 四种组合:
+    tile_n256 / tile_k256 (base)   gemm1=49.8  gemm2=49.4   E2E=136
+    tile_n256 / tile_k512          gemm1=49.8  gemm2=49.3   E2E=135
+    tile_n64  / tile_k256          gemm1=49.8  gemm2=49.2   E2E=135
+    tile_n64  / tile_k512 (你说的)  gemm1=49.9  gemm2=49.4   E2E=133
+  -> GEMM 时间完全压在一条线 (~49.8/49.2us), tile_n/tile_k 在这里无影响。
+  -> 之前看到的 "gemm2 27.8us" 是 AITER_GROUPED_PROFILE 只跑 5 次的假象
+     (同一 base 一会儿 49.8 一会儿 18.0, 不可信)。
+  原因: token=1 时每专家 GEMM 只有 M=16(基本是 padding), kernel 被
+        "扫完 384 个专家、大部分空 tile" 的发射/调度开销占满, 是
+        overhead-bound 不是 K-throughput-bound, 所以改 tile_k 没用。
+        tile_k=512 只有在 GEMM 真的 K-bound 时(大 M / prefill)才有意义。
+
+注意: 全程 token=1 这种小负载【run-to-run 抖动很大】(同一配置 127/177/227us
+      都出现过, GPU 频率漂移)。正式 tuning 要每个候选多测取 min, 单次不可信。
+      可靠对比只看【同批 back-to-back 的相对序】。
+
+================================================================================
+ 6. 分支对比 & 已应用的改动 (最终结论)
+================================================================================
+分支:
+  原分支   = gfx1250_moe_2mode_e2e_v1
+  当前分支 = jli/ds_gfx1250_moe_gemmopt  (我们自己的 gemmopt 分支)
+
+性能对比 (同条件 back-to-back, us):
+    case        原分支   当前分支[调优前]   当前分支[调优后]
+    dsr1 t1      98        196               106
+    kimi t1     136        209               127
+    dsr1 t64    912        802               590
+    kimi t64    785        805               830
+
+解读:
+  - 调优前: 当前分支【没有更好】, token=1 反而慢近 2x。
+      原因 1: 当前分支 CSV 的 E=256 token=1 行还带着 split_k1=4
+              (给旧 kernel 调的), 在新 gemmopt kernel 上最差 -> 196us。
+      原因 2: E=384 (kimi) 一行都没有 -> 全走默认 tile_m=64。
+  - 调优后: token=1 追平原分支 (106≈98, 127≈136);
+            token=64 的 dsr1 明显更快 (590 vs 912) ->
+            gemmopt 分支的 GEMM 改动在 compute-bound 的 token=64 确有收益,
+            之前被错误 config 盖住了。
+
+已应用到当前分支的改动 (只改 CSV: aiter/configs/tuned_grouped_fmoe.csv, 共 3 行):
+  [改] E=256 token=1 : split_k1 4 -> 1, split_k2 -> 2   (196us -> 106us)
+  [加] E=384 token=1 : tile_m=16, n_warp=4, split_k1=1, split_k2=1  (-> 127us)
+  [加] E=384 token=64: tile_m=64, n_warp=4, split_k1=1, split_k2=1  (-> 830us)
+  (这些是【在当前分支上重新实测】选出来的, 不是照搬原分支)
+
+未应用:
+  - tile_k 从 CSV 读取的代码改动: 已验证在 decode 对 GEMM 无帮助, 不带进来,
+    保持 diff 最小 (只改 CSV)。若以后要在 prefill/大 token 调 tile_k 再加。
+
+正确性: E=384 token=1 verify 通过, rel_l2 = 3.2e-3 (a8w4 容差内)。
+
+待办: CSV 改动尚【未 commit】; run.sh 仍为 untracked(未动)。
+      需要的话可以帮你 commit。
+
+--------------------------------------------------------------------------------
+ 附: 当前分支 CSV 关键行 (7168/2048, topk=8)
+--------------------------------------------------------------------------------
+ token=1  E=256  tile_m=16 n_warp=4 split_k1=1 split_k2=2   <- 已改
+ token=1  E=384  tile_m=16 n_warp=4 split_k1=1 split_k2=1   <- 新加
+ token=64 E=256  tile_m=32 n_warp=4 split_k1=1 split_k2=1   (原本就有, 已是最优)
+ token=64 E=384  tile_m=64 n_warp=4 split_k1=1 split_k2=1   <- 新加
+================================================================================
