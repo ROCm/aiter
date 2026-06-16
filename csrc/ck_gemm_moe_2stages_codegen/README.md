@@ -21,6 +21,21 @@ You can find the results of this tuning in `aiter/configs/tuned_fmoe.csv`, like 
     `cu_num` means the number of compute units, and it is used to distinguish between graphics.
     `run_1stage` indicates whether to run fused 1-stage kernel (1) or 2-stages kernels (0).
 
+### EP tuning
+
+Use `gemm_moe_ep_tune.py` for expert-parallel MoE shapes. The untuned CSV uses the same columns as the regular tuner, plus an `ep` column. `expert` is the local expert count and `ep` is the expert-parallel size, so the tuner uses `expert * ep` as the global expert count. If `ep` is omitted, it defaults to `1`.
+
+For DSV3 FP4 EP tuning, the dedicated config files are:
+- `aiter/configs/model_configs/dsv3_fp4_ep_untuned_fmoe.csv`
+- `aiter/configs/model_configs/dsv3_fp4_ep_tuned_fmoe.csv`
+
+Example:
+```bash
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_ep_tune.py \
+  -i aiter/configs/model_configs/dsv3_fp4_ep_untuned_fmoe.csv \
+  -o aiter/configs/model_configs/dsv3_fp4_ep_tuned_fmoe.csv
+```
+
 4. Build tuned kernels and test:
 Test the performance, modify the test instance in `op_tests/test_moe.py` or `python3 op_tests/test_moe_2stage.py` and run it, please wait a few minutes as it will build moe tuned kernels in `aiter/configs/tuned_fmoe.csv` via jit:
 `python3 op_tests/test_moe.py` or `python3 op_tests/test_moe_2stage.py`

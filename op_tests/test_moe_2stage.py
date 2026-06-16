@@ -81,8 +81,8 @@ def test_fmoe(
         return
 
     if ep < 1:
-            raise ValueError(f"ep must be >= 1, got {ep}")
-        global_E = E * ep
+        raise ValueError(f"ep must be >= 1, got {ep}")
+    global_E = E * ep
 
     torch_quant = aiter.get_torch_quant(qType)
     input = torch.randn((token, model_dim), dtype=dtype)
