@@ -13,6 +13,12 @@
 
 
 namespace aiter {
+#if defined(__gfx1250__)
+    static constexpr bool mhc_async_load_oob_guard = true;
+#else
+    static constexpr bool mhc_async_load_oob_guard = false;
+#endif
+
     constexpr int ceil_pow2(int n) {
         if(n <= 1) return 1;
         int p = 1;
@@ -185,18 +191,22 @@ namespace aiter {
                     for(int j = 0; j < fn_loads_per_row; j++) {
                         int K = lane_id + j * warp_size;
                         int K_swizzled = K ^ xor_mask;
-                        // gfx1250 async_load uses a flat pointer with no buffer-descriptor
-                        // bounds check, so an out-of-range fn_row (tile_n > n_oob) would
-                        // page-fault instead of returning 0 like the gfx9 buffer path.
-                        // Zero the LDS slot directly for padding rows.
-                        if (fn_row < n_oob) {
+                        if constexpr (mhc_async_load_oob_guard) {
+                            if (fn_row < n_oob) {
+                                async_load(
+                                    g_b,
+                                    s_fn_wr_ptr + i * tile_k + K,
+                                    fn_row * fn_stride + K_swizzled + k * tile_k + k_split_offset
+                                );
+                            } else {
+                                *(s_fn_wr_ptr + i * tile_k + K) = 0.0f;
+                            }
+                        } else {
                             async_load(
                                 g_b,
                                 s_fn_wr_ptr + i * tile_k + K,
                                 fn_row * fn_stride + K_swizzled + k * tile_k + k_split_offset
                             );
-                        } else {
-                            *(s_fn_wr_ptr + i * tile_k + K) = 0.0f;
                         }
                     }
                 }
@@ -208,21 +218,25 @@ namespace aiter {
                     int fn_row = fn_row_base + i;
                     int xor_mask = (fn_row & 0xF) << fn_xor_shift;
                     int K_swizzled = vec_col ^ xor_mask;
-                    // gfx1250 async_load uses a flat pointer with no buffer-descriptor
-                    // bounds check, so an out-of-range fn_row (tile_n > n_oob) would
-                    // page-fault instead of returning 0 like the gfx9 buffer path.
-                    // Zero the LDS slot directly for padding rows.
-                    if (fn_row < n_oob) {
+                    if constexpr (mhc_async_load_oob_guard) {
+                        if (fn_row < n_oob) {
+                            async_load<fn_vec_size>(
+                                g_b,
+                                s_fn_wr_ptr + i * tile_k + vec_col,
+                                fn_row * fn_stride + K_swizzled + k * tile_k + k_split_offset
+                            );
+                        } else {
+                            #pragma unroll
+                            for (int v = 0; v < fn_vec_size; v++) {
+                                *(s_fn_wr_ptr + i * tile_k + vec_col + v) = 0.0f;
+                            }
+                        }
+                    } else {
                         async_load<fn_vec_size>(
                             g_b,
                             s_fn_wr_ptr + i * tile_k + vec_col,
                             fn_row * fn_stride + K_swizzled + k * tile_k + k_split_offset
                         );
-                    } else {
-                        #pragma unroll
-                        for (int v = 0; v < fn_vec_size; v++) {
-                            *(s_fn_wr_ptr + i * tile_k + vec_col + v) = 0.0f;
-                        }
                     }
                 }
             }
@@ -1844,10 +1858,23 @@ namespace aiter {
                 DTYPE_I* s_x_wr_ptr = s_x + (k & 1) * tile_mk;
                 int offset_base = threadIdx.x / threads_per_row * x_stride + threadIdx.x % threads_per_row * x_async_load_vec + k_split_offset + k * tile_k;
                 static constexpr int s_offset_i = x_async_load_threads * x_async_load_vec;
+                [[maybe_unused]] const int row_base = threadIdx.x / threads_per_row;
                 for(int i = 0; i < x_load_waitcnt; i++) {
                     int s_offset = i * s_offset_i + threadIdx.x * x_async_load_vec;
-                    async_load<x_async_load_vec>(g_x, s_x_wr_ptr + s_offset,
-                        offset_base + rows_per_load * i * x_stride, 0, opus::number<GROUP_NT>{});
+                    if constexpr (mhc_async_load_oob_guard) {
+                        if (row_base + rows_per_load * i < m_oob) {
+                            async_load<x_async_load_vec>(g_x, s_x_wr_ptr + s_offset,
+                                offset_base + rows_per_load * i * x_stride, 0, opus::number<GROUP_NT>{});
+                        } else {
+                            #pragma unroll
+                            for (int v = 0; v < x_async_load_vec; v++) {
+                                *(s_x_wr_ptr + s_offset + v) = static_cast<DTYPE_I>(0);
+                            }
+                        }
+                    } else {
+                        async_load<x_async_load_vec>(g_x, s_x_wr_ptr + s_offset,
+                            offset_base + rows_per_load * i * x_stride, 0, opus::number<GROUP_NT>{});
+                    }
                 }
             }
         };
@@ -1866,8 +1893,20 @@ namespace aiter {
                 + lane_id % threads_per_row * r_async_load_vec + k_split_offset + k * tile_k;
             static constexpr int s_offset_i = warp_size * r_async_load_vec;
             int s_offset = warp_id * tile_mk + lane_id * r_async_load_vec;
+            [[maybe_unused]] const int row_base = lane_id / threads_per_row;
             for(int i = 0; i < residual_load_waitcnt; i++) {
-                async_load<r_async_load_vec>(g_res, s_residual_wr_ptr + s_offset, offset_base + rows_per_load * hc_hidden_size * i, 0, opus::number<GROUP_NT>{});
+                if constexpr (mhc_async_load_oob_guard) {
+                    if (row_base + rows_per_load * i < m_oob) {
+                        async_load<r_async_load_vec>(g_res, s_residual_wr_ptr + s_offset, offset_base + rows_per_load * hc_hidden_size * i, 0, opus::number<GROUP_NT>{});
+                    } else {
+                        #pragma unroll
+                        for (int v = 0; v < r_async_load_vec; v++) {
+                            *(s_residual_wr_ptr + s_offset + v) = static_cast<DTYPE_I>(0);
+                        }
+                    }
+                } else {
+                    async_load<r_async_load_vec>(g_res, s_residual_wr_ptr + s_offset, offset_base + rows_per_load * hc_hidden_size * i, 0, opus::number<GROUP_NT>{});
+                }
                 s_offset += s_offset_i;
             }
         };
