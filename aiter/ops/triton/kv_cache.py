@@ -6,6 +6,7 @@ import triton
 from aiter.ops.triton._triton_kernels.kv_cache import (
     _cat_and_cache_mla_kernel,
     _reshape_and_cache_kernel,
+    _reshape_and_cache_shuffle_kernel,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -162,6 +163,10 @@ def reshape_and_cache(
       key_cache, value_cache (selected by ``kv_cache_layout``):
         "HND" (default): [num_blocks, num_kv_heads, block_size, head_dim]
         "NHD":           [num_blocks, block_size, num_kv_heads, head_dim]
+        "SHUFFLE":       key   [num_blocks, num_kv_heads, head_dim // X, block_size, X]
+                         value [num_blocks, num_kv_heads, block_size // X, head_dim, X]
+                         (X = 16 // itemsize; aiter asm/CK paged layout read by
+                          unified_attention with shuffled_kv_cache=True)
 
     The "NHD" layout matches what aiter.ops.triton.attention.unified_attention.unified_attention
     reads (it indexes ``k.shape[1]`` as block_size, ``k.shape[2]`` as num_kv_heads).
@@ -175,7 +180,8 @@ def reshape_and_cache(
     assert kv_cache_layout in (
         "HND",
         "NHD",
-    ), f"kv_cache_layout must be 'HND' or 'NHD', got {kv_cache_layout!r}"
+        "SHUFFLE",
+    ), f"kv_cache_layout must be 'HND', 'NHD' or 'SHUFFLE', got {kv_cache_layout!r}"
     _LOGGER.info(
         f"RESHAPE_AND_CACHE: key={tuple(key.shape)} value={tuple(value.shape)} "
         + f"key_cache={tuple(key_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
@@ -183,6 +189,63 @@ def reshape_and_cache(
 
     (num_tokens,) = slot_mapping.shape
     if num_tokens == 0:
+        return
+
+    if kv_cache_layout == "SHUFFLE":
+        # aiter 5D SHUFFLE (asm) layout consumed by
+        # unified_attention(shuffled_kv_cache=True). K and V have *different*
+        # layouts here, so this path is handled separately from HND/NHD:
+        #   key_cache:   [num_blocks, KH, D // X, block_size, X]
+        #   value_cache: [num_blocks, KH, block_size // X, D, X]
+        n_k, kh_k, d_k = key.shape
+        n_v, kh_v, d_v = value.shape
+        kc_nb, kc_kh, kc_dx, kc_bs, kc_x = key_cache.shape
+        vc_nb, vc_kh, vc_bsx, vc_d, vc_x = value_cache.shape
+        X = kc_x
+        d_c = kc_dx * X
+        block_size = kc_bs
+        assert n_k == n_v == num_tokens, "key/value first dim must match slot_mapping"
+        assert kh_k == kh_v == kc_kh == vc_kh, "kv head count mismatch"
+        assert d_k == d_v == d_c == vc_d, "head_dim mismatch"
+        assert vc_x == X, "key/value cache pack width X mismatch"
+        assert vc_bsx == block_size // X, "value_cache block_size//X mismatch"
+        assert d_c % X == 0 and block_size % X == 0, (
+            "head_dim and block_size must be divisible by X for SHUFFLE layout"
+        )
+        key_c = key.contiguous() if not key.is_contiguous() else key
+        val_c = value.contiguous() if not value.is_contiguous() else value
+        slot_i64 = (
+            slot_mapping.to(torch.int64)
+            if slot_mapping.dtype != torch.int64
+            else slot_mapping
+        )
+        _reshape_and_cache_shuffle_kernel[(num_tokens,)](
+            key_c,
+            val_c,
+            slot_i64,
+            key_cache,
+            value_cache,
+            key_c.stride(0),
+            key_c.stride(1),
+            val_c.stride(0),
+            val_c.stride(1),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            key_cache.stride(3),
+            key_cache.stride(4),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            value_cache.stride(2),
+            value_cache.stride(3),
+            value_cache.stride(4),
+            N=num_tokens,
+            KH=kc_kh,
+            D=d_c,
+            BLOCK_SIZE=block_size,
+            X=X,
+            num_warps=1,
+        )
         return
     n_k, kh_k, d_k = key.shape
     n_v, kh_v, d_v = value.shape

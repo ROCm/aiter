@@ -402,3 +402,48 @@ def test_reshape_and_cache_empty():
 
     torch.testing.assert_close(key_cache, k_before)
     torch.testing.assert_close(value_cache, v_before)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_kv_heads,head_dim,block_size", [(8, 128, 64), (4, 64, 32)])
+def test_reshape_and_cache_shuffle(dtype, num_kv_heads, head_dim, block_size):
+    """The SHUFFLE layout triton write must match the CK asm_layout index math:
+        K [num_blocks, KH, D // X, block_size, X]
+        V [num_blocks, KH, block_size // X, D, X]
+    (X = 16 // itemsize). Read back by unified_attention(shuffled_kv_cache=True)."""
+    torch.manual_seed(0)
+    dev = "cuda"
+    N = 20
+    num_blocks = 16
+    x = 16 // torch.tensor([], dtype=dtype).element_size()
+
+    key = torch.randn(N, num_kv_heads, head_dim, device=dev, dtype=dtype)
+    value = torch.randn(N, num_kv_heads, head_dim, device=dev, dtype=dtype)
+    k_cache = torch.zeros(
+        num_blocks, num_kv_heads, head_dim // x, block_size, x, device=dev, dtype=dtype
+    )
+    v_cache = torch.zeros(
+        num_blocks, num_kv_heads, block_size // x, head_dim, x, device=dev, dtype=dtype
+    )
+
+    slot_mapping = torch.randperm(num_blocks * block_size, device=dev)[:N].to(torch.int64)
+    slot_mapping[3] = -1  # padded token must be skipped in-kernel
+    slot_mapping[11] = -1
+
+    reshape_and_cache(
+        key, value, k_cache, v_cache, slot_mapping, kv_cache_layout="SHUFFLE"
+    )
+
+    k_ref = torch.zeros_like(k_cache)
+    v_ref = torch.zeros_like(v_cache)
+    for t in range(N):
+        slot = int(slot_mapping[t].item())
+        if slot < 0:
+            continue
+        b = slot // block_size
+        off = slot % block_size
+        k_ref[b, :, :, off, :] = key[t].reshape(num_kv_heads, head_dim // x, x)
+        v_ref[b, :, off // x, :, off % x] = value[t]
+
+    assert torch.equal(k_cache, k_ref)
+    assert torch.equal(v_cache, v_ref)

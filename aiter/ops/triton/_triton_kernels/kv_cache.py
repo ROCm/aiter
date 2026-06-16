@@ -368,3 +368,92 @@ def _reshape_and_cache_kernel(
     v_vals = tl.load(v_new_ptr + new_off)
     tl.store(k_cache_ptr + cache_off, k_vals)
     tl.store(v_cache_ptr + cache_off, v_vals)
+
+
+@triton.jit
+def _reshape_and_cache_shuffle_kernel(
+    k_new_ptr,  # [N, KH, D]
+    v_new_ptr,  # [N, KH, D]
+    slot_mapping_ptr,  # [N] int64; slot < 0 => skip
+    k_cache_ptr,  # [num_blocks, KH, D // X, BLOCK_SIZE, X]
+    v_cache_ptr,  # [num_blocks, KH, BLOCK_SIZE // X, D, X]
+    k_new_stride_token,
+    k_new_stride_head,
+    v_new_stride_token,
+    v_new_stride_head,
+    kc_stride_block,
+    kc_stride_head,
+    kc_stride_xidx,
+    kc_stride_within,
+    kc_stride_x,
+    vc_stride_block,
+    vc_stride_head,
+    vc_stride_xidx,
+    vc_stride_d,
+    vc_stride_x,
+    N: tl.constexpr,
+    KH: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    X: tl.constexpr,
+):
+    """One program per token; scatters the token's (KH, D) K/V slab into the
+    aiter 5D SHUFFLE (asm) paged layout consumed by
+    unified_attention(shuffled_kv_cache=True):
+
+        K [num_blocks, KH, D // X, BLOCK_SIZE, X]
+            -> K[block, head, d // X, within, d % X]
+        V [num_blocks, KH, BLOCK_SIZE // X, D, X]
+            -> V[block, head, within // X, d, within % X]
+
+    slot < 0 entries are skipped in-kernel so callers can pre-fill padded
+    positions with -1 without a Python-side branch (CUDAGraph-safe). Index
+    math matches csrc reshape_and_cache_kernel<asmLayout=true> exactly."""
+    token_idx = tl.program_id(0)
+    if token_idx >= N:
+        return
+    slot = tl.load(slot_mapping_ptr + token_idx)
+    if slot < 0:
+        return
+    block_id = slot // BLOCK_SIZE
+    within = slot % BLOCK_SIZE
+
+    head_offs = tl.arange(0, KH)
+    d_offs = tl.arange(0, D)
+
+    k_new_off = (
+        token_idx * k_new_stride_token
+        + head_offs[:, None] * k_new_stride_head
+        + d_offs[None, :]
+    )
+    v_new_off = (
+        token_idx * v_new_stride_token
+        + head_offs[:, None] * v_new_stride_head
+        + d_offs[None, :]
+    )
+    k_vals = tl.load(k_new_ptr + k_new_off)
+    v_vals = tl.load(v_new_ptr + v_new_off)
+
+    # K: [num_blocks, KH, D // X, BLOCK_SIZE, X]
+    k_xidx = d_offs // X
+    k_xoff = d_offs % X
+    k_dst = (
+        block_id * kc_stride_block
+        + head_offs[:, None] * kc_stride_head
+        + k_xidx[None, :] * kc_stride_xidx
+        + within * kc_stride_within
+        + k_xoff[None, :] * kc_stride_x
+    )
+    tl.store(k_cache_ptr + k_dst, k_vals)
+
+    # V: [num_blocks, KH, BLOCK_SIZE // X, D, X]
+    v_xidx = within // X
+    v_xoff = within % X
+    v_dst = (
+        block_id * vc_stride_block
+        + head_offs[:, None] * vc_stride_head
+        + v_xidx * vc_stride_xidx
+        + d_offs[None, :] * vc_stride_d
+        + v_xoff * vc_stride_x
+    )
+    tl.store(v_cache_ptr + v_dst, v_vals)

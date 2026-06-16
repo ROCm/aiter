@@ -78,7 +78,7 @@ def reshape_and_cache(
     Triton-fallback constraints:
       - k_scale / v_scale must be None (FP8 KV scales not yet supported
         by the triton path)
-      - asm_layout must be False (CDNA-specific layout)
+      - asm_layout=True writes the aiter 5D SHUFFLE paged layout
     """
     if _hip_cache_supported():
         return _reshape_and_cache_ck(
@@ -97,13 +97,14 @@ def reshape_and_cache(
         "reshape_and_cache triton fallback does not yet support FP8 KV "
         "cache scales (k_scale / v_scale must be None)"
     )
-    assert not asm_layout, (
-        "reshape_and_cache triton fallback does not support asm_layout "
-        "(CDNA-specific cache layout)"
-    )
     from .triton.kv_cache import reshape_and_cache as _reshape_and_cache_triton
 
-    return _reshape_and_cache_triton(key, value, key_cache, value_cache, slot_mapping)
+    # asm_layout -> aiter 5D SHUFFLE layout (written by the triton SHUFFLE path,
+    # read by unified_attention(shuffled_kv_cache=True)); otherwise plain HND.
+    layout = "SHUFFLE" if asm_layout else "HND"
+    return _reshape_and_cache_triton(
+        key, value, key_cache, value_cache, slot_mapping, kv_cache_layout=layout
+    )
 
 
 @compile_ops("module_cache", develop=True)
