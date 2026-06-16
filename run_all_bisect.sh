@@ -17,7 +17,7 @@ AITER=/local_vol1_nobackup/qiwan/mi400_aiter
 CODIR="$AITER/hsa/gfx1250/pa_decode_bf16"
 BISECT="$CODIR/bisect"
 DST="$CODIR/pa_decode_bf16_d64_page256_gqa8.co"
-CLEAN="$CODIR/bisect/bisect_00.co"   # restore to robust full-allsync (correct, slow)
+CLEAN="$CODIR/bisect/bisect_FIX.co"   # confirmed TDMWAIT fix (= variant 40)
 LOGDIR="$AITER/bisect_logs"
 mkdir -p "$LOGDIR"
 
