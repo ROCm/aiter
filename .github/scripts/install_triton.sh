@@ -60,7 +60,7 @@ install_triton_from_wheelhouse() {
     return 0
 }
 
-TRITON_INDEX_URL="https://pypi.amd.com/triton/release_/rocm-7.0.0/simple/"
+TRITON_INDEX_URL="https://pypi.amd.com/triton/release_tmp/rocm-7.0.0/simple/"
 ROCM_VERSION=$(dpkg -l rocm-core 2>/dev/null | awk '/^ii/{print $3}' || true)
 if [[ -n "$ROCM_VERSION" ]]; then
     ROCM_MAJOR_MINOR=$(echo "$ROCM_VERSION" | cut -d. -f1,2)

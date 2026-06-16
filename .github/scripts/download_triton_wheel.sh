@@ -9,17 +9,18 @@ python3 -m pip config set global.retries 15
 python3 -m pip config set global.timeout 120
 
 TRITON_DEFAULT_ROCM_VERSION="${TRITON_DEFAULT_ROCM_VERSION:-7.2.0}"
-TRITON_INDEX_URL="https://pypi.amd.com/triton/release_/rocm-${TRITON_DEFAULT_ROCM_VERSION}/simple/"
+TRITON_INDEX_URL="https://pypi.amd.com/triton/release_tmp/rocm-${TRITON_DEFAULT_ROCM_VERSION}/simple/"
 ROCM_VERSION=$(dpkg -l rocm-core 2>/dev/null | awk '/^ii/{print $3}')
 if [[ -n "${ROCM_VERSION}" ]]; then
     ROCM_MAJOR_MINOR=$(echo "${ROCM_VERSION}" | cut -d. -f1,2)
-    TRITON_INDEX_URL="https://pypi.amd.com/triton/release_/rocm-${ROCM_MAJOR_MINOR}.0/simple/"
+    TRITON_INDEX_URL="https://pypi.amd.com/triton/release_tmp/rocm-${ROCM_MAJOR_MINOR}.0/simple/"
 else
     echo "rocm-core not found; using default ROCm version ${TRITON_DEFAULT_ROCM_VERSION}"
 fi
 
 echo "Downloading triton wheel from ${TRITON_INDEX_URL} into ${TRITON_WHEEL_DIR}"
 python3 -m pip download \
+    --no-deps \
     --only-binary=:all: \
     --dest "${TRITON_WHEEL_DIR}" \
     --index-url "${TRITON_INDEX_URL}" \
@@ -28,6 +29,7 @@ python3 -m pip download \
 
 echo "Downloading triton-kernels wheel from ${TRITON_INDEX_URL} into ${TRITON_WHEEL_DIR}"
 python3 -m pip download \
+    --no-deps \
     --only-binary=:all: \
     --dest "${TRITON_WHEEL_DIR}" \
     --index-url "${TRITON_INDEX_URL}" \
