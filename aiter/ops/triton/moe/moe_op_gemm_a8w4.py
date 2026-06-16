@@ -372,7 +372,14 @@ def moe_gemm_a8w4(
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
-    use_gluon = get_arch() == "gfx1250"
+    # gfx1250 dispatches to the gluon kernel by default. Set AITER_FORCE_TRITON=1
+    # to fall back to the triton kernel instead (e.g. for FFM bring-up or A/B
+    # comparison). NOTE: the triton kernel only understands the CDNA4 scale
+    # layout, so callers forcing triton must swizzle scales accordingly, not with
+    # the GFX1250 layout the gluon path expects.
+    use_gluon = (
+        get_arch() == "gfx1250" and os.environ.get("AITER_FORCE_TRITON", "0") != "1"
+    )
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     x_has_mx = x_scales is not None
     if x_has_mx:
