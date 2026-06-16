@@ -331,6 +331,12 @@ constexpr int encode_s_waitcnt(int lgkmcnt, int vmcnt, int expcnt = -1)
     return (v & 0xF) | (e << 4) | (l << 8) | (((v >> 4) & 0x3) << 14);
 }
 
+template <int kImm>
+__device__ __forceinline__ void s_nop()
+{
+    asm volatile("s_nop %0" ::"i"(kImm));
+}
+
 // Single-stride lane swap helpers. Inline asm is used (rather than the LLVM
 // builtin __builtin_amdgcn_permlane{32,16}_swap) because the builtin form,
 // when chained, was observed to be miscompiled by LLVM: between two chained
