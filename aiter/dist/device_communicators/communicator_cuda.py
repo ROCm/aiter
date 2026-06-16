@@ -32,9 +32,6 @@ _FUSED_AR_RMS_QUANT_ALIASES = {
     "per_1x32": "mxfp4",
 }
 
-_AITER_AR_1STAGE_MAX_TOKENS = 80
-
-
 def _normalize_fused_ar_rms_quant_type(quant_type):
     if isinstance(quant_type, str):
         normalized = _FUSED_AR_RMS_QUANT_ALIASES.get(quant_type.lower())
@@ -71,11 +68,7 @@ def _can_fused_ar_rms_quant(input_: torch.Tensor) -> bool:
 
 
 def _can_1stage_fused_ar_rms_quant(input_: torch.Tensor) -> bool:
-    if not _can_fused_ar_rms_quant(input_):
-        return False
-    hidden_dim = int(input_.shape[-1])
-    token_num = input_.numel() // hidden_dim
-    return token_num <= _AITER_AR_1STAGE_MAX_TOKENS
+    return _can_fused_ar_rms_quant(input_)
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
