@@ -865,6 +865,10 @@ def test_pa_decode_vmask(
     det_split_o = int((_bits(so_z1) != _bits(so_z2)).sum().item())
     det_out_raw = int((_bits(out_z1_raw) != _bits(out_z2_raw)).sum().item())  # uninit, harmless
     nondeterministic = (det_final > 0) or (det_split_o > 0)
+    # Magnitude of the nondeterminism: last-bit bf16 noise (~1e-2 relative) vs a
+    # real value error.  Helps decide if the residual race is benign or corrupting.
+    det_final_maxabs = float((final_z1.float() - final_z2.float()).abs().max().item())
+    det_so_maxabs = float((so_z1.float() - so_z2.float()).abs().max().item())
 
     # V-mask (NaN-V vs zero-V): partials + final must match, no NaN reaching either.
     vmask_split_nan = int(torch.isnan(so_n.float()).sum().item())
@@ -882,8 +886,8 @@ def test_pa_decode_vmask(
     status = "RACE" if nondeterministic else ("PASS" if vmask_ok else "FAIL")
     aiter.logger.info(
         "[V-mask %s] b=%d kvh=%d ctx=%s mtp=%d | pad=%d || DET(zeroVx2): final=%d "
-        "split_o=%d (out_raw=%d uninit/harmless) || VMASK(NaNvs0): split_o[nan=%d "
-        "mismatch=%d] FINAL[nan=%d mismatch=%d]",
+        "(maxabs=%.3g) split_o=%d (maxabs=%.3g) [out_raw=%d uninit/harmless] || "
+        "VMASK(NaNvs0): split_o[nan=%d mismatch=%d] FINAL[nan=%d mismatch=%d]",
         status,
         inp["batch"],
         kv_head_num,
@@ -891,7 +895,9 @@ def test_pa_decode_vmask(
         mtp,
         n_pad,
         det_final,
+        det_final_maxabs,
         det_split_o,
+        det_so_maxabs,
         det_out_raw,
         vmask_split_nan,
         vmask_split_mismatch,
@@ -907,7 +913,9 @@ def test_pa_decode_vmask(
         "varlen": varlen,
         "pad_slots": n_pad,
         "det_final": det_final,
+        "det_final_maxabs": det_final_maxabs,
         "det_split_o": det_split_o,
+        "det_so_maxabs": det_so_maxabs,
         "det_out_raw_uninit": det_out_raw,
         "nondeterministic": nondeterministic,
         "vmask_split_nan": vmask_split_nan,
