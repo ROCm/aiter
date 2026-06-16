@@ -290,15 +290,15 @@ def ref_pa_decode(
     token (`ctx - mtp + 1 + i`), but the GPU follows the no-`+1` border above.
     For mtp=0 this is the full context (no-op).
 
-    sink (optional): per-Q-head fp32 logits in the kernel's SCALED domain (GPT-OSS/
-    Triton convention), shape [kv_head_num*gqa].  The kernel divides the loaded sink
-    by s_eff once (work-loop SINK-DOMAIN) so its softmax merge contributes exactly
-    exp(sink) — i.e. the sink competes directly with the SCALED scores (q.k)*s_eff.
-    So the reference appends the sink logit AS-IS (NOT *s_eff): it adds one virtual
-    logit `sink` to each row's softmax denominator.  This domain is identical for the
-    kernel's split (store_partial_results SINK-SPLIT, owner-only) and non-split
-    (pa_normalize do_sink=1) paths, so one reference covers both.  The sink has no
-    value, so it only shrinks the real-token weights.
+    sink (optional): per-Q-head fp32 raw logits in the q.k domain, shape
+    [kv_head_num*gqa].  The reference applies the softmax_scale COEFFICIENT to the
+    sink (sink_hg = sink * softmax_scale) so it competes with the softmax-scaled
+    attention logits.  CONSISTENCY: the kernel must produce exp(sink*softmax_scale)
+    for this to match — i.e. the kernel divides v_SINK by (query*key) only (NOT the
+    full s_eff = query*key*softmax), so its merge (× scl = query*key*softmax*log2e)
+    yields exp2(softmax*log2e*sink) = exp(softmax_scale*sink).  Same for the kernel's
+    split (store_partial_results SINK-SPLIT, owner-only) and non-split (pa_normalize
+    do_sink=1) paths.  The sink has no value, so it only shrinks the real-token weights.
     """
     num_pages, kv_head_num = K.shape[0], K.shape[1]
     head_dim = Q.shape[-1]
@@ -307,9 +307,11 @@ def ref_pa_decode(
     mtp = qlen - 1
     device = Q.device
     s_eff = query_scale * key_scale * softmax_scale
-    # SCALED-domain sink: append `sink` directly (the kernel's /s_eff makes its merge
-    # = exp(sink), competing with the scaled scores).  Do NOT multiply by s_eff.
-    sink_hg = sink.float().view(kv_head_num, gqa) if sink is not None else None
+    # Apply the softmax_scale coefficient to the sink (raw q.k-domain logit -> scaled
+    # logit competing with (q.k)*softmax_scale). Kernel must match: v_SINK /= (q*k).
+    sink_hg = (
+        sink.float().view(kv_head_num, gqa) * softmax_scale if sink is not None else None
+    )
 
     # K[p,h,d//16,tok,d%16] -> K_tm[p,h,tok,d];  V[p,h,tok//16,d,tok%16] -> V_tm[p,h,tok,d]
     K_tm = (
