@@ -870,6 +870,34 @@ def test_pa_decode_vmask(
                 m = max(m, int((_bits(lst[i]) != _bits(lst[j])).sum().item()))
         return m
 
+    def maxpair_absdiff(lst):
+        """Max absolute value of the pairwise differences between repeats (the
+        magnitude of the largest nondeterministic discrepancy, not just its count)."""
+        m = 0.0
+        for i in range(len(lst)):
+            for j in range(i + 1, len(lst)):
+                d = (lst[i].float() - lst[j].float()).abs()
+                d = d[~torch.isnan(d)]  # ignore NaN-vs-NaN / NaN-vs-num slots
+                if d.numel():
+                    m = max(m, float(d.max().item()))
+        return m
+
+    def maxpair_reldiff(lst):
+        """Max relative value of the pairwise differences between repeats:
+        max |a-b| / max(|a|,|b|) over elements (worst-case elementwise relative
+        discrepancy), ignoring NaN slots."""
+        m = 0.0
+        for i in range(len(lst)):
+            for j in range(i + 1, len(lst)):
+                a, b = lst[i].float(), lst[j].float()
+                d = (a - b).abs()
+                denom = torch.maximum(a.abs(), b.abs())
+                r = d / denom.clamp_min(1e-9)
+                r = r[~torch.isnan(r)]  # ignore NaN-vs-NaN / NaN-vs-num slots
+                if r.numel():
+                    m = max(m, float(r.max().item()))
+        return m
+
     def any_nan(lst):
         return int(sum(int(torch.isnan(t.float()).sum().item()) for t in lst))
 
@@ -880,6 +908,13 @@ def test_pa_decode_vmask(
     det_zero = max(maxpair(z_fin), maxpair(z_so))
     det_nan = max(maxpair(n_fin), maxpair(n_so))
     nondeterministic = (det_zero > 0) or (det_nan > 0)
+
+    # Magnitude of the largest within-input discrepancy (max |a-b| over repeats),
+    # both absolute and relative to the element magnitude.
+    det_zero_absmax = max(maxpair_absdiff(z_fin), maxpair_absdiff(z_so))
+    det_nan_absmax = max(maxpair_absdiff(n_fin), maxpair_absdiff(n_so))
+    det_zero_relmax = max(maxpair_reldiff(z_fin), maxpair_reldiff(z_so))
+    det_nan_relmax = max(maxpair_reldiff(n_fin), maxpair_reldiff(n_so))
 
     # NaN anywhere (kernel partials or final), either input.
     nan_zero = any_nan(z_so) + any_nan(z_fin)
@@ -901,7 +936,8 @@ def test_pa_decode_vmask(
 
     aiter.logger.info(
         "[V-mask %s] b=%d kvh=%d ctx=%s mtp=%d | pad=%d reps=%d || DET(within-input): "
-        "zero=%d nan=%d %s || NaN: zero=%d nan=%d || VMASK(NaNvs0): split_o=%d final=%d",
+        "zero=%d nan=%d (absmax: zero=%.3g nan=%.3g | relmax: zero=%.3g nan=%.3g) %s "
+        "|| NaN: zero=%d nan=%d || VMASK(NaNvs0): split_o=%d final=%d",
         status,
         inp["batch"],
         kv_head_num,
@@ -911,6 +947,10 @@ def test_pa_decode_vmask(
         REPS,
         det_zero,
         det_nan,
+        det_zero_absmax,
+        det_nan_absmax,
+        det_zero_relmax,
+        det_nan_relmax,
         "<-- RACE (V-mask verdict blocked)" if nondeterministic else "",
         nan_zero,
         nan_nan,
@@ -927,6 +967,10 @@ def test_pa_decode_vmask(
         "pad_slots": n_pad,
         "det_zero": det_zero,
         "det_nan": det_nan,
+        "det_zero_absmax": det_zero_absmax,
+        "det_nan_absmax": det_nan_absmax,
+        "det_zero_relmax": det_zero_relmax,
+        "det_nan_relmax": det_nan_relmax,
         "nondeterministic": nondeterministic,
         "nan_zero": nan_zero,
         "nan_nan": nan_nan,
