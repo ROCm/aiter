@@ -28,21 +28,21 @@ constexpr bool is_atomic_v = (kEpilog == EpilogPolicy::Atomic);
 template <EpilogPolicy kEpilog>
 constexpr bool is_nonatomic_v = (kEpilog == EpilogPolicy::Nonatomic);
 
-template <bool kAtomic, int BM, int BK, int BN, int kStages, int kAS_LDS_slot_bytes>
+template <bool kAtomic, int BM, int BK, int BN, int kAStages, int kStages, int kAS_LDS_slot_bytes>
 struct LDSLayout;
 
-template <int BM, int BK, int BN, int kStages, int kAS_LDS_slot_bytes>
-struct alignas(16) LDSLayout</*kAtomic=*/true, BM, BK, BN, kStages, kAS_LDS_slot_bytes> {
+template <int BM, int BK, int BN, int kAStages, int kStages, int kAS_LDS_slot_bytes>
+struct alignas(16) LDSLayout<true, BM, BK, BN, kAStages, kStages, kAS_LDS_slot_bytes> {
     union {
-        alignas(16) __hip_fp4x2_storage_t s_Aq[kStages][BM][BK / 2];
+        alignas(16) __hip_fp4x2_storage_t s_Aq[kAStages][BM][BK / 2];
         alignas(16) float lds_acc[BM * BN];
     };
 };
 
-template <int BM, int BK, int BN, int kStages, int kAS_LDS_slot_bytes>
-struct alignas(16) LDSLayout</*kAtomic=*/false, BM, BK, BN, kStages, kAS_LDS_slot_bytes> {
+template <int BM, int BK, int BN, int kAStages, int kStages, int kAS_LDS_slot_bytes>
+struct alignas(16) LDSLayout<false, BM, BK, BN, kAStages, kStages, kAS_LDS_slot_bytes> {
     union {
-        alignas(16) __hip_fp4x2_storage_t s_Aq[kStages][BM][BK / 2];
+        alignas(16) __hip_fp4x2_storage_t s_Aq[kAStages][BM][BK / 2];
         alignas(16) float                 lds_acc[BM * BN];
     };
     alignas(16) uint8_t               s_Ascale[kStages][kAS_LDS_slot_bytes];
@@ -71,7 +71,7 @@ kernel(
     __hip_bfloat16*              __restrict__ out_bf16,
     uint8_t*                     __restrict__ flat_out_scale)
 {
-    static_assert(K == 512);
+    static_assert(K % 256 == 0, "K must be a multiple of BK=256");
     static_assert(N_OUT % 256 == 0);
     constexpr bool kAtomic     = is_atomic_v<kEpilog>;
     constexpr bool kNonatomic  = is_nonatomic_v<kEpilog>;
@@ -90,6 +90,11 @@ kernel(
     constexpr int kStages       = 2;
     constexpr int kLoopIter     = K_TILES_TOTAL - kStages;
     constexpr int kUnroll       = kLoopIter;
+    static_assert(K_TILES_TOTAL >= kStages,
+                  "gemm2 needs K >= kStages*BK (=512); smaller K is unsupported");
+    static_assert(!is_nonatomic_v<kEpilog> || K_TILES_TOTAL == kStages,
+                  "gemm2 nonatomic (BM=128) path is not yet generalized beyond K=512");
+    constexpr int kAStages      = (K_TILES_TOTAL == kStages) ? kStages : 3;
     constexpr int kSubBlocks    = (BM < 32) ? 1 : BM / 32;
     constexpr int kMChunks      = (BM == 16) ? 1 : BM / 16;
     constexpr int BM_GRID       = BM;
@@ -125,7 +130,7 @@ kernel(
     const buffer_rsrc_t B_scale_rsrc =
         make_buffer_rsrc(B_scale, (uint32_t)((long long)NUM_EXPERTS * kBS_per_expert_dw * 4));
 
-    __shared__ LDSLayout<kAtomic, BM, BK, BN, kStages, kAS_LDS_slot_bytes> lds;
+    __shared__ LDSLayout<kAtomic, BM, BK, BN, kAStages, kStages, kAS_LDS_slot_bytes> lds;
     auto&        s_Aq    = lds.s_Aq;
 
     i32x4 a[kMChunks][2];
@@ -134,7 +139,7 @@ kernel(
     int   a_scale_s_base[kSubBlocks];
     int   b_scale_s_base[2];
     int   a_scale_aiter[kSubBlocks];
-    int   a_scale_v[kSubBlocks][2];
+    int   a_scale_v[kSubBlocks][K_TILES_TOTAL];
     int   b_scale_v[kStages][2];
     f32x4 accm[kMChunks][4];
     f32x4 c_zero;
@@ -186,10 +191,16 @@ kernel(
         const int v_voff = ((lane / 16) * 16 + (lane % 16)) * 4;
         #pragma unroll
         for (int sub = 0; sub < kSubBlocks; sub++) {
-            a_scale_v[sub][0] = buffer_load_b32_imm<  0>(
-                A_scale_rsrc, v_voff, a_scale_s_base[sub]);
-            a_scale_v[sub][1] = buffer_load_b32_imm<256>(
-                A_scale_rsrc, v_voff, a_scale_s_base[sub]);
+            ck_tile::static_for<0, K_TILES_TOTAL, 1>{}([&](auto ktt) {
+                constexpr int KT    = ktt.value;
+                constexpr int KT_HI = KT / 16;
+                constexpr int IMM   = (KT - KT_HI * 16) * 256;
+                constexpr int BASE  = KT_HI * 16 * 256;
+                const int s_off = (KT_HI == 0) ? a_scale_s_base[sub]
+                                               : (a_scale_s_base[sub] + BASE);
+                a_scale_v[sub][KT] = buffer_load_b32_imm<IMM>(
+                    A_scale_rsrc, v_voff, s_off);
+            });
         }
     };
 
@@ -240,11 +251,15 @@ kernel(
 
     auto issue_b_scale_load_ku = [&]<int KU>(auto& bs_sub) {
         const int v_voff = ((lane / 16) * 16 + (lane % 16)) * 4;
-        constexpr int IMM = KU * (kBS_stride_k0_dw * 4);
+        constexpr int KU_HI = KU / 16;
+        constexpr int IMM   = (KU - KU_HI * 16) * (kBS_stride_k0_dw * 4);
+        constexpr int BASE  = KU_HI * 16 * (kBS_stride_k0_dw * 4);
         #pragma unroll
         for (int mw = 0; mw < 2; mw++) {
+            const int s_off = (KU_HI == 0) ? b_scale_s_base[mw]
+                                           : (b_scale_s_base[mw] + BASE);
             bs_sub[mw] = buffer_load_b32_imm<IMM>(
-                B_scale_rsrc, v_voff, b_scale_s_base[mw]);
+                B_scale_rsrc, v_voff, s_off);
         }
     };
 
@@ -378,7 +393,8 @@ kernel(
                 apply_bf16_flat_epilog_bm128<N_OUT>(
                     accm, out_bf16, m_row, n_block_idx, wave_n, lane);
             }
-        } else {
+        } else if constexpr (K_TILES_TOTAL == kStages) {
+            // ── K=512 fast path (T == kStages): unchanged from the original ──
             issue_a_load_lds(0, 0, cached_actual_row);
             issue_a_load_lds(1, 1, cached_actual_row);
             __builtin_amdgcn_sched_barrier(0);
@@ -408,6 +424,57 @@ kernel(
                 ck_tile::static_for<0, 4, 1>{}([&](auto jj) {
                     constexpr int J = jj.value;
                     issue_mfma_cluster.template operator()<J, /*kInit=*/(S == 0)>(slot_);
+                });
+            });
+
+            __syncthreads();
+            apply_atomic_bf16_epilog<N_OUT, BM>(
+                accm, out_bf16, sorted_token_ids, sorted_weights,
+                m_row, n_block_idx, wave_n, lane, tid, M, lds.lds_acc);
+        } else {
+            ck_tile::static_for<0, kStages, 1>{}([&](auto ss) {
+                constexpr int KC = ss.value;
+                issue_a_load_lds(KC, KC, cached_actual_row);
+                issue_b_scale_load_ku.template operator()<KC>(b_scale_v[KC]);
+                #pragma unroll
+                for (int j = 0; j < 4; j++)
+                    issue_b_load_j.template operator()<KC>(b[KC], j);
+            });
+            __builtin_amdgcn_sched_barrier(0);
+            issue_a_scale_load_atomic();
+
+            ck_tile::static_for<0, kUnroll, 1>{}([&](auto off) {
+                constexpr int OFFSET     = off.value;
+                constexpr int K_C        = kStages + OFFSET;
+                constexpr int read_slot  = OFFSET % kAStages;
+                constexpr int write_slot = K_C    % kAStages;
+                constexpr int slot_b     = OFFSET % kStages;
+                __syncthreads();
+                issue_a_ds_read(/*lds_slot=*/read_slot);
+                issue_a_scale_ds_read_ku_atomic.template operator()<OFFSET>();
+                issue_a_load_lds(write_slot, K_C, cached_actual_row);
+                ck_tile::static_for<0, 4, 1>{}([&](auto jj) {
+                    constexpr int J = jj.value;
+                    __builtin_amdgcn_sched_barrier(0);
+                    issue_mfma_cluster.template operator()<J, /*kInit=*/(OFFSET == 0)>(slot_b);
+                    __builtin_amdgcn_sched_barrier(0);
+                    issue_b_load_j.template operator()<K_C>(b[slot_b], J);
+                    __builtin_amdgcn_sched_barrier(0);
+                });
+                issue_b_scale_load_ku.template operator()<K_C>(b_scale_v[slot_b]);
+            });
+
+            ck_tile::static_for<0, kStages, 1>{}([&](auto ss) {
+                constexpr int S         = ss.value;
+                constexpr int kt        = K_TILES_TOTAL - kStages + S;
+                constexpr int read_slot = kt % kAStages;
+                constexpr int slot_b    = kt % kStages;
+                __syncthreads();
+                issue_a_ds_read(/*lds_slot=*/read_slot);
+                issue_a_scale_ds_read_ku_atomic.template operator()<kt>();
+                ck_tile::static_for<0, 4, 1>{}([&](auto jj) {
+                    constexpr int J = jj.value;
+                    issue_mfma_cluster.template operator()<J, /*kInit=*/false>(slot_b);
                 });
             });
 

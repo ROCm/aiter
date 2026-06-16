@@ -244,6 +244,8 @@ class mxfp4_moe_gemm_codegen:
                         )
 
             # BM=128 nonatomic — enumerate XCD-swizzle variants (large-M target).
+            if e // 256 != 2:
+                continue
             for xcd in BM128_XCD_SWIZZLES:
                 suffix = "" if xcd == 0 else f"_XCD{xcd}"
                 yield Instance(
