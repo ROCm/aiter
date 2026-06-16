@@ -246,6 +246,13 @@ def cpu_reduce(
             global_lse = m + torch.log(s)
             scale = torch.exp(lses - global_lse)
             o = (so[locs] * scale.unsqueeze(-1)).sum(dim=0)
+            # A row whose splits are ALL -inf (max == -inf) is fully causally
+            # masked -> its correct output is 0.  Without this guard the math
+            # above is exp(-inf - (-inf)) = exp(NaN) = NaN, which poisons the
+            # output independently of the kernel (so a NaN here is NOT a V-mask
+            # failure).  Zero those rows per-head.
+            finite = torch.isfinite(m).unsqueeze(-1)
+            o = torch.where(finite, o, torch.zeros_like(o))
             out_flat[seq_id] = o.to(out_flat.dtype)
     return out
 
@@ -753,10 +760,12 @@ def fill_v_padding(V, value, kv_indices, kv_indptr, seq_lens_kv, page_size):
     return V, n_pad
 
 
-def _run_pa_pipeline(inp, V):
-    """Run the PA stage + host LSE reduce for a given V tensor; return final bf16 out.
-    Calls the op directly (not the perftest wrapper) for a single deterministic run,
-    and allocates fresh split scratch since the kernel writes into it."""
+def _run_pa_kernel(inp, V):
+    """Run ONLY the GPU PA stage for a given V tensor (no host reduce).  Returns
+    (out_raw, split_o) — both kernel-side outputs.  out_raw holds direct-to-O rows
+    (non-split work); split_o holds the per-split partials.  Comparing THESE between
+    the NaN-V and zero-V runs is the true test of the kernel's V-mask: it excludes
+    the host cpu_reduce (whose own -inf handling is unrelated to V padding)."""
     split_o = torch.zeros(
         (inp["split_rows"], 1, inp["q_head_num"], inp["head_dim"]),
         dtype=dtypes.fp32,
@@ -789,22 +798,15 @@ def _run_pa_pipeline(inp, V):
         sink=inp["sink"],
     )
     torch.cuda.synchronize()
-    out = cpu_reduce(
-        out,
-        split_o,
-        split_lse,
-        inp["reduce_indptr"],
-        inp["reduce_final_map"],
-        inp["reduce_partial_map"],
-        inp["gqa"],
-    )
-    return out
+    return out.clone(), split_o.clone(), split_lse.clone()
 
 
 def _bits(t):
-    """Reinterpret a bf16 tensor as int16 for exact bitwise comparison (NaN-safe:
-    torch.equal on floats treats NaN != NaN, which would mask a real bit match)."""
-    return t.contiguous().view(torch.int16)
+    """Reinterpret a float tensor as same-width int for exact bitwise comparison
+    (NaN-safe: torch.equal on floats treats NaN != NaN, masking a real bit match)."""
+    if t.dtype == torch.bfloat16 or t.dtype == torch.float16:
+        return t.contiguous().view(torch.int16)
+    return t.contiguous().view(torch.int32)
 
 
 def test_pa_decode_vmask(
@@ -817,9 +819,15 @@ def test_pa_decode_vmask(
     context_lens: Optional[list] = None,
 ) -> dict:
     """V-mask correctness: filling the last-page padding region with NaN vs 0 must
-    yield BIT-IDENTICAL kernel output.  A mismatch (or any NaN in the output) means
-    stale padding V leaked into the PV WMMA — i.e. the kernel's V-mask is missing or
-    wrong for this shape."""
+    yield BIT-IDENTICAL *kernel* output.
+
+    The kernel-side tensors (out_raw + split_o) are the real signal: if the V-mask
+    works, the NaN can never enter the PV WMMA, so these are byte-identical AND have
+    no NaN.  A divergence (or NaN in split_o/out_raw) is a genuine V-mask failure.
+
+    The final post-reduce output is also compared, but a NaN that appears ONLY after
+    cpu_reduce (with the kernel side clean + matching) is a host-reduce artifact on
+    fully-masked rows, NOT a V-mask bug — flagged separately as host_nan."""
     inp = _build_pa_inputs(batch, kv_head_num, ctx_len, mtp, scales, varlen, context_lens)
     ps = inp["page_size"]
 
@@ -830,16 +838,50 @@ def test_pa_decode_vmask(
         inp["V"], 0.0, inp["kv_indices"], inp["kv_indptr"], inp["seq_lens_kv"], ps
     )
 
-    out_nan = _run_pa_pipeline(inp, V_nan)
-    out_zero = _run_pa_pipeline(inp, V_zero)
+    # ---- DETERMINISM CONTROL: run the SAME (zero-V) input twice. ----
+    # Inputs are seed-fixed, so any byte difference between two zero-V runs is GPU
+    # nondeterminism (a race), NOT a V-padding effect.  If this fires, the NaN-vs-0
+    # mismatch below is measuring that race, not the V-mask — so the V-mask verdict
+    # is inconclusive until the race is fixed.
+    out_zero_raw, so_zero, sl_zero = _run_pa_kernel(inp, V_zero)
+    out_zero_raw2, so_zero2, sl_zero2 = _run_pa_kernel(inp, V_zero)
+    det_mismatch = int((_bits(out_zero_raw) != _bits(out_zero_raw2)).sum().item()) + int(
+        (_bits(so_zero) != _bits(so_zero2)).sum().item()
+    )
+    nondeterministic = det_mismatch > 0
 
-    nan_count = int(torch.isnan(out_nan.float()).sum().item())
-    mismatch = int((_bits(out_nan) != _bits(out_zero)).sum().item())
-    bitmatch = mismatch == 0
-    status = "PASS" if bitmatch else "FAIL"
+    # ---- kernel-side V-mask test (NaN-V vs zero-V) ----
+    out_nan_raw, so_nan, sl_nan = _run_pa_kernel(inp, V_nan)
+
+    kern_mismatch = int((_bits(out_nan_raw) != _bits(out_zero_raw)).sum().item()) + int(
+        (_bits(so_nan) != _bits(so_zero)).sum().item()
+    )
+    kern_nan = int(torch.isnan(out_nan_raw.float()).sum().item()) + int(
+        torch.isnan(so_nan.float()).sum().item()
+    )
+    # V-mask is only judged when the kernel is deterministic; otherwise the race
+    # dominates and the result is inconclusive.
+    kern_ok = (kern_mismatch == 0) and (kern_nan == 0) and not nondeterministic
+
+    # ---- final post-reduce output (informational; host cpu_reduce included) ----
+    out_nan = cpu_reduce(
+        out_nan_raw.clone(), so_nan, sl_nan, inp["reduce_indptr"],
+        inp["reduce_final_map"], inp["reduce_partial_map"], inp["gqa"],
+    )
+    out_zero = cpu_reduce(
+        out_zero_raw.clone(), so_zero, sl_zero, inp["reduce_indptr"],
+        inp["reduce_final_map"], inp["reduce_partial_map"], inp["gqa"],
+    )
+    final_mismatch = int((_bits(out_nan) != _bits(out_zero)).sum().item())
+    final_nan = int(torch.isnan(out_nan.float()).sum().item())
+    # A NaN that appears only after the (clean, matching) kernel side is host-reduce.
+    host_nan = final_nan if kern_ok else 0
+
+    status = "RACE" if nondeterministic else ("PASS" if kern_ok else "FAIL")
     aiter.logger.info(
-        "[V-mask %s] batch=%d kvh=%d ctx=%s mtp=%d varlen=%s | pad_slots=%d "
-        "nan_in_out=%d mismatched_elems=%d",
+        "[V-mask %s] batch=%d kvh=%d ctx=%s mtp=%d varlen=%s | pad_slots=%d || "
+        "DET_CONTROL(zeroV x2): mismatch=%d %s || KERNEL(NaNvs0): nan=%d mismatch=%d "
+        "|| FINAL: nan=%d mismatch=%d (host_nan=%d)",
         status,
         inp["batch"],
         kv_head_num,
@@ -847,8 +889,13 @@ def test_pa_decode_vmask(
         mtp,
         varlen,
         n_pad,
-        nan_count,
-        mismatch,
+        det_mismatch,
+        "<-- NONDETERMINISTIC (GPU race; V-mask verdict inconclusive)" if nondeterministic else "",
+        kern_nan,
+        kern_mismatch,
+        final_nan,
+        final_mismatch,
+        host_nan,
     )
 
     return {
@@ -858,9 +905,14 @@ def test_pa_decode_vmask(
         "mtp": mtp,
         "varlen": varlen,
         "pad_slots": n_pad,
-        "nan_in_out": nan_count,
-        "mismatch": mismatch,
-        "bitmatch": bitmatch,
+        "det_mismatch": det_mismatch,
+        "nondeterministic": nondeterministic,
+        "kern_nan": kern_nan,
+        "kern_mismatch": kern_mismatch,
+        "final_nan": final_nan,
+        "final_mismatch": final_mismatch,
+        "host_nan": host_nan,
+        "bitmatch": kern_ok,
     }
 
 
@@ -973,16 +1025,39 @@ if args.vmask:
     df_md = df.to_markdown(index=False)
     aiter.logger.info("pa_decode_bf16_asm V-mask summary (markdown):\n%s", df_md)
     df.to_csv("pa_decode_bf16_asm_vmask.csv")
+    n_race = int(df["nondeterministic"].sum())
     n_fail = int((~df["bitmatch"]).sum())
+    n_host_nan = int((df["host_nan"] > 0).sum())
+    if n_race:
+        aiter.logger.error(
+            "V-mask test INCONCLUSIVE: %d/%d configs are NONDETERMINISTIC — running "
+            "the SAME (zero-V) input twice gave different kernel bytes (det_mismatch>0). "
+            "That is a GPU RACE in the kernel, independent of V padding; the NaN-vs-0 "
+            "mismatch is measuring the race, not the V-mask. Fix the race first.",
+            n_race,
+            len(df),
+        )
+        sys.exit(2)
     if n_fail:
         aiter.logger.error(
-            "V-mask test FAILED: %d/%d configs did not bit-match (NaN leaked "
-            "into PV) — kernel V-mask is missing/incorrect for those shapes.",
+            "V-mask test FAILED: %d/%d configs — kernel output (out_raw/split_o) "
+            "diverged or held NaN, i.e. stale padding V leaked into the PV WMMA. "
+            "Kernel V-mask is missing/incorrect for those shapes.",
             n_fail,
             len(df),
         )
         sys.exit(1)
-    aiter.logger.info("V-mask test PASSED: all %d configs bit-match.", len(df))
+    if n_host_nan:
+        aiter.logger.warning(
+            "V-mask test PASSED (all %d configs: kernel side bit-matches, no kernel "
+            "NaN), but %d config(s) show NaN AFTER cpu_reduce (host_nan>0). That is a "
+            "host-reduce artifact on fully-masked rows, NOT a V-mask bug — the fixed "
+            "cpu_reduce should zero those rows.",
+            len(df),
+            n_host_nan,
+        )
+    else:
+        aiter.logger.info("V-mask test PASSED: all %d configs bit-match.", len(df))
 else:
     df = []
     for batch, kv_head_num, ctx_len, mtp in itertools.product(
