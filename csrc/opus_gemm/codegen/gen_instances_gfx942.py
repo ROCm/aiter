@@ -774,8 +774,8 @@ def _validate_a16w16_wave_k_coop_gfx942(k: OpusGemmInstance):
         errors.append("wave-K-coop is gfx942-only")
     if k.kernel_tag != "a16w16_wave_k_coop":
         errors.append(f"kernel_tag={k.kernel_tag} must be a16w16_wave_k_coop")
-    if k.BLOCK_SIZE not in (64, 256, 512, 1024):
-        errors.append(f"BLOCK_SIZE={k.BLOCK_SIZE} must be 64, 256, 512, or 1024")
+    if k.BLOCK_SIZE not in (256, 512):
+        errors.append(f"BLOCK_SIZE={k.BLOCK_SIZE} must be 256 or 512")
     waves_per_wg = k.BLOCK_SIZE // WARP_SIZE
     if (k.T_M, k.T_N) != (1, 1):
         errors.append(
@@ -810,7 +810,8 @@ def _validate_a16w16_wave_k_coop_gfx942(k: OpusGemmInstance):
     partial_bytes = k.B_M * k.B_N * 4 * t_k
     ab_bytes = a_bytes + b_bytes
     alias_partial = ab_bytes + partial_bytes > _GFX942_LDS_PER_WG_BYTES
-    lds_bytes = ab_bytes + (0 if alias_partial else partial_bytes)
+    alias_bytes = max(ab_bytes, partial_bytes)
+    lds_bytes = alias_bytes if alias_partial else ab_bytes + partial_bytes
     if alias_partial and ab_bytes > _GFX942_LDS_PER_WG_BYTES:
         errors.append(f"A/B LDS={ab_bytes // 1024}KiB exceeds 64KiB")
     if lds_bytes > _GFX942_LDS_PER_WG_BYTES:
