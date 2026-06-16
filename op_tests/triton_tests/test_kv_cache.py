@@ -405,7 +405,9 @@ def test_reshape_and_cache_empty():
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("num_kv_heads,head_dim,block_size", [(8, 128, 64), (4, 64, 32)])
+@pytest.mark.parametrize(
+    "num_kv_heads,head_dim,block_size", [(8, 128, 64), (4, 64, 32)]
+)
 def test_reshape_and_cache_shuffle(dtype, num_kv_heads, head_dim, block_size):
     """The SHUFFLE layout triton write must match the CK asm_layout index math:
         K [num_blocks, KH, D // X, block_size, X]
@@ -426,7 +428,9 @@ def test_reshape_and_cache_shuffle(dtype, num_kv_heads, head_dim, block_size):
         num_blocks, num_kv_heads, block_size // x, head_dim, x, device=dev, dtype=dtype
     )
 
-    slot_mapping = torch.randperm(num_blocks * block_size, device=dev)[:N].to(torch.int64)
+    slot_mapping = torch.randperm(num_blocks * block_size, device=dev)[:N].to(
+        torch.int64
+    )
     slot_mapping[3] = -1  # padded token must be skipped in-kernel
     slot_mapping[11] = -1
 

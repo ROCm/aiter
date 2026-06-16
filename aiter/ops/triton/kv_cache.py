@@ -209,9 +209,9 @@ def reshape_and_cache(
         assert d_k == d_v == d_c == vc_d, "head_dim mismatch"
         assert vc_x == X, "key/value cache pack width X mismatch"
         assert vc_bsx == block_size // X, "value_cache block_size//X mismatch"
-        assert d_c % X == 0 and block_size % X == 0, (
-            "head_dim and block_size must be divisible by X for SHUFFLE layout"
-        )
+        assert (
+            d_c % X == 0 and block_size % X == 0
+        ), "head_dim and block_size must be divisible by X for SHUFFLE layout"
         key_c = key.contiguous() if not key.is_contiguous() else key
         val_c = value.contiguous() if not value.is_contiguous() else value
         slot_i64 = (
