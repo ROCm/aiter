@@ -19,3 +19,5 @@
 99  vmask_only: ALL 15 barriers REMOVED   md5=02535d9e   [reference: does the config race at all?]
 20  REMOVE non-reduce LIVE {02,03,04,09,10}; KEEP reduce {12,13,14,15}   md5=14d66604   [race here => non-reduce barriers matter]
 21  REMOVE reduce LIVE {12,13,14,15}; KEEP non-reduce {02,03,04,09,10}   md5=b5742ec5   [race here => reduce barriers matter]
+22  KEEP TDM {02,03} only; remove {04,09,10}+reduce   md5=b4149f2d   [PASS => TDM barriers suffice]
+23  KEEP LDS {04,09,10} only; remove {02,03}+reduce   md5=f0da3e38   [PASS => LDS barriers suffice]
