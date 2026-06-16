@@ -37,10 +37,12 @@ struct __attribute__((packed)) KernelArgs
     p3 _p16;
     unsigned int KVs;
     p3 _p17;
-    unsigned int GQA;
+    unsigned int mtp;
     p3 _p18;
+    unsigned int GQA;
+    p3 _p19;
     void* ptr_QTP;
-    p2 _p19;
+    p2 _p20;
 };
 
 
@@ -198,7 +200,7 @@ void pa_fwd(aiter_tensor_t* Q,              //   [num_seqs, num_heads, head_size
     float k_scalar     = sqrt(dim);
     k_scalar           = (float)((double)k_log2e / (double)k_scalar);
 
-    KernelArgs args;
+    KernelArgs args = {};
     size_t arg_size = sizeof(args);
     args.ptr_O      = out_->data_ptr();
     args.ptr_Q      = Q->data_ptr();
@@ -222,6 +224,7 @@ void pa_fwd(aiter_tensor_t* Q,              //   [num_seqs, num_heads, head_size
     args.Qs        = stride_Q;
     args.Bs        = stride_KV_blk;
     args.KVs       = stride_KV_head;
+    args.mtp       = max_qlen - 1;
     args.GQA       = gqa_ratio;
     args.ptr_QTP   = (qo_indptr != nullptr) ? qo_indptr->data_ptr() : nullptr;
 

@@ -17,24 +17,46 @@
 #include <cmath>
 #include <type_traits>
 
+#include "aiter_dispatch.h"
 #include "aiter_hip_common.h"
+#include "aiter_stream.h"
+#include "fused_qk_norm_rope_cache_quant.h"
 #include "hip_reduce.h"
 #include "quant_utils.cuh"
 #include "rope/rope_common.h"
 #include "vec_convert.h"
-#include <torch/cuda.h>
- 
- #define CHECK_TYPE(x, st) \
-     TORCH_CHECK(          \
-         x.scalar_type() == st, #x " dtype is ", x.scalar_type(), ", while ", st, " is expected")
- #define CHECK_TH_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
- #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
- #define CHECK_INPUT(x) \
-     CHECK_TH_CUDA(x);  \
-     CHECK_CONTIGUOUS(x)
+
+#define CHECK_TYPE(x, st)                     \
+    AITER_CHECK(x.dtype() == st,              \
+                #x " dtype is ",              \
+                AiterDtype_to_str(x.dtype()), \
+                ", while ",                   \
+                AiterDtype_to_str(st),        \
+                " is expected")
+#define CHECK_TH_CUDA(x) AITER_CHECK(x.is_gpu(), #x " must be a GPU tensor")
+#define CHECK_CONTIGUOUS(x) AITER_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_INPUT(x) \
+    CHECK_TH_CUDA(x);  \
+    CHECK_CONTIGUOUS(x)
+
+// Like is_contiguous() but ignoring dim 0 (permits an interleaved block stride, e.g. vLLM unbind(1)).
+static inline bool is_contiguous_from_dim1(const aiter_tensor_t& t)
+{
+    if(t.numel() == 0)
+        return true;
+    int64_t expected = 1;
+    for(int d = t.dim() - 1; d >= 1; --d)
+    {
+        if(t.size(d) != 1 && t.stride(d) != expected)
+            return false;
+        expected *= t.size(d);
+    }
+    return true;
+}
 
 namespace aiter {
-/** Map q/k/v tensor strides to logical [token, head, dim] element strides (PyTorch strides are in elements). */
+/** Map q/k/v tensor strides to logical [token, head, dim] element strides (PyTorch strides are in
+ * elements). */
 struct ActivationStrides3D
 {
     int64_t st;
@@ -42,404 +64,381 @@ struct ActivationStrides3D
     int64_t sd;
 };
 
-inline ActivationStrides3D activation_strides_logical_3d(
-    at::Tensor const& t, int64_t num_heads, int64_t head_dim)
+inline ActivationStrides3D
+activation_strides_logical_3d(const aiter_tensor_t& t, int64_t num_heads, int64_t head_dim)
 {
     if(t.dim() == 2)
     {
-        TORCH_CHECK(
-            t.size(1) == num_heads * head_dim,
-            "activation dim 1 must be num_heads * head_dim (got ",
-            t.size(1),
-            " vs ",
-            num_heads * head_dim,
-            ")");
-        return {t.stride(0), num_heads * t.stride(1), t.stride(1)};
+        AITER_CHECK(t.size(1) == num_heads * head_dim,
+                    "activation dim 1 must be num_heads * head_dim (got ",
+                    t.size(1),
+                    " vs ",
+                    num_heads * head_dim,
+                    ")");
+        return {t.stride(0), head_dim * t.stride(1), t.stride(1)};
     }
-    TORCH_CHECK(t.dim() == 3, "q/k/v must be 2D [T, H*D] or 3D [T, H, D], got dim ", t.dim());
-    TORCH_CHECK(t.size(1) == num_heads && t.size(2) == head_dim,
+    AITER_CHECK(t.dim() == 3, "q/k/v must be 2D [T, H*D] or 3D [T, H, D], got dim ", t.dim());
+    AITER_CHECK(t.size(1) == num_heads && t.size(2) == head_dim,
                 "q/k/v 3D shape must be [T, num_heads, head_dim]");
     return {t.stride(0), t.stride(1), t.stride(2)};
 }
 } // namespace aiter
- 
- namespace {
- using mrope_utils::vec_t;
 
- // Minimum absmax used when computing FP8 KV scales to avoid division by zero when
- // activations are all zero (e.g. CUDA graph warmup, invalid slots, or padding).
- static constexpr float kFp8KvQuantAbsmaxFloorF32 = 1e-8f;
- 
- template <typename Func, typename T>
- __inline__ __device__ T warpReduceSum(Func func, T val)
- {
- #pragma unroll
-     for(int mask = 16; mask > 0; mask >>= 1)
-         val = func(val, __shfl_xor(val, mask, 32));
-     return val;
- }
- 
- template <typename T>
- inline __device__ __host__ T divUp(T m, T n)
- {
-     return (m + n - 1) / n;
- }
- 
- __device__ float abs(float x)
- {
-     union
-     {
-         float f32;
-         uint32_t u32;
-     } y;
-     y.f32 = x;
-     y.u32 = y.u32 & 0x7fffffff;
-     return y.f32;
- };
- 
- // Adopted and changed from vllm
- // https://github.com/vllm-project/vllm/blob/main/csrc/fused_qknorm_rope_kernel.cu
- 
- // Perform per-head QK Norm,  RoPE in a single kernel.
- // scalar_t: data type of QKV and RMSNorm weights
- // kv_cache_scalar_t: data type of kv cache
- // head_dim: the dimension of each head
- // interleave: interleave=!is_neox.
- // num_kv_heads: number of kv heads for kv cache
- // kv_dt: data type of kv cache for quantization
- template <typename scalar_t,
-           typename kv_cache_scalar_t,
-           int head_dim,
-           bool interleave,
-           int num_kv_heads,
-           vllm::Fp8KVCacheDataType kv_dt>
- __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
-     scalar_t* qkv_void,            // Combined QKV tensor (unused if separate_qkv)
-     bool const separate_qkv,       // If true, use q_act/k_act/v_act with [token, heads, dim] layout
-     scalar_t* q_act,               // [num_tokens, num_heads_q * head_dim] or nullptr
-     scalar_t* k_act,               // [num_tokens, num_heads_k * head_dim] or nullptr
-     scalar_t* v_act,               // [num_tokens, num_heads_v * head_dim] or nullptr
-     int64_t const q_st,
-     int64_t const q_sh,
-     int64_t const q_sd,
-     int64_t const k_st,
-     int64_t const k_sh,
-     int64_t const k_sd,
-     int64_t const v_st,
-     int64_t const v_sh,
-     int64_t const v_sd,
-     int const num_heads_q,         // Number of query heads
-     int const num_heads_k,         // Number of key heads
-     int const num_heads_v,         // Number of value heads
-     float const eps,               // Epsilon for RMS normalization
-     scalar_t const* q_weight,      // RMSNorm weights for query
-     scalar_t const* k_weight,      // RMSNorm weights for key
-     scalar_t const* cos_sin_cache, // Pre-computed cos/sin cache
-     int64_t const* position_ids,   // Position IDs for RoPE
-     kv_cache_scalar_t*
-         k_cache, // Key cache [num_blocks, num_kv_heads, head_size // x, block_size, x]
-     kv_cache_scalar_t*
-         v_cache,           // Value cache [num_blocks, num_kv_heads, block_size/X, head_size, X]
-     int64_t* slot_mapping, // Slot mapping
-     float* k_scale,        // Key scale for quantized key cache [num_blocks, block_size]
-     float* v_scale,        // Value scale for quantized value cache [num_blocks, block_size]
-     int const num_tokens,  // Number of tokens
-     int const page_size,   // Page size for kv cache
-     int x                  // kv cache tiling size
- )
- {
- 
-     int const warpsPerBlock = blockDim.x / 32;
-     int const warpId        = threadIdx.x / 32;
-     int const laneId        = threadIdx.x % 32;
- 
-     int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
- 
-     int const num_heads    = num_heads_q + num_heads_k + num_heads_v;
-     int const tokenIdx     = globalWarpIdx / num_heads;
-     int const localHeadIdx = globalWarpIdx % num_heads;
-     if(tokenIdx >= num_tokens)
-         return;
-     bool const isQ                  = localHeadIdx < num_heads_q;
-     bool const isK                  = (localHeadIdx < num_heads_q + num_heads_k) & !isQ;
-     bool const isV                  = !isQ & !isK;
-     int const headIdx               = isV   ? localHeadIdx - num_heads_q - num_heads_k
-                                       : isK ? localHeadIdx - num_heads_q
-                                             : localHeadIdx;
-     constexpr int numElemsPerThread = head_dim / 32;
-     scalar_t elements[numElemsPerThread];
-     constexpr int best_vec_size = sizeof(float4) / sizeof(scalar_t);
-     constexpr int vec_size      = std::min(best_vec_size, numElemsPerThread);
-     constexpr int load_loop_cnt = numElemsPerThread / vec_size;
-     using ltype                 = ::vec_t<scalar_t, vec_size>;
-     const float inverted_kscale = k_scale == nullptr ? 1.0f : 1 / (*k_scale);
-     const float inverted_vscale = v_scale == nullptr ? 1.0f : 1 / (*v_scale);
- 
-     int64_t const act_st = isQ ? q_st : (isK ? k_st : v_st);
-     int64_t const act_sh = isQ ? q_sh : (isK ? k_sh : v_sh);
-     int64_t const act_sd = isQ ? q_sd : (isK ? k_sd : v_sd);
-     scalar_t* const act_base = isQ ? q_act : (isK ? k_act : v_act);
- 
-     // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before
-     // kernel launch
-     if(!separate_qkv)
-     {
- #pragma unroll
-         for(int i = 0; i < load_loop_cnt; i += 1)
-         {
-             int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim +
-                                   laneId * numElemsPerThread) /
-                                  vec_size;
-             reinterpret_cast<ltype*>(elements)[i] =
-                 reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
-         }
-     }
-     else if(act_sd == 1)
-     {
-         int64_t const base_elems = (int64_t)tokenIdx * act_st + (int64_t)headIdx * act_sh +
-                                    (int64_t)(laneId * numElemsPerThread);
- #pragma unroll
-         for(int i = 0; i < load_loop_cnt; i += 1)
-         {
-             reinterpret_cast<ltype*>(elements)[i] =
-                 *reinterpret_cast<ltype const*>(act_base + base_elems + i * vec_size);
-         }
-     }
-     else
-     {
- #pragma unroll
-         for(int j = 0; j < numElemsPerThread; j++)
-         {
-             int64_t const off = (int64_t)tokenIdx * act_st + (int64_t)headIdx * act_sh +
-                                 (int64_t)(laneId * numElemsPerThread + j) * act_sd;
-             elements[j] = act_base[off];
-         }
-     }
- 
-     // If qk, we adopt RMSNorm + RoPE, so we need to compute sum of squares.
-     if(!isV)
-     {
- 
-         // Compute norm squares
-         float sumOfSquares = 0.0f;
- #pragma unroll
-         for(int i = 0; i < numElemsPerThread; i++)
-         {
-             sumOfSquares += static_cast<float>(elements[i]) * static_cast<float>(elements[i]);
-         }
-         auto sum_func = [](float a, float b) { return a + b; };
-         sumOfSquares  = warpReduceSum(sum_func, sumOfSquares);
-         float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
- 
-         // Normalize elements
- #pragma unroll
-         for(int i = 0; i < numElemsPerThread; i++)
-         {
-             int dim      = laneId * numElemsPerThread + i;
-             float weight = isQ ? float(q_weight[dim]) : float(k_weight[dim]);
-             elements[i]  = static_cast<scalar_t>(elements[i] * rms_rcp * weight);
-         }
- 
-         // Apply RoPE to normalized elements
- 
-         int64_t pos_id = position_ids[tokenIdx];
- 
-         // Calculate cache pointer for this position - similar to
-         // pos_encoding_kernels.cu
-         scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
-         int const embed_dim       = head_dim / 2;
-         scalar_t const* cos_ptr   = cache_ptr;
-         scalar_t const* sin_ptr   = cache_ptr + embed_dim;
- 
-         if constexpr(interleave)
-         {
-             // Perform interleaving. Use pre-computed cos/sin values.
- #pragma unroll
-             for(int i = 0; i < numElemsPerThread / 2; ++i)
-             {
-                 int const idx0 = 2 * i;
-                 int const idx1 = 2 * i + 1;
- 
-                 float const val0 = elements[idx0];
-                 float const val1 = elements[idx1];
- 
-                 int const dim_idx  = laneId * numElemsPerThread + idx0;
-                 int const half_dim = dim_idx / 2;
-                 float cos_val      = static_cast<float>(cos_ptr[half_dim]);
-                 float sin_val      = static_cast<float>(sin_ptr[half_dim]);
- 
-                 elements[idx0] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
-                 elements[idx1] = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
-             }
-         }
-         else
-         {
-             scalar_t elements2[numElemsPerThread]; // Additional buffer required for RoPE.
-             // Before data exchange with in warp, we need to sync.
-             __syncwarp();
-             // Get the data from the other half of the warp. Use pre-computed cos/sin
-             // values.
- #pragma unroll
-             for(int i = 0; i < numElemsPerThread; i++)
-             {
-                 elements2[i] = static_cast<scalar_t>(__shfl_xor(float(elements[i]), 16, 32));
-                 if(laneId < 16)
-                 {
-                     elements2[i] = -elements2[i];
-                 }
- 
-                 int dim_idx  = laneId * numElemsPerThread + i;
-                 dim_idx      = (dim_idx * 2) % head_dim;
-                 int half_dim = dim_idx / 2;
-                 // Use pre-computed cos/sin from cache
-                 float cos_val = cos_ptr[half_dim];
-                 float sin_val = sin_ptr[half_dim];
- 
-                 elements[i] = static_cast<scalar_t>(elements[i] * cos_val + elements2[i] * sin_val);
-             }
-             __syncwarp();
-         }
-         int64_t const qk_st = isQ ? q_st : k_st;
-         int64_t const qk_sh = isQ ? q_sh : k_sh;
-         int64_t const qk_sd = isQ ? q_sd : k_sd;
-         scalar_t* const qk_dst = isQ ? q_act : k_act;
-         if(!separate_qkv)
-         {
- #pragma unroll
-             for(int i = 0; i < load_loop_cnt; i += 1)
-             {
-                 int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim +
-                                       laneId * numElemsPerThread) /
-                                      vec_size;
-                 reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] =
-                     reinterpret_cast<ltype*>(elements)[i];
-             }
-         }
-         else if(qk_sd == 1)
-         {
-             int64_t const base_elems = (int64_t)tokenIdx * qk_st + (int64_t)headIdx * qk_sh +
-                                          (int64_t)(laneId * numElemsPerThread);
- #pragma unroll
-             for(int i = 0; i < load_loop_cnt; i += 1)
-             {
-                 *reinterpret_cast<ltype*>(qk_dst + base_elems + i * vec_size) =
-                     reinterpret_cast<ltype*>(elements)[i];
-             }
-         }
-         else
-         {
- #pragma unroll
-             for(int j = 0; j < numElemsPerThread; j++)
-             {
-                 int64_t const off = (int64_t)tokenIdx * qk_st + (int64_t)headIdx * qk_sh +
-                                     (int64_t)(laneId * numElemsPerThread + j) * qk_sd;
-                 qk_dst[off] = elements[j];
-             }
-         }
-     }
- 
-     if(isQ)
-     {
-         // For Q, we are done.
-         return;
-     }
- 
-     // cache the kv into kv cache and quant if required
-     int64_t slot_id = slot_mapping[tokenIdx];
-     if(slot_id < 0)
-     {
-         // invalid slot, skip
-         return;
-     }
-     int64_t block_idx    = slot_id / page_size;
-     int64_t block_offset = slot_id % page_size;
-     __shared__ float shared_max[num_kv_heads];
-     float dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<kv_cache_scalar_t>::max());
-     float warp_max  = elements[0];
- 
-     // If quantization is required, compute the max abs value across the head_dim * num_heads
-     if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
-     {
-         auto f_absmax_f32 = [](float v_0_, float v_1_) {
-             return __builtin_fmaxf(abs(v_0_), abs(v_1_));
-         };
- #pragma unroll
-         for(int i = 1; i < numElemsPerThread; i++)
-         {
-             warp_max = f_absmax_f32(warp_max, elements[i]);
-         }
-         warp_max = warpReduceSum(f_absmax_f32, warp_max);
-     }
-     if(isK)
-     {
-         float k_scale_val = 1.0f;
-         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
-         {
-             float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
-             k_scale_val                 = warp_max_safe / dtype_max;
-             int64_t scale_offset =
-                 block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
-             k_scale[scale_offset] = k_scale_val;
-         }
-         int64_t cache_offset = block_idx * page_size * num_heads_k * head_dim +
-                                headIdx * head_dim * page_size + block_offset * x;
- #pragma unroll
-         for(int i = 0; i < numElemsPerThread; i++)
-         {
-             int64_t offset = cache_offset + (laneId * numElemsPerThread + i) / x * page_size * x +
-                              (laneId * numElemsPerThread + i) % x;
-             if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
-             {
-                 k_cache[offset] = elements[i];
-             }
-             else
-             {
-                 k_cache[offset] =
-                     ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / k_scale_val);
-             }
-         }
-     }
-     else
-     {
-         float v_scale_val = 1.0f;
-         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
-         {
-             float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
-             v_scale_val                 = warp_max_safe / dtype_max;
-             int64_t scale_offset =
-                 block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
-             v_scale[scale_offset] = v_scale_val;
-         }
-         int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
-                                headIdx * head_dim * page_size + block_offset / x * head_dim * x +
-                                block_offset % x;
-         // no vectorized store for v cache since its not contiguous on head_dim
- #pragma unroll
-         for(int i = 0; i < numElemsPerThread; i++)
-         {
-             int64_t offset = cache_offset + (laneId * numElemsPerThread + i) * x;
-             if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
-             {
-                 v_cache[offset] = elements[i];
-             }
-             else
-             {
-                 v_cache[offset] =
-                     ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / v_scale_val);
-             }
-         }
+namespace {
+using mrope_utils::vec_t;
+
+// Minimum absmax used when computing FP8 KV scales to avoid division by zero when
+// activations are all zero (e.g. CUDA graph warmup, invalid slots, or padding).
+static constexpr float kFp8KvQuantAbsmaxFloorF32 = 1e-8f;
+
+template <typename Func, typename T>
+__inline__ __device__ T warpReduceSum(Func func, T val)
+{
+#pragma unroll
+    for(int mask = 16; mask > 0; mask >>= 1)
+        val = func(val, __shfl_xor(val, mask, 32));
+    return val;
+}
+
+template <typename T>
+inline __device__ __host__ T divUp(T m, T n)
+{
+    return (m + n - 1) / n;
+}
+
+__device__ float abs(float x)
+{
+    union
+    {
+        float f32;
+        uint32_t u32;
+    } y;
+    y.f32 = x;
+    y.u32 = y.u32 & 0x7fffffff;
+    return y.f32;
+};
+
+// Adopted and changed from vllm
+// https://github.com/vllm-project/vllm/blob/main/csrc/fused_qknorm_rope_kernel.cu
+
+// Perform per-head QK Norm,  RoPE in a single kernel.
+// scalar_t: data type of QKV and RMSNorm weights
+// kv_cache_scalar_t: data type of kv cache
+// head_dim: the dimension of each head
+// interleave: interleave=!is_neox.
+// num_kv_heads: number of kv heads for kv cache
+// kv_dt: data type of kv cache for quantization
+template <typename scalar_t,
+          typename kv_cache_scalar_t,
+          int head_dim,
+          bool interleave,
+          int num_kv_heads,
+          vllm::Fp8KVCacheDataType kv_dt>
+__global__ void fusedQKNormRopeQuantCacheShuffleKernel(
+    scalar_t* q_act, // [num_tokens, num_heads_q * head_dim]
+    scalar_t* k_act, // [num_tokens, num_heads_k * head_dim]
+    scalar_t* v_act, // [num_tokens, num_heads_v * head_dim]
+    int64_t const q_st,
+    int64_t const q_sh,
+    int64_t const q_sd,
+    int64_t const k_st,
+    int64_t const k_sh,
+    int64_t const k_sd,
+    int64_t const v_st,
+    int64_t const v_sh,
+    int64_t const v_sd,
+    int const num_heads_q,         // Number of query heads
+    int const num_heads_k,         // Number of key heads
+    int const num_heads_v,         // Number of value heads
+    float const eps,               // Epsilon for RMS normalization
+    scalar_t const* q_weight,      // RMSNorm weights for query
+    scalar_t const* k_weight,      // RMSNorm weights for key
+    scalar_t const* cos_sin_cache, // Pre-computed cos/sin cache
+    int64_t const* position_ids,   // Position IDs for RoPE
+    kv_cache_scalar_t*
+        k_cache, // Key cache [num_blocks, num_kv_heads, head_size // x, block_size, x]
+    kv_cache_scalar_t*
+        v_cache,           // Value cache [num_blocks, num_kv_heads, block_size/X, head_size, X]
+    int64_t* slot_mapping, // Slot mapping
+    float* k_scale,        // Key scale for quantized key cache [num_blocks, block_size]
+    float* v_scale,        // Value scale for quantized value cache [num_blocks, block_size]
+    int const num_tokens,  // Number of tokens
+    int const page_size,   // Page size for kv cache
+    int x,                 // kv cache tiling size
+    int const rotary_dim   // Rotary dimension (concatenated cos+sin width); <= head_dim
+)
+{
+
+    int const warpsPerBlock = blockDim.x / 32;
+    int const warpId        = threadIdx.x / 32;
+    int const laneId        = threadIdx.x % 32;
+
+    int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
+
+    int const num_heads    = num_heads_q + num_heads_k + num_heads_v;
+    int const tokenIdx     = globalWarpIdx / num_heads;
+    int const localHeadIdx = globalWarpIdx % num_heads;
+    if(tokenIdx >= num_tokens)
+        return;
+    bool const isQ                  = localHeadIdx < num_heads_q;
+    bool const isK                  = (localHeadIdx < num_heads_q + num_heads_k) & !isQ;
+    bool const isV                  = !isQ & !isK;
+    int const headIdx               = isV   ? localHeadIdx - num_heads_q - num_heads_k
+                                      : isK ? localHeadIdx - num_heads_q
+                                            : localHeadIdx;
+    constexpr int numElemsPerThread = head_dim / 32;
+    scalar_t elements[numElemsPerThread];
+    constexpr int best_vec_size = sizeof(float4) / sizeof(scalar_t);
+    constexpr int vec_size      = std::min(best_vec_size, numElemsPerThread);
+    constexpr int load_loop_cnt = numElemsPerThread / vec_size;
+    using ltype                 = ::vec_t<scalar_t, vec_size>;
+    const float inverted_kscale = k_scale == nullptr ? 1.0f : 1 / (*k_scale);
+    const float inverted_vscale = v_scale == nullptr ? 1.0f : 1 / (*v_scale);
+
+    int64_t const act_st     = isQ ? q_st : (isK ? k_st : v_st);
+    int64_t const act_sh     = isQ ? q_sh : (isK ? k_sh : v_sh);
+    int64_t const act_sd     = isQ ? q_sd : (isK ? k_sd : v_sd);
+    scalar_t* const act_base = isQ ? q_act : (isK ? k_act : v_act);
+
+    // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before
+    // kernel launch
+    if(act_sd == 1)
+    {
+        int64_t const base_elems = (int64_t)tokenIdx * act_st + (int64_t)headIdx * act_sh +
+                                   (int64_t)(laneId * numElemsPerThread);
+#pragma unroll
+        for(int i = 0; i < load_loop_cnt; i += 1)
+        {
+            reinterpret_cast<ltype*>(elements)[i] =
+                *reinterpret_cast<ltype const*>(act_base + base_elems + i * vec_size);
+        }
+    }
+    else
+    {
+#pragma unroll
+        for(int j = 0; j < numElemsPerThread; j++)
+        {
+            int64_t const off = (int64_t)tokenIdx * act_st + (int64_t)headIdx * act_sh +
+                                (int64_t)(laneId * numElemsPerThread + j) * act_sd;
+            elements[j] = act_base[off];
+        }
+    }
+
+    // If qk, we adopt RMSNorm + RoPE, so we need to compute sum of squares.
+    if(!isV)
+    {
+
+        // Compute norm squares
+        float sumOfSquares = 0.0f;
+#pragma unroll
+        for(int i = 0; i < numElemsPerThread; i++)
+        {
+            sumOfSquares += static_cast<float>(elements[i]) * static_cast<float>(elements[i]);
+        }
+        auto sum_func = [](float a, float b) { return a + b; };
+        sumOfSquares  = warpReduceSum(sum_func, sumOfSquares);
+        float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
+
+        // Normalize elements
+#pragma unroll
+        for(int i = 0; i < numElemsPerThread; i++)
+        {
+            int dim      = laneId * numElemsPerThread + i;
+            float weight = isQ ? float(q_weight[dim]) : float(k_weight[dim]);
+            elements[i]  = static_cast<scalar_t>(elements[i] * rms_rcp * weight);
+        }
+
+        // Apply RoPE to normalized elements
+
+        int64_t pos_id            = position_ids[tokenIdx];
+        int const embed_dim       = rotary_dim / 2;
+        scalar_t const* cache_ptr = cos_sin_cache + pos_id * rotary_dim;
+        scalar_t const* cos_ptr   = cache_ptr;
+        scalar_t const* sin_ptr   = cache_ptr + embed_dim;
+
+        if constexpr(interleave)
+        {
+            // Perform interleaving. Use pre-computed cos/sin values.
+#pragma unroll
+            for(int i = 0; i < numElemsPerThread / 2; ++i)
+            {
+                int const idx0 = 2 * i;
+                int const idx1 = 2 * i + 1;
+                int const dim0 = laneId * numElemsPerThread + idx0;
+
+                if(dim0 + 1 < rotary_dim)
+                {
+                    float const val0  = elements[idx0];
+                    float const val1  = elements[idx1];
+                    int const half_dim = dim0 / 2;
+                    float cos_val     = static_cast<float>(cos_ptr[half_dim]);
+                    float sin_val     = static_cast<float>(sin_ptr[half_dim]);
+
+                    elements[idx0] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
+                    elements[idx1] = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
+                }
+            }
+        }
+        else
+        {
+            scalar_t elements2[numElemsPerThread]; // Additional buffer required for RoPE.
+            // Before data exchange within warp, we need to sync.
+            __syncwarp();
+            int const partner_lane_delta = embed_dim / numElemsPerThread;
+            // Get the data from the other half of the warp. Use pre-computed cos/sin values.
+#pragma unroll
+            for(int i = 0; i < numElemsPerThread; i++)
+            {
+                int const dim_idx = laneId * numElemsPerThread + i;
+                if(dim_idx < rotary_dim)
+                {
+                    elements2[i] = static_cast<scalar_t>(
+                        __shfl_xor(float(elements[i]), partner_lane_delta, 32));
+                    if(dim_idx < embed_dim)
+                    {
+                        elements2[i] = -elements2[i];
+                    }
+
+                    int const half_dim = dim_idx % embed_dim;
+                    float cos_val      = static_cast<float>(cos_ptr[half_dim]);
+                    float sin_val      = static_cast<float>(sin_ptr[half_dim]);
+
+                    elements[i] = static_cast<scalar_t>(
+                        elements[i] * cos_val + elements2[i] * sin_val);
+                }
+            }
+            __syncwarp();
+        }
+        int64_t const qk_st    = isQ ? q_st : k_st;
+        int64_t const qk_sh    = isQ ? q_sh : k_sh;
+        int64_t const qk_sd    = isQ ? q_sd : k_sd;
+        scalar_t* const qk_dst = isQ ? q_act : k_act;
+        if(qk_sd == 1)
+        {
+            int64_t const base_elems = (int64_t)tokenIdx * qk_st + (int64_t)headIdx * qk_sh +
+                                       (int64_t)(laneId * numElemsPerThread);
+#pragma unroll
+            for(int i = 0; i < load_loop_cnt; i += 1)
+            {
+                *reinterpret_cast<ltype*>(qk_dst + base_elems + i * vec_size) =
+                    reinterpret_cast<ltype*>(elements)[i];
+            }
+        }
+        else
+        {
+#pragma unroll
+            for(int j = 0; j < numElemsPerThread; j++)
+            {
+                int64_t const off = (int64_t)tokenIdx * qk_st + (int64_t)headIdx * qk_sh +
+                                    (int64_t)(laneId * numElemsPerThread + j) * qk_sd;
+                qk_dst[off] = elements[j];
+            }
+        }
+    }
+
+    if(isQ)
+    {
+        // For Q, we are done.
+        return;
+    }
+
+    // cache the kv into kv cache and quant if required
+    int64_t slot_id = slot_mapping[tokenIdx];
+    if(slot_id < 0)
+    {
+        // invalid slot, skip
+        return;
+    }
+    int64_t block_idx    = slot_id / page_size;
+    int64_t block_offset = slot_id % page_size;
+    __shared__ float shared_max[num_kv_heads];
+    float dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<kv_cache_scalar_t>::max());
+    float warp_max  = elements[0];
+
+    // If quantization is required, compute the max abs value across the head_dim * num_heads
+    if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+    {
+        auto f_absmax_f32 = [](float v_0_, float v_1_) {
+            return __builtin_fmaxf(abs(v_0_), abs(v_1_));
+        };
+#pragma unroll
+        for(int i = 1; i < numElemsPerThread; i++)
+        {
+            warp_max = f_absmax_f32(warp_max, elements[i]);
+        }
+        warp_max = warpReduceSum(f_absmax_f32, warp_max);
+    }
+    if(isK)
+    {
+        float k_scale_val = 1.0f;
+        if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+        {
+            float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
+            k_scale_val               = warp_max_safe / dtype_max;
+            int64_t scale_offset =
+                block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
+            k_scale[scale_offset] = k_scale_val;
+        }
+        int64_t cache_offset = block_idx * page_size * num_heads_k * head_dim +
+                               headIdx * head_dim * page_size + block_offset * x;
+#pragma unroll
+        for(int i = 0; i < numElemsPerThread; i++)
+        {
+            int64_t offset = cache_offset + (laneId * numElemsPerThread + i) / x * page_size * x +
+                             (laneId * numElemsPerThread + i) % x;
+            if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+            {
+                k_cache[offset] = elements[i];
+            }
+            else
+            {
+                k_cache[offset] =
+                    ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / k_scale_val);
+            }
+        }
+    }
+    else
+    {
+        float v_scale_val = 1.0f;
+        if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+        {
+            float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
+            v_scale_val               = warp_max_safe / dtype_max;
+            int64_t scale_offset =
+                block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
+            v_scale[scale_offset] = v_scale_val;
+        }
+        int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
+                               headIdx * head_dim * page_size + block_offset / x * head_dim * x +
+                               block_offset % x;
+        // no vectorized store for v cache since its not contiguous on head_dim
+#pragma unroll
+        for(int i = 0; i < numElemsPerThread; i++)
+        {
+            int64_t offset = cache_offset + (laneId * numElemsPerThread + i) * x;
+            if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+            {
+                v_cache[offset] = elements[i];
+            }
+            else
+            {
+                v_cache[offset] =
+                    ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / v_scale_val);
+            }
+        }
     }
 }
 
- template <typename scalar_t,
+template <typename scalar_t,
           typename kv_cache_scalar_t,
           int head_dim,
           bool interleave,
           int X,
           int wg_size = 64,
           vllm::Fp8KVCacheDataType kv_dt>
- __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
-    scalar_t* qkv_void,            // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v), head_dim]
+__global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
+    scalar_t* qkv_void, // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v),
+                        // head_dim]
     int const num_heads_q,         // Number of query heads
     int const num_heads_k,         // Number of key heads
     int const num_heads_v,         // Number of value heads
@@ -452,22 +451,24 @@ inline ActivationStrides3D activation_strides_logical_3d(
         k_cache, // Key cache [num_blocks, num_heads_k, head_size // X, block_size, X]
     kv_cache_scalar_t*
         v_cache,           // Value cache [num_blocks, num_heads_v, block_size // X, head_size, X]
-    int64_t* slot_mapping,  // Slot mapping
-    int64_t const* cu_q_len, // Cu Q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
-    float* k_scale,        // Key scale for quantized key cache [num_blocks, num_heads_k]
-    float* v_scale,        // Value scale for quantized value cache [num_blocks, num_heads_v]
-    int const num_tokens,  // Number of tokens
-    int const page_size,   // Page size for kv cache
-    int const batch_size,  // Batch size
-    int const blocks_per_batch // Uniform blocks per batch (>0: division mapping, 0: prefix-sum fallback)
+    int64_t* slot_mapping, // Slot mapping
+    int64_t const*
+        cu_q_len,   // Cu Q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
+    float* k_scale, // Key scale for quantized key cache [num_blocks, num_heads_k]
+    float* v_scale, // Value scale for quantized value cache [num_blocks, num_heads_v]
+    int const num_tokens, // Number of tokens
+    int const page_size,  // Page size for kv cache
+    int const batch_size, // Batch size
+    int const
+        blocks_per_batch // Uniform blocks per batch (>0: division mapping, 0: prefix-sum fallback)
 )
 {
-    int const num_heads        = num_heads_q + num_heads_k + num_heads_v;
-    int const localHeadIdx     = blockIdx.z;
-    int const page_size_log2   = __builtin_ctz(page_size);
-    int const page_mask        = page_size - 1;
+    int const num_heads      = num_heads_q + num_heads_k + num_heads_v;
+    int const localHeadIdx   = blockIdx.z;
+    int const page_size_log2 = __builtin_ctz(page_size);
+    int const page_mask      = page_size - 1;
 
-    int batch_id = -1;
+    int batch_id   = -1;
     int cum_blocks = 0;
     if(gridDim.x > 1)
     {
@@ -486,7 +487,7 @@ inline ActivationStrides3D activation_strides_logical_3d(
     else
     {
         // Fallback: batch_size <= 1 or max_tokens_per_batch unknown
-        batch_id = 0;
+        batch_id   = 0;
         cum_blocks = 0;
     }
     if(batch_id < 0)
@@ -514,11 +515,11 @@ inline ActivationStrides3D activation_strides_logical_3d(
         {
             return;
         }
-        int64_t prev_slot_idx = slot_mapping[prev_first_token_idx];
+        int64_t prev_slot_idx   = slot_mapping[prev_first_token_idx];
         int64_t preTg_block_idx = prev_slot_idx >> page_size_log2;
-        int64_t last_token_idx = batch_end_idx - 1;
-        slot_idx = slot_mapping[last_token_idx];
-        block_idx = slot_idx >> page_size_log2;
+        int64_t last_token_idx  = batch_end_idx - 1;
+        slot_idx                = slot_mapping[last_token_idx];
+        block_idx               = slot_idx >> page_size_log2;
         if(preTg_block_idx == block_idx)
         {
             return;
@@ -527,8 +528,8 @@ inline ActivationStrides3D activation_strides_logical_3d(
     }
     else
     {
-        slot_idx = slot_mapping[first_token_idx];
-        block_idx = slot_idx >> page_size_log2;
+        slot_idx     = slot_mapping[first_token_idx];
+        block_idx    = slot_idx >> page_size_log2;
         block_offset = slot_idx & page_mask;
     }
     if(slot_idx < 0)
@@ -540,7 +541,7 @@ inline ActivationStrides3D activation_strides_logical_3d(
         __shared__ int64_t idx_smem[2];
         if(threadIdx.x < page_size)
         {
-            int64_t token_idx  = first_token_idx - (threadIdx.x + 1);
+            int64_t token_idx = first_token_idx - (threadIdx.x + 1);
             if(token_idx >= batch_start_idx && token_idx < batch_end_idx)
             {
                 int64_t block_idx1 = slot_mapping[token_idx] >> page_size_log2;
@@ -557,12 +558,12 @@ inline ActivationStrides3D activation_strides_logical_3d(
         first_token_idx = idx_smem[0];
         slot_idx        = idx_smem[1];
         // block_idx unchanged: idx_smem search guarantees same page (block_idx2 == block_idx)
-        block_offset    = slot_idx & page_mask;
+        block_offset = slot_idx & page_mask;
     }
     // Each token should compute its own slot_id and block_offset
-    int64_t actual_slot_id = -1;
+    int64_t actual_slot_id      = -1;
     int64_t actual_block_offset = 0;
-    int64_t actual_block_idx = -1;
+    int64_t actual_block_idx    = -1;
     // Calculate the num_tokens that are in the same cache block (page)
     int tokens_in_block = 0;
     if(first_token_idx + threadIdx.x < batch_end_idx)
@@ -570,47 +571,49 @@ inline ActivationStrides3D activation_strides_logical_3d(
         actual_slot_id = slot_mapping[first_token_idx + threadIdx.x];
         if(actual_slot_id >= 0)
         {
-            actual_block_idx = actual_slot_id >> page_size_log2;
+            actual_block_idx    = actual_slot_id >> page_size_log2;
             actual_block_offset = actual_slot_id & page_mask;
-            tokens_in_block = (actual_block_idx == block_idx) ? 1 : 0;
+            tokens_in_block     = (actual_block_idx == block_idx) ? 1 : 0;
         }
     }
     auto sum               = [](float a, float b) { return a + b; };
     int numtokens_in_block = 0;
-    numtokens_in_block = block_reduce<float, decltype(sum), wg_size, true>(static_cast<float>(tokens_in_block), sum);
+    numtokens_in_block =
+        block_reduce<float, decltype(sum), wg_size, true>(static_cast<float>(tokens_in_block), sum);
     // Calculate tokenIdx for current thread
-    int tokenIdx = first_token_idx + threadIdx.x;
+    int tokenIdx                    = first_token_idx + threadIdx.x;
     bool const isQ                  = localHeadIdx < num_heads_q;
     bool const isK                  = (localHeadIdx < num_heads_q + num_heads_k) & !isQ;
     bool const isV                  = !isQ & !isK;
     int const headIdx               = isV   ? localHeadIdx - num_heads_q - num_heads_k
-                                     : isK ? localHeadIdx - num_heads_q
-                                           : localHeadIdx;
+                                      : isK ? localHeadIdx - num_heads_q
+                                            : localHeadIdx;
     constexpr int numElemsPerThread = head_dim;
-    constexpr int best_vec_size = sizeof(float4) / sizeof(scalar_t);
-    constexpr int vec_size      = std::min(best_vec_size, numElemsPerThread);
-    constexpr int load_loop_cnt = numElemsPerThread / vec_size;
-    using ltype                 = ::vec_t<scalar_t, vec_size>;
-    using kv_cache_ltype        = ::vec_t<kv_cache_scalar_t, vec_size>;
+    constexpr int best_vec_size     = sizeof(float4) / sizeof(scalar_t);
+    constexpr int vec_size          = std::min(best_vec_size, numElemsPerThread);
+    constexpr int load_loop_cnt     = numElemsPerThread / vec_size;
+    using ltype                     = ::vec_t<scalar_t, vec_size>;
+    using kv_cache_ltype            = ::vec_t<kv_cache_scalar_t, vec_size>;
     ltype elements;
     ltype next_elements;
-    float block_max = 0.0f;
+    float block_max         = 0.0f;
     auto cur_element_offset = head_dim * threadIdx.x;
-    auto f_absmax_f32 = [](float v_0_, float v_1_) {
+    auto f_absmax_f32       = [](float v_0_, float v_1_) {
         return __builtin_fmaxf(abs(v_0_), abs(v_1_));
     };
-    // V: only valid tokens; Q/K: ALL threads must participate (avoids __syncthreads deadlock in block_reduce)
+    // V: only valid tokens; Q/K: ALL threads must participate (avoids __syncthreads deadlock in
+    // block_reduce)
     if(isV)
     {
         int64_t total_elements = numtokens_in_block * head_dim;
         for(int idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
         {
-            int token_idx          = first_token_idx + idx * vec_size / head_dim;
-            int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) /
-                                vec_size;
+            int token_idx = first_token_idx + idx * vec_size / head_dim;
+            int64_t offsetWarp =
+                (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
             int vec_slot = idx % (head_dim / vec_size);
-            elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot];
-            #pragma unroll
+            elements     = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot];
+#pragma unroll
             for(int j = 0; j < vec_size; j++)
             {
                 block_max = f_absmax_f32(block_max, static_cast<float>(elements[j]));
@@ -619,113 +622,125 @@ inline ActivationStrides3D activation_strides_logical_3d(
     }
     else
     {
-            constexpr int64_t head_thread = head_dim / vec_size;
-            int64_t total_elements = numtokens_in_block * head_dim;
-            auto sum_op = [](float a, float b) { return a + b; };
-            if constexpr(interleave) {
-                for(int idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
+        constexpr int64_t head_thread = head_dim / vec_size;
+        int64_t total_elements        = numtokens_in_block * head_dim;
+        auto sum_op                   = [](float a, float b) { return a + b; };
+        if constexpr(interleave)
+        {
+            for(int idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
+            {
+                int token_local = idx / head_thread;
+                int vec_slot    = idx % head_thread;
+                int token_idx   = first_token_idx + token_local;
+                if(token_idx >= batch_end_idx)
+                    continue;
+                int64_t offsetWarp =
+                    (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
+                elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot];
+                ltype weights;
+                scalar_t const* weight_ptr = isQ ? q_weight : k_weight;
+                weights                    = reinterpret_cast<const ltype*>(weight_ptr)[vec_slot];
+                float partial_sum          = 0.0f;
+#pragma unroll
+                for(int j = 0; j < vec_size; j++)
+                    partial_sum +=
+                        static_cast<float>(elements[j]) * static_cast<float>(elements[j]);
+                float sumOfSquares =
+                    wave_reduce<float, decltype(sum_op), head_thread, true>(partial_sum, sum_op);
+                float rms_rcp  = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
+                int64_t pos_id = position_ids[token_idx];
+                scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
+                scalar_t const* cos_ptr   = cache_ptr;
+                scalar_t const* sin_ptr   = cache_ptr + head_dim / 2;
+                int const base_idx        = vec_slot * vec_size;
+
+                using cos_sin_ltype = ::vec_t<scalar_t, vec_size / 2>;
+                cos_sin_ltype cos;
+                cos = reinterpret_cast<const cos_sin_ltype*>(cos_ptr)[vec_slot];
+                cos_sin_ltype sin;
+                sin = reinterpret_cast<const cos_sin_ltype*>(sin_ptr)[vec_slot];
+#pragma unroll
+                for(int k = 0; k < vec_size; k += 2)
                 {
-                    int token_local = idx / head_thread;
-                    int vec_slot    = idx % head_thread;
-                    int token_idx   = first_token_idx + token_local;
-                    if(token_idx >= batch_end_idx) continue;
-                    int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
-                    elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot];
-                    ltype weights;
-                    scalar_t const* weight_ptr = isQ ? q_weight : k_weight;
-                    weights = reinterpret_cast<const ltype*>(weight_ptr)[vec_slot];
-                    float partial_sum = 0.0f;
-                    #pragma unroll
-                    for(int j = 0; j < vec_size; j++)
-                        partial_sum += static_cast<float>(elements[j]) * static_cast<float>(elements[j]);
-                    float sumOfSquares = wave_reduce<float, decltype(sum_op), head_thread, true>(partial_sum, sum_op);
-                    float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
-                    int64_t pos_id  = position_ids[token_idx];
-                    scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
-                    scalar_t const* cos_ptr  = cache_ptr;
-                    scalar_t const* sin_ptr  = cache_ptr + head_dim / 2;
-                    int const base_idx = vec_slot * vec_size;
-                    
-                    using cos_sin_ltype = ::vec_t<scalar_t, vec_size/2>;
-                    cos_sin_ltype cos;
-                    cos = reinterpret_cast<const cos_sin_ltype*>(cos_ptr)[vec_slot];
-                    cos_sin_ltype sin;
-                    sin = reinterpret_cast<const cos_sin_ltype*>(sin_ptr)[vec_slot];
-                    #pragma unroll
-                    for(int k = 0; k < vec_size; k += 2)
-                    {
-                        int const local0   = base_idx + k;
-                        int const local1   = base_idx + k + 1;
-                        float weight0 = static_cast<float>(weights[k]);
-                        float weight1 = static_cast<float>(weights[k + 1]);
-                        int const half_dim = local0 / 2;
-                        float cos_val = static_cast<float>(cos[k/2]);
-                        float sin_val = static_cast<float>(sin[k/2]);
-                        float const val0  = static_cast<float>(elements[k]) * rms_rcp * weight0;
-                        float const val1  = static_cast<float>(elements[k + 1]) * rms_rcp * weight1;
-                        elements[k]       = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
-                        elements[k + 1]   = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
-                        block_max          = f_absmax_f32(block_max, elements[k]);
-                        block_max          = f_absmax_f32(block_max, elements[k + 1]);
-                    }
-                    reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot] = elements;
+                    int const local0   = base_idx + k;
+                    int const local1   = base_idx + k + 1;
+                    float weight0      = static_cast<float>(weights[k]);
+                    float weight1      = static_cast<float>(weights[k + 1]);
+                    int const half_dim = local0 / 2;
+                    float cos_val      = static_cast<float>(cos[k / 2]);
+                    float sin_val      = static_cast<float>(sin[k / 2]);
+                    float const val0   = static_cast<float>(elements[k]) * rms_rcp * weight0;
+                    float const val1   = static_cast<float>(elements[k + 1]) * rms_rcp * weight1;
+                    elements[k]        = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
+                    elements[k + 1]    = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
+                    block_max          = f_absmax_f32(block_max, elements[k]);
+                    block_max          = f_absmax_f32(block_max, elements[k + 1]);
                 }
-            } else {
-                constexpr int64_t head_thread_half = head_dim / vec_size / 2;
-                for(int idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
-                {
-                    int token_local = idx / head_thread;
-                    int vec_slot    = idx % head_thread;
-                    int token_idx   = first_token_idx + token_local;
-                    if(token_idx >= batch_end_idx) continue;
-                    if(vec_slot >= head_thread_half) continue;
-                    int pair_slot   = vec_slot + head_thread_half;
-                    int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
-                    elements      = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot];
-                    next_elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + pair_slot];
-                    ltype weights0, weights1;
-                    scalar_t const* weight_ptr = isQ ? q_weight : k_weight;
-                    weights0 = reinterpret_cast<const ltype*>(weight_ptr)[vec_slot];
-                    weights1 = reinterpret_cast<const ltype*>(weight_ptr)[pair_slot];
-                    int64_t pos_id = position_ids[token_idx];
-                    scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
-                    scalar_t const* cos_ptr  = cache_ptr;
-                    scalar_t const* sin_ptr  = cache_ptr + head_dim / 2;
-                    float partial_sum = 0.0f;
-                    #pragma unroll
-                    for(int j = 0; j < vec_size; j++)
-                        partial_sum += static_cast<float>(elements[j]) * static_cast<float>(elements[j])
-                                     + static_cast<float>(next_elements[j]) * static_cast<float>(next_elements[j]);
-                    float sumOfSquares = wave_reduce<float, decltype(sum_op), head_thread_half, true>(partial_sum, sum_op);
-                    float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
-                    using cos_sin_ltype = ::vec_t<scalar_t, vec_size>;
-                    cos_sin_ltype cos;
-                    cos = reinterpret_cast<const cos_sin_ltype*>(cos_ptr)[vec_slot];
-                    cos_sin_ltype sin;
-                    sin = reinterpret_cast<const cos_sin_ltype*>(sin_ptr)[vec_slot];
-                    #pragma unroll                    
-                    for(int j = 0; j < vec_size; j++)
-                    {
-                        int const idx0 = vec_slot * vec_size + j;
-                        int const idx1 = pair_slot * vec_size + j;
-                        float weight0 = static_cast<float>(weights0[j]);
-                        float weight1 = static_cast<float>(weights1[j]);
-                        float cos_val = static_cast<float>(cos[j]);
-                        float sin_val = static_cast<float>(sin[j]);
-                        float const val0 = static_cast<float>(elements[j]) * rms_rcp * weight0;
-                        float const val1 = static_cast<float>(next_elements[j]) * rms_rcp * weight1;
-                        float out0 = val0 * cos_val - val1 * sin_val;
-                        float out1 = val1 * cos_val + val0 * sin_val;
-                        block_max = f_absmax_f32(block_max, out0);
-                        block_max = f_absmax_f32(block_max, out1);
-                        elements[j]      = static_cast<scalar_t>(out0);
-                        next_elements[j] = static_cast<scalar_t>(out1);
-                    }
-                    reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot]  = elements;
-                    reinterpret_cast<ltype*>(qkv_void)[offsetWarp + pair_slot]  = next_elements;
-                }
+                reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot] = elements;
             }
-            // store q
+        }
+        else
+        {
+            constexpr int64_t head_thread_half = head_dim / vec_size / 2;
+            for(int idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
+            {
+                int token_local = idx / head_thread;
+                int vec_slot    = idx % head_thread;
+                int token_idx   = first_token_idx + token_local;
+                if(token_idx >= batch_end_idx)
+                    continue;
+                if(vec_slot >= head_thread_half)
+                    continue;
+                int pair_slot = vec_slot + head_thread_half;
+                int64_t offsetWarp =
+                    (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
+                elements      = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot];
+                next_elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + pair_slot];
+                ltype weights0, weights1;
+                scalar_t const* weight_ptr = isQ ? q_weight : k_weight;
+                weights0                   = reinterpret_cast<const ltype*>(weight_ptr)[vec_slot];
+                weights1                   = reinterpret_cast<const ltype*>(weight_ptr)[pair_slot];
+                int64_t pos_id             = position_ids[token_idx];
+                scalar_t const* cache_ptr  = cos_sin_cache + pos_id * head_dim;
+                scalar_t const* cos_ptr    = cache_ptr;
+                scalar_t const* sin_ptr    = cache_ptr + head_dim / 2;
+                float partial_sum          = 0.0f;
+#pragma unroll
+                for(int j = 0; j < vec_size; j++)
+                    partial_sum +=
+                        static_cast<float>(elements[j]) * static_cast<float>(elements[j]) +
+                        static_cast<float>(next_elements[j]) * static_cast<float>(next_elements[j]);
+                float sumOfSquares = wave_reduce<float, decltype(sum_op), head_thread_half, true>(
+                    partial_sum, sum_op);
+                float rms_rcp       = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
+                using cos_sin_ltype = ::vec_t<scalar_t, vec_size>;
+                cos_sin_ltype cos;
+                cos = reinterpret_cast<const cos_sin_ltype*>(cos_ptr)[vec_slot];
+                cos_sin_ltype sin;
+                sin = reinterpret_cast<const cos_sin_ltype*>(sin_ptr)[vec_slot];
+#pragma unroll
+                for(int j = 0; j < vec_size; j++)
+                {
+                    int const idx0   = vec_slot * vec_size + j;
+                    int const idx1   = pair_slot * vec_size + j;
+                    float weight0    = static_cast<float>(weights0[j]);
+                    float weight1    = static_cast<float>(weights1[j]);
+                    float cos_val    = static_cast<float>(cos[j]);
+                    float sin_val    = static_cast<float>(sin[j]);
+                    float const val0 = static_cast<float>(elements[j]) * rms_rcp * weight0;
+                    float const val1 = static_cast<float>(next_elements[j]) * rms_rcp * weight1;
+                    float out0       = val0 * cos_val - val1 * sin_val;
+                    float out1       = val1 * cos_val + val0 * sin_val;
+                    block_max        = f_absmax_f32(block_max, out0);
+                    block_max        = f_absmax_f32(block_max, out1);
+                    elements[j]      = static_cast<scalar_t>(out0);
+                    next_elements[j] = static_cast<scalar_t>(out1);
+                }
+                reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot]  = elements;
+                reinterpret_cast<ltype*>(qkv_void)[offsetWarp + pair_slot] = next_elements;
+            }
+        }
+        // store q
     }
     if(isQ)
     {
@@ -733,30 +748,34 @@ inline ActivationStrides3D activation_strides_logical_3d(
         return;
     }
     float dtype_max = opus::cast<float>(opus::finfo<opus::fp8_t>::max());
-    auto f_max_f32 = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
+    auto f_max_f32  = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
     if(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
     {
         block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
     }
     if(isK)
     {
-        float k_scale_val = 1.0f;
+        float k_scale_val   = 1.0f;
         float inv_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
             float const block_max_safe = fmaxf(block_max, kFp8KvQuantAbsmaxFloorF32);
-            k_scale_val                  = block_max_safe / dtype_max;
-            inv_scale_val                = dtype_max / block_max_safe;
-            int64_t scale_offset = block_idx * num_heads_k + headIdx;
+            k_scale_val                = block_max_safe / dtype_max;
+            inv_scale_val              = dtype_max / block_max_safe;
+            int64_t scale_offset       = block_idx * num_heads_k + headIdx;
             if(block_offset > 0)
             {
                 float k_scale_global = k_scale[scale_offset];
                 if(k_scale_global < k_scale_val)
                 {
                     // k_cache layout: [num_blocks, num_heads_k, head_size//X, page_size, X]
+                    // TODO(stride-aware): this assumes a contiguous block stride
+                    // (block_idx * page_size * num_heads_k * head_dim). Mirror the
+                    // runtime per-block-stride fix from the pts shuffle path when this
+                    // kernel must support non-contiguous (e.g. vLLM unbind(1)) caches.
                     int64_t cache_base = block_idx * page_size * num_heads_k * head_dim +
-                                        headIdx * head_dim * page_size;
-                    float rescale = k_scale_global * inv_scale_val;
+                                         headIdx * head_dim * page_size;
+                    float rescale            = k_scale_global * inv_scale_val;
                     constexpr int num_hc     = head_dim / X;
                     constexpr int vecs_per_x = X / vec_size;
                     for(int hc = 0; hc < num_hc; hc++)
@@ -767,8 +786,9 @@ inline ActivationStrides3D activation_strides_logical_3d(
                             for(int tok = threadIdx.x; tok < block_offset; tok += blockDim.x)
                             {
                                 int64_t addr = hc_base + tok * X + xo * vec_size;
-                                kv_cache_ltype data = *reinterpret_cast<kv_cache_ltype*>(&k_cache[addr]);
-                                #pragma unroll
+                                kv_cache_ltype data =
+                                    *reinterpret_cast<kv_cache_ltype*>(&k_cache[addr]);
+#pragma unroll
                                 for(int j = 0; j < vec_size; j++)
                                 {
                                     data[j] = opus::cast<kv_cache_scalar_t>(
@@ -791,17 +811,19 @@ inline ActivationStrides3D activation_strides_logical_3d(
                 k_scale[scale_offset] = k_scale_val;
             }
         }
-        int64_t cache_offset = block_idx * page_size * num_heads_k * head_dim +
-                               headIdx * head_dim * page_size;
+        int64_t cache_offset =
+            block_idx * page_size * num_heads_k * head_dim + headIdx * head_dim * page_size;
         int64_t total_elements = numtokens_in_block * head_dim;
         for(int64_t idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
         {
             int token_idx          = first_token_idx + idx * vec_size / head_dim;
             int head_offset        = (idx * vec_size) % head_dim;
             int block_offset_local = (token_idx - first_token_idx + block_offset) & page_mask;
-            int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
+            int64_t offsetWarp =
+                (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
             elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + head_offset / vec_size];
-            int64_t vec_offset = cache_offset + (head_offset / X) * page_size * X + block_offset_local * X + head_offset % X;
+            int64_t vec_offset = cache_offset + (head_offset / X) * page_size * X +
+                                 block_offset_local * X + head_offset % X;
             if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
             {
                 *reinterpret_cast<ltype*>(k_cache + vec_offset) = elements;
@@ -819,14 +841,14 @@ inline ActivationStrides3D activation_strides_logical_3d(
     }
     else
     {
-        float v_scale_val = 1.0f;
+        float v_scale_val   = 1.0f;
         float inv_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
             float const block_max_safe = fmaxf(block_max, kFp8KvQuantAbsmaxFloorF32);
-            v_scale_val                  = block_max_safe / dtype_max;
-            inv_scale_val                = dtype_max / block_max_safe;
-            int64_t scale_offset = block_idx * num_heads_k + headIdx;
+            v_scale_val                = block_max_safe / dtype_max;
+            inv_scale_val              = dtype_max / block_max_safe;
+            int64_t scale_offset       = block_idx * num_heads_k + headIdx;
             if(block_offset > 0)
             {
                 float v_scale_global = v_scale[scale_offset];
@@ -834,48 +856,53 @@ inline ActivationStrides3D activation_strides_logical_3d(
                 {
                     // v_cache layout: [num_blocks, num_heads_k, page_size//X, head_size, X]
                     int64_t cache_base = block_idx * page_size * num_heads_v * head_dim +
-                                        headIdx * head_dim * page_size;
-                    float rescale = v_scale_global * inv_scale_val;
+                                         headIdx * head_dim * page_size;
+                    float rescale             = v_scale_global * inv_scale_val;
                     constexpr int vecs_per_bh = (X / vec_size) * head_dim;
-                    int n_full_blocks   = block_offset / X;
-                    int full_vecs       = n_full_blocks * vecs_per_bh;
+                    int n_full_blocks         = block_offset / X;
+                    int full_vecs             = n_full_blocks * vecs_per_bh;
                     for(int idx = threadIdx.x; idx < full_vecs; idx += blockDim.x)
                     {
-                        kv_cache_ltype data =
-                            *reinterpret_cast<kv_cache_ltype*>(v_cache + cache_base + idx * vec_size);
-                        #pragma unroll
+                        kv_cache_ltype data = *reinterpret_cast<kv_cache_ltype*>(
+                            v_cache + cache_base + idx * vec_size);
+#pragma unroll
                         for(int j = 0; j < vec_size; j++)
                         {
-                            data[j] = opus::cast<kv_cache_scalar_t>(
-                                opus::cast<float>(data[j]) * rescale);
+                            data[j] =
+                                opus::cast<kv_cache_scalar_t>(opus::cast<float>(data[j]) * rescale);
                         }
-                        *reinterpret_cast<kv_cache_ltype*>(v_cache + cache_base + idx * vec_size) = data;
+                        *reinterpret_cast<kv_cache_ltype*>(v_cache + cache_base + idx * vec_size) =
+                            data;
                     }
-                    if((block_offset % X) != 0) {
+                    if((block_offset % X) != 0)
+                    {
                         int last_block_divX = (block_offset - 1) / X;
                         int last_x_idx      = (block_offset - 1) % X;
                         int last_full_vec   = (last_x_idx + 1) / vec_size;
-                        int partial_vecs   = last_full_vec * head_dim;
-                        for(int idx = threadIdx.x; idx < partial_vecs; idx += blockDim.x) {
+                        int partial_vecs    = last_full_vec * head_dim;
+                        for(int idx = threadIdx.x; idx < partial_vecs; idx += blockDim.x)
+                        {
                             int head_offset = idx / last_full_vec;
                             int vec_chunk   = idx % last_full_vec;
                             int64_t vec_off = cache_base + last_block_divX * head_dim * X +
                                               head_offset * X + vec_chunk * vec_size;
                             kv_cache_ltype data =
                                 *reinterpret_cast<kv_cache_ltype*>(&v_cache[vec_off]);
-                            #pragma unroll
-                            for(int j = 0; j < vec_size; j++) {
-                                data[j] = opus::cast<kv_cache_scalar_t>(
-                                    opus::cast<float>(data[j]) * rescale);
+#pragma unroll
+                            for(int j = 0; j < vec_size; j++)
+                            {
+                                data[j] = opus::cast<kv_cache_scalar_t>(opus::cast<float>(data[j]) *
+                                                                        rescale);
                             }
                             *reinterpret_cast<kv_cache_ltype*>(&v_cache[vec_off]) = data;
                         }
                         int tail_count = (last_x_idx - last_full_vec * vec_size + 1) * head_dim;
-                        for(int idx = threadIdx.x; idx < tail_count; idx += blockDim.x) {
+                        for(int idx = threadIdx.x; idx < tail_count; idx += blockDim.x)
+                        {
                             int head_offset = idx % head_dim;
                             int x_idx       = last_full_vec * vec_size + idx / head_dim;
                             int64_t v_base  = cache_base + last_block_divX * head_dim * X +
-                                              head_offset * X + x_idx;
+                                             head_offset * X + x_idx;
                             v_cache[v_base] = opus::cast<kv_cache_scalar_t>(
                                 opus::cast<float>(v_cache[v_base]) * rescale);
                         }
@@ -893,16 +920,18 @@ inline ActivationStrides3D activation_strides_logical_3d(
                 v_scale[scale_offset] = v_scale_val;
             }
         }
-        int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
-                               headIdx * head_dim * page_size;
+        int64_t cache_offset =
+            block_idx * page_size * num_heads_v * head_dim + headIdx * head_dim * page_size;
         int64_t total_elements = numtokens_in_block * head_dim;
         for(int64_t idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
         {
             int token_idx          = first_token_idx + idx * vec_size / head_dim;
             int head_offset        = (idx * vec_size) % head_dim;
             int block_offset_local = (token_idx - first_token_idx + block_offset) & page_mask;
-            int64_t v_base         = cache_offset + (block_offset_local / X) * head_dim * X + head_offset * X + block_offset_local % X;
-            int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
+            int64_t v_base         = cache_offset + (block_offset_local / X) * head_dim * X +
+                             head_offset * X + block_offset_local % X;
+            int64_t offsetWarp =
+                (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
             elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + head_offset / vec_size];
 #pragma unroll
             for(int j = 0; j < vec_size; j++)
@@ -915,231 +944,73 @@ inline ActivationStrides3D activation_strides_logical_3d(
                 else
                 {
                     v_cache[offset] =
-                    opus::cast<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
+                        opus::cast<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
                 }
             }
         }
     }
 }
- #define DISPATCH_KV_HEAD(num_kv_heads, ...)                             \
-     if(num_kv_heads == 1)                                               \
-     {                                                                   \
-         constexpr int NUM_KV_HEADS = 1;                                 \
-         __VA_ARGS__                                                     \
-     }                                                                   \
-     else if(num_kv_heads == 2)                                          \
-     {                                                                   \
-         constexpr int NUM_KV_HEADS = 2;                                 \
-         __VA_ARGS__                                                     \
-     }                                                                   \
-     else if(num_kv_heads == 4)                                          \
-     {                                                                   \
-         constexpr int NUM_KV_HEADS = 4;                                 \
-         __VA_ARGS__                                                     \
-     }                                                                   \
-     else if(num_kv_heads == 8)                                          \
-     {                                                                   \
-         constexpr int NUM_KV_HEADS = 8;                                 \
-         __VA_ARGS__                                                     \
-     }                                                                   \
-     else if(num_kv_heads == 16)                                         \
-     {                                                                   \
-         constexpr int NUM_KV_HEADS = 16;                                \
-         __VA_ARGS__                                                     \
-     }                                                                   \
-     else if(num_kv_heads == 32)                                         \
-     {                                                                   \
-         constexpr int NUM_KV_HEADS = 32;                                \
-         __VA_ARGS__                                                     \
-     }                                                                   \
-     else                                                                \
-     {                                                                   \
-         TORCH_CHECK(false, "Unsupported num_kv_heads: ", num_kv_heads); \
-     }
- 
- #define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...) \
-     if(interleave)                                       \
-     {                                                    \
-         const bool INTERLEAVE = true;                    \
-         DISPATCH_KV_HEAD(num_heads_k, __VA_ARGS__)       \
-     }                                                    \
-     else                                                 \
-     {                                                    \
-         const bool INTERLEAVE = false;                   \
-         DISPATCH_KV_HEAD(num_heads_k, __VA_ARGS__)       \
-     }
- 
- template <typename scalar_t, typename kv_cache_scalar_t, vllm::Fp8KVCacheDataType kv_dt>
- void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv,
-                                             bool const separate_qkv,
-                                             scalar_t* q_act,
-                                             scalar_t* k_act,
-                                             scalar_t* v_act,
-                                             int64_t const q_st,
-                                             int64_t const q_sh,
-                                             int64_t const q_sd,
-                                             int64_t const k_st,
-                                             int64_t const k_sh,
-                                             int64_t const k_sd,
-                                             int64_t const v_st,
-                                             int64_t const v_sh,
-                                             int64_t const v_sd,
-                                             int const num_tokens,
-                                             int const num_heads_q,
-                                             int const num_heads_k,
-                                             int const num_heads_v,
-                                             int const head_dim,
-                                             float const eps,
-                                             scalar_t const* q_weight,
-                                             scalar_t const* k_weight,
-                                             scalar_t const* cos_sin_cache,
-                                             bool const interleave,
-                                             int64_t const* position_ids,
-                                             kv_cache_scalar_t* k_cache,
-                                             kv_cache_scalar_t* v_cache,
-                                             int64_t* slot_mapping,
-                                             float* k_scale,
-                                             float* v_scale,
-                                             int page_size,
-                                             int x,
-                                             hipStream_t stream)
- {
-     // make sure no thread is wasted, adopt 64 here
-     constexpr int blockSize      = 64;
-     constexpr int warp_per_block = blockSize / 32;
-     int const gridSize =
-         (num_tokens * (num_heads_q + num_heads_k + num_heads_v) + 1) / warp_per_block;
- 
-     dim3 gridDim(gridSize);
-     dim3 blockDim(blockSize);
- 
-     switch(head_dim)
-     {
-     case 64:
-         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-             fusedQKNormRopeQuantCacheShuffleKernel<scalar_t,
-                                                    kv_cache_scalar_t,
-                                                    64,
-                                                    INTERLEAVE,
-                                                    NUM_KV_HEADS,
-                                                    kv_dt>
-                 <<<gridDim, blockDim, 0, stream>>>(qkv,
-                                                    separate_qkv,
-                                                    q_act,
-                                                    k_act,
-                                                    v_act,
-                                                    q_st,
-                                                    q_sh,
-                                                    q_sd,
-                                                    k_st,
-                                                    k_sh,
-                                                    k_sd,
-                                                    v_st,
-                                                    v_sh,
-                                                    v_sd,
-                                                    num_heads_q,
-                                                    num_heads_k,
-                                                    num_heads_v,
-                                                    eps,
-                                                    q_weight,
-                                                    k_weight,
-                                                    cos_sin_cache,
-                                                    position_ids,
-                                                    k_cache,
-                                                    v_cache,
-                                                    slot_mapping,
-                                                    k_scale,
-                                                    v_scale,
-                                                    num_tokens,
-                                                    page_size,
-                                                    x);
-         });
-         break;
-     case 128:
-         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-             fusedQKNormRopeQuantCacheShuffleKernel<scalar_t,
-                                                    kv_cache_scalar_t,
-                                                    128,
-                                                    INTERLEAVE,
-                                                    NUM_KV_HEADS,
-                                                    kv_dt>
-                 <<<gridDim, blockDim, 0, stream>>>(qkv,
-                                                    separate_qkv,
-                                                    q_act,
-                                                    k_act,
-                                                    v_act,
-                                                    q_st,
-                                                    q_sh,
-                                                    q_sd,
-                                                    k_st,
-                                                    k_sh,
-                                                    k_sd,
-                                                    v_st,
-                                                    v_sh,
-                                                    v_sd,
-                                                    num_heads_q,
-                                                    num_heads_k,
-                                                    num_heads_v,
-                                                    eps,
-                                                    q_weight,
-                                                    k_weight,
-                                                    cos_sin_cache,
-                                                    position_ids,
-                                                    k_cache,
-                                                    v_cache,
-                                                    slot_mapping,
-                                                    k_scale,
-                                                    v_scale,
-                                                    num_tokens,
-                                                    page_size,
-                                                    x);
-         });
-         break;
-     case 256:
-         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-             fusedQKNormRopeQuantCacheShuffleKernel<scalar_t,
-                                                    kv_cache_scalar_t,
-                                                    256,
-                                                    INTERLEAVE,
-                                                    NUM_KV_HEADS,
-                                                    kv_dt>
-                 <<<gridDim, blockDim, 0, stream>>>(qkv,
-                                                    separate_qkv,
-                                                    q_act,
-                                                    k_act,
-                                                    v_act,
-                                                    q_st,
-                                                    q_sh,
-                                                    q_sd,
-                                                    k_st,
-                                                    k_sh,
-                                                    k_sd,
-                                                    v_st,
-                                                    v_sh,
-                                                    v_sd,
-                                                    num_heads_q,
-                                                    num_heads_k,
-                                                    num_heads_v,
-                                                    eps,
-                                                    q_weight,
-                                                    k_weight,
-                                                    cos_sin_cache,
-                                                    position_ids,
-                                                    k_cache,
-                                                    v_cache,
-                                                    slot_mapping,
-                                                    k_scale,
-                                                    v_scale,
-                                                    num_tokens,
-                                                    page_size,
-                                                    x);
-         });
-         break;
-     default: TORCH_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
-     }
- }
+#define DISPATCH_KV_HEAD(num_kv_heads, ...)                             \
+    if(num_kv_heads == 1)                                               \
+    {                                                                   \
+        constexpr int NUM_KV_HEADS = 1;                                 \
+        __VA_ARGS__                                                     \
+    }                                                                   \
+    else if(num_kv_heads == 2)                                          \
+    {                                                                   \
+        constexpr int NUM_KV_HEADS = 2;                                 \
+        __VA_ARGS__                                                     \
+    }                                                                   \
+    else if(num_kv_heads == 4)                                          \
+    {                                                                   \
+        constexpr int NUM_KV_HEADS = 4;                                 \
+        __VA_ARGS__                                                     \
+    }                                                                   \
+    else if(num_kv_heads == 8)                                          \
+    {                                                                   \
+        constexpr int NUM_KV_HEADS = 8;                                 \
+        __VA_ARGS__                                                     \
+    }                                                                   \
+    else if(num_kv_heads == 16)                                         \
+    {                                                                   \
+        constexpr int NUM_KV_HEADS = 16;                                \
+        __VA_ARGS__                                                     \
+    }                                                                   \
+    else if(num_kv_heads == 32)                                         \
+    {                                                                   \
+        constexpr int NUM_KV_HEADS = 32;                                \
+        __VA_ARGS__                                                     \
+    }                                                                   \
+    else                                                                \
+    {                                                                   \
+        AITER_CHECK(false, "Unsupported num_kv_heads: ", num_kv_heads); \
+    }
+
+#define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...) \
+    if(interleave)                                       \
+    {                                                    \
+        const bool INTERLEAVE = true;                    \
+        DISPATCH_KV_HEAD(num_heads_k, __VA_ARGS__)       \
+    }                                                    \
+    else                                                 \
+    {                                                    \
+        const bool INTERLEAVE = false;                   \
+        DISPATCH_KV_HEAD(num_heads_k, __VA_ARGS__)       \
+    }
+
 template <typename scalar_t, typename kv_cache_scalar_t, vllm::Fp8KVCacheDataType kv_dt>
-void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
+void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* q_act,
+                                            scalar_t* k_act,
+                                            scalar_t* v_act,
+                                            int64_t const q_st,
+                                            int64_t const q_sh,
+                                            int64_t const q_sd,
+                                            int64_t const k_st,
+                                            int64_t const k_sh,
+                                            int64_t const k_sd,
+                                            int64_t const v_st,
+                                            int64_t const v_sh,
+                                            int64_t const v_sd,
                                             int const num_tokens,
                                             int const num_heads_q,
                                             int const num_heads_k,
@@ -1154,14 +1025,168 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                             kv_cache_scalar_t* k_cache,
                                             kv_cache_scalar_t* v_cache,
                                             int64_t* slot_mapping,
-                                            int64_t const* cu_q_len,
                                             float* k_scale,
                                             float* v_scale,
                                             int page_size,
                                             int x,
-                                            int batch_size,
-                                            int max_tokens_per_batch,
+                                            int const rotary_dim,
                                             hipStream_t stream)
+{
+    // make sure no thread is wasted, adopt 64 here
+    constexpr int blockSize      = 64;
+    constexpr int warp_per_block = blockSize / 32;
+    int const gridSize =
+        (num_tokens * (num_heads_q + num_heads_k + num_heads_v) + 1) / warp_per_block;
+
+    dim3 gridDim(gridSize);
+    dim3 blockDim(blockSize);
+
+    switch(head_dim)
+    {
+    case 64:
+        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+            fusedQKNormRopeQuantCacheShuffleKernel<scalar_t,
+                                                   kv_cache_scalar_t,
+                                                   64,
+                                                   INTERLEAVE,
+                                                   NUM_KV_HEADS,
+                                                   kv_dt>
+                <<<gridDim, blockDim, 0, stream>>>(q_act,
+                                                   k_act,
+                                                   v_act,
+                                                   q_st,
+                                                   q_sh,
+                                                   q_sd,
+                                                   k_st,
+                                                   k_sh,
+                                                   k_sd,
+                                                   v_st,
+                                                   v_sh,
+                                                   v_sd,
+                                                   num_heads_q,
+                                                   num_heads_k,
+                                                   num_heads_v,
+                                                   eps,
+                                                   q_weight,
+                                                   k_weight,
+                                                   cos_sin_cache,
+                                                   position_ids,
+                                                   k_cache,
+                                                   v_cache,
+                                                   slot_mapping,
+                                                   k_scale,
+                                                   v_scale,
+                                                   num_tokens,
+                                                   page_size,
+                                                   x,
+                                                   rotary_dim);
+        });
+        break;
+    case 128:
+        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+            fusedQKNormRopeQuantCacheShuffleKernel<scalar_t,
+                                                   kv_cache_scalar_t,
+                                                   128,
+                                                   INTERLEAVE,
+                                                   NUM_KV_HEADS,
+                                                   kv_dt>
+                <<<gridDim, blockDim, 0, stream>>>(q_act,
+                                                   k_act,
+                                                   v_act,
+                                                   q_st,
+                                                   q_sh,
+                                                   q_sd,
+                                                   k_st,
+                                                   k_sh,
+                                                   k_sd,
+                                                   v_st,
+                                                   v_sh,
+                                                   v_sd,
+                                                   num_heads_q,
+                                                   num_heads_k,
+                                                   num_heads_v,
+                                                   eps,
+                                                   q_weight,
+                                                   k_weight,
+                                                   cos_sin_cache,
+                                                   position_ids,
+                                                   k_cache,
+                                                   v_cache,
+                                                   slot_mapping,
+                                                   k_scale,
+                                                   v_scale,
+                                                   num_tokens,
+                                                   page_size,
+                                                   x,
+                                                   rotary_dim);
+        });
+        break;
+    case 256:
+        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+            fusedQKNormRopeQuantCacheShuffleKernel<scalar_t,
+                                                   kv_cache_scalar_t,
+                                                   256,
+                                                   INTERLEAVE,
+                                                   NUM_KV_HEADS,
+                                                   kv_dt>
+                <<<gridDim, blockDim, 0, stream>>>(q_act,
+                                                   k_act,
+                                                   v_act,
+                                                   q_st,
+                                                   q_sh,
+                                                   q_sd,
+                                                   k_st,
+                                                   k_sh,
+                                                   k_sd,
+                                                   v_st,
+                                                   v_sh,
+                                                   v_sd,
+                                                   num_heads_q,
+                                                   num_heads_k,
+                                                   num_heads_v,
+                                                   eps,
+                                                   q_weight,
+                                                   k_weight,
+                                                   cos_sin_cache,
+                                                   position_ids,
+                                                   k_cache,
+                                                   v_cache,
+                                                   slot_mapping,
+                                                   k_scale,
+                                                   v_scale,
+                                                   num_tokens,
+                                                   page_size,
+                                                   x,
+                                                   rotary_dim);
+        });
+        break;
+    default: AITER_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
+    }
+}
+template <typename scalar_t, typename kv_cache_scalar_t, vllm::Fp8KVCacheDataType kv_dt>
+void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
+                                                 int const num_tokens,
+                                                 int const num_heads_q,
+                                                 int const num_heads_k,
+                                                 int const num_heads_v,
+                                                 int const head_dim,
+                                                 float const eps,
+                                                 scalar_t const* q_weight,
+                                                 scalar_t const* k_weight,
+                                                 scalar_t const* cos_sin_cache,
+                                                 bool const interleave,
+                                                 int64_t const* position_ids,
+                                                 kv_cache_scalar_t* k_cache,
+                                                 kv_cache_scalar_t* v_cache,
+                                                 int64_t* slot_mapping,
+                                                 int64_t const* cu_q_len,
+                                                 float* k_scale,
+                                                 float* v_scale,
+                                                 int page_size,
+                                                 int x,
+                                                 int batch_size,
+                                                 int max_tokens_per_batch,
+                                                 hipStream_t stream)
 {
     int blockSize = page_size < 64 ? 64 : page_size;
 
@@ -1170,9 +1195,9 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
     // Mode A: best when max_tpb < page_size (gridSizeY small, each batch few Y-blocks)
     // Mode B: best when max_tpb known but large (no prefix-sum, simple division)
     // Mode C: only when max_tpb unknown AND avg >= page_size
-    int max_tpb = max_tokens_per_batch > 0
-        ? max_tokens_per_batch
-        : (batch_size > 0 ? (num_tokens + batch_size - 1) / batch_size : num_tokens);
+    int max_tpb           = max_tokens_per_batch > 0
+                                ? max_tokens_per_batch
+                                : (batch_size > 0 ? (num_tokens + batch_size - 1) / batch_size : num_tokens);
     int gridSizeY_decode  = (max_tpb + page_size - 1) / page_size + 1;
     int gridSizeY_general = (num_tokens + page_size - 1) / page_size + 2 * batch_size;
 
@@ -1183,7 +1208,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
     if(batch_size > 1 && max_tpb < page_size)
     {
         // Mode A: decode fast path — batch_id = blockIdx.x
-        gridDimX = batch_size;
+        gridDimX  = batch_size;
         gridSizeY = gridSizeY_decode;
     }
     else if(batch_size > 1)
@@ -1192,143 +1217,165 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
         // When max_tokens_per_batch provided: use actual max (exact).
         // When max_tokens_per_batch=0: use num_tokens as conservative upper bound
         // (safe for any distribution; may over-allocate Y-blocks for small batches).
-        gridDimX = 1;
+        gridDimX               = 1;
         blocks_per_batch_param = max_tokens_per_batch > 0
-            ? gridSizeY_decode
-            : ((num_tokens + page_size - 1) / page_size + 1);
-        gridSizeY = batch_size * blocks_per_batch_param;
+                                     ? gridSizeY_decode
+                                     : ((num_tokens + page_size - 1) / page_size + 1);
+        gridSizeY              = batch_size * blocks_per_batch_param;
     }
     else
     {
         // batch_size <= 1: single batch, batch_id = 0
-        gridDimX = 1;
+        gridDimX  = 1;
         gridSizeY = (num_tokens + page_size - 1) / page_size + 1;
     }
 
     dim3 gridDim(gridDimX, gridSizeY, num_heads_q + num_heads_k + num_heads_v);
     dim3 blockDim(blockSize);
 
-#define DISPATCH_X_VALUE(x_val, ...)                                            \
-    if(x_val == 16) { constexpr int X_VAL = 16; __VA_ARGS__ }                  \
-    else if(x_val == 8) { constexpr int X_VAL = 8; __VA_ARGS__ }               \
-    else if(x_val == 4) { constexpr int X_VAL = 4; __VA_ARGS__ }               \
-    else { TORCH_CHECK(false, "Unsupported x: ", x_val); }
+#define DISPATCH_X_VALUE(x_val, ...)                  \
+    if(x_val == 16)                                   \
+    {                                                 \
+        constexpr int X_VAL = 16;                     \
+        __VA_ARGS__                                   \
+    }                                                 \
+    else if(x_val == 8)                               \
+    {                                                 \
+        constexpr int X_VAL = 8;                      \
+        __VA_ARGS__                                   \
+    }                                                 \
+    else if(x_val == 4)                               \
+    {                                                 \
+        constexpr int X_VAL = 4;                      \
+        __VA_ARGS__                                   \
+    }                                                 \
+    else                                              \
+    {                                                 \
+        AITER_CHECK(false, "Unsupported x: ", x_val); \
+    }
 
-#define DISPATCH_INTERLEAVE_BQ(interleave, ...)                                 \
-    if(interleave) { const bool INTERLEAVE = true; __VA_ARGS__ }                \
-    else           { const bool INTERLEAVE = false; __VA_ARGS__ }
+#define DISPATCH_INTERLEAVE_BQ(interleave, ...) \
+    if(interleave)                              \
+    {                                           \
+        const bool INTERLEAVE = true;           \
+        __VA_ARGS__                             \
+    }                                           \
+    else                                        \
+    {                                           \
+        const bool INTERLEAVE = false;          \
+        __VA_ARGS__                             \
+    }
 
-#define LAUNCH_BLOCK_QUANT_ARGS                                                 \
-                                                       num_heads_q,             \
-                                                       num_heads_k,             \
-                                                       num_heads_v,             \
-                                                       eps,                     \
-                                                       q_weight,                \
-                                                       k_weight,                \
-                                                       cos_sin_cache,           \
-                                                       position_ids,            \
-                                                       k_cache,                 \
-                                                       v_cache,                 \
-                                                       slot_mapping,            \
-                                                       cu_q_len,                \
-                                                       k_scale,                 \
-                                                       v_scale,                 \
-                                                       num_tokens,              \
-                                                       page_size,               \
-                                                       batch_size,              \
-                                                       blocks_per_batch_param
+#define LAUNCH_BLOCK_QUANT_ARGS                                                                  \
+    num_heads_q, num_heads_k, num_heads_v, eps, q_weight, k_weight, cos_sin_cache, position_ids, \
+        k_cache, v_cache, slot_mapping, cu_q_len, k_scale, v_scale, num_tokens, page_size,       \
+        batch_size, blocks_per_batch_param
 
-#define LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, WG_SIZE)                            \
-        DISPATCH_INTERLEAVE_BQ(interleave, {                                    \
-            DISPATCH_X_VALUE(x, {                                               \
-                fusedQKNormRopeBlockQuantCacheShuffleKernel<scalar_t,            \
-                    kv_cache_scalar_t, HEAD_DIM, INTERLEAVE,                    \
-                    X_VAL, WG_SIZE, kv_dt>                                      \
-                    <<<gridDim, blockDim, 0, stream>>>(qkv,                     \
-                        LAUNCH_BLOCK_QUANT_ARGS);                               \
-            });                                                                 \
-        });
+#define LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, WG_SIZE)                              \
+    DISPATCH_INTERLEAVE_BQ(interleave, {                                          \
+        DISPATCH_X_VALUE(x, {                                                     \
+            fusedQKNormRopeBlockQuantCacheShuffleKernel<scalar_t,                 \
+                                                        kv_cache_scalar_t,        \
+                                                        HEAD_DIM,                 \
+                                                        INTERLEAVE,               \
+                                                        X_VAL,                    \
+                                                        WG_SIZE,                  \
+                                                        kv_dt>                    \
+                <<<gridDim, blockDim, 0, stream>>>(qkv, LAUNCH_BLOCK_QUANT_ARGS); \
+        });                                                                       \
+    });
 
-#define DISPATCH_BLOCK_SIZE(HEAD_DIM)                                            \
-    if(blockSize == 64) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64) }             \
-    else if(blockSize == 128) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 128) }      \
-    else if(blockSize == 256) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 256) }      \
-    else { TORCH_CHECK(false, "Unsupported blockSize: ", blockSize); }
+#define DISPATCH_BLOCK_SIZE(HEAD_DIM)                             \
+    if(blockSize == 64)                                           \
+    {                                                             \
+        LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64)                   \
+    }                                                             \
+    else if(blockSize == 128)                                     \
+    {                                                             \
+        LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 128)                  \
+    }                                                             \
+    else if(blockSize == 256)                                     \
+    {                                                             \
+        LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 256)                  \
+    }                                                             \
+    else                                                          \
+    {                                                             \
+        AITER_CHECK(false, "Unsupported blockSize: ", blockSize); \
+    }
 
     switch(head_dim)
     {
-    case 64:  DISPATCH_BLOCK_SIZE(64);  break;
+    case 64: DISPATCH_BLOCK_SIZE(64); break;
     case 128: DISPATCH_BLOCK_SIZE(128); break;
     case 256: DISPATCH_BLOCK_SIZE(256); break;
-        
+
 #undef LAUNCH_BLOCK_QUANT_KERNEL
 #undef DISPATCH_BLOCK_SIZE
 #undef DISPATCH_X_VALUE
 #undef DISPATCH_INTERLEAVE_BQ
-    default: TORCH_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
+    default: AITER_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
     }
 }
- } // namespace
- #define CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT(SRC_T, CACHE_T, KV_DTYPE)       \
-         launchFusedQKNormRopeBlockQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE>( \
-             reinterpret_cast<SRC_T*>(qkv.data_ptr()),                     \
-             num_tokens,                                                   \
-             num_heads_q,                                                  \
-             num_heads_k,                                                  \
-             num_heads_v,                                                  \
-             head_dim,                                                     \
-             eps,                                                          \
-             reinterpret_cast<SRC_T*>(q_weight.data_ptr()),                \
-             reinterpret_cast<SRC_T*>(k_weight.data_ptr()),                \
-             reinterpret_cast<SRC_T*>(cos_sin_cache.data_ptr()),           \
-             !is_neox,                                                     \
-             position_ids.data_ptr<int64_t>(),                             \
-             reinterpret_cast<CACHE_T*>(k_cache.data_ptr()),               \
-             reinterpret_cast<CACHE_T*>(v_cache.data_ptr()),               \
-             slot_mapping.data_ptr<int64_t>(),                             \
-             cu_q_len.data_ptr<int64_t>(),                                 \
-             k_scale.has_value() ? k_scale->data_ptr<float>() : nullptr,   \
-             v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr,   \
-             page_size,                                                    \
-             x,                                                            \
-             batch_size,                                                   \
-             max_tokens_per_batch,                                         \
-             stream);
+} // namespace
+#define CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT(SRC_T, CACHE_T, KV_DTYPE)                  \
+    launchFusedQKNormRopeBlockQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE>(             \
+        reinterpret_cast<SRC_T*>(qkv.data_ptr()),                                      \
+        num_tokens,                                                                    \
+        num_heads_q,                                                                   \
+        num_heads_k,                                                                   \
+        num_heads_v,                                                                   \
+        head_dim,                                                                      \
+        eps,                                                                           \
+        reinterpret_cast<SRC_T*>(q_weight.data_ptr()),                                 \
+        reinterpret_cast<SRC_T*>(k_weight.data_ptr()),                                 \
+        reinterpret_cast<SRC_T*>(cos_sin_cache.data_ptr()),                            \
+        !is_neox,                                                                      \
+        reinterpret_cast<int64_t*>(position_ids.data_ptr()),                           \
+        reinterpret_cast<CACHE_T*>(k_cache.data_ptr()),                                \
+        reinterpret_cast<CACHE_T*>(v_cache.data_ptr()),                                \
+        reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                           \
+        reinterpret_cast<int64_t*>(cu_q_len.data_ptr()),                               \
+        k_scale.has_value() ? reinterpret_cast<float*>(k_scale->data_ptr()) : nullptr, \
+        v_scale.has_value() ? reinterpret_cast<float*>(v_scale->data_ptr()) : nullptr, \
+        page_size,                                                                     \
+        x,                                                                             \
+        batch_size,                                                                    \
+        max_tokens_per_batch,                                                          \
+        stream);
 
-#define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)                                    \
-    launchFusedQKNormRopeQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE>(                               \
-        use_separate ? nullptr : reinterpret_cast<SRC_T*>(qkv.data_ptr()),                      \
-        use_separate,                                                                             \
-        use_separate ? reinterpret_cast<SRC_T*>(opt_q.value().data_ptr()) : nullptr,             \
-        use_separate ? reinterpret_cast<SRC_T*>(opt_k.value().data_ptr()) : nullptr,             \
-        use_separate ? reinterpret_cast<SRC_T*>(opt_v.value().data_ptr()) : nullptr,             \
-        q_stride_token,                                                                           \
-        q_stride_head,                                                                            \
-        q_stride_dim,                                                                             \
-        k_stride_token,                                                                           \
-        k_stride_head,                                                                            \
-        k_stride_dim,                                                                             \
-        v_stride_token,                                                                           \
-        v_stride_head,                                                                            \
-        v_stride_dim,                                                                             \
-        num_tokens,                                                                               \
-        num_heads_q,                                                                              \
-        num_heads_k,                                                                              \
-        num_heads_v,                                                                              \
-        head_dim,                                                                                 \
-        eps,                                                                                      \
-        reinterpret_cast<SRC_T*>(q_weight.data_ptr()),                                            \
-        reinterpret_cast<SRC_T*>(k_weight.data_ptr()),                                            \
-        reinterpret_cast<SRC_T*>(cos_sin_cache.data_ptr()),                                       \
-        !is_neox,                                                                                 \
-        position_ids.data_ptr<int64_t>(),                                                         \
-        reinterpret_cast<CACHE_T*>(k_cache.data_ptr()),                                         \
-        reinterpret_cast<CACHE_T*>(v_cache.data_ptr()),                                         \
-        slot_mapping.data_ptr<int64_t>(),                                                         \
-        k_scale.has_value() ? k_scale->data_ptr<float>() : nullptr,                             \
-        v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr,                             \
-        page_size,                                                                                \
-        x,                                                                                        \
+#define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)                        \
+    launchFusedQKNormRopeQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE>(                  \
+        reinterpret_cast<SRC_T*>(q_t.data_ptr()),                                       \
+        reinterpret_cast<SRC_T*>(k_t.data_ptr()),                                       \
+        reinterpret_cast<SRC_T*>(v_t.data_ptr()),                                       \
+        q_stride_token,                                                                \
+        q_stride_head,                                                                 \
+        q_stride_dim,                                                                  \
+        k_stride_token,                                                                \
+        k_stride_head,                                                                 \
+        k_stride_dim,                                                                  \
+        v_stride_token,                                                                \
+        v_stride_head,                                                                 \
+        v_stride_dim,                                                                  \
+        num_tokens,                                                                    \
+        num_heads_q,                                                                   \
+        num_heads_k,                                                                   \
+        num_heads_v,                                                                   \
+        head_dim,                                                                      \
+        eps,                                                                           \
+        reinterpret_cast<SRC_T*>(q_weight.data_ptr()),                                 \
+        reinterpret_cast<SRC_T*>(k_weight.data_ptr()),                                 \
+        reinterpret_cast<SRC_T*>(cos_sin_cache.data_ptr()),                            \
+        !is_neox,                                                                      \
+        reinterpret_cast<int64_t*>(position_ids.data_ptr()),                           \
+        reinterpret_cast<CACHE_T*>(k_cache.data_ptr()),                                \
+        reinterpret_cast<CACHE_T*>(v_cache.data_ptr()),                                \
+        reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                           \
+        k_scale.has_value() ? reinterpret_cast<float*>(k_scale->data_ptr()) : nullptr, \
+        v_scale.has_value() ? reinterpret_cast<float*>(v_scale->data_ptr()) : nullptr, \
+        page_size,                                                                     \
+        x,                                                                             \
+        rotary_dim_,                                                                   \
         stream);
 
 template <typename T, int HEAD_SIZE, bool IS_NEOX>
@@ -1553,7 +1600,7 @@ void fused_rope_rms_2way(const T* q0,
                          hipStream_t stream)
 {
     using mrope_utils::WARP_SIZE;
-    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int block_size = 256;
     auto total_warps         = (num_tokens0 + num_tokens1) * (num_heads_q + num_heads_k);
     auto num_warps_per_block = block_size / WARP_SIZE;
@@ -2230,7 +2277,7 @@ void fused_rope_rms_1way(const T* q,
                          hipStream_t stream)
 {
     using mrope_utils::WARP_SIZE;
-    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int block_size = 256;
     auto num_warps_per_block = block_size / WARP_SIZE;
     dim3 threadsPerBlock(block_size);
@@ -2361,42 +2408,321 @@ void fused_rope_rms_1way(const T* q,
 #undef DISPATCH_NEOX
 }
 
+template <typename T, int HEAD_SIZE, bool IS_NEOX>
+__global__ void fused_rope_rms_2way_amax_kernel(const T* q0_,
+                                                const T* k0_,
+                                                const T* q1_,
+                                                const T* k1_,
+                                                const T* w_q0,
+                                                const T* w_k0,
+                                                const T* w_q1,
+                                                const T* w_k1,
+                                                const T* cos_sin0,
+                                                const T* cos_sin1,
+                                                int num_tokens0,
+                                                int num_tokens1,
+                                                int num_heads_q,
+                                                int num_heads_k,
+                                                float eps,
+                                                int total_warps,
+                                                T* out_q01_,
+                                                T* out_k01_,
+                                                float* q_partial_amax,
+                                                float* k_partial_amax)
+{
+    using mrope_utils::WARP_SIZE;
+    constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
+    constexpr int PAIR_VEC_SIZE   = VEC_SIZE / 2;
+    constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
+    const int warp_id             = threadIdx.x / WARP_SIZE;
+    const int lane_id             = threadIdx.x % WARP_SIZE;
+    const int num_warps_per_block = blockDim.x / WARP_SIZE;
+    const int global_warp_id      = blockIdx.x * num_warps_per_block + warp_id;
+    if(global_warp_id >= total_warps)
+    {
+        return;
+    }
+
+    int batch_id = blockIdx.y;
+    auto q0      = q0_ + batch_id * num_tokens0 * num_heads_q * HEAD_SIZE;
+    auto k0      = k0_ + batch_id * num_tokens0 * num_heads_k * HEAD_SIZE;
+    auto q1      = q1_ + batch_id * num_tokens1 * num_heads_q * HEAD_SIZE;
+    auto k1      = k1_ + batch_id * num_tokens1 * num_heads_k * HEAD_SIZE;
+    auto out_q01 = out_q01_ + batch_id * (num_tokens0 + num_tokens1) * num_heads_q * HEAD_SIZE;
+    auto out_k01 = out_k01_ + batch_id * (num_tokens0 + num_tokens1) * num_heads_k * HEAD_SIZE;
+    int warp_offset_q0 = 0;
+    int warp_offset_k0 = num_tokens0 * num_heads_q;
+    int warp_offset_q1 = num_tokens0 * (num_heads_q + num_heads_k);
+    int warp_offset_k1 = num_tokens0 * (num_heads_q + num_heads_k) + num_tokens1 * num_heads_q;
+
+    bool is_q0 = global_warp_id < warp_offset_k0;
+    bool is_k0 = !is_q0 && global_warp_id < warp_offset_q1;
+    bool is_q1 = !is_q0 && !is_k0 && global_warp_id < warp_offset_k1;
+    bool is_k1 = !is_q0 && !is_k0 && !is_q1;
+
+    int access_id_in_head = lane_id * VEC_SIZE;
+    int neighbor_offset =
+        access_id_in_head < HALF_HEAD_SIZE ? HALF_HEAD_SIZE / VEC_SIZE : -HALF_HEAD_SIZE / VEC_SIZE;
+
+    int token_id;
+    int specialized_warp_id;
+    int head_id_in_token;
+    int data_offset;
+
+    vec_t<T, VEC_SIZE> w_vec, x_vec, cos_sin_vec;
+    vec_t<T, PAIR_VEC_SIZE> cos_vec, sin_vec;
+
+    if(is_q0)
+    {
+        specialized_warp_id = global_warp_id - warp_offset_q0;
+        token_id            = specialized_warp_id / num_heads_q;
+        head_id_in_token    = specialized_warp_id % num_heads_q;
+        data_offset         = (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_q0 + access_id_in_head);
+        x_vec.load(q0 + data_offset + access_id_in_head);
+        if constexpr(IS_NEOX)
+            cos_sin_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head]);
+        else
+        {
+            cos_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head / 2]);
+            sin_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+        }
+    }
+    else if(is_k0)
+    {
+        specialized_warp_id = global_warp_id - warp_offset_k0;
+        token_id            = specialized_warp_id / num_heads_k;
+        head_id_in_token    = specialized_warp_id % num_heads_k;
+        data_offset         = (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_k0 + access_id_in_head);
+        x_vec.load(k0 + data_offset + access_id_in_head);
+        if constexpr(IS_NEOX)
+            cos_sin_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head]);
+        else
+        {
+            cos_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head / 2]);
+            sin_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+        }
+    }
+    else if(is_q1)
+    {
+        specialized_warp_id = global_warp_id - warp_offset_q1;
+        token_id            = specialized_warp_id / num_heads_q;
+        head_id_in_token    = specialized_warp_id % num_heads_q;
+        data_offset         = (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_q1 + access_id_in_head);
+        x_vec.load(q1 + data_offset + access_id_in_head);
+        if constexpr(IS_NEOX)
+            cos_sin_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head]);
+        else
+        {
+            cos_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head / 2]);
+            sin_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+        }
+    }
+    else
+    {
+        specialized_warp_id = global_warp_id - warp_offset_k1;
+        token_id            = specialized_warp_id / num_heads_k;
+        head_id_in_token    = specialized_warp_id % num_heads_k;
+        data_offset         = (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_k1 + access_id_in_head);
+        x_vec.load(k1 + data_offset + access_id_in_head);
+        if constexpr(IS_NEOX)
+            cos_sin_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head]);
+        else
+        {
+            cos_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head / 2]);
+            sin_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+        }
+    }
+
+    mrope_utils::warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+    vec_t<T, VEC_SIZE> out_vec;
+    if constexpr(IS_NEOX)
+    {
+        auto nb_cos_sin_vec = mrope_utils::warp_shfl_sync_vec<T, VEC_SIZE>(
+            cos_sin_vec, threadIdx.x + neighbor_offset);
+        auto nb_x_vec =
+            mrope_utils::warp_shfl_sync_vec<T, VEC_SIZE>(x_vec, threadIdx.x + neighbor_offset);
+        if(neighbor_offset > 0)
+        {
+#pragma unroll
+            for(int i = 0; i < VEC_SIZE; ++i)
+                out_vec[i] = (float)x_vec[i] * (float)cos_sin_vec[i] -
+                             (float)nb_x_vec[i] * (float)nb_cos_sin_vec[i];
+        }
+        else
+        {
+#pragma unroll
+            for(int i = 0; i < VEC_SIZE; ++i)
+                out_vec[i] = (float)x_vec[i] * (float)nb_cos_sin_vec[i] +
+                             (float)nb_x_vec[i] * (float)cos_sin_vec[i];
+        }
+    }
+    else
+    {
+#pragma unroll
+        for(int i = 0; i < PAIR_VEC_SIZE; ++i)
+        {
+            out_vec[2 * i + 0] = (float)x_vec[2 * i + 0] * (float)cos_vec[i] -
+                                 (float)x_vec[2 * i + 1] * (float)sin_vec[i];
+            out_vec[2 * i + 1] = (float)x_vec[2 * i + 1] * (float)cos_vec[i] +
+                                 (float)x_vec[2 * i + 0] * (float)sin_vec[i];
+        }
+    }
+
+    float local_max = 0.0f;
+#pragma unroll
+    for(int i = 0; i < VEC_SIZE; ++i)
+        local_max = fmaxf(local_max, fabsf((float)out_vec[i]));
+#pragma unroll
+    for(int mask = 16; mask > 0; mask >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor(local_max, mask, WARP_SIZE));
+    if(lane_id == 0)
+    {
+        if(is_q0 || is_q1)
+        {
+            q_partial_amax[blockIdx.y * total_warps + global_warp_id] = local_max;
+            k_partial_amax[blockIdx.y * total_warps + global_warp_id] = 0.0f;
+        }
+        else
+        {
+            q_partial_amax[blockIdx.y * total_warps + global_warp_id] = 0.0f;
+            k_partial_amax[blockIdx.y * total_warps + global_warp_id] = local_max;
+        }
+    }
+
+    if(is_q0)
+    {
+        out_vec.store(out_q01 + (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE +
+                      access_id_in_head);
+    }
+    else if(is_k0)
+    {
+        out_vec.store(out_k01 + (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE +
+                      access_id_in_head);
+    }
+    else if(is_q1)
+    {
+        out_vec.store(out_q01 +
+                      ((num_tokens0 + token_id) * num_heads_q + head_id_in_token) * HEAD_SIZE +
+                      access_id_in_head);
+    }
+    else
+    {
+        out_vec.store(out_k01 +
+                      ((num_tokens0 + token_id) * num_heads_k + head_id_in_token) * HEAD_SIZE +
+                      access_id_in_head);
+    }
+}
+// Per-head scale reduction for the 2way layout. q_partial_amax / k_partial_amax
+// are produced by fused_rope_rms_2way_amax_kernel: shape [batch, total_warps],
+// where total_warps lays out 4 contiguous segments
+//   q0 [num_tokens0 * num_heads_q],
+//   k0 [num_tokens0 * num_heads_k],
+//   q1 [num_tokens1 * num_heads_q],
+//   k1 [num_tokens1 * num_heads_k].
+// Slots that do not match a side are written as 0, so we only read the segments
+// for the requested side.
+__global__ void qk_partial_amax_to_perhead_scale_kernel(
+    const float* q_partial_amax,
+    const float* k_partial_amax,
+    int num_tokens0,
+    int num_tokens1,
+    int num_heads_q,
+    int num_heads_k,
+    int total_warps,
+    float* q_scale, // [batch, num_heads_q]
+    float* k_scale) // [batch, num_heads_k]
+{
+    int b = blockIdx.y;
+    int head_packed = blockIdx.x; // 0 .. num_heads_q + num_heads_k - 1
+    bool is_q = head_packed < num_heads_q;
+    int h = is_q ? head_packed : head_packed - num_heads_q;
+    int H = is_q ? num_heads_q : num_heads_k;
+
+    int warp_offset_seg0 = is_q ? 0 : num_tokens0 * num_heads_q;
+    int warp_offset_seg1 = is_q
+        ? num_tokens0 * (num_heads_q + num_heads_k)
+        : num_tokens0 * (num_heads_q + num_heads_k) + num_tokens1 * num_heads_q;
+
+    const float* base = (is_q ? q_partial_amax : k_partial_amax) + (int64_t)b * total_warps;
+
+    float local = 0.0f;
+    for(int t = threadIdx.x; t < num_tokens0; t += blockDim.x)
+        local = fmaxf(local, base[warp_offset_seg0 + t * H + h]);
+    for(int t = threadIdx.x; t < num_tokens1; t += blockDim.x)
+        local = fmaxf(local, base[warp_offset_seg1 + t * H + h]);
+
+    __shared__ float sm[256];
+    sm[threadIdx.x] = local;
+    __syncthreads();
+#pragma unroll
+    for(int s = 128; s > 0; s >>= 1)
+    {
+        if(threadIdx.x < s)
+            sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if(threadIdx.x == 0)
+    {
+        constexpr float fp8_max = 240.0f;
+        float* out             = is_q ? q_scale : k_scale;
+        out[b * H + h]         = fmaxf(sm[0], 1e-8f) / fp8_max;
+    }
+}
+
+// FP8 static quant where each (batch, head) carries its own scale.
+// Input/output shape: [batch, num_tokens, num_heads, head_size].
+template <typename T>
+__global__ void static_fp8_quant_perhead_kernel(mrope_utils::fp8e4m3fnuz* out,
+                                                const T* input,
+                                                const float* scale, // [batch, num_heads]
+                                                int batch_size,
+                                                int num_tokens,
+                                                int num_heads,
+                                                int head_size)
+{
+    int64_t idx    = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)gridDim.x * blockDim.x;
+    int64_t numel  = (int64_t)batch_size * num_tokens * num_heads * head_size;
+    for(int64_t i = idx; i < numel; i += stride)
+    {
+        int64_t tmp = i / head_size;
+        int h       = tmp % num_heads;
+        tmp /= num_heads;
+        int b         = tmp / num_tokens;
+        float inv     = 1.0f / scale[b * num_heads + h];
+        out[i] = mrope_utils::fp8e4m3fnuz(static_cast<float>(input[i]) * inv);
+    }
+}
+
 namespace aiter {
 
 void fused_qk_norm_rope_cache_quant_shuffle(
-    at::Tensor& qkv, // Deprecated concat QKV; empty if only q/k/v. If both given, q/k/v used; qkv ignored.
+    aiter_tensor_t& q,
+    aiter_tensor_t& k,
+    aiter_tensor_t& v,
     int64_t num_heads_q,               // Number of query heads
     int64_t num_heads_k,               // Number of key heads
     int64_t num_heads_v,               // Number of value heads
     int64_t head_dim,                  // Dimension per head
     double eps,                        // Epsilon for RMS normalization
-    at::Tensor& q_weight,              // RMSNorm weights for query [head_dim]
-    at::Tensor& k_weight,              // RMSNorm weights for key [head_dim]
-    at::Tensor& cos_sin_cache,         // Cos/sin cache [max_position, head_dim]
+    aiter_tensor_t& q_weight,          // RMSNorm weights for query [head_dim]
+    aiter_tensor_t& k_weight,          // RMSNorm weights for key [head_dim]
+    aiter_tensor_t& cos_sin_cache,     // Cos/sin cache [max_position, rotary_dim]
     bool is_neox,                      // Whether RoPE is applied in Neox style
-    at::Tensor& position_ids,          // Position IDs for RoPE [num_tokens]
-    at::Tensor& k_cache,               // [num_blocks, num_kv_heads, head_dim//x, page_size, x]
-    at::Tensor& v_cache,               // 4D [num_blocks, num_heads_v, head_dim, page_size] or 5D shuffle
+    aiter_tensor_t& position_ids,      // Position IDs for RoPE [num_tokens]
+    aiter_tensor_t& k_cache,           // [num_blocks, num_kv_heads, head_dim//x, page_size, x]
+    aiter_tensor_t& v_cache,           // 4D [num_blocks, num_heads_v, head_dim, page_size] or 5D shuffle
                                        // [num_blocks, num_heads_v, page_size//x, head_dim, x]
-    at::Tensor& slot_mapping,          // slot mapping
+    aiter_tensor_t& slot_mapping,      // slot mapping
     const std::string& kv_cache_dtype, // kv cache data type
-    std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
-    std::optional<at::Tensor> v_scale,  // v scale tensor for quantized v cache
-    std::optional<at::Tensor> opt_q,    // [num_tokens, num_heads_q * head_dim] (preferred)
-    std::optional<at::Tensor> opt_k,    // [num_tokens, num_heads_k * head_dim]
-    std::optional<at::Tensor> opt_v     // [num_tokens, num_heads_v * head_dim]
+    std::optional<aiter_tensor_t> k_scale, // k scale tensor for quantized k cache
+    std::optional<aiter_tensor_t> v_scale  // v scale tensor for quantized v cache
 )
 {
-    const bool have_q = opt_q.has_value();
-    const bool have_k = opt_k.has_value();
-    const bool have_v = opt_v.has_value();
-    const bool any_sep = have_q || have_k || have_v;
-    TORCH_CHECK(
-        !any_sep || (have_q && have_k && have_v),
-        "fused_qk_norm_rope_cache_quant_shuffle: pass all of q, k, v together, or omit all three.");
-    const bool use_separate = have_q && have_k && have_v;
-    const bool have_qkv   = qkv.numel() > 0;
-
     CHECK_INPUT(position_ids);
     CHECK_INPUT(q_weight);
     CHECK_INPUT(k_weight);
@@ -2404,147 +2730,126 @@ void fused_qk_norm_rope_cache_quant_shuffle(
     CHECK_INPUT(k_cache);
     CHECK_INPUT(v_cache);
     CHECK_INPUT(slot_mapping);
-    CHECK_TYPE(position_ids, torch::kInt64);
-    CHECK_TYPE(slot_mapping, torch::kInt64);
+    CHECK_TH_CUDA(q);
+    CHECK_TH_CUDA(k);
+    CHECK_TH_CUDA(v);
+    CHECK_TYPE(position_ids, AITER_DTYPE_i64);
+    CHECK_TYPE(slot_mapping, AITER_DTYPE_i64);
 
-    TORCH_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
-    TORCH_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
-    TORCH_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
-    TORCH_CHECK(cos_sin_cache.dim() == 2, "Cos/sin cache must be 2D: [max_position, head_dim]");
-    TORCH_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
-    TORCH_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
-    TORCH_CHECK(cos_sin_cache.size(1) == head_dim, "Cos/sin cache dimension must match head_dim");
-    TORCH_CHECK(head_dim % 32 == 0,
+    AITER_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
+    AITER_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
+    AITER_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
+    AITER_CHECK(cos_sin_cache.dim() == 2, "Cos/sin cache must be 2D: [max_position, rotary_dim]");
+    AITER_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
+    AITER_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
+    int64_t const rotary_dim_ = cos_sin_cache.size(1);
+    AITER_CHECK(rotary_dim_ > 0, "rotary_dim must be positive");
+    AITER_CHECK(rotary_dim_ <= head_dim,
+                "rotary_dim (",
+                rotary_dim_,
+                ") must be <= head_dim (",
+                head_dim,
+                ")");
+    AITER_CHECK(rotary_dim_ % 2 == 0, "rotary_dim must be even");
+    if(is_neox)
+    {
+        int64_t const num_elems_per_thread = head_dim / 32;
+        AITER_CHECK((rotary_dim_ / 2) % num_elems_per_thread == 0,
+                    "For NeoX-style partial rotary, rotary_dim/2 (",
+                    rotary_dim_ / 2,
+                    ") must be divisible by head_dim/32 (",
+                    num_elems_per_thread,
+                    ")");
+    }
+    AITER_CHECK(head_dim % 32 == 0,
                 "Head dimension must be multiple of 32 for fused QK Norm RoPE kernel");
-    TORCH_CHECK(
+    AITER_CHECK(
         num_heads_k <= 32,
         "Number of key heads must be less than or equal to 32 for fused QK Norm RoPE kernel");
 
     int64_t num_tokens = 0;
-    at::ScalarType act_dtype = at::ScalarType::Undefined;
+    AiterDtype act_dtype{};
 
     int64_t q_stride_token = 0, q_stride_head = 0, q_stride_dim = 0;
     int64_t k_stride_token = 0, k_stride_head = 0, k_stride_dim = 0;
     int64_t v_stride_token = 0, v_stride_head = 0, v_stride_dim = 0;
+    aiter_tensor_t const& q_t = q;
+    aiter_tensor_t const& k_t = k;
+    aiter_tensor_t const& v_t = v;
 
-    if(use_separate)
+    AITER_CHECK((q_t.dim() == 2 || q_t.dim() == 3) && (k_t.dim() == 2 || k_t.dim() == 3) &&
+                    (v_t.dim() == 2 || v_t.dim() == 3),
+                "q, k, v must be 2D [num_tokens, num_heads * head_dim] or 3D [num_tokens, "
+                "num_heads, head_dim]");
+    num_tokens = q_t.size(0);
+    AITER_CHECK(k_t.size(0) == num_tokens && v_t.size(0) == num_tokens,
+                "q, k, v must share the same num_tokens");
+    if(q_t.dim() == 2)
     {
-        at::Tensor const& q_t = opt_q.value();
-        at::Tensor const& k_t = opt_k.value();
-        at::Tensor const& v_t = opt_v.value();
-        CHECK_TH_CUDA(q_t);
-        CHECK_TH_CUDA(k_t);
-        CHECK_TH_CUDA(v_t);
-        TORCH_CHECK(
-            (q_t.dim() == 2 || q_t.dim() == 3) && (k_t.dim() == 2 || k_t.dim() == 3) &&
-                (v_t.dim() == 2 || v_t.dim() == 3),
-            "q, k, v must be 2D [num_tokens, num_heads * head_dim] or 3D [num_tokens, num_heads, head_dim]");
-        num_tokens = q_t.size(0);
-        TORCH_CHECK(k_t.size(0) == num_tokens && v_t.size(0) == num_tokens,
-                    "q, k, v must share the same num_tokens");
-        if(q_t.dim() == 2)
-        {
-            TORCH_CHECK(q_t.size(1) == num_heads_q * head_dim,
-                        "q dim 1 must be num_heads_q * head_dim");
-        }
-        else
-        {
-            TORCH_CHECK(q_t.size(1) == num_heads_q && q_t.size(2) == head_dim,
-                        "q 3D shape must be [num_tokens, num_heads_q, head_dim]");
-        }
-        if(k_t.dim() == 2)
-        {
-            TORCH_CHECK(k_t.size(1) == num_heads_k * head_dim,
-                        "k dim 1 must be num_heads_k * head_dim");
-        }
-        else
-        {
-            TORCH_CHECK(k_t.size(1) == num_heads_k && k_t.size(2) == head_dim,
-                        "k 3D shape must be [num_tokens, num_heads_k, head_dim]");
-        }
-        if(v_t.dim() == 2)
-        {
-            TORCH_CHECK(v_t.size(1) == num_heads_v * head_dim,
-                        "v dim 1 must be num_heads_v * head_dim");
-        }
-        else
-        {
-            TORCH_CHECK(v_t.size(1) == num_heads_v && v_t.size(2) == head_dim,
-                        "v 3D shape must be [num_tokens, num_heads_v, head_dim]");
-        }
-        TORCH_CHECK(q_t.scalar_type() == k_t.scalar_type() && q_t.scalar_type() == v_t.scalar_type(),
-                    "q, k, v must share the same dtype");
-        TORCH_CHECK(q_t.scalar_type() == q_weight.scalar_type() &&
-                        q_t.scalar_type() == k_weight.scalar_type(),
-                    "q/k/v must match q_weight/k_weight dtype");
-        act_dtype = q_t.scalar_type();
-        ActivationStrides3D const sq = activation_strides_logical_3d(q_t, num_heads_q, head_dim);
-        ActivationStrides3D const sk = activation_strides_logical_3d(k_t, num_heads_k, head_dim);
-        ActivationStrides3D const sv = activation_strides_logical_3d(v_t, num_heads_v, head_dim);
-        q_stride_token = sq.st;
-        q_stride_head    = sq.sh;
-        q_stride_dim     = sq.sd;
-        k_stride_token   = sk.st;
-        k_stride_head    = sk.sh;
-        k_stride_dim     = sk.sd;
-        v_stride_token   = sv.st;
-        v_stride_head    = sv.sh;
-        v_stride_dim     = sv.sd;
-        if(have_qkv)
-        {
-            TORCH_WARN_ONCE(
-                "fused_qk_norm_rope_cache_quant_shuffle: `qkv` is deprecated and will be removed. "
-                "Separate `q`, `k`, `v` were also passed; the kernel uses `q/k/v` in-place and ignores `qkv`.");
-            int64_t const total_heads = num_heads_q + num_heads_k + num_heads_v;
-            TORCH_CHECK(qkv.dim() == 2,
-                        "When passing both qkv and q/k/v, qkv must be 2D [num_tokens, total_heads*head_dim]");
-            TORCH_CHECK(qkv.size(0) == num_tokens && qkv.size(1) == total_heads * head_dim,
-                        "When passing both qkv and q/k/v, qkv shape must be [num_tokens, (nh_q+nh_k+nh_v)*head_dim] "
-                        "(qkv is unused but must be consistent).");
-            TORCH_CHECK(qkv.scalar_type() == q_t.scalar_type(),
-                        "When passing both qkv and q/k/v, qkv dtype must match q/k/v.");
-            CHECK_INPUT(qkv);
-        }
+        AITER_CHECK(q_t.size(1) == num_heads_q * head_dim, "q dim 1 must be num_heads_q * head_dim");
     }
     else
     {
-        TORCH_CHECK(
-            have_qkv,
-            "fused_qk_norm_rope_cache_quant_shuffle: pass non-empty `qkv`, or pass all of `q`, `k`, `v`.");
-        TORCH_WARN_ONCE(
-            "fused_qk_norm_rope_cache_quant_shuffle: the concatenated `qkv` input alone is deprecated and "
-            "will be removed; prefer separate `q`, `k`, `v` tensors.");
-        CHECK_INPUT(qkv);
-        TORCH_CHECK(qkv.dim() == 2,
-                    "QKV tensor must be 2D: [num_tokens, "
-                    "(num_heads_q+num_heads_k+num_heads_v)*head_dim]");
-        TORCH_CHECK(qkv.scalar_type() == q_weight.scalar_type() &&
-                        qkv.scalar_type() == k_weight.scalar_type(),
-                    "qkv, q_weight and k_weight must have the same dtype");
-        num_tokens = qkv.size(0);
-        act_dtype  = qkv.scalar_type();
+        AITER_CHECK(q_t.size(1) == num_heads_q && q_t.size(2) == head_dim,
+                    "q 3D shape must be [num_tokens, num_heads_q, head_dim]");
     }
+    if(k_t.dim() == 2)
+    {
+        AITER_CHECK(k_t.size(1) == num_heads_k * head_dim, "k dim 1 must be num_heads_k * head_dim");
+    }
+    else
+    {
+        AITER_CHECK(k_t.size(1) == num_heads_k && k_t.size(2) == head_dim,
+                    "k 3D shape must be [num_tokens, num_heads_k, head_dim]");
+    }
+    if(v_t.dim() == 2)
+    {
+        AITER_CHECK(v_t.size(1) == num_heads_v * head_dim, "v dim 1 must be num_heads_v * head_dim");
+    }
+    else
+    {
+        AITER_CHECK(v_t.size(1) == num_heads_v && v_t.size(2) == head_dim,
+                    "v 3D shape must be [num_tokens, num_heads_v, head_dim]");
+    }
+    AITER_CHECK(q_t.dtype() == k_t.dtype() && q_t.dtype() == v_t.dtype(),
+                "q, k, v must share the same dtype");
+    AITER_CHECK(q_t.dtype() == q_weight.dtype() && q_t.dtype() == k_weight.dtype(),
+                "q/k/v must match q_weight/k_weight dtype");
+    act_dtype                    = q_t.dtype();
+    ActivationStrides3D const sq = activation_strides_logical_3d(q_t, num_heads_q, head_dim);
+    ActivationStrides3D const sk = activation_strides_logical_3d(k_t, num_heads_k, head_dim);
+    ActivationStrides3D const sv = activation_strides_logical_3d(v_t, num_heads_v, head_dim);
+    q_stride_token               = sq.st;
+    q_stride_head                = sq.sh;
+    q_stride_dim                 = sq.sd;
+    k_stride_token               = sk.st;
+    k_stride_head                = sk.sh;
+    k_stride_dim                 = sk.sd;
+    v_stride_token               = sv.st;
+    v_stride_head                = sv.sh;
+    v_stride_dim                 = sv.sd;
 
-    TORCH_CHECK(position_ids.size(0) == num_tokens,
+    AITER_CHECK(position_ids.size(0) == num_tokens,
                 "Number of tokens in position_ids must match activations");
 
-    TORCH_CHECK(k_cache.dim() == 5,
-                "k_cache must be 5D [num_blocks, num_kv_heads, head_dim//x, page_size, x], got dim ",
-                k_cache.dim());
-    int64_t x            = k_cache.size(-1);
-    int64_t page_size_k  = k_cache.size(-2);
-    TORCH_CHECK(x > 0 && head_dim % x == 0,
+    AITER_CHECK(
+        k_cache.dim() == 5,
+        "k_cache must be 5D [num_blocks, num_kv_heads, head_dim//x, page_size, x], got dim ",
+        k_cache.dim());
+    int64_t x           = k_cache.size(-1);
+    int64_t page_size_k = k_cache.size(-2);
+    AITER_CHECK(x > 0 && head_dim % x == 0,
                 "head_dim (",
                 head_dim,
                 ") must be divisible by k_cache x (",
                 x,
                 ")");
-    TORCH_CHECK(k_cache.size(2) == head_dim / x,
+    AITER_CHECK(k_cache.size(2) == head_dim / x,
                 "k_cache dim 2 must equal head_dim//x, got ",
                 k_cache.size(2),
                 " expected ",
                 head_dim / x);
-    TORCH_CHECK(k_cache.size(1) == num_heads_k,
+    AITER_CHECK(k_cache.size(1) == num_heads_k,
                 "k_cache dim 1 must equal num_heads_k, got ",
                 k_cache.size(1));
 
@@ -2552,18 +2857,18 @@ void fused_qk_norm_rope_cache_quant_shuffle(
     if(v_cache.dim() == 5)
     {
         // Shuffle layout: [num_blocks, num_heads_v, page_size//x, head_dim, x]
-        TORCH_CHECK(v_cache.size(0) == k_cache.size(0),
+        AITER_CHECK(v_cache.size(0) == k_cache.size(0),
                     "v_cache and k_cache num_blocks must match");
-        TORCH_CHECK(v_cache.size(1) == num_heads_v,
+        AITER_CHECK(v_cache.size(1) == num_heads_v,
                     "v_cache dim 1 must equal num_heads_v, got ",
                     v_cache.size(1));
-        TORCH_CHECK(v_cache.size(-1) == x && v_cache.size(-2) == head_dim,
+        AITER_CHECK(v_cache.size(-1) == x && v_cache.size(-2) == head_dim,
                     "v_cache trailing dims must be [head_dim, x], got [",
                     v_cache.size(-2),
                     ", ",
                     v_cache.size(-1),
                     "]");
-        TORCH_CHECK(v_cache.size(-3) * x == page_size_k,
+        AITER_CHECK(v_cache.size(-3) * x == page_size_k,
                     "v_cache shuffle: size(-3)*x must equal k_cache page_size; got ",
                     v_cache.size(-3),
                     "*",
@@ -2575,21 +2880,21 @@ void fused_qk_norm_rope_cache_quant_shuffle(
     else if(v_cache.dim() == 4)
     {
         // [num_blocks, num_heads_v, head_dim, page_size]
-        TORCH_CHECK(v_cache.size(0) == k_cache.size(0),
+        AITER_CHECK(v_cache.size(0) == k_cache.size(0),
                     "v_cache and k_cache num_blocks must match");
-        TORCH_CHECK(v_cache.size(1) == num_heads_v,
+        AITER_CHECK(v_cache.size(1) == num_heads_v,
                     "v_cache dim 1 must equal num_heads_v, got ",
                     v_cache.size(1));
-        TORCH_CHECK(v_cache.size(2) == head_dim,
+        AITER_CHECK(v_cache.size(2) == head_dim,
                     "v_cache dim 2 must equal head_dim, got ",
                     v_cache.size(2));
         page_size = v_cache.size(-1);
-        TORCH_CHECK(page_size == page_size_k,
+        AITER_CHECK(page_size == page_size_k,
                     "v_cache page_size (last dim) must match k_cache page_size; got ",
                     page_size,
                     " vs ",
                     page_size_k);
-        TORCH_CHECK(page_size % x == 0,
+        AITER_CHECK(page_size % x == 0,
                     "page_size must be divisible by x for V cache layout; got page_size=",
                     page_size,
                     " x=",
@@ -2597,48 +2902,25 @@ void fused_qk_norm_rope_cache_quant_shuffle(
     }
     else
     {
-        TORCH_CHECK(false,
-                    "v_cache must be 4D [num_blocks, num_heads_v, head_dim, page_size] or 5D shuffle "
-                    "[num_blocks, num_heads_v, page_size//x, head_dim, x], got dim ",
-                    v_cache.dim());
+        AITER_CHECK(
+            false,
+            "v_cache must be 4D [num_blocks, num_heads_v, head_dim, page_size] or 5D shuffle "
+            "[num_blocks, num_heads_v, page_size//x, head_dim, x], got dim ",
+            v_cache.dim());
     }
 
-    if(!use_separate)
-    {
-        int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
-        TORCH_CHECK(qkv.size(1) == total_heads * head_dim,
-                    "QKV tensor size must match total number of heads and head dimension");
-    }
+    const int stream_device = q_t.device_id;
+    HipDeviceGuard device_guard(stream_device);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int64_t stream_device = use_separate ? opt_q.value().get_device() : qkv.get_device();
-    auto stream                 = at::hip::getCurrentHIPStream(stream_device);
-
-    DISPATCH_BY_KV_CACHE_DTYPE(act_dtype, kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_QUANT);
+    DISPATCH_BY_KV_CACHE_DTYPE_rmTorch(act_dtype, kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_QUANT);
 }
 
-template <typename T>
-struct KernelElementType
-{
-    using type = T;
-};
-
-template <>
-struct KernelElementType<c10::Half>
-{
-    using type = __half;
-};
-
-template <>
-struct KernelElementType<c10::BFloat16>
-{
-    using type = hip_bfloat16;
-};
-
-void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
-                                                at::Tensor& qw,
-                                                at::Tensor& kw,
-                                                at::Tensor& cos_sin,
-                                                at::Tensor& positions,
+void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
+                                                aiter_tensor_t& qw,
+                                                aiter_tensor_t& kw,
+                                                aiter_tensor_t& cos_sin,
+                                                aiter_tensor_t& positions,
                                                 int64_t num_tokens,
                                                 int64_t num_heads_q,
                                                 int64_t num_heads_k,
@@ -2646,169 +2928,190 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                                                 int64_t head_size,
                                                 bool is_neox_style,
                                                 double eps,
-                                                at::Tensor& q_out,
-                                                at::Tensor& k_cache,
-                                                at::Tensor& v_cache,
-                                                at::Tensor& slot_mapping,
-                                                at::Tensor& per_tensor_k_scale,
-                                                at::Tensor& per_tensor_v_scale,
-                                                std::optional<at::Tensor> k_out,
-                                                std::optional<at::Tensor> v_out,
+                                                aiter_tensor_t& q_out,
+                                                aiter_tensor_t& k_cache,
+                                                aiter_tensor_t& v_cache,
+                                                aiter_tensor_t& slot_mapping,
+                                                aiter_tensor_t& per_tensor_k_scale,
+                                                aiter_tensor_t& per_tensor_v_scale,
+                                                std::optional<aiter_tensor_t> k_out,
+                                                std::optional<aiter_tensor_t> v_out,
                                                 bool return_kv,
                                                 bool use_shuffle_layout,
                                                 int64_t block_size,
                                                 int64_t x,
                                                 int64_t rotary_dim)
 {
-    TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
+    AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
                 cos_sin.is_contiguous());
-    TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && slot_mapping.is_contiguous());
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(qkv));
-    auto stream         = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    auto pos_strides    = positions.strides();
-    auto kv_cache_dtype = k_cache.scalar_type();
-    auto qkv_dtype      = qkv.scalar_type();
-    TORCH_CHECK(pos_strides.size() == 1);
-    float per_tensor_k_scale_ = per_tensor_k_scale.item<float>();
-    float per_tensor_v_scale_ = per_tensor_v_scale.item<float>();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kBFloat16, at::kHalf, qkv_dtype, "fused_qk_norm_rope_cache_pts_quant_shuffle", [&] {
-            using T = KernelElementType<scalar_t>::type;
+    AITER_CHECK(slot_mapping.is_contiguous());
+    if(!(k_cache.is_contiguous() && v_cache.is_contiguous()))
+    {
+        // Non-contiguous block dim (e.g. vLLM [num_blocks, 2, ...] after unbind(1)) is OK as long as each block is internally contiguous.
+        AITER_CHECK(is_contiguous_from_dim1(k_cache) && is_contiguous_from_dim1(v_cache),
+                    "k_cache/v_cache must be contiguous within a block (dims >= 1)");
+    }
+    HipDeviceGuard device_guard(qkv.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    auto kv_cache_dtype      = k_cache.dtype();
+    auto qkv_dtype           = qkv.dtype();
+    AITER_CHECK(positions.dim() == 1, "positions must be 1D");
+    float per_tensor_k_scale_ = *reinterpret_cast<float*>(per_tensor_k_scale.data_ptr());
+    float per_tensor_v_scale_ = *reinterpret_cast<float*>(per_tensor_v_scale.data_ptr());
+    // Per-block (dim-0) stride: == num_heads_k*HEAD_SIZE*block_size when contiguous (old formula); larger for an interleaved [num_blocks, 2, ...] cache.
+    int64_t k_cache_block_stride = k_cache.stride(0);
+    int64_t v_cache_block_stride = v_cache.stride(0);
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
+        qkv_dtype, "fused_qk_norm_rope_cache_pts_quant_shuffle", [&] {
+            using T = scalar_t;
             if(kv_cache_dtype == qkv_dtype)
             {
                 T* k_out_ptr = (return_kv && k_out.has_value())
-                                   ? (T*)k_out.value().data_ptr<scalar_t>()
+                                   ? reinterpret_cast<T*>(k_out.value().data_ptr())
                                    : nullptr;
                 T* v_out_ptr = (return_kv && v_out.has_value())
-                                   ? (T*)v_out.value().data_ptr<scalar_t>()
+                                   ? reinterpret_cast<T*>(v_out.value().data_ptr())
                                    : nullptr;
-                mrope_utils::fused_rope_rms_set_kv<T, T>((T*)qkv.data_ptr<scalar_t>(),
-                                                         (T*)qw.data_ptr<scalar_t>(),
-                                                         (T*)kw.data_ptr<scalar_t>(),
-                                                         (T*)cos_sin.data_ptr<scalar_t>(),
-                                                         positions.data_ptr<int64_t>(),
-                                                         0,
-                                                         pos_strides[0],
-                                                         num_tokens,
-                                                         num_heads_q,
-                                                         num_heads_k,
-                                                         num_heads_v,
-                                                         head_size,
-                                                         is_neox_style,
-                                                         eps,
-                                                         (T*)q_out.data_ptr<scalar_t>(),
-                                                         (T*)k_cache.data_ptr<scalar_t>(),
-                                                         (T*)v_cache.data_ptr<scalar_t>(),
-                                                         slot_mapping.data_ptr<int64_t>(),
-                                                         stream,
-                                                         per_tensor_k_scale_,
-                                                         per_tensor_v_scale_,
-                                                         k_out_ptr,
-                                                         v_out_ptr,
-                                                         use_shuffle_layout,
-                                                         block_size,
-                                                         x,
-                                                         rotary_dim);
+                mrope_utils::fused_rope_rms_set_kv<T, T>(
+                    reinterpret_cast<T*>(qkv.data_ptr()),
+                    reinterpret_cast<T*>(qw.data_ptr()),
+                    reinterpret_cast<T*>(kw.data_ptr()),
+                    reinterpret_cast<T*>(cos_sin.data_ptr()),
+                    reinterpret_cast<int64_t*>(positions.data_ptr()),
+                    0,
+                    positions.stride(0),
+                    num_tokens,
+                    num_heads_q,
+                    num_heads_k,
+                    num_heads_v,
+                    head_size,
+                    is_neox_style,
+                    eps,
+                    reinterpret_cast<T*>(q_out.data_ptr()),
+                    reinterpret_cast<T*>(k_cache.data_ptr()),
+                    reinterpret_cast<T*>(v_cache.data_ptr()),
+                    reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),
+                    stream,
+                    per_tensor_k_scale_,
+                    per_tensor_v_scale_,
+                    k_out_ptr,
+                    v_out_ptr,
+                    use_shuffle_layout,
+                    block_size,
+                    x,
+                    rotary_dim,
+                    k_cache_block_stride,
+                    v_cache_block_stride);
             }
             else
             {
-                // Check if kv_cache_dtype is fp8e4m3fnuz or fp8e4m3fn
-                if(kv_cache_dtype == at::ScalarType::Float8_e4m3fnuz)
+                if(kv_cache_dtype == AITER_DTYPE_fp8)
                 {
-                    mrope_utils::fp8e4m3fnuz* k_out_fp8_ptr =
-                        (return_kv && k_out.has_value())
-                            ? (mrope_utils::fp8e4m3fnuz*)k_out.value().data_ptr()
-                            : nullptr;
-                    mrope_utils::fp8e4m3fnuz* v_out_fp8_ptr =
-                        (return_kv && v_out.has_value())
-                            ? (mrope_utils::fp8e4m3fnuz*)v_out.value().data_ptr()
-                            : nullptr;
-                    mrope_utils::fused_rope_rms_set_kv<T, mrope_utils::fp8e4m3fnuz>(
-                        (T*)qkv.data_ptr<scalar_t>(),
-                        (T*)qw.data_ptr<scalar_t>(),
-                        (T*)kw.data_ptr<scalar_t>(),
-                        (T*)cos_sin.data_ptr<scalar_t>(),
-                        positions.data_ptr<int64_t>(),
-                        0,
-                        pos_strides[0],
-                        num_tokens,
-                        num_heads_q,
-                        num_heads_k,
-                        num_heads_v,
-                        head_size,
-                        is_neox_style,
-                        eps,
-                        (T*)q_out.data_ptr<scalar_t>(),
-                        (mrope_utils::fp8e4m3fnuz*)k_cache.data_ptr(),
-                        (mrope_utils::fp8e4m3fnuz*)v_cache.data_ptr(),
-                        slot_mapping.data_ptr<int64_t>(),
-                        stream,
-                        per_tensor_k_scale_,
-                        per_tensor_v_scale_,
-                        k_out_fp8_ptr,
-                        v_out_fp8_ptr,
-                        use_shuffle_layout,
-                        block_size,
-                        x,
-                        rotary_dim);
-                }
-                else if(kv_cache_dtype == at::ScalarType::Float8_e4m3fn)
-                {
-                    mrope_utils::fp8e4m3fn* k_out_fp8_ptr =
-                        (return_kv && k_out.has_value())
-                            ? (mrope_utils::fp8e4m3fn*)k_out.value().data_ptr()
-                            : nullptr;
-                    mrope_utils::fp8e4m3fn* v_out_fp8_ptr =
-                        (return_kv && v_out.has_value())
-                            ? (mrope_utils::fp8e4m3fn*)v_out.value().data_ptr()
-                            : nullptr;
-                    mrope_utils::fused_rope_rms_set_kv<T, mrope_utils::fp8e4m3fn>(
-                        (T*)qkv.data_ptr<scalar_t>(),
-                        (T*)qw.data_ptr<scalar_t>(),
-                        (T*)kw.data_ptr<scalar_t>(),
-                        (T*)cos_sin.data_ptr<scalar_t>(),
-                        positions.data_ptr<int64_t>(),
-                        0,
-                        pos_strides[0],
-                        num_tokens,
-                        num_heads_q,
-                        num_heads_k,
-                        num_heads_v,
-                        head_size,
-                        is_neox_style,
-                        eps,
-                        (T*)q_out.data_ptr<scalar_t>(),
-                        (mrope_utils::fp8e4m3fn*)k_cache.data_ptr(),
-                        (mrope_utils::fp8e4m3fn*)v_cache.data_ptr(),
-                        slot_mapping.data_ptr<int64_t>(),
-                        stream,
-                        per_tensor_k_scale_,
-                        per_tensor_v_scale_,
-                        k_out_fp8_ptr,
-                        v_out_fp8_ptr,
-                        use_shuffle_layout,
-                        block_size,
-                        x,
-                        rotary_dim);
+                    if(is_fp8_ocp_arch())
+                    {
+                        mrope_utils::fp8e4m3fn* k_out_fp8_ptr =
+                            (return_kv && k_out.has_value())
+                                ? reinterpret_cast<mrope_utils::fp8e4m3fn*>(
+                                      k_out.value().data_ptr())
+                                : nullptr;
+                        mrope_utils::fp8e4m3fn* v_out_fp8_ptr =
+                            (return_kv && v_out.has_value())
+                                ? reinterpret_cast<mrope_utils::fp8e4m3fn*>(
+                                      v_out.value().data_ptr())
+                                : nullptr;
+                        mrope_utils::fused_rope_rms_set_kv<T, mrope_utils::fp8e4m3fn>(
+                            reinterpret_cast<T*>(qkv.data_ptr()),
+                            reinterpret_cast<T*>(qw.data_ptr()),
+                            reinterpret_cast<T*>(kw.data_ptr()),
+                            reinterpret_cast<T*>(cos_sin.data_ptr()),
+                            reinterpret_cast<int64_t*>(positions.data_ptr()),
+                            0,
+                            positions.stride(0),
+                            num_tokens,
+                            num_heads_q,
+                            num_heads_k,
+                            num_heads_v,
+                            head_size,
+                            is_neox_style,
+                            eps,
+                            reinterpret_cast<T*>(q_out.data_ptr()),
+                            reinterpret_cast<mrope_utils::fp8e4m3fn*>(k_cache.data_ptr()),
+                            reinterpret_cast<mrope_utils::fp8e4m3fn*>(v_cache.data_ptr()),
+                            reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),
+                            stream,
+                            per_tensor_k_scale_,
+                            per_tensor_v_scale_,
+                            k_out_fp8_ptr,
+                            v_out_fp8_ptr,
+                            use_shuffle_layout,
+                            block_size,
+                            x,
+                            rotary_dim,
+                            k_cache_block_stride,
+                            v_cache_block_stride);
+                    }
+                    else
+                    {
+                        mrope_utils::fp8e4m3fnuz* k_out_fp8_ptr =
+                            (return_kv && k_out.has_value())
+                                ? reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(
+                                      k_out.value().data_ptr())
+                                : nullptr;
+                        mrope_utils::fp8e4m3fnuz* v_out_fp8_ptr =
+                            (return_kv && v_out.has_value())
+                                ? reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(
+                                      v_out.value().data_ptr())
+                                : nullptr;
+                        mrope_utils::fused_rope_rms_set_kv<T, mrope_utils::fp8e4m3fnuz>(
+                            reinterpret_cast<T*>(qkv.data_ptr()),
+                            reinterpret_cast<T*>(qw.data_ptr()),
+                            reinterpret_cast<T*>(kw.data_ptr()),
+                            reinterpret_cast<T*>(cos_sin.data_ptr()),
+                            reinterpret_cast<int64_t*>(positions.data_ptr()),
+                            0,
+                            positions.stride(0),
+                            num_tokens,
+                            num_heads_q,
+                            num_heads_k,
+                            num_heads_v,
+                            head_size,
+                            is_neox_style,
+                            eps,
+                            reinterpret_cast<T*>(q_out.data_ptr()),
+                            reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(k_cache.data_ptr()),
+                            reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(v_cache.data_ptr()),
+                            reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),
+                            stream,
+                            per_tensor_k_scale_,
+                            per_tensor_v_scale_,
+                            k_out_fp8_ptr,
+                            v_out_fp8_ptr,
+                            use_shuffle_layout,
+                            block_size,
+                            x,
+                            rotary_dim,
+                            k_cache_block_stride,
+                            v_cache_block_stride);
+                    }
                 }
                 else
                 {
-                    TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
+                    AITER_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
                 }
             }
         });
 }
 
-void fused_qk_norm_rope_2way(at::Tensor& q0,
-                             at::Tensor& k0,
-                             at::Tensor& q1,
-                             at::Tensor& k1,
-                             at::Tensor& w_q0,
-                             at::Tensor& w_k0,
-                             at::Tensor& w_q1,
-                             at::Tensor& w_k1,
-                             at::Tensor& cos_sin0,
-                             at::Tensor& cos_sin1,
+void fused_qk_norm_rope_2way(aiter_tensor_t& q0,
+                             aiter_tensor_t& k0,
+                             aiter_tensor_t& q1,
+                             aiter_tensor_t& k1,
+                             aiter_tensor_t& w_q0,
+                             aiter_tensor_t& w_k0,
+                             aiter_tensor_t& w_q1,
+                             aiter_tensor_t& w_k1,
+                             aiter_tensor_t& cos_sin0,
+                             aiter_tensor_t& cos_sin1,
                              int64_t batch_size,
                              int64_t num_tokens0,
                              int64_t num_tokens1,
@@ -2817,48 +3120,47 @@ void fused_qk_norm_rope_2way(at::Tensor& q0,
                              int64_t head_size,
                              bool is_interleaved,
                              double eps,
-                             at::Tensor& out_q01,
-                             at::Tensor& out_k01)
+                             aiter_tensor_t& out_q01,
+                             aiter_tensor_t& out_k01)
 {
-    TORCH_CHECK(q0.is_contiguous() && k0.is_contiguous() && q1.is_contiguous() &&
+    AITER_CHECK(q0.is_contiguous() && k0.is_contiguous() && q1.is_contiguous() &&
                 k1.is_contiguous());
-    TORCH_CHECK(w_q0.is_contiguous() && w_k0.is_contiguous() && w_q1.is_contiguous() &&
+    AITER_CHECK(w_q0.is_contiguous() && w_k0.is_contiguous() && w_q1.is_contiguous() &&
                 w_k1.is_contiguous());
-    TORCH_CHECK(cos_sin0.is_contiguous() && cos_sin1.is_contiguous());
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(q0));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kBFloat16, at::kHalf, q0.scalar_type(), "fused_qk_norm_rope_2way", [&] {
-            using T = KernelElementType<scalar_t>::type;
-            fused_rope_rms_2way<T>((T*)q0.data_ptr<scalar_t>(),
-                                   (T*)k0.data_ptr<scalar_t>(),
-                                   (T*)q1.data_ptr<scalar_t>(),
-                                   (T*)k1.data_ptr<scalar_t>(),
-                                   (T*)w_q0.data_ptr<scalar_t>(),
-                                   (T*)w_k0.data_ptr<scalar_t>(),
-                                   (T*)w_q1.data_ptr<scalar_t>(),
-                                   (T*)w_k1.data_ptr<scalar_t>(),
-                                   (T*)cos_sin0.data_ptr<scalar_t>(),
-                                   (T*)cos_sin1.data_ptr<scalar_t>(),
-                                   batch_size,
-                                   num_tokens0,
-                                   num_tokens1,
-                                   num_heads_q,
-                                   num_heads_k,
-                                   head_size,
-                                   is_interleaved,
-                                   eps,
-                                   (T*)out_q01.data_ptr<scalar_t>(),
-                                   (T*)out_k01.data_ptr<scalar_t>(),
-                                   stream);
-        });
+    AITER_CHECK(cos_sin0.is_contiguous() && cos_sin1.is_contiguous());
+    HipDeviceGuard device_guard(q0.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(q0.dtype(), "fused_qk_norm_rope_2way", [&] {
+        using T = scalar_t;
+        fused_rope_rms_2way<T>(reinterpret_cast<T*>(q0.data_ptr()),
+                               reinterpret_cast<T*>(k0.data_ptr()),
+                               reinterpret_cast<T*>(q1.data_ptr()),
+                               reinterpret_cast<T*>(k1.data_ptr()),
+                               reinterpret_cast<T*>(w_q0.data_ptr()),
+                               reinterpret_cast<T*>(w_k0.data_ptr()),
+                               reinterpret_cast<T*>(w_q1.data_ptr()),
+                               reinterpret_cast<T*>(w_k1.data_ptr()),
+                               reinterpret_cast<T*>(cos_sin0.data_ptr()),
+                               reinterpret_cast<T*>(cos_sin1.data_ptr()),
+                               batch_size,
+                               num_tokens0,
+                               num_tokens1,
+                               num_heads_q,
+                               num_heads_k,
+                               head_size,
+                               is_interleaved,
+                               eps,
+                               reinterpret_cast<T*>(out_q01.data_ptr()),
+                               reinterpret_cast<T*>(out_k01.data_ptr()),
+                               stream);
+    });
 }
 
-void fused_qk_norm_rope_1way(at::Tensor& q,
-                             at::Tensor& k,
-                             at::Tensor& w_q,
-                             at::Tensor& w_k,
-                             at::Tensor& cos_sin,
+void fused_qk_norm_rope_1way(aiter_tensor_t& q,
+                             aiter_tensor_t& k,
+                             aiter_tensor_t& w_q,
+                             aiter_tensor_t& w_k,
+                             aiter_tensor_t& cos_sin,
                              int64_t batch_size,
                              int64_t num_tokens,
                              int64_t num_heads_q,
@@ -2866,118 +3168,447 @@ void fused_qk_norm_rope_1way(at::Tensor& q,
                              int64_t head_size,
                              bool is_interleaved,
                              double eps,
-                             at::Tensor& out_q,
-                             at::Tensor& out_k)
+                             aiter_tensor_t& out_q,
+                             aiter_tensor_t& out_k)
 {
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous());
-    TORCH_CHECK(w_q.is_contiguous() && w_k.is_contiguous());
-    TORCH_CHECK(cos_sin.is_contiguous());
-    TORCH_CHECK(out_q.is_contiguous() && out_k.is_contiguous());
-    // cos_sin must be fp32 to match the qwen-image-edit / diffusers reference,
-    // where the complex RoPE freqs carry full fp32 precision before the rope
-    // multiply. Passing bf16/fp16 cos_sin truncates the input before the
-    // kernel even runs, producing precision drift in the generated image.
-    TORCH_CHECK(cos_sin.scalar_type() == at::kFloat,
+    AITER_CHECK(q.is_contiguous() && k.is_contiguous());
+    AITER_CHECK(w_q.is_contiguous() && w_k.is_contiguous());
+    AITER_CHECK(cos_sin.is_contiguous());
+    AITER_CHECK(out_q.is_contiguous() && out_k.is_contiguous());
+    AITER_CHECK(cos_sin.dtype() == AITER_DTYPE_fp32,
                 "fused_qk_norm_rope_1way requires cos_sin in float32 (got ",
-                cos_sin.scalar_type(), ")");
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(q));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kBFloat16, at::kHalf, q.scalar_type(), "fused_qk_norm_rope_1way", [&] {
-            using T = KernelElementType<scalar_t>::type;
-            fused_rope_rms_1way<T>((T*)q.data_ptr<scalar_t>(),
-                                   (T*)k.data_ptr<scalar_t>(),
-                                   (T*)w_q.data_ptr<scalar_t>(),
-                                   (T*)w_k.data_ptr<scalar_t>(),
-                                   cos_sin.data_ptr<float>(),
-                                   batch_size,
-                                   num_tokens,
-                                   num_heads_q,
-                                   num_heads_k,
-                                   head_size,
-                                   is_interleaved,
-                                   eps,
-                                   (T*)out_q.data_ptr<scalar_t>(),
-                                   (T*)out_k.data_ptr<scalar_t>(),
-                                   stream);
-        });
+                AiterDtype_to_str(cos_sin.dtype()), ")");
+    HipDeviceGuard device_guard(q.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(q.dtype(), "fused_qk_norm_rope_1way", [&] {
+        using T = scalar_t;
+        fused_rope_rms_1way<T>(reinterpret_cast<T*>(q.data_ptr()),
+                               reinterpret_cast<T*>(k.data_ptr()),
+                               reinterpret_cast<T*>(w_q.data_ptr()),
+                               reinterpret_cast<T*>(w_k.data_ptr()),
+                               reinterpret_cast<float*>(cos_sin.data_ptr()),
+                               batch_size,
+                               num_tokens,
+                               num_heads_q,
+                               num_heads_k,
+                               head_size,
+                               is_interleaved,
+                               eps,
+                               reinterpret_cast<T*>(out_q.data_ptr()),
+                               reinterpret_cast<T*>(out_k.data_ptr()),
+                               stream);
+    });
 }
 
 void fused_qk_norm_rope_cache_block_quant_shuffle(
-    at::Tensor& qkv,                   // Combined QKV tensor [num_tokens,
-                                       // (num_heads_q+num_heads_k+num_heads_v)*head_dim]
-    int64_t num_heads_q,               // Number of query heads
-    int64_t num_heads_k,               // Number of key heads
-    int64_t num_heads_v,               // Number of value heads
-    int64_t head_dim,                  // Dimension per head
-    double eps,                        // Epsilon for RMS normalization
-    at::Tensor& q_weight,              // RMSNorm weights for query [head_dim]
-    at::Tensor& k_weight,              // RMSNorm weights for key [head_dim]
-    at::Tensor& cos_sin_cache,         // Cos/sin cache [max_position, head_dim]
-    bool is_neox,                      // Whether RoPE is applied in Neox style
-    at::Tensor& position_ids,          // Position IDs for RoPE [num_tokens]
-    at::Tensor& k_cache,               // k cache
-    at::Tensor& v_cache,               // v cache
-    at::Tensor& slot_mapping,          // slot mapping
-    at::Tensor& cu_q_len,              // cu q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
-    const std::string& kv_cache_dtype, // kv cache data type
-    std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
-    std::optional<at::Tensor> v_scale, // v scale tensor for quantized v cache
-    int64_t max_tokens_per_batch       // max tokens in any single batch (0 = use avg, safe for uniform distributions)
+    aiter_tensor_t& qkv,           // Combined QKV tensor [num_tokens,
+                                   // (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+    int64_t num_heads_q,           // Number of query heads
+    int64_t num_heads_k,           // Number of key heads
+    int64_t num_heads_v,           // Number of value heads
+    int64_t head_dim,              // Dimension per head
+    double eps,                    // Epsilon for RMS normalization
+    aiter_tensor_t& q_weight,      // RMSNorm weights for query [head_dim]
+    aiter_tensor_t& k_weight,      // RMSNorm weights for key [head_dim]
+    aiter_tensor_t& cos_sin_cache, // Cos/sin cache [max_position, head_dim]
+    bool is_neox,                  // Whether RoPE is applied in Neox style
+    aiter_tensor_t& position_ids,  // Position IDs for RoPE [num_tokens]
+    aiter_tensor_t& k_cache,       // k cache
+    aiter_tensor_t& v_cache,       // v cache
+    aiter_tensor_t& slot_mapping,  // slot mapping
+    aiter_tensor_t&
+        cu_q_len, // cu q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
+    const std::string& kv_cache_dtype,     // kv cache data type
+    std::optional<aiter_tensor_t> k_scale, // k scale tensor for quantized k cache
+    std::optional<aiter_tensor_t> v_scale, // v scale tensor for quantized v cache
+    int64_t max_tokens_per_batch // max tokens in any single batch (0 = use avg, safe for uniform
+                                 // distributions)
 )
- {
-     // Input validation
-     CHECK_INPUT(qkv);
-     CHECK_INPUT(cu_q_len);
-     CHECK_INPUT(position_ids);
-     CHECK_INPUT(q_weight);
-     CHECK_INPUT(k_weight);
-     CHECK_INPUT(cos_sin_cache);
-     CHECK_TYPE(position_ids, torch::kInt64);
- 
-     TORCH_CHECK(qkv.dim() == 2,
-                 "QKV tensor must be 2D: [num_tokens, "
-                 "(num_heads_q+num_heads_k+num_heads_v)*head_dim]");
-     TORCH_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
-     TORCH_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
-     TORCH_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
-     TORCH_CHECK(cos_sin_cache.dim() == 2, "Cos/sin cache must be 2D: [max_position, head_dim]");
-     TORCH_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
-     TORCH_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
-     TORCH_CHECK(cos_sin_cache.size(1) == head_dim, "Cos/sin cache dimension must match head_dim");
-     TORCH_CHECK(qkv.scalar_type() == q_weight.scalar_type() &&
-                     qkv.scalar_type() == k_weight.scalar_type(),
-                 "qkv, q_weight and k_weight must have the same dtype");
-     TORCH_CHECK(head_dim % 32 == 0,
-                 "Head dimension must be multiple of 32 for fused QK Norm RoPE kernel");
-     TORCH_CHECK(
-         num_heads_k <= 32,
-         "Number of key heads must be less than or equal to 32 for fused QK Norm RoPE kernel");
+{
+    // Input validation
+    CHECK_INPUT(qkv);
+    CHECK_INPUT(cu_q_len);
+    CHECK_INPUT(position_ids);
+    CHECK_INPUT(q_weight);
+    CHECK_INPUT(k_weight);
+    CHECK_INPUT(cos_sin_cache);
+    CHECK_TYPE(position_ids, AITER_DTYPE_i64);
 
-     // cu_q_len format: [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
-     // batch_size = cu_q_len.size(0) - 1
-     TORCH_CHECK(cu_q_len.dim() == 1, "Cu Q len tensor must be 1D");
-     int64_t batch_size = cu_q_len.size(0) - 1;
-     TORCH_CHECK(batch_size > 0, "Batch size must be greater than 0");
-     
-     int64_t num_tokens = qkv.size(0);
-     int64_t page_size  = k_cache.size(-2);
-     int64_t x          = k_cache.size(-1);
-     TORCH_CHECK(x > 0 && (x & (x - 1)) == 0,
-                 "KV cache tiling size (x) must be a power of two, got ", x);
-     // vec_size is 8 for bf16/fp16, 4 for fp32; vec_per_x = x/vec_size requires x >= vec_size
-     TORCH_CHECK(x >= 4,
-                 "KV cache tiling size (x) must be >= 4 for vectorized access, got ", x);
-     TORCH_CHECK(position_ids.size(0) == num_tokens,
-                 "Number of tokens in position_ids must match QKV");
+    AITER_CHECK(qkv.dim() == 2,
+                "QKV tensor must be 2D: [num_tokens, "
+                "(num_heads_q+num_heads_k+num_heads_v)*head_dim]");
+    AITER_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
+    AITER_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
+    AITER_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
+    AITER_CHECK(cos_sin_cache.dim() == 2, "Cos/sin cache must be 2D: [max_position, head_dim]");
+    AITER_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
+    AITER_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
+    AITER_CHECK(cos_sin_cache.size(1) == head_dim, "Cos/sin cache dimension must match head_dim");
+    AITER_CHECK(qkv.dtype() == q_weight.dtype() && qkv.dtype() == k_weight.dtype(),
+                "qkv, q_weight and k_weight must have the same dtype");
+    AITER_CHECK(head_dim % 32 == 0,
+                "Head dimension must be multiple of 32 for fused QK Norm RoPE kernel");
+    AITER_CHECK(
+        num_heads_k <= 32,
+        "Number of key heads must be less than or equal to 32 for fused QK Norm RoPE kernel");
 
- 
-     int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
-     TORCH_CHECK(qkv.size(1) == total_heads * head_dim,
-                 "QKV tensor size must match total number of heads and head dimension");
- 
-     auto stream = at::hip::getCurrentHIPStream(qkv.get_device());
-     DISPATCH_BY_KV_CACHE_DTYPE_OPUS(qkv.scalar_type(), kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT);
- }
+    // cu_q_len format: [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
+    // batch_size = cu_q_len.size(0) - 1
+    AITER_CHECK(cu_q_len.dim() == 1, "Cu Q len tensor must be 1D");
+    int64_t batch_size = cu_q_len.size(0) - 1;
+    AITER_CHECK(batch_size > 0, "Batch size must be greater than 0");
+
+    int64_t num_tokens = qkv.size(0);
+    int64_t page_size  = k_cache.size(-2);
+    int64_t x          = k_cache.size(-1);
+    AITER_CHECK(
+        x > 0 && (x & (x - 1)) == 0, "KV cache tiling size (x) must be a power of two, got ", x);
+    // vec_size is 8 for bf16/fp16, 4 for fp32; vec_per_x = x/vec_size requires x >= vec_size
+    AITER_CHECK(x >= 4, "KV cache tiling size (x) must be >= 4 for vectorized access, got ", x);
+    AITER_CHECK(position_ids.size(0) == num_tokens,
+                "Number of tokens in position_ids must match QKV");
+
+    int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
+    AITER_CHECK(qkv.size(1) == total_heads * head_dim,
+                "QKV tensor size must match total number of heads and head dimension");
+
+    HipDeviceGuard device_guard_blk(qkv.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(
+        qkv.dtype(), kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT);
+}
+
+void fused_qk_norm_rope_2way_fp8_perhead_quant(aiter_tensor_t& q0,
+                                               aiter_tensor_t& k0,
+                                               aiter_tensor_t& q1,
+                                               aiter_tensor_t& k1,
+                                               aiter_tensor_t& w_q0,
+                                               aiter_tensor_t& w_k0,
+                                               aiter_tensor_t& w_q1,
+                                               aiter_tensor_t& w_k1,
+                                               aiter_tensor_t& cos_sin0,
+                                               aiter_tensor_t& cos_sin1,
+                                               int64_t batch_size,
+                                               int64_t num_tokens0,
+                                               int64_t num_tokens1,
+                                               int64_t num_heads_q,
+                                               int64_t num_heads_k,
+                                               int64_t head_size,
+                                               bool is_interleaved,
+                                               double eps,
+                                               aiter_tensor_t& q_fp8,
+                                               aiter_tensor_t& k_fp8,
+                                               aiter_tensor_t& q_descale,
+                                               aiter_tensor_t& k_descale,
+                                               aiter_tensor_t& q_unquantized,
+                                               aiter_tensor_t& k_unquantized)
+{
+    AITER_CHECK(q0.is_contiguous() && k0.is_contiguous() && q1.is_contiguous() &&
+                k1.is_contiguous());
+    AITER_CHECK(w_q0.is_contiguous() && w_k0.is_contiguous() && w_q1.is_contiguous() &&
+                w_k1.is_contiguous());
+    AITER_CHECK(cos_sin0.is_contiguous() && cos_sin1.is_contiguous());
+    AITER_CHECK(q_fp8.is_contiguous() && k_fp8.is_contiguous());
+    AITER_CHECK(q_descale.is_contiguous() && k_descale.is_contiguous());
+    AITER_CHECK(q_unquantized.is_contiguous() && k_unquantized.is_contiguous());
+    AITER_CHECK(q0.dtype() == k0.dtype() && q0.dtype() == q1.dtype() && q0.dtype() == k1.dtype());
+    AITER_CHECK(q0.dtype() == w_q0.dtype() && q0.dtype() == w_k0.dtype() &&
+                q0.dtype() == w_q1.dtype() && q0.dtype() == w_k1.dtype());
+    AITER_CHECK(q0.dtype() == q_unquantized.dtype() && k0.dtype() == k_unquantized.dtype());
+    AITER_CHECK(q_fp8.dtype() == AITER_DTYPE_fp8 && k_fp8.dtype() == AITER_DTYPE_fp8);
+    AITER_CHECK(q_descale.dtype() == AITER_DTYPE_fp32 && k_descale.dtype() == AITER_DTYPE_fp32);
+
+    HipDeviceGuard device_guard(q0.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    int total_warps         = (num_tokens0 + num_tokens1) * (num_heads_q + num_heads_k);
+    constexpr int block_size = 256;
+    constexpr int warp_size  = 32;
+    int num_warps_per_block  = block_size / warp_size;
+
+    AiterTensor q_partial_amax =
+        AiterTensor::empty({batch_size, total_warps}, AITER_DTYPE_fp32, q0.device_id, stream);
+    AiterTensor k_partial_amax =
+        AiterTensor::empty({batch_size, total_warps}, AITER_DTYPE_fp32, q0.device_id, stream);
+
+    dim3 threadsPerBlock(block_size);
+    dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block, batch_size);
+
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        q0.dtype(), "fused_qk_norm_rope_2way_fp8_perhead_amax", [&] {
+            using T = scalar_t;
+            auto launch_amax = [&]<int HS, bool NEOX>() {
+                fused_rope_rms_2way_amax_kernel<T, HS, NEOX>
+                    <<<numBlocks, threadsPerBlock, 0, stream>>>(
+                        reinterpret_cast<T*>(q0.data_ptr()),
+                        reinterpret_cast<T*>(k0.data_ptr()),
+                        reinterpret_cast<T*>(q1.data_ptr()),
+                        reinterpret_cast<T*>(k1.data_ptr()),
+                        reinterpret_cast<T*>(w_q0.data_ptr()),
+                        reinterpret_cast<T*>(w_k0.data_ptr()),
+                        reinterpret_cast<T*>(w_q1.data_ptr()),
+                        reinterpret_cast<T*>(w_k1.data_ptr()),
+                        reinterpret_cast<T*>(cos_sin0.data_ptr()),
+                        reinterpret_cast<T*>(cos_sin1.data_ptr()),
+                        (int)num_tokens0,
+                        (int)num_tokens1,
+                        (int)num_heads_q,
+                        (int)num_heads_k,
+                        (float)eps,
+                        total_warps,
+                        reinterpret_cast<T*>(q_unquantized.data_ptr()),
+                        reinterpret_cast<T*>(k_unquantized.data_ptr()),
+                        reinterpret_cast<float*>(q_partial_amax.data_ptr()),
+                        reinterpret_cast<float*>(k_partial_amax.data_ptr()));
+            };
+            switch(head_size)
+            {
+            case 64:
+                if(!is_interleaved) launch_amax.template operator()<64, true>();
+                else                launch_amax.template operator()<64, false>();
+                break;
+            case 128:
+                if(!is_interleaved) launch_amax.template operator()<128, true>();
+                else                launch_amax.template operator()<128, false>();
+                break;
+            case 256:
+                if(!is_interleaved) launch_amax.template operator()<256, true>();
+                else                launch_amax.template operator()<256, false>();
+                break;
+            default:
+                AITER_CHECK(false, "Unsupported head_size: ", head_size);
+            }
+        });
+
+    {
+        dim3 reduce_grid((unsigned)(num_heads_q + num_heads_k), (unsigned)batch_size);
+        dim3 reduce_block(256);
+        qk_partial_amax_to_perhead_scale_kernel<<<reduce_grid, reduce_block, 0, stream>>>(
+            reinterpret_cast<float*>(q_partial_amax.data_ptr()),
+            reinterpret_cast<float*>(k_partial_amax.data_ptr()),
+            (int)num_tokens0,
+            (int)num_tokens1,
+            (int)num_heads_q,
+            (int)num_heads_k,
+            total_warps,
+            reinterpret_cast<float*>(q_descale.data_ptr()),
+            reinterpret_cast<float*>(k_descale.data_ptr()));
+    }
+
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        q0.dtype(), "fused_qk_norm_rope_2way_fp8_perhead_quant", [&] {
+            using T          = scalar_t;
+            int total_tokens = num_tokens0 + num_tokens1;
+            int64_t q_numel  = (int64_t)batch_size * total_tokens * num_heads_q * head_size;
+            int64_t k_numel  = (int64_t)batch_size * total_tokens * num_heads_k * head_size;
+            dim3 quant_block(256);
+            dim3 q_grid((unsigned)((q_numel + quant_block.x - 1) / quant_block.x));
+            dim3 k_grid((unsigned)((k_numel + quant_block.x - 1) / quant_block.x));
+            static_fp8_quant_perhead_kernel<T><<<q_grid, quant_block, 0, stream>>>(
+                reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(q_fp8.data_ptr()),
+                reinterpret_cast<T*>(q_unquantized.data_ptr()),
+                reinterpret_cast<float*>(q_descale.data_ptr()),
+                (int)batch_size,
+                total_tokens,
+                (int)num_heads_q,
+                (int)head_size);
+            static_fp8_quant_perhead_kernel<T><<<k_grid, quant_block, 0, stream>>>(
+                reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(k_fp8.data_ptr()),
+                reinterpret_cast<T*>(k_unquantized.data_ptr()),
+                reinterpret_cast<float*>(k_descale.data_ptr()),
+                (int)batch_size,
+                total_tokens,
+                (int)num_heads_k,
+                (int)head_size);
+        });
+}
+
+// ---------- per-(batch, head) FP8 V quant (2-way, no bf16 cat) ----------
+
+__device__ __forceinline__ void atomic_fmax_pos(float* addr, float val)
+{
+    int* iaddr = reinterpret_cast<int*>(addr);
+    int ival   = __float_as_int(val);
+    atomicMax(iaddr, ival);
+}
+
+__global__ void v_amax_to_descale_kernel(const float* __restrict__ v_amax,
+                                         int num_heads,
+                                         float* __restrict__ v_descale)
+{
+    int b   = blockIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= num_heads) return;
+    constexpr float fp8_max = 240.0f;
+    v_descale[b * num_heads + idx] =
+        fmaxf(v_amax[b * num_heads + idx], 1e-8f) / fp8_max;
+}
+
+template <typename T, int TILE_T, int HEAD_SIZE>
+__global__ void __launch_bounds__(256) v_2way_per_head_amax_tiled_kernel(
+    const T* __restrict__ v0_,
+    const T* __restrict__ v1_,
+    int num_tokens0,
+    int num_tokens1,
+    int num_heads,
+    float* __restrict__ v_amax)
+{
+    constexpr int BT = 256;
+    int b            = blockIdx.z;
+    int h            = blockIdx.y;
+    int tile         = blockIdx.x;
+    int total_tokens = num_tokens0 + num_tokens1;
+    int t_start      = tile * TILE_T;
+    int t_end        = min(t_start + TILE_T, total_tokens);
+    int slab_h_stride = num_heads * HEAD_SIZE;
+    float local       = 0.0f;
+
+    for(int idx = threadIdx.x; idx < (t_end - t_start) * HEAD_SIZE; idx += BT)
+    {
+        int local_t = idx / HEAD_SIZE;
+        int d       = idx % HEAD_SIZE;
+        int t       = t_start + local_t;
+        float val;
+        if(t < num_tokens0)
+        {
+            int64_t off = ((int64_t)b * num_tokens0 + t) * slab_h_stride +
+                          (int64_t)h * HEAD_SIZE + d;
+            val = (float)v0_[off];
+        }
+        else
+        {
+            int t1      = t - num_tokens0;
+            int64_t off = ((int64_t)b * num_tokens1 + t1) * slab_h_stride +
+                          (int64_t)h * HEAD_SIZE + d;
+            val = (float)v1_[off];
+        }
+        local = fmaxf(local, fabsf(val));
+    }
+
+    __shared__ float sm[BT];
+    sm[threadIdx.x] = local;
+    __syncthreads();
+#pragma unroll
+    for(int s = BT / 2; s > 0; s >>= 1)
+    {
+        if(threadIdx.x < s) sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if(threadIdx.x == 0) atomic_fmax_pos(v_amax + b * num_heads + h, sm[0]);
+}
+
+template <typename T, int TILE_T, int HEAD_SIZE>
+__global__ void __launch_bounds__(256) v_2way_per_head_quant_tiled_kernel(
+    const T* __restrict__ v0_,
+    const T* __restrict__ v1_,
+    int num_tokens0,
+    int num_tokens1,
+    int num_heads,
+    mrope_utils::fp8e4m3fnuz* __restrict__ v_fp8_,
+    const float* __restrict__ v_descale)
+{
+    constexpr int BT = 256;
+    int b            = blockIdx.z;
+    int h            = blockIdx.y;
+    int tile         = blockIdx.x;
+    int total_tokens = num_tokens0 + num_tokens1;
+    int t_start      = tile * TILE_T;
+    int t_end        = min(t_start + TILE_T, total_tokens);
+    int slab_h_stride = num_heads * HEAD_SIZE;
+    float inv         = 1.0f / v_descale[b * num_heads + h];
+
+    for(int idx = threadIdx.x; idx < (t_end - t_start) * HEAD_SIZE; idx += BT)
+    {
+        int local_t = idx / HEAD_SIZE;
+        int d       = idx % HEAD_SIZE;
+        int t       = t_start + local_t;
+        int64_t out_off = ((int64_t)b * total_tokens + t) * slab_h_stride +
+                          (int64_t)h * HEAD_SIZE + d;
+        float val;
+        if(t < num_tokens0)
+        {
+            int64_t in_off = ((int64_t)b * num_tokens0 + t) * slab_h_stride +
+                             (int64_t)h * HEAD_SIZE + d;
+            val = (float)v0_[in_off];
+        }
+        else
+        {
+            int t1         = t - num_tokens0;
+            int64_t in_off = ((int64_t)b * num_tokens1 + t1) * slab_h_stride +
+                             (int64_t)h * HEAD_SIZE + d;
+            val = (float)v1_[in_off];
+        }
+        v_fp8_[out_off] = mrope_utils::fp8e4m3fnuz(val * inv);
+    }
+}
+
+void v_2way_per_head_fp8_quant(aiter_tensor_t& v0,
+                               aiter_tensor_t& v1,
+                               aiter_tensor_t& v_fp8,
+                               aiter_tensor_t& v_descale)
+{
+    AITER_CHECK(v0.is_contiguous() && v1.is_contiguous());
+    AITER_CHECK(v_fp8.is_contiguous() && v_descale.is_contiguous());
+    AITER_CHECK(v0.ndim == 4 && v1.ndim == 4, "v0/v1 must be 4D [B, T, H, D]");
+    int64_t batch_size  = v0.size(0);
+    int64_t num_tokens0 = v0.size(1);
+    int64_t num_tokens1 = v1.size(1);
+    int64_t num_heads   = v0.size(2);
+    int64_t head_size   = v0.size(3);
+    AITER_CHECK(v1.size(0) == batch_size && v1.size(2) == num_heads &&
+                    v1.size(3) == head_size,
+                "v0/v1 must share B/H/D");
+    AITER_CHECK(head_size == 128,
+                "v_2way_per_head_fp8_quant currently only supports head_size=128");
+    AITER_CHECK(v0.dtype() == v1.dtype(), "v0/v1 dtype must match");
+    AITER_CHECK(v_fp8.dtype() == AITER_DTYPE_fp8, "v_fp8 must be fp8");
+    AITER_CHECK(v_descale.dtype() == AITER_DTYPE_fp32, "v_descale must be fp32");
+
+    HipDeviceGuard device_guard(v0.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    AiterTensor v_amax =
+        AiterTensor::empty({batch_size, num_heads}, AITER_DTYPE_fp32, v0.device_id, stream);
+
+    constexpr int TILE_T    = 128;
+    constexpr int HEAD_SIZE = 128;
+    int num_tiles           = (int)((num_tokens0 + num_tokens1 + TILE_T - 1) / TILE_T);
+    dim3 grid((unsigned)num_tiles, (unsigned)num_heads, (unsigned)batch_size);
+    dim3 block(256);
+
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        v0.dtype(), "v_2way_per_head_amax_tiled", [&] {
+            v_2way_per_head_amax_tiled_kernel<scalar_t, TILE_T, HEAD_SIZE>
+                <<<grid, block, 0, stream>>>(
+                    reinterpret_cast<scalar_t*>(v0.data_ptr()),
+                    reinterpret_cast<scalar_t*>(v1.data_ptr()),
+                    (int)num_tokens0,
+                    (int)num_tokens1,
+                    (int)num_heads,
+                    reinterpret_cast<float*>(v_amax.data_ptr()));
+        });
+
+    {
+        dim3 fg((unsigned)((num_heads + 31) / 32), (unsigned)batch_size);
+        dim3 fb(32);
+        v_amax_to_descale_kernel<<<fg, fb, 0, stream>>>(
+            reinterpret_cast<float*>(v_amax.data_ptr()),
+            (int)num_heads,
+            reinterpret_cast<float*>(v_descale.data_ptr()));
+    }
+
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        v0.dtype(), "v_2way_per_head_quant_tiled", [&] {
+            v_2way_per_head_quant_tiled_kernel<scalar_t, TILE_T, HEAD_SIZE>
+                <<<grid, block, 0, stream>>>(
+                    reinterpret_cast<scalar_t*>(v0.data_ptr()),
+                    reinterpret_cast<scalar_t*>(v1.data_ptr()),
+                    (int)num_tokens0,
+                    (int)num_tokens1,
+                    (int)num_heads,
+                    reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(v_fp8.data_ptr()),
+                    reinterpret_cast<float*>(v_descale.data_ptr()));
+        });
+}
 
 } // namespace aiter

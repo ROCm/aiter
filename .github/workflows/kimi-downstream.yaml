@@ -1,0 +1,146 @@
+name: Kimi Downstream Test
+
+# End-to-end Kimi-K2.5-MXFP4 accuracy regression for AITER against the official
+# nightly downstream serving images:
+#   vLLM   -> rocm/vllm-dev:nightly                 (upstream-native KimiK25)
+#   SGLang -> lmsysorg/sglang-rocm:<mi35x rocm720>  (upstream-native kimi_k25)
+#
+# The PR's AITER is built from source into the image at runtime (gfx950), then a
+# self-contained launcher runs gsm8k. The ATOM (in-tree) path is covered in
+# atom-test.yaml.
+#
+# Verified on MI350X (gfx950) TP8, gsm8k 3-shot flexible-extract, threshold 0.92:
+#   vLLM   2026-05-30 aiter ef114b0d4  -> 0.9409
+#   SGLang 2026-05-31 aiter 1ec891b44  -> 0.9272  (--attention-backend aiter +
+#          --disable-shared-experts-fusion; see kimi_sglang_accuracy.sh header)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 19 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  kimi-downstream:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:kimi') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:sglang') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    name: Kimi-K2.5 (${{ matrix.backend }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: vllm
+            # Official ROCm vLLM nightly (floating tag).
+            base_image: rocm/vllm-dev:nightly
+            script: kimi_vllm_accuracy.sh
+            continue_on_error: false
+          - backend: sglang
+            # Official ROCm SGLang image. lmsysorg/sglang-rocm has no floating
+            # nightly tag; pin to the latest MI35X / ROCm7.2 date build and bump
+            # periodically. See https://hub.docker.com/r/lmsysorg/sglang-rocm/tags
+            base_image: lmsysorg/sglang-rocm:v0.5.12.post1-rocm720-mi35x-20260531
+            script: kimi_sglang_accuracy.sh
+            # Blocking. Two SGLang-side bugs in this Kimi-K2.5 path on MI350X
+            # (gfx950) are worked around in the launcher (kimi_sglang_accuracy.sh):
+            #  1) MoE loader: shared-experts fusion vs unfused per-expert Quark
+            #     MXFP4 shard shape -> _load_w13 copy_ mismatch 3584 vs 7168.
+            #     Fixed with --disable-shared-experts-fusion.
+            #  2) MLA forward: SGLang's default triton/fused-MLA path
+            #     (forward_mla_fused_rope_rocm.py) crashes on Kimi-K2.5 head dims
+            #     ("batch2 ... [8,128] but got [8,64]"); fp8 KV cache instead dies
+            #     in decode on the triton fp8 dot. Fixed by routing attention
+            #     through AITER's MLA backend (--attention-backend aiter) + bf16
+            #     KV cache. This exercises the PR's AITER kernels end to end.
+            # Verified on MI350X (gfx950) TP8, aiter 1ec891b44: gsm8k 3-shot
+            # flexible-extract 0.9272 (strict 0.9265). Threshold 0.92.
+            continue_on_error: false
+    runs-on: linux-aiter-mi35x-8
+    continue-on-error: ${{ matrix.continue_on_error }}
+    timeout-minutes: 180
+    env:
+      MODEL_PATH: "amd/Kimi-K2.5-MXFP4"
+      ACC_THRESHOLD: "0.92"
+      CONTAINER: "kimi_${{ matrix.backend }}_aiter_test"
+    steps:
+      - name: Checkout AITER (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Pull base image
+        run: docker pull ${{ matrix.base_image }}
+
+      - name: Start CI container
+        run: |
+          docker ps -aq -f name=${CONTAINER} | xargs -r docker stop | xargs -r docker rm
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+            --ipc=host --group-add video --shm-size=16G --privileged \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 \
+            --network=host \
+            -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
+            -v "${{ github.workspace }}:/workspace" -w /workspace \
+            -v /models:/models \
+            --name ${CONTAINER} \
+            ${{ matrix.base_image }}
+          docker exec ${CONTAINER} git config --global --add safe.directory /workspace || true
+
+      - name: Build & install PR AITER (gfx950)
+        run: |
+          docker exec ${CONTAINER} bash -lc '
+            set -e
+            pip uninstall -y amd-aiter aiter 2>/dev/null || true
+            pip install --upgrade "pybind11>=3.0.1"
+            cd /workspace
+            MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e .
+            (pip show amd-aiter || pip show aiter) | grep -E "^Version|^Location" || true
+          '
+
+      - name: Run Kimi-K2.5 gsm8k accuracy
+        timeout-minutes: 120
+        run: |
+          set -uo pipefail
+          docker exec ${CONTAINER} bash -lc '
+            chmod +x /workspace/.github/scripts/${{ matrix.script }}
+            bash /workspace/.github/scripts/${{ matrix.script }}
+          ' 2>&1 | tee kimi_${{ matrix.backend }}_output.txt
+
+      - name: Check gsm8k threshold
+        run: |
+          val=$(grep -oE 'KIMI_FLEX_EXTRACT=[0-9.]+' kimi_${{ matrix.backend }}_output.txt | tail -1 | cut -d= -f2)
+          if [ -z "$val" ]; then echo "ERROR: no KIMI_FLEX_EXTRACT in output"; exit 2; fi
+          echo "Kimi-K2.5 ${{ matrix.backend }} flexible-extract=${val} threshold=${ACC_THRESHOLD}"
+          if awk -v v="$val" -v t="${ACC_THRESHOLD}" 'BEGIN{exit (v<t)?0:1}'; then
+            echo "Accuracy test FAILED: ${val} < ${ACC_THRESHOLD}"; exit 1
+          fi
+          echo "Accuracy test PASSED: ${val} >= ${ACC_THRESHOLD}"
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-${{ matrix.backend }}-output
+          path: kimi_${{ matrix.backend }}_output.txt
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker stop ${CONTAINER} || true
+          docker rm ${CONTAINER} || true
