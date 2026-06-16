@@ -3769,6 +3769,211 @@ def test_batch_prefill_sink(
     )
 
 
+# ===========================================================================
+# ASM qkptph/vph FP8 causal paged batch-prefill kernel (module
+# module_mha_batch_prefill_asm). Self-contained: builds paged inputs in the
+# exact layout the asm launcher consumes (packed-Q via cu_seqlens, vec_k_col_v
+# K, column-major V, per-token-head q/k descales, per-head v descale, optional
+# p_scale, SGLang 1D page table) and validates against an fp32 reference whose
+# math mirrors scripts/f8_fmha_prefill/fwd_fp8.cpp (poc_kl).
+# ===========================================================================
+from aiter.ops.mha_batch_prefill_asm import mha_batch_prefill_asm
+
+_ASM_FP8 = dtypes.fp8
+_ASM_FP8_MAX = float(torch.finfo(_ASM_FP8).max)
+_ASM_PAGE = 16
+_ASM_VECX = 16  # FP8 128-bit vector width; equals page size
+
+
+def _asm_quant_per_row(x):
+    """Per-(row) symmetric fp8 quant over the last dim. Returns (fp8, descale)."""
+    amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+    descale = (amax / _ASM_FP8_MAX).to(torch.float32)
+    xq = (x / descale).to(_ASM_FP8)
+    return xq, descale.squeeze(-1)
+
+
+def _asm_reference(qf8, kf8, vf8, q_desc, k_desc, v_desc, p_scale, scale, gqa):
+    """fp32 reference for one batch element. Shapes:
+    qf8 [sq,hq,d], kf8/vf8 [sk,hk,d], q_desc [sq,hq], k_desc [sk,hk],
+    v_desc [hk], p_scale [hq] or None. Returns out [sq,hq,d] fp32.
+    """
+    sq, hq, d = qf8.shape
+    sk, hk, _ = kf8.shape
+    qd = qf8.float() * q_desc[..., None]            # [sq,hq,d]
+    kd = kf8.float() * k_desc[..., None]            # [sk,hk,d]
+    vd = vf8.float() * v_desc[None, :, None]        # [sk,hk,d]
+    out = torch.empty(sq, hq, d, dtype=torch.float32, device=qf8.device)
+    # Bottom-right causal mask (sq==sk here): key k visible to query q if k<=q.
+    qidx = torch.arange(sq, device=qf8.device)[:, None]
+    kidx = torch.arange(sk, device=qf8.device)[None, :]
+    mask = kidx > (qidx + (sk - sq))
+    for h in range(hq):
+        hk_i = h // gqa
+        scores = (qd[:, h] @ kd[:, hk_i].transpose(0, 1)) * scale  # [sq,sk]
+        scores = scores.masked_fill(mask, float("-inf"))
+        m = scores.amax(dim=-1, keepdim=True)
+        p = torch.exp(scores - m)
+        if p_scale is not None:
+            p = p * p_scale[h]
+        denom = p.sum(dim=-1, keepdim=True).clamp(min=1e-20)
+        p_deq = p.to(_ASM_FP8).float()              # P quantized to fp8 for PV
+        acc = p_deq @ vd[:, hk_i]                    # [sq,d]
+        out[:, h] = acc / denom
+    return out
+
+
+def _asm_pack_paged_kv(kf8_list, vf8_list, kdesc_list, num_heads_k, head_dim):
+    """Scatter per-batch BHSD-style fp8 K/V (and K-descale) into paged pools with
+    an identity LTD. Returns dict of tensors the launcher consumes."""
+    dev = kf8_list[0].device
+    page, x = _ASM_PAGE, _ASM_VECX
+    ppb = [(kf8.shape[0] + page - 1) // page for kf8 in kf8_list]
+    num_pages = sum(ppb)
+    kv_indptr = torch.tensor([0, *list(itertools.accumulate(ppb))], dtype=torch.int32, device=dev)
+    kv_page_indices = torch.arange(num_pages, dtype=torch.int32, device=dev)  # identity LTD
+    seqlens_kvcache = torch.tensor([kf8.shape[0] for kf8 in kf8_list], dtype=torch.int32, device=dev)
+
+    k_pool = torch.zeros(num_pages, num_heads_k, head_dim // x, page, x, dtype=_ASM_FP8, device=dev)
+    v_pool = torch.zeros(num_pages, num_heads_k, head_dim, page, dtype=_ASM_FP8, device=dev)
+    kdesc_pool = torch.zeros(num_pages, page, num_heads_k, dtype=torch.float32, device=dev)
+
+    for b, (kf8, vf8, kdesc) in enumerate(zip(kf8_list, vf8_list, kdesc_list)):
+        sk = kf8.shape[0]
+        base = kv_indptr[b].item()
+        for t in range(sk):
+            phys = base + t // page          # identity LTD
+            row = t % page
+            # K: [phys, hk, d//x, row, d%x]
+            kt = kf8[t].view(num_heads_k, head_dim // x, x)  # [hk, d/x, x]
+            k_pool[phys, :, :, row, :] = kt
+            # V: [phys, hk, d, row]
+            v_pool[phys, :, :, row] = vf8[t]  # [hk, d]
+            # K-descale: [phys, row, hk]
+            kdesc_pool[phys, row, :] = kdesc[t]
+    return dict(
+        k_pool=k_pool, v_pool=v_pool, kdesc_pool=kdesc_pool,
+        kv_indptr=kv_indptr, kv_page_indices=kv_page_indices,
+        seqlens_kvcache=seqlens_kvcache, num_pages=num_pages,
+    )
+
+
+def run_batch_prefill_asm(seqlens, num_qo_heads=8, num_kv_heads=1, head_dim=128,
+                          use_p_scale=True, seed=0, bench=False, warmup=10, iters=50):
+    """Drive mha_batch_prefill_asm for the given per-batch seqlens (prefill:
+    qo_len==kv_len per batch) and validate against the fp32 reference. When
+    bench=True, also time the kernel and report latency + TFLOPS."""
+    torch.manual_seed(seed)
+    dev = "cuda"
+    batch = len(seqlens)
+    gqa = num_qo_heads // num_kv_heads
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q_packed, qdesc_packed, out_ref_packed = [], [], []
+    kf8_list, vf8_list, kdesc_list = [], [], []
+    v_desc = (torch.rand(num_kv_heads, device=dev) * 0.5 + 0.5).to(torch.float32)
+    p_scale = (
+        (torch.rand(num_qo_heads, device=dev) * 0.5 + 0.75).to(torch.float32)
+        if use_p_scale else None
+    )
+
+    for s in seqlens:
+        q = torch.randn(s, num_qo_heads, head_dim, device=dev)
+        k = torch.randn(s, num_kv_heads, head_dim, device=dev)
+        v = torch.randn(s, num_kv_heads, head_dim, device=dev)
+        qf8, qdesc = _asm_quant_per_row(q)              # [s,hq,d],[s,hq]
+        kf8, kdesc = _asm_quant_per_row(k)              # [s,hk,d],[s,hk]
+        # V descale is per-kv-head only (launcher v_descale [hk]).
+        vf8 = (v / v_desc[None, :, None]).to(_ASM_FP8)
+        q_packed.append(qf8)
+        qdesc_packed.append(qdesc)
+        kf8_list.append(kf8)
+        vf8_list.append(vf8)
+        kdesc_list.append(kdesc)
+        out_ref_packed.append(
+            _asm_reference(qf8, kf8, vf8, qdesc, kdesc, v_desc, p_scale, scale, gqa)
+        )
+
+    q_packed = torch.cat(q_packed, dim=0).contiguous()          # [total_q,hq,d]
+    qdesc_packed = torch.cat(qdesc_packed, dim=0).contiguous()  # [total_q,hq]
+    out_ref = torch.cat(out_ref_packed, dim=0)                  # [total_q,hq,d]
+    cu_seqlens_q = torch.tensor([0, *list(itertools.accumulate(seqlens))],
+                                dtype=torch.int32, device=dev)
+    paged = _asm_pack_paged_kv(kf8_list, vf8_list, kdesc_list, num_kv_heads, head_dim)
+
+    out = torch.empty_like(q_packed, dtype=torch.bfloat16)
+
+    def _launch():
+        mha_batch_prefill_asm(
+            q_packed, paged["k_pool"], paged["v_pool"],
+            cu_seqlens_q, paged["kv_indptr"], paged["kv_page_indices"],
+            paged["seqlens_kvcache"], out,
+            qdesc_packed, paged["kdesc_pool"], v_desc,
+            batch, num_qo_heads, num_kv_heads, head_dim, head_dim,
+            _ASM_PAGE, paged["num_pages"], max(seqlens), scale,
+            p_scale=p_scale,
+        )
+
+    _launch()
+
+    out_f = out.float()
+    diff = out_f - out_ref
+    nrms = (diff.pow(2).sum() / out_ref.pow(2).sum().clamp(min=1e-20)).sqrt().item()
+    max_abs = diff.abs().max().item()
+
+    latency_ms = None
+    tflops = None
+    if bench:
+        for _ in range(warmup):
+            _launch()
+        torch.cuda.synchronize()
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
+        for _ in range(iters):
+            _launch()
+        end.record()
+        torch.cuda.synchronize()
+        latency_ms = start.elapsed_time(end) / iters
+        # Causal FLOPs: per batch sum_q (q+1) score pairs * 2*(d_qk+d_v) (QK + PV).
+        score_pairs = sum(s * (s + 1) / 2 for s in seqlens)
+        flops = num_qo_heads * score_pairs * (head_dim + head_dim) * 2.0
+        tflops = flops / (latency_ms * 1e-3) / 1e12
+
+    msg = (f"[asm] seqlens={seqlens} hq={num_qo_heads} hk={num_kv_heads} "
+           f"p_scale={use_p_scale} NRMS={nrms:.4e} max_abs={max_abs:.4e}")
+    if bench:
+        msg += f" | latency={latency_ms:.4f} ms  {tflops:.1f} TFLOPS"
+    print(msg)
+    assert nrms < 0.06, f"asm kernel vs reference NRMS too high: {nrms:.4e}"
+    return dict(nrms=nrms, max_abs=max_abs, latency_ms=latency_ms, tflops=tflops)
+
+
+@pytest.mark.skipif(get_gpu_arch() != "gfx942", reason="asm qkptph/vph kernel is gfx942-only")
+@pytest.mark.parametrize("use_p_scale", [False, True])
+@pytest.mark.parametrize("seqlen", [256, 512])
+def test_batch_prefill_asm_batched(seqlen, use_p_scale):
+    # Batched / b=1 path (varlen kernel with a single [0, S] segment).
+    run_batch_prefill_asm([seqlen], use_p_scale=use_p_scale, seed=11)
+
+
+@pytest.mark.skipif(get_gpu_arch() != "gfx942", reason="asm qkptph/vph kernel is gfx942-only")
+@pytest.mark.parametrize("use_p_scale", [False, True])
+@pytest.mark.parametrize("seqlens", [[256, 512], [512, 256, 384]])
+def test_batch_prefill_asm_varlen(seqlens, use_p_scale):
+    # Varlen: distinct per-batch sequence lengths.
+    run_batch_prefill_asm(seqlens, use_p_scale=use_p_scale, seed=23)
+
+
+# Perf sweep: b=1 latency/TFLOPS at increasing context, reporting NRMS + runtime.
+# Opt-in (it is a benchmark, not a correctness gate) via AITER_ASM_PERF=1.
+@pytest.mark.skipif(get_gpu_arch() != "gfx942", reason="asm qkptph/vph kernel is gfx942-only")
+@pytest.mark.skipif(os.environ.get("AITER_ASM_PERF") != "1",
+                    reason="perf sweep; set AITER_ASM_PERF=1 to run")
+@pytest.mark.parametrize("seqlen", [512, 1024, 2048, 4096, 8192, 16384, 32768])
+def test_batch_prefill_asm_perf(seqlen):
+    run_batch_prefill_asm([seqlen], use_p_scale=True, seed=31, bench=True)
+
+
 # CI runs `python3 test_batch_prefill.py` (no pytest), so the __main__ block
 # above only executes the non-sink scenarios. Add a small representative sweep
 # of the StreamLLM sink scenarios here so they actually exercise in CI.
@@ -3796,3 +4001,14 @@ if __name__ == "__main__":
             dtype=dtype,
             seed=42,
         )
+
+    # ASM qkptph/vph FP8 causal paged kernel (gfx942 only).
+    if get_gpu_arch() == "gfx942":
+        if os.environ.get("AITER_ASM_PERF") == "1":
+            # Perf sweep: b=1 latency/TFLOPS (+ NRMS) at increasing context.
+            for s in (512, 1024, 2048, 4096, 8192, 16384, 32768):
+                run_batch_prefill_asm([s], use_p_scale=True, seed=31, bench=True)
+        else:
+            for sl in ([512], [256, 512], [512, 256, 384]):
+                for ps in (False, True):
+                    run_batch_prefill_asm(sl, use_p_scale=ps, seed=7)
