@@ -88,7 +88,9 @@ template<int BLOCK_SIZE_,
          int B_M_, int B_N_, int B_K_,
          int LAYOUT_,
          typename D_A_, typename D_B_, typename D_C_, typename D_ACC_,
-         bool ENABLE_BIAS_ = false>
+         bool ENABLE_BIAS_ = false,
+         int NUM_SLOTS_ = 3,
+         int WG_PER_CU_ = 2>
 struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;   // 128 (4 waves x 32)
     static constexpr int B_M = B_M_;
@@ -176,14 +178,44 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static constexpr int kBRows = kBlockN;                       // w1 loads all B rows
     static constexpr int kSlotElemsA = kARows * kSmemPitch;
     static constexpr int kSlotElemsB = kBRows * kSmemPitch;
-    static constexpr int kNumSlots = 3;                          // triple buffer
+    // Prefetch depth P (number of LDS slots == in-flight TDM count). Runtime
+    // config: the producer keeps exactly kNumSlots TDMs in flight (decoupled
+    // run-ahead, s_wait_tensorcnt(kNumSlots-1)). Lower P reduces the in-flight
+    // direct-copy TDM request count req = rows * P * (B_K/128) per operand,
+    // which must stay under the hardware direct-copy limit (256 / SIMD-pair;
+    // < 128 per operand for 2 WG/CU co-residency). The codegen picks P per tile
+    // to satisfy this -- see _ctdm_pick_num_slots() in opus_gemm_common.py.
+    static constexpr int kNumSlots = NUM_SLOTS_;                 // prefetch depth P (2 or 3)
+    static_assert(kNumSlots == 2 || kNumSlots == 3,
+                  "kNumSlots (prefetch depth P) must be 2 or 3");
+
+    // Target WG/CU co-residency. When the in-flight TDM request count
+    // (rows * P * B_K*2/256 per operand) would exceed the 2-WG safe budget
+    // (< 128/operand) but LDS could still fit 2 WG, we MUST force 1 WG/CU so two
+    // workgroups don't oversubscribe a SIMD-pair's 256-request direct-copy budget
+    // (which deadlocks the TDM engine). The codegen sets this per (tile,P) -- see
+    // _ctdm_pick_configs() in opus_gemm_common.py. 1 WG/CU is enforced portably
+    // via LDS padding below (a WG using > 160 KB LDS leaves no room for a second
+    // on the 320 KB/CU budget), avoiding fragile occupancy attributes.
+    static constexpr int kWgPerCu = WG_PER_CU_;
+    static_assert(kWgPerCu == 1 || kWgPerCu == 2, "kWgPerCu must be 1 or 2");
     static constexpr int kSlotBytesA = kSlotElemsA * (int)sizeof(DataA);
     static constexpr int kSlotBytesB = kSlotElemsB * (int)sizeof(DataB);
 
     static constexpr int kSegBytesA = kNumSlots * kSlotElemsA * (int)sizeof(DataA);
     static constexpr int kSegBytesB = kNumSlots * kSlotElemsB * (int)sizeof(DataB);
-    // gfx1250 LDS max ~320KB (give up 2 WG/CU co-residency for the large tiles).
-    static_assert(kSegBytesA + kSegBytesB <= 320 * 1024, "LDS exceeds 320KB");
+    // Real A/B LDS footprint.
+    static constexpr int kSegBytesAB = kSegBytesA + kSegBytesB;
+    // 1-WG/CU enforcement via LDS padding: if this instance must run 1 WG/CU
+    // (kWgPerCu==1) but its A/B LDS would otherwise fit two WGs (<= 160 KB), pad
+    // the shared allocation past 160 KB so only one WG fits on the 320 KB/CU
+    // budget. (The pad tail is never accessed.) When kWgPerCu==2 or the tile is
+    // already > 160 KB, no pad is added.
+    static constexpr int kHalfLds = 160 * 1024;
+    static constexpr int kLdsTotalBytes =
+        (kWgPerCu == 1 && kSegBytesAB <= kHalfLds) ? (kHalfLds + 1024) : kSegBytesAB;
+    // gfx1250 LDS max ~320KB.
+    static_assert(kLdsTotalBytes <= 320 * 1024, "LDS exceeds 320KB");
 
     // Workspace plain store: fp32 dwordx4.
     static constexpr int kCVec = 16 / (int)sizeof(DataAcc);      // 4 (fp32)

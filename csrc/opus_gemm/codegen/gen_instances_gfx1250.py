@@ -140,13 +140,16 @@ def gen_cluster_tdm_splitk_ws_instance(
     }}
 """
 
+    num_slots = getattr(k, "num_slots", 3)
+    wg_per_cu = getattr(k, "wg_per_cu", 2)
     traits_aliases = f"""
 template <typename D_C>
 using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     {k.B_M}, {k.B_N}, {k.B_K},
     {layout_int},
     {da}, {db}, D_C, fp32_t,
-    {enable_bias_str}>;
+    {enable_bias_str},
+    {num_slots}, {wg_per_cu}>;
 """
 
     INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT

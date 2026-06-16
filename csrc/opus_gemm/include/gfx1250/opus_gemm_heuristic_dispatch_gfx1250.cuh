@@ -15,24 +15,33 @@
 // HEURISTIC_DEFAULT_KIDS_GFX1250.
 #pragma once
 
-// Kid map (see opus_gemm_common.py; B_K=128 picks here, tuner explores 256/512):
-//   tileN (B_M=16, B_N=32): 20000 (B_K=128)
-//   tileM (B_M=32)        : 20010=32x32, 20011=32x64, 20012=32x128, 20013=32x256
+// Kid map (B_K=128 chosen here; tuner explores B_K 256/512 + the P/wg space).
+// Tiles whose per-TDM direct-copy request count (rows*B_K*2/256) hits the 256
+// SIMD-pair limit on some operand are NOT generated (e.g. 32x256x128) so the
+// heuristic must not return them. All returned kids are no-cluster prefetch-3.
+//   tileN (B_M=16): 20000=16x32, 20024=16x64, 20032=16x128
+//   tileM (B_M=32): 20040=32x32, 20048=32x64, 20056=32x128
+// MUST stay in sync with opus_gemm_common.py :: gfx1250_kernels_list and
+// GFX1250_BASE_KIDS (regenerated; kid numbers are NOT contiguous).
 inline int opus_a16w16_heuristic_kid_gfx1250(int M, int N, int K, bool has_bias)
 {
     (void)K;
     (void)has_bias;  // bias is folded by the reduce kernel for every kid.
 
     // M >= 32 (and M % 32 == 0) -> tileM (B_M=32); widest B_N that divides N.
+    // (32x256 is unavailable -- per-TDM B req = 256 hits the direct-copy limit;
+    // fall through to the B_M=16 tileN family for N % 256 == 0.)
     if (M % 32 == 0)
     {
-        if (N % 256 == 0) return 20013;  // 32x256
-        if (N % 128 == 0) return 20012;  // 32x128
-        if (N % 64 == 0)  return 20011;  // 32x64
-        if (N % 32 == 0)  return 20010;  // 32x32
+        if (N % 128 == 0) return 20056;  // 32x128x128
+        if (N % 64 == 0)  return 20048;  // 32x64x128
+        if (N % 32 == 0)  return 20040;  // 32x32x128
     }
 
-    // Small M (M % 16 == 0) -> tileN 16x32 (requires N % 32 == 0). Otherwise
-    // the launcher rejects the shape (ragged M/N unsupported on this family).
-    return 20000;  // 16x32x128
+    // Small M (or N not tileM-friendly) -> tileN family (B_M=16). Ragged M/N is
+    // handled by the TDM row/col clamp + padded workspace, so the smallest
+    // 16x32 tile is always a valid fallback.
+    if (N % 128 == 0) return 20032;  // 16x128x128
+    if (N % 64 == 0)  return 20024;  // 16x64x128
+    return 20000;                    // 16x32x128
 }

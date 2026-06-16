@@ -71,6 +71,14 @@ class OpusGemmInstance:
     # "tileM" (split M). Only consumed by the a16w16_cluster_tdm_splitk_ws tag.
     ctdm_layout: str = "tileN"
 
+    # gfx1250 cluster_tdm_splitk_ws prefetch depth P (== LDS slots == in-flight
+    # TDM count; producer keeps exactly this many TDMs in flight). 2 or 3.
+    num_slots: int = 3
+    # gfx1250 cluster_tdm_splitk_ws target WG/CU co-residency (1 or 2). 1 is
+    # enforced via LDS padding in the traits; chosen by _ctdm_pick_configs() so
+    # two WGs never oversubscribe a SIMD-pair's 256-request direct-copy budget.
+    wg_per_cu: int = 2
+
     @property
     def name(self) -> str:
         parts = [
@@ -102,6 +110,9 @@ class OpusGemmInstance:
             # The T_M x T_N segment (1x2 for tileN, 2x1 for tileM) keeps the name
             # unique between the two consumer-tiling layouts.
             parts.insert(tag_at, "splitk_cluster_tdm_ws")
+            # Prefetch depth P and WG/CU occupancy make each (tile, P, wg) symbol
+            # unique (the producer + LDS-pad differ by these).
+            parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
         elif self.name_tag:
             parts.insert(tag_at, self.name_tag)
         elif self.kernel_tag in _GFX942_KERNEL_NAME_TAGS:
@@ -710,7 +721,7 @@ gfx942_kernels_list = {**gfx942_nosplit_kernels_list, **gfx942_splitk_kernels_li
 GFX1250_KID_OFFSET = 20000
 
 
-def _a16w16_cluster_tdm_splitk_ws_gfx1250(bm, bn, bk, layout):
+def _a16w16_cluster_tdm_splitk_ws_gfx1250(bm, bn, bk, layout, num_slots=3, wg_per_cu=2):
     """Factory for the gfx1250 a16w16 cluster/TDM split-K (workspace + reduce) kid.
 
     Locked geometry from the kernel base
@@ -738,7 +749,46 @@ def _a16w16_cluster_tdm_splitk_ws_gfx1250(bm, bn, bk, layout):
         ["fp32_t"],
         arch_prefix="gfx1250",
         ctdm_layout=layout,
+        num_slots=num_slots,
+        wg_per_cu=wg_per_cu,
     )
+
+
+def _ctdm_pick_configs(bm, bn, bk):
+    """Resource-feasible (P, wg_per_cu) configs for a gfx1250 cluster_tdm tile.
+
+    Hardware prerequisites (gfx1250, per CU):
+      * Direct-copy TDM budget: 256 256-byte requests per SIMD-pair (A and B sit
+        on separate pairs). The per-TDM (one B_K slot) request count is
+            req = rows * B_K * 2 / 256        (rows = B_M for A, B_N for B)
+        2 WG/CU share a pair UNCONTROLLED -> each operand must be < 128; a single
+        WG must be < 256. (req == 256 deadlocks the TDM engine -- the original
+        32x256x128 hang.)
+      * LDS: 320 KB / CU. LDS(P) = P * (B_M + B_N) * (B_K + 8) * 2 bytes.
+        2 WG/CU need LDS(P) <= 160 KB; 1 WG/CU needs <= 320 KB.
+      * VGPR (1024/SIMD, 512/wave at 2 WG/CU) is not the binding constraint for
+        the current tiles and is left to the compiler.
+
+    Returns a list of (num_slots P, wg_per_cu) for P in {3, 2}, picking the max
+    feasible wg per P. Empty if the tile cannot run at any P (req >= 256).
+    """
+    rpr = bk // 128                       # 256B-req rows-multiplier (B_K/128)
+    req_a = bm * rpr                       # per-TDM A request count
+    req_b = bn * rpr                       # per-TDM B request count
+    pitch = bk + 8                         # bf16 padded row pitch
+    out = []
+    # Prefetch depth P in {3, 2}: the run-ahead producer supports both (lower P
+    # = lower LDS, can enable 2 WG/CU when P=3 LDS > 160 KB).
+    for P in (3, 2):
+        lds = P * (bm + bn) * pitch * 2
+        if lds > 320 * 1024:
+            continue                       # won't fit even 1 WG/CU
+        if req_a < 128 and req_b < 128 and lds <= 160 * 1024:
+            out.append((P, 2))             # 2 WG/CU safe
+        elif req_a < 256 and req_b < 256:
+            out.append((P, 1))             # force 1 WG/CU (LDS-pad in traits)
+        # else: req >= 256 on some operand -> not runnable at this P
+    return out
 
 
 # Initial tile set seeded from the feasible no-cluster sweep
@@ -757,25 +807,53 @@ def _a16w16_cluster_tdm_splitk_ws_gfx1250(bm, bn, bk, layout):
 #   (b) tileN with kExpN>1 (B_N>32, kTileN=2) -> wrong values: the B-read
 #       N-decomposition order (make_layout_rb_ctdm) disagreed with the C-store
 #       order; B now mirrors A (kExpN outer, kTileN=wave_n inner).
-gfx1250_kernels_list = {
-    # -- tileN family (B_M=16, kExpN = B_N/32) -- small M --
-    20000: _a16w16_cluster_tdm_splitk_ws_gfx1250( 16, 32, 128, "tileN"),
-    20001: _a16w16_cluster_tdm_splitk_ws_gfx1250( 16, 32, 256, "tileN"),
-    20002: _a16w16_cluster_tdm_splitk_ws_gfx1250( 16, 32, 512, "tileN"),
-    # -- tileM family (B_M=32, kExpM=1; any B_N) -- generalizes M --
-    20010: _a16w16_cluster_tdm_splitk_ws_gfx1250( 32,  32, 128, "tileM"),
-    20011: _a16w16_cluster_tdm_splitk_ws_gfx1250( 32,  64, 128, "tileM"),
-    20012: _a16w16_cluster_tdm_splitk_ws_gfx1250( 32, 128, 128, "tileM"),
-    20013: _a16w16_cluster_tdm_splitk_ws_gfx1250( 32, 256, 128, "tileM"),
-    20014: _a16w16_cluster_tdm_splitk_ws_gfx1250( 32,  64, 256, "tileM"),
-    20015: _a16w16_cluster_tdm_splitk_ws_gfx1250( 32, 128, 256, "tileM"),
-    # NOTE: 32x256x256 omitted -- LDS (~445KB) exceeds the 320KB gfx1250 budget.
-    # -- generalized tiles (kExpM>1 / tileN kExpN>1) -- validated post-fix --
-    20020: _a16w16_cluster_tdm_splitk_ws_gfx1250( 64,  16, 128, "tileM"),  # kExpM=2, kExpN=1
-    20021: _a16w16_cluster_tdm_splitk_ws_gfx1250( 64,  64, 128, "tileM"),  # kExpM=2, kExpN=4
-    20022: _a16w16_cluster_tdm_splitk_ws_gfx1250( 16,  64, 128, "tileN"),  # kExpM=1, kExpN=2
-    20023: _a16w16_cluster_tdm_splitk_ws_gfx1250( 16, 128, 128, "tileN"),  # kExpM=1, kExpN=4
-}
+# Candidate tiles (B_M, B_N, B_K, layout). Each is expanded across its
+# resource-feasible (P, wg_per_cu) configs by _ctdm_pick_configs(); tiles whose
+# per-TDM request count hits the 256 direct-copy limit on some operand (e.g.
+# 32x256x128, 32x128x256) yield no config and are dropped automatically.
+_GFX1250_CTDM_TILES = [
+    # tileN family (B_M=16)
+    (16, 32, 128, "tileN"),
+    (16, 32, 256, "tileN"),
+    (16, 32, 512, "tileN"),
+    (16, 64, 128, "tileN"),
+    (16, 128, 128, "tileN"),
+    # tileM family (B_M>=32)
+    (32, 32, 128, "tileM"),
+    (32, 64, 128, "tileM"),
+    (32, 128, 128, "tileM"),
+    (32, 64, 256, "tileM"),
+    (64, 16, 128, "tileM"),
+    (64, 64, 128, "tileM"),
+]
+
+# Deterministic kid numbering: base 20000 + tile_index*8 + config_index. Each
+# tile contributes up to 2 configs (P=3, P=2). Stride 8 keeps room.
+gfx1250_kernels_list = {}
+_GFX1250_KID_BASE = 20000
+_GFX1250_KID_STRIDE = 8
+# Stability gate: high N-register-expansion (kExpN = B_N/(16*kTileN) >= 4) tiles
+# have a NON-deterministic producer/consumer race that the current
+# tensorcnt(drain)+named-barrier+dscnt handshake cannot close (the producer
+# lacks a primitive that waits for the TDM's LDS write to become *visible* to
+# the consumer wave; the race probability scales with kExpN). kExpN<=2 is
+# reliable (stress-verified). Disable kExpN>2 kids until the producer
+# LDS-visibility handshake (DS_ATOMIC_ASYNC_BARRIER_ARRIVE) is wired up.
+# The _ti index (and thus every retained kid id) is preserved so already-tuned
+# CSV winners keep their meaning.
+_GFX1250_MAX_KEXPN = 2
+for _ti, (_bm, _bn, _bk, _layout) in enumerate(_GFX1250_CTDM_TILES):
+    _ktile_n = 1 if _layout == "tileM" else 2
+    _kexp_n = _bn // (16 * _ktile_n)
+    if _kexp_n > _GFX1250_MAX_KEXPN:
+        continue  # unstable high-expansion tile: skip (kids disabled)
+    for _ci, (_P, _wg) in enumerate(_ctdm_pick_configs(_bm, _bn, _bk)):
+        _kid = _GFX1250_KID_BASE + _ti * _GFX1250_KID_STRIDE + _ci
+        gfx1250_kernels_list[_kid] = _a16w16_cluster_tdm_splitk_ws_gfx1250(
+            _bm, _bn, _bk, _layout, num_slots=_P, wg_per_cu=_wg
+        )
+
+GFX1250_BASE_KIDS = frozenset(gfx1250_kernels_list.keys())
 
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
