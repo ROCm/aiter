@@ -398,9 +398,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
         if emit_bf16:
             raise ValueError("emit_bf16 is not supported for per-token FP8 quant")
-        total_bytes = input_.numel() * input_.element_size()
+        hidden_dim = int(input_.shape[-1])
+        element_size = input_.element_size()
+        total_bytes = input_.numel() * element_size
         if (
-            int(input_.shape[-1]) in [512, 1024, 2048, 4096]
+            (
+                hidden_dim in [512, 1024, 2048, 4096]
+                or (
+                    hidden_dim == 7168
+                    and input_.dtype in (torch.float16, torch.bfloat16)
+                )
+            )
             and total_bytes <= 4096 * 1024
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
