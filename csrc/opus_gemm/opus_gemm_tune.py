@@ -238,10 +238,7 @@ def kid_rejects_shape(k_inst, M, N, K):
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         if loops < 2 or K % B_K != 0 or padded_N != N:
             return True
-        return not any(
-            N == n_exact and M % rows == 0
-            for n_exact, rows in BF16WS_EXACT_REDUCE_SHAPES
-        )
+        return not any(N == n_exact for n_exact, _ in BF16WS_EXACT_REDUCE_SHAPES)
 
     if k_inst.kernel_tag in (
         "a16w16",

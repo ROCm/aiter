@@ -220,7 +220,7 @@ __global__ void splitk_reduce_kernel_bf16ws_fallback(
         ws_handle, c_out, split_k, M, N, batch, padded_M, padded_N, bias, bias_stride_batch);
 }
 
-// Exact-N row-block fast path: static split_k unroll, no N tail/OOB.
+// Exact-N row-block fast path: static split_k unroll, guarded M tail.
 template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_ = 8,
          typename D_WS = float, typename D_OUT = __bf16,
          bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT>
@@ -245,7 +245,7 @@ __global__ void splitk_reduce_kernel_exact_n_rowblock(
     static_assert(STEP * sizeof(D_OUT) == 16);
     static_assert(VEC % STEP == 0);
 
-    const int bm_blk = int(opus::block_id_y());  // 0 .. (M / ROWS_PER_BLOCK - 1)
+    const int bm_blk = int(opus::block_id_y());
     const int b      = int(opus::block_id_z());
     const int tid    = int(opus::thread_id_x());
 
@@ -254,6 +254,9 @@ __global__ void splitk_reduce_kernel_exact_n_rowblock(
     const int n_vec   = tid - row_off * N_VEC;
     const int m       = bm_blk * ROWS_PER_BLOCK + row_off;
     const int n_base  = n_vec * VEC;
+    if (m >= M) {
+        return;
+    }
     const D_WS* workspace = reinterpret_cast<const D_WS*>(ws_handle->ptr);
 
     opus::vector_t<float, VEC> bias_fp32;
@@ -279,11 +282,8 @@ __global__ void splitk_reduce_kernel_exact_n_rowblock(
     auto g_ws = opus::make_gmem(workspace,
                                 (unsigned int)(split_stride * SPLIT_K * sizeof(D_WS)));
 
-    opus::vector_t<float, VEC> acc;
-    #pragma unroll
-    for (int t = 0; t < VEC; ++t) acc[t] = 0.0f;
-
-    // Direct accumulation keeps the fixed split order without staging partials.
+    // Issue all SPLIT_K loads up front, matching the legacy v3 schedule.
+    opus::vector_t<float, VEC> partial[SPLIT_K];
     #pragma unroll
     for (int s = 0; s < SPLIT_K; ++s) {
         int ws_idx = ws_row_base + (int)(s * split_stride);
@@ -293,7 +293,7 @@ __global__ void splitk_reduce_kernel_exact_n_rowblock(
                 auto v8 = g_ws.template load<8>(ws_idx + g * 8);
                 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    acc[g * 8 + j] += static_cast<float>(v8[j]);
+                    partial[s][g * 8 + j] = static_cast<float>(v8[j]);
                 }
             }
         } else {
@@ -304,10 +304,19 @@ __global__ void splitk_reduce_kernel_exact_n_rowblock(
                 auto v4 = g_ws.template load<4>(ws_idx + g * 4);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    acc[g * 4 + j] += static_cast<float>(v4[j]);
+                    partial[s][g * 4 + j] = static_cast<float>(v4[j]);
                 }
             }
         }
+    }
+
+    opus::vector_t<float, VEC> acc;
+    #pragma unroll
+    for (int t = 0; t < VEC; ++t) acc[t] = partial[0][t];
+    #pragma unroll
+    for (int s = 1; s < SPLIT_K; ++s) {
+        #pragma unroll
+        for (int t = 0; t < VEC; ++t) acc[t] += partial[s][t];
     }
 
     if constexpr (HAS_BIAS) {

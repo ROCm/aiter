@@ -216,9 +216,12 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         f"<<<grid_main, block_main, 0, stream>>>(kargs);"
     )
     reduce_rowblock_prelude = """
-    // Exact-N row-block fast path: static split_k, no OOB.
+    // Exact-N row-block fast path: static split_k, guarded M tail.
     const bool reduce_rowblock_align = (padded_N == N);
 """
+    rowblock_rows_by_n = {}
+    for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS:
+        rowblock_rows_by_n.setdefault(vec * nvec, []).append(rows)
 
     def reduce_rowblock_branch(hasbias):
         hb = "true" if hasbias else "false"
@@ -232,16 +235,18 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS:
             n_exact = vec * nvec
             block_size = nvec * rows
+            rows_for_n = rowblock_rows_by_n[n_exact]
+            m_condition = "" if rows == rows_for_n[-1] else f" && (M % {rows} == 0)"
             for sk in SPLITK_REDUCE_SUPPORTED_SPLITKS:
                 kw = "if" if first else "else if"
                 first = False
                 branches.append(
-                    f"""            {kw} (reduce_rowblock_align && N == {n_exact} && (M % {rows} == 0) && split_k == {sk}) {{{{{{{{
-            dim3 grid_rowblock(1, M / {rows}, batch);
+                    f"""            {kw} (reduce_rowblock_align && N == {n_exact}{m_condition} && split_k == {sk}) {{{{{{{{
+            dim3 grid_rowblock(1, (M + {rows} - 1) / {rows}, batch);
             dim3 block_rowblock({block_size});
             splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, {workspace_ptr_type}, __bf16, {{hb}}, __bf16>
                 <<<grid_rowblock, block_rowblock, 0, stream>>>(
-                    ws_handle_,
+                    ws_handle_device_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     M, N, batch, padded_M, padded_N,
                     {{bias_arg}});
@@ -267,7 +272,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         return (
             f"{indent}{reduce_kernel}<REDUCE_VEC, REDUCE_BS, {dtype}, {hb}, {dtype}, true>\n"
             f"{indent}    <<<grid_reduce, block_reduce, 0, stream>>>(\n"
-            f"{indent}        ws_handle_,\n"
+            f"{indent}        ws_handle_device_,\n"
             f"{indent}        reinterpret_cast<{dtype}*>(Y.data_ptr()),\n"
             f"{indent}        split_k, M, N, batch, padded_M, padded_N,"
             f"{bias_args}"
@@ -283,8 +288,10 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     if bf16ws:
         fp32ws_name = k.name.replace("_bf16ws", "")
         exact_reduce_shape_conditions = " ||\n        ".join(
-            f"(N == {vec * nvec} && (M % {rows} == 0))"
-            for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS
+            f"(N == {n_exact})"
+            for n_exact in sorted(
+                {vec * nvec for vec, nvec, _ in EXACT_N_ROWBLOCK_REDUCE_CONFIGS}
+            )
         )
         bf16ws_fallback_decl = f"""
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
@@ -462,6 +469,8 @@ void
     HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
     const bool capturing = (capture_status != hipStreamCaptureStatusNone);
     extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
+    extern const opus_splitk_ws_handle* opus_splitk_ws_device_handle(hipStream_t, bool);
+    extern void opus_splitk_ws_sync_to_device(hipStream_t);
     auto* ws_handle_ = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
 
     size_t ws_bytes = (size_t)split_k * (size_t)batch
@@ -484,12 +493,15 @@ void
     HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
     ws_handle_->ptr = new_ptr;
     ws_handle_->bytes = grow_bytes;
+    opus_splitk_ws_sync_to_device(stream);
     }}
+    const auto* ws_handle_device_ =
+        opus_splitk_ws_device_handle(stream, /*allow_create=*/!capturing);
 
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a         = XQ.data_ptr();
     kargs.ptr_b         = WQ.data_ptr();
-    kargs.ws_handle     = ws_handle_;
+    kargs.ws_handle     = ws_handle_device_;
     kargs.ptr_c         = Y.data_ptr();
     kargs.ptr_bias      = ptr_bias_;
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
