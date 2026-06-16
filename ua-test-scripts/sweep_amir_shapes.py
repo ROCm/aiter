@@ -81,13 +81,17 @@ QUICK_PREFILL_SQ_SK   = [(1000, 1000), (10000, 10000)]
 
 # --- Parsing the test-script output ---------------------------------------
 
-_RE_SPLITS  = re.compile(r"num_splits=(\d+)")
-_RE_CK_T    = re.compile(r"CK time\s*=\s*([\d.]+)\s*ms")
-_RE_TRI_T   = re.compile(r"Triton time\s*=\s*([\d.]+)\s*ms")
-_RE_CK_BW   = re.compile(r"CK Bandwidth\s*=\s*([\d.]+)\s*GB/s")
-_RE_TRI_BW  = re.compile(r"Triton Bandwidth\s*=\s*([\d.]+)\s*GB/s")
-_RE_CK_TF   = re.compile(r"CK TFLOPs\s*=\s*([\d.]+)")
-_RE_SPEEDUP = re.compile(r"Speedup\s*=\s*([\d.]+)x")
+# NB: the single-shape output of test_unified_attention_ck.py aligns its labels
+# with padding ("CK     time   =", "CK     BW     =", "UA vs Triton   ="), so the
+# label tokens are separated by arbitrary whitespace — match with \s+ not a
+# literal space, or every cell parses as FAILED.
+_RE_SPLITS  = re.compile(r"num_splits\s*=\s*(\d+)")
+_RE_CK_T    = re.compile(r"CK\s+time\s*=\s*([\d.]+)\s*ms")
+_RE_TRI_T   = re.compile(r"Triton\s+time\s*=\s*([\d.]+)\s*ms")
+_RE_CK_BW   = re.compile(r"CK\s+(?:BW|Bandwidth)\s*=\s*([\d.]+)\s*GB/s")
+_RE_TRI_BW  = re.compile(r"Triton\s+(?:BW|Bandwidth)\s*=\s*([\d.]+)\s*GB/s")
+_RE_CK_TF   = re.compile(r"CK\s+TFLOPs\s*=\s*([\d.]+)")
+_RE_SPEEDUP = re.compile(r"(?:UA vs Triton|Speedup)\s*=\s*([\d.]+)x")
 
 
 def _parse_run(stdout: str) -> dict:

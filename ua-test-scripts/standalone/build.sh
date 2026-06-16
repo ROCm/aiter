@@ -49,7 +49,7 @@ mkdir -p "$OUT/obj"
 # Otherwise we no-op in <1s, so runners can call build.sh unconditionally.
 # ---------------------------------------------------------------------------
 EXE="$OUT/ua_trace"
-WANT_STAMP="$ARCH $DTYPE $D $MASK ${XCFLAGS:-}"
+WANT_STAMP="$ARCH $DTYPE $D $MASK $TARGET_INSTANCE ${XCFLAGS:-}"
 if [[ "${REBUILD:-0}" != "1" && -x "$EXE" && "$(cat "$OUT/.built" 2>/dev/null || true)" == "$WANT_STAMP" ]]; then
     newer="$(find "$CK/include/ck_tile" "$UADIR" -type f \
                   \( -name '*.hpp' -o -name '*.h' -o -name '*.cpp' \) -newer "$EXE" -print -quit 2>/dev/null || true)"
@@ -107,6 +107,14 @@ cat > "$OUT/flags.rsp" <<EOF
 -fno-gpu-rdc
 -gline-tables-only
 EOF
+
+# Match the driver's runtime args.data_type + input element buffers to the
+# instance this slim build compiled as real (build.sh stubs every other dtype).
+# Without this the driver defaults to fp8 and a bf16/fp16 build dispatches to a
+# stubbed instance ("no matching kernel"). DTYPE is already in the build stamp.
+case "$DTYPE" in
+    bf16) printf '%s\n' "-DUA_TRACE_BF16=1" >> "$OUT/flags.rsp" ;;
+esac
 
 # Optional extra -D toggles (e.g. XCFLAGS="-DUA_FP8_WIDE_MMA=0") for A/B probes.
 # Newline-split into the response file so each token is its own arg. Folded into

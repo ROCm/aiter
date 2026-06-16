@@ -24,6 +24,14 @@
 // Env:
 //   CHECK=1      run the host reference accuracy check (use a SMALL sq -- the
 //                reference is O(hq * sq^2 * d) on the CPU)
+//   PAGED=1      exercise the PAGED address path (default 0 = contiguous nopage).
+//                Uses an IDENTITY block table so the paged pool is byte-identical
+//                to contiguous -> same DRAM pattern, isolates page-index overhead.
+//                Build the matching instance, e.g.
+//                  TARGET_INSTANCE=unified_attention_d128_fp8_nmask_ps128 ./build.sh
+//   PAGE_BLK=128 paging granularity (tokens/page). 128 == the kv tile (one page
+//                per tile, kRebaseKSrd fast path); 16/32/64 span multiple pages.
+//                Must match the built ps{N} instance.
 //   SEED=42      RNG seed
 //   QKV_STD=1.0  stddev of the normal fill for Q/K/V
 //   RTOL=2e-2 ATOL=1e-2   accuracy tolerances (|got-ref| <= ATOL + RTOL*|ref|)
@@ -82,9 +90,10 @@ static double env_d(const char* k, double dflt)
 // Host reference: O[i,h,:] = sum_j softmax_j( scale * <Q[i,h], K[j,kv]> ) * V[j,kv],
 // reading the SAME fp8 bytes the kernel reads (cast to float). GQA: kv = h / nr.
 // Causal (mask==2, bottom-right anchor): key j valid iff j <= i + (sk - sq).
-static std::vector<float> reference(const std::vector<fp8_t>& q,
-                                    const std::vector<fp8_t>& k,
-                                    const std::vector<fp8_t>& v,
+template <typename T>
+static std::vector<float> reference(const std::vector<T>& q,
+                                    const std::vector<T>& k,
+                                    const std::vector<T>& v,
                                     int sq, int sk, int hq, int hk, int d, int mask,
                                     float scale_s, float q_descale, float k_descale,
                                     float v_descale)
@@ -101,12 +110,12 @@ static std::vector<float> reference(const std::vector<fp8_t>& q,
         const int kv = h / nr;
         for(int i = 0; i < sq; ++i)
         {
-            const fp8_t* qrow = &q[((size_t)i * hq + h) * d];
+            const T* qrow = &q[((size_t)i * hq + h) * d];
             float m = -std::numeric_limits<float>::infinity();
             for(int j = 0; j < sk; ++j)
             {
                 if(mask == 2 && (long)j > (long)i + off) { sc[j] = -std::numeric_limits<float>::infinity(); continue; }
-                const fp8_t* krow = &k[((size_t)j * hk + kv) * d];
+                const T* krow = &k[((size_t)j * hk + kv) * d];
                 float dot = 0.f;
                 for(int e = 0; e < d; ++e)
                     dot += ck_tile::type_convert<float>(qrow[e]) * ck_tile::type_convert<float>(krow[e]);
@@ -126,7 +135,7 @@ static std::vector<float> reference(const std::vector<fp8_t>& q,
             {
                 if(sc[j] == 0.f) continue;
                 const float p = sc[j] * inv;
-                const fp8_t* vrow = &v[((size_t)j * hk + kv) * d];
+                const T* vrow = &v[((size_t)j * hk + kv) * d];
                 for(int e = 0; e < d; ++e)
                     orow[e] += p * ck_tile::type_convert<float>(vrow[e]);
             }
@@ -150,9 +159,10 @@ static std::vector<float> reference(const std::vector<fp8_t>& q,
 // d is bounded by kRefMaxD (these instances are d<=128); guarded in main().
 static constexpr int kRefMaxD = 256;
 
-__global__ void ref_attn_kernel(const fp8_t* __restrict__ q,
-                                const fp8_t* __restrict__ k,
-                                const fp8_t* __restrict__ v,
+template <typename T>
+__global__ void ref_attn_kernel(const T* __restrict__ q,
+                                const T* __restrict__ k,
+                                const T* __restrict__ v,
                                 float* __restrict__ o,
                                 int sq, int sk, int hq, int hk, int d, int mask,
                                 float qk_scale, float v_descale)
@@ -166,7 +176,7 @@ __global__ void ref_attn_kernel(const fp8_t* __restrict__ q,
     const int  kv  = h / nr;
     const long off = (long)sk - (long)sq; // bottom-right causal anchor
 
-    const fp8_t* qrow = &q[((long)i * hq + h) * d];
+    const T*     qrow = &q[((long)i * hq + h) * d];
     float        acc[kRefMaxD];
     for(int e = 0; e < d; ++e)
         acc[e] = 0.f;
@@ -177,7 +187,7 @@ __global__ void ref_attn_kernel(const fp8_t* __restrict__ q,
     {
         if(mask == 2 && (long)j > (long)i + off)
             break; // causal: no valid keys past the diagonal
-        const fp8_t* krow = &k[((long)j * hk + kv) * d];
+        const T*     krow = &k[((long)j * hk + kv) * d];
         float        dot  = 0.f;
         for(int e = 0; e < d; ++e)
             dot += ck_tile::type_convert<float>(qrow[e]) * ck_tile::type_convert<float>(krow[e]);
@@ -186,7 +196,7 @@ __global__ void ref_attn_kernel(const fp8_t* __restrict__ q,
         const float corr  = expf(m - m_new); // 0 on the first valid key (m=-inf)
         const float p     = expf(s - m_new);
         l                 = l * corr + p;
-        const fp8_t* vrow = &v[((long)j * hk + kv) * d];
+        const T*     vrow = &v[((long)j * hk + kv) * d];
         for(int e = 0; e < d; ++e)
             acc[e] = acc[e] * corr + p * ck_tile::type_convert<float>(vrow[e]);
         m = m_new;
@@ -198,7 +208,8 @@ __global__ void ref_attn_kernel(const fp8_t* __restrict__ q,
         orow[e] = acc[e] * inv * v_descale;
 }
 
-static std::vector<float> reference_gpu(const fp8_t* q, const fp8_t* k, const fp8_t* v,
+template <typename T>
+static std::vector<float> reference_gpu(const T* q, const T* k, const T* v,
                                         int sq, int sk, int hq, int hk, int d, int mask,
                                         float scale_s, float q_descale, float k_descale,
                                         float v_descale)
@@ -211,7 +222,7 @@ static std::vector<float> reference_gpu(const fp8_t* q, const fp8_t* k, const fp
     const long  rows  = (long)hq * sq;
     const int   block = 128;
     const int   grid  = (int)((rows + block - 1) / block);
-    ref_attn_kernel<<<grid, block>>>(q, k, v, o_dev, sq, sk, hq, hk, d, mask, qk_scale, v_descale);
+    ref_attn_kernel<T><<<grid, block>>>(q, k, v, o_dev, sq, sk, hq, hk, d, mask, qk_scale, v_descale);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -224,6 +235,19 @@ static std::vector<float> reference_gpu(const fp8_t* q, const fp8_t* k, const fp
 int main(int argc, char** argv)
 {
     using DT = ck_tile::unified_attention_args::data_type_enum;
+
+    // The driver historically hard-coded fp8 inputs. The input element type AND
+    // args.data_type must match the instance the slim build compiled as the real
+    // (non-stub) kernel -- build.sh derives both from DTYPE. A mismatch lands the
+    // runtime dispatch on a stubbed instance ("no matching kernel"). UA_TRACE_BF16
+    // (injected by build.sh when DTYPE=bf16) switches inputs + data_type to bf16.
+#if defined(UA_TRACE_BF16)
+    using qkv_t                  = bf16_t;
+    constexpr DT kTraceDtype     = DT::bf16;
+#else
+    using qkv_t                  = fp8_t;
+    constexpr DT kTraceDtype     = DT::fp8;
+#endif
 
     const ck_tile::index_t sq   = argc > 1 ? std::atoi(argv[1]) : 8192;
     const ck_tile::index_t hq   = argc > 2 ? std::atoi(argv[2]) : 16;
@@ -251,6 +275,22 @@ int main(int argc, char** argv)
     const float        q_descale = 1.0f, k_descale = 1.0f, v_descale = 1.0f;
     const float        scale_s   = 1.0f / std::sqrt((float)d);
 
+    // ---- paging config (PAGED=1) -------------------------------------------
+    // Exercise the PAGED address path on the SAME canonical shape. With an
+    // IDENTITY block table (logical page p -> physical block p) the paged K/V
+    // pool is byte-identical to the contiguous one, so (a) the host/GPU
+    // reference is unchanged and (b) the DRAM access pattern matches contiguous
+    // EXACTLY. That isolates the pure page-index-fetch / address-computation
+    // overhead -- the thing we want at ~0 -- with no page-scatter confound.
+    //   PAGED=1        enable the paged instance (default 0 = contiguous nopage)
+    //   PAGE_BLK=128   paging granularity (tokens/page). 128 == the kv tile, so
+    //                  one page per tile (kRebaseKSrd fast path). 16/32/64 span
+    //                  multiple pages (dedup path). Must match the built instance.
+    const bool paged     = std::getenv("PAGED") && std::atoi(std::getenv("PAGED")) != 0;
+    const int  page_blk  = std::max(1, (int)env_d("PAGE_BLK", 128));
+    const int  num_pages = paged ? (int)(((long)sk + page_blk - 1) / page_blk) : 0;
+    const long padded_kv = paged ? (long)num_pages * page_blk : (long)total_kv;
+
     // ---- random host inputs (fp8 in, bf16 out) ----
     std::mt19937 gen(seed);
     std::normal_distribution<float> nd(0.f, qkv_std);
@@ -258,23 +298,32 @@ int main(int argc, char** argv)
     // so float<->fp8 MUST go through ck_tile::type_convert (a static_cast would
     // truncate to an integer). type_convert honours CK_TILE_USE_OCP_FP8=1 (forced
     // in build.sh) so the host encodes the SAME e4m3fn bytes the gfx950 kernel reads.
-    auto fill_fp8 = [&](size_t n) {
-        std::vector<fp8_t> h(n);
-        for(size_t i = 0; i < n; ++i) h[i] = ck_tile::type_convert<fp8_t>(nd(gen));
+    auto fill_qkv = [&](size_t n) {
+        std::vector<qkv_t> h(n);
+        for(size_t i = 0; i < n; ++i) h[i] = ck_tile::type_convert<qkv_t>(nd(gen));
         return h;
     };
-    std::vector<fp8_t>  q_h = fill_fp8((size_t)total_q * hq * d);
-    std::vector<fp8_t>  k_h = fill_fp8((size_t)total_kv * hk * d);
-    std::vector<fp8_t>  v_h = fill_fp8((size_t)total_kv * hk * d);
+    std::vector<qkv_t>  q_h = fill_qkv((size_t)total_q * hq * d);
+    std::vector<qkv_t>  k_h = fill_qkv((size_t)total_kv * hk * d);
+    std::vector<qkv_t>  v_h = fill_qkv((size_t)total_kv * hk * d);
     std::vector<bf16_t> o_h((size_t)total_q * hq * d, ck_tile::type_convert<bf16_t>(0.0f));
+    if(paged)
+    {
+        // Pad the pool tail (tokens [sk, num_pages*page_blk)) with zeros. The
+        // kernel never reads past seq_len=sk (identity table), so the tail is
+        // inert -- it only exists so the buffer descriptor's (num_blks*page_blk)
+        // rows stay in-bounds of the allocation.
+        k_h.resize((size_t)padded_kv * hk * d, ck_tile::type_convert<qkv_t>(0.f));
+        v_h.resize((size_t)padded_kv * hk * d, ck_tile::type_convert<qkv_t>(0.f));
+    }
 
-    fp8_t*  q = device_from(q_h);
-    fp8_t*  k = device_from(k_h);
-    fp8_t*  v = device_from(v_h);
+    qkv_t*  q = device_from(q_h);
+    qkv_t*  k = device_from(k_h);
+    qkv_t*  v = device_from(v_h);
     bf16_t* o = device_from(o_h);
 
     // Rotation copies (copy 0 == q/k/v); distinct DRAM addresses defeat L2 reuse.
-    std::vector<fp8_t*> q_rot{q}, k_rot{k}, v_rot{v};
+    std::vector<qkv_t*> q_rot{q}, k_rot{k}, v_rot{v};
     for(int r = 1; r < rotate; ++r)
     {
         q_rot.push_back(device_from(q_h));
@@ -282,22 +331,29 @@ int main(int argc, char** argv)
         v_rot.push_back(device_from(v_h));
     }
 
-    int32_t* block_tables    = device_i32({0});               // ignored when !is_paged
+    // Identity block table for paged mode (logical page p -> physical block p),
+    // so the paged pool is byte-identical to contiguous. [1, num_pages] int32.
+    std::vector<int32_t> bt_host;
+    if(paged) { bt_host.resize(num_pages); for(int i = 0; i < num_pages; ++i) bt_host[i] = i; }
+    else      { bt_host = {0}; }                              // ignored when !is_paged
+    int32_t* block_tables    = device_i32(bt_host);
     int32_t* seq_lens        = device_i32({(int32_t)sk});     // [num_seqs]
     int32_t* query_start_len = device_i32({0, (int32_t)sq});  // [num_seqs+1]
     int32_t* kv_start_len    = device_i32({0, (int32_t)sk});  // [num_seqs+1]
 
     ck_tile::unified_attention_args args{};
-    args.data_type          = DT::fp8;
+    args.data_type          = kTraceDtype;
     args.mask_type          = mask;
     if(mask == 0) { args.window_size_left = -1; args.window_size_right = -1; args.is_top_left = false; }
     else          { args.window_size_left = -1; args.window_size_right = 0;  args.is_top_left = false; }
 
     args.num_tokens         = total_q;
-    args.num_blks           = total_kv;   // contiguous: token count, page dim folded to 1
+    // contiguous: page dim folded to 1, num_blks == token count.
+    // paged: num_blks == physical page count, page_blk_size == tokens/page.
+    args.num_blks           = paged ? num_pages : total_kv;
     args.num_head_q         = hq;
     args.num_queries_per_kv = nqpkv;
-    args.page_blk_size      = 1;
+    args.page_blk_size      = paged ? page_blk : 1;
     args.hdim               = d;
     args.scale_s            = scale_s;
     args.q_descale = q_descale; args.k_descale = k_descale; args.v_descale = v_descale;
@@ -306,14 +362,18 @@ int main(int argc, char** argv)
     args.query_stride_0 = hq * d;
     args.query_stride_1 = d;
 
-    // Contiguous K/V as 4-D [total_kv, 1, hk, d] (page dim size 1).
+    // K/V as 4-D [num_blks, page_blk_size, hk, d].
+    //   contiguous: page_blk_size==1 -> stride_0 == stride_1 == hk*d
+    //   paged:      stride_0 == page_blk*hk*d (page), stride_1 == hk*d (token-in-page)
+    const ck_tile::index_t kv_page_stride =
+        paged ? (ck_tile::index_t)((long)page_blk * hk * d) : (ck_tile::index_t)(hk * d);
     args.k_ptr            = k;
-    args.stride_k_cache_0 = hk * d;
+    args.stride_k_cache_0 = kv_page_stride;
     args.stride_k_cache_1 = hk * d;
     args.stride_k_cache_2 = d;
     args.stride_k_cache_3 = 1;
     args.v_ptr            = v;
-    args.stride_v_cache_0 = hk * d;
+    args.stride_v_cache_0 = kv_page_stride;
     args.stride_v_cache_1 = hk * d;
     args.stride_v_cache_2 = d;
     args.stride_v_cache_3 = 1;
@@ -323,15 +383,15 @@ int main(int argc, char** argv)
     args.output_stride_1 = d;
 
     args.block_tables_ptr   = block_tables;
-    args.block_table_stride = 1;
+    args.block_table_stride = paged ? num_pages : 1;  // max_num_blocks_per_seq
     args.seq_lens_ptr       = seq_lens;
     args.query_start_len_ptr = query_start_len;
     args.num_seqs           = num_seqs;
     args.max_seqlen_q       = sq;        // force the prefill_d128 tier
     args.cache_ptr_int32_overflow_possible = false;
     args.num_splits         = 1;
-    args.is_paged           = false;     // <-- contiguous (nopage) instance
-    args.kv_start_len_ptr   = kv_start_len;
+    args.is_paged           = paged;     // PAGED=1 -> ps{page_blk} instance
+    args.kv_start_len_ptr   = kv_start_len;  // ignored when is_paged
 
     auto launch = [&](int rot_idx) {
         args.q_ptr = q_rot[rot_idx % rotate];
@@ -356,6 +416,9 @@ int main(int argc, char** argv)
     }
     std::cout << "[ua_trace] launched ok  sq=" << sq << " hq=" << hq << " hk=" << hk
               << " d=" << d << " mask=" << mask << " std=" << qkv_std
+              << (paged ? ("  [paged blk=" + std::to_string(page_blk)
+                           + " pages=" + std::to_string(num_pages) + "]")
+                        : "  [contiguous]")
               << (do_perf ? "  [perf]" : "") << std::endl;
 
     if(do_perf)

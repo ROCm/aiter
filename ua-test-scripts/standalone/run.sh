@@ -20,12 +20,17 @@ SQ="${1:-8192}"; HQ="${2:-16}"; HK="${3:-2}"; D="${4:-128}"; MASK="${5:-0}"; ITE
 DTYPE="${DTYPE:-fp8}"; GPU="${GPU:-2}"; ARCH="${ARCH:-gfx950}"
 SIMD_MASK="${SIMD_MASK:-0x1}"; CU="${CU:-1}"; SE_MASK="${SE_MASK:-0x1}"
 SIMD="${SIMD:-0}"; REPORT_ITERS="${REPORT_ITERS:-4}"
+# Paged-path overlay: PAGED=1 traces the paged instance (PAGE_BLK tokens/page).
+# Needs a build whose real instance matches the page size, e.g.
+#   PAGED=1 PAGE_BLK=128 TARGET_INSTANCE=unified_attention_d128_fp8_nmask_ps128
+PAGED="${PAGED:-0}"; PAGE_BLK="${PAGE_BLK:-128}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPTS="$(dirname "$HERE")"
 EXE="$HERE/build/ua_trace"
 MASKTAG=$([[ "$MASK" == "0" ]] && echo "noncausal" || echo "causal")
-TAG="${TAG:-att_std_d${D}_${DTYPE}_${MASKTAG}_sq${SQ}}"
+PAGETAG=$([[ "$PAGED" == "0" ]] && echo "" || echo "_paged${PAGE_BLK}")
+TAG="${TAG:-att_std_d${D}_${DTYPE}_${MASKTAG}_sq${SQ}${PAGETAG}}"
 RUN_DIR="$SCRIPTS/rocprof_analysis/runs/$TAG"
 ATT_DIR="$RUN_DIR/att"
 
@@ -33,12 +38,13 @@ ATT_DIR="$RUN_DIR/att"
 # or any kernel source/header is newer than the exe. So a stale binary can never
 # be silently traced/measured -- no JIT-style "is it stale?" ambiguity.
 echo "[std] (1/3) build (self-guarding) ..."
+[[ -n "${TARGET_INSTANCE:-}" ]] && export TARGET_INSTANCE
 ARCH="$ARCH" DTYPE="$DTYPE" D="$D" MASK="$MASK" bash "$HERE/build.sh"
 
 echo "[std] (2/3) rocprofv3 ATT on executable -> $TAG ..."
 rm -rf "$ATT_DIR"; mkdir -p "$ATT_DIR"
 ATT_LIB_DIR="/opt/rocm/lib"
-HIP_VISIBLE_DEVICES="$GPU" /opt/rocm/bin/rocprofv3 \
+HIP_VISIBLE_DEVICES="$GPU" PAGED="$PAGED" PAGE_BLK="$PAGE_BLK" /opt/rocm/bin/rocprofv3 \
     --att --att-library-path "$ATT_LIB_DIR" \
     --att-target-cu "$CU" --att-shader-engine-mask "$SE_MASK" \
     --att-simd-select "$SIMD_MASK" --att-consecutive-kernels 1 --att-activity 8 \
