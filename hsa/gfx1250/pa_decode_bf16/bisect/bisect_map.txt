@@ -14,3 +14,8 @@
 13  REMOVED barrier after: fn=cross_wave_reduce      load=ds_load_b32 v_8bit(v_K[0][m * WAVES + w]), v_tmp0 offse   md5=80d3762d   [LIVE: emitted, meaningful test]
 14  REMOVED barrier after: fn=cross_wave_reduce      load=ds_load_b32 v_8bit(xwr_buf[0][idx]), v_tmp0 offset: RED   md5=724f6109   [LIVE: emitted, meaningful test]
 15  REMOVED barrier after: fn=cross_wave_reduce      load=ds_load_b32 v_8bit(xwr_buf[k + 1][idx]), v_tmp0 offset:   md5=f91a650c   [LIVE: emitted, meaningful test]
+
+---- GROUP / REFERENCE VARIANTS (cumulative bisect, since single removal all-PASS) ----
+99  vmask_only: ALL 15 barriers REMOVED   md5=02535d9e   [reference: does the config race at all?]
+20  REMOVE non-reduce LIVE {02,03,04,09,10}; KEEP reduce {12,13,14,15}   md5=14d66604   [race here => non-reduce barriers matter]
+21  REMOVE reduce LIVE {12,13,14,15}; KEEP non-reduce {02,03,04,09,10}   md5=b5742ec5   [race here => reduce barriers matter]

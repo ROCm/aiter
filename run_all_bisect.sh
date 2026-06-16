@@ -21,8 +21,12 @@ CLEAN="$CODIR/pa_decode_bf16_d64_page256_gqa8.co.vmask_only.bak"   # restore tar
 LOGDIR="$AITER/bisect_logs"
 mkdir -p "$LOGDIR"
 
-# Test config that exposes the partial-page race (kv_seq_len=4097 -> OOB-wave last iter).
-TEST_ARGS="-b 64 -kvh 8 -c 4097 -m 0"
+# Test config that exposes the partial-page race.  MUST be a partial page:
+#   ctx_len NOT a multiple of 256 AND pages%4 != 0  -> pad_slots>0 + OOB waves.
+#   4097 -> 17 pages, pad=16320 (the config where the race was seen).
+#   8192 -> 32 pages, pad=0  -> NO partial page, NO race -> useless for bisect!
+# Override with:  TEST_ARGS="-b 64 -kvh 8 -c 4097 -m 0" ./run_all_bisect.sh
+TEST_ARGS="${TEST_ARGS:--b 64 -kvh 8 -c 4097 -m 0}"
 
 # Which variants to run.
 LIVE="00 02 03 04 09 10 12 13 14 15"
@@ -72,6 +76,12 @@ for nn in $NUMS; do
         verdict="(no verdict line; run exited rc=$rc — see $PER)"
     fi
     echo "    -> $verdict" | tee -a "$SUMMARY"
+    # Guard: a config with pad=0 has NO partial page -> the race can't trigger,
+    # so every variant trivially PASSes and the bisect is meaningless.
+    if echo "$verdict" | grep -aq "pad=0"; then
+        echo "    !! WARNING: pad=0 -> no partial page -> race NOT exercised. Use a" | tee -a "$SUMMARY"
+        echo "    !! partial-page ctx, e.g. TEST_ARGS=\"-b 64 -kvh 8 -c 4097 -m 0\" $0" | tee -a "$SUMMARY"
+    fi
 done
 
 # Leave the kernel in the known-good (V-mask-only) state.
