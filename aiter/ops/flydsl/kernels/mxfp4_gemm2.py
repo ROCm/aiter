@@ -960,14 +960,17 @@ def _cshuffle_flat_bf16_epilog(
     """Nonatomic flat epilog WITH cshuffle: cshuffle accm -> lds_acc (the SAME reorg
     the atomic epilog does) so the flat_out write is a COALESCED <2xbf16> store, then
     write per-sorted-row to flat_out[(m_row+row)*N_OUT + n] (no weight/atomic; a
-    scatter_reduce sums the TOPK rows). Mirrors fly's mfma_moe2 cshuffle gemm2
-    (coalesced) vs the port's direct uncoalesced nonatomic write. For BM>64 the
-    cshuffle is done in ceil(BM/64) PASSES of 64 rows so lds_acc fits 64KB (BM128's
-    full 128*BN*4=128KB would not); each pass reuses the same 64-row scratch."""
-    _RPP = min(BM, 64)  # rows per cshuffle pass (lds_acc holds _RPP*BN f32)
-    _PASSES = BM // _RPP
-    _iC = _RPP // 16  # accm i-chunks per pass
-    _REPS = _RPP // 8
+    scatter_reduce sums the TOPK rows). Mirrors fly's mfma_moe2 cshuffle gemm2.
+
+    The LDS scratch holds bf16 (the output dtype), NOT f32: BM*BN*2 <= 64KB for
+    BM<=128, so the cshuffle is SINGLE-PASS even at BM128 -- vs an f32 scratch, where
+    128*BN*4=128KB forces a 2-pass 64-row split (2x the LDS barriers). Storing bf16 is
+    lossless: the f32->bf16 convert just moves from the readback to the LDS store, and
+    the readback then reads 2 adjacent bf16 as one <2xbf16> dword straight to flat_out.
+    Halving the barriers is the win on the epilog-bound INTER=256 shapes (qwen/kimik2_b).
+    """
+    _iC = BM // 16  # accm i-chunks (ALL BM rows -- single pass)
+    _REPS = BM // 8
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
     lds_base = _lds_base_ptr3(lds_acc.get())
@@ -977,38 +980,34 @@ def _cshuffle_flat_bf16_epilog(
     col_start = n_lane * fx.Int32(2)
     out_base = _global_base_ptr1(arg_out)
 
-    for p in range_constexpr(_PASSES):
-        rocdl.barrier()  # pre-store fence (prev pass readback / K-loop s_Aq reads done)
-        for ii in range_constexpr(_iC):
-            i = p * _iC + ii
-            row_base = fx.Int32(ii * 16) + lane_div_16 * fx.Int32(4)  # LOCAL row
-            for J in range_constexpr(4):
-                col = wave * fx.Int32(64) + fx.Int32(J * 16) + lane_mod_16
-                vec = Vec(accm[i][J])
-                for v in range_constexpr(4):
-                    idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
-                    llvm.StoreOp(_raw(vec[v]), _gep3(lds_base, idx * fx.Int32(4)))
-        # drain the LDS cshuffle stores (s_barrier alone does NOT) before readback.
-        llvm.inline_asm(
-            res=None,
-            operands_=[],
-            asm_string="s_waitcnt lgkmcnt(0)",
-            constraints="",
-            has_side_effects=True,
-        )
-        rocdl.barrier()
-        for mr in range_constexpr(_REPS):
-            row_local = fx.Int32(mr * 8) + m_lane
-            sorted_row = m_row + fx.Int32(p * _RPP) + row_local
-            for s in range_constexpr(4):
-                idx0 = row_local * fx.Int32(BN) + col_start + fx.Int32(s * 64)
-                v2 = Vec(
-                    llvm.load(T.vec(2, T.f32), _gep3(lds_base, idx0 * fx.Int32(4)))
-                )
-                pk = Vec.from_elements([v2[0], v2[1]], fx.Float32).to(fx.BFloat16)
-                n_col = n_block_idx * fx.Int32(BN) + col_start + fx.Int32(s * 64)
-                elem = fx.Int64(sorted_row) * fx.Int64(N_OUT) + fx.Int64(n_col)
-                llvm.StoreOp(_raw(pk), _gep1(out_base, elem * fx.Int64(2)))
+    rocdl.barrier()  # pre-store fence (K-loop s_Aq reads done; lds_acc union reuse)
+    for i in range_constexpr(_iC):
+        row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
+        for J in range_constexpr(4):
+            col = wave * fx.Int32(64) + fx.Int32(J * 16) + lane_mod_16
+            bf4 = Vec(accm[i][J]).to(fx.BFloat16)  # 4 rows -> bf16 (the store dtype)
+            for v in range_constexpr(4):
+                idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
+                llvm.StoreOp(_raw(bf4[v]), _gep3(lds_base, idx * fx.Int32(2)))
+    # drain the LDS cshuffle stores (s_barrier alone does NOT) before readback.
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="s_waitcnt lgkmcnt(0)",
+        constraints="",
+        has_side_effects=True,
+    )
+    rocdl.barrier()
+    for mr in range_constexpr(_REPS):
+        row_local = fx.Int32(mr * 8) + m_lane
+        sorted_row = m_row + row_local
+        for s in range_constexpr(4):
+            idx0 = row_local * fx.Int32(BN) + col_start + fx.Int32(s * 64)
+            # 2 adjacent bf16 = one dword, already the output dtype -> straight write
+            pk = Vec(llvm.load(T.vec(2, T.bf16), _gep3(lds_base, idx0 * fx.Int32(2))))
+            n_col = n_block_idx * fx.Int32(BN) + col_start + fx.Int32(s * 64)
+            elem = fx.Int64(sorted_row) * fx.Int64(N_OUT) + fx.Int64(n_col)
+            llvm.StoreOp(_raw(pk), _gep1(out_base, elem * fx.Int64(2)))
 
 
 @flyc.jit
