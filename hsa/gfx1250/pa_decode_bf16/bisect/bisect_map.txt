@@ -38,3 +38,4 @@
 41  site03 V_TDM: s_wait_dscnt 0       md5=5018f446
 42  site03 V_TDM: s_wait_loadcnt 0     md5=e787b656
 43  site03 V_TDM: s_wait_kmcnt 0       md5=2852fe8c
+FIX  site03 V_TDM: s_wait_tensorcnt 0  (=variant 40, DEPLOYED canonical)  md5=b9a85851
