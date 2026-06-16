@@ -223,7 +223,7 @@ def mla_decode_fwd(
 
         MAYBE_FINAL_OUT = True
 
-        if max_seqlen_q == 1 and (nhead in [8, 16] or return_lse):
+        if nhead in [8, 16] and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
 
         logits = (
@@ -274,7 +274,7 @@ def mla_decode_fwd(
             logits,
             attn_lse,
             o,
-            None,
+            final_lse,
             q_scale,
             kv_scale,
         )
@@ -288,8 +288,6 @@ def mla_decode_fwd(
                 and nhead == 32
             )
         ):
-            if return_lse:
-                final_lse = attn_lse[:, 0, :, 0]
             lse = final_lse if return_lse else attn_lse
             return logits.view(total_s, nhead, v_head_dim), lse
 
@@ -518,7 +516,7 @@ def mla_decode_fwd(
                 logits,
                 attn_lse,
                 o,
-                None,
+                final_lse,
                 q_scale,
                 kv_scale,
             )
