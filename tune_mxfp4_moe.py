@@ -128,12 +128,37 @@ def time_variant(shape, mx_w, hidden, tids, tw, ref, k1, k2, iters, warmup):
 def tune_shape(name, shape, M_list, cu_num, writer, iters, warmup):
     dev = torch.device("cuda")
     fly_w, mx_w = B.build_weights(shape, dev)
+    # The legacy a4w4 SEGFAULTS on the dsv4 geometry (uncatchable, kills the tuner),
+    # so anchor the cosine gate on the port's own BM16-inline output for dsv4 instead
+    # of run_fly. BM16 is the simplest/most-trusted variant and runs for all dsv4 M.
+    _dsv4 = name.startswith("dsv4")
     for M in M_list:
         hidden, tids, tw = B.build_inputs(shape, M, dev)
-        try:
-            _, ref = B.run_fly(shape, M, fly_w, hidden, tids, tw, iters, warmup)
-        except Exception:
-            ref = None  # no anchor -> accept any variant that runs
+        if _dsv4:
+            try:
+                mx_w["w1"].gemm1_backend = "flydsl"
+                mx_w["w2"].gemm2_backend = "flydsl"
+                ref = B._mxfp4_moe_run(
+                    hidden,
+                    mx_w["w1"],
+                    mx_w["w2"],
+                    tids,
+                    tw,
+                    shape.TOPK,
+                    kernelName1=B.g1_kernel_name(shape, 16, "INLINEQUANT"),
+                    kernelName2=B.g2_kernel_name(shape, 16, "ATOMIC"),
+                    w1_scale=mx_w["w1_scale"],
+                    w2_scale=mx_w["w2_scale"],
+                    activation=ActivationType.Silu,
+                    quant_type=QuantType.per_1x32,
+                ).clone()
+            except Exception:
+                ref = None
+        else:
+            try:
+                _, ref = B.run_fly(shape, M, fly_w, hidden, tids, tw, iters, warmup)
+            except Exception:
+                ref = None  # no anchor -> accept any variant that runs
         best = None
         for label, k1, k2 in candidate_variants(shape, M):
             try:
