@@ -1787,8 +1787,7 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and (
-                activation == ActivationType.Swiglu
-                or gate_mode == GateMode.INTERLEAVE
+                activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE
             )
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
         )
