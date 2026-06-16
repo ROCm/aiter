@@ -847,7 +847,7 @@ def test_pa_decode_vmask(
     #       kernel is nondeterministic the vmask diff is dominated by the race.
     # `out` (direct-O) is torch.empty -> uninitialized for split rows, so we judge by
     # split_o (zero-init kernel partials) and the FINAL reduced output only.
-    REPS = 3
+    REPS = 10   # intermittent race -> need enough reps to detect reliably
 
     def rd(o, so, sl):
         return cpu_reduce(

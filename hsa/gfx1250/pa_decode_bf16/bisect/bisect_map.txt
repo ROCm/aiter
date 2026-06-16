@@ -43,3 +43,5 @@ FIX  site03 V_TDM: s_wait_tensorcnt 0  (=variant 40, DEPLOYED canonical)  md5=b9
 ---- PERF-GATED FIX (drain only near the partial-page last iter; steady keeps tensorcnt 2) ----
 g1  V_TDM drain s_wait_tensorcnt 0 ONLY on last iter (loop_idx>=cnt-1)    md5=572a1afd
 g2  V_TDM drain s_wait_tensorcnt 0 on last 2 iters (loop_idx>=cnt-2)      md5=4d392568
+gs1 V_TDM: GATED-STRONG s_wait_idle+wgp_barrier, last 1 iter   md5=6506e399
+gs2 V_TDM: GATED-STRONG s_wait_idle+wgp_barrier, last 2 iters  md5=c2e8ca03
