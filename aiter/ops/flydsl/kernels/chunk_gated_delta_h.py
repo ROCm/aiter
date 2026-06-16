@@ -143,7 +143,20 @@ def compile_chunk_gated_delta_h(
     LDS_W_ELEMS = LDS_W_ELEMS_PER_STAGE * LDS_W_STAGES
     LDS_W_BYTES = LDS_W_ELEMS * 2
 
-    LDS_K_STRIDE = K
+    # OPT-KP: lds_k stride padding to break LDS bank conflict on the
+    # ds_read_tr16_b64 transpose read (Hotspot #3, ~8.3% stall in the ATT
+    # trace). lds_k cannot use XOR swizzle because ds_read_tr_b16 spans 4
+    # rows per instruction and a row-dependent XOR would break the HW
+    # transpose alignment. Padding, however, is a row-INDEPENDENT linear
+    # shift: every row moves by a constant, so the 4-row transpose blocks
+    # stay regular while the row stride is no longer an integer multiple of
+    # the 32-bank period (128 B), spreading consecutive rows across banks.
+    # PAD must be a multiple of 4 bf16 (8 B) to keep ds_read_tr16 alignment,
+    # matching LDS_H_PAD / LDS_VN_PAD. Write (line ~539) and transpose read
+    # (lines ~925/933) both express their offsets in terms of LDS_K_STRIDE,
+    # so this single definition propagates everywhere.
+    LDS_K_PAD = 4  # 4 bf16 = 8 bytes
+    LDS_K_STRIDE = K + LDS_K_PAD
     LDS_K_ELEMS = BT * LDS_K_STRIDE
     LDS_K_BYTES = LDS_K_ELEMS * 2
 
