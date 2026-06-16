@@ -1467,6 +1467,69 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _can_impl_fmha_fwd_with_sink_asm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    causal: bool,
+    window_size: Tuple[int, ...],
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_kv: Optional[torch.Tensor] = None,
+    sink_ptr: Optional[Tensor] = None,
+) -> bool:
+    # gfx1250 ASM bf16 forward (fmha_fwd_with_sink_asm).  Single-shot batched
+    # (no varlen / dropout / swa / quant / alibi / bias).  Sink logits
+    # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
+    _, _, nhead_q, hdim_q = q.shape
+    _, seqlen_k, nhead_k, _ = k.shape
+    hdim_v = v.shape[3]
+    window_size_left = int(window_size[0])
+    window_size_right = int(window_size[1])
+    sink_size = int(window_size[2]) if len(window_size) == 3 else 0
+    window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
+    window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
+    swa = (window_size_left > 0) or (window_size_right > 0)
+
+    ret = get_gfx() == "gfx1250"
+    ret = ret and (q.dtype == dtypes.bf16)
+    # Only causal gfx1250 binaries are registered in fmha_fwd_bf16*.csv.
+    ret = ret and bool(causal)
+    ret = ret and (hdim_q in (64, 128))
+    ret = ret and (hdim_v == hdim_q)
+    ret = ret and (nhead_q % nhead_k == 0)
+    ret = ret and (not swa)
+    ret = ret and (sink_size == 0)
+    ret = ret and (alibi_slopes is None and bias is None)
+    ret = ret and (dropout_p == 0.0)
+    ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+    ret = ret and (q_descale is None and k_descale is None and v_descale is None)
+    # Per-hdim sink eligibility:
+    #
+    #   D128 kernels (`_rxy`) compile ENABLE_SINK=0 -- the kernel ignores
+    #   any sink buffer.  Routing a caller's sink_ptr to it would silently
+    #   drop the sink term, so we fall back to CK whenever sink_ptr is set.
+    #
+    #   D64 kernels (`_rxy_sink`) compile ENABLE_SINK=1 -- the kernel
+    #   ALWAYS reads SINK and adds `exp((sink - max) * scale)` to the
+    #   softmax denominator.  There is no "skip sink" mode on this binary,
+    #   so calling it with sink_ptr=None now forwards a null pointer to the
+    #   kernel (the wrapper no longer raises / zero-fills), which the D64
+    #   binary would dereference.  To preserve flash_attn_func's documented
+    #   `sink_ptr is None` semantics we keep requiring an explicit sink for
+    #   D64 here and fall back to CK otherwise.
+    if hdim_q == 128:
+        ret = ret and (sink_ptr is None)
+    elif hdim_q == 64:
+        ret = ret and (sink_ptr is not None)
+    return ret
+
+
 def _native_splitkv_heuristic(batch, nhead_q, seqlen_q, seqlen_k, num_cu):
     # Pick split-KV group count G for the native D64 kernel; G == 0 falls back to
     # the CK non-split-KV kernel. Tuned on 100 measured shapes
@@ -1588,43 +1651,6 @@ def _flash_attn_forward(
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         return ret
 
-    def can_impl_fmha_fwd_with_sink_asm():
-        # gfx1250 ASM bf16 forward (fmha_fwd_with_sink_asm).  Single-shot batched
-        # (no varlen / dropout / swa / quant / alibi / bias).  Sink logits
-        # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
-        ret = get_gfx() == "gfx1250"
-        ret = ret and (q.dtype == dtypes.bf16)
-        # Only causal gfx1250 binaries are registered in fmha_fwd_bf16*.csv.
-        ret = ret and bool(causal)
-        ret = ret and (hdim_q in (64, 128))
-        ret = ret and (hdim_v == hdim_q)
-        ret = ret and (nhead_q % nhead_k == 0)
-        ret = ret and (not swa)
-        ret = ret and (sink_size == 0)
-        ret = ret and (alibi_slopes is None and bias is None)
-        ret = ret and (dropout_p == 0.0)
-        ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
-        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
-        # Per-hdim sink eligibility:
-        #
-        #   D128 kernels (`_rxy`) compile ENABLE_SINK=0 -- the kernel ignores
-        #   any sink buffer.  Routing a caller's sink_ptr to it would silently
-        #   drop the sink term, so we fall back to CK whenever sink_ptr is set.
-        #
-        #   D64 kernels (`_rxy_sink`) compile ENABLE_SINK=1 -- the kernel
-        #   ALWAYS reads SINK and adds `exp((sink - max) * scale)` to the
-        #   softmax denominator.  There is no "skip sink" mode on this binary,
-        #   so calling it with sink_ptr=None now forwards a null pointer to the
-        #   kernel (the wrapper no longer raises / zero-fills), which the D64
-        #   binary would dereference.  To preserve flash_attn_func's documented
-        #   `sink_ptr is None` semantics we keep requiring an explicit sink for
-        #   D64 here and fall back to CK otherwise.
-        if hdim_q == 128:
-            ret = ret and (sink_ptr is None)
-        elif hdim_q == 64:
-            ret = ret and (sink_ptr is not None)
-        return ret
-
     def can_impl_fmha_native():
         # Native hand-written HIP D64 split-K forward. gfx942-only, dense bf16, no
         # bias/alibi/swa/dropout/sink/fp8/varlen. See design doc.
@@ -1692,7 +1718,22 @@ def _flash_attn_forward(
             return out_, softmax_lse, S_dmask, rng_state
         # ns <= 1 (0 = heuristic fallback, 1 = forced no-split) -> existing dispatch
     # can_impl_fmha_native() False -> num_splits ignored, existing dispatch
-    if can_impl_fmha_fwd_with_sink_asm():
+    if _can_impl_fmha_fwd_with_sink_asm(
+        q,
+        k,
+        v,
+        dropout_p,
+        causal,
+        (window_size_left, window_size_right, sink_size),
+        bias,
+        alibi_slopes,
+        q_descale,
+        k_descale,
+        v_descale,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        sink_ptr,
+    ):
         # gfx1250 ASM bf16 path: q/k/v are bshd; kernel reads strides directly,
         # no API-side permute.  softmax_scale is forwarded as-is (kernel applies
         # it internally to Q·K^T).  sink_ptr is passed through verbatim -- it is
@@ -2369,7 +2410,21 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
-    if not ENABLE_CK:
+    is_grad = torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v))
+    can_use_asm_without_ck = (not is_grad) and _can_impl_fmha_fwd_with_sink_asm(
+        q,
+        k,
+        v,
+        dropout_p,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        sink_ptr=sink_ptr,
+    )
+    if not ENABLE_CK and not can_use_asm_without_ck:
         from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
 
         return flash_attn_func_triton(
