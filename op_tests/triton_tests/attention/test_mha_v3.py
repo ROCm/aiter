@@ -1023,6 +1023,169 @@ def test_mha_backward_varlen_fp8(
         assert_cosine_similarity(tri, ref)
 
 
+@pytest.mark.parametrize("VARLEN", [False, True])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS",
+    [
+        (128, 128, 8, 8),  # baseline: equal seqlens, MHA
+        (128, 256, 8, 8),  # seqlen_q != seqlen_k exercises causal_offset / delta_qk
+        (128, 128, 16, 4),  # GQA combined with sliding window
+    ],
+)
+@pytest.mark.parametrize(
+    "CAUSAL, WINDOW_SIZE",
+    [
+        (True, (32, 0)),  # causal sliding window
+        (False, (16, 16)),  # non-causal symmetric window
+        (False, (-1, 32)),  # non-causal infinite-left window
+    ],
+)
+def test_mha_v3_sliding_window_bwd(
+    CAUSAL: bool,
+    WINDOW_SIZE: tuple,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    VARLEN: bool,
+    dtype=torch.float16,
+):
+    """Exercise the FA3 (interface_v3) backward path with sliding-window attention.
+
+    The dao_ai tests cover interface_v2; this pins the interface_v3 bwd, whose
+    sliding-window guard was removed alongside v2's. Checks out/dq/dk/dv against
+    the PyTorch reference for causal, symmetric, and infinite-left windows, across
+    equal/unequal seqlens and GQA, dense and varlen.
+    """
+    BATCH = 2
+    HEAD_SZ = 64
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    q = torch.randn(
+        BATCH,
+        SEQLEN_Q,
+        NUM_Q_HEADS,
+        HEAD_SZ,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        BATCH,
+        SEQLEN_K,
+        NUM_K_HEADS,
+        HEAD_SZ,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
+    v = torch.randn(
+        BATCH,
+        SEQLEN_K,
+        NUM_K_HEADS,
+        HEAD_SZ,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
+
+    if VARLEN:
+        query_padding_mask = generate_random_padding_mask(
+            SEQLEN_Q, BATCH, "cuda", mode="full"
+        )
+        key_padding_mask = generate_random_padding_mask(
+            SEQLEN_K, BATCH, "cuda", mode="full"
+        )
+        (
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q,
+            k,
+            v,
+            output_pad_fn,
+            dq_pad_fn,
+            dk_pad_fn,
+        ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+        q_unpad.requires_grad_(True)
+        k_unpad.requires_grad_(True)
+        v_unpad.requires_grad_(True)
+        triton_out = flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=CAUSAL,
+            window_size=WINDOW_SIZE,
+        )
+    else:
+        query_padding_mask = None
+        key_padding_mask = None
+        triton_out = flash_attn_func(q, k, v, causal=CAUSAL, window_size=WINDOW_SIZE)
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    torch_out, _ = attention_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        causal=CAUSAL,
+        window_size=WINDOW_SIZE,
+    )
+
+    if VARLEN:
+        triton_out = output_pad_fn(triton_out)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+    do = torch.randn_like(torch_out)
+    if VARLEN:
+        triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+            triton_out, (q_unpad, k_unpad, v_unpad), do
+        )
+        triton_dq = dq_pad_fn(triton_dq)
+        triton_dk = dk_pad_fn(triton_dk)
+        triton_dv = dk_pad_fn(triton_dv)
+    else:
+        triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
+
+    torch_dq, torch_dk, torch_dv = torch.autograd.grad(
+        torch_out, (q_ref, k_ref, v_ref), do
+    )
+
+    torch.testing.assert_close(
+        triton_dq,
+        torch_dq,
+        atol=1e-2,
+        rtol=1e-2,
+        msg=lambda m: f"FA3 sliding-window bwd dq mismatch\n\n{m}\n",
+    )
+    torch.testing.assert_close(
+        triton_dk,
+        torch_dk,
+        atol=1e-2,
+        rtol=1e-2,
+        msg=lambda m: f"FA3 sliding-window bwd dk mismatch\n\n{m}\n",
+    )
+    torch.testing.assert_close(
+        triton_dv,
+        torch_dv,
+        atol=1e-2,
+        rtol=1e-2,
+        msg=lambda m: f"FA3 sliding-window bwd dv mismatch\n\n{m}\n",
+    )
+
+
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])
 def test_flash_attn_kvcache_paged_graph(mha_type):
     """graph capture with paged KV cache (block_table)."""
