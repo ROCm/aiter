@@ -86,6 +86,19 @@ def fmha_prefill_paged_asm_launch(
                     .permute(0, 2, 1)
                     .contiguous())  # [batch, nhead_q, max_seqlen_q]
 
+    import os
+    if os.environ.get("FMHA_ASM_DEBUG"):
+        print(f"[ASM DEBUG] batch={batch} total_q={total_q} max_seqlen_q={max_seqlen_q} max_seqlen_k={max_seqlen_k}")
+        print(f"[ASM DEBUG] nhead_q={nhead_q} nhead_k={nhead_k} num_pages={num_pages} page_size={page_size}")
+        print(f"[ASM DEBUG] k_page_stride_bytes={k_page_stride_bytes} k_head_stride_bytes={k_head_stride_bytes}")
+        print(f"[ASM DEBUG] v_page_stride_bytes={v_page_stride_bytes} v_head_stride_bytes={v_head_stride_bytes}")
+        print(f"[ASM DEBUG] o_head_stride_bytes={o_head_stride_bytes} sched_groups={sched_groups}")
+        print(f"[ASM DEBUG] softmax_scale={softmax_scale}")
+        print(f"[ASM DEBUG] kv_indptr={kv_indptr.tolist()}")
+        print(f"[ASM DEBUG] kv_page_indices[:8]={kv_page_indices[:8].tolist()}")
+        print(f"[ASM DEBUG] q shape={list(q.shape)} k shape={list(k.shape)} v shape={list(v.shape)}")
+        print(f"[ASM DEBUG] seqlens_q={seqlens_q}")
+
     _get_impl()(
         *torch_to_c_types(
             out,
