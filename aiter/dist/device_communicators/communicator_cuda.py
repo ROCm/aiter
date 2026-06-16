@@ -60,6 +60,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     _ar_1stage_override = {"1": True, "0": False}.get(
         os.environ.get("AITER_AR_1STAGE", "")
     )
+    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", 128))
 
     def __init__(
         self,
@@ -279,7 +280,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         use_1stage = (
             self._ar_1stage_override
             if self._ar_1stage_override is not None
-            else (total_bytes <= 128 * 1024)
+            else (total_bytes <= self._ar_1stage_max_kb * 1024)
         )
         if (
             not use_general_path
@@ -407,7 +408,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
+                else (total_bytes <= self._ar_1stage_max_kb * 1024)
             )
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
                 input_, res_inp_, weight_, eps, use_1stage
@@ -456,7 +457,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
+                else (total_bytes <= self._ar_1stage_max_kb * 1024)
             )
             try:
                 result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
