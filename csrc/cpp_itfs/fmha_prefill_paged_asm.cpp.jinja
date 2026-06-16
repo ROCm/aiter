@@ -137,9 +137,9 @@ void {{func_name}}(
     const int q_head_stride  = 128;                    // bytes per Q head
     const int q_batch_stride = max_seqlen_q * q_token_stride; // bytes per batch entry
 
-    // V layout (paged pool): [pages, page_size, nhead_k, 128] fp8
-    // Token stride within a page = nhead_k * 128
-    const int v_token_stride = nhead_k * 128;
+    // V layout (paged pool): [pages, nhead_k, 128, page_size] fp8 col-major (vec_k_col_v native)
+    // Head stride = hd * page_size; token stride = 1 (innermost).
+    const int v_head_stride_col = 128 * page_size;
 
     // O layout: [total_q, nhead_q, 128] bf16 (2 bytes)
     const int o_token_stride = nhead_q * 128 * 2;
@@ -166,8 +166,8 @@ void {{func_name}}(
     args.s_qk_head_dim  = 128;
     args.s_v_head_dim   = 128;
     args.s_q_head_num   = nhead_q;
-    args.s_v_Seqs       = v_token_stride;   // V token stride in bytes (within a page)
-    args.s_v_Hs         = v_head_stride_bytes; // V head stride in bytes
+    args.s_v_Seqs       = 1;                // V token stride = 1 (col-major, tokens innermost)
+    args.s_v_Hs         = v_head_stride_col; // V head stride = hd * page_size bytes
     args.s_v_Bs         = 0;               // V not batch-strided (paged)
     args.s_o_Seqs       = o_token_stride;   // O token stride in bytes
     args.s_o_Hs         = o_head_stride_bytes; // O head stride in bytes
