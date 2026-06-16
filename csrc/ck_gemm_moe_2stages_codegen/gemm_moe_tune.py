@@ -49,13 +49,13 @@ from aiter.utility.base_tuner import TunerCommon
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 
-
 try:
     from aiter.ops.flydsl.utils import is_flydsl_available
 except ImportError:
 
     def is_flydsl_available():
         return False
+
 
 if is_flydsl_available():
     try:
@@ -71,6 +71,7 @@ if is_flydsl_available():
 
         def is_flydsl_available():
             return False
+
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list

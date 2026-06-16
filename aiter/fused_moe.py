@@ -23,6 +23,7 @@ from aiter.jit.utils.chip_info import (
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
+
 try:
     from aiter.ops.flydsl.utils import is_flydsl_available
     from aiter.ops.flydsl.moe_common import GateMode
@@ -34,6 +35,7 @@ except ImportError:
 
     def is_flydsl_available():
         return False
+
 
 from aiter import (
     fused_dynamic_mxfp4_quant_moe_sort,
