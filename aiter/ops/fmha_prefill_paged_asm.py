@@ -42,6 +42,10 @@ def fmha_prefill_paged_asm_launch(
     p_scale_inv,            # unused, kept for API compat
     out=None,
 ):
+    import os as _os
+    if _os.environ.get("FMHA_ASM_DEBUG"):
+        print(f"[ASM DEBUG ENTRY] cu_seqlens_q={cu_seqlens_q.tolist()} max_seqlen_q={max_seqlen_q}", flush=True)
+
     batch   = cu_seqlens_q.shape[0] - 1
     total_q = q.shape[0]
     nhead_q = q.shape[1]
