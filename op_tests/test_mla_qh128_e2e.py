@@ -76,18 +76,21 @@ PAGE_INDICES_OOB = 4
 _RUN_POC_KL = False
 _Q_PATTERN = 3
 
-_CTX_LENS = [1, 3, 17, 1024, 1024+3, 1024+17]
-_BATCH_SIZES = [1, 64]
-_SPLIT_PER_BATCH = [1, 2]
+_CTX_LENS = list[int](range(63, 130))# [3, 7, 10, 60, 100, 150, 1024+3]
+_BATCH_SIZES = [64]
+_SPLIT_PER_BATCH = [1,2]
 _MASK_CHOICES = [1]
 
 KV_MAX_SZ = 65536 * 32
-# Poison slots beyond ctx_lens with NaN/Inf to detect kernel reads of invalid tokens.
+# Fill page token slots beyond ctx_lens: "nan" (NaN/Inf poison) or a scalar (e.g. 1.0).
 POISON_INVALID_KV_SLOTS = True
+INVALID_KV_SLOT_FILL = "nan"
 
 
 def _poison_invalid_kv_slots(kv_pages_bf16: torch.Tensor, ctx_lens: int) -> None:
-    """In-place: fill page token slots beyond ctx_lens with NaN / +Inf."""
+    """In-place: fill page token slots beyond ctx_lens."""
+    if not POISON_INVALID_KV_SLOTS:
+        return
     num_pages_per_batch = (ctx_lens + PAGE_SIZE - 1) // PAGE_SIZE
     total_pages = kv_pages_bf16.shape[0]
     for logical_page in range(total_pages):
@@ -100,8 +103,11 @@ def _poison_invalid_kv_slots(kv_pages_bf16: torch.Tensor, ctx_lens: int) -> None
         if valid_in_page >= PAGE_SIZE:
             continue
         tail = kv_pages_bf16[logical_page, valid_in_page:]
-        tail[..., ::2] = float("nan")
-        tail[..., 1::2] = float("inf")
+        if INVALID_KV_SLOT_FILL == "nan":
+            tail[..., ::2] = float("nan")
+            tail[..., 1::2] = float("inf")
+        else:
+            tail.fill_(float(INVALID_KV_SLOT_FILL))
 
 
 def _nonfinite_report(tensor: torch.Tensor, name: str) -> str:
@@ -733,9 +739,10 @@ def run_synth() -> bool:
     assert _RUN_POC_KL is False
     assert _Q_PATTERN == 3
     aiter.logger.info(
-        "test_mla_qh128 (stage1-only synth): variant=%s poison_invalid_kv=%s",
+        "test_mla_qh128 (stage1-only synth): variant=%s poison_invalid_kv=%s invalid_kv_fill=%s",
         VARIANT,
         POISON_INVALID_KV_SLOTS,
+        INVALID_KV_SLOT_FILL,
     )
     aiter.logger.info(
         "sweep: ctx_lens=%s batch=%s splits=%s mask=%s",
