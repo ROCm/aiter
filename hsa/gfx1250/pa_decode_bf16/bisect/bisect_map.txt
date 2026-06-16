@@ -51,3 +51,4 @@ gs2 V_TDM: GATED-STRONG s_wait_idle+wgp_barrier, last 2 iters  md5=c2e8ca03
 50  s_wait_tensorcnt 1 after V_TDM (keep 1 in flight)               md5=be424eb5
 52  s_wait_tensorcnt 0 MOVED to pv-head (hidden under softmax)      md5=927ddcf2
 53  s_wait_tensorcnt 1 at pv-head                                   md5=c9101e9a
+54  s_wait_tensorcnt 2 at pv-head (loosest)   md5=341aafc6
