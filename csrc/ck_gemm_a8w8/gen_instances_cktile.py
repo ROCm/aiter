@@ -25,7 +25,6 @@ from gemm_a8w8_common import (  # noqa: E402
     kernels_list_cktile,
 )
 
-
 """
 a8w8_gemm instance gen for cktile
 """
@@ -42,14 +41,14 @@ class gemm_a8w8_fwd_codegen:
         self.istune = istune
         self.tune_file = tune_file
 
-
     def get_tune_dict(self):
         if os.path.exists(self.tune_file):
             return build_tune_dict(
-                pd.read_csv(self.tune_file), default_kernels_dict_cktile, kernels_list_cktile
+                pd.read_csv(self.tune_file),
+                default_kernels_dict_cktile,
+                kernels_list_cktile,
             )
         return default_kernels_dict_cktile
-
 
     def gen_code(self, kernels_dict: dict):
         """
@@ -64,7 +63,6 @@ class gemm_a8w8_fwd_codegen:
 
         # generate manifest header for kernel instances
         self.gen_manifest_head(kernels_dict)
-
 
     def run(self):
         """
@@ -84,8 +82,7 @@ class gemm_a8w8_fwd_codegen:
             self.gen_code(kernels_list_cktile)
         else:
             # generate code for tuned kernels from tune_file
-            self.gen_code(self.get_tune_dict())       
-
+            self.gen_code(self.get_tune_dict())
 
     def gen_instance(self, k: tileKernelInstance):
         TILE_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
@@ -193,7 +190,6 @@ template torch::Tensor
                             )
                         ).write_text(intsance)
 
-
     def gen_lookup_dict(self, kernels_dict: dict):
         LOOKUP_head = """#pragma once
 // SPDX-License-Identifier: MIT
@@ -254,7 +250,9 @@ torch::Tensor
 #endif // USE_ROCM
 """
 
-        with open(os.path.join(self.working_path, "gemm_a8w8_cktile_manifest.h"), "w") as f:
+        with open(
+            os.path.join(self.working_path, "gemm_a8w8_cktile_manifest.h"), "w"
+        ) as f:
             f.write(MAINFEST_head)
             for mnk, k in kernels_dict.items():
                 f.write(MAINFEST_template.format(kernel_name=k.name))

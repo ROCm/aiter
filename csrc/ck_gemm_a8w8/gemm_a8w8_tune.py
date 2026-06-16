@@ -126,7 +126,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
         "config_env_name": "AITER_CONFIG_GEMM_A8W8",
     }
 
-    def getKernelName(self, kernelId, libType): # ="ck"
+    def getKernelName(self, kernelId, libType):  # ="ck"
         """
         Get the kernel name based on the kernel ID for different types.
         """
@@ -191,7 +191,6 @@ class GemmA8W8Tuner(GemmCommonTuner):
                 )
         return tasks_ck
 
-
     def get_gemm_a8w8_cktile_tune_task(
         self,
         info_keys,
@@ -202,9 +201,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
     ):
         gfx, cu_num, M, N, K, q_dtype_w = info_keys
         kernel_list = {
-            k: v
-            for k, v in kernels_list_cktile.items()
-            if v.BlockPerCu in block_per_cu
+            k: v for k, v in kernels_list_cktile.items() if v.BlockPerCu in block_per_cu
         }
 
         gemm_keys = ["x", "weight", "x_scale", "w_scale", "out"]
@@ -246,7 +243,6 @@ class GemmA8W8Tuner(GemmCommonTuner):
                     )
                 )
         return tasks_cktile
-
 
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op
