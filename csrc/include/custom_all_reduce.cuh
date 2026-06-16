@@ -2456,14 +2456,7 @@ __global__ void __launch_bounds__(1024, 1)
                                           const T* __restrict__ cos_sin_cache,
                                           const int64_t* __restrict__ position_ids,
                                           int head_dim,
-                                          int rotary_dim,
-                                          opus::fp8_t* __restrict__ k_cache,
-                                          opus::fp8_t* __restrict__ v_cache,
-                                          float* __restrict__ k_scale,
-                                          float* __restrict__ v_scale,
-                                          const int64_t* __restrict__ slot_mapping,
-                                          int page_size,
-                                          int x_layout)
+                                          int rotary_dim)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int hidden_dim_qk       = hidden_dim_q + hidden_dim_k;
@@ -2632,13 +2625,6 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                              const int64_t* position_ids,
                                              int head_dim,
                                              int rotary_dim,
-                                             opus::fp8_t* k_cache,
-                                             opus::fp8_t* v_cache,
-                                             float* k_scale,
-                                             float* v_scale,
-                                             const int64_t* slot_mapping,
-                                             int page_size,
-                                             int x_layout,
                                              hipStream_t stream)
 {
     constexpr int PACK_SIZE      = 16 / sizeof(T);
@@ -2685,14 +2671,7 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                                     cos_sin_cache,
                                                     position_ids,
                                                     head_dim,
-                                                    rotary_dim,
-                                                    k_cache,
-                                                    v_cache,
-                                                    k_scale,
-                                                    v_scale,
-                                                    slot_mapping,
-                                                    page_size,
-                                                    x_layout);
+                                                    rotary_dim);
 }
 
 template <typename T, typename OutT, int ngpus>
@@ -4451,14 +4430,7 @@ void dispatchFusedQKNormAllReduce(hipStream_t stream,
                                   T* cos_sin_cache,
                                   int64_t* position_ids,
                                   int head_dim,
-                                  int rotary_dim,
-                                  opus::fp8_t* k_cache = nullptr,
-                                  opus::fp8_t* v_cache = nullptr,
-                                  float* k_scale = nullptr,
-                                  float* v_scale = nullptr,
-                                  int64_t* slot_mapping = nullptr,
-                                  int page_size = 0,
-                                  int x_layout = 0)
+                                  int rotary_dim)
 {
     auto d = 16 / sizeof(T);
     if(hidden_dim_q % d != 0 || hidden_dim_k % d != 0 || hidden_dim_v % d != 0)
@@ -4474,8 +4446,7 @@ void dispatchFusedQKNormAllReduce(hipStream_t stream,
         qknorm_allreduce_fusion_kernel_2stage_launcher<T, NGPUS, FUSE_ROPE>(         \
             ptrs, sg_, self_sg_, rank_, qkv_in, q_w, k_w, q_out, k_out, v_out,       \
             token_num, hidden_dim_q, hidden_dim_k, hidden_dim_v, eps, cos_sin_cache, \
-            position_ids, head_dim, rotary_dim, k_cache, v_cache, k_scale, v_scale,  \
-            slot_mapping, page_size, x_layout, stream);                              \
+            position_ids, head_dim, rotary_dim, stream);                             \
         return;                                                                      \
     }
 

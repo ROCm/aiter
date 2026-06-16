@@ -885,24 +885,24 @@ void fused_qknorm_allreduce_rope(fptr_t _fa,
         inp_ptr = (void*)reg_ptr;
     }
 
-#define DISPATCH_AR_ROPE_FUSION(DTYPE)                                                      \
-    {                                                                                        \
-        fa->dispatchFusedQKNormAllReduce<DTYPE, true>(stream,                                \
-                                                reinterpret_cast<DTYPE*>(inp_ptr),           \
-                                                reinterpret_cast<DTYPE*>(q_w.data_ptr()),    \
-                                                reinterpret_cast<DTYPE*>(k_w.data_ptr()),    \
-                                                reinterpret_cast<DTYPE*>(q_out.data_ptr()),  \
-                                                reinterpret_cast<DTYPE*>(k_out.data_ptr()),  \
-                                                reinterpret_cast<DTYPE*>(v_out.data_ptr()),  \
-                                                token_num,                                   \
-                                                hidden_dim_q,                                \
-                                                hidden_dim_k,                                \
-                                                hidden_dim_v,                                \
-                                                eps,                                         \
-                                                reinterpret_cast<DTYPE*>(cos_sin_cache.data_ptr()), \
+#define DISPATCH_AR_ROPE_FUSION(DTYPE)                                                               \
+    {                                                                                                \
+        fa->dispatchFusedQKNormAllReduce<DTYPE, true>(stream,                                        \
+                                                reinterpret_cast<DTYPE*>(inp_ptr),                   \
+                                                reinterpret_cast<DTYPE*>(q_w.data_ptr()),            \
+                                                reinterpret_cast<DTYPE*>(k_w.data_ptr()),            \
+                                                reinterpret_cast<DTYPE*>(q_out.data_ptr()),          \
+                                                reinterpret_cast<DTYPE*>(k_out.data_ptr()),          \
+                                                reinterpret_cast<DTYPE*>(v_out.data_ptr()),          \
+                                                token_num,                                           \
+                                                hidden_dim_q,                                        \
+                                                hidden_dim_k,                                        \
+                                                hidden_dim_v,                                        \
+                                                eps,                                                 \
+                                                reinterpret_cast<DTYPE*>(cos_sin_cache.data_ptr()),  \
                                                 reinterpret_cast<int64_t*>(position_ids.data_ptr()), \
-                                                head_dim,                                    \
-                                                rotary_dim);                                 \
+                                                head_dim,                                            \
+                                                rotary_dim);                                         \
     }
 
     switch(dtype)
