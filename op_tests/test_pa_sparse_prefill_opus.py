@@ -197,7 +197,9 @@ def _quantize_nope(real: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
     # Per-block E8M0 exponent chosen so the block max maps to (224, 448], i.e.
     # strictly inside the e4m3fn finite range (overflow -> NaN on cast).
-    e_unbiased = torch.ceil(torch.log2(amax.clamp(min=1e-30) / _FP8_MAX)).to(torch.int32)
+    e_unbiased = torch.ceil(torch.log2(amax.clamp(min=1e-30) / _FP8_MAX)).to(
+        torch.int32
+    )
     e_unbiased = torch.where(amax == 0, torch.zeros_like(e_unbiased), e_unbiased)
     e_byte = (e_unbiased + 127).clamp(0, 255).to(torch.uint8)  # [R, NBLK]
     s = torch.exp2(e_unbiased.to(torch.float32)).unsqueeze(-1)  # [R, NBLK, 1]
@@ -206,7 +208,7 @@ def _quantize_nope(real: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     deq = (q.to(torch.float32) * s).reshape(r, _FP8_D_NOPE)
 
     packed = torch.zeros(r, _FP8_D_NOPE_PADDED, dtype=torch.uint8, device=real.device)
-    packed[:, : _FP8_D_NOPE] = q.reshape(r, _FP8_D_NOPE).view(torch.uint8)
+    packed[:, :_FP8_D_NOPE] = q.reshape(r, _FP8_D_NOPE).view(torch.uint8)
     packed[:, _FP8_D_NOPE : _FP8_D_NOPE + _FP8_NBLK] = e_byte
     return packed.view(torch.float8_e4m3fn), deq
 
@@ -430,7 +432,9 @@ def _make_inputs_fp8(
     device = torch.device(device)
 
     def _streams(rows: int):
-        nope_fp8, deq = _quantize_nope(torch.randn(rows, _FP8_D_NOPE, device=device) * 0.5)
+        nope_fp8, deq = _quantize_nope(
+            torch.randn(rows, _FP8_D_NOPE, device=device) * 0.5
+        )
         rope = (torch.randn(rows, _FP8_D_ROPE, device=device) * 0.5).to(torch.bfloat16)
         row_fp32 = torch.cat([deq, rope.to(torch.float32)], dim=1)  # [rows, 512]
         return nope_fp8, rope, row_fp32
@@ -553,7 +557,14 @@ def run_pa_sparse_prefill_opus(
         ref_fn, ref_inputs = _ref_pa_sparse_prefill_fp8, data["ref"]
     else:
         kernel_inputs = _make_inputs(
-            n, h, d, total_pages, total_tokens, _PREC_TO_DTYPE[prec], mode=mode, seed=seed
+            n,
+            h,
+            d,
+            total_pages,
+            total_tokens,
+            _PREC_TO_DTYPE[prec],
+            mode=mode,
+            seed=seed,
         )
         kernel_fn = pa_sparse_prefill_opus
         ref_fn, ref_inputs = _ref_pa_sparse_prefill_opus, kernel_inputs
@@ -570,7 +581,9 @@ def run_pa_sparse_prefill_opus(
 
     if bench:
         # `@perftest()` returns (data, avg_us_per_iter).
-        _, lat_us = _profile_func(kernel_fn, **kernel_inputs, softmax_scale=softmax_scale)
+        _, lat_us = _profile_func(
+            kernel_fn, **kernel_inputs, softmax_scale=softmax_scale
+        )
         # Sparse attention FLOPS: 4 * H * total_nnz * D
         total_nnz = nnz_p + nnz_e
         flops = 4.0 * h * total_nnz * d
