@@ -185,11 +185,19 @@ namespace aiter {
                     for(int j = 0; j < fn_loads_per_row; j++) {
                         int K = lane_id + j * warp_size;
                         int K_swizzled = K ^ xor_mask;
-                        async_load(
-                            g_b,
-                            s_fn_wr_ptr + i * tile_k + K,
-                            fn_row * fn_stride + K_swizzled + k * tile_k + k_split_offset
-                        );
+                        // gfx1250 async_load uses a flat pointer with no buffer-descriptor
+                        // bounds check, so an out-of-range fn_row (tile_n > n_oob) would
+                        // page-fault instead of returning 0 like the gfx9 buffer path.
+                        // Zero the LDS slot directly for padding rows.
+                        if (fn_row < n_oob) {
+                            async_load(
+                                g_b,
+                                s_fn_wr_ptr + i * tile_k + K,
+                                fn_row * fn_stride + K_swizzled + k * tile_k + k_split_offset
+                            );
+                        } else {
+                            *(s_fn_wr_ptr + i * tile_k + K) = 0.0f;
+                        }
                     }
                 }
             } else {
@@ -200,11 +208,22 @@ namespace aiter {
                     int fn_row = fn_row_base + i;
                     int xor_mask = (fn_row & 0xF) << fn_xor_shift;
                     int K_swizzled = vec_col ^ xor_mask;
-                    async_load<fn_vec_size>(
-                        g_b,
-                        s_fn_wr_ptr + i * tile_k + vec_col,
-                        fn_row * fn_stride + K_swizzled + k * tile_k + k_split_offset
-                    );
+                    // gfx1250 async_load uses a flat pointer with no buffer-descriptor
+                    // bounds check, so an out-of-range fn_row (tile_n > n_oob) would
+                    // page-fault instead of returning 0 like the gfx9 buffer path.
+                    // Zero the LDS slot directly for padding rows.
+                    if (fn_row < n_oob) {
+                        async_load<fn_vec_size>(
+                            g_b,
+                            s_fn_wr_ptr + i * tile_k + vec_col,
+                            fn_row * fn_stride + K_swizzled + k * tile_k + k_split_offset
+                        );
+                    } else {
+                        #pragma unroll
+                        for (int v = 0; v < fn_vec_size; v++) {
+                            *(s_fn_wr_ptr + i * tile_k + vec_col + v) = 0.0f;
+                        }
+                    }
                 }
             }
         };
