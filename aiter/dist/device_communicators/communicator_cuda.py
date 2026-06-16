@@ -32,6 +32,7 @@ _FUSED_AR_RMS_QUANT_ALIASES = {
     "per_1x32": "mxfp4",
 }
 
+
 def _normalize_fused_ar_rms_quant_type(quant_type):
     if isinstance(quant_type, str):
         normalized = _FUSED_AR_RMS_QUANT_ALIASES.get(quant_type.lower())
@@ -51,42 +52,6 @@ def _normalize_fused_ar_rms_quant_type(quant_type):
     raise ValueError(
         "unsupported fused AR+RMSNorm quant_type="
         f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
-    )
-
-
-def _can_fused_ar_rms_quant(input_: torch.Tensor) -> bool:
-    hidden_dim = int(input_.shape[-1])
-    element_size = input_.element_size()
-    if hidden_dim <= 0:
-        return False
-    if input_.dtype not in (torch.float16, torch.bfloat16):
-        return False
-    if element_size <= 0 or 16 % element_size != 0:
-        return False
-    pack_size = 16 // element_size
-    return hidden_dim % pack_size == 0 and hidden_dim // pack_size <= 1024
-
-
-def _can_1stage_fused_ar_rms_quant(input_: torch.Tensor) -> bool:
-    return _can_fused_ar_rms_quant(input_)
-
-
-def _can_1stage_fused_ar_rms(input_: torch.Tensor, out_hidden_dim: int = 0) -> bool:
-    hidden_dim = int(input_.shape[-1])
-    element_size = input_.element_size()
-    if hidden_dim <= 0:
-        return False
-    if input_.dtype not in (torch.float16, torch.bfloat16):
-        return False
-    if element_size <= 0 or 16 % element_size != 0:
-        return False
-    pack_size = 16 // element_size
-    out_hidden_dim = out_hidden_dim or hidden_dim
-    return (
-        hidden_dim % pack_size == 0
-        and out_hidden_dim % pack_size == 0
-        and hidden_dim // pack_size <= 1024
-        and out_hidden_dim // pack_size <= 1024
     )
 
 
@@ -314,7 +279,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         use_1stage = (
             self._ar_1stage_override
             if self._ar_1stage_override is not None
-            else _can_1stage_fused_ar_rms(input_, out_n)
+            else (total_bytes <= 128 * 1024)
         )
         if (
             not use_general_path
@@ -435,14 +400,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("emit_bf16 is not supported for per-token FP8 quant")
         total_bytes = input_.numel() * input_.element_size()
         if (
-            _can_fused_ar_rms_quant(input_)
+            int(input_.shape[-1]) in [512, 1024, 2048, 4096]
             and total_bytes <= 4096 * 1024
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else _can_1stage_fused_ar_rms_quant(input_)
+                else (total_bytes <= 128 * 1024)
             )
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
                 input_, res_inp_, weight_, eps, use_1stage
@@ -481,20 +446,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         K = input_.shape[-1]
         fused_ok = False
         out = res_out = scale_out = bf16_out = None
-        ca_comm = self.ca_comm
-        input_is_packable_slice = can_pack_2d_last_dim_slice(input_)
-        can_use_custom_ar_input = ca_comm is not None and (
-            ca_comm.should_custom_ar(input_, prefill_support)
-            or (
-                input_is_packable_slice
-                and ca_comm.should_custom_ar_bytes(input_, prefill_support)
-            )
-        )
         if (
-            ca_comm is not None
-            and not ca_comm.disabled
-            and can_use_custom_ar_input
-            and K % group_size == 0
+            K % group_size == 0
             and K <= 16384
             and total_bytes < 8 * 1024 * 8192
             and self.world_size != 6
@@ -503,28 +456,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else _can_1stage_fused_ar_rms_quant(input_)
+                else (total_bytes <= 128 * 1024)
             )
-            result = ca_comm.custom_fused_ar_rms_per_group_quant(
-                input_,
-                res_inp_,
-                weight_,
-                eps,
-                group_size,
-                use_1stage,
-                emit_bf16=emit_bf16,
-                prefill_support=prefill_support,
-            )
-            if result is None:
-                raise RuntimeError(
-                    "custom_fused_ar_rms_per_group_quant returned None after "
-                    "the fused path eligibility checks passed"
+            try:
+                result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
+                    input_,
+                    res_inp_,
+                    weight_,
+                    eps,
+                    group_size,
+                    use_1stage,
+                    emit_bf16=emit_bf16,
                 )
-            if emit_bf16:
-                out, res_out, scale_out, bf16_out = result
-            else:
-                out, res_out, scale_out = result
-            fused_ok = True
+                if emit_bf16:
+                    out, res_out, scale_out, bf16_out = result
+                else:
+                    out, res_out, scale_out = result
+                fused_ok = True
+            except Exception:
+                pass
         if not fused_ok:
             out_, res_out = self.fused_allreduce_rmsnorm(
                 input_, res_inp_, weight_, eps, prefill_support
