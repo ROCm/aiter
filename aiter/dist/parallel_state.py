@@ -178,11 +178,11 @@ def fused_allreduce_rmsnorm_quant_fake(
     return (
         torch.empty_like(res_inp),
         torch.empty_like(inp),
-        torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device()),
+        torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device),
     )
 
 
-@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_quant_fake)
 def fused_allreduce_rmsnorm_quant_(
     inp: torch.Tensor,
     res_inp: torch.Tensor,
