@@ -1227,14 +1227,8 @@ class CustomAllreduce:
         group_size: int = 128,
         use_1stage: bool = False,
         emit_bf16: bool = False,
-        prefill_support: bool = False,
     ):
-        input_is_weak_contiguous = is_weak_contiguous(input)
-        input_is_packable_slice = can_pack_2d_last_dim_slice(input)
-        can_use_input = self.should_custom_ar(input, prefill_support) or (
-            input_is_packable_slice and self.should_custom_ar_bytes(input, prefill_support)
-        )
-        if self.disabled or not can_use_input:
+        if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
@@ -1244,7 +1238,7 @@ class CustomAllreduce:
                     w=weight,
                     eps=eps,
                     group_size=group_size,
-                    registered=input_is_weak_contiguous,
+                    registered=True,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                 )
