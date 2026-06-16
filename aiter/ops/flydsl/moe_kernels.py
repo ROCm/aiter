@@ -1046,6 +1046,8 @@ def flydsl_silu_and_mul_interleaved(
     num_valid_ids: torch.Tensor,
     token_num: int,
     topk: int,
+    quant_mode: str = "none",
+    gui_layout: bool = True,
 ) -> None:
     """Fused silu activation for interleaved (gate/up block-interleaved) layout.
 
@@ -1057,8 +1059,8 @@ def flydsl_silu_and_mul_interleaved(
     _silu_fn = _get_compiled_silu_fused(
         inter_dim,
         topk,
-        quant_mode="none",
-        gui_layout=True,
+        quant_mode=quant_mode,
+        gui_layout=gui_layout,
         act="silu",
     )
     empty_scale = torch.empty(0, dtype=torch.uint8, device=out.device)
