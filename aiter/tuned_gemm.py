@@ -27,7 +27,13 @@ from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logge
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.flydsl.utils import is_flydsl_available
+try:
+    from aiter.ops.flydsl.utils import is_flydsl_available
+except ImportError:
+
+    def is_flydsl_available():
+        return False
+
 from aiter.ops.gemm_op_common import get_padded_m
 from torch import Tensor
 
