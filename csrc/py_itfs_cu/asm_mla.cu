@@ -178,7 +178,13 @@ void mla_decode_stage1_asm_fwd(
     args.ptr_GKVTP       = (g_kv_indptr != nullptr) ? g_kv_indptr->data_ptr() : nullptr;
     args.s_cp_world_size = (cp_world_size > 0) ? (unsigned int)cp_world_size : 1u;
     args.s_cp_rank       = (cp_rank >= 0) ? (unsigned int)cp_rank : 0u;
-
+    if (args.ptr_GKVTP != nullptr)
+    {
+        AITER_CHECK(cp_world_size > 0,
+                    __func__, ": cp_world_size must be > 0 when g_kv_indptr is provided");
+        AITER_CHECK(cp_rank >= 0 && cp_rank < cp_world_size,
+                    __func__, ": cp_rank must be in [0, cp_world_size) when g_kv_indptr is provided");
+    }
     if (persistent)
     {
         args.out_16_nosplit = kv_split;

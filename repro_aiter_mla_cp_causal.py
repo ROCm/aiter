@@ -78,7 +78,6 @@ def aiter_decode(q_local, kv_local, qlen, cp_world_size=1, cp_rank=0, s_global=N
     """
     Lloc = kv_local.shape[0]
     o = torch.zeros(qlen, NHEAD, L, dtype=DT, device=DEV)
-    lse = torch.zeros(qlen, NHEAD, dtype=torch.float32, device=DEV)
 
     kv_buffer = (
         kv_local if Lloc > 0 else torch.zeros(1, D, dtype=DT, device=DEV)
@@ -142,6 +141,7 @@ def aiter_decode(q_local, kv_local, qlen, cp_world_size=1, cp_rank=0, s_global=N
         intra_batch_mode=False,
         dtype_q=DT,
         dtype_kv=DT,
+        is_cp_round_robin=True,
     )
 
     _, final_lse = mla_decode_fwd(
@@ -271,8 +271,8 @@ print(f"  Expected: out==0 and lse==-inf -> {'PASS' if out_ok and lse_ok else 'F
 # --------------------------------------------------------------------------- #
 # End-to-end: sanitized AITER per-rank -> merge vs golden
 # --------------------------------------------------------------------------- #
-san = [sanitize(o, l) for o, l in zip(ait_outs, ait_lses)]
-ait_merged = merge([o for o, _ in san], [l for _, l in san])
+san = [sanitize(o, lse) for o, lse in zip(ait_outs, ait_lses)]
+ait_merged = merge([o for o, _ in san], [lse for _, lse in san])
 ait_err = (ait_merged - gold_out).abs().max().item()
 print("\n[END-TO-END] AITER (sanitized) merge vs golden:")
 print(f"  max|diff| = {ait_err:.3e}   (cp-aware ref diff = {cpa_err:.2e})")
