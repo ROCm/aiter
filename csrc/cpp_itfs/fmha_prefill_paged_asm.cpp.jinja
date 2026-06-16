@@ -25,7 +25,7 @@ struct __attribute__((packed)) KernelArgs
     int32_t  s_k_Seqs;      int32_t _p12[3]; // 0x0C0  K vec-col stride in bytes (16 for vkcolv)
     int32_t  s_k_Hs;        int32_t _p13[3]; // 0x0D0  K head stride in bytes
     int32_t  s_k_Bs;        int32_t _p14[3]; // 0x0E0  K batch stride (0: paged)
-    int32_t  s_opt;         int32_t _p15[3]; // 0x0F0  flags (not read by PS kernel)
+    int32_t  s_opt;         int32_t _p15[3]; // 0x0F0  num_pages (total KV pool pages; SRD bound)
     int32_t  s_lse;         int32_t _p16[3]; // 0x100  1 if LSE requested (0)
     int32_t  s_kv_seq_len;  int32_t _p17[3]; // 0x110  max_seqlen_k
     int32_t  s_qk_head_dim; int32_t _p18[3]; // 0x120  128
@@ -44,11 +44,11 @@ struct __attribute__((packed)) KernelArgs
     int32_t  s_log2_plen;   int32_t _p29[3]; // 0x1D0  log2(page_size) = 4
     int32_t  s_K_page_stride; int32_t _p30[3];// 0x1E0  K page stride (bytes); kernel reads lo dword
     int32_t  s_V_page_stride; int32_t _p31[3];// 0x1F0  V page stride (bytes); kernel reads lo dword
-    void    *ptr_q_descale; uint64_t _p32;   // 0x200  q_descale_per_token [total_q, nhead_q] fp32
+    void    *ptr_q_descale; uint64_t _p32;   // 0x200  q_descale [batch, nhead_q, max_seqlen_q] fp32
     void    *ptr_k_descale; uint64_t _p33;   // 0x210  k_descale_per_token [pages, page_size, nhead_k] fp32
     void    *ptr_v_descale; uint64_t _p34;   // 0x220  v_descale_per_head  [nhead_k] fp32
     int32_t  s_descale_q_Bs;  int32_t _p35[3];// 0x230  q_descale batch byte stride (= max_seqlen_q*4)
-    int32_t  s_descale_q_Hs;  int32_t _p36[3];// 0x240  q_descale head byte stride (= total_q*4)
+    int32_t  s_descale_q_Hs;  int32_t _p36[3];// 0x240  q_descale head byte stride (= max_seqlen_q*4)
     int32_t  s_kscale_page_stride;  int32_t _p37[3]; // 0x250 k_descale page stride (elements; kernel <<2)
     int32_t  s_kscale_token_stride; int32_t _p38[3]; // 0x260 k_descale token stride (elements; kernel <<2)
     int32_t  s_vscale_Bs;  int32_t _p39[3]; // 0x270  v_descale batch byte stride (0: no batch dim)
@@ -80,7 +80,7 @@ void {{func_name}}(
     int   page_size,            // must be 16
     void* kv_page_indices,      // [num_pages_used] int32
     void* kv_indptr,            // [batch+1] int32
-    void* q_descale_per_token,  // [nhead_q, total_q] fp32  (head-major)
+    void* q_descale_per_token,  // [batch, nhead_q, max_seqlen_q] fp32
     void* k_descale_per_token,  // [num_pages, page_size, nhead_k] fp32
     void* v_descale_per_head,   // [nhead_k] fp32
     void* p_scale,              // [nhead_q] fp32, nullable
@@ -160,7 +160,7 @@ void {{func_name}}(
     args.s_k_Seqs       = 16;               // K vec-col stride: 16 fp8 elements (kVecX)
     args.s_k_Hs         = k_head_stride_bytes; // K head stride in bytes
     args.s_k_Bs         = 0;               // K/V not batch-strided (paged)
-    args.s_opt          = 0;
+    args.s_opt          = num_pages;  // total KV pool pages; kernel uses for SRD bound
     args.s_lse          = 0;
     args.s_kv_seq_len   = max_seqlen_k;
     args.s_qk_head_dim  = 128;
@@ -182,11 +182,10 @@ void {{func_name}}(
     args.ptr_q_descale  = q_descale_per_token;
     args.ptr_k_descale  = k_descale_per_token;
     args.ptr_v_descale  = v_descale_per_head;
-    // Q descale: [nhead_q, total_q] fp32 (head-major, transposed by Python caller)
-    // head stride = total_q * 4; within a head, tokens are contiguous (stride 4 per token)
-    // batch stride = max_seqlen_q * 4 (advance within a head's row by one batch entry)
-    args.s_descale_q_Bs = max_seqlen_q * 4;
-    args.s_descale_q_Hs = total_q * 4;   // bytes per head (= total_q elements)
+    // Q descale: [batch, nhead_q, max_seqlen_q] fp32 (batch-head-major, arranged by Python caller)
+    // head stride = max_seqlen_q * 4; batch stride = nhead_q * max_seqlen_q * 4
+    args.s_descale_q_Bs = nhead_q * max_seqlen_q * 4;
+    args.s_descale_q_Hs = max_seqlen_q * 4;
     // K descale strides: [pages, page_size, nhead_k] fp32 — passed as elements, kernel <<2
     args.s_kscale_page_stride  = page_size * nhead_k;
     args.s_kscale_token_stride = nhead_k;
@@ -194,10 +193,11 @@ void {{func_name}}(
     // V descale: [nhead_k] fp32 — no batch dim
     args.s_vscale_Bs    = 0;
     args.s_vscale_Hs    = 4;   // bytes per kv-head
-    // P scale (optional)
+    // P scale (optional) — strides must be 0 when pointer is null, otherwise
+    // tgid_z * s_p_scale_Bs for batch>0 reads garbage from a non-null offset
     args.ptr_p_scale    = p_scale;
-    args.s_p_scale_Bs   = nhead_q * 4;
-    args.s_p_scale_Hs   = 4;
+    args.s_p_scale_Bs   = p_scale ? nhead_q * 4 : 0;
+    args.s_p_scale_Hs   = p_scale ? 4 : 0;
     // Persistent snake scheduler
     args.s_sched_groups = sched_groups;
 

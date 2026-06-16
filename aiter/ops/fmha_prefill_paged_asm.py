@@ -74,13 +74,22 @@ def fmha_prefill_paged_asm_launch(
     # Output head byte stride: stride between heads = 128 * sizeof(bf16) = 256 bytes
     o_head_stride_bytes = out.stride(1) * out.element_size()
 
+    # The kernel uses fixed stride s_Bs = max_seqlen_q * q_token_stride for Q/O addressing,
+    # so it only works correctly when every batch entry has exactly max_seqlen_q tokens.
+    seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+    if any(s != max_seqlen_q for s in seqlens_q):
+        return None, None, None, None  # signal caller to fall back to CK
+
     props = torch.cuda.get_device_properties(q.device)
     num_cu = props.multi_processor_count
     sched_groups = _sched_groups(num_cu, nhead_q, max_seqlen_q)
 
-    # Kernel expects q_descale in [nhead_q, total_q] layout (head-major).
-    # Incoming q_descale_per_token is [total_q, nhead_q] (token-major) — transpose it.
-    q_descale_hm = q_descale_per_token.t().contiguous()  # [nhead_q, total_q]
+    # Kernel expects q_descale in [batch, nhead_q, max_seqlen_q] layout.
+    # All seqlens equal max_seqlen_q here, so a simple reshape+permute suffices.
+    q_descale_hm = (q_descale_per_token
+                    .reshape(batch, max_seqlen_q, nhead_q)
+                    .permute(0, 2, 1)
+                    .contiguous())  # [batch, nhead_q, max_seqlen_q]
 
     _get_impl()(
         *torch_to_c_types(

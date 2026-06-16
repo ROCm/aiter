@@ -2942,7 +2942,7 @@ def _mha_batch_prefill(
         and causal
     ):
         from aiter.ops.fmha_prefill_paged_asm import fmha_prefill_paged_asm_launch
-        return fmha_prefill_paged_asm_launch(
+        asm_result = fmha_prefill_paged_asm_launch(
             q, k, v,
             cu_seqlens_q, kv_indptr, kv_page_indices, kv_last_page_lens,
             max_seqlen_q, max_seqlen_k, softmax_scale, causal,
@@ -2950,6 +2950,8 @@ def _mha_batch_prefill(
             p_scale, p_scale_inv,
             out,
         )
+        if asm_result[0] is not None:
+            return asm_result
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_batch_prefill(
