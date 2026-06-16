@@ -3136,8 +3136,8 @@ def run_batch_prefill_per_token_head(
     ):
         return {"status": "skipped"}
 
-    qo_lens = build_qo_lens(batch_size, qo_len, randomize=batch_size > 1)
-    kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=batch_size > 1)
+    qo_lens = build_qo_lens(batch_size, qo_len, randomize=False)
+    kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=False)
     max_qo_len = qo_lens.max().item()
     max_kv_len = kv_lens.max().item()
 
