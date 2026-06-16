@@ -118,7 +118,6 @@ else:
     from .ops.trans_ragged_layout import *  # noqa: F403,E402
     from .ops.sample import *  # noqa: F403,E402
     from .ops.fused_qk_norm_mrope_cache_quant import *  # noqa: F403,E402
-    from .ops.fused_minimax_m3_qknorm_rope_kv_insert import *  # noqa: F403,E402
     from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
     from .ops.fused_qk_rmsnorm_group_quant import *  # noqa: F403,E402
     from .ops.groupnorm import *  # noqa: F403,E402
