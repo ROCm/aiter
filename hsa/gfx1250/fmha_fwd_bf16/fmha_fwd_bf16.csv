@@ -1,0 +1,3 @@
+dtype,hdim_q,hdim_v,mask,knl_name,co_name
+bf16,64,64,1,_ZN5aiter35fmha_bf16_pertokenBf16_hd64_128x256E,fmha_bf16_pertokenBf16_hd64_128x256.co
+bf16,128,128,1,_ZN5aiter36fmha_bf16_pertokenBf16_hd128_128x256E,fmha_bf16_pertokenBf16_hd128_128x256.co

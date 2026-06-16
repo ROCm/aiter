@@ -1028,6 +1028,7 @@ void mla_reduce_v1(
     const std::optional<torch::Tensor>& reduce_final_map, // contiguous [#work, 2]
     const torch::Tensor& reduce_partial_map,              // contiguous [reduce_indptr[-1]]
     const int32_t max_seqlen_q,
+    const int32_t num_kv_splits,
     torch::Tensor& final_output,             //            [bs, h, dv]
     std::optional<torch::Tensor>& final_lse) // contiguous [bs, h]
 {
@@ -1067,7 +1068,7 @@ void mla_reduce_v1(
         params.p_partial_output     = partial_output.data_ptr();
         params.stride_s_o           = final_output.stride(-3);
         params.stride_h_o           = final_output.stride(-2);
-        params.max_splits           = dev_prop.multiProcessorCount;
+        params.max_splits           = max(dev_prop.multiProcessorCount, num_kv_splits);
         params.num_reduce_tile      = num_reduce_tile;
         params.output_lse           = output_lse;
         params.use_reduce_final_map = !no_reduce_final_map;

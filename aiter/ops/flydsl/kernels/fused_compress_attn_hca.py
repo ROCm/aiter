@@ -59,7 +59,7 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from .tensor_shim import STensor, _to_raw
+from .tensor_shim import STensor, _to_raw, _run_compiled
 
 # Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
 # (the multi-wave LDS kernel references CompilationContext, STensor,
@@ -1203,7 +1203,7 @@ def flydsl_hca_compress_attn(
         k_split_num_waves=k_split_num_waves,
         slice_size=slice_size,
     )
-    compress_fn(
+    compress_args = (
         kv_in,
         int(kv_in.stride(0)),
         score_in,
@@ -1220,8 +1220,9 @@ def flydsl_hca_compress_attn(
         kv_compressed,
         int(kv_compressed.stride(0)),
         int(plan_capacity),
-        stream=stream_obj,
+        stream_obj,
     )
+    _run_compiled(compress_fn, *compress_args)
 
     rms_weight_is_bf16 = rms_weight.dtype == torch.bfloat16
     norm_fn = compile_hca_norm_rope_scatter(
@@ -1232,7 +1233,7 @@ def flydsl_hca_compress_attn(
         rms_weight_is_bf16=rms_weight_is_bf16,
         rms_eps=rms_eps,
     )
-    norm_fn(
+    norm_args = (
         kv_compressed,
         int(kv_compressed.stride(0)),
         plan_gpu,
@@ -1245,5 +1246,6 @@ def flydsl_hca_compress_attn(
         block_tables,
         int(block_tables.stride(0)),
         int(plan_capacity),
-        stream=stream_obj,
+        stream_obj,
     )
+    _run_compiled(norm_fn, *norm_args)
