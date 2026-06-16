@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
 
+from chip_info import get_gfx  # noqa: E402
 
 @dataclass
 class kernelInstance:
@@ -243,9 +244,37 @@ default_kernels_dict = {
     (-10):                 kernelInstance(       128,        16,        32,       128,           16,         16,          1,          1,      [8, 16, 1],      [8, 16, 1],   [1, 16, 1, 8],  [4, 4, 1],           1,           1, "Intrawave",  2),
 }
 
-kernels_list_cktile = {
-    0:  tileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           32,      "Intrawave",        False,             True,           False,             1      ),
+kernels_list_cktile_942 = {
+    #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
+     0:   tileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,           32,      "Intrawave",        False,             True,           False,             1      ),
+     1:   tileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,           32,      "Intrawave",        False,             True,           False,             2      ),
+     2:   tileKernelInstance(    32,     128,      128,     1,        4,       1,        16,            16,           32,      "Intrawave",        False,             True,           False,             1      ),
+     3:   tileKernelInstance(    32,     128,      128,     1,        4,       1,        16,            16,           32,      "Intrawave",        False,             True,           False,             2      ),
+     4:   tileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           32,      "Intrawave",        False,             True,           False,             1      ),
+     5:   tileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,           32,      "Intrawave",        False,             True,           False,             2      ),
 }
+
+kernels_list_cktile_95x = {
+    #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
+     0:   tileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
+     1:   tileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
+     2:   tileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,           64,      "Intrawave",        False,             True,           False,             1      ),
+     3:   tileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,           64,      "Intrawave",        False,             True,           False,             2      ),
+     4:   tileKernelInstance(    32,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
+     5:   tileKernelInstance(    32,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
+     6:   tileKernelInstance(    32,     128,      128,     1,        4,       1,        16,            16,           64,      "Intrawave",        False,             True,           False,             1      ),
+     7:   tileKernelInstance(    32,     128,      128,     1,        4,       1,        16,            16,           64,      "Intrawave",        False,             True,           False,             2      ),
+     8:   tileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
+     9:   tileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
+    10:   tileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
+}
+
+arch = get_gfx()
+# TODO: use expand_blockpercu as in csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_cktile_instance.py?
+if arch.startswith("gfx95"):
+    kernels_list_cktile = kernels_list_cktile_95x
+else:
+    kernels_list_cktile = kernels_list_cktile_942
 
 default_kernels_dict_cktile = {
     (-1):  tileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           32,      "Intrawave",        False,             True,           False,             1      ),
