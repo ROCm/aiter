@@ -271,7 +271,7 @@ def ref_pa_decode(
     softmax_scale,
     sink=None,
 ):
-    """Torch host reference for the gfx1250 PA-decode kernel (no sink, mtp=0).
+    """Torch host reference for the gfx1250 PA-decode kernel (handles mtp + sink).
 
     De-interleaves the tiled paged FP8 K/V into token-major [token, head, dim]
     (matching test_pa_ps.py's k-cache reconstruction / asm_V_shuffle), dequants
@@ -290,10 +290,15 @@ def ref_pa_decode(
     token (`ctx - mtp + 1 + i`), but the GPU follows the no-`+1` border above.
     For mtp=0 this is the full context (no-op).
 
-    sink (optional): per-Q-head fp32 logits in the kernel's PRE-SCALE raw domain,
-    shape [kv_head_num*gqa].  It adds one virtual logit `s_eff*sink_raw` (s_eff =
-    query_scale*key_scale*softmax_scale) to each row's softmax denominator; the
-    sink has no value, so it only shrinks the real-token weights.
+    sink (optional): per-Q-head fp32 logits in the kernel's SCALED domain (GPT-OSS/
+    Triton convention), shape [kv_head_num*gqa].  The kernel divides the loaded sink
+    by s_eff once (work-loop SINK-DOMAIN) so its softmax merge contributes exactly
+    exp(sink) — i.e. the sink competes directly with the SCALED scores (q.k)*s_eff.
+    So the reference appends the sink logit AS-IS (NOT *s_eff): it adds one virtual
+    logit `sink` to each row's softmax denominator.  This domain is identical for the
+    kernel's split (store_partial_results SINK-SPLIT, owner-only) and non-split
+    (pa_normalize do_sink=1) paths, so one reference covers both.  The sink has no
+    value, so it only shrinks the real-token weights.
     """
     num_pages, kv_head_num = K.shape[0], K.shape[1]
     head_dim = Q.shape[-1]
@@ -302,9 +307,9 @@ def ref_pa_decode(
     mtp = qlen - 1
     device = Q.device
     s_eff = query_scale * key_scale * softmax_scale
-    sink_hg = (
-        (sink.float().view(kv_head_num, gqa) * s_eff) if sink is not None else None
-    )
+    # SCALED-domain sink: append `sink` directly (the kernel's /s_eff makes its merge
+    # = exp(sink), competing with the scaled scores).  Do NOT multiply by s_eff.
+    sink_hg = sink.float().view(kv_head_num, gqa) if sink is not None else None
 
     # K[p,h,d//16,tok,d%16] -> K_tm[p,h,tok,d];  V[p,h,tok//16,d,tok%16] -> V_tm[p,h,tok,d]
     K_tm = (
