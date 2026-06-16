@@ -64,6 +64,21 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
                 ),
             ]
         elif arch.is_rdna:
+            # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni
+            # ViT prefill shape (B=1, S=3200, H=16, head_dim=72, fp16).
+            if arch.name == "gfx1151":
+                return [
+                    triton.Config(
+                        {
+                            "BLOCK_M": 128,
+                            "BLOCK_N": 64,
+                            "PRE_LOAD_V": False,
+                            "waves_per_eu": 2,
+                        },
+                        num_stages=1,
+                        num_warps=8,
+                    ),
+                ]
             BLOCK_N = 64 if arch.name == "gfx1100" else 32
             return [
                 triton.Config(
@@ -166,6 +181,21 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
                     )
                 ]
         elif arch.is_rdna:
+            # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni
+            # ViT prefill shape (B=1, S=3200, H=16, head_dim=72, fp16).
+            if arch.name == "gfx1151":
+                return [
+                    triton.Config(
+                        {
+                            "BLOCK_M": 128,
+                            "BLOCK_N": 64,
+                            "PRE_LOAD_V": False,
+                            "waves_per_eu": 2,
+                        },
+                        num_stages=1,
+                        num_warps=8,
+                    ),
+                ]
             BLOCK_N = 64 if arch.name == "gfx1100" else 32
             return [
                 triton.Config(
@@ -941,6 +971,7 @@ def attn_fwd(
     USE_SEQUSED: tl.constexpr,
     FORCE_MASKING: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
+    HEAD_STRIDE_ALIGNED_8: tl.constexpr = False,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32
@@ -1091,17 +1122,29 @@ def attn_fwd(
 
     # Initialize for processing
     # Compute pointers for all the tensors used in this kernel.
-    q_offset = (
-        Q + off_z * stride_qz + off_h_q * stride_qh + cu_seqlens_q_start * stride_qm
-    )
+    # When the caller guarantees that the head-axis strides of Q/K/V are
+    # multiples of 8 elements (set via HEAD_STRIDE_ALIGNED_8), the head-axis
+    # offset is a multiple of 8 *elements*. The resulting byte alignment is
+    # element-size dependent: 16 bytes for 16-bit types (fp16/bf16), 8 bytes
+    # for fp8, 32 bytes for fp32. The 16-byte case is the one that lets
+    # AxisInfo widen the K/V global load to a 128-bit (buffer_load_b128)
+    # access; for the other dtypes the hint is still sound but yields a
+    # different (smaller or larger) vector width. Auto-specialization only
+    # fires at the 16-element threshold, so hint the smaller multiple
+    # explicitly.
+    qh_off = off_h_q * stride_qh
+    kh_off = off_h_k * stride_kh
+    vh_off = off_h_k * stride_vh
+    if HEAD_STRIDE_ALIGNED_8:
+        qh_off = tl.multiple_of(qh_off, 8)
+        kh_off = tl.multiple_of(kh_off, 8)
+        vh_off = tl.multiple_of(vh_off, 8)
+
+    q_offset = Q + off_z * stride_qz + qh_off + cu_seqlens_q_start * stride_qm
     q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qk
-    k_offset = (
-        K + off_z * stride_kz + off_h_k * stride_kh + cu_seqlens_k_start * stride_kn
-    )
+    k_offset = K + off_z * stride_kz + kh_off + cu_seqlens_k_start * stride_kn
     k_ptrs = k_offset + offs_d_qk[:, None] * stride_kk + offs_n[None, :] * stride_kn
-    v_offset = (
-        V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
-    )
+    v_offset = V + off_z * stride_vz + vh_off + cu_seqlens_k_start * stride_vk
     v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v[None, :] * stride_vn
     if USE_BIAS:
         # Note: this might get large enough to overflow on some configs
@@ -1784,6 +1827,15 @@ def attention_forward_prefill_triton_impl(
 
     num_xcd = 1 if arch.is_rdna else 8
 
+    # Soundness precondition for the `tl.multiple_of` head-stride hint inside
+    # `attn_fwd`: only enable it when every Q/K/V head-axis stride is a
+    # multiple of 8 elements. With a non-contiguous input (e.g. a transposed
+    # view) stride_*h need not equal head_dim, so the head_dim constexpr
+    # alone is not enough.
+    head_stride_aligned_8 = (
+        stride_qh % 8 == 0 and stride_kh % 8 == 0 and stride_vh % 8 == 0
+    )
+
     # launch kernel
     def grid(META):
         return (nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]), batch)
@@ -1864,4 +1916,5 @@ def attention_forward_prefill_triton_impl(
         USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
         FORCE_MASKING=force_masking,
         NUM_XCD=num_xcd,
+        HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
     )
