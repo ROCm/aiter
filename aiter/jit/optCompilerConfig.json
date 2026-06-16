@@ -515,7 +515,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-ffast-math'"
+            "'-ffast-math'",
+            "'-mllvm -enable-post-misched=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],

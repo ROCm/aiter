@@ -1335,6 +1335,21 @@ namespace py = pybind11;
           py::arg("kv_indptr_extend"),                 \
           py::arg("attn_sink"),                        \
           py::arg("out"),                              \
+          py::arg("softmax_scale"));                   \
+    m.def("pa_sparse_prefill_fp8_opus_fwd",            \
+          &pa_sparse_prefill_fp8_opus_fwd,             \
+          py::arg("q_nope"),                           \
+          py::arg("q_rope"),                           \
+          py::arg("unified_kv_nope"),                  \
+          py::arg("unified_kv_rope"),                  \
+          py::arg("kv_indices_prefix"),                \
+          py::arg("kv_indptr_prefix"),                 \
+          py::arg("kv_nope"),                          \
+          py::arg("kv_rope"),                          \
+          py::arg("kv_indices_extend"),                \
+          py::arg("kv_indptr_extend"),                 \
+          py::arg("attn_sink"),                        \
+          py::arg("out"),                              \
           py::arg("softmax_scale"));
 
 #define NORM_PYBIND                                \
