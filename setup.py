@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.2.0.dev20260608+c957349"
+FLYDSL_VERSION = "flydsl==0.2.0.dev20260616+4fff65b"
 FLYDSL_FIND_LINKS = (
     "https://rocm.frameworks-devreleases.amd.com/whl/gfx942-gfx950/flydsl/"
 )
@@ -479,7 +479,7 @@ else:
         "einops",
         "psutil",
         "packaging",
-        "flydsl>=0.2.0.dev20260608",
+        "flydsl>=0.2.0.dev20260616",
     ]
 
 setup(

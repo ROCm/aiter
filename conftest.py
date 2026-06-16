@@ -1,6 +1,6 @@
 from importlib.metadata import version
 
-EXPECTED_FLYDSL_VERSION = "0.2.0.dev20260608+c957349"
+EXPECTED_FLYDSL_VERSION = "0.2.0.dev20260616+4fff65b"
 
 
 def pytest_configure(config):
