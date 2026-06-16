@@ -125,177 +125,197 @@ def compile_one_config(**job):
     )
 
     aot_arch = job.pop("gfx", "") or GROUPED_MOE_AOT_ARCH_DEFAULT
+    shape_str = (
+        f"{job.get('kernel_name', 'grouped_gemm')}  "
+        f"model_dim={job['model_dim']} inter_dim={job['inter_dim']} "
+        f"E={job['experts']} topk={job['topk']} "
+        f"contiguous={bool(job.get('grouped_contiguous_m', False))}"
+    )
 
     t0 = time.time()
-    dev = torch.device("cpu")
-    dtype = torch.bfloat16 if job["out_dtype"] == "bf16" else torch.float16
-    pack = 2 if job["data_format"] == "fp4" else 1
-    compiler1 = (
-        compile_moe_grouped_gemm1_mxfp4_masked
-        if job["data_format"] == "fp4"
-        else compile_moe_grouped_gemm1_a8w4_masked
-    )
-    compiler2 = (
-        compile_moe_grouped_gemm2_mxfp4_masked
-        if job["data_format"] == "fp4"
-        else compile_moe_grouped_gemm2_a8w4_masked
-    )
-    warp_tile_m = job["tile_m"] // job["m_warp"]
-    warp_tile_n = job["tile_n"] // job["n_warp"]
-    contiguous = bool(job.get("grouped_contiguous_m", False))
-    common = dict(
-        model_dim=job["model_dim"],
-        inter_dim=job["inter_dim"],
-        experts=job["experts"],
-        max_m=job["max_m"],
-        tile_m=job["tile_m"],
-        tile_n=job["tile_n"],
-        tile_k=job["tile_k"],
-        m_warp=job["m_warp"],
-        n_warp=job["n_warp"],
-        out_dtype=job["out_dtype"],
-        num_buffers=job["num_buffers"],
-        grouped_persistent_m=job["grouped_persistent_m"],
-        grouped_contiguous_m=contiguous,
-        persistent_workers=job["persistent_workers"],
-        expert_sched_mode=job["expert_sched_mode"],
-    )
-    if contiguous:
-        act_lead = 1
-        ub = job["token_num"] * job["topk"] + job["experts"] * (job["tile_m"] - 1)
-        rows = max(job["tile_m"], _align_up(ub, job["tile_m"]))
-    else:
-        act_lead = job["experts"]
-        rows = job["max_m"]
-    with compile_only_env(), override_env(
-        "FLYDSL_GPU_ARCH", aot_arch
-    ), FakeTensorMode():
-        masked_m = torch.full(
-            (job["experts"],), job["max_m"], dtype=torch.int32, device=dev
+    try:
+        dev = torch.device("cpu")
+        dtype = torch.bfloat16 if job["out_dtype"] == "bf16" else torch.float16
+        pack = 2 if job["data_format"] == "fp4" else 1
+        compiler1 = (
+            compile_moe_grouped_gemm1_mxfp4_masked
+            if job["data_format"] == "fp4"
+            else compile_moe_grouped_gemm1_a8w4_masked
         )
-        # Contiguous-M layout tensor (mirrors runtime psum_t); None otherwise.
-        contiguous_layout = (
-            torch.empty((job["experts"],), dtype=torch.int32, device=dev)
-            if contiguous
-            else None
+        compiler2 = (
+            compile_moe_grouped_gemm2_mxfp4_masked
+            if job["data_format"] == "fp4"
+            else compile_moe_grouped_gemm2_a8w4_masked
         )
-        y1 = torch.empty((act_lead, rows, job["inter_dim"]), dtype=dtype)
-        x1 = torch.empty((act_lead, rows, job["model_dim"] // pack), dtype=torch.uint8)
-        w1 = torch.empty(
-            (job["experts"], 2 * job["inter_dim"], job["model_dim"] // 2),
-            dtype=torch.uint8,
+        warp_tile_m = job["tile_m"] // job["m_warp"]
+        warp_tile_n = job["tile_n"] // job["n_warp"]
+        contiguous = bool(job.get("grouped_contiguous_m", False))
+        common = dict(
+            model_dim=job["model_dim"],
+            inter_dim=job["inter_dim"],
+            experts=job["experts"],
+            max_m=job["max_m"],
+            tile_m=job["tile_m"],
+            tile_n=job["tile_n"],
+            tile_k=job["tile_k"],
+            m_warp=job["m_warp"],
+            n_warp=job["n_warp"],
+            out_dtype=job["out_dtype"],
+            num_buffers=job["num_buffers"],
+            grouped_persistent_m=job["grouped_persistent_m"],
+            grouped_contiguous_m=contiguous,
+            persistent_workers=job["persistent_workers"],
+            expert_sched_mode=job["expert_sched_mode"],
         )
-        sx1 = torch.empty(
-            (
-                act_lead,
-                *preshuffled_scale_shape(rows, job["model_dim"], warp_tile_m, _TILE_K),
-            ),
-            dtype=torch.uint8,
-        )
-        sw1 = torch.empty(
-            (
-                job["experts"],
-                *preshuffled_scale_shape(
-                    2 * job["inter_dim"], job["model_dim"], warp_tile_n, _TILE_K
+        if contiguous:
+            act_lead = 1
+            ub = job["token_num"] * job["topk"] + job["experts"] * (job["tile_m"] - 1)
+            rows = max(job["tile_m"], _align_up(ub, job["tile_m"]))
+        else:
+            act_lead = job["experts"]
+            rows = job["max_m"]
+        with compile_only_env(), override_env(
+            "FLYDSL_GPU_ARCH", aot_arch
+        ), FakeTensorMode():
+            masked_m = torch.full(
+                (job["experts"],), job["max_m"], dtype=torch.int32, device=dev
+            )
+            # Contiguous-M layout tensor (mirrors runtime psum_t); None otherwise.
+            contiguous_layout = (
+                torch.empty((job["experts"],), dtype=torch.int32, device=dev)
+                if contiguous
+                else None
+            )
+            y1 = torch.empty((act_lead, rows, job["inter_dim"]), dtype=dtype)
+            x1 = torch.empty(
+                (act_lead, rows, job["model_dim"] // pack), dtype=torch.uint8
+            )
+            w1 = torch.empty(
+                (job["experts"], 2 * job["inter_dim"], job["model_dim"] // 2),
+                dtype=torch.uint8,
+            )
+            sx1 = torch.empty(
+                (
+                    act_lead,
+                    *preshuffled_scale_shape(
+                        rows, job["model_dim"], warp_tile_m, _TILE_K
+                    ),
                 ),
-            ),
-            dtype=torch.uint8,
-        )
-        y2 = torch.empty((act_lead, rows, job["model_dim"]), dtype=dtype)
-        x2 = torch.empty((act_lead, rows, job["inter_dim"] // pack), dtype=torch.uint8)
-        w2 = torch.empty(
-            (job["experts"], job["model_dim"], job["inter_dim"] // 2),
-            dtype=torch.uint8,
-        )
-        sx2 = torch.empty(
-            (
-                act_lead,
-                *preshuffled_scale_shape(rows, job["inter_dim"], warp_tile_m, _TILE_K),
-            ),
-            dtype=torch.uint8,
-        )
-        sw2 = torch.empty(
-            (
-                job["experts"],
-                *preshuffled_scale_shape(
-                    job["model_dim"], job["inter_dim"], warp_tile_n, _TILE_K
+                dtype=torch.uint8,
+            )
+            sw1 = torch.empty(
+                (
+                    job["experts"],
+                    *preshuffled_scale_shape(
+                        2 * job["inter_dim"], job["model_dim"], warp_tile_n, _TILE_K
+                    ),
                 ),
-            ),
-            dtype=torch.uint8,
-        )
-        exe1 = compiler1(
-            act=job["act"],
-            stage1_weight_layout=job["stage1_weight_layout"],
-            split_k=job["split_k1"],
-            **common,
-        )
-        exe1(
-            y1,
-            x1,
-            w1,
-            sx1,
-            sw1,
-            masked_m,
-            job["max_m"],
-            job["inter_dim"],
-            job["model_dim"],
-            job["experts"],
-            stream=0,
-            _m_tile_map=contiguous_layout,
-        )
-        # Bias-epilogue variant: runtime calls stage1(..., bias=...) when the model
-        # carries per-expert bias (e.g. gpt-oss), which triggers a distinct compiled
-        # kernel (gemm1_bias_* / finalize_act_bias). Precompile it alongside the
-        # bias-free kernel so neither path JITs at first inference.
-        bias1 = torch.empty((job["experts"], 2 * job["inter_dim"]), dtype=dtype)
-        exe1(
-            y1,
-            x1,
-            w1,
-            sx1,
-            sw1,
-            masked_m,
-            job["max_m"],
-            job["inter_dim"],
-            job["model_dim"],
-            job["experts"],
-            stream=0,
-            _m_tile_map=contiguous_layout,
-            bias=bias1,
-        )
-        exe2 = compiler2(split_k=job["split_k2"], **common)
-        exe2(
-            y2,
-            x2,
-            w2,
-            sx2,
-            sw2,
-            masked_m,
-            job["max_m"],
-            job["model_dim"],
-            job["inter_dim"],
-            job["experts"],
-            stream=0,
-            _m_tile_map=contiguous_layout,
-        )
-        # Bias-epilogue variant for stage2 (gemm2_bias_*); see stage1 note above.
-        bias2 = torch.empty((job["experts"], job["model_dim"]), dtype=dtype)
-        exe2(
-            y2,
-            x2,
-            w2,
-            sx2,
-            sw2,
-            masked_m,
-            job["max_m"],
-            job["model_dim"],
-            job["inter_dim"],
-            job["experts"],
-            stream=0,
-            _m_tile_map=contiguous_layout,
-            bias=bias2,
-        )
-    return {**job, "compile_time": time.time() - t0, "compile_arch": aot_arch}
+                dtype=torch.uint8,
+            )
+            y2 = torch.empty((act_lead, rows, job["model_dim"]), dtype=dtype)
+            x2 = torch.empty(
+                (act_lead, rows, job["inter_dim"] // pack), dtype=torch.uint8
+            )
+            w2 = torch.empty(
+                (job["experts"], job["model_dim"], job["inter_dim"] // 2),
+                dtype=torch.uint8,
+            )
+            sx2 = torch.empty(
+                (
+                    act_lead,
+                    *preshuffled_scale_shape(
+                        rows, job["inter_dim"], warp_tile_m, _TILE_K
+                    ),
+                ),
+                dtype=torch.uint8,
+            )
+            sw2 = torch.empty(
+                (
+                    job["experts"],
+                    *preshuffled_scale_shape(
+                        job["model_dim"], job["inter_dim"], warp_tile_n, _TILE_K
+                    ),
+                ),
+                dtype=torch.uint8,
+            )
+            exe1 = compiler1(
+                act=job["act"],
+                stage1_weight_layout=job["stage1_weight_layout"],
+                split_k=job["split_k1"],
+                **common,
+            )
+            exe1(
+                y1,
+                x1,
+                w1,
+                sx1,
+                sw1,
+                masked_m,
+                job["max_m"],
+                job["inter_dim"],
+                job["model_dim"],
+                job["experts"],
+                stream=0,
+                _m_tile_map=contiguous_layout,
+            )
+            # Bias-epilogue variant: runtime calls stage1(..., bias=...) when the model
+            # carries per-expert bias (e.g. gpt-oss), which triggers a distinct compiled
+            # kernel (gemm1_bias_* / finalize_act_bias). Precompile it alongside the
+            # bias-free kernel so neither path JITs at first inference.
+            bias1 = torch.empty((job["experts"], 2 * job["inter_dim"]), dtype=dtype)
+            exe1(
+                y1,
+                x1,
+                w1,
+                sx1,
+                sw1,
+                masked_m,
+                job["max_m"],
+                job["inter_dim"],
+                job["model_dim"],
+                job["experts"],
+                stream=0,
+                _m_tile_map=contiguous_layout,
+                bias=bias1,
+            )
+            exe2 = compiler2(split_k=job["split_k2"], **common)
+            exe2(
+                y2,
+                x2,
+                w2,
+                sx2,
+                sw2,
+                masked_m,
+                job["max_m"],
+                job["model_dim"],
+                job["inter_dim"],
+                job["experts"],
+                stream=0,
+                _m_tile_map=contiguous_layout,
+            )
+            # Bias-epilogue variant for stage2 (gemm2_bias_*); see stage1 note above.
+            bias2 = torch.empty((job["experts"], job["model_dim"]), dtype=dtype)
+            exe2(
+                y2,
+                x2,
+                w2,
+                sx2,
+                sw2,
+                masked_m,
+                job["max_m"],
+                job["model_dim"],
+                job["inter_dim"],
+                job["experts"],
+                stream=0,
+                _m_tile_map=contiguous_layout,
+                bias=bias2,
+            )
+        elapsed = time.time() - t0
+        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
+        return {**job, "compile_time": elapsed, "compile_arch": aot_arch}
+    except Exception as e:
+        print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
+        return {**job, "compile_time": None, "compile_arch": aot_arch}
 
 
 def main(argv=None):
@@ -303,8 +323,13 @@ def main(argv=None):
     parser.add_argument("--csv", nargs="+", default=DEFAULT_CSVS)
     args = parser.parse_args(argv)
     jobs = collect_aot_jobs(args.csv, parse_csv)
-    for job in jobs:
-        print(compile_one_config(**job))
+    print(f"[aiter] FlyDSL GROUPED_MOE AOT: {len(jobs)} kernels")
+    results = [compile_one_config(**job) for job in jobs]
+    ok = sum(1 for r in results if r["compile_time"] is not None)
+    fail = len(results) - ok
+    print(f"[aiter] FlyDSL GROUPED_MOE AOT: compiled {ok} ok, {fail} failed")
+    if fail:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
