@@ -45,3 +45,4 @@ g1  V_TDM drain s_wait_tensorcnt 0 ONLY on last iter (loop_idx>=cnt-1)    md5=57
 g2  V_TDM drain s_wait_tensorcnt 0 on last 2 iters (loop_idx>=cnt-2)      md5=4d392568
 gs1 V_TDM: GATED-STRONG s_wait_idle+wgp_barrier, last 1 iter   md5=6506e399
 gs2 V_TDM: GATED-STRONG s_wait_idle+wgp_barrier, last 2 iters  md5=c2e8ca03
+44  s_wait_tensorcnt 0 after BOTH K_TDM and V_TDM   md5=718188a1   [cheap: tensorcnt only, 2 points]
