@@ -32,6 +32,8 @@ _FUSED_AR_RMS_QUANT_ALIASES = {
     "per_1x32": "mxfp4",
 }
 
+_AITER_AR_1STAGE_MAX_TOKENS = 80
+
 
 def _normalize_fused_ar_rms_quant_type(quant_type):
     if isinstance(quant_type, str):
@@ -53,6 +55,27 @@ def _normalize_fused_ar_rms_quant_type(quant_type):
         "unsupported fused AR+RMSNorm quant_type="
         f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
     )
+
+
+def _can_fused_ar_rms_per_token_quant(input_: torch.Tensor) -> bool:
+    hidden_dim = int(input_.shape[-1])
+    element_size = input_.element_size()
+    if hidden_dim <= 0:
+        return False
+    if input_.dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if element_size <= 0 or 16 % element_size != 0:
+        return False
+    pack_size = 16 // element_size
+    return hidden_dim % pack_size == 0 and hidden_dim // pack_size <= 1024
+
+
+def _can_1stage_fused_ar_rms_per_token_quant(input_: torch.Tensor) -> bool:
+    if not _can_fused_ar_rms_per_token_quant(input_):
+        return False
+    hidden_dim = int(input_.shape[-1])
+    token_num = input_.numel() // hidden_dim
+    return token_num <= _AITER_AR_1STAGE_MAX_TOKENS
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -398,24 +421,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
         if emit_bf16:
             raise ValueError("emit_bf16 is not supported for per-token FP8 quant")
-        hidden_dim = int(input_.shape[-1])
-        element_size = input_.element_size()
-        total_bytes = input_.numel() * element_size
+        total_bytes = input_.numel() * input_.element_size()
         if (
-            (
-                hidden_dim in [512, 1024, 2048, 4096]
-                or (
-                    hidden_dim == 7168
-                    and input_.dtype in (torch.float16, torch.bfloat16)
-                )
-            )
+            _can_fused_ar_rms_per_token_quant(input_)
             and total_bytes <= 4096 * 1024
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
+                else _can_1stage_fused_ar_rms_per_token_quant(input_)
             )
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
                 input_, res_inp_, weight_, eps, use_1stage
