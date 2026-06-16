@@ -8,6 +8,7 @@
 import copy
 import importlib
 import importlib.abc
+import importlib.util
 import os
 import re
 import shlex
@@ -91,7 +92,51 @@ def get_hip_version():
         output = subprocess.check_output([hipconfig, "--version"], text=True)
         return output
     except Exception:
-        raise RuntimeError("ROCm version file not found")
+        pass
+    # The fallbacks below previously hard-coded /opt/rocm, so they never
+    # helped users whose ROCm lives elsewhere.  Resolve the ROCm root the
+    # same way the rest of this module does (ROCM_HOME / ROCM_PATH env, then
+    # `which hipcc`, then /opt/rocm).  NOTE: the module-level ROCM_HOME global
+    # is assigned *after* this function is first called (see bottom of file),
+    # so we must call _find_rocm_home() directly here rather than referencing
+    # the global.  /opt/rocm is kept as a last-resort candidate so behavior on
+    # default installs is unchanged.
+    rocm_roots = []
+    discovered = _find_rocm_home()
+    if discovered:
+        rocm_roots.append(discovered)
+    if "/opt/rocm" not in rocm_roots:
+        rocm_roots.append("/opt/rocm")
+
+    # Fallback: try <rocm_root>/bin/hipconfig for each candidate root.
+    for root in rocm_roots:
+        rocm_hipconfig = os.path.join(root, "bin", "hipconfig")
+        if os.path.isfile(rocm_hipconfig):
+            try:
+                output = subprocess.check_output(
+                    [rocm_hipconfig, "--version"], text=True
+                )
+                return output
+            except Exception:
+                pass
+    # Fallback: read HIP version from a header / info file under each root.
+    for root in rocm_roots:
+        for ver_rel in ["include/hip/hip_version.h", ".info/version"]:
+            ver_path = os.path.join(root, ver_rel)
+            if os.path.isfile(ver_path):
+                with open(ver_path) as f:
+                    content = f.read()
+                if "HIP_VERSION_MAJOR" in content:
+                    import re
+
+                    major = re.search(r"HIP_VERSION_MAJOR\s+(\d+)", content)
+                    minor = re.search(r"HIP_VERSION_MINOR\s+(\d+)", content)
+                    patch = re.search(r"HIP_VERSION_PATCH\s+(\d+)", content)
+                    if major and minor and patch:
+                        return f"{major.group(1)}.{minor.group(1)}.{patch.group(1)}"
+                else:
+                    return content.strip()
+    raise RuntimeError("ROCm version file not found")
 
 
 def _find_rocm_home() -> Optional[str]:
@@ -99,7 +144,21 @@ def _find_rocm_home() -> Optional[str]:
     # Guess #1
     rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
     if rocm_home is None:
-        # Guess #2
+        # Guess #2: rocm-sdk-devel pip package ships a self-contained ROCm
+        # tree under site-packages/_rocm_sdk_devel/. Prefer this over a
+        # hipcc-on-PATH lookup because the venv's bin/hipcc is a python
+        # wrapper, not a real binary — realpath() can't recover the SDK
+        # root from it.
+        try:
+            spec = importlib.util.find_spec("_rocm_sdk_devel")
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None and spec.submodule_search_locations:
+            candidate = spec.submodule_search_locations[0]
+            if os.path.exists(os.path.join(candidate, "bin", "hipconfig")):
+                rocm_home = candidate
+    if rocm_home is None:
+        # Guess #3
         hipcc_path = shutil.which("hipcc")
         if hipcc_path is not None:
             rocm_home = os.path.dirname(os.path.dirname(os.path.realpath(hipcc_path)))
@@ -107,7 +166,7 @@ def _find_rocm_home() -> Optional[str]:
             if os.path.basename(rocm_home) == "hip":
                 rocm_home = os.path.dirname(rocm_home)
         else:
-            # Guess #3
+            # Guess #4
             fallback_path = "/opt/rocm"
             if os.path.exists(fallback_path):
                 rocm_home = fallback_path

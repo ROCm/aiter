@@ -29,7 +29,7 @@ void gemm_a16w16_kbuf2v_kernel(Kargs kargs) {
     using T = opus::remove_cvref_t<Traits>;
     static_assert(T::E_M == 1,
                   "gemm_a16w16_kbuf2v_kernel requires E_M==1; "
-                  "use a16w16_kbuf1_large_tile (kid 50000) / a16w16_kbuf1_sk for B_M > 64 traits.");
+                  "use a16w16_kbuf1_large_tile (kid 10000) / a16w16_kbuf1_sk for B_M > 64 traits.");
     constexpr bool IS_SPLITK = std::is_same_v<Kargs, opus_gemm_splitk_kargs>;
     {
     using D_A = typename T::D_A;
@@ -74,7 +74,7 @@ void gemm_a16w16_kbuf2v_kernel(Kargs kargs) {
 
     auto g_c = [&]() {
         if constexpr (IS_SPLITK) {
-            return make_gmem(reinterpret_cast<D_C*>(kargs.ptr_workspace)
+            return make_gmem(reinterpret_cast<D_C*>(kargs.ws_handle->ptr)
                              + (size_t)split_id  * kargs.batch * kargs.stride_ws_batch
                              + (size_t)batch_id  * kargs.stride_ws_batch
                              + (size_t)row       * kargs.stride_ws
@@ -223,6 +223,7 @@ void gemm_a16w16_kbuf2v_kernel(Kargs kargs) {
         v_b[1][ST] = load<T::VEC_B>(s_b[2 + ST], u_rb);
     };
 
+    #pragma unroll 4
     for (; tile < outer_end; tile += 2) {
         sub_iter(opus::number<0>{}, tile);
         sub_iter(opus::number<1>{}, tile);
