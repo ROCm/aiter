@@ -743,6 +743,25 @@ def _precompile_to_cache(
             )
             _run_compiled(exe, args)
 
+            # Reduce mode (accumulate=False) runs a separate topk reduction
+            # kernel inside the runtime stage2 wrapper. Precompile it via the
+            # same shared helper the runtime uses so the cache key matches.
+            # Single-GPU path uses use_mask=False (plain); EP/masked reduction
+            # is a multi-GPU path (separately gated) and not covered here.
+            if not accumulate:
+                from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+                _run_moe_reduction(
+                    target,
+                    out,
+                    tokens,
+                    topk,
+                    model_dim,
+                    expert_mask=None,
+                    topk_ids=None,
+                    stream=0,
+                )
+
 
 def compile_one_config(
     kernel_name: str,
