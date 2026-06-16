@@ -838,70 +838,83 @@ def test_pa_decode_vmask(
         inp["V"], 0.0, inp["kv_indices"], inp["kv_indptr"], inp["seq_lens_kv"], ps
     )
 
-    # Run zero-V twice (determinism control) + NaN-V once.  Inputs are seed-fixed.
-    out_z1_raw, so_z1, sl_z1 = _run_pa_kernel(inp, V_zero)
-    out_z2_raw, so_z2, sl_z2 = _run_pa_kernel(inp, V_zero)
-    out_n_raw, so_n, sl_n = _run_pa_kernel(inp, V_nan)
+    # Run EACH input REPS times.  The kernel race is intermittent, so a single
+    # zero-V-x2 control can miss it (the two runs happen to agree).  Running both
+    # zero-V and NaN-V several times lets us separate the race from a real V leak:
+    #   * det_zero / det_nan = max pairwise mismatch WITHIN each input's repeats
+    #       -> nonzero == kernel nondeterminism (a race), independent of V.
+    #   * vmask = NaN-V vs zero-V.  Only meaningful when det_zero==det_nan==0; if the
+    #       kernel is nondeterministic the vmask diff is dominated by the race.
+    # `out` (direct-O) is torch.empty -> uninitialized for split rows, so we judge by
+    # split_o (zero-init kernel partials) and the FINAL reduced output only.
+    REPS = 3
 
-    # IMPORTANT: the raw `out` (direct-O tensor) is UNINITIALIZED for split rows —
-    # for a split work the kernel writes split_o, NOT out, and cpu_reduce fills out
-    # afterward.  So out_raw's split rows differ run-to-run (uninit GPU memory) and
-    # carry junk/NaN that is NOT a kernel race or a V leak.  We therefore judge ONLY
-    # the well-defined signals and report raw `out` diff separately as harmless:
-    #   * split_o            — kernel partials, zero-initialized -> deterministic if clean
-    #   * FINAL reduced out  — cpu_reduce overwrites the uninit split rows
     def rd(o, so, sl):
         return cpu_reduce(
             o.clone(), so, sl, inp["reduce_indptr"],
             inp["reduce_final_map"], inp["reduce_partial_map"], inp["gqa"],
         )
 
-    final_z1 = rd(out_z1_raw, so_z1, sl_z1)
-    final_z2 = rd(out_z2_raw, so_z2, sl_z2)
-    final_n = rd(out_n_raw, so_n, sl_n)
+    def run_reps(V):
+        fins, sos = [], []
+        for _ in range(REPS):
+            o, so, sl = _run_pa_kernel(inp, V)
+            sos.append(so)
+            fins.append(rd(o, so, sl))
+        return fins, sos
 
-    # Determinism (two identical zero-V runs): well-defined outputs must match.
-    det_final = int((_bits(final_z1) != _bits(final_z2)).sum().item())
-    det_split_o = int((_bits(so_z1) != _bits(so_z2)).sum().item())
-    det_out_raw = int((_bits(out_z1_raw) != _bits(out_z2_raw)).sum().item())  # uninit, harmless
-    nondeterministic = (det_final > 0) or (det_split_o > 0)
-    # Magnitude of the nondeterminism: last-bit bf16 noise (~1e-2 relative) vs a
-    # real value error.  Helps decide if the residual race is benign or corrupting.
-    det_final_maxabs = float((final_z1.float() - final_z2.float()).abs().max().item())
-    det_so_maxabs = float((so_z1.float() - so_z2.float()).abs().max().item())
+    def maxpair(lst):
+        m = 0
+        for i in range(len(lst)):
+            for j in range(i + 1, len(lst)):
+                m = max(m, int((_bits(lst[i]) != _bits(lst[j])).sum().item()))
+        return m
 
-    # V-mask (NaN-V vs zero-V): partials + final must match, no NaN reaching either.
-    vmask_split_nan = int(torch.isnan(so_n.float()).sum().item())
-    vmask_split_mismatch = int((_bits(so_n) != _bits(so_z1)).sum().item())
-    final_nan = int(torch.isnan(final_n.float()).sum().item())
-    final_mismatch = int((_bits(final_n) != _bits(final_z1)).sum().item())
+    def any_nan(lst):
+        return int(sum(int(torch.isnan(t.float()).sum().item()) for t in lst))
 
-    vmask_ok = (
-        not nondeterministic
-        and vmask_split_nan == 0
-        and vmask_split_mismatch == 0
-        and final_nan == 0
-        and final_mismatch == 0
-    )
-    status = "RACE" if nondeterministic else ("PASS" if vmask_ok else "FAIL")
+    z_fin, z_so = run_reps(V_zero)
+    n_fin, n_so = run_reps(V_nan)
+
+    # Determinism within each input (intermittent race detector).
+    det_zero = max(maxpair(z_fin), maxpair(z_so))
+    det_nan = max(maxpair(n_fin), maxpair(n_so))
+    nondeterministic = (det_zero > 0) or (det_nan > 0)
+
+    # NaN anywhere (kernel partials or final), either input.
+    nan_zero = any_nan(z_so) + any_nan(z_fin)
+    nan_nan = any_nan(n_so) + any_nan(n_fin)
+    final_nan = any_nan(n_fin) + any_nan(z_fin)
+
+    # V-mask diff (NaN-V vs zero-V), first repeat of each.
+    vmask_split_mismatch = int((_bits(n_so[0]) != _bits(z_so[0])).sum().item())
+    final_mismatch = int((_bits(n_fin[0]) != _bits(z_fin[0])).sum().item())
+
+    # Verdict: a race blocks a clean V-mask verdict.  Only when the kernel is
+    # deterministic AND no NaN does a NaN-vs-0 diff mean a real V leak.
+    if nondeterministic:
+        status, vmask_ok = "RACE", False
+    elif (nan_zero + nan_nan) > 0 or vmask_split_mismatch > 0 or final_mismatch > 0:
+        status, vmask_ok = "FAIL", False
+    else:
+        status, vmask_ok = "PASS", True
+
     aiter.logger.info(
-        "[V-mask %s] b=%d kvh=%d ctx=%s mtp=%d | pad=%d || DET(zeroVx2): final=%d "
-        "(maxabs=%.3g) split_o=%d (maxabs=%.3g) [out_raw=%d uninit/harmless] || "
-        "VMASK(NaNvs0): split_o[nan=%d mismatch=%d] FINAL[nan=%d mismatch=%d]",
+        "[V-mask %s] b=%d kvh=%d ctx=%s mtp=%d | pad=%d reps=%d || DET(within-input): "
+        "zero=%d nan=%d %s || NaN: zero=%d nan=%d || VMASK(NaNvs0): split_o=%d final=%d",
         status,
         inp["batch"],
         kv_head_num,
         context_lens if context_lens is not None else ctx_len,
         mtp,
         n_pad,
-        det_final,
-        det_final_maxabs,
-        det_split_o,
-        det_so_maxabs,
-        det_out_raw,
-        vmask_split_nan,
+        REPS,
+        det_zero,
+        det_nan,
+        "<-- RACE (V-mask verdict blocked)" if nondeterministic else "",
+        nan_zero,
+        nan_nan,
         vmask_split_mismatch,
-        final_nan,
         final_mismatch,
     )
 
@@ -912,15 +925,13 @@ def test_pa_decode_vmask(
         "mtp": mtp,
         "varlen": varlen,
         "pad_slots": n_pad,
-        "det_final": det_final,
-        "det_final_maxabs": det_final_maxabs,
-        "det_split_o": det_split_o,
-        "det_so_maxabs": det_so_maxabs,
-        "det_out_raw_uninit": det_out_raw,
+        "det_zero": det_zero,
+        "det_nan": det_nan,
         "nondeterministic": nondeterministic,
-        "vmask_split_nan": vmask_split_nan,
-        "vmask_split_mismatch": vmask_split_mismatch,
+        "nan_zero": nan_zero,
+        "nan_nan": nan_nan,
         "final_nan": final_nan,
+        "vmask_split_mismatch": vmask_split_mismatch,
         "final_mismatch": final_mismatch,
         "bitmatch": vmask_ok,
     }
