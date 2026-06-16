@@ -32,3 +32,9 @@
 31  site03 V_TDM: wgp_barrier ONLY (no s_wait_idle)   md5=bf3a2569
 32  site02 K_TDM: s_wait_idle ONLY (no wgp_barrier)   md5=5c6e635d
 33  site03 V_TDM: s_wait_idle ONLY (no wgp_barrier)   md5=50740434
+
+---- COUNTER-NARROW (site03 V_TDM: s_wait_idle -> single counter wait) ----
+40  site03 V_TDM: s_wait_tensorcnt 0   md5=b9a85851
+41  site03 V_TDM: s_wait_dscnt 0       md5=5018f446
+42  site03 V_TDM: s_wait_loadcnt 0     md5=e787b656
+43  site03 V_TDM: s_wait_kmcnt 0       md5=2852fe8c
