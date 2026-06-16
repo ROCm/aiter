@@ -185,38 +185,6 @@ def tensor_model_parallel_fused_qknorm_allreduce_rope(
     )
 
 
-def tensor_model_parallel_fused_qknorm_allreduce_rope_cache_quant(
-    qkv_in: torch.Tensor,
-    q_w: torch.Tensor,
-    k_w: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    position_ids: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    head_dim: int,
-    rotary_dim: int,
-    eps: float,
-):
-    return get_tp_group().fused_qknorm_allreduce_rope_cache_quant(
-        qkv_in,
-        q_w,
-        k_w,
-        cos_sin_cache,
-        position_ids,
-        k_cache,
-        v_cache,
-        k_scale,
-        v_scale,
-        slot_mapping,
-        head_dim,
-        rotary_dim,
-        eps,
-    )
-
-
 def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
     _assert_no_custom_group("tensor_model_parallel_custom_all_gather")
     return get_tp_group().custom_all_gather(input_)

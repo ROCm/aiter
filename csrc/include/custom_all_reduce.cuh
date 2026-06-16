@@ -2436,93 +2436,7 @@ apply_neox_rope_pack_shuffle(
     return y;
 }
 
-template <typename T, int PACK_SIZE>
-__device__ __forceinline__ void store_fp8_kv_cache_pack(
-    typename opus::vector_t<T, PACK_SIZE> x,
-    opus::fp8_t* __restrict__ cache,
-    float* __restrict__ scale,
-    const int64_t* __restrict__ slot_mapping,
-    int token_id,
-    int head_id,
-    int access_id_in_head,
-    int head_dim,
-    int num_heads,
-    int page_size,
-    int x_layout,
-    bool is_key)
-{
-    const int64_t slot_id = slot_mapping[token_id];
-    if(slot_id < 0)
-        return;
-
-    const int head_packs = head_dim / PACK_SIZE;
-    float local_max      = 0.0f;
-#pragma unroll
-    for(int i = 0; i < PACK_SIZE; ++i)
-    {
-        local_max = fmaxf(local_max, fabsf(upcast_s(x[i])));
-    }
-
-    for(int stride = head_packs / 2; stride > 0; stride >>= 1)
-    {
-        local_max = fmaxf(local_max, shfl_xor<float>(local_max, stride, head_packs));
-    }
-
-    const int64_t block_id     = slot_id / page_size;
-    const int64_t block_offset = slot_id % page_size;
-    const float fp8_max =
-        opus::cast<opus::fp32_t>(opus::numeric_limits<opus::fp8_t>::max());
-    const float scale_val = fmaxf(local_max / fp8_max, 1.0e-12f);
-    const float inv_scale = 1.0f / scale_val;
-
-    if(access_id_in_head == 0)
-    {
-        scale[(block_id * num_heads + head_id) * page_size + block_offset] = scale_val;
-    }
-
-    if(is_key)
-    {
-        opus::vector_t<opus::fp8_t, PACK_SIZE> q_pack;
-#pragma unroll
-        for(int i = 0; i < PACK_SIZE; ++i)
-        {
-            q_pack[i] = opus::cast<opus::fp8_t>(upcast_s(x[i]) * inv_scale);
-        }
-
-        // K cache layout is [block, head, head_dim // x, page, x], so each
-        // normalized pack maps to contiguous fp8 bytes inside the x tile.
-        const int dim = access_id_in_head;
-        const int64_t cache_offset =
-            ((((block_id * num_heads + head_id) * (head_dim / x_layout) +
-               (dim / x_layout)) *
-                  page_size +
-              block_offset) *
-                 x_layout +
-             (dim % x_layout));
-        *reinterpret_cast<opus::vector_t<opus::fp8_t, PACK_SIZE>*>(&cache[cache_offset]) =
-            q_pack;
-        return;
-    }
-
-#pragma unroll
-    for(int i = 0; i < PACK_SIZE; ++i)
-    {
-        const int dim = access_id_in_head + i;
-        opus::fp8_t q = opus::cast<opus::fp8_t>(upcast_s(x[i]) * inv_scale);
-        // V cache layout is [block, head, page_size // x, head_dim, x].
-        // For one token, adjacent head_dim elements are separated by x_layout.
-        const int64_t cache_offset =
-            ((((block_id * num_heads + head_id) * (page_size / x_layout) +
-               (block_offset / x_layout)) *
-                  head_dim +
-              dim) *
-                 x_layout +
-             (block_offset % x_layout));
-        cache[cache_offset] = q;
-    }
-}
-
-template <typename T, int ngpus, int WARP_SIZE, bool FUSE_ROPE, bool FUSE_CACHE>
+template <typename T, int ngpus, int WARP_SIZE, bool FUSE_ROPE>
 __global__ void __launch_bounds__(1024, 1)
     qknorm_allreduce_fusion_kernel_2stage(RankData* _dp,
                                           RankSignals sg,
@@ -2613,23 +2527,6 @@ __global__ void __launch_bounds__(1024, 1)
                 tmps[rank][tidx * 2 + 1] = var_vec;
             }
         } else {
-            if constexpr(FUSE_CACHE)
-            {
-                const int v_access = access_id_in_token - hidden_dim_qk;
-                store_fp8_kv_cache_pack<T, pack_size>(
-                    vec,
-                    v_cache,
-                    v_scale,
-                    slot_mapping,
-                    tidx,
-                    v_access / head_dim,
-                    v_access % head_dim,
-                    head_dim,
-                    hidden_dim_v / head_dim,
-                    page_size,
-                    x_layout,
-                    false);
-            }
             *reinterpret_cast<P*>(&v_out[tidx * hidden_dim_v +
                                         access_id_in_token - hidden_dim_qk]) = vec;
         }
@@ -2709,29 +2606,13 @@ __global__ void __launch_bounds__(1024, 1)
                     access_id_in_head,
                     rotary_dim);
             }
-            if constexpr(FUSE_CACHE)
-            {
-                store_fp8_kv_cache_pack<T, pack_size>(
-                    vec,
-                    k_cache,
-                    k_scale,
-                    slot_mapping,
-                    tidx,
-                    k_access / head_dim,
-                    k_access % head_dim,
-                    head_dim,
-                    hidden_dim_k / head_dim,
-                    page_size,
-                    x_layout,
-                    true);
-            }
             *reinterpret_cast<P*>(&k_out[tidx * hidden_dim_k + k_access]) = vec;
         }
         __syncthreads();
     }
 }
 
-template <typename T, int NGPUS, bool FUSE_ROPE, bool FUSE_CACHE>
+template <typename T, int NGPUS, bool FUSE_ROPE>
 void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                              RankSignals sg,
                                              Signal* self_sg,
@@ -2782,25 +2663,10 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
         if(head_dim / PACK_SIZE > WARP_SIZE)
             throw std::runtime_error("rope shuffle fusion requires one head to fit within one warp");
     }
-    if constexpr(FUSE_CACHE)
-    {
-        if(k_cache == nullptr || v_cache == nullptr || k_scale == nullptr || v_scale == nullptr ||
-           slot_mapping == nullptr)
-            throw std::runtime_error("qknorm_allreduce cache fusion requires cache, scale and slot_mapping tensors");
-        if(page_size <= 0 || x_layout <= 0 || page_size % x_layout != 0 || head_dim % x_layout != 0)
-            throw std::runtime_error("Invalid cache page_size/x_layout/head_dim for qknorm cache fusion");
-        if(head_dim % PACK_SIZE != 0)
-            throw std::runtime_error("head_dim must be divisible by PACK_SIZE for qknorm cache fusion");
-        if(x_layout % PACK_SIZE != 0)
-            throw std::runtime_error("x_layout must be divisible by PACK_SIZE for qknorm cache fusion");
-        int const head_packs = head_dim / PACK_SIZE;
-        if((head_packs & (head_packs - 1)) != 0)
-            throw std::runtime_error("head_dim/PACK_SIZE must be a power of two for qknorm cache fusion");
-    }
     dim3 threadsPerBlock(BLOCK_SIZE);
     int grid_blocks = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(grid_blocks);
-    qknorm_allreduce_fusion_kernel_2stage<T, NGPUS, WARP_SIZE, FUSE_ROPE, FUSE_CACHE>
+    qknorm_allreduce_fusion_kernel_2stage<T, NGPUS, WARP_SIZE, FUSE_ROPE>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
                                                     sg,
                                                     self_sg,
@@ -4569,7 +4435,7 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
 #undef DISPATCH_AR_FUSION_MXFP4_KERNEL
 }
 
-template <typename T, bool FUSE_ROPE, bool FUSE_CACHE = false>
+template <typename T, bool FUSE_ROPE>
 void dispatchFusedQKNormAllReduce(hipStream_t stream,
                                   T* qkv_in,
                                   T* q_w,
@@ -4603,14 +4469,14 @@ void dispatchFusedQKNormAllReduce(hipStream_t stream,
     }
     RankData* ptrs = get_buffer_RD(stream, qkv_in);
 
-#define DISPATCH_QKNORM_AR_FUSION_KERNEL(NGPUS)                                   \
-    {                                                                             \
-        qknorm_allreduce_fusion_kernel_2stage_launcher<T, NGPUS, FUSE_ROPE, FUSE_CACHE>( \
-            ptrs, sg_, self_sg_, rank_, qkv_in, q_w, k_w, q_out, k_out, v_out,            \
-            token_num, hidden_dim_q, hidden_dim_k, hidden_dim_v, eps, cos_sin_cache,      \
-            position_ids, head_dim, rotary_dim, k_cache, v_cache, k_scale, v_scale,       \
-            slot_mapping, page_size, x_layout, stream);                                  \
-        return;                                                                           \
+#define DISPATCH_QKNORM_AR_FUSION_KERNEL(NGPUS)                                      \
+    {                                                                                \
+        qknorm_allreduce_fusion_kernel_2stage_launcher<T, NGPUS, FUSE_ROPE>(         \
+            ptrs, sg_, self_sg_, rank_, qkv_in, q_w, k_w, q_out, k_out, v_out,       \
+            token_num, hidden_dim_q, hidden_dim_k, hidden_dim_v, eps, cos_sin_cache, \
+            position_ids, head_dim, rotary_dim, k_cache, v_cache, k_scale, v_scale,  \
+            slot_mapping, page_size, x_layout, stream);                              \
+        return;                                                                      \
     }
 
     switch(world_size_)
