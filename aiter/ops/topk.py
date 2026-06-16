@@ -45,9 +45,18 @@ def grouped_topk_hip(
 # is propagated to the spawned EngineCore/worker processes (plain AITER_* vars
 # are not). Unsupported configs and any compile/launch failure still fall back
 # to HIP automatically.
-_USE_FLYDSL_GROUPED_TOPK = os.environ.get(
-    "AITER_USE_FLYDSL_GROUPED_TOPK", "0"
-) in ("1", "true", "True", "yes", "on")
+def _use_flydsl_grouped_topk() -> bool:
+    # Evaluated at call time (not import time): vLLM injects this env var into the
+    # spawned worker processes at runtime, which may happen after aiter.ops.topk is
+    # first imported. Reading it lazily avoids that import-vs-injection race.
+    return os.environ.get("AITER_USE_FLYDSL_GROUPED_TOPK", "0") in (
+        "1",
+        "true",
+        "True",
+        "yes",
+        "on",
+    )
+
 
 _FLYDSL_WARP_SIZE = 64
 
@@ -121,7 +130,7 @@ def grouped_topk(
     ``AITER_USE_FLYDSL_GROUPED_TOPK=1`` and the configuration is supported,
     dispatches to the FlyDSL ``flydsl_grouped_topk`` kernel instead. Both write
     their result in place into ``topk_weights`` / ``topk_ids``."""
-    if _USE_FLYDSL_GROUPED_TOPK and _flydsl_grouped_topk_supported(
+    if _use_flydsl_grouped_topk() and _flydsl_grouped_topk_supported(
         gating_output, topk_ids, num_expert_group, topk_group
     ):
         try:
@@ -204,7 +213,7 @@ def biased_grouped_topk(
         # Optional FlyDSL replacement for the HIP biased op, gated by the same
         # env switch as the non-biased grouped_topk (default: HIP). Falls back
         # to HIP on any unsupported config or compile/launch failure.
-        if _USE_FLYDSL_GROUPED_TOPK and _flydsl_biased_grouped_topk_supported(
+        if _use_flydsl_grouped_topk() and _flydsl_biased_grouped_topk_supported(
             gating_output, correction_bias, topk_ids, num_expert_group, topk_group
         ):
             try:

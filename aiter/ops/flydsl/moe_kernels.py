@@ -2456,11 +2456,17 @@ def flydsl_grouped_topk(
             f"flydsl_grouped_topk: unsupported gating dtype {gating_output.dtype}"
         )
     dtype_str = _GATING_DTYPE_TO_STR[gating_output.dtype]
-    gating_output = gating_output.contiguous()
+    # detach() before handing tensors to FlyDSL: the first compile of a config
+    # builds the kernel arg adaptor via __dlpack__, which raises on tensors that
+    # require grad ("Can't export tensors that require gradient"). Routing inputs
+    # such as a model's correction_bias Parameter (or a gating_output produced
+    # outside inference_mode) can carry requires_grad=True. detach() shares
+    # storage, so in-place writes to topk_weights/topk_ids still land correctly.
+    gating_output = gating_output.detach().contiguous()
 
     if is_biased:
         # The kernel reads bias with the same element type as the gating tensor.
-        bias = correction_bias.to(gating_output.dtype).contiguous()
+        bias = correction_bias.detach().to(gating_output.dtype).contiguous()
     else:
         bias = _placeholder_bias(
             int(num_experts), gating_output.dtype, gating_output.device
@@ -2481,8 +2487,8 @@ def flydsl_grouped_topk(
     args = (
         gating_output,
         bias,
-        topk_weights,
-        topk_ids,
+        topk_weights.detach(),
+        topk_ids.detach(),
         int(topk_weights.stride(0)),
         int(topk_ids.stride(0)),
         int(num_tokens),
