@@ -3,10 +3,13 @@ import functools
 
 @functools.lru_cache(maxsize=1)
 def get_num_sms():
-    # Returns the Compute Unit count of the current device.
+    # Returns the Compute Unit count of the device.
     #
-    # Prefer chip_info.get_cu_num() (honors the CU_NUM env override and parses
-    # rocminfo "Compute Unit"). Fallback to torch when get_cu_num() fails.
+    # Prefer chip_info.get_cu_num(): it honors the CU_NUM env override and is the
+    # same value the tuning dispatch keys (gfx, cu_num, M, N, K) are built from,
+    # so grid/segment sizing stays consistent with the selected tuned configs.
+    # Fall back to torch's multi_processor_count when get_cu_num() is unavailable
+    # (e.g. rocminfo missing/unparseable).
     try:
         from aiter.jit.utils.chip_info import get_cu_num
 
