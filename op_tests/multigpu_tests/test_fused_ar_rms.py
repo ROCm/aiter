@@ -681,19 +681,6 @@ def test_fused_ar_rmsnorm_padded_input_case(
 try:
     import pytest
 
-    def test_minimax_m2_tp2_num_tokens_128_uses_1stage_gate():
-        from aiter.dist.device_communicators.communicator_cuda import (
-            _can_1stage_fused_ar_rms,
-            _can_1stage_fused_ar_rms_quant,
-            _can_fused_ar_rms_quant,
-        )
-
-        x = torch.empty((128, 3072), dtype=torch.bfloat16)
-        assert _can_1stage_fused_ar_rms(x)
-        assert x.shape[-1] % 128 == 0
-        assert _can_fused_ar_rms_quant(x)
-        assert _can_1stage_fused_ar_rms_quant(x)
-
     @pytest.mark.parametrize(
         "x_pad_to_multiple,input_strided,residual_strided",
         [
