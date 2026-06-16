@@ -17,17 +17,17 @@ from ..jit.core import compile_ops
 
 @compile_ops("module_mha_batch_prefill_asm", fc_name="mha_batch_prefill_asm")
 def mha_batch_prefill_asm(
-    q: Tensor,                    # [total_q, hq, d] fp8
-    k: Tensor,                    # [num_pages, hk, d/x, page, x] fp8
-    v: Tensor,                    # [num_pages, hk, d, page] fp8 (col-major)
-    cu_seqlens_q: Tensor,         # [b+1] int32 (QTP)
-    kv_indptr: Tensor,            # [b+1] int32 (LTP)
-    kv_page_indices: Tensor,      # [num_pages] int32 (LTD)
-    seqlens_kvcache: Tensor,      # [b] int32 per-batch KV token len
-    out: Tensor,                  # [total_q, hq, dv] bf16 (written in place)
+    q: Tensor,  # [total_q, hq, d] fp8
+    k: Tensor,  # [num_pages, hk, d/x, page, x] fp8
+    v: Tensor,  # [num_pages, hk, d, page] fp8 (col-major)
+    cu_seqlens_q: Tensor,  # [b+1] int32 (QTP)
+    kv_indptr: Tensor,  # [b+1] int32 (LTP)
+    kv_page_indices: Tensor,  # [num_pages] int32 (LTD)
+    seqlens_kvcache: Tensor,  # [b] int32 per-batch KV token len
+    out: Tensor,  # [total_q, hq, dv] bf16 (written in place)
     q_descale_per_token: Tensor,  # [total_q, hq] f32
     k_descale_per_token: Tensor,  # [num_pages, page, hk] f32
-    v_descale_per_head: Tensor,   # [hk] f32
+    v_descale_per_head: Tensor,  # [hk] f32
     batch: int,
     num_heads: int,
     num_heads_k: int,
