@@ -13,10 +13,9 @@ Usage:
 """
 
 from aiter.ops.triton.gluon.sparse_attention_dsv4 import (
-    _sparse_attn_decode_kernel as csa_decode_gl,
-    _sparse_attn_prefill_kernel as csa_prefill_gl,
     sparse_attn_prefill_gluon,
     sparse_attn_decode_gluon,
+    sparse_attn_decode_split_gluon,
 )
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_decode_kernel as csa_decode_tl,
@@ -35,8 +34,8 @@ USE_GLUON = os.environ.get("USE_GLUON", "0") == "1"
 BACKEND = "gluon" if USE_GLUON else "triton"
 
 
-sparse_attn_prefill_kernel = csa_prefill_gl if USE_GLUON else csa_prefill_tl
-sparse_attn_decode_kernel = csa_decode_gl if USE_GLUON else csa_decode_tl
+sparse_attn_prefill_kernel = csa_prefill_tl
+sparse_attn_decode_kernel = csa_decode_tl
 
 
 NOPE_DIM = 448
@@ -196,13 +195,14 @@ def _launch_decode(
     if USE_GLUON:
         # Persistent Gluon decode kernel: the host launcher builds the 1-D grid
         # and passes num_queries (it grid-strides over the tile space itself).
-        sparse_attn_decode_gluon(
+        sparse_attn_decode_split_gluon(
             q,
             main_cache,
             main_idx,
             main_indptr,
             out,
             scale,
+            num_splits=1,
             extra_cache=extra_cache if has_extra else None,
             extra_indices=extra_idx if has_extra else None,
             extra_indptr=extra_indptr if has_extra else None,

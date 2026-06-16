@@ -667,3 +667,357 @@ def _sparse_attn_decode_kernel(
         out_rope,
         mask=head_mask[:, None],
     )
+
+
+# ---------------------------------------------------------------------------
+# Sparse decode — flash-decode (split-K) variant
+# ---------------------------------------------------------------------------
+# Adapted from vLLM's rocm_aiter_mla_sparse.py. The single-pass decode kernel
+# above launches only num_queries * heads_blocks workgroups, which under-fills
+# the device at low batch (the latency-bound regime). The partial kernel adds a
+# split axis: each split walks a contiguous slice of the per-query main / extra
+# segments and writes raw (m, l, acc) partials; the reduce kernel combines them
+# (sink + final normalize). Slices are handled independently so a block never
+# straddles the main/extra boundary.
+
+
+@triton.jit
+def _sparse_attn_decode_partial_kernel(
+    q_ptr,
+    main_cache_ptr,
+    main_indices_ptr,
+    main_indptr_ptr,
+    extra_cache_ptr,
+    extra_indices_ptr,
+    extra_indptr_ptr,
+    part_m_ptr,
+    part_l_ptr,
+    part_acc_ptr,
+    q_stride0,
+    q_stride1,
+    main_cache_stride0,
+    extra_cache_stride0,
+    pm_stride0,
+    pm_stride_s,
+    pa_stride0,
+    pa_stride_s,
+    pa_stride_h,
+    main_num_rows,
+    extra_num_rows,
+    main_block_size,
+    extra_block_size,
+    scale,
+    num_heads,
+    HAS_EXTRA: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    split_id = tl.program_id(1)
+    pid_h = tl.program_id(2)
+
+    head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_offsets < num_heads
+    nope_offsets = tl.arange(0, NOPE_BLOCK)
+    nope_mask = nope_offsets < NOPE_DIM
+    rope_offsets = tl.arange(0, ROPE_DIM)
+
+    q_row_ptr = q_ptr + query_idx * q_stride0 + head_offsets[:, None] * q_stride1
+    q_nope = tl.load(
+        q_row_ptr + nope_offsets[None, :],
+        mask=head_mask[:, None] & nope_mask[None, :],
+        other=0.0,
+    )
+    q_rope = tl.load(
+        q_row_ptr + NOPE_DIM + rope_offsets[None, :],
+        mask=head_mask[:, None],
+        other=0.0,
+    )
+
+    neg_large = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc_nope = tl.zeros((BLOCK_H, NOPE_BLOCK), dtype=tl.float32)
+    acc_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
+    k_offsets = tl.arange(0, BLOCK_K)
+
+    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
+    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
+
+    # Each split processes a contiguous slice of this query's main (SWA) and
+    # extra (topk) segments. Slices are handled independently so a block never
+    # straddles the main/extra boundary.
+    main_start = tl.load(main_indptr_ptr + query_idx)
+    main_end = tl.load(main_indptr_ptr + query_idx + 1)
+    main_len = main_end - main_start
+    main_chunk = (main_len + NUM_SPLITS - 1) // NUM_SPLITS
+    main_lo = split_id * main_chunk
+    main_hi = tl.minimum(main_lo + main_chunk, main_len)
+
+    for k_start in tl.range(main_lo, main_hi, BLOCK_K, num_stages=NUM_STAGES):
+        k_pos = k_start + k_offsets
+        in_range = k_pos < main_hi
+        slot = tl.load(main_indices_ptr + main_start + k_pos, mask=in_range, other=-1)
+        valid = in_range & (slot >= 0) & (slot < main_num_rows)
+        safe_slot = tl.where(valid, slot, 0)
+
+        block_idx = safe_slot // main_block_size
+        pos_in_block = safe_slot % main_block_size
+        cache_block_ptr = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
+        token_data_ptr = cache_block_ptr + pos_in_block * 576
+        token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos_in_block * 8
+
+        x_uint8 = tl.load(
+            token_data_ptr[:, None] + nope_offsets[None, :],
+            mask=valid[:, None] & nope_mask[None, :],
+            other=0,
+        )
+        if IS_FNUZ:
+            x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
+        else:
+            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+        encoded_scales = tl.load(
+            token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+            mask=valid[:, None] & nope_mask[None, :],
+            other=127,
+        )
+        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+        k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+
+        rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+        k_rope = tl.load(
+            rope_ptr[:, None] + rope_offsets[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        )
+        k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+        k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+
+        scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))
+        scores *= scale
+        scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+        l_new = l_i * alpha + tl.sum(p, axis=1)
+
+        acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+        acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
+        m_i = m_new
+        l_i = l_new
+
+    if HAS_EXTRA:
+        extra_start = tl.load(extra_indptr_ptr + query_idx)
+        extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
+        extra_len = extra_end - extra_start
+        extra_chunk = (extra_len + NUM_SPLITS - 1) // NUM_SPLITS
+        extra_lo = split_id * extra_chunk
+        extra_hi = tl.minimum(extra_lo + extra_chunk, extra_len)
+
+        for k_start in tl.range(extra_lo, extra_hi, BLOCK_K, num_stages=NUM_STAGES):
+            k_pos = k_start + k_offsets
+            in_range = k_pos < extra_hi
+            slot = tl.load(
+                extra_indices_ptr + extra_start + k_pos, mask=in_range, other=-1
+            )
+            valid = in_range & (slot >= 0) & (slot < extra_num_rows)
+            safe_slot = tl.where(valid, slot, 0)
+
+            block_idx = safe_slot // extra_block_size
+            pos_in_block = safe_slot % extra_block_size
+            cache_block_ptr = (
+                extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
+            )
+            token_data_ptr = cache_block_ptr + pos_in_block * 576
+            token_scale_ptr = (
+                cache_block_ptr + extra_block_size * 576 + pos_in_block * 8
+            )
+
+            x_uint8 = tl.load(
+                token_data_ptr[:, None] + nope_offsets[None, :],
+                mask=valid[:, None] & nope_mask[None, :],
+                other=0,
+            )
+            if IS_FNUZ:
+                x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
+            else:
+                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            encoded_scales = tl.load(
+                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                mask=valid[:, None] & nope_mask[None, :],
+                other=127,
+            )
+            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+            k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+
+            rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+            k_rope = tl.load(
+                rope_ptr[:, None] + rope_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+            k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+            k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+
+            scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(
+                q_rope,
+                tl.trans(k_rope),
+            )
+            scores *= scale
+            scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
+
+            m_block = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_block)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+            l_new = l_i * alpha + tl.sum(p, axis=1)
+
+            acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+            acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
+            m_i = m_new
+            l_i = l_new
+
+    # Store raw (un-normalized) partial state for this split. Softmax sink and
+    # final normalization happen in the reduce kernel.
+    pm_base = query_idx * pm_stride0 + split_id * pm_stride_s + head_offsets
+    tl.store(part_m_ptr + pm_base, m_i, mask=head_mask)
+    tl.store(part_l_ptr + pm_base, l_i, mask=head_mask)
+    acc_base = (
+        part_acc_ptr
+        + query_idx * pa_stride0
+        + split_id * pa_stride_s
+        + head_offsets[:, None] * pa_stride_h
+    )
+    tl.store(
+        acc_base + nope_offsets[None, :],
+        acc_nope,
+        mask=head_mask[:, None] & nope_mask[None, :],
+    )
+    tl.store(
+        acc_base + NOPE_DIM + rope_offsets[None, :],
+        acc_rope,
+        mask=head_mask[:, None],
+    )
+
+
+@triton.jit
+def _sparse_attn_decode_reduce_kernel(
+    part_m_ptr,
+    part_l_ptr,
+    part_acc_ptr,
+    attn_sink_ptr,
+    out_ptr,
+    out_stride0,
+    out_stride1,
+    pm_stride0,
+    pm_stride_s,
+    pa_stride0,
+    pa_stride_s,
+    pa_stride_h,
+    num_heads,
+    HAS_ATTN_SINK: tl.constexpr,
+    COMB_DIM: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    SPLITS_PAD: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_offsets < num_heads
+    comb_offsets = tl.arange(0, COMB_DIM)
+    # SPLITS_PAD is NUM_SPLITS rounded up to a power of two so the parallel
+    # split-axis load is a legal arange for any split count; padding lanes are
+    # masked off.
+    split_offsets = tl.arange(0, SPLITS_PAD)
+    split_mask = split_offsets < NUM_SPLITS
+
+    neg_large = -3.4028234663852886e38
+
+    # Phase 1: load every split's running max/sum at once and reduce the max
+    # in parallel (tl.max over the split axis) instead of walking the splits
+    # serially. This breaks the long online-softmax dependency chain that made
+    # the reduce latency-bound.
+    load_mask = split_mask[:, None] & head_mask[None, :]
+    pm_split = (
+        part_m_ptr
+        + query_idx * pm_stride0
+        + split_offsets[:, None] * pm_stride_s
+        + head_offsets[None, :]
+    )
+    m_all = tl.load(pm_split, mask=load_mask, other=neg_large)  # [S, H]
+    l_all = tl.load(
+        part_l_ptr
+        + query_idx * pm_stride0
+        + split_offsets[:, None] * pm_stride_s
+        + head_offsets[None, :],
+        mask=load_mask,
+        other=0.0,
+    )
+
+    m_comb = tl.max(m_all, axis=0)  # [H]
+    if HAS_ATTN_SINK:
+        sink = tl.load(
+            attn_sink_ptr + head_offsets, mask=head_mask, other=neg_large
+        ).to(tl.float32)
+        m_final = tl.maximum(m_comb, sink)
+    else:
+        m_final = m_comb
+
+    w_all = tl.exp(m_all - m_final[None, :])  # [S, H]
+    w_all = tl.where(load_mask, w_all, 0.0)
+    l_final = tl.sum(w_all * l_all, axis=0)  # [H]
+    if HAS_ATTN_SINK:
+        l_final = l_final + tl.exp(sink - m_final)
+    denom = tl.maximum(l_final, 1.0e-30)
+
+    # Phase 2: weighted sum of the per-split accumulators. The combine weight
+    # for each split only depends on the (already known) global max, so the
+    # acc loads carry no cross-split dependency and the compiler can pipeline
+    # them; only the cheap FMA into `acc` is loop-carried.
+    acc = tl.zeros((BLOCK_H, COMB_DIM), dtype=tl.float32)
+    for s in tl.static_range(NUM_SPLITS):
+        m_s = tl.load(
+            part_m_ptr + query_idx * pm_stride0 + s * pm_stride_s + head_offsets,
+            mask=head_mask,
+            other=neg_large,
+        )
+        w_s = tl.exp(m_s - m_final)
+        acc_base = (
+            part_acc_ptr
+            + query_idx * pa_stride0
+            + s * pa_stride_s
+            + head_offsets[:, None] * pa_stride_h
+        )
+        acc_s = tl.load(
+            acc_base + comb_offsets[None, :],
+            mask=head_mask[:, None],
+            other=0.0,
+        )
+        acc += w_s[:, None] * acc_s
+
+    out = tl.where(l_final[:, None] > 0.0, acc / denom[:, None], 0.0)
+
+    out_row_ptr = (
+        out_ptr + query_idx * out_stride0 + head_offsets[:, None] * out_stride1
+    )
+    tl.store(
+        out_row_ptr + comb_offsets[None, :],
+        out,
+        mask=head_mask[:, None],
+    )

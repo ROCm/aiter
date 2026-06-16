@@ -5,6 +5,9 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse_dsv4.py
 
 
+import functools
+import math
+
 import torch
 import triton
 from packaging.version import Version
@@ -16,6 +19,8 @@ from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _pack_dense_prefix_to_ragged_kernel,
     _pack_global_topk_ragged_kernel,
     _sparse_attn_decode_kernel,
+    _sparse_attn_decode_partial_kernel,
+    _sparse_attn_decode_reduce_kernel,
     _sparse_attn_prefill_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -27,6 +32,7 @@ _TRITON_GE_36 = _TRITON_VERSION >= Version("3.6.0")
 _arch = arch_info.get_arch()
 _gluon_sparse_attn_prefill = None
 _gluon_sparse_attn_decode = None
+_gluon_sparse_attn_decode_split = None
 if _TRITON_GE_36 and _arch == "gfx950":
     try:
         from aiter.ops.triton.gluon.sparse_attention_dsv4 import (
@@ -35,6 +41,14 @@ if _TRITON_GE_36 and _arch == "gfx950":
         )
     except ImportError:
         pass  # symbols stay None (set above)
+    try:
+        # Split-K (flash-decode) Gluon variant — separate import so a missing
+        # symbol does not disable the single-pass Gluon path.
+        from aiter.ops.triton.gluon.sparse_attention_dsv4 import (
+            sparse_attn_decode_split_gluon as _gluon_sparse_attn_decode_split,
+        )
+    except ImportError:
+        pass  # symbol stays None (set above)
 
 # Buffer-load resource descriptors are 32-bit byte-addressed; the Gluon kernels
 # keep all per-row offsets in int32, so they can only be used when the addressed
@@ -361,6 +375,213 @@ def _sparse_attn_prefill_ragged(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Flash-decode (split-K) heuristic + launcher
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache
+def _decode_cu_count() -> int:
+    try:
+        return torch.cuda.get_device_properties(0).multi_processor_count
+    except Exception:
+        return 256  # gfx950 default; gated behind a fallback for other archs.
+
+
+def _decode_partial_iters(
+    avg_main_len: float, avg_extra_len: float, splits: int, block_k: int
+) -> int:
+    """BLOCK_K iterations one partial workgroup walks for ``splits`` splits.
+
+    Each split processes ``ceil(seg_len / splits)`` tokens of a segment, walked
+    ``BLOCK_K`` at a time, and the main/extra segments are handled separately.
+    """
+    main_iters = (
+        math.ceil(math.ceil(avg_main_len / splits) / block_k) if avg_main_len > 0 else 0
+    )
+    extra_iters = (
+        math.ceil(math.ceil(avg_extra_len / splits) / block_k)
+        if avg_extra_len > 0
+        else 0
+    )
+    return main_iters + extra_iters
+
+
+def _decode_num_splits(
+    num_queries: int,
+    heads_blocks: int,
+    avg_main_len: float = 0.0,
+    avg_extra_len: float = 0.0,
+    block_k: int = 32,
+    max_splits: int = 8,
+) -> int:
+    """Pick a flash-decode split count for the gather-latency-bound decode.
+
+    Decode launches only ``num_queries * heads_blocks`` workgroups, which
+    under-fills the device in the low-batch regime that dominates latency.
+    Splitting the per-query KV segment across workgroups adds memory-level
+    parallelism (more concurrent gathers), which is the right lever for this
+    HBM-gather-latency-bound kernel.
+
+    But each split also writes a full fp32 partial accumulator
+    (``BLOCK_H x COMB_DIM`` per workgroup) to HBM that the reduce kernel reads
+    back, so the overhead grows with the split count. The cost model works in
+    ``BLOCK_K``-iteration units::
+
+        cost(s) = waves(s) * (iters_per_split(s) + MU) + NU * (s - 1)
+
+    where ``waves = ceil(base * s / CU)``, ``iters_per_split`` is the real
+    per-workgroup BLOCK_K iteration count (``_decode_partial_iters``), ``MU``
+    charges per-wave launch/tail latency, and ``NU`` charges the per-split
+    reduce + partial-accumulator HBM traffic. Splitting is chosen only when the
+    iteration drop outweighs the extra-wave and reduce overhead; ties favour
+    fewer splits. This avoids splitting short segments (where the gather is too
+    cheap to offset the reduce overhead) and over-splitting tiny batches (where
+    the partial-acc HBM traffic dominates) — both measured net losses on gfx950.
+    Returns 1 (use the single-pass kernel, no reduce) when no split helps.
+
+    Tuned on gfx950 against the split-vs-single-pass decode sweep.
+    """
+    if avg_main_len <= 0.0 and avg_extra_len <= 0.0:
+        return 1
+    # Minimum per-query work to split at all. Short segments are too cheap to
+    # gather for the split to offset the second kernel launch + partial-acc HBM
+    # round-trip: measured net loss on gfx950 once the single-pass per-query
+    # iteration count drops below ~16 BLOCK_K tiles (e.g. topk<=256).
+    MIN_ITERS_TO_SPLIT = 16
+    if _decode_partial_iters(avg_main_len, avg_extra_len, 1, block_k) < MIN_ITERS_TO_SPLIT:
+        return 1
+    base = max(1, num_queries * heads_blocks)
+    cu = max(1, _decode_cu_count())
+    MU = 1.0  # per-wave launch/tail latency penalty
+    NU = 4.0  # per-extra-split reduce + partial-accumulator HBM penalty
+    best_splits = 1
+    best_cost = None
+    for splits in range(1, max_splits + 1):
+        waves = (base * splits + cu - 1) // cu
+        iters = _decode_partial_iters(avg_main_len, avg_extra_len, splits, block_k)
+        cost = waves * (iters + MU) + NU * (splits - 1)
+        if best_cost is None or cost < best_cost - 1e-9:
+            best_splits = splits
+            best_cost = cost
+    return best_splits
+
+
+def _decode_avg_seg_lens(
+    num_queries: int,
+    main_indices: torch.Tensor,
+    extra_indices: torch.Tensor,
+    has_extra: bool,
+) -> tuple[float, float]:
+    """Per-query average main / extra segment lengths, read sync-free from the
+    flat ragged index sizes (``main_indices`` / ``extra_indices`` are [nnz])."""
+    inv_q = 1.0 / max(1, num_queries)
+    avg_main_len = main_indices.numel() * inv_q
+    avg_extra_len = (extra_indices.numel() * inv_q) if has_extra else 0.0
+    return avg_main_len, avg_extra_len
+
+
+def _sparse_attn_decode_split_triton(
+    q: torch.Tensor,
+    out: torch.Tensor,
+    main_cache: torch.Tensor,
+    main_indices: torch.Tensor,
+    main_indptr: torch.Tensor,
+    extra_cache: torch.Tensor,
+    extra_indices: torch.Tensor,
+    extra_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+    has_attn_sink: bool,
+    has_extra: bool,
+    scale: float,
+    num_heads: int,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    num_splits: int,
+    block_h: int = 16,
+    block_k: int = 32,
+    num_stages: int = 1,
+    num_warps: int = 4,
+) -> None:
+    """Flash-decode (split-K) Triton launcher: partial kernel writes per-split
+    (m, l, acc) and the reduce kernel combines them (sink + normalize). Fills
+    ``out`` in place."""
+    num_queries = q.shape[0]
+    heads_blocks = triton.cdiv(num_heads, block_h)
+    nope_block = triton.next_power_of_2(nope_head_dim)
+    comb_dim = nope_head_dim + rope_head_dim
+
+    part_m = torch.empty(
+        (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
+    )
+    part_l = torch.empty_like(part_m)
+    part_acc = torch.empty(
+        (num_queries, num_splits, num_heads, comb_dim),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    _sparse_attn_decode_partial_kernel[(num_queries, num_splits, heads_blocks)](
+        q,
+        main_cache,
+        main_indices,
+        main_indptr,
+        extra_cache,
+        extra_indices,
+        extra_indptr,
+        part_m,
+        part_l,
+        part_acc,
+        q.stride(0),
+        q.stride(1),
+        main_cache.stride(0),
+        extra_cache.stride(0),
+        part_m.stride(0),
+        part_m.stride(1),
+        part_acc.stride(0),
+        part_acc.stride(1),
+        part_acc.stride(2),
+        main_cache.shape[0] * main_cache.shape[1],
+        extra_cache.shape[0] * extra_cache.shape[1],
+        main_cache.shape[1],
+        extra_cache.shape[1],
+        scale,
+        num_heads,
+        HAS_EXTRA=has_extra,
+        NOPE_DIM=nope_head_dim,
+        NOPE_BLOCK=nope_block,
+        ROPE_DIM=rope_head_dim,
+        IS_FNUZ=_is_fp8_fnuz(),
+        BLOCK_H=block_h,
+        BLOCK_K=block_k,
+        NUM_SPLITS=num_splits,
+        NUM_STAGES=num_stages,
+        num_warps=num_warps,
+    )
+
+    _sparse_attn_decode_reduce_kernel[(num_queries, heads_blocks)](
+        part_m,
+        part_l,
+        part_acc,
+        attn_sink,
+        out,
+        out.stride(0),
+        out.stride(1),
+        part_m.stride(0),
+        part_m.stride(1),
+        part_acc.stride(0),
+        part_acc.stride(1),
+        part_acc.stride(2),
+        num_heads,
+        HAS_ATTN_SINK=has_attn_sink,
+        COMB_DIM=comb_dim,
+        BLOCK_H=block_h,
+        NUM_SPLITS=num_splits,
+        SPLITS_PAD=triton.next_power_of_2(num_splits),
+        num_warps=num_warps,
+    )
+
+
 def _sparse_attn_decode_ragged(
     q: torch.Tensor,
     main_cache: torch.Tensor,
@@ -429,10 +650,47 @@ def _sparse_attn_decode_ragged(
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
     out = torch.empty_like(q, dtype=torch.bfloat16)
+
+    # Flash-decode split count: splitting the KV sequence adds parallelism when
+    # num_queries * heads_blocks under-fills the device (the low-batch,
+    # latency-bound regime). num_splits == 1 means the device is already full, so
+    # the single-pass kernel (no reduce overhead) is preferred. Average segment
+    # lengths are read sync-free from the ragged index sizes.
+    avg_main_len, avg_extra_len = _decode_avg_seg_lens(
+        num_queries, main_indices, extra_indices, has_extra
+    )
+
     # Prefer the persistent Gluon kernel, but it gathers the paged cache via
     # 32-bit buffer_load offsets, so fall back to Triton when either cache pool
     # exceeds the 2 GiB descriptor cap.
     if _use_gluon(_gluon_sparse_attn_decode, main_cache, extra_cache):
+        gluon_block_h = 64  # the Gluon decode kernels' fixed BLOCK_H
+        num_splits = _decode_num_splits(
+            num_queries,
+            triton.cdiv(num_heads, gluon_block_h),
+            avg_main_len,
+            avg_extra_len,
+            block_k=32,
+        )
+        if num_splits > 1 and _gluon_sparse_attn_decode_split is not None:
+            # Flash-decode (split-K) Gluon path for the under-filled regime.
+            _gluon_sparse_attn_decode_split(
+                q,
+                main_cache,
+                main_indices,
+                main_indptr,
+                out,
+                float(scale),
+                num_splits=num_splits,
+                extra_cache=extra_cache if has_extra else None,
+                extra_indices=extra_indices if has_extra else None,
+                extra_indptr=extra_indptr if has_extra else None,
+                attn_sink=attn_sink if has_attn_sink else None,
+                nope_dim=nope_head_dim,
+                rope_dim=rope_head_dim,
+                is_fnuz=_is_fp8_fnuz(),
+            )
+            return out
         # Persistent Gluon kernel: its host launcher builds the 1-D grid and
         # passes num_queries (it grid-strides over the tile space itself).
         _gluon_sparse_attn_decode(
@@ -449,6 +707,38 @@ def _sparse_attn_decode_ragged(
             nope_dim=nope_head_dim,
             rope_dim=rope_head_dim,
             is_fnuz=_is_fp8_fnuz(),
+        )
+        return out
+
+    # Triton fallback (non-gfx950, or KV pool > 2 GiB). Same split-vs-single
+    # decision; the partial kernel uses BLOCK_H=16.
+    triton_block_h = 16
+    num_splits = _decode_num_splits(
+        num_queries,
+        triton.cdiv(num_heads, triton_block_h),
+        avg_main_len,
+        avg_extra_len,
+        block_k=32,
+    )
+    if num_splits > 1:
+        _sparse_attn_decode_split_triton(
+            q,
+            out,
+            main_cache,
+            main_indices,
+            main_indptr,
+            extra_cache,
+            extra_indices,
+            extra_indptr,
+            attn_sink,
+            has_attn_sink,
+            has_extra,
+            scale,
+            num_heads,
+            nope_head_dim,
+            rope_head_dim,
+            num_splits,
+            block_h=triton_block_h,
         )
         return out
 
