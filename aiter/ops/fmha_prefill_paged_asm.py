@@ -56,9 +56,10 @@ def fmha_prefill_paged_asm_launch(
     k_head_stride_bytes = (128 // 16) * page_size * 16 * 1   # = 128 * page_size
     # K: page stride = nhead_k * k_head_stride_bytes
     k_page_stride_bytes = nhead_k * k_head_stride_bytes
-    # V: [pages, nhead_k, hd, page_size] col-major (tokens innermost, stride=1)
-    v_head_stride_bytes = 128 * page_size                # bytes per kv-head = hd * page_size
-    v_page_stride_bytes = nhead_k * 128 * page_size      # bytes per page
+    # V pool: [pages, nhead_k, hd, page_size] col-major (KV cache manager native layout).
+    # Kernel consumes col-major V directly — no permute needed.
+    v_head_stride_bytes = 128 * page_size * 1                 # bytes per kv-head (hd * page_size * bpe)
+    v_page_stride_bytes = nhead_k * 128 * page_size * 1       # bytes per page (col-major)
 
     # Output: [total_q, nhead_q, 128] bf16 = 2 bytes per element
     if out is None:
