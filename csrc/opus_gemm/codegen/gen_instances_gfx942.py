@@ -67,6 +67,7 @@ PIPELINE_HEADER_MAP = {
     "a16w16_em3en4_lds1_pgr2_sk": _gfx942_pipeline("a16w16_em3en4_lds1_pgr2_sk"),
     "a16w16_kbuf1_large_tile": _gfx942_pipeline("a16w16_kbuf1_large_tile"),
     "a16w16_wave_k_coop": _gfx942_pipeline("a16w16_wave_k_coop"),
+    "a16w16_wave_k_coop_accum": _gfx942_pipeline("a16w16_wave_k_coop"),
     **{nosplit: _gfx942_pipeline(nosplit) for nosplit in _NOSPLIT},
     **{
         splitk: _gfx942_pipeline(nosplit) for nosplit, splitk in W3_KERNEL_PAIRS.items()
@@ -81,6 +82,7 @@ KARGS_NAME_MAP = {
     "a16w16_em3en4_lds1_pgr2_sk": "opus_gemm_splitk_kargs",
     "a16w16_kbuf1_large_tile": "opus_gemm_noscale_kargs",
     "a16w16_wave_k_coop": "opus_gemm_noscale_kargs",
+    "a16w16_wave_k_coop_accum": "opus_gemm_noscale_kargs",
     **{tag: "opus_gemm_splitk_kargs" for tag in _SPLITK},
     **{tag: "opus_gemm_noscale_kargs" for tag in _NOSPLIT},
 }
@@ -89,6 +91,7 @@ KERNEL_FUNC_MAP = {
     "a16w16_em3en4_lds1_pgr2_sk": "gemm_a16w16_em3en4_lds1_pgr2_sk_kernel",
     "a16w16_kbuf1_large_tile": "gemm_a16w16_kbuf1_large_tile_kernel",
     "a16w16_wave_k_coop": "gemm_a16w16_wave_k_coop_kernel",
+    "a16w16_wave_k_coop_accum": "gemm_a16w16_wave_k_coop_accum_kernel",
     # gfx942 paired tags: nosplit_tag's kernel symbol; splitk_tag reuses it.
     **{nosplit: f"gemm_{nosplit}_kernel" for nosplit in W3_KERNEL_PAIRS.keys()},
     **{splitk: f"gemm_{nosplit}_kernel" for nosplit, splitk in W3_KERNEL_PAIRS.items()},
@@ -542,7 +545,8 @@ def gen_a16w16_nosplit_gfx942_instance(
     kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
-    is_wkc = k.kernel_tag == "a16w16_wave_k_coop"
+    is_wkc_accum = k.kernel_tag == "a16w16_wave_k_coop_accum"
+    is_wkc = k.kernel_tag in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum")
     waves_per_wg = k.BLOCK_SIZE // 64
     t_k = waves_per_wg if is_wkc else 1
     lds_depth_suffix = ", 1" if is_wkc else ""
@@ -597,11 +601,12 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     launch_block = f"""
     auto stream = aiter::getCurrentHIPStream();
     {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);"""
-    grid_decl = (
-        "    dim3 grid(num_tiles_n, num_tiles_m, batch);"
-        if is_wkc
-        else "    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);"
-    )
+    if is_wkc_accum:
+        grid_decl = "    dim3 grid(num_tiles_n * 8, num_tiles_m, batch);"
+    elif is_wkc:
+        grid_decl = "    dim3 grid(num_tiles_n, num_tiles_m, batch);"
+    else:
+        grid_decl = "    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);"
 
     preamble = instance_impl_preamble()
     host_tu_split = instance_impl_host_tu_split(
@@ -690,6 +695,7 @@ _GFX942_NOSPLIT_TAGS = (
     "a16w16_kbuf2v_bk128",
     "a16w16_kbuf1",
     "a16w16_wave_k_coop",
+    "a16w16_wave_k_coop_accum",
 )
 for _tag in _GFX942_NOSPLIT_TAGS:
     register_emit("gfx942", _tag, gen_a16w16_nosplit_gfx942_instance)
@@ -772,8 +778,8 @@ def _validate_a16w16_wave_k_coop_gfx942(k: OpusGemmInstance):
     errors = []
     if getattr(k, "arch_prefix", "") != "gfx942":
         errors.append("wave-K-coop is gfx942-only")
-    if k.kernel_tag != "a16w16_wave_k_coop":
-        errors.append(f"kernel_tag={k.kernel_tag} must be a16w16_wave_k_coop")
+    if k.kernel_tag not in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum"):
+        errors.append(f"kernel_tag={k.kernel_tag} must be a16w16_wave_k_coop/_accum")
     if k.BLOCK_SIZE not in (256, 512):
         errors.append(f"BLOCK_SIZE={k.BLOCK_SIZE} must be 256 or 512")
     waves_per_wg = k.BLOCK_SIZE // WARP_SIZE

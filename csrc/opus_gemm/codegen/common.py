@@ -25,6 +25,7 @@ _GFX942_A16W16_TAGS = (
         "a16w16_em3en4_lds1_pgr2_sk",
         "a16w16_kbuf1_large_tile",
         "a16w16_wave_k_coop",
+        "a16w16_wave_k_coop_accum",
     )
     + _NOSPLIT
 )

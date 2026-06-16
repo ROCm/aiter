@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// gfx942 wave-K-cooperative pipeline family (kids 10300-10303).
+// gfx942 wave-K-cooperative pipeline family.
 //
-// Target small-shape tiles: one WG owns a small (M, N) output tile; all waves
-// within the WG split across K (T_K=BLOCK_SIZE/wave_size) and accumulate into
-// wave-local fp32 partials, then LDS-reduce those partials and store bf16 Y.
-// No splitK across WGs, no atomic, no separate reduce kernel, no cross-WG sync.
+// Deterministic WKC kids 10300-10303: one WG owns a small (M, N) output tile;
+// all waves within the WG split across K, then LDS-reduce partials and store Y.
+// Accum WKC kids 10310-10314: split K across 8 WGs and atomic-add bf16x2 Y.
 //
 // Geometry: B=(B_M, B_N, B_K), T=(1, 1, BLOCK_SIZE/wave_size),
 // W=(16, 16, 16), LDS_DEPTH=1.
@@ -97,6 +96,7 @@ OPUS_D auto make_layout_wkc_ub(int lane_id)
 
 using short4_ab = opus::vector_t<__bf16, 4>;
 using float4_acc = float __attribute__((ext_vector_type(4)));
+using bf16x2_accum = __bf16 __attribute__((ext_vector_type(2)));
 
 template<typename T, typename G, typename U>
 OPUS_D auto load_a_wave_tile(G& g_a, const U& u_ga,
@@ -295,6 +295,48 @@ void load_wkc_e2n1_tile(opus::array<short4_ab, 8>& v_a,
                           wave_slab_id, u_ua, u_ub);
 }
 
+template<typename T, int E_K, typename U_A, typename U_B>
+__device__ __forceinline__
+void load_wkc_e4n1_k(opus::array<short4_ab, 16>& v_a,
+                     opus::array<short4_ab, 4>& v_b,
+                     const char* smem_a_base,
+                     const char* smem_b_base,
+                     int wave_slab_id,
+                     const U_A& u_ua,
+                     const U_B& u_ub)
+{
+    v_a[E_K] = load_a_mfma_operand<T>(
+        smem_a_base, wave_slab_id, 0, E_K, u_ua);
+    v_a[4 + E_K] = load_a_mfma_operand<T>(
+        smem_a_base, wave_slab_id, 1, E_K, u_ua);
+    v_a[8 + E_K] = load_a_mfma_operand<T>(
+        smem_a_base, wave_slab_id, 2, E_K, u_ua);
+    v_a[12 + E_K] = load_a_mfma_operand<T>(
+        smem_a_base, wave_slab_id, 3, E_K, u_ua);
+    v_b[E_K] = load_b_mfma_operand<T>(
+        smem_b_base, wave_slab_id, 0, E_K, u_ub);
+}
+
+template<typename T, typename U_A, typename U_B>
+__device__ __forceinline__
+void load_wkc_e4n1_tile(opus::array<short4_ab, 16>& v_a,
+                        opus::array<short4_ab, 4>& v_b,
+                        const char* smem_a_base,
+                        const char* smem_b_base,
+                        int wave_slab_id,
+                        const U_A& u_ua,
+                        const U_B& u_ub)
+{
+    load_wkc_e4n1_k<T, 0>(v_a, v_b, smem_a_base, smem_b_base,
+                          wave_slab_id, u_ua, u_ub);
+    load_wkc_e4n1_k<T, 1>(v_a, v_b, smem_a_base, smem_b_base,
+                          wave_slab_id, u_ua, u_ub);
+    load_wkc_e4n1_k<T, 2>(v_a, v_b, smem_a_base, smem_b_base,
+                          wave_slab_id, u_ua, u_ub);
+    load_wkc_e4n1_k<T, 3>(v_a, v_b, smem_a_base, smem_b_base,
+                          wave_slab_id, u_ua, u_ub);
+}
+
 template<typename T, typename U_A, typename U_B>
 __device__ __forceinline__
 void load_wkc_e1n2_tile(opus::array<short4_ab, 2>& v_a,
@@ -349,6 +391,23 @@ void phase_wkc_e2n1k4(opus::array<short4_ab, 8>& v_a,
     s_waitcnt_lgkmcnt(6_I);
     v_c = mma.step_k(1_I, v_a, v_b, v_c);
     s_waitcnt_lgkmcnt(3_I);
+    v_c = mma.step_k(2_I, v_a, v_b, v_c);
+    s_waitcnt_lgkmcnt(0_I);
+    v_c = mma.step_k(3_I, v_a, v_b, v_c);
+}
+
+template<typename MMA>
+__device__ __forceinline__
+void phase_wkc_e4n1k4(opus::array<short4_ab, 16>& v_a,
+                      opus::array<short4_ab, 4>& v_b,
+                      opus::array<float4_acc, 4>& v_c,
+                      MMA& mma)
+{
+    s_waitcnt_lgkmcnt(15_I);
+    v_c = mma.step_k(0_I, v_a, v_b, v_c);
+    s_waitcnt_lgkmcnt(10_I);
+    v_c = mma.step_k(1_I, v_a, v_b, v_c);
+    s_waitcnt_lgkmcnt(5_I);
     v_c = mma.step_k(2_I, v_a, v_b, v_c);
     s_waitcnt_lgkmcnt(0_I);
     v_c = mma.step_k(3_I, v_a, v_b, v_c);
@@ -498,6 +557,34 @@ void wkc_compute_tile(const char* smem_a_base,
                       const U_A& u_ua,
                       const U_B& u_ub,
                       float4_acc* acc,
+                      wkc_tile_tag<4, 1, 4>)
+{
+    auto mma = make_wkc_tiled_mma<4, 1, 4>();
+    opus::array<short4_ab, 16> v_a;
+    opus::array<short4_ab, 4> v_b;
+    opus::array<float4_acc, 4> v_c;
+
+    load_wkc_e4n1_tile<T>(
+        v_a, v_b, smem_a_base, smem_b_base, wave_slab_id, u_ua, u_ub);
+    v_c[0] = acc[0];
+    v_c[1] = acc[1];
+    v_c[2] = acc[2];
+    v_c[3] = acc[3];
+    phase_wkc_e4n1k4(v_a, v_b, v_c, mma);
+    acc[0] = v_c[0];
+    acc[1] = v_c[1];
+    acc[2] = v_c[2];
+    acc[3] = v_c[3];
+}
+
+template<typename T, typename U_A, typename U_B>
+__device__ __forceinline__
+void wkc_compute_tile(const char* smem_a_base,
+                      const char* smem_b_base,
+                      int wave_slab_id,
+                      const U_A& u_ua,
+                      const U_B& u_ub,
+                      float4_acc* acc,
                       wkc_tile_tag<1, 2, 2>)
 {
     auto mma = make_wkc_tiled_mma<1, 2, 2>();
@@ -614,6 +701,76 @@ OPUS_D void reduce_partials_and_store_y(const char* lds_partial_base,
         if (full_tile || (gm < m_total && gn < n_total)) {
             ptr_y[gm * stride_y + gn] = static_cast<Y_T>(sum);
         }
+    }
+}
+
+OPUS_D void atomic_add_bf16x2(__bf16* ptr, float x0, float x1)
+{
+    bf16x2_accum v;
+    v[0] = static_cast<__bf16>(x0);
+    v[1] = static_cast<__bf16>(x1);
+    __builtin_amdgcn_global_atomic_fadd_v2bf16(
+        reinterpret_cast<bf16x2_accum*>(ptr), v);
+}
+
+template<typename T, typename Y_T>
+OPUS_D void zero_output_tile_bf16x2(Y_T* ptr_y, int row, int col,
+                                    int m_total, int n_total,
+                                    int stride_y, int tid_in_wg)
+{
+    constexpr int TILE_CELLS = T::B_M * T::B_N;
+    static_assert(std::is_same<Y_T, __bf16>::value,
+                  "WKC atomic accumulate supports bf16 output only");
+    const bool full_tile = (row + T::B_M <= m_total) && (col + T::B_N <= n_total);
+    bf16x2_accum zero;
+    zero[0] = static_cast<__bf16>(0.0f);
+    zero[1] = static_cast<__bf16>(0.0f);
+
+    for (int idx = tid_in_wg * 2; idx < TILE_CELLS; idx += T::BLOCK_SIZE * 2) {
+        int m = idx / T::B_N;
+        int n = idx - m * T::B_N;
+        int gm = row + m;
+        int gn = col + n;
+        if (full_tile || (gm < m_total && gn + 1 < n_total)) {
+            __bf16* out = reinterpret_cast<__bf16*>(
+                ptr_y + gm * stride_y + gn);
+            *reinterpret_cast<bf16x2_accum*>(out) = zero;
+        } else if (gm < m_total && gn < n_total) {
+            ptr_y[gm * stride_y + gn] = static_cast<Y_T>(0.0f);
+        }
+    }
+}
+
+template<typename T, typename Y_T>
+OPUS_D void reduce_partials_and_atomic_add_y(
+    const char* lds_partial_base, Y_T* ptr_y, int row, int col,
+    int m_total, int n_total, int stride_y, int tid_in_wg)
+{
+    constexpr int TILE_CELLS = T::B_M * T::B_N;
+    const float* partials = reinterpret_cast<const float*>(lds_partial_base);
+    static_assert(std::is_same<Y_T, __bf16>::value,
+                  "WKC atomic accumulate supports bf16 output only");
+
+    const bool full_tile = (row + T::B_M <= m_total) && (col + T::B_N <= n_total);
+    for (int idx = tid_in_wg * 2; idx < TILE_CELLS; idx += T::BLOCK_SIZE * 2) {
+        int m = idx / T::B_N;
+        int n = idx - m * T::B_N;
+        int gm = row + m;
+        int gn = col + n;
+        if (!(full_tile || (gm < m_total && gn + 1 < n_total))) {
+            continue;
+        }
+
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < T::T_K; ++w) {
+            sum0 += partials[w * TILE_CELLS + idx];
+            sum1 += partials[w * TILE_CELLS + idx + 1];
+        }
+        __bf16* out = reinterpret_cast<__bf16*>(
+            ptr_y + gm * stride_y + gn);
+        atomic_add_bf16x2(out, sum0, sum1);
     }
 }
 
@@ -738,6 +895,119 @@ void gemm_a16w16_wave_k_coop_kernel(opus_gemm_noscale_kargs kargs)
     __builtin_amdgcn_s_barrier();
 
     reduce_partials_and_store_y<T, D_C>(
+        smem_partial, ptr_y, row, col, kargs.m, kargs.n, kargs.stride_c, tid);
+
+#endif // __gfx942__
+#endif // __HIP_DEVICE_COMPILE__
+}
+
+template<typename Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1)
+void gemm_a16w16_wave_k_coop_accum_kernel(opus_gemm_noscale_kargs kargs)
+{
+#ifdef __HIP_DEVICE_COMPILE__
+#if defined(__gfx942__)
+    using namespace opus_wkc_gfx942;
+    using namespace opus;
+
+    using T = opus::remove_cvref_t<Traits>;
+    using D_A = typename T::D_A;
+    using D_B = typename T::D_B;
+    using D_C = typename T::D_C;
+
+    constexpr int SPLIT_K = 8;
+    constexpr int K_PER_SPLIT = T::B_K * T::T_K;
+    constexpr int A_BYTES = T::B_M * (T::B_K + 4) * sizeof(D_A) * T::T_K;
+    constexpr int B_BYTES = T::B_N * (T::B_K + 4) * sizeof(D_B) * T::T_K;
+    constexpr int REDUCE_BYTES = T::T_K * T::B_M * T::B_N * sizeof(float);
+    constexpr int AB_BYTES = A_BYTES + B_BYTES;
+    constexpr bool ALIAS_PARTIAL =
+        (AB_BYTES + REDUCE_BYTES > 64 * 1024) &&
+        (AB_BYTES <= 64 * 1024);
+    constexpr int LDS_BYTES =
+        ALIAS_PARTIAL
+            ? (AB_BYTES > REDUCE_BYTES ? AB_BYTES : REDUCE_BYTES)
+            : AB_BYTES + REDUCE_BYTES;
+    static_assert(LDS_BYTES <= 64 * 1024,
+                  "WKC accumulate LDS budget exceeded");
+
+    const int tile_split = opus::block_id_x();
+    const int num_tiles_n = ceil_div(kargs.n, T::B_N);
+    const int split_id = tile_split / num_tiles_n;
+    const int tile_n = tile_split - split_id * num_tiles_n;
+    const int tile_m = opus::block_id_y();
+    const int batch_id = opus::block_id_z();
+    const int row = tile_m * T::B_M;
+    const int col = tile_n * T::B_N;
+
+    const int tid = opus::thread_id_x();
+    const int wave_id =
+        __builtin_amdgcn_readfirstlane(tid / opus::get_warp_size());
+    const int wave_id_k = wave_id;
+    const int lane_id = tid % opus::get_warp_size();
+
+    const D_A* ptr_a = reinterpret_cast<const D_A*>(kargs.ptr_a)
+                       + batch_id * kargs.stride_a_batch + row * kargs.stride_a;
+    const D_B* ptr_b = reinterpret_cast<const D_B*>(kargs.ptr_b)
+                       + batch_id * kargs.stride_b_batch + col * kargs.stride_b;
+    D_C* ptr_y = reinterpret_cast<D_C*>(kargs.ptr_c)
+                 + batch_id * kargs.stride_c_batch;
+
+    const bool full_tile = row + T::B_M <= kargs.m && col + T::B_N <= kargs.n;
+    auto g_a = make_gmem(
+        ptr_a,
+        full_tile ? 0xffffffffu
+                  : (unsigned int)(((kargs.m - row) * kargs.stride_a) * sizeof(D_A)));
+    auto g_b = make_gmem(
+        ptr_b,
+        full_tile ? 0xffffffffu
+                  : (unsigned int)(((kargs.n - col) * kargs.stride_b) * sizeof(D_B)));
+
+    if (split_id == 0) {
+        zero_output_tile_bf16x2<T, D_C>(
+            ptr_y, row, col, kargs.m, kargs.n, kargs.stride_c, tid);
+        __builtin_amdgcn_s_barrier();
+    }
+
+    __shared__ char smem[LDS_BYTES];
+    char* smem_a = smem;
+    char* smem_b = smem + A_BYTES;
+    char* smem_partial = smem + A_BYTES + B_BYTES;
+    if constexpr (ALIAS_PARTIAL) {
+        smem_partial = smem;
+    }
+
+    float4_acc acc[T::E_M * T::E_N] = {};
+
+    auto u_ga = make_layout_wkc_ga<T>(lane_id, kargs.stride_a);
+    auto u_gb = make_layout_wkc_gb<T>(lane_id, kargs.stride_b);
+    auto u_sa = make_layout_wkc_sa<T>(lane_id);
+    auto u_sb = make_layout_wkc_sb<T>(lane_id);
+    auto u_ua = make_layout_wkc_ua<T>(lane_id);
+    auto u_ub = make_layout_wkc_ub<T>(lane_id);
+
+    #pragma unroll 1
+    for (int k_base = split_id * K_PER_SPLIT + wave_id_k * T::B_K;
+         k_base < kargs.k;
+         k_base += SPLIT_K * K_PER_SPLIT) {
+        auto vb = load_b_wave_tile<T>(g_b, u_gb, k_base);
+        auto va = load_a_wave_tile<T>(g_a, u_ga, k_base);
+        store_b_wave_to_lds<T>(smem_b, wave_id_k, vb, u_sb);
+        store_a_wave_to_lds<T>(smem_a, wave_id_k, va, u_sa);
+        wave_compute_one_k_tile<T>(
+            smem_a, smem_b, wave_id_k, u_ua, u_ub,
+            acc);
+    }
+
+    if constexpr (ALIAS_PARTIAL) {
+        __builtin_amdgcn_s_barrier();
+    }
+    store_wave_acc_to_lds_partial<T>(
+        smem_partial, wave_id_k, acc, lane_id);
+    s_waitcnt_lgkmcnt(0_I);
+    __builtin_amdgcn_s_barrier();
+
+    reduce_partials_and_atomic_add_y<T, D_C>(
         smem_partial, ptr_y, row, col, kargs.m, kargs.n, kargs.stride_c, tid);
 
 #endif // __gfx942__

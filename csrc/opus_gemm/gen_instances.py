@@ -290,7 +290,7 @@ class opus_gemm_codegen:
         elif k.kernel_tag in _GFX942_A16W16_TAGS:
             if k.kernel_tag == "a16w16_em3en4_lds1_pgr2_sk":
                 info = _validate_a16w16_em3en4_gfx942(k)
-            elif k.kernel_tag == "a16w16_wave_k_coop":
+            elif k.kernel_tag in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum"):
                 info = _validate_a16w16_wave_k_coop_gfx942(k)
             else:
                 info = _validate_a16w16_gfx942(k)

@@ -14,6 +14,7 @@ _GFX942_KERNEL_NAME_TAGS = {
     "a16w16_kbuf2v_bk128_sk": "splitk_p1_bk128",
     "a16w16_em3en4_lds1_pgr2_sk": "splitk_em3en4_lds1_pgr2",
     "a16w16_wave_k_coop": "wkc",
+    "a16w16_wave_k_coop_accum": "wkc_accum",
     "a16w16_kbuf2v": "p1",
     "a16w16_kbuf2v_bk128": "p1_bk128",
     "a16w16_kbuf1": "legacy",
@@ -588,6 +589,15 @@ def _a16w16_wave_k_coop_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     )
 
 
+def _a16w16_wave_k_coop_accum_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
+    """Wave-K-cooperative splitK atomic accumulate path."""
+    vec = 16 // 2
+    return OpusGemmInstance(
+        bs, bm, bn, bk, 1, tn, wm, wn, wk, vec, vec, 4, 0, 0, 0,
+        "a16w16_wave_k_coop_accum", ["bf16_t"], arch_prefix="gfx942",
+    )
+
+
 def _a16w16_em3en4_lds1_pgr2_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     """SplitK EM3EN4: host 128x96, device 96x128 LDSB1."""
     vec = 16 // 2
@@ -608,6 +618,11 @@ gfx942_nosplit_kernels_list = {
     10301: _a16w16_wave_k_coop_gfx942(512, 16, 32, 32,    1, 16, 16, 16),  # WKC 16x32, B_K=32
     10302: _a16w16_wave_k_coop_gfx942(512, 32, 16, 64,    1, 16, 16, 16),  # WKC 32x16, aliased partial
     10303: _a16w16_wave_k_coop_gfx942(256, 32, 32, 64,    1, 16, 16, 16),  # WKC 32x32, T_K=4
+    10310: _a16w16_wave_k_coop_accum_gfx942(256, 16, 16, 64, 1, 16, 16, 16),  # WKC 16x16 split8 atomic accumulate
+    10311: _a16w16_wave_k_coop_accum_gfx942(512, 16, 32, 32, 1, 16, 16, 16),  # WKC 16x32 split8 atomic accumulate
+    10312: _a16w16_wave_k_coop_accum_gfx942(512, 32, 16, 64, 1, 16, 16, 16),  # WKC 32x16 split8 atomic accumulate
+    10313: _a16w16_wave_k_coop_accum_gfx942(256, 32, 32, 64, 1, 16, 16, 16),  # WKC 32x32 split8 atomic accumulate
+    10314: _a16w16_wave_k_coop_accum_gfx942(256, 64, 16, 64, 1, 16, 16, 16),  # WKC 64x16 split8 atomic accumulate
 }
 
 gfx942_splitk_kernels_list = {
