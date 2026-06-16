@@ -601,7 +601,8 @@ def _sanity_check(
     use_bias: bool = True,
     tol: float = VERIFY_TOL_A4W4,
     all_ones: bool = False,
-) -> None:
+    raise_on_fail: bool = True,
+) -> dict:
     """Tiny shape; compare grouped FlyDSL vs PyTorch fp32 ref.
 
     ``tol=0.02`` is the expected rel_l2 ceiling on **random uint8 mxfp4
@@ -638,10 +639,19 @@ def _sanity_check(
     # Production-consistent gate (op_tests/test_moe_2stage.py): logits_diff < 0.01.
     # rel_l2 is over-sensitive to the noisy fp32 reference (rel_l2 ~= sqrt(2*ld)),
     # so it is printed for reference only and no longer gates pass/fail.
-    assert ld < LOGITS_DIFF_TOL, (
-        f"grouped {tag} vs ref logits_diff={ld:.4e} > {LOGITS_DIFF_TOL} "
-        f"(rel_l2={rel:.4f}, informational)"
-    )
+    passed = ld < LOGITS_DIFF_TOL
+    if raise_on_fail:
+        assert passed, (
+            f"grouped {tag} vs ref logits_diff={ld:.4e} > {LOGITS_DIFF_TOL} "
+            f"(rel_l2={rel:.4f}, informational)"
+        )
+    return {
+        "logits_diff": ld,
+        "rel_l2": rel,
+        "passed": passed,
+        "grouped_norm": float(out.float().norm()),
+        "ref_norm": float(ref.float().norm()),
+    }
 
 
 @pytest.mark.parametrize("layout", ["gguu", "gugu"])
@@ -767,6 +777,31 @@ def _mock_grouped_gemm() -> None:
     q.per_1x32_f4_quant_hip = q.per_1x32_f4_quant_triton
 
 
+def _summarize_accuracy(rows: list):
+    """Build a precision summary table from per-case metrics and print it.
+
+    Mirrors the pandas DataFrame reporting in op_tests/test_moe_2stage.py.
+    Returns the DataFrame (or the raw rows if pandas is unavailable).
+    """
+    if not rows:
+        return None
+    try:
+        import pandas as pd
+    except ImportError:
+        print("[precision summary] pandas not installed; raw rows:", flush=True)
+        for r in rows:
+            print(f"  {r}", flush=True)
+        return rows
+    df = pd.DataFrame(rows)
+    try:
+        table = df.to_markdown(index=False)
+    except ImportError:
+        # to_markdown needs the optional `tabulate` package; plain fallback.
+        table = df.to_string(index=False)
+    print("\n[precision summary]\n" + table, flush=True)
+    return df
+
+
 def main() -> None:
     if not is_gfx1250():
         print("skipping: requires gfx1250")
@@ -782,7 +817,15 @@ def main() -> None:
         "GateMode.SEPARATED (default), gugu with INTERLEAVE.",
     )
     parser.add_argument("--experts", type=int, default=256)
-    parser.add_argument("--tokens", type=int, default=64)
+    parser.add_argument(
+        "--tokens",
+        type=int,
+        nargs="+",
+        default=[64],
+        metavar="N",
+        help="one or more space-separated token counts; the scenario runs "
+        "once per value, e.g. --tokens 64 128 256",
+    )
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--model-dim", type=int, default=7168)
     parser.add_argument("--inter-dim", type=int, default=256)
@@ -825,31 +868,68 @@ def main() -> None:
             "least two K tiles)."
         )
 
+    # --tokens accepts one or more counts; run the chosen scenario once per
+    # value. Each iteration sets args.tokens to a single int so _bench /
+    # _sanity_check read it unchanged.
+    token_list = args.tokens if isinstance(args.tokens, list) else [args.tokens]
+    activation = (
+        ActivationType.Swiglu if args.act == "swiglu" else ActivationType.Silu
+    )
+    rows = []
+    for _tok in token_list:
+        args.tokens = _tok
+        if len(token_list) > 1:
+            print(f"\n===== tokens={_tok} =====", flush=True)
+        if args.scenario == "verify":
+            tol = (
+                VERIFY_TOL_ALL_ONES
+                if args.all_ones
+                else VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
+            )
+            # raise_on_fail=False so one out-of-gate token does not abort the
+            # sweep; the failure is recorded and reported after the table.
+            metrics = _sanity_check(
+                args.data_format,
+                layout=args.layout,
+                experts=args.experts,
+                tokens=args.tokens,
+                topk=args.topk,
+                model_dim=args.model_dim,
+                inter_dim=args.inter_dim,
+                tol=tol,
+                activation=activation,
+                swiglu_limit=args.swiglu_limit,
+                use_bias=not args.no_bias,
+                all_ones=args.all_ones,
+                raise_on_fail=False,
+            )
+            rows.append(
+                {
+                    "data_format": args.data_format,
+                    "layout": args.layout,
+                    "act": args.act,
+                    "experts": args.experts,
+                    "tokens": _tok,
+                    "topk": args.topk,
+                    "model_dim": args.model_dim,
+                    "inter_dim": args.inter_dim,
+                    "logits_diff": metrics["logits_diff"],
+                    "rel_l2": metrics["rel_l2"],
+                    "pass": metrics["passed"],
+                }
+            )
+        else:
+            _bench(args)
+
     if args.scenario == "verify":
-        activation = (
-            ActivationType.Swiglu if args.act == "swiglu" else ActivationType.Silu
-        )
-        tol = (
-            VERIFY_TOL_ALL_ONES
-            if args.all_ones
-            else VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
-        )
-        _sanity_check(
-            args.data_format,
-            layout=args.layout,
-            experts=args.experts,
-            tokens=args.tokens,
-            topk=args.topk,
-            model_dim=args.model_dim,
-            inter_dim=args.inter_dim,
-            tol=tol,
-            activation=activation,
-            swiglu_limit=args.swiglu_limit,
-            use_bias=not args.no_bias,
-            all_ones=args.all_ones,
-        )
-        return
-    _bench(args)
+        _summarize_accuracy(rows)
+        # Preserve CI semantics: non-zero exit if any case missed the gate.
+        failed = [r for r in rows if not r["pass"]]
+        if failed:
+            raise SystemExit(
+                f"{len(failed)}/{len(rows)} verify case(s) exceeded "
+                f"logits_diff gate {LOGITS_DIFF_TOL}"
+            )
 
 
 if __name__ == "__main__":
