@@ -761,10 +761,9 @@ def _build_kernel(
                     swa_off_elems = ArithValue(slot) * ArithValue(
                         swa_slot_stride
                     ) + ArithValue(ring) * ArithValue(swa_pos_stride)
-                    swa_off_bytes = (
-                        arith.index_cast(T.index, _to_raw(swa_off_elems))
-                        * arith.constant(2, type=T.index)
-                    )
+                    swa_off_bytes = arith.index_cast(
+                        T.index, _to_raw(swa_off_elems)
+                    ) * arith.constant(2, type=T.index)
                     swa_out_g = GTensor(
                         swa_kv,
                         dtype=T.bf16,
