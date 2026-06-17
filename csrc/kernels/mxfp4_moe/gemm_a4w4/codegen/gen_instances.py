@@ -329,7 +329,7 @@ AUX_INSTANCE_HEADER = """// SPDX-License-Identifier: MIT
 #include <hip/amd_detail/amd_hip_bf16.h>
 
 {kernel_include}
-#include "aux/codegen/mxfp4_moe_aux_dispatch.h"
+#include "moe_aux/codegen/mxfp4_moe_aux_dispatch.h"
 
 using namespace aiter::mxfp4_moe::aux_dispatch;
 
@@ -341,10 +341,10 @@ extern "C" void {fn_name}(
 }}
 """
 
-AUX_INC_SORT_QUANT  = '#include "aux/moe_sort_quant.cuh"'
-AUX_INC_3STAGE      = '#include "aux/moe_3stage_sort.cuh"'
-AUX_INC_SORT_SCALES = '#include "aux/moe_sort_scales.cuh"'
-AUX_INC_SCATTER     = '#include "aux/moe_scatter_reduce.cuh"'
+AUX_INC_SORT_QUANT  = '#include "moe_aux/moe_sort_quant.cuh"'
+AUX_INC_3STAGE      = '#include "moe_aux/moe_3stage_sort.cuh"'
+AUX_INC_SORT_SCALES = '#include "moe_aux/moe_sort_scales.cuh"'
+AUX_INC_SCATTER     = '#include "moe_aux/moe_scatter_reduce.cuh"'
 
 AUX_SORT_QUANT_PARAMS = """    int            M,
     const void*    a_input,
