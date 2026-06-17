@@ -17,7 +17,7 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict, write_lookup_header  # noqa: E402
+from chip_info import build_tune_dict, write_lookup_header, gen_lookup_header_map  # noqa: E402
 
 from gemm_a8w8_common import (  # noqa: E402
     default_kernels_dict,
@@ -78,32 +78,9 @@ class gemm_a8w8_fwd_codegen:
                         )
 
     def gen_lookup_dict(self, kernels_dict):
-        LOOKUP_head = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-
-#ifdef USE_ROCM
-
-#define GENERATE_LOOKUP_TABLE(ABTYPE, DTYPE, ETYPE)                                                                                      \\
-   {                                                                                                                             \\"""
-
-        LOOKUP_template = """
-       {{{MNK},                                                                                                       \\
-        {kernel_name}<ABTYPE, DTYPE, ETYPE>}},                       \\"""
-
-        LOOKUP_end = """
-   }
-
-#endif // USE_ROCM
-"""
-        write_lookup_header(
-            os.path.join(self.working_path, "gemm_a8w8_lookup.h"),
-            kernels_dict,
-            LOOKUP_head,
-            LOOKUP_template,
-            LOOKUP_end,
-            self.istune,
-        )
+        kernels_dict = gen_lookup_header_map(kernels_dict, self.istune)
+        with open(os.path.join(self.working_path, "gemm_a8w8_lookup.h"), "w") as f:
+            f.write(_render("lookup.cuh.j2", kernels_dict=kernels_dict))
 
     def gen_manifest_head(self, kernels_dict):
         kernel_names = [k.name for k in kernels_dict.values()]

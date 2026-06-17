@@ -375,6 +375,17 @@ def write_name_keyed_lookup_header(
         f.write(lookup_end)
 
 
+def gen_lookup_header_map(kernels_dict, istune=False):
+    for key, k in kernels_dict.items():
+        if not istune and (isinstance(key, tuple) and isinstance(key[0], str)):
+            # 5-tuple key: (gfx, cu_num, M, N, K)
+            # 6-tuple key: (gfx, cu_num, B, M, N, K)
+            # key[0] is the gfx arch string; the remaining elements are ints.
+            yield (key, k.name)
+        elif istune and isinstance(key, int) and key >= 0:
+            yield (key, k.name)
+
+
 def write_lookup_header(
     output_path, kernels_dict, lookup_head, lookup_template, lookup_end, istune=False
 ):
@@ -401,8 +412,8 @@ def write_lookup_header(
     """
     with open(output_path, "w") as f:
         f.write(lookup_head)
-        for key, k in kernels_dict.items():
-            if not istune and (isinstance(key, tuple) and isinstance(key[0], str)):
+        for key, name in gen_lookup_header_map(kernels_dict, istune):
+            if isinstance(key[0], str):
                 # 5-tuple key: (gfx, cu_num, M, N, K)
                 # 6-tuple key: (gfx, cu_num, B, M, N, K)
                 # key[0] is the gfx arch string; the remaining elements are ints.
@@ -412,11 +423,11 @@ def write_lookup_header(
                 f.write(
                     lookup_template.format(
                         MNK=cpp_key,
-                        kernel_name=k.name,
+                        kernel_name=name,
                     )
                 )
-            elif istune and isinstance(key, int) and key >= 0:
-                f.write(lookup_template.format(MNK=key, kernel_name=k.name))
+            else:
+                f.write(lookup_template.format(MNK=key, kernel_name=name))
         f.write(lookup_end)
 
 
