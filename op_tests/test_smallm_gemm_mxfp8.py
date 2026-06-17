@@ -217,6 +217,7 @@ def _ref_grouped(a_deq, w_deq, sorted_ids, expert_ids, num_valid, a_div, block_m
         (32, 1536, 6144, 4, False, 4, 4),  # gemm1 @EP8 (E=32)
         (64, 6144, 768, 1, True, 8, 1),  # gemm2 @EP4 (E=64)
         (128, 1536, 6144, 4, False, 16, 4),  # gemm1 @EP2: M_routed=64 (wide envelope)
+        (32, 768, 6144, 4, False, 4, 4),  # gemm1 @TP8 (N=768=2*intermediate/8)
     ],
 )
 @torch.inference_mode()

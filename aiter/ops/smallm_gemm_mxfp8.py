@@ -253,12 +253,14 @@ def mxfp8_gemv(
 # is E-aware because the win-envelope widens with E: more experts -> more routing
 # padding -> Triton wastes more, so HIP's relative position improves at higher
 # M_routed. Measured on MI355X (block_m=64, top_k=4; M3 = 256 experts):
-#   gemm1 (deep K=6144): wins to M_routed 16 at any E (EP16/8/4 = E 16/32/64), and
-#                        to 64 once E>=128 (EP2). no-EP (E=256) exceeds the 2GB
-#                        raw-buffer limit -> rejected (falls to Triton).
+#   gemm1 (deep K=6144): wins to M_routed 16 at any E, and to 64 once E>=128.
+#       N is the per-GPU gate_up width = 2*intermediate/TP, so it is TP-keyed:
+#       1536 @TP4, 768 @TP8 (both shipped). (gemm2 @TP8 is N=6144,K=384 -- K=384
+#       fails the K%1024-or-768 preflight + is fp32, so it cannot engage -> Triton.)
 #   gemm2 (shallow K=768): wins to M_routed 8 at any E (incl. no-EP E=256, 1.2GB).
 _MOE_ALLOWLIST = {
-    (1536, 6144, 4, False): [(1, 16, 0), (17, 64, 128)],  # gemm1 gate_up (deep K)
+    (1536, 6144, 4, False): [(1, 16, 0), (17, 64, 128)],  # gemm1 gate_up @TP4 (deep K)
+    (768, 6144, 4, False): [(1, 16, 0), (17, 64, 128)],  # gemm1 gate_up @TP8 (deep K)
     (6144, 768, 1, True): [(1, 8, 0)],  # gemm2 down weighted (shallow K)
     (6144, 768, 1, False): [(1, 8, 0)],  # gemm2 down no-combine
 }
