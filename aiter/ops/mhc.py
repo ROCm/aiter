@@ -117,7 +117,9 @@ def _mhc_fused_fill_splitk(m, valid_splitk, num_cu):
 
 
 def _mhc_fused_config_gfx950_256(m, hidden_size, num_cu):
-    tile_k = 64 if m >= 2 * hidden_size else 32
+    # tile_k crossover is a device-fill point (~32*num_cu rows), not a hidden_size
+    # multiple: on MI355X both hidden=7168 and 4096 flip to wide-k at m=8192=32*256.
+    tile_k = 64 if m >= 32 * num_cu else 32
     if hidden_size % tile_k != 0:
         tile_k = 32 if tile_k == 64 else 64
 

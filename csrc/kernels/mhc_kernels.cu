@@ -161,6 +161,10 @@ namespace aiter {
         v_a[1] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I), 0, true, interleave_size>(g_a, ga_offset + tile_k);
         lds_load_fn_tile(1);
         
+        // Single accumulator for both fn halves. fn_lo is the unscaled bf16 residual
+        // fn - fp32(fn_hi); bf16 shares fp32's 8-bit exponent so the residual keeps its
+        // own magnitude (~2^-8 of hi) without underflow -- no scale needed. hi*x and lo*x
+        // therefore accumulate directly into the same v_cf.
         fp32xovec_t v_cf[repeat_n];
         for (int n = 0; n < repeat_n; n++) {
             opus::clear(v_cf[n]);
@@ -168,57 +172,77 @@ namespace aiter {
         opus::s_waitcnt_vmcnt(opus::number<2 * fn_lds_load_waitcnt + x_load_waitcnt>{});
         const int k_loop = hc_hidden_size / (split_k * tile_k);
 
-        static constexpr int gemm_steps = tile_k / mfma_k * repeat_n;
-        static constexpr int bf_kk_per_window = 8 / repeat_n;
-        static constexpr int bf_vecs_per_n = bf_kk_per_window / fn_vec_size;
-        static constexpr int bf_vecs_per_window = repeat_n * bf_vecs_per_n;
-        static_assert(gemm_steps % 8 == 0, "flattened mfma loop must be divisible by 8");
-        static_assert(8 % repeat_n == 0, "repeat_n must divide the bf window");
-        static_assert(bf_kk_per_window % fn_vec_size == 0,
-                      "bf window per n must be divisible by fn_vec_size");
-        auto lds_load_bf_window = [&](float* s_fn_rd_ptr, float (&dst)[8], int p_window_base) {
-            int kk_window_base = p_window_base / repeat_n;
-            if constexpr (fn_vec_size == 1) {
-                #pragma unroll
-                for (int p = 0; p < 8; p++) {
-                    int kk = kk_window_base + p / repeat_n;
-                    int n = p % repeat_n;
-                    int fn_row = n * mfma_n + lane_id % mfma_n;
-                    int K_wanted;
-                    K_wanted = (kk / 8 * mfma_k + lane_id / mfma_n) * 8 + kk % 8;
-                    dst[p] = *(s_fn_rd_ptr + fn_row * tile_k +
-                               (K_wanted ^ ((fn_row & 0xF) << fn_xor_shift)));
-                }
-            } else {
-                #pragma unroll
-                for (int vec_id = 0; vec_id < bf_vecs_per_window; vec_id++) {
-                    int n = vec_id / bf_vecs_per_n;
-                    int kk_vec_base = kk_window_base + (vec_id % bf_vecs_per_n) * fn_vec_size;
-                    int fn_row = n * mfma_n + lane_id % mfma_n;
-                    int K_wanted_base;
-                    K_wanted_base = (kk_vec_base / 8 * mfma_k + lane_id / mfma_n) * 8 +
-                                    kk_vec_base % 8;
-                    int K_lds_base = K_wanted_base ^ ((fn_row & 0xF) << fn_xor_shift);
-                    fp32x4_t bf_vec = *(reinterpret_cast<fp32x4_t*>(
-                        s_fn_rd_ptr + fn_row * tile_k + K_lds_base));
+        // bf16 GEMM: one mfma_f32_16x16x32_bf16 contracts a full "chunk" of 8 K-elems
+        // per lane x 4 lane-groups = 32 K. The x activation is natively bf16; fn (fp32)
+        // is split into hi/lo bf16 (RNE), contributing 2 MFMAs per (chunk, n) into one
+        // accumulator -- replacing the 8 scalar fp32 MFMAs the old window issued per n.
+        using dtype_x8 = opus::vector_t<DTYPE_I, 8>;
+        static constexpr int n_chunks = vec_tile / 8;
+        // ds_read events one lds_read_fn_chunk issues: (8/fn_vec_size) vec reads per n.
+        static constexpr int fn_reads_per_chunk = (8 / fn_vec_size) * repeat_n;
+        static_assert(vec_tile % 8 == 0, "vec_tile must be a multiple of 8 for 16b x8 MFMA");
+        struct fn_raw_t { float f8[repeat_n][8]; };
+        struct fn_chunk_t { dtype_x8 hi[repeat_n]; dtype_x8 lo[repeat_n]; }; // lo is the bf16 residual fn - fp32(hi), unscaled
+        struct x_chunks_t { dtype_x8 chunk[n_chunks]; };
+        // Stage 1: issue only the ds_read for fn chunk c (the 8 K-elems kk=c*8..c*8+7 per
+        // n) into fp32 registers. Decoupled from the bf16 conversion so the LDS read
+        // latency is hidden behind the MFMAs of the current chunk instead of stalling on
+        // lgkmcnt right before the convert. Swizzle/address math mirrors the original
+        // window; mfma_k (4) is the LDS-layout constant, unrelated to the bf16 MFMA K=32.
+        auto lds_read_fn_chunk = [&](float* s_fn_rd_ptr, fn_raw_t& raw, int c) {
+            #pragma unroll
+            for (int n = 0; n < repeat_n; n++) {
+                int fn_row = n * mfma_n + lane_id % mfma_n;
+                if constexpr (fn_vec_size == 1) {
                     #pragma unroll
-                    for (int i = 0; i < fn_vec_size; i++) {
-                        int p_offset = (kk_vec_base + i) * repeat_n + n - p_window_base;
-                        dst[p_offset] = bf_vec[i];
+                    for (int e = 0; e < 8; e++) {
+                        int kk = c * 8 + e;
+                        int K_wanted = (kk / 8 * mfma_k + lane_id / mfma_n) * 8 + kk % 8;
+                        raw.f8[n][e] = *(s_fn_rd_ptr + fn_row * tile_k +
+                                         (K_wanted ^ ((fn_row & 0xF) << fn_xor_shift)));
+                    }
+                } else {
+                    #pragma unroll
+                    for (int v = 0; v < 8 / fn_vec_size; v++) {
+                        int kk_base = c * 8 + v * fn_vec_size;
+                        int K_wanted_base = (kk_base / 8 * mfma_k + lane_id / mfma_n) * 8 +
+                                            kk_base % 8;
+                        int K_lds_base = K_wanted_base ^ ((fn_row & 0xF) << fn_xor_shift);
+                        fp32x4_t bf_vec = *(reinterpret_cast<fp32x4_t*>(
+                            s_fn_rd_ptr + fn_row * tile_k + K_lds_base));
+                        #pragma unroll
+                        for (int i = 0; i < fn_vec_size; i++) {
+                            raw.f8[n][v * fn_vec_size + i] = bf_vec[i];
+                        }
                     }
                 }
             }
         };
+        // Stage 2: split the fp32 fn into hi/lo bf16 (VALU only, no LDS dependency) so it
+        // co-executes with the XDL MFMAs.
+        auto cvt_fn_chunk = [&](const fn_raw_t& raw, fn_chunk_t& dst) {
+            #pragma unroll
+            for (int n = 0; n < repeat_n; n++) {
+                #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    DTYPE_I hi = static_cast<DTYPE_I>(raw.f8[n][e]);
+                    dst.hi[n][e] = hi;
+                    dst.lo[n][e] = static_cast<DTYPE_I>(raw.f8[n][e] - static_cast<float>(hi));
+                }
+            }
+        };
 
+        using mfma_bf16 = opus::mfma<DTYPE_I, DTYPE_I, opus::fp32_t, mfma_m, mfma_n, 32>;
 #define GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH)                                             \
         do {                                                                                      \
-            fp32xtile v_af;                                                                       \
-            for (int i = 0; i < vec_tile; i++)                                                    \
-                v_af[i] = static_cast<float>(v_a[BUF][i]);                                        \
             if (n_idx == 0) {                                                                     \
-                for (int i = 0; i < vec_tile; i++)                                                \
-                    sqrsum_part += v_af[i] * v_af[i];                                             \
+                for (int i = 0; i < vec_tile; i++) {                                              \
+                    float xv = static_cast<float>(v_a[BUF][i]);                                   \
+                    sqrsum_part += xv * xv;                                                       \
+                }                                                                                 \
             }                                                                                     \
+            /* snapshot x before the prefetch overwrites v_a[BUF]; reinterpret as chunks */       \
+            x_chunks_t v_x = __builtin_bit_cast(x_chunks_t, v_a[BUF]);                             \
             if (DO_PREFETCH) {                                                                    \
                 v_a[BUF] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I),             \
                                                 0, true, interleave_size>(                        \
@@ -229,39 +253,37 @@ namespace aiter {
             }                                                                                     \
             __builtin_amdgcn_s_barrier();                                                         \
             float* s_fn_rd_ptr = s_fn + (LDS_SLOT) * tile_n * tile_k;                             \
-            float v_bf[2][8];                                                                      \
-            lds_load_bf_window(s_fn_rd_ptr, v_bf[0], 0);                                           \
+            fn_raw_t raw[2];                                                                       \
+            fn_chunk_t fc;                                                                         \
+            /* depth-1 decoupled prefetch: chunk c is read one iteration ahead so its LDS  */      \
+            /* latency overlaps chunk (c-1)'s MFMAs. At the top of iter c we wait until only */     \
+            /* the next chunk's reads remain in flight (lgkmcnt = reads_per_chunk), keeping  */     \
+            /* them hidden, then convert the just-arrived chunk c.                           */     \
+            lds_read_fn_chunk(s_fn_rd_ptr, raw[0], 0);                                             \
             __builtin_amdgcn_sched_barrier(0);                                                     \
             _Pragma("unroll")                                                                     \
-            for (int p_base = 8; p_base < gemm_steps; p_base += 8) {                               \
-                int bf_rd_buf = (p_base / 8 - 1) & 0x1;                                           \
-                int bf_wr_buf = (p_base / 8) & 0x1;                                               \
+            for (int c = 0; c < n_chunks; c++) {                                                  \
+                int rd = c & 0x1;                                                                  \
+                int wr = (c + 1) & 0x1;                                                            \
+                if (c + 1 < n_chunks) {                                                           \
+                    lds_read_fn_chunk(s_fn_rd_ptr, raw[wr], c + 1);                               \
+                    opus::s_waitcnt_lgkmcnt(opus::number<fn_reads_per_chunk>{});                  \
+                } else {                                                                          \
+                    opus::s_waitcnt_lgkmcnt(opus::number<0>{});                                   \
+                }                                                                                 \
+                cvt_fn_chunk(raw[rd], fc);                                                         \
+                dtype_x8 x_bf = v_x.chunk[c];                                                     \
                 _Pragma("unroll")                                                                 \
-                for (int p_offset = 0; p_offset < 8; p_offset++) {                                 \
-                    int p_old = p_base - 8 + p_offset;                                             \
-                    int kk_old = p_old / repeat_n;                                                 \
-                    int n_old = p_old % repeat_n;                                                  \
-                    v_cf[n_old] = __builtin_amdgcn_mfma_f32_16x16x4f32(                            \
-                        v_bf[bf_rd_buf][p_offset], v_af[kk_old], v_cf[n_old], 0, 0, 0);            \
-                    if (p_offset == 0) {                                                           \
-                        lds_load_bf_window(s_fn_rd_ptr, v_bf[bf_wr_buf], p_base);                  \
-                    }                                                                              \
+                for (int n = 0; n < repeat_n; n++) {                                              \
+                    v_cf[n] = mfma_bf16{}(fc.hi[n], x_bf, v_cf[n]);                               \
+                    v_cf[n] = mfma_bf16{}(fc.lo[n], x_bf, v_cf[n]);                               \
                     __builtin_amdgcn_sched_barrier(0);                                             \
-                }                                                                                  \
+                }                                                                                 \
             }                                                                                      \
             if (DO_PREFETCH) {                                                                    \
                 __syncthreads();                                                                  \
                 lds_load_fn_tile((k) + 2);                                                        \
             }                                                                                     \
-            int bf_tail_buf = (gemm_steps / 8 - 1) & 0x1;                                          \
-            _Pragma("unroll")                                                                     \
-            for (int p_offset = 0; p_offset < 8; p_offset++) {                                     \
-                int p_old = gemm_steps - 8 + p_offset;                                             \
-                int kk_old = p_old / repeat_n;                                                     \
-                int n_old = p_old % repeat_n;                                                      \
-                v_cf[n_old] = __builtin_amdgcn_mfma_f32_16x16x4f32(                                \
-                    v_bf[bf_tail_buf][p_offset], v_af[kk_old], v_cf[n_old], 0, 0, 0);              \
-            }                                                                                      \
         } while (0)
         for (int k = 0; k < k_loop - 2; k += 2) {
             GEMM_LOOP_BODY(0, k % 2, k, 1);
@@ -1754,6 +1776,10 @@ namespace aiter {
         
         static constexpr int fn_load_vec = 16 / sizeof(float);
         static constexpr int fn_load_waitcnt = tile_n * tile_k / (warp_size * fn_load_vec);
+        using bf16_t = opus::bf16_t;
+        // fn stays fp32 through load + double buffering; the hi/lo bf16 split is done
+        // just before the MFMA (see compute_store_tile) so the conversion VALU ops can
+        // co-execute with the XDL bf16 MFMA instead of serializing the fn load path.
         using fp32xfntile = opus::array<fp32xtile, repeat_n>;
         auto vgpr_load_fn_tile = [&](int k) {
             fp32xfntile v_fn;
@@ -1789,6 +1815,9 @@ namespace aiter {
         lds_load_residual_tile(1);
         v_fn1 = vgpr_load_fn_tile(1);
 
+        // fn is split into hi + unscaled bf16 residual (fn - fp32(fn_hi)); bf16 shares
+        // fp32's 8-bit exponent so the residual keeps its own magnitude without underflow
+        // -- no scale needed. hi*x and lo*x accumulate directly into the same v_cf.
         float sqrsum_part[m_repeat];
         fp32xovec_t v_cf[m_repeat][repeat_n];
         for (int b = 0; b < m_repeat; b++) {
@@ -1814,7 +1843,7 @@ namespace aiter {
                     for(int h = 0; h < hc_mult; h++) {
                         residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset + h * tile_mk));
                     }
-                    opus::s_waitcnt_lgkmcnt(opus::number<0>{});
+                    opus::s_waitcnt_lgkmcnt(opus::number<hc_mult>{});
                     for(int k = 0; k < ds_read_vec; k++) {
                         res[k] = static_cast<float>(x_vec[k]) * post_mix_v[b];
                     }
@@ -1832,11 +1861,34 @@ namespace aiter {
                         g_nres, res, (b * mfma_m + lane_id % mfma_m) * residual_stride + warp_id * hidden_size + i * tile_k +
                         (s_offset % tile_k) + k_split_offset);
                     s_offset += step;
+                    // res (the bf16 next_residual the reference re-loads) feeds the
+                    // bf16 XDL MFMA unchanged; fn contributes hi + lo into the same
+                    // fp32 accumulator. One 16x16x32 bf16 MFMA contracts ds_read_vec
+                    // (=8) K-elements x 4 lane-group segments = 32 K, replacing the
+                    // 8 scalar fp32 MFMAs this block used to issue.
+                    //
+                    // The fp32->bf16 split of fn is done here (not at load) so its VALU
+                    // conversion ops overlap the XDL MFMAs: while one MFMA runs, the
+                    // next operand's hi/lo conversion issues on the VALU. fn_hi =
+                    // rtn-bf16(fn); fn_lo = bf16(fn - fp32(fn_hi)) is the unscaled residual
+                    // (bf16 shares fp32's exponent, no underflow) and accumulates into the
+                    // same v_cf as hi.
+                    static_assert(ds_read_vec == 8, "16x16x32 bf16 MFMA expects 8 elems/lane");
+                    opus::vector_t<bf16_t, ds_read_vec> res_bf;
+                    for(int k = 0; k < ds_read_vec; k++) {
+                        res_bf[k] = opus::fp32_to_bf16(res[k]);
+                    }
                     for(int n = 0; n < repeat_n; n++) {
-                        for(int k = 0; k < ds_read_vec; k++) {
-                            v_cf[b][n] = __builtin_amdgcn_mfma_f32_16x16x4f32(
-                                v_fn[n][k + j * ds_read_vec], res[k], v_cf[b][n], 0, 0, 0);
+                        opus::vector_t<bf16_t, ds_read_vec> fn_hi8, fn_lo8;
+                        for(int e = 0; e < ds_read_vec; e++) {
+                            fn_hi8[e] = opus::fp32_to_bf16(v_fn[n][e + j * ds_read_vec]);
                         }
+                        v_cf[b][n] = opus::mfma_f32_16x16x32_bf16{}(fn_hi8, res_bf, v_cf[b][n]);
+                        for(int e = 0; e < ds_read_vec; e++) {
+                            float f = v_fn[n][e + j * ds_read_vec];
+                            fn_lo8[e] = opus::fp32_to_bf16(f - opus::bf16_to_fp32(fn_hi8[e]));
+                        }
+                        v_cf[b][n] = opus::mfma_f32_16x16x32_bf16{}(fn_lo8, res_bf, v_cf[b][n]);
                     }
                 }
             }
@@ -1862,27 +1914,30 @@ namespace aiter {
         for(; i + 3 < k_loop ; i += 2) {
             wait_load_cnt();
             compute_store_tile(i, v_fn0);
+            v_fn0 = vgpr_load_fn_tile(i + 2);
+            __builtin_amdgcn_sched_barrier(0);
             __builtin_amdgcn_s_barrier();
             lds_load_x_tile(i + 2);
             lds_load_residual_tile(i + 2);
-            v_fn0 = vgpr_load_fn_tile(i + 2);
             __builtin_amdgcn_sched_barrier(0);
             wait_load_cnt();
             compute_store_tile(i + 1, v_fn1);
+            v_fn1 = vgpr_load_fn_tile(i + 3);
+            __builtin_amdgcn_sched_barrier(0);
             __builtin_amdgcn_s_barrier();
             lds_load_x_tile(i + 3);
             lds_load_residual_tile(i + 3);
-            v_fn1 = vgpr_load_fn_tile(i + 3);
         }
 
         if (i + 1 < k_loop) {
             wait_load_cnt();
             compute_store_tile(i, v_fn0);
             if (i + 2 < k_loop) {
+                v_fn0 = vgpr_load_fn_tile(i + 2);
+                __builtin_amdgcn_sched_barrier(0);
                 __builtin_amdgcn_s_barrier();
                 lds_load_x_tile(i + 2);
                 lds_load_residual_tile(i + 2);
-                v_fn0 = vgpr_load_fn_tile(i + 2);
                 wait_load_cnt();
             }
             else {
