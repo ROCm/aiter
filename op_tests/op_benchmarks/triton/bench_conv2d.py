@@ -23,9 +23,11 @@ solver name is captured only when --miopen-solvers is passed, because
 detection requires a separate subprocess with MIOPEN_LOG_LEVEL=6 (~60s
 fixed startup cost).
 
-For NCHW non-1x1 shapes, kernel+repack timing is also captured: the input
-prepack cache (_PACK_CACHE_CBLOCKED) is cleared before each timing call,
-giving the steady-state inference cost when input layout changes per call.
+For NCHW non-1x1 shapes, two Triton numbers are reported: kernel-only (the
+cblocked input pack is done once up front and handed to the kernel via
+x_blocked=) and kernel+repack (the public call, which packs the input on the
+host every time — the real inference cost when the input layout changes per
+call).
 
 No model loading at runtime — model shapes come from the pre-extracted
 model_shapes.json (see extract_conv_shapes.py for how to regenerate it).
@@ -46,6 +48,7 @@ import triton
 
 import aiter.ops.triton.conv.conv2d as _ops_module
 from aiter.ops.triton.conv._utils import (
+    BLOCK_K,
     flops_conv,
     _out_hw,
     _is_1x1_conv,
@@ -53,7 +56,7 @@ from aiter.ops.triton.conv._utils import (
     dynamic_conv_tolerances,
     _winograd_tolerances,
 )
-from aiter.ops.triton.conv._prepack import _PACK_CACHE_CBLOCKED
+from aiter.ops.triton.conv._prepack import prepack_nchw_to_cblocked
 from aiter.ops.triton.conv.conv2d import (
     conv2d,
     conv2d_nchw,
@@ -301,7 +304,8 @@ def bench_one_shape(
     tflops_tri_e2e (or None), correct, kernel_name, has_repack, flops.
 
     measure_repack: if True (default), additionally times the kernel+input-repack
-    path for NCHW non-1x1 shapes by clearing _PACK_CACHE_CBLOCKED between calls.
+    path for NCHW non-1x1 shapes by timing the public call (which packs the input
+    on the host each time).
     """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA not available; conv2d bench requires a GPU.")
@@ -353,22 +357,46 @@ def bench_one_shape(
         y_tri, y_ref, dtype, K_red=C * R * S, is_winograd=is_winograd
     )
 
-    ms_tri = triton.testing.do_bench(run_triton, warmup=15, rep=50)
+    # Kernel-only timing: the cblocked routes pack the input on the host. To
+    # time just the kernel we pre-pack once outside the loop and hand the packed
+    # input back via x_blocked=. Non-cblocked routes do no host pack, so the
+    # plain call already is kernel-only.
+    packs_input = "cblocked" in kernel_name.lower()
+    if packs_input:
+        x_blocked_pre, _ = prepack_nchw_to_cblocked(x_in, BLOCK_K)
+        cblk_fn = (
+            conv2d_winograd_f4x3_cblocked
+            if "winograd" in kernel_name.lower()
+            else conv2d_nchw_cblocked
+        )
+
+        def run_triton_kernel_only():
+            return cblk_fn(
+                x_in,
+                w,
+                b,
+                stride,
+                padding,
+                dilation,
+                activation="none",
+                x_blocked=x_blocked_pre,
+            )
+
+        ms_tri = triton.testing.do_bench(run_triton_kernel_only, warmup=15, rep=50)
+    else:
+        ms_tri = triton.testing.do_bench(run_triton, warmup=15, rep=50)
+
     ms_th = triton.testing.do_bench(run_torch, warmup=15, rep=50)
 
-    # Kernel+repack timing: clear input pack cache between calls. Only NCHW
-    # non-1x1 — 1x1 takes raw weights (no repacking) and NHWC has its own
-    # path that doesn't use _PACK_CACHE_CBLOCKED.
+    # Kernel+repack timing: the public call now always packs the input on the
+    # host, so timing it directly includes the repack. NCHW non-1x1 only (1x1
+    # takes raw weights; NHWC has no host-side input pack). For non-cblocked
+    # routes there's no host pack, so this matches the kernel-only number.
     has_repack = (
         measure_repack and layout != "nhwc" and not _is_1x1_conv(R, S, dilation)
     )
     if has_repack:
-
-        def run_triton_e2e():
-            _PACK_CACHE_CBLOCKED.clear()
-            return run_triton()
-
-        ms_tri_e2e = triton.testing.do_bench(run_triton_e2e, warmup=15, rep=50)
+        ms_tri_e2e = triton.testing.do_bench(run_triton, warmup=15, rep=50)
     else:
         ms_tri_e2e = None
 

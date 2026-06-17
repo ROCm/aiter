@@ -15,7 +15,6 @@ weight is a cache hit, making the steady-state repack cost negligible.
 
 import os
 from collections import OrderedDict
-from typing import Dict
 import torch
 
 from aiter.ops.triton.conv._utils import BLOCK_K, _storage_ptr
@@ -64,10 +63,6 @@ class _LRUPackCache:
 
 _PACK_CACHE = _LRUPackCache()
 _PACK_CACHE_3x3 = _LRUPackCache()
-# Input pack — kept as single-entry dict by design: in real inference each
-# layer's input is a unique intermediate activation that won't be reused,
-# and the bench clears this per-call to model per-batch repack cost.
-_PACK_CACHE_CBLOCKED: Dict = {}
 _PACK_CACHE_WINOGRAD_F4X3 = _LRUPackCache()
 
 
@@ -148,24 +143,6 @@ def prepack_nchw_to_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
         x_padded.reshape(N, C_blocks, Cb, H, W).permute(0, 1, 3, 4, 2).contiguous()
     )
     return x_blocked, C_pad
-
-
-def get_or_make_input_pack_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
-    key = (
-        _storage_ptr(x),
-        tuple(x.shape),
-        x.dtype,
-        block_c,
-    )
-    cached = _PACK_CACHE_CBLOCKED.get(key)
-    if cached is not None:
-        src_ref, item = cached
-        if src_ref is not None and _storage_ptr(src_ref) == key[0]:
-            return item
-    item = prepack_nchw_to_cblocked(x, block_c)
-    _PACK_CACHE_CBLOCKED.clear()
-    _PACK_CACHE_CBLOCKED[key] = (x, item)
-    return item
 
 
 def prepack_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
