@@ -15,7 +15,7 @@ from aiter.ops.triton.conv._utils import (
 from aiter.ops.triton.conv._prepack import (
     get_or_make_weight_pack,
     get_or_make_weight_pack_3x3,
-    get_or_make_input_pack_cblocked,
+    prepack_nchw_to_cblocked,
     get_or_make_winograd_filter_f4x3,
 )
 from aiter.ops.triton.conv._launch import (
@@ -146,9 +146,14 @@ def conv2d_winograd_f4x3_cblocked(
     dilation=(1, 1),
     activation="none",
     block_k=BLOCK_K,
+    x_blocked=None,
 ):
     """NCHW conv2d using Winograd F(4x4,3x3) with NCHWc input layout for coalesced loads.
-    Raises ValueError for non-eligible convs."""
+    Raises ValueError for non-eligible convs.
+
+    x_blocked: optional pre-packed NCHWc input. Used by the benchmark to time
+    the kernel without host-side input packing; when None (the normal inference
+    path) the input is packed here."""
     assert x.is_cuda and w_oihw.is_cuda
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
@@ -166,7 +171,10 @@ def conv2d_winograd_f4x3_cblocked(
     y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
     U, (_, C_pad) = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
-    x_blocked, C_pad_blocked = get_or_make_input_pack_cblocked(x, block_k)
+    if x_blocked is None:
+        x_blocked, C_pad_blocked = prepack_nchw_to_cblocked(x, block_k)
+    else:
+        C_pad_blocked = x_blocked.shape[-1] * x_blocked.shape[1]
     _launch_winograd_f4x3_cblocked(
         x_blocked,
         C_pad_blocked,
@@ -549,9 +557,14 @@ def conv2d_nchw_cblocked(
     dilation=(1, 1),
     activation="none",
     block_k=BLOCK_K,
+    x_blocked=None,
 ):
     """NCHW conv2d with channel-blocked input packing for 3x3 kernels.
-    Raises ValueError for non-3x3."""
+    Raises ValueError for non-3x3.
+
+    x_blocked: optional pre-packed NCHWc input. Used by the benchmark to time
+    the kernel without host-side input packing; when None (the normal inference
+    path) the input is packed here."""
     assert x.is_cuda and w_oihw.is_cuda
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
@@ -565,7 +578,10 @@ def conv2d_nchw_cblocked(
     bias_fp32 = bias.float().contiguous() if bias is not None else None
     w_3x3, (_, C_pad) = get_or_make_weight_pack_3x3(w_oihw.contiguous(), block_k)
     Cb = block_k  # packing block size matches weight padding block
-    x_blocked, C_pad_x = get_or_make_input_pack_cblocked(x, Cb)
+    if x_blocked is None:
+        x_blocked, C_pad_x = prepack_nchw_to_cblocked(x, Cb)
+    else:
+        C_pad_x = x_blocked.shape[-1] * x_blocked.shape[1]
     # Ensure channel padding is consistent
     assert (
         C_pad_x == C_pad
