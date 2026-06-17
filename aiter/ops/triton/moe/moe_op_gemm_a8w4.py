@@ -251,10 +251,17 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     block_k = 512
 
     if block_m == 16:
-        block_n = 256
         block_k = 512
         num_warps = 4
-        num_stages = 1
+        if get_arch() == "gfx1250":
+            # decode (block_m==16): NUM_BUFFERS=3 + block_n=128 restores the
+            # software-pipelined expert GEMM; the #3504 decode kernel's
+            # block_n=256/NUM_BUFFERS=1 regressed conc-1 decode on gfx1250.
+            block_n = 128
+            num_stages = 3
+        else:
+            block_n = 256
+            num_stages = 1
 
     elif block_m == 32:
         if n <= 1024:
@@ -310,6 +317,21 @@ def swizzle_scales_gfx1250(data):
     data = data.transpose(-1, -2)
 
     return data
+
+
+def swizzle_scales(data):
+    """Arch-agnostic scale swizzle for moe_gemm_a8w4.
+
+    Returns (swizzled_data, layout_string) where layout_string is the
+    SWIZZLE_MX_SCALE value the kernel expects, or None for unknown arches.
+    """
+    arch = get_arch()
+    if arch == "gfx1250":
+        return swizzle_scales_gfx1250(data), "GFX1250_SCALE"
+    elif arch == "gfx950":
+        return swizzle_scales_gfx950(data), "CDNA4_SCALE"
+    else:
+        return data, None
 
 
 # -----------------------------------------------------------------------------

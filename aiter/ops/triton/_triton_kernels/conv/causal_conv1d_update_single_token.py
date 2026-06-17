@@ -10,6 +10,70 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _ba_source_offsets(
+    idx_hv, num_v_heads, num_k_heads, INTERLEAVED_QKVZ: tl.constexpr
+):
+    """Return (b_off, a_off) into the packed ba tensor for one v-head index."""
+    if INTERLEAVED_QKVZ:
+        G = num_v_heads // num_k_heads
+        idx_h = idx_hv // G
+        idx_v = idx_hv % G
+        b_off = idx_h * (2 * G) + idx_v
+        a_off = idx_h * (2 * G) + G + idx_v
+    else:
+        b_off = idx_hv
+        a_off = num_v_heads + idx_hv
+    return b_off, a_off
+
+
+@triton.jit
+def _z_source_idx(
+    idx_z,
+    num_k_heads,
+    num_v_heads,
+    head_k_dim,
+    head_v_dim,
+    head_qkvz_dim,
+    INTERLEAVED_QKVZ: tl.constexpr,
+):
+    """Map flat z index to source column in the packed x tensor."""
+    if INTERLEAVED_QKVZ:
+        G = num_v_heads // num_k_heads
+        gs = G * head_v_dim
+        return idx_z // gs * head_qkvz_dim + 2 * head_k_dim + gs + idx_z % gs
+    else:
+        return 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim + idx_z
+
+
+@triton.jit
+def _feat_source_idx(
+    idx_feats,
+    num_k_heads,
+    head_k_dim,
+    head_v_dim,
+    head_qkvz_dim,
+    num_v_heads,
+    INTERLEAVED_QKVZ: tl.constexpr,
+):
+    """Map logical conv-output feature index to source column in packed x."""
+    if INTERLEAVED_QKVZ:
+        nk = num_k_heads
+        hk = head_k_dim
+        gs = (num_v_heads // nk) * head_v_dim
+        in_q = (idx_feats < nk * hk).to(tl.int64)
+        in_k = ((idx_feats >= nk * hk) & (idx_feats < nk * hk * 2)).to(tl.int64)
+        in_v = (idx_feats >= nk * hk * 2).to(tl.int64)
+        q_idx = idx_feats // hk * head_qkvz_dim + idx_feats % hk
+        rel_k = idx_feats - nk * hk
+        k_idx = rel_k // hk * head_qkvz_dim + hk + rel_k % hk
+        rel_v = idx_feats - nk * hk * 2
+        v_idx = rel_v // gs * head_qkvz_dim + 2 * hk + rel_v % gs
+        return in_q * q_idx + in_k * k_idx + in_v * v_idx
+    else:
+        return idx_feats.to(tl.int64)
+
+
 @triton.jit()
 def _causal_conv1d_update_single_token_kernel(
     # Pointers to matrices
@@ -265,6 +329,7 @@ def _reshape_causal_conv1d_update_single_token_kernel(
     NP2_STATELEN: tl.constexpr,
     USE_PAD_SLOT: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    INTERLEAVED_QKVZ: tl.constexpr,
 ):
     # ruff: noqa: E501
     idx_seq = tl.program_id(0)
@@ -275,14 +340,8 @@ def _reshape_causal_conv1d_update_single_token_kernel(
     if tl.program_id(1) == 0:
         ## HV = triton.next_power_of_2(num_v_heads)
         idx_hv = tl.arange(0, HV)
-        ## map idx_hv to source idx
-        idx_h = idx_hv // (num_v_heads // num_k_heads)
-        idx_v = idx_hv % (num_v_heads // num_k_heads)
-        b_source_offset = idx_h * (2 * num_v_heads // num_k_heads) + idx_v
-        a_source_offset = (
-            idx_h * (2 * num_v_heads // num_k_heads)
-            + num_v_heads // num_k_heads
-            + idx_v
+        b_source_offset, a_source_offset = _ba_source_offsets(
+            idx_hv, num_v_heads, num_k_heads, INTERLEAVED_QKVZ
         )
 
         b_source_ptrs = (
@@ -302,12 +361,14 @@ def _reshape_causal_conv1d_update_single_token_kernel(
     ## write z
     elif tl.program_id(1) < 1 + num_program_write_z:
         idx_z = (tl.program_id(1) - 1) * BLOCK_Z + tl.arange(0, BLOCK_Z)
-        ## map idx_z to source idx
-        idx_z_x = (
-            idx_z // (num_v_heads // num_k_heads * head_v_dim) * head_qkvz_dim
-            + 2 * head_k_dim
-            + num_v_heads // num_k_heads * head_v_dim
-            + idx_z % (num_v_heads // num_k_heads * head_v_dim)
+        idx_z_x = _z_source_idx(
+            idx_z,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            head_qkvz_dim,
+            INTERLEAVED_QKVZ,
         )
         z_source_ptrs = x_ptr + idx_seq * stride_x_seq + idx_z_x * stride_x_dim
         mask_z = idx_z < num_v_heads * head_v_dim
@@ -330,34 +391,20 @@ def _reshape_causal_conv1d_update_single_token_kernel(
             mask_remain = (idx_seq_remain < num_tokens) & mask_z
             tl.store(z_ptrs, 0.0, mask=mask_remain)
             tl.store(core_attn_out_ptrs, 0.0, mask=mask_remain)
-    ## do regular causal conv1d udpate
+    ## do regular causal conv1d update
     else:
         # [BLOCK_N,] elements along the feature-dimension (channel)
         idx_feats = (tl.program_id(1) - 1 - num_program_write_z) * BLOCK_N + tl.arange(
             0, BLOCK_N
         )
-        ## map idx_feats to idx_feats_x
-        idx_feats_x = (
-            (idx_feats < num_k_heads * head_k_dim).to(tl.int64)
-            * (idx_feats // head_k_dim * head_qkvz_dim + idx_feats % head_k_dim)
-            + (
-                (idx_feats >= num_k_heads * head_k_dim)
-                & (idx_feats < num_k_heads * head_k_dim * 2)
-            ).to(tl.int64)
-            * (
-                (idx_feats - num_k_heads * head_k_dim) // head_k_dim * head_qkvz_dim
-                + head_k_dim
-                + (idx_feats - num_k_heads * head_k_dim) % head_k_dim
-            )
-            + (idx_feats >= num_k_heads * head_k_dim * 2).to(tl.int64)
-            * (
-                (idx_feats - num_k_heads * head_k_dim * 2)
-                // (num_v_heads // num_k_heads * head_v_dim)
-                * head_qkvz_dim
-                + 2 * head_k_dim
-                + (idx_feats - num_k_heads * head_k_dim * 2)
-                % (num_v_heads // num_k_heads * head_v_dim)
-            )
+        idx_feats_x = _feat_source_idx(
+            idx_feats,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            head_qkvz_dim,
+            num_v_heads,
+            INTERLEAVED_QKVZ,
         )
 
         if IS_APC_ENABLED:
