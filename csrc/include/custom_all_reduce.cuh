@@ -1894,6 +1894,7 @@ __global__ void __launch_bounds__(1024, 1)
             OP zero_pack{};
             *reinterpret_cast<OP*>(output + out_idx) = zero_pack;
         }
+        __syncthreads();
     }
 }
 
@@ -1976,6 +1977,7 @@ __global__ void __launch_bounds__(1024, 1)
         ar_fusion_epilogue_per_group<P, A, T, OutT, pack_size, TRANSPOSE_SCALE>(
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             group_size, output, scale_out, active, bf16_output, m);
+        __syncthreads();
     }
 }
 
@@ -2083,6 +2085,7 @@ __global__ void __launch_bounds__(1024, 1)
         ar_fusion_epilogue_mxfp4<P, A, T, pack_size>(
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             output, scale_out, active, bf16_output);
+        __syncthreads();
     }
 }
 
