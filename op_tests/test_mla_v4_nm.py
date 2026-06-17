@@ -730,9 +730,10 @@ def _run_one_point(
     seed=0,
     num_iters=50,
     num_warmup=3,
-    num_kv_splits=1,
+    num_kv_splits=1,  # int, or None to auto-pick via get_meta_param (like the wrapper)
     gqa_ratio=GQA_RATIO,
     attn_sink=True,
+    out_16_nosplit=0,  # 1 -> kernel writes packed-BF16 result; wrapper resolves into output_buf
 ):
     """One shape point: build inputs ONCE, time the asm kernel via
     run_perftest, then compare the last iter's output against the two torch
@@ -761,6 +762,53 @@ def _run_one_point(
         f"picks sub_Q=64 and launches gdx=ceil(gqa*max_seqlen_q/64) WGs along "
         f"the head dim; only these three pairs are exercised by CSV+dispatcher."
     )
+
+    # Auto-pick the split count when the caller passes None — mirrors the
+    # production wrapper (aiter/mla.py mla_decode_fwd_v4_nm), which forwards
+    # num_kv_splits=None to get_meta_param's CU-occupancy x HBM-efficiency
+    # heuristic. We resolve it to a concrete int HERE (before any buffer
+    # allocation) because this driver pre-allocates logits/lse/split_indptr
+    # sized to a fixed split count; page_size=1 so total_kv = batch*kv_seq_lens
+    # and nhead = NUM_KV_HEADS*gqa_ratio.
+    if num_kv_splits is None:
+        # tg_factor mirrors the wrapper: gqa=128 launches ceil(128/64)=2 WGs
+        # per (seq, split), so its effective CU occupancy is 2x — feed that in
+        # so the heuristic doesn't over-split (bs=64/gqa=128 -> 2, not 4).
+        num_heads = NUM_KV_HEADS * gqa_ratio
+        tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
+        # max_splits mirrors the wrapper: small-batch long-context shapes may
+        # exceed V3's default cap of 16. Bound by (1) the 16-token KV tile
+        # (floor(kv/16) splits max) and (2) ~2x CU occupancy.
+        from aiter.jit.utils.chip_info import get_cu_num as _get_cu_num
+
+        cu_num = _get_cu_num()
+        tile_cap = max(1, kv_seq_lens // 16)
+        occ_cap = max(1, (2 * cu_num) // max(1, batch * tg_factor))
+        max_splits = max(16, min(tile_cap, occ_cap))
+        num_kv_splits, _ = aiter.mla.get_meta_param(
+            None,
+            batch,
+            batch * kv_seq_lens,
+            num_heads,
+            q_seq_logical,
+            dtypes.fp8,
+            tg_factor,
+            max_splits,
+        )
+        num_kv_splits = int(num_kv_splits)
+        print(
+            f"[v4 nm] auto-selected num_kv_splits={num_kv_splits} "
+            f"(tg_factor={tg_factor}, max_splits={max_splits})"
+        )
+
+    # out_16_nosplit=1 is the kernel's single-pass packed-BF16 direct path; it
+    # has no stage2 merge, so it is only valid with num_kv_splits==1 (the same
+    # constraint the wrapper enforces).
+    if out_16_nosplit != 0:
+        assert num_kv_splits == 1, (
+            f"out_16_nosplit={out_16_nosplit} requires num_kv_splits==1 "
+            f"(bf16-direct-write is single-pass only); got {num_kv_splits}."
+        )
 
     # Multi-split input guard (checked BEFORE any kernel launch): the .co inner
     # KV loop processes pass_size=16 tokens/iteration; each split WG must get at
@@ -875,7 +923,7 @@ def _run_one_point(
         inputs["sink"],  # per-head [num_heads] sink; req'd positional
         inputs["max_seqlen_q"],
         sm_scale,
-        0,  # out_16_nosplit
+        int(out_16_nosplit),  # out_16_nosplit (timing path; raw kernel does not unpack)
         num_kv_splits,
         logits_buf,
         lse_buf,
@@ -902,7 +950,7 @@ def _run_one_point(
         max_seqlen_q=inputs["max_seqlen_q"],
         sink=inputs["sink"],
         sm_scale=sm_scale,
-        out_16_nosplit=0,
+        out_16_nosplit=int(out_16_nosplit),
         num_kv_splits=num_kv_splits,
         logits=logits_buf,
         attn_lse=lse_buf,
@@ -911,13 +959,17 @@ def _run_one_point(
         num_rotate_args=1,
     )
 
-    # Resolve the asm output to compare against. The two split modes write to
-    # different buffers (Plan B: the wrapper's _fwd_kernel_stage2_asm V3 stage2
-    # path writes merged BF16 into `output_buf` only when there's >1 split):
-    #   single-pass  -> kernel writes one FP32 partial to logits[:, 0], no
-    #                   stage2; cast it to BF16 to match the multi-split output.
-    #   multi-pass   -> stage2 merge already wrote merged BF16 to output_buf.
-    if num_kv_splits == 1:
+    # Resolve the asm output to compare against. Three cases, all reading the
+    # buffer the wrapper actually populated (the 2b call above):
+    #   out_16_nosplit=1   -> kernel writes packed-BF16 into the logits region;
+    #                         the wrapper unpacks it into output_buf (see
+    #                         mla_decode_fwd_v4_nm). Read output_buf directly.
+    #   single-pass (fp32) -> kernel writes one FP32 partial to logits[:, 0],
+    #                         no stage2; cast it to BF16.
+    #   multi-pass         -> stage2 merge wrote merged BF16 to output_buf.
+    if out_16_nosplit != 0:
+        out_asm = output_buf  # wrapper unpacked packed-BF16 here
+    elif num_kv_splits == 1:
         out_asm = logits_buf[:, 0].to(dtypes.bf16)  # [total_q, num_heads, dv]
     else:
         out_asm = output_buf  # already [total_q, num_heads, dv] BF16
@@ -1439,6 +1491,17 @@ if __name__ == "__main__":
         help="Enable attn sink. True by default."
         "--attn-sink=False to disable attn sink.",
     )
+    parser.add_argument(
+        "--out_16_nosplit",
+        "--out-16-nosplit",
+        dest="out_16_nosplit",
+        type=int,
+        default=0,
+        help="1 -> kernel single-pass packed-BF16 direct path (no stage2 "
+        "merge). Requires --split-kv 1. The wrapper unpacks the result into "
+        "the output buffer; accuracy compares against it automatically. "
+        "Default 0 (fp32 split path).",
+    )
     args = parser.parse_args()
 
     perf_rows = []
@@ -1459,6 +1522,7 @@ if __name__ == "__main__":
             num_kv_splits=args.split_kv,
             gqa_ratio=args.gqa_ratio,
             attn_sink=args.attn_sink,
+            out_16_nosplit=args.out_16_nosplit,
         )
         perf_rows.append((batch, kv_seq_lens, q_seq_logical, us_asm, us_ref))
 

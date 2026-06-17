@@ -105,21 +105,40 @@ def _fwd_kernel_stage2_asm(
 
 
 @functools.lru_cache()
-def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
+def get_meta_param(
+    num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype, tg_factor=1, max_splits=None
+):
+    # tg_factor: number of thread-groups (workgroups) the kernel launches per
+    # (seq, kv-split) along the head dim. Default 1. For variants that synthesize
+    # a larger logical head count from multiple WGs — e.g. the v4 nm gqa=128
+    # path runs gdx=ceil(128/64)=2 WGs per (seq, split) — the GPU's CU occupancy
+    # is driven by `bs * tg_factor * num_kv_splits`, not `bs * num_kv_splits`.
+    # Only the occupancy term scales; avg_kv, the fp8 block cap, and the indptr
+    # all stay keyed on the real `bs`.
+    #
+    # max_splits: inclusive upper bound of the auto-search range. Default None
+    # keeps the historical V3 cap of 16 (so V3 callers are unaffected). Callers
+    # that know a larger physical ceiling — e.g. v4 nm, whose min KV tile is 16
+    # so a context_len=4096 single seq admits up to 4096/16=256 splits — pass a
+    # bigger value to let the heuristic explore it. The occupancy term still
+    # self-limits the choice once bs*tg_factor*split saturates the CUs, and the
+    # fp8 block cap below independently bounds it for numerical correctness.
     if num_kv_splits is None:
         cu_num = get_cu_num()
         avg_kv = total_kv / bs
         overhead = 84.1
+        bs_occ = bs * tg_factor
+        search_hi = 16 if max_splits is None else max(1, int(max_splits))
         tmp = [
             (
-                bs
+                bs_occ
                 * i
-                / ((bs * i + cu_num - 1) // cu_num * cu_num)
+                / ((bs_occ * i + cu_num - 1) // cu_num * cu_num)
                 * avg_kv
                 / (avg_kv + overhead * i),
                 i,
             )
-            for i in range(1, 17)
+            for i in range(1, search_hi + 1)
         ]
         num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
@@ -1020,10 +1039,10 @@ def mla_decode_fwd_v4_nm(
     max_seqlen_q,
     *,
     sink,  # REQUIRED [num_heads] FP32 — attention sink logit
-    split_indptr=None,  # [num_seqs+1]; auto-built uniform if None (matches V3 get_meta_param)
+    split_indptr=None,  # [num_seqs+1] int32; auto-built by get_meta_param if None
     sm_scale=None,  # ignored on v4 nm; kernel hardcodes 1/sqrt(512)
     out_16_nosplit=0,
-    num_kv_splits=1,
+    num_kv_splits=None,  # None -> auto-pick via V3 get_meta_param heuristic
     logits=None,
     attn_lse=None,
 ):
@@ -1043,9 +1062,24 @@ def mla_decode_fwd_v4_nm(
       needed). `output[total_q, num_heads, v_head_dim]` BF16 is only written
       by the kernel when `out_16_nosplit == 1`.
 
+    Split-count selection (`num_kv_splits`):
+      `None` (default) auto-picks the split count via V3's `get_meta_param`
+      heuristic (CU-occupancy x HBM-efficiency, capped by the fp8 min block
+      for the kernel tile) — identical to `mla_decode_fwd`'s non-persistent
+      path. Pass an explicit int to override. Note V4 nm is always
+      non-persistent, so only that branch of `get_meta_param` applies.
+
+      gqa=128 caveat: the shipped qh64 .co realizes 128 heads as TWO
+      thread-groups (gdx=ceil(128/64)=2) per (seq, kv-split). That already
+      doubles CU occupancy, so the wrapper passes tg_factor=2 to
+      get_meta_param — auto-split then correctly picks e.g. 2 (not 4) at
+      bs=64, avoiding over-splitting an already-saturated GPU.
+
     Multi-pass mode (`num_kv_splits > 1`):
       1. If `split_indptr` is None, build a uniform one:
-         `[0, N, 2N, ..., bs*N]` so every seq uses all N passes.
+         `[0, N, 2N, ..., bs*N]` so every seq uses all N passes. When
+         `num_kv_splits` is auto-picked, `get_meta_param` returns this
+         indptr directly.
       2. Force `out_16_nosplit = 0` — the kernel's bf16-direct-write path
          does not support multi-pass.
       3. After the kernel returns FP32 partials, run V3's
@@ -1113,10 +1147,61 @@ def mla_decode_fwd_v4_nm(
             f"`q` (got sink={sink.device}, q={q.device})."
         )
 
-    # ---- V3-style auto-fill of split_indptr (== num_kv_splits_indptr) ----
-    # V3 `get_meta_param` builds this exact tensor when caller didn't provide
-    # one; mirror that here so the multi-split path is a one-liner for the
-    # caller.
+    # ---- V3-style split-count + split_indptr resolution -------------------
+    # Port of mla_decode_fwd's non-persistent branch (line ~204), adapted to
+    # V4 nm's stricter buffer contract. V4 nm is always non-persistent, so we
+    # only need that branch (no work_meta_data / persistent path).
+    #
+    #   num_kv_splits is None  -> auto-pick via get_meta_param's
+    #       CU-occupancy x HBM-efficiency heuristic (and take the matching
+    #       uniform indptr it returns, an int32/torch.int cuda tensor).
+    #   num_kv_splits given     -> RESPECT it verbatim. The caller may have
+    #       pre-allocated logits/attn_lse sized to exactly this split count
+    #       (see test_v4_nm_multi_split_covers_full_kv), so we must NOT route
+    #       an explicit value back through get_meta_param's fp8 cap (which
+    #       could shrink it and desync the buffer shapes). Only synthesize a
+    #       uniform split_indptr if the caller didn't pass one.
+    total_kv = kv_page_indices.shape[0]
+    if num_kv_splits is None:
+        # The shipped qh64 .co has a 64-row tile; the dispatcher launches
+        # gdx = ceil(num_heads / 64) thread-groups per (seq, kv-split) along
+        # the head dim. gqa=128 (num_heads=128) is realized as TWO WGs
+        # (tg_idx 0/1), so it already consumes 2x the CU occupancy of gqa=64
+        # before any kv-split. Feed that as tg_factor so the heuristic counts
+        # bs*tg_factor*splits workgroups and stops over-splitting (e.g.
+        # bs=64/gqa=128 picks splits=2, not 4).
+        tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
+
+        # Raise the auto-search ceiling above V3's default 16 for small-batch
+        # long-context shapes. Two bounds gate it:
+        #   (1) KV-tile physical limit: the v4 kernel's inner loop consumes a
+        #       16-token tile, so each split must own >=16 tokens — the most
+        #       splits a (uniform) seq of `min_kv` tokens admits is
+        #       floor(min_kv / 16). page_size=1, so min_kv = total_kv//num_seqs
+        #       for the uniform partition we build below.
+        #   (2) Occupancy guard: never explore past ~2x the CU count of logical
+        #       workgroups (bs * tg_factor * split). Beyond that the GPU is
+        #       saturated and extra splits only add stage2-merge cost.
+        # Default-floor at 16 so well-saturated shapes keep V3's exact behavior.
+        cu_num = get_cu_num()
+        min_kv = total_kv // num_seqs if num_seqs > 0 else total_kv
+        tile_cap = max(1, min_kv // 16)
+        occ_cap = max(1, (2 * cu_num) // max(1, num_seqs * tg_factor))
+        max_splits = max(16, min(tile_cap, occ_cap))
+
+        num_kv_splits, meta_split_indptr = get_meta_param(
+            None,
+            num_seqs,
+            total_kv,
+            num_heads,
+            max_seqlen_q,
+            q.dtype,
+            tg_factor,
+            max_splits,
+        )
+        if split_indptr is None:
+            split_indptr = meta_split_indptr.to(device=q.device, dtype=torch.int32)
+
     if split_indptr is None:
         split_indptr = torch.arange(
             0,
@@ -1256,5 +1341,23 @@ def mla_decode_fwd_v4_nm(
             num_stages=2,
             waves_per_eu=4,
         )
+
+    # ---- out_16_nosplit=1: resolve the kernel's packed-BF16 output ----------
+    # When out_16_nosplit=1 (single-pass only), the kernel does NOT write the
+    # `output` buffer. Instead it writes the final result as DENSELY-PACKED
+    # BF16 into the `logits` allocation. Global layout is identical to the
+    # fp32 path — [total_q, nsplit=1, num_heads, v_head_dim] contiguous in
+    # num_heads — but each element is 2 bytes (R16_BPP=2), so the per-head
+    # stride is v_head_dim*2 bytes = v_head_dim BF16 slots, occupying only the
+    # FIRST half of the fp32 `logits` byte range. Reinterpret those bytes as a
+    # tight [total_q, num_heads, v_head_dim] BF16 tensor and copy into the
+    # caller's `output` so `output` is the single authoritative result buffer
+    # (mirrors the multi-split stage2 path, which also lands in `output`).
+    if out_16_nosplit != 0:
+        n_bf16 = total_q * num_heads * v_head_dim
+        packed_bf16 = (
+            logits.contiguous().view(torch.bfloat16).flatten()[:n_bf16]
+        ).view(total_q, num_heads, v_head_dim)
+        output.copy_(packed_bf16)
 
     return logits, attn_lse
