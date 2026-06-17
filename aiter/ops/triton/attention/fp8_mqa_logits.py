@@ -72,6 +72,7 @@ def _gfx942_tile_fits_lds(
     # accumulator stay in registers in Triton 3.6+). Account for `occupancy`
     # co-resident workgroups and keep a 0.9 safety factor for compiler
     # overhead.
+    # If a future Triton spills Q or scores to LDS, re-add a `q + kv + scores <= 64 KB` upper-bound term here to avoid re-triggering the JIT abort.
     lds_bytes = occupancy * num_stages * block_kv * head_size
     return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
 
