@@ -1622,6 +1622,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
+                sorted_weights=sorted_weights,
             )
 
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
@@ -1649,6 +1650,7 @@ def fused_moe_2stages(
                 topk=topk,
                 block_size=block_size_M,
                 num_rows=num_local_tokens,
+                sorted_weights=sorted_weights,
             )
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
@@ -1746,6 +1748,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
+                sorted_weights=sorted_weights,
             )
             a2 = a2.view(token_num, topk, -1)
         else:
@@ -1764,6 +1767,7 @@ def fused_moe_2stages(
             topk=topk,
             block_size=block_size_M,
             num_rows=num_local_tokens,
+            sorted_weights=sorted_weights,
         )
         a2 = a2.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
