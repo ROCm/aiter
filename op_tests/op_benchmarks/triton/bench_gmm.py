@@ -135,6 +135,7 @@ def benchmark_gmm(
     accumulate: bool = False,
     grid_dim: int | None = None,
     work_stealing: bool = False,
+    work_stealing_mode: str | None = None,
     output: bool = False,
 ) -> None:
     assert (
@@ -143,6 +144,7 @@ def benchmark_gmm(
     assert (
         metric in METRICS
     ), f"Unknown benchmark metric '{metric}'. Choose one of {METRICS}."
+    assert work_stealing_mode in ("global", "per_xcd"), "Invalid work stealing mode."
 
     desc, gen_tensors, kernel_wrapper = select_triton_kernel(gmm_type)
 
@@ -167,7 +169,9 @@ def benchmark_gmm(
         triton_provider_desc.append(f"gd{grid_dim}")
     # work stealing
     if has_work_stealing:
-        triton_provider_desc.append("ws")
+        triton_provider_desc.append(
+            f"ws{'g' if work_stealing_mode == 'global' else 'x'}"
+        )
     # unit of benchmark metric
     triton_provider_desc.append(unit)
     triton_provider: str = "_".join(triton_provider_desc)
@@ -226,6 +230,7 @@ def benchmark_gmm(
             if gmm_type == "gmm":
                 kwargs["bias"] = bias
                 kwargs["work_stealing"] = work_stealing
+                kwargs["work_stealing_mode"] = work_stealing_mode
             elif gmm_type == "ptgmm" or gmm_type == "nptgmm":
                 kwargs["bias_grad"] = bias
                 kwargs["accumulate"] = accumulate
@@ -328,7 +333,7 @@ def benchmark_gmm(
     if has_grid_dim:
         logging.info("  overridden persistent grid_dim = %d", grid_dim)
     if has_work_stealing:
-        logging.info("  work stealing enabled")
+        logging.info("  work stealing enabled - %s mode", work_stealing_mode)
     logging.info(
         "  metric = %s (in %s)",
         metric,
@@ -492,6 +497,13 @@ def parse_args() -> argparse.Namespace:
         help="enable work stealing dynamic load-balancing of persistent kernels",
     )
     parser.add_argument(
+        "--work-stealing-mode",
+        type=str.lower,
+        choices=("global", "per_xcd"),
+        default="global",
+        help="work stealing behavior with respect to atomic synchronization (default: global)",
+    )
+    parser.add_argument(
         "-o",
         action="store_true",
         help="write performance results to CSV file in the current directory",
@@ -542,6 +554,7 @@ def main() -> None:
         accumulate=args.accumulate,
         grid_dim=args.grid_dim,
         work_stealing=args.work_stealing,
+        work_stealing_mode=args.work_stealing_mode,
         output=args.o,
     )
 
