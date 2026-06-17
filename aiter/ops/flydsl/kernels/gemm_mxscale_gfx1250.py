@@ -113,6 +113,7 @@ def compile_mxscale_gemm(
     grouped_masked_m: bool = False,
     grouped_persistent_m: bool = False,
     grouped_contiguous_m: bool = False,
+    grouped_gather_m: bool = False,
     grouped_contiguous_num_1d_blocks: int | None = None,
     persistent_workers: int | None = None,
     stage1_act: str | None = None,
@@ -244,6 +245,54 @@ def compile_mxscale_gemm(
         raise ValueError(
             f"wave_specialized_tdm requires exactly 4 waves, got {num_warps}"
         )
+
+    # -- Gather-A (gather MoE) mode --------------------------------------
+    # Stage1 reads its activation rows directly from the *token-order* buffer
+    # via a per-tile TDM gather (descriptor groups 2/3 carry row indices)
+    # instead of from a physically route-gathered contiguous buffer. Only the
+    # A payload is gathered in-kernel; the A scale stays in the grouped layout
+    # prepared on the host (scatter+preshuffle), so this is a pure replacement
+    # of the A 2D load with per-wave gather descriptor(s). A wave fetches its
+    # `tile_m // num_warps` rows with `gather_subops` gather descriptors (each
+    # <= 8 rows, the TDM 32-bit gather limit); the per-step TDM load count is
+    # adjusted accordingly so pipeline fencing stays correct.
+    grouped_gather_m_mode = bool(grouped_gather_m)
+    gather_rows_per_wave = 0
+    gather_rows_per_sub = 0
+    gather_subops = 0
+    # 32-bit row indices (max 8 rows / descriptor) keep token indices exact for
+    # arbitrarily large prefills (16-bit would overflow past 64K tokens).
+    gather_index_size = 32
+    gather_max_rows_per_sub = 8
+    if grouped_gather_m_mode:
+        if not grouped_contiguous_m:
+            raise ValueError("grouped_gather_m requires grouped_contiguous_m=True")
+        if wave_specialized_tdm:
+            raise ValueError(
+                "grouped_gather_m is incompatible with wave_specialized_tdm"
+            )
+        if split_k != 1:
+            raise ValueError("grouped_gather_m requires split_k == 1")
+        if tile_m % num_warps != 0:
+            raise ValueError(
+                f"grouped_gather_m requires tile_m ({tile_m}) divisible by "
+                f"num_warps ({num_warps})"
+            )
+        gather_rows_per_wave = tile_m // num_warps
+        # Each wave fetches its rows with one or more gather descriptors of at
+        # most `gather_max_rows_per_sub` rows (TDM 32-bit gather limit).
+        if gather_rows_per_wave <= gather_max_rows_per_sub:
+            gather_subops = 1
+            gather_rows_per_sub = gather_rows_per_wave
+        elif gather_rows_per_wave % gather_max_rows_per_sub == 0:
+            gather_subops = gather_rows_per_wave // gather_max_rows_per_sub
+            gather_rows_per_sub = gather_max_rows_per_sub
+        else:
+            raise ValueError(
+                "grouped_gather_m requires tile_m // num_warps to be <= 8 or a "
+                f"multiple of 8 (got {gather_rows_per_wave}); adjust tile_m / "
+                "num_warps"
+            )
 
     # -- Format-dependent compile-time constants --
     # A8W4: activation is FP8 (PACK_FACTOR_A=1), weight is FP4 (PACK_FACTOR_B=2)
@@ -458,7 +507,15 @@ def compile_mxscale_gemm(
     # TENSORcnt is tracked per-wave in hardware. The regular path issues four
     # tensor ops per wave per K-stage, while the wave-specialized path issues
     # only one tensor op from each dedicated loader wave.
-    TDM_LOADS_PER_STEP = 1 if wave_specialized_tdm else (6 if stage1_dual_b else 4)
+    # In gather mode the single A 2D-load is replaced by `gather_subops` gather
+    # descriptors; the non-A loads (B, As, Bs [+B_up, Bs_up for dual_b]) are
+    # unchanged.
+    _a_tdm_ops = gather_subops if grouped_gather_m_mode else 1
+    TDM_LOADS_PER_STEP = (
+        1
+        if wave_specialized_tdm
+        else ((5 if stage1_dual_b else 3) + _a_tdm_ops)
+    )
     tail_plan = [
         (ls, cs, o * TDM_LOADS_PER_STEP // 2 if o > 0 else o)
         for ls, cs, o in _base_tail_plan
@@ -506,6 +563,10 @@ def compile_mxscale_gemm(
     )
     needs_grouped_row_masked_store = grouped_masked_m and (M % tile_m != 0)
     kernel_tag_mode = str(kernel_tag).replace("-", "_")
+    if grouped_gather_m_mode:
+        # The GPU kernel symbol must differ from the 2D variant so the JIT does
+        # not reuse a cached 2D binary of the same shape/tag for the gather path.
+        kernel_tag_mode = f"{kernel_tag_mode}_gather"
 
     if use_fp4_bank_friendly_schedule:
         _bank_half_wm = wmma_m_rep // 2
@@ -539,9 +600,11 @@ def compile_mxscale_gemm(
         arg_masked_m: fx.Tensor,
         arg_m_tile_prefix: fx.Tensor,
         arg_m_tile_map: fx.Tensor,
+        arg_gather_index: fx.Tensor,
         i32_m_tile_bound: fx.Int32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_num_tokens: fx.Int32,
     ):
         # Enable back-to-back WMMA issue (SCHED_MODE bit[4] = DISABLE_VALU_STALL)
         rocdl.disable_xdl_arb_stall()
@@ -658,8 +721,56 @@ def compile_mxscale_gemm(
                 bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
             zero_i32 = arith.constant(0, type=T.i32)
 
-            def make_desc_a(memref, k_base):
+            def make_desc_a(memref, k_base, gather_sub=0):
                 k_packed_off = k_base / arith.index(PACK_FACTOR_A)
+                if const_expr(grouped_gather_m_mode):
+                    # Gather MoE: each wave fetches `gather_rows_per_wave`
+                    # consecutive grouped rows of the A tile, split into
+                    # `gather_subops` descriptors of `gather_rows_per_sub` rows.
+                    # Rows are redirected to their original token rows via
+                    # `arg_gather_index`; padding rows carry index -1
+                    # (>= num_tokens) so the TDM treats them as OOB and
+                    # zero-fills the LDS slot.
+                    wid_idx = arith.index_cast(T.index, _raw(rocdl.wave_id()))
+                    gi_rsrc = buffer_ops.create_buffer_resource(
+                        arg_gather_index, max_size=True
+                    )
+                    sub_row0 = (
+                        flat_m_base
+                        + wid_idx * arith.index(gather_rows_per_wave)
+                        + arith.index(gather_sub * gather_rows_per_sub)
+                    )
+                    row_indices = []
+                    for _gi in range_constexpr(gather_rows_per_sub):
+                        ridx = buffer_ops.buffer_load(
+                            gi_rsrc,
+                            arith.index_cast(T.i32, sub_row0 + arith.index(_gi)),
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                        row_indices.append(_raw(ridx))
+                    lds_byte_off = (
+                        wid_idx * arith.index(gather_rows_per_wave * lds_a_stride_bytes)
+                        + arith.index(
+                            gather_sub * gather_rows_per_sub * lds_a_stride_bytes
+                        )
+                    )
+                    return tdm_ops.make_tensor_gather_descriptor(
+                        global_ptr=arg_a,
+                        lds_memref=memref,
+                        row_indices=row_indices,
+                        row_width=packed_tile_k_a,
+                        tensor_dim0=K_packed_a,
+                        tensor_dim1=i32_num_tokens.ir_value(),
+                        stride=K_packed_a,
+                        elem_bytes=1,
+                        pad_interval=packed_tile_k_a,
+                        pad_amount=LDS_PAD_A_BYTES,
+                        index_size=gather_index_size,
+                        lds_byte_offset=lds_byte_off,
+                        global_byte_offset=k_packed_off,
+                        workgroup_mask=a_mcast_mask,
+                    )
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_a,
                     lds_memref=memref,
@@ -1996,13 +2107,29 @@ def compile_mxscale_gemm(
             stages_bs_lds_addr = []
             stages_bs_up_lds_addr = []
             for i in range_constexpr(num_buffers):
-                stages_a_lds_addr.append(
-                    vector.extract(
-                        make_desc_a(stages_a_mem[i], arith.index(0)).dgroup0,
-                        static_position=[1],
-                        dynamic_position=[],
+                if const_expr(grouped_gather_m_mode):
+                    # One LDS base per gather sub-descriptor (each covers
+                    # `gather_rows_per_sub` rows at a distinct LDS offset).
+                    stages_a_lds_addr.append(
+                        [
+                            vector.extract(
+                                make_desc_a(
+                                    stages_a_mem[i], arith.index(0), _s
+                                ).dgroup0,
+                                static_position=[1],
+                                dynamic_position=[],
+                            )
+                            for _s in range_constexpr(gather_subops)
+                        ]
                     )
-                )
+                else:
+                    stages_a_lds_addr.append(
+                        vector.extract(
+                            make_desc_a(stages_a_mem[i], arith.index(0)).dgroup0,
+                            static_position=[1],
+                            dynamic_position=[],
+                        )
+                    )
                 stages_b_lds_addr.append(
                     vector.extract(
                         make_desc_b(stages_b_mem[i], arith.index(0)).dgroup0,
@@ -2066,6 +2193,26 @@ def compile_mxscale_gemm(
                 )
             else:
                 pred_const = arith.constant(1, type=T.i32)
+
+            # A-specific dgroup0 lane0 (predicate). In gather mode lane0 also
+            # encodes the gather-mode + index-size bits (see
+            # make_tensor_gather_dgroup0); a plain `1` would drop them and the
+            # TDM would not run in gather mode. Reuse the validity gating so
+            # inactive tiles still disable the load.
+            if const_expr(grouped_gather_m_mode):
+                _gather_pred_bits = (
+                    1 | ((1 if gather_index_size == 32 else 0) << 30) | (1 << 31)
+                )
+                if const_expr(grouped_masked_m):
+                    a_pred_const = arith.select(
+                        tile_valid,
+                        arith.constant(_gather_pred_bits, type=T.i32),
+                        arith.constant(0, type=T.i32),
+                    )
+                else:
+                    a_pred_const = arith.constant(_gather_pred_bits, type=T.i32)
+            else:
+                a_pred_const = pred_const
 
             if const_expr(wave_specialized_tdm):
                 active_stage_lds_addr = [
@@ -2159,6 +2306,16 @@ def compile_mxscale_gemm(
                     )
 
                 dgroup1_a = desc_a_init.dgroup1
+                if const_expr(grouped_gather_m_mode):
+                    # group1 (gather config) and the K column address (lanes 2/3)
+                    # are shared across sub-descriptors; only the row-index groups
+                    # (2/3) differ per sub-descriptor.
+                    _desc_a_subs = [
+                        make_desc_a(stages_a_mem[0], split_k_base, _s)
+                        for _s in range_constexpr(gather_subops)
+                    ]
+                    dgroup2_a_list = [_d.dgroup2 for _d in _desc_a_subs]
+                    dgroup3_a_list = [_d.dgroup3 for _d in _desc_a_subs]
                 dgroup1_b = desc_b_init.dgroup1
                 if const_expr(stage1_dual_b):
                     dgroup1_b_up = desc_b_up_init.dgroup1
@@ -2172,6 +2329,33 @@ def compile_mxscale_gemm(
                     wrapped = arith.cmpi(arith.CmpIPredicate.ult, new_lo, lo)
                     hi_inc = arith.addi(hi, arith.constant(1, type=T.i32))
                     return new_lo, arith.select(wrapped, hi_inc, hi)
+
+                def _mk_a_descs(a_lds, lo, hi):
+                    # Build the A descriptor(s) for one K-step. In gather MoE the
+                    # single 2D load becomes `gather_subops` gather descriptors
+                    # sharing the K column address (lo/hi) and group1, with a
+                    # distinct LDS base and row-index groups (2/3) per sub.
+                    # ``a_lds`` is a single LDS base (2D) or a per-sub list.
+                    if const_expr(grouped_gather_m_mode):
+                        descs = []
+                        for _s in range_constexpr(gather_subops):
+                            dg0 = vector.from_elements(
+                                T.vec(4, T.i32),
+                                [a_pred_const, a_lds[_s], lo, hi],
+                            )
+                            descs.append(
+                                tdm_ops.TDMGatherDescriptor(
+                                    dg0,
+                                    dgroup1_a,
+                                    dgroup2_a_list[_s],
+                                    dgroup3_a_list[_s],
+                                )
+                            )
+                        return descs
+                    dg0 = vector.from_elements(
+                        T.vec(4, T.i32), [a_pred_const, a_lds, lo, hi]
+                    )
+                    return [tdm_ops.TDMDescriptor2D(dg0, dgroup1_a)]
 
             # Prologue
             if const_expr(wave_specialized_tdm):
@@ -2189,10 +2373,6 @@ def compile_mxscale_gemm(
                     active_addr_lo = arith.addi(active_addr_lo, active_adv_i32)
             else:
                 for i in range_constexpr(pre_loaded):
-                    dg0_a = vector.from_elements(
-                        T.vec(4, T.i32),
-                        [pred_const, stages_a_lds_addr[i], addr_lo_a, addr_hi_a],
-                    )
                     dg0_b = vector.from_elements(
                         T.vec(4, T.i32),
                         [pred_const, stages_b_lds_addr[i], addr_lo_b, addr_hi_b],
@@ -2226,7 +2406,7 @@ def compile_mxscale_gemm(
                         )
 
                     issue_tdm_loads(
-                        tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a),
+                        *_mk_a_descs(stages_a_lds_addr[i], addr_lo_a, addr_hi_a),
                         tdm_ops.TDMDescriptor2D(dg0_b, dgroup1_b),
                         tdm_ops.TDMDescriptor2D(dg0_as, dgroup1_as),
                         tdm_ops.TDMDescriptor2D(dg0_bs, dgroup1_bs),
@@ -2422,15 +2602,6 @@ def compile_mxscale_gemm(
                                     + arith.index(buf_idx * tile_k)
                                 ),
                             ):
-                                dg0_a = vector.from_elements(
-                                    T.vec(4, T.i32),
-                                    [
-                                        pred_const,
-                                        stages_a_lds_addr[_ls],
-                                        _ab[0][0],
-                                        _ab[0][1],
-                                    ],
-                                )
                                 dg0_b = vector.from_elements(
                                     T.vec(4, T.i32),
                                     [
@@ -2479,7 +2650,9 @@ def compile_mxscale_gemm(
                                         ],
                                     )
                                 issue_tdm_loads(
-                                    tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a),
+                                    *_mk_a_descs(
+                                        stages_a_lds_addr[_ls], _ab[0][0], _ab[0][1]
+                                    ),
                                     tdm_ops.TDMDescriptor2D(dg0_b, dgroup1_b),
                                     tdm_ops.TDMDescriptor2D(dg0_as, dgroup1_as),
                                     tdm_ops.TDMDescriptor2D(dg0_bs, dgroup1_bs),
@@ -2711,7 +2884,15 @@ def compile_mxscale_gemm(
                             )
 
                             def _tail_mid_nws(_ls=_load_stage, _ab=_tail_ab):
-                                _desc_a = make_desc_a(stages_a_mem[_ls], _tail_load_k)
+                                if const_expr(grouped_gather_m_mode):
+                                    _desc_a_list = [
+                                        make_desc_a(stages_a_mem[_ls], _tail_load_k, _s)
+                                        for _s in range_constexpr(gather_subops)
+                                    ]
+                                else:
+                                    _desc_a_list = [
+                                        make_desc_a(stages_a_mem[_ls], _tail_load_k)
+                                    ]
                                 _desc_b = make_desc_b(stages_b_mem[_ls], _tail_load_k)
                                 if const_expr(stage1_dual_b):
                                     _desc_b_up = make_desc_b(
@@ -2728,7 +2909,7 @@ def compile_mxscale_gemm(
                                         stages_bs_up_mem[_ls], _tail_load_k, N
                                     )
                                 issue_tdm_loads(
-                                    _desc_a,
+                                    *_desc_a_list,
                                     _desc_b,
                                     _desc_as,
                                     _desc_bs,
@@ -3038,7 +3219,7 @@ def compile_mxscale_gemm(
     # Bump this when changing generated IR in ways not otherwise reflected in
     # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
     # reusing a previously compiled kernel after source-only descriptor fixes.
-    tdm_store_descriptor_version = 31
+    tdm_store_descriptor_version = 32
 
     # M/N are compile-time constants used throughout the generated IR
     # (B_TOTAL_N, C_N, grid dimensions, output/bias strides, scale descriptor
@@ -3073,6 +3254,9 @@ def compile_mxscale_gemm(
         grouped_masked_m,
         grouped_persistent_m,
         grouped_contiguous_m,
+        grouped_gather_m_mode,
+        gather_rows_per_wave,
+        gather_index_size,
         _k_contiguous_1d,
         _persistent_workers,
         stage1_act_mode,
@@ -3117,9 +3301,11 @@ def compile_mxscale_gemm(
             arg_c,
             arg_c,
             arg_c,
+            arg_c,
             i32_m,
             i32_m,
             i32_n,
+            i32_m,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3187,9 +3373,11 @@ def compile_mxscale_gemm(
             arg_masked_m,
             arg_m_tile_prefix,
             arg_m_tile_map,
+            arg_c,
             i32_m_tile_bound,
             i32_m,
             i32_n,
+            i32_m,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3248,9 +3436,11 @@ def compile_mxscale_gemm(
             arg_masked_m,
             arg_m_tile_prefix,
             arg_m_tile_map,
+            arg_c,
             i32_m,
             i32_m,
             i32_n,
+            i32_m,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3304,9 +3494,11 @@ def compile_mxscale_gemm(
             arg_c,
             arg_c,
             arg_c,
+            arg_c,
             i32_m,
             i32_m,
             i32_n,
+            i32_m,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3375,9 +3567,11 @@ def compile_mxscale_gemm(
             arg_masked_m,
             arg_m_tile_prefix,
             arg_m_tile_map,
+            arg_c,
             i32_m_tile_bound,
             i32_m,
             i32_n,
+            i32_m,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3437,9 +3631,11 @@ def compile_mxscale_gemm(
             arg_masked_m,
             arg_m_tile_prefix,
             arg_m_tile_map,
+            arg_c,
             i32_m,
             i32_m,
             i32_n,
+            i32_m,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3457,7 +3653,148 @@ def compile_mxscale_gemm(
             stream=stream,
         )
 
+    @flyc.jit
+    def launch_mxscale_gemm_gather(
+        arg_c: fx.Tensor,
+        arg_a: fx.Tensor,
+        arg_b: fx.Tensor,
+        arg_a_scale: fx.Tensor,
+        arg_b_scale: fx.Tensor,
+        arg_masked_m: fx.Tensor,
+        arg_m_tile_prefix: fx.Tensor,
+        arg_m_tile_map: fx.Tensor,
+        arg_gather_index: fx.Tensor,
+        i32_m_tile_bound: fx.Int32,
+        i32_m: fx.Int32,
+        i32_n: fx.Int32,
+        i32_num_tokens: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _ = cache_tag
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            arena_alloc.finalized = False
+            arena_alloc.finalize()
+
+        idx_n = arith.index_cast(T.index, i32_n.ir_value())
+        n_tiles = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
+        gx = arith.index_cast(T.index, i32_m_tile_bound.ir_value()) * n_tiles
+        gy = arith.index(1)
+        gz = split_k
+
+        launcher = kernel_mxscale_gemm(
+            arg_c,
+            arg_a,
+            arg_b,
+            arg_a_scale,
+            arg_b_scale,
+            arg_c,
+            arg_masked_m,
+            arg_m_tile_prefix,
+            arg_m_tile_map,
+            arg_gather_index,
+            i32_m_tile_bound,
+            i32_m,
+            i32_n,
+            i32_num_tokens,
+        )
+        for op in ctx.gpu_module_body.operations:
+            if const_expr(
+                hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
+            ):
+                if const_expr(effective_waves_per_eu is not None):
+                    _wpe = int(effective_waves_per_eu)
+                    if const_expr(_wpe >= 1):
+                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                            ir.IntegerType.get_signless(32), _wpe
+                        )
+                if const_expr(use_cluster):
+                    op.attributes["rocdl.cluster_dims"] = ir.StringAttr.get(
+                        f"{cluster_m},{cluster_n},1"
+                    )
+        cluster_arg = (cluster_m, cluster_n, 1) if use_cluster else None
+        launcher.launch(
+            grid=(gx, gy, gz),
+            block=(block_threads, 1, 1),
+            stream=stream,
+            cluster=cluster_arg,
+        )
+
+    @flyc.jit
+    def launch_mxscale_gemm_gather_bias(
+        arg_c: fx.Tensor,
+        arg_a: fx.Tensor,
+        arg_b: fx.Tensor,
+        arg_a_scale: fx.Tensor,
+        arg_b_scale: fx.Tensor,
+        arg_bias: fx.Tensor,
+        arg_masked_m: fx.Tensor,
+        arg_m_tile_prefix: fx.Tensor,
+        arg_m_tile_map: fx.Tensor,
+        arg_gather_index: fx.Tensor,
+        i32_m_tile_bound: fx.Int32,
+        i32_m: fx.Int32,
+        i32_n: fx.Int32,
+        i32_num_tokens: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _ = cache_tag
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            arena_alloc.finalized = False
+            arena_alloc.finalize()
+
+        idx_n = arith.index_cast(T.index, i32_n.ir_value())
+        n_tiles = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
+        gx = arith.index_cast(T.index, i32_m_tile_bound.ir_value()) * n_tiles
+        gy = arith.index(1)
+        gz = split_k
+
+        launcher = kernel_mxscale_gemm(
+            arg_c,
+            arg_a,
+            arg_b,
+            arg_a_scale,
+            arg_b_scale,
+            arg_bias,
+            arg_masked_m,
+            arg_m_tile_prefix,
+            arg_m_tile_map,
+            arg_gather_index,
+            i32_m_tile_bound,
+            i32_m,
+            i32_n,
+            i32_num_tokens,
+        )
+        for op in ctx.gpu_module_body.operations:
+            if const_expr(
+                hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
+            ):
+                if const_expr(effective_waves_per_eu is not None):
+                    _wpe = int(effective_waves_per_eu)
+                    if const_expr(_wpe >= 1):
+                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                            ir.IntegerType.get_signless(32), _wpe
+                        )
+                if const_expr(use_cluster):
+                    op.attributes["rocdl.cluster_dims"] = ir.StringAttr.get(
+                        f"{cluster_m},{cluster_n},1"
+                    )
+        cluster_arg = (cluster_m, cluster_n, 1) if use_cluster else None
+        launcher.launch(
+            grid=(gx, gy, gz),
+            block=(block_threads, 1, 1),
+            stream=stream,
+            cluster=cluster_arg,
+        )
+
     if expert_sched_mode:
+        launch_mxscale_gemm_gather.compile_hints["llvm_options"] = {
+            "amdgpu-expert-scheduling-mode": True,
+        }
+        launch_mxscale_gemm_gather_bias.compile_hints["llvm_options"] = {
+            "amdgpu-expert-scheduling-mode": True,
+        }
         launch_mxscale_gemm.compile_hints["llvm_options"] = {
             "amdgpu-expert-scheduling-mode": True,
         }
@@ -3478,6 +3815,8 @@ def compile_mxscale_gemm(
         }
 
     if epilogue_bias_mode:
+        if grouped_gather_m_mode:
+            return launch_mxscale_gemm_gather_bias
         if grouped_masked_m:
             return (
                 launch_mxscale_gemm_masked_persistent_bias
@@ -3485,6 +3824,8 @@ def compile_mxscale_gemm(
                 else launch_mxscale_gemm_masked_bias
             )
         return launch_mxscale_gemm_bias
+    if grouped_gather_m_mode:
+        return launch_mxscale_gemm_gather
     if grouped_masked_m:
         return (
             launch_mxscale_gemm_masked_persistent

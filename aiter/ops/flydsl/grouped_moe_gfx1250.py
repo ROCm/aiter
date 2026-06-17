@@ -511,6 +511,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
         grouped_contiguous_m = True
+    # Gather MoE: read stage1 activations directly from token order via TDM
+    # gather instead of physically route-copying them. Requires the contiguous
+    # (DeepGEMM-style) scheduler, so force it on when requested.
+    _want_gather_moe = os.environ.get("AITER_USE_GATHER_MOE", "0") in _TRUTHY_ENV
+    if _want_gather_moe:
+        grouped_contiguous_m = True
     # Switch to DeepGEMM-style contiguous-M at large batches (env-overridable).
     _contig_token_threshold = _as_int(
         os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"), 512
@@ -597,6 +603,20 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         route_E = 1
         route_max_m = int(contiguous_m)
 
+    # Gather MoE is only wired for the fast (non-naive) contiguous path. When
+    # active, stage1 reads activations from the token-order buffer via TDM
+    # gather using ``rows_to_tokens`` (contiguous grouped row -> source token),
+    # so the physical payload route-copy is skipped (scale still gathered +
+    # preshuffled on the host -- payload_only scope).
+    use_gather_moe = bool(
+        _want_gather_moe and effective_grouped_contiguous_m and not _use_naive
+    )
+    if _want_gather_moe and not use_gather_moe:
+        logger.warning(
+            "[grouped_a8w4] AITER_USE_GATHER_MOE requested but unsupported in "
+            "this path (needs fast contiguous scheduler); falling back to copy."
+        )
+
     def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
         from aiter.ops.triton.quant import dynamic_mxfp8_quant
 
@@ -625,8 +645,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("a1 fp4 quant done")
         a1_payload = a1_quant.view(torch.uint8).contiguous()
         a1_scale_token_u8 = a1_scale_token.view(torch.uint8).contiguous()
-        grouped_a1 = torch.empty(
-            (route_E, route_max_m, model_dim // 2), dtype=torch.uint8, device=device
+        # Gather MoE reads A from token order, so the grouped payload buffer is
+        # never written/read -- skip the allocation.
+        grouped_a1 = (
+            None
+            if use_gather_moe
+            else torch.empty(
+                (route_E, route_max_m, model_dim // 2),
+                dtype=torch.uint8,
+                device=device,
+            )
         )
         # Only the naive path needs the row-major scale buffer; the fast path
         # gathers + preshuffles the scale in one fused kernel (no a1_scale_raw).
@@ -644,8 +672,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         a1_payload, a1_scale_token_u8 = _quantize_mxfp8_payload(
             hidden_states, model_dim
         )
-        grouped_a1 = torch.empty(
-            (route_E, route_max_m, model_dim), dtype=torch.uint8, device=device
+        # Gather MoE reads A from token order, so the grouped payload buffer is
+        # never written/read -- skip the allocation.
+        grouped_a1 = (
+            None
+            if use_gather_moe
+            else torch.empty(
+                (route_E, route_max_m, model_dim), dtype=torch.uint8, device=device
+            )
         )
         # Padding rows decode with scale=1.0. Only the naive path needs the
         # row-major scale buffer; the fast path fuses gather + preshuffle.
@@ -661,18 +695,25 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     # Route-gather into the grouped per-expert layout.
     if not _use_naive:
-        _grouped_dbg("start route gather (scatter-copy kernel)")
-        # Payload route-gather only; the e8m0 scale is route-gathered AND
-        # preshuffled into the WMMA layout in one fused pass below (no
-        # intermediate row-major a1_scale_raw + separate permute).
-        flydsl_moe_scatter_copy_token(
-            a1_payload,
-            None,
-            rows_to_tokens,
-            route_E,
-            route_max_m,
-            grouped_a1=grouped_a1,
-        )
+        if use_gather_moe:
+            # Gather MoE: skip the physical payload copy entirely; stage1 reads
+            # A rows directly from the token-order ``a1_payload`` via TDM gather
+            # (gather index = ``rows_to_tokens``). Only the scale is gathered +
+            # preshuffled on the host below.
+            _grouped_dbg("gather MoE: skip payload scatter-copy")
+        else:
+            _grouped_dbg("start route gather (scatter-copy kernel)")
+            # Payload route-gather only; the e8m0 scale is route-gathered AND
+            # preshuffled into the WMMA layout in one fused pass below (no
+            # intermediate row-major a1_scale_raw + separate permute).
+            flydsl_moe_scatter_copy_token(
+                a1_payload,
+                None,
+                rows_to_tokens,
+                route_E,
+                route_max_m,
+                grouped_a1=grouped_a1,
+            )
         grouped_a1_scale = flydsl_moe_scatter_preshuffle_scale(
             a1_scale_token_u8,
             rows_to_tokens,
@@ -741,6 +782,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         expert_sched_mode=False,
         grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
+        grouped_gather_m=use_gather_moe,
         persistent_workers=None,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
@@ -752,9 +794,17 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage1 tokens={token_num} max_m={max_m} E={E}")
+    if use_gather_moe:
+        # A is the token-order activation buffer; the kernel gathers the rows it
+        # needs via ``rows_to_tokens`` (contiguous grouped row -> source token).
+        stage1_a = a1_payload.view(1, int(token_num), -1)
+        _gather_idx_arg = rows_to_tokens.clamp(min=0)
+    else:
+        stage1_a = grouped_a1
+        _gather_idx_arg = None
     stage1(
         grouped_a2,
-        grouped_a1,
+        stage1_a,
         grouped_w1,
         grouped_a1_scale,
         grouped_w1_scale,
@@ -766,12 +816,181 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         stream=torch.cuda.current_stream(),
         _m_tile_prefix=m_tile_prefix,
         _m_tile_map=m_tile_map,
+        _gather_index=_gather_idx_arg,
+        _num_tokens=int(token_num) if use_gather_moe else None,
         bias=_bias1_arg,
     )
     if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage1 sync OK, unsort")
     _grouped_dbg("[crash-probe] after stage1 sync OK")
+
+    if use_gather_moe and os.environ.get("AITER_GATHER_AB", "0") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    ):
+        torch.cuda.synchronize()
+        _ref_grouped_a1 = torch.zeros(
+            (route_E, route_max_m, a1_payload.shape[1]),
+            dtype=torch.uint8,
+            device=device,
+        )
+        flydsl_moe_scatter_copy_token(
+            a1_payload,
+            None,
+            rows_to_tokens,
+            route_E,
+            route_max_m,
+            grouped_a1=_ref_grouped_a1,
+        )
+        _ref_stage1 = stage1_compiler(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            max_m=max_m,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
+            out_dtype=out_dtype_str,
+            num_buffers=num_buffers,
+            split_k=split_k1,
+            expert_sched_mode=False,
+            grouped_persistent_m=False,
+            grouped_contiguous_m=effective_grouped_contiguous_m,
+            grouped_gather_m=False,
+            persistent_workers=None,
+            act="swiglu" if activation == ActivationType.Swiglu else "silu",
+            stage1_weight_layout=stage1_weight_layout,
+        )
+        _ref_a2 = torch.empty_like(grouped_a2)
+        _ref_stage1(
+            _ref_a2,
+            _ref_grouped_a1,
+            grouped_w1,
+            grouped_a1_scale,
+            grouped_w1_scale,
+            masked_m,
+            max_m,
+            inter_dim,
+            model_dim,
+            E,
+            stream=torch.cuda.current_stream(),
+            _m_tile_prefix=m_tile_prefix,
+            _m_tile_map=m_tile_map,
+            _gather_index=None,
+            _num_tokens=None,
+            bias=_bias1_arg,
+        )
+        torch.cuda.synchronize()
+        _d = (grouped_a2.float() - _ref_a2.float()).abs()
+        print(
+            f"[gather-AB] stage1 gather-vs-scatter: max={_d.max().item():.4e} "
+            f"mean={_d.mean().item():.4e} "
+            f"ref_norm={_ref_a2.float().norm().item():.4e} "
+            f"gather_norm={grouped_a2.float().norm().item():.4e}",
+            flush=True,
+        )
+        _vmask = (rows_to_tokens >= 0).view(route_E, route_max_m)
+        _gv = grouped_a2.view(route_E, route_max_m, -1)[_vmask]
+        _rv = _ref_a2.view(route_E, route_max_m, -1)[_vmask]
+        _dv = (_gv.float() - _rv.float()).abs()
+        print(
+            f"[gather-AB] VALID-rows gather-vs-2D: max={_dv.max().item():.4e} "
+            f"mean={_dv.mean().item():.4e} nvalid={int(_vmask.sum())}",
+            flush=True,
+        )
+        # Decisive: run the GATHER kernel on the scattered grouped buffer with an
+        # identity index. This must reproduce the 2D result exactly; if not, the
+        # in-gemm gather path itself is broken (vs the payload/index mapping).
+        _ident = torch.arange(
+            route_max_m * route_E, dtype=torch.int32, device=device
+        )
+        _ident_a2 = torch.empty_like(grouped_a2)
+        stage1(
+            _ident_a2,
+            _ref_grouped_a1.view(1, route_max_m * route_E, -1),
+            grouped_w1,
+            grouped_a1_scale,
+            grouped_w1_scale,
+            masked_m,
+            max_m,
+            inter_dim,
+            model_dim,
+            E,
+            stream=torch.cuda.current_stream(),
+            _m_tile_prefix=m_tile_prefix,
+            _m_tile_map=m_tile_map,
+            _gather_index=_ident,
+            _num_tokens=int(route_max_m * route_E),
+            bias=_bias1_arg,
+        )
+        torch.cuda.synchronize()
+        _di = (_ident_a2.float() - _ref_a2.float()).abs()
+        print(
+            f"[gather-AB] stage1 gather-identity-vs-2D: max={_di.max().item():.4e} "
+            f"mean={_di.mean().item():.4e} "
+            f"ident_norm={_ident_a2.float().norm().item():.4e}",
+            flush=True,
+        )
+        _rt = rows_to_tokens
+        print(
+            f"[gather-AB] rows_to_tokens: numel={_rt.numel()} "
+            f"contig_m={route_max_m * route_E} token_num={token_num} "
+            f"min={int(_rt.min())} max={int(_rt.max())} "
+            f"n_pad={int((_rt < 0).sum())} "
+            f"n_ge_tok={int((_rt >= token_num).sum())}",
+            flush=True,
+        )
+        _a_view = a1_payload.contiguous().view(-1, a1_payload.shape[-1])
+        _valid = _rt >= 0
+        _g = torch.zeros_like(_ref_grouped_a1.view(route_max_m * route_E, -1))
+        _g[_valid] = _a_view[_rt[_valid].to(torch.long)]
+        _gd = (
+            _g.int() - _ref_grouped_a1.view(route_max_m * route_E, -1).int()
+        ).abs()
+        print(
+            f"[gather-AB] torch a1[rows_to_tokens] vs scatter grouped_a1: "
+            f"max={int(_gd.max())} nbad={int((_gd>0).sum())}",
+            flush=True,
+        )
+        print(
+            f"[gather-AB] a1_payload shape={tuple(a1_payload.shape)} "
+            f"contiguous={a1_payload.is_contiguous()} "
+            f"stage1_a shape={tuple(a1_payload.view(1, int(token_num), -1).shape)}",
+            flush=True,
+        )
+        # Re-run the EXACT real config into a fresh buffer (determinism check).
+        _real2 = torch.empty_like(grouped_a2)
+        stage1(
+            _real2,
+            a1_payload.view(1, int(token_num), -1),
+            grouped_w1,
+            grouped_a1_scale,
+            grouped_w1_scale,
+            masked_m,
+            max_m,
+            inter_dim,
+            model_dim,
+            E,
+            stream=torch.cuda.current_stream(),
+            _m_tile_prefix=m_tile_prefix,
+            _m_tile_map=m_tile_map,
+            _gather_index=rows_to_tokens,
+            _num_tokens=int(token_num),
+            bias=_bias1_arg,
+        )
+        torch.cuda.synchronize()
+        _r2 = (_real2.float() - grouped_a2.float()).abs()
+        _r2r = (_real2.float() - _ref_a2.float()).abs()
+        print(
+            f"[gather-AB] real-rerun vs grouped_a2: max={_r2.max().item():.4e}; "
+            f"real-rerun vs 2D: max={_r2r.max().item():.4e}",
+            flush=True,
+        )
 
     # Optional single-token stage1 dump.
     _dump_a2 = os.environ.get("AITER_GROUPED_DUMP_A2", "0")
