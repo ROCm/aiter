@@ -66,7 +66,7 @@ jobs:
     needs: [check-signal]
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
-      docker-image: rocm/pytorch:latest
+      docker-image: rocm/ffm-dev:latest
       artifact-name: triton_wheelhouse
       retention-days: 3
 
@@ -81,7 +81,7 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      DOCKER_IMAGE: "rocm/pytorch:latest"
+      DOCKER_IMAGE: "rocm/ffm-dev:latest"
       TRITON_TEST: "op_tests/triton_tests/"
 
     steps:
@@ -216,7 +216,7 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      DOCKER_IMAGE: "rocm/pytorch:latest"
+      DOCKER_IMAGE: "rocm/ffm-dev:latest"
       TRITON_TEST: "op_tests/triton_tests/"
 
     steps:
