@@ -498,7 +498,7 @@ def _moe_gemm_a4w4_gfx1250(
             w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
         if not X_SCALES_TDM:
-            if EVEN_K:
+            if EVEN_K or load_idx != num_k_iter - 1:
                 gl.amd.gfx1250.async_copy.global_to_shared(
                     x_scales_buffer.index(load_idx % NUM_BUFFERS),
                     x_scales_ptrs,
@@ -612,7 +612,7 @@ def _moe_gemm_a4w4_gfx1250(
             w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
         if not X_SCALES_TDM:
-            if EVEN_K:
+            if EVEN_K or load_idx != num_k_iter - 1:
                 gl.amd.gfx1250.async_copy.global_to_shared(
                     x_scales_buffer.index(load_idx % NUM_BUFFERS),
                     x_scales_ptrs,
