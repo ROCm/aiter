@@ -1016,6 +1016,73 @@ def _get_compiled_swiglu(inter_dim: int):
     return build_swiglu_and_mul_module(inter_dim)
 
 
+def flydsl_swiglu_and_mul_interleaved(
+    input: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Fused swiglu activation for interleaved (gate/up block-interleaved) layout.
+
+    input: (rows, inter_dim*2) bf16, interleaved layout.
+    out:   (rows, inter_dim) bf16.
+    """
+    inter_dim = out.shape[-1]
+    num_rows = input.shape[0]
+    _swiglu_fn = _get_compiled_swiglu(inter_dim)
+    _run_compiled(
+        _swiglu_fn,
+        (
+            input,
+            out,
+            num_rows,
+            torch.cuda.current_stream(),
+        ),
+    )
+
+
+def flydsl_silu_and_mul_interleaved(
+    input: torch.Tensor,
+    out: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+    quant_mode: str = "none",
+    gui_layout: bool = True,
+) -> None:
+    """Fused silu activation for interleaved (gate/up block-interleaved) layout.
+
+    input: (rows, inter_dim*2) bf16, interleaved layout.
+    out:   (rows, inter_dim) bf16.
+    """
+    inter_dim = out.shape[-1]
+    num_sorted_rows = sorted_token_ids.shape[0]
+    _silu_fn = _get_compiled_silu_fused(
+        inter_dim,
+        topk,
+        quant_mode=quant_mode,
+        gui_layout=gui_layout,
+        act="silu",
+    )
+    empty_scale = torch.empty(0, dtype=torch.uint8, device=out.device)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=out.device)
+    empty_f32 = torch.empty(0, dtype=torch.float32, device=out.device)
+    _run_compiled(
+        _silu_fn,
+        (
+            _ptr_view_safe(input),
+            _ptr_view_safe(out),
+            _ptr_view_safe(empty_scale),
+            _ptr_view_safe(sorted_token_ids),
+            _ptr_view_safe(num_valid_ids),
+            _ptr_view_safe(empty_i32),
+            _ptr_view_safe(empty_f32),
+            token_num,
+            num_sorted_rows,
+            torch.cuda.current_stream(),
+        ),
+    )
+
+
 # Public API
 
 

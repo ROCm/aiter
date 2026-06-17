@@ -251,9 +251,7 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
         inp["cache_scale"].clone() if inp["cache_scale"] is not None else None
     )
 
-    _, us_kernel = run_perftest(
-        _run_kernel, inp, use_2kernel=use_2kernel, num_iters=3, num_warmup=1
-    )
+    _, us_kernel = run_perftest(_run_kernel, inp, use_2kernel=use_2kernel)
 
     fused_compress_attn_reference(
         kv_in=ref_inp["kv_in"],
