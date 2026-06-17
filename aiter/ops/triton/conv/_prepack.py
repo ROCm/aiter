@@ -1,6 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+"""Weight/input repacking for the conv2d kernels.
+
+Several conv kernels don't consume the raw OIHW weight (or NCHW input) layout
+directly — they need it reshaped into a kernel-local format for coalesced loads:
+K-major padded tiles for the 1x1/general GEMM, [K_out, 9, C_pad] for the 3x3
+kernels, channel-blocked NCHWc for the cblocked path, and the G·g·Gᵀ filter
+transform for Winograd F(4x4,3x3). These packs are pure functions of the weight
+tensor, so the results are LRU-cached keyed on (storage ptr, shape, dtype,
+block, version): a weight repacks once and every later call with the same
+weight is a cache hit, making the steady-state repack cost negligible.
+"""
+
 import os
 from collections import OrderedDict
 from typing import Dict
@@ -32,12 +44,6 @@ class _LRUPackCache:
         self._d.move_to_end(key)
         while len(self._d) > self._max:
             self._d.popitem(last=False)
-
-    def clear(self):
-        self._d.clear()
-
-    def __len__(self):
-        return len(self._d)
 
 
 _PACK_CACHE = _LRUPackCache()

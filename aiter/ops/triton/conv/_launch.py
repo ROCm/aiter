@@ -2,13 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-
-try:
-    import triton
-    import triton.language as tl
-except Exception:
-    triton = None
-    tl = None
+import triton
 
 from aiter.ops.triton.conv._utils import _out_hw, _is_winograd_eligible
 from aiter.ops.triton.utils.conv_config_utils import format_shape_key
@@ -83,9 +77,6 @@ def _launch_1x1(
     """Launch specialized 1x1 kernel.
     layout: "nchw" or "nhwc" (case-insensitive).
     """
-    if triton is None:
-        raise RuntimeError("Triton not available")
-
     sh, sw = stride
     ph, pw = padding
 
@@ -160,9 +151,6 @@ def _launch_3x3_nhwc(
     activation,
 ):
     """Launch specialized 3x3 NHWC kernel (hardcoded stride_c=1, stride_k=1)."""
-    if triton is None:
-        raise RuntimeError("Triton not available")
-
     sh, sw = stride
     ph, pw = padding
     dh, dw = dilation
@@ -239,9 +227,6 @@ def _launch_3x3_cblocked(
     activation,
 ):
     """Launch specialized 3x3 kernel for channel-blocked input."""
-    if triton is None:
-        raise RuntimeError("Triton not available")
-
     sh, sw = stride
     ph, pw = padding
     dh, dw = dilation
@@ -324,9 +309,6 @@ def _launch_general(
     """Launch general conv kernel.
     layout: "nchw" or "nhwc" (case-insensitive).
     """
-    if triton is None:
-        raise RuntimeError("Triton not available")
-
     sh, sw = stride
     ph, pw = padding
     dh, dw = dilation
@@ -404,8 +386,6 @@ def _launch_winograd_f4x3_fused(
     layout="nchw",
 ):
     """Launch Winograd F(4x4,3x3) with fused GEMM+output transform (2 kernels instead of 3)."""
-    if triton is None:
-        raise RuntimeError("Triton not available")
     ph, pw = padding
     tile_H = (P + 3) // 4
     tile_W = (Q + 3) // 4
@@ -497,8 +477,6 @@ def _launch_winograd_f4x3(
     layout="nchw",
 ):
     """Launch Winograd F(4x4,3x3) pipeline: input transform -> batched GEMM -> output transform."""
-    if triton is None:
-        raise RuntimeError("Triton not available")
     ph, pw = padding
     tile_H = (P + 3) // 4
     tile_W = (Q + 3) // 4
@@ -607,8 +585,6 @@ def _launch_winograd_f4x3_cblocked(
     block_k,
 ):
     """Launch Winograd F(4x4,3x3) with NCHWc input layout: cblocked input transform -> batched GEMM -> output transform."""
-    if triton is None:
-        raise RuntimeError("Triton not available")
     ph, pw = padding
     tile_H = (P + 3) // 4
     tile_W = (Q + 3) // 4
