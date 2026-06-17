@@ -38,7 +38,7 @@ run_stress() {
     printf "%-28s RACE %2d/%2d   bitfail %2d/%2d\n" "$tag" "$races" "$LOOPS" "$fails" "$LOOPS"
 }
 
-echo "== md5s =="; md5sum "$DIAG/deployed_backup.co" "$DIAG"/grp?.co "$DIAG/allsync.co
+echo "== md5s =="; md5sum "$DIAG/deployed_backup.co" "$DIAG"/grp?.co "$DIAG/allsync.co"
 echo "== stress (LOOPS=$LOOPS, varlen, b=17,64 c=4097,8193,16385 m=2,3) =="
 
 if [ "$WHICH" = base ]; then
