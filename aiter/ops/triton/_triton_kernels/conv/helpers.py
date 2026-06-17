@@ -7,7 +7,9 @@ import os
 # configs and let @triton.autotune do a runtime search across each kernel file's
 # AUTOTUNE_*_CONFIGS list. Default off — production / CI path uses JSON configs
 # from configs/conv/.
-CONV_AUTOTUNE_ENABLED = os.environ.get("AITER_TRITON_CONV_AUTOTUNE", "0").lower() in (
+CONV_AUTOTUNE_ENABLED = os.environ.get(
+    "AITER_TRITON_CONV_AUTOTUNE", "0"
+).strip().lower() in (
     "1",
     "true",
     "yes",
