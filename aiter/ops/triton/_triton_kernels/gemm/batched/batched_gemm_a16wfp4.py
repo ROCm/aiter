@@ -313,6 +313,9 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     NUM_KSPLIT = triton.cdiv(K, (SPLITK_BLOCK_SIZE // 2))
 
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
+
+
+def _get_config(
     M: int,
     N: int,
     K: int,
