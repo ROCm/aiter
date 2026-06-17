@@ -65,6 +65,7 @@ class _GroupedA8W4Config:
     persistent_workers: Optional[int] = None
     data_format: str = "a8w4"
     act: str = "silu"
+    swiglu_limit: Optional[float] = None
     stage1_weight_layout: str = "gguu"
 
 
@@ -321,11 +322,20 @@ def _check_stage1_args(
         )
 
 
-def _apply_gate_up(gate: torch.Tensor, up: torch.Tensor, act: str) -> torch.Tensor:
+def _apply_gate_up(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    act: str,
+    swiglu_limit: Optional[float] = None,
+) -> torch.Tensor:
+    _lim = 7.0 if not swiglu_limit else float(swiglu_limit)
     if act == "swiglu":
-        gate = gate.clamp(max=7.0)
-        up = up.clamp(min=-7.0, max=7.0)
+        gate = gate.clamp(max=_lim)
+        up = up.clamp(min=-_lim, max=_lim)
         return gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+    if swiglu_limit:
+        gate = gate.clamp(max=_lim)
+        up = up.clamp(min=-_lim, max=_lim)
     return torch.nn.functional.silu(gate) * up
 
 
@@ -337,6 +347,7 @@ def _compile_stage1_finalize_act(
     inter_dim: int,
     out_dtype: str,
     act: str,
+    swiglu_limit: Optional[float] = None,
     stage1_weight_layout: str = "gguu",
 ):
     if out_dtype not in ("f16", "bf16"):
@@ -420,9 +431,10 @@ def _compile_stage1_finalize_act(
                 u = up_h.extf(T.f32)
                 one = arith.constant(1.0, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
+                _lim = 7.0 if not swiglu_limit else float(swiglu_limit)
                 if const_expr(act == "swiglu"):
-                    limit = arith.constant(7.0, type=T.f32)
-                    neg_limit = arith.constant(-7.0, type=T.f32)
+                    limit = arith.constant(_lim, type=T.f32)
+                    neg_limit = arith.constant(-_lim, type=T.f32)
                     alpha = arith.constant(1.702, type=T.f32)
                     g = arith.minimumf(g, limit)
                     u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
@@ -435,6 +447,11 @@ def _compile_stage1_finalize_act(
                     )
                     out_f = g * sig * (u + one)
                 else:
+                    if const_expr(swiglu_limit):
+                        limit = arith.constant(_lim, type=T.f32)
+                        neg_limit = arith.constant(-_lim, type=T.f32)
+                        g = arith.minimumf(g, limit)
+                        u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                     t = g * neg_log2e
                     emu = llvm.call_intrinsic(
                         T.f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -479,6 +496,7 @@ def _compile_stage1_finalize_act_bias(
     inter_dim: int,
     out_dtype: str,
     act: str,
+    swiglu_limit: Optional[float] = None,
     stage1_weight_layout: str = "gguu",
 ):
     if out_dtype not in ("f16", "bf16"):
@@ -582,9 +600,10 @@ def _compile_stage1_finalize_act_bias(
                 u = up_h.extf(T.f32) + up_bias_h.extf(T.f32)
                 one = arith.constant(1.0, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
+                _lim = 7.0 if not swiglu_limit else float(swiglu_limit)
                 if const_expr(act == "swiglu"):
-                    limit = arith.constant(7.0, type=T.f32)
-                    neg_limit = arith.constant(-7.0, type=T.f32)
+                    limit = arith.constant(_lim, type=T.f32)
+                    neg_limit = arith.constant(-_lim, type=T.f32)
                     alpha = arith.constant(1.702, type=T.f32)
                     g = arith.minimumf(g, limit)
                     u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
@@ -597,6 +616,11 @@ def _compile_stage1_finalize_act_bias(
                     )
                     out_f = g * sig * (u + one)
                 else:
+                    if const_expr(swiglu_limit):
+                        limit = arith.constant(_lim, type=T.f32)
+                        neg_limit = arith.constant(-_lim, type=T.f32)
+                        g = arith.minimumf(g, limit)
+                        u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                     t = g * neg_log2e
                     emu = llvm.call_intrinsic(
                         T.f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -749,6 +773,7 @@ def _compile_base_a8w4_gemm(
         grouped_contiguous_m=cfg.grouped_contiguous_m,
         persistent_workers=cfg.persistent_workers,
         stage1_act=stage1_act,
+        swiglu_limit=cfg.swiglu_limit,
         stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
         kernel_tag=kernel_tag,
@@ -782,6 +807,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     grouped_contiguous_m: bool = False,
     persistent_workers: int | None = None,
     act: str = "silu",
+    swiglu_limit: Optional[float] = None,
     stage1_weight_layout: str = "gguu",
     data_format: str = "a8w4",
 ):
@@ -811,6 +837,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         persistent_workers=persistent_workers,
         data_format=str(data_format),
         act=str(act),
+        swiglu_limit=(None if swiglu_limit is None else float(swiglu_limit)),
         stage1_weight_layout=str(stage1_weight_layout),
     )
     _validate_common(cfg)
@@ -874,6 +901,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 inter_dim=cfg.inter_dim,
                 out_dtype=cfg.out_dtype,
                 act=cfg.act,
+                swiglu_limit=cfg.swiglu_limit,
                 stage1_weight_layout=cfg.stage1_weight_layout,
             )
         return _lazy["finalize_act"]
@@ -886,6 +914,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 inter_dim=cfg.inter_dim,
                 out_dtype=cfg.out_dtype,
                 act=cfg.act,
+                swiglu_limit=cfg.swiglu_limit,
                 stage1_weight_layout=cfg.stage1_weight_layout,
             )
         return _lazy["finalize_act_bias"]

@@ -450,6 +450,7 @@ def fused_moe_(
         bias1=bias1,
         bias2=bias2,
         gate_mode=gate_mode,
+        swiglu_limit=swiglu_limit,
     )
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out

@@ -322,6 +322,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     bias1: Optional[torch.Tensor],
     bias2: Optional[torch.Tensor],
     gate_mode: GateMode = GateMode.SEPARATED,
+    swiglu_limit: Optional[float] = None,
 ):
     def _grouped_dbg(msg: str, stacklevel: int = 1):
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
@@ -743,6 +744,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_contiguous_m=effective_grouped_contiguous_m,
         persistent_workers=None,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
+        swiglu_limit=swiglu_limit,
         stage1_weight_layout=stage1_weight_layout,
     )
     _grouped_dbg("stage1 compile done; start launch")
