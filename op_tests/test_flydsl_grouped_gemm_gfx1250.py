@@ -44,7 +44,6 @@ from aiter.fused_moe import (  # noqa: E402
     torch_moe_stage2,
 )
 from aiter.ops.flydsl.grouped_moe_gfx1250 import (  # noqa: E402
-    _grouped_a8w4_prepare_scale_batch,
     _grouped_b_scale_prepare_batch,
 )
 from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402
@@ -104,7 +103,7 @@ def is_gfx1250() -> bool:
 # kernels consume (16-row * 16-byte chunks). We use that public API
 # directly. Scale shuffle, on the other hand, has its own grouped-only
 # permutation; ``aiter.ops.shuffle.shuffle_scale`` is *not* compatible
-# and we must use ``_grouped_a8w4_prepare_scale_batch`` below.
+# and we must use ``_grouped_b_scale_prepare_batch`` below.
 # ---------------------------------------------------------------------------
 def _grouped_scale(
     scale_raw: torch.Tensor,
@@ -333,7 +332,9 @@ def _run_grouped_via_fused_moe(
     else:
         w1_logical = _pattern_packed(experts, 2 * inter, K_pack, seed=seed + 17)
         w2_logical = _pattern_packed(experts, K, inter_pack, seed=seed + 47)
-        w1_scale_raw = _weight_scale(experts, 2 * inter, K // SCALE_BLOCK, seed=seed + 201)
+        w1_scale_raw = _weight_scale(
+            experts, 2 * inter, K // SCALE_BLOCK, seed=seed + 201
+        )
         w2_scale_raw = _weight_scale(experts, K, inter // SCALE_BLOCK, seed=seed + 202)
         if use_bias:
             bg = torch.Generator(device="cpu").manual_seed(seed + 91)
@@ -468,7 +469,9 @@ def _prepare_grouped_moe_case(
         w2_logical = _pattern_packed(experts, K, inter_pack, seed=seed + 47)
         # Varied weight scales so the B-scale preshuffle layout is actually
         # exercised (see _weight_scale).
-        w1_scale_raw = _weight_scale(experts, 2 * inter, K // SCALE_BLOCK, seed=seed + 201)
+        w1_scale_raw = _weight_scale(
+            experts, 2 * inter, K // SCALE_BLOCK, seed=seed + 201
+        )
         w2_scale_raw = _weight_scale(experts, K, inter // SCALE_BLOCK, seed=seed + 202)
         if use_bias:
             bg = torch.Generator(device="cpu").manual_seed(seed + 91)
@@ -872,9 +875,7 @@ def main() -> None:
     # value. Each iteration sets args.tokens to a single int so _bench /
     # _sanity_check read it unchanged.
     token_list = args.tokens if isinstance(args.tokens, list) else [args.tokens]
-    activation = (
-        ActivationType.Swiglu if args.act == "swiglu" else ActivationType.Silu
-    )
+    activation = ActivationType.Swiglu if args.act == "swiglu" else ActivationType.Silu
     rows = []
     for _tok in token_list:
         args.tokens = _tok

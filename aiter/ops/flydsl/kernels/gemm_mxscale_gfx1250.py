@@ -565,9 +565,7 @@ def compile_mxscale_gemm(
             for _wn in range(_bank_half_wn, wmma_n_rep):
                 _bank_group_to_row_major.append(_wm * wmma_n_rep + _wn)
 
-    @flyc.kernel(
-        name=module_name, known_block_size=[block_threads, 1, 1]
-    )
+    @flyc.kernel(name=module_name, known_block_size=[block_threads, 1, 1])
     def kernel_mxscale_gemm(
         arg_c: fx.Tensor,
         arg_a: fx.Tensor,
