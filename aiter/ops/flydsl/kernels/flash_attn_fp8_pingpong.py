@@ -123,14 +123,25 @@ def build_flash_attn_fp8_module(
         softmax_scale = 1.0 / host_math.sqrt(head_dim)
 
     # ---- LDS layout (fp8 element type) ----
-    # K tile : [BLOCK_N kv][HEAD_DIM d]      row-major
-    # V tile : [BLOCK_N kv][HEAD_DIM d]      row-major
-    # P tile : [BLOCK_M q][BLOCK_N kv] (fp8) row-major, per workgroup
+    # K tile : [BLOCK_N kv][HEAD_DIM d]          row-major
+    # V tile : [HEAD_DIM d][BLOCK_N kv] (fp8)    *transposed* (Step 1)
+    # P tile : [BLOCK_M q][BLOCK_N kv] (fp8)     row-major, per workgroup
+    #
+    # V is laid out transposed so the GEMM2 A-operand fragment
+    #   A_frag[L][v] = V[kv = hi*32 + v, d = lo + dt*32]
+    #             = Vt[d = lo + dt*32][kv = hi*32 + v]
+    # is a single contiguous 32-byte (v_i8x32) load along kv, replacing the
+    # old 32 single-byte strided gathers.
     K_STRIDE = HEAD_DIM
-    V_STRIDE = HEAD_DIM
+    V_STRIDE = BLOCK_N  # transposed: stride over kv per d-row
     P_STRIDE = BLOCK_N
-    LDS_K_SIZE = BLOCK_N * K_STRIDE
-    LDS_V_SIZE = BLOCK_N * V_STRIDE
+    # Step 2: double-buffer K and V (ping-pong by KV-tile parity) so the
+    # global load for tile i+1 overlaps the MFMA compute of tile i.
+    NUM_BUF = 2
+    LDS_K_TILE = BLOCK_N * K_STRIDE
+    LDS_V_TILE = HEAD_DIM * V_STRIDE
+    LDS_K_SIZE = NUM_BUF * LDS_K_TILE
+    LDS_V_SIZE = NUM_BUF * LDS_V_TILE
     LDS_P_SIZE = BLOCK_M * P_STRIDE
     LDS_K_OFF = 0
     LDS_V_OFF = LDS_K_OFF + LDS_K_SIZE
@@ -252,16 +263,29 @@ def build_flash_attn_fp8_module(
             )
             return _pointer_load(v_i8x16, gep)
 
-        def coop_load_kv(kv_start, lds_off, src_ptr, stride):
+        zero_vec16 = Vec.filled(VEC, 0, i8_dtype)
+
+        def global_load_kv(kv_start, src_ptr):
+            # Issue the (latency-bound) global load for this lane's row chunk.
+            # Returns a register vec<16xi8>; OOB rows zeroed.
             row_idx = kv_start + load_row
             in_bounds = row_idx < seq_len_v
             safe_row = fx.Index(ArithValue(in_bounds).select(row_idx, fx.Index(0)))
             g_idx = global_idx(safe_row, load_col)
             vec = _load_global_i8x16(src_ptr, g_idx)
-            zero_vec = Vec.filled(VEC, 0, i8_dtype)
-            vec = ArithValue(in_bounds).select(vec, zero_vec.ir_value())
-            lds_idx = fx.Index(lds_off) + load_row * stride + load_col
+            return ArithValue(in_bounds).select(vec, zero_vec16.ir_value())
+
+        def store_k_lds(vec, lds_off):
+            lds_idx = fx.Index(lds_off) + load_row * K_STRIDE + load_col
             Vec(vec).store(lds, [lds_idx])
+
+        def store_v_lds_transposed(vec, lds_off):
+            # Scatter the 16 contiguous d-values into transposed Vt[d][kv].
+            vv = Vec(vec)
+            for e in range_constexpr(VEC):
+                d_row = load_col + fx.Index(e)
+                vt_idx = fx.Index(lds_off) + d_row * V_STRIDE + load_row
+                Vec.from_elements([vv[e]], i8_dtype).store(lds, [vt_idx])
 
         # ---- Preload Q packs (register resident) for this wave ----
         # A-operand for GEMM1 is K; B-operand is Q (Q^T).  But we keep Q in
@@ -296,17 +320,38 @@ def build_flash_attn_fp8_module(
         init_args = [c_neg_inf, c_zero_f]
         for _ in range_constexpr(D_TILES):
             init_args.append(Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32))
+        # Double-buffer carried state: buffer parity + prefetched K/V register
+        # vectors for the *current* tile.  Prefetch tile 0 before the loop.
+        # The global loads (the latency-bound part) are issued one iteration
+        # ahead so they overlap the previous tile's MFMA compute; the SSA
+        # dependency from the LDS store auto-inserts the consume waitcnt.
+        init_args.append(fx.Index(0))  # buf parity
+        init_args.append(global_load_kv(fx.Index(0), k_ptr))  # K reg, tile 0
+        init_args.append(global_load_kv(fx.Index(0), v_ptr))  # V reg, tile 0
 
         loop_results = init_args
         for kv_start, iter_args in range(0, seq_len_v, BLOCK_N, init=init_args):
             m_running = iter_args[0]
             l_running = iter_args[1]
             o_accs = [iter_args[2 + i] for i in range_constexpr(D_TILES)]
+            buf = iter_args[2 + D_TILES]
+            k_reg = iter_args[3 + D_TILES]
+            v_reg = iter_args[4 + D_TILES]
 
-            # ---- Load K, V tiles into LDS ----
-            coop_load_kv(kv_start, LDS_K_OFF, k_ptr, K_STRIDE)
-            coop_load_kv(kv_start, LDS_V_OFF, v_ptr, V_STRIDE)
+            k_buf_off = fx.Index(LDS_K_OFF) + buf * fx.Index(LDS_K_TILE)
+            v_buf_off = fx.Index(LDS_V_OFF) + buf * fx.Index(LDS_V_TILE)
+            next_buf = fx.Index(1) - buf
+            next_kv = kv_start + fx.Index(BLOCK_N)
+
+            # ---- Commit the prefetched current tile into its LDS buffer ----
+            store_k_lds(k_reg, k_buf_off)
+            store_v_lds_transposed(v_reg, v_buf_off)
             gpu.barrier()
+
+            # ---- Prefetch the NEXT tile's global loads (latency hides under
+            #      this tile's MFMA compute below).  Carried to next iter. ----
+            k_next = global_load_kv(next_kv, k_ptr)
+            v_next = global_load_kv(next_kv, v_ptr)
 
             # ===============================================================
             # GEMM1: S[kv,q] = K @ Q^T  for each of the N_KV_TILES kv subtiles
@@ -320,7 +365,7 @@ def build_flash_attn_fp8_module(
                     # K A-operand: kv-row = lo + nt*32, d = ks*64 + hi*32 + v
                     kv_row = lo + fx.Index(nt * 32)
                     d_base = fx.Index(ks * MFMA_K) + hi * 32
-                    lds_idx = fx.Index(LDS_K_OFF) + kv_row * K_STRIDE + d_base
+                    lds_idx = k_buf_off + kv_row * K_STRIDE + d_base
                     k_pack = Vec.load(v_i8x32, lds, [lds_idx])
                     k_pack = Vec(k_pack).bitcast(fx.Int32)
                     s_acc = mfma.call(k_pack, q_packs[ks], s_acc)
@@ -410,22 +455,21 @@ def build_flash_attn_fp8_module(
                 o_accs[dt] = _fmul(Vec(o_accs[dt]), corr_vec)
 
             for dt in range_constexpr(D_TILES):
-                # V A-operand: kv = hi*32+v, d = lo + dt*32.  V_lds is [kv, d]
-                # so V[hi*32 : hi*32+32, lo+dt*32] is strided by V_STRIDE.
-                # Gather 32 fp8 (one per kv = hi*32+v) for d = lo + dt*32.
-                v_elems = []
-                for v in range_constexpr(32):
-                    kv = hi * 32 + v
-                    d_col = lo + fx.Index(dt * 32)
-                    vlds = fx.Index(LDS_V_OFF) + kv * V_STRIDE + d_col
-                    v_elems.append(Vec.load(Vec.make_type(1, i8_dtype), lds, [vlds])[0])
-                v_pack = Vec.from_elements(v_elems, i8_dtype).bitcast(fx.Int32)
+                # V A-operand: kv = hi*32+v, d = lo + dt*32.  V_lds is now
+                # transposed Vt[d][kv] so the 32 kv values for a fixed
+                # d = lo + dt*32 are contiguous -> single v_i8x32 load.
+                d_row = lo + fx.Index(dt * 32)
+                vlds = v_buf_off + d_row * V_STRIDE + hi * 32
+                v_pack = Vec.load(v_i8x32, lds, [vlds])
+                v_pack = Vec(v_pack).bitcast(fx.Int32)
                 o_accs[dt] = mfma.call(v_pack, p_pack, o_accs[dt])
 
             m_running = m_new
             l_running = l_new
 
-            loop_results = yield [m_running, l_running] + o_accs
+            loop_results = yield (
+                [m_running, l_running] + o_accs + [next_buf, k_next, v_next]
+            )
 
         # ---- Epilogue: O = (O / l) * v_descale ; store bf16 ----
         l_final = loop_results[1]
