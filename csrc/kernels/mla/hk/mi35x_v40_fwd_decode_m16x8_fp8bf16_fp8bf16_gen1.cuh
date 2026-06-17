@@ -132,13 +132,17 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                              4>; // 4 vgprs -> 1 range of 4: 1 base tile (16x32 bf16)
     using o_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_o_begin, k_o_end>>, 4>; // 128 vgprs
-    // PV V operand = two non-contiguous base tiles overlaying dead QK state:
-    //   v_0 = p_comp HI half (124:127), dead after the fp32->bf16 pack to p_mfma
-    //   v_1 = k_0 slot (84:87),         dead once QK is finished
-    using pv_v_top_ranges =
+    // PV V operand = three non-contiguous base tiles overlaying dead QK state,
+    // forming a 3-deep round-robin (6 ds_read_b64 in flight) for the PV GEMM:
+    //   pv_v_0 = p_comp HI half (124:127), dead after the fp32->bf16 pack to p_mfma
+    //   pv_v_1 = k_0 slot (84:87),         dead once QK is finished
+    //   pv_v_2 = k_1 slot (80:83),         dead once QK is finished
+    using pv_v_0_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_v0_begin, k_v0_end>>, 4>;
-    using pv_v_bot_ranges =
+    using pv_v_1_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k0_begin, k_k0_begin + 3>>, 4>;
+    using pv_v_2_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k1_begin, k_k1_begin + 3>>, 4>;
     // q_lds: Phase-B Q-from-LDS, contiguous 8 vgprs (68:75) split into q_lds_0 + q_lds_1
     // (4 vgprs each) so 2 adjacent Phase-B iters can pair-fuse like Phase A.
     using q_lds_ranges =
@@ -175,11 +179,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
     hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_top_ranges> k_0;
     hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_bot_ranges> k_1;
     hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_alt_top_ranges> k_2;
-    // PV V operand tiles (16 K-rows each = 1 base tile of (16, 32) bf16). v_0
-    // overlays p_comp HI (124:127, dead after pack), v_1 overlays k_0 (84:87,
-    // dead after QK). Together = the 32x32 V tile for the PV mfma.
-    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_top_ranges> pv_v_top;
-    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_bot_ranges> pv_v_bot;
+    // PV V round-robin tiles (16 K-rows each = 1 base tile of (16, 32) bf16).
+    // pv_v_0 overlays p_comp HI (124:127, dead after pack), pv_v_1 overlays k_0
+    // (84:87), pv_v_2 overlays k_1 (80:83); both k tiles dead after QK. The PV
+    // GEMM streams 32 V base tiles S_0..S_31 (S_j = V-cols [j*16:(j+1)*16])
+    // through these 3 slots, S_j -> slot (j%3), 6 ds_read_b64 in flight.
+    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_0_ranges> pv_v_0;
+    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_1_ranges> pv_v_1;
+    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_2_ranges> pv_v_2;
     // p_mfma: bf16 P-operand for PV mfma, row_l 16x32 (4 vgprs/lane = 1 base tile).
     hk::art<mfma_ab_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, p_mfma_ranges> p_mfma;
     // oaccu: full kVoHeadDim=512 wide, kTileM=16 rows, row_l 16x16 sub-tiles (fp32).
@@ -890,23 +897,22 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
             // rescales), so kDoRescale implies !kIsFirstIter.
             //
             // PV GEMM: O = P @ V, computed as oaccu^T = V^T @ P^T via
-            // mma_ABt(oaccu, V, p_mfma). For V4.0 kBlockN=32, each iter covers
-            // 32 V-cols (= 2 mfma A-tiles = pv_v_top + pv_v_bot) and writes 2
-            // oaccu base tiles. With kVoHeadDim=512 we run 16 iters. Per iter:
-            // 4 ds_read_b64_tr_b16 to fill the 2 V-tiles (pv_v_top=124:127 over
-            // dead p_comp-hi, pv_v_bot=84:87 over dead k_0), wait lgkmcnt(0),
-            // 2 mfmas (3-arg init when kIsFirstIter, else 4-arg accum).
+            // mma_ABt(oaccu, V, p_mfma). With kVoHeadDim=512 and kBlockN=32 the V
+            // operand is 32 base tiles S_0..S_31 (S_j = V-cols [j*16:(j+1)*16],
+            // 4 vgprs = 2 ds_read_b64_tr_b16 each). They stream through a 3-deep
+            // round-robin over pv_v_0/pv_v_1/pv_v_2 (S_j -> slot j%3), keeping 6
+            // ds_read_b64 (= 3 base tiles) in flight. Flat mfma_j (j=0..31) reads
+            // slot(j%3) then issues reload S_{j+3}->slot(j%3) (mfma-then-ds_read,
+            // safe WAR order). Steady wait lgkmcnt(4) drains the operand (2 reads)
+            // leaving 4; the tail (no more reloads) tapers wait(4)->wait(2)->wait(0).
+            // The 16-iter loop runs 2 flat mfmas/iter (j=2*iter, 2*iter+1) so the
+            // online-softmax rescale stays per-iter (scales next iter's 8 oaccu).
             //
-            // Rescale schedule (kDoRescale only), V32 PV scaler workaround:
-            //   - vgprs [+0,+1] via 1x v_pk_mul_f32 (prologue only -- v_pk
-            //     after mfma trips the hazard)
-            //   - vgprs [+2,+3] via 2x v_mul_f32, iters 1..N-1 interleaved
-            //     between the 2 mfmas of iter i-1.
-            // Prologue scales iter 0's 2 sub-tiles (both halves) via
-            // pk_mul_pair; the remaining 30 sub-tiles (iters 1..15) are scaled
-            // in-loop by iter i in [0..14]: 2 mul_pair for +0/+1 hidden under
-            // ds_read latency, 2 mul_pair for +2/+3 between the 2 mfmas.
+            // Rescale schedule (kDoRescale only): prologue pk_mul_pair scales
+            // iter 0's 8 oaccu vgprs; in-loop iter i scales iter (i+1)'s 8 vgprs
+            // as 4 mul_pair hidden under the V-tile load latency.
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / T::kBlockN; // 16
+            constexpr uint32_t kNumVTiles  = 2u * num_pv_iter;          // 32 = S_0..S_31
             auto pv_gemm = [&]<bool kDoRescale>() {
                 auto pk_mul_pair = [&](float r, auto base_c) {
                     constexpr uint32_t base = decltype(base_c)::value;
@@ -921,6 +927,26 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                     asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base + 1), "v"(r));
                 };
 
+                // Issue both ds_read_b64 for base tile S_jj into round-robin slot.
+                auto load_S = [&]<uint32_t jj, uint32_t slot>() {
+                    constexpr uint32_t base =
+                        (slot == 0u) ? k_v0_begin : (slot == 1u) ? k_k0_begin : k_k1_begin;
+                    kv_manager.template load_transposed_v_to_gpr<0u, jj * 16u, base + 0>(
+                        p_lds_kv_curr);
+                    kv_manager.template load_transposed_v_to_gpr<16u, jj * 16u, base + 2>(
+                        p_lds_kv_curr);
+                };
+                // mfma: oaccu_dst (+)= pv_v_{slot}^T @ p_mfma (3-arg init when first).
+                auto do_mma = [&]<uint32_t slot, typename OA>(OA& oaccu_dst) {
+                    auto run = [&](auto& v) {
+                        if constexpr(kIsFirstIter) hk::mma_ABt(oaccu_dst, v, p_mfma);
+                        else hk::mma_ABt(oaccu_dst, v, p_mfma, oaccu_dst);
+                    };
+                    if constexpr(slot == 0u) run(pv_v_0);
+                    else if constexpr(slot == 1u) run(pv_v_1);
+                    else run(pv_v_2);
+                };
+
                 if constexpr(kDoRescale)
                 {
                     opus::static_for<2>([&](auto s) {
@@ -929,36 +955,20 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                     });
                 }
 
+                // Prologue: preload S_0,S_1,S_2 (6 ds_read_b64) into slots 0,1,2.
+                load_S.template operator()<0u, 0u>();
+                load_S.template operator()<1u, 1u>();
+                load_S.template operator()<2u, 2u>();
+
                 opus::static_for<num_pv_iter>([&](auto i) {
                     constexpr uint32_t iter            = i.value;
-                    constexpr bool has_next            = (iter + 1) < num_pv_iter;
-                    constexpr uint32_t kColOffset      = iter * T::kBlockN;
-                    constexpr uint32_t next_oaccu_base = k_o_begin + (iter + 1) * 8u;
+                    constexpr bool     has_next        = (iter + 1u) < num_pv_iter;
+                    constexpr uint32_t next_oaccu_base = k_o_begin + (iter + 1u) * 8u;
+                    constexpr uint32_t j_lo            = 2u * iter;      // flat mfma idx (a)
+                    constexpr uint32_t j_hi            = 2u * iter + 1u; // flat mfma idx (b)
+                    constexpr uint32_t slot_lo         = j_lo % 3u;
+                    constexpr uint32_t slot_hi         = j_hi % 3u;
 
-                    kv_manager
-                        .template load_transposed_v_to_gpr<0u, kColOffset + 0u, k_v0_begin + 0>(
-                            p_lds_kv_curr);
-                    kv_manager
-                        .template load_transposed_v_to_gpr<16u, kColOffset + 0u, k_v0_begin + 2>(
-                            p_lds_kv_curr);
-                    kv_manager
-                        .template load_transposed_v_to_gpr<0u, kColOffset + 16u, k_k0_begin + 0>(
-                            p_lds_kv_curr);
-                    kv_manager
-                        .template load_transposed_v_to_gpr<16u, kColOffset + 16u, k_k0_begin + 2>(
-                            p_lds_kv_curr);
-
-                    // Scale next iter's BOTH sub-tiles +0/+1 -- 2 mul_pair =
-                    // 4 v_mul_f32 hidden under ds_read latency. Last iter has
-                    // no next.
-                    if constexpr(kDoRescale && has_next)
-                    {
-                        mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 0>{});
-                        mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 0>{});
-                    }
-
-                    // Per-iter oaccu views: 2 adjacent 16x16 col_l base tiles
-                    // (vgprs k_o_begin + iter*8 .. +7).
                     constexpr uint32_t oaccu_base = k_o_begin + iter * 8u;
                     using oaccu_a_r               = hkdart::split_many_t<
                         hkdart::type_list<hkdart::range<oaccu_base + 0, oaccu_base + 3>>,
@@ -971,43 +981,35 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                     hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_b_r>
                         oaccu_b;
 
-                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(2, -1));
-                    if constexpr(kIsFirstIter || (has_next == false))
+                    // ---- mfma_a (flat j_lo, reads slot_lo) ----
+                    // Steady: FIFO=[S_jlo,S_{jlo+1},S_{jlo+2}]=6, wait(4) drains
+                    // S_jlo leaving 4. Tail iter15 (j=30): FIFO=[S30,S31]=4 -> wait(2).
+                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(has_next ? 4 : 2, -1));
+                    do_mma.template operator()<slot_lo>(oaccu_a);
+                    // Reload S_{jlo+3} -> slot_lo; rescale next oaccu +0/+1,+4/+5.
+                    if constexpr(j_lo + 3u < kNumVTiles)
                     {
-                        if constexpr(kIsFirstIter)
-                        {
-                            hk::mma_ABt(oaccu_a, pv_v_top, p_mfma);
-                        }
-                        else
-                        {
-                            hk::mma_ABt(oaccu_a, pv_v_top, p_mfma, oaccu_a);
-                        }
-                        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(0, -1));
-                        if constexpr(kIsFirstIter)
-                        {
-                            hk::mma_ABt(oaccu_b, pv_v_bot, p_mfma);
-                        }
-                        else
-                        {
-                            hk::mma_ABt(oaccu_b, pv_v_bot, p_mfma, oaccu_b);
-                        }
+                        load_S.template operator()<j_lo + 3u, slot_lo>();
                     }
-                    else
+                    if constexpr(kDoRescale && has_next)
                     {
-                        // 4-arg accumulate. When kDoRescale, interleave next
-                        // iter's +2/+3 rescale (2 mul_pair) into the 2 mfmas,
-                        // 1 mul_pair per slot.
-                        hk::mma_ABt(oaccu_a, pv_v_top, p_mfma, oaccu_a);
-                        if constexpr(kDoRescale)
-                        {
-                            mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 2>{});
-                        }
-                        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(0, -1));
-                        hk::mma_ABt(oaccu_b, pv_v_bot, p_mfma, oaccu_b);
-                        if constexpr(kDoRescale)
-                        {
-                            mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 2>{});
-                        }
+                        mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 0>{});
+                        mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 0>{});
+                    }
+
+                    // ---- mfma_b (flat j_hi, reads slot_hi) ----
+                    // Steady wait(4); tail iter15 (j=31): FIFO=[S31]=2 -> wait(0).
+                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(has_next ? 4 : 0, -1));
+                    do_mma.template operator()<slot_hi>(oaccu_b);
+                    // Rescale next oaccu +2/+3,+6/+7; reload S_{jhi+3} -> slot_hi.
+                    if constexpr(kDoRescale && has_next)
+                    {
+                        mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 2>{});
+                        mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 2>{});
+                    }
+                    if constexpr(j_hi + 3u < kNumVTiles)
+                    {
+                        load_S.template operator()<j_hi + 3u, slot_hi>();
                     }
                 });
             };
