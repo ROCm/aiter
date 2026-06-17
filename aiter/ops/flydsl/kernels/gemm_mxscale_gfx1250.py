@@ -1591,7 +1591,7 @@ def compile_mxscale_gemm(
             def _stage1_act_mul_scalar(g, u):
                 one = arith.constant(1.0, type=T.f32)
                 alpha = arith.constant(1.702, type=T.f32)
-                _lim = 7.0 if not swiglu_limit else float(swiglu_limit)
+                _lim = 7.0 if swiglu_limit is None else float(swiglu_limit)
                 limit = arith.constant(_lim, type=T.f32)
                 neg_limit = arith.constant(-_lim, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
@@ -1605,7 +1605,7 @@ def compile_mxscale_gemm(
                         T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], []
                     )
                     return g * sig * (u + one)
-                if const_expr(swiglu_limit):
+                if const_expr(swiglu_limit is not None):
                     g = arith.minimumf(g, limit)
                     u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                 return _stage1_silu_elem(g) * u

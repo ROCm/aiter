@@ -328,12 +328,12 @@ def _apply_gate_up(
     act: str,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
-    _lim = 7.0 if not swiglu_limit else float(swiglu_limit)
+    _lim = 7.0 if swiglu_limit is None else float(swiglu_limit)
     if act == "swiglu":
         gate = gate.clamp(max=_lim)
         up = up.clamp(min=-_lim, max=_lim)
         return gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
-    if swiglu_limit:
+    if swiglu_limit is not None:
         gate = gate.clamp(max=_lim)
         up = up.clamp(min=-_lim, max=_lim)
     return torch.nn.functional.silu(gate) * up
@@ -431,7 +431,7 @@ def _compile_stage1_finalize_act(
                 u = up_h.extf(T.f32)
                 one = arith.constant(1.0, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
-                _lim = 7.0 if not swiglu_limit else float(swiglu_limit)
+                _lim = 7.0 if swiglu_limit is None else float(swiglu_limit)
                 if const_expr(act == "swiglu"):
                     limit = arith.constant(_lim, type=T.f32)
                     neg_limit = arith.constant(-_lim, type=T.f32)
@@ -447,7 +447,7 @@ def _compile_stage1_finalize_act(
                     )
                     out_f = g * sig * (u + one)
                 else:
-                    if const_expr(swiglu_limit):
+                    if const_expr(swiglu_limit is not None):
                         limit = arith.constant(_lim, type=T.f32)
                         neg_limit = arith.constant(-_lim, type=T.f32)
                         g = arith.minimumf(g, limit)
@@ -600,7 +600,7 @@ def _compile_stage1_finalize_act_bias(
                 u = up_h.extf(T.f32) + up_bias_h.extf(T.f32)
                 one = arith.constant(1.0, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
-                _lim = 7.0 if not swiglu_limit else float(swiglu_limit)
+                _lim = 7.0 if swiglu_limit is None else float(swiglu_limit)
                 if const_expr(act == "swiglu"):
                     limit = arith.constant(_lim, type=T.f32)
                     neg_limit = arith.constant(-_lim, type=T.f32)
@@ -616,7 +616,7 @@ def _compile_stage1_finalize_act_bias(
                     )
                     out_f = g * sig * (u + one)
                 else:
-                    if const_expr(swiglu_limit):
+                    if const_expr(swiglu_limit is not None):
                         limit = arith.constant(_lim, type=T.f32)
                         neg_limit = arith.constant(-_lim, type=T.f32)
                         g = arith.minimumf(g, limit)

@@ -69,8 +69,8 @@ def _parse_optional_float(value, source: str) -> float | None:
         raise ValueError(f"{source} must be a float, got {value!r}") from e
 
 
-def _row_swiglu_limit(row: dict[str, str]) -> float:
-    return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit") or 0.0
+def _row_swiglu_limit(row: dict[str, str]) -> float | None:
+    return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit")
 
 
 def parse_csv(csv_path: str):
@@ -208,7 +208,7 @@ def _precompile_to_cache(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     stage1_fuse_quant=None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float | None = None,
     # Stage2-only kernel tuning knobs (registered by the production-variant
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
@@ -354,7 +354,7 @@ def _precompile_to_cache(
                 _padded_rows * _padded_cols, dtype=torch.uint8, device=dev
             )
         if a_dtype == "fp8":
-            if act == "silu" and swiglu_limit == 0.0:
+            if act == "silu" and swiglu_limit is None:
                 # fused_moe_2stages uses fused_quant_fp8_sort for this path.
                 rows = (max_num_tokens_padded + 31) // 32 * 32
                 cols = (inter_dim + 31) // 32
