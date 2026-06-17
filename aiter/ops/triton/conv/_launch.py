@@ -33,6 +33,51 @@ from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
 )
 
 
+def _make_mn_grid(M_total, K_out):
+    """Grid for the GEMM-style conv kernels (1x1, 3x3 nhwc/cblocked, general):
+    one program per (BLOCK_M tile of M_total) x (BLOCK_N tile of K_out)."""
+
+    def grid(meta):
+        return (
+            triton.cdiv(M_total, meta["BLOCK_M"]) * triton.cdiv(K_out, meta["BLOCK_N"]),
+        )
+
+    return grid
+
+
+def _make_wino_input_grid(T, C_pad):
+    """Grid for the Winograd F(4,3) input-transform kernels: one program per
+    tile T x (BLOCK_C tile of C_pad)."""
+
+    def grid(meta):
+        return (T, triton.cdiv(C_pad, meta["BLOCK_C"]))
+
+    return grid
+
+
+def _make_wino_gemm_grid(T, K_out):
+    """Grid for the Winograd F(4,3) batched GEMM: (BLOCK_M tile of T) x
+    (BLOCK_N tile of K_out) program blocks, batched over the 36 tile elements."""
+
+    def grid(meta):
+        return (
+            triton.cdiv(T, meta["BLOCK_M"]) * triton.cdiv(K_out, meta["BLOCK_N"]),
+            36,
+        )
+
+    return grid
+
+
+def _make_wino_output_grid(T, K_out):
+    """Grid for the Winograd F(4,3) output-transform kernels: one program per
+    tile T x (BLOCK_K tile of K_out)."""
+
+    def grid(meta):
+        return (T, triton.cdiv(K_out, meta["BLOCK_K"]))
+
+    return grid
+
+
 def _select_3x3_method(N, C, H, W, K_out, stride, dilation):
     """Pick the best 3x3 kernel method based on shape heuristics.
 
@@ -82,11 +127,6 @@ def _launch_1x1(
 
     w = w_oihw.squeeze(-1).squeeze(-1).contiguous()  # [K_out, C]
 
-    def grid(meta):
-        BM = meta["BLOCK_M"]
-        BN = meta["BLOCK_N"]
-        return (triton.cdiv(N * P * Q, BM) * triton.cdiv(K_out, BN),)
-
     M_total = N * P * Q
 
     shape_key = format_shape_key(
@@ -106,7 +146,7 @@ def _launch_1x1(
     )
     config = _get_config_1x1(shape_key=shape_key, M=M_total)
 
-    _conv2d_1x1_kernel[grid](
+    _conv2d_1x1_kernel[_make_mn_grid(M_total, K_out)](
         x,
         w,
         bias_fp32,
@@ -153,11 +193,6 @@ def _launch_3x3_nhwc(
     ph, pw = padding
     dh, dw = dilation
 
-    def grid(meta):
-        BM = meta["BLOCK_M"]
-        BN = meta["BLOCK_N"]
-        return (triton.cdiv(N * P * Q, BM) * triton.cdiv(K_out, BN),)
-
     M_total = N * P * Q
 
     shape_key = format_shape_key(
@@ -177,7 +212,7 @@ def _launch_3x3_nhwc(
     )
     config = _get_config_nhwc(shape_key=shape_key, M=M_total)
 
-    _conv2d_3x3_nhwc_kernel[grid](
+    _conv2d_3x3_nhwc_kernel[_make_mn_grid(M_total, K_out)](
         x,
         w_3x3,
         bias_fp32,
@@ -227,11 +262,6 @@ def _launch_3x3_cblocked(
     ph, pw = padding
     dh, dw = dilation
 
-    def grid(meta):
-        BM = meta["BLOCK_M"]
-        BN = meta["BLOCK_N"]
-        return (triton.cdiv(N * P * Q, BM) * triton.cdiv(K_out, BN),)
-
     M_total = N * P * Q
 
     shape_key = format_shape_key(
@@ -251,7 +281,7 @@ def _launch_3x3_cblocked(
     )
     config = _get_config_cblocked(shape_key=shape_key, M=M_total)
 
-    _conv2d_3x3_cblocked_kernel[grid](
+    _conv2d_3x3_cblocked_kernel[_make_mn_grid(M_total, K_out)](
         x_blocked,
         w_3x3,
         bias_fp32,
@@ -307,11 +337,6 @@ def _launch_general(
     ph, pw = padding
     dh, dw = dilation
 
-    def grid(meta):
-        BM = meta["BLOCK_M"]
-        BN = meta["BLOCK_N"]
-        return (triton.cdiv(N * P * Q, BM) * triton.cdiv(K_out, BN),)
-
     M_total = N * P * Q
 
     shape_key = format_shape_key(
@@ -331,7 +356,7 @@ def _launch_general(
     )
     config = _get_config_general(shape_key=shape_key, M=M_total)
 
-    _conv2d_general_kernel[grid](
+    _conv2d_general_kernel[_make_mn_grid(M_total, K_out)](
         x,
         w_k,
         bias_fp32,
@@ -405,10 +430,7 @@ def _launch_winograd_f4x3_fused(
     fused_config = _get_config_wino_fused(shape_key=shape_key, M=T)
 
     # 1. Input transform
-    def input_grid_f4(meta):
-        return (T, triton.cdiv(C_pad, meta["BLOCK_C"]))
-
-    _winograd_f4x3_input_transform_kernel[input_grid_f4](
+    _winograd_f4x3_input_transform_kernel[_make_wino_input_grid(T, C_pad)](
         x,
         V,
         N,
@@ -497,10 +519,7 @@ def _launch_winograd_f4x3(
     output_config = _get_config_wino_output(shape_key=shape_key, M=T)
 
     # 1. Input transform
-    def input_grid_f4(meta):
-        return (T, triton.cdiv(C_pad, meta["BLOCK_C"]))
-
-    _winograd_f4x3_input_transform_kernel[input_grid_f4](
+    _winograd_f4x3_input_transform_kernel[_make_wino_input_grid(T, C_pad)](
         x,
         V,
         N,
@@ -518,12 +537,7 @@ def _launch_winograd_f4x3(
     )
 
     # 2. Batched GEMM
-    def gemm_grid(meta):
-        BM = meta["BLOCK_M"]
-        BN = meta["BLOCK_N"]
-        return (triton.cdiv(T, BM) * triton.cdiv(K_out, BN), 36)
-
-    _winograd_f4x3_batched_gemm_kernel[gemm_grid](
+    _winograd_f4x3_batched_gemm_kernel[_make_wino_gemm_grid(T, K_out)](
         V,
         U,
         M,
@@ -534,11 +548,7 @@ def _launch_winograd_f4x3(
     )
 
     # 3. Output transform
-
-    def output_grid_f4(meta):
-        return (T, triton.cdiv(K_out, meta["BLOCK_K"]))
-
-    _winograd_f4x3_output_transform_kernel[output_grid_f4](
+    _winograd_f4x3_output_transform_kernel[_make_wino_output_grid(T, K_out)](
         M,
         bias_fp32,
         y,
@@ -605,10 +615,7 @@ def _launch_winograd_f4x3_cblocked(
     output_config = _get_config_wino_output(shape_key=shape_key, M=T)
 
     # 1. Cblocked input transform
-    def input_grid_f4(meta):
-        return (T, triton.cdiv(C_pad, meta["BLOCK_C"]))
-
-    _winograd_f4x3_cblocked_input_transform_kernel[input_grid_f4](
+    _winograd_f4x3_cblocked_input_transform_kernel[_make_wino_input_grid(T, C_pad)](
         x_blocked,
         V,
         N,
@@ -625,12 +632,7 @@ def _launch_winograd_f4x3_cblocked(
         **input_config,
     )
 
-    def gemm_grid(meta):
-        BM = meta["BLOCK_M"]
-        BN = meta["BLOCK_N"]
-        return (triton.cdiv(T, BM) * triton.cdiv(K_out, BN), 36)
-
-    _winograd_f4x3_batched_gemm_kernel[gemm_grid](
+    _winograd_f4x3_batched_gemm_kernel[_make_wino_gemm_grid(T, K_out)](
         V,
         U,
         M,
@@ -640,10 +642,7 @@ def _launch_winograd_f4x3_cblocked(
         **gemm_config,
     )
 
-    def output_grid_f4(meta):
-        return (T, triton.cdiv(K_out, meta["BLOCK_K"]))
-
-    _winograd_f4x3_output_transform_kernel[output_grid_f4](
+    _winograd_f4x3_output_transform_kernel[_make_wino_output_grid(T, K_out)](
         M,
         bias_fp32,
         y,
