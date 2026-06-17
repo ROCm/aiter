@@ -570,7 +570,7 @@ def compile_mxscale_gemm(
         tx = gpu.thread_id("x")
         bx = arith.index_cast(T.index, _raw(gpu.block_id("x")))
         by = arith.index_cast(T.index, _raw(gpu.block_id("y")))
-        m_tiles_per_batch = (arith.index(M) + arith.index(tile_m - 1)) / arith.index(
+        m_tiles_per_batch = (arith.index(M) + arith.index(tile_m - 1)) // arith.index(
             tile_m
         )
 
@@ -633,7 +633,7 @@ def compile_mxscale_gemm(
             layout_thr = fx.make_layout(
                 (m_warp, n_warp, 2, 16), (n_warp * WAVE_SIZE, WAVE_SIZE, 16, 1)
             )
-            thr_coord = idx2crd(tx, layout_thr)
+            thr_coord = idx2crd(fx.Int32(tx), layout_thr)
             wave_m_idx, wave_n_idx, lane_kgrp, lane16 = (
                 fx.get(thr_coord, 0),
                 fx.get(thr_coord, 1),
@@ -659,7 +659,7 @@ def compile_mxscale_gemm(
             zero_i32 = arith.constant(0, type=T.i32)
 
             def make_desc_a(memref, k_base):
-                k_packed_off = k_base / arith.index(PACK_FACTOR_A)
+                k_packed_off = k_base // arith.index(PACK_FACTOR_A)
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_a,
                     lds_memref=memref,
@@ -679,13 +679,13 @@ def compile_mxscale_gemm(
                 )
 
             def make_desc_b(memref, k_base, n_offset=0):
-                k_packed_off = k_base / arith.index(PACK_FACTOR_B)
+                k_packed_off = k_base // arith.index(PACK_FACTOR_B)
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_b,
                     lds_memref=memref,
                     global_offset=(
                         batch_b_base
-                        + (blk_n + arith.index(n_offset)) / arith.index(16),
+                        + (blk_n + arith.index(n_offset)) // arith.index(16),
                         k_packed_off * arith.index(16),
                     ),
                     tensor_shape=(batch_count * (B_TOTAL_N // 16), K_packed_b * 16),
@@ -700,19 +700,19 @@ def compile_mxscale_gemm(
                 )
 
             def make_desc_as(memref, k_base):
-                k_scale_off = k_base / arith.index(SCALE_BLOCK)
-                outer_off = blk_m / arith.index(wmma_m_rep)
+                k_scale_off = k_base // arith.index(SCALE_BLOCK)
+                outer_off = blk_m // arith.index(wmma_m_rep)
                 inner_off = k_scale_off * arith.index(wmma_m_rep)
                 a_scale_row_base = batch_as_base + outer_off
                 if flat_m_base_override is not None:
-                    a_scale_row_base = flat_m_base / arith.index(wmma_m_rep)
+                    a_scale_row_base = flat_m_base // arith.index(wmma_m_rep)
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_a_scale,
                     lds_memref=memref,
                     global_offset=(a_scale_row_base, inner_off),
                     tensor_shape=(
                         (
-                            c_rows / arith.index(wmma_m_rep)
+                            c_rows // arith.index(wmma_m_rep)
                             if const_expr(grouped_contiguous_m)
                             else batch_count * (M // wmma_m_rep)
                         ),
@@ -729,8 +729,8 @@ def compile_mxscale_gemm(
                 )
 
             def make_desc_bs(memref, k_base, n_offset=0):
-                k_scale_off = k_base / arith.index(SCALE_BLOCK)
-                outer_off = (blk_n + arith.index(n_offset)) / arith.index(
+                k_scale_off = k_base // arith.index(SCALE_BLOCK)
+                outer_off = (blk_n + arith.index(n_offset)) // arith.index(
                     b_scale_load_rep
                 )
                 inner_off = k_scale_off * arith.index(b_scale_load_rep)
@@ -898,7 +898,7 @@ def compile_mxscale_gemm(
                 lds_ptr, warp_base, reps, interleaved_cols
             ):
                 """Precompute scale lane bases (byte offsets)."""
-                warp_lds_row = warp_base / arith.index(reps) + lane16
+                warp_lds_row = warp_base // arith.index(reps) + lane16
                 base = warp_lds_row * arith.index(interleaved_cols)
                 if const_expr(is_fp4 or is_a8w4):
                     # FP4/A8W4: always add lane_kgrp offset (no opsel on BScale)
@@ -1673,7 +1673,7 @@ def compile_mxscale_gemm(
                         + arith.index(wn * WMMA_N)
                         + lane_kgrp * arith.index(8)
                     )
-                    out_col_base = raw_col_base / arith.index(2)
+                    out_col_base = raw_col_base // arith.index(2)
                     store_valid = tile_valid
                     if const_expr(needs_grouped_row_masked_store):
                         row_valid = arith.cmpi(
@@ -1822,8 +1822,8 @@ def compile_mxscale_gemm(
                 if const_expr(_effective_l2_pf <= 0):
                     return
                 pf_k = k_base + arith.index(_effective_l2_pf * tile_k)
-                pf_k_packed_a = pf_k / arith.index(PACK_FACTOR_A)
-                pf_k_packed_b = pf_k / arith.index(PACK_FACTOR_B)
+                pf_k_packed_a = pf_k // arith.index(PACK_FACTOR_A)
+                pf_k_packed_b = pf_k // arith.index(PACK_FACTOR_B)
                 tdm_ops.l2_prefetch_tile(
                     arg_a,
                     (flat_m_base, pf_k_packed_a),
@@ -1836,7 +1836,7 @@ def compile_mxscale_gemm(
                 tdm_ops.l2_prefetch_tile(
                     arg_b,
                     (
-                        batch_b_base + blk_n / arith.index(16),
+                        batch_b_base + blk_n // arith.index(16),
                         pf_k_packed_b * arith.index(16),
                     ),
                     (tile_n // 16, packed_tile_k_b * 16),
@@ -2810,7 +2810,7 @@ def compile_mxscale_gemm(
             worker_id = arith.index_cast(T.index, _raw(gpu.block_idx.y))
             grid_size = arith.index(_persistent_workers)
             idx_n = arith.index_cast(T.index, i32_n.ir_value())
-            n_tiles_per_batch = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
+            n_tiles_per_batch = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
             max_m_tiles_per_batch = (M + tile_m - 1) // tile_m
 
             # Total M tile count = prefix[batch_count].
@@ -2822,7 +2822,7 @@ def compile_mxscale_gemm(
             total_m_tiles_idx = arith.index_cast(T.index, total_m_tiles_i32)
             tiles_per_worker = (
                 total_m_tiles_idx + grid_size - arith.index(1)
-            ) / grid_size
+            ) // grid_size
 
             # gfx950 a4w4 stage2 persist_m<=0 style: grid.x enumerates N tiles,
             # grid.y enumerates CU workers. Each worker owns a contiguous chunk
@@ -2857,7 +2857,7 @@ def compile_mxscale_gemm(
                     map_rsrc, global_m_tile, vec_width=1, dtype=T.i32
                 )
                 map_entry = arith.index_cast(T.index, map_entry_i32)
-                batch_idx = map_entry / arith.index(max_m_tiles_per_batch)
+                batch_idx = map_entry // arith.index(max_m_tiles_per_batch)
                 bx_local = map_entry - batch_idx * arith.index(max_m_tiles_per_batch)
                 split_k_id = arith.index_cast(T.index, _raw(gpu.block_idx.z))
                 _emit_tile(
@@ -2887,7 +2887,7 @@ def compile_mxscale_gemm(
                 )
                 m_tile_bound = arith.index_cast(T.index, i32_m_tile_bound.ir_value())
                 idx_n = arith.index_cast(T.index, i32_n.ir_value())
-                n_tiles = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
+                n_tiles = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
 
                 # Port of ``deep_gemm::Scheduler::get_swizzled_block_idx`` for
                 # ``GemmType::MGroupedContiguous`` with ``kIsMulticastOnA == false``.
@@ -2896,7 +2896,7 @@ def compile_mxscale_gemm(
                 primary_num_blocks = m_tile_bound
                 secondary_num_blocks = n_tiles
                 num_blocks_per_group = secondary_num_blocks * k_num_1d
-                group_idx = flat_pid / num_blocks_per_group
+                group_idx = flat_pid // num_blocks_per_group
                 first_block_idx = group_idx * k_num_1d
                 in_group_idx = flat_pid - group_idx * num_blocks_per_group
                 remaining_primary = primary_num_blocks - first_block_idx
@@ -2908,10 +2908,10 @@ def compile_mxscale_gemm(
                 )
                 in_m = (
                     in_group_idx
-                    - (in_group_idx / num_blocks_in_group) * num_blocks_in_group
+                    - (in_group_idx // num_blocks_in_group) * num_blocks_in_group
                 )
                 flat_m_tile = first_block_idx + in_m
-                by_contig = in_group_idx / num_blocks_in_group
+                by_contig = in_group_idx // num_blocks_in_group
 
                 m_tile_active = arith.cmpi(
                     arith.CmpIPredicate.slt, flat_m_tile, primary_num_blocks
@@ -2990,7 +2990,7 @@ def compile_mxscale_gemm(
             else:
                 if const_expr(batch_count > 1):
                     flat_bx = arith.index_cast(T.index, _raw(gpu.block_idx.x))
-                    batch_idx = flat_bx / m_tiles_per_batch
+                    batch_idx = flat_bx // m_tiles_per_batch
                     bx_local = flat_bx - batch_idx * m_tiles_per_batch
                     bz = (
                         arith.index_cast(T.index, _raw(gpu.block_idx.z))
@@ -3101,10 +3101,10 @@ def compile_mxscale_gemm(
 
         idx_m = arith.index_cast(T.index, i32_m.ir_value())
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
+        gx = _raw((idx_m + arith.index(tile_m - 1)) // arith.index(tile_m))
         if const_expr(batch_count > 1):
             gx = gx * batch_count
-        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gy = _raw((idx_n + arith.index(tile_n - 1)) // arith.index(tile_n))
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
@@ -3167,14 +3167,14 @@ def compile_mxscale_gemm(
         idx_m = arith.index_cast(T.index, i32_m.ir_value())
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
         if const_expr(grouped_contiguous_m):
-            n_tiles = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
+            n_tiles = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
             gx = arith.index_cast(T.index, i32_m_tile_bound.ir_value()) * n_tiles
             gy = arith.index(1)
         else:
-            gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
+            gx = _raw((idx_m + arith.index(tile_m - 1)) // arith.index(tile_m))
             if const_expr(batch_count > 1):
                 gx = gx * batch_count
-            gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+            gy = _raw((idx_n + arith.index(tile_n - 1)) // arith.index(tile_n))
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
@@ -3234,7 +3234,7 @@ def compile_mxscale_gemm(
             arena_alloc.finalize()
 
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        gx = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
+        gx = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
         gy = arith.index(_persistent_workers)
         gz = split_k
 
@@ -3288,10 +3288,10 @@ def compile_mxscale_gemm(
 
         idx_m = arith.index_cast(T.index, i32_m.ir_value())
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
+        gx = _raw((idx_m + arith.index(tile_m - 1)) // arith.index(tile_m))
         if const_expr(batch_count > 1):
             gx = gx * batch_count
-        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gy = _raw((idx_n + arith.index(tile_n - 1)) // arith.index(tile_n))
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
@@ -3355,14 +3355,14 @@ def compile_mxscale_gemm(
         idx_m = arith.index_cast(T.index, i32_m.ir_value())
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
         if const_expr(grouped_contiguous_m):
-            n_tiles = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
+            n_tiles = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
             gx = arith.index_cast(T.index, i32_m_tile_bound.ir_value()) * n_tiles
             gy = arith.index(1)
         else:
-            gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
+            gx = _raw((idx_m + arith.index(tile_m - 1)) // arith.index(tile_m))
             if const_expr(batch_count > 1):
                 gx = gx * batch_count
-            gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+            gy = _raw((idx_n + arith.index(tile_n - 1)) // arith.index(tile_n))
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
@@ -3423,7 +3423,7 @@ def compile_mxscale_gemm(
             arena_alloc.finalize()
 
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        gx = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
+        gx = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
         gy = arith.index(_persistent_workers)
         gz = split_k
 

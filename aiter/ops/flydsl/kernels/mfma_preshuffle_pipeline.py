@@ -731,23 +731,23 @@ def xcd_remap_bx_by(
     _c1 = fx.arith.constant(1, index=True)
     _c_tm = fx.arith.constant(tile_m, index=True)
     _gx = fx.arith.constant(N // tile_n, index=True)
-    _gy = (c_m + _c_tm - _c1) / _c_tm
+    _gy = (c_m + _c_tm - _c1) // _c_tm
 
     _linear_id = bx * _gx + by
     _num_wgs = _gx * _gy
 
     _c_xcds = fx.arith.constant(num_xcds, index=True)
-    _q = _num_wgs / _c_xcds
+    _q = _num_wgs // _c_xcds
     _r = _num_wgs % _c_xcds
     _xcd = _linear_id % _c_xcds
-    _in_xcd = _linear_id / _c_xcds
+    _in_xcd = _linear_id // _c_xcds
     _xcd_lt_r = fx.arith.cmpi(CmpIPredicate.ult, _xcd, _r)
     _clip = fx.arith.select(_xcd_lt_r, _xcd, _r)
     _wgid = _xcd * _q + _clip + _in_xcd
 
     _c_wgm = fx.arith.constant(xcd_swizzle, index=True)
     _num_wgid_in_group = _c_wgm * _gx
-    _group_id = _wgid / _num_wgid_in_group
+    _group_id = _wgid // _num_wgid_in_group
     _first_pid_m = _group_id * _c_wgm
     _remaining_m = _gy - _first_pid_m
     _cmp_m = fx.arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
@@ -755,7 +755,7 @@ def xcd_remap_bx_by(
 
     _wgid_in_group = _wgid % _num_wgid_in_group
     new_bx = _first_pid_m + (_wgid_in_group % _group_size_m)
-    new_by = _wgid_in_group / _group_size_m
+    new_by = _wgid_in_group // _group_size_m
     return new_bx, new_by
 
 

@@ -528,28 +528,28 @@ def compile_mixed_moe_gemm1(
                 _c_tn_sw = arith.constant(tile_n, index=True)
                 _c_idp_sw = arith.constant(2 * inter_dim_pad, index=True)
                 if const_expr(mock_gate_only or gate_up_interleave):
-                    _gx = (n_in - _c_idp_sw + _c_tn_sw - _c1_sw) / _c_tn_sw
+                    _gx = (n_in - _c_idp_sw + _c_tn_sw - _c1_sw) // _c_tn_sw
                 else:
                     _c2_sw = arith.constant(2, index=True)
                     _gx = (
                         (n_in - _c_idp_sw + _c2_sw * _c_tn_sw - _c1_sw)
-                        / _c_tn_sw
-                        / _c2_sw
+                        // _c_tn_sw
+                        // _c2_sw
                     )
                 _c_pm_sw = arith.constant(persist_m, index=True)
-                _gy = (size_expert_ids_in + _c_pm_sw - _c1_sw) / _c_pm_sw
+                _gy = (size_expert_ids_in + _c_pm_sw - _c1_sw) // _c_pm_sw
 
                 _linear_id = bx_persist * _gx + by
                 _num_wgs = _gx * _gy
 
                 _c_xcds = arith.constant(_NUM_XCDS_S1, index=True)
-                _wgs_per_xcd = _num_wgs / _c_xcds
-                _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id / _c_xcds)
+                _wgs_per_xcd = _num_wgs // _c_xcds
+                _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id // _c_xcds)
 
                 _WGM_S1 = xcd_swizzle
                 _c_wgm = arith.constant(_WGM_S1, index=True)
                 _num_wgid_in_group = _c_wgm * _gx
-                _group_id = _wgid / _num_wgid_in_group
+                _group_id = _wgid // _num_wgid_in_group
                 _first_pid_m = _group_id * _c_wgm
                 _remaining_m = _gy - _first_pid_m
                 _cmp_m = arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
@@ -557,7 +557,7 @@ def compile_mixed_moe_gemm1(
 
                 _wgid_in_group = _wgid % _num_wgid_in_group
                 bx_persist = _first_pid_m + (_wgid_in_group % _group_size_m)
-                by = _wgid_in_group / _group_size_m
+                by = _wgid_in_group // _group_size_m
 
             by_n = by * arith.constant(tile_n, index=True)
 
@@ -616,7 +616,7 @@ def compile_mixed_moe_gemm1(
             c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
 
             # X: [tokens, model_dim]
-            x_nbytes_idx = (tokens_in * k_in * c_elem_bytes) / c_a_pack
+            x_nbytes_idx = (tokens_in * k_in * c_elem_bytes) // c_a_pack
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
             x_rsrc = _ptr_buffer_resource(arg_x, x_nbytes_i32)
 
@@ -635,14 +635,14 @@ def compile_mixed_moe_gemm1(
             if const_expr(not (is_f16_a or a_scale_one)):
                 # A scale: [sorted_size, model_dim/32] pre-scattered by caller
                 c32 = arith.constant(32, index=True)
-                kblk = k_in / c32
+                kblk = k_in // c32
                 sx_nbytes_idx = sorted_m * kblk
                 sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
                 sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
 
             if const_expr(not is_f16_b):
                 c32 = arith.constant(32, index=True)
-                kblk_w = k_in / c32
+                kblk_w = k_in // c32
                 mn_w = arith.constant(experts * (2 * inter_dim), index=True)
                 sw_nbytes_idx = mn_w * kblk_w
                 sw_nbytes_i32 = arith.index_cast(T.i32, sw_nbytes_idx)
@@ -674,7 +674,7 @@ def compile_mixed_moe_gemm1(
                 )
                 _sort_padded_rows = (
                     (_sort_rows_idx + arith.constant(255, index=True))
-                    / arith.constant(256, index=True)
+                    // arith.constant(256, index=True)
                     * arith.constant(256, index=True)
                 )
                 _sort_padded_cols = arith.constant(
@@ -720,8 +720,8 @@ def compile_mixed_moe_gemm1(
                 chunk_i32 = x_load_bytes // 4
 
                 c_k_div4 = (
-                    (k_in / c_a_pack) * arith.constant(int(a_elem_bytes), index=True)
-                ) / arith.index(4)
+                    (k_in // c_a_pack) * arith.constant(int(a_elem_bytes), index=True)
+                ) // arith.index(4)
                 tile_k_dwords = (int(tile_k) * int(a_elem_bytes)) // (
                     4 * int(a_elem_vec_pack)
                 )
@@ -786,9 +786,9 @@ def compile_mixed_moe_gemm1(
 
                 def load_x_tile(base_k):
                     base_k_div4 = (
-                        (base_k / c_a_pack)
+                        (base_k // c_a_pack)
                         * arith.constant(int(a_elem_bytes), index=True)
-                    ) / arith.index(4)
+                    ) // arith.index(4)
                     parts = []
                     for i in range_constexpr(num_x_loads):
                         idx_i32 = x_row_base_div4[i] + base_k_div4 + x_col_local_i32[i]
@@ -1110,9 +1110,9 @@ def compile_mixed_moe_gemm1(
                     def dma_x_tile_to_lds(base_k, lds_buffer):
                         c4_idx = arith.index(4)
                         base_k_div4 = (
-                            (base_k / c_a_pack)
+                            (base_k // c_a_pack)
                             * arith.constant(int(elem_bytes), index=True)
-                        ) / arith.index(4)
+                        ) // arith.index(4)
 
                         lds_ptr_i64 = None
                         for i in range_constexpr(_num_dma_loads):
@@ -1162,7 +1162,7 @@ def compile_mixed_moe_gemm1(
                     col_base_swz = (
                         col_base_swz_bytes
                         if elem_bytes == 1
-                        else (col_base_swz_bytes / arith.index(2))
+                        else (col_base_swz_bytes // arith.index(2))
                     )
                     idx_a16 = crd2idx(
                         [fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)], layout_lds
@@ -2307,7 +2307,7 @@ def compile_mixed_moe_gemm1(
                                     byte_k << arith.constant(k * 8, type=T.i32)
                                 )
 
-                            ptr_addr_idx = row_byte_base + col_g0 / arith.constant(
+                            ptr_addr_idx = row_byte_base + col_g0 // arith.constant(
                                 2, index=True
                             )
                             out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
@@ -2491,8 +2491,8 @@ def compile_mixed_moe_gemm1(
                     _gui_eff_n = _gui_out_n
                     _gui_tile_n = tile_n // 2
                     _gui_cshuffle_nlane = min(32, _gui_tile_n // _e_vec)
-                    _gui_by_n = by_n / arith.constant(2, index=True)
-                    _gui_n_tile_base = n_tile_base / arith.constant(2, index=True)
+                    _gui_by_n = by_n // arith.constant(2, index=True)
+                    _gui_n_tile_base = n_tile_base // arith.constant(2, index=True)
                     c_shuffle_epilog(
                         arith=arith,
                         vector=vector,
@@ -2717,12 +2717,12 @@ def compile_mixed_moe_gemm1(
         if const_expr(mock_gate_only or gate_up_interleave):
             gx = (
                 inter_in - inter_dim_pad_total + tile2_pad + tile_n_index - 1
-            ) / tile_n_index
+            ) // tile_n_index
         else:
             gx = (
                 (inter_in - inter_dim_pad_total + tile2_pad + 2 * tile_n_index - 1)
-                / tile_n_index
-                / arith.constant(2, index=True)
+                // tile_n_index
+                // arith.constant(2, index=True)
             )
 
         _c_pm_l = arith.constant(persist_m, index=True)
@@ -2730,7 +2730,7 @@ def compile_mixed_moe_gemm1(
             arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
             + _c_pm_l
             - arith.constant(1, index=True)
-        ) / _c_pm_l
+        ) // _c_pm_l
 
         moe_gemm1(
             arg_out,
@@ -3170,24 +3170,24 @@ def compile_mixed_moe_gemm2(
                 _c1_sw = arith.constant(1, index=True)
                 _c_tn_sw = arith.constant(tile_n, index=True)
                 _c_mdp_sw = arith.constant(model_dim_pad, index=True)
-                _gx = (n_in - _c_mdp_sw + _c_tn_sw - _c1_sw) / _c_tn_sw
+                _gx = (n_in - _c_mdp_sw + _c_tn_sw - _c1_sw) // _c_tn_sw
                 if const_expr(_persistent):
                     _gy = arith.constant(_cu_num, index=True)
                 else:
                     _c_pm_sw = arith.constant(persist_m, index=True)
-                    _gy = (size_expert_ids_in + _c_pm_sw - _c1_sw) / _c_pm_sw
+                    _gy = (size_expert_ids_in + _c_pm_sw - _c1_sw) // _c_pm_sw
 
                 _linear_id = bx_persist * _gx + by_outer
                 _num_wgs = _gx * _gy
 
                 _c_xcds = arith.constant(_NUM_XCDS_S, index=True)
-                _wgs_per_xcd = _num_wgs / _c_xcds
-                _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id / _c_xcds)
+                _wgs_per_xcd = _num_wgs // _c_xcds
+                _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id // _c_xcds)
 
                 _WGM_S = xcd_swizzle
                 _c_wgm = arith.constant(_WGM_S, index=True)
                 _num_wgid_in_group = _c_wgm * _gx
-                _group_id = _wgid / _num_wgid_in_group
+                _group_id = _wgid // _num_wgid_in_group
                 _first_pid_m = _group_id * _c_wgm
                 _remaining_m = _gy - _first_pid_m
                 _cmp_m = arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
@@ -3195,7 +3195,7 @@ def compile_mixed_moe_gemm2(
 
                 _wgid_in_group = _wgid % _num_wgid_in_group
                 bx_persist = _first_pid_m + (_wgid_in_group % _group_size_m)
-                by_outer = _wgid_in_group / _group_size_m
+                by_outer = _wgid_in_group // _group_size_m
 
             by = by_outer
 
@@ -3360,8 +3360,8 @@ def compile_mixed_moe_gemm2(
                 _c_cu = arith.constant(_cu_num, index=True)
                 _c_tm_p = arith.constant(tile_m, index=True)
                 _num_valid_idx = arith.index_cast(ir.IndexType.get(), num_valid_i32)
-                _total_m_tiles = (_num_valid_idx + _c_tm_p - _c1_p) / _c_tm_p
-                _tiles_per_block_base = _total_m_tiles / _c_cu
+                _total_m_tiles = (_num_valid_idx + _c_tm_p - _c1_p) // _c_tm_p
+                _tiles_per_block_base = _total_m_tiles // _c_cu
                 _tiles_remainder = _total_m_tiles - (_tiles_per_block_base * _c_cu)
                 _has_extra_tile = arith.cmpi(
                     CmpIPredicate.ult, bx_persist, _tiles_remainder
@@ -3921,9 +3921,9 @@ def compile_mixed_moe_gemm2(
                     def dma_x_tile_to_lds(base_k, lds_base):
                         c4_idx = arith.index(4)
                         base_k_div4 = (
-                            (base_k / c_a_pack)
+                            (base_k // c_a_pack)
                             * arith.constant(int(elem_bytes), index=True)
-                        ) / arith.index(4)
+                        ) // arith.index(4)
 
                         lds_ptr_i64 = None
                         for i in range_constexpr(_num_dma_loads):
@@ -3975,7 +3975,7 @@ def compile_mixed_moe_gemm2(
                     col_base_swz = (
                         col_base_swz_bytes
                         if elem_bytes == 1
-                        else (col_base_swz_bytes / arith.index(2))
+                        else (col_base_swz_bytes // arith.index(2))
                     )
                     # Pass as list so layout_utils.crd2idx uses static arith path
                     idx_a16 = crd2idx(
@@ -4971,7 +4971,7 @@ def compile_mixed_moe_gemm2(
         _model_dim_pad_idx = arith.constant(model_dim_pad, index=True)
         gx = (
             n_in - _model_dim_pad_idx + _tile_n_idx - arith.constant(1, index=True)
-        ) / _tile_n_idx
+        ) // _tile_n_idx
         if const_expr(_persistent):
             gy = arith.constant(_cu_num, index=True)
         else:
@@ -4980,7 +4980,7 @@ def compile_mixed_moe_gemm2(
                 arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
                 + _c_pm_l
                 - arith.constant(1, index=True)
-            ) / _c_pm_l
+            ) // _c_pm_l
 
         _launcher = moe_gemm2(
             arg_out,

@@ -680,10 +680,10 @@ def compile_moe_gemm1(
                     return parts
 
                 # tx -> wave/lane (GEMM-style decomposition).
-                coord_wl = fx.idx2crd(tx, layout_tx_wave_lane)
+                coord_wl = fx.idx2crd(fx.Int32(tx), layout_tx_wave_lane)
                 wave_id = fx.get(coord_wl, 0)
                 lane_id = fx.get(coord_wl, 1)
-                coord_l16 = fx.idx2crd(lane_id, layout_lane16)
+                coord_l16 = fx.idx2crd(fx.Int32(lane_id), layout_lane16)
                 lane_div_16 = fx.get(coord_l16, 0)
                 lane_mod_16 = fx.get(coord_l16, 1)
 
@@ -728,11 +728,11 @@ def compile_moe_gemm1(
                     row_gate = expert_off_idx + col_g
                     row_up = row_gate + inter_idx
 
-                    coord_gate = fx.idx2crd(row_gate, layout_n_blk_intra)
+                    coord_gate = fx.idx2crd(fx.Int32(row_gate), layout_n_blk_intra)
                     n_blk_gate.append(fx.get(coord_gate, 0))
                     n_intra_gate.append(fx.get(coord_gate, 1))
 
-                    coord_up = fx.idx2crd(row_up, layout_n_blk_intra)
+                    coord_up = fx.idx2crd(fx.Int32(row_up), layout_n_blk_intra)
                     n_blk_up.append(fx.get(coord_up, 0))
                     n_intra_up.append(fx.get(coord_up, 1))
 
@@ -899,7 +899,7 @@ def compile_moe_gemm1(
                         if elem_bytes == 1
                         else (col_base_swz_bytes // arith.index(int(elem_bytes)))
                     )
-                    idx_a16 = crd2idx((curr_row_a_lds, col_base_swz), layout_lds)
+                    idx_a16 = crd2idx((fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)), layout_lds)
                     idx_a16 = idx_a16 + lds_base
                     loaded_a16 = vector.load_op(vec16_x, lds_x, [idx_a16])
                     a_i64x2 = vector.bitcast(T.i64x2, loaded_a16)
@@ -2548,10 +2548,10 @@ def compile_moe_gemm2(
                     return parts
 
                 # tx -> wave/lane (GEMM-style decomposition).
-                coord_wl = fx.idx2crd(tx, layout_tx_wave_lane)
+                coord_wl = fx.idx2crd(fx.Int32(tx), layout_tx_wave_lane)
                 wave_id = fx.get(coord_wl, 0)
                 lane_id = fx.get(coord_wl, 1)
-                coord_l16 = fx.idx2crd(lane_id, layout_lane16)
+                coord_l16 = fx.idx2crd(fx.Int32(lane_id), layout_lane16)
                 lane_div_16 = fx.get(coord_l16, 0)
                 lane_mod_16 = fx.get(coord_l16, 1)
 
@@ -2587,7 +2587,7 @@ def compile_moe_gemm2(
                     col_g_list.append(col_g)
 
                     row_w = expert_off_idx + col_g
-                    coord_w = fx.idx2crd(row_w, layout_n_blk_intra)
+                    coord_w = fx.idx2crd(fx.Int32(row_w), layout_n_blk_intra)
                     n_blk_list.append(fx.get(coord_w, 0))
                     n_intra_list.append(fx.get(coord_w, 1))
 
@@ -2751,7 +2751,7 @@ def compile_moe_gemm2(
                         if elem_bytes == 1
                         else (col_base_swz_bytes // arith.index(int(elem_bytes)))
                     )
-                    idx_a16 = crd2idx((curr_row_a_lds, col_base_swz), layout_lds)
+                    idx_a16 = crd2idx((fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)), layout_lds)
                     idx_a16 = idx_a16 + lds_base
                     loaded_a16 = vector.load_op(vec16_x, lds_x, [idx_a16])
                     a_i64x2 = vector.bitcast(T.i64x2, loaded_a16)
