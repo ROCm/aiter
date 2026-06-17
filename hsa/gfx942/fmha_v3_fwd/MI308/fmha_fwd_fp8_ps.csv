@@ -1,0 +1,2 @@
+dtype,hdim_q,hdim_v,mask,mode,bf16_cvt,ts_qo,ts_kv,ps,knl_name,co_name
+fp8,128,128,2,1,0,256,128,1,_ZN5aiter36fmha_fwd_hd128_fp8_causal_qkptph_vphE,fmha_fwd_hd128_fp8_causal_qkptph_vph_ps.co
