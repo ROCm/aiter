@@ -29,6 +29,7 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, check_smem_capacity
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
+    WGP_BARRIER_ID,
     extract_lds_base_idx,
     get_lds_memref,
     issue_tdm_loads,
@@ -978,12 +979,20 @@ def compile_mxscale_gemm(
                 emit_filler=None,
                 next_bs_info=None,
                 mid_compute_callback=None,
+                pf_a_frags=None,
+                skip_wait=False,
             ):
                 """Half-based A-streaming with zigzag wn ordering.
 
                 When *next_bs_info* is provided, the next K-subtile's B+scale
                 loads are issued BEFORE the s_wait_dscnt so they overlap with
                 the current WMMA execution (partial drain pattern).
+
+                When *pf_a_frags* is provided the A ds_loads for this k-step are
+                skipped — the pre-fetched VGPR values from the previous tile's
+                interleaved post-fetch are used directly.  Combined with
+                *skip_wait*, the current-tile WMMAs run on loop-carried VGPRs
+                while the next tile's ds_loads stay in flight.
                 """
                 next_result = None
                 _front_wm = (wmma_m_rep + 1) // 2
@@ -1008,10 +1017,13 @@ def compile_mxscale_gemm(
                                 b_scales,
                             )
 
-                a_frags_front = [
-                    load_a_frag(a_buf, a_base, wm, ks)
-                    for wm in range_constexpr(_front_wm)
-                ]
+                if const_expr(pf_a_frags is not None):
+                    a_frags_front = pf_a_frags[:_front_wm]
+                else:
+                    a_frags_front = [
+                        load_a_frag(a_buf, a_base, wm, ks)
+                        for wm in range_constexpr(_front_wm)
+                    ]
 
                 _use_partial_drain = (
                     next_bs_info is not None and _front_wm * wmma_n_rep >= 4
@@ -1025,6 +1037,13 @@ def compile_mxscale_gemm(
                         nb_buf, nb_base, nbs_buf, nbs_base, nas_buf, nas_base, n_ks
                     )
                     rocdl.s_wait_dscnt(_bs_ds_loads)
+                elif const_expr(skip_wait):
+                    # Current-tile operands are all loop-carried VGPRs; no
+                    # current-tile ds_loads pending. Wait for ~half of the
+                    # next-tile loads issued by the caller so WMMA starts now and
+                    # the rest keep flying during execution.
+                    _n_pf_per_ks = _bs_ds_loads + wmma_m_rep * DS_LOADS_PER_A_FRAG
+                    rocdl.s_wait_dscnt(_n_pf_per_ks // 2)
                 else:
                     rocdl.s_wait_dscnt(0)
 
@@ -1035,12 +1054,16 @@ def compile_mxscale_gemm(
                     mid_compute_callback()
 
                 if const_expr(_back_wm > 0):
-                    a_frags_back = [
-                        load_a_frag(a_buf, a_base, _front_wm + h, ks)
-                        for h in range_constexpr(_back_wm)
-                    ]
-                    _back_drain = _bs_ds_loads if _use_partial_drain else 0
-                    rocdl.s_wait_dscnt(_back_drain)
+                    if const_expr(pf_a_frags is not None):
+                        a_frags_back = pf_a_frags[_front_wm : _front_wm + _back_wm]
+                    else:
+                        a_frags_back = [
+                            load_a_frag(a_buf, a_base, _front_wm + h, ks)
+                            for h in range_constexpr(_back_wm)
+                        ]
+                    if const_expr(not skip_wait):
+                        _back_drain = _bs_ds_loads if _use_partial_drain else 0
+                        rocdl.s_wait_dscnt(_back_drain)
                     _emit_rows(_front_wm, a_frags_back)
 
                 if const_expr(_use_partial_drain):
@@ -1055,6 +1078,32 @@ def compile_mxscale_gemm(
                     return accs, next_result
                 return accs
 
+            def _issue_pf_all_ks(lds_a, lds_b, lds_bs, lds_as):
+                """Issue every k-step's A/B/scale ds_loads from one LDS tile.
+
+                Returns a list[(a_frags, b_frags, b_scales, a_scales)] of
+                loop-carryable VGPR fragments — one entry per k-step.
+                """
+                _a_buf, _a_base = _precompute_a_lane_bases(lds_a)
+                _b_buf, _b_base = _precompute_b_lane_bases(lds_b)
+                _as_buf, _as_base = _precompute_scale_lane_bases(
+                    lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
+                )
+                _bs_buf, _bs_base = _precompute_scale_lane_bases(
+                    lds_bs, warp_n_base, b_scale_load_rep, interleaved_scale_cols_b
+                )
+                pf = []
+                for ks in range_constexpr(k_wmma_steps):
+                    _b_ks, _bs_ks, _as_ks = _load_b_and_scales(
+                        _b_buf, _b_base, _bs_buf, _bs_base, _as_buf, _as_base, ks
+                    )
+                    _a_ks = [
+                        load_a_frag(_a_buf, _a_base, wm, ks)
+                        for wm in range_constexpr(wmma_m_rep)
+                    ]
+                    pf.append((_a_ks, _b_ks, _bs_ks, _as_ks))
+                return pf
+
             # -- Compute on one LDS buffer --
             def compute_tile(
                 accs_in,
@@ -1064,6 +1113,11 @@ def compile_mxscale_gemm(
                 lds_bs,
                 emit_filler=None,
                 mid_compute_callback=None,
+                pf_all_ks=None,
+                next_lds_a=None,
+                next_lds_b=None,
+                next_lds_bs=None,
+                next_lds_as=None,
             ):
                 current_accs = list(accs_in)
                 a_buf, a_base = _precompute_a_lane_bases(lds_a)
@@ -1074,6 +1128,83 @@ def compile_mxscale_gemm(
                 bs_buf, bs_base = _precompute_scale_lane_bases(
                     lds_bs, warp_n_base, b_scale_load_rep, interleaved_scale_cols_b
                 )
+
+                _has_pf = pf_all_ks is not None
+                _has_next = next_lds_b is not None
+
+                if const_expr(_has_next):
+                    nxt_a_buf, nxt_a_base = _precompute_a_lane_bases(next_lds_a)
+                    nxt_b_buf, nxt_b_base = _precompute_b_lane_bases(next_lds_b)
+                    nxt_as_buf, nxt_as_base = _precompute_scale_lane_bases(
+                        next_lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
+                    )
+                    nxt_bs_buf, nxt_bs_base = _precompute_scale_lane_bases(
+                        next_lds_bs,
+                        warp_n_base,
+                        b_scale_load_rep,
+                        interleaved_scale_cols_b,
+                    )
+
+                if const_expr(_has_pf and _has_next):
+                    # Interleaved prefetch path: for each k-step, issue the NEXT
+                    # tile's ds_loads, then run the CURRENT tile's WMMAs on the
+                    # pre-fetched (loop-carried) VGPRs. LLVM (guided by
+                    # hot_loop_scheduler sched_dsrd/sched_mfma hints) overlaps the
+                    # ds_loads with WMMA latency. Returns (accs, nxt_pf_all_ks).
+                    nxt_pf = []
+                    for ks in range_constexpr(k_wmma_steps):
+                        pf_a_ks, pf_b_ks, pf_bs_ks, pf_as_ks = pf_all_ks[ks]
+                        _mid_cb = mid_compute_callback if ks == 0 else None
+                        _filler = emit_filler if ks == k_wmma_steps - 1 else None
+                        nxt_b_ks, nxt_bs_ks, nxt_as_ks = _load_b_and_scales(
+                            nxt_b_buf,
+                            nxt_b_base,
+                            nxt_bs_buf,
+                            nxt_bs_base,
+                            nxt_as_buf,
+                            nxt_as_base,
+                            ks,
+                        )
+                        nxt_a_ks = [
+                            load_a_frag(nxt_a_buf, nxt_a_base, wm, ks)
+                            for wm in range_constexpr(wmma_m_rep)
+                        ]
+                        nxt_pf.append((nxt_a_ks, nxt_b_ks, nxt_bs_ks, nxt_as_ks))
+                        current_accs = _a_streaming_compute(
+                            current_accs,
+                            a_buf,
+                            a_base,
+                            pf_b_ks,
+                            pf_bs_ks,
+                            pf_as_ks,
+                            ks,
+                            emit_filler=_filler,
+                            mid_compute_callback=_mid_cb,
+                            pf_a_frags=pf_a_ks,
+                            skip_wait=True,
+                        )
+                    return current_accs, nxt_pf
+
+                if const_expr(_has_pf):
+                    # Pre-fetched WMMAs without next-tile prefetch (tail tiles).
+                    for ks in range_constexpr(k_wmma_steps):
+                        pf_a_ks, pf_b_ks, pf_bs_ks, pf_as_ks = pf_all_ks[ks]
+                        _mid_cb = mid_compute_callback if ks == 0 else None
+                        _filler = emit_filler if ks == k_wmma_steps - 1 else None
+                        current_accs = _a_streaming_compute(
+                            current_accs,
+                            a_buf,
+                            a_base,
+                            pf_b_ks,
+                            pf_bs_ks,
+                            pf_as_ks,
+                            ks,
+                            emit_filler=_filler,
+                            mid_compute_callback=_mid_cb,
+                            pf_a_frags=pf_a_ks,
+                            skip_wait=True,
+                        )
+                    return current_accs
 
                 if const_expr(k_wmma_steps == 1):
                     b_frags, b_scales, a_scales = _load_b_and_scales(
@@ -1365,8 +1496,14 @@ def compile_mxscale_gemm(
                 lds_bs,
                 emit_filler=None,
                 mid_compute_callback=None,
+                pf_all_ks=None,
+                next_lds_a=None,
+                next_lds_b=None,
+                next_lds_bs=None,
+                next_lds_as=None,
             ):
                 if const_expr(compute_schedule_kind == COMPUTE_SCHEDULE_FP4_COL_BAND):
+                    # The LDS-prefetch interleave path is ROW_MAJOR_STREAMING only.
                     return compute_tile_fp4_bank_friendly(
                         accs_in,
                         lds_a,
@@ -1384,6 +1521,11 @@ def compile_mxscale_gemm(
                     lds_bs,
                     emit_filler=emit_filler,
                     mid_compute_callback=mid_compute_callback,
+                    pf_all_ks=pf_all_ks,
+                    next_lds_a=next_lds_a,
+                    next_lds_b=next_lds_b,
+                    next_lds_bs=next_lds_bs,
+                    next_lds_as=next_lds_as,
                 )
 
             def hot_loop_scheduler_scheduled():
@@ -2011,6 +2153,15 @@ def compile_mxscale_gemm(
             else:
                 pred_const = arith.constant(1, type=T.i32)
 
+            # TDM descriptor dgroup0 lane layout: [predicate, lds_addr, addr_lo,
+            # addr_hi].  Build as two vec2 halves joined by shuffle so LLVM cannot
+            # reuse a nearby vec4 template (which causes a dead s_mov_b64 for the
+            # upper pair that is immediately overwritten).
+            def _pack_dg0(pred, lds_addr, addr_lo, addr_hi):
+                lo = vector.from_elements(T.vec(2, T.i32), [pred, lds_addr])
+                hi = vector.from_elements(T.vec(2, T.i32), [addr_lo, addr_hi])
+                return vector.shuffle(lo, hi, [0, 1, 2, 3])
+
             if const_expr(wave_specialized_tdm):
                 active_stage_lds_addr = [
                     _select_wave_tdm_value(
@@ -2058,6 +2209,34 @@ def compile_mxscale_gemm(
                 active_adv_i32 = _select_wave_tdm_value(
                     adv_a_i32, adv_b_i32, adv_as_i32, adv_bs_i32
                 )
+
+                # Hoist uniform dg0 components to SGPR once.  readfirstlane marks
+                # each value as "provably uniform" to LLVM's divergence analysis,
+                # so when they are later packed into a dgroup0 vector LLVM
+                # allocates that vector in SGPR space and emits s_mov rather than
+                # v_readfirstlane per tile.
+                _pred_sgpr = rocdl.readfirstlane(T.i32, pred_const)
+                _addr_hi_sgpr = rocdl.readfirstlane(T.i32, active_addr_hi)
+                _stage_lds_sgprs = [
+                    rocdl.readfirstlane(T.i32, v) for v in active_stage_lds_addr
+                ]
+
+                def _issue_active_tdm(load_stage, addr_lo, k_prefetch=None):
+                    # Issue a WS-TDM load using pre-computed addr_lo (SGPR).  The
+                    # caller advances addr_lo AFTER this call (via active_adv_i32)
+                    # so the s_add_co_i32 happens in the compute window, not on
+                    # the critical path just before TDM.
+                    dg0 = _pack_dg0(
+                        _pred_sgpr,
+                        _stage_lds_sgprs[load_stage],
+                        addr_lo,
+                        _addr_hi_sgpr,
+                    )
+                    tdm_ops.tensor_load_2d(
+                        tdm_ops.TDMDescriptor2D(dg0, active_dgroup1)
+                    )
+                    if k_prefetch is not None:
+                        _l2_prefetch(k_prefetch)
             else:
                 addr_lo_a = vector.extract(
                     desc_a_init.dgroup0, static_position=[2], dynamic_position=[]
@@ -2120,53 +2299,36 @@ def compile_mxscale_gemm(
             # Prologue
             if const_expr(wave_specialized_tdm):
                 for i in range_constexpr(pre_loaded):
-                    dg0 = vector.from_elements(
-                        T.vec(4, T.i32),
-                        [
-                            pred_const,
-                            active_stage_lds_addr[i],
-                            active_addr_lo,
-                            active_addr_hi,
-                        ],
-                    )
-                    tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0, active_dgroup1))
+                    _issue_active_tdm(i, active_addr_lo)
+                    # Advance right after TDM: s_add_co_i32 runs during the
+                    # subsequent compute window, not on the next TDM's critical path.
                     active_addr_lo = arith.addi(active_addr_lo, active_adv_i32)
             else:
                 for i in range_constexpr(pre_loaded):
-                    dg0_a = vector.from_elements(
-                        T.vec(4, T.i32),
-                        [pred_const, stages_a_lds_addr[i], addr_lo_a, addr_hi_a],
+                    dg0_a = _pack_dg0(
+                        pred_const, stages_a_lds_addr[i], addr_lo_a, addr_hi_a
                     )
-                    dg0_b = vector.from_elements(
-                        T.vec(4, T.i32),
-                        [pred_const, stages_b_lds_addr[i], addr_lo_b, addr_hi_b],
+                    dg0_b = _pack_dg0(
+                        pred_const, stages_b_lds_addr[i], addr_lo_b, addr_hi_b
                     )
-                    dg0_as = vector.from_elements(
-                        T.vec(4, T.i32),
-                        [pred_const, stages_as_lds_addr[i], addr_lo_as, addr_hi_as],
+                    dg0_as = _pack_dg0(
+                        pred_const, stages_as_lds_addr[i], addr_lo_as, addr_hi_as
                     )
-                    dg0_bs = vector.from_elements(
-                        T.vec(4, T.i32),
-                        [pred_const, stages_bs_lds_addr[i], addr_lo_bs, addr_hi_bs],
+                    dg0_bs = _pack_dg0(
+                        pred_const, stages_bs_lds_addr[i], addr_lo_bs, addr_hi_bs
                     )
                     if const_expr(stage1_dual_b):
-                        dg0_b_up = vector.from_elements(
-                            T.vec(4, T.i32),
-                            [
-                                pred_const,
-                                stages_b_up_lds_addr[i],
-                                addr_lo_b_up,
-                                addr_hi_b_up,
-                            ],
+                        dg0_b_up = _pack_dg0(
+                            pred_const,
+                            stages_b_up_lds_addr[i],
+                            addr_lo_b_up,
+                            addr_hi_b_up,
                         )
-                        dg0_bs_up = vector.from_elements(
-                            T.vec(4, T.i32),
-                            [
-                                pred_const,
-                                stages_bs_up_lds_addr[i],
-                                addr_lo_bs_up,
-                                addr_hi_bs_up,
-                            ],
+                        dg0_bs_up = _pack_dg0(
+                            pred_const,
+                            stages_bs_up_lds_addr[i],
+                            addr_lo_bs_up,
+                            addr_hi_bs_up,
                         )
 
                     issue_tdm_loads(
@@ -2214,64 +2376,174 @@ def compile_mxscale_gemm(
             # This overlaps TDM DMA with the remaining WMMA instructions,
             _fence_outstanding = TDM_LOADS_PER_STEP * (num_buffers - 2)
 
+            # LDS-prefetch interleaving: on the WS-TDM ROW_MAJOR_STREAMING path,
+            # the next tile's ds_loads are issued inside the current tile's WMMA
+            # window and carried in VGPRs, so each tile's compute starts with its
+            # operands already resident (no s_wait_dscnt(0) stall at tile entry).
+            _use_lds_pf = (
+                wave_specialized_tdm
+                and compute_schedule_kind == COMPUTE_SCHEDULE_ROW_MAJOR_STREAMING
+                and os.environ.get("AITER_GROUPED_LDS_PF", "1") == "1"
+            )
+
+            if const_expr(_use_lds_pf):
+                _n_pf_a_per_ks = wmma_m_rep
+                _n_pf_b_per_ks = wmma_n_rep
+                if const_expr(use_scale_opsel):
+                    _n_pf_bs_per_ks = (b_scale_load_rep + 1) // 2
+                    _n_pf_as_per_ks = (wmma_m_rep + 1) // 2
+                else:
+                    _n_pf_bs_per_ks = b_scale_load_rep
+                    _n_pf_as_per_ks = wmma_m_rep
+                _n_pf_per_ks = (
+                    _n_pf_a_per_ks
+                    + _n_pf_b_per_ks
+                    + _n_pf_bs_per_ks
+                    + _n_pf_as_per_ks
+                )
+                _n_pf_total = k_wmma_steps * _n_pf_per_ks
+
+                def _pf_all_ks_to_flat(pf_all_ks):
+                    flat = []
+                    for (a_frags, b_frags, b_scales, a_scales) in pf_all_ks:
+                        flat.extend(a_frags)
+                        flat.extend(b_frags)
+                        flat.extend(b_scales)
+                        flat.extend(a_scales)
+                    return flat
+
+                def _flat_to_pf_all_ks(state, base):
+                    result = []
+                    idx = base
+                    for _ in range_constexpr(k_wmma_steps):
+                        a_frags = list(state[idx : idx + _n_pf_a_per_ks])
+                        idx += _n_pf_a_per_ks
+                        b_frags = list(state[idx : idx + _n_pf_b_per_ks])
+                        idx += _n_pf_b_per_ks
+                        b_scales = list(state[idx : idx + _n_pf_bs_per_ks])
+                        idx += _n_pf_bs_per_ks
+                        a_scales = list(state[idx : idx + _n_pf_as_per_ks])
+                        idx += _n_pf_as_per_ks
+                        result.append((a_frags, b_frags, b_scales, a_scales))
+                    return result
+
+            # Loop-carried prefetch operands for the first tail tile (seeded by
+            # the main loop's last iteration, or directly below when loop_iters==0).
+            _tail_pf_all_ks = None
+
             if const_expr(loop_iters > 0):
                 if const_expr(wave_specialized_tdm):
-                    init_args = list(accs) + [active_addr_lo]
+                    if const_expr(_use_lds_pf):
+                        # Drain this wave's prologue TDMs, then barrier so every
+                        # wave's LDS writes are visible before any wave ds_loads.
+                        rocdl.s_wait_tensorcnt(0)
+                        rocdl.s_barrier_signal(WGP_BARRIER_ID)
+                        rocdl.s_barrier_wait(WGP_BARRIER_ID)
+                        _pf_init = _issue_pf_all_ks(
+                            stages_a_idx[0],
+                            stages_b_idx[0],
+                            stages_bs_idx[0],
+                            stages_as_idx[0],
+                        )
+                        _pf_init_flat = _pf_all_ks_to_flat(_pf_init)
+                    else:
+                        _pf_init_flat = []
+
+                    init_args = list(accs) + [active_addr_lo] + _pf_init_flat
 
                     for loop_iter, state in range(0, loop_iters, 1, init=init_args):
                         accs_in = list(state[:n_accs])
                         cur_addr_lo = state[n_accs]
 
+                        if const_expr(_use_lds_pf):
+                            _pf_base = n_accs + 1
+                            _cur_pf_all_ks = _flat_to_pf_all_ks(state, _pf_base)
+                        else:
+                            _cur_pf_all_ks = None
+
                         for buf_idx in range_constexpr(num_buffers):
                             load_stage = (buf_idx + num_buffers - 1) % num_buffers
+                            next_buf = (buf_idx + 1) % num_buffers
 
-                            pipeline_fence_signal(
-                                outstanding=_fence_outstanding, use_cluster=use_cluster
-                            )
-                            pipeline_fence_wait(use_cluster=use_cluster)
-
-                            addr_box = [cur_addr_lo]
-
-                            def _mid_tdm_ws(
-                                _ls=load_stage,
-                                _ab=addr_box,
-                                _k_off=(
+                            if const_expr(_use_lds_pf):
+                                # TDM hoisted BEFORE fence: the next tile's ds_load
+                                # prefetch (issued inside compute) must read a stage
+                                # whose TDM has already completed, so the TDM cannot
+                                # sit mid-compute as in the non-pf path.
+                                _k_off_tdm = (
                                     split_k_base
                                     + loop_iter * arith.index(num_buffers * tile_k)
                                     + arith.index(buf_idx * tile_k)
-                                ),
-                            ):
-                                dg0 = vector.from_elements(
-                                    T.vec(4, T.i32),
-                                    [
-                                        pred_const,
-                                        active_stage_lds_addr[_ls],
-                                        _ab[0],
-                                        active_addr_hi,
-                                    ],
                                 )
-                                tdm_ops.tensor_load_2d(
-                                    tdm_ops.TDMDescriptor2D(dg0, active_dgroup1)
+                                _issue_active_tdm(
+                                    load_stage, cur_addr_lo, k_prefetch=_k_off_tdm
                                 )
-                                _ab[0] = arith.addi(_ab[0], active_adv_i32)
-                                _l2_prefetch(_k_off)
+                                cur_addr_lo = arith.addi(cur_addr_lo, active_adv_i32)
 
-                            rocdl.sched_barrier(0)
-                            accs_in = compute_tile_scheduled(
-                                accs_in,
-                                stages_a_idx[buf_idx],
-                                stages_b_idx[buf_idx],
-                                stages_as_idx[buf_idx],
-                                stages_bs_idx[buf_idx],
-                                mid_compute_callback=_mid_tdm_ws,
-                            )
-                            cur_addr_lo = addr_box[0]
+                                pipeline_fence_signal(
+                                    outstanding=_fence_outstanding,
+                                    use_cluster=use_cluster,
+                                )
+                                pipeline_fence_wait(use_cluster=use_cluster)
+
+                                rocdl.sched_barrier(0)
+                                accs_in, _cur_pf_all_ks = compute_tile_scheduled(
+                                    accs_in,
+                                    stages_a_idx[buf_idx],
+                                    stages_b_idx[buf_idx],
+                                    stages_as_idx[buf_idx],
+                                    stages_bs_idx[buf_idx],
+                                    pf_all_ks=_cur_pf_all_ks,
+                                    next_lds_a=stages_a_idx[next_buf],
+                                    next_lds_b=stages_b_idx[next_buf],
+                                    next_lds_bs=stages_bs_idx[next_buf],
+                                    next_lds_as=stages_as_idx[next_buf],
+                                )
+                            else:
+                                pipeline_fence_signal(
+                                    outstanding=_fence_outstanding,
+                                    use_cluster=use_cluster,
+                                )
+                                pipeline_fence_wait(use_cluster=use_cluster)
+
+                                addr_box = [cur_addr_lo]
+
+                                def _mid_tdm_ws(
+                                    _ls=load_stage,
+                                    _ab=addr_box,
+                                    _k_off=(
+                                        split_k_base
+                                        + loop_iter * arith.index(num_buffers * tile_k)
+                                        + arith.index(buf_idx * tile_k)
+                                    ),
+                                ):
+                                    _issue_active_tdm(_ls, _ab[0], k_prefetch=_k_off)
+                                    _ab[0] = arith.addi(_ab[0], active_adv_i32)
+
+                                rocdl.sched_barrier(0)
+                                accs_in = compute_tile_scheduled(
+                                    accs_in,
+                                    stages_a_idx[buf_idx],
+                                    stages_b_idx[buf_idx],
+                                    stages_as_idx[buf_idx],
+                                    stages_bs_idx[buf_idx],
+                                    mid_compute_callback=_mid_tdm_ws,
+                                )
+                                cur_addr_lo = addr_box[0]
                             hot_loop_scheduler_scheduled()
 
-                        results = yield list(accs_in) + [cur_addr_lo]
+                        if const_expr(_use_lds_pf):
+                            _pf_yield = _pf_all_ks_to_flat(_cur_pf_all_ks)
+                        else:
+                            _pf_yield = []
+                        results = yield list(accs_in) + [cur_addr_lo] + _pf_yield
 
                     accs = list(results[:n_accs])
                     active_addr_lo = results[n_accs]
+                    if const_expr(_use_lds_pf):
+                        _tail_pf_all_ks = _flat_to_pf_all_ks(results, _pf_base)
+                    else:
+                        _tail_pf_all_ks = None
                 else:
                     if const_expr(stage1_dual_b):
                         init_args = (
@@ -2366,61 +2638,43 @@ def compile_mxscale_gemm(
                                     + arith.index(buf_idx * tile_k)
                                 ),
                             ):
-                                dg0_a = vector.from_elements(
-                                    T.vec(4, T.i32),
-                                    [
-                                        pred_const,
-                                        stages_a_lds_addr[_ls],
-                                        _ab[0][0],
-                                        _ab[0][1],
-                                    ],
+                                dg0_a = _pack_dg0(
+                                    pred_const,
+                                    stages_a_lds_addr[_ls],
+                                    _ab[0][0],
+                                    _ab[0][1],
                                 )
-                                dg0_b = vector.from_elements(
-                                    T.vec(4, T.i32),
-                                    [
-                                        pred_const,
-                                        stages_b_lds_addr[_ls],
-                                        _ab[1][0],
-                                        _ab[1][1],
-                                    ],
+                                dg0_b = _pack_dg0(
+                                    pred_const,
+                                    stages_b_lds_addr[_ls],
+                                    _ab[1][0],
+                                    _ab[1][1],
                                 )
                                 if const_expr(stage1_dual_b):
-                                    dg0_b_up = vector.from_elements(
-                                        T.vec(4, T.i32),
-                                        [
-                                            pred_const,
-                                            stages_b_up_lds_addr[_ls],
-                                            _ab[2][0],
-                                            _ab[2][1],
-                                        ],
+                                    dg0_b_up = _pack_dg0(
+                                        pred_const,
+                                        stages_b_up_lds_addr[_ls],
+                                        _ab[2][0],
+                                        _ab[2][1],
                                     )
-                                dg0_as = vector.from_elements(
-                                    T.vec(4, T.i32),
-                                    [
-                                        pred_const,
-                                        stages_as_lds_addr[_ls],
-                                        _ab[3][0] if stage1_dual_b else _ab[2][0],
-                                        _ab[3][1] if stage1_dual_b else _ab[2][1],
-                                    ],
+                                dg0_as = _pack_dg0(
+                                    pred_const,
+                                    stages_as_lds_addr[_ls],
+                                    _ab[3][0] if stage1_dual_b else _ab[2][0],
+                                    _ab[3][1] if stage1_dual_b else _ab[2][1],
                                 )
-                                dg0_bs = vector.from_elements(
-                                    T.vec(4, T.i32),
-                                    [
-                                        pred_const,
-                                        stages_bs_lds_addr[_ls],
-                                        _ab[4][0] if stage1_dual_b else _ab[3][0],
-                                        _ab[4][1] if stage1_dual_b else _ab[3][1],
-                                    ],
+                                dg0_bs = _pack_dg0(
+                                    pred_const,
+                                    stages_bs_lds_addr[_ls],
+                                    _ab[4][0] if stage1_dual_b else _ab[3][0],
+                                    _ab[4][1] if stage1_dual_b else _ab[3][1],
                                 )
                                 if const_expr(stage1_dual_b):
-                                    dg0_bs_up = vector.from_elements(
-                                        T.vec(4, T.i32),
-                                        [
-                                            pred_const,
-                                            stages_bs_up_lds_addr[_ls],
-                                            _ab[5][0],
-                                            _ab[5][1],
-                                        ],
+                                    dg0_bs_up = _pack_dg0(
+                                        pred_const,
+                                        stages_bs_up_lds_addr[_ls],
+                                        _ab[5][0],
+                                        _ab[5][1],
                                     )
                                 issue_tdm_loads(
                                     tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a),
@@ -2562,6 +2816,21 @@ def compile_mxscale_gemm(
                         addr_lo_bs = results[n_accs + 6]
                         addr_hi_bs = results[n_accs + 7]
 
+            # When loop_iters == 0 the main loop never runs, so _tail_pf_all_ks was
+            # never seeded. Seed it here like the main-loop prologue: drain prologue
+            # TDMs, barrier, then issue the first compute stage's ds_loads so the
+            # tail's interleaved-prefetch path carries operands across tail tiles.
+            if const_expr(loop_iters == 0 and _use_lds_pf):
+                rocdl.s_wait_tensorcnt(0)
+                rocdl.s_barrier_signal(WGP_BARRIER_ID)
+                rocdl.s_barrier_wait(WGP_BARRIER_ID)
+                _tail_pf_all_ks = _issue_pf_all_ks(
+                    stages_a_idx[0],
+                    stages_b_idx[0],
+                    stages_bs_idx[0],
+                    stages_as_idx[0],
+                )
+
             # Tail -- same acc_mixed pattern: fence at top, TDM mid-compute.
             if const_expr(loop_iters > 0):
                 pipeline_fence(outstanding=0, use_cluster=use_cluster)
@@ -2569,10 +2838,34 @@ def compile_mxscale_gemm(
                 gpu.cluster_barrier()
             epi_addrs_box = [None]
             _tail_had_load = False
-            for _load_stage, _compute_stage, _outstanding in tail_plan:
+
+            # Pre-expand tail_plan with each entry's NEXT active compute stage so
+            # the LDS-prefetch path can chain pf operands across tail tiles without
+            # a dict lookup inside the traced loop.
+            _tail_plan_ext = []
+            _tail_plan_active_cs = [cs for ls, cs, out in tail_plan if out != -1]
+            for ls, cs, out in tail_plan:
+                _next_cs = None
+                if out != -1:
+                    _apos = _tail_plan_active_cs.index(cs)
+                    if _apos + 1 < len(_tail_plan_active_cs):
+                        _next_cs = _tail_plan_active_cs[_apos + 1]
+                _tail_plan_ext.append((ls, cs, out, _next_cs))
+
+            for _load_stage, _compute_stage, _outstanding, _tail_next_cs in (
+                _tail_plan_ext
+            ):
                 if const_expr(_outstanding == -1):
                     if const_expr(_tail_had_load):
                         pipeline_fence(outstanding=0, use_cluster=use_cluster)
+                    # Final tail tile: no next tile to overlap, but if a prior tile
+                    # (or the main loop) pre-fetched this tile's operands, consume
+                    # them so compute_tile uses skip_wait instead of serial waits.
+                    _last_pf = (
+                        _tail_pf_all_ks
+                        if (_use_lds_pf and _tail_pf_all_ks is not None)
+                        else None
+                    )
                     if const_expr(use_tdm_store):
                         accs = compute_tile_scheduled(
                             accs,
@@ -2580,6 +2873,7 @@ def compile_mxscale_gemm(
                             stages_b_idx[_compute_stage],
                             stages_as_idx[_compute_stage],
                             stages_bs_idx[_compute_stage],
+                            pf_all_ks=_last_pf,
                         )
                     else:
 
@@ -2615,18 +2909,7 @@ def compile_mxscale_gemm(
                             _tail_addr_box = [active_addr_lo]
 
                             def _tail_mid_ws(_ls=_load_stage, _ab=_tail_addr_box):
-                                dg0 = vector.from_elements(
-                                    T.vec(4, T.i32),
-                                    [
-                                        pred_const,
-                                        active_stage_lds_addr[_ls],
-                                        _ab[0],
-                                        active_addr_hi,
-                                    ],
-                                )
-                                tdm_ops.tensor_load_2d(
-                                    tdm_ops.TDMDescriptor2D(dg0, active_dgroup1)
-                                )
+                                _issue_active_tdm(_ls, _ab[0])
                                 _ab[0] = arith.addi(_ab[0], active_adv_i32)
 
                             _tail_mid_cb = _tail_mid_ws
@@ -2685,14 +2968,44 @@ def compile_mxscale_gemm(
                             _tail_mid_cb = _tail_mid_nws
 
                     rocdl.sched_barrier(0)
-                    accs = compute_tile_scheduled(
-                        accs,
-                        stages_a_idx[_compute_stage],
-                        stages_b_idx[_compute_stage],
-                        stages_as_idx[_compute_stage],
-                        stages_bs_idx[_compute_stage],
-                        mid_compute_callback=_tail_mid_cb,
-                    )
+                    _use_tail_pf = _use_lds_pf and _tail_pf_all_ks is not None
+                    _has_tail_next = _tail_next_cs is not None
+                    if const_expr(_use_tail_pf and _has_tail_next):
+                        # Consume carried pf for the current tile, issue the next
+                        # active tail tile's ds_loads, and carry the result forward.
+                        accs, _tail_pf_all_ks = compute_tile_scheduled(
+                            accs,
+                            stages_a_idx[_compute_stage],
+                            stages_b_idx[_compute_stage],
+                            stages_as_idx[_compute_stage],
+                            stages_bs_idx[_compute_stage],
+                            mid_compute_callback=_tail_mid_cb,
+                            pf_all_ks=_tail_pf_all_ks,
+                            next_lds_a=stages_a_idx[_tail_next_cs],
+                            next_lds_b=stages_b_idx[_tail_next_cs],
+                            next_lds_bs=stages_bs_idx[_tail_next_cs],
+                            next_lds_as=stages_as_idx[_tail_next_cs],
+                        )
+                    elif const_expr(_use_tail_pf):
+                        accs = compute_tile_scheduled(
+                            accs,
+                            stages_a_idx[_compute_stage],
+                            stages_b_idx[_compute_stage],
+                            stages_as_idx[_compute_stage],
+                            stages_bs_idx[_compute_stage],
+                            mid_compute_callback=_tail_mid_cb,
+                            pf_all_ks=_tail_pf_all_ks,
+                        )
+                        _tail_pf_all_ks = None
+                    else:
+                        accs = compute_tile_scheduled(
+                            accs,
+                            stages_a_idx[_compute_stage],
+                            stages_b_idx[_compute_stage],
+                            stages_as_idx[_compute_stage],
+                            stages_bs_idx[_compute_stage],
+                            mid_compute_callback=_tail_mid_cb,
+                        )
                     if const_expr(stage1_dual_b):
                         hot_loop_scheduler_scheduled()
                         accs_up = compute_tile_scheduled(

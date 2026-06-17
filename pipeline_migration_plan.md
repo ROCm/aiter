@@ -69,22 +69,39 @@ aiter 的 MoE grouped GEMM kernel (`aiter/ops/flydsl/kernels/gemm_mxscale_gfx125
 5. **`epilogue_bias`**: per-expert bias
 6. **`grouped_masked_m` / `m_tile_prefix` / `m_tile_map`**: per-expert variable M
 
+## 实施进度
+
+- **Phase 1 ✅ 已完成 + 已验证**（2026-06-17）
+- **Phase 6 ✅ 已完成**（`_pack_dg0` 替换 NWS 路径，与 Phase 1 一并做）
+- **WS-TDM 启用开关 ✅ 已加**：`AITER_GROUPED_WS_TDM=1` 让 stage2 走 WS-TDM（`grouped_moe_gfx1250.py`）。stage1 因 act 融合自动禁用；要求 `m_warp*n_warp==4` 且 `split_k2==1`。
+- **WS-TDM 已通过 ISA 验证真正启用**（2026-06-17）：对比 `kernel_mxscale_gemm2` 的 final ISA，WS-on vs WS-off：`tensor_load` 16→4（每 wave 专精一个 tensor）、`readfirstlane` 37→5（Phase 1 SGPR hoisting 生效）、`s_mov_b64` 5→2（`_pack_dg0` 生效）、ISA 1139→950 行。数值 rel_l2=2.74e-3 与 NWS 一致。
+
+### Phase 2 关键发现（重要架构错配）
+
+调查后发现计划与 aiter 实际架构有错配，**Phase 2 的多数子项对 aiter 不适用**：
+
+1. **「TDM before fence」只在 WS 路径**：FlyDSL 的 NWS 路径同样把 TDM 放在 `_mid_tdm_nws` callback 里（fence 后），与 aiter 现状**完全一致**，无需改。aiter 的 WS 路径目前仍用 `_mid_tdm_ws` callback（Phase 1 已统一走 `_issue_active_tdm`），可选择性提前。
+2. **`use_ws_tdm_split_signal_overlap` + `late_compute_callback` + `a0_prefetch` 依赖 fp8 schedule**：FlyDSL 这些只在 `compute_tile_fp8_quadrant` / `compute_tile_fp8_deep_pipeline` 里实现。aiter **只有 `ROW_MAJOR_STREAMING` 和 `FP4_COL_BAND` 两种 schedule，没有 fp8 schedule**，移植后是 dead code。
+3. **真正有移植价值的是 Phase 3**：`_use_lds_pf`（LDS prefetch interleaving）针对 `ROW_MAJOR_STREAMING`，aiter 有这个 schedule，但需要给 aiter 的 `compute_tile` 加 `pf_all_ks` / `next_lds_*` 支持。
+
+**结论**：Phase 2 跳过 fp8-only 子项（4、5），核心「TDM 提前」对 aiter WS 路径可做但收益有限（NWS 已一致）。重点转向 **Phase 3**（LDS prefetch），这是 aiter 上唯一有明确性能潜力的移植项。
+
 ## 实施顺序
 
-### Phase 1: 基础工具函数（低风险）
-1. 添加 `_pack_dg0` helper 到 aiter 的 `gemm_mxscale_gfx1250.py`
-2. 将所有 `vector.from_elements(T.vec(4, T.i32), [...])` 构建 dg0 的地方替换为 `_pack_dg0`
-3. 添加 `readfirstlane` SGPR hoisting（WS-TDM prologue 前）
-4. 添加 `_issue_active_tdm` helper（封装 WS-TDM load 发射）
+### Phase 1: 基础工具函数（低风险）— ✅ 已完成
+1. ✅ 添加 `_pack_dg0` helper 到 aiter 的 `gemm_mxscale_gfx1250.py`
+2. ✅ 将所有 `vector.from_elements(T.vec(4, T.i32), [...])` 构建 dg0 的地方替换为 `_pack_dg0`
+3. ✅ 添加 `readfirstlane` SGPR hoisting（WS-TDM prologue 前）
+4. ✅ 添加 `_issue_active_tdm` helper（封装 WS-TDM load 发射）
 
-### Phase 2: WS-TDM 主循环重构（核心改动）
-1. 将 TDM 发射从 `_mid_tdm_ws` callback 提取到循环体顶部（fence 之前）
-2. addr advance 紧跟 TDM
-3. fence_signal + fence_wait 在 TDM 之后
-4. 添加 `use_ws_tdm_split_signal_overlap` 延迟 signal 路径
-5. 添加 `a0_prefetch` / `maybe_prefetch_fp8_deep_a0` 传递
+### Phase 2: WS-TDM 主循环重构 — ⚠️ 大部分不适用 aiter（见上方关键发现）
+1. ⏭️ TDM 提前到循环顶部：NWS 已与 FlyDSL 一致；WS 路径可选做，收益有限
+2. ⏭️ addr advance 紧跟 TDM：同上
+3. ⏭️ fence_signal/wait 时序：aiter 现状已合理
+4. ❌ `use_ws_tdm_split_signal_overlap`：依赖 fp8 schedule，aiter 无，跳过
+5. ❌ `a0_prefetch` / `maybe_prefetch_fp8_deep_a0`：依赖 fp8 deep pipeline，aiter 无，跳过
 
-### Phase 3: LDS prefetch 路径（WS-TDM only）
+### Phase 3: LDS prefetch 路径（WS-TDM only）— 🚧 进行中（aiter 上的重点）
 1. 添加 `_use_lds_pf` 条件判断
 2. 添加 `_pf_all_ks_to_flat`, `_flat_to_pf_all_ks`, `_issue_pf_all_ks` helpers
 3. 主循环增加 pf_flat loop-carry

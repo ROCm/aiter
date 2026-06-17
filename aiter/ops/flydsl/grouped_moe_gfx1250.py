@@ -963,6 +963,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         else compile_moe_grouped_gemm2_a8w4_masked
     )
     _grouped_dbg("start stage2 compile")
+    # Experimental: opt stage2 into the wave-specialized TDM pipeline. Stage2 has
+    # no fused activation, so WS-TDM is eligible (stage1 auto-disables it).
+    # Requires m_warp*n_warp == 4 (the kernel enforces 4 waves) and split_k == 1.
+    _ws_tdm_requested = os.environ.get("AITER_GROUPED_WS_TDM", "0") == "1"
+    _ws_tdm_stage2 = _ws_tdm_requested and m_warp * n_warp == 4 and split_k2 == 1
+    if _ws_tdm_requested:
+        _grouped_dbg(
+            f"[ws-tdm] stage2 wave_specialized_tdm={_ws_tdm_stage2} "
+            f"(m_warp*n_warp={m_warp * n_warp} need 4, split_k2={split_k2} need 1)"
+        )
     stage2 = stage2_compiler(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -980,6 +990,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_persistent_m=effective_grouped_persistent_m,
         grouped_contiguous_m=effective_grouped_contiguous_m,
         persistent_workers=persistent_workers,
+        wave_specialized_tdm=_ws_tdm_stage2,
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None

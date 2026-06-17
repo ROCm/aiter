@@ -683,9 +683,18 @@ def _bench(args: argparse.Namespace) -> None:
             print(f"[bench] chrome trace -> {trace_path}", flush=True)
 
         # run_perftest returns (data, avg_us); the timing is the second value.
-        _, us = run_perftest(_thunk, num_warmup=args.warmup, num_iters=args.iters)
+        # --cuda-graph: capture+replay the call in a CUDA graph so the reported
+        # time excludes host-side launch overhead (pure device work).
+        use_graph = getattr(args, "cuda_graph", False)
+        _, us = run_perftest(
+            _thunk,
+            num_warmup=args.warmup,
+            num_iters=args.iters,
+            testGraph=use_graph,
+        )
         print(
-            f"[bench] {args.data_format}/{args.layout} fused_moe end-to-end us = {us:.2f}",
+            f"[bench] {args.data_format}/{args.layout} fused_moe "
+            f"{'cudagraph' if use_graph else 'end-to-end'} us = {us:.2f}",
             flush=True,
         )
     finally:
@@ -777,6 +786,20 @@ def main() -> None:
         help="(verify only) hidden=1, weight bytes=0x22 (=+1.0), "
         "scale=127 (=2^0), bias=0. Expect rel_l2 < 0.01 since both "
         "grouped and ref see the exact same dequantised values.",
+    )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        default=True,
+        help="(bench only, default on) capture the fused_moe call into a CUDA "
+        "graph and time graph replay instead of per-iter eager launches. "
+        "Removes host launch overhead so timing reflects pure device work.",
+    )
+    parser.add_argument(
+        "--no-cuda-graph",
+        dest="cuda_graph",
+        action="store_false",
+        help="(bench only) disable CUDA graph; time eager per-iter launches.",
     )
     args = parser.parse_args()
     if not args.real_gemm:
