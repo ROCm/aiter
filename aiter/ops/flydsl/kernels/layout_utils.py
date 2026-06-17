@@ -141,24 +141,10 @@ def crd2idx(crd, layout):
         crd_i32 = []
         for c in crd:
             cv = c
-            if isinstance(cv, int):
-                cv = arith.constant(cv, T.i32)
-                crd_i32.append(cv)
-                continue
             if isinstance(cv, ArithValue):
-                raw = cv.ir_value() if hasattr(cv, "ir_value") else cv
-                if isinstance(raw, ir.Value) and isinstance(raw.type, ir.IndexType):
-                    cv = arith.index_cast(T.i32, raw)
-                else:
-                    cv = raw
-            elif isinstance(cv, ir.Value) and isinstance(cv.type, ir.IndexType):
+                cv = cv.ir_value() if hasattr(cv, "ir_value") else cv
+            if isinstance(cv, ir.Value) and isinstance(cv.type, ir.IndexType):
                 cv = arith.index_cast(T.i32, cv)
-            elif hasattr(cv, "ir_value"):
-                raw = cv.ir_value()
-                if isinstance(raw, ir.Value) and isinstance(raw.type, ir.IndexType):
-                    cv = arith.index_cast(T.i32, raw)
-                else:
-                    cv = raw
             crd_i32.append(cv)
         coord_val = fx.make_coord(*crd_i32)
         scalar = fx.get_scalar(fx.crd2idx(coord_val, layout)).ir_value()
