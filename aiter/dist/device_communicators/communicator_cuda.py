@@ -60,6 +60,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     _ar_1stage_override = {"1": True, "0": False}.get(
         os.environ.get("AITER_AR_1STAGE", "")
     )
+    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", 128))
 
     def __init__(
         self,
@@ -280,7 +281,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         use_1stage = (
             self._ar_1stage_override
             if self._ar_1stage_override is not None
-            else (total_bytes <= 128 * 1024)
+            else (total_bytes <= self._ar_1stage_max_kb * 1024)
         )
         if (
             not use_general_path
@@ -413,16 +414,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
         if emit_bf16:
             raise ValueError("emit_bf16 is not supported for per-token FP8 quant")
-        total_bytes = input_.numel() * input_.element_size()
+        hidden_dim = int(input_.shape[-1])
+        element_size = input_.element_size()
+        total_bytes = input_.numel() * element_size
         if (
-            int(input_.shape[-1]) in [512, 1024, 2048, 4096]
+            (
+                hidden_dim in [512, 1024, 2048, 4096]
+                or (
+                    hidden_dim == 7168
+                    and input_.dtype in (torch.float16, torch.bfloat16)
+                )
+            )
             and total_bytes <= 4096 * 1024
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
+                else (total_bytes <= self._ar_1stage_max_kb * 1024)
             )
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
                 input_, res_inp_, weight_, eps, use_1stage
@@ -472,7 +481,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
+                else (total_bytes <= self._ar_1stage_max_kb * 1024)
             )
             result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
                 input_,
