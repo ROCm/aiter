@@ -43,12 +43,9 @@ from aiter.fused_moe import (  # noqa: E402
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.ops.flydsl.grouped_moe_gfx1250 import (  # noqa: E402
-    _grouped_b_scale_prepare_batch,
-)
 from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402
 from aiter.ops.quant import per_1x32_f4_quant  # noqa: E402
-from aiter.ops.shuffle import shuffle_weight  # noqa: E402
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight  # noqa: E402
 from aiter.utility import fp4_utils  # noqa: E402
 from aiter.utility import dtypes  # noqa: E402
 
@@ -102,8 +99,9 @@ def is_gfx1250() -> bool:
 # byte-for-byte equivalent to the FP4 TDM B layout the grouped FlyDSL
 # kernels consume (16-row * 16-byte chunks). We use that public API
 # directly. Scale shuffle, on the other hand, has its own grouped-only
-# permutation; ``aiter.ops.shuffle.shuffle_scale`` is *not* compatible
-# and we must use ``_grouped_b_scale_prepare_batch`` below.
+# permutation: the grouped n32k4 layout is produced by
+# ``aiter.ops.shuffle.shuffle_scale(..., is_n32k4=True)`` (used below), not by
+# the default ``shuffle_scale``.
 # ---------------------------------------------------------------------------
 def _grouped_scale(
     scale_raw: torch.Tensor,
@@ -117,17 +115,13 @@ def _grouped_scale(
 ) -> torch.Tensor:
     """Prepare grouped weight (B) e8m0 scales for the test kernel.
 
-    Uses the new B-scale layout (``_grouped_b_scale_prepare_batch``); tile_n /
-    n_warp / tile_k are kept for call-site compatibility but the new weight
-    layout is fixed by the WMMA scale contract and does not depend on them.
+    Uses the public n32k4 shuffle (``shuffle_scale(..., is_n32k4=True)``); rows /
+    k_dim / tile_n / n_warp / tile_k are kept for call-site compatibility but the
+    layout is fixed by the WMMA scale contract and derives from the shape.
     """
-    del tile_n, n_warp, tile_k  # unused: new B layout is WMMA-fixed
-    return _grouped_b_scale_prepare_batch(
-        scale_raw.contiguous().cuda().view(dtypes.fp8_e8m0),
-        experts=experts,
-        rows=rows,
-        k_dim=k_dim,
-        device="cuda",
+    del rows, k_dim, tile_n, n_warp, tile_k  # unused: n32k4 layout is WMMA-fixed
+    return shuffle_scale(
+        scale_raw.contiguous().cuda(), experts_cnt=experts, is_n32k4=True
     )
 
 

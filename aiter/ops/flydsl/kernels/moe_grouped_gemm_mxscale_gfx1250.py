@@ -265,9 +265,9 @@ def _preshuffled_scale_shape(
 def _preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
     """Weight (B) scale shape in the n32k4 layout: (rows//32, (k_dim//32)*32).
 
-    Matches ``grouped_moe_gfx1250._grouped_b_scale_preshuffle_e8m0``: a 32-row
-    super-block folds into the column dim (col = remain_k*128 + row32*4 + r), so
-    32 N-rows collapse to one row and each k_scale column expands x32.
+    Matches ``aiter.ops.shuffle.shuffle_scale_n32k4``: a 32-row super-block folds
+    into the column dim (col = remain_k*128 + row32*4 + r), so 32 N-rows collapse
+    to one row and each k_scale column expands x32.
     """
     k_scale = int(k_dim) // 32
     if k_scale % 4 != 0:
@@ -316,7 +316,6 @@ def _check_stage1_args(
             f"w shape must be {(cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // pack_b)}, got {tuple(w.shape)}"
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
-    warp_tile_n = cfg.tile_n // cfg.n_warp
     scale_x_rows = int(x.shape[1]) if cfg.grouped_contiguous_m else cfg.max_m
     scale_x_shape = _preshuffled_scale_shape(
         scale_x_rows, cfg.model_dim, warp_tile_m, cfg.tile_k
@@ -688,7 +687,6 @@ def _check_stage2_args(
             f"w shape must be {(cfg.experts, cfg.model_dim, cfg.inter_dim // pack_b)}, got {tuple(w.shape)}"
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
-    warp_tile_n = cfg.tile_n // cfg.n_warp
     scale_x_rows = int(x.shape[1]) if cfg.grouped_contiguous_m else cfg.max_m
     scale_x_shape = _preshuffled_scale_shape(
         scale_x_rows, cfg.inter_dim, warp_tile_m, cfg.tile_k
