@@ -29,6 +29,29 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Docker login
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKER_PASSWORD:-}" ]; then
+            echo "::warning::DOCKER_PASSWORD is not available; continuing without Docker login"
+            exit 0
+          fi
+          DOCKER_USER="${DOCKERHUB_USERNAME:-rocmshared}"
+          for attempt in 1 2 3; do
+            if echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USER}" --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "::warning::Docker login failed after 3 attempts; continuing without login"
+
       - name: Download Triton wheel
         id: download_triton_wheel
         env:

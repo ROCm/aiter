@@ -69,6 +69,7 @@ jobs:
       docker-image: rocm/ffm-dev:latest
       artifact-name: triton_wheelhouse
       retention-days: 3
+    secrets: inherit
 
   # Step 2: MI35X matrix jobs
   triton:

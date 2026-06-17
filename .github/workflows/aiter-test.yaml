@@ -131,7 +131,7 @@ jobs:
               export GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" &&
               prebuild_start=$(date +%s) &&
               set +e &&
-              python setup.py bdist_wheel 2>&1 | tee .aiter-prebuild.log
+              python3 setup.py bdist_wheel 2>&1 | tee .aiter-prebuild.log
               build_status=${PIPESTATUS[0]}
               set -e
               prebuild_end=$(date +%s)
@@ -351,6 +351,7 @@ jobs:
       docker-image: rocm/ffm-dev:latest
       artifact-name: triton_wheelhouse
       retention-days: 3
+    secrets: inherit
 
   standard:
     if: >-
