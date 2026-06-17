@@ -277,120 +277,130 @@ __forceinline__ torch::Tensor gemm_a8w8_cktile_impl(torch::Tensor& XQ,
                                                     std::optional<torch::Tensor> bias,
                                                     int k_batch = 1)
 {
-    // check
-    TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
-    TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
-
-    TORCH_CHECK(XQ.stride(-1) == 1,
-                "CKTile blockscale GEMM: XQ inner dim must be contiguous, "
-                "got strides=[",
-                XQ.stride(0),
-                ",",
-                XQ.stride(1),
-                "]");
-    TORCH_CHECK(WQ.stride(-1) == 1,
-                "CKTile blockscale GEMM: WQ inner dim must be contiguous, "
-                "got strides=[",
-                WQ.stride(0),
-                ",",
-                WQ.stride(1),
-                "]");
-    TORCH_CHECK(Y.stride(-1) == 1,
-                "CKTile blockscale GEMM: Y inner dim must be contiguous, "
-                "got strides=[",
-                Y.stride(0),
-                ",",
-                Y.stride(1),
-                "]");
-
-    // Split-K uses atomic_add into C; zero the output buffer first.
-    // Use zero_() so all rows are cleared regardless of the leading-dimension
-    // stride (e.g. padded tensors produced by vLLM's _maybe_pad_fp8_weight).
-    if(k_batch > 1)
+    // There are no 16x16x128 i8 mfma instructions
+    // TODO: Find a better way to filter unsupported instances
+    if constexpr(!(std::is_same_v<ABDataType, TILE_I8> && GemmInstance::K_Warp_Tile_v > 64))
     {
-        Y.zero_();
-    }
+        // check
+        TORCH_CHECK(XQ.dtype() == WQ.dtype(),
+                    "Weights and activations should have the same dtype!");
+        TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
 
-    const int stride_A  = XQ.stride(0);
-    const int stride_B  = WQ.stride(0);
-    const int stride_C  = Y.stride(0);
-    const int stride_AQ = x_scale.stride(0);
-    const int stride_BQ = w_scale.stride(0);
+        TORCH_CHECK(XQ.stride(-1) == 1,
+                    "CKTile blockscale GEMM: XQ inner dim must be contiguous, "
+                    "got strides=[",
+                    XQ.stride(0),
+                    ",",
+                    XQ.stride(1),
+                    "]");
+        TORCH_CHECK(WQ.stride(-1) == 1,
+                    "CKTile blockscale GEMM: WQ inner dim must be contiguous, "
+                    "got strides=[",
+                    WQ.stride(0),
+                    ",",
+                    WQ.stride(1),
+                    "]");
+        TORCH_CHECK(Y.stride(-1) == 1,
+                    "CKTile blockscale GEMM: Y inner dim must be contiguous, "
+                    "got strides=[",
+                    Y.stride(0),
+                    ",",
+                    Y.stride(1),
+                    "]");
 
-    const int M = XQ.size(0);
-    const int N = WQ.size(0);
-    const int K = XQ.size(1);
-
-    const int AQK = 1; // Row quantization: tensor shape [M, 1]
-    const int BQK = 1; // Column quantization: tensor shape [1, N]
-
-    auto runWithBias = [&]() {
-        using HostArgs = ck_tile::QuantGemmMultiDHostArgs<1>;
-
-        HostArgs args(XQ.data_ptr(),
-                      WQ.data_ptr(),
-                      std::array<const void*, 1>{bias.value().data_ptr()},
-                      Y.data_ptr(),
-                      x_scale.data_ptr(),
-                      w_scale.data_ptr(),
-                      k_batch,
-                      M,
-                      N,
-                      K,
-                      AQK,
-                      BQK,
-                      stride_A,
-                      stride_B,
-                      std::array<ck_tile::index_t, 1>{0},
-                      stride_C,
-                      stride_AQ,
-                      stride_BQ);
-
-        TileGemmComputeImpl<ABDataType,
-                            DDataType,
-                            EDataType,
-                            GemmInstance,
-                            HostArgs,
-                            true,
-                            false,
-                            false>(args);
-    };
-
-    auto runWithoutBias = [&]() {
-        using HostArgs = ck_tile::QuantGemmHostArgs;
-
-        HostArgs args(XQ.data_ptr(),
-                      WQ.data_ptr(),
-                      Y.data_ptr(),
-                      x_scale.data_ptr(),
-                      w_scale.data_ptr(),
-                      k_batch,
-                      M,
-                      N,
-                      K,
-                      AQK,
-                      BQK,
-                      stride_A,
-                      stride_B,
-                      stride_C,
-                      stride_AQ,
-                      stride_BQ);
-
-        TileGemmComputeImpl<ABDataType,
-                            DDataType,
-                            EDataType,
-                            GemmInstance,
-                            HostArgs,
-                            false,
-                            false,
-                            false>(args);
-    };
-
-    if constexpr(HasBias)
-    {
-        if(bias != std::nullopt)
+        // Split-K uses atomic_add into C; zero the output buffer first.
+        // Use zero_() so all rows are cleared regardless of the leading-dimension
+        // stride (e.g. padded tensors produced by vLLM's _maybe_pad_fp8_weight).
+        if(k_batch > 1)
         {
-            runWithBias();
+            Y.zero_();
+        }
+
+        const int stride_A  = XQ.stride(0);
+        const int stride_B  = WQ.stride(0);
+        const int stride_C  = Y.stride(0);
+        const int stride_AQ = x_scale.stride(0);
+        const int stride_BQ = w_scale.stride(0);
+
+        const int M = XQ.size(0);
+        const int N = WQ.size(0);
+        const int K = XQ.size(1);
+
+        const int AQK = 1; // Row quantization: tensor shape [M, 1]
+        const int BQK = 1; // Column quantization: tensor shape [1, N]
+
+        auto runWithBias = [&]() {
+            using HostArgs = ck_tile::QuantGemmMultiDHostArgs<1>;
+
+            HostArgs args(XQ.data_ptr(),
+                          WQ.data_ptr(),
+                          std::array<const void*, 1>{bias.value().data_ptr()},
+                          Y.data_ptr(),
+                          x_scale.data_ptr(),
+                          w_scale.data_ptr(),
+                          k_batch,
+                          M,
+                          N,
+                          K,
+                          AQK,
+                          BQK,
+                          stride_A,
+                          stride_B,
+                          std::array<ck_tile::index_t, 1>{0},
+                          stride_C,
+                          stride_AQ,
+                          stride_BQ);
+
+            TileGemmComputeImpl<ABDataType,
+                                DDataType,
+                                EDataType,
+                                GemmInstance,
+                                HostArgs,
+                                true,
+                                false,
+                                false>(args);
+        };
+
+        auto runWithoutBias = [&]() {
+            using HostArgs = ck_tile::QuantGemmHostArgs;
+
+            HostArgs args(XQ.data_ptr(),
+                          WQ.data_ptr(),
+                          Y.data_ptr(),
+                          x_scale.data_ptr(),
+                          w_scale.data_ptr(),
+                          k_batch,
+                          M,
+                          N,
+                          K,
+                          AQK,
+                          BQK,
+                          stride_A,
+                          stride_B,
+                          stride_C,
+                          stride_AQ,
+                          stride_BQ);
+
+            TileGemmComputeImpl<ABDataType,
+                                DDataType,
+                                EDataType,
+                                GemmInstance,
+                                HostArgs,
+                                false,
+                                false,
+                                false>(args);
+        };
+
+        if constexpr(HasBias)
+        {
+            if(bias != std::nullopt)
+            {
+                runWithBias();
+            }
+            else
+            {
+                runWithoutBias();
+            }
         }
         else
         {
@@ -399,7 +409,7 @@ __forceinline__ torch::Tensor gemm_a8w8_cktile_impl(torch::Tensor& XQ,
     }
     else
     {
-        runWithoutBias();
+        throw std::runtime_error("Wrong! Warp gemm not supported! Skipping gemm!\n");
     }
 
     return Y;
