@@ -39,6 +39,7 @@ jobs:
     name: Kimi-K2.5 (${{ matrix.backend }})
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - backend: vllm
