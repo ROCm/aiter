@@ -1,43 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""HCA-path FlyDSL compress + norm+rope+scatter kernels (2-kernel split).
+"""HCA-path compress + norm+rope+scatter kernels — **gfx1250 (RDNA4, wave32)**.
 
-Targeted optimization for V4-Pro HCA Main: D=512, RD=64, ratio=128, overlap=False.
-Inspired by SGLang's `c128_v2.cuh`, adapted to AMD wave64 / flydsl with a
-multi-wave LDS K-split (Phase 3 of the optimization series):
+Port of ``fused_compress_attn_hca.py`` (wave64) to gfx1250 wave32.
+Key differences:
+  - BLOCK_THREADS = 32 (wave32)
+  - SLICE = 32 (head_dim elements per block)
+  - VEC = SLICE_SZ / 32 (vs /64)
+  - Kernel B: D=512 → VEC=16, requires split load/store paths
+  - Kernel names suffixed with "w32"
 
-  Kernel A — flydsl_hca_compress_forward (multi-wave K-split)
-    Grid:  (num_compress, NUM_SPLIT=head_dim/SLICE)
-    Block: BLOCK_THREADS = 64 * k_split_num_waves (default 8 → 512 threads)
-    Each block covers SLICE=64 head_dim elements of one boundary.
-    K=128 split across NW waves (K_PER_WAVE = K/NW = 16). Per-wave local
-    online-softmax + cross-wave LDS reduction. Each wave's K range splits
-    at clamp(window_len, k_start, k_end) into a Phase 1 (state cache,
-    padded softmax) sub-loop followed by a Phase 2 (ragged input) sub-loop.
-    Output: kv_compressed[num_compress, head_dim] fp32 (compact, indexed by pid).
-
-  Kernel B — flydsl_hca_norm_rope_scatter
-    Grid:  (num_compress,)
-    Block: BLOCK_THREADS=64 (1 wave)
-    Each block reads one row of kv_compressed (full head_dim), does RMSNorm +
-    GPT-J RoPE on the RD tail, scatters to paged kv_cache (BF16 only — HCA
-    Main is the only HCA path that currently routes here; FP8 quant lives in
-    the legacy single-kernel for now).
-
-Why split into two kernels:
-  Single-kernel HCA has 1 wave per boundary × K=128 serial chain = poor CU
-  utilization at small N. Splitting head_dim into NUM_SPLIT=8 grid-Y blocks
-  and parallelising K across NW=8 waves gives 1024 blocks at N=16, drastically
-  cutting register pressure and shortening per-iter dependency chains.
-
-Cost: extra HBM r/w of kv_compressed = num_compress * head_dim * 4 bytes.
-For N=16384 D=512: 32 MB → ~4 us at 8 TB/s. Amortised by the compress kernel
-speedup; after the ``slice_size`` + VEC=8 refactor the 2-kernel path beats
-the legacy single-kernel at ALL N (1.06-3.7×, small N gets the largest win).
-
-NOTE: HCA-only and BF16-only by design. CSA / Indexer / FP8 paths continue
-to use the legacy single-kernel ``flydsl_fused_compress_attn``.
+See ``fused_compress_attn_hca.py`` for the original wave64 documentation.
 """
 
 import math
@@ -67,8 +41,8 @@ from .tensor_shim import STensor, _to_raw, _run_compiled
 # which formatters may not see).
 _FORCE_BIND_LDS = (CompilationContext, STensor, SmemAllocator, SmemPtr, get_rocm_arch)
 
-BLOCK_THREADS = 64  # 1 wave64
-SLICE = 64  # head_dim elements per block (grid-Y split)
+BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250)
+SLICE = 32  # head_dim elements per block (grid-Y split)
 _NEG_INF = float("-inf")
 _LOG2E = math.log2(math.e)
 
@@ -131,14 +105,15 @@ def _build_compress_forward_kernel(
         head_dim % slice_size == 0
     ), f"head_dim={head_dim} must be divisible by slice_size={slice_size}"
     assert (
-        slice_size % 64 == 0
-    ), f"slice_size={slice_size} must be a multiple of 64 (wave width)"
-    assert slice_size // 64 in (
+        slice_size % 32 == 0
+    ), f"slice_size={slice_size} must be a multiple of 32 (wave width)"
+    assert slice_size // 32 in (
         1,
         2,
         4,
         8,
-    ), f"VEC={slice_size // 64} must be 1, 2, 4, or 8"
+        16,
+    ), f"VEC={slice_size // 32} must be 1, 2, 4, 8, or 16"
     assert (
         ratio % k_split_num_waves == 0
     ), f"K={ratio} must divide evenly across {k_split_num_waves} waves"
@@ -147,10 +122,10 @@ def _build_compress_forward_kernel(
     K = ratio
     DIM_FULL = D
     SLICE_SZ = slice_size
-    VEC = SLICE_SZ // 64  # per-lane head_dim element count
+    VEC = SLICE_SZ // BLOCK_THREADS  # per-lane head_dim element count
     NUM_SPLIT = D // SLICE_SZ
     NW = k_split_num_waves
-    BLOCK_TH = 64 * NW
+    BLOCK_TH = BLOCK_THREADS * NW
     K_PER_WAVE = K // NW
 
     # LDS layout: three independent fp32 arrays, each [NW * slice_size].
@@ -175,7 +150,7 @@ def _build_compress_forward_kernel(
     allocator.ptr = lds_w_off + LDS_W_BYTES
 
     _kname = (
-        f"hca_compress_forward_D{D}_R{ratio}_NW{NW}_SL{SLICE_SZ}_S{state_size}_flydsl"
+        f"hca_compress_forward_w32_D{D}_R{ratio}_NW{NW}_SL{SLICE_SZ}_S{state_size}_flydsl"
     )
     fm_fast = arith.FastMathFlags.fast
 
@@ -206,7 +181,7 @@ def _build_compress_forward_kernel(
 
         c_zero_i32 = arith.constant(0, type=i32)
         c_one_i32 = arith.constant(1, type=i32)
-        c_64 = arith.constant(64, type=i32)
+        c_WS = arith.constant(BLOCK_THREADS, type=i32)
         c_neg_inf = arith.constant(_NEG_INF, type=f32)
         c_zero_f32 = arith.constant(0.0, type=f32)
         c_log2e = arith.constant(_LOG2E, type=f32)
@@ -224,8 +199,8 @@ def _build_compress_forward_kernel(
             )
 
         # Per-thread wave / lane (block-local).
-        wid = arith.divsi(_to_raw(tid), c_64)  # ∈ [0, NW)
-        lid = arith.remui(_to_raw(tid), c_64)  # ∈ [0, 64)
+        wid = arith.divsi(_to_raw(tid), c_WS)  # ∈ [0, NW)
+        lid = arith.remui(_to_raw(tid), c_WS)  # ∈ [0, 32)
 
         # ── Load plan row ──────────────────────────────────────────────
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
@@ -584,17 +559,20 @@ def _build_compress_forward_kernel(
                     out_vec = vector.from_elements(T.vec(VEC, T.f32), comp_list)
                     buffer_ops.buffer_store(out_vec, out_rsrc, out_off)
                 else:
-                    # VEC == 8: AMD HW max is dwordx4 → 2 stores.
-                    assert VEC == 8
-                    half = VEC // 2
-                    v0 = vector.from_elements(T.vec(half, T.f32), comp_list[0:half])
-                    v1 = vector.from_elements(T.vec(half, T.f32), comp_list[half:VEC])
-                    buffer_ops.buffer_store(v0, out_rsrc, out_off)
-                    buffer_ops.buffer_store(
-                        v1,
-                        out_rsrc,
-                        ArithValue(out_off) + arith.constant(half, type=i32),
-                    )
+                    # VEC > 4: AMD HW max is dwordx4 → split into N× dwordx4 stores.
+                    quarter = 4
+                    n_chunks = VEC // quarter
+                    for q in range_constexpr(n_chunks):
+                        base = q * quarter
+                        sv = vector.from_elements(
+                            T.vec(quarter, T.f32),
+                            comp_list[base : base + quarter],
+                        )
+                        buffer_ops.buffer_store(
+                            sv,
+                            out_rsrc,
+                            ArithValue(out_off) + arith.constant(base, type=i32),
+                        )
 
     @flyc.jit
     def launch_hca_compress_forward(
@@ -673,7 +651,7 @@ def _build_norm_rope_scatter_kernel(
     D = head_dim
     RD = rope_head_dim
     NOPE = D - RD
-    VEC = D // BLOCK_THREADS  # 8 for D=512
+    VEC = D // BLOCK_THREADS  # 16 for D=512 (wave32)
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
 
@@ -681,7 +659,7 @@ def _build_norm_rope_scatter_kernel(
     assert RD > 0 and RD % 2 == 0 and RD % VEC == 0
 
     _kname = (
-        f"hca_norm_rope_scatter_D{D}_RD{RD}_R{ratio}_KB{k_per_block}"
+        f"hca_norm_rope_scatter_w32_D{D}_RD{RD}_R{ratio}_KB{k_per_block}"
         f"{'_rmsbf16' if rms_weight_is_bf16 else ''}_flydsl"
     )
     fm_fast = arith.FastMathFlags.fast
@@ -740,7 +718,7 @@ def _build_norm_rope_scatter_kernel(
             base_off = (
                 ArithValue(pid) * ArithValue(kv_compressed_row_stride) + tid_x_vec
             )
-            # VEC ∈ {2, 4, 8}: VEC <= 4 → single dwordx{VEC}; VEC=8 → 2× dwordx4.
+            # VEC ∈ {2, 4, 8, 16}: VEC <= 4 → single dwordx{VEC}; VEC>4 → N× dwordx4.
             if const_expr(VEC <= 4):
                 raw = buffer_ops.buffer_load(
                     kvc_rsrc, base_off, vec_width=VEC, dtype=f32
@@ -750,24 +728,20 @@ def _build_norm_rope_scatter_kernel(
                     for i in range(VEC)
                 ]
             else:
-                assert VEC == 8
-                half = 4
-                r0 = buffer_ops.buffer_load(
-                    kvc_rsrc, base_off, vec_width=half, dtype=f32
-                )
-                r1 = buffer_ops.buffer_load(
-                    kvc_rsrc,
-                    ArithValue(base_off) + arith.constant(half, type=i32),
-                    vec_width=half,
-                    dtype=f32,
-                )
-                comp_lane = [
-                    vector.extract(r0, static_position=[i], dynamic_position=[])
-                    for i in range(half)
-                ] + [
-                    vector.extract(r1, static_position=[i], dynamic_position=[])
-                    for i in range(half)
-                ]
+                quarter = 4
+                n_chunks = VEC // quarter
+                comp_lane = []
+                for q in range_constexpr(n_chunks):
+                    r = buffer_ops.buffer_load(
+                        kvc_rsrc,
+                        ArithValue(base_off) + arith.constant(q * quarter, type=i32),
+                        vec_width=quarter,
+                        dtype=f32,
+                    )
+                    for i in range_constexpr(quarter):
+                        comp_lane.append(
+                            vector.extract(r, static_position=[i], dynamic_position=[])
+                        )
 
             # ── RMSNorm (wave reduce-add of squares / D + eps; rsqrt) ──
             sq_local = arith.constant(0.0, type=f32)
@@ -793,17 +767,42 @@ def _build_norm_rope_scatter_kernel(
                         rmsw_rsrc, off_dw, vec_width=1, dtype=i32
                     )
                     raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
-                else:
+                    vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                    rmsw_lane = []
+                    for i in range_constexpr(VEC):
+                        bf16_v = vector.extract(
+                            vec_bf16, static_position=[i], dynamic_position=[]
+                        )
+                        rmsw_lane.append(arith.extf(f32, bf16_v))
+                elif const_expr(dwords <= 4):
                     raw = buffer_ops.buffer_load(
                         rmsw_rsrc, off_dw, vec_width=dwords, dtype=i32
                     )
-                vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
-                rmsw_lane = []
-                for i in range_constexpr(VEC):
-                    bf16_v = vector.extract(
-                        vec_bf16, static_position=[i], dynamic_position=[]
-                    )
-                    rmsw_lane.append(arith.extf(f32, bf16_v))
+                    vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                    rmsw_lane = []
+                    for i in range_constexpr(VEC):
+                        bf16_v = vector.extract(
+                            vec_bf16, static_position=[i], dynamic_position=[]
+                        )
+                        rmsw_lane.append(arith.extf(f32, bf16_v))
+                else:
+                    # dwords > 4 (VEC=16 → dwords=8): split into 2× dwordx4
+                    half_dw = 4
+                    half_bf16 = half_dw * 2
+                    rmsw_lane = []
+                    for chunk in range_constexpr(dwords // half_dw):
+                        r = buffer_ops.buffer_load(
+                            rmsw_rsrc,
+                            ArithValue(off_dw) + arith.constant(chunk * half_dw, type=i32),
+                            vec_width=half_dw,
+                            dtype=i32,
+                        )
+                        vbf16 = vector.bitcast(T.vec(half_bf16, T.bf16), r)
+                        for i in range_constexpr(half_bf16):
+                            bf16_v = vector.extract(
+                                vbf16, static_position=[i], dynamic_position=[]
+                            )
+                            rmsw_lane.append(arith.extf(f32, bf16_v))
             else:
                 if const_expr(VEC <= 4):
                     raw = buffer_ops.buffer_load(
@@ -814,23 +813,20 @@ def _build_norm_rope_scatter_kernel(
                         for i in range(VEC)
                     ]
                 else:
-                    half = 4
-                    r0 = buffer_ops.buffer_load(
-                        rmsw_rsrc, tid_x_vec, vec_width=half, dtype=f32
-                    )
-                    r1 = buffer_ops.buffer_load(
-                        rmsw_rsrc,
-                        ArithValue(tid_x_vec) + arith.constant(half, type=i32),
-                        vec_width=half,
-                        dtype=f32,
-                    )
-                    rmsw_lane = [
-                        vector.extract(r0, static_position=[i], dynamic_position=[])
-                        for i in range(half)
-                    ] + [
-                        vector.extract(r1, static_position=[i], dynamic_position=[])
-                        for i in range(half)
-                    ]
+                    quarter = 4
+                    n_chunks = VEC // quarter
+                    rmsw_lane = []
+                    for q in range_constexpr(n_chunks):
+                        r = buffer_ops.buffer_load(
+                            rmsw_rsrc,
+                            ArithValue(tid_x_vec) + arith.constant(q * quarter, type=i32),
+                            vec_width=quarter,
+                            dtype=f32,
+                        )
+                        for i in range_constexpr(quarter):
+                            rmsw_lane.append(
+                                vector.extract(r, static_position=[i], dynamic_position=[])
+                            )
 
             normed_lane = [
                 arith.MulFOp(
@@ -950,8 +946,21 @@ def _build_norm_rope_scatter_kernel(
                     bf16_as_i32, static_position=[0], dynamic_position=[]
                 )
                 buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
-            else:
+            elif const_expr(dwords <= 4):
                 buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
+            else:
+                # dwords > 4 (VEC=16 → dwords=8): split into 2× dwordx4
+                c4_i32 = arith.constant(4, type=i32)
+                lo = vector.extract_strided_slice(
+                    T.vec(4, T.i32), bf16_as_i32, offsets=[0], sizes=[4], strides=[1]
+                )
+                hi = vector.extract_strided_slice(
+                    T.vec(4, T.i32), bf16_as_i32, offsets=[4], sizes=[4], strides=[1]
+                )
+                buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
+                buffer_ops.buffer_store(
+                    hi, out_rsrc, ArithValue(cache_off_dw) + c4_i32
+                )
 
     @flyc.jit
     def launch_hca_norm_rope_scatter(
@@ -1005,7 +1014,7 @@ _DEFAULT_COMPILE_HINTS = {
 
 
 @lru_cache(maxsize=32)
-def compile_hca_compress_forward(
+def compile_hca_compress_forward_gfx1250(
     *,
     head_dim: int,
     ratio: int,
@@ -1042,7 +1051,7 @@ def compile_hca_compress_forward(
 
 
 @lru_cache(maxsize=8)
-def compile_hca_norm_rope_scatter(
+def compile_hca_norm_rope_scatter_gfx1250(
     *,
     head_dim: int,
     rope_head_dim: int,
@@ -1063,7 +1072,7 @@ def compile_hca_norm_rope_scatter(
     return launcher
 
 
-def flydsl_hca_compress_attn(
+def flydsl_hca_compress_attn_gfx1250(
     *,
     kv_in: torch.Tensor,  # [num_q_tokens, head_dim] bf16
     score_in: torch.Tensor,  # [num_q_tokens, head_dim] bf16
@@ -1103,42 +1112,10 @@ def flydsl_hca_compress_attn(
     docstring). Override only when bench-sweeping; the default matches the
     production tuning used by ATOM's compressor.
     """
-    # ---- gfx1250 dispatch (wave32) ----
-    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
-
-    if _get_gfx() == "gfx1250":
-        from .fused_compress_attn_hca_gfx1250 import flydsl_hca_compress_attn_gfx1250
-
-        return flydsl_hca_compress_attn_gfx1250(
-            kv_in=kv_in,
-            score_in=score_in,
-            kv_state=kv_state,
-            score_state=score_state,
-            state_slot_mapping=state_slot_mapping,
-            plan_gpu=plan_gpu,
-            ape=ape,
-            rms_weight=rms_weight,
-            rms_eps=rms_eps,
-            cos_cache=cos_cache,
-            sin_cache=sin_cache,
-            kv_cache=kv_cache,
-            block_tables=block_tables,
-            k_per_block=k_per_block,
-            ratio=ratio,
-            head_dim=head_dim,
-            rope_head_dim=rope_head_dim,
-            kv_compressed_scratch=kv_compressed_scratch,
-            k_split_num_waves=k_split_num_waves,
-            slice_size=slice_size,
-            stream=stream,
-        )
-
     if k_split_num_waves is None or slice_size is None:
-        # Local import to avoid a circular import between the two HCA modules
-        # at package init time.
-        from .fused_compress_attn import hca_per_n_config
+        from .fused_compress_attn_gfx1250 import hca_per_n_config_gfx1250
 
-        auto_slice, auto_kw = hca_per_n_config(plan_gpu.shape[0])
+        auto_slice, auto_kw = hca_per_n_config_gfx1250(plan_gpu.shape[0])
         if slice_size is None:
             slice_size = auto_slice
         if k_split_num_waves is None:
@@ -1226,7 +1203,7 @@ def flydsl_hca_compress_attn(
         stream = torch.cuda.current_stream()
     stream_obj = Stream(stream)
 
-    compress_fn = compile_hca_compress_forward(
+    compress_fn = compile_hca_compress_forward_gfx1250(
         head_dim=head_dim,
         ratio=ratio,
         state_size=int(state_size),
@@ -1255,7 +1232,7 @@ def flydsl_hca_compress_attn(
     _run_compiled(compress_fn, *compress_args)
 
     rms_weight_is_bf16 = rms_weight.dtype == torch.bfloat16
-    norm_fn = compile_hca_norm_rope_scatter(
+    norm_fn = compile_hca_norm_rope_scatter_gfx1250(
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         ratio=ratio,
