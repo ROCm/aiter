@@ -1210,6 +1210,15 @@ def mxfp4_moe_run(
     # D_INTER == per-shard MoE inter_dim = moe_intermediate_size / TP_size.
     # w1 stacks gate||up along N, so w1.shape[1] = 2 * D_INTER.
     D_INTER = w1.shape[1] // 2
+    # gemm2 K (= D_INTER) must be a 256-multiple; zero-pad w2/w2_scale (and the
+    # inter buffer below) when it is not. No-op for 256-multiples (D_INTER=512).
+    Kpad_inter = ((D_INTER + 255) // 256) * 256
+    if Kpad_inter != D_INTER:
+        w2 = torch.nn.functional.pad(w2, (0, (Kpad_inter - D_INTER) // 2))
+        if w2_scale is not None:
+            w2_scale = torch.nn.functional.pad(
+                w2_scale, (0, (Kpad_inter - D_INTER) // 32)
+            )
     M, _ = hidden_states.shape
     device = hidden_states.device
 
@@ -1322,15 +1331,17 @@ def mxfp4_moe_run(
         a_scale_sorted_shuffled = _empty_u8(device)
 
     # -- gemm1: A_q x w1 -> inter (packed MXFP4, sorted layout) ----------
-    inter_sorted_quant = torch.empty(
-        (max_sorted, D_INTER // 2), device=device, dtype=torch.uint8
+    # Bridge buffer K-padded to Kpad_inter; zero-init so the padded tail is 0.
+    _inter_alloc = torch.zeros if Kpad_inter != D_INTER else torch.empty
+    inter_sorted_quant = _inter_alloc(
+        (max_sorted, Kpad_inter // 2), device=device, dtype=torch.uint8
     )
     BM_MIN = 64
-    inter_scale_cols = D_INTER // 32
+    inter_scale_cols = Kpad_inter // 32
     inter_scale_bytes = max_sorted * (1024 // BM_MIN) * 4
     inter_scale_rows = (inter_scale_bytes + inter_scale_cols - 1) // inter_scale_cols
     inter_scale_rows = (inter_scale_rows + 31) // 32 * 32
-    inter_sorted_shuffled_scale = torch.empty(
+    inter_sorted_shuffled_scale = _inter_alloc(
         (inter_scale_rows, inter_scale_cols), device=device, dtype=torch.uint8
     )
 
