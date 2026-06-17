@@ -899,7 +899,9 @@ def compile_moe_gemm1(
                         if elem_bytes == 1
                         else (col_base_swz_bytes // arith.index(int(elem_bytes)))
                     )
-                    idx_a16 = crd2idx((fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)), layout_lds)
+                    idx_a16 = crd2idx(
+                        (fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)), layout_lds
+                    )
                     idx_a16 = idx_a16 + lds_base
                     loaded_a16 = vector.load_op(vec16_x, lds_x, [idx_a16])
                     a_i64x2 = vector.bitcast(T.i64x2, loaded_a16)
@@ -2751,7 +2753,9 @@ def compile_moe_gemm2(
                         if elem_bytes == 1
                         else (col_base_swz_bytes // arith.index(int(elem_bytes)))
                     )
-                    idx_a16 = crd2idx((fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)), layout_lds)
+                    idx_a16 = crd2idx(
+                        (fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)), layout_lds
+                    )
                     idx_a16 = idx_a16 + lds_base
                     loaded_a16 = vector.load_op(vec16_x, lds_x, [idx_a16])
                     a_i64x2 = vector.bitcast(T.i64x2, loaded_a16)

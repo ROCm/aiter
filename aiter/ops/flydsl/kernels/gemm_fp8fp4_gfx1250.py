@@ -749,7 +749,10 @@ def compile_fp8fp4_gemm(
             return _make_tdm_desc(
                 global_ptr=arg_b,
                 lds_memref=memref,
-                global_offset=(blk_n // arith.index(16), k_packed_off * arith.index(16)),
+                global_offset=(
+                    blk_n // arith.index(16),
+                    k_packed_off * arith.index(16),
+                ),
                 tensor_shape=(N // 16, K_packed_b * 16),
                 strides=(K_packed_b * 16, 1),
                 tile_shape=(tile_n // 16, packed_tile_k_b * 16),
