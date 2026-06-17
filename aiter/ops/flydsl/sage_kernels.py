@@ -50,6 +50,8 @@ sage_quant = _sage_quant
 
 __all__ = [
     "flydsl_sage_attn_func",
+    "flydsl_sage_attn_raw_func",
+    "sage_quant",
 ]
 
 # Tile size baked into the CDNA kernel. Seq_len_q must be a multiple of this.
@@ -269,4 +271,75 @@ def flydsl_sage_attn_func(
     if layout == "bhsd":
         o = o.permute(0, 2, 1, 3).contiguous()
 
+    return o
+
+
+def flydsl_sage_attn_raw_func(
+    q_int8: torch.Tensor,
+    k_int8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    seq_q: int,
+    seq_k: int,
+    causal: bool = False,
+    waves_per_eu: int = 2,
+    block_m: int = 256,
+    block_n: int = 128,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> torch.Tensor:
+    """Run the FlyDSL sage attention kernel on already-quantized inputs.
+
+    Takes INT8 Q/K and FP8 V as produced by ``sage_quant``, skipping
+    quantization entirely. Useful for benchmarking the attention kernel
+    in isolation from the quantization overhead.
+
+    q_int8, k_int8: BSHD int8, head_dim packed at dtype width.
+    v_fp8: BSHD fp8.
+    q_scale, k_scale: [batch, heads, num_q_blocks] float32.
+    v_scale: [batch, heads, head_dim] float32.
+    seq_q, seq_k: original (unpadded) sequence lengths.
+    """
+    batch, seq_q_pad, num_q_heads, head_dim = q_int8.shape
+    _, _, num_kv_heads, _ = k_int8.shape
+    num_q_blocks = q_scale.shape[2]
+
+    o = torch.empty(
+        (batch, seq_q_pad, num_q_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=q_int8.device,
+    )
+
+    with torch.cuda.device(q_int8.device.index):
+        launch_stream = (
+            torch.cuda.current_stream(q_int8.device) if stream is None else stream
+        )
+        exe = _get_kernel(
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            causal=causal,
+            waves_per_eu=waves_per_eu,
+            block_m=block_m,
+            block_n=block_n,
+        )
+        exe(
+            q_int8.reshape(-1),
+            k_int8.reshape(-1),
+            v_fp8.reshape(-1),
+            o.reshape(-1),
+            q_scale,
+            k_scale,
+            v_scale,
+            batch,
+            seq_q_pad,
+            seq_k,
+            num_q_blocks,
+            stream=launch_stream,
+        )
+
+    n_pad_q = seq_q_pad - seq_q
+    if n_pad_q > 0:
+        o = o[:, :seq_q, :, :].contiguous()
     return o

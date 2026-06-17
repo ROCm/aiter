@@ -259,6 +259,8 @@ def _combined_routing_fused(
         EVEN_M,
     )
 
+    tl.debug_barrier()
+
     if pid != 0 and pid < blocks1a:
         n_tokens = tl.load(ExpertHist + pid)
         if n_tokens == 0:

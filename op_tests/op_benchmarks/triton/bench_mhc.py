@@ -2,32 +2,64 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-Benchmark for mHC (manifold-constrained Hyper Connection) fused kernel.
+Benchmark for mHC (manifold-constrained Hyper Connection) fused kernels.
 
-Measures performance of the Triton `mhc()` implementation across various
-input shapes and configurations, reporting time, throughput (TFLOPS), and
-bandwidth.
+Measures performance of Triton `mhc()` and `mhc_post()` implementations across
+various input shapes and configurations, reporting time, throughput (TFLOPS),
+and bandwidth.
 
-- `--with-hip`: adds the HIP kernel aiter.mhc_pre alongside the Triton kernel.
-  When passed, a silent Triton-vs-HIP correctness check runs as the first
-  step of each `(M, n, C)` row, once per config.
-  AssertionError on mismatch aborts the benchmark.
+Usage:
+  python bench_mhc.py              # Benchmark mhc (pre-transformer)
+  python bench_mhc.py --op post    # Benchmark mhc_post (post-transformer)
+  python bench_mhc.py --op e2e     # Benchmark full pipeline (mhc → mhc_post)
+
+- `--with-hip`: adds the HIP kernel alongside the Triton kernel.
+  When passed, a Triton-vs-HIP correctness check runs as the first step of
+  each `(M, n, C)` row (once per config). Requires `--dtype bf16` and
+  `n == 4` for all ops. Mismatch behavior is operation-specific:
+    - `--op pre`:  AssertionError aborts the benchmark.
+    - `--op post`: WARNING is logged with the max-abs diff and timing
+                   continues. (Allows profiling shapes where the HIP
+                   kernel is known to have a non-determinism / race issue
+                   at large M+H without losing the rest of the matrix.)
+    - `--op e2e`:  WARNING is logged; matches `--op post` (the e2e
+                   pipeline includes the post kernel). The HIP path
+                   chains `aiter.mhc_pre` -> `aiter.mhc_post` on the
+                   same shared input that feeds the Triton path.
 """
 
-import sys
+from __future__ import annotations
+
 import argparse
+import enum
 import logging
+import sys
 from itertools import product
+from typing import Any
+
 import torch
 import triton
 
-from aiter.ops.triton.fusions.mhc import mhc
+from aiter.ops.triton.fusions.mhc import mhc, mhc_post
+from aiter.ops.triton.utils.mhc_config_utils import hip_post_dispatch_block
 from aiter.test_common import checkAllclose
-from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
     get_caller_name_no_ext,
+    print_vgpr,
 )
+from op_tests.triton_tests.utils.mhc_ref import (
+    generate_mhc_inputs,
+    mhc_e2e_ref,
+)
+
+# Optional HIP imports; --with-hip code paths fail loudly at runtime via
+# _validate_with_hip when these are None.
+try:  # pragma: no cover
+    import aiter as _aiter
+    import aiter.jit.utils.chip_info as _aiter_chip_info
+except ImportError:  # pragma: no cover
+    _aiter = None
+    _aiter_chip_info = None
 
 arg_to_torch_dtype = {
     "fp16": torch.float16,
@@ -35,31 +67,408 @@ arg_to_torch_dtype = {
     "fp32": torch.float32,
 }
 
-# Configure logging before importing aiter modules
-logging.basicConfig(
-    level=logging.INFO, format="[%(name)s] %(levelname)s: %(message)s", force=True
-)
+
+class Metric(enum.Enum):
+    """Benchmark output metrics; ``value`` matches the perf_report column header."""
+
+    TIME = "time(ms)"
+    THROUGHPUT = "throughput(TFLOPS)"
+    BANDWIDTH = "bandwidth(GB/s)"
+    ARITHMETIC_INTENSITY = "arithmetic_intensity(FLOP/byte)"
+
+    @property
+    def column_label(self) -> str:
+        return self.value
+
+    def compute(self, ms: float, flops: float | None, mem: int) -> float:
+        if self is Metric.TIME:
+            return ms
+        if self is Metric.THROUGHPUT:
+            return 0.0 if flops is None else flops / (ms * 1e-3) / 1e12
+        if self is Metric.BANDWIDTH:
+            return mem / (ms * 1e-3) / 1e9
+        if self is Metric.ARITHMETIC_INTENSITY:
+            return 0.0 if flops is None else flops / mem
+        raise ValueError(f"Unhandled metric: {self}")
+
+
+# CLI --metric alias -> Metric.
+_METRIC_BY_CLI = {
+    "time": Metric.TIME,
+    "throughput": Metric.THROUGHPUT,
+    "bandwidth": Metric.BANDWIDTH,
+    "arithmetic_intensity": Metric.ARITHMETIC_INTENSITY,
+}
+
+
+def _metric_from_provider(provider: str) -> Metric:
+    """Recover the ``Metric`` from a ``[backend_]<column_label>`` provider string."""
+    for m in Metric:
+        if m.column_label in provider:
+            return m
+    raise ValueError(f"Unrecognized provider string: {provider!r}")
+
+
+# Color/linestyle pairs for `triton.testing.Benchmark.styles`, sliced by line_vals count.
+_PALETTE = [
+    ("red", "-"),
+    ("blue", "-"),
+    ("yellow", "-"),
+    ("green", "-"),
+    ("red", "--"),
+    ("blue", "--"),
+    ("yellow", "--"),
+    ("green", "--"),
+]
 
 
 def get_benchmark_configs(args):
-    """Generate list of benchmark configurations based on args."""
-    configs = []
-
+    """Return [(M, n, C), ...] for the current CLI args."""
     if args.M and args.n and args.C:
-        configs.append((args.M, args.n, args.C))
-    else:
-        # Default configurations - typical mHC usage patterns
-        # Format: (M, n, C) where:
-        #   M: batch/sequence length
-        #   n: stream parameter (manifold dimension)
-        #   C: hidden dimension per stream
-        Ms = [2**i for i in range(10, 15)]
-        n = 4
-        Cs = [512, 4096, 2**15]
-        # Sort by C (hidden dimension) to show scaling across C values
-        configs = sorted(list(product(Ms, [n], Cs)), key=lambda x: (x[2], x[0]))
+        return [(args.M, args.n, args.C)]
 
-    return configs
+    Ms = [2**i for i in range(10, 15)]
+    n = 4
+    # --with-hip: C=512 is excluded because the greedy post dispatcher selects
+    # block=512 and then fails the kernel's hidden_size >= residual_block * 2 check.
+    Cs = [1280, 2560, 4096, 7168]
+    return sorted(list(product(Ms, [n], Cs)), key=lambda x: (x[2], x[0]))
+
+
+def _compute_metrics(
+    operation: str,
+    M: int,
+    n: int,
+    C: int,
+    sinkhorn_iters: int | None = None,
+    elem_bytes: int | None = None,
+) -> tuple[float, int]:
+    """Analytic FLOPs and memory traffic; returns ``(flops, bytes)``.
+
+    For ``operation == "e2e"`` the pre and post stages are accumulated
+    in-place. ``elem_bytes`` defaults to 2 (bf16/fp16) when omitted.
+    """
+    if operation not in ("pre", "post", "e2e"):
+        raise ValueError(f"Unsupported operation: {operation!r}")
+
+    elem_size = elem_bytes if elem_bytes is not None else 2
+    total_flops = 0.0
+    total_memory = 0
+
+    if operation in ("pre", "e2e"):
+        nC = n * C
+        n_squared = n * n
+        N = n_squared + 2 * n
+
+        # Eq 14: matmul for 3 streams
+        flops_matmul = 2.0 * M * nC * n + 2.0 * M * nC * n + 2.0 * M * nC * n_squared
+        # Eq 15: RMS normalization
+        flops_rms = 4.0 * M * nC
+        flops_apply_pre = 2.0 * M * n * C
+        # Eq 19: Sinkhorn-Knopp
+        flops_sinkhorn = 10.0 * M * n_squared * sinkhorn_iters
+        total_flops += flops_matmul + flops_rms + flops_apply_pre + flops_sinkhorn
+
+        bias_size = 4  # bias is always fp32 regardless of activation dtype
+        total_memory += (
+            M * nC * elem_size  # x (GEMM)
+            + M * nC * elem_size  # x (apply-pre re-read)
+            + nC * n * elem_size  # phi_pre
+            + nC * n * elem_size  # phi_post
+            + nC * n_squared * elem_size  # phi_res
+            + N * bias_size
+            + M * n * elem_size  # post_mix write
+            + M * n_squared * elem_size  # comb_mix write
+            + M * C * elem_size  # layer_input write
+        )
+
+    if operation in ("post", "e2e"):
+        # out[M, j, c] = post_mix[M, j] * layer_input[M, c]
+        #              + sum_h comb_mix[M, h, j] * residual[M, h, c]
+        # 2 * n * (n+1) FLOPs per (M, c) under the GEMV "2 FLOPs per MAC"
+        # convention.
+        mix_bytes = 4  # fp32 mixes
+        total_flops += 2.0 * M * n * (n + 1) * C
+        total_memory += (
+            M * C * elem_size  # read layer_input
+            + M * n * C * elem_size  # read residual
+            + M * n * mix_bytes  # read post_mix
+            + M * n * n * mix_bytes  # read comb_mix
+            + M * n * C * elem_size  # write out
+        )
+
+    return float(total_flops), int(total_memory)
+
+
+def _get_benchmark_config(args, operation):
+    """Build the dict consumed by ``_create_benchmark_kernel`` via the op handler."""
+    handler = _OP_HANDLERS[operation]
+    configs = get_benchmark_configs(args)
+
+    x_vals_list = handler.x_vals(configs)
+
+    if args.metric == "all" or args.metric is None:
+        metrics = [m.column_label for m in Metric]
+    else:
+        metrics = [_METRIC_BY_CLI.get(args.metric, Metric.THROUGHPUT).column_label]
+
+    backends = ["triton"] + (["hip"] if args.with_hip else [])
+    if args.with_hip:
+        line_vals = [f"{b}_{m}" for m in metrics for b in backends]
+    else:
+        line_vals = list(metrics)
+
+    benchmark_name = handler.benchmark_name(args)
+    if args.with_hip:
+        benchmark_name += "_triton+hip"
+
+    return {
+        "x_names": handler.x_names,
+        "x_vals_list": x_vals_list,
+        "metrics": metrics,
+        "line_vals": line_vals,
+        "benchmark_name": benchmark_name,
+        "palette": _PALETTE[: len(line_vals)],
+    }
+
+
+class _MhcHandler:
+    """Single handler for {pre, post, e2e}: three timing slices of the same
+    pre -> post pipeline. ``self.op`` selects the slice."""
+
+    _X_NAMES = {
+        "pre": ["M", "n", "C"],
+        "post": ["M", "C"],
+        "e2e": ["M", "n", "C"],
+    }
+    POST_N = 4
+
+    def __init__(self, op: str):
+        self.op = op
+        self.name = op
+        self.x_names = self._X_NAMES[op]
+
+    def x_vals(self, configs: list[tuple[int, int, int]]) -> list[tuple]:
+        return [(M, C) for M, _n, C in configs] if self.op == "post" else configs
+
+    def benchmark_name(self, args: argparse.Namespace) -> str:
+        if self.op == "pre":
+            return get_caller_name_no_ext() + f"_sinkhorn-{args.sinkhorn_iters}iters"
+        if self.op == "post":
+            return f"bench_mhc_post_{args.dtype}"
+        return f"mhc-e2e-{args.dtype}"
+
+    def vgpr_msg(self) -> str:
+        return f"Retrieving VGPR usage for mhc {self.op} Triton kernels..."
+
+    def setup_call(
+        self,
+        params: dict[str, int],
+        args: argparse.Namespace,
+        dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        op = self.op
+        M = params["M"]
+        n = self.POST_N if op == "post" else params["n"]
+        C = params["C"]
+        sinkhorn_iters = args.sinkhorn_iters
+        if op == "post":
+            torch.manual_seed(0)
+
+        x, phi, alpha_pre, alpha_post, alpha_res, bias, _ = generate_mhc_inputs(
+            M, n, C, dtype
+        )
+
+        flops, mem_bytes = _compute_metrics(
+            op,
+            M,
+            n=n,
+            C=C,
+            sinkhorn_iters=sinkhorn_iters,
+            elem_bytes=x.element_size(),
+        )
+
+        def _call_triton_pre():
+            return mhc(
+                x,
+                phi,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                bias,
+                n,
+                hc_pre_eps=1e-6,
+                sinkhorn_iters=sinkhorn_iters,
+            )
+
+        if op == "post":
+            h_post, h_res, layer_input = _call_triton_pre()
+            residual = x.view(M, n, C)
+
+        if op == "pre":
+            triton_fn = _call_triton_pre
+
+        elif op == "post":
+
+            def triton_fn():
+                return mhc_post(None, layer_input, residual, h_post, h_res)
+
+        else:  # e2e
+
+            def triton_fn():
+                hp, hr, li = _call_triton_pre()
+                return mhc_post(None, li, x.view(M, n, C), hp, hr, None)
+
+        hip_fn = None
+        check_payload = None
+        if args.with_hip:
+            residual_b, fn_hip, hc_scale, hc_base = _triton_to_hip_pre_inputs(
+                x, phi, alpha_pre, alpha_post, alpha_res, bias, n
+            )
+            hip_dev = torch.device(residual_b.device)
+
+            # All HIP mhc_pre invocations share these kwargs.
+            def _call_aiter_pre():
+                return _aiter.mhc_pre(
+                    residual_b,
+                    fn_hip,
+                    hc_scale,
+                    hc_base,
+                    rms_eps=1e-6,
+                    hc_pre_eps=1e-6,
+                    hc_sinkhorn_eps=0.0,
+                    hc_post_mult_value=2.0,
+                    sinkhorn_repeat=sinkhorn_iters,
+                )
+
+            if op == "pre":
+
+                def hip_fn():
+                    with hip_dev:
+                        return _call_aiter_pre()
+
+            elif op == "post":
+                with hip_dev:
+                    post_mix_hip, comb_mix_hip, layer_input_hip = _call_aiter_pre()
+                out_hip = torch.empty(M, n, C, dtype=dtype, device=residual_b.device)
+
+                def hip_fn():
+                    with hip_dev:
+                        _aiter.mhc_post(
+                            out_hip,
+                            layer_input_hip,
+                            residual_b,
+                            post_mix_hip,
+                            comb_mix_hip,
+                        )
+                        return out_hip
+
+                check_payload = (
+                    x.view(M, n, C),
+                    phi,
+                    alpha_pre,
+                    alpha_post,
+                    alpha_res,
+                    bias,
+                    n,
+                    sinkhorn_iters,
+                )
+            else:  # e2e
+                out_hip = torch.empty(M, n, C, dtype=dtype, device=residual_b.device)
+
+                def hip_fn():
+                    with hip_dev:
+                        pm, cm, li_h = _call_aiter_pre()
+                        _aiter.mhc_post(out_hip, li_h, residual_b, pm, cm)
+                        return out_hip
+
+                check_payload = (
+                    x.view(M, n, C),
+                    phi,
+                    alpha_pre,
+                    alpha_post,
+                    alpha_res,
+                    bias,
+                    n,
+                    sinkhorn_iters,
+                )
+
+        return {
+            "triton_fn": triton_fn,
+            "hip_fn": hip_fn,
+            "metrics": (flops, mem_bytes),
+            "check_payload": check_payload,
+        }
+
+    def correctness_check(self, setup: dict[str, Any], params: dict[str, int]) -> None:
+        if setup["hip_fn"] is None:
+            return
+        op = self.op
+        if op == "pre":
+            _assert_triton_matches_hip(
+                "pre",
+                setup["triton_fn"](),
+                setup["hip_fn"](),
+                M=params["M"],
+                n=params["n"],
+                C=params["C"],
+            )
+            return
+        xl, phi, ap, apo, ar, bs, n_, si = setup["check_payload"]
+        _, x_l_plus_1, _, _ = mhc_e2e_ref(
+            xl,
+            phi,
+            ap,
+            apo,
+            ar,
+            bs,
+            n_,
+            hc_pre_eps=1e-6,
+            sinkhorn_iters=si,
+        )
+        t_out = setup["triton_fn"]()
+        h_out = setup["hip_fn"]()
+        t_vs_ref = (t_out.float() - x_l_plus_1).abs().max().item()
+        h_vs_ref = (h_out.float() - x_l_plus_1).abs().max().item()
+        if op == "post":
+            logging.info(
+                "mhc_post (M=%d, C=%d): triton-vs-ref max=%.4g  hip-vs-ref max=%.4g",
+                params["M"],
+                params["C"],
+                t_vs_ref,
+                h_vs_ref,
+            )
+            _assert_triton_matches_hip(
+                "post", t_out, h_out, M=params["M"], C=params["C"]
+            )
+        else:  # e2e
+            logging.info(
+                "mhc_e2e (M=%d, n=%d, C=%d): triton-vs-ref max=%.4g  hip-vs-ref max=%.4g",
+                params["M"],
+                params["n"],
+                params["C"],
+                t_vs_ref,
+                h_vs_ref,
+            )
+            _assert_triton_matches_hip(
+                "e2e",
+                t_out,
+                h_out,
+                M=params["M"],
+                n=params["n"],
+                C=params["C"],
+            )
+
+    def validate_hip(self, args: argparse.Namespace) -> None:
+        if self.op != "post":
+            _validate_with_hip_pre(args)
+        if self.op != "pre":
+            _validate_with_hip_post(args)
+
+
+_OP_HANDLERS: dict[str, _MhcHandler] = {
+    op: _MhcHandler(op) for op in ("pre", "post", "e2e")
+}
 
 
 def _triton_to_hip_pre_inputs(x, phi, alpha_pre, alpha_post, alpha_res, bias, n):
@@ -83,226 +492,71 @@ def _triton_to_hip_pre_inputs(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
     return residual, fn_hip, hc_scale, hc_base
 
 
-def run_benchmark(args):
-    """Run mHC benchmark with specified configuration."""
+def _create_benchmark_kernel(args, operation):
+    """Build a perf_report-decorated bench function for one op."""
+    handler = _OP_HANDLERS[operation]
     dtype = arg_to_torch_dtype[args.dtype]
-    sinkhorn_iters = args.sinkhorn_iters
 
-    configs = get_benchmark_configs(args)
-    x_vals_list = configs
-    x_names = ["M", "n", "C"]
+    config = _get_benchmark_config(args, operation)
 
-    # Determine which metrics to report (following bench_diffusion_attention pattern)
-    if args.metric == "all" or args.metric is None:
-        metrics = [
-            "time(ms)",
-            "throughput(TFLOPS)",
-            "bandwidth(GB/s)",
-            "arithmetic_intensity(FLOP/byte)",
-        ]
-    else:
-        metric_map = {
-            "time": "time(ms)",
-            "throughput": "throughput(TFLOPS)",
-            "bandwidth": "bandwidth(GB/s)",
-            "arithmetic_intensity": "arithmetic_intensity(FLOP/byte)",
-        }
-        metrics = [metric_map.get(args.metric, "throughput(TFLOPS)")]
-
-    backends = ["triton"] + (["hip"] if args.with_hip else [])
-    if args.with_hip:
-        line_vals = [f"{b}_{m}" for m in metrics for b in backends]
-    else:
-        line_vals = list(metrics)
-
-    benchmark_name = get_caller_name_no_ext()
-    benchmark_name += f"_sinkhorn-{sinkhorn_iters}iters"
-    if args.with_hip:
-        benchmark_name += "_triton+hip"
-
-    _palette = [
-        ("red", "-"),
-        ("blue", "-"),
-        ("yellow", "-"),
-        ("green", "-"),
-        ("red", "--"),
-        ("blue", "--"),
-        ("yellow", "--"),
-        ("green", "--"),
-    ]
     benchmark = triton.testing.Benchmark(
-        x_names=x_names,
-        x_vals=x_vals_list,
+        x_names=config["x_names"],
+        x_vals=config["x_vals_list"],
         line_arg="provider",
-        line_vals=line_vals,
-        line_names=line_vals,
-        styles=_palette[: len(line_vals)],
+        line_vals=config["line_vals"],
+        line_names=config["line_vals"],
+        styles=config["palette"],
         ylabel="",
-        plot_name=benchmark_name,
+        plot_name=config["benchmark_name"],
         args={},
     )
 
-    _checked_configs: set = set()
+    # Per-shape correctness check runs only on first occurrence of each shape.
+    _checked_configs: set[tuple] = set()
 
     @triton.testing.perf_report([benchmark])
-    def bench_mhc_kernel(M, n, C, provider):
-        """Benchmark mHC kernel for given configuration."""
-        (
-            x,
-            phi,
-            alpha_pre,
-            alpha_post,
-            alpha_res,
-            bias,
-            n_streams,
-        ) = generate_mhc_inputs(M, n, C, dtype)
+    def bench_mhc_kernel(provider, **benchmark_params):
+        setup = handler.setup_call(benchmark_params, args, dtype)
+        triton_fn = setup["triton_fn"]
+        hip_fn = setup["hip_fn"]
+        flops, mem_bytes = setup["metrics"]
 
-        # Compute FLOPs for mHC operation
-        nC = n * C
-        n_squared = n * n
-        N = n_squared + 2 * n
-
-        # Standard GEMM FLOPs (2*M*N*K for matrix multiply)
-        # Eq 14: x @ phi for 3 streams
-        # - x @ phi_pre: (M, nC) @ (nC, n) = 2*M*nC*n
-        # - x @ phi_post: (M, nC) @ (nC, n) = 2*M*nC*n
-        # - x @ phi_res: (M, nC) @ (nC, n²) = 2*M*nC*n²
-        flops_matmul = 2.0 * M * nC * n + 2.0 * M * nC * n + 2.0 * M * nC * n_squared
-
-        # Eq 15: RMS normalization - M rows, each with nC elements
-        # sqrt(sum(x^2)/K) requires: square + sum + divide + sqrt ≈ 4*nC ops per row
-        flops_rms = 4.0 * M * nC
-
-        # Apply-pre step:
-        # layer_input[m, c] = Σᵢ pre_mix[m, i] * x[m, i*C + c]
-        # = 2*M*n*C FLOPs (multiply-add for each (m, i, c))
-        flops_apply_pre = 2.0 * M * n * C
-
-        # Eq 19: Sinkhorn-Knopp
-        # Each iteration: 2 normalizations (row + col) on M matrices of size (n, n)
-        # Simplified: ~10*n² per iteration (accounting for expensive exp/log ops)
-        flops_sinkhorn = 10.0 * M * n_squared * sinkhorn_iters
-
-        total_flops = flops_matmul + flops_rms + flops_apply_pre + flops_sinkhorn
-
-        # Compute memory traffic
-        elem_size = 2  # bf16/fp16 = 2 bytes
-        bias_size = 4  # bias is fp32 = 4 bytes
-
-        # Memory reads:
-        # - x: (M, nC) - read once for the GEMM
-        # - x re-read by the apply-pre step: (M, n*C) = (M, nC) again
-        # - phi_pre, phi_post, phi_res: (nC, n), (nC, n), (nC, n_res)
-        # - bias: (N,) in fp32
-        mem_read = (
-            M * nC * elem_size  # x (GEMM)
-            + M * nC * elem_size  # x (apply-pre re-read)
-            + nC * n * elem_size  # phi_pre
-            + nC * n * elem_size  # phi_post
-            + nC * n_squared * elem_size  # phi_res
-            + N * bias_size  # bias
-        )
-
-        # Memory writes:
-        # - post_mix: (M, n)
-        # - comb_mix doubly-stochastic Sinkhorn output: (M, n_squared)
-        # - layer_input: (M, C) - replaces the old H^pre write
-        mem_write = (
-            M * n * elem_size  # post_mix
-            + M * n_squared * elem_size  # comb_mix
-            + M * C * elem_size  # layer_input
-        )
-
-        total_mem = mem_read + mem_write
-
-        def triton_fn():
-            return mhc(
-                x,
-                phi,
-                alpha_pre,
-                alpha_post,
-                alpha_res,
-                bias,
-                n_streams,
-                sinkhorn_iters=sinkhorn_iters,
-            )
-
-        hip_fn = None
-        if args.with_hip:
-            import aiter  # noqa: F401  (side-effect: register module_mhc ops)
-
-            residual, fn_hip, hc_scale, hc_base = _triton_to_hip_pre_inputs(
-                x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
-            )
-            hip_device_ctx = torch.device(residual.device)
-
-            def hip_fn():
-                with hip_device_ctx:
-                    return aiter.mhc_pre(
-                        residual,
-                        fn_hip,
-                        hc_scale,
-                        hc_base,
-                        rms_eps=1e-6,
-                        hc_pre_eps=0.0,
-                        hc_sinkhorn_eps=0.0,
-                        hc_post_mult_value=2.0,  # parity with Triton's 2*sigmoid(H_post)
-                        sinkhorn_repeat=sinkhorn_iters,
-                    )
-
-        if args.with_hip and (M, n, C) not in _checked_configs:
-            post_t, comb_t, li_t = triton_fn()
-            post_h, comb_h, li_h = hip_fn()
-            cfg = f"(M={M}, n={n}, C={C})"
-            for name, t, h, atol, rtol in (
-                ("post_mix", post_t, post_h, 4e-2, 1e-2),
-                ("comb_mix", comb_t, comb_h, 4e-2, 1e-2),
-                ("layer_input", li_t, li_h, 8e-2, 2e-2),
-            ):
-                msg = f"{name} mismatch between Triton and HIP at {cfg}"
-                pct = checkAllclose(
-                    t.detach().cpu().float(),
-                    h.detach().cpu().float(),
-                    atol=atol,
-                    rtol=rtol,
-                    tol_err_ratio=0.05,
-                    msg=msg,
-                    printLog=True,
-                )
-                assert (
-                    pct <= 0.05
-                ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
-            _checked_configs.add((M, n, C))
+        if args.with_hip and hip_fn is not None:
+            config_key = tuple(benchmark_params[k] for k in handler.x_names)
+            if config_key not in _checked_configs:
+                handler.correctness_check(setup, benchmark_params)
+                _checked_configs.add(config_key)
 
         backend = "hip" if provider.startswith("hip_") else "triton"
         fn = hip_fn if backend == "hip" else triton_fn
 
-        # Benchmark
-        ms = triton.testing.do_bench(fn)
+        ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
-        # Return requested metric based on provider string (following bench_diffusion_attention pattern)
-        if "ms" in provider:
-            return ms
-        elif "TFLOPS" in provider:
-            return total_flops / (ms * 1e-3) / 1e12
-        elif "GB/s" in provider:
-            return total_mem / (ms * 1e-3) / 1e9
-        elif "arithmetic_intensity" in provider:
-            return total_flops / total_mem
-        return ms
+        return _metric_from_provider(provider).compute(ms, flops, mem_bytes)
 
-    bench_mhc_kernel.run(save_path="." if args.o else None, print_data=True)
+    return bench_mhc_kernel
 
 
-def parse_args():
-    """Parse command line arguments."""
+def run_benchmark(args, operation):
+    bench_fn = _create_benchmark_kernel(args, operation=operation)
+    bench_fn.run(save_path="." if args.o else None, print_data=True)
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="Benchmark mHC",
-        description="Benchmark mHC (manifold-constrained Hyper Connection) kernel",
+        description="Benchmark mHC (manifold-constrained Hyper Connection) kernels",
         allow_abbrev=False,
     )
 
-    # Shape parameters
+    parser.add_argument(
+        "--op",
+        type=str,
+        default="pre",
+        choices=["pre", "post", "e2e"],
+        help="Which operation to benchmark: 'pre' (mhc), 'post' (mhc_post), or 'e2e' (full pipeline)",
+    )
+
     parser.add_argument(
         "-M",
         type=int,
@@ -322,7 +576,6 @@ def parse_args():
         help="Hidden dimension per stream (typically 1024)",
     )
 
-    # Kernel configuration
     parser.add_argument(
         "--dtype",
         type=str,
@@ -334,7 +587,7 @@ def parse_args():
         "-sinkhorn_iters",
         type=int,
         default=20,
-        help="Number of Sinkhorn-Knopp iterations (default: 20)",
+        help="Number of Sinkhorn-Knopp iterations for mhc (default: 20)",
     )
     parser.add_argument(
         "--with-hip",
@@ -342,22 +595,22 @@ def parse_args():
         action="store_true",
         default=False,
         help=(
-            "Also benchmark the HIP aiter.mhc_pre kernel "
-            "(mhc_pre_gemm_sqrsum + mhc_pre_big_fuse) alongside Triton. "
-            "Requires --dtype bf16. Also runs a silent Triton-vs-HIP "
-            "correctness check once per (M, n, C) before timing that row; "
-            "aborts on mismatch."
+            "Also benchmark the HIP kernel alongside Triton. Requires "
+            "--dtype bf16 and n == 4 for all ops. Runs a Triton-vs-HIP "
+            "correctness check once per (M, n, C) before timing that row. "
+            "Mismatch policy: --op pre aborts; --op post and --op e2e log "
+            "a WARNING and continue. For --op e2e the HIP path chains "
+            "aiter.mhc_pre -> aiter.mhc_post on the shared input."
         ),
     )
 
-    # Output options
     parser.add_argument(
         "-metric",
         nargs="?",
         const="throughput",
         choices=["all", "time", "throughput", "bandwidth", "arithmetic_intensity"],
         default=None,
-        help="Metrics for the kernel benchmark (default: all)",
+        help="Metrics for the kernel benchmark (default: all for pre, time+bandwidth for post)",
     )
     parser.add_argument(
         "-print_vgpr",
@@ -369,102 +622,181 @@ def parse_args():
         "-o",
         action="store_true",
         default=False,
-        help="Write performance results to CSV file",
+        help=(
+            "Write performance results to a CSV file in the current "
+            "directory. Filename pattern (per --op):\n"
+            "  pre  -> bench_mhc_sinkhorn-<sinkhorn_iters>iters[+_triton+hip].csv\n"
+            "  post -> bench_mhc_post_<dtype>[+_triton+hip].csv\n"
+            "  e2e  -> mhc-e2e-<dtype>.csv\n"
+            "(The '_triton+hip' suffix is appended when --with-hip is set.)"
+        ),
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=25,
+        help=(
+            "Warmup iterations passed to triton.testing.do_bench (default: "
+            "25). Increase for sub-50us kernels where the default produces "
+            "noisy timings; decrease to speed up sweeps over large shapes."
+        ),
+    )
+    parser.add_argument(
+        "--rep",
+        type=int,
+        default=100,
+        help=(
+            "Measurement iterations passed to triton.testing.do_bench "
+            "(default: 100). The reported time is the median over rep "
+            "iterations."
+        ),
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.op == "post" and args.n is not None and args.n != 4:
+        parser.error(
+            f"--op post requires n == 4 (got -n {args.n}). "
+            "The post bench config pins n=4 to match aiter.mhc_post, which "
+            "hardcodes hc_mult == 4 via TORCH_CHECK."
+        )
+
+    return args
 
 
-def _validate_with_hip(args):
-    """Reject unsupported --with-hip combinations up-front with kernel-named errors.
+def _assert_triton_matches_hip(
+    op: str,
+    triton_out,
+    hip_out,
+    *,
+    M: int,
+    C: int,
+    n: int | None = None,
+) -> None:
+    """Triton-vs-HIP parity via ``checkAllclose`` for all ops.
 
-    Returns 0 if args are acceptable, or a non-zero exit code suitable for sys.exit().
+    pre  -> per-tensor (post_mix, comb_mix, layer_input) check with op-specific
+            atol/rtol from op_tests/triton_tests/fusions/test_mhc.py;
+            fails assert when bad-element ratio > 5%.
+    post -> single-tensor check with atol=4e-2, rtol=1e-2; SOFT-WARNS at >5%.
+    e2e  -> single-tensor check with atol=4e-2, rtol=1e-2; SOFT-WARNS at >5%.
+    """
+    cfg = f"(M={M}, C={C})" if n is None else f"(M={M}, n={n}, C={C})"
+    if op == "pre":
+        post_t, comb_t, li_t = triton_out
+        post_h, comb_h, li_h = hip_out
+        checks = (
+            ("post_mix", post_t, post_h, 4e-2, 1e-2),
+            ("comb_mix", comb_t, comb_h, 4e-2, 1e-2),
+            ("layer_input", li_t, li_h, 8e-2, 2e-2),
+        )
+    else:
+        checks = ((f"mhc_{op}", triton_out, hip_out, 4e-2, 1e-2),)
+
+    for name, t, h, atol, rtol in checks:
+        msg = f"{name} mismatch between Triton and HIP at {cfg}"
+        pct = checkAllclose(
+            t.detach().cpu().float(),
+            h.detach().cpu().float(),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=0.05,
+            msg=msg,
+            printLog=True,
+        )
+        ok = pct <= 0.05
+        logging.log(
+            logging.INFO if ok else logging.WARNING,
+            "%s correctness %s at %s: bad_element_ratio=%.2f%% (atol=%g, rtol=%g)",
+            name,
+            "OK" if ok else "MISMATCH",
+            cfg,
+            pct * 100,
+            atol,
+            rtol,
+        )
+        if op == "pre":
+            assert (
+                ok
+            ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+
+
+def _validate_with_hip_pre(args) -> None:
+    """Validate --with-hip args for mhc_pre; raises AssertionError on failure."""
+    for M_, n_, C_ in get_benchmark_configs(args):
+        hc_hidden_size = n_ * C_
+        assert hc_hidden_size % 64 == 0, (
+            f"--with-hip requires n*C (hc_hidden_size) divisible by 64 "
+            f"(got n={n_}, C={C_}, n*C={hc_hidden_size} for M={M_}). "
+            f"aiter.mhc_pre_gemm_sqrsum requires hc_hidden_size % tile_k == 0 "
+            f"for tile_k in {{64, 128}}."
+        )
+        assert C_ % 128 == 0 and C_ >= 512, (
+            f"--with-hip requires C (hidden_size) divisible by 128 and >= 512 "
+            f"(got C={C_} for M={M_}, n={n_}). aiter.mhc_pre_big_fuse dispatches "
+            f"with residual_block in {{128, 256}} and enforces "
+            f"hidden_size % residual_block == 0 && hidden_size >= "
+            f"residual_block * 2 via TORCH_CHECK."
+        )
+
+
+def _validate_with_hip_post(args) -> None:
+    """Validate --with-hip args for mhc_post; raises AssertionError on failure."""
+    arch_id = _aiter_chip_info.get_gfx()
+    for M_, n_, C_ in get_benchmark_configs(args):
+        block = hip_post_dispatch_block(C_, arch_id)
+        assert block is not None, (
+            f"--with-hip requires C (hidden_size) divisible by 256 "
+            f"(got C={C_} for M={M_}, n={n_}). aiter.mhc_post dispatches with "
+            f"residual_block in {{256, 512, 1024}}."
+        )
+        assert C_ >= 2 * block, (
+            f"--with-hip on {arch_id} selects residual_block={block} for C={C_}; "
+            f"requires hidden_size >= {2 * block} (got C={C_} for M={M_}, n={n_})."
+        )
+
+
+def _validate_with_hip(args, operation: str = "pre") -> None:
+    """
+    Common --with-hip validation (dtype/n); raises AssertionError on failure.
     """
     if not args.with_hip:
-        return 0
+        return
 
-    if args.dtype != "bf16":
-        logging.error(
-            "--with-hip only supports --dtype bf16 (got %r). "
-            "aiter.mhc_pre_gemm_sqrsum is template-instantiated for bf16 "
-            "residual only (with fp32 fn/hc_scale/hc_base).",
-            args.dtype,
-        )
-        return 1
+    assert args.dtype == "bf16", (
+        f"--with-hip only supports --dtype bf16 (got {args.dtype!r}). "
+        f"{'aiter.mhc_pre' if operation == 'pre' else 'aiter.mhc_post'} kernel "
+        f"is template-instantiated for bf16 residual with fp32 parameters."
+    )
 
-    # Validate every (M, n, C) that will actually be benchmarked. This
-    # covers both the explicit "-M -n -C" case and the default suite, so we
-    # catch e.g. the default C=128 case (hidden_size below the HIP kernel's
-    # residual_block * 2 = 512 lower bound) before any kernel launch.
+    n_kernel = "aiter.mhc_pre_big_fuse" if operation == "pre" else "aiter.mhc_post"
     for M_, n_, C_ in get_benchmark_configs(args):
-        # aiter.mhc_pre_big_fuse hardcodes hc_mult == 4 via TORCH_CHECK.
-        if n_ != 4:
-            logging.error(
-                "--with-hip requires n == 4 (got n=%d for M=%d, C=%d). "
-                "aiter.mhc_pre_big_fuse hardcodes hc_mult == 4 "
-                "(static_assert in mhc_pre_big_fuse_kernel + runtime "
-                "TORCH_CHECK in mhc_pre_big_fuse).",
-                n_,
-                M_,
-                C_,
-            )
-            return 1
+        assert n_ == 4, (
+            f"--with-hip requires n == 4 (got n={n_} for M={M_}, C={C_}). "
+            f"{n_kernel} hardcodes hc_mult == 4 via TORCH_CHECK."
+        )
 
-        hc_hidden_size = n_ * C_
-        # aiter.mhc_pre_gemm_sqrsum: hc_hidden_size % tile_k == 0 for tile_k
-        # in {64, 128}. The Python dispatcher always selects a valid tile_k
-        # iff hc_hidden_size is at least 64-aligned.
-        if hc_hidden_size % 64 != 0:
-            logging.error(
-                "--with-hip requires n*C (hc_hidden_size) divisible by 64 "
-                "(got n=%d, C=%d, n*C=%d for M=%d). aiter.mhc_pre_gemm_sqrsum "
-                "requires hc_hidden_size %% tile_k == 0 for tile_k in {64, 128}.",
-                n_,
-                C_,
-                hc_hidden_size,
-                M_,
-            )
-            return 1
-
-        # aiter.mhc_pre_big_fuse MHC_PRE_BIG_FUSE_KERNEL_DISPATCH:
-        #   m <= cu_num*12  -> residual_block = 256 (needs C % 256 == 0, C >= 512)
-        #   m >  cu_num*12  -> residual_block = 128 (needs C % 128 == 0, C >= 256)
-        # Use the strictest condition so the check is independent of cu_num
-        # (validated by the TORCH_CHECK inside MHC_PRE_BIG_FUSE_KERNEL_IMPL).
-        if C_ % 128 != 0 or C_ < 512:
-            logging.error(
-                "--with-hip requires C (hidden_size) divisible by 128 and "
-                ">= 512 (got C=%d for M=%d, n=%d). aiter.mhc_pre_big_fuse "
-                "dispatches with residual_block in {128, 256} and enforces "
-                "hidden_size %% residual_block == 0 && hidden_size >= "
-                "residual_block * 2 via TORCH_CHECK.",
-                C_,
-                M_,
-                n_,
-            )
-            return 1
-
-    return 0
+    _OP_HANDLERS[operation].validate_hip(args)
 
 
 def main():
-    """Main entry point."""
-    args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(name)s] %(levelname)s: %(message)s",
+        force=True,
+    )
 
-    rc = _validate_with_hip(args)
-    if rc != 0:
-        return rc
+    args = parse_args()
+    handler = _OP_HANDLERS[args.op]
+
+    _validate_with_hip(args, operation=args.op)
 
     if args.print_vgpr:
-        print("Retrieving VGPR usage for mHC Triton kernels...")
-
-        def fun():
-            return run_benchmark(args)
-
-        print_vgpr(fun, get_caller_name_no_ext())
+        print(handler.vgpr_msg())
+        print_vgpr(lambda: run_benchmark(args, args.op), get_caller_name_no_ext())
         return 0
 
-    run_benchmark(args)
+    run_benchmark(args, args.op)
     return 0
 
 

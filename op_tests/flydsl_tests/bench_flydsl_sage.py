@@ -6,25 +6,13 @@
 
 Runs on gfx942 (MI300X) / gfx950 (MI350).
 
-Speed mode (default):
-    Only the attention kernel is timed. Q/K/V quantization (``sage_quant``),
-    output allocation prep, and kernel-cache lookup are performed once,
-    outside the ``do_bench`` loop. This matches ``bench_sage.py`` without
-    ``--e2e`` and lets you compare raw kernel throughput across backends.
-
-End-to-end mode (``--e2e``):
-    The full high-precision wrapper is timed, including ``sage_quant`` on
-    every call (mirrors ``bench_sage.py --e2e``).
-
 Usage:
     python op_tests/flydsl_tests/bench_flydsl_sage.py
-    python op_tests/flydsl_tests/bench_flydsl_sage.py --e2e
     python op_tests/flydsl_tests/bench_flydsl_sage.py --csv results.csv
     python op_tests/flydsl_tests/bench_flydsl_sage.py --warmup 50 --rep 200
 """
 
 import argparse
-import math
 import os
 import sys
 
@@ -64,7 +52,10 @@ except Exception:
     pass
 
 try:
-    from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
+    from aiter.ops.triton.attention.fav3_sage import (
+        fav3_sage_wrapper_func,
+        fav3_sage_func as _triton_sage_func,
+    )
 
     HAS_TRITON_SAGE = True
 except Exception as e:
@@ -73,12 +64,23 @@ except Exception as e:
 
 try:
     import flydsl  # noqa: F401
-    from aiter.ops.flydsl.sage_kernels import flydsl_sage_attn_func
+    from aiter.ops.flydsl.sage_kernels import (
+        flydsl_sage_attn_func,
+        flydsl_sage_attn_raw_func as _flydsl_sage_raw_func,
+        sage_quant as _v1_sage_quant,
+    )
 
     HAS_FLYDSL_SAGE = True
 except Exception as e:
     HAS_FLYDSL_SAGE = False
     _flydsl_sage_err = str(e)
+
+try:
+    from aiter.utility.dtypes import fp8 as _fp8_dtype
+
+    HAS_V1_QUANT = True
+except Exception:
+    HAS_V1_QUANT = False
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +98,7 @@ SHAPES: List[Tuple] = [
     (2, 4096, 8, 8, 128, False),
     (1, 16384, 8, 8, 128, False),
     (1, 16384, 24, 24, 128, False),  # large seq + many heads
-    (1, 75600, 5, 5, 128, False),  # initial setting
+    (1, 75600, 5, 5, 128, False),  # large seq + many heads
 ]
 
 
@@ -208,163 +210,6 @@ def run_accuracy(shapes, device):
 
 
 # ---------------------------------------------------------------------------
-# Kernel-only runner builders
-#
-# Both functions pre-compute everything the high-precision wrappers do *except*
-# the actual attention kernel launch, and return a thunk that runs only the
-# kernel. This mirrors ``bench_sage.py``'s default (non-e2e) timing path so
-# the Triton and FlyDSL columns are apples-to-apples kernel throughput.
-# ---------------------------------------------------------------------------
-
-
-def _build_triton_kernel_runner(q, k, v, causal, layout="bshd"):
-    """Return a thunk that times only the Triton ``fav3_sage_func`` kernel."""
-    import aiter as _aiter
-    from aiter.ops.triton.attention.fav3_sage import (
-        fav3_sage_func,
-        get_sage_fwd_configs,
-    )
-    from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
-        sage_quant as _triton_sage_quant,
-    )
-
-    cfg = get_sage_fwd_configs()
-    fp8_type = _aiter.dtypes.fp8
-    fp8_max = torch.finfo(fp8_type).max
-
-    head_dim = q.shape[-1]
-    softmax_scale = head_dim**-0.5
-
-    q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale = _triton_sage_quant(
-        q,
-        k,
-        v,
-        fp8_type,
-        fp8_max,
-        BLKQ=cfg["BLOCK_M"],
-        BLKK=cfg["BLOCK_N"],
-        sm_scale=softmax_scale,
-        layout=layout,
-    )
-
-    return lambda: fav3_sage_func(
-        q_int8,
-        k_int8,
-        v_fp8,
-        q_scale,
-        k_scale,
-        v_scale,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        return_lse=False,
-        layout=layout,
-        config=cfg,
-    )
-
-
-def _build_flydsl_kernel_runner(q, k, v, causal, layout="bshd"):
-    """Return a thunk that times only the FlyDSL ``sage_attn_cdna`` kernel.
-
-    Replicates the prep work inside :func:`flydsl_sage_attn_func` once, then
-    captures everything needed for the kernel ``exe(...)`` call in the closure.
-    """
-    from aiter.utility.dtypes import fp8 as _fp8_dtype
-    from aiter.ops.flydsl.sage_kernels import (
-        sage_quant as _flydsl_sage_quant_dispatch,
-        _get_kernel as _flydsl_get_kernel,
-    )
-
-    if layout == "bshd":
-        batch, seq_q, num_q_heads, head_dim = q.shape
-        _, seq_k, num_kv_heads, _ = k.shape
-    else:
-        batch, num_q_heads, seq_q, head_dim = q.shape
-        _, num_kv_heads, seq_k, _ = k.shape
-
-    softmax_scale = 1.0 / math.sqrt(head_dim)
-
-    try:
-        cu_count = torch.cuda.get_device_properties(
-            q.device.index
-        ).multi_processor_count
-    except Exception:
-        cu_count = 256
-    grid_at_bm256 = batch * num_q_heads * ((seq_q + 255) // 256)
-    block_m = 128 if grid_at_bm256 < cu_count else 256
-    block_n = 128
-    waves_per_eu = 2
-
-    fp8_dtype = _fp8_dtype
-    fp8_max = torch.finfo(fp8_dtype).max
-
-    q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale = _flydsl_sage_quant_dispatch(
-        q,
-        k,
-        v,
-        FP8_TYPE=fp8_dtype,
-        FP8_MAX=fp8_max,
-        BLKQ=block_m,
-        BLKK=block_n,
-        sm_scale=softmax_scale,
-        layout=layout,
-    )
-
-    if layout == "bhsd":
-        q_int8 = q_int8.permute(0, 2, 1, 3).contiguous()
-        k_int8 = k_int8.permute(0, 2, 1, 3).contiguous()
-        v_fp8 = v_fp8.permute(0, 2, 1, 3).contiguous()
-    else:
-        q_int8 = q_int8.contiguous()
-        k_int8 = k_int8.contiguous()
-        v_fp8 = v_fp8.contiguous()
-
-    seq_q_pad = ((seq_q + block_m - 1) // block_m) * block_m
-    n_pad_q = seq_q_pad - seq_q
-    if n_pad_q > 0:
-        q_int8 = torch.nn.functional.pad(q_int8, (0, 0, 0, 0, 0, n_pad_q))
-
-    num_q_blocks = q_scale.shape[2]
-
-    exe = _flydsl_get_kernel(
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        causal=causal,
-        waves_per_eu=waves_per_eu,
-        block_m=block_m,
-        block_n=block_n,
-    )
-
-    q_flat = q_int8.reshape(-1)
-    k_flat = k_int8.reshape(-1)
-    v_flat = v_fp8.reshape(-1)
-    out_shape = (batch, seq_q_pad, num_q_heads, head_dim)
-    device_index = q.device.index
-
-    def _runner():
-        o = torch.empty(out_shape, dtype=torch.bfloat16, device=q.device)
-        launch_stream = torch.cuda.current_stream(q.device)
-        with torch.cuda.device(device_index):
-            exe(
-                q_flat,
-                k_flat,
-                v_flat,
-                o.reshape(-1),
-                q_scale,
-                k_scale,
-                v_scale,
-                batch,
-                seq_q_pad,
-                seq_k,
-                num_q_blocks,
-                stream=launch_stream,
-            )
-        return o
-
-    return _runner
-
-
-# ---------------------------------------------------------------------------
 # Speed
 # ---------------------------------------------------------------------------
 
@@ -385,149 +230,242 @@ def _do_bench(fn, warmup, rep):
     return (time.perf_counter() - t0) / 50 * 1000
 
 
-def run_speed(shapes, device, warmup, rep, e2e, no_sdpa=False):
-    mode = "e2e (wrapper, incl. sage_quant)" if e2e else "kernel-only (pre-quantized)"
-    print("\n" + "=" * 110)
-    print(f"SPEED  (warmup={warmup}ms  rep={rep}ms  mode={mode})")
-    print("=" * 110)
+def _v1_prequant(q, k, v, softmax_scale, block_m, block_n=128):
+    """Quantize BF16 q/k/v to INT8/FP8 for v1 sage attention."""
+    fp8_max = torch.finfo(_fp8_dtype).max
+    return _v1_sage_quant(
+        q,
+        k,
+        v,
+        FP8_TYPE=_fp8_dtype,
+        FP8_MAX=fp8_max,
+        BLKQ=block_m,
+        BLKK=block_n,
+        sm_scale=softmax_scale,
+        layout="bshd",
+    )
 
-    if no_sdpa:
-        hdr = (
-            f"{'Shape':<38}"
-            f"{'Triton ms':>10} {'Triton TFLOPS':>13}"
-            f"{'FlyDSL ms':>10} {'FlyDSL TFLOPS':>13} {'vs Triton':>10}"
-        )
-    else:
-        hdr = (
-            f"{'Shape':<38}"
-            f"{'SDPA ms':>9} {'SDPA TFLOPS':>11}"
-            f"{'Triton ms':>10} {'Triton TFLOPS':>13} {'vs SDPA':>8}"
-            f"{'FlyDSL ms':>10} {'FlyDSL TFLOPS':>13} {'vs SDPA':>8} {'vs Triton':>10}"
-        )
+
+def run_speed(shapes, device, warmup, rep):
+    print("\n" + "=" * 150)
+    print(f"SPEED  (warmup={warmup}ms  rep={rep}ms)")
+    print("=" * 150)
+
+    hdr = (
+        f"{'Shape':<38}"
+        f"{'SDPA ms':>9} {'SDPA TFLOPS':>11}"
+        f"{'Triton ms':>10} {'Triton TFLOPS':>13} {'Triton attn TFLOPS':>18} {'vs SDPA':>8}"
+        f"{'FlyDSL ms':>10} {'FlyDSL TFLOPS':>13} {'FlyDSL attn TFLOPS':>18} {'vs SDPA':>8} {'vs Triton':>10}"
+    )
     print(hdr)
-    print("-" * 110)
+    print("-" * 150)
 
     csv_rows = []
     for B, S, Hq, Hk, D, causal in shapes:
         label = _label(B, S, Hq, Hk, D, causal)
         q, k, v = _make_qkv(B, S, Hq, Hk, D, device)
         flops = _attn_flops(B, Hq, S, D, causal)
+        sm_scale = 1.0 / (D**0.5)
+        # Attn-only pre-quant uses BLOCK_M=256 to match Triton's fav3_sage_func
+        # default config; end-to-end wrappers auto-select their own block_m.
+        ATTN_BLOCK_M = 256
 
         # SDPA (fp32 reference) — expand KV heads for GQA
-        if no_sdpa:
-            sdpa_ms = None
-            sdpa_tflops = None
-        else:
-            q_bhsd = q.float().transpose(1, 2).contiguous()
-            k_bhsd = k.float().transpose(1, 2).contiguous()
-            v_bhsd = v.float().transpose(1, 2).contiguous()
-            if Hq != Hk:
-                groups = Hq // Hk
-                k_bhsd = k_bhsd.repeat_interleave(groups, dim=1)
-                v_bhsd = v_bhsd.repeat_interleave(groups, dim=1)
+        q_bhsd = q.float().transpose(1, 2).contiguous()
+        k_bhsd = k.float().transpose(1, 2).contiguous()
+        v_bhsd = v.float().transpose(1, 2).contiguous()
+        if Hq != Hk:
+            groups = Hq // Hk
+            k_bhsd = k_bhsd.repeat_interleave(groups, dim=1)
+            v_bhsd = v_bhsd.repeat_interleave(groups, dim=1)
 
-            def sdpa_fn():
-                return F.scaled_dot_product_attention(
-                    q_bhsd, k_bhsd, v_bhsd, is_causal=causal
+        def sdpa_fn(_q=q_bhsd, _k=k_bhsd, _v=v_bhsd, _c=causal):
+            return F.scaled_dot_product_attention(_q, _k, _v, is_causal=_c)
+
+        sdpa_ms = _do_bench(sdpa_fn, warmup, rep)
+        sdpa_tflops = flops / sdpa_ms / 1e9
+        del q_bhsd, k_bhsd, v_bhsd, sdpa_fn
+
+        # Pre-quantize for attn-only benchmarks
+        prequant_ok = HAS_FLYDSL_SAGE and HAS_V1_QUANT
+        q_int8 = q_scale = k_int8 = k_scale = v_fp8 = v_scale = None
+        if prequant_ok:
+            try:
+                q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale = _v1_prequant(
+                    q, k, v, sm_scale, ATTN_BLOCK_M
                 )
+                # Pad seq dim to ATTN_BLOCK_M multiple
+                seq_q_pad = ((S + ATTN_BLOCK_M - 1) // ATTN_BLOCK_M) * ATTN_BLOCK_M
+                n_pad = seq_q_pad - S
+                if n_pad > 0:
+                    q_int8 = torch.nn.functional.pad(
+                        q_int8.contiguous(), (0, 0, 0, 0, 0, n_pad)
+                    )
+                else:
+                    q_int8 = q_int8.contiguous()
+                k_int8 = k_int8.contiguous()
+                v_fp8 = v_fp8.contiguous()
+                torch.cuda.synchronize()
+            except Exception:
+                prequant_ok = False
 
-            sdpa_ms = _do_bench(sdpa_fn, warmup, rep)
-            sdpa_tflops = flops / sdpa_ms / 1e9
-
-        # Triton sage
+        # Triton sage (end-to-end)
         if HAS_TRITON_SAGE:
             try:
-                if e2e:
-
-                    def triton_fn():
-                        return fav3_sage_wrapper_func(q, k, v, causal=causal)
-
-                else:
-                    triton_fn = _build_triton_kernel_runner(q, k, v, causal)
-
-                triton_fn()
+                fav3_sage_wrapper_func(q, k, v, causal=causal)
                 torch.cuda.synchronize()
+
+                def triton_fn(_q=q, _k=k, _v=v, _c=causal):
+                    return fav3_sage_wrapper_func(_q, _k, _v, causal=_c)
 
                 triton_ms = _do_bench(triton_fn, warmup, rep)
+                del triton_fn
                 triton_tflops = flops / triton_ms / 1e9
-                if no_sdpa:
-                    t_str = f"{triton_ms:>10.3f} {triton_tflops:>13.2f}"
+                triton_vs_sdpa = sdpa_ms / triton_ms
+
+                # Triton attn-only
+                if prequant_ok:
+                    try:
+                        _triton_sage_func(
+                            q_int8,
+                            k_int8,
+                            v_fp8,
+                            q_scale,
+                            k_scale,
+                            v_scale,
+                            softmax_scale=sm_scale,
+                            causal=causal,
+                            layout="bshd",
+                        )
+                        torch.cuda.synchronize()
+
+                        def triton_attn_fn(
+                            _qi=q_int8,
+                            _ki=k_int8,
+                            _vf=v_fp8,
+                            _qs=q_scale,
+                            _ks=k_scale,
+                            _vs=v_scale,
+                            _sm=sm_scale,
+                            _c=causal,
+                        ):
+                            return _triton_sage_func(
+                                _qi,
+                                _ki,
+                                _vf,
+                                _qs,
+                                _ks,
+                                _vs,
+                                softmax_scale=_sm,
+                                causal=_c,
+                                layout="bshd",
+                            )
+
+                        triton_attn_ms = _do_bench(triton_attn_fn, warmup, rep)
+                        del triton_attn_fn
+                        triton_attn_tflops = flops / triton_attn_ms / 1e9
+                        t_attn_str = f"{triton_attn_tflops:>18.2f}"
+                    except Exception:
+                        t_attn_str = f"{'FAILED':>18}"
                 else:
-                    triton_vs_sdpa = sdpa_ms / triton_ms
-                    t_str = (
-                        f"{triton_ms:>10.3f} {triton_tflops:>13.2f}"
-                        f" {triton_vs_sdpa:>7.2f}x"
-                    )
-            except Exception:
+                    t_attn_str = f"{'N/A':>18}"
+
                 t_str = (
-                    f"{'FAILED':>10} {'':>13}"
-                    if no_sdpa
-                    else f"{'FAILED':>10} {'':>13} {'':>8}"
+                    f"{triton_ms:>10.3f} {triton_tflops:>13.2f} "
+                    f"{t_attn_str} {triton_vs_sdpa:>7.2f}x"
                 )
+            except Exception:
+                t_str = f"{'FAILED':>10} {'':>13} {'':>18} {'':>8}"
                 triton_ms = None
         else:
-            t_str = (
-                f"{'N/A':>10} {'':>13}"
-                if no_sdpa
-                else f"{'N/A':>10} {'':>13} {'':>8}"
-            )
+            t_str = f"{'N/A':>10} {'':>13} {'':>18} {'':>8}"
             triton_ms = None
 
-        # FlyDSL sage
+        # FlyDSL sage (end-to-end)
         if HAS_FLYDSL_SAGE:
             try:
-                if e2e:
-
-                    def flydsl_fn():
-                        return flydsl_sage_attn_func(q, k, v, causal=causal)
-
-                else:
-                    flydsl_fn = _build_flydsl_kernel_runner(q, k, v, causal)
-
-                flydsl_fn()
+                flydsl_sage_attn_func(q, k, v, causal=causal)
                 torch.cuda.synchronize()
 
+                def flydsl_fn(_q=q, _k=k, _v=v, _c=causal):
+                    return flydsl_sage_attn_func(_q, _k, _v, causal=_c)
+
                 flydsl_ms = _do_bench(flydsl_fn, warmup, rep)
+                del flydsl_fn
                 flydsl_tflops = flops / flydsl_ms / 1e9
+                flydsl_vs_sdpa = sdpa_ms / flydsl_ms
                 flydsl_vs_triton = (
                     f"{triton_ms / flydsl_ms:.2f}x" if triton_ms else "  N/A"
                 )
-                if no_sdpa:
-                    f_str = (
-                        f"{flydsl_ms:>10.3f} {flydsl_tflops:>13.2f}"
-                        f" {flydsl_vs_triton:>10}"
-                    )
+
+                # FlyDSL attn-only
+                if prequant_ok:
+                    try:
+                        _flydsl_sage_raw_func(
+                            q_int8,
+                            k_int8,
+                            v_fp8,
+                            q_scale,
+                            k_scale,
+                            v_scale,
+                            seq_q=S,
+                            seq_k=S,
+                            causal=causal,
+                            block_m=ATTN_BLOCK_M,
+                        )
+                        torch.cuda.synchronize()
+
+                        def flydsl_attn_fn(
+                            _qi=q_int8,
+                            _ki=k_int8,
+                            _vf=v_fp8,
+                            _qs=q_scale,
+                            _ks=k_scale,
+                            _vs=v_scale,
+                            _sq=S,
+                            _sk=S,
+                            _c=causal,
+                            _bm=ATTN_BLOCK_M,
+                        ):
+                            return _flydsl_sage_raw_func(
+                                _qi,
+                                _ki,
+                                _vf,
+                                _qs,
+                                _ks,
+                                _vs,
+                                seq_q=_sq,
+                                seq_k=_sk,
+                                causal=_c,
+                                block_m=_bm,
+                            )
+
+                        flydsl_attn_ms = _do_bench(flydsl_attn_fn, warmup, rep)
+                        del flydsl_attn_fn
+                        flydsl_attn_tflops = flops / flydsl_attn_ms / 1e9
+                        f_attn_str = f"{flydsl_attn_tflops:>18.2f}"
+                    except Exception:
+                        f_attn_str = f"{'FAILED':>18}"
                 else:
-                    flydsl_vs_sdpa = sdpa_ms / flydsl_ms
-                    f_str = (
-                        f"{flydsl_ms:>10.3f} {flydsl_tflops:>13.2f}"
-                        f" {flydsl_vs_sdpa:>7.2f}x {flydsl_vs_triton:>10}"
-                    )
-            except Exception:
+                    f_attn_str = f"{'N/A':>18}"
+
                 f_str = (
-                    f"{'FAILED':>10} {'':>13} {'':>10}"
-                    if no_sdpa
-                    else f"{'FAILED':>10} {'':>13} {'':>8} {'':>10}"
+                    f"{flydsl_ms:>10.3f} {flydsl_tflops:>13.2f} "
+                    f"{f_attn_str} {flydsl_vs_sdpa:>7.2f}x {flydsl_vs_triton:>10}"
                 )
+            except Exception:
+                f_str = f"{'FAILED':>10} {'':>13} {'':>18} {'':>8} {'':>10}"
                 flydsl_ms = None
         else:
-            f_str = (
-                f"{'N/A':>10} {'':>13} {'':>10}"
-                if no_sdpa
-                else f"{'N/A':>10} {'':>13} {'':>8} {'':>10}"
-            )
+            f_str = f"{'N/A':>10} {'':>13} {'':>18} {'':>8} {'':>10}"
             flydsl_ms = None
 
-        if no_sdpa:
-            line = f"{label:<38}{t_str}{f_str}"
-        else:
-            line = (
-                f"{label:<38}"
-                f"{sdpa_ms:>9.3f} {sdpa_tflops:>11.2f}"
-                f"{t_str}{f_str}"
-            )
+        line = f"{label:<38}" f"{sdpa_ms:>9.3f} {sdpa_tflops:>11.2f}" f"{t_str}{f_str}"
         print(line)
         csv_rows.append((label, sdpa_ms, sdpa_tflops, triton_ms, flydsl_ms))
+
+        del q, k, v, q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale
+        torch.cuda.empty_cache()
 
     return csv_rows
 
@@ -554,20 +492,6 @@ def main():
     )
     parser.add_argument("--accuracy-only", action="store_true")
     parser.add_argument("--speed-only", action="store_true")
-    parser.add_argument(
-        "--no-sdpa",
-        action="store_true",
-        help="Skip the PyTorch SDPA reference timing and drop its columns.",
-    )
-    parser.add_argument(
-        "--e2e",
-        action="store_true",
-        help=(
-            "End-to-end timing: include sage_quant in the timed region "
-            "(default: time only the attention kernel, with quantization "
-            "performed once outside the do_bench loop)."
-        ),
-    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -584,7 +508,6 @@ def main():
         f"Providers: triton_sage={'YES' if HAS_TRITON_SAGE else 'NO'}  "
         f"flydsl_sage={'YES' if HAS_FLYDSL_SAGE else 'NO'}"
     )
-    print(f"Speed mode: {'e2e (incl. sage_quant)' if args.e2e else 'kernel-only'}")
 
     if not HAS_TRITON_SAGE:
         print(f"  [triton sage unavailable: {_triton_sage_err}]")
@@ -596,9 +519,7 @@ def main():
 
     speed_rows = None
     if not args.accuracy_only:
-        speed_rows = run_speed(
-            SHAPES, device, args.warmup, args.rep, args.e2e, no_sdpa=args.no_sdpa
-        )
+        speed_rows = run_speed(SHAPES, device, args.warmup, args.rep)
 
     if args.csv and speed_rows:
         save_csv(args.csv, speed_rows)
