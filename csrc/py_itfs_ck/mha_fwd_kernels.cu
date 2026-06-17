@@ -40,8 +40,9 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    const std::optional<at::Tensor> &cu_seqlens_kv_,
                                    const std::string& data_type,
                                    bias_enum bias_type,
-                                   quant_scale_enum qscale_type,
-                                   const std::optional<at::Tensor> &sink_ptr_)
+                                   int qscale_type,
+                                   const std::optional<at::Tensor> &sink_ptr_,
+                                   int how_v3_bf16_cvt)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -101,14 +102,14 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
     const ck_tile::index_t *cu_seqlen_q_ptr = cu_seqlens_q_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_q_.value().data_ptr<int32_t>()) : nullptr;
     const ck_tile::index_t *cu_seqlen_kv_ptr = cu_seqlens_kv_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_kv_.value().data_ptr<int32_t>()) : nullptr;
     const void *sink_ptr      = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
-    return mha_fwd_args{false, // use_asm_v3
+    return mha_fwd_args{true, // use_asm_v3
                         false, // v3_api_check
-                        1, // how_v3_bf16_cvt
+                        how_v3_bf16_cvt,
                         data_type,
                         false, // is_group_mode
                         static_cast<int>(bias_type),
                         has_lse,
-                        static_cast<int>(qscale_type),
+                        qscale_type,
                         mask.sink > 0, // has_sink
                         q.data_ptr(),
                         k.data_ptr(),
@@ -198,6 +199,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         std::optional<const at::Tensor> k_descale_,    // [1]
         std::optional<const at::Tensor> v_descale_,    // [1]
         std::optional<const at::Tensor> sink_ptr,      // [hq]
+        int how_v3_bf16_cvt,
         std::optional<at::Generator> gen_)
 {
     auto q_dtype = q.scalar_type();
@@ -225,8 +227,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                 k_descale_.has_value() == v_descale_.has_value(),
                 "q_descale, k_descale, v_descale must be all provided or all not provided");
 
-    quant_scale_enum qscale_type =
-        q_descale_.has_value() ? quant_scale_enum::pertensor : quant_scale_enum::no_scale;
+    int qscale_type = q_descale_.has_value() ? 1 : 0;
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
 
@@ -383,7 +384,8 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                 dtype_str,
                 bias_type,
                 qscale_type,
-                sink_ptr);
+                sink_ptr,
+                how_v3_bf16_cvt);
 
         float t = aiter::mha_fwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");

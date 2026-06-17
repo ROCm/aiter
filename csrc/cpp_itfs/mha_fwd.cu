@@ -1,13 +1,10 @@
 #include "mha_fwd.h"
 #include "aiter_hip_common.h"
-#if FAV3_ON
 #include "asm_fmha_v3_fwd_configs.hpp"
-#endif
 #include <memory>
 #include <string>
 
 namespace aiter {
-#if FAV3_ON
 
 int get_cfg_mask_type(const mha_fwd_args& a)
 {
@@ -210,6 +207,11 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     if(!a.use_asm_v3)
         return -1;
 
+    // Keep decode/small-Q on CK when available. With ENABLE_CK=0, the
+    // unsupported sentinel lets Python fall back to Triton.
+    if(a.seqlen_q <= 128)
+        return -1;
+
     std::string arch_id = get_gpu_arch();
 
     if((a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
@@ -266,9 +268,8 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz, bdx, 1, 1, s_.stream_id_});
     });
 }
-#endif
 
-#if FAV2_ON
+#if ENABLE_CK
 float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
 {
     fmha_fwd_traits traits{a.hdim_q,
@@ -365,11 +366,9 @@ float mha_fwd(mha_fwd_args args, const ck_tile::stream_config& s)
 {
     float ret = -1;
 
-#if FAV3_ON
     ret = fmha_fwd_v3(args, s);
-#endif
 
-#if FAV2_ON
+#if ENABLE_CK
     if(ret == -1 && !args.v3_api_check)
     {
         ret = fmha_fwd_ck(args, s);

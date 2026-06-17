@@ -1133,7 +1133,6 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'"
         ],
         "flags_extra_cc": [
-            "'-DFAV3_ON=1'",
             "'-DENABLE_CK=0'"
         ],
         "flags_extra_hip": [],
@@ -1151,9 +1150,7 @@
             "f'{AITER_CSRC_DIR}/pybind/mha_fwd_pybind.cu'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'"
         ],
-        "flags_extra_cc": [
-            "'-DFAV2_ON=1'"
-        ],
+        "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
@@ -1166,6 +1163,7 @@
         "verbose": "False",
         "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}'",
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'"
         ]
     },
@@ -1177,9 +1175,7 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cu'"
         ],
-        "flags_extra_cc": [
-            "'-DFAV2_ON=1'"
-        ],
+        "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
@@ -1229,7 +1225,6 @@
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [
-            "'-DONLY_FAV3=1'",
             "'-DENABLE_CK=0'"
         ],
         "flags_extra_hip": [],
@@ -1267,7 +1262,6 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'"
         ],
         "flags_extra_cc": [
-            "'-DFAV3_ON=1'",
             "'-DENABLE_CK=0'"
         ],
         "flags_extra_hip": [],

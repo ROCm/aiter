@@ -37,6 +37,7 @@ def cmdGenFunc_mha_fwd(
     k_descale: Optional[Tensor] = None,
     v_descale: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    how_v3_bf16_cvt: int = 1,
     gen: Optional[Generator] = None,
 ):
     _, seqlen_q, _, _ = q.shape
@@ -46,6 +47,8 @@ def cmdGenFunc_mha_fwd(
         causal = False
 
     md_name = "mha_fwd"
+    if not ENABLE_CK:
+        md_name += "_nock"
     filter = "*"
     if q.dtype == dtypes.fp16:
         md_name += "_fp16"
@@ -95,9 +98,13 @@ def cmdGenFunc_mha_fwd(
         filter += "_pertensor*"
 
     blob_gen_cmd = [
-        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-        "--receipt 100 --filter {} --output_dir {{}}".format(filter),
+        f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}",
     ]
+    if ENABLE_CK:
+        blob_gen_cmd.append(
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
+            "--receipt 100 --filter {} --output_dir {{}}".format(filter)
+        )
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
@@ -182,6 +189,7 @@ def gen_mha_fwd_fake_tensors(
     k_descale: Optional[Tensor] = None,
     v_descale: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    how_v3_bf16_cvt: int = 1,
     gen: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return common_mha_fwd_fake_tensors(
@@ -216,6 +224,7 @@ def mha_fwd(
     k_descale: Optional[Tensor] = None,
     v_descale: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    how_v3_bf16_cvt: int = 1,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
@@ -841,6 +850,8 @@ def cmdGenFunc_mha_bwd(
     d_sink: Optional[Tensor] = None,
 ):
     md_name = "mha_bwd"
+    if not ENABLE_CK:
+        md_name += "_nock"
     filter1 = "*"  # get_bwd_dot_do_o_blobs()
     filter2 = "*"  # get_bwd_convert_dq_blobs()
     filter3 = "*"  # get_bwd_dq_dk_dv_blobs()
@@ -893,14 +904,17 @@ def cmdGenFunc_mha_bwd(
     filter = f"{filter1}@{filter2}@{filter3}"
 
     blob_gen_cmd = [
-        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 300 --filter {} --output_dir {{}}".format(filter),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
+    if ENABLE_CK:
+        blob_gen_cmd.insert(
+            0,
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
+            "--receipt 300 --filter {} --output_dir {{}}".format(filter),
+        )
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
     }
 
 
@@ -1467,69 +1481,6 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
-def _can_impl_fmha_fwd_with_sink_asm(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dropout_p: float,
-    causal: bool,
-    window_size: Tuple[int, ...],
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_kv: Optional[torch.Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
-) -> bool:
-    # gfx1250 ASM bf16 forward (fmha_fwd_with_sink_asm).  Single-shot batched
-    # (no varlen / dropout / swa / quant / alibi / bias).  Sink logits
-    # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
-    _, _, nhead_q, hdim_q = q.shape
-    _, seqlen_k, nhead_k, _ = k.shape
-    hdim_v = v.shape[3]
-    window_size_left = int(window_size[0])
-    window_size_right = int(window_size[1])
-    sink_size = int(window_size[2]) if len(window_size) == 3 else 0
-    window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
-    window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    swa = (window_size_left > 0) or (window_size_right > 0)
-
-    ret = get_gfx() == "gfx1250"
-    ret = ret and (q.dtype == dtypes.bf16)
-    # Only causal gfx1250 binaries are registered in fmha_fwd_bf16*.csv.
-    ret = ret and bool(causal)
-    ret = ret and (hdim_q in (64, 128))
-    ret = ret and (hdim_v == hdim_q)
-    ret = ret and (nhead_q % nhead_k == 0)
-    ret = ret and (not swa)
-    ret = ret and (sink_size == 0)
-    ret = ret and (alibi_slopes is None and bias is None)
-    ret = ret and (dropout_p == 0.0)
-    ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
-    ret = ret and (q_descale is None and k_descale is None and v_descale is None)
-    # Per-hdim sink eligibility:
-    #
-    #   D128 kernels (`_rxy`) compile ENABLE_SINK=0 -- the kernel ignores
-    #   any sink buffer.  Routing a caller's sink_ptr to it would silently
-    #   drop the sink term, so we fall back to CK whenever sink_ptr is set.
-    #
-    #   D64 kernels (`_rxy_sink`) compile ENABLE_SINK=1 -- the kernel
-    #   ALWAYS reads SINK and adds `exp((sink - max) * scale)` to the
-    #   softmax denominator.  There is no "skip sink" mode on this binary,
-    #   so calling it with sink_ptr=None now forwards a null pointer to the
-    #   kernel (the wrapper no longer raises / zero-fills), which the D64
-    #   binary would dereference.  To preserve flash_attn_func's documented
-    #   `sink_ptr is None` semantics we keep requiring an explicit sink for
-    #   D64 here and fall back to CK otherwise.
-    if hdim_q == 128:
-        ret = ret and (sink_ptr is None)
-    elif hdim_q == 64:
-        ret = ret and (sink_ptr is not None)
-    return ret
-
-
 def _native_splitkv_heuristic(batch, nhead_q, seqlen_q, seqlen_k, num_cu):
     # Pick split-KV group count G for the native D64 kernel; G == 0 falls back to
     # the CK non-split-KV kernel. Tuned on 100 measured shapes
@@ -1577,6 +1528,57 @@ def _native_splitkv_heuristic(batch, nhead_q, seqlen_q, seqlen_k, num_cu):
     return min(g, kv_cap) if kv_cap > 0 else 0
 
 
+def _can_use_aiter_bwd_without_ck(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    causal: bool,
+    window_size: Tuple[int, ...],
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    deterministic: bool,
+) -> bool:
+    _, seqlen_q, nhead_q, hdim_q = q.shape
+    _, seqlen_k, nhead_k, hdim_v = v.shape
+    window_size_left = int(window_size[0])
+    window_size_right = int(window_size[1])
+    window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
+    window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
+    nmask = not causal and window_size_left == -1 and window_size_right == -1
+    mask = causal and window_size_left == -1
+    swa = (window_size_left > 0) or (window_size_right > 0)
+    gfx = get_gfx()
+
+    ret = alibi_slopes is None
+    ret = ret and (bias is None)
+    ret = ret and (dropout_p == 0.0)
+    ret = ret and (seqlen_q > 16)
+    ret = ret and (nhead_q % nhead_k == 0)
+    if not ret:
+        return False
+
+    if gfx == "gfx942":
+        ret = not deterministic
+        ret = ret and (hdim_q == hdim_v)
+        ret = ret and (64 <= hdim_q <= 192 and hdim_q % 8 == 0)
+        ret = ret and (
+            (hdim_q == 64 and not swa)
+            or (64 < hdim_q <= 192 and (nmask or mask or (swa and hdim_q <= 128)))
+        )
+        return ret
+
+    if gfx == "gfx950":
+        is_950_1block = seqlen_k <= 256 and 64 < hdim_q <= 128 and hdim_q % 8 == 0
+        ret = (not deterministic) or is_950_1block
+        ret = ret and (((64 < hdim_q <= 128) or (hdim_q == 192 and hdim_v == 128)))
+        ret = ret and (hdim_q % 8 == 0)
+        ret = ret and (not swa)
+        return ret
+
+    return False
+
+
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1615,40 +1617,41 @@ def _flash_attn_forward(
     # nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
-    def is_fmha_v3_fp8():
-        ret = get_gfx() in ("gfx942", "gfx950")
-        ret = ret and (hdim_q == 128)
-        ret = ret and (q.dtype == dtypes.fp8)
-        ret = ret and (
-            q_descale is not None and k_descale is not None and v_descale is not None
-        )
-        # support per tensor and per head quant scale
-        ret = ret and (
-            q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
-        )
-        ret = ret and (
-            q_descale.shape == k_descale.shape and q_descale.shape == v_descale.shape
-        )
-        return ret
-
-    def can_impl_fmha_v3_fwd():
-        # basic
-        # fmha v3 is hand-written gfx9 ASM; non-gfx9 must fall back to ck-tile.
-        ret = get_gfx() in ("gfx942", "gfx950")
-        ret = ret and (alibi_slopes is None)
-        ret = ret and (bias is None)
-        ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_v == 128)
-        ret = ret and (hdim_q == 128 or hdim_q == 192)
+    def can_impl_fmha_fwd_with_sink_asm():
+        # gfx1250 ASM bf16 forward (fmha_fwd_with_sink_asm).  Single-shot batched
+        # (no varlen / dropout / swa / quant / alibi / bias).  Sink logits
+        # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
+        ret = get_gfx() == "gfx1250"
+        ret = ret and (q.dtype == dtypes.bf16)
+        # Only causal gfx1250 binaries are registered in fmha_fwd_bf16*.csv.
+        ret = ret and bool(causal)
+        ret = ret and (hdim_q in (64, 128))
+        ret = ret and (hdim_v == hdim_q)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
-        ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
+        ret = ret and (sink_size == 0)
+        ret = ret and (alibi_slopes is None and bias is None)
+        ret = ret and (dropout_p == 0.0)
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
-        # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table
-        # (1,2,4,8,16); arbitrary divisor ratios route to CK.
-        if is_fmha_v3_fp8():
-            gqa_ratio = nhead_q // nhead_k
-            ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
+        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
+        # Per-hdim sink eligibility:
+        #
+        #   D128 kernels (`_rxy`) compile ENABLE_SINK=0 -- the kernel ignores
+        #   any sink buffer.  Routing a caller's sink_ptr to it would silently
+        #   drop the sink term, so we fall back to CK whenever sink_ptr is set.
+        #
+        #   D64 kernels (`_rxy_sink`) compile ENABLE_SINK=1 -- the kernel
+        #   ALWAYS reads SINK and adds `exp((sink - max) * scale)` to the
+        #   softmax denominator.  There is no "skip sink" mode on this binary,
+        #   so calling it with sink_ptr=None now forwards a null pointer to the
+        #   kernel (the wrapper no longer raises / zero-fills), which the D64
+        #   binary would dereference.  To preserve flash_attn_func's documented
+        #   `sink_ptr is None` semantics we keep requiring an explicit sink for
+        #   D64 here and fall back to CK otherwise.
+        if hdim_q == 128:
+            ret = ret and (sink_ptr is None)
+        elif hdim_q == 64:
+            ret = ret and (sink_ptr is not None)
         return ret
 
     def can_impl_fmha_native():
@@ -1718,22 +1721,7 @@ def _flash_attn_forward(
             return out_, softmax_lse, S_dmask, rng_state
         # ns <= 1 (0 = heuristic fallback, 1 = forced no-split) -> existing dispatch
     # can_impl_fmha_native() False -> num_splits ignored, existing dispatch
-    if _can_impl_fmha_fwd_with_sink_asm(
-        q,
-        k,
-        v,
-        dropout_p,
-        causal,
-        (window_size_left, window_size_right, sink_size),
-        bias,
-        alibi_slopes,
-        q_descale,
-        k_descale,
-        v_descale,
-        cu_seqlens_q,
-        cu_seqlens_kv,
-        sink_ptr,
-    ):
+    if can_impl_fmha_fwd_with_sink_asm():
         # gfx1250 ASM bf16 path: q/k/v are bshd; kernel reads strides directly,
         # no API-side permute.  softmax_scale is forwarded as-is (kernel applies
         # it internally to Q·K^T).  sink_ptr is passed through verbatim -- it is
@@ -1756,27 +1744,6 @@ def _flash_attn_forward(
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-    elif can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
-        out_, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size_left,
-            window_size_right,
-            return_lse,
-            return_softmax,
-            how_v3_bf16_cvt,
-            out,
-            bias,
-            alibi_slopes,
-            q_descale,
-            k_descale,
-            v_descale,
-            None,
-        )
     else:
         out_, softmax_lse, S_dmask, rng_state = mha_fwd(
             q,
@@ -1799,189 +1766,11 @@ def _flash_attn_forward(
             k_descale,
             v_descale,
             sink_ptr,
+            how_v3_bf16_cvt,
             None,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return out_, softmax_lse, S_dmask, rng_state
-
-
-# @torch_compile_guard(mutates_args=[])
-def can_impl_fmha_v3_bwd(
-    dout: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
-    dbias: Optional[torch.Tensor],
-    dropout_p: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
-    deterministic: bool,
-    is_v3_atomic_fp32: Optional[bool] = True,
-) -> bool:
-    _, seqlen_q, nhead_q, hdim_q = q.shape
-    _, seqlen_k, nhead_k, hdim_v = v.shape
-    batch_stride_q = q.stride(0)
-    stride_q = q.stride(1)
-    nhead_stride_q = q.stride(2)
-
-    batch_stride_k = k.stride(0)
-    stride_k = k.stride(1)
-    nhead_stride_k = k.stride(2)
-
-    batch_stride_v = v.stride(0)
-    stride_v = v.stride(1)
-    nhead_stride_v = v.stride(2)
-
-    batch_stride_do = dout.stride(0)
-    stride_do = dout.stride(1)
-    nhead_stride_do = dout.stride(2)
-
-    batch_stride_dk = dk.stride(0)
-    nhead_stride_dk = dk.stride(2)
-
-    batch_stride_dv = dv.stride(0)
-    nhead_stride_dv = dv.stride(2)
-
-    # mask
-    window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
-    window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    mask = causal and window_size_left == -1  # causal mask
-    nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)
-
-    def np():
-        # bwd_hd128_bf16_a16_rtne
-        # bwd_hd128_bf16_a16_rtna
-        # bwd_hd128_bf16_a16_rtz
-        # bwd_hd128_bf16_a32_rtne
-        # bwd_hd128_bf16_a32_rtna
-        # bwd_hd128_bf16_a32_rtz
-        # bwd_hd128_bf16_causal_a16_rtne
-        # bwd_hd128_bf16_causal_a16_rtna
-        # bwd_hd128_bf16_causal_a16_rtz
-        # bwd_hd128_bf16_causal_a32_rtne
-        # bwd_hd128_bf16_causal_a32_rtna
-        # bwd_hd128_bf16_causal_a32_rtz
-        # bwd_hd128_fp16_a16
-        # bwd_hd128_fp16_a32
-        # bwd_hd128_fp16_causal_a16
-        # bwd_hd128_fp16_causal_a32
-        # bwd_hd64_bf16_a16_rtne
-        # bwd_hd64_bf16_a16_rtna
-        # bwd_hd64_bf16_a16_rtz
-        # bwd_hd64_bf16_causal_a16_rtne
-        # bwd_hd64_bf16_causal_a16_rtna
-        # bwd_hd64_bf16_causal_a16_rtz
-        # bwd_hd64_fp16_a16
-        # bwd_hd64_fp16_causal_a16
-        npssk = seqlen_q == seqlen_k
-        npssk &= seqlen_k % 64 == 0
-        npssk &= stride_q == stride_do
-        npssk &= nhead_stride_q == nhead_stride_do
-        npssk &= batch_stride_q == batch_stride_do
-        npssk &= stride_k == stride_v
-        npssk &= nhead_stride_k == nhead_stride_v
-        npssk &= batch_stride_k == batch_stride_v
-        npssk &= nhead_stride_k == nhead_stride_dk
-        npssk &= nhead_stride_v == nhead_stride_dv
-        npssk &= (batch_stride_dk / batch_stride_k) == (nhead_q / nhead_k)
-        npssk &= (batch_stride_dv / batch_stride_v) == (nhead_q / nhead_k)
-
-        hd128_case = (hdim_q == 128) and npssk
-        hd64_case = (hdim_q == 64 and is_v3_atomic_fp32 == False) and npssk
-        ret = hd128_case or hd64_case
-        ret &= not swa
-
-        return ret
-
-    def pssk():
-        # only for hd64 a32 causal/no causal, fp16/bf16-rtne/rtna/rtz cases
-        # FIXME: Currently we only support mask_type == mask_enum::no_mask or causal mask with seqlen_q == seqlen_k
-        # Because python side only support mask_enum::bottom_right
-        # However v3 kernel only support mask_enum::top_left
-        # bwd_hd64_bf16_a32_rtne_pssk
-        # bwd_hd64_bf16_a32_rtna_pssk
-        # bwd_hd64_bf16_a32_rtz_pssk
-        # bwd_hd64_bf16_causal_a32_rtne_pssk
-        # bwd_hd64_bf16_causal_a32_rtna_pssk
-        # bwd_hd64_bf16_causal_a32_rtz_pssk
-        # bwd_hd64_fp16_a32_pssk
-        # bwd_hd64_fp16_causal_a32_pssk
-        # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        ret = hdim_q == 64 and is_v3_atomic_fp32 == True
-        ret &= not swa
-
-        return ret
-
-    def pddv():
-        # only for a16 causal/no causal, fp16/bf16-rtne/rtna/rtz cases
-        # bwd_hd128_bf16_a16_rtne_pddv
-        # bwd_hd128_bf16_a16_rtna_pddv
-        # bwd_hd128_bf16_a16_rtz_pddv
-        # bwd_hd128_bf16_causal_a16_rtne_pddv
-        # bwd_hd128_bf16_causal_a16_rtna_pddv
-        # bwd_hd128_bf16_causal_a16_rtz_pddv
-        # bwd_hd128_fp16_a16_pddv
-        # bwd_hd128_fp16_causal_a16_pddv
-        ret = is_v3_atomic_fp32 == False
-        ret &= hdim_q > 64 and hdim_q < 128
-        ret &= seqlen_q == seqlen_k
-        ret &= seqlen_k % 64 == 0
-        ret &= stride_q == stride_do
-        ret &= nhead_stride_q == nhead_stride_do
-        ret &= batch_stride_q == batch_stride_do
-        ret &= stride_k == stride_v
-        ret &= nhead_stride_k == nhead_stride_v
-        ret &= batch_stride_k == batch_stride_v
-        ret &= nhead_stride_k == nhead_stride_dk
-        ret &= nhead_stride_v == nhead_stride_dv
-        ret &= (batch_stride_dk / batch_stride_k) == (nhead_q / nhead_k)
-        ret &= (batch_stride_dv / batch_stride_v) == (nhead_q / nhead_k)
-        ret &= not swa
-
-        return ret
-
-    def psskddv():
-        # only for a32 causal/no causal, fp16/bf16-rtne/rtna/rtz cases
-        # bwd_hd128_bf16_a32_rtne_psskddv
-        # bwd_hd128_bf16_a32_rtna_psskddv
-        # bwd_hd128_bf16_a32_rtz_psskddv
-        # bwd_hd128_bf16_causal_a32_rtne_psskddv
-        # bwd_hd128_bf16_causal_a32_rtna_psskddv
-        # bwd_hd128_bf16_causal_a32_rtz_psskddv
-        # bwd_hd128_fp16_a32_psskddv
-        # bwd_hd128_fp16_causal_a32_psskddv
-        # bwd_hd192_fp16_a32_psskddv
-        # bwd_hd192_fp16_causal_a32_psskddv
-        # bwd_hd192_bf16_a32_rtne_psskddv
-        # bwd_hd192_bf16_a32_rtna_psskddv
-        # bwd_hd192_bf16_a32_rtz_psskddv
-        # bwd_hd192_bf16_causal_a32_rtne_psskddv
-        # bwd_hd192_bf16_causal_a32_rtna_psskddv
-        # bwd_hd192_bf16_causal_a32_rtz_psskddv
-        ret = is_v3_atomic_fp32 == True
-        ret &= hdim_q > 64 and hdim_q <= 192
-        ret &= nmask or mask or (swa and hdim_q > 64 and hdim_q <= 128)
-
-        return ret
-
-    # basic
-    ret = get_gfx() == "gfx942"
-    ret &= alibi_slopes is None
-    ret &= bias is None
-    ret &= dbias is None
-    ret &= dropout_p == 0.0
-    ret &= not deterministic
-    ret &= hdim_q == hdim_v
-    ret &= nhead_q % nhead_k == 0
-    ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
-    ret &= np() or pssk() or pddv() or psskddv()
-    return ret
 
 
 def _flash_attn_backward_fake(
@@ -2053,32 +1842,11 @@ def _flash_attn_backward(
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
         how_v3_bf16_cvt = 0
 
-    # can_impl_fmha_v3_bwd should before maybe_contiguous to get pure dout, q, k, v, out
-    can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd(
-        dout,
-        q,
-        k,
-        v,
-        dk,
-        dv,
-        dbias,
-        dropout_p,
-        causal,
-        window_size_left,
-        window_size_right,
-        bias,
-        alibi_slopes,
-        deterministic,
-        is_v3_atomic_fp32,
-    )
-
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
 
     _, seqlen_q, nhead_q, hdim_q = q.shape
-    _, seqlen_k, nhead_k, hdim_v = v.shape
-    nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    _, seqlen_k, _, _ = v.shape
 
     # only 1 block when sk <= 256, thus deterministic
     is_950_1block = (
@@ -2089,85 +1857,36 @@ def _flash_attn_backward(
         and hdim_q % 8 == 0
     )
 
-    def can_impl_fmha_v3_bwd_gfx950():
-        ret = get_gfx() == "gfx950"
-        ret &= alibi_slopes is None
-        ret &= bias is None
-        ret &= dbias is None
-        ret &= dropout_p == 0.0
-        ret &= not deterministic or is_950_1block
-        ret &= nhead_q % nhead_k == 0
-        ret &= (
-            (hdim_q > 64 and hdim_q <= 128) or (hdim_q == 192 and hdim_v == 128)
-        ) and hdim_q % 8 == 0
-        ret &= not swa
-        return ret
-
-    can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
-
-    if (
-        can_impl_fmha_v3_bwd_ and seqlen_q > 16
-    ):  # ck fmha bwd has optimization for seqlen_q <= 16
-        if dq is not None:
-            dq.zero_()
-        (
-            dq,
-            dk,
-            dv,
-            softmax_d,
-        ) = fmha_v3_bwd(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size_left,
-            window_size_right,
-            False if is_950_1block else deterministic,
-            False if is_950_1block else is_v3_atomic_fp32,
-            how_v3_bf16_cvt,
-            dq,
-            dk,
-            dv,
-            alibi_slopes,
-            rng_state,
-            None,
-        )
-    else:
-        (
-            dq,
-            dk,
-            dv,
-            softmax_d,
-        ) = mha_bwd(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size_left,
-            window_size_right,
-            deterministic,
-            dq,
-            dk,
-            dv,
-            dbias,
-            bias,
-            alibi_slopes,
-            rng_state,
-            None,
-            sink,
-            d_sink,
-            # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
-        )
+    (
+        dq,
+        dk,
+        dv,
+        softmax_d,
+    ) = mha_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        False if is_950_1block else deterministic,
+        dq,
+        dk,
+        dv,
+        dbias,
+        bias,
+        alibi_slopes,
+        rng_state,
+        None,
+        sink,
+        d_sink,
+        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+    )
     return softmax_d
 
 
@@ -2410,21 +2129,70 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
-    is_grad = torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v))
-    can_use_asm_without_ck = (not is_grad) and _can_impl_fmha_fwd_with_sink_asm(
-        q,
-        k,
-        v,
-        dropout_p,
-        causal,
-        window_size,
-        bias,
-        alibi_slopes,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_kv=cu_seqlens_kv,
-        sink_ptr=sink_ptr,
-    )
-    if not ENABLE_CK and not can_use_asm_without_ck:
+    def run_flash_attn_func():
+        return FlashAttnFunc.apply(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            bias,
+            alibi_slopes,
+            deterministic,
+            return_lse,
+            return_attn_probs,
+            torch.is_grad_enabled(),
+            True,  # is_v3_atomic_fp32
+            how_v3_bf16_cvt,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            sink_ptr,
+            num_splits,
+        )
+
+    if not ENABLE_CK:
+        is_grad = torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v))
+        if is_grad and not _can_use_aiter_bwd_without_ck(
+            q,
+            k,
+            v,
+            dropout_p,
+            causal,
+            window_size,
+            bias,
+            alibi_slopes,
+            deterministic,
+        ):
+            from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
+
+            return flash_attn_func_triton(
+                q=q,
+                k=k,
+                v=v,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                bias=bias,
+                alibi_slopes=alibi_slopes,
+                deterministic=deterministic,
+                return_lse=return_lse,
+                return_attn_probs=return_attn_probs,
+                sink=sink_ptr,
+            )
+        try:
+            return run_flash_attn_func()
+        except RuntimeError as exc:
+            msg = str(exc)
+            unsupported = (
+                "invalid argument for fmha_fwd" in msg
+                or "invalid argument for fmha_v3_fwd" in msg
+            )
+            if not unsupported:
+                raise
+
         from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
 
         return flash_attn_func_triton(
@@ -2442,27 +2210,8 @@ def flash_attn_func(
             return_attn_probs=return_attn_probs,
             sink=sink_ptr,
         )
-    return FlashAttnFunc.apply(
-        q,
-        k,
-        v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        bias,
-        alibi_slopes,
-        deterministic,
-        return_lse,
-        return_attn_probs,
-        torch.is_grad_enabled(),
-        True,  # is_v3_atomic_fp32
-        how_v3_bf16_cvt,
-        cu_seqlens_q,
-        cu_seqlens_kv,
-        sink_ptr,
-        num_splits,
-    )
+
+    return run_flash_attn_func()
 
 
 def _flash_attn_varlen_forward(

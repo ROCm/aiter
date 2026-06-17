@@ -25,6 +25,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,       // [b, sq, hq, d]
                                 std::optional<const at::Tensor> k_descale,    // [1]
                                 std::optional<const at::Tensor> v_descale,    // [1]
                                 std::optional<const at::Tensor> sink_ptr,     // [hq]
+                                int how_v3_bf16_cvt,
                                 std::optional<at::Generator> gen);
 } // namespace torch_itfs
 } // namespace aiter

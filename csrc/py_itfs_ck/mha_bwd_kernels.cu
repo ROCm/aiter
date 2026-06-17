@@ -314,9 +314,9 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                 d_sink_data_ptr = d_sink.data_ptr();
             }
 
-            return mha_bwd_args{false, // use_v3
-                                false, // is_v3_atomic_fp32
-                                false, // how_v3_bf16_cvt
+            return mha_bwd_args{true, // use_v3
+                                true, // is_v3_atomic_fp32
+                                1, // how_v3_bf16_cvt
                                 false, // v3_api_check
 
                                 head_size_q,

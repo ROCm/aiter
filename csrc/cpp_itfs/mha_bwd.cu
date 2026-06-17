@@ -239,9 +239,7 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
 float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
     float asm_ret = fmha_v3_bwd(a, s);
-#if ONLY_FAV3
-    return asm_ret;
-#else // !ONLY_FAV3
+#if ENABLE_CK
     if(asm_ret != -1)
         return asm_ret;
 
@@ -373,6 +371,8 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     };
 
     return launcher.run(ck_args, s);
+#else
+    return asm_ret;
 #endif
 }
 

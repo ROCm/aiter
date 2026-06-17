@@ -970,6 +970,7 @@ namespace py = pybind11;
           py::arg("k_descale")     = std::nullopt, \
           py::arg("v_descale")     = std::nullopt, \
           py::arg("sink_ptr")      = std::nullopt, \
+          py::arg("how_v3_bf16_cvt") = 1,           \
           py::arg("gen")           = std::nullopt);
 
 #define LIBMHA_FWD_PYBIND                          \
@@ -994,6 +995,8 @@ namespace py = pybind11;
           py::arg("q_descale")     = std::nullopt, \
           py::arg("k_descale")     = std::nullopt, \
           py::arg("v_descale")     = std::nullopt, \
+          py::arg("sink_ptr")      = std::nullopt, \
+          py::arg("how_v3_bf16_cvt") = 1,           \
           py::arg("gen")           = std::nullopt);
 
 #define MHA_VARLEN_FWD_ASM_PYBIND                        \
@@ -1178,7 +1181,8 @@ namespace py = pybind11;
           py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt, \
-          py::arg("sink_ptr")            = std::nullopt);
+          py::arg("sink_ptr")            = std::nullopt, \
+          py::arg("how_v3_bf16_cvt")     = 1);
 
 #define MHA_BATCH_PREFILL_PYBIND                       \
     m.def("mha_batch_prefill",                         \
