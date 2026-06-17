@@ -8,7 +8,8 @@ pybind11==3.0.1
 ninja==1.11.1.4
 psutil
 packaging
-flydsl==0.2.0
+--find-links https://rocm.frameworks-devreleases.amd.com/whl/gfx942-gfx950/flydsl/
+flydsl==0.2.0.dev20260616+4fff65b
 
 # Test deps.
 pandas==2.2.3
