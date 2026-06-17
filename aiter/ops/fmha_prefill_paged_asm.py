@@ -90,6 +90,11 @@ def fmha_prefill_paged_asm_launch(
                     .permute(0, 2, 1)
                     .contiguous())  # [batch, nhead_q, max_seqlen_q]
 
+    # Kernel indexes p_scale as [batch, nhead_q] with s_p_scale_Bs = nhead_q*4.
+    # If caller passes [nhead_q] (no batch dim), expand it so batch>0 reads valid data.
+    if p_scale is not None and p_scale.dim() == 1:
+        p_scale = p_scale.unsqueeze(0).expand(batch, -1).contiguous()
+
     import os
     if os.environ.get("FMHA_ASM_DEBUG"):
         print(f"[ASM DEBUG] batch={batch} total_q={total_q} max_seqlen_q={max_seqlen_q} max_seqlen_k={max_seqlen_k}")
