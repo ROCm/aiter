@@ -34,7 +34,11 @@ git config --global --add safe.directory /workspace
 pip config set global.retries 15
 pip config set global.timeout 120
 retry_cmd 3 pip install -r .github/requirements/triton-test.txt
-.github/scripts/install_triton.sh
+if [[ "${AITER_USE_SYSTEM_TRITON:-0}" == "1" ]]; then
+    echo "[SKIP] AITER_USE_SYSTEM_TRITON=1; keeping Triton from the base image."
+else
+    .github/scripts/install_triton.sh
+fi
 pip uninstall -y aiter || true
 retry_cmd 3 pip install --no-build-isolation -e .
 

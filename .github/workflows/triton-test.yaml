@@ -61,22 +61,12 @@ jobs:
           path: triton_shard_*.list
           retention-days: 7
 
-  prepare_triton_wheel:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
-    needs: [check-signal]
-    uses: ./.github/workflows/prepare-triton-wheel.yaml
-    with:
-      docker-image: rocm/ffm-dev:latest
-      artifact-name: triton_wheelhouse
-      retention-days: 3
-    secrets: inherit
-
   # Step 2: MI35X matrix jobs
   triton:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
     name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-mi35x-1
-    needs: [split_triton_tests, prepare_triton_wheel, check-signal]
+    needs: [split_triton_tests, check-signal]
     strategy:
       fail-fast: false
       matrix:
@@ -97,15 +87,6 @@ jobs:
         timeout-minutes: 15
         with:
           name: triton_shards
-
-      - name: Download Triton wheel artifact
-        id: download_triton_wheel
-        uses: actions/download-artifact@v4
-        timeout-minutes: 30
-        continue-on-error: true
-        with:
-          name: triton_wheelhouse
-          path: triton_wheels
 
       - name: List test shard files
         run: |
@@ -150,7 +131,7 @@ jobs:
           docker run -dt \
           --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
-          -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
+          -e AITER_USE_SYSTEM_TRITON=1 \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
@@ -211,7 +192,7 @@ jobs:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
     name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
     runs-on: aiter-1gpu-runner
-    needs: [split_triton_tests, prepare_triton_wheel, check-signal]
+    needs: [split_triton_tests, check-signal]
     strategy:
       fail-fast: false
       matrix:
@@ -232,15 +213,6 @@ jobs:
         timeout-minutes: 15
         with:
           name: triton_shards
-
-      - name: Download Triton wheel artifact
-        id: download_triton_wheel
-        uses: actions/download-artifact@v4
-        timeout-minutes: 30
-        continue-on-error: true
-        with:
-          name: triton_wheelhouse
-          path: triton_wheels
 
       - name: List test shard files
         run: |
@@ -285,7 +257,7 @@ jobs:
           docker run -dt \
           --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
-          -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
+          -e AITER_USE_SYSTEM_TRITON=1 \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
