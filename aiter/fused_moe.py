@@ -2537,20 +2537,25 @@ def cktile_moe_stage1(
             inter_dim = out.shape[-1]
             if activation == ActivationType.Swiglu:
                 from aiter.ops.flydsl.moe_kernels import (
-                    _get_compiled_swiglu,
-                    _run_compiled,
+                    flydsl_swiglu_and_mul_interleaved,
                 )
 
-                _swiglu_fn = _get_compiled_swiglu(inter_dim)
-                num_rows = valid_out.view(-1, inter_dim * 2).shape[0]
-                _run_compiled(
-                    _swiglu_fn,
-                    (
-                        valid_out.view(-1, inter_dim * 2),
-                        out.view(-1, inter_dim),
-                        num_rows,
-                        torch.cuda.current_stream(),
-                    ),
+                flydsl_swiglu_and_mul_interleaved(
+                    valid_out.view(-1, inter_dim * 2),
+                    out.view(-1, inter_dim),
+                )
+            elif activation == ActivationType.Silu:
+                from aiter.ops.flydsl.moe_kernels import (
+                    flydsl_silu_and_mul_interleaved,
+                )
+
+                flydsl_silu_and_mul_interleaved(
+                    valid_out.view(-1, inter_dim * 2),
+                    out.view(-1, inter_dim),
+                    sorted_token_ids,
+                    num_valid_ids,
+                    token_num,
+                    topk,
                 )
             else:
                 NLane = 16
@@ -2558,10 +2563,7 @@ def cktile_moe_stage1(
                 flat = valid_out.view(-1, N0, 2, NLane)
                 gate = flat[:, :, 0, :].reshape(-1, inter_dim)
                 up = flat[:, :, 1, :].reshape(-1, inter_dim)
-                if activation == ActivationType.Gelu:
-                    out.view(-1, inter_dim).copy_(torch.nn.functional.gelu(gate) * up)
-                else:
-                    out.view(-1, inter_dim).copy_(torch.nn.functional.silu(gate) * up)
+                out.view(-1, inter_dim).copy_(torch.nn.functional.gelu(gate) * up)
         else:
             if bias1 is not None and topk_ids is None:
                 raise ValueError(
