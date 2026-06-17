@@ -52,8 +52,7 @@ template <ck_tile::index_t M_Tile,
           bool TransposeC                          = false,
           bool UsePersistentKernel                 = false,
           ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave,
-          int BlockPerCu                           = 1,
-          bool AQRowMajor                          = false>
+          int BlockPerCu                           = 1>
 struct CreateTileGemmConfig
 {
     static constexpr ck_tile::index_t M_Tile_v                  = M_Tile;
@@ -70,7 +69,6 @@ struct CreateTileGemmConfig
     static constexpr bool UsePersistentKernel_v                 = UsePersistentKernel;
     static constexpr ck_tile::GemmPipelineScheduler Scheduler_v = Scheduler;
     static constexpr int BlockPerCu_v                           = BlockPerCu;
-    static constexpr bool AQRowMajor_v                          = AQRowMajor;
 };
 
 template <ck_tile::index_t M_Tile,
@@ -86,8 +84,7 @@ template <ck_tile::index_t M_Tile,
           bool TransposeC                          = false,
           bool UsePersistentKernel                 = false,
           ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave,
-          int BlockPerCu                           = 1,
-          bool AQRowMajor                          = false>
+          int BlockPerCu                           = 1>
 using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             N_Tile,
                                             K_Tile,
@@ -101,8 +98,7 @@ using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             TransposeC,
                                             UsePersistentKernel,
                                             Scheduler,
-                                            BlockPerCu,
-                                            AQRowMajor>;
+                                            BlockPerCu>;
 
 template <typename EDataType, bool HasBias>
 struct EpilogueTraits;
