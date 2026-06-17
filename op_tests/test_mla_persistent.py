@@ -7,6 +7,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.core import is_experimental_enabled
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter import dtypes
+from op_tests.bench_mla_reduce_micro import bench_mla_reduce_v1
 import random
 import itertools
 import argparse
@@ -978,6 +979,7 @@ def test_mla(
     paged_layout,
     scale_dim,
     return_lse,
+    bench_reduce=False,
 ):
     ret = {}
 
@@ -1637,6 +1639,20 @@ def test_mla(
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
 
+    if bench_reduce and not non_persistent_mode:
+        reduce_res = bench_mla_reduce_v1(
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            max_seqlen_qo,
+            nhead,
+            v_head_dim,
+            total_q,
+            out_dtype=out_dtype,
+        )
+        ret["reduce:us"] = reduce_res["us"]
+        ret["reduce:GB/s"] = reduce_res["gbps"]
+
     flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
     bytes = (
         total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
@@ -1794,6 +1810,12 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
+parser.add_argument(
+    "--bench_reduce",
+    action="store_true",
+    help="""also time mla_reduce_v1 standalone on the decode metadata. Default: False.
+    --bench_reduce # True""",
+)
 
 args = parser.parse_args()
 for nhead, decode_qlen in args.nhead:
@@ -1820,6 +1842,7 @@ for nhead, decode_qlen in args.nhead:
                 paged_layout=args.paged_layout,
                 scale_dim=args.scale_dim,
                 return_lse=args.return_lse,
+                bench_reduce=args.bench_reduce,
             )
             df.append(ret)
     df = pd.DataFrame(df)
