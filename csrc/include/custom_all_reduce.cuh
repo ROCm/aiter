@@ -1926,12 +1926,12 @@ __global__ void __launch_bounds__(1024, 1)
         ptrs[i] = (const P*)_dp->ptrs[i];
         tmps[i] = get_tmp_buf<P>(sg.signals[i]);
     }
+    start_sync<ngpus>(sg, self_sg, rank);
     for(int global_tidx = blockIdx.x; global_tidx < token_num; global_tidx += gridDim.x)
     {
         int input_idx    = global_tidx * input_hidden_dim + access_id_in_token;
         int residual_idx = global_tidx * hidden_dim + access_id_in_token;
         int out_idx      = global_tidx * out_hidden_dim + access_id_in_token;
-        start_sync<ngpus>(sg, self_sg, rank);
 
         A acc{};
         P vec{};
@@ -2037,10 +2037,10 @@ __global__ void __launch_bounds__(1024, 1)
         ptrs[i] = (const P*)_dp->ptrs[i];
         tmps[i] = get_tmp_buf<P>(sg.signals[i]);
     }
+    start_sync<ngpus>(sg, self_sg, rank);
     for(int global_tidx = blockIdx.x; global_tidx < token_num; global_tidx += gridDim.x)
     {
         int idx = global_tidx * hidden_dim + access_id_in_token;
-        start_sync<ngpus>(sg, self_sg, rank);
 
         A acc{};
         P vec{};
@@ -2136,10 +2136,10 @@ __global__ void __launch_bounds__(1024, 1)
         ptrs[i] = (const P*)_dp->ptrs[i];
         tmps[i] = get_tmp_buf<P>(sg.signals[i]);
     }
+    start_sync<ngpus>(sg, self_sg, rank);
     for(int global_tidx = blockIdx.x; global_tidx < token_num; global_tidx += gridDim.x)
     {
         int idx = global_tidx * hidden_dim + access_id_in_token;
-        start_sync<ngpus>(sg, self_sg, rank);
 
         A acc{};
         P vec{};
