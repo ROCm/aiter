@@ -487,8 +487,10 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                         const int klocal_token_idx =
                             TOKENS_PER_WARP * warpid + token_depth * 16 + lane16id;
                         const int kglobal_token_idx = partition_start_token_idx + klocal_token_idx;
+                        const int kblock_idx = kglobal_token_idx / BLOCK_SIZE;
+                        const int ktoken_in_block = kglobal_token_idx % BLOCK_SIZE;
                         const int k_scale_idx =
-                            wg_start_kv_head_idx * num_blocks * BLOCK_SIZE + kglobal_token_idx;
+                            kblock_idx * NUM_KV_HEADS * BLOCK_SIZE + wg_start_kv_head_idx * BLOCK_SIZE + ktoken_in_block;
                         d_out[gqa_ratio_loop][mtp][token_depth] *=
                             k_scale_ptr ? *(k_scale_ptr + k_scale_idx) : float(1.0);
                     }
@@ -775,8 +777,10 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                             // tokens
                             const int vglobal_token_idx =
                                 partition_start_token_idx + vlocal_token_idx;
+                            const int vblock_idx = vglobal_token_idx / BLOCK_SIZE;
+                            const int vtoken_in_block = vglobal_token_idx % BLOCK_SIZE;
                             const int v_scale_idx =
-                                wg_start_kv_head_idx * num_blocks * BLOCK_SIZE + vglobal_token_idx;
+                                vblock_idx * NUM_KV_HEADS * BLOCK_SIZE + wg_start_kv_head_idx * BLOCK_SIZE + vtoken_in_block;
                             v_scale = v_scale_ptr ? *(v_scale_ptr + v_scale_idx) : float(1.0);
                         }
 
