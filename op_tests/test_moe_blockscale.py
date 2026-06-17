@@ -155,7 +155,7 @@ def asm_moe_test(
         a1_scale,
         fc1_scale,
         fc2_scale,
-        "",
+        os.environ.get("AITER_KERNEL_NAME", ""),
         scale_blk_n,
         scale_blk_k,
         None,
