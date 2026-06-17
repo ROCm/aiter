@@ -165,7 +165,16 @@ def generate_data(m, n, k, seed, device="cuda"):
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     zero_bias = torch.zeros((1, n), dtype=torch.float32, device=device)
-    return (x, weight, x_scale, w_scale, out, weight_shuffle, x_scale_t, zero_bias)
+    return {
+        "x": x,
+        "weight": weight,
+        "x_scale": x_scale,
+        "w_scale": w_scale,
+        "out": out,
+        "weight_shuffle": weight_shuffle,
+        "x_scale_t": x_scale_t,
+        "zero_bias": zero_bias,
+    }
 
 
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
@@ -295,9 +304,12 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             for k, v in candidate_kernels_cktile_dict.items()
             if v.BlockPerCu in block_per_cu
         }
-        # gemm_a8w8_idx = [0, 5 if preshuffleB else 1, 2, 3, 4]
-        gemm_a8w8_idx = [0, 5, 6, 3, 4] if preshuffleB else [0, 1, 2, 3, 4]
-        ref_data_idx = [0, 1, 2, 3]
+        gemm_keys = (
+            ["x", "weight_shuffle", "x_scale_t", "w_scale", "out"]
+            if preshuffleB
+            else ["x", "weight", "x_scale", "w_scale", "out"]
+        )
+        ref_keys = ["x", "weight", "x_scale", "w_scale"]
         tasks_cktile = []
         for i, kernel in kernel_list.items():
             if not get_gfx().startswith("gfx95"):
@@ -307,16 +319,20 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     continue
 
             maxsplitK = (
-                aiter.compute_gemm_SplitK(
-                    M,
-                    N,
-                    K,
-                    kernel.M_Tile,
-                    kernel.N_Tile,
-                    kernel.K_Tile,
+                0
+                if preshuffleB
+                else (
+                    aiter.compute_gemm_SplitK(
+                        M,
+                        N,
+                        K,
+                        kernel.M_Tile,
+                        kernel.N_Tile,
+                        kernel.K_Tile,
+                    )
+                    if useSplitK
+                    else 0
                 )
-                if useSplitK
-                else 0
             )
             for splitK in range(maxsplitK + 1):
                 info = (info_keys, i, splitK, "", "cktile", preshuffleB)
@@ -327,7 +343,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         (M, N, K, seed),
                         run_gemm_a8w8_blockscale_cktile,
                         (
-                            gemm_a8w8_idx,
+                            gemm_keys,
                             i,
                             splitK,
                             preshuffleB,
@@ -335,7 +351,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         dict(run_kwargs),
                         run_torch,
                         (
-                            ref_data_idx,
+                            ref_keys,
                             None,
                             dtypes.bf16,
                         ),
@@ -343,6 +359,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         None,
                         1e-2,
                         0.01,
+                        None,
+                        None,
+                        ("out",),
                     )
                 )
         return tasks_cktile
@@ -362,22 +381,30 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             else candidate_kernels_dict
         )
         kernels_num = len(kernel_list)
-        gemm_a8w8_idx = [0, 5, 6, 3, 4] if preshuffleB else [0, 1, 2, 3, 4]
-        ref_data_idx = [0, 1, 2, 3]
+        gemm_keys = (
+            ["x", "weight_shuffle", "x_scale_t", "w_scale", "out"]
+            if preshuffleB
+            else ["x", "weight", "x_scale", "w_scale", "out"]
+        )
+        ref_keys = ["x", "weight", "x_scale", "w_scale"]
         tasks_ck = []
         for i in range(kernels_num):
             kernel = kernel_list[i]
             maxsplitK = (
-                aiter.compute_gemm_SplitK(
-                    M,
-                    N,
-                    K,
-                    kernel.MPerBLOCK,
-                    kernel.NPerBLOCK,
-                    kernel.KPerBLOCK,
+                0
+                if preshuffleB
+                else (
+                    aiter.compute_gemm_SplitK(
+                        M,
+                        N,
+                        K,
+                        kernel.MPerBLOCK,
+                        kernel.NPerBLOCK,
+                        kernel.KPerBLOCK,
+                    )
+                    if useSplitK
+                    else 0
                 )
-                if useSplitK
-                else 0
             )
             for splitK in range(maxsplitK + 1):
                 info = (info_keys, i, splitK, "", "ck", preshuffleB)
@@ -388,7 +415,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         (M, N, K, seed),
                         run_gemm_a8w8_blockscale,
                         (
-                            gemm_a8w8_idx,
+                            gemm_keys,
                             i,
                             splitK,
                             preshuffleB,
@@ -396,7 +423,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         dict(run_kwargs),
                         run_torch,
                         (
-                            ref_data_idx,
+                            ref_keys,
                             None,
                             dtypes.bf16,
                         ),
@@ -404,6 +431,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         None,
                         1e-2,
                         0.01,
+                        None,
+                        None,
+                        ("out",),
                     )
                 )
         return tasks_ck
@@ -423,14 +453,24 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         }
         results = []
         for i in range(len(untunedf)):
-            M = int(untunedf.loc[i, "M"])
-            N = int(untunedf.loc[i, "N"])
-            K = int(untunedf.loc[i, "K"])
+            row = untunedf.iloc[i]
+            M = int(row["M"])
+            N = int(row["N"])
+            K = int(row["K"])
             shape_str = f"({M}, {N}, {K})"
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
             try:
-                x, weight, x_scale, w_scale, out, weight_shuffle, x_scale_t, _ = (
-                    generate_data(M, N, K, 0)
+                gd = generate_data(M, N, K, 0)
+                x, weight, x_scale, w_scale, out = (
+                    gd["x"],
+                    gd["weight"],
+                    gd["x_scale"],
+                    gd["w_scale"],
+                    gd["out"],
                 )
+                weight_shuffle, x_scale_t = gd["weight_shuffle"], gd["x_scale_t"]
                 if is_preshuffle:
                     out, us = run_perftest(
                         gemm_a8w8_blockscale_bpreshuffle,
@@ -453,8 +493,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
                 status = (
                     "ok"
-                    if err_ratio <= args.errRatio
-                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                    if err_ratio <= allowed_err_ratio
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
@@ -481,8 +521,12 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         if not asm_kernels:
             return []
 
-        gemm_asm_idx = [0, 5, 6, 3, 4, 7] if preshuffleB else [0, 1, 2, 3, 4, 7]
-        ref_data_idx = [0, 1, 2, 3]
+        gemm_asm_keys = (
+            ["x", "weight_shuffle", "x_scale_t", "w_scale", "out", "zero_bias"]
+            if preshuffleB
+            else ["x", "weight", "x_scale", "w_scale", "out", "zero_bias"]
+        )
+        ref_keys = ["x", "weight", "x_scale", "w_scale"]
         tasks_asm = []
         asm_kernel_id = 0
         for key, kernel_names in asm_kernels.items():
@@ -512,7 +556,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             (M, N, K, seed),
                             run_gemm_a8w8_blockscale_asm,
                             (
-                                gemm_asm_idx,
+                                gemm_asm_keys,
                                 kernel_name,
                                 splitK,
                                 preshuffleB,
@@ -520,7 +564,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             dict(run_kwargs),
                             run_torch,
                             (
-                                ref_data_idx,
+                                ref_keys,
                                 None,
                                 dtypes.bf16,
                             ),
@@ -528,6 +572,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             None,
                             1e-2,
                             0.01,
+                            None,
+                            None,
+                            ("out",),
                         )
                     )
                     asm_kernel_id += 1
@@ -553,12 +600,11 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         }
         task = []
         tasks_data = []  # [(kernel_nums, datas)]
-        seed = 10000
+        seed = 0
         for i in range(len(untunedf)):
             M = untunedf.loc[i, "M"]
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
-            seed = seed + 1
             prev_task_count = len(task)
             info_keys = (gfx, cu_num, M, N, K)
             lib = args.libtype

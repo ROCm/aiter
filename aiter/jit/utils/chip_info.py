@@ -9,7 +9,7 @@ import subprocess
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
 
-from build_targets import (  # noqa: F401 — re-exported for callers
+from build_targets import (  # noqa: F401 -- re-exported for callers
     GFX_MAP,
     _parse_gpu_archs_env,
     filter_tune_df,
@@ -51,7 +51,7 @@ def get_gfx_custom_op_core() -> int:
     if gfx == "native":
         gfx = _detect_native()[0]
     elif ";" in gfx:
-        # TODO: multi-arch GPU_ARCHS (e.g. "gfx942;gfx950") — picking the
+        # TODO: multi-arch GPU_ARCHS (e.g. "gfx942;gfx950") -- picking the
         # last entry is a known limitation for build-time codegen callers.
         # For runtime dispatch, prefer get_gfx_runtime().
         gfx = gfx.split(";")[-1]
@@ -74,7 +74,7 @@ def get_gfx():
 def get_gfx_runtime() -> str:
     """Return the arch of the live GPU, always via rocminfo.
 
-    Unlike get_gfx(), ignores GPU_ARCHS — always detects the actual running
+    Unlike get_gfx(), ignores GPU_ARCHS -- always detects the actual running
     GPU.  Use for runtime dispatch decisions (selecting tuned kernels, picking
     code paths).  Use get_gfx() for build-time codegen paths (gen_instances,
     csrc module-level arch selection) where no GPU may be available.
@@ -87,6 +87,38 @@ def get_gfx_runtime() -> str:
             f"Supported architectures: {sorted(supported)}"
         )
     return gfx_arch
+
+
+# Backfill map for legacy tuned configs that predate the `gfx` column.
+# These cu_num values were only ever tuned on a single arch historically:
+#   256 -> gfx950, 80/304 -> gfx942.
+# Newer archs that happen to share a cu_num (e.g. gfx1250 also reports 256)
+# are always written with their real arch by the tuner, so they never rely on
+# this backfill.
+_LEGACY_CU_NUM_TO_GFX = {
+    256: "gfx950",
+    80: "gfx942",
+    304: "gfx942",
+}
+
+
+def gfx_from_cu_num(cu_num) -> str:
+    """Infer the gfx arch for a legacy config row that has no `gfx` column.
+
+    Used to migrate old tuned CSVs (keyed on cu_num only) to the new
+    (gfx, cu_num, ...) schema. Unknown cu_num falls back to the live GPU arch.
+    """
+    try:
+        cu_num = int(cu_num)
+    except (TypeError, ValueError):
+        return get_gfx_runtime()
+    gfx = _LEGACY_CU_NUM_TO_GFX.get(cu_num)
+    if gfx is not None:
+        return gfx
+    try:
+        return get_gfx_runtime()
+    except Exception:
+        return "gfx942"
 
 
 @functools.lru_cache(maxsize=1)
@@ -144,12 +176,12 @@ def get_build_targets() -> list[tuple[str, int]]:
     to exactly the right set of kernels for the target GPU(s).
 
     Priority:
-      1. GPU_ARCHS set to an explicit non-empty target list → delegate to
+      1. GPU_ARCHS set to an explicit non-empty target list -> delegate to
          get_build_targets_env() (no GPU needed).
-      2. GPU_ARCHS unset, empty/whitespace, or "native" → call get_gfx()
+      2. GPU_ARCHS unset, empty/whitespace, or "native" -> call get_gfx()
          (GPU_ARCHS-aware; falls back to rocminfo when GPU_ARCHS is unset) and
          get_cu_num(), which correctly reflect partition mode and binned variants.
-      3. Neither → raise RuntimeError with a clear message.
+      3. Neither -> raise RuntimeError with a clear message.
     """
     gpu_archs = os.getenv("GPU_ARCHS")
     gpu_archs_normalized = gpu_archs.strip() if gpu_archs is not None else ""
@@ -157,7 +189,7 @@ def get_build_targets() -> list[tuple[str, int]]:
         return get_build_targets_env()
 
     try:
-        # get_gfx() is intentional here — this is a build-time path; get_gfx_runtime()
+        # get_gfx() is intentional here -- this is a build-time path; get_gfx_runtime()
         # would fail in CI environments without a live GPU.
         return [(get_gfx(), get_cu_num())]
     except Exception as e:
@@ -180,19 +212,20 @@ def build_tune_dict(
     Args:
         tune_df:          pandas DataFrame already loaded from the tuning CSV.
         default_dict:     module-level fallback dict (negative-int keys) to start from.
-        kernels_list:     module-level dict mapping kernelId → kernelInstance.
+        kernels_list:     module-level dict mapping kernelId -> kernelInstance.
         libtype:          Optional string to filter the "libtype" column (e.g. "ck").
                           Required for CSVs that mix multiple library types (e.g.
                           a8w8_bpreshuffle_tuned_gemm.csv mixes "ck" and "cktile").
                           If None, no libtype filtering is applied.
-        kernels_by_name:  Optional dict mapping kernelName string → kernelInstance.
+        kernels_by_name:  Optional dict mapping kernelName string -> kernelInstance.
                           When provided and the CSV has a "kernelName" column, kernel
-                          lookup uses the name instead of kernelId. If the name is not
-                          found in kernels_by_name, the entry is skipped (heuristic
-                          default used) and a warning is logged — no kernelId fallback
-                          is attempted, because kernelIds are not stable across kernel
-                          list reorderings. Falls back to kernelId if the kernelName
-                          column is absent from the CSV.
+                          lookup uses the name instead of kernelId. Falls back to
+                          kernelId if the kernelName column is absent from the CSV.
+
+    Strict on stale tuned-CSV rows: any row whose kernelName (or kernelId, in the
+    fallback path) is not present in the registry will raise RuntimeError listing
+    every offending row. A row that codegen silently drops would otherwise compile
+    into a .so guaranteed to TORCH_CHECK(false, ...) at runtime for that shape.
 
     Returns:
         dict with mixed keys: negative ints (from default_dict) and
@@ -208,6 +241,7 @@ def build_tune_dict(
         logger.warning(
             "kernels_by_name provided but CSV has no kernelName column, falling back to kernelId."
         )
+    bad_rows: list[str] = []
     for _, row in filtered.iterrows():
         key = (
             str(row["gfx"]),
@@ -222,10 +256,9 @@ def build_tune_dict(
             if kernel is not None:
                 tune_dict[key] = kernel
             else:
-                logger.warning(
-                    f"kernelName '{kname}' not found in kernels_by_name "
-                    f"(gfx={key[0]}, cu_num={key[1]}, M={key[2]}, N={key[3]}, K={key[4]}); "
-                    f"falling back to heuristic default."
+                bad_rows.append(
+                    f"  kernelName={kname!r} not in kernels_by_name "
+                    f"(gfx={key[0]}, cu_num={key[1]}, M={key[2]}, N={key[3]}, K={key[4]})"
                 )
         else:
             kid = int(row["kernelId"])
@@ -233,11 +266,19 @@ def build_tune_dict(
             if kernel is not None:
                 tune_dict[key] = kernel
             else:
-                logger.warning(
-                    f"kernelId {kid} not in kernels_list "
+                bad_rows.append(
+                    f"  kernelId={kid} not in kernels_list "
                     f"(gfx={key[0]}, cu_num={key[1]}, M={key[2]}, N={key[3]}, K={key[4]}, "
-                    f"kernels_list size={len(kernels_list)}); falling back to heuristic default."
+                    f"kernels_list size={len(kernels_list)})"
                 )
+    if bad_rows:
+        raise RuntimeError(
+            "build_tune_dict: tuned CSV references kernels not in the build registry. "
+            "Either re-tune the CSV against the current kernel list or restore the "
+            "missing kernel definition; the build refuses to produce a .so that would "
+            "TORCH_CHECK(false, ...) at runtime for these shapes:\n"
+            + "\n".join(bad_rows)
+        )
     return tune_dict
 
 
@@ -251,7 +292,7 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
     Args:
         tune_df:      pandas DataFrame loaded from the batched tuning CSV.
         default_dict: module-level fallback dict (negative-int keys) to start from.
-        kernels_list: module-level dict mapping kernelId → kernelInstance.
+        kernels_list: module-level dict mapping kernelId -> kernelInstance.
         libtype:      Optional string to filter the "libtype" column (same semantics
                       as build_tune_dict).
 
@@ -264,6 +305,7 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
     filtered = filter_tune_df(tune_df, targets)
     if libtype is not None and "libtype" in tune_df.columns:
         filtered = filtered[filtered["libtype"] == libtype]
+    bad_rows: list[str] = []
     for _, row in filtered.iterrows():
         key = (
             str(row["gfx"]),
@@ -278,12 +320,59 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
         if kernel is not None:
             tune_dict[key] = kernel
         else:
-            logger.warning(
-                f"kernelId {kid} not in kernels_list "
+            bad_rows.append(
+                f"  kernelId={kid} not in kernels_list "
                 f"(gfx={key[0]}, cu_num={key[1]}, B={key[2]}, M={key[3]}, N={key[4]}, K={key[5]}, "
-                f"kernels_list size={len(kernels_list)}); falling back to heuristic default."
+                f"kernels_list size={len(kernels_list)})"
             )
+    if bad_rows:
+        raise RuntimeError(
+            "build_tune_dict_batched: tuned CSV references kernels not in the build "
+            "registry. Either re-tune the CSV against the current kernel list or "
+            "restore the missing kernel definition; the build refuses to produce a "
+            ".so that would TORCH_CHECK(false, ...) at runtime for these shapes:\n"
+            + "\n".join(bad_rows)
+        )
     return tune_dict
+
+
+def write_name_keyed_lookup_header(
+    output_path, kernels_dict, lookup_head, lookup_template, lookup_end
+):
+    """Write a name-keyed C++ GEMM dispatch lookup header from a kernels_dict.
+
+    Sister of write_lookup_header(), but emits {"<kernel_name>", &kernel<...>}
+    entries instead of (gfx,cu_num,M,N,K) tuple keys.  Used by the blockscale
+    GEMM modules whose runtime dispatch is now driven by Python-resolved
+    kernel name strings (read from the tuned CSV) rather than a build-time
+    tuple-keyed lookup.  The kernels_dict may contain duplicate entries for
+    the same kernel (multiple shapes mapping to the same kernel.name); we
+    dedupe by name so each kernel is registered exactly once.
+
+    Skips negative-int default_dict keys (heuristic fallbacks the dispatch
+    layer references directly by symbol).
+
+    Args:
+        output_path:     Full path of the .h file to write.
+        kernels_dict:    Dict returned by build_tune_dict.
+        lookup_head:     String written before the loop (defines the macro header).
+        lookup_template: String with {kernel_name} placeholder (used twice:
+                          once for the C++ string key, once for the symbol).
+        lookup_end:      String written after the loop (closes the macro / #endif).
+    """
+    seen = set()
+    with open(output_path, "w") as f:
+        f.write(lookup_head)
+        for key, k in kernels_dict.items():
+            if isinstance(key, int) and key < 0:
+                # default_dict heuristic-fallback entries; the dispatch layer
+                # references the heuristic kernel by symbol, not via the table.
+                continue
+            if k.name in seen:
+                continue
+            seen.add(k.name)
+            f.write(lookup_template.format(kernel_name=k.name))
+        f.write(lookup_end)
 
 
 def write_lookup_header(
@@ -297,10 +386,10 @@ def write_lookup_header(
     type parameters), but the iteration and key-formatting logic is shared here.
 
     Key layout in kernels_dict:
-      - Negative ints          (default_dict entries) → skipped in non-tune mode.
-      - (gfx,cu_num,M,N,K) 5-tuples (tuned entries)  → written as {"gfx",cu_num,M,N,K} C++ key.
-      - (gfx,cu_num,B,M,N,K) 6-tuples (batched)      → written as {"gfx",cu_num,B,M,N,K} C++ key.
-      - Non-negative ints (tune mode only)            → written as plain integer kernel ID.
+      - Negative ints          (default_dict entries) -> skipped in non-tune mode.
+      - (gfx,cu_num,M,N,K) 5-tuples (tuned entries)  -> written as {"gfx",cu_num,M,N,K} C++ key.
+      - (gfx,cu_num,B,M,N,K) 6-tuples (batched)      -> written as {"gfx",cu_num,B,M,N,K} C++ key.
+      - Non-negative ints (tune mode only)            -> written as plain integer kernel ID.
 
     Args:
         output_path:     Full path of the .h file to write.
@@ -360,5 +449,7 @@ def get_device_name():
         return "MI300"
     elif gfx == "gfx950":
         return "MI350"
+    elif gfx == "gfx1250":
+        return "MI400"
     else:
         raise RuntimeError("Unsupported gfx")

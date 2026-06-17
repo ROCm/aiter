@@ -356,6 +356,84 @@ def test_top_k_top_p_statistical_distribution(batch_size, vocab_size, k, p):
             )
 
 
+# ---------------------------------------------------------------------------
+# Regression: HSA OOB caused by uninitialized `temp_storage.last_valid_id`.
+#
+# When every thread in a block fails the predicate `x > low` on the first
+# iteration of the kernel's do-while loop (e.g. an all-zero or all-NaN probs
+# row), `max_valid` from the BlockReduce is -1, so the guarded write
+# `temp_storage.last_valid_id = max_valid` is skipped.  The recovery path
+# `sampled_id = temp_storage.last_valid_id` then reads uninitialized shared
+# memory and the subsequent `probs[row_idx * d + sampled_id]` faults at a
+# page boundary.  Reproduced as a page-aligned `Memory access fault by GPU`
+# inside TopKTopPSamplingFromProbKernel on Qwen3.6-A3B-FP8 (vocab=248320).
+#
+# These tests must produce only in-range token ids (and not segfault) for
+# both kernels (TopP-only and joint TopK+TopP).
+# ---------------------------------------------------------------------------
+
+
+def _make_degenerate_probs(batch_size, vocab_size, mode):
+    """Build a probs tensor whose first row triggers the all-fail-predicate
+    path; remaining rows are valid normalized distributions.
+
+    "zero" / "nan" are the OOB-triggering rows: the predicate `x > low` is
+    satisfied by NO thread on the first iter (`0 > 0` / `NaN > 0` are both
+    false), so `max_valid` stays -1, the guarded write to `last_valid_id` is
+    skipped, and the unfixed kernel reads uninitialized smem -> OOB.
+    """
+    probs = torch.rand(batch_size, vocab_size, device="cuda")
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    if mode == "zero":
+        probs[0] = 0.0
+    elif mode == "nan":
+        probs[0] = float("nan")
+    else:
+        raise ValueError(mode)
+    return probs
+
+
+@pytest.mark.parametrize("batch_size", [1, 8])
+# Include 248320 (Qwen3.6 — original crash) and 128256 (Llama-3) which both
+# satisfy vocab %% (BLOCK_THREADS * VEC_SIZE) != 0, where the last block has
+# fewer active threads and the bug surfaces most reliably.
+@pytest.mark.parametrize("vocab_size", [32000, 128256, 248320])
+@pytest.mark.parametrize("mode", ["zero", "nan"])
+def test_top_p_sampling_degenerate_row(batch_size, vocab_size, mode):
+    """Regression: TopPSamplingFromProbKernel must not OOB on degenerate rows."""
+    probs = _make_degenerate_probs(batch_size, vocab_size, mode)
+    p = 0.95
+    for _ in range(50):
+        samples = torch.ops.aiter.top_p_sampling_from_probs(
+            probs, None, *_to_tensor_scalar_tuple(p), deterministic=True
+        )
+        assert torch.all(samples >= 0) and torch.all(samples < vocab_size), (
+            f"OOB id from TopPSamplingFromProbKernel "
+            f"(mode={mode}, vocab={vocab_size}): {samples.tolist()}"
+        )
+
+
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("vocab_size", [32000, 128256, 248320])
+@pytest.mark.parametrize("mode", ["zero", "nan"])
+@pytest.mark.parametrize("k,p", [(20, 0.95), (1, 1.0), (50, 0.5)])
+def test_top_k_top_p_sampling_degenerate_row(batch_size, vocab_size, mode, k, p):
+    """Regression: TopKTopPSamplingFromProbKernel must not OOB on degenerate rows."""
+    probs = _make_degenerate_probs(batch_size, vocab_size, mode)
+    for _ in range(50):
+        samples = torch.ops.aiter.top_k_top_p_sampling_from_probs(
+            probs,
+            None,
+            *_to_tensor_scalar_tuple(k),
+            *_to_tensor_scalar_tuple(p),
+            deterministic=True,
+        )
+        assert torch.all(samples >= 0) and torch.all(samples < vocab_size), (
+            f"OOB id from TopKTopPSamplingFromProbKernel "
+            f"(mode={mode}, vocab={vocab_size}, k={k}, p={p}): {samples.tolist()}"
+        )
+
+
 if __name__ == "__main__":
     test_top_k_top_p_joint_sampling_from_probs(40, 129280, 0.6, 20)
     # test_top_k_top_p_statistical_distribution(10, 10000, 5, 0.3)
