@@ -5,8 +5,8 @@
 #include <cstdlib>
 #include <optional>
 
-
-{% for kernel_name in noscale_4arg_kernels -%}
+{% for a16w16_tag, noscale_tag, kernel_name in kernels -%}
+{% if a16w16_tag %}
 template <typename D_C>
 void
 {{ kernel_name }}(
@@ -15,16 +15,14 @@ void
     aiter_tensor_t &Y,
     std::optional<aiter_tensor_t> bias,
     int splitK);
-{% endfor %}
-{% for kernel_name in noscale_3arg_kernels -%}
+{% elif noscale_tag %}
 template <typename D_C>
 void
 {{ kernel_name }}(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y);
-{% endfor %}
-{% for kernel_name in scale_kernels %}
+{% else %}
 template <typename D_C>
 void
 {{ kernel_name }}(
@@ -33,4 +31,8 @@ void
     aiter_tensor_t &Y,
     std::optional<aiter_tensor_t> x_scale,
     std::optional<aiter_tensor_t> w_scale);
+{% endif %}
+{% if loop.last %}
+
+{% endif %}
 {% endfor %}

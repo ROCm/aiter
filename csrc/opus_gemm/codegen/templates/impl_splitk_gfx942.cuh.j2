@@ -227,11 +227,9 @@ void
 {% endif %}
     if (Y.dtype() == AITER_DTYPE_bf16) {
     if (bias.has_value()) {
-{% if v2_enabled %}
-{% set fb = namespace(value=true) %}
+{%- if v2_enabled %}
 {% for nvec, rows in V3_NVEC_ROWS %}{% for sk in V2_SUPPORTED_SPLITKS %}
-        {% if fb.value %}if{% else %}else if{% endif %} (v2_align && v3_n_vec == {{ nvec }} && (M % {{ rows }} == 0) && split_k == {{ sk }}) {
-{% set fb.value = false %}
+        {% if not loop.first %}else {% endif %}if (v2_align && v3_n_vec == {{ nvec }} && (M % {{ rows }} == 0) && split_k == {{ sk }}) {
         dim3 grid_v3(1, M / {{ rows }}, batch);
         dim3 block_v3({{ nvec * rows }});
         splitk_reduce_kernel_v3<{{ sk }}, {{ nvec }}, {{ rows }}, V2_VEC, __bf16, true, __bf16>
@@ -266,10 +264,8 @@ void
 {% endif %}
     } else {
 {% if v2_enabled %}
-{% set first_branch = namespace(value=true) %}
 {% for nvec, rows in V3_NVEC_ROWS %}{% for sk in V2_SUPPORTED_SPLITKS %}
-        {% if first_branch.value %}if{% else %}else if{% endif %} (v2_align && v3_n_vec == {{ nvec }} && (M % {{ rows }} == 0) && split_k == {{ sk }}) {
-{% set first_branch.value = false %}
+        {% if not loop.first %}else {% endif %}if (v2_align && v3_n_vec == {{ nvec }} && (M % {{ rows }} == 0) && split_k == {{ sk }}) {
         dim3 grid_v3(1, M / {{ rows }}, batch);
         dim3 block_v3({{ nvec * rows }});
         splitk_reduce_kernel_v3<{{ sk }}, {{ nvec }}, {{ rows }}, V2_VEC, __bf16, false, __bf16>

@@ -23,7 +23,7 @@ void
 
     int loops_ = (K + {{ k.B_K }} - 1) / {{ k.B_K }};
     AITER_CHECK(loops_ >= 2,
-        "K=", K, " too small for k.B_K={{ k.B_K }}, need K >= {{ 2 * k.B_K }}");
+        "K=", K, " too small for B_K={{ k.B_K }}, need K >= {{ 2 * k.B_K }}");
     AITER_CHECK(loops_ % 2 == 0,
         "ceil_div(K, {{ k.B_K }})=", loops_, " must be even (prefetch constraint)");
     AITER_CHECK(K % 2 == 0,
@@ -46,9 +46,11 @@ void
     kargs.stride_b_batch = N * K;
     kargs.stride_c_batch = M * N;
 {% if has_tune_tags %}
+
     AITER_CHECK(!bias.has_value(),
         "bias not supported on this a16w16 kid");
 {% endif %}
+
     int num_tiles_m = (M + {{ k.B_M }} - 1) / {{ k.B_M }};
     int num_tiles_n = (N + {{ k.B_N }} - 1) / {{ k.B_N }};
     dim3 grid(num_tiles_m * num_tiles_n, 1, batch);

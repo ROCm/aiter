@@ -12,7 +12,7 @@
 {% for macro in macros -%}
 #define {{macro.name}}(CTYPE) \
 {%- for entry in macro.rows %}
-    { { {{entry.id | join(', ') }} }, &{{entry.kernel_name}}<{{entry.ctype}}> },{{ ' \\' if not loop.last else '' }}
+    { { {{entry.id | join(', ') }} }, &{{entry.kernel_name}}<CTYPE> },{{ ' \\' if not loop.last else '' }}
 {%- endfor %}
 
 {% endfor %}
