@@ -36,6 +36,15 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
+# mxfp4_moe pipeline kinds (w1.shuffle_kind / CSV `_tag`). Both use the same a16w4
+# gate/up-interleaved weight+scale layout; the kind selects the gemm engine and the
+# tuned-CSV set so the two backends can be tuned/dispatched independently:
+#   "mxfp4_moe"          -> HIP MFMA gemm (PR #3470 backend)
+#   "mxfp4_guinterleave" -> FlyDSL port gemm (gemm{1,2}_a4w4 flydsl); implies flydsl
+# Both route through _mxfp4_moe_run; only the per-kernel gemm backend differs.
+_MXFP4_PORT_KIND = "mxfp4_guinterleave"
+_MXFP4_KINDS = ("mxfp4_moe", _MXFP4_PORT_KIND)
+
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
@@ -420,7 +429,7 @@ def fused_moe_(
 
     _w1_kind = getattr(w1, "shuffle_kind", None)
     _csv_is_mxfp4 = metadata.pipeline is not None
-    if _w1_kind == "mxfp4_moe" and not _csv_is_mxfp4:
+    if _w1_kind in _MXFP4_KINDS and not _csv_is_mxfp4:
         # No tuned CSV pipeline for this mxfp4 shape -> synthesize an M-adaptive port
         # pipeline mirroring what the tuned CSV / the bench's per-M-best selection
         # picks: BM16 inline_quant + atomic for decode (small M), BM32 atomic for mid
@@ -458,7 +467,7 @@ def fused_moe_(
             ),
         )
         _csv_is_mxfp4 = True
-    if (_w1_kind == "mxfp4_moe") != _csv_is_mxfp4:
+    if (_w1_kind in _MXFP4_KINDS) != _csv_is_mxfp4:
         raise TypeError(
             f"fused_moe: weight/CSV backend mismatch. "
             f"w1.shuffle_kind={_w1_kind!r}, "
@@ -1191,9 +1200,17 @@ def _mxfp4_moe_run(
     cshuffle = p2.get("cshuffle", False)
     prologue_name = "inline_quant" if inline_quant else "threestage"
 
-    # FlyDSL gemm1/gemm2 opt-in tag(???? w1/w2.view ???,view ?????????)?
-    gemm1_backend = getattr(w1, "gemm1_backend", None)
-    gemm2_backend = getattr(w2, "gemm2_backend", None)
+    # FlyDSL gemm1/gemm2 backend. Explicit gemm{1,2}_backend tag wins; otherwise the
+    # port kind (shuffle_kind=="mxfp4_guinterleave") implies flydsl so the tag alone
+    # fully selects the backend (HIP rows can't accidentally drive flydsl-only kernels
+    # and vice-versa). Read before any .view() that would drop the attribute.
+    _port_kind = getattr(w1, "shuffle_kind", None) == _MXFP4_PORT_KIND
+    gemm1_backend = getattr(w1, "gemm1_backend", None) or (
+        "flydsl" if _port_kind else None
+    )
+    gemm2_backend = getattr(w2, "gemm2_backend", None) or (
+        "flydsl" if _port_kind else None
+    )
     # Real (unpadded) inter for a non-256-aligned shard (dsv4 TP8: 384). The weights
     # are zero-padded to D_INTER (next %256) so the gemm2 runs the proven layout, but
     # this lets it skip loading/MFMA-ing the pad-tail half-steps. Read before .view

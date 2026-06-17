@@ -186,7 +186,7 @@ def _build_kimi_mx(device, M, seed=2):
         w1_scale=shuffle_scale_a16w4(w1s, NE, True),
         w2_scale=shuffle_scale_a16w4(w2s, NE, False),
     )
-    w["w1"].shuffle_kind = "mxfp4_moe"
+    w["w1"].shuffle_kind = "mxfp4_guinterleave"
 
     torch.manual_seed(seed + 1)
     hidden = torch.randn((M, H), dtype=dtypes.bf16, device=device) / 10
@@ -296,7 +296,7 @@ def test_flydsl_gemm2_parametrized_k_numeric(D_INTER):
     w1q, w1s = tq(w1, quant_dtype=dtypes.fp4x2)
     w2q, w2s = tq(w2, quant_dtype=dtypes.fp4x2)
     w1u8 = shuffle_weight_a16w4(w1q, 16, True)
-    w1u8.shuffle_kind = "mxfp4_moe"
+    w1u8.shuffle_kind = "mxfp4_guinterleave"
     w1_scale = shuffle_scale_a16w4(w1s, NE, True)
     w2u8 = shuffle_weight_a16w4(w2q, 16, False)
     w2_scale = shuffle_scale_a16w4(w2s, NE, False)

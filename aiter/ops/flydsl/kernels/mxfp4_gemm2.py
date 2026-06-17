@@ -27,6 +27,8 @@ mxfp4_gemm1.py. Constraint: D_INTER % BK(256) == 0 (covers 512/768/1024/1536/
 BK=256 kernel.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -51,6 +53,13 @@ BK = 256
 KH_TILE = BK // 2  # 128 packed bytes per K-tile (BK-derived, K-independent)
 kStages = 2
 NUM_CU = 256  # persistent-grid workgroup count (matches gemm2_a4w4.cuh NUM_CU).
+# XCD remap mode for the persistent (cshuffle/nonatomic) grid, read at build time.
+#   <=0 : step-1-only contiguous-per-XCD (mirrors xcd_remap.hpp swizzle=-1; the
+#         original port behavior).
+#   N>0 : flydsl-style 2-step remap with M-major group size N (mirrors
+#         xcd_remap.hpp positive swizzle) -- same-XCD tiles share M-row panels so
+#         the stationary operand stays hot in that XCD's private L2 slice.
+PORT_XCD_SWIZZLE = int(os.environ.get("PORT_XCD_SWIZZLE", "-1"))
 # Measured: 1 workgroup/CU (grid == NUM_CU) is optimal; over-subscribing the
 # persistent grid only adds L2/memory-queue contention (the kernel has enough
 # memory-level parallelism at 1 wg/CU), so the grid is capped at NUM_CU.
@@ -445,21 +454,41 @@ def compile_gemm2_a4w4_port(
             bound = total_m_blocks * fx.Int32(_num_n_blocks)
             grid_nb = fx.Int32(gpu.grid_dim.x)
 
-            # XCD-grouped interleave (mirrors xcd_remap.hpp swizzle=-1): remap the
-            # raw persistent index -> wgid so consecutive indices spread across the
-            # 8 XCDs and same-XCD tiles reuse B in that XCD's private L2 slice. Only
-            # constant divisors (cheap). HIP's plain NONATOMIC baseline omits this.
+            # XCD-grouped interleave: remap the raw persistent index -> wgid so
+            # consecutive indices spread across the 8 XCDs and same-XCD tiles reuse
+            # B in that XCD's private L2 slice. HIP's plain NONATOMIC baseline omits
+            # this. Returns a row-major linear tile (m_block*_num_n_blocks+n_block),
+            # which _gemm2_body / _issue_all_a_loads split back into (m,n).
+            #   PORT_XCD_SWIZZLE<=0: step-1-only (mirrors xcd_remap.hpp swizzle=-1).
+            #   PORT_XCD_SWIZZLE>0 : 2-step M-major grouping (positive swizzle).
             _NXCD = 8
             _xq = bound // fx.Int32(_NXCD)
             _xr = bound % fx.Int32(_NXCD)
+            _SW = PORT_XCD_SWIZZLE
 
             def _xcd(pid):
                 xc = pid % fx.Int32(_NXCD)
-                return (
+                wgid = (
                     xc * _xq
                     + fx.Int32(arith.minsi(_raw(xc), _raw(_xr)))
                     + pid // fx.Int32(_NXCD)
                 )
+                if const_expr(_SW <= 0):
+                    return wgid
+                # 2-step M-major grouping (mirrors remap_xcd_grouped positive branch).
+                # num_wgid_in_group is a build-time constant; group_size_m is runtime
+                # (clamped for the partial trailing group), same as the HIP kernel.
+                _ng = fx.Int32(_SW * _num_n_blocks)  # num_wgid_in_group (const)
+                group_id = wgid // _ng
+                first_pid_m = group_id * fx.Int32(_SW)
+                remaining_m = total_m_blocks - first_pid_m
+                group_size_m = fx.Int32(
+                    arith.minsi(_raw(remaining_m), _raw(fx.Int32(_SW)))
+                )
+                wig = wgid % _ng
+                m_block = first_pid_m + (wig % group_size_m)
+                n_block = wig // group_size_m
+                return m_block * fx.Int32(_num_n_blocks) + n_block
 
             if bx_i32 < bound:
                 tile = _xcd(bx_i32)

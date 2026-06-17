@@ -367,10 +367,12 @@ def test_fmoe(
         w2_scale_aiter = shuffle_scale_a16w4(_w2s, E, False)
         w1_qt_aiter.gemm1_backend = "flydsl"
         w2_qt_aiter.gemm2_backend = "flydsl"
-        # shuffle_kind tag selects the mxfp4 PORT (gemm{1,2}_a4w4_port) rather than
-        # the generic flydsl moe (flydsl_moe{1,2}_afp4_wfp4).
-        w1_qt_aiter.shuffle_kind = "mxfp4_moe"
-        w2_qt_aiter.shuffle_kind = "mxfp4_moe"
+        # shuffle_kind="mxfp4_guinterleave" selects the FlyDSL PORT (gemm{1,2}_a4w4
+        # flydsl) and its own tuned CSV rows (_tag=mxfp4_guinterleave), separate from
+        # the HIP mxfp4_moe backend -- so port-only kernels (BM64/cshuffle) never reach
+        # the HIP gemm.
+        w1_qt_aiter.shuffle_kind = "mxfp4_guinterleave"
+        w2_qt_aiter.shuffle_kind = "mxfp4_guinterleave"
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
