@@ -183,6 +183,7 @@ def _moe_gemm_a4w4_gfx1250(
     UPCAST_INDICES: gl.constexpr,
     L2_PREFETCH_DISTANCE: gl.constexpr,
     X_SCALES_TDM: gl.constexpr,
+    EVEN_K: gl.constexpr,
     # layouts
     WMMA_LAYOUT: gl.constexpr,
     DOT_LAYOUT_X: gl.constexpr,
@@ -497,14 +498,20 @@ def _moe_gemm_a4w4_gfx1250(
             w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
         if not X_SCALES_TDM:
-            x_scales_mask = (offs_x_k_scales[None, :] + idx_x_scales) < gl.cdiv(
-                K, MX_PACK_DIVISOR
-            )
-            gl.amd.gfx1250.async_copy.global_to_shared(
-                x_scales_buffer.index(load_idx % NUM_BUFFERS),
-                x_scales_ptrs,
-                mask=x_scales_mask,
-            )
+            if EVEN_K:
+                gl.amd.gfx1250.async_copy.global_to_shared(
+                    x_scales_buffer.index(load_idx % NUM_BUFFERS),
+                    x_scales_ptrs,
+                )
+            else:
+                x_scales_mask = (offs_x_k_scales[None, :] + idx_x_scales) < gl.cdiv(
+                    K, MX_PACK_DIVISOR
+                )
+                gl.amd.gfx1250.async_copy.global_to_shared(
+                    x_scales_buffer.index(load_idx % NUM_BUFFERS),
+                    x_scales_ptrs,
+                    mask=x_scales_mask,
+                )
             gl.amd.gfx1250.async_copy.commit_group()
             x_scales_ptrs += MX_SCALE_BLOCK_K * stride_x_mx_k
 
@@ -605,14 +612,20 @@ def _moe_gemm_a4w4_gfx1250(
             w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
         if not X_SCALES_TDM:
-            x_scales_mask = (offs_x_k_scales[None, :] + idx_x_scales) < gl.cdiv(
-                K, MX_PACK_DIVISOR
-            )
-            gl.amd.gfx1250.async_copy.global_to_shared(
-                x_scales_buffer.index(load_idx % NUM_BUFFERS),
-                x_scales_ptrs,
-                mask=x_scales_mask,
-            )
+            if EVEN_K:
+                gl.amd.gfx1250.async_copy.global_to_shared(
+                    x_scales_buffer.index(load_idx % NUM_BUFFERS),
+                    x_scales_ptrs,
+                )
+            else:
+                x_scales_mask = (offs_x_k_scales[None, :] + idx_x_scales) < gl.cdiv(
+                    K, MX_PACK_DIVISOR
+                )
+                gl.amd.gfx1250.async_copy.global_to_shared(
+                    x_scales_buffer.index(load_idx % NUM_BUFFERS),
+                    x_scales_ptrs,
+                    mask=x_scales_mask,
+                )
             gl.amd.gfx1250.async_copy.commit_group()
             x_scales_ptrs += MX_SCALE_BLOCK_K * stride_x_mx_k
         load_idx += 1
