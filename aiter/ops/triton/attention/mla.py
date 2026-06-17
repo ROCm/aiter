@@ -10,7 +10,9 @@ from aiter.ops.triton._triton_kernels.attention.mla import (
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_decode_fwd_kernel as triton_mla_decode_fwd_kernel,
 )
-from aiter.ops.triton._triton_kernels.attention.mla import _mla_decode_fwd_reduce_kernel
+from aiter.ops.triton._triton_kernels.attention.mla import (
+    _mla_decode_fwd_reduce_kernel as triton_mla_decode_fwd_reduce_kernel,
+)
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
@@ -22,10 +24,14 @@ try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
         _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
     )
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+        _mla_decode_fwd_reduce_kernel as gluon_mla_decode_fwd_reduce_kernel,
+    )
 except:  # noqa: E722
     gluon_mla_prefill_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel = None
+    gluon_mla_decode_fwd_reduce_kernel = None
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -63,31 +69,30 @@ def select_3d_config(
     kv_dtype,
     shuffled_kv_cache,
 ):
+    attn_num_warps = 2
     reduce_num_warps = 2
-    attn_warps = 2
-    waves_per_eu = 1
+    attn_waves_per_eu = 1
+    reduce_waves_per_eu = 2
     num_segments = 0
-    if shuffled_kv_cache:
-        if IS_DEVICE_ARCH_GFX12:
-            if kv_dtype == torch.bfloat16:
-                if num_2d_prgms >= 512:
-                    num_segments = 1
-                else:
-                    num_segments = 2
-            else:
-                if num_2d_prgms >= 512:
-                    num_segments = 1
-                else:
-                    num_segments = 2
+    TILE_SIZE = block_size
+    if IS_DEVICE_ARCH_GFX12:
+        # If we cannot infer max_seqlen_k during graph capture
+        maybe_guess_max_seqlen_k = 128000 if max_seqlen_k == 0 else max_seqlen_k
+        attn_num_warps = 2
+        reduce_num_warps = 4
+        attn_waves_per_eu = 1
+        reduce_waves_per_eu = 1
+        if shuffled_kv_cache:
             if kv_dtype == torch.uint8:
                 assert (
                     block_size == 128
                 ), "Only block_size == 128 is supported for FP4 KV cache"
-        else:
-            attn_warps = 2
-            waves_per_eu = 1
 
-    TILE_SIZE = block_size
+        occ = attn_waves_per_eu * 4 // attn_num_warps
+        MAX_SEGMENTS = max(1, math.ceil(maybe_guess_max_seqlen_k / TILE_SIZE))
+        num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
+        num_segments = min(MAX_SEGMENTS, num_segments)
+        num_segments = triton.next_power_of_2(num_segments)
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     if num_segments == 0:
@@ -104,15 +109,15 @@ def select_3d_config(
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
-        "num_warps": attn_warps,
-        "waves_per_eu": waves_per_eu,
+        "num_warps": attn_num_warps,
+        "waves_per_eu": attn_waves_per_eu,
         "num_stages": 2 if DEVICE_ARCH in ("gfx1250", "gfx950") else 1,
     }
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": reduce_num_warps,
-        "waves_per_eu": 2,
+        "waves_per_eu": reduce_waves_per_eu,
         "num_stages": 1,
     }
     return attn_config, reduce_config
@@ -157,7 +162,12 @@ def mla_prefill_fwd(
     # BLOCK_M = 128
     BLOCK_M = 16
     BLOCK_Q = BLOCK_M // num_queries_per_kv
-    assert BLOCK_Q >= 1
+    assert BLOCK_Q >= 1 or (num_queries_per_kv > BLOCK_M)
+    BLOCK_Q = max(BLOCK_Q, 1)
+    # When num_queries_per_kv > BLOCK_M the query heads of a single KV head do
+    # not fit into one BLOCK_M tile, so we split them across NUM_HEAD_BLOCKS
+    # blocks along the head dimension.
+    NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -168,7 +178,7 @@ def mla_prefill_fwd(
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     # cu_count = get_num_sms()
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    total_num_q_blocks = (q.shape[0] // BLOCK_Q + num_seqs) * NUM_HEAD_BLOCKS
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     # if batch contains a prefill
     attn_config = select_2d_config(
@@ -207,6 +217,7 @@ def mla_prefill_fwd(
             num_seqs=num_seqs,
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
+            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
             WARP_SIZE=WARP_SIZE,
             QUERY_DTYPE=QUERY_DTYPE,
             KV_CACHE_DTYPE=KV_CACHE_DTYPE,
@@ -241,6 +252,7 @@ def mla_prefill_fwd(
             num_seqs=num_seqs,
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
+            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
             **attn_config,
         )
     return out
@@ -325,30 +337,24 @@ def mla_decode_fwd(
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
     ), "qk_head_dim must be equal to kv_lora_rank + qk_rope_head_dim"
 
-    BLOCK_M = (
-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
-    )
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
-    assert BLOCK_Q >= 1
-    # Ideally we would launch with kernel with:
-    # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
-    # However, it is slow to realize the query_lens on cpu.
-    # Instead we use upper-bound:
-    # \sum_i[ceil(query_len[i] / BLOCK_Q)]
-    #   <= \sum_i[floor(query_len[i] / BLOCK_Q) + 1]
-    #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
-    #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
-    #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
-    if IS_DEVICE_ARCH_GFX12:
-        target_num_prgms = 256
+    MAX_BLOCK_M = 16
+    if num_queries_per_kv <= 16:
+        BLOCK_M = 16
     else:
-        cu_count = get_num_sms()
-        target_num_prgms = cu_count * 4
+        BLOCK_M = min(triton.next_power_of_2(num_queries_per_kv), MAX_BLOCK_M)
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    assert BLOCK_Q >= 1 or (num_queries_per_kv > BLOCK_M)
+    BLOCK_Q = max(BLOCK_Q, 1)
+    NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
+    cu_count = get_num_sms()
+    target_num_prgms = cu_count * 4
     ALL_DECODE = num_tokens_per_seq == 1
     if ALL_DECODE:
-        total_num_q_blocks = num_seqs
+        total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
     else:
-        total_num_q_blocks = ((num_tokens_per_seq + BLOCK_Q - 1) // BLOCK_Q) * num_seqs
+        total_num_q_blocks = (
+            ((num_tokens_per_seq + BLOCK_Q - 1) // BLOCK_Q) * num_seqs * NUM_HEAD_BLOCKS
+        )
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     # if batch contains a prefill
 
@@ -439,6 +445,7 @@ def mla_decode_fwd(
             QUERY_DTYPE=QUERY_DTYPE,
             KV_CACHE_DTYPE=KV_CACHE_DTYPE,
             BLOCK_SCALES_SIZE=BLOCK_SCALES_SIZE,
+            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
             **attn_config,
         )
     else:
@@ -447,6 +454,7 @@ def mla_decode_fwd(
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
             query_ptr=q,
+            query_scales_ptr=q_scales,
             kv_buffer_ptr=kv_buffer,
             block_tables_ptr=block_tables,
             seq_lens_ptr=seqused_k,
@@ -458,6 +466,8 @@ def mla_decode_fwd(
             block_tables_stride=block_tables.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
+            query_scales_stride_0=q_scales.stride(0) if q_scales is not None else 0,
+            query_scales_stride_1=q_scales.stride(1) if q_scales is not None else 0,
             KV_LORA_RANK=kv_lora_rank,
             QK_ROPE_HEAD_DIM=qk_rope_head_dim,
             stride_kv_buffer_0=kv_buffer.stride(0),
@@ -468,6 +478,7 @@ def mla_decode_fwd(
             num_tokens_per_seq=num_tokens_per_seq,
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
+            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
             ALL_DECODE=ALL_DECODE,
             SHUFFLED_KV_CACHE=shuffled_kv_cache,
             IS_Q_FP8=(q_dtype == e4m3_dtype),
@@ -480,7 +491,15 @@ def mla_decode_fwd(
     elif skip_reduce:
         return segm_output, segm_max, segm_expsum
 
-    _mla_decode_fwd_reduce_kernel[(total_num_tokens, num_query_heads)](
+    # Temporarily disable gluon reduce kernel, optimize later
+    # if IS_DEVICE_ARCH_GFX12:
+    #     _reduce_kernel = gluon_mla_decode_fwd_reduce_kernel
+    # else:
+    #     _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
+
+    _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
+
+    _reduce_kernel[(total_num_tokens, num_query_heads)](
         output_ptr=out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
@@ -493,9 +512,11 @@ def mla_decode_fwd(
         output_stride_1=out.stride(1),
         block_tables_stride=block_tables.stride(0),
         num_tokens_per_seq=num_tokens_per_seq,
+        total_num_tokens=total_num_tokens,
         KV_LORA_RANK=kv_lora_rank,
         query_start_len_ptr=cu_seqlens_q,
         BLOCK_Q=BLOCK_Q,
+        ALL_DECODE=ALL_DECODE,
         **reduce_config,
     )
     return out

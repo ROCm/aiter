@@ -1,6 +1,6 @@
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.causal_conv1d import (
+from aiter.ops.triton._triton_kernels.conv.causal_conv1d import (
     _causal_conv1d_fwd_kernel,
     _causal_conv1d_update_kernel,
     PAD_SLOT_ID,

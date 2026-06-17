@@ -3,8 +3,12 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/aiter_core_pybind.cu'"
         ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [
+            "'-DENABLE_CK=0'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
@@ -1057,6 +1061,23 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_fused_qknorm_idxrqknorm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/fused_qknorm_idxrqknorm_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fused_qknorm_idxrqknorm.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DENABLE_FP8'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/ck_tile'",
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_fused_qk_norm_rope_cache_quant_shuffle": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/fused_qk_norm_rope_cache_quant_pybind.cu'",
@@ -1075,6 +1096,36 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_fmha_fwd_with_sink_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_fwd_with_sink.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_fwd_bf16 --output_dir {{}}'"
+        ]
+    },
+    "module_fmha_fwd_with_sink_varlen_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_fwd_with_sink_varlen.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_fwd_bf16_varlen --output_dir {{}}'"
+        ]
     },
     "module_pa_decode_bf16_asm": {
         "srcs": [
@@ -1481,6 +1532,25 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_mha_fwd_native_splitkv": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mha_fwd_native_splitkv_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/mha_fwd_native_splitkv.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_msk0_split.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_msk1_split.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_combine.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-mllvm -enable-post-misched=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/kernels/mha_native'"
+        ],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
