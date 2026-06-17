@@ -7,8 +7,8 @@ Ops layer:  aiter.pa_decode_bf16_asm  (wraps SP3 PA_DECODE_D64_1TG_4W_PS)
 Kernel properties (see the reference host file sched2/pa_ps.cpp):
   * head_dim=64, page_size=256, gqa=8.
   * FP8 Q **and** FP8 paged KV cache; bf16 output.
-  * per-tensor scalar dequant scales for Q/K/V (softmax scale folded into
-    key_scale by the wrapper).
+  * per-tensor scalar dequant scales for Q/K/V (softmax scale passed
+    separately as a by-value kernarg, no longer folded into key_scale).
   * persistent / split-KV; GPT-OSS style attention sink (no-op here).
 
 Style mirrors op_tests/test_pa_ps.py: a torch host reference is compared against
@@ -246,6 +246,13 @@ def cpu_reduce(
             global_lse = m + torch.log(s)
             scale = torch.exp(lses - global_lse)
             o = (so[locs] * scale.unsqueeze(-1)).sum(dim=0)
+            # A row whose splits are ALL -inf (max == -inf) is fully causally
+            # masked -> its correct output is 0.  Without this guard the math
+            # above is exp(-inf - (-inf)) = exp(NaN) = NaN, which poisons the
+            # output independently of the kernel (so a NaN here is NOT a V-mask
+            # failure).  Zero those rows per-head.
+            finite = torch.isfinite(m).unsqueeze(-1)
+            o = torch.where(finite, o, torch.zeros_like(o))
             out_flat[seq_id] = o.to(out_flat.dtype)
     return out
 
@@ -264,7 +271,7 @@ def ref_pa_decode(
     softmax_scale,
     sink=None,
 ):
-    """Torch host reference for the gfx1250 PA-decode kernel (no sink, mtp=0).
+    """Torch host reference for the gfx1250 PA-decode kernel (handles mtp + sink).
 
     De-interleaves the tiled paged FP8 K/V into token-major [token, head, dim]
     (matching test_pa_ps.py's k-cache reconstruction / asm_V_shuffle), dequants
@@ -283,13 +290,16 @@ def ref_pa_decode(
     token (`ctx - mtp + 1 + i`), but the GPU follows the no-`+1` border above.
     For mtp=0 this is the full context (no-op).
 
-    sink (optional): per-Q-head fp32 logits in the SCALED-logit domain (Triton /
-    GPT-OSS convention), shape [kv_head_num*gqa].  It adds one virtual logit
-    `sink_raw` directly to each row's softmax denominator (compared against the
-    scaled logits (q.k)*s_eff); the sink has no value, so it only shrinks the
-    real-token weights.  NOTE: the ASM kernel divides the passed sink by s_eff
-    internally (it then re-multiplies by scl_log2e=s_eff*log2e), so callers pass
-    the scaled-domain sink directly -- no *s_eff here.
+    sink (optional): per-Q-head fp32 logits already in the SCALED-score domain, shape
+    [kv_head_num*gqa].  Aligned with aiter Triton (unified_attention: seeds running
+    max M = sink*RCP_LN2, scores = qk*scale*log2e) and Gluon (pa_decode:
+    qk_scale = softmax_scale*query*key, exp_sums += exp2((sink - max_logits)*LOG2_E)):
+    the sink is appended AS-IS and competes directly with the fully-scaled logits
+    qk*s_eff (s_eff = query*key*softmax_scale) -> contributes exp(sink).  Do NOT apply
+    any extra coefficient (no *s_eff, no *softmax_scale).  The kernel matches: it
+    divides v_SINK by s_eff once so its merge yields exp(sink), identical for split
+    (store_partial_results SINK-SPLIT, owner-only) and non-split (pa_normalize
+    do_sink=1).  The sink has no value, so it only shrinks the real-token weights.
     """
     num_pages, kv_head_num = K.shape[0], K.shape[1]
     head_dim = Q.shape[-1]
@@ -298,6 +308,8 @@ def ref_pa_decode(
     mtp = qlen - 1
     device = Q.device
     s_eff = query_scale * key_scale * softmax_scale
+    # Triton/Gluon convention: sink is already a scaled-domain logit -> append as-is
+    # (competes with qk*s_eff -> exp(sink)). NO *s_eff and NO *softmax_scale.
     sink_hg = sink.float().view(kv_head_num, gqa) if sink is not None else None
 
     # K[p,h,d//16,tok,d%16] -> K_tm[p,h,tok,d];  V[p,h,tok//16,d,tok%16] -> V_tm[p,h,tok,d]
@@ -415,6 +427,7 @@ def test_pa_decode(
     scales: Optional[Tuple[float, float, float]] = None,
     varlen: bool = False,
     use_sink: bool = False,
+    context_lens: Optional[list] = None,
 ) -> dict:
     """Random FP8 paged inputs (arbitrary kv_len) vs the torch host reference.
 
@@ -444,12 +457,18 @@ def test_pa_decode(
     softmax_scale = 1.0 / (head_dim**0.5)
 
     # ---- KV lengths + paged block tables (mirrors test_pa_ps.py) ----
-    seq_lens_kv = torch.empty(batch, dtype=torch.int32, device=device)
-    if varlen:
+    if context_lens is not None:
+        # Explicit per-sequence context lengths (e.g. a context_lens tensor dumped
+        # from a production run): batch = len(context_lens), exact per-seq kv_len.
+        # Overrides batch/ctx_len/varlen.
+        seq_lens_kv = torch.tensor(context_lens, dtype=torch.int32, device=device)
+        batch = seq_lens_kv.numel()
+    elif varlen:
+        seq_lens_kv = torch.empty(batch, dtype=torch.int32, device=device)
         for i in range(batch):
             seq_lens_kv[i] = max(int(random.uniform(1, ctx_len)), 1)
     else:
-        seq_lens_kv.fill_(ctx_len)
+        seq_lens_kv = torch.full((batch,), ctx_len, dtype=torch.int32, device=device)
 
     max_blocks_per_seq = ceil_div(int(seq_lens_kv.max().item()), page_size)
     max_blocks = max_blocks_per_seq * batch
@@ -521,7 +540,7 @@ def test_pa_decode(
     # real (~Q.K range) when use_sink, else a finite large-negative no-op (NOT
     # None/-inf).  The same buffer goes to the kernel and the reference.
     if use_sink:
-        sink = (torch.randn(q_head_num, device=device) * 2.0).to(dtypes.fp32)
+        sink = (torch.randn(q_head_num, device=device) * 2.0).to(dtypes.fp32) * 0.125
     else:
         sink = torch.full((q_head_num,), -1.0e30, dtype=dtypes.fp32, device=device)
 
@@ -594,6 +613,402 @@ def test_pa_decode(
     }
 
 
+# ---------------------------------------------------------------------------
+# V-mask NaN-vs-zero bit-match test
+# ---------------------------------------------------------------------------
+# When kv_seq_len is not a multiple of page_size, the last KV page holds
+# uninitialized V for tokens [seq_len, page_end).  The score border mask drives
+# P=0 there, but a stale fp8-NaN V byte makes the PV WMMA compute 0*NaN = NaN
+# (then spread by the reduce).  The kernel's V-mask (apply_V_mask in
+# PA_DECODE_D64_1TG_4W_PS.sp3...) zeros those V bytes before the PV WMMA.  This
+# test fills that padding region two ways — all-NaN vs all-zero — and requires
+# the kernel outputs to be BIT-IDENTICAL: if the mask is correct the NaN can
+# never reach the math, so both runs must produce the same bytes.
+
+
+def _build_pa_inputs(
+    batch,
+    kv_head_num,
+    ctx_len,
+    mtp,
+    scales,
+    varlen,
+    context_lens,
+    device="cuda",
+    seed=0,
+):
+    """Construct one PA-decode test case (mirrors test_pa_decode's input setup) and
+    return all kernel inputs + split-KV metadata in a dict, so several kernel runs
+    can share byte-identical inputs (used by the V-mask bit-match test)."""
+    gqa = PA_GQA_RATIO
+    head_dim = PA_HEAD_DIM
+    page_size = PA_PAGE_SIZE
+    assert (
+        mtp < PA_TILE_Q // gqa
+    ), f"kernel requires mtp < {PA_TILE_Q // gqa}, got {mtp}"
+    qlen_with_mtp = mtp + 1
+    q_head_num = kv_head_num * gqa
+    torch.manual_seed(seed)
+    random.seed(seed)
+
+    if scales is None:
+        query_scale = round(random.uniform(0.5, 2.0), 4)
+        key_scale = round(random.uniform(0.5, 2.0), 4)
+        value_scale = round(random.uniform(0.5, 2.0), 4)
+    else:
+        query_scale, key_scale, value_scale = scales
+    softmax_scale = 1.0 / (head_dim**0.5)
+
+    if context_lens is not None:
+        seq_lens_kv = torch.tensor(context_lens, dtype=torch.int32, device=device)
+        batch = seq_lens_kv.numel()
+    elif varlen:
+        seq_lens_kv = torch.empty(batch, dtype=torch.int32, device=device)
+        for i in range(batch):
+            seq_lens_kv[i] = max(int(random.uniform(1, ctx_len)), 1)
+    else:
+        seq_lens_kv = torch.full((batch,), ctx_len, dtype=torch.int32, device=device)
+
+    max_blocks_per_seq = ceil_div(int(seq_lens_kv.max().item()), page_size)
+    max_blocks = max_blocks_per_seq * batch
+    block_tables = (
+        torch.randperm(max_blocks, device=device)
+        .to(torch.int32)
+        .reshape(batch, max_blocks_per_seq)
+    )
+    actual_blocks = ceil_div(seq_lens_kv, page_size)
+    kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=device)
+    kv_indptr[1:] = torch.cumsum(actual_blocks, dim=0)
+    kv_indices = torch.cat(
+        [block_tables[i, : int(actual_blocks[i].item())] for i in range(batch)]
+    ).to(torch.int32)
+    qo_indptr = torch.arange(
+        0, (batch + 1) * qlen_with_mtp, qlen_with_mtp, dtype=torch.int32, device=device
+    )
+
+    num_phys_pages = max_blocks
+    Q = (
+        0.5
+        * torch.randn(batch, qlen_with_mtp, kv_head_num, gqa, head_dim, device=device)
+    ).to(fp8)
+    K = (
+        0.5
+        * torch.randn(
+            num_phys_pages, kv_head_num, head_dim // 16, page_size, 16, device=device
+        )
+    ).to(fp8)
+    V = (
+        0.5
+        * torch.randn(
+            num_phys_pages, kv_head_num, page_size // 16, head_dim, 16, device=device
+        )
+    ).to(fp8)
+
+    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+    (
+        work_indptr,
+        work_info,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        split_rows,
+    ) = make_sched2_metadata(
+        batch,
+        kv_head_num,
+        gqa,
+        qo_indptr,
+        kv_indptr,
+        seq_lens_kv,
+        page_size,
+        qlen_with_mtp,
+        num_cu,
+        device,
+    )
+    sink = torch.full((q_head_num,), -1.0e30, dtype=dtypes.fp32, device=device)
+
+    return dict(
+        batch=batch,
+        gqa=gqa,
+        mtp=mtp,
+        page_size=page_size,
+        head_dim=head_dim,
+        q_head_num=q_head_num,
+        Q=Q,
+        K=K,
+        V=V,
+        kv_indices=kv_indices,
+        seq_lens_kv=seq_lens_kv,
+        softmax_scale=softmax_scale,
+        kv_indptr=kv_indptr,
+        qo_indptr=qo_indptr,
+        query_scale=query_scale,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        work_indptr=work_indptr,
+        work_info=work_info,
+        reduce_indptr=reduce_indptr,
+        reduce_final_map=reduce_final_map,
+        reduce_partial_map=reduce_partial_map,
+        split_rows=split_rows,
+        sink=sink,
+    )
+
+
+def fill_v_padding(V, value, kv_indices, kv_indptr, seq_lens_kv, page_size):
+    """Return a clone of V with each sequence's last-page padding tokens (token
+    index >= seq_len) set to `value`.  V is the paged cache [page, kv_head,
+    token//16, head_dim, token%16].  These positions hold uninitialized data in a
+    real KV cache; the kernel's V-mask must zero them.  Returns (V_filled, n_pad)
+    where n_pad is the total number of (page,token) padding slots filled."""
+    V = V.clone()
+    n_pad = 0
+    for b in range(seq_lens_kv.numel()):
+        seq = int(seq_lens_kv[b].item())
+        lo, hi = int(kv_indptr[b].item()), int(kv_indptr[b + 1].item())
+        nb = hi - lo
+        if nb == 0:
+            continue
+        last_page = int(kv_indices[hi - 1].item())
+        valid_in_last = seq - (nb - 1) * page_size
+        for t in range(valid_in_last, page_size):  # empty range when last page is full
+            V[last_page, :, t // 16, :, t % 16] = value
+            n_pad += 1
+    return V, n_pad
+
+
+def _run_pa_kernel(inp, V):
+    """Run ONLY the GPU PA stage for a given V tensor (no host reduce).  Returns
+    (out_raw, split_o) — both kernel-side outputs.  out_raw holds direct-to-O rows
+    (non-split work); split_o holds the per-split partials.  Comparing THESE between
+    the NaN-V and zero-V runs is the true test of the kernel's V-mask: it excludes
+    the host cpu_reduce (whose own -inf handling is unrelated to V padding)."""
+    split_o = torch.zeros(
+        (inp["split_rows"], 1, inp["q_head_num"], inp["head_dim"]),
+        dtype=dtypes.fp32,
+        device="cuda",
+    )
+    split_lse = torch.full(
+        (inp["split_rows"], 1, inp["q_head_num"], 1),
+        float("-inf"),
+        dtype=dtypes.fp32,
+        device="cuda",
+    )
+    out = aiter.pa_decode_bf16_asm(
+        inp["Q"],
+        inp["K"],
+        V,
+        inp["kv_indices"],
+        inp["seq_lens_kv"],
+        inp["softmax_scale"],
+        inp["kv_indptr"],
+        gqa=inp["gqa"],
+        mtp=inp["mtp"],
+        query_scale=inp["query_scale"],
+        key_scale=inp["key_scale"],
+        value_scale=inp["value_scale"],
+        qo_indptr=inp["qo_indptr"],
+        work_indptr=inp["work_indptr"],
+        work_info=inp["work_info"],
+        split_o=split_o,
+        split_lse=split_lse,
+        sink=inp["sink"],
+    )
+    torch.cuda.synchronize()
+    return out.clone(), split_o.clone(), split_lse.clone()
+
+
+def _bits(t):
+    """Reinterpret a float tensor as same-width int for exact bitwise comparison
+    (NaN-safe: torch.equal on floats treats NaN != NaN, masking a real bit match)."""
+    if t.dtype == torch.bfloat16 or t.dtype == torch.float16:
+        return t.contiguous().view(torch.int16)
+    return t.contiguous().view(torch.int32)
+
+
+def test_pa_decode_vmask(
+    batch: int,
+    kv_head_num: int,
+    ctx_len: int,
+    mtp: int = 0,
+    scales: Optional[Tuple[float, float, float]] = None,
+    varlen: bool = False,
+    context_lens: Optional[list] = None,
+) -> dict:
+    """V-mask correctness: filling the last-page padding region with NaN vs 0 must
+    yield BIT-IDENTICAL *kernel* output.
+
+    The kernel-side tensors (out_raw + split_o) are the real signal: if the V-mask
+    works, the NaN can never enter the PV WMMA, so these are byte-identical AND have
+    no NaN.  A divergence (or NaN in split_o/out_raw) is a genuine V-mask failure.
+
+    The final post-reduce output is also compared, but a NaN that appears ONLY after
+    cpu_reduce (with the kernel side clean + matching) is a host-reduce artifact on
+    fully-masked rows, NOT a V-mask bug — flagged separately as host_nan."""
+    inp = _build_pa_inputs(
+        batch, kv_head_num, ctx_len, mtp, scales, varlen, context_lens
+    )
+    ps = inp["page_size"]
+
+    V_nan, n_pad = fill_v_padding(
+        inp["V"],
+        float("nan"),
+        inp["kv_indices"],
+        inp["kv_indptr"],
+        inp["seq_lens_kv"],
+        ps,
+    )
+    V_zero, _ = fill_v_padding(
+        inp["V"], 0.0, inp["kv_indices"], inp["kv_indptr"], inp["seq_lens_kv"], ps
+    )
+
+    # Run EACH input REPS times.  The kernel race is intermittent, so a single
+    # zero-V-x2 control can miss it (the two runs happen to agree).  Running both
+    # zero-V and NaN-V several times lets us separate the race from a real V leak:
+    #   * det_zero / det_nan = max pairwise mismatch WITHIN each input's repeats
+    #       -> nonzero == kernel nondeterminism (a race), independent of V.
+    #   * vmask = NaN-V vs zero-V.  Only meaningful when det_zero==det_nan==0; if the
+    #       kernel is nondeterministic the vmask diff is dominated by the race.
+    # `out` (direct-O) is torch.empty -> uninitialized for split rows, so we judge by
+    # split_o (zero-init kernel partials) and the FINAL reduced output only.
+    REPS = 10  # intermittent race -> need enough reps to detect reliably
+
+    def rd(o, so, sl):
+        return cpu_reduce(
+            o.clone(),
+            so,
+            sl,
+            inp["reduce_indptr"],
+            inp["reduce_final_map"],
+            inp["reduce_partial_map"],
+            inp["gqa"],
+        )
+
+    def run_reps(V):
+        fins, sos = [], []
+        for _ in range(REPS):
+            o, so, sl = _run_pa_kernel(inp, V)
+            sos.append(so)
+            fins.append(rd(o, so, sl))
+        return fins, sos
+
+    def maxpair(lst):
+        m = 0
+        for i in range(len(lst)):
+            for j in range(i + 1, len(lst)):
+                m = max(m, int((_bits(lst[i]) != _bits(lst[j])).sum().item()))
+        return m
+
+    def maxpair_absdiff(lst):
+        """Max absolute value of the pairwise differences between repeats (the
+        magnitude of the largest nondeterministic discrepancy, not just its count)."""
+        m = 0.0
+        for i in range(len(lst)):
+            for j in range(i + 1, len(lst)):
+                d = (lst[i].float() - lst[j].float()).abs()
+                d = d[~torch.isnan(d)]  # ignore NaN-vs-NaN / NaN-vs-num slots
+                if d.numel():
+                    m = max(m, float(d.max().item()))
+        return m
+
+    def maxpair_reldiff(lst):
+        """Max relative value of the pairwise differences between repeats:
+        max |a-b| / max(|a|,|b|) over elements (worst-case elementwise relative
+        discrepancy), ignoring NaN slots."""
+        m = 0.0
+        for i in range(len(lst)):
+            for j in range(i + 1, len(lst)):
+                a, b = lst[i].float(), lst[j].float()
+                d = (a - b).abs()
+                denom = torch.maximum(a.abs(), b.abs())
+                r = d / denom.clamp_min(1e-9)
+                r = r[~torch.isnan(r)]  # ignore NaN-vs-NaN / NaN-vs-num slots
+                if r.numel():
+                    m = max(m, float(r.max().item()))
+        return m
+
+    def any_nan(lst):
+        return int(sum(int(torch.isnan(t.float()).sum().item()) for t in lst))
+
+    z_fin, z_so = run_reps(V_zero)
+    n_fin, n_so = run_reps(V_nan)
+
+    # Determinism within each input (intermittent race detector).
+    det_zero = max(maxpair(z_fin), maxpair(z_so))
+    det_nan = max(maxpair(n_fin), maxpair(n_so))
+    nondeterministic = (det_zero > 0) or (det_nan > 0)
+
+    # Magnitude of the largest within-input discrepancy (max |a-b| over repeats),
+    # both absolute and relative to the element magnitude.
+    det_zero_absmax = max(maxpair_absdiff(z_fin), maxpair_absdiff(z_so))
+    det_nan_absmax = max(maxpair_absdiff(n_fin), maxpair_absdiff(n_so))
+    det_zero_relmax = max(maxpair_reldiff(z_fin), maxpair_reldiff(z_so))
+    det_nan_relmax = max(maxpair_reldiff(n_fin), maxpair_reldiff(n_so))
+
+    # NaN anywhere (kernel partials or final), either input.
+    nan_zero = any_nan(z_so) + any_nan(z_fin)
+    nan_nan = any_nan(n_so) + any_nan(n_fin)
+    final_nan = any_nan(n_fin) + any_nan(z_fin)
+
+    # V-mask diff (NaN-V vs zero-V), first repeat of each.
+    vmask_split_mismatch = int((_bits(n_so[0]) != _bits(z_so[0])).sum().item())
+    final_mismatch = int((_bits(n_fin[0]) != _bits(z_fin[0])).sum().item())
+
+    # Verdict: a race blocks a clean V-mask verdict.  Only when the kernel is
+    # deterministic AND no NaN does a NaN-vs-0 diff mean a real V leak.
+    if nondeterministic:
+        status, vmask_ok = "RACE", False
+    elif (nan_zero + nan_nan) > 0 or vmask_split_mismatch > 0 or final_mismatch > 0:
+        status, vmask_ok = "FAIL", False
+    else:
+        status, vmask_ok = "PASS", True
+
+    aiter.logger.info(
+        "[V-mask %s] b=%d kvh=%d ctx=%s mtp=%d | pad=%d reps=%d || DET(within-input): "
+        "zero=%d nan=%d (absmax: zero=%.3g nan=%.3g | relmax: zero=%.3g nan=%.3g) %s "
+        "|| NaN: zero=%d nan=%d || VMASK(NaNvs0): split_o=%d final=%d",
+        status,
+        inp["batch"],
+        kv_head_num,
+        context_lens if context_lens is not None else ctx_len,
+        mtp,
+        n_pad,
+        REPS,
+        det_zero,
+        det_nan,
+        det_zero_absmax,
+        det_nan_absmax,
+        det_zero_relmax,
+        det_nan_relmax,
+        "<-- RACE (V-mask verdict blocked)" if nondeterministic else "",
+        nan_zero,
+        nan_nan,
+        vmask_split_mismatch,
+        final_mismatch,
+    )
+
+    return {
+        "batch": inp["batch"],
+        "kvh": kv_head_num,
+        "max_kv": int(inp["seq_lens_kv"].max().item()),
+        "mtp": mtp,
+        "varlen": varlen,
+        "pad_slots": n_pad,
+        "det_zero": det_zero,
+        "det_nan": det_nan,
+        "det_zero_absmax": det_zero_absmax,
+        "det_nan_absmax": det_nan_absmax,
+        "det_zero_relmax": det_zero_relmax,
+        "det_nan_relmax": det_nan_relmax,
+        "nondeterministic": nondeterministic,
+        "nan_zero": nan_zero,
+        "nan_nan": nan_nan,
+        "final_nan": final_nan,
+        "vmask_split_mismatch": vmask_split_mismatch,
+        "final_mismatch": final_mismatch,
+        "bitmatch": vmask_ok,
+    }
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of pa_decode_bf16_asm test",
@@ -655,23 +1070,96 @@ parser.add_argument(
     the kernel + matching sink term in the reference. Requires the sink-enabled
     kernel binary; with the current .co the kernel ignores it and this fails.""",
 )
+parser.add_argument(
+    "--context_lens",
+    type=int,
+    nargs="*",
+    default=None,
+    help="""Explicit per-sequence context lengths for ONE shape (e.g. a context_lens
+    tensor dumped from a production run). batch = number of values given; overrides
+    -b/-c/--varlen. e.g. --context_lens 462 549 670 520 ...""",
+)
+parser.add_argument(
+    "--vmask",
+    action="store_true",
+    help="""Run the V-mask NaN-vs-zero bit-match test instead of the accuracy test:
+    fill each sequence's last-page padding (token >= seq_len) with NaN vs with 0 and
+    require BIT-IDENTICAL kernel output. Catches stale/garbage V leaking into the PV
+    WMMA. Exits non-zero if any config mismatches. Use ctx_len values that are NOT a
+    multiple of 256 so a padding region exists, e.g. -c 7 100 260 777 4097.""",
+)
 args = parser.parse_args()
 
-df = []
-for batch, kv_head_num, ctx_len, mtp in itertools.product(
-    args.batch_size, args.kv_head_num, args.ctx_len, args.mtp
-):
-    ret = test_pa_decode(
-        batch,
-        kv_head_num,
-        ctx_len,
-        mtp,
-        tuple(args.scales) if args.scales is not None else None,
-        args.varlen,
-        args.sink,
+# An explicit context_lens vector defines a single shape: batch = its length, the
+# kv_lens are the exact values. Collapse the -b/-c sweep to that one config (kv_head
+# / mtp are still swept) and pass the vector through.
+batch_sizes = [len(args.context_lens)] if args.context_lens else args.batch_size
+ctx_lens = [max(args.context_lens)] if args.context_lens else args.ctx_len
+
+if args.vmask:
+    # V-mask bit-match sweep: NaN-padded V vs zero-padded V must match bit-for-bit.
+    import sys
+
+    df = []
+    for batch, kv_head_num, ctx_len, mtp in itertools.product(
+        batch_sizes, args.kv_head_num, ctx_lens, args.mtp
+    ):
+        ret = test_pa_decode_vmask(
+            batch,
+            kv_head_num,
+            ctx_len,
+            mtp,
+            tuple(args.scales) if args.scales is not None else None,
+            args.varlen,
+            args.context_lens,
+        )
+        df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("pa_decode_bf16_asm V-mask summary (markdown):\n%s", df_md)
+    df.to_csv("pa_decode_bf16_asm_vmask.csv")
+    n_race = int(df["nondeterministic"].sum())
+    n_fail = int((~df["bitmatch"]).sum())
+    if n_race:
+        aiter.logger.error(
+            "V-mask test INCONCLUSIVE: %d/%d configs NONDETERMINISTIC — two identical "
+            "zero-V runs differ in split_o or FINAL output (det_split_o/det_final>0). "
+            "That is a real GPU race (NOT the harmless uninit out_raw). Fix it first.",
+            n_race,
+            len(df),
+        )
+        sys.exit(2)
+    if n_fail:
+        aiter.logger.error(
+            "V-mask test FAILED: %d/%d configs — NaN-V vs zero-V diverged or held NaN "
+            "in split_o/FINAL, i.e. stale padding V leaked into the PV WMMA.",
+            n_fail,
+            len(df),
+        )
+        sys.exit(1)
+    aiter.logger.info(
+        "V-mask test PASSED: all %d configs — kernel deterministic, split_o & FINAL "
+        "bit-match between NaN-V and zero-V, no NaN. (det_out_raw is uninitialized "
+        "direct-O scratch for split rows; cpu_reduce overwrites it — harmless.)",
+        len(df),
     )
-    df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("pa_decode_bf16_asm summary (markdown):\n%s", df_md)
-df.to_csv("pa_decode_bf16_asm.csv")
+else:
+    df = []
+    for batch, kv_head_num, ctx_len, mtp in itertools.product(
+        batch_sizes, args.kv_head_num, ctx_lens, args.mtp
+    ):
+        ret = test_pa_decode(
+            batch,
+            kv_head_num,
+            ctx_len,
+            mtp,
+            tuple(args.scales) if args.scales is not None else None,
+            args.varlen,
+            args.sink,
+            args.context_lens,
+        )
+        df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("pa_decode_bf16_asm summary (markdown):\n%s", df_md)
+    df.to_csv("pa_decode_bf16_asm.csv")
