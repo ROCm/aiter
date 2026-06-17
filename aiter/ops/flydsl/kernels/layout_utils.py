@@ -83,12 +83,15 @@ def idx2crd(idx, layout):
     """
     parsed = _parse_layout(layout)
 
+    if hasattr(idx, "ir_value"):
+        idx = idx.ir_value()
+
     if parsed is None or _has_dynamic_strides(parsed[1]):
-        result = fx.idx2crd(idx, layout)
+        result = fx.idx2crd(fx.Int32(idx), layout)
         ndims = len(parsed[1]) if parsed else 1
         return [_wrap(fx.get(result, i)) for i in range(ndims)]
 
-    if hasattr(idx, "type") and str(idx.type) != "index":
+    if isinstance(idx, ir.Value) and not isinstance(idx.type, ir.IndexType):
         idx = arith.index_cast(T.index, idx)
     shapes, strides = parsed
     ndims = len(strides)
@@ -138,15 +141,28 @@ def crd2idx(crd, layout):
         crd_i32 = []
         for c in crd:
             cv = c
+            if isinstance(cv, int):
+                cv = arith.constant(cv, T.i32)
+                crd_i32.append(cv)
+                continue
             if isinstance(cv, ArithValue):
-                cv = cv.ir_value() if hasattr(cv, "ir_value") else cv
-            if isinstance(cv, ir.Value) and isinstance(cv.type, ir.IndexType):
+                raw = cv.ir_value() if hasattr(cv, "ir_value") else cv
+                if isinstance(raw, ir.Value) and isinstance(raw.type, ir.IndexType):
+                    cv = arith.index_cast(T.i32, raw)
+                else:
+                    cv = raw
+            elif isinstance(cv, ir.Value) and isinstance(cv.type, ir.IndexType):
                 cv = arith.index_cast(T.i32, cv)
+            elif hasattr(cv, "ir_value"):
+                raw = cv.ir_value()
+                if isinstance(raw, ir.Value) and isinstance(raw.type, ir.IndexType):
+                    cv = arith.index_cast(T.i32, raw)
+                else:
+                    cv = raw
             crd_i32.append(cv)
         coord_val = fx.make_coord(*crd_i32)
-        result = fx.crd2idx(coord_val, layout)
-        scalar = fx.get_scalar(result)
-        if isinstance(scalar, ir.Value) and not isinstance(scalar.type, ir.IndexType):
+        scalar = fx.get_scalar(fx.crd2idx(coord_val, layout)).ir_value()
+        if not isinstance(scalar.type, ir.IndexType):
             scalar = arith.index_cast(T.index, scalar)
         return _wrap(scalar)
 

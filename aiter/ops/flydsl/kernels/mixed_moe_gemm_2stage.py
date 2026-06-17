@@ -797,10 +797,10 @@ def compile_mixed_moe_gemm1(
                     return parts
 
                 # Wave/lane decomposition (identical to stage2)
-                coord_wl = idx2crd(tx, layout_tx_wave_lane)
+                coord_wl = idx2crd(fx.Int32(tx), layout_tx_wave_lane)
                 wave_id = layout_get(coord_wl, 0)
                 lane_id = layout_get(coord_wl, 1)
-                coord_l16 = idx2crd(lane_id, layout_lane16)
+                coord_l16 = idx2crd(fx.Int32(lane_id), layout_lane16)
                 lane_div_16 = layout_get(coord_l16, 0)
                 lane_mod_16 = layout_get(coord_l16, 1)
                 row_a_lds = lane_mod_16
@@ -831,12 +831,12 @@ def compile_mixed_moe_gemm1(
                     global_n = by_n + n_tile_base + c_offset + lane_mod_16
                     # Gate/interleave: rows [expert_off, expert_off + 2*inter_dim)
                     gate_row_w = expert_off_idx + global_n
-                    gate_coord = idx2crd(gate_row_w, layout_n_blk_intra)
+                    gate_coord = idx2crd(fx.Int32(gate_row_w), layout_n_blk_intra)
                     gate_n_blk_list.append(layout_get(gate_coord, 0))
                     gate_n_intra_list.append(layout_get(gate_coord, 1))
                     if const_expr(not mock_gate_only and not gate_up_interleave):
                         up_row_w = gate_row_w + inter_idx
-                        up_coord = idx2crd(up_row_w, layout_n_blk_intra)
+                        up_coord = idx2crd(fx.Int32(up_row_w), layout_n_blk_intra)
                         up_n_blk_list.append(layout_get(up_coord, 0))
                         up_n_intra_list.append(layout_get(up_coord, 1))
 
@@ -879,7 +879,7 @@ def compile_mixed_moe_gemm1(
                     k0 = base_k_bytes // c64 + arith.constant(ku, index=True)
                     k1 = lane_div_16
                     coord_pack = (n_blk, k0, k1, n_intra, arith.constant(0, index=True))
-                    idx_pack = crd2idx(coord_pack, layout_b)
+                    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
                     vec_elems = kpack_bytes // int(b_elem_bytes)
                     b16 = _buffer_load_vec(
                         buffer_ops,
@@ -1164,7 +1164,9 @@ def compile_mixed_moe_gemm1(
                         if elem_bytes == 1
                         else (col_base_swz_bytes / arith.index(2))
                     )
-                    idx_a16 = crd2idx([curr_row_a_lds, col_base_swz], layout_lds)
+                    idx_a16 = crd2idx(
+                        [fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)], layout_lds
+                    )
                     loaded_a16 = vector.load_op(vec16_x, lds_buffer, [idx_a16])
                     a_i64x2 = vector.bitcast(vec2_i64, loaded_a16)
                     a0 = vector.extract(
@@ -3605,10 +3607,10 @@ def compile_mixed_moe_gemm2(
                     return parts
 
                 # tx -> wave/lane (GEMM-style decomposition).
-                coord_wl = idx2crd(tx, layout_tx_wave_lane)
+                coord_wl = idx2crd(fx.Int32(tx), layout_tx_wave_lane)
                 wave_id = layout_get(coord_wl, 0)
                 lane_id = layout_get(coord_wl, 1)
-                coord_l16 = idx2crd(lane_id, layout_lane16)
+                coord_l16 = idx2crd(fx.Int32(lane_id), layout_lane16)
                 lane_div_16 = layout_get(coord_l16, 0)
                 lane_mod_16 = layout_get(coord_l16, 1)
 
@@ -3976,7 +3978,9 @@ def compile_mixed_moe_gemm2(
                         else (col_base_swz_bytes / arith.index(2))
                     )
                     # Pass as list so layout_utils.crd2idx uses static arith path
-                    idx_a16 = crd2idx([curr_row_a_lds, col_base_swz], layout_lds)
+                    idx_a16 = crd2idx(
+                        [fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)], layout_lds
+                    )
                     idx_a16 = idx_a16 + lds_base
                     loaded_a16 = vector.load_op(vec16_x, lds_x, [idx_a16])
                     a_i64x2 = vector.bitcast(vec2_i64, loaded_a16)
