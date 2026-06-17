@@ -614,9 +614,6 @@ def test_grouped_a4w4_swiglu_matches_torch_ref(layout):
     _sanity_check("a4w4", layout=layout, activation=ActivationType.Swiglu)
 
 
-# A tight limit forces the gate/up clamp to actually fire so that the grouped
-# epilogue and the torch reference must agree on the clamped path (not just the
-# pass-through). SiLU now honors swiglu_limit too, so it is covered here.
 @pytest.mark.parametrize("layout", ["gguu", "gugu"])
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
 def test_grouped_a4w4_swiglu_limit_clamps(layout, activation):
