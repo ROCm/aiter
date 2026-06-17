@@ -375,6 +375,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_warps = 4
 
     l2_prefetch_distance = 2
+    x_scales_tdm = False
 
     ret = {
         "block_m": block_m,
@@ -384,6 +385,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "xcd_swizzle": num_xcds,
         "num_buffers": num_buffers,
         "l2_prefetch_distance": l2_prefetch_distance,
+        "x_scales_tdm": x_scales_tdm,
         "split_k": 1,
         "waves_per_eu": 0,
         "num_ctas": 1,
@@ -666,6 +668,7 @@ def moe_gemm_a4w4(
             NUM_BUFFERS=config["num_buffers"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             L2_PREFETCH_DISTANCE=config["l2_prefetch_distance"],
+            X_SCALES_TDM=config.get("x_scales_tdm", False),
             **layouts,
             num_ctas=1 if gather_indx is not None else config["num_ctas"],
             num_warps=config["num_warps"],
