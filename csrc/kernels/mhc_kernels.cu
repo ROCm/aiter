@@ -161,17 +161,8 @@ namespace aiter {
         static constexpr int32_t interleave_size = warp_size / mfma_m;
         float sqrsum_part = 0.0f;
 
-#if defined(__gfx942__)
-        // gfx942 path keeps 32-bit async copies.
-        static constexpr int fn_vec_size = 1;
-        static constexpr int fn_xor_shift = 0;
-#else
-        // Swizzle at 4-float granularity so LDS reads can use 128-bit contiguous loads.
-        // The row mask occupies bits [2:5], spreading 16 rows across 64 banks while
-        // preserving the low 2 bits of K for ds_read_b128.
         static constexpr int fn_vec_size = 4;
         static constexpr int fn_xor_shift = 2;
-#endif
         const int fn_row_base = warp_id * (tile_n / warp_per_block);
         auto lds_load_fn_tile = [&](int k){
             float* s_fn_wr_ptr = k % 2 == 0 ? s_fn : (s_fn + tile_n * tile_k);
