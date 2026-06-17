@@ -32,22 +32,17 @@ from typing import Optional
 import pytest
 import torch
 
-_LOCAL_DEPS = ("/root/data/aiter", "/root/data/triton/python")
-for _dep in reversed(_LOCAL_DEPS):
-    if os.path.exists(_dep) and _dep not in sys.path:
-        sys.path.insert(0, _dep)
-
-from aiter import ActivationType, QuantType  # noqa: E402
-from aiter.fused_moe import (  # noqa: E402
+from aiter import ActivationType, QuantType, logger
+from aiter.fused_moe import (
     fused_moe,
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402
-from aiter.ops.quant import per_1x32_f4_quant  # noqa: E402
-from aiter.ops.shuffle import shuffle_scale, shuffle_weight  # noqa: E402
-from aiter.utility import fp4_utils  # noqa: E402
-from aiter.utility import dtypes  # noqa: E402
+from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.quant import per_1x32_f4_quant
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.utility import fp4_utils
+from aiter.utility import dtypes
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
@@ -799,6 +794,17 @@ def _summarize_accuracy(rows: list):
     return df
 
 
+def set_data_format(data_format: str) -> None:
+    """Select the grouped GEMM data format.
+
+    a8w4 needs ``AITER_FORCE_A8W4=1`` so ``fused_moe`` routes the a8w4 path
+    (see fused_moe.py); a4w4 needs nothing extra.
+    """
+    if data_format == "a8w4":
+        os.environ["AITER_FORCE_A8W4"] = "1"
+    logger.info("grouped GEMM data format: %s", data_format)
+
+
 def main() -> None:
     if not is_gfx1250():
         print("skipping: requires gfx1250")
@@ -864,6 +870,8 @@ def main() -> None:
             "at least 512 for the grouped GEMM kernels (tile_k=256 requires at "
             "least two K tiles)."
         )
+
+    set_data_format(args.data_format)
 
     # --tokens accepts one or more counts; run the chosen scenario once per
     # value. Each iteration sets args.tokens to a single int so _bench /
