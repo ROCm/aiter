@@ -264,7 +264,7 @@ def _batched_gemm_a16wfp4_reduce_kernel(
     if ACTUAL_KSPLIT == MAX_KSPLIT:
         c = tl.load(c_in_ptrs)
     else:
-        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT)
+        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
     c = tl.sum(c, axis=0)
 
     c = c.to(c_out_ptr.type.element_ty)
@@ -309,10 +309,10 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
             triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
         )
 
+    # re-ensuring NUM_KSPLIT is the correct value
+    NUM_KSPLIT = triton.cdiv(K, (SPLITK_BLOCK_SIZE // 2))
+
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
-
-
-def _get_config(
     M: int,
     N: int,
     K: int,

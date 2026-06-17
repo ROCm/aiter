@@ -154,7 +154,7 @@ def batched_gemm_a16wfp4_(
     if config["BLOCK_SIZE_K"] >= 2 * K:
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
         config["SPLITK_BLOCK_SIZE"] = 2 * K
-
+        config["NUM_KSPLIT"] = 1
     if config["NUM_KSPLIT"] == 1:
         stride_ck = 0
         stride_cn = y.stride(2)
