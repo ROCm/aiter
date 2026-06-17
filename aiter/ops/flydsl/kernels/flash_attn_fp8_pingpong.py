@@ -204,6 +204,14 @@ def build_flash_attn_fp8_module(
             )
             return arith.trunci(T.i8, _raw(packed))
 
+        def _f32x4_to_fp8_word(f0, f1, f2, f3):
+            # Pack 4 f32 -> one i32 (4 contiguous fp8 bytes [f0,f1,f2,f3]) using
+            # two cvt_pk_fp8_f32: low word = (f0,f1), high word = (f2,f3).
+            # Halves both the cvt count and the LDS store count vs per-byte.
+            w0 = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f0), _raw(f1), fx.Int32(0), False)
+            w1 = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f2), _raw(f3), _raw(w0), True)
+            return w1
+
         mfma = Mfma32x32x64()
 
         q_ptr = _extract_aligned_pointer(Q)
@@ -423,15 +431,30 @@ def build_flash_attn_fp8_module(
             # P_lds is shared by all 8 waves, so the row index must be the
             # block-local q = wave_q_offset + lo (NOT just lo, which would
             # make every wave collide on the same 32 rows).
+            # The C-layout value index r maps to kv = hi*4 + (r%4) + 8*(r//4)
+            # (+ nt*32).  For each group rg = r//4 the four values r=rg*4+0..3
+            # land on CONTIGUOUS kv = hi*4 + 8*rg + nt*32 + {0,1,2,3}, so pack
+            # them into one i32 (4 fp8 bytes) and emit a single b32 LDS store
+            # instead of four byte stores (16 -> 4 stores per kv subtile).
             p_q_local = wave_q_offset + lo
+            i32_dtype = fx.Int32
             for nt in range_constexpr(N_KV_TILES):
-                for r in range_constexpr(C_F32_PER_LANE):
-                    kv_row = hi * 4 + (r % 4) + 8 * (r // 4) + nt * 32
-                    p_i8 = _f32_to_fp8_byte(p_vals[nt][r])
+                for rg in range_constexpr(C_F32_PER_LANE // 4):
+                    base = rg * 4
+                    word = _f32x4_to_fp8_word(
+                        p_vals[nt][base + 0],
+                        p_vals[nt][base + 1],
+                        p_vals[nt][base + 2],
+                        p_vals[nt][base + 3],
+                    )
+                    kv_row = hi * 4 + 8 * rg + nt * 32
                     p_idx = (
                         fx.Index(LDS_P_OFF) + p_q_local * P_STRIDE + fx.Index(kv_row)
                     )
-                    Vec.from_elements([fx.Int8(p_i8)], i8_dtype).store(lds, [p_idx])
+                    # Store the i32 as 4 contiguous int8 bytes at p_idx:
+                    # vec<1xi32> -> bitcast -> vec<4xi8>.
+                    word_vec = Vec.from_elements([fx.Int32(word)], i32_dtype)
+                    Vec(word_vec).bitcast(i8_dtype).store(lds, [p_idx])
             # P round-trip is intra-wave (each wave writes & reads only its own
             # 32 P rows), but a lane reads kv columns written by its hi-peer
             # lane in the same wave -> only an LDS fence is needed, NOT a full
