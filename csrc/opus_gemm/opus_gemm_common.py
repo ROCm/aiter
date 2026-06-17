@@ -832,16 +832,21 @@ _GFX1250_CTDM_TILES = [
 gfx1250_kernels_list = {}
 _GFX1250_KID_BASE = 20000
 _GFX1250_KID_STRIDE = 8
-# Stability gate: high N-register-expansion (kExpN = B_N/(16*kTileN) >= 4) tiles
-# have a NON-deterministic producer/consumer race that the current
-# tensorcnt(drain)+named-barrier+dscnt handshake cannot close (the producer
-# lacks a primitive that waits for the TDM's LDS write to become *visible* to
-# the consumer wave; the race probability scales with kExpN). kExpN<=2 is
-# reliable (stress-verified). Disable kExpN>2 kids until the producer
-# LDS-visibility handshake (DS_ATOMIC_ASYNC_BARRIER_ARRIVE) is wired up.
-# The _ti index (and thus every retained kid id) is preserved so already-tuned
-# CSV winners keep their meaning.
-_GFX1250_MAX_KEXPN = 2
+# Stability gate on the consumer N-register-expansion kExpN = B_N/(16*kTileN).
+# Two compounding hazards on high-expansion tiles, both now fixed in the consumer:
+#  (1) WMMA-source WAR (MI400 SPG 4.6.12.1): v_wmma_*_16x16x32_bf16 reads its
+#      Matrix A/B over 16 passes; an instruction overwriting those source VGPRs
+#      within ~8 co-exec slots corrupts. The compiler only inserts the required
+#      gap for VALU/XDL writers, NOT for ds_load (VMEM) writers, so a next-round
+#      ds_load overwriting the source silently raced.
+#  (2) DScnt overflow: a 2-round-overlap prefetch keeps 2 rounds of ds in flight
+#      (up to 72 > the 6-bit DScnt limit of 63 for kExpN=8).
+# Fix: round-granular ping-pong prefetch -- load round i+1 into the OTHER buffer
+# BEFORE round i's WMMA (distinct VGPRs => no WAR), but DRAIN each round's ds
+# immediately (<=1 round = <=36 in flight => no DScnt overflow). Stress-verified
+# 8/8 at the hardest config (splitK=4,K=2880) for kExpN up to 8 (32x128 incl.).
+# Guard kept as a safety valve; current tiles top out at kExpN=8.
+_GFX1250_MAX_KEXPN = 8
 for _ti, (_bm, _bn, _bk, _layout) in enumerate(_GFX1250_CTDM_TILES):
     _ktile_n = 1 if _layout == "tileM" else 2
     _kexp_n = _bn // (16 * _ktile_n)

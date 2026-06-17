@@ -36,6 +36,8 @@ __host__ __device__ constexpr inline int opus_ctdm_ws_min_i(int a, int b) {
     return a < b ? a : b;
 }
 
+
+
 template <typename UserTraits>
 __global__ __launch_bounds__(128, 1)
 void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_kargs_gfx1250 kargs) {
@@ -151,7 +153,7 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
             if (k_steps >= 2) { w.move(KStep, 0_I,0_I,0_I,0_I, slot_bytes); w.load_to_lds(); }
             if (k_steps >= 3) { w.move(KStep, 0_I,0_I,0_I,0_I, slot_bytes); w.load_to_lds(); }
             if (k_steps >= 3) {
-                __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<1>{});  // drain ALL in-flight TDMs before announce (run-ahead announces too early: TENSORcnt-done of the oldest does not make that slot's LDS write visible to the consumer wave; draining all gives the announced slot time to land).
+                __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<1>{});  // drain ALL: partial wait announces a slot whose TDM LDS write is not yet visible to the consumer wave (producer-side visibility gap, run-ahead races); draining all lets it land.
                 // issue step p into slot p%3, then drain ALL outstanding TDMs and
                 // announce the completed step p-2 (slot (p-2)%3). FREE[p%3] gates
                 // overwriting slot p%3 (consumer must be done with step p-3).
@@ -173,7 +175,7 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
             w.load_to_lds();                                                              // step0 -> slot0
             if (k_steps >= 2) { w.move(KStep, 0_I,0_I,0_I,0_I, slot_bytes); w.load_to_lds(); }  // step1 -> slot1
             if (k_steps >= 2) {
-                __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<1>{});  // drain ALL before announce (see P=3 path)
+                __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<1>{});  // drain ALL before announce (producer-side LDS visibility; see P=3 path)
                 for (int p = 2; p < k_steps; ) {
                     bjsw(opus::number<4>{}); w.move(KStep,0_I,0_I,0_I,0_I, -slot_bytes); w.load_to_lds(); __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<2>{}); if (++p >= k_steps) break;  // slot0 loaded; announce step p-1 slot1
                     bjsw(opus::number<5>{}); w.move(KStep,0_I,0_I,0_I,0_I,  slot_bytes); w.load_to_lds(); __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<1>{}); ++p;                          // slot1 loaded; announce slot0
@@ -220,8 +222,15 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
     auto u_ra = make_layout_ra_ctdm<T>(lane_id, wave_m);
     auto u_rb = make_layout_rb_ctdm<T>(lane_id, wave_n);
 
-    typename decltype(mma)::vtype_a v_a;
-    typename decltype(mma)::vtype_b v_b;
+    // Double-buffered WMMA source registers (ping-pong across consume rounds).
+    // The single-buffer version had a WAR reg race: round k+1's ds_loads
+    // overwrite the SAME VGPRs that round k's (multi-cycle) WMMAs are still
+    // reading -- the race window scales with the WMMA count per round
+    // (kExpM*kExpN), so high-expansion tiles fail non-deterministically. With
+    // two buffers, consecutive rounds use DISTINCT VGPRs, so an overwrite never
+    // aliases an in-flight WMMA read.
+    typename decltype(mma)::vtype_a v_a[2];   // 2-deep ping-pong (see consume prefetch)
+    typename decltype(mma)::vtype_b v_b[2];
     typename decltype(mma)::vtype_c reg_c;
     clear(reg_c);
 
@@ -237,17 +246,40 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
         // this round's ds_reads (== kSchedDsCount); (3) s_wait_dscnt(0) batch-
         // waits exactly this round's ds batch (nothing else is outstanding);
         // (4) WMMA, now guaranteed to read landed registers.
-        #pragma unroll
-        for (int i = 0; i < T::kHalvesPerSlot; ++i) {
-            __builtin_amdgcn_sched_barrier(0);
-            auto sa = make_smem(smem_a + s*slot_a + i*T::kKHalfElems);
-            auto sb = make_smem(smem_b + s*slot_b + i*T::kKHalfElems);
-            if constexpr (AFirst) { v_a = load<T::kVecA>(sa, u_ra); v_b = load<T::kVecB>(sb, u_rb); }
-            else                  { v_b = load<T::kVecB>(sb, u_rb); v_a = load<T::kVecA>(sa, u_ra); }
+        // Prefetched (software-pipelined) reads with a 2-deep ping-pong buffer.
+        // Loading round i+1 BEFORE issuing round i's WMMA keeps buf[i&1] (read by
+        // the WMMA) and buf[(i+1)&1] (just loaded) SIMULTANEOUSLY live -> the
+        // compiler cannot coalesce the two buffers into one register set (a plain
+        // store-then-use double buffer, OR an inline-asm "+v" pin, DOES get
+        // coalesced / is allocation-dependent and unreliable). Distinct VGPRs per
+        // adjacent round => round i+1's ds_load never overwrites a register that
+        // round i's multi-cycle WMMA is still reading (WAR reg race).
+        // do_load issues a round's A+B reads then DRAINS them (round-granular
+        // s_wait_dscnt(0)). Draining per round caps the in-flight ds at ONE round
+        // (<=63 DScnt even for kExpN=8) instead of two (prefetch overlap = 2
+        // rounds = up to 72 > 63). The next round is still loaded BEFORE the
+        // current round's WMMA, so both ping-pong buffers hold valid data in
+        // DISTINCT VGPRs simultaneously (liveness overlap => no coalescing =>
+        // round i+1's ds never overwrites a register round i's multi-pass WMMA is
+        // still reading -- the WMMA-source WAR, MI400 SPG 4.6.12.1).
+        auto do_load = [&](int half, int buf) __attribute__((always_inline)) {
+            auto sa = make_smem(smem_a + s*slot_a + half*T::kKHalfElems);
+            auto sb = make_smem(smem_b + s*slot_b + half*T::kKHalfElems);
+            if constexpr (AFirst) { v_a[buf] = load<T::kVecA>(sa, u_ra); v_b[buf] = load<T::kVecB>(sb, u_rb); }
+            else                  { v_b[buf] = load<T::kVecB>(sb, u_rb); v_a[buf] = load<T::kVecA>(sa, u_ra); }
             __builtin_amdgcn_sched_barrier(0);
             opus::s_wait_dscnt(opus::number<0>{});
             __builtin_amdgcn_sched_barrier(0);
-            reg_c = mma(v_a, v_b, reg_c);
+        };
+        __builtin_amdgcn_sched_barrier(0);
+        do_load(0, 0);                                   // prologue: round 0 -> buf0 (loaded+drained)
+        #pragma unroll
+        for (int i = 0; i < T::kHalvesPerSlot; ++i) {
+            const int cur = i & 1;
+            __builtin_amdgcn_sched_barrier(0);
+            if (i + 1 < T::kHalvesPerSlot) do_load(i + 1, (i + 1) & 1);  // load+drain next round (distinct buf, 1-round in-flight)
+            __builtin_amdgcn_sched_barrier(0);
+            reg_c = mma(v_a[cur], v_b[cur], reg_c);
         }
         // FREE: all of this slot's ds_reads are drained per-round above; the
         // wall keeps the FREE signal AFTER the last WMMA so the run-ahead
