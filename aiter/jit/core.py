@@ -30,6 +30,11 @@ ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
 AITER_DISABLE_KERNARG_PRELOAD = (
     int(os.environ.get("AITER_DISABLE_KERNARG_PRELOAD", "0")) != 0
 )
+# Runtime switch for the optional FlyDSL backend, mirroring ENABLE_CK. Set
+# ENABLE_FLYDSL=0 to fully disable FlyDSL kernel imports/usage (e.g. when the
+# installed flydsl version is incompatible with the current source).
+ENABLE_FLYDSL = int(os.environ.get("ENABLE_FLYDSL", "1")) != 0
+
 
 def is_experimental_enabled() -> bool:
     # Mirror the C++ side (atoi(...) != 0): treat unset and "0" as disabled,
