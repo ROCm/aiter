@@ -90,7 +90,6 @@ def get_or_make_weight_pack(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
         tuple(w_oihw.shape),
         w_oihw.dtype,
         block_k,
-        int(getattr(w_oihw, "_version", 0)),
     )
     entry = _PACK_CACHE.get(key)
     if entry is not None:
@@ -120,7 +119,6 @@ def get_or_make_weight_pack_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
         tuple(w_oihw.shape),
         w_oihw.dtype,
         block_c,
-        int(getattr(w_oihw, "_version", 0)),
     )
     cached = _PACK_CACHE_3x3.get(key)
     if cached is not None:
@@ -158,7 +156,6 @@ def get_or_make_input_pack_cblocked(x: torch.Tensor, block_c: int = BLOCK_K):
         tuple(x.shape),
         x.dtype,
         block_c,
-        int(getattr(x, "_version", 0)),
     )
     cached = _PACK_CACHE_CBLOCKED.get(key)
     if cached is not None:
@@ -208,7 +205,6 @@ def get_or_make_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_
         tuple(w_oihw.shape),
         w_oihw.dtype,
         block_c,
-        int(getattr(w_oihw, "_version", 0)),
     )
     cached = _PACK_CACHE_WINOGRAD_F4X3.get(key)
     if cached is not None:
