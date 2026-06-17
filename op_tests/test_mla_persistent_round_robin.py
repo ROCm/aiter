@@ -32,7 +32,9 @@ torch.set_printoptions(sci_mode=False)
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
         return False
-    if dtype == dtypes.bf16 and nhead == 32 and get_gfx() == "gfx942":
+    if dtype == dtypes.fp8 and kv_dtype == dtypes.fp8:
+        return False
+    if get_gfx() == "gfx942":
         return False
     return True
 
@@ -677,7 +679,7 @@ parser.add_argument(
     type=dtypes.str2Dtype,
     choices=[dtypes.d_dtypes["bf16"]],
     nargs="*",
-    default="bf16",
+    default=[dtypes.d_dtypes["bf16"]],
     metavar="{bf16, fp8}",
     help="""Data type of Q.
     e.g.: -d bf16""",
@@ -689,7 +691,7 @@ parser.add_argument(
     choices=[dtypes.d_dtypes["bf16"]],
     nargs="*",
     metavar="{bf16, fp8}",
-    default="bf16",
+    default=[dtypes.d_dtypes["bf16"]],
     help="""Data type of KV.
     e.g.: -kvd bf16""",
 )
@@ -698,7 +700,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[13, 23, 64, 256, 512, 1200, 3200, 5200, 8192, 16384],
+    default=[13, 23, 64, 256, 512, 1200, 3200, 5200, 8192],
     help="""Context length (global KV length).
     e.g.: -c 13""",
 )
@@ -717,7 +719,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(16, 4)],
+    default=[(16, 2), (32, 3), (64, 1), (64, 2), (128, 2)],
     help="""Number of heads, decode_qlen pairs.
     e.g.: -n 16,4""",
 )
