@@ -1,24 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL ??? mxfp4 MoE gemm2 (a4w4 down-proj) ???????
+"""FlyDSL port of the mxfp4 MoE gemm2 (a4w4 down-proj) kernel.
 
-? aiter/ops/flydsl/mxfp4_gemm1_kernels.py:? functools.cache ??????
-(@flyc.jit launch fn),????? launch(*args)(JitFunction ?????????)?
+Mirrors aiter/ops/flydsl/mxfp4_gemm1_kernels.py: a functools.cache holds the
+compiled launch fn (@flyc.jit launch fn); callers then invoke launch(*args) (the
+JitFunction handles argument marshalling).
 
-gemm2 ? epilog ? (atomic, mxfp4out) ??,? fused_moe ? kernelName2 ??:
+gemm2 has several epilogs (atomic, mxfp4out, cshuffle), selected by fused_moe's
+kernelName2:
   * atomic           -> LDS cshuffle + global_atomic_fadd x sorted_weights (BM16/32/64)
-  * nonatomic        -> flat per-sorted-row bf16 ?? (BM128),?? scatter_reduce
-  * nonatomic_mxfp4  -> flat per-sorted-row fp4 (q + e8m0 scale) ?? (BM128)
+  * nonatomic        -> flat per-sorted-row bf16 write (BM128), then scatter_reduce
+  * nonatomic_mxfp4  -> flat per-sorted-row fp4 (q + e8m0 scale) write (BM128)
 """
 
 import functools
 
 import torch
 
-# ????? (BM, use_nt, epilog) ????(????? prebuilt HIP ??)?
+# Supported (BM, use_nt, epilog) combinations (mirrors the prebuilt HIP set).
 _SUPPORTED = {
-    # atomic: BM?{16,32,64} x {ATOMIC, NT}
+    # atomic: BM in {16,32,64} x {ATOMIC, NT}
     (16, False, "atomic"),
     (16, True, "atomic"),
     (32, False, "atomic"),
@@ -95,7 +97,7 @@ def _assert_supported(
     epilog = _epilog_of(atomic, mxfp4out, cshuffle)
     if (BM, use_nt, epilog) not in _SUPPORTED:
         raise NotImplementedError(
-            f"flydsl mxfp4 gemm2 ????? (variant) "
+            f"flydsl mxfp4 gemm2 unsupported variant "
             f"(BM={BM}, use_nt={use_nt}, epilog={epilog})"
         )
 
@@ -125,10 +127,11 @@ def flydsl_mxfp4_gemm2(
     cshuffle=False,
     D_INTER_REAL=None,
 ):
-    """?? FlyDSL ??? gemm2,?? flat_out(mxfp4out ???? flat_out_scale)?
+    """Run the FlyDSL port gemm2, writing flat_out (plus flat_out_scale when mxfp4out).
 
-    ???? HIP aiter.mxfp4_moe_gemm2_a4w4 ?????????;
-    w2_u8 / w2_scale_u8 ?? uint8 view(FlyDSL ? DLPack ?? fp4/e8m0 dtype code)?
+    Same buffer I/O contract as the HIP aiter.mxfp4_moe_gemm2_a4w4 kernel;
+    w2_u8 / w2_scale_u8 must be uint8 views (FlyDSL via DLPack cannot carry the
+    fp4/e8m0 dtype codes).
     """
     _assert_supported(
         NE=NE,
@@ -146,10 +149,12 @@ def flydsl_mxfp4_gemm2(
         BM, use_nt, NE, D_HIDDEN, epilog, D_INTER, D_INTER_REAL
     )
 
-    # grid ?? = max_m_blocks(kernel ???? cumsum ???????)?
+    # grid size = max_m_blocks (an upper bound; the kernel reads the true active
+    # block count from cumsum at runtime and early-exits past it).
     max_m_blocks = (max_sorted + BM - 1) // BM
 
-    # ? mxfp4 epilog ?? scale,? launch ???????? out_scale ???
+    # Only the mxfp4 epilog writes a scale; pass a dummy out_scale otherwise so the
+    # launch signature stays uniform.
     out_scale = flat_out_scale if mxfp4out else _dummy_out_scale(flat_out.device.index)
 
     launch(

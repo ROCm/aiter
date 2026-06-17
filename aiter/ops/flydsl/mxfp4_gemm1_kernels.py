@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL ??? mxfp4 MoE gemm1 (a4w4 up/gate-proj) ???????
+"""FlyDSL port of the mxfp4 MoE gemm1 (a4w4 up/gate-proj) kernel.
 
-? aiter/ops/flydsl/moe_kernels.py:? functools.cache ??????
-(@flyc.jit launch fn),????? launch(*args)(JitFunction ?????????)?
+Mirrors aiter/ops/flydsl/moe_kernels.py: a functools.cache holds the compiled
+launch fn (@flyc.jit launch fn); callers then invoke launch(*args) (the
+JitFunction handles argument marshalling).
 """
 
 import functools
 
 import torch
 
-# ????? (BM, use_nt, inline_quant) ?????
+# Supported (BM, use_nt, inline_quant) variant combinations.
 _SUPPORTED = {
     (32, True, False),
     (32, False, False),
@@ -80,10 +81,11 @@ def flydsl_mxfp4_gemm1(
     D_INTER,
     topk,
 ):
-    """?? FlyDSL ??? gemm1,?? inter_sorted_quant / inter_sorted_shuffled_scale?
+    """Run the FlyDSL port gemm1, writing inter_sorted_quant / inter_sorted_shuffled_scale.
 
-    ???? HIP aiter.mxfp4_moe_gemm1_a4w4 ?????????;
-    w1_u8 / w1_scale_u8 ?? uint8 view(FlyDSL ? DLPack ?? fp4/e8m0 dtype code)?
+    Same buffer I/O contract as the HIP aiter.mxfp4_moe_gemm1_a4w4 kernel;
+    w1_u8 / w1_scale_u8 must be uint8 views (FlyDSL via DLPack cannot carry the
+    fp4/e8m0 dtype codes).
     """
     _assert_supported(
         NE=NE,
