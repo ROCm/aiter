@@ -430,20 +430,22 @@ class opus_gemm_codegen:
 
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
-        decls = []
+        noscale_4arg_kernels = []
+        noscale_3arg_kernels = []
+        scale_kernels = []
         for mnk, k in kernels_dict.items():
             if k.kernel_tag in A16W16_TUNE_TAGS:
-                decls.append(
-                    _render("_manifest_noscale_4arg.cuh.j2", kernel_name=k.name)
-                )
+                noscale_4arg_kernels.append(k.name)
             elif k.kernel_tag in NOSCALE_TAGS:
-                decls.append(
-                    _render("_manifest_noscale_3arg.cuh.j2", kernel_name=k.name)
-                )
+                noscale_3arg_kernels.append(k.name)
             else:
-                decls.append(_render("_manifest_scale.cuh.j2", kernel_name=k.name))
+                scale_kernels.append(k.name)
         with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
-            f.write(_render("opus_gemm_manifest.h.j2", kernel_decls="".join(decls)))
+            f.write(_render("opus_gemm_manifest.h.j2",
+                            noscale_3arg_kernels = noscale_3arg_kernels,
+                            noscale_4arg_kernels = noscale_4arg_kernels,
+                            scale_kernels = scale_kernels,
+                            ))
 
     # -- Per-pass TU emission -- Replaces the old "one .cpp per (kid, dtype)" scheme.
 

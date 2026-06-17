@@ -4,4 +4,33 @@
 #include "aiter_tensor.h"
 #include <cstdlib>
 #include <optional>
-{{ kernel_decls }}
+
+
+{% for kernel_name in noscale_4arg_kernels -%}
+template <typename D_C>
+void
+{{ kernel_name }}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int splitK);
+{% endfor %}
+{% for kernel_name in noscale_3arg_kernels -%}
+template <typename D_C>
+void
+{{ kernel_name }}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y);
+{% endfor %}
+{% for kernel_name in scale_kernels %}
+template <typename D_C>
+void
+{{ kernel_name }}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> x_scale,
+    std::optional<aiter_tensor_t> w_scale);
+{% endfor %}
