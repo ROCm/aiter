@@ -46,8 +46,8 @@ export MASK CONTIG=1   # forwarded to rocprof_att_prefill.sh (contiguous, non/ca
 export AITER_PERF_ITERS="${AITER_PERF_ITERS:-2}"
 export AITER_PERF_WARMUP="${AITER_PERF_WARMUP:-1}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SCRIPTS="$(dirname "$HERE")"            # ua-test-scripts
-AITER_ROOT="$(dirname "$SCRIPTS")"      # repo root
+SCRIPTS="$(dirname "$HERE")"                      # ua-test-scripts/analysis (run dirs + py modules)
+AITER_ROOT="$(dirname "$(dirname "$SCRIPTS")")"  # analysis -> ua-test-scripts -> repo root
 TAG="${TAG:-att_lt_d128_${DTYPE}_b${BATCH}_sq${SQ}_sk${SK}}"
 RUN_DIR="$SCRIPTS/rocprof_analysis/runs/$TAG"
 

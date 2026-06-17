@@ -9,7 +9,7 @@
 # (dynamic page size, masked): unified_attention_d128_fp8_mask.cpp. Building
 # just that TU gives the exact ISA for the kernel we profile.
 #
-# -g (not full -g): keeps -O3 codegen identical to the JIT
+# -gline-tables-only (not full -g): keeps -O3 codegen identical to the JIT
 # build (so the ISA is representative) and only adds .debug_line, which is all
 # llvm-objdump --source / rocprofv3's source-snapshot need.
 #
@@ -24,16 +24,16 @@ set -euo pipefail
 INSTANCE="${INSTANCE:-unified_attention_d128_fp8_mask}"
 ARCH="${ARCH:-gfx950}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-AITER_ROOT="$(dirname "$HERE")"
+AITER_ROOT="$(dirname "$(dirname "$HERE")")"   # analysis/ -> ua-test-scripts -> repo root
 CK="$AITER_ROOT/3rdparty/composable_kernel"
 SRC="$CK/example/ck_tile/42_unified_attention/instances/${INSTANCE}.cpp"
-OUT="${OUT:-$HERE/isa_analysis_g/$INSTANCE}"
+OUT="${OUT:-$HERE/isa_analysis/$INSTANCE}"
 mkdir -p "$OUT"
 
 [[ -f "$SRC" ]] || { echo "instance src not found: $SRC" >&2; exit 1; }
 
 # Exact JIT cuda_cflags (copied from build.ninja for module_unified_attention),
-# with --offload-arch=native pinned to $ARCH and -g added.
+# with --offload-arch=native pinned to $ARCH and -gline-tables-only added.
 CFLAGS=(
   -DWITH_HIP -D_GLIBCXX_USE_CXX11_ABI=1 -DTORCH_EXTENSION_NAME=module_unified_attention
   -I"$CK/../ck_helper"
@@ -71,8 +71,7 @@ CFLAGS=(
   -mllvm -amdgpu-function-calls=false
   -mllvm -enable-post-misched=0
   -fno-gpu-rdc
-  -g
-  ${XCFLAGS:-}
+  -gline-tables-only
 )
 
 echo "[1/4] compiling $INSTANCE ($ARCH) with line tables ..."
@@ -80,11 +79,13 @@ echo "      src: $SRC"
 time /opt/rocm/bin/hipcc "${CFLAGS[@]}" -c "$SRC" -o "$OUT/instance.o"
 
 echo "[2/4] extracting $ARCH device code object ..."
-roc-obj-ls "$OUT/instance.o" | sed -n '1,20p'
-# Extract all bundled code objects next to the .o; pick the gfx950 one.
-( cd "$OUT" && roc-obj-extract "$OUT/instance.o" )
-CO=$(ls "$OUT"/*"$ARCH"* 2>/dev/null | head -1 || true)
-[[ -n "$CO" ]] || { echo "could not find extracted $ARCH code object in $OUT" >&2; ls -la "$OUT" >&2; exit 1; }
+# roc-obj-ls needs a Perl module that isn't installed here; extract the
+# embedded fatbin section and unbundle the gfx950 code object directly.
+/opt/rocm/llvm/bin/llvm-objcopy --dump-section=.hip_fatbin="$OUT/fat.bin" "$OUT/instance.o"
+/opt/rocm/llvm/bin/clang-offload-bundler --type=o --input="$OUT/fat.bin" \
+    --unbundle --targets=hipv4-amdgcn-amd-amdhsa--${ARCH} --output="$OUT/device_${ARCH}.co"
+CO="$OUT/device_${ARCH}.co"
+[[ -s "$CO" ]] || { echo "could not extract $ARCH code object" >&2; exit 1; }
 echo "      code object: $CO"
 
 echo "[3/4] disassembling with interleaved source ..."

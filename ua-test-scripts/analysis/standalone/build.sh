@@ -25,8 +25,8 @@ MASKTAG=$([[ "$MASK" == "0" ]] && echo "nmask" || echo "mask")
 TARGET_INSTANCE="${TARGET_INSTANCE:-unified_attention_d${D}_${DTYPE}_${MASKTAG}_nopage}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SCRIPTS="$(dirname "$HERE")"
-AITER_ROOT="$(dirname "$SCRIPTS")"
+SCRIPTS="$(dirname "$HERE")"                    # analysis/
+AITER_ROOT="$(dirname "$(dirname "$SCRIPTS")")"  # analysis/ -> ua-test-scripts -> repo root
 CK="$AITER_ROOT/3rdparty/composable_kernel"
 UADIR="$CK/example/ck_tile/42_unified_attention"
 OUT="${OUT:-$HERE/build}"

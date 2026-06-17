@@ -14,7 +14,9 @@
 #   MAX_JOBS=32 ua-test-scripts/rebuild_and_test.sh    # cap build parallelism
 set -uo pipefail
 
-AITER_ROOT="/root/aiter"
+# Repo root = parent of this script's dir (ua-test-scripts/), so the script works
+# from any clone location, not just /root/aiter.
+AITER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JIT_DIR="$AITER_ROOT/aiter/jit"
 SO="$JIT_DIR/module_unified_attention.so"
 TEST="$AITER_ROOT/op_tests/test_unified_attention_ck.py"

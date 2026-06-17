@@ -1,21 +1,17 @@
+# All generated analysis artifacts live under analysis/ and are regenerable.
 # rocprofv3 captures and counters
 .rocprofv3/
-# generated CSV/JSON analysis runs
+# generated CSV/JSON/log analysis runs
 rocprof_analysis/
-# generated build/perf artifacts
 *.csv
 *.json
 *.log
 # standalone driver build artifacts (compiled exe + per-TU objects)
-standalone/build/
-standalone/build_*/
-standalone/.rocprofv3/
-
+analysis/standalone/build/
+analysis/standalone/build_*/
 # VGPR probe artifacts (large generated .s)
 vgpr_probe/
-
 # single-instance ISA disassembly working dirs (fat.bin / instance.o / .s)
 isa_analysis*/
-
 # python caches
 __pycache__/

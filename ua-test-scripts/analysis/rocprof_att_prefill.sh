@@ -98,7 +98,7 @@ BUF_BYTES="${BUF_BYTES:-0}"
 MODE="${MODE:-summary}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-AITER_ROOT="$(dirname "$HERE")"
+AITER_ROOT="$(dirname "$(dirname "$HERE")")"   # analysis/ -> ua-test-scripts -> repo root
 RUN_DIR="$HERE/rocprof_analysis/runs/$TAG"
 ATT_DIR="$RUN_DIR/att"
 mkdir -p "$ATT_DIR"

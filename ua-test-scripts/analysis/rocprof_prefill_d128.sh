@@ -29,7 +29,7 @@ TAG="${TAG:-prefill_d${D}_${DTYPE}_b${BATCH}_sq${SQ}_sk${SK}}"
 ITERS="${ITERS:-50}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-AITER_ROOT="$(dirname "$HERE")"
+AITER_ROOT="$(dirname "$(dirname "$HERE")")"   # analysis/ -> ua-test-scripts -> repo root
 RUN_DIR="$HERE/rocprof_analysis/runs/$TAG"
 mkdir -p "$RUN_DIR"
 
