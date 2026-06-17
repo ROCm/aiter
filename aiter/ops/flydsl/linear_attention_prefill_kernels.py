@@ -33,6 +33,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.runtime.device import get_rocm_arch
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
+from .kernels.chunk_gated_delta_h_naive import compile_chunk_gated_delta_h_naive
 from .kernels.chunk_gated_delta_h_kv import compile_chunk_gated_delta_h_kv
 from .kernels.chunk_gated_delta_h_vk import compile_chunk_gated_delta_h_vk
 from .kernels.chunk_gated_delta_h_vk_naive import (
@@ -813,6 +814,47 @@ def _get_or_compile_kv_naive(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_naive(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+):
+    """Compile (and cache) the NAIVE (un-pipelined) BASELINE-fork K5 kernel.
+    Same public VK h-layout and tiling as the baseline ``_get_or_compile``,
+    but with all prefetch / software-pipeline scheduling removed -- for
+    trace baselining. Works at any BV (it is the baseline layout)."""
+    return compile_chunk_gated_delta_h_naive(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
 def _resolve_state_dtype(initial_state, state_dtype):
     """Mirror the legacy state-dtype resolution. Cheap; runs every call."""
     if initial_state is not None:
@@ -853,6 +895,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     _use_vk: bool = False,
     _use_vk_naive: bool = False,
     _use_kv_naive: bool = False,
+    _use_naive: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
 
@@ -973,10 +1016,12 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         + int(bool(_use_vk))
         + int(bool(_use_vk_naive))
         + int(bool(_use_kv_naive))
+        + int(bool(_use_naive))
     ) > 1:
         raise ValueError(
             "FlyDSL K5: ``_use_kv`` / ``_use_vk`` / ``_use_vk_naive`` / "
-            "``_use_kv_naive`` are mutually exclusive; pass at most one."
+            "``_use_kv_naive`` / ``_use_naive`` are mutually exclusive; "
+            "pass at most one."
         )
 
     # OPT-KV / OPT-VK: pick the separate VWARP kernel only when BV==64 (the
@@ -995,6 +1040,10 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # ``bool(_use_vk) and (BV == 64)`` to re-enable the VK fork.
     _vk_active = False
     _vk_naive_active = bool(_use_vk_naive) and (BV == 64)
+    # NAIVE baseline fork: un-pipelined twin of the baseline kernel. Works at
+    # ANY BV (it is the baseline layout, NOT the BV==64-only VWARP fork) and
+    # emits the public VK h-layout, so it is NOT part of ``_kv_active``.
+    _naive_active = bool(_use_naive)
     # KV-class forks (h stored [..., K, V] -> host transposes to VK).
     _kv_active = _kv_opt_active or _kv_naive_active
     if _kv_opt_active:
@@ -1005,6 +1054,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         _compile_fn = _get_or_compile_vk
     elif _vk_naive_active:
         _compile_fn = _get_or_compile_vk_naive
+    elif _naive_active:
+        _compile_fn = _get_or_compile_naive
     else:
         _compile_fn = _get_or_compile
     launch_fn = _compile_fn(
@@ -1275,4 +1326,44 @@ def chunk_gated_delta_rule_fwd_h_flydsl_kv_naive(
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
         _use_kv_naive=True,
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_naive(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """NAIVE (un-pipelined) BASELINE-fork K5 implementation. Same public VK
+    h-layout and tiling as the baseline ``chunk_gated_delta_rule_fwd_h_flydsl``,
+    but with all prefetch / software-pipeline scheduling removed -- used to
+    baseline the raw bottleneck structure in a trace before re-designing the
+    pipeline. Works at ANY BV (it is the baseline layout)."""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _use_naive=True,
     )

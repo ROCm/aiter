@@ -37,6 +37,7 @@ try:
         chunk_gated_delta_rule_fwd_h_flydsl_vk,
         chunk_gated_delta_rule_fwd_h_flydsl_vk_naive,
         chunk_gated_delta_rule_fwd_h_flydsl_kv_naive,
+        chunk_gated_delta_rule_fwd_h_flydsl_naive,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_h_opt_vk,
@@ -611,6 +612,7 @@ def _normalize_opt_v_new(vn_opt):
 _K5_KERNEL_PREFIXES = [
     "chunk_gdn_fwd_h_flydsl_vk",
     "chunk_gdn_fwd_h_flydsl_kv",
+    "chunk_gdn_fwd_h_flydsl_naive",
     "chunk_gated_delta_rule_fwd_kernel_h",
 ]
 
@@ -862,6 +864,48 @@ class TestCorrectness:
             fs_ref,
             output_final_state=args.output_final_state,
             label="flydsl_vk_naive",
+        )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_flydsl_naive(self, args: PrefillArgs):
+        """Naive (un-pipelined) fork of the BASELINE FlyDSL K5 kernel: same
+        baseline layout / VK public outputs, with all prefetch / software-
+        pipeline scheduling removed (cross-chunk w prefetch, OPT-VC g/gk/u
+        emitter queue, OPT-K / OPT-W interleaves). Works at any BV (not gated
+        on BV==64). Used to baseline the raw bottleneck structure in a trace."""
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_naive(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl_naive",
         )
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
@@ -1195,6 +1239,17 @@ def _run_perf_comparison(args: PrefillArgs):
             cu_seqlens=cu,
         )
 
+    def flydsl_naive_launch():
+        chunk_gated_delta_rule_fwd_h_flydsl_naive(
+            k=k,
+            w=w_c,
+            u=u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
     def triton_vk_launch():
         chunk_gated_delta_rule_fwd_h_opt_vk(
             k=k,
@@ -1254,6 +1309,7 @@ def _run_perf_comparison(args: PrefillArgs):
     flydsl_vk_launch()
     flydsl_vk_naive_launch()
     flydsl_kv_naive_launch()
+    flydsl_naive_launch()
     if _HAS_VLLM_K5:
         vllm_launch()
     torch.cuda.synchronize()
@@ -1263,6 +1319,7 @@ def _run_perf_comparison(args: PrefillArgs):
     us_fly_vk = _bench_fn(flydsl_vk_launch)
     us_fly_vk_naive = _bench_fn(flydsl_vk_naive_launch)
     us_fly_kv_naive = _bench_fn(flydsl_kv_naive_launch)
+    us_fly_naive = _bench_fn(flydsl_naive_launch)
     us_triton_vk = _bench_fn(triton_vk_launch)
     us_triton_origin_opt = _bench_fn(triton_origin_opt_launch)
     us_vllm = _bench_fn(vllm_launch) if _HAS_VLLM_K5 else float("nan")
@@ -1288,6 +1345,7 @@ def _run_perf_comparison(args: PrefillArgs):
             "FlyDSL_kvnaive(us)": us_fly_kv_naive,
             "FlyDSL_vkfork(us)": us_fly_vk,
             "FlyDSL_vknaive(us)": us_fly_vk_naive,
+            "FlyDSL_naive(us)": us_fly_naive,
             "Triton_vk(us)": us_triton_vk,
             "Triton_origin_opt(us)": us_triton_origin_opt,
             "vLLM_vk(us)": us_vllm,
@@ -1320,6 +1378,7 @@ def _print_perf_table():
         ("var", "varlen", 3),
         ("fs", "final_st", 3),
         ("FlyDSL", "FlyDSL_vk(us)", 8),
+        ("FlyDSL_n", "FlyDSL_naive(us)", 9),
         ("FlyDSL_kv", "FlyDSL_kv(us)", 9),
         ("FlyDSL_kvn", "FlyDSL_kvnaive(us)", 10),
         ("FlyDSL_vkf", "FlyDSL_vkfork(us)", 10),
