@@ -11,6 +11,7 @@ from aiter import pertoken_quant
 from aiter import dtypes
 from einops import rearrange
 import argparse
+import os
 
 BLOCK_SIZE_M = 32
 
