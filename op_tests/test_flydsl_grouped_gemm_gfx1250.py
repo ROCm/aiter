@@ -618,13 +618,9 @@ def test_grouped_a4w4_swiglu_matches_torch_ref(layout):
 # epilogue and the torch reference must agree on the clamped path (not just the
 # pass-through). SiLU now honors swiglu_limit too, so it is covered here.
 @pytest.mark.parametrize("layout", ["gguu", "gugu"])
-@pytest.mark.parametrize(
-    "activation", [ActivationType.Silu, ActivationType.Swiglu]
-)
+@pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
 def test_grouped_a4w4_swiglu_limit_clamps(layout, activation):
-    _sanity_check(
-        "a4w4", layout=layout, activation=activation, swiglu_limit=1.0
-    )
+    _sanity_check("a4w4", layout=layout, activation=activation, swiglu_limit=1.0)
 
 
 # ---------------------------------------------------------------------------
