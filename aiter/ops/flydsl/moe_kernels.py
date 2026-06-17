@@ -786,6 +786,204 @@ def _run_moe_reduction(
     )
 
 
+# ---------------------------------------------------------------------------
+# gfx1250 MXScale shape-alignment helpers
+#
+# The FlyDSL mxscale MoE kernels hard-require K (the GEMM contraction dim,
+# stage1: model_dim, stage2: inter_dim) be divisible by tile_k (itself a
+# multiple of WMMA_K=128), and tile_n to divide N (stage1: 2*inter_dim with
+# the stage1 wrapper also requiring inter_dim % tile_n == 0; stage2:
+# model_dim). Model shapes like GPT-OSS (2880) break both constraints with
+# default tile_n=128 / tile_k=128.
+#
+# The helpers below let the gfx1250 stage1/stage2 wrappers (a) pick the
+# largest legal tile_n that divides the required N dims, and (b) zero-pad
+# activations, weights and scales on the K dim to the next multiple of
+# tile_k. Zero padding is algebraically safe for mx-quantized GEMM (the
+# extra K-slice contributes 0·anything = 0), and is cheap relative to the
+# kernel cost (~2% for 2944 vs 2880).
+# ---------------------------------------------------------------------------
+
+_MXSCALE_FORMAT_PACK = {
+    # in_dtype: (pack_a, pack_b, weight_is_preshuffled)
+    "fp4": (2, 2, False),
+    "fp8": (1, 1, True),
+    "a8w4": (1, 2, True),
+}
+
+
+# Cache padded weight / scale tensors keyed on storage pointer so that
+# repeated fused_moe calls with the same W / W_scale don't re-pad +
+# re-memcpy ~100MB per invocation. This is the dominant cost for shapes
+# whose model_dim is not natively tile_k-aligned (e.g. GPT-OSS 2880 ->
+# padded to 2944).
+#
+# Key:   (data_ptr, numel, element_size, delta_bytes, pad_value, preshuffled)
+# Value: padded tensor (strong ref keeps the entry alive).
+# Policy: FIFO eviction bounded by _MXSCALE_PAD_CACHE_MAX_BYTES total VRAM
+# occupancy (default 512MB) to avoid OOM'ing on multi-GB weight tensors.
+# Disable via AITER_GFX1250_DISABLE_PAD_CACHE=1 if memory-constrained.
+_MXSCALE_PAD_CACHE: dict = {}
+_MXSCALE_PAD_CACHE_BYTES: int = 0
+_MXSCALE_PAD_CACHE_MAX_BYTES: int = int(
+    os.environ.get("AITER_GFX1250_PAD_CACHE_MAX_BYTES", str(512 * 1024 * 1024))
+)
+_MXSCALE_PAD_CACHE_ENABLED: bool = not bool(
+    int(os.environ.get("AITER_GFX1250_DISABLE_PAD_CACHE", "0"))
+)
+
+
+def _mxscale_pad_cache_key(t: torch.Tensor, delta: int, value: int, preshuffled: bool):
+    return (
+        int(t.data_ptr()),
+        int(t.numel()),
+        int(t.element_size()),
+        int(delta),
+        int(value),
+        bool(preshuffled),
+    )
+
+
+def _mxscale_pad_cache_get(key):
+    if not _MXSCALE_PAD_CACHE_ENABLED:
+        return None
+    return _MXSCALE_PAD_CACHE.get(key)
+
+
+def _mxscale_pad_cache_put(key, value):
+    global _MXSCALE_PAD_CACHE_BYTES
+    if not _MXSCALE_PAD_CACHE_ENABLED:
+        return
+    # nbytes of the padded tensor we would cache
+    nbytes = int(value.numel()) * int(value.element_size())
+    if nbytes > _MXSCALE_PAD_CACHE_MAX_BYTES:
+        # Too big to cache without blowing the budget; skip entirely.
+        return
+    # Evict oldest entries (FIFO) until the new one fits within the byte budget.
+    while (
+        _MXSCALE_PAD_CACHE_BYTES + nbytes
+    ) > _MXSCALE_PAD_CACHE_MAX_BYTES and _MXSCALE_PAD_CACHE:
+        oldest_key = next(iter(_MXSCALE_PAD_CACHE))
+        evicted = _MXSCALE_PAD_CACHE.pop(oldest_key)
+        _MXSCALE_PAD_CACHE_BYTES -= int(evicted.numel()) * int(evicted.element_size())
+    _MXSCALE_PAD_CACHE[key] = value
+    _MXSCALE_PAD_CACHE_BYTES += nbytes
+
+
+def _mxscale_align_up(x: int, align: int) -> int:
+    return ((int(x) + int(align) - 1) // int(align)) * int(align)
+
+
+def _mxscale_pick_tile_n(
+    default_tile_n: int, *required_divisors: int, in_dtype: str = "fp8", align: int = 16
+) -> int:
+    """Largest tile_n <= default_tile_n that divides every N dim in
+    ``required_divisors`` and is a multiple of ``align`` (bumped to 32 for
+    fp4, which uses WMMA_N_EFF=32).
+
+    Matches FlyDSL's own ``bench_resolve_tiles`` heuristic (largest multiple
+    of align that divides the N dim). The downstream launch-shape picker
+    (`_pick_fp16_single_launch_shape`) will adapt m_warp/n_warp to whatever
+    tile_n we pick, falling back to degenerate shapes such as n_warp=1 when
+    needed (e.g. tile_n=240 for GPT-OSS fp8).
+    """
+    if in_dtype == "fp4":
+        align = max(align, 32)
+    tn = int(default_tile_n)
+    while tn >= align:
+        if all((int(d) % tn) == 0 for d in required_divisors):
+            return tn
+        tn -= align
+    return align
+
+
+def _mxscale_zero_pad_last(
+    t: torch.Tensor, delta: int, value: int = 0, cache: bool = False
+) -> torch.Tensor:
+    """Append ``delta`` elements of ``value`` along the last dim (default 0).
+
+    ``torch.nn.functional.pad`` does not implement some 1-byte float dtypes
+    (e.g. Float8_e8m0fnu / Float8_e4m3fn / Float4_e2m1fn_x2); operate through
+    a uint8 view in that case, then restore the original dtype.
+
+    ``value`` is interpreted as the raw byte/element value (e.g. 0x7F for
+    E8M0 = 1.0, 0x00 for E8M0 = 2^-127 / fp8 zero).
+
+    When ``cache=True`` (typical for static weight/scale tensors), the result
+    is memoized by the input's storage pointer so repeated calls with the
+    same tensor avoid redoing the ~100MB memcpy.
+    """
+    if int(delta) <= 0:
+        return t
+    if cache:
+        key = _mxscale_pad_cache_key(t, int(delta), int(value), False)
+        cached = _mxscale_pad_cache_get(key)
+        if cached is not None:
+            return cached
+    if t.element_size() == 1 and t.dtype not in (torch.uint8, torch.int8):
+        orig_dtype = t.dtype
+        u8 = t.contiguous().view(torch.uint8)
+        padded = torch.nn.functional.pad(u8, (0, int(delta)), value=int(value))
+        padded = padded.view(orig_dtype)
+    else:
+        padded = torch.nn.functional.pad(t.contiguous(), (0, int(delta)), value=value)
+    if cache:
+        _mxscale_pad_cache_put(key, padded)
+    return padded
+
+
+def _mxscale_pad_weight_k(
+    w: torch.Tensor, delta_bytes: int, weight_is_preshuffled: bool, cache: bool = True
+) -> torch.Tensor:
+    """Zero-pad a weight tensor of shape ``(E, N, K/pack_b)`` on the K-byte
+    (last) dim.
+
+    When the caller has already preshuffled the weight
+    (fp8 / a8w4 path), a raw ``F.pad`` on the last dim would insert zero
+    bytes *inside* each 16-wide shuffled column group, not at the end of
+    the virtual K axis. Instead reshape into the underlying 16x16 tile grid
+    and append whole zero tiles, which preserves the invariant
+    ``preshuffle(pad(W)) == pad_shuffled(preshuffle(W))``.
+    """
+    if int(delta_bytes) <= 0:
+        return w
+    if not weight_is_preshuffled:
+        return _mxscale_zero_pad_last(w, int(delta_bytes), cache=cache)
+
+    if cache:
+        key = _mxscale_pad_cache_key(w, int(delta_bytes), 0, True)
+        cached = _mxscale_pad_cache_get(key)
+        if cached is not None:
+            return cached
+
+    if int(delta_bytes) % 16 != 0:
+        raise ValueError(
+            f"preshuffled K-pad delta must be a multiple of 16 bytes, got {delta_bytes}"
+        )
+    E, N, K_old = w.shape
+    if N % 16 != 0 or K_old % 16 != 0:
+        raise ValueError(
+            f"preshuffled weight must have N and K/pack_b divisible by 16, got N={N}, K={K_old}"
+        )
+
+    orig_dtype = w.dtype
+    w_u8 = w.contiguous()
+    if w.element_size() == 1 and w.dtype not in (torch.uint8, torch.int8):
+        w_u8 = w_u8.view(torch.uint8)
+
+    # Tile view: (E, N/16, K/16, 16, 16). Append delta_bytes/16 zero
+    # tile-columns along the K-tile dim (dim 2).
+    tile_view = w_u8.view(E, N // 16, K_old // 16, 16, 16)
+    delta_tiles = int(delta_bytes) // 16
+    padded = torch.nn.functional.pad(tile_view, (0, 0, 0, 0, 0, delta_tiles))
+    padded = padded.contiguous().view(E, N, K_old + int(delta_bytes))
+    if padded.dtype != orig_dtype:
+        padded = padded.view(orig_dtype)
+    if cache:
+        _mxscale_pad_cache_put(key, padded)
+    return padded
+
+
 @functools.cache
 def _get_compiled_silu_fused(
     inter_dim: int,
@@ -816,6 +1014,73 @@ def _get_compiled_swiglu(inter_dim: int):
     from aiter.ops.flydsl.kernels.swiglu_and_mul import build_swiglu_and_mul_module
 
     return build_swiglu_and_mul_module(inter_dim)
+
+
+def flydsl_swiglu_and_mul_interleaved(
+    input: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Fused swiglu activation for interleaved (gate/up block-interleaved) layout.
+
+    input: (rows, inter_dim*2) bf16, interleaved layout.
+    out:   (rows, inter_dim) bf16.
+    """
+    inter_dim = out.shape[-1]
+    num_rows = input.shape[0]
+    _swiglu_fn = _get_compiled_swiglu(inter_dim)
+    _run_compiled(
+        _swiglu_fn,
+        (
+            input,
+            out,
+            num_rows,
+            torch.cuda.current_stream(),
+        ),
+    )
+
+
+def flydsl_silu_and_mul_interleaved(
+    input: torch.Tensor,
+    out: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+    quant_mode: str = "none",
+    gui_layout: bool = True,
+) -> None:
+    """Fused silu activation for interleaved (gate/up block-interleaved) layout.
+
+    input: (rows, inter_dim*2) bf16, interleaved layout.
+    out:   (rows, inter_dim) bf16.
+    """
+    inter_dim = out.shape[-1]
+    num_sorted_rows = sorted_token_ids.shape[0]
+    _silu_fn = _get_compiled_silu_fused(
+        inter_dim,
+        topk,
+        quant_mode=quant_mode,
+        gui_layout=gui_layout,
+        act="silu",
+    )
+    empty_scale = torch.empty(0, dtype=torch.uint8, device=out.device)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=out.device)
+    empty_f32 = torch.empty(0, dtype=torch.float32, device=out.device)
+    _run_compiled(
+        _silu_fn,
+        (
+            _ptr_view_safe(input),
+            _ptr_view_safe(out),
+            _ptr_view_safe(empty_scale),
+            _ptr_view_safe(sorted_token_ids),
+            _ptr_view_safe(num_valid_ids),
+            _ptr_view_safe(empty_i32),
+            _ptr_view_safe(empty_f32),
+            token_num,
+            num_sorted_rows,
+            torch.cuda.current_stream(),
+        ),
+    )
 
 
 # Public API
@@ -1371,9 +1636,14 @@ def flydsl_moe_stage2(
     )
     _run_compiled(exe, args)
 
+    if not accumulate:
+        use_mask = expert_mask is not None
+        if use_mask and topk_ids is None:
+            raise ValueError(
+                "topk_ids is required when expert_mask is provided for reduce mode"
+            )
     if not accumulate and not return_per_slot:
         _run_moe_reduction(
             target, out, token_num, topk, model_dim, expert_mask, topk_ids
         )
-
     return out

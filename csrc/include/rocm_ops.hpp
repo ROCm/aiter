@@ -1707,6 +1707,53 @@ namespace py = pybind11;
           py::arg("x"),                                     \
           py::arg("rotary_dim") = 0);
 
+#define FUSED_QKNORM_IDXRQKNORM_PYBIND      \
+    m.def("fused_qknorm_idxrqknorm",        \
+          &aiter::fused_qknorm_idxrqknorm,  \
+          py::arg("qkv"),                                  \
+          py::arg("q_norm_weight"),                        \
+          py::arg("k_norm_weight"),                        \
+          py::arg("cos_sin_cache"),                        \
+          py::arg("positions"),                            \
+          py::arg("num_heads"),                            \
+          py::arg("num_kv_heads"),                         \
+          py::arg("rotary_dim"),                           \
+          py::arg("eps"),                                  \
+          py::arg("index_q_norm_weight"),                  \
+          py::arg("index_k_norm_weight"),                  \
+          py::arg("num_index_heads"),                       \
+          py::arg("slot_mapping"),                         \
+          py::arg("kv_cache"),                             \
+          py::arg("index_cache"),                          \
+          py::arg("block_size"),                           \
+          py::arg("q_out"),                                \
+          py::arg("index_q_out"),                          \
+          py::arg("index_slot_mapping"));                   \
+    m.def("fused_qknorm_idxrqknorm_fp8",     \
+          &aiter::fused_qknorm_idxrqknorm_fp8, \
+          py::arg("qkv"),                                  \
+          py::arg("q_norm_weight"),                        \
+          py::arg("k_norm_weight"),                        \
+          py::arg("cos_sin_cache"),                        \
+          py::arg("positions"),                            \
+          py::arg("num_heads"),                            \
+          py::arg("num_kv_heads"),                         \
+          py::arg("rotary_dim"),                           \
+          py::arg("eps"),                                  \
+          py::arg("index_q_norm_weight"),                  \
+          py::arg("index_k_norm_weight"),                  \
+          py::arg("num_index_heads"),                       \
+          py::arg("slot_mapping"),                         \
+          py::arg("kv_cache"),                             \
+          py::arg("index_cache"),                          \
+          py::arg("block_size"),                           \
+          py::arg("q_out"),                                \
+          py::arg("index_q_out"),                          \
+          py::arg("index_slot_mapping"),                   \
+          py::arg("kv_cache_dtype"),                       \
+          py::arg("k_scale"),                              \
+          py::arg("v_scale"))
+
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                    \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",             \
           &aiter::fused_qk_norm_rope_cache_quant_shuffle,       \
