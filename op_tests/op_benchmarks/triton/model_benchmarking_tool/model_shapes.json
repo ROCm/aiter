@@ -683,5 +683,211 @@
                 "dv": 128
             }
         ]
+    },
+    "Kimi-K2 Thinking": {
+        "gemm_a8w8_blockscale": [
+            {
+                "N": 36864,
+                "K": 7168,
+                "TP_dim": "N"
+            },
+            {
+                "N": 7168,
+                "K": 18432,
+                "TP_dim": "K"
+            },
+            {
+                "N": 4096,
+                "K": 7168,
+                "TP_dim": "N"
+            },
+            {
+                "N": 7168,
+                "K": 2048,
+                "TP_dim": "K"
+            },
+            {
+                "N": 2112,
+                "K": 7168,
+                "TP_dim": null
+            },
+            {
+                "N": 12288,
+                "K": 1536,
+                "TP_dim": "N"
+            },
+            {
+                "N": 16384,
+                "K": 512,
+                "TP_dim": "N"
+            },
+            {
+                "N": 7168,
+                "K": 8192,
+                "TP_dim": "K"
+            }
+        ],
+        "gemm_afp4wfp4": [
+            {
+                "N": 36864,
+                "K": 7168,
+                "TP_dim": "N"
+            },
+            {
+                "N": 7168,
+                "K": 18432,
+                "TP_dim": "K"
+            },
+            {
+                "N": 4096,
+                "K": 7168,
+                "TP_dim": "N"
+            },
+            {
+                "N": 7168,
+                "K": 2048,
+                "TP_dim": "K"
+            },
+            {
+                "N": 2112,
+                "K": 7168,
+                "TP_dim": null
+            },
+            {
+                "N": 12288,
+                "K": 1536,
+                "TP_dim": "N"
+            },
+            {
+                "N": 16384,
+                "K": 512,
+                "TP_dim": "N"
+            },
+            {
+                "N": 7168,
+                "K": 8192,
+                "TP_dim": "K"
+            }
+        ],
+        "gemm_a16w16": [
+            {
+                "N": 256,
+                "K": 7168,
+                "TP_dim": null
+            }
+        ],
+        "batched_gemm_a16wfp4": [
+            {
+                "B": 64,
+                "N": 512,
+                "K": 128,
+                "TP_dim": "B"
+            },
+            {
+                "B": 64,
+                "N": 128,
+                "K": 512,
+                "TP_dim": "B"
+            }
+        ],
+        "batched_gemm_a8w8": [
+            {
+                "B": 64,
+                "N": 512,
+                "K": 128,
+                "TP_dim": "B"
+            },
+            {
+                "B": 64,
+                "N": 128,
+                "K": 512,
+                "TP_dim": "B"
+            }
+        ],
+        "batched_gemm_afp4wfp4": [
+            {
+                "B": 64,
+                "N": 512,
+                "K": 128,
+                "TP_dim": "B"
+            },
+            {
+                "B": 64,
+                "N": 128,
+                "K": 512,
+                "TP_dim": "B"
+            }
+        ],
+        "moe_op_gemm_a8w8_blockscale": [
+            {
+                "E": 384,
+                "Dim1": 7168,
+                "Dim2": 4096,
+                "TopK": 8
+            }
+        ],
+        "moe_op_gemm_a8w4": [
+            {
+                "E": 384,
+                "Dim1": 7168,
+                "Dim2": 4096,
+                "TopK": 8
+            }
+        ],
+        "moe_op_gemm_a4w4": [
+            {
+                "E": 384,
+                "Dim1": 7168,
+                "Dim2": 4096,
+                "TopK": 8
+            }
+        ],
+	    "rmsnorm": [
+            {
+                "N": 7168
+            },
+            {
+                "N": 1536
+            },
+            {
+                "N": 512
+            }
+        ],
+	    "rope": [
+            {
+                "num_heads": 64,
+                "num_kv_heads": 64,
+                "head_dim": 64,
+                "two_inputs": "true",
+                "positions": "true",
+                "rotate_style": "gptj"
+            },
+            {
+                "num_heads": 64,
+                "num_kv_heads": 1,
+                "head_dim": 64,
+                "two_inputs": "true",
+                "positions": "true",
+                "rotate_style": "gptj"
+            }
+        ],
+        "mha": [
+            {
+                "comment": "Prefill",
+                "hq": 64,
+                "hkv": 64,
+                "dqk": 192,
+                "dv": 128
+            }
+        ],
+        "mla": [
+            {
+                "comment": "Decode",
+                "hq": 64,
+                "hkv": 1,
+                "dqk": 576,
+                "dv": 512
+            }
+        ]
     }
 }
