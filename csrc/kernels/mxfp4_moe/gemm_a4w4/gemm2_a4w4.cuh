@@ -52,7 +52,9 @@ template <int NUM_EXPERTS, int K, int N_OUT, int TOPK, int BM,
           EpilogPolicy kEpilog,
           bool kUseNT = false,
           int kXcdSwizzle = 0,
-          bool kMxfp4Out = false>
+          bool kMxfp4Out = false,
+          int BN_ = 256,
+          int BK_ = 256>
 __global__ void
 __launch_bounds__(256,
                   is_nonatomic_v<kEpilog> ? 1 :
@@ -72,7 +74,8 @@ kernel(
     uint8_t*                     __restrict__ flat_out_scale)
 {
     static_assert(K % 256 == 0, "K must be a multiple of BK=256");
-    static_assert(N_OUT % 256 == 0);
+    static_assert(BN_ == 128 || BN_ == 256, "BN must be 128 or 256");
+    static_assert(N_OUT % 16 == 0, "N_OUT must be a multiple of MFMA-N=16");
     constexpr bool kAtomic     = is_atomic_v<kEpilog>;
     constexpr bool kNonatomic  = is_nonatomic_v<kEpilog>;
     constexpr bool kUseAGPR    = kNonatomic;
@@ -82,19 +85,31 @@ kernel(
         (kNonatomic && BM == 128),
         "Atomic supports BM ∈ {16,32,64}; Nonatomic supports BM == 128");
 
-    constexpr int BN     = 256;
-    constexpr int BK     = 256;
+    constexpr int BN     = BN_;
+    constexpr int BK     = BK_;
     constexpr int K_HALF = K / 2;
+    static_assert(BK == 256 || BK == 512, "BK must be 256 or 512");
+    static_assert(BK == 256 || !is_nonatomic_v<kEpilog>,
+                  "BK=512 not wired for the nonatomic (BM=128) path");
+    // BK=512 = kKUnits 128-byte LDS units (each a BK=256 worth, swizzled <128>).
+    constexpr int kUnitBytes = 128;
+    constexpr int kKUnits    = BK / 256;
+    constexpr int kKSub      = BK / 128;
+
+    constexpr int kGroupsPerWave = BN / 128;
+    constexpr int kNTilesPerWave = BN / 64;
 
     constexpr int K_TILES_TOTAL = K / BK;
     constexpr int kStages       = 2;
     constexpr int kLoopIter     = K_TILES_TOTAL - kStages;
     constexpr int kUnroll       = kLoopIter;
-    static_assert(K_TILES_TOTAL >= kStages,
-                  "gemm2 needs K >= kStages*BK (=512); smaller K is unsupported");
+    static_assert(K_TILES_TOTAL >= 1,
+                  "gemm2 needs K >= BK (=256)");
     static_assert(!is_nonatomic_v<kEpilog> || K_TILES_TOTAL == kStages,
                   "gemm2 nonatomic (BM=128) path is not yet generalized beyond K=512");
-    constexpr int kAStages      = (K_TILES_TOTAL == kStages) ? kStages : 3;
+    // K_TILES_TOTAL==1 (K=256, e.g. padded D_INTER): single-tile, no pipeline.
+    constexpr int kAStages      = (K_TILES_TOTAL == 1) ? 1
+                                : (K_TILES_TOTAL == kStages) ? kStages : 3;
     constexpr int kSubBlocks    = (BM < 32) ? 1 : BM / 32;
     constexpr int kMChunks      = (BM == 16) ? 1 : BM / 16;
     constexpr int BM_GRID       = BM;
@@ -133,15 +148,15 @@ kernel(
     __shared__ LDSLayout<kAtomic, BM, BK, BN, kAStages, kStages, kAS_LDS_slot_bytes> lds;
     auto&        s_Aq    = lds.s_Aq;
 
-    i32x4 a[kMChunks][2];
-    i32x4 b[kStages][4][2];
-    int   b_load_s_base[4];
+    i32x4 a[kMChunks][kKSub];
+    i32x4 b[kStages][kNTilesPerWave][kKSub];
+    int   b_load_s_base[kNTilesPerWave];
     int   a_scale_s_base[kSubBlocks];
-    int   b_scale_s_base[2];
-    int   a_scale_aiter[kSubBlocks];
-    int   a_scale_v[kSubBlocks][K_TILES_TOTAL];
-    int   b_scale_v[kStages][2];
-    f32x4 accm[kMChunks][4];
+    int   b_scale_s_base[kGroupsPerWave];
+    int   a_scale_aiter[kSubBlocks][kKUnits];
+    int   a_scale_v[kSubBlocks][K_TILES_TOTAL * kKUnits];
+    int   b_scale_v[kStages][kGroupsPerWave][kKUnits];
+    f32x4 accm[kMChunks][kNTilesPerWave];
     f32x4 c_zero;
 
     auto issue_a_load_lds = [&](int slot, int kt,
@@ -149,24 +164,29 @@ kernel(
         constexpr int kRowsPerChunk = 8;
         constexpr int kLanesPerRow  = 8;
         const int row_off = lane / kLanesPerRow;
-        if constexpr (BM == 16) {
-            if (wave < 2) {
-                const int lds_row = wave * 8;
-                const int mask    = lds_swizzle_mask<BK / 2>(lds_row + row_off);
-                const int voffset = (((lane % kLanesPerRow) * 16) ^ mask)
-                                  + car[wave] * (K / 2);
-                buffer_load_lds(A_q_rsrc, &s_Aq[slot][lds_row][0],
-                                /*size=*/16, voffset, kt * (BK / 2), 0, 0);
-            }
-        } else {
-            #pragma unroll
-            for (int sub = 0; sub < kSubBlocks; sub++) {
-                const int lds_row = wave * (BM / 4) + sub * kRowsPerChunk;
-                const int mask    = lds_swizzle_mask<BK / 2>(lds_row + row_off);
-                const int voffset = (((lane % kLanesPerRow) * 16) ^ mask)
-                                  + car[sub] * (K / 2);
-                buffer_load_lds(A_q_rsrc, &s_Aq[slot][lds_row][0],
-                                /*size=*/16, voffset, kt * (BK / 2), 0, 0);
+        #pragma unroll
+        for (int u = 0; u < kKUnits; u++) {
+            const int u_lds = u * kUnitBytes;
+            const int u_src = u * kUnitBytes;
+            if constexpr (BM == 16) {
+                if (wave < 2) {
+                    const int lds_row = wave * 8;
+                    const int mask    = lds_swizzle_mask<kUnitBytes>(lds_row + row_off);
+                    const int voffset = (((lane % kLanesPerRow) * 16) ^ mask)
+                                      + car[wave] * (K / 2);
+                    buffer_load_lds(A_q_rsrc, &s_Aq[slot][lds_row][u_lds],
+                                    /*size=*/16, voffset, kt * (BK / 2) + u_src, 0, 0);
+                }
+            } else {
+                #pragma unroll
+                for (int sub = 0; sub < kSubBlocks; sub++) {
+                    const int lds_row = wave * (BM / 4) + sub * kRowsPerChunk;
+                    const int mask    = lds_swizzle_mask<kUnitBytes>(lds_row + row_off);
+                    const int voffset = (((lane % kLanesPerRow) * 16) ^ mask)
+                                      + car[sub] * (K / 2);
+                    buffer_load_lds(A_q_rsrc, &s_Aq[slot][lds_row][u_lds],
+                                    /*size=*/16, voffset, kt * (BK / 2) + u_src, 0, 0);
+                }
             }
         }
     };
@@ -174,10 +194,12 @@ kernel(
     auto issue_a_ds_read = [&](int lds_slot) {
         const int lane_row = lane % 16;
         const int lane_col = (lane / 16) * 16;
-        const int mask     = lds_swizzle_mask<BK / 2>(lane_row);
+        const int mask     = lds_swizzle_mask<kUnitBytes>(lane_row);
         #pragma unroll
-        for (int k = 0; k < 2; k++) {
-            const int lds_col = (lane_col + k * 64) ^ mask;
+        for (int k = 0; k < kKSub; k++) {
+            const int unit    = k / 2;
+            const int half    = k % 2;
+            const int lds_col = unit * kUnitBytes + ((lane_col + half * 64) ^ mask);
             #pragma unroll
             for (int i = 0; i < kMChunks; i++) {
                 const int lds_row = lane_row + i * 16;
@@ -191,14 +213,14 @@ kernel(
         const int v_voff = ((lane / 16) * 16 + (lane % 16)) * 4;
         #pragma unroll
         for (int sub = 0; sub < kSubBlocks; sub++) {
-            ck_tile::static_for<0, K_TILES_TOTAL, 1>{}([&](auto ktt) {
-                constexpr int KT    = ktt.value;
-                constexpr int KT_HI = KT / 16;
-                constexpr int IMM   = (KT - KT_HI * 16) * 256;
-                constexpr int BASE  = KT_HI * 16 * 256;
-                const int s_off = (KT_HI == 0) ? a_scale_s_base[sub]
+            ck_tile::static_for<0, K_TILES_TOTAL * kKUnits, 1>{}([&](auto ktt) {
+                constexpr int SU    = ktt.value;
+                constexpr int SU_HI = SU / 16;
+                constexpr int IMM   = (SU - SU_HI * 16) * 256;
+                constexpr int BASE  = SU_HI * 16 * 256;
+                const int s_off = (SU_HI == 0) ? a_scale_s_base[sub]
                                                : (a_scale_s_base[sub] + BASE);
-                a_scale_v[sub][KT] = buffer_load_b32_imm<IMM>(
+                a_scale_v[sub][SU] = buffer_load_b32_imm<IMM>(
                     A_scale_rsrc, v_voff, s_off);
             });
         }
@@ -207,7 +229,9 @@ kernel(
     auto issue_a_scale_ds_read_ku_atomic = [&]<int KU>() {
         #pragma unroll
         for (int sub = 0; sub < kSubBlocks; sub++) {
-            a_scale_aiter[sub] = a_scale_v[sub][KU];
+            #pragma unroll
+            for (int u = 0; u < kKUnits; u++)
+                a_scale_aiter[sub][u] = a_scale_v[sub][KU * kKUnits + u];
         }
     };
 
@@ -232,69 +256,80 @@ kernel(
                 const int lds_off = sub * 256
                                   + (lane / 16) * 64
                                   + (lane % 16) * 4;
-                a_scale_aiter[sub] = *reinterpret_cast<int*>(&lds.s_Ascale[slot][lds_off]);
+                a_scale_aiter[sub][0] = *reinterpret_cast<int*>(&lds.s_Ascale[slot][lds_off]);
             }
         }
     };
 
     auto issue_b_load_j = [&]<int K_C>(auto& b_sub, int j) {
-        constexpr int K_BYTE = K_C * 2048;
+        constexpr int K_BYTE = K_C * kKSub * 1024;
         const int v_voff = (lane / 16) * 256
                          + (lane % 16) * 16
                          + K_BYTE;
         constexpr int kBQ_AUX = (kAtomic && kUseNT) ? 2 : 0;
-        buffer_load_b128_imm_inplace<   0, kBQ_AUX>(
-            b_sub[j][0], B_q_rsrc, v_voff, b_load_s_base[j]);
-        buffer_load_b128_imm_inplace<1024, kBQ_AUX>(
-            b_sub[j][1], B_q_rsrc, v_voff, b_load_s_base[j]);
+        ck_tile::static_for<0, kKSub, 1>{}([&](auto kk) {
+            constexpr int k = kk.value;
+            buffer_load_b128_imm_inplace<k * 1024, kBQ_AUX>(
+                b_sub[j][k], B_q_rsrc, v_voff, b_load_s_base[j]);
+        });
     };
 
     auto issue_b_scale_load_ku = [&]<int KU>(auto& bs_sub) {
         const int v_voff = ((lane / 16) * 16 + (lane % 16)) * 4;
-        constexpr int KU_HI = KU / 16;
-        constexpr int IMM   = (KU - KU_HI * 16) * (kBS_stride_k0_dw * 4);
-        constexpr int BASE  = KU_HI * 16 * (kBS_stride_k0_dw * 4);
         #pragma unroll
-        for (int mw = 0; mw < 2; mw++) {
-            const int s_off = (KU_HI == 0) ? b_scale_s_base[mw]
-                                           : (b_scale_s_base[mw] + BASE);
-            bs_sub[mw] = buffer_load_b32_imm<IMM>(
-                B_scale_rsrc, v_voff, s_off);
+        for (int mw = 0; mw < kGroupsPerWave; mw++) {
+            ck_tile::static_for<0, kKUnits, 1>{}([&](auto uu) {
+                constexpr int u     = uu.value;
+                constexpr int SU    = KU * kKUnits + u;
+                constexpr int SU_HI = SU / 16;
+                constexpr int IMM   = (SU - SU_HI * 16) * (kBS_stride_k0_dw * 4);
+                constexpr int BASE  = SU_HI * 16 * (kBS_stride_k0_dw * 4);
+                const int s_off = (SU_HI == 0) ? b_scale_s_base[mw]
+                                               : (b_scale_s_base[mw] + BASE);
+                bs_sub[mw][u] = buffer_load_b32_imm<IMM>(
+                    B_scale_rsrc, v_voff, s_off);
+            });
         }
     };
 
     auto issue_mfma_cluster = [&]<int J, bool kInit>(int slot) {
         constexpr int mni  = J / 2;
         constexpr int in_b = J % 2;
-        const int sb = b_scale_v[slot][mni];
-        #pragma unroll
-        for (int sub = 0; sub < kSubBlocks; sub++) {
-            const int sa = a_scale_aiter[sub];
-            const int i0 = sub * 2 + 0;
-            [[maybe_unused]] const int i1 = sub * 2 + 1;
-            if constexpr (kInit) {
-                if constexpr (kUseAGPR) mfma_f4f4_agpr_init_zero<0, 0 + in_b>(accm[i0][J], a[i0][0], b[slot][J][0], sa, sb);
-                else                    mfma_f4f4_vgpr_init<0, 0 + in_b>(accm[i0][J], a[i0][0], b[slot][J][0], c_zero, sa, sb);
-            } else {
-                if constexpr (kUseAGPR) mfma_f4f4_agpr<0, 0 + in_b>(accm[i0][J], a[i0][0], b[slot][J][0], sa, sb);
-                else                    mfma_f4f4_vgpr<0, 0 + in_b>(accm[i0][J], a[i0][0], b[slot][J][0], sa, sb);
-            }
-            if constexpr (BM != 16) {
-                if constexpr (kInit) {
-                    if constexpr (kUseAGPR) mfma_f4f4_agpr_init_zero<1, 0 + in_b>(accm[i1][J], a[i1][0], b[slot][J][0], sa, sb);
-                    else                    mfma_f4f4_vgpr_init<1, 0 + in_b>(accm[i1][J], a[i1][0], b[slot][J][0], c_zero, sa, sb);
+        ck_tile::static_for<0, kKUnits, 1>{}([&](auto uu) {
+            constexpr int u  = uu.value;
+            constexpr int k0 = 2 * u + 0;
+            constexpr int k1 = 2 * u + 1;
+            constexpr bool kI = kInit && (u == 0);
+            const int sb = b_scale_v[slot][mni][u];
+            #pragma unroll
+            for (int sub = 0; sub < kSubBlocks; sub++) {
+                const int sa = a_scale_aiter[sub][u];
+                const int i0 = sub * 2 + 0;
+                [[maybe_unused]] const int i1 = sub * 2 + 1;
+                if constexpr (kI) {
+                    if constexpr (kUseAGPR) mfma_f4f4_agpr_init_zero<0, 0 + in_b>(accm[i0][J], a[i0][k0], b[slot][J][k0], sa, sb);
+                    else                    mfma_f4f4_vgpr_init<0, 0 + in_b>(accm[i0][J], a[i0][k0], b[slot][J][k0], c_zero, sa, sb);
                 } else {
-                    if constexpr (kUseAGPR) mfma_f4f4_agpr<1, 0 + in_b>(accm[i1][J], a[i1][0], b[slot][J][0], sa, sb);
-                    else                    mfma_f4f4_vgpr<1, 0 + in_b>(accm[i1][J], a[i1][0], b[slot][J][0], sa, sb);
+                    if constexpr (kUseAGPR) mfma_f4f4_agpr<0, 0 + in_b>(accm[i0][J], a[i0][k0], b[slot][J][k0], sa, sb);
+                    else                    mfma_f4f4_vgpr<0, 0 + in_b>(accm[i0][J], a[i0][k0], b[slot][J][k0], sa, sb);
+                }
+                if constexpr (BM != 16) {
+                    if constexpr (kI) {
+                        if constexpr (kUseAGPR) mfma_f4f4_agpr_init_zero<1, 0 + in_b>(accm[i1][J], a[i1][k0], b[slot][J][k0], sa, sb);
+                        else                    mfma_f4f4_vgpr_init<1, 0 + in_b>(accm[i1][J], a[i1][k0], b[slot][J][k0], c_zero, sa, sb);
+                    } else {
+                        if constexpr (kUseAGPR) mfma_f4f4_agpr<1, 0 + in_b>(accm[i1][J], a[i1][k0], b[slot][J][k0], sa, sb);
+                        else                    mfma_f4f4_vgpr<1, 0 + in_b>(accm[i1][J], a[i1][k0], b[slot][J][k0], sa, sb);
+                    }
+                }
+                if constexpr (kUseAGPR) mfma_f4f4_agpr<2, 2 + in_b>(accm[i0][J], a[i0][k1], b[slot][J][k1], sa, sb);
+                else                    mfma_f4f4_vgpr<2, 2 + in_b>(accm[i0][J], a[i0][k1], b[slot][J][k1], sa, sb);
+                if constexpr (BM != 16) {
+                    if constexpr (kUseAGPR) mfma_f4f4_agpr<3, 2 + in_b>(accm[i1][J], a[i1][k1], b[slot][J][k1], sa, sb);
+                    else                    mfma_f4f4_vgpr<3, 2 + in_b>(accm[i1][J], a[i1][k1], b[slot][J][k1], sa, sb);
                 }
             }
-            if constexpr (kUseAGPR) mfma_f4f4_agpr<2, 2 + in_b>(accm[i0][J], a[i0][1], b[slot][J][1], sa, sb);
-            else                    mfma_f4f4_vgpr<2, 2 + in_b>(accm[i0][J], a[i0][1], b[slot][J][1], sa, sb);
-            if constexpr (BM != 16) {
-                if constexpr (kUseAGPR) mfma_f4f4_agpr<3, 2 + in_b>(accm[i1][J], a[i1][1], b[slot][J][1], sa, sb);
-                else                    mfma_f4f4_vgpr<3, 2 + in_b>(accm[i1][J], a[i1][1], b[slot][J][1], sa, sb);
-            }
-        }
+        });
     };
 
     auto run_one = [&](int m_block_idx, int n_block_idx, int e) {
@@ -328,7 +363,7 @@ kernel(
         }
 
         #pragma unroll
-        for (int j = 0; j < 4; j++) {
+        for (int j = 0; j < kNTilesPerWave; j++) {
             b_load_s_base[j] = __builtin_amdgcn_readfirstlane(
                 ((long long)e * N_OUT + n_block_idx * BN + wave_n * (BN / 4) + j * 16)
                 * (K / 2));
@@ -338,7 +373,7 @@ kernel(
             const int mni_base = n_block_idx * (BN / 16 / 2)
                                + wave_n     * (BN / 64 / 2);
             #pragma unroll
-            for (int mw = 0; mw < 2; mw++) {
+            for (int mw = 0; mw < kGroupsPerWave; mw++) {
                 b_scale_s_base[mw] = __builtin_amdgcn_readfirstlane(
                     ((long long)e               * kBS_per_expert_dw
                    + (mni_base + mw) * kBS_stride_n0_dw) * 4);
@@ -354,7 +389,29 @@ kernel(
             }
         }
 
-        if constexpr (kNonatomic) {
+        if constexpr (K_TILES_TOTAL == 1) {
+            issue_a_load_lds(0, 0, cached_actual_row);
+            __builtin_amdgcn_sched_barrier(0);
+            issue_a_scale_load_atomic();
+            issue_b_scale_load_ku.template operator()<0>(b_scale_v[0]);
+            #pragma unroll
+            for (int j = 0; j < kNTilesPerWave; j++)
+                issue_b_load_j.template operator()<0>(b[0], j);
+
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            __builtin_amdgcn_s_barrier();
+            issue_a_ds_read(/*lds_slot=*/0);
+            issue_a_scale_ds_read_ku_atomic.template operator()<0>();
+            ck_tile::static_for<0, kNTilesPerWave, 1>{}([&](auto jj) {
+                constexpr int J = jj.value;
+                issue_mfma_cluster.template operator()<J, /*kInit=*/true>(0);
+            });
+
+            __syncthreads();
+            apply_atomic_bf16_epilog<N_OUT, BM, BN>(
+                accm, out_bf16, sorted_token_ids, sorted_weights,
+                m_row, n_block_idx, wave_n, lane, tid, M, lds.lds_acc);
+        } else if constexpr (kNonatomic) {
             // iter-boundary fence: persistent-grid only, LDS-slot reuse race.
             __syncthreads();
 
@@ -364,11 +421,11 @@ kernel(
             issue_a_scale_load_nonatomic(/*slot=*/1, /*kt=*/1);
             __builtin_amdgcn_sched_barrier(0);
             #pragma unroll
-            for (int j = 0; j < 4; j++)
+            for (int j = 0; j < kNTilesPerWave; j++)
                 issue_b_load_j.template operator()<0>(b[0], j);
             issue_b_scale_load_ku.template operator()<0>(b_scale_v[0]);
             #pragma unroll
-            for (int j = 0; j < 4; j++)
+            for (int j = 0; j < kNTilesPerWave; j++)
                 issue_b_load_j.template operator()<1>(b[1], j);
             issue_b_scale_load_ku.template operator()<1>(b_scale_v[1]);
 
@@ -379,18 +436,18 @@ kernel(
                 __syncthreads();
                 issue_a_ds_read(/*lds_slot=*/slot_);
                 issue_a_scale_ds_read_nonatomic(/*slot=*/slot_);
-                ck_tile::static_for<0, 4, 1>{}([&](auto jj) {
+                ck_tile::static_for<0, kNTilesPerWave, 1>{}([&](auto jj) {
                     constexpr int J = jj.value;
                     issue_mfma_cluster.template operator()<J, /*kInit=*/(S == 0)>(slot_);
                 });
             });
 
             if constexpr (kMxfp4Out) {
-                apply_mxfp4_flat_epilog_bm128<N_OUT>(
+                apply_mxfp4_flat_epilog_bm128<N_OUT, BN>(
                     accm, reinterpret_cast<uint8_t*>(out_bf16), flat_out_scale,
                     m_row, n_block_idx, wave_n, lane, tid, lds.lds_acc);
             } else {
-                apply_bf16_flat_epilog_bm128<N_OUT>(
+                apply_bf16_flat_epilog_bm128<N_OUT, BN>(
                     accm, out_bf16, m_row, n_block_idx, wave_n, lane);
             }
         } else if constexpr (K_TILES_TOTAL == kStages) {
@@ -402,10 +459,10 @@ kernel(
             issue_b_scale_load_ku.template operator()<0>(b_scale_v[0]);
             issue_b_scale_load_ku.template operator()<1>(b_scale_v[1]);
             #pragma unroll
-            for (int j = 0; j < 4; j++)
+            for (int j = 0; j < kNTilesPerWave; j++)
                 issue_b_load_j.template operator()<0>(b[0], j);
             #pragma unroll
-            for (int j = 0; j < 4; j++)
+            for (int j = 0; j < kNTilesPerWave; j++)
                 issue_b_load_j.template operator()<1>(b[1], j);
 
             ck_tile::static_for<0, kStages, 1>{}([&](auto ss) {
@@ -421,14 +478,14 @@ kernel(
                 __builtin_amdgcn_s_barrier();
                 issue_a_ds_read(/*lds_slot=*/slot_);
                 issue_a_scale_ds_read_ku_atomic.template operator()<kt>();
-                ck_tile::static_for<0, 4, 1>{}([&](auto jj) {
+                ck_tile::static_for<0, kNTilesPerWave, 1>{}([&](auto jj) {
                     constexpr int J = jj.value;
                     issue_mfma_cluster.template operator()<J, /*kInit=*/(S == 0)>(slot_);
                 });
             });
 
             __syncthreads();
-            apply_atomic_bf16_epilog<N_OUT, BM>(
+            apply_atomic_bf16_epilog<N_OUT, BM, BN>(
                 accm, out_bf16, sorted_token_ids, sorted_weights,
                 m_row, n_block_idx, wave_n, lane, tid, M, lds.lds_acc);
         } else {
@@ -437,7 +494,7 @@ kernel(
                 issue_a_load_lds(KC, KC, cached_actual_row);
                 issue_b_scale_load_ku.template operator()<KC>(b_scale_v[KC]);
                 #pragma unroll
-                for (int j = 0; j < 4; j++)
+                for (int j = 0; j < kNTilesPerWave; j++)
                     issue_b_load_j.template operator()<KC>(b[KC], j);
             });
             __builtin_amdgcn_sched_barrier(0);
@@ -453,7 +510,7 @@ kernel(
                 issue_a_ds_read(/*lds_slot=*/read_slot);
                 issue_a_scale_ds_read_ku_atomic.template operator()<OFFSET>();
                 issue_a_load_lds(write_slot, K_C, cached_actual_row);
-                ck_tile::static_for<0, 4, 1>{}([&](auto jj) {
+                ck_tile::static_for<0, kNTilesPerWave, 1>{}([&](auto jj) {
                     constexpr int J = jj.value;
                     __builtin_amdgcn_sched_barrier(0);
                     issue_mfma_cluster.template operator()<J, /*kInit=*/(OFFSET == 0)>(slot_b);
@@ -472,20 +529,20 @@ kernel(
                 __syncthreads();
                 issue_a_ds_read(/*lds_slot=*/read_slot);
                 issue_a_scale_ds_read_ku_atomic.template operator()<kt>();
-                ck_tile::static_for<0, 4, 1>{}([&](auto jj) {
+                ck_tile::static_for<0, kNTilesPerWave, 1>{}([&](auto jj) {
                     constexpr int J = jj.value;
                     issue_mfma_cluster.template operator()<J, /*kInit=*/false>(slot_b);
                 });
             });
 
             __syncthreads();
-            apply_atomic_bf16_epilog<N_OUT, BM>(
+            apply_atomic_bf16_epilog<N_OUT, BM, BN>(
                 accm, out_bf16, sorted_token_ids, sorted_weights,
                 m_row, n_block_idx, wave_n, lane, tid, M, lds.lds_acc);
         }
     };
 
-    constexpr int num_n_blocks_local = N_OUT / 256;
+    constexpr int num_n_blocks_local = (N_OUT + BN - 1) / BN;  // ceil: ragged-N tail OOB/predicated
     const int total_m_blocks = __ldg(cumsum_tensor) / BM_GRID;
     if constexpr (kPersistent) {
         const int total_work = total_m_blocks * num_n_blocks_local;
@@ -520,7 +577,7 @@ kernel(
 }
 
 template <int NUM_EXPERTS, int K, int N_OUT, int TOPK, int BM,
-          bool kUseNT = false, int kXcdSwizzle = 0>
+          bool kUseNT = false, int kXcdSwizzle = 0, int BN = 256, int BK = 256>
 inline void launch_atomic(
     hipStream_t stream,
     const void* A_q,    const void* A_scale,
@@ -532,13 +589,13 @@ inline void launch_atomic(
 {
     static_assert(BM == 16 || BM == 32 || BM == 64, "BM must be 16, 32, or 64");
     constexpr int BM_GRID = BM;
-    constexpr int num_n_blocks = N_OUT / 256;
+    constexpr int num_n_blocks = (N_OUT + BN - 1) / BN;  // ceil for ragged N
     const int max_m_blocks =
         (M * TOPK + NUM_EXPERTS * (BM_GRID - 1) + BM_GRID - 1) / BM_GRID;
     const int grid = max_m_blocks * num_n_blocks;
     const int max_sorted = max_m_blocks * BM;  // runtime A_q/A_scale bound (replaces MAX_M)
     kernel<NUM_EXPERTS, K, N_OUT, TOPK, BM,
-           EpilogPolicy::Atomic, kUseNT, kXcdSwizzle>
+           EpilogPolicy::Atomic, kUseNT, kXcdSwizzle, /*kMxfp4Out=*/false, BN, BK>
         <<<grid, 256, 0, stream>>>(
             reinterpret_cast<const __hip_fp4x2_storage_t*>(A_q),
             reinterpret_cast<const __amd_scale_t*>(A_scale),
@@ -551,7 +608,7 @@ inline void launch_atomic(
             /*flat_out_scale=*/nullptr);
 }
 
-template <int NUM_EXPERTS, int K, int N_OUT, int kXcdSwizzle = 0>
+template <int NUM_EXPERTS, int K, int N_OUT, int kXcdSwizzle = 0, int BN = 256>
 inline void launch_nonatomic(
     hipStream_t stream,
     const void* A_q,    const void* A_scale,
@@ -561,13 +618,13 @@ inline void launch_nonatomic(
     void*       flat_out)
 {
     constexpr int BM = 128;
-    constexpr int num_n_blocks = N_OUT / 256;
+    constexpr int num_n_blocks = (N_OUT + BN - 1) / BN;  // ceil for ragged N
     const int max_m_blocks = (max_sorted + BM - 1) / BM;
     const int total_work   = max_m_blocks * num_n_blocks;
     const int grid = (total_work < NUM_CU) ? total_work : NUM_CU;
     kernel<NUM_EXPERTS, K, N_OUT, /*TOPK=*/9, BM,
            EpilogPolicy::Nonatomic, /*kUseNT=*/false,
-           kXcdSwizzle>
+           kXcdSwizzle, /*kMxfp4Out=*/false, BN>
         <<<grid, 256, 0, stream>>>(
             reinterpret_cast<const __hip_fp4x2_storage_t*>(A_q),
             reinterpret_cast<const __amd_scale_t*>(A_scale),
@@ -580,7 +637,7 @@ inline void launch_nonatomic(
             /*flat_out_scale=*/nullptr);
 }
 
-template <int NUM_EXPERTS, int K, int N_OUT, int kXcdSwizzle = 0>
+template <int NUM_EXPERTS, int K, int N_OUT, int kXcdSwizzle = 0, int BN = 256>
 inline void launch_nonatomic_mxfp4(
     hipStream_t stream,
     const void* A_q,    const void* A_scale,
@@ -591,13 +648,13 @@ inline void launch_nonatomic_mxfp4(
     void*       flat_out_scale)
 {
     constexpr int BM = 128;
-    constexpr int num_n_blocks = N_OUT / 256;
+    constexpr int num_n_blocks = (N_OUT + BN - 1) / BN;  // ceil for ragged N
     const int max_m_blocks = (max_sorted + BM - 1) / BM;
     const int total_work   = max_m_blocks * num_n_blocks;
     const int grid = (total_work < NUM_CU) ? total_work : NUM_CU;
     kernel<NUM_EXPERTS, K, N_OUT, /*TOPK=*/9, BM,
            EpilogPolicy::Nonatomic, /*kUseNT=*/false,
-           kXcdSwizzle, /*kMxfp4Out=*/true>
+           kXcdSwizzle, /*kMxfp4Out=*/true, BN>
         <<<grid, 256, 0, stream>>>(
             reinterpret_cast<const __hip_fp4x2_storage_t*>(A_q),
             reinterpret_cast<const __amd_scale_t*>(A_scale),

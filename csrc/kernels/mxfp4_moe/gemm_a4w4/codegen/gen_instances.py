@@ -21,6 +21,7 @@ from pathlib import Path
 SHAPES = [
     (385,  7168,      512,      9),  # Kimi-K2.5 TP=4
     (257,  7168,      512,      9),  # DSR
+    (385,  7168,      192,      9),  # Kimi-K2.5 TP=4, D_INTER=192
 ]
 
 # XCD-swizzle group sizes to enumerate for BM=128 paths (large-M targets).
@@ -123,13 +124,35 @@ class Instance:
         self.body = body
 
 
+def pick_bn(n_out):
+    """Largest BN in {256,128} dividing N_OUT; else 256 (kernel ceil-tiles +
+    predicates the ragged N tail, needs only N_OUT % 16 == 0)."""
+    for bn in (256, 128):
+        if n_out % bn == 0:
+            return bn
+    return 256
+
+
+def pad_k(k):
+    """gemm2 K (= D_INTER) padded up to a 256-multiple (BK / scale-layout)."""
+    return ((k + 255) // 256) * 256
+
+
+def pick_bk(k):
+    """gemm2 K-tile: 512 when K is a 512-multiple and >= 1024, else 256."""
+    if k % 512 == 0 and k >= 1024:
+        return 512
+    return 256
+
+
 def _g1_body(ne, h, e, bm, *, use_nt=False, inline_quant=False, xcd_swizzle=0):
     """Body of an extern "C" wrapper that calls aiter::mxfp4_moe::gemm1::launch."""
     n_out = 2 * e
+    bn = pick_bn(n_out)
     if inline_quant:
         return (
             f"    aiter::mxfp4_moe::gemm1::launch<\n"
-            f"        {ne}, {h}, {n_out}, /*BM*/{bm},\n"
+            f"        {ne}, {h}, {n_out}, /*BM*/{bm}, /*BN*/{bn},\n"
             f"        /*kUseNT*/{str(use_nt).lower()},\n"
             f"        /*kInlineQuant*/true,\n"
             f"        /*kXcdSwizzle*/{xcd_swizzle}>(\n"
@@ -141,7 +164,7 @@ def _g1_body(ne, h, e, bm, *, use_nt=False, inline_quant=False, xcd_swizzle=0):
         return (
             f"    (void)hidden_ptr;\n"
             f"    aiter::mxfp4_moe::gemm1::launch<\n"
-            f"        {ne}, {h}, {n_out}, /*BM*/{bm},\n"
+            f"        {ne}, {h}, {n_out}, /*BM*/{bm}, /*BN*/{bn},\n"
             f"        /*kUseNT*/{str(use_nt).lower()},\n"
             f"        /*kInlineQuant*/false,\n"
             f"        /*kXcdSwizzle*/{xcd_swizzle}>(\n"
@@ -154,9 +177,10 @@ def _g1_body(ne, h, e, bm, *, use_nt=False, inline_quant=False, xcd_swizzle=0):
 def _g2_atomic_body(ne, h, e, topk, bm, *, use_nt=False, xcd_swizzle=0):
     return (
         f"    aiter::mxfp4_moe::gemm2::launch_atomic<\n"
-        f"        {ne}, {e}, {h}, {topk}, /*BM*/{bm},\n"
+        f"        {ne}, {pad_k(e)}, {h}, {topk}, /*BM*/{bm},\n"
         f"        /*kUseNT*/{str(use_nt).lower()},\n"
-        f"        /*kXcdSwizzle*/{xcd_swizzle}>(\n"
+        f"        /*kXcdSwizzle*/{xcd_swizzle}, /*BN*/{pick_bn(h)},"
+        f" /*BK*/{pick_bk(pad_k(e))}>(\n"
         f"            stream, A_q, A_scale, B_q, B_scale,\n"
         f"            sorted_expert_ids, cumsum, sorted_token_ids, sorted_weights,\n"
         f"            M, bf16_out);"
@@ -166,7 +190,7 @@ def _g2_atomic_body(ne, h, e, topk, bm, *, use_nt=False, xcd_swizzle=0):
 def _g2_nonatomic_body(ne, h, e, *, xcd_swizzle=0):
     return (
         f"    aiter::mxfp4_moe::gemm2::launch_nonatomic<\n"
-        f"        {ne}, {e}, {h}, /*kXcdSwizzle*/{xcd_swizzle}>(\n"
+        f"        {ne}, {pad_k(e)}, {h}, /*kXcdSwizzle*/{xcd_swizzle}, /*BN*/{pick_bn(h)}>(\n"
         f"            stream, A_q, A_scale, B_q, B_scale,\n"
         f"            sorted_expert_ids, cumsum, max_sorted, bf16_out);"
     )
