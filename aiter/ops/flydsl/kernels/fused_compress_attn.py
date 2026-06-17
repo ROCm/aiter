@@ -8,6 +8,19 @@ Drop-in replacement for the Triton ``_fused_compress_attn_kernel`` in
 pool over K=2*RATIO source positions, RMSNorm (fp32), GPT-J interleaved RoPE,
 optional FP8 (ue8m0 scale + MFMA 16x16 preshuffle) cache scatter.
 
+Two kernel families share this file:
+  - Legacy single-wave (``_build_kernel``): 1 wave64 per boundary, K iters
+    serialized. Handles all shapes + the FP8/quant/preshuffle family.
+  - K-split multi-wave (``_build_kernel_ksplit``, BF16 + FP8 scatter): K split
+    across NW waves in one workgroup (block = 64*NW), LDS cross-wave
+    online-softmax reduce, single dispatch. Parallelizes the serial softmax
+    chain that bottlenecks the latency-bound small-N decode regime. On the
+    CSA Main (D=512, BF16) and CSA Indexer (D=128, FP8) shapes it auto-engages
+    via ``csa_ksplit_num_waves(plan_capacity)`` and wins ~1.3-1.4× (BF16) /
+    ~1.15-1.24× (FP8) at decode bs=1-32; it falls back to legacy at high N
+    where CU occupancy already saturates. See
+    ``flydsl_fused_compress_attn``'s ``k_split_num_waves`` arg.
+
 Grid: ``(plan_capacity, 1, 1)`` — one program per packed plan row
 ``[ragged_id, batch_id, position, window_len]``. Position == -1 rows
 sentinel-skip; sentinel-skip is implemented as an scf.IfOp that wraps the
@@ -63,14 +76,29 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, vector, buffer_ops
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, vector, buffer_ops
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import T, Int32, Stream
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl, scf
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.runtime.device import get_rocm_arch
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from .tensor_shim import _to_raw
+from .tensor_shim import STensor, _to_raw, _run_compiled
+
+# Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
+# (the K-split LDS path references these only inside @flyc.kernel / @flyc.jit
+# closures, which formatters may not see).
+_FORCE_BIND_LDS = (
+    CompilationContext,
+    STensor,
+    SmemAllocator,
+    SmemPtr,
+    get_rocm_arch,
+    gpu,
+)
 
 # --- shape constants --------------------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64; D must be a multiple
@@ -1183,6 +1211,855 @@ def _build_kernel(
 
 
 # ============================================================================
+# K-split single-kernel builder (multi-wave LDS reduce)
+# ============================================================================
+#
+# Why this exists: the legacy single-wave kernel above runs ONE wave64 per
+# boundary, serializing K iters of online-softmax. PMC on CSA Main (D=512,
+# K=8) showed VALU IPC ~0.33 with 53% of cycles in SQ_WAIT_ANY and only 128
+# VMEM insts — i.e. the wave is stalled on the *serial dependency chain*
+# (each iter's m/kv/w accumulator + 2x exp2 transcendental per lane), not on
+# memory. At decode bs=1-32 each CU holds a single wave, so nothing hides the
+# chain latency.
+#
+# Fix: split K across NW waves in ONE workgroup (block = 64*NW), grid stays
+# = plan_capacity (single dispatch → no extra ~2.2us launch floor). Each wave
+# runs K/NW iters; LDS cross-wave online-softmax merges the per-wave
+# accumulators; wave 0 then does RMSNorm + GPT-J RoPE + BF16 scatter inline
+# (same tail as the legacy kernel). NW sibling waves on one CU hide each
+# other's exp2 / dependency latency.
+#
+# BF16 scatter only (the V4-Pro CSA Main path the user cares about). FP8 /
+# quant / preshuffle continue to use the legacy single-wave kernel.
+
+
+def _build_kernel_ksplit(
+    *,
+    head_dim: int,
+    rope_head_dim: int,
+    ratio: int,
+    overlap: bool,
+    state_size: int,
+    k_per_block: int,
+    k_split_num_waves: int,
+    quant: bool,
+    use_ue8m0: bool,
+    preshuffle: bool,
+    rms_weight_is_bf16: bool,
+    rms_eps: float,
+):
+    """K-split single-kernel: NW-wave LDS-reduced compress + norm + rope +
+    scatter (BF16 or FP8). Constexpr knobs mirror :func:`_build_kernel` minus
+    ``enable_prefetch_input`` (each wave runs so few iters that prefetch is
+    moot). The FP8 / ue8m0 / preshuffle scatter is emitted in wave 0, where
+    ``lid`` (0..63) plays the single-wave ``tid`` role — pair-coop
+    shuffle_xor and wave_reduce_max stay within wave 0's 64 lanes, identical
+    to the legacy kernel's semantics.
+
+    Layout:
+      - Grid:  (plan_capacity, 1, 1)  — one workgroup per plan row.
+      - Block: 64 * NW threads (NW waves).
+      - VEC = D / 64: each lane owns VEC contiguous D-columns. One wave's 64
+        lanes cover the full head_dim.
+      - K = (2 if overlap else 1) * ratio, split into NW slices of K_PER_WAVE.
+      - LDS: 3 fp32 arrays of NW*D (m, kv, w). Each lane writes its VEC
+        accumulator values at wid*D + lid*VEC + i; wave 0 reads NW values per
+        owned element and folds them with a global-max online-softmax.
+    """
+    D = head_dim
+    RD = rope_head_dim
+    NOPE = D - RD
+    VEC = D // BLOCK_THREADS
+    K = (2 if overlap else 1) * ratio
+    DIM_FULL = (2 if overlap else 1) * D
+    NW = k_split_num_waves
+    BLOCK_TH = BLOCK_THREADS * NW
+    K_PER_WAVE = K // NW
+
+    ROPE_THREAD_LO = NOPE // VEC
+    PAIRS_PER_THREAD = VEC // 2
+
+    assert D % BLOCK_THREADS == 0, f"D={D} must divide {BLOCK_THREADS}"
+    assert VEC in (2, 4, 8), f"VEC={VEC} outside supported set"
+    assert NOPE >= 0 and NOPE % VEC == 0
+    assert RD > 0 and RD % 2 == 0 and RD % VEC == 0
+    assert state_size >= K, f"state_size={state_size} < K={K}"
+    assert K % NW == 0, f"K={K} must divide evenly across NW={NW} waves"
+    if quant and preshuffle:
+        assert D % _PRESHUFFLE_TILE == 0
+        assert k_per_block % _PRESHUFFLE_TILE == 0
+
+    # LDS: 3 fp32 arrays, each NW * D entries.
+    LDS_ELEMS = NW * D
+    LDS_BYTES = LDS_ELEMS * 4
+
+    GPU_ARCH = get_rocm_arch()
+    allocator = SmemAllocator(
+        None,
+        arch=GPU_ARCH,
+        global_sym_name=(
+            f"csa_ksplit_smem_D{D}_R{ratio}_O{int(overlap)}_NW{NW}_S{state_size}"
+        ),
+    )
+    lds_m_off = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_m_off + LDS_BYTES
+    lds_kv_off = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_kv_off + LDS_BYTES
+    lds_w_off = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_w_off + LDS_BYTES
+
+    _name_parts = [
+        "fused_compress_attn",
+        f"D{D}",
+        f"RD{RD}",
+        f"R{ratio}",
+        ("OVL" if overlap else "NOOVL"),
+        f"SS{state_size}",
+        f"KB{k_per_block}",
+        f"KS{NW}",
+    ]
+    if quant:
+        _name_parts.append("Q")
+        if use_ue8m0:
+            _name_parts.append("ue8m0")
+        if preshuffle:
+            _name_parts.append("psh")
+    if rms_weight_is_bf16:
+        _name_parts.append("rmsbf16")
+    _name_parts.append("flydsl")
+    _kname = "_".join(_name_parts)
+
+    fm_fast = arith.FastMathFlags.fast
+    log2_block = int(math.log2(BLOCK_THREADS))
+
+    @flyc.kernel(name=_kname, known_block_size=[BLOCK_TH, 1, 1])
+    def kernel(
+        kv_in: fx.Tensor,
+        kv_in_row_stride: Int32,
+        score_in: fx.Tensor,
+        score_in_row_stride: Int32,
+        plan: fx.Tensor,
+        kv_state: fx.Tensor,
+        kv_state_slot_stride: Int32,
+        kv_state_pos_stride: Int32,
+        score_state: fx.Tensor,
+        score_state_slot_stride: Int32,
+        score_state_pos_stride: Int32,
+        state_slot_mapping: fx.Tensor,
+        ape: fx.Tensor,
+        rms_weight: fx.Tensor,
+        cos_cache: fx.Tensor,
+        sin_cache: fx.Tensor,
+        kv_cache: fx.Tensor,
+        kv_cache_block_stride: Int32,
+        kv_cache_token_stride: Int32,
+        cache_scale: fx.Tensor,  # [NB, k_per_block] f32 (dummy if not quant)
+        cache_scale_block_stride: Int32,
+        block_table: fx.Tensor,
+        block_table_seq_stride: Int32,
+    ):
+        f32 = T.f32
+        i32 = T.i32
+        vecVf32 = T.vec(VEC, T.f32)
+
+        pid = fx.block_idx.x
+        tid = fx.thread_idx.x  # 0 .. BLOCK_TH-1
+
+        c_neg_inf = arith.constant(_NEG_INF, type=f32)
+        c_zero_f32 = arith.constant(0.0, type=f32)
+        c_zero_i32 = arith.constant(0, type=i32)
+        c_one_i32 = arith.constant(1, type=i32)
+        c_64 = arith.constant(BLOCK_THREADS, type=i32)
+        c_eps = arith.constant(rms_eps, type=f32)
+        c_inv_D = arith.constant(1.0 / D, type=f32)
+        c_log2e = arith.constant(_LOG2E, type=f32)
+        c_K_m1 = arith.constant(K - 1, type=i32)
+        c_K_per_wave = arith.constant(K_PER_WAVE, type=i32)
+        c_state_size = arith.constant(state_size, type=i32)
+        c_VEC = arith.constant(VEC, type=i32)
+        c_D = arith.constant(D, type=i32)
+
+        def fexp_f32(x):
+            return llvm.call_intrinsic(
+                f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
+            )
+
+        wid = arith.divsi(_to_raw(tid), c_64)  # ∈ [0, NW)
+        lid = arith.remui(_to_raw(tid), c_64)  # ∈ [0, 64)
+
+        # ---- plan row (single dwordx4) ----
+        plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
+        plan_base = ArithValue(pid) * arith.constant(4, type=i32)
+        plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
+        ragged_id = vector.extract(plan_vec, static_position=[0], dynamic_position=[])
+        batch_id = vector.extract(plan_vec, static_position=[1], dynamic_position=[])
+        position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
+        window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
+
+        is_active = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
+        _if_active = scf.IfOp(is_active)
+        with _if_then(_if_active):
+            slot_map_rsrc = buffer_ops.create_buffer_resource(
+                state_slot_mapping, max_size=True
+            )
+            slot = buffer_ops.buffer_load(
+                slot_map_rsrc, batch_id, vec_width=1, dtype=i32
+            )
+
+            # This lane owns columns [lid*VEC, lid*VEC+VEC) of head_dim.
+            lid_x_vec = ArithValue(lid) * c_VEC
+
+            kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
+            score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
+            kv_state_rsrc = buffer_ops.create_buffer_resource(kv_state, max_size=True)
+            score_state_rsrc = buffer_ops.create_buffer_resource(
+                score_state, max_size=True
+            )
+            ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
+
+            def _col_off_for_k(k_i32):
+                if const_expr(not overlap):
+                    return c_zero_i32
+                is_b = arith.cmpi(
+                    CmpIPredicate.sge, k_i32, arith.constant(ratio, type=i32)
+                )
+                return arith.select(is_b, c_D, c_zero_i32)
+
+            def _load_f32_vec(rsrc, off_elems_i32):
+                if const_expr(VEC <= 4):
+                    raw = buffer_ops.buffer_load(
+                        rsrc, off_elems_i32, vec_width=VEC, dtype=f32
+                    )
+                    return [
+                        vector.extract(raw, static_position=[i], dynamic_position=[])
+                        for i in range(VEC)
+                    ]
+                else:
+                    assert VEC == 8
+                    half = VEC // 2
+                    r0 = buffer_ops.buffer_load(
+                        rsrc, off_elems_i32, vec_width=half, dtype=f32
+                    )
+                    r1 = buffer_ops.buffer_load(
+                        rsrc,
+                        ArithValue(off_elems_i32) + arith.constant(half, type=i32),
+                        vec_width=half,
+                        dtype=f32,
+                    )
+                    out = []
+                    for i in range_constexpr(half):
+                        out.append(
+                            vector.extract(r0, static_position=[i], dynamic_position=[])
+                        )
+                    for i in range_constexpr(half):
+                        out.append(
+                            vector.extract(r1, static_position=[i], dynamic_position=[])
+                        )
+                    return out
+
+            def _load_bf16_vec_then_f32(rsrc, off_elems_i32):
+                off_dw = ArithValue(off_elems_i32) >> c_one_i32
+                dwords = (VEC + 1) // 2
+                if const_expr(dwords == 1):
+                    raw_s = buffer_ops.buffer_load(rsrc, off_dw, vec_width=1, dtype=i32)
+                    raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
+                else:
+                    raw = buffer_ops.buffer_load(
+                        rsrc, off_dw, vec_width=dwords, dtype=i32
+                    )
+                vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                out = []
+                for i in range_constexpr(VEC):
+                    bf16_v = vector.extract(
+                        vec_bf16, static_position=[i], dynamic_position=[]
+                    )
+                    out.append(arith.extf(f32, bf16_v))
+                return out
+
+            def _softmax_step(m_lane, kv_lane, w_lane, score_lane, kv_v_lane):
+                """Padding-aware per-lane online-softmax update. Phase 2 scores
+                are finite, so the is-pad branch is dead code there (compiler
+                elides)."""
+                new_m, new_kv, new_w = [], [], []
+                for i in range_constexpr(VEC):
+                    m_old = m_lane[i]
+                    score = score_lane[i]
+                    m_new = arith.maximumf(m_old, score)
+                    is_first = arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
+                    scale_active = fexp_f32(arith.subf(m_old, m_new))
+                    scale_v = arith.select(is_first, c_zero_f32, scale_active)
+                    wk_active = fexp_f32(arith.subf(score, m_new))
+                    is_pad = arith.cmpf(CmpFPredicate.OEQ, score, c_neg_inf)
+                    w_k = arith.select(is_pad, c_zero_f32, wk_active)
+                    new_m.append(m_new)
+                    new_kv.append(
+                        arith.AddFOp(
+                            arith.MulFOp(kv_lane[i], scale_v, fastmath=fm_fast).result,
+                            arith.MulFOp(w_k, kv_v_lane[i], fastmath=fm_fast).result,
+                            fastmath=fm_fast,
+                        ).result
+                    )
+                    new_w.append(
+                        arith.AddFOp(
+                            arith.MulFOp(w_lane[i], scale_v, fastmath=fm_fast).result,
+                            w_k,
+                            fastmath=fm_fast,
+                        ).result
+                    )
+                return new_m, new_kv, new_w
+
+            def _phase1_loads(k_i32):
+                s = arith.addi(arith.subi(_to_raw(position), c_K_m1), k_i32)
+                is_pad = arith.cmpi(CmpIPredicate.slt, s, c_zero_i32)
+                s_safe = arith.select(is_pad, c_zero_i32, s)
+                ring = arith.remui(s_safe, c_state_size)
+                col_off = _col_off_for_k(k_i32)
+                base_kv = (
+                    ArithValue(slot) * ArithValue(kv_state_slot_stride)
+                    + ArithValue(ring) * ArithValue(kv_state_pos_stride)
+                    + ArithValue(col_off)
+                    + lid_x_vec
+                )
+                base_sc = (
+                    ArithValue(slot) * ArithValue(score_state_slot_stride)
+                    + ArithValue(ring) * ArithValue(score_state_pos_stride)
+                    + ArithValue(col_off)
+                    + lid_x_vec
+                )
+                kv_v = _load_f32_vec(kv_state_rsrc, base_kv)
+                sc_v = _load_f32_vec(score_state_rsrc, base_sc)
+                sc_pad = [arith.select(is_pad, c_neg_inf, sc_v[i]) for i in range(VEC)]
+                return kv_v, sc_pad
+
+            def _phase2_loads(k_i32):
+                col_off = _col_off_for_k(k_i32)
+                ape_row = arith.remui(k_i32, arith.constant(ratio, type=i32))
+                in_row_raw = arith.subi(_to_raw(ragged_id), arith.subi(c_K_m1, k_i32))
+                in_row = arith.maxsi(in_row_raw, c_zero_i32)
+                base_in = (
+                    ArithValue(in_row) * ArithValue(kv_in_row_stride)
+                    + ArithValue(col_off)
+                    + lid_x_vec
+                )
+                base_sc = (
+                    ArithValue(in_row) * ArithValue(score_in_row_stride)
+                    + ArithValue(col_off)
+                    + lid_x_vec
+                )
+                base_ape = (
+                    ArithValue(ape_row) * arith.constant(DIM_FULL, type=i32)
+                    + ArithValue(col_off)
+                    + lid_x_vec
+                )
+                kv = _load_bf16_vec_then_f32(kv_in_rsrc, base_in)
+                sc = _load_bf16_vec_then_f32(score_in_rsrc, base_sc)
+                ape_v = _load_f32_vec(ape_rsrc, base_ape)
+                score = [
+                    arith.AddFOp(sc[i], ape_v[i], fastmath=fm_fast).result
+                    for i in range(VEC)
+                ]
+                return kv, score
+
+            # ---- this wave's K range [wid*KPW, (wid+1)*KPW), split at window_len ----
+            k_start = ArithValue(wid) * c_K_per_wave
+            k_end = k_start + c_K_per_wave
+            wl = _to_raw(window_len)
+            split_lo = arith.maxsi(wl, _to_raw(k_start))
+            split = arith.minsi(split_lo, _to_raw(k_end))
+
+            init_m = [c_neg_inf for _ in range(VEC)]
+            init_kv = [c_zero_f32 for _ in range(VEC)]
+            init_w = [c_zero_f32 for _ in range(VEC)]
+            init_state = init_m + init_kv + init_w
+
+            # Phase 1 sub-loop [k_start, split): state cache.
+            p1 = init_state
+            for k_static, state in range(
+                _to_raw(k_start), _to_raw(split), 1, init=init_state
+            ):
+                m_lane = list(state[0:VEC])
+                kv_lane = list(state[VEC : 2 * VEC])
+                w_lane = list(state[2 * VEC : 3 * VEC])
+                k_i32 = arith.index_cast(i32, _to_raw(k_static))
+                kv_v, sc_v = _phase1_loads(k_i32)
+                nm, nkv, nw = _softmax_step(m_lane, kv_lane, w_lane, sc_v, kv_v)
+                p1 = yield list(nm) + list(nkv) + list(nw)
+
+            # Phase 2 sub-loop [split, k_end): ragged input.
+            final = p1
+            for k_static, state in range(_to_raw(split), _to_raw(k_end), 1, init=p1):
+                m_lane = list(state[0:VEC])
+                kv_lane = list(state[VEC : 2 * VEC])
+                w_lane = list(state[2 * VEC : 3 * VEC])
+                k_i32 = arith.index_cast(i32, _to_raw(k_static))
+                kv_v, score = _phase2_loads(k_i32)
+                nm, nkv, nw = _softmax_step(m_lane, kv_lane, w_lane, score, kv_v)
+                final = yield list(nm) + list(nkv) + list(nw)
+
+            m_local = list(final[0:VEC])
+            kv_local = list(final[VEC : 2 * VEC])
+            w_local = list(final[2 * VEC : 3 * VEC])
+
+            # ---- LDS write: each lane writes VEC entries at wid*D + lid*VEC ----
+            lds_base = allocator.get_base()
+            lds_m = STensor(
+                SmemPtr(lds_base, lds_m_off, T.f32, shape=(LDS_ELEMS,)),
+                dtype=T.f32,
+                shape=(LDS_ELEMS,),
+            )
+            lds_kv = STensor(
+                SmemPtr(lds_base, lds_kv_off, T.f32, shape=(LDS_ELEMS,)),
+                dtype=T.f32,
+                shape=(LDS_ELEMS,),
+            )
+            lds_w = STensor(
+                SmemPtr(lds_base, lds_w_off, T.f32, shape=(LDS_ELEMS,)),
+                dtype=T.f32,
+                shape=(LDS_ELEMS,),
+            )
+            lds_thread_base = ArithValue(wid) * c_D + lid_x_vec
+            for i in range_constexpr(VEC):
+                idx_i = lds_thread_base + arith.constant(i, type=i32)
+                lds_m[fx.Index(idx_i)] = m_local[i]
+                lds_kv[fx.Index(idx_i)] = kv_local[i]
+                lds_w[fx.Index(idx_i)] = w_local[i]
+
+            gpu.barrier()
+
+            # ---- wave 0: cross-wave reduce + norm + rope + scatter ----
+            is_wave0 = arith.cmpi(CmpIPredicate.eq, wid, c_zero_i32)
+            _if_w0 = scf.IfOp(is_wave0)
+            with _if_then(_if_w0):
+                comp_lane = []
+                for i in range_constexpr(VEC):
+                    lane_off = lid_x_vec + arith.constant(i, type=i32)
+                    m_g = c_neg_inf
+                    m_arr = []
+                    for w in range_constexpr(NW):
+                        idx_w = arith.constant(w * D, type=i32) + lane_off
+                        m_w = lds_m[fx.Index(idx_w)]
+                        m_arr.append(m_w)
+                        m_g = arith.maximumf(m_g, m_w)
+                    kv_sum = c_zero_f32
+                    w_sum = c_zero_f32
+                    for w in range_constexpr(NW):
+                        idx_w = arith.constant(w * D, type=i32) + lane_off
+                        kv_w = lds_kv[fx.Index(idx_w)]
+                        w_w = lds_w[fx.Index(idx_w)]
+                        scale_w = fexp_f32(arith.subf(m_arr[w], m_g))
+                        kv_sum = arith.AddFOp(
+                            kv_sum,
+                            arith.MulFOp(kv_w, scale_w, fastmath=fm_fast).result,
+                            fastmath=fm_fast,
+                        ).result
+                        w_sum = arith.AddFOp(
+                            w_sum,
+                            arith.MulFOp(w_w, scale_w, fastmath=fm_fast).result,
+                            fastmath=fm_fast,
+                        ).result
+                    rcp_w = llvm.call_intrinsic(
+                        f32, "llvm.amdgcn.rcp.f32", [w_sum], [], []
+                    )
+                    comp_lane.append(
+                        arith.MulFOp(kv_sum, rcp_w, fastmath=fm_fast).result
+                    )
+
+                # ---- RMSNorm (wave-reduce sum-of-squares over wave 0) ----
+                def wave_reduce_add(x):
+                    w = _to_raw(x)
+                    for sh_exp in range_constexpr(log2_block):
+                        off = BLOCK_THREADS // (2 << sh_exp)
+                        peer = _to_raw(ArithValue(w).shuffle_xor(off, BLOCK_THREADS))
+                        w = arith.AddFOp(w, peer, fastmath=fm_fast).result
+                    return w
+
+                sq_local = arith.constant(0.0, type=f32)
+                for i in range_constexpr(VEC):
+                    sq_local = arith.AddFOp(
+                        sq_local,
+                        arith.MulFOp(
+                            comp_lane[i], comp_lane[i], fastmath=fm_fast
+                        ).result,
+                        fastmath=fm_fast,
+                    ).result
+                sq_full = wave_reduce_add(sq_local)
+                var = arith.MulFOp(sq_full, c_inv_D, fastmath=fm_fast).result
+                rrms = fmath.rsqrt(
+                    arith.AddFOp(var, c_eps, fastmath=fm_fast).result, fastmath=fm_fast
+                )
+
+                rmsw_rsrc = buffer_ops.create_buffer_resource(rms_weight, max_size=True)
+                if const_expr(rms_weight_is_bf16):
+                    rmsw_lane = _load_bf16_vec_then_f32(rmsw_rsrc, lid_x_vec)
+                else:
+                    rmsw_lane = _load_f32_vec(rmsw_rsrc, lid_x_vec)
+
+                normed_lane = [
+                    arith.MulFOp(
+                        arith.MulFOp(comp_lane[i], rrms, fastmath=fm_fast).result,
+                        rmsw_lane[i],
+                        fastmath=fm_fast,
+                    ).result
+                    for i in range(VEC)
+                ]
+
+                # ---- GPT-J RoPE on RD tail ----
+                comp_pos_i32 = arith.muli(
+                    arith.divsi(_to_raw(position), arith.constant(ratio, type=i32)),
+                    arith.constant(ratio, type=i32),
+                )
+                cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
+                sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
+                c_half_rd = arith.constant(RD // 2, type=i32)
+                cos_row_base = ArithValue(comp_pos_i32) * c_half_rd
+
+                is_rope_t = arith.cmpi(
+                    CmpIPredicate.sge,
+                    _to_raw(lid),
+                    arith.constant(ROPE_THREAD_LO, type=i32),
+                )
+                rope_rel_raw = ArithValue(lid) - arith.constant(
+                    ROPE_THREAD_LO, type=i32
+                )
+                rope_rel = arith.maxsi(rope_rel_raw, c_zero_i32)
+                cs_lo = ArithValue(rope_rel) * arith.constant(
+                    PAIRS_PER_THREAD, type=i32
+                )
+
+                if const_expr(PAIRS_PER_THREAD == 1):
+                    cos_b = buffer_ops.buffer_load(
+                        cos_rsrc, cos_row_base + cs_lo, vec_width=1, dtype=T.bf16
+                    )
+                    sin_b = buffer_ops.buffer_load(
+                        sin_rsrc, cos_row_base + cs_lo, vec_width=1, dtype=T.bf16
+                    )
+                    cos_vals = [arith.extf(f32, cos_b)]
+                    sin_vals = [arith.extf(f32, sin_b)]
+                else:
+                    cos_vec = buffer_ops.buffer_load(
+                        cos_rsrc,
+                        cos_row_base + cs_lo,
+                        vec_width=PAIRS_PER_THREAD,
+                        dtype=T.bf16,
+                    )
+                    sin_vec = buffer_ops.buffer_load(
+                        sin_rsrc,
+                        cos_row_base + cs_lo,
+                        vec_width=PAIRS_PER_THREAD,
+                        dtype=T.bf16,
+                    )
+                    cos_vals = [
+                        arith.extf(
+                            f32,
+                            vector.extract(
+                                cos_vec, static_position=[i], dynamic_position=[]
+                            ),
+                        )
+                        for i in range(PAIRS_PER_THREAD)
+                    ]
+                    sin_vals = [
+                        arith.extf(
+                            f32,
+                            vector.extract(
+                                sin_vec, static_position=[i], dynamic_position=[]
+                            ),
+                        )
+                        for i in range(PAIRS_PER_THREAD)
+                    ]
+
+                rotated_lane = list(normed_lane)
+                for kk in range_constexpr(PAIRS_PER_THREAD):
+                    e = normed_lane[2 * kk]
+                    o = normed_lane[2 * kk + 1]
+                    cc = cos_vals[kk]
+                    ss = sin_vals[kk]
+                    new_e = arith.subf(
+                        arith.MulFOp(e, cc, fastmath=fm_fast).result,
+                        arith.MulFOp(o, ss, fastmath=fm_fast).result,
+                    )
+                    new_o = arith.AddFOp(
+                        arith.MulFOp(e, ss, fastmath=fm_fast).result,
+                        arith.MulFOp(o, cc, fastmath=fm_fast).result,
+                        fastmath=fm_fast,
+                    ).result
+                    rotated_lane[2 * kk] = new_e
+                    rotated_lane[2 * kk + 1] = new_o
+
+                out_lane = [
+                    arith.select(is_rope_t, rotated_lane[i], normed_lane[i])
+                    for i in range_constexpr(VEC)
+                ]
+
+                # ---- paged scatter (BF16 or FP8). Emitted in wave 0; ``lid``
+                # (0..63) is the single-wave ``tid`` equivalent. ----
+                ci = arith.divsi(_to_raw(position), arith.constant(ratio, type=i32))
+                block_in_seq = arith.divsi(ci, arith.constant(k_per_block, type=i32))
+                slot_in_block = arith.remui(ci, arith.constant(k_per_block, type=i32))
+                bt_rsrc = buffer_ops.create_buffer_resource(block_table, max_size=True)
+                bt_off = ArithValue(batch_id) * ArithValue(
+                    block_table_seq_stride
+                ) + ArithValue(block_in_seq)
+                physical_block = buffer_ops.buffer_load(
+                    bt_rsrc, bt_off, vec_width=1, dtype=i32
+                )
+
+                if const_expr(not quant):
+                    cache_off = (
+                        ArithValue(physical_block) * ArithValue(kv_cache_block_stride)
+                        + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
+                        + lid_x_vec
+                    )
+                    out_vec_t = T.vec(VEC, T.bf16)
+                    raw_vec = vector.from_elements(vecVf32, out_lane)
+                    bf16_vec = raw_vec.truncf(out_vec_t)
+                    out_rsrc = buffer_ops.create_buffer_resource(
+                        kv_cache, max_size=True
+                    )
+                    cache_off_dw = ArithValue(cache_off) >> c_one_i32
+                    dwords = (VEC + 1) // 2
+                    bf16_as_i32 = vector.bitcast(T.vec(dwords, T.i32), bf16_vec)
+                    if const_expr(dwords == 1):
+                        scalar_i32 = vector.extract(
+                            bf16_as_i32, static_position=[0], dynamic_position=[]
+                        )
+                        buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
+                    else:
+                        buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
+                else:
+                    # ── FP8 per-row scaled write + fp32 scale (mirror legacy) ──
+                    # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword
+                    # store via shuffle_xor(1) within the wave.
+                    def wave_reduce_max(x):
+                        w = _to_raw(x)
+                        for sh_exp in range_constexpr(log2_block):
+                            off = BLOCK_THREADS // (2 << sh_exp)
+                            peer = _to_raw(
+                                ArithValue(w).shuffle_xor(off, BLOCK_THREADS)
+                            )
+                            w = arith.maximumf(w, peer)
+                        return w
+
+                    _, fp8_max = _fp8_const()
+                    c_fp8_max = arith.constant(fp8_max, type=f32)
+                    c_neg_fp8_max = arith.constant(-fp8_max, type=f32)
+                    c_safety_floor = arith.constant(1e-4, type=f32)
+                    c_inv_fp8_max = arith.constant(1.0 / fp8_max, type=f32)
+
+                    # (a) per-lane amax → wave-reduce-max
+                    am_local = arith.constant(0.0, type=f32)
+                    for i in range_constexpr(VEC):
+                        abs_v = fmath.absf(out_lane[i])
+                        am_local = arith.maximumf(am_local, abs_v)
+                    amax = wave_reduce_max(am_local)
+                    am_safe = arith.maximumf(amax, c_safety_floor)
+
+                    # (b) scale = am_safe / FP8_MAX, optionally ceil-pow2
+                    scale_raw = arith.MulFOp(
+                        am_safe, c_inv_fp8_max, fastmath=fm_fast
+                    ).result
+                    if const_expr(use_ue8m0):
+                        scale_i32 = scale_raw.bitcast(i32)
+                        bits_up = (
+                            scale_i32 + arith.constant(0x7FFFFF, type=i32)
+                        ) & arith.constant(0xFF800000, type=i32)
+                        scale_v = bits_up.bitcast(f32)
+                    else:
+                        scale_v = scale_raw
+
+                    # (c) inv_scale via rcp.f32
+                    inv_scale = llvm.call_intrinsic(
+                        f32, "llvm.amdgcn.rcp.f32", [scale_v], [], []
+                    )
+
+                    # (d) per-lane fp8 cast: clamp + fnuz NaN guard
+                    c_neg_uf = arith.constant(-(2.0**-8), type=f32)
+                    c_zero = arith.constant(0.0, type=f32)
+                    fp8_inputs = []
+                    for i in range_constexpr(VEC):
+                        v = arith.MulFOp(
+                            out_lane[i], inv_scale, fastmath=fm_fast
+                        ).result
+                        v = arith.minimumf(arith.maximumf(v, c_neg_fp8_max), c_fp8_max)
+                        is_tn = arith.andi(
+                            arith.cmpf(CmpFPredicate.OLT, v, c_zero),
+                            arith.cmpf(CmpFPredicate.OGT, v, c_neg_uf),
+                        )
+                        v_safe = arith.select(is_tn, c_zero, v)
+                        fp8_inputs.append(v_safe)
+
+                    # (e) pack VEC fp32 → VEC fp8 bytes
+                    c_p0 = arith.constant(0, type=i32)
+                    if const_expr(VEC == 2):
+                        pk = rocdl.cvt_pk_fp8_f32(
+                            i32, fp8_inputs[0], fp8_inputs[1], c_p0, 0
+                        )
+                        peer_pk = ArithValue(pk).shuffle_xor(1, BLOCK_THREADS)
+                        dword = ArithValue(pk) | (
+                            ArithValue(peer_pk) << arith.constant(16, type=i32)
+                        )
+                    elif const_expr(VEC == 4):
+                        pk = rocdl.cvt_pk_fp8_f32(
+                            i32, fp8_inputs[0], fp8_inputs[1], c_p0, 0
+                        )
+                        pk = rocdl.cvt_pk_fp8_f32(
+                            i32, fp8_inputs[2], fp8_inputs[3], pk, 1
+                        )
+                        dword = pk
+                    else:
+                        assert VEC == 8
+                        p0 = rocdl.cvt_pk_fp8_f32(
+                            i32, fp8_inputs[0], fp8_inputs[1], c_p0, 0
+                        )
+                        p0 = rocdl.cvt_pk_fp8_f32(
+                            i32, fp8_inputs[2], fp8_inputs[3], p0, 1
+                        )
+                        p1 = rocdl.cvt_pk_fp8_f32(
+                            i32, fp8_inputs[4], fp8_inputs[5], c_p0, 0
+                        )
+                        p1 = rocdl.cvt_pk_fp8_f32(
+                            i32, fp8_inputs[6], fp8_inputs[7], p1, 1
+                        )
+                        dword = (p0, p1)
+
+                    out_rsrc = buffer_ops.create_buffer_resource(
+                        kv_cache, max_size=True
+                    )
+                    block_byte_base = ArithValue(physical_block) * ArithValue(
+                        kv_cache_block_stride
+                    )
+
+                    if const_expr(preshuffle):
+                        c_TILE = arith.constant(_PRESHUFFLE_TILE, type=i32)
+                        c_TILE_D = arith.constant(_PRESHUFFLE_TILE * D, type=i32)
+                        c_TILE_TILE = arith.constant(
+                            _PRESHUFFLE_TILE * _PRESHUFFLE_TILE, type=i32
+                        )
+                        token_tile_id = arith.divsi(slot_in_block, c_TILE)
+                        token_in_tile = arith.remui(slot_in_block, c_TILE)
+                        d_for_tid = ArithValue(lid) * arith.constant(VEC, type=i32)
+                        col_tile_id = arith.divsi(d_for_tid, c_TILE)
+                        col_in_tile = arith.remui(d_for_tid, c_TILE)
+                        in_block_off = (
+                            ArithValue(token_tile_id) * c_TILE_D
+                            + ArithValue(col_tile_id) * c_TILE_TILE
+                            + ArithValue(token_in_tile) * c_TILE
+                            + ArithValue(col_in_tile)
+                        )
+                    else:
+                        in_block_off = ArithValue(slot_in_block) * arith.constant(
+                            D, type=i32
+                        ) + ArithValue(lid) * arith.constant(VEC, type=i32)
+
+                    byte_off = block_byte_base + in_block_off
+
+                    if const_expr(VEC == 2):
+                        is_even = arith.cmpi(
+                            CmpIPredicate.eq,
+                            arith.andi(_to_raw(lid), arith.constant(1, type=i32)),
+                            arith.constant(0, type=i32),
+                        )
+                        _if_even = scf.IfOp(is_even)
+                        with _if_then(_if_even):
+                            buffer_ops.buffer_store(
+                                dword, out_rsrc, byte_off, offset_is_bytes=True
+                            )
+                    elif const_expr(VEC == 4):
+                        buffer_ops.buffer_store(
+                            dword, out_rsrc, byte_off, offset_is_bytes=True
+                        )
+                    else:
+                        store_vec = vector.from_elements(
+                            T.vec(2, i32), [dword[0], dword[1]]
+                        )
+                        buffer_ops.buffer_store(
+                            store_vec, out_rsrc, byte_off, offset_is_bytes=True
+                        )
+
+                    # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
+                    is_lane0 = arith.cmpi(
+                        CmpIPredicate.eq,
+                        _to_raw(lid),
+                        arith.constant(0, type=i32),
+                    )
+                    _if_l0 = scf.IfOp(is_lane0)
+                    with _if_then(_if_l0):
+                        cs_rsrc = buffer_ops.create_buffer_resource(
+                            cache_scale, max_size=True
+                        )
+                        cs_off = ArithValue(physical_block) * ArithValue(
+                            cache_scale_block_stride
+                        ) + ArithValue(slot_in_block)
+                        buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
+
+    @flyc.jit
+    def launch_fused_compress_attn_ksplit(
+        kv_in: fx.Tensor,
+        kv_in_row_stride: fx.Int32,
+        score_in: fx.Tensor,
+        score_in_row_stride: fx.Int32,
+        plan: fx.Tensor,
+        kv_state: fx.Tensor,
+        kv_state_slot_stride: fx.Int32,
+        kv_state_pos_stride: fx.Int32,
+        score_state: fx.Tensor,
+        score_state_slot_stride: fx.Int32,
+        score_state_pos_stride: fx.Int32,
+        state_slot_mapping: fx.Tensor,
+        ape: fx.Tensor,
+        rms_weight: fx.Tensor,
+        cos_cache: fx.Tensor,
+        sin_cache: fx.Tensor,
+        kv_cache: fx.Tensor,
+        kv_cache_block_stride: fx.Int32,
+        kv_cache_token_stride: fx.Int32,
+        cache_scale: fx.Tensor,
+        cache_scale_block_stride: fx.Int32,
+        block_table: fx.Tensor,
+        block_table_seq_stride: fx.Int32,
+        plan_capacity: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+
+        idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
+        k = kernel(
+            kv_in,
+            kv_in_row_stride,
+            score_in,
+            score_in_row_stride,
+            plan,
+            kv_state,
+            kv_state_slot_stride,
+            kv_state_pos_stride,
+            score_state,
+            score_state_slot_stride,
+            score_state_pos_stride,
+            state_slot_mapping,
+            ape,
+            rms_weight,
+            cos_cache,
+            sin_cache,
+            kv_cache,
+            kv_cache_block_stride,
+            kv_cache_token_stride,
+            cache_scale,
+            cache_scale_block_stride,
+            block_table,
+            block_table_seq_stride,
+        )
+        k.launch(
+            grid=(idx_p, 1, 1),
+            block=(BLOCK_TH, 1, 1),
+            stream=stream,
+        )
+
+    return launch_fused_compress_attn_ksplit
+
+
+# ============================================================================
 # Cached compile + public API
 # ============================================================================
 
@@ -1259,6 +2136,66 @@ def compile_flydsl_fused_compress_attn(
     return launcher
 
 
+def csa_ksplit_num_waves(plan_capacity: int) -> int:
+    """Auto-pick ``k_split_num_waves`` for the CSA Main BF16 path
+    (D=512, RD=64, ratio=4, overlap, K=8) and the CSA Indexer FP8 path
+    (D=128, RD=64, ratio=4, overlap, K=8) on MI355X. Returns 1 to mean
+    "use the legacy single-wave kernel".
+
+    Rationale (measured, MI355X): the multi-wave LDS K-split parallelizes the
+    serial online-softmax chain that bottlenecks the latency-bound small-N
+    regime (decode: plan_capacity ≤ ~528 always). It wins ~22-30% (BF16) /
+    ~15-24% (FP8) there. At high N the per-boundary CU occupancy is already
+    saturated, so the extra NW× blocks + LDS reduce become pure overhead and
+    the kernel regresses past plan_capacity ≈ 1300. NW=4 beats NW=8 (8-wave
+    LDS fold costs more than the 2 extra K-iters it removes for K=8) and
+    beats NW=2 across both shapes' decode range.
+
+    Dispatch on ``plan_capacity`` (NOT num_compress): it's the grid size and
+    is CUDAGraph-stable (baked into captured launch args), so captured graphs
+    select the same kernel they were traced with.
+    """
+    if plan_capacity <= 768:
+        return 4
+    if plan_capacity <= 1280:
+        return 2
+    return 1  # legacy single-wave
+
+
+@lru_cache(maxsize=32)
+def compile_flydsl_fused_compress_attn_ksplit(
+    *,
+    head_dim: int,
+    rope_head_dim: int,
+    ratio: int,
+    overlap: bool,
+    state_size: int,
+    k_per_block: int,
+    k_split_num_waves: int,
+    quant: bool,
+    use_ue8m0: bool,
+    preshuffle: bool,
+    rms_weight_is_bf16: bool,
+    rms_eps: float,
+):
+    launcher = _build_kernel_ksplit(
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        ratio=ratio,
+        overlap=overlap,
+        state_size=state_size,
+        k_per_block=k_per_block,
+        k_split_num_waves=k_split_num_waves,
+        quant=quant,
+        use_ue8m0=use_ue8m0,
+        preshuffle=preshuffle,
+        rms_weight_is_bf16=rms_weight_is_bf16,
+        rms_eps=rms_eps,
+    )
+    launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
+    return launcher
+
+
 def flydsl_fused_compress_attn(
     *,
     kv_in: torch.Tensor,  # [num_q_tokens, DIM_FULL] bf16
@@ -1283,6 +2220,7 @@ def flydsl_fused_compress_attn(
     cache_scale: Optional[torch.Tensor] = None,  # fp32 [NB, k_per_block]
     use_ue8m0: bool = True,
     preshuffle: bool = True,
+    k_split_num_waves: Optional[int] = None,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> None:
     """FlyDSL drop-in replacement for ``fused_compress_attn`` (Triton).
@@ -1290,6 +2228,15 @@ def flydsl_fused_compress_attn(
     Same side-effecting semantics: cache scatter IS the output. Caller MUST
     invoke BEFORE ``update_compressor_states`` (state cache reads must see
     previous-fwd data).
+
+    ``k_split_num_waves`` (BF16 or FP8 scatter): when set to NW > 1, routes to
+    the multi-wave LDS K-split kernel (block = 64*NW, K split across NW waves,
+    single dispatch). Speeds up the latency-bound decode regime (small N,
+    1 wave/CU) where the legacy single-wave serial K-chain stalls. Requires a
+    real ``block_tables`` (has_block_table). When None, auto-picks NW for the
+    tuned CSA Main (BF16) and CSA Indexer (FP8) shapes via
+    :func:`csa_ksplit_num_waves` and uses legacy elsewhere; when 1, forces
+    legacy. K must be divisible by NW.
     """
     # ---- input validation ----
     plan_capacity = plan_gpu.shape[0]
@@ -1403,6 +2350,75 @@ def flydsl_fused_compress_attn(
         cs_arg = rms_weight  # fp32 dummy
         cs_block_stride = 0
 
+    # ---- K-split fast path (BF16 + FP8 scatter) ----
+    # k_split_num_waves: None ⟹ auto-pick (tuned geometries only); int>1 ⟹
+    # forced NW; 1 ⟹ forced legacy. Auto triggers for the CSA Main (BF16) and
+    # CSA Indexer (FP8) shapes the K-split kernel was tuned for; other shapes
+    # fall through to the legacy single-wave kernel.
+    _is_csa_main = (
+        head_dim == 512 and rope_head_dim == 64 and ratio == 4 and overlap and not quant
+    )
+    _is_csa_indexer = (
+        head_dim == 128 and rope_head_dim == 64 and ratio == 4 and overlap and quant
+    )
+    if k_split_num_waves is None and has_bt and (_is_csa_main or _is_csa_indexer):
+        nw_eff = csa_ksplit_num_waves(plan_capacity)
+    else:
+        nw_eff = k_split_num_waves if k_split_num_waves is not None else 1
+    use_ksplit = nw_eff > 1 and has_bt
+    if use_ksplit:
+        k_split_num_waves = nw_eff
+        if K_pool % k_split_num_waves != 0:
+            raise ValueError(
+                f"k_split_num_waves={k_split_num_waves} must divide K={K_pool}"
+            )
+        ks_launcher = compile_flydsl_fused_compress_attn_ksplit(
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            ratio=ratio,
+            overlap=overlap,
+            state_size=state_size,
+            k_per_block=k_per_block,
+            k_split_num_waves=int(k_split_num_waves),
+            quant=quant,
+            use_ue8m0=use_ue8m0,
+            preshuffle=preshuffle,
+            rms_weight_is_bf16=_rms_weight_is_bf16,
+            rms_eps=float(rms_eps),
+        )
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        fx_stream = Stream(stream)
+        ks_args = (
+            kv_in,
+            kv_in.stride(0),
+            score_in,
+            score_in.stride(0),
+            plan_gpu,
+            kv_state,
+            kv_state.stride(0),
+            kv_state.stride(1),
+            score_state,
+            score_state.stride(0),
+            score_state.stride(1),
+            state_slot_mapping,
+            ape,
+            rms_weight,
+            cos_2d,
+            sin_2d,
+            kv_cache_arg,
+            kv_cache_block_stride,
+            kv_cache_token_stride,
+            cs_arg,
+            cs_block_stride,
+            bt_arg,
+            bt_seq_stride,
+            plan_capacity,
+            fx_stream,
+        )
+        _run_compiled(ks_launcher, *ks_args)
+        return
+
     launcher = compile_flydsl_fused_compress_attn(
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
@@ -1422,7 +2438,7 @@ def flydsl_fused_compress_attn(
         stream = torch.cuda.current_stream()
     fx_stream = Stream(stream)
 
-    launcher(
+    args = (
         kv_in,
         kv_in.stride(0),
         score_in,
@@ -1447,5 +2463,6 @@ def flydsl_fused_compress_attn(
         bt_arg,
         bt_seq_stride,
         plan_capacity,
-        stream=fx_stream,
+        fx_stream,
     )
+    _run_compiled(launcher, *args)

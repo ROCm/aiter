@@ -1479,8 +1479,7 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
     "_mla_decode_fwd_kernel",
     [
         "num_query_heads",
-        "num_queries_per_kv",
-        "num_tokens_per_seq",
+        "num_kv_heads",
         "TILE_SIZE",
         "KV_LORA_RANK",
         "QK_ROPE_HEAD_DIM",
@@ -1542,6 +1541,7 @@ def _mla_decode_fwd_kernel(
     QUERY_DTYPE: gl.constexpr = "bf16",  # bool
     KV_CACHE_DTYPE: gl.constexpr = "bf16",  # bool
     BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
+    NUM_HEAD_BLOCKS: gl.constexpr = 1,  # int
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -1579,15 +1579,20 @@ def _mla_decode_fwd_kernel(
     kv_head_idx = gl.program_id(1)
     segm_idx = gl.program_id(2)
 
-    num_q_blocks_per_seq = cdiv_fn(num_tokens_per_seq, BLOCK_Q)
+    num_token_blocks_per_seq = cdiv_fn(num_tokens_per_seq, BLOCK_Q)
+    num_q_blocks_per_seq = num_token_blocks_per_seq * NUM_HEAD_BLOCKS
 
     if cfg.ALL_DECODE:
-        seq_idx = q_block_global_idx
+        seq_idx = q_block_global_idx // NUM_HEAD_BLOCKS
     else:
         seq_idx = q_block_global_idx // num_q_blocks_per_seq
+    q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
 
     q_start_idx = gl.load(query_start_len_ptr + seq_idx)
-    q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
+
+    token_q_block_local_idx = q_block_local_idx // NUM_HEAD_BLOCKS
+    head_block_idx = q_block_local_idx % NUM_HEAD_BLOCKS
+    head_offset = head_block_idx * BLOCK_M
 
     # sequence len for this particular sequence
     seq_len = gl.load(seq_lens_ptr + seq_idx)
@@ -1654,11 +1659,13 @@ def _mla_decode_fwd_kernel(
     )
 
     query_pos_lora = (
-        q_block_local_idx * BLOCK_Q + offs_q_m_lora // cfg.NUM_QUERIES_PER_KV
+        token_q_block_local_idx * BLOCK_Q + offs_q_m_lora // cfg.NUM_QUERIES_PER_KV
     )
     query_offset_0_lora = q_start_idx + query_pos_lora
     query_offset_1_lora = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_lora % cfg.NUM_QUERIES_PER_KV
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV
+        + head_offset
+        + offs_q_m_lora % cfg.NUM_QUERIES_PER_KV
     )
     query_offset_lora = (
         query_offset_0_lora[:, None] * query_stride_0
@@ -1677,11 +1684,13 @@ def _mla_decode_fwd_kernel(
     Q_lora = q_lora_shared.load(layout=cfg.Q_DOT_LAYOUT)
 
     query_pos_rope = (
-        q_block_local_idx * BLOCK_Q + offs_q_m_rope // cfg.NUM_QUERIES_PER_KV
+        token_q_block_local_idx * BLOCK_Q + offs_q_m_rope // cfg.NUM_QUERIES_PER_KV
     )
     query_offset_0_rope = q_start_idx + query_pos_rope
     query_offset_1_rope = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_rope % cfg.NUM_QUERIES_PER_KV
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV
+        + head_offset
+        + offs_q_m_rope % cfg.NUM_QUERIES_PER_KV
     )
     query_offset_rope = (
         query_offset_0_rope[:, None] * query_stride_0
@@ -1775,14 +1784,17 @@ def _mla_decode_fwd_kernel(
     offs_q_m_qk = gl.arange(
         0, BLOCK_M, layout=gl.SliceLayout(1, cfg.QK_WMMA_UNPACKED_LAYOUT)
     )
-    query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // cfg.NUM_QUERIES_PER_KV
+    query_pos_qk = (
+        token_q_block_local_idx * BLOCK_Q + offs_q_m_qk // cfg.NUM_QUERIES_PER_KV
+    )
     query_offset_0_qk = q_start_idx + query_pos_qk
     query_offset_1_qk = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_qk % cfg.NUM_QUERIES_PER_KV
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV
+        + head_offset
+        + offs_q_m_qk % cfg.NUM_QUERIES_PER_KV
     )
     query_mask_0_qk = query_pos_qk < num_tokens_per_seq
     query_mask_1_qk = query_offset_1_qk < num_query_heads
-    # query_mask_qk = query_mask_1_qk[:, None] & query_mask_0_qk[:, None]
 
     query_offset_0_pv = gl.convert_layout(
         query_offset_0_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
@@ -1798,10 +1810,10 @@ def _mla_decode_fwd_kernel(
     )
 
     # compute the length of the longest sequence prefix spanned by any
-    # query token in the current q_block (q_block_local_idx)
+    # query token in the current q_block (token_q_block_local_idx)
     max_seq_prefix_len = (
         context_len
-        + q_block_local_idx * BLOCK_Q
+        + token_q_block_local_idx * BLOCK_Q
         + (BLOCK_M - 1) // cfg.NUM_QUERIES_PER_KV
         + 1
     )
@@ -1816,7 +1828,7 @@ def _mla_decode_fwd_kernel(
         segm_max_ptr,
         segm_expsum_ptr,
         max_seq_prefix_len,
-        q_block_local_idx,
+        token_q_block_local_idx,
         num_q_blocks_per_seq,
         context_len,
         kv_head_idx,
@@ -2033,6 +2045,7 @@ _mla_prefill_fwd_kernel_non_pipelined_repr = make_kernel_repr(
         "QK_ROPE_HEAD_DIM",
         "BLOCK_Q",
         "BLOCK_M",
+        "NUM_HEAD_BLOCKS",
         "NUM_SEGMENTS_PER_SEQ",
         "num_warps",
         "num_stages",
@@ -2072,6 +2085,7 @@ def _mla_prefill_fwd_kernel_non_pipelined(
     WARP_SIZE: gl.constexpr,  # int
     num_warps: gl.constexpr,  # int
     num_stages: gl.constexpr,  # int
+    NUM_HEAD_BLOCKS: gl.constexpr = 1,  # int
     QUERY_DTYPE: gl.constexpr = "bf16",  # bool
     KV_CACHE_DTYPE: gl.constexpr = "bf16",  # bool
     K_WIDTH: gl.constexpr = 0,  # int
@@ -2107,13 +2121,18 @@ def _mla_prefill_fwd_kernel_non_pipelined(
     kv_head_idx = gl.program_id(0)
     q_block_global_idx = gl.program_id(1)
 
+    # split the flat block index into a token-block part and a head-block part
+    token_q_block_global_idx = q_block_global_idx // NUM_HEAD_BLOCKS
+    head_block_idx = q_block_global_idx % NUM_HEAD_BLOCKS
+    head_offset = head_block_idx * BLOCK_M
+
     seq_idx = _find_seq_idx(
-        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+        query_start_len_ptr, token_q_block_global_idx, num_seqs, BLOCK_Q, True
     )
 
     q_block_start_idx = gl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
 
-    q_block_local_idx = q_block_global_idx - q_block_start_idx
+    q_block_local_idx = token_q_block_global_idx - q_block_start_idx
 
     cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx)
     cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
@@ -2204,7 +2223,9 @@ def _mla_prefill_fwd_kernel_non_pipelined(
 
     query_offset_0_lora = cur_batch_in_all_start_index + query_pos_lora
     query_offset_1_lora = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_lora % cfg.NUM_QUERIES_PER_KV
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV
+        + head_offset
+        + offs_q_m_lora % cfg.NUM_QUERIES_PER_KV
     )
     query_offset_lora = (
         query_offset_0_lora[:, None] * query_stride_0
@@ -2227,7 +2248,9 @@ def _mla_prefill_fwd_kernel_non_pipelined(
     )
     query_offset_0_rope = cur_batch_in_all_start_index + query_pos_rope
     query_offset_1_rope = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_rope % cfg.NUM_QUERIES_PER_KV
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV
+        + head_offset
+        + offs_q_m_rope % cfg.NUM_QUERIES_PER_KV
     )
     query_offset_rope = (
         query_offset_0_rope[:, None] * query_stride_0
@@ -2249,7 +2272,9 @@ def _mla_prefill_fwd_kernel_non_pipelined(
     query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // cfg.NUM_QUERIES_PER_KV
     # query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
     query_offset_1_qk = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_qk % cfg.NUM_QUERIES_PER_KV
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV
+        + head_offset
+        + offs_q_m_qk % cfg.NUM_QUERIES_PER_KV
     )
     # query_offset_qk = (
     #     query_offset_0_qk[:, None] * query_stride_0
@@ -2404,7 +2429,9 @@ def _mla_prefill_fwd_kernel_non_pipelined(
     query_pos_pv = q_block_local_idx * BLOCK_Q + offs_q_m_pv // cfg.NUM_QUERIES_PER_KV
     query_offset_0_pv = cur_batch_in_all_start_index + query_pos_pv
     query_offset_1_pv = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_pv % cfg.NUM_QUERIES_PER_KV
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV
+        + head_offset
+        + offs_q_m_pv % cfg.NUM_QUERIES_PER_KV
     )
     query_mask_0_pv = query_pos_pv < cur_batch_query_len
     query_mask_1_pv = query_offset_1_pv < num_query_heads
@@ -2433,6 +2460,7 @@ _mla_decode_fwd_kernel_non_pipelined_repr = make_kernel_repr(
         "QK_ROPE_HEAD_DIM",
         "BLOCK_Q",
         "BLOCK_M",
+        "NUM_HEAD_BLOCKS",
         "NUM_SEGMENTS_PER_SEQ",
         "num_warps",
         "num_stages",
@@ -2446,17 +2474,21 @@ def _mla_decode_fwd_kernel_non_pipelined(
     segm_max_ptr,  # [total_num_tokens, num_query_heads, num_segments]
     segm_expsum_ptr,  # [total_num_tokens, num_query_heads, num_segments]
     query_ptr,  # [total_num_tokens, num_query_heads, head_size]
+    query_scales_ptr,  # nvfp4 query scales (unused for non-shuffled bf16/fp8)
     kv_buffer_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
     SCALE: gl.constexpr,  # float32
     q_scale_ptr,  # float32
     kv_scale_ptr,  # float32
+    out_scale_ptr,  # float32 (only set when NUM_SEGMENTS_PER_SEQ == 1)
     num_query_heads: gl.constexpr,  # int
     num_kv_heads: gl.constexpr,  # int
     block_tables_stride: gl.int64,  # int
     query_stride_0: gl.int64,  # int
     query_stride_1: gl.int64,  # int, should be equal to head_size
+    query_scales_stride_0: gl.int64,  # int
+    query_scales_stride_1: gl.int64,  # int
     KV_LORA_RANK: gl.constexpr,  # int
     QK_ROPE_HEAD_DIM: gl.constexpr,  # int
     stride_kv_buffer_0: gl.int64,  # int
@@ -2473,12 +2505,24 @@ def _mla_decode_fwd_kernel_non_pipelined(
     WARP_SIZE: gl.constexpr,  # int
     num_warps: gl.constexpr,  # int
     num_stages: gl.constexpr,  # int
+    NUM_HEAD_BLOCKS: gl.constexpr = 1,  # int
     SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
     ALL_DECODE: gl.constexpr = False,  # bool
-    IS_Q_FP8: gl.constexpr = False,  # bool
-    IS_KV_FP8: gl.constexpr = False,  # bool
+    K_WIDTH: gl.constexpr = 0,  # int
+    SCALE_K_WIDTH_LORA: gl.constexpr = 16,  # int
+    SCALE_K_WIDTH_ROPE: gl.constexpr = 16,  # int
+    QUERY_DTYPE: gl.constexpr = "bf16",  # str: "bf16" | "fp8"
+    KV_CACHE_DTYPE: gl.constexpr = "bf16",  # str: "bf16" | "fp8"
+    BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
 ):
     assert not SHUFFLED_KV_CACHE
+    # Non-shuffled KV cache only supports bf16/fp8 query: nvfp4 query requires a
+    # shuffled cache (handled by the pipelined kernel). query_scales_ptr is
+    # accepted so the launch signature matches the pipelined kernel, but it is
+    # only consumed for nvfp4, which never reaches this path.
+    assert QUERY_DTYPE == "bf16" or QUERY_DTYPE == "fp8"
+    IS_Q_FP8: gl.constexpr = QUERY_DTYPE == "fp8"
+    IS_KV_FP8: gl.constexpr = KV_CACHE_DTYPE == "fp8"
     cfg = MLAConfig(
         KV_LORA_RANK,
         QK_ROPE_HEAD_DIM,
@@ -2496,22 +2540,32 @@ def _mla_decode_fwd_kernel_non_pipelined(
         False,
         False,
         SHUFFLED_KV_CACHE,
-        IS_Q_FP8,
-        IS_KV_FP8,
+        QUERY_DTYPE,
+        KV_CACHE_DTYPE,
+        ALL_DECODE,
+        K_WIDTH,
+        SCALE_K_WIDTH_LORA,
+        SCALE_K_WIDTH_ROPE,
+        BLOCK_SCALES_SIZE,
     )
     q_block_global_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
     segm_idx = gl.program_id(2)
 
-    num_q_blocks_per_seq = cdiv_fn(num_tokens_per_seq, BLOCK_Q)
+    num_token_blocks_per_seq = cdiv_fn(num_tokens_per_seq, BLOCK_Q)
+    num_q_blocks_per_seq = num_token_blocks_per_seq * NUM_HEAD_BLOCKS
 
     if ALL_DECODE:
-        seq_idx = q_block_global_idx
+        seq_idx = q_block_global_idx // NUM_HEAD_BLOCKS
     else:
         seq_idx = q_block_global_idx // num_q_blocks_per_seq
 
     q_start_idx = gl.load(query_start_len_ptr + seq_idx)
     q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
+
+    token_q_block_local_idx = q_block_local_idx // NUM_HEAD_BLOCKS
+    head_block_idx = q_block_local_idx % NUM_HEAD_BLOCKS
+    head_offset = head_block_idx * BLOCK_M
 
     # sequence len for this particular sequence
     seq_len = gl.load(seq_lens_ptr + seq_idx)
@@ -2595,11 +2649,13 @@ def _mla_decode_fwd_kernel_non_pipelined(
     )
 
     query_pos_lora = (
-        q_block_local_idx * BLOCK_Q + offs_q_m_lora // cfg.NUM_QUERIES_PER_KV
+        token_q_block_local_idx * BLOCK_Q + offs_q_m_lora // cfg.NUM_QUERIES_PER_KV
     )
     query_offset_0_lora = q_start_idx + query_pos_lora
     query_offset_1_lora = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_lora % cfg.NUM_QUERIES_PER_KV
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV
+        + head_offset
+        + offs_q_m_lora % cfg.NUM_QUERIES_PER_KV
     )
     query_offset_lora = (
         query_offset_0_lora[:, None] * query_stride_0
@@ -2618,11 +2674,13 @@ def _mla_decode_fwd_kernel_non_pipelined(
     Q_lora = q_lora_shared.load(layout=cfg.Q_DOT_LAYOUT)
 
     query_pos_rope = (
-        q_block_local_idx * BLOCK_Q + offs_q_m_rope // cfg.NUM_QUERIES_PER_KV
+        token_q_block_local_idx * BLOCK_Q + offs_q_m_rope // cfg.NUM_QUERIES_PER_KV
     )
     query_offset_0_rope = q_start_idx + query_pos_rope
     query_offset_1_rope = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_rope % cfg.NUM_QUERIES_PER_KV
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV
+        + head_offset
+        + offs_q_m_rope % cfg.NUM_QUERIES_PER_KV
     )
     query_offset_rope = (
         query_offset_0_rope[:, None] * query_stride_0
@@ -2641,10 +2699,14 @@ def _mla_decode_fwd_kernel_non_pipelined(
     Q_rope = q_rope_shared.load(layout=cfg.Q_DOT_LAYOUT)
 
     offs_q_m_qk = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.QK_WMMA_LAYOUT))
-    query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // cfg.NUM_QUERIES_PER_KV
+    query_pos_qk = (
+        token_q_block_local_idx * BLOCK_Q + offs_q_m_qk // cfg.NUM_QUERIES_PER_KV
+    )
     query_offset_0_qk = q_start_idx + query_pos_qk
     query_offset_1_qk = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_qk % cfg.NUM_QUERIES_PER_KV
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV
+        + head_offset
+        + offs_q_m_qk % cfg.NUM_QUERIES_PER_KV
     )
     query_mask_0_qk = query_pos_qk < num_tokens_per_seq
     query_mask_1_qk = query_offset_1_qk < num_query_heads
@@ -2667,10 +2729,10 @@ def _mla_decode_fwd_kernel_non_pipelined(
     context_len = seq_len - num_tokens_per_seq
 
     # compute the length of the longest sequence prefix spanned by any
-    # query token in the current q_block (q_block_local_idx)
+    # query token in the current q_block (token_q_block_local_idx)
     max_seq_prefix_len = (
         context_len
-        + q_block_local_idx * BLOCK_Q
+        + token_q_block_local_idx * BLOCK_Q
         + (BLOCK_M - 1) // cfg.NUM_QUERIES_PER_KV
         + 1
     )
@@ -2780,10 +2842,14 @@ def _mla_decode_fwd_kernel_non_pipelined(
     offs_q_d_lora_pv = gl.arange(
         0, KV_LORA_RANK, layout=gl.SliceLayout(0, cfg.PV_WMMA_LAYOUT)
     )
-    query_pos_pv = q_block_local_idx * BLOCK_Q + offs_q_m_pv // cfg.NUM_QUERIES_PER_KV
+    query_pos_pv = (
+        token_q_block_local_idx * BLOCK_Q + offs_q_m_pv // cfg.NUM_QUERIES_PER_KV
+    )
     query_offset_0_pv = q_start_idx + query_pos_pv
     query_offset_1_pv = (
-        kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_pv % cfg.NUM_QUERIES_PER_KV
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV
+        + head_offset
+        + offs_q_m_pv % cfg.NUM_QUERIES_PER_KV
     )
     query_mask_0_pv = query_pos_pv < num_tokens_per_seq
     query_mask_1_pv = query_offset_1_pv < num_query_heads
@@ -2807,3 +2873,160 @@ def _mla_decode_fwd_kernel_non_pipelined(
     )
     gl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0_qk & query_mask_1_qk)
     gl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0_qk & query_mask_1_qk)
+
+
+_mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
+    "_mla_decode_fwd_reduce_kernel",
+    [
+        "num_query_heads",
+        "TILE_SIZE",
+        "KV_LORA_RANK",
+        "NUM_SEGMENTS_PER_SEQ",
+        "ALL_DECODE",
+        "num_warps",
+    ],
+)
+
+
+@gluon.jit(repr=_mla_decode_fwd_reduce_kernel_repr)
+def _mla_decode_fwd_reduce_kernel(
+    output_ptr,  # [num_tokens, num_query_heads, head_size]
+    segm_output_ptr,
+    # [num_tokens, num_query_heads, max_num_segments, head_size]
+    segm_max_ptr,  # [num_tokens, num_query_heads, max_num_segments]
+    segm_expsum_ptr,  # [num_tokens, num_query_heads, max_num_segments]
+    seq_lens_ptr,  # [num_seqs]
+    out_scale_ptr,  # float32
+    num_seqs,  # int
+    num_query_heads: gl.constexpr,  # int
+    output_stride_0: gl.int64,  # int
+    output_stride_1: gl.int64,  # int, should be equal to head_size
+    block_tables_stride: gl.int64,  # int
+    num_tokens_per_seq: gl.int32,
+    total_num_tokens: gl.int32,
+    TILE_SIZE: gl.constexpr,  # int
+    KV_LORA_RANK: gl.constexpr,  # int
+    query_start_len_ptr,  # [num_seqs+1]
+    BLOCK_Q: gl.constexpr,  # int
+    NUM_SEGMENTS_PER_SEQ: gl.constexpr,  # int
+    num_warps: gl.constexpr = 2,
+    waves_per_eu: gl.constexpr = 2,
+    num_stages: gl.constexpr = 1,
+    ALL_DECODE: gl.constexpr = False,  # int
+    FP8_MIN: gl.constexpr = float8_info.min,
+    FP8_MAX: gl.constexpr = float8_info.max,
+):
+    WARP_SIZE: gl.constexpr = 32
+
+    # All parallelism along KV_LORA_RANK; segments are per-thread so
+    # gl.max / gl.sum along axis=0 are thread-local reductions.
+    tpw_d: gl.constexpr = gl.constexpr(min(WARP_SIZE, KV_LORA_RANK))
+    wpc_d: gl.constexpr = gl.constexpr(
+        min(num_warps, KV_LORA_RANK // min(WARP_SIZE, KV_LORA_RANK))
+    )
+    spt_d: gl.constexpr = gl.constexpr(
+        KV_LORA_RANK
+        // (
+            min(WARP_SIZE, KV_LORA_RANK)
+            * min(num_warps, KV_LORA_RANK // min(WARP_SIZE, KV_LORA_RANK))
+        )
+    )
+    REDUCE_LAYOUT: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[NUM_SEGMENTS_PER_SEQ, spt_d],
+        threads_per_warp=[1, tpw_d],
+        warps_per_cta=[1, wpc_d],
+        order=[1, 0],
+    )
+    SEGM_LAYOUT: gl.constexpr = gl.SliceLayout(1, REDUCE_LAYOUT)
+    OUTPUT_LAYOUT: gl.constexpr = gl.SliceLayout(0, REDUCE_LAYOUT)
+
+    SEGM_OUTPUT_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1,
+        per_phase=1,
+        max_phase=1,
+        order=[1, 0],
+    )
+
+    query_token_idx = gl.program_id(0)
+    query_head_idx = gl.program_id(1)
+
+    # TDM async load segm_output into shared memory
+    SEGM_OUTPUT_COLS: gl.constexpr = gl.constexpr(NUM_SEGMENTS_PER_SEQ * KV_LORA_RANK)
+    total_rows = total_num_tokens * num_query_heads
+    segm_output_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=segm_output_ptr,
+        shape=(total_rows, SEGM_OUTPUT_COLS),
+        strides=(SEGM_OUTPUT_COLS, gl.constexpr(1)),
+        block_shape=(gl.constexpr(1), SEGM_OUTPUT_COLS),
+        layout=SEGM_OUTPUT_SHARED_LAYOUT,
+    )
+    segm_output_shared = gl.allocate_shared_memory(
+        segm_output_ptr.type.element_ty,
+        [gl.constexpr(1), SEGM_OUTPUT_COLS],
+        layout=SEGM_OUTPUT_SHARED_LAYOUT,
+    )
+
+    # row offset: query_token_idx * num_query_heads + query_head_idx
+    row_idx = (query_token_idx * num_query_heads + query_head_idx).to(gl.int32)
+    gl.amd.gfx1250.tdm.async_load(
+        segm_output_desc,
+        [row_idx, 0],
+        segm_output_shared,
+    )
+
+    if ALL_DECODE:
+        seq_idx = query_token_idx
+    else:
+        seq_idx = query_token_idx // num_tokens_per_seq
+
+    seq_len = gl.load(seq_lens_ptr + seq_idx)
+
+    out_scale = None
+    if out_scale_ptr is not None:
+        out_scale = 1 / gl.load(out_scale_ptr)
+
+    num_segments = NUM_SEGMENTS_PER_SEQ
+    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+
+    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+    offs_segm = gl.arange(0, NUM_SEGMENTS_PER_SEQ, layout=SEGM_LAYOUT)
+    segm_mask = offs_segm < gl.full(
+        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=gl.int32, layout=SEGM_LAYOUT
+    )
+
+    # load segment maxima
+    segm_offset = (
+        query_token_idx.to(gl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        + query_head_idx * NUM_SEGMENTS_PER_SEQ
+        + offs_segm
+    )
+    segm_max = gl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
+    overall_max = gl.max(segm_max)
+
+    # load and rescale segment exp sums
+    segm_expsum = gl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
+    segm_expsum = segm_expsum * gl.exp2(segm_max - overall_max)
+    overall_expsum = gl.sum(segm_expsum)
+
+    # Wait for the async load and read from shared memory
+    gl.amd.gfx1250.tdm.async_wait(0)
+    segm_output = segm_output_shared.reshape((NUM_SEGMENTS_PER_SEQ, KV_LORA_RANK)).load(
+        layout=REDUCE_LAYOUT
+    )
+
+    segm_output = gl.where(segm_mask[:, None], segm_output, 0.0)
+    segm_output *= gl.exp2(segm_max - overall_max)[:, None]
+    acc_sum = gl.sum(segm_output, axis=0)
+    acc = gl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+
+    if out_scale_ptr is not None:
+        acc = acc * out_scale
+
+    if output_ptr.type.element_ty.is_fp8():
+        acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+
+    offs_d = gl.arange(0, KV_LORA_RANK, layout=OUTPUT_LAYOUT)
+    output_offset = (
+        query_token_idx * output_stride_0 + query_head_idx * output_stride_1 + offs_d
+    )
+    gl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))

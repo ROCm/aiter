@@ -900,7 +900,7 @@ namespace aiter {
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(layer_input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
-        
+
         MHC_PRE_BIG_FUSE_KERNEL_DISPATCH(m);
     }
 
@@ -1089,7 +1089,7 @@ namespace aiter {
                 int offset = k * residual_block;
                 for(int i = 0; i < x_load_waitcnt; i++) {
                     int offset_in_block = i * x_async_load_threads * x_async_load_vec + threadIdx.x * x_async_load_vec;
-                    async_load<x_async_load_vec>(g_x, s_x_wr_ptr + offset_in_block, offset + offset_in_block, 0, opus::number<GROUP_NT>{});
+                    async_load<x_async_load_vec>(g_x, s_x_wr_ptr + offset_in_block, offset + offset_in_block, 0, opus::number<0>{}, opus::number<GROUP_NT>{});
                 }
             }
         };
@@ -1105,7 +1105,7 @@ namespace aiter {
             int offset = warp_id * hidden_size + k * residual_block;
             for(int i = 0; i < residual_load_waitcnt; i++) {
                 int offset_in_block = i * warp_size * r_async_load_vec + lane_id * r_async_load_vec;
-                async_load<r_async_load_vec>(g_residual, s_residual_wr_ptr + warp_id * residual_block + offset_in_block, offset + offset_in_block, 0, opus::number<GROUP_NT>{});
+                async_load<r_async_load_vec>(g_residual, s_residual_wr_ptr + warp_id * residual_block + offset_in_block, offset + offset_in_block, 0, opus::number<0>{}, opus::number<GROUP_NT>{});
             }
         };
         float post_mix_v = post_layer_mix[idx * hc_mult + warp_id];
@@ -1209,24 +1209,33 @@ namespace aiter {
         MHC_POST_KERNEL_IMPL_(kernel_name, hidden_size, residual_block, false); \
     }
 
-#define MHC_POST_KERNEL_DISPATCH(hidden_size) \
+#define MHC_POST_KERNEL_DISPATCH_NT(hidden_size, store_nt_val) \
     if (arch_id != "gfx942" && hidden_size % 1024 == 0) { \
-        MHC_POST_KERNEL_IMPL(mhc_post_kernel, hidden_size, 1024); \   
+        MHC_POST_KERNEL_IMPL_(mhc_post_kernel, hidden_size, 1024, store_nt_val); \
     } else if (hidden_size % 512 == 0) { \
-        MHC_POST_KERNEL_IMPL(mhc_post_kernel, hidden_size, 512); \   
+        MHC_POST_KERNEL_IMPL_(mhc_post_kernel, hidden_size, 512, store_nt_val); \
     } else if (hidden_size % 256 == 0) { \
-        MHC_POST_KERNEL_IMPL(mhc_post_kernel_x2vgpr, hidden_size, 256); \
+        MHC_POST_KERNEL_IMPL_(mhc_post_kernel_x2vgpr, hidden_size, 256, store_nt_val); \
     } else { \
         AITER_CHECK(false, "hidden_size must be divisible by 256"); \
     }
-    
+
+#define MHC_POST_KERNEL_DISPATCH(hidden_size) \
+    do { \
+        if (m > 8 * cu_num) { \
+            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, true); \
+        } else { \
+            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, false); \
+        } \
+    } while (0)
+
     void mhc_post(
         torch::Tensor& out,
         torch::Tensor& x, // (m, hc_mult, h)
         torch::Tensor& residual, // (m, hc_mult, hidden_size)
         torch::Tensor& post_layer_mix, // (m, hc_mult)
-        torch::Tensor& comb_res_mix // (m, hc_mult, hc_mult)
-    )
+        torch::Tensor& comb_res_mix, // (m, hc_mult, hc_mult)
+        int store_nt = -1)
     {
         int m = residual.size(0);
         int hc_mult = residual.size(1);
@@ -1239,8 +1248,13 @@ namespace aiter {
         const hipStream_t stream = at::hip::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
         const std::string arch_id = get_gpu_arch();
-        
-        MHC_POST_KERNEL_DISPATCH(hidden_size);
+        if (store_nt < 0) {
+            MHC_POST_KERNEL_DISPATCH(hidden_size);
+        } else if (store_nt != 0) {
+            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, true);
+        } else {
+            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, false);
+        }
     }
 
 
@@ -1864,7 +1878,7 @@ namespace aiter {
                     if constexpr (mhc_async_load_oob_guard) {
                         if (row_base + rows_per_load * i < m_oob) {
                             async_load<x_async_load_vec>(g_x, s_x_wr_ptr + s_offset,
-                                offset_base + rows_per_load * i * x_stride, 0, opus::number<GROUP_NT>{});
+                                offset_base + rows_per_load * i * x_stride, 0, opus::number<0>{}, opus::number<GROUP_NT>{});
                         } else {
                             #pragma unroll
                             for (int v = 0; v < x_async_load_vec; v++) {
@@ -1873,7 +1887,7 @@ namespace aiter {
                         }
                     } else {
                         async_load<x_async_load_vec>(g_x, s_x_wr_ptr + s_offset,
-                            offset_base + rows_per_load * i * x_stride, 0, opus::number<GROUP_NT>{});
+                            offset_base + rows_per_load * i * x_stride, 0, opus::number<0>{}, opus::number<GROUP_NT>{});
                     }
                 }
             }
@@ -1897,7 +1911,7 @@ namespace aiter {
             for(int i = 0; i < residual_load_waitcnt; i++) {
                 if constexpr (mhc_async_load_oob_guard) {
                     if (row_base + rows_per_load * i < m_oob) {
-                        async_load<r_async_load_vec>(g_res, s_residual_wr_ptr + s_offset, offset_base + rows_per_load * hc_hidden_size * i, 0, opus::number<GROUP_NT>{});
+                        async_load<r_async_load_vec>(g_res, s_residual_wr_ptr + s_offset, offset_base + rows_per_load * hc_hidden_size * i, 0, opus::number<0>{}, opus::number<GROUP_NT>{});
                     } else {
                         #pragma unroll
                         for (int v = 0; v < r_async_load_vec; v++) {
@@ -1905,7 +1919,7 @@ namespace aiter {
                         }
                     }
                 } else {
-                    async_load<r_async_load_vec>(g_res, s_residual_wr_ptr + s_offset, offset_base + rows_per_load * hc_hidden_size * i, 0, opus::number<GROUP_NT>{});
+                    async_load<r_async_load_vec>(g_res, s_residual_wr_ptr + s_offset, offset_base + rows_per_load * hc_hidden_size * i, 0, opus::number<0>{}, opus::number<GROUP_NT>{});
                 }
                 s_offset += s_offset_i;
             }

@@ -366,6 +366,15 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
+    # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
+    # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
+    # producing NaN in the fused_moe output. checkAllclose's err/logits_diff can be
+    # masked by atomic-reduction noise, so detect NaN explicitly and deterministically.
+    has_nan = out2_ck.isnan().any().item()
+    if has_nan:
+        logging.error(
+            "output contains NaN! (possible aiter #3117 stage2 K-pad regression)"
+        )
     err = checkAllclose(
         out2_ref,
         out2_ck,
@@ -384,9 +393,12 @@ def test_fmoe(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
     if strict_accuracy:
+        assert not has_nan, "accuracy check failed: output contains NaN"
         assert not (
             err != 0 and logits_diff > 0.01
         ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
+    elif has_nan:
+        logging.warning("accuracy check failed (non-strict): output contains NaN")
     elif err != 0 and logits_diff > 0.01:
         logging.warning(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
