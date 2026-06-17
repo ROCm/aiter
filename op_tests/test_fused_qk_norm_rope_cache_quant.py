@@ -2697,8 +2697,9 @@ def test_pts_quant_shuffle_block_layout_parity(
     block_size=16,
     cache_dtype=None,
     eps=1e-6,
+    use_shuffle_layout=True,
 ):
-    """Parity: the pts shuffle write must give identical KV cache for the original [2, num_blocks, ...] and new [num_blocks, 2, ...] (unbind(1)) layouts."""
+    """Parity: the pts write must give identical KV cache for the original [2, num_blocks, ...] and new [num_blocks, 2, ...] (unbind(1)) paged layouts, for both use_shuffle_layout=True and False (both honor the cache's per-block stride)."""
     cache_dtype = cache_dtype or dtype  # None => auto (cache dtype == qkv dtype)
     x = (
         16 // torch.empty(0, dtype=cache_dtype).element_size()
@@ -2775,7 +2776,7 @@ def test_pts_quant_shuffle_block_layout_parity(
             k_out,
             v_out,
             True,  # return_kv
-            True,  # use_shuffle_layout
+            use_shuffle_layout,
             block_size,
             x,
             rotary_dim,
@@ -2786,9 +2787,10 @@ def test_pts_quant_shuffle_block_layout_parity(
     q_new, k_new, v_new = run(blocks_first=True)  # [num_blocks, 2, ...]
 
     tag = (
-        f"shuffle_block_layout qkv={dtype}, cache={cache_dtype}, tokens={num_tokens}, "
+        f"block_layout_parity qkv={dtype}, cache={cache_dtype}, tokens={num_tokens}, "
         f"Hq={num_heads_q}, Hkv={num_heads_kv}, D={head_size}, rotary_dim={rotary_dim}, "
-        f"block_size={block_size}, blocks={num_blocks}, neox={is_neox_style}"
+        f"block_size={block_size}, blocks={num_blocks}, neox={is_neox_style}, "
+        f"shuffle={use_shuffle_layout}"
     )
     # Only the block stride differs -> must match exactly; checkAllclose logs but doesn't raise, so assert on its ratio.
     for name, a, b in (
@@ -2812,6 +2814,7 @@ def test_pts_quant_shuffle_block_layout_parity(
         "block_size": block_size,
         "num_blocks": num_blocks,
         "is_neox_style": "1" if is_neox_style else "0",
+        "use_shuffle_layout": "1" if use_shuffle_layout else "0",
         "status": "PASS",
     }
 
@@ -2936,6 +2939,15 @@ parser.add_argument(
     default=[torch.bfloat16, torch.float16],
     help="""QKV (activation) dtypes for the parity sweep; the cache dtype matches it, plus fp8.
     e.g.: --qkv_dtypes bf16""",
+)
+parser.add_argument(
+    "--shuffle_layouts",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True, False],
+    help="""Shuffle layouts for the parity sweep: True (x-packed shuffle) and/or
+    False (contiguous); both honor the cache's per-block stride.
+    e.g.: --shuffle_layouts false""",
 )
 parser.add_argument(
     "-d",
@@ -3178,19 +3190,21 @@ if __name__ == "__main__":
                                     else partial_rotary_configs[head_size]
                                 )
                                 for num_tokens in args.parity_tokens:
-                                    df.append(
-                                        test_pts_quant_shuffle_block_layout_parity(
-                                            qkv_dtype,
-                                            num_tokens,
-                                            num_head,
-                                            num_kv_head,
-                                            head_size,
-                                            rotary_dim,
-                                            is_neox_style,
-                                            block_size=block_size,
-                                            cache_dtype=cache_dtype,
+                                    for use_shuffle_layout in args.shuffle_layouts:
+                                        df.append(
+                                            test_pts_quant_shuffle_block_layout_parity(
+                                                qkv_dtype,
+                                                num_tokens,
+                                                num_head,
+                                                num_kv_head,
+                                                head_size,
+                                                rotary_dim,
+                                                is_neox_style,
+                                                block_size=block_size,
+                                                cache_dtype=cache_dtype,
+                                                use_shuffle_layout=use_shuffle_layout,
+                                            )
                                         )
-                                    )
     df = pd.DataFrame(df)
     aiter.logger.info(
         "pts_quant_shuffle_block_layout parity summary (markdown):\n%s",

@@ -66,7 +66,7 @@ jobs:
             # Verified on MI350X (gfx950) TP8, aiter 1ec891b44: gsm8k 3-shot
             # flexible-extract 0.9272 (strict 0.9265). Threshold 0.92.
             continue_on_error: false
-    runs-on: linux-aiter-do-mi350x-8
+    runs-on: linux-aiter-mi35x-8
     continue-on-error: ${{ matrix.continue_on_error }}
     timeout-minutes: 180
     env:

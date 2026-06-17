@@ -1,0 +1,21 @@
+self-hosted-runner:
+  labels:
+    - aiter-1gpu-runner
+    - aiter-8gpu-runner
+    - aiter-gfx1100
+    - build-only-aiter
+    - linux-aiter-do-mi350x-1
+    - linux-aiter-do-mi350x-2
+    - linux-aiter-do-mi350x-4
+    - linux-aiter-do-mi350x-8
+    - linux-aiter-mi300x-1
+    - linux-aiter-mi300x-2
+    - linux-aiter-mi300x-4
+    - linux-aiter-mi300x-8
+    - linux-aiter-mi35x-1
+    - linux-aiter-mi35x-4
+    - linux-aiter-mi35x-8
+    - linux-aiter-mi355-1
+    - linux-aiter-mi355-8
+
+config-variables: null

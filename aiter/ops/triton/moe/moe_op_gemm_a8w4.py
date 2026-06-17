@@ -19,6 +19,7 @@ from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 
 
 @functools.lru_cache
@@ -78,7 +79,7 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def get_kernel_config_triton(m, n, k, routing_data):
+def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -112,12 +113,14 @@ def get_kernel_config_triton(m, n, k, routing_data):
     # Look for a tuned entry with the same (N, K) but any block_m — the tile
     # geometry and num_stages from that entry are a better starting point than
     # a generic default, and avoid regressing to num_stages=1 on gfx950.
+    # Under CDNA4 swizzle, skip BLOCK_K<256 entries since unswizzle can't compile them.
     dispatch = _get_a8w4_dispatch(arch)
     proxy = next(
         (
             v
             for bm in (16, 32, 64, 128)
             if (v := dispatch.get(f"bm{bm}_n{n}_k{k}")) is not None
+            and (swizzle_mx_scale != "CDNA4_SCALE" or v.get("BLOCK_SIZE_K", 0) >= 256)
         ),
         None,
     )
@@ -165,7 +168,6 @@ def get_kernel_config_triton(m, n, k, routing_data):
             block_n = 128
             num_warps = 4 if block_m == 128 else 8
     elif arch == "gfx950":
-        num_stages = 1
         if block_m == 16:
             block_n = 128
             num_warps = 4
@@ -205,10 +207,21 @@ def get_kernel_config_triton(m, n, k, routing_data):
             num_stages = 1
 
         else:
-            block_n = 512
+            # Cap by N: BN=512 wasted compute on small-N shapes (e.g. N=256
+            # → 50% pad, grid_n=1). Tuned shapes bypass this via JSON.
+            block_n = min(triton.next_power_of_2(n), 256)
             # routing caps block_m at 128; nw=4 wins ~2x at block_m=128 on gpt-oss
             # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
             num_warps = 4 if block_m == 128 else 8
+
+        # bits_a=8 (fp8), bits_b=4 (mxfp4). Picks ns=2 when the tile fits in LDS,
+        # else falls back to ns=1. The previous hardcoded ns=1 silently regressed
+        # gpt-oss W4A8 MoE shapes by 30-40% vs the JSON-tuned ns=2 winners; the
+        # block_m==64 branch keeps its rocprof-tuned ns=1 override.
+        if block_m != 64:
+            num_stages = pick_gemm_num_stages(
+                arch, block_m, block_n, block_k, 8, 4, use_async_padding=True
+            )
     else:
         block_n = 128
         num_warps = 4
@@ -238,10 +251,17 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     block_k = 512
 
     if block_m == 16:
-        block_n = 256
         block_k = 512
         num_warps = 4
-        num_stages = 1
+        if get_arch() == "gfx1250":
+            # decode (block_m==16): NUM_BUFFERS=3 + block_n=128 restores the
+            # software-pipelined expert GEMM; the #3504 decode kernel's
+            # block_n=256/NUM_BUFFERS=1 regressed conc-1 decode on gfx1250.
+            block_n = 128
+            num_stages = 3
+        else:
+            block_n = 256
+            num_stages = 1
 
     elif block_m == 32:
         if n <= 1024:
@@ -297,6 +317,21 @@ def swizzle_scales_gfx1250(data):
     data = data.transpose(-1, -2)
 
     return data
+
+
+def swizzle_scales(data):
+    """Arch-agnostic scale swizzle for moe_gemm_a8w4.
+
+    Returns (swizzled_data, layout_string) where layout_string is the
+    SWIZZLE_MX_SCALE value the kernel expects, or None for unknown arches.
+    """
+    arch = get_arch()
+    if arch == "gfx1250":
+        return swizzle_scales_gfx1250(data), "GFX1250_SCALE"
+    elif arch == "gfx950":
+        return swizzle_scales_gfx950(data), "CDNA4_SCALE"
+    else:
+        return data, None
 
 
 # -----------------------------------------------------------------------------
@@ -368,7 +403,12 @@ def moe_gemm_a8w4(
     if use_gluon:
         config = get_kernel_config_gluon(M, N, K, routing_data)
     else:
-        config = get_kernel_config_triton(M, N, K, routing_data)
+        config = get_kernel_config_triton(M, N, K, routing_data, swizzle_mx_scale)
+    # CDNA4 swizzle requires BLOCK_K % 256 == 0; some tuned small-K entries
+    # pick BK<256 for utilization. Clamp only when swizzle is requested so
+    # StridedLayout callers keep their tuned BK<256.
+    if swizzle_mx_scale == "CDNA4_SCALE" and config["block_k"] < 256:
+        config["block_k"] = 256
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1

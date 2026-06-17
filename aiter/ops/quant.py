@@ -2,7 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from typing import Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
+
+if TYPE_CHECKING:
+    from ..utility.mx_types import MxScaleRoundMode
 
 import torch
 import torch.nn.functional as F
@@ -12,23 +15,28 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
 from ..utility import dtypes, fp4_utils
+from ..utility import mx_types as _mx_types
 from ..utility.mx_types import (
     MX_DEFAULT_ROUND_MODE,
     MxDtypeInt,
-    MxScaleRoundMode,
     MxScaleRoundModeInt,
 )
 from . import triton
 from .enum import ActivationType, QuantType
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 
-# BC alias: the previous name was fp4-specific, but this enum is shared
-# across the whole MX family. Existing callers using ``MxFp4RoundMode``
-# continue to work; new code should prefer ``MxScaleRoundMode``.
-MxFp4RoundMode = MxScaleRoundMode
+# Type alias for round-mode parameters; Union keeps int interop without
+# triggering the JIT build that loading MxScaleRoundMode would cause.
+RoundModeLike = Union[int, "MxScaleRoundMode"]
 
-# Public alias to make this importable side-by-side with QuantType / ActivationType.
-RoundModeLike = Union[int, MxScaleRoundMode]
+
+def __getattr__(name):
+    if name in ("MxScaleRoundMode", "MxFp4RoundMode"):
+        cls = _mx_types.MxScaleRoundMode
+        globals()["MxScaleRoundMode"] = cls
+        globals()["MxFp4RoundMode"] = cls
+        return cls
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 @compile_ops("module_smoothquant")
@@ -48,7 +56,7 @@ def moe_smoothquant_fwd(
 def get_dtype_max(dtype):
     try:
         dtypeMax = torch.finfo(dtype).max
-    except:
+    except TypeError:
         dtypeMax = torch.iinfo(dtype).max
     return dtypeMax
 

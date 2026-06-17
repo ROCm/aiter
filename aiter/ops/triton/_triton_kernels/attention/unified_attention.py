@@ -845,7 +845,18 @@ def kernel_unified_attention_3d(
         tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
 
 
-@triton.jit
+_reduce_segments_repr = make_kernel_repr(
+    "reduce_segments",
+    [
+        "num_query_heads",
+        "TILE_SIZE",
+        "HEAD_SIZE",
+        "NUM_SEGMENTS_PER_SEQ",
+    ],
+)
+
+
+@triton.jit(repr=_reduce_segments_repr)
 def reduce_segments(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     segm_output_ptr,
