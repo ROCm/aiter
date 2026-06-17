@@ -551,9 +551,13 @@ class GroupCoordinator:
         k_w: torch.Tensor,
         eps: float,
     ):
-        if self.device_communicator is None:
-            raise ValueError("No device communicator found")
-        return self.device_communicator.fused_qknorm_allreduce(qkv_in, q_w, k_w, eps)
+        return fused_qknorm_allreduce_(
+            qkv_in,
+            q_w,
+            k_w,
+            eps,
+            group_name=self.unique_name,
+        )
 
     def _fused_allreduce_rmsnorm_out_place(
         self,
@@ -678,6 +682,11 @@ class GroupCoordinator:
                     output_, input_, group=self.device_group
                 )
         return output_
+
+    def reduce_scatter(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        return self.reduce_scatter_tensor(input_, dim=dim)
 
     def all_gather(
         self,
@@ -1170,6 +1179,24 @@ def get_tp_group() -> GroupCoordinator:
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
 
+_PCP: Optional[GroupCoordinator] = None
+
+
+def get_pcp_group() -> GroupCoordinator:
+    assert _PCP is not None, "prefill context parallel group is not initialized"
+    return _PCP
+
+
+def get_prefill_context_model_parallel_world_size() -> int:
+    """Return world size for the prefill context parallel group."""
+    return get_pcp_group().world_size if _PCP is not None else 1
+
+
+def get_prefill_context_model_parallel_rank() -> int:
+    """Return my rank for the prefill context parallel group."""
+    return get_pcp_group().rank_in_group if _PCP is not None else 0
+
+
 _PP: Optional[GroupCoordinator] = None
 
 
@@ -1194,6 +1221,14 @@ def get_ep_group() -> GroupCoordinator:
     return _EP
 
 
+_DCP: Optional[GroupCoordinator] = None
+
+
+def get_dcp_group() -> GroupCoordinator:
+    assert _DCP is not None, "decode context model parallel group is not initialized"
+    return _DCP
+
+
 def has_custom_group() -> bool:
     """Return whether any custom group is initialized."""
     return bool(_CUSTOM)
@@ -1204,9 +1239,9 @@ class CustomGroupConfig:
 
     Each group is defined by a rank list that can be:
     - 1D List[int]: all ranks form a single communication group,
-      e.g. [0,1,2,3,4,5,6,7] → one TP8 group
+      e.g. [0,1,2,3,4,5,6,7] -> one TP8 group
     - 2D List[List[int]]: multiple independent subgroups,
-      e.g. [[0,1,2,3],[4,5,6,7]] → two independent TP4 groups
+      e.g. [[0,1,2,3],[4,5,6,7]] -> two independent TP4 groups
 
     Usage:
         config = CustomGroupConfig()
@@ -1290,6 +1325,8 @@ def graph_capture():
         for group in (get_pp_group(), get_dp_group(), get_ep_group()):
             if group is not None and group.device_communicator is not None:
                 stack.enter_context(group.graph_capture(context))
+            if _DCP is not None and _DCP.world_size > 1:
+                stack.enter_context(_DCP.graph_capture(context))
         for group in _CUSTOM.values():
             stack.enter_context(group.graph_capture(context))
         yield context
@@ -1366,9 +1403,10 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
-    # decode_context_model_parallel_size: Optional[int] = 1,
+    decode_context_model_parallel_size: Optional[int] = 1,
     backend: Optional[str] = None,
     data_parallel_size: int = 1,
+    prefill_context_model_parallel_size: int = 1,
     custom_group_config: Optional[Dict[str, List]] = None,
 ) -> None:
     """
@@ -1422,8 +1460,16 @@ def initialize_model_parallel(
     # otherwise it will cause deadlock.
     # to get group_ranks for each dimension, transpose that dimension to the
     # last dimension, then reshape to 2D, then unbind the last dimension
+    # the layout order is: ExternalDP x DP x PP x PCP x TP
+    # PCP (prefill context parallel) is an INDEPENDENT dimension that grows
+    # world_size (world = ... x pcp x tp), and sits just outside TP (mirrors
+    # vLLM's layout). It is NOT the commented-out DCP below, which reuses TP.
     all_ranks = torch.arange(world_size).reshape(
-        -1, data_parallel_size, pipeline_model_parallel_size, tensor_model_parallel_size
+        -1,
+        data_parallel_size,
+        pipeline_model_parallel_size,
+        prefill_context_model_parallel_size,
+        tensor_model_parallel_size,
     )  # noqa
 
     # When custom groups are provided, all communication goes through them
@@ -1447,28 +1493,48 @@ def initialize_model_parallel(
         group_name="tp",
     )
 
-    # # Build the DCP model-parallel groups.
-    # global _DCP
-    # assert _DCP is None, "decode context model parallel group is already initialized"
-    # # Note(hc): In the current implementation of decode context parallel,
-    # # dcp_size must not exceed tp_size, because the world size does not
-    # # change by DCP, it simply reuses the GPUs of TP group, and split one
-    # # TP group into tp_size//dcp_size DCP groups.
-    # group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
-    # group_ranks = [x.tolist() for x in group_ranks]
-    # _DCP = init_model_parallel_group(
-    #     group_ranks,
-    #     get_world_group().local_rank,
-    #     backend,
-    #     use_message_queue_broadcaster=True,
-    #     group_name="dcp",
-    # )
+    # Build the DCP model-parallel groups.
+    global _DCP
+    assert _DCP is None, "decode context model parallel group is already initialized"
+    # Note(hc): In the current implementation of decode context parallel,
+    # dcp_size must not exceed tp_size, because the world size does not
+    # change by DCP, it simply reuses the GPUs of TP group, and split one
+    # TP group into tp_size//dcp_size DCP groups.
+    group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
+    group_ranks = [x.tolist() for x in group_ranks]
+    _DCP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_device_communicator=need_std_comm,
+        group_name="dcp",
+    )
+
+    # Build the prefill context-parallel (PCP) groups.
+    # PCP is an INDEPENDENT dimension (world = ... x pcp x tp), unlike the
+    # commented-out DCP above which reuses TP GPUs. PCP sits just outside TP,
+    # so transpose(3, 4) brings the PCP dim innermost. DO NOT touch _DCP.
+    global _PCP
+    assert _PCP is None, "prefill context parallel group is already initialized"
+    group_ranks = (
+        all_ranks.transpose(3, 4)
+        .reshape(-1, prefill_context_model_parallel_size)
+        .unbind(0)
+    )
+    group_ranks = [x.tolist() for x in group_ranks]
+    _PCP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_device_communicator=need_std_comm,
+        group_name="pcp",
+    )
 
     # Build the pipeline model-parallel groups.
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = (
-        all_ranks.transpose(2, 3).reshape(-1, pipeline_model_parallel_size).unbind(0)
+        all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
     )
     group_ranks = [x.tolist() for x in group_ranks]
     _PP = init_model_parallel_group(
@@ -1481,7 +1547,7 @@ def initialize_model_parallel(
 
     global _DP
     assert _DP is None, "data parallel group is already initialized"
-    group_ranks = all_ranks.transpose(1, 3).reshape(-1, data_parallel_size).unbind(0)
+    group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
     _DP = init_model_parallel_group(
         group_ranks,
@@ -1495,7 +1561,12 @@ def initialize_model_parallel(
     assert _EP is None, "expert parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(1, 2)
-        .reshape(-1, data_parallel_size * tensor_model_parallel_size)
+        .reshape(
+            -1,
+            data_parallel_size
+            * prefill_context_model_parallel_size
+            * tensor_model_parallel_size,
+        )
         .unbind(0)
     )
     group_ranks = [x.tolist() for x in group_ranks]
@@ -1561,11 +1632,12 @@ def initialize_model_parallel(
 
     logger.info(
         "rank %s in world size %s is assigned as "
-        "DP rank %s, PP rank %s, TP rank %s, EP rank %s",
+        "DP rank %s, PP rank %s, PCP rank %s, TP rank %s, EP rank %s",
         rank,
         world_size,
         _DP.rank_in_group,
         _PP.rank_in_group,
+        _PCP.rank_in_group,
         _TP.rank_in_group,
         _EP.rank_in_group,
     )
@@ -1574,8 +1646,10 @@ def initialize_model_parallel(
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    decode_context_model_parallel_size: Optional[int] = 1,
     backend: Optional[str] = None,
     data_parallel_size: int = 1,
+    prefill_context_model_parallel_size: int = 1,
     custom_group_config: Optional[Dict[str, List]] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
@@ -1587,8 +1661,10 @@ def ensure_model_parallel_initialized(
         initialize_model_parallel(
             tensor_model_parallel_size,
             pipeline_model_parallel_size,
+            decode_context_model_parallel_size,
             backend,
             data_parallel_size,
+            prefill_context_model_parallel_size=prefill_context_model_parallel_size,
             custom_group_config=custom_group_config,
         )
         return
@@ -1656,6 +1732,11 @@ def destroy_model_parallel():
         _TP.destroy()
     _TP = None
 
+    global _PCP
+    if _PCP:
+        _PCP.destroy()
+    _PCP = None
+
     global _PP
     if _PP:
         _PP.destroy()
@@ -1670,6 +1751,11 @@ def destroy_model_parallel():
     if _EP:
         _EP.destroy()
     _EP = None
+
+    global _DCP
+    if _DCP:
+        _DCP.destroy()
+    _DCP = None
 
     global _CUSTOM
     for group in _CUSTOM.values():

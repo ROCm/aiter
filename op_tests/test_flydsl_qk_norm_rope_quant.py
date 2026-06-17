@@ -364,6 +364,89 @@ def test_flydsl_qk_norm_rope_quant_cos_sin_4d():
     torch.testing.assert_close(out_2d[1], out_4d[1], atol=0.0, rtol=0.0)
 
 
+def test_flydsl_qk_norm_rope_quant_kv_write():
+    """Cover the fused SWA cache-write path (BF16 only).
+
+    With ``swa_kv`` provided, the kernel scatters each token's post-norm/rope
+    KV row into ``swa_kv[slot, pos % cache_size, :]`` where
+    ``slot = state_slot_mapping[batch_id_per_token[t]]``. Since the scatter
+    stores the SAME bytes the kernel writes to ``kv_out``, the result must be
+    bit-exact against a gather built from ``kv_out``. A ``-1`` sentinel in
+    ``batch_id_per_token`` (CG-pad tokens) must be skipped, leaving those
+    ring slots untouched.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    H, D, RD = 16, 512, 64
+    bs = 5
+    mtp = 1  # MTP-1: 2 tokens/seq -> token->seq is NOT identity
+    tok_per_seq = 1 + mtp
+    T_valid = bs * tok_per_seq
+    pad = 3  # CG-pad sentinel tokens
+    T = T_valid + pad
+    cache_size = 129  # window 128 + 1 spec
+    num_slots = 8
+
+    max_pos = max(cache_size, 64)
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, RD, 2, device=device).float() / RD))
+    freqs = torch.einsum(
+        "i,j->ij", torch.arange(max_pos, device=device).float(), inv_freq
+    )
+    cos = freqs.cos().to(torch.bfloat16).contiguous()
+    sin = freqs.sin().to(torch.bfloat16).contiguous()
+
+    q = torch.randn(T, H * D, dtype=torch.bfloat16, device=device) * 0.1
+    Q_LORA = 1536
+    qkv_a = torch.randn(T, Q_LORA + D, dtype=torch.bfloat16, device=device) * 0.1
+    _, kv = torch.split(qkv_a, [Q_LORA, D], dim=-1)
+    kv_w = torch.randn(D, dtype=torch.bfloat16, device=device).abs() + 0.5
+    pos = torch.randint(0, max_pos - 1, (T,), dtype=torch.int64, device=device)
+
+    # batch_id_per_token: valid tokens map to seqs round-robin; pad tail = -1.
+    bid = torch.full((T,), -1, dtype=torch.int64, device=device)
+    bid[:T_valid] = torch.arange(T_valid, device=device) // tok_per_seq
+    # random per-seq state slot (distinct so collisions don't mask bugs)
+    state_slot = torch.randperm(num_slots, device=device)[:bs].to(torch.int32)
+
+    swa_kv = torch.zeros(num_slots, cache_size, D, dtype=torch.bfloat16, device=device)
+
+    got_q, got_kv, _, _ = flydsl_qk_norm_rope_quant(
+        q,
+        kv,
+        kv_w,
+        cos,
+        sin,
+        pos,
+        num_q_heads=H,
+        head_dim=D,
+        rope_head_dim=RD,
+        swa_kv=swa_kv,
+        state_slot_mapping=state_slot,
+        batch_id_per_token=bid,
+    )
+
+    # Expected ring: for each valid token, swa_kv[slot, pos%cache] == kv_out.
+    expected = torch.zeros_like(swa_kv)
+    for t in range(T):
+        b = int(bid[t].item())
+        if b < 0:
+            continue
+        slot = int(state_slot[b].item())
+        ring = int(pos[t].item()) % cache_size
+        expected[slot, ring] = got_kv[t]
+
+    torch.testing.assert_close(swa_kv, expected, atol=0.0, rtol=0.0)
+
+    # kv_out itself must match the no-kv_write path bit-for-bit (scatter is a
+    # pure side write; it must not perturb the primary output).
+    ref_q, ref_kv, _, _ = flydsl_qk_norm_rope_quant(
+        q, kv, kv_w, cos, sin, pos, num_q_heads=H, head_dim=D, rope_head_dim=RD
+    )
+    torch.testing.assert_close(got_kv, ref_kv, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(got_q, ref_q, atol=0.0, rtol=0.0)
+    print("[kv_write] fused SWA scatter bit-exact; pad sentinel skipped — PASS")
+
+
 # ============================================================================
 # argparse + matrix sweep
 # ============================================================================
@@ -440,6 +523,8 @@ args = parser.parse_args()
 
 # Smoke-test the advertised 4D cos/sin layout once before sweeping.
 test_flydsl_qk_norm_rope_quant_cos_sin_4d()
+# Smoke-test the fused SWA cache-write path.
+test_flydsl_qk_norm_rope_quant_kv_write()
 
 quant_keys = ["bf16"] if args.no_quant else args.quant
 qweight_modes = [False, True] if args.qweight else [False]
