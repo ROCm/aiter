@@ -729,7 +729,28 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+      - name: Restore Aiter wheel cache
+        id: restore_aiter_wheel
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: 30
+        with:
+          path: aiter_wheels
+          key: ${{ runner.os }}-aiter-wheel-${{ github.run_id }}-py3.12
+
       - name: Download Aiter wheel artifact
+        if: steps.restore_aiter_wheel.outputs.cache-hit != 'true'
+        id: download_aiter_wheel
+        uses: actions/download-artifact@v4
+        timeout-minutes: 30
+        continue-on-error: true
+        with:
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
+          path: aiter_wheels
+
+      - name: Retry Download Aiter wheel artifact
+        if: steps.restore_aiter_wheel.outputs.cache-hit != 'true' && steps.download_aiter_wheel.outcome == 'failure'
         uses: actions/download-artifact@v4
         timeout-minutes: 30
         with:
