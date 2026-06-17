@@ -19,7 +19,7 @@ jobs:
 
       - name: Verify 3rdparty commits
         if: github.ref != 'refs/heads/main'
-        run: echo "Temporarily skipping CK dependency check."
+        run: ./.github/scripts/check_deps.sh
 
       - name: Skip check on main branch
         if: github.ref == 'refs/heads/main'
@@ -41,7 +41,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Set up Python environment
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install dependencies

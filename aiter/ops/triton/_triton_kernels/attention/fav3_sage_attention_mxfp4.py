@@ -592,6 +592,7 @@ def sage_fwd_mxfp4(
     stride_vsz,
     stride_vsh,
     Out,
+    LSE,
     stride_qz,
     stride_qh,
     stride_qm,
@@ -608,6 +609,9 @@ def sage_fwd_mxfp4(
     stride_bh,
     stride_bm,
     stride_bn,
+    stride_lse_z,
+    stride_lse_h,
+    stride_lse_m,
     cu_seqlens_q,
     cu_seqlens_k,
     kv_block_indices,
@@ -630,6 +634,7 @@ def sage_fwd_mxfp4(
     PRE_LOAD_V: tl.constexpr,
     USE_BIAS: tl.constexpr,
     USE_BLOCK_SPARSE: tl.constexpr,
+    RETURN_LSE: tl.constexpr,
 ):
     # Constants
     Q_HEAD_DIV: tl.constexpr = 2 if Q_DTYPE_STR == "e2m1" else 1
@@ -708,6 +713,20 @@ def sage_fwd_mxfp4(
             tl.zeros([BLOCK_M, BLOCK_DMODEL_V], dtype=Out.type.element_ty),
             mask=o_mask,
         )
+
+        if RETURN_LSE:
+            l_offset = (
+                LSE
+                + off_z * stride_lse_z
+                + off_h_q * stride_lse_h
+                + q_start * stride_lse_m
+            )
+            l_ptrs = l_offset + offs_m * stride_lse_m
+            tl.store(
+                l_ptrs,
+                tl.full([BLOCK_M], float("-inf"), dtype=tl.float32),
+                mask=offs_m < seqlen_q,
+            )
 
         return
 
@@ -925,9 +944,25 @@ def sage_fwd_mxfp4(
         )
 
     # Epilogue
-    l_recip = 1 / tl.where(m_i == float("-inf"), 1.0, l_i)[:, None]
+    invalid_mask = m_i == float("-inf")
+    l_i_safe = tl.where(invalid_mask, 1.0, l_i)
+    l_i_safe = tl.maximum(l_i_safe, 1e-7)
+    l_recip = 1 / l_i_safe[:, None]
     v_descale = tl.load(vd_ptr, mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V, other=0.0)
     acc = acc * l_recip * v_descale
+    acc = tl.where(invalid_mask[:, None], 0.0, acc)
+
+    if RETURN_LSE:
+        # m_i / l_i are in base-2 (sm_scale was pre-multiplied by 1/ln(2)).
+        # Convert back to natural units to match the int8 sage convention.
+        LN2: tl.constexpr = 0.6931471824645996
+        log_l_i = tl.where(invalid_mask, 0.0, tl.math.log2(l_i_safe))
+        softmax_lse = tl.where(invalid_mask, float("-inf"), (m_i + log_l_i) * LN2)
+        l_offset = (
+            LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + q_start * stride_lse_m
+        )
+        l_ptrs = l_offset + offs_m * stride_lse_m
+        tl.store(l_ptrs, softmax_lse, mask=offs_m < seqlen_q)
 
     o_ptr = (
         Out

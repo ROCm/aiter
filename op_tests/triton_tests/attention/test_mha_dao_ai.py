@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import contextlib
+
 import torch
 import pytest
 from aiter.ops.triton.attention.mha import (
@@ -13,6 +15,28 @@ from aiter.test_mha_common import (
     generate_random_padding_mask,
     generate_qkv,
 )
+
+
+@contextlib.contextmanager
+def _with_default_device(device):
+    """Run the capture under an explicit torch default device, restored on exit.
+
+    Graph-capture safety is relative to global state: a sibling test that leaks
+    ``torch.set_default_device("cuda")`` (some set it at module scope and never
+    reset it) makes any tensor constructor in the op that omits ``device=``
+    allocate on CUDA, an illegal H2D during capture. Parametrizing the graph
+    tests over the default device makes both regimes deterministic and
+    ordering-independent: the "cpu" case checks capture correctness; the "cuda"
+    case reproduces the leaked-global-state regime that surfaces device-implicit
+    allocations. (Host<->device syncs inside a captured region are already
+    illegal under torch.cuda.graph, so capture catches those too.)
+    """
+    prev_device = torch.get_default_device()
+    try:
+        torch.set_default_device(device)
+        yield
+    finally:
+        torch.set_default_device(prev_device)
 
 
 @pytest.fixture
@@ -180,3 +204,156 @@ def test_mha_dao_ai(
             rtol=1e-2,
             msg=lambda msg: f"dao_ai bwd dv mismatch\n\n{msg}\n",
         )
+
+
+@pytest.mark.parametrize("default_device", ["cpu", "cuda"])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+def test_mha_dao_ai_graph(dao_ai_impl, mha_type, default_device):
+    """graph capture for flash_attn_func with dao_ai impl."""
+    d = 128
+    device = "cuda"
+    torch.manual_seed(20)
+    batch_size = 2
+    seqlen = 128
+    nheads = 8
+    nheads_k = nheads if mha_type == "mha" else 2
+    dtype = torch.float16
+
+    q = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, nheads_k, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, nheads_k, d, device=device, dtype=dtype)
+
+    q_orig = q.clone()
+    k_orig = k.clone()
+    v_orig = v.clone()
+
+    # warmup (Triton JIT)
+    for _ in range(3):
+        _ = flash_attn_func(q, k, v, causal=True)
+    torch.cuda.synchronize()
+
+    q.copy_(q_orig)
+    k.copy_(k_orig)
+    v.copy_(v_orig)
+
+    g = torch.cuda.CUDAGraph()
+    with _with_default_device(default_device), torch.cuda.graph(g):
+        out_graph = flash_attn_func(q, k, v, causal=True)
+
+    q.copy_(q_orig)
+    k.copy_(k_orig)
+    v.copy_(v_orig)
+    g.replay()
+    torch.cuda.synchronize()
+
+    out_eager = flash_attn_func(
+        q_orig.clone(), k_orig.clone(), v_orig.clone(), causal=True
+    )
+    torch.cuda.synchronize()
+
+    assert not torch.isnan(out_graph).any(), "Graph replay produced NaN"
+    diff = (out_eager - out_graph).abs().max().item()
+    assert diff < 1e-5, f"Graph replay vs eager max diff {diff:.6e} exceeds 1e-5"
+
+
+@pytest.mark.parametrize("default_device", ["cpu", "cuda"])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+def test_mha_dao_ai_varlen_graph(dao_ai_impl, mha_type, default_device):
+    """graph capture for flash_attn_varlen_func with dao_ai impl."""
+    d = 128
+    device = "cuda"
+    torch.manual_seed(20)
+    batch_size = 2
+    seqlen = 128
+    nheads = 8
+    nheads_k = nheads if mha_type == "mha" else 2
+    dtype = torch.float16
+
+    q = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, nheads_k, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, nheads_k, d, device=device, dtype=dtype)
+    query_padding_mask = generate_random_padding_mask(
+        seqlen, batch_size, device, mode="full"
+    )
+    key_padding_mask = generate_random_padding_mask(
+        seqlen, batch_size, device, mode="full"
+    )
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+    q_orig = q_unpad.clone()
+    k_orig = k_unpad.clone()
+    v_orig = v_unpad.clone()
+
+    # warmup (Triton JIT)
+    for _ in range(3):
+        _ = flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=True,
+        )
+    torch.cuda.synchronize()
+
+    with torch.no_grad():
+        q_unpad.copy_(q_orig)
+        k_unpad.copy_(k_orig)
+        v_unpad.copy_(v_orig)
+
+    g = torch.cuda.CUDAGraph()
+    with _with_default_device(default_device), torch.cuda.graph(g):
+        out_graph = flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=True,
+        )
+
+    with torch.no_grad():
+        q_unpad.copy_(q_orig)
+        k_unpad.copy_(k_orig)
+        v_unpad.copy_(v_orig)
+    g.replay()
+    torch.cuda.synchronize()
+
+    out_eager = flash_attn_varlen_func(
+        q_orig.clone(),
+        k_orig.clone(),
+        v_orig.clone(),
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=True,
+    )
+    torch.cuda.synchronize()
+
+    if isinstance(out_graph, tuple):
+        out_graph = out_graph[0]
+    if isinstance(out_eager, tuple):
+        out_eager = out_eager[0]
+
+    assert not torch.isnan(out_graph).any(), "Graph replay produced NaN"
+    diff = (out_eager - out_graph).abs().max().item()
+    assert diff < 1e-5, f"Graph replay vs eager max diff {diff:.6e} exceeds 1e-5"
