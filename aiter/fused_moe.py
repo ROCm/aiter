@@ -1194,6 +1194,11 @@ def _mxfp4_moe_run(
     # FlyDSL gemm1/gemm2 opt-in tag(???? w1/w2.view ???,view ?????????)?
     gemm1_backend = getattr(w1, "gemm1_backend", None)
     gemm2_backend = getattr(w2, "gemm2_backend", None)
+    # Real (unpadded) inter for a non-256-aligned shard (dsv4 TP8: 384). The weights
+    # are zero-padded to D_INTER (next %256) so the gemm2 runs the proven layout, but
+    # this lets it skip loading/MFMA-ing the pad-tail half-steps. Read before .view
+    # (which would drop the attribute).
+    _inter_real_g2 = getattr(w2, "inter_real", None)
 
     # MXFP4 weights pack 2 nibbles/byte. ATOM may pass float4_e2m1fn_x2;
     # normalize to uint8 -- kernels read raw bytes either way.
@@ -1513,6 +1518,7 @@ def _mxfp4_moe_run(
                     NE=NE,
                     D_HIDDEN=D_HIDDEN,
                     D_INTER=D_INTER,
+                    D_INTER_REAL=_inter_real_g2,
                     topk=topk,
                 )
             else:
@@ -1577,6 +1583,7 @@ def _mxfp4_moe_run(
             NE=NE,
             D_HIDDEN=D_HIDDEN,
             D_INTER=D_INTER,
+            D_INTER_REAL=_inter_real_g2,
             topk=topk,
         )
     else:

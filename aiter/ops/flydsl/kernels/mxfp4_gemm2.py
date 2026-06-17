@@ -257,7 +257,14 @@ def _issue_a_load_lds(
 
 
 def compile_gemm2_a4w4_port(
-    BM=32, use_nt=False, NE=NE, N_OUT=N_OUT, MAX_M=MAX_M, epilog="atomic", D_INTER=K
+    BM=32,
+    use_nt=False,
+    NE=NE,
+    N_OUT=N_OUT,
+    MAX_M=MAX_M,
+    epilog="atomic",
+    D_INTER=K,
+    D_INTER_REAL=None,
 ):
     """Compile the gemm2 a4w4 port for a given shape / specialization / epilog.
 
@@ -281,12 +288,20 @@ def compile_gemm2_a4w4_port(
     )
     _atomic = epilog == "atomic"
     # K = contraction dim = inter_dim. Parametrized; defaults to KIMI/DSR's 512.
+    # For a non-256-aligned shard (dsv4 TP8: real inter=384) the caller pads weights/
+    # inter/scales to D_INTER (the next %256, e.g. 512) and passes D_INTER_REAL=384;
+    # the K-loop tiles over the padded _K but skips loading/MFMA-ing the pad-tail
+    # 128-K half-steps (k >= _K_REAL) -> the real ~25% weight bandwidth is not read.
     _K = D_INTER
+    _K_REAL = D_INTER if D_INTER_REAL is None else D_INTER_REAL
     assert _K % BK == 0, (
         f"D_INTER (gemm2 contraction K = inter_dim) must be a multiple of {BK}, "
         f"got {_K}; inter_dim not divisible by {BK} (e.g. 384/192) is not "
         f"supported by this BK={BK} kernel"
     )
+    assert (
+        _K_REAL % 128 == 0 and 0 < _K_REAL <= _K
+    ), f"D_INTER_REAL={_K_REAL} must be a multiple of 128 and in (0, {_K}]"
     _K_HALF = k_half_for(_K)
     _K_TILES_TOTAL = k_tiles_total_for(_K)
     # The BM128 non-atomic epilogs use a hybrid persistent grid (one-shot for small
@@ -328,7 +343,8 @@ def compile_gemm2_a4w4_port(
     }[epilog]
     # Tag with the inter (K) so specializations with different contraction dims get
     # distinct kernel/smem symbols (KIMI i512 keeps the original numeric layout).
-    _tag = f"ne{NE}_h{N_OUT}_i{_K}_bm{BM}{'_nt' if use_nt else ''}_{_epi_tag}"
+    _rtag = "" if _K_REAL == _K else f"r{_K_REAL}"
+    _tag = f"ne{NE}_h{N_OUT}_i{_K}{_rtag}_bm{BM}{'_nt' if use_nt else ''}_{_epi_tag}"
     _name = f"gemm2_a4w4_port_{_tag}"
 
     allocator = SmemAllocator(
@@ -413,6 +429,7 @@ def compile_gemm2_a4w4_port(
                 epilog,
                 aq_rsrc=aq_rsrc,
                 D_INTER=_K,
+                D_INTER_REAL=_K_REAL,
                 aStages=_aStages,
             )
 
@@ -561,6 +578,7 @@ def _gemm2_body(
     *,
     aq_rsrc=None,
     D_INTER=K,
+    D_INTER_REAL=None,
     aStages=kStages,
 ):
     _atomic = epilog == "atomic"
@@ -572,6 +590,16 @@ def _gemm2_body(
     _K = D_INTER
     _K_HALF = k_half_for(_K)
     _K_TILES_TOTAL = k_tiles_total_for(_K)  # KIMI: 2
+    # Real (unpadded) contraction. For a non-256-aligned shard (dsv4 TP8: 384) the
+    # weights/inter/scales are zero-padded to D_INTER (=512) so the layout/shuffle
+    # is the proven %256 one, but the last 128-K MFMA half-step(s) that fall in the
+    # pad region (k in [384,512)) are NOT issued: we skip both the B(weight) HBM
+    # load and the MFMA for them. The skipped step would add inter(0)*w(0)=0, so the
+    # result is unchanged while ~25% of the last tile's weight bandwidth is saved.
+    _K_REAL = D_INTER if D_INTER_REAL is None else D_INTER_REAL
+    _n_real_half = (
+        _K_REAL + 127
+    ) // 128  # valid 128-K MFMA half-steps (512->4, 384->3)
     _kUnroll = kunroll_for(_K)  # streaming main-loop trips (KIMI: 0)
     _kAS_per_chunk_dw = kas_per_chunk_dw_for(_K)
     _kBS_stride_n0_dw = kbs_stride_n0_dw_for(_K)
@@ -688,6 +716,10 @@ def _gemm2_body(
         out = [[None, None] for _ in range(4)]
         for j in range_constexpr(4):
             for half in range_constexpr(2):
+                # Skip the weight HBM load for half-steps in the zero-pad tail
+                # (k >= _K_REAL): the MFMA for them is skipped too, so they are dead.
+                if const_expr(kt * 2 + half >= _n_real_half):
+                    continue
                 frag = buffer_ops.buffer_load(
                     bq_rsrc,
                     (v_voff_b + fx.Int32(half * 1024)) // fx.Int32(4),
@@ -736,13 +768,17 @@ def _gemm2_body(
     zero4 = Vec.filled(4, 0.0, fx.Float32)
     accm = [[None, None, None, None] for _ in range(_kMChunks)]
 
-    def mfma_cluster(b_tile, a, a_scale_sub, b_scale_slot, init):
+    def mfma_cluster(b_tile, a, a_scale_sub, b_scale_slot, init, kt=0):
+        # half0 = global K-half-step kt*2, half1 = kt*2+1. Skip the half1 MFMAs when
+        # that step is in the zero-pad tail (k >= _K_REAL): b_tile[J][1] was not even
+        # loaded, and the step would only add inter(0)*w(0)=0.
+        _skip_h1 = (kt * 2 + 1) >= _n_real_half
         for J in range_constexpr(4):
             mni = J // 2
             in_b = J % 2
             sb = b_scale_slot[mni]
             b_J0 = b_tile[J][0]
-            b_J1 = b_tile[J][1]
+            b_J1 = None if const_expr(_skip_h1) else b_tile[J][1]
             for sub in range_constexpr(_kSubBlocks):
                 sa = a_scale_sub[sub]
                 i0 = sub * 2
@@ -766,15 +802,16 @@ def _gemm2_body(
                             mfma_res_ty,
                             [a[i1][0], b_J0, accm[i1][J], 4, 4, 1, sa, 0 + in_b, sb],
                         )
-                accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_res_ty,
-                    [a[i0][1], b_J1, accm[i0][J], 4, 4, 2, sa, 2 + in_b, sb],
-                )
-                if const_expr(_kMChunks > 1):
-                    accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                if const_expr(not _skip_h1):
+                    accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                         mfma_res_ty,
-                        [a[i1][1], b_J1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb],
+                        [a[i0][1], b_J1, accm[i0][J], 4, 4, 2, sa, 2 + in_b, sb],
                     )
+                    if const_expr(_kMChunks > 1):
+                        accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                            mfma_res_ty,
+                            [a[i1][1], b_J1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb],
+                        )
 
     # -- K-loop fence helper (shared by fast + streaming paths) ---------------
     # `S` selects the atomic path's hand-tuned vmcnt (23 on the first drained tile,
@@ -830,11 +867,17 @@ def _gemm2_body(
             # silent-wrong at M>=32). Wait for all loads (vmcnt 0) for the 1-tile case.
             if const_expr(_K_TILES_TOTAL == 1):
                 _kloop_fence(0)
+            elif const_expr(_K_REAL < _K):
+                # Pad-tail skip (TP8): fewer B loads are issued than the 23/22 tuning
+                # assumes, so that hand-tuned vmcnt under-waits and the A ds_read can
+                # race the A->LDS load. Wait for all loads (vmcnt 0) -- correctness
+                # over the small fence overhead.
+                _kloop_fence(0)
             else:
                 _kloop_fence(23 if S == 0 else 22)
             a = issue_a_ds_read(slot)
             a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
-            mfma_cluster(b[slot], a, a_scale_sub, b_scale_v[slot], init=(S == 0))
+            mfma_cluster(b[slot], a, a_scale_sub, b_scale_v[slot], init=(S == 0), kt=kt)
     else:
         # -- streaming double-buffered K-loop (K_TILES_TOTAL>2): the kernel
         #    preloaded tiles 0..kStages-1 (prologue) into the kStages LDS slots.

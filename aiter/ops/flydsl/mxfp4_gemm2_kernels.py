@@ -45,11 +45,19 @@ def _epilog_of(atomic, mxfp4out, cshuffle=False):
 
 
 @functools.cache
-def _get_compiled_mxfp4_gemm2_port(BM, use_nt, NE, N_OUT, epilog, D_INTER):
+def _get_compiled_mxfp4_gemm2_port(
+    BM, use_nt, NE, N_OUT, epilog, D_INTER, D_INTER_REAL=None
+):
     from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
 
     return compile_gemm2_a4w4_port(
-        BM=BM, use_nt=use_nt, NE=NE, N_OUT=N_OUT, epilog=epilog, D_INTER=D_INTER
+        BM=BM,
+        use_nt=use_nt,
+        NE=NE,
+        N_OUT=N_OUT,
+        epilog=epilog,
+        D_INTER=D_INTER,
+        D_INTER_REAL=D_INTER_REAL,
     )
 
 
@@ -115,6 +123,7 @@ def flydsl_mxfp4_gemm2(
     topk,
     flat_out_scale=None,
     cshuffle=False,
+    D_INTER_REAL=None,
 ):
     """?? FlyDSL ??? gemm2,?? flat_out(mxfp4out ???? flat_out_scale)?
 
@@ -133,7 +142,9 @@ def flydsl_mxfp4_gemm2(
         cshuffle=cshuffle,
     )
     epilog = _epilog_of(atomic, mxfp4out, cshuffle)
-    launch = _get_compiled_mxfp4_gemm2_port(BM, use_nt, NE, D_HIDDEN, epilog, D_INTER)
+    launch = _get_compiled_mxfp4_gemm2_port(
+        BM, use_nt, NE, D_HIDDEN, epilog, D_INTER, D_INTER_REAL
+    )
 
     # grid ?? = max_m_blocks(kernel ???? cumsum ???????)?
     max_m_blocks = (max_sorted + BM - 1) // BM

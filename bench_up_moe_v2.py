@@ -61,6 +61,9 @@ SHAPES = {
     "dsv4_tp2": Shape(NE=384, H=7168, INTER=1536, TOPK=6),
     "dsv4_tp4": Shape(NE=384, H=7168, INTER=768, TOPK=6),
     "dsv4_tp6": Shape(NE=384, H=7168, INTER=512, TOPK=6),
+    # TP8: INTER=3072/8=384 is NOT %256 -> padded to 512 before shuffle (mxfp4 8-K-
+    # group scale layout needs INTER%256). After the zero-pad it is exactly dsv4_tp6.
+    "dsv4_tp8": Shape(NE=384, H=7168, INTER=384, TOPK=6),
     "dsv4_lite": Shape(NE=256, H=4096, INTER=256, TOPK=6),
 }
 
@@ -216,6 +219,43 @@ def build_weights(shape, device, seed=0):
     w1_qt, w1_scale = torch_quant(w1, quant_dtype=dtypes.fp4x2)
     w2_qt, w2_scale = torch_quant(w2, quant_dtype=dtypes.fp4x2)
 
+    # mxfp4 a16w4 requires the gemm2 contraction INTER % 256 == 0 (the e8m0 scale
+    # uses an 8-K-element group layout -> INTER/32 must be divisible by 8). For a
+    # non-aligned shard (dsv4 TP8: INTER=3072/8=384) pad gate/up/down + scales to
+    # the next 256 with ZEROS before shuffling. The padded columns contribute 0
+    # everywhere (gate/up=0 -> silu(0)*0=0 -> inter=0 -> gemm2 += 0), so the result
+    # is numerically identical to the real INTER; the kernel then runs the proven
+    # %256-aligned path (TP8 -> exactly TP6). gemm1 thus computes the padded INTER;
+    # a gemm1-compute-at-384 / output-at-512 variant could recover that ~25% but
+    # needs a kernel change (the inter A-scale is %256-bound too).
+    if inter % 256:
+        inter_pad = (inter + 255) // 256 * 256
+        _F = torch.nn.functional
+
+        def _pad_gu_qt(t):  # fp4-packed gate||up [ne, 2*inter, last] -> pad each half
+            dt, (ne_, _gu, last) = t.dtype, t.shape
+            u = t.contiguous().view(torch.uint8).view(ne_, 2, inter, last)
+            u = _F.pad(u, (0, 0, 0, inter_pad - inter))
+            return u.reshape(ne_, 2 * inter_pad, last).contiguous().view(dt)
+
+        def _pad_last_qt(t, new):  # 1-byte-packed [.., last] -> zero-pad last dim
+            dt = t.dtype
+            u = t.contiguous().view(torch.uint8)
+            u = _F.pad(u, (0, new - u.shape[-1]))
+            return u.contiguous().view(dt)
+
+        def _pad_gu_sc(t):  # e8m0 scale, flat [ne*2*inter, k]: pad inter in the rows
+            dt, k = t.dtype, t.shape[-1]
+            u = t.contiguous().view(torch.uint8).view(ne, 2, inter, k)
+            u = _F.pad(u, (0, 0, 0, inter_pad - inter))
+            return u.reshape(ne * 2 * inter_pad, k).contiguous().view(dt)
+
+        w1_qt = _pad_gu_qt(w1_qt)  # [ne, 2*inter, h//2] fp4
+        w1_scale = _pad_gu_sc(w1_scale)  # [ne*2*inter, h//32] e8m0
+        w2_qt = _pad_last_qt(w2_qt, inter_pad // 2)  # [ne, h, inter//2] fp4
+        w2_scale = _pad_last_qt(w2_scale, inter_pad // 32)  # [ne*h, inter//32] e8m0
+        inter = inter_pad
+
     # fly: legacy preshuffle (16,16) ??(op_tests/test_moe_2stage.py ??)?
     fly = dict(
         w1=shuffle_weight(w1_qt, layout=(16, 16)),
@@ -227,9 +267,18 @@ def build_weights(shape, device, seed=0):
     # mx: mxfp4_moe a16w4 gate/up-interleaved ??,w1 ? shuffle_kind ???
     mx_w1 = shuffle_weight_a16w4(w1_qt, 16, True)
     mx_w1.shuffle_kind = "mxfp4_moe"
+    mx_w2 = shuffle_weight_a16w4(w2_qt, 16, False)
+    # Non-256-aligned shard (TP8 384): weights were zero-padded to `inter` (512). Tell
+    # the gemm2 the real contraction so it SKIPS loading/MFMA-ing the pad-tail
+    # half-steps (k >= real inter) -- the padded zeros land exactly in the skipped
+    # K0 block, so it is numerically exact and saves ~the pad's weight bandwidth
+    # (~5-6% faster end-to-end at TP8). Set OOB_TP8_SKIP=0 to fall back to plain
+    # pad-512 (no skip).
+    if shape.INTER % 256 and os.environ.get("OOB_TP8_SKIP", "1") == "1":
+        mx_w2.inter_real = shape.INTER
     mx = dict(
         w1=mx_w1,
-        w2=shuffle_weight_a16w4(w2_qt, 16, False),
+        w2=mx_w2,
         w1_scale=shuffle_scale_a16w4(w1_scale, ne, True),
         w2_scale=shuffle_scale_a16w4(w2_scale, ne, False),
     )
