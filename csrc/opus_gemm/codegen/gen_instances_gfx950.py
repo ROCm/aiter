@@ -568,53 +568,6 @@ def gen_persistent_instance(
     kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
-    has_oob_str = "true" if k.has_oob else "false"
-
-    min_k = 2 * k.B_K
-    k_check = f"""
-    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
-    AITER_CHECK(loops_ >= 2,
-        "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
-    AITER_CHECK(loops_ % 2 == 0,
-        "ceil_div(K, {k.B_K})=", loops_, " must be even (prefetch constraint)");
-    AITER_CHECK(K % 2 == 0,
-        "K=", K, " must be even (a16w16 family rejects odd K)");
-    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
-    AITER_CHECK(batch >= 1, "batch must be >= 1");
-"""
-
-    grid_setup = f"""
-    constexpr int NUM_CU = 256;
-    constexpr int NUM_XCD = 8;
-    const int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
-    const int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
-    int split_m = std::max(1, (NUM_CU + num_tiles_n - 1) / num_tiles_n);
-    while (split_m < num_tiles_m && (num_tiles_m % split_m) != 0) split_m++;
-    if (split_m > num_tiles_m) split_m = num_tiles_m;
-    const int m_per_wg = num_tiles_m / split_m;
-    AITER_CHECK(num_tiles_m % split_m == 0,
-        "persistent: num_tiles_m=", num_tiles_m,
-        " must be divisible by split_m=", split_m);
-
-    // Pad grid.y so the XCD-local swizzle math stays bijective. See the
-    // long comment in opus_gemm_pipeline_a16w16_persistent_gfx950.cuh
-    // for why this is needed and why it is free on the large-M shapes
-    // the swizzle is tuned for (split_m is already a multiple of
-    // NUM_XCD there, so the pad is a no-op). When split_m < NUM_XCD
-    // (small-M shapes like M=8192 N=8192 K=256), the pad multiplies
-    // grid.y by NUM_XCD/split_m and the kernel's wave-uniform
-    // early-return guard drops the over-shoot WGs.
-    const int m_grp_per_xcd = (split_m + NUM_XCD - 1) / NUM_XCD;
-    const int grid_y_padded = m_grp_per_xcd * NUM_XCD;
-
-    kargs.m_per_wg = m_per_wg;
-    kargs.num_tiles_n = num_tiles_n;
-    kargs.split_m = split_m;          // un-padded; kernel uses for early-return
-    kargs.m_grp_per_xcd = m_grp_per_xcd;
-
-    dim3 grid(num_tiles_n, grid_y_padded, batch);
-    dim3 block({k.BLOCK_SIZE});
-"""
 
     INSTANCE_IMPL = _render(
         "impl_persistent_gfx950.cuh.j2",
@@ -622,29 +575,12 @@ def gen_persistent_instance(
         pipeline_header=pipeline_header,
         fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
         fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
-        kid_name=k.name,
+        k=k,
         traits_name=traits_name,
-        BLOCK_SIZE=k.BLOCK_SIZE,
-        B_M=k.B_M,
-        B_N=k.B_N,
-        B_K=k.B_K,
         da=da,
         db=db,
-        VEC_A=k.VEC_A,
-        VEC_B=k.VEC_B,
-        VEC_C=k.VEC_C,
-        T_M=k.T_M,
-        T_N=k.T_N,
-        W_M=k.W_M,
-        W_N=k.W_N,
-        W_K=k.W_K,
-        has_oob_str=has_oob_str,
-        cachectl_a=k.cachectl_a,
-        cachectl_b=k.cachectl_b,
         kargs_name=kargs_name,
         kernel_func=kernel_func,
-        k_check=k_check,
-        grid_setup=grid_setup,
     )
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
     record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_TUNE_HOST_EXTRA)
@@ -675,20 +611,10 @@ def gen_scale_instance(
         pipeline_header=pipeline_header,
         fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
         fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
-        kid_name=k.name,
+        k=k,
         traits_name=traits_name,
-        BLOCK_SIZE=k.BLOCK_SIZE,
-        B_M=k.B_M,
-        B_N=k.B_N,
-        B_K=k.B_K,
         da=da,
         db=db,
-        VEC_A=k.VEC_A,
-        VEC_B=k.VEC_B,
-        VEC_C=k.VEC_C,
-        GROUP_M=k.GROUP_M,
-        GROUP_N=k.GROUP_N,
-        GROUP_K=k.GROUP_K,
         kargs_name=kargs_name,
         kernel_func=kernel_func,
     )
@@ -717,121 +643,44 @@ def gen_noscale_instance_gfx950(
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
     is_a16w16_split_barrier = k.kernel_tag == "a16w16"
-    is_a16w16_traits_with_tile_wave = (
-        is_a16w16_split_barrier  # gfx950 noscale only a16w16 SB
-    )
-    traits_extra = ""
-    if is_a16w16_traits_with_tile_wave:
-        traits_extra = (
-            f",\n        opus::seq<{k.T_M}, {k.T_N}, 1>,"
-            f"\n        opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>"
-        )
-
-    min_k = 2 * k.B_K
-    k_check = f"""
-    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
-    AITER_CHECK(loops_ >= 2,
-        "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
-    AITER_CHECK(loops_ % 2 == 0,
-        "ceil_div(K, {k.B_K})=", loops_, " must be even (prefetch constraint)");
-    AITER_CHECK(K % 2 == 0,
-        "K=", K, " must be even (a16w16 family rejects odd K due to a "
-        "latent K-tail accumulation bug; pass an even K)");
-    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
-"""
-
-    if k.kernel_tag in A16W16_TUNE_TAGS:
-        extra_param = (
-            ",\n    std::optional<aiter_tensor_t> bias," "\n    int /*splitK*/"
-        )
-    else:
-        extra_param = ""
-
-    has_oob_str = "true" if k.has_oob else "false"
+    has_tune_tags = k.kernel_tag in A16W16_TUNE_TAGS
 
     if is_a16w16_split_barrier:
-        bias_kargs_block = (
-            BIAS_HOST_VALIDATE
-            + "    kargs.ptr_bias = ptr_bias_;\n"
-            + "    kargs.stride_bias_batch = stride_bias_batch_;\n"
+        cachectl_extra = ""
+        if hasattr(k, "cachectl_a") and k.cachectl_a >= 0:
+            cachectl_extra = f",\n    {k.cachectl_a}, {k.cachectl_b}"
+        INSTANCE_IMPL = _render(
+            "impl_noscale_a16w16_gfx950.cuh.j2",
+            traits_header=traits_header,
+            pipeline_header=pipeline_header,
+            fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
+            fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
+            kernel_func=kernel_func,
+            k=k,
+            traits_name=traits_name,
+            kargs_name=kargs_name,
+            has_tune_tags=has_tune_tags,
+            is_a16w16=True,
+            cachectl_extra=cachectl_extra,
+            da=da,
+            db=db,
         )
-    elif k.kernel_tag in A16W16_TUNE_TAGS:
-        bias_kargs_block = (
-            "    AITER_CHECK(!bias.has_value(),\n"
-            '        "bias not supported on this a16w16 kid");\n'
+    else:
+        # a8w8 noscale: single-traits, no bias.
+        INSTANCE_IMPL = _render(
+            "impl_noscale_a8w8_gfx950.cuh.j2",
+            traits_header=traits_header,
+            pipeline_header=pipeline_header,
+            fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
+            fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
+            kernel_func=kernel_func,
+            k=k,
+            traits_name=traits_name,
+            kargs_name=kargs_name,
+            has_tune_tags=has_tune_tags,
+            da=da,
+            db=db,
         )
-    else:
-        bias_kargs_block = ""
-
-    kargs_init_extra = ""
-
-    cachectl_extra = ""
-    if is_a16w16_split_barrier and hasattr(k, "cachectl_a") and k.cachectl_a >= 0:
-        cachectl_extra = f",\n    {k.cachectl_a}, {k.cachectl_b}"
-    traits_alias_tail = f",\n    {has_oob_str}"
-    if is_a16w16_split_barrier:
-        traits_aliases = f"""
-template <typename D_C>
-using {k.name}_TraitsNoBias = {traits_name}<{k.BLOCK_SIZE},
-    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-    opus::tuple<{da}, {db}, D_C, fp32_t>,
-    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
-    false,
-    D_C{traits_alias_tail}{cachectl_extra}>;
-template <typename D_C>
-using {k.name}_TraitsBias = {traits_name}<{k.BLOCK_SIZE},
-    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-    opus::tuple<{da}, {db}, D_C, fp32_t>,
-    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
-    true,
-    D_C{traits_alias_tail}{cachectl_extra}>;
-"""
-    else:
-        traits_aliases = f"""
-template <typename D_C>
-using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
-    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-    opus::tuple<{da}, {db}, D_C, fp32_t>,
-    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra}>;
-"""
-
-    if is_a16w16_split_barrier:
-        launch_block = f"""
-    auto stream = aiter::getCurrentHIPStream();
-    if (bias.has_value()) {{{{
-        {kernel_func}<{k.name}_TraitsBias<D_C>><<<grid, block, 0, stream>>>(kargs);
-    }}}} else {{{{
-        {kernel_func}<{k.name}_TraitsNoBias<D_C>><<<grid, block, 0, stream>>>(kargs);
-    }}}}"""
-    else:
-        launch_block = f"""
-    auto stream = aiter::getCurrentHIPStream();
-    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);"""
-
-    template_name = (
-        "impl_noscale_a16w16_gfx950.cuh.j2"
-        if is_a16w16_split_barrier
-        else "impl_noscale_a8w8_gfx950.cuh.j2"
-    )
-    INSTANCE_IMPL = _render(
-        template_name,
-        traits_header=traits_header,
-        pipeline_header=pipeline_header,
-        fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
-        fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
-        kernel_func=kernel_func,
-        traits_aliases=traits_aliases,
-        kid_name=k.name,
-        kargs_name=kargs_name,
-        extra_param=extra_param,
-        k_check=k_check,
-        kargs_init_extra=kargs_init_extra,
-        bias_kargs_block=bias_kargs_block,
-        B_M=k.B_M,
-        B_N=k.B_N,
-        BLOCK_SIZE=k.BLOCK_SIZE,
-        launch_block=launch_block,
-    )
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
     if k.kernel_tag in A16W16_TUNE_TAGS:
@@ -883,27 +732,6 @@ def gen_mono_tile_instance(
     **_unused,
 ):
     """gfx950 a16w16_mono_tile launcher emit."""
-    traits_aliases = f"""
-template <typename D_C>
-using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
-    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-    opus::tuple<{da}, {db}, D_C, fp32_t>,
-    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>>;
-"""
-    min_k = 2 * k.B_K
-    k_check = f"""
-    int loops_ = K / {k.B_K};
-    AITER_CHECK(K % {k.B_K} == 0,
-        "mono-tile requires K divisible by B_K={k.B_K}; got K=", K);
-    AITER_CHECK(loops_ >= 2,
-        "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
-    AITER_CHECK(K % 2 == 0,
-        "K=", K, " must be even (a16w16 family rejects odd K)");
-    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
-    AITER_CHECK(batch >= 1, "batch must be >= 1");
-    AITER_CHECK(N % {k.B_N} == 0,
-        "mono-tile requires N divisible by B_N={k.B_N}; got N=", N);
-"""
     INSTANCE_IMPL = _render(
         "impl_mono_tile_gfx950.cuh.j2",
         traits_header=traits_header,
@@ -912,12 +740,10 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         fwd_decl_kargs_fnarg=kargs_name,
         kernel_func=kernel_func,
         kargs_name=kargs_name,
-        kid_name=k.name,
-        traits_aliases=traits_aliases,
-        k_check=k_check,
-        B_M=k.B_M,
-        B_N=k.B_N,
-        BLOCK_SIZE=k.BLOCK_SIZE,
+        k=k,
+        traits_name=traits_name,
+        da=da,
+        db=db,
     )
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
@@ -959,44 +785,17 @@ def gen_flatmm_instance(
     kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
-    has_bias_str = "false"
-
-    k_check = f"""
-    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
-    AITER_CHECK(loops_ >= Traits::prefetch_k_iter,
-        "K=", K, " too small for flatmm B_K={k.B_K}, need K >= pfk*B_K = ",
-        Traits::prefetch_k_iter * {k.B_K}, " (pfk=", Traits::prefetch_k_iter, ")");
-    AITER_CHECK(M >= 1 && N >= 1 && K >= 1, "M, N, K must be >= 1");
-    AITER_CHECK(batch >= 1, "batch must be >= 1");
-    AITER_CHECK(K % 2 == 0,
-        "K=", K, " must be even (a16w16 family rejects odd K due to a "
-        "latent K-tail accumulation bug; pass an even K)");
-"""
-
-    traits_aliases = f"""
-template <typename D_C>
-using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
-    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-    opus::tuple<{da}, {db}, D_C, fp32_t, D_C>,
-    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
-    opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
-    {k.WG_PER_CU},
-    {has_bias_str}>;
-"""
-
     INSTANCE_IMPL = _render(
         "impl_flatmm_gfx950.cuh.j2",
         traits_header=traits_header,
         pipeline_header=pipeline_header,
         fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
         fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
-        traits_aliases=traits_aliases,
-        kid_name=k.name,
+        k=k,
+        traits_name=traits_name,
         kargs_name=kargs_name,
-        k_check=k_check,
-        B_M=k.B_M,
-        B_N=k.B_N,
-        BLOCK_SIZE=k.BLOCK_SIZE,
+        da=da,
+        db=db,
         kernel_func=kernel_func,
     )
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
@@ -1022,34 +821,18 @@ def gen_flatmm_splitk_instance(
     kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
-    has_oob_str = "true" if k.has_oob else "false"
-    traits_aliases = f"""
-template <typename D_C>
-using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
-    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-    opus::tuple<{da}, {db}, fp32_t, fp32_t, {da}>,
-    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
-    opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
-    {k.WG_PER_CU},
-    false,
-    {has_oob_str}>;
-"""
-
     INSTANCE_IMPL = _render(
         "impl_flatmm_splitk_gfx950.cuh.j2",
         traits_header=traits_header,
         pipeline_header=pipeline_header,
         fwd_decl_kargs_tpl=fwd_decl_kargs_tpl,
         fwd_decl_kargs_fnarg=fwd_decl_kargs_fnarg,
-        traits_aliases=traits_aliases,
-        kid_name=k.name,
+        k=k,
+        traits_name=traits_name,
         kargs_name=kargs_name,
-        B_K=k.B_K,
-        B_M=k.B_M,
-        B_N=k.B_N,
-        BLOCK_SIZE=k.BLOCK_SIZE,
+        da=da,
+        db=db,
         kernel_func=kernel_func,
-        has_oob_str=has_oob_str,
     )
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
     record_one_instantiation(cg, k, kernel_func, kargs_name, A16W16_TUNE_HOST_EXTRA)

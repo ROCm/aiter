@@ -1,8 +1,23 @@
 {% extends "_base_impl.cuh.j2" %}
+{%- block traits_aliases %}
+template <typename D_C>
+using {{ k.name }}_Traits = {{ traits_name }}<{{ k.BLOCK_SIZE }},
+    opus::seq<{{ k.B_M }}, {{ k.B_N }}, {{ k.B_K }}>,
+    opus::tuple<{{ da }}, {{ db }}, fp32_t, fp32_t>,
+    opus::seq<{{ k.VEC_A }}, {{ k.VEC_B }}, {{ k.VEC_C }}>,
+    opus::seq<{{ k.T_M }}, {{ k.T_N }}, 1>,
+    opus::seq<{{ k.W_M }}, {{ k.W_N }}, {{ k.W_K }}>>;
+{%- endblock %}
 {%- block device_tu_split %}
 #ifdef OPUS_FUSED_HOST_TU
 #include "{{ traits_header }}"
-{{ kernel_fwd_decl }}
+{% if fused %}
+template<typename Traits, typename D_OUT>
+__global__ void {{ kernel_func }}({{ kargs_name }} kargs);
+{% else %}
+template<typename Traits{{ fwd_decl_kargs_tpl }}>
+__global__ void {{ kernel_func }}({{ fwd_decl_kargs_fnarg }} kargs);
+{% endif %}
 #else
 #include "{{ pipeline_header }}"
 #endif
@@ -10,7 +25,7 @@
 {%- block launcher %}
 template <typename D_C>
 void
-{{ kid_name }}(
+{{ k.name }}(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
@@ -39,11 +54,11 @@ void
     // the row into the next M-row's data, corrupting the accumulator
     // (observed max|err|~44 on bf16). Reject K%B_K!=0 until the
     // mask_va_tail port lands; callers must pad K to a multiple of B_K.
-    AITER_CHECK(K % {{ B_K }} == 0,
-    "K=", K, " must be a multiple of B_K={{ B_K }} for {{ err_label }} "
+    AITER_CHECK(K % {{ k.B_K }} == 0,
+    "K=", K, " must be a multiple of B_K={{ k.B_K }} for {{ err_label }} "
     "(K-tail masking not yet implemented on gfx942 splitk)");
 {% include "_bias_validate.cuh.j2" %}
-    using Traits = {{ kid_name }}_Traits<D_C>;
+    using Traits = {{ k.name }}_Traits<D_C>;
 
     // splitK semantics for gfx942 splitk launchers:
     //   splitK >  1 -> caller-pinned (tuner / explicit override). Used verbatim
@@ -69,8 +84,8 @@ void
         }
         if (cu_cached <= 0) cu_cached = 64;  // safe gfx942 lower bound
     }
-    int tiles_mn = ((M + {{ B_M }} - 1) / {{ B_M }})
-                 * ((N + {{ B_N }} - 1) / {{ B_N }}) * batch;
+    int tiles_mn = ((M + {{ k.B_M }} - 1) / {{ k.B_M }})
+                 * ((N + {{ k.B_N }} - 1) / {{ k.B_N }}) * batch;
     if (tiles_mn <= 0) tiles_mn = 1;
     // P1 variant wants 2 wg/CU co-residency for TLP -> aim for 2x cu_num grid.
     int target_wg_dbuf2 = {{ target_wg_expr }};
@@ -83,9 +98,9 @@ void
     // K-tile iterations per split (one in LDS + one prefetched). Applies to
     // both caller-pinned and auto-picked split_k. P1 (depth=2 K-dbuf) additionally
     // requires loops even per split.
-    int total_iters = (K + {{ B_K }} - 1) / {{ B_K }};
+    int total_iters = (K + {{ k.B_K }} - 1) / {{ k.B_K }};
     constexpr int min_iters_per_split = 2;
-    constexpr bool require_even_loops_dbuf2 = {{ require_even_loops_str }};
+    constexpr bool require_even_loops_dbuf2 = {{ "true" if k.kernel_tag in ("a16w16_kbuf2v_sk", "a16w16_kbuf2v_bk128_sk") else "false" }};
     while (split_k > 1) {
     int iters_full = (total_iters + split_k - 1) / split_k;
     int last_loops = total_iters - (split_k - 1) * iters_full;
@@ -95,8 +110,8 @@ void
     split_k--;
     }
     AITER_CHECK(total_iters >= min_iters_per_split,
-    "K=", K, " too small for {{ err_label }} B_K={{ B_K }}: need K >= ",
-    {{ B_K }} * min_iters_per_split);
+    "K=", K, " too small for {{ err_label }} B_K={{ k.B_K }}: need K >= ",
+    {{ k.B_K }} * min_iters_per_split);
     if (require_even_loops_dbuf2) {
     int iters_full = (total_iters + split_k - 1) / split_k;
     int last_loops = total_iters - (split_k - 1) * iters_full;
@@ -105,17 +120,21 @@ void
         " split_k=", split_k, " gives loops=(", iters_full, ",", last_loops, ")");
     }
 
-    int num_tiles_m = (M + {{ B_M }} - 1) / {{ B_M }};
-    int num_tiles_n = (N + {{ B_N }} - 1) / {{ B_N }};
-    int padded_M    = num_tiles_m * {{ B_M }};
-    int padded_N    = num_tiles_n * {{ B_N }};
+    int num_tiles_m = (M + {{ k.B_M }} - 1) / {{ k.B_M }};
+    int num_tiles_n = (N + {{ k.B_N }} - 1) / {{ k.B_N }};
+    int padded_M    = num_tiles_m * {{ k.B_M }};
+    int padded_N    = num_tiles_n * {{ k.B_N }};
 
     auto stream = aiter::getCurrentHIPStream();
     size_t ws_bytes = (size_t)split_k * (size_t)batch
-                * (size_t)padded_M * (size_t)padded_N * sizeof(float);{{ ws_alloc_extra }}
+                * (size_t)padded_M * (size_t)padded_N * sizeof(float);
+{% if fused %}
+    int num_flags = batch * num_tiles_m * num_tiles_n;
+    size_t total_bytes = ws_bytes + (size_t)num_flags * sizeof(unsigned int);
+{% endif %}
     static thread_local void*  ws_cached_ptr   = nullptr;
     static thread_local size_t ws_cached_bytes = 0;
-    if (ws_cached_ptr == nullptr || {{ ws_size_var }} > ws_cached_bytes)
+    if (ws_cached_ptr == nullptr || {% if fused %}total_bytes{% else %}ws_bytes{% endif %} > ws_cached_bytes)
     {
     hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
     HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
@@ -130,11 +149,16 @@ void
         HIP_CALL(hipFree(ws_cached_ptr));
     }
     const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
-    size_t grow_bytes = (({{ ws_size_var }} + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
+    size_t grow_bytes = (({% if fused %}total_bytes{% else %}ws_bytes{% endif %} + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
     HIP_CALL(hipMalloc(&ws_cached_ptr, grow_bytes));
     ws_cached_bytes = grow_bytes;
     }
-    void* ptr_workspace_ = ws_cached_ptr;{{ flags_block }}
+    void* ptr_workspace_ = ws_cached_ptr;
+{% if fused %}
+    unsigned int* ptr_flags_ = reinterpret_cast<unsigned int*>(
+    static_cast<char*>(ws_cached_ptr) + ws_bytes);
+    HIP_CALL(hipMemsetAsync(ptr_flags_, 0, num_flags * sizeof(unsigned int), stream));
+{% endif %}
 
     {{ kargs_name }} kargs{};
     kargs.ptr_a         = XQ.data_ptr();
@@ -142,7 +166,10 @@ void
     kargs.ptr_workspace = ptr_workspace_;
     kargs.ptr_c         = Y.data_ptr();
     kargs.ptr_bias      = ptr_bias_;
-{{ kargs_flags_assign }}    kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
+{% if fused %}
+    kargs.ptr_flags     = ptr_flags_;
+{% endif %}
+    kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
     kargs.split_k = split_k;
     kargs.stride_a        = K;
     kargs.stride_b        = K;
@@ -153,10 +180,147 @@ void
     kargs.stride_ws_batch = padded_M * padded_N;
     kargs.stride_c_batch  = M * N;
     kargs.stride_bias_batch = stride_bias_batch_;
-{{ cooperative_assign }}
-    dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
-    dim3 block_main({{ BLOCK_SIZE }});
+{% if fused %}
+    static thread_local int cu_for_coop = -1;
+    if (cu_for_coop < 0) {
+    int dev_c = 0;
+    hipDeviceProp_t prop_c{};
+    if (hipGetDevice(&dev_c) == hipSuccess &&
+        hipGetDeviceProperties(&prop_c, dev_c) == hipSuccess) {
+        cu_for_coop = prop_c.multiProcessorCount;
+    }
+    if (cu_for_coop <= 0) cu_for_coop = 64;
+    }
+    int total_wgs_coop = num_tiles_m * num_tiles_n * batch * split_k;
+    kargs.cooperative_reduce = (total_wgs_coop <= cu_for_coop) ? 1 : 0;
+{% endif %}
 
-{{ kernel_launch_body }}{{ reduce_launch }}
+    dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
+    dim3 block_main({{ k.BLOCK_SIZE }});
+
+{% if fused %}
+    if (Y.dtype() == AITER_DTYPE_bf16) {
+    {{ kernel_func }}<{{ k.name }}_Traits<D_C>, __bf16><<<grid_main, block_main, 0, stream>>>(kargs);
+    } else {
+    {{ kernel_func }}<{{ k.name }}_Traits<D_C>, float><<<grid_main, block_main, 0, stream>>>(kargs);
+    }
+{% else %}
+    {{ kernel_func }}<{{ k.name }}_Traits<D_C>><<<grid_main, block_main, 0, stream>>>(kargs);
+
+    constexpr int REDUCE_VEC = 16;
+    constexpr int REDUCE_BS  = 64;
+    dim3 grid_reduce((N + REDUCE_VEC * REDUCE_BS - 1) / (REDUCE_VEC * REDUCE_BS),
+                  batch * M, 1);
+    dim3 block_reduce(REDUCE_BS);
+{% if v2_enabled %}
+    // V2/V3 fast path: split_k static-unroll, no OOB.
+    constexpr int V2_VEC = 8;
+    constexpr int V2_BS  = 8;
+    const bool v2_align = (N % (V2_VEC * V2_BS) == 0) && (padded_N == N);
+    dim3 grid_reduce_v2(v2_align ? (N / (V2_VEC * V2_BS)) : 1, batch * M, 1);
+    dim3 block_reduce_v2(V2_BS);
+
+    // V3: multi-row per wg (BLOCK = N_VEC * ROWS_PER_BLOCK = 64, 1 full wave).
+    // Dispatch picks the (N_VEC, ROWS) tuple at runtime; supported set is in
+    // V3_NVEC_ROWS (gen_instances.py).
+    const int v3_n_vec = N / V2_VEC;
+{% endif %}
+    if (Y.dtype() == AITER_DTYPE_bf16) {
+    if (bias.has_value()) {
+{% if v2_enabled %}
+{% set fb = namespace(value=true) %}
+{% for nvec, rows in V3_NVEC_ROWS %}{% for sk in V2_SUPPORTED_SPLITKS %}
+        {% if fb.value %}if{% else %}else if{% endif %} (v2_align && v3_n_vec == {{ nvec }} && (M % {{ rows }} == 0) && split_k == {{ sk }}) {
+{% set fb.value = false %}
+        dim3 grid_v3(1, M / {{ rows }}, batch);
+        dim3 block_v3({{ nvec * rows }});
+        splitk_reduce_kernel_v3<{{ sk }}, {{ nvec }}, {{ rows }}, V2_VEC, __bf16, true, __bf16>
+            <<<grid_v3, block_v3, 0, stream>>>(
+                reinterpret_cast<const float*>(ptr_workspace_),
+                reinterpret_cast<__bf16*>(Y.data_ptr()),
+                M, N, batch, padded_M, padded_N,
+                reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_);
+        }
+{% endfor %}{% endfor %}
+{% for sk in V2_SUPPORTED_SPLITKS %}
+        else if (v2_align && split_k == {{ sk }}) {
+        splitk_reduce_kernel_v2<{{ sk }}, V2_VEC, V2_BS, __bf16, true, __bf16>
+            <<<grid_reduce_v2, block_reduce_v2, 0, stream>>>(
+                reinterpret_cast<const float*>(ptr_workspace_),
+                reinterpret_cast<__bf16*>(Y.data_ptr()),
+                M, N, batch, padded_M, padded_N,
+                reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_);
+        }
+{% endfor %}
+        else {
+{% endif %}
+        splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, true>
+            <<<grid_reduce, block_reduce, 0, stream>>>(
+                reinterpret_cast<const float*>(ptr_workspace_),
+                reinterpret_cast<__bf16*>(Y.data_ptr()),
+                split_k, M, N, batch, padded_M, padded_N,
+                reinterpret_cast<const __bf16*>(ptr_bias_),
+                stride_bias_batch_);
+{% if v2_enabled %}
+        }
+{% endif %}
+    } else {
+{% if v2_enabled %}
+{% set first_branch = namespace(value=true) %}
+{% for nvec, rows in V3_NVEC_ROWS %}{% for sk in V2_SUPPORTED_SPLITKS %}
+        {% if first_branch.value %}if{% else %}else if{% endif %} (v2_align && v3_n_vec == {{ nvec }} && (M % {{ rows }} == 0) && split_k == {{ sk }}) {
+{% set first_branch.value = false %}
+        dim3 grid_v3(1, M / {{ rows }}, batch);
+        dim3 block_v3({{ nvec * rows }});
+        splitk_reduce_kernel_v3<{{ sk }}, {{ nvec }}, {{ rows }}, V2_VEC, __bf16, false, __bf16>
+            <<<grid_v3, block_v3, 0, stream>>>(
+                reinterpret_cast<const float*>(ptr_workspace_),
+                reinterpret_cast<__bf16*>(Y.data_ptr()),
+                M, N, batch, padded_M, padded_N,
+                nullptr, 0);
+        }
+{% endfor %}{% endfor %}
+{% for sk in V2_SUPPORTED_SPLITKS %}
+        else if (v2_align && split_k == {{ sk }}) {
+        splitk_reduce_kernel_v2<{{ sk }}, V2_VEC, V2_BS, __bf16, false, __bf16>
+            <<<grid_reduce_v2, block_reduce_v2, 0, stream>>>(
+                reinterpret_cast<const float*>(ptr_workspace_),
+                reinterpret_cast<__bf16*>(Y.data_ptr()),
+                M, N, batch, padded_M, padded_N,
+                nullptr, 0);
+        }
+{% endfor %}
+        else {
+{% endif %}
+        splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, true>
+            <<<grid_reduce, block_reduce, 0, stream>>>(
+                reinterpret_cast<const float*>(ptr_workspace_),
+                reinterpret_cast<__bf16*>(Y.data_ptr()),
+                split_k, M, N, batch, padded_M, padded_N,
+                nullptr, 0);
+{% if v2_enabled %}
+        }
+{% endif %}
+    }
+    } else {
+    // fp32 output: V2 not implemented yet; use baseline.
+    if (bias.has_value()) {
+        splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, true, float, true>
+            <<<grid_reduce, block_reduce, 0, stream>>>(
+                reinterpret_cast<const float*>(ptr_workspace_),
+                reinterpret_cast<float*>(Y.data_ptr()),
+                split_k, M, N, batch, padded_M, padded_N,
+                reinterpret_cast<const float*>(ptr_bias_),
+                stride_bias_batch_);
+    } else {
+        splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float, true>
+            <<<grid_reduce, block_reduce, 0, stream>>>(
+                reinterpret_cast<const float*>(ptr_workspace_),
+                reinterpret_cast<float*>(Y.data_ptr()),
+                split_k, M, N, batch, padded_M, padded_N,
+                nullptr, 0);
+    }
+    }
+{% endif %}
 }
 {%- endblock %}

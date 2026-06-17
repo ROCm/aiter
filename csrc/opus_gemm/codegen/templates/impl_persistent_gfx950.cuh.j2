@@ -3,20 +3,20 @@
 #include <algorithm>{% endblock %}
 {% block traits_aliases %}
 template <typename D_C>
-using {{ kid_name }}_Traits = {{ traits_name }}<{{ BLOCK_SIZE }},
-    opus::seq<{{ B_M }}, {{ B_N }}, {{ B_K }}>,
+using {{ k.name }}_Traits = {{ traits_name }}<{{ k.BLOCK_SIZE }},
+    opus::seq<{{ k.B_M }}, {{ k.B_N }}, {{ k.B_K }}>,
     opus::tuple<{{ da }}, {{ db }}, D_C, fp32_t>,
-    opus::seq<{{ VEC_A }}, {{ VEC_B }}, {{ VEC_C }}>,
-    opus::seq<{{ T_M }}, {{ T_N }}, 1>,
-    opus::seq<{{ W_M }}, {{ W_N }}, {{ W_K }}>,
-    {{ has_oob_str }},
-    {{ cachectl_a }},
-    {{ cachectl_b }}>;
+    opus::seq<{{ k.VEC_A }}, {{ k.VEC_B }}, {{ k.VEC_C }}>,
+    opus::seq<{{ k.T_M }}, {{ k.T_N }}, 1>,
+    opus::seq<{{ k.W_M }}, {{ k.W_N }}, {{ k.W_K }}>,
+    {{ "true" if k.has_oob else "false" }},
+    {{ k.cachectl_a }},
+    {{ k.cachectl_b }}>;
 {% endblock %}
 {%- block launcher %}
 template <typename D_C>
 void
-{{ kid_name }}(
+{{ k.name }}(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
@@ -27,7 +27,18 @@ void
     int M = XQ.size(1);
     int N = WQ.size(1);
     int K = XQ.size(2);
-{{ k_check }}
+
+
+    int loops_ = (K + {{ k.B_K }} - 1) / {{ k.B_K }};
+    AITER_CHECK(loops_ >= 2,
+        "K=", K, " too small for B_K={{ k.B_K }}, need K >= {{ 2 * k.B_K }}");
+    AITER_CHECK(loops_ % 2 == 0,
+        "ceil_div(K, {{ k.B_K }})=", loops_, " must be even (prefetch constraint)");
+    AITER_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K)");
+    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
+    AITER_CHECK(batch >= 1, "batch must be >= 1");
+
     AITER_CHECK(!bias.has_value(),
         "bias is not supported on a16w16_persistent kid; use a16w16 "
         "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
@@ -46,9 +57,40 @@ void
     kargs.stride_a_batch = M * K;
     kargs.stride_b_batch = N * K;
     kargs.stride_c_batch = M * N;
-{{ grid_setup }}
+
+    constexpr int NUM_CU = 256;
+    constexpr int NUM_XCD = 8;
+    const int num_tiles_m = (M + {{ k.B_M }} - 1) / {{ k.B_M }};
+    const int num_tiles_n = (N + {{ k.B_N }} - 1) / {{ k.B_N }};
+    int split_m = std::max(1, (NUM_CU + num_tiles_n - 1) / num_tiles_n);
+    while (split_m < num_tiles_m && (num_tiles_m % split_m) != 0) split_m++;
+    if (split_m > num_tiles_m) split_m = num_tiles_m;
+    const int m_per_wg = num_tiles_m / split_m;
+    AITER_CHECK(num_tiles_m % split_m == 0,
+        "persistent: num_tiles_m=", num_tiles_m,
+        " must be divisible by split_m=", split_m);
+
+    // Pad grid.y so the XCD-local swizzle math stays bijective. See the
+    // long comment in opus_gemm_pipeline_a16w16_persistent_gfx950.cuh
+    // for why this is needed and why it is free on the large-M shapes
+    // the swizzle is tuned for (split_m is already a multiple of
+    // NUM_XCD there, so the pad is a no-op). When split_m < NUM_XCD
+    // (small-M shapes like M=8192 N=8192 K=256), the pad multiplies
+    // grid.y by NUM_XCD/split_m and the kernel's wave-uniform
+    // early-return guard drops the over-shoot WGs.
+    const int m_grp_per_xcd = (split_m + NUM_XCD - 1) / NUM_XCD;
+    const int grid_y_padded = m_grp_per_xcd * NUM_XCD;
+
+    kargs.m_per_wg = m_per_wg;
+    kargs.num_tiles_n = num_tiles_n;
+    kargs.split_m = split_m;          // un-padded; kernel uses for early-return
+    kargs.m_grp_per_xcd = m_grp_per_xcd;
+
+    dim3 grid(num_tiles_n, grid_y_padded, batch);
+    dim3 block({{ k.BLOCK_SIZE }});
+
     auto stream = aiter::getCurrentHIPStream();
-    {{ kernel_func }}<{{ kid_name }}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
+    {{ kernel_func }}<{{ k.name }}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
 
 }
 {%- endblock %}

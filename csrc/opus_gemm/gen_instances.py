@@ -134,12 +134,13 @@ def _kargs_template_vars(kernel_tag, kargs_name):
 
 
 # Launcher signature tails after Y.
-A16W16_TUNE_HOST_EXTRA = ",\n    std::optional<aiter_tensor_t>,\n    int"
-A8W8_SCALE_HOST_EXTRA = (
-    ",\n    std::optional<aiter_tensor_t> x_scale,"
-    "\n    std::optional<aiter_tensor_t> w_scale"
-)
+A16W16_TUNE_HOST_EXTRA = """,
+    std::optional<aiter_tensor_t>,
+    int"""
 
+A8W8_SCALE_HOST_EXTRA = """,
+    std::optional<aiter_tensor_t> x_scale,
+    std::optional<aiter_tensor_t> w_scale"""
 
 def _record_one_instantiation(
     self_obj, k, kernel_func, kargs_name, host_extra, kargs_explicit_param=""

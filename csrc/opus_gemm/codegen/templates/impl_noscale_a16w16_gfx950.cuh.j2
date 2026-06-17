@@ -1,17 +1,58 @@
 {% extends "_base_impl.cuh.j2" %}
+{%- block traits_aliases %}
+{% if is_a16w16 %}
+template <typename D_C>
+using {{ k.name }}_TraitsNoBias = {{ traits_name }}<{{ k.BLOCK_SIZE }},
+    opus::seq<{{ k.B_M }}, {{ k.B_N }}, {{ k.B_K }}>,
+    opus::tuple<{{ da }}, {{ db }}, D_C, fp32_t>,
+    opus::seq<{{ k.VEC_A }}, {{ k.VEC_B }}, {{ k.VEC_C }}>,
+    opus::seq<{{ k.T_M }}, {{ k.T_N }}, 1>,
+    opus::seq<{{ k.W_M }}, {{ k.W_N }}, {{ k.W_K }}>,
+    false,
+    D_C,
+    {{"true" if k.has_oob else "false"}}{{ cachectl_extra }}>;
+template <typename D_C>
+using {{ k.name }}_TraitsBias = {{ traits_name }}<{{ k.BLOCK_SIZE }},
+    opus::seq<{{ k.B_M }}, {{ k.B_N }}, {{ k.B_K }}>,
+    opus::tuple<{{ da }}, {{ db }}, D_C, fp32_t>,
+    opus::seq<{{ k.VEC_A }}, {{ k.VEC_B }}, {{ k.VEC_C }}>,
+    opus::seq<{{ k.T_M }}, {{ k.T_N }}, 1>,
+    opus::seq<{{ k.W_M }}, {{ k.W_N }}, {{ k.W_K }}>,
+    true,
+    D_C{{ traits_alias_tail }}{{ cachectl_extra }}>;
+{% else %}
+template <typename D_C>
+using {{ k.name }}_Traits = {{ traits_name }}<{{ k.BLOCK_SIZE }},
+    opus::seq<{{ k.B_M }}, {{ k.B_N }}, {{ k.B_K }}>,
+    opus::tuple<{{ da }}, {{ db }}, D_C, fp32_t>,
+    opus::seq<{{ k.VEC_A }}, {{ k.VEC_B }}, {{ k.VEC_C }}>>;
+{% endif %}
+{%- endblock %}
 {%- block launcher %}
 template <typename D_C>
 void
-{{ kid_name }}(
+{{ k.name }}(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
-    aiter_tensor_t &Y{{ extra_param }})
+    aiter_tensor_t &Y{% if has_tune_tags %},
+    std::optional<aiter_tensor_t> bias,
+    int /*splitK*/{% endif %})
 {
     int batch = XQ.size(0);
     int M = XQ.size(1);
     int N = WQ.size(1);
     int K = XQ.size(2);
-{{ k_check }}
+
+    int loops_ = (K + {{ k.B_K }} - 1) / {{ k.B_K }};
+    AITER_CHECK(loops_ >= 2,
+        "K=", K, " too small for k.B_K={{ k.B_K }}, need K >= {{ 2 * k.B_K }}");
+    AITER_CHECK(loops_ % 2 == 0,
+        "ceil_div(K, {{ k.B_K }})=", loops_, " must be even (prefetch constraint)");
+    AITER_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K due to a "
+        "latent K-tail accumulation bug; pass an even K)");
+    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
+
     {{ kargs_name }} kargs{};
     kargs.ptr_a = XQ.data_ptr();
     kargs.ptr_b = WQ.data_ptr();
@@ -26,12 +67,29 @@ void
     kargs.stride_a_batch = M * K;
     kargs.stride_b_batch = N * K;
     kargs.stride_c_batch = M * N;
-{{ kargs_init_extra }}{{ bias_kargs_block }}
-    int num_tiles_m = (M + {{ B_M }} - 1) / {{ B_M }};
-    int num_tiles_n = (N + {{ B_N }} - 1) / {{ B_N }};
+{% if is_a16w16 %}
+{% include "_bias_validate.cuh.j2" %}
+    kargs.ptr_bias = ptr_bias_;
+    kargs.stride_bias_batch = stride_bias_batch_;
+{% elif has_tune_tags %}
+    AITER_CHECK(!bias.has_value(),
+        "bias not supported on this a16w16 kid");
+{% endif %}
+    int num_tiles_m = (M + {{ k.B_M }} - 1) / {{ k.B_M }};
+    int num_tiles_n = (N + {{ k.B_N }} - 1) / {{ k.B_N }};
     dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
-    dim3 block({{ BLOCK_SIZE }});
-{{ launch_block }}
+    dim3 block({{ k.BLOCK_SIZE }});
+
+    auto stream = aiter::getCurrentHIPStream();
+{% if is_a16w16 %}
+    if (bias.has_value()) {
+        {{ kernel_func }}<{{ k.name }}_TraitsBias<D_C>><<<grid, block, 0, stream>>>(kargs);
+    } else {
+        {{ kernel_func }}<{{ k.name }}_TraitsNoBias<D_C>><<<grid, block, 0, stream>>>(kargs);
+    }
+{% else %}
+    {{ kernel_func }}<{{ k.name }}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
+{% endif %}
 
 }
 {%- endblock %}

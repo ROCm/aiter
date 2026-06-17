@@ -1,16 +1,16 @@
 {% extends "_base_impl.cuh.j2" %}
 {% block traits_aliases %}
 template <typename D_C>
-using {{ kid_name }}_Traits = {{ traits_name }}<{{ BLOCK_SIZE }},
-    opus::seq<{{ B_M }}, {{ B_N }}, {{ B_K }}>,
+using {{ k.name }}_Traits = {{ traits_name }}<{{ k.BLOCK_SIZE }},
+    opus::seq<{{ k.B_M }}, {{ k.B_N }}, {{ k.B_K }}>,
     opus::tuple<{{ da }}, {{ db }}, D_C, fp32_t, fp32_t>,
-    opus::seq<{{ VEC_A }}, {{ VEC_B }}, {{ VEC_C }}>,
-    opus::seq<{{ GROUP_M }}, {{ GROUP_N }}, {{ GROUP_K }}>>;
+    opus::seq<{{ k.VEC_A }}, {{ k.VEC_B }}, {{ k.VEC_C }}>,
+    opus::seq<{{ k.GROUP_M }}, {{ k.GROUP_N }}, {{ k.GROUP_K }}>>;
 {% endblock %}
 {%- block launcher %}
 template <typename D_C>
 void
-{{ kid_name }}(
+{{ k.name }}(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
@@ -22,11 +22,11 @@ void
     int N = WQ.size(1);
     int K = XQ.size(2);
 
-    using Traits = {{ kid_name }}_Traits<D_C>;
+    using Traits = {{ k.name }}_Traits<D_C>;
 
-    int GROUP_M = {{ GROUP_M }};
-    int GROUP_N = {{ GROUP_N }};
-    int GROUP_K = {{ GROUP_K }};
+    int GROUP_M = {{ k.GROUP_M }};
+    int GROUP_N = {{ k.GROUP_N }};
+    int GROUP_K = {{ k.GROUP_K }};
     int num_groups_m = M / GROUP_M;
     int num_groups_n = N / GROUP_N;
     int num_groups_k = K / GROUP_K;
@@ -53,13 +53,13 @@ void
     kargs.stride_sfa_batch = num_groups_m * num_groups_k;
     kargs.stride_sfb_batch = num_groups_n * num_groups_k;
 
-    int num_tiles_m = (M + {{ B_M }} - 1) / {{ B_M }};
-    int num_tiles_n = (N + {{ B_N }} - 1) / {{ B_N }};
+    int num_tiles_m = (M + {{ k.B_M }} - 1) / {{ k.B_M }};
+    int num_tiles_n = (N + {{ k.B_N }} - 1) / {{ k.B_N }};
     dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
-    dim3 block({{ BLOCK_SIZE }});
+    dim3 block({{ k.BLOCK_SIZE }});
 
     auto stream = aiter::getCurrentHIPStream();
-    {{ kernel_func }}<{{ kid_name }}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
+    {{ kernel_func }}<{{ k.name }}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
 
 }
 {%- endblock %}

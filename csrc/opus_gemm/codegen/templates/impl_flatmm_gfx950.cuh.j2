@@ -1,8 +1,18 @@
 {% extends "_base_impl.cuh.j2" %}
+{%- block traits_aliases %}
+template <typename D_C>
+using {{ k.name }}_Traits = {{ traits_name }}<{{ k.BLOCK_SIZE }},
+    opus::seq<{{ k.B_M }}, {{ k.B_N }}, {{ k.B_K }}>,
+    opus::tuple<{{ da }}, {{ db }}, D_C, fp32_t, D_C>,
+    opus::seq<{{ k.VEC_A }}, {{ k.VEC_B }}, {{ k.VEC_C }}>,
+    opus::seq<{{ k.W_M }}, {{ k.W_N }}, {{ k.W_K }}>,
+    {{ k.WG_PER_CU }},
+    false>;
+{%- endblock %}
 {%- block launcher %}
 template <typename D_C>
 void
-{{ kid_name }}(
+{{ k.name }}(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
@@ -18,8 +28,18 @@ void
         "bias is not yet supported on a16w16_flatmm kid; use a16w16 "
         "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
 
-    using Traits = {{ kid_name }}_Traits<D_C>;
-{{ k_check }}
+    using Traits = {{ k.name }}_Traits<D_C>;
+
+    int loops_ = (K + {{ k.B_K }} - 1) / {{ k.B_K }};
+    AITER_CHECK(loops_ >= Traits::prefetch_k_iter,
+        "K=", K, " too small for flatmm B_K={{ k.B_K }}, need K >= pfk*B_K = ",
+        Traits::prefetch_k_iter * {{ k.B_K }}, " (pfk=", Traits::prefetch_k_iter, ")");
+    AITER_CHECK(M >= 1 && N >= 1 && K >= 1, "M, N, K must be >= 1");
+    AITER_CHECK(batch >= 1, "batch must be >= 1");
+    AITER_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K due to a "
+        "latent K-tail accumulation bug; pass an even K)");
+
     {{ kargs_name }} kargs{};
     kargs.ptr_a = XQ.data_ptr();
     kargs.ptr_b = WQ.data_ptr();
@@ -36,13 +56,13 @@ void
     kargs.stride_b_batch = N * K;
     kargs.stride_c_batch = M * N;
 
-    int num_tiles_m = (M + {{ B_M }} - 1) / {{ B_M }};
-    int num_tiles_n = (N + {{ B_N }} - 1) / {{ B_N }};
+    int num_tiles_m = (M + {{ k.B_M }} - 1) / {{ k.B_M }};
+    int num_tiles_n = (N + {{ k.B_N }} - 1) / {{ k.B_N }};
     dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
-    dim3 block({{ BLOCK_SIZE }});
+    dim3 block({{ k.BLOCK_SIZE }});
 
     auto stream = aiter::getCurrentHIPStream();
-    {{ kernel_func }}<{{ kid_name }}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
+    {{ kernel_func }}<{{ k.name }}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
 
 }
 {%- endblock %}

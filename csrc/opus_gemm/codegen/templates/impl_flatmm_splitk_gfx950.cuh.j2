@@ -1,8 +1,19 @@
 {% extends "_base_impl.cuh.j2" %}
+{%- block traits_aliases %}
+template <typename D_C>
+using {{ k.name }}_Traits = {{ traits_name }}<{{ k.BLOCK_SIZE }},
+    opus::seq<{{ k.B_M }}, {{ k.B_N }}, {{ k.B_K }}>,
+    opus::tuple<{{ da }}, {{ db }}, fp32_t, fp32_t, {{ da }}>,
+    opus::seq<{{ k.VEC_A }}, {{ k.VEC_B }}, {{ k.VEC_C }}>,
+    opus::seq<{{ k.W_M }}, {{ k.W_N }}, {{ k.W_K }}>,
+    {{ k.WG_PER_CU }},
+    false,
+    {{ "true" if k.has_oob else "false" }}>;
+{%- endblock %}
 {%- block launcher %}
 template <typename D_C>
 void
-{{ kid_name }}(
+{{ k.name }}(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
@@ -28,11 +39,11 @@ void
         "K=", K, " must be even (a16w16 family rejects odd K due to a "
         "latent K-tail accumulation bug; pass an even K)");
 {% include "_bias_validate.cuh.j2" %}
-    using Traits = {{ kid_name }}_Traits<D_C>;
+    using Traits = {{ k.name }}_Traits<D_C>;
 
     int split_k = (splitK <= 1) ? 1 : splitK;
 
-    int total_iters = (K + {{ B_K }} - 1) / {{ B_K }};
+    int total_iters = (K + {{ k.B_K }} - 1) / {{ k.B_K }};
     constexpr int pfk = Traits::prefetch_k_iter;
     while (split_k > 1) {
         int iters_full = (total_iters + split_k - 1) / split_k;
@@ -41,14 +52,14 @@ void
         split_k--;
     }
     AITER_CHECK(total_iters >= pfk,
-        "K=", K, " too small for flatmm_splitk B_K={{ B_K }}: "
-        "need total_iters >= pfk*B_K = ", pfk * {{ B_K }},
+        "K=", K, " too small for flatmm_splitk B_K={{ k.B_K }}: "
+        "need total_iters >= pfk*B_K = ", pfk * {{ k.B_K }},
         " (pfk=", pfk, ")");
 
-    int num_tiles_m = (M + {{ B_M }} - 1) / {{ B_M }};
-    int num_tiles_n = (N + {{ B_N }} - 1) / {{ B_N }};
-    int padded_M    = num_tiles_m * {{ B_M }};
-    int padded_N    = num_tiles_n * {{ B_N }};
+    int num_tiles_m = (M + {{ k.B_M }} - 1) / {{ k.B_M }};
+    int num_tiles_n = (N + {{ k.B_N }} - 1) / {{ k.B_N }};
+    int padded_M    = num_tiles_m * {{ k.B_M }};
+    int padded_N    = num_tiles_n * {{ k.B_N }};
 
     // Per-stream workspace handle (process-global registry, mutex-protected
     // in opus_gemm.cu). Replaces the prior `static thread_local` cache --
@@ -109,7 +120,7 @@ void
     kargs.stride_bias_batch = stride_bias_batch_;
 
     dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
-    dim3 block_main({{ BLOCK_SIZE }});
+    dim3 block_main({{ k.BLOCK_SIZE }});
 
     constexpr int REDUCE_VEC = 16;
     constexpr int REDUCE_BS  = 64;
@@ -117,10 +128,10 @@ void
                       batch * M, 1);
     dim3 block_reduce(REDUCE_BS);
 
-    {{ kernel_func }}<{{ kid_name }}_Traits<D_C>><<<grid_main, block_main, 0, stream>>>(kargs);
+    {{ kernel_func }}<{{ k.name }}_Traits<D_C>><<<grid_main, block_main, 0, stream>>>(kargs);
     if (Y.dtype() == AITER_DTYPE_bf16) {
         if (bias.has_value()) {
-            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {{ has_oob_str }}>
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {{ "true" if k.has_oob else "false" }}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
                     ws_handle_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
@@ -128,7 +139,7 @@ void
                     reinterpret_cast<const __bf16*>(ptr_bias_),
                     stride_bias_batch_);
         } else {
-            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {{ has_oob_str }}>
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {{ "true" if k.has_oob else "false" }}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
                     ws_handle_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
@@ -137,7 +148,7 @@ void
         }
     } else {
         if (bias.has_value()) {
-            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, true, float, {{ has_oob_str }}>
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, true, float, {{ "true" if k.has_oob else "false" }}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
                     ws_handle_,
                     reinterpret_cast<float*>(Y.data_ptr()),
@@ -145,7 +156,7 @@ void
                     reinterpret_cast<const float*>(ptr_bias_),
                     stride_bias_batch_);
         } else {
-            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float, {{ has_oob_str }}>
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float, {{ "true" if k.has_oob else "false" }}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
                     ws_handle_,
                     reinterpret_cast<float*>(Y.data_ptr()),
