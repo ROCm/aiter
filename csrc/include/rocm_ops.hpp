@@ -2233,11 +2233,11 @@ namespace py = pybind11;
           py::arg("num_heads_qk"),                                    \
           py::arg("num_heads_v"),                                     \
           py::arg("head_dim"),                                        \
-          py::arg("softplus_beta")           = 1.0f,                  \
-          py::arg("softplus_threshold")      = 20.0f,                 \
-          py::arg("scale")                   = -1.0f,                 \
-          py::arg("use_qk_l2norm_in_kernel") = true,                  \
-          py::arg("output")                  = c10::nullopt);
+          py::arg("softplus_beta"),                                   \
+          py::arg("softplus_threshold"),                              \
+          py::arg("scale"),                                           \
+          py::arg("use_qk_l2norm_in_kernel"),                         \
+          py::arg("output"));
 #define MLA_HK_PYBIND                   \
     m.def("hk_mla_decode_fwd",          \
           &hk_mla_decode_fwd,           \
