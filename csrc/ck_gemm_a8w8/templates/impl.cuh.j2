@@ -1,0 +1,200 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#include "gemm_a8w8_common.cuh"
+
+template <typename ABDataType, typename DDataType, typename EDataType = DDataType>
+torch::Tensor
+{{ k.name }}(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y,
+    std::optional<torch::Tensor> bias,
+    int KBatch)
+{
+    // The smallest kernel we have available. Works well for memory bound shapes.
+
+    // Check if this input needs to be padded.
+    int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
+    int N = WQ.size(0);
+    int K = WQ.size(1);
+    bool pad = (M % {{ k.MPerBLOCK }} != 0) || (N % {{ k.NPerBLOCK }} != 0) || (K % ({{ k.KPerBLOCK }} * KBatch) != 0);
+    using AccDataType = std::conditional_t<ck::is_same_v<ABDataType, I8>, I32, F32>;
+    if (pad)
+    {
+        // pad
+{%- if istune %}
+        using DeviceGemmInstance = DeviceGemmHelper<
+            ABDataType,
+            AccDataType,
+            DDataType, EDataType,
+            RowwiseScale<AccDataType, DDataType, EDataType>,
+            {{ k.BLOCK_SIZE }},
+            {{ k.MPerBLOCK }},
+            {{ k.NPerBLOCK }},
+            {{ k.KPerBLOCK }},
+            {{ k.WAVE_TILE_M }},
+            {{ k.WAVE_TILE_N }},
+            {{ k.WAVE_MAP_M }},
+            {{ k.WAVE_MAP_N }},
+            S<{{ k.ABLOCK_TRANSFER | join(', ') }}>,
+            S<{{ k.BBLOCK_TRANSFER | join(', ') }}>,
+            S<{{ k.CBLOCK_TRANSFER | join(', ') }}>,
+            S<{{ k.CBLOCK_SPV | join(', ') }}>,
+            {{ k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE }},
+            {{ k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE }},
+            ck::BlockGemmPipelineScheduler::{{ k.LOOP_SCHED }},
+            ck::BlockGemmPipelineVersion::v{{ k.PIPELINE_VERSION }},
+            ck::tensor_operation::device::GemmSpecialization::MNKPadding>;
+        // Run kernel instance.
+        return gemm_a8w8_rowwise_impl<ABDataType, DDataType, EDataType, false, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+{%- else %}
+        if (bias != std::nullopt)
+        {
+            using DeviceGemmInstance = DeviceGemmHelper<
+                ABDataType,
+                AccDataType,
+                DDataType, EDataType,
+                MultiplyMultiplyAdd<AccDataType, DDataType, EDataType>,
+                {{ k.BLOCK_SIZE }},
+                {{ k.MPerBLOCK }},
+                {{ k.NPerBLOCK }},
+                {{ k.KPerBLOCK }},
+                {{ k.WAVE_TILE_M }},
+                {{ k.WAVE_TILE_N }},
+                {{ k.WAVE_MAP_M }},
+                {{ k.WAVE_MAP_N }},
+                S<{{ k.ABLOCK_TRANSFER | join(', ') }}>,
+                S<{{ k.BBLOCK_TRANSFER | join(', ') }}>,
+                S<{{ k.CBLOCK_TRANSFER | join(', ') }}>,
+                S<{{ k.CBLOCK_SPV | join(', ') }}, {{ k.CBLOCK_SPV[0] }}>,
+                {{ k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE }},
+                {{ k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE }},
+                ck::BlockGemmPipelineScheduler::{{ k.LOOP_SCHED }},
+                ck::BlockGemmPipelineVersion::v{{ k.PIPELINE_VERSION }},
+                ck::tensor_operation::device::GemmSpecialization::MNKPadding>;
+            // Run kernel instance.
+            return gemm_a8w8_rowwise_impl<ABDataType, DDataType, EDataType, true, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+        }
+        else
+        {
+            using DeviceGemmInstance = DeviceGemmHelper<
+                ABDataType,
+                AccDataType,
+                DDataType, EDataType,
+                RowwiseScale<AccDataType, DDataType, EDataType>,
+                {{ k.BLOCK_SIZE }},
+                {{ k.MPerBLOCK }},
+                {{ k.NPerBLOCK }},
+                {{ k.KPerBLOCK }},
+                {{ k.WAVE_TILE_M }},
+                {{ k.WAVE_TILE_N }},
+                {{ k.WAVE_MAP_M }},
+                {{ k.WAVE_MAP_N }},
+                S<{{ k.ABLOCK_TRANSFER | join(', ') }}>,
+                S<{{ k.BBLOCK_TRANSFER | join(', ') }}>,
+                S<{{ k.CBLOCK_TRANSFER | join(', ') }}>,
+                S<{{ k.CBLOCK_SPV | join(', ') }}>,
+                {{ k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE }},
+                {{ k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE }},
+                ck::BlockGemmPipelineScheduler::{{ k.LOOP_SCHED }},
+                ck::BlockGemmPipelineVersion::v{{ k.PIPELINE_VERSION }},
+                ck::tensor_operation::device::GemmSpecialization::MNKPadding>;
+            // Run kernel instance.
+            return gemm_a8w8_rowwise_impl<ABDataType, DDataType, EDataType, false, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+        }
+{%- endif %}
+
+        // pad
+    }
+    else
+    {
+        // no pad
+{%- if istune %}
+        using DeviceGemmInstance = DeviceGemmHelper<
+            ABDataType,
+            AccDataType,
+            DDataType, EDataType,
+            RowwiseScale<AccDataType, DDataType, EDataType>,
+            {{ k.BLOCK_SIZE }},
+            {{ k.MPerBLOCK }},
+            {{ k.NPerBLOCK }},
+            {{ k.KPerBLOCK }},
+            {{ k.WAVE_TILE_M }},
+            {{ k.WAVE_TILE_N }},
+            {{ k.WAVE_MAP_M }},
+            {{ k.WAVE_MAP_N }},
+            S<{{ k.ABLOCK_TRANSFER | join(', ') }}>,
+            S<{{ k.BBLOCK_TRANSFER | join(', ') }}>,
+            S<{{ k.CBLOCK_TRANSFER | join(', ') }}>,
+            S<{{ k.CBLOCK_SPV | join(', ') }}>,
+            {{ k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE }},
+            {{ k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE }},
+            ck::BlockGemmPipelineScheduler::{{ k.LOOP_SCHED }},
+            ck::BlockGemmPipelineVersion::v{{ k.PIPELINE_VERSION }},
+            ck::tensor_operation::device::GemmSpecialization::Default>;
+        // Run kernel instance.
+        return gemm_a8w8_rowwise_impl<ABDataType, DDataType, EDataType, false, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+{%- else %}
+        if (bias != std::nullopt)
+        {
+            using DeviceGemmInstance = DeviceGemmHelper<
+                ABDataType,
+                AccDataType,
+                DDataType, EDataType,
+                MultiplyMultiplyAdd<AccDataType, DDataType, EDataType>,
+                {{ k.BLOCK_SIZE }},
+                {{ k.MPerBLOCK }},
+                {{ k.NPerBLOCK }},
+                {{ k.KPerBLOCK }},
+                {{ k.WAVE_TILE_M }},
+                {{ k.WAVE_TILE_N }},
+                {{ k.WAVE_MAP_M }},
+                {{ k.WAVE_MAP_N }},
+                S<{{ k.ABLOCK_TRANSFER | join(', ') }}>,
+                S<{{ k.BBLOCK_TRANSFER | join(', ') }}>,
+                S<{{ k.CBLOCK_TRANSFER | join(', ') }}>,
+                S<{{ k.CBLOCK_SPV | join(', ') }}, {{ k.CBLOCK_SPV[0] }}>,
+                {{ k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE }},
+                {{ k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE }},
+                ck::BlockGemmPipelineScheduler::{{ k.LOOP_SCHED }},
+                ck::BlockGemmPipelineVersion::v{{ k.PIPELINE_VERSION }},
+                ck::tensor_operation::device::GemmSpecialization::Default>;
+            // Run kernel instance.
+            return gemm_a8w8_rowwise_impl<ABDataType, DDataType, EDataType, true, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+        }
+        else
+        {
+            using DeviceGemmInstance = DeviceGemmHelper<
+                ABDataType,
+                AccDataType,
+                DDataType, EDataType,
+                RowwiseScale<AccDataType, DDataType, EDataType>,
+                {{ k.BLOCK_SIZE }},
+                {{ k.MPerBLOCK }},
+                {{ k.NPerBLOCK }},
+                {{ k.KPerBLOCK }},
+                {{ k.WAVE_TILE_M }},
+                {{ k.WAVE_TILE_N }},
+                {{ k.WAVE_MAP_M }},
+                {{ k.WAVE_MAP_N }},
+                S<{{ k.ABLOCK_TRANSFER | join(', ') }}>,
+                S<{{ k.BBLOCK_TRANSFER | join(', ') }}>,
+                S<{{ k.CBLOCK_TRANSFER | join(', ') }}>,
+                S<{{ k.CBLOCK_SPV | join(', ') }}>,
+                {{ k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE }},
+                {{ k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE }},
+                ck::BlockGemmPipelineScheduler::{{ k.LOOP_SCHED }},
+                ck::BlockGemmPipelineVersion::v{{ k.PIPELINE_VERSION }},
+                ck::tensor_operation::device::GemmSpecialization::Default>;
+            // Run kernel instance.
+            return gemm_a8w8_rowwise_impl<ABDataType, DDataType, EDataType, false, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+        }
+{%- endif %}
+
+        // no pad
+    }
+}
+
