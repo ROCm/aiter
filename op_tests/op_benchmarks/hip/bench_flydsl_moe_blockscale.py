@@ -24,7 +24,7 @@ Caveats:
   * Only the ``dsr1`` preset has a tuned tile row in the dispatcher CSV.
     Other presets run with the default tile (64,128,128) and may be far
     from optimal — read the non-DSR1 numbers as exploratory, not tuned.
-  * Tier-C kwarg combinations on non-DSR1 shapes are skipped (logged),
+  * Unsupported kwarg combinations on non-DSR1 shapes are skipped (logged),
     not raised, so a multi-preset run completes end-to-end.
 """
 
@@ -263,6 +263,8 @@ def _bench_one(
                 tile_k=tile_k,
                 waves_per_eu=waves_per_eu,
                 act=act,
+                num_iters=num_iters,
+                num_warmup=num_warmup,
             )
         )
         out2, a2_bq, a2_scale_2d, us_fly_s2 = _launch_flydsl_stage2(
@@ -276,6 +278,8 @@ def _bench_one(
             sorted_w=sorted_w,
             sorted_e=sorted_e,
             num_valid=num_valid,
+            num_iters=num_iters,
+            num_warmup=num_warmup,
         )
         us_fly_total = us_fly_s1 + us_fly_s2
         fly_note = ""

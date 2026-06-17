@@ -39,7 +39,7 @@ from aiter.aot.flydsl.common import (
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
-    _ptr_view_safe,
+    _as_memref,
     _run_compiled,
     _s1_args_fp4,
     _s1_args_std,
@@ -532,10 +532,11 @@ def _precompile_to_cache(
                 # Blockscale fp8/fp8 launcher has an arg_out_scale_sorted slot;
                 # other stage1 launchers don't. Pass a 1-byte placeholder for
                 # blockscale so the slot count matches, None otherwise so
-                # _s1_args_std omits it.
-                _is_blockscale_s1 = (
-                    a_dtype == "fp8" and b_dtype == "fp8" and not _is_splitk
-                )
+                # _s1_args_std omits it. The slot is unconditional in
+                # compile_blockscale_moe_gemm1 (present for k_batch>1 too), so
+                # this must match the runtime condition in moe_kernels.py and
+                # NOT exclude split-K.
+                _is_blockscale_s1 = a_dtype == "fp8" and b_dtype == "fp8"
                 _s1_scale_arg = (
                     torch.empty(1, dtype=torch.uint8, device=dev)
                     if _is_blockscale_s1
@@ -606,13 +607,13 @@ def _precompile_to_cache(
                 _run_compiled(
                     silu_fused,
                     (
-                        _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
-                        _ptr_view_safe(out.view(-1).view(torch.uint8)),
-                        _ptr_view_safe(out_scale_sorted_flat),
-                        _ptr_view_safe(sorted_token_ids),
-                        _ptr_view_safe(num_valid_ids),
-                        _ptr_view_safe(sorted_token_ids.view(-1)),
-                        _ptr_view_safe(torch.empty(0, device=dev, dtype=torch.float32)),
+                        _as_memref(tmp_out.view(-1, inter_dim * 2)),
+                        _as_memref(out.view(-1).view(torch.uint8)),
+                        _as_memref(out_scale_sorted_flat),
+                        _as_memref(sorted_token_ids),
+                        _as_memref(num_valid_ids),
+                        _as_memref(sorted_token_ids.view(-1)),
+                        _as_memref(torch.empty(0, device=dev, dtype=torch.float32)),
                         tokens,
                         sorted_token_ids.shape[0],
                         0,

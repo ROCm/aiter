@@ -26,7 +26,7 @@ AITER-SIDE ADDITIONS (on top of upstream)
 * ``gui_layout`` per-16 interleave for stage1 ``tmp_out`` to match the
   downstream ``silu_and_mul_fq`` consumer in the split-K path.
 * The ``compile_flydsl_moe_stage{1,2}`` adapter functions and the
-  Tier A/B/C aiter dispatcher signature (originally housed in a separate
+  aiter dispatcher signature (originally housed in a separate
   ``_blockscale_moe_gemm_2stage_upstream.py`` companion file; merged into
   this file 2026-06 to make the upstream vendor surface and the aiter
   adapter discoverable in one place).
@@ -138,29 +138,14 @@ def compile_moe_blockscale_gemm1(
     # `tmp_out` in the gui_layout per-16 interleave that the downstream
     # `silu_and_mul_fq` kernel expects.
     k_batch = int(k_batch)
-    if k_batch < 1:
-        raise ValueError(f"k_batch must be >= 1, got {k_batch}")
-    if k_batch > 1:
-        if model_dim % k_batch != 0:
-            raise ValueError(f"k_batch={k_batch} does not divide model_dim={model_dim}")
-        k_per_split = model_dim // k_batch
-        if k_per_split % scale_block_k != 0:
-            raise ValueError(
-                f"k_per_split={k_per_split} not divisible by "
-                f"scale_block_k={scale_block_k}"
-            )
-        if k_per_split % tile_k != 0:
-            raise ValueError(
-                f"k_per_split={k_per_split} not divisible by tile_k={tile_k}"
-            )
-        if (k_per_split // tile_k) < 2 or ((k_per_split // tile_k) % 2) != 0:
-            raise ValueError(
-                f"k_per_split={k_per_split} / tile_k={tile_k} = "
-                f"{k_per_split // tile_k} must be even and >= 2 (K-loop "
-                "unrolls in pairs of tile_k tiles)"
-            )
-    else:
-        k_per_split = int(model_dim)
+    # Single source of truth for the K-slice rule lives in
+    # `_splitk_kslice_reason` (defined later at module scope; resolved at call
+    # time). This catches direct kernel callers that bypass the dispatcher's
+    # `_validate_split_k`.
+    _kslice_reason = _splitk_kslice_reason(k_batch, model_dim, tile_k, scale_block_k)
+    if _kslice_reason is not None:
+        raise ValueError(_kslice_reason)
+    k_per_split = model_dim // k_batch if k_batch > 1 else int(model_dim)
     if k_batch > 1 and bool(doweight_stage1):
         # The plan defers sorted_weight to silu_and_mul_fq under split-K, but
         # the current aiter dispatcher's _gui_sk path does not forward
@@ -3303,475 +3288,6 @@ def compile_moe_blockscale_gemm2(
     return launch_moe_blockscale_gemm2
 
 
-# MoE Reduction Kernel (reduce sum over topk dimension)
-@functools.lru_cache(maxsize=1024)
-def compile_moe_reduction(
-    *,
-    topk: int,
-    model_dim: int,
-    dtype_str: str = "f16",
-    use_mask: bool = False,
-):
-    """Compile a reduction kernel that sums over the topk dimension.
-
-    Input:  X [tokens, topk, model_dim]
-            valid_mask [tokens, topk] (optional, if use_mask=True)
-    Output: Y [tokens, model_dim]
-
-    This kernel performs: Y[t, d] = sum(X[t, :, d]) for all t, d.
-    When use_mask=True, only sums slots where valid_mask[t,k]=1.
-    Used in conjunction with compile_moe_blockscale_gemm2(accumulate=False) to avoid atomic contention.
-    """
-    get_hip_arch()
-    ir.ShapedType.get_dynamic_size()
-
-    # Kernel Config
-    BLOCK_SIZE = 256
-    VEC_WIDTH = 8
-
-    masked = "masked" if use_mask else ""
-
-    module_name = f"bs_moe_reduce_topk{topk}_{dtype_str}{masked}"
-
-    if dtype_str == "f32":
-        elem_type_tag = "f32"
-    elif dtype_str == "f16":
-        elem_type_tag = "f16"
-    elif dtype_str == "bf16":
-        elem_type_tag = "bf16"
-    else:
-        raise ValueError(f"Unsupported dtype: {dtype_str}")
-    compute_type = lambda: T.f32  # noqa: E731
-    i8_type = lambda: T.i8  # noqa: E731
-
-    def elem_type():
-        ty = (
-            T.f32
-            if elem_type_tag == "f32"
-            else (T.f16 if elem_type_tag == "f16" else T.bf16)
-        )
-        return ty() if callable(ty) else ty
-
-    if True:
-
-        @flyc.kernel(name=module_name)
-        def moe_reduction_kernel(
-            X: fx.Tensor,
-            Y: fx.Tensor,
-            valid_mask: fx.Tensor,
-            i32_m_tokens: fx.Int32,
-        ):
-            m_tokens = fx.Index(i32_m_tokens)
-            c_topk = fx.Index(topk)
-            c_model_dim = fx.Index(model_dim)
-            mask_nbytes_idx = m_tokens * c_topk
-            elem_bits = 32 if dtype_str == "f32" else 16
-            copy_vec_width = 128 // elem_bits  # 8 for f16/bf16, 4 for f32
-            n_sub = VEC_WIDTH // copy_vec_width  # 1 for f16/bf16, 2 for f32
-            # Buffer-backed tensors via layout API (all dtypes)
-            X_buf = fx.rocdl.make_buffer_tensor(X)
-            Y_buf = fx.rocdl.make_buffer_tensor(Y)
-            # Scalar buffer resources for tail path and mask
-            x_rsrc = buffer_ops.create_buffer_resource(X, max_size=True)
-            y_rsrc = buffer_ops.create_buffer_resource(Y, max_size=True)
-            mask_rsrc = buffer_ops.create_buffer_resource(
-                valid_mask, max_size=False, num_records_bytes=mask_nbytes_idx
-            )
-
-            token_idx = gpu.block_id("x")
-            tile_idx = gpu.block_id("y")
-            tid = gpu.thread_id("x")
-
-            # Guard: token in range (Index is unsigned → auto ult)
-            tok_ok = token_idx < m_tokens
-            _if_tok = scf.IfOp(tok_ok)
-            with _if_then(_if_tok):
-                tile_cols = BLOCK_SIZE * VEC_WIDTH
-                c_tile_cols = fx.Index(tile_cols)
-                c_vecw = fx.Index(VEC_WIDTH)
-
-                col_base = tile_idx * c_tile_cols + tid * c_vecw
-
-                # Guard: any work in bounds (Index < → ult)
-                col_ok = col_base < c_model_dim
-                _if_col = scf.IfOp(col_ok)
-                with _if_then(_if_col):
-                    # Fast path: full vector in-bounds (Index <= → ule)
-                    end_ok = col_base + c_vecw <= c_model_dim
-                    _if_full = scf.IfOp(end_ok, has_else=True)
-                    with _if_then(_if_full):
-                        # ── Vector path via layout API (all dtypes) ──
-                        # fx.copy auto-iterates when atom width < VEC_WIDTH
-                        # (e.g. f32: BufferCopy128b handles 4, fx.copy issues 2 calls for 8)
-                        copy_atom = fx.make_copy_atom(
-                            fx.rocdl.BufferCopy128b(), elem_bits
-                        )
-                        vec_type_c = T.vec(copy_vec_width, compute_type())
-                        vec_type_e = T.vec(copy_vec_width, elem_type())
-
-                        acc_vecs = [
-                            vector.broadcast(vec_type_c, fx.Float32(0.0).ir_value())
-                            for _ in range(n_sub)
-                        ]
-                        elem_dtype = fx.Numeric.from_ir_type(elem_type())
-
-                        tok_i32 = fx.Int32(token_idx)
-                        tile_i32 = fx.Int32(tile_idx)
-                        tid_i32 = fx.Int32(tid)
-
-                        for k in range_constexpr(topk):
-                            # X[token, k, :] → tile → thread's VEC_WIDTH slice
-                            x_row = X_buf[tok_i32, fx.Int32(k), None]
-                            x_tiled = fx.logical_divide(
-                                x_row, fx.make_layout(tile_cols, 1)
-                            )
-                            x_div = fx.logical_divide(
-                                x_tiled[None, tile_i32], fx.make_layout(VEC_WIDTH, 1)
-                            )
-                            x_thread = x_div[None, tid_i32]
-
-                            if const_expr(use_mask):
-                                m_idx_i32 = fx.Int32(token_idx * c_topk + fx.Index(k))
-                                mv = buffer_ops.buffer_load(
-                                    mask_rsrc, m_idx_i32, vec_width=1, dtype=i8_type()
-                                )
-                                mv_ok = mv != fx.Int8(0)
-
-                            if const_expr(n_sub > 1):
-                                x_inner = fx.logical_divide(
-                                    x_thread, fx.make_layout(copy_vec_width, 1)
-                                )
-                            for si in range_constexpr(n_sub):
-                                src = (
-                                    x_inner[None, fx.Int32(si)]
-                                    if n_sub > 1
-                                    else x_thread
-                                )
-                                r = fx.make_rmem_tensor(copy_vec_width, elem_dtype)
-                                fx.copy_atom_call(copy_atom, src, r)
-                                vec_e = fx.memref_load_vec(r)
-
-                                if const_expr(use_mask):
-                                    zero_e = vector.broadcast(
-                                        vec_type_e,
-                                        arith.constant(0.0, type=elem_type()),
-                                    )
-                                    vec_e = mv_ok.select(vec_e, zero_e)
-
-                                if const_expr(elem_bits < 32):
-                                    vec_c = vec_e.extf(vec_type_c)
-                                else:
-                                    vec_c = vec_e
-                                acc_vecs[si] = acc_vecs[si] + vec_c
-
-                        # ── Store results ──
-                        if const_expr(n_sub > 1):
-                            y_row = Y_buf[tok_i32, None]
-                            y_tiled = fx.logical_divide(
-                                y_row, fx.make_layout(tile_cols, 1)
-                            )
-                            y_div = fx.logical_divide(
-                                y_tiled[None, tile_i32], fx.make_layout(VEC_WIDTH, 1)
-                            )
-                            y_inner = fx.logical_divide(
-                                y_div[None, tid_i32], fx.make_layout(copy_vec_width, 1)
-                            )
-
-                        for si in range_constexpr(n_sub):
-                            out_vec = acc_vecs[si]
-                            if const_expr(elem_bits < 32):
-                                out_vec = out_vec.truncf(vec_type_e)
-
-                            if const_expr(n_sub > 1):
-                                dst = y_inner[None, fx.Int32(si)]
-                            else:
-                                y_row = Y_buf[tok_i32, None]
-                                y_tiled = fx.logical_divide(
-                                    y_row, fx.make_layout(tile_cols, 1)
-                                )
-                                y_div = fx.logical_divide(
-                                    y_tiled[None, tile_i32],
-                                    fx.make_layout(VEC_WIDTH, 1),
-                                )
-                                dst = y_div[None, tid_i32]
-
-                            r_out = fx.make_rmem_tensor(copy_vec_width, elem_dtype)
-                            fx.memref_store_vec(out_vec, r_out)
-                            fx.copy_atom_call(copy_atom, r_out, dst)
-
-                    with _if_else(_if_full):
-                        for lane in range_constexpr(VEC_WIDTH):
-                            col = col_base + fx.Index(lane)
-                            lane_ok = col < c_model_dim
-                            _if_lane = scf.IfOp(lane_ok)
-                            with _if_then(_if_lane):
-                                a = arith.constant(0.0, type=compute_type())
-                                token_base = token_idx * c_topk
-                                for k in range_constexpr(topk):
-                                    k_idx = fx.Index(k)
-                                    x_idx_i32 = fx.Int32(
-                                        (token_base + k_idx) * c_model_dim + col
-                                    )
-                                    if const_expr(use_mask):
-                                        m_idx_i32 = fx.Int32(token_base + k_idx)
-                                        mv = buffer_ops.buffer_load(
-                                            mask_rsrc,
-                                            m_idx_i32,
-                                            vec_width=1,
-                                            dtype=i8_type(),
-                                        )
-                                        v = (mv != fx.Int8(0)).select(
-                                            buffer_ops.buffer_load(
-                                                x_rsrc,
-                                                x_idx_i32,
-                                                vec_width=1,
-                                                dtype=elem_type(),
-                                            ),
-                                            arith.constant(0.0, type=elem_type()),
-                                        )
-                                    else:
-                                        v = buffer_ops.buffer_load(
-                                            x_rsrc,
-                                            x_idx_i32,
-                                            vec_width=1,
-                                            dtype=elem_type(),
-                                        )
-                                    if const_expr(dtype_str in ("f16", "bf16")):
-                                        v = v.extf(compute_type())
-                                    a = a + v
-
-                                out = a
-                                if const_expr(dtype_str in ("f16", "bf16")):
-                                    out = out.truncf(elem_type())
-                                y_idx_i32 = fx.Int32(token_idx * c_model_dim + col)
-                                buffer_ops.buffer_store(out, y_rsrc, y_idx_i32)
-
-    # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
-    tile_size = BLOCK_SIZE * VEC_WIDTH
-    gy_static = (model_dim + tile_size - 1) // tile_size
-
-    @flyc.jit
-    def launch_moe_reduction(
-        X: fx.Tensor,
-        Y: fx.Tensor,
-        valid_mask: fx.Tensor,
-        i32_m_tokens: fx.Int32,
-        stream: fx.Stream,
-    ):
-        gx = fx.Index(i32_m_tokens)
-        moe_reduction_kernel(X, Y, valid_mask, i32_m_tokens).launch(
-            grid=(gx, gy_static, 1),
-            block=(BLOCK_SIZE, 1, 1),
-            stream=stream,
-        )
-
-    return launch_moe_reduction
-
-
-# MoE GEMM2 Execution Modes
-class MoeGemm2Mode:
-    """Execution mode for MoE GEMM2."""
-
-    ATOMIC = "atomic"  # Use atomic accumulation (default)
-    REDUCE = "reduce"  # Use non-atomic write + reduce kernel
-
-
-class _MoeGemm2ReduceWrapper:
-    """Wrapper combining GEMM2 (no atomics) with reduction kernel.
-
-    This wrapper handles the intermediate buffer allocation and orchestrates
-    the two-phase computation:
-    1. GEMM2 outputs to [tokens*topk, model_dim] without atomics
-    2. Reduce sums over topk to produce [tokens, model_dim]
-    """
-
-    def __init__(
-        self,
-        gemm2_exe,
-        reduce_exe,
-        topk: int,
-        model_dim: int,
-        out_dtype_str: str = "f16",
-        use_mask: bool = False,
-    ):
-        self._gemm2_exe = gemm2_exe
-        self._reduce_exe = reduce_exe
-        self._topk = topk
-        self._model_dim = model_dim
-        self._out_dtype_str = out_dtype_str
-        self._use_mask = use_mask
-
-    def _get_torch_dtype(self):
-        """Convert dtype string to torch dtype."""
-        import torch
-
-        dtype_map = {
-            "f16": torch.float16,
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-            "f32": torch.float32,
-        }
-        return dtype_map.get(self._out_dtype_str, torch.float16)
-
-    def __call__(
-        self,
-        arg_out,
-        arg_x,
-        arg_w,
-        arg_scale_x,
-        arg_scale_w,
-        arg_sorted_token_ids,
-        arg_expert_ids,
-        arg_sorted_weights,
-        arg_num_valid_ids,
-        tokens_in,
-        n_in,
-        k_in,
-        size_expert_ids_in,
-        valid_mask=None,
-        stream=None,
-    ):
-        """Execute GEMM2 + reduce.
-
-        Args match moe_gemm2 kernel signature (see compile_moe_blockscale_gemm2).
-        """
-        import torch
-
-        if stream is None:
-            stream = torch.cuda.current_stream()
-        intermediate = torch.empty(
-            tokens_in * self._topk,
-            self._model_dim,
-            device=arg_out.device,
-            dtype=self._get_torch_dtype(),
-        )
-        if not self._use_mask:
-            intermediate.zero_()
-        # Phase 1: GEMM2 (no atomics) -> [tokens*topk, model_dim]
-        self._gemm2_exe(
-            intermediate.view(-1),
-            arg_x,
-            arg_w,
-            arg_scale_x,
-            arg_scale_w,
-            arg_sorted_token_ids,
-            arg_expert_ids,
-            arg_sorted_weights,
-            arg_num_valid_ids,
-            tokens_in,
-            n_in,
-            k_in,
-            size_expert_ids_in,
-            stream,
-        )
-        # Phase 2: Reduce over topk -> [tokens, model_dim]
-        X = intermediate.view(tokens_in, self._topk, self._model_dim)
-        Y = arg_out.view(tokens_in, self._model_dim)
-        if not self._use_mask:
-            if valid_mask is not None:
-                logging.warning(
-                    "valid_mask provided but use_mask=False; ignoring valid_mask"
-                )
-            valid_mask = torch.empty(
-                (0, self._topk), device=arg_out.device, dtype=torch.uint8
-            )
-        self._reduce_exe(X, Y, valid_mask, tokens_in, stream)
-
-    @property
-    def mode(self) -> str:
-        """Return the execution mode."""
-        return MoeGemm2Mode.REDUCE
-
-
-def compile_moe_blockscale_gemm2_ex(
-    *,
-    model_dim: int,
-    inter_dim: int,
-    experts: int,
-    topk: int,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    doweight_stage2: bool,
-    in_dtype: str = "fp8",
-    out_dtype: str = "f16",
-    use_cshuffle_epilog: bool | None = None,
-    # Extended parameters for mode control
-    mode: str = MoeGemm2Mode.ATOMIC,
-    valid_mask=None,
-):
-    """Compile MoE GEMM2 kernel with optional reduction.
-
-    This is the extended interface that supports explicit mode control.
-
-    Args:
-        mode: Execution mode selection:
-            - "atomic": Use atomic accumulation (original behavior)
-            - "reduce": Use non-atomic write + reduce kernel
-
-    Returns:
-        Compiled executable (either wrapped or raw depending on mode).
-    """
-    # Compile based on mode
-    if mode == MoeGemm2Mode.REDUCE:
-        # Determine if we need masked reduction
-        use_mask = valid_mask is not None
-
-        # Compile GEMM2 with accumulate=False
-        gemm2_exe = compile_moe_blockscale_gemm2(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            doweight_stage2=doweight_stage2,
-            in_dtype=in_dtype,
-            out_dtype=out_dtype,
-            use_cshuffle_epilog=use_cshuffle_epilog,
-            accumulate=False,
-        )
-        # Compile reduction kernel with masking support
-        out_s = str(out_dtype).strip().lower()
-        if out_s in ("f16", "fp16", "half"):
-            dtype_str = "f16"
-        elif out_s in ("bf16", "bfloat16"):
-            dtype_str = "bf16"
-        else:
-            dtype_str = "f32"
-        reduce_exe = compile_moe_reduction(
-            topk=topk,
-            model_dim=model_dim,
-            dtype_str=dtype_str,
-            use_mask=use_mask,
-        )
-        return _MoeGemm2ReduceWrapper(
-            gemm2_exe=gemm2_exe,
-            reduce_exe=reduce_exe,
-            topk=topk,
-            model_dim=model_dim,
-            out_dtype_str=dtype_str,
-            use_mask=use_mask,
-        )
-    else:
-        # Compile GEMM2 with accumulate=True (atomic mode)
-        return compile_moe_blockscale_gemm2(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            doweight_stage2=doweight_stage2,
-            in_dtype=in_dtype,
-            out_dtype=out_dtype,
-            use_cshuffle_epilog=use_cshuffle_epilog,
-            accumulate=True,
-        )
-
-
 # Adapter aliases (the adapter code below references these names).
 _upstream_compile_gemm1 = compile_moe_blockscale_gemm1
 _upstream_compile_gemm2 = compile_moe_blockscale_gemm2
@@ -3821,45 +3337,63 @@ def _validate_blockscale_dtypes(a_dtype: str, b_dtype: str) -> None:
         )
 
 
+def _splitk_kslice_reason(
+    k_batch: int,
+    model_dim: int,
+    tile_k: int,
+    scale_block_k: int = SCALE_BLOCK_K_DEFAULT,
+) -> "str | None":
+    """Single source of truth for the split-K K-slice constraints.
+
+    Returns ``None`` if ``(k_batch, model_dim, tile_k, scale_block_k)`` is a
+    valid split-K configuration, otherwise a human-readable string describing
+    the first violation. The raising validators (`_validate_split_k`, the
+    inline check in `compile_moe_blockscale_gemm1`) wrap this reason in their
+    own exception/prefix; the boolean predicate (`_splitk_kslice_is_valid`)
+    just tests it for ``None``.
+
+    Constraints, per the split-K plan (Steps 1-5):
+      - model_dim divisible by k_batch (clean K partition across CTAs).
+      - K-slice (= model_dim/k_batch) divisible by scale_block_k (each CTA
+        processes whole scale blocks in K).
+      - K-slice divisible by tile_k (no per-CTA tail-tile handling).
+      - tile count per slice (= K-slice/tile_k) even and >= 2 (the main K-loop
+        unrolls in pairs of tile_k tiles plus a 2-tile tail).
+    """
+    if k_batch <= 0:
+        return f"k_batch={k_batch} must be >= 1"
+    if k_batch == 1:
+        return None
+    if model_dim % k_batch != 0:
+        return f"model_dim={model_dim} not divisible by k_batch={k_batch}"
+    k_per_split = model_dim // k_batch
+    if k_per_split % scale_block_k != 0:
+        return (
+            f"k_per_split={k_per_split} (model_dim/k_batch) not divisible by "
+            f"scale_block_k={scale_block_k}"
+        )
+    if k_per_split % tile_k != 0:
+        return f"k_per_split={k_per_split} not divisible by tile_k={tile_k}"
+    ttps = k_per_split // tile_k
+    if ttps < 2 or (ttps % 2) != 0:
+        return (
+            f"k_per_split={k_per_split} / tile_k={tile_k} = {ttps} must be "
+            "even and >= 2 (K-loop unrolls in pairs of tile_k tiles)"
+        )
+    return None
+
+
 def _validate_split_k(
     *, k_batch: int, model_dim: int, tile_k: int, scale_block_k: int, stage: str
 ) -> None:
-    """Validate split-K constraints for stage1.
+    """Validate split-K constraints for stage1; raises ValueError on failure.
 
-    Per the split-K plan (Steps 1-5):
-      1. K-slice must be divisible by scale_block_k (each CTA processes whole
-         scale blocks in K).
-      2. K-slice must be divisible by tile_k (no per-CTA tail-tile handling).
-    Violations raise ValueError so the caller can fall back to k_batch=1.
+    Thin wrapper over `_splitk_kslice_reason` that prefixes the violation with
+    ``"blockscale {stage}:"`` so the caller can fall back to k_batch=1.
     """
-    if k_batch <= 0:
-        raise ValueError(f"blockscale {stage}: k_batch={k_batch} must be >= 1")
-    if k_batch == 1:
-        return
-    if model_dim % k_batch != 0:
-        raise ValueError(
-            f"blockscale {stage}: model_dim={model_dim} not divisible by "
-            f"k_batch={k_batch}"
-        )
-    k_per_split = model_dim // k_batch
-    if k_per_split % scale_block_k != 0:
-        raise ValueError(
-            f"blockscale {stage}: k_per_split={k_per_split} (model_dim/k_batch) "
-            f"not divisible by scale_block_k={scale_block_k}"
-        )
-    if k_per_split % tile_k != 0:
-        raise ValueError(
-            f"blockscale {stage}: k_per_split={k_per_split} not divisible by "
-            f"tile_k={tile_k}"
-        )
-    # The main K-loop processes pairs of tile_k tiles + a 2-tile tail. That
-    # requires total_tiles_per_split (=k_per_split/tile_k) to be even and >= 2.
-    if (k_per_split // tile_k) < 2 or ((k_per_split // tile_k) % 2) != 0:
-        raise ValueError(
-            f"blockscale {stage}: k_per_split={k_per_split} / tile_k={tile_k} "
-            f"= {k_per_split // tile_k} must be even and >= 2 "
-            "(K-loop unrolls in pairs of tile_k tiles)"
-        )
+    reason = _splitk_kslice_reason(k_batch, model_dim, tile_k, scale_block_k)
+    if reason is not None:
+        raise ValueError(f"blockscale {stage}: {reason}")
 
 
 def _validate_scale_blocks(
@@ -3892,21 +3426,12 @@ def _splitk_kslice_is_valid(
 ) -> bool:
     """Cheap predicate version of ``_validate_split_k`` (no exceptions).
 
-    Returns True iff a ``k_batch`` value satisfies the K-slice constraints
-    (model_dim divisible by k_batch, slice divisible by scale_block_k and
-    tile_k, and an even number of tile_k tiles per slice >= 2).
+    Returns True iff ``k_batch`` satisfies the K-slice constraints. Delegates
+    to `_splitk_kslice_reason` so the rule lives in exactly one place.
     """
-    if k_batch <= 1:
-        return True
-    if model_dim % k_batch != 0:
-        return False
-    kps = model_dim // k_batch
-    if kps % scale_block_k != 0:
-        return False
-    if kps % tile_k != 0:
-        return False
-    ttps = kps // tile_k
-    return ttps >= 2 and (ttps % 2) == 0
+    return (
+        _splitk_kslice_reason(k_batch, model_dim, tile_k, scale_block_k) is None
+    )
 
 
 def pick_k_batch_for_blockscale_stage1(
@@ -3960,7 +3485,7 @@ def pick_k_batch_for_blockscale_stage1(
     return 1
 
 
-def _reject_tier_c(
+def _reject_unsupported_kwargs(
     *,
     act: str,
     enable_bias: bool,
@@ -3973,7 +3498,7 @@ def _reject_tier_c(
     xcd_swizzle: int,
     stage: str,
 ) -> None:
-    """Tier-B/C gate. Raises NotImplementedError for unsupported requests.
+    """Raise NotImplementedError for kwargs this port does not support yet.
 
     The DSR1 / TP=8 prefill production path uses only the default values
     for every knob below; any deviation today means upstream has to grow
@@ -3986,27 +3511,27 @@ def _reject_tier_c(
     if enable_bias:
         raise NotImplementedError(
             f"blockscale {stage}: enable_bias=True not supported "
-            "(upstream FlyDSL blockscale has no bias path yet — Tier C)"
+            "(upstream FlyDSL blockscale has no bias path yet)"
         )
     if model_dim_pad != 0:
         raise NotImplementedError(
             f"blockscale {stage}: model_dim_pad={model_dim_pad} != 0 "
-            "(clean shapes only — Tier C)"
+            "(clean shapes only)"
         )
     if inter_dim_pad != 0:
         raise NotImplementedError(
             f"blockscale {stage}: inter_dim_pad={inter_dim_pad} != 0 "
-            "(clean shapes only — Tier C)"
+            "(clean shapes only)"
         )
     if swiglu_limit != 0.0:
         raise NotImplementedError(
             f"blockscale {stage}: swiglu_limit={swiglu_limit} != 0.0 "
-            "(no clipping in upstream SiLU — Tier C)"
+            "(no clipping in upstream SiLU)"
         )
     if persist_m != 1:
         raise NotImplementedError(
             f"blockscale {stage}: persist_m={persist_m} != 1 "
-            "(persistent kernel not supported in upstream blockscale — Tier C)"
+            "(persistent kernel not supported in upstream blockscale)"
         )
     # use_async_copy: upstream FlyDSL blockscale always uses async/buffer
     # copy regardless of this flag, so we accept either value as a no-op.
@@ -4019,12 +3544,12 @@ def _reject_tier_c(
     if b_nt not in (0, 2):
         raise NotImplementedError(
             f"blockscale {stage}: b_nt={b_nt} not supported "
-            "(non-temporal B load hint — Tier C)"
+            "(non-temporal B load hint)"
         )
     if xcd_swizzle != 0:
         raise NotImplementedError(
             f"blockscale {stage}: xcd_swizzle={xcd_swizzle} != 0 "
-            "(XCD-aware workgroup remap — Tier C)"
+            "(XCD-aware workgroup remap)"
         )
 
 
@@ -4065,11 +3590,11 @@ def compile_blockscale_moe_gemm1(
     Forwards to upstream ``compile_moe_blockscale_gemm1`` after validating
     the wide aiter signature against what upstream currently supports.
 
-    See module docstring for tier breakdown of supported kwargs.
+    See module docstring for the breakdown of supported kwargs.
     """
     _validate_blockscale_dtypes(a_dtype, b_dtype)
     sbk = _validate_scale_blocks(scale_block_m, scale_block_n, scale_block_k)
-    _reject_tier_c(
+    _reject_unsupported_kwargs(
         act=act,
         enable_bias=enable_bias,
         model_dim_pad=model_dim_pad,
@@ -4166,8 +3691,8 @@ def compile_blockscale_moe_gemm2(
     _validate_blockscale_dtypes(a_dtype, b_dtype)
     sbk = _validate_scale_blocks(scale_block_m, scale_block_n, scale_block_k)
     # Stage2 doesn't have act/swiglu_limit/k_batch/use_async_copy; pass
-    # defaults so _reject_tier_c can stay one function.
-    _reject_tier_c(
+    # defaults so _reject_unsupported_kwargs can stay one function.
+    _reject_unsupported_kwargs(
         act="silu",
         enable_bias=enable_bias,
         model_dim_pad=model_dim_pad,

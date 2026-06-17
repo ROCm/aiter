@@ -324,7 +324,7 @@ def get_flydsl_stage1_kernels_fp8_blockscale(out_dtype: str) -> Dict[str, Dict]:
     tile_ns = [128]
     tile_ks = [128, 256]
     waves_per_eus = [1, 2, 3, 4]
-    # b_nt and xcd_swizzle are Tier-C in the adapter; only the defaults
+    # b_nt and xcd_swizzle are not supported by the adapter; only the defaults
     # (bnt=2, xcd=0 for stage1) are reachable, so we don't enumerate them.
     bnt = 2
     xcd = 0
@@ -363,8 +363,8 @@ def get_flydsl_stage2_kernels_fp8_blockscale(out_dtype: str) -> Dict[str, Dict]:
     tile_ns = [128]
     tile_ks = [128, 256]
     modes = ["atomic", "reduce"]
-    # b_nt, xcd_swizzle, and persist_m are Tier-C in the adapter; only the
-    # defaults (bnt=0, xcd=0, non-persistent for stage2) are reachable.
+    # b_nt, xcd_swizzle, and persist_m are not supported by the adapter; only
+    # the defaults (bnt=0, xcd=0, non-persistent for stage2) are reachable.
     bnt = 0
     xcd = 0
     for tm in tile_ms:
@@ -652,13 +652,17 @@ def _view_safe(t: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _ptr_view_safe(t: torch.Tensor):
+def _as_memref(t: torch.Tensor):
     """Pass a TensorAdaptor (fx.Tensor / memref) for kernels with shaped args.
 
     Used for the upstream MoE GEMM kernel whose args are annotated `fx.Tensor`
     (dynamic-shape memref).  For kernels whose args are annotated `fx.Pointer`
-    (raw pointer, shape carried by explicit args), use ``_ptr_arg_safe``
+    (raw pointer, shape carried by explicit args), use ``_as_pointer``
     instead — it produces a PointerAdaptor that survives ptrtoint.
+
+    NB: ``gemm_kernels._as_memref`` is the raw-pointer flavor (opposite of
+    this one); the MoE tree uses ``_as_memref`` (memref) / ``_as_pointer``
+    (pointer) to avoid that cross-module name collision.
 
     FakeTensor branch returns a null PointerAdaptor (via ``from_c_void_p``)
     rather than a dlpack memref: a raw pointer satisfies both ``fx.Pointer``
@@ -677,7 +681,7 @@ def _ptr_view_safe(t: torch.Tensor):
     return flyc.from_dlpack(view)
 
 
-def _ptr_arg_safe(t: torch.Tensor):
+def _as_pointer(t: torch.Tensor):
     """Pass a PointerAdaptor (raw device pointer) for kernels with `fx.Pointer` args.
 
     Used by kernels that immediately call ``fx.ptrtoint`` on their args: the
@@ -721,17 +725,17 @@ def _s1_args_fp4(
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
-        _ptr_arg_safe(out),
-        _ptr_arg_safe(a),
-        _ptr_arg_safe(w),
-        _ptr_arg_safe(a_scale),
-        _ptr_arg_safe(w_scale),
-        _ptr_arg_safe(sorted_ids),
-        _ptr_arg_safe(sorted_expert_ids),
-        _ptr_arg_safe(sorted_weights),
-        _ptr_arg_safe(num_valid_ids),
-        _ptr_arg_safe(_bias),
-        _ptr_arg_safe(out_scale_sorted),
+        _as_pointer(out),
+        _as_pointer(a),
+        _as_pointer(w),
+        _as_pointer(a_scale),
+        _as_pointer(w_scale),
+        _as_pointer(sorted_ids),
+        _as_pointer(sorted_expert_ids),
+        _as_pointer(sorted_weights),
+        _as_pointer(num_valid_ids),
+        _as_pointer(_bias),
+        _as_pointer(out_scale_sorted),
         token_num,
         n_in,
         k_in,
@@ -762,10 +766,10 @@ def _s1_args_std(
         stream = torch.cuda.current_stream()
     # The std stage1 launcher feeds two kernel families with different arg
     # annotations: the bf16/int4 ``moe_gemm1`` (moe_gemm_2stage.py) takes
-    # ``fx.Pointer`` args (calls ptrtoint) and needs ``_ptr_arg_safe``, while
+    # ``fx.Pointer`` args (calls ptrtoint) and needs ``_as_pointer``, while
     # the fp8/fp8 blockscale launcher takes ``fx.Tensor`` (memref) args and
-    # needs ``_ptr_view_safe``. ``use_ptr`` selects the right helper.
-    _ptr = _ptr_arg_safe if use_ptr else _ptr_view_safe
+    # needs ``_as_memref``. ``use_ptr`` selects the right helper.
+    _ptr = _as_pointer if use_ptr else _as_memref
     # The `arg_out_scale_sorted` slot only exists on the blockscale fp8/fp8
     # launcher (Phase B-v2). Other stage1 launchers (mixed_moe_gemm1 fp4,
     # moe_gemm1 bf16/int4) have 14 args and reject the extra positional.
@@ -819,16 +823,16 @@ def _s2_args_fp4(
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
-        _ptr_arg_safe(target),
-        _ptr_arg_safe(a),
-        _ptr_arg_safe(w),
-        _ptr_arg_safe(a_scale),
-        _ptr_arg_safe(w_scale),
-        _ptr_arg_safe(sorted_ids),
-        _ptr_arg_safe(sorted_expert_ids),
-        _ptr_arg_safe(sorted_weights),
-        _ptr_arg_safe(num_valid_ids),
-        _ptr_arg_safe(_bias),
+        _as_pointer(target),
+        _as_pointer(a),
+        _as_pointer(w),
+        _as_pointer(a_scale),
+        _as_pointer(w_scale),
+        _as_pointer(sorted_ids),
+        _as_pointer(sorted_expert_ids),
+        _as_pointer(sorted_weights),
+        _as_pointer(num_valid_ids),
+        _as_pointer(_bias),
         token_num,
         n_in,
         k_in,
@@ -858,7 +862,7 @@ def _s2_args_std(
         stream = torch.cuda.current_stream()
     # See _s1_args_std: bf16/int4 moe_gemm2 wants fx.Pointer args (ptrtoint),
     # fp8/fp8 blockscale moe_gemm2 wants fx.Tensor (memref) args.
-    _ptr = _ptr_arg_safe if use_ptr else _ptr_view_safe
+    _ptr = _as_pointer if use_ptr else _as_memref
     return (
         _ptr(target),
         _ptr(a),
@@ -1385,6 +1389,23 @@ def flydsl_moe_stage1(
     _is_splitk = k_batch > 1
     gate_up_interleave = gate_mode == "interleave"
 
+    # Split-K cannot fuse the per-1x128 f32 blockscale into the GEMM epilog
+    # (partials are atomic-added, then reduced). If an fp8 output were also
+    # requested, the only available fused-quant path is silu_and_mul_fq, which
+    # emits an e8m0 per-32 MX scale -- a different block size (32 vs 128) AND a
+    # different scale dtype (e8m0 vs f32) than stage2 reads. Stage2 would then
+    # misparse the scale buffer (garbage/NaN), and the result would diverge from
+    # CK's per-1x128 f32 reference. CK/ASM avoid this by reducing split-K in
+    # bf16 and quantizing in a separate post-reduction step; mirror that by
+    # restricting blockscale split-K to bf16 output for now.
+    if _is_splitk and a_dtype == "fp8" and b_dtype == "fp8" and _need_fp8:
+        raise NotImplementedError(
+            "fp8/fp8 blockscale split-K (k_batch>1) with out_dtype='fp8' is not "
+            "supported: the split-K fused-quant path emits an e8m0 per-32 scale, "
+            "which is incompatible with the per-1x128 f32 scale stage2 consumes. "
+            "Use out_dtype='bf16' for split-K, or k_batch=1 to fuse the f32 scale."
+        )
+
     dev = a.device
     _splitk_fp4 = _is_splitk and _need_fp4
     _gui_sk = gate_up_interleave and _is_splitk
@@ -1609,13 +1630,13 @@ def flydsl_moe_stage1(
         _run_compiled(
             _silu_fused_k,
             (
-                _ptr_arg_safe(tmp_out.view(-1, inter_dim * 2)),
-                _ptr_arg_safe(out.view(-1).view(torch.uint8)),
-                _ptr_arg_safe(out_scale_sorted_flat),
-                _ptr_arg_safe(sorted_token_ids),
-                _ptr_arg_safe(num_valid_ids),
-                _ptr_arg_safe(topk_ids_arg),
-                _ptr_arg_safe(bias_arg),
+                _as_pointer(tmp_out.view(-1, inter_dim * 2)),
+                _as_pointer(out.view(-1).view(torch.uint8)),
+                _as_pointer(out_scale_sorted_flat),
+                _as_pointer(sorted_token_ids),
+                _as_pointer(num_valid_ids),
+                _as_pointer(topk_ids_arg),
+                _as_pointer(bias_arg),
                 token_num,
                 num_sorted_rows,
                 torch.cuda.current_stream(),
@@ -1634,13 +1655,13 @@ def flydsl_moe_stage1(
         _run_compiled(
             _silu_fused_k,
             (
-                _ptr_arg_safe(tmp_out.view(-1, inter_dim * 2)),
-                _ptr_arg_safe(out.view(-1).view(torch.uint8)),
-                _ptr_arg_safe(out_scale_sorted_flat),
-                _ptr_arg_safe(sorted_token_ids),
-                _ptr_arg_safe(num_valid_ids),
-                _ptr_arg_safe(topk_ids_arg),
-                _ptr_arg_safe(bias_arg),
+                _as_pointer(tmp_out.view(-1, inter_dim * 2)),
+                _as_pointer(out.view(-1).view(torch.uint8)),
+                _as_pointer(out_scale_sorted_flat),
+                _as_pointer(sorted_token_ids),
+                _as_pointer(num_valid_ids),
+                _as_pointer(topk_ids_arg),
+                _as_pointer(bias_arg),
                 token_num,
                 num_sorted_rows,
                 torch.cuda.current_stream(),
@@ -1657,13 +1678,13 @@ def flydsl_moe_stage1(
         _run_compiled(
             _silu_fused_k,
             (
-                _ptr_arg_safe(tmp_out.view(-1, inter_dim * 2)),
-                _ptr_arg_safe(out.view(-1).view(torch.uint8)),
-                _ptr_arg_safe(out_scale_sorted_flat),
-                _ptr_arg_safe(sorted_token_ids),
-                _ptr_arg_safe(num_valid_ids),
-                _ptr_arg_safe(topk_ids_arg),
-                _ptr_arg_safe(bias_arg),
+                _as_pointer(tmp_out.view(-1, inter_dim * 2)),
+                _as_pointer(out.view(-1).view(torch.uint8)),
+                _as_pointer(out_scale_sorted_flat),
+                _as_pointer(sorted_token_ids),
+                _as_pointer(num_valid_ids),
+                _as_pointer(topk_ids_arg),
+                _as_pointer(bias_arg),
                 token_num,
                 num_sorted_rows,
                 torch.cuda.current_stream(),

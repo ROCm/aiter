@@ -10,7 +10,7 @@ Exercises the full aiter dispatcher path:
        -> ROCm/FlyDSL ``kernels/moe_blockscale_2stage.py`` (vendored inline)
 
 Three groups:
-  1. Adapter / dispatcher / Tier-C smoke tests (always run).
+  1. Adapter / dispatcher / unsupported-kwarg smoke tests (always run).
   2. Stage1 + stage2 + full pipeline correctness at small shape vs torch
      ref and vs CK 2-stage (always run; needs GPU).
   3. Production-shape perf benchmark (M=8192, DeepSeek-R1-0528 shape),
@@ -287,7 +287,7 @@ def _prepare_data(
 
 
 # ---------------------------------------------------------------------------
-# Group 1: adapter / dispatcher / Tier-C smoke
+# Group 1: adapter / dispatcher / unsupported-kwarg smoke
 # ---------------------------------------------------------------------------
 def test_imports():
     from aiter.ops.flydsl.kernels import blockscale_moe_gemm_2stage as m
@@ -369,7 +369,7 @@ def test_dispatcher_routes_fp8_fp8_bf16_compiles():
         ("inter_dim_pad", 16, "inter_dim_pad=16"),
     ],
 )
-def test_tier_c_kwargs_raise(kwarg, bad_value, expected_match):
+def test_unsupported_kwargs_raise(kwarg, bad_value, expected_match):
     base = dict(
         model_dim=7168,
         inter_dim=512,
@@ -442,6 +442,33 @@ def test_splitk_invalid_kslice_raises(k_batch, model_dim, tile_k, expected_match
         )
 
 
+@pytest.mark.parametrize("k_batch", [2, 4])
+def test_splitk_fp8_output_raises(k_batch):
+    """fp8 output is fused per-1x128 f32 quant in the k_batch=1 epilog; split-K
+    (k_batch>1) instead atomic-adds bf16 partials for a later silu_and_mul_fq
+    e8m0 quant. The two scale formats are incompatible, so the combo must be
+    rejected rather than silently producing wrong scales.
+    """
+    with pytest.raises(
+        NotImplementedError, match="out_dtype='fp8' with k_batch>1 is not"
+    ):
+        compile_blockscale_moe_gemm1(
+            model_dim=7168,
+            inter_dim=256,
+            experts=8,
+            topk=2,
+            tile_m=64,
+            tile_n=128,
+            tile_k=128,
+            doweight_stage1=False,
+            a_dtype="fp8",
+            b_dtype="fp8",
+            out_dtype="fp8",
+            act="silu",
+            k_batch=k_batch,
+        )
+
+
 def test_invalid_dtype_combo_raises():
     with pytest.raises(ValueError, match="only a_dtype='fp8' and b_dtype='fp8'"):
         compile_blockscale_moe_gemm1(
@@ -462,7 +489,15 @@ def test_invalid_dtype_combo_raises():
 # Group 2: functional correctness — stage1, stage2, full pipeline
 # ---------------------------------------------------------------------------
 def _launch_flydsl_stage1(
-    data, *, tile_m, tile_n, tile_k, waves_per_eu, act: str = "silu"
+    data,
+    *,
+    tile_m,
+    tile_n,
+    tile_k,
+    waves_per_eu,
+    act: str = "silu",
+    num_iters: int = 10,
+    num_warmup: int = 3,
 ):
     """Compile + run FlyDSL stage1 via the aiter dispatcher; return (out, us)."""
     tokens = data["tokens"]
@@ -545,7 +580,7 @@ def _launch_flydsl_stage1(
             stream,
         )
 
-    _, us = run_perftest(_run, num_iters=10, num_warmup=3)
+    _, us = run_perftest(_run, num_iters=num_iters, num_warmup=num_warmup)
     torch.cuda.synchronize()
     return out1, a1_bq, a1_bscale_ref, sorted_ids, sorted_w, sorted_e, num_valid, us
 
@@ -562,6 +597,8 @@ def _launch_flydsl_stage2(
     sorted_w,
     sorted_e,
     num_valid,
+    num_iters: int = 10,
+    num_warmup: int = 3,
 ):
     tokens = data["tokens"]
     model_dim = data["model_dim"]
@@ -633,7 +670,7 @@ def _launch_flydsl_stage2(
             stream,
         )
 
-    _, us = run_perftest(_run, num_iters=10, num_warmup=3)
+    _, us = run_perftest(_run, num_iters=num_iters, num_warmup=num_warmup)
     torch.cuda.synchronize()
     # Re-run clean so out2 reflects exactly one launch (atomic accumulation)
     out2.zero_()
