@@ -1,17 +1,10 @@
 # Background: Attention, the DeepSeek Lightning Indexer, and the FP8 MQA Logits Kernel
 
 > **Purpose.** This document builds up — from first principles — the background needed to
-> work on the FP8 MQA logits kernel (ticket SILOTIGER-614). It assumes only a superficial
-> understanding of attention and walks through: how attention works, the efficiency variants
-> that lead to DeepSeek's design, what the "lightning indexer" is and where it fits, and
-> finally how all of that maps onto the specific kernel we are implementing for gfx942.
+> work on the FP8 MQA logits kernel. It provides background on attention 
+> and walks through: how attention works, the efficiency variants
+> that lead to DeepSeek's design, what the "lightning indexer" is and where it fits.
 >
-> It is intentionally detailed, with concrete dimensions and worked examples in each section.
->
-> Companion document: the implementation plan in
-> [`fp8-mqa-logits-flydsl-gfx942.md`](./fp8-mqa-logits-flydsl-gfx942.md).
->
-> All references in the final section were verified to exist and be relevant.
 
 ### Notation used throughout
 
