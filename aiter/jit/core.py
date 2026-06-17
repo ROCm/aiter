@@ -27,7 +27,9 @@ from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
-
+AITER_DISABLE_KERNARG_PRELOAD = (
+    int(os.environ.get("AITER_DISABLE_KERNARG_PRELOAD", "0")) != 0
+)
 
 def is_experimental_enabled() -> bool:
     # Mirror the C++ side (atoi(...) != 0): treat unset and "0" as disabled,
