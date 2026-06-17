@@ -6,7 +6,6 @@ Select precision with ``data_format="fp4"|"fp8"|"a8w4"``.
 """
 
 import os
-from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -117,7 +116,7 @@ def compile_mxscale_gemm(
     grouped_contiguous_num_1d_blocks: int | None = None,
     persistent_workers: int | None = None,
     stage1_act: str | None = None,
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
     stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
     kernel_tag: str = "gemm",

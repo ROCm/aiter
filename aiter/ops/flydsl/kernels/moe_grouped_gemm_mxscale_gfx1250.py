@@ -65,7 +65,7 @@ class _GroupedA8W4Config:
     persistent_workers: Optional[int] = None
     data_format: str = "a8w4"
     act: str = "silu"
-    swiglu_limit: Optional[float] = None
+    swiglu_limit: float | None = None
     stage1_weight_layout: str = "gguu"
 
 
@@ -326,7 +326,7 @@ def _apply_gate_up(
     gate: torch.Tensor,
     up: torch.Tensor,
     act: str,
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     _lim = 7.0 if not swiglu_limit else float(swiglu_limit)
     if act == "swiglu":
@@ -347,7 +347,7 @@ def _compile_stage1_finalize_act(
     inter_dim: int,
     out_dtype: str,
     act: str,
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
     stage1_weight_layout: str = "gguu",
 ):
     if out_dtype not in ("f16", "bf16"):
@@ -496,7 +496,7 @@ def _compile_stage1_finalize_act_bias(
     inter_dim: int,
     out_dtype: str,
     act: str,
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
     stage1_weight_layout: str = "gguu",
 ):
     if out_dtype not in ("f16", "bf16"):
@@ -807,7 +807,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     grouped_contiguous_m: bool = False,
     persistent_workers: int | None = None,
     act: str = "silu",
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
     stage1_weight_layout: str = "gguu",
     data_format: str = "a8w4",
 ):
