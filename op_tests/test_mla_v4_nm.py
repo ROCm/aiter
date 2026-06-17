@@ -1038,6 +1038,27 @@ def test_v4_nm_accuracy_and_perf():
     _run_one_point(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0)
 
 
+@needs_gfx950
+def test_v4_nm_out_16_nosplit_accuracy_and_perf():
+    """Exercise the single-pass packed-BF16 direct path (out_16_nosplit=1).
+
+    The kernel writes its result as densely-packed BF16 into the logits
+    region (NOT the output buffer); the wrapper unpacks it into `output`
+    (see mla_decode_fwd_v4_nm). This locks in both that the unpack lands the
+    right bytes (accuracy vs the fp8-dequant torch ref) and that the path
+    runs end-to-end at perf. num_kv_splits must be 1 (bf16-direct is
+    single-pass). Perf is informational; accuracy is the gate.
+    """
+    _run_one_point(
+        batch=2,
+        kv_seq_lens=64,
+        q_seq_logical=4,
+        seed=0,
+        num_kv_splits=1,
+        out_16_nosplit=1,
+    )
+
+
 # ---------------------------------------------------------------------------
 # ATOM-API wrapper (future drop-in replacement for ATOM's
 # `sparse_attn_v4_paged_decode`). Lives in the test file as a *proof of API

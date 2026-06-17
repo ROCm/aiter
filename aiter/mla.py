@@ -107,7 +107,14 @@ def _fwd_kernel_stage2_asm(
 
 @functools.lru_cache()
 def get_meta_param(
-    num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype, tg_factor=1, max_splits=None
+    num_kv_splits,
+    bs,
+    total_kv,
+    nhead,
+    max_seqlen_q,
+    dtype,
+    tg_factor=1,
+    max_splits=None,
 ):
     # tg_factor: number of thread-groups (workgroups) the kernel launches per
     # (seq, kv-split) along the head dim. Default 1. For variants that synthesize
