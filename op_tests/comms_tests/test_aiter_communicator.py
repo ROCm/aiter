@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-"""Correctness of AiterCommunicator's collective ops — all_reduce and all_gather
+"""Correctness of IrisCommunicator's collective ops — all_reduce and all_gather
 — in eager mode, under cudagraph capture + replay, AND under capture + replay
 with the input changing every replay.
 
@@ -38,6 +38,7 @@ from aiter.dist.parallel_state import (
     init_distributed_environment,
 )
 from aiter.dist.utils import get_distributed_init_method, get_open_port
+from aiter.ops.triton.comms.communicator import make_communicator
 from aiter.test_common import checkAllclose
 
 logger = logging.getLogger("aiter")
@@ -61,60 +62,20 @@ OPS = ["all_reduce", "all_gather"]
 
 
 # ── Communicator: one interface, two impls, one branching point ──
-# AiterCommunicator (aiter) already defines the interface this test drives:
-# should_allreduce / should_allgather, all_reduce(x) -> out, all_gather(x, dim)
-# -> out, and a `disabled` flag. "iris" is that real class (the impl under test);
-# "torch" is the known-good baseline below, with the same surface and output
-# contract. make_communicator is the single place the backend is chosen — every
-# harness below is impl-agnostic and runs identically for both.
+# The interface (Communicator ABC), both impls — IrisCommunicator (the impl under
+# test) and TorchCommunicator (the known-good control) — and the make_communicator
+# selector all live in aiter's communicator.py, which is exactly what the serving
+# path runs. This test drives that selector directly: "iris" is the impl under
+# test, "torch" is the control, same surface and output contract for both.
+# make_communicator returns the communicator without raising on unavailability, so
+# _build_communicator checks `.disabled` here.
 
 
-class TorchCommunicator:
-    """torch.distributed reference with AiterCommunicator's interface — the
-    known-good baseline the iris impl is checked against. Matches the contract:
-    all_reduce returns a new SUM tensor (input untouched); all_gather returns the
-    per-rank inputs concatenated along `dim`, rank-ordered."""
-
-    def __init__(self, group, device):
-        self.group = group
-        self.device = device
-        self.world_size = dist.get_world_size(group)
-        self.disabled = False
-
-    def should_allreduce(self, x):
-        return True
-
-    def should_allgather(self, x):
-        return True
-
-    def all_reduce(self, x):
-        out = x.clone()
-        dist.all_reduce(out, group=self.group)  # SUM
-        return out
-
-    def all_gather(self, x, dim=-1):
-        if dim < 0:
-            dim += x.dim()
-        sz = x.size()
-        out = torch.empty((self.world_size,) + tuple(sz), dtype=x.dtype, device=x.device)
-        dist.all_gather_into_tensor(out, x.contiguous(), group=self.group)
-        return out.movedim(0, dim).reshape(sz[:dim] + (self.world_size * sz[dim],) + sz[dim + 1:])
-
-
-def make_communicator(backend, group, device):
-    """The one backend branching point. 'iris' = aiter's AiterCommunicator
-    (imported lazily so the torch baseline doesn't require it); 'torch' = the
-    TorchCommunicator baseline."""
-    if backend == "iris":
-        from aiter.ops.triton.comms.communicator import AiterCommunicator
-
-        comm = AiterCommunicator(group=group, device=device)
-        if comm.disabled:
-            raise RuntimeError("AiterCommunicator disabled")
-        return comm
-    if backend == "torch":
-        return TorchCommunicator(group, device)
-    raise ValueError(f"unknown backend {backend!r}")
+def _build_communicator(backend, group, device):
+    comm = make_communicator(backend, group, device)
+    if comm.disabled:
+        raise RuntimeError(f"{backend} communicator disabled")
+    return comm
 
 
 def _make_op(comm, op_name, x):
@@ -123,13 +84,13 @@ def _make_op(comm, op_name, x):
     if op_name == "all_reduce":
         if not comm.should_allreduce(x):
             raise RuntimeError(
-                f"AiterCommunicator rejected all_reduce: shape={tuple(x.shape)} dtype={x.dtype}"
+                f"IrisCommunicator rejected all_reduce: shape={tuple(x.shape)} dtype={x.dtype}"
             )
         return lambda: comm.all_reduce(x)
     if op_name == "all_gather":
         if not comm.should_allgather(x):
             raise RuntimeError(
-                f"AiterCommunicator rejected all_gather: shape={tuple(x.shape)} dtype={x.dtype}"
+                f"IrisCommunicator rejected all_gather: shape={tuple(x.shape)} dtype={x.dtype}"
             )
         return lambda: comm.all_gather(x)
     raise ValueError(f"unknown op {op_name!r}")
@@ -163,7 +124,7 @@ def run_comm(
     dist.all_reduce(torch.zeros(1).cuda(), group=group)
     torch.cuda.synchronize()
 
-    comm = make_communicator(backend, group, device)
+    comm = _build_communicator(backend, group, device)
     op = _make_op(comm, op_name, x)
 
     # Warm up eagerly so first-call allocations (workspace, symmetric buffers)
@@ -193,7 +154,7 @@ def reference(op_name, inputs, dim=-1):
     """What every rank should hold afterwards. all_reduce = elementwise sum
     (accumulated in fp32 so the reference itself doesn't eat bf16 rounding);
     all_gather = concat of the per-rank inputs along `dim`, rank-ordered (the
-    AiterCommunicator.all_gather contract)."""
+    IrisCommunicator.all_gather contract)."""
     if op_name == "all_reduce":
         acc = torch.zeros_like(inputs[0], dtype=torch.float32)
         for x in inputs:
@@ -252,7 +213,7 @@ def test_communicator(
     mode = "cudagraph" if capture else "eager"
     atol = tolerance(op_name, dtype)
     for out in rets:
-        msg = f"AiterCommunicator.{op_name} [{mode}]: {shape=} {dtype=}"
+        msg = f"IrisCommunicator.{op_name} [{mode}]: {shape=} {dtype=}"
         checkAllclose(ref, out.to(ref), atol=atol, rtol=0.01, msg=msg)
 
 
@@ -280,7 +241,7 @@ def run_comm_vary(
     distributed_init_method: Optional[str] = None,
 ):
     """One rank of the varying-input cudagraph check, for `backend` ('iris' = the
-    AiterCommunicator under test; 'torch' = the known-good control).
+    IrisCommunicator under test; 'torch' = the known-good control).
 
     Captures the op once, then replays NUM_VARY_REPLAYS times, copying a DIFFERENT
     input into the static capture buffer before each replay — exactly how vLLM
@@ -303,7 +264,7 @@ def run_comm_vary(
     dist.all_reduce(torch.zeros(1).cuda(), group=group)
     torch.cuda.synchronize()
 
-    comm = make_communicator(backend, group, device)
+    comm = _build_communicator(backend, group, device)
 
     # Full deterministic input matrix on this device: every rank's input for
     # every replay. We need all ranks' inputs (not just ours) to build the
