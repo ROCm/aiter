@@ -432,7 +432,12 @@ def build_flash_attn_fp8_module(
                         fx.Index(LDS_P_OFF) + p_q_local * P_STRIDE + fx.Index(kv_row)
                     )
                     Vec.from_elements([fx.Int8(p_i8)], i8_dtype).store(lds, [p_idx])
-            gpu.barrier()
+            # P round-trip is intra-wave (each wave writes & reads only its own
+            # 32 P rows), but a lane reads kv columns written by its hi-peer
+            # lane in the same wave -> only an LDS fence is needed, NOT a full
+            # workgroup barrier.  s_waitcnt lgkmcnt(0) (keep vm/exp maxed):
+            #   vmcnt[3:0]=0xF, expcnt[2:0]=0x7, lgkmcnt[3:0]=0x0, vmcnt[5:4]=0x3
+            rocdl.s_waitcnt(0xC07F)
 
             # ===============================================================
             # GEMM2: O[d,q] += V^T @ P
