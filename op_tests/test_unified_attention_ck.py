@@ -768,7 +768,14 @@ def _compute_num_splits(cfg: "CaseConfig", total_q: int, device: str) -> int:
                     dtype=cfg.dtype, device=device)
     seq_lens = torch.empty((len(cfg.seq_lens),),
                            dtype=torch.int32, device=device)
-    return int(_pick_num_splits(q, k, seq_lens))
+    # block_tables shape[1] (max_num_blocks_per_seq) is the heuristic's
+    # capture-safe sk upper bound; size it from the longest seq so the probe
+    # reports what the wrapper actually launches.
+    max_sk = max((s[1] for s in cfg.seq_lens), default=0)
+    max_blocks = (max_sk + cfg.block_size - 1) // cfg.block_size
+    block_tables = torch.empty((len(cfg.seq_lens), max(1, max_blocks)),
+                               dtype=torch.int32, device=device)
+    return int(_pick_num_splits(q, k, seq_lens, block_tables))
 
 
 # ----------------------------------------------------------------------------

@@ -282,3 +282,301 @@ first; B only if the consumer still stalls on loads after A.
   `pa_fwd_asm` / `mla_decode_fwd`, zero-conversion coalesced loads.
 - ROCm TurboQuant blog: 4-bit KV dequant, GQA-aware tiling, transposed-V LDS,
   native MFMA dispatch.
+
+---
+
+## 12. Design E — Single-warp, many-CTA-per-CU occupancy attack (2026-06-17)
+
+> Status: planned; E0 diagnostic in progress. Distinct lever from Design A.
+> Target: **fp8 long-context decode** (the production `b4 sq1 sk196608 GQA-6 d128
+> page64` shape — CK ~4.56 TB/s vs Triton ~4.76, peak ~8).
+
+### Premise / why it's not Design A
+
+Design A (§4, findings §5) deepened the K/V ring **inside one warpgroup** and was
+perf-neutral: 2-buffering already issues loads at the loop's natural rate, so more
+depth = more LDS, no BW. That is an *issue-rate* lever and it's spent.
+
+Design E attacks the axis the brief itself names as the structural cap (§3):
+**"~1 WG/CU (LDS-bound) caps memory-level parallelism."** Raise the count of
+**independent** single-warp CTAs resident per CU so 4 staggered (non-lockstep) K/V
+streams overlap → more bytes-in-flight → closer to peak HBM. Untested.
+
+### Key grounding: the single-warp pipeline ALREADY exists
+
+The "1 warp / BLOCKM=16 / no LDS roundtrip for S,P" design is the existing
+**TinyDecode m16 tier**, so this is *tuning occupancy of an existing path*, not a
+new pipeline:
+- `decode_d128_m16` / `decode_d64_m16`: `BlockWarps=sequence<1,1,1>` →
+  `kBlockSize=64` (one 64-lane warp), `kBlockM=16`, 16×16×32 MFMA, `NumWarpGroups==1`
+  (`unified_attention_impl.hpp:191-207,256-263`; `TinyDecodePolicy`
+  `NumWarpPerGroup=1`, `default_policy.hpp:788-792`).
+- For **bf16/fp16** S (`sp_compute`) and P are already register-resident — P is a
+  plain register cast, no LDS roundtrip (`pipeline.hpp:1332-1349`). So LDS is
+  essentially *all* K/V ring, exactly the intuition.
+- **fp8 m16 caveat:** the 16×16×32 PV gemm forces the **LDS-roundtrip P relayout
+  (strategy B, with two `s_barrier`s)** — `pipeline.hpp:1189-1199,1284-1324`. On a
+  single-warp CTA the `s_barrier` is a near-no-op but the lgkm drain remains. So for
+  the fp8 target, "keep P in registers" is NOT free — closing that (a 16×16 within-
+  wave permute instead of the LDS trip) is itself a sub-experiment.
+
+### The knobs fight each other (what E0/E2 must resolve)
+
+| Knob (user intuition) | Helps | Hurts |
+|---|---|---|
+| Large BLOCKN (= page_size; wide loads, fast SRD-rebase) | per-load coalescing, fewer iters/syncs | LDS+VGPR per CTA scale with BLOCKN → **lower** occupancy |
+| Many tiles in flight (deep ring) | MLP within a warp | shown neutral (Design A); costs LDS |
+| 4 WGs/CU (independent warps) | **the untested win** (aggregate MLP) | needs *small* per-CTA LDS+VGPR |
+
+"page_size vs BLOCKN synergy" = set **BLOCKN = page_size** so each KV tile is exactly
+one page → the existing single-page SRD-rebase fast path fires (`kRebaseKSrd`, needs
+`kPageSize % kPageBlockSize == 0`), widest coalesced load, no multi-page math.
+
+### LDS / occupancy facts (gfx950)
+
+- LDS/CU = **160 KiB** (`arch.hpp:1107-1113`). Policy K/V ring = `4·GetSmemSizeKV`
+  (2K+2V double buffer, `default_policy.hpp:773-777`).
+- m16 d128 **bf16** total LDS ≈ 20 KiB (probe comment: *"LDS pressure alone caps
+  decode_d128_m16 at 1 CTA/CU"*, `unified_attention_impl.hpp:301-303`) — but 20 KiB
+  on a 160 KiB CU is NOT a hard 1-CTA cap, so the real binder is likely **VGPR=256**
+  (bf16 saturating). **E0 must confirm VGPR vs LDS.**
+- `kBlockPerCu` is the default `-1`→2 hint for all decode instances
+  (`unified_attention_impl.hpp:376-378`, `pipeline.hpp:102-108`); effective residency
+  is `min(VGPR, LDS)` bound, not the hint.
+
+### Experiment ladder (each gated, default bit-identical; `--full` must stay green)
+
+- **E0 — diagnose (no code):** for `unified_attention_d128_fp8_mask_decode_t`
+  measure VGPR/lane, LDS/CTA (`measure_vgpr.sh`), resident CTAs/CU, achieved BW
+  %peak + vmcnt-wait fraction (`att_analysis` on the production shape). Decides the
+  binding resource and whether E1 has headroom.
+- **E1 — maximize m16 occupancy:** cut the binding resource (single-buffer K/V to
+  halve ring LDS; trim persistent VGPR via single-sp / narrower o_acc; raise the
+  `kBlockPerCu` bound) and confirm CTAs/CU rises 1→4 and BW follows.
+- **E2 — BLOCKN = page_size wide-load sweep:** `BLOCKN ∈ {16,32,64}` aligned to page,
+  single-page rebase active; trade load width vs occupancy.
+- **E3 — strip per-iter sync:** single-warp loop still does full `vmcnt<0>` drain +
+  `s_barrier` each iter (`pipeline.hpp:1693-1694…`); lighten to a staged per-warp
+  wait (no cross-warp ordering needed at 1 warp).
+- **E4 (stretch) — feed occupancy:** ensure `_pick_num_splits`
+  (`unified_attention.py:202-325`) launches enough independent CTAs to fill the new
+  residency (ties into Design C Stream-K).
+
+### Risks
+- **VGPR, not LDS, may be the wall** → may only fit 2 CTAs/CU regardless of LDS cuts
+  (E0 gates this).
+- More resident CTAs ⇒ more splits ⇒ more combine overhead (loss is worst at
+  b=64/splits=16 — Design C territory).
+- fp8 m16 P relayout LDS roundtrip must be made single-warp-cheap or it caps the win.
+
+---
+
+## 13. Design E results + HipKittens 4-wave interleave borrow (2026-06-17)
+
+### E0 diagnostic — DONE (via the torch-free standalone, not the JIT harness)
+
+Tooling: extended `ua-test-scripts/analysis/standalone/ua_trace` to drive the real
+decode tier (`SK` decouples context from `sq`; `NUM_SEQS` replicates batch; the
+production split-KV heuristic + fp32 `o_acc/lse_acc` workspaces + LSE combine are
+wired so CHECK validates). `rocprof_standalone.sh` runs the 4-phase PMC tree in
+~40-75 s vs ~10 min on the Python path. Target instance
+`unified_attention_d128_fp8_nmask_decode_t` = `decode_d128_m16`, paged64.
+
+Measured (production `sq=1 sk=196608 GQA-8 d128 page64`, fp8):
+
+| batch | grid CTAs (2·b·128 splits) | lat | achieved BW |
+|---|---|---|---|
+| b=1 | 256  | 65 µs  | 1.54 TB/s |
+| b=4 | 1024 | 88 µs  | **4.55 TB/s** |
+| b=8 | 2048 | 166 µs | 4.86 TB/s |
+
+PMC (per-dispatch, b=4): `SQ_WAVES=1024`, `VGPR=132`, `LDS≈35 KB`, WG=64 (single
+wave). Memory-wait dominates: `TCP_PENDING_STALL_CYCLES≈33M` and `SQ_WAIT_ANY≈19M`
+vs `GRBM_GUI_ACTIVE≈1.7M`.
+
+**Verdict (updates §12 risks):**
+- **It is genuinely bandwidth-bound at production batch.** BW saturates at b=4 and
+  barely moves to b=8 (4.55→4.86) — more resident CTAs no longer help. So the lever
+  is **bytes-per-second efficiency per CTA**, not raw occupancy. (Caveat: `rotate=1`
+  may let L2 serve some KV; bump `ROTATE` for the true HBM ceiling — the *flat
+  plateau* shape holds regardless.)
+- **VGPR=132, LDS≈35 KB → the m16 tier is NOT pinned at 1 CTA/CU** (the §12 bf16
+  worry). fp8 m16 already runs ~4 waves' worth of work; pure occupancy-raising (E1)
+  is therefore *not* the headline win. The headline is **latency-hiding inside the
+  streaming loop**: keep enough KV loads in flight to cover HBM latency while the
+  MFMA runs.
+
+### HipKittens study (arXiv 2511.08083 + repo `HazyResearch/HipKittens`)
+
+HK has two overlap schedules:
+- **8-wave ping-pong** (2 waves/SIMD, leader/follower swap compute↔memory via
+  `s_barrier` + shared-LDS double buffer) — *balanced* work (their GEMM + attn
+  **forward**, `kernels/attn/gqa/kernel.cpp`, `NUM_WARPS 8`). **This is our prefill
+  FA4 analog — leave it alone.**
+- **4-wave interleave** (1 wave/SIMD, each wave issues *both* compute & memory,
+  finely staggered) — *imbalanced* work (compute- or **memory-**heavy). This is the
+  decode model.
+
+Two separable ideas inside "4-wave":
+1. **1 wave/SIMD ⇒ full 256 VGPR + 256 AGPR to that wave** (registers are split by
+   resident-wave-count per SIMD; paper §3.2 fn). More registers ⇒ deeper in-flight
+   load pipeline ⇒ more HBM latency hidden. We already are single-wave; we are
+   *under-using* the register file (VGPR=132) to hold in-flight KV.
+2. **The interleave itself** (the part to copy), from
+   `kernels/attn/gqa_backwards/archive/GQA_bkwd_4warps.cpp` +
+   `kernels/attn/gqa/kernel.cpp`:
+   - **Double/triple-buffered loads issued ahead** — next tile's `buffer_load`
+     issued at the top of the cluster (`tic`/`toc`), MFMA consumes the resident tile.
+   - **`__builtin_amdgcn_sched_group_barrier(mask,cnt,group)`** to *force* a fixed
+     MFMA:VALU issue ratio (`sched_barrier_pairs<P,N>` = repeat "1 MFMA then N VALU"),
+     so the matrix and vector/transcendental (exp2) pipes run in parallel instead of
+     serial bursts.
+   - **`__builtin_amdgcn_s_setprio(1/0)`** around MFMA clusters so address/memory
+     issue doesn't steal slots mid-MFMA.
+   - Small register tiles, no LDS round-trip for S/P.
+- **Pure-memory-bound floor** (rotary/layernorm, `NUM_WORKERS=1`): when there is
+  *no* compute to hide, HK just does 1 wave/block + huge grid + wide
+  `buffer_load_dwordx4` + minimal address math. Decode has MFMA to hide, so it wants
+  the interleave on top of this.
+
+**1 WG×4 waves vs 4 WGs×1 wave (the user's question):** equivalent *for the 4-wave
+interleave* — the waves are independent (no cross-wave handoff), and the per-SIMD
+register split depends only on resident-wave-count, so either gives each wave the
+full file **iff the launch lands one wave per SIMD** (size to ~4 resident WGs/CU).
+Difference is LDS: LDS is per-WG, so 4 separate WGs split the 160 KB into ~40 KB
+each (matches the brief), while 1 WG-of-4 pools it. Decode splits are independent
+KV ranges that don't share LDS → **4 separate single-warp WGs is the clean choice**
+(what we already launch). The ping-pong's leader/follower handoff is the *only*
+thing that needs a single WG — and that's prefill, which we keep.
+
+### Implementation plan (decode pipeline rewrite; prefill FA4 untouched)
+
+Gated behind a new `kDecodeInterleave` policy flag on the TinyDecode tiers only;
+prefill (`prefill_d128/d64`, FA4 8-warp ping-pong) is a different policy/variant and
+is not touched. Default OFF → bit-identical until proven.
+
+1. **Deepen the in-flight KV window** beyond the current 2-buffer: software-pipeline
+   N tiles (N from the register/LDS budget, target ~4-8) with `buffer_load` issued
+   ahead — this is the actual latency-hider E0 says we lack.
+2. **Interleave QK/PV MFMA with the KV loads + softmax** via `sched_group_barrier`
+   ratios (port `sched_barrier_pairs`/`_exp_pairs`), and `s_setprio` around MFMA.
+3. **Keep S/P register-resident**; for fp8 m16 replace the strategy-B LDS P-relayout
+   with an in-wave 16×16 permute (the §12 caveat) so the loop never round-trips LDS.
+4. **Strip the per-iter full `vmcnt<0>` drain + `s_barrier`** to a staged per-wave
+   wait (single warp ⇒ no cross-warp ordering needed).
+
+Validate every step with the standalone CHECK (b=1/4, paged, split-KV combine) and
+the b=1/4/8 BW table above; north-star = achieved HBM %peak, not TFLOP/s.
+
+### Results (2026-06-17) — interleave is neutral; the split CAP is the lever
+
+Implemented step 1 of the plan: `UA_DECODE_INTERLEAVE` (pipeline.hpp, default 0,
+decode-only `NumWarpGroups==1`). It issues the next tile's K+V async prefetch
+*before* the consume-wait and relaxes the per-iter `s_waitcnt_vmcnt<0>` full drain
+to a partial `vmcnt<K_insts+V_insts>`, so ~2 KV tiles stream in flight with **no
+extra LDS** (still the 2-buffer ring). CHECK passes on every shape (sk multiple &
+non-multiple {8192,8200,4097}, tiny {130,200}, b=4 multi-seq).
+
+**Perf A/B (standalone, fp8 decode_t, sk=196608 GQA-8 d128 page64, rotate=2):**
+
+| shape | OFF | ON |
+|---|---|---|
+| b=1 | 65.3 µs / 0.77 TB/s | 66.1 µs / 0.76 TB/s |
+| b=4 | 69.7 µs / 2.89 TB/s | 70.1 µs / 2.87 TB/s |
+
+→ **Neutral (even slightly worse).** In-loop KV-prefetch depth is NOT the decode
+binder — confirms the Design A finding at the source-schedule level too (the backend
+already pipelines the `buffer_load_lds`; 2 LDS buffers cap residency regardless). The
+macro is left **OFF** (harmless gated infra for a future *deep* ring, where it would
+need 4+ LDS buffers to actually raise residency).
+
+**The actual win — the split cap.** E0 said decode is occupancy/MLP-bound at low
+batch. The binder is the host `_pick_num_splits` (`unified_attention.py:202-325`):
+for b=1 GQA-8 it computes `raw_splits = ceil(num_cus·4 / base_ctas) = ceil(1024/1)
+= 1024` then **clamps `min(128, …)`**, launching only 256 CTAs on 256 CUs (~1 of 4
+SIMDs busy). Forcing more splits (standalone `NUM_SPLITS`, main-kernel time only):
+
+| batch | splits 128 | splits 512 | splits 1024 |
+|---|---|---|---|
+| b=1 | 65.3 µs / 0.77 | 21.5 µs / 2.34 | **16.1 µs / 3.13 TB/s** |
+| b=2 | 65.1 µs / 1.55 | **24.1 µs / 4.18** | — |
+
+CHECK passes at 512/1024 splits (combine correct). At **high** batch the cap is
+already inert (`raw_splits < 128` once `base_ctas` grows), so this only starves
+small-batch long-context decode — exactly the production target shape. The cap=128
+was set citing a prior MI300X A/B ("gap was per-split work, not occupancy"); this
+MI355X (256-CU) data contradicts that for this shape.
+
+**Caveats before changing the default heuristic:**
+- Standalone perf times the **main kernel only** — combine excluded. At b=1/1024
+  splits combine reads `o_acc[hq,splits,1,d]` fp32 ≈ 4 MiB (~1 µs) vs a ~49 µs
+  main-kernel saving, so the net win largely holds, but must be confirmed.
+### End-to-end split A/B (2026-06-17, incl. the REAL combine kernel)
+
+`AITER_UA_FORCE_SPLITS` on `test_unified_attention_ck.py` single-shape decode
+(b, sq=1, sk, GQA-8, d128, page64, fp8 → bf16; CK time = main + combine, median):
+
+| shape | splits 128 | 256 | 512 | 1024 | best | win |
+|---|---|---|---|---|---|---|
+| b=1 sk=196608 | 76.9 µs | 46.9 | **40.8** | 108.6 | 512 | **1.88×** |
+| b=2 sk=196608 | 77.5 | 49.3 | **45.7** | — | 512 | 1.70× |
+| b=4 sk=196608 | 81.2 | **54.1** | 68.1 | — | 256 | 1.50× |
+| b=8 sk=196608 | **88.6** | 94.9 | 117 | — | 128 | 1.0× |
+| b=1 sk=65536 | 35.5 | **24.1** | 30.5 | — | 256 | 1.47× |
+| b=1 sk=16384 | 17.9 | **15.3** | 25.3 | — | 256 | 1.17× |
+
+**The win is real but bounded and shape-dependent** (the standalone's 4× was inflated
+by excluding combine). Two findings:
+1. Optimal splits **decrease with batch** (b=1→512, b=4→256, b=8→128) — `base_ctas`
+   grows with batch so less fan-out is needed; over-splitting pays pure combine cost.
+   The current `min(128,…)` cap truncates only the **low-batch** end (the production
+   target), where it leaves 1.5–1.9× on the table.
+2. Optimal splits **increase with sk** (b=1: 16K→256, 196K→512) — longer per-split
+   KV work amortizes the combine, so longer context tolerates more splits.
+
+**The blocker: `_pick_num_splits` cannot see `sk`** — by design it does NOT read
+`seq_lens` off-device (CUDA-graph capture safety, docstring L245). So it can't be made
+sk-aware without giving that up, and no single static constant wins across the sk×batch
+grid: `target=num_cus·2` fixes long-context low-batch but **regresses** sk=16K b=1
+(25.3 vs 128's 17.9); `cap=256` regresses b=8 (94.9 vs 88.6). Correctness (CK vs torch)
+stays PASS at every split count tested (combine is correct).
+
+### IMPLEMENTED (2026-06-17): sk-aware split heuristic
+
+`_pick_num_splits` (`unified_attention.py`) rewritten — the launch heuristic, NOT the
+kernel pipeline, is the highest-ROI decode lever:
+
+```python
+hard_cap    = num_cus * 2                              # was num_cus * 4
+occ_splits  = ceil(hard_cap / base_ctas)               # fill ~2 waves/CU
+sk_ub       = block_tables.shape[1] * key_cache.shape[1]   # capture-safe sk bound
+work_splits = sk_ub // _UA_MIN_SPLIT_KV_TOKENS         # =128, env-overridable
+num_splits  = clamp(next_pow2(min(occ_splits, work_splits)), 1, hard_cap)
+```
+
+Key enabler: `sk_ub = max_num_blocks_per_seq · block_size` is read from tensor SHAPES
+only (no device sync) → stays CUDA-graph-capture safe, solving the "heuristic can't see
+sk" blocker. `min_split_size = 128` tokens (2 pages) is the best single constant for the
+linear work cap (the true optimum grows ~√sk; 128 is optimal at mid/long sk, ≤2 µs miss
+at very short sk). The standalone C++ port (`ua_trace_main.cpp:pick_num_splits`) mirrors
+it. `AITER_UA_MIN_SPLIT_KV_TOKENS` env overrides for tuning.
+
+**Validated end-to-end (CK incl. combine, no FORCE_SPLITS; heuristic picks):**
+
+| shape | old (cap128) | new | picked splits | net |
+|---|---|---|---|---|
+| b=1 sk=196608 | 76.9 µs | **41.2** | 512 | **1.87×** |
+| b=2 sk=196608 | 77.5 | **45.4** | 512 | 1.71× |
+| b=4 sk=196608 | 81.2 | **53.7** | 256 | 1.51× |
+| b=8 sk=196608 | 88.6 | 89.4 | 128 | ~neutral |
+| b=1 sk=65536 | 35.5 | **31.1** | 512 | 1.14× |
+| b=1 sk=16384 | 17.9 | 16.6 | 128 | 1.08× |
+| b=1 sk=4096 | 14.3 | 15.0 | 32 | 0.95× (−0.7 µs) |
+
+Correctness PASS at every shape; **regression fixtures all green** (prefill guard still
+returns 1; GQA-3/5/6 decode + prefill fixtures unaffected). Only the predicted, negligible
+−5% at very short context. The kernel `UA_DECODE_INTERLEAVE` macro stays OFF (neutral).
+
+**Remaining:** A/B vs Triton across the full 640-shape production trace to confirm the net
+distribution win; consider the √sk form (C≈1.4) if the mid-sk residual (b=1 sk=65536 picks
+512 vs optimal 256) matters.

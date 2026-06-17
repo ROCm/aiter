@@ -199,36 +199,54 @@ def _num_cus(device: torch.device) -> int:
     return cached
 
 
+# Minimum KV tokens per split. Caps num_splits so each split retains enough
+# per-CTA traversal work to amortize the combine kernel's per-(token,head)
+# reduce, which scales linearly with num_splits. Below this, over-splitting
+# trades main-kernel latency for combine cost and net regresses (measured:
+# decode_pipeline_research_plan.md §13 — the optimal per-split size actually
+# grows ~sqrt(sk), so 128 is the best single constant: optimal at mid/long sk,
+# only a sub-2us miss at very short sk). Env-overridable for tuning.
+_UA_MIN_SPLIT_KV_TOKENS = int(os.environ.get("AITER_UA_MIN_SPLIT_KV_TOKENS", "128"))
+
+
 def _pick_num_splits(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     seq_lens: torch.Tensor,
+    block_tables: Optional[torch.Tensor] = None,
 ) -> int:
-    """Pick KV-splits to oversubscribe CTAs ~4x the device's CU count.
+    """Pick KV-splits to fill the device without over-splitting the combine.
 
     Cost model (pure-CPU, no device sync — safe under CUDA graph capture):
-        base_ctas   = num_kv_heads * q_tiles
-        target_ctas = num_cus * 4
-        raw_splits  = ceil(target_ctas / base_ctas)
-        num_splits  = clamp(next_pow2(raw_splits), 1, 128)
+        base_ctas    = num_kv_heads * q_tiles
+        occ_splits   = ceil(num_cus * 2 / base_ctas)        # fill ~2 waves/CU
+        sk_ub        = max_num_blocks_per_seq * block_size  # host-side sk bound
+        work_splits  = sk_ub // _UA_MIN_SPLIT_KV_TOKENS      # combine-amortize cap
+        num_splits   = clamp(next_pow2(min(occ_splits, work_splits)), 1, num_cus*2)
 
-    Why 4x oversubscription + cap 128 (was 2x + cap 16):
-      * Mirrors the Triton FlashDecoding heuristic in `select_3d_config`
-        (`target_num_prgms = cu_count * 4`, `min(num_segments, 128)`),
-        so the two backends pick comparable split counts at the same
-        shape and we're A/B-comparing kernels, not heuristics.
-      * The 2x + cap-16 ceiling capped a 304-CU MI300X at only 16x8 =
-        128 CTAs for b=1 GQA-8 decode (~42% occupancy on MI300X, ~50%
-        on the 256-CU MI355X) — leaving ~half the device idle and
-        bottlenecking on serial per-split KV traversal at long sk.
-        At cap=64 the b=1 hd=128 sk=128K decode still ran 0.52x
-        Triton; at cap=128 it reaches 0.81x — the gap was per-split
-        work, not occupancy.
-      * Workspace stays small: o_acc is fp32 [num_q_heads, num_splits,
-        total_q, head_size]. At cap=128, batch=4, hd=128, GQA-8
-        q_heads=64 → 64*128*4*128*4 ≈ 16 MiB. Combine cost scales
-        linearly with num_splits per (token, head); the Triton
-        combine kernel reads each split's o_acc/lse_acc exactly once.
+    `sk_ub` is read from tensor SHAPES only (block_tables.shape[1] *
+    key_cache.shape[1]) — an upper bound on per-seq KV length that needs no
+    device read, so it stays CUDA-graph-capture safe. It is tight for the
+    common uniform-batch decode case and conservatively large (more splits
+    allowed) when block tables are padded.
+
+    Why 2x oversubscription + an sk-derived work cap (was 4x + flat cap 128):
+      * The flat cap 128 truncated only the LOW-batch end: for b=1 GQA-8
+        long-context decode the 4x rule wants ~1024 splits but clamped to
+        128, leaving ~3 of every 4 SIMDs idle. Measured end-to-end (CK incl.
+        combine, MI355X, GQA-8 d128 fp8, decode_pipeline_research_plan.md
+        §13): raising splits is 1.5-1.9x at b<=4 long context. But pushing
+        too far regresses — combine cost (linear in num_splits) overtakes the
+        main-kernel saving. The end-to-end optimum is ~2 waves/CU (hence
+        num_cus*2, not *4), bounded by the per-split work cap below.
+      * The optimal per-split KV size grows ~sqrt(sk); _UA_MIN_SPLIT_KV_TOKENS
+        is the best single constant for the linear `sk_ub // min` cap (optimal
+        at mid/long sk, sub-2us miss at very short sk). This keeps short-context
+        decode from over-splitting into combine-bound territory.
+      * Workspace stays bounded: o_acc is fp32 [num_q_heads, num_splits,
+        total_q, head_size]; num_splits <= num_cus*2 keeps it within a small
+        multiple of the old cap-128 footprint (largest at low batch, where
+        total_q is tiny). Combine reads each split's o_acc/lse_acc once.
       * Rounding to next_pow2 matches the combine kernel's
         NUM_SPLITS_PADDED = next_pow2(num_splits), so we don't pay
         for masked-out lanes — and stays compatible with the
@@ -313,16 +331,31 @@ def _pick_num_splits(
     if avg_q > 8 and base_ctas >= num_cus:
         return 1
 
-    target_ctas = num_cus * 4
-    # ceil-div so a single under-saturated base_ctas still gets bumped
-    # to the next power-of-2 splits tier instead of rounding down to 0.
-    raw_splits  = (target_ctas + base_ctas - 1) // max(1, base_ctas)
+    # Occupancy target: enough CTAs to fill ~2 waves/CU. ceil-div so a single
+    # under-saturated base_ctas still gets bumped to the next splits tier.
+    hard_cap    = num_cus * 2
+    occ_splits  = (hard_cap + base_ctas - 1) // max(1, base_ctas)
+
+    # Combine-amortization cap. Each split traverses ~sk_ub/num_splits KV tokens;
+    # the combine reduce costs ~num_splits per (token, head). Bounding splits so
+    # each retains >= _UA_MIN_SPLIT_KV_TOKENS tokens keeps the fan-out from
+    # net-regressing at short context. sk_ub is an upper bound on per-seq KV
+    # length read from tensor SHAPES only (no device sync). Without block_tables
+    # (sk unknown) we fall back to the legacy occupancy-only cap of 128.
+    if block_tables is not None and block_tables.dim() >= 2:
+        block_size  = key_cache.shape[1]
+        sk_ub       = int(block_tables.shape[1]) * int(block_size)
+        work_splits = max(1, sk_ub // max(1, _UA_MIN_SPLIT_KV_TOKENS))
+        raw_splits  = min(occ_splits, work_splits)
+    else:
+        raw_splits  = min(occ_splits, 128)
+
     # Round up to next pow2 so combine's NUM_SPLITS_PADDED == num_splits
     # (no masked-out reduce lanes wasted).
     pow2_splits = 1
     while pow2_splits < raw_splits:
         pow2_splits <<= 1
-    return max(1, min(128, pow2_splits))
+    return max(1, min(hard_cap, pow2_splits))
 
 
 def _combine_splits(
@@ -480,7 +513,7 @@ def unified_attention_fwd(
 
     # Transparent split-KV: heuristic picks num_splits and the wrapper owns
     # the workspace + combine.
-    chosen = _pick_num_splits(query, key_cache, seq_lens)
+    chosen = _pick_num_splits(query, key_cache, seq_lens, block_tables)
     if chosen <= 1:
         _unified_attention_fwd_kernel(
             output,
