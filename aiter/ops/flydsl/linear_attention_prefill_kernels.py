@@ -987,7 +987,13 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # same h-store, all prefetch/pipeline scheduling removed).
     _kv_opt_active = bool(_use_kv) and (BV == 64)
     _kv_naive_active = bool(_use_kv_naive) and (BV == 64)
-    _vk_active = bool(_use_vk) and (BV == 64)
+    # NOTE: ``_use_vk`` is intentionally routed to the BASELINE kernel
+    # (``chunk_gated_delta_h.py`` via ``_get_or_compile``) even at BV==64,
+    # instead of the separate VK fork (``chunk_gated_delta_h_vk.py``). The
+    # baseline already emits the public VK layout ([..., V, K]), identical to
+    # the VK fork's output, so this is output-equivalent. Set this back to
+    # ``bool(_use_vk) and (BV == 64)`` to re-enable the VK fork.
+    _vk_active = False
     _vk_naive_active = bool(_use_vk_naive) and (BV == 64)
     # KV-class forks (h stored [..., K, V] -> host transposes to VK).
     _kv_active = _kv_opt_active or _kv_naive_active

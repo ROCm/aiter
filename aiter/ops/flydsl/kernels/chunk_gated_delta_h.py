@@ -13,6 +13,7 @@ For each chunk t (serial over NT chunks):
 """
 
 import math
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -130,16 +131,29 @@ def compile_chunk_gated_delta_h(
 
     NUM_H_ACCS = NUM_K_BLOCKS * N_REPEAT
 
+    # -- LDS bank-conflict padding (env-overridable for sweeps) --
+    # The transpose-read buffers (k / vn / h) break bank conflicts via stride
+    # PADDING (a row-independent linear shift compatible with the
+    # ds_read_tr16_b64 hardware-transpose read). PAD is in bf16 elements and
+    # must be a multiple of 4 (8 B) to keep ds_read_tr16 8-B alignment.
+    # Override at runtime with FLYDSL_K5_LDS_{K,VN,H}_PAD for sweeps.
+    # (lds_w uses XOR swizzle instead of padding -- see below.)
+    def _pad_env(name, default):
+        v = os.environ.get(f"FLYDSL_K5_LDS_{name}_PAD")
+        return default if v is None else int(v)
+
     # -- LDS layout: w and k store all K-blocks to reduce barriers --
     LDS_W_STRIDE = K
     LDS_W_ELEMS_PER_STAGE = BT * LDS_W_STRIDE
-    # OPT-DBW: ping/pong double-buffer for lds_w. Stage 0 is at byte offset
-    # 0, stage 1 at byte offset LDS_W_ELEMS_PER_STAGE * 2. ds_write(w[t+1])
-    # can be issued at the end of chunk t (after GEMM2) while chunk t still
-    # reads the (previously written) lds_w[t%2]. This decouples
-    # ds_write_b128(w) from the chunk-internal vmcnt(8) critical path that
-    # hotspot #2 in the ATT trace identified (2.32 M cycles / 9.7% stall).
-    LDS_W_STAGES = 2
+    # OPT-DBW (REVERTED): a ping/pong double-buffer for lds_w was intended
+    # here (stage 0 @ byte 0, stage 1 @ LDS_W_ELEMS_PER_STAGE*2) to decouple
+    # ds_write(w[t+1]) from the chunk-internal vmcnt critical path. It was
+    # never wired up: the w write/read offsets (see ~464-470 / ~709-715) use
+    # NO stage index, so stage 1 was pure dead LDS (16 KB / 28% of total LDS
+    # for K=128,BT=64). Set stages back to 1 to reclaim that LDS. Restoring
+    # the optimization requires adding an (i_t & 1) stage offset to BOTH the
+    # lds_w write and read offsets, not just bumping LDS_W_STAGES.
+    LDS_W_STAGES = 1
     LDS_W_ELEMS = LDS_W_ELEMS_PER_STAGE * LDS_W_STAGES
     LDS_W_BYTES = LDS_W_ELEMS * 2
 
@@ -155,19 +169,19 @@ def compile_chunk_gated_delta_h(
     # matching LDS_H_PAD / LDS_VN_PAD. Write (line ~539) and transpose read
     # (lines ~925/933) both express their offsets in terms of LDS_K_STRIDE,
     # so this single definition propagates everywhere.
-    LDS_K_PAD = 4  # 4 bf16 = 8 bytes
+    LDS_K_PAD = _pad_env("K", 4)  # 4 bf16 = 8 bytes
     LDS_K_STRIDE = K + LDS_K_PAD
     LDS_K_ELEMS = BT * LDS_K_STRIDE
     LDS_K_BYTES = LDS_K_ELEMS * 2
 
     # OPT-D: lds_vn stride padding (break 2-way bank conflict, +8 B/row).
-    LDS_VN_PAD = 4  # 4 bf16 = 8 bytes
+    LDS_VN_PAD = _pad_env("VN", 4)  # 4 bf16 = 8 bytes
     LDS_VN_STRIDE = BV + LDS_VN_PAD
     LDS_VN_ELEMS = BT * LDS_VN_STRIDE
     LDS_VN_BYTES = LDS_VN_ELEMS * 2
 
     # OPT-H: lds_h stride padding (break 2-way bank conflict on ds_read_u16).
-    LDS_H_PAD = 4  # 4 bf16 = 8 bytes
+    LDS_H_PAD = _pad_env("H", 4)  # 4 bf16 = 8 bytes
     LDS_H_STRIDE = BV + LDS_H_PAD
     LDS_H_ELEMS = K * LDS_H_STRIDE
     LDS_H_BYTES = LDS_H_ELEMS * 2
