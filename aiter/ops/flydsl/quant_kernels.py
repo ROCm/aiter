@@ -21,6 +21,7 @@ from .kernels.dynamic_quant import (
     build_per_1x32_fp4_quant_block_rotation_module,
     build_per_1x32_fp4_quant_block_rotation_mfma_module,
     build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module,
+    build_per_1x32_fp4_quant_block_single_rotation_mfma_moe_sorting_module,
 )
 from .kernels.tensor_shim import get_dtype_str
 
@@ -32,7 +33,69 @@ __all__ = [
     "flydsl_per_1x32_fp4_quant_block_rotation_mfma",
     "flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace",
     "flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort",
+    "mxfp4_singrot_R_preshuffle",
 ]
+
+
+def mxfp4_singrot_R_preshuffle(
+    rot_R: torch.Tensor,
+    *,
+    rot_transposed: bool = False,
+) -> torch.Tensor:
+    """Permute a single ``(32, 32)`` rotation matrix into MFMA B-fragment order.
+
+    The single-shared-R rotation+quant kernel needs, for output tile
+    ``(n_tile, k_tile)`` and lane ``L``, the B-fragment
+    ``R[n = n_tile*16 + L%16][k = k_tile*16 + (L//16)*4 + 0..3]`` (4 contiguous
+    K). Reading that straight from a row-major ``[n][k]`` ``R`` is a strided
+    per-lane gather (adjacent lanes 64 B apart). Pre-laying ``R`` so the
+    fragment lands contiguously at flat element
+    ``((n_tile*NUM_K_TILES + k_tile)*64 + L)*4`` lets the kernel read it with a
+    single lane-contiguous coalesced load (adjacent lanes 8 B apart) -- exactly
+    the MoE preshuffled-weight trick.
+
+    Parameters
+    ----------
+    rot_R : ``(32, 32)`` / ``(1, 32, 32)`` single matrix, or a per-block
+        ``(scale_N, 32, 32)`` stack (the permutation is applied to each block).
+    rot_transposed : if True, ``rot_R`` is stored ``[k][n]``; it is transposed
+        to the canonical ``[n][k]`` before shuffling (so the kernel can always
+        treat the shuffled tensor as non-transposed).
+
+    Returns
+    -------
+    A contiguous ``(32, 32)`` tensor (same dtype/device) whose flat layout is
+    the fragment order, carrying a ``rot_preshuffled = True`` marker attribute.
+    Pass it to :func:`flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace`
+    (single-R); the dispatch detects the marker and selects the shuffled load.
+    """
+    G = _FP4_GROUP_SIZE          # 32
+    TILE = 16
+    NT = G // TILE               # 2 n-tiles
+    KT = G // TILE               # 2 k-tiles
+    FV = 4                       # WMMA_FRAG_VALS
+    orig_shape = tuple(rot_R.shape)
+    # Accept a single (32,32)/(1,32,32) matrix or (B,32,32) stack; shuffle each block.
+    R = rot_R.reshape(-1, G, G)              # (B, 32, 32)
+    if rot_transposed:
+        R = R.transpose(-1, -2)
+    B = R.shape[0]
+    Rf = R.contiguous().reshape(B, G * G)    # [b, n*32 + k]
+    L = torch.arange(64, device=R.device)
+    n_r = L % TILE                           # n within tile (0..15)
+    g = L // TILE                            # lane group 0..3
+    out = torch.empty(B, NT * KT * 64 * FV, dtype=Rf.dtype, device=R.device)
+    for nt in range(NT):
+        for kt in range(KT):
+            n = nt * TILE + n_r              # (64,)
+            k0 = kt * TILE + g * FV          # (64,)
+            blk = (nt * KT + kt) * 64 * FV
+            for i in range(FV):
+                src = n * G + (k0 + i)       # (64,)
+                out[:, blk + L * FV + i] = Rf[:, src]
+    out = out.reshape(orig_shape).contiguous()
+    out.rot_preshuffled = True
+    return out
 
 
 def _out_dtype_str(dtype: torch.dtype) -> str:
@@ -85,7 +148,7 @@ def flydsl_dynamic_per_tensor_quant(
         raise ValueError(
             f"unsupported input dtype {input.dtype}; only bf16/fp16 supported"
         )
-    # tensor_shim uses "f16" for half but the kernel module uses "fp16"; normalize.
+    # tensor_shim uses "f16"; the kernel module wants "fp16".
     if in_dtype == "f16":
         in_dtype = "fp16"
 
@@ -94,9 +157,8 @@ def flydsl_dynamic_per_tensor_quant(
     cols = int(input.shape[-1])
     rows = int(input.numel() // cols)
 
-    # Host-side init: zero the global accumulator that data_to_scale_kernel
-    # atomically max-reduces into. ``zero_`` is enqueued on the active stream
-    # so this stays async w.r.t. the host.
+    # Zero the global accumulator the kernel atomically max-reduces into,
+    # enqueued on the active stream (stays async w.r.t. the host).
     if stream is None:
         scale.zero_()
     else:
@@ -125,13 +187,8 @@ def flydsl_per_1x32_fp4_quant(
 ) -> None:
     """In-place MXFP4 per-1x32 dynamic quantization.
 
-    Mirrors the semantics of ``aiter.dynamic_per_group_scaled_quant_fp4``
-    (CUDA) with ``group_size=32, shuffle_scale=False``:
-
-        for each contiguous group of 32 elements in the last dim:
-            scale = round_up_pow2(amax) * 0.25              # OCP MX scale
-            out[group] = HW-quantize(input[group] / scale)  # fp4 E2M1, packed 2-per-byte
-            scale_e8m0 = (bitcast<u32>(scale) >> 23) & 0xFF
+    Mirrors ``aiter.dynamic_per_group_scaled_quant_fp4`` (CUDA, ``group_size=32,
+    shuffle_scale=False``): per 32-elem group, OCP MX scale, fp4 E2M1 packed 2/byte.
 
     Parameters
     ----------
@@ -204,17 +261,8 @@ def flydsl_per_1x32_fp4_quant_hadamard(
 ) -> None:
     """In-place MXFP4 per-1x32 dynamic quant **with fused H_32 rotation**.
 
-    Equivalent of ``flydsl_per_1x32_fp4_quant`` but applies the orthonormal
-    Walsh-Hadamard transform ``H_32 / sqrt(32)`` to each group of 32 elements
-    immediately after loading and before computing the per-group amax.
-
-    The stored E8M0 scale is the dequant scale for the **rotated** values, so
-    a downstream consumer must apply the inverse rotation
-    (``H_32 / sqrt(32)`` since Walsh-Hadamard is its own inverse up to
-    normalization) after the dequant step.
-
-    See ``flydsl_per_1x32_fp4_quant`` for the rest of the contract (shape /
-    layout / dtype rules).
+    Like ``flydsl_per_1x32_fp4_quant`` but applies ``H_32 / sqrt(32)`` per group
+    before amax; the scale dequants rotated values (Walsh-Hadamard is self-inverse).
     """
     assert input.is_contiguous(), "FlyDSL per_1x32_fp4_quant_hadamard requires contiguous input"
     assert out.is_contiguous(), "FlyDSL per_1x32_fp4_quant_hadamard requires contiguous out"
@@ -274,31 +322,9 @@ def flydsl_per_1x32_fp4_quant_block_rotation(
 ) -> None:
     """In-place MXFP4 per-1x32 dynamic quant **with fused per-block rotation**.
 
-    Equivalent of running
-    ``y = apply_block_rotation(input, rot_R); quant_mxfp4_per_1x32(y)``
-    in a single kernel:
-
-      *   ``input``         : ``(rows, cols)``               bf16 / fp16, contiguous
-      *   ``rot_R``         : ``(cols // 32, 32, 32)``       bf16 / fp16 / f32, contiguous
-      *   ``out``           : ``(rows, cols // 2)``          uint8 (fp4x2)
-      *   ``scale``         : ``(rows, cols // 32)``         uint8 (fp8 e8m0)
-
-    The rotation is the same block-diagonal map as the host reference
-
-    .. code-block:: python
-
-        def apply_block_rotation(x, R):
-            *lead, N = x.shape
-            B, g, _ = R.shape                   # g == 32
-            xb = x.reshape(*lead, B, g)
-            return torch.einsum("...bg,bhg->...bh", xb, R).reshape(*lead, N)
-
-    LDS reuse of ``R[b]`` makes the kernel cheap when many tokens share the
-    same group: ``rot_R`` is read from VRAM only ``rows / 64`` times per b.
-
-    The stored E8M0 scale is the dequant scale of the *rotated* values.
-    Downstream consumers must invert by applying ``R[b]^T`` (assumed
-    orthogonal) on top of dequant.
+    Single-kernel ``y = einsum("...bg,bhg->...bh", x, rot_R); quant_mxfp4_per_1x32(y)``
+    over ``input (rows, cols)``, ``rot_R (cols//32, 32, 32)``; scale dequants rotated
+    values, so consumers must apply ``R[b]^T`` on top of dequant.
     """
     assert input.is_contiguous(), "FlyDSL per_1x32_fp4_quant_block_rotation requires contiguous input"
     assert rot_R.is_contiguous(), "FlyDSL per_1x32_fp4_quant_block_rotation requires contiguous rot_R"
@@ -371,41 +397,16 @@ def flydsl_per_1x32_fp4_quant_block_rotation_mfma(
 ) -> None:
     """MFMA-accelerated variant of :func:`flydsl_per_1x32_fp4_quant_block_rotation`.
 
-    Implemented with ``v_mfma_f32_16x16x16_{bf16,f16}_1k`` instead of the
-    1024-FMA scalar chain. Restrictions:
-
-    *   ``input.dtype`` must match ``rot_R.dtype`` (both bf16 or both fp16).
-    *   ``rot_R`` cannot be fp32; use the scalar wrapper for fp32 R.
+    Uses ``v_mfma_f32_16x16x16_{bf16,f16}_1k`` instead of the scalar FMA chain;
+    ``input.dtype`` must match ``rot_R.dtype`` (bf16/fp16, no fp32).
 
     Parameters
     ----------
     rot_transposed : bool, default False
-        How to interpret the last two dims of ``rot_R`` (shape
-        ``(scale_N, 32, 32)``):
+        ``False``: ``rot_R[b,h,g]`` is ``R`` (``Y[m] = X[m] @ R.T``); ``True``:
+        ``rot_R[b,g,h]`` is ``R.T`` (``Y[m] = X[m] @ R``). Compile-time flag.
 
-        - ``False``: ``rot_R[b, h, g]`` is the rotation matrix ``R``.
-          The kernel computes
-          ``y[m, b*32 + h] = sum_g x[m, b*32 + g] * rot_R[b, h, g]``,
-          equivalent to ``Y = einsum("...bg, bhg -> ...bh", X, rot_R)``
-          (per-block ``Y[m] = X[m] @ R.T``).
-        - ``True``: ``rot_R[b, g, h]`` is the rotation matrix stored
-          transposed along its last two dims (i.e. the caller passes
-          ``R.transpose(-1, -2)``). The kernel computes
-          ``y[m, b*32 + h] = sum_g x[m, b*32 + g] * rot_R[b, g, h]``,
-          equivalent to ``Y = einsum("...bg, bgh -> ...bh", X, rot_R)``
-          (per-block ``Y[m] = X[m] @ R``).
-
-        Both modes yield mathematically equivalent results when fed
-        corresponding (transposed vs. non-transposed) ``rot_R`` tensors.
-        The flag is compile-time (selects a different cached kernel via
-        ``lru_cache``); there is no runtime branch. The transposed mode
-        pays a small one-time per-workgroup overhead in the cooperative
-        LDS load (~8 scalar stores per thread instead of 1 vec8), then
-        proceeds with an identical MFMA hot path.
-
-    All other shape / contiguity constraints are identical to the scalar
-    wrapper. See :func:`flydsl_per_1x32_fp4_quant_block_rotation` for the
-    full contract.
+    See :func:`flydsl_per_1x32_fp4_quant_block_rotation` for the full contract.
     """
     assert input.is_contiguous(), "FlyDSL per_1x32_fp4_quant_block_rotation_mfma requires contiguous input"
     assert rot_R.is_contiguous(), "FlyDSL per_1x32_fp4_quant_block_rotation_mfma requires contiguous rot_R"
@@ -450,7 +451,7 @@ def flydsl_per_1x32_fp4_quant_block_rotation_mfma(
     if rot_dtype == "f16":
         rot_dtype = "fp16"
 
-    # MFMA requires both A and B same fp type at the hardware level.
+    # MFMA requires A and B to share the same fp type.
     if in_dtype != rot_dtype:
         raise ValueError(
             f"MFMA path requires input.dtype == rot_R.dtype "
@@ -478,12 +479,80 @@ def flydsl_per_1x32_fp4_quant_block_rotation_mfma(
 def _read_rot_R_transpose_attr(rot_R: torch.Tensor) -> bool:
     """Return user-set ``rot_R.transpose`` bool (default ``False``).
 
-    ``Tensor.transpose`` resolves to a built-in method by default, so we
-    only honour the attribute when the caller has explicitly bound a
-    ``bool`` to it.
+    Only honoured when a ``bool`` is bound (else it's the built-in method).
     """
     attr = getattr(rot_R, "transpose", False)
     return attr if isinstance(attr, bool) else False
+
+
+def _largest_divisor_leq(n: int, cap: int) -> int:
+    """Largest divisor of ``n`` that is ``<= cap`` (>= 1)."""
+    cap = max(1, min(cap, n))
+    for d in range(cap, 0, -1):
+        if n % d == 0:
+            return d
+    return 1
+
+
+def _select_single_rot_blocks_per_wg(
+    blocks_per_wg, scale_n: int, num_sorted_blocks: int, device,
+) -> int:
+    """Pick ``K`` (blocks per workgroup) for the single-shared-R kernel.
+
+    ``"auto"`` resolves to ``K = 1``: merging blocks is net-negative on MI355
+    (it kills inter-WG latency hiding). An explicit int is a power-user knob.
+    """
+    if isinstance(blocks_per_wg, int):
+        return _largest_divisor_leq(scale_n, max(1, blocks_per_wg))
+    if blocks_per_wg != "auto":
+        raise ValueError(
+            f"blocks_per_wg must be an int or 'auto', got {blocks_per_wg!r}"
+        )
+    # Measured best: no merging.
+    return 1
+
+
+# Measured-best (persist_m, blocks_per_wg, waves_per_wg) per token count M
+# (single-shared-R). Auto-tune picks the first bucket whose M_max >= M.
+_SINGLE_ROT_AUTO_TABLE = (
+    # (M_max, persist_m, blocks_per_wg, waves_per_wg)
+    (1 << 10,  1, 1, 1),   # <= 1024
+    (1 << 11,  2, 1, 2),   # <= 2048
+    (1 << 12,  2, 1, 4),   # <= 4096
+    (1 << 13,  1, 1, 1),   # <= 8192
+    (1 << 14,  2, 1, 4),   # <= 16384
+    (1 << 15, 16, 2, 2),   # <= 32768
+    (40960,    1, 1, 1),   # <= 40960
+    (1 << 16, 32, 2, 2),   # <= 65536 and beyond
+)
+
+
+def _single_rot_auto_config(m_rows: int):
+    """Return (persist_m, blocks_per_wg, waves_per_wg) tuned for M = ``m_rows``
+    (smallest bucket whose M_max >= M)."""
+    for m_max, pm, k, w in _SINGLE_ROT_AUTO_TABLE:
+        if m_rows <= m_max:
+            return pm, k, w
+    return _SINGLE_ROT_AUTO_TABLE[-1][1:]
+
+
+# Measured-best (persist_m, blocks_per_wg, waves_per_wg) per token count M for
+# the PER-BLOCK R[b] kernel; K is always 1 (per-block K>1 serializes R[b] loads).
+_PERBLOCK_ROT_AUTO_TABLE = (
+    # (M_max, persist_m, blocks_per_wg, waves_per_wg)
+    (1 << 13,  1, 1, 2),   # <= 8192   : W=2 hides the per-row latency
+    (1 << 14,  2, 1, 1),   # <= 16384  : persist_m=2, single wave
+    (1 << 31,  1, 1, 1),   # large M   : plain pm1/K1/W1
+)
+
+
+def _perblock_rot_auto_config(m_rows: int):
+    """Return (persist_m, blocks_per_wg, waves_per_wg) tuned for M = ``m_rows``
+    on the per-block R[b] path (smallest covering bucket)."""
+    for m_max, pm, k, w in _PERBLOCK_ROT_AUTO_TABLE:
+        if m_rows <= m_max:
+            return pm, k, w
+    return _PERBLOCK_ROT_AUTO_TABLE[-1][1:]
 
 
 def flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace(
@@ -496,60 +565,41 @@ def flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace(
     token_num: int,
     *,
     rot_transposed: bool = False,
+    blocks_per_wg: "int | str" = "auto",
+    waves_per_wg: "int | None" = None,
+    preload_b: "bool | None" = None,
+    persist_m: "int | None" = None,
+    xcd_remap: bool = False,
     stream: torch.cuda.Stream = None,
 ) -> None:
     """In-place rotation + per-1x32 MXFP4 quant + MoE scale-sort.
 
-    **Single-kernel** fusion: launches
-    :func:`build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module`,
-    which iterates over destination ``sorted_row`` blocks, gathers each
-    routed token via ``sorted_ids``, runs the MFMA-accelerated per-block
-    rotation + per-1x32 MXFP4 quant, and writes:
-
-      * the packed fp4x2 bytes to ``out`` at row
-        ``token_idx * topk + topk_id`` (the topk-expanded source row),
-      * the E8M0 scale byte directly into ``out_scale`` at the
-        ``fp4_scale_shuffle_id(scaleN_pad, sorted_row, b)`` address.
-
-    This mirrors the CUDA ``fused_dynamic_mxfp4_quant_moe_sort_hip``
-    behaviour. ``topk`` is inferred as ``rows // token_num`` (stage1
-    activations give ``topk == 1``; stage2 activations give the real
-    ``topk``).
-
-    NOTE on coverage: only ``out`` rows that appear in ``sorted_ids``
-    (routed tokens) are written; unrouted rows are left untouched. This
-    matches what the downstream tile-quantised CK GEMM consumes (it only
-    reads routed positions). The previous two-kernel chain
-    (``flydsl_per_1x32_fp4_quant_block_rotation_mfma`` +
-    ``mxfp4_moe_sort_hip``) instead wrote every source row of ``out``;
-    the MoE-sorted ``out_scale`` is identical between the two.
+    Single-kernel MFMA rotation + per-1x32 MXFP4 quant, then a MoE scale-sort;
+    mirrors CUDA ``fused_dynamic_mxfp4_quant_moe_sort_hip``. ``topk`` is inferred
+    as ``rows // token_num``. Only routed rows of ``out`` are written.
 
     Parameters
     ----------
-    out : ``(rows, cols // 2)`` ``uint8`` (caller views as ``fp4x2``).
-        Packed fp4x2 quant output. Must be contiguous.
+    out : ``(rows, cols // 2)`` ``uint8`` (``fp4x2``) packed output. Contiguous.
     input : ``(rows, cols)`` ``bf16`` / ``fp16``. Contiguous.
-    rot_R : ``(cols // 32, 32, 32)`` ``bf16`` / ``fp16``, dtype must
-        match ``input``. Set ``rot_R.transpose = True`` (instance
-        attribute) or pass ``rot_transposed=True`` to use the
-        ``[b, g, h]`` storage layout; see
-        :func:`flydsl_per_1x32_fp4_quant_block_rotation_mfma` for the
-        full convention.
-    out_scale : ``(((sorted_ids.shape[0] + 31) // 32) * 32, cols // 32)``
-        ``fp8_e8m0`` -- MoE-sorted, MXFP4-shuffled scale destination.
-        Allocated by the caller (matches what
-        :func:`aiter.ops.quant.mxfp4_moe_sort_fwd` returns).
+    rot_R : ``(cols // 32, 32, 32)`` ``bf16`` / ``fp16`` matching ``input``. A
+        single ``(32, 32)`` / ``(1, 32, 32)`` matrix takes the shared-R fast path.
+    blocks_per_wg : int or ``"auto"``, default ``"auto"``
+        Blocks per workgroup (single-R path); ``"auto"`` is the measured-best ``K``
+        for ``M = rows``. Per-block path always uses ``K = 1``.
+    waves_per_wg : int or ``None``, default ``None``
+        Waves per workgroup; ``None`` takes the measured-best ``W`` for ``M``.
+    persist_m : int or ``None``, default ``None``
+        Persistent row-block groups; ``None`` takes the measured-best value.
+    out_scale : ``(((sorted_ids.shape[0]+31)//32)*32, cols//32)`` ``fp8_e8m0``
+        MoE-sorted, MXFP4-shuffled scale dest (as ``mxfp4_moe_sort_fwd`` returns).
     sorted_ids, num_valid_ids, token_num
-        MoE sort inputs as produced by ``moe_sort_block_fwd``; same
-        semantics as :func:`aiter.ops.quant.mxfp4_moe_sort_fwd`.
-    rot_transposed : ``bool``, default ``False``. Selects the kernel
-        build for the rotation tensor layout (see
+        MoE sort inputs; same semantics as ``aiter.ops.quant.mxfp4_moe_sort_fwd``.
+    rot_transposed : ``bool``, default ``False``. Rotation tensor layout (see
         :func:`flydsl_per_1x32_fp4_quant_block_rotation_mfma`).
-    stream : optional ``torch.cuda.Stream`` -- defaults to the current
-        CUDA stream.
+    stream : optional ``torch.cuda.Stream`` -- defaults to the current stream.
     """
     assert input.dim() == 2, f"input must be 2-D (rows, cols), got {input.shape}"
-    assert rot_R.dim() == 3, f"rot_R must be 3-D (B, g, g), got {rot_R.shape}"
     rows = int(input.shape[0])
     cols = int(input.shape[-1])
     if cols % _FP4_GROUP_SIZE != 0:
@@ -558,13 +608,25 @@ def flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace(
         )
     scale_n = cols // _FP4_GROUP_SIZE
 
+    # Fast path: a single 32x32 rot_R shares one R across blocks (LDS once);
+    # a (scale_N, 32, 32) tensor uses the per-block kernel.
+    _g = _FP4_GROUP_SIZE
+    single_R = (
+        (rot_R.dim() == 2 and tuple(rot_R.shape) == (_g, _g))
+        or (rot_R.dim() == 3 and tuple(rot_R.shape) == (1, _g, _g))
+    )
+    # Read the host-applied preshuffle marker before reshape/contiguous drops it.
+    _rot_pshuf = bool(getattr(rot_R, "rot_preshuffled", False))
+    if not single_R:
+        assert rot_R.dim() == 3, f"rot_R must be 3-D (B, g, g), got {rot_R.shape}"
+        expected_R_shape = (scale_n, _g, _g)
+        assert tuple(rot_R.shape) == expected_R_shape, (
+            f"rot_R shape {tuple(rot_R.shape)} != expected {expected_R_shape}"
+        )
+
     expected_out_shape = (rows, cols // 2)
     assert tuple(out.shape) == expected_out_shape, (
         f"out shape {tuple(out.shape)} != expected {expected_out_shape}"
-    )
-    expected_R_shape = (scale_n, _FP4_GROUP_SIZE, _FP4_GROUP_SIZE)
-    assert tuple(rot_R.shape) == expected_R_shape, (
-        f"rot_R shape {tuple(rot_R.shape)} != expected {expected_R_shape}"
     )
     expected_out_scale_rows = (sorted_ids.shape[0] + 31) // 32 * 32
     assert tuple(out_scale.shape) == (expected_out_scale_rows, scale_n), (
@@ -615,44 +677,117 @@ def flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace(
     if num_valid_ids.dtype != torch.int32:
         num_valid_ids = num_valid_ids.to(torch.int32)
 
-    num_sorted_blocks = (
-        int(sorted_ids.shape[0]) + _FP4_GROUP_QUANT_BLOCK_SIZE - 1
+    # Both kernels traverse contiguous source rows, so the grid is sized by real
+    # source-row blocks (not the padded sorted space).
+    num_row_blocks = (
+        rows + _FP4_GROUP_QUANT_BLOCK_SIZE - 1
     ) // _FP4_GROUP_QUANT_BLOCK_SIZE
 
-    # The input gather computes an i32 element offset ``src_row * cols``; once
-    # ``rows * cols >= 2**31`` that product overflows (and the bf16 byte offset
-    # leaves the 4 GB buffer window). Only then pay for the slower 64-bit GEP +
-    # global load; otherwise keep the cheap hardware buffer load. This mirrors
-    # the wptr64 selection in the moe GEMM kernels.
+    # Use the slower 64-bit GEP only when the i32 offset src_row*cols would
+    # overflow at rows*cols >= 2**31; else keep the cheap buffer load.
     use_ptr64 = (rows * cols) >= (1 << 31)
 
-    launcher = build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module(
-        cols=cols,
-        in_dtype=in_dtype,
-        rot_dtype=rot_dtype,
-        topk=topk,
-        rot_transposed=bool(rot_transposed),
-        use_ptr64=bool(use_ptr64),
-    )
+    if single_R:
+        # Single shared (32, 32) R; normalize (1, 32, 32) and pick K.
+        rot_R = rot_R.reshape(_g, _g)
+        # Auto-tune (persist_m, K, W) for M = rows; explicit args override.
+        auto_pm, auto_k, auto_w = _single_rot_auto_config(rows)
+        k = _select_single_rot_blocks_per_wg(
+            auto_k if blocks_per_wg == "auto" else blocks_per_wg,
+            scale_n, num_row_blocks, input.device,
+        )
+        # Multi-wave factor: explicit arg, else tuned default.
+        w = auto_w if waves_per_wg is None else int(waves_per_wg)
+        # Preload R B-fragments into registers: explicit arg, else on.
+        pb = True if preload_b is None else bool(preload_b)
+        # Preshuffle (default on): trust host marker or shuffle here; implies
+        # preload_b and folds in rot_transposed.
+        if not _rot_pshuf:
+            rot_R = mxfp4_singrot_R_preshuffle(
+                rot_R, rot_transposed=bool(rot_transposed),
+            )
+            _rot_pshuf = True
+        if _rot_pshuf:
+            pb = True  # shuffled load goes straight HBM->VGPR
+        launcher = (
+            build_per_1x32_fp4_quant_block_single_rotation_mfma_moe_sorting_module(
+                cols=cols,
+                in_dtype=in_dtype,
+                rot_dtype=rot_dtype,
+                topk=topk,
+                # rot_transposed is absorbed by the host shuffle when preshuffled
+                rot_transposed=bool(rot_transposed) and not _rot_pshuf,
+                use_ptr64=bool(use_ptr64),
+                blocks_per_wg=k,
+                waves_per_wg=w,
+                preload_b=pb,
+                rot_preshuffled=_rot_pshuf,
+                persist_m=auto_pm if persist_m is None else int(persist_m),
+                xcd_remap=bool(xcd_remap),
+            )
+        )
+    else:
+        # Per-block R[b]: auto-tune (persist_m, K, W) for M = rows; explicit args
+        # override. The table always returns K = 1 (per-block K>1 serializes loads).
+        auto_pm, auto_k, auto_w = _perblock_rot_auto_config(rows)
+        # Multi-wave amortizes the one R[b] load over W waves. Explicit arg, else default.
+        w = auto_w if waves_per_wg is None else int(waves_per_wg)
+        # K: "auto" takes the tuned K (always 1); explicit int clamped to divide scale_n.
+        if isinstance(blocks_per_wg, str):
+            kb = auto_k
+        else:
+            kb = int(blocks_per_wg)
+            if kb < 1 or scale_n % kb != 0:
+                kb = 1
+        # Preshuffle (default on) per block; trust host marker or shuffle here,
+        # folding in rot_transposed.
+        if not _rot_pshuf:
+            rot_R = mxfp4_singrot_R_preshuffle(
+                rot_R, rot_transposed=bool(rot_transposed),
+            )
+            _rot_pshuf = True
+        # Preshuffle implies preload_b; persist_m defaults to 1 for this path.
+        pb = True if (preload_b is None or _rot_pshuf) else bool(preload_b)
+        launcher = build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module(
+            cols=cols,
+            in_dtype=in_dtype,
+            rot_dtype=rot_dtype,
+            topk=topk,
+            # rot_transposed absorbed by the host shuffle when preshuffled
+            rot_transposed=bool(rot_transposed) and not _rot_pshuf,
+            use_ptr64=bool(use_ptr64),
+            waves_per_wg=w,
+            blocks_per_wg=kb,
+            preload_b=pb,
+            rot_preshuffled=_rot_pshuf,
+            persist_m=auto_pm if persist_m is None else int(persist_m),
+            xcd_remap=bool(xcd_remap),
+        )
 
     if stream is None:
         stream = torch.cuda.current_stream()
 
-    # The kernel addresses ``out_scale`` by byte; pass a uint8 view so the
-    # 1-byte E8M0 stores land regardless of the caller's scalar type.
-    out_scale_u8 = out_scale.view(torch.uint8)
+    # Step 1: rotation + per-1x32 MXFP4 quant (NO sort). Contiguous source rows
+    # -> plain unsorted scale temp + natural-order fp4x2 ``out`` (no gather).
+    from aiter import dtypes as _dtypes
 
-    launcher(
-        input,
-        rot_R,
-        sorted_ids,
-        num_valid_ids,
-        out,
-        out_scale_u8,
-        num_sorted_blocks,
-        token_num,
-        stream,
+    scale_unsorted = torch.empty(
+        rows, scale_n, dtype=_dtypes.fp8_e8m0, device=input.device,
     )
+    launcher(
+        input, rot_R, out, scale_unsorted.view(torch.uint8),
+        num_row_blocks, token_num, stream,
+    )
+
+    # Step 2: MoE scale-sort + MXFP4 shuffle -> out_scale in the MoE-sorted,
+    # MXFP4-shuffled layout (bit-identical to ``mxfp4_moe_sort_fwd``).
+    from aiter.ops.quant import mxfp4_moe_sort_hip
+
+    with torch.cuda.stream(stream):
+        mxfp4_moe_sort_hip(
+            out_scale, scale_unsorted, sorted_ids, num_valid_ids,
+            token_num, cols,
+        )
 
 
 def flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort(
@@ -668,24 +803,18 @@ def flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort(
     """Alloc-and-return wrapper around
     :func:`flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace`.
 
-    User-facing API matches
-    :func:`aiter.ops.quant.fused_dynamic_mxfp4_quant_moe_sort`, so this
-    is a drop-in upgrade when a per-block rotation has to be folded
-    into the per-1x32 MXFP4 quant + MoE scale-sort pipeline. See the
-    underlying in-place function for the kernel-level details.
+    API matches ``aiter.ops.quant.fused_dynamic_mxfp4_quant_moe_sort``; see the
+    in-place function for kernel-level details.
 
     Parameters
     ----------
     input : ``(rows, cols)`` ``bf16`` / ``fp16``.
-    rot_R : ``(cols // 32, 32, 32)`` ``bf16`` / ``fp16``. Set
-        ``rot_R.transpose = True`` (instance attribute) or pass
-        ``rot_transposed=True`` to switch to the ``[b, g, h]`` storage
-        layout.
+    rot_R : ``(cols // 32, 32, 32)`` ``bf16`` / ``fp16``. Set ``rot_R.transpose``
+        or pass ``rot_transposed=True`` for the ``[b, g, h]`` layout.
     sorted_ids, num_valid_ids, token_num
         Same semantics as :func:`aiter.ops.quant.mxfp4_moe_sort_fwd`.
-    rot_transposed : optional ``bool`` override. When ``None`` (the
-        default), the value is read from the ``rot_R.transpose``
-        attribute.
+    rot_transposed : optional ``bool`` override; ``None`` reads
+        ``rot_R.transpose``.
 
     Returns
     -------
