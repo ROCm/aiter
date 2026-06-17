@@ -261,8 +261,11 @@ def rope_norm_store_kv_fp8_hip(
         (num_req, num_kv_heads), dtype=torch.int32, device=qkv.device
     )
 
-    # Tile by the effective warp count (rows for prefill, batch for decode).
-    hpw_key = num_rows if is_prefill else num_req
+    # Tile by actual token rows, not by q_scale layout. vLLM may pass
+    # is_prefill=False for prefill/unified batches to keep row-major q_scale,
+    # but HPW should follow the real row-head work size.
+    decode_one_token = num_rows == num_req
+    tile_hpw = select_tile_hpw(num_rows, num_q_heads)
     H = _get_hadamard(qk_head_dim, qkv.device, qkv.dtype)
     rope_norm_store_kv_fp8_fused_hip(
         qkv,
@@ -281,9 +284,9 @@ def rope_norm_store_kv_fp8_hip(
         q_scale_rows,
         1e-5,
         float(fp8_max),
-        bool(num_rows == num_req),
+        bool(decode_one_token),
         False,
-        select_tile_hpw(hpw_key, num_q_heads),
+        tile_hpw,
     )
 
     if not is_prefill:
