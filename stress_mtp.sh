@@ -1,50 +1,48 @@
 #!/bin/bash
-# Intermittent-race stress harness. A single vmask pass is a FALSE NEGATIVE (the
-# race is scheduling-dependent). This runs each candidate LOOPS times and counts
-# how many runs report nondeterminism, so PASS/FAIL becomes statistical.
+# Intermittent mtp=2,3 race stress harness. Single pass = false negative; this
+# loops each candidate LOOPS times and counts races via the test EXIT CODE
+# (2=INCONCLUSIVE/race, 1=bitmatch-fail, 0=clean).
 #
-# Stage 1 (default): confirm the BASELINE races reliably enough to bisect.
-#   bash stress_mtp.sh base 30
-# Stage 2: once baseline races in a good fraction, bisect all candidates:
-#   bash stress_mtp.sh all 30
+# Candidates are EXPLICIT fixed-path .co files (no "current deployed" capture).
+# Trigger = the ORIGINAL failing config: varlen OFF, b=64 kvh=8 c=8193,16385 m=2,3.
+#
+#   bash stress_mtp.sh base 50    # confirm baseline races reliably
+#   bash stress_mtp.sh all  50    # then bisect all groups
 #
 # Run from /local_vol1_nobackup/qiwan/mi400_aiter on the gfx1250 box.
 set -e
 WHICH=${1:-base}
-LOOPS=${2:-30}
+LOOPS=${2:-50}
 CO_DIR=hsa/gfx1250/pa_decode_bf16
 DEPLOYED=$CO_DIR/pa_decode_bf16_d64_page256_gqa8.co
 DIAG=$CO_DIR/mtp_diag
-cp -f "$DEPLOYED" "$DIAG/deployed_backup.co"
 
-# Aggressive trigger: varlen ON (irregular work => more scheduling variance),
-# batch sweep, multi-ctx + mtp 2,3 multi-config in one process.
 run_stress() {
     local tag=$1 co=$2
     cp -f "$co" "$DEPLOYED"
     rm -f aiter/jit/module_pa_decode_bf16_asm.so
+    # warm the jit .so build once (don't count this run)
     AITER_REBUILD=1 python3 op_tests/test_pa_decode_bf16_asm.py --vmask \
-        -m 2 3 -b 64 -kvh 8 -c 8193 16385 >/dev/null 2>&1 || true   # warm jit build once
+        -m 2 3 -b 64 -kvh 8 -c 8193 16385 >/dev/null 2>&1 || true
     local races=0 fails=0 r rc
     for r in $(seq 1 $LOOPS); do
         set +e
         python3 op_tests/test_pa_decode_bf16_asm.py --vmask \
-            -m 2 3 -b 17 64 -kvh 8 -c 4097 8193 16385 --varlen >/dev/null 2>&1
+            -m 2 3 -b 64 -kvh 8 -c 8193 16385 >/dev/null 2>&1
         rc=$?
         set -e
-        [ $rc -eq 2 ] && races=$((races+1))   # INCONCLUSIVE = race
-        [ $rc -eq 1 ] && fails=$((fails+1))   # bitmatch fail
+        [ $rc -eq 2 ] && races=$((races+1))
+        [ $rc -eq 1 ] && fails=$((fails+1))
     done
-    printf "%-28s RACE %2d/%2d   bitfail %2d/%2d\n" "$tag" "$races" "$LOOPS" "$fails" "$LOOPS"
+    printf "%-26s [%s]  RACE %2d/%2d   bitfail %2d/%2d\n" \
+        "$tag" "$(md5sum "$co" | cut -c1-8)" "$races" "$LOOPS" "$fails" "$LOOPS"
 }
 
-echo "== md5s =="; md5sum "$DIAG/deployed_backup.co" "$DIAG"/grp?.co "$DIAG/allsync.co"
-echo "== stress (LOOPS=$LOOPS, varlen, b=17,64 c=4097,8193,16385 m=2,3) =="
-
+echo "== stress LOOPS=$LOOPS  trigger: varlen OFF, b=64 kvh=8 c=8193,16385 m=2,3 =="
 if [ "$WHICH" = base ]; then
-    run_stress "baseline variant-54" "$DIAG/deployed_backup.co"
+    run_stress "baseline variant-54" "$DIAG/baseline.co"
 else
-    run_stress "baseline variant-54" "$DIAG/deployed_backup.co"
+    run_stress "baseline variant-54" "$DIAG/baseline.co"
     run_stress "group A (TDM)"        "$DIAG/grpA.co"
     run_stress "group B (LDS load)"   "$DIAG/grpB.co"
     run_stress "group C (gemm ds)"    "$DIAG/grpC.co"
@@ -52,6 +50,7 @@ else
     run_stress "allsync (all)"        "$DIAG/allsync.co"
 fi
 
-cp -f "$DIAG/deployed_backup.co" "$DEPLOYED"
+# leave a known state: canonical baseline deployed
+cp -f "$DIAG/baseline.co" "$DEPLOYED"
 rm -f aiter/jit/module_pa_decode_bf16_asm.so
-echo "done"
+echo "done (deployed restored to baseline 341aafc6)"
