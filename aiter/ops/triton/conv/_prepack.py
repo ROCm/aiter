@@ -20,7 +20,23 @@ import torch
 
 from aiter.ops.triton.conv._utils import BLOCK_K, _storage_ptr
 
-_PACK_CACHE_MAXSIZE = int(os.environ.get("AITER_TRITON_CONV_PACK_CACHE_SIZE", "256"))
+_DEFAULT_PACK_CACHE_MAXSIZE = 256
+
+
+def _read_pack_cache_maxsize(default: int = _DEFAULT_PACK_CACHE_MAXSIZE) -> int:
+    """Read AITER_TRITON_CONV_PACK_CACHE_SIZE, falling back to `default` for
+    missing, non-integer, or non-positive values."""
+    raw = os.environ.get("AITER_TRITON_CONV_PACK_CACHE_SIZE")
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+_PACK_CACHE_MAXSIZE = _read_pack_cache_maxsize()
 
 
 class _LRUPackCache:
