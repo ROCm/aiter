@@ -40,7 +40,7 @@ retry_cmd 3 pip install --no-build-isolation -e .
 
 echo
 echo "==== Verify triton installed by install_triton.sh ===="
-python .github/scripts/verify_triton_pin.py
+python3 .github/scripts/verify_triton_pin.py
 
 # Read BUILD_TRITON env var, default to 0. If 1, override the pinned triton wheel with a source build; if 0, use the pinned wheel from triton-test.txt.
 BUILD_TRITON=${BUILD_TRITON:-0}
