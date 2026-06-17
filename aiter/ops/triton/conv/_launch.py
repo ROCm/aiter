@@ -87,8 +87,6 @@ def _launch_1x1(
         BN = meta["BLOCK_N"]
         return (triton.cdiv(N * P * Q, BM) * triton.cdiv(K_out, BN),)
 
-    bias_arg = bias_fp32 if bias_fp32 is not None else w.new_empty(1)
-
     M_total = N * P * Q
 
     shape_key = format_shape_key(
@@ -111,7 +109,7 @@ def _launch_1x1(
     _conv2d_1x1_kernel[grid](
         x,
         w,
-        bias_arg,
+        bias_fp32,
         y,
         N,
         C,
@@ -125,7 +123,7 @@ def _launch_1x1(
         ph,
         pw,
         M_total,
-        HAS_BIAS=1 if bias_fp32 is not None else 0,
+        HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=activation,
         LAYOUT=layout,
         **config,
@@ -160,8 +158,6 @@ def _launch_3x3_nhwc(
         BN = meta["BLOCK_N"]
         return (triton.cdiv(N * P * Q, BM) * triton.cdiv(K_out, BN),)
 
-    bias_arg = bias_fp32 if bias_fp32 is not None else w_3x3.new_empty(1)
-
     M_total = N * P * Q
 
     shape_key = format_shape_key(
@@ -184,7 +180,7 @@ def _launch_3x3_nhwc(
     _conv2d_3x3_nhwc_kernel[grid](
         x,
         w_3x3,
-        bias_arg,
+        bias_fp32,
         y,
         N,
         C,
@@ -201,7 +197,7 @@ def _launch_3x3_nhwc(
         dh,
         dw,
         M_total,
-        HAS_BIAS=1 if bias_fp32 is not None else 0,
+        HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=activation,
         **config,
     )
@@ -236,8 +232,6 @@ def _launch_3x3_cblocked(
         BN = meta["BLOCK_N"]
         return (triton.cdiv(N * P * Q, BM) * triton.cdiv(K_out, BN),)
 
-    bias_arg = bias_fp32 if bias_fp32 is not None else w_3x3.new_empty(1)
-
     M_total = N * P * Q
 
     shape_key = format_shape_key(
@@ -260,7 +254,7 @@ def _launch_3x3_cblocked(
     _conv2d_3x3_cblocked_kernel[grid](
         x_blocked,
         w_3x3,
-        bias_arg,
+        bias_fp32,
         y,
         N,
         C,
@@ -278,7 +272,7 @@ def _launch_3x3_cblocked(
         dh,
         dw,
         M_total,
-        HAS_BIAS=1 if bias_fp32 is not None else 0,
+        HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=activation,
         **config,
     )
@@ -318,8 +312,6 @@ def _launch_general(
         BN = meta["BLOCK_N"]
         return (triton.cdiv(N * P * Q, BM) * triton.cdiv(K_out, BN),)
 
-    bias_arg = bias_fp32 if bias_fp32 is not None else w_k.new_empty(1)
-
     M_total = N * P * Q
 
     shape_key = format_shape_key(
@@ -342,7 +334,7 @@ def _launch_general(
     _conv2d_general_kernel[grid](
         x,
         w_k,
-        bias_arg,
+        bias_fp32,
         y,
         N,
         C,
@@ -361,7 +353,7 @@ def _launch_general(
         dh,
         dw,
         M_total,
-        HAS_BIAS=1 if bias_fp32 is not None else 0,
+        HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=activation,
         LAYOUT=layout,
         **config,
@@ -434,7 +426,6 @@ def _launch_winograd_f4x3_fused(
     )
 
     # 2. Fused GEMM + output transform
-    bias_arg = bias_fp32 if bias_fp32 is not None else x.new_empty(1)
 
     def fused_grid_f4(meta):
         return (triton.cdiv(T, meta["BLOCK_T"]), triton.cdiv(K_out, meta["BLOCK_K"]))
@@ -442,7 +433,7 @@ def _launch_winograd_f4x3_fused(
     _winograd_f4x3_fused_gemm_output_kernel[fused_grid_f4](
         V,
         U,
-        bias_arg,
+        bias_fp32,
         y,
         N,
         K_out,
@@ -452,7 +443,7 @@ def _launch_winograd_f4x3_fused(
         tile_H,
         tile_W,
         T,
-        HAS_BIAS=1 if bias_fp32 is not None else 0,
+        HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=activation,
         LAYOUT=layout,
         **fused_config,
@@ -543,14 +534,13 @@ def _launch_winograd_f4x3(
     )
 
     # 3. Output transform
-    bias_arg = bias_fp32 if bias_fp32 is not None else x.new_empty(1)
 
     def output_grid_f4(meta):
         return (T, triton.cdiv(K_out, meta["BLOCK_K"]))
 
     _winograd_f4x3_output_transform_kernel[output_grid_f4](
         M,
-        bias_arg,
+        bias_fp32,
         y,
         N,
         K_out,
@@ -559,7 +549,7 @@ def _launch_winograd_f4x3(
         tile_H,
         tile_W,
         T,
-        HAS_BIAS=1 if bias_fp32 is not None else 0,
+        HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=activation,
         LAYOUT=layout,
         **output_config,
@@ -650,14 +640,12 @@ def _launch_winograd_f4x3_cblocked(
         **gemm_config,
     )
 
-    bias_arg = bias_fp32 if bias_fp32 is not None else x_blocked.new_empty(1)
-
     def output_grid_f4(meta):
         return (T, triton.cdiv(K_out, meta["BLOCK_K"]))
 
     _winograd_f4x3_output_transform_kernel[output_grid_f4](
         M,
-        bias_arg,
+        bias_fp32,
         y,
         N,
         K_out,
@@ -666,7 +654,7 @@ def _launch_winograd_f4x3_cblocked(
         tile_H,
         tile_W,
         T,
-        HAS_BIAS=1 if bias_fp32 is not None else 0,
+        HAS_BIAS=bias_fp32 is not None,
         ACTIVATION=activation,
         **output_config,
     )
