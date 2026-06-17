@@ -144,11 +144,12 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_pretune.py]=1
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     echo "Triton test files:"
+    FILE_TIMES[op_tests/triton_tests/conv/test_causal_conv1d.py]=786
     FILE_TIMES[op_tests/triton_tests/test_pa_decode_gluon.py]=726
-    FILE_TIMES[op_tests/triton_tests/test_causal_conv1d.py]=694
     FILE_TIMES[op_tests/triton_tests/attention/test_mha_v3.py]=585
     FILE_TIMES[op_tests/triton_tests/gemm/batched/test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant.py]=385
     FILE_TIMES[op_tests/triton_tests/attention/test_mha_fp8.py]=310
+    FILE_TIMES[op_tests/triton_tests/test_gated_delta_rule.py]=313
     FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_a16w16.py]=232
     FILE_TIMES[op_tests/triton_tests/rope/test_fused_qkv_split_qk_rope.py]=208
     FILE_TIMES[op_tests/triton_tests/attention/test_mha_with_pe.py]=188
@@ -162,6 +163,9 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_mul_add.py]=125
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_a8w8.py]=122
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_a8w8_blockscale.py]=110
+    FILE_TIMES[op_tests/triton_tests/attention/test_unified_attention_sparse_mla.py]=110
+    FILE_TIMES[op_tests/triton_tests/quant/test_fused_mxfp4_quant.py]=86
+    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_kv_cache.py]=78
     FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py]=109
     FILE_TIMES[op_tests/triton_tests/attention/test_fav3_sage.py]=108
     FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a16w16_gated.py]=100
@@ -171,23 +175,24 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_routing.py]=89
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_a4w4.py]=88
     FILE_TIMES[op_tests/triton_tests/gemm/feed_forward/test_ff_a16w16.py]=87
-    FILE_TIMES[op_tests/triton_tests/quant/test_fused_mxfp4_quant.py]=86
     FILE_TIMES[op_tests/triton_tests/attention/test_unified_attention.py]=80
-    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_kv_cache.py]=78
     FILE_TIMES[op_tests/triton_tests/attention/test_mha_with_sink.py]=75
     FILE_TIMES[op_tests/triton_tests/normalization/test_layernorm.py]=74
     FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_a8w8_blockscale_a16w16.py]=73
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_a16w4.py]=69
     FILE_TIMES[op_tests/triton_tests/normalization/test_rmsnorm.py]=64
-    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_bmm_rope_kv_cache.py]=56
-    FILE_TIMES[op_tests/triton_tests/test_activation.py]=53
+    FILE_TIMES[op_tests/triton_tests/attention/test_flash_attn_kvcache.py]=72
     FILE_TIMES[op_tests/triton_tests/test_gmm.py]=51
+    FILE_TIMES[op_tests/triton_tests/fusions/test_fused_bmm_rope_kv_cache.py]=56
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_int8_smoothquant.py]=50
+    FILE_TIMES[op_tests/triton_tests/test_activation.py]=53
     FILE_TIMES[op_tests/triton_tests/fusions/test_fused_reduce_qk_norm_rope_swa_write.py]=47
     FILE_TIMES[op_tests/triton_tests/attention/test_la.py]=44
     FILE_TIMES[op_tests/triton_tests/attention/test_mha_dao_ai.py]=38
     FILE_TIMES[op_tests/triton_tests/attention/test_la_paged.py]=35
     FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_split_cat.py]=33
+    FILE_TIMES[op_tests/triton_tests/attention/test_mla_decode_rope.py]=28
+    FILE_TIMES[op_tests/triton_tests/attention/test_chunked_pa_prefill.py]=27
     FILE_TIMES[op_tests/triton_tests/attention/test_pa_prefill.py]=29
     FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py]=29
     FILE_TIMES[op_tests/triton_tests/gemm/fused/test_fused_gemm_a8w8_blockscale_mul_add.py]=29

@@ -70,7 +70,7 @@ from flydsl.expr.vector import ReductionOp
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl._mlir.dialects import llvm, rocdl
 
-from .tensor_shim import GTensor, _to_raw
+from .tensor_shim import GTensor, _to_raw, _run_compiled
 
 # JIT-free MX-format mode/dtype int mirrors. ``aiter.utility.mx_types``'s
 # pybind11 ``MxScaleRoundMode`` / ``MxDtype`` lazy-load on first attribute
@@ -81,6 +81,29 @@ from aiter.utility.mx_types import (
     MxDtypeInt as _D,
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
+
+_STATIC_ADAPTOR_CACHE = {}
+_STATIC_ADAPTOR_CACHE_MAX = 64
+
+
+def _cached_from_dlpack(t: torch.Tensor):
+    key = (
+        int(t.data_ptr()),
+        str(t.device),
+        str(t.dtype),
+        tuple(t.shape),
+        tuple(t.stride()),
+        int(t.storage_offset()),
+    )
+    cached = _STATIC_ADAPTOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_STATIC_ADAPTOR_CACHE) >= _STATIC_ADAPTOR_CACHE_MAX:
+        _STATIC_ADAPTOR_CACHE.clear()
+    adaptor = flyc.from_dlpack(t)
+    _STATIC_ADAPTOR_CACHE[key] = adaptor
+    return adaptor
+
 
 # --- shape constants (V4-Pro MVP) -------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64
@@ -968,15 +991,24 @@ def flydsl_qk_norm_rope_quant(
 
     if stream is None:
         stream = torch.cuda.current_stream()
-    fx_stream = Stream(stream)
+
+    def _has_direct_state():
+        return getattr(launcher, "_direct_call_state", None) is not None
 
     def _ptr_arg(t):
+        if _has_direct_state():
+            return int(t.data_ptr())
         return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
-    q_weight_static = flyc.from_dlpack(q_weight_arg)
-    kv_weight_static = flyc.from_dlpack(kv_weight)
-    cos_static = flyc.from_dlpack(cos_2d)
-    sin_static = flyc.from_dlpack(sin_2d)
+    def _stream_arg():
+        if _has_direct_state():
+            return stream
+        return Stream(stream)
+
+    q_weight_static = _cached_from_dlpack(q_weight_arg)
+    kv_weight_static = _cached_from_dlpack(kv_weight)
+    cos_static = _cached_from_dlpack(cos_2d)
+    sin_static = _cached_from_dlpack(sin_2d)
 
     # HW grid Y is a 16-bit field on AMD HIP → cap 65535 blocks/launch. The
     # kernel uses per-token GTensor base-shift so each chunk's resource span
@@ -992,7 +1024,7 @@ def flydsl_qk_norm_rope_quant(
     for start in range(0, T_tok, MAX_GRID_Y):
         n = min(MAX_GRID_Y, T_tok - start)
         end = start + n
-        launcher(
+        args = (
             _ptr_arg(q_view[start:end]),
             _ptr_arg(kv[start:end]),
             q_weight_static,
@@ -1006,7 +1038,8 @@ def flydsl_qk_norm_rope_quant(
             _ptr_arg(kv_scale_arg[start:end] if quant else kv_scale_arg),
             kv.stride(0),
             n,
-            stream=fx_stream,
+            _stream_arg(),
         )
+        _run_compiled(launcher, *args)
 
     return q_out, kv_out, (q_scale if quant else None), (kv_scale if quant else None)
