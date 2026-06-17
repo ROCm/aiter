@@ -389,7 +389,6 @@ def _compile_stage1_finalize_act(
         arg_tmp: fx.Tensor,
         arg_masked_m: fx.Tensor,
     ):
-        elem_ty = T.bf16 if out_dtype == "bf16" else T.f16
         tx = arith.index_cast(T.index, _raw(gpu.thread_id("x")))
         bx = arith.index_cast(T.index, _raw(gpu.block_id("x")))
         linear_vec = bx * arith.index(block_threads) + tx
@@ -422,11 +421,11 @@ def _compile_stage1_finalize_act(
             )
             if_row = scf.IfOp(row_ok, results_=[], has_else=False)
             with ir.InsertionPoint(if_row.then_block):
-                tmp_row_dw = e * arith.index(int(max_m) * tmp_dw_per_row) + row * arith.index(tmp_dw_per_row)
+                tmp_row_dw = e * arith.index(
+                    int(max_m) * tmp_dw_per_row
+                ) + row * arith.index(tmp_dw_per_row)
                 one = arith.constant(1.0, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
-                mask16 = arith.constant(0xFFFF, type=T.i32)
-                shift16 = arith.constant(16, type=T.i32)
                 if const_expr(act == "swiglu"):
                     limit = arith.constant(7.0, type=T.f32)
                     neg_limit = arith.constant(-7.0, type=T.f32)
@@ -528,7 +527,9 @@ def _compile_stage1_finalize_act(
                             )
                         )
                     out_vec = vector.from_elements(T.vec(VEC_DW, T.i32), result_dws)
-                    buffer_ops.buffer_store(out_vec, y_rsrc, arith.index_cast(T.i32, out_dw_base))
+                    buffer_ops.buffer_store(
+                        out_vec, y_rsrc, arith.index_cast(T.i32, out_dw_base)
+                    )
                 else:
                     gate_base_dw = tmp_row_dw + col_dw
                     up_base_dw = tmp_row_dw + col_dw + arith.index(out_dw_per_row)
@@ -552,8 +553,12 @@ def _compile_stage1_finalize_act(
                         sk_off = arith.index(sk * slice_stride_dw)
                         gate_dw_off = arith.index_cast(T.i32, gate_base_dw + sk_off)
                         up_dw_off = arith.index_cast(T.i32, up_base_dw + sk_off)
-                        gate_vec = buffer_ops.buffer_load(tmp_rsrc, gate_dw_off, vec_width=VEC_DW, dtype=T.i32)
-                        up_vec = buffer_ops.buffer_load(tmp_rsrc, up_dw_off, vec_width=VEC_DW, dtype=T.i32)
+                        gate_vec = buffer_ops.buffer_load(
+                            tmp_rsrc, gate_dw_off, vec_width=VEC_DW, dtype=T.i32
+                        )
+                        up_vec = buffer_ops.buffer_load(
+                            tmp_rsrc, up_dw_off, vec_width=VEC_DW, dtype=T.i32
+                        )
                         for lane in range_constexpr(VEC_DW):
                             g_dw = vector.extract(
                                 gate_vec,
@@ -663,7 +668,9 @@ def _compile_stage1_finalize_act(
                             _pack_pair_from_f32(out_lo, out_hi, out_dtype, i32=T.i32)
                         )
                     out_vec = vector.from_elements(T.vec(VEC_DW, T.i32), result_dws)
-                    buffer_ops.buffer_store(out_vec, y_rsrc, arith.index_cast(T.i32, out_dw_base))
+                    buffer_ops.buffer_store(
+                        out_vec, y_rsrc, arith.index_cast(T.i32, out_dw_base)
+                    )
                 scf.YieldOp([])
             scf.YieldOp([])
 
@@ -962,9 +969,13 @@ def _compile_base_a8w4_gemm(
         num_buffers=eff_num_buffers,
         waves_per_eu=cfg.waves_per_eu,
         out_dtype=cfg.out_dtype,
-        use_tdm_store=cfg.use_tdm_store and stage1_act is None and cfg.grouped_contiguous_m,
+        use_tdm_store=cfg.use_tdm_store
+        and stage1_act is None
+        and cfg.grouped_contiguous_m,
         inst_prefetch=cfg.inst_prefetch,
-        wave_specialized_tdm=cfg.wave_specialized_tdm and stage1_act is None and cfg.grouped_contiguous_m,
+        wave_specialized_tdm=cfg.wave_specialized_tdm
+        and stage1_act is None
+        and cfg.grouped_contiguous_m,
         split_k=cfg.split_k,
         cluster_m=cfg.cluster_m,
         cluster_n=cfg.cluster_n,

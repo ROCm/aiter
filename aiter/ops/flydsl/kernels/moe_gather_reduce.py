@@ -114,8 +114,7 @@ def build_moe_gather_reduce_module(
     n_iters = (out_dwords + DWORDS_PER_ITER - 1) // DWORDS_PER_ITER
 
     module_name = (
-        f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}"
-        f"_sk{split_k}_v{VEC}"
+        f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}_sk{split_k}_v{VEC}"
     )
 
     @flyc.kernel(name=module_name)
@@ -175,9 +174,8 @@ def build_moe_gather_reduce_module(
                 )
                 return row_i32, w_f32
 
-            dw_base = (
-                thread_id * vec_i32
-                + iter_idx_i32 * arith.constant(DWORDS_PER_ITER, type=i32)
+            dw_base = thread_id * vec_i32 + iter_idx_i32 * arith.constant(
+                DWORDS_PER_ITER, type=i32
             )
             dw_valid = arith.cmpi(CmpIPredicate.ult, dw_base, out_dwords_i32)
             _if_dw = scf.IfOp(dw_valid)
@@ -200,9 +198,7 @@ def build_moe_gather_reduce_module(
                             for _ in range(2 * VEC)
                         ]
                         for sk in range_constexpr(split_k):
-                            sk_off = (
-                                arith.constant(sk, type=i32) * slice_stride_dw_i32
-                            )
+                            sk_off = arith.constant(sk, type=i32) * slice_stride_dw_i32
                             raw_vec = buffer_ops.buffer_load(
                                 in_rsrc,
                                 src_dw_base + sk_off,
@@ -302,7 +298,11 @@ def build_moe_gather_reduce_module(
 
         idx_tokens = arith.index_cast(T.index, num_tokens)
         launcher = moe_gather_reduce_kernel(
-            grouped_out_flat, topids_to_rows, gather_w, out, num_tokens,
+            grouped_out_flat,
+            topids_to_rows,
+            gather_w,
+            out,
+            num_tokens,
             slice_stride_dw,
         )
         launcher.launch(
