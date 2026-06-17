@@ -86,7 +86,7 @@ _STATIC_ADAPTOR_CACHE = {}
 _STATIC_ADAPTOR_CACHE_MAX = 64
 
 
-def _cached_from_dlpack(t: torch.Tensor):
+def _cached_from_torch_tensor(t: torch.Tensor):
     key = (
         int(t.data_ptr()),
         str(t.device),
@@ -100,7 +100,7 @@ def _cached_from_dlpack(t: torch.Tensor):
         return cached
     if len(_STATIC_ADAPTOR_CACHE) >= _STATIC_ADAPTOR_CACHE_MAX:
         _STATIC_ADAPTOR_CACHE.clear()
-    adaptor = flyc.from_dlpack(t)
+    adaptor = flyc.from_torch_tensor(t)
     _STATIC_ADAPTOR_CACHE[key] = adaptor
     return adaptor
 
@@ -1005,10 +1005,10 @@ def flydsl_qk_norm_rope_quant(
             return stream
         return Stream(stream)
 
-    q_weight_static = _cached_from_dlpack(q_weight_arg)
-    kv_weight_static = _cached_from_dlpack(kv_weight)
-    cos_static = _cached_from_dlpack(cos_2d)
-    sin_static = _cached_from_dlpack(sin_2d)
+    q_weight_static = _cached_from_torch_tensor(q_weight_arg)
+    kv_weight_static = _cached_from_torch_tensor(kv_weight)
+    cos_static = _cached_from_torch_tensor(cos_2d)
+    sin_static = _cached_from_torch_tensor(sin_2d)
 
     # HW grid Y is a 16-bit field on AMD HIP → cap 65535 blocks/launch. The
     # kernel uses per-token GTensor base-shift so each chunk's resource span
